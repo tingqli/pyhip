@@ -2,7 +2,8 @@ import ctypes
 from ctypes.util import find_library
 import subprocess
 import functools
-import os
+import os, sys
+import inspect
 
 lib = ctypes.CDLL(find_library("amdhip64"))
 lib.hipModuleLoad.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
@@ -125,7 +126,10 @@ Compile .s into .co and expose test_kernel as a python function
 
 '''
 
-def kernel(src_fpath, func_name=None):
+def kernel(src_relative_path, func_name=None):
+    base_dir = os.path.dirname(inspect.getframeinfo(sys._getframe(1)).filename)
+    src_fpath = os.path.join(base_dir, src_relative_path)
+
     def decorator(func):
         nonlocal src_fpath, func_name
 
