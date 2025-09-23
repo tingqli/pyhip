@@ -28,6 +28,26 @@ __global__ void dsread_test(uint32_t* data, uint32_t* indices_u32, int sm) {
     }
 }
 
+__global__ void dsread_testx2(uint32_t* data, uint32_t* indices_u32, int sm) {
+    __shared__ uint32_t lds_mem[64/4*1024]; // 64KB
+
+    // this loads prevents compiler from optimizing all computation on uninitialized LDS data
+    for(int i = threadIdx.x; i < sizeof(lds_mem)/sizeof(lds_mem[0]); i += blockDim.x) {
+        lds_mem[i] = data[i];
+    }
+    uint32_t idx_u32 = indices_u32[threadIdx.x & 63];
+    uint32_t sum = 0;
+    for(int n = 0; n < 10000; n++) {
+        // n&sm prevents compiler from optimizing the load
+        uint2 v = ((uint2*)lds_mem)[idx_u32 + (n&sm)];
+        sum += v.x + v.y;
+    }
+    if (threadIdx.x == 0) {
+        data[0] = sum; // prevent opt
+    }
+}
+
+
 __global__ void dsread_testx4(uint32_t* data, uint32_t* indices_u32, int sm) {
     __shared__ uint32_t lds_mem[64/4*1024]; // 64KB
 

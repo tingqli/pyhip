@@ -12,6 +12,9 @@ print(f"{torch.get_default_device()=}")
 def dsread_test(data, off, sm): ...
 
 @pyhip.kernel("dsread_test.cpp")
+def dsread_testx2(data, off, sm): ...
+
+@pyhip.kernel("dsread_test.cpp")
 def dsread_testx4(data, off, sm): ...
 
 def test_lds_bank_size():
@@ -56,8 +59,18 @@ def test_lds_bank_conflict(lane_src, kernel):
     lane_group = [lane_dst for lane_dst in range(64) if dts[lane_dst] > avg_dt*1.05]
     return [lane_src] + lane_group
 
+print("======================== LDS bank size ")
 test_lds_bank_size()
 
+print("======================== ds_read_b64 ")
+groupped = []
+for i in range(64):
+    if i not in groupped:
+        lane_group = test_lds_bank_conflict(i, dsread_testx2)
+        groupped += lane_group
+        print("lane_group: ", lane_group)
+
+print("======================== ds_read_b128 ")
 groupped = []
 for i in range(64):
     if i not in groupped:
