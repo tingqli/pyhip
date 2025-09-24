@@ -4,6 +4,7 @@ import subprocess
 import functools
 import os, sys
 import inspect
+from .asmtools import prettify
 
 lib = ctypes.CDLL(find_library("amdhip64"))
 lib.hipModuleLoad.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
@@ -83,10 +84,11 @@ def compile_hip_device_only(src_path):
     gfx_arch = amdgpu_arch()
     if ext == ".cpp" and (not os.path.isfile(asm_path) or src_mtime > os.path.getmtime(asm_path)):
         # (re)compile into asm
-        cmd1 = f"hipcc -x hip --offload-device-only --offload-arch={gfx_arch} -std=c++20 -I. -O2 {src_path} -S -o {asm_path}"
+        cmd1 = f"hipcc -x hip --offload-device-only --offload-arch={gfx_arch} -std=c++20 -I. -O2 -Rpass-analysis=kernel-resource-usage {src_path} -S -o {asm_path}"
         print(cmd1)
         if os.system(cmd1) != 0:
             raise Exception("compilation 1 failed")
+        prettify(asm_path, asm_path)
 
     if not os.path.isfile(co_path) or src_mtime > os.path.getmtime(co_path):
         # (re)compile into co
