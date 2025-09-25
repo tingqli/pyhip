@@ -57,6 +57,8 @@ class amdhip_func:
                 fields.append((f"arg_{i}", ctypes.c_int))
             elif arg_type == "unsigned long":
                 fields.append((f"arg_{i}", ctypes.c_ulong))
+            elif arg_type == "unsigned int":
+                fields.append((f"arg_{i}", ctypes.c_uint))
             else:
                 raise Exception(f"Unsupported arg type: {arg_type}")
         class Args(ctypes.Structure):
@@ -165,6 +167,8 @@ def kernel(src_relative_path):
 
         print(f"\033[0;32m Kernel {func_name}({arg_types})  {src_fpath} : {module_fpath} : {sym_name} \033[0m")
 
-        return amdhip_func(module_fpath, sym_name, func_name, arg_types)
+        wrapper = amdhip_func(module_fpath, sym_name, func_name, arg_types)
+        functools.update_wrapper(wrapper, func) 
+        return wrapper
 
     return decorator
