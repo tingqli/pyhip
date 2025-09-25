@@ -55,10 +55,11 @@ def add_gfx_msg(asm_line, line_no):
     kwargs = {}
     list_args = []
     for a in instops[1:]:
+        if a == ";": break  # comment
         if a.startswith("offset:"):
-            kwargs["offset"] = int(a[7:])
+            kwargs["offset"] = int(a[7:], 0)
         elif a.startswith("format:"):
-            kwargs["format"] = int(a[7:])
+            kwargs["format"] = int(a[7:], 0)
         elif a in ["glc","slc","sc0","sc1","nt","idxen", "offen","lds"]:
             kwargs[a] = 1
         else:
@@ -196,10 +197,10 @@ def global_store_(opcodes, vaddr, vdata, saddr, offset=0, nt=0, sc0=0, sc1=0):
     return msg
 
 @gfx_inst
-def s_load_(opcodes, sdst, sbase, soffset=0, offset21s=0, glc=0):
+def s_load_(opcodes, sdst, sbase, soffset=0, offset=0, glc=0):
     addr = f"{sbase}"
     if soffset != 0: addr += f" + {soffset}"
-    if offset21s != 0: addr += f" + {offset21s}"
+    if offset != 0: addr += f" + {offset}"
     return f"{sdst} = load_{opcodes[0]}_from({addr}, glc={glc});  // 8.2.1.1. Scalar Memory Addressing"
 
 
@@ -231,7 +232,11 @@ def v_cndmask_(opcodes, vdst, src0, vsrc1, vcc, *rest):
 
 @gfx_inst
 def s_and_saveexec_b64(op, sdst, ssrc):
-    return f"({sdst}, exec) = (exec, {ssrc}&exec); scc=(exec!=0)"
+    return f"exec={ssrc}&exec; {sdst}=old_exec; scc=(exec!=0)"
+
+@gfx_inst
+def s_or_saveexec_b64(op, sdst, ssrc):
+    return f"exec={ssrc}|exec; {sdst}=old_exec; scc=(exec!=0)"
 
 @gfx_inst
 def s_cbranch_(opcodes, label):
@@ -295,7 +300,7 @@ def s_andn2_(opcodes, sdst, src0, ssrc1):
 
 @gfx_inst
 def s_andn2_saveexec_(opcodes, sdst, ssrc):
-    return f"{sdst} = EXEC; EXEC = ({ssrc} & ~EXEC);  SCC=(EXEC != 0)"
+    return f"exec=({ssrc} & ~exec);  {sdst}=old_exec;  scc=(exec != 0)"
 
 @gfx_inst
 def v_mov_(opcodes,  vdst, src, *rest):
@@ -326,6 +331,10 @@ def s_or_(opcodes,  dst, src0, src1):
 @gfx_inst
 def s_xor_(opcodes,  dst, src0, src1):
     return f"{dst} = {src0} ^ {src1};  scc=({dst}!=0);"
+
+@gfx_inst
+def s_xor_saveexec_(opcodes,  dst, src0):
+    return f"exec={src0}^exec;  {dst}=old_exec;  scc=(exec!=0);"
 
 @gfx_inst
 def v_lshlrev_(opcodes, vdst, vsrc0, vsrc1, *rest):
