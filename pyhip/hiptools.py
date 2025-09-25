@@ -6,50 +6,57 @@ import os, sys
 import inspect
 from .asmtools import prettify
 
-lib = ctypes.CDLL(find_library("amdhip64"))
-lib.hipModuleLoad.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
-lib.hipModuleLoad.restype = ctypes.c_int32
-lib.hipModuleGetFunction.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p]
-lib.hipModuleGetFunction.restype = ctypes.c_int32
-lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p, 
-                                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-                                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-                                ctypes.c_uint32, # unsigned int sharedMemBytes
-                                ctypes.c_uint64, # hipStream_t stream
-                                ctypes.c_void_p, # void **kernelParams
-                                ctypes.c_void_p, # void **extra
-                                ]
-lib.hipModuleLaunchKernel.restype = ctypes.c_int32
-lib.hipGetErrorString.argtypes = [ctypes.c_int32]
-lib.hipGetErrorString.restype = ctypes.c_char_p
+@functools.cache
+def get_lib():
+    lib = ctypes.CDLL(find_library("amdhip64"))
+    lib.hipModuleLoad.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
+    lib.hipModuleLoad.restype = ctypes.c_int32
+    lib.hipModuleGetFunction.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p]
+    lib.hipModuleGetFunction.restype = ctypes.c_int32
+    lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p, 
+                                    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                                    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                                    ctypes.c_uint32, # unsigned int sharedMemBytes
+                                    ctypes.c_uint64, # hipStream_t stream
+                                    ctypes.c_void_p, # void **kernelParams
+                                    ctypes.c_void_p, # void **extra
+                                    ]
+    lib.hipModuleLaunchKernel.restype = ctypes.c_int32
+    lib.hipGetErrorString.argtypes = [ctypes.c_int32]
+    lib.hipGetErrorString.restype = ctypes.c_char_p
+    return lib
 
 def hip_check_error(err):
     if err != 0:
-        raise Exception("HIP error:" + lib.hipGetErrorString(err).decode("utf-8"))
+        raise Exception("HIP error:" + get_lib().hipGetErrorString(err).decode("utf-8"))
 
 @functools.cache
 def hipModuleLoad(module_fpath):
     p_module = ctypes.c_void_p()
-    hip_check_error(lib.hipModuleLoad(ctypes.byref(p_module), module_fpath.encode('utf-8')))
+    hip_check_error(get_lib().hipModuleLoad(ctypes.byref(p_module), module_fpath.encode('utf-8')))
     # print(f"hipModuleLoad({module_fpath}) ... success.")
     return p_module
 
 def hipModuleGetFunction(p_module, func_name):
     p_func = ctypes.c_void_p()
-    hip_check_error(lib.hipModuleGetFunction(ctypes.byref(p_func), p_module, func_name.encode('utf-8')))
+    hip_check_error(get_lib().hipModuleGetFunction(ctypes.byref(p_func), p_module, func_name.encode('utf-8')))
     # print(f"hipModuleGetFunction({func_name}) ... success.")
     return p_func
 
 class amdhip_func:
-    def __init__(self, p_func, kname, kargs):
-        self.p_func = p_func
+    def __init__(self, module_fpath, sym_name, kname, kargs):
+        self.module_fpath = module_fpath
+        self.sym_name = sym_name
         self.kname = kname
+        self.p_func = None
         fields = []
         for i,arg_type in enumerate(kargs):
             if arg_type.endswith("*"):
                 fields.append((f"arg_{i}", ctypes.c_void_p))
             elif arg_type == "int":
                 fields.append((f"arg_{i}", ctypes.c_int))
+            elif arg_type == "unsigned long":
+                fields.append((f"arg_{i}", ctypes.c_ulong))
             else:
                 raise Exception(f"Unsupported arg type: {arg_type}")
         class Args(ctypes.Structure):
@@ -57,8 +64,16 @@ class amdhip_func:
         self.args = Args()
         ExtraType = ctypes.c_void_p * 5
         self.config = ExtraType(1, ctypes.addressof(self.args), 2, ctypes.sizeof(self.args), 3)
+        self.fun_loaded = False
+
+    def lazy_load_func(self):
+        if self.p_func is None:
+            self.fun_loaded = True
+            p_module = hipModuleLoad(self.module_fpath)
+            self.p_func = hipModuleGetFunction(p_module, self.sym_name)
 
     def __call__(self, gridDims:list[int], blockDims:list[int], *args):
+        self.lazy_load_func()
         for i,a in enumerate(args):
             setattr(self.args, f"arg_{i}", a)
         sharedMemBytes = 0
@@ -66,7 +81,7 @@ class amdhip_func:
             gridDims.append(1)
         while len(blockDims) < 3:
             blockDims.append(1)
-        hip_check_error(lib.hipModuleLaunchKernel(self.p_func, *gridDims, *blockDims, sharedMemBytes, 0, 0, ctypes.byref(self.config)))
+        hip_check_error(get_lib().hipModuleLaunchKernel(self.p_func, *gridDims, *blockDims, sharedMemBytes, 0, 0, ctypes.byref(self.config)))
 
 @functools.cache
 def amdgpu_arch():
@@ -109,7 +124,7 @@ def get_all_kernel_args(co_path):
         if len(ls) < 7: continue
         if ls[3] != ".text" : continue
         symbol_name = line_raw.split()[6]
-        func_sig = "".join(ls[6:]).strip().rstrip(")")
+        func_sig = " ".join(ls[6:]).strip().rstrip(")")
         fname, args = func_sig.split("(")
         args = [a.strip() for a in args.split(",")]
         kernel_args[fname] = (symbol_name, args)
@@ -128,15 +143,14 @@ Compile .s into .co and expose test_kernel as a python function
 
 '''
 
-def kernel(src_relative_path, func_name=None):
+def kernel(src_relative_path):
     base_dir = os.path.dirname(inspect.getframeinfo(sys._getframe(1)).filename)
     src_fpath = os.path.join(base_dir, src_relative_path)
 
     def decorator(func):
-        nonlocal src_fpath, func_name
+        nonlocal src_fpath
 
-        if func_name is None:
-            func_name = func.__name__
+        func_name = func.__name__
 
         if src_fpath.endswith(".cpp") or src_fpath.endswith(".s"):
             module_fpath = compile_hip_device_only(src_fpath)
@@ -149,9 +163,8 @@ def kernel(src_relative_path, func_name=None):
 
         sym_name, arg_types = kargs[func_name]
 
-        p_module = hipModuleLoad(module_fpath)
-        p_func = hipModuleGetFunction(p_module, sym_name)
         print(f"\033[0;32m Kernel {func_name}({arg_types})  {src_fpath} : {module_fpath} : {sym_name} \033[0m")
-        return amdhip_func(p_func, func_name, arg_types)
+
+        return amdhip_func(module_fpath, sym_name, func_name, arg_types)
 
     return decorator

@@ -294,6 +294,10 @@ def s_andn2_(opcodes, sdst, src0, ssrc1):
     return f"{sdst} = ({src0} & ~{ssrc1}); scc=({sdst}!=0);"
 
 @gfx_inst
+def s_andn2_saveexec_(opcodes, sdst, ssrc):
+    return f"{sdst} = EXEC; EXEC = ({ssrc} & ~EXEC);  SCC=(EXEC != 0)"
+
+@gfx_inst
 def v_mov_(opcodes,  vdst, src, *rest):
     return f"{vdst} = {src};"
 
