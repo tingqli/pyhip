@@ -1,20 +1,7 @@
 import pyhip
 
 
-hip_module = pyhip.kernel("main.cpp")
-
-@hip_module
-def sum_1d_x4(gridDims, blockDims, count, data_f32, numElements, save_sum): ...
-@hip_module
-def sum_1d_x2(gridDims, blockDims, count, data_f32, numElements, save_sum): ...
-@hip_module
-def sum_1d_16x64(gridDims, blockDims, count, data_f32, numElements, save_sum): ...
-@hip_module
-def sum_1d_8x128(gridDims, blockDims, count, data_f32, numElements, save_sum): ...
-@hip_module
-def sum_1d_4x256(gridDims, blockDims, count, data_f32, numElements, save_sum): ...
-@hip_module
-def sum_1d_2x512(gridDims, blockDims, count, data_f32, numElements, save_sum): ...
+hip_module = pyhip.module("main.cpp")
 
 import torch
 torch.cuda.set_device(7)
@@ -23,7 +10,7 @@ torch.manual_seed(0)
 cur_gpu_device =torch.cuda.get_device_name()
 print(f"{torch.get_default_device()=}")
 
-def test_count_negatives(kfunc):
+def test_count_negatives(kfunc, force_occupancy):
     act_sum = torch.tensor(0, dtype=torch.float32)
 
     numElements = 640*1024*1024
@@ -51,16 +38,19 @@ def test_count_negatives(kfunc):
     for i in range(3):
         torch.cuda._sleep(1_00_000_000)
         ev_start.record()    
-        kfunc([grid_size], [256], act_sum.data_ptr(), input.data_ptr(), numElements, 0)
+        kfunc([grid_size], [256], act_sum.data_ptr(), input.data_ptr(), numElements, 0, force_occupancy=force_occupancy)
         ev_end.record()
         torch.cuda.synchronize()
         dt_ms = ev_start.elapsed_time(ev_end)
         print(f" {kfunc.__name__}  dt: {dt_ms*1e3:7.1f} us  {numElements*4e-6/dt_ms:.3f} GB/s")
 
-
-test_count_negatives(sum_1d_x4)
-test_count_negatives(sum_1d_x2)
-test_count_negatives(sum_1d_16x64)
-test_count_negatives(sum_1d_8x128)
-test_count_negatives(sum_1d_4x256)
-test_count_negatives(sum_1d_2x512)
+force_occupancy = 1
+test_count_negatives(hip_module.sum_1d_x4, force_occupancy)
+test_count_negatives(hip_module.sum_1d_x2, force_occupancy)
+test_count_negatives(hip_module.sum_1d_16x64, force_occupancy)
+test_count_negatives(hip_module.sum_1d_8x128, force_occupancy)
+test_count_negatives(hip_module.sum_1d_4x256, force_occupancy)
+test_count_negatives(hip_module.sum_1d_2x512, force_occupancy)
+test_count_negatives(hip_module.sum_1d_x4e, force_occupancy)
+test_count_negatives(hip_module.sum_1d_x4e2, force_occupancy)
+test_count_negatives(hip_module.sum_1d_buffx4, force_occupancy)

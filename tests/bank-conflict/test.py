@@ -8,13 +8,13 @@ cur_gpu_device =torch.cuda.get_device_name()
 print(f"{torch.get_default_device()=}")
 
 
-@pyhip.kernel("dsread_test.cpp")
+@pyhip.module("dsread_test.cpp")
 def dsread_test(data, off, sm): ...
 
-@pyhip.kernel("dsread_test.cpp")
+@pyhip.module("dsread_test.cpp")
 def dsread_testx2(data, off, sm): ...
 
-@pyhip.kernel("dsread_test.cpp")
+@pyhip.module("dsread_test.cpp")
 def dsread_testx4(data, off, sm): ...
 
 def test_lds_bank_size():

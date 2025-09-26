@@ -1,10 +1,12 @@
-import torch
-import pyhip
 
+import pyhip
+@pyhip.module("mla.cpp")
+def gemm_qk_lds(q, k, P, kv_len, sm): ...
+
+import torch
 torch.cuda.set_device(6)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
-
 cur_gpu_device =torch.cuda.get_device_name()
 print(f"{torch.get_default_device()=}")
 
@@ -19,8 +21,6 @@ def check_all_close(out, out_ref, rtol=0.01, atol=0.01, verbose=False):
         print("PASS")
 
 def test_gemm_qk():
-    @pyhip.kernel("mla.cpp")
-    def gemm_qk_lds(q, k, P, kv_len, sm): ...
 
     #kernel = gemm_qk
     kernel = gemm_qk_lds
@@ -36,7 +36,7 @@ def test_gemm_qk():
     k = torch.randn(batch, kv_len, dim, dtype=torch.float16)
     out = torch.randn(batch, heads, 16, dtype=torch.float)
 
-    kernel([batch, heads//64], [4*64], q.data_ptr(), k.data_ptr(), out.data_ptr(), kv_len, 1)
+    kernel([heads//64, batch], [4*64], q.data_ptr(), k.data_ptr(), out.data_ptr(), kv_len, 1)
 
     temp = torch.einsum("bhd,bkd->bhk",[q.to(torch.float), k.to(torch.float)])
     out_ref = torch.einsum("bhkl->bhl",[temp.reshape(batch, heads, kv_len//16, 16)])
@@ -47,7 +47,7 @@ def test_gemm_qk():
     for i in range(3):
         torch.cuda._sleep(1_000_000_000)
         ev_start.record()
-        kernel([batch, heads//64], [4*64], q.data_ptr(), k.data_ptr(), out.data_ptr(), kv_len, 1)
+        kernel([heads//64, batch], [4*64], q.data_ptr(), k.data_ptr(), out.data_ptr(), kv_len, 1)
         ev_end.record()
         torch.cuda.synchronize()
         dt_ms = ev_start.elapsed_time(ev_end)/1

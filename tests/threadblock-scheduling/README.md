@@ -9,4 +9,4 @@ some key points:
 
  - kernel can do their own mapping between thread-block index and work-loads index to make best use of L2 cache, this technique is called `Threadblock Swizzling`
 
-
+ - `TG_ID` seems to be related to occupancy, but same (`TG_ID`,`SE_ID`,`CU_ID`) combination happens multiple(4x) times within a concurrent-launching-batch, so the ID alone cannot identify the CU

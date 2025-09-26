@@ -74,11 +74,13 @@ class amdhip_func:
             p_module = hipModuleLoad(self.module_fpath)
             self.p_func = hipModuleGetFunction(p_module, self.sym_name)
 
-    def __call__(self, gridDims:list[int], blockDims:list[int], *args):
+    def __call__(self, gridDims:list[int], blockDims:list[int], *args, sharedMemBytes = 0, force_occupancy = 0):
         self.lazy_load_func()
+        if force_occupancy > 0:
+            LDS_bytes = 64*1024
+            sharedMemBytes = LDS_bytes//force_occupancy
         for i,a in enumerate(args):
             setattr(self.args, f"arg_{i}", a)
-        sharedMemBytes = 0
         while len(gridDims) < 3:
             gridDims.append(1)
         while len(blockDims) < 3:
@@ -135,40 +137,62 @@ def get_all_kernel_args(co_path):
 '''
 Compile .cpp into .s and .co, then exposes test_kernel as a python function
 
-    @pyhip.kernel("mla-hip.cpp")
+    @pyhip.module("mla-hip.cpp")
     def test_kernel(q, k, v, n, sm): ...
 
 Compile .s into .co and expose test_kernel as a python function
 
-    @pyhip.kernel("mla-hip.s")
+    @pyhip.module("mla-hip.s")
     def test_kernel(q, k, v, n, sm): ...
 
 '''
 
-def kernel(src_relative_path):
-    base_dir = os.path.dirname(inspect.getframeinfo(sys._getframe(1)).filename)
-    src_fpath = os.path.join(base_dir, src_relative_path)
-
-    def decorator(func):
-        nonlocal src_fpath
-
-        func_name = func.__name__
+class module:
+    def __init__(self, src_file_path):
+        if os.path.isabs(src_file_path):
+            src_fpath = src_file_path
+        else:
+            base_dir = os.path.dirname(inspect.getframeinfo(sys._getframe(1)).filename)
+            src_fpath = os.path.join(base_dir, src_file_path)
 
         if src_fpath.endswith(".cpp") or src_fpath.endswith(".s"):
             module_fpath = compile_hip_device_only(src_fpath)
         else:
             module_fpath = src_fpath
 
-        kargs = get_all_kernel_args(module_fpath)
-        if func_name not in kargs:
-            raise Exception(f"Cannot find {func_name} in {module_fpath}, only found {list(kargs.keys())}")
+        self.src_fpath = src_fpath
+        self.module_fpath = module_fpath
+        self.kargs = get_all_kernel_args(module_fpath)
+    
+    def __call__(self, func):
+        '''
+        decorator on func
+        '''
+        assert callable(func)
+        func_name = func.__name__
 
-        sym_name, arg_types = kargs[func_name]
+        if func_name not in self.kargs:
+            raise Exception(f"Cannot find {func_name} in {self.module_fpath}, only found {list(self.kargs.keys())}")
 
-        print(f"\033[0;32m Kernel {func_name}({arg_types})  {src_fpath} : {module_fpath} : {sym_name} \033[0m")
+        sym_name, arg_types = self.kargs[func_name]
 
-        wrapper = amdhip_func(module_fpath, sym_name, func_name, arg_types)
+        print(f"\033[0;32m Kernel {func_name}({arg_types})  {self.src_fpath} : {self.module_fpath} : {sym_name} \033[0m")
+
+        wrapper = amdhip_func(self.module_fpath, sym_name, func_name, arg_types)
         functools.update_wrapper(wrapper, func) 
         return wrapper
 
-    return decorator
+    def __getattr__(self, func_name):
+        '''
+        w/o decorator on func, directly build wrapper from name
+        '''
+        if func_name not in self.kargs:
+            raise Exception(f"Cannot find {func_name} in {self.module_fpath}, only found {list(self.kargs.keys())}")
+
+        sym_name, arg_types = self.kargs[func_name]
+
+        print(f"\033[0;32m Kernel {func_name}({arg_types})  {self.src_fpath} : {self.module_fpath} : {sym_name} \033[0m")
+
+        wrapper = amdhip_func(self.module_fpath, sym_name, func_name, arg_types)
+        wrapper.__name__ = func_name
+        return wrapper

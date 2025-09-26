@@ -1,1 +1,1 @@
-from .hiptools import kernel
+from .hiptools import module

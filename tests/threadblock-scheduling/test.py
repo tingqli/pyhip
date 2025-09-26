@@ -8,7 +8,7 @@ cur_gpu_device =torch.cuda.get_device_name()
 print(f"{torch.get_default_device()=}")
 
 
-@pyhip.kernel("main.cpp")
+@pyhip.module("main.cpp")
 def threadblock_test(gridDims, blockDims, busy_time, info): ...
 
 # since our kernel uses very little resources, we got Occupancy [waves/SIMD]: 8 

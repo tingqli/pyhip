@@ -34,12 +34,12 @@ import pyhip
 # and then it loads mla.co and kernel function test_kernel, wrap it as a normal python callable
 # you can call it with gridDim & blockDim & torch cuda tensors like this:
 #     test_kernel([gridx,gridy,gridz],[blkx,blky,blkz], q.data_ptr(), ....)
-@pyhip.kernel("mla.cpp")
+@pyhip.module("mla.cpp")
 def test_kernel(q, k, v, n, sm): ...
 
 # when we meet performance issue, we can make a copy of mla.s and hack it by hand, this allows us
 # to root-cause performance issue much easier since we can avoid involving complex HIP compiler.
-@pyhip.kernel("mla-copy.s")
+@pyhip.module("mla-copy.s")
 def test_kernel(q, k, v, n, sm): ...
 
 # launch kernel on torch cuda tensor
