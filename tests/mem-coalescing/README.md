@@ -1,5 +1,6 @@
 # coalescing memory read
-- `DWORDx4` is much faster than `DWORDx2`
+- `DWORDx4` is much faster than `DWORDx2`, even with `occupancy=8`. 
+   in `occupancy=8` case, pipelined version of `sum_1d_x4e2` provides no higher bandwidth comparing to non-pipelined version `sum_1d_x4`,  but `sum_1d_x2e2` can still provides higher bandwidth than `sum_1d_x2`. which indicates that due to `large-latency` + `high-bandwidth`, memory-system needs more concurrent requests to saturate bandwidth, that's why `DWORDx2` is not enough. check [Little's law](https://en.wikipedia.org/wiki/Little%27s_law).
 
 - coalescing happens as long as data-addresses from 64-lanes fall in same area of cache-lines, they can be permuted w/o damage performance.
 

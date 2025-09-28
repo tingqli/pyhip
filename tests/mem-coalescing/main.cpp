@@ -244,6 +244,42 @@ __global__ void sum_1d_x4e2(float* d_sum, const float* d_in, uint numElements, i
     if (save_sum) reduce_save_sum(d_sum, nc.x + nc.y + nc.z + nc.w);
 }
 
+__global__ void sum_1d_x2e2(float* d_sum, const float* d_in, uint numElements, int save_sum) {
+    float2 const *vectorized_in = reinterpret_cast<float2 const *>(d_in);
+
+    auto numVectElements = (numElements >> 1);
+
+    auto lane_id = threadIdx.x & 63; // 0...63
+    auto warp_id = threadIdx.x >> 6; // 0,1,2,3
+    auto warp_cnt = blockDim.x >> 6; // 4
+    auto total_warps = gridDim.x * warp_cnt;
+    auto warpVectElements = numVectElements / total_warps;
+
+    // permutation of 64 lanes do not hurt coalescing performance
+    uint tid = (blockIdx.x*warp_cnt + warp_id) * warpVectElements + (lane_id^0);
+
+    float2 nc = make_float2(0.0f,0.0f);
+    for (int i = 0; i < warpVectElements; i+=512, tid += 512) {
+        auto v40 = vectorized_in[tid];
+        auto v41 = vectorized_in[tid + 64];
+        auto v42 = vectorized_in[tid + 64*2];
+        auto v43 = vectorized_in[tid + 64*3];
+        auto v44 = vectorized_in[tid + 64*4];
+        auto v45 = vectorized_in[tid + 64*5];
+        auto v46 = vectorized_in[tid + 64*6];
+        auto v47 = vectorized_in[tid + 64*7];
+        nc += v40;
+        nc += v41;
+        nc += v42;
+        nc += v43;
+        nc += v44;
+        nc += v45;
+        nc += v46;
+        nc += v47;
+    } 
+    if (save_sum) reduce_save_sum(d_sum, nc.x + nc.y);
+}
+
 // 
 // https://github.com/mk1-project/quickreduce/blob/main/csrc/core/buffer.h
 using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
@@ -270,16 +306,6 @@ static float32x4_t buffer_load_dwordx4(int32x4_t srsrc,
                         int32_t voffset,
                         int32_t soffset,
                         int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4f32");
-
-//  %raw_buffer0 = call <4 x float> @llvm.amdgcn.raw.buffer.load.v4f32(<4 x i32> %tmp0, i32 128, i32 0, i32 0) #0
-//   call void @llvm.amdgcn.raw.buffer.load.lds(<4 x i32> %rsrc,
-//       ptr addrspace(3) @lds.0,  // LDS base offset
-//       i32 4,                    // Data byte size: 1/2/4 (/12/16 for gfx950)
-//       i32 0,                    // voffset(VGPR, included in bounds checking and swizzling)
-//       i32 0,                    // soffset(SGPR/imm, excluded from bounds checking and swizzling)
-//       i32 0,                    // imm offset(imm, included in bounds checking and swizzling)
-//       i32 0                     // auxiliary/cachepolicy(imm):
-// )
 
 __device__ __inline__
 static void buffer_store_dwordx4(int32x4_t data,
