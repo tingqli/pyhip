@@ -65,7 +65,8 @@ class amdhip_func:
             _fields_ = fields
         self.args = Args()
         ExtraType = ctypes.c_void_p * 5
-        self.config = ExtraType(1, ctypes.addressof(self.args), 2, ctypes.sizeof(self.args), 3)
+        self.arg_size = ctypes.c_uint64(ctypes.sizeof(self.args))
+        self.config = ExtraType(1, ctypes.addressof(self.args), 2, ctypes.addressof(self.arg_size), 3)
         self.fun_loaded = False
 
     def lazy_load_func(self):
@@ -130,7 +131,10 @@ def get_all_kernel_args(co_path):
         symbol_name = line_raw.split()[6]
         func_sig = " ".join(ls[6:]).strip().rstrip(")")
         fname, args = func_sig.split("(")
-        args = [a.strip() for a in args.split(",")]
+        if len(args) == 0:
+            args = []
+        else:
+            args = [a.strip() for a in args.split(",")]
         kernel_args[fname] = (symbol_name, args)
     return kernel_args
 
