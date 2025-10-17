@@ -25,10 +25,12 @@ for i in range(2):
     with pyhip.cudaPerf(M*N*K*2*num_CU):
         gemm_tile_256x256x32([num_CU],[256], A.data_ptr(), B.data_ptr(), K, out.data_ptr(), N, K//32)
 
-if 0:
+if num_CU == 1:
     ref = A.to(dtype=torch.float) @ B.transpose(1,0).to(dtype=torch.float)
     if torch.allclose(ref, out, atol=0.01, rtol=0.01):
         print("PASS")
     else:
         print(ref)
         print(out)
+else:
+    print("????")
