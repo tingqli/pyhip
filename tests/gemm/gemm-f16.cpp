@@ -28,38 +28,78 @@ TARGET_BUILTIN(__builtin_amdgcn_mfma_f32_16x16x16f16, "V4fV4hV4hV4fIiIiIi", "nc"
 
 */
 using float16x4 = __attribute__((__vector_size__(4 * sizeof(__fp16)))) __fp16;
+using float16x32 = __attribute__((__vector_size__(32 * sizeof(__fp16)))) __fp16;
 using float32x16 = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 
-__global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16* B, int nstrideAB, float* C, int nstrideC) {
+
+/*
+    thread block level tile copy
+
+    instruction-level   : 32x32x8
+    warp-level          : 128x128x32 : 4x4x4 of instruction-level
+    block-level         : 256x256x32  : 2x2 of warp-level
+
+    2x2 warps prefetch A_256x32 & B_256x32 data from HBM into registers
+    for 256x32, each warp loads 32x64 fp16 data.
+*/
+struct block_copy_256x32 {
+    float16x32 regs;
+    __device__ void prefetch(__fp16* psrc, int nstride) {
+        regs = *(float16x32*)(psrc + threadIdx.x*nstride);
+    }
+    __device__ void store(__fp16* pdst, int nstride) {
+        *(float16x32*)(pdst + threadIdx.x*nstride) = regs;
+    }
+};
+
+
+
+__global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16* B, int nstrideAB, float* C, int nstrideC, int OuterK) {
     int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     int lane = threadIdx.x & 63;
-    auto i_off = (lane & 31) * nstrideAB;
+    auto i_off = (lane & 31) * 32;
     auto k_off = (lane >> 5) * 4;
-    
+
+    __shared__ __fp16 Abuff[256*32];
+    __shared__ __fp16 Bbuff[256*32];
+
+    block_copy_256x32 copyA;
+    block_copy_256x32 copyB;
+
     float16x4 a[4];
     float16x4 b[4];
     float32x16 c[16] = {0};
-
-    for(int m = 0; m < 4; m++) {
-        a[m] = *(float16x4*)(A + i_off + k_off + m*32*nstrideAB);
-    }
-
-    for(int n = 0; n < 4; n ++) {
-        b[n] = *(float16x4*)(B + i_off + k_off + n*32*nstrideAB);
-    }
-
-    for(int m = 0; m < 4; m++) {
-        for(int n = 0; n < 4; n ++) {
-            auto i = m*4 + n;
-            c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a[m], b[n], c[i], 0, 0, 0);
+ 
+    for(int ok = 0; ok < OuterK; ok ++) {
+        copyA.prefetch(A + ok*32, nstrideAB);
+        copyB.prefetch(B + ok*32, nstrideAB);
+        copyA.store(Abuff, 32);
+        copyB.store(Bbuff, 32);
+        __syncthreads();
+ 
+        for(int k = 0; k < 32; k += 8) {
+            for(int m = 0; m < 4; m++) {
+                a[m] = *(float16x4*)(Abuff + i_off + k_off + m*32*32 + k + (warp_id >> 1)*32*4*32);
+            }
+            for(int n = 0; n < 4; n++) {
+                b[n] = *(float16x4*)(Bbuff + i_off + k_off + n*32*32 + k + (warp_id & 1)*32*4*32);
+            }
+            for(int m = 0; m < 4; m++) {
+                for(int n = 0; n < 4; n ++) {
+                    auto i = m*4 + n;
+                    c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a[m], b[n], c[i], 0, 0, 0);
+                }
+            }
         }
+        __syncthreads();
     }
 
     for(int m = 0; m < 4; m++) {
         for(int n = 0; n < 4; n ++) {
             auto i = m*4 + n;
             auto& v = c[i];
-            auto* p0 = C + ((lane>>5)*4)*nstrideC + (lane & 31) + m*32*nstrideC + n*32;
+            auto warp_off = (warp_id >> 1)*32*4*nstrideC + (warp_id & 1)*32*4;
+            auto* p0 = C + ((lane>>5)*4)*nstrideC + (lane & 31) + m*32*nstrideC + n*32  + warp_off;
 
             for (int i=0; i < 4; i++, p0 += 8*nstrideC) {
                 auto* p = p0;
