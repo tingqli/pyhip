@@ -69,25 +69,40 @@ static int32x4_t buffer_load_dwordx4(int32x4_t srsrc,
     block-level         : 256x256x32  : 2x2 of warp-level
 
     2x2 warps prefetch A_256x32 & B_256x32 data from HBM into registers
-    for 256x32, each warp loads 32x64 fp16 data.
+    for mem-coalesing reason, each warp should load (256/4)x32 = 64x32 halfs
+    each dwordx4 instruction should load 16x32 halfs, with 8-halfs per lane:
+
+        lane0 lane1 lane2 lane3
+        lane4 lane5 lane6 lane7 
+        ... ...
+
 */
 struct block_copy_256x32 {
-    union bigType {
-        float16x32 h32;
-        int32x4_t d4x4[4];
-        int32x16_t d16;
-    } data;
-    __device__ void prefetch(__fp16* psrc, int soffset, int nstride) {
-        data.h32 = *(float16x32*)(psrc + soffset + threadIdx.x*nstride);
-    }
+    int32x4_t d4x4[4];
+    //__device__ void prefetch(__fp16* psrc, int soffset, int nstride) {
+    //    data.h32 = *(float16x32*)(psrc + soffset + threadIdx.x*nstride);
+    //}
     __device__ void prefetch(BufferResource& buff, int soffset, int nstride) {
-        data.d4x4[0] = buffer_load_dwordx4(buff.descriptor, threadIdx.x*nstride*sizeof(__fp16), (soffset + 0)*sizeof(__fp16), 0);
-        data.d4x4[1] = buffer_load_dwordx4(buff.descriptor, threadIdx.x*nstride*sizeof(__fp16), (soffset + 8)*sizeof(__fp16), 0);
-        data.d4x4[2] = buffer_load_dwordx4(buff.descriptor, threadIdx.x*nstride*sizeof(__fp16), (soffset + 16)*sizeof(__fp16), 0);
-        data.d4x4[3] = buffer_load_dwordx4(buff.descriptor, threadIdx.x*nstride*sizeof(__fp16), (soffset + 24)*sizeof(__fp16), 0);
+        auto lane_offset = ((threadIdx.x & 3)*8 + (threadIdx.x >> 2) * nstride) * sizeof(__fp16);
+        d4x4[0] = buffer_load_dwordx4(buff.descriptor, lane_offset, (soffset + 0)*sizeof(__fp16), 0);
+        d4x4[1] = buffer_load_dwordx4(buff.descriptor, lane_offset, (soffset + 64*1*nstride)*sizeof(__fp16), 0);
+        d4x4[2] = buffer_load_dwordx4(buff.descriptor, lane_offset, (soffset + 64*2*nstride)*sizeof(__fp16), 0);
+        d4x4[3] = buffer_load_dwordx4(buff.descriptor, lane_offset, (soffset + 64*3*nstride)*sizeof(__fp16), 0);
     }
     __device__ void store(__fp16* pdst, int nstride) {
-        *(int32x16_t*)(pdst + threadIdx.x*nstride) = data.d16;
+        auto lane_offset = ((threadIdx.x & 3)*8 + (threadIdx.x >> 2) * nstride);
+        *(int32x4_t*)(pdst + lane_offset + 0) = d4x4[0];
+        *(int32x4_t*)(pdst + lane_offset + 64*1*nstride) = d4x4[1];
+        *(int32x4_t*)(pdst + lane_offset + 64*2*nstride) = d4x4[2];
+        *(int32x4_t*)(pdst + lane_offset + 64*3*nstride) = d4x4[3];
+    }
+    template<int nstride>
+    __device__ void store(__fp16* pdst) {
+        auto lane_offset = ((threadIdx.x & 3)*8 + (threadIdx.x >> 2) * nstride);
+        *(int32x4_t*)(pdst + lane_offset + 0) = d4x4[0];
+        *(int32x4_t*)(pdst + lane_offset + 64*1*nstride) = d4x4[1];
+        *(int32x4_t*)(pdst + lane_offset + 64*2*nstride) = d4x4[2];
+        *(int32x4_t*)(pdst + lane_offset + 64*3*nstride) = d4x4[3];
     }
 };
 
@@ -127,8 +142,8 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
 
     copyA.prefetch(bufferA, 0*32, nstrideAB);
     copyB.prefetch(bufferB, 0*32, nstrideAB);
-    copyA.store(Abuff, 32);
-    copyB.store(Bbuff, 32);
+    copyA.store<32>(Abuff);
+    copyB.store<32>(Bbuff);
 
     copyA.prefetch(bufferA, 1*32, nstrideAB);
     copyB.prefetch(bufferB, 1*32, nstrideAB);
@@ -139,8 +154,8 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
         auto LDS0 = ((ok + 0)&1)*256*32;
         auto LDS1 = ((ok + 1)&1)*256*32;
 
-        copyA.store(Abuff + LDS1, 32);
-        copyB.store(Bbuff + LDS1, 32);
+        copyA.store<32>(Abuff + LDS1);
+        copyB.store<32>(Bbuff + LDS1);
 
         copyA.prefetch(bufferA, (ok+2)*32, nstrideAB);
         copyB.prefetch(bufferB, (ok+2)*32, nstrideAB);
