@@ -79,11 +79,10 @@ static int32x4_t buffer_load_dwordx4(int32x4_t srsrc,
 */
 struct block_copy_256x32 {
     int32x4_t d4x4[4];
-    //__device__ void prefetch(__fp16* psrc, int soffset, int nstride) {
-    //    data.h32 = *(float16x32*)(psrc + soffset + threadIdx.x*nstride);
-    //}
     __device__ void prefetch(BufferResource& buff, int soffset, int nstride) {
         auto lane_offset = ((threadIdx.x & 3)*8 + (threadIdx.x >> 2) * nstride) * sizeof(__fp16);
+        //auto lane_offset = ((threadIdx.x & 7)*8 + (threadIdx.x >> 3) * nstride) * sizeof(__fp16);
+        //auto lane_offset = (threadIdx.x * 8) * sizeof(__fp16);
         d4x4[0] = buffer_load_dwordx4(buff.descriptor, lane_offset, (soffset + 0)*sizeof(__fp16), 0);
         d4x4[1] = buffer_load_dwordx4(buff.descriptor, lane_offset, (soffset + 64*1*nstride)*sizeof(__fp16), 0);
         d4x4[2] = buffer_load_dwordx4(buff.descriptor, lane_offset, (soffset + 64*2*nstride)*sizeof(__fp16), 0);
@@ -106,17 +105,50 @@ struct block_copy_256x32 {
     }
 };
 
+#define SGB_VMEM_read_0x0020 0x0020
+#define SGB_MFMA_0x0008      0x0008
+#define SGB_DS_read_0x0100   0x0100
+#define SGB_DS_write_0x0200  0x0200
+/*
+__global__ void __launch_bounds__(256, 1) xxxtile(int* A, int N, int * B) {
+    union bigtype {
+        int32x4_t dwx4[2];
+        float16x4 dhx4[4];
+    } buff;
+
+    BufferResource bufferA(A, N * 128 * sizeof(__fp16));
+
+    auto lane_offset = ((threadIdx.x & 3)*8 + (threadIdx.x >> 2) * 256) * sizeof(__fp16);
+    buff.dwx4[0] = buffer_load_dwordx4(bufferA.descriptor, lane_offset, (64*0)*sizeof(int), 0);
+    buff.dwx4[1] = buffer_load_dwordx4(bufferA.descriptor, lane_offset, (64*1)*sizeof(int), 0);
+
+    float32x16 c = {};
+    for(int i=0; i < N; i++) {
+
+        c = __builtin_amdgcn_mfma_f32_32x32x8f16(buff.dhx4[0], buff.dhx4[1], c, 0, 0, 0);
+        c = __builtin_amdgcn_mfma_f32_32x32x8f16(buff.dhx4[2], buff.dhx4[3], c, 0, 0, 0);
+
+        buff.dwx4[0] = buffer_load_dwordx4(bufferA.descriptor, lane_offset, (64*i)*sizeof(int), 0);
+        buff.dwx4[1] = buffer_load_dwordx4(bufferA.descriptor, lane_offset, (64*i+32)*sizeof(int), 0);
+
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
+    }
+    *(float32x16*)B = c;
+}
+
+*/
 __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16* B, int nstrideAB, float* C, int nstrideC, int OuterK) {
     int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     int lane = threadIdx.x & 63;
     auto i_off = (lane & 31) * 32;
     auto k_off = (lane >> 5) * 4;
+    auto k_off8 = (lane >> 5) * 8;
 
     BufferResource bufferA(A, 256*nstrideAB * sizeof(__fp16));
     BufferResource bufferB(B, 256*nstrideAB * sizeof(__fp16));
-
-    //auto *bufferA = A;
-    //auto *bufferB = B;
 
     __shared__ __fp16 Abuff[256*32*2];
     __shared__ __fp16 Bbuff[256*32*2];
@@ -124,8 +156,12 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
     block_copy_256x32 copyA;
     block_copy_256x32 copyB;
 
-    float16x4 a[4];
-    float16x4 b[4];
+    union ABType {
+        float16x4 h[4]; // 32x8[x4]xhalfs
+        int32x4_t d[2]; // 2 * 32x16xhalfs
+    };
+    ABType a[4];
+    ABType b[4];
     float32x16 c[16] = {0};
 
     // prefetch(data0) to regs
@@ -139,41 +175,115 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
     //     store regs(data1) to LDS1
     //     prefetch(data2) to regs
     //
+  
+    /*
+              copy.prefetch(data0)
+              copy.store(data0, LDS0)
+
+              copy.prefetch(data1)
+
+              __syncthreads();
+              copy.store(data1, LDS1)
+              copy.prefetch(data2)
+              REG1.lds_load(data0, LDS0)
+        for:
+              __syncthreads();
+
+              copy.store(data2, LDS0)
+              copy.prefetch(data3)
+
+              REG1.MFMA(data0)
+              REG1.lds_load(data1, LDS1)
+
+              swap LDS0 with LDS1
+    */
+
+    auto load_from_LDS = [&](int LDSOffset) {
+        auto LDS0 = ((0 + 0)&1)*256*32;
+        for(int ik = 0; ik < 2; ik += 1) {
+            for(int m = 0; m < 4; m++) {
+                a[m].d[ik] = *(int32x4_t*)(Abuff + LDSOffset + (i_off + k_off8) + m*32*32 + ik*16 + (warp_id >> 1)*32*4*32);
+            }
+            for(int n = 0; n < 4; n++) {
+                b[n].d[ik] = *(int32x4_t*)(Bbuff + LDSOffset + (i_off + k_off8) + n*32*32 + ik*16 + (warp_id & 1)*32*4*32);
+            }
+        }
+    };
 
     copyA.prefetch(bufferA, 0*32, nstrideAB);
     copyB.prefetch(bufferB, 0*32, nstrideAB);
     copyA.store<32>(Abuff);
     copyB.store<32>(Bbuff);
-
     copyA.prefetch(bufferA, 1*32, nstrideAB);
     copyB.prefetch(bufferB, 1*32, nstrideAB);
 
+    __syncthreads();
+    load_from_LDS(0);
+    copyA.store<32>(Abuff + 256*32);
+    copyB.store<32>(Bbuff + 256*32);
+    copyA.prefetch(bufferA, 2*32, nstrideAB);
+    copyB.prefetch(bufferB, 2*32, nstrideAB);
+    
     for(int ok = 0; ok < OuterK; ok ++) {
         __syncthreads();
 
         auto LDS0 = ((ok + 0)&1)*256*32;
         auto LDS1 = ((ok + 1)&1)*256*32;
 
-        copyA.store<32>(Abuff + LDS1);
-        copyB.store<32>(Bbuff + LDS1);
+        copyA.store<32>(Abuff + LDS0);
+        copyB.store<32>(Bbuff + LDS0);
+        copyA.prefetch(bufferA, (ok+3)*32, nstrideAB);
+        copyB.prefetch(bufferB, (ok+3)*32, nstrideAB);
 
-        copyA.prefetch(bufferA, (ok+2)*32, nstrideAB);
-        copyB.prefetch(bufferB, (ok+2)*32, nstrideAB);
-
-        for(int k = 0; k < 32; k += 8) {
-            for(int m = 0; m < 4; m++) {
-                a[m] = *(float16x4*)(Abuff + LDS0 + i_off + k_off + m*32*32 + k + (warp_id >> 1)*32*4*32);
-            }
-            for(int n = 0; n < 4; n++) {
-                b[n] = *(float16x4*)(Bbuff + LDS0 + i_off + k_off + n*32*32 + k + (warp_id & 1)*32*4*32);
-            }
+        for(int ik = 0; ik < 4; ik += 1) {
             for(int m = 0; m < 4; m++) {
                 for(int n = 0; n < 4; n ++) {
                     auto i = m*4 + n;
-                    c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a[m], b[n], c[i], 0, 0, 0);
+                    c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a[m].h[ik], b[n].h[ik], c[i], 0, 0, 0);
                 }
             }
         }
+        // as long as MFMA instruction issued, we can start READ a&b register for next iteration
+        // and no need to worry about RAW ?
+        load_from_LDS(LDS1);
+        /*
+        0x0200 DS write     ds_write_b128  x 8
+        0x0100 DS read      ds_read2_b64 x 16
+        0x0008 MFMA         v_mfma_f32_32x32x8_f16 x 64
+        0x0020 VMEM read    buffer_load_dwordx4 x 8
+        */
+#if 0
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 8, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 8, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 16, 0);
+#endif
+        /*
+#if 0
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 4, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 16, 0);
+
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 2, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 2, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 2, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 2, 0);
+
+        __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 8, 0);
+        
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 4, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 16, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 4, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 16, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 4, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 16, 0);
+#else
+
+#endif
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 16, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 8, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 8, 0);
+*/
     }
 
     for(int m = 0; m < 4; m++) {

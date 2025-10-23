@@ -99,9 +99,18 @@ def compile_hip_device_only(src_path):
     src_mtime = os.path.getmtime(src_path)
     pre, ext = os.path.splitext(src_path)
     assert ext == ".cpp" or ext == ".s"
+    ll_path = pre + ".ll"
     asm_path = pre + ".s"
     co_path = pre + ".co"
     gfx_arch = amdgpu_arch()
+
+    if os.getenv("DUMP_LL", None) is not None:
+        cmd1 = f"hipcc -x hip --offload-device-only --offload-arch={gfx_arch} -std=c++20 -I. -O2 {src_path} -S -emit-llvm -o {ll_path}"
+        print(cmd1)
+        if os.system(cmd1) != 0:
+            raise Exception("compilation 0 failed")
+        print(f"\033[0;32m LLVM IR {ll_path} was generated. \033[0m")
+
     if ext == ".cpp" and (not os.path.isfile(asm_path) or src_mtime > os.path.getmtime(asm_path)):
         # (re)compile into asm
         cmd1 = f"hipcc -x hip --offload-device-only --offload-arch={gfx_arch} -std=c++20 -I. -O2 -Rpass-analysis=kernel-resource-usage {src_path} -S -o {asm_path}"

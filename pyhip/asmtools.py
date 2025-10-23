@@ -164,6 +164,11 @@ def v_addc_co_(opcodes,  vdst, vcc0, src0, vsrc1, vcc1, *rest):
     return f"tmp = 64'U({src0}) + 64'U({vsrc1}) + {vcc0}.u64[laneId]; {vcc1}.u64[laneId]=overflow_carry;  {vdst}=tmp"
 
 @gfx_inst
+def v_add_lshl_(opcodes, vdst, src0, src1, src2):
+    dtype = opcodes[0]
+    return f"{vdst} = ({src0} + {src1}) << {src2}[4:0]"
+
+@gfx_inst
 def v_add_(opcodes, vdst, src0, src1, clamp=0, omod=0):
     dtype = opcodes[0]
     return f"{vdst} = {src0} + {src1}"

@@ -3,6 +3,10 @@
 
 Passing `-mllvm -print-after-all` to clang (or just `-print-after-all` to llc), all IRs after every pass will be dumpped to console during compilation.
 
+```bash
+/opt/rocm/llvm/bin/llc -march=amdgcn  -mcpu=gfx942 -print-after-all < xxx.ll > xxx.s 2> xxx.ir
+```
+
 # LDS异步写入指令编译产生多余vmcnt的问题
 
 
