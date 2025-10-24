@@ -164,12 +164,34 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
     block_copy_256x32 copyA;
     block_copy_256x32 copyB;
 
-    union ABType {
-        float16x4 h[4]; // 32x8[x4]xhalfs
-        int32x4_t d[2]; // 2 * 32x16xhalfs
+    constexpr int lds_nstride = 32;
+
+    struct ABRegs {
+        union ABType {
+            // (M=32,K=8x4) halfs, each lane has 16 halfs
+            float16x4 h[4]; // 32x8[x4]xhalfs
+            int32x4_t d[2]; // 2 * 32x16xhalfs
+        } regs[4];
+
+        __device__ void load(__fp16 * buff) {
+            int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
+            int lane = threadIdx.x & 63;
+            auto LDS0 = ((0 + 0)&1)*256*32;
+            for(int ik = 0; ik < 2; ik ++) {
+                auto row = (lane & 31);
+                auto col = swizzle_col<1,3>(row, (lane >> 5) + ik*2);
+                auto lane_off = row * lds_nstride + col * 8;
+                for(int m = 0; m < 4; m++) {
+                    regs[m].d[ik] = *(int32x4_t*)(buff + lane_off + m*32*lds_nstride);
+                }
+            }
+        }
     };
-    ABType a[4];
-    ABType b[4];
+
+    ABRegs a[2];
+    ABRegs b[2];
+    auto* Abuff_warp = Abuff + (warp_id >> 1)*32*4*lds_nstride;
+    auto* Bbuff_warp = Bbuff + (warp_id & 1)*32*4*lds_nstride;
     float32x16 c[16] = {0};
 
     // prefetch(data0) to regs
@@ -206,50 +228,6 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
               swap LDS0 with LDS1
     */
 
-    auto load_from_LDS = [&](int LDSOffset) {
-        constexpr int lds_nstride = 32;
-        auto LDS0 = ((0 + 0)&1)*256*32;
-#if 1
-        for(int ik = 0; ik < 2; ik ++) {
-            auto row = (lane & 31);
-            auto col = swizzle_col<1,3>(row, (lane >> 5) + ik*2);
-            auto lane_off = row * lds_nstride + col * 8;
-            for(int m = 0; m < 4; m++) {
-                a[m].d[ik] = *(int32x4_t*)(Abuff + LDSOffset + lane_off + m*32*lds_nstride + (warp_id >> 1)*32*4*lds_nstride);
-            }
-            for(int n = 0; n < 4; n++) {
-                b[n].d[ik] = *(int32x4_t*)(Bbuff + LDSOffset + lane_off + n*32*lds_nstride + (warp_id & 1)*32*4*lds_nstride);
-            }
-        }
-#else
-        /*
-            ds_read2_b64 v[48:51], v41 offset0:4 offset1:6 
-                Load 64 bits of data from one location in a data share and
-                then 64 bits of data from a second location in a data
-                share and store the results into a 128-bit vector register
-
-            ds_read2_b64 has more bank-conflict than ds_read_b128
-
-            [lane0a halfx4] [lane32a halfx4]    [lane0b halfx4] [lane32b halfx4]
-                    [lane0 halfx8]                    [lane32 halfx8]
-            [lane1a halfx4] [lane33a halfx4]    [lane1b halfx4] [lane33b halfx4]
-                    [lane1 halfx8]                    [lane33 halfx8]
-            ... ...
-                    ... ...
-            [lane31a halfx4] [lane63a halfx4]   [lane31b halfx4] [lane63b halfx4]
-                    [lane31 halfx8]                    [lane63 halfx8]
-        */ 
-        for(int ik = 0; ik < 4; ik ++) {
-            for(int m = 0; m < 4; m++) {
-                a[m].h[ik] = *(float16x4*)(Abuff + LDSOffset + (i_off + k_off) + m*32*32 + ik*8 + (warp_id >> 1)*32*4*32);
-            }
-            for(int n = 0; n < 4; n++) {
-                b[n].h[ik] = *(float16x4*)(Bbuff + LDSOffset + (i_off + k_off) + n*32*32 + ik*8 + (warp_id & 1)*32*4*32);
-            }
-        }
-#endif
-    };
-
     copyA.prefetch(bufferA, 0*32, nstrideAB);
     copyB.prefetch(bufferB, 0*32, nstrideAB);
     copyA.store<32>(Abuff);
@@ -258,17 +236,18 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
     copyB.prefetch(bufferB, 1*32, nstrideAB);
 
     __syncthreads();
-    load_from_LDS(0);
+    a[0].load(Abuff_warp + 0);
+    b[0].load(Bbuff_warp + 0);
     copyA.store<32>(Abuff + 256*32);
     copyB.store<32>(Bbuff + 256*32);
     copyA.prefetch(bufferA, 2*32, nstrideAB);
     copyB.prefetch(bufferB, 2*32, nstrideAB);
     
-    for(int ok = 0; ok < OuterK; ok ++) {
+    for(int ok = 0; ok < OuterK; ok += 2) {
         __syncthreads();
 
-        auto LDS0 = ((ok + 0)&1)*256*32;
-        auto LDS1 = ((ok + 1)&1)*256*32;
+        constexpr auto LDS0 = 0;
+        constexpr auto LDS1 = 256*32;
 
         copyA.store<32>(Abuff + LDS0);
         copyB.store<32>(Bbuff + LDS0);
@@ -279,13 +258,38 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
             for(int m = 0; m < 4; m++) {
                 for(int n = 0; n < 4; n ++) {
                     auto i = m*4 + n;
-                    c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a[m].h[ik], b[n].h[ik], c[i], 0, 0, 0);
+                    c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a[0].regs[m].h[ik], b[0].regs[n].h[ik], c[i], 0, 0, 0);
                 }
             }
+            __builtin_amdgcn_sched_barrier(~SGB_MFMA_0x0008);
         }
         // as long as MFMA instruction issued, we can start READ a&b register for next iteration
         // and no need to worry about RAW ?
-        load_from_LDS(LDS1);
+        a[1].load(Abuff_warp + LDS1);
+        b[1].load(Bbuff_warp + LDS1);
+
+        __syncthreads();
+
+        copyA.store<32>(Abuff + LDS1);
+        copyB.store<32>(Bbuff + LDS1);
+        copyA.prefetch(bufferA, (ok+4)*32, nstrideAB);
+        copyB.prefetch(bufferB, (ok+4)*32, nstrideAB);
+
+        for(int ik = 0; ik < 4; ik += 1) {
+            for(int m = 0; m < 4; m++) {
+                for(int n = 0; n < 4; n ++) {
+                    auto i = m*4 + n;
+                    c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a[1].regs[m].h[ik], b[1].regs[n].h[ik], c[i], 0, 0, 0);
+                }
+            }
+            __builtin_amdgcn_sched_barrier(~SGB_MFMA_0x0008);
+        }
+        // as long as MFMA instruction issued, we can start READ a&b register for next iteration
+        // and no need to worry about RAW ?
+        a[0].load(Abuff_warp + LDS0);
+        b[0].load(Bbuff_warp + LDS0);
+
+
         /*
         0x0200 DS write     ds_write_b128  x 8
         0x0100 DS read      ds_read2_b64 x 16
@@ -294,39 +298,34 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
         */ 
 #if 1
         for(int i = 0; i < 8;i++) {
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
             __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 1, 0);
             __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
-            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 5, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 4, 0);
+            //__builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
         }
-        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-40, 0);
+        for(int i = 0; i < 16; i++) {
+            __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
+        }
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-5*8-16, 0);
+
+
+        for(int i = 0; i < 8;i++) {
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 4, 0);
+            //__builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
+        }
+        for(int i = 0; i < 16; i++) {
+            __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
+        }
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-5*8-16, 0);
+
         //__builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 16, 0);
 #endif
-        /*
-#if 0
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 4, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 16, 0);
-
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 2, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 2, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 2, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 2, 0);
-
-        __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 8, 0);
-        
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 4, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 16, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 4, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 16, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 4, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 16, 0);
-#else
-
-#endif
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 16, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 8, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 8, 0);
-*/
     }
 
     for(int m = 0; m < 4; m++) {
