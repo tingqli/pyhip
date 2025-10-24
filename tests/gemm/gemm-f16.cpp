@@ -77,6 +77,12 @@ static int32x4_t buffer_load_dwordx4(int32x4_t srsrc,
         ... ...
 
 */
+
+template<int shift, int mask>
+__device__ __inline__ int swizzle_col(int logical_row, int logical_col) {
+    return (logical_col^(logical_row >> shift))&(mask);
+}
+
 struct block_copy_256x32 {
     int32x4_t d4x4[4];
     __device__ void prefetch(BufferResource& buff, int soffset, int nstride) {
@@ -97,7 +103,9 @@ struct block_copy_256x32 {
     }
     template<int nstride>
     __device__ void store(__fp16* pdst) {
-        auto lane_offset = ((threadIdx.x & 3)*8 + (threadIdx.x >> 2) * nstride);
+        auto row = (threadIdx.x >> 2);
+        auto col = swizzle_col<1, 3>(row, threadIdx.x & 3);
+        auto lane_offset = (col*8 + row * nstride);
         *(int32x4_t*)(pdst + lane_offset + 0) = d4x4[0];
         *(int32x4_t*)(pdst + lane_offset + 64*1*nstride) = d4x4[1];
         *(int32x4_t*)(pdst + lane_offset + 64*2*nstride) = d4x4[2];
@@ -199,15 +207,47 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
     */
 
     auto load_from_LDS = [&](int LDSOffset) {
+        constexpr int lds_nstride = 32;
         auto LDS0 = ((0 + 0)&1)*256*32;
-        for(int ik = 0; ik < 2; ik += 1) {
+#if 1
+        for(int ik = 0; ik < 2; ik ++) {
+            auto row = (lane & 31);
+            auto col = swizzle_col<1,3>(row, (lane >> 5) + ik*2);
+            auto lane_off = row * lds_nstride + col * 8;
             for(int m = 0; m < 4; m++) {
-                a[m].d[ik] = *(int32x4_t*)(Abuff + LDSOffset + (i_off + k_off8) + m*32*32 + ik*16 + (warp_id >> 1)*32*4*32);
+                a[m].d[ik] = *(int32x4_t*)(Abuff + LDSOffset + lane_off + m*32*lds_nstride + (warp_id >> 1)*32*4*lds_nstride);
             }
             for(int n = 0; n < 4; n++) {
-                b[n].d[ik] = *(int32x4_t*)(Bbuff + LDSOffset + (i_off + k_off8) + n*32*32 + ik*16 + (warp_id & 1)*32*4*32);
+                b[n].d[ik] = *(int32x4_t*)(Bbuff + LDSOffset + lane_off + n*32*lds_nstride + (warp_id & 1)*32*4*lds_nstride);
             }
         }
+#else
+        /*
+            ds_read2_b64 v[48:51], v41 offset0:4 offset1:6 
+                Load 64 bits of data from one location in a data share and
+                then 64 bits of data from a second location in a data
+                share and store the results into a 128-bit vector register
+
+            ds_read2_b64 has more bank-conflict than ds_read_b128
+
+            [lane0a halfx4] [lane32a halfx4]    [lane0b halfx4] [lane32b halfx4]
+                    [lane0 halfx8]                    [lane32 halfx8]
+            [lane1a halfx4] [lane33a halfx4]    [lane1b halfx4] [lane33b halfx4]
+                    [lane1 halfx8]                    [lane33 halfx8]
+            ... ...
+                    ... ...
+            [lane31a halfx4] [lane63a halfx4]   [lane31b halfx4] [lane63b halfx4]
+                    [lane31 halfx8]                    [lane63 halfx8]
+        */ 
+        for(int ik = 0; ik < 4; ik ++) {
+            for(int m = 0; m < 4; m++) {
+                a[m].h[ik] = *(float16x4*)(Abuff + LDSOffset + (i_off + k_off) + m*32*32 + ik*8 + (warp_id >> 1)*32*4*32);
+            }
+            for(int n = 0; n < 4; n++) {
+                b[n].h[ik] = *(float16x4*)(Bbuff + LDSOffset + (i_off + k_off) + n*32*32 + ik*8 + (warp_id & 1)*32*4*32);
+            }
+        }
+#endif
     };
 
     copyA.prefetch(bufferA, 0*32, nstrideAB);
@@ -251,12 +291,15 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
         0x0100 DS read      ds_read2_b64 x 16
         0x0008 MFMA         v_mfma_f32_32x32x8_f16 x 64
         0x0020 VMEM read    buffer_load_dwordx4 x 8
-        */
-#if 0
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 8, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 8, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64, 0);
-        __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 16, 0);
+        */ 
+#if 1
+        for(int i = 0; i < 8;i++) {
+            __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 5, 0);
+        }
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-40, 0);
+        //__builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 16, 0);
 #endif
         /*
 #if 0
