@@ -147,13 +147,28 @@ __global__ void __launch_bounds__(256, 1) xxxtile(int* A, int N, int * B) {
 }
 
 */
-__global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16* B, int nstrideAB, float* C, int nstrideC, int OuterK) {
+__global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(
+        __fp16* A, __fp16* B, int nstrideAB, float* C, int nstrideC,
+        int nblkK, int nblkM, int nblkN) {
     int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     int lane = threadIdx.x & 63;
 
-    A += blockIdx.y * 256 * nstrideAB;
-    B += blockIdx.x * 256 * nstrideAB;
-    C += blockIdx.x * 256 + blockIdx.y * 256 * nstrideC;
+    auto blk_index = blockIdx.x;
+#if 0
+    // naive block <-> CU mapping
+    auto blkY = blk_index / nblkN;
+    auto blkX = blk_index % nblkN;
+#else
+    // mapps blocks within same XCC/XCD closer
+    // here we assume CU's of 4 XCC/XCD distributed into a 2x2 Tile
+    auto xcc_id = blk_index & 3;
+    blk_index = blk_index >> 2;
+    auto blkY = (blk_index / (nblkN/2)) + (xcc_id >> 1)*(nblkM/2);
+    auto blkX = (blk_index % (nblkN/2)) + (xcc_id & 1)*(nblkN/2);
+#endif
+    A += blkY * 256 * nstrideAB;
+    B += blkX * 256 * nstrideAB;
+    C += blkX * 256 + blkY * 256 * nstrideC;
 
     BufferResource bufferA(A, 256*nstrideAB * sizeof(__fp16));
     BufferResource bufferB(B, 256*nstrideAB * sizeof(__fp16));
@@ -243,7 +258,7 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16
     copyA.prefetch(bufferA, 2*32, nstrideAB);
     copyB.prefetch(bufferB, 2*32, nstrideAB);
     
-    for(int ok = 0; ok < OuterK; ok += 2) {
+    for(int ok = 0; ok < nblkK; ok += 2) {
         __syncthreads();
 
         constexpr auto LDS0 = 0;
