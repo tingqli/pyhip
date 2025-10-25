@@ -75,7 +75,6 @@ static int32x4_t buffer_load_dwordx4(int32x4_t srsrc,
         lane0 lane1 lane2 lane3
         lane4 lane5 lane6 lane7 
         ... ...
-
 */
 
 template<int shift, int mask>
@@ -151,9 +150,10 @@ __global__ void __launch_bounds__(256, 1) xxxtile(int* A, int N, int * B) {
 __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(__fp16* A, __fp16* B, int nstrideAB, float* C, int nstrideC, int OuterK) {
     int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     int lane = threadIdx.x & 63;
-    auto i_off = (lane & 31) * 32;
-    auto k_off = (lane >> 5) * 4;
-    auto k_off8 = (lane >> 5) * 8;
+
+    A += blockIdx.y * 256 * nstrideAB;
+    B += blockIdx.x * 256 * nstrideAB;
+    C += blockIdx.x * 256 + blockIdx.y * 256 * nstrideC;
 
     BufferResource bufferA(A, 256*nstrideAB * sizeof(__fp16));
     BufferResource bufferB(B, 256*nstrideAB * sizeof(__fp16));

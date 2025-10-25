@@ -25,10 +25,11 @@ class torchPerf(object):
         print(self.profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
 
 class cudaPerf(object):
-    def __init__(self, flops, rw_bytes = 0):
+    def __init__(self, flops, rw_bytes = 0, name=""):
         global torch
         import torch
         self.flops = flops
+        self.name = name
         self.rw_bytes = rw_bytes
         self.ev_start = torch.cuda.Event(enable_timing=True)
         self.ev_end = torch.cuda.Event(enable_timing=True)
@@ -45,7 +46,7 @@ class cudaPerf(object):
         self.show(self.flops, self.rw_bytes)
 
     def show(self, flops = None, rw_bytes = None):
-        msg = f"dt = {self.dt_ms*1e3:.3f} us"
+        msg = f"{self.name} dt = {self.dt_ms*1e3:.3f} us"
         if flops and flops > 0:
             msg += f"  {flops*1e-9/self.dt_ms:.1f} TFLOPS "
         if rw_bytes and rw_bytes > 0:
