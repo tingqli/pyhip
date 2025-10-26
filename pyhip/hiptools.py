@@ -176,6 +176,7 @@ class module:
         self.src_fpath = src_fpath
         self.module_fpath = module_fpath
         self.kargs = get_all_kernel_args(module_fpath)
+        self.funcs = {}
     
     def __call__(self, func):
         '''
@@ -199,6 +200,9 @@ class module:
         '''
         w/o decorator on func, directly build wrapper from name
         '''
+        if func_name in self.funcs:
+            return self.funcs[func_name]
+
         if func_name not in self.kargs:
             raise Exception(f"Cannot find {func_name} in {self.module_fpath}, only found {list(self.kargs.keys())}")
 
@@ -208,4 +212,6 @@ class module:
 
         wrapper = amdhip_func(self.module_fpath, sym_name, func_name, arg_types)
         wrapper.__name__ = func_name
+
+        self.funcs[func_name] = wrapper
         return wrapper

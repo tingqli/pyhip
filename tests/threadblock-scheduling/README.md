@@ -7,6 +7,8 @@ some key points:
 
  - depending on LDS&register resource required by compiled kernel, concurrent waves/warps per-SIMD is ranging from 1 to 8 (for CDNA3), and this number is shown by compiler as `Occupancy [waves/SIMD]` when option `-Rpass-analysis=kernel-resource-usage` is specified in command-line;
 
- - kernel can do their own mapping between thread-block index and work-loads index to make best use of L2 cache, this technique is called `Threadblock Swizzling`
+  - `TG_ID` seems to be related to occupancy
 
- - `TG_ID` seems to be related to occupancy, but same (`TG_ID`,`SE_ID`,`CU_ID`) combination happens multiple(4x) times within a concurrent-launching-batch, so the ID alone cannot identify the CU
+  - `compete_cache` kernel was used to demonstrate that waves running on same XCC will compete for same L2-cache.
+
+  - to make waves sharing L2-cache (with overlapping cache foot-print) run on same XCC,  kernel can do their own mapping between thread-block index and work-loads index to increase L2-cache hitrate, this is called `Threadblock Swizzling`. But the best pattern dependens on HW wave scheduler's behaviour.
