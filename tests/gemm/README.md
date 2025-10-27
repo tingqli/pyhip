@@ -34,6 +34,11 @@ note:
  - to reach compute-bound, MFMA must be issued continously w/o any bubbles
  - long latency vmem instruction requires carefully scheduled w/o blocking other instruction's issue
 
+## LDS swizzle
+
+LDS's bandwidth can only meet MFMA's requirements if no bank-conflict happens, [swizzle-solver.py](./swizzle-solver.py) is used to simulate bank-conflict and try swizzle patterns.
+
+check [these tests](../bank-conflict/README.md) for details.
 
 ## thread-block swizzle
 [thread-block tests](../threadblock-scheduling/test.py) demonstrated the fact that thread blocks are dispatched by GPU HW according to some pre-determined pattern, in which some groups of thread-blocks will be on the same die with shared L2-cache, thread-block swizzle use this fact to map work-loads that accessing overlaping/shared data into same block-group, so they can benefit from same L2-cache and increase L2 hit-rate.
