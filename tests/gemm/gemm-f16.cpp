@@ -202,12 +202,23 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(
             }
         }
     };
-
     ABRegs a[2];
     ABRegs b[2];
     auto* Abuff_warp = Abuff + (warp_id >> 1)*32*4*lds_nstride;
     auto* Bbuff_warp = Bbuff + (warp_id & 1)*32*4*lds_nstride;
     float32x16 c[16] = {0};
+
+    auto mfma = [](ABRegs &a, ABRegs &b, float32x16 (&c)[16]) {
+        for(int ik = 0; ik < 4; ik += 1) {
+            for(int m = 0; m < 4; m++) {
+                for(int n = 0; n < 4; n ++) {
+                    auto i = m*4 + n;
+                    c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(
+                                a.regs[m].h[ik], b.regs[n].h[ik], c[i], 0, 0, 0);
+                }
+            }
+        }
+    };
 
     // prefetch(data0) to regs
     // store regs(data0) to LDS1
@@ -269,41 +280,24 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(
         copyA.prefetch(bufferA, (ok+3)*32, nstrideAB);
         copyB.prefetch(bufferB, (ok+3)*32, nstrideAB);
 
-        for(int ik = 0; ik < 4; ik += 1) {
-            for(int m = 0; m < 4; m++) {
-                for(int n = 0; n < 4; n ++) {
-                    auto i = m*4 + n;
-                    c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a[0].regs[m].h[ik], b[0].regs[n].h[ik], c[i], 0, 0, 0);
-                }
-            }
-            __builtin_amdgcn_sched_barrier(~SGB_MFMA_0x0008);
-        }
+        mfma(a[0], b[0], c);
         // as long as MFMA instruction issued, we can start READ a&b register for next iteration
         // and no need to worry about RAW ?
         a[1].load(Abuff_warp + LDS1);
         b[1].load(Bbuff_warp + LDS1);
 
+        //__builtin_amdgcn_sched_barrier(0);
         __syncthreads();
+        //asm volatile("s_waitcnt lgkmcnt(0)\n s_barrier\n");
 
         copyA.store<32>(Abuff + LDS1);
         copyB.store<32>(Bbuff + LDS1);
         copyA.prefetch(bufferA, (ok+4)*32, nstrideAB);
         copyB.prefetch(bufferB, (ok+4)*32, nstrideAB);
 
-        for(int ik = 0; ik < 4; ik += 1) {
-            for(int m = 0; m < 4; m++) {
-                for(int n = 0; n < 4; n ++) {
-                    auto i = m*4 + n;
-                    c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a[1].regs[m].h[ik], b[1].regs[n].h[ik], c[i], 0, 0, 0);
-                }
-            }
-            __builtin_amdgcn_sched_barrier(~SGB_MFMA_0x0008);
-        }
-        // as long as MFMA instruction issued, we can start READ a&b register for next iteration
-        // and no need to worry about RAW ?
+        mfma(a[1], b[1], c);
         a[0].load(Abuff_warp + LDS0);
         b[0].load(Bbuff_warp + LDS0);
-
 
         /*
         0x0200 DS write     ds_write_b128  x 8

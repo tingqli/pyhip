@@ -29,6 +29,9 @@ Download and open the generated pftrace file with https://ui.perfetto.dev/.
 thread trace: https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/amd-mainline/how-to/using-thread-trace.html
 
  - ROCm 7.x
+```bash
+$ docker run -it --rm --cap-add=SYS_ADMIN --network=host --device=/dev/kfd --device=/dev/dri  --cap-add=SYS_PTRACE --shm-size=4G --security-opt seccomp=unconfined --security-opt apparmor=unconfined -v ~/pyhip/:/pyhip --entrypoint /bin/bash rocm/pytorch:rocm7.0_ubuntu22.04_py3.10_pytorch_release_2.8.0 
+```
  - manually install [ROCprof trace decoder](https://github.com/ROCm/rocprof-trace-decoder/releases)
  - manually install [ROCprof Compute Viewer](https://github.com/ROCm/rocprof-compute-viewer/releases) on Windows to view results
  - use following example configs

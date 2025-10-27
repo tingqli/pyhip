@@ -49,10 +49,11 @@ def check_bank_conflict(lane_groups, offsets):
 
 
 class LDSTile2D:
-    def __init__(self, M, K, itemsize):
+    def __init__(self, M, K, itemsize, swizzle):
         self.M = M
         self.K = K
         self.itemsize = itemsize
+        self.swizzle = swizzle
         self.conflicts = 0
         self.NUM_BANKS = 32
         self.BANK_WIDTH = np.dtype(np.int32).itemsize
@@ -61,15 +62,16 @@ class LDSTile2D:
     def reset(self):
         self.access_map[:] = 0
 
-    def swizzle(self, row, col):
-        #return row, (col^(row//2))&(self.K-1)
-        return row, col
+    #def swizzle(self, row, col):
+    #    return row, (col^(row//2))&(self.K-1)
+    #    #return row, (col^(row))&(self.K-1)
+    #    return row, col
 
     def show_swizzle(self):
         reverse_swizzle = {}
         for row in range(self.M):
             for col in range(self.K):
-                phy_row, phy_col = self.swizzle(row, col)
+                phy_row, phy_col = self.swizzle(row, col, self.M, self.K)
                 reverse_swizzle[(phy_row, phy_col)] = (row, col)
 
         print("=" * 80)
@@ -111,7 +113,7 @@ class LDSTile2D:
 
                 assert logical_row >=0 and logical_row < self.M, f"logical_row {logical_row} not in [0, {self.M})"
                 assert logical_col >=0 and logical_col < self.K, f"logical_col {logical_col} not in [0, {self.K})"
-                physical_row, physical_col = self.swizzle(logical_row, logical_col)
+                physical_row, physical_col = self.swizzle(logical_row, logical_col, self.M, self.K)
                 assert physical_row >=0 and physical_row < self.M
                 assert physical_col >=0 and physical_col < self.K
 
@@ -179,33 +181,51 @@ class LDSTile2D:
         self.access(self.lane_groups_rb128, lane_rows, lane_cols)
         print(f"ds_read_b128(). total conflicts += {self.conflicts-conflicts0}")
 
+def simulate_b128_bank_conflict(LDS_M, LDS_K, mfma_M, swizzle):
+    lane = np.arange(0, WARP_SIZE)
 
-lds = LDSTile2D(32, 4, 16)
+    # item size is set to b128 (16 bytes)
+    lds = LDSTile2D(LDS_M, LDS_K, 16, swizzle)
+    print(f"================= ds_write_b128 for buffer_load_dwordx4 in K-major lane pattern")
+    lane_write_row = lane // LDS_K
+    lane_write_col = lane % LDS_K
+    assert WARP_SIZE % LDS_K == 0
+    bload_M = WARP_SIZE // LDS_K
+    assert bload_M >= 1, f"Assuming WARP_SIZE{WARP_SIZE} can cover one row at least"
+    for row_off in range(0, LDS_M, bload_M):
+        print(f"{row_off=}")
+        lds.ds_write_b128(lane_write_row + row_off, lane_write_col)
 
-def write_lane_coord(row0=0, col0=0):
-    row = []
-    col = []
-    for lane in range(0, WARP_SIZE):
-        row.append((lane // 4) + row0)
-        col.append((lane % 4) + col0)
-    return row, col
+    assert WARP_SIZE % mfma_M == 0
+    assert mfma_M == 32 or mfma_M == 16
+    mfma_K = WARP_SIZE // mfma_M
 
-print("================= ds_write_b128 ")
-# buffer_load_dwordx4
-lane = np.arange(0, WARP_SIZE)
-lane_write_row = lane // 4
-lane_write_col = lane % 4
+    print(f"================= ds_read_b128 for VMFMA {mfma_M}x{mfma_K}")
+    print(f"               mfma_K is in element of lanes, not related to A's dtype")
 
-lds.ds_write_b128(lane_write_row, lane_write_col)
-lds.ds_write_b128(lane_write_row + 16, lane_write_col)
+    lane_read_row = lane % mfma_M
+    lane_read_col = lane // mfma_M
 
-print("================= ds_read_b128 ")
-# VMFMA 32x32x8
-lane_read_row = lane % 32
-lane_read_col = lane // 32
-lds.ds_read_b128(lane_read_row, lane_read_col)
-lds.ds_read_b128(lane_read_row, lane_read_col + 2)
+    for row_off in range(0, LDS_M, mfma_M):
+        for col_off in range(0, LDS_K, mfma_K):
+            lds.ds_read_b128(lane_read_row + row_off, lane_read_col + col_off)
+    lds.show_swizzle()
+    assert lds.conflicts == 0
+    print(f"LDS 2D Tile ({LDS_M}, {LDS_K}, b128/half8/dowrd4): VMFMA {mfma_M}x{mfma_K} final LDS bank-conflicts: {lds.conflicts}")
 
 
+def swizzle1(row, col, max_rows, max_cols):
+    return row, (col^(row)) % max_cols
 
-lds.show_swizzle()
+def swizzle2(row, col, max_rows, max_cols):
+    return row, (col^(row//2)) % max_cols
+
+# 32x4(half8)
+simulate_b128_bank_conflict(32, 4, 32, swizzle2) # only swizzle2 works
+simulate_b128_bank_conflict(32, 4, 16, swizzle1) # both swizzle1/swizzle2 works
+simulate_b128_bank_conflict(32, 4, 16, swizzle2)
+
+# 64x4(half8)
+simulate_b128_bank_conflict(64, 4, 16, swizzle1) # both swizzle1/swizzle2 works
+simulate_b128_bank_conflict(64, 4, 16, swizzle2) 
+simulate_b128_bank_conflict(64, 4, 32, swizzle2) # only swizzle2 works
