@@ -8,7 +8,14 @@ from .asmtools import prettify
 
 @functools.cache
 def get_lib():
-    lib = ctypes.CDLL(find_library("amdhip64"))
+    try:
+        lib = ctypes.CDLL(find_library("amdhip64"))
+    except Exception as e:
+        print(e)
+        import torch
+        torch_amdhip64 = os.path.join(torch.__path__[0], "lib", "libamdhip64.so")
+        print(f"Try {torch_amdhip64} instead...")
+        lib = ctypes.CDLL(torch_amdhip64)
     lib.hipModuleLoad.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
     lib.hipModuleLoad.restype = ctypes.c_int32
     lib.hipModuleGetFunction.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p]
@@ -95,7 +102,7 @@ def amdgpu_arch():
     index = 0
     return gfx_archs.splitlines()[index].strip()
 
-def compile_hip_device_only(src_path):
+def compile_hip_device_only(src_path, extra_compiler_options):
     src_mtime = os.path.getmtime(src_path)
     pre, ext = os.path.splitext(src_path)
     assert ext == ".cpp" or ext == ".s"
@@ -105,7 +112,7 @@ def compile_hip_device_only(src_path):
     gfx_arch = amdgpu_arch()
 
     if os.getenv("DUMP_LL", None) is not None:
-        cmd1 = f"hipcc -x hip --offload-device-only --offload-arch={gfx_arch} -std=c++20 -I. -O2 {src_path} -S -emit-llvm -o {ll_path}"
+        cmd1 = f"hipcc -x hip --offload-device-only --offload-arch={gfx_arch} -std=c++20 -I. -O2 {src_path} {extra_compiler_options} -S -emit-llvm -o {ll_path}"
         print(cmd1)
         if os.system(cmd1) != 0:
             raise Exception("compilation 0 failed")
@@ -113,7 +120,7 @@ def compile_hip_device_only(src_path):
 
     if ext == ".cpp" and (not os.path.isfile(asm_path) or src_mtime > os.path.getmtime(asm_path)):
         # (re)compile into asm
-        cmd1 = f"hipcc -x hip --offload-device-only --offload-arch={gfx_arch} -std=c++20 -I. -O2 -Rpass-analysis=kernel-resource-usage {src_path} -S -o {asm_path}"
+        cmd1 = f"hipcc -x hip --offload-device-only --offload-arch={gfx_arch} -std=c++20 -I. -O2 {extra_compiler_options} -Rpass-analysis=kernel-resource-usage {src_path} -S -o {asm_path}"
         print(cmd1)
         if os.system(cmd1) != 0:
             raise Exception("compilation 1 failed")
@@ -161,7 +168,7 @@ Compile .s into .co and expose test_kernel as a python function
 '''
 
 class module:
-    def __init__(self, src_file_path):
+    def __init__(self, src_file_path, extra_compiler_options = ""):
         if os.path.isabs(src_file_path):
             src_fpath = src_file_path
         else:
@@ -169,7 +176,7 @@ class module:
             src_fpath = os.path.join(base_dir, src_file_path)
 
         if src_fpath.endswith(".cpp") or src_fpath.endswith(".s"):
-            module_fpath = compile_hip_device_only(src_fpath)
+            module_fpath = compile_hip_device_only(src_fpath, extra_compiler_options)
         else:
             module_fpath = src_fpath
 
