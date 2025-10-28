@@ -180,23 +180,19 @@ struct Warp_MFMA_AB {
     static constexpr int nM = BM / IM;
     static constexpr int nK = BK / IK;
 
-    union ABType {
-        // (M=32,K=8x4) halfs, each lane has 16 halfs
-        float16x4 h[nK]; // 32x8[x4]xhalfs
-        int32x4_t d[nK/2]; // 2 * 32x16xhalfs
-    } regs[nM];
+    float16x4 regs[nM][nK];
 
     template<int nstride>
     __device__ void load(__fp16 * buff) {
         int lane = threadIdx.x & 63;
         #pragma unroll
-        for(int ik = 0; ik < nK/2; ik ++) {
+        for(int ik = 0; ik < nK; ik +=2) {
             auto row = (lane & (IM-1));
-            auto col = swizzle_col<1,3>(row, (lane >> M_shift) + ik*2);
+            auto col = swizzle_col<1,3>(row, (lane >> M_shift) + ik);
             auto lane_off = row * nstride + col * 8;
             #pragma unroll
             for(int m = 0; m < nM; m++) {
-                regs[m].d[ik] = *(int32x4_t*)(buff + lane_off + m*32*nstride);
+                (int32x4_t&)(regs[m][ik]) = *(int32x4_t*)(buff + lane_off + m*32*nstride);
             }
         }
     }
@@ -204,7 +200,6 @@ struct Warp_MFMA_AB {
 
 using ABTile = WGTile<__fp16, 256, 32, 256>;
 using ABRegs = Warp_MFMA_AB<128, 32>;
-
 
 #define SGB_VMEM_read_0x0020 0x0020
 #define SGB_MFMA_0x0008      0x0008
@@ -245,7 +240,7 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(
                 for(int n = 0; n < 4; n ++) {
                     auto i = m*4 + n;
                     c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(
-                                a.regs[m].h[ik], b.regs[n].h[ik], c[i], 0, 0, 0);
+                                a.regs[m][ik], b.regs[n][ik], c[i], 0, 0, 0);
                     //asm("v_mfma_f32_32x32x8_f16 %0, %1, %2, %3\n"
                     //            : "+a"(c[i])
                     //            : "v"(a.regs[m].h[ik]), "v"(b.regs[n].h[ik]), "a"(c[i])
@@ -264,7 +259,6 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(
     tileB.prefetch(bufferB, 0*32, nstrideAB);
     tileA.store<32,swizzle>(Abuff);
     tileB.store<32,swizzle>(Bbuff);
-
     tileA.prefetch(bufferA, 1*32, nstrideAB);
     tileB.prefetch(bufferB, 1*32, nstrideAB);
 
@@ -276,7 +270,7 @@ __global__ void __launch_bounds__(256, 1) gemm_tile_256x256x32(
     tileA.prefetch(bufferA, 2*32, nstrideAB);
     tileB.prefetch(bufferB, 2*32, nstrideAB);
 
-    // body
+    // loop body
     for(int ok = 0; ok < nblkK; ok += 2) {
         __syncthreads();
 
