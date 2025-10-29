@@ -19,4 +19,5 @@
 || add alignment `8` to tensor view | 64.0T | generated code will use `buffer_load_dwordx4` instead of `buffer_load_ushort`|
 | swizzle | add swizzle for lds read/write | 84.2 T | avoid bank conflict using swizzle |
 | prefetch | prefetch next global tile | 116 T | global load will run parallel with compute |
+|| global prefetch 3 tiles, ds prefetch 1 tile | 117 T | |
 

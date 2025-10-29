@@ -115,7 +115,7 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
         tile_distribution_encoding<sequence<WAVE_M>, 
             // M=2x4xM of Gemm N=2xK of Gemm
             tuple<sequence<TILE_N / TILE_N_WAVE, TILE_N_WAVE / Gemm::kN>, sequence<TILE_K / Gemm::kK>>,
-            // wave parallel(M, N)
+            // wave parallel(M, N)?
             tuple<sequence<0, 1>>,
             tuple<sequence<0, 0>>,
             // repeatition
@@ -138,6 +138,8 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
         make_static_tile_distribution(b_dist));
 
     auto c_tensor = make_static_distributed_tensor<float>(make_static_tile_distribution(c_dist));
+    decltype(a_ds_read_win.load()) a_tensor0, a_tensor1;
+    decltype(b_ds_read_win.load()) b_tensor0, b_tensor1;
     clear_tile(c_tensor);
     constexpr auto a_warp_y_lengths =
         to_sequence(Gemm::AWarpDstr{}.get_ys_to_d_descriptor().get_lengths());
@@ -149,84 +151,127 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
     constexpr auto b_warp_y_index_zeros = uniform_sequence_gen_t<Gemm::BWarpDstr::NDimY, 0>{};
     constexpr auto c_warp_y_index_zeros = uniform_sequence_gen_t<Gemm::CWarpDstr::NDimY, 0>{};
 
-    // dram0->reg
+    auto gemm = [&] (auto&& a_tensor, auto&& b_tensor) {
+        static_for<0, TILE_K / Gemm::kK, 1>{}([&](auto k) {
+        static_for<0, TILE_M_WAVE / Gemm::kM, 1>{} ([&] (auto m) {
+            Gemm::AWarpTensor a;
+            a.get_thread_buffer() = a_tensor.get_y_sliced_thread_data(
+                        merge_sequences(sequence<m, k>{}, a_warp_y_index_zeros),
+                        merge_sequences(sequence<1, 1>{}, a_warp_y_lengths));
+            static_for<0, TILE_N_WAVE / Gemm::kN, 1>{} ([&] (auto n) {
+                Gemm::BWarpTensor b;
+                b.get_thread_buffer() = b_tensor.get_y_sliced_thread_data(
+                            merge_sequences(sequence<n, k>{}, b_warp_y_index_zeros),
+                            merge_sequences(sequence<1, 1>{}, b_warp_y_lengths));
+                Gemm::CWarpTensor c;
+                c.get_thread_buffer() = c_tensor.get_y_sliced_thread_data(
+                        merge_sequences(sequence<m, n>{}, c_warp_y_index_zeros),
+                        merge_sequences(sequence<1, 1>{}, c_warp_y_lengths));
+                Gemm{}(c, a, b);
+                c_tensor.set_y_sliced_thread_data(
+                    merge_sequences(sequence<m, n>{}, c_warp_y_index_zeros),
+                    merge_sequences(sequence<1, 1>{}, c_warp_y_lengths),
+                    c.get_thread_buffer());
+            });
+        });
+        });
+    };
+
+    // dram(block0)->reg
     auto a_dram_t = a_dram_win.load();
     auto b_dram_t = b_dram_win.load();
     move_tile_window(a_dram_win, {0, TILE_K});
     move_tile_window(b_dram_win, {0, TILE_K});
+    // reg(block0)->ds
+    a_ds_write_win.store(a_dram_t);
+    b_ds_write_win.store(b_dram_t);
 
-    while (k_blocks-- > 1) {
-        // reg->ds
+    // dram(block1)->reg
+    a_dram_t = a_dram_win.load();
+    b_dram_t = b_dram_win.load();
+    move_tile_window(a_dram_win, {0, TILE_K});
+    move_tile_window(b_dram_win, {0, TILE_K});
+
+    block_sync_lds();
+    // ds->reg0(block0)
+    a_tensor0 = a_ds_read_win.load();
+    b_tensor0 = b_ds_read_win.load();
+    block_sync_lds(); //?
+    // reg(block2)->ds
+    a_ds_write_win.store(a_dram_t);
+    b_ds_write_win.store(b_dram_t);
+
+    // dram(block2)->reg
+    a_dram_t = a_dram_win.load();
+    b_dram_t = b_dram_win.load();
+    move_tile_window(a_dram_win, {0, TILE_K});
+    move_tile_window(b_dram_win, {0, TILE_K});
+
+    while (k_blocks > 3) {
+        block_sync_lds();
+        // ds->reg1(block1)
+        a_tensor1 = a_ds_read_win.load();
+        b_tensor1 = b_ds_read_win.load();
+        // matmul(block0)
+        gemm(a_tensor0, b_tensor0);
+        block_sync_lds();
+
+        // reg(block2)->ds
         a_ds_write_win.store(a_dram_t);
         b_ds_write_win.store(b_dram_t);
-        // dram1->reg
+
+        // dram(block3)->reg
         a_dram_t = a_dram_win.load();
         b_dram_t = b_dram_win.load();
         move_tile_window(a_dram_win, {0, TILE_K});
         move_tile_window(b_dram_win, {0, TILE_K});
+
+        block_sync_lds();
+        // ds->reg0(block2)
+        a_tensor0 = a_ds_read_win.load();
+        b_tensor0 = b_ds_read_win.load();
+        // matmul(block1)
+        gemm(a_tensor1, b_tensor1);
         block_sync_lds();
 
-        // ds->reg
-        auto a_tensor = a_ds_read_win.load();
-        auto b_tensor = b_ds_read_win.load();
-        static_for<0, TILE_K / Gemm::kK, 1>{}([&](auto k) {
-        static_for<0, TILE_M_WAVE / Gemm::kM, 1>{} ([&] (auto m) {
-            Gemm::AWarpTensor a;
-            a.get_thread_buffer() = a_tensor.get_y_sliced_thread_data(
-                        merge_sequences(sequence<m, k>{}, a_warp_y_index_zeros),
-                        merge_sequences(sequence<1, 1>{}, a_warp_y_lengths));
-            static_for<0, TILE_N_WAVE / Gemm::kN, 1>{} ([&] (auto n) {
-                Gemm::BWarpTensor b;
-                b.get_thread_buffer() = b_tensor.get_y_sliced_thread_data(
-                            merge_sequences(sequence<n, k>{}, b_warp_y_index_zeros),
-                            merge_sequences(sequence<1, 1>{}, b_warp_y_lengths));
-                Gemm::CWarpTensor c;
-                c.get_thread_buffer() = c_tensor.get_y_sliced_thread_data(
-                        merge_sequences(sequence<m, n>{}, c_warp_y_index_zeros),
-                        merge_sequences(sequence<1, 1>{}, c_warp_y_lengths));
-                Gemm{}(c, a, b);
-                c_tensor.set_y_sliced_thread_data(
-                    merge_sequences(sequence<m, n>{}, c_warp_y_index_zeros),
-                    merge_sequences(sequence<1, 1>{}, c_warp_y_lengths),
-                    c.get_thread_buffer());
-            });
-        });
-        });
-        block_sync_lds();
+        // reg(block3)->ds
+        a_ds_write_win.store(a_dram_t);
+        b_ds_write_win.store(b_dram_t);
+
+        // dram(block4)->reg
+        a_dram_t = a_dram_win.load();
+        b_dram_t = b_dram_win.load();
+        move_tile_window(a_dram_win, {0, TILE_K});
+        move_tile_window(b_dram_win, {0, TILE_K});
+
+        k_blocks -= 2;
     }
     // tail
     {
-        // reg->ds
-        a_ds_write_win.store(a_dram_t);
-        b_ds_write_win.store(b_dram_t);
+        // tail - 3
+        block_sync_lds();
+        // ds->reg1(block3)
+        a_tensor1 = a_ds_read_win.load();
+        b_tensor1 = b_ds_read_win.load();
+        // matmul(block2)
+        gemm(a_tensor0, b_tensor0);
         block_sync_lds();
 
-        // ds->reg
-        auto a_tensor = a_ds_read_win.load();
-        auto b_tensor = b_ds_read_win.load();
-        static_for<0, TILE_K / Gemm::kK, 1>{}([&](auto k) {
-        static_for<0, TILE_M_WAVE / Gemm::kM, 1>{} ([&] (auto m) {
-            Gemm::AWarpTensor a;
-            a.get_thread_buffer() = a_tensor.get_y_sliced_thread_data(
-                        merge_sequences(sequence<m, k>{}, a_warp_y_index_zeros),
-                        merge_sequences(sequence<1, 1>{}, a_warp_y_lengths));
-            static_for<0, TILE_N_WAVE / Gemm::kN, 1>{} ([&] (auto n) {
-                Gemm::BWarpTensor b;
-                b.get_thread_buffer() = b_tensor.get_y_sliced_thread_data(
-                            merge_sequences(sequence<n, k>{}, b_warp_y_index_zeros),
-                            merge_sequences(sequence<1, 1>{}, b_warp_y_lengths));
-                Gemm::CWarpTensor c;
-                c.get_thread_buffer() = c_tensor.get_y_sliced_thread_data(
-                        merge_sequences(sequence<m, n>{}, c_warp_y_index_zeros),
-                        merge_sequences(sequence<1, 1>{}, c_warp_y_lengths));
-                Gemm{}(c, a, b);
-                c_tensor.set_y_sliced_thread_data(
-                    merge_sequences(sequence<m, n>{}, c_warp_y_index_zeros),
-                    merge_sequences(sequence<1, 1>{}, c_warp_y_lengths),
-                    c.get_thread_buffer());
-            });
-        });
-        });
+        // reg(block4)->ds
+        a_ds_write_win.store(a_dram_t);
+        b_ds_write_win.store(b_dram_t);
+
+        // tail - 2
+        block_sync_lds();
+        // ds->reg0(block4)
+        a_tensor0 = a_ds_read_win.load();
+        b_tensor0 = b_ds_read_win.load();
+        // matmul(block3)
+        gemm(a_tensor1, b_tensor1);
+
+        // tail - 1
+        if (k_blocks > 2)
+            gemm(a_tensor0, b_tensor0);
     }
     auto c_dram_win = make_tile_window(c_view, make_tuple(number<TILE_M>(), number<TILE_N>()), make_multi_index(m_block_idx * TILE_M, n_block_idx * TILE_N),
         make_static_tile_distribution(c_dist));
