@@ -1,7 +1,6 @@
 #include "ck_tile/core/config.hpp"
 #include "ck_tile/core.hpp"
 #include "ck_tile/ops/gemm/warp/warp_gemm.hpp"
-#include <__clang_hip_runtime_wrapper.h>
 #include <ck_tile/core/numeric/integral_constant.hpp>
 #include <ck_tile/core/arch/arch.hpp>
 #include <ck_tile/core/container/tuple.hpp>
@@ -37,8 +36,38 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
     auto b_view = make_naive_tensor_view<address_space_enum::global>(B, make_tuple(N, K), make_tuple(K, 1), number<8>(), number<1>());
     auto c_view = make_naive_tensor_view<address_space_enum::global>(C, make_tuple(M, N), make_tuple(N, 1), number<8>(), number<1>());
     __shared__ fp16_t share_buf[TILE_M * TILE_K + TILE_N * TILE_K];
-    auto a_ds_view = make_naive_tensor_view<address_space_enum::lds>(share_buf, make_tuple(TILE_M, TILE_K), make_tuple(TILE_K, 1));
-    auto b_ds_view = make_naive_tensor_view<address_space_enum::lds>(share_buf + TILE_M * TILE_K, make_tuple(TILE_N, TILE_K), make_tuple(TILE_K, 1));
+    // auto a_ds_view = make_naive_tensor_view<address_space_enum::lds>(share_buf, make_tuple(TILE_M, TILE_K), make_tuple(TILE_K, 1));
+    constexpr auto rows_per_banks = 32 * 4 / (TILE_K * sizeof(fp16_t)) >= 1 ? 32 * 4 / (TILE_K * sizeof(fp16_t)) : 1;
+    auto a_ds_desc0 = make_naive_tensor_descriptor(make_tuple(TILE_M / rows_per_banks, rows_per_banks * TILE_K / 8, 8), make_tuple(TILE_K * rows_per_banks, 8, 1));
+    auto a_ds_desc1 = transform_tensor_descriptor(a_ds_desc0, 
+        // k = k^(m % K)
+        make_tuple(make_xor_transform(make_tuple(TILE_M / rows_per_banks, rows_per_banks * TILE_K / 8)), make_pass_through_transform(number<8>())),
+        make_tuple(sequence<0, 1>(), sequence<2>()),
+        make_tuple(sequence<0, 1>(), sequence<2>()));
+    auto a_ds_desc2 = transform_tensor_descriptor(a_ds_desc1,
+        make_tuple(make_pass_through_transform(number<TILE_M / rows_per_banks>()), make_unmerge_transform(make_tuple(rows_per_banks, TILE_K / 8)), make_pass_through_transform(number<8>())),
+        make_tuple(sequence<0>(), sequence<1>(), sequence<2>()),
+        make_tuple(sequence<0>(), sequence<1, 2>(), sequence<3>()));
+    auto a_ds_desc = transform_tensor_descriptor(a_ds_desc2, 
+        make_tuple(make_merge_transform(make_tuple(TILE_M / rows_per_banks, rows_per_banks)), make_merge_transform(make_tuple(TILE_K / 8, 8))),
+        make_tuple(sequence<0, 1>(), sequence<2, 3>()),
+        make_tuple(sequence<0>(), sequence<1>()));
+    auto a_ds_view = make_tensor_view<address_space_enum::lds>(share_buf, a_ds_desc);
+    // auto b_ds_view = make_naive_tensor_view<address_space_enum::lds>(share_buf + TILE_M * TILE_K, make_tuple(TILE_N, TILE_K), make_tuple(TILE_K, 1));
+    auto b_ds_desc0 = make_naive_tensor_descriptor(make_tuple(TILE_N / rows_per_banks, rows_per_banks * TILE_K / 8, 8), make_tuple(TILE_K * rows_per_banks, 8, 1));
+    auto b_ds_desc1 = transform_tensor_descriptor(b_ds_desc0, 
+        make_tuple(make_xor_transform(make_tuple(TILE_N / rows_per_banks, rows_per_banks * TILE_K / 8)), make_pass_through_transform(number<8>())),
+        make_tuple(sequence<0, 1>(), sequence<2>()),
+        make_tuple(sequence<0, 1>(), sequence<2>()));
+    auto b_ds_desc2 = transform_tensor_descriptor(b_ds_desc1,
+        make_tuple(make_pass_through_transform(number<TILE_N / rows_per_banks>()), make_unmerge_transform(make_tuple(rows_per_banks, TILE_K / 8)), make_pass_through_transform(number<8>())),
+        make_tuple(sequence<0>(), sequence<1>(), sequence<2>()),
+        make_tuple(sequence<0>(), sequence<1, 2>(), sequence<3>()));
+    auto b_ds_desc = transform_tensor_descriptor(b_ds_desc2, 
+        make_tuple(make_merge_transform(make_tuple(TILE_M / rows_per_banks, rows_per_banks)), make_merge_transform(make_tuple(TILE_K / 8, 8))),
+        make_tuple(sequence<0, 1>(), sequence<2, 3>()),
+        make_tuple(sequence<0>(), sequence<1>()));
+    auto b_ds_view = make_tensor_view<address_space_enum::lds>(share_buf + TILE_M * TILE_K, b_ds_desc);
 
     auto n_blocks = N / TILE_N;
     auto k_blocks = K / TILE_K;
@@ -94,8 +123,10 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
     auto c_dist = detail::make_embed_tile_distribution_encoding(
         tile_distribution_encoding<sequence<>, 
             tuple<sequence<2, 4>, sequence<2, 4>>, 
+            // wave parrallel: N first, then M(from right to left)
             tuple<sequence<1, 2>>,
             tuple<sequence<0, 0>>, 
+            // repeatition: N first, then M
             sequence<1, 2>, 
             sequence<1, 1>>(),
         Gemm::CWarpDstrEncoding{});
