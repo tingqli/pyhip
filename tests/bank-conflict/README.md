@@ -1,3 +1,7 @@
+# LDS basics
+
+https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/pipeline-descriptions.html#desc-lds
+
 # Measuring bank-conflict behaviour
 
 according to [lds-bank-conflict](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html), `ds_read_b128` has non-trivial lane-group, but there is no documentation mentioned that. [test.py](./test.py) was designed to :
@@ -77,4 +81,5 @@ If VGPRs register pressure is big and no over-subscription (SIMD unit hyper-thre
    - call MFMA instructions
 
 But we found many un-neccessary `s_waitcnt vmcnt(0)` instructions following `buffer_load_dword lds` instructions, perhaps compiler failed to detect the independencies between these two stages, if we remove them from assembly files, we can see a great boost in performance.
+
 

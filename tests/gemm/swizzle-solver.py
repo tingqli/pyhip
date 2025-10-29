@@ -229,3 +229,6 @@ simulate_b128_bank_conflict(32, 4, 16, swizzle2)
 simulate_b128_bank_conflict(64, 4, 16, swizzle1) # both swizzle1/swizzle2 works
 simulate_b128_bank_conflict(64, 4, 16, swizzle2) 
 simulate_b128_bank_conflict(64, 4, 32, swizzle2) # only swizzle2 works
+
+
+simulate_b128_bank_conflict(64, 8, 16, swizzle1)

@@ -62,6 +62,8 @@ def add_gfx_msg(asm_line, line_no):
             kwargs["format"] = int(a[7:], 0)
         elif a in ["glc","slc","sc0","sc1","nt","idxen", "offen","lds"]:
             kwargs[a] = 1
+        elif a.startswith("src0_sel:") or a.startswith("src1_sel:"):
+            kwargs[a.split(":")[0]] = a.split(":")[1]
         else:
             list_args.append(a)
 
@@ -210,7 +212,7 @@ def s_load_(opcodes, sdst, sbase, soffset=0, offset=0, glc=0):
 
 
 @gfx_inst
-def v_cmp_(opcodes, vdst, src0, src1, clamp=None):
+def v_cmp_(opcodes, vdst, src0, src1, clamp=None, src0_sel="", src1_sel=""):
     op_to_sign = {"gt":">", "lt":"<", "ge":">=", "le":"<=", "eq":"==", "ne":"<>", "u":"not-orderable"}
     cmp_op = opcodes[0]
     dtype = opcodes[1]
@@ -218,7 +220,7 @@ def v_cmp_(opcodes, vdst, src0, src1, clamp=None):
     if cmp_op[0] == 'n' and len(cmp_op) == 3:
         cmp_op = cmp_op[1:]
         msg += " ! "
-    msg += f"({src0}.{dtype} {op_to_sign[cmp_op]} {src1}.{dtype})"
+    msg += f"({src0}.{dtype} {src0_sel} {op_to_sign[cmp_op]} {src1}.{dtype} {src1_sel})"
     return msg
 
 @gfx_inst

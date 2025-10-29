@@ -5,7 +5,7 @@
 #__builtin_amdgcn_mfma_f32_16x16x16f16
 
 M,N,K,B = 32,32,8,1
-#M,N,K,B = 16,16,16,1
+M,N,K,B = 16,16,16,1
 
 print(f"MNKB={M}x{N}x{K}_{B}")
 
@@ -41,7 +41,7 @@ def output_item_lane(i, j, b=0):
 print(f"Matrix C/D: each lane contain {H} rows")
 for i in range(0,M,H):
     item0, lane = output_item_lane(i, 0)
-    print(f"{i:2} item[{item0:2}:{item0+H:2}] : ", end="")
+    print(f"row {i:2}~{i+H:2} item[{item0:2}:{item0+H:2}] : ", end="")
     
     for j in range(N):
         item, lane = output_item_lane(i, j)

@@ -1,7 +1,7 @@
 import torch
 import pyhip
 
-torch.cuda.set_device(3)
+torch.cuda.set_device(7)
 torch.set_default_device('cuda')
 
 cur_gpu_device =torch.cuda.get_device_name()
@@ -13,13 +13,14 @@ hip = pyhip.module("test.cpp")
 # thus we can observe thread-block are launched in batch of 640 (80 CUs * 8 blocks/CU)
 # by looking at the 5'th column (walltime of start for each block)
 # 
-batch_size = 80+40
 
+occupancy = 1
+batch_size = (80+40)*occupancy
 info = torch.zeros(batch_size, 8, dtype=torch.int64)
 
 busy_time_us = 10
 # we split batch_size as two factor to confirm the block launching sequence
-hip.threadblock_test([batch_size],[256], busy_time_us*100, info.data_ptr(), force_occupancy=1)
+hip.threadblock_test([batch_size],[256], busy_time_us*100, info.data_ptr(), force_occupancy=occupancy)
 
 min_time = info[:, 5].min().item()
 info[:, 5] -= min_time
@@ -33,7 +34,7 @@ while True:
     t0 = (time_filter)
     t1 = (time_filter + 500)
 
-    summary = torch.full((NUM_XCC, NUM_SE, NUM_CU), -1, dtype=torch.int32)
+    summary = torch.full((NUM_XCC, NUM_SE, NUM_CU, occupancy), -1, dtype=torch.int32)
     count = 0
     for b in range(batch_size):
         il = info[b,:].tolist()
@@ -41,8 +42,14 @@ while True:
         if start >= t0 and start < t1:
             #print(XCC, SE, CU)
             count += 1
-            assert summary[XCC,SE,CU] == -1, "No CU is allocated more than 1 wave"
-            summary[XCC,SE,CU] = b
+            found_empty_slot = False
+            for occ in range(occupancy):
+                if summary[XCC,SE,CU,occ] == -1:
+                    summary[XCC,SE,CU,occ] = b
+                    found_empty_slot = True
+                    break
+            assert found_empty_slot, f"more threads on CU than {occupancy=}"
+            
 
     if count == 0: break
 
@@ -51,13 +58,12 @@ while True:
     for xcc in range(NUM_XCC):
         print(f"XCC{xcc}:")
         for se in range(NUM_SE):
-            item_ids = summary[xcc,se,:]
-            valid_cu_mask = "".join(["1" if i >= 0 else "0" for i in item_ids])
-            item_ids = item_ids[item_ids >= 0]
-            items = item_ids.tolist()
-            items.sort()
-            
-            print(f"\tSE{se} CU:{valid_cu_mask} : {items}")
+            print(f"\tSE{se}:\n")
+            for cu in range(NUM_CU):
+                item_ids = summary[xcc, se, cu, :]
+                items = item_ids[item_ids >= 0].tolist()
+                items.sort()
+                print(f"\t\tCU{cu}: {items}")
 
 print("============== test block's cache associativity ==============")
 print(" if two waves accessing two different 4MB buffers were executing on same XCC,")
@@ -84,7 +90,7 @@ while len(all_blocks) > 0:
                     d_sum.data_ptr(),
                     d_in1.data_ptr(),
                     d_in2.data_ptr(),
-                    num_elements, block0, block1, 0, force_occupancy=1)
+                    num_elements, block0, block1, 0, force_occupancy=2)
         l = p.dt(excludes=1)
         latencies.append(l)
         if 0:
