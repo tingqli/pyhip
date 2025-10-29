@@ -3,6 +3,13 @@
 
 # tips
  - install clangd extension in vscode and its intelligence should be helpful for writing ck code.
+ - use thread trace to get micro-arch level trace: ``
+ - use rocprof-compute to get bank conflict metric:
+ ```
+ rocprof-compute profile --no-roof -b 12 --name mytest -- python gemm-ck.py 0
+ rocprof-compute analyze -p workloads/mytest/MI308X/
+ ```
+ - dd
 
 # optimization gemm using ck
 | version | changes | performance | comment |
@@ -11,3 +18,5 @@
 || add `__launch_bounds__(256, 1)`| 22.0T |avoid spill: previous: `903`, now: `0`| 
 || add alignment `8` to tensor view | 64.0T | generated code will use `buffer_load_dwordx4` instead of `buffer_load_ushort`|
 | swizzle | add swizzle for lds read/write | 84.2 T | avoid bank conflict using swizzle |
+| prefetch | prefetch next global tile | 116 T | global load will run parallel with compute |
+
