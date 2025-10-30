@@ -177,101 +177,90 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
         });
     };
 
-    // dram(block0)->reg
+    // dram0->reg
     auto a_dram_t = a_dram_win.load();
     auto b_dram_t = b_dram_win.load();
     move_tile_window(a_dram_win, {0, TILE_K});
     move_tile_window(b_dram_win, {0, TILE_K});
-    // reg(block0)->ds
+    // reg(block0)->ds0
     a_ds_write_win.store(a_dram_t);
     b_ds_write_win.store(b_dram_t);
-
-    // dram(block1)->reg
-    a_dram_t = a_dram_win.load();
-    b_dram_t = b_dram_win.load();
-    move_tile_window(a_dram_win, {0, TILE_K});
-    move_tile_window(b_dram_win, {0, TILE_K});
 
     block_sync_lds();
-    // ds->reg0(block0)
+    // ds0->reg0(block0)
     a_tensor0 = a_ds_read_win.load();
     b_tensor0 = b_ds_read_win.load();
-    block_sync_lds(); //?
-    // reg(block2)->ds
-    a_ds_write_win.store(a_dram_t);
-    b_ds_write_win.store(b_dram_t);
 
-    // dram(block2)->reg
+    // dram1->reg
     a_dram_t = a_dram_win.load();
     b_dram_t = b_dram_win.load();
     move_tile_window(a_dram_win, {0, TILE_K});
     move_tile_window(b_dram_win, {0, TILE_K});
 
-    while (k_blocks > 3) {
+    while (k_blocks > 0) {
         block_sync_lds();
-        // ds->reg1(block1)
+        // reg(block1)->ds0
+        a_ds_write_win.store(a_dram_t);
+        b_ds_write_win.store(b_dram_t);
+        // dram2->reg
+        a_dram_t = a_dram_win.load();
+        b_dram_t = b_dram_win.load();
+        move_tile_window(a_dram_win, {0, TILE_K});
+        move_tile_window(b_dram_win, {0, TILE_K});
+        // ds0->reg1(block1)
         a_tensor1 = a_ds_read_win.load();
         b_tensor1 = b_ds_read_win.load();
-        // matmul(block0)
+        // matmul0
         gemm(a_tensor0, b_tensor0);
-        block_sync_lds();
 
-        // reg(block2)->ds
+        //block_sync_lds();
+
+        block_sync_lds();
+        // reg(block2)->ds0
         a_ds_write_win.store(a_dram_t);
         b_ds_write_win.store(b_dram_t);
-
-        // dram(block3)->reg
+        // dram3->reg
         a_dram_t = a_dram_win.load();
         b_dram_t = b_dram_win.load();
         move_tile_window(a_dram_win, {0, TILE_K});
         move_tile_window(b_dram_win, {0, TILE_K});
-
-        block_sync_lds();
-        // ds->reg0(block2)
+        // ds0->reg0(block2)
         a_tensor0 = a_ds_read_win.load();
         b_tensor0 = b_ds_read_win.load();
-        // matmul(block1)
+        // matmul1
         gemm(a_tensor1, b_tensor1);
-        block_sync_lds();
 
-        // reg(block3)->ds
-        a_ds_write_win.store(a_dram_t);
-        b_ds_write_win.store(b_dram_t);
-
-        // dram(block4)->reg
-        a_dram_t = a_dram_win.load();
-        b_dram_t = b_dram_win.load();
-        move_tile_window(a_dram_win, {0, TILE_K});
-        move_tile_window(b_dram_win, {0, TILE_K});
-
+        //block_sync_lds();
         k_blocks -= 2;
-    }
-    // tail
-    {
-        // tail - 3
-        block_sync_lds();
-        // ds->reg1(block3)
-        a_tensor1 = a_ds_read_win.load();
-        b_tensor1 = b_ds_read_win.load();
-        // matmul(block2)
-        gemm(a_tensor0, b_tensor0);
-        block_sync_lds();
+#define SGB_VMEM_read_0x0020 0x0020
+#define SGB_MFMA_0x0008      0x0008
+#define SGB_DS_read_0x0100   0x0100
+#define SGB_DS_write_0x0200  0x0200
+        for(int i = 0; i < 8; i++) {
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 4, 0);
+            //__builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
+        }
+        for(int i = 0; i < 16; i++) {
+            __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
+        }
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-5*8-16, 0);
 
-        // reg(block4)->ds
-        a_ds_write_win.store(a_dram_t);
-        b_ds_write_win.store(b_dram_t);
-
-        // tail - 2
-        block_sync_lds();
-        // ds->reg0(block4)
-        a_tensor0 = a_ds_read_win.load();
-        b_tensor0 = b_ds_read_win.load();
-        // matmul(block3)
-        gemm(a_tensor1, b_tensor1);
-
-        // tail - 1
-        if (k_blocks > 2)
-            gemm(a_tensor0, b_tensor0);
+        for(int i = 0; i < 8; i++) {
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 4, 0);
+            //__builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
+        }
+        for(int i = 0; i < 16; i++) {
+            __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
+        }
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-5*8-16, 0);
     }
     auto c_dram_win = make_tile_window(c_view, make_tuple(number<TILE_M>(), number<TILE_N>()), make_multi_index(m_block_idx * TILE_M, n_block_idx * TILE_N),
         make_static_tile_distribution(c_dist));
