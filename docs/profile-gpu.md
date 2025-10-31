@@ -16,6 +16,24 @@ Download & install both:
 /opt/nvidia/nsight-systems/2025.5.1/bin/nsys profile --trace=cuda python3 your-torch-script.py
 ```
 
+To profile at kernel level, we need install [NVIDIA Nsight Compute](https://developer.nvidia.com/nsight-compute-history) and using commond line tips shown [here](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#launching-nvidia-nsight-compute-from-a-cuda-kernel), for example:
+
+```bash
+
+# use nvidia-smi to check driver version
+Thu Oct 30 10:22:54 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.172.08             Driver Version: 570.172.08     CUDA Version: 12.8     |
+
+# download correct version of "NVIDIA Nsight Compute" from https://developer.nvidia.com/nsight-compute-history
+# Nsight System right-click prompt can tell us  --kernel-name --launch-skip  --launch-count to profile the exact kernel launch instance.
+/usr/local/NVIDIA-Nsight-Compute/ncu --kernel-name gemm_autotune_kernel --launch-skip 4 --launch-count 1 -o profile python3 example_gemm_autotune.py
+
+# copy the generated file profile.ncu-rep to Windows host and view it with Windows's version of Nsight-Compute
+
+```
+
+
 # AMDGPU: kernel level
 https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/latest/how-to/using-rocprofv3.html
 
