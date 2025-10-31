@@ -38,32 +38,32 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
     __shared__ fp16_t share_buf[TILE_M * TILE_K + TILE_N * TILE_K];
     // auto a_ds_view = make_naive_tensor_view<address_space_enum::lds>(share_buf, make_tuple(TILE_M, TILE_K), make_tuple(TILE_K, 1));
     constexpr auto rows_per_banks = 32 * 4 / (TILE_K * sizeof(fp16_t)) >= 1 ? 32 * 4 / (TILE_K * sizeof(fp16_t)) : 1;
-    auto a_ds_desc0 = make_naive_tensor_descriptor(make_tuple(TILE_M / rows_per_banks, rows_per_banks * TILE_K / 8, 8), make_tuple(TILE_K * rows_per_banks, 8, 1));
-    auto a_ds_desc1 = transform_tensor_descriptor(a_ds_desc0, 
+    constexpr auto a_ds_desc0 = make_naive_tensor_descriptor(make_tuple(TILE_M / rows_per_banks, rows_per_banks * TILE_K / 8, 8), make_tuple(TILE_K * rows_per_banks, 8, 1));
+    constexpr auto a_ds_desc1 = transform_tensor_descriptor(a_ds_desc0, 
         // k = k^(m % K)
         make_tuple(make_xor_transform(make_tuple(TILE_M / rows_per_banks, rows_per_banks * TILE_K / 8)), make_pass_through_transform(number<8>())),
         make_tuple(sequence<0, 1>(), sequence<2>()),
         make_tuple(sequence<0, 1>(), sequence<2>()));
-    auto a_ds_desc2 = transform_tensor_descriptor(a_ds_desc1,
+    constexpr auto a_ds_desc2 = transform_tensor_descriptor(a_ds_desc1,
         make_tuple(make_pass_through_transform(number<TILE_M / rows_per_banks>()), make_unmerge_transform(make_tuple(rows_per_banks, TILE_K / 8)), make_pass_through_transform(number<8>())),
         make_tuple(sequence<0>(), sequence<1>(), sequence<2>()),
         make_tuple(sequence<0>(), sequence<1, 2>(), sequence<3>()));
-    auto a_ds_desc = transform_tensor_descriptor(a_ds_desc2, 
+    constexpr auto a_ds_desc = transform_tensor_descriptor(a_ds_desc2, 
         make_tuple(make_merge_transform(make_tuple(TILE_M / rows_per_banks, rows_per_banks)), make_merge_transform(make_tuple(TILE_K / 8, 8))),
         make_tuple(sequence<0, 1>(), sequence<2, 3>()),
         make_tuple(sequence<0>(), sequence<1>()));
     auto a_ds_view = make_tensor_view<address_space_enum::lds>(share_buf, a_ds_desc);
     // auto b_ds_view = make_naive_tensor_view<address_space_enum::lds>(share_buf + TILE_M * TILE_K, make_tuple(TILE_N, TILE_K), make_tuple(TILE_K, 1));
-    auto b_ds_desc0 = make_naive_tensor_descriptor(make_tuple(TILE_N / rows_per_banks, rows_per_banks * TILE_K / 8, 8), make_tuple(TILE_K * rows_per_banks, 8, 1));
-    auto b_ds_desc1 = transform_tensor_descriptor(b_ds_desc0, 
+    constexpr auto b_ds_desc0 = make_naive_tensor_descriptor(make_tuple(TILE_N / rows_per_banks, rows_per_banks * TILE_K / 8, 8), make_tuple(TILE_K * rows_per_banks, 8, 1));
+    constexpr auto b_ds_desc1 = transform_tensor_descriptor(b_ds_desc0, 
         make_tuple(make_xor_transform(make_tuple(TILE_N / rows_per_banks, rows_per_banks * TILE_K / 8)), make_pass_through_transform(number<8>())),
         make_tuple(sequence<0, 1>(), sequence<2>()),
         make_tuple(sequence<0, 1>(), sequence<2>()));
-    auto b_ds_desc2 = transform_tensor_descriptor(b_ds_desc1,
+    constexpr auto b_ds_desc2 = transform_tensor_descriptor(b_ds_desc1,
         make_tuple(make_pass_through_transform(number<TILE_N / rows_per_banks>()), make_unmerge_transform(make_tuple(rows_per_banks, TILE_K / 8)), make_pass_through_transform(number<8>())),
         make_tuple(sequence<0>(), sequence<1>(), sequence<2>()),
         make_tuple(sequence<0>(), sequence<1, 2>(), sequence<3>()));
-    auto b_ds_desc = transform_tensor_descriptor(b_ds_desc2, 
+    constexpr auto b_ds_desc = transform_tensor_descriptor(b_ds_desc2, 
         make_tuple(make_merge_transform(make_tuple(TILE_M / rows_per_banks, rows_per_banks)), make_merge_transform(make_tuple(TILE_K / 8, 8))),
         make_tuple(sequence<0, 1>(), sequence<2, 3>()),
         make_tuple(sequence<0>(), sequence<1>()));
@@ -81,26 +81,25 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
     auto a_dram_win = make_tile_window(a_view, make_tuple(number<TILE_M>(), number<TILE_K>()), make_multi_index(m_block_idx * TILE_M, 0),
         make_static_tile_distribution(tile_distribution_encoding<sequence<>,
             tuple<sequence<4, 4, 16>, sequence<4, 8>>,
-            // wave distriutes in the outer most in M dimension, the distribution is [16, 4(x8)] for each wave
+            // order: repeat, interwave, intra-wave distribution is [16, 4(x8)]
             tuple<sequence<1>, sequence<1, 2>>,
-            tuple<sequence<0>, sequence<2, 0>>,
-            // repeation is second 4 in M dimension
+            tuple<sequence<1>, sequence<2, 0>>,
             sequence<1, 2>,
-            sequence<1, 1>>()));
+            sequence<0, 1>>()));
     auto b_dram_win = make_tile_window(b_view, make_tuple(number<TILE_N>(), number<TILE_K>()), make_multi_index(n_block_idx * TILE_N, 0),
         make_static_tile_distribution(tile_distribution_encoding<sequence<>,
             tuple<sequence<4, 4, 16>, sequence<4, 8>>,
             tuple<sequence<1>, sequence<1, 2>>,
-            tuple<sequence<0>, sequence<2, 0>>,
+            tuple<sequence<1>, sequence<2, 0>>,
             sequence<1, 2>,
-            sequence<1, 1>>()));
+            sequence<0, 1>>()));
     auto a_ds_write_win = make_tile_window(a_ds_view, make_tuple(number<TILE_M>(), number<TILE_K>()), make_multi_index(0, 0),
         a_dram_win.get_tile_distribution());
     auto b_ds_write_win = make_tile_window(b_ds_view, make_tuple(number<TILE_N>(), number<TILE_K>()), make_multi_index(0, 0),
         b_dram_win.get_tile_distribution());
 
-    using Gemm = WarpGemmMfmaF16F16F32M32N32K16TransposedCDistribution<>;
-    auto a_dist = detail::make_embed_tile_distribution_encoding(
+    using Gemm = WarpGemmMfmaF16F16F32M32N32K16<>;
+    constexpr auto a_dist = detail::make_embed_tile_distribution_encoding(
         tile_distribution_encoding<sequence<WAVE_N>, 
             // M=2x4xM of Gemm N=2xK of Gemm
             tuple<sequence<TILE_M / TILE_M_WAVE, TILE_M_WAVE / Gemm::kM>, sequence<TILE_K / Gemm::kK>>,
@@ -111,7 +110,7 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
             sequence<1, 2>,
             sequence<1, 0>>(),
         Gemm::AWarpDstrEncoding{});
-    auto b_dist = detail::make_embed_tile_distribution_encoding(
+    constexpr auto b_dist = detail::make_embed_tile_distribution_encoding(
         tile_distribution_encoding<sequence<WAVE_M>, 
             // M=2x4xM of Gemm N=2xK of Gemm
             tuple<sequence<TILE_N / TILE_N_WAVE, TILE_N_WAVE / Gemm::kN>, sequence<TILE_K / Gemm::kK>>,
@@ -122,7 +121,7 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
             sequence<1, 2>,
             sequence<1, 0>>(),
         Gemm::BWarpDstrEncoding{});
-    auto c_dist = detail::make_embed_tile_distribution_encoding(
+    constexpr auto c_dist = detail::make_embed_tile_distribution_encoding(
         tile_distribution_encoding<sequence<>, 
             tuple<sequence<2, 4>, sequence<2, 4>>, 
             // wave parallel: N first, then M(from right to left)
@@ -207,7 +206,7 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
         b_dram_t = b_dram_win.load();
         move_tile_window(a_dram_win, {0, TILE_K});
         move_tile_window(b_dram_win, {0, TILE_K});
-        // ds0->reg1(block1)
+                // ds0->reg1(block1)
         a_tensor1 = a_ds_read_win.load();
         b_tensor1 = b_ds_read_win.load();
         // matmul0
@@ -264,7 +263,7 @@ __device__ void gemm_tile_256x256x32(const fp16_t* A, const fp16_t* B, float* C,
     }
     auto c_dram_win = make_tile_window(c_view, make_tuple(number<TILE_M>(), number<TILE_N>()), make_multi_index(m_block_idx * TILE_M, n_block_idx * TILE_N),
         make_static_tile_distribution(c_dist));
-    
+
     store_tile(c_dram_win, c_tensor);
 }
 

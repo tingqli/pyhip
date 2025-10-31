@@ -9,7 +9,6 @@
  rocprof-compute profile --no-roof -b 12 --name mytest -- python gemm-ck.py 0
  rocprof-compute analyze -p workloads/mytest/MI308X/
  ```
- - dd
 
 # optimization gemm using ck
 | version | changes | performance | comment |
@@ -21,3 +20,4 @@
 | prefetch | prefetch next global tile | 116 T | global load will run parallel with compute |
 || global prefetch 3 tiles, ds prefetch 1 tile | 117 T | |
 | schedule | use `__builtin_amdgcn_sched_group_barrier` to interleave vmem/ds/mfma | 170 T | global prefetch 2 tiles |
+| wave layout | 4 waves load 16x32 than repeat 4 times instead of load 64x32; remove `transpose` in mfma | 200 T | work closer for 4 waves will be good for memory access; `transpose` will not be good for storing memory access.|
