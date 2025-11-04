@@ -38,3 +38,8 @@ hipcc -x hip --offload-device-only --offload-arch=gfx942 -std=c++20 -I.  -Rpass-
    - 当带有指令interleaving约束时，寄存器会被分配两份；
    - 当没有指令interleaving约束时，被连续的`MFMA`指令使用过的AB寄存器在`DS_READ_`指令处已经释放并可以复用, 最终原始代码中的两组寄存器就被大量重叠的映射到少的的多的寄存器；
 
+
+编译器的这种行为习惯表明：
+ - 除非手工使用`__builtin_amdgcn_sched_group_barrier()`约束`machine-scheduler`显式重排指令，  `machine-scheduler`步骤几乎完全不会为了增加issue而自动重新排列指令，因为这可能潜在导致后继物理寄存器占用量增加;
+ - 增加occupancy对这种情况有帮助，但是是以牺牲性能为代价的，因为会引入更多的冗余的数据搬运;
+ - 使用 inline `asm volatile` 可以更加显式的表达指令次序，因为这种汇编会完全绕开LLVM后端的各种优化逻辑，直接按照原始顺序映射为最终的汇编，但是这会导致开发者把代码书写的非常支离破碎; 详见[gemm-ilp.cpp](../tests/gemm/gemm-ilp.cpp)
