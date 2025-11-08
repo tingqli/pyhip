@@ -42,16 +42,6 @@ using float32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 using int32x16_t = __attribute__((__vector_size__(16 * sizeof(int)))) int;
 
-__device__ __inline__
-static uint buffer_load_dword(int32x4_t srsrc,
-                        int32_t voffset,
-                        int32_t soffset,
-                        int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.i32");
-__device__ __inline__
-static int32x4_t buffer_load_dwordx4(int32x4_t srsrc,
-                        int32_t voffset,
-                        int32_t soffset,
-                        int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
 using as3_uint32_ptr = __attribute__((address_space(3))) uint32_t *;
 union BufferResource {
     __device__ __inline__ constexpr BufferResource()
@@ -68,9 +58,6 @@ union BufferResource {
         uint32_t range;     // Byte range for the buffer resource
         uint32_t config;    // Constant, DFMT=32b
     };
-    __device__ __inline__ int32x4_t load_dwordx4(int32_t voffset, int32_t soffset) {
-        return buffer_load_dwordx4(descriptor, voffset, soffset, 0);
-    }
 };
 
 /*
