@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-/*
+/************************************************
 GEMM Kernel trait
 
 Workgroup size: 256
@@ -26,8 +26,16 @@ clang/include/clang/Basic/BuiltinsAMDGPU.def
 TARGET_BUILTIN(__builtin_amdgcn_mfma_f32_32x32x8f16, "V16fV4hV4hV16fIiIiIi", "nc", "mai-insts")
 TARGET_BUILTIN(__builtin_amdgcn_mfma_f32_16x16x16f16, "V4fV4hV4hV4fIiIiIi", "nc", "mai-insts")
 
-*/
+    Is `s_waitcnt_vmcnt` in C++ dangerous because you can't stop compiler from insertting more
+    VMEM-instructions between your-VMEMs & s_waitcnt_vmcnt?
+
+    No, if compiler inserts more VMEMs, it only means your `s_waitcnt_vmcnt<N>()` do not guarentee exact N VMEMs
+    is running, but it still guarentees your-VMEMs before N your-VMEMs are all finished.
+    same argument can be made to s_waitcnt_lgkmcnt<N>(). so program is still valid, but the extra waits may be incured.
+*************************************************/
+
 using float16x4 = __attribute__((__vector_size__(4 * sizeof(__fp16)))) __fp16;
+using float16x8 = __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16;
 using float16x32 = __attribute__((__vector_size__(32 * sizeof(__fp16)))) __fp16;
 using float32x16 = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 using float32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
@@ -134,7 +142,7 @@ __device__ void s_waitcnt_lgkmcnt() {
     threads: number of threads in work-group
 */
 using DWORD4 = int32x4_t;
-template<typename T, int rows, int cols, int nthreads>
+template<typename T, int rows, int cols, int nthreads, typename FSwizzle>
 struct WGTile {
     static_assert((sizeof(T) * cols) % sizeof(DWORD4) == 0, "cannot load a row using DWORD4");
 
@@ -179,11 +187,12 @@ struct WGTile {
         s_waitcnt_vmcnt<0>();
     }
 
-    template<int r, int nstride, typename F>
+    template<int r>
     __device__ void store(T* pdst) {
+        constexpr int nstride = cols;
         static_assert(r >=0 && r < num_dwordx4);
         auto row = (threadIdx.x >> lane_col_shift);
-        auto col = F::swizzle(row, threadIdx.x & (lane_cols-1));
+        auto col = FSwizzle::swizzle(row, threadIdx.x & (lane_cols-1));
         auto lane_offset = (col*sizeof(DWORD4)/sizeof(T) + row * nstride);
         constexpr int offset = r * wg_rows * nstride * sizeof(T);
         as3_uint32_ptr vaddr = (as3_uint32_ptr)(pdst + lane_offset);
@@ -191,16 +200,14 @@ struct WGTile {
         asm volatile("ds_write_b128 %[vaddr], %[vdata] offset:%[offset]"
                     ::[vaddr]"v"(vaddr), [vdata]"v"(data[r]), [offset]"i"(offset));
     }
-    template<int nstride, typename F>
+
     __device__ void store(T* pdst) {
-        store<0, nstride, F>(pdst);
-        store<1, nstride, F>(pdst);
-        store<2, nstride, F>(pdst);
-        store<3, nstride, F>(pdst);
+        store<0>(pdst);
+        store<1>(pdst);
+        store<2>(pdst);
+        store<3>(pdst);
         s_waitcnt_lgkmcnt<0>();
     }
-
-
 };
  
 #define NUM_THREADS 256
@@ -222,45 +229,36 @@ struct WGTile {
 #define BLK_N (INST_N * WARP_N * 2)
 #define BLK_K (INST_K * WARP_K)
 
-using ABTile = WGTile<__fp16, BLK_M, BLK_K, NUM_THREADS>;
+
 
 /*
-Warp level MFMA A/B register
+Warp level LDS Buffer view, each warp has it's own sub-tile
 */
-struct ABRegs {
-    static constexpr int M_shift = clog2(INST_M);
-    static constexpr int nM = WARP_M;
-    static constexpr int nK = WARP_K;
+template<typename T, int nCols, typename FSwizzle>
+struct LDS_buff {
+    T * base;
 
-    float16x4 regs[nM][nK];
+    __device__ LDS_buff(T * base) : base(base) {}
 
-    template<int ik, int m, int nstride, typename F>
-    __device__ void load(__fp16 * buff) {
+    // (m,k) is (row,col) in unit of 32x16 tile
+    template<int m, int k>
+    __device__ float16x8 MFMA_ld_32x16_fp16(int offset=0) {
+        constexpr int MFMA_M = 32;
+        constexpr int M_shift = clog2(MFMA_M);
+        float16x8 v;
         int lane = threadIdx.x & 63;
-        auto row = (lane & (INST_M-1));
-        auto col = F::swizzle(row, (lane >> M_shift) + ik * (INST_M == 32 ? 1:2));
-        auto lane_off = row * nstride + col * 8;
-        //(int32x4_t&)(regs[m][ik]) = *(int32x4_t*)(buff + lane_off + m*INST_M*nstride);
-        as3_uint32_ptr vaddr = (as3_uint32_ptr)(buff + lane_off + m*INST_M*nstride);
+        auto row = (lane & (MFMA_M-1));
+        auto col = FSwizzle::swizzle(row, (lane >> M_shift) + k * (MFMA_M == 32 ? 1:2));
+        auto lane_off = row * nCols + col * 8;
+        //(int32x4_t&)(regs[m][ik]) = *(int32x4_t*)(buff + lane_off + m*INST_M*nCols);
+        as3_uint32_ptr vaddr = (as3_uint32_ptr)(base + offset + lane_off + m*MFMA_M*nCols);
         asm volatile("ds_read_b128 %[vdst], %[vaddr] offset:%[offset]"
-                    : [vdst]"=v"((int32x4_t&)(regs[m][ik]))
+                    : [vdst]"=v"((int32x4_t&)(v))
                     : [vaddr]"v"(vaddr),[offset]"i"(0));
-    }
-
-    template<int nstride, typename F>
-    __device__ void load(__fp16 * buff) {
-        load<0, 0, nstride, F>(buff);
-        load<0, 1, nstride, F>(buff);
-        load<0, 2, nstride, F>(buff);
-        load<0, 3, nstride, F>(buff);
-
-        load<2, 0, nstride, F>(buff);
-        load<2, 1, nstride, F>(buff);
-        load<2, 2, nstride, F>(buff);
-        load<2, 3, nstride, F>(buff);
-        s_waitcnt_lgkmcnt<0>();
+        return v;
     }
 };
+
 
 __device__ void amdgcn_mfma_f32_32x32x8f16(float16x4 a, float16x4 b, float32x16& c) {
     //c = __builtin_amdgcn_mfma_f32_32x32x8f16(a, b, c, 0, 0, 0);
@@ -270,20 +268,11 @@ __device__ void amdgcn_mfma_f32_32x32x8f16(float16x4 a, float16x4 b, float32x16&
                 :);
 };
 
-template<int m, int n, int ik>
-__device__ void my_mfma_mnk(ABRegs &a, ABRegs &b, float32x16 (&c)[16]) {
+template<int m, int n, int k, int nM, int nN, int nK>
+__device__ void my_mfma_mnk(float16x4 (&a)[nM][nK], float16x4 (&b)[nN][nK], float32x16 (&c)[16]) {
     auto i = m*4 + n;
     //c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a.regs[m][ik], b.regs[n][ik], c[i], 0, 0, 0);
-    amdgcn_mfma_f32_32x32x8f16(a.regs[m][ik], b.regs[n][ik], c[i]);
-}
-
-template<int m, int ik>
-__device__ void my_mfma_mk(ABRegs &a, ABRegs &b, float32x16 (&c)[16]) {
-    //c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a.regs[m][ik], b.regs[n][ik], c[i], 0, 0, 0);
-    amdgcn_mfma_f32_32x32x8f16(a.regs[m][ik], b.regs[0][ik], c[m*4+0]);
-    amdgcn_mfma_f32_32x32x8f16(a.regs[m][ik], b.regs[1][ik], c[m*4+1]);
-    amdgcn_mfma_f32_32x32x8f16(a.regs[m][ik], b.regs[2][ik], c[m*4+2]);
-    amdgcn_mfma_f32_32x32x8f16(a.regs[m][ik], b.regs[3][ik], c[m*4+3]);
+    amdgcn_mfma_f32_32x32x8f16(a[m][k], b[n][k], c[i]);
 }
 
 #define SGB_VMEM_read_0x0020 0x0020
@@ -304,7 +293,7 @@ __global__ void __launch_bounds__(256, 1) gemm(__fp16* A, __fp16* B, int nstride
 #if 1
     blkX = blockIdx.x;
     blkY = blockIdx.y;
-    if (1)
+    if (0)
     {
         // 1 XCD
         auto blk_index = blockIdx.x + blockIdx.y * gridDim.x;
@@ -360,148 +349,138 @@ __global__ void __launch_bounds__(256, 1) gemm(__fp16* A, __fp16* B, int nstride
     BufferResource bufferA(A, BLK_M*nstrideAB * sizeof(__fp16));
     BufferResource bufferB(B, BLK_N*nstrideAB * sizeof(__fp16));
 
-    __shared__ __fp16 Abuff[BLK_M*BLK_K*2];
-    __shared__ __fp16 Bbuff[BLK_N*BLK_K*2];
-
+    __shared__ __fp16 Abuff[BLK_M*BLK_K];
+    __shared__ __fp16 Bbuff[BLK_N*BLK_K];
     constexpr int lds_nstride = BLK_K;
 
-    ABRegs a[2];
-    ABRegs b[2];
+#if INST_M == 32
+    using swizzle = SwizzleCol<1, 3>;
+#else
+    using swizzle = SwizzleCol<0, 7>;
+#endif
+
     auto* Abuff_warp = Abuff + (warp_id >> 1)*(INST_M * WARP_M)*BLK_K;
     auto* Bbuff_warp = Bbuff + (warp_id & 1)*(INST_N * WARP_N)*BLK_K;
 
+    LDS_buff<__fp16, lds_nstride, swizzle> ldsA0(Abuff_warp);
+    LDS_buff<__fp16, lds_nstride, swizzle> ldsA1(Abuff_warp + BLK_M*BLK_K);
+
+    LDS_buff<__fp16, lds_nstride, swizzle> ldsB0(Bbuff_warp);
+    LDS_buff<__fp16, lds_nstride, swizzle> ldsB1(Bbuff_warp + BLK_M*BLK_K);
+
+    float16x4 Aregs[WARP_M][WARP_K];
+    float16x4 Bregs[WARP_N][WARP_K];
+#if INST_M == 32
+    float32x16 c[16] = {0};
+#else
+    float32x4 c[16] = {0};
+#endif
+    using ABTile = WGTile<__fp16, BLK_M, BLK_K, NUM_THREADS, swizzle>;
     ABTile tileA;
     ABTile tileB;
 
-    // prelog
-#if INST_M == 32
-    float32x16 c[16] = {0};
-    using swizzle = SwizzleCol<1, 3>;
-#else
-    float32x4 c[16] = {0};
-    using swizzle = SwizzleCol<0, 7>;
-#endif
-    tileA.prefetch(bufferA, 0*BLK_K, nstrideAB);
-    tileB.prefetch(bufferB, 0*BLK_K, nstrideAB);
-    s_waitcnt_vmcnt<0>();
-    tileA.store<lds_nstride,swizzle>(Abuff);
-    tileB.store<lds_nstride,swizzle>(Bbuff);
-    tileA.prefetch(bufferA, 1*BLK_K, nstrideAB);
-    tileB.prefetch(bufferB, 1*BLK_K, nstrideAB);
-    s_waitcnt_vmcnt<0>();
+    #define MFMA(m,n,k) my_mfma_mnk<m, n, k>(Aregs, Bregs, c);
+    #define LDA(m,k)    (float16x8&)(Aregs[m][k]) = ldsA0.MFMA_ld_32x16_fp16<m, k>();
+    #define LDB(n,k)    (float16x8&)(Bregs[n][k]) = ldsB0.MFMA_ld_32x16_fp16<n, k>();
 
-    __syncthreads();
-
-    a[0].load<lds_nstride,swizzle>(Abuff_warp + 0);
-    b[0].load<lds_nstride,swizzle>(Bbuff_warp + 0);
-    tileA.store<lds_nstride,swizzle>(Abuff + BLK_M*BLK_K);
-    tileB.store<lds_nstride,swizzle>(Bbuff + BLK_M*BLK_K);
-    tileA.prefetch(bufferA, 2*BLK_K, nstrideAB);
-    tileB.prefetch(bufferB, 2*BLK_K, nstrideAB);
-    s_waitcnt_vmcnt<0>();
-
+    // prelog: before entering main loop, we need
+    //   - LDS contains A/B data at ok=0
+            tileA.prefetch(bufferA, 0*BLK_K, nstrideAB);
+            tileB.prefetch(bufferB, 0*BLK_K, nstrideAB);
+            s_waitcnt_vmcnt<0>();
+            tileA.store(Abuff);
+            tileB.store(Bbuff);
+            __syncthreads();
+    //   - prefetching A/B data at ok=1
+            tileA.prefetch(bufferA, 1*BLK_K, nstrideAB);
+            tileB.prefetch(bufferB, 1*BLK_K, nstrideAB);
+    //   - partially A/B registers has been loadded from LDS
+            LDA(0,0);    LDB(0,0);
+            LDA(1,0);    LDB(1,0);
+            LDA(2,0);    LDB(2,0);
+            LDA(3,0);    LDB(3,0);
     // loop body
-    for(int ok = 0; ok < nblkK; ok += 2) {
+    for(int ok = 0; ok < nblkK; ok ++) {
+        // Stage1 :
+        // ARegs(m=0,1,2,3, k=0/1) & BRegs(m=0,1,2,3, k=0/1) have been fetched into Registers, we can start MFMA directly
+        // w/o waitting initial LDS read arrival, and interleaving with the rest LDS reads ABRegs(k=2/3)
+        /*
+            MFMA has 4x4x4 = 64 instances
+        */
+
+        s_waitcnt_lgkmcnt<4>();
+        MFMA(0,0,0); LDA(0,2);
+        MFMA(0,1,0); LDB(0,2);
+        MFMA(1,0,0); LDA(1,2);
+        MFMA(1,1,0); LDB(1,2);
+
+        s_waitcnt_lgkmcnt<4>();
+        MFMA(0,2,0); LDA(2,2);
+        MFMA(0,3,0); LDB(2,2);
+        MFMA(1,2,0); LDA(3,2);
+        MFMA(1,3,0); LDB(3,2);
+        // extra time to ensure LDS reads are all done before enter stage2
+        MFMA(2,0,0);
+        MFMA(2,1,0);
+        MFMA(2,2,0);
+        MFMA(2,3,0);
+
+        MFMA(3,0,0);
+        MFMA(3,1,0);
+        MFMA(3,2,0);
+        MFMA(3,3,0);
+        s_waitcnt_lgkmcnt<0>();
+
+        // Stage2 : LDS has been read by all waves,
+        //          write data from next-iter & prefetch for next-next-iter
         __syncthreads();
+        #define LDW_PFA(row, m,k) \
+            s_waitcnt_vmcnt<7>(); \
+            tileA.store<row>(Abuff); \
+            MFMA(m,0,k); \
+            tileA.prefetch<row>(bufferA, (ok+2)*BLK_K, nstrideAB); \
+            MFMA(m,1,k); MFMA(m,2,k); MFMA(m,3,k);
 
-        constexpr auto LDS0 = 0;
-        constexpr auto LDS1 = BLK_M*BLK_K;
+        #define LDW_PFB(row, m,k) \
+            s_waitcnt_vmcnt<7>(); \
+            tileB.store<row>(Bbuff); \
+            MFMA(m,0,k); \
+            tileB.prefetch<row>(bufferB, (ok+2)*BLK_K, nstrideAB); \
+            MFMA(m,1,k); MFMA(m,2,k); MFMA(m,3,k);
 
-#define CODE_GEN1(tile, lds_buff, hbm_buff, row, m, k) \
-        s_waitcnt_vmcnt<7>(); \
-        tile.store<row, lds_nstride,swizzle>(lds_buff + LDS0); \
-        my_mfma_mnk<m, 0, k>(a[0], b[0], c); \
-        tile.prefetch<row>(hbm_buff, (ok+3)*BLK_K, nstrideAB); \
-        my_mfma_mnk<m, 1, k>(a[0], b[0], c); \
-        my_mfma_mnk<m, 2, k>(a[0], b[0], c); \
-        my_mfma_mnk<m, 3, k>(a[0], b[0], c);
+        LDW_PFA(0, 0, 1);
+        LDW_PFA(1, 1, 1);
+        LDW_PFA(2, 2, 1);
+        LDW_PFA(3, 3, 1);
 
-        CODE_GEN1(tileA, Abuff, bufferA, 0, 0, 0); my_mfma_mnk<0,0,2>(a[0], b[0], c); my_mfma_mnk<2,0,3>(a[0], b[0], c);
-        CODE_GEN1(tileA, Abuff, bufferA, 1, 1, 0); my_mfma_mnk<0,1,2>(a[0], b[0], c); my_mfma_mnk<2,1,3>(a[0], b[0], c);
-        CODE_GEN1(tileA, Abuff, bufferA, 2, 2, 0); my_mfma_mnk<0,2,2>(a[0], b[0], c); my_mfma_mnk<2,2,3>(a[0], b[0], c);
-        CODE_GEN1(tileA, Abuff, bufferA, 3, 3, 0); my_mfma_mnk<0,3,2>(a[0], b[0], c); my_mfma_mnk<2,3,3>(a[0], b[0], c);
-        CODE_GEN1(tileB, Bbuff, bufferB, 0, 0, 1); my_mfma_mnk<1,0,2>(a[0], b[0], c); my_mfma_mnk<3,0,3>(a[0], b[0], c);
-        CODE_GEN1(tileB, Bbuff, bufferB, 1, 1, 1); my_mfma_mnk<1,1,2>(a[0], b[0], c); my_mfma_mnk<3,1,3>(a[0], b[0], c);
-        CODE_GEN1(tileB, Bbuff, bufferB, 2, 2, 1); my_mfma_mnk<1,2,2>(a[0], b[0], c); my_mfma_mnk<3,2,3>(a[0], b[0], c);
-        CODE_GEN1(tileB, Bbuff, bufferB, 3, 3, 1); my_mfma_mnk<1,3,2>(a[0], b[0], c); my_mfma_mnk<3,3,3>(a[0], b[0], c);
-        
-        // mfma(a[0], b[0], c);
+        LDW_PFB(0, 0, 2);
+        LDW_PFB(1, 1, 2);
+        LDW_PFB(2, 2, 2);
+        LDW_PFB(3, 3, 2);
 
-        //my_mfma_mk<0,2>(a[0], b[0], c);
-        //my_mfma_mk<1,2>(a[0], b[0], c);
-
-        my_mfma_mnk<2, 0, 2>(a[0], b[0], c); a[1].load<0, 0, lds_nstride,swizzle>(Abuff_warp + LDS1);
-        my_mfma_mnk<2, 1, 2>(a[0], b[0], c); a[1].load<0, 1, lds_nstride,swizzle>(Abuff_warp + LDS1);
-        my_mfma_mnk<2, 2, 2>(a[0], b[0], c); a[1].load<0, 2, lds_nstride,swizzle>(Abuff_warp + LDS1);
-        my_mfma_mnk<2, 3, 2>(a[0], b[0], c); a[1].load<0, 3, lds_nstride,swizzle>(Abuff_warp + LDS1);
-
-        my_mfma_mnk<3, 0, 2>(a[0], b[0], c); a[1].load<2, 0, lds_nstride,swizzle>(Abuff_warp + LDS1);
-        my_mfma_mnk<3, 1, 2>(a[0], b[0], c); a[1].load<2, 1, lds_nstride,swizzle>(Abuff_warp + LDS1);
-        my_mfma_mnk<3, 2, 2>(a[0], b[0], c); a[1].load<2, 2, lds_nstride,swizzle>(Abuff_warp + LDS1);
-        my_mfma_mnk<3, 3, 2>(a[0], b[0], c); a[1].load<2, 3, lds_nstride,swizzle>(Abuff_warp + LDS1);
-
-        my_mfma_mnk<0, 0, 3>(a[0], b[0], c); b[1].load<0, 0, lds_nstride,swizzle>(Bbuff_warp + LDS1);
-        my_mfma_mnk<0, 1, 3>(a[0], b[0], c); b[1].load<0, 1, lds_nstride,swizzle>(Bbuff_warp + LDS1);
-        my_mfma_mnk<0, 2, 3>(a[0], b[0], c); b[1].load<0, 2, lds_nstride,swizzle>(Bbuff_warp + LDS1);
-        my_mfma_mnk<0, 3, 3>(a[0], b[0], c); b[1].load<0, 3, lds_nstride,swizzle>(Bbuff_warp + LDS1);
-
-        my_mfma_mnk<1, 0, 3>(a[0], b[0], c); b[1].load<2, 0, lds_nstride,swizzle>(Bbuff_warp + LDS1);
-        my_mfma_mnk<1, 1, 3>(a[0], b[0], c); b[1].load<2, 1, lds_nstride,swizzle>(Bbuff_warp + LDS1);
-        my_mfma_mnk<1, 2, 3>(a[0], b[0], c); b[1].load<2, 2, lds_nstride,swizzle>(Bbuff_warp + LDS1);
-        my_mfma_mnk<1, 3, 3>(a[0], b[0], c); b[1].load<2, 3, lds_nstride,swizzle>(Bbuff_warp + LDS1);
-
-        //my_mfma_mk<2,3>(a[0], b[0], c);
-       // my_mfma_mk<3,3>(a[0], b[0], c);
-
+        // Stage3: wait for LDS writes from all waves to finish, so we can read ABregs for next-iter in advance
+        // this also means we must finish using these ABregs before stage3
+        // MFMA(0..3, 0..3, 3);
+        s_waitcnt_lgkmcnt<0>();
         __syncthreads();
+        LDA(0,0);MFMA(0,0,3);    LDB(0,0);MFMA(0,1,3);
+        LDA(1,0);MFMA(0,2,3);    LDB(1,0);MFMA(0,3,3);
+        LDA(2,0);MFMA(1,0,3);    LDB(2,0);MFMA(1,1,3);
+        LDA(3,0);MFMA(1,2,3);    LDB(3,0);MFMA(1,3,3);
 
-#define CODE_GEN2(tile, lds_buff, hbm_buff, row, m, k) \
-        s_waitcnt_vmcnt<7>(); \
-        tile.store<row, lds_nstride,swizzle>(lds_buff + LDS1); \
-        my_mfma_mnk<m, 0, k>(a[1], b[1], c); \
-        tile.prefetch<row>(hbm_buff, (ok+4)*BLK_K, nstrideAB); \
-        my_mfma_mnk<m, 1, k>(a[1], b[1], c); \
-        my_mfma_mnk<m, 2, k>(a[1], b[1], c); \
-        my_mfma_mnk<m, 3, k>(a[1], b[1], c);
+        MFMA(2,0,3);
+        MFMA(2,1,3);
+        MFMA(2,2,3);
+        MFMA(2,3,3);
 
-        CODE_GEN2(tileA, Abuff, bufferA, 0, 0, 0); my_mfma_mnk<0,0,2>(a[1], b[1], c); my_mfma_mnk<2,0, 3>(a[1], b[1], c);
-        CODE_GEN2(tileA, Abuff, bufferA, 1, 1, 0); my_mfma_mnk<0,1,2>(a[1], b[1], c); my_mfma_mnk<2,1, 3>(a[1], b[1], c);
-        CODE_GEN2(tileA, Abuff, bufferA, 2, 2, 0); my_mfma_mnk<0,2,2>(a[1], b[1], c); my_mfma_mnk<2,2, 3>(a[1], b[1], c);
-        CODE_GEN2(tileA, Abuff, bufferA, 3, 3, 0); my_mfma_mnk<0,3,2>(a[1], b[1], c); my_mfma_mnk<2,3, 3>(a[1], b[1], c);
-
-        CODE_GEN2(tileB, Bbuff, bufferB, 0, 0, 1); my_mfma_mnk<1,0,2>(a[1], b[1], c); my_mfma_mnk<3,0, 3>(a[1], b[1], c);
-        CODE_GEN2(tileB, Bbuff, bufferB, 1, 1, 1); my_mfma_mnk<1,1,2>(a[1], b[1], c); my_mfma_mnk<3,1, 3>(a[1], b[1], c);
-        CODE_GEN2(tileB, Bbuff, bufferB, 2, 2, 1); my_mfma_mnk<1,2,2>(a[1], b[1], c); my_mfma_mnk<3,2, 3>(a[1], b[1], c);
-        CODE_GEN2(tileB, Bbuff, bufferB, 3, 3, 1); my_mfma_mnk<1,3,2>(a[1], b[1], c); my_mfma_mnk<3,3, 3>(a[1], b[1], c);
-
-        //mfma(a[1], b[1], c);
-
-        //my_mfma_mk<0,2>(a[1], b[1], c);
-        //my_mfma_mk<1,2>(a[1], b[1], c);
-
-        my_mfma_mnk<2, 0, 2>(a[1], b[1], c); a[0].load<0, 0, lds_nstride,swizzle>(Abuff_warp + LDS0);
-        my_mfma_mnk<2, 1, 2>(a[1], b[1], c); a[0].load<0, 1, lds_nstride,swizzle>(Abuff_warp + LDS0);
-        my_mfma_mnk<2, 2, 2>(a[1], b[1], c); a[0].load<0, 2, lds_nstride,swizzle>(Abuff_warp + LDS0);
-        my_mfma_mnk<2, 3, 2>(a[1], b[1], c); a[0].load<0, 3, lds_nstride,swizzle>(Abuff_warp + LDS0);
-
-        my_mfma_mnk<3, 0, 2>(a[1], b[1], c); a[0].load<2, 0, lds_nstride,swizzle>(Abuff_warp + LDS0);
-        my_mfma_mnk<3, 1, 2>(a[1], b[1], c); a[0].load<2, 1, lds_nstride,swizzle>(Abuff_warp + LDS0);
-        my_mfma_mnk<3, 2, 2>(a[1], b[1], c); a[0].load<2, 2, lds_nstride,swizzle>(Abuff_warp + LDS0);
-        my_mfma_mnk<3, 3, 2>(a[1], b[1], c); a[0].load<2, 3, lds_nstride,swizzle>(Abuff_warp + LDS0);
-
-        my_mfma_mnk<0, 0, 3>(a[1], b[1], c); b[0].load<0, 0, lds_nstride,swizzle>(Bbuff_warp + LDS0);
-        my_mfma_mnk<0, 1, 3>(a[1], b[1], c); b[0].load<0, 1, lds_nstride,swizzle>(Bbuff_warp + LDS0);
-        my_mfma_mnk<0, 2, 3>(a[1], b[1], c); b[0].load<0, 2, lds_nstride,swizzle>(Bbuff_warp + LDS0);
-        my_mfma_mnk<0, 3, 3>(a[1], b[1], c); b[0].load<0, 3, lds_nstride,swizzle>(Bbuff_warp + LDS0);
-
-        my_mfma_mnk<1, 0, 3>(a[1], b[1], c); b[0].load<2, 0, lds_nstride,swizzle>(Bbuff_warp + LDS0);
-        my_mfma_mnk<1, 1, 3>(a[1], b[1], c); b[0].load<2, 1, lds_nstride,swizzle>(Bbuff_warp + LDS0);
-        my_mfma_mnk<1, 2, 3>(a[1], b[1], c); b[0].load<2, 2, lds_nstride,swizzle>(Bbuff_warp + LDS0);
-        my_mfma_mnk<1, 3, 3>(a[1], b[1], c); b[0].load<2, 3, lds_nstride,swizzle>(Bbuff_warp + LDS0);
-
-        //my_mfma_mk<2,3>(a[1], b[1], c);
-        //my_mfma_mk<3,3>(a[1], b[1], c);
+        MFMA(3,0,3);
+        MFMA(3,1,3);
+        MFMA(3,2,3);
+        MFMA(3,3,3);
     }
+    // this wait can fix GPU Memory access fault
+    // maybe due to early termination before async loads return data to regs
+    s_waitcnt_vmcnt<0>();
 
 #if INST_M == 32
     for(int m = 0; m < 4; m++) {
