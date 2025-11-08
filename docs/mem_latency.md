@@ -1,11 +1,38 @@
-/* Memory loads latency
+# Memory loads latency
 
 When pipelining a for loop with data-load stages & computation stages, 
 we need rough memory access latency data to estimate how many cycles 
 in advance the data loads should be.
 
-Following code measures latency.
-*/
+Following code measures HBM & LDS reads latency using `s_memtime`. this markdown can be directly executed by:
+
+```bash
+python -m pyhip mem_latency.md
+```
+
+We can see:
+| mem type   |      latency(cycles)      |  throughput |
+|----------|:-------------:|------:|
+| HBM load |  700~800 |  |
+| LDS read (no bank-conflict) b128/b32 |    68/55   |    |
+| LDS read b128 (8-bank-conflict) | 120 |    |
+| LDS read b32 (full-bank-conflict) | 119 |    |
+
+### How these latency can be useful?
+
+It gives us guidance in manual pipelining process. for example, how many cycles in advance should we place the HBM/LDS loads before waitting for the results?
+
+<details>
+
+<summary>source codes</summary>
+
+### HIP device kernels
+ - inline asm volatile prevents compiler from changing the code
+ - `__builtin_amdgcn_sched_barrier` prevents compiler schedule unrelavant codes into the target assembly snippets.
+ - `s_memtime` is low-overhead cycle accurate self-profiling instruction.
+
+```c++
+
 #include <hip/hip_fp16.h> // for __fp16
 #include <hip/hip_bf16.h> // for bfloat16
 #include "hip/hip_runtime.h"
@@ -57,6 +84,18 @@ __device__ T ds_read_b128(T* base, int index) {
                 : [vaddr]"v"(vaddr),[offset]"i"(0));
     return v;
 }
+
+template<typename T>
+__device__ T ds_read_b32(T* base, int index) {
+    T v;
+    static_assert(sizeof(T) == sizeof(int32_t));
+    as3_uint32_ptr vaddr = (as3_uint32_ptr)(base + index);
+    asm volatile("ds_read_b32 %[vdst], %[vaddr] offset:%[offset]"
+                : [vdst]"=v"((int32_t&)(v))
+                : [vaddr]"v"(vaddr),[offset]"i"(0));
+    return v;
+}
+
 template<uint16_t cnt>
 __device__ void s_waitcnt_lgkmcnt() {
     asm volatile ("s_waitcnt lgkmcnt(%0)\n"::"i"(cnt));
@@ -131,9 +170,21 @@ __global__ __launch_bounds__(256, 1) void test(int* A, int K, int i0, int* indic
     }
     if (threadIdx.x == 0)
         printf(" ds_read_b128 latency cycles: %lu\n", dc/10);
-}
 
-/*PYHIP
+    dc = 0;
+    for(int i = 0; i < 10; i++) {
+        dc += get_cycles([&](){
+            ds_read_b32((int32_t*)lds, index);
+            s_waitcnt_lgkmcnt<0>();
+        });
+    }
+    if (threadIdx.x == 0)
+        printf(" ds_read_b32 latency cycles: %lu\n", dc/10);
+
+}
+```
+### Python HOST side
+```python
 
 import torch
 torch.set_printoptions(linewidth=300)
@@ -148,12 +199,13 @@ K=1024*1024*1024-1
 #A = torch.randn(K, dtype=torch.int32)
 A = torch.randint(0, K-4096, (K,), dtype=torch.int32)
 
-voff = [i*1 for i in range(64)]
+voff = [i*32 for i in range(64)]
 voff = torch.tensor(voff, dtype=torch.uint32)
 
 hip.test([1], [64], A.data_ptr(), K, 0, voff.data_ptr())
 hip.test([1], [64], A.data_ptr(), K, 1, voff.data_ptr())
 hip.test([1], [64], A.data_ptr(), K, 2, voff.data_ptr())
 hip.test([1], [64], A.data_ptr(), K, 3, voff.data_ptr())
+```
+</details>
 
-*/
