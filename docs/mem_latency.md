@@ -12,15 +12,17 @@ python -m pyhip mem_latency.md
 
 We got following measurements on MI308X @ 1-wave/CU *(LDS/HBM is exclusively used by one wave per CU)*:
 
-| mem type                             | latency(cycles) |  throughput/CU (cycles) |
-|--------------------------------------|----------------:|------------------------:|
-| HBM load  dwordx4                    | 500~800         |   ~32       |
-| LDS read (no bank-conflict) b128/b32 | 50/55           |  16/4       |
-| LDS read b32 (4-bank-conflict)       | 120             |    16       |
-| LDS read b32 (full-bank-conflict)    | 119             |  64/64      |
+| mem type                             | latency(cycles) |  throughput/CU (cycles) | throughput/CU (bytes/cycles) |
+|--------------------------------------|----------------:|------------------------:|-----------------------------:|
+| HBM load  dwordx4                    | 500~800         |   ~32                   |      32                      |
+| LDS read (no bank-conflict) b128/b32 | 64/52           |  16/4      [^1]         |      64/64 [^1]              |
+| LDS read b32 (4-bank-conflict)       | 120             |    16                   |      16                      |    
+| LDS read b32 (full-bank-conflict)    | 119             |  64/64                  |       4                      |
 
  - $latency = clock\_of[load_1, wait]$
  - $throughput = (clock\_of[load_1,load_2, ...., load_{11}, wait] - latency)/10 $
+
+[^1]: The doc says LDS's throughput is evenly divided between SIMD1&2 and SIMD3&4, since our test only uses 1 wave, the measured throughput of 16-cycles (or 64bytes/cycles) is actually just half of the real LDS capability.
 
 The measurements are consistent with [LDS desciption](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/pipeline-descriptions.html#desc-lds):
  - The doc says a single wavefront can get 64B/cycle from LDS, which is consistent with ds_read_b32 throughput 4 (4B*64/4cycles = 64B/cycle).
@@ -28,6 +30,26 @@ The measurements are consistent with [LDS desciption](https://rocm.docs.amd.com/
  - HBM load throughput `16B*64/32*80*GPU_freq = 2.56 TB/s/GHz` is roughly consistent with max HBM bandwidth.
 
 Normally to fully use the VALU/MatrixCore's power, at least 4 waves per CU will be launched, and throughput/wave will be 1/4 of the number above.
+
+# Example Usage in gemm
+
+Suppose we want to implement following GEMM kernel:
+ - 4 waves per CU
+ - using `v_mfma_f32_32x32x8_f16`, latency/throughput is 32 cycles
+ - each wave allocate 16(4x4) 32x32 C tiles, which is `128x128` floats accumulator registers, and just fit into `256x64` AccGPRs limitations.
+ - 4 waves make up a work-group (thread block), calculate a `2x2x(128x128)=256x256` C tile
+ - A/B tile are both in shape of `256x32`, and they are first loaded into LDS by 4 waves cooperatively, in memory-coalescing manner. then 4 waves load them into VGPR registers to feed to MFMA instruction.
+
+To design a pipeline, the latency/throughput data was considered as following:
+ - for each wave, the inner loop will do such gemm sub-problem : `128x32 @ 32x128 =+=> 128x128`, since each MFMA instruction do a small gemm of `32x8 @ 8x32 =+=> 32x32`, there will be `4*4*4=64` MFMA instructions, estimated total cycles are : `64*32=2048`
+ - meanwhile/in-parallel, 4 waves need to prefetch `256x32x2xsizeof(half)=32768 Bytes`, the HBM throughput `32B/cycle` tells us that HBM is capable of loading upto `2048*32=64KB` data within 2048 computation cycles. Thus the problem is indeed compute-bounded.
+ - considering HBM load latency of 500~800 cycles, we need to issue buffer load at least 800 cycles before we wait vmcnt and save the loaded data into LDS. and if we do HBM load using dwordx4 buffer load, and 4 waves together need to issue `32768/(64*16)=32` such loads, which is 8 dwordx4-load instructions per wave.
+ - These instructions are issued together by 4 waves, and the HW execution pipeline serving them are shared by all waves in CU, and it needs time to send these mem-access-request down the complex memory-subsystem, the rate at which these request are sent will not exceed the 32-cycles throughput we measured, which means if we issue multiple requests faster than `1-request/32-cycles`, the issue pipeline is likely to be blocked, and consider all requests from 4 waves are actually sharing this `1-request/32-cycles` limitation, for each wave we better issue at rate of `1/4-request per 32-cycles = 1-request per 4*32 cycles` to avoid issue-blocking. as result, the issuing of totally 8 such instructions should be evenly distributed into `8*4=32` MFMA instructions
+ - LDS write: .... ....(TO BE DONE)
+ - within each inner loop, each wave needs to reads two `128x32` tiles (A & B) from LDS into register to feed to MFMA, which is `128*32*2*sizeof(half)=16384 bytes` corresponds to 16 `ds_read_b128` instructions:
+   - these instructions have ~64 cycles of latency, thus need to be issued at leat 2 MFMA instructions ahead before the MFMA really using the load result.
+   - these instructions have ~8 cycles of throughput(when being issued from at least 2 SIMDs), so they can be interleaved with MFMA in 1:1 ratio. 4 waves would issue 4 ds_read_b128 within 32 cycles in total and just saturate the throughput rate of `1-ds_read_b128 per 8-cycles`
+
 
 <details>
 
