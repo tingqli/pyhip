@@ -10,22 +10,24 @@ Following code measures HBM & LDS reads latency using `s_memtime`. this markdown
 python -m pyhip mem_latency.md
 ```
 
-We got following measurements on MI308X:
+We got following measurements on MI308X @ 1-wave/CU *(LDS/HBM is exclusively used by one wave per CU)*:
 
-| mem type                             | latency(cycles) |  throughput |
-|--------------------------------------|----------------:|------------:|
+| mem type                             | latency(cycles) |  throughput/CU (cycles) |
+|--------------------------------------|----------------:|------------------------:|
 | HBM load  dwordx4                    | 500~800         |   ~32       |
 | LDS read (no bank-conflict) b128/b32 | 50/55           |  16/4       |
 | LDS read b32 (4-bank-conflict)       | 120             |    16       |
 | LDS read b32 (full-bank-conflict)    | 119             |  64/64      |
 
- - latency = clock_of(`load1(); wait(0)`)
- - throughput = (clock_of(`load1(); load2(); load3(); ....; load11(); wait(0)`) - latency)/10
+ - $latency = clock\_of[load_1, wait]$
+ - $throughput = (clock\_of[load_1,load_2, ...., load_{11}, wait] - latency)/10 $
 
 The measurements are consistent with [LDS desciption](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/pipeline-descriptions.html#desc-lds):
  - The doc says a single wavefront can get 64B/cycle from LDS, which is consistent with ds_read_b32 throughput 4 (4B*64/4cycles = 64B/cycle).
+ - at full bank-conflict(voff_stride=32), ds_read_b32 needs 64 cycles to get a new result in throughput mode, thus actual throughput of LDS is `4B*64/64cycles = 4B/cycles`, which means only 1 bank is working per cycle since all lanes fall into a single bank.
  - HBM load throughput `16B*64/32*80*GPU_freq = 2.56 TB/s/GHz` is roughly consistent with max HBM bandwidth.
 
+Normally to fully use the VALU/MatrixCore's power, at least 4 waves per CU will be launched, and throughput/wave will be 1/4 of the number above.
 
 <details>
 
@@ -305,10 +307,11 @@ voff_stride = 1 # no bank conflict for ds_read_b32 & ds_read_b128
 voff = [i*voff_stride for i in range(64)]
 voff = torch.tensor(voff, dtype=torch.uint32)
 
-hip.test([num_CU], [64], A.data_ptr(), per_CU_K, 0, voff.data_ptr())
-hip.test([num_CU], [64], A.data_ptr(), per_CU_K, 1, voff.data_ptr())
-hip.test([num_CU], [64], A.data_ptr(), per_CU_K, 2, voff.data_ptr())
-hip.test([num_CU], [64], A.data_ptr(), per_CU_K, 3, voff.data_ptr())
+threads = 64
+hip.test([num_CU], [threads], A.data_ptr(), per_CU_K, 0, voff.data_ptr())
+hip.test([num_CU], [threads], A.data_ptr(), per_CU_K, 1, voff.data_ptr())
+hip.test([num_CU], [threads], A.data_ptr(), per_CU_K, 2, voff.data_ptr())
+hip.test([num_CU], [threads], A.data_ptr(), per_CU_K, 3, voff.data_ptr())
 ```
 </details>
 
