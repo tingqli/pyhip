@@ -12,24 +12,25 @@ python -m pyhip mem_latency.md
 
 We got following measurements on MI308X @ 1-wave/CU *(LDS/HBM is exclusively used by one wave per CU)*:
 
-| mem type                             | latency(cycles) |  throughput/CU (cycles) | throughput/CU (bytes/cycles) |
-|--------------------------------------|----------------:|------------------------:|-----------------------------:|
-| HBM load  dwordx4                    | 500~800         |   ~32                   |      32                      |
-| LDS read (no bank-conflict) b128/b32 | 64/52           |  16/4      [^1]         |      64/64 [^1]              |
-| LDS read b32 (4-bank-conflict)       | 120             |    16                   |      16                      |    
-| LDS read b32 (full-bank-conflict)    | 119             |  64/64                  |       4                      |
-
- - $latency = clock\_of[load_1, wait]$
- - $throughput = (clock\_of[load_1,load_2, ...., load_{11}, wait] - latency)/10 $
+| mem type                             | latency(cycles) |  throughput/CU (cycles) | throughput/CU (bytes/cycles) | issue-cycle @4-waves/CU (cycles/instruction) |
+|--------------------------------------|----------------:|------------------------:|-----------------------------:|----------------------:|
+| HBM load  dwordx4                    | 500~800         |   ~32                   |      32                      |    32*4 = 128         |
+| LDS read (no bank-conflict) b128/b32 | 64/52           |  16/4      [^1]         |      64/64 [^1]              |    8*4 = 32           |
+| LDS read b32 (4-bank-conflict)       | 120             |    16                   |      16                      |                       |
+| LDS read b32 (full-bank-conflict)    | 119             |  64/64                  |       4                      |                       |
+ - $latency = clock_-of[load_1, wait]$
+ - $throughput_-cycles = (clock_-of[load_1,load_2, ...., load_{11}, wait] - latency)/10 $
+ - $issue_-cycle(num_-waves) = throughput_-cycles \times num_-waves $
 
 [^1]: The doc says LDS's throughput is evenly divided between SIMD1&2 and SIMD3&4, since our test only uses 1 wave, the measured throughput of 16-cycles (or 64bytes/cycles) is actually just half of the real LDS capability.
 
 The measurements are consistent with [LDS desciption](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/pipeline-descriptions.html#desc-lds):
+
  - The doc says a single wavefront can get 64B/cycle from LDS, which is consistent with ds_read_b32 throughput 4 (4B*64/4cycles = 64B/cycle).
  - at full bank-conflict(voff_stride=32), ds_read_b32 needs 64 cycles to get a new result in throughput mode, thus actual throughput of LDS is `4B*64/64cycles = 4B/cycles`, which means only 1 bank is working per cycle since all lanes fall into a single bank.
  - HBM load throughput `16B*64/32*80*GPU_freq = 2.56 TB/s/GHz` is roughly consistent with max HBM bandwidth.
-
-Normally to fully use the VALU/MatrixCore's power, at least 4 waves per CU will be launched, and throughput/wave will be 1/4 of the number above.
+ - Normally to fully use the VALU/MatrixCore's power, at least 4 waves per CU will be launched, and throughput/wave will be 1/4 of the number above.
+ - Issue-cycle: it makes no sense to issue at rates higher than attainable throughput, if we issue at higher rate and HW has no big enough FIFO to buffer these requests, it would block the whole issue-pipeline and prevent following potential unrelavant instructions from being issued. Thus we have issue-cycle to guide how instructions should be scheduled in final assembly. For example, in 4-waves-per-CU cases, buffer load dwordx4 should be issued at least every 128-cycles. ds_read_b128 should be issued at least every 32 cycles.
 
 # Example Usage in gemm
 
