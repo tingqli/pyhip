@@ -256,10 +256,10 @@ __device__ void amdgcn_mfma_f32_32x32x8f16(float16x4 a, float16x4 b, float32x16&
 };
 
 template<int m, int n, int k, int nM, int nN, int nK>
-__device__ void my_mfma_mnk(float16x4 (&a)[nM][nK], float16x4 (&b)[nN][nK], float32x16 (&c)[16]) {
+__device__ void my_mfma_mnk(float16x4 (&a)[nM][nK], float16x4 (&b)[nN][nK], float (&c)[16*16]) {
     auto i = m*4 + n;
     //c[i] = __builtin_amdgcn_mfma_f32_32x32x8f16(a.regs[m][ik], b.regs[n][ik], c[i], 0, 0, 0);
-    amdgcn_mfma_f32_32x32x8f16(a[m][k], b[n][k], c[i]);
+    amdgcn_mfma_f32_32x32x8f16(a[m][k], b[n][k], (float32x16&)(c[i*16]));
 }
 
 #define SGB_VMEM_read_0x0020 0x0020
@@ -358,10 +358,11 @@ __global__ void __launch_bounds__(256, 1) gemm(__fp16* A, __fp16* B, int nstride
     float16x4 Aregs[WARP_M][WARP_K];
     float16x4 Bregs[WARP_N][WARP_K];
 #if INST_M == 32
-    float32x16 c[16] = {0};
+    float c[16*16] = {0};
 #else
     float32x4 c[16] = {0};
 #endif
+
     using ABTile = WGTile<__fp16, BLK_M, BLK_K, NUM_THREADS, swizzle>;
     ABTile tileA;
     ABTile tileB;
@@ -377,7 +378,7 @@ __global__ void __launch_bounds__(256, 1) gemm(__fp16* A, __fp16* B, int nstride
             s_waitcnt_vmcnt<0>();
             tileA.store(Abuff);
             tileB.store(Bbuff);
-            __syncthreads();
+            __syncthreads(); 
     //   - prefetching A/B data at ok=1
             tileA.prefetch(bufferA, 1*BLK_K, nstrideAB);
             tileB.prefetch(bufferB, 1*BLK_K, nstrideAB);
@@ -470,20 +471,22 @@ __global__ void __launch_bounds__(256, 1) gemm(__fp16* A, __fp16* B, int nstride
     s_waitcnt_vmcnt<0>();
 
 #if INST_M == 32
+    #pragma unroll
     for(int m = 0; m < 4; m++) {
+        #pragma unroll
         for(int n = 0; n < 4; n ++) {
-            auto i = m*4 + n;
-            auto& v = c[i];
+            auto * pc = c + (m*4 + n)*16;
+            //auto& v = c[i*16];
             auto warp_off = (warp_id >> 1)*32*4*nstrideC + (warp_id & 1)*32*4;
             auto* p0 = C + ((lane>>5)*4)*nstrideC + (lane & 31) + m*32*nstrideC + n*32  + warp_off;
-
+            #pragma unroll
             for (int i=0; i < 4; i++, p0 += 8*nstrideC) {
                 auto* p = p0;
-                p[0] = v[i*4+0]; p += nstrideC;
-                p[0] = v[i*4+1]; p += nstrideC;
-                p[0] = v[i*4+2]; p += nstrideC;
-                p[0] = v[i*4+3]; p += nstrideC;
-            }
+                p[0] = pc[i*4+0]; p += nstrideC;
+                p[0] = pc[i*4+1]; p += nstrideC;
+                p[0] = pc[i*4+2]; p += nstrideC;
+                p[0] = pc[i*4+3]; p += nstrideC;
+            } 
         }
     }
 #else

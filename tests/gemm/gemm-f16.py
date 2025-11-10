@@ -4,7 +4,7 @@ import sys
 
 import torch
 torch.set_printoptions(linewidth=300)
-torch.cuda.set_device(5)
+torch.cuda.set_device(2)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
 cur_gpu_device =torch.cuda.get_device_name()
@@ -26,8 +26,8 @@ for CU_rows in range(int(num_CU**0.5), 2, -1):
         if gap == 0:
             break
 
-#BLK_M, BLK_N, BLK_K = 256, 256, 32
-BLK_M, BLK_N, BLK_K = 128, 128, 64
+BLK_M, BLK_N, BLK_K = 256, 256, 32
+#BLK_M, BLK_N, BLK_K = 128, 128, 64
 
 CU_rows = 8 #best_rows
 CU_cols = 10 #num_CU//CU_rows
@@ -65,7 +65,7 @@ if len(sys.argv) == 1:
         print(ref[:,0])
         print(out[:,0])
 
-for i in range(4):
+for i in range(2):
     with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name="gemm_tile"):
         gemm([(N//BLK_N), (M//BLK_M)],[256], A.data_ptr(), B.data_ptr(), StrideK, out.data_ptr(), N, K)
 

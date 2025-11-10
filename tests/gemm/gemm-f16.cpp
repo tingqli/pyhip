@@ -174,7 +174,7 @@ struct WGTile {
  
 #define NUM_THREADS 256
 
-#if 0
+#if 1
     #define INST_M 32
     #define INST_N 32
     #define INST_K 8
@@ -436,39 +436,43 @@ __global__ void __launch_bounds__(256, 1) gemm(__fp16* A, __fp16* B, int nstride
             __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
             __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 1, 0);
             __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
-            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 4, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 2, 0);
             //__builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 2, 0);
         }
         for(int i = 0; i < 16; i++) {
             __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
-            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 2, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
         }
-        //__builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-5*8-16, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-5*8-16, 0);
 
         for(int i = 0; i < 8;i++) {
             __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
             __builtin_amdgcn_sched_group_barrier(SGB_DS_write_0x0200, 1, 0);
             __builtin_amdgcn_sched_group_barrier(SGB_VMEM_read_0x0020, 1, 0);
-            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 4, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 2, 0);
             //__builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 2, 0);
         }
         for(int i = 0; i < 16; i++) {
             __builtin_amdgcn_sched_group_barrier(SGB_DS_read_0x0100, 1, 0);
-            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 2, 0);
+            __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 1, 0);
         }
-        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-5*8-2*16, 0);
+        __builtin_amdgcn_sched_group_barrier(SGB_MFMA_0x0008, 64-5*8-16, 0);
 #endif
 #endif
     }
 
 #if INST_M == 32
+    #pragma unroll
     for(int m = 0; m < 4; m++) {
+        #pragma unroll
         for(int n = 0; n < 4; n ++) {
             auto i = m*4 + n;
             auto& v = c[i];
             auto warp_off = (warp_id >> 1)*32*4*nstrideC + (warp_id & 1)*32*4;
             auto* p0 = C + ((lane>>5)*4)*nstrideC + (lane & 31) + m*32*nstrideC + n*32  + warp_off;
-
+            #pragma unroll
             for (int i=0; i < 4; i++, p0 += 8*nstrideC) {
                 auto* p = p0;
                 p[0] = v[i*4+0]; p += nstrideC;
