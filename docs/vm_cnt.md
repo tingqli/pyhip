@@ -12,6 +12,8 @@ This also suggests that:
 
  - Maybe we can guess the same for 4-bit `LGKMcnt`. only 16 LDS requests can be run on-the-fly, but considering the super-fast throughput of LDS, that causes no stall most-likely.
 
+Further tests using [rocprofiler thread-trace](https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/develop/how-to/using-thread-trace.html) (need to uncomment the `Random Access` line) shows that if we issue VMEM continously, the 24'th VMEM load will stall the issue pipe which is even earlier than expected.
+
 <details>
 
 <summary>source codes</summary>
@@ -69,22 +71,34 @@ __device__ T buffer_load_dword(BufferResource& buffer, int soffset, int voffset)
     return v;
 }
 
+// constexpr伪随机数生成函数
+constexpr uint32_t nextRandom(uint32_t seed, uint32_t max_mask) {
+    constexpr uint32_t a = 1664525;
+    constexpr uint32_t c = 1013904223;
+    //constexpr unsigned long m = 4294967295; // 2^32 - 1
+    return (a * seed + c) & max_mask;
+}
+
 __global__ __launch_bounds__(256, 1) void test(int* A, int cnt, int *matched) {
     BufferResource buff(A, cnt*sizeof(int));
     int voffset = threadIdx.x * sizeof(int);
     constexpr int NUM_VALUES = 128;
     int value[NUM_VALUES];
 
+    A += blockIdx.x * cnt;
+    matched += blockIdx.x * 64;
     auto clear = [&](){
         for(int i = 0; i < NUM_VALUES; i++) value[i] = 0;
     };
     {
-        constexpr int N = 4096;
+        constexpr int N = 128;
         constexpr int waitN = 63;
         clear();
+        asm volatile("buffer_inv sc0 sc1\n");
         s_waitcnt_vmcnt<0>();
         __builtin_amdgcn_sched_barrier(0);
         compile_time_loop<N>([&](auto i){
+            //constexpr int index = nextRandom(i, (8192*8)-1);     // Random Access
             constexpr int index = i;
             constexpr int ti = i & (NUM_VALUES - 1);
             value[ti] = buffer_load_dword<int>(buff, index*64*sizeof(int), voffset);
@@ -112,14 +126,15 @@ torch.set_printoptions(linewidth=300)
 torch.cuda.set_device(2)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
+num_CU = torch.cuda.get_device_properties().multi_processor_count
 
 magic_num = 1234
-cnt = 64*81920
+cnt = 64*8192*8
 
 for i in range(10):
-    A = torch.arange(0, cnt, dtype=torch.int32)
-    B = torch.zeros([64], dtype=torch.int32)
-    hip.test([1], [64], A.data_ptr(), cnt, B.data_ptr())
+    A = torch.arange(0, num_CU*cnt, dtype=torch.int32)
+    B = torch.zeros([num_CU*64], dtype=torch.int32)
+    hip.test([num_CU], [64], A.data_ptr(), cnt, B.data_ptr())
     print(B[0].item()//64)
 
 ```
