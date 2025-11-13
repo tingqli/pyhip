@@ -483,7 +483,9 @@ __global__ void __launch_bounds__(256, 1) gemm(__fp16* A, __fp16* B, int nstride
         }
     }
 #else
+    #pragma unroll
     for(int m = 0; m < 4; m++) {
+        #pragma unroll
         for(int n = 0; n < 4; n ++) {
             auto i = m*4 + n;
             auto& v = c[i];

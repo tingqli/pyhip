@@ -54,7 +54,14 @@ if __name__ == "__main__":
 
     hip_code, python_code = extract_sources(src_file_path)
 
-    with tempfile.NamedTemporaryFile(suffix=".cpp") as tmp_cpp:
+    if args.verbose:
+        print(f"=============== python_code:")
+        print(python_code)
+
+    with tempfile.NamedTemporaryFile(suffix=".cpp", delete=not args.verbose) as tmp_cpp:
         tmp_cpp.write(hip_code.encode())
-        hip = module(tmp_cpp.name)
+        tmp_cpp.flush()
+        if args.verbose:
+            print(f"=============== hip_code: {tmp_cpp.name}")
+        hip = module(tmp_cpp.name, "-fbracket-depth=20480")
         exec(python_code, {"hip":hip})
