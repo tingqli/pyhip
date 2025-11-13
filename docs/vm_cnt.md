@@ -4,9 +4,8 @@ We want to find out the max possible VM_CNT that can be tracked by AMDGPU, we do
 
 But our test shows that even we issued 4096 buffer-loads, and wait for 63 loads on the fly, the data before last-63 loads was indeed loaded into the register, this feature seems to track much more loads than we thought. OR it's more likely implemented in another simple way:
 
-```txt
-It has an internal queue with only 64 (the VM_CNT stored in 6-bits) entries, any VMEM requests more than 64 will stall the issue pipe, thus HW tracks no more than 64 VMEM-requests.
-```
+**It has an internal queue with only 64 (the VM_CNT stored in 6-bits) entries, any VMEM requests more than 64 will stall the issue pipe, thus HW tracks no more than 64 VMEM-requests.**
+
 
 This also suggests that:
  - if any wave try to issue another VMEM while 64 concurrent VMEMs already on-the-fly, the wave has to stall (or switch out).
