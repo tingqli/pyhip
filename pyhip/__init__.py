@@ -59,3 +59,39 @@ class cudaPerf(object):
         if rw_bytes and rw_bytes > 0:
             msg += f"  {rw_bytes*1e-6/self.dt_ms:.1f} GB/s "
         print(msg)
+
+class cuPerf(object):
+    def __init__(self, flops = 0, batch = 0, rw_bytes = 0, name="", filter=None, verbose=1):
+        global torch
+        import torch
+        self.is_enabled = name.startswith(filter)
+        if self.is_enabled :
+            self.filter = filter
+            self.flops = flops
+            self.name = name
+            self.batch = batch
+            self.verbose = verbose
+            self.rw_bytes = rw_bytes
+            self.ev_start = torch.cuda.Event(enable_timing=True)
+            self.ev_end = torch.cuda.Event(enable_timing=True)
+            self.latencies = []
+
+    def __enter__(self):
+        if self.is_enabled:
+            torch.cuda._sleep(1_000_000)
+            self.ev_start.record()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        if self.is_enabled:
+            self.ev_end.record()
+            torch.cuda.synchronize()
+            self.dt_ms = self.ev_start.elapsed_time(self.ev_end)
+            msg = f"{self.name} dt = {self.dt_ms*1e3:.3f} us"
+            if self.batch > 0:
+                msg += f"  {self.dt_ms/self.batch:.3f} ms/item x {self.batch} "
+            if self.flops and self.flops > 0:
+                msg += f"  {self.flops*1e-9/self.dt_ms:.1f} TFLOPS "
+            if self.rw_bytes and self.rw_bytes > 0:
+                msg += f"  {self.rw_bytes*1e-6/self.dt_ms:.1f} GB/s "
+            print(msg)
