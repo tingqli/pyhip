@@ -92,7 +92,7 @@ def add_gfx_msg(asm_line, line_no):
         print("opcodes   :\t",opcodes)
         print("list_args :\t",list_args)
         print("kwargs    :\t",kwargs)
-        raise
+        return asm_line
     asm_line = asm_line.rstrip()
     cols = len(asm_line)
     align_to_col = 50

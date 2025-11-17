@@ -14,7 +14,8 @@ We got following measurements on MI308X @ 1-wave/CU *(LDS/HBM is exclusively use
 
 | mem type                             | latency(cycles) |  throughput/CU (cycles) | throughput/CU (bytes/cycles) | issue-cycle @4-waves/CU (cycles/instruction) |
 |--------------------------------------|----------------:|------------------------:|-----------------------------:|----------------------:|
-| HBM load  dwordx4                    | 500~800         |   ~32                   |      32                      |    32*4 = 128         |
+| buffer load  dwordx4                 | 500~800         |   ~32                   |      32                      |    32*4 = 128         |
+| buffer load  dword lds               | 500~800         |   ~11                   |      23                      |    11*4 = 44          |
 | LDS read (no bank-conflict) b128/b32 | 64/52           |  16/4      [^1]         |      64/64 [^1]              |    8*4 = 32           |
 | LDS read b32 (4-bank-conflict)       | 120             |    16                   |      16                      |                       |
 | LDS read b32 (full-bank-conflict)    | 119             |  64/64                  |       4                      |                       |
@@ -139,6 +140,13 @@ __device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffse
         :[vaddr]"v"(voffset), [srsrc]"s"(buffer.descriptor), [soffset]"s"(soffset));
     return v;
 }
+
+template<int imm_off>
+__device__ void buffer_load_dword_lds(BufferResource& buffer, int soffset, int voffset) {
+    asm volatile("buffer_load_dword %[vaddr], %[srsrc], %[soffset] offen offset:%[ioffset] lds\n"
+        ::[vaddr]"v"(voffset), [srsrc]"s"(buffer.descriptor), [soffset]"s"(soffset), [ioffset]"i"(imm_off));
+}
+
 template<uint16_t cnt>
 __device__ void s_waitcnt_vmcnt() {
     asm volatile ("s_waitcnt vmcnt(%0)\n"::"i"(cnt));
@@ -224,6 +232,51 @@ __global__ __launch_bounds__(256, 1) void test(int* A, int K, int i0, int* indic
     auto buffer_load_dwordx4_tput = (float)(buffer_load_dwordx4_latency_tput - buffer_load_dwordx4_latency)/10.0;
     if (verbose)
         printf(" buffer_load_dwordx4 throughput cycles: %.2f\n", buffer_load_dwordx4_tput);
+
+
+    // buffer_load_dword_lds:latency
+    voffset = threadIdx.x * sizeof(int32_t);
+    dc = 0;
+    count = 0;
+    asm volatile("s_mov_b32 m0, %0"::"s"(0));
+    for(int i = 0; i < 64*1024; i += 64) {
+        dc += get_cycles([&](){
+            buffer_load_dword_lds<0>(buff, soffset, voffset);
+            s_waitcnt_vmcnt<0>();
+        });
+        count ++;
+        soffset =  (__builtin_amdgcn_readfirstlane(lds[0][0]) * sizeof(int)/sizeof(int32x4_t))*sizeof(int32x4_t);
+    }
+    auto buffer_load_dword_lds_latency =  dc/count;
+    if (verbose)
+        printf(" buffer_load_dword_lds latency cycles: %lu\n", buffer_load_dword_lds_latency);
+
+    // buffer_load_dword_lds: tput
+    dc = count = 0;
+    asm volatile("s_mov_b32 m0, %0"::"s"(0));
+    //#pragma nounroll
+    for(int i = 0; i < 64*1024; i += 64) {
+        dc += get_cycles([&](){
+            buffer_load_dword_lds<0>(buff, soffset, voffset);
+            buffer_load_dword_lds<1*256>(buff, soffset, voffset);
+            buffer_load_dword_lds<2*256>(buff, soffset, voffset);
+            buffer_load_dword_lds<3*256>(buff, soffset, voffset);
+            buffer_load_dword_lds<4*256>(buff, soffset, voffset);
+            buffer_load_dword_lds<5*256>(buff, soffset, voffset);
+            buffer_load_dword_lds<6*256>(buff, soffset, voffset);
+            buffer_load_dword_lds<7*256>(buff, soffset, voffset);
+            buffer_load_dword_lds<8*256>(buff, soffset, voffset);
+            buffer_load_dword_lds<9*256>(buff, soffset, voffset);
+            buffer_load_dword_lds<10*256>(buff, soffset, voffset);
+            s_waitcnt_vmcnt<0>();
+        });
+        soffset =  (__builtin_amdgcn_readfirstlane(lds[0][0]) * sizeof(int)/sizeof(int32x4_t))*sizeof(int32x4_t);
+        count ++;
+    }
+    auto buffer_load_dword_lds_lat_tput = dc/count;
+    auto buffer_load_dword_lds_tput = (float)(buffer_load_dword_lds_lat_tput - buffer_load_dword_lds_latency)/10.0;
+    if (verbose)
+        printf(" buffer_load_dword_lds throughput cycles: %.2f\n", buffer_load_dword_lds_tput);
 
     dc = 0;
     int index = indices[threadIdx.x];
