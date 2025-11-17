@@ -60,11 +60,38 @@ class cudaPerf(object):
             msg += f"  {rw_bytes*1e-6/self.dt_ms:.1f} GB/s "
         print(msg)
 
+class torchPerf(object):
+    def __init__(self, dir = ""):
+        global torch
+        import torch
+        import os        
+        self.TP_DIR = os.getenv("TORCH_PERF_DIR", dir)
+        if self.TP_DIR != "":
+            self.profiler = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        with_stack=True,
+                        on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                        self.TP_DIR, use_gzip=True))
+        else:
+            self.profiler = None
+
+    def __enter__(self):
+        if self.profiler is not None:
+            self.profiler.start()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        if self.profiler is not None:
+            self.profiler.stop()
+
 class cuPerf(object):
     def __init__(self, flops = 0, batch = 0, rw_bytes = 0, name="", filter=None, verbose=1):
         global torch
         import torch
-        self.is_enabled = name.startswith(filter)
+        self.is_enabled = (filter is None) or (name.startswith(filter))
         if self.is_enabled :
             self.filter = filter
             self.flops = flops
