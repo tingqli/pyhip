@@ -70,10 +70,9 @@ __device__ inline auto amd_wave_read_first_lane(const Object& obj)
     return out;
 }
 
-__device__ DWORDX4 read_dwordx4(BufferResource& buffer, int soffset, int nstride) {
+__device__ DWORDX4 read_dwordx4(BufferResource& buffer, int soffset, int nstride, int lane_offset) {
     DWORDX4 data;
     //volatile int dummy[40] = {0};
-    int lane_offset = threadIdx.x * sizeof(DWORDX4);
     int soff = soffset;
     auto r = amd_wave_read_first_lane(buffer.descriptor);
     asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], %[soffset] offen\n"
@@ -95,15 +94,87 @@ __device__ void s_waitcnt_lgkmcnt() {
 #define WIDTH 256 * 16
 #endif
 
-__global__ void __launch_bounds__(NUM_THREADS, 8) myread(char* src, int *result) {
-    src += blockIdx.x * WIDTH;
-    BufferResource buf(src, WIDTH);
+// mfma 16x16x16 layout: 0-15 threads read [0-15, 0](each element is DWORDX4), then 16-31 threads read [16-31, 1]...
+__global__ void __launch_bounds__(NUM_THREADS, 8) myread_4m_4kx16mx16k(char* src, int *result) {
+    src += blockIdx.x * WIDTH * 64;
+    BufferResource buf(src, 0xffffffff);
     int sum = 0;
+    int wave_id = threadIdx.x / 64;
+    int lane_id = threadIdx.x % 64;
+    int row_id = lane_id % 16;
+    int col_id = lane_id / 16;
+    
     #pragma unroll
-    for (int i = 0; i < WIDTH; i += NUM_THREADS * sizeof(DWORDX4)) {
-        auto data = read_dwordx4(buf, i, 0);
+    for (int i = 0; i < WIDTH; i += 4 * sizeof(DWORDX4)) {
+        auto data = read_dwordx4(buf, i, 0, (wave_id * 16 + row_id) * WIDTH + col_id * sizeof(DWORDX4));
     }
     s_waitcnt_vmcnt<0>();
-    // if (blockIdx.x == 0)
-    //     result[threadIdx.x] = sum;
+}
+
+// len(K)==256,read once: 0-15 threads read[0, 0-15](each element is DWORDX4), 16-31 threads read[1, 0-15]...
+__global__ void __launch_bounds__(NUM_THREADS, 8) myread_4m_4mx16kx16k(char* src, int *result) {
+    src += blockIdx.x * WIDTH * 16;
+    BufferResource buf(src, 0xffffffff);
+    int sum = 0;
+    int wave_id = threadIdx.x / 64;
+    int lane_id = threadIdx.x % 64;
+    int row_id = lane_id / 16;
+    int col_id = lane_id % 16;
+    
+    #pragma unroll
+    for (int i = 0; i < WIDTH; i += 16 * sizeof(DWORDX4)) {
+        auto data = read_dwordx4(buf, i, 0, (wave_id * 4 + row_id) * WIDTH + col_id * sizeof(DWORDX4));
+    }
+    s_waitcnt_vmcnt<0>();
+}
+
+// sequential read: 0-63 threads read[0, 0-63]
+__global__ void __launch_bounds__(NUM_THREADS, 8) myread_4m_1mx64kx16k(char* src, int *result) {
+    src += blockIdx.x * WIDTH * 4;
+    BufferResource buf(src, 0xffffffff);
+    int sum = 0;
+    int wave_id = threadIdx.x / 64;
+    int lane_id = threadIdx.x % 64;
+    int row_id = lane_id / 64;
+    int col_id = lane_id % 64;
+    
+    #pragma unroll
+    for (int i = 0; i < WIDTH; i += 64 * sizeof(DWORDX4)) {
+        auto data = read_dwordx4(buf, i, 0, (wave_id * 1 + row_id) * WIDTH + col_id * sizeof(DWORDX4));
+    }
+    s_waitcnt_vmcnt<0>();
+}
+
+// len(K)==256,read twice: 0-7 threads read[0, 0-7](each element is DWORDX4), 8-15 threads read[1, 0-7]...
+__global__ void __launch_bounds__(NUM_THREADS, 8) myread_4m_8mx8kx16k(char* src, int *result) {
+    src += blockIdx.x * WIDTH * 32;
+    BufferResource buf(src, 0xffffffff);
+    int sum = 0;
+    int wave_id = threadIdx.x / 64;
+    int lane_id = threadIdx.x % 64;
+    int row_id = lane_id / 8;
+    int col_id = lane_id % 8;
+    
+    #pragma unroll
+    for (int i = 0; i < WIDTH; i += 8 * sizeof(DWORDX4)) {
+        auto data = read_dwordx4(buf, i, 0, (wave_id * 8 + row_id) * WIDTH + col_id * sizeof(DWORDX4));
+    }
+    s_waitcnt_vmcnt<0>();
+}
+
+// len(K)==256,read four times: 0-3 threads read[0, 0-3](each element is DWORDX4), 4-7 threads read[1, 0-3]...
+__global__ void __launch_bounds__(NUM_THREADS, 8) myread_4m_16mx4kx16k(char* src, int *result) {
+    src += blockIdx.x * WIDTH * 64;
+    BufferResource buf(src, 0xffffffff);
+    int sum = 0;
+    int wave_id = threadIdx.x / 64;
+    int lane_id = threadIdx.x % 64;
+    int row_id = lane_id / 4;
+    int col_id = lane_id % 4;
+    
+    #pragma unroll
+    for (int i = 0; i < WIDTH; i += 4 * sizeof(DWORDX4)) {
+        auto data = read_dwordx4(buf, i, 0, (wave_id * 16 + row_id) * WIDTH + col_id * sizeof(DWORDX4));
+    }
+    s_waitcnt_vmcnt<0>();
 }
