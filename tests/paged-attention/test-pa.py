@@ -10,12 +10,12 @@ HQ = 32
 HK = 4
 S = 128
 KV_LEN = 45694
-#KV_LEN = 512
+#KV_LEN = 256
 DT = torch.bfloat16
 BLOCK_SIZE = 1
 BLOCK_NUM = B * KV_LEN + 1000
-FAKE_Q = 1
-FAKE_K_IDX = 1
+FAKE_Q = 0
+FAKE_K_IDX = 0
 
 print(f'kvcache = {B * (HK * KV_LEN * S * 2 * 2) // 1024 // 1024:,} MB')
 workspace_buffer = torch.empty(
@@ -131,7 +131,7 @@ if 0:
 # pa hip
 def div_up(x, y):
     return (x + y - 1) // y
-KV_PART_SIZE = 512
+KV_PART_SIZE = 256
 hip = pyhip.module("pa.cpp", f"-D{HQ=} -D{HK=} -D{S=} -D{BLOCK_SIZE=} -DSCALE={scale} -D{KV_PART_SIZE=} -D{FAKE_Q=} -D{FAKE_K_IDX=}")
 pa = hip.pa
 my_out = torch.ones_like(query)
@@ -144,8 +144,9 @@ if 1:
     ref_qk = query.reshape(B, HK, HQ // HK, -1) @ key_caches[-1][1:KV_LEN+1].permute(1, 2, 3, 0)
     ref_qk = ref_qk.to(torch.float32)
     qk_out = qk_out[..., :KV_LEN]
-    #idx = torch.where(torch.abs(ref_qk - qk_out) > 1)
-    #print(f'idx = {idx}\nref_qk={ref_qk[idx]}\ncur={qk_out[idx]}')
+    idx = torch.where(torch.abs(ref_qk - qk_out) > 1)
+    if len(idx[0]):
+        print(f'idx = {idx}\nref_qk={ref_qk[idx]}\ncur={qk_out[idx]}')
     assert torch.allclose(ref_qk.to(torch.float32), qk_out, rtol=0.01, atol=0.01), "pa qk is wrong"
 for i in range(10):
     with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="pa"):

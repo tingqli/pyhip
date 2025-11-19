@@ -92,25 +92,25 @@ __device__ DWORDX4 read_dwordx4(BufferResource& buffer, int soffset, int nstride
 }
 
 template<typename T>
-__device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffset) {
+__device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffset, int is_asm=0) {
     T v;
-    #if 1
-    auto r = amd_wave_read_first_lane(buffer.descriptor);
-    asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], %[soffset] offen\n"
-        :[vdst]"=v"(v)
-        :[vaddr]"v"(voffset), [srsrc]"s"(r), [soffset]"s"(soffset));
-    #else
-    v = *(T*)((char*)buffer.address + soffset + voffset);
-    #endif
+    if (is_asm) {
+        auto r = amd_wave_read_first_lane(buffer.descriptor);
+        asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], %[soffset] offen\n"
+            :[vdst]"=v"(v)
+            :[vaddr]"v"(voffset), [srsrc]"s"(r), [soffset]"s"(soffset));
+    } else {
+        v = *(T*)((char*)buffer.address + soffset + voffset);
+    }
     return v;
 }
 
 __device__ void amdgcn_mfma_f32_16x16x16bf16(bfloat16x4 a, bfloat16x4 b, float32x4& c) {
-    //c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
-    asm volatile("v_mfma_f32_16x16x16_bf16 %0, %1, %2, %3\n"
-                : "+a"(c)
-                : "v"(a), "v"(b), "a"(c)
-                :);
+    c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
+    // asm volatile("v_mfma_f32_16x16x16_bf16 %0, %1, %2, %3\n"
+    //             : "+v"(c)
+    //             : "v"(a), "v"(b), "v"(c)
+    //             :);
 }
 
 template<uint16_t cnt>
@@ -180,36 +180,33 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     BufferResource q_buf(query, (HQ / HK) * S * sizeof(__bf16));
     static_assert(HQ / HK <= 16, "use mfma16 requires M <= 16");
     bfloat16x8 q_cur[S / 32];
+    // key load layout: 4rows x 16 cols
+    uint key_load_col_id = lane_id % 16; // 0 ~ 15
+    uint key_load_row_id = lane_id / 16; // 0 ~ 3
     // mfma16x16 layout: 16rows x 4cols
-    uint col_id = lane_id / 16;      // 0 ~ 3
-    uint row_id = lane_id % 16;      // 0 ~ 15
+    uint fma_col_id = lane_id / 16;      // 0 ~ 3
+    uint fma_row_id = lane_id % 16;      // 0 ~ 15
 
-    uint k_offsets[KV_PART_SIZE_WARP / 16];
+    uint k_offsets[KV_PART_SIZE_WARP / 4];
     if constexpr (BLOCK_SIZE == 1) {
-        for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
+        for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+            uint local_row_id = n * 4 + key_load_row_id;
+            local_row_id = local_row_id + kv_len_start < kv_len_end ? local_row_id : 0;
 #if FAKE_K_IDX
-            uint row = row_id + n * 16  + kv_len_start + 1;
-            if (row > kv_len_end)
-                row = 1;
-            // auto ref = kv_page_indices[row_id + n * 16 < kv_len_end - kv_len_start ? row_id + n * 16 : 0];
-            // if (ref != row) {
-            //     printf("ref=%d row=%d x=%d\n", ref, row, threadIdx.x);
-            // }
-            k_offsets[n] = HK * S * sizeof(__bf16) * row + 8 * sizeof(__bf16) * col_id;
+            k_offsets[n] = HK * S * sizeof(__bf16) * (kv_len_start + local_row_id + 1) + 8 * sizeof(__bf16) * key_load_col_id;
 #else
-            uint row = row_id + n * 16 < kv_len_end - kv_len_start ? row_id + n * 16 : 0;
-            k_offsets[n] = HK * S * sizeof(__bf16) * kv_page_indices[row] + 8 * sizeof(__bf16) * col_id;
+            k_offsets[n] = HK * S * sizeof(__bf16) * kv_page_indices[local_row_id] + 8 * sizeof(__bf16) * key_load_col_id;
 #endif
         }
     }
     // query -> reg
-    if (row_id < HQ / HK) {
+    if (fma_row_id < HQ / HK) {
         #pragma unroll
         for (uint k = 0; k < S; k += 32) {
 #if FAKE_Q
             q_cur[k / 32] = __bf16(b + 1.0f);
 #else
-            q_cur[k / 32] = buffer_load_dwordx4<bfloat16x8>(q_buf, k * sizeof(__bf16), (row_id * q_h_stride + col_id * 8) * sizeof(__bf16));
+            q_cur[k / 32] = buffer_load_dwordx4<bfloat16x8>(q_buf, k * sizeof(__bf16), (fma_row_id * q_h_stride + fma_col_id * 8) * sizeof(__bf16), false);
 #endif
         }
     }
@@ -217,161 +214,38 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     // key -> reg
     float32x4 acc[KV_PART_SIZE_WARP / 16] = {0};
     BufferResource k_buf(key_cache, 0xffffffff);
-    __builtin_amdgcn_s_waitcnt(3952);
-    __builtin_amdgcn_sched_group_barrier(0,0,0);
-#if 1 // prefetch 3 rows
-    bfloat16x8 k_curs[S / 32 * 4];
 
-    for (int k = 0; k < S; k += 32) {
-        k_curs[k / 32] = buffer_load_dwordx4<bfloat16x8>(k_buf, k * sizeof(__bf16), k_offsets[0]);
-    }
-    for (int k = 0; k < S; k += 32) {
-        k_curs[k / 32 + S / 32] = buffer_load_dwordx4<bfloat16x8>(k_buf, k * sizeof(__bf16), k_offsets[1]);
-    }
-    for (int k = 0; k < S; k += 32) {
-        k_curs[k / 32 + S / 32 * 2] = buffer_load_dwordx4<bfloat16x8>(k_buf, k * sizeof(__bf16), k_offsets[2]);
+    bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4];
+
+    for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+        k_reg_caches[n] = buffer_load_dwordx4<bfloat16x8>(k_buf, 0, k_offsets[n]);
     }
 
-    uint idx_comupte = 0;
-    uint idx_write = S / 32 * 3;
-    uint n;
-    #pragma unroll
-    for (n = 3; n < KV_PART_SIZE_WARP / 16; n++) {
-        compile_time_loop<S / 32>([&](auto k){
-            k_curs[idx_write + k] = buffer_load_dwordx4<bfloat16x8>(k_buf, k * 32 * sizeof(__bf16), k_offsets[n]);
-            if (n != KV_PART_SIZE_WARP / 16 - 1) {
-                s_waitcnt_vmcnt<S / 32 * 3>();
-            } else {
-                s_waitcnt_vmcnt<S / 32 * 3 - k - 1>();
-            }
-            amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].lo, q_cur[k].lo, acc[n - 3]);
-            amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].hi, q_cur[k].hi, acc[n - 3]);
-        });
+    __shared__ __bf16 k_buff_lds[16 * S * 4];
 
-        idx_comupte = (idx_comupte + S / 32) % (S / 32 * 4);
-        idx_write = (idx_write + S / 32) % (S / 32 * 4);
-    }
-    compile_time_loop<S / 32>([&](auto k){
-        s_waitcnt_vmcnt<S / 32 * 2 - k - 1>();
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].lo, q_cur[k].lo, acc[n - 3]);
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].hi, q_cur[k].hi, acc[n - 3]);
-    });
-    idx_comupte = (idx_comupte + S / 32) % (S / 32 * 4);
-    compile_time_loop<S / 32>([&](auto k){
-        s_waitcnt_vmcnt<S / 32 - k - 1>();
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].lo, q_cur[k].lo, acc[n - 2]);
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].hi, q_cur[k].hi, acc[n - 2]);
-    });
-    idx_comupte = (idx_comupte + S / 32) % (S / 32 * 4);
-    compile_time_loop<S / 32>([&](auto k){
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].lo, q_cur[k].lo, acc[n - 1]);
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].hi, q_cur[k].hi, acc[n - 1]);
-    });
+    __bf16* cur_k_buff_lds = k_buff_lds + warp_id * 16 * S;
+    for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
+        *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 0];
+        *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 1];
+        *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 2];
+        *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 3];
 
-#elif 1 // prefetch 2 rows
-    bfloat16x8 k_curs[S / 32 * 3];
-
-    for (int k = 0; k < S; k += 32) {
-        k_curs[k / 32] = buffer_load_dwordx4<bfloat16x8>(k_buf, k * sizeof(__bf16), k_offsets[0]);
-    }
-    for (int k = 0; k < S; k += 32) {
-        k_curs[k / 32 + S / 32] = buffer_load_dwordx4<bfloat16x8>(k_buf, k * sizeof(__bf16), k_offsets[1]);
-    }
-
-    uint idx_comupte = 0;
-    uint idx_write = S / 32 * 2;
-    uint n;
-    #pragma unroll
-    for (n = 2; n < KV_PART_SIZE_WARP / 16; n++) {
-        compile_time_loop<S / 32>([&](auto k){
-            k_curs[idx_write + k] = buffer_load_dwordx4<bfloat16x8>(k_buf, k * 32 * sizeof(__bf16), k_offsets[n]);
-            if (n != KV_PART_SIZE_WARP / 16 - 1) {
-                s_waitcnt_vmcnt<S / 32 * 2>();
-            } else {
-                s_waitcnt_vmcnt<S / 32 * 2 - k - 1>();
-            }
-            amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].lo, q_cur[k].lo, acc[n - 2]);
-            amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].hi, q_cur[k].hi, acc[n - 2]);
-        });
-
-        idx_comupte = (idx_comupte + S / 32) % (S / 32 * 3);
-        idx_write = (idx_write + S / 32) % (S / 32 * 3);
-    }
-    compile_time_loop<S / 32>([&](auto k){
-        s_waitcnt_vmcnt<S / 32 - k - 1>();
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].lo, q_cur[k].lo, acc[n - 2]);
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].hi, q_cur[k].hi, acc[n - 2]);
-    });
-    idx_comupte = (idx_comupte + S / 32) % (S / 32 * 3);
-    compile_time_loop<S / 32>([&](auto k){
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].lo, q_cur[k].lo, acc[n - 1]);
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k].hi, q_cur[k].hi, acc[n - 1]);
-    });
-
-#elif 1   // prefetch 1 row
-    if constexpr (BLOCK_SIZE == 1) {
-        uint row = row_id + 0 < kv_len_end - kv_len_start ? row_id + 0 : 0;
-        k_offset = HK * S * sizeof(__bf16) * kv_page_indices[row] + 8 * sizeof(__bf16) * col_id;
-    }
-    bfloat16x8 k_curs[S / 32 * 2];
-    for (int k = 0; k < S; k += 32) {
-        k_curs[k / 32] = buffer_load_dwordx4<bfloat16x8>(k_buf, k * sizeof(__bf16), k_offset);
-    }
-    uint idx_comupte = 0;
-    uint idx_write = S / 32;
-    s_waitcnt_vmcnt<0>();
-    uint n;
-    #pragma unroll
-    for (n = 1; n < KV_PART_SIZE_WARP / 16; n++) {
-        if constexpr (BLOCK_SIZE == 1) {
-            uint row = row_id + n * 16 < kv_len_end - kv_len_start ? row_id + n * 16 : 0;
-            k_offset = HK * S * sizeof(__bf16) * kv_page_indices[row] + 8 * sizeof(__bf16) * col_id;
-        }
-        #pragma unroll
-        for (int k = 0; k < S; k += 32) {
-            if (n != KV_PART_SIZE_WARP - 1)
-                k_curs[idx_write + k / 32] = buffer_load_dwordx4<bfloat16x8>(k_buf, k * sizeof(__bf16), k_offset);
-            amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k / 32].lo, q_cur[k / 32].lo, acc[n - 1]);
-            amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k / 32].hi, q_cur[k / 32].hi, acc[n - 1]);
-        }
-        idx_comupte = S / 32 - idx_comupte;
-        idx_write = S / 32 - idx_write;
-        s_waitcnt_vmcnt<0>();
-    }
-    #pragma unroll
-    for (int k = 0; k < S; k += 32) {
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k / 32].lo, q_cur[k / 32].lo, acc[n - 1]);
-        amdgcn_mfma_f32_16x16x16bf16(k_curs[idx_comupte + k / 32].hi, q_cur[k / 32].hi, acc[n - 1]);
-    }
-
-#else
-    for (uint n = 0; n < KV_PART_SIZE_WARP; n += 16) {
-        if constexpr (BLOCK_SIZE == 1) {
-            uint row = row_id + n < kv_len_end - kv_len_start ? row_id + n : 0;
-            k_offset = HK * S * sizeof(__bf16) * kv_page_indices[row] + 8 * sizeof(__bf16) * col_id;
-        }
-        for (int k = 0; k < S; k += 32) {
-            auto k_cur = buffer_load_dwordx4<bfloat16x8>(k_buf, k * sizeof(__bf16), k_offset);
-            s_waitcnt_vmcnt<0>();
-            amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k / 32].lo, acc[n / 16]);
-            amdgcn_mfma_f32_16x16x16bf16(k_cur.hi, q_cur[k / 32].hi, acc[n / 16]);
+        for (int k = 0; k < S / 32; k++) {
+            auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + k * 32 + fma_col_id * 8]);
+            amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n]);
+            amdgcn_mfma_f32_16x16x16bf16(k_cur.hi, q_cur[k].hi, acc[n]);
         }
     }
-#endif
-    __builtin_amdgcn_sched_group_barrier(0,0,0);
+
     if (qk_ptr) {
         // [B, HK, HQ / HK, stride]
         auto stride = (kv_len + KV_PART_SIZE - 1) / KV_PART_SIZE * KV_PART_SIZE;
-        if (row_id < HQ / HK) {
+        if (fma_row_id < HQ / HK) {
             for (int n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
-                auto cur_tmp_ptr = qk_ptr + (hk * (HQ / HK) + row_id) * stride + kv_len_start + n * 16 + col_id * 4;
+                auto cur_tmp_ptr = qk_ptr + (hk * (HQ / HK) + fma_row_id) * stride + kv_len_start + n * 16 + fma_col_id * 4;
                 for (int i = 0; i < 4; i++)
                     cur_tmp_ptr[i] = acc[n][i];
             }
         }
     }
-            s_waitcnt_vmcnt<0>();
-            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 10 && lane_id == 0) {
-             //printf("kv_page_indices=%p kv_len_start=%d threadIdx.x=%d kv_page_indices[row + n]=%d\n", kv_page_indices,  kv_len_start, threadIdx.x, k_offset);
-            }
 }
