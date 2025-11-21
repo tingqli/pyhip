@@ -1,13 +1,19 @@
 import pyhip
 
 def kernel(J):
-    p_kargs = J.new_gpr('s',[0,1])
-    pA = J.new_gpr('s',2,align=4)
-    K = J.new_gpr('s',1)
+    p_kargs = J.new_gpr('s',[0,1],name="p_kargs")
+    threadIdx_x = J.new_gpr('v',[0,0],name="threadIdx_x")
+    pA = J.new_gpr('s',2,align=4,name="pA")
+    K = J.new_gpr('s',1,name="K")
+    acc = J.new_gpr("a", 4,name="acc")
+    s_idx = J.new_gpr('s',1, dtype="u32", name="s_idx")
+    s_temp0 = J.new_gpr('s',1,name="s_temp0")
+    s_temp = J.new_gpr('s',2, align=2,name="s_temp")
+    s_temp2 = J.new_gpr('s',2, align=2,name="s_temp2")
+    vtemp = J.new_gpr('v',2, dtype="u32", align=2,name="vtemp")
 
     J.s_load_dwordx2(pA, p_kargs, 0)
 
-    acc = J.new_gpr("a", 4)
     for i in range(4):
         J.v_accvgpr_write_b32(acc[i], 0)
 
@@ -17,24 +23,28 @@ def kernel(J):
     # v_mov_b32(v3, s3)
     #with J.BB():
     #    J.v_lshl_add_u32(v[2], v[0], 2, v[2])
-    s_idx = J.new_gpr('s',1)
 
-    J.s_mov_b32(s_idx, 0)
+    s_idx[0] = 0
+    s_idx[0] = 30 - s_idx[0]
+    s_idx[0] = s_idx[0] >> 1
+    vtemp[0] = 1.0
+    vtemp[1] = 7*vtemp[0]
+    vtemp[1] = vtemp[0] << 3
+    vtemp[1] = 3 << vtemp[0]
 
+    vtemp[1] = vtemp[0] >> 3
+    vtemp[1] = 3 >> vtemp[0]
     J.Label("bb0")
 
     #J.s_lshl_b32(s_temp[1],1, s_idx)
-    s_temp0 = J.new_gpr('s',1)
     J.s_lshl_b32(s_temp0,s_idx,2)
     #s_temp[0] = s_idx[0] << 2
 
-    s_temp = J.new_gpr('s',2, align=2)
     J.s_add_u32(s_temp[0], pA[0], s_temp0)
     J.s_addc_u32(s_temp[1], pA[1], 0)
 
     J.s_store_dword(K, s_temp, 0, mod="glc")
 
-    s_temp2 = J.new_gpr('s',2, align=2)
     J.s_add_u32(s_temp2[0], pA[0], s_temp0)
 
     J.s_addk_i32(s_idx, 1)

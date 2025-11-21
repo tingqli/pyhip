@@ -10,13 +10,14 @@ class Instruction:
         self.is_branch = self.opcode.startswith("s_branch")
         self.is_cbranch = self.opcode.startswith("s_cbranch_")
         self.debug_info = ""
+        self.sid = 0
 
-    def __call__(self, *operands, mod:str=""):
+    def __call__(self, *operands, mod:str="", insert_bb_pos = None):
         self.operands = operands
         self.mod = mod
         for i, op in enumerate(operands):
-            assert isinstance(op, GPRExpr) or isinstance(op, int) or isinstance(op, GPRs), f"arg {i} type is {type(op)}"
-        self.parent_bb.add_instruction(self)
+            assert isinstance(op, GPRExpr) or isinstance(op, int) or isinstance(op, float) or isinstance(op, GPRs), f"arg {i} type is {type(op)}"
+        self.parent_bb.add_instruction(self, insert_bb_pos)
 
     def __repr__(self):
         return f"{self.opcode} {','.join([repr(op) for op in self.operands])} {self.mod} ; {self.debug_info}"
@@ -27,36 +28,27 @@ class GPRExpr:
         self.src0 = src0
         self.src1 = src1
         self.src2 = src2
-        self.depth = 1
-        if isinstance(src0, GPRExpr):
-            self.depth = max(self.depth, src0.depth + 1)
-        if isinstance(src1, GPRExpr):
-            self.depth = max(self.depth, src1.depth + 1)
-        if isinstance(src2, GPRExpr):
-            self.depth = max(self.depth, src2.depth + 1)
-
-    def match(self, other: 'GPRExpr'):
-        if self.op == "pattern":
-            # pattern node handles the rest
-            return self.src0.match(other)
-        if self.op != other.op:
-            return False
-        if (self.src0 is not other.src0) and (not self.src0.match(other.src0)):
-            return False
-        if (self.src1 is not other.src1) and (not self.src1.match(other.src1)):
-            return False
-        return True
 
     def __add__(self, other):
         return GPRExpr("+", self, other)
+    def __radd__(self, other):
+        return GPRExpr("+", other, self)
     def __sub__(self, other):
         return GPRExpr("-", self, other)
+    def __rsub__(self, other):
+        return GPRExpr("-", other, self)
     def __mul__(self, other):
+        return GPRExpr("*", self, other)
+    def __rmul__(self, other):
         return GPRExpr("*", self, other)
     def __lshift__(self, other):
         return GPRExpr("<<", self, other)
+    def __rlshift__(self, other):
+        return GPRExpr("<<", other, self)
     def __rshift__(self, other):
         return GPRExpr(">>", self, other)
+    def __rrshift__(self, other):
+        return GPRExpr(">>", other, self)
 
     def __repr__(self):
         if self.op == "getitem":
@@ -97,12 +89,14 @@ class GPRItemPat:
 # GPRs should be allocated by JIT
 class GPRs:
     patterns = None
-    def __init__(self, jit, rtype, start_id, count, align=0):
+    def __init__(self, jit, rtype, start_id, count, dtype, align=0, name=""):
         self.jit = jit
         self.rtype = rtype
         self.start_id = start_id
         self.count = count
         self.align = align
+        self.dtype = dtype
+        self.name = name # for debugging purpose only
 
     def __getitem__(self, key):
         if isinstance(key, slice):
@@ -115,25 +109,12 @@ class GPRs:
         else:
             assert 0, f"unsupported key {key}"
 
-    def __setitem__(self, key, value:GPRExpr):
+    def __setitem__(self, key, value:Union[GPRExpr,int,float]):
         dst = self[key]
-        i0 = GPRExpr("pattern", GPRItemPat("i", 1))
-        s1 = GPRExpr("pattern", GPRItemPat("s", 1))
-        s2 = GPRExpr("pattern", GPRItemPat("s", 1))
-        ds1 = GPRExpr("pattern", GPRItemPat("s", 2))
-        ds2 = GPRExpr("pattern", GPRItemPat("s", 2))
-
-        if (s1 << s2).match(value):
-            inst = Instruction(self.jit.current_bb, "s_lshl_b32")
-            inst(dst, s1.src0.other, s2.src0.other)
-        elif (s1 << i0).match(value):
-            inst = Instruction(self.jit.current_bb, "s_lshl_b32")
-            inst(dst, s1.src0.other, s2.src0.other)
-        elif (s1 + s2).match(value):
-            inst = Instruction(self.jit.current_bb, "s_add_u32")
-            inst(dst, s1.src0.other, s2.src0.other)
-        else:
-            assert 0
+        inst = Instruction(self.jit.current_bb, "expression_place_holder")
+        inst(dst, value)
+        # expression_place_holder will be compiled later when all program is ready
+        # all expressions within same BB can be processed together
 
     def __repr__(self):
         if self.count == 1:
@@ -164,8 +145,13 @@ class BasicBlock:
             successor = self.jit.label2bb[label]
             self.add_successor(successor)
 
-    def add_instruction(self, instr: Instruction):
-        self.instructions.append(instr)
+    def add_instruction(self, instr: Instruction, insert_bb_pos=None):
+        if insert_bb_pos is None:
+            self.instructions.append(instr)
+        else:
+            self.instructions.insert(insert_bb_pos, instr)
+            assert not (instr.is_branch or instr.is_cbranch), "do not insert branch please!"
+
         # branch or cbranch can tell successors
         if instr.is_branch:
             # one possible successor
@@ -196,13 +182,20 @@ class BasicBlock:
 
     def __repr__(self):
         # https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html#Special-format-strings
-        asm = f"{self.label_name}:\n"
-        asm += f";BB#{self.bb_index}\n"
-        asm += f";predecessors:[{','.join([p.label_name for p in self.predecessors])}]\n"
-        asm += f";successors:[{','.join([p.label_name for p in self.successors])}]\n"
+        asm = f"{self.label_name}:\t"
+        asm += f" ;BB#{self.bb_index}"
+        asm += f" predecessors:[{','.join([p.label_name for p in self.predecessors])}]"
+        asm += f" successors:[{','.join([p.label_name for p in self.successors])}]\n"
         for inst in self.instructions:
             asm += f"\t{inst}\n"
         return asm
+
+import struct
+
+def float_to_ieee754_bits_little(f):
+    packed = struct.pack('<f', f)    # 小端序
+    bits = struct.unpack('<I', packed)[0]  # 解包为无符号整数
+    return bits
 
 # JIT emits instructions into BBs
 class JIT:
@@ -234,14 +227,14 @@ class JIT:
     def _align_up(self, a, align):
         return ((a + align - 1)//align) * align
 
-    def new_gpr(self, reg_type, count_range, align=1):
+    def new_gpr(self, reg_type, count_range, dtype="", align=1, name=""):
         assert reg_type == 's' or reg_type == 'v' or reg_type == 'a'
         if isinstance(count_range, int):
             # allocate do not reuse, just increase the index
             count = count_range
             start_id = self._align_up(self.free_gpr_id[reg_type], align)
             self.free_gpr_id[reg_type] = start_id + count
-            gprs = GPRs(self, reg_type, start_id, count, align=align)
+            gprs = GPRs(self, reg_type, start_id, count, dtype=dtype, align=align, name=name)
             self.relocatable_gprs.append(gprs)
             return gprs
         elif isinstance(count_range, tuple) or isinstance(count_range, list):
@@ -251,7 +244,7 @@ class JIT:
             assert self.free_gpr_id[reg_type] <= first_id, "specified reg has been allocated"
             assert self.free_gpr_id[reg_type] <= last_id, "specified reg has been allocated"
             self.free_gpr_id[reg_type] = last_id + 1
-            gprs = GPRs(self, reg_type, first_id, last_id - first_id + 1, align=align)
+            gprs = GPRs(self, reg_type, first_id, last_id - first_id + 1, dtype=dtype, align=align, name=name)
             self.fixed_gprs.append(gprs)
             return gprs
         else:
@@ -311,19 +304,20 @@ class JIT:
                             live_intervals[gprs][1] = jump_back_sid
 
         # add debug-info to inst
-        for bb in self.blocks:
-            for inst in bb.instructions:
-                debug_info = f" #{inst.sid}  regs:"
-                for gprs in live_intervals:
-                    first_sid, last_sid = live_intervals[gprs]
-                    if inst.sid >= first_sid and inst.sid <= last_sid:
-                        debug_info += f"{gprs},"
-                inst.debug_info = debug_info
+        if 0:
+            for bb in self.blocks:
+                for inst in bb.instructions:
+                    debug_info = f" #{inst.sid}  regs:"
+                    for gprs in live_intervals:
+                        first_sid, last_sid = live_intervals[gprs]
+                        if inst.sid >= first_sid and inst.sid <= last_sid:
+                            debug_info += f"'{gprs.name}'{gprs} "
+                    inst.debug_info = debug_info
 
         self.asm_debug_info += ";============ register live interval ==============\n"
         for gprs in live_intervals:
             first_sid, last_sid = live_intervals[gprs]
-            self.asm_debug_info += f";{repr(gprs):10s}  {first_sid} ~ {last_sid}\n"
+            self.asm_debug_info += f";'{gprs.name}'{repr(gprs):10s}  {first_sid} ~ {last_sid}\n"
 
         # re-assign each gprs's start_id (linear_scan)
         # sorted_live_interval = [(live_intervals[gprs][0], live_intervals[gprs][1], gprs) for gprs in live_intervals].sort()
@@ -370,7 +364,7 @@ class JIT:
                     gprs.start_id = i
                     slots[i:(i+count)] = [1]*count # mark as used
                     return
-            assert 0, f"cannot allocate {gprs}, not enough resources"
+            assert 0, f"cannot allocate '{gprs.name}'{gprs}, not enough resources"
 
         def free_gpr(gprs):
             rtype = gprs.rtype
@@ -385,16 +379,113 @@ class JIT:
             for ev,gprs in events:
                 if ev == 0: # first use
                     alloc_gpr(gprs)
-                    self.asm_debug_info += f";alloc {gprs} at #{sid}\n"
+                    self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}\n"
             # now free
             for ev,gprs in events:
                 if ev == 1: # last use
                     free_gpr(gprs)
-                    self.asm_debug_info += f";free {gprs} at #{sid}\n"
+                    self.asm_debug_info += f";free '{gprs.name}'{gprs} at #{sid}\n"
 
         # (following code-gen phase will use the new start_id automatically)
-
+        # add debug info to asm instruction
+        for bb in self.blocks:
+            for inst in bb.instructions:
+                debug_info = f"#{inst.sid} "
+                for op in inst.operands:
+                    if isinstance(op, GPRExpr):
+                        op = op.src0
+                    if isinstance(op, GPRs):
+                        debug_info += f"{op.name},"
+                    else:
+                        debug_info += f"{op},"
+                inst.debug_info = debug_info
         return
+
+    def compile_bb_expr(self, bb, expr_insts):
+        for inst in expr_insts:
+            pos = bb.instructions.index(inst)
+            bb.instructions.remove(inst)
+            # insert new instructions at pos
+            dst_expr = inst.operands[0]
+            src_expr = inst.operands[1]
+            assert isinstance(dst_expr, GPRExpr)
+            assert dst_expr.op == "getitem"
+
+            # convert to binary format
+            if isinstance(src_expr, float):
+                src_expr = float_to_ieee754_bits_little(src_expr)
+
+            if isinstance(src_expr, GPRExpr):
+                # op(dst_expr, ...)
+                if src_expr.op == "getitem":
+                    # assign
+                    dst_gprs = dst_expr.src0
+                    dst_idx0 = dst_expr.src1
+                    dst_idx1 = dst_expr.src2
+                    dst_cnt = dst_idx1 - dst_idx0 + 1
+                    src_cnt = src_expr.src2 - src_expr.src1 + 1
+                    assert dst_cnt == src_cnt
+                    assert dst_cnt == 1 or dst_cnt == 2
+                    new_inst = Instruction(bb, f"{dst_gprs.rtype}_mov_b32")
+                    new_inst(dst_expr, src_expr, insert_bb_pos=pos)
+                elif src_expr.op == "+":
+                    assert dst_gprs.dtype != ""
+                    new_inst = Instruction(bb, f"{dst_gprs.rtype}_add_{dst_gprs.dtype}")
+                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
+                elif src_expr.op == "-":
+                    assert dst_gprs.dtype != ""
+                    new_inst = Instruction(bb, f"{dst_gprs.rtype}_sub_{dst_gprs.dtype}")
+                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
+                elif src_expr.op == "*":
+                    assert dst_gprs.dtype != ""
+                    if dst_gprs.rtype == "s":
+                        new_inst = Instruction(bb, f"s_mul_{dst_gprs.dtype}")
+                    elif dst_gprs.rtype == "v":
+                        if dst_gprs.dtype == "u32" or dst_gprs.dtype == "u16":
+                            new_inst = Instruction(bb, f"v_mul_lo_{dst_gprs.dtype}")
+                        elif dst_gprs.dtype == "f32" or dst_gprs.dtype == "f16":
+                            new_inst = Instruction(bb, f"v_mul_{dst_gprs.dtype}")
+                        else:
+                            assert 0, f"unsupported v_mul dtype: {dst_gprs.dtype}"
+                    else:
+                        assert 0, f"unsupported v_mul rtype: {dst_gprs.rtype}"
+                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
+                elif src_expr.op == "<<":
+                    if dst_gprs.rtype == "s":
+                        new_inst = Instruction(bb, f"s_lshl_b32")
+                        new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
+                    elif dst_gprs.rtype == "v":
+                        new_inst = Instruction(bb, f"v_lshlrev_b32")
+                        new_inst(dst_expr, src_expr.src1, src_expr.src0, insert_bb_pos=pos)
+                    else:
+                        assert 0, f"unsupported v_mul rtype: {dst_gprs.rtype}"
+                elif src_expr.op == ">>":
+                    if dst_gprs.rtype == "s":
+                        new_inst = Instruction(bb, f"s_lshr_b32")
+                        new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
+                    elif dst_gprs.rtype == "v":
+                        new_inst = Instruction(bb, f"v_lshrrev_b32")
+                        new_inst(dst_expr, src_expr.src1, src_expr.src0, insert_bb_pos=pos)
+                    else:
+                        assert 0, f"unsupported v_mul rtype: {dst_gprs.rtype}"
+                else:
+                    assert 0, f"unsupported expression {src_expr}"
+            elif isinstance(src_expr, int):
+                dst_gprs = dst_expr.src0
+                new_inst = Instruction(bb, f"{dst_gprs.rtype}_mov_b32")
+                new_inst(dst_expr, src_expr, insert_bb_pos=pos)
+            else:
+                assert 0, f"unsupported expression {src_expr}"
+            
+
+    def compile_expressions(self):
+        # first version, only simple binary expressions
+        for bb in self.blocks:
+            expr_insts = []
+            for inst in bb.instructions:
+                if inst.opcode == "expression_place_holder":
+                    expr_insts.append(inst)
+            self.compile_bb_expr(bb, expr_insts)
 
     def build(self, signature):
         self.asm_debug_info = ""
@@ -413,6 +504,7 @@ class JIT:
         for bb in self.blocks:
             bb.solve_succesors()
 
+        self.compile_expressions()
         self.register_allocation_linear_scan()
 
         # generate asm: basic blocks are in natural order
