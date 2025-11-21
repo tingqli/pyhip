@@ -1,4 +1,5 @@
 from .hiptools import module
+from .jit import JIT
 
 class torchPerf(object):
     def __init__(self):
