@@ -1,4 +1,6 @@
 #include <__clang_hip_runtime_wrapper.h>
+#include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <hip/amd_detail/amd_hip_runtime.h>
 #include <hip/hip_fp16.h> // for __fp16
@@ -12,13 +14,16 @@
 using float16x4 = __fp16 __attribute__ ((ext_vector_type(2)));
 using float16x8 = __fp16 __attribute__ ((ext_vector_type(8)));
 using float16x32 = __fp16 __attribute__ ((ext_vector_type(32)));
+using bfloat16x2 = __bf16  __attribute__ ((ext_vector_type(2)));
 using bfloat16x4 = __bf16  __attribute__ ((ext_vector_type(4)));
 using bfloat16x8 = __bf16  __attribute__ ((ext_vector_type(8)));
 using bfloat16x32 = __bf16 __attribute__ ((ext_vector_type(32)));
 using float32x16 = float  __attribute__ ((ext_vector_type(16)));
 using float32x4 = float  __attribute__ ((ext_vector_type(4)));
+using float32x2 = float  __attribute__ ((ext_vector_type(2)));
 using int32x4_t = int  __attribute__ ((ext_vector_type(4)));
 using int32x16_t = int  __attribute__ ((ext_vector_type(16)));
+using uint32x2_t = uint  __attribute__ ((ext_vector_type(2)));
 
 using as3_uint32_ptr = __attribute__((address_space(3))) uint32_t *;
 union BufferResource {
@@ -92,7 +97,7 @@ __device__ DWORDX4 read_dwordx4(BufferResource& buffer, int soffset, int nstride
 }
 
 template<typename T>
-__device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffset, int is_asm=0) {
+__device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffset, bool is_asm=false) {
     T v;
     if (is_asm) {
         auto r = amd_wave_read_first_lane(buffer.descriptor);
@@ -101,6 +106,19 @@ __device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffse
             :[vaddr]"v"(voffset), [srsrc]"s"(r), [soffset]"s"(soffset));
     } else {
         v = *(T*)((char*)buffer.address + soffset + voffset);
+    }
+    return v;
+}
+
+template<typename T>
+__device__ T global_load_dwordx4(void* addr, uint64_t voffset, bool is_asm=false) {
+    T v;
+    if (is_asm) {
+        asm volatile("global_load_dwordx4 %[vdst], %[vaddr], off\n"
+                :[vdst]"=v"(v)
+                :[vaddr]"v"((char*)addr + voffset));
+    } else {
+        v = *(T*)((char*)addr + voffset);
     }
     return v;
 }
@@ -149,14 +167,41 @@ constexpr void compile_time_loop(F&& f) {
 }
 
 #define KV_PART_SIZE_WARP (KV_PART_SIZE / 4)
+
+struct share_buf_t {
+    __bf16* buf;
+    __device__ share_buf_t(__bf16* buf) : buf(buf) {}
+      // for output reduce: 4 warpx16xS
+    __device__ __bf16* get_out_buf(uint warp_id) {
+        return buf + 16 * S * warp_id;
+    }
+    // for key cache: 4 warpx16xS
+    __device__ __bf16* get_key_buf(uint warp_id) {
+        return buf + 16 * S * warp_id;
+    }
+    // for value cache: 4 warpx16xS
+    __device__ __bf16* get_value_buf(uint warp_id) {
+        return buf + 16 * S * warp_id;
+    }
+    // 4warp * (16m + 1)
+    __device__ float* get_max_buf(uint m, uint warp_id) {
+        return (float*)buf + m + warp_id * 16;
+    }
+    __device__ float* get_sum_buf(uint m, uint warp_id) {
+        return (float*)buf + m + warp_id * 16 + 64;
+    }
+};
+
 __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
             __bf16* query,          // [B, HQ, S]
             __bf16* key_cache,      // [BLOCK, BLOCK_SIZE, HK, S]
             __bf16* value_cache,
             uint* kv_indptr,        // [B + 1]
             uint* kv_page_indices,  // [B * KV_LEN + 1]
-            __bf16* out,            // [B, HQ, S]
-            float* qk_ptr) {
+            __bf16* out_seg,        // [B, HQ, PART, S]
+            float* qk_ptr,          // [B, HK, HQ // HK, PART * KV_PART_SIZE]
+            float* max_out,         // [B, HQ, PART, 1]
+            float* sum_out) {       // [B, HQ, PART, 1]
     // wg: B, HK, kv_part
     uint b = blockIdx.x;
     uint hk = blockIdx.y;
@@ -174,7 +219,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     uint kv_len_start = std::min(kv_part * KV_PART_SIZE + warp_id * KV_PART_SIZE_WARP, kv_len);
     uint kv_len_end = std::min(kv_len_start + KV_PART_SIZE_WARP, kv_len);
     kv_page_indices += kv_indptr[b] + kv_len_start / BLOCK_SIZE;
-    out += b * HQ * S + hq * S;
+    out_seg += b * HQ * gridDim.z * S + hq * gridDim.z * S + kv_part * S;
+    max_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
+    sum_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
 
     // stage1(q*k): [16, 32]x[64, 32]'
     BufferResource q_buf(query, (HQ / HK) * S * sizeof(__bf16));
@@ -186,8 +233,10 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     // mfma16x16 layout: 16rows x 4cols
     uint fma_col_id = lane_id / 16;      // 0 ~ 3
     uint fma_row_id = lane_id % 16;      // 0 ~ 15
+    float prev_max = - FLT_MAX;
+    float prev_sum = 0;
 
-    uint k_offsets[KV_PART_SIZE_WARP / 4];
+    uint64_t k_offsets[KV_PART_SIZE_WARP / 4];
     if constexpr (BLOCK_SIZE == 1) {
         for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
             uint local_row_id = n * 4 + key_load_row_id;
@@ -195,7 +244,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
 #if FAKE_K_IDX
             k_offsets[n] = HK * S * sizeof(__bf16) * (kv_len_start + local_row_id + 1) + 8 * sizeof(__bf16) * key_load_col_id;
 #else
-            k_offsets[n] = HK * S * sizeof(__bf16) * kv_page_indices[local_row_id] + 8 * sizeof(__bf16) * key_load_col_id;
+            k_offsets[n] = HK * S * sizeof(__bf16) * (uint64_t)kv_page_indices[local_row_id] + 8 * sizeof(__bf16) * key_load_col_id;
 #endif
         }
     }
@@ -204,7 +253,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         #pragma unroll
         for (uint k = 0; k < S; k += 32) {
 #if FAKE_Q
-            q_cur[k / 32] = __bf16(b + 1.0f);
+            q_cur[k / 32] = __bf16(1.0f);
 #else
             q_cur[k / 32] = buffer_load_dwordx4<bfloat16x8>(q_buf, k * sizeof(__bf16), (fma_row_id * q_h_stride + fma_col_id * 8) * sizeof(__bf16), false);
 #endif
@@ -213,17 +262,18 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     //s_waitcnt_vmcnt<0>();
     // key -> reg
     float32x4 acc[KV_PART_SIZE_WARP / 16] = {0};
-    BufferResource k_buf(key_cache, 0xffffffff);
 
-    bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4];
+    bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4], v_reg_caches[KV_PART_SIZE_WARP / 4];
 
     for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-        k_reg_caches[n] = buffer_load_dwordx4<bfloat16x8>(k_buf, 0, k_offsets[n]);
+        k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, k_offsets[n]);
     }
-
-    __shared__ __bf16 k_buff_lds[16 * S * 4];
-
-    __bf16* cur_k_buff_lds = k_buff_lds + warp_id * 16 * S;
+    __shared__ __bf16 buff_lds[16 * S * 4];
+    share_buf_t share_buf(buff_lds);
+    for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+        v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, k_offsets[n], false);
+    }
+    __bf16* cur_k_buff_lds = share_buf.get_key_buf(warp_id);
     for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
         *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 0];
         *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 1];
@@ -235,17 +285,221 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
             amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n]);
             amdgcn_mfma_f32_16x16x16bf16(k_cur.hi, q_cur[k].hi, acc[n]);
         }
+        acc[n] *= SCALE;
     }
-
+    // for debug
     if (qk_ptr) {
         // [B, HK, HQ / HK, stride]
         auto stride = (kv_len + KV_PART_SIZE - 1) / KV_PART_SIZE * KV_PART_SIZE;
         if (fma_row_id < HQ / HK) {
             for (int n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
-                auto cur_tmp_ptr = qk_ptr + (hk * (HQ / HK) + fma_row_id) * stride + kv_len_start + n * 16 + fma_col_id * 4;
+                auto cur_tmp_ptr = qk_ptr + b * HK * HQ / HK * stride + (hk * (HQ / HK) + fma_row_id) * stride + kv_len_start + n * 16 + fma_col_id * 4;
                 for (int i = 0; i < 4; i++)
                     cur_tmp_ptr[i] = acc[n][i];
             }
         }
+    }
+
+    // sum(exp(acc-max))
+    auto cur_max = prev_max;
+    for (uint n = 0; n < 4; n++) {
+        for (uint i = 0; i < 4; i++) {
+            auto tmp = n * 16 + fma_col_id * 4 + i + kv_len_start < kv_len_end ? acc[n][i] : -FLT_MAX;
+            cur_max = fmaxf(cur_max, tmp);
+        }
+    }
+    for(int mask = 64 / 2; mask >= 16; mask /= 2) {
+        cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
+    }
+    float cur_sum = 0;
+    for (uint n = 0; n < 4; n++) {
+        for (uint i = 0; i < 4; i++) {
+            acc[n][i] = n * 16 + fma_col_id * 4 + i + kv_len_start < kv_len_end ? __expf(acc[n][i] - cur_max) : 0;
+            cur_sum += acc[n][i];
+        }
+    }
+    for(int mask = 64 / 2; mask >= 16; mask /= 2) {
+        cur_sum += __shfl_xor(cur_sum, mask);
+    }
+    cur_sum += prev_sum * __expf(prev_max - cur_max);
+    const float inv_sum_scale =
+        __fdividef(1.f, cur_sum + 1e-6f);
+    bfloat16x4 acc_low[KV_PART_SIZE_WARP / 16];
+    for (uint n = 0; n < 4; n++) {
+        for (uint i = 0; i < 4; i++) {
+            acc_low[n][i] = acc[n][i] * inv_sum_scale;
+        }
+    }
+    //s_waitcnt_vmcnt<0>();
+    __bf16* cur_v_buff_lds = share_buf.get_value_buf(warp_id);
+    //__bf16* cur_v_buff_lds = kv_buff_lds + warp_id * 16 * S;
+    float32x4 vout[S / 64 * 4] = {0};
+    for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
+        *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 0];
+        *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 1];
+        *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 2];
+        *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 3];
+
+        // layout: [4tx4, 16tx4k]-> 16 tokens, 64 of head size used for one iter
+        // K/N 0 1 2 3   4 5 6 7   8 9 10 11  12 13 14 15 ...  56 57 58 59  60 61 62 63 
+        //   0 thread0   thread1   thread2    thread3          thread14     thread15
+        //   1
+        //   2
+        //   3
+        //   4 thread16  thread17  thread18   thread19         thread30     thread31
+        //   5
+        //   6
+        //   7
+        //   ...
+        //  12 thread48  thread49  thread50   thread51         thread62     thread63
+        //  13
+        //  14
+        //  15
+        bfloat16x4 v_curs[4], v_curs_tr[4];
+        auto transpose4x4 = [] (bfloat16x4 in[4], bfloat16x4 out[4]) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    out[i][j] = in[j][i];
+            }
+        };
+        for (int k = 0; k < S / 64; k++) {
+            v_curs[0] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 0) * S + k * 64 + key_load_col_id * 4]);
+            v_curs[1] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 1) * S + k * 64 + key_load_col_id * 4]);
+            v_curs[2] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 2) * S + k * 64 + key_load_col_id * 4]);
+            v_curs[3] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 3) * S + k * 64 + key_load_col_id * 4]);
+            transpose4x4(v_curs, v_curs_tr);
+            amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[0], acc_low[n], vout[k * 4 + 0]);
+            amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[1], acc_low[n], vout[k * 4 + 1]);
+            amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[2], acc_low[n], vout[k * 4 + 2]);
+            amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[3], acc_low[n], vout[k * 4 + 3]);
+        }
+    }
+    __syncthreads();
+    // cross max/sum
+    if (fma_col_id == 0) {
+        *share_buf.get_max_buf(fma_row_id, warp_id) = cur_max;
+        *share_buf.get_sum_buf(fma_row_id, warp_id) = cur_sum;
+    }
+    __syncthreads();
+    // each wave will process HQ / HK / 4 tokens of output, each
+    float maxs[HQ / HK], sums[HQ / HK];
+    float real_max[HQ / HK / 4], real_sum[HQ / HK / 4];
+    for (uint i = 0; i < HQ / HK / 4; i++) {
+        uint m_token_id = HQ / HK / 4 * warp_id + i;
+        maxs[4 * i + 0] = *share_buf.get_max_buf(m_token_id, 0);
+        maxs[4 * i + 1] = *share_buf.get_max_buf(m_token_id, 1);
+        maxs[4 * i + 2] = *share_buf.get_max_buf(m_token_id, 2);
+        maxs[4 * i + 3] = *share_buf.get_max_buf(m_token_id, 3);
+        real_max[i] = fmaxf(
+            fmaxf(maxs[4 * i + 0], maxs[4 * i + 1]),
+            fmaxf(maxs[4 * i + 2], maxs[4 * i + 3]));
+
+        sums[4 * i + 0] = *share_buf.get_sum_buf(m_token_id, 0);
+        sums[4 * i + 1] = *share_buf.get_sum_buf(m_token_id, 1);
+        sums[4 * i + 2] = *share_buf.get_sum_buf(m_token_id, 2);
+        sums[4 * i + 3] = *share_buf.get_sum_buf(m_token_id, 3);
+        real_sum[i] = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) + 
+                      sums[4 * i + 1] * __expf(maxs[4 * i + 1] - real_max[i]) + 
+                      sums[4 * i + 2] * __expf(maxs[4 * i + 2] - real_max[i]) + 
+                      sums[4 * i + 3] * __expf(maxs[4 * i + 3] - real_max[i]);
+    }
+
+    bfloat16x4 vout_low[S / 64 * 4];
+    for (uint k = 0; k < S / 64 ; k++) {
+        for (uint i = 0; i < 4; i++)
+            for (uint j = 0; j < 4; j++)
+                vout_low[k * 4 + j][i] = vout[k * 4 + i][j];
+    }
+    __syncthreads();
+
+    auto shared_out = share_buf.get_out_buf(warp_id) + fma_row_id * S;
+    for (int k = 0; k < S / 64; k++) {
+        ((bfloat16x4*)(shared_out + k * 64))[fma_col_id * 4 + 0] = vout_low[k * 4 + 0];
+        ((bfloat16x4*)(shared_out + k * 64))[fma_col_id * 4 + 1] = vout_low[k * 4 + 1];
+        ((bfloat16x4*)(shared_out + k * 64))[fma_col_id * 4 + 2] = vout_low[k * 4 + 2];
+        ((bfloat16x4*)(shared_out + k * 64))[fma_col_id * 4 + 3] = vout_low[k * 4 + 3];
+    }
+    __syncthreads();
+    for (uint i = 0; i < HQ / HK / 4; i++) {
+        uint m_token_id = HQ / HK / 4 * warp_id + i;
+        auto out_v = ((bfloat16x2*)(share_buf.get_out_buf(0) + m_token_id * S))[lane_id];
+        out_v = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) * out_v;
+
+        for (int w = 1; w < 4; w++) {
+            auto next_v = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S))[lane_id];
+            next_v = sums[4 * i + w] * __expf(maxs[4 * i + w] - real_max[i]) * next_v;
+            out_v += next_v;
+        }
+        out_v = out_v / real_sum[i];
+        if (m_token_id < HQ / HK) {
+            ((bfloat16x2*)(out_seg + m_token_id * gridDim.z * S))[lane_id] = out_v;
+            max_out[m_token_id * gridDim.z] = real_max[i];
+            sum_out[m_token_id * gridDim.z] = real_sum[i];
+        }
+    }
+}
+
+__global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
+            uint* kv_indptr,        // [B + 1]
+            __bf16* out_seg,        // [B, HQ, PART, S]
+            float* max_out,         // [B, HQ, PART, 1]
+            float* sum_out,         // [B, HQ, PART, 1]
+            __bf16* out,            // [B, HQ, S]
+            uint max_part
+            ) {
+    // wg: B, HQ
+    uint b = blockIdx.x;
+    uint hq = blockIdx.y;
+    uint lane_id = threadIdx.x % 64;
+    uint warp_id = threadIdx.x / 64;
+    out += b * HQ * S + hq * S;
+    out_seg += b * HQ * max_part * S + hq * max_part * S;
+    max_out += b * HQ * max_part * 1 + hq * max_part * 1;
+    sum_out += b * HQ * max_part * 1 + hq * max_part * 1;
+    uint kv_len = kv_indptr[b + 1] - kv_indptr[b];
+    uint part_num = (kv_len + KV_PART_SIZE - 1) / KV_PART_SIZE;
+    float real_max = -FLT_MAX;
+    for (uint i = lane_id; i < part_num; i += 64) {
+        real_max = fmaxf(real_max, max_out[i]);
+    }
+    for (uint mask = 64 / 2; mask >= 1; mask /= 2) {
+        real_max = fmaxf(real_max, __shfl_xor(real_max, mask));
+    }
+
+    float32x2 cur_val = 0;
+    float warp_sum = 0;
+    for (uint i = warp_id; i < part_num; i += 4) {
+        auto cur_max = max_out[i];
+        auto cur_out_seg = out_seg + i * S;
+        // TODO: support S is not 128
+        auto cur_val_low = ((bfloat16x2*)cur_out_seg)[lane_id];
+        float32x2 tmp_val;
+        tmp_val[0] = cur_val_low[0];
+        tmp_val[1] = cur_val_low[1];
+        cur_val += tmp_val * sum_out[i] * __expf(cur_max - real_max);
+        warp_sum += sum_out[i] * __expf(cur_max - real_max);
+    }
+
+    __shared__ float out_lds[4 * S];
+    __shared__ float sum_lds[4];
+    if (lane_id == 0) {
+        sum_lds[warp_id] = warp_sum;
+    }
+    *(float32x2*)(&out_lds[warp_id * S + lane_id * 2]) = cur_val;
+    __syncthreads();
+    if (warp_id == 0) {
+        warp_sum += sum_lds[1] + sum_lds[2] + sum_lds[3];
+        for (int i = 1; i < 4; i++) {
+            cur_val += *(float32x2*)(&out_lds[i * S + lane_id * 2]);
+        }
+        const float inv_sum_scale =
+            __fdividef(1.f, warp_sum + 1e-6f);
+        cur_val *= inv_sum_scale;
+        bfloat16x2 tmp_val;
+        tmp_val[0] = cur_val[0];
+        tmp_val[1] = cur_val[1];
+        ((bfloat16x2*)out)[lane_id] = tmp_val;
     }
 }

@@ -2,7 +2,7 @@ import torch
 import aiter
 import pyhip
 
-torch.cuda.set_device(6)
+torch.cuda.set_device(4)
 torch.set_default_device('cuda')
 
 B = 1
@@ -10,7 +10,7 @@ HQ = 32
 HK = 4
 S = 128
 KV_LEN = 45694
-#KV_LEN = 256
+#KV_LEN = 512
 DT = torch.bfloat16
 BLOCK_SIZE = 1
 BLOCK_NUM = B * KV_LEN + 1000
@@ -28,7 +28,7 @@ workspace_buffer = torch.empty(
 if FAKE_Q:
     query = torch.ones(B, HQ, S, dtype=DT)
 else:
-    query = torch.randn(B, HQ, S, dtype=DT)
+    query = torch.randint(-2, 3, [B, HQ, S], dtype=DT)
 key_caches = []
 value_caches = []
 kv_indptrs = []
@@ -38,8 +38,8 @@ BUF_COPY = 1
 BUF_COPY = 32
 # [N, BLOCK_SIZE, HK, S]
 for _ in range(BUF_COPY):
-    key_cache = torch.randn(BLOCK_NUM, BLOCK_SIZE, HK, S, dtype=DT)
-    value_cache = torch.randn(BLOCK_NUM, BLOCK_SIZE, HK, S, dtype=DT)
+    key_cache = torch.randint(-2, 3, [BLOCK_NUM, BLOCK_SIZE, HK, S], dtype=DT)
+    value_cache = torch.randint(-2, 3, [BLOCK_NUM, BLOCK_SIZE, HK, S], dtype=DT)
     batch_start = [0] * (B + 1)
     for b in range(B):
         batch_start[b + 1] = (b + 1) * KV_LEN
@@ -132,24 +132,42 @@ if 0:
 def div_up(x, y):
     return (x + y - 1) // y
 KV_PART_SIZE = 256
+# -g -ggdb -O1
 hip = pyhip.module("pa.cpp", f"-D{HQ=} -D{HK=} -D{S=} -D{BLOCK_SIZE=} -DSCALE={scale} -D{KV_PART_SIZE=} -D{FAKE_Q=} -D{FAKE_K_IDX=}")
 pa = hip.pa
-my_out = torch.ones_like(query)
+pa_reduce = hip.pa_reduce
+my_out_seg = torch.ones([B, HQ, div_up(KV_LEN, KV_PART_SIZE), S], dtype=DT) * 3
+my_out = torch.empty([B, HQ, S], dtype=DT)
+my_max = torch.empty([B, HQ, div_up(KV_LEN, KV_PART_SIZE), 1], dtype=torch.float32) * 5
+my_sum = torch.empty([B, HQ, div_up(KV_LEN, KV_PART_SIZE), 1], dtype=torch.float32) * 6
 qk_out = torch.ones([B, HK, HQ // HK, div_up(KV_LEN, KV_PART_SIZE) * KV_PART_SIZE], dtype=torch.float32)
-pa([B, HK, div_up(KV_LEN, KV_PART_SIZE)], [256], query.data_ptr(), key_caches[-1].data_ptr(), value_caches[-1].data_ptr(), kv_indptrs[-1].data_ptr(), kv_page_indices_[-1].data_ptr(), my_out.data_ptr(), qk_out.data_ptr())
+pa([B, HK, div_up(KV_LEN, KV_PART_SIZE)], [256], query.data_ptr(), key_caches[-1].data_ptr(), value_caches[-1].data_ptr(), kv_indptrs[-1].data_ptr(), kv_page_indices_[-1].data_ptr(), my_out_seg.data_ptr(), qk_out.data_ptr(), my_max.data_ptr(), my_sum.data_ptr())
+pa_reduce([B, HQ], [256], kv_indptrs[-1].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), div_up(KV_LEN, KV_PART_SIZE))
 #assert torch.allclose(out, my_out), "pa acc is wrong"
 print('pa acc ok')
 # check q*k
 if 1:
-    ref_qk = query.reshape(B, HK, HQ // HK, -1) @ key_caches[-1][1:KV_LEN+1].permute(1, 2, 3, 0)
+    ref_qk = query.reshape(B, HK, HQ // HK, -1) @ key_caches[-1][1:KV_LEN*B +1].reshape(B, -1, HK, S).permute(0, 2, 3, 1)
     ref_qk = ref_qk.to(torch.float32)
     qk_out = qk_out[..., :KV_LEN]
+    ref_qk = ref_qk * scale
     idx = torch.where(torch.abs(ref_qk - qk_out) > 1)
     if len(idx[0]):
         print(f'idx = {idx}\nref_qk={ref_qk[idx]}\ncur={qk_out[idx]}')
     assert torch.allclose(ref_qk.to(torch.float32), qk_out, rtol=0.01, atol=0.01), "pa qk is wrong"
-for i in range(10):
+    s = torch.softmax(ref_qk, dim=-1).to(value_cache.dtype)
+    ref_out = s @ value_caches[-1][1:KV_LEN*B+1].reshape(B, -1, HK, S).permute(0, 2, 1, 3)
+    ref_out = ref_out.reshape(B, HQ, S)
+    cur_out = my_out # my_out_seg[:,:,0,:]
+    idx = torch.where(torch.abs(ref_out - cur_out) > 0.05)
+    if len(idx[0]):
+        print(f'idx = {idx}\nref_out={ref_out[idx]}\ncur={cur_out[idx]}')
+    assert torch.allclose(ref_out, cur_out, rtol=0.01, atol=0.01), "pa out is wrong"
+
+i = 0
+for _ in range(10):
     with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="pa"):
-        pa([B, HK, div_up(KV_LEN, KV_PART_SIZE)], [256], query.data_ptr(), key_caches[i].data_ptr(), value_caches[i].data_ptr(), kv_indptrs[i].data_ptr(), kv_page_indices_[i].data_ptr(), my_out.data_ptr(), 0)
+        pa([B, HK, div_up(KV_LEN, KV_PART_SIZE)], [256], query.data_ptr(), key_caches[i].data_ptr(), value_caches[i].data_ptr(), kv_indptrs[i].data_ptr(), kv_page_indices_[i].data_ptr(), my_out_seg.data_ptr(), 0, my_max.data_ptr(), my_sum.data_ptr())
+        pa_reduce([B, HQ], [256], kv_indptrs[i].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), div_up(KV_LEN, KV_PART_SIZE))
     i = (i + 1) % BUF_COPY
 print('done')
