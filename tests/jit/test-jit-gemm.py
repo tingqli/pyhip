@@ -57,8 +57,8 @@ class Buffer:
 '''
 jit 程序也能表达 Tile 吗？
 '''
-
-def gemm_kernel(J):
+@pyhip.jit("(int*, int)")
+def kernel(J):
     p_kargs = J.new_gpr('s',[0,1])
     threadId_X = J.new_gpr('v',[0,0])
     vtemp =J.new_gpr('v',4) 
@@ -120,10 +120,6 @@ def gemm_kernel(J):
     J.Label("bb1")
 
     # flat_store_dword(v[2:3], v0)
-
-jit = pyhip.JIT()
-gemm_kernel(jit)
-kernel = jit.build("test(int* p, int K)")
 
 import torch
 torch.set_printoptions(linewidth=300)

@@ -1,5 +1,5 @@
 from .hiptools import module
-from .jit import JIT
+from .asmjit import jit
 
 class torchPerf(object):
     def __init__(self):

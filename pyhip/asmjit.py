@@ -487,7 +487,7 @@ class JIT:
                     expr_insts.append(inst)
             self.compile_bb_expr(bb, expr_insts)
 
-    def build(self, signature):
+    def build(self, kernel_name, signature, extra_compiler_options):
         self.asm_debug_info = ""
         self._finish_bb(self.current_bb)
 
@@ -534,9 +534,8 @@ class JIT:
         signature = f"{kernel_name}({str_arg_c_del})"
         '''
         inline_asm = "\n".join([ f'"{line}\\n"' if len(line) else "" for line in asm.splitlines()])
-        kernel_name = signature.split("(")[0]
         str_used_gprs = ",".join([f'\"{s}\"' for s in used_gprs])
-        print(f" kernel: {signature}  used_gprs={used_gprs}")
+        print(f" kernel: {kernel_name}{signature}  used_gprs={used_gprs}")
 
         hip_src =r'''
 #include <hip/hip_fp16.h> // for __fp16
@@ -546,7 +545,7 @@ class JIT:
 #include <iostream>
 #include <cstdio>
 #include <cstdlib>
-__global__ void __launch_bounds__(256, 1) ''' + signature +  r''' {
+__global__ void __launch_bounds__(256, 1) ''' + kernel_name + signature +  r''' {
     //A[threadIdx.x] = K;
     asm volatile("\n"
 ''' + "\n" + inline_asm + \
@@ -559,5 +558,23 @@ r'''
         cpp_src_fpath = os.path.join(os.getcwd(),f'.jit-gen-{kernel_name}.cpp')
         with open(cpp_src_fpath, 'w', encoding='utf-8') as f:
             f.write(hip_src)
-        hip = module(cpp_src_fpath)
+        hip = module(cpp_src_fpath, extra_compiler_options)
         return getattr(hip, kernel_name)
+
+'''
+@jit(signature="(type arg, ...)")
+def kernel(J):
+    ...
+'''
+class jit:
+    def __init__(self, signature, extra_compiler_options = ""):
+        self.signature = signature
+        self.extra_compiler_options = extra_compiler_options
+
+    def __call__(self, func):
+        assert callable(func)
+        J = JIT()
+        func(J)
+        func_name = func.__name__
+        return J.build(func_name, self.signature, self.extra_compiler_options)
+

@@ -1,5 +1,6 @@
 import pyhip
 
+@pyhip.jit("(int* p, int K)")
 def kernel(J):
     p_kargs = J.new_gpr('s',[0,1],name="p_kargs")
     threadIdx_x = J.new_gpr('v',[0,0],name="threadIdx_x")
@@ -56,9 +57,9 @@ def kernel(J):
 
     # flat_store_dword(v[2:3], v0)
 
-jit = pyhip.JIT()
-kernel(jit)
-kernel = jit.build("test(int* p, int K)")
+# jit = pyhip.JIT()
+# kernel(jit)
+# kernel = jit.build("test(int* p, int K)")
 
 import torch
 torch.set_printoptions(linewidth=300)
