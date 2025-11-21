@@ -1,4 +1,4 @@
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Union
 from .hiptools import module
 
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
@@ -6,6 +6,10 @@ class Instruction:
     def __init__(self, parent_bb:'BasicBlock', opcode):
         self.opcode = opcode
         self.parent_bb = parent_bb
+        assert not opcode.startswith("s_call")
+        self.is_branch = self.opcode.startswith("s_branch")
+        self.is_cbranch = self.opcode.startswith("s_cbranch_")
+        self.debug_info = ""
 
     def __call__(self, *operands, mod:str=""):
         self.operands = operands
@@ -15,7 +19,7 @@ class Instruction:
         self.parent_bb.add_instruction(self)
 
     def __repr__(self):
-        return f"{self.opcode} {','.join([repr(op) for op in self.operands])} {self.mod}"
+        return f"{self.opcode} {','.join([repr(op) for op in self.operands])} {self.mod} ; {self.debug_info}"
 
 class GPRExpr:
     def __init__(self, op:str, src0=None, src1=None, src2=None):
@@ -93,11 +97,12 @@ class GPRItemPat:
 # GPRs should be allocated by JIT
 class GPRs:
     patterns = None
-    def __init__(self, jit, rtype, start_id, count):
+    def __init__(self, jit, rtype, start_id, count, align=0):
         self.jit = jit
         self.rtype = rtype
         self.start_id = start_id
         self.count = count
+        self.align = align
 
     def __getitem__(self, key):
         if isinstance(key, slice):
@@ -138,25 +143,63 @@ class GPRs:
 
 # every basic block has a Label in asm
 class BasicBlock:
+    index = 0
     def __init__(self, jit, label_name):
+        self.bb_index = BasicBlock.index
+        BasicBlock.index += 1
         self.jit = jit
         self.label_name = label_name
+        if label_name == "":
+            self.label_name = f"_bb_no_name_{self.bb_index}"
+        
+        jit.label2bb[self.label_name] = self
         self.instructions: List[Instruction] = []
         self.predecessors: List['BasicBlock'] = []
         self.successors: List['BasicBlock'] = []
+        self.unsolved_successores : List[str] = []
+
+    # all bb has been defined, solve label target bb
+    def solve_succesors(self):
+        for label in self.unsolved_successores:
+            successor = self.jit.label2bb[label]
+            self.add_successor(successor)
 
     def add_instruction(self, instr: Instruction):
         self.instructions.append(instr)
-
-    def add_successor(self, successor: 'BasicBlock'):
-        if successor not in self.successors:
-            self.successors.append(successor)
-        if self not in successor.predecessors:
-            successor.predecessors.append(self)
+        # branch or cbranch can tell successors
+        if instr.is_branch:
+            # one possible successor
+            self.jit._finish_bb(self, "")
+            target_lable_str = instr.mod
+            self.add_successor(target_lable_str)
+        elif instr.is_cbranch:
+            # two possible successor
+            self.jit._finish_bb(self, "")
+            target_lable_str = instr.mod
+            self.add_successor(target_lable_str)
+            self.add_successor(self.jit.current_bb)
+    
+    def add_successor(self, successor: Union['BasicBlock', str]):
+        if isinstance(successor, BasicBlock):
+            if successor not in self.successors:
+                self.successors.append(successor)
+            if self not in successor.predecessors:
+                successor.predecessors.append(self)
+        else:
+            assert isinstance(successor, str)
+            if successor in self.jit.label2bb:
+                successor = self.jit.label2bb[successor]
+                self.add_successor(successor)
+            else:
+                # unknown BB in the future
+                self.unsolved_successores.append(successor)
 
     def __repr__(self):
         # https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html#Special-format-strings
-        asm = f"{self.label_name}%=:\n"
+        asm = f"{self.label_name}:\n"
+        asm += f";BB#{self.bb_index}\n"
+        asm += f";predecessors:[{','.join([p.label_name for p in self.predecessors])}]\n"
+        asm += f";successors:[{','.join([p.label_name for p in self.successors])}]\n"
         for inst in self.instructions:
             asm += f"\t{inst}\n"
         return asm
@@ -164,10 +207,13 @@ class BasicBlock:
 # JIT emits instructions into BBs
 class JIT:
     def __init__(self):
-        self.current_bb = BasicBlock(self, "main")
         self.blocks = []
         # increased freely
         self.free_gpr_id = {'s':0, 'v':0, 'a': 0}
+        self.label2bb = {}
+        self.current_bb = BasicBlock(self, "main")
+        self.relocatable_gprs = []
+        self.fixed_gprs = []
 
     def __getattr__(self, instruction):
         return Instruction(self.current_bb, instruction)
@@ -176,12 +222,13 @@ class JIT:
         assert bb is self.current_bb
         self.blocks.append(bb)
         next_bb = BasicBlock(self, next_bb_name)
-        bb.add_successor(next_bb)
         self.current_bb = next_bb
 
     def Label(self, name=""):
         # creat new basic block, archieve current bb
+        old_bb = self.current_bb
         self._finish_bb(self.current_bb, name)
+        old_bb.add_successor(self.current_bb)
         return self.current_bb
 
     def _align_up(self, a, align):
@@ -194,7 +241,9 @@ class JIT:
             count = count_range
             start_id = self._align_up(self.free_gpr_id[reg_type], align)
             self.free_gpr_id[reg_type] = start_id + count
-            return GPRs(self, reg_type, start_id, count)
+            gprs = GPRs(self, reg_type, start_id, count, align=align)
+            self.relocatable_gprs.append(gprs)
+            return gprs
         elif isinstance(count_range, tuple) or isinstance(count_range, list):
             assert len(count_range) == 2
             assert align == 1
@@ -202,19 +251,179 @@ class JIT:
             assert self.free_gpr_id[reg_type] <= first_id, "specified reg has been allocated"
             assert self.free_gpr_id[reg_type] <= last_id, "specified reg has been allocated"
             self.free_gpr_id[reg_type] = last_id + 1
-            return GPRs(self, reg_type, first_id, last_id - first_id + 1)
+            gprs = GPRs(self, reg_type, first_id, last_id - first_id + 1, align=align)
+            self.fixed_gprs.append(gprs)
+            return gprs
         else:
             assert 0
 
+    # this step is not mandatory，but it allows more registers to use
+    # linear-scan:
+    #    try to shrink register usage on `relocatable_gprs`
+    #    do not touch `fixed_gprs`
+    def register_allocation_linear_scan(self):
+        # note: BB in self.blocks has been ordered, assign each instruction an serial
+        serial_index = 0
+        for bb in self.blocks:
+            for inst in bb.instructions:
+                inst.sid = serial_index
+                serial_index += 1
+
+        # find live-intervals of gprs in `relocatable_gprs`
+        live_intervals = {}
+        bb_access_gprs = {}
+        for bb in self.blocks:
+            bb_access_gprs[bb] = []
+            for inst in bb.instructions:
+                # inst.sid
+                for op in inst.operands:
+                    if isinstance(op, GPRExpr):
+                        gprs = op.src0
+                    elif isinstance(op, GPRs):
+                        gprs = op
+                    else:
+                        continue
+                    if gprs in self.fixed_gprs:
+                        continue
+                    assert gprs in self.relocatable_gprs
+                    if gprs not in live_intervals:
+                        live_intervals[gprs] = [inst.sid, inst.sid]
+                    live_intervals[gprs][0] = min(live_intervals[gprs][0], inst.sid)
+                    live_intervals[gprs][1] = max(live_intervals[gprs][1], inst.sid)
+                    bb_access_gprs[bb].append(gprs)
+
+        # extend live-interval of gprs within loop
+        # if jump to bb with higher sid, then we don't need to handle since interval logic works fine
+        # based on sid, but if we found a jump back(successor with smaller sid), we need to handle
+        # it, and it only affect register which's life ends within current bb
+        # so in bb where register ends, we check if such loop-back exists, if so extend it to the jump-back
+        # instruction.
+        for bb in self.blocks:
+            if len(bb.instructions) == 0: continue
+            sid0 = bb.instructions[0].sid
+            for parent_bb in bb.predecessors:
+                if parent_bb.instructions[0].sid > sid0:
+                    # backward jump detected, enlarge all gpr's interval
+                    jump_back_sid = parent_bb.instructions[-1].sid
+                    for gprs in live_intervals:
+                        first_sid,last_sid = live_intervals[gprs]
+                        if first_sid < sid0 and last_sid >= sid0 and last_sid < jump_back_sid:
+                            live_intervals[gprs][1] = jump_back_sid
+
+        # add debug-info to inst
+        for bb in self.blocks:
+            for inst in bb.instructions:
+                debug_info = f" #{inst.sid}  regs:"
+                for gprs in live_intervals:
+                    first_sid, last_sid = live_intervals[gprs]
+                    if inst.sid >= first_sid and inst.sid <= last_sid:
+                        debug_info += f"{gprs},"
+                inst.debug_info = debug_info
+
+        self.asm_debug_info += ";============ register live interval ==============\n"
+        for gprs in live_intervals:
+            first_sid, last_sid = live_intervals[gprs]
+            self.asm_debug_info += f";{repr(gprs):10s}  {first_sid} ~ {last_sid}\n"
+
+        # re-assign each gprs's start_id (linear_scan)
+        # sorted_live_interval = [(live_intervals[gprs][0], live_intervals[gprs][1], gprs) for gprs in live_intervals].sort()
+        event_list = []
+        for gprs in live_intervals:
+            first_sid, last_sid = live_intervals[gprs]
+            event_list.append((first_sid, 0, repr(gprs), gprs)) # 0 means first-use
+            event_list.append((last_sid, 1, repr(gprs), gprs)) # 1 means last-use
+
+        # linear_scan all events according to time
+        reg_resource = {"s":[0 for _ in range(103)],
+                        "v": [0 for _ in range(256)],
+                        "a": [0 for _ in range(256)]}
+        # reserve fixed gprs
+        for gprs in self.fixed_gprs:
+            i0 = gprs.start_id
+            i1 = gprs.start_id + gprs.count
+            reg_resource[gprs.rtype][i0:i1] = [1]*gprs.count
+        
+        '''
+        self.rtype = rtype
+        self.start_id = start_id
+        self.count = count
+        self.align = align
+        '''
+        from collections import OrderedDict
+        # there may be multiple first/last use events at same sid
+        # we group them and then do allocation before free, because
+        #   - alloc happens before instruction
+        #   - free happends after instruction
+        event_groups = OrderedDict()
+        for sid, event, _, gprs in sorted(event_list):
+            if sid not in event_groups:
+                event_groups[sid] = []
+            event_groups[sid].append([event, gprs])
+
+        def alloc_gpr(gprs):
+            rtype = gprs.rtype
+            count = gprs.count
+            align = gprs.align
+            slots = reg_resource[rtype]
+            for i in range(0, len(slots), align):
+                if all(s == 0 for s in slots[i:(i+count)]):
+                    gprs.start_id = i
+                    slots[i:(i+count)] = [1]*count # mark as used
+                    return
+            assert 0, f"cannot allocate {gprs}, not enough resources"
+
+        def free_gpr(gprs):
+            rtype = gprs.rtype
+            count = gprs.count
+            slots = reg_resource[rtype]
+            i = gprs.start_id
+            slots[i:(i+count)] = [0]*count
+
+        self.asm_debug_info += ";============ register allocation ==============\n"
+        for sid, events in event_groups.items():
+            # at same first allocation 
+            for ev,gprs in events:
+                if ev == 0: # first use
+                    alloc_gpr(gprs)
+                    self.asm_debug_info += f";alloc {gprs} at #{sid}\n"
+            # now free
+            for ev,gprs in events:
+                if ev == 1: # last use
+                    free_gpr(gprs)
+                    self.asm_debug_info += f";free {gprs} at #{sid}\n"
+
+        # (following code-gen phase will use the new start_id automatically)
+
+        return
+
     def build(self, signature):
+        self.asm_debug_info = ""
         self._finish_bb(self.current_bb)
-        # generate asm
+
+        # remove unreachable bb
+        bb_to_remove = []
+        for bb in self.blocks[1:]:
+            if len(bb.predecessors) == 0:
+                print(f"remove unreachable code block {bb.label_name}")
+                bb_to_remove.append(bb)
+        for bb in bb_to_remove:
+            self.blocks.remove(bb)
+
+        # resolve successors from label
+        for bb in self.blocks:
+            bb.solve_succesors()
+
+        self.register_allocation_linear_scan()
+
+        # generate asm: basic blocks are in natural order
         asm=""
         for bb in self.blocks:
             asm += repr(bb)
+        asm += self.asm_debug_info
 
         used_gprs = []
         for a in asm.splitlines():
+            if a[0] == ";": continue
             for op in a.replace(","," ").split()[1:]:
                 if (op.startswith("s") or op.startswith("v") or op.startswith("a")) and (op[1].isdigit()):
                     gpr_type = op[0]
