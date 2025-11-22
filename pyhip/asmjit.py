@@ -1,5 +1,7 @@
 from typing import List, Optional, Set, Union
 from .hiptools import module
+import inspect
+import os
 
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
@@ -16,7 +18,7 @@ class Instruction:
         self.operands = operands
         self.mod = mod
         for i, op in enumerate(operands):
-            assert isinstance(op, GPRExpr) or isinstance(op, int) or isinstance(op, float) or isinstance(op, GPRs), f"arg {i} type is {type(op)}"
+            assert isinstance(op, GPRExpr) or isinstance(op, int) or isinstance(op, float) or op=="scc" or isinstance(op, GPRs), f"arg {i} type is {type(op)}"
         self.parent_bb.add_instruction(self, insert_bb_pos)
 
     def __repr__(self):
@@ -49,6 +51,30 @@ class GPRExpr:
         return GPRExpr(">>", self, other)
     def __rrshift__(self, other):
         return GPRExpr(">>", other, self)
+    def __and__(self, other):
+        return GPRExpr("&", self, other)
+    def __rand__(self, other):
+        return GPRExpr("&", self, other)
+    def __or__(self, other):
+        return GPRExpr("|", self, other)
+    def __ror__(self, other):
+        return GPRExpr("|", self, other)
+    def __xor__(self, other):
+        return GPRExpr("^", self, other)
+    def __rxor__(self, other):
+        return GPRExpr("^", self, other)
+    def __eq__(self, other):
+        return GPRExpr("eq", self, other)
+    def __ne__(self, other):
+        return GPRExpr("ne", self, other)
+    def __lt__(self, other):
+        return GPRExpr("lt", self, other)
+    def __gt__(self, other):
+        return GPRExpr("gt", self, other)
+    def __le__(self, other):
+        return GPRExpr("le", self, other)
+    def __ge__(self, other):
+        return GPRExpr("ge", self, other)
 
     def __repr__(self):
         if self.op == "getitem":
@@ -65,21 +91,6 @@ class GPRExpr:
             return f"{self.src0} {self.op} {self.src1}"
         else:
             return f"{self.op}({self.src0},{self.src1},{self.src2})"
-
-class GPRItemPat:
-    def __init__(self, rtype:str, count:int = 1):
-        self.rtype = rtype
-        self.count = count
-
-    def match(self, other):
-        if self.rtype == "i":
-            return isinstance(other, int)
-        self.other = other
-        if not isinstance(other, GPRExpr): return False
-        if other.op != "getitem": return False
-        if self.rtype != other.src0.rtype: return False
-        other_count = other.src2 - other.src1 + 1
-        return self.count == other_count
 
 # a continous region of GPRs allocated
 # to reference GPR in it, we need getitem:
@@ -198,13 +209,14 @@ def float_to_ieee754_bits_little(f):
     return bits
 
 # JIT emits instructions into BBs
+all_kernel_hip_src_names = {}
 class JIT:
     def __init__(self):
         self.blocks = []
         # increased freely
         self.free_gpr_id = {'s':0, 'v':0, 'a': 0}
         self.label2bb = {}
-        self.current_bb = BasicBlock(self, "main")
+        self.current_bb = BasicBlock(self, "_jit_main")
         self.relocatable_gprs = []
         self.fixed_gprs = []
 
@@ -295,6 +307,7 @@ class JIT:
             if len(bb.instructions) == 0: continue
             sid0 = bb.instructions[0].sid
             for parent_bb in bb.predecessors:
+                assert len(parent_bb.instructions) > 0, f"{parent_bb.label_name} is empty"
                 if parent_bb.instructions[0].sid > sid0:
                     # backward jump detected, enlarge all gpr's interval
                     jump_back_sid = parent_bb.instructions[-1].sid
@@ -410,6 +423,12 @@ class JIT:
             src_expr = inst.operands[1]
             assert isinstance(dst_expr, GPRExpr)
             assert dst_expr.op == "getitem"
+            dst_gprs = dst_expr.src0
+            dst_idx0 = dst_expr.src1
+            dst_idx1 = dst_expr.src2
+            dst_cnt = dst_idx1 - dst_idx0 + 1
+            rtype = dst_gprs.rtype
+            dtype = dst_gprs.dtype
 
             # convert to binary format
             if isinstance(src_expr, float):
@@ -417,62 +436,88 @@ class JIT:
 
             if isinstance(src_expr, GPRExpr):
                 # op(dst_expr, ...)
+                # so far there is no rigid syntax checks
                 if src_expr.op == "getitem":
                     # assign
-                    dst_gprs = dst_expr.src0
-                    dst_idx0 = dst_expr.src1
-                    dst_idx1 = dst_expr.src2
-                    dst_cnt = dst_idx1 - dst_idx0 + 1
                     src_cnt = src_expr.src2 - src_expr.src1 + 1
                     assert dst_cnt == src_cnt
                     assert dst_cnt == 1 or dst_cnt == 2
-                    new_inst = Instruction(bb, f"{dst_gprs.rtype}_mov_b32")
+                    new_inst = Instruction(bb, f"{rtype}_mov_b32")
                     new_inst(dst_expr, src_expr, insert_bb_pos=pos)
                 elif src_expr.op == "+":
-                    assert dst_gprs.dtype != ""
-                    new_inst = Instruction(bb, f"{dst_gprs.rtype}_add_{dst_gprs.dtype}")
+                    assert dtype != ""
+                    new_inst = Instruction(bb, f"{rtype}_add_{dtype}")
                     new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
                 elif src_expr.op == "-":
-                    assert dst_gprs.dtype != ""
-                    new_inst = Instruction(bb, f"{dst_gprs.rtype}_sub_{dst_gprs.dtype}")
+                    assert dtype != ""
+                    new_inst = Instruction(bb, f"{rtype}_sub_{dtype}")
                     new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
                 elif src_expr.op == "*":
-                    assert dst_gprs.dtype != ""
-                    if dst_gprs.rtype == "s":
-                        new_inst = Instruction(bb, f"s_mul_{dst_gprs.dtype}")
-                    elif dst_gprs.rtype == "v":
-                        if dst_gprs.dtype == "u32" or dst_gprs.dtype == "u16":
-                            new_inst = Instruction(bb, f"v_mul_lo_{dst_gprs.dtype}")
-                        elif dst_gprs.dtype == "f32" or dst_gprs.dtype == "f16":
-                            new_inst = Instruction(bb, f"v_mul_{dst_gprs.dtype}")
+                    assert dtype != ""
+                    if rtype == "s":
+                        new_inst = Instruction(bb, f"s_mul_{dtype}")
+                    elif rtype == "v":
+                        if dtype in ["u32", "u16"]:
+                            new_inst = Instruction(bb, f"v_mul_lo_{dtype}")
+                        elif dtype in ["f32", "f16"]:
+                            new_inst = Instruction(bb, f"v_mul_{dtype}")
                         else:
-                            assert 0, f"unsupported v_mul dtype: {dst_gprs.dtype}"
+                            assert 0, f"unsupported v_mul dtype: {dtype}"
                     else:
-                        assert 0, f"unsupported v_mul rtype: {dst_gprs.rtype}"
+                        assert 0, f"unsupported v_mul rtype: {rtype}"
                     new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
                 elif src_expr.op == "<<":
-                    if dst_gprs.rtype == "s":
+                    if rtype == "s":
                         new_inst = Instruction(bb, f"s_lshl_b32")
                         new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                    elif dst_gprs.rtype == "v":
+                    elif rtype == "v":
                         new_inst = Instruction(bb, f"v_lshlrev_b32")
                         new_inst(dst_expr, src_expr.src1, src_expr.src0, insert_bb_pos=pos)
                     else:
-                        assert 0, f"unsupported v_mul rtype: {dst_gprs.rtype}"
+                        assert 0, f"unsupported v_mul rtype: {rtype}"
                 elif src_expr.op == ">>":
-                    if dst_gprs.rtype == "s":
-                        new_inst = Instruction(bb, f"s_lshr_b32")
+                    if rtype == "s":
+                        if dtype == "u32":
+                            new_inst = Instruction(bb, f"s_lshr_b32")
+                        elif dtype == "i32":
+                            new_inst = Instruction(bb, f"s_ashr_i32")
+                        else:
+                            assert 0, f"unsupported sgpr shift right dtype {dtype}"
                         new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                    elif dst_gprs.rtype == "v":
-                        new_inst = Instruction(bb, f"v_lshrrev_b32")
+                    elif rtype == "v":
+                        if dtype == "u32":
+                            new_inst = Instruction(bb, f"v_lshrrev_b32")
+                        elif dtype == "i32":
+                            new_inst = Instruction(bb, f"v_ashrrev_i32")
+                        else:
+                            assert 0, f"unsupported vgpr shift right dtype {dtype}"
                         new_inst(dst_expr, src_expr.src1, src_expr.src0, insert_bb_pos=pos)
                     else:
-                        assert 0, f"unsupported v_mul rtype: {dst_gprs.rtype}"
+                        assert 0, f"unsupported rtype: {rtype}"
+                elif src_expr.op == "&":
+                    new_inst = Instruction(bb, f"{rtype}_and_b32")
+                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
+                elif src_expr.op == "|":
+                    new_inst = Instruction(bb, f"{rtype}_or_b32")
+                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
+                elif src_expr.op == "^":
+                    new_inst = Instruction(bb, f"{rtype}_xor_b32")
+                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
+                elif src_expr.op in ["eq","ne","lt","gt","le","ge"]:
+                    if rtype == "s":
+                        op = src_expr.op
+                        if op == "ne" : op = "lg"
+                        new_inst1 = Instruction(bb, f"s_{op}_{dtype}")
+                        new_inst2 = Instruction(bb, f"s_mov_b32")
+                        new_inst1(src_expr.src0, src_expr.src1, insert_bb_pos=pos)
+                        new_inst2(dst_expr, "scc", insert_bb_pos=pos+1)
+                    else:
+                        assert 0, f"unsupported rtype: {rtype}"
                 else:
                     assert 0, f"unsupported expression {src_expr}"
             elif isinstance(src_expr, int):
                 dst_gprs = dst_expr.src0
-                new_inst = Instruction(bb, f"{dst_gprs.rtype}_mov_b32")
+                new_inst = Instruction(bb, f"{rtype}_mov_b32")
                 new_inst(dst_expr, src_expr, insert_bb_pos=pos)
             else:
                 assert 0, f"unsupported expression {src_expr}"
@@ -487,7 +532,7 @@ class JIT:
                     expr_insts.append(inst)
             self.compile_bb_expr(bb, expr_insts)
 
-    def build(self, kernel_name, signature, extra_compiler_options):
+    def build(self, kernel_name, signature, extra_compiler_options, temp_filename):
         self.asm_debug_info = ""
         self._finish_bb(self.current_bb)
 
@@ -497,8 +542,12 @@ class JIT:
             if len(bb.predecessors) == 0:
                 print(f"remove unreachable code block {bb.label_name}")
                 bb_to_remove.append(bb)
-        for bb in bb_to_remove:
-            self.blocks.remove(bb)
+        for empty_bb in bb_to_remove:
+            for bb in empty_bb.predecessors:
+                bb.successors.remove(empty_bb)
+            for bb in empty_bb.successors:
+                bb.predecessors.remove(empty_bb)
+            self.blocks.remove(empty_bb)    
 
         # resolve successors from label
         for bb in self.blocks:
@@ -534,7 +583,9 @@ class JIT:
         signature = f"{kernel_name}({str_arg_c_del})"
         '''
         inline_asm = "\n".join([ f'"{line}\\n"' if len(line) else "" for line in asm.splitlines()])
-        str_used_gprs = ",".join([f'\"{s}\"' for s in used_gprs])
+        str_used_gprs = ""
+        if len(used_gprs):
+            str_used_gprs = "," + ",".join([f'\"{s}\"' for s in used_gprs])
         print(f" kernel: {kernel_name}{signature}  used_gprs={used_gprs}")
 
         hip_src =r'''
@@ -551,11 +602,11 @@ __global__ void __launch_bounds__(256, 1) ''' + kernel_name + signature +  r''' 
 ''' + "\n" + inline_asm + \
 r'''
                 ::
-                :"memory",''' + str_used_gprs + r''');
+                :"memory"''' + str_used_gprs + r''');
 }
         '''
         import os
-        cpp_src_fpath = os.path.join(os.getcwd(),f'.jit-gen-{kernel_name}.cpp')
+        cpp_src_fpath = os.path.join(os.getcwd(),f'{temp_filename}.cpp')
         with open(cpp_src_fpath, 'w', encoding='utf-8') as f:
             f.write(hip_src)
         hip = module(cpp_src_fpath, extra_compiler_options)
@@ -573,8 +624,13 @@ class jit:
 
     def __call__(self, func):
         assert callable(func)
+        # here we need to avoid generating same temp HIP source name for different kernel with same name.
+        # otherwise it will try to generate same CO binary and causes conflict when being loaded & used
+        file_info = inspect.getfile(func)
+        line_no = inspect.getsourcelines(func)[1]
+        filename = os.path.basename(file_info)
         J = JIT()
         func(J)
         func_name = func.__name__
-        return J.build(func_name, self.signature, self.extra_compiler_options)
+        return J.build(func_name, self.signature, self.extra_compiler_options, temp_filename = f"jit-{filename}-{line_no}-{func_name}")
 

@@ -56,14 +56,30 @@ v2[0] = v2[0] + v2[1]  # v_add_u32(v[0], v[0], v[1])
 # 时并不生成instruction，而是插入一个特殊占位符指令，在全部jit运行完毕之后，这些占位符指令记录下来的表达式
 # 就能被统一优化并生成instruction序列。
 # 能够进行公共表达式优化的都必须在一个基本块内部。
-# 复杂表达式先被拆分为简单表达式，然后
+# 复杂表达式先被拆分为简单表达式，然后查找公共
 v2[0] = v2[0] + (v2[1] & 0x60)<<2
 
 ```
 
-```
- sdst[...] = ssrc0 << ssrc1
- s_lshl_b32 sdst,   ssrc0,     ssrc1:u32
+# control flow
+
+比较表达式：
+ - 结果可以参与运算,可以使用:
+    s_mov_b32 dst, scc 
+    s_cselect_b64 vcc, -1, 0
+    S_CSELECT_{B32, B64}    SOP2 n  D = SCC ? S0 : S1.
+    S_CMOVK_I32             SOPK n  if (SCC) D = signext(simm16).
+    S_CMOV_{B32,B64}        SOP1 n  if (SCC) D = S0, else NOP.
+
+ - 直接控制跳转： S_CBRANCH_SCC0/S_CBRANCH_SCC1
+
+# 单元测试
+复杂的jit逻辑需要单元测试保证正确性：
+ - 类似LLVM那样直接检查最终汇编代码是否符合预期，这种检查可以使用特殊jit指令完成，无需invoke后端编译工具
+ - 也可以实际运行代码看运行结果是否符合预期，测试用例需要读入数据，执行某些操作，写回数据，由host检查结果正确性
+
+```bash
+pytest unittest/
 ```
 
 # 表达式解析
