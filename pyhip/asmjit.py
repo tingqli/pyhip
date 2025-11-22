@@ -18,7 +18,12 @@ class Instruction:
         self.operands = operands
         self.mod = mod
         for i, op in enumerate(operands):
-            assert isinstance(op, GPRExpr) or isinstance(op, int) or isinstance(op, float) or op=="scc" or isinstance(op, GPRs), f"arg {i} type is {type(op)}"
+            assert isinstance(op, GPRExpr) or \
+                   isinstance(op, int) or isinstance(op, float) or \
+                   op=="scc" or op == "vcc" or op == "off" or \
+                   (isinstance(op, str) and op.startswith("0x")) or \
+                   isinstance(op, GPRs), \
+            f"arg {i} type is {type(op)}"
         self.parent_bb.add_instruction(self, insert_bb_pos)
 
     def op_repr(self, op):
@@ -479,14 +484,40 @@ class JIT:
             if isinstance(src1_operand, float): # convert float-const into int?
                 src1_operand = float_to_ieee754_bits_little(src1_operand)
 
+        def vgpr_add_sub_ui32(op):
+            nonlocal src0_operand, src1_operand
+            if isinstance(src0_operand, GPRExpr) and isinstance(src1_operand, GPRExpr):
+                return Instruction(bb, f"v_add_u32_e32" if op == '+' else f"v_sub_u32_e32")
+            if isinstance(src0_operand, GPRExpr):
+                if op == '-':
+                    src1_operand = hex(-src1_operand & 0xffffffff)
+                # v_add_u32_e32's src0 can be const
+                src1_operand, src0_operand = src0_operand, src1_operand
+                return Instruction(bb, f"v_add_u32_e32") # vgpr + (+/- const)
+            if isinstance(src1_operand, GPRExpr):
+                if op == '-':
+                    return Instruction(bb, f"v_sub_u32_e32") # const - vgpr
+                return Instruction(bb, f"v_add_u32_e32") # const + vgpr
+            assert 0
+
         # now src0_operand & src1_operand are generated, we can generate our result
         if expr.op == "+":
             assert dtype != ""
-            new_inst = Instruction(bb, f"{rtype}_add_{dtype}")
+            if rtype == "s":
+                new_inst = Instruction(bb, f"{rtype}_add_{dtype}")
+            elif rtype == "v" and dtype in ["u32", "i32"]:
+                new_inst = vgpr_add_sub_ui32(expr.op)
+            else:
+                assert 0
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "-":
             assert dtype != ""
-            new_inst = Instruction(bb, f"{rtype}_sub_{dtype}")
+            if rtype == "s":
+                new_inst = Instruction(bb, f"{rtype}_sub_{dtype}")
+            elif rtype == "v" and dtype in ["u32", "i32"]:
+                new_inst = vgpr_add_sub_ui32(expr.op)
+            else:
+                assert 0
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "*":
             assert dtype != ""
@@ -501,6 +532,8 @@ class JIT:
                     new_inst = Instruction(bb, f"v_mul_lo_{dtype}")
                 elif dtype in ["f32", "f16"]:
                     new_inst = Instruction(bb, f"v_mul_{dtype}")
+                elif dtype in ["i32"]:
+                    new_inst = Instruction(bb, f"v_mul_i32_i24")
                 else:
                     assert 0, f"unsupported v_mul dtype: {dtype}"
             else:
@@ -551,6 +584,18 @@ class JIT:
                 mov = Instruction(bb, f"s_mov_b32")
                 cmp(src0_operand, src1_operand)
                 mov(dst_expr, "scc")
+            elif rtype == "v":
+                op = expr.op
+                # if op == "ne" : op = "lg"
+                # only src0 can be const
+                if not isinstance(src1_operand, GPRExpr):
+                    src1_operand, src0_operand = src0_operand, src1_operand
+                    cmp_op_reverse = {"gt":"le", "lt":"ge", "le":"gt", "ge":"lt", "eq":"eq", "ne":"ne"}
+                    op = cmp_op_reverse[op]
+                cmp = Instruction(bb, f"v_cmp_{op}_{dtype}_e32")
+                mov = Instruction(bb, f"v_cndmask_b32_e64")
+                cmp("vcc", src0_operand, src1_operand)
+                mov(dst_expr, 0, 1, "vcc")
             else:
                 assert 0, f"unsupported rtype: {rtype}"
         else:
