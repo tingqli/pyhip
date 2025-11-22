@@ -148,6 +148,7 @@ __device__ void s_waitcnt_lgkmcnt() {
 #define SCALE 1.0 
 #define KV_PART_SIZE 256
 #endif
+#define KV_MIN_PART_SIZE 256
 
 template<typename TS, typename TD>
 TD& cast(TS& t) {
@@ -166,7 +167,7 @@ constexpr void compile_time_loop(F&& f) {
                           std::make_index_sequence<N>{});
 }
 
-#define KV_PART_SIZE_WARP (KV_PART_SIZE / 4)
+#define KV_PART_SIZE_WARP (KV_MIN_PART_SIZE / 4)
 
 struct share_buf_t {
     __bf16* buf;
@@ -217,8 +218,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     uint kv_len = kv_indptr[b + 1] - kv_indptr[b];
     if (kv_part * KV_PART_SIZE >= kv_len) return;
     uint kv_len_start = std::min(kv_part * KV_PART_SIZE + warp_id * KV_PART_SIZE_WARP, kv_len);
-    uint kv_len_end = std::min(kv_len_start + KV_PART_SIZE_WARP, kv_len);
-    kv_page_indices += kv_indptr[b] + kv_len_start / BLOCK_SIZE;
+    uint kv_len_end = std::min(kv_len_start + KV_PART_SIZE, kv_len);
+    kv_page_indices += kv_indptr[b];
     out_seg += b * HQ * gridDim.z * S + hq * gridDim.z * S + kv_part * S;
     max_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
     sum_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
@@ -236,18 +237,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     float prev_max = - FLT_MAX;
     float prev_sum = 0;
 
-    uint64_t k_offsets[KV_PART_SIZE_WARP / 4];
-    if constexpr (BLOCK_SIZE == 1) {
-        for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-            uint local_row_id = n * 4 + key_load_row_id;
-            local_row_id = local_row_id + kv_len_start < kv_len_end ? local_row_id : 0;
-#if FAKE_K_IDX
-            k_offsets[n] = HK * S * sizeof(__bf16) * (kv_len_start + local_row_id + 1) + 8 * sizeof(__bf16) * key_load_col_id;
-#else
-            k_offsets[n] = HK * S * sizeof(__bf16) * (uint64_t)kv_page_indices[local_row_id] + 8 * sizeof(__bf16) * key_load_col_id;
-#endif
-        }
-    }
     // query -> reg
     if (fma_row_id < HQ / HK) {
         #pragma unroll
@@ -260,121 +249,146 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         }
     }
     //s_waitcnt_vmcnt<0>();
-    // key -> reg
-    float32x4 acc[KV_PART_SIZE_WARP / 16] = {0};
-
-    bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4], v_reg_caches[KV_PART_SIZE_WARP / 4];
-
-    for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-        k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, k_offsets[n]);
-    }
     __shared__ __bf16 buff_lds[16 * S * 4];
     share_buf_t share_buf(buff_lds);
-    for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-        v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, k_offsets[n], false);
-    }
-    __bf16* cur_k_buff_lds = share_buf.get_key_buf(warp_id);
-    for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
-        *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 0];
-        *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 1];
-        *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 2];
-        *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 3];
-
-        for (int k = 0; k < S / 32; k++) {
-            auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + k * 32 + fma_col_id * 8]);
-            amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n]);
-            amdgcn_mfma_f32_16x16x16bf16(k_cur.hi, q_cur[k].hi, acc[n]);
-        }
-        acc[n] *= SCALE;
-    }
-    // for debug
-    if (qk_ptr) {
-        // [B, HK, HQ / HK, stride]
-        auto stride = (kv_len + KV_PART_SIZE - 1) / KV_PART_SIZE * KV_PART_SIZE;
-        if (fma_row_id < HQ / HK) {
-            for (int n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
-                auto cur_tmp_ptr = qk_ptr + b * HK * HQ / HK * stride + (hk * (HQ / HK) + fma_row_id) * stride + kv_len_start + n * 16 + fma_col_id * 4;
-                for (int i = 0; i < 4; i++)
-                    cur_tmp_ptr[i] = acc[n][i];
-            }
-        }
-    }
-
-    // sum(exp(acc-max))
-    auto cur_max = prev_max;
-    for (uint n = 0; n < 4; n++) {
-        for (uint i = 0; i < 4; i++) {
-            auto tmp = n * 16 + fma_col_id * 4 + i + kv_len_start < kv_len_end ? acc[n][i] : -FLT_MAX;
-            cur_max = fmaxf(cur_max, tmp);
-        }
-    }
-    for(int mask = 64 / 2; mask >= 16; mask /= 2) {
-        cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
-    }
-    float cur_sum = 0;
-    for (uint n = 0; n < 4; n++) {
-        for (uint i = 0; i < 4; i++) {
-            acc[n][i] = n * 16 + fma_col_id * 4 + i + kv_len_start < kv_len_end ? __expf(acc[n][i] - cur_max) : 0;
-            cur_sum += acc[n][i];
-        }
-    }
-    for(int mask = 64 / 2; mask >= 16; mask /= 2) {
-        cur_sum += __shfl_xor(cur_sum, mask);
-    }
-    cur_sum += prev_sum * __expf(prev_max - cur_max);
-    const float inv_sum_scale =
-        __fdividef(1.f, cur_sum + 1e-6f);
-    bfloat16x4 acc_low[KV_PART_SIZE_WARP / 16];
-    for (uint n = 0; n < 4; n++) {
-        for (uint i = 0; i < 4; i++) {
-            acc_low[n][i] = acc[n][i] * inv_sum_scale;
-        }
-    }
-    //s_waitcnt_vmcnt<0>();
-    __bf16* cur_v_buff_lds = share_buf.get_value_buf(warp_id);
-    //__bf16* cur_v_buff_lds = kv_buff_lds + warp_id * 16 * S;
     float32x4 vout[S / 64 * 4] = {0};
-    for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
-        *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 0];
-        *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 1];
-        *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 2];
-        *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 3];
+    auto cur_max = prev_max;
+    float cur_sum;
 
-        // layout: [4tx4, 16tx4k]-> 16 tokens, 64 of head size used for one iter
-        // K/N 0 1 2 3   4 5 6 7   8 9 10 11  12 13 14 15 ...  56 57 58 59  60 61 62 63 
-        //   0 thread0   thread1   thread2    thread3          thread14     thread15
-        //   1
-        //   2
-        //   3
-        //   4 thread16  thread17  thread18   thread19         thread30     thread31
-        //   5
-        //   6
-        //   7
-        //   ...
-        //  12 thread48  thread49  thread50   thread51         thread62     thread63
-        //  13
-        //  14
-        //  15
-        bfloat16x4 v_curs[4], v_curs_tr[4];
-        auto transpose4x4 = [] (bfloat16x4 in[4], bfloat16x4 out[4]) {
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                #pragma unroll
-                for (int j = 0; j < 4; j++)
-                    out[i][j] = in[j][i];
+    for (uint part_idx = 0; part_idx < KV_PART_SIZE / KV_MIN_PART_SIZE; part_idx++) {
+        uint64_t k_offsets[KV_PART_SIZE_WARP / 4];
+        auto cur_kv_len_start = kv_len_start + part_idx * KV_MIN_PART_SIZE;
+        if (BLOCK_SIZE == 1) {
+            for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+                uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
+                global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
+    #if FAKE_K_IDX
+                k_offsets[n] = HK * S * sizeof(__bf16) * (global_row_id + 1) + 8 * sizeof(__bf16) * key_load_col_id;
+    #else
+                k_offsets[n] = (uint64_t)(kv_page_indices[global_row_id]) * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+    #endif
             }
-        };
-        for (int k = 0; k < S / 64; k++) {
-            v_curs[0] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 0) * S + k * 64 + key_load_col_id * 4]);
-            v_curs[1] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 1) * S + k * 64 + key_load_col_id * 4]);
-            v_curs[2] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 2) * S + k * 64 + key_load_col_id * 4]);
-            v_curs[3] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 3) * S + k * 64 + key_load_col_id * 4]);
-            transpose4x4(v_curs, v_curs_tr);
-            amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[0], acc_low[n], vout[k * 4 + 0]);
-            amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[1], acc_low[n], vout[k * 4 + 1]);
-            amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[2], acc_low[n], vout[k * 4 + 2]);
-            amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[3], acc_low[n], vout[k * 4 + 3]);
         }
+        // key -> reg
+        float32x4 acc[KV_PART_SIZE_WARP / 16] = {0};
+
+        bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4], v_reg_caches[KV_PART_SIZE_WARP / 4];
+
+        for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+            k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, k_offsets[n]);
+        }
+        for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+            v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, k_offsets[n], false);
+        }
+        __bf16* cur_k_buff_lds = share_buf.get_key_buf(warp_id);
+        for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 0];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 1];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 2];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 3];
+
+            for (int k = 0; k < S / 32; k++) {
+                auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + k * 32 + fma_col_id * 8]);
+                amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n]);
+                amdgcn_mfma_f32_16x16x16bf16(k_cur.hi, q_cur[k].hi, acc[n]);
+            }
+            acc[n] *= SCALE;
+        }
+        // for debug
+        if (qk_ptr) {
+            // [B, HK, HQ / HK, stride]
+            auto stride = (kv_len + KV_PART_SIZE - 1) / KV_PART_SIZE * KV_PART_SIZE;
+            if (fma_row_id < HQ / HK) {
+                for (int n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
+                    auto cur_tmp_ptr = qk_ptr + b * HK * HQ / HK * stride + (hk * (HQ / HK) + fma_row_id) * stride + cur_kv_len_start + n * 16 + fma_col_id * 4;
+                    for (int i = 0; i < 4; i++)
+                        cur_tmp_ptr[i] = acc[n][i];
+                }
+            }
+        }
+
+        // sum(exp(acc-max))
+        for (uint n = 0; n < 4; n++) {
+            for (uint i = 0; i < 4; i++) {
+                auto tmp = n * 16 + fma_col_id * 4 + i + cur_kv_len_start < kv_len_end ? acc[n][i] : -FLT_MAX;
+                cur_max = fmaxf(cur_max, tmp);
+            }
+        }
+        for(int mask = 64 / 2; mask >= 16; mask /= 2) {
+            cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
+        }
+        cur_sum = 0;
+        for (uint n = 0; n < 4; n++) {
+            for (uint i = 0; i < 4; i++) {
+                acc[n][i] = n * 16 + fma_col_id * 4 + i + cur_kv_len_start < kv_len_end ? __expf(acc[n][i] - cur_max) : 0;
+                cur_sum += acc[n][i];
+            }
+        }
+        for(int mask = 64 / 2; mask >= 16; mask /= 2) {
+            cur_sum += __shfl_xor(cur_sum, mask);
+        }
+        cur_sum += prev_sum * __expf(prev_max - cur_max);
+        const float inv_sum_scale =
+            __fdividef(1.f, cur_sum + 1e-6f);
+        bfloat16x4 acc_low[KV_PART_SIZE_WARP / 16];
+        for (uint n = 0; n < 4; n++) {
+            for (uint i = 0; i < 4; i++) {
+                acc_low[n][i] = acc[n][i] * inv_sum_scale;
+            }
+        }
+        // compensation prev vout
+        if (part_idx != 0) {
+            for (int k = 0; k < S / 64 * 4; k++) {
+                vout[k] = prev_sum * __expf(prev_max - cur_max) * inv_sum_scale * vout[k];
+            }
+        }
+        //s_waitcnt_vmcnt<0>();
+        __bf16* cur_v_buff_lds = share_buf.get_value_buf(warp_id);
+        //__bf16* cur_v_buff_lds = kv_buff_lds + warp_id * 16 * S;
+        for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
+            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 0];
+            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 1];
+            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 2];
+            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 3];
+
+            // layout: [4tx4, 16tx4k]-> 16 tokens, 64 of head size used for one iter
+            // K/N 0 1 2 3   4 5 6 7   8 9 10 11  12 13 14 15 ...  56 57 58 59  60 61 62 63 
+            //   0 thread0   thread1   thread2    thread3          thread14     thread15
+            //   1
+            //   2
+            //   3
+            //   4 thread16  thread17  thread18   thread19         thread30     thread31
+            //   5
+            //   6
+            //   7
+            //   ...
+            //  12 thread48  thread49  thread50   thread51         thread62     thread63
+            //  13
+            //  14
+            //  15
+            bfloat16x4 v_curs[4], v_curs_tr[4];
+            auto transpose4x4 = [] (bfloat16x4 in[4], bfloat16x4 out[4]) {
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        out[i][j] = in[j][i];
+                }
+            };
+            for (int k = 0; k < S / 64; k++) {
+                v_curs[0] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 0) * S + k * 64 + key_load_col_id * 4]);
+                v_curs[1] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 1) * S + k * 64 + key_load_col_id * 4]);
+                v_curs[2] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 2) * S + k * 64 + key_load_col_id * 4]);
+                v_curs[3] = *(bfloat16x4*)(&cur_v_buff_lds[(key_load_row_id * 4 + 3) * S + k * 64 + key_load_col_id * 4]);
+                transpose4x4(v_curs, v_curs_tr);
+                amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[0], acc_low[n], vout[k * 4 + 0]);
+                amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[1], acc_low[n], vout[k * 4 + 1]);
+                amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[2], acc_low[n], vout[k * 4 + 2]);
+                amdgcn_mfma_f32_16x16x16bf16(v_curs_tr[3], acc_low[n], vout[k * 4 + 3]);
+            }
+        }
+        prev_max = cur_max;
+        prev_sum = cur_sum;
     }
     __syncthreads();
     // cross max/sum

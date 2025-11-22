@@ -131,7 +131,7 @@ if 0:
 # pa hip
 def div_up(x, y):
     return (x + y - 1) // y
-KV_PART_SIZE = 256
+KV_PART_SIZE = 256 * 4
 # -g -ggdb -O1
 hip = pyhip.module("pa.cpp", f"-D{HQ=} -D{HK=} -D{S=} -D{BLOCK_SIZE=} -DSCALE={scale} -D{KV_PART_SIZE=} -D{FAKE_Q=} -D{FAKE_K_IDX=}")
 pa = hip.pa
