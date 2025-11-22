@@ -166,6 +166,6 @@ def test_vadd():
         print(B)
     torch.testing.assert_close(B[:256], ref)
 
-#test_basic()
-#test_basic2()
-#test_vadd()
+test_basic()
+test_basic2()
+test_vadd()

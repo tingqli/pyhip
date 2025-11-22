@@ -21,8 +21,13 @@ class Instruction:
             assert isinstance(op, GPRExpr) or isinstance(op, int) or isinstance(op, float) or op=="scc" or isinstance(op, GPRs), f"arg {i} type is {type(op)}"
         self.parent_bb.add_instruction(self, insert_bb_pos)
 
+    def op_repr(self, op):
+        if isinstance(op, str):
+            return op
+        return repr(op)
+
     def __repr__(self):
-        return f"{self.opcode} {','.join([repr(op) for op in self.operands])} {self.mod} ; {self.debug_info}"
+        return f"{self.opcode} {','.join([self.op_repr(op) for op in self.operands])} {self.mod} ; {self.debug_info}"
 
 class GPRExpr:
     def __init__(self, op:str, src0=None, src1=None, src2=None):
@@ -236,6 +241,14 @@ class JIT:
         old_bb.add_successor(self.current_bb)
         return self.current_bb
 
+    '''
+    # scalar jump (wave level, no divergent)
+    def Jump(self, label:str, cond:GPRExpr = None):
+        if cond is None:
+            self.s_branch(mod=label)
+        else:
+    '''
+
     def _align_up(self, a, align):
         return ((a + align - 1)//align) * align
 
@@ -414,114 +427,150 @@ class JIT:
                 inst.debug_info = debug_info
         return
 
+    '''
+    with the help of temp vars, complex expression can be recursively generated & appended into bb.
+    '''
+    def recursive_expr_gen(self, bb, dst_expr:GPRExpr,  expr:Union['GPRExpr',int,float]):
+        assert dst_expr.op == "getitem"
+        dst_gprs = dst_expr.src0
+        dst_idx0 = dst_expr.src1
+        dst_idx1 = dst_expr.src2
+        assert dst_idx1 == dst_idx0
+        rtype = dst_gprs.rtype
+        dtype = dst_gprs.dtype        
+        if isinstance(expr, float):
+            expr = float_to_ieee754_bits_little(expr)
+        if isinstance(expr, int):
+            new_inst = Instruction(bb, f"{rtype}_mov_b32")
+            new_inst(dst_expr, expr)
+            return
+        assert isinstance(expr, GPRExpr)
+        if expr.op == "getitem":
+            # assign
+            src_cnt = expr.src2 - expr.src1 + 1
+            assert src_cnt == 1
+            new_inst = Instruction(bb, f"{rtype}_mov_b32")
+            new_inst(dst_expr, expr)
+            return
+
+        if isinstance(expr.src0, GPRExpr):
+            if expr.src0.op == "getitem":
+                # "getitem" expr can be used as operand directly
+                src0_operand = expr.src0
+            else:
+                src0_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                src0_operand = GPRExpr("getitem", src0_gprs, 0, 0)
+                self.recursive_expr_gen(bb, src0_operand, expr.src0)
+        else:
+            src0_operand = expr.src0 # int,float,...
+            if isinstance(src0_operand, float): # convert float-const into int?
+                src0_operand = float_to_ieee754_bits_little(src0_operand)
+
+        if isinstance(expr.src1, GPRExpr):
+            if expr.src1.op == "getitem":
+                # "getitem" expr can be used as operand directly
+                src1_operand = expr.src1
+            else:
+                src1_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                src1_operand = GPRExpr("getitem", src1_gprs, 0, 0)
+                self.recursive_expr_gen(bb, src1_operand, expr.src1)
+        else:
+            src1_operand = expr.src1 # int,float,...
+            if isinstance(src1_operand, float): # convert float-const into int?
+                src1_operand = float_to_ieee754_bits_little(src1_operand)
+
+        # now src0_operand & src1_operand are generated, we can generate our result
+        if expr.op == "+":
+            assert dtype != ""
+            new_inst = Instruction(bb, f"{rtype}_add_{dtype}")
+            new_inst(dst_expr, src0_operand, src1_operand)
+        elif expr.op == "-":
+            assert dtype != ""
+            new_inst = Instruction(bb, f"{rtype}_sub_{dtype}")
+            new_inst(dst_expr, src0_operand, src1_operand)
+        elif expr.op == "*":
+            assert dtype != ""
+            if rtype == "s":
+                if dtype == "u32":
+                    print("s_mul_u32 not exist, using s_mul_i32 instead")
+                    new_inst = Instruction(bb, f"s_mul_i32")
+                else:
+                    new_inst = Instruction(bb, f"s_mul_{dtype}")
+            elif rtype == "v":
+                if dtype in ["u32", "u16"]:
+                    new_inst = Instruction(bb, f"v_mul_lo_{dtype}")
+                elif dtype in ["f32", "f16"]:
+                    new_inst = Instruction(bb, f"v_mul_{dtype}")
+                else:
+                    assert 0, f"unsupported v_mul dtype: {dtype}"
+            else:
+                assert 0, f"unsupported v_mul rtype: {rtype}"
+            new_inst(dst_expr, src0_operand, src1_operand)
+        elif expr.op == "<<":
+            if rtype == "s":
+                new_inst = Instruction(bb, f"s_lshl_b32")
+                new_inst(dst_expr, src0_operand, src1_operand)
+            elif rtype == "v":
+                new_inst = Instruction(bb, f"v_lshlrev_b32")
+                new_inst(dst_expr, src1_operand, src0_operand)
+            else:
+                assert 0, f"unsupported v_mul rtype: {rtype}"
+        elif expr.op == ">>":
+            if rtype == "s":
+                if dtype == "u32":
+                    new_inst = Instruction(bb, f"s_lshr_b32")
+                elif dtype == "i32":
+                    new_inst = Instruction(bb, f"s_ashr_i32")
+                else:
+                    assert 0, f"unsupported sgpr shift right dtype {dtype}"
+                new_inst(dst_expr, src0_operand, src1_operand)
+            elif rtype == "v":
+                if dtype == "u32":
+                    new_inst = Instruction(bb, f"v_lshrrev_b32")
+                elif dtype == "i32":
+                    new_inst = Instruction(bb, f"v_ashrrev_i32")
+                else:
+                    assert 0, f"unsupported vgpr shift right dtype {dtype}"
+                new_inst(dst_expr, src1_operand, src0_operand)
+            else:
+                assert 0, f"unsupported rtype: {rtype}"
+        elif expr.op == "&":
+            new_inst = Instruction(bb, f"{rtype}_and_b32")
+            new_inst(dst_expr, src0_operand, src1_operand)
+        elif expr.op == "|":
+            new_inst = Instruction(bb, f"{rtype}_or_b32")
+            new_inst(dst_expr, src0_operand, src1_operand)
+        elif expr.op == "^":
+            new_inst = Instruction(bb, f"{rtype}_xor_b32")
+            new_inst(dst_expr, src0_operand, src1_operand)
+        elif expr.op in ["eq","ne","lt","gt","le","ge"]:
+            if rtype == "s":
+                op = expr.op
+                if op == "ne" : op = "lg"
+                cmp = Instruction(bb, f"s_cmp_{op}_{dtype}")
+                mov = Instruction(bb, f"s_mov_b32")
+                cmp(src0_operand, src1_operand)
+                mov(dst_expr, "scc")
+            else:
+                assert 0, f"unsupported rtype: {rtype}"
+        else:
+            assert 0, f"unsupported expression {expr}"
+
+
     def compile_bb_expr(self, bb, expr_insts):
         for inst in expr_insts:
             pos = bb.instructions.index(inst)
             bb.instructions.remove(inst)
+            
             # insert new instructions at pos
+            assert inst.opcode == "expression_place_holder"
             dst_expr = inst.operands[0]
             src_expr = inst.operands[1]
-            assert isinstance(dst_expr, GPRExpr)
-            assert dst_expr.op == "getitem"
-            dst_gprs = dst_expr.src0
-            dst_idx0 = dst_expr.src1
-            dst_idx1 = dst_expr.src2
-            dst_cnt = dst_idx1 - dst_idx0 + 1
-            rtype = dst_gprs.rtype
-            dtype = dst_gprs.dtype
 
-            # convert to binary format
-            if isinstance(src_expr, float):
-                src_expr = float_to_ieee754_bits_little(src_expr)
-
-            if isinstance(src_expr, GPRExpr):
-                # op(dst_expr, ...)
-                # so far there is no rigid syntax checks
-                if src_expr.op == "getitem":
-                    # assign
-                    src_cnt = src_expr.src2 - src_expr.src1 + 1
-                    assert dst_cnt == src_cnt
-                    assert dst_cnt == 1 or dst_cnt == 2
-                    new_inst = Instruction(bb, f"{rtype}_mov_b32")
-                    new_inst(dst_expr, src_expr, insert_bb_pos=pos)
-                elif src_expr.op == "+":
-                    assert dtype != ""
-                    new_inst = Instruction(bb, f"{rtype}_add_{dtype}")
-                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                elif src_expr.op == "-":
-                    assert dtype != ""
-                    new_inst = Instruction(bb, f"{rtype}_sub_{dtype}")
-                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                elif src_expr.op == "*":
-                    assert dtype != ""
-                    if rtype == "s":
-                        new_inst = Instruction(bb, f"s_mul_{dtype}")
-                    elif rtype == "v":
-                        if dtype in ["u32", "u16"]:
-                            new_inst = Instruction(bb, f"v_mul_lo_{dtype}")
-                        elif dtype in ["f32", "f16"]:
-                            new_inst = Instruction(bb, f"v_mul_{dtype}")
-                        else:
-                            assert 0, f"unsupported v_mul dtype: {dtype}"
-                    else:
-                        assert 0, f"unsupported v_mul rtype: {rtype}"
-                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                elif src_expr.op == "<<":
-                    if rtype == "s":
-                        new_inst = Instruction(bb, f"s_lshl_b32")
-                        new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                    elif rtype == "v":
-                        new_inst = Instruction(bb, f"v_lshlrev_b32")
-                        new_inst(dst_expr, src_expr.src1, src_expr.src0, insert_bb_pos=pos)
-                    else:
-                        assert 0, f"unsupported v_mul rtype: {rtype}"
-                elif src_expr.op == ">>":
-                    if rtype == "s":
-                        if dtype == "u32":
-                            new_inst = Instruction(bb, f"s_lshr_b32")
-                        elif dtype == "i32":
-                            new_inst = Instruction(bb, f"s_ashr_i32")
-                        else:
-                            assert 0, f"unsupported sgpr shift right dtype {dtype}"
-                        new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                    elif rtype == "v":
-                        if dtype == "u32":
-                            new_inst = Instruction(bb, f"v_lshrrev_b32")
-                        elif dtype == "i32":
-                            new_inst = Instruction(bb, f"v_ashrrev_i32")
-                        else:
-                            assert 0, f"unsupported vgpr shift right dtype {dtype}"
-                        new_inst(dst_expr, src_expr.src1, src_expr.src0, insert_bb_pos=pos)
-                    else:
-                        assert 0, f"unsupported rtype: {rtype}"
-                elif src_expr.op == "&":
-                    new_inst = Instruction(bb, f"{rtype}_and_b32")
-                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                elif src_expr.op == "|":
-                    new_inst = Instruction(bb, f"{rtype}_or_b32")
-                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                elif src_expr.op == "^":
-                    new_inst = Instruction(bb, f"{rtype}_xor_b32")
-                    new_inst(dst_expr, src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                elif src_expr.op in ["eq","ne","lt","gt","le","ge"]:
-                    if rtype == "s":
-                        op = src_expr.op
-                        if op == "ne" : op = "lg"
-                        new_inst1 = Instruction(bb, f"s_{op}_{dtype}")
-                        new_inst2 = Instruction(bb, f"s_mov_b32")
-                        new_inst1(src_expr.src0, src_expr.src1, insert_bb_pos=pos)
-                        new_inst2(dst_expr, "scc", insert_bb_pos=pos+1)
-                    else:
-                        assert 0, f"unsupported rtype: {rtype}"
-                else:
-                    assert 0, f"unsupported expression {src_expr}"
-            elif isinstance(src_expr, int):
-                dst_gprs = dst_expr.src0
-                new_inst = Instruction(bb, f"{rtype}_mov_b32")
-                new_inst(dst_expr, src_expr, insert_bb_pos=pos)
-            else:
-                assert 0, f"unsupported expression {src_expr}"
-            
+            tempbb = BasicBlock(self, "")
+            self.recursive_expr_gen(tempbb, dst_expr, src_expr)
+            for i, newinst in enumerate(tempbb.instructions):
+                bb.instructions.insert(pos + i, newinst)
 
     def compile_expressions(self):
         # first version, only simple binary expressions

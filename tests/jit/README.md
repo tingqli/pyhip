@@ -2,6 +2,8 @@
 
 基于inline-asm的JIT，跟真正的jit不同，inline-asm是一种文本形式的代码，因此其本身就具有IR的特点，所以在生成最终asm源码之前有很多变换的可能。
 
+使用Jit书写程序跟使用高级语言存在一个非常重大的区别：Jit有两种语言分别描述编译期行为和运行期行为，其中宿主语言(此处是Python, Xbyak是C++)负责描述编译期逻辑，也就是为了完成最终运行时行为而针对性构造代码的逻辑，而运行期语言（此处是AMDGPU汇编+一些高级语法糖, Xbyak是x86/arm64纯汇编）则是描述运行期行为。 直接使用CUDA/HIP高级语言中的模板(meta-programming)能够完成类似效果，但是比较晦涩。
+
 这些特性是叠加式的不是全部都ready整个系统才可用
 
 # 寄存器手动分配/释放
@@ -63,15 +65,65 @@ v2[0] = v2[0] + (v2[1] & 0x60)<<2
 
 # control flow
 
-比较表达式：
- - 结果可以参与运算,可以使用:
+比较表达式有一些特殊，因为其结果存放于特殊flag寄存器(scc/vcc)中：
+
+ - 结果可以参与运算,可以使用一些指令转换结果:
+```s
     s_mov_b32 dst, scc 
     s_cselect_b64 vcc, -1, 0
     S_CSELECT_{B32, B64}    SOP2 n  D = SCC ? S0 : S1.
     S_CMOVK_I32             SOPK n  if (SCC) D = signext(simm16).
     S_CMOV_{B32,B64}        SOP1 n  if (SCC) D = S0, else NOP.
 
- - 直接控制跳转： S_CBRANCH_SCC0/S_CBRANCH_SCC1
+    v_cndmask_b32_e64 v1, 0, 1, vcc
+    v_addc_co_u32_e32 
+```
+ - 直接控制跳转则不需要如此，直接利用scc/vcc即可： S_CBRANCH_SCC0/S_CBRANCH_SCC1
+
+为了简化逻辑，我们可以总是把比较表达式的结果转移到通用寄存器中，如果这个表达式给跳转使用的话，则再次使用s_cmp_eq等方式转换回scc
+然后再最后如果整个表达式是给 S_CBRANCH_SCC1 使用，则检查是否末尾指令存在把scc转换到某个通用寄存器再换回来的情况，是的话就优化掉
+或者在生成过程中最后一步如果结果已经在scc中，并且正在为`Jump`语法糖生成代码，就不用再转换到通用寄存器中了。
+
+当然这只对使用表达式的情况，编程者总是可以退回到纯汇编来避免不优化的代码被生成。
+
+```python
+
+# 循环体不等效于基本块，因为循环内也可能有跳转分支，所以循环体完全可能由多个基本块组成
+# 严格来说汇编中不存在循环体的等效概念，随意跳转
+# 使用下面的逻辑可以很容易的模仿for/while loop
+
+# ... prelog
+J.Label("loop_start")
+# break if condition is true
+J.Jump("loop_ends", (a[0]*32 + 5) >= b[0])
+
+# ... loop_body
+
+J.Jump("loop_start") # jump back
+J.Label("loop_ends")
+
+
+# 在此基础上包装一下下面的语法糖, 该语法糖在进入和退出时生成上面的代码
+with J.While((a[0]*32 + 5) >= b[0]):
+    # ... loop_body
+
+
+# if/else逻辑：
+J.JumpNot("else_body", (a[0]*32 + 5) >= b[0])
+... # if body
+J.Jump("if_else_end")
+J.Label("else_body")
+... # else body
+J.Label("if_else_end")
+
+# 在此基础上包装一下下面的语法糖，假设
+with J.If((a[0]*32 + 5) >= b[0]) as branch:
+    ... # if body
+    branch.Else() # 生成 jump到结尾和else-body的代码
+    ...# else body
+
+# 综合来看，复杂表达式/Label/Jump/While/If构造可以极大简化汇编代码书写
+```
 
 # 单元测试
 复杂的jit逻辑需要单元测试保证正确性：
@@ -81,6 +133,8 @@ v2[0] = v2[0] + (v2[1] & 0x60)<<2
 ```bash
 pytest unittest/
 ```
+
+
 
 # 表达式解析
     公共表达式提取---留给手工优化
