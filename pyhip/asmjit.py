@@ -2,6 +2,7 @@ from typing import List, Optional, Set, Union
 from .hiptools import module
 import inspect
 import os
+from contextlib import contextmanager
 
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
@@ -85,6 +86,15 @@ class GPRExpr:
         return GPRExpr("le", self, other)
     def __ge__(self, other):
         return GPRExpr("ge", self, other)
+
+    def find_dtype(self):
+        if self.op == "getitem":
+            return self.src0.dtype
+        if isinstance(self.src0, GPRExpr):
+            return self.src0.find_dtype()
+        if isinstance(self.src1, GPRExpr):
+            return self.src1.find_dtype()
+        assert 0
 
     def __repr__(self):
         if self.op == "getitem":
@@ -246,13 +256,56 @@ class JIT:
         old_bb.add_successor(self.current_bb)
         return self.current_bb
 
+    def log(self, *args, **kwargs):
+        PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
+        if PYHIP_JIT_LOG:
+            color_id = 3
+            color0 = f"\033[0;{30+(color_id % 8)}m"
+            color1 = f"\033[0m"
+            print(color0, f"[{PYHIP_JIT_LOG=}] ", *args, color1, **kwargs)
+
     '''
     # scalar jump (wave level, no divergent)
-    def Jump(self, label:str, cond:GPRExpr = None):
+    '''
+    def Jump(self, label:str, cond:GPRExpr = None, reverse = False):
         if cond is None:
             self.s_branch(mod=label)
         else:
-    '''
+            # generate expression into scc
+            dtype = cond.find_dtype()
+            dst_gprs = self.new_gpr("s", 1, dtype=dtype, align=1, name="")
+            dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
+            self.recursive_expr_gen(self.current_bb, dst_expr, cond)
+            # optimize 
+            last_inst = self.current_bb.instructions[-1]
+            if last_inst.opcode == "s_mov_b32" and last_inst.operands[0] == dst_expr and last_inst.operands[1] == "scc":
+                self.log("s_mov_b32 scc optimized")
+                self.current_bb.instructions.pop()
+            else:
+                # we need to mov dst_expr into scc, s_or can update scc:
+                # D0.u32 = (S0.u32 | S1.u32);
+                # SCC = D0.u32 != 0U
+                self.s_or_b32(dst_expr, dst_expr, 0)
+            if reverse:
+                self.s_cbranch_scc0(mod=label)
+            else:
+                self.s_cbranch_scc1(mod=label)
+
+    @contextmanager
+    def While(self, cond:GPRExpr = None):
+        current_frame = inspect.currentframe()
+        caller_frame = current_frame.f_back.f_back
+        lineno = caller_frame.f_lineno
+        label_begin = f"_while_begin_{lineno}"
+        label_end = f"_while_end_{lineno}"
+        self.Label(label_begin)
+        self.Jump(label_end, cond, reverse=True)
+        try:
+            # following dict is for loop body code to continue or break
+            yield {"begin":label_begin, "end":label_end}
+        finally:
+            self.Jump(label_begin)
+            self.Label(label_end)
 
     def _align_up(self, a, align):
         return ((a + align - 1)//align) * align
@@ -523,7 +576,7 @@ class JIT:
             assert dtype != ""
             if rtype == "s":
                 if dtype == "u32":
-                    print("s_mul_u32 not exist, using s_mul_i32 instead")
+                    self.log("s_mul_u32 not exist, using s_mul_i32 instead")
                     new_inst = Instruction(bb, f"s_mul_i32")
                 else:
                     new_inst = Instruction(bb, f"s_mul_{dtype}")
@@ -634,7 +687,7 @@ class JIT:
         bb_to_remove = []
         for bb in self.blocks[1:]:
             if len(bb.predecessors) == 0:
-                print(f"remove unreachable code block {bb.label_name}")
+                self.log(f"remove unreachable code block {bb.label_name}")
                 bb_to_remove.append(bb)
         for empty_bb in bb_to_remove:
             for bb in empty_bb.predecessors:
@@ -680,7 +733,7 @@ class JIT:
         str_used_gprs = ""
         if len(used_gprs):
             str_used_gprs = "," + ",".join([f'\"{s}\"' for s in used_gprs])
-        print(f" kernel: {kernel_name}{signature}  used_gprs={used_gprs}")
+        self.log(f" kernel: {kernel_name}{signature}  used_gprs={used_gprs}")
 
         hip_src =r'''
 #include <hip/hip_fp16.h> // for __fp16
