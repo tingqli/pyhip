@@ -110,8 +110,9 @@ class GPRExpr:
         assert self.op == "getitem"
         gprs = self.src0
         dst = self[key]
-        inst = Instruction(gprs.jit.current_bb, "expression_place_holder")
-        inst(dst, value)
+        #inst = Instruction(gprs.jit.current_bb, "expression_place_holder")
+        #inst(dst, value)
+        gprs.jit.recursive_expr_gen(gprs.jit.current_bb, dst, value)
 
     def find_dtype(self):
         if self.op == "getitem":
@@ -177,8 +178,9 @@ class GPRs:
 
     def __setitem__(self, key, value:Union[GPRExpr,int,float]):
         dst = self[key]
-        inst = Instruction(self.jit.current_bb, "expression_place_holder")
-        inst(dst, value)
+        #inst = Instruction(self.jit.current_bb, "expression_place_holder")
+        #inst(dst, value)
+        self.jit.recursive_expr_gen(self.jit.current_bb, dst, value)
         # expression_place_holder will be compiled later when all program is ready
         # all expressions within same BB can be processed together
 
@@ -641,7 +643,7 @@ class JIT:
         dst_idx1 = dst_expr.src2
         assert dst_idx1 == dst_idx0
         rtype = dst_gprs.rtype
-        dtype = dst_gprs.dtype        
+        dtype = dst_gprs.dtype
         if isinstance(expr, float):
             expr = float_to_ieee754_bits_little(expr)
         if isinstance(expr, int):
@@ -656,6 +658,12 @@ class JIT:
             new_inst = Instruction(bb, f"{rtype}_mov_b32")
             new_inst(dst_expr, expr)
             return
+
+        if dtype == "":
+            if expr.op not in ["&","|","^"]:
+                dtype = expr.find_dtype()
+                self.log(f"infer dtype={dtype} by expr {expr}")
+                assert dtype != ""
 
         if isinstance(expr.src0, GPRExpr):
             if expr.src0.op == "getitem":
@@ -701,7 +709,6 @@ class JIT:
 
         # now src0_operand & src1_operand are generated, we can generate our result
         if expr.op == "+":
-            assert dtype != "", f"{expr}"
             if rtype == "s":
                 new_inst = Instruction(bb, f"{rtype}_add_{dtype}")
             elif rtype == "v" and dtype in ["u32", "i32"]:
@@ -710,7 +717,6 @@ class JIT:
                 assert 0
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "-":
-            assert dtype != "", f"{expr}"
             if rtype == "s":
                 new_inst = Instruction(bb, f"{rtype}_sub_{dtype}")
             elif rtype == "v" and dtype in ["u32", "i32"]:
@@ -719,7 +725,6 @@ class JIT:
                 assert 0
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "*":
-            assert dtype != "", f"{expr}"
             if rtype == "s":
                 if dtype == "u32":
                     self.log("s_mul_u32 not exist, using s_mul_i32 instead")
@@ -846,7 +851,9 @@ class JIT:
         for bb in self.blocks:
             bb.solve_succesors()
 
-        self.compile_expressions()
+        # use following way only
+        # if we want to do multi-expression optimization (like common expr extraction...)
+        # self.compile_expressions()
         self.register_allocation_linear_scan()
 
         # generate asm: basic blocks are in natural order
