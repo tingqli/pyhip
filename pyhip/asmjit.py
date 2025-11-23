@@ -87,6 +87,32 @@ class GPRExpr:
     def __ge__(self, other):
         return GPRExpr("ge", self, other)
 
+    # given: a = gprs[4:7]
+    #   a[0] -> gprs[4]
+    #   a[0:1] -> gprs[4:5]
+    def __getitem__(self, key):
+        assert self.op == "getitem"
+        gprs = self.src0
+        base_offset = self.src1
+        if isinstance(key, slice):
+            s = key
+            assert s.step == 1 or s.step is None, f"slice {s} with step not eq 1"
+            return GPRExpr("getitem", gprs, base_offset + s.start, base_offset + s.stop)
+        elif isinstance(key, int):
+            idx = key
+            return GPRExpr("getitem", gprs, base_offset + idx, base_offset + idx)
+        else:
+            assert 0, f"unsupported key {key}"
+
+    # given: a = gprs[4:7]
+    #    a[0:1] = ...  is equivalent to gprs[4:5]=...
+    def __setitem__(self, key, value:Union['GPRExpr',int,float]):
+        assert self.op == "getitem"
+        gprs = self.src0
+        dst = self[key]
+        inst = Instruction(gprs.jit.current_bb, "expression_place_holder")
+        inst(dst, value)
+
     def find_dtype(self):
         if self.op == "getitem":
             return self.src0.dtype
@@ -94,6 +120,15 @@ class GPRExpr:
             return self.src0.find_dtype()
         if isinstance(self.src1, GPRExpr):
             return self.src1.find_dtype()
+        assert 0
+
+    def find_rtype(self):
+        if self.op == "getitem":
+            return self.src0.rtype
+        if isinstance(self.src0, GPRExpr):
+            return self.src0.find_rtype()
+        if isinstance(self.src1, GPRExpr):
+            return self.src1.find_rtype()
         assert 0
 
     def __repr__(self):
@@ -146,6 +181,63 @@ class GPRs:
         inst(dst, value)
         # expression_place_holder will be compiled later when all program is ready
         # all expressions within same BB can be processed together
+
+    '''
+    all magic methods GPRExpr supports can also be supported
+    GPRs will convert self into a GPRExpr before compose expression
+    '''
+    def to_expr(self):
+        if self.count == 1:
+            return self[0]
+        else:
+            return self[0:(self.count - 1)]
+
+    def __add__(self, other):
+        return GPRExpr("+", self.to_expr(), other)
+    def __radd__(self, other):
+        return GPRExpr("+", other, self.to_expr())
+    def __sub__(self, other):
+        return GPRExpr("-", self.to_expr(), other)
+    def __rsub__(self, other):
+        return GPRExpr("-", other, self.to_expr())
+    def __mul__(self, other):
+        return GPRExpr("*", self.to_expr(), other)
+    def __rmul__(self, other):
+        return GPRExpr("*", self.to_expr(), other)
+    def __lshift__(self, other):
+        return GPRExpr("<<", self.to_expr(), other)
+    def __rlshift__(self, other):
+        return GPRExpr("<<", other, self.to_expr())
+    def __rshift__(self, other):
+        return GPRExpr(">>", self.to_expr(), other)
+    def __rrshift__(self, other):
+        return GPRExpr(">>", other, self.to_expr())
+    def __and__(self, other):
+        return GPRExpr("&", self.to_expr(), other)
+    def __rand__(self, other):
+        return GPRExpr("&", self.to_expr(), other)
+    def __or__(self, other):
+        return GPRExpr("|", self.to_expr(), other)
+    def __ror__(self, other):
+        return GPRExpr("|", self.to_expr(), other)
+    def __xor__(self, other):
+        return GPRExpr("^", self.to_expr(), other)
+    def __rxor__(self, other):
+        return GPRExpr("^", self.to_expr(), other)
+    # overloading __eq__ methods also effects compile-time behaviour
+    # for example we cannot correctly using list's index or `in` methods
+    #def __eq__(self, other):
+    #    return GPRExpr("eq", self.to_expr(), other)
+    #def __ne__(self, other):
+    #    return GPRExpr("ne", self.to_expr(), other)
+    def __lt__(self, other):
+        return GPRExpr("lt", self.to_expr(), other)
+    def __gt__(self, other):
+        return GPRExpr("gt", self.to_expr(), other)
+    def __le__(self, other):
+        return GPRExpr("le", self.to_expr(), other)
+    def __ge__(self, other):
+        return GPRExpr("ge", self.to_expr(), other)
 
     def __repr__(self):
         if self.count == 1:
@@ -228,6 +320,44 @@ def float_to_ieee754_bits_little(f):
     bits = struct.unpack('<I', packed)[0]  # 解包为无符号整数
     return bits
 
+class Buffer:
+    def __init__(self, J):
+        self.J = J
+        self.desc = J.new_gpr('s', 4, align=4)
+        self.base = self.desc[0:1]
+        self.range = self.desc[2]
+        self.config = self.desc[3]
+        J.s_mov_b32(self.config, 0x00020000)
+
+    def setup(self, base, size):
+        self.base[0] = base[0]
+        self.base[1] = base[1]
+        self.range[0] = size # size可以是GPRExpr
+
+    def load_dwordx4(self, vdst, voffset, soffset, offset12=0):
+        # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
+        assert isinstance(offset12 , int) # must be compile time constant
+        mod = f"offen"
+        if offset12 > 0:
+            mod += f" offset12:{offset12}"
+        self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
+
+    def store_dwordx4(self, vdata, voffset, soffset, offset12=0):
+        # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
+        assert isinstance(offset12 , int) # must be compile time constant
+        mod = f"offen"
+        if offset12 > 0:
+            mod += f" offset12:{offset12}"
+        self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
+
+    def store_dword(self, vdata, voffset, soffset, offset12=0):
+        # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
+        assert isinstance(offset12 , int) # must be compile time constant
+        mod = f"offen"
+        if offset12 > 0:
+            mod += f" offset12:{offset12}"
+        self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
+
 # JIT emits instructions into BBs
 all_kernel_hip_src_names = {}
 class JIT:
@@ -263,6 +393,11 @@ class JIT:
             color0 = f"\033[0;{30+(color_id % 8)}m"
             color1 = f"\033[0m"
             print(color0, f"[{PYHIP_JIT_LOG=}] ", *args, color1, **kwargs)
+
+    def Buffer(self, sgpr_base, sgpr_size):
+        buff = Buffer(self)
+        buff.setup(sgpr_base, sgpr_size)
+        return buff
 
     '''
     # scalar jump (wave level, no divergent)
@@ -309,6 +444,14 @@ class JIT:
 
     def _align_up(self, a, align):
         return ((a + align - 1)//align) * align
+
+    def auto_gpr(self, expr:GPRExpr, name=""):
+        # derive dtype reg_type from expr & allocate
+        rtype = expr.find_rtype()
+        dtype = expr.find_dtype()
+        gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name=name)
+        gprs[0] = expr
+        return gprs
 
     def new_gpr(self, reg_type, count_range, dtype="", align=1, name=""):
         assert reg_type == 's' or reg_type == 'v' or reg_type == 'a'
@@ -459,16 +602,19 @@ class JIT:
 
         self.asm_debug_info += ";============ register allocation ==============\n"
         for sid, events in event_groups.items():
-            # at same first allocation 
+            # if one instruction happens to be the first & last use-site of one reg
+            # then, it uses the last one as src, and first one as dst, and they can be same
+            # so we free befor alloc.
+            # free
             for ev,gprs in events:
-                if ev == 0: # first use
-                    alloc_gpr(gprs)
-                    self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}\n"
-            # now free
-            for ev,gprs in events:
-                if ev == 1: # last use
+                if ev == 1: # last use(as src)
                     free_gpr(gprs)
                     self.asm_debug_info += f";free '{gprs.name}'{gprs} at #{sid}\n"
+            # allocation 
+            for ev,gprs in events:
+                if ev == 0: # first use(as dst)
+                    alloc_gpr(gprs)
+                    self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}\n"
 
         # (following code-gen phase will use the new start_id automatically)
         # add debug info to asm instruction
@@ -555,7 +701,7 @@ class JIT:
 
         # now src0_operand & src1_operand are generated, we can generate our result
         if expr.op == "+":
-            assert dtype != ""
+            assert dtype != "", f"{expr}"
             if rtype == "s":
                 new_inst = Instruction(bb, f"{rtype}_add_{dtype}")
             elif rtype == "v" and dtype in ["u32", "i32"]:
@@ -564,7 +710,7 @@ class JIT:
                 assert 0
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "-":
-            assert dtype != ""
+            assert dtype != "", f"{expr}"
             if rtype == "s":
                 new_inst = Instruction(bb, f"{rtype}_sub_{dtype}")
             elif rtype == "v" and dtype in ["u32", "i32"]:
@@ -573,7 +719,7 @@ class JIT:
                 assert 0
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "*":
-            assert dtype != ""
+            assert dtype != "", f"{expr}"
             if rtype == "s":
                 if dtype == "u32":
                     self.log("s_mul_u32 not exist, using s_mul_i32 instead")
@@ -739,11 +885,7 @@ class JIT:
 #include <hip/hip_fp16.h> // for __fp16
 #include <hip/hip_bf16.h> // for bfloat16
 #include "hip/hip_runtime.h"
-#include <vector>
-#include <iostream>
-#include <cstdio>
-#include <cstdlib>
-__global__ void __launch_bounds__(256, 1) ''' + kernel_name + signature +  r''' {
+__global__ void ''' + kernel_name + signature +  r''' {
     //A[threadIdx.x] = K;
     asm volatile("\n"
 ''' + "\n" + inline_asm + \
