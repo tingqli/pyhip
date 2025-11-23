@@ -1,5 +1,4 @@
 import torch
-import aiter
 import pyhip
 
 torch.cuda.set_device(4)
@@ -16,6 +15,7 @@ BLOCK_SIZE = 1
 BLOCK_NUM = B * KV_LEN + 1000
 FAKE_Q = 0
 FAKE_K_IDX = 0
+OUTPUT_QK = 0
 
 print(f'kvcache = {B * (HK * KV_LEN * S * 2 * 2) // 1024 // 1024:,} MB')
 workspace_buffer = torch.empty(
@@ -97,6 +97,7 @@ def test_aiter(query,
     return out
 
 if 0:
+    import aiter
     out_ref = None
     # if 0:
     #     torch.save({
@@ -133,7 +134,7 @@ def div_up(x, y):
     return (x + y - 1) // y
 KV_PART_SIZE = 256 * 4
 # -g -ggdb -O1
-hip = pyhip.module("pa.cpp", f"-D{HQ=} -D{HK=} -D{S=} -D{BLOCK_SIZE=} -DSCALE={scale} -D{KV_PART_SIZE=} -D{FAKE_Q=} -D{FAKE_K_IDX=}")
+hip = pyhip.module("pa.cpp", f"-D{HQ=} -D{HK=} -D{S=} -D{BLOCK_SIZE=} -DSCALE={scale} -D{KV_PART_SIZE=} -D{FAKE_Q=} -D{FAKE_K_IDX=} -D{OUTPUT_QK=}")
 pa = hip.pa
 pa_reduce = hip.pa_reduce
 my_out_seg = torch.ones([B, HQ, div_up(KV_LEN, KV_PART_SIZE), S], dtype=DT) * 3
@@ -149,12 +150,13 @@ print('pa acc ok')
 if 1:
     ref_qk = query.reshape(B, HK, HQ // HK, -1) @ key_caches[-1][1:KV_LEN*B +1].reshape(B, -1, HK, S).permute(0, 2, 3, 1)
     ref_qk = ref_qk.to(torch.float32)
-    qk_out = qk_out[..., :KV_LEN]
     ref_qk = ref_qk * scale
-    idx = torch.where(torch.abs(ref_qk - qk_out) > 1)
-    if len(idx[0]):
-        print(f'idx = {idx}\nref_qk={ref_qk[idx]}\ncur={qk_out[idx]}')
-    assert torch.allclose(ref_qk.to(torch.float32), qk_out, rtol=0.01, atol=0.01), "pa qk is wrong"
+    if OUTPUT_QK:
+        qk_out = qk_out[..., :KV_LEN]
+        idx = torch.where(torch.abs(ref_qk - qk_out) > 1)
+        if len(idx[0]):
+            print(f'idx = {idx}\nref_qk={ref_qk[idx]}\ncur={qk_out[idx]}')
+        assert torch.allclose(ref_qk.to(torch.float32), qk_out, rtol=0.01, atol=0.01), "pa qk is wrong"
     s = torch.softmax(ref_qk, dim=-1).to(value_cache.dtype)
     ref_out = s @ value_caches[-1][1:KV_LEN*B+1].reshape(B, -1, HK, S).permute(0, 2, 1, 3)
     ref_out = ref_out.reshape(B, HQ, S)

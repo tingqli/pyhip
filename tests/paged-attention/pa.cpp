@@ -111,6 +111,27 @@ __device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffse
 }
 
 template<typename T>
+__device__ T buffer_load_dword(BufferResource& buffer, int soffset, int voffset, int coffset, bool is_asm=false) {
+    T v;
+    if (is_asm) {
+        int32x4_t r = __builtin_bit_cast(int32x4_t, buffer);
+        r.x         = __builtin_amdgcn_readfirstlane(r.x);
+        r.y         = __builtin_amdgcn_readfirstlane(r.y);
+        r.z         = __builtin_amdgcn_readfirstlane(r.z);
+        r.w         = __builtin_amdgcn_readfirstlane(r.w);
+
+        //auto r = amd_wave_read_first_lane(buffer.descriptor);
+        asm volatile("buffer_load_dword %[vdst], %[vaddr], %[srsrc], 0 offen offset:%[coffset]\n"
+            :[vdst]"=v"(v)
+            :[vaddr]"v"(voffset), [srsrc]"s"(r), [coffset]"n"(coffset)
+            : "memory");
+    } else {
+        v = *(T*)((char*)buffer.address + soffset + voffset + coffset);
+    }
+    return v;
+}
+
+template<typename T>
 __device__ T global_load_dwordx4(void* addr, uint64_t voffset, bool is_asm=false) {
     T v;
     if (is_asm) {
@@ -215,10 +236,11 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     query += b * q_b_stride + hq * q_h_stride;
     key_cache += hk * S;
     value_cache += hk * S;
-    uint kv_len = kv_indptr[b + 1] - kv_indptr[b];
+    uint last_kv_idx = kv_indptr[b + 1];
+    uint kv_len = last_kv_idx - kv_indptr[b];
     if (kv_part * KV_PART_SIZE >= kv_len) return;
     uint kv_len_start = std::min(kv_part * KV_PART_SIZE + warp_id * KV_PART_SIZE_WARP, kv_len);
-    uint kv_len_end = std::min(kv_len_start + KV_PART_SIZE, kv_len);
+    uint kv_len_end = std::min(kv_part * KV_PART_SIZE + KV_PART_SIZE, kv_len);
     kv_page_indices += kv_indptr[b];
     out_seg += b * HQ * gridDim.z * S + hq * gridDim.z * S + kv_part * S;
     max_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
@@ -255,17 +277,21 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     auto cur_max = prev_max;
     float cur_sum;
 
+    BufferResource idx_buf(kv_page_indices, last_kv_idx * sizeof(uint));
+    static_assert(KV_PART_SIZE / KV_MIN_PART_SIZE >= 2, "part size must be >= 2");
+    uint k_idxs[KV_PART_SIZE_WARP / 4];
+    auto cur_kv_len_start = kv_len_start + 0 * KV_MIN_PART_SIZE;
+
+    #pragma unroll
     for (uint part_idx = 0; part_idx < KV_PART_SIZE / KV_MIN_PART_SIZE; part_idx++) {
-        uint64_t k_offsets[KV_PART_SIZE_WARP / 4];
-        auto cur_kv_len_start = kv_len_start + part_idx * KV_MIN_PART_SIZE;
         if (BLOCK_SIZE == 1) {
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+    #if FAKE_K_IDX
                 uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
                 global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
-    #if FAKE_K_IDX
-                k_offsets[n] = HK * S * sizeof(__bf16) * (global_row_id + 1) + 8 * sizeof(__bf16) * key_load_col_id;
+                k_idxs[n] = global_row_id + 1;
     #else
-                k_offsets[n] = (uint64_t)(kv_page_indices[global_row_id]) * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+                k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
     #endif
             }
         }
@@ -274,26 +300,32 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
 
         bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4], v_reg_caches[KV_PART_SIZE_WARP / 4];
 
-        for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-            k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, k_offsets[n]);
+        if (part_idx == 0) {
+            for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+                auto offset = k_idxs[n] * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+                k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset);
+            }
         }
         for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-            v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, k_offsets[n], false);
+            auto offset = k_idxs[n] * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+            v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, offset, false);
         }
         __bf16* cur_k_buff_lds = share_buf.get_key_buf(warp_id);
         for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
-            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 0];
-            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 1];
-            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 2];
-            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = k_reg_caches[4 * n + 3];
+            // swizzle: row ^ col
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + (key_load_col_id ^ (key_load_row_id + 0)) * 8]) = k_reg_caches[4 * n + 0];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + (key_load_col_id ^ (key_load_row_id + 4)) * 8]) = k_reg_caches[4 * n + 1];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + (key_load_col_id ^ (key_load_row_id + 8)) * 8]) = k_reg_caches[4 * n + 2];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + (key_load_col_id ^ (key_load_row_id + 12))* 8]) = k_reg_caches[4 * n + 3];
 
             for (int k = 0; k < S / 32; k++) {
-                auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + k * 32 + fma_col_id * 8]);
+                auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + (fma_row_id ^ (fma_col_id + 4 * k)) * 8]);
                 amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n]);
                 amdgcn_mfma_f32_16x16x16bf16(k_cur.hi, q_cur[k].hi, acc[n]);
             }
             acc[n] *= SCALE;
         }
+    #if OUTPUT_QK
         // for debug
         if (qk_ptr) {
             // [B, HK, HQ / HK, stride]
@@ -306,11 +338,27 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
                 }
             }
         }
+    #endif
 
+        auto cur_kv_len_start_copy = cur_kv_len_start;
+        // --------------------------
+        cur_kv_len_start += KV_MIN_PART_SIZE;
+        if (BLOCK_SIZE == 1) {
+            for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+    #if FAKE_K_IDX
+                uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
+                global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
+                k_idxs[n] = global_row_id + 1;
+    #else
+                k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
+    #endif
+            }
+        }
+        // -----------------------------
         // sum(exp(acc-max))
         for (uint n = 0; n < 4; n++) {
             for (uint i = 0; i < 4; i++) {
-                auto tmp = n * 16 + fma_col_id * 4 + i + cur_kv_len_start < kv_len_end ? acc[n][i] : -FLT_MAX;
+                auto tmp = n * 16 + fma_col_id * 4 + i + cur_kv_len_start_copy < kv_len_end ? acc[n][i] : -FLT_MAX;
                 cur_max = fmaxf(cur_max, tmp);
             }
         }
@@ -320,14 +368,23 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         cur_sum = 0;
         for (uint n = 0; n < 4; n++) {
             for (uint i = 0; i < 4; i++) {
-                acc[n][i] = n * 16 + fma_col_id * 4 + i + cur_kv_len_start < kv_len_end ? __expf(acc[n][i] - cur_max) : 0;
+                acc[n][i] = n * 16 + fma_col_id * 4 + i + cur_kv_len_start_copy < kv_len_end ? __expf(acc[n][i] - cur_max) : 0;
                 cur_sum += acc[n][i];
             }
         }
         for(int mask = 64 / 2; mask >= 16; mask /= 2) {
             cur_sum += __shfl_xor(cur_sum, mask);
         }
-        cur_sum += prev_sum * __expf(prev_max - cur_max);
+        // ----------------------------------
+        if (part_idx != KV_PART_SIZE / KV_MIN_PART_SIZE - 1) {
+            for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
+                auto offset = k_idxs[n] * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+                k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset);
+            }
+        }
+        // ----------------------------------
+        auto fixed_sum = prev_sum * __expf(prev_max - cur_max);
+        cur_sum += fixed_sum;
         const float inv_sum_scale =
             __fdividef(1.f, cur_sum + 1e-6f);
         bfloat16x4 acc_low[KV_PART_SIZE_WARP / 16];
@@ -339,7 +396,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         // compensation prev vout
         if (part_idx != 0) {
             for (int k = 0; k < S / 64 * 4; k++) {
-                vout[k] = prev_sum * __expf(prev_max - cur_max) * inv_sum_scale * vout[k];
+                vout[k] = fixed_sum * inv_sum_scale * vout[k];
             }
         }
         //s_waitcnt_vmcnt<0>();
@@ -430,24 +487,27 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
 
     auto shared_out = share_buf.get_out_buf(warp_id) + fma_row_id * S;
     for (int k = 0; k < S / 64; k++) {
-        ((bfloat16x4*)(shared_out + k * 64))[fma_col_id * 4 + 0] = vout_low[k * 4 + 0];
-        ((bfloat16x4*)(shared_out + k * 64))[fma_col_id * 4 + 1] = vout_low[k * 4 + 1];
-        ((bfloat16x4*)(shared_out + k * 64))[fma_col_id * 4 + 2] = vout_low[k * 4 + 2];
-        ((bfloat16x4*)(shared_out + k * 64))[fma_col_id * 4 + 3] = vout_low[k * 4 + 3];
+        // swizzle: row ^ col
+        ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 0) ^ fma_row_id] = vout_low[k * 4 + 0];
+        ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 1) ^ fma_row_id] = vout_low[k * 4 + 1];
+        ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 2) ^ fma_row_id] = vout_low[k * 4 + 2];
+        ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 3) ^ fma_row_id] = vout_low[k * 4 + 3];
     }
     __syncthreads();
     for (uint i = 0; i < HQ / HK / 4; i++) {
         uint m_token_id = HQ / HK / 4 * warp_id + i;
-        auto out_v = ((bfloat16x2*)(share_buf.get_out_buf(0) + m_token_id * S))[lane_id];
-        out_v = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) * out_v;
-
-        for (int w = 1; w < 4; w++) {
-            auto next_v = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S))[lane_id];
-            next_v = sums[4 * i + w] * __expf(maxs[4 * i + w] - real_max[i]) * next_v;
-            out_v += next_v;
-        }
-        out_v = out_v / real_sum[i];
         if (m_token_id < HQ / HK) {
+            auto out_v = ((bfloat16x2*)(share_buf.get_out_buf(0) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
+            out_v = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) * out_v;
+
+            for (int w = 1; w < 4; w++) {
+                auto next_v = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
+                next_v = sums[4 * i + w] * __expf(maxs[4 * i + w] - real_max[i]) * next_v;
+                out_v += next_v;
+            }
+            const float inv_sum_scale =
+                __fdividef(1.f, real_sum[i] + 1e-6f);
+            out_v = out_v * inv_sum_scale;
             ((bfloat16x2*)(out_seg + m_token_id * gridDim.z * S))[lane_id] = out_v;
             max_out[m_token_id * gridDim.z] = real_max[i];
             sum_out[m_token_id * gridDim.z] = real_sum[i];
@@ -501,7 +561,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
     if (lane_id == 0) {
         sum_lds[warp_id] = warp_sum;
     }
-    *(float32x2*)(&out_lds[warp_id * S + lane_id * 2]) = cur_val;
+    if (warp_id != 0)
+        *(float32x2*)(&out_lds[warp_id * S + lane_id * 2]) = cur_val;
     __syncthreads();
     if (warp_id == 0) {
         warp_sum += sum_lds[1] + sum_lds[2] + sum_lds[3];
