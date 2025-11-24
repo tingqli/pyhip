@@ -37,4 +37,5 @@ def test_loop():
     torch.cuda.synchronize()
     assert OUT[0] == 21, f"{OUT=}"
 
-test_loop()
+if __name__ == "__main__":
+    test_loop()

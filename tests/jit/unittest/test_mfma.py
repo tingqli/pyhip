@@ -107,4 +107,5 @@ def test_mfma_32x32x16(BM, BN, K):
         print(C)
         assert 0
 
-test_mfma_32x32x16(32*2, 32*1, 16)
+if __name__ == "__main__":
+    test_mfma_32x32x16(32*2, 32*1, 16)

@@ -98,5 +98,6 @@ def test_vexpr():
         res = OUT[idx, :]
         assert torch.allclose(ref, res), f"expression {idx} failed: ref {ref[:8]} != res {res[:8]}"
     
-test_sexpr()
-test_vexpr()
+if __name__ == "__main__":
+    test_sexpr()
+    test_vexpr()

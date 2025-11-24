@@ -21,10 +21,10 @@ class Instruction:
         for i, op in enumerate(operands):
             assert isinstance(op, GPRExpr) or \
                    isinstance(op, int) or isinstance(op, float) or \
-                   op=="scc" or op == "vcc" or op == "off" or \
+                   (isinstance(op, str) and (op in ["scc", "vcc", "exec", "off"])) or \
                    (isinstance(op, str) and op.startswith("0x")) or \
                    isinstance(op, GPRs), \
-            f"arg {i} type is {type(op)}"
+            f"arg {i} : {type(op)} {op}"
         self.parent_bb.add_instruction(self, insert_bb_pos)
 
     def op_repr(self, op):
@@ -444,13 +444,89 @@ class JIT:
         label_begin = f"_while_begin_{lineno}"
         label_end = f"_while_end_{lineno}"
         self.Label(label_begin)
-        self.Jump(label_end, cond, reverse=True)
+        if cond is not None:
+            self.Jump(label_end, cond, reverse=True)
         try:
             # following dict is for loop body code to continue or break
             yield {"begin":label_begin, "end":label_end}
         finally:
             self.Jump(label_begin)
             self.Label(label_end)
+
+    '''
+    Use this to set exec-mask to handle the tail/vari-SIMD-length problem
+    '''
+    @contextmanager
+    def SetExecMask(self, cond:GPRExpr = None):
+        dtype = cond.find_dtype()
+        dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
+        dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
+        self.recursive_expr_gen(self.current_bb, dst_expr, cond)
+        last_inst = self.current_bb.instructions[-1]
+        if last_inst.opcode == "v_cndmask_b32_e64" and \
+            last_inst.operands[0] == dst_expr and \
+            last_inst.operands[1] == 0 and \
+            last_inst.operands[2] == 1 and \
+            last_inst.operands[3] == "vcc" :
+            self.log("v_cndmask_b32_e64 dst,0,1,vcc is optimized")
+            self.current_bb.instructions.pop()
+        else:
+            self.v_cmp_ne_u32_e64("vcc", 0, dst_gprs)
+        exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
+        self.s_and_saveexec_b64(exec_backup, "vcc")
+        try:
+            yield
+        finally:
+            self.s_or_b64("exec", "exec", exec_backup)
+
+    '''
+    SIMT while: just a prototype with bugs, do not use
+    '''
+    @contextmanager
+    def SIMTWhile(self, cond:GPRExpr = None):
+        current_frame = inspect.currentframe()
+        caller_frame = current_frame.f_back.f_back
+        lineno = caller_frame.f_lineno
+        label_begin = f"_simtwhile_begin_{lineno}"
+        label_end = f"_simtwhile_end_{lineno}"
+        exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
+        # exec_stopped = self.new_gpr("s", 2, dtype="i32", align=2)
+
+        # generate expression into vcc
+        dtype = cond.find_dtype()
+        def generate_not_cond_in_vcc():
+            dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
+            dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
+            self.recursive_expr_gen(self.current_bb, dst_expr, cond)
+            last_inst = self.current_bb.instructions[-1]
+            if last_inst.opcode == "v_cndmask_b32_e64" and \
+                last_inst.operands[0] == dst_expr and \
+                last_inst.operands[1] == 0 and \
+                last_inst.operands[1] == 1 and \
+                last_inst.operands[1] == "vcc" :
+                self.log("v_cndmask_b32_e64 dst,0,1,vcc is optimized")
+                self.current_bb.instructions.pop()
+                # above code generate condition to keep alive
+                # we need vcc[lane]=1 when cond is false
+                self.s_not_b64("vcc","vcc")
+            else:
+                self.v_cmp_eq_u32_e64("vcc", 0, dst_gprs)
+
+        generate_not_cond_in_vcc()
+        # backup exec, set exec-mask based on vcc
+        self.s_and_saveexec_b64(exec_backup, "vcc")
+        # jump to end if no lanes are alive
+        self.s_cbranch_execz(mod=label_end)
+        self.Label(label_begin)
+        try:
+            # following dict is for loop body code to continue or break
+            yield {"begin":label_begin, "end":label_end}
+        finally:
+            generate_not_cond_in_vcc()
+            self.s_andn2_b64("exec", "exec", "vcc")
+            self.s_cbranch_execnz(mod=label_begin)
+            self.Label(label_end)
+            self.s_or_b64("exec", "exec", exec_backup)
 
     def _align_up(self, a, align):
         return ((a + align - 1)//align) * align
@@ -817,7 +893,7 @@ class JIT:
                 # only src0 can be const
                 if not isinstance(src1_operand, GPRExpr):
                     src1_operand, src0_operand = src0_operand, src1_operand
-                    cmp_op_reverse = {"gt":"le", "lt":"ge", "le":"gt", "ge":"lt", "eq":"eq", "ne":"ne"}
+                    cmp_op_reverse = {"gt":"lt", "lt":"gt", "le":"ge", "ge":"le", "eq":"eq", "ne":"ne"}
                     op = cmp_op_reverse[op]
                 cmp = Instruction(bb, f"v_cmp_{op}_{dtype}_e32")
                 mov = Instruction(bb, f"v_cndmask_b32_e64")
@@ -863,6 +939,7 @@ class JIT:
             if len(bb.predecessors) == 0:
                 self.log(f"remove unreachable code block {bb.label_name}")
                 bb_to_remove.append(bb)
+
         for empty_bb in bb_to_remove:
             for bb in empty_bb.predecessors:
                 bb.successors.remove(empty_bb)
@@ -873,6 +950,20 @@ class JIT:
         # resolve successors from label
         for bb in self.blocks:
             bb.solve_succesors()
+        
+        # remove empty bb
+        bb_to_remove = []
+        for bb in self.blocks[:-1]:
+            if len(bb.instructions) == 0:
+                assert len(bb.predecessors) == 1
+                assert len(bb.successors) == 1
+                bb.predecessors[0].successors.remove(bb)
+                bb.successors[0].predecessors.remove(bb)
+                bb.predecessors[0].add_successor(bb.successors[0])
+                bb_to_remove.append(bb)
+        for empty_bb in bb_to_remove:
+            self.blocks.remove(empty_bb)   
+
 
         # use following way only
         # if we want to do multi-expression optimization (like common expr extraction...)

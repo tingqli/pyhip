@@ -6,6 +6,18 @@
 
 这些特性是叠加式的不是全部都ready整个系统才可用
 
+# ABI
+https://llvm.org/docs/AMDGPUUsage.html#amdgpu-amdhsa-sgpr-register-set-up-order-table
+SGRP会按顺序初始化很多可选信息，但是最常用的是 Kernarg Segment Ptr，其次是 Work-Group Id X/Y/Z
+
+https://llvm.org/docs/AMDGPUUsage.html#amdgpu-amdhsa-vgpr-register-set-up-order-for-unpacked-work-item-id-method-table
+v0中会初始化work-item id，但是会根据kernel是否使用到了`threadIdx.x`/`threadIdx.y`/`threadIdx.z`而定:
+
+```s
+	v_bfe_u32 v2, v0, 20, 10 # 提取 threadIdx.z
+	v_bfe_u32 v1, v0, 10, 10 # 提取 threadIdx.y
+```
+
 # 寄存器手动分配/释放
 
 寄存器手动分配/释放,可以指定寄存器名，或者不指定自动分配
@@ -132,6 +144,19 @@ with J.If((a[0]*32 + 5) >= b[0]) as branch:
 
 ```bash
 pytest unittest/
+```
+
+# SIMT 控制流
+
+SIMT的控制流比较复杂，涉及到对exec的更新等逻辑，需要针对for/if/else等高层语义进行逻辑分析才能给出正确的代码,其中还涉及到thread-diverge等需要多层嵌套保存上下文的功能。但是我们也可以从另一个角度使用此功能，就是仿照arm sve predicate register的设计，交给编程者显式设置execmask的有效范围决定VALU的计算宽度，而不是根据for/if/else等控制流分析出计算宽度的逻辑，这样通过简单的改变把灵活性交给编程者，复杂性大大降低
+
+```python
+    with J.While() as loop: # 无限循环
+        with J.SetExecMask(vi < count):  # 循环条件设置ExecMask
+            J.s_cbranch_execz(mod=loop["end"]) # 全部条件都失效，退出外层循环
+            # ... ... 循环体内部代码
+
+        vi[0] = vi + 64 # 前进 warpSize
 ```
 
 # 实践
