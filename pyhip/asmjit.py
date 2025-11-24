@@ -21,7 +21,7 @@ class Instruction:
         for i, op in enumerate(operands):
             assert isinstance(op, GPRExpr) or \
                    isinstance(op, int) or isinstance(op, float) or \
-                   (isinstance(op, str) and (op in ["scc", "vcc", "exec", "off"])) or \
+                   (isinstance(op, str) and (op in ["scc", "vcc", "exec", "off", "execz"])) or \
                    (isinstance(op, str) and op.startswith("0x")) or \
                    isinstance(op, GPRs), \
             f"arg {i} : {type(op)} {op}"
@@ -30,6 +30,8 @@ class Instruction:
     def op_repr(self, op):
         if isinstance(op, str):
             return op
+        if isinstance(op, int):
+            return hex(op)
         return repr(op)
 
     def __repr__(self):
@@ -457,7 +459,13 @@ class JIT:
     Use this to set exec-mask to handle the tail/vari-SIMD-length problem
     '''
     @contextmanager
-    def SetExecMask(self, cond:GPRExpr = None):
+    def ExecMask(self, cond:GPRExpr = None):
+        current_frame = inspect.currentframe()
+        caller_frame = current_frame.f_back.f_back
+        lineno = caller_frame.f_lineno
+        label_begin = f"_execmask_begin_{lineno}"
+        label_end = f"_execmask_end_{lineno}"
+        
         dtype = cond.find_dtype()
         dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
         dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
@@ -473,11 +481,14 @@ class JIT:
         else:
             self.v_cmp_ne_u32_e64("vcc", 0, dst_gprs)
         exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
-        self.s_and_saveexec_b64(exec_backup, "vcc")
+        self.s_and_saveexec_b64(exec_backup, "vcc") # scc = (exec!=0)
+        self.s_cbranch_execz(mod=label_end) # early skip
         try:
-            yield
+            yield # the body of computation with ExecMask
         finally:
-            self.s_or_b64("exec", "exec", exec_backup)
+            self.Label(label_end)
+            self.s_mov_b64("exec", exec_backup)
+            # if we want to do something when execz happens, we can use scc0
 
     '''
     SIMT while: just a prototype with bugs, do not use
@@ -681,6 +692,7 @@ class JIT:
             if sid not in event_groups:
                 event_groups[sid] = []
             event_groups[sid].append([event, gprs])
+            gprs.start_id = -1 # set gprs status to "not allocated"
 
         def alloc_gpr(gprs):
             rtype = gprs.rtype
@@ -707,15 +719,23 @@ class JIT:
             # then, it uses the last one as src, and first one as dst, and they can be same
             # so we free befor alloc.
             # free
+            unalloc_gprs = []
             for ev,gprs in events:
                 if ev == 1: # last use(as src)
-                    free_gpr(gprs)
-                    self.asm_debug_info += f";free '{gprs.name}'{gprs} at #{sid}\n"
+                    if gprs.start_id >= 0:
+                        free_gpr(gprs)
+                        self.asm_debug_info += f";free '{gprs.name}'{gprs} at #{sid}\n"
+                    else:
+                        unalloc_gprs.append(gprs)
             # allocation 
             for ev,gprs in events:
                 if ev == 0: # first use(as dst)
                     alloc_gpr(gprs)
                     self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}\n"
+
+            # in case some gpr's last & first sids are the same
+            for gprs in unalloc_gprs:
+                free_gpr(gprs)
 
         # (following code-gen phase will use the new start_id automatically)
         # add debug info to asm instruction

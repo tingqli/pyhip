@@ -152,10 +152,11 @@ SIMT的控制流比较复杂，涉及到对exec的更新等逻辑，需要针对
 
 ```python
     with J.While() as loop: # 无限循环
-        with J.SetExecMask(vi < count):  # 循环条件设置ExecMask
-            J.s_cbranch_execz(mod=loop["end"]) # 全部条件都失效，退出外层循环
+        with J.ExecMask(vi < count):  # 循环条件设置ExecMask
             # ... ... 循环体内部代码
-
+            # ... ... 
+        # 全部条件都失效的话，SCC会被ExecMask内部代码置零，此时退出外层循环
+        J.s_cbranch_scc0(mod=loop["end"])
         vi[0] = vi + 64 # 前进 warpSize
 ```
 
