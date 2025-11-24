@@ -126,10 +126,18 @@ class GPRExpr:
     def find_rtype(self):
         if self.op == "getitem":
             return self.src0.rtype
+        rtype0 = None
+        rtype1 = None
         if isinstance(self.src0, GPRExpr):
-            return self.src0.find_rtype()
+            rtype0 = self.src0.find_rtype()
+            if rtype0 == "v": return rtype0
         if isinstance(self.src1, GPRExpr):
-            return self.src1.find_rtype()
+            rtype1 = self.src1.find_rtype()
+            if rtype1 == "v": return rtype1
+        assert rtype0 != "a"
+        assert rtype1 != "a"
+        if rtype0 == "s": return rtype0
+        if rtype1 == "s": return rtype1
         assert 0
 
     def __repr__(self):
@@ -908,7 +916,8 @@ class JIT:
 #include <hip/hip_bf16.h> // for bfloat16
 #include "hip/hip_runtime.h"
 __global__ void ''' + kernel_name + signature +  r''' {
-    //A[threadIdx.x] = K;
+    // force HIP to initialize sgpr2/sgpr3/sgpr4, TODO: add threadIdx.y/z
+    asm volatile(""::"s"(blockIdx.x),"s"(blockIdx.y),"s"(blockIdx.z));
     asm volatile("\n"
 ''' + "\n" + inline_asm + \
 r'''
