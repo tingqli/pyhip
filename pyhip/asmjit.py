@@ -448,6 +448,13 @@ class JIT:
         return ((a + align - 1)//align) * align
 
     def auto_gpr(self, expr:GPRExpr, name=""):
+        if name == "":
+            # try to reover python var's name from code_context
+            stack = inspect.stack()
+            caller_frame = stack[1]
+            if caller_frame.code_context:
+                src_line = caller_frame.code_context[0].strip()
+                name = src_line.split("=")[0].strip()
         # derive dtype reg_type from expr & allocate
         rtype = expr.find_rtype()
         dtype = expr.find_dtype()
@@ -456,6 +463,14 @@ class JIT:
         return gprs
 
     def new_gpr(self, reg_type, count_range, dtype="", align=1, name=""):
+        if name == "":
+            # try to reover python var's name from code_context
+            stack = inspect.stack()
+            caller_frame = stack[1]
+            if caller_frame.code_context:
+                src_line = caller_frame.code_context[0].strip()
+                name = src_line.split("=")[0].strip()
+
         assert reg_type == 's' or reg_type == 'v' or reg_type == 'a'
         if isinstance(count_range, int):
             # allocate do not reuse, just increase the index
@@ -913,6 +928,8 @@ r'''
 def kernel(J):
     ...
 '''
+gen_hip_file_unique_id = 0
+
 class jit:
     def __init__(self, signature, extra_compiler_options = ""):
         self.signature = signature
@@ -928,5 +945,8 @@ class jit:
         J = JIT()
         func(J)
         func_name = func.__name__
-        return J.build(func_name, self.signature, self.extra_compiler_options, temp_filename = f"jit-{filename}-{line_no}-{func_name}")
+        global gen_hip_file_unique_id
+        gen_hip_file_unique_id += 1
+        return J.build(func_name, self.signature, self.extra_compiler_options,
+                       temp_filename = f".jit-{gen_hip_file_unique_id}-{filename}-{line_no}-{func_name}")
 
