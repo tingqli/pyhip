@@ -110,6 +110,11 @@ __device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffse
     return v;
 }
 
+__device__ float llvm_amdgcn_raw_buffer_load_fp32(int32x4_t srsrc,
+                                 int voffset,
+                                 int soffset,
+                                 int glc_slc) __asm("llvm.amdgcn.raw.buffer.load.f32");
+
 template<typename T>
 __device__ T buffer_load_dword(BufferResource& buffer, int soffset, int voffset, int coffset, bool is_asm=false) {
     T v;
@@ -126,7 +131,10 @@ __device__ T buffer_load_dword(BufferResource& buffer, int soffset, int voffset,
             :[vaddr]"v"(voffset), [srsrc]"s"(r), [coffset]"n"(coffset)
             : "memory");
     } else {
-        v = *(T*)((char*)buffer.address + soffset + voffset + coffset);
+        int32x4_t r = __builtin_bit_cast(int32x4_t, buffer);
+        auto d = llvm_amdgcn_raw_buffer_load_fp32(r, voffset + coffset, soffset, 0);
+        v = __builtin_bit_cast(T, d);
+        //v = *(T*)((char*)buffer.address + soffset + voffset + coffset);
     }
     return v;
 }
@@ -277,19 +285,20 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     auto cur_max = prev_max;
     float cur_sum;
 
-    BufferResource idx_buf(kv_page_indices, last_kv_idx * sizeof(uint));
+    BufferResource idx_buf(kv_page_indices, kv_len * sizeof(uint));
     static_assert(KV_PART_SIZE / KV_MIN_PART_SIZE >= 2, "part size must be >= 2");
     uint k_idxs[KV_PART_SIZE_WARP / 4];
     auto cur_kv_len_start = kv_len_start + 0 * KV_MIN_PART_SIZE;
 
     #pragma unroll
     for (uint part_idx = 0; part_idx < KV_PART_SIZE / KV_MIN_PART_SIZE; part_idx++) {
+        if (part_idx == 0)
         if (BLOCK_SIZE == 1) {
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
     #if FAKE_K_IDX
                 uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
                 global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
-                k_idxs[n] = global_row_id + 1;
+                k_idxs[n] = global_row_id + 1 + kv_indptr[b];
     #else
                 k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
     #endif
@@ -302,12 +311,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
 
         if (part_idx == 0) {
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-                auto offset = k_idxs[n] * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+                auto offset = k_idxs[n] * (HK * S * sizeof(__bf16)) + 8 * sizeof(__bf16) * key_load_col_id;
                 k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset);
             }
         }
         for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-            auto offset = k_idxs[n] * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+            auto offset = k_idxs[n] * (HK * S * sizeof(__bf16)) + 8 * sizeof(__bf16) * key_load_col_id;
             v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, offset, false);
         }
         __bf16* cur_k_buff_lds = share_buf.get_key_buf(warp_id);
@@ -343,6 +352,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         auto cur_kv_len_start_copy = cur_kv_len_start;
         // --------------------------
         cur_kv_len_start += KV_MIN_PART_SIZE;
+        if (part_idx != KV_PART_SIZE / KV_MIN_PART_SIZE - 1)
         if (BLOCK_SIZE == 1) {
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
     #if FAKE_K_IDX
@@ -378,7 +388,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         // ----------------------------------
         if (part_idx != KV_PART_SIZE / KV_MIN_PART_SIZE - 1) {
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-                auto offset = k_idxs[n] * HK * S * sizeof(__bf16) + 8 * sizeof(__bf16) * key_load_col_id;
+                auto offset = k_idxs[n] * (HK * S * sizeof(__bf16)) + 8 * sizeof(__bf16) * key_load_col_id;
                 k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset);
             }
         }
