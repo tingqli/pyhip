@@ -6,7 +6,7 @@ from contextlib import contextmanager
 
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
-    def __init__(self, parent_bb:'BasicBlock', opcode):
+    def __init__(self, parent_bb:'BasicBlock', opcode, loc=""):
         self.opcode = opcode
         self.parent_bb = parent_bb
         assert not opcode.startswith("s_call")
@@ -14,11 +14,22 @@ class Instruction:
         self.is_cbranch = self.opcode.startswith("s_cbranch_")
         self.debug_info = ""
         self.sid = 0
+        self.loc = loc
 
     def __call__(self, *operands, mod:str="", insert_bb_pos = None):
-        self.operands = operands
+        self.operands = list(operands)
         self.mod = mod
+        jit = self.parent_bb.jit
         for i, op in enumerate(operands):
+            # generate expression
+            if isinstance(op, GPRExpr) and op.op != "getitem":
+                rtype = op.find_rtype()
+                dtype = op.find_dtype()
+                dst_gprs = jit.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
+                jit.recursive_expr_gen(self.parent_bb, dst_expr, op, loc=inspect.currentframe().f_back.f_lineno)
+                self.operands[i] = dst_expr
+
             assert isinstance(op, GPRExpr) or \
                    isinstance(op, int) or isinstance(op, float) or \
                    (isinstance(op, str) and (op in ["scc", "vcc", "exec", "off", "execz"])) or \
@@ -26,6 +37,12 @@ class Instruction:
                    isinstance(op, GPRs), \
             f"arg {i} : {type(op)} {op}"
         self.parent_bb.add_instruction(self, insert_bb_pos)
+
+    def isVALU(self):
+        return self.opcode.startswith("v_")
+
+    def isTransOp(self):
+        return self.opcode[:6] in ["v_exp_","v_log_","v_rcp_","v_rsq_","v_sqrt","v_sin_","v_cos_"]
 
     def op_repr(self, op):
         if isinstance(op, str):
@@ -40,6 +57,9 @@ class Instruction:
 class GPRExpr:
     def __init__(self, op:str, src0=None, src1=None, src2=None):
         self.op=op
+        # some instructions only support const on operand src0
+        if op in ["+", "*", "&", "|", "^"] and (isinstance(src1, int) or isinstance(src1, float)):
+            src0, src1 = src1, src0
         self.src0 = src0
         self.src1 = src1
         self.src2 = src2
@@ -56,6 +76,17 @@ class GPRExpr:
         return GPRExpr("*", self, other)
     def __rmul__(self, other):
         return GPRExpr("*", self, other)
+    def __floordiv__(self, other):
+        assert isinstance(other, int)
+        if other <= 0 or (other & (other - 1)) != 0:
+            assert "the divisor is not power of 2"
+        shift_right_bits = other.bit_length() - 1
+        return GPRExpr(">>", self, shift_right_bits)
+    def __mod__(self, other):
+        assert isinstance(other, int)
+        if other <= 0 or (other & (other - 1)) != 0:
+            assert "the divisor is not power of 2"
+        return GPRExpr("&", self, (other-1))
     def __lshift__(self, other):
         return GPRExpr("<<", self, other)
     def __rlshift__(self, other):
@@ -89,6 +120,25 @@ class GPRExpr:
     def __ge__(self, other):
         return GPRExpr("ge", self, other)
 
+    def overlap(self, other: Union['GPRExpr','GPRs']):
+        assert self.op == "getitem"
+        if isinstance(other, GPRs):
+            other = other[0:other.count-1]
+        assert other.op == "getitem"
+        gprs0 = self.src0
+        gprs1 = other.src0
+        if gprs0.rtype != gprs1.rtype:
+            return False
+        first0 = gprs0.start_id + self.src1
+        last0 = gprs0.start_id + self.src2
+        
+        first1 = gprs1.start_id + other.src1
+        last1 = gprs1.start_id + other.src2
+
+        if first1 > last0 or first0 > last1:
+            return False
+        return True
+
     # given: a = gprs[4:7]
     #   a[0] -> gprs[4]
     #   a[0:1] -> gprs[4:5]
@@ -114,7 +164,7 @@ class GPRExpr:
         dst = self[key]
         #inst = Instruction(gprs.jit.current_bb, "expression_place_holder")
         #inst(dst, value)
-        gprs.jit.recursive_expr_gen(gprs.jit.current_bb, dst, value)
+        gprs.jit.recursive_expr_gen(gprs.jit.current_bb, dst, value, loc=inspect.currentframe().f_back.f_lineno)
 
     def find_dtype(self):
         if self.op == "getitem":
@@ -175,6 +225,9 @@ class GPRs:
         self.dtype = dtype
         self.name = name # for debugging purpose only
 
+    def overlap(self, other: Union['GPRExpr','GPRs']):
+        return self[0:self.count-1].overlap(other)
+
     def __getitem__(self, key):
         if isinstance(key, slice):
             s = key
@@ -190,7 +243,7 @@ class GPRs:
         dst = self[key]
         #inst = Instruction(self.jit.current_bb, "expression_place_holder")
         #inst(dst, value)
-        self.jit.recursive_expr_gen(self.jit.current_bb, dst, value)
+        self.jit.recursive_expr_gen(self.jit.current_bb, dst, value, loc=inspect.currentframe().f_back.f_lineno)
         # expression_place_holder will be compiled later when all program is ready
         # all expressions within same BB can be processed together
 
@@ -383,7 +436,7 @@ class JIT:
         self.fixed_gprs = []
 
     def __getattr__(self, instruction):
-        return Instruction(self.current_bb, instruction)
+        return Instruction(self.current_bb, instruction, loc=inspect.currentframe().f_back.f_lineno)
 
     def _finish_bb(self, bb, next_bb_name=""):
         assert bb is self.current_bb
@@ -422,7 +475,7 @@ class JIT:
             dtype = cond.find_dtype()
             dst_gprs = self.new_gpr("s", 1, dtype=dtype, align=1, name="")
             dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
-            self.recursive_expr_gen(self.current_bb, dst_expr, cond)
+            self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=inspect.currentframe().f_back.f_lineno)
             # optimize 
             last_inst = self.current_bb.instructions[-1]
             if last_inst.opcode == "s_mov_b32" and last_inst.operands[0] == dst_expr and last_inst.operands[1] == "scc":
@@ -469,7 +522,7 @@ class JIT:
         dtype = cond.find_dtype()
         dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
         dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
-        self.recursive_expr_gen(self.current_bb, dst_expr, cond)
+        self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=inspect.currentframe().f_back.f_lineno)
         last_inst = self.current_bb.instructions[-1]
         if last_inst.opcode == "v_cndmask_b32_e64" and \
             last_inst.operands[0] == dst_expr and \
@@ -542,7 +595,7 @@ class JIT:
     def _align_up(self, a, align):
         return ((a + align - 1)//align) * align
 
-    def auto_gpr(self, expr:GPRExpr, name=""):
+    def auto_gpr(self, expr:GPRExpr, name="", loc=""):
         if name == "":
             # try to reover python var's name from code_context
             stack = inspect.stack()
@@ -554,7 +607,9 @@ class JIT:
         rtype = expr.find_rtype()
         dtype = expr.find_dtype()
         gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name=name)
-        gprs[0] = expr
+        if loc == "":
+            loc = inspect.currentframe().f_back.f_lineno
+        self.recursive_expr_gen(self.current_bb, gprs[0], expr, loc=loc)
         return gprs
 
 
@@ -567,7 +622,7 @@ class JIT:
     su32x4      alloc four scalar i32
     vf32x4      alloc four vector f32
     '''
-    def gpr(self, desc:str, align=1, name=""):
+    def gpr(self, desc:Union[str,GPRExpr], align=0, name=""):
         if name == "":
             # try to reover python var's name from code_context
             stack = inspect.stack()
@@ -575,6 +630,9 @@ class JIT:
             if caller_frame.code_context:
                 src_line = caller_frame.code_context[0].strip()
                 name = src_line.split("=")[0].strip()
+
+        if isinstance(desc, GPRExpr):
+            return self.auto_gpr(desc, name=name, loc=inspect.currentframe().f_back.f_lineno)
 
         desc = desc.strip()
         rtype = desc[0]
@@ -594,6 +652,9 @@ class JIT:
                 count_range = int(dtype_cnt[1])
             else:
                 count_range = 1
+            if align == 0: # derive alignment automatically
+                align = min(count_range, 4)//2*2
+        align = max(align, 1)
         return self.new_gpr(rtype, count_range, dtype, align, name)
 
 
@@ -781,7 +842,7 @@ class JIT:
         # add debug info to asm instruction
         for bb in self.blocks:
             for inst in bb.instructions:
-                debug_info = f"#{inst.sid} "
+                debug_info = f"#{inst.loc}   sid:{inst.sid} "
                 for op in inst.operands:
                     if isinstance(op, GPRExpr):
                         op = op.src0
@@ -795,7 +856,7 @@ class JIT:
     '''
     with the help of temp vars, complex expression can be recursively generated & appended into bb.
     '''
-    def recursive_expr_gen(self, bb, dst_expr:GPRExpr,  expr:Union['GPRExpr',int,float]):
+    def recursive_expr_gen(self, bb, dst_expr:GPRExpr,  expr:Union['GPRExpr',int,float], loc=""):
         assert dst_expr.op == "getitem"
         dst_gprs = dst_expr.src0
         dst_idx0 = dst_expr.src1
@@ -806,7 +867,7 @@ class JIT:
         if isinstance(expr, float):
             expr = float_to_ieee754_bits_little(expr)
         if isinstance(expr, int):
-            new_inst = Instruction(bb, f"{rtype}_mov_b32")
+            new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
             new_inst(dst_expr, expr)
             return
         assert isinstance(expr, GPRExpr)
@@ -814,7 +875,7 @@ class JIT:
             # assign
             src_cnt = expr.src2 - expr.src1 + 1
             assert src_cnt == 1
-            new_inst = Instruction(bb, f"{rtype}_mov_b32")
+            new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
             new_inst(dst_expr, expr)
             return
 
@@ -831,7 +892,7 @@ class JIT:
             else:
                 src0_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
                 src0_operand = GPRExpr("getitem", src0_gprs, 0, 0)
-                self.recursive_expr_gen(bb, src0_operand, expr.src0)
+                self.recursive_expr_gen(bb, src0_operand, expr.src0, loc=loc)
         else:
             src0_operand = expr.src0 # int,float,...
             if isinstance(src0_operand, float): # convert float-const into int?
@@ -844,7 +905,7 @@ class JIT:
             else:
                 src1_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
                 src1_operand = GPRExpr("getitem", src1_gprs, 0, 0)
-                self.recursive_expr_gen(bb, src1_operand, expr.src1)
+                self.recursive_expr_gen(bb, src1_operand, expr.src1, loc=loc)
         else:
             src1_operand = expr.src1 # int,float,...
             if isinstance(src1_operand, float): # convert float-const into int?
@@ -853,33 +914,39 @@ class JIT:
         def vgpr_add_sub_ui32(op):
             nonlocal src0_operand, src1_operand
             if isinstance(src0_operand, GPRExpr) and isinstance(src1_operand, GPRExpr):
-                return Instruction(bb, f"v_add_u32_e32" if op == '+' else f"v_sub_u32_e32")
+                return Instruction(bb, f"v_add_u32_e32" if op == '+' else f"v_sub_u32_e32", loc=loc)
             if isinstance(src0_operand, GPRExpr):
                 if op == '-':
                     src1_operand = hex(-src1_operand & 0xffffffff)
                 # v_add_u32_e32's src0 can be const
                 src1_operand, src0_operand = src0_operand, src1_operand
-                return Instruction(bb, f"v_add_u32_e32") # vgpr + (+/- const)
+                return Instruction(bb, f"v_add_u32_e32", loc=loc) # vgpr + (+/- const)
             if isinstance(src1_operand, GPRExpr):
                 if op == '-':
                     return Instruction(bb, f"v_sub_u32_e32") # const - vgpr
-                return Instruction(bb, f"v_add_u32_e32") # const + vgpr
+                return Instruction(bb, f"v_add_u32_e32", loc=loc) # const + vgpr
             assert 0
 
         # now src0_operand & src1_operand are generated, we can generate our result
         if expr.op == "+":
             if rtype == "s":
-                new_inst = Instruction(bb, f"{rtype}_add_{dtype}")
-            elif rtype == "v" and dtype in ["u32", "i32"]:
-                new_inst = vgpr_add_sub_ui32(expr.op)
+                new_inst = Instruction(bb, f"{rtype}_add_{dtype}", loc=loc)
+            elif rtype == "v":
+                if dtype in ["u32", "i32"]:
+                    new_inst = vgpr_add_sub_ui32(expr.op)
+                else:
+                    new_inst = Instruction(bb, f"{rtype}_add_{dtype}", loc=loc)
             else:
                 assert 0
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "-":
             if rtype == "s":
-                new_inst = Instruction(bb, f"{rtype}_sub_{dtype}")
-            elif rtype == "v" and dtype in ["u32", "i32"]:
-                new_inst = vgpr_add_sub_ui32(expr.op)
+                new_inst = Instruction(bb, f"{rtype}_sub_{dtype}", loc=loc)
+            elif rtype == "v":
+                if dtype in ["u32", "i32"]:
+                    new_inst = vgpr_add_sub_ui32(expr.op)
+                else:
+                    new_inst = Instruction(bb, f"{rtype}_sub_{dtype}", loc=loc)
             else:
                 assert 0
             new_inst(dst_expr, src0_operand, src1_operand)
@@ -887,16 +954,16 @@ class JIT:
             if rtype == "s":
                 if dtype == "u32":
                     self.log("s_mul_u32 not exist, using s_mul_i32 instead")
-                    new_inst = Instruction(bb, f"s_mul_i32")
+                    new_inst = Instruction(bb, f"s_mul_i32", loc=loc)
                 else:
-                    new_inst = Instruction(bb, f"s_mul_{dtype}")
+                    new_inst = Instruction(bb, f"s_mul_{dtype}", loc=loc)
             elif rtype == "v":
                 if dtype in ["u32", "u16"]:
-                    new_inst = Instruction(bb, f"v_mul_lo_{dtype}")
+                    new_inst = Instruction(bb, f"v_mul_lo_{dtype}", loc=loc)
                 elif dtype in ["f32", "f16"]:
-                    new_inst = Instruction(bb, f"v_mul_{dtype}")
+                    new_inst = Instruction(bb, f"v_mul_{dtype}", loc=loc)
                 elif dtype in ["i32"]:
-                    new_inst = Instruction(bb, f"v_mul_i32_i24")
+                    new_inst = Instruction(bb, f"v_mul_i32_i24", loc=loc)
                 else:
                     assert 0, f"unsupported v_mul dtype: {dtype}"
             else:
@@ -904,47 +971,47 @@ class JIT:
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "<<":
             if rtype == "s":
-                new_inst = Instruction(bb, f"s_lshl_b32")
+                new_inst = Instruction(bb, f"s_lshl_b32", loc=loc)
                 new_inst(dst_expr, src0_operand, src1_operand)
             elif rtype == "v":
-                new_inst = Instruction(bb, f"v_lshlrev_b32")
+                new_inst = Instruction(bb, f"v_lshlrev_b32", loc=loc)
                 new_inst(dst_expr, src1_operand, src0_operand)
             else:
                 assert 0, f"unsupported v_mul rtype: {rtype}"
         elif expr.op == ">>":
             if rtype == "s":
                 if dtype == "u32":
-                    new_inst = Instruction(bb, f"s_lshr_b32")
+                    new_inst = Instruction(bb, f"s_lshr_b32", loc=loc)
                 elif dtype == "i32":
-                    new_inst = Instruction(bb, f"s_ashr_i32")
+                    new_inst = Instruction(bb, f"s_ashr_i32", loc=loc)
                 else:
                     assert 0, f"unsupported sgpr shift right dtype {dtype}"
                 new_inst(dst_expr, src0_operand, src1_operand)
             elif rtype == "v":
-                if dtype == "u32":
-                    new_inst = Instruction(bb, f"v_lshrrev_b32")
+                if dtype in ["u32","f32"]:
+                    new_inst = Instruction(bb, f"v_lshrrev_b32", loc=loc)
                 elif dtype == "i32":
-                    new_inst = Instruction(bb, f"v_ashrrev_i32")
+                    new_inst = Instruction(bb, f"v_ashrrev_i32", loc=loc)
                 else:
                     assert 0, f"unsupported vgpr shift right dtype {dtype}"
                 new_inst(dst_expr, src1_operand, src0_operand)
             else:
                 assert 0, f"unsupported rtype: {rtype}"
         elif expr.op == "&":
-            new_inst = Instruction(bb, f"{rtype}_and_b32")
+            new_inst = Instruction(bb, f"{rtype}_and_b32", loc=loc)
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "|":
-            new_inst = Instruction(bb, f"{rtype}_or_b32")
+            new_inst = Instruction(bb, f"{rtype}_or_b32", loc=loc)
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "^":
-            new_inst = Instruction(bb, f"{rtype}_xor_b32")
+            new_inst = Instruction(bb, f"{rtype}_xor_b32", loc=loc)
             new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op in ["eq","ne","lt","gt","le","ge"]:
             if rtype == "s":
                 op = expr.op
                 if op == "ne" : op = "lg"
-                cmp = Instruction(bb, f"s_cmp_{op}_{dtype}")
-                mov = Instruction(bb, f"s_mov_b32")
+                cmp = Instruction(bb, f"s_cmp_{op}_{dtype}", loc=loc)
+                mov = Instruction(bb, f"s_mov_b32", loc=loc)
                 cmp(src0_operand, src1_operand)
                 mov(dst_expr, "scc")
             elif rtype == "v":
@@ -955,8 +1022,8 @@ class JIT:
                     src1_operand, src0_operand = src0_operand, src1_operand
                     cmp_op_reverse = {"gt":"lt", "lt":"gt", "le":"ge", "ge":"le", "eq":"eq", "ne":"ne"}
                     op = cmp_op_reverse[op]
-                cmp = Instruction(bb, f"v_cmp_{op}_{dtype}_e32")
-                mov = Instruction(bb, f"v_cndmask_b32_e64")
+                cmp = Instruction(bb, f"v_cmp_{op}_{dtype}_e32", loc=loc)
+                mov = Instruction(bb, f"v_cndmask_b32_e64", loc=loc)
                 cmp("vcc", src0_operand, src1_operand)
                 mov(dst_expr, 0, 1, "vcc")
             else:
@@ -988,6 +1055,36 @@ class JIT:
                 if inst.opcode == "expression_place_holder":
                     expr_insts.append(inst)
             self.compile_bb_expr(bb, expr_insts)
+
+    def insert_nop(self):
+        for bb in self.blocks:
+            i = 1
+            while i < len(bb.instructions):
+                prev = bb.instructions[i-1]
+                cur = bb.instructions[i]
+                loc = cur.loc
+                n_nops = -1
+                if cur.opcode == "v_readfirstlane_b32":
+                    vsrc0 = cur.operands[1]
+                    if prev.opcode.startswith("v_"):
+                        vdst = prev.operands[0]
+                        if vdst.overlap(vsrc0):
+                            n_nops = 1
+                            self.log(f"insert s_nop({n_nops}) at #{loc} : [VALU writes VGPRn,v_readlane vsrc0 reads VGPRn]")
+                    
+                if prev.isTransOp() and (not cur.isTransOp()) and (cur.isVALU()):
+                    vdst = prev.operands[0]
+                    for op in cur.operands:
+                        if (isinstance(op, GPRExpr) or isinstance(op, GPRs)) and vdst.overlap(op):
+                            n_nops = 1
+                            self.log(f"insert s_nop({n_nops}) at #{loc} : [VALU Trans op, Non-trans VALU op consumes result of that op]")
+                            break
+
+                if n_nops >= 0:
+                    inst = Instruction(bb, "s_nop")
+                    inst(n_nops, insert_bb_pos = i)
+
+                i += 1
 
     def build(self, kernel_name, signature, extra_compiler_options, temp_filename):
         self.asm_debug_info = ""
@@ -1028,6 +1125,7 @@ class JIT:
         # use following way only
         # if we want to do multi-expression optimization (like common expr extraction...)
         # self.compile_expressions()
+        self.insert_nop()
         self.register_allocation_linear_scan()
 
         # generate asm: basic blocks are in natural order
