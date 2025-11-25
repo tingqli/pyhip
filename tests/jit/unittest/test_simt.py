@@ -50,7 +50,7 @@ def test_simt():
 
 
 
-def txest_get_amax():
+def test_get_amax():
     @pyhip.jit("(int*, int)")
     def kernel(J):
         kargs = J.new_gpr('s',[0,1])
@@ -74,21 +74,22 @@ def txest_get_amax():
                 J.v_max_f32_e32(vmax, vmax, vdata)
             J.s_cbranch_scc0(mod=loop["end"])
             vi[0] = vi + 64
-
+        vmax = J.reduce("v_max_f32", vmax)
         voff = J.auto_gpr(threadIdx_x << 2)
         J.global_store_dword(voff, vmax, pA)
         J.s_waitcnt(mod=f"vmcnt({0})")
 
-    TOTAL_CNT = 128
+    TOTAL_CNT = 200
     A = torch.randint(-100,100, (TOTAL_CNT,), dtype=torch.float)
-    CNT = 128
-    print(A)
+    A[128] = 120
+    A[129] = 125
+    CNT = 129
+    ref = torch.max(A[:CNT])
     kernel([1],[64], A.data_ptr(), CNT)
     torch.cuda.synchronize()
-    
-    print(A)
+    assert torch.allclose(ref, A[:64])
 
 if __name__ == "__main__":
-    #test_simt()
-    txest_get_amax()
+    test_simt()
+    test_get_amax()
 

@@ -1043,6 +1043,31 @@ r'''
         hip = module(cpp_src_fpath, extra_compiler_options)
         return getattr(hip, kernel_name)
 
+    '''
+    reduce("v_max_f32", vinput)
+    reduce("v_add_f32", vinput)
+    '''
+    def reduce(self, vinst, vinput):
+        self.s_nop(mod="2")
+        v1 = self.new_gpr('v',1,dtype="i32", align=1)
+        getattr(self, vinst)(v1, vinput, vinput, mod="row_shr:8 bound_ctrl:0")
+        self.s_nop(mod="2")
+        getattr(self, vinst)(v1, v1, v1, mod="row_shr:4 bound_ctrl:0")
+        self.s_nop(mod="2")
+        getattr(self, vinst)(v1, v1, v1, mod="row_shr:2 bound_ctrl:0")
+        self.s_nop(mod="2")
+        getattr(self, vinst)(v1, v1, v1, mod="row_shr:1 bound_ctrl:0")
+        self.s_nop(mod="2")
+        getattr(self, vinst)(v1, v1, v1, mod="row_bcast:15 bound_ctrl:0")
+        self.s_nop(mod="2")
+        getattr(self, vinst)(v1, v1, v1, mod="row_bcast:31 bound_ctrl:0")
+        self.s_nop(mod="2")
+        vaddr = self.new_gpr('v',1,dtype="i32", align=1)
+        vaddr[0] = 63*4 # broadcast last lane to all lanes
+        self.ds_bpermute_b32(v1, vaddr, v1) # vdst,  vaddr,    vdata   offset
+        self.s_waitcnt(mod=f"lgkmcnt({0})")
+        return v1
+
 '''
 @jit(signature="(type arg, ...)")
 def kernel(J):
