@@ -53,18 +53,18 @@ def test_simt():
 def test_get_amax():
     @pyhip.jit("(int*, int)")
     def kernel(J):
-        kargs = J.new_gpr('s',[0,1])
-        threadIdx_x = J.new_gpr('v',[0,0], dtype="i32")
-        count = J.new_gpr('s', 1, dtype="i32")
-        pA = J.new_gpr('s',2,align=2)
+        kargs = J.gpr('su32[0:1]')
+        threadIdx_x = J.gpr('vi32[0]')
+        count = J.gpr('si32')
+        pA = J.gpr('su32x2',align=2)
         J.s_load_dwordx2(pA, kargs, 0)
         J.s_load_dword(count, kargs, 8)
         J.s_waitcnt(mod=f"lgkmcnt({0})")
 
         # vdst,vaddr,saddr offset13s sc0 nt sc1
         vi = J.auto_gpr(threadIdx_x[0])
-        vdata = J.new_gpr('v',1,dtype="i32", align=1)
-        vmax = J.new_gpr('v',1,dtype="f32", align=1)
+        vdata = J.gpr('vi32')
+        vmax = J.gpr('vf32')
         vmax[0] = torch.finfo(torch.float).min
         with J.While() as loop:
             with J.ExecMask(vi < count):

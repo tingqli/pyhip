@@ -557,6 +557,46 @@ class JIT:
         gprs[0] = expr
         return gprs
 
+
+    '''
+    si32[0:1]   reserve s[0:1] as two i32
+    vi32[0]     reserve v[0] as i32
+    af32[0:255] reserve a[0:255] as f32
+
+    si32x2      alloc two scalar i32 
+    su32x4      alloc four scalar i32
+    vf32x4      alloc four vector f32
+    '''
+    def gpr(self, desc:str, align=1, name=""):
+        if name == "":
+            # try to reover python var's name from code_context
+            stack = inspect.stack()
+            caller_frame = stack[1]
+            if caller_frame.code_context:
+                src_line = caller_frame.code_context[0].strip()
+                name = src_line.split("=")[0].strip()
+
+        desc = desc.strip()
+        rtype = desc[0]
+        if "[" in desc[1:]:
+            dtype, range = desc[1:].split("[")
+            assert range[-1] == "]"
+            range = range[:-1]
+            if ":" in range:
+                first, last = range.split(":")
+                count_range = (int(first), int(last))
+            else:
+                count_range = (int(range),int(range))
+        else:
+            dtype_cnt = desc[1:].split("x")
+            dtype = dtype_cnt[0]
+            if len(dtype_cnt) == 2:
+                count_range = int(dtype_cnt[1])
+            else:
+                count_range = 1
+        return self.new_gpr(rtype, count_range, dtype, align, name)
+
+
     def new_gpr(self, reg_type, count_range, dtype="", align=1, name=""):
         if name == "":
             # try to reover python var's name from code_context
