@@ -320,7 +320,7 @@ class BasicBlock:
         self.label_name = label_name
         if label_name == "":
             self.label_name = f"_bb_no_name_{self.bb_index}"
-        
+
         jit.label2bb[self.label_name] = self
         self.instructions: List[Instruction] = []
         self.predecessors: List['BasicBlock'] = []
@@ -343,12 +343,13 @@ class BasicBlock:
         # branch or cbranch can tell successors
         if instr.is_branch:
             # one possible successor
-            self.jit._finish_bb(self, "")
+            self.jit._finish_bb(self)
             target_lable_str = instr.mod
             self.add_successor(target_lable_str)
         elif instr.is_cbranch:
             # two possible successor
-            self.jit._finish_bb(self, "")
+            self.jit._finish_bb(self)
+            self.jit.current_bb = BasicBlock(self.jit, "")
             target_lable_str = instr.mod
             self.add_successor(target_lable_str)
             self.add_successor(self.jit.current_bb)
@@ -436,18 +437,25 @@ class JIT:
         self.fixed_gprs = []
 
     def __getattr__(self, instruction):
+        if self.current_bb is None:
+            self.current_bb = BasicBlock(self, label_name="")
         return Instruction(self.current_bb, instruction, loc=inspect.currentframe().f_back.f_lineno)
 
-    def _finish_bb(self, bb, next_bb_name=""):
+    def _finish_bb(self, bb):
+        if bb is None:
+            self.current_bb = None
+            return
         assert bb is self.current_bb
         self.blocks.append(bb)
-        next_bb = BasicBlock(self, next_bb_name)
-        self.current_bb = next_bb
+        self.current_bb = None
 
     def Label(self, name=""):
         # creat new basic block, archieve current bb
         old_bb = self.current_bb
-        self._finish_bb(self.current_bb, name)
+        if old_bb is None:
+            old_bb = self.blocks[-1]
+        self._finish_bb(self.current_bb)
+        self.current_bb = BasicBlock(self, name)
         old_bb.add_successor(self.current_bb)
         return self.current_bb
 
@@ -734,7 +742,8 @@ class JIT:
             if len(bb.instructions) == 0: continue
             sid0 = bb.instructions[0].sid
             for parent_bb in bb.predecessors:
-                assert len(parent_bb.instructions) > 0, f"{parent_bb.label_name} is empty"
+                if len(parent_bb.instructions) == 0: continue
+                # assert len(parent_bb.instructions) > 0, f"{parent_bb.label_name} is empty"
                 if parent_bb.instructions[0].sid > sid0:
                     # backward jump detected, enlarge all gpr's interval
                     jump_back_sid = parent_bb.instructions[-1].sid
@@ -1109,10 +1118,15 @@ class JIT:
             bb.solve_succesors()
         
         # remove empty bb
+        '''
+        asm=""
+        for bb in self.blocks:
+            asm += repr(bb)
+        print(asm)
         bb_to_remove = []
         for bb in self.blocks[:-1]:
             if len(bb.instructions) == 0:
-                assert len(bb.predecessors) == 1
+                assert len(bb.predecessors) == 1, f"{bb.label_name}"
                 assert len(bb.successors) == 1
                 bb.predecessors[0].successors.remove(bb)
                 bb.successors[0].predecessors.remove(bb)
@@ -1120,7 +1134,7 @@ class JIT:
                 bb_to_remove.append(bb)
         for empty_bb in bb_to_remove:
             self.blocks.remove(empty_bb)   
-
+        '''
 
         # use following way only
         # if we want to do multi-expression optimization (like common expr extraction...)
