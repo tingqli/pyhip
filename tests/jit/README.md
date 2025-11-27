@@ -18,6 +18,14 @@ v0中会初始化work-item id，但是会根据kernel是否使用到了`threadId
 	v_bfe_u32 v1, v0, 10, 10 # 提取 threadIdx.y
 ```
 
+kernel参数的加载逻辑，在pyhip.jit修饰符调用中检查python kernel原型中从第二个参数开始的参数的annotation, 这些字符串annotation就是对应hip的参数类型，然后动态分配这些参数的sgpr,生成从`s[0:1]`中加载这些参数的指令，把这些参数sgpr收集并且传递给python的jit-kernel.
+
+```python
+    @pyhip.jit()
+    def kernel(J, pA:"int*", count:"int"):
+        ...
+```
+
 # 寄存器手动分配/释放
 
 寄存器手动分配/释放,可以指定寄存器名，或者不指定自动分配

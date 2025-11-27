@@ -13,25 +13,9 @@ def test_mfma_32x32x16(BM, BN, K):
     assert K % 16 == 0
     assert BM % 32 == 0
     assert BN % 32 == 0
-    @pyhip.jit("(void* A, void* B, void* C, int strideAB, int strideC, int K)")
-    def kernel(J):
-        pkargs = J.new_gpr('s',[0,1])
-        thread_id_x = J.new_gpr('v',[0,0], dtype="i32")
-        lane_id = J.auto_gpr(thread_id_x[0] & 63)
-
-        pA = J.new_gpr('s', 2, align=2)
-        pB = J.new_gpr('s', 2, align=2)
-        pC = J.new_gpr('s', 2, align=2)
-        K = J.new_gpr('s', 1, align=1, dtype="i32")
-        strideAB = J.new_gpr('s', 1, dtype="i32", align=1)
-        strideC = J.new_gpr('s', 1, dtype="i32", align=1)
-        J.s_load_dwordx2(pA, pkargs, 0)
-        J.s_load_dwordx2(pB, pkargs, 8)
-        J.s_load_dwordx2(pC, pkargs, 16)
-        J.s_load_dword(strideAB, pkargs, 24)
-        J.s_load_dword(strideC, pkargs, 28)
-        J.s_load_dword(K, pkargs, 32)
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
+    @pyhip.jit()
+    def kernel(J, pA:"void*", pB:"void*", pC:"void*", strideAB:"int", strideC:"int", K:"int"):
+        lane_id = J.auto_gpr(J.threadIdx.x[0] & 63)
 
         n_block_m = BM//32
         n_block_n = BN//32

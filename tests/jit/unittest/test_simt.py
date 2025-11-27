@@ -9,18 +9,10 @@ from contextlib import contextmanager
 
 
 def test_simt():
-    @pyhip.jit("(int*, int)")
-    def kernel(J):
-        kargs = J.new_gpr('s',[0,1])
-        threadIdx_x = J.new_gpr('v',[0,0], dtype="i32")
-        count = J.new_gpr('s', 1, dtype="i32")
-        pA = J.new_gpr('s',2,align=2)
-        J.s_load_dwordx2(pA, kargs, 0)
-        J.s_load_dword(count, kargs, 8)
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
-
+    @pyhip.jit()
+    def kernel(J, pA:"int*", count:"int"):
         # vdst,vaddr,saddr offset13s sc0 nt sc1
-        vi = J.auto_gpr(threadIdx_x[0])
+        vi = J.auto_gpr(J.threadIdx.x[0])
         vdata = J.new_gpr('v',1,dtype="i32", align=1)
 
         with J.While() as loop:
@@ -51,18 +43,9 @@ def test_simt():
 
 
 def test_get_amax():
-    @pyhip.jit("(int*, int)")
-    def kernel(J):
-        kargs = J.gpr('su32[0:1]')
-        threadIdx_x = J.gpr('vi32[0]')
-        count = J.gpr('si32')
-        pA = J.gpr('su32x2',align=2)
-        J.s_load_dwordx2(pA, kargs, 0)
-        J.s_load_dword(count, kargs, 8)
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
-
-        # vdst,vaddr,saddr offset13s sc0 nt sc1
-        vi = J.auto_gpr(threadIdx_x[0])
+    @pyhip.jit()
+    def kernel(J, pA:"int*", count:"int"):
+        vi = J.auto_gpr(J.threadIdx.x[0])
         vdata = J.gpr('vi32')
         vmax = J.gpr('vf32')
         vmax[0] = torch.finfo(torch.float).min
@@ -75,7 +58,7 @@ def test_get_amax():
             J.s_cbranch_scc0(mod=loop["end"])
             vi[0] = vi + 64
         vmax = J.reduce("v_max_f32", vmax)
-        voff = J.auto_gpr(threadIdx_x << 2)
+        voff = J.auto_gpr(J.threadIdx.x << 2)
         J.global_store_dword(voff, vmax, pA)
         J.s_waitcnt(mod=f"vmcnt({0})")
 

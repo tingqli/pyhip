@@ -6,18 +6,10 @@ torch.set_default_device('cuda')
 torch.manual_seed(0)
 
 def test_reduce():
-    @pyhip.jit("(int*, int)")
-    def kernel(J):
-        kargs = J.new_gpr('s',[0,1])
-        threadIdx_x = J.new_gpr('v',[0,0], dtype="i32")
-        count = J.new_gpr('s', 1, dtype="i32")
-        pA = J.new_gpr('s', 2, align=2)
-        J.s_load_dwordx2(pA, kargs, 0)
-        J.s_load_dword(count, kargs, 8)
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
-
+    @pyhip.jit()
+    def kernel(J, pA:"int*", count:"int"):
         v1 = J.new_gpr("v", 1)
-        voff = J.auto_gpr(threadIdx_x << 2)
+        voff = J.auto_gpr(J.threadIdx.x << 2)
         J.global_load_dword(v1, voff, pA)
         J.s_waitcnt(mod=f"vmcnt({0})")
 

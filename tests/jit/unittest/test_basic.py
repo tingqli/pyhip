@@ -6,12 +6,8 @@ torch.set_default_device('cuda')
 torch.manual_seed(0)
 
 def test_basic():
-    @pyhip.jit("(int*, int)")
-    def kernel(J):
-        p_kargs = J.new_gpr('s',[0,1],name="p_kargs")
-        threadIdx_x = J.new_gpr('v',[0,0],name="threadIdx_x")
-        pA = J.new_gpr('s',2,align=4,name="pA")
-        cnt = J.new_gpr('s',1,name="K")
+    @pyhip.jit()
+    def kernel(J, pA:"int*", cnt:"int"):
         acc = J.new_gpr("a", 4,name="acc")
         s_idx = J.new_gpr('s',1, dtype="u32", name="s_idx")
         s_temp0 = J.new_gpr('s',1,name="s_temp0")
@@ -19,13 +15,8 @@ def test_basic():
         s_temp2 = J.new_gpr('s',2, align=2,name="s_temp2")
         vtemp = J.new_gpr('v',2, dtype="u32", align=2,name="vtemp")
 
-        J.s_load_dwordx2(pA, p_kargs, 0)
-
         for i in range(4):
             J.v_accvgpr_write_b32(acc[i], 0)
-
-        J.s_load_dword(cnt, p_kargs, 8)
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
 
         s_idx[0] = 0
         J.Label("bb0")
@@ -57,19 +48,12 @@ def test_basic():
     torch.testing.assert_close(A, ref)
 
 def test_basic2():
-    @pyhip.jit("(int*, int)")
-    def kernel(J):
-        p_kargs = J.new_gpr('s',[0,1],name="p_kargs")
-        threadIdx_x = J.new_gpr('v',[0,0],name="threadIdx_x")
-        pA = J.new_gpr('s',2,align=4,name="pA")
-        cnt = J.new_gpr('s',1,name="K")
+    @pyhip.jit()
+    def kernel(J, pA:"int*", cnt:"int"):
         s_idx = J.new_gpr('s',1, dtype="u32", name="s_idx")
         s_offset = J.new_gpr('s',1,dtype="u32", name="s_offset")
         s_temp = J.new_gpr('s',2, dtype="u32", align=2,name="s_temp")
 
-        J.s_load_dwordx2(pA, p_kargs, 0)
-
-        J.s_load_dword(cnt, p_kargs, 8)
         J.s_waitcnt(mod=f"lgkmcnt({0})")
 
         s_idx[0] = 0
@@ -98,7 +82,6 @@ def test_basic2():
     ref[:CNT] = CNT
     torch.testing.assert_close(A, ref)
 
-
 class Buffer:
     def __init__(self, J):
         self.J = J
@@ -108,13 +91,10 @@ class Buffer:
         self.config = self.desc[3]
         J.s_mov_b32(self.config, 0x00020000)
 
-    def setup(self, sgpr_args_base, offset_base:int, offset_count:int, sizeof_ele:int):
-        J = self.J
-        J.s_load_dwordx2(self.base, sgpr_args_base, offset_base)
-        J.s_load_dword(self.range, sgpr_args_base, offset_count)
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
-        if sizeof_ele != 1:
-            J.s_mulk_i32(self.range, sizeof_ele)
+    def setup(self, base, range):
+        self.base[0] = base[0]
+        self.base[1] = base[1]
+        self.range[0] = range[0]
 
     def load_dwordx4(self, vdst, voffset, soffset, offset12=0):
         # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
@@ -133,20 +113,19 @@ class Buffer:
         self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
 
 def test_vadd():
-    @pyhip.jit("(int*, int*, int)")
-    def kernel(J):
-        p_kargs = J.new_gpr('s',[0,1])
-        threadId_X = J.new_gpr('v', [0,0], dtype="u32")
+    @pyhip.jit()
+    def kernel(J, pA:"int*", pB:"int*", cnt:"int"):
         vtemp =J.new_gpr('v',1) 
         v4 = J.new_gpr('v', 4, dtype="u32",align=2)
 
         buff_a = Buffer(J)
         buff_b = Buffer(J)
+
+        size = J.gpr(cnt[0] * 4)
+        buff_a.setup(pA, size)
+        buff_b.setup(pB, size)
         
-        buff_a.setup(p_kargs, 0, 16, sizeof_ele=4)
-        buff_b.setup(p_kargs, 8, 16, sizeof_ele=4)
-        
-        vtemp[0] = threadId_X[0] << 4
+        vtemp[0] = J.threadIdx.x[0] << 4
         buff_a.load_dwordx4(v4, vtemp[0], 0)
         J.s_waitcnt(mod=f"vmcnt(0)")
 
@@ -168,5 +147,5 @@ def test_vadd():
 
 if __name__ == "__main__":
     test_basic()
-    #test_basic2()
-    #test_vadd()
+    test_basic2()
+    test_vadd()

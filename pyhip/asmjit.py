@@ -1180,7 +1180,7 @@ class JIT:
 #include "hip/hip_runtime.h"
 __global__ void ''' + kernel_name + signature +  r''' {
     // force HIP to initialize sgpr2/sgpr3/sgpr4, TODO: add threadIdx.y/z
-    asm volatile(""::"s"(blockIdx.x),"s"(blockIdx.y),"s"(blockIdx.z));
+    asm volatile(" ; blockIdx.x %0, blockIdx.y %1, blockIdx.z %2"::"s"(blockIdx.x),"s"(blockIdx.y),"s"(blockIdx.z));
     asm volatile("\n"
 ''' + "\n" + inline_asm + \
 r'''
@@ -1227,9 +1227,12 @@ def kernel(J):
 '''
 gen_hip_file_unique_id = 0
 
+class Idx3D:
+    def __init__(self):
+        pass
+
 class jit:
-    def __init__(self, signature, extra_compiler_options = ""):
-        self.signature = signature
+    def __init__(self, extra_compiler_options = ""):
         self.extra_compiler_options = extra_compiler_options
 
     def __call__(self, func):
@@ -1239,11 +1242,51 @@ class jit:
         file_info = inspect.getfile(func)
         line_no = inspect.getsourcelines(func)[1]
         filename = os.path.basename(file_info)
+
+        argspec = inspect.getfullargspec(func)
+        argtypes = func.__annotations__
+
         J = JIT()
-        func(J)
+        # create special sgpr for args
+        # and generate codes to load these args
+        signatures = []
+        sgpr_args = []
+        J.kargs = J.new_gpr('s',[0,1],name="kargs")
+        J.threadIdx = Idx3D()
+        J.blockIdx = Idx3D()
+        J.threadIdx.x = J.new_gpr('v',[0,0], dtype="u32", name="threadIdx.x")
+        J.blockIdx.x = J.new_gpr('s',[2,2], dtype="u32", name="blockIdx.x")
+        J.blockIdx.y = J.new_gpr('s',[3,3], dtype="u32", name="blockIdx.y")
+        J.blockIdx.z = J.new_gpr('s',[4,4], dtype="u32", name="blockIdx.z")
+        arg_offset = 0
+        for arg_name in argspec.args[1:]:
+            assert arg_name in argtypes
+            atype = argtypes[arg_name].strip()
+            assert isinstance(atype, str)
+            signatures.append(f"{atype} {arg_name}")
+            if atype.endswith("*"):
+                arg_offset = ((arg_offset + 7) // 8) * 8
+                sgpr = J.new_gpr('s',2, dtype="u32", align=2, name=arg_name)
+                J.s_load_dwordx2(sgpr, J.kargs, arg_offset)
+                sgpr_args.append(sgpr)
+                arg_offset += 8
+                continue
+            if atype in ["int","uint","unsigned int"]:
+                arg_offset = ((arg_offset + 3) // 4) * 4
+                sgpr = J.new_gpr('s',1, dtype=f"{atype[0]}32", align=1, name=arg_name)
+                J.s_load_dword(sgpr, J.kargs, arg_offset)
+                sgpr_args.append(sgpr)
+                arg_offset += 4
+                continue
+
+        if len(sgpr_args) > 0:
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        # now generate your kernel code
+        func(J, *sgpr_args)
         func_name = func.__name__
         global gen_hip_file_unique_id
         gen_hip_file_unique_id += 1
-        return J.build(func_name, self.signature, self.extra_compiler_options,
+        return J.build(func_name, f"({','.join(signatures)})", self.extra_compiler_options,
                        temp_filename = f".jit-{gen_hip_file_unique_id}-{filename}-{line_no}-{func_name}")
 

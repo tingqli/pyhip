@@ -27,21 +27,11 @@ exprs = [
 ]
 
 def test_sexpr():
-    @pyhip.jit("(int*, int, int)")
-    def kernel(J):
-        s_pkargs = J.new_gpr('s',[0,1],name="s_pkargs")
-        threadIdx_x = J.new_gpr('v',[0,0],name="threadIdx_x")
-        s_pout = J.new_gpr('s', 2, align=2, name="s_pout")
-        s_inputs = J.new_gpr('s', 2, dtype="i32", name="s_inputs")
+    @pyhip.jit()
+    def kernel(J, s_pout:"int*", s_input0:"int", s_input1:"int"):
         s_output = J.new_gpr('s', 1, dtype="i32", name="s_output")
-
-        J.s_load_dwordx2(s_pout, s_pkargs, 0)
-        J.s_load_dword(s_inputs[0], s_pkargs, 8)
-        J.s_load_dword(s_inputs[1], s_pkargs, 8+4)
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
-
         for idx, func in enumerate(exprs):
-            s_output[0] = func(s_inputs[0], s_inputs[1])
+            s_output[0] = func(s_input0, s_input1)
             J.s_store_dword(s_output, s_pout, idx*4, mod="glc")
 
         J.s_waitcnt(mod=f"lgkmcnt({0})")
@@ -58,23 +48,13 @@ def test_sexpr():
     print(OUT)
 
 def test_vexpr():
-    @pyhip.jit("(int*, int*, int*)")
-    def kernel(J):
-        s_pkargs = J.new_gpr('s',[0,1],name="s_pkargs")
-        threadIdx_x = J.new_gpr('v',[0,0],name="threadIdx_x")
-        s_pout = J.new_gpr('s', 2, align=2, name="s_pout")
-        s_pin0 = J.new_gpr('s', 2, align=2, name="s_pin0")
-        s_pin1 = J.new_gpr('s', 2, align=2, name="s_pin1")
-        J.s_load_dwordx2(s_pout, s_pkargs, 0)
-        J.s_load_dwordx2(s_pin0, s_pkargs, 8)
-        J.s_load_dwordx2(s_pin1, s_pkargs, 16)
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
-
+    @pyhip.jit()
+    def kernel(J, s_pout:"int*", s_pin0:"int*", s_pin1:"int*"):
         v_inputs = J.new_gpr('v', 2, dtype="i32", name="v_inputs")
         v_output = J.new_gpr('v', 1, dtype="i32", name="v_output")
         vaddr = J.new_gpr('v', 1, dtype="i32", name="v_output")
 
-        vaddr[0] = threadIdx_x[0] << 2
+        vaddr[0] = J.threadIdx.x[0] << 2
         J.global_load_dword(v_inputs[0], vaddr, s_pin0)
         J.global_load_dword(v_inputs[1], vaddr, s_pin1)
         J.s_waitcnt(mod=f"vmcnt({0})")
