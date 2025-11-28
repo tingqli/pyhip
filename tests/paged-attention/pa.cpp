@@ -1,4 +1,5 @@
 #include <__clang_hip_runtime_wrapper.h>
+#include <bit>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
@@ -115,6 +116,16 @@ __device__ float llvm_amdgcn_raw_buffer_load_fp32(int32x4_t srsrc,
                                  int soffset,
                                  int glc_slc) __asm("llvm.amdgcn.raw.buffer.load.f32");
 
+__device__ __inline__
+void llvm_amdgcn_raw_buffer_load_lds(int32x4_t rsrc,    //
+                                as3_uint32_ptr lds_ptr, // LDS base offset
+                                int32_t size,           // Data byte size: 1/2/4 (/12/16 for gfx950)
+                                int32_t voffset,        // voffset(VGPR, included in bounds checking and swizzling)
+                                int32_t soffset,        // soffset(SGPR/imm, excluded from bounds checking and swizzling)
+                                int32_t offset,         // imm offset(imm, included in bounds checking and swizzling)
+                                int32_t aux             // auxiliary/cachepolicy(imm):
+                            ) __asm("llvm.amdgcn.raw.buffer.load.lds");
+
 template<typename T>
 __device__ T buffer_load_dword(BufferResource& buffer, int soffset, int voffset, int coffset, bool is_asm=false) {
     T v;
@@ -220,6 +231,9 @@ struct share_buf_t {
     __device__ float* get_sum_buf(uint m, uint warp_id) {
         return (float*)buf + m + warp_id * 16 + 64;
     }
+    __device__ uint* get_idx_buf(uint warp_id) {
+        return (uint*)get_key_buf(warp_id);
+    }
 };
 
 __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
@@ -286,9 +300,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     float cur_sum;
 
     BufferResource idx_buf(kv_page_indices, kv_len * sizeof(uint));
-    static_assert(KV_PART_SIZE / KV_MIN_PART_SIZE >= 2, "part size must be >= 2");
     uint k_idxs[KV_PART_SIZE_WARP / 4];
     auto cur_kv_len_start = kv_len_start + 0 * KV_MIN_PART_SIZE;
+
+    uint* idx_lds = share_buf.get_idx_buf(warp_id);
+    llvm_amdgcn_raw_buffer_load_lds(idx_buf.descriptor, (as3_uint32_ptr)idx_lds, 4, (lane_id + cur_kv_len_start) * sizeof(uint), 0, 0, 0);
+    __builtin_amdgcn_sched_barrier(0);
 
     #pragma unroll
     for (uint part_idx = 0; part_idx < KV_PART_SIZE / KV_MIN_PART_SIZE; part_idx++) {
@@ -300,7 +317,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
                 global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
                 k_idxs[n] = global_row_id + 1 + kv_indptr[b];
     #else
-                k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
+                //k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
+                k_idxs[n] = idx_lds[n * 4 + key_load_row_id];
     #endif
             }
         }
@@ -354,6 +372,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         cur_kv_len_start += KV_MIN_PART_SIZE;
         if (part_idx != KV_PART_SIZE / KV_MIN_PART_SIZE - 1)
         if (BLOCK_SIZE == 1) {
+            // llvm_amdgcn_raw_buffer_load_lds(idx_buf.descriptor, (as3_uint32_ptr)idx_lds, 4, (lane_id + kv_len_start) * sizeof(uint), (part_idx + 1) * KV_MIN_PART_SIZE * sizeof(uint), 0, 0);
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
     #if FAKE_K_IDX
                 uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
@@ -361,6 +380,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
                 k_idxs[n] = global_row_id + 1;
     #else
                 k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
+                // k_idxs[n] = idx_lds[n * 4 + key_load_row_id];
     #endif
             }
         }
@@ -395,12 +415,12 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         // ----------------------------------
         auto fixed_sum = prev_sum * __expf(prev_max - cur_max);
         cur_sum += fixed_sum;
-        const float inv_sum_scale =
-            __fdividef(1.f, cur_sum + 1e-6f);
+        const float inv_sum_scale = 1.f / (cur_sum + 1e-6f);
         bfloat16x4 acc_low[KV_PART_SIZE_WARP / 16];
         for (uint n = 0; n < 4; n++) {
             for (uint i = 0; i < 4; i++) {
-                acc_low[n][i] = acc[n][i] * inv_sum_scale;
+                auto tmp = acc[n][i] * inv_sum_scale;
+                acc_low[n][i] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(tmp) >> 16));
             }
         }
         // compensation prev vout
@@ -491,7 +511,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     for (uint k = 0; k < S / 64 ; k++) {
         for (uint i = 0; i < 4; i++)
             for (uint j = 0; j < 4; j++)
-                vout_low[k * 4 + j][i] = vout[k * 4 + i][j];
+                vout_low[k * 4 + j][i] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(vout[k * 4 + i][j]) >> 16));
     }
     __syncthreads();
 
@@ -515,8 +535,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
                 next_v = sums[4 * i + w] * __expf(maxs[4 * i + w] - real_max[i]) * next_v;
                 out_v += next_v;
             }
-            const float inv_sum_scale =
-                __fdividef(1.f, real_sum[i] + 1e-6f);
+            const float inv_sum_scale = 1.f / (real_sum[i] + 1e-6f);
             out_v = out_v * inv_sum_scale;
             ((bfloat16x2*)(out_seg + m_token_id * gridDim.z * S))[lane_id] = out_v;
             max_out[m_token_id * gridDim.z] = real_max[i];
@@ -579,8 +598,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
         for (int i = 1; i < 4; i++) {
             cur_val += *(float32x2*)(&out_lds[i * S + lane_id * 2]);
         }
-        const float inv_sum_scale =
-            __fdividef(1.f, warp_sum + 1e-6f);
+        const float inv_sum_scale = 1.f / (warp_sum + 1e-6f);
         cur_val *= inv_sum_scale;
         bfloat16x2 tmp_val;
         tmp_val[0] = cur_val[0];
