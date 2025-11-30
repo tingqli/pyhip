@@ -527,17 +527,26 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     for (uint i = 0; i < HQ / HK / 4; i++) {
         uint m_token_id = HQ / HK / 4 * warp_id + i;
         if (m_token_id < HQ / HK) {
-            auto out_v = ((bfloat16x2*)(share_buf.get_out_buf(0) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
+            bfloat16x2 tmp = ((bfloat16x2*)(share_buf.get_out_buf(0) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
+            float32x2 out_v;
+            out_v[0] = tmp[0];
+            out_v[1] = tmp[1];
             out_v = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) * out_v;
 
             for (int w = 1; w < 4; w++) {
-                auto next_v = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
+                auto tmp = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
+                float32x2 next_v;
+                next_v[0] = tmp[0];
+                next_v[1] = tmp[1];
                 next_v = sums[4 * i + w] * __expf(maxs[4 * i + w] - real_max[i]) * next_v;
                 out_v += next_v;
             }
             const float inv_sum_scale = 1.f / (real_sum[i] + 1e-6f);
             out_v = out_v * inv_sum_scale;
-            ((bfloat16x2*)(out_seg + m_token_id * gridDim.z * S))[lane_id] = out_v;
+            bfloat16x2 tmp_out;
+            tmp_out[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_v[0]) >> 16));
+            tmp_out[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_v[1]) >> 16));
+            ((bfloat16x2*)(out_seg + m_token_id * gridDim.z * S))[lane_id] = tmp_out;
             max_out[m_token_id * gridDim.z] = real_max[i];
             sum_out[m_token_id * gridDim.z] = real_sum[i];
         }
