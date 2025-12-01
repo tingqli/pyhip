@@ -647,9 +647,10 @@ class JIT:
             if caller_frame.code_context:
                 src_line = caller_frame.code_context[0].strip()
                 if "=" in src_line:
-                    var_name, assign = src_line.split("=")
-                    if ".gpr(" in assign:
-                        name = var_name.strip()
+                    items = src_line.split("=")
+                    if len(items) > 1:
+                        if ".gpr(" in items[1]:
+                            name = items[0].strip()
 
         if isinstance(desc, GPRExpr):
             return self.auto_gpr(desc, name=name, loc=inspect.currentframe().f_back.f_lineno)
