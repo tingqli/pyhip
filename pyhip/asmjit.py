@@ -1304,8 +1304,12 @@ class JIT:
         decl_lds = ""
         if self.free_lds_offset > 0:
             # (as3_uint32_ptr)(lds_buffer) is always 0
-            decl_lds += f"    __shared__ char lds_buffer[{self.free_lds_offset}];\n"
+            # but this 2 lines of code has side effect: compiler may use s0 as `lds_buffer`` input 
+            # which causes damage to kernal-arg pointer s[0:1], we can work-around it by putting
+            # these 2 lines of codes at the end of the kernel's source code.
+            decl_lds += f"    __shared__ uint lds_buffer[{self.free_lds_offset//4}];\n"
             decl_lds += f'    asm(" ; lds_buffer %0 "::"s"((as3_uint32_ptr)(lds_buffer)));'
+            pass
 
         hip_src =r'''
 #include <hip/hip_fp16.h> // for __fp16
@@ -1315,12 +1319,12 @@ using as3_uint32_ptr = __attribute__((address_space(3))) uint32_t *;
 __global__ void ''' + kernel_name + signature +  r''' {
     // force HIP to initialize sgpr2/sgpr3/sgpr4, TODO: add threadIdx.y/z
     asm volatile(" ; blockIdx.x %0, blockIdx.y %1, blockIdx.z %2"::"s"(blockIdx.x),"s"(blockIdx.y),"s"(blockIdx.z));
-''' + decl_lds + r'''
     asm volatile("\n"
 ''' + "\n" + inline_asm + \
 r'''
                 ::
                 :"memory"''' + str_used_gprs + r''');
+''' + decl_lds + r'''
 }
         '''
         import os

@@ -130,8 +130,8 @@ if USE_REDUCE_JIT:
 
             si[0] = si + 4
 
-        sum_lds = 0                 # __shared__ float sum_lds[4];
-        out_lds = sum_lds + 4*4 # __shared__ float out_lds[4 * S];
+        sum_lds = J.alloc_lds(4*4)   # __shared__ float sum_lds[4];
+        out_lds = J.alloc_lds(4*4*S) # __shared__ float out_lds[4 * S];
 
         vaddr = J.gpr("vi32")
         vaddr[0] = sum_lds + (s_warp_id<<2)
@@ -313,8 +313,7 @@ else:
     checks1 = torch.empty([64,], dtype=torch.float32)
     pa_reduce_jit([B, HQ], [256], 
                 kv_indptrs[-1].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), div_up(KV_LEN, KV_PART_SIZE),
-                checks1.data_ptr(),
-                sharedMemBytes=32*1024)
+                checks1.data_ptr())
 #assert torch.allclose(out, my_out), "pa acc is wrong"
 print('pa acc ok')
 # check q*k
