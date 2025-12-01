@@ -32,7 +32,7 @@ class Instruction:
 
             assert isinstance(op, GPRExpr) or \
                    isinstance(op, int) or isinstance(op, float) or \
-                   (isinstance(op, str) and (op in ["scc", "vcc", "exec", "off", "execz"])) or \
+                   (isinstance(op, str) and (op in ["scc", "vcc", "exec", "off", "execz", "m0"])) or \
                    (isinstance(op, str) and op.startswith("0x")) or \
                    isinstance(op, GPRs), \
             f"arg {i} : {type(op)} {op}"
@@ -143,7 +143,7 @@ class GPRExpr:
     #   a[0] -> gprs[4]
     #   a[0:1] -> gprs[4:5]
     def __getitem__(self, key):
-        assert self.op == "getitem"
+        assert self.op == "getitem", f"{self}"
         gprs = self.src0
         base_offset = self.src1
         if isinstance(key, slice):
@@ -405,7 +405,7 @@ class Buffer:
         assert isinstance(offset12 , int) # must be compile time constant
         mod = f"offen"
         if offset12 > 0:
-            mod += f" offset12:{offset12}"
+            mod += f" offset:{offset12}"
         self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
 
     def store_dwordx4(self, vdata, voffset, soffset, offset12=0):
@@ -413,15 +413,22 @@ class Buffer:
         assert isinstance(offset12 , int) # must be compile time constant
         mod = f"offen"
         if offset12 > 0:
-            mod += f" offset12:{offset12}"
+            mod += f" offset:{offset12}"
         self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
+
+    def load_dword_lds(self, voffset, soffset, offset12=0):
+        mod = f"offen"
+        if offset12 > 0:
+            mod += f" offset:{offset12}"
+        mod += " lds"
+        self.J.buffer_load_dword(voffset, self.desc, soffset, mod=mod)
 
     def store_dword(self, vdata, voffset, soffset, offset12=0):
         # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
         assert isinstance(offset12 , int) # must be compile time constant
         mod = f"offen"
         if offset12 > 0:
-            mod += f" offset12:{offset12}"
+            mod += f" offset:{offset12}"
         self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
 
 # JIT emits instructions into BBs
@@ -431,10 +438,12 @@ class JIT:
         self.blocks = []
         # increased freely
         self.free_gpr_id = {'s':0, 'v':0, 'a': 0}
+        self.free_lds_offset = 0
         self.label2bb = {}
         self.current_bb = BasicBlock(self, "_jit_main")
         self.relocatable_gprs = []
         self.fixed_gprs = []
+
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -637,7 +646,10 @@ class JIT:
             caller_frame = stack[1]
             if caller_frame.code_context:
                 src_line = caller_frame.code_context[0].strip()
-                name = src_line.split("=")[0].strip()
+                if "=" in src_line:
+                    var_name, assign = src_line.split("=")
+                    if ".gpr(" in assign:
+                        name = var_name.strip()
 
         if isinstance(desc, GPRExpr):
             return self.auto_gpr(desc, name=name, loc=inspect.currentframe().f_back.f_lineno)
@@ -1095,6 +1107,120 @@ class JIT:
 
                 i += 1
 
+    def run_threads(self, *thread_jits):
+        # generate instructions to special BB
+        oldbb = self.current_bb
+
+        # collect all instructions from each thread
+        class VThread:
+            def __init__(self, bb:BasicBlock, name, signal_table):
+                self.name = name
+                self.bb = bb
+                self.index = 0      # current instruction
+                self.waitting = False
+                self.finished = False
+                self.next()  # initialize self.inst
+                self.signal_table = signal_table
+
+            def progress():
+                return self.index * 4
+
+            def next(self):
+                if self.finished or self.index >= len(self.bb.instructions):
+                    self.finished = True
+                    return None
+
+                while True:
+                    self.inst = self.bb.instructions[self.index]
+                    self.index += 1
+                    if self.inst.opcode.startswith == "signal":
+                        signal_name = self.inst.mod
+                        if signal_name in self.signal_table:
+                            assert self.signal_table[signal_name][0] == 0
+                            self.signal_table[signal_name][0] = 1
+                            wait_thr = self.signal_table[signal_name][1]
+                            wait_thr.waitting = False
+                        else:
+                            self.signal_table[signal_name] = [0, None]
+                        continue # signal thread keep fetching next instruction
+
+                    if self.inst.opcode.startswith == "wait":
+                        # go into wait status
+                        signal_name = self.inst.mod
+                        if signal_name in self.signal_table:
+                            signaled, thr = self.signal_table[signal_name]
+                            assert (thr is self) or (thr is None), "only 1 thread can wait on a signal only once"
+                        else:
+                            self.signal_table[signal_name] = [0, self] # so other thread can wake me up
+                            signaled = 0
+                        self.waitting = not signaled
+                        if self.waitting:
+                            return
+                        else:
+                            # has signaled,just fetch next instruction
+                            continue
+                    break
+
+                self.is_mem_load = self.inst.opcode.startswith("global_load_") or self.inst.opcode.startswith("buffer_load_")
+                self.is_mfma = self.inst.opcode.startswith("v_mfma_")
+                self.is_dsrd = self.inst.opcode.startswith("ds_read")
+                self.is_dswr = self.inst.opcode.startswith("ds_write")
+                self.is_ds = self.is_dsrd or self.is_dswr
+                return self.inst
+
+        vthreads = []
+        for thr in thread_jits:
+            bb = BasicBlock(self, thr.__name__)
+            self.current_bb = bb
+            thr(self)
+            vthreads.append(VThread(bb, thr.__name__))
+        
+        self.current_bb = oldbb
+        # schedule instructions from bbs into self.current_bb
+        ISSUE_INTERVAL = { "vmem": 113,"ds":32, "mfma": 16}
+        last_global_load_cycle = -100000
+        last_ds_cycle = -100000
+        last_mfma_cycle = -100000
+        clock_cycle = 0
+
+        is_all_finished = False
+        while not is_all_finished:
+            # select instruction : also handle signal & wait pseudo instruction
+            min_progress = 1e12
+            selected_thr = None
+            is_all_finished = True
+            for thr in vthreads:
+                if thr.finished: continue
+                is_all_finished = False
+                if thr.waitting: continue
+                # check issue-interval
+                if thr.is_mem_load and (clock_cycle - last_global_load_cycle) < ISSUE_INTERVAL["vmem"]: continue
+                if thr.is_ds and (clock_cycle - last_ds_cycle) < ISSUE_INTERVAL["vmem"]: continue
+                if thr.is_mfma and (clock_cycle - last_mfma_cycle) < ISSUE_INTERVAL["mfma"]: continue
+                # select the candidate with minimal timeslice
+                progress = thr.progress()
+                if min_progress > progress:
+                    min_progress = progress
+                    selected_thr = thr
+
+            if selected_thr is not None:
+                self.current_bb.add_instruction(selected_thr.inst)
+                selected_thr.next()
+                if selected_thr.is_mem_load: last_global_load_cycle = clock_cycle
+                if selected_thr.is_ds: last_ds_cycle = clock_cycle
+                if selected_thr.is_mfma: last_mfma_cycle = clock_cycle
+            else:
+                pass # just wait for some threads ready
+
+            # assume each issue took 4 cycles
+            clock_cycle += 4
+
+    def alloc_lds(self, num_bytes, align=4):
+        # aways alloc, no free
+        offset = ((self.free_lds_offset + align - 1)//align) * align
+        self.free_lds_offset = offset + num_bytes
+        return offset
+
     def build(self, kernel_name, signature, extra_compiler_options, temp_filename):
         self.asm_debug_info = ""
         self._finish_bb(self.current_bb)
@@ -1174,13 +1300,21 @@ class JIT:
             str_used_gprs = "," + ",".join([f'\"{s}\"' for s in used_gprs])
         self.log(f" kernel: {kernel_name}{signature}  used_gprs={used_gprs}")
 
+        decl_lds = ""
+        if self.free_lds_offset > 0:
+            # (as3_uint32_ptr)(lds_buffer) is always 0
+            decl_lds += f"    __shared__ char lds_buffer[{self.free_lds_offset}];\n"
+            decl_lds += f'    asm(" ; lds_buffer %0 "::"s"((as3_uint32_ptr)(lds_buffer)));'
+
         hip_src =r'''
 #include <hip/hip_fp16.h> // for __fp16
 #include <hip/hip_bf16.h> // for bfloat16
 #include "hip/hip_runtime.h"
+using as3_uint32_ptr = __attribute__((address_space(3))) uint32_t *;
 __global__ void ''' + kernel_name + signature +  r''' {
     // force HIP to initialize sgpr2/sgpr3/sgpr4, TODO: add threadIdx.y/z
     asm volatile(" ; blockIdx.x %0, blockIdx.y %1, blockIdx.z %2"::"s"(blockIdx.x),"s"(blockIdx.y),"s"(blockIdx.z));
+''' + decl_lds + r'''
     asm volatile("\n"
 ''' + "\n" + inline_asm + \
 r'''
