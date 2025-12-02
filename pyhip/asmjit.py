@@ -79,13 +79,13 @@ class GPRExpr:
     def __floordiv__(self, other):
         assert isinstance(other, int)
         if other <= 0 or (other & (other - 1)) != 0:
-            assert "the divisor is not power of 2"
+            assert 0, "the divisor is not power of 2"
         shift_right_bits = other.bit_length() - 1
         return GPRExpr(">>", self, shift_right_bits)
     def __mod__(self, other):
         assert isinstance(other, int)
         if other <= 0 or (other & (other - 1)) != 0:
-            assert "the divisor is not power of 2"
+            assert 0, "the divisor is not power of 2"
         return GPRExpr("&", self, (other-1))
     def __lshift__(self, other):
         return GPRExpr("<<", self, other)
@@ -443,7 +443,7 @@ class JIT:
         self.current_bb = BasicBlock(self, "_jit_main")
         self.relocatable_gprs = []
         self.fixed_gprs = []
-
+        self.debug_log_info = []
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -1216,11 +1216,61 @@ class JIT:
             # assume each issue took 4 cycles
             clock_cycle += 4
 
+    def shift_bits(self, imm):
+        if imm <= 0 or (imm & (imm - 1)) != 0:
+            assert 0, f"the imm{imm} is not power of 2"
+        return imm.bit_length() - 1
+
     def alloc_lds(self, num_bytes, align=4):
         # aways alloc, no free
         offset = ((self.free_lds_offset + align - 1)//align) * align
         self.free_lds_offset = offset + num_bytes
         return offset
+
+    def debug_log(self, sgpr_ptr:GPRs, gprs:Union[GPRs, GPRExpr], torch_dtype):
+        caller_frame = inspect.stack()[1]
+        name = "?"
+        if caller_frame.code_context:
+            src_line = caller_frame.code_context[0].strip()
+            if ".debug_log(" in src_line:
+                args = src_line.split(".debug_log(")[-1].split(",")
+                if len(args) >= 2:
+                    name = args[1].strip()
+        # gprs
+        assert sgpr_ptr.rtype == "s" and sgpr_ptr.count == 2
+        if isinstance(gprs, GPRExpr):
+            self.op == "getitem"
+            rtype = gprs.src0.rtype
+            count = gprs.src2 - gprs.src1 + 1
+        elif isinstance(gprs, GPRs):
+            rtype = gprs.rtype
+            count = gprs.count
+
+        if rtype == "s":
+            vtemp = self.gpr(f"vu32x{count}")
+            for i in range(count):
+                self.v_mov_b32(vtemp[i], gprs[i])
+            gprs = vtemp
+        # record log info at compile time
+        self.debug_log_info.append([
+            name,
+            rtype,
+            count, # number of 32-bit regs
+            torch_dtype
+        ])
+        log_info_index = len(self.debug_log_info) - 1
+
+        vtemp = self.gpr("vu32")
+        vtemp[0] = log_info_index
+        self.global_store_dword((self.threadIdx.x[0] & 0), vtemp, sgpr_ptr)
+        self.s_add_u32(sgpr_ptr[0], sgpr_ptr[0], 4)
+        self.s_addc_u32(sgpr_ptr[1], sgpr_ptr[1], 0)
+
+        for i in range(count):
+            self.global_store_dword((self.threadIdx.x[0] & 63)<< 2, gprs[i], sgpr_ptr)
+            self.s_add_u32(sgpr_ptr[0], sgpr_ptr[0], 64*4)
+            self.s_addc_u32(sgpr_ptr[1], sgpr_ptr[1], 0)
+        self.s_waitcnt(mod="vmcnt(0)")
 
     def build(self, kernel_name, signature, extra_compiler_options, temp_filename):
         self.asm_debug_info = ""
@@ -1332,7 +1382,54 @@ r'''
         with open(cpp_src_fpath, 'w', encoding='utf-8') as f:
             f.write(hip_src)
         hip = module(cpp_src_fpath, extra_compiler_options)
-        return getattr(hip, kernel_name)
+        hip_func = getattr(hip, kernel_name)
+        # attach debug_log member function & data to hip_func
+        if len(self.debug_log_info):
+            # logbytes: tensor.numpy().tobytes()
+            def get_logs(self, debug_log_info, verbose = True):
+                global torch
+                import torch
+                from collections import OrderedDict
+
+                tensor = self._debug_log_buff
+                buffer = tensor.cpu().numpy()
+                offset = 0
+                ret = OrderedDict()
+                cnt = 0
+                color_id = 3
+                color0 = f"\033[0;{30+(color_id % 8)}m"
+                color1 = f"\033[0m"
+                if verbose:
+                    print(f"{color0}==== {kernel_name} debug log ===={color1}")
+                while True:
+                    index = struct.unpack_from('<I', buffer, offset)[0]
+                    offset += 4
+                    if index < 0 or index >= len(debug_log_info): break
+                    name, rtype, count, dtype = debug_log_info[index]
+                    dtype_size = torch.tensor([], dtype=dtype).element_size()
+
+                    tensor = torch.frombuffer(buffer, dtype=dtype, count=count*64*(4//dtype_size), offset=offset).reshape(count, 64*(4//dtype_size))
+                    if rtype == "s": tensor = tensor[:,0].tolist()
+                    offset += 64*4*count
+                    tag = f"[{cnt}]:  {name} ({rtype}gpr x {count})"
+                    if verbose:
+                        print(f"{color0}{tag}{color1}")
+                        print(f"{tensor}")
+                    ret[tag] = tensor
+                    cnt += 1
+                return ret
+
+            def log_ptr(self, size=40960):
+                global torch
+                import torch
+                self._debug_log_buff = torch.full([size//4], -1, dtype=torch.int32)
+                return self._debug_log_buff.data_ptr()
+
+            from functools import partial
+            hip_func.get_logs = partial(get_logs, hip_func, self.debug_log_info)
+            hip_func.log_ptr = partial(log_ptr, hip_func)
+
+        return hip_func
 
     '''
     reduce("v_max_f32", vinput)
