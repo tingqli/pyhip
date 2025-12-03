@@ -266,8 +266,16 @@ class GPRs:
     def __rsub__(self, other):
         return GPRExpr("-", other, self.to_expr())
     def __mul__(self, other):
+        if isinstance(other, int) and other >= 0:
+            if (other & (other - 1)) == 0:
+                shift_left_bits = other.bit_length() - 1
+                return GPRExpr("<<", self.to_expr(), shift_left_bits)
         return GPRExpr("*", self.to_expr(), other)
     def __rmul__(self, other):
+        if isinstance(other, int) and other >= 0:
+            if (other & (other - 1)) == 0:
+                shift_left_bits = other.bit_length() - 1
+                return GPRExpr("<<", self.to_expr(), shift_left_bits)
         return GPRExpr("*", self.to_expr(), other)
     def __lshift__(self, other):
         return GPRExpr("<<", self.to_expr(), other)
@@ -407,6 +415,14 @@ class Buffer:
         if offset12 > 0:
             mod += f" offset:{offset12}"
         self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
+
+    def load_dwordx2(self, vdst, voffset, soffset, offset12=0):
+        # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
+        assert isinstance(offset12 , int) # must be compile time constant
+        mod = f"offen"
+        if offset12 > 0:
+            mod += f" offset:{offset12}"
+        self.J.buffer_load_dwordx2(vdst, voffset, self.desc, soffset, mod=mod)
 
     def store_dwordx4(self, vdata, voffset, soffset, offset12=0):
         # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
