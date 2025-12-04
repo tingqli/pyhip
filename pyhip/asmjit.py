@@ -73,8 +73,16 @@ class GPRExpr:
     def __rsub__(self, other):
         return GPRExpr("-", other, self)
     def __mul__(self, other):
+        if isinstance(other, int) and other >= 0:
+            if (other & (other - 1)) == 0:
+                shift_left_bits = other.bit_length() - 1
+                return GPRExpr("<<", self, shift_left_bits)
         return GPRExpr("*", self, other)
     def __rmul__(self, other):
+        if isinstance(other, int) and other >= 0:
+            if (other & (other - 1)) == 0:
+                shift_left_bits = other.bit_length() - 1
+                return GPRExpr("<<", self, shift_left_bits)
         return GPRExpr("*", self, other)
     def __floordiv__(self, other):
         assert isinstance(other, int)
@@ -460,6 +468,7 @@ class JIT:
         self.relocatable_gprs = []
         self.fixed_gprs = []
         self.debug_log_info = []
+        self.mark_idx = 0
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -529,8 +538,9 @@ class JIT:
         current_frame = inspect.currentframe()
         caller_frame = current_frame.f_back.f_back
         lineno = caller_frame.f_lineno
-        label_begin = f"_while_begin_{lineno}"
-        label_end = f"_while_end_{lineno}"
+        label_begin = f"_while_begin_{lineno}_{self.mark_idx}"
+        label_end = f"_while_end_{lineno}_{self.mark_idx}"
+        self.mark_idx += 1
         self.Label(label_begin)
         if cond is not None:
             self.Jump(label_end, cond, reverse=True)
@@ -549,8 +559,9 @@ class JIT:
         current_frame = inspect.currentframe()
         caller_frame = current_frame.f_back.f_back
         lineno = caller_frame.f_lineno
-        label_begin = f"_execmask_begin_{lineno}"
-        label_end = f"_execmask_end_{lineno}"
+        label_begin = f"_execmask_begin_{lineno}_{self.mark_idx}"
+        label_end = f"_execmask_end_{lineno}_{self.mark_idx}"
+        self.mark_idx += 1
         
         dtype = cond.find_dtype()
         dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
@@ -584,8 +595,9 @@ class JIT:
         current_frame = inspect.currentframe()
         caller_frame = current_frame.f_back.f_back
         lineno = caller_frame.f_lineno
-        label_begin = f"_simtwhile_begin_{lineno}"
-        label_end = f"_simtwhile_end_{lineno}"
+        label_begin = f"_simtwhile_begin_{lineno}_{self.mark_idx}"
+        label_end = f"_simtwhile_end_{lineno}_{self.mark_idx}"
+        self.mark_idx += 1
         exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
         # exec_stopped = self.new_gpr("s", 2, dtype="i32", align=2)
 
@@ -1542,3 +1554,15 @@ class jit:
         return J.build(func_name, f"({','.join(signatures)})", self.extra_compiler_options,
                        temp_filename = f".jit-{gen_hip_file_unique_id}-{filename}-{line_no}-{func_name}")
 
+class Addr2D:
+    def __init__(self, J:JIT, base, row_init, col_init, stride):
+        self.vaddr = J.gpr('vu32')
+        # TODO: use shift to simplify
+        # TODO: remove zero add/mul
+        if isinstance(base, int) and base == 0:
+            self.vaddr = row_init * stride + col_init
+        else:
+            self.vaddr = base + row_init * stride + col_init
+
+    def get_addr(self):
+        return self.vaddr
