@@ -55,6 +55,7 @@ import math
 def test_softmax():
     Q = 16
     K = 256
+    K_STOP = 256
     #how many elements(keys) in one lane.
     LANE_SZ = 4
     ROW_LANES = 16
@@ -81,6 +82,9 @@ def test_softmax():
         row_id = J.gpr(lane_id & (ROW_LANES-1))
         col_id = J.gpr(lane_id>>toshift(ROW_LANES))
         
+        kv_end = J.new_gpr('v', 1, dtype="u32")
+        kv_end[0] = K_STOP
+
         buff_in = Buffer(J)
         buff_out = Buffer(J)
         size = J.new_gpr('s', 1, dtype="u32",align=1)
@@ -89,6 +93,7 @@ def test_softmax():
         buff_out.setup(pOut, size)
         voffset =J.new_gpr('v',1, dtype="u32")
         vdata = J.gpr(f'vf32x{COL_REPEAT*LANE_SZ}')
+        #seem can't work with multiply. K*4 should be put into reg? cant' be imm?
         voffset[0] = (row_id[0] << (toshift(K*4))) + ((col_id[0])<< (toshift(4*LANE_SZ)))
         # voffset[0] = (((J.threadIdx.x[0]&(ROW_LANES-1)) << (toshift(COL_LANES*COL_REPEAT))) + (J.threadIdx.x[0]>>toshift(ROW_LANES)))<< (toshift(4*LANE_SZ))
         voffset_1 =J.new_gpr('v',1, dtype="u32")
@@ -100,6 +105,11 @@ def test_softmax():
         temp =J.new_gpr('v',1) 
         vmax =J.new_gpr('v',1)
         vmax[0]=vdata[0]
+        # v_cmp_gt_u32_e32 vcc, v6, v7                     ;	vcc.u64[laneId] = (v6.u32  > v7.u32 )
+        # v_mov_b32_e32 v3, 0xff7fffff                     ;	v3 = 0xff7fffff;
+        # v_cndmask_b32_e32 v2, v3, v2, vcc 
+        # kv_pos = J.gpr(J.threadIdx.x[0]*LANE_SZ)
+
         for i in range(1,COL_REPEAT*LANE_SZ):
             J.v_max_f32_e32(vmax, vdata[i], vmax) 
         laneid_xor = J.new_gpr('v',1)
@@ -118,8 +128,8 @@ def test_softmax():
             J.v_exp_f32_e32(vdata[i], vdata[i])
         # sum(exponent(x-row_max))
         vsum = J.gpr("vf32")
-        vsum[0]=vdata[0]
-        for i in range(1,COL_REPEAT*LANE_SZ):
+        vsum[0]=0
+        for i in range(0,COL_REPEAT*LANE_SZ):
             J.v_add_f32_e32(vsum, vdata[i], vsum)
         
         # find row_max across lane
@@ -140,7 +150,8 @@ def test_softmax():
             voffset_1[0] = voffset_1[0] + (COL_LANES*LANE_SZ*4)
         J.s_waitcnt(mod=f"vmcnt(0)")
 
-    input = torch.randint(-4, 5, (Q,K)).to(dtype=torch.float32) / 5.0
+    input = torch.randint(-4, 5, (Q,K)).to(dtype=torch.float32)
+    kv_end = torch.tensor(K_STOP, dtype=torch.torch.uint32)
     # max = input.amax(dim=1,keepdim=True)
     # exponent=torch.exp(input-max)
     # sum=torch.sum(exponent,dim=1,keepdim=True)
@@ -148,7 +159,10 @@ def test_softmax():
     softmax=torch.nn.Softmax(dim=1)
     ref=softmax(input)
     kernel([div_up(K, KV_PART_SIZE_CU)],[256], input.data_ptr(), output.data_ptr())
-    assert torch.allclose(ref, output, atol=0.1, rtol=0.1)
+    print(ref)
+    print(output)
+    assert torch.allclose(ref, output, atol=0.01, rtol=0.1)
+
 
 if __name__ == "__main__":
     test_softmax()
