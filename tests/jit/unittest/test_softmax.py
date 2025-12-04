@@ -49,14 +49,18 @@ class Buffer:
         if offset12 > 0:
             mod += f" offset12:{offset12}"
         self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
+def div_up(x, y):
+    return (x + y - 1) // y
 import math
 def test_softmax():
     Q = 16
-    K = 64
+    K = 256
     #how many elements(keys) in one lane.
     LANE_SZ = 4
-    ROW_LANES = Q
-    COL_LANES = 64 // ROW_LANES
+    ROW_LANES = 16
+    COL_LANES = 4
+    KV_PART_SIZE_WARP = 64
+    KV_PART_SIZE_CU = 256
     #how many key elements in one tile. one tile means one lane only needs to handle 'LANE_SZ' data.
     KEYS_PER_TILE = COL_LANES * LANE_SZ
     COL_REPEAT = K // KEYS_PER_TILE
@@ -67,6 +71,16 @@ def test_softmax():
         return int(math.log2(a))
     @pyhip.jit()
     def kernel(J, pIn:"float*", pOut:"float*"):
+        warp_id = J.gpr("su32")
+        warp_off = J.new_gpr('s', 1, dtype="u32",align=1)
+        J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
+        lane_id = J.gpr(J.threadIdx.x[0] & 63)
+        warp_off = J.new_gpr('s', 1, dtype="u32",align=1)
+        warp_off[0] = warp_id[0] * KV_PART_SIZE_WARP
+        # need to be merged beg
+        row_id = J.gpr(lane_id & (ROW_LANES-1))
+        col_id = J.gpr(lane_id>>toshift(ROW_LANES))
+        
         buff_in = Buffer(J)
         buff_out = Buffer(J)
         size = J.new_gpr('s', 1, dtype="u32",align=1)
@@ -75,11 +89,12 @@ def test_softmax():
         buff_out.setup(pOut, size)
         voffset =J.new_gpr('v',1, dtype="u32")
         vdata = J.gpr(f'vf32x{COL_REPEAT*LANE_SZ}')
-        voffset[0] = (((J.threadIdx.x[0]&(ROW_LANES-1)) << (toshift(COL_LANES*COL_REPEAT))) + (J.threadIdx.x[0]>>toshift(ROW_LANES)))<< (toshift(4*LANE_SZ))
+        voffset[0] = (row_id[0] << (toshift(K*4))) + ((col_id[0])<< (toshift(4*LANE_SZ)))
+        # voffset[0] = (((J.threadIdx.x[0]&(ROW_LANES-1)) << (toshift(COL_LANES*COL_REPEAT))) + (J.threadIdx.x[0]>>toshift(ROW_LANES)))<< (toshift(4*LANE_SZ))
         voffset_1 =J.new_gpr('v',1, dtype="u32")
         voffset_1[0] = voffset[0]
         for i in range(0, COL_REPEAT):
-            buff_in.load_dwordx4(vdata[i*4:i*4+3], (voffset_1[0]), 0)
+            buff_in.load_dwordx4(vdata[i*4:i*4+3], (voffset_1[0]), warp_off)
             voffset_1[0] = voffset_1[0] + (COL_LANES*LANE_SZ*4)
         J.s_waitcnt(mod=f"vmcnt(0)")
         temp =J.new_gpr('v',1) 
@@ -87,15 +102,12 @@ def test_softmax():
         vmax[0]=vdata[0]
         for i in range(1,COL_REPEAT*LANE_SZ):
             J.v_max_f32_e32(vmax, vdata[i], vmax) 
-        vlaneid = J.new_gpr('v',1)
-        vlane_id = J.threadIdx.x[0] & 63
-        vlaneid_xor = J.new_gpr('v',1)
+        laneid_xor = J.new_gpr('v',1)
         # find row_max across lane
-        # for mask in range(16,33,16):
         for i in range(0, SWAPS_PER_ROW):
             mask = (i+1)*ROW_LANES
-            vlaneid_xor = (vlane_id^mask) << 2
-            J.ds_bpermute_b32(temp, vlaneid_xor, vmax)
+            laneid_xor = (lane_id^mask) << 2
+            J.ds_bpermute_b32(temp, laneid_xor, vmax)
             J.s_waitcnt(mod=f"lgkmcnt(0)")
             J.v_max_f32_e32(vmax, temp, vmax)
         # exponent(x-row_max)
@@ -108,11 +120,13 @@ def test_softmax():
         vsum = J.gpr("vf32")
         vsum[0]=vdata[0]
         for i in range(1,COL_REPEAT*LANE_SZ):
-            J.v_add_f32_e32(vsum, vdata[i], vsum) 
+            J.v_add_f32_e32(vsum, vdata[i], vsum)
+        
+        # find row_max across lane
         for i in range(0, SWAPS_PER_ROW):
             mask = (i+1)*ROW_LANES
-            vlaneid_xor = (vlane_id^mask) << 2
-            J.ds_bpermute_b32(temp, vlaneid_xor, vsum)
+            laneid_xor = (lane_id^mask) << 2
+            J.ds_bpermute_b32(temp, laneid_xor, vsum)
             J.s_waitcnt(mod=f"lgkmcnt(0)")
             J.v_add_f32_e32(vsum, temp, vsum)
         inv_sum_scale = J.gpr("vf32x1")
@@ -122,7 +136,7 @@ def test_softmax():
 
         voffset_1[0] = voffset[0]
         for i in range(0, COL_REPEAT):
-            buff_out.store_dwordx4(vdata[i*4:i*4+3], (voffset_1[0]), 0)
+            buff_out.store_dwordx4(vdata[i*4:i*4+3], (voffset_1[0]), warp_off)
             voffset_1[0] = voffset_1[0] + (COL_LANES*LANE_SZ*4)
         J.s_waitcnt(mod=f"vmcnt(0)")
 
@@ -133,7 +147,7 @@ def test_softmax():
     output = torch.zeros(Q,K,dtype=torch.float32)
     softmax=torch.nn.Softmax(dim=1)
     ref=softmax(input)
-    kernel([1],[64], input.data_ptr(), output.data_ptr())
+    kernel([div_up(K, KV_PART_SIZE_CU)],[256], input.data_ptr(), output.data_ptr())
     assert torch.allclose(ref, output, atol=0.1, rtol=0.1)
 
 if __name__ == "__main__":
