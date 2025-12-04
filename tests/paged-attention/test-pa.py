@@ -8,7 +8,7 @@ B = 1
 HQ = 32
 HK = 4
 S = 128
-KV_LEN = 45694
+KV_LEN = 1024
 #KV_LEN = 512
 DT = torch.bfloat16
 BLOCK_SIZE = 1
@@ -18,7 +18,7 @@ FAKE_K_IDX = 0
 OUTPUT_QK = 0
 BUF_COPY = 1
 BUF_COPY = 32
-KV_PART_SIZE = 256 * 4
+KV_PART_SIZE = 256
 USE_REDUCE_JIT = False
 
 ######################################################################

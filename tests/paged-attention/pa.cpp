@@ -338,6 +338,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
             v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, offset, false);
         }
         __bf16* cur_k_buff_lds = share_buf.get_key_buf(warp_id);
+        //4 times
         for (uint n = 0; n < KV_PART_SIZE_WARP / 16; n++) {
             // swizzle: row ^ col
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + (key_load_col_id ^ (key_load_row_id + 0)) * 8]) = k_reg_caches[4 * n + 0];
@@ -345,6 +346,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + (key_load_col_id ^ (key_load_row_id + 8)) * 8]) = k_reg_caches[4 * n + 2];
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + (key_load_col_id ^ (key_load_row_id + 12))* 8]) = k_reg_caches[4 * n + 3];
 
+            //4
             for (int k = 0; k < S / 32; k++) {
                 auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + (fma_row_id ^ (fma_col_id + 4 * k)) * 8]);
                 amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n]);
@@ -386,6 +388,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         }
         // -----------------------------
         // sum(exp(acc-max))
+         asm volatile("s_nop 6\n");
         for (uint n = 0; n < 4; n++) {
             for (uint i = 0; i < 4; i++) {
                 auto tmp = n * 16 + fma_col_id * 4 + i + cur_kv_len_start_copy < kv_len_end ? acc[n][i] : -FLT_MAX;
@@ -429,6 +432,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
                 vout[k] = fixed_sum * inv_sum_scale * vout[k];
             }
         }
+        asm volatile("s_nop 6\n");
+
         //s_waitcnt_vmcnt<0>();
         __bf16* cur_v_buff_lds = share_buf.get_value_buf(warp_id);
         //__bf16* cur_v_buff_lds = kv_buff_lds + warp_id * 16 * S;
