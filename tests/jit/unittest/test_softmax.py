@@ -57,10 +57,11 @@ class Buffer:
 import math
 
 
+# def test_softmax(kv_len):
 def test_softmax():
+
     Q = 16
     K = 64
-    KV_LEN = 16
     # how many elements(keys) in one lane.
     LANE_SZ = 4
     ROW_LANES = Q
@@ -78,7 +79,7 @@ def test_softmax():
         return int(math.log2(a))
 
     @pyhip.jit()
-    def kernel(J, pIn: "float*", pOut: "float*"):
+    def kernel(J, pIn: "float*", pOut: "float*", kv_len: "uint"):
         lane_id = J.gpr(J.threadIdx.x[0] & 63)
         row_id = J.gpr(lane_id & (ROW_LANES - 1))
         col_id = J.gpr(lane_id >> toshift(ROW_LANES))
@@ -86,13 +87,14 @@ def test_softmax():
         buff_out = Buffer(J)
         size = J.new_gpr("s", 1, dtype="u32", align=1)
         size[0] = Q * K * 4
+        kv_stop = J.new_gpr("v", 1, dtype="u32", align=1)
+        kv_stop[0] = kv_len[0]
         buff_in.setup(pIn, size)
         buff_out.setup(pOut, size)
         voffset = J.new_gpr("v", 1, dtype="u32")
         vdata = J.gpr(f"vf32x{COL_REPEAT*LANE_SZ}")
         voffset[0] = (row_id[0] << (toshift(K * 4))) + (
-            (col_id[0]) << (toshift(4 * LANE_SZ))
-        )
+            (col_id[0]) << (toshift(4 * LANE_SZ)))
         # voffset[0] = (((J.threadIdx.x[0]&(ROW_LANES-1)) << (toshift(COL_LANES*COL_REPEAT))) + (J.threadIdx.x[0]>>toshift(ROW_LANES)))<< (toshift(4*LANE_SZ))
         voffset_1 = J.new_gpr("v", 1, dtype="u32")
         voffset_1[0] = voffset[0]
@@ -103,29 +105,26 @@ def test_softmax():
         temp = J.new_gpr("v", 1)
 
         vmax = J.new_gpr("v", 1)
-        k_end = J.new_gpr("v", 1, dtype="u32")
+        # k_end = J.new_gpr("v", 1, dtype="u32")
         k_pos = J.new_gpr("v", 1, dtype="u32")
-        # v_cmp_lt_u32_e32 vcc, v6, v7                     ;	vcc.u64[laneId] = (v6.u32  < v7.u32 )
-        # s_waitcnt vmcnt(0)
-        # ds_bpermute_b32 v2, v3, v2                       ;	v2 = v2.lane[ (v3)/4 % 64 ];   select source lane with v3
-        # v_mov_b32_e32 v3, 0xff7fffff                     ;	v3 = 0xff7fffff;
-        # s_waitcnt lgkmcnt(0)
-        # v_cndmask_b32_e32 v2, v3, v2, vcc                ;	v2.b32 = vcc.u64[laneId] ? v2.u32 : v3.u32
+
         temp0 = J.gpr("vf32")
         temp1 = J.new_gpr("v", 1, dtype="u32")
         float_min = J.gpr("vf32")
-        k_pos[0] = col_id[0] * LANE_SZ
+        # float_min = -FLOAT_MAX
         J.v_mov_b32_e32(float_min[0], 0xFF7FFFFF)
-        vmax[0] = vdata[0]
-        k_end[0] = KV_LEN
+        k_pos[0] = col_id[0] * LANE_SZ
+        vmax[0] = float_min[0]
+        # k_end[0] = KV_LEN
         for i in range(0, COL_REPEAT):
             temp1[0] = k_pos[0]
             for j in range(0, LANE_SZ):
-                J.v_cmp_lt_u32_e32("vcc", k_pos[0], k_end[0])
+                J.v_cmp_lt_u32_e32("vcc", temp1[0], kv_stop[0])
                 J.v_cndmask_b32_e32(temp0, float_min, vdata[i * LANE_SZ + j], "vcc")
                 J.v_max_f32_e32(vmax, temp0, vmax)
                 temp1[0] = temp1[0] + 1
             k_pos[0] = k_pos[0] + KEYS_PER_TILE
+
         vlaneid = J.new_gpr("v", 1)
         vlane_id = J.threadIdx.x[0] & 63
         vlaneid_xor = J.new_gpr("v", 1)
@@ -143,6 +142,7 @@ def test_softmax():
             # packe 2 multiply? only multiply can pack for f32
             J.v_mul_f32_e32(vdata[i], 0x3FB8AA3B, vdata[i])
             J.v_exp_f32_e32(vdata[i], vdata[i])
+
         # sum(exponent(x-row_max))
         vsum = J.gpr("vf32")
         vsum[0] = 0
@@ -150,7 +150,7 @@ def test_softmax():
         for i in range(0, COL_REPEAT):
             temp1[0] = k_pos[0]
             for j in range(0, LANE_SZ):
-                J.v_cmp_lt_u32_e32("vcc", k_pos[0], k_end[0])
+                J.v_cmp_lt_u32_e32("vcc", temp1[0], kv_stop[0])
                 J.v_cndmask_b32_e32(temp0, 0, vdata[i * LANE_SZ + j], "vcc")
                 J.v_add_f32_e32(vsum, temp0, vsum)
                 temp1[0] = temp1[0] + 1
@@ -167,28 +167,43 @@ def test_softmax():
         for i in range(0, COL_REPEAT * LANE_SZ):
             J.v_mul_f32(vdata[i], vdata[i], inv_sum_scale)
 
+        # vdata[0] = vmax[0]
+        # vdata[1] = vmax[0]
+        # vdata[2] = vmax[0]
+        # vdata[3] = vmax[0]
+
+        # vdata[0] = vsum[0]
+        # vdata[1] = vsum[0]
+        # vdata[2] = vsum[0]
+        # vdata[3] = vsum[0]
         voffset_1[0] = voffset[0]
         for i in range(0, COL_REPEAT):
             buff_out.store_dwordx4(vdata[i * 4 : i * 4 + 3], (voffset_1[0]), 0)
             voffset_1[0] = voffset_1[0] + (COL_LANES * LANE_SZ * 4)
         J.s_waitcnt(mod=f"vmcnt(0)")
 
-    input = torch.randint(-4, 5, (Q, K)).to(dtype=torch.float32) / 5.0
-    input_1 = torch.rand(Q, KV_LEN).to(dtype=torch.float32)
-    input_1 = input[:, 0:KV_LEN]
-
-    # max = input.amax(dim=1,keepdim=True)
-    # exponent=torch.exp(input-max)
-    # sum=torch.sum(exponent,dim=1,keepdim=True)
-    output = torch.zeros(Q, K, dtype=torch.float32)
     softmax = torch.nn.Softmax(dim=1)
-    ref = softmax(input_1)
-    kernel([1], [64], input.data_ptr(), output.data_ptr())
-    output1 = output[:, 0:KV_LEN]
-    assert torch.allclose(ref, output1, atol=0.001, rtol=0.01)
-    print(output1)
-    print(ref)
-    # print(output-ref)
+    input_buf = torch.randint(-4, 5, (Q, K)).to(dtype=torch.float32) / 5.0
+    output_buf = torch.zeros(Q, K, dtype=torch.float32)
+
+    for KV_LEN in range(1, K + 1):
+        print(f"------------------------------------------------")
+        # for KV_LEN in range(1, K+1):
+        input_ref = input_buf[:, 0:KV_LEN]
+        kernel([1], [64], input_buf.data_ptr(), output_buf.data_ptr(), int(KV_LEN))
+        output_ref = softmax(input_ref)
+        output = output_buf[:, 0:KV_LEN]
+        # print(output-output_ref)
+        assert torch.allclose(output_ref, output, atol=0.001, rtol=0.005)
+        print(f"KV_LEN={KV_LEN} PASSED")
+    # max=input_1.amax(dim=1,keepdim=True)
+    # exponent=torch.exp(input_1-max)
+    # sum=torch.sum(exponent,dim=1,keepdim=True)
+    # for r in range(0, 16):
+    #     for c in range(0, KV_LEN):
+    #         assert abs((sum[r,0]-output1[r,c])/output1[r,c]) <0.01, f'sum[{r}][0]={sum[r,0]}, output1[{r},{c}]={output1[r,c]}'
+    # assert max[r, 0] == output1[r,c], f'max[{r}][0]={max[r, 0]}, output1[{r},{c}]={output1[r,c]}'
+    # assert abs((exponent[r,c]-output1[r,c])/output1[r,c]) <0.001, f'suexponentm[{r}][c]={exponent[r,c]}, output1[{r},{c}]={output1[r,c]}'
 
 
 if __name__ == "__main__":
