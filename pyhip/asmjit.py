@@ -238,15 +238,17 @@ class GPRs:
 
     def __getitem__(self, key):
         if key is Ellipsis:
+            # support a[...]
             return GPRExpr("getitem", self, 0, self.count - 1)
         elif isinstance(key, slice):
             s = key
+            start, stop = s.start,s.stop
             if s.start is None or s.stop is None:
-                s.start = 0
-                s.stop = self.count - 1
-                s.step = 1
+                # support a[:]
+                start = 0
+                stop = self.count - 1
             assert s.step == 1 or s.step is None, f"slice {s} with step not eq 1"
-            return GPRExpr("getitem", self, s.start, s.stop)
+            return GPRExpr("getitem", self, start, stop)
         elif isinstance(key, int):
             idx = key
             return GPRExpr("getitem", self, idx, idx)
@@ -958,6 +960,75 @@ class JIT:
 
     def is_iconst(self, i):
         return isinstance(i, int) and (i >= -16) and (i <= 64)
+    
+    def special_expr_64bits(self, bb, dst_expr:GPRExpr,  expr:Union['GPRExpr'], loc=""):
+        # we only support very limited 64bit expression which can be used for addressing
+        # s_add_u32/s_addc_u32
+        #   s[:] = q[:] + k[:]  k can be 32bit number
+        assert isinstance(expr, GPRExpr)
+        assert dst_expr.op == "getitem"
+        dst_gprs = dst_expr.src0
+        dst_idx0 = dst_expr.src1
+        dst_idx1 = dst_expr.src2
+        assert (dst_idx1 - dst_idx0) == 1
+        if dst_gprs.rtype == "s":
+            assert expr.find_dtype() == "u32"
+            assert expr.op == "+"
+            lhs = expr.src0
+            rhs = expr.src1
+            assert lhs.op == "getitem"
+            lhs_gprs = lhs.src0
+            assert (lhs.src2 - lhs.src1) <= 1
+            assert (lhs_gprs.rtype == "s")
+            if rhs.op == "getitem":
+                rlhs_gprs = rhs.src0
+                assert (rhs.src2 - rhs.src1) <= 1
+                add_low = Instruction(bb, f"s_add_u32", loc=loc)
+                add_low(dst_gprs[dst_idx0], lhs_gprs[lhs.src1], rlhs_gprs[rhs.src1])
+                add_high = Instruction(bb, f"s_addc_u32", loc=loc)
+                add_high(dst_gprs[dst_idx1],
+                         0 if lhs.src2 == lhs.src1 else lhs_gprs[lhs.src2],
+                         0 if rhs.src2 == rhs.src1 else rlhs_gprs[rhs.src2])
+                return
+            else:
+                assert isinstance(rhs, GPRExpr)
+                src1_gprs = self.new_gpr("s", 1, dtype="u32", align=1, name="")
+                src1_operand = GPRExpr("getitem", src1_gprs, 0, 0)
+                self.recursive_expr_gen(bb, src1_operand, rhs, loc=loc)
+                add_low = Instruction(bb, f"s_add_u32", loc=loc)
+                add_low(dst_gprs[dst_idx0], lhs_gprs[lhs.src1], src1_operand)
+                add_high = Instruction(bb, f"s_addc_u32", loc=loc)
+                add_high(dst_gprs[dst_idx1],
+                         0 if lhs.src2 == lhs.src1 else lhs_gprs[lhs.src2],
+                         0)
+        else:
+            # v_lshl_add_u64
+            #   a[:] = b[:] + c[:]
+            #   a[:] = b[:] + c[:] << k  # k in [0,1,2,3,4]
+            #   a[:] = b[:] + c[:] * k  # k in [1,2,4,8,16]
+            assert dst_gprs.rtype == "v"
+            assert expr.op == "+"
+            lhs, rhs = expr.src0, expr.src1
+            assert lhs.op == "getitem"
+            lhs_gprs = lhs.src0
+            assert lhs_gprs.rtype == "v"
+            assert (lhs.src2 - lhs.src1) == 1
+            if rhs.op == "getitem":
+                rhs_gprs = rhs
+                shift_left = 0
+            elif rhs.op == "<<" and rhs.src0.op == "getitem":
+                rhs_gprs = rhs.src0
+                assert (rhs.src0.src2 - rhs.src0.src1) == 1
+                assert rhs.src1 in [0,1,2,3,4]
+                shift_left = rhs.src1
+            elif rhs.op == "*" and rhs.src0.op == "getitem":
+                rhs_gprs = rhs.src0
+                assert (rhs.src0.src2 - rhs.src0.src1) == 1
+                assert rhs.src1 in [1,2,4,8,16]
+                shift_left = self.shift_bits(rhs.src1)
+            inst = Instruction(bb,"v_lshl_add_u64")
+            inst(dst_gprs, rhs_gprs, shift_left, lhs_gprs)
+        return
     '''
     with the help of temp vars, complex expression can be recursively generated & appended into bb.
     '''
@@ -966,6 +1037,9 @@ class JIT:
         dst_gprs = dst_expr.src0
         dst_idx0 = dst_expr.src1
         dst_idx1 = dst_expr.src2
+        if dst_idx1 - dst_idx0 + 1 > 1:
+            self.special_expr_64bits(bb, dst_expr, expr, loc)
+            return
         assert dst_idx1 == dst_idx0
         rtype = dst_gprs.rtype
         dtype = dst_gprs.dtype
