@@ -34,7 +34,7 @@ def test_debug_log():
             assert len(v) == 1 and v[0] == s_i_count
             s_i_count += 1
         if "vdst" in k:
-            assert v.numel() == 128 and torch.allclose(v, INPUT.cpu())
+            assert v.numel() == 128 and torch.allclose(v.reshape(INPUT.shape), INPUT.cpu())
             vdst_count += 1
     assert s_i_count == 3
     assert vdst_count == 3

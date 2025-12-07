@@ -237,8 +237,14 @@ class GPRs:
         return self[0:self.count-1].overlap(other)
 
     def __getitem__(self, key):
-        if isinstance(key, slice):
+        if key is Ellipsis:
+            return GPRExpr("getitem", self, 0, self.count - 1)
+        elif isinstance(key, slice):
             s = key
+            if s.start is None or s.stop is None:
+                s.start = 0
+                s.stop = self.count - 1
+                s.step = 1
             assert s.step == 1 or s.step is None, f"slice {s} with step not eq 1"
             return GPRExpr("getitem", self, s.start, s.stop)
         elif isinstance(key, int):
@@ -285,6 +291,17 @@ class GPRs:
                 shift_left_bits = other.bit_length() - 1
                 return GPRExpr("<<", self.to_expr(), shift_left_bits)
         return GPRExpr("*", self.to_expr(), other)
+    def __floordiv__(self, other):
+        assert isinstance(other, int)
+        if other <= 0 or (other & (other - 1)) != 0:
+            assert 0, "the divisor is not power of 2"
+        shift_right_bits = other.bit_length() - 1
+        return GPRExpr(">>", self.to_expr(), shift_right_bits)
+    def __mod__(self, other):
+        assert isinstance(other, int)
+        if other <= 0 or (other & (other - 1)) != 0:
+            assert 0, "the divisor is not power of 2"
+        return GPRExpr("&", self.to_expr(), (other-1))
     def __lshift__(self, other):
         return GPRExpr("<<", self.to_expr(), other)
     def __rlshift__(self, other):
@@ -421,6 +438,7 @@ class Buffer:
         assert isinstance(offset12 , int) # must be compile time constant
         mod = f"offen"
         if offset12 > 0:
+            assert offset12.bit_length() <= 12
             mod += f" offset:{offset12}"
         self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
 
@@ -431,6 +449,14 @@ class Buffer:
         if offset12 > 0:
             mod += f" offset:{offset12}"
         self.J.buffer_load_dwordx2(vdst, voffset, self.desc, soffset, mod=mod)
+
+    def load_dword(self, vdst, voffset, soffset, offset12=0):
+        # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
+        assert isinstance(offset12 , int) # must be compile time constant
+        mod = f"offen"
+        if offset12 > 0:
+            mod += f" offset:{offset12}"
+        self.J.buffer_load_dword(vdst, voffset, self.desc, soffset, mod=mod)
 
     def store_dwordx4(self, vdata, voffset, soffset, offset12=0):
         # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
@@ -552,6 +578,46 @@ class JIT:
             self.Label(label_end)
 
     '''
+    for setting VCC based on condition expression
+    '''
+    def SetMask(self, dst, cond:GPRExpr = None):
+        dst_is_sgprx2 = isinstance(dst, GPRs) and dst.rtype == "s" and dst.count == 2
+        dst_is_vcc = isinstance(dst, str) and dst == "vcc"
+        dst_is_exec = isinstance(dst, str) and dst == "exec"
+        #assert dst_is_vcc or dst_is_sgprx2
+        dtype = cond.find_dtype()
+        dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
+        dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
+        self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=inspect.currentframe().f_back.f_lineno)
+        last_inst = self.current_bb.instructions[-1]
+        if dst_is_exec:
+            # use v_cmpx_
+            assert last_inst.opcode == "v_cndmask_b32_e64" and \
+                    last_inst.operands[0] == dst_expr and \
+                    last_inst.operands[1] == 0 and \
+                    last_inst.operands[2] == 1 and \
+                    last_inst.operands[3] == "vcc"
+            secondlast_inst = self.current_bb.instructions[-2]
+            assert secondlast_inst.opcode.startswith("v_cmp_")
+            secondlast_inst.opcode = secondlast_inst.opcode.replace("v_cmp_","v_cmpx_")
+            self.log("v_cndmask_b32_e64 dst,0,1,vcc is optimized")
+            self.log("v_cmp_ is replaced by v_cmpx_")
+            self.current_bb.instructions.pop()
+        elif dst_is_vcc and \
+            last_inst.opcode == "v_cndmask_b32_e64" and \
+            last_inst.operands[0] == dst_expr and \
+            last_inst.operands[1] == 0 and \
+            last_inst.operands[2] == 1 and \
+            last_inst.operands[3] == "vcc" :
+            self.log("v_cndmask_b32_e64 dst,0,1,vcc is optimized")
+            self.current_bb.instructions.pop()
+        else:
+            # generate mask into dst (vcc or sgprx2)
+            self.v_cmp_ne_u32_e64(dst, 0, dst_gprs)
+        return
+
+
+    '''
     Use this to set exec-mask to handle the tail/vari-SIMD-length problem
     '''
     @contextmanager
@@ -563,20 +629,7 @@ class JIT:
         label_end = f"_execmask_end_{lineno}_{self.mark_idx}"
         self.mark_idx += 1
         
-        dtype = cond.find_dtype()
-        dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
-        dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
-        self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=inspect.currentframe().f_back.f_lineno)
-        last_inst = self.current_bb.instructions[-1]
-        if last_inst.opcode == "v_cndmask_b32_e64" and \
-            last_inst.operands[0] == dst_expr and \
-            last_inst.operands[1] == 0 and \
-            last_inst.operands[2] == 1 and \
-            last_inst.operands[3] == "vcc" :
-            self.log("v_cndmask_b32_e64 dst,0,1,vcc is optimized")
-            self.current_bb.instructions.pop()
-        else:
-            self.v_cmp_ne_u32_e64("vcc", 0, dst_gprs)
+        self.SetMask("vcc", cond)
         exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
         self.s_and_saveexec_b64(exec_backup, "vcc") # scc = (exec!=0)
         self.s_cbranch_execz(mod=label_end) # early skip
@@ -903,6 +956,8 @@ class JIT:
                 inst.debug_info = debug_info
         return
 
+    def is_iconst(self, i):
+        return isinstance(i, int) and (i >= -16) and (i <= 64)
     '''
     with the help of temp vars, complex expression can be recursively generated & appended into bb.
     '''
@@ -920,6 +975,8 @@ class JIT:
             new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
             new_inst(dst_expr, expr)
             return
+        if isinstance(expr, GPRs):
+            expr = expr.to_expr()
         assert isinstance(expr, GPRExpr)
         if expr.op == "getitem":
             # assign
@@ -1009,7 +1066,11 @@ class JIT:
                     new_inst = Instruction(bb, f"s_mul_{dtype}", loc=loc)
             elif rtype == "v":
                 if dtype in ["u32", "u16"]:
-                    new_inst = Instruction(bb, f"v_mul_lo_{dtype}", loc=loc)
+                    if isinstance(src0_operand, int) and (not self.is_iconst(src0_operand)):
+                        assert src0_operand.bit_length() <= 24
+                        new_inst = Instruction(bb, f"v_mul_u32_u24", loc=loc)
+                    else:
+                        new_inst = Instruction(bb, f"v_mul_lo_{dtype}", loc=loc)
                 elif dtype in ["f32", "f16"]:
                     new_inst = Instruction(bb, f"v_mul_{dtype}", loc=loc)
                 elif dtype in ["i32"]:
@@ -1412,50 +1473,49 @@ r'''
         hip = module(cpp_src_fpath, extra_compiler_options)
         hip_func = getattr(hip, kernel_name)
         # attach debug_log member function & data to hip_func
-        if len(self.debug_log_info):
-            # logbytes: tensor.numpy().tobytes()
-            def get_logs(self, debug_log_info, verbose = True):
-                global torch
-                import torch
-                from collections import OrderedDict
+        # logbytes: tensor.numpy().tobytes()
+        def get_logs(self, debug_log_info, verbose = True):
+            global torch
+            import torch
+            from collections import OrderedDict
 
-                tensor = self._debug_log_buff
-                buffer = tensor.cpu().numpy()
-                offset = 0
-                ret = OrderedDict()
-                cnt = 0
-                color_id = 3
-                color0 = f"\033[0;{30+(color_id % 8)}m"
-                color1 = f"\033[0m"
+            tensor = self._debug_log_buff
+            buffer = tensor.cpu().numpy()
+            offset = 0
+            ret = OrderedDict()
+            cnt = 0
+            color_id = 3
+            color0 = f"\033[0;{30+(color_id % 8)}m"
+            color1 = f"\033[0m"
+            if verbose:
+                print(f"{color0}==== {kernel_name} debug log ===={color1}")
+            while True:
+                index = struct.unpack_from('<I', buffer, offset)[0]
+                offset += 4
+                if index < 0 or index >= len(debug_log_info): break
+                name, rtype, count, dtype = debug_log_info[index]
+                dtype_size = torch.tensor([], dtype=dtype).element_size()
+
+                tensor = torch.frombuffer(buffer, dtype=dtype, count=count*64*(4//dtype_size), offset=offset).reshape(count, 8, 8*(4//dtype_size))
+                if rtype == "s": tensor = tensor[:,0,0].tolist()
+                offset += 64*4*count
+                tag = f"[{cnt}]:  {name} ({rtype}gpr x {count})"
                 if verbose:
-                    print(f"{color0}==== {kernel_name} debug log ===={color1}")
-                while True:
-                    index = struct.unpack_from('<I', buffer, offset)[0]
-                    offset += 4
-                    if index < 0 or index >= len(debug_log_info): break
-                    name, rtype, count, dtype = debug_log_info[index]
-                    dtype_size = torch.tensor([], dtype=dtype).element_size()
+                    print(f"{color0}{tag}{color1}")
+                    print(f"{tensor}")
+                ret[tag] = tensor
+                cnt += 1
+            return ret
 
-                    tensor = torch.frombuffer(buffer, dtype=dtype, count=count*64*(4//dtype_size), offset=offset).reshape(count, 64*(4//dtype_size))
-                    if rtype == "s": tensor = tensor[:,0].tolist()
-                    offset += 64*4*count
-                    tag = f"[{cnt}]:  {name} ({rtype}gpr x {count})"
-                    if verbose:
-                        print(f"{color0}{tag}{color1}")
-                        print(f"{tensor}")
-                    ret[tag] = tensor
-                    cnt += 1
-                return ret
+        def log_ptr(self, size=40960):
+            global torch
+            import torch
+            self._debug_log_buff = torch.full([size//4], -1, dtype=torch.int32)
+            return self._debug_log_buff.data_ptr()
 
-            def log_ptr(self, size=40960):
-                global torch
-                import torch
-                self._debug_log_buff = torch.full([size//4], -1, dtype=torch.int32)
-                return self._debug_log_buff.data_ptr()
-
-            from functools import partial
-            hip_func.get_logs = partial(get_logs, hip_func, self.debug_log_info)
-            hip_func.log_ptr = partial(log_ptr, hip_func)
+        from functools import partial
+        hip_func.get_logs = partial(get_logs, hip_func, self.debug_log_info)
+        hip_func.log_ptr = partial(log_ptr, hip_func)
 
         return hip_func
 
