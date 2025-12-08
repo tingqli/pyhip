@@ -497,6 +497,7 @@ class JIT:
         self.fixed_gprs = []
         self.debug_log_info = []
         self.mark_idx = 0
+        self.debug_cond_sgpr = None
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -1390,17 +1391,30 @@ class JIT:
         self.free_lds_offset = offset + num_bytes
         return offset
 
-    def debug_log(self, sgpr_ptr:GPRs, gprs:Union[GPRs, GPRExpr], torch_dtype):
+    def debug_setup(self, log_ptr:GPRs, cond:GPRExpr):
+        self.debug_log_ptr = log_ptr
+        assert isinstance(log_ptr, GPRs) and log_ptr.rtype == "s" and log_ptr.count == 2
+        self.debug_cond_sgpr = self.gpr("su32")
+        self.debug_cond_sgpr[0] = cond
+
+    def debug_log(self, gprs:Union[GPRs, GPRExpr], torch_dtype):
+        """
+        cond : filter the kernel instance to enable log
+        """
+        assert isinstance(self.debug_cond_sgpr, GPRs)
+        log_index = len(self.debug_log_info)
+        #self.Jump(f"debug_log_skip_{log_index}", cond, reverse=True)
+        self.s_cmp_eq_u32(0, self.debug_cond_sgpr)
+        self.s_cbranch_scc1(mod=f"debug_log_skip_{log_index}")
         caller_frame = inspect.stack()[1]
         name = "?"
         if caller_frame.code_context:
             src_line = caller_frame.code_context[0].strip()
             if ".debug_log(" in src_line:
                 args = src_line.split(".debug_log(")[-1].split(",")
-                if len(args) >= 2:
-                    name = args[1].strip()
+                if len(args) >= 1:
+                    name = args[0].strip()
         # gprs
-        assert sgpr_ptr.rtype == "s" and sgpr_ptr.count == 2
         if isinstance(gprs, GPRExpr):
             self.op == "getitem"
             rtype = gprs.src0.rtype
@@ -1425,15 +1439,20 @@ class JIT:
 
         vtemp = self.gpr("vu32")
         vtemp[0] = log_info_index
-        self.global_store_dword((self.threadIdx.x[0] & 0), vtemp, sgpr_ptr)
-        self.s_add_u32(sgpr_ptr[0], sgpr_ptr[0], 4)
-        self.s_addc_u32(sgpr_ptr[1], sgpr_ptr[1], 0)
+        self.global_store_dword((self.threadIdx.x[0] & 0), vtemp, self.debug_log_ptr)
+        self.s_add_u32(self.debug_log_ptr[0], self.debug_log_ptr[0], 4)
+        self.s_addc_u32(self.debug_log_ptr[1], self.debug_log_ptr[1], 0)
 
+        # data from same lane will be stored as inner-most dimension
+        # data between lanes has stride of (4*count)
+        vaddr = self.gpr((self.threadIdx.x[0] & 63) * (count * 4))
         for i in range(count):
-            self.global_store_dword((self.threadIdx.x[0] & 63)<< 2, gprs[i], sgpr_ptr)
-            self.s_add_u32(sgpr_ptr[0], sgpr_ptr[0], 64*4)
-            self.s_addc_u32(sgpr_ptr[1], sgpr_ptr[1], 0)
+            self.global_store_dword(vaddr, gprs[i], self.debug_log_ptr)
+            vaddr[0] = vaddr[0] + 4
+        self.s_add_u32(self.debug_log_ptr[0], self.debug_log_ptr[0], (64 * count * 4))
+        self.s_addc_u32(self.debug_log_ptr[1], self.debug_log_ptr[1], 0)
         self.s_waitcnt(mod="vmcnt(0)")
+        self.Label(f"debug_log_skip_{log_index}")
 
     def build(self, kernel_name, signature, extra_compiler_options, temp_filename):
         self.asm_debug_info = ""
@@ -1570,13 +1589,18 @@ r'''
                 name, rtype, count, dtype = debug_log_info[index]
                 dtype_size = torch.tensor([], dtype=dtype).element_size()
 
-                tensor = torch.frombuffer(buffer, dtype=dtype, count=count*64*(4//dtype_size), offset=offset).reshape(count, 8, 8*(4//dtype_size))
-                if rtype == "s": tensor = tensor[:,0,0].tolist()
+                tensor = torch.frombuffer(buffer, dtype=dtype, count=count*64*(4//dtype_size), offset=offset)
+                if rtype == "s": tensor = tensor[0:1].tolist()
                 offset += 64*4*count
                 tag = f"[{cnt}]:  {name} ({rtype}gpr x {count})"
                 if verbose:
-                    print(f"{color0}{tag}{color1}")
-                    print(f"{tensor}")
+                    if rtype == "s":
+                        print(f"{color0}{tag}{color1} {tensor}")
+                    else:
+                        print(f"{color0}{tag}{color1}")
+                        tensor = tensor.reshape(64, (4*count//dtype_size))
+                        for lane_id in range(64):
+                            print(f" lane {lane_id:2} : {tensor[lane_id, :]}")
                 ret[tag] = tensor
                 cnt += 1
             return ret
