@@ -1397,7 +1397,7 @@ class JIT:
         self.debug_cond_sgpr = self.gpr("su32")
         self.debug_cond_sgpr[0] = cond
 
-    def debug_log(self, gprs:Union[GPRs, GPRExpr], torch_dtype):
+    def debug_log(self, gprs:Union[GPRs, GPRExpr], torch_dtype, gpr_layout=""):
         """
         cond : filter the kernel instance to enable log
         """
@@ -1428,27 +1428,79 @@ class JIT:
             for i in range(count):
                 self.v_mov_b32(vtemp[i], gprs[i])
             gprs = vtemp
-        # record log info at compile time
-        self.debug_log_info.append([
-            name,
-            rtype,
-            count, # number of 32-bit regs
-            torch_dtype
-        ])
-        log_info_index = len(self.debug_log_info) - 1
 
         vtemp = self.gpr("vu32")
-        vtemp[0] = log_info_index
+        vtemp[0] = log_index
         self.global_store_dword((self.threadIdx.x[0] & 0), vtemp, self.debug_log_ptr)
         self.s_add_u32(self.debug_log_ptr[0], self.debug_log_ptr[0], 4)
         self.s_addc_u32(self.debug_log_ptr[1], self.debug_log_ptr[1], 0)
 
         # data from same lane will be stored as inner-most dimension
         # data between lanes has stride of (4*count)
-        vaddr = self.gpr((self.threadIdx.x[0] & 63) * (count * 4))
-        for i in range(count):
-            self.global_store_dword(vaddr, gprs[i], self.debug_log_ptr)
-            vaddr[0] = vaddr[0] + 4
+        if gpr_layout == "":
+            # default layout, just put data in same lane together
+            vaddr = self.gpr((self.threadIdx.x[0] & 63) * (count * 4))
+            for i in range(count):
+                self.global_store_dword(vaddr, gprs[i], self.debug_log_ptr)
+                vaddr[0] = vaddr[0] + 4
+            shape = (64, 4*count//torch_dtype.itemsize)
+        else:
+            # "4h.4h.16v.4h"
+            layout = gpr_layout.split(".")
+            assert len(layout) == 4
+            lane_size = int(layout[-1][:-1])
+            lane_bytes = lane_size * torch_dtype.itemsize
+            lane_dir = layout[-1][-1]
+            assert lane_dir== "h", "only lane along inner-most dim is supported"
+            assert lane_bytes == 16, "only DWORDx4 lane-size supported"
+            lane_dim0, lane_dim1 = int(layout[-3][:-1]), int(layout[-2][:-1])
+            lane_dir0, lane_dir1 = layout[-3][-1], layout[-2][-1]
+            assert (lane_dim0 * lane_dim1) == 64, "64 lanes must be layout as 2D"
+            assert (lane_dir0 == "v" or  lane_dir0 == "h")
+            assert (lane_dir1 == "v" or  lane_dir1 == "h")
+            assert (lane_dir0 != lane_dir1)
+            dw4_count = int(layout[0][:-1])
+            dw4_count_dir = layout[0][-1]
+            assert dw4_count * (lane_bytes//4) == count, "GPR count must match"
+            total_v = 1
+            total_v *= lane_dim0 if lane_dir0 == "v" else 1
+            total_v *= lane_dim1 if lane_dir1 == "v" else 1
+            total_v *= dw4_count if dw4_count_dir == "v" else 1
+            total_v *= lane_size if lane_dir == "v" else 1
+            total_h = 1
+            total_h *= lane_dim0 if lane_dir0 == "h" else 1
+            total_h *= lane_dim1 if lane_dir1 == "h" else 1
+            total_h *= dw4_count if dw4_count_dir == "h" else 1
+            total_h *= lane_size if lane_dir == "h" else 1
+            stride_bytes = total_h * torch_dtype.itemsize
+            shape = (total_v, total_h)
+            lane_id = self.gpr(self.threadIdx.x[0] % 64)
+            if lane_dir1 == "v":
+                vtemp[0] = (lane_id % lane_dim1)*stride_bytes + (lane_id//lane_dim1)*lane_bytes
+                if dw4_count_dir == "v":
+                    dw4_step = lane_dim1*stride_bytes
+                else:
+                    dw4_step = lane_dim0*lane_bytes
+            else:
+                vtemp[0] = (lane_id % lane_dim1)*lane_bytes + (lane_id//lane_dim1)*stride_bytes
+                if dw4_count_dir == "v":
+                    dw4_step = lane_dim0*stride_bytes
+                else:
+                    dw4_step = lane_dim1*lane_bytes
+
+            for dc in range(dw4_count):
+                self.global_store_dwordx4(vtemp, gprs[dc*4+0:dc*4+3], self.debug_log_ptr)
+                vtemp[0] = vtemp[0] + dw4_step
+
+        # record log info at compile time
+        self.debug_log_info.append([
+            name,
+            rtype,
+            count, # number of 32-bit regs
+            torch_dtype,
+            shape,
+            gpr_layout
+        ])
         self.s_add_u32(self.debug_log_ptr[0], self.debug_log_ptr[0], (64 * count * 4))
         self.s_addc_u32(self.debug_log_ptr[1], self.debug_log_ptr[1], 0)
         self.s_waitcnt(mod="vmcnt(0)")
@@ -1586,7 +1638,7 @@ r'''
                 index = struct.unpack_from('<I', buffer, offset)[0]
                 offset += 4
                 if index < 0 or index >= len(debug_log_info): break
-                name, rtype, count, dtype = debug_log_info[index]
+                name, rtype, count, dtype, shape, layout = debug_log_info[index]
                 dtype_size = torch.tensor([], dtype=dtype).element_size()
 
                 tensor = torch.frombuffer(buffer, dtype=dtype, count=count*64*(4//dtype_size), offset=offset)
@@ -1597,10 +1649,13 @@ r'''
                     if rtype == "s":
                         print(f"{color0}{tag}{color1} {tensor}")
                     else:
-                        print(f"{color0}{tag}{color1}")
-                        tensor = tensor.reshape(64, (4*count//dtype_size))
-                        for lane_id in range(64):
-                            print(f" lane {lane_id:2} : {tensor[lane_id, :]}")
+                        print(f"{color0}{tag} {shape=} {dtype=} {layout=} {color1}")
+                        if layout != "":
+                            print(tensor.reshape(*shape))
+                        else:
+                            tensor = tensor.reshape(64, (4*count//dtype_size))
+                            for lane_id in range(64):
+                                print(f" lane {lane_id:2} : {tensor[lane_id, :]}")
                 ret[tag] = tensor
                 cnt += 1
             return ret

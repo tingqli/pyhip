@@ -28,16 +28,15 @@ def test_debug_log():
     torch.cuda.synchronize()
     # will print all log items, and also returns a list of logs
     logs = kernel.get_logs()
-    assert len(logs) == 6, f"{logs=}"
+    assert len(logs) == 2, f"{logs=}"
     s_i_count = 0
     vdst_count = 0
-    for k,v in logs.items():
-        if "s_i" in k:
-            assert len(v) == 1 and v[0] == s_i_count
-            s_i_count += 1
-        if "vdst" in k:
-            assert v.numel() == 128 and torch.allclose(v.reshape(INPUT.shape), INPUT.cpu())
-            vdst_count += 1
+    for v in logs["s_i"]:
+        assert len(v) == 1 and v[0] == s_i_count
+        s_i_count += 1
+    for v in logs["vdst"]:
+        assert v.numel() == 128 and torch.allclose(v.reshape(INPUT.shape), INPUT.cpu())
+        vdst_count += 1
     assert s_i_count == 3
     assert vdst_count == 3
 
