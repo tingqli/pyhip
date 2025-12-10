@@ -25,12 +25,7 @@ def test_sv():
 
         score_buf = J.Buffer(pScore, M * K * 2)
         value_buf = J.Buffer(pValue, K * N * 2)
-        tmp = J.gpr("su32")
-        zero = J.gpr("su32")
-        zero[0] = 0
-        tmp[0] = warp_id * (M * N * 4)
-        J.s_add_u32(pOut[0], pOut[0], tmp)
-        J.s_addc_u32(pOut[1], pOut[1], zero)
+        pOut[:] = pOut[:] + warp_id * (M * N * 4)
         out_buf   = J.Buffer(pOut, M * N * 4)
 
         # init vcache

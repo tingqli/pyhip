@@ -30,8 +30,8 @@ def test_execmask_skip_memload():
         vdst[0] = 0
 
         J.ds_bpermute_b32(vdst, vaddr, J.threadIdx.x[0], mod=f"offset:{0}")
-
-        J.debug_log(log_ptr, vdst, torch.int32)
+        J.debug_setup(log_ptr, J.blockIdx.x[0] == 0)
+        J.debug_log(vdst, torch.int32)
 
     A = torch.arange(0,64*4,4, dtype=torch.int)
     A[1] = 4
@@ -57,7 +57,8 @@ def test_execmask_from_vcc():
         J.ds_bpermute_b32(vdst, vaddr, J.threadIdx.x[0], mod=f"offset:{4*8}")
         J.s_mov_b64("exec", -1)
 
-        J.debug_log(log_ptr, vdst, torch.int32)
+        J.debug_setup(log_ptr, J.blockIdx.x[0] == 0)
+        J.debug_log(vdst, torch.int32)
 
     A = torch.arange(0,64*4,4, dtype=torch.int)
     A[1] = 4

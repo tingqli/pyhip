@@ -53,8 +53,7 @@ def test_sum():
         J.s_min_u32(idx1, idx1, count)
         J.s_sub_u32(wave_count[0], idx1[0], idx0[0])
 
-        J.s_add_u32(pA[0], pA[0], idx0 << 2)
-        J.s_addc_u32(pA[1], pA[1], 0)
+        pA[:] = pA[:] + idx0*4
 
         buff = J.Buffer(pA, wave_count[0] << 2)
 

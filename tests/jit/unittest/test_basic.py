@@ -25,9 +25,7 @@ def test_basic():
         J.s_lshl_b32(s_temp0,s_idx,2)
         #s_temp[0] = s_idx[0] << 2
 
-        J.s_add_u32(s_temp[0], pA[0], s_temp0)
-        J.s_addc_u32(s_temp[1], pA[1], 0)
-
+        s_temp[:] = pA[:] + s_temp0[0]
         J.s_store_dword(cnt, s_temp, 0, mod="glc")
 
         J.s_add_u32(s_temp2[0], pA[0], s_temp0)
