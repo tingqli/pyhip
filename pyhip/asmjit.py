@@ -1203,8 +1203,8 @@ class JIT:
             elif rtype == "v":
                 op = expr.op
                 # if op == "ne" : op = "lg"
-                # only src0 can be const
-                if not isinstance(src1_operand, GPRExpr):
+                # src1 can only be vgpr, but src0 can be anything
+                if (not isinstance(src1_operand, GPRExpr)) or (src1_operand.find_rtype() != "v"):
                     src1_operand, src0_operand = src0_operand, src1_operand
                     cmp_op_reverse = {"gt":"lt", "lt":"gt", "le":"ge", "ge":"le", "eq":"eq", "ne":"ne"}
                     op = cmp_op_reverse[op]
@@ -1385,6 +1385,9 @@ class JIT:
             assert 0, f"the imm{imm} is not power of 2"
         return imm.bit_length() - 1
 
+    def float_bits(self, f):
+        return float_to_ieee754_bits_little(f)
+
     def alloc_lds(self, num_bytes, align=4):
         # aways alloc, no free
         offset = ((self.free_lds_offset + align - 1)//align) * align
@@ -1447,20 +1450,24 @@ class JIT:
         else:
             # "4h.4h.16v.4h"
             layout = gpr_layout.split(".")
-            assert len(layout) == 4
+            assert len(layout) ==3 or len(layout) == 4
             lane_size = int(layout[-1][:-1])
             lane_bytes = lane_size * torch_dtype.itemsize
             lane_dir = layout[-1][-1]
             assert lane_dir== "h", "only lane along inner-most dim is supported"
-            assert lane_bytes == 16, "only DWORDx4 lane-size supported"
+            assert lane_bytes == 16 or lane_bytes == 4, f"{lane_bytes=} but only DWORDx1/x4 lane-size supported"
             lane_dim0, lane_dim1 = int(layout[-3][:-1]), int(layout[-2][:-1])
             lane_dir0, lane_dir1 = layout[-3][-1], layout[-2][-1]
             assert (lane_dim0 * lane_dim1) == 64, "64 lanes must be layout as 2D"
             assert (lane_dir0 == "v" or  lane_dir0 == "h")
             assert (lane_dir1 == "v" or  lane_dir1 == "h")
             assert (lane_dir0 != lane_dir1)
-            dw4_count = int(layout[0][:-1])
-            dw4_count_dir = layout[0][-1]
+            if len(layout) == 4:
+                dw4_count = int(layout[0][:-1])
+                dw4_count_dir = layout[0][-1]
+            else:
+                dw4_count = 1
+                dw4_count_dir = "h"
             assert dw4_count * (lane_bytes//4) == count, "GPR count must match"
             total_v = 1
             total_v *= lane_dim0 if lane_dir0 == "v" else 1
@@ -1489,7 +1496,10 @@ class JIT:
                     dw4_step = lane_dim1*lane_bytes
 
             for dc in range(dw4_count):
-                self.global_store_dwordx4(vtemp, gprs[dc*4+0:dc*4+3], self.debug_log_ptr)
+                if lane_bytes == 4:
+                    self.global_store_dword(vtemp, gprs[dc], self.debug_log_ptr)
+                if lane_bytes == 16:
+                    self.global_store_dwordx4(vtemp, gprs[dc*4+0:dc*4+3], self.debug_log_ptr)
                 vtemp[0] = vtemp[0] + dw4_step
 
         # record log info at compile time
@@ -1557,7 +1567,7 @@ class JIT:
         asm=""
         for bb in self.blocks:
             asm += repr(bb)
-        asm += self.asm_debug_info
+        # asm += self.asm_debug_info
 
         used_gprs = []
         for a in asm.splitlines():
@@ -1579,7 +1589,22 @@ class JIT:
         str_arg_c_del = ",".join([f"{a[0]} {a[1]}" for a in args])
         signature = f"{kernel_name}({str_arg_c_del})"
         '''
-        inline_asm = "\n".join([ f'"{line}\\n"' if len(line) else "" for line in asm.splitlines()])
+        with_debug = "-g" in extra_compiler_options
+        inline_asm_lines = []
+        line_no = 11
+        asm_cnt = 0
+        for line in asm.splitlines():
+            if len(line):
+                if asm_cnt > 0 and with_debug:
+                    asm_cnt = 0
+                    inline_asm_lines.append(f'"    .loc 2 {line_no} {5}\\n"')
+                    line_no += 1
+                inline_asm_lines.append(f'"{line}\\n"')
+                line_no += 1
+                asm_cnt += 1
+            else:
+                inline_asm_lines.append("")
+        inline_asm = "\n".join(inline_asm_lines)
         str_used_gprs = ""
         if len(used_gprs):
             str_used_gprs = "," + ",".join([f'\"{s}\"' for s in used_gprs])
@@ -1627,7 +1652,7 @@ r'''
             tensor = self._debug_log_buff
             buffer = tensor.cpu().numpy()
             offset = 0
-            ret = OrderedDict()
+            ret = {}
             cnt = 0
             color_id = 3
             color0 = f"\033[0;{30+(color_id % 8)}m"
@@ -1651,12 +1676,15 @@ r'''
                     else:
                         print(f"{color0}{tag} {shape=} {dtype=} {layout=} {color1}")
                         if layout != "":
-                            print(tensor.reshape(*shape))
+                            tensor = tensor.reshape(*shape)
+                            print(tensor)
                         else:
                             tensor = tensor.reshape(64, (4*count//dtype_size))
                             for lane_id in range(64):
                                 print(f" lane {lane_id:2} : {tensor[lane_id, :]}")
-                ret[tag] = tensor
+                if name not in ret:
+                    ret[name] = []
+                ret[name].append(tensor)
                 cnt += 1
             return ret
 
