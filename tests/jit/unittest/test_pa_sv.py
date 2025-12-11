@@ -55,19 +55,6 @@ def test_sv():
             lds_base = warp_id * (16 * N * 2) + J.alloc_lds(32 * 1024)
             cur_v_write_lds = J.gpr(key_load_row_id * (N * 2) + key_load_col_id * (8 * 2) + lds_base)
 
-            trans_low = J.gpr("su32")
-            trans_low[0] = 0x01_00_05_04
-            trans_high = J.gpr("su32")
-            trans_high[0] = 0x03_02_07_06
-            def transpose4x4_b16(src, dst):
-                def trans2x2(s0, s1, d0, d1):
-                    J.v_perm_b32(d0, s0, s1, trans_low)
-                    J.v_perm_b32(d1, s0, s1, trans_high)
-                trans2x2(src[0], src[2], dst[0], dst[2])
-                trans2x2(src[1], src[3], dst[4], dst[6])
-                trans2x2(src[4], src[6], dst[1], dst[3])
-                trans2x2(src[5], src[7], dst[5], dst[7])
-
             for i in range(4):
                 # write 4x128 elements to lds for each call
                 J.ds_write_b128(cur_v_write_lds, v_reg_caches[i * 16 + 0: i * 16 + 3], mod='offset:0')
@@ -85,7 +72,7 @@ def test_sv():
                     J.ds_read_b64(v_curs[4:5], cur_v_read_lds, mod=f'offset:{N * 4}')
                     J.ds_read_b64(v_curs[6:7], cur_v_read_lds, mod=f'offset:{N * 6}')
                     J.s_waitcnt(mod='lgkmcnt(0)')
-                    transpose4x4_b16(v_curs, v_curs_tr)
+                    J.transpose_per_lane(4, 4, 2, v_curs, v_curs_tr)
                     if is_first_iter and i == 0:
                         J.v_mfma_f32_16x16x16_bf16(vout[j * 16 + 0: j * 16 + 3], v_curs_tr[0:1], acc_low[2 * i : 2 * i + 1], 0)
                         J.v_mfma_f32_16x16x16_bf16(vout[j * 16 + 4: j * 16 + 7], v_curs_tr[2:3], acc_low[2 * i : 2 * i + 1], 0)

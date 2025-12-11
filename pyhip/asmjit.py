@@ -901,6 +901,18 @@ class JIT:
             event_groups[sid].append([event, gprs])
             gprs.start_id = -1 # set gprs status to "not allocated"
 
+        def gpr_usage():
+            ret = ""
+            for rtype, slots in reg_resource.items():
+                used = 0
+                last_id = 0
+                for i,s in enumerate(slots):
+                    if s:
+                        used += 1
+                        last_id = i
+                ret += f"{rtype}:{used}({last_id}) "
+            return ret
+
         def alloc_gpr(gprs):
             rtype = gprs.rtype
             count = gprs.count
@@ -938,7 +950,7 @@ class JIT:
             for ev,gprs in events:
                 if ev == 0: # first use(as dst)
                     alloc_gpr(gprs)
-                    self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}\n"
+                    self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}      {gpr_usage()}\n"
 
             # in case some gpr's last & first sids are the same
             for gprs in unalloc_gprs:
@@ -1449,6 +1461,7 @@ class JIT:
             shape = (64, 4*count//torch_dtype.itemsize)
         else:
             # "4h.4h.16v.4h"
+            # "4v1.4h.16v4.4h"   each segment has optional stride (rows in v-dir or num of dtypes in h-dir)
             layout = gpr_layout.split(".")
             assert len(layout) ==3 or len(layout) == 4
             lane_size = int(layout[-1][:-1])
@@ -1568,7 +1581,12 @@ class JIT:
         for bb in self.blocks:
             asm += repr(bb)
         # asm += self.asm_debug_info
-
+        if 0:
+            color0 = f"\033[0;{30+(2 % 8)}m"
+            color1 = f"\033[0m"
+            print(color0)
+            print(self.asm_debug_info)
+            print(color1)
         used_gprs = []
         for a in asm.splitlines():
             if a[0] == ";": continue
@@ -1725,11 +1743,98 @@ r'''
         self.s_waitcnt(mod=f"lgkmcnt({0})")
         return v1
 
-'''
-@jit(signature="(type arg, ...)")
-def kernel(J):
-    ...
-'''
+
+    def transpose_per_lane(self, src_row, src_cols, dtype_bytes, src, dst):
+        """
+        jit is better at writting general logic,
+        assume item in src&dst are row-major
+
+        for example when N is 4:
+            [x|x] is a b32 VGPR, x is a b16 (2bytes) with the VGPR
+            both src & dst are 8 VGPRs contains 4x4 b16(16bits) array
+
+                [0|0] [1|1]        [0|2] [4|6]
+                [2|2] [3|3]  ====> [0|2] [4|6]
+                [4|4] [5|5]        [1|3] [5|5]
+                [6|6] [7|7]        [1|3] [7|7]
+            trans2x2:
+         src1   [01|23]  => [01|45]
+         src0   [45|67]     [23|67]
+        """
+        M, N = src_row, src_cols
+        assert dtype_bytes in [1,2,4]
+        items_per_GPR = 4 // dtype_bytes
+        assert (M % items_per_GPR) == 0
+        assert (N % items_per_GPR) == 0
+        assert src.count*items_per_GPR >= M*N, f"{src.count=} {items_per_GPR=} {M=} {N=}"
+        assert dst.count*items_per_GPR >= N*M
+        # these sgprs are generated ever time this function is called
+        # not cached
+        if dtype_bytes == 4:
+            for src_row in range(0,M,items_per_GPR):
+                for src_col in range(0,N,items_per_GPR):
+                    dst_row, dst_col = src_col, src_row
+                    src_idx = src_row * N//items_per_GPR + src_col//items_per_GPR
+                    dst_idx = dst_row * M//items_per_GPR + dst_col//items_per_GPR
+                    dst[dst_idx] = src[src_idx]
+        if dtype_bytes == 2:
+            trans_low = self.gpr("su32")
+            trans_low[0] = 0x01_00_05_04
+            trans_high = self.gpr("su32")
+            trans_high[0] = 0x03_02_07_06
+            def trans2x2(s0, s1, d0, d1):
+                self.v_perm_b32(d0, s0, s1, trans_low)
+                self.v_perm_b32(d1, s0, s1, trans_high)
+
+            for src_row in range(0,M,items_per_GPR):
+                for src_col in range(0,N,items_per_GPR):
+                    dst_row, dst_col = src_col, src_row # transpose
+                    src_idx = src_row * N//items_per_GPR + src_col//items_per_GPR
+                    dst_idx = dst_row * M//items_per_GPR + dst_col//items_per_GPR
+                    #print(idx1, idx1+N//2, idx2, idx2+N//2)
+                    trans2x2(src[src_idx], src[src_idx+N//items_per_GPR],
+                            dst[dst_idx], dst[dst_idx+M//items_per_GPR])
+        if dtype_bytes == 1:
+            trans_low1 = self.gpr("su32")
+            trans_low1[0] = 0x02_06_00_04
+            trans_high1 = self.gpr("su32")
+            trans_high1[0] = 0x03_07_01_05
+
+            trans_low2 = self.gpr("su32")
+            trans_low2[0] = 0x01_00_05_04
+            trans_high2 = self.gpr("su32")
+            trans_high2[0] = 0x03_02_07_06
+            
+            vtemp0 = self.gpr("vu32")
+            vtemp1 = self.gpr("vu32")
+            vtemp2 = self.gpr("vu32")
+            vtemp3 = self.gpr("vu32")
+            def trans4x4(s0, s1, s2, s3, d0, d1, d2, d3):
+                self.v_perm_b32(vtemp0, s0, s1, trans_low1)
+                self.v_perm_b32(vtemp1, s0, s1, trans_high1)
+                self.v_perm_b32(vtemp2, s2, s3, trans_low1)
+                self.v_perm_b32(vtemp3, s2, s3, trans_high1)
+                self.v_perm_b32(d0, vtemp0, vtemp2, trans_low2)
+                self.v_perm_b32(d2, vtemp0, vtemp2, trans_high2)
+                self.v_perm_b32(d1, vtemp1, vtemp3, trans_low2)
+                self.v_perm_b32(d3, vtemp1, vtemp3, trans_high2)
+
+            for src_row in range(0,M,items_per_GPR):
+                for src_col in range(0,N,items_per_GPR):
+                    dst_row, dst_col = src_col, src_row # transpose
+                    src_idx = src_row * N//items_per_GPR + src_col//items_per_GPR
+                    dst_idx = dst_row * M//items_per_GPR + dst_col//items_per_GPR
+                    trans4x4(
+                        src[src_idx],
+                        src[src_idx+N//items_per_GPR],
+                        src[src_idx+N//items_per_GPR*2],
+                        src[src_idx+N//items_per_GPR*3],
+                        dst[dst_idx],
+                        dst[dst_idx+M//items_per_GPR],
+                        dst[dst_idx+M//items_per_GPR*2],
+                        dst[dst_idx+M//items_per_GPR*3]
+                    )
+
 gen_hip_file_unique_id = 0
 
 class Idx3D:
