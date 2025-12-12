@@ -1965,9 +1965,9 @@ class Addr2D:
         # TODO: use shift to simplify
         # TODO: remove zero add/mul
         if isinstance(base, int) and base == 0:
-            self.vaddr = row_init * stride + col_init
+            self.vaddr[0] = row_init * stride + col_init
         else:
-            self.vaddr = base + row_init * stride + col_init
+            self.vaddr[0] = base + row_init * stride + col_init
 
     def get_addr(self):
         return self.vaddr

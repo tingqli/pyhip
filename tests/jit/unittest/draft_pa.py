@@ -1,6 +1,8 @@
 import pyhip
 import torch
 import math
+
+from pyhip.asmjit import Addr2D
 torch.cuda.set_device(6)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
@@ -63,8 +65,124 @@ def get_jit_kernel(HQ, # query heads
                    num_parts,    # how many steps each warp goes
                    debug_loc,    # debug
                    ):
+    GQA = HQ // HK
+    def reduce(J:pyhip.JIT,
+               warp_id,
+               p_out_seg,
+               p_max_out,
+               p_sum_out,
+               lds_base,
+               cur_sum,
+               cur_max,
+               vout,
+               ):
+        lane_id = get_lane_id(J)
+        lane_mod_16 = get_lane_id_mod(J, 16)
+        lane_div_16 = get_lane_id_div(J, 16)
+
+        J.s_barrier()
+        with J.ExecMask(lane_div_16[0] == 0):
+            # ds_write2st64_b32 v34, v109, v94 offset1:1
+            addr = Addr2D(J, lds_base, warp_id, lane_mod_16 * 4, 16 * 4)
+            J.ds_write2_b32(addr.get_addr(), cur_max, cur_sum, mod=f'offset1:{4 * 16}')
+        J.s_barrier()
+
+        maxs = J.gpr(GQA, 'vf32')
+        sums = J.gpr(GQA, 'vf32')
+        gqa4 = div_up(GQA, 4)
+        real_max = J.gpr(gqa4, 'vf32')
+        real_sum = J.gpr(gqa4, 'vf32')
+        for i in range(gqa4):
+            m_token_id = gqa4 * warp_id + i
+            # TODO: precompute offset
+            addr = Addr2D(J, lds_base, 0, m_token_id * 4, 16 * 4)
+            J.ds_read2_b32(maxs[4 * i + 0 : 4 * i + 1], addr.get_addr(), mod=f'offset1:{16}')
+            J.ds_read2_b32(maxs[4 * i + 2 : 4 * i + 3], addr.get_addr(), mod=f'offset0:{2 * 16} offset1:{3 * 16}')
+            J.ds_read2_b32(sums[4 * i + 0 : 4 * i + 1], addr.get_addr(), mod=f'offset0:{4 * 16} offset1:{5 * 16}')
+            J.ds_read2_b32(sums[4 * i + 2 : 4 * i + 3], addr.get_addr(), mod=f'offset0:{6 * 16} offset1:{7 * 16}')
+            J.s_waitcnt(mod='lgkmcnt(0)')
+            J.v_max_f32_e32(real_max[i], maxs[4 * i + 0], maxs[4 * i + 1])
+            J.v_max3_f32(real_max[i], real_max[i], maxs[4 * i + 2], maxs[4 * i + 3])
+            tmp = J.gpr(4, 'vf32')
+            alpha = math.log2(math.exp(1))
+            J.v_exp_f32_e32(tmp[0], (maxs[4 * i + 0] - real_max[i]) * alpha)
+            J.v_exp_f32_e32(tmp[1], (maxs[4 * i + 1] - real_max[i]) * alpha)
+            J.v_exp_f32_e32(tmp[2], (maxs[4 * i + 2] - real_max[i]) * alpha)
+            J.v_exp_f32_e32(tmp[3], (maxs[4 * i + 3] - real_max[i]) * alpha)
+            J.v_pk_mul_f32(tmp[0:1], tmp[0:1], sums[4 * i + 0 : 4 * i + 1])
+            J.v_pk_mul_f32(tmp[2:3], tmp[2:3], sums[4 * i + 2 : 4 * i + 3])
+            J.v_add_f32_e32(tmp[0], tmp[0], tmp[1])
+            J.v_add_f32_e32(tmp[2], tmp[2], tmp[3])
+            J.v_add_f32_e32(real_sum[i], tmp[0], tmp[2])
+
+        vout_low = J.gpr(S // 64 * 4 * 2, 'vf32')
+        for k in range(S // 64):
+            vout_low_4 = vout_low[k * 8 : k * 8 + 7]
+            for i in range(4):
+                # NOTE: the following will be error:
+                # vout_4 = vout[k * 4 : k * 4 + 3]
+                # vout_low_4[2 * i + 1] = (vout_4[2][i] >> 16) | (vout_4[3][i] & 0xffff0000)
+                vout_low_4[2 * i + 0] = (vout[k * 4 + 0, i] >> 16) | (vout[k * 4 + 1, i] & 0xffff0000)
+                vout_low_4[2 * i + 1] = (vout[k * 4 + 2, i] >> 16) | (vout[k * 4 + 3, i] & 0xffff0000)
+
+        J.s_barrier()
+
+        addr = Addr2D(J, lds_base, warp_id, S * 2 * lane_mod_16, 16 * S * 2)
+        lane_div_16_4 = lane_div_16 * 4
+        for k in range(S // 64):
+            J.ds_write_b64(addr.get_addr() + ((lane_div_16_4    ) ^ lane_mod_16) * 8, vout_low[8 * k + 0 : 8 * k + 1], mod=f'offset:{k * 64 * 2}')
+            J.ds_write_b64(addr.get_addr() + ((lane_div_16_4 + 1) ^ lane_mod_16) * 8, vout_low[8 * k + 2 : 8 * k + 3], mod=f'offset:{k * 64 * 2}')
+            J.ds_write_b64(addr.get_addr() + ((lane_div_16_4 + 2) ^ lane_mod_16) * 8, vout_low[8 * k + 4 : 8 * k + 5], mod=f'offset:{k * 64 * 2}')
+            J.ds_write_b64(addr.get_addr() + ((lane_div_16_4 + 3) ^ lane_mod_16) * 8, vout_low[8 * k + 6 : 8 * k + 7], mod=f'offset:{k * 64 * 2}')
+        J.s_barrier()
+
+        offset_out = max_num_parts * (S * 2)
+        offset_max_sum = max_num_parts * 4
+        for i in range(gqa4):
+            m_token_id = gqa4 * warp_id + i
+            with J.ExecMask(m_token_id < GQA):
+                addr = Addr2D(J, lds_base, m_token_id, ((m_token_id ^ (lane_id >> 1)) * 2 + (lane_id & 1)) * 4, S * 2)
+                tmp = J.gpr(4, 'vf32')
+                J.ds_read_b32(tmp[0], addr.get_addr(), mod=f'offset:{16 * S * 2 * 0}')
+                J.ds_read_b32(tmp[1], addr.get_addr(), mod=f'offset:{16 * S * 2 * 1}')
+                J.ds_read_b32(tmp[2], addr.get_addr(), mod=f'offset:{16 * S * 2 * 2}')
+                J.ds_read_b32(tmp[3], addr.get_addr(), mod=f'offset:{16 * S * 2 * 3}')
+                J.s_waitcnt(mod='lgkmcnt(0)')
+                out_v = J.gpr(2, 'vf32')
+                out_v[0] = tmp[0] << 16
+                out_v[1] = tmp[0] & 0xffff0000
+
+                exp_d_max = J.gpr("vf32")
+                J.v_exp_f32_e32(exp_d_max, (maxs[4 * i + 0] - real_max[i]) * alpha)
+                for j in range(2):
+                    out_v[j] = exp_d_max * out_v[j]
+                for k in range(1, 4):
+                    tmp[0] = tmp[k] << 16
+                    tmp[1] = tmp[k] & 0xffff0000
+                    exp_d_max = J.gpr("vf32")
+                    J.v_exp_f32_e32(exp_d_max, (maxs[4 * i + k] - real_max[i]) * alpha)
+                    for j in range(2):
+                        tmp[j] = exp_d_max * tmp[j]
+                        out_v[j] += tmp[j]
+                inv_sum_scale = J.gpr('vf32')
+                J.v_rcp_f32(inv_sum_scale, real_sum[i] + 1e-6)
+                J.v_mul_f32(out_v[0], out_v[0], inv_sum_scale)
+                J.v_mul_f32(out_v[1], out_v[1], inv_sum_scale)
+                bf16x2 = J.gpr((out_v[1] & 0xffff0000) | (out_v[0] >> 16))
+
+                J.global_store_dword(lane_id << 2, bf16x2, p_out_seg)
+                tmp = J.gpr("su32")
+                J.v_readfirstlane_b32(tmp, real_max[i])
+                J.s_store_dword(tmp, p_max_out, 0, mod="glc")
+                J.v_readfirstlane_b32(tmp, real_sum[i])
+                J.s_store_dword(tmp, p_sum_out, 0, mod="glc")
+                p_out_seg[0] += offset_out
+                p_max_out[0] += offset_max_sum
+                p_sum_out[0] += offset_max_sum
+                # J.s_waitcnt(mod=f"vmcnt(0)")
+
     @pyhip.jit("-g")
-    def pa_jit(J,
+    def pa_jit(J:pyhip.JIT,
                 query:"__bf16*",      #[B, HQ, S]
                 key_cache:"__bf16*",    # [BLOCK, BLOCK_SIZE, HK, S]
                 value_cache:"__bf16*",  # 
@@ -99,19 +217,21 @@ def get_jit_kernel(HQ, # query heads
         # key_cache/value_cache : [BLOCK, BLOCK_SIZE, HK, S] => [BLOCK, BLOCK_SIZE, 1(HK), S]
         key_cache[:] = key_cache[:] + hk[0]*(S*2)
         value_cache[:] = value_cache[:] + hk[0]*(S*2)
+        warp_id = J.gpr("su32")
+        J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
         # out_seg : [B, HQ, PART, S]          => [1, (HQ//HK), max_num_parts, S]
         # max_out : [B, HQ, max_num_parts, 1] => [1, (HQ//HK), max_num_parts, 1]
         # sum_out : [B, HQ, max_num_parts, 1] => [1, (HQ//HK), max_num_parts, 1]
-        output_offet = J.gpr(b * max_num_parts * (HQ) + (hq*max_num_parts + kv_part))
+        gqa4 = div_up(GQA, 4)
+        output_offet = J.gpr(b * max_num_parts * (HQ) + ((hq+gqa4*warp_id)*max_num_parts + kv_part))
+        output_offet4 = output_offet*(4)
         out_seg[:] = out_seg[:] + output_offet*(S*2)
-        max_out[:] = max_out[:] + output_offet*(4)
-        sum_out[:] = sum_out[:] + output_offet*(4)
+        max_out[:] = max_out[:] + output_offet4
+        sum_out[:] = sum_out[:] + output_offet4
 
         lane_id = get_lane_id(J)
         lane_mod_16 = get_lane_id_mod(J, 16)
         lane_div_16 = get_lane_id_div(J, 16)
-        warp_id = J.gpr("su32")
-        J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
 
         # 先顺序执行把正确性调对
         # 如何验证正确性？调试阶段可以使用debug_log，优化阶段需要更加自动化的检查正确性机制，就是需要把运算结果写回内存，由host侧代码检查正确性
@@ -475,6 +595,8 @@ def get_jit_kernel(HQ, # query heads
                 #J.debug_log(vout, torch.float, "4v1.4h.16v4.4h")
                 pass
 
+        reduce(J, warp_id, out_seg, max_out, sum_out, 
+               lds_base=lds_key, cur_sum=cur_sum, cur_max=cur_max, vout=vout)
         vout_tr = J.gpr(S//16, 4, 'vf32')
         J.transpose_per_lane(4, 4, 4, vout[0:3], vout_tr[0:3])
         J.transpose_per_lane(4, 4, 4, vout[4:7], vout_tr[4:7])
@@ -515,7 +637,166 @@ def get_jit_kernel(HQ, # query heads
         # following hack prevent kernel-arg loading to reuse same sgprs for different args
         return
 
-    return pa_jit
+    @pyhip.jit()
+    def pa_reduce_jit(J, kv_indptr:"uint*",
+                        out_seg:"__bf16*",
+                        max_out:"float*",
+                        sum_out:"float*",
+                        out:"__bf16*",
+                        max_part:"int",
+                        checks:"float*"):
+        # asm volatile(";xxx  %0  %1  %2"::"s"(blockIdx.x),"s"(blockIdx.y),"s"(blockIdx.z));
+        # 上面的hip代码诱导编译器告诉我们blockIdx存放位置是s2/3/4
+        b = J.blockIdx.x
+        hq = J.blockIdx.y
+        lane_id = J.gpr(J.threadIdx.x[0] % 64)
+        warp_id = J.gpr(J.threadIdx.x[0] // 64)
+        s_warp_id = J.gpr("su32")
+        J.v_readfirstlane_b32(s_warp_id, warp_id)
+
+        # 每个WG处理一个batch的一个head，
+        offset1 = J.gpr(b * HQ * max_part + hq * max_part)
+        offset4 = J.gpr(offset1 * 4)
+
+        # 支持2xsgpr和sgpr的运算？
+        # 支持指令参数表达式？可以节省代码函数和手工分配临时变量寄存器？
+        J.s_add_u32(max_out[0], max_out[0], offset4)
+        J.s_addc_u32(max_out[1], max_out[1], 0)
+
+        kv_inds = J.gpr(2, "si32",align=2)
+        J.s_load_dwordx2(kv_inds, kv_indptr, 0)
+        J.s_waitcnt(mod=f"lgkmcnt(0)") # 这类的wait应该可以自动生成，在第一次使用load指令结果的地方？
+        kv_len = J.gpr(kv_inds[1] - kv_inds[0])
+        part_num = J.gpr((kv_len[0] + (KV_PART_SIZE - 1))//KV_PART_SIZE)
+
+        # 每个wave都独立的把最大值求出来，这一步其实可以WG内的wave协作分工来求
+        # 最后来一次跨wave的reduce
+        real_max = J.gpr("vf32")
+        real_max[0] = torch.finfo(torch.float).min
+        vi = J.auto_gpr(lane_id[0])
+        with J.While() as loop:
+            with J.ExecMask(vi < part_num):
+                vdst = J.gpr("vf32")
+                J.global_load_dword(vdst, vi[0] << 2, max_out)
+                J.s_waitcnt(mod=f"vmcnt(0)")
+                J.v_max_f32(real_max, real_max, vdst)
+            J.s_cbranch_scc0(mod=loop["end"])# 没有非零的exec-mask，退出loop
+            vi[0] = vi + 64
+
+        # per-wave cross-lane reduce
+        real_max = J.reduce("v_max_f32", real_max)
+
+        cur_val = J.gpr(2, "vf32")
+        cur_val[0] = 0
+        cur_val[1] = 0
+        warp_sum = J.gpr("vf32")
+        warp_sum[0] = 0
+
+        # N个wave协作加权part_num这么多个token，但是part_num可能不能被N整除，
+        # 因此循环次数每个wave的都不一样，但是一个wave内部的所有threads/lanes循环次数一样
+        # 因此无需ExecMask
+
+        J.s_add_u32(out_seg[0], out_seg[0], offset1*(S*2))
+        J.s_addc_u32(out_seg[1], out_seg[1], 0)
+        
+        J.s_add_u32(sum_out[0], sum_out[0], offset4)
+        J.s_addc_u32(sum_out[1], sum_out[1], 0)
+
+        J.s_add_u32(out[0], out[0], (b * HQ * S + hq * S)*2)
+        J.s_addc_u32(out[1], out[1], 0)
+
+        J.s_waitcnt(mod=f"lgkmcnt(0)")    
+        si = J.gpr("si32")
+        J.v_readfirstlane_b32(si, warp_id)
+        with J.While(si < part_num) as loop:
+            cur_val_low = J.gpr(2, "vf32") # bf16x2 => f32x2
+            vaddr = J.gpr("vi32")
+
+            soff = J.gpr(si*(2*S))
+            vaddr[0] = lane_id*4 + soff
+
+            cur_max = J.gpr("sf32")
+            cur_sum = J.gpr("sf32")
+            soff = J.gpr(si << 2)
+            J.s_load_dword(cur_max, max_out, soff)
+            J.s_load_dword(cur_sum, sum_out, soff)
+            assert S % 64 == 0
+            assert S == 128
+            J.global_load_dword(cur_val_low[0], vaddr, out_seg)
+            J.s_waitcnt(mod=f"vmcnt(0) lgkmcnt(0)")
+
+            # bf16x2 => f32x2
+            cur_val_low[1] = cur_val_low[0] & 0xffff0000
+            cur_val_low[0] = cur_val_low[0] << 16
+            
+            # SALU do not support float
+            import math
+            alpha = math.log2(math.exp(1))
+
+            exp_d_max = J.gpr("vf32")
+            J.v_exp_f32_e32(exp_d_max, (cur_max[0] - real_max[0])*alpha)
+            exp_d_max[0] = cur_sum[0] * exp_d_max
+
+            cur_val[0] = cur_val[0] + cur_val_low[0] * exp_d_max[0]
+            cur_val[1] = cur_val[1] + cur_val_low[1] * exp_d_max[0]
+
+            warp_sum[0] = warp_sum[0] + exp_d_max[0]
+
+            si[0] = si + 4
+
+        sum_lds = J.alloc_lds(4*4)   # __shared__ float sum_lds[4];
+        out_lds = J.alloc_lds(4*4*S) # __shared__ float out_lds[4 * S];
+
+        vaddr = J.gpr("vi32")
+        vaddr[0] = sum_lds + (s_warp_id<<2)
+        J.ds_write_b32(vaddr, warp_sum)
+        vaddr[0] = (S*4)
+        vaddr[0] = out_lds + (s_warp_id*vaddr[0] + lane_id*(2*4))
+        J.ds_write_b64(vaddr, cur_val)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        J.s_barrier()
+
+        J.Jump("exit_final", s_warp_id[0] != 0)
+
+        other_sum = J.gpr(3, "vf32")
+        vaddr[0] = sum_lds
+        J.ds_read_b32(other_sum[0], vaddr, mod=f"offset:4")
+        J.ds_read_b32(other_sum[1], vaddr, mod=f"offset:8")
+        J.ds_read_b32(other_sum[2], vaddr, mod=f"offset:12")
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        warp_sum[0] = warp_sum[0] + other_sum[0] + other_sum[1] + other_sum[2]
+
+        other_val = J.gpr(2, "vf32")
+        for i in range(1,4):
+            vaddr[0] = out_lds + (i*S*4 + lane_id*(2*4))
+            J.ds_read_b64(other_val, vaddr)
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.v_pk_add_f32(cur_val, cur_val, other_val)
+
+        inv_sum_scale = J.gpr("vf32")
+
+        J.v_rcp_f32(inv_sum_scale, warp_sum[0] + 1e-6)
+        J.v_mul_f32(cur_val[0], cur_val[0], inv_sum_scale)
+        J.v_mul_f32(cur_val[1], cur_val[1], inv_sum_scale)
+
+        bf16x2 = J.gpr((cur_val[1] & 0xffff0000) | (cur_val[0] >> 16))
+
+        J.global_store_dword(lane_id<<2, bf16x2, out)
+        J.s_waitcnt(mod=f"vmcnt(0)")
+
+        if 0:
+            J.Jump("skip", (b[0] == 0) & (hq[0] == 0) & (s_warp_id[0] == 0), reverse=True)
+            checks = J.gpr(2, "su32",align=2)
+            vaddr = J.gpr(lane_id[0]<<2)
+            J.global_store_dword(vaddr, bf16x2, checks)
+            J.s_waitcnt(mod=f"vmcnt(0)")
+            J.Label("skip")
+            J.s_nop(0)
+
+        J.Label("exit_final")
+
+    return pa_jit, pa_reduce_jit
 
 
 
@@ -590,6 +871,15 @@ i = 0
 print(query[0,:8,:])
 print(key_cache[:16,0,0,:])
 accuracy = {}
+
+def get_full_ref():
+    ref_qk = query.reshape(B, HK, HQ // HK, -1) @ key_caches[0][1:KV_LEN*B +1].reshape(B, -1, HK, S).permute(0, 2, 3, 1)
+    ref_qk = ref_qk.to(torch.float32)
+    ref_qk = ref_qk * scale
+    s = torch.softmax(ref_qk, dim=-1).to(value_cache.dtype)
+    ref_out = s @ value_caches[0][1:KV_LEN*B+1].reshape(B, -1, HK, S).permute(0, 2, 1, 3)
+    ref_out = ref_out.reshape(B, HQ, S)
+    return ref_out.to(query.dtype)
 
 # 参考flashattention2的python实现
 def FA2_ref(debug_loc):
@@ -670,7 +960,7 @@ if 1:
         "kv_part": 12,
         "warp_id": 3
     }
-    pa_jit = get_jit_kernel(HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts, debug_loc)
+    pa_jit, pa_reduce_jit = get_jit_kernel(HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts, debug_loc)
     debug_log_ptr = pa_jit.log_ptr()
     pa_jit([B, HK, max_num_parts], [256],
             query.data_ptr(),           # [B, HQ, S]
@@ -683,6 +973,10 @@ if 1:
             my_sum.data_ptr(),
             max_num_parts,
             debug_log_ptr)
+    pa_reduce_jit([B, HQ], [256], 
+                kv_indptrs[0].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
+                0)
+
     logs = pa_jit.get_logs()
     fa2_logs = FA2_ref(debug_loc)
     print(fa2_logs["kv_idxs"])
@@ -779,10 +1073,16 @@ if 1:
             print("============== res =============")
             print(res)
     print(accuracy)
-    #assert 0
+    ref_out = get_full_ref()
+    idx = torch.where(torch.abs(ref_out - my_out) > 0.05)
+    if len(idx[0]):
+        print(f'idx = {idx}\nref_out={ref_out[idx]}\ncur={my_out[idx]}')
+
+    assert torch.allclose(ref_out, my_out, rtol=0.02, atol=0.02), "out is wrong"
+    print('acc ok')
 
 print("======================= test performance ==============================")
-pa_jit = get_jit_kernel(HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts, None)
+pa_jit, pa_reduce_jit = get_jit_kernel(HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts, None)
 debug_log_ptr = pa_jit.log_ptr()
 for round in range(10):
     with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="pa_jit"):
@@ -797,6 +1097,10 @@ for round in range(10):
                my_sum.data_ptr(),
                max_num_parts,
                debug_log_ptr)
+    pa_reduce_jit([B, HQ], [256], 
+                kv_indptrs[i].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
+                0)
+
     i = (i + 1) % BUF_COPY
 print(f"[{B}, {HK}, {div_up(KV_LEN, KV_PART_SIZE)}]")
 print(f"{accuracy=}")

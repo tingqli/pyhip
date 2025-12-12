@@ -388,7 +388,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         }
         // -----------------------------
         // sum(exp(acc-max))
-         asm volatile("s_nop 6\n");
         for (uint n = 0; n < 4; n++) {
             for (uint i = 0; i < 4; i++) {
                 auto tmp = n * 16 + fma_col_id * 4 + i + cur_kv_len_start_copy < kv_len_end ? acc[n][i] : -FLT_MAX;
@@ -432,8 +431,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
                 vout[k] = fixed_sum * inv_sum_scale * vout[k];
             }
         }
-        asm volatile("s_nop 6\n");
-
         //s_waitcnt_vmcnt<0>();
         __bf16* cur_v_buff_lds = share_buf.get_value_buf(warp_id);
         //__bf16* cur_v_buff_lds = kv_buff_lds + warp_id * 16 * S;

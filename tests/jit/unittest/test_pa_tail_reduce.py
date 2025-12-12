@@ -16,7 +16,7 @@ def test_reduce():
     # p_vout: f32[4, 16, 128], p_cur_maxes: f32[4, 16], p_cur_sums: f32[4, 16]
     # p_out_seg: bf16[16, 128], p_max_out: f32[16], p_sum_out: f32[16]
     @pyhip.jit("-ggdb")
-    def kernel(J:pyhip.JIT, p_vout:"void*", p_cur_maxes:"void*", p_cur_sums:"void*",
+    def mytest(J:pyhip.JIT, p_vout:"void*", p_cur_maxes:"void*", p_cur_sums:"void*",
                             p_out_seg:"void*", p_max_out:"void*", p_sum_out:"void*", max_part:"int"):
         warp_id = J.gpr("su32")
         v_warp_id = J.gpr(J.threadIdx.x[0] // 64)
@@ -208,7 +208,7 @@ def test_reduce():
     # [B, HQ, PART]
     p_sum_out = torch.zeros([B, HQ, PART], dtype=torch.float32)
 
-    kernel([num_blocks],[64*waves_per_block], vout.data_ptr(), cur_maxes.data_ptr(), cur_sums.data_ptr(),
+    mytest([num_blocks],[64*waves_per_block], vout.data_ptr(), cur_maxes.data_ptr(), cur_sums.data_ptr(),
             p_out_seg.data_ptr(), p_max_out.data_ptr(), p_sum_out.data_ptr(), PART)
     def get_ref():
         real_max = cur_maxes.max(dim=0, keepdim=True)[0]
