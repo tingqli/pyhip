@@ -64,6 +64,12 @@ class GPRExpr:
         self.src1 = src1
         self.src2 = src2
 
+    def __len__(self):
+        # number of registers
+        if self.op == "getitem":
+            return self.src2 - self.src1 + 1
+        return None
+
     def __add__(self, other):
         return GPRExpr("+", self, other)
     def __radd__(self, other):
@@ -232,28 +238,67 @@ class GPRs:
         self.align = align
         self.dtype = dtype
         self.name = name # for debugging purpose only
+        self.set_shape([count]) # default shape: 1D
+
+    def set_shape(self, shape):
+        self.shape = shape # multi-dimension shape
+        self.strides = [1 for _ in shape]
+        for i in range(len(shape)-2, -1, -1):
+            self.strides[i] = self.strides[i+1] * shape[i+1]
+
+    def __len__(self):
+        return self.count
 
     def overlap(self, other: Union['GPRExpr','GPRs']):
         return self[0:self.count-1].overlap(other)
 
+    '''
+    GPRs following AMDGPU's slicing rules instead of python:
+         [first:last]  instead of  [start:stop)
+    '''
     def __getitem__(self, key):
         if key is Ellipsis:
             # support a[...]
             return GPRExpr("getitem", self, 0, self.count - 1)
-        elif isinstance(key, slice):
-            s = key
-            start, stop = s.start,s.stop
-            if s.start is None or s.stop is None:
-                # support a[:]
-                start = 0
-                stop = self.count - 1
+        # in multi-dimension shape case, key can be a tuple
+        # only the last key in the tuple can be slice
+        if not isinstance(key, tuple):
+            key = (key,)
+
+        base_idx = 0
+        last_dim_id = len(key) - 1
+        for i,k in enumerate(key[:-1]):
+            assert isinstance(k, int)
+            assert k < self.shape[i]
+            base_idx += k * self.strides[i]
+
+        last_k = key[-1]
+
+        if isinstance(last_k, slice):
+            s = last_k
+            first, last = s.start,s.stop
+            if first is None: first = 0
+            if last is None: last = self.shape[last_dim_id] - 1
             assert s.step == 1 or s.step is None, f"slice {s} with step not eq 1"
-            return GPRExpr("getitem", self, start, stop)
-        elif isinstance(key, int):
-            idx = key
-            return GPRExpr("getitem", self, idx, idx)
+
+            assert first >= 0 and first < self.shape[last_dim_id]
+            assert last >= 0 and last < self.shape[last_dim_id]
+
+            first = first * self.strides[last_dim_id]
+            last = last * self.strides[last_dim_id] + self.strides[last_dim_id] - 1
+
+            assert base_idx + first < self.count
+            assert base_idx + last < self.count
+            return GPRExpr("getitem", self, base_idx + first, base_idx + last)
+        elif isinstance(last_k, int):
+            # print(f"{last_k=} {last_dim_id=} {self.shape=} {self.strides=}")
+            first = last_k * self.strides[last_dim_id]
+            last = last_k * self.strides[last_dim_id] + self.strides[last_dim_id] - 1
+            assert base_idx + first < self.count
+            assert base_idx + last < self.count
+            return GPRExpr("getitem", self, base_idx + first, base_idx + last)
         else:
-            assert 0, f"unsupported key {key}"
+            assert 0, f"unsupported key {last_k}"
 
     def __setitem__(self, key, value:Union[GPRExpr,int,float]):
         dst = self[key]
@@ -424,7 +469,7 @@ def float_to_ieee754_bits_little(f):
 class Buffer:
     def __init__(self, J):
         self.J = J
-        self.desc = J.new_gpr('s', 4, align=4)
+        self.desc = J.new_gpr('s', 4, dtype="u32", align=4)
         self.base = self.desc[0:1]
         self.range = self.desc[2]
         self.config = self.desc[3]
@@ -541,15 +586,17 @@ class JIT:
     def Jump(self, label:str, cond:GPRExpr = None, reverse = False):
         if cond is None:
             self.s_branch(mod=label)
-        else:
             # generate expression into scc
+        else:
             dtype = cond.find_dtype()
             dst_gprs = self.new_gpr("s", 1, dtype=dtype, align=1, name="")
             dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
             self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=inspect.currentframe().f_back.f_lineno)
             # optimize 
             last_inst = self.current_bb.instructions[-1]
-            if last_inst.opcode == "s_mov_b32" and last_inst.operands[0] == dst_expr and last_inst.operands[1] == "scc":
+            if last_inst.opcode == "s_mov_b32" and \
+               last_inst.operands[0] is dst_expr and \
+               last_inst.operands[1] == "scc":
                 self.log("s_mov_b32 scc optimized")
                 self.current_bb.instructions.pop()
             else:
@@ -596,7 +643,7 @@ class JIT:
         if dst_is_exec:
             # use v_cmpx_
             assert last_inst.opcode == "v_cndmask_b32_e64" and \
-                    last_inst.operands[0] == dst_expr and \
+                    last_inst.operands[0] is dst_expr and \
                     last_inst.operands[1] == 0 and \
                     last_inst.operands[2] == 1 and \
                     last_inst.operands[3] == "vcc"
@@ -608,7 +655,7 @@ class JIT:
             self.current_bb.instructions.pop()
         elif dst_is_vcc and \
             last_inst.opcode == "v_cndmask_b32_e64" and \
-            last_inst.operands[0] == dst_expr and \
+            last_inst.operands[0] is dst_expr and \
             last_inst.operands[1] == 0 and \
             last_inst.operands[2] == 1 and \
             last_inst.operands[3] == "vcc" :
@@ -665,7 +712,7 @@ class JIT:
             self.recursive_expr_gen(self.current_bb, dst_expr, cond)
             last_inst = self.current_bb.instructions[-1]
             if last_inst.opcode == "v_cndmask_b32_e64" and \
-                last_inst.operands[0] == dst_expr and \
+                last_inst.operands[0] is dst_expr and \
                 last_inst.operands[1] == 0 and \
                 last_inst.operands[1] == 1 and \
                 last_inst.operands[1] == "vcc" :
@@ -713,17 +760,14 @@ class JIT:
         self.recursive_expr_gen(self.current_bb, gprs[0], expr, loc=loc)
         return gprs
 
-
     '''
-    si32[0:1]   reserve s[0:1] as two i32
-    vi32[0]     reserve v[0] as i32
-    af32[0:255] reserve a[0:255] as f32
-
-    si32x2      alloc two scalar i32 
-    su32x4      alloc four scalar i32
-    vf32x4      alloc four vector f32
+    a = J.gpr(4, 4, 4,"abf16x2"): alloc 4*4*4 AccVGPRs, each 32-bit gpr has bf16x2 type
+    a[2,0,0]   : referencing single gpr
+    a[2,0,0:3] : referencing gpr groups (continous, no more than instruction needed)
+    a[2,0]     : same as above
+    a[2]       : referencing
     '''
-    def gpr(self, desc:Union[str,GPRExpr], align=0, name=""):
+    def gpr(self, *desc, align=0, name=""):
         if name == "":
             # try to reover python var's name from code_context
             stack = inspect.stack()
@@ -736,34 +780,42 @@ class JIT:
                         if ".gpr(" in items[1]:
                             name = items[0].strip()
 
-        if isinstance(desc, GPRExpr):
-            return self.auto_gpr(desc, name=name, loc=inspect.currentframe().f_back.f_lineno)
+        if len(desc) == 1 and isinstance(desc[0], GPRExpr):
+            return self.auto_gpr(desc[0], name=name, loc=inspect.currentframe().f_back.f_lineno)
 
-        desc = desc.strip()
-        rtype = desc[0]
-        if "[" in desc[1:]:
-            dtype, range = desc[1:].split("[")
-            assert range[-1] == "]"
-            range = range[:-1]
-            if ":" in range:
-                first, last = range.split(":")
-                count_range = (int(first), int(last))
-            else:
-                count_range = (int(range),int(range))
+        # allocate GPRs
+        dtype = desc[-1]
+        assert isinstance(dtype, str)
+
+        num_gprs = 1
+        shape = []
+        for i in range(len(desc)-1):
+            dim = desc[i]
+            assert isinstance(dim, int)
+            shape.append(dim)
+            num_gprs *= dim
+
+        # allows empty shape info: `J.gpr("su32")`
+        if len(shape) == 0:
+            shape = [1]
+
+        dtype = dtype.strip()
+        if dtype[0] in ["v", "a", "s"]:
+            rtype = dtype[0]
+            dtype = dtype[1:]
         else:
-            dtype_cnt = desc[1:].split("x")
-            dtype = dtype_cnt[0]
-            if len(dtype_cnt) == 2:
-                count_range = int(dtype_cnt[1])
-            else:
-                count_range = 1
-            if align == 0: # derive alignment automatically
-                align = min(count_range, 4)//2*2
+            rtype = "v"
+
+        if align == 0: # derive alignment automatically
+            align = min(num_gprs, 4)//2*2
         align = max(align, 1)
-        return self.new_gpr(rtype, count_range, dtype, align, name)
+        gprs = self.new_gpr(rtype, num_gprs, dtype, align, name)
+        # set additional shape meta data for easier indexing & slicing
+        gprs.set_shape(shape)
+        return gprs
 
 
-    def new_gpr(self, reg_type, count_range, dtype="", align=1, name=""):
+    def new_gpr(self, reg_type, count_range, dtype="u32", align=1, name=""):
         if name == "":
             # try to reover python var's name from code_context
             stack = inspect.stack()
@@ -772,6 +824,8 @@ class JIT:
                 src_line = caller_frame.code_context[0].strip()
                 name = src_line.split("=")[0].strip()
 
+        dtype = dtype.replace("fp32","f32")
+        assert dtype in ["u32","i32","f32","bf16x2","fp16x2","bf8x4","fp8x4"]
         assert reg_type == 's' or reg_type == 'v' or reg_type == 'a'
         if isinstance(count_range, int):
             # allocate do not reuse, just increase the index
@@ -1439,7 +1493,7 @@ class JIT:
             count = gprs.count
 
         if rtype == "s":
-            vtemp = self.gpr(f"vu32x{count}")
+            vtemp = self.gpr(count, "vu32")
             for i in range(count):
                 self.v_mov_b32(vtemp[i], gprs[i])
             gprs = vtemp
@@ -1574,6 +1628,9 @@ class JIT:
         # if we want to do multi-expression optimization (like common expr extraction...)
         # self.compile_expressions()
         self.insert_nop()
+
+        # for bb in self.blocks: print(repr(bb))
+
         self.register_allocation_linear_scan()
 
         # generate asm: basic blocks are in natural order
@@ -1766,8 +1823,8 @@ r'''
         items_per_GPR = 4 // dtype_bytes
         assert (M % items_per_GPR) == 0
         assert (N % items_per_GPR) == 0
-        assert src.count*items_per_GPR >= M*N, f"{src.count=} {items_per_GPR=} {M=} {N=}"
-        assert dst.count*items_per_GPR >= N*M
+        assert len(src)*items_per_GPR >= M*N, f"{len(src)=} {src=} {items_per_GPR=} {M=} {N=}"
+        assert len(dst)*items_per_GPR >= N*M
         # these sgprs are generated ever time this function is called
         # not cached
         if dtype_bytes == 4:
@@ -1861,7 +1918,7 @@ class jit:
         # and generate codes to load these args
         signatures = []
         sgpr_args = []
-        J.kargs = J.new_gpr('s',[0,1],name="kargs")
+        J.kargs = J.new_gpr('s',[0,1],dtype="u32",name="kargs")
         J.threadIdx = Idx3D()
         J.blockIdx = Idx3D()
         J.threadIdx.x = J.new_gpr('v',[0,0], dtype="u32", name="threadIdx.x")

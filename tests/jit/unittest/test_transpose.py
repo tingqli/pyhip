@@ -27,26 +27,26 @@ def test_trans(M, N, dtype):
         buf_in = J.Buffer(pA, 64*M*N*dtype_bytes)
         buf_out = J.Buffer(pB, 64*M*N*dtype_bytes)
 
-        num_items_per_dword = 4//dtype_bytes
-        vinput = J.gpr(f"vu32x{M*N//num_items_per_dword}")
-        voutput = J.gpr(f"vu32x{M*N//num_items_per_dword}")
+        num_dwords_per_row = N*dtype_bytes//4
+        vinput = J.gpr(M, num_dwords_per_row, "vu32")
+        voutput = J.gpr(M, num_dwords_per_row, "vu32")
 
         """
         加载数据令人头疼：每个lane有自己的地址，lane内部dword多次加载也可以做到有来自不同地址的数据
         """
-        num_dwords_per_row = N*dtype_bytes//4
+        
         for m in range(M):
             for n in range(num_dwords_per_row):
                 voffset = J.gpr(lane_id * (M*N*dtype_bytes) + m*N*dtype_bytes + n*4)
-                buf_in.load_dword(vinput[m*num_dwords_per_row + n], voffset, 0, offset12=0)
+                buf_in.load_dword(vinput[m, n], voffset, 0, offset12=0)
 
         J.s_waitcnt(mod="vmcnt(0)")
-        J.transpose_per_lane(M, N, dtype_bytes, vinput, voutput)
+        J.transpose_per_lane(M, N, dtype_bytes, vinput[...], voutput[...])
 
         for m in range(M):
             for n in range(num_dwords_per_row):
                 voffset = J.gpr(lane_id * (M*N*dtype_bytes) + m*N*dtype_bytes + n*4)
-                buf_out.store_dword(voutput[m*num_dwords_per_row + n], voffset, 0, offset12=0)
+                buf_out.store_dword(voutput[m, n], voffset, 0, offset12=0)
         J.s_waitcnt(mod="vmcnt(0)")
     
     inp = torch.randn(64, M, N).to(dtype=dtype)

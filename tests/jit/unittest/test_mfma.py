@@ -66,7 +66,7 @@ class RegTile:
             self.n_cols = (self.cols//num_items) // self.lane_cols
             self.n_rows = self.rows//(64 // self.lane_cols)
 
-        self.gpr = J.gpr(f"vu32x{self.lane_regs * self.n_cols * self.n_rows}")
+        self.gpr = J.gpr(self.lane_regs * self.n_cols * self.n_rows, "vu32")
         self.voffset = get_voffset(J, self.lane_rows, self.lane_cols, self.lane_bytes, stride_bytes)
         self.stride_bytes = stride_bytes
 

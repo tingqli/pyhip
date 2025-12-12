@@ -50,7 +50,7 @@ def test_reduce():
         J.global_load_dword(cur_sum, voff, p_cur_sums)
         # vout
         vout_buf   = J.Buffer(p_vout, HQ * S * 4)
-        vout = J.gpr(f'vf32x{S // 64 * 4 * 4}')
+        vout = J.gpr(S // 64 * 4 * 4, 'vf32')
         for i in range(2):
             voff[0] = lane16_id * (S * 4) + i * 64 * 4 + lane4_id * (4 * 4 * 4)
             v_half = vout[i * 16 : i * 16 + 15]
@@ -81,11 +81,11 @@ def test_reduce():
                 J.ds_write2_b32(addr.get_addr(), cur_max, cur_sum, mod=f'offset1:{4 * 16}')
             J.s_barrier()
 
-            maxs = J.gpr(f'vf32x{GQA}')
-            sums = J.gpr(f'vf32x{GQA}')
+            maxs = J.gpr(GQA, 'vf32')
+            sums = J.gpr(GQA, 'vf32')
             gqa4 = div_up(GQA, 4)
-            real_max = J.gpr(f'vf32x{gqa4}')
-            real_sum = J.gpr(f'vf32x{gqa4}')
+            real_max = J.gpr(gqa4, 'vf32')
+            real_sum = J.gpr(gqa4, 'vf32')
             for i in range(gqa4):
                 m_token_id = gqa4 * v_warp_id + i
                 # TODO: precompute offset
@@ -97,7 +97,7 @@ def test_reduce():
                 J.s_waitcnt(mod='lgkmcnt(0)')
                 J.v_max_f32_e32(real_max[i], maxs[4 * i + 0], maxs[4 * i + 1])
                 J.v_max3_f32(real_max[i], real_max[i], maxs[4 * i + 2], maxs[4 * i + 3])
-                tmp = J.gpr(f'vf32x4')
+                tmp = J.gpr(4, 'vf32')
                 alpha = math.log2(math.exp(1))
                 J.v_exp_f32_e32(tmp[0], (maxs[4 * i + 0] - real_max[i]) * alpha)
                 J.v_exp_f32_e32(tmp[1], (maxs[4 * i + 1] - real_max[i]) * alpha)
@@ -109,7 +109,7 @@ def test_reduce():
                 J.v_add_f32_e32(tmp[2], tmp[2], tmp[3])
                 J.v_add_f32_e32(real_sum[i], tmp[0], tmp[2])
 
-            vout_low = J.gpr(f'vf32x{S // 64 * 4 * 2}')
+            vout_low = J.gpr(S // 64 * 4 * 2, 'vf32')
             for k in range(S // 64):
                 vout_low_4 = vout_low[k * 8 : k * 8 + 7]
                 vout_4 = vout[k * 16 : k * 16 + 15]
@@ -140,8 +140,8 @@ def test_reduce():
             J.s_addc_u32(p_max_out[1], p_max_out[1], 0)
             J.s_add_u32(p_sum_out[0], p_sum_out[0], offset4)
             J.s_addc_u32(p_sum_out[1], p_sum_out[1], 0)
-            max_addr = J.gpr('vu32x2')
-            sum_addr = J.gpr('vu32x2')
+            max_addr = J.gpr(2, 'vu32')
+            sum_addr = J.gpr(2, 'vu32')
             J.v_lshl_add_u64(max_addr, p_max_out, 0, 0)
             J.v_lshl_add_u64(sum_addr, p_sum_out, 0, 0)
 
@@ -151,13 +151,13 @@ def test_reduce():
                 J.v_readfirstlane_b32(s_m_token_id, m_token_id)
                 with J.ExecMask(m_token_id < GQA):
                     addr = Addr2D(J, lds_base, m_token_id, ((m_token_id ^ (lane_id >> 1)) * 2 + (lane_id & 1)) * 4, S * 2)
-                    tmp = J.gpr('vf32x4')
+                    tmp = J.gpr(4, 'vf32')
                     J.ds_read_b32(tmp[0], addr.get_addr(), mod=f'offset:{16 * S * 2 * 0}')
                     J.ds_read_b32(tmp[1], addr.get_addr(), mod=f'offset:{16 * S * 2 * 1}')
                     J.ds_read_b32(tmp[2], addr.get_addr(), mod=f'offset:{16 * S * 2 * 2}')
                     J.ds_read_b32(tmp[3], addr.get_addr(), mod=f'offset:{16 * S * 2 * 3}')
                     J.s_waitcnt(mod='lgkmcnt(0)')
-                    out_v = J.gpr('vf32x2')
+                    out_v = J.gpr(2, 'vf32')
                     out_v[0] = tmp[0] << 16
                     out_v[1] = tmp[0] & 0xffff0000
 

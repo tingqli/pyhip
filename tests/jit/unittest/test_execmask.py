@@ -10,9 +10,9 @@ torch.manual_seed(0)
 def test_execmask_skip_memload():
     @pyhip.jit()
     def kernel(J, p_selectors:"int*", log_ptr:"int*"):
-        vaddr=J.gpr("vu32x1")
-        vdst=J.gpr("vu32x1")
-        mask = J.gpr("su32x2")
+        vaddr=J.gpr("vu32")
+        vdst=J.gpr("vu32")
+        mask = J.gpr(2, "su32")
 
         # J.v_mul_u32_u24(vdst, vdst, 0x100)
         # 构造非法地址
@@ -45,8 +45,8 @@ def test_execmask_skip_memload():
 def test_execmask_from_vcc():
     @pyhip.jit()
     def kernel(J, p_selectors:"int*", log_ptr:"int*"):
-        vaddr=J.gpr("vu32x1")
-        vdst=J.gpr("vu32x1")
+        vaddr=J.gpr("vu32")
+        vdst=J.gpr("vu32")
 
         J.global_load_dword(vaddr, J.threadIdx.x[0]*4, p_selectors)
 
@@ -71,5 +71,5 @@ def test_execmask_from_vcc():
 
 
 if __name__ == "__main__":
-    # test_execmask_skip_memload()
+    test_execmask_skip_memload()
     test_execmask_from_vcc()

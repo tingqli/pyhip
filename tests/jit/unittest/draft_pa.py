@@ -88,7 +88,7 @@ def get_jit_kernel(HQ, # query heads
         sizeof_bf16 = 2
 
         # 这个读取latency非常大，需要提前发起hidding,
-        kv_cum_len = J.gpr("su32x2")
+        kv_cum_len = J.gpr(2, "su32")
         J.s_load_dwordx2(kv_cum_len, kv_indptr, b[0]<<2)
 
         assert (HQ % HK) == 0
@@ -126,7 +126,7 @@ def get_jit_kernel(HQ, # query heads
         def issue_load_query():
             q_buf = J.Buffer(query, (HQ//HK)*S*2)
             assert (HQ//HK) <= 16, f"use mfma16 requires M <= 16"
-            q_cur = J.gpr(f"au32x{4*S//32}") # bfloat16x8
+            q_cur = J.gpr(4*S//32, f"au32") # bfloat16x8
             for i in range(4*S//32):
                 J.v_accvgpr_write_b32(q_cur[i], 0)
 
@@ -170,7 +170,7 @@ def get_jit_kernel(HQ, # query heads
         assert BLOCK_SIZE == 1
         # 加载kv_page_indices的初始延迟比较大，等待之前一次性多读入全部要用到的可以提高效率
         # kv_page_ids_buff会对越界的索引返回0，因此cur_kv_ids中越界的部分被0填充不会产生越界
-        kv_ids = J.gpr(f'vu32x{num_parts}')
+        kv_ids = J.gpr(num_parts, 'vu32')
         for part_idx in range(num_parts):
             offset12 = part_idx*(KV_PART_SIZE//num_parts)*4
             assert offset12.bit_length() <= 12            
@@ -187,12 +187,12 @@ def get_jit_kernel(HQ, # query heads
         寄存器比较大，可以用来做cache, key_reg/value_reg 
         """
         # 外存读入每次DWORDx4对应 4 x S(128) 的数据, 64xS一共需要读取64//4次
-        key_reg = J.gpr(f"au32x{4*(64//4)}")
-        value_reg = J.gpr(f"au32x{4*(64//4)}")
+        key_reg = J.gpr(4*(64//4), "au32")
+        value_reg = J.gpr(4*(64//4), "au32")
 
         # 初始化64位基地址
-        vKbase64bits = J.gpr(f"vu32x2")
-        vVbase64bits = J.gpr(f"vu32x2")
+        vKbase64bits = J.gpr(2, "vu32")
+        vVbase64bits = J.gpr(2, "vu32")
         J.v_mov_b64(vKbase64bits, key_cache)
         J.v_mov_b64(vVbase64bits, value_cache)
         J.v_add_co_u32(vKbase64bits[0], "vcc", lane_mod_16[0]*16, vKbase64bits[0])
@@ -201,26 +201,26 @@ def get_jit_kernel(HQ, # query heads
         J.v_addc_co_u32(vVbase64bits[1], "vcc", 0, vVbase64bits[1], "vcc")
 
         # 64x128 bf16
-        lds_key = J.alloc_lds(64 * S * sizeof_bf16*4)
+        lds_key = J.alloc_lds(64 * S * sizeof_bf16)
 
-        mtime_start = J.gpr("su32x2")
+        mtime_start = J.gpr(2, "su32")
         #J.s_memtime(mtime_start)
 
         # 预取第一part的key/value
         J.s_waitcnt(mod=f"vmcnt(0)")
 
         # 形成 offsets
-        kv_offsets = J.gpr("vu32x16")
+        kv_offsets = J.gpr(16, "vu32")
         cur_bperm = J.gpr(lane_div_16[0]*4)
         #for i in range(16):
         #    J.ds_bpermute_b32(kv_offsets[i], cur_bperm, cur_kv_ids, mod=f"offset:{i*4*4}")
         #J.s_waitcnt(mod=f"lgkmcnt({0})")
 
         # 预取第一轮需要的数据
-        kv_off = J.gpr("vu32x2")
+        kv_off = J.gpr(2, "vu32")
         hks_bits = J.shift_bits(HK*S*2)
-        vKaddr64bits = J.gpr(f"vu32x2")
-        vVaddr64bits = J.gpr(f"vu32x2")
+        vKaddr64bits = J.gpr(2, "vu32")
+        vVaddr64bits = J.gpr(2, "vu32")
         cur_bperm = J.gpr(lane_div_16[0]*4)
 
         for i in range(16):
@@ -244,9 +244,9 @@ def get_jit_kernel(HQ, # query heads
             vm_cnt_preload_value += 1
         J.s_waitcnt(mod=f"lgkmcnt({0})")
 
-        out = J.gpr(f"vf32x{16*S//64}")
-        for i in range(out.count):
-            out[i] = 0
+        vout = J.gpr(16*S//64, "vf32")
+        for i in range(vout.count):
+            vout[i] = 0
         prev_max = J.gpr("vf32")
         cur_sum = J.gpr("vf32")
         prev_max[0] = torch.finfo(torch.float).min
@@ -255,10 +255,10 @@ def get_jit_kernel(HQ, # query heads
             vm_cnt_preload_key = 0 # 统计从这个点开始，又发起了多少个vmem指令
             vaddr_warp_base = J.gpr("vu32")
             vaddr_warp_base[0] = warp_id * (16*S*sizeof_bf16)
-            acc = J.gpr(f"vf32x{4*4}", align=4)
+            acc = J.gpr(4*4, "vf32", align=4)
             for n in range(4):
                 J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_value+16-(n+1)*4})")
-                vKaddr64bits = J.gpr(f"vu32x2")
+                vKaddr64bits = J.gpr(2, "vu32")
                 # 可以发起一次Q*K计算的最小数据单位：16行的key 已经就位，写入LDS
                 # 这个写入比较快并且issue stall的代价小，因此没有跟任何计算交织
                 for i in range(4):
@@ -269,7 +269,7 @@ def get_jit_kernel(HQ, # query heads
                     J.ds_write_b128(vaddr, key_reg[16*n+i0:16*n+i0+3], mod=f"offset:{lds_key}")
                     # J.debug_log(key_reg[16*n+i0:16*n+i0+3], torch.bfloat16, "4v.16h.8h")
 
-                temp_key = [J.gpr("au32x4"),J.gpr("au32x4")]
+                temp_key = [J.gpr(4, "au32"),J.gpr(4, "au32")]
                 acc_out = acc[4*n:4*n+3]
 
                 row = lane_mod_16[0]
@@ -277,7 +277,7 @@ def get_jit_kernel(HQ, # query heads
                 vaddr = J.gpr(row*(S*sizeof_bf16) + (col^(row))*16 + vaddr_warp_base)
 
                 # 因为写入和读取layout不同，必须等待写入完全结束才能发起读取
-                J.s_waitcnt(mod=f"lgkmcnt({0})")
+                #J.s_waitcnt(mod=f"lgkmcnt({0})")
                 # 因为每次ds读取可以产生2次MFMA计算，因此pipeline这两步可以并行
                 J.ds_read_b128(temp_key[0], vaddr, mod=f"offset:{lds_key}")
                 next_round_load_key = 0
@@ -295,7 +295,7 @@ def get_jit_kernel(HQ, # query heads
                     acc_in = 0 if k==0 else acc_out
                     # 7.5. Dependency Resolution: Required Independent Instructions
                     J.v_mfma_f32_16x16x16_bf16(acc_out, temp_key[k&1][0:1], q_cur[4*k+0:4*k+1], acc_in)
-                    J.s_nop(15)
+                    #J.s_nop(15)
                     J.v_mfma_f32_16x16x16_bf16(acc_out, temp_key[k&1][2:3], q_cur[4*k+2:4*k+3], acc_out)
                     # 发起下一轮的vmem预取，有很大概率会引起issue stall
                     # 因此我们跟上面耗时的LDS+MFMA指令交织起来，降低指令密度，降低stall概率
@@ -385,20 +385,23 @@ def get_jit_kernel(HQ, # query heads
             J.v_exp_f32(max_fixup, max_fixup * alpha)
 
             # cur_sum = max_fixup * cur_sum + P.sum(dim=1, keepdim = True)
-            psum = J.gpr("vf32")
+            psum = J.gpr(2, "vf32")
             psum[0] = 0
+            psum[1] = 0
             for n in range(4):
                 acc_out = acc[4*n:4*n+3]
-                for i in range(4):
-                    psum[0] = psum[0] + acc_out[i]
+                J.v_pk_add_f32(psum[0:1], psum[0:1], acc_out[0:1])
+                J.v_pk_add_f32(psum[0:1], psum[0:1], acc_out[2:3])
+                #for i in range(4): psum[0] = psum[0] + acc_out[i]
+            psum[0] = psum[0] + psum[1]
 
             vtemp = J.gpr("vf32")
             for mask in [32, 16]:
-                J.ds_bpermute_b32(vtemp, (lane_id ^ mask)*4, psum)
+                J.ds_bpermute_b32(vtemp, (lane_id ^ mask)*4, psum[0])
                 J.s_waitcnt(mod=f"lgkmcnt(0)")
-                psum[0] = psum + vtemp
+                psum[0] = psum[0] + vtemp
 
-            cur_sum[0] = cur_sum * max_fixup + psum
+            cur_sum[0] = cur_sum * max_fixup + psum[0]
 
             # prev_max = cur_max
             prev_max[0] = cur_max
@@ -408,44 +411,81 @@ def get_jit_kernel(HQ, # query heads
                 J.debug_log(cur_sum, torch.float, "4h.16v.1h")
                 J.debug_log(max_fixup, torch.float, "4h.16v.1h")
 
-
-            # out : max_fixup是per-row的 
+            # out : max_fixup是per-row的, vout列交织并不影响
             # O = max_fixup*O + (P @ V)
-            for i in range(out.count):
-                out[i] = out[i] * max_fixup
+            for i in range(len(vout)):
+                vout[i] = vout[i] * max_fixup
 
-            # 需要用到value了，等待前一轮value就位
-            '''
+            # P 转换为 bf16
+            acc_low = J.gpr(2*4, "vu32", align=4) # 4 x bfloat16x4
+            #acc_low = acc
             for n in range(4):
-                J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_key + 16 - (n+1)*4})")
-                # 16行的 value 已经就位，写入LDS
-                for i in range(4):
-                    i0 = 4*i
-                    row = J.gpr(lane_div_16[0] + i0)
-                    col = lane_mod_16[0]
-                    vaddr = J.gpr(row*(S*sizeof_bf16) + (col^(row))*16 + vaddr_warp_base)
-                    J.ds_write_b128(vaddr, value_reg[16*n+i0:16*n+i0+3], mod=f"offset:{lds_key}")
-            '''
+                acc_out = acc[4*n:4*n+3]
+                acc_low[n*2+0] = (acc_out[0]>>16)|(acc_out[1]&0xFFFF0000)
+                acc_low[n*2+1] = (acc_out[2]>>16)|(acc_out[3]&0xFFFF0000)
+
+            # O += (P@V) 需要用到value了，等待前一轮value就位
+            
+            cur_v_write_lds = J.gpr(lane_div_16 * (S * 2) + lane_mod_16 * (8 * 2) + vaddr_warp_base)
 
             vm_cnt_preload_value = 0
-            if (part_idx + 1) < num_parts:
-                vVaddr64bits = J.gpr(f"vu32x2")
-                for i in range(16):
-                    kv_off[0], kv_off[1] = kv_offsets[i], 0
-                    J.v_lshlrev_b64(kv_off, hks_bits, kv_off) # 从这个移位开始就可能产生超过4GB 32位的值
-                    vVaddr64bits[:] = vVbase64bits[:] + kv_off[:]
-                    # 计算下轮预取需要用到的offset
-                    if (part_idx + 2) < num_parts:
-                        J.ds_bpermute_b32(kv_offsets[i], cur_bperm, kv_ids[part_idx + 2], mod=f"offset:{i*4*4}")
-                    J.global_load_dwordx4(value_reg[4*i+0:4*i+3], vVaddr64bits, "off")
-                    vm_cnt_preload_value += 1
+            for n in range(4):
+                # 等待value到达，发起下一轮preload之前发起计算
+                J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_key + 16 - (n+1)*4})")
+
+                # write 4x128 elements to lds for each call
+                J.ds_write_b128(cur_v_write_lds, value_reg[n * 16 + 0: n * 16 + 3], mod='offset:0')
+                J.ds_write_b128(cur_v_write_lds, value_reg[n * 16 + 4: n * 16 + 7], mod='offset:1024')
+                J.ds_write_b128(cur_v_write_lds, value_reg[n * 16 + 8: n * 16 +11], mod='offset:2048')
+                J.ds_write_b128(cur_v_write_lds, value_reg[n * 16 +12: n * 16 +15], mod='offset:3072')
+
+                v_curs = J.gpr(8, 'vf32')
+                v_curs_tr = J.gpr(8, 'vf32')
+                # read 64 elements from lds for each iter
+                for j in range(S // 64):
+                    cur_v_read_lds = J.gpr(vaddr_warp_base + lane_div_16 * (4 * S * 2) + (j * 64 * 2) + lane_mod_16 * (4 * 2))
+                    J.ds_read_b64(v_curs[0:1], cur_v_read_lds, mod=f'offset:0')
+                    J.ds_read_b64(v_curs[2:3], cur_v_read_lds, mod=f'offset:{S * 2}')
+                    J.ds_read_b64(v_curs[4:5], cur_v_read_lds, mod=f'offset:{S * 4}')
+                    J.ds_read_b64(v_curs[6:7], cur_v_read_lds, mod=f'offset:{S * 6}')
+                    J.s_waitcnt(mod='lgkmcnt(0)')
+                    J.transpose_per_lane(4, 4, 2, v_curs, v_curs_tr)
+
+                    #J.debug_log(v_curs_tr, torch.bfloat16, "4v1.4h.16v4.4h")
+
+                    J.v_mfma_f32_16x16x16_bf16(vout[j * 16 + 0: j * 16 + 3], v_curs_tr[0:1], acc_low[2 * n : 2 * n + 1], vout[j * 16 + 0: j * 16 + 3])
+                    J.v_mfma_f32_16x16x16_bf16(vout[j * 16 + 4: j * 16 + 7], v_curs_tr[2:3], acc_low[2 * n : 2 * n + 1], vout[j * 16 + 4: j * 16 + 7])
+                    J.v_mfma_f32_16x16x16_bf16(vout[j * 16 + 8: j * 16 +11], v_curs_tr[4:5], acc_low[2 * n : 2 * n + 1], vout[j * 16 + 8: j * 16 +11])
+                    J.v_mfma_f32_16x16x16_bf16(vout[j * 16 +12: j * 16 +15], v_curs_tr[6:7], acc_low[2 * n : 2 * n + 1], vout[j * 16 +12: j * 16 +15])
+
+                if (part_idx + 1) < num_parts:
+                    vVaddr64bits = J.gpr(2, "vu32")
+                    for i0 in range(4):
+                        i = n*4 + i0
+                        kv_off[0], kv_off[1] = kv_offsets[i], 0
+                        J.v_lshlrev_b64(kv_off, hks_bits, kv_off) # 从这个移位开始就可能产生超过4GB 32位的值
+                        vVaddr64bits[:] = vVbase64bits[:] + kv_off[:]
+                        # 计算下轮预取需要用到的offset
+                        if (part_idx + 2) < num_parts:
+                            J.ds_bpermute_b32(kv_offsets[i], cur_bperm, kv_ids[part_idx + 2], mod=f"offset:{i*4*4}")
+                        J.global_load_dwordx4(value_reg[4*i+0:4*i+3], vVaddr64bits, "off")
+                        vm_cnt_preload_value += 1
+
+            if debug_loc is not None:
+                # vout: 是列交织的
+                #J.debug_log(vout, torch.float, "4v1.4h.16v4.4h")
+                pass
+
             if (part_idx + 2) < num_parts:
+                vout_tr = J.gpr(S//64 * 4 * 4, 'vf32')
+                J.transpose_per_lane(4, 4, 4, vout[0:15], vout_tr[0:15])
+                J.transpose_per_lane(4, 4, 4, vout[16:31], vout_tr[16:31])
                 J.s_waitcnt(mod=f"lgkmcnt({0})")
 
         #a=J.alloc_lds((8-4)*1024)
         J.s_waitcnt(mod=f"vmcnt({0})")
 
-        mtime_stop = J.gpr("su32x2")
+        mtime_stop = J.gpr(2, "su32")
         J.s_memtime(mtime_stop)
 
         J.s_waitcnt(mod=f"lgkmcnt({0})")

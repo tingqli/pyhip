@@ -92,7 +92,7 @@ def test_softmax():
         buff_in.setup(pIn, size)
         buff_out.setup(pOut, size)
         voffset = J.new_gpr("v", 1, dtype="u32")
-        vdata = J.gpr(f"vf32x{COL_REPEAT*LANE_SZ}")
+        vdata = J.gpr(COL_REPEAT*LANE_SZ, "vf32")
         voffset[0] = (row_id[0] << (toshift(K * 4))) + (
             (col_id[0]) << (toshift(4 * LANE_SZ)))
         # voffset[0] = (((J.threadIdx.x[0]&(ROW_LANES-1)) << (toshift(COL_LANES*COL_REPEAT))) + (J.threadIdx.x[0]>>toshift(ROW_LANES)))<< (toshift(4*LANE_SZ))
@@ -162,7 +162,7 @@ def test_softmax():
             J.ds_bpermute_b32(temp, vlaneid_xor, vsum)
             J.s_waitcnt(mod=f"lgkmcnt(0)")
             J.v_add_f32_e32(vsum, temp, vsum)
-        inv_sum_scale = J.gpr("vf32x1")
+        inv_sum_scale = J.gpr(1, "vf32")
         J.v_rcp_f32(inv_sum_scale[0], vsum[0] + 1e-6)
         for i in range(0, COL_REPEAT * LANE_SZ):
             J.v_mul_f32(vdata[i], vdata[i], inv_sum_scale)

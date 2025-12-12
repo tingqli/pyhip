@@ -59,13 +59,13 @@ def test_sum():
 
         voffset = J.gpr(lane_id << 4) # 16bytes per-lane
         
-        vtemp = J.gpr(f"vf32x4")
+        vtemp = J.gpr(4, f"vf32")
         vtemp[0] = 0
         vtemp[1] = 0
         vtemp[2] = 0
         vtemp[3] = 0
 
-        vsum = J.gpr(f"vf32x4")
+        vsum = J.gpr(4, f"vf32")
         vsum[0] = 0
         vsum[1] = 0
         vsum[2] = 0
@@ -78,7 +78,7 @@ def test_sum():
         fifo = []
         for f in range(FIFO_CNT):
             fifo.append({
-                "vgprs": J.gpr(f'vf32x{4*dwordx4_per_step}'),
+                "vgprs": J.gpr(4*dwordx4_per_step, 'vf32'),
                 # how vmem load instruction is on the fly
                 # when this vgprs are being loaded
                 "vmcnt": 0,
