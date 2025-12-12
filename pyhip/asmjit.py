@@ -1127,7 +1127,7 @@ class JIT:
             new_inst(dst_expr, expr)
             return
 
-        if dtype == "":
+        if dtype == "" or (dtype not in ["u32", "s32"]):
             if expr.op not in ["&","|","^"]:
                 dtype = expr.find_dtype()
                 self.log(f"infer dtype={dtype} by expr {expr}")
@@ -1506,7 +1506,9 @@ class JIT:
 
         # data from same lane will be stored as inner-most dimension
         # data between lanes has stride of (4*count)
-        if gpr_layout == "":
+        if callable(gpr_layout):
+            shape = gpr_layout(self.debug_log_ptr, gprs)
+        elif gpr_layout == "":
             # default layout, just put data in same lane together
             vaddr = self.gpr((self.threadIdx.x[0] & 63) * (count * 4))
             for i in range(count):
