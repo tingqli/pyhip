@@ -1,3 +1,4 @@
+from functools import cache
 from typing import List, Optional, Set, Union
 from .hiptools import module
 import inspect
@@ -527,6 +528,27 @@ class Buffer:
         if offset12 > 0:
             mod += f" offset:{offset12}"
         self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
+
+@cache
+def get_perm_pattern_16(J):
+    trans_low = J.gpr("su32")
+    trans_low[0] = 0x01_00_05_04
+    trans_high = J.gpr("su32")
+    trans_high[0] = 0x03_02_07_06
+    return trans_low, trans_high
+
+@cache
+def get_perm_pattern_8(J):
+    trans_low1 = J.gpr("su32")
+    trans_low1[0] = 0x02_06_00_04
+    trans_high1 = J.gpr("su32")
+    trans_high1[0] = 0x03_07_01_05
+
+    trans_low2 = J.gpr("su32")
+    trans_low2[0] = 0x01_00_05_04
+    trans_high2 = J.gpr("su32")
+    trans_high2[0] = 0x03_02_07_06
+    return trans_low1, trans_high1, trans_low2, trans_high2
 
 # JIT emits instructions into BBs
 all_kernel_hip_src_names = {}
@@ -1585,7 +1607,7 @@ class JIT:
         self.s_waitcnt(mod="vmcnt(0)")
         self.Label(f"debug_log_skip_{log_index}")
 
-    def build(self, kernel_name, signature, extra_compiler_options, temp_filename):
+    def build(self, kernel_name, signature, extra_compiler_options, temp_filename, dump_stat):
         self.asm_debug_info = ""
         self._finish_bb(self.current_bb)
 
@@ -1639,6 +1661,29 @@ class JIT:
         asm=""
         for bb in self.blocks:
             asm += repr(bb)
+
+        if dump_stat:
+            latencies = {
+                'ds_read_b128': 8,
+                'ds_write_b128': 20,
+                'ds_write_b64': 12,
+                'v_exp_f32': 16
+            }
+            for bb in self.blocks:
+                ins_stat = {}
+                print(f'\nblock "{bb.label_name}" has {len(bb.instructions)} instructions:')
+                cycles = 0
+                for ins in bb.instructions:
+                    if ins.opcode not in ins_stat:
+                        ins_stat[ins.opcode] = [0, 0]
+                    latency = dict.get(latencies, ins.opcode, 4)
+                    ins_stat[ins.opcode][0] += 1
+                    ins_stat[ins.opcode][1] += latency
+                    cycles += latency
+                ops = sorted(ins_stat.keys())
+                for op in ops:
+                    print(f'\t{op:30}: {ins_stat[op][0]:5} times, {ins_stat[op][1]:8,} cycles')
+                print(f'estimated issue cost(without stall) will be {cycles:,} cycles')
         # asm += self.asm_debug_info
         if 0:
             color0 = f"\033[0;{30+(2 % 8)}m"
@@ -1837,10 +1882,7 @@ r'''
                     dst_idx = dst_row * M//items_per_GPR + dst_col//items_per_GPR
                     dst[dst_idx] = src[src_idx]
         if dtype_bytes == 2:
-            trans_low = self.gpr("su32")
-            trans_low[0] = 0x01_00_05_04
-            trans_high = self.gpr("su32")
-            trans_high[0] = 0x03_02_07_06
+            trans_low, trans_high = get_perm_pattern_16(self)
             def trans2x2(s0, s1, d0, d1):
                 self.v_perm_b32(d0, s0, s1, trans_low)
                 self.v_perm_b32(d1, s0, s1, trans_high)
@@ -1854,16 +1896,7 @@ r'''
                     trans2x2(src[src_idx], src[src_idx+N//items_per_GPR],
                             dst[dst_idx], dst[dst_idx+M//items_per_GPR])
         if dtype_bytes == 1:
-            trans_low1 = self.gpr("su32")
-            trans_low1[0] = 0x02_06_00_04
-            trans_high1 = self.gpr("su32")
-            trans_high1[0] = 0x03_07_01_05
-
-            trans_low2 = self.gpr("su32")
-            trans_low2[0] = 0x01_00_05_04
-            trans_high2 = self.gpr("su32")
-            trans_high2[0] = 0x03_02_07_06
-            
+            trans_low1, trans_high1, trans_low2, trans_high2 = get_perm_pattern_8(self)
             vtemp0 = self.gpr("vu32")
             vtemp1 = self.gpr("vu32")
             vtemp2 = self.gpr("vu32")
@@ -1901,8 +1934,9 @@ class Idx3D:
         pass
 
 class jit:
-    def __init__(self, extra_compiler_options = ""):
+    def __init__(self, extra_compiler_options = "", dump_stat = False):
         self.extra_compiler_options = extra_compiler_options
+        self.dump_stat = dump_stat
 
     def __call__(self, func):
         assert callable(func)
@@ -1957,7 +1991,8 @@ class jit:
         global gen_hip_file_unique_id
         gen_hip_file_unique_id += 1
         return J.build(func_name, f"({','.join(signatures)})", self.extra_compiler_options,
-                       temp_filename = f".jit-{gen_hip_file_unique_id}-{filename}-{line_no}-{func_name}")
+                       temp_filename = f".jit-{gen_hip_file_unique_id}-{filename}-{line_no}-{func_name}",
+                       dump_stat=self.dump_stat)
 
 class Addr2D:
     def __init__(self, J:JIT, base, row_init, col_init, stride):

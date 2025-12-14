@@ -65,6 +65,7 @@ def get_jit_kernel(HQ, # query heads
                    num_parts,    # how many steps each warp goes
                    debug_loc,    # debug
                    ):
+    acc_scale *= math.log2(math.exp(1))
     GQA = HQ // HK
     def reduce(J:pyhip.JIT,
                warp_id,
@@ -104,11 +105,10 @@ def get_jit_kernel(HQ, # query heads
             J.v_max_f32_e32(real_max[i], maxs[4 * i + 0], maxs[4 * i + 1])
             J.v_max3_f32(real_max[i], real_max[i], maxs[4 * i + 2], maxs[4 * i + 3])
             tmp = J.gpr(4, 'vf32')
-            alpha = math.log2(math.exp(1))
-            J.v_exp_f32_e32(tmp[0], (maxs[4 * i + 0] - real_max[i]) * alpha)
-            J.v_exp_f32_e32(tmp[1], (maxs[4 * i + 1] - real_max[i]) * alpha)
-            J.v_exp_f32_e32(tmp[2], (maxs[4 * i + 2] - real_max[i]) * alpha)
-            J.v_exp_f32_e32(tmp[3], (maxs[4 * i + 3] - real_max[i]) * alpha)
+            J.v_exp_f32_e32(tmp[0], maxs[4 * i + 0] - real_max[i])
+            J.v_exp_f32_e32(tmp[1], maxs[4 * i + 1] - real_max[i])
+            J.v_exp_f32_e32(tmp[2], maxs[4 * i + 2] - real_max[i])
+            J.v_exp_f32_e32(tmp[3], maxs[4 * i + 3] - real_max[i])
             J.v_pk_mul_f32(tmp[0:1], tmp[0:1], sums[4 * i + 0 : 4 * i + 1])
             J.v_pk_mul_f32(tmp[2:3], tmp[2:3], sums[4 * i + 2 : 4 * i + 3])
             J.v_add_f32_e32(tmp[0], tmp[0], tmp[1])
@@ -153,14 +153,14 @@ def get_jit_kernel(HQ, # query heads
                 out_v[1] = tmp[0] & 0xffff0000
 
                 exp_d_max = J.gpr("vf32")
-                J.v_exp_f32_e32(exp_d_max, (maxs[4 * i + 0] - real_max[i]) * alpha)
+                J.v_exp_f32_e32(exp_d_max, maxs[4 * i + 0] - real_max[i])
                 for j in range(2):
                     out_v[j] = exp_d_max * out_v[j]
                 for k in range(1, 4):
                     tmp[0] = tmp[k] << 16
                     tmp[1] = tmp[k] & 0xffff0000
                     exp_d_max = J.gpr("vf32")
-                    J.v_exp_f32_e32(exp_d_max, (maxs[4 * i + k] - real_max[i]) * alpha)
+                    J.v_exp_f32_e32(exp_d_max, maxs[4 * i + k] - real_max[i])
                     for j in range(2):
                         tmp[j] = exp_d_max * tmp[j]
                         out_v[j] += tmp[j]
@@ -181,7 +181,7 @@ def get_jit_kernel(HQ, # query heads
                 p_sum_out[0] += offset_max_sum
                 # J.s_waitcnt(mod=f"vmcnt(0)")
 
-    @pyhip.jit("-g")
+    @pyhip.jit("-g", dump_stat=True)
     def pa_jit(J:pyhip.JIT,
                 query:"__bf16*",      #[B, HQ, S]
                 key_cache:"__bf16*",    # [BLOCK, BLOCK_SIZE, HK, S]
@@ -208,6 +208,10 @@ def get_jit_kernel(HQ, # query heads
         # 这个读取latency非常大，需要提前发起hidding,
         kv_cum_len = J.gpr(2, "su32")
         J.s_load_dwordx2(kv_cum_len, kv_indptr, b[0]<<2)
+
+        s_acc_scale = J.gpr(2, 'sf32')
+        s_acc_scale[0] = acc_scale
+        s_acc_scale[1] = acc_scale
 
         assert (HQ % HK) == 0
         hq = J.gpr(hk * (HQ // HK))
@@ -293,7 +297,7 @@ def get_jit_kernel(HQ, # query heads
         kv_ids = J.gpr(num_parts, 'vu32')
         for part_idx in range(num_parts):
             offset12 = part_idx*(KV_PART_SIZE//num_parts)*4
-            assert offset12.bit_length() <= 12            
+            assert offset12.bit_length() <= 12   
             kv_page_ids_buff.load_dword(kv_ids[part_idx], J.threadIdx.x[0]*4, 0, offset12=offset12)
 
         # 每次kv-len维度上步进256，自己完成其中的64个计算，步进4次，4个warps一共完成1024个计算
@@ -374,13 +378,18 @@ def get_jit_kernel(HQ, # query heads
         cur_sum = J.gpr("vf32")
         prev_max[0] = torch.finfo(torch.float).min
         cur_sum[0] = 0
+        # for stat info
+        J.Label('main')
         for part_idx in range(num_parts):
             vm_cnt_preload_key = 0 # 统计从这个点开始，又发起了多少个vmem指令
             vaddr_warp_base = J.gpr("vu32")
             vaddr_warp_base[0] = warp_id * (16*S*sizeof_bf16)
             acc = J.gpr(4, 4, "vf32", align=4)
             for n in range(4):
-                J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_value+16-(n+1)*4})")
+                if part_idx != num_parts - 1:
+                    J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_value+16-4})")
+                else:
+                    J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_value+16-(n+1)*4})")
                 vKaddr64bits = J.gpr(2, "vu32")
                 # 可以发起一次Q*K计算的最小数据单位：16行的key 已经就位，写入LDS
                 # 这个写入比较快并且issue stall的代价小，因此没有跟任何计算交织
@@ -440,8 +449,8 @@ def get_jit_kernel(HQ, # query heads
                 #J.s_waitcnt(mod=f"vmcnt(0) lgkmcnt(0)");J.s_endpgm()
 
             for n in range(4):
-                for i in range(4):
-                    acc[n,i] = acc[n,i] * acc_scale
+                J.v_pk_mul_f32(acc[n,0:1], s_acc_scale, acc[n,0:1])
+                J.v_pk_mul_f32(acc[n,2:3], s_acc_scale, acc[n,2:3])
 
             """
             prev_max = torch.full([qlen,1], torch.finfo(torch.float).min, dtype=torch.float)
@@ -492,15 +501,15 @@ def get_jit_kernel(HQ, # query heads
                 J.v_max_f32(cur_max, cur_max, vtemp)
 
             # acc现在保存P P = (S - cur_max).exp()
-            import math
-            alpha = math.log2(math.e)
             for n in range(4):
                 for i in range(4):
-                    J.v_exp_f32(acc[n,i], (acc[n,i] - cur_max) * alpha)
+                    J.v_exp_f32(acc[n,i], acc[n,i] - cur_max)
             
             # max_fixup = (prev_max-cur_max).exp()
-            max_fixup = J.gpr(prev_max - cur_max)
-            J.v_exp_f32(max_fixup, max_fixup * alpha)
+            if part_idx or debug_loc is not None:
+                max_fixup = J.gpr(2, 'vf32')
+                max_fixup[0] = J.gpr(prev_max - cur_max)
+                J.v_exp_f32(max_fixup[0], max_fixup[0])
 
             # cur_sum = max_fixup * cur_sum + P.sum(dim=1, keepdim = True)
             psum = J.gpr(2, "vf32")
@@ -518,7 +527,10 @@ def get_jit_kernel(HQ, # query heads
                 J.s_waitcnt(mod=f"lgkmcnt(0)")
                 psum[0] = psum[0] + vtemp
 
-            cur_sum[0] = cur_sum * max_fixup + psum[0]
+            if part_idx:
+                cur_sum[0] = cur_sum * max_fixup[0] + psum[0]
+            else:
+                cur_sum[0] = psum[0]
 
             # prev_max = cur_max
             prev_max[0] = cur_max
@@ -526,15 +538,15 @@ def get_jit_kernel(HQ, # query heads
             # O = max_fixup * O + (P @ V)
             if debug_loc is not None:
                 J.debug_log(cur_sum, torch.float, "4h.16v.1h")
-                J.debug_log(max_fixup, torch.float, "4h.16v.1h")
+                J.debug_log(max_fixup[0], torch.float, "4h.16v.1h")
 
-            # out : max_fixup是per-row的, vout列交织并不影响
-            # O = max_fixup*O + (P @ V)
-            for i in range(S//16):
-                vout[i,0] = vout[i,0] * max_fixup
-                vout[i,1] = vout[i,1] * max_fixup
-                vout[i,2] = vout[i,2] * max_fixup
-                vout[i,3] = vout[i,3] * max_fixup
+            if part_idx:
+                # out : max_fixup是per-row的, vout列交织并不影响
+                # O = max_fixup*O + (P @ V)
+                max_fixup[1] = max_fixup[0]
+                for i in range(S//16):
+                    J.v_pk_mul_f32(vout[i,0:1], max_fixup, vout[i,0:1])
+                    J.v_pk_mul_f32(vout[i,2:3], max_fixup, vout[i,2:3])
 
             # P 转换为 bf16
             acc_low = J.gpr(4, 2, "vbf16x2", align=4) # 4 x bfloat16x4
@@ -550,7 +562,10 @@ def get_jit_kernel(HQ, # query heads
             vm_cnt_preload_value = 0
             for n in range(4):
                 # 等待value到达，发起下一轮preload之前发起计算
-                J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_key + 16 - (n+1)*4})")
+                if part_idx != num_parts - 1:
+                    J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_key + 16 - 4})")
+                else:
+                    J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_key + 16 - (n+1)*4})")
 
                 # write 4x128 elements to lds for each call
                 J.ds_write_b128(cur_v_write_lds, value_reg[n*4 + 0], mod='offset:0')
@@ -594,14 +609,16 @@ def get_jit_kernel(HQ, # query heads
                 # vout: 是列交织的
                 #J.debug_log(vout, torch.float, "4v1.4h.16v4.4h")
                 pass
+        # for stat info
+        J.Label('main_end')
 
         reduce(J, warp_id, out_seg, max_out, sum_out, 
                lds_base=lds_key, cur_sum=cur_sum, cur_max=cur_max, vout=vout)
-        vout_tr = J.gpr(S//16, 4, 'vf32')
-        J.transpose_per_lane(4, 4, 4, vout[0:3], vout_tr[0:3])
-        J.transpose_per_lane(4, 4, 4, vout[4:7], vout_tr[4:7])
 
         if debug_loc is not None:
+            vout_tr = J.gpr(S//16, 4, 'vf32')
+            J.transpose_per_lane(4, 4, 4, vout[0:3], vout_tr[0:3])
+            J.transpose_per_lane(4, 4, 4, vout[4:7], vout_tr[4:7])
             def dump_vout(debug_log_ptr, gprs):
                 for i in range(2):
                     #vdata = vout_tr[i * 16 : i * 16 + 15]
@@ -613,20 +630,20 @@ def get_jit_kernel(HQ, # query heads
                 return (16, S)
             J.debug_log(vout_tr[...], torch.float, dump_vout)
 
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
+        # J.s_waitcnt(mod=f"lgkmcnt({0})")
 
         #a=J.alloc_lds((8-4)*1024)
-        J.s_waitcnt(mod=f"vmcnt({0})")
-
-        mtime_stop = J.gpr(2, "su32")
-        J.s_memtime(mtime_stop)
-
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
-
-        J.s_sub_u32(mtime_stop[0], mtime_stop[0], mtime_start[0])
-        J.s_subb_u32(mtime_stop[1], mtime_stop[1], mtime_start[1])
+        # J.s_waitcnt(mod=f"vmcnt({0})")
 
         if debug_loc is not None:
+            mtime_stop = J.gpr(2, "su32")
+            J.s_memtime(mtime_stop)
+
+            J.s_waitcnt(mod=f"lgkmcnt({0})")
+
+            J.s_sub_u32(mtime_stop[0], mtime_stop[0], mtime_start[0])
+            J.s_subb_u32(mtime_stop[1], mtime_stop[1], mtime_start[1])
+
             vdata = J.gpr("vu32")
             vdata[0] = mtime_stop[0]
             #J.global_atomic_umax(J.threadIdx.x[0] << 2, vdata, debug_out)
@@ -730,11 +747,8 @@ def get_jit_kernel(HQ, # query heads
             cur_val_low[0] = cur_val_low[0] << 16
             
             # SALU do not support float
-            import math
-            alpha = math.log2(math.exp(1))
-
             exp_d_max = J.gpr("vf32")
-            J.v_exp_f32_e32(exp_d_max, (cur_max[0] - real_max[0])*alpha)
+            J.v_exp_f32_e32(exp_d_max, cur_max[0] - real_max[0])
             exp_d_max[0] = cur_sum[0] * exp_d_max
 
             cur_val[0] = cur_val[0] + cur_val_low[0] * exp_d_max[0]
