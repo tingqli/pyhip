@@ -3,7 +3,7 @@ import torch
 import math
 
 from pyhip.asmjit import Addr2D
-torch.cuda.set_device(6)
+torch.cuda.set_device(2)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
@@ -476,22 +476,24 @@ def get_jit_kernel(HQ, # query heads
             # acc 的layout是 4h.4h.16v.4h, 每个lane内部对应元素的k_pos要根据这个layout
             # 4个float被组织在一个lane里面，但是每个float的k_pos不同，因此下面的k_pos
             # 只是lane中第一个元素的k_pos
-            k_pos = J.gpr("vu32")
-            k_pos[0] = part_idx * (KV_PART_SIZE//num_parts) + warp_id * (KV_PART_SIZE//num_parts//4) + (lane_div_16[0] * 4)
-            fmin = J.gpr("vf32")
-            fmin[0] = torch.finfo(torch.float).min
-            for n in range(4):
-                for i in range(4):
-                    J.SetMask("vcc", k_pos + i < kv_part_len)
-                    J.v_cndmask_b32_e32(acc[n,i], fmin, acc[n,i], "vcc")
-                k_pos[0] = k_pos[0] + 16
+            first_idx = J.gpr(part_idx * (KV_PART_SIZE//num_parts) + warp_id * (KV_PART_SIZE//num_parts//4))
+
+            with J.If(first_idx + 64 > kv_part_len):            
+                k_pos = J.gpr("vu32")
+                k_pos[0] = first_idx + (lane_div_16[0] * 4)
+                fmin = J.gpr("vf32")
+                fmin[0] = torch.finfo(torch.float).min
+                for n in range(4):
+                    for i in range(4):
+                        J.SetMask("vcc", k_pos + i < kv_part_len)
+                        J.v_cndmask_b32_e32(acc[n,i], fmin, acc[n,i], "vcc")
+                    k_pos[0] = k_pos[0] + 16
 
             # cur_max: cur_max = torch.maximum(rowmax, prev_max)
             cur_max = J.gpr("vf32")
             cur_max[0] = prev_max[0]
             for n in range(4):
-                for i in range(4):
-                    J.v_max_f32(cur_max, cur_max, acc[n, i])
+                J.vmax("f32", cur_max, [cur_max, acc[n, 0], acc[n, 1], acc[n, 2], acc[n, 3]])
 
              # cur_max: cross-lane
             vtemp = J.gpr("vf32")

@@ -649,6 +649,19 @@ class JIT:
             self.Jump(label_begin)
             self.Label(label_end)
 
+    @contextmanager
+    def If(self, cond:GPRExpr):
+        current_frame = inspect.currentframe()
+        caller_frame = current_frame.f_back.f_back
+        lineno = caller_frame.f_lineno
+        label_end = f"_if_end_{lineno}_{self.mark_idx}"
+        self.mark_idx += 1
+        self.Jump(label_end, cond, reverse=True)
+        try:
+            yield None
+        finally:
+            self.Label(label_end)
+
     '''
     for setting VCC based on condition expression
     '''
@@ -1789,7 +1802,7 @@ r'''
                 dtype_size = torch.tensor([], dtype=dtype).element_size()
 
                 tensor = torch.frombuffer(buffer, dtype=dtype, count=count*64*(4//dtype_size), offset=offset)
-                if rtype == "s": tensor = tensor[0:1].tolist()
+                if rtype == "s": tensor = tensor.reshape(64, (4*count//dtype_size))[0,:].tolist()
                 offset += 64*4*count
                 tag = f"[{cnt}]:  {name} ({rtype}gpr x {count})"
                 if verbose:
@@ -1926,6 +1939,30 @@ r'''
                         dst[dst_idx+M//items_per_GPR*2],
                         dst[dst_idx+M//items_per_GPR*3]
                     )
+
+    def vmax(self, dtype, dst_vgpr, src_vgprs:list):
+        others = []
+        # put the dst at first place if it's one of the sources
+        for s in src_vgprs:
+            if s is dst_vgpr:
+                others.append(s)
+                break
+        for s in src_vgprs:
+            if s is not dst_vgpr:
+                others.append(s)
+        if len(others) >= 3:
+            inst_vmax3 = getattr(self, f"v_max3_{dtype}")
+            inst_vmax3(dst_vgpr, others.pop(0), others.pop(0), others.pop(0))
+            while len(others) >= 2:
+                inst_vmax3 = getattr(self, f"v_max3_{dtype}")
+                inst_vmax3(dst_vgpr, dst_vgpr, others.pop(0), others.pop(0))
+            if len(others):
+                inst_vmax2 = getattr(self, f"v_max_{dtype}")
+                inst_vmax2(dst_vgpr, dst_vgpr, others.pop(0))
+        else:
+            assert len(others) == 2
+            inst_vmax2 = getattr(self, f"v_max_{dtype}")
+            inst_vmax2(dst_vgpr, others.pop(0), others.pop(0))
 
 gen_hip_file_unique_id = 0
 
