@@ -1373,13 +1373,13 @@ class JIT:
 
                 i += 1
 
-    def run_threads(self, *thread_jits):
+    def Interleave(self, *thread_jits):
         # generate instructions to special BB
         oldbb = self.current_bb
 
         # collect all instructions from each thread
         class VThread:
-            def __init__(self, bb:BasicBlock, name, signal_table):
+            def __init__(self, bb:BasicBlock, name, signal_table = None):
                 self.name = name
                 self.bb = bb
                 self.index = 0      # current instruction
@@ -1388,7 +1388,7 @@ class JIT:
                 self.next()  # initialize self.inst
                 self.signal_table = signal_table
 
-            def progress():
+            def progress(self):
                 return self.index * 4
 
             def next(self):
@@ -1399,6 +1399,7 @@ class JIT:
                 while True:
                     self.inst = self.bb.instructions[self.index]
                     self.index += 1
+                    """
                     if self.inst.opcode.startswith == "signal":
                         signal_name = self.inst.mod
                         if signal_name in self.signal_table:
@@ -1425,25 +1426,26 @@ class JIT:
                         else:
                             # has signaled,just fetch next instruction
                             continue
+                    """
                     break
 
                 self.is_mem_load = self.inst.opcode.startswith("global_load_") or self.inst.opcode.startswith("buffer_load_")
                 self.is_mfma = self.inst.opcode.startswith("v_mfma_")
                 self.is_dsrd = self.inst.opcode.startswith("ds_read")
                 self.is_dswr = self.inst.opcode.startswith("ds_write")
-                self.is_ds = self.is_dsrd or self.is_dswr
+                self.is_ds = self.inst.opcode.startswith("ds_")
                 return self.inst
 
         vthreads = []
         for thr in thread_jits:
             bb = BasicBlock(self, thr.__name__)
             self.current_bb = bb
-            thr(self)
+            thr()
             vthreads.append(VThread(bb, thr.__name__))
         
         self.current_bb = oldbb
         # schedule instructions from bbs into self.current_bb
-        ISSUE_INTERVAL = { "vmem": 113,"ds":32, "mfma": 16}
+        ISSUE_INTERVAL = { "vmem": 113,"ds":16, "mfma": 16}
         last_global_load_cycle = -100000
         last_ds_cycle = -100000
         last_mfma_cycle = -100000
@@ -1455,31 +1457,32 @@ class JIT:
             min_progress = 1e12
             selected_thr = None
             is_all_finished = True
-            for thr in vthreads:
+            for ithr, thr in  enumerate(vthreads):
                 if thr.finished: continue
                 is_all_finished = False
                 if thr.waitting: continue
                 # check issue-interval
                 if thr.is_mem_load and (clock_cycle - last_global_load_cycle) < ISSUE_INTERVAL["vmem"]: continue
-                if thr.is_ds and (clock_cycle - last_ds_cycle) < ISSUE_INTERVAL["vmem"]: continue
+                if thr.is_ds and (clock_cycle - last_ds_cycle) < ISSUE_INTERVAL["ds"]: continue
                 if thr.is_mfma and (clock_cycle - last_mfma_cycle) < ISSUE_INTERVAL["mfma"]: continue
                 # select the candidate with minimal timeslice
                 progress = thr.progress()
-                if min_progress > progress:
+                if min_progress > progress or ithr == 0:
                     min_progress = progress
                     selected_thr = thr
 
             if selected_thr is not None:
                 self.current_bb.add_instruction(selected_thr.inst)
-                selected_thr.next()
                 if selected_thr.is_mem_load: last_global_load_cycle = clock_cycle
                 if selected_thr.is_ds: last_ds_cycle = clock_cycle
                 if selected_thr.is_mfma: last_mfma_cycle = clock_cycle
+                selected_thr.next()
             else:
                 pass # just wait for some threads ready
 
             # assume each issue took 4 cycles
             clock_cycle += 4
+        pass
 
     def shift_bits(self, imm):
         if imm <= 0 or (imm & (imm - 1)) != 0:
@@ -1620,6 +1623,37 @@ class JIT:
         self.s_waitcnt(mod="vmcnt(0)")
         self.Label(f"debug_log_skip_{log_index}")
 
+    def hide_dependency(self):
+        # hide dependency between address calculation & ds_read/ds_write/global_load
+        # by reorder instructions following the mem-access
+        for bb in self.blocks:
+            i = 1
+            while i < len(bb.instructions):
+                prev = bb.instructions[i-1]
+                cur = bb.instructions[i]
+                vaddr = None
+                if cur.opcode.startswith("global_load_dword"):
+                    vaddr = cur.operands[1]
+                elif cur.opcode.startswith("ds_write_"):
+                    vaddr = cur.operands[0]
+                elif cur.opcode.startswith("ds_read_"):
+                    vaddr = cur.operands[1]
+                if (vaddr is not None) and len(prev.operands) and prev.opcode.startswith("v_") and prev.operands[0].overlap(vaddr):
+                    # if next & next-next instructions is not s_waitcnt and another vmem/ds instruction,
+                    # we can swap because any instruction try to use the result of load have to wait
+                    swap_cnt = 0
+                    while swap_cnt < 3:
+                        if i + 1 >= len(bb.instructions):
+                            break
+                        next = bb.instructions[i + 1]
+                        if next.opcode.startswith("v_") and (not next.operands[0].overlap(vaddr)):
+                            bb.instructions[i], bb.instructions[i+1] = next, cur
+                            i = i + 1
+                            swap_cnt += 1
+                        else:
+                            break
+                i = i + 1
+
     def build(self, kernel_name, signature, extra_compiler_options, temp_filename, dump_stat):
         self.asm_debug_info = ""
         self._finish_bb(self.current_bb)
@@ -1667,6 +1701,7 @@ class JIT:
         self.insert_nop()
 
         # for bb in self.blocks: print(repr(bb))
+        self.hide_dependency()
 
         self.register_allocation_linear_scan()
 
