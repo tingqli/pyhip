@@ -1379,14 +1379,20 @@ class JIT:
 
         # collect all instructions from each thread
         class VThread:
-            def __init__(self, bb:BasicBlock, name, signal_table = None):
+            def __init__(self, bb:BasicBlock, name, signal_table):
                 self.name = name
                 self.bb = bb
                 self.index = 0      # current instruction
                 self.waitting = False
                 self.finished = False
-                self.next()  # initialize self.inst
                 self.signal_table = signal_table
+
+                self.is_mem_load = False
+                self.is_mfma =  False
+                self.is_dsrd =  False
+                self.is_dswr =  False
+                self.is_ds =  False
+                self.next()  # initialize self.inst
 
             def progress(self):
                 return self.index * 4
@@ -1395,25 +1401,27 @@ class JIT:
                 if self.finished or self.index >= len(self.bb.instructions):
                     self.finished = True
                     return None
-
-                while True:
-                    self.inst = self.bb.instructions[self.index]
-                    self.index += 1
-                    """
-                    if self.inst.opcode.startswith == "signal":
-                        signal_name = self.inst.mod
+                self.inst = None
+                while self.index < len(self.bb.instructions):
+                    inst = self.bb.instructions[self.index]
+                    if inst.opcode == "signal":
+                        signal_name = inst.mod
                         if signal_name in self.signal_table:
                             assert self.signal_table[signal_name][0] == 0
                             self.signal_table[signal_name][0] = 1
+                            # change waitting thread's state into waitting
                             wait_thr = self.signal_table[signal_name][1]
-                            wait_thr.waitting = False
+                            # let waitting thread to move to next instruction
+                            wait_thr.next()
                         else:
-                            self.signal_table[signal_name] = [0, None]
+                            # signal a thread which is not in waitting yet
+                            self.signal_table[signal_name] = [1, None]
+                        self.index += 1
                         continue # signal thread keep fetching next instruction
 
-                    if self.inst.opcode.startswith == "wait":
+                    if inst.opcode == "wait":
                         # go into wait status
-                        signal_name = self.inst.mod
+                        signal_name = inst.mod
                         if signal_name in self.signal_table:
                             signaled, thr = self.signal_table[signal_name]
                             assert (thr is self) or (thr is None), "only 1 thread can wait on a signal only once"
@@ -1422,26 +1430,34 @@ class JIT:
                             signaled = 0
                         self.waitting = not signaled
                         if self.waitting:
+                            # next() still going to wait
                             return
                         else:
                             # has signaled,just fetch next instruction
+                            self.index += 1
                             continue
-                    """
+                    self.inst = inst
+                    self.index += 1
                     break
 
-                self.is_mem_load = self.inst.opcode.startswith("global_load_") or self.inst.opcode.startswith("buffer_load_")
-                self.is_mfma = self.inst.opcode.startswith("v_mfma_")
-                self.is_dsrd = self.inst.opcode.startswith("ds_read")
-                self.is_dswr = self.inst.opcode.startswith("ds_write")
-                self.is_ds = self.inst.opcode.startswith("ds_")
-                return self.inst
+                self.finished = self.inst is None
+
+                if not self.finished:
+                    self.is_mem_load = self.inst.opcode.startswith("global_load_") or self.inst.opcode.startswith("buffer_load_")
+                    self.is_mfma = self.inst.opcode.startswith("v_mfma_")
+                    self.is_dsrd = self.inst.opcode.startswith("ds_read")
+                    self.is_dswr = self.inst.opcode.startswith("ds_write")
+                    self.is_ds = self.inst.opcode.startswith("ds_")
+                    return self.inst
+                return None
 
         vthreads = []
+        signal_table = {}
         for thr in thread_jits:
             bb = BasicBlock(self, thr.__name__)
             self.current_bb = bb
             thr()
-            vthreads.append(VThread(bb, thr.__name__))
+            vthreads.append(VThread(bb, thr.__name__, signal_table))
         
         self.current_bb = oldbb
         # schedule instructions from bbs into self.current_bb
@@ -1508,6 +1524,7 @@ class JIT:
         """
         cond : filter the kernel instance to enable log
         """
+        if self.debug_cond_sgpr is None: return
         assert isinstance(self.debug_cond_sgpr, GPRs)
         log_index = len(self.debug_log_info)
         #self.Jump(f"debug_log_skip_{log_index}", cond, reverse=True)
@@ -1654,6 +1671,51 @@ class JIT:
                             break
                 i = i + 1
 
+    # 前移一些ALU指令到加载kargs的s_waitcnt之前, kernel编写者需要手工把无关的valu指令放在整个kernel的最开始处
+    def hide_karg_loads(self):
+        if len(self.blocks) == 0: return
+
+        sgpr_loading = []
+
+        def can_move_forward(inst):
+            if inst.opcode.startswith("v_") and len(inst.operands) > 0:
+                for i in range(1,len(inst.operands)):
+                    src = inst.operands[i]
+                    if (not isinstance(src, GPRExpr)) and (not isinstance(src, GPRs)):
+                        continue
+                    for sgpr in sgpr_loading:
+                        if src.overlap(sgpr): return False
+                return True
+            return False
+
+        first_bb = self.blocks[0]
+        for i in range(len(first_bb.instructions)):
+            inst = first_bb.instructions[i]
+            if inst.opcode.startswith("s_waitcnt"):
+                # looking for v_ instructions(w/o using any sgpr) to move before this waitcnt
+                k = i + 1
+                i_s_waitcnt = i
+                while k < len(first_bb.instructions):
+                    inst_k = first_bb.instructions[k]
+                    if not can_move_forward(inst_k): break
+                    # move instruction forward
+                    first_bb.instructions[i_s_waitcnt],first_bb.instructions[k] = inst_k, first_bb.instructions[i_s_waitcnt]
+                    i_s_waitcnt = k
+                    k = k + 1
+                break
+            if not inst.opcode.startswith("s_load_"): break
+            if len(inst.operands):
+                sgpr_loading.append(inst.operands[0])
+
+    def show_code(self):
+        self.log("===================== bb")
+        for bb in self.blocks:
+            self.log(repr(bb))
+        if self.current_bb is not None:
+            self.log("===================== current_bb")
+            self.log(repr(self.current_bb))
+        
+
     def build(self, kernel_name, signature, extra_compiler_options, temp_filename, dump_stat):
         self.asm_debug_info = ""
         self._finish_bb(self.current_bb)
@@ -1702,6 +1764,10 @@ class JIT:
 
         # for bb in self.blocks: print(repr(bb))
         self.hide_dependency()
+
+        # kernel args are loaded with s_waitcnt, many v_ instructions can be
+        # moved into this wait cycles
+        self.hide_karg_loads()
 
         self.register_allocation_linear_scan()
 
@@ -1861,7 +1927,7 @@ r'''
                 cnt += 1
             return ret
 
-        def log_ptr(self, size=40960):
+        def log_ptr(self, size=1024*1024):
             global torch
             import torch
             self._debug_log_buff = torch.full([size//4], -1, dtype=torch.int32)
