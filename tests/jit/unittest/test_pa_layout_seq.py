@@ -1,8 +1,10 @@
+import os
+os.environ['PYHIP_JIT_LOG'] = '1'
 import pyhip
 import torch
 import math
 
-from pyhip.asmjit import Addr2D
+from pyhip.asmjit import Addr2D, float_to_ieee754_bits_little
 torch.cuda.set_device(2)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
@@ -62,7 +64,7 @@ def get_jit_kernel(HQ, # query heads
                    BLOCK_SIZE,   # block size
                    KV_PART_SIZE, # kv-lengths each warp handles
                    acc_scale,
-                   num_parts,    # how many steps each warp goes
+                   NUM_PARTS,    # how many steps each warp goes
                    debug_loc,    # debug
                    ):
     acc_scale *= math.log2(math.exp(1))
@@ -180,7 +182,7 @@ def get_jit_kernel(HQ, # query heads
                 p_sum_out[0] += offset_max_sum
                 # J.s_waitcnt(mod=f"vmcnt(0)")
 
-    @pyhip.jit("-g", dump_stat=True)
+    @pyhip.jit("-g", kernel_suffix=f'{HQ=}-{HK=}-{S=}-{BLOCK_SIZE=}-{KV_PART_SIZE=}-SC={float_to_ieee754_bits_little(acc_scale):x}-DLOC={1 if debug_loc else 0}')
     def pa_jit(J:pyhip.JIT,
                 query:"__bf16*",        # [B, HQ, S]
                 key_cache:"__bf16*",    # [block_num, HK, block_size // (16*2), 2, S // ITEMSIZE, 16, ITEMSIZE]
@@ -295,7 +297,7 @@ def get_jit_kernel(HQ, # query heads
         kv_ids_num = KV_PART_SIZE // 4 // BLOCK_SIZE
         kv_ids = J.gpr(1, 'vu32')
         block_table_buff.load_dword(kv_ids[0], lane_mod_16 % kv_ids_num * 4, warp_id * (kv_ids_num * 4))
-        assert kv_ids_num <= 16, f'add logic to handle more than 16 blocks accessed'
+        assert 0 < kv_ids_num <= 16, f'kv id# per simd must be in (0, 16]'
 
         """
         LDS有限，因此要以尽量小的单位使用
@@ -336,7 +338,7 @@ def get_jit_kernel(HQ, # query heads
         for i in range(kv_ids_num):
             J.v_mov_b32_dpp(kv_offsets[i], kv_ids[0], mod=f'row_newbcast:{i} row_mask:0xf bank_mask:0xf')
         # block number each part iter will access
-        kv_ids_num_per_part = kv_ids_num // num_parts
+        kv_ids_num_per_part = kv_ids_num // NUM_PARTS
         assert kv_ids_num_per_part > 0
         # shared row(=16tokens) num
         key_shared_idx_per_64 = 4 // kv_ids_num_per_part
@@ -391,11 +393,11 @@ def get_jit_kernel(HQ, # query heads
         cur_sum[0] = 0
         # for stat info
         J.Label('main')
-        for part_idx in range(num_parts):
+        for part_idx in range(NUM_PARTS):
             vm_cnt_preload_key = 0 # 统计从这个点开始，又发起了多少个vmem指令
             acc = J.gpr(4, 4, "vf32", align=4)
             for n in range(4):
-                if (part_idx + 1) < num_parts:
+                if (part_idx + 1) < NUM_PARTS:
                     if n % key_shared_idx_per_64 == 0:
                         assert next_key_block_idx < kv_ids_num
                         kv_off[0], kv_off[1] = kv_offsets[next_key_block_idx], 0
@@ -404,7 +406,7 @@ def get_jit_kernel(HQ, # query heads
                         vKaddr64bits[:] = vKbase64bits[:] + kv_off[:]
                         offset = 0
                 for k in range(S//32):
-                    if part_idx != num_parts - 1:
+                    if part_idx != NUM_PARTS - 1:
                         J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_value+16-1})")
                     else:
                         J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_value+16-n*4-k-1})")
@@ -416,7 +418,7 @@ def get_jit_kernel(HQ, # query heads
                     J.v_mfma_f32_16x16x16_bf16(acc[n], key_reg[4*n+k, 2:3], q_cur[4*k+2:4*k+3], acc[n])
                     # 发起下一轮的vmem预取，有很大概率会引起issue stall
                     # 因此我们跟上面耗时的LDS+MFMA指令交织起来，降低指令密度，降低stall概率
-                    if (part_idx + 1) < num_parts:
+                    if (part_idx + 1) < NUM_PARTS:
                         J.global_load_dwordx4(key_reg[4*n + k], vKaddr64bits, mod=f",off, offset:{offset}")
                         vm_cnt_preload_key += 1
                         offset += 1024
@@ -458,9 +460,9 @@ def get_jit_kernel(HQ, # query heads
             # acc 的layout是 4h.4h.16v.4h, 每个lane内部对应元素的k_pos要根据这个layout
             # 4个float被组织在一个lane里面，但是每个float的k_pos不同，因此下面的k_pos
             # 只是lane中第一个元素的k_pos
-            first_idx = J.gpr(part_idx * (KV_PART_SIZE//num_parts) + warp_id * (KV_PART_SIZE//num_parts//4))
+            first_idx = J.gpr(warp_id * (KV_PART_SIZE//4) + part_idx * (KV_PART_SIZE//NUM_PARTS//4))
 
-            with J.If(first_idx + 64 > kv_part_len):            
+            with J.If(first_idx + 64 > kv_part_len):
                 k_pos = J.gpr("vu32")
                 k_pos[0] = first_idx + (lane_div_16[0] * 8)
                 fmin = J.gpr("vf32")
@@ -544,7 +546,7 @@ def get_jit_kernel(HQ, # query heads
             vm_cnt_preload_value = 0
             # 2 groups, each group has 32 tokens of value
             for n in range(2):
-                if (part_idx + 1) < num_parts:
+                if (part_idx + 1) < NUM_PARTS:
                     if n % value_shared_idx_per_64 == 0:
                         assert next_value_block_idx < kv_ids_num
                         kv_off[0], kv_off[1] = kv_offsets[next_value_block_idx], 0
@@ -556,14 +558,14 @@ def get_jit_kernel(HQ, # query heads
                 # [S, 32 tokens] x [16 query, 4(lane4)*2group*(2*4)]'
                 for j in range(S // 16):
                     # 等待value到达，发起下一轮preload之前发起计算
-                    if part_idx != num_parts - 1:
+                    if part_idx != NUM_PARTS - 1:
                         J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_key + 16 - 1})")
                     else:
                         J.s_waitcnt(mod=f"vmcnt({vm_cnt_preload_key + 16 - j - (n*8) - 1})")
                     J.v_mfma_f32_16x16x16_bf16(vout[j], value_reg[n*8+j,0:1], acc_low[2*n+0, 0:1], vout[j])
                     J.v_mfma_f32_16x16x16_bf16(vout[j], value_reg[n*8+j,2:3], acc_low[2*n+1, 0:1], vout[j])
 
-                    if (part_idx + 1) < num_parts:
+                    if (part_idx + 1) < NUM_PARTS:
                         J.global_load_dwordx4(value_reg[8*n + j], vVaddr64bits, mod=f",off, offset:{offset}")
                         vm_cnt_preload_value += 1
                         offset += 1024
@@ -571,10 +573,10 @@ def get_jit_kernel(HQ, # query heads
                             vVaddr64bits[:] = vVaddr64bits[:] + s_4096[:]
                             offset = 0
 
-            if debug_loc is not None:
-                # vout: 是列交织的
-                #J.debug_log(vout, torch.float, "4v1.4h.16v4.4h")
-                pass
+                if debug_loc is not None:
+                    # vout: 是列交织的
+                    #J.debug_log(vout, torch.float, "4v1.4h.16v4.4h")
+                    pass
         # for stat info
         J.Label('main_end')
 
@@ -605,7 +607,7 @@ def get_jit_kernel(HQ, # query heads
         # following hack prevent kernel-arg loading to reuse same sgprs for different args
         return
 
-    @pyhip.jit()
+    @pyhip.jit(kernel_suffix=f'{KV_PART_SIZE=}-{HQ=}-{S=}')
     def pa_reduce_jit(J, seq_len:"uint*",
                         out_seg:"__bf16*",
                         max_out:"float*",
@@ -774,16 +776,18 @@ S = 128
 # 每个block可以遍历 kv_indptr 来确定自己需要负责的kv-len区间，因为 kv_indptr
 # 相对较小，遍历很快，
 KV_LEN = 40*1024
-#KV_LEN = 45694
+KV_LEN = 45694
 
 #KV_LEN = 512
 DT = torch.bfloat16
 BLOCK_SIZE16 = 16
+# should be [32, 64]
 BLOCK_SIZE = 32
 BUF_COPY = 1
 BUF_COPY = 32
 
 KV_MIN_PART_SIZE = 256
+# should be [256, 512, 1024]
 KV_PART_SIZE = 256 * 4
 
 query = torch.randint(-2, 3, [B, HQ, S], dtype=DT)
@@ -1136,6 +1140,7 @@ if 1:
 print("======================= test performance ==============================")
 pa_jit, pa_reduce_jit = get_jit_kernel(HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts, None)
 debug_log_ptr = pa_jit.log_ptr()
+i = 0
 for round in range(10):
     with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="pa_jit"):
         pa_jit([B, HK, max_num_parts], [256],
@@ -1150,9 +1155,9 @@ for round in range(10):
                 max_num_parts,
                 max_num_blocks_per_seq[BLOCK_SIZE],
                 0)
-    pa_reduce_jit([B, HQ], [256],
-                seq_lens[BLOCK_SIZE][i].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
-                0)
+        pa_reduce_jit([B, HQ], [256],
+                    seq_lens[BLOCK_SIZE][i].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
+                    0)
 
     i = (i + 1) % BUF_COPY
 print(f"[{B}, {HK}, {div_up(KV_LEN, KV_PART_SIZE)}]")

@@ -1806,10 +1806,13 @@ r'''
 ''' + decl_lds + r'''
 }
         '''
-        import os
-        cpp_src_fpath = os.path.join(os.getcwd(),f'{temp_filename}.cpp')
+        cpp_src_fpath = f'{temp_filename}.cpp'
         with open(cpp_src_fpath, 'w', encoding='utf-8') as f:
             f.write(hip_src)
+
+        return self.compile(kernel_name, cpp_src_fpath, extra_compiler_options)
+
+    def compile(self, kernel_name, cpp_src_fpath, extra_compiler_options):
         hip = module(cpp_src_fpath, extra_compiler_options)
         hip_func = getattr(hip, kernel_name)
         # attach debug_log member function & data to hip_func
@@ -1867,7 +1870,7 @@ r'''
         from functools import partial
         hip_func.get_logs = partial(get_logs, hip_func, self.debug_log_info)
         hip_func.log_ptr = partial(log_ptr, hip_func)
-
+        
         return hip_func
 
     '''
@@ -2006,9 +2009,11 @@ class Idx3D:
         pass
 
 class jit:
-    def __init__(self, extra_compiler_options = "", dump_stat = False):
+    def __init__(self, extra_compiler_options = "", dump_stat = False, kernel_suffix = '', force_recompile = False):
         self.extra_compiler_options = extra_compiler_options
         self.dump_stat = dump_stat
+        self.kernel_suffix = kernel_suffix
+        self.force_recompile = force_recompile
 
     def __call__(self, func):
         assert callable(func)
@@ -2017,11 +2022,24 @@ class jit:
         file_info = inspect.getfile(func)
         line_no = inspect.getsourcelines(func)[1]
         filename = os.path.basename(file_info)
+        dirname = os.path.dirname(file_info)
 
         argspec = inspect.getfullargspec(func)
         argtypes = func.__annotations__
+        func_name = func.__name__
+        if self.kernel_suffix:
+            prefix_name = f'{dirname}/.jit-{func_name}-{self.kernel_suffix}'
+        else:
+            global gen_hip_file_unique_id
+            gen_hip_file_unique_id += 1
+            prefix_name = f"{dirname}/.jit-{gen_hip_file_unique_id}-{filename}-{line_no}-{func_name}"
 
         J = JIT()
+        # check if cache is available
+        cpp_path = f'{prefix_name}.cpp'
+        if not self.force_recompile and os.path.isfile(cpp_path) and os.path.getmtime(cpp_path) > os.path.getmtime(file_info):
+            return J.compile(func_name, cpp_path, self.extra_compiler_options)
+
         # create special sgpr for args
         # and generate codes to load these args
         signatures = []
@@ -2059,11 +2077,8 @@ class jit:
 
         # now generate your kernel code
         func(J, *sgpr_args)
-        func_name = func.__name__
-        global gen_hip_file_unique_id
-        gen_hip_file_unique_id += 1
         return J.build(func_name, f"({','.join(signatures)})", self.extra_compiler_options,
-                       temp_filename = f".jit-{gen_hip_file_unique_id}-{filename}-{line_no}-{func_name}",
+                       temp_filename = prefix_name,
                        dump_stat=self.dump_stat)
 
 class Addr2D:
