@@ -117,6 +117,18 @@ def get_jit_kernel(HQ, # query heads
             J.v_add_f32_e32(tmp[2], tmp[2], tmp[3])
             J.v_add_f32_e32(real_sum[i], tmp[0], tmp[2])
 
+        offset_max_sum = max_num_parts * 4
+        for i in range(gqa4):
+            m_token_id = gqa4 * warp_id + i
+            with J.ExecMask(m_token_id < GQA):
+                tmp = J.gpr("su32")
+                J.v_readfirstlane_b32(tmp, real_max[i])
+                J.s_store_dword(tmp, p_max_out, 0, mod="glc")
+                J.v_readfirstlane_b32(tmp, real_sum[i])
+                J.s_store_dword(tmp, p_sum_out, 0, mod="glc")
+                p_max_out[0] += offset_max_sum
+                p_sum_out[0] += offset_max_sum
+
         vout_low = J.gpr(S // 64 * 4 * 2, 'vf32')
         for k in range(S // 64):
             vout_low_4 = vout_low[k * 8 : k * 8 + 7]
@@ -138,7 +150,6 @@ def get_jit_kernel(HQ, # query heads
         J.s_barrier()
 
         offset_out = max_num_parts * (S * 2)
-        offset_max_sum = max_num_parts * 4
         for i in range(gqa4):
             m_token_id = gqa4 * warp_id + i
             with J.ExecMask(m_token_id < GQA):
@@ -171,15 +182,8 @@ def get_jit_kernel(HQ, # query heads
                 J.v_mul_f32(out_v[1], out_v[1], inv_sum_scale)
                 bf16x2 = J.gpr((out_v[1] & 0xffff0000) | (out_v[0] >> 16))
 
-                J.global_store_dword(lane_id << 2, bf16x2, p_out_seg)
-                tmp = J.gpr("su32")
-                J.v_readfirstlane_b32(tmp, real_max[i])
-                J.s_store_dword(tmp, p_max_out, 0, mod="glc")
-                J.v_readfirstlane_b32(tmp, real_sum[i])
-                J.s_store_dword(tmp, p_sum_out, 0, mod="glc")
+                J.global_store_dword(lane_id << 2, bf16x2, p_out_seg, mod='nt')
                 p_out_seg[0] += offset_out
-                p_max_out[0] += offset_max_sum
-                p_sum_out[0] += offset_max_sum
                 # J.s_waitcnt(mod=f"vmcnt(0)")
 
     @pyhip.jit("-g", kernel_suffix=f'{HQ=}-{HK=}-{S=}-{BLOCK_SIZE=}-{KV_PART_SIZE=}-SC={float_to_ieee754_bits_little(acc_scale):x}-DLOC={1 if debug_loc else 0}')
