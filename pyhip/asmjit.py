@@ -135,7 +135,7 @@ class GPRExpr:
     def __ge__(self, other):
         return GPRExpr("ge", self, other)
 
-    def overlap(self, other: Union['GPRExpr','GPRs']):
+    def overlap(self, other: Union['GPRExpr','GPRs'], fully_match = False):
         assert self.op == "getitem"
         if isinstance(other, GPRs):
             other = other[0:other.count-1]
@@ -150,6 +150,8 @@ class GPRExpr:
         first1 = gprs1.start_id + other.src1
         last1 = gprs1.start_id + other.src2
 
+        if fully_match:
+            return first1 == first0 and last0 == last1
         if first1 > last0 or first0 > last1:
             return False
         return True
@@ -250,8 +252,8 @@ class GPRs:
     def __len__(self):
         return self.count
 
-    def overlap(self, other: Union['GPRExpr','GPRs']):
-        return self[0:self.count-1].overlap(other)
+    def overlap(self, other: Union['GPRExpr','GPRs'], fully_match = False):
+        return self[0:self.count-1].overlap(other, fully_match)
 
     '''
     GPRs following AMDGPU's slicing rules instead of python:
@@ -449,6 +451,15 @@ class BasicBlock:
             else:
                 # unknown BB in the future
                 self.unsolved_successores.append(successor)
+
+    def debug_str(self):
+        asm = f"{self.label_name}:\t"
+        asm += f" ;BB#{self.bb_index}"
+        asm += f" predecessors:[{','.join([p.label_name for p in self.predecessors])}]"
+        asm += f" successors:[{','.join([p.label_name for p in self.successors])}]\n"
+        for i,inst in enumerate(self.instructions):
+            asm += f"\t /*{i}*/ {inst}\n"
+        return asm
 
     def __repr__(self):
         # https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html#Special-format-strings
@@ -1343,7 +1354,7 @@ class JIT:
                     expr_insts.append(inst)
             self.compile_bb_expr(bb, expr_insts)
 
-    def insert_nop(self):
+    def pass_insert_nop(self):
         for bb in self.blocks:
             i = 1
             while i < len(bb.instructions):
@@ -1640,7 +1651,7 @@ class JIT:
         self.s_waitcnt(mod="vmcnt(0)")
         self.Label(f"debug_log_skip_{log_index}")
 
-    def hide_dependency(self):
+    def pass_hide_dependency(self):
         # hide dependency between address calculation & ds_read/ds_write/global_load
         # by reorder instructions following the mem-access
         for bb in self.blocks:
@@ -1672,7 +1683,7 @@ class JIT:
                 i = i + 1
 
     # 前移一些ALU指令到加载kargs的s_waitcnt之前, kernel编写者需要手工把无关的valu指令放在整个kernel的最开始处
-    def hide_karg_loads(self):
+    def pass_hide_karg_loads(self):
         if len(self.blocks) == 0: return
 
         sgpr_loading = []
@@ -1707,13 +1718,186 @@ class JIT:
             if len(inst.operands):
                 sgpr_loading.append(inst.operands[0])
 
+    def pass_cse(self):
+        self.show_code()
+
+        # we limited CSE to following instructions because they are used by recursive expression generation.
+        # Result of these instructions can be reused w/o worry about side-effect.
+        # but any other instructions, although cannot be elimited, may update registers holding the reusable value,
+        # so any other instructions with it's 1st operand (most likely vdst)
+        # holding a value will destroy this reuable value (maybe over-react, but it's for correctness/safety reason)
+        #
+        cse_inst_list = [
+            "v_mov_b32",
+            "v_sub_",
+            "v_add_",
+            "v_mul_",
+            "v_lshlrev_b32",
+            "v_lshrrev_b32",
+            "v_ashrrev_i32",
+            "v_and_b32",
+            "v_or_b32",
+            "v_xor_b32",
+        ]
+        def is_cse_inst(inst):
+            for prefix in cse_inst_list:
+                if inst.opcode.startswith(prefix):
+                    return True
+            return False
+
+        reg_2_value_version = {}
+        def get_value_version(reg):
+            tag = repr(reg)
+            if tag not in reg_2_value_version:
+                reg_2_value_version[tag] = 0 # value-version
+            return reg_2_value_version[tag]
+
+        # any update to reg will create a new (versioned) value
+        def inc_value_version(reg):
+            tag = repr(reg)
+            if tag not in reg_2_value_version:
+                reg_2_value_version[tag] = 0 # value-version
+            else:
+                reg_2_value_version[tag] += 1 # increase version number
+            return reg_2_value_version[tag]
+
+        replace_index = 0
+        replace_limit = int(os.getenv("CSE_LIMIT", "999999"))
+        for bb in self.blocks:
+
+            reg_2_value_version = {}
+            value_table = {}
+
+            # to make following algo easier, we record the instruction number of each
+            # read & write to a register
+            reg_accesses = {}
+            def add_reg_access(r, time, rwtype):
+                key = repr(r)
+                if key not in reg_accesses:
+                    reg_accesses[key] = []
+                reg_accesses[key].append((time, rwtype))
+
+            def reg_access_last_read_from(r, time):
+                key = repr(r)
+                last_time = time
+                accesses = reg_accesses[key]
+                for t, rw in accesses:
+                    if t > time:
+                        if "r" in rw:
+                            last_time = t
+                        if "w" in rw:
+                            break
+                return last_time
+
+            def reg_access_next_write_to(r, time):
+                key = repr(r)
+                accesses = reg_accesses[key]
+                for t, rw in accesses:
+                    if t > time:
+                        if "w" in rw:
+                            return t
+                # no write, the value is always valid, return the max time
+                return len(bb.instructions)
+
+            def replace_vdst_with_exist(t_first, t_last_read, vdst, vexist):
+                key = repr(vdst)
+                accesses = reg_accesses[key]
+                for t, rw in accesses:
+                    if t >= t_first and t <= t_last_read and "r" in rw:
+                        inst = bb.instructions[t]
+                        print(f"found  {inst}")
+                        for i,op in enumerate(inst.operands):
+                            if isinstance(op, GPRExpr) or isinstance(op, GPRs):
+                                if vdst.overlap(op):
+                                    assert vdst.overlap(op, fully_match=True)
+                                    inst.operands[i] = vexist
+                                    print(f"\t {i} {op} {vexist}")
+                                
+
+            for t, inst in enumerate(bb.instructions):
+                if len(inst.operands) == 0: continue
+                # instruction may have multiple vdst/vsrc: v[4:7]
+                dst = inst.operands[0]
+                if isinstance(dst, GPRExpr) or isinstance(dst, GPRs):
+                    # Why "rw" instead of just "w" ?
+                    # we cannot be 100% sure that first operand is dst,
+                    # it may be a src too, let's be conservative
+                    for i in range(len(dst)):
+                        add_reg_access(dst[i], t, "rw")
+
+                for src in inst.operands[1:]:
+                    if isinstance(src, GPRExpr) or isinstance(src, GPRs):
+                        for i in range(len(src)):
+                            add_reg_access(src[i], t, "r")
+
+            removed_insts = []
+            for t, inst in enumerate(bb.instructions):
+                # live_value_numbering table:
+                #  - update existing vdst generates a new value : 
+                #       v2 = v1+v0;
+                #       v1 = 8;     <===== v1 has updated, with value number: v1.1
+                #       v3 = v1+v0; <===== this is not the same as v2
+                # 
+                if len(inst.operands) == 0: continue
+                vdst = inst.operands[0]
+
+                # invalidate previous value this vdst is holding
+                for k in list(value_table.keys()):
+                    v, version = value_table[k]
+                    if v is vdst and version < cur_version:
+                        del value_table[k]
+
+                # 
+                if is_cse_inst(inst):
+                    assert isinstance(vdst, GPRExpr) or isinstance(vdst, GPRs)
+                    cur_version = inc_value_version(vdst)
+
+                    # this key includes opcode & all input-values & modifiers
+                    src_ops = []
+                    for op in inst.operands[1:]:
+                        op_name = str(inst.op_repr(op))
+                        if isinstance(op, GPRExpr) or isinstance(op, GPRs):
+                            op_name += "." + str(get_value_version(op))
+                        src_ops.append(op_name)
+                    # the dependent inputs are versioned, to avoid mismatches when some inputs
+                    # may be updated with new value.
+                    key = f"{inst.opcode} {','.join(src_ops)} {inst.mod}"
+                    if key not in value_table:
+                        # first time a reusable value is generated in versioned vdst
+                        value_table[key] = [vdst, cur_version]
+                    else:
+                        vexist, version = value_table[key]
+                        # can we safely use this existing value?
+                        # we need to check life-cycle requirements:
+                        #   the last read from vdst happens before the next update(write) to vexist
+                        t_last_read = reg_access_last_read_from(vdst, t)
+                        t_next_update = reg_access_next_write_to(vexist, t)
+                        print(f"===========  {replace_index} / {replace_limit} ", 
+                              (t_next_update > t_last_read) and (replace_index < replace_limit))
+                        print(t, inst.loc, inst.debug_info, inst)
+                        print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
+                        print(f"{reg_accesses[repr(vdst)]}")
+                        if t_next_update > t_last_read and replace_index < replace_limit:
+                            removed_insts.append(t)
+                            replace_vdst_with_exist(t + 1, t_last_read, vdst, vexist)
+                        else:
+                            # we cannot safely reuse vexist, optionally we can add another vexist
+                            # so others may benefit
+                            pass
+                        replace_index += 1
+
+            # Eliminate
+            bb.instructions = [inst for t,inst in enumerate(bb.instructions) if t not in removed_insts]
+
+        self.show_code()
+
     def show_code(self):
         self.log("===================== bb")
         for bb in self.blocks:
-            self.log(repr(bb))
+            self.log(bb.debug_str())
         if self.current_bb is not None:
             self.log("===================== current_bb")
-            self.log(repr(self.current_bb))
+            self.log(bb.debug_str())
         
 
     def build(self, kernel_name, signature, extra_compiler_options, temp_filename, dump_stat):
@@ -1760,14 +1944,17 @@ class JIT:
         # use following way only
         # if we want to do multi-expression optimization (like common expr extraction...)
         # self.compile_expressions()
-        self.insert_nop()
+        self.pass_insert_nop()
 
         # for bb in self.blocks: print(repr(bb))
-        self.hide_dependency()
+        self.pass_hide_dependency()
 
         # kernel args are loaded with s_waitcnt, many v_ instructions can be
         # moved into this wait cycles
-        self.hide_karg_loads()
+        self.pass_hide_karg_loads()
+
+        # Common Subexpression Elimination，CSE
+        # self.pass_cse()
 
         self.register_allocation_linear_scan()
 
