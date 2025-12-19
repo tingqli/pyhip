@@ -1,9 +1,11 @@
 import os
 import random
+from typing import Optional
 os.environ['PYHIP_JIT_LOG'] = '1'
 import pyhip
 import torch
 import math
+from torch import Tensor
 
 from pyhip.asmjit import Addr2D, float_to_ieee754_bits_little
 torch.cuda.set_device(2)
@@ -20,6 +22,7 @@ def test_aiter(hidden_states,
                topk_ids,
                ):
     from aiter.fused_moe import fused_moe
+    # from aiter.fused_moe_bf16_asm import asm_moe_tkw1
     return fused_moe(
         hidden_states,
         w1,
@@ -55,7 +58,59 @@ topk_ids_base = torch.randperm(E, dtype=torch.int32)
 
 if 1:
     import aiter
-    test_aiter(hidden_states=hidden_states[0], w1=w1[0], w2=w2[0], topk_weight=topk_weight[0], topk_ids=topk_ids[0])
+
+    i = 0
+    for _ in range(10):
+        idx_start = random.randint(0, E - TOPK)
+        topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
+        with pyhip.cudaPerf(B * HIDDEN_SIZE * INTER_SIZE_TP * 2, B * (HIDDEN_SIZE * INTER_SIZE_TP * 3 * TOPK), name="moe"):
+            test_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i])
+        i = (i + 1) % BUF_COPY
+
+def my_ck_moe_stage2(
+    inter_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: Optional[str] = None,
+    w2_scale: Optional[Tensor] = None,
+    a2_scale: Optional[Tensor] = None,
+    block_m: Optional[int] = 32,
+    sorted_weights: Optional[Tensor] = None,
+    quant_type: int = 0,
+    activation: int = 0,
+) -> None:
+    print('my gemm2')
+    pass
+
+def my_ck_moe_stage1(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: Optional[str] = None,
+    w1_scale: Optional[Tensor] = None,
+    a1_scale: Optional[Tensor] = None,
+    block_m: Optional[int] = 32,
+    sorted_weights: Optional[Tensor] = None,
+    quant_type: int = 0,
+    activation: int = 0,
+):
+    print(f'my gemm1')
+
+if 1:
+    import aiter
+    aiter.ops.moe_op.ck_moe_stage2 = my_ck_moe_stage2
+    aiter.ops.moe_op.ck_moe_stage1 = my_ck_moe_stage1
+    print(f'\nprofile new moe...')
 
     i = 0
     for _ in range(10):
