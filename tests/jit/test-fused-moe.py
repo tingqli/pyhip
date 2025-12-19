@@ -116,26 +116,26 @@ def get_kernel(
 
                 # save 2 16x16 float to LDS
 
-                vaddr = J.gpr("vu32")
-                vaddr[0] = lds_base + warp_id * (16*32*sizeof_f32) + lane_mod_16 * (32*sizeof_f32) + lane_div_16*(4*sizeof_f32)
-                J.ds_write_b128(vaddr, Creg[0])
-                J.ds_write_b128(vaddr, Creg[1], mod=f"offset:{16*sizeof_f32}")
+            vaddr = J.gpr("vu32")
+            vaddr[0] = lds_base + warp_id * (16*32*sizeof_f32) + lane_mod_16 * (32*sizeof_f32) + lane_div_16*(4*sizeof_f32)
+            J.ds_write_b128(vaddr, Creg[0])
+            J.ds_write_b128(vaddr, Creg[1], mod=f"offset:{16*sizeof_f32}")
 
-                J.s_barrier()
-                # each wave reduce 4 rows
-                vrow = J.gpr(lane_div_16 + warp_id*4)
-                vaddr[0] = lds_base + vrow * (32*sizeof_f32) + lane_mod_16*(2*sizeof_f32)
-                gate_up = J.gpr(4, 2, "vf32")
-                J.ds_read_b64(gate_up[0], vaddr, mod=f"offset:{0*(16*32*sizeof_f32)}") # 4x16 dword2
-                J.ds_read_b64(gate_up[1], vaddr, mod=f"offset:{1*(16*32*sizeof_f32)}")
-                J.ds_read_b64(gate_up[2], vaddr, mod=f"offset:{2*(16*32*sizeof_f32)}")
-                J.ds_read_b64(gate_up[3], vaddr, mod=f"offset:{3*(16*32*sizeof_f32)}")
+            J.s_barrier()
+            # each wave reduce 4 rows
+            vrow = J.gpr(lane_div_16 + warp_id*4)
+            vaddr[0] = lds_base + vrow * (32*sizeof_f32) + lane_mod_16*(2*sizeof_f32)
+            gate_up = J.gpr(4, 2, "vf32")
+            J.ds_read_b64(gate_up[0], vaddr, mod=f"offset:{0*(16*32*sizeof_f32)}") # 4x16 dword2
+            J.ds_read_b64(gate_up[1], vaddr, mod=f"offset:{1*(16*32*sizeof_f32)}")
+            J.ds_read_b64(gate_up[2], vaddr, mod=f"offset:{2*(16*32*sizeof_f32)}")
+            J.ds_read_b64(gate_up[3], vaddr, mod=f"offset:{3*(16*32*sizeof_f32)}")
 
-                J.s_waitcnt(mod=f"lgkmcnt(2)")
-                J.v_pk_add_f32(gate_up[0], gate_up[0], gate_up[1])
-                J.s_waitcnt(mod=f"lgkmcnt(0)")
-                J.v_pk_add_f32(gate_up[2], gate_up[2], gate_up[3])
-                J.v_pk_add_f32(gate_up[0], gate_up[0], gate_up[2])
+            J.s_waitcnt(mod=f"lgkmcnt(2)")
+            J.v_pk_add_f32(gate_up[0], gate_up[0], gate_up[1])
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.v_pk_add_f32(gate_up[2], gate_up[2], gate_up[3])
+            J.v_pk_add_f32(gate_up[0], gate_up[0], gate_up[2])
             # apply activation
             # gate_up[0]
             if with_silu:
@@ -186,10 +186,10 @@ def get_kernel(
 
     return moe_gemm_kernel, (64*4) if use_split_K else (64)
 
-with_silu = 0
-
-M,K,N = 15,2048,192*8
-M,K,N = 1,96,17920
+# gate-up(12~13us)
+with_silu, M,K,N  = 1,1,2048,192*8
+# down(6~7us)
+with_silu, M,K,N, = 0,1,96,2048*8
 gateup_kernel, wg_size = get_kernel(K, N, with_silu)
 
 input = (torch.randn(M, K, dtype=torch.bfloat16) + 1)*0.01
@@ -222,7 +222,7 @@ assert N % 32 == 0
 for i in range(10,20):
     di = i % len(layers)
     input, weight, res = layers[di]
-    with pyhip.cudaPerf(M*N*K*2, name=f"gateup_kernel-{di}"):
+    with pyhip.cudaPerf(M*N*K*2, name=f"gateup_kernel-{di} {with_silu=} {wg_size=}"):
         gateup_kernel([N//32],[wg_size], input.data_ptr(), weight.data_ptr(), res.data_ptr(), M)
 
 ref_out = output_ref.to(torch.float)
@@ -235,6 +235,7 @@ if not torch.allclose(ref_out, res, rtol=0.02, atol=0.02):
     assert 0
 else:
     print("acc OK")
+
 # jit = pyhip.JIT()
 # kernel(jit)
 # kernel = jit.build("test(int* p, int K)")
