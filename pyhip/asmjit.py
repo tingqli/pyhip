@@ -5,6 +5,10 @@ import inspect
 import os
 from contextlib import contextmanager
 
+def get_caller_loc():
+    frame = inspect.currentframe().f_back.f_back
+    return f" {os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
     def __init__(self, parent_bb:'BasicBlock', opcode, loc=""):
@@ -28,7 +32,7 @@ class Instruction:
                 dtype = op.find_dtype()
                 dst_gprs = jit.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
                 dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
-                jit.recursive_expr_gen(self.parent_bb, dst_expr, op, loc=inspect.currentframe().f_back.f_lineno)
+                jit.recursive_expr_gen(self.parent_bb, dst_expr, op, loc=self.loc)
                 self.operands[i] = dst_expr
 
             assert isinstance(op, GPRExpr) or \
@@ -181,7 +185,7 @@ class GPRExpr:
         dst = self[key]
         #inst = Instruction(gprs.jit.current_bb, "expression_place_holder")
         #inst(dst, value)
-        gprs.jit.recursive_expr_gen(gprs.jit.current_bb, dst, value, loc=inspect.currentframe().f_back.f_lineno)
+        gprs.jit.recursive_expr_gen(gprs.jit.current_bb, dst, value, loc=get_caller_loc())
 
     def find_dtype(self):
         if self.op == "getitem":
@@ -307,7 +311,7 @@ class GPRs:
         dst = self[key]
         #inst = Instruction(self.jit.current_bb, "expression_place_holder")
         #inst(dst, value)
-        self.jit.recursive_expr_gen(self.jit.current_bb, dst, value, loc=inspect.currentframe().f_back.f_lineno)
+        self.jit.recursive_expr_gen(self.jit.current_bb, dst, value, loc=get_caller_loc())
         # expression_place_holder will be compiled later when all program is ready
         # all expressions within same BB can be processed together
 
@@ -458,7 +462,7 @@ class BasicBlock:
         asm += f" predecessors:[{','.join([p.label_name for p in self.predecessors])}]"
         asm += f" successors:[{','.join([p.label_name for p in self.successors])}]\n"
         for i,inst in enumerate(self.instructions):
-            asm += f"\t /*{i}*/ {inst}\n"
+            asm += f"\t /*{i} #{inst.loc} */ {inst}\n"
         return asm
 
     def __repr__(self):
@@ -561,6 +565,7 @@ def get_perm_pattern_8(J):
     trans_high2[0] = 0x03_02_07_06
     return trans_low1, trans_high1, trans_low2, trans_high2
 
+
 # JIT emits instructions into BBs
 all_kernel_hip_src_names = {}
 class JIT:
@@ -580,7 +585,7 @@ class JIT:
     def __getattr__(self, instruction):
         if self.current_bb is None:
             self.current_bb = BasicBlock(self, label_name="")
-        return Instruction(self.current_bb, instruction, loc=inspect.currentframe().f_back.f_lineno)
+        return Instruction(self.current_bb, instruction, loc=get_caller_loc())
 
     def _finish_bb(self, bb):
         if bb is None:
@@ -608,6 +613,20 @@ class JIT:
             color1 = f"\033[0m"
             print(color0, f"[{PYHIP_JIT_LOG=}] ", *args, color1, **kwargs)
 
+    def debug_print(self, *args, **kwargs):
+        # caller's function name must be
+        caller_name = inspect.currentframe().f_back.f_code.co_name
+        PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
+        for item in PYHIP_DEBUG_LOG.split(":"):
+            if item == "":continue
+            if item in caller_name or item == "*":
+                color_id = 3
+                color0 = f"\033[0;{30+(color_id % 8)}m"
+                color1 = f"\033[0m"
+                print(color0, f"[PYHIP_DEBUG_LOG: {caller_name}] ", *args, color1, **kwargs)
+                return True
+        return False
+
     def Buffer(self, sgpr_base, sgpr_size):
         buff = Buffer(self)
         buff.setup(sgpr_base, sgpr_size)
@@ -624,7 +643,7 @@ class JIT:
             dtype = cond.find_dtype()
             dst_gprs = self.new_gpr("s", 1, dtype=dtype, align=1, name="")
             dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
-            self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=inspect.currentframe().f_back.f_lineno)
+            self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=get_caller_loc())
             # optimize 
             last_inst = self.current_bb.instructions[-1]
             if last_inst.opcode == "s_mov_b32" and \
@@ -684,7 +703,7 @@ class JIT:
         dtype = cond.find_dtype()
         dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
         dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
-        self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=inspect.currentframe().f_back.f_lineno)
+        self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=get_caller_loc())
         last_inst = self.current_bb.instructions[-1]
         if dst_is_exec:
             # use v_cmpx_
@@ -1719,8 +1738,35 @@ class JIT:
                 sgpr_loading.append(inst.operands[0])
 
     def pass_cse(self):
-        self.show_code()
+        debug_enabled = self.debug_print()
+        if debug_enabled:
+            self.show_code()
 
+        def is_gpr(op):
+            return isinstance(op, GPRs) or isinstance(op, GPRExpr)
+
+        # check GPRs, only GPRs which written only once (SSA) can be optimized by CSE pass
+        # in addition, these GPRs can live across BasicBlock boundary
+        gpr_update_count = {}
+        for bb in self.blocks:
+            for t, inst in enumerate(bb.instructions):
+                for index, gpr in enumerate(inst.operands):
+                    if is_gpr(gpr):
+                        for i in range(len(gpr)):
+                            key = repr(gpr[i])
+                            if key not in gpr_update_count:
+                                gpr_update_count[key] = 0
+                            if index == 0: # vdst
+                                gpr_update_count[key] += 1
+        ssa_gpr = []
+        for k,update_cnt in gpr_update_count.items():
+            if update_cnt <= 1:
+                ssa_gpr.append(k)
+
+        # TODO: if some ssa gpr also only depends on ssa gpr(like threadIdx.x),
+        # it means their value can exist across BB boundary
+
+        self.log("pass_cse: ", f"{ssa_gpr=}")
         # we limited CSE to following instructions because they are used by recursive expression generation.
         # Result of these instructions can be reused w/o worry about side-effect.
         # but any other instructions, although cannot be elimited, may update registers holding the reusable value,
@@ -1805,14 +1851,13 @@ class JIT:
                 for t, rw in accesses:
                     if t >= t_first and t <= t_last_read and "r" in rw:
                         inst = bb.instructions[t]
-                        print(f"found  {inst}")
+                        if debug_enabled: print(f"found  {inst}")
                         for i,op in enumerate(inst.operands):
-                            if isinstance(op, GPRExpr) or isinstance(op, GPRs):
+                            if is_gpr(op):
                                 if vdst.overlap(op):
                                     assert vdst.overlap(op, fully_match=True)
                                     inst.operands[i] = vexist
-                                    print(f"\t {i} {op} {vexist}")
-                                
+                                    if debug_enabled: print(f"\t {i} {op} {vexist}")
 
             for t, inst in enumerate(bb.instructions):
                 if len(inst.operands) == 0: continue
@@ -1840,6 +1885,8 @@ class JIT:
                 # 
                 if len(inst.operands) == 0: continue
                 vdst = inst.operands[0]
+                if not is_gpr(vdst):
+                    continue
 
                 # invalidate previous value this vdst is holding
                 for k in list(value_table.keys()):
@@ -1847,16 +1894,17 @@ class JIT:
                     if v is vdst and version < cur_version:
                         del value_table[k]
 
-                # 
-                if is_cse_inst(inst):
-                    assert isinstance(vdst, GPRExpr) or isinstance(vdst, GPRs)
+                # all dst gprs must be valid (only written once)
+                is_valid_gpr = all([repr(vdst[i]) in ssa_gpr for i in range(len(vdst))])
+                if is_cse_inst(inst) and is_valid_gpr:
+                    assert is_gpr(vdst)
                     cur_version = inc_value_version(vdst)
 
                     # this key includes opcode & all input-values & modifiers
                     src_ops = []
                     for op in inst.operands[1:]:
                         op_name = str(inst.op_repr(op))
-                        if isinstance(op, GPRExpr) or isinstance(op, GPRs):
+                        if is_gpr(op):
                             op_name += "." + str(get_value_version(op))
                         src_ops.append(op_name)
                     # the dependent inputs are versioned, to avoid mismatches when some inputs
@@ -1872,11 +1920,12 @@ class JIT:
                         #   the last read from vdst happens before the next update(write) to vexist
                         t_last_read = reg_access_last_read_from(vdst, t)
                         t_next_update = reg_access_next_write_to(vexist, t)
-                        print(f"===========  {replace_index} / {replace_limit} ", 
-                              (t_next_update > t_last_read) and (replace_index < replace_limit))
-                        print(t, inst.loc, inst.debug_info, inst)
-                        print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
-                        print(f"{reg_accesses[repr(vdst)]}")
+                        if debug_enabled:
+                            print(f"===========  {replace_index} / {replace_limit} ", 
+                                (t_next_update > t_last_read) and (replace_index < replace_limit))
+                            print(t, inst.loc, inst.debug_info, inst)
+                            print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
+                            print(f"{reg_accesses[repr(vdst)]}")
                         if t_next_update > t_last_read and replace_index < replace_limit:
                             removed_insts.append(t)
                             replace_vdst_with_exist(t + 1, t_last_read, vdst, vexist)
@@ -1888,8 +1937,8 @@ class JIT:
 
             # Eliminate
             bb.instructions = [inst for t,inst in enumerate(bb.instructions) if t not in removed_insts]
-
-        self.show_code()
+        if debug_enabled:
+            self.show_code()
 
     def show_code(self):
         self.log("===================== bb")
@@ -1897,7 +1946,7 @@ class JIT:
             self.log(bb.debug_str())
         if self.current_bb is not None:
             self.log("===================== current_bb")
-            self.log(bb.debug_str())
+            self.log(self.current_bb.debug_str())
         
 
     def build(self, kernel_name, signature, extra_compiler_options, temp_filename, dump_stat):
@@ -1954,7 +2003,7 @@ class JIT:
         self.pass_hide_karg_loads()
 
         # Common Subexpression Elimination，CSE
-        # self.pass_cse()
+        self.pass_cse()
 
         self.register_allocation_linear_scan()
 
@@ -1993,8 +2042,10 @@ class JIT:
             print(self.asm_debug_info)
             print(color1)
         used_gprs = []
+        artifact = {"asm":[]}
         for a in asm.splitlines():
             if a[0] == ";": continue
+            artifact["asm"].append(a)
             for op in a.replace(","," ").split()[1:]:
                 if (op.startswith("s") or op.startswith("v") or op.startswith("a")) and (op[1].isdigit()):
                     gpr_type = op[0]
@@ -2063,9 +2114,10 @@ r'''
         with open(cpp_src_fpath, 'w', encoding='utf-8') as f:
             f.write(hip_src)
 
-        return self.compile(kernel_name, cpp_src_fpath, extra_compiler_options)
+        artifact["used_gprs"] = used_gprs
+        return self.compile(kernel_name, cpp_src_fpath, extra_compiler_options, artifact)
 
-    def compile(self, kernel_name, cpp_src_fpath, extra_compiler_options):
+    def compile(self, kernel_name, cpp_src_fpath, extra_compiler_options, artifact):
         hip = module(cpp_src_fpath, extra_compiler_options)
         hip_func = getattr(hip, kernel_name)
         # attach debug_log member function & data to hip_func
@@ -2123,6 +2175,7 @@ r'''
         from functools import partial
         hip_func.get_logs = partial(get_logs, hip_func, self.debug_log_info)
         hip_func.log_ptr = partial(log_ptr, hip_func)
+        hip_func.artifact = artifact
         
         return hip_func
 
