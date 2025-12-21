@@ -5,9 +5,17 @@ import inspect
 import os
 from contextlib import contextmanager
 
+from .mem_allocator import SimpleMemoryAllocator
+
 def get_caller_loc():
     frame = inspect.currentframe().f_back.f_back
-    return f" {os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+    loc = ""
+    while True:
+        loc += f" {os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+        if frame.f_code.co_filename != __file__:
+            break
+        frame = frame.f_back
+    return loc
 
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
@@ -74,6 +82,32 @@ class GPRExpr:
         if self.op == "getitem":
             return self.src2 - self.src1 + 1
         return None
+
+    def __iter__(self):
+        assert self.op == "getitem"
+        gprs = self.src0
+        for i in range(self.src1, self.src2 + 1):
+            yield GPRExpr("getitem", gprs, i, i)
+
+    def split_const_terms(self):
+        const_terms = 0
+        cur_expr = self
+        while True:
+            if cur_expr.op == "+":
+                if isinstance(cur_expr.src0, int):
+                    const_terms += self.src0
+                    cur_expr = cur_expr.src1
+                    continue
+                if isinstance(cur_expr.src1, int):
+                    const_terms += self.src1
+                    cur_expr = cur_expr.src0
+                    continue
+            if cur_expr.op == "-" and isinstance(cur_expr.src1, int):
+                const_terms -= self.src1
+                cur_expr = cur_expr.src0
+                continue
+            break
+        return const_terms, cur_expr
 
     def __add__(self, other):
         return GPRExpr("+", self, other)
@@ -255,6 +289,10 @@ class GPRs:
 
     def __len__(self):
         return self.count
+
+    def __iter__(self):
+        for i in range(self.count):
+            yield GPRExpr("getitem", self, i, i)
 
     def overlap(self, other: Union['GPRExpr','GPRs'], fully_match = False):
         return self[0:self.count-1].overlap(other, fully_match)
@@ -565,6 +603,89 @@ def get_perm_pattern_8(J):
     trans_high2[0] = 0x03_02_07_06
     return trans_low1, trans_high1, trans_low2, trans_high2
 
+class LDSTensor:
+    def __init__(self, J, shape, dtype):
+        self.J = J
+        self.shape = shape
+        stride_bytes = [dtype.itemsize]
+        for i,dim in enumerate(reversed(shape)):
+            cur = dim * stride_bytes[-1]
+            stride_bytes.append(cur)
+        self.size_bytes = stride_bytes[-1]
+        self.stride_bytes = list(reversed(stride_bytes))[1:]
+        self.dtype = dtype
+        self.lds_base = self.J.alloc_lds(self.size_bytes)
+
+    def __del__(self):
+        self.J.free_lds(self.lds_base)
+
+    def read(self, dtype:str, vdst, *coord_exprs, offset1=None):
+        self._access("read", dtype, vdst, *coord_exprs, offset1=offset1)
+
+    def write(self, dtype:str, vdst, *coord_exprs, offset1=None):
+        self._access("write", dtype, vdst, *coord_exprs, offset1=offset1)
+
+    def _access(self, op_name, dtype:str, vdst, *coord_exprs, offset1=None):
+        # extract const part
+        const_terms = 0
+        exprs = []
+        for i, ep in enumerate(coord_exprs):
+            if isinstance(ep, int):
+                const = ep
+                nc_ep = None
+            else:
+                # assert isinstance(ep,GPRExpr)
+                const, nc_ep = ep.split_const_terms()
+            const_terms += const*self.stride_bytes[i]
+            exprs.append(nc_ep)
+
+        # combine non-const part
+        for i, ep in enumerate(exprs):
+            if ep is None: continue
+            if i == 0:
+                cur_expr = ep * self.stride_bytes[i]
+            else:
+                cur_expr = cur_expr + ep * self.stride_bytes[i]
+
+        # mapping const part to offset
+        if offset1 is not None:
+            if const_terms < 0:
+                offset0 = 0
+                cur_expr = cur_expr + const_terms
+            else:
+                if const_terms + offset1 <= 0xFF:
+                    offset0 = const_terms
+                    offset1 = const_terms + offset1
+                else:
+                    offset0 = 0
+                    cur_expr = cur_expr + const_terms
+            assert offset0 <= 0xFF and offset0 >= 0
+            assert offset1 <= 0xFF and offset1 >= 0
+            mod = f"offset0:{offset0} offset1:{offset1}"
+            tag2 = "2"
+        else:
+            if const_terms < 0:
+                offset0 = 0
+                cur_expr = cur_expr + const_terms
+            else:
+                if const_terms < 64*1024:
+                    offset0 = const_terms
+                else:
+                    offset0 = 0
+                    cur_expr = cur_expr + const_terms
+            assert offset0 >= 0 and offset0 < 64*1024
+            mod = f"offset:{offset0}"
+            tag2 = ""
+
+        loc = get_caller_loc()
+        dst_gprs = self.J.gpr("vu32")
+        self.J.recursive_expr_gen(self.J.current_bb, dst_gprs[0], cur_expr, loc=loc)
+        if op_name == "read":
+            getattr(self.J, f"ds_{op_name}{tag2}_{dtype}")(vdst, dst_gprs[0], mod=mod)
+        elif op_name == "write":
+            getattr(self.J, f"ds_{op_name}{tag2}_{dtype}")(dst_gprs[0], vdst, mod=mod)
+        else:
+            assert 0, op_name
 
 # JIT emits instructions into BBs
 all_kernel_hip_src_names = {}
@@ -573,7 +694,6 @@ class JIT:
         self.blocks = []
         # increased freely
         self.free_gpr_id = {'s':0, 'v':0, 'a': 0}
-        self.free_lds_offset = 0
         self.label2bb = {}
         self.current_bb = BasicBlock(self, "_jit_main")
         self.relocatable_gprs = []
@@ -581,6 +701,7 @@ class JIT:
         self.debug_log_info = []
         self.mark_idx = 0
         self.debug_cond_sgpr = None
+        self.lds_allocator = SimpleMemoryAllocator(160*1024)
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -1169,18 +1290,23 @@ class JIT:
         dst_gprs = dst_expr.src0
         dst_idx0 = dst_expr.src1
         dst_idx1 = dst_expr.src2
-        if dst_idx1 - dst_idx0 + 1 > 1:
-            self.special_expr_64bits(bb, dst_expr, expr, loc)
-            return
-        assert dst_idx1 == dst_idx0
+
+        # assign constant(float or int) to multiple VGPRs
         rtype = dst_gprs.rtype
         dtype = dst_gprs.dtype
         if isinstance(expr, float):
             expr = float_to_ieee754_bits_little(expr)
         if isinstance(expr, int):
-            new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
-            new_inst(dst_expr, expr)
+            for dst in dst_expr:
+                new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
+                new_inst(dst, expr)
             return
+
+        if dst_idx1 - dst_idx0 + 1 > 1:
+            self.special_expr_64bits(bb, dst_expr, expr, loc)
+            return
+        assert dst_idx1 == dst_idx0
+
         if isinstance(expr, GPRs):
             expr = expr.to_expr()
         assert isinstance(expr, GPRExpr)
@@ -1539,10 +1665,14 @@ class JIT:
         return float_to_ieee754_bits_little(f)
 
     def alloc_lds(self, num_bytes, align=4):
-        # aways alloc, no free
-        offset = ((self.free_lds_offset + align - 1)//align) * align
-        self.free_lds_offset = offset + num_bytes
+        offset = self.lds_allocator.malloc(num_bytes, align)
         return offset
+
+    def free_lds(self, offset):
+        self.lds_allocator.free(offset)
+
+    def LDSTensor(self, shape, dtype):
+        return LDSTensor(self, shape, dtype)
 
     def debug_setup(self, log_ptr:GPRs, cond:GPRExpr):
         self.debug_log_ptr = log_ptr
@@ -1745,22 +1875,48 @@ class JIT:
         def is_gpr(op):
             return isinstance(op, GPRs) or isinstance(op, GPRExpr)
 
-        # check GPRs, only GPRs which written only once (SSA) can be optimized by CSE pass
-        # in addition, these GPRs can live across BasicBlock boundary
-        gpr_update_count = {}
-        for bb in self.blocks:
+        # check GPRs, GPRs can be optimized by CSE pass
+        #   - written only once
+        #   - accessed by 1 BB only
+        #   - being read after written
+        #
+        def vdst_operand_id(inst):
+            opcode = inst.opcode
+            mod = inst.mod
+            if opcode.startswith("buffer_load_") and "lds" in mod:
+                return -1
+            if opcode.startswith("ds_write") or \
+                opcode.startswith("global_store") or \
+                opcode.startswith("global_load_lds_") or \
+                opcode.startswith("flat_store_") or \
+                opcode.startswith("scratch_load_lds_") or \
+                opcode.startswith("buffer_store_"):
+                return -1
+            return 0
+
+        gpr_info = {}
+        for bb_id, bb in enumerate(self.blocks):
             for t, inst in enumerate(bb.instructions):
+                vdst_index = vdst_operand_id(inst)
                 for index, gpr in enumerate(inst.operands):
                     if is_gpr(gpr):
-                        for i in range(len(gpr)):
-                            key = repr(gpr[i])
-                            if key not in gpr_update_count:
-                                gpr_update_count[key] = 0
-                            if index == 0: # vdst
-                                gpr_update_count[key] += 1
+                        for i, r in enumerate(gpr):
+                            key = repr(r)
+                            if key not in gpr_info:
+                                gpr_info[key] = {"wr":"","bbs":set()}
+                            gpr_info[key]["bbs"].add(bb_id)
+                            if index == vdst_index:
+                                gpr_info[key]["wr"] += "w"
+                            else:
+                                gpr_info[key]["wr"] += "r"
         ssa_gpr = []
-        for k,update_cnt in gpr_update_count.items():
-            if update_cnt <= 1:
+        for k,info in gpr_info.items():
+            wr = info["wr"]
+            bbs = info["bbs"]
+            if len(bbs) == 1 and \
+                len(wr) > 0 and \
+                wr[0] == "w" and \
+                wr.count("w") == 1:
                 ssa_gpr.append(k)
 
         # TODO: if some ssa gpr also only depends on ssa gpr(like threadIdx.x),
@@ -1808,7 +1964,7 @@ class JIT:
             return reg_2_value_version[tag]
 
         replace_index = 0
-        replace_limit = int(os.getenv("CSE_LIMIT", "999999"))
+        CSE_LIMIT = int(os.getenv("CSE_LIMIT", "999999"))
         for bb in self.blocks:
 
             reg_2_value_version = {}
@@ -1867,13 +2023,13 @@ class JIT:
                     # Why "rw" instead of just "w" ?
                     # we cannot be 100% sure that first operand is dst,
                     # it may be a src too, let's be conservative
-                    for i in range(len(dst)):
-                        add_reg_access(dst[i], t, "rw")
+                    for r in dst:
+                        add_reg_access(r, t, "rw")
 
                 for src in inst.operands[1:]:
                     if isinstance(src, GPRExpr) or isinstance(src, GPRs):
-                        for i in range(len(src)):
-                            add_reg_access(src[i], t, "r")
+                        for r in src:
+                            add_reg_access(r, t, "r")
 
             removed_insts = []
             for t, inst in enumerate(bb.instructions):
@@ -1895,7 +2051,7 @@ class JIT:
                         del value_table[k]
 
                 # all dst gprs must be valid (only written once)
-                is_valid_gpr = all([repr(vdst[i]) in ssa_gpr for i in range(len(vdst))])
+                is_valid_gpr = all([repr(r) in ssa_gpr for r in vdst])
                 if is_cse_inst(inst) and is_valid_gpr:
                     assert is_gpr(vdst)
                     cur_version = inc_value_version(vdst)
@@ -1921,12 +2077,12 @@ class JIT:
                         t_last_read = reg_access_last_read_from(vdst, t)
                         t_next_update = reg_access_next_write_to(vexist, t)
                         if debug_enabled:
-                            print(f"===========  {replace_index} / {replace_limit} ", 
-                                (t_next_update > t_last_read) and (replace_index < replace_limit))
+                            print(f"===========  {replace_index} / {CSE_LIMIT=} ", 
+                                (t_next_update > t_last_read) and (replace_index < CSE_LIMIT))
                             print(t, inst.loc, inst.debug_info, inst)
                             print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
                             print(f"{reg_accesses[repr(vdst)]}")
-                        if t_next_update > t_last_read and replace_index < replace_limit:
+                        if t_next_update > t_last_read and replace_index < CSE_LIMIT:
                             removed_insts.append(t)
                             replace_vdst_with_exist(t + 1, t_last_read, vdst, vexist)
                         else:
@@ -2085,12 +2241,12 @@ class JIT:
         self.log(f" kernel: {kernel_name}{signature}  used_gprs={used_gprs}")
 
         decl_lds = ""
-        if self.free_lds_offset > 0:
+        if self.lds_allocator.upper_bound() > 0:
             # (as3_uint32_ptr)(lds_buffer) is always 0
             # but this 2 lines of code has side effect: compiler may use s0 as `lds_buffer`` input 
             # which causes damage to kernal-arg pointer s[0:1], we can work-around it by putting
             # these 2 lines of codes at the end of the kernel's source code.
-            decl_lds += f"    __shared__ uint lds_buffer[{self.free_lds_offset//4}];\n"
+            decl_lds += f"    __shared__ uint lds_buffer[{self.lds_allocator.upper_bound()//4}];\n"
             decl_lds += f'    asm(" ; lds_buffer %0 "::"s"((as3_uint32_ptr)(lds_buffer)));'
             pass
 
@@ -2178,6 +2334,12 @@ r'''
         hip_func.artifact = artifact
         
         return hip_func
+
+    def div_up(self, x, y):
+        return (x + y - 1) // y
+
+    def round_up(self, x, y):
+        return self.div_up(x, y) * y
 
     '''
     reduce("v_max_f32", vinput)
@@ -2344,7 +2506,7 @@ class jit:
         # check if cache is available
         cpp_path = f'{prefix_name}.cpp'
         if not self.force_recompile and os.path.isfile(cpp_path) and os.path.getmtime(cpp_path) > os.path.getmtime(file_info):
-            return J.compile(func_name, cpp_path, self.extra_compiler_options)
+            return J.compile(func_name, cpp_path, self.extra_compiler_options, {})
 
         # create special sgpr for args
         # and generate codes to load these args
