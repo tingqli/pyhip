@@ -2117,7 +2117,7 @@ r'''
         artifact["used_gprs"] = used_gprs
         return self.compile(kernel_name, cpp_src_fpath, extra_compiler_options, artifact)
 
-    def compile(self, kernel_name, cpp_src_fpath, extra_compiler_options, artifact):
+    def compile(self, kernel_name, cpp_src_fpath, extra_compiler_options, artifact=None):
         hip = module(cpp_src_fpath, extra_compiler_options)
         hip_func = getattr(hip, kernel_name)
         # attach debug_log member function & data to hip_func
