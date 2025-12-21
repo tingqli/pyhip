@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#define INTERLEAVE_ACCESS 0
 using float16x8 = __fp16 __attribute__ ((ext_vector_type(8)));
 using float32x4 = float  __attribute__ ((ext_vector_type(4)));
 
@@ -39,15 +40,28 @@ __global__ void __launch_bounds__(256, 1) run_mfma(__fp16* A_ptr, __fp16* B_ptr,
     float16x8 a[REG_M];
     float16x8 b[REG_N];
     float32x4 c[REG_M*REG_N] = {0};
+    #pragma unroll
     for(int m = 0; m < REG_M; m++) {
+#if INTERLEAVE_ACCESS
+        a[m] = *(float16x8*)(A_warp + (rowid*REG_M + m)*K + colid*8);
+#else
         a[m] = *(float16x8*)(A_warp + (rowid + m*16)*K + colid*8);
+#endif
+
     }
+    #pragma unroll
     for(int n = 0; n < REG_N; n++) {
-        b[n] = *(float16x8*)(B_warp + (rowid + n*16)*K + colid*8);
+#if INTERLEAVE_ACCESS
+     b[n] = *(float16x8*)(B_warp + (rowid*REG_N + n)*K + colid*8);
+#else
+    b[n] = *(float16x8*)(B_warp + (rowid + n*16)*K + colid*8);
+#endif
     }
 
     // for(int k = 0; k < K; k += BK) {
+        #pragma unroll
         for(int m = 0; m < REG_M; m++) {
+            #pragma unroll
             for(int n = 0; n < REG_N; n++) {
                 auto i = m*REG_N + n;
                 // amdgcn_mfma_f32_16x16x16bf16(a[m].lo, b[n].lo, c[i]);
@@ -58,11 +72,22 @@ __global__ void __launch_bounds__(256, 1) run_mfma(__fp16* A_ptr, __fp16* B_ptr,
             }
         }
     // }
-
+    #pragma unroll
     for(int m = 0; m < REG_M; m++) {
+        #pragma unroll
         for(int n = 0; n < REG_N; n++) {
             auto idx = m*REG_N + n;
             auto& v = c[idx];
+#if INTERLEAVE_ACCESS
+            float* p0 = C_warp + (m+ colid*4*REG_M)*N + n + rowid*REG_N;
+            *p0= v[0];
+            p0 += REG_M*N;
+            *p0 = v[1];
+            p0 += REG_M*N;
+            *p0 = v[2];
+            p0 += REG_M*N;
+            *p0 = v[3];
+#else
             float* p0 = C_warp + (m*16+ colid*4)*N + n*16+rowid;
             *p0= v[0];
             p0 += N;
@@ -71,6 +96,7 @@ __global__ void __launch_bounds__(256, 1) run_mfma(__fp16* A_ptr, __fp16* B_ptr,
             *p0 = v[2];
             p0 += N;
             *p0 = v[3];
+#endif
         }
     }
 }
