@@ -1,5 +1,7 @@
 from functools import cache
 from typing import List, Optional, Set, Union
+
+import filelock
 from .hiptools import module
 import inspect
 import os
@@ -2505,49 +2507,51 @@ class jit:
         J = JIT()
         # check if cache is available
         cpp_path = f'{prefix_name}.cpp'
-        if not self.force_recompile and os.path.isfile(cpp_path) and os.path.getmtime(cpp_path) > os.path.getmtime(file_info):
-            return J.compile(func_name, cpp_path, self.extra_compiler_options, {})
 
-        # create special sgpr for args
-        # and generate codes to load these args
-        signatures = []
-        sgpr_args = []
-        J.kargs = J.new_gpr('s',[0,1],dtype="u32",name="kargs")
-        J.threadIdx = Idx3D()
-        J.blockIdx = Idx3D()
-        J.threadIdx.x = J.new_gpr('v',[0,0], dtype="u32", name="threadIdx.x")
-        J.blockIdx.x = J.new_gpr('s',[2,2], dtype="u32", name="blockIdx.x")
-        J.blockIdx.y = J.new_gpr('s',[3,3], dtype="u32", name="blockIdx.y")
-        J.blockIdx.z = J.new_gpr('s',[4,4], dtype="u32", name="blockIdx.z")
-        arg_offset = 0
-        for arg_name in argspec.args[1:]:
-            assert arg_name in argtypes
-            atype = argtypes[arg_name].strip()
-            assert isinstance(atype, str)
-            signatures.append(f"{atype} {arg_name}")
-            if atype.endswith("*"):
-                arg_offset = ((arg_offset + 7) // 8) * 8
-                sgpr = J.new_gpr('s',2, dtype="u32", align=2, name=arg_name)
-                J.s_load_dwordx2(sgpr, J.kargs, arg_offset)
-                sgpr_args.append(sgpr)
-                arg_offset += 8
-                continue
-            if atype in ["int","uint","unsigned int"]:
-                arg_offset = ((arg_offset + 3) // 4) * 4
-                sgpr = J.new_gpr('s',1, dtype=f"{atype[0]}32", align=1, name=arg_name)
-                J.s_load_dword(sgpr, J.kargs, arg_offset)
-                sgpr_args.append(sgpr)
-                arg_offset += 4
-                continue
+        with filelock.FileLock('.compile.lock'):
+            if not self.force_recompile and os.path.isfile(cpp_path) and os.path.getmtime(cpp_path) > os.path.getmtime(file_info):
+                return J.compile(func_name, cpp_path, self.extra_compiler_options, {})
 
-        if len(sgpr_args) > 0:
-            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            # create special sgpr for args
+            # and generate codes to load these args
+            signatures = []
+            sgpr_args = []
+            J.kargs = J.new_gpr('s',[0,1],dtype="u32",name="kargs")
+            J.threadIdx = Idx3D()
+            J.blockIdx = Idx3D()
+            J.threadIdx.x = J.new_gpr('v',[0,0], dtype="u32", name="threadIdx.x")
+            J.blockIdx.x = J.new_gpr('s',[2,2], dtype="u32", name="blockIdx.x")
+            J.blockIdx.y = J.new_gpr('s',[3,3], dtype="u32", name="blockIdx.y")
+            J.blockIdx.z = J.new_gpr('s',[4,4], dtype="u32", name="blockIdx.z")
+            arg_offset = 0
+            for arg_name in argspec.args[1:]:
+                assert arg_name in argtypes
+                atype = argtypes[arg_name].strip()
+                assert isinstance(atype, str)
+                signatures.append(f"{atype} {arg_name}")
+                if atype.endswith("*"):
+                    arg_offset = ((arg_offset + 7) // 8) * 8
+                    sgpr = J.new_gpr('s',2, dtype="u32", align=2, name=arg_name)
+                    J.s_load_dwordx2(sgpr, J.kargs, arg_offset)
+                    sgpr_args.append(sgpr)
+                    arg_offset += 8
+                    continue
+                if atype in ["int","uint","unsigned int"]:
+                    arg_offset = ((arg_offset + 3) // 4) * 4
+                    sgpr = J.new_gpr('s',1, dtype=f"{atype[0]}32", align=1, name=arg_name)
+                    J.s_load_dword(sgpr, J.kargs, arg_offset)
+                    sgpr_args.append(sgpr)
+                    arg_offset += 4
+                    continue
 
-        # now generate your kernel code
-        func(J, *sgpr_args)
-        return J.build(func_name, f"({','.join(signatures)})", self.extra_compiler_options,
-                       temp_filename = prefix_name,
-                       dump_stat=self.dump_stat)
+            if len(sgpr_args) > 0:
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+            # now generate your kernel code
+            func(J, *sgpr_args)
+            return J.build(func_name, f"({','.join(signatures)})", self.extra_compiler_options,
+                        temp_filename = prefix_name,
+                        dump_stat=self.dump_stat)
 
 class Addr2D:
     def __init__(self, J:JIT, base, row_init, col_init, stride):

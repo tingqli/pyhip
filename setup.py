@@ -8,5 +8,6 @@ setup(
     description='A python interface for ROCM HIP language',
     url='https://github.com/tingqli/pyhip',
     author='Li, Tingqian',
-    author_email='ltq18@hotmail.com'
+    author_email='ltq18@hotmail.com',
+    requires='filelock'
 )

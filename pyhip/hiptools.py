@@ -5,6 +5,7 @@ import functools
 import os, sys
 import inspect
 from .asmtools import prettify
+import torch
 
 @functools.cache
 def get_lib():
@@ -24,7 +25,7 @@ def get_lib():
                                     ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
                                     ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
                                     ctypes.c_uint32, # unsigned int sharedMemBytes
-                                    ctypes.c_uint64, # hipStream_t stream
+                                    ctypes.c_void_p, # hipStream_t stream
                                     ctypes.c_void_p, # void **kernelParams
                                     ctypes.c_void_p, # void **extra
                                     ]
@@ -93,7 +94,8 @@ class amdhip_func:
             gridDims.append(1)
         while len(blockDims) < 3:
             blockDims.append(1)
-        hip_check_error(get_lib().hipModuleLaunchKernel(self.p_func, *gridDims, *blockDims, sharedMemBytes, 0, 0, ctypes.byref(self.config)))
+        stream = ctypes.cast(torch.cuda.current_stream(), ctypes.c_void_p)
+        hip_check_error(get_lib().hipModuleLaunchKernel(self.p_func, *gridDims, *blockDims, sharedMemBytes, stream, 0, ctypes.byref(self.config)))
 
 @functools.cache
 def amdgpu_arch():

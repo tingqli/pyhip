@@ -344,8 +344,8 @@ def test():
                 assert N1 == 2 * K2
                 gemm1, wg_size1 = get_kernel(K1, N1, True)
                 gemm2, wg_size2 = get_kernel(K2, N2, False)
-                gemm1_out = torch.empty([TOPK, 1, N1 // 2], dtype=hidden_states.dtype)
-                gemm2_out = torch.zeros([1, N2], dtype=hidden_states.dtype)
+                gemm1_out = torch.empty([TOPK, 1, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
+                gemm2_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
                 w1_reordered = get_reordered_weight(w1, True)
                 w2_reordered = get_reordered_weight(w2, False)
                 gemm1([N1//32, TOPK],[wg_size1], hidden_states.data_ptr(), w1_reordered.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), 1)
