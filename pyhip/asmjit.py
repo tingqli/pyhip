@@ -6,6 +6,7 @@ from .hiptools import module
 import inspect
 import os
 from contextlib import contextmanager
+import math
 
 from .mem_allocator import SimpleMemoryAllocator
 
@@ -298,6 +299,9 @@ class GPRs:
 
     def overlap(self, other: Union['GPRExpr','GPRs'], fully_match = False):
         return self[0:self.count-1].overlap(other, fully_match)
+
+    def split_const_terms(self):
+        return 0, GPRExpr("getitem", self, 0, self.count - 1)
 
     '''
     GPRs following AMDGPU's slicing rules instead of python:
@@ -655,9 +659,11 @@ class LDSTensor:
                 offset0 = 0
                 cur_expr = cur_expr + const_terms
             else:
-                if const_terms + offset1 <= 0xFF:
-                    offset0 = const_terms
-                    offset1 = const_terms + offset1
+                item_size = self.stride_bytes[-1]
+                if (const_terms % item_size) == 0 and \
+                   (const_terms//item_size) + offset1 <= 0xFF:
+                    offset0 = const_terms//item_size
+                    offset1 = offset0 + offset1
                 else:
                     offset0 = 0
                     cur_expr = cur_expr + const_terms
@@ -2471,6 +2477,16 @@ r'''
             assert len(others) == 2
             inst_vmax2 = getattr(self, f"v_max_{dtype}")
             inst_vmax2(dst_vgpr, others.pop(0), others.pop(0))
+
+    def sigmoid(self, vgpr_src):
+        temp0 = self.gpr("vf32")
+        self.v_exp_f32(temp0, vgpr_src * (-math.log2(math.exp(1))))
+        out = self.gpr("vf32")
+        self.v_rcp_f32(out[0], temp0[0] + 1.0)
+        return out
+
+    def silu(self, vgpr_src):
+        return self.gpr(self.sigmoid(vgpr_src) * vgpr_src)
 
 gen_hip_file_unique_id = 0
 
