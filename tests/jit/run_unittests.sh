@@ -1,4 +1,4 @@
 #!/bin/bash
 
-rm unittest/.jit-*
+rm ~/.pyhip -rf
 pytest unittest

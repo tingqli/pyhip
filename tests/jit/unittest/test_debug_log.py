@@ -6,11 +6,11 @@ torch.set_default_device('cuda')
 torch.manual_seed(0)
 
 def test_debug_log():
-    @pyhip.jit()
-    def kernel(J, input:"__bf16*", count:"int", log_ptr:"int*"):
+    @pyhip.jit(with_debug_log=True)
+    def kernel(J, input:"__bf16*", count:"int"):
         s_i = J.gpr("su32")
 
-        J.debug_setup(log_ptr, J.blockIdx.x[0] == 0)
+        J.debug_setup(J.blockIdx.x[0] == 0)
 
         vdst = J.gpr("vu32")
         J.global_load_dword(vdst, (J.threadIdx.x[0] & 63)<<2, input)
@@ -24,10 +24,10 @@ def test_debug_log():
 
     INPUT = torch.randn((64*2), dtype=torch.bfloat16)
 
-    kernel([1],[64], INPUT.data_ptr(), 3, kernel.log_ptr())
+    artifacts = kernel([1],[64], INPUT.data_ptr(), 3)
     torch.cuda.synchronize()
     # will print all log items, and also returns a list of logs
-    logs = kernel.get_logs()
+    logs = artifacts["debug_log"]
     assert len(logs) == 2, f"{logs=}"
     s_i_count = 0
     vdst_count = 0

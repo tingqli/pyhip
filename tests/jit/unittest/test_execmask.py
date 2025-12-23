@@ -8,8 +8,8 @@ torch.manual_seed(0)
     execmask 可以用来屏蔽内存访问
 '''
 def test_execmask_skip_memload():
-    @pyhip.jit()
-    def kernel(J, p_selectors:"int*", log_ptr:"int*"):
+    @pyhip.jit(with_debug_log=True)
+    def kernel(J, p_selectors:"int*"):
         vaddr=J.gpr("vu32")
         vdst=J.gpr("vu32")
         mask = J.gpr(2, "su32")
@@ -30,7 +30,7 @@ def test_execmask_skip_memload():
         vdst[0] = 0
 
         J.ds_bpermute_b32(vdst, vaddr, J.threadIdx.x[0], mod=f"offset:{0}")
-        J.debug_setup(log_ptr, J.blockIdx.x[0] == 0)
+        J.debug_setup(J.blockIdx.x[0] == 0)
         J.debug_log(vdst, torch.int32)
 
     A = torch.arange(0,64*4,4, dtype=torch.int)
@@ -38,13 +38,12 @@ def test_execmask_skip_memload():
     A[2] = 8
     A[3] = 4
     print(A)
-    kernel([1],[64], A.data_ptr(), kernel.log_ptr())
+    artifacts = kernel([1],[64], A.data_ptr())
     torch.cuda.synchronize()
-    kernel.get_logs()
 
 def test_execmask_from_vcc():
-    @pyhip.jit()
-    def kernel(J, p_selectors:"int*", log_ptr:"int*"):
+    @pyhip.jit(with_debug_log=True)
+    def kernel(J, p_selectors:"int*"):
         vaddr=J.gpr("vu32")
         vdst=J.gpr("vu32")
 
@@ -57,7 +56,7 @@ def test_execmask_from_vcc():
         J.ds_bpermute_b32(vdst, vaddr, J.threadIdx.x[0], mod=f"offset:{4*8}")
         J.s_mov_b64("exec", -1)
 
-        J.debug_setup(log_ptr, J.blockIdx.x[0] == 0)
+        J.debug_setup(J.blockIdx.x[0] == 0)
         J.debug_log(vdst, torch.int32)
 
     A = torch.arange(0,64*4,4, dtype=torch.int)
@@ -65,9 +64,8 @@ def test_execmask_from_vcc():
     A[2] = 8
     A[3] = 4
     print(A)
-    kernel([1],[64], A.data_ptr(), kernel.log_ptr())
+    kernel([1],[64], A.data_ptr())
     torch.cuda.synchronize()
-    kernel.get_logs()
 
 
 if __name__ == "__main__":

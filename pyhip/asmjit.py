@@ -10,6 +10,8 @@ import math
 
 from .mem_allocator import SimpleMemoryAllocator
 
+import hashlib
+
 def get_caller_loc():
     frame = inspect.currentframe().f_back.f_back
     loc = ""
@@ -709,6 +711,7 @@ class JIT:
         self.debug_log_info = []
         self.mark_idx = 0
         self.debug_cond_sgpr = None
+        self.debug_log_ptr = None
         self.lds_allocator = SimpleMemoryAllocator(160*1024)
 
     def __getattr__(self, instruction):
@@ -1237,6 +1240,15 @@ class JIT:
             assert expr.op == "+"
             lhs = expr.src0
             rhs = expr.src1
+            if isinstance(lhs, int) and isinstance(rhs, GPRExpr):
+                assert rhs.op == "getitem"
+                assert lhs.bit_length() <= 32
+                rlhs_gprs = rhs.src0
+                add_low = Instruction(bb, f"s_add_u32", loc=loc)
+                add_low(dst_gprs[dst_idx0], lhs, rlhs_gprs[rhs.src1])
+                add_high = Instruction(bb, f"s_addc_u32", loc=loc)
+                add_high(dst_gprs[dst_idx1], 0, 0 if rhs.src2 == rhs.src1 else rlhs_gprs[rhs.src2])
+                return
             assert lhs.op == "getitem"
             lhs_gprs = lhs.src0
             assert (lhs.src2 - lhs.src1) <= 1
@@ -1682,9 +1694,7 @@ class JIT:
     def LDSTensor(self, shape, dtype):
         return LDSTensor(self, shape, dtype)
 
-    def debug_setup(self, log_ptr:GPRs, cond:GPRExpr):
-        self.debug_log_ptr = log_ptr
-        assert isinstance(log_ptr, GPRs) and log_ptr.rtype == "s" and log_ptr.count == 2
+    def debug_setup(self, cond:GPRExpr):
         self.debug_cond_sgpr = self.gpr("su32")
         self.debug_cond_sgpr[0] = cond
 
@@ -1692,7 +1702,12 @@ class JIT:
         """
         cond : filter the kernel instance to enable log
         """
-        if self.debug_cond_sgpr is None: return
+        if self.debug_log_ptr is None:
+            self.log("WARNNING: calling debug_log w/o debug_log_ptr")
+            return
+        if self.debug_cond_sgpr is None:
+            self.log("WARNNING: calling debug_log w/o debug_setup")
+            return
         assert isinstance(self.debug_cond_sgpr, GPRs)
         log_index = len(self.debug_log_info)
         #self.Jump(f"debug_log_skip_{log_index}", cond, reverse=True)
@@ -1807,6 +1822,51 @@ class JIT:
         self.s_addc_u32(self.debug_log_ptr[1], self.debug_log_ptr[1], 0)
         self.s_waitcnt(mod="vmcnt(0)")
         self.Label(f"debug_log_skip_{log_index}")
+        # debug log function
+
+    @staticmethod
+    def parse_debug_logs(debug_log_info, debug_log_buff, verbose = True):
+        global torch
+        import torch
+        from collections import OrderedDict
+
+        buffer = debug_log_buff.cpu().numpy()
+        offset = 0
+        ret = {}
+        cnt = 0
+        color_id = 3
+        color0 = f"\033[0;{30+(color_id % 8)}m"
+        color1 = f"\033[0m"
+        if verbose:
+            print(f"{color0}==== {verbose} debug log ===={color1}")
+        while True:
+            index = struct.unpack_from('<I', buffer, offset)[0]
+            offset += 4
+            if index < 0 or index >= len(debug_log_info): break
+            name, rtype, count, dtype, shape, layout = debug_log_info[index]
+            dtype_size = torch.tensor([], dtype=dtype).element_size()
+
+            tensor = torch.frombuffer(buffer, dtype=dtype, count=count*64*(4//dtype_size), offset=offset)
+            if rtype == "s": tensor = tensor.reshape(64, (4*count//dtype_size))[0,:].tolist()
+            offset += 64*4*count
+            tag = f"[{cnt}]:  {name} ({rtype}gpr x {count})"
+            if verbose:
+                if rtype == "s":
+                    print(f"{color0}{tag}{color1} {tensor}")
+                else:
+                    print(f"{color0}{tag} {shape=} {dtype=} {layout=} {color1}")
+                    if layout != "":
+                        tensor = tensor.reshape(*shape)
+                        print(tensor)
+                    else:
+                        tensor = tensor.reshape(64, (4*count//dtype_size))
+                        for lane_id in range(64):
+                            print(f" lane {lane_id:2} : {tensor[lane_id, :]}")
+            if name not in ret:
+                ret[name] = []
+            ret[name].append(tensor)
+            cnt += 1
+        return ret
 
     def pass_hide_dependency(self):
         # hide dependency between address calculation & ds_read/ds_write/global_load
@@ -2113,7 +2173,7 @@ class JIT:
             self.log(self.current_bb.debug_str())
         
 
-    def build(self, kernel_name, signature, extra_compiler_options, temp_filename, dump_stat):
+    def build(self, kernel_name, signature, extra_compiler_options, cpp_src_fpath, dump_stat):
         self.asm_debug_info = ""
         self._finish_bb(self.current_bb)
 
@@ -2274,73 +2334,18 @@ r'''
 ''' + decl_lds + r'''
 }
         '''
-        cpp_src_fpath = f'{temp_filename}.cpp'
+
         with open(cpp_src_fpath, 'w', encoding='utf-8') as f:
             f.write(hip_src)
 
         artifact["used_gprs"] = used_gprs
-        return self.compile(kernel_name, cpp_src_fpath, extra_compiler_options, artifact)
+        artifact["debug_log_info"] = self.debug_log_info
 
-    def compile(self, kernel_name, cpp_src_fpath, extra_compiler_options, artifact=None):
+        return self.compile(kernel_name, cpp_src_fpath, extra_compiler_options), artifact
+
+    def compile(self, kernel_name, cpp_src_fpath, extra_compiler_options):
         hip = module(cpp_src_fpath, extra_compiler_options)
         hip_func = getattr(hip, kernel_name)
-        # attach debug_log member function & data to hip_func
-        # logbytes: tensor.numpy().tobytes()
-        def get_logs(self, debug_log_info, verbose = True):
-            global torch
-            import torch
-            from collections import OrderedDict
-
-            tensor = self._debug_log_buff
-            buffer = tensor.cpu().numpy()
-            offset = 0
-            ret = {}
-            cnt = 0
-            color_id = 3
-            color0 = f"\033[0;{30+(color_id % 8)}m"
-            color1 = f"\033[0m"
-            if verbose:
-                print(f"{color0}==== {kernel_name} debug log ===={color1}")
-            while True:
-                index = struct.unpack_from('<I', buffer, offset)[0]
-                offset += 4
-                if index < 0 or index >= len(debug_log_info): break
-                name, rtype, count, dtype, shape, layout = debug_log_info[index]
-                dtype_size = torch.tensor([], dtype=dtype).element_size()
-
-                tensor = torch.frombuffer(buffer, dtype=dtype, count=count*64*(4//dtype_size), offset=offset)
-                if rtype == "s": tensor = tensor.reshape(64, (4*count//dtype_size))[0,:].tolist()
-                offset += 64*4*count
-                tag = f"[{cnt}]:  {name} ({rtype}gpr x {count})"
-                if verbose:
-                    if rtype == "s":
-                        print(f"{color0}{tag}{color1} {tensor}")
-                    else:
-                        print(f"{color0}{tag} {shape=} {dtype=} {layout=} {color1}")
-                        if layout != "":
-                            tensor = tensor.reshape(*shape)
-                            print(tensor)
-                        else:
-                            tensor = tensor.reshape(64, (4*count//dtype_size))
-                            for lane_id in range(64):
-                                print(f" lane {lane_id:2} : {tensor[lane_id, :]}")
-                if name not in ret:
-                    ret[name] = []
-                ret[name].append(tensor)
-                cnt += 1
-            return ret
-
-        def log_ptr(self, size=1024*1024):
-            global torch
-            import torch
-            self._debug_log_buff = torch.full([size//4], -1, dtype=torch.int32)
-            return self._debug_log_buff.data_ptr()
-
-        from functools import partial
-        hip_func.get_logs = partial(get_logs, hip_func, self.debug_log_info)
-        hip_func.log_ptr = partial(log_ptr, hip_func)
-        hip_func.artifact = artifact
-        
         return hip_func
 
     def div_up(self, x, y):
@@ -2494,39 +2499,90 @@ class Idx3D:
     def __init__(self):
         pass
 
-class jit:
-    def __init__(self, extra_compiler_options = "", dump_stat = False, kernel_suffix = '', force_recompile = False):
+_jit_kernel_unique_id = {}
+class jit_kernel:
+    def __init__(self, gen_func, extra_compiler_options, with_debug_log = False, dump_stat = False, force_recompile = False):
+        assert callable(gen_func)
         self.extra_compiler_options = extra_compiler_options
         self.dump_stat = dump_stat
-        self.kernel_suffix = kernel_suffix
+        # with_debug_log needs extra internal debug-log buffer, so it's always recompiled
         self.force_recompile = force_recompile
+        self.with_debug_log = with_debug_log
+        self.gen_func = gen_func
+        self.func_name = gen_func.__name__
+        argspec = inspect.getfullargspec(gen_func)
+        argtypes = gen_func.__annotations__
+        compile_time_args = []
+        runtime_time_args = []
+        for arg_id, arg_name in enumerate(argspec.args[1:]):
+            if arg_name in argtypes:
+                atype = argtypes[arg_name].strip()
+                if isinstance(atype, str):
+                    # runtime args (and only runtime args) must have 
+                    # C-type string annotations
+                    runtime_time_args.append((arg_id, arg_name, atype))
+                else:
+                    # other args w/o string annotation are compile-time args
+                    compile_time_args.append((arg_id, arg_name, atype))
+            else:
+                compile_time_args.append((arg_id, arg_name, None))
 
-    def __call__(self, func):
-        assert callable(func)
-        # here we need to avoid generating same temp HIP source name for different kernel with same name.
-        # otherwise it will try to generate same CO binary and causes conflict when being loaded & used
-        file_info = inspect.getfile(func)
-        line_no = inspect.getsourcelines(func)[1]
-        filename = os.path.basename(file_info)
-        dirname = os.path.dirname(file_info)
+        self.compile_time_arg_info = compile_time_args
+        self.runtime_time_arg_info = runtime_time_args
+        self.gen_total_args = len(argspec.args) - 1 # except first arg J
+        self.kernel_cache = {}
 
-        argspec = inspect.getfullargspec(func)
-        argtypes = func.__annotations__
-        func_name = func.__name__
-        if self.kernel_suffix:
-            prefix_name = f'{dirname}/.jit-{func_name}-{self.kernel_suffix}'
-        else:
-            global gen_hip_file_unique_id
-            gen_hip_file_unique_id += 1
-            prefix_name = f"{dirname}/.jit-{gen_hip_file_unique_id}-{filename}-{line_no}-{func_name}"
+        self.gen_src_file = inspect.getfile(gen_func)
+        self.gen_src_fname = os.path.basename(self.gen_src_file)
+        self.line_no = inspect.getsourcelines(gen_func)[1]
+        global _jit_kernel_unique_id
+        if self.func_name not in _jit_kernel_unique_id:
+            _jit_kernel_unique_id[self.func_name] = 0
+        _jit_kernel_unique_id[self.func_name] += 1
+
+        # same gen function may constructed many times
+        self.gen_construct_id = _jit_kernel_unique_id[self.func_name]
+
+        # self.gen_func_unique_id = hashlib.sha256(f"{self.gen_src_file}-{self.line_no}-{_jit_kernel_unique_id}".encode('utf-8')).hexdigest()
+        self.gen_func_unique_id = f"{self.gen_src_file}-{self.line_no}".replace("/","-")
+
+    def split_args(self, args:tuple):
+        compile_args = []
+        runtime_args = []
+        kernel_key = []
+
+        # gridDims, blockDims
+        runtime_args.append(args[0])
+        runtime_args.append(args[1])
+
+        for c in self.compile_time_arg_info:
+            value = args[c[0] + 2]
+            name = c[1]
+            compile_args.append(value)
+            kernel_key.append(f"{name}={value}")
+
+        for c in self.runtime_time_arg_info:
+            runtime_args.append(args[c[0] + 2])
+
+        return compile_args, runtime_args, "-".join(kernel_key)
+
+    def build(self, compile_args, kernel_key):
+        # put all generated files under $HOME/.pyhip
+        os.makedirs(os.path.expanduser(f"~/.pyhip"), exist_ok=True)
+        cpp_src_fpath = os.path.expanduser(f"~/.pyhip/{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}.cpp")
 
         J = JIT()
-        # check if cache is available
-        cpp_path = f'{prefix_name}.cpp'
 
         with filelock.FileLock('.compile.lock'):
-            if not self.force_recompile and os.path.isfile(cpp_path) and os.path.getmtime(cpp_path) > os.path.getmtime(file_info):
-                return J.compile(func_name, cpp_path, self.extra_compiler_options, {})
+            # skip compilation process when target file already exists
+            # note the `cpp_src_fpath` is supposed to be generated in previous run(with same compile_args)
+            
+            if not self.force_recompile and \
+                not self.with_debug_log and \
+                os.path.isfile(cpp_src_fpath) and \
+                os.path.getmtime(cpp_src_fpath) > os.path.getmtime(self.gen_src_file):
+                # if user want non-empty artifact, need to set force_recompile=True
+                return J.compile(self.func_name, cpp_src_fpath, self.extra_compiler_options), {}
 
             # create special sgpr for args
             # and generate codes to load these args
@@ -2539,35 +2595,84 @@ class jit:
             J.blockIdx.x = J.new_gpr('s',[2,2], dtype="u32", name="blockIdx.x")
             J.blockIdx.y = J.new_gpr('s',[3,3], dtype="u32", name="blockIdx.y")
             J.blockIdx.z = J.new_gpr('s',[4,4], dtype="u32", name="blockIdx.z")
+            gen_time_args = [None for _ in range(self.gen_total_args)]
+
+            # fill compile-time args
+            for i, (arg_id, arg_name, atype) in enumerate(self.compile_time_arg_info):
+                gen_time_args[arg_id] = compile_args[i]
+
+            # fill generation-time args
             arg_offset = 0
-            for arg_name in argspec.args[1:]:
-                assert arg_name in argtypes
-                atype = argtypes[arg_name].strip()
-                assert isinstance(atype, str)
+            for arg_id, arg_name, atype in self.runtime_time_arg_info:
                 signatures.append(f"{atype} {arg_name}")
                 if atype.endswith("*"):
                     arg_offset = ((arg_offset + 7) // 8) * 8
                     sgpr = J.new_gpr('s',2, dtype="u32", align=2, name=arg_name)
                     J.s_load_dwordx2(sgpr, J.kargs, arg_offset)
-                    sgpr_args.append(sgpr)
+                    gen_time_args[arg_id] = sgpr
                     arg_offset += 8
                     continue
                 if atype in ["int","uint","unsigned int"]:
                     arg_offset = ((arg_offset + 3) // 4) * 4
                     sgpr = J.new_gpr('s',1, dtype=f"{atype[0]}32", align=1, name=arg_name)
                     J.s_load_dword(sgpr, J.kargs, arg_offset)
-                    sgpr_args.append(sgpr)
+                    gen_time_args[arg_id] = sgpr
                     arg_offset += 4
                     continue
+                assert 0, f"unsupported runtime arg type {arg_id=} {arg_name=} {atype=}"
 
-            if len(sgpr_args) > 0:
+            if self.with_debug_log:
+                # this extra debug log ptr will be provided by self
+                signatures.append(f"void* debug_log_ptr")
+                arg_offset = ((arg_offset + 7) // 8) * 8
+                J.debug_log_ptr = J.new_gpr('s',2, dtype="u32", align=2, name="debug_log_ptr")
+                J.s_load_dwordx2(J.debug_log_ptr, J.kargs, arg_offset)
+                arg_offset += 8
+
+            if arg_offset > 0:
                 J.s_waitcnt(mod=f"lgkmcnt(0)")
 
             # now generate your kernel code
-            func(J, *sgpr_args)
-            return J.build(func_name, f"({','.join(signatures)})", self.extra_compiler_options,
-                        temp_filename = prefix_name,
+            self.gen_func(J, *gen_time_args)
+
+            return J.build(self.func_name, f"({','.join(signatures)})", self.extra_compiler_options,
+                        cpp_src_fpath = cpp_src_fpath,
                         dump_stat=self.dump_stat)
+
+    def __call__(self, *args):
+        compile_args, runtime_args, kernel_key = self.split_args(args)
+
+        if self.with_debug_log:
+            global torch
+            import torch
+            debug_log_buff = torch.full([1024*1024//4], -1, dtype=torch.int32)
+            runtime_args.append(debug_log_buff.data_ptr())
+            kernel, artifact = self.build(compile_args, kernel_key)
+            kernel(*runtime_args)
+            artifact["debug_log"] = JIT.parse_debug_logs(artifact["debug_log_info"], debug_log_buff, verbose=f"{self.func_name}-{kernel_key}")
+            return artifact
+
+        # check cache to see if such object already exist
+        if kernel_key in self.kernel_cache:
+            # invoke the kernel binary directly with runtime-args only
+            kernel, artifact = self.kernel_cache[kernel_key]
+        else:
+            kernel, artifact = self.build(compile_args, kernel_key)
+            self.kernel_cache[kernel_key] = (kernel, artifact)
+
+        kernel(*runtime_args)
+
+        return artifact
+
+class jit:
+    def __init__(self, extra_compiler_options = "", with_debug_log=False, dump_stat = False, force_recompile = False):
+        self.extra_compiler_options = extra_compiler_options
+        self.with_debug_log = with_debug_log
+        self.dump_stat = dump_stat
+        self.force_recompile = force_recompile
+
+    def __call__(self, gen_func):
+        return jit_kernel(gen_func, self.extra_compiler_options, self.with_debug_log, self.dump_stat, self.force_recompile)
 
 class Addr2D:
     def __init__(self, J:JIT, base, row_init, col_init, stride):

@@ -5,11 +5,11 @@ torch.cuda.set_device(2)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
 
-def extract_inst_pattern(kernel, inst_opcode):
+def extract_inst_pattern(artifact, inst_opcode):
     # return a instruction occurrence pattern string for each BB
     ret = []
     ipattern = ""
-    for asm in kernel.artifact["asm"][1:]:
+    for asm in artifact["asm"][1:]:
         print(asm)
         opcode = asm.split()[0]
         if opcode.endswith(":"):
@@ -88,22 +88,21 @@ def test_lds_tensor():
                              act_bf16[0],
                              p_output)
         J.s_waitcnt(mod=f"vmcnt(0)")
-
-    # check if LDSTensor generats correct read & write code
-    # (with CSE's help, only offsets are different between ds_write/ds_read instructions)
-    ip_ds_write_b128 = extract_inst_pattern(kernel,"ds_write_b128")[-1]
-    ip_ds_write_b128 = ip_ds_write_b128.strip("0")
-    assert ip_ds_write_b128 == "11", ip_ds_write_b128
-
-    ip_ds_read_b64 = extract_inst_pattern(kernel,"ds_read_b64")[-1]
-    ip_ds_read_b64 = ip_ds_read_b64.strip("0")
-    assert ip_ds_read_b64 == "1111", ip_ds_read_b64
-
     A = (torch.randn(M, K, dtype=torch.bfloat16) + 1)*0.1
     B = torch.randn(N, K, dtype=torch.bfloat16)
     C = torch.ones(M, N, dtype=torch.bfloat16)
     C0 = A @ B.t()
-    kernel([1], [256],  A.data_ptr(), B.data_ptr(), C.data_ptr())
+    artifact = kernel([1], [256],  A.data_ptr(), B.data_ptr(), C.data_ptr())
+
+    # check if LDSTensor generats correct read & write code
+    # (with CSE's help, only offsets are different between ds_write/ds_read instructions)
+    ip_ds_write_b128 = extract_inst_pattern(artifact,"ds_write_b128")[-1]
+    ip_ds_write_b128 = ip_ds_write_b128.strip("0")
+    assert ip_ds_write_b128 == "11", ip_ds_write_b128
+
+    ip_ds_read_b64 = extract_inst_pattern(artifact,"ds_read_b64")[-1]
+    ip_ds_read_b64 = ip_ds_read_b64.strip("0")
+    assert ip_ds_read_b64 == "1111", ip_ds_read_b64
 
     if not torch.allclose(C, C0, atol=0.01, rtol=0.01):
         print(C)
