@@ -178,6 +178,7 @@ def get_kernel(
             lds_buff.write("b128", Creg[0], lane_mod_16 + warp_id*16, lane_div_16*4)
             lds_buff.write("b128", Creg[1], lane_mod_16 + warp_id*16, lane_div_16*4 + 16)
 
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
             J.s_barrier()
             # each wave reduce 4 rows
             vrow = J.gpr(lane_div_16 + warp_id*4)
