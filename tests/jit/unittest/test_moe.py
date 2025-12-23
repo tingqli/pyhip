@@ -228,24 +228,24 @@ def get_kernel(
     return moe_gemm_batch1, 64*num_split_K
 
 #####################################################################
-
-def test():
-    def test_aiter(hidden_states,
-                w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
-                w2,  # [expert(local_expert:EP), dim, inter_dim]
-                topk_weight,
-                topk_ids,
-                ):
-        from aiter.fused_moe import fused_moe
-        # from aiter.fused_moe_bf16_asm import asm_moe_tkw1
-        return fused_moe(
-            hidden_states,
-            w1,
-            w2,
+def test_aiter(hidden_states,
+            w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+            w2,  # [expert(local_expert:EP), dim, inter_dim]
             topk_weight,
             topk_ids,
-        )
+            ):
+    from aiter.fused_moe import fused_moe
+    # from aiter.fused_moe_bf16_asm import asm_moe_tkw1
+    return fused_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+    )
 
+
+def test_batch1():
     B = 1
     HIDDEN_SIZE = 2048
     TP = 8
@@ -276,7 +276,7 @@ def test():
         for _ in range(10):
             idx_start = random.randint(0, E - TOPK)
             topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
-            with pyhip.cudaPerf(B * HIDDEN_SIZE * INTER_SIZE_TP * 2, B * (HIDDEN_SIZE * INTER_SIZE_TP * 3 * TOPK), name="moe"):
+            with pyhip.cudaPerf(B * HIDDEN_SIZE * INTER_SIZE_TP * 2, B * (HIDDEN_SIZE * INTER_SIZE_TP * 3 * TOPK), name=f"aiter[{B=}]"):
                 test_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i])
             i = (i + 1) % BUF_COPY
 
@@ -359,11 +359,153 @@ def test():
         for _ in range(10):
             idx_start = random.randint(0, E - TOPK)
             topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
-            with pyhip.cudaPerf(B * HIDDEN_SIZE * INTER_SIZE_TP * 2, B * (HIDDEN_SIZE * INTER_SIZE_TP * 3 * TOPK), name="moe"):
+            with pyhip.cudaPerf(B * HIDDEN_SIZE * INTER_SIZE_TP * 2, B * (HIDDEN_SIZE * INTER_SIZE_TP * 3 * TOPK), name=f"cur[{B=}]"):
                 test_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i])
             i = (i + 1) % BUF_COPY
 
         print(ref_out.shape, cur_out.shape)
+        aiter.fused_moe.fused_moe = org_fused_moe
+        if not torch.allclose(ref_out, cur_out, rtol=0.02, atol=0.02):
+            idx = torch.where(torch.abs(ref_out - cur_out) > 0.02)
+            if len(idx[0]):
+                print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
+            assert 0
+        else:
+            print("acc OK")
+
+def test_batch():
+    B = 2
+    HIDDEN_SIZE = 2048
+    TP = 8
+    INTER_SIZE = 768
+    E = 128
+    TOPK = 8
+    INTER_SIZE_TP = INTER_SIZE // TP
+    BUF_COPY = 32
+    hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
+    w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
+    w1 = [w_.clone() for _ in range(BUF_COPY)]
+    w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
+    w2 = [w_.clone() for _ in range(BUF_COPY)]
+    topk_weight = torch.randn([BUF_COPY, B, TOPK], dtype=torch.float32)
+    topk_ids = torch.ones([BUF_COPY, B, TOPK], dtype=torch.int32)
+    topk_ids_base = torch.randperm(E, dtype=torch.int32)
+
+    if 1:
+        import aiter
+
+        topk_ids[0,:,] = topk_ids_base[: TOPK]
+        from aiter.ops.shuffle import shuffle_weight
+        # aiter needs preshuffle weights
+        w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
+        w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
+        ref_out = test_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0])
+        i = 0
+        for _ in range(10):
+            idx_start = random.randint(0, E - TOPK)
+            topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
+            with pyhip.cudaPerf(B * HIDDEN_SIZE * INTER_SIZE_TP * 2, B * (HIDDEN_SIZE * INTER_SIZE_TP * 3 * TOPK), name=f"aiter[{B=}]"):
+                test_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i])
+            i = (i + 1) % BUF_COPY
+
+    if 1:
+        import aiter
+        from aiter import ActivationType, QuantType, dtypes
+        from aiter.fused_moe import moe_sorting
+
+        org_fused_moe = None
+        def my_fused_moe(
+            hidden_states,
+            w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+            w2,  # [expert(local_expert:EP), dim, inter_dim]
+            topk_weight,
+            topk_ids,
+            expert_mask: Optional[torch.tensor] = None,  # EP
+            activation=ActivationType.Silu,
+            quant_type=QuantType.No,
+            doweight_stage1=False,
+            # following for quant
+            w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
+            w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
+            a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
+            a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+            # following for tuning
+            block_size_M=None,
+            num_local_tokens: Optional[torch.tensor] = None,
+            moe_sorting_dispatch_policy=0,
+            dtype=None,
+            # following for cktile support
+            hidden_pad=0,
+            intermediate_pad=0,
+            bias1=None,
+            bias2=None,
+        ):
+            # the following should be added in aiter.fused_moe.fused_moe
+            if hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and quant_type == QuantType.No and w1.dtype == torch.bfloat16:
+                E, N1, K1 = w1.shape
+                N2, K2 = w2.shape[1], w2.shape[2]
+                assert N1 == 2 * K2
+                sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+                    topk_ids,
+                    topk_weight,
+                    E,
+                    K1,     # reduce dim is same with output dim
+                    dtype,
+                    32,
+                    expert_mask,
+                    num_local_tokens,
+                    moe_sorting_dispatch_policy,
+                )
+
+                # gemm1, wg_size1 = get_kernel(K1, N1, True)
+                # gemm2, wg_size2 = get_kernel(K2, N2, False)
+                # gemm1_out = torch.empty([TOPK, 1, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
+                gemm2_out = torch.zeros([B, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+                # gemm1([N1//32, TOPK],[wg_size1], hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), 1)
+                # gemm2([N2//32, TOPK],[wg_size2], gemm1_out.data_ptr(), w2.data_ptr(), gemm2_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), 1)
+                return gemm2_out
+            else:
+                return org_fused_moe(hidden_states,
+                    w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+                    w2,  # [expert(local_expert:EP), dim, inter_dim]
+                    topk_weight,
+                    topk_ids,
+                    expert_mask,  # EP
+                    activation,
+                    quant_type,
+                    doweight_stage1,
+                    # following for quant
+                    w1_scale,  # [expert(local_expert:EP), inter_dim, 1]
+                    w2_scale,  # [expert(local_expert:EP), model_dim, 1]
+                    a1_scale,  # [expert(local_expert:EP), 1, model_dim]
+                    a2_scale,  # [expert(local_expert:EP), 1, inter_dim]
+                    # following for tuning
+                    block_size_M,
+                    num_local_tokens,
+                    moe_sorting_dispatch_policy,
+                    dtype,
+                    # following for cktile support
+                    hidden_pad,
+                    intermediate_pad,
+                    bias1,
+                    bias2)
+        org_fused_moe = aiter.fused_moe.fused_moe
+        aiter.fused_moe.fused_moe = my_fused_moe
+
+        topk_ids[0,:,] = topk_ids_base[: TOPK]
+        w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
+        w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
+        cur_out = test_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0])
+        i = 0
+        for _ in range(10):
+            idx_start = random.randint(0, E - TOPK)
+            topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
+            with pyhip.cudaPerf(B * HIDDEN_SIZE * INTER_SIZE_TP * 2, B * (HIDDEN_SIZE * INTER_SIZE_TP * 3 * TOPK), name=f"cur[{B=}]"):
+                test_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i])
+            i = (i + 1) % BUF_COPY
+
+        print(ref_out.shape, cur_out.shape)
+        aiter.fused_moe.fused_moe = org_fused_moe
         if not torch.allclose(ref_out, cur_out, rtol=0.02, atol=0.02):
             idx = torch.where(torch.abs(ref_out - cur_out) > 0.02)
             if len(idx[0]):
@@ -373,4 +515,5 @@ def test():
             print("acc OK")
 
 if __name__ == '__main__':
-    test()
+    test_batch1()
+    test_batch()
