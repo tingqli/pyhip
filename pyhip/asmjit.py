@@ -32,6 +32,7 @@ class Instruction:
         self.is_cbranch = self.opcode.startswith("s_cbranch_")
         self.debug_info = ""
         self.sid = 0
+        self.is_dead = False
         self.loc = loc
 
     def __call__(self, *operands, mod:str="", insert_bb_pos = None):
@@ -181,7 +182,7 @@ class GPRExpr:
     def overlap(self, other: Union['GPRExpr','GPRs'], fully_match = False):
         assert self.op == "getitem"
         if isinstance(other, GPRs):
-            other = other[0:other.count-1]
+            other = other[...]
         assert other.op == "getitem"
         gprs0 = self.src0
         gprs1 = other.src0
@@ -1112,9 +1113,28 @@ class JIT:
                     inst.debug_info = debug_info
 
         self.asm_debug_info += ";============ register live interval ==============\n"
+        possible_dead_variables = {}
         for gprs in live_intervals:
             first_sid, last_sid = live_intervals[gprs]
             self.asm_debug_info += f";'{gprs.name}'{repr(gprs):10s}  {first_sid} ~ {last_sid}\n"
+
+            if first_sid == last_sid:
+                if first_sid not in possible_dead_variables:
+                    possible_dead_variables[first_sid] = []
+                possible_dead_variables[first_sid].append(gprs)
+
+        # mark-up dead-loads
+        for bb in self.blocks:
+            for inst in bb.instructions:
+                if inst.sid in possible_dead_variables:
+                    if inst.opcode.startswith("s_load_"):
+                        dst_gpr = inst.operands[0]
+                        is_dead_load = False
+                        for gpr in possible_dead_variables[inst.sid]:
+                            if dst_gpr.overlap(gpr,fully_match=True):
+                                is_dead_load = True
+                                break
+                        inst.is_dead = is_dead_load
 
         # re-assign each gprs's start_id (linear_scan)
         # sorted_live_interval = [(live_intervals[gprs][0], live_intervals[gprs][1], gprs) for gprs in live_intervals].sort()
@@ -1206,6 +1226,13 @@ class JIT:
             # in case some gpr's last & first sids are the same
             for gprs in unalloc_gprs:
                 free_gpr(gprs)
+
+        # remove dead-loads
+        for bb in self.blocks:
+            # delete dead instructions
+            for i in range(len(bb.instructions)-1, -1, -1):
+                if bb.instructions[i].is_dead:
+                    bb.instructions.pop(i)
 
         # (following code-gen phase will use the new start_id automatically)
         # add debug info to asm instruction
@@ -2492,6 +2519,7 @@ r'''
 
     def silu(self, vgpr_src):
         return self.gpr(self.sigmoid(vgpr_src) * vgpr_src)
+
 
 gen_hip_file_unique_id = 0
 
