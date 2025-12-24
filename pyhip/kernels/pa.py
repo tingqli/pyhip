@@ -178,7 +178,7 @@ def reduce(J:pyhip.JIT,
 
 @pyhip.jit("-g")
 def pa_jit(J:pyhip.JIT,
-            HQ,HK,S,BLOCK_SIZE,KV_PART_SIZE,acc_scale,num_parts,debug_loc,
+            HQ,HK,S,BLOCK_SIZE,KV_PART_SIZE,acc_scale,num_parts,
             query:"__bf16*",        # [B, HQ, S]
             key_cache:"__bf16*",    # [block_num, HK, block_size // (16*2), 2, S // ITEMSIZE, 16, ITEMSIZE]
             value_cache:"__bf16*",  # [block_num, HK, block_size // (4*ITEMSIZE), S // 16, 4, 16, ITEMSIZE]
@@ -190,7 +190,6 @@ def pa_jit(J:pyhip.JIT,
             # max_num_parts (max number of workgroups for one-item/one-head-group in batch)
             max_num_parts:"uint",
             max_num_blocks_per_seq:"uint",
-            log_ptr:"uint*",
             ):
     acc_scale *= math.log2(math.exp(1))
     GQA = HQ // HK
@@ -241,9 +240,6 @@ def pa_jit(J:pyhip.JIT,
     # 如何验证正确性？调试阶段可以使用debug_log，优化阶段需要更加自动化的检查正确性机制，就是需要把运算结果写回内存，由host侧代码检查正确性
     # 但是直接传回acc的话，数据量过大，可以采用仅仅传回某个特定位置的acc的方法，这个特定位置由外部参数指定，外部多次运行传入不同位置参数
     # 就能拿出不同位置计算结果并检查正确性，并且这个也用debug_log完成，无需额外申请内存
-    if debug_loc is not None:
-        J.debug_setup(log_ptr, (b[0] == debug_loc["b"])&(hk[0] == debug_loc["hk"])&(kv_part[0]==debug_loc["kv_part"])&(warp_id[0]==debug_loc["warp_id"]))
-    #J.debug_setup(log_ptr, (b[0] == (save_acc_loc&0xFF))&(hk[0] == (save_acc_loc>>8)&0xFF)&(kv_part[0]==(save_acc_loc>>16)&0xFF)&(warp_id[0]==(save_acc_loc>>16)&0xFF))
 
     # Python 没有类似C++那种使用{}限制变量作用域，提高代码可读性
     # 的方法，类似效果的就是使用closure
@@ -424,10 +420,6 @@ def pa_jit(J:pyhip.JIT,
                         vKaddr64bits[:] = vKaddr64bits[:] + s_4096[:]
 
         # online-softmax 计算开始，此时可以交织完成value数据的准备以避免issue stall
-        if debug_loc is not None:
-            J.debug_log(acc[...], torch.float, "4h.4h.16v.4h")
-            #J.debug_log(q_cur, torch.bfloat16, "4h.4h.16v.8h")
-            #J.s_waitcnt(mod=f"vmcnt(0) lgkmcnt(0)");J.s_endpgm()
 
         for n in range(4):
             J.v_pk_mul_f32(acc[n,0:1], s_acc_scale, acc[n,0:1])
@@ -489,7 +481,7 @@ def pa_jit(J:pyhip.JIT,
                 J.v_exp_f32(acc[n,i], acc[n,i] - cur_max)
         
         # max_fixup = (prev_max-cur_max).exp()
-        if part_idx or debug_loc is not None:
+        if part_idx:
             max_fixup = J.gpr(2, 'vf32')
             max_fixup[0] = J.gpr(prev_max - cur_max)
             J.v_exp_f32(max_fixup[0], max_fixup[0])
@@ -519,9 +511,6 @@ def pa_jit(J:pyhip.JIT,
         prev_max[0] = cur_max
 
         # O = max_fixup * O + (P @ V)
-        if debug_loc is not None:
-            J.debug_log(cur_sum, torch.float, "4h.16v.1h")
-            J.debug_log(max_fixup[0], torch.float, "4h.16v.1h")
 
         if part_idx:
             # out : max_fixup是per-row的, vout列交织并不影响
@@ -570,10 +559,6 @@ def pa_jit(J:pyhip.JIT,
                         vVaddr64bits[:] = vVaddr64bits[:] + s_4096[:]
                         offset = 0
 
-            if debug_loc is not None:
-                # vout: 是列交织的
-                #J.debug_log(vout, torch.float, "4v1.4h.16v4.4h")
-                pass
     # for stat info
     J.Label('main_end')
 
@@ -584,21 +569,6 @@ def pa_jit(J:pyhip.JIT,
 
     #a=J.alloc_lds((8-4)*1024)
     # J.s_waitcnt(mod=f"vmcnt({0})")
-
-    if debug_loc is not None:
-        mtime_stop = J.gpr(2, "su32")
-        J.s_memtime(mtime_stop)
-
-        J.s_waitcnt(mod=f"lgkmcnt({0})")
-
-        J.s_sub_u32(mtime_stop[0], mtime_stop[0], mtime_start[0])
-        J.s_subb_u32(mtime_stop[1], mtime_stop[1], mtime_start[1])
-
-        vdata = J.gpr("vu32")
-        vdata[0] = mtime_stop[0]
-        #J.global_atomic_umax(J.threadIdx.x[0] << 2, vdata, debug_out)
-        J.debug_log(mtime_stop[0], torch.uint32)
-        J.debug_log(mtime_stop[1], torch.uint32)
 
     # scalar-memoryreads can return out-of-order:
     # following hack prevent kernel-arg loading to reuse same sgprs for different args
@@ -852,8 +822,6 @@ my_max = torch.empty([B, HQ, max_num_parts, 1], dtype=torch.float32) * 5
 my_sum = torch.empty([B, HQ, max_num_parts, 1], dtype=torch.float32) * 6
 qk_out = torch.ones([B, HK, HQ // HK, max_num_parts * KV_PART_SIZE], dtype=torch.float32)
 
-accuracy = {}
-
 def get_full_ref(block_size):
     # [block_num, HK, block_size // (16*2), 2, S // ITEMSIZE, 16, ITEMSIZE]
     #  ->[block_num, HK, block_size // (16*2), 2, 16, S // ITEMSIZE, ITEMSIZE]
@@ -887,77 +855,7 @@ def get_full_ref(block_size):
     ref_out = ref_out.reshape(B, HQ, S)
     return ref_out.to(query.dtype)
 
-# 参考flashattention2的python实现
-def FA2_ref(debug_loc):
-    hk = debug_loc["hk"]
-    qlen = HQ//HK
-    hq = hk*qlen
-    kv_part = debug_loc["kv_part"]
-    warp_id = debug_loc["warp_id"]
-    matQ = query[debug_loc["b"], hq:hq+qlen,:]
-    # 只取 debug_warp_id 负责的部分数据
-    kv_pos = []
-    for min_part in range(num_parts):
-        for i in range(64):
-            kv_pos.append(kv_part*KV_PART_SIZE + min_part*KV_MIN_PART_SIZE + warp_id*64 + i)
-    kv_idxs = kv_page_indices_[0][kv_pos]
-    matK = key_caches[0][kv_idxs, 0, hk, :]
-    matV = value_caches[0][kv_idxs, 0, hk, :]
-    # 一次性计算参考答案
-    def normal_attn():
-        acc = torch.nn.functional.linear(matQ.float(), matK.float())
-        acc = acc*scale
-        rowmax = acc.max(dim=1, keepdim = True).values
-        acc_exp = (acc - rowmax).exp()
-        rowsum = acc_exp.sum(dim=1, keepdim = True)
-        acc_softmax = acc_exp/rowsum
-        output = acc_softmax @ matV.float()
-        return output
-    
-    fa2_logs = {"Q":matQ, "K":matK, "kv_idxs":kv_idxs}
-    fa2_logs["O"] = []
-    fa2_logs["S"] = []
-    fa2_logs["cur_max"] = []
-    fa2_logs["max_fixup"] = []
-    fa2_logs["cur_sum"] = []
-    def FA2_online_softmax():
-        # 按照16x64的间隔，做4次online softmax
-        prev_max = torch.full([qlen,1], torch.finfo(torch.float).min, dtype=torch.float)
-        cur_sum = torch.full([qlen,1], 0, dtype=torch.float)
-        O = torch.full([qlen, 128], 0, dtype=torch.float)
-        Q = matQ.float()
-        for min_part in range(num_parts):
-            K = matK[min_part*64:(min_part+1)*64,:].float()
-            V = matV[min_part*64:(min_part+1)*64,:].float()
-            S = Q @ K.t()
-            fa2_logs["S"].append(S)
-            S = S*scale
-            rowmax = S.max(dim=1, keepdim = True).values
-            cur_max = torch.maximum(rowmax, prev_max)
-            fa2_logs["cur_max"].append(cur_max)
-            P = (S - cur_max).exp()
-            max_fixup = (prev_max-cur_max).exp()
-            fa2_logs["max_fixup"].append(max_fixup)
-            cur_sum = max_fixup * cur_sum + P.sum(dim=1, keepdim = True)
-            fa2_logs["cur_sum"].append(cur_sum)
-            prev_max = cur_max
-            O = max_fixup * O
-            fa2_logs["O"].append(O)
-            O += (P.bfloat16().float() @ V)
-        fa2_logs["O"].append(O)
-        fa2_out = (1.0/cur_sum)*O
-        return fa2_out
-
-    ref_out = normal_attn()
-    fa2_out = FA2_online_softmax()
-    if not torch.allclose(ref_out, fa2_out, atol=0.01, rtol=0.01):
-        print(ref_out)
-        print(fa2_out)
-        assert 0
-    #print(S.shape, rowmax.shape, rowsum.shape)
-    return fa2_logs
-
-def test_aiter(query,
+def run_aiter(query,
                key_cache,
                value_cache,
                block_tables,
@@ -972,7 +870,7 @@ def test_aiter(query,
         max_num_blocks_per_seq,
     )
 
-if 1:
+if 0:
     import aiter
     out_ref = None
     # if 0:
@@ -990,7 +888,7 @@ if 1:
         key_caches[-1][1:KV_LEN+1] = data['k']
         value_caches[-1][1:KV_LEN+1] = data['v']
         out_ref = data['out'].to(device=query.device)
-    out = test_aiter(query=query, key_cache=key_caches[BLOCK_SIZE16][-1], value_cache=value_caches[BLOCK_SIZE16][-1],
+    out = run_aiter(query=query, key_cache=key_caches[BLOCK_SIZE16][-1], value_cache=value_caches[BLOCK_SIZE16][-1],
                      block_tables=block_tables[BLOCK_SIZE16][-1], seq_lens=seq_lens[BLOCK_SIZE16][-1], max_num_blocks_per_seq=max_num_blocks_per_seq[BLOCK_SIZE16])
 
     if out_ref is not None:
@@ -999,21 +897,14 @@ if 1:
     i = 0
     for _ in range(10):
         with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="aiter"):
-            test_aiter(query=query, key_cache=key_caches[BLOCK_SIZE16][i], value_cache=value_caches[BLOCK_SIZE16][i],
+            run_aiter(query=query, key_cache=key_caches[BLOCK_SIZE16][i], value_cache=value_caches[BLOCK_SIZE16][i],
                        block_tables=block_tables[BLOCK_SIZE16][i], seq_lens=seq_lens[BLOCK_SIZE16][i], max_num_blocks_per_seq=max_num_blocks_per_seq[BLOCK_SIZE16])
         i = (i + 1) % BUF_COPY
 
-if 0:
+def test_acc():
     print("======================= verify correctness ==============================")
-    debug_loc = {
-        "b": 0,
-        "hk": 2,
-        "kv_part": 12,
-        "warp_id": 3
-    }
-    debug_log_ptr = pa_jit.log_ptr()
     pa_jit([B, HK, max_num_parts], [256],
-           HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts, debug_loc,
+           HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts,
             query.data_ptr(),           # [B, HQ, S]
             key_caches[BLOCK_SIZE][0].data_ptr(),   # [BLOCK_NUM, HK, S // 8, BLOCK_SIZE, 8]
             value_caches[BLOCK_SIZE][0].data_ptr(), # [BLOCK_NUM, HK, S, BLOCK_SIZE // 8, 8]
@@ -1023,108 +914,11 @@ if 0:
             my_max.data_ptr(), 
             my_sum.data_ptr(),
             max_num_parts,
-            max_num_blocks_per_seq[BLOCK_SIZE],
-            debug_log_ptr)
+            max_num_blocks_per_seq[BLOCK_SIZE])
     pa_reduce_jit([B, HQ], [256], KV_PART_SIZE, HQ, S,
                 seq_lens[BLOCK_SIZE][0].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
                 0)
 
-    logs = pa_jit.get_logs()
-    # fa2_logs = FA2_ref(debug_loc)
-    # print(fa2_logs["kv_idxs"])
-    # print("=============Q")
-    # print(fa2_logs["Q"])
-
-    # if "q_cur" in logs:
-    #     print("=============q_cur")
-    #     print(logs["q_cur"][0])
-
-    # print("=============K", fa2_logs["K"].shape)
-    # print(fa2_logs["K"])
-    # print("=============temp_key")
-    # if "temp_key" in logs:
-    #     for k in logs["temp_key"]:
-    #         print(":", k.shape)
-    #         print(k)
-    # if "acc" in logs:
-    #     print(logs["acc"][0].shape, fa2_logs["S"][0].shape)
-    #     accuracy["acc"] = "pass"
-    #     for part in range(num_parts):
-    #         res = logs["acc"][part][:(HQ//HK),:].cuda()
-    #         ref = fa2_logs["S"][part]
-    #         if not torch.allclose(res, ref):
-    #             accuracy["acc"] = f"failed at {part}/{num_parts}"
-    #             print("=============ref", ref.device)
-    #             print(ref)
-    #             print("=============res", res.device)
-    #             print(res)
-    #             break
-    
-    # if "out" in logs:
-    #     accuracy["out"] = "pass"
-    #     for part in range(num_parts):
-    #         res = logs["out"][part][:(HQ//HK),:].cuda()
-    #         ref = fa2_logs["O"][part]
-    #         print("out", res.shape, ref.shape)
-    #         if not torch.allclose(res, ref):
-    #             accuracy["out"] = f"failed at {part}/{num_parts}"
-    #             print("=============ref", ref.device)
-    #             print(ref)
-    #             print("=============res", res.device)
-    #             print(res)
-    #             break
-    
-    # if "max_fixup" in logs:
-    #     accuracy["max_fixup"] = "pass"
-    #     for part in range(num_parts):
-    #         res = logs["max_fixup"][part].cuda()[:(HQ//HK),0:1]
-    #         ref = fa2_logs["max_fixup"][part]
-    #         print("max_fixup", res.shape, ref.shape)
-    #         if not torch.allclose(res, ref):
-    #             accuracy["max_fixup"] = f"failed at {part}/{num_parts}"
-    #             print("=============ref", ref.device)
-    #             print(ref)
-    #             print("=============res", res.device)
-    #             print(logs["max_fixup"][part].cuda())
-    #             break
-
-    # if "cur_max" in logs:
-    #     accuracy["cur_max"] = "pass"
-    #     for part in range(num_parts):
-    #         res = logs["cur_max"][part].cuda()[:(HQ//HK),0:1]
-    #         ref = fa2_logs["cur_max"][part]
-    #         print("cur_max", res.shape, ref.shape)
-    #         if not torch.allclose(res, ref):
-    #             accuracy["cur_max"] = f"failed at {part}/{num_parts}"
-    #             print("=============ref", ref.device)
-    #             print(ref)
-    #             print("=============res", res.device)
-    #             print(logs["cur_max"][part].cuda())
-    #             break
-    # if "cur_sum" in logs:
-    #     accuracy["cur_sum"] = "pass"
-    #     for part in range(num_parts):
-    #         res = logs["cur_sum"][part].cuda()[:(HQ//HK),0:1]
-    #         ref = fa2_logs["cur_sum"][part]
-    #         print("cur_sum", res.shape, ref.shape)
-    #         if not torch.allclose(res, ref):
-    #             accuracy["cur_sum"] = f"failed at {part}/{num_parts}"
-    #             print("=============ref", ref.device)
-    #             print(ref)
-    #             print("=============res", res.device)
-    #             print(logs["cur_sum"][part].cuda())
-    #             break
-    # if "vout_tr[...]" in logs:
-    #     accuracy["O"] = "pass"
-    #     res = logs["vout_tr[...]"][-1][:(HQ//HK)].cuda()
-    #     ref = fa2_logs["O"][-1]
-    #     if not torch.allclose(res, ref, atol=0.05, rtol=0.05):
-    #         accuracy["O"] = f"failed"
-    #         print("============== ref =============")
-    #         print(ref)
-    #         print("============== res =============")
-    #         print(res)
-    # print(accuracy)
     ref_out = get_full_ref(BLOCK_SIZE)
     idx = torch.where(torch.abs(ref_out - my_out) > 0.05)
     if len(idx[0]):
@@ -1133,28 +927,31 @@ if 0:
     assert torch.allclose(ref_out, my_out, rtol=0.02, atol=0.02), "out is wrong"
     print('acc ok')
 
-print("======================= test performance ==============================")
+def test_perf():
+    print("======================= test performance ==============================")
 
-i = 0
-for round in range(10):
-    with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="pa_jit"):
-        pa_jit([B, HK, max_num_parts], [256],
-                HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts, None,
-                query.data_ptr(),                       # [B, HQ, S]
-                key_caches[BLOCK_SIZE][i].data_ptr(),   # [BLOCK_NUM, HK, S // 8, BLOCK_SIZE, 8]
-                value_caches[BLOCK_SIZE][i].data_ptr(), # [BLOCK_NUM, HK, S, BLOCK_SIZE // 8, 8]
-                block_tables[BLOCK_SIZE][i].data_ptr(),
-                seq_lens[BLOCK_SIZE][i].data_ptr(),
-                my_out_seg.data_ptr(),
-                my_max.data_ptr(), 
-                my_sum.data_ptr(),
-                max_num_parts,
-                max_num_blocks_per_seq[BLOCK_SIZE],
-                0)
-        pa_reduce_jit([B, HQ], [256], KV_PART_SIZE, HQ, S,
-                    seq_lens[BLOCK_SIZE][i].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
-                    0)
+    i = 0
+    for round in range(10):
+        with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="pa_jit"):
+            pa_jit([B, HK, max_num_parts], [256],
+                    HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts,
+                    query.data_ptr(),                       # [B, HQ, S]
+                    key_caches[BLOCK_SIZE][i].data_ptr(),   # [BLOCK_NUM, HK, S // 8, BLOCK_SIZE, 8]
+                    value_caches[BLOCK_SIZE][i].data_ptr(), # [BLOCK_NUM, HK, S, BLOCK_SIZE // 8, 8]
+                    block_tables[BLOCK_SIZE][i].data_ptr(),
+                    seq_lens[BLOCK_SIZE][i].data_ptr(),
+                    my_out_seg.data_ptr(),
+                    my_max.data_ptr(), 
+                    my_sum.data_ptr(),
+                    max_num_parts,
+                    max_num_blocks_per_seq[BLOCK_SIZE])
+            pa_reduce_jit([B, HQ], [256], KV_PART_SIZE, HQ, S,
+                        seq_lens[BLOCK_SIZE][i].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
+                        0)
 
-    i = (i + 1) % BUF_COPY
-print(f"[{B}, {HK}, {div_up(KV_LEN, KV_PART_SIZE)}]")
-print(f"{accuracy=}")
+        i = (i + 1) % BUF_COPY
+    print(f"[{B}, {HK}, {div_up(KV_LEN, KV_PART_SIZE)}]")
+
+if __name__ == '__main__':
+    test_acc()
+    test_perf()

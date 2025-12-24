@@ -2,13 +2,8 @@ import os
 import random
 from typing import Optional
 os.environ['PYHIP_JIT_LOG'] = '1'
-import pyhip
+from pyhip import cudaPerf, jit, JIT
 import torch
-
-torch.cuda.set_device(2)
-torch.set_default_device('cuda')
-torch.manual_seed(0)
-torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 
 from functools import cache
 #####################################################################
@@ -52,8 +47,8 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     [-1, N//16, K//32, 4k, 16n, 8k]
 """
 
-@pyhip.jit()
-def moe_gemm_batch1(J:pyhip.JIT,
+@jit()
+def moe_gemm_batch1(J:JIT,
                     K,            # compile-time args
                     N,            # compile-time args
                     with_silu,    # compile-time args
@@ -222,8 +217,8 @@ def moe_gemm_batch1(J:pyhip.JIT,
             J.global_atomic_pk_add_bf16(vaddr+16*sizeof_bf16, creg_low[1,0], p_output)
             J.global_atomic_pk_add_bf16(vaddr+16*sizeof_bf16+4, creg_low[1,1], p_output)
 
-@pyhip.jit()
-def moe_gemm_batch(J:pyhip.JIT,
+@jit()
+def moe_gemm_batch(J:JIT,
                    TOPK,
                    K,            # compile-time args
                    N,            # compile-time args
@@ -475,7 +470,7 @@ def run_batch(B=1):
         for _ in range(10):
             idx_start = random.randint(0, E - TOPK)
             topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
-            with pyhip.cudaPerf(flops, mem_size, name=f"aiter[{B=}]"):
+            with cudaPerf(flops, mem_size, name=f"aiter[{B=}]"):
                 run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i])
             i = (i + 1) % BUF_COPY
 
@@ -582,7 +577,7 @@ def run_batch(B=1):
         for _ in range(10):
             idx_start = random.randint(0, E - TOPK)
             topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
-            with pyhip.cudaPerf(flops, mem_size, name=f"cur[{B=}]"):
+            with cudaPerf(flops, mem_size, name=f"cur[{B=}]"):
                 run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i])
             i = (i + 1) % BUF_COPY
 
@@ -598,6 +593,11 @@ def run_batch(B=1):
             print("acc OK")
 
 def test():
+    torch.cuda.set_device(2)
+    torch.set_default_device('cuda')
+    torch.manual_seed(0)
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
+
     for i in range(16):
         run_batch(B=i+1)
 
