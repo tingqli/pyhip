@@ -1,7 +1,7 @@
 import os
 import random
 from typing import Optional
-os.environ['PYHIP_JIT_LOG'] = '1'
+os.environ['PYHIP_JIT_LOG'] = '0'
 from pyhip import cudaPerf, jit, JIT
 import torch
 

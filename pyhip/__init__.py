@@ -123,3 +123,5 @@ class cuPerf(object):
             if self.rw_bytes and self.rw_bytes > 0:
                 msg += f"  {self.rw_bytes*1e-6/self.dt_ms:.1f} GB/s "
             print(msg)
+
+from .kernels import *

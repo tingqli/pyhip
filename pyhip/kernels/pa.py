@@ -1,15 +1,10 @@
 import os
-os.environ['PYHIP_JIT_LOG'] = '1'
+os.environ['PYHIP_JIT_LOG'] = '0'
 import pyhip
 import torch
 import math
 
-from pyhip.asmjit import Addr2D, float_to_ieee754_bits_little
-torch.cuda.set_device(2)
-torch.set_default_device('cuda')
-torch.manual_seed(0)
-torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
-
+from pyhip.asmjit import Addr2D
 from functools import cache
 
 """
@@ -57,124 +52,8 @@ def get_lane_voffset(J, lane_rows_cols, lane_bytes, stride_bytes):
         voffset = J.gpr(get_lane_id_div(J, lane_cols)*stride_bytes + get_lane_id_mod(J, lane_cols)*(lane_bytes))
     return voffset
 
-
-def reduce(J:pyhip.JIT,
-            GQA,
-            warp_id,
-            p_out_seg,
-            p_max_out,
-            p_sum_out,
-            lds_base,
-            cur_sum,
-            cur_max,
-            vout,
-            ):
-    lane_id = get_lane_id(J)
-    lane_mod_16 = get_lane_id_mod(J, 16)
-    lane_div_16 = get_lane_id_div(J, 16)
-    
-    J.s_barrier()
-    with J.ExecMask(lane_div_16[0] == 0):
-        # ds_write2st64_b32 v34, v109, v94 offset1:1
-        addr = Addr2D(J, lds_base, warp_id, lane_mod_16 * 4, 16 * 4)
-        J.ds_write2_b32(addr.get_addr(), cur_max, cur_sum, mod=f'offset1:{4 * 16}')
-    J.s_barrier()
-
-    maxs = J.gpr(GQA, 'vf32')
-    sums = J.gpr(GQA, 'vf32')
-    gqa4 = div_up(GQA, 4)
-    real_max = J.gpr(gqa4, 'vf32')
-    real_sum = J.gpr(gqa4, 'vf32')
-    for i in range(gqa4):
-        m_token_id = gqa4 * warp_id + i
-        # TODO: precompute offset
-        addr = Addr2D(J, lds_base, 0, m_token_id * 4, 16 * 4)
-        J.ds_read2_b32(maxs[4 * i + 0 : 4 * i + 1], addr.get_addr(), mod=f'offset1:{16}')
-        J.ds_read2_b32(maxs[4 * i + 2 : 4 * i + 3], addr.get_addr(), mod=f'offset0:{2 * 16} offset1:{3 * 16}')
-        J.ds_read2_b32(sums[4 * i + 0 : 4 * i + 1], addr.get_addr(), mod=f'offset0:{4 * 16} offset1:{5 * 16}')
-        J.ds_read2_b32(sums[4 * i + 2 : 4 * i + 3], addr.get_addr(), mod=f'offset0:{6 * 16} offset1:{7 * 16}')
-        J.s_waitcnt(mod='lgkmcnt(0)')
-        J.v_max_f32_e32(real_max[i], maxs[4 * i + 0], maxs[4 * i + 1])
-        J.v_max3_f32(real_max[i], real_max[i], maxs[4 * i + 2], maxs[4 * i + 3])
-        tmp = J.gpr(4, 'vf32')
-        J.v_exp_f32_e32(tmp[0], maxs[4 * i + 0] - real_max[i])
-        J.v_exp_f32_e32(tmp[1], maxs[4 * i + 1] - real_max[i])
-        J.v_exp_f32_e32(tmp[2], maxs[4 * i + 2] - real_max[i])
-        J.v_exp_f32_e32(tmp[3], maxs[4 * i + 3] - real_max[i])
-        J.v_pk_mul_f32(tmp[0:1], tmp[0:1], sums[4 * i + 0 : 4 * i + 1])
-        J.v_pk_mul_f32(tmp[2:3], tmp[2:3], sums[4 * i + 2 : 4 * i + 3])
-        J.v_add_f32_e32(tmp[0], tmp[0], tmp[1])
-        J.v_add_f32_e32(tmp[2], tmp[2], tmp[3])
-        J.v_add_f32_e32(real_sum[i], tmp[0], tmp[2])
-
-    offset_max_sum = max_num_parts * 4
-    for i in range(gqa4):
-        m_token_id = gqa4 * warp_id + i
-        with J.ExecMask(m_token_id < GQA):
-            tmp = J.gpr("su32")
-            J.v_readfirstlane_b32(tmp, real_max[i])
-            J.s_store_dword(tmp, p_max_out, 0, mod="glc")
-            J.v_readfirstlane_b32(tmp, real_sum[i])
-            J.s_store_dword(tmp, p_sum_out, 0, mod="glc")
-            p_max_out[0] += offset_max_sum
-            p_sum_out[0] += offset_max_sum
-
-    vout_low = J.gpr(S // 64 * 4 * 2, 'vf32')
-    for k in range(S // 64):
-        vout_low_4 = vout_low[k * 8 : k * 8 + 7]
-        for i in range(4):
-            # NOTE: the following will be error:
-            # vout_4 = vout[k * 4 : k * 4 + 3]
-            # vout_low_4[2 * i + 1] = (vout_4[2][i] >> 16) | (vout_4[3][i] & 0xffff0000)
-            vout_low_4[2 * i + 0] = (vout[4 * k + i, 0] >> 16) | (vout[4 * k + i, 1] & 0xffff0000)
-            vout_low_4[2 * i + 1] = (vout[4 * k + i, 2] >> 16) | (vout[4 * k + i, 3] & 0xffff0000)
-
-    J.s_barrier()
-
-    addr = Addr2D(J, lds_base, warp_id, S * 2 * lane_mod_16, 16 * S * 2)
-    for k in range(S // 64):
-        J.ds_write_b64(addr.get_addr() + ((lane_div_16    ) ^ lane_mod_16) * 8, vout_low[8 * k + 0 : 8 * k + 1], mod=f'offset:{k * 64 * 2}')
-        J.ds_write_b64(addr.get_addr() + ((lane_div_16 + 4) ^ lane_mod_16) * 8, vout_low[8 * k + 2 : 8 * k + 3], mod=f'offset:{k * 64 * 2}')
-        J.ds_write_b64(addr.get_addr() + ((lane_div_16 + 8) ^ lane_mod_16) * 8, vout_low[8 * k + 4 : 8 * k + 5], mod=f'offset:{k * 64 * 2}')
-        J.ds_write_b64(addr.get_addr() + ((lane_div_16 +12) ^ lane_mod_16) * 8, vout_low[8 * k + 6 : 8 * k + 7], mod=f'offset:{k * 64 * 2}')
-    J.s_barrier()
-
-    offset_out = max_num_parts * (S * 2)
-    for i in range(gqa4):
-        m_token_id = gqa4 * warp_id + i
-        with J.ExecMask(m_token_id < GQA):
-            addr = Addr2D(J, lds_base, m_token_id, ((m_token_id ^ (lane_id >> 1)) * 2 + (lane_id & 1)) * 4, S * 2)
-            tmp = J.gpr(4, 'vf32')
-            J.ds_read_b32(tmp[0], addr.get_addr(), mod=f'offset:{16 * S * 2 * 0}')
-            J.ds_read_b32(tmp[1], addr.get_addr(), mod=f'offset:{16 * S * 2 * 1}')
-            J.ds_read_b32(tmp[2], addr.get_addr(), mod=f'offset:{16 * S * 2 * 2}')
-            J.ds_read_b32(tmp[3], addr.get_addr(), mod=f'offset:{16 * S * 2 * 3}')
-            J.s_waitcnt(mod='lgkmcnt(0)')
-            out_v = J.gpr(2, 'vf32')
-            out_v[0] = tmp[0] << 16
-            out_v[1] = tmp[0] & 0xffff0000
-
-            exp_d_max = J.gpr("vf32")
-            J.v_exp_f32_e32(exp_d_max, maxs[4 * i + 0] - real_max[i])
-            for j in range(2):
-                out_v[j] = exp_d_max * out_v[j]
-            for k in range(1, 4):
-                tmp[0] = tmp[k] << 16
-                tmp[1] = tmp[k] & 0xffff0000
-                exp_d_max = J.gpr("vf32")
-                J.v_exp_f32_e32(exp_d_max, maxs[4 * i + k] - real_max[i])
-                for j in range(2):
-                    tmp[j] = exp_d_max * tmp[j]
-                    out_v[j] += tmp[j]
-            inv_sum_scale = J.gpr('vf32')
-            J.v_rcp_f32(inv_sum_scale, real_sum[i] + 1e-6)
-            J.v_mul_f32(out_v[0], out_v[0], inv_sum_scale)
-            J.v_mul_f32(out_v[1], out_v[1], inv_sum_scale)
-            bf16x2 = J.gpr((out_v[1] & 0xffff0000) | (out_v[0] >> 16))
-
-            J.global_store_dword(lane_id << 2, bf16x2, p_out_seg, mod='nt')
-            p_out_seg[0] += offset_out
-            # J.s_waitcnt(mod=f"vmcnt(0)")
+def div_up(x, y):
+    return (x + y - 1) // y
 
 @pyhip.jit("-g")
 def pa_jit(J:pyhip.JIT,
@@ -193,6 +72,125 @@ def pa_jit(J:pyhip.JIT,
             ):
     acc_scale *= math.log2(math.exp(1))
     GQA = HQ // HK
+
+    def reduce(J:pyhip.JIT,
+                GQA,
+                warp_id,
+                p_out_seg,
+                p_max_out,
+                p_sum_out,
+                lds_base,
+                cur_sum,
+                cur_max,
+                vout,
+                ):
+        lane_id = get_lane_id(J)
+        lane_mod_16 = get_lane_id_mod(J, 16)
+        lane_div_16 = get_lane_id_div(J, 16)
+        
+        J.s_barrier()
+        with J.ExecMask(lane_div_16[0] == 0):
+            # ds_write2st64_b32 v34, v109, v94 offset1:1
+            addr = Addr2D(J, lds_base, warp_id, lane_mod_16 * 4, 16 * 4)
+            J.ds_write2_b32(addr.get_addr(), cur_max, cur_sum, mod=f'offset1:{4 * 16}')
+        J.s_barrier()
+
+        maxs = J.gpr(GQA, 'vf32')
+        sums = J.gpr(GQA, 'vf32')
+        gqa4 = div_up(GQA, 4)
+        real_max = J.gpr(gqa4, 'vf32')
+        real_sum = J.gpr(gqa4, 'vf32')
+        for i in range(gqa4):
+            m_token_id = gqa4 * warp_id + i
+            # TODO: precompute offset
+            addr = Addr2D(J, lds_base, 0, m_token_id * 4, 16 * 4)
+            J.ds_read2_b32(maxs[4 * i + 0 : 4 * i + 1], addr.get_addr(), mod=f'offset1:{16}')
+            J.ds_read2_b32(maxs[4 * i + 2 : 4 * i + 3], addr.get_addr(), mod=f'offset0:{2 * 16} offset1:{3 * 16}')
+            J.ds_read2_b32(sums[4 * i + 0 : 4 * i + 1], addr.get_addr(), mod=f'offset0:{4 * 16} offset1:{5 * 16}')
+            J.ds_read2_b32(sums[4 * i + 2 : 4 * i + 3], addr.get_addr(), mod=f'offset0:{6 * 16} offset1:{7 * 16}')
+            J.s_waitcnt(mod='lgkmcnt(0)')
+            J.v_max_f32_e32(real_max[i], maxs[4 * i + 0], maxs[4 * i + 1])
+            J.v_max3_f32(real_max[i], real_max[i], maxs[4 * i + 2], maxs[4 * i + 3])
+            tmp = J.gpr(4, 'vf32')
+            J.v_exp_f32_e32(tmp[0], maxs[4 * i + 0] - real_max[i])
+            J.v_exp_f32_e32(tmp[1], maxs[4 * i + 1] - real_max[i])
+            J.v_exp_f32_e32(tmp[2], maxs[4 * i + 2] - real_max[i])
+            J.v_exp_f32_e32(tmp[3], maxs[4 * i + 3] - real_max[i])
+            J.v_pk_mul_f32(tmp[0:1], tmp[0:1], sums[4 * i + 0 : 4 * i + 1])
+            J.v_pk_mul_f32(tmp[2:3], tmp[2:3], sums[4 * i + 2 : 4 * i + 3])
+            J.v_add_f32_e32(tmp[0], tmp[0], tmp[1])
+            J.v_add_f32_e32(tmp[2], tmp[2], tmp[3])
+            J.v_add_f32_e32(real_sum[i], tmp[0], tmp[2])
+
+        offset_max_sum = max_num_parts * 4
+        for i in range(gqa4):
+            m_token_id = gqa4 * warp_id + i
+            with J.ExecMask(m_token_id < GQA):
+                tmp = J.gpr("su32")
+                J.v_readfirstlane_b32(tmp, real_max[i])
+                J.s_store_dword(tmp, p_max_out, 0, mod="glc")
+                J.v_readfirstlane_b32(tmp, real_sum[i])
+                J.s_store_dword(tmp, p_sum_out, 0, mod="glc")
+                p_max_out[0] += offset_max_sum
+                p_sum_out[0] += offset_max_sum
+
+        vout_low = J.gpr(S // 64 * 4 * 2, 'vf32')
+        for k in range(S // 64):
+            vout_low_4 = vout_low[k * 8 : k * 8 + 7]
+            for i in range(4):
+                # NOTE: the following will be error:
+                # vout_4 = vout[k * 4 : k * 4 + 3]
+                # vout_low_4[2 * i + 1] = (vout_4[2][i] >> 16) | (vout_4[3][i] & 0xffff0000)
+                vout_low_4[2 * i + 0] = (vout[4 * k + i, 0] >> 16) | (vout[4 * k + i, 1] & 0xffff0000)
+                vout_low_4[2 * i + 1] = (vout[4 * k + i, 2] >> 16) | (vout[4 * k + i, 3] & 0xffff0000)
+
+        J.s_barrier()
+
+        addr = Addr2D(J, lds_base, warp_id, S * 2 * lane_mod_16, 16 * S * 2)
+        for k in range(S // 64):
+            J.ds_write_b64(addr.get_addr() + ((lane_div_16    ) ^ lane_mod_16) * 8, vout_low[8 * k + 0 : 8 * k + 1], mod=f'offset:{k * 64 * 2}')
+            J.ds_write_b64(addr.get_addr() + ((lane_div_16 + 4) ^ lane_mod_16) * 8, vout_low[8 * k + 2 : 8 * k + 3], mod=f'offset:{k * 64 * 2}')
+            J.ds_write_b64(addr.get_addr() + ((lane_div_16 + 8) ^ lane_mod_16) * 8, vout_low[8 * k + 4 : 8 * k + 5], mod=f'offset:{k * 64 * 2}')
+            J.ds_write_b64(addr.get_addr() + ((lane_div_16 +12) ^ lane_mod_16) * 8, vout_low[8 * k + 6 : 8 * k + 7], mod=f'offset:{k * 64 * 2}')
+        J.s_barrier()
+
+        offset_out = max_num_parts * (S * 2)
+        for i in range(gqa4):
+            m_token_id = gqa4 * warp_id + i
+            with J.ExecMask(m_token_id < GQA):
+                addr = Addr2D(J, lds_base, m_token_id, ((m_token_id ^ (lane_id >> 1)) * 2 + (lane_id & 1)) * 4, S * 2)
+                tmp = J.gpr(4, 'vf32')
+                J.ds_read_b32(tmp[0], addr.get_addr(), mod=f'offset:{16 * S * 2 * 0}')
+                J.ds_read_b32(tmp[1], addr.get_addr(), mod=f'offset:{16 * S * 2 * 1}')
+                J.ds_read_b32(tmp[2], addr.get_addr(), mod=f'offset:{16 * S * 2 * 2}')
+                J.ds_read_b32(tmp[3], addr.get_addr(), mod=f'offset:{16 * S * 2 * 3}')
+                J.s_waitcnt(mod='lgkmcnt(0)')
+                out_v = J.gpr(2, 'vf32')
+                out_v[0] = tmp[0] << 16
+                out_v[1] = tmp[0] & 0xffff0000
+
+                exp_d_max = J.gpr("vf32")
+                J.v_exp_f32_e32(exp_d_max, maxs[4 * i + 0] - real_max[i])
+                for j in range(2):
+                    out_v[j] = exp_d_max * out_v[j]
+                for k in range(1, 4):
+                    tmp[0] = tmp[k] << 16
+                    tmp[1] = tmp[k] & 0xffff0000
+                    exp_d_max = J.gpr("vf32")
+                    J.v_exp_f32_e32(exp_d_max, maxs[4 * i + k] - real_max[i])
+                    for j in range(2):
+                        tmp[j] = exp_d_max * tmp[j]
+                        out_v[j] += tmp[j]
+                inv_sum_scale = J.gpr('vf32')
+                J.v_rcp_f32(inv_sum_scale, real_sum[i] + 1e-6)
+                J.v_mul_f32(out_v[0], out_v[0], inv_sum_scale)
+                J.v_mul_f32(out_v[1], out_v[1], inv_sum_scale)
+                bf16x2 = J.gpr((out_v[1] & 0xffff0000) | (out_v[0] >> 16))
+
+                J.global_store_dword(lane_id << 2, bf16x2, p_out_seg, mod='nt')
+                p_out_seg[0] += offset_out
+                # J.s_waitcnt(mod=f"vmcnt(0)")
+
     '''
     偏移之后，找到本WG需要处理的数据：
         
@@ -730,228 +728,235 @@ def pa_reduce_jit(J,
         J.s_nop(0)
 
     J.Label("exit_final")
-B = 1
-HQ = 32
-HK = 4
-S = 128
 
-# KV_LEN 如何切分为CU个数的整数倍,切分不均匀是很大的原因，
-#
-# B*HK=4, KV_LEN需要是20的整数倍才能保证均匀分给80个CU 45694/20=2284.7
-# 因此每个block需要完成2284~2285个token，但是每个batch的kv-len数目不同
-# 每个block可以遍历 kv_indptr 来确定自己需要负责的kv-len区间，因为 kv_indptr
-# 相对较小，遍历很快，
-KV_LEN = 40*1024
-KV_LEN = 45694
+def test():
+    B = 1
+    HQ = 32
+    HK = 4
+    S = 128
 
-#KV_LEN = 512
-DT = torch.bfloat16
-BLOCK_SIZE16 = 16
-# should be [32, 64]
-BLOCK_SIZE = 32
-BUF_COPY = 1
-BUF_COPY = 32
+    # KV_LEN 如何切分为CU个数的整数倍,切分不均匀是很大的原因，
+    #
+    # B*HK=4, KV_LEN需要是20的整数倍才能保证均匀分给80个CU 45694/20=2284.7
+    # 因此每个block需要完成2284~2285个token，但是每个batch的kv-len数目不同
+    # 每个block可以遍历 kv_indptr 来确定自己需要负责的kv-len区间，因为 kv_indptr
+    # 相对较小，遍历很快，
+    KV_LEN = 40*1024
+    KV_LEN = 45694
 
-KV_MIN_PART_SIZE = 256
-# should be [256, 512, 1024]
-KV_PART_SIZE = 256 * 4
+    #KV_LEN = 512
+    DT = torch.bfloat16
+    BLOCK_SIZE16 = 16
+    # should be [32, 64]
+    BLOCK_SIZE = 32
+    BUF_COPY = 1
+    BUF_COPY = 32
 
-query = torch.randint(-2, 3, [B, HQ, S], dtype=DT)
-ITEMSIZE = 16 // query.itemsize
-seq_lens = {}
-key_caches = {}
-value_caches = {}
-block_tables = {}
-max_num_blocks_per_seq = {}
-block_num = {}
-# [N, BLOCK_SIZE, HK, S]
-for block_size in (BLOCK_SIZE16, BLOCK_SIZE):
-    max_num_blocks_per_seq[block_size] = (KV_LEN + block_size - 1) // block_size
-    block_num = B * max_num_blocks_per_seq[block_size]
-    key_caches[block_size] = []
-    value_caches[block_size] = []
-    block_tables[block_size] = []
-    seq_lens[block_size] = []
-    for _ in range(BUF_COPY):
-        if block_size == BLOCK_SIZE16:
-            key_cache_shape = (block_num, HK, S // ITEMSIZE, block_size, ITEMSIZE)
-        else:
-            # [..., block_size // mfma M group, mfma M group, K // vec_size, mfma M, vec_size]
-            # the highest 2 dimensions are for one 16x16x(4*8)mfma, `S // ITEMSIZE` is used for reduced dimension
-            #   in order to match value_cache reduced dimension (4*8), the result of key*query should be also (4*8) which means each thread will have contious 8 elments.
-            #   so the 5th `16` dimension and 3rd `2` come from:
-            #      actual tokens 5th   3rd
-            #      token 0- 3    0- 3  group0
-            #      token 4- 7    0- 3  group1
-            #      token 8-11    4- 7  group0
-            #      token12-15    4- 7  group1
-            #      token16-19    8-11  gourp0
-            #      token20-23    8-11  gourp1
-            #      token24-27   12-15  gourp0
-            #      token28-31   12-15  gourp1
-            key_cache_shape = (block_num, HK, block_size // (16*2), 2, S // ITEMSIZE, 16, ITEMSIZE)
-        key_cache = torch.randint(-2, 3, key_cache_shape, dtype=DT)
-        if block_size == BLOCK_SIZE16:
-            value_cache_shape = (block_num, HK, block_size // ITEMSIZE, S, ITEMSIZE)
-        else:
-            # the highest 3 dimensions are for one 16x16x(4*8)mfma, `block_size // (4*ITEMSIZE)` is used for reduced dimension
-            #   `S // 16` is for N dimension
-            # [..., block_size // mfma K, M // 16, mfma K col, mfma M, vec_size]
-            value_cache_shape = (block_num, HK, block_size // (4*ITEMSIZE), S // 16, 4, 16, ITEMSIZE)
-        value_cache = torch.randint(-2, 3, value_cache_shape, dtype=DT)
-        seq_len = torch.full(size=(B,), fill_value=KV_LEN, dtype=torch.int)
-        block_table = torch.linspace(0, block_num - 1, block_num, dtype=torch.int32).reshape(B, max_num_blocks_per_seq[block_size])
-        seq_lens[block_size].append(seq_len)
-        key_caches[block_size].append(key_cache)
-        value_caches[block_size].append(value_cache)
-        block_tables[block_size].append(block_table)
+    KV_MIN_PART_SIZE = 256
+    # should be [256, 512, 1024]
+    KV_PART_SIZE = 256 * 4
 
-scale = 1 / (S**0.5)
+    query = torch.randint(-2, 3, [B, HQ, S], dtype=DT)
+    ITEMSIZE = 16 // query.itemsize
+    seq_lens = {}
+    key_caches = {}
+    value_caches = {}
+    block_tables = {}
+    max_num_blocks_per_seq = {}
+    block_num = {}
+    # [N, BLOCK_SIZE, HK, S]
+    for block_size in (BLOCK_SIZE16, BLOCK_SIZE):
+        max_num_blocks_per_seq[block_size] = (KV_LEN + block_size - 1) // block_size
+        block_num = B * max_num_blocks_per_seq[block_size]
+        key_caches[block_size] = []
+        value_caches[block_size] = []
+        block_tables[block_size] = []
+        seq_lens[block_size] = []
+        for _ in range(BUF_COPY):
+            if block_size == BLOCK_SIZE16:
+                key_cache_shape = (block_num, HK, S // ITEMSIZE, block_size, ITEMSIZE)
+            else:
+                # [..., block_size // mfma M group, mfma M group, K // vec_size, mfma M, vec_size]
+                # the highest 2 dimensions are for one 16x16x(4*8)mfma, `S // ITEMSIZE` is used for reduced dimension
+                #   in order to match value_cache reduced dimension (4*8), the result of key*query should be also (4*8) which means each thread will have contious 8 elments.
+                #   so the 5th `16` dimension and 3rd `2` come from:
+                #      actual tokens 5th   3rd
+                #      token 0- 3    0- 3  group0
+                #      token 4- 7    0- 3  group1
+                #      token 8-11    4- 7  group0
+                #      token12-15    4- 7  group1
+                #      token16-19    8-11  gourp0
+                #      token20-23    8-11  gourp1
+                #      token24-27   12-15  gourp0
+                #      token28-31   12-15  gourp1
+                key_cache_shape = (block_num, HK, block_size // (16*2), 2, S // ITEMSIZE, 16, ITEMSIZE)
+            key_cache = torch.randint(-2, 3, key_cache_shape, dtype=DT)
+            if block_size == BLOCK_SIZE16:
+                value_cache_shape = (block_num, HK, block_size // ITEMSIZE, S, ITEMSIZE)
+            else:
+                # the highest 3 dimensions are for one 16x16x(4*8)mfma, `block_size // (4*ITEMSIZE)` is used for reduced dimension
+                #   `S // 16` is for N dimension
+                # [..., block_size // mfma K, M // 16, mfma K col, mfma M, vec_size]
+                value_cache_shape = (block_num, HK, block_size // (4*ITEMSIZE), S // 16, 4, 16, ITEMSIZE)
+            value_cache = torch.randint(-2, 3, value_cache_shape, dtype=DT)
+            seq_len = torch.full(size=(B,), fill_value=KV_LEN, dtype=torch.int)
+            block_table = torch.linspace(0, block_num - 1, block_num, dtype=torch.int32).reshape(B, max_num_blocks_per_seq[block_size])
+            seq_lens[block_size].append(seq_len)
+            key_caches[block_size].append(key_cache)
+            value_caches[block_size].append(value_cache)
+            block_tables[block_size].append(block_table)
 
-num_parts = KV_PART_SIZE//KV_MIN_PART_SIZE
+    scale = 1 / (S**0.5)
 
-# pa hip
-def div_up(x, y):
-    return (x + y - 1) // y
+    num_parts = KV_PART_SIZE//KV_MIN_PART_SIZE
 
-max_num_parts = div_up(KV_LEN, KV_PART_SIZE)
-# -g -ggdb -O1
-my_out_seg = torch.ones([B, HQ, max_num_parts, S], dtype=DT) * 3
-my_out = torch.empty([B, HQ, S], dtype=DT)
-my_max = torch.empty([B, HQ, max_num_parts, 1], dtype=torch.float32) * 5
-my_sum = torch.empty([B, HQ, max_num_parts, 1], dtype=torch.float32) * 6
-qk_out = torch.ones([B, HK, HQ // HK, max_num_parts * KV_PART_SIZE], dtype=torch.float32)
+    # pa hip
+    max_num_parts = div_up(KV_LEN, KV_PART_SIZE)
+    # -g -ggdb -O1
+    my_out_seg = torch.ones([B, HQ, max_num_parts, S], dtype=DT) * 3
+    my_out = torch.empty([B, HQ, S], dtype=DT)
+    my_max = torch.empty([B, HQ, max_num_parts, 1], dtype=torch.float32) * 5
+    my_sum = torch.empty([B, HQ, max_num_parts, 1], dtype=torch.float32) * 6
 
-def get_full_ref(block_size):
-    # [block_num, HK, block_size // (16*2), 2, S // ITEMSIZE, 16, ITEMSIZE]
-    #  ->[block_num, HK, block_size // (16*2), 2, 16, S // ITEMSIZE, ITEMSIZE]
-    #  ->[block_num, HK, block_size // (16*2), 32, S]
-    key_cache = key_caches[block_size][0].permute(0, 1, 2, 3, 5, 4, 6).reshape(-1, HK, block_size // 32, 32, S)
-    #  ->[block_num, HK, block_size // (16*2), 8, 4, S]
-    key_cache = key_cache.reshape(-1, HK, block_size // (16*2), 8, 4, S)
-    # interleave 0, 1, ... 4, 5... to 0, 4, 1, 5 ...
-    key_cache = key_cache[:,:,:,(0,4,1,5,2,6,3,7), :, :]
-    #  ->[block_num, HK, block_size, S]
-    key_cache = key_cache.reshape(-1, HK, block_size, S)
-    #  ->[B, max_num_blocks_per_seq, HK, block_size, S] -> [B, HK, max_num_blocks_per_seq, block_size, S]
-    key_cache = key_cache.reshape(B, max_num_blocks_per_seq[block_size], HK, block_size, S).permute(0, 2, 1, 3, 4)
-    #  ->[B, HK, KV_LEN_pad, S]
-    key_cache = key_cache.reshape(B, HK, -1, S)
-    key_cache = key_cache[..., :KV_LEN, :].transpose(2, 3)
-    ref_qk = query.reshape(B, HK, HQ // HK, -1) @ key_cache
-    ref_qk = ref_qk.to(torch.float32)
-    ref_qk = ref_qk * scale
-    s = torch.softmax(ref_qk, dim=-1).to(key_cache.dtype)
-    # [block_num, HK, block_size // (4*ITEMSIZE), S // 16, 4, 16, ITEMSIZE]
-    #  ->[block_num, HK, block_size // (4*ITEMSIZE), 4, ITEMSIZE, S // 16, 16]
-    #  ->[block_num, HK, block_size, S]
-    value_cache = value_caches[block_size][0].permute(0, 1, 2, 4, 6, 3, 5).reshape(-1, HK, block_size, S)
-    #  ->[B, max_num_blocks_per_seq, HK, block_size, S] -> [B, HK, max_num_blocks_per_seq, block_size, S]
-    value_cache = value_cache.reshape(B, max_num_blocks_per_seq[block_size], HK, block_size, S).permute(0, 2, 1, 3, 4)
-    #  ->[B, HK, KV_LEN_pad, S]
-    value_cache = value_cache.reshape(B, HK, -1, S)
-    value_cache = value_cache[..., :KV_LEN, :]
-    ref_out = s @ value_cache
-    ref_out = ref_out.reshape(B, HQ, S)
-    return ref_out.to(query.dtype)
+    def get_ref(block_size):
+        # [block_num, HK, block_size // (16*2), 2, S // ITEMSIZE, 16, ITEMSIZE]
+        #  ->[block_num, HK, block_size // (16*2), 2, 16, S // ITEMSIZE, ITEMSIZE]
+        #  ->[block_num, HK, block_size // (16*2), 32, S]
+        key_cache = key_caches[block_size][0].permute(0, 1, 2, 3, 5, 4, 6).reshape(-1, HK, block_size // 32, 32, S)
+        #  ->[block_num, HK, block_size // (16*2), 8, 4, S]
+        key_cache = key_cache.reshape(-1, HK, block_size // (16*2), 8, 4, S)
+        # interleave 0, 1, ... 4, 5... to 0, 4, 1, 5 ...
+        key_cache = key_cache[:,:,:,(0,4,1,5,2,6,3,7), :, :]
+        #  ->[block_num, HK, block_size, S]
+        key_cache = key_cache.reshape(-1, HK, block_size, S)
+        #  ->[B, max_num_blocks_per_seq, HK, block_size, S] -> [B, HK, max_num_blocks_per_seq, block_size, S]
+        key_cache = key_cache.reshape(B, max_num_blocks_per_seq[block_size], HK, block_size, S).permute(0, 2, 1, 3, 4)
+        #  ->[B, HK, KV_LEN_pad, S]
+        key_cache = key_cache.reshape(B, HK, -1, S)
+        key_cache = key_cache[..., :KV_LEN, :].transpose(2, 3)
+        ref_qk = query.reshape(B, HK, HQ // HK, -1) @ key_cache
+        ref_qk = ref_qk.to(torch.float32)
+        ref_qk = ref_qk * scale
+        s = torch.softmax(ref_qk, dim=-1).to(key_cache.dtype)
+        # [block_num, HK, block_size // (4*ITEMSIZE), S // 16, 4, 16, ITEMSIZE]
+        #  ->[block_num, HK, block_size // (4*ITEMSIZE), 4, ITEMSIZE, S // 16, 16]
+        #  ->[block_num, HK, block_size, S]
+        value_cache = value_caches[block_size][0].permute(0, 1, 2, 4, 6, 3, 5).reshape(-1, HK, block_size, S)
+        #  ->[B, max_num_blocks_per_seq, HK, block_size, S] -> [B, HK, max_num_blocks_per_seq, block_size, S]
+        value_cache = value_cache.reshape(B, max_num_blocks_per_seq[block_size], HK, block_size, S).permute(0, 2, 1, 3, 4)
+        #  ->[B, HK, KV_LEN_pad, S]
+        value_cache = value_cache.reshape(B, HK, -1, S)
+        value_cache = value_cache[..., :KV_LEN, :]
+        ref_out = s @ value_cache
+        ref_out = ref_out.reshape(B, HQ, S)
+        return ref_out.to(query.dtype)
 
-def run_aiter(query,
-               key_cache,
-               value_cache,
-               block_tables,
-               seq_lens,
-               max_num_blocks_per_seq):
-    return aiter.pa_fwd_asm(
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        seq_lens,
-        max_num_blocks_per_seq,
-    )
+    def run_aiter(query,
+                key_cache,
+                value_cache,
+                block_tables,
+                seq_lens,
+                max_num_blocks_per_seq):
+        import aiter
+        return aiter.pa_fwd_asm(
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            seq_lens,
+            max_num_blocks_per_seq,
+        )
 
-if 0:
-    import aiter
-    out_ref = None
-    # if 0:
-    #     torch.save({
-    #         "q": query,
-    #         "k": key_cache[1:45694+1],
-    #         "v": value_cache[1:45694+1],
-    #         "kv_page_indices": kv_page_indices,
-    #         "out": out
-    #     }, "/mywork/users/luocheng/sglang/mytest/pa.pt")
-    if 0:
-        import os.path
-        data = torch.load(os.path.dirname(__file__) + '/pa.pt')
-        query = data['q'].to(device=query.device)
-        key_caches[-1][1:KV_LEN+1] = data['k']
-        value_caches[-1][1:KV_LEN+1] = data['v']
-        out_ref = data['out'].to(device=query.device)
-    out = run_aiter(query=query, key_cache=key_caches[BLOCK_SIZE16][-1], value_cache=value_caches[BLOCK_SIZE16][-1],
-                     block_tables=block_tables[BLOCK_SIZE16][-1], seq_lens=seq_lens[BLOCK_SIZE16][-1], max_num_blocks_per_seq=max_num_blocks_per_seq[BLOCK_SIZE16])
+    def test_aiter_perf():
+        import aiter
+        out_ref = None
+        # if 0:
+        #     torch.save({
+        #         "q": query,
+        #         "k": key_cache[1:45694+1],
+        #         "v": value_cache[1:45694+1],
+        #         "kv_page_indices": kv_page_indices,
+        #         "out": out
+        #     }, "/mywork/users/luocheng/sglang/mytest/pa.pt")
+        # if 0:
+        #     import os.path
+        #     data = torch.load(os.path.dirname(__file__) + '/pa.pt')
+        #     query = data['q'].to(device=query.device)
+        #     key_caches[-1][1:KV_LEN+1] = data['k']
+        #     value_caches[-1][1:KV_LEN+1] = data['v']
+        #     out_ref = data['out'].to(device=query.device)
+        out = run_aiter(query=query, key_cache=key_caches[BLOCK_SIZE16][-1], value_cache=value_caches[BLOCK_SIZE16][-1],
+                        block_tables=block_tables[BLOCK_SIZE16][-1], seq_lens=seq_lens[BLOCK_SIZE16][-1], max_num_blocks_per_seq=max_num_blocks_per_seq[BLOCK_SIZE16])
 
-    if out_ref is not None:
-        assert torch.allclose(out, out_ref), "aiter acc is wrong"
-        print('aiter acc ok')
-    i = 0
-    for _ in range(10):
-        with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="aiter"):
-            run_aiter(query=query, key_cache=key_caches[BLOCK_SIZE16][i], value_cache=value_caches[BLOCK_SIZE16][i],
-                       block_tables=block_tables[BLOCK_SIZE16][i], seq_lens=seq_lens[BLOCK_SIZE16][i], max_num_blocks_per_seq=max_num_blocks_per_seq[BLOCK_SIZE16])
-        i = (i + 1) % BUF_COPY
+        if out_ref is not None:
+            assert torch.allclose(out, out_ref), "aiter acc is wrong"
+            print('aiter acc ok')
+        i = 0
+        for _ in range(10):
+            with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="aiter"):
+                run_aiter(query=query, key_cache=key_caches[BLOCK_SIZE16][i], value_cache=value_caches[BLOCK_SIZE16][i],
+                        block_tables=block_tables[BLOCK_SIZE16][i], seq_lens=seq_lens[BLOCK_SIZE16][i], max_num_blocks_per_seq=max_num_blocks_per_seq[BLOCK_SIZE16])
+            i = (i + 1) % BUF_COPY
 
-def test_acc():
-    print("======================= verify correctness ==============================")
-    pa_jit([B, HK, max_num_parts], [256],
-           HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts,
-            query.data_ptr(),           # [B, HQ, S]
-            key_caches[BLOCK_SIZE][0].data_ptr(),   # [BLOCK_NUM, HK, S // 8, BLOCK_SIZE, 8]
-            value_caches[BLOCK_SIZE][0].data_ptr(), # [BLOCK_NUM, HK, S, BLOCK_SIZE // 8, 8]
-            block_tables[BLOCK_SIZE][0].data_ptr(),
-            seq_lens[BLOCK_SIZE][0].data_ptr(),
-            my_out_seg.data_ptr(),
-            my_max.data_ptr(), 
-            my_sum.data_ptr(),
-            max_num_parts,
-            max_num_blocks_per_seq[BLOCK_SIZE])
-    pa_reduce_jit([B, HQ], [256], KV_PART_SIZE, HQ, S,
-                seq_lens[BLOCK_SIZE][0].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
-                0)
+    def test_acc():
+        print("======================= verify correctness ==============================")
+        pa_jit([B, HK, max_num_parts], [256],
+            HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts,
+                query.data_ptr(),           # [B, HQ, S]
+                key_caches[BLOCK_SIZE][0].data_ptr(),   # [BLOCK_NUM, HK, S // 8, BLOCK_SIZE, 8]
+                value_caches[BLOCK_SIZE][0].data_ptr(), # [BLOCK_NUM, HK, S, BLOCK_SIZE // 8, 8]
+                block_tables[BLOCK_SIZE][0].data_ptr(),
+                seq_lens[BLOCK_SIZE][0].data_ptr(),
+                my_out_seg.data_ptr(),
+                my_max.data_ptr(), 
+                my_sum.data_ptr(),
+                max_num_parts,
+                max_num_blocks_per_seq[BLOCK_SIZE])
+        pa_reduce_jit([B, HQ], [256], KV_PART_SIZE, HQ, S,
+                    seq_lens[BLOCK_SIZE][0].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
+                    0)
 
-    ref_out = get_full_ref(BLOCK_SIZE)
-    idx = torch.where(torch.abs(ref_out - my_out) > 0.05)
-    if len(idx[0]):
-        print(f'idx = {idx}\nref_out={ref_out[idx]}\ncur={my_out[idx]}')
+        ref_out = get_ref(BLOCK_SIZE)
+        idx = torch.where(torch.abs(ref_out - my_out) > 0.05)
+        if len(idx[0]):
+            print(f'idx = {idx}\nref_out={ref_out[idx]}\ncur={my_out[idx]}')
 
-    assert torch.allclose(ref_out, my_out, rtol=0.02, atol=0.02), "out is wrong"
-    print('acc ok')
+        assert torch.allclose(ref_out, my_out, rtol=0.02, atol=0.02), "out is wrong"
+        print('acc ok')
 
-def test_perf():
-    print("======================= test performance ==============================")
+    def test_perf():
+        print("======================= test performance ==============================")
 
-    i = 0
-    for round in range(10):
-        with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="pa_jit"):
-            pa_jit([B, HK, max_num_parts], [256],
-                    HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts,
-                    query.data_ptr(),                       # [B, HQ, S]
-                    key_caches[BLOCK_SIZE][i].data_ptr(),   # [BLOCK_NUM, HK, S // 8, BLOCK_SIZE, 8]
-                    value_caches[BLOCK_SIZE][i].data_ptr(), # [BLOCK_NUM, HK, S, BLOCK_SIZE // 8, 8]
-                    block_tables[BLOCK_SIZE][i].data_ptr(),
-                    seq_lens[BLOCK_SIZE][i].data_ptr(),
-                    my_out_seg.data_ptr(),
-                    my_max.data_ptr(), 
-                    my_sum.data_ptr(),
-                    max_num_parts,
-                    max_num_blocks_per_seq[BLOCK_SIZE])
-            pa_reduce_jit([B, HQ], [256], KV_PART_SIZE, HQ, S,
-                        seq_lens[BLOCK_SIZE][i].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
-                        0)
+        i = 0
+        for round in range(10):
+            with pyhip.cudaPerf(B * HQ // HK * KV_LEN * S * 2 * 2, B * (HK * KV_LEN * S * 2 * 2), name="pa_jit"):
+                pa_jit([B, HK, max_num_parts], [256],
+                        HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, scale, num_parts,
+                        query.data_ptr(),                       # [B, HQ, S]
+                        key_caches[BLOCK_SIZE][i].data_ptr(),   # [BLOCK_NUM, HK, S // 8, BLOCK_SIZE, 8]
+                        value_caches[BLOCK_SIZE][i].data_ptr(), # [BLOCK_NUM, HK, S, BLOCK_SIZE // 8, 8]
+                        block_tables[BLOCK_SIZE][i].data_ptr(),
+                        seq_lens[BLOCK_SIZE][i].data_ptr(),
+                        my_out_seg.data_ptr(),
+                        my_max.data_ptr(), 
+                        my_sum.data_ptr(),
+                        max_num_parts,
+                        max_num_blocks_per_seq[BLOCK_SIZE])
+                pa_reduce_jit([B, HQ], [256], KV_PART_SIZE, HQ, S,
+                            seq_lens[BLOCK_SIZE][i].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), max_num_parts,
+                            0)
 
-        i = (i + 1) % BUF_COPY
-    print(f"[{B}, {HK}, {div_up(KV_LEN, KV_PART_SIZE)}]")
+            i = (i + 1) % BUF_COPY
+        print(f"[{B}, {HK}, {div_up(KV_LEN, KV_PART_SIZE)}]")
 
-if __name__ == '__main__':
+    test_aiter_perf()
     test_acc()
     test_perf()
+
+if __name__ == '__main__':
+    torch.cuda.set_device(2)
+    torch.set_default_device('cuda')
+    torch.manual_seed(0)
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
+    
+    test()
