@@ -49,6 +49,7 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
 
 @jit()
 def moe_gemm_batch1(J:JIT,
+                    weight_dtype,
                     K,            # compile-time args
                     N,            # compile-time args
                     with_silu,    # compile-time args
@@ -56,7 +57,9 @@ def moe_gemm_batch1(J:JIT,
                     p_weight:"void*",
                     p_output:"void*",
                     p_topk_ids:"void*",
-                    p_topk_weight:"float*", M:"int"):
+                    p_topk_weight:"float*", 
+                    p_w_scale:"float*",
+                    M:"int"):
 
     BLOCK_SIZE_M = 16  # nBM * 16
     BLOCK_SIZE_N = 32  # nBN * 32
@@ -72,10 +75,14 @@ def moe_gemm_batch1(J:JIT,
 
     sizeof_bf16 = 2
     sizeof_f32 = 4
-    stride_AB = K*sizeof_bf16
+    sizeof_w = sizeof_bf16 if weight_dtype == torch.bfloat16 else 1
+    stride_A = K*sizeof_bf16
+    stride_B = K*sizeof_w
 
     Creg = J.gpr(2, 4, "vf32")
-    Areg = J.gpr(2, 2, 2, "vbf16x2") # 8-bf16 == DWORDx4
+    # there is 16 elements per weight read if fp8, so A should be double read
+    A_rep = 1 if weight_dtype == torch.bfloat16 else 2
+    Areg = J.gpr(2, A_rep, 2, 2, "vbf16x2") # 8-bf16 == DWORDx4
     Breg = J.gpr(2, 2, 2, 2, "vbf16x2") # 8-bf16 == DWORDx4
 
     Creg[:] = 0
@@ -96,17 +103,20 @@ def moe_gemm_batch1(J:JIT,
         warp_id = J.gpr("su32")
         J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
         assert K % (num_split_K*32) == 0
-        p_weight[:] = p_weight[:] + (16 if with_silu else 32)*J.blockIdx.x*stride_AB
+        p_weight[:] = p_weight[:] + (16 if with_silu else 32)*J.blockIdx.x*stride_B
         p_output[:] = p_output[:] + (16 if with_silu else 32)*J.blockIdx.x*sizeof_bf16
+        J.debug_setup((J.blockIdx.x[0] == 0) & (e_idx[0] == 0) & (warp_id[0] == 0))
 
         p_weight1 = J.gpr(2,"su32")
         if with_silu:
-            J.s_add_u32(p_weight1[0], p_weight[0], (N//2)*K*sizeof_bf16)
+            J.s_add_u32(p_weight1[0], p_weight[0], (N//2)*K*sizeof_w)
             J.s_addc_u32(p_weight1[1], p_weight[1], 0)
         else:
-            J.s_add_u32(p_weight1[0], p_weight[0], 16*K*sizeof_bf16)
+            J.s_add_u32(p_weight1[0], p_weight[0], 16*K*sizeof_w)
             J.s_addc_u32(p_weight1[1], p_weight[1], 0)
-        voffset_a = J.gpr((J.threadIdx.x % 16)*stride_AB + (J.threadIdx.x//16) * 16)
+        # 16 elements for a if fp8
+        a_element_num_per_thread = 8 if weight_dtype == torch.bfloat16 else 16
+        voffset_a = J.gpr((J.threadIdx.x % 16)*stride_A + (J.threadIdx.x//16) * (a_element_num_per_thread*sizeof_bf16))
         voffset_b = J.gpr(J.threadIdx.x * 16)
 
         soffset_kb = J.gpr("su32")
@@ -123,42 +133,91 @@ def moe_gemm_batch1(J:JIT,
             J.s_load_dword(s_weight, p_topk_weight, e_idx[0] * 4)
 
         buff_a = J.Buffer(p_input, M*K*sizeof_bf16)
-        buff_a.load_dwordx4(Areg[pp_reg_id], voffset_a, soffset_ka)
 
-    J.s_waitcnt(mod=f"lgkmcnt(0)")
-    p_weight[:] = p_weight[:] + s_e_id * (N * K * sizeof_bf16)
-    p_weight1[:] = p_weight1[:] + s_e_id * (N * K * sizeof_bf16)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        if weight_dtype != torch.bfloat16:
+            v_w_scale = J.gpr(2, 2, 'vf32')
+            # scale layout: [E, N, 1]
+            offset0 = J.gpr(1, 'vu32')
+            offset0[0] = J.gpr(s_e_id * (N * sizeof_f32) + (16 if with_silu else 32) * J.blockIdx.x * sizeof_f32) + lane_mod_16 * sizeof_f32
+            offset1 = offset0 + (N // 2 * sizeof_f32 if with_silu else 16 * sizeof_f32)
+            J.global_load_dword(v_w_scale[0, 0], offset0, p_w_scale)
+            J.global_load_dword(v_w_scale[1, 0], offset1, p_w_scale)
 
-    buff_b0 = J.Buffer(p_weight, 16*K*sizeof_bf16)
-    buff_b1 = J.Buffer(p_weight1, 16*K*sizeof_bf16)
+        buff_a.load_dwordx4(Areg[pp_reg_id, 0], voffset_a, soffset_ka)
+        if weight_dtype != torch.bfloat16:
+            buff_a.load_dwordx4(Areg[pp_reg_id, 1], voffset_a, soffset_ka + 16)
+
+    p_weight[:] = p_weight[:] + s_e_id * (N * K * sizeof_w)
+    p_weight1[:] = p_weight1[:] + s_e_id * (N * K * sizeof_w)
+
+    buff_b0 = J.Buffer(p_weight, 16*K*sizeof_w)
+    buff_b1 = J.Buffer(p_weight1, 16*K*sizeof_w)
 
     # ping pong register buffer id
     buff_b0.load_dwordx4(Breg[pp_reg_id, 0], voffset_b, soffset_kb)
     buff_b1.load_dwordx4(Breg[pp_reg_id, 1], voffset_b, soffset_kb)
-    soffset_kb[0] = soffset_kb[0] + 16*(32*num_split_K)*sizeof_bf16
-    soffset_ka[0] = soffset_ka[0] + 32*num_split_K*sizeof_bf16
+    soffset_kb[0] = soffset_kb[0] + 16*64*num_split_K
+    soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread*4*num_split_K*sizeof_bf16
     pp_reg_id = pp_reg_id ^ 1
 
-    k_max = div_up(K, num_split_K*32)
+    k_step_wg = num_split_K*32 if weight_dtype == torch.bfloat16 else num_split_K*64
+    if weight_dtype == torch.bfloat16:
+        assert K % (num_split_K*32) == 0, f'K must be multiple of {num_split_K*32}'
+    else:
+        # a wave needs at least 64 elements
+        assert K % 64 == 0, 'K must be multiple of 64'
+
+    # (A0.B0.C0.D0.A1.B1.C1.D1)[3, 2, 7, 6] = (A1.B1.A0.B0)
+    pattern_cvt_bf16 = J.gpr("su32")
+    pattern_cvt_bf16[0] = 0x03_02_07_06
+    k_max = div_up(K, k_step_wg)
     for k in range(k_max):
         # [16,32] * [2,16,32] => [2,16,16]
         if k + 1 < k_max:
-            buff_a.load_dwordx4(Areg[pp_reg_id], voffset_a, soffset_ka)
+            buff_a.load_dwordx4(Areg[pp_reg_id, 0], voffset_a, soffset_ka)
+            if weight_dtype != torch.bfloat16:
+                buff_a.load_dwordx4(Areg[pp_reg_id, 1], voffset_a, soffset_ka + 16)
             buff_b0.load_dwordx4(Breg[pp_reg_id, 0], voffset_b, soffset_kb)
             buff_b1.load_dwordx4(Breg[pp_reg_id, 1], voffset_b, soffset_kb)
             pp_reg_id = pp_reg_id ^ 1
-            soffset_kb[0] = soffset_kb[0] + 16*(32*num_split_K)*sizeof_bf16
-            soffset_ka[0] = soffset_ka[0] + 32*num_split_K*sizeof_bf16
-            J.s_waitcnt(mod=f"vmcnt(3)")
+            soffset_kb[0] = soffset_kb[0] + 16*64*num_split_K
+            soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread*4*num_split_K*sizeof_bf16
+            if weight_dtype == torch.bfloat16:
+                J.s_waitcnt(mod=f"vmcnt(3)")
+            else:
+                J.s_waitcnt(mod=f"vmcnt(4)")
         else:
             pp_reg_id = pp_reg_id ^ 1
             J.s_waitcnt(mod=f"vmcnt(0)")
 
-        J.v_mfma_f32_16x16x16_bf16(Creg[0], Breg[pp_reg_id,0,0], Areg[pp_reg_id,0], Creg[0])
-        J.v_mfma_f32_16x16x16_bf16(Creg[1], Breg[pp_reg_id,1,0], Areg[pp_reg_id,0], Creg[1])
+        if weight_dtype != torch.bfloat16:
+            if k == 0:
+                J.v_mov_b32(v_w_scale[0, 1], v_w_scale[0, 0])
+                J.v_mov_b32(v_w_scale[1, 1], v_w_scale[1, 0])
 
-        J.v_mfma_f32_16x16x16_bf16(Creg[0], Breg[pp_reg_id,0,1], Areg[pp_reg_id,1], Creg[0])
-        J.v_mfma_f32_16x16x16_bf16(Creg[1], Breg[pp_reg_id,1,1], Areg[pp_reg_id,1], Creg[1])
+            # decompress
+            v_w_f32 = J.gpr(2, 2, 'vf32', align=4)
+            v_w_bf16 = J.gpr(2, 2, 'vf32', align=4)
+            # Breg[2, 2, 2, 2]: pin, block_id, #no of 8 items, 2 dwords/4bf16
+            for i in range(2):
+                for j in range(2):
+                    for block_id in range(2):
+                        J.v_cvt_pk_f32_fp8(v_w_f32[0], Breg[pp_reg_id, block_id, i, j])
+                        J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[1], Breg[pp_reg_id, block_id, i, j], mod='src0_sel:WORD_1')
+                        J.v_pk_mul_f32(v_w_f32[0], v_w_f32[0], v_w_scale[block_id])
+                        J.v_pk_mul_f32(v_w_f32[1], v_w_f32[1], v_w_scale[block_id])
+                        J.v_perm_b32(v_w_bf16[block_id, 0], v_w_f32[0, 0], v_w_f32[0, 1], pattern_cvt_bf16)
+                        J.v_perm_b32(v_w_bf16[block_id, 1], v_w_f32[1, 0], v_w_f32[1, 1], pattern_cvt_bf16)
+                    # 2, A_rep, 2, 2
+                    for block_id in range(2):
+                        J.v_mfma_f32_16x16x16_bf16(Creg[block_id], v_w_bf16[block_id], Areg[pp_reg_id, i, j], Creg[block_id])
+        else:
+            J.v_mfma_f32_16x16x16_bf16(Creg[0], Breg[pp_reg_id,0,0], Areg[pp_reg_id,0,0], Creg[0])
+            J.v_mfma_f32_16x16x16_bf16(Creg[1], Breg[pp_reg_id,1,0], Areg[pp_reg_id,0,0], Creg[1])
+
+            J.v_mfma_f32_16x16x16_bf16(Creg[0], Breg[pp_reg_id,0,1], Areg[pp_reg_id,0,1], Creg[0])
+            J.v_mfma_f32_16x16x16_bf16(Creg[1], Breg[pp_reg_id,1,1], Areg[pp_reg_id,0,1], Creg[1])
 
     if use_split_K:
         assert with_silu
@@ -427,18 +486,23 @@ def run_aiter(hidden_states,
             w2,  # [expert(local_expert:EP), dim, inter_dim]
             topk_weight,
             topk_ids,
+            w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
+            w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
             ):
     from aiter.fused_moe import fused_moe
-    # from aiter.fused_moe_bf16_asm import asm_moe_tkw1
+    from aiter import QuantType
     return fused_moe(
         hidden_states,
         w1,
         w2,
         topk_weight,
         topk_ids,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        quant_type=QuantType.No if w1.dtype == torch.bfloat16 else QuantType.per_Token
     )
 
-def run_batch(B=1):
+def run_batch(B=1, weight_type=torch.bfloat16):
     HIDDEN_SIZE = 2048
     TP = 4
     INTER_SIZE = 768
@@ -447,10 +511,25 @@ def run_batch(B=1):
     INTER_SIZE_TP = INTER_SIZE // TP
     BUF_COPY = 32
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
-    w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
-    w1 = [w_.clone() for _ in range(BUF_COPY)]
-    w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
-    w2 = [w_.clone() for _ in range(BUF_COPY)]
+    if weight_type == torch.bfloat16:
+        w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=weight_type)
+        w1 = [w_.clone() for _ in range(BUF_COPY)]
+        w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=weight_type)
+        w2 = [w_.clone() for _ in range(BUF_COPY)]
+        w1_scale = [None] * BUF_COPY
+        w2_scale = [None] * BUF_COPY
+    else:
+        import aiter
+        torch_quant = aiter.get_torch_quant(aiter.QuantType.per_Token)
+        w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
+        w1_qt, w1_qt_scale = torch_quant(w_, quant_dtype=weight_type)
+        w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
+        w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
+        w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
+        w2_qt, w2_qt_scale = torch_quant(w_, quant_dtype=weight_type)
+        w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
+        w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
+
     topk_weight = torch.randn([BUF_COPY, B, TOPK], dtype=torch.float32)
     topk_ids = torch.ones([BUF_COPY, B, TOPK], dtype=torch.int32)
     topk_ids_base = torch.randperm(E, dtype=torch.int32)
@@ -463,7 +542,7 @@ def run_batch(B=1):
         # aiter needs preshuffle weights
         w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
-        ref_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0])
+        ref_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
         flops = 2 * B * (HIDDEN_SIZE * INTER_SIZE_TP * 2 + B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP)
         mem_size = (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * TOPK * 2
@@ -471,7 +550,7 @@ def run_batch(B=1):
             idx_start = random.randint(0, E - TOPK)
             topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
             with cudaPerf(flops, mem_size, name=f"aiter[{B=}]"):
-                run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i])
+                run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
             i = (i + 1) % BUF_COPY
 
     if 1:
@@ -507,7 +586,8 @@ def run_batch(B=1):
             bias2=None,
         ):
             # the following should be added in aiter.fused_moe.fused_moe
-            if hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and quant_type == QuantType.No and w1.dtype == torch.bfloat16:
+            if hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
+                (quant_type == QuantType.No and w1.dtype == torch.bfloat16) or (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz):
                 B = hidden_states.shape[0]
                 E, N1, K1 = w1.shape
                 N2, K2 = w2.shape[1], w2.shape[2]
@@ -516,8 +596,8 @@ def run_batch(B=1):
                 if B == 1:
                     assert N1 == 2 * K2
                     gemm2_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
-                    moe_gemm_batch1([N1//32, TOPK],[256], K1, N1, True, hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), 1)
-                    moe_gemm_batch1([N2//32, TOPK],[64], K2, N2, False, gemm1_out.data_ptr(), w2.data_ptr(), gemm2_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), 1)
+                    moe_gemm_batch1([N1//32, TOPK],[256], w1.dtype, K1, N1, True, hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, 1)
+                    moe_gemm_batch1([N2//32, TOPK],[64], w1.dtype, K2, N2, False, gemm1_out.data_ptr(), w2.data_ptr(), gemm2_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, 1)
                     return gemm2_out
                 else:
                     BLOCK_M = 16
@@ -572,13 +652,13 @@ def run_batch(B=1):
         topk_ids[0,:,] = topk_ids_base[: TOPK]
         w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
-        cur_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0])
+        cur_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
         for _ in range(10):
             idx_start = random.randint(0, E - TOPK)
             topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
             with cudaPerf(flops, mem_size, name=f"cur[{B=}]"):
-                run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i])
+                run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
             i = (i + 1) % BUF_COPY
 
         print(ref_out.shape, cur_out.shape)
@@ -599,7 +679,11 @@ def test():
     torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 
     for i in range(16):
-        run_batch(B=i+1)
+        run_batch(B=i+1, weight_type=torch.bfloat16)
+
+    run_batch(1, weight_type=torch.float8_e4m3fnuz)
+    # for i in range(16):
+    #     run_batch(B=i+1)
 
 if __name__ == '__main__':
     test()
