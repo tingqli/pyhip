@@ -151,8 +151,43 @@ with J.If((a[0]*32 + 5) >= b[0]) as branch:
  - 也可以实际运行代码看运行结果是否符合预期，测试用例需要读入数据，执行某些操作，写回数据，由host检查结果正确性
 
 ```bash
-pytest unittest/
+./run_unittests.sh
 ```
+
+# 编译期参数
+编译期参数以非字符串annotation标识(例如下面例子中的`K`,`N`,`with_silu`)，用来定制jit kernel的运行期行为，生成的kernel也会使用编译期参数作为文件名key，存放在~/.pyhip目录下。
+
+```python
+@pyhip.jit()
+def moe_gemm_batch1(J:pyhip.JIT,
+                    K,            # compile-time args
+                    N,            # compile-time args
+                    with_silu,    # compile-time args
+                    p_input:"void*",
+                    p_weight:"void*",
+                    p_output:"void*",
+                    p_topk_ids:"void*",
+                    p_topk_weight:"float*", M:"int"):
+```
+
+# `可配置kernel` VS `DSL`
+
+得益于强大的编译期表达能力，JIT非常适合生成可配置kernel，例如gemm使用多大的wave size，4个wave如何在空间中排列，使用哪种MFMA指令等。
+
+但是DSL则完全是另一件事情，因为那需要更加抽象编译期概念的封装和更复杂的逐步lowering的编译流程。jit中的injector/emitter并不能代替这种高级抽象。
+
+DSL通过提供更高层抽象，来便于表达计算流程，通常这意味着细节被隐藏以及难以分析和进一步做后继优化，其性能完全取决于编译器的能力。
+
+
+
+
+```python
+gprA.load(ldsTileA)
+gprB.load(ldsTileB)
+J.gemm(gprC, gprA, gprB, gprC)
+
+```
+
 
 # SIMT 控制流
 

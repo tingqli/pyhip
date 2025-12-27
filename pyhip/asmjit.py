@@ -56,6 +56,7 @@ class Instruction:
                    isinstance(op, GPRs), \
             f"arg {i} : {type(op)} {op}"
         self.parent_bb.add_instruction(self, insert_bb_pos)
+        return self
 
     def isVALU(self):
         return self.opcode.startswith("v_")
@@ -1052,10 +1053,12 @@ class JIT:
     #    do not touch `fixed_gprs`
     def register_allocation_linear_scan(self):
         # note: BB in self.blocks has been ordered, assign each instruction an serial
+        inst_list = []
         serial_index = 0
         for bb in self.blocks:
             for inst in bb.instructions:
                 inst.sid = serial_index
+                inst_list.append(inst)
                 serial_index += 1
 
         # find live-intervals of gprs in `relocatable_gprs`
@@ -1172,6 +1175,7 @@ class JIT:
             event_groups[sid].append([event, gprs])
             gprs.start_id = -1 # set gprs status to "not allocated"
 
+        alive_gprs = []
         def gpr_usage():
             ret = ""
             for rtype, slots in reg_resource.items():
@@ -1184,17 +1188,23 @@ class JIT:
                 ret += f"{rtype}:{used}({last_id}) "
             return ret
 
-        def alloc_gpr(gprs):
+        def alloc_gpr(gprs, sid):
             rtype = gprs.rtype
             count = gprs.count
             align = gprs.align
             slots = reg_resource[rtype]
             for i in range(0, len(slots), align):
-                if all(s == 0 for s in slots[i:(i+count)]):
+                if all(s == 0 for s in slots[i:(i+count)]) and i+count <= len(slots):
                     gprs.start_id = i
+                    gprs.sid = sid
                     slots[i:(i+count)] = [1]*count # mark as used
+                    alive_gprs.append(gprs)
                     return
-            assert 0, f"cannot allocate '{gprs.name}'{gprs}, not enough resources"
+            # summary for diagnose GPR overflow issue
+            summary = gpr_usage() + "\n"
+            for g in alive_gprs:
+                summary += f"\t{str(g.count):5s} {g.rtype}GPRs  {repr(g):15s} {g.name:20s}  {inst_list[g.sid].loc}\n"
+            assert 0, f"cannot allocate '{gprs.name}'  {rtype}GPRs x {count} {align=}, not enough resource:\n {summary}"
 
         def free_gpr(gprs):
             rtype = gprs.rtype
@@ -1202,6 +1212,7 @@ class JIT:
             slots = reg_resource[rtype]
             i = gprs.start_id
             slots[i:(i+count)] = [0]*count
+            alive_gprs.remove(gprs)
 
         self.asm_debug_info += ";============ register allocation ==============\n"
         for sid, events in event_groups.items():
@@ -1220,7 +1231,7 @@ class JIT:
             # allocation 
             for ev,gprs in events:
                 if ev == 0: # first use(as dst)
-                    alloc_gpr(gprs)
+                    alloc_gpr(gprs, sid)
                     self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}      {gpr_usage()}\n"
 
             # in case some gpr's last & first sids are the same
@@ -1345,7 +1356,10 @@ class JIT:
             expr = float_to_ieee754_bits_little(expr)
         if isinstance(expr, int):
             for dst in dst_expr:
-                new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
+                if rtype == "a":
+                    new_inst = Instruction(bb, f"v_accvgpr_write_b32", loc=loc)
+                else:
+                    new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
                 new_inst(dst, expr)
             return
 
@@ -1664,7 +1678,7 @@ class JIT:
         
         self.current_bb = oldbb
         # schedule instructions from bbs into self.current_bb
-        ISSUE_INTERVAL = { "vmem": 113,"ds":16, "mfma": 16}
+        ISSUE_INTERVAL = { "vmem": 32,"ds":32, "mfma": 16}
         last_global_load_cycle = -100000
         last_ds_cycle = -100000
         last_mfma_cycle = -100000
@@ -1722,6 +1736,9 @@ class JIT:
         return LDSTensor(self, shape, dtype)
 
     def debug_setup(self, cond:GPRExpr):
+        if self.debug_log_ptr is None:
+            self.log("WARNNING: calling debug_setup w/o debug_log_ptr")
+            return
         self.debug_cond_sgpr = self.gpr("su32")
         self.debug_cond_sgpr[0] = cond
 
@@ -2256,6 +2273,7 @@ class JIT:
         # Common Subexpression Elimination，CSE
         self.pass_cse()
 
+        # for bb in self.blocks: print(repr(bb))
         self.register_allocation_linear_scan()
 
         # generate asm: basic blocks are in natural order
@@ -2587,7 +2605,8 @@ class jit_kernel:
             value = args[c[0] + 2]
             name = c[1]
             compile_args.append(value)
-            kernel_key.append(f"{name}={value}")
+            tag = f"{name}={value}".replace("[","").replace("]","").replace(" ","").replace(",","_")
+            kernel_key.append(tag)
 
         for c in self.runtime_time_arg_info:
             runtime_args.append(args[c[0] + 2])
