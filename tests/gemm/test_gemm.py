@@ -36,9 +36,9 @@ N_WAVES=2
 BM=M_WAVES*WAVE_M
 BN=N_WAVES*WAVE_N
 
-M_WGS=1
-N_WGS=1
-K_BLKS=4
+M_WGS=8
+N_WGS=10
+K_BLKS=32
 
 M=BM*M_WGS
 N=BN*N_WGS
@@ -47,10 +47,20 @@ K=BK*K_BLKS
 MIN=-1
 MAX=2
 
-A = torch.randint(MIN,MAX,(M, K)).to(dtype=torch.float16)
-B = torch.randint(MIN,MAX,(N, K)).to(dtype=torch.float16)
-# A=torch.ones(M, K).to(torch.float16)
-# B=torch.ones(N, K).to(torch.float16)
+fakeA=0
+fakeB=0
+if fakeA:
+    A=torch.ones(M, K).to(torch.float16)*2
+else:
+    A = torch.randint(MIN,MAX,(M, K)).to(dtype=torch.float16)
+if fakeB:
+    B=torch.ones(N, K).to(torch.float16)
+else:
+    B = torch.randint(MIN,MAX,(N, K)).to(dtype=torch.float16)
+
+# A = torch.randint(MIN,MAX,(M, K)).to(dtype=torch.float16)
+# B = torch.randint(MIN,MAX,(N, K)).to(dtype=torch.float16)
+
 out=torch.zeros(M,N).to(torch.float32)
 out_ref=torch.zeros(M,N).to(torch.float16)
 B_tr=B.transpose(0,1)
@@ -58,7 +68,7 @@ print(f'////////////////////////////////////////////////////////////////////////
 print(f'{M=}, {N=}, {K=}, {BM=},{BN=},{REG_M=}, {REG_N=}, GRID_DIM:[{M_WGS},{N_WGS}], BLOCK_DIM[{64*M_WAVES*N_WAVES}]')
 print(f'////////////////////////////////////////////////////////////////////////////////////////')
 
-hip = pyhip.module("gemm.cpp", f"-D{BM=} -D{BN=} -D{BK=} -D{WAVE_M=} -D{WAVE_N=}  -D{REG_M=} -D{REG_N=} -D{REG_K=} -D{N_WAVES=}  -D{MFMA_KL=}")
+hip = pyhip.module("gemm.cpp", f"-D{BM=} -D{BN=} -D{BK=} -D{WAVE_M=} -D{WAVE_N=}  -D{REG_M=} -D{REG_N=} -D{REG_K=} -D{N_WAVES=} -D{M_WAVES=} -D{MFMA_KL=}")
 run_mfma = hip.run_mfma
 for i in range(2):
     with pyhip.cudaPerf(M*N*K*2):
