@@ -67,6 +67,8 @@ class amdhip_func:
                 fields.append((f"arg_{i}", ctypes.c_ulong))
             elif arg_type == "unsigned int":
                 fields.append((f"arg_{i}", ctypes.c_uint))
+            elif arg_type == "float" or arg_type == "float32_t": 
+                fields.append((f"arg_{i}", ctypes.c_float))
             else:
                 raise Exception(f"Unsupported arg type: {arg_type}")
         class Args(ctypes.Structure):
