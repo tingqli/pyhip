@@ -79,5 +79,5 @@ out_ref=torch.matmul(A,B_tr)
 # print(A[32:64])
 # print(f'ref:{out_ref[32:48]}')
 # print(f'out:{out[32:48]}')
-assert torch.allclose(out_ref.to(torch.float32), out, atol=0.1, rtol=0.1)
+assert torch.allclose(out_ref.to(torch.float32), out, atol=0.1, rtol=0.01)
 
