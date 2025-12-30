@@ -1596,7 +1596,43 @@ class JIT:
                     # so extra compensation is needed for C/C++'s rounding-toward-zero result
                     Instruction(bb, f"s_add_i32", loc=loc)(dst_expr, dst_expr, temp)
             else:
-                assert 0, f"TODO floordiv {rtype=} {dtype=} {dst_expr=} {src0_operand=} {src1_operand=}"
+                # assert src1_operand.find_rtype() == "s"
+                # copied from hip compiler's output
+                s3 = src1_operand
+                s2 = src0_operand
+                s4 = self.gpr("su32")
+                s5 = self.gpr("su32")
+                s6 = self.gpr("su32")
+                s7 = self.gpr("su32")
+                v1 = self.gpr("vu32")
+                self.s_abs_i32(s4, s3)
+                self.v_cvt_f32_u32_e32(v1, s4)
+                self.s_sub_i32(s5, 0, s4)
+                self.s_xor_b32(s3, s2, s3)
+                self.s_abs_i32(dst_expr, s2)
+                self.v_rcp_iflag_f32_e32(v1, v1)
+                self.s_ashr_i32(s3, s3, 31)
+                self.v_mul_f32_e32(v1, 0x4f7ffffe, v1)
+                self.v_cvt_u32_f32_e32(v1, v1)
+                self.s_nop(mod="0")
+                self.v_readfirstlane_b32(s6, v1)
+                self.s_mul_i32(s5, s5, s6)
+                self.s_mul_hi_u32(s5, s6, s5)
+                self.s_add_i32(s6, s6, s5)
+                self.s_mul_hi_u32(s5, dst_expr, s6)
+                self.s_mul_i32(s6, s5, s4)
+                self.s_sub_i32(dst_expr, dst_expr, s6)
+                self.s_add_i32(s7, s5, 1)
+                self.s_sub_i32(s6, dst_expr, s4)
+                self.s_cmp_ge_u32(dst_expr, s4)
+                self.s_cselect_b32(s5, s7, s5)
+                self.s_cselect_b32(dst_expr, s6, dst_expr)
+                self.s_add_i32(s6, s5, 1)
+                self.s_cmp_ge_u32(dst_expr, s4)
+                self.s_cselect_b32(dst_expr, s6, s5)
+                self.s_xor_b32(dst_expr, dst_expr, s3)
+                self.s_sub_i32(dst_expr, dst_expr, s3)
+                # assert 0, f"TODO floordiv {rtype=} {dtype=} {dst_expr=} {src0_operand=} {src1_operand=}"
         else:
             assert 0, f"unsupported expression {expr}"
 
