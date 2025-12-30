@@ -101,6 +101,8 @@ def moe_gemm_loop(J:JIT,
     pattern_cvt_bf16 = J.gpr("su32")
     pattern_cvt_bf16[0] = 0x03_02_07_06
     k_max = div_up(K, k_step_wg)
+    s_cvt_bf16_bias = J.gpr(1, "su32")
+    s_cvt_bf16_bias[0] = 0x00008000
     for k in range(k_max):
         # [16,32] * [2,16,32] => [2,16,16]
         if k + 1 < k_max:
@@ -135,6 +137,10 @@ def moe_gemm_loop(J:JIT,
                         J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[1], B_reg[pp_reg_id, block_id, i, j], mod='src0_sel:WORD_1')
                         J.v_pk_mul_f32(v_w_f32[0], v_w_f32[0], v_w_scale[block_id])
                         J.v_pk_mul_f32(v_w_f32[1], v_w_f32[1], v_w_scale[block_id])
+                        J.v_add_u32(v_w_f32[0, 0], v_w_f32[0, 0], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[0, 1], v_w_f32[0, 1], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[1, 0], v_w_f32[1, 0], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[1, 1], v_w_f32[1, 1], s_cvt_bf16_bias)
                         J.v_perm_b32(v_w_bf16[block_id, 0], v_w_f32[0, 0], v_w_f32[0, 1], pattern_cvt_bf16)
                         J.v_perm_b32(v_w_bf16[block_id, 1], v_w_f32[1, 0], v_w_f32[1, 1], pattern_cvt_bf16)
                     # 2, A_rep, 2, 2
@@ -223,6 +229,8 @@ def moe_gemm_batch1(J:JIT,
                   buff_a, p_weight, p_weight1, p_w_scale,
                   voffset_a, voffset_b, C_reg)
 
+    s_cvt_bf16_bias = J.gpr(1, "su32")
+    s_cvt_bf16_bias[0] = 0x00008000
     if use_split_k:
         assert with_silu
         # split K
@@ -251,6 +259,7 @@ def moe_gemm_batch1(J:JIT,
 
         if with_silu:
             out = J.gpr(gate_up[0, 1] * J.silu(gate_up[0, 0]))
+            J.v_add_u32(out[0], out[0], s_cvt_bf16_bias)
             vaddr = J.gpr(vrow * (N // 2 * sizeof_bf16) + lane_mod_16 * (sizeof_bf16))
             with J.ExecMask(vrow < M[0]):
                 J.global_store_short_d16_hi(vaddr, out[0], p_output)
@@ -270,6 +279,7 @@ def moe_gemm_batch1(J:JIT,
         for i in range(2):
             for j in range(4):
                 C_reg[i, j] = C_reg[i, j] * s_weight
+                J.v_add_u32(C_reg[i, j], C_reg[i, j], s_cvt_bf16_bias)
         for i in range(2):
             creg_low[i,0] = (C_reg[i, 0] >> 16) |(C_reg[i, 1] & 0xFFFF0000)
             creg_low[i,1] = (C_reg[i, 2] >> 16) |(C_reg[i, 3] & 0xFFFF0000)
@@ -371,6 +381,8 @@ def moe_gemm_batch(J:JIT,
                   buff_a, p_weight, p_weight1, p_w_scale,
                   voffset_a, voffset_b, C_reg)
 
+    s_cvt_bf16_bias = J.gpr(1, "su32")
+    s_cvt_bf16_bias[0] = 0x00008000
     if use_split_k:
         assert with_silu
         # split K
@@ -405,6 +417,7 @@ def moe_gemm_batch(J:JIT,
             # output: [B, TOPK, N]
             v_token_id = J.gpr(v_sorted_id_permute[0] & 0xffffff)
             v_topk_id = J.gpr(v_sorted_id_permute[0] >> 24)
+            J.v_add_u32(out[0], out[0], s_cvt_bf16_bias)
             vaddr = J.gpr(v_token_id * (N // 2 * sizeof_bf16 * TOPK) + v_topk_id * (N // 2 * sizeof_bf16) + lane_mod_16 * sizeof_bf16)
             with J.ExecMask(v_token_id < M[0]):
                 J.global_store_short_d16_hi(vaddr, out[0], p_output)
@@ -425,6 +438,7 @@ def moe_gemm_batch(J:JIT,
         for i in range(2):
             for j in range(4):
                 C_reg[i, j] = C_reg[i, j] * v_weight
+                J.v_add_u32(C_reg[i, j], C_reg[i, j], s_cvt_bf16_bias)
         for i in range(2):
             creg_low[i, 0] = (C_reg[i, 0] >> 16) | (C_reg[i, 1] & 0xFFFF0000)
             creg_low[i, 1] = (C_reg[i, 2] >> 16) | (C_reg[i, 3] & 0xFFFF0000)

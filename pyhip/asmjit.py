@@ -11,6 +11,7 @@ import math
 from .mem_allocator import SimpleMemoryAllocator
 
 import hashlib
+import subprocess
 
 def get_caller_loc():
     frame = inspect.currentframe().f_back.f_back
@@ -21,6 +22,13 @@ def get_caller_loc():
             break
         frame = frame.f_back
     return loc
+
+def get_git_revision_hash() -> str:
+    try:
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
+    except Exception as e:
+        print(f'warning: get git revision error: {e}')
+        return 'unknown'
 
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
@@ -2360,9 +2368,16 @@ class JIT:
             # which causes damage to kernal-arg pointer s[0:1], we can work-around it by putting
             # these 2 lines of codes at the end of the kernel's source code.
             decl_lds += f"    __shared__ uint lds_buffer[{self.lds_allocator.upper_bound()//4}];\n"
-            decl_lds += f'    asm(" ; lds_buffer %0 "::"s"((as3_uint32_ptr)(lds_buffer)));'
+            decl_lds += f'    asm(" ; lds_buffer %0 "::"s"((as3_uint32_ptr)(lds_buffer)));\n'
             pass
 
+        # embed revision into bin
+        git_commit = [rf'".pushsection .rodata\n"']
+        git_commit += [rf'"    .align 8\n"']
+        git_commit += [rf'"    .asciz  \".git:{get_git_revision_hash()}\"\n"']
+        git_commit += [rf'"    .popsection"']
+        git_commit = '\n'.join(git_commit)
+        git_commit = f'''    asm volatile({git_commit});\n'''
         hip_src =r'''
 #include <hip/hip_fp16.h> // for __fp16
 #include <hip/hip_bf16.h> // for bfloat16
@@ -2376,7 +2391,7 @@ __global__ void ''' + kernel_name + signature +  r''' {
 r'''
                 ::
                 :"memory"''' + str_used_gprs + r''');
-''' + decl_lds + r'''
+''' + decl_lds + git_commit + r'''
 }
         '''
 
