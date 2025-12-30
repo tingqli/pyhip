@@ -70,7 +70,7 @@ print(f'////////////////////////////////////////////////////////////////////////
 
 hip = pyhip.module("gemm.cpp", f"-D{BM=} -D{BN=} -D{BK=} -D{WAVE_M=} -D{WAVE_N=}  -D{REG_M=} -D{REG_N=} -D{REG_K=} -D{N_WAVES=} -D{M_WAVES=} -D{MFMA_KL=}")
 run_mfma = hip.run_mfma
-for i in range(2):
+for i in range(5):
     with pyhip.cudaPerf(M*N*K*2):
         run_mfma([M_WGS, N_WGS],[64*M_WAVES*N_WAVES], A.data_ptr(), B.data_ptr(), out.data_ptr(), K, N)
 out_ref=torch.matmul(A,B_tr)
