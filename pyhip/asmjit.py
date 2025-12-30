@@ -145,11 +145,15 @@ class GPRExpr:
                 return GPRExpr("<<", self, shift_left_bits)
         return GPRExpr("*", self, other)
     def __floordiv__(self, other):
-        assert isinstance(other, int)
-        if other <= 0 or (other & (other - 1)) != 0:
-            assert 0, "the divisor is not power of 2"
-        shift_right_bits = other.bit_length() - 1
-        return GPRExpr(">>", self, shift_right_bits)
+        if isinstance(other, int):
+            if other <= 0 or (other & (other - 1)) != 0:
+                # the divisor is not power of 2
+                return GPRExpr("floordiv", self, other)
+            else:
+                shift_right_bits = other.bit_length() - 1
+                return GPRExpr(">>", self, shift_right_bits)
+        else:
+            return GPRExpr("floordiv", self, other)
     def __mod__(self, other):
         assert isinstance(other, int)
         if other <= 0 or (other & (other - 1)) != 0:
@@ -390,28 +394,13 @@ class GPRs:
     def __rsub__(self, other):
         return GPRExpr("-", other, self.to_expr())
     def __mul__(self, other):
-        if isinstance(other, int) and other >= 0:
-            if (other & (other - 1)) == 0:
-                shift_left_bits = other.bit_length() - 1
-                return GPRExpr("<<", self.to_expr(), shift_left_bits)
-        return GPRExpr("*", self.to_expr(), other)
+        return self.to_expr().__mul__(other)
     def __rmul__(self, other):
-        if isinstance(other, int) and other >= 0:
-            if (other & (other - 1)) == 0:
-                shift_left_bits = other.bit_length() - 1
-                return GPRExpr("<<", self.to_expr(), shift_left_bits)
-        return GPRExpr("*", self.to_expr(), other)
+        return self.to_expr().__rmul__(other)
     def __floordiv__(self, other):
-        assert isinstance(other, int)
-        if other <= 0 or (other & (other - 1)) != 0:
-            assert 0, "the divisor is not power of 2"
-        shift_right_bits = other.bit_length() - 1
-        return GPRExpr(">>", self.to_expr(), shift_right_bits)
+        return self.to_expr().__floordiv__(other)
     def __mod__(self, other):
-        assert isinstance(other, int)
-        if other <= 0 or (other & (other - 1)) != 0:
-            assert 0, "the divisor is not power of 2"
-        return GPRExpr("&", self.to_expr(), (other-1))
+        return self.to_expr().__mod__(other)
     def __lshift__(self, other):
         return GPRExpr("<<", self.to_expr(), other)
     def __rlshift__(self, other):
@@ -1387,7 +1376,7 @@ class JIT:
             new_inst(dst_expr, expr)
             return
 
-        if dtype == "" or (dtype not in ["u32", "s32"]):
+        if dtype == "" or (dtype not in ["u32", "i32"]):
             if expr.op not in ["&","|","^"]:
                 dtype = expr.find_dtype()
                 self.log(f"infer dtype={dtype} by expr {expr}")
@@ -1540,6 +1529,74 @@ class JIT:
                 mov(dst_expr, 0, 1, "vcc")
             else:
                 assert 0, f"unsupported rtype: {rtype}"
+        elif expr.op == "floordiv":
+            # from Hacker's Delight: use multiply+shift to calculate div
+            assert dtype in ["u32","i32"]
+            def find_min_k(d, n_max, allow_eq = False):
+                k = 32
+                while True:
+                    mod = (1 << k) % d
+                    if allow_eq and (1 << k) == n_max * (d - mod):
+                        return k
+                    elif (1 << k) > n_max * (d - mod):
+                        return k
+                    k += 1
+            assert rtype == "s"
+            if isinstance(src1_operand, int):
+                d = src1_operand
+                if dtype == "u32":
+                    assert d > 0
+                    """
+                    a = n/d
+                    b = n*[2**k/d + e]/2**k = n/d + (n*e/2**k) = a + (n*e/2**k)
+                         e is error introduced by ceil(2**k/d): [d-(2**k % d)]/d
+
+                    floor(b) = floor(a) when (e/2**k) < 1/d because a=n/d, floor(a+1/d) may > floor(a)
+                    so we need 2**k > e*d = n*[d-(2**k % d)]
+                    """
+                    n_max = 2**32-1
+                    min_k = find_min_k(d, n_max)
+                    ceil_sd = (2**min_k + d - 1)//d
+                    assert ceil_sd < 2**32
+                    Instruction(bb, f"s_mul_hi_u32", loc=loc)(dst_expr, src0_operand, ceil_sd)
+                    Instruction(bb, f"s_lshr_b32", loc=loc)(dst_expr, dst_expr, min_k-32)
+                else:
+                    """
+                    consider negative as a mirror of positive
+                    """
+                    #assert d > 0
+                    abs_d = abs(d)
+                    min_k = max(find_min_k(abs_d, 2**31 - 1), find_min_k(abs_d, 2**31, True))
+                    ceil_sd = (2**min_k + abs_d - 1)//abs_d
+                    assert ceil_sd < 2**32, f"{d=} {min_k=} {ceil_sd=} {hex(ceil_sd)=}"
+                    need_compensation = 0 if ceil_sd < 2**31 else 1
+                    if d < 0:
+                        ceil_sd = (-ceil_sd) # restore sign of divisor
+
+                    need_compensation = 0
+                    if ceil_sd >= 2**31:
+                        # sd will be interpreted as (sd - 2^32) by s_mul_hi_i32
+                        # and get n*(sd - 2^32), need compensate it by adding n*2^32
+                        need_compensation = 1
+                    elif ceil_sd < -2**31:
+                        # sd will be interpreted as (sd + 2^32) by s_mul_hi_i32
+                        # and get n*(sd + 2^32), need compensate it by sub n*2^32
+                        need_compensation = -1
+                    ceil_sd = ceil_sd & 0xFFFFFFFF
+
+                    temp = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                    Instruction(bb, f"s_mul_hi_i32", loc=loc)(dst_expr, src0_operand, ceil_sd)
+                    if need_compensation == 1:
+                        Instruction(bb, f"s_add_i32", loc=loc)(dst_expr, dst_expr, src0_operand)
+                    if need_compensation == -1:
+                        Instruction(bb, f"s_sub_i32", loc=loc)(dst_expr, dst_expr, src0_operand)
+                    Instruction(bb, f"s_lshr_b32", loc=loc)(temp, dst_expr, 31)
+                    Instruction(bb, f"s_ashr_i32", loc=loc)(dst_expr, dst_expr, min_k-32)
+                    # when n/d < 0, arithematic shift right 1 bit is floor(n/2)
+                    # so extra compensation is needed for C/C++'s rounding-toward-zero result
+                    Instruction(bb, f"s_add_i32", loc=loc)(dst_expr, dst_expr, temp)
+            else:
+                assert 0, f"TODO floordiv {rtype=} {dtype=} {dst_expr=} {src0_operand=} {src1_operand=}"
         else:
             assert 0, f"unsupported expression {expr}"
 
