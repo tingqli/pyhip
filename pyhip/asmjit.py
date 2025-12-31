@@ -830,9 +830,15 @@ class JIT:
         dst_is_sgprx2 = isinstance(dst, GPRs) and dst.rtype == "s" and dst.count == 2
         dst_is_vcc = isinstance(dst, str) and dst == "vcc"
         dst_is_exec = isinstance(dst, str) and dst == "exec"
+        dst_is_scc = isinstance(dst, str) and dst == "scc"
         #assert dst_is_vcc or dst_is_sgprx2
+        rtype = "v"
+        if dst_is_scc:
+            rtype = "s"
+        if isinstance(dst, GPRs):
+            rtype = dst.rtype
         dtype = cond.find_dtype()
-        dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
+        dst_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1)
         dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
         self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=get_caller_loc())
         last_inst = self.current_bb.instructions[-1]
@@ -857,6 +863,15 @@ class JIT:
             last_inst.operands[3] == "vcc" :
             self.log("v_cndmask_b32_e64 dst,0,1,vcc is optimized")
             self.current_bb.instructions.pop()
+        elif dst_is_scc and \
+            last_inst.opcode == "s_mov_b32" and \
+            last_inst.operands[0] is dst_expr and \
+            last_inst.operands[1] == "scc" :
+            self.log("s_mov_b32 dst,scc is optimized")
+            self.current_bb.instructions.pop()
+        elif dst_is_scc:
+            # generate scc
+            self.s_cmp_lg_i32(0, dst_gprs)
         else:
             # generate mask into dst (vcc or sgprx2)
             self.v_cmp_ne_u32_e64(dst, 0, dst_gprs)
@@ -981,7 +996,7 @@ class JIT:
 
         # allocate GPRs
         dtype = desc[-1]
-        assert isinstance(dtype, str)
+        assert isinstance(dtype, str), f"{dtype=}"
 
         num_gprs = 1
         shape = []
@@ -1414,7 +1429,7 @@ class JIT:
                 return Instruction(bb, f"v_add_u32_e32" if op == '+' else f"v_sub_u32_e32", loc=loc)
             if isinstance(src0_operand, GPRExpr):
                 if op == '-':
-                    src1_operand = hex(-src1_operand & 0xffffffff)
+                    src1_operand = hex((-src1_operand) & 0xffffffff)
                 # v_add_u32_e32's src0 can be const
                 src1_operand, src0_operand = src0_operand, src1_operand
                 return Instruction(bb, f"v_add_u32_e32", loc=loc) # vgpr + (+/- const)
@@ -1598,17 +1613,17 @@ class JIT:
             else:
                 # assert src1_operand.find_rtype() == "s"
                 # copied from hip compiler's output
-                s3 = src1_operand
                 s2 = src0_operand
+                s3 = self.gpr("su32")
                 s4 = self.gpr("su32")
                 s5 = self.gpr("su32")
                 s6 = self.gpr("su32")
                 s7 = self.gpr("su32")
                 v1 = self.gpr("vu32")
-                self.s_abs_i32(s4, s3)
+                self.s_abs_i32(s4, src1_operand)
                 self.v_cvt_f32_u32_e32(v1, s4)
                 self.s_sub_i32(s5, 0, s4)
-                self.s_xor_b32(s3, s2, s3)
+                self.s_xor_b32(s3, s2, src1_operand)
                 self.s_abs_i32(dst_expr, s2)
                 self.v_rcp_iflag_f32_e32(v1, v1)
                 self.s_ashr_i32(s3, s3, 31)

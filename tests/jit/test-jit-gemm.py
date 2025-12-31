@@ -90,7 +90,7 @@ class UGEMM:
         wave_nCN = wave_size_N // mfma_MN
         wave_nCK = 2
 
-        # wnM,wnN: 2x2, 1x4, 4x1
+        # wnM,wnN: 2x2, 1x4, 4x1, 1x1, 1x2, 2x1, ....
         self.J = J
         self.mfma_MN = mfma_MN
         self.wave_size_M = wave_size_M
@@ -98,8 +98,7 @@ class UGEMM:
         self.wave_cnt_M = wave_cnt_M
         self.wave_cnt_N = wave_cnt_N
         self.wave_cnt = wave_cnt_M * wave_cnt_N
-        assert self.wave_cnt == 4
-        
+
         self.wg_M = self.wave_size_M * self.wave_cnt_M
         self.wg_N = self.wave_size_N * self.wave_cnt_N
         self.wg_K = self.mfma_K * wave_nCK          # 2*(2*8) or 2*(2*16)
@@ -155,14 +154,10 @@ class UGEMM:
         if skip_load:
             prefetch_step_size = 0
         def prefetchA(index):
-            if index == 0:
-                prefetch_soffsetA[0] = 0 if skip_load else id_prefetch * self.wg_K * sizeof_bf16 
             buff_a.load_dwordx4(prefetch_Areg[index], prefetch_voffset, prefetch_soffsetA)
             prefetch_soffsetA[0] = prefetch_soffsetA[0] + prefetch_step_size
 
         def prefetchB(index):
-            if index == 0:
-                prefetch_soffsetB[0] = 0 if skip_load else id_prefetch * self.wg_K * sizeof_bf16
             buff_b.load_dwordx4(prefetch_Breg[index], prefetch_voffset, prefetch_soffsetB)
             prefetch_soffsetB[0] = prefetch_soffsetB[0] + prefetch_step_size
 
@@ -178,10 +173,16 @@ class UGEMM:
             swizzle_col = swizzle(row, col) % (num_lanes_per_row)
             ds_write_vaddr[i] = J.gpr((row * (self.wg_K * sizeof_bf16)) + swizzle_col*(sizeof_DWORDX4))
 
+        lgkmcnt = 0
         def ds_writeA(index, lds_base):
+            nonlocal lgkmcnt
             J.ds_write_b128(ds_write_vaddr[index], prefetch_Areg[index], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
+            lgkmcnt += 1
+
         def ds_writeB(index, lds_base):
+            nonlocal lgkmcnt
             J.ds_write_b128(ds_write_vaddr[index], prefetch_Breg[index], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
+            lgkmcnt += 1
 
         # each wave reads its own part
         ds_readA_vaddr = J.gpr(self.wave_nCM, self.wave_nCK, "vu32")
@@ -210,23 +211,33 @@ class UGEMM:
 
         Creg_size = (self.mfma_MN * self.mfma_MN)//64
         mfma_C = self.J.gpr(self.wave_nCM, self.wave_nCN, Creg_size, f"af32")
-        mfma_C[:] = 0 
         ABReg_size = (self.mfma_MN * self.mfma_K * 2//4)//64
         mfma_A = J.gpr(2, self.wave_nCM, self.wave_nCK, ABReg_size, "vbf16x2")
-        mfma_B = J.gpr(2, self.wave_nCM, self.wave_nCK, ABReg_size, "vbf16x2")
+        mfma_B = J.gpr(2, self.wave_nCN, self.wave_nCK, ABReg_size, "vbf16x2")
 
         def ds_readA(i, m, k, lds_base):
+            nonlocal lgkmcnt
             J.ds_read_b128(mfma_A[i,m,k], ds_readA_vaddr[m, k], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
+            lgkmcnt += 1
 
         def ds_readB(i, n, k, lds_base):
+            nonlocal lgkmcnt
             J.ds_read_b128(mfma_B[i,n,k], ds_readB_vaddr[n,k], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
+            lgkmcnt += 1
 
         J.debug_setup((J.blockIdx.x[0] == 0) & (J.blockIdx.y[0] == 0) & (warp_id[0] == debug_warp))
 
         # prelog
+        k_offset = J.gpr("su32")        
         id_prefetch = 0
+        k_offset[0] = 0
+        prefetch_soffsetA[0] = 0 if skip_load else (id_prefetch) * self.wg_K * sizeof_bf16
+        prefetch_soffsetB[0] = 0 if skip_load else (id_prefetch) * self.wg_K * sizeof_bf16
+
         for r in range(num_prefetch_M): prefetchA(r)
         for r in range(num_prefetch_N): prefetchB(r)
+        mfma_C[:] = 0 
+
         J.s_waitcnt(mod="vmcnt(0)")
 
         #J.debug_log(prefetch_Areg[:], torch.bfloat16, "4v.8v.8h.8h")
@@ -234,6 +245,10 @@ class UGEMM:
 
         id_ds_write = id_prefetch
         id_prefetch += 1
+        k_offset[0] = 0 if skip_load else (k_offset[0] + self.wg_K * sizeof_bf16)
+        prefetch_soffsetA[0] = k_offset[0]
+        prefetch_soffsetB[0] = k_offset[0]
+
         for r in range(num_prefetch_M):
             ds_writeA(r, ldsA[id_ds_write & 1])
             prefetchA(r)
@@ -248,6 +263,10 @@ class UGEMM:
         id_ds_read = id_ds_write
         id_ds_write = id_prefetch
         id_prefetch += 1
+        k_offset[0] = 0 if skip_load else (k_offset[0] + self.wg_K * sizeof_bf16)
+        prefetch_soffsetA[0] = k_offset[0]
+        prefetch_soffsetB[0] = k_offset[0]
+
         for r in range(num_prefetch_M):
             ds_writeA(r, ldsA[id_ds_write & 1])
             prefetchA(r)
@@ -255,16 +274,20 @@ class UGEMM:
             ds_writeB(r, ldsB[id_ds_write & 1])
             prefetchB(r)
 
+        ds_read_lgkmcnt = [0,0]
         for k in range(0,self.wave_nCK//2):
             for m in range(self.wave_nCM):
                 ds_readA(id_ds_read & 1, m, k, ldsA[id_ds_read & 1])
             for n in range(self.wave_nCN):
                 ds_readB(id_ds_read & 1, n, k, ldsB[id_ds_read & 1])
+        ds_read_lgkmcnt[0] = lgkmcnt
+
         for k in range(self.wave_nCK//2, self.wave_nCK):
             for m in range(self.wave_nCM):
                 ds_readA(id_ds_read & 1, m, k, ldsA[id_ds_read & 1])
             for n in range(self.wave_nCN):
                 ds_readB(id_ds_read & 1, n, k, ldsB[id_ds_read & 1])
+        ds_read_lgkmcnt[1] = lgkmcnt
 
         num_ds_reads = self.wave_nCK * self.wave_nCM * self.wave_nCN
         num_ds_writes = num_prefetch_M + num_prefetch_N
@@ -294,96 +317,119 @@ class UGEMM:
         cur_k[0] = 0
         k_loop_cnt = self.K//self.wg_K
         assert k_loop_cnt % 2 == 0
-        #with J.While(cur_k[0] < k_loop_cnt):
+
+
+        # mfma reg stage1 | ds_read/hidden
+        # ---------------------------------
+        #  wait LDS buffer to be finished
+        #
+        #   J.s_waitcnt ds_read finished
+        #   J.s_barrier() 
+        #
+
+
+        with J.While(cur_k[0] < k_loop_cnt):
             # store 2 to LDSB & start prefetch 3
             # read 1 from LDSA & MFMA 0
-            #cur_k[0] = cur_k[0] + 2
-            #for unroll in range(2):
-        for unroll in range(k_loop_cnt):
-            id_ds_read = id_compute + 1
-            id_ds_write = id_compute + 2
-            id_prefetch = id_compute + 3 
+            for unroll in range(2):
+                #for unroll in range(k_loop_cnt):
+                id_ds_read = id_compute + 1
+                id_ds_write = id_compute + 2
+                id_prefetch = id_compute + 3
 
-            def mfma0_generator():
+                #prefetch_soffsetA[0] = 0 if skip_load else id_prefetch * self.wg_K * sizeof_bf16
+                #prefetch_soffsetB[0] = 0 if skip_load else id_prefetch * self.wg_K * sizeof_bf16
+
+                # cur_k[0] = cur_k[0] + 2
+                k_offset[0] = 0 if skip_load else (k_offset[0] + self.wg_K * sizeof_bf16)
+                prefetch_soffsetA[0] = k_offset[0]
+                prefetch_soffsetB[0] = k_offset[0]
+
+                def mfma0_generator():
+                    for k in range(0,self.wave_nCK//2):
+                        for m in range(self.wave_nCM):
+                            for n in range(self.wave_nCN):
+                                yield getattr(J, mfma_name)(mfma_C[m,n],
+                                                    mfma_B[id_compute&1, n, k, 0:1],
+                                                    mfma_A[id_compute&1, m, k, 0:1],
+                                                    mfma_C[m,n])
+                        for m in range(self.wave_nCM):
+                            for n in range(self.wave_nCN):
+                                yield getattr(J, mfma_name)(mfma_C[m,n],
+                                                    mfma_B[id_compute&1, n, k, 2:3],
+                                                    mfma_A[id_compute&1, m, k, 2:3],
+                                                    mfma_C[m,n])
+                    J.s_waitcnt(mod=f"lgkmcnt({min(15,lgkmcnt - ds_read_lgkmcnt[1])})")
+                    for k in range(self.wave_nCK//2, self.wave_nCK):
+                        for m in range(self.wave_nCM):
+                            for n in range(self.wave_nCN):
+                                yield getattr(J, mfma_name)(mfma_C[m,n],
+                                                    mfma_B[id_compute&1, n, k, 0:1],
+                                                    mfma_A[id_compute&1, m, k, 0:1],
+                                                    mfma_C[m,n])
+                        for m in range(self.wave_nCM):
+                            for n in range(self.wave_nCN):
+                                yield getattr(J, mfma_name)(mfma_C[m,n],
+                                                    mfma_B[id_compute&1, n, k, 2:3],
+                                                    mfma_A[id_compute&1, m, k, 2:3],
+                                                    mfma_C[m,n])
+
+                mfma0 = mfma0_generator()
+
+                def emit_mfma(gen, cycles):
+                    while cycles > 0:
+                        if next(gen, None) is None:
+                            break
+                        cycles -= mfma_cycles
+
+
+                # DS write阶段没开始之前，LDS里面存放的数据仍然有效
+                # 读入本轮 mfma_A/mfma_B 的后半段K 同时计算前半段
+                # 
+
+                J.s_waitcnt(mod=f"lgkmcnt({min(15,lgkmcnt - ds_read_lgkmcnt[0])})")
+                J.s_barrier()
+                # ================= stage1 ds_write + buffer_load ==============
+                
+                for r in range(num_prefetch_M):
+                    emit_mfma(mfma0, 16)
+                    J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
+                    ds_writeA(r, ldsA[id_ds_write & 1])
+                    emit_mfma(mfma0, 16*2)
+                    prefetchA(r)
+                    emit_mfma(mfma0, 16*6)
+
+                for r in range(num_prefetch_N):
+                    emit_mfma(mfma0, 16)
+                    J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
+                    ds_writeB(r, ldsB[id_ds_write & 1])
+                    emit_mfma(mfma0, 16*2)
+                    prefetchB(r)
+                    emit_mfma(mfma0, 16*6)
+
+                # ================= stage2 ds_read  ==============
                 for k in range(0,self.wave_nCK//2):
                     for m in range(self.wave_nCM):
-                        for n in range(self.wave_nCN):
-                            yield getattr(J, mfma_name)(mfma_C[m,n],
-                                                mfma_B[id_compute&1, n, k, 0:1],
-                                                mfma_A[id_compute&1, m, k, 0:1],
-                                                mfma_C[m,n])
-                    for m in range(self.wave_nCM):
-                        for n in range(self.wave_nCN):
-                            yield getattr(J, mfma_name)(mfma_C[m,n],
-                                                mfma_B[id_compute&1, n, k, 2:3],
-                                                mfma_A[id_compute&1, m, k, 2:3],
-                                                mfma_C[m,n])
+                        ds_readA(id_ds_read & 1, m, k, ldsA[id_ds_read & 1])
+                        emit_mfma(mfma0, 16*2)
+                    for n in range(self.wave_nCN):
+                        ds_readB(id_ds_read & 1, n, k, ldsB[id_ds_read & 1])
+                        emit_mfma(mfma0, 16*2)
+                ds_read_lgkmcnt[0] = lgkmcnt
 
-            def mfma1_generator():
                 for k in range(self.wave_nCK//2, self.wave_nCK):
                     for m in range(self.wave_nCM):
-                        for n in range(self.wave_nCN):
-                            yield getattr(J, mfma_name)(mfma_C[m,n],
-                                                mfma_B[id_compute&1, n, k, 0:1],
-                                                mfma_A[id_compute&1, m, k, 0:1],
-                                                mfma_C[m,n])
-                    for m in range(self.wave_nCM):
-                        for n in range(self.wave_nCN):
-                            yield getattr(J, mfma_name)(mfma_C[m,n],
-                                                mfma_B[id_compute&1, n, k, 2:3],
-                                                mfma_A[id_compute&1, m, k, 2:3],
-                                                mfma_C[m,n])
+                        ds_readA(id_ds_read & 1, m, k, ldsA[id_ds_read & 1])
+                        emit_mfma(mfma0, 16*2)
+                    for n in range(self.wave_nCN):
+                        ds_readB(id_ds_read & 1, n, k, ldsB[id_ds_read & 1])
+                        emit_mfma(mfma0, 16*2)
+                ds_read_lgkmcnt[1] = lgkmcnt
 
-            mfma0 = mfma0_generator()
-            mfma1 = mfma1_generator()
+                emit_mfma(mfma0, 9999999)
 
-            def emit_mfma(gen, cycles):
-                while cycles > 0:
-                    if next(gen, None) is None:
-                        break
-                    cycles -= mfma_cycles
-
-            J.s_waitcnt(mod=f"lgkmcnt({min(15,num_ds_reads//2)})")
-            J.s_barrier()
-            # ================= stage1 ds_write + buffer_load ==============
-            J.s_waitcnt(mod=f"vmcnt({num_prefetch_N})")
-            for r in range(num_prefetch_M):
-                ds_writeA(r, ldsA[id_ds_write & 1])
-                emit_mfma(mfma0, 16)
-                prefetchA(r)
-                emit_mfma(mfma0, 16*4)
-
-            J.s_waitcnt(mod=f"vmcnt({num_prefetch_M})")
-            for r in range(num_prefetch_N):
-                ds_writeB(r, ldsB[id_ds_write & 1])
-                emit_mfma(mfma0, 16)
-                prefetchB(r)
-                emit_mfma(mfma0, 16*4)
-
-            emit_mfma(mfma0, 9999999)
-
-            # ================= stage2 ds_read  ==============
-            J.s_waitcnt(mod=f"lgkmcnt({min(15,num_ds_writes)})")
-            for k in range(0,self.wave_nCK//2):
-                for m in range(self.wave_nCM):
-                    ds_readA(id_ds_read & 1, m, k, ldsA[id_ds_read & 1])
-                    emit_mfma(mfma1, 16*2)
-                for n in range(self.wave_nCN):
-                    ds_readB(id_ds_read & 1, n, k, ldsB[id_ds_read & 1])
-                    emit_mfma(mfma1, 16*2)
-
-            for k in range(self.wave_nCK//2, self.wave_nCK):
-                for m in range(self.wave_nCM):
-                    ds_readA(id_ds_read & 1, m, k, ldsA[id_ds_read & 1])
-                    emit_mfma(mfma1, 16*2)
-                for n in range(self.wave_nCN):
-                    ds_readB(id_ds_read & 1, n, k, ldsB[id_ds_read & 1])
-                    emit_mfma(mfma1, 16*2)
-
-            emit_mfma(mfma1, 9999999)
-
-            id_compute += 1
-
+                id_compute += 1
+            cur_k[0] = cur_k[0] + 2
         # write out
         J.s_waitcnt(mod=f"vmcnt(0)")
         if 0:
@@ -392,33 +438,130 @@ class UGEMM:
             J.debug_log(mfma_C[2], torch.float, "4h.4h.16v.4h")
             J.debug_log(mfma_C[3], torch.float, "4h.4h.16v.4h")
 
+        # store to LDS for mem coealecing 
+        J.free_lds(ldsA[0])
+        J.free_lds(ldsA[1])
+        J.free_lds(ldsB[0])
+        J.free_lds(ldsB[1])
+        
         buff_c = J.Buffer(sgpr_c, self.wg_M * N * sizeof_fp32)
-        # store_dwordx4(self, vdata, voffset, soffset, offset12=0):
-        for m in range(self.wave_nCM):
-            for n in range(self.wave_nCN):
-                row = lane_id % self.mfma_MN + warp_offset_m + m*self.mfma_MN
-                col = lane_id // self.mfma_MN + n * (self.mfma_MN * sizeof_fp32 // sizeof_DWORDX4)
-                voffset = J.gpr(row * (N*sizeof_fp32) + warp_offset_n*sizeof_fp32 + col*sizeof_DWORDX4)
-                if self.mfma_MN == 16:
-                    buff_c.store_dwordx4(mfma_C[m,n], voffset, 0)
-                elif self.mfma_MN == 32:
-                    for ni in range(4):
-                        noff = ni*4
-                        buff_c.store_dwordx4(mfma_C[m,n,noff:noff+3], voffset, 0, offset12=ni*8*sizeof_fp32)
-                else:
-                    assert 0
+        if 1:
+            # swizzle-LDS to form better memory-coelascing VMEM
+            # each warp has its own [mfma_M x self.wave_size_N] output buffer
+            lds_out = J.alloc_lds(4 * self.mfma_MN * self.wave_size_N * sizeof_fp32)
+            lds_warp_offset = warp_id * (self.mfma_MN * self.wave_size_N * sizeof_fp32)
+            num_lanes_per_row = self.wave_size_N * sizeof_fp32 // sizeof_DWORDX4
+            assert 64 % num_lanes_per_row == 0
+            rows_per_read = 64//num_lanes_per_row
+            assert rows_per_read > 0
+            assert self.mfma_MN % rows_per_read == 0            
+
+            vdata = J.gpr(4, "vu32")
+
+            for m in range(self.wave_nCM):
+                for n in range(self.wave_nCN):
+                    row = lane_id % self.mfma_MN
+                    if self.mfma_MN == 16:
+                        col = lane_id // self.mfma_MN + n * (self.mfma_MN * sizeof_fp32 // sizeof_DWORDX4)
+                        swizzle_col = swizzle(row, col) % (num_lanes_per_row)
+                        vaddr_w = J.gpr((row) * (self.wave_size_N * sizeof_fp32) + \
+                                        lds_warp_offset + \
+                                        (swizzle_col) * sizeof_DWORDX4)
+                        J.ds_write_b128(vaddr_w, mfma_C[m,n], mod=f"offset:{lds_out}")
+                    else:
+                        for ni in range(4):
+                            noff = ni*4
+                            col = lane_id // self.mfma_MN + (n*self.mfma_MN + ni*8) * sizeof_fp32 // sizeof_DWORDX4
+                            swizzle_col = swizzle(row, col) % (num_lanes_per_row)
+                            vaddr_w = J.gpr((row) * (self.wave_size_N * sizeof_fp32) + \
+                                            lds_warp_offset + \
+                                            (swizzle_col) * sizeof_DWORDX4)
+                            J.ds_write_b128(vaddr_w, mfma_C[m,n,noff:noff+3],
+                                            mod=f"offset:{lds_out}")
+
+                voffset = J.gpr((lane_id % num_lanes_per_row) * sizeof_DWORDX4 + \
+                                (lane_id // num_lanes_per_row + m*self.mfma_MN + warp_offset_m) * (N*sizeof_fp32) + \
+                                (warp_offset_n*sizeof_fp32))
+
+                for r in range(0, self.mfma_MN, rows_per_read):
+                    row = lane_id // num_lanes_per_row + r
+                    col = lane_id % num_lanes_per_row
+                    swizzle_col = swizzle(row, col) % num_lanes_per_row
+                    vaddr_r = J.gpr((swizzle_col) * sizeof_DWORDX4 + \
+                                    (row) * (self.wave_size_N * sizeof_fp32) + \
+                                    lds_warp_offset)
+                    J.ds_read_b128(vdata, vaddr_r, mod=f"offset:{lds_out}")
+                    J.s_waitcnt(mod=f"lgkmcnt(0)")
+                    buff_c.store_dwordx4(vdata, voffset, 0)
+                    voffset[0] = voffset[0] + rows_per_read * (N*sizeof_fp32)
+        else:
+            # store_dwordx4(self, vdata, voffset, soffset, offset12=0):
+            for m in range(self.wave_nCM):
+                for n in range(self.wave_nCN):
+                    row = lane_id % self.mfma_MN + warp_offset_m + m*self.mfma_MN
+                    col = lane_id // self.mfma_MN + n * (self.mfma_MN * sizeof_fp32 // sizeof_DWORDX4)
+                    voffset = J.gpr(row * (N*sizeof_fp32) + warp_offset_n*sizeof_fp32 + col*sizeof_DWORDX4)
+                    if self.mfma_MN == 16:
+                        buff_c.store_dwordx4(mfma_C[m,n], voffset, 0)
+                    elif self.mfma_MN == 32:
+                        for ni in range(4):
+                            noff = ni*4
+                            buff_c.store_dwordx4(mfma_C[m,n,noff:noff+3], voffset, 0, offset12=ni*8*sizeof_fp32)
+                    else:
+                        assert 0
+
+
+def tb_swizzle(J, block_1d_id:"sgpr", M:"sgpr", wg_M:int, wg_N:int, N:int, M01:int, GroupNum:int):
+    M0 = J.gpr(J.div_up(M, wg_M))
+    N0 = J.div_up(N, wg_N)
+    group_size    = J.div_up(M0 * N0, GroupNum)
+    big_group_num = J.gpr(GroupNum - (group_size * GroupNum - M0 * N0))
+    group_id_y    = J.gpr(block_1d_id // GroupNum)
+    group_id_x    = J.gpr(block_1d_id - group_id_y * GroupNum) 
+
+    remap_block_1d_id = J.gpr(group_id_x * group_size + group_id_y)
+
+    with J.If(group_id_x > big_group_num):
+        remap_block_1d_id[0] = remap_block_1d_id[0] + (big_group_num - group_id_x)
+
+    idx_M0 = J.gpr(remap_block_1d_id // N0)
+    idx_N0 = J.gpr(remap_block_1d_id - idx_M0 * N0)
+
+    M0_tmp     = J.gpr(M0 // M01)
+    M0_mod_M01 = J.gpr(M0 - M0_tmp * M01)
+
+    # M01_adapt = (idx_M0 < M0 - M0_mod_M01) ? M01 : M0_mod_M01;
+    M01_adapt = J.gpr("su32")
+    J.SetMask("scc", idx_M0 < M0 - M0_mod_M01)
+    J.s_cselect_b32(M01_adapt, M01, M0_mod_M01)
+
+    idx_M00          = J.gpr(idx_M0 // M01)
+    idx_M01          = J.gpr(idx_M0 - idx_M00 * M01)
+    idx_N0_M01_local = J.gpr(idx_N0 + idx_M01 * N0)
+
+    N_out           = J.gpr(idx_N0_M01_local // M01_adapt)
+    idx_loc_mod_M01 = J.gpr(idx_N0_M01_local - N_out * M01_adapt)
+
+    M_out = J.gpr(idx_loc_mod_M01 + idx_M00 * M01)
+    return M_out, N_out
 
 @pyhip.jit(with_debug_log=False)
-def gemm_kernel(J, K, N,
+def gemm_kernel(J, K, N, M01, GroupNum,
                 mfma_MN, wave_size, wave_cnt,
                 debug_warp, skip_load,
                 pA:"void*", pB:"void*", pC:"float*", M:"int"):
     #mfma_MN = 16
     #wave_size=[16*4,16*4]
     #wave_cnt=[2,2]
-    blk_n = J.blockIdx.x
-    blk_m = J.blockIdx.y
+    block_1d_id = J.blockIdx.x
+
     gemm = UGEMM(J, mfma_MN, wave_size, wave_cnt, K, N)
+    if GroupNum <= 1 and M01 <= 1:
+        N0 = J.div_up(N, gemm.wg_N)
+        blk_m = J.gpr(block_1d_id // N0)
+        blk_n = J.gpr(block_1d_id - blk_m*N0)
+    else:
+        blk_m, blk_n = tb_swizzle(J, block_1d_id, M, gemm.wg_M, gemm.wg_N, N, M01, GroupNum)
 
     sizeof_bf16 = 2
     sizeof_fp32 = 4
@@ -442,19 +585,24 @@ CU_cols = 10 #num_CU//CU_rows
 
 debug_warp = 5
 skip_load = 0
-mfma_MN = 16
-wave_size = [64, 64]
+M01 = 8
+GroupNum = 4
+
+mfma_MN = 32
+wave_size = [128, 128]
 wave_cnt = [2,2]
 wg_size = [wave_size[i]*wave_cnt[i] for i in range(2)]
 
-M,N,K = wg_size[0]*8,wg_size[1]*10,64*50
+M,N,K = wg_size[0]*8*4,wg_size[1]*10*4,8192*1
 
+blk_cnt = (N//wg_size[1]) * (M//wg_size[0])
 A = torch.randn(M, K, dtype=torch.bfloat16)
 B = torch.randn(N, K, dtype=torch.bfloat16)
 out = torch.randn(M, N, dtype=torch.float)
 
-gemm_kernel([N//wg_size[1], M//wg_size[0]],[256],
-            K, N, mfma_MN, wave_size, wave_cnt,
+gemm_kernel([blk_cnt],[256],
+            K, N, M01, GroupNum,
+            mfma_MN, wave_size, wave_cnt,
             debug_warp, skip_load,
             A.data_ptr(), B.data_ptr(), out.data_ptr(), M)
 ref_out = A @ B.t()
@@ -487,18 +635,26 @@ else:
 #    row = (i*4 + debug_warp)*8
 #    print(A[row:row+8])
 
-DATA_CLONES = 20
+DATA_CLONES = 40
 As = [torch.clone(A) for _ in range(DATA_CLONES)]
 Bs = [torch.clone(B) for _ in range(DATA_CLONES)]
 Cs = [torch.clone(out) for _ in range(DATA_CLONES)]
+di = 0
 
 for i in range(10):
-    di = i%DATA_CLONES
+    di = (di + 1)%DATA_CLONES
+    #di = 0
     with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"gemm_{di}"):
-        gemm_kernel([N//wg_size[1], M//wg_size[0]],[256],
-                    K, N, mfma_MN, wave_size, wave_cnt,
+        gemm_kernel([blk_cnt],[256],
+                    K, N, M01, GroupNum,
+                    mfma_MN, wave_size, wave_cnt,
                     debug_warp, skip_load,
                     As[di].data_ptr(), Bs[di].data_ptr(), Cs[di].data_ptr(), M)
+
+for i in range(10):
+    di = (di + 1)%DATA_CLONES
+    with pyhip.cudaPerf(M*N*K*2, name=f"torch-linear-{di}"):
+        ref = torch.nn.functional.linear(As[di], Bs[di])
 
 torch.cuda.synchronize()
 print(f"{M=} {N=} {K=} {mfma_MN=} {wave_size=} {wave_cnt=} {wg_size=} {acc_info}")
