@@ -738,7 +738,8 @@ class JIT:
 
     def log(self, *args, **kwargs):
         PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
-        if PYHIP_JIT_LOG:
+        PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
+        if PYHIP_JIT_LOG or len(PYHIP_DEBUG_LOG):
             color_id = 3
             color0 = f"\033[0;{30+(color_id % 8)}m"
             color1 = f"\033[0m"
@@ -2131,8 +2132,8 @@ class JIT:
                         for i, r in enumerate(gpr):
                             key = repr(r)
                             if key not in gpr_info:
-                                gpr_info[key] = {"wr":"","bbs":set()}
-                            gpr_info[key]["bbs"].add(bb_id)
+                                gpr_info[key] = {"wr":"","location":list()}
+                            gpr_info[key]["location"].append((bb_id, t, index))
                             if index == vdst_index:
                                 gpr_info[key]["wr"] += "w"
                             else:
@@ -2140,9 +2141,10 @@ class JIT:
         ssa_gpr = []
         for k,info in gpr_info.items():
             wr = info["wr"]
-            bbs = info["bbs"]
-            if len(bbs) == 1 and \
-                len(wr) > 0 and \
+            locs = info["location"]
+            if debug_enabled:
+                print(k, wr, locs)
+            if len(wr) > 0 and \
                 wr[0] == "w" and \
                 wr.count("w") == 1:
                 ssa_gpr.append(k)
@@ -2243,6 +2245,16 @@ class JIT:
                                     inst.operands[i] = vexist
                                     if debug_enabled: print(f"\t {i} {op} {vexist}")
 
+            def replace_vdst_with_exist_global(vdst, vexist):
+                for bb_id, inst_id, op_id in gpr_info[repr(vdst)]["location"]:
+                    inst = self.blocks[bb_id].instructions[inst_id]
+                    op = inst.operands[op_id]
+                    if vdst.overlap(op):
+                        if debug_enabled: print(f"found  {inst}")
+                        assert vdst.overlap(op, fully_match=True)
+                        inst.operands[op_id] = vexist
+                        if debug_enabled: print(f"\t {i} {op} {vexist}")
+
             for t, inst in enumerate(bb.instructions):
                 if len(inst.operands) == 0: continue
                 # instruction may have multiple vdst/vsrc: v[4:7]
@@ -2299,24 +2311,32 @@ class JIT:
                         value_table[key] = [vdst, cur_version]
                     else:
                         vexist, version = value_table[key]
-                        # can we safely use this existing value?
-                        # we need to check life-cycle requirements:
-                        #   the last read from vdst happens before the next update(write) to vexist
-                        t_last_read = reg_access_last_read_from(vdst, t)
-                        t_next_update = reg_access_next_write_to(vexist, t)
-                        if debug_enabled:
-                            print(f"===========  {replace_index} / {CSE_LIMIT=} ", 
-                                (t_next_update > t_last_read) and (replace_index < CSE_LIMIT))
-                            print(t, inst.loc, inst.debug_info, inst)
-                            print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
-                            print(f"{reg_accesses[repr(vdst)]}")
-                        if t_next_update > t_last_read and replace_index < CSE_LIMIT:
+                        if repr(vexist) in ssa_gpr and replace_index < CSE_LIMIT:
                             removed_insts.append(t)
-                            replace_vdst_with_exist(t + 1, t_last_read, vdst, vexist)
+                            replace_vdst_with_exist_global(vdst, vexist)
+                            if debug_enabled:
+                                print(f"===========  {replace_index} / {CSE_LIMIT=} ")
+                                print(t, inst.loc, inst.debug_info, inst)
+                                print(f"{vdst} replaced with  {vexist} {key} globally")
                         else:
-                            # we cannot safely reuse vexist, optionally we can add another vexist
-                            # so others may benefit
-                            pass
+                            # can we safely use this existing value?
+                            # we need to check life-cycle requirements:
+                            #   the last read from vdst happens before the next update(write) to vexist
+                            t_last_read = reg_access_last_read_from(vdst, t)
+                            t_next_update = reg_access_next_write_to(vexist, t)
+                            if debug_enabled:
+                                print(f"===========  {replace_index} / {CSE_LIMIT=} ", 
+                                    (t_next_update > t_last_read) and (replace_index < CSE_LIMIT))
+                                print(t, inst.loc, inst.debug_info, inst)
+                                print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
+                                print(f"{reg_accesses[repr(vdst)]}")
+                            if t_next_update > t_last_read and replace_index < CSE_LIMIT:
+                                removed_insts.append(t)
+                                replace_vdst_with_exist(t + 1, t_last_read, vdst, vexist)
+                            else:
+                                # we cannot safely reuse vexist, optionally we can add another vexist
+                                # so others may benefit
+                                pass
                         replace_index += 1
 
             # Eliminate

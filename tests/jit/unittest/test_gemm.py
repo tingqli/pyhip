@@ -1,5 +1,60 @@
 import pyhip
 import pytest
+import functools
+
+class MFMA_DW4Loader:
+    J = None
+    def __init__(self, J,
+                 mfma_MN:int, wg_M:int, wave_cnt:int,
+                 row_bytes:int, stride_bytes:int,
+                 skip_load:bool = False):
+        MFMA_DW4Loader.J = J
+        self.mfma_MN = mfma_MN
+        self.wave_cnt = wave_cnt
+        self.wg_M = wg_M
+        sizeof_DWORDX4 = 16
+        assert (row_bytes) % sizeof_DWORDX4 == 0 # each lane prefetch DWORDx4 which is 8xhalf
+        num_lanes_per_row = row_bytes // sizeof_DWORDX4
+        assert 64 % num_lanes_per_row == 0
+        dw4_prefetch_MN = (self.wave_cnt*64//num_lanes_per_row)
+        assert dw4_prefetch_MN >= 1
+        assert self.wg_M % dw4_prefetch_MN == 0
+        # print(f"{self.wg_M=} {num_lanes_per_row=} {dw4_prefetch_MN=}")
+        num_prefetch_M = self.wg_M // dw4_prefetch_MN
+        self.prefetch_reg = J.gpr(num_prefetch_M, 4, "vu32")
+        self.num_lanes_per_row = num_lanes_per_row
+        self.prefetch_voffset = J.gpr((J.threadIdx.x % num_lanes_per_row) * sizeof_DWORDX4 + (J.threadIdx.x //num_lanes_per_row) * stride_bytes)
+        self.prefetch_soffset = J.gpr("su32")
+        self.prefetch_step_size = (dw4_prefetch_MN)*stride_bytes
+        self.num_prefetch_M = num_prefetch_M
+        self.stride_bytes = stride_bytes
+        swizzle_row_div = 1 if self.mfma_MN == 16 else 2
+        if skip_load:
+            self.prefetch_step_size = 0
+        
+        # precompute ds_write vaddr
+        self.ds_write_b128_vaddr = [] 
+        for index in range(num_prefetch_M):
+            vaddr = J.gpr("vu32")
+            col = J.threadIdx.x % num_lanes_per_row
+            row = (J.threadIdx.x // num_lanes_per_row) + index*dw4_prefetch_MN
+            swizzle_col = ((row//swizzle_row_div) ^ col) % (num_lanes_per_row)
+            vaddr[0] = J.gpr((row * row_bytes) + swizzle_col*(sizeof_DWORDX4))
+            self.ds_write_b128_vaddr.append(vaddr) 
+
+    def __len__(self):
+        return self.num_prefetch_M
+
+    def reset_offset(self, koff):
+        self.prefetch_soffset[0] = koff[0]
+
+    def prefetch(self, index, buff_a):
+        buff_a.load_dwordx4(self.prefetch_reg[index], self.prefetch_voffset, self.prefetch_soffset)
+        self.prefetch_soffset[0] = self.prefetch_soffset[0] + self.prefetch_step_size
+
+    def ds_write(self, index, lds_base):
+        self.J.ds_write_b128(self.ds_write_b128_vaddr[index], self.prefetch_reg[index], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
+
 
 class UGEMM:
     def __init__(self, J, 
@@ -53,8 +108,8 @@ class UGEMM:
 
         LDSA_size = self.wg_M * self.wg_K * sizeof_bf16
         LDSB_size = self.wg_N * self.wg_K * sizeof_bf16
-        ldsA = [J.alloc_lds(LDSA_size) for _ in range(1)]
-        ldsB = [J.alloc_lds(LDSB_size) for _ in range(1)]
+        ldsA = J.alloc_lds(LDSA_size)
+        ldsB = J.alloc_lds(LDSB_size)
 
         # prefetch in memory-coalescing way
         assert (sizeof_bf16*self.wg_K) % sizeof_DWORDX4 == 0 # each lane prefetch DWORDx4 which is 8xhalf
@@ -62,56 +117,29 @@ class UGEMM:
         assert 64 % num_lanes_per_row == 0
         dw4_prefetch_MN = (self.wave_cnt*64//num_lanes_per_row)
         assert dw4_prefetch_MN >= 1
-        assert self.wg_M % dw4_prefetch_MN == 0
-        assert self.wg_N % dw4_prefetch_MN == 0
         print(f"{self.wg_M=} {num_lanes_per_row=} {dw4_prefetch_MN=}")
-        num_prefetch_M = self.wg_M // dw4_prefetch_MN
-        num_prefetch_N = self.wg_N // dw4_prefetch_MN
-        prefetch_Areg = J.gpr(num_prefetch_M, 4, "vu32")
-        prefetch_Breg = J.gpr(num_prefetch_N, 4, "vu32")
+
+        loaderA = MFMA_DW4Loader(J, self.mfma_MN, self.wg_M, self.wave_cnt, sizeof_bf16*self.wg_K, self.K * sizeof_bf16, skip_load=skip_load)
+        loaderB = MFMA_DW4Loader(J, self.mfma_MN, self.wg_N, self.wave_cnt, sizeof_bf16*self.wg_K, self.K * sizeof_bf16, skip_load=skip_load)
 
         # 4-wave within a WG coorperatively loads VRAM data in DWORDx4
-        stride_AB = self.K * sizeof_bf16
-        if skip_load:
-            stride_AB = 0
-        prefetch_voffset = J.gpr((J.threadIdx.x % num_lanes_per_row) * sizeof_DWORDX4 + \
-                                 (J.threadIdx.x //num_lanes_per_row) * stride_AB)
-        prefetch_soffsetA = J.gpr("su32")
-        prefetch_soffsetB = J.gpr("su32")
-        prefetch_step_size = (dw4_prefetch_MN)*stride_AB
-        if skip_load:
-            prefetch_step_size = 0
         def prefetchA(index):
-            buff_a.load_dwordx4(prefetch_Areg[index], prefetch_voffset, prefetch_soffsetA)
-            prefetch_soffsetA[0] = prefetch_soffsetA[0] + prefetch_step_size
+            loaderA.prefetch(index, buff_a)
 
         def prefetchB(index):
-            buff_b.load_dwordx4(prefetch_Breg[index], prefetch_voffset, prefetch_soffsetB)
-            prefetch_soffsetB[0] = prefetch_soffsetB[0] + prefetch_step_size
+            loaderB.prefetch(index, buff_b)
 
         def swizzle(row, col):
             swizzle_row_div = 1 if self.mfma_MN == 16 else 2
             return (row//swizzle_row_div) ^ col
 
+        def ds_writeA(index):
+            loaderA.ds_write(index, ldsA)
+
+        def ds_writeB(index):
+            loaderB.ds_write(index, ldsB)
+
         # each swizzle generates a new vaddr pattern, precompute all of them
-        ds_write_vaddr = J.gpr(max(num_prefetch_M, num_prefetch_N), "vu32")
-        for i in range(max(num_prefetch_M, num_prefetch_N)):
-            col = J.threadIdx.x % num_lanes_per_row
-            row = (J.threadIdx.x // num_lanes_per_row) + i*dw4_prefetch_MN
-            swizzle_col = swizzle(row, col) % (num_lanes_per_row)
-            ds_write_vaddr[i] = J.gpr((row * (self.wg_K * sizeof_bf16)) + swizzle_col*(sizeof_DWORDX4))
-
-        lgkmcnt = 0
-        def ds_writeA(index, lds_base):
-            nonlocal lgkmcnt
-            J.ds_write_b128(ds_write_vaddr[index], prefetch_Areg[index], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
-            lgkmcnt += 1
-
-        def ds_writeB(index, lds_base):
-            nonlocal lgkmcnt
-            J.ds_write_b128(ds_write_vaddr[index], prefetch_Breg[index], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
-            lgkmcnt += 1
-
         # each wave reads its own part
         ds_readA_vaddr = J.gpr(self.wave_nCM, self.wave_nCK, "vu32")
         ds_readB_vaddr = J.gpr(self.wave_nCN, self.wave_nCK, "vu32")
@@ -140,18 +168,14 @@ class UGEMM:
         Creg_size = (self.mfma_MN * self.mfma_MN)//64
         mfma_C = self.J.gpr(self.wave_nCM, self.wave_nCN, Creg_size, f"af32")
         ABReg_size = (self.mfma_MN * self.mfma_K * 2//4)//64
-        mfma_A = J.gpr(1, self.wave_nCM, self.wave_nCK, ABReg_size, "vbf16x2")
-        mfma_B = J.gpr(1, self.wave_nCN, self.wave_nCK, ABReg_size, "vbf16x2")
+        mfma_A = J.gpr(self.wave_nCM, self.wave_nCK, ABReg_size, "vbf16x2")
+        mfma_B = J.gpr(self.wave_nCN, self.wave_nCK, ABReg_size, "vbf16x2")
 
-        def ds_readA(i, m, k, lds_base):
-            nonlocal lgkmcnt
-            J.ds_read_b128(mfma_A[i,m,k], ds_readA_vaddr[m, k], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
-            lgkmcnt += 1
+        def ds_readA(m, k):
+            J.ds_read_b128(mfma_A[m,k], ds_readA_vaddr[m, k], mod=f"offset:{ldsA}") #  vaddr, vdata offset gds
 
-        def ds_readB(i, n, k, lds_base):
-            nonlocal lgkmcnt
-            J.ds_read_b128(mfma_B[i,n,k], ds_readB_vaddr[n,k], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
-            lgkmcnt += 1
+        def ds_readB(n, k):
+            J.ds_read_b128(mfma_B[n,k], ds_readB_vaddr[n,k], mod=f"offset:{ldsB}") #  vaddr, vdata offset gds
 
         J.debug_setup((J.blockIdx.x[0] == 0) & (J.blockIdx.y[0] == 0) & (warp_id[0] == debug_warp))
 
@@ -170,13 +194,13 @@ class UGEMM:
         #==============================================================
 
         k_offset = J.gpr("su32")        
-        id_ds_write = 0
-        id_ds_read = 0
-        id_compute = 0
         
+        num_prefetch_M = len(loaderA)
+        num_prefetch_N = len(loaderB)
+
         k_offset[0] = 0
-        prefetch_soffsetA[0] = k_offset[0]
-        prefetch_soffsetB[0] = k_offset[0]
+        loaderA.reset_offset(k_offset)
+        loaderB.reset_offset(k_offset)
         # prelog 0
         for r in range(num_prefetch_M): prefetchA(r)
         for r in range(num_prefetch_N): prefetchB(r)
@@ -184,16 +208,16 @@ class UGEMM:
 
         # prelog 1: ds_write + prefetch
         k_offset[0] = 0 if skip_load else (k_offset[0] + self.wg_K * sizeof_bf16)
-        prefetch_soffsetA[0] = k_offset[0]
-        prefetch_soffsetB[0] = k_offset[0]
+        loaderA.reset_offset(k_offset)
+        loaderB.reset_offset(k_offset)
 
         for r in range(num_prefetch_M):
             J.s_waitcnt(mod=f"vmcnt({num_prefetch_M + num_prefetch_N - 1})")
-            ds_writeA(r, ldsA[id_ds_write & 1])
+            ds_writeA(r)
             prefetchA(r)
         for r in range(num_prefetch_N):
             J.s_waitcnt(mod=f"vmcnt({num_prefetch_M + num_prefetch_N - 1})")
-            ds_writeB(r, ldsB[id_ds_write & 1])
+            ds_writeB(r)
             prefetchB(r)
 
         # prelog 1: wait ds_write
@@ -203,22 +227,22 @@ class UGEMM:
         # prelog 1: ds_read0
         for k in range(0,self.wave_nCK//2):
             for m in range(self.wave_nCM):
-                ds_readA(id_ds_read & 1, m, k, ldsA[id_ds_read & 1])
+                ds_readA(m, k)
             for n in range(self.wave_nCN):
-                ds_readB(id_ds_read & 1, n, k, ldsB[id_ds_read & 1])
+                ds_readB(n, k)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
 
         if 0:
             J.s_waitcnt(mod="lgkmcnt(0)")
-            J.debug_log(mfma_A[0, 0], torch.bfloat16, "2h.4h.16v.8h")
-            J.debug_log(mfma_A[0, 1], torch.bfloat16, "2h.4h.16v.8h")
-            J.debug_log(mfma_A[0, 2], torch.bfloat16, "2h.4h.16v.8h")
-            J.debug_log(mfma_A[0, 3], torch.bfloat16, "2h.4h.16v.8h")
+            J.debug_log(mfma_A[0], torch.bfloat16, "2h.4h.16v.8h")
+            J.debug_log(mfma_A[1], torch.bfloat16, "2h.4h.16v.8h")
+            J.debug_log(mfma_A[2], torch.bfloat16, "2h.4h.16v.8h")
+            J.debug_log(mfma_A[3], torch.bfloat16, "2h.4h.16v.8h")
 
-            J.debug_log(mfma_B[0, 0], torch.bfloat16, "2h.4h.16v.8h")
-            J.debug_log(mfma_B[0, 1], torch.bfloat16, "2h.4h.16v.8h")
-            J.debug_log(mfma_B[0, 2], torch.bfloat16, "2h.4h.16v.8h")
-            J.debug_log(mfma_B[0, 3], torch.bfloat16, "2h.4h.16v.8h")
+            J.debug_log(mfma_B[0], torch.bfloat16, "2h.4h.16v.8h")
+            J.debug_log(mfma_B[1], torch.bfloat16, "2h.4h.16v.8h")
+            J.debug_log(mfma_B[2], torch.bfloat16, "2h.4h.16v.8h")
+            J.debug_log(mfma_B[3], torch.bfloat16, "2h.4h.16v.8h")
 
         mfma_info={
             16:("v_mfma_f32_16x16x16_bf16",16),
@@ -239,28 +263,28 @@ class UGEMM:
                 for m in range(self.wave_nCM):
                     for n in range(self.wave_nCN):
                         yield getattr(J, mfma_name)(mfma_C[m,n],
-                                            mfma_B[id_compute&1, n, k, 0:1],
-                                            mfma_A[id_compute&1, m, k, 0:1],
+                                            mfma_B[n, k, 0:1],
+                                            mfma_A[m, k, 0:1],
                                             mfma_C[m,n])
                 for m in range(self.wave_nCM):
                     for n in range(self.wave_nCN):
                         yield getattr(J, mfma_name)(mfma_C[m,n],
-                                            mfma_B[id_compute&1, n, k, 2:3],
-                                            mfma_A[id_compute&1, m, k, 2:3],
+                                            mfma_B[n, k, 2:3],
+                                            mfma_A[m, k, 2:3],
                                             mfma_C[m,n])
         def mfma_generator1():
             for k in range(self.wave_nCK//2, self.wave_nCK):
                 for m in range(self.wave_nCM):
                     for n in range(self.wave_nCN):
                         yield getattr(J, mfma_name)(mfma_C[m,n],
-                                            mfma_B[id_compute&1, n, k, 0:1],
-                                            mfma_A[id_compute&1, m, k, 0:1],
+                                            mfma_B[n, k, 0:1],
+                                            mfma_A[m, k, 0:1],
                                             mfma_C[m,n])
                 for m in range(self.wave_nCM):
                     for n in range(self.wave_nCN):
                         yield getattr(J, mfma_name)(mfma_C[m,n],
-                                            mfma_B[id_compute&1, n, k, 2:3],
-                                            mfma_A[id_compute&1, m, k, 2:3],
+                                            mfma_B[n, k, 2:3],
+                                            mfma_A[m, k, 2:3],
                                             mfma_C[m,n])
 
         def emit_mfma(generators:list, cycles:int):
@@ -283,8 +307,8 @@ class UGEMM:
             #for unroll in range(k_loop_cnt):
 
             k_offset[0] = 0 if skip_load else (k_offset[0] + self.wg_K * sizeof_bf16)
-            prefetch_soffsetA[0] = k_offset[0]
-            prefetch_soffsetB[0] = k_offset[0]
+            loaderA.reset_offset(k_offset)
+            loaderB.reset_offset(k_offset)
 
             mfma0 = mfma_generator0()
             mfma1 = mfma_generator1()
@@ -294,10 +318,10 @@ class UGEMM:
             # ================= ds_read1(for current iteration) & mfma0 ==============
             for k in range(self.wave_nCK//2, self.wave_nCK):
                 for m in range(self.wave_nCM):
-                    ds_readA(id_ds_read & 1, m, k, ldsA[id_ds_read & 1])
+                    ds_readA(m, k)
                     emit_mfma([mfma0], 16*2)
                 for n in range(self.wave_nCN):
-                    ds_readB(id_ds_read & 1, n, k, ldsB[id_ds_read & 1])
+                    ds_readB(n, k)
                     emit_mfma([mfma0], 16*2)
 
             # ensure all waves has been finished reading LDS, so ds_write can overwrite it
@@ -308,7 +332,7 @@ class UGEMM:
             for r in range(num_prefetch_M):
                 emit_mfma([mfma0, mfma1], 16)
                 J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
-                ds_writeA(r, ldsA[id_ds_write & 1])
+                ds_writeA(r)
                 emit_mfma([mfma0, mfma1], 16*2)
                 prefetchA(r)
                 emit_mfma([mfma0, mfma1], 16*8)
@@ -316,7 +340,7 @@ class UGEMM:
             for r in range(num_prefetch_N):
                 emit_mfma([mfma0, mfma1], 16)
                 J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
-                ds_writeB(r, ldsB[id_ds_write & 1])
+                ds_writeB(r)
                 emit_mfma([mfma0, mfma1], 16*2)
                 prefetchB(r)
                 emit_mfma([mfma0, mfma1], 16*8)
@@ -329,10 +353,10 @@ class UGEMM:
             # ================= ds_read0(for next iteration) & mfma1 ==============
             for k in range(0,self.wave_nCK//2):
                 for m in range(self.wave_nCM):
-                    ds_readA(id_ds_read & 1, m, k, ldsA[id_ds_read & 1])
+                    ds_readA(m, k)
                     emit_mfma([mfma1], 16*2)
                 for n in range(self.wave_nCN):
-                    ds_readB(id_ds_read & 1, n, k, ldsB[id_ds_read & 1])
+                    ds_readB(n, k)
                     emit_mfma([mfma1], 16*2)
             emit_mfma([mfma1], 999999999)
             cur_k[0] = cur_k[0] + 1
@@ -346,8 +370,8 @@ class UGEMM:
             J.debug_log(mfma_C[3], torch.float, "4h.4h.16v.4h")
 
         # store to LDS for mem coealecing 
-        for lds in ldsA: J.free_lds(lds)
-        for lds in ldsB: J.free_lds(lds)
+        J.free_lds(ldsA)
+        J.free_lds(ldsB)
 
         if 1:
             # swizzle-LDS to form better memory-coelascing VMEM
@@ -611,5 +635,5 @@ if __name__ == "__main__":
     test_gemm(32, [64, 64], [1, 2])
     test_gemm(32, [64, 64], [2, 1])
     test_gemm(32, [64, 64], [1, 1])
-    test_gemm(32, [32, 32], [2, 2])
+    test_gemm(32, [32, 32], [2, 2]) 
 
