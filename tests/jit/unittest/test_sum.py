@@ -44,9 +44,8 @@ wait1-compute1
 def test_sum():
     @pyhip.jit()
     def kernel(J, pA:"int*", count:"int", wave_count:"int", pDst:"int*"):
-        warp_id = J.gpr("su32")
-        J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
-        lane_id = J.gpr(J.threadIdx.x[0] % 64)
+        warp_id = J.warp_id
+        lane_id = J.lane_id
 
         idx0 = J.gpr((J.blockIdx.x[0] * 4 + warp_id) * wave_count)
         idx1 = J.gpr(idx0[0] + wave_count)
@@ -55,7 +54,7 @@ def test_sum():
 
         pA[:] = pA[:] + idx0*4
 
-        buff = J.Buffer(pA, wave_count[0] << 2)
+        buff = J.Buffer(pA, wave_count[0] << 2) 
 
         voffset = J.gpr(lane_id << 4) # 16bytes per-lane
         

@@ -712,6 +712,7 @@ class JIT:
         self.debug_cond_sgpr = None
         self.debug_log_ptr = None
         self.lds_allocator = SimpleMemoryAllocator(160*1024)
+        self.special_vars = {}
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -2170,6 +2171,7 @@ class JIT:
             "v_and_b32",
             "v_or_b32",
             "v_xor_b32",
+            "v_readfirstlane_b32",
         ]
         def is_cse_inst(inst):
             for prefix in cse_inst_list:
@@ -2681,6 +2683,20 @@ r'''
     def silu(self, vgpr_src):
         return self.gpr(self.sigmoid(vgpr_src) * vgpr_src)
 
+    @property
+    def warp_id(self):
+        if "warp_id" not in self.special_vars:
+            _warp_id = self.gpr("su32")
+            self.v_readfirstlane_b32(_warp_id, self.threadIdx.x[0] // 64)
+            self.special_vars["warp_id"] = _warp_id
+        return self.special_vars["warp_id"]
+
+    @property
+    def lane_id(self):
+        if "lane_id" not in self.special_vars:
+            _lane_id = self.gpr(self.threadIdx.x[0] % 64)
+            self.special_vars["lane_id"] = _lane_id
+        return self.special_vars["lane_id"]
 
 gen_hip_file_unique_id = 0
 
