@@ -25,15 +25,15 @@ def test_torch_fp16_perf(num_CU = 80, K = 8192):
     N = 32 * 4 * CU_rows*2
     A = torch.randn(M, K, dtype=torch.float16)
     B = torch.randn(N, K, dtype=torch.float16)
-    for i in range(2):
+    for i in range(4):
         with pyhip.cudaPerf(M*N*K*2):
             out = torch.nn.functional.linear(A, B)
 
 num_CU = 80
 test_torch_fp16_perf(num_CU, K)
 
-if 0:
-    bench_mfma = hip.bench_mfma
-    for i in range(4):
-        with pyhip.cudaPerf(num_CU*4*M*N*K*2):
-            bench_mfma([num_CU],[64*4], A.data_ptr(), B.data_ptr(), 32, out.data_ptr(), N, K)
+# if 1:
+#     bench_mfma = hip.bench_mfma
+#     for i in range(4):
+#         with pyhip.cudaPerf(num_CU*4*M*N*K*2):
+#             bench_mfma([num_CU],[64*4], A.data_ptr(), B.data_ptr(), 32, out.data_ptr(), N, K)

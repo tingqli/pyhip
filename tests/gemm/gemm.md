@@ -1,36 +1,36 @@
 mem type	latency(cycles)	throughput/CU (cycles)	throughput/CU (bytes/cycles)	issue-cycle @4-waves/CU (cycles/instruction)
-buffer load dwordx4	500~800	~32	32	32*4 = 128
-buffer load dword lds	500~800	~11	23	11*4 = 44
-LDS read (no bank-conflict) b128/b32	64/52	16/4 [^1]	64/64 [^1]	8*4 = 32
+buffer load dwordx4	500~800	~32	32	32x4 = 128
+buffer load dword lds	500~800	~11	23	11x4 = 44
+LDS read (no bank-conflict) b128/b32	64/52	16/4 [^1]	64/64 [^1]	8x4 = 32
 LDS read b32 (4-bank-conflict)	120	16	16	
 LDS read b32 (full-bank-conflict)	119	64/64	4	
 
 
 mem type	latency(cycles)	throughput/CU (cycles)	throughput/CU (bytes/cycles)	issue-cycle @4-waves/CU (cycles/instruction)
-buffer load dwordx4	500~800	~32	32	32*4 = 128
-buffer load dword lds	500~800	~11	23	11*4 = 44
-LDS read (no bank-conflict) b128/b32	64/52	16/4 [^1]	64/64 [^1]	8*4 = 32
+buffer load dwordx4	500~800	~32	32	32x4 = 128
+buffer load dword lds	500~800	~11	23	11x4 = 44
+LDS read (no bank-conflict) b128/b32	64/52	16/4 [^1]	64/64 [^1]	8x4 = 32
 LDS read b32 (4-bank-conflict)	120	16	16	
 LDS read b32 (full-bank-conflict)	119	64/64	4	
 
 ##REGS:
 1. HBM data need to put into regs first , 32KB divided by 4 waves, Each  wave8KB,  each lane 8KB/64 =128 VGPRs for HBM,
    Total:128BGPRs.
-2. REGs for [128, 8]*[128*8]= [128, 128],   A,B KL=4,  A: 128/32*KL/2=8REGA,  B: 128/32*KL/2= 8REGB, ,  C: 4*4*4 = 64 
+2. REGs for [128, 8]x[128x8]= [128, 128],   A,B KL=4,  A: 128/32xKL/2=8REGA,  B: 128/32xKL/2= 8REGB, ,  C: 4x4x4 = 64 
    Total: 16VGPRs + 64 ACC when innter most K is 8.
 
 ##LDS:
-1. 32KB for [256,32]*[256,32]
+1. 32KB for [256,32]x[256,32]
 2. Can add ping-pong. Split the prefetch and MFMA needed LDS.
 
 
 ##Latency in 1st level:
   
 
-Total  LDS per CU =   [256,32]*[256,32] = 32KB
+Total  LDS per CU =   [256,32]x[256,32] = 32KB
 
-FMA latency per Wave:          [128,32] * [128, 32] = [128, 128]               MFMA_f32_32x32x8_f16,        per ISA cyles:32?                              Total : 32* 4*4*4=2,048 , 2048 cycles for FMA , 
-Load HBM latency per CU:         [256,32]*[256,32]=[256,256]                  A+B=32KB                      HBM tput per CU, 32B                   HBM cycles:            (256*32*2)*2/32 = 1,024 cycles.
+FMA latency per Wave:          [128,32] x [128, 32] = [128, 128]               MFMA_f32_32x32x8_f16,        per ISA cyles:32?                              Total : 32x 4x4x4=2,048 , 2048 cycles for FMA , 
+Load HBM latency per CU:         [256,32]x[256,32]=[256,256]                  A+B=32KB                      HBM tput per CU, 32B                   HBM cycles:            (256x32x2)x2/32 = 1,024 cycles.
 
 
 ##PIPE LANE in 1st level:
@@ -45,8 +45,8 @@ FMA and load, store. So  wait vmcnt(0) should be about at  1024+800 , wait lgkmc
 
 ##Latency in 2nd level: FMA hide LDS loading. Ping-pong registers for A, B
 
-Each WARP calculate: [128,8]*[128,8], FMA latency= 32*4*4=512 cycles;
-Loading A+B:   assume LBS is 128B/cycle for 4 SIMD16, Each SIMD16 is 32B/cycles.   256*8*2=4KB,     4KB/32=128 cycles.
+Each WARP calculate: [128,8]x[128,8], FMA latency= 32x4x4=512 cycles;
+Loading A+B:   assume LBS is 128B/cycle for 4 SIMD16, Each SIMD16 is 32B/cycles.   256x8x2=4KB,     4KB/32=128 cycles.
 
 ##PIPE LANE in 1st level:
 
@@ -67,33 +67,44 @@ ILP doesn't use either ping-pong LDS or ping-pong registers for A,B or pingpong 
 CU calculate [256, 256, 32] matrix, using MFA_f32_32x32x8_f16 ISAs. Buffer load using 4xDWORD, LDS load/store also using 4xDWORDS. 8 elemnts each time.
 
 ### ISA number:
-FMA per wave:   **MFMA_F32_32x32x8_f16** , For each wavefront, [128,128,32], needs MFMA ISAs number 128*128*32/(32*32*8) = 64 MFA ISAs.
-**buffer_load_dwordx4 & ds_write_128b**  per lane:  256*32*2/4 waves/64 lanes/ 8element = 8 ISAs, 
-**ds_read_128b** per lane: 128*32*2/64lanes/8 elements = 16 ISAs. 
+FMA per wave:   **MFMA_F32_32x32x8_f16** , For each wavefront, [128,128,32], needs MFMA ISAs number 128x128x32/( 32x32x8) = 64 MFA ISAs.
+
+**buffer_load_dwordx4 & ds_write_128b**  per lane:  256x32x2/4 waves/64 lanes/ 8element = 8 ISAs, 
+
+**ds_read_128b** per lane: 128x32x2/64lanes/8 elements = 16 ISAs. 
+
 buffer_load_dwordx4/ds_write_128 is 8 ISAs per lane, but ds_read_128b per lane is 16 ISAs(NOT 8 ISAs) per lane. 
+
 Because the 4 waves in one CU, 2x2 tiles.For the  buffer_load_dwordx4/ds_write_128 no duplicate data is access across 4 waves,divided evenly across 4 waves.
+
 But for the ds_read_128b, duplicate read across the waves because of data reuse. 4 waves would read 2 times data.
 
+
 ### LDS occupancy:
-LDS size for [256, 256, 32] = 256*32*2*2= 32KB. Total 64 KB, only use 50%.  
+LDS size for [256, 256, 32] = 256x32x2x2= 32KB. Total 64 KB, only use 50%.  
 
 ## VGPR&ACC number for FMA :
 FOR 32x32x8, KL=4. So for FP16 input, REG_KL=KL/sizeof(FP16) = 2. As for 128x128x32 case:
+
 **REGM=4, REGN=4, REGK=4, REG_KL=2**. SO MFMA need regs=REGMxREGKxREG_KL+REGNxREGKxREGKL=64 regs.
-For ACC result needs regs 128*128/64 = 256 registers. So all the ACC registers would be used to hold result.
+
+For ACC result needs regs 128x128/64 = 256 registers. So all the ACC registers would be used to hold result.
+
 **So FMA needs 256 ACC registers and 64 VGPRs.**
 
 For for the MFMA 128x128x32, A would be divided into REGM*REGK tiles. **A[0:3, 0:3]**
-B would be divided into REGN*REGK tiles. **B[0:3, 0:3]**
-C would be divied into REGM*REGN tiels. **C[0:3, 0:3]**
+
+B would be divided into REGNxREGK tiles. **B[0:3, 0:3]**
+
+C would be divied into REGMxREGN tiels. **C[0:3, 0:3]**
 
 ### VGPR number for prefetch:
-To prefech all 256x256x32 per CU, the CU needs registers  (256*2*32)/2=8K. So each lane would need 8K/4/64=32 VGPRs
+To prefech all 256x256x32 per CU, the CU needs registers  (256x2x32)/2=8K. So each lane would need 8K/4/64=32 VGPRs
 
 
 
 ### ILP Prologue:
-
+```
 8 buffer0_load_dwordx8_[0:8]           ->    trigger buffer_0 , buffer_0 is all A+B for CU to calculate 256x256x32
 wait_cnt(vcnt(0))                      ->    buffer_0 prefetch done
 8  ds_write_128b_[0:8]                 ->    trigger buffer_0  into LDS
@@ -101,10 +112,11 @@ wait_cnt(vcnt(0))                      ->    buffer_0 prefetch done
 wait_cnt(lgkmcnt(0))                   ->    ready: buffer_0 into LDS  8 ds_write_128b  done.
 sbarrier()                                       
 ds_read_128b_[0:7]                     ->    trigger read the first half of LDS.   A[0:3,0:1] + B[0:3,0:1]
-
+```
 
 
 ### ILP hot loop:
+```
 ///////////////////hot loop start:
 ///////////////////status: N-th buffer prefetch done, buffer_N in LDS;  Trigger first half of buffer_N  (A[0:3,0:1] + B[0:3,0:1]) into LDS ; buffer_N+1  prefetch triggered.
 
@@ -289,5 +301,6 @@ updated buffer offset
 ###########status: Nth buffer matmul done.
                    (N+1)th buffer prefetch done, (N+1)th buffer in LDS;
                    half of (N+1)th in LDS  into A[0:3,0:1] + B[0:3,0:1] triggered.  (N+2)th buffer prefetch triggered..
+```
 
 ### ILP tail:

@@ -15,11 +15,43 @@ using float32x4 = float  __attribute__ ((ext_vector_type(4)));
 // using float16x8 = __fp16 __attribute__ ((ext_vector_type(8)));
 // using float16x32 = __fp16 __attribute__ ((ext_vector_type(32)));
 using float32x16 = float  __attribute__ ((ext_vector_type(16)));
-// using float32x4 = float  __attribute__ ((ext_vector_type(4)));
-// using float32x2 = float  __attribute__ ((ext_vector_type(2)));
-// using int32x4_t = int  __attribute__ ((ext_vector_type(4)));
-// using int32x16_t = int  __attribute__ ((ext_vector_type(16)));
-// using uint32x2_t = uint  __attribute__ ((ext_vector_type(2)));
+using float32x4 = float  __attribute__ ((ext_vector_type(4)));
+using float32x2 = float  __attribute__ ((ext_vector_type(2)));
+using int32x4_t = int  __attribute__ ((ext_vector_type(4)));
+using int32x16_t = int  __attribute__ ((ext_vector_type(16)));
+using uint32x2_t = uint  __attribute__ ((ext_vector_type(2)));
+
+__device__ __inline__
+static uint buffer_load_dword(int32x4_t srsrc,
+                        int32_t voffset,
+                        int32_t soffset,
+                        int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.i32");
+__device__ __inline__
+static int32x4_t buffer_load_dwordx4(int32x4_t srsrc,
+                        int32_t voffset,
+                        int32_t soffset,
+                        int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+
+union BufferResource {
+    __device__ __inline__ constexpr BufferResource()
+        : config(0x00020000U) {}
+
+    __device__ __inline__ constexpr BufferResource(void* buffer_address, uint32_t buffer_size)
+        : address(buffer_address),
+          range(buffer_size),
+          config(0x00020000U) {}
+
+    int32x4_t descriptor;
+    struct{
+        void* address;      // 8B, out of which first 48b is address, and 16b is stride (unused)
+        uint32_t range;     // Byte range for the buffer resource
+        uint32_t config;    // Constant, DFMT=32b
+    };
+    __device__ __inline__ int32x4_t load_dwordx4(int32_t voffset, int32_t soffset) {
+        return buffer_load_dwordx4(descriptor, voffset, soffset, 0);
+    }
+};
+
 
 
 __global__ void __launch_bounds__(256, 1) run_mfma(__fp16* A_ptr, __fp16* B_ptr, float* C_ptr, int K,int N) {
@@ -48,10 +80,18 @@ __global__ void __launch_bounds__(256, 1) run_mfma(__fp16* A_ptr, __fp16* B_ptr,
     constexpr uint B_load_regs = BN*BK/(64*(waves)*ELEMENTS);
 
 
-    int offset_load_hbm =  prefetch_rowid*K + prefetch_colid*(ELEMENTS);
+    int prefetch_voff =  prefetch_rowid*K + prefetch_colid*(ELEMENTS);
 
-    __fp16* A_ptr_prefetch = A_ptr + (wgid_m*BM + warp_id*(BM/(waves)))*K + offset_load_hbm;
-    __fp16* B_ptr_prefetch = B_ptr + (wgid_n*BN + warp_id*(BN/(waves)))*K +  offset_load_hbm;
+
+    __fp16* A_ptr_prefetch = A_ptr + (wgid_m*BM + warp_id*(BM/(waves)))*K + prefetch_voff;
+    __fp16* B_ptr_prefetch = B_ptr + (wgid_n*BN + warp_id*(BN/(waves)))*K +  prefetch_voff;
+
+
+    A_ptr += wgid_m * BM * K;
+    B_ptr += wgid_n * BN * K;
+
+    BufferResource bufferA(A_ptr, BM * K * sizeof(__fp16));
+    BufferResource bufferB(B_ptr, BN * K * sizeof(__fp16));
 
     //A,B LDS store ping-pong buffer.
     auto A_LDS0_store = Abuff + warp_id*(BM/(waves)) * BK + prefetch_rowid*BK;
@@ -83,13 +123,11 @@ __global__ void __launch_bounds__(256, 1) run_mfma(__fp16* A_ptr, __fp16* B_ptr,
     auto lds_read = [](float16x8 *vreg, __shared__ __fp16* src, int fma_rowid, int fma_colid) {
         int  swizzle_colid;
         for (int idx = 0; idx < REG_K/2; idx++) {
-            swizzle_colid = ((fma_rowid/2)^(fma_colid + 2*idx)) % 4;
+            swizzle_colid = ((fma_rowid>>1)^(fma_colid + 2*idx)) % 4;
             vreg[idx] = *(float16x8*)(src+swizzle_colid*8);
         }
     };
 
-
-    //REGK is register factor based on MFMA ISA. Here 2 REGK are combined to meet minim 128 bit HBM read for coalescing tranction.
 
     float32x16 c[REG_M*REG_N] = {0};
     float16x8 a[REG_M*REG_K/2];
@@ -138,38 +176,17 @@ __global__ void __launch_bounds__(256, 1) run_mfma(__fp16* A_ptr, __fp16* B_ptr,
     for(int k_idx = BK,cnt = 0; k_idx < K; k_idx += BK, cnt++)
     {
         __syncthreads();
-            // auto tmp_pref_A = A_ptr_prefetch;
-            // #pragma unroll
-            // for(int m = 0; m < A_load_regs; m++) {
-            //     auto swizzle_col_id = (prefetch_colid ^ (((prefetch_rowid + m*rows_per_load) % 32)/2)) % 4;
-            //     auto tmp_store_A = A_LDS_store + (rows_per_load*BK)*m + swizzle_col_id *(ELEMENTS);
-            //     prefecth_A[m]= *(float16x8*)tmp_pref_A;
-            //     *(float16x8*)(tmp_store_A) = prefecth_A[m];
-            //     tmp_pref_A += rows_per_load*K;
-            // }
-
-
 
         {
             auto tmp_load_A = A_LDS_load;
             #pragma unroll
             for(int m = 0; m < REG_M; m++) {
-                // int  swizzle_colid;
-                // for (int k = 0; k < REG_K/2; k++) {
-                //     swizzle_colid = ((fma_rowid/2)^(fma_colid + 2*k)) % 4;
-                //     a[m*REG_K/2 + k] = *(float16x8*)(tmp_load_A+swizzle_colid*8);
-                // }
                 lds_read(&a[m*REG_K/2],tmp_load_A, fma_rowid, fma_colid);
                 tmp_load_A += BK*32;
             }
             auto tmp_load_B = B_LDS_load;
             #pragma unroll
             for(int n = 0; n < REG_N; n++) {
-                // int  swizzle_colid;
-                // for (int k = 0; k < REG_K/2; k++) {
-                //     swizzle_colid = ((fma_rowid/2)^(fma_colid + 2*k)) % 4;
-                //     b[n*REG_K/2 + k] = *(float16x8*)(tmp_load_B+swizzle_colid*8);
-                // }
                 lds_read(&b[n*REG_K/2],tmp_load_B, fma_rowid, fma_colid);
                 tmp_load_B += BK*32;
             }
@@ -224,18 +241,6 @@ __global__ void __launch_bounds__(256, 1) run_mfma(__fp16* A_ptr, __fp16* B_ptr,
             }
         }
 
-            // auto tmp_pref_B = B_ptr_prefetch;
-            // #pragma unroll
-            // for(int n = 0; n < load_regs; n++) {
-            //     auto swizzle_col_id = (prefetch_colid ^ (((prefetch_rowid + n*rows_per_load)%32)/2)) % 4;
-            //     auto tmp_store_B = B_LDS_store + (rows_per_load*BK)*n + swizzle_col_id *(ELEMENTS);
-            //     prefecth_B[n]= *(float16x8*)tmp_pref_B;
-            //     *(float16x8*)(tmp_store_B) = prefecth_B[n];
-            //     tmp_pref_B += rows_per_load*K;
-            // }
-
-            // prefetch(&prefecth_B[0],  B_ptr_prefetch);
-            // lds_write(&prefecth_B[0],  B_LDS_store, prefetch_rowid, prefetch_colid);
         
         //update prefetch 
         A_ptr_prefetch += BK;
@@ -248,27 +253,19 @@ __global__ void __launch_bounds__(256, 1) run_mfma(__fp16* A_ptr, __fp16* B_ptr,
     }
 
     __syncthreads();
+    //tails handling.
     {
         {
             auto tmp_load_A = A_LDS_load;
             #pragma unroll
             for(int m = 0; m < REG_M; m++) {
-                // int  swizzle_colid;
-                // for (int k = 0; k < REG_K/2; k++) {
-                //     swizzle_colid = ((fma_rowid/2)^(fma_colid + 2*k)) % 4;
-                //     a[m*REG_K/2 + k] = *(float16x8*)(tmp_load_A+swizzle_colid*8);
-                // }
+
                 lds_read(&a[m*REG_K/2],tmp_load_A, fma_rowid, fma_colid);
                 tmp_load_A += BK*32;
             }
             auto tmp_load_B = B_LDS_load;
             #pragma unroll
             for(int n = 0; n < REG_N; n++) {
-                // int  swizzle_colid;
-                // for (int k = 0; k < REG_K/2; k++) {
-                //     swizzle_colid = ((fma_rowid/2)^(fma_colid + 2*k)) % 4;
-                //     b[n*REG_K/2 + k] = *(float16x8*)(tmp_load_B+swizzle_colid*8);
-                // }
                 lds_read(&b[n*REG_K/2],tmp_load_B, fma_rowid, fma_colid);
                 tmp_load_B += BK*32;
             }
