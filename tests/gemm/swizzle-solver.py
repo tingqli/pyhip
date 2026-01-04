@@ -181,34 +181,51 @@ class LDSTile2D:
         self.access(self.lane_groups_rb128, lane_rows, lane_cols)
         print(f"ds_read_b128(). total conflicts += {self.conflicts-conflicts0}")
 
-def simulate_b128_bank_conflict(LDS_M, LDS_K, mfma_M, swizzle):
+def simulate_b128_bank_conflict(LDS_M, LDS_K, mfma_M, swizzle, WR_reverse = False, both_mfma = False):
     lane = np.arange(0, WARP_SIZE)
-
-    # item size is set to b128 (16 bytes)
-    lds = LDSTile2D(LDS_M, LDS_K, 16, swizzle)
-    print(f"================= ds_write_b128 for buffer_load_dwordx4 in K-major lane pattern")
-    lane_write_row = lane // LDS_K
-    lane_write_col = lane % LDS_K
-    assert WARP_SIZE % LDS_K == 0
-    bload_M = WARP_SIZE // LDS_K
-    assert bload_M >= 1, f"Assuming WARP_SIZE{WARP_SIZE} can cover one row at least"
-    for row_off in range(0, LDS_M, bload_M):
-        print(f"{row_off=}")
-        lds.ds_write_b128(lane_write_row + row_off, lane_write_col)
 
     assert WARP_SIZE % mfma_M == 0
     assert mfma_M == 32 or mfma_M == 16
     mfma_K = WARP_SIZE // mfma_M
 
-    print(f"================= ds_read_b128 for VMFMA {mfma_M}x{mfma_K}")
-    print(f"               mfma_K is in element of lanes, not related to A's dtype")
-
     lane_read_row = lane % mfma_M
     lane_read_col = lane // mfma_M
 
+    # item size is set to b128 (16 bytes)
+    lds = LDSTile2D(LDS_M, LDS_K, 16, swizzle)
+    if both_mfma:
+        print(f"================= ds_write_b128 for VMFMA {mfma_M}x{mfma_K}")
+        print(f"               mfma_K is in element of lanes, not related to A's dtype")
+        for row_off in range(0, LDS_M, mfma_M):
+            for col_off in range(0, LDS_K, mfma_K):
+                if WR_reverse:
+                    lds.ds_read_b128(lane_read_row + row_off, lane_read_col + col_off)
+                else:
+                    lds.ds_write_b128(lane_read_row + row_off, lane_read_col + col_off)
+    else:
+        print(f"================= ds_write_b128 for buffer_load_dwordx4 in K-major lane pattern")
+        lane_write_row = lane // LDS_K
+        lane_write_col = lane % LDS_K
+        assert WARP_SIZE % LDS_K == 0
+        bload_M = WARP_SIZE // LDS_K
+        assert bload_M >= 1, f"Assuming WARP_SIZE{WARP_SIZE} can cover one row at least"
+        for row_off in range(0, LDS_M, bload_M):
+            print(f"{row_off=}")
+            if WR_reverse:
+                lds.ds_read_b128(lane_write_row + row_off, lane_write_col)
+            else:
+                lds.ds_write_b128(lane_write_row + row_off, lane_write_col)
+
+
+    print(f"================= ds_read_b128 for VMFMA {mfma_M}x{mfma_K}")
+    print(f"               mfma_K is in element of lanes, not related to A's dtype")
+
     for row_off in range(0, LDS_M, mfma_M):
         for col_off in range(0, LDS_K, mfma_K):
-            lds.ds_read_b128(lane_read_row + row_off, lane_read_col + col_off)
+            if WR_reverse:
+                lds.ds_write_b128(lane_read_row + row_off, lane_read_col + col_off)
+            else:
+                lds.ds_read_b128(lane_read_row + row_off, lane_read_col + col_off)
     lds.show_swizzle()
     assert lds.conflicts == 0
     print(f"LDS 2D Tile ({LDS_M}, {LDS_K}, b128/half8/dowrd4): VMFMA {mfma_M}x{mfma_K} final LDS bank-conflicts: {lds.conflicts}")
@@ -219,6 +236,14 @@ def swizzle1(row, col, max_rows, max_cols):
 
 def swizzle2(row, col, max_rows, max_cols):
     return row, (col^(row//2)) % max_cols
+
+
+
+#simulate_b128_bank_conflict(32, 4, 32, swizzle2)
+#simulate_b128_bank_conflict(32, 4, 32, swizzle2, both_mfma=True)
+simulate_b128_bank_conflict(64, 8, 16, swizzle1, both_mfma=True)
+#simulate_b128_bank_conflict(32, 4, 32, swizzle2, WR_reverse=True)
+assert 0
 
 # 32x4(half8)
 simulate_b128_bank_conflict(32, 4, 32, swizzle2) # only swizzle2 works

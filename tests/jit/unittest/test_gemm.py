@@ -2,16 +2,18 @@ import pyhip
 import pytest
 import functools
 
+"""
+work-group协作，每次预取 wg_M * row_bytes 大小的内容到预取寄存器，写入LDS
+"""
 class MFMA_DW4Loader:
-    J = None
-    def __init__(self, J,
-                 mfma_MN:int, wg_M:int, wave_cnt:int,
-                 row_bytes:int, stride_bytes:int,
+    def __init__(self, J, ptr, buff_size,
+                 wg_M:int, row_bytes:int, stride_bytes:int,
+                 wave_cnt:int, swizzle_row_div:int,
                  skip_load:bool = False):
-        MFMA_DW4Loader.J = J
-        self.mfma_MN = mfma_MN
+        self.buff = J.Buffer(ptr, buff_size) # wg_M*stride_bytes)
         self.wave_cnt = wave_cnt
         self.wg_M = wg_M
+        self.J = J
         sizeof_DWORDX4 = 16
         assert (row_bytes) % sizeof_DWORDX4 == 0 # each lane prefetch DWORDx4 which is 8xhalf
         num_lanes_per_row = row_bytes // sizeof_DWORDX4
@@ -28,7 +30,7 @@ class MFMA_DW4Loader:
         self.prefetch_step_size = (dw4_prefetch_MN)*stride_bytes
         self.num_prefetch_M = num_prefetch_M
         self.stride_bytes = stride_bytes
-        swizzle_row_div = 1 if self.mfma_MN == 16 else 2
+        self.swizzle_row_div = swizzle_row_div
         if skip_load:
             self.prefetch_step_size = 0
         
@@ -48,11 +50,81 @@ class MFMA_DW4Loader:
     def reset_offset(self, koff):
         self.prefetch_soffset[0] = koff[0]
 
-    def prefetch(self, index, buff_a):
-        buff_a.load_dwordx4(self.prefetch_reg[index], self.prefetch_voffset, self.prefetch_soffset)
+    def prefetch(self, index):
+        assert index < self.num_prefetch_M
+        self.buff.load_dwordx4(self.prefetch_reg[index], self.prefetch_voffset, self.prefetch_soffset)
         self.prefetch_soffset[0] = self.prefetch_soffset[0] + self.prefetch_step_size
 
     def ds_write(self, index, lds_base):
+        assert index < self.num_prefetch_M
+        self.J.ds_write_b128(self.ds_write_b128_vaddr[index], self.prefetch_reg[index], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
+
+"""
+外存数据经过按照 mfma_MN x  mfma_K 尺寸 preshuffle，
+work-group协作，每次预取 wg_M * row_bytes 大小的内容到预取寄存器
+"""
+class MFMA_DW4Loader_preshuffled:
+    def __init__(self, J, ptr, buff_size, mfma_MN, 
+                 wg_M:int, row_bytes:int, stride_bytes:int,
+                 wave_cnt:int, swizzle_row_div:int,
+                 skip_load:bool = False):
+        self.buff = J.Buffer(ptr, buff_size)
+        sizeof_DWORDX4 = 16
+        assert row_bytes % sizeof_DWORDX4 == 0
+        row_lanes = row_bytes // sizeof_DWORDX4
+        mfma_K_lanes = 64 // mfma_MN
+        assert row_lanes % mfma_K_lanes == 0, f"{row_lanes=} {mfma_K_lanes=}"
+        assert wg_M % mfma_MN == 0
+        num_prefetch_m = wg_M // mfma_MN
+        num_prefetch_n = row_lanes // mfma_K_lanes
+        assert (num_prefetch_m * num_prefetch_n) % wave_cnt == 0
+        wave_prefetches = num_prefetch_m * num_prefetch_n // wave_cnt
+        # big_waves = wave_cnt - (wave_prefetches * wave_cnt - num_prefetch_m * num_prefetch_n)
+        num_lanes_per_row = row_bytes // sizeof_DWORDX4
+
+        warp_id = J.warp_id
+        lane_id = J.lane_id
+        # at compile time, precompute offsets for waves and generate conditional assign
+        self.ds_write_b128_vaddr = [J.gpr("vu32") for _ in range(wave_prefetches)]
+        self.prefetch_reg = J.gpr(wave_prefetches, 4, "vu32")
+        self.prefetch_sbase = J.gpr("su32")
+        self.prefetch_offsets = J.gpr(wave_prefetches, "su32")
+        self.prefetch_voffset = lane_id * sizeof_DWORDX4
+        prefetch_id = 0
+        for wave in range(wave_cnt):
+            with J.If(warp_id[0] == wave):
+                # pre-shuffled data unit size: [mfma_MN, mfma_K_lanes * sizeof_DWORDX4]
+                for i in range(wave_prefetches):
+                    prefetch_n = prefetch_id % num_prefetch_n
+                    prefetch_m = prefetch_id // num_prefetch_n
+                    assert prefetch_m < num_prefetch_m
+                    prefetch_id += 1
+                    offset = prefetch_m * (mfma_MN * stride_bytes) + prefetch_n * (mfma_MN * mfma_K_lanes * sizeof_DWORDX4)
+                    self.prefetch_offsets[i] = offset
+
+                    #ds_offset = prefetch_m * (mfma_MN * row_bytes) + prefetch_n * (mfma_MN * mfma_K_lanes * sizeof_DWORDX4)
+                    col = (lane_id // mfma_MN) + prefetch_n * mfma_K_lanes
+                    row = (lane_id % mfma_MN) + prefetch_m * mfma_MN
+                    swizzle_col = ((row//swizzle_row_div) ^ col) % (num_lanes_per_row)
+                    self.ds_write_b128_vaddr[i][0] = (row * row_bytes) + swizzle_col*(sizeof_DWORDX4)
+
+        self.wave_prefetches = wave_prefetches
+        self.mfma_MN = mfma_MN
+        self.J = J
+
+    def __len__(self):
+        return self.wave_prefetches
+
+    def reset_offset(self, koff_bytes):
+        self.prefetch_sbase[0] = koff_bytes[0] * self.mfma_MN
+
+    def prefetch(self, index):
+        assert index < self.wave_prefetches
+        self.buff.load_dwordx4(self.prefetch_reg[index], self.prefetch_voffset, self.prefetch_offsets[index] + self.prefetch_sbase[0])
+        #self.prefetch_sbase[0] = self.prefetch_sbase[0] + self.prefetch_step_size
+
+    def ds_write(self, index, lds_base):
+        assert index < self.wave_prefetches
         self.J.ds_write_b128(self.ds_write_b128_vaddr[index], self.prefetch_reg[index], mod=f"offset:{lds_base}") #  vaddr, vdata offset gds
 
 
@@ -99,7 +171,7 @@ class UGEMM:
         self.wave_nCN = wave_nCN
         self.wave_nCK = wave_nCK
 
-    def run(self, buff_a, buff_b, buff_c, M, debug_warp, skip_load):
+    def run(self, loaderA, loaderB, buff_c, M, debug_warp, skip_load):
         J = self.J
 
         sizeof_bf16 = 2
@@ -119,25 +191,10 @@ class UGEMM:
         assert dw4_prefetch_MN >= 1
         print(f"{self.wg_M=} {num_lanes_per_row=} {dw4_prefetch_MN=}")
 
-        loaderA = MFMA_DW4Loader(J, self.mfma_MN, self.wg_M, self.wave_cnt, sizeof_bf16*self.wg_K, self.K * sizeof_bf16, skip_load=skip_load)
-        loaderB = MFMA_DW4Loader(J, self.mfma_MN, self.wg_N, self.wave_cnt, sizeof_bf16*self.wg_K, self.K * sizeof_bf16, skip_load=skip_load)
-
         # 4-wave within a WG coorperatively loads VRAM data in DWORDx4
-        def prefetchA(index):
-            loaderA.prefetch(index, buff_a)
-
-        def prefetchB(index):
-            loaderB.prefetch(index, buff_b)
-
         def swizzle(row, col):
             swizzle_row_div = 1 if self.mfma_MN == 16 else 2
             return (row//swizzle_row_div) ^ col
-
-        def ds_writeA(index):
-            loaderA.ds_write(index, ldsA)
-
-        def ds_writeB(index):
-            loaderB.ds_write(index, ldsB)
 
         # each swizzle generates a new vaddr pattern, precompute all of them
         # each wave reads its own part
@@ -202,8 +259,8 @@ class UGEMM:
         loaderA.reset_offset(k_offset)
         loaderB.reset_offset(k_offset)
         # prelog 0
-        for r in range(num_prefetch_M): prefetchA(r)
-        for r in range(num_prefetch_N): prefetchB(r)
+        for r in range(num_prefetch_M): loaderA.prefetch(r)
+        for r in range(num_prefetch_N): loaderB.prefetch(r)
         mfma_C[:] = 0 
 
         # prelog 1: ds_write + prefetch
@@ -213,12 +270,12 @@ class UGEMM:
 
         for r in range(num_prefetch_M):
             J.s_waitcnt(mod=f"vmcnt({num_prefetch_M + num_prefetch_N - 1})")
-            ds_writeA(r)
-            prefetchA(r)
+            loaderA.ds_write(r, ldsA)
+            loaderA.prefetch(r)
         for r in range(num_prefetch_N):
             J.s_waitcnt(mod=f"vmcnt({num_prefetch_M + num_prefetch_N - 1})")
-            ds_writeB(r)
-            prefetchB(r)
+            loaderB.ds_write(r, ldsB)
+            loaderB.prefetch(r)
 
         # prelog 1: wait ds_write
         J.s_waitcnt(mod="lgkmcnt(0)")
@@ -233,7 +290,6 @@ class UGEMM:
         J.s_waitcnt(mod=f"lgkmcnt(0)")
 
         if 0:
-            J.s_waitcnt(mod="lgkmcnt(0)")
             J.debug_log(mfma_A[0], torch.bfloat16, "2h.4h.16v.8h")
             J.debug_log(mfma_A[1], torch.bfloat16, "2h.4h.16v.8h")
             J.debug_log(mfma_A[2], torch.bfloat16, "2h.4h.16v.8h")
@@ -301,7 +357,6 @@ class UGEMM:
         cur_k = J.gpr("su32")
         cur_k[0] = 0
         k_loop_cnt = self.K//self.wg_K
-        assert k_loop_cnt % 2 == 0
 
         with J.While(cur_k[0] < k_loop_cnt):
             #for unroll in range(k_loop_cnt):
@@ -332,17 +387,17 @@ class UGEMM:
             for r in range(num_prefetch_M):
                 emit_mfma([mfma0, mfma1], 16)
                 J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
-                ds_writeA(r)
+                loaderA.ds_write(r, ldsA)
                 emit_mfma([mfma0, mfma1], 16*2)
-                prefetchA(r)
+                loaderA.prefetch(r)
                 emit_mfma([mfma0, mfma1], 16*8)
 
             for r in range(num_prefetch_N):
                 emit_mfma([mfma0, mfma1], 16)
                 J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
-                ds_writeB(r)
+                loaderB.ds_write(r, ldsB)
                 emit_mfma([mfma0, mfma1], 16*2)
-                prefetchB(r)
+                loaderB.prefetch(r)
                 emit_mfma([mfma0, mfma1], 16*8)
 
             # enure mfma0 finished using part0 of mfma_A/mfma_B, before ds_read0 overwrites them
@@ -473,9 +528,9 @@ def tb_swizzle(J, block_1d_id:"sgpr", M:"sgpr", wg_M:int, wg_N:int, N:int, M01:i
     M_out = J.gpr(idx_loc_mod_M01 + idx_M00 * M01)
     return M_out, N_out
 
-@pyhip.jit(with_debug_log=False)
+@pyhip.jit(with_debug_log=False, force_recompile=True)
 def gemm_kernel(J, K, N, M01, GroupNum,
-                mfma_MN, wave_size, wave_cnt,
+                mfma_MN, wave_size, wave_cnt, A_preshuffled, B_preshuffled,
                 debug_warp, skip_load,
                 pA:"void*", pB:"void*", pC:"float*", M:"int"):
 
@@ -500,11 +555,30 @@ def gemm_kernel(J, K, N, M01, GroupNum,
     J.s_min_u32(min_M1, blk_m * gemm.wg_M + gemm.wg_M, M)
     actual_wg_M = J.gpr(min_M1 - blk_m * gemm.wg_M)
 
-    buff_a = J.Buffer(pA, actual_wg_M * K * sizeof_bf16)
-    buff_b = J.Buffer(pB, gemm.wg_N * K * sizeof_bf16)
+
+    stride_bytes = K * sizeof_bf16
+    total_wave_cnt = wave_cnt[0] * wave_cnt[1]
+    swizzle_row_div = 1 if mfma_MN == 16 else 2
+    if not A_preshuffled:
+        loaderA = MFMA_DW4Loader(J, pA, actual_wg_M * K * sizeof_bf16,
+                                gemm.wg_M, sizeof_bf16*gemm.wg_K, stride_bytes,
+                                total_wave_cnt, swizzle_row_div, skip_load)
+    else:
+        loaderA = MFMA_DW4Loader_preshuffled(J, pA, actual_wg_M * K * sizeof_bf16, mfma_MN,
+                                gemm.wg_M, sizeof_bf16*gemm.wg_K, stride_bytes,
+                                total_wave_cnt, swizzle_row_div, skip_load)
+    if not B_preshuffled:
+        loaderB = MFMA_DW4Loader(J, pB, gemm.wg_N * K * sizeof_bf16,
+                                gemm.wg_N, sizeof_bf16*gemm.wg_K, stride_bytes,
+                                total_wave_cnt, swizzle_row_div, skip_load)
+    else:
+        loaderB = MFMA_DW4Loader_preshuffled(J, pB, actual_wg_M * K * sizeof_bf16, mfma_MN,
+                                gemm.wg_N, sizeof_bf16*gemm.wg_K, stride_bytes,
+                                total_wave_cnt, swizzle_row_div, skip_load)
+    
     buff_c = J.Buffer(pC, actual_wg_M * N * sizeof_fp32)
 
-    gemm.run(buff_a, buff_b, buff_c, M, debug_warp, skip_load)
+    gemm.run(loaderA, loaderB, buff_c, M, debug_warp, skip_load)
     return
 
 
@@ -514,10 +588,27 @@ torch.cuda.set_device(2)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
 
+def pre_shuffle(x, mfma_MN):
+    M, K = x.shape
+    K_bytes = K * x.itemsize
+    sizeof_DWORDX4 = 16
+    mfma_K_lanes = 64 // mfma_MN
+    mfma_K_L = sizeof_DWORDX4//x.itemsize
+    mfma_K = mfma_K_lanes * mfma_K_L 
+
+    assert M % mfma_MN == 0
+    mfma_K_bytes = mfma_K_lanes * sizeof_DWORDX4
+    assert K_bytes % mfma_K_bytes == 0
+
+    x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L)
+    x = x.permute(0,2,3,1,4)
+    return x.contiguous()
+
+
 @pytest.mark.parametrize("mfma_MN", [32,16])
 @pytest.mark.parametrize("wave_size", [[128,128],[64,64],[32,32],[64,32]])
 @pytest.mark.parametrize("wave_cnt", [[2,2],[1,2],[2,1],[1,1]])
-def test_gemm(mfma_MN, wave_size, wave_cnt):
+def test_gemm(mfma_MN, wave_size, wave_cnt, A_preshuffled = False, B_preshuffled = False):
 
     # following cases consumes too much VGPRs for prefetch_Areg/prefetch_Breg
     # due to lack of cooperative waves
@@ -535,7 +626,7 @@ def test_gemm(mfma_MN, wave_size, wave_cnt):
     CU_rows = 8 #best_rows
     CU_cols = 10 #num_CU//CU_rows
 
-    debug_warp = 5
+    debug_warp = 0
     skip_load = 0
     M01 = 8
     GroupNum = 4
@@ -545,7 +636,7 @@ def test_gemm(mfma_MN, wave_size, wave_cnt):
     #wave_cnt = [2,2]
     wg_size = [wave_size[i]*wave_cnt[i] for i in range(2)]
 
-    M,N,K = wg_size[0]*8*4,wg_size[1]*10*4,8192*1
+    M,N,K = wg_size[0]*8*4,wg_size[1]*10*4,8192
     # M -= 14
 
     blk_cnt = (N//wg_size[1]) * ((M + wg_size[0] - 1)//wg_size[0])
@@ -553,11 +644,18 @@ def test_gemm(mfma_MN, wave_size, wave_cnt):
     B = torch.randn(N, K, dtype=torch.bfloat16)
     out = torch.randn(M, N, dtype=torch.float)
 
+    A1 = A
+    B1 = B
+    if A_preshuffled:
+        A1 = pre_shuffle(A1, mfma_MN)
+    if B_preshuffled:
+        B1 = pre_shuffle(B1, mfma_MN)
+        
     gemm_kernel([blk_cnt],[wave_cnt[0] * wave_cnt[1] * 64],
                 K, N, M01, GroupNum,
-                mfma_MN, wave_size, wave_cnt,
+                mfma_MN, wave_size, wave_cnt, A_preshuffled, B_preshuffled,
                 debug_warp, skip_load,
-                A.data_ptr(), B.data_ptr(), out.data_ptr(), M)
+                A1.data_ptr(), B1.data_ptr(), out.data_ptr(), M)
     ref_out = A @ B.t()
 
     debug_warp_m = debug_warp//2
@@ -582,8 +680,8 @@ def test_gemm(mfma_MN, wave_size, wave_cnt):
         acc_flag = True
 
     DATA_CLONES = 40
-    As = [torch.clone(A) for _ in range(DATA_CLONES)]
-    Bs = [torch.clone(B) for _ in range(DATA_CLONES)]
+    As = [torch.clone(A1) for _ in range(DATA_CLONES)]
+    Bs = [torch.clone(B1) for _ in range(DATA_CLONES)]
     Cs = [torch.clone(out) for _ in range(DATA_CLONES)]
     di = 0
 
@@ -594,11 +692,14 @@ def test_gemm(mfma_MN, wave_size, wave_cnt):
         with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"gemm_{di}") as p0:
             gemm_kernel([blk_cnt],[256],
                         K, N, M01, GroupNum,
-                        mfma_MN, wave_size, wave_cnt,
+                        mfma_MN, wave_size, wave_cnt, A_preshuffled, B_preshuffled,
                         debug_warp, skip_load,
                         As[di].data_ptr(), Bs[di].data_ptr(), Cs[di].data_ptr(), M)
         tflops_res.append(p0.tflops())
 
+    As = [torch.clone(A) for _ in range(DATA_CLONES)]
+    Bs = [torch.clone(B) for _ in range(DATA_CLONES)]
+    Cs = [torch.clone(out) for _ in range(DATA_CLONES)]
     tflops_ref = []
     for i in range(10):
         di = (di + 1)%DATA_CLONES
@@ -626,8 +727,10 @@ def test_gemm(mfma_MN, wave_size, wave_cnt):
 if __name__ == "__main__":
     #test_gemm(16, [128, 128], [1, 1])
     #assert 0
-    test_gemm(32, [128, 128], [2, 2])
-    test_gemm(16, [128, 128], [2, 2])
+    #test_gemm(32, [128, 128], [2, 2], A_preshuffled = False, B_preshuffled = True)
+    test_gemm(16, [128, 128], [2, 2], A_preshuffled = False, B_preshuffled = True)
+    #test_gemm(16, [128, 128], [2, 2], A_preshuffled = True, B_preshuffled = True)
+    #test_gemm(32, [128, 128], [2, 2], A_preshuffled = True, B_preshuffled = True)
     assert 0
     test_gemm(32, [64, 128], [2, 2])
     test_gemm(32, [128, 64], [2, 2])
