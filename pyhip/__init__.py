@@ -1,30 +1,6 @@
 from .hiptools import module
 from .asmjit import jit, JIT
 
-class torchPerf(object):
-    def __init__(self):
-        global torch
-        import torch
-
-        self.profiler = torch.profiler.profile(
-                        activities=[
-                            torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.CUDA,
-                        ],
-                        with_flops=True,
-                        with_stack=True,
-                        #on_trace_ready=torch.profiler.tensorboard_trace_handler("profiler_trace_dir", use_gzip=True)
-                        )
-
-    def __enter__(self):
-        self.profiler.start()
-        return self
-
-    def __exit__(self, type, value, traceback):
-        torch.cuda.synchronize()
-        self.profiler.stop()
-        print(self.profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
-
 class cudaPerf(object):
     def __init__(self, flops = 0, rw_bytes = 0, name="", verbose=1):
         global torch
@@ -61,6 +37,10 @@ class cudaPerf(object):
             msg += f"  {rw_bytes*1e-6/self.dt_ms:.1f} GB/s "
         print(msg)
 
+    def tflops(self, excludes=0):
+        avg_dt_ms = self.dt(excludes) * 1e3
+        return self.flops*1e-9/avg_dt_ms
+
 class torchPerf(object):
     def __init__(self, dir = ""):
         global torch
@@ -87,6 +67,7 @@ class torchPerf(object):
     def __exit__(self, type, value, traceback):
         if self.profiler is not None:
             self.profiler.stop()
+            print(self.profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
 
 class cuPerf(object):
     def __init__(self, flops = 0, batch = 0, rw_bytes = 0, name="", filter=None, verbose=1):

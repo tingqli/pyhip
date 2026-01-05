@@ -589,27 +589,6 @@ class Buffer:
             mod += f" offset:{offset12}"
         self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
 
-@cache
-def get_perm_pattern_16(J):
-    trans_low = J.gpr("su32")
-    trans_low[0] = 0x01_00_05_04
-    trans_high = J.gpr("su32")
-    trans_high[0] = 0x03_02_07_06
-    return trans_low, trans_high
-
-@cache
-def get_perm_pattern_8(J):
-    trans_low1 = J.gpr("su32")
-    trans_low1[0] = 0x02_06_00_04
-    trans_high1 = J.gpr("su32")
-    trans_high1[0] = 0x03_07_01_05
-
-    trans_low2 = J.gpr("su32")
-    trans_low2[0] = 0x01_00_05_04
-    trans_high2 = J.gpr("su32")
-    trans_high2[0] = 0x03_02_07_06
-    return trans_low1, trans_high1, trans_low2, trans_high2
-
 class LDSTensor:
     def __init__(self, J, shape, dtype):
         self.J = J
@@ -698,6 +677,9 @@ class LDSTensor:
 
 # JIT emits instructions into BBs
 all_kernel_hip_src_names = {}
+replace_index = 0
+
+
 class JIT:
     def __init__(self):
         self.blocks = []
@@ -1144,14 +1126,14 @@ class JIT:
         for bb in self.blocks:
             for inst in bb.instructions:
                 if inst.sid in possible_dead_variables:
-                    if inst.opcode.startswith("s_load_"):
-                        dst_gpr = inst.operands[0]
-                        is_dead_load = False
-                        for gpr in possible_dead_variables[inst.sid]:
-                            if dst_gpr.overlap(gpr,fully_match=True):
-                                is_dead_load = True
-                                break
-                        inst.is_dead = is_dead_load
+                    #if inst.opcode.startswith("s_load_"):
+                    dst_gpr = inst.operands[0]
+                    is_dead_load = False
+                    for gpr in possible_dead_variables[inst.sid]:
+                        if dst_gpr.overlap(gpr,fully_match=True):
+                            is_dead_load = True
+                            break
+                    inst.is_dead = is_dead_load
 
         # re-assign each gprs's start_id (linear_scan)
         # sorted_live_interval = [(live_intervals[gprs][0], live_intervals[gprs][1], gprs) for gprs in live_intervals].sort()
@@ -2160,6 +2142,7 @@ class JIT:
         # so any other instructions with it's 1st operand (most likely vdst)
         # holding a value will destroy this reuable value (maybe over-react, but it's for correctness/safety reason)
         #
+        # TODO, support s_mul_i32,s_lshl_b32,s_lshr_b32,s_ashr_i32,s_and_b32,s_or_b32,s_xor_b32,s_sub_u32,s_sub_i32,s_add_i32,s_add_u32,s_addk_i32,s_cmp_
         cse_inst_list = [
             "v_mov_b32",
             "v_sub_",
@@ -2195,7 +2178,7 @@ class JIT:
                 reg_2_value_version[tag] += 1 # increase version number
             return reg_2_value_version[tag]
 
-        replace_index = 0
+        global replace_index
         CSE_LIMIT = int(os.getenv("CSE_LIMIT", "999999"))
         for bb in self.blocks:
 
@@ -2252,8 +2235,16 @@ class JIT:
                     inst = self.blocks[bb_id].instructions[inst_id]
                     op = inst.operands[op_id]
                     if vdst.overlap(op):
+                        if not vdst.overlap(op, fully_match=True):
+                            # some access pattern are not compatible, do not replace
+                            return
+
+                for bb_id, inst_id, op_id in gpr_info[repr(vdst)]["location"]:
+                    inst = self.blocks[bb_id].instructions[inst_id]
+                    op = inst.operands[op_id]
+                    if vdst.overlap(op):
                         if debug_enabled: print(f"found  {inst}")
-                        assert vdst.overlap(op, fully_match=True)
+                        assert vdst.overlap(op, fully_match=True), f"{vdst}({vdst.src0.name}) overlap with {inst}"
                         inst.operands[op_id] = vexist
                         if debug_enabled: print(f"\t {i} {op} {vexist}")
 
@@ -2292,12 +2283,11 @@ class JIT:
                     if v is vdst and version < cur_version:
                         del value_table[k]
 
+                cur_version = inc_value_version(vdst)
+
                 # all dst gprs must be valid (only written once)
                 is_valid_gpr = all([repr(r) in ssa_gpr for r in vdst])
                 if is_cse_inst(inst) and is_valid_gpr:
-                    assert is_gpr(vdst)
-                    cur_version = inc_value_version(vdst)
-
                     # this key includes opcode & all input-values & modifiers
                     src_ops = []
                     for op in inst.operands[1:]:
@@ -2544,6 +2534,11 @@ r'''
     def round_up(self, x, y):
         return self.div_up(x, y) * y
 
+    @cache
+    def get_sgpr_const(self, value):
+        sgpr = self.gpr("su32")
+        sgpr[0] = value
+        return sgpr
     '''
     reduce("v_max_f32", vinput)
     reduce("v_add_f32", vinput)
@@ -2587,6 +2582,16 @@ r'''
          src1   [01|23]  => [01|45]
          src0   [45|67]     [23|67]
         """
+        def get_perm_pattern_16():
+            return self.get_sgpr_const(0x01_00_05_04), self.get_sgpr_const(0x03_02_07_06)
+
+        def get_perm_pattern_8():
+            trans_low1 = self.get_sgpr_const(0x02_06_00_04)
+            trans_high1 = self.get_sgpr_const(0x03_07_01_05)
+            trans_low2 = self.get_sgpr_const(0x01_00_05_04)
+            trans_high2 = self.get_sgpr_const(0x03_02_07_06)
+            return trans_low1, trans_high1, trans_low2, trans_high2
+
         M, N = src_row, src_cols
         assert dtype_bytes in [1,2,4]
         items_per_GPR = 4 // dtype_bytes
@@ -2604,7 +2609,7 @@ r'''
                     dst_idx = dst_row * M//items_per_GPR + dst_col//items_per_GPR
                     dst[dst_idx] = src[src_idx]
         if dtype_bytes == 2:
-            trans_low, trans_high = get_perm_pattern_16(self)
+            trans_low, trans_high = get_perm_pattern_16()
             def trans2x2(s0, s1, d0, d1):
                 self.v_perm_b32(d0, s0, s1, trans_low)
                 self.v_perm_b32(d1, s0, s1, trans_high)
@@ -2618,7 +2623,7 @@ r'''
                     trans2x2(src[src_idx], src[src_idx+N//items_per_GPR],
                             dst[dst_idx], dst[dst_idx+M//items_per_GPR])
         if dtype_bytes == 1:
-            trans_low1, trans_high1, trans_low2, trans_high2 = get_perm_pattern_8(self)
+            trans_low1, trans_high1, trans_low2, trans_high2 = get_perm_pattern_8()
             vtemp0 = self.gpr("vu32")
             vtemp1 = self.gpr("vu32")
             vtemp2 = self.gpr("vu32")
@@ -2683,6 +2688,9 @@ r'''
     def silu(self, vgpr_src):
         return self.gpr(self.sigmoid(vgpr_src) * vgpr_src)
 
+    def pk_f32_to_bf16(self, vdst, vsrc0, vsrc1):
+        self.v_perm_b32(vdst, vsrc0, vsrc1, self.get_sgpr_const(0x03_02_07_06))
+
     @property
     def warp_id(self):
         if "warp_id" not in self.special_vars:
@@ -2697,6 +2705,7 @@ r'''
             _lane_id = self.gpr(self.threadIdx.x[0] % 64)
             self.special_vars["lane_id"] = _lane_id
         return self.special_vars["lane_id"]
+
 
 gen_hip_file_unique_id = 0
 
