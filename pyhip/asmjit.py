@@ -590,7 +590,7 @@ class Buffer:
         self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
 
 class LDSTensor:
-    def __init__(self, J, shape, dtype):
+    def __init__(self, J, shape, dtype, lds_base=None):
         self.J = J
         self.shape = shape
         stride_bytes = [dtype.itemsize]
@@ -600,16 +600,28 @@ class LDSTensor:
         self.size_bytes = stride_bytes[-1]
         self.stride_bytes = list(reversed(stride_bytes))[1:]
         self.dtype = dtype
-        self.lds_base = self.J.alloc_lds(self.size_bytes)
+        if lds_base is None:
+            self.lds_base = self.J.alloc_lds(self.size_bytes)
+            self.own = True
+        else:
+            self.lds_base = lds_base
+            self.own = False
 
     def __del__(self):
-        self.J.free_lds(self.lds_base)
+        if self.own:
+            self.J.free_lds(self.lds_base)
 
     def read(self, dtype:str, vdst, *coord_exprs, offset1=None):
         self._access("read", dtype, vdst, *coord_exprs, offset1=offset1)
 
     def write(self, dtype:str, vdst, *coord_exprs, offset1=None):
         self._access("write", dtype, vdst, *coord_exprs, offset1=offset1)
+
+    # reuse the same share buffer
+    def view_as(self, shape, dtype):
+        t = LDSTensor(self.J, shape, dtype, self.lds_base)
+        assert t.size_bytes <= self.size_bytes, f'new view size must be less than the original, new={t.size_bytes:,} old={self.size_bytes:,}'
+        return t
 
     def _access(self, op_name, dtype:str, vdst, *coord_exprs, offset1=None):
         # extract const part
