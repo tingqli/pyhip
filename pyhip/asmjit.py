@@ -2230,15 +2230,17 @@ class JIT:
                                     inst.operands[i] = vexist
                                     if debug_enabled: print(f"\t {i} {op} {vexist}")
 
-            def replace_vdst_with_exist_global(vdst, vexist):
+            def can_replace_vdst_with_exist_global(vdst):
                 for bb_id, inst_id, op_id in gpr_info[repr(vdst)]["location"]:
                     inst = self.blocks[bb_id].instructions[inst_id]
                     op = inst.operands[op_id]
                     if vdst.overlap(op):
                         if not vdst.overlap(op, fully_match=True):
                             # some access pattern are not compatible, do not replace
-                            return
+                            return False
+                return True
 
+            def replace_vdst_with_exist_global(vdst, vexist):
                 for bb_id, inst_id, op_id in gpr_info[repr(vdst)]["location"]:
                     inst = self.blocks[bb_id].instructions[inst_id]
                     op = inst.operands[op_id]
@@ -2247,6 +2249,7 @@ class JIT:
                         assert vdst.overlap(op, fully_match=True), f"{vdst}({vdst.src0.name}) overlap with {inst}"
                         inst.operands[op_id] = vexist
                         if debug_enabled: print(f"\t {i} {op} {vexist}")
+                return True
 
             for t, inst in enumerate(bb.instructions):
                 if len(inst.operands) == 0: continue
@@ -2304,12 +2307,13 @@ class JIT:
                     else:
                         vexist, version = value_table[key]
                         if repr(vexist) in ssa_gpr and replace_index < CSE_LIMIT:
-                            removed_insts.append(t)
-                            replace_vdst_with_exist_global(vdst, vexist)
-                            if debug_enabled:
-                                print(f"===========  {replace_index} / {CSE_LIMIT=} ")
-                                print(t, inst.loc, inst.debug_info, inst)
-                                print(f"{vdst} replaced with  {vexist} {key} globally")
+                            if can_replace_vdst_with_exist_global(vdst):
+                                removed_insts.append(t)
+                                if debug_enabled:
+                                    print(f"===========  {replace_index} / {CSE_LIMIT=} ")
+                                    print(t, inst.loc, inst.debug_info, inst)
+                                    print(f"{vdst} replaced with  {vexist} {key} globally")
+                                replace_vdst_with_exist_global(vdst, vexist)
                         else:
                             # can we safely use this existing value?
                             # we need to check life-cycle requirements:
