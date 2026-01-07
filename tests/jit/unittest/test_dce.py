@@ -34,15 +34,22 @@ def test_dce():
         vdst = J.gpr(4,4,"vf32")
         lane = J.threadIdx.x[0] % 64
         J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + 0, p)
-        J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + K*2, p)
-        J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + K*2 + 8, p)
-        J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + 8, p)
+        J.global_load_dwordx4(vdst[1], (lane % 16)*K*4 + (lane//16)*16 + K*2, p)
+        J.global_load_dwordx4(vdst[2], (lane % 16)*K*4 + (lane//16)*16 + K*2 + 8, p)
+        J.global_load_dwordx4(vdst[3], (lane % 16)*K*4 + (lane//16)*16 + 8, p)
 
     A = torch.zeros(64*1024, dtype=torch.int32)
     artifact = kernel([1],[64], A.data_ptr(), A.data_ptr(),A.data_ptr(),A.data_ptr(), 1)
     ipattern = extract_inst_pattern(artifact,"s_load_dwordx2")[-1]
     ipattern = ipattern.strip("0")
-    assert ipattern == "1", ipattern
+    assert ipattern == "", ipattern
+
+    ipattern = extract_inst_pattern(artifact,"global_load_dwordx4")[-1]
+    ipattern = ipattern.strip("0")
+    assert ipattern == "", ipattern
+
+    for asm_line in artifact["asm"][1:]:
+        assert "v_" not in asm_line
 
 if __name__ == "__main__":
     test_dce()

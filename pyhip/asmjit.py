@@ -220,7 +220,10 @@ class GPRExpr:
         assert self.op == "getitem", f"{self}"
         gprs = self.src0
         base_offset = self.src1
-        if isinstance(key, slice):
+        if key is Ellipsis:
+            # support a[...]
+            return GPRExpr("getitem", gprs, self.src1, self.src2)        
+        elif isinstance(key, slice):
             s = key
             assert s.step == 1 or s.step is None, f"slice {s} with step not eq 1"
             return GPRExpr("getitem", gprs, base_offset + s.start, base_offset + s.stop)
@@ -548,7 +551,7 @@ class Buffer:
         if offset12 > 0:
             assert offset12.bit_length() <= 12
             mod += f" offset:{offset12}"
-        self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
+        return self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
 
     def load_dwordx2(self, vdst, voffset, soffset, offset12=0):
         # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
@@ -556,7 +559,7 @@ class Buffer:
         mod = f"offen"
         if offset12 > 0:
             mod += f" offset:{offset12}"
-        self.J.buffer_load_dwordx2(vdst, voffset, self.desc, soffset, mod=mod)
+        return self.J.buffer_load_dwordx2(vdst, voffset, self.desc, soffset, mod=mod)
 
     def load_dword(self, vdst, voffset, soffset, offset12=0):
         # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
@@ -564,7 +567,7 @@ class Buffer:
         mod = f"offen"
         if offset12 > 0:
             mod += f" offset:{offset12}"
-        self.J.buffer_load_dword(vdst, voffset, self.desc, soffset, mod=mod)
+        return self.J.buffer_load_dword(vdst, voffset, self.desc, soffset, mod=mod)
 
     def store_dwordx4(self, vdata, voffset, soffset, offset12=0):
         # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
@@ -572,14 +575,14 @@ class Buffer:
         mod = f"offen"
         if offset12 > 0:
             mod += f" offset:{offset12}"
-        self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
+        return self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
 
     def load_dword_lds(self, voffset, soffset, offset12=0):
         mod = f"offen"
         if offset12 > 0:
             mod += f" offset:{offset12}"
         mod += " lds"
-        self.J.buffer_load_dword(voffset, self.desc, soffset, mod=mod)
+        return self.J.buffer_load_dword(voffset, self.desc, soffset, mod=mod)
 
     def store_dword(self, vdata, voffset, soffset, offset12=0):
         # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
@@ -587,7 +590,7 @@ class Buffer:
         mod = f"offen"
         if offset12 > 0:
             mod += f" offset:{offset12}"
-        self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
+        return self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
 
 class LDSTensor:
     def __init__(self, J, shape, dtype, lds_base=None):
@@ -690,10 +693,23 @@ class LDSTensor:
 # JIT emits instructions into BBs
 all_kernel_hip_src_names = {}
 replace_index = 0
+dump_serial_id = 0
 
+PYHIP_CACHE_DIR = os.getenv("PYHIP_CACHE_DIR", os.path.expanduser("~/.pyhip"))
+os.makedirs(PYHIP_CACHE_DIR, exist_ok=True)
+
+PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
+PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
+PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
+PYHIP_DUMP_DIR = os.getenv("PYHIP_DUMP_DIR", "")
+
+if len(PYHIP_DUMP_DIR):
+    # remove temp-cache to force recompile once 
+    os.system(f'rm -rf {PYHIP_CACHE_DIR}/*')
+    os.makedirs(PYHIP_DUMP_DIR, exist_ok=True)
 
 class JIT:
-    def __init__(self):
+    def __init__(self, kernel_tag = ""):
         self.blocks = []
         # increased freely
         self.free_gpr_id = {'s':0, 'v':0, 'a': 0}
@@ -707,6 +723,7 @@ class JIT:
         self.debug_log_ptr = None
         self.lds_allocator = SimpleMemoryAllocator(160*1024)
         self.special_vars = {}
+        self.kernel_tag = kernel_tag
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -732,8 +749,6 @@ class JIT:
         return self.current_bb
 
     def log(self, *args, **kwargs):
-        PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
-        PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
         if PYHIP_JIT_LOG or len(PYHIP_DEBUG_LOG):
             color_id = 3
             color0 = f"\033[0;{30+(color_id % 8)}m"
@@ -742,8 +757,8 @@ class JIT:
 
     def debug_print(self, *args, **kwargs):
         # caller's function name must be
+        if len(PYHIP_DEBUG_LOG) == 0: return
         caller_name = inspect.currentframe().f_back.f_code.co_name
-        PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
         for item in PYHIP_DEBUG_LOG.split(":"):
             if item == "":continue
             if item in caller_name or item == "*":
@@ -963,7 +978,7 @@ class JIT:
         dtype = expr.find_dtype()
         gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name=name)
         if loc == "":
-            loc = inspect.currentframe().f_back.f_lineno
+            loc = get_caller_loc()
         self.recursive_expr_gen(self.current_bb, gprs[0], expr, loc=loc)
         return gprs
 
@@ -988,7 +1003,7 @@ class JIT:
                             name = items[0].strip()
 
         if len(desc) == 1 and isinstance(desc[0], GPRExpr):
-            return self.auto_gpr(desc[0], name=name, loc=inspect.currentframe().f_back.f_lineno)
+            return self.auto_gpr(desc[0], name=name, loc=get_caller_loc())
 
         # allocate GPRs
         dtype = desc[-1]
@@ -1054,6 +1069,79 @@ class JIT:
             return gprs
         else:
             assert 0
+
+    def pass_dce(self):
+
+        inst_list = []
+        serial_index = 0
+        for bb in self.blocks:
+            for inst in bb.instructions:
+                inst.sid = serial_index
+                inst_list.append(inst)
+                serial_index += 1
+
+        # in unit of one gpr
+        def is_normal_gpr(op):
+            if (not isinstance(op, GPRExpr)) and (not isinstance(op, GPRs)):
+                return False
+            gprs = op
+            if isinstance(gprs, GPRExpr):
+                assert gprs.op == "getitem"
+                gprs = gprs.src0
+            assert isinstance(gprs, GPRs), f"{type(gprs)}"
+            return not (gprs in self.fixed_gprs)
+            
+        live_intervals = {}
+        for bid, bb in enumerate(self.blocks):
+            for iid, inst in enumerate(bb.instructions):
+                for op in inst.operands:
+                    if is_normal_gpr(op):
+                        flatten_gpr = op[...]
+                        for i in range(len(flatten_gpr)):
+                            key = repr(flatten_gpr[i])
+                            if key not in live_intervals:
+                                live_intervals[key] = [bid, iid]
+                            live_intervals[key].append(inst.sid)
+
+        # recursively remove all unused gpr & instrustions producing them
+        while True:
+            useless_gprs = {}
+            for gpr_repr in live_intervals:
+                ivs = live_intervals[gpr_repr]
+                bid, iid  = ivs[:2]
+                if len(set(ivs[2:])) == 1:
+                    useless_gprs[gpr_repr] = ivs
+
+            if len(useless_gprs) == 0: break
+
+            for gpr_repr in useless_gprs:
+                del live_intervals[gpr_repr]
+                bid, iid, sid  = useless_gprs[gpr_repr][:3]
+                inst = self.blocks[bid].instructions[iid]
+                if inst.is_dead:
+                    continue
+                assert sid == inst.sid
+                dst_gpr = inst.operands[0]
+                if all([repr(dst_gpr[i]) in useless_gprs for i in range(len(dst_gpr))]):
+                    inst.is_dead = True
+                    self.debug_print(gpr_repr, sid, "============", inst)
+                    # other operand used by this inst also disappears
+                    for op in inst.operands[1:]:
+                        if is_normal_gpr(op):
+                            flatten_gpr = op[...]
+                            for i in range(len(flatten_gpr)):
+                                key = repr(flatten_gpr[i])
+                                if key in live_intervals:
+                                    self.debug_print(key, live_intervals[key])
+                                    id = live_intervals[key].index(sid, 2)
+                                    del live_intervals[key][id]
+
+        # remove dead-loads
+        for bb in self.blocks:
+            # delete dead instructions
+            for i in range(len(bb.instructions)-1, -1, -1):
+                if bb.instructions[i].is_dead:
+                    bb.instructions.pop(i)
 
     # this step is not mandatory，but it allows more registers to use
     # linear-scan:
@@ -1124,28 +1212,9 @@ class JIT:
                     inst.debug_info = debug_info
 
         self.asm_debug_info += ";============ register live interval ==============\n"
-        possible_dead_variables = {}
         for gprs in live_intervals:
             first_sid, last_sid = live_intervals[gprs]
             self.asm_debug_info += f";'{gprs.name}'{repr(gprs):10s}  {first_sid} ~ {last_sid}\n"
-
-            if first_sid == last_sid:
-                if first_sid not in possible_dead_variables:
-                    possible_dead_variables[first_sid] = []
-                possible_dead_variables[first_sid].append(gprs)
-
-        # mark-up dead-loads
-        for bb in self.blocks:
-            for inst in bb.instructions:
-                if inst.sid in possible_dead_variables:
-                    #if inst.opcode.startswith("s_load_"):
-                    dst_gpr = inst.operands[0]
-                    is_dead_load = False
-                    for gpr in possible_dead_variables[inst.sid]:
-                        if dst_gpr.overlap(gpr,fully_match=True):
-                            is_dead_load = True
-                            break
-                    inst.is_dead = is_dead_load
 
         # re-assign each gprs's start_id (linear_scan)
         # sorted_live_interval = [(live_intervals[gprs][0], live_intervals[gprs][1], gprs) for gprs in live_intervals].sort()
@@ -1245,13 +1314,6 @@ class JIT:
             # in case some gpr's last & first sids are the same
             for gprs in unalloc_gprs:
                 free_gpr(gprs)
-
-        # remove dead-loads
-        for bb in self.blocks:
-            # delete dead instructions
-            for i in range(len(bb.instructions)-1, -1, -1):
-                if bb.instructions[i].is_dead:
-                    bb.instructions.pop(i)
 
         # (following code-gen phase will use the new start_id automatically)
         # add debug info to asm instruction
@@ -2093,8 +2155,6 @@ class JIT:
 
     def pass_cse(self):
         debug_enabled = self.debug_print()
-        if debug_enabled:
-            self.show_code()
 
         def is_gpr(op):
             return isinstance(op, GPRs) or isinstance(op, GPRExpr)
@@ -2349,8 +2409,6 @@ class JIT:
 
             # Eliminate
             bb.instructions = [inst for t,inst in enumerate(bb.instructions) if t not in removed_insts]
-        if debug_enabled:
-            self.show_code()
 
     def show_code(self):
         self.log("===================== bb")
@@ -2359,7 +2417,18 @@ class JIT:
         if self.current_bb is not None:
             self.log("===================== current_bb")
             self.log(self.current_bb.debug_str())
-        
+
+    def dump_code(self, fname):
+        global dump_serial_id
+        if len(PYHIP_DUMP_DIR) == 0: return
+        with open(f"{PYHIP_DUMP_DIR}/{dump_serial_id}-{fname}-{self.kernel_tag}.txt", 'w') as f:
+            print("===================== bb", file=f)
+            for bb in self.blocks:
+                print(bb.debug_str(), file=f)
+            print("===================== current_bb", file=f)
+            if self.current_bb is not None:
+                print(self.current_bb.debug_str(), file=f)
+        dump_serial_id += 1
 
     def build(self, kernel_name, signature, extra_compiler_options, cpp_src_fpath, dump_stat):
         self.asm_debug_info = ""
@@ -2406,19 +2475,27 @@ class JIT:
         # if we want to do multi-expression optimization (like common expr extraction...)
         # self.compile_expressions()
         self.pass_insert_nop()
+        self.dump_code(f"after_pass_insert_nop")
 
         # for bb in self.blocks: print(repr(bb))
         self.pass_hide_dependency()
+        self.dump_code(f"after_pass_hide_dependency")
 
         # kernel args are loaded with s_waitcnt, many v_ instructions can be
         # moved into this wait cycles
         self.pass_hide_karg_loads()
+        self.dump_code(f"after_pass_hide_karg_loads")
 
         # Common Subexpression Elimination，CSE
         self.pass_cse()
+        self.dump_code(f"after_pass_cse")
+
+        self.pass_dce()
+        self.dump_code(f"after_pass_dce")
 
         # for bb in self.blocks: print(repr(bb))
         self.register_allocation_linear_scan()
+        self.dump_code(f"after_reg_allocation")
 
         # generate asm: basic blocks are in natural order
         asm=""
@@ -2544,11 +2621,29 @@ r'''
         hip_func = getattr(hip, kernel_name)
         return hip_func
 
+    def div(self, x, y):
+        assert x % y == 0
+        assert x >= y
+        return x // y
+
     def div_up(self, x, y):
         return (x + y - 1) // y
 
     def round_up(self, x, y):
         return self.div_up(x, y) * y
+
+    def emitter(self, yield_cycle = 1):
+        def emit(generators:list, cycles:int=99999999):
+            while cycles > 0:
+                found = False
+                for g in generators:
+                    if next(g, None) is not None:
+                        found = True
+                        break
+                if not found:
+                    break
+                cycles -= yield_cycle
+        return emit
 
     @cache
     def get_sgpr_const(self, value):
@@ -2799,10 +2894,9 @@ class jit_kernel:
 
     def build(self, compile_args, kernel_key):
         # put all generated files under $HOME/.pyhip
-        os.makedirs(os.path.expanduser(f"~/.pyhip"), exist_ok=True)
-        cpp_src_fpath = os.path.expanduser(f"~/.pyhip/{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}.cpp")
+        cpp_src_fpath = f"{PYHIP_CACHE_DIR}/{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}.cpp"
 
-        J = JIT()
+        J = JIT(f"{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}")
 
         with filelock.FileLock('.compile.lock'):
             # skip compilation process when target file already exists
