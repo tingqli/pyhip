@@ -2960,6 +2960,11 @@ class jit_kernel:
                 J.s_load_dwordx2(J.debug_log_ptr, J.kargs, arg_offset)
                 arg_offset += 8
 
+            # initialize warp_id/lane_id vgpr here to prevent ExecMask issue
+            # (dce will remove them if no one use it)
+            J.warp_id
+            J.lane_id
+
             if arg_offset > 0:
                 J.s_waitcnt(mod=f"lgkmcnt(0)")
 
