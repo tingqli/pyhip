@@ -9,5 +9,5 @@ setup(
     url='https://github.com/tingqli/pyhip',
     author='Li, Tingqian',
     author_email='ltq18@hotmail.com',
-    install_requires=['filelock']
+    install_requires=['filelock','numpy']
 )

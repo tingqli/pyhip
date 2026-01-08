@@ -584,7 +584,6 @@ def gemm_kernel(J, K, N, M01, GroupNum,
 
 import torch
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
-torch.cuda.set_device(2)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
 

@@ -3,7 +3,6 @@ import torch
 import pytest
 
 torch.set_printoptions(linewidth=300)
-torch.cuda.set_device(2)
 torch.set_default_device('cuda')
 torch.manual_seed(0)
 

@@ -14,6 +14,20 @@ specifically, following tools from ROCm is used:
 pip install git+https://github.com/tingqli/pyhip.git
 ```
 
+Development setup,
+
+```bash
+# create a MI300 GPU Droplet with ROCM (7.1) on https://amd.digitalocean.com/
+git clone https://github.com/tingqli/pyhip.git
+git config --global user.name
+git config --global user.email
+apt install python3.12-venv
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install numpy pytest
+pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm7.1
+```
+
 # Usage
 
 install torch rocm before using it in your script
