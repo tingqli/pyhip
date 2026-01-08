@@ -1632,7 +1632,7 @@ class JIT:
                     n_max = 2**32-1
                     min_k = find_min_k(d, n_max)
                     ceil_sd = (2**min_k + d - 1)//d
-                    assert ceil_sd < 2**32
+                    assert ceil_sd < 2**32, f"{d=} {min_k=} {ceil_sd=}"
                     Instruction(bb, f"s_mul_hi_u32", loc=loc)(dst_expr, src0_operand, ceil_sd)
                     Instruction(bb, f"s_lshr_b32", loc=loc)(dst_expr, dst_expr, min_k-32)
                 else:

@@ -621,21 +621,30 @@ def test_gemm(mfma_MN, wave_size, wave_cnt, A_preshuffled = False, B_preshuffled
     # only test performance when setting is optimal
     if mfma_MN in [32, 16] and wave_size == [128, 128] and wave_cnt == [2, 2]:
         perf_ratio = 0.95
+    
+    props = torch.cuda.get_device_properties()
+    num_CUs = props.multi_processor_count
 
-    CU_rows = 8 #best_rows
-    CU_cols = 10 #num_CU//CU_rows
+    if num_CUs % 16 == 0:
+        CU_rows = num_CUs//16
+        CU_cols = 16
+    elif num_CUs % 8 == 0:
+        CU_rows = 8
+        CU_cols = num_CUs//CU_rows
+    else:
+        assert 0, f"{num_CUs=}"
 
     debug_warp = 0
     skip_load = 0
     M01 = 8
-    GroupNum = 4
+    GroupNum = 8
 
     #mfma_MN = 16
     #wave_size = [128, 128]
     #wave_cnt = [2,2]
     wg_size = [wave_size[i]*wave_cnt[i] for i in range(2)]
 
-    M,N,K = wg_size[0]*8*4,wg_size[1]*10*4,8192
+    M,N,K = wg_size[0]*CU_rows*2,wg_size[1]*CU_cols*2,8192
     # M -= 14
 
     blk_cnt = (N//wg_size[1]) * ((M + wg_size[0] - 1)//wg_size[0])
@@ -726,7 +735,7 @@ def test_gemm(mfma_MN, wave_size, wave_cnt, A_preshuffled = False, B_preshuffled
 if __name__ == "__main__":
     #test_gemm(16, [128, 128], [1, 1])
     #assert 0
-    #test_gemm(32, [128, 128], [2, 2], A_preshuffled = False, B_preshuffled = True)
+    #test_gemm(32, [128, 128], [2, 2], A_preshuffled = False, B_preshuffled = False) 
     test_gemm(16, [128, 128], [2, 2], A_preshuffled = False, B_preshuffled = True)
     #test_gemm(16, [128, 128], [2, 2], A_preshuffled = True, B_preshuffled = True)
     #test_gemm(32, [128, 128], [2, 2], A_preshuffled = True, B_preshuffled = True)
