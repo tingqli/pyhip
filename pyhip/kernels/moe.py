@@ -78,20 +78,8 @@ def moe_gemm_loop(J:JIT,
         for n in range(B_horz):
             J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
 
-    for m in range(A_vert):
-        buff_a.load_dwordx4(A_reg[0, m, 0], voffset_a[m], 0)
-        if weight_dtype != torch.bfloat16:
-            buff_a.load_dwordx4(A_reg[0, m, 1], voffset_a[m], 16)
-
     # ping pong register buffer id
     pp_reg_id = 0
-    for n in range(B_horz):
-        buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
-
-    soffset_kb[0] = soffset_kb[0] + 16 * 64 * num_split_k
-    soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * num_split_k * sizeof_bf16
-    pp_reg_id = pp_reg_id ^ 1
-
     k_step_wg = num_split_k * 32 if weight_dtype == torch.bfloat16 else num_split_k * 64
 
     # (A0.B0.C0.D0.A1.B1.C1.D1)[3, 2, 7, 6] = (A1.B1.A0.B0)
@@ -101,33 +89,23 @@ def moe_gemm_loop(J:JIT,
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
 
-    def loop(is_first, is_tail, pp_reg_id):
-        #nonlocal pp_reg_id
-        # [16,32] * [2,16,32] => [2,16,16]
-        if not is_tail:
-            for m in range(A_vert):
-                buff_a.load_dwordx4(A_reg[pp_reg_id, m, 0], voffset_a[m], soffset_ka)
-                if weight_dtype != torch.bfloat16:
-                    buff_a.load_dwordx4(A_reg[pp_reg_id, m, 1], voffset_a[m], soffset_ka + 16)
-            for n in range(B_horz):
-                buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
+    def load_gen(pp_reg_id):
+        for m in range(A_vert):
+            buff_a.load_dwordx4(A_reg[pp_reg_id, m, 0], voffset_a[m], soffset_ka)
+            if weight_dtype != torch.bfloat16:
+                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 1], voffset_a[m], soffset_ka + 16)
+        for n in range(B_horz):
+            yield buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
 
-            pp_reg_id = pp_reg_id ^ 1
-            soffset_kb[0] = soffset_kb[0] + 16 * 64 * num_split_k
-            soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * num_split_k * sizeof_bf16
-            if weight_dtype == torch.bfloat16:
-                J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert})")
-            else:
-                J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * 2})")
+        soffset_kb[0] = soffset_kb[0] + 16 * 64 * num_split_k
+        soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * num_split_k * sizeof_bf16
+        if weight_dtype == torch.bfloat16:
+            J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert})")
         else:
-            pp_reg_id = pp_reg_id ^ 1
-            J.s_waitcnt(mod=f"vmcnt(0)")
-
+            J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * 2})")
+    
+    def mfma_gen(pp_reg_id):
         if weight_dtype != torch.bfloat16:
-            if is_first:
-                for n in range(B_horz):
-                    J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
-
             # decompress
             v_w_f32 = J.gpr(2, 2, 'vf32', align=4)
             v_w_bf16 = J.gpr(B_horz, 2, 'vf32', align=4)
@@ -147,12 +125,33 @@ def moe_gemm_loop(J:JIT,
                     # 2, A_rep, 2, 2
                     for n in range(B_horz):
                         for m in range(A_vert):
-                            J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i, j], C_reg[n, m])
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i, j], C_reg[n, m])
         else:
             for m in range(A_vert):
                 for n in range(B_horz):
-                    J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 0], A_reg[pp_reg_id, m, 0, 0], C_reg[n, m])
-                    J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 1], A_reg[pp_reg_id, m, 0, 1], C_reg[n, m])
+                    yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 0], A_reg[pp_reg_id, m, 0, 0], C_reg[n, m])
+                    yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 1], A_reg[pp_reg_id, m, 0, 1], C_reg[n, m])
+
+    def loop(pp_reg_id):
+        loader = load_gen(pp_reg_id)
+        mfma = mfma_gen(1 - pp_reg_id)
+
+        J.emitter()([loader])
+
+        J.emitter()([mfma])
+
+    # prolog
+    loader = load_gen(0)
+    J.emitter()([loader])
+    if weight_dtype != torch.bfloat16:
+        for n in range(B_horz):
+            J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
+    pp_reg_id = 1
+
+    def tail(pp_reg_id):
+        J.s_waitcnt(mod=f"vmcnt(0)")
+        mfma = mfma_gen(pp_reg_id)
+        J.emitter()([mfma])
 
     if isinstance(K, int):
         if weight_dtype == torch.bfloat16:
@@ -160,36 +159,35 @@ def moe_gemm_loop(J:JIT,
         else:
             # a wave needs at least 64 elements
             assert K % 64 == 0, 'K must be multiple of 64'
-        loop(True, False, pp_reg_id)
-        pp_reg_id ^= 1
-        for k in range(1, k_max - 1):
-            loop(False, False, pp_reg_id)
+    
+        for k in range(0, k_max - 1):
+            loop(pp_reg_id)
             pp_reg_id ^= 1
-        loop(False, True, pp_reg_id)
-        pp_reg_id ^= 1
+
+        # tail
+        tail(1 - pp_reg_id)
+
     else:
         cur_k = J.gpr("si32")
         cur_k[0] = 0
         # at least 2 blocks, TODO: add check?
         k_loop_cnt = K // k_step_wg - 2
-        loop(True, False, pp_reg_id)
-        pp_reg_id ^= 1
+
         # unroll 2 times for pin/pong buffer, align #loop to even
-        k_loop_cnt_even = J.gpr(k_loop_cnt & 0xfffffffe)
-        with J.While(cur_k[0] < k_loop_cnt_even):
-            loop(False, False, pp_reg_id)
-            pp_reg_id ^= 1
-            loop(False, False, pp_reg_id)
-            pp_reg_id ^= 1
+        with J.While(cur_k[0] < k_loop_cnt):
+            loop(1)
+            loop(0)
             cur_k[0] += 2
-        J.Jump("odd_k_block", cur_k[0] < k_loop_cnt)
-        loop(False, True, pp_reg_id)
+        J.Jump("odd_k_block", cur_k[0] == k_loop_cnt + 1)
+        # there are 2 blocks left
+        loop(1)
+        # tail
+        tail(1)
         J.Jump("k_block_end")
         # 1 block + tail
         J.Label("odd_k_block")
-        loop(False, False, pp_reg_id)
-        pp_reg_id ^= 1
-        loop(False, True, pp_reg_id)
+        # tail
+        tail(0)
         J.Label("k_block_end")
 
 @jit()
@@ -579,7 +577,7 @@ def moe_gemm_batch_vmn(J:JIT,
     v_sorted_id = J.gpr(A_vert, 'vu32')
     J.global_load_dword(v_sorted_id[0], lane_mod_16 << 2, p_sorted_ids)
     for n in range(1, A_vert):
-        p_sorted_ids[:] += n * 16 * 4
+        p_sorted_ids[:] += 16 * 4
         J.global_load_dword(v_sorted_id[n], lane_mod_16 << 2, p_sorted_ids)
     voffset_b = J.gpr(B_horz, 'vu32')
     if with_silu:
@@ -596,7 +594,7 @@ def moe_gemm_batch_vmn(J:JIT,
         for m in range(1, B_horz):
             voffset_b[m] = voffset_b[0] + K * (16 * sizeof_w * m)
         for m in range(1, A_vert):
-            p_sorted_weights[:] += m * 16 * 4
+            p_sorted_weights[:] += 16 * 4
             J.global_load_dword(v_weight[m], lane_mod_16 << 2, p_sorted_weights)
 
     p_output[:] = p_output[:] + (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * J.blockIdx.x * sizeof_bf16
@@ -682,6 +680,7 @@ def moe_gemm_batch_vmn(J:JIT,
                 vaddr = J.gpr(v_token_id * (N // 2 * sizeof_bf16 * TOPK) + v_topk_id * (N // 2 * sizeof_bf16) + lane_mod_16 * sizeof_bf16 + n * 16 * sizeof_bf16)
                 with J.ExecMask(v_token_id < M[0]):
                     J.global_store_short_d16_hi(vaddr, out[0], p_output)
+            J.s_barrier()
     else:
         for n in range(B_horz):
             # split N
@@ -767,7 +766,7 @@ def moe_gemm_stage1(J:JIT,
     v_sorted_id = J.gpr(A_vert, 'vu32')
     J.global_load_dword(v_sorted_id[0], lane_mod_16 << 2, p_sorted_ids)
     for n in range(1, A_vert):
-        p_sorted_ids[:] += n * 16 * 4
+        p_sorted_ids[:] += 16 * 4
         J.global_load_dword(v_sorted_id[n], lane_mod_16 << 2, p_sorted_ids)
     voffset_b = J.gpr(B_horz, 'vu32')
     voffset_b[0] = J.threadIdx.x * 16
@@ -940,23 +939,26 @@ def run_batch(B=1, weight_type=torch.bfloat16):
 
     topk_weight = torch.randn([BUF_COPY, B, TOPK], dtype=torch.float32)
     topk_ids = torch.ones([BUF_COPY, B, TOPK], dtype=torch.int32)
-    topk_ids_base = torch.randperm(E, dtype=torch.int32)
+    # make a B*TOPK seq, which contains 0...E-1 0...E-1
+    rep_e = div_up(B * TOPK, E)
+    topk_ids_1d = torch.ones([rep_e, E], dtype=torch.int32)
+    topk_ids_1d[:, ] = torch.randperm(E, dtype=torch.int32)
+    topk_ids[:, ] = topk_ids_1d.reshape(-1)[ : B * TOPK].reshape(B, TOPK)
+    access_expert = torch.unique(topk_ids[0])
+    access_expert = access_expert.shape[0]
 
     if 1:
         import aiter
 
-        topk_ids[0,:,] = topk_ids_base[: TOPK]
         from aiter.ops.shuffle import shuffle_weight
         # aiter needs preshuffle weights
         w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
         ref_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
-        flops = 2 * B * (HIDDEN_SIZE * INTER_SIZE_TP * 2 + TOPK * HIDDEN_SIZE * INTER_SIZE_TP)
-        mem_size = (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * TOPK * B * (2 if weight_type == torch.bfloat16 else 1)
+        flops = 2 * B * TOPK * (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP)
+        mem_size = B * HIDDEN_SIZE * 2 + (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * access_expert * (2 if weight_type == torch.bfloat16 else 1)
         for _ in range(10):
-            idx_start = random.randint(0, E - TOPK)
-            topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
             with cudaPerf(flops, mem_size, name=f"aiter[{B=},{str(weight_type).split('.')[1]}]"):
                 run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
             i = (i + 1) % BUF_COPY
@@ -1060,7 +1062,7 @@ def run_batch(B=1, weight_type=torch.bfloat16):
                         else:
                             if 1:
                                 BLOCK_TILE_SIZE_M = BLOCK_M
-                                BLOCK_TILE_SIZE_N = 64
+                                BLOCK_TILE_SIZE_N = 128
                                 moe_gemm_stage1([1, sorted_expert_ids.shape[0]], [256],
                                                 w1.dtype, TOPK, K1, N1, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                                 hidden_states.data_ptr(), w1.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, w2.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0,
@@ -1070,11 +1072,11 @@ def run_batch(B=1, weight_type=torch.bfloat16):
                                                 gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
                             elif 1:
                                 BLOCK_TILE_SIZE_M = BLOCK_M
-                                BLOCK_TILE_SIZE_N = 64
+                                BLOCK_TILE_SIZE_N = 128
                                 moe_gemm_batch_vmn([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
                                                 w1.dtype, TOPK, K1, N1, True, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                                 hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-                                BLOCK_TILE_SIZE_N = 64
+                                BLOCK_TILE_SIZE_N = 128
                                 moe_gemm_batch_vmn([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
                                                 w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                                 gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
@@ -1117,14 +1119,11 @@ def run_batch(B=1, weight_type=torch.bfloat16):
         org_fused_moe = aiter.fused_moe.fused_moe
         aiter.fused_moe.fused_moe = my_fused_moe
 
-        topk_ids[0,:,] = topk_ids_base[: TOPK]
         w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
         cur_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
         for _ in range(10):
-            idx_start = random.randint(0, E - TOPK)
-            topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
             with cudaPerf(flops, mem_size, name=f"cur[{B=},{str(weight_type).split('.')[1]}]"):
                 run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
             i = (i + 1) % BUF_COPY
@@ -1147,7 +1146,7 @@ def test():
     torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
     start = 1
     end = 64
-    # run_batch(B=1, weight_type=torch.bfloat16)
+    run_batch(B=8192, weight_type=torch.bfloat16)
     # run_batch(B=1, weight_type=torch.float8_e4m3fnuz)
     for i in range(start-1, end):
         run_batch(B=i + 1, weight_type=torch.bfloat16)
