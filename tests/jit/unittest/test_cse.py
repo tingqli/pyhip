@@ -32,12 +32,13 @@ def test_cse_1bb():
         J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + K*2, p)
         J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + K*2 + 8, p)
         J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + 8, p)
+        J.v_exp_f32(vdst[0,0],vdst[0,0])
 
     A = torch.zeros(64*1024, dtype=torch.int32)
     artifact = kernel([1],[64], A.data_ptr(), 1)
     ipattern = extract_inst_pattern(artifact,"global_load_dwordx4")[-1]
     ipattern = ipattern.strip("0")
-    assert ipattern == "10010101"
+    assert ipattern == "100101001", ipattern
     print(ipattern)
 
 def test_cse_2bb():
@@ -50,6 +51,7 @@ def test_cse_2bb():
         J.Label()
         J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + K*2 + 8, p)
         J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + 8, p)
+        J.v_exp_f32(vdst[0,0],vdst[0,0])
 
     A = torch.zeros(64*1024, dtype=torch.int32)
     artifact = kernel([1],[64], A.data_ptr(), 1)
@@ -57,7 +59,7 @@ def test_cse_2bb():
     ipattern0 = ipattern0.strip("0")
     ipattern1 = ipattern1.strip("0")
     assert ipattern0 == "1001", ipattern0
-    assert ipattern1 == "101", ipattern1
+    assert ipattern1 == "1001", ipattern1
 
 def test_cse_inloop():
     @pyhip.jit(force_recompile = True)
@@ -75,6 +77,7 @@ def test_cse_inloop():
             J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + K*2 + 8, p)
             J.global_load_dwordx4(vdst[0], (lane % 16)*K*4 + (lane//16)*16 + 8, p)
             si[0] += 1
+        J.v_exp_f32(vdst[0,0],vdst[0,0])
 
     A = torch.zeros(64*1024, dtype=torch.int32)
     artifact = kernel([1],[64], A.data_ptr(), 1)
@@ -105,6 +108,7 @@ def test_cse_global():
             J.global_load_dwordx4(vdst[0], off2 + 8, p)
             J.global_load_dwordx4(vdst[0], off3 + 8, p)
             si[0] += 1
+        J.v_exp_f32(vdst[0,0],vdst[0,0])
 
     A = torch.zeros(64*1024, dtype=torch.int32)
     artifact = kernel([1],[64], A.data_ptr(), 1)

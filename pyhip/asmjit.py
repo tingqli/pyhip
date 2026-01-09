@@ -69,6 +69,43 @@ class Instruction:
     def isVALU(self):
         return self.opcode.startswith("v_")
 
+    def is_simple_operand0_store(self):
+        # simple operand0_store :
+        #   - operands[0] is the only state-change of this instruction
+        #   - no other side-effect other than store to 1st op
+        if getattr(self, "_is_simple_operand0_store", None) is None:
+            opcode = self.opcode
+            mod = self.mod
+            if opcode.startswith("s_load_"):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("s_scratch_load_"):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("s_buffer_load"):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("ds_read"):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("flat_load_"):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("global_load_") and (not opcode.startswith("global_load_lds_")):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("tbuffer_load_"):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("buffer_load_") and ("lds" not in mod):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("scratch_load_") and (not opcode.startswith("scratch_load_lds_")):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("ds_swizzle_"):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("ds_permute_") or opcode.startswith("ds_bpermute_"):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("ds_consume"):
+                self._is_simple_operand0_store = True
+            elif opcode.startswith("ds_") and ("_rtn_" in opcode):
+                self._is_simple_operand0_store = True
+            else:
+                self._is_simple_operand0_store = False
+        return self._is_simple_operand0_store
+
     def isTransOp(self):
         return self.opcode[:6] in ["v_exp_","v_log_","v_rcp_","v_rsq_","v_sqrt","v_sin_","v_cos_"]
 
@@ -704,11 +741,15 @@ PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
 PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_DUMP_DIR = os.getenv("PYHIP_DUMP_DIR", "")
+PYHIP_RECOMPILE = int(os.getenv("PYHIP_RECOMPILE", "0"))
 
 if len(PYHIP_DUMP_DIR):
     # remove temp-cache to force recompile once 
-    os.system(f'rm -rf {PYHIP_CACHE_DIR}/*')
+    PYHIP_RECOMPILE = 1
     os.makedirs(PYHIP_DUMP_DIR, exist_ok=True)
+
+if PYHIP_RECOMPILE:
+    os.system(f'rm -rf {PYHIP_CACHE_DIR}/*')
 
 class JIT:
     def __init__(self, kernel_tag = ""):
@@ -1072,8 +1113,55 @@ class JIT:
         else:
             assert 0
 
-    def pass_dce(self):
+    # Dead Store Elimination
+    def pass_dse(self):
+        # if a register is written multiple times w/o any read, all such writes can be removed
+        # dead loads, if a load dst is used by no one, remove such loads
+        gpr_stores = {}
+        gpr_src = set()
+        for bid, bb in enumerate(self.blocks):
+            for iid, inst in enumerate(bb.instructions):
+                possible_src_id0 = 0
+                if inst.is_simple_operand0_store():
+                    dst_gpr = inst.operands[0]
+                    flatten_gpr = dst_gpr[...]
+                    for i in range(len(flatten_gpr)):
+                        key = repr(flatten_gpr[i])
+                        if key not in gpr_stores:
+                            gpr_stores[key] = []
+                        gpr_stores[key].append((bid, iid))
+                    possible_src_id0 = 1 # skip dst-gpr for src-gpr tests
+                for op in inst.operands[possible_src_id0:]:
+                    if (not isinstance(op, GPRExpr)) and (not isinstance(op, GPRs)):
+                        continue
+                    flatten_gpr = op[...]
+                    for i in range(len(flatten_gpr)):
+                        key = repr(flatten_gpr[i])
+                        gpr_src.add(key)
 
+        # keep store-only gprs
+        for key in gpr_src:
+            if key in gpr_stores:
+                del gpr_stores[key]
+
+        for key in gpr_stores:
+            # just store, no use/read
+            for bid, iid in gpr_stores[key]:
+                inst = self.blocks[bid].instructions[iid]
+                if inst.is_dead: continue
+                # all component of dst must also be marked as dead-store
+                dst_gpr = inst.operands[0]
+                flatten_dst = dst_gpr[...]
+                if all([repr(r) in gpr_stores for r in flatten_dst]):
+                    inst.is_dead = True
+
+        # remove dead-loads
+        for bb in self.blocks:
+            for i in range(len(bb.instructions)-1, -1, -1):
+                if bb.instructions[i].is_dead:
+                    bb.instructions.pop(i)
+
+    def pass_dce(self):
         inst_list = []
         serial_index = 0
         for bb in self.blocks:
@@ -1092,7 +1180,7 @@ class JIT:
                 gprs = gprs.src0
             assert isinstance(gprs, GPRs), f"{type(gprs)}"
             return not (gprs in self.fixed_gprs)
-            
+
         live_intervals = {}
         for bid, bb in enumerate(self.blocks):
             for iid, inst in enumerate(bb.instructions):
@@ -1138,9 +1226,8 @@ class JIT:
                                     id = live_intervals[key].index(sid, 2)
                                     del live_intervals[key][id]
 
-        # remove dead-loads
+        # delete dead instructions
         for bb in self.blocks:
-            # delete dead instructions
             for i in range(len(bb.instructions)-1, -1, -1):
                 if bb.instructions[i].is_dead:
                     bb.instructions.pop(i)
@@ -2496,6 +2583,11 @@ class JIT:
         self.pass_cse()
         self.dump_code(f"after_pass_cse")
 
+        # Dead Store Elimination, DSE
+        self.pass_dse()
+        self.dump_code(f"after_pass_dse")
+
+        # Dead Code Elimination，DCE
         self.pass_dce()
         self.dump_code(f"after_pass_dce")
 
