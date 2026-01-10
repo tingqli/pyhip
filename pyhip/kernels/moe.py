@@ -750,20 +750,12 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     voff_b = J.gpr(J.lane_id * sizeof_DW4 + J.gpr(J.warp_id * (mfma_MN * K * sizeof_bf16)))
     soff_b = J.gpr("su32")
     soff_b[0] = 0
-    def load_next_B(index):
-        for n in range(num_mfma_n):
-            for k in range(num_mfma_k):
-                buff_b.load_dwordx4(B[index,n,k], voff_b, soff_b)
-                soff_b[0] = soff_b[0] + mfma_MN * mfma_K * sizeof_bf16
-            soff_b[0] = soff_b[0] + (3*num_mfma_k * mfma_MN * mfma_K * sizeof_bf16)
-
-    def load_next_B_gen(index):
+    def loadB_generator(index):
         for n in range(num_mfma_n):
             for k in range(num_mfma_k):
                 yield buff_b.load_dwordx4(B[index,n,k], voff_b, soff_b)
                 soff_b[0] = soff_b[0] + mfma_MN * mfma_K * sizeof_bf16
             soff_b[0] = soff_b[0] + (3*num_mfma_k * mfma_MN * mfma_K * sizeof_bf16)
-
 
     def mfma_generator(index):
         for k in range(num_mfma_k):
@@ -781,18 +773,17 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     emit_bload = J.emitter(1)
 
     # prelog0, load Bn0
-    load_next_B(0)
+    emit_bload([loadB_generator(0)])
 
     # prelog1, load Bn1, compute Cn0
-    load_next_B(1)
+    emit_bload([loadB_generator(1)])
     J.s_waitcnt(mod=f"vmcnt({num_mfma_n*num_mfma_k})")
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
 
-    mfma0 = mfma_generator(0)
-    emit_mfma([mfma0])
+    emit_mfma([mfma_generator(0)])
 
     # loop:    load Bn2, compute Cn1, store Cn0 to LDS & load Cn0 & store to HBM
-    s_cvt_bf16_bias = J.gpr("su32")
-    s_cvt_bf16_bias[0] = 0x00008000
+    s_cvt_bf16_bias = J.get_sgpr_const(0x00008000)
 
     vmem_lane_size = sizeof_DW
 
@@ -800,7 +791,6 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     lds_width = num_mfma_n * 4 * mfma_MN * sizeof_bf16
     lds_stride = lds_width + lds_padding
     lds = J.alloc_lds((num_mfma_m * mfma_MN) * (lds_stride))
-    #lds = J.alloc_lds(64*1024)
 
     # WG level write C into LDS
     row = J.threadIdx.x % mfma_MN
@@ -814,7 +804,6 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 J.ds_write_b64(voff_c_lds_w, C[index, m, n, 0:1], mod=f"offset:{offset}")
 
     # WG level load C from LDS
-    
     num_lanes_ldsr = J.div(lds_width, vmem_lane_size)
     assert num_lanes_ldsr <= 64, num_lanes_ldsr
     col = J.threadIdx.x % num_lanes_ldsr
@@ -823,8 +812,6 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     num_loads = J.div(num_mfma_m * mfma_MN, num_rows_per_load)
     voff_c_lds_r = J.gpr(row * lds_stride + col * (vmem_lane_size))
     vmem_stride = N * sizeof_bf16
-    # vaddr_output = J.gpr(v_token_id[m] * vmem_stride + lane_div_16 * (4 * sizeof_bf16) + n * 4 * (4 * sizeof_bf16))
-    #voff_vmem = J.gpr(row * vmem_stride + col * (vmem_lane_size))
     v_weights = J.gpr(num_mfma_m, 2, "vf32") # pkmul
     voff_vmem = J.gpr(num_loads, "vu32")
     for m in range(num_mfma_m):
@@ -833,67 +820,23 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     voff_vmem_row = J.gpr(num_loads, "vu32")
     for i in range(num_loads):
         J.ds_read_b32(voff_vmem_row[i], row * 4, mod=f"offset:{lds_token_ids + i * num_rows_per_load * 4}")
-        #voff_vmem[i] = 0
+
     J.s_waitcnt(mod="lgkmcnt(0)")
     for m in range(num_mfma_m):
         v_weights[m,1] = v_weights[m,0]
-
-    #J.debug_log(v_weights[0], torch.float)
 
     for i in range(num_loads):
         voff_vmem[i] = voff_vmem_row[i] * vmem_stride + col * (vmem_lane_size)
 
     temp_c = J.gpr(num_loads, vmem_lane_size//sizeof_DW, "vbf16x2")
-    def ds_load_C():
-        for i in range(num_loads):
-            offset = lds + i * num_rows_per_load * lds_stride
-            J.ds_read_b32(temp_c[i], voff_c_lds_r, mod=f"offset:{offset}")
 
-    def atomic_pk_add_bf16():
-        for i in range(num_loads):
-            J.global_atomic_pk_add_bf16(voff_vmem[i], temp_c[i], pC)
-            #J.global_store_dword(voff, temp_c[i], pC)
-        return num_loads
-
-    def cvt_f32_to_pk_bf16(index):
-        for m in range(num_mfma_m):
-            for n in range(num_mfma_n):
-                #J.v_pk_mul_f32(C[index,m,n,0:1], C[index,m,n,0:1], s_weight)
-                #J.v_pk_mul_f32(C[index,m,n,2:3], C[index,m,n,2:3], s_weight)
-                J.v_add_u32(C[index,m,n,0], C[index,m,n,0], s_cvt_bf16_bias)
-                J.v_add_u32(C[index,m,n,1], C[index,m,n,1], s_cvt_bf16_bias)
-                J.v_add_u32(C[index,m,n,2], C[index,m,n,2], s_cvt_bf16_bias)
-                J.v_add_u32(C[index,m,n,3], C[index,m,n,3], s_cvt_bf16_bias)
-                J.pk_f32_to_bf16(C[index,m,n,0], C[index,m,n,0], C[index,m,n,1])
-                J.pk_f32_to_bf16(C[index,m,n,1], C[index,m,n,2], C[index,m,n,3])
-
-    # directly output to vmem
-    vmem_atomic_lane_size = sizeof_DW2
-    row = J.threadIdx.x % mfma_MN
-    col = J.threadIdx.x // mfma_MN
-    vmem_atomic_vaddr = J.gpr(row * vmem_stride + col * (vmem_atomic_lane_size))
 
     def loop_body(ni):
-        #load_next_B(n&1)
-
         J.s_waitcnt(mod=f"vmcnt({num_loads})")
-        #J.s_waitcnt(mod=f"vmcnt({0})")
+
         mfma1 = mfma_generator((ni+1)&1)
-
-        B_loader = load_next_B_gen(ni&1)
+        B_loader = loadB_generator(ni&1)
         
-        #load_next_B(ni&1)
-
-        """
-        index = ni & 1
-        for n in range(num_mfma_n):
-            for k in range(num_mfma_k):
-                buff_b.load_dwordx4(B[index,n,k], voff_b, soff_b)
-                emit_mfma([mfma1], 32)
-                soff_b[0] = soff_b[0] + mfma_MN * mfma_K * sizeof_bf16
-            soff_b[0] = soff_b[0] + (3*num_mfma_k * mfma_MN * mfma_K * sizeof_bf16)
-            #soff_b[0] = soff_b[0] + (-num_mfma_k * mfma_MN * mfma_K * sizeof_bf16)
-        """
         #cvt_f32_to_pk_bf16(n&1)
         index = ni&1
         for m in range(num_mfma_m):
@@ -908,74 +851,69 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 J.pk_f32_to_bf16(C[index,m,n,0], C[index,m,n,0], C[index,m,n,1])
                 J.pk_f32_to_bf16(C[index,m,n,1], C[index,m,n,2], C[index,m,n,3])
             #emit_mfma([mfma1], 16)
-        #if ni == 0:
-        #    J.debug_log(C[index,0,0,0:1], torch.bfloat16)
-        if 0:
-            for m in range(num_mfma_m):
-                for n in range(num_mfma_n):
-                    offset = m * mfma_MN * vmem_stride + n * (4*mfma_MN * sizeof_bf16)
-                    J.global_atomic_pk_add_bf16(vmem_atomic_vaddr[0] + offset, C[index,m,n,0], pC)
-                    J.global_atomic_pk_add_bf16(vmem_atomic_vaddr[0] + offset + 2*sizeof_bf16, C[index,m,n,1], pC)
-                    emit_mfma([mfma1], 64)
-            vmem_atomic_vaddr[0] = vmem_atomic_vaddr[0] + (4 * num_mfma_n * mfma_MN * sizeof_bf16)
-        else:
-            # ds_write_C(ni&1)
-            index = ni & 1
-            for m in range(num_mfma_m):
-                emit_bload([B_loader], 1)
-                for n in range(num_mfma_n):
-                    offset = lds + m*mfma_MN*lds_stride + n*(4*mfma_MN*sizeof_bf16)
-                    # suppose 4 fp32 in C[0:3] was already converted into packed bf16 and stored in C[0:1]
-                    J.ds_write_b64(voff_c_lds_w, C[index, m, n, 0:1], mod=f"offset:{offset}")
-                    emit_mfma([mfma1], 16)
+
+        # ds_write_C(ni&1)
+        index = ni & 1
+        for m in range(num_mfma_m):
+            emit_bload([B_loader], 1)
+            for n in range(num_mfma_n):
+                offset = lds + m*mfma_MN*lds_stride + n*(4*mfma_MN*sizeof_bf16)
+                J.ds_write_b64(voff_c_lds_w, C[index, m, n, 0:1], mod=f"offset:{offset}")
+                emit_mfma([mfma1], 16)
+        emit_mfma([mfma1], 32)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        J.s_barrier()
+
+        #ds_load_C()
+        for i in range(num_loads):
+            offset = lds + i * num_rows_per_load * lds_stride
+            if vmem_lane_size == sizeof_DW4:
+                J.ds_read_b128(temp_c[i], voff_c_lds_r, mod=f"offset:{offset}")
+            else:
+                assert vmem_lane_size == sizeof_DW
+                J.ds_read_b32(temp_c[i], voff_c_lds_r, mod=f"offset:{offset}")
             emit_mfma([mfma1], 32)
-            J.s_waitcnt(mod=f"lgkmcnt(0)")
-            J.s_barrier()
 
-            #ds_load_C()
-            for i in range(num_loads):
-                offset = lds + i * num_rows_per_load * lds_stride
-                if vmem_lane_size == sizeof_DW4:
-                    J.ds_read_b128(temp_c[i], voff_c_lds_r, mod=f"offset:{offset}")
-                else:
-                    assert vmem_lane_size == sizeof_DW
-                    J.ds_read_b32(temp_c[i], voff_c_lds_r, mod=f"offset:{offset}")
-                emit_mfma([mfma1], 32)
+        emit_bload([B_loader])
 
-            emit_bload([B_loader])
-
-            #atomic_pk_add_bf16()
-            for i in range(num_loads):
-                J.s_waitcnt(mod=f"lgkmcnt({min(15,num_loads - i - 1)})")
-                if vmem_lane_size == sizeof_DW4:
-                    J.global_store_dwordx4(voff_vmem[i], temp_c[i], pC)      # this is fast:  (48us)
-                else:
-                    assert vmem_lane_size == sizeof_DW
-                    # the bigger the M is, the bigger the perf-diff is
-                    #J.global_store_dword(voff, temp_c[i], pC)       # this is slightly slower than directly store  (49us)
-                    with J.ExecMask(voff_vmem_row[i] < M[0]):
-                        J.global_atomic_pk_add_bf16(voff_vmem[i], temp_c[i], pC) # this is much slower than directly store      (60us)
-                emit_mfma([mfma1], 32)
+        #atomic_pk_add_bf16()
+        for i in range(num_loads):
+            J.s_waitcnt(mod=f"lgkmcnt({min(15,num_loads - i - 1)})")
+            if vmem_lane_size == sizeof_DW4:
+                J.global_store_dwordx4(voff_vmem[i], temp_c[i], pC)      # this is fast:  (48us)
+            else:
+                assert vmem_lane_size == sizeof_DW
+                # the bigger the M is, the bigger the perf-diff is
+                with J.ExecMask(voff_vmem_row[i] < M[0]):
+                    #J.global_store_dword(voff_vmem[i], temp_c[i], pC)       # this is slightly slower than directly store  (49us)
+                    J.global_atomic_pk_add_bf16(voff_vmem[i], temp_c[i], pC) # this is much slower than directly store      (60us)
+            emit_mfma([mfma1], 32)
 
         emit_mfma([mfma1])
         pC[:] += (4 * num_mfma_n * mfma_MN * sizeof_bf16) 
-        #assert 0, (4 * num_mfma_n * mfma_MN)
 
-    if 0:  
+        if 0:
+            vrow = J.gpr(2560, "vf32")
+            for i in range(len(vrow)):
+                J.v_exp_f32(vrow[i], vrow[i])
+            for i in range(len(vrow)):
+                J.v_exp_f32(vrow[i], vrow[i])
+
+    if 0:
         for n in range(J.div(N, 4 * num_mfma_n * mfma_MN)):
             loop_body(n)
         return
+
     loop_i = J.gpr("su32")
     loop_i[0] = 0
-    loop_cnt = J.div(N, 8 * num_mfma_n * mfma_MN)
-    J.s_waitcnt(mod=f"vmcnt(0)")
-    with J.While(loop_i[0] < loop_cnt):
+    loop_cnt = J.div(N, 4 * num_mfma_n * mfma_MN)
+    with J.While(loop_i[0] < (loop_cnt//2)):
         loop_body(0)
         loop_body(1)
         loop_i[0] = loop_i[0] + 1
 
-    #v_mfma_f32_32x32x16_bf8_bf8
-    #J.s_waitcnt(mod=f"vmcnt(0)")
+    if loop_cnt % 2:
+        loop_body(0)
 
 @jit(with_debug_log=False)
 def moe_gemm_stage1(J:JIT,
@@ -1009,9 +947,6 @@ def moe_gemm_stage1(J:JIT,
     sizeof_f32 = 4
     sizeof_w = sizeof_bf16 if weight_dtype == torch.bfloat16 else 1
     stride_A1 = K1 * sizeof_bf16
-    stride_B1 = K1 * sizeof_w
-    stride_A2 = K2 * sizeof_bf16
-    stride_B2 = K2 * sizeof_w
 
     A_vert = BLOCK_TILE_SIZE_M // 16
     B_horz = BLOCK_TILE_SIZE_N // 16
@@ -1046,9 +981,6 @@ def moe_gemm_stage1(J:JIT,
     lds_buff = J.LDSTensor([4 * BLOCK_TILE_SIZE_M, 64], torch.float32)
     lds_buff_out = lds_buff.view_as([BLOCK_TILE_SIZE_M, 32 // 2], torch.float32)
 
-    lds_weights = J.alloc_lds(256*4)
-    lds_token_ids = J.alloc_lds(256*4)
-
     v_sorted_id = J.gpr(A_vert, 'vu32')
     J.global_load_dword(v_sorted_id[0], lane_mod_16 << 2, p_sorted_ids)
     for n in range(1, A_vert):
@@ -1072,10 +1004,6 @@ def moe_gemm_stage1(J:JIT,
 
     # wait for v_sorted_id
     J.s_waitcnt(mod=f"vmcnt(0)")
-    J.ds_write_b32(J.threadIdx.x * 4, v_sorted_weights, mod=f"offset:{lds_weights}")
-    with J.ExecMask(J.threadIdx.x < 16):
-        for m in range(A_vert):  
-            J.ds_write_b32(J.lane_id * 4, v_sorted_id[m] & 0xffffff, mod=f"offset:{lds_token_ids + m*16*4}")
 
     voffset_a1 = J.gpr(A_vert, 'vu32')
     v_topk_id = J.gpr(A_vert, 'vu32')
@@ -1111,7 +1039,7 @@ def moe_gemm_stage1(J:JIT,
     # each wave reduce 4 rows once
     vrow = J.gpr(lane_div_16 + warp_id * 4)
 
-    A_reg_gemm2 = J.gpr(A_vert, (N1 // BLOCK_TILE_SIZE_N) * (n_groups // 2), 4, "bf16x2")
+    A_reg_gemm2 = J.gpr(A_vert, (N1 // BLOCK_TILE_SIZE_N) * (n_groups // 2), 4, "abf16x2")
     for block_n in range(N1 // BLOCK_TILE_SIZE_N):
         if block_n != 0:
             C_reg[:] = 0
@@ -1132,7 +1060,7 @@ def moe_gemm_stage1(J:JIT,
             J.s_barrier()
             v_sorted_id_permute = J.gpr("vu32")
             for m in range(A_vert):
-                #J.ds_bpermute_b32(v_sorted_id_permute, vrow * 4, v_sorted_id[m])
+                #J.ds_bpermute_b32(v_sorted_id_permute, vrow * 4, v_sorted_id[m]) 
                 gate_up = J.gpr(4, 2, 2, "vf32")
                 # interleave 
                 lds_buff.read("b64", gate_up[0], vrow + (0 * 16 + m * 64), lane_mod_16 * 2, offset1 = 16)
@@ -1184,18 +1112,21 @@ def moe_gemm_stage1(J:JIT,
             p_w_up_scale[:] += BLOCK_TILE_SIZE_N // 2 * sizeof_f32
 
     # be sure A_reg_gemm2 ready
-    J.s_waitcnt(mod=f"lgkmcnt(0)")
-    '''
-    print(e_idx, warp_id)
-    J.debug_setup((e_idx[0] == 3) & (warp_id[0] == 0))
-    J.debug_log(A_reg_gemm2[0], torch.bfloat16)
-    J.debug_log(A_reg_gemm2[1], torch.bfloat16)
-    J.debug_log(J.gpr(v_sorted_id[1] & 0xFFFFFF), torch.int32)
-    '''
     # release LDS buffer 
-    del lds_buff
+    #del lds_buff_out
+    lds_buff.free()
+
     # gemm2
-    if 0: return
+    lds_weights = J.alloc_lds(256*4)
+    lds_token_ids = J.alloc_lds(256*4)
+
+    J.ds_write_b32(J.threadIdx.x * 4, v_sorted_weights, mod=f"offset:{lds_weights}")
+    with J.ExecMask(J.threadIdx.x < 16):
+        for m in range(A_vert):
+            J.ds_write_b32(J.lane_id * 4, v_sorted_id[m] & 0xffffff, mod=f"offset:{lds_token_ids + m*16*4}")
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+
     num_mfma_n = 2
     down_kernel(J, 16,
                 num_mfma_n, BLOCK_TILE_SIZE_M, N2, K2,
@@ -1205,6 +1136,7 @@ def moe_gemm_stage1(J:JIT,
                 p_w_down,
                 p_output,
                 M)
+
 
 #####################################################################
 def _run_aiter(hidden_states,
