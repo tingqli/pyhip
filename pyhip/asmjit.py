@@ -44,7 +44,7 @@ class Instruction:
         self.loc = loc
 
     def __call__(self, *operands, mod:str="", insert_bb_pos = None):
-        self.operands = list(operands)
+        self.operands = []
         self.mod = mod
         jit = self.parent_bb.jit
         for i, op in enumerate(operands):
@@ -55,14 +55,20 @@ class Instruction:
                 dst_gprs = jit.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
                 dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
                 jit.recursive_expr_gen(self.parent_bb, dst_expr, op, loc=self.loc)
-                self.operands[i] = dst_expr
+                self.operands.append(dst_expr)
+                continue
+
+            # canonicalize GPR operand into GPRExpr
+            if isinstance(op, GPRs):
+                op = op.to_expr()
 
             assert isinstance(op, GPRExpr) or \
                    isinstance(op, int) or isinstance(op, float) or \
                    (isinstance(op, str) and (op in ["scc", "vcc", "exec", "off", "execz", "m0"])) or \
-                   (isinstance(op, str) and op.startswith("0x")) or \
-                   isinstance(op, GPRs), \
-            f"arg {i} : {type(op)} {op}"
+                   (isinstance(op, str) and op.startswith("0x")), f"arg {i} : {type(op)} {op}"
+
+            self.operands.append(op)
+
         self.parent_bb.add_instruction(self, insert_bb_pos)
         return self
 
@@ -322,14 +328,10 @@ class GPRExpr:
         else:
             return f"{self.op}({self.src0},{self.src1},{self.src2})"
 
-# a continous region of GPRs allocated
-# to reference GPR in it, we need getitem:
-#   v[0:1]
-#   v[2]
-# we cann't use v2 as pure-asm does
-# GPRs should be allocated by JIT
+# a logical continous region of GPRs allocated
+# may not physically continous
 class GPRs:
-    patterns = None
+
     def __init__(self, jit, rtype, start_id, count, dtype, align=0, name=""):
         self.jit = jit
         self.rtype = rtype
@@ -420,10 +422,7 @@ class GPRs:
     GPRs will convert self into a GPRExpr before compose expression
     '''
     def to_expr(self):
-        if self.count == 1:
-            return self[0]
-        else:
-            return self[0:(self.count - 1)]
+        return self[...]
 
     def __add__(self, other):
         return GPRExpr("+", self.to_expr(), other)
@@ -647,9 +646,18 @@ class LDSTensor:
             self.lds_base = lds_base
             self.own = False
 
+    # Python do not guarantee `__del__` happens immediatly at `del obj`
+    # it may delay which is not intended. call free instead
+    """
     def __del__(self):
         if self.own:
             self.J.free_lds(self.lds_base)
+            self.own = False
+    """
+    def free(self):
+        if self.own:
+            self.J.free_lds(self.lds_base)
+            self.own = False
 
     def read(self, dtype:str, vdst, *coord_exprs, offset1=None):
         self._access("read", dtype, vdst, *coord_exprs, offset1=offset1)
@@ -955,56 +963,6 @@ class JIT:
             self.s_mov_b64("exec", exec_backup)
             # if we want to do something when execz happens, we can use scc0
 
-    '''
-    SIMT while: just a prototype with bugs, do not use
-    '''
-    @contextmanager
-    def SIMTWhile(self, cond:GPRExpr = None):
-        current_frame = inspect.currentframe()
-        caller_frame = current_frame.f_back.f_back
-        lineno = caller_frame.f_lineno
-        label_begin = f"_simtwhile_begin_{lineno}_{self.mark_idx}"
-        label_end = f"_simtwhile_end_{lineno}_{self.mark_idx}"
-        self.mark_idx += 1
-        exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
-        # exec_stopped = self.new_gpr("s", 2, dtype="i32", align=2)
-
-        # generate expression into vcc
-        dtype = cond.find_dtype()
-        def generate_not_cond_in_vcc():
-            dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
-            dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
-            self.recursive_expr_gen(self.current_bb, dst_expr, cond)
-            last_inst = self.current_bb.instructions[-1]
-            if last_inst.opcode == "v_cndmask_b32_e64" and \
-                last_inst.operands[0] is dst_expr and \
-                last_inst.operands[1] == 0 and \
-                last_inst.operands[1] == 1 and \
-                last_inst.operands[1] == "vcc" :
-                self.log("v_cndmask_b32_e64 dst,0,1,vcc is optimized")
-                self.current_bb.instructions.pop()
-                # above code generate condition to keep alive
-                # we need vcc[lane]=1 when cond is false
-                self.s_not_b64("vcc","vcc")
-            else:
-                self.v_cmp_eq_u32_e64("vcc", 0, dst_gprs)
-
-        generate_not_cond_in_vcc()
-        # backup exec, set exec-mask based on vcc
-        self.s_and_saveexec_b64(exec_backup, "vcc")
-        # jump to end if no lanes are alive
-        self.s_cbranch_execz(mod=label_end)
-        self.Label(label_begin)
-        try:
-            # following dict is for loop body code to continue or break
-            yield {"begin":label_begin, "end":label_end}
-        finally:
-            generate_not_cond_in_vcc()
-            self.s_andn2_b64("exec", "exec", "vcc")
-            self.s_cbranch_execnz(mod=label_begin)
-            self.Label(label_end)
-            self.s_or_b64("exec", "exec", exec_backup)
-
     def _align_up(self, a, align):
         return ((a + align - 1)//align) * align
 
@@ -1132,7 +1090,7 @@ class JIT:
                         gpr_stores[key].append((bid, iid))
                     possible_src_id0 = 1 # skip dst-gpr for src-gpr tests
                 for op in inst.operands[possible_src_id0:]:
-                    if (not isinstance(op, GPRExpr)) and (not isinstance(op, GPRs)):
+                    if not isinstance(op, GPRExpr):
                         continue
                     flatten_gpr = op[...]
                     for i in range(len(flatten_gpr)):
@@ -1172,12 +1130,10 @@ class JIT:
 
         # in unit of one gpr
         def is_normal_gpr(op):
-            if (not isinstance(op, GPRExpr)) and (not isinstance(op, GPRs)):
+            if not isinstance(op, GPRExpr):
                 return False
-            gprs = op
-            if isinstance(gprs, GPRExpr):
-                assert gprs.op == "getitem"
-                gprs = gprs.src0
+            assert op.op == "getitem"
+            gprs = op.src0
             assert isinstance(gprs, GPRs), f"{type(gprs)}"
             return not (gprs in self.fixed_gprs)
 
@@ -1206,7 +1162,12 @@ class JIT:
 
             for gpr_repr in useless_gprs:
                 del live_intervals[gpr_repr]
+
+                ivs = useless_gprs[gpr_repr]
+                if len(ivs) < 3:
+                    continue # the instruction has been marked as dead
                 bid, iid, sid  = useless_gprs[gpr_repr][:3]
+                
                 inst = self.blocks[bid].instructions[iid]
                 if inst.is_dead:
                     continue
@@ -1232,17 +1193,90 @@ class JIT:
                 if bb.instructions[i].is_dead:
                     bb.instructions.pop(i)
 
+    def pass_break_down_gprs(self):
+        # gprs are allocate in unit of GPRs, break GPRs into smaller pieces
+        # can help to reduce register space fragmentation issue.
+        # each instruction operand reference to gpr represents a 
+        # requirement on physical adjacency of a subset of GPRs
+        # and these requirement are overlapping, for example:
+        #     v[0:3] requires v[0,1,2,3] to be physically adjacent to each other
+        #      - v[0:1] requirements are weaker than above one.
+        #      - v[2:5] further extends physical adjacency of 0:3 to 0:5
+        #     so basically these requirements, if overlapping with each other
+        #     they will form a bigger adjacency requirement. all such requirements
+        #     are maintained in GPRs.
+        # some referencing are not used to compose instructions and such reference
+        # are just logical references and not a physical requirement, so we need 
+        # go through all instructions and collect real adjacency requirements.
+        # these adjacency requirements help to break GPRs into smaller pieces
+        class GPRparts:
+            def __init__(self):
+                self.parts = []
+            def update(self, first, last, loc):
+                merged_parts = []
+                merged_locs = [loc]
+                for i,p in enumerate(self.parts):
+                    i0,i1,locs = p
+                    n0,n1 = min(i0, first), max(i1, last)
+                    full_range = n1 - n0 + 1
+                    max_range = (i1-i0+1) + (last-first+1)
+                    if full_range < max_range:
+                        # overlapping
+                        merged_parts.append(i)
+                        merged_locs.extend(locs)
+                        first, last = n0, n1 # new range
+                # delete merged parts
+                for i in range(len(self.parts)-1, -1, -1):
+                    if i in merged_parts:
+                        self.parts.pop(i)
+                self.parts.append((first, last, merged_locs))
+
+        gpr_parts = {}
+        for bid, bb in enumerate(self.blocks):
+            for iid, inst in enumerate(bb.instructions):
+                for oid,op in enumerate(inst.operands):
+                    if not isinstance(op, GPRExpr): continue
+                    assert op.op == "getitem"
+                    gprs = repr(op.src0)
+                    first = op.src1
+                    last = op.src2
+                    if op.src0.count == 1 or op.src0.rtype == 's': continue
+                    if gprs not in gpr_parts:
+                        gpr_parts[gprs] = GPRparts()
+                    gpr_parts[gprs].update(first, last, (bid,iid,oid))
+
+        for k,parts in gpr_parts.items():
+            if len(parts.parts) == 1: continue
+            #print("#### ", k)
+            for first, last, locs in parts.parts:
+                gprs = self.gpr(last-first+1, k[0]+"u32")
+                #print(first, last, locs)
+                for bid,iid,oid in locs:
+                    inst = self.blocks[bid].instructions[iid]
+                    #sin = repr(inst)
+                    op = inst.operands[oid]
+                    # some instructions may share same GPRExpr
+                    if op.src0 is gprs: continue
+                    #op0 = repr(op)
+                    op.src1 = op.src1 - first
+                    op.src2 = op.src2 - first
+                    op.src0 = gprs
+                    #op1 = repr(op)
+                    #print(op0,"=====>",op1, "       ", sin, "====>", inst)
+
     # this step is not mandatory，but it allows more registers to use
     # linear-scan:
     #    try to shrink register usage on `relocatable_gprs`
     #    do not touch `fixed_gprs`
     def register_allocation_linear_scan(self):
         # note: BB in self.blocks has been ordered, assign each instruction an serial
+        inst_dict = {}
         inst_list = []
         serial_index = 0
         for bb in self.blocks:
             for inst in bb.instructions:
                 inst.sid = serial_index
+                inst_dict[inst.sid] = inst
                 inst_list.append(inst)
                 serial_index += 1
 
@@ -1256,8 +1290,6 @@ class JIT:
                 for op in inst.operands:
                     if isinstance(op, GPRExpr):
                         gprs = op.src0
-                    elif isinstance(op, GPRs):
-                        gprs = op
                     else:
                         continue
                     if gprs in self.fixed_gprs:
@@ -1391,14 +1423,16 @@ class JIT:
                 if ev == 1: # last use(as src)
                     if gprs.start_id >= 0:
                         free_gpr(gprs)
-                        self.asm_debug_info += f";free '{gprs.name}'{gprs} at #{sid}\n"
+                        inst_dict[sid].loc += f" free '{gprs.name}'{gprs}"
+                        #self.asm_debug_info += f";free '{gprs.name}'{gprs} at #{sid}\n"
                     else:
                         unalloc_gprs.append(gprs)
             # allocation 
             for ev,gprs in events:
                 if ev == 0: # first use(as dst)
                     alloc_gpr(gprs, sid)
-                    self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}      {gpr_usage()}\n"
+                    inst_dict[sid].loc += f" alloc '{gprs.name}'{gprs}    {gpr_usage()}"
+                    #self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}      {gpr_usage()}\n"
 
             # in case some gpr's last & first sids are the same
             for gprs in unalloc_gprs:
@@ -1411,9 +1445,7 @@ class JIT:
                 debug_info = f"#{inst.loc}   sid:{inst.sid} "
                 for op in inst.operands:
                     if isinstance(op, GPRExpr):
-                        op = op.src0
-                    if isinstance(op, GPRs):
-                        debug_info += f"{op.name},"
+                        debug_info += f"{op.src0.name},"
                     else:
                         debug_info += f"{op},"
                 inst.debug_info = debug_info
@@ -1842,7 +1874,7 @@ class JIT:
                 if prev.isTransOp() and (not cur.isTransOp()) and (cur.isVALU()):
                     vdst = prev.operands[0]
                     for op in cur.operands:
-                        if (isinstance(op, GPRExpr) or isinstance(op, GPRs)) and vdst.overlap(op):
+                        if isinstance(op, GPRExpr) and vdst.overlap(op):
                             n_nops = 1
                             self.log(f"insert s_nop({n_nops}) at #{loc} : [VALU Trans op, Non-trans VALU op consumes result of that op]")
                             break
@@ -2176,9 +2208,6 @@ class JIT:
             cnt += 1
         return ret
 
-    def is_gpr(self, op):
-        return isinstance(op, GPRs) or isinstance(op, GPRExpr)
-
     def pass_hide_dependency(self):
         # hide dependency between address calculation & ds_read/ds_write/global_load
         # by reorder instructions following the mem-access
@@ -2202,7 +2231,7 @@ class JIT:
                         if i + 1 >= len(bb.instructions):
                             break
                         next = bb.instructions[i + 1]
-                        if next.opcode.startswith("v_") and self.is_gpr(next.operands[0]) and (not next.operands[0].overlap(vaddr)):
+                        if next.opcode.startswith("v_") and isinstance(next.operands[0], GPRExpr) and (not next.operands[0].overlap(vaddr)):
                             bb.instructions[i], bb.instructions[i+1] = next, cur
                             i = i + 1
                             swap_cnt += 1
@@ -2250,7 +2279,7 @@ class JIT:
         debug_enabled = self.debug_print()
 
         def is_gpr(op):
-            return isinstance(op, GPRs) or isinstance(op, GPRExpr)
+            return isinstance(op, GPRExpr)
 
         # check GPRs, GPRs can be optimized by CSE pass
         #   - written only once
@@ -2590,6 +2619,9 @@ class JIT:
         # Dead Code Elimination，DCE
         self.pass_dce()
         self.dump_code(f"after_pass_dce")
+
+        self.pass_break_down_gprs()
+        self.dump_code(f"after_pass_break_down_gprs")
 
         # for bb in self.blocks: print(repr(bb))
         self.register_allocation_linear_scan()
