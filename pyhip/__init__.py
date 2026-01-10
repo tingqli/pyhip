@@ -29,6 +29,10 @@ class cudaPerf(object):
     def dt(self, excludes=0):
         return sum(self.latencies[excludes:])/len(self.latencies[excludes:])
 
+    def bw(self, excludes=0):
+        avg_dt_ms = self.dt(excludes) * 1e3
+        return self.rw_bytes*1e-6/avg_dt_ms
+
     def show(self, flops = None, rw_bytes = None):
         msg = f"{self.name} dt = {self.dt_ms*1e3:.3f} us"
         if flops and flops > 0:

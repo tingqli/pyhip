@@ -1,6 +1,8 @@
 import os
 import random
 from typing import Optional
+
+import pytest
 os.environ['PYHIP_JIT_LOG'] = '0'
 from pyhip import cudaPerf, jit, JIT
 import torch
@@ -1205,7 +1207,7 @@ def moe_gemm_stage1(J:JIT,
                 M)
 
 #####################################################################
-def run_aiter(hidden_states,
+def _run_aiter(hidden_states,
             w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
             w2,  # [expert(local_expert:EP), dim, inter_dim]
             topk_weight,
@@ -1226,7 +1228,7 @@ def run_aiter(hidden_states,
         quant_type=QuantType.No if w1.dtype == torch.bfloat16 else QuantType.per_Token
     )
 
-def run_batch(B=1, weight_type=torch.bfloat16):
+def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10):
     HIDDEN_SIZE = 2048
     TP = 4
     INTER_SIZE = 768
@@ -1239,10 +1241,8 @@ def run_batch(B=1, weight_type=torch.bfloat16):
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
     if weight_type == torch.bfloat16:
         w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=weight_type)
-        #w_[...] = 0.01
         w1 = [w_.clone() for _ in range(BUF_COPY)]
         w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=weight_type)
-        #w_[...] = 0.01
         w2 = [w_.clone() for _ in range(BUF_COPY)]
         w1_scale = [None] * BUF_COPY
         w2_scale = [None] * BUF_COPY
@@ -1267,196 +1267,115 @@ def run_batch(B=1, weight_type=torch.bfloat16):
     topk_ids[:, ] = topk_ids_1d.reshape(-1)[ : B * TOPK].reshape(B, TOPK)
     access_expert = torch.unique(topk_ids[0])
     access_expert = access_expert.shape[0]
-    #topk_weight[...] = 0.1
-    #topk_weight[:,-1,0] = 0.5
-    #hidden_states[...]=0.01
 
-    if 1:
-        import aiter
+    flops = 2 * B * TOPK * (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP)
+    mem_size = B * HIDDEN_SIZE * 2 + (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * access_expert * (2 if weight_type == torch.bfloat16 else 1)
 
-        from aiter.ops.shuffle import shuffle_weight
+    import aiter
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.fused_moe import moe_sorting
+
+    def run(hidden_states, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale):
+        B = hidden_states.shape[0]
+        E, N1, K1 = w1.shape
+        N2, K2 = w2.shape[1], w2.shape[2]
+        gemm1_out = torch.empty([B, TOPK, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
+        if kernel_type == '16x32_2s_b1':
+            # test moe_gemm_batch: 2 stages, BLOCK_TILE_M=16, BLOCK_TILE_N=32, batch == 1
+            cur_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+            moe_gemm_batch1([N1 // 32, TOPK],[256], w1.dtype, True, hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, 1, N1, K1)
+            moe_gemm_batch1([N2 // 32, TOPK],[64], w1.dtype, False, gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, 1, N2, K2)
+        elif kernel_type == '16x32_2s_b':
+            # test moe_gemm_batch: 2 stages, BLOCK_TILE_M=16, BLOCK_TILE_N=32
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+                topk_ids,
+                topk_weight,
+                E,
+                K1,     # reduce dim is same with output dim
+                hidden_states.dtype,
+                16,
+                None,
+                None,
+                0,
+            )
+            moe_gemm_batch([N1 // 32, sorted_expert_ids.shape[0]], [256],
+                            w1.dtype, True,
+                            hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B, N1, K1, TOPK)
+            moe_gemm_batch([N2 // 32, sorted_expert_ids.shape[0]], [64],
+                            w1.dtype, False,
+                            gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, N2, K2, TOPK)
+        elif kernel_type == 'mxn_splitk_2s':
+            # test moe_gemm_batch_vmn: 2 stages, m/n can be set
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+                topk_ids,
+                topk_weight,
+                E,
+                K1,     # reduce dim is same with output dim
+                hidden_states.dtype,
+                TILE_M,
+                None,
+                None,
+                0,
+            )
+            BLOCK_TILE_SIZE_M = TILE_M
+            BLOCK_TILE_SIZE_N = TILE_N
+            moe_gemm_batch_vmn([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
+                                w1.dtype, TOPK, K1, N1, True, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
+            moe_gemm_batch_vmn([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
+                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+        elif kernel_type == 'mxn_splitk_1s':
+            # test moe_gemm_stage1
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+                topk_ids,
+                topk_weight,
+                E,
+                K1,     # reduce dim is same with output dim
+                hidden_states.dtype,
+                TILE_M,
+                None,
+                None,
+                0,
+            )
+            BLOCK_TILE_SIZE_M = TILE_M
+            BLOCK_TILE_SIZE_N = TILE_N
+            moe_gemm_stage1([1, sorted_expert_ids.shape[0]], [256], 
+                            w1.dtype, TOPK, K1, N1, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                            hidden_states.data_ptr(), w1.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, w2.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0,
+                            cur_out.data_ptr(), 
+                            sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
+        else:
+            assert 0, f'not support kernel type "{kernel_type}"'
+        return cur_out
+
+    tflops_res = []
+    latencies = []
+    bw = []
+    if kernel_type == 'aiter':
         # aiter needs preshuffle weights
+        i = 0
+        for _ in range(run_count):
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{B=},{str(weight_type).split('.')[1]}]") as p:
+                _run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
+            i = (i + 1) % BUF_COPY
+            tflops_res.append(p.tflops())
+            latencies.append(p.dt())
+            bw.append(p.bw())
+    else:
         w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
-        ref_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
+        ref_out = _run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
+        cur_out = run(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
-        flops = 2 * B * TOPK * (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP)
-        mem_size = B * HIDDEN_SIZE * 2 + (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * access_expert * (2 if weight_type == torch.bfloat16 else 1)
-        for _ in range(10):
-            with cudaPerf(flops, mem_size, name=f"aiter[{B=},{str(weight_type).split('.')[1]}]"):
-                run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
+        for _ in range(run_count):
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{B=},{str(weight_type).split('.')[1]}]") as p:
+                run(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
             i = (i + 1) % BUF_COPY
+            tflops_res.append(p.tflops())
+            latencies.append(p.dt())
+            bw.append(p.bw())
 
-    if 1:
-        import aiter
-        from aiter import ActivationType, QuantType, dtypes
-        from aiter.fused_moe import moe_sorting
-
-        org_fused_moe = None
-        def my_fused_moe(
-            hidden_states,
-            w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
-            w2,  # [expert(local_expert:EP), dim, inter_dim]
-            topk_weight,
-            topk_ids,
-            expert_mask: Optional[torch.tensor] = None,  # EP
-            activation=ActivationType.Silu,
-            quant_type=QuantType.No,
-            doweight_stage1=False,
-            # following for quant
-            w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
-            w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
-            a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
-            a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
-            # following for tuning
-            block_size_M=None,
-            num_local_tokens: Optional[torch.tensor] = None,
-            moe_sorting_dispatch_policy=0,
-            dtype=None,
-            # following for cktile support
-            hidden_pad=0,
-            intermediate_pad=0,
-            bias1=None,
-            bias2=None,
-        ):
-            # the following should be added in aiter.fused_moe.fused_moe
-            if hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
-                ((quant_type == QuantType.No and w1.dtype == torch.bfloat16) or (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)):
-                B = hidden_states.shape[0]
-                E, N1, K1 = w1.shape
-                N2, K2 = w2.shape[1], w2.shape[2]
-                assert N1 == 2 * K2
-                gemm1_out = torch.empty([B, TOPK, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
-                if B == 1:
-                    assert N1 == 2 * K2
-                    gemm2_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
-                    moe_gemm_batch1([N1 // 32, TOPK],[256], w1.dtype, True, hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, 1, N1, K1)
-                    moe_gemm_batch1([N2 // 32, TOPK],[64], w1.dtype, False, gemm1_out.data_ptr(), w2.data_ptr(), gemm2_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, 1, N2, K2)
-                    return gemm2_out
-                else:
-                    # test moe_gemm_batch
-                    if B == 2:
-                        BLOCK_M = 16
-                        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-                            topk_ids,
-                            topk_weight,
-                            E,
-                            K1,     # reduce dim is same with output dim
-                            hidden_states.dtype,
-                            BLOCK_M,
-                            expert_mask,
-                            num_local_tokens,
-                            moe_sorting_dispatch_policy,
-                        )
-                        moe_gemm_batch([N1 // 32, sorted_expert_ids.shape[0]], [256],
-                                        #w1.dtype, TOPK, K1, N1, True,
-                                        w1.dtype, True,
-                                        hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B, N1, K1, TOPK)
-                        moe_gemm_batch([N2 // 32, sorted_expert_ids.shape[0]], [64],
-                                        #w1.dtype, TOPK, K2, N2, False,
-                                        w1.dtype, False,
-                                        gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, N2, K2, TOPK)
-                        return moe_buf
-                    else:
-                        BLOCK_M = 32
-                        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-                            topk_ids,
-                            topk_weight,
-                            E,
-                            K1,     # reduce dim is same with output dim
-                            hidden_states.dtype,
-                            BLOCK_M,
-                            expert_mask,
-                            num_local_tokens,
-                            moe_sorting_dispatch_policy,
-                        )
-                        # test moe_gemm_batch_vmn
-                        if B == 31:
-                            BLOCK_TILE_SIZE_M = BLOCK_M
-                            BLOCK_TILE_SIZE_N = 64
-                            moe_gemm_batch_vmn([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
-                                                w1.dtype, TOPK, K1, N1, True, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-                            BLOCK_TILE_SIZE_N = 64
-                            moe_gemm_batch_vmn([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
-                                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                                gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
-                            return moe_buf
-                        # test moe_gemm_stage1
-                        else:
-                            if 1:
-                                BLOCK_TILE_SIZE_M = BLOCK_M
-                                BLOCK_TILE_SIZE_N = 128
-                                moe_gemm_stage1([1, sorted_expert_ids.shape[0]], [256], 
-                                                w1.dtype, TOPK, K1, N1, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                                hidden_states.data_ptr(), w1.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, w2.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0,
-                                                moe_buf.data_ptr(), 
-                                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
-                            elif 1:
-                                BLOCK_TILE_SIZE_M = BLOCK_M
-                                BLOCK_TILE_SIZE_N = 128
-                                moe_gemm_batch_vmn([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
-                                                w1.dtype, TOPK, K1, N1, True, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-                                BLOCK_TILE_SIZE_N = 128
-                                moe_gemm_batch_vmn([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
-                                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                                gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
-                            else:
-                                moe_gemm_batch([N1 // 32, sorted_expert_ids.shape[0]], [256],
-                                                #w1.dtype, TOPK, K1, N1, True,
-                                                w1.dtype, True,
-                                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B, N1, K1, TOPK)
-                                moe_gemm_batch([N2 // 32, sorted_expert_ids.shape[0]], [64],
-                                                #w1.dtype, TOPK, K2, N2, False,
-                                                w1.dtype, False,
-                                                gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, N2, K2, TOPK)
-
-                            return moe_buf
-            else:
-                return org_fused_moe(hidden_states,
-                    w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
-                    w2,  # [expert(local_expert:EP), dim, inter_dim]
-                    topk_weight,
-                    topk_ids,
-                    expert_mask,  # EP
-                    activation,
-                    quant_type,
-                    doweight_stage1,
-                    # following for quant
-                    w1_scale,  # [expert(local_expert:EP), inter_dim, 1]
-                    w2_scale,  # [expert(local_expert:EP), model_dim, 1]
-                    a1_scale,  # [expert(local_expert:EP), 1, model_dim]
-                    a2_scale,  # [expert(local_expert:EP), 1, inter_dim]
-                    # following for tuning
-                    block_size_M,
-                    num_local_tokens,
-                    moe_sorting_dispatch_policy,
-                    dtype,
-                    # following for cktile support
-                    hidden_pad,
-                    intermediate_pad,
-                    bias1,
-                    bias2)
-        org_fused_moe = aiter.fused_moe.fused_moe
-        aiter.fused_moe.fused_moe = my_fused_moe
-
-        w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
-        w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
-        cur_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
-        i = 0
-        for _ in range(10):
-            with cudaPerf(flops, mem_size, name=f"cur[{B=},{str(weight_type).split('.')[1]}]"):
-                run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
-            i = (i + 1) % BUF_COPY
-
-        if 0:
-            torch.cuda.synchronize()
-            print(f"================== ref_out {ref_out.shape}")
-            print(ref_out[254:,:])
-            print(f"================== cur_out {cur_out.shape}")
-            print(cur_out[254:,:])        
-        aiter.fused_moe.fused_moe = org_fused_moe
         if not torch.allclose(ref_out, cur_out, rtol=0.1, atol=0.03):
             print(cur_out)
             idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
@@ -1464,23 +1383,96 @@ def run_batch(B=1, weight_type=torch.bfloat16):
                 print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
             assert 0
         else:
-            print("acc OK")
+            print(f"{kernel_type}[{B=} {weight_type=}] acc OK")
+    if run_count > 0:
+        return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
+                'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
+                'bw': sum(bw[1:]) / len(bw[1:])}                               # GB/s
 
-def test():
-    torch.cuda.set_device(2)
+# special path for batch1 
+def entry_b1(test_fp8=True, run_count=10):
+    kernel_type = '16x32_2s_b1'
+    perf = {}
+    perf[kernel_type] = {}
+    perf_bf16 = {}
+
+    perf_bf16[1] = _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, run_count=run_count)
+    perf[kernel_type]['bf16'] = perf_bf16
+    if test_fp8:
+        perf_fp8 = {}
+        perf_fp8[1] = _run_batch(kernel_type, B=1, weight_type=torch.float8_e4m3fnuz, run_count=run_count)
+        perf[kernel_type]['fp8'] = perf_fp8
+    return perf
+
+def entry_common(kernel_type, batch, test_fp8=True, TILE_M=None, TILE_N=None, run_count=10):
+    perf = {}
+    perf[kernel_type] = {}
+    perf_bf16 = {}
+    for i in batch:
+        perf_bf16[i] = _run_batch(kernel_type, B=i, weight_type=torch.bfloat16, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count)
+    perf[kernel_type]['bf16'] = perf_bf16
+
+    if test_fp8:
+        perf_fp8 = {}
+        for i in batch: 
+            perf_fp8[i] = _run_batch(kernel_type, B=i, weight_type=torch.float8_e4m3fnuz, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count)
+        perf[kernel_type]['fp8'] = perf_fp8
+    
+    return perf
+
+def init_env():
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
     torch.set_default_device('cuda')
     torch.manual_seed(0)
-    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
-    start = 1
-    end = 64
-    run_batch(B=8192, weight_type=torch.bfloat16)
-    return
-    # run_batch(B=1, weight_type=torch.float8_e4m3fnuz)
-    for i in range(start-1, end):
-        run_batch(B=i + 1, weight_type=torch.bfloat16)
 
-    for i in range(start-1, end): 
-        run_batch(B=i + 1, weight_type=torch.float8_e4m3fnuz)
+def test_acc():
+    init_env()
+    batch = list(range(2, 64))
+    # fix TILE_M=16, TILE_N=32
+    entry_b1(run_count=0)
+    entry_common('16x32_2s_b', batch=batch, test_fp8=True, run_count=0)
+    batch += list(range(128, 256))
+    batch += [i * 256 for i in range(1, 4)]
+    batch += [i * 2048 for i in range(1, 5)]
+    # TODO: mxn_splitk_1s may fail on the case:
+    #batch += list(range(2048 * 3, 2048 * 3 + 256))
+    # TILE_M/N is configurable
+    entry_common('mxn_splitk_2s', batch=batch, test_fp8=True, TILE_M=32, TILE_N=64, run_count=0)
+    # TODO: support fp8
+    entry_common('mxn_splitk_1s', batch=batch, test_fp8=False, TILE_M=32, TILE_N=128, run_count=0)
+
+def show_perf(perf):
+    print('\nsummary:')
+    for kernel, vals in perf.items():
+        for prec, vals_ in vals.items():
+            for b, data in vals_.items():
+                print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
+
+@pytest.mark.parametrize("batch", [[1, 2, 4, 8, 12, 16, 32, 64]])
+def test_small_batch_perf(batch):
+    init_env()
+    perf = {}
+    perf.update(entry_common('aiter', batch))
+    # fix TILE_M=16, TILE_N=32
+    perf.update(entry_b1())           # batch 1
+    perf.update(entry_common('16x32_2s_b', batch=batch, test_fp8=True))
+    show_perf(perf)
+
+@pytest.mark.parametrize("batch", [[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]])
+def test_perf(batch):
+    init_env()
+    perf = {}
+    test_fp8 = False
+    perf.update(entry_common('aiter', batch, test_fp8=test_fp8))
+    # TODO: support fp8
+    perf.update(entry_common('mxn_splitk_1s', batch=batch, test_fp8=False, TILE_M=32, TILE_N=128))
+    # TILE_M/N is configurable
+    perf.update(entry_common('mxn_splitk_2s', batch=batch, test_fp8=test_fp8, TILE_M=32, TILE_N=64))
+    show_perf(perf)
 
 if __name__ == '__main__':
-    test()
+    test_acc()
+    batch = [1, 2, 4, 8, 12, 16, 32, 64]
+    test_small_batch_perf(batch)
+    batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    test_perf(batch)
