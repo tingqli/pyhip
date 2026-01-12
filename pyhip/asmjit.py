@@ -990,6 +990,10 @@ class JIT:
     a[2,0,0:3] : referencing gpr groups (continous, no more than instruction needed)
     a[2,0]     : same as above
     a[2]       : referencing
+
+    a = J.gpr("vu32", 0)    : alloc 1 vgpr and set initial value to 0
+    a = J.gpr(4, "af32", 0) : alloc 4 agpr and set initial value to 0
+    a = J.gpr(4, "af32", 0, 3) : alloc 4 agpr and set initial value to 0,3,3,3
     '''
     def gpr(self, *desc, align=0, name=""):
         if name == "":
@@ -1008,16 +1012,24 @@ class JIT:
             return self.auto_gpr(desc[0], name=name, loc=get_caller_loc())
 
         # allocate GPRs
-        dtype = desc[-1]
-        assert isinstance(dtype, str), f"{dtype=}"
 
         num_gprs = 1
         shape = []
-        for i in range(len(desc)-1):
+        i = 0
+        for i in range(len(desc)):
             dim = desc[i]
-            assert isinstance(dim, int)
+            if not isinstance(dim, int):
+                break
             shape.append(dim)
             num_gprs *= dim
+
+        dtype = desc[i]
+        assert isinstance(dtype, str), f"{desc=} {i=} {dtype=}"
+
+        if i + 1 < len(desc):
+            initial_values = desc[(i+1):]
+        else:
+            initial_values = None
 
         # allows empty shape info: `J.gpr("su32")`
         if len(shape) == 0:
@@ -1036,6 +1048,16 @@ class JIT:
         gprs = self.new_gpr(rtype, num_gprs, dtype, align, name)
         # set additional shape meta data for easier indexing & slicing
         gprs.set_shape(shape)
+
+        if initial_values is not None:
+            if isinstance(initial_values, list) or isinstance(initial_values, tuple):
+                n_values = len(initial_values)
+                flatten_gprs = gprs[...]
+                for i in range(len(flatten_gprs)):
+                    flatten_gprs[i] = initial_values[min(i, n_values-1)]
+            else:
+                gprs[...] = initial_values
+
         return gprs
 
 

@@ -44,6 +44,24 @@ def test_basic():
     ref[:CNT] = CNT
     torch.testing.assert_close(A, ref)
 
+def test_basic1():
+    magic_value = 0x123463
+    @pyhip.jit()
+    def kernel(J, pA:"int*", mv:"int"):
+        idx = J.gpr("su32", mv*8)
+        idx4 = J.gpr(4, "su32", mv*9, mv*10)
+        J.s_store_dword(idx, pA, 0, mod="glc")
+        J.s_store_dwordx4(idx4, pA, 4, mod="glc")
+
+    A = torch.ones(5, dtype=torch.int)
+    kernel([1],[64], A.data_ptr(), magic_value)
+    torch.cuda.synchronize()
+    assert A[0] == magic_value*8, A[0]
+    assert A[1] == magic_value*9, A[1]
+    assert A[2] == magic_value*10, A[2]
+    assert A[3] == magic_value*10, A[3]
+    assert A[4] == magic_value*10, A[4]
+
 def test_basic2():
     @pyhip.jit()
     def kernel(J, pA:"int*", cnt:"int"):
@@ -143,6 +161,8 @@ def test_vadd():
     torch.testing.assert_close(B[:256], ref)
 
 if __name__ == "__main__":
+    test_basic1()
+    assert 0
     test_basic()
     test_basic2()
     test_vadd()
