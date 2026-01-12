@@ -701,6 +701,93 @@ def moe_gemm_batch_vmn(J:JIT,
                     J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
                     J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
 
+@jit()
+def moe_gemm_batch_down(J:JIT,
+                       weight_dtype,
+                       TOPK, K, N,          # 8,  128, 2048
+                       with_silu,           #
+                       BLOCK_TILE_SIZE_M,   # 32
+                       BLOCK_TILE_SIZE_N,   # 64
+                       p_input:"void*",     # [8192, 8, 128]
+                       p_weight:"void*",    # [128, 2048, 128]
+                       p_output:"void*",    # [8192, 2048]
+                       p_sorted_ids:"void*",        # [69624]
+                       p_sorted_weights:"float*",   # [69624]
+                       p_sorted_expert_ids:"void*", # [2176]
+                       p_num_valid_ids:"void*",     # [2]  value: [65536,  8192]
+                       p_w_scale:"float*",
+                       M:"int",):
+    sizeof_bf16 = 2
+    sizeof_f32 = 4
+    sizeof_w = sizeof_bf16 if weight_dtype == torch.bfloat16 else 1
+    sizeof_DW = 4
+    sizeof_DW4 = sizeof_DW * 4
+    stride_w = K * sizeof_w
+
+    e_idx = J.blockIdx.y
+    s_e_id = J.gpr(1, 'su32')
+    J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
+    max_id = J.gpr(1, 'su32')
+    J.s_load_dword(max_id, p_num_valid_ids, 0)
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
+    # invalid padding section
+    J.Jump("continue_following", e_idx * BLOCK_TILE_SIZE_M < max_id)
+    J.s_endpgm()
+    J.Label("continue_following")
+
+    p_sorted_ids[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
+    p_sorted_weights[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
+    p_weight[:] += s_e_id * (N * K * sizeof_w)
+
+    mfma_MN = 16
+    mfma_K = (64//mfma_MN) * (sizeof_DW4//sizeof_bf16)
+    num_mfma_m = J.div(BLOCK_TILE_SIZE_M, mfma_MN)
+    num_mfma_k = J.div(K, mfma_K)
+
+    A = J.gpr(num_mfma_m, num_mfma_k, 4, "abf16x2")
+
+    # collect token id
+    row = J.lane_id % mfma_MN
+    col = J.lane_id // mfma_MN
+    v_sorted_id = J.gpr(num_mfma_m, 'vu32')
+    for m in range(num_mfma_m):
+        J.global_load_dword(v_sorted_id[m], row*sizeof_DW + m*mfma_MN*sizeof_DW, p_sorted_ids)
+
+    J.s_waitcnt(mod=f"vmcnt(0)")
+
+    vaddr = J.gpr(num_mfma_m, "vu32")
+    for m in range(num_mfma_m):
+        vaddr[m] = (v_sorted_id[m] & 0xFFFFFF) * (TOPK * K * sizeof_w) + (v_sorted_id[m]>>24) *(K * sizeof_w) + col * sizeof_DW4
+
+    buff_a = J.Buffer(p_input, M * TOPK * K * sizeof_bf16)
+    for m in range(num_mfma_m):
+        for k in range(num_mfma_k):
+            buff_a.load_dwordx4(A[m,k], vaddr[m], 0, offset12=k*mfma_K*sizeof_bf16)
+    
+    v_sorted_weights = J.gpr('vf32')
+    assert BLOCK_TILE_SIZE_M <= 256
+    with J.ExecMask(J.threadIdx.x < BLOCK_TILE_SIZE_M):
+        J.global_load_dword(v_sorted_weights, J.threadIdx.x * 4, p_sorted_weights)
+
+    J.s_waitcnt(mod=f"vmcnt(0)")
+
+    lds_weights = J.alloc_lds(256*4)
+    lds_token_ids = J.alloc_lds(256*4)
+
+    with J.ExecMask(J.threadIdx.x < BLOCK_TILE_SIZE_M):
+        J.ds_write_b32(J.threadIdx.x * 4, v_sorted_weights, mod=f"offset:{lds_weights}")
+    with J.ExecMask(J.threadIdx.x < 16):
+        for m in range(num_mfma_m):
+            J.ds_write_b32(J.lane_id * 4, v_sorted_id[m] & 0xffffff, mod=f"offset:{lds_token_ids + m*16*4}")
+
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
+    J.s_barrier()
+
+    num_mfma_n = 2
+    down_kernel(J, mfma_MN, num_mfma_n, BLOCK_TILE_SIZE_M, N, K,
+                A, lds_token_ids, lds_weights,
+                p_weight, p_output, M)
+
 def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 A, # A = J.gpr(num_mfma_m, num_mfma_k, 4, "abf16x2")
                 lds_token_ids,  # 256 int32 token_id
@@ -1237,7 +1324,13 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             moe_gemm_batch_vmn([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
                                 w1.dtype, TOPK, K1, N1, True, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                 hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-            moe_gemm_batch_vmn([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
+            
+            if weight_type == torch.bfloat16:
+                moe_gemm_batch_down([1, sorted_expert_ids.shape[0]], [256],
+                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+            else:
+                moe_gemm_batch_vmn([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
                                 w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                 gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
         elif kernel_type == 'mxn_splitk_1s':
@@ -1296,7 +1389,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
             if len(idx[0]):
                 print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
-            assert 0
+            assert 0, f"{kernel_type=}, {B=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=}"
         else:
             print(f"{kernel_type}[{B=} {weight_type=}] acc OK")
     if run_count > 0:
@@ -1342,6 +1435,8 @@ def init_env():
 
 def test_acc():
     init_env()
+    #entry_common('mxn_splitk_2s', batch=[8192], test_fp8=False, TILE_M=32, TILE_N=64, run_count=0)
+    #assert 0,"========================"
     batch = list(range(2, 64))
     # fix TILE_M=16, TILE_N=32
     entry_b1(run_count=0)
@@ -1350,7 +1445,7 @@ def test_acc():
     batch += [i * 256 for i in range(1, 4)]
     batch += [i * 2048 for i in range(1, 5)]
     # TODO: mxn_splitk_1s may fail on the case:
-    #batch += list(range(2048 * 3, 2048 * 3 + 256))
+    batch += list(range(2048 * 3, 2048 * 3 + 256))
     # TILE_M/N is configurable
     entry_common('mxn_splitk_2s', batch=batch, test_fp8=True, TILE_M=32, TILE_N=64, run_count=0)
     # TODO: support fp8
