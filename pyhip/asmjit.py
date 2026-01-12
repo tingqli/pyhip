@@ -13,6 +13,8 @@ from .mem_allocator import SimpleMemoryAllocator
 import hashlib
 import subprocess
 
+import types
+
 def get_caller_loc():
     frame = inspect.currentframe().f_back.f_back
     loc = ""
@@ -775,6 +777,65 @@ class JIT:
         self.lds_allocator = SimpleMemoryAllocator(64*1024)
         self.special_vars = {}
         self.kernel_tag = kernel_tag
+        # sizeof mnemonics
+        self.sizeof_fp32 = 4
+        self.sizeof_DW = 4
+        self.sizeof_DW4 = 16
+        self.sizeof_fp32 = 4
+        self.sizeof_bf16 = 2
+        self.sizeof_fp16 = 2
+        self.sizeof_fp8 = 1
+        self.sizeof_bf8 = 1
+        # allows J.sizeof(dtype), dtype can be string or torch dtype
+        self._sizeof = {
+            "dw4" : 16,
+            "dwx4" : 16,
+            "DW4" : 16,
+            "DWx4" : 16,
+            "dwordx4":16,
+            "DWORDx4":16,
+
+            "f32" : 4,
+            "fp32" : 4,
+            "float" : 4,
+            "int" : 4,
+            "uint" : 4,
+            "DWORD" : 4,
+            "DW" : 4,
+            "s32": 4,
+            "u32": 4,
+
+            "bf16" : 2,
+            "bfloat16":2,
+            "fp16":2,
+            "float16":2,
+            "half":2,
+            "f16":2,
+            "s16": 2,
+            "u16": 2,
+
+            "s8": 1,
+            "u8": 1,
+
+            # https://rocm.docs.amd.com/projects/HIP/en/latest/reference/low_fp_types.html
+            "fp8" : 1,
+            "bf8" : 1,
+            # CDNA4/gfx950 : FP8-OCP (Open Compute Project)
+            # https://www.opencompute.org/documents/ocp-8-bit-floating-point-specification-ofp8-revision-1-0-2023-12-01-pdf-1
+            #   torch.float8_e4m3fn:1,
+            #   torch.float8_e5m2:1,
+            # CDNA3/gfx940 : FP8-FNUZ (Finite and NaN Only, no Inf support)
+            #  there is a 2 scaling factor between :
+            #    fp8/float8_e4m3fnuz & bf8/float8_e5m2fnuz
+            # torch.float8_e4m3fnuz:1,
+            # torch.float8_e5m2fnuz:1,
+        }
+
+    def sizeof(self, dtype):
+        if isinstance(dtype ,str):
+            return self._sizeof[dtype]
+        # assume it's torch dype
+        return dtype.itemsize
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -2784,6 +2845,30 @@ r'''
 
     def round_up(self, x, y):
         return self.div_up(x, y) * y
+
+    """
+    def compute_generator():
+        yield 16 # yield the cycles following instruction is going to take
+        J.v_mfma
+    
+    gen = compute_generator()
+    J.emit(gen, 32)         # emit instructions which consume 32 cycles
+
+    """
+    def emit(self, generators, cycles:int=99999999):
+        # canonicalize generators a list/tuple of generators
+        if isinstance(generators, types.GeneratorType):
+            generators = (generators,)
+        while cycles > 0:
+            found = False
+            for g in generators:
+                yield_cycle = next(g, None)
+                if yield_cycle is not None:
+                    found = True
+                    break
+            if not found:
+                break
+            cycles -= yield_cycle
 
     def emitter(self, yield_cycle = 1):
         def emit(generators:list, cycles:int=99999999):
