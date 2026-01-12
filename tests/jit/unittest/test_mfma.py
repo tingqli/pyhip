@@ -17,7 +17,11 @@ def get_voffset(J, lane_rows, lane_cols, lane_bytes, stride_bytes):
     else:
         voffset = J.gpr((lane_id // lane_cols)*stride_bytes + (lane_id % lane_cols)*(lane_bytes))
     return voffset
-
+        # n_block_m = BM//32
+        # n_block_n = BN//32
+# matA = RegTile(J, (32*n_block_m, 16), (32,1), 8, torch.float16, strideAB_bytes)
+# matB = RegTile(J, (32*n_block_n, 16), (32,1), 8, torch.float16, strideAB_bytes)
+# matC0 = RegTile(J, (32*n_block_m, 32*n_block_n), (32,1), 4, torch.float, strideC_bytes)
 class RegTile:
     def __init__(self, J, shape, lane_layout, num_items, dtype, stride_bytes):
         """
