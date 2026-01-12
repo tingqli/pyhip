@@ -569,6 +569,14 @@ class Buffer:
             mod += f" offset:{offset12}"
         return self.J.buffer_load_dword(vdst, voffset, self.desc, soffset, mod=mod)
 
+    def load_ubyte(self, vdst, voffset, soffset, offset12=0):
+        # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
+        assert isinstance(offset12 , int) # must be compile time constant
+        mod = f"offen"
+        if offset12 > 0:
+            mod += f" offset:{offset12}"
+        return self.J.buffer_load_ubyte(vdst, voffset, self.desc, soffset, mod=mod)
+
     def store_dwordx4(self, vdata, voffset, soffset, offset12=0):
         # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
         assert isinstance(offset12 , int) # must be compile time constant

@@ -88,7 +88,7 @@ class amdhip_func:
     def __call__(self, gridDims:list[int], blockDims:list[int], *args, sharedMemBytes = 0, force_occupancy = 0):
         self.lazy_load_func()
         if force_occupancy > 0:
-            LDS_bytes = 64*1024
+            LDS_bytes = 160*1024
             sharedMemBytes = LDS_bytes//force_occupancy
         for i,a in enumerate(args):
             setattr(self.args, f"arg_{i}", a)
