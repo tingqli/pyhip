@@ -772,7 +772,7 @@ class JIT:
         self.mark_idx = 0
         self.debug_cond_sgpr = None
         self.debug_log_ptr = None
-        self.lds_allocator = SimpleMemoryAllocator(160*1024)
+        self.lds_allocator = SimpleMemoryAllocator(64*1024)
         self.special_vars = {}
         self.kernel_tag = kernel_tag
 
@@ -944,7 +944,7 @@ class JIT:
     Use this to set exec-mask to handle the tail/vari-SIMD-length problem
     '''
     @contextmanager
-    def ExecMask(self, cond:GPRExpr = None):
+    def ExecMask(self, cond:GPRExpr = None, early_skip = True):
         current_frame = inspect.currentframe()
         caller_frame = current_frame.f_back.f_back
         lineno = caller_frame.f_lineno
@@ -955,11 +955,12 @@ class JIT:
         self.SetMask("vcc", cond)
         exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
         self.s_and_saveexec_b64(exec_backup, "vcc") # scc = (exec!=0)
-        self.s_cbranch_execz(mod=label_end) # early skip
+        if early_skip: self.s_cbranch_execz(mod=label_end) # early skip
         try:
             yield # the body of computation with ExecMask
         finally:
-            self.Label(label_end)
+            if early_skip: 
+                self.Label(label_end)
             self.s_mov_b64("exec", exec_backup)
             # if we want to do something when execz happens, we can use scc0
 

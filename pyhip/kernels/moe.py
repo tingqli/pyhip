@@ -790,18 +790,11 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     lds_padding = (4 if vmem_lane_size == sizeof_DW else 8) * sizeof_bf16 # to avoid bank-conflict
     lds_width = num_mfma_n * 4 * mfma_MN * sizeof_bf16
     lds_stride = lds_width + lds_padding
-    lds = J.alloc_lds((num_mfma_m * mfma_MN) * (lds_stride))
 
     # WG level write C into LDS
     row = J.threadIdx.x % mfma_MN
     col = J.threadIdx.x // mfma_MN
     voff_c_lds_w = J.gpr(row * lds_stride + col * (4 * sizeof_bf16))
-    def ds_write_C(index):
-        for m in range(num_mfma_m):
-            for n in range(num_mfma_n):
-                offset = lds + m*mfma_MN*lds_stride + n*(4*mfma_MN*sizeof_bf16)
-                # suppose 4 fp32 in C[0:3] was already converted into packed bf16 and stored in C[0:1]
-                J.ds_write_b64(voff_c_lds_w, C[index, m, n, 0:1], mod=f"offset:{offset}")
 
     # WG level load C from LDS
     num_lanes_ldsr = J.div(lds_width, vmem_lane_size)
@@ -822,6 +815,9 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
         J.ds_read_b32(voff_vmem_row[i], row * 4, mod=f"offset:{lds_token_ids + i * num_rows_per_load * 4}")
 
     J.s_waitcnt(mod="lgkmcnt(0)")
+
+    lds = J.alloc_lds((num_mfma_m * mfma_MN) * (lds_stride))
+
     for m in range(num_mfma_m):
         v_weights[m,1] = v_weights[m,0]
 
@@ -830,13 +826,12 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
 
     temp_c = J.gpr(num_loads, vmem_lane_size//sizeof_DW, "vbf16x2")
 
-
     def loop_body(ni):
         J.s_waitcnt(mod=f"vmcnt({num_loads})")
 
         mfma1 = mfma_generator((ni+1)&1)
         B_loader = loadB_generator(ni&1)
-        
+
         #cvt_f32_to_pk_bf16(n&1)
         index = ni&1
         for m in range(num_mfma_m):
@@ -884,34 +879,21 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
             else:
                 assert vmem_lane_size == sizeof_DW
                 # the bigger the M is, the bigger the perf-diff is
-                with J.ExecMask(voff_vmem_row[i] < M[0]):
-                    #J.global_store_dword(voff_vmem[i], temp_c[i], pC)       # this is slightly slower than directly store  (49us)
+                with J.ExecMask(voff_vmem_row[i] < M[0], early_skip=False):
                     J.global_atomic_pk_add_bf16(voff_vmem[i], temp_c[i], pC) # this is much slower than directly store      (60us)
             emit_mfma([mfma1], 32)
 
         emit_mfma([mfma1])
         pC[:] += (4 * num_mfma_n * mfma_MN * sizeof_bf16) 
 
-        if 0:
-            vrow = J.gpr(2560, "vf32")
-            for i in range(len(vrow)):
-                J.v_exp_f32(vrow[i], vrow[i])
-            for i in range(len(vrow)):
-                J.v_exp_f32(vrow[i], vrow[i])
-
-    if 0:
-        for n in range(J.div(N, 4 * num_mfma_n * mfma_MN)):
-            loop_body(n)
-        return
-
     loop_i = J.gpr("su32")
     loop_i[0] = 0
     loop_cnt = J.div(N, 4 * num_mfma_n * mfma_MN)
+    J.s_waitcnt(mod=f"vmcnt(0)")
     with J.While(loop_i[0] < (loop_cnt//2)):
         loop_body(0)
         loop_body(1)
         loop_i[0] = loop_i[0] + 1
-
     if loop_cnt % 2:
         loop_body(0)
 
@@ -1112,21 +1094,22 @@ def moe_gemm_stage1(J:JIT,
             p_w_up_scale[:] += BLOCK_TILE_SIZE_N // 2 * sizeof_f32
 
     # be sure A_reg_gemm2 ready
-    # release LDS buffer 
-    #del lds_buff_out
-    lds_buff.free()
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
 
-    # gemm2
+    # release LDS buffer 
+    lds_buff.free()
     lds_weights = J.alloc_lds(256*4)
     lds_token_ids = J.alloc_lds(256*4)
 
-    J.ds_write_b32(J.threadIdx.x * 4, v_sorted_weights, mod=f"offset:{lds_weights}")
+    with J.ExecMask(J.threadIdx.x < BLOCK_TILE_SIZE_M):
+        J.ds_write_b32(J.threadIdx.x * 4, v_sorted_weights, mod=f"offset:{lds_weights}")
+
     with J.ExecMask(J.threadIdx.x < 16):
         for m in range(A_vert):
             J.ds_write_b32(J.lane_id * 4, v_sorted_id[m] & 0xffffff, mod=f"offset:{lds_token_ids + m*16*4}")
     J.s_waitcnt(mod=f"lgkmcnt(0)")
-
-
+    J.s_barrier()
+    # gemm2
     num_mfma_n = 2
     down_kernel(J, 16,
                 num_mfma_n, BLOCK_TILE_SIZE_M, N2, K2,
