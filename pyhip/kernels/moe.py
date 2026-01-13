@@ -1326,6 +1326,39 @@ def _run_aiter(hidden_states,
         quant_type=QuantType.No if w1.dtype == torch.bfloat16 else QuantType.per_Token
     )
 
+# https://github.com/huggingface/transformers/blob/1fed6166c00b800330fcda8494f78cbcad8e4e3b/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L235-L263
+def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids):
+    batch_size, hidden_dim = hidden_states.shape
+    E, N1, K1 = w1.shape
+    INTER_SIZE = N1 // 2
+    final_hidden_states = torch.zeros(
+        (batch_size, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+    )
+
+    # One hot encode the selected experts to create an expert mask
+    # this will be used to easily index which expert is going to be sollicitated
+    expert_mask = torch.nn.functional.one_hot(topk_ids.to(dtype=torch.long), num_classes=E).permute(2, 1, 0)
+
+    # Loop over all available experts in the model and perform the computation on each expert
+    for expert_idx in range(E):
+        def expert_forward(n, x):
+            gate_proj = w1[n, 0 : INTER_SIZE].t()
+            up_proj = w1[n, INTER_SIZE :,].t()
+            down_proj = w2[n].t()
+            return (torch.nn.functional.silu(x @ gate_proj) * (x @ up_proj)) @ down_proj
+        idx, top_x = torch.where(expert_mask[expert_idx])
+
+        # Index the correct hidden states and compute the expert hidden state for
+        # the current expert. We need to make sure to multiply the output hidden
+        # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+        current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+        current_hidden_states = expert_forward(expert_idx, current_state) * topk_weight[top_x, idx, None]
+
+        # However `index_add_` only support torch tensors for indexing so we'll use
+        # the `top_x` tensor here.
+        final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+    return final_hidden_states
+
 def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10):
     HIDDEN_SIZE = 2048
     TP = 4
@@ -1339,8 +1372,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
     if weight_type == torch.bfloat16:
         w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=weight_type)
+        w1_ref = w_
         w1 = [w_.clone() for _ in range(BUF_COPY)]
         w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=weight_type)
+        w2_ref = w_
         w2 = [w_.clone() for _ in range(BUF_COPY)]
         w1_scale = [None] * BUF_COPY
         w2_scale = [None] * BUF_COPY
@@ -1349,10 +1384,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         torch_quant = aiter.get_torch_quant(aiter.QuantType.per_Token)
         w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
         w1_qt, w1_qt_scale = torch_quant(w_, quant_dtype=weight_type)
+        w1_ref = (w1_qt.to(dtype=torch.bfloat16) * w1_qt_scale).to(dtype=torch.bfloat16)
         w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
         w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
         w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
         w2_qt, w2_qt_scale = torch_quant(w_, quant_dtype=weight_type)
+        w2_ref = (w2_qt.to(dtype=torch.bfloat16) * w2_qt_scale).to(dtype=torch.bfloat16)
         w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
         w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
 
@@ -1489,7 +1526,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     else:
         w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
-        ref_out = _run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
+        ref_out = get_torch_ref(hidden_states=hidden_states[0], w1=w1_ref, w2=w2_ref, topk_weight=topk_weight[0], topk_ids=topk_ids[0])
         cur_out = run(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
         for _ in range(run_count):
