@@ -1550,6 +1550,13 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
                 'bw': sum(bw[1:]) / len(bw[1:])}                               # GB/s
 
+def is_arch_type(arch):
+    props = torch.cuda.get_device_properties()
+    return arch in props.gcnArchName
+
+def get_fp8type():
+    return torch.float8_e4m3fn if is_arch_type('950') else torch.float8_e4m3fnuz
+
 # special path for batch1 
 def entry_b1(test_fp8=True, run_count=10):
     kernel_type = '16x32_2s_b1'
@@ -1561,7 +1568,7 @@ def entry_b1(test_fp8=True, run_count=10):
     perf[kernel_type]['bf16'] = perf_bf16
     if test_fp8:
         perf_fp8 = {}
-        perf_fp8[1] = _run_batch(kernel_type, B=1, weight_type=torch.float8_e4m3fnuz, run_count=run_count)
+        perf_fp8[1] = _run_batch(kernel_type, B=1, weight_type=get_fp8type(), run_count=run_count)
         perf[kernel_type]['fp8'] = perf_fp8
     return perf
 
@@ -1576,7 +1583,7 @@ def entry_common(kernel_type, batch, test_fp8=True, TILE_M=None, TILE_N=None, ru
     if test_fp8:
         perf_fp8 = {}
         for i in batch: 
-            perf_fp8[i] = _run_batch(kernel_type, B=i, weight_type=torch.float8_e4m3fnuz, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count)
+            perf_fp8[i] = _run_batch(kernel_type, B=i, weight_type=get_fp8type(), TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count)
         perf[kernel_type]['fp8'] = perf_fp8
     
     return perf
@@ -1616,7 +1623,7 @@ def show_perf(perf):
 def test_small_batch_perf(batch):
     init_env()
     perf = {}
-    perf.update(entry_common('aiter', batch))
+    perf.update(entry_common('aiter', batch, test_fp8=is_arch_type('942')))
     # fix TILE_M=16, TILE_N=32
     perf.update(entry_b1())           # batch 1
     perf.update(entry_common('16x32_2s_b', batch=batch, test_fp8=True))
