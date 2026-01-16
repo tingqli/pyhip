@@ -2,7 +2,7 @@ from functools import cache
 from typing import List, Optional, Set, Union
 
 import filelock
-from .hiptools import module
+from .hiptools import module, amdgpu_arch
 import inspect
 import os
 from contextlib import contextmanager
@@ -31,6 +31,59 @@ def get_git_revision_hash() -> str:
     except Exception as e:
         print(f'warning: get git revision error: {e}')
         return 'unknown'
+
+@cache
+def _utils_dst_operand_id(opcode, mod):
+    if opcode.startswith("buffer_load_") and "lds" in mod:
+        return -1
+    if opcode.startswith("ds_write") or \
+        opcode.startswith("global_store") or \
+        opcode.startswith("global_load_lds_") or \
+        opcode.startswith("flat_store_") or \
+        opcode.startswith("scratch_load_lds_") or \
+        opcode.startswith("buffer_store_"):
+        return -1
+    return 0
+
+@cache
+def _utils_is_trans_op(opcode):
+    return opcode[:6] in ["v_exp_","v_log_","v_rcp_","v_rsq_","v_sqrt","v_sin_","v_cos_"]
+
+@cache
+def _utils_is_simple_operand0_store(opcode, mod):
+    '''
+      simple operand0_store :
+        - operands[0] is the only state-change of this instruction
+        - no other side-effect other than store to 1st op
+    '''
+    if opcode.startswith("s_load_"):
+        return True
+    elif opcode.startswith("s_scratch_load_"):
+        return True
+    elif opcode.startswith("s_buffer_load"):
+        return True
+    elif opcode.startswith("ds_read"):
+        return True
+    elif opcode.startswith("flat_load_"):
+        return True
+    elif opcode.startswith("global_load_") and (not opcode.startswith("global_load_lds_")):
+        return True
+    elif opcode.startswith("tbuffer_load_"):
+        return True
+    elif opcode.startswith("buffer_load_") and ("lds" not in mod):
+        return True
+    elif opcode.startswith("scratch_load_") and (not opcode.startswith("scratch_load_lds_")):
+        return True
+    elif opcode.startswith("ds_swizzle_"):
+        return True
+    elif opcode.startswith("ds_permute_") or opcode.startswith("ds_bpermute_"):
+        return True
+    elif opcode.startswith("ds_consume"):
+        return True
+    elif opcode.startswith("ds_") and ("_rtn_" in opcode):
+        return True
+
+    return False
 
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
@@ -77,45 +130,14 @@ class Instruction:
     def isVALU(self):
         return self.opcode.startswith("v_")
 
+    def dst_operand_id(self):
+        return _utils_dst_operand_id(self.opcode, self.mod)
+
     def is_simple_operand0_store(self):
-        # simple operand0_store :
-        #   - operands[0] is the only state-change of this instruction
-        #   - no other side-effect other than store to 1st op
-        if getattr(self, "_is_simple_operand0_store", None) is None:
-            opcode = self.opcode
-            mod = self.mod
-            if opcode.startswith("s_load_"):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("s_scratch_load_"):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("s_buffer_load"):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("ds_read"):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("flat_load_"):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("global_load_") and (not opcode.startswith("global_load_lds_")):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("tbuffer_load_"):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("buffer_load_") and ("lds" not in mod):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("scratch_load_") and (not opcode.startswith("scratch_load_lds_")):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("ds_swizzle_"):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("ds_permute_") or opcode.startswith("ds_bpermute_"):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("ds_consume"):
-                self._is_simple_operand0_store = True
-            elif opcode.startswith("ds_") and ("_rtn_" in opcode):
-                self._is_simple_operand0_store = True
-            else:
-                self._is_simple_operand0_store = False
-        return self._is_simple_operand0_store
+        return _utils_is_simple_operand0_store(self.opcode, self.mod)
 
     def isTransOp(self):
-        return self.opcode[:6] in ["v_exp_","v_log_","v_rcp_","v_rsq_","v_sqrt","v_sin_","v_cos_"]
+        return _utils_is_trans_op(self.opcode)
 
     def op_repr(self, op):
         if isinstance(op, str):
@@ -334,7 +356,7 @@ class GPRExpr:
 # may not physically continous
 class GPRs:
 
-    def __init__(self, jit, rtype, start_id, count, dtype, align=0, name=""):
+    def __init__(self, jit, rtype, start_id, count, dtype, align=0, name="", is_fixed=False):
         self.jit = jit
         self.rtype = rtype
         self.start_id = start_id
@@ -342,6 +364,7 @@ class GPRs:
         self.align = align
         self.dtype = dtype
         self.name = name # for debugging purpose only
+        self.is_fixed = is_fixed
         self.set_shape([count]) # default shape: 1D
 
     def set_shape(self, shape):
@@ -615,6 +638,14 @@ class Buffer:
             mod += f" offset:{offset12}"
         return self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
 
+    def store_dwordx2(self, vdata, voffset, soffset, offset12=0):
+        # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
+        assert isinstance(offset12 , int) # must be compile time constant
+        mod = f"offen"
+        if offset12 > 0:
+            mod += f" offset:{offset12}"
+        return self.J.buffer_store_dwordx2(vdata, voffset, self.desc, soffset, mod=mod)
+
     def load_dword_lds(self, voffset, soffset, offset12=0):
         mod = f"offen"
         if offset12 > 0:
@@ -780,6 +811,7 @@ class JIT:
         # sizeof mnemonics
         self.sizeof_fp32 = 4
         self.sizeof_DW = 4
+        self.sizeof_DW2 = 8
         self.sizeof_DW4 = 16
         self.sizeof_fp32 = 4
         self.sizeof_bf16 = 2
@@ -830,6 +862,7 @@ class JIT:
             # torch.float8_e4m3fnuz:1,
             # torch.float8_e5m2fnuz:1,
         }
+        self.arch = amdgpu_arch()
 
     def sizeof(self, dtype):
         if isinstance(dtype ,str):
@@ -1139,7 +1172,7 @@ class JIT:
             count = count_range
             start_id = self._align_up(self.free_gpr_id[reg_type], align)
             self.free_gpr_id[reg_type] = start_id + count
-            gprs = GPRs(self, reg_type, start_id, count, dtype=dtype, align=align, name=name)
+            gprs = GPRs(self, reg_type, start_id, count, dtype=dtype, align=align, name=name, is_fixed=False)
             self.relocatable_gprs.append(gprs)
             return gprs
         elif isinstance(count_range, tuple) or isinstance(count_range, list):
@@ -1149,7 +1182,7 @@ class JIT:
             assert self.free_gpr_id[reg_type] <= first_id, "specified reg has been allocated"
             assert self.free_gpr_id[reg_type] <= last_id, "specified reg has been allocated"
             self.free_gpr_id[reg_type] = last_id + 1
-            gprs = GPRs(self, reg_type, first_id, last_id - first_id + 1, dtype=dtype, align=align, name=name)
+            gprs = GPRs(self, reg_type, first_id, last_id - first_id + 1, dtype=dtype, align=align, name=name, is_fixed=True)
             self.fixed_gprs.append(gprs)
             return gprs
         else:
@@ -1294,8 +1327,9 @@ class JIT:
         # go through all instructions and collect real adjacency requirements.
         # these adjacency requirements help to break GPRs into smaller pieces
         class GPRparts:
-            def __init__(self):
+            def __init__(self, name):
                 self.parts = []
+                self.name = name
             def update(self, first, last, loc):
                 merged_parts = []
                 merged_locs = [loc]
@@ -1326,14 +1360,14 @@ class JIT:
                     last = op.src2
                     if op.src0.count == 1 or op.src0.rtype == 's': continue
                     if gprs not in gpr_parts:
-                        gpr_parts[gprs] = GPRparts()
+                        gpr_parts[gprs] = GPRparts(op.src0.name)
                     gpr_parts[gprs].update(first, last, (bid,iid,oid))
 
         for k,parts in gpr_parts.items():
             if len(parts.parts) == 1: continue
             #print("#### ", k)
             for first, last, locs in parts.parts:
-                gprs = self.gpr(last-first+1, k[0]+"u32")
+                gprs = self.gpr(last-first+1, k[0]+"u32", name=f"{parts.name}[{first}:{last}]")
                 #print(first, last, locs)
                 for bid,iid,oid in locs:
                     inst = self.blocks[bid].instructions[iid]
@@ -1366,24 +1400,17 @@ class JIT:
 
         # find live-intervals of gprs in `relocatable_gprs`
         live_intervals = {}
-        bb_access_gprs = {}
         for bb in self.blocks:
-            bb_access_gprs[bb] = []
             for inst in bb.instructions:
                 # inst.sid
                 for op in inst.operands:
-                    if isinstance(op, GPRExpr):
-                        gprs = op.src0
-                    else:
-                        continue
-                    if gprs in self.fixed_gprs:
-                        continue
-                    assert gprs in self.relocatable_gprs
+                    if not isinstance(op, GPRExpr): continue
+                    gprs = op.src0
+                    if gprs.is_fixed: continue
                     if gprs not in live_intervals:
                         live_intervals[gprs] = [inst.sid, inst.sid]
                     live_intervals[gprs][0] = min(live_intervals[gprs][0], inst.sid)
                     live_intervals[gprs][1] = max(live_intervals[gprs][1], inst.sid)
-                    bb_access_gprs[bb].append(gprs)
 
         # extend live-interval of gprs within loop
         # if jump to bb with higher sid, then we don't need to handle since interval logic works fine
@@ -1430,15 +1457,19 @@ class JIT:
             event_list.append((last_sid, 1, repr(gprs), gprs)) # 1 means last-use
 
         # linear_scan all events according to time
-        reg_resource = {"s":[0 for _ in range(103)],
+        reg_resource = {"s": [0 for _ in range(103)],
                         "v": [0 for _ in range(256)],
                         "a": [0 for _ in range(256)]}
+        gpr_used = {"s": [0 for _ in range(103)],
+                    "v": [0 for _ in range(256)],
+                    "a": [0 for _ in range(256)]}
         # reserve fixed gprs
         for gprs in self.fixed_gprs:
             i0 = gprs.start_id
             i1 = gprs.start_id + gprs.count
             reg_resource[gprs.rtype][i0:i1] = [1]*gprs.count
-        
+            gpr_used[gprs.rtype][i0:i1] = [1]*gprs.count
+
         '''
         self.rtype = rtype
         self.start_id = start_id
@@ -1481,12 +1512,13 @@ class JIT:
                     gprs.sid = sid
                     slots[i:(i+count)] = [1]*count # mark as used
                     alive_gprs.append(gprs)
+                    gpr_used[rtype][i:(i+count)] = [1]*count
                     return
             # summary for diagnose GPR overflow issue
             summary = gpr_usage() + "\n"
             for g in alive_gprs:
                 summary += f"\t{str(g.count):5s} {g.rtype}GPRs  {repr(g):15s} {g.name:20s}  {inst_list[g.sid].loc}\n"
-            assert 0, f"cannot allocate '{gprs.name}'  {rtype}GPRs x {count} {align=}, not enough resource:\n {summary}"
+            assert 0, f"{inst_list[sid].loc} cannot allocate '{gprs.name}'  {rtype}GPRs x {count} {align=}, not enough resource:\n {summary}"
 
         def free_gpr(gprs):
             rtype = gprs.rtype
@@ -1533,7 +1565,13 @@ class JIT:
                     else:
                         debug_info += f"{op},"
                 inst.debug_info = debug_info
-        return
+
+        used_gprs = []
+        for rtype in gpr_used:
+            for i, cnt in enumerate(gpr_used[rtype]):
+                if cnt > 0:
+                    used_gprs.append(f"{rtype}{i}")
+        return used_gprs
 
     def is_iconst(self, i):
         return isinstance(i, int) and (i >= -16) and (i <= 64)
@@ -2370,35 +2408,24 @@ class JIT:
         #   - accessed by 1 BB only
         #   - being read after written
         #
-        def vdst_operand_id(inst):
-            opcode = inst.opcode
-            mod = inst.mod
-            if opcode.startswith("buffer_load_") and "lds" in mod:
-                return -1
-            if opcode.startswith("ds_write") or \
-                opcode.startswith("global_store") or \
-                opcode.startswith("global_load_lds_") or \
-                opcode.startswith("flat_store_") or \
-                opcode.startswith("scratch_load_lds_") or \
-                opcode.startswith("buffer_store_"):
-                return -1
-            return 0
-
         gpr_info = {}
         for bb_id, bb in enumerate(self.blocks):
             for t, inst in enumerate(bb.instructions):
-                vdst_index = vdst_operand_id(inst)
+                vdst_index = inst.dst_operand_id()
                 for index, gpr in enumerate(inst.operands):
-                    if is_gpr(gpr):
+                    if isinstance(gpr, GPRExpr):
                         for i, r in enumerate(gpr):
                             key = repr(r)
                             if key not in gpr_info:
-                                gpr_info[key] = {"wr":"","location":list()}
-                            gpr_info[key]["location"].append((bb_id, t, index))
-                            if index == vdst_index:
-                                gpr_info[key]["wr"] += "w"
+                                info = {"wr":"","location":list()}
+                                gpr_info[key] = info
                             else:
-                                gpr_info[key]["wr"] += "r"
+                                info = gpr_info[key]
+                            info["location"].append((bb_id, t, index))
+                            if index == vdst_index:
+                                info["wr"] += "w"
+                            else:
+                                info["wr"] += "r"
         ssa_gpr = []
         for k,info in gpr_info.items():
             wr = info["wr"]
@@ -2413,7 +2440,7 @@ class JIT:
         # TODO: if some ssa gpr also only depends on ssa gpr(like threadIdx.x),
         # it means their value can exist across BB boundary
 
-        self.log("pass_cse: ", f"{ssa_gpr=}")
+        self.debug_print("pass_cse: ", f"{ssa_gpr=}")
         # we limited CSE to following instructions because they are used by recursive expression generation.
         # Result of these instructions can be reused w/o worry about side-effect.
         # but any other instructions, although cannot be elimited, may update registers holding the reusable value,
@@ -2459,7 +2486,6 @@ class JIT:
         global replace_index
         CSE_LIMIT = int(os.getenv("CSE_LIMIT", "999999"))
         for bb in self.blocks:
-
             reg_2_value_version = {}
             value_table = {}
 
@@ -2533,7 +2559,7 @@ class JIT:
                 if len(inst.operands) == 0: continue
                 # instruction may have multiple vdst/vsrc: v[4:7]
                 dst = inst.operands[0]
-                if isinstance(dst, GPRExpr) or isinstance(dst, GPRs):
+                if isinstance(dst, GPRExpr):
                     # Why "rw" instead of just "w" ?
                     # we cannot be 100% sure that first operand is dst,
                     # it may be a src too, let's be conservative
@@ -2541,7 +2567,7 @@ class JIT:
                         add_reg_access(r, t, "rw")
 
                 for src in inst.operands[1:]:
-                    if isinstance(src, GPRExpr) or isinstance(src, GPRs):
+                    if isinstance(src, GPRExpr):
                         for r in src:
                             add_reg_access(r, t, "r")
 
@@ -2554,64 +2580,70 @@ class JIT:
                 #       v3 = v1+v0; <===== this is not the same as v2
                 # 
                 if len(inst.operands) == 0: continue
-                vdst = inst.operands[0]
-                if not is_gpr(vdst):
+                vdsts = inst.operands[0]
+                if not isinstance(vdsts, GPRExpr):
                     continue
-
-                # invalidate previous value this vdst is holding
-                for k in list(value_table.keys()):
-                    v, version = value_table[k]
-                    if v is vdst and version < cur_version:
-                        del value_table[k]
-
-                cur_version = inc_value_version(vdst)
+                
+                # maintain a value version number for each vgpr instance
+                is_valid_gpr = True
+                for dst_gpr in vdsts:
+                    is_valid_gpr = is_valid_gpr and (repr(dst_gpr) in ssa_gpr)
+                    cur_version = inc_value_version(dst_gpr)
+                    # invalidate previous value this vdst is holding
+                    for k in list(value_table.keys()):
+                        v, version = value_table[k]
+                        if v is dst_gpr and version < cur_version:
+                            del value_table[k]
 
                 # all dst gprs must be valid (only written once)
-                is_valid_gpr = all([repr(r) in ssa_gpr for r in vdst])
-                if is_cse_inst(inst) and is_valid_gpr:
+                if is_valid_gpr and is_cse_inst(inst) :
                     # this key includes opcode & all input-values & modifiers
                     src_ops = []
                     for op in inst.operands[1:]:
-                        op_name = str(inst.op_repr(op))
-                        if is_gpr(op):
-                            op_name += "." + str(get_value_version(op))
+                        if isinstance(op, GPRExpr):
+                            op_name = ""
+                            for v in op:
+                                op_name += repr(v) + "." + str(get_value_version(v)) + ";"
+                        else:
+                            op_name = str(inst.op_repr(op))
                         src_ops.append(op_name)
                     # the dependent inputs are versioned, to avoid mismatches when some inputs
                     # may be updated with new value.
-                    key = f"{inst.opcode} {','.join(src_ops)} {inst.mod}"
-                    if key not in value_table:
-                        # first time a reusable value is generated in versioned vdst
-                        value_table[key] = [vdst, cur_version]
-                    else:
-                        vexist, version = value_table[key]
-                        if repr(vexist) in ssa_gpr and replace_index < CSE_LIMIT:
-                            if can_replace_vdst_with_exist_global(vdst):
-                                removed_insts.append(t)
-                                if debug_enabled:
-                                    print(f"===========  {replace_index} / {CSE_LIMIT=} ")
-                                    print(t, inst.loc, inst.debug_info, inst)
-                                    print(f"{vdst} replaced with  {vexist} {key} globally")
-                                replace_vdst_with_exist_global(vdst, vexist)
-                        else:
-                            # can we safely use this existing value?
-                            # we need to check life-cycle requirements:
-                            #   the last read from vdst happens before the next update(write) to vexist
-                            t_last_read = reg_access_last_read_from(vdst, t)
-                            t_next_update = reg_access_next_write_to(vexist, t)
-                            if debug_enabled:
-                                print(f"===========  {replace_index} / {CSE_LIMIT=} ", 
-                                    (t_next_update > t_last_read) and (replace_index < CSE_LIMIT))
-                                print(t, inst.loc, inst.debug_info, inst)
-                                print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
-                                print(f"{reg_accesses[repr(vdst)]}")
-                            if t_next_update > t_last_read and replace_index < CSE_LIMIT:
-                                removed_insts.append(t)
-                                replace_vdst_with_exist(t + 1, t_last_read, vdst, vexist)
+                    for idst,vdst in enumerate(vdsts):
+                        key = f"{inst.opcode} {','.join(src_ops)} {inst.mod} [{idst}]"
+                        if key not in value_table:
+                            # first time a reusable value is generated in versioned vdst
+                            value_table[key] = [vdst, cur_version]
+                        elif len(vdsts) == 1:
+                            vexist, version = value_table[key]
+                            if repr(vexist) in ssa_gpr and replace_index < CSE_LIMIT:
+                                if can_replace_vdst_with_exist_global(vdst):
+                                    removed_insts.append(t)
+                                    if debug_enabled:
+                                        print(f"===========  {replace_index} / {CSE_LIMIT=} ")
+                                        print(t, inst.loc, inst.debug_info, inst)
+                                        print(f"{vdst} replaced with  {vexist} {key} globally")
+                                    replace_vdst_with_exist_global(vdst, vexist)
                             else:
-                                # we cannot safely reuse vexist, optionally we can add another vexist
-                                # so others may benefit
-                                pass
-                        replace_index += 1
+                                # can we safely use this existing value?
+                                # we need to check life-cycle requirements:
+                                #   the last read from vdst happens before the next update(write) to vexist
+                                t_last_read = reg_access_last_read_from(vdst, t)
+                                t_next_update = reg_access_next_write_to(vexist, t)
+                                if debug_enabled:
+                                    print(f"===========  {replace_index} / {CSE_LIMIT=} ", 
+                                        (t_next_update > t_last_read) and (replace_index < CSE_LIMIT))
+                                    print(t, inst.loc, inst.debug_info, inst)
+                                    print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
+                                    print(f"{reg_accesses[repr(vdst)]}")
+                                if t_next_update > t_last_read and replace_index < CSE_LIMIT:
+                                    removed_insts.append(t)
+                                    replace_vdst_with_exist(t + 1, t_last_read, vdst, vexist)
+                                else:
+                                    # we cannot safely reuse vexist, optionally we can add another vexist
+                                    # so others may benefit
+                                    pass
+                            replace_index += 1
 
             # Eliminate
             bb.instructions = [inst for t,inst in enumerate(bb.instructions) if t not in removed_insts]
@@ -2693,6 +2725,8 @@ class JIT:
         self.dump_code(f"after_pass_hide_karg_loads")
 
         # Common Subexpression Elimination，CSE
+        #from viztracer import VizTracer
+        #with VizTracer(output_file="optional.json") as tracer:
         self.pass_cse()
         self.dump_code(f"after_pass_cse")
 
@@ -2708,7 +2742,7 @@ class JIT:
         self.dump_code(f"after_pass_break_down_gprs")
 
         # for bb in self.blocks: print(repr(bb))
-        self.register_allocation_linear_scan()
+        used_gprs = self.register_allocation_linear_scan()
         self.dump_code(f"after_reg_allocation")
 
         # generate asm: basic blocks are in natural order
@@ -2745,11 +2779,11 @@ class JIT:
             print(color0)
             print(self.asm_debug_info)
             print(color1)
-        used_gprs = []
         artifact = {"asm":[]}
         for a in asm.splitlines():
             if a[0] == ";": continue
             artifact["asm"].append(a)
+            """
             for op in a.replace(","," ").split()[1:]:
                 if (op.startswith("s") or op.startswith("v") or op.startswith("a")) and (op[1].isdigit()):
                     gpr_type = op[0]
@@ -2763,6 +2797,7 @@ class JIT:
                     for idx in range(idx0, idx1 + 1):
                         str_gpr = f"{gpr_type}{idx}"
                         if str_gpr not in used_gprs: used_gprs.append(str_gpr)
+            """
         '''
         str_arg_c_del = ",".join([f"{a[0]} {a[1]}" for a in args])
         signature = f"{kernel_name}({str_arg_c_del})"
@@ -3036,6 +3071,19 @@ r'''
 
     def silu(self, vgpr_src):
         return self.gpr(self.sigmoid(vgpr_src) * vgpr_src)
+
+
+    # a unified instruction for f32=>bf16 conversion
+    def uni_cvt_pk_bf16_f32(self, vdst, vsrc0, vsrc1):
+        if "gfx950" in self.arch:
+            return self.v_cvt_pk_bf16_f32(vdst, vsrc0, vsrc1)
+        else:
+            # this is simple but less accurate, no round to even
+            s_cvt_bf16_bias = self.get_sgpr_const(0x00008000)
+            return self.v_perm_b32(vdst,
+                                   vsrc0 + s_cvt_bf16_bias,
+                                   vsrc1 + s_cvt_bf16_bias,
+                                   self.get_sgpr_const(0x03_02_07_06))
 
     def pk_f32_to_bf16(self, vdst, vsrc0, vsrc1):
         self.v_perm_b32(vdst, vsrc0, vsrc1, self.get_sgpr_const(0x03_02_07_06))
