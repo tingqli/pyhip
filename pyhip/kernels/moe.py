@@ -1315,6 +1315,12 @@ def _run_aiter(hidden_states,
             ):
     from aiter.fused_moe import fused_moe
     from aiter import QuantType
+    if w1.dtype == torch.float4_e2m1fn_x2:
+        quant_type = QuantType.per_1x32
+    elif w1.dtype == torch.bfloat16:
+        quant_type = QuantType.No
+    else:
+        quant_type = QuantType.per_Token
     return fused_moe(
         hidden_states,
         w1,
@@ -1323,7 +1329,7 @@ def _run_aiter(hidden_states,
         topk_ids,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        quant_type=QuantType.No if w1.dtype == torch.bfloat16 else QuantType.per_Token
+        quant_type=quant_type
     )
 
 # https://github.com/huggingface/transformers/blob/1fed6166c00b800330fcda8494f78cbcad8e4e3b/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L235-L263
@@ -1359,14 +1365,7 @@ def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids):
         final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
     return final_hidden_states
 
-def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10):
-    HIDDEN_SIZE = 2048
-    TP = 4
-    INTER_SIZE = 768
-    TP = 8
-    INTER_SIZE = 1024
-    E = 128
-    TOPK = 8
+def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8):
     INTER_SIZE_TP = INTER_SIZE // TP
     BUF_COPY = 32
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
@@ -1379,6 +1378,25 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w2 = [w_.clone() for _ in range(BUF_COPY)]
         w1_scale = [None] * BUF_COPY
         w2_scale = [None] * BUF_COPY
+    elif weight_type == torch.float4_e2m1fn_x2:
+        import aiter
+        from aiter.utility import fp4_utils
+        w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
+        w1_qt, w1_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
+        w1_f32 = fp4_utils.mxfp4_to_f32(w1_qt).to(dtype=torch.bfloat16).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE // 32, 32)
+        w1_scale_f32 = fp4_utils.e8m0_to_f32(w1_qt_scale_).to(dtype=torch.bfloat16).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE // 32, 1)
+        w1_ref = (w1_f32 * w1_scale_f32).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE)
+        w1_qt_scale = fp4_utils.e8m0_shuffle(w1_qt_scale_)
+        w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
+        w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
+        w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
+        w2_qt, w2_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
+        w2_f32 = fp4_utils.mxfp4_to_f32(w2_qt).to(dtype=torch.bfloat16).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP // 32, 32)
+        w2_scale_f32 = fp4_utils.e8m0_to_f32(w2_qt_scale_).to(dtype=torch.bfloat16).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP // 32, 1)
+        w2_ref = (w2_f32 * w2_scale_f32).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP)
+        w2_qt_scale = fp4_utils.e8m0_shuffle(w2_qt_scale_)
+        w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
+        w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
     else:
         import aiter
         torch_quant = aiter.get_torch_quant(aiter.QuantType.per_Token)
@@ -1481,6 +1499,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                cur_out.data_ptr(), 
                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
         elif kernel_type == 'mxn_2s':
+            assert weight_type == torch.bfloat16, f'mxn_2s only support bfloat16, but got {weight_type}'
             # test moe_gemm_batch_vmn: 2 stages, m/n can be set
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
                 topk_ids,
@@ -1493,14 +1512,44 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 None,
                 0,
             )
-            BLOCK_TILE_SIZE_M = TILE_M
-            BLOCK_TILE_SIZE_N = TILE_N
-            moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
-                               w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                               hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-            moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
-                             w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                             gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+            if weight_type == torch.float4_e2m1fn_x2:
+                # if B <= 1024:
+                #     a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
+                #         hidden_states,
+                #         sorted_ids=sorted_ids,
+                #         num_valid_ids=num_valid_ids,
+                #         token_num=token_num,
+                #         topk=1,
+                #         block_size=block_size_M,
+                #     )
+                # else:
+                from aiter import get_hip_quant as get_quant
+                from aiter.utility.fp4_utils import moe_mxfp4_sort
+                quant_func = get_quant(aiter.QuantType.per_1x32)
+                hidden_states_q, hidden_states_scale = quant_func(
+                    hidden_states,
+                    scale=None,
+                    quant_dtype=torch.float4_e2m1fn_x2,
+                    num_rows=None,
+                )
+                # TODO: it seems assume using 8(x32)blocks
+                hidden_states_scale = moe_mxfp4_sort(
+                    hidden_states_scale,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=B,
+                    block_size=TILE_M,
+                )
+                # TODO: call kernel
+            else:
+                BLOCK_TILE_SIZE_M = TILE_M
+                BLOCK_TILE_SIZE_N = TILE_N
+                moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
+                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
+                moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
+                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
 
             # BLOCK_TILE_SIZE_N = 64
             # moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
@@ -1558,33 +1607,25 @@ def get_fp8type():
     return torch.float8_e4m3fn if is_arch_type('950') else torch.float8_e4m3fnuz
 
 # special path for batch1 
-def entry_b1(test_fp8=True, run_count=10):
+def entry_b1(prec=[torch.bfloat16], run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8):
     kernel_type = '16x32_2s_b1'
     perf = {}
     perf[kernel_type] = {}
-    perf_bf16 = {}
+    perf_prec = {}
 
-    perf_bf16[1] = _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, run_count=run_count)
-    perf[kernel_type]['bf16'] = perf_bf16
-    if test_fp8:
-        perf_fp8 = {}
-        perf_fp8[1] = _run_batch(kernel_type, B=1, weight_type=get_fp8type(), run_count=run_count)
-        perf[kernel_type]['fp8'] = perf_fp8
+    for weight_type in prec:
+        perf_prec[1] = _run_batch(kernel_type, B=1, weight_type=weight_type, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP)
+        perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, test_fp8=True, TILE_M=None, TILE_N=None, run_count=10):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=None, TILE_N=None, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8):
     perf = {}
     perf[kernel_type] = {}
-    perf_bf16 = {}
-    for i in batch:
-        perf_bf16[i] = _run_batch(kernel_type, B=i, weight_type=torch.bfloat16, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count)
-    perf[kernel_type]['bf16'] = perf_bf16
-
-    if test_fp8:
-        perf_fp8 = {}
-        for i in batch: 
-            perf_fp8[i] = _run_batch(kernel_type, B=i, weight_type=get_fp8type(), TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count)
-        perf[kernel_type]['fp8'] = perf_fp8
+    for weight_type in prec:
+        perf_prec = {}
+        for i in batch:
+            perf_prec[i] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP)
+        perf[kernel_type][str(weight_type)] = perf_prec
     
     return perf
 
@@ -1595,22 +1636,23 @@ def init_env():
 
 def test_acc():
     init_env()
-    #entry_common('mxn_splitk_2s', batch=[8192], test_fp8=False, TILE_M=32, TILE_N=64, run_count=0)
+    #entry_common('aiter', batch=[8192], prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, run_count=2, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8)
+    entry_common('mxn_2s', batch=[8192], prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, run_count=0, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8)
     #entry_common('mxn_2s', batch=[8192], test_fp8=False, TILE_M=128, TILE_N=128, run_count=0)
     #assert 0,"========================"
     batch = list(range(2, 64))
     # fix TILE_M=16, TILE_N=32
-    entry_b1(run_count=0)
-    entry_common('16x32_2s_b', batch=batch, test_fp8=True, run_count=0)
+    entry_b1(run_count=0, prec=[torch.bfloat16, get_fp8type()])
+    entry_common('16x32_2s_b', batch=batch, prec=[torch.bfloat16, get_fp8type()], run_count=0)
     batch += list(range(128, 256))
     batch += [i * 256 for i in range(1, 4)]
     batch += [i * 2048 for i in range(1, 5)]
     batch += list(range(2048 * 3, 2048 * 3 + 256))
     # TILE_M/N is configurable
-    entry_common('mxn_splitk_2s', batch=batch, test_fp8=True, TILE_M=32, TILE_N=64, run_count=0)
+    entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=32, TILE_N=64, run_count=0)
     # TODO: support fp8
-    entry_common('mxn_splitk_1s', batch=batch, test_fp8=False, TILE_M=32, TILE_N=128, run_count=0)
-    entry_common('mxn_2s', batch=batch, test_fp8=False, TILE_M=128, TILE_N=128, run_count=0)
+    entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=128, run_count=0)
+    entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, run_count=0)
 
 def show_perf(perf):
     print('\nsummary:')
@@ -1623,27 +1665,29 @@ def show_perf(perf):
 def test_small_batch_perf(batch):
     init_env()
     perf = {}
-    perf.update(entry_common('aiter', batch, test_fp8=is_arch_type('942')))
+    if is_arch_type('942'):
+        perf.update(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()]))
+    else:
+        perf.update(entry_common('aiter', batch, prec=[torch.bfloat16]))
     # fix TILE_M=16, TILE_N=32
-    perf.update(entry_b1())           # batch 1
-    perf.update(entry_common('16x32_2s_b', batch=batch, test_fp8=True))
+    perf.update(entry_b1(prec=[torch.bfloat16, get_fp8type()]))           # batch 1
+    perf.update(entry_common('16x32_2s_b', batch=batch, prec=[torch.bfloat16, get_fp8type()]))
     show_perf(perf)
 
 @pytest.mark.parametrize("batch", [[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]])
 def test_perf(batch):
     init_env()
     perf = {}
-    test_fp8 = False
-    perf.update(entry_common('aiter', batch, test_fp8=test_fp8))
+    perf.update(entry_common('aiter', batch, prec=[torch.bfloat16]))
     # TODO: support fp8
-    perf.update(entry_common('mxn_splitk_1s', batch=batch, test_fp8=False, TILE_M=32, TILE_N=128))
-    perf.update(entry_common('mxn_2s', batch=batch, test_fp8=False, TILE_M=128, TILE_N=128))
+    perf.update(entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=128))
+    perf.update(entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128))
     # TILE_M/N is configurable
-    perf.update(entry_common('mxn_splitk_2s', batch=batch, test_fp8=test_fp8, TILE_M=32, TILE_N=128))
+    perf.update(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=128))
     show_perf(perf)
 
 if __name__ == '__main__':
-    #test_acc()
+    test_acc()
     batch = [1, 2, 4, 8, 12, 16, 32, 64]
     test_small_batch_perf(batch)
     batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
