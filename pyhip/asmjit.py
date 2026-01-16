@@ -107,7 +107,7 @@ class Instruction:
             if isinstance(op, GPRExpr) and op.op != "getitem":
                 rtype = op.find_rtype()
                 dtype = op.find_dtype()
-                dst_gprs = jit.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                dst_gprs = jit.new_gpr(rtype, 1, dtype=dtype, align=1, name="idst")
                 dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
                 jit.recursive_expr_gen(self.parent_bb, dst_expr, op, loc=self.loc)
                 self.operands.append(dst_expr)
@@ -928,7 +928,7 @@ class JIT:
             # generate expression into scc
         else:
             dtype = cond.find_dtype()
-            dst_gprs = self.new_gpr("s", 1, dtype=dtype, align=1, name="")
+            dst_gprs = self.new_gpr("s", 1, dtype=dtype, align=1, name="Jump_cond")
             dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
             self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=get_caller_loc())
             # optimize 
@@ -994,7 +994,7 @@ class JIT:
         if isinstance(dst, GPRs):
             rtype = dst.rtype
         dtype = cond.find_dtype()
-        dst_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1)
+        dst_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="SetMask_dst")
         dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
         self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=get_caller_loc())
         last_inst = self.current_bb.instructions[-1]
@@ -1047,7 +1047,7 @@ class JIT:
         self.mark_idx += 1
         
         self.SetMask("vcc", cond)
-        exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
+        exec_backup = self.new_gpr("s", 2, dtype="i32", align=2, name="ExecMask_exec_backup")
         self.s_and_saveexec_b64(exec_backup, "vcc") # scc = (exec!=0)
         if early_skip: self.s_cbranch_execz(mod=label_end) # early skip
         try:
@@ -1092,10 +1092,9 @@ class JIT:
     def gpr(self, *desc, align=0, name=""):
         if name == "":
             # try to reover python var's name from code_context
-            stack = inspect.stack()
-            caller_frame = stack[1]
-            if caller_frame.code_context:
-                src_line = caller_frame.code_context[0].strip()
+            code_context = inspect.getframeinfo(inspect.currentframe().f_back).code_context
+            if code_context:
+                src_line = code_context[0].strip()
                 if "=" in src_line:
                     items = src_line.split("=")
                     if len(items) > 1:
@@ -1158,10 +1157,9 @@ class JIT:
     def new_gpr(self, reg_type, count_range, dtype="u32", align=1, name=""):
         if name == "":
             # try to reover python var's name from code_context
-            stack = inspect.stack()
-            caller_frame = stack[1]
-            if caller_frame.code_context:
-                src_line = caller_frame.code_context[0].strip()
+            code_context = inspect.getframeinfo(inspect.currentframe().f_back).code_context
+            if code_context:
+                src_line = code_context[0].strip()
                 name = src_line.split("=")[0].strip()
 
         dtype = dtype.replace("fp32","f32")
@@ -1616,7 +1614,7 @@ class JIT:
                 return
             else:
                 assert isinstance(rhs, GPRExpr)
-                src1_gprs = self.new_gpr("s", 1, dtype="u32", align=1, name="")
+                src1_gprs = self.new_gpr("s", 1, dtype="u32", align=1, name="src1_gprs")
                 src1_operand = GPRExpr("getitem", src1_gprs, 0, 0)
                 self.recursive_expr_gen(bb, src1_operand, rhs, loc=loc)
                 add_low = Instruction(bb, f"s_add_u32", loc=loc)
@@ -1703,7 +1701,7 @@ class JIT:
                 # "getitem" expr can be used as operand directly
                 src0_operand = expr.src0
             else:
-                src0_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                src0_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="src0_gprs")
                 src0_operand = GPRExpr("getitem", src0_gprs, 0, 0)
                 self.recursive_expr_gen(bb, src0_operand, expr.src0, loc=loc)
         else:
@@ -1716,7 +1714,7 @@ class JIT:
                 # "getitem" expr can be used as operand directly
                 src1_operand = expr.src1
             else:
-                src1_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                src1_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="src1_gprs")
                 src1_operand = GPRExpr("getitem", src1_gprs, 0, 0)
                 self.recursive_expr_gen(bb, src1_operand, expr.src1, loc=loc)
         else:
@@ -1900,7 +1898,7 @@ class JIT:
                         need_compensation = -1
                     ceil_sd = ceil_sd & 0xFFFFFFFF
 
-                    temp = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                    temp = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="temp")
                     Instruction(bb, f"s_mul_hi_i32", loc=loc)(dst_expr, src0_operand, ceil_sd)
                     if need_compensation == 1:
                         Instruction(bb, f"s_add_i32", loc=loc)(dst_expr, dst_expr, src0_operand)
@@ -2920,7 +2918,7 @@ r'''
 
     @cache
     def get_sgpr_const(self, value):
-        sgpr = self.gpr("su32")
+        sgpr = self.gpr("su32", name=f"sgpr_const_{value}")
         sgpr[0] = value
         return sgpr
     '''
@@ -2929,7 +2927,7 @@ r'''
     '''
     def reduce(self, vinst, vinput):
         self.s_nop(mod="2")
-        v1 = self.new_gpr('v',1,dtype="i32", align=1)
+        v1 = self.new_gpr('v',1,dtype="i32", align=1, name="reduce_v1")
         getattr(self, vinst)(v1, vinput, vinput, mod="row_shr:8 bound_ctrl:0")
         self.s_nop(mod="2")
         getattr(self, vinst)(v1, v1, v1, mod="row_shr:4 bound_ctrl:0")
@@ -2942,7 +2940,7 @@ r'''
         self.s_nop(mod="2")
         getattr(self, vinst)(v1, v1, v1, mod="row_bcast:31 bound_ctrl:0")
         self.s_nop(mod="2")
-        vaddr = self.new_gpr('v',1,dtype="i32", align=1)
+        vaddr = self.new_gpr('v',1,dtype="i32", align=1, name="reduce_vaddr")
         vaddr[0] = 63*4 # broadcast last lane to all lanes
         self.ds_bpermute_b32(v1, vaddr, v1) # vdst,  vaddr,    vdata   offset
         self.s_waitcnt(mod=f"lgkmcnt({0})")
@@ -3187,7 +3185,7 @@ class jit_kernel:
         with filelock.FileLock('.compile.lock'):
             # skip compilation process when target file already exists
             # note the `cpp_src_fpath` is supposed to be generated in previous run(with same compile_args)
-            
+
             if not self.force_recompile and \
                 not self.with_debug_log and \
                 os.path.isfile(cpp_src_fpath) and \
