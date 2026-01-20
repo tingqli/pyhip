@@ -375,7 +375,18 @@ def moe_2stage_splitk(J:JIT,
                       p_num_valid_ids:"void*",
                       p_w_scale:"float*",
                       M:"int",):
-    #assert K % BLOCK_SIZE_K == 0
+    assert weight_dtype == torch.bfloat16 or weight_dtype == torch.float4_e2m1fn_x2 or weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz
+    if weight_dtype == torch.float4_e2m1fn_x2:
+        if with_silu:
+            assert BLOCK_TILE_SIZE_N % 64 == 0, f'due to scale is packed with [2*16, 8*32], gate/up each needs 2*16 rows; current BLOCK_TILE_SIZE_N={BLOCK_TILE_SIZE_N} is not supported'
+            assert K % 1024 == 0, f'will read (16*4)*4(wave) bytes once in main loop, aka 256*2=512 elements; to use packed scale in K dimension, will double read; current K={K} is not supported'
+        else:
+            assert BLOCK_TILE_SIZE_N % 32 == 0, f'due to scale is packed with [2*16, 8*32], current BLOCK_TILE_SIZE_N={BLOCK_TILE_SIZE_N} is not supported'
+            assert K % 32 == 0, f'will read 16*4 bytes once in main loop, aka 64*2=128 elements; tails support K%32==0; current K={K} is not supported'
+    elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+        assert K % 64 == 0, f'will read 16*4 bytes once in main loop, aka 64 elements; current K={K} is not supported'
+    else:
+        assert K % 32 == 0, f'will read 16*4 bytes once in main loop, aka 64/2=32 elements; current K={K} is not supported'
     assert BLOCK_TILE_SIZE_M % 16 == 0
     assert BLOCK_TILE_SIZE_N % 32 == 0
     assert N % BLOCK_TILE_SIZE_N == 0
@@ -386,9 +397,15 @@ def moe_2stage_splitk(J:JIT,
 
     sizeof_bf16 = 2
     sizeof_f32 = 4
-    sizeof_w = sizeof_bf16 if weight_dtype == torch.bfloat16 else 1
+    def get_k_bytes(k_in_elements):
+        if weight_dtype == torch.bfloat16:
+            return k_in_elements * sizeof_bf16
+        elif weight_dtype == torch.float4_e2m1fn_x2:
+            return k_in_elements // 2
+        elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+            return k_in_elements
     stride_A = K * sizeof_bf16
-    stride_B = K * sizeof_w
+    stride_B = get_k_bytes(K)
 
     A_vert = BLOCK_TILE_SIZE_M // 16
     B_horz = BLOCK_TILE_SIZE_N // 16
@@ -425,18 +442,28 @@ def moe_2stage_splitk(J:JIT,
         J.global_load_dword(v_sorted_id[n], lane_mod_16 << 2, p_sorted_ids)
     voffset_b = J.gpr(B_horz, 'vu32')
     if with_silu:
-        voffset_b[0] = BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x * stride_B + J.threadIdx.x * 16
-        voffset_b[B_horz // 2] = voffset_b[0] + (N // 2) * K * sizeof_w
+        if weight_dtype == torch.float4_e2m1fn_x2:
+            # not shuffled
+            voffset_b[0] = (BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x + lane_mod_16) * stride_B + lane_div_16 * 16 + J.warp_id * get_k_bytes(K // 4)
+        else:
+            # shffled
+            voffset_b[0] = BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x * stride_B + J.threadIdx.x * 16
+        voffset_b[B_horz // 2] = voffset_b[0] + (N // 2) * get_k_bytes(K)
         for m in range(1, B_horz // 2):
-            voffset_b[m] = voffset_b[0] + K * (16 * sizeof_w * m)
-            voffset_b[B_horz // 2 + m] = voffset_b[B_horz // 2] + K * (16 * sizeof_w * m)
+            voffset_b[m] = voffset_b[0] + get_k_bytes(K) * 16 * m
+            voffset_b[B_horz // 2 + m] = voffset_b[B_horz // 2] + get_k_bytes(K) * 16 * m
     else:
         p_sorted_weights[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
         v_weight = J.gpr(A_vert, 'vf32')
-        voffset_b[0] = BLOCK_TILE_SIZE_N * J.blockIdx.x * stride_B + J.threadIdx.x * 16
+        if weight_dtype == torch.float4_e2m1fn_x2:
+            # not shuffled
+            voffset_b[0] = (BLOCK_TILE_SIZE_N * J.blockIdx.x + lane_mod_16) * stride_B + lane_div_16 * 16
+        else:
+            # shffled
+            voffset_b[0] = BLOCK_TILE_SIZE_N * J.blockIdx.x * stride_B + J.threadIdx.x * 16
         J.global_load_dword(v_weight[0], lane_mod_16 << 2, p_sorted_weights)
         for m in range(1, B_horz):
-            voffset_b[m] = voffset_b[0] + K * (16 * sizeof_w * m)
+            voffset_b[m] = voffset_b[0] + get_k_bytes(K) * 16 * m
         for m in range(1, A_vert):
             p_sorted_weights[:] += 16 * 4
             J.global_load_dword(v_weight[m], lane_mod_16 << 2, p_sorted_weights)
@@ -450,19 +477,49 @@ def moe_2stage_splitk(J:JIT,
     voffset_a = J.gpr(A_vert, 'vu32')
     v_topk_id = J.gpr(A_vert, 'vu32')
     v_token_id = J.gpr(A_vert, 'vu32')
-    # 16 elements for a if fp8
-    a_element_num_per_thread = 8 if weight_dtype == torch.bfloat16 else 16
+    # a elements number:
+    # bf16: 8 elements
+    # fp8: 16 elements
+    # fp4: 32 elements
+    if weight_dtype == torch.bfloat16:
+        a_element_num_per_thread = 8
+    elif weight_dtype == torch.float4_e2m1fn_x2:
+        a_element_num_per_thread = 32
+    elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+        a_element_num_per_thread = 16
+    else:
+        raise ValueError(f"Unsupported weight dtype: {weight_dtype}")
     for m in range(A_vert):
         v_token_id[m] = v_sorted_id[m] & 0xffffff
         if with_silu:
-            voffset_a[m] = J.gpr(v_token_id[m] * stride_A + (J.threadIdx.x // 16) * (a_element_num_per_thread * sizeof_bf16))
+            if weight_dtype != torch.float4_e2m1fn_x2:
+                voffset_a[m] = J.gpr(v_token_id[m] * stride_A + (J.threadIdx.x // 16) * (a_element_num_per_thread * sizeof_bf16))
+            else:
+                voffset_a[m] = J.gpr(v_token_id[m] * stride_A + (lane_div_16) * (a_element_num_per_thread * sizeof_bf16) + J.warp_id * (K // 4 * sizeof_bf16))
         else:
             v_topk_id[m] = v_sorted_id[m] >> 24
             # input layout: [B, TOPK, INTER_MEDIA]
             voffset_a[m] = J.gpr(v_token_id[m] * TOPK * K * sizeof_bf16 + v_topk_id[m] * (K * sizeof_bf16) + (J.threadIdx.x // 16) * (a_element_num_per_thread * sizeof_bf16))
 
-    voffset_scale = J.gpr(B_horz, 'vu32')
-    if weight_dtype != torch.bfloat16:
+    voffset_scale = None
+    if weight_dtype == torch.float4_e2m1fn_x2:
+        # 32 rows shared in a uint32
+        voffset_scale = J.gpr(B_horz // 2, 'vu32')
+        # the group of fp4 is 32 elements, and scale will align to 8 groups
+        k_scale_stride = div_up(div_up(K, 32), 8) * 8
+        p_w_scale[:] += (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * k_scale_stride * J.blockIdx.x
+        if with_silu:
+            voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride)) + J.lane_id * sizeof_f32 + J.warp_id * (k_scale_stride // 8 // 4 * 64 * sizeof_f32)
+            voffset_scale[B_horz // 4] = voffset_scale[0] + N // 2 * k_scale_stride
+            for m in range(1, B_horz // 4):
+                voffset_scale[m] = voffset_scale[0] + 32 * k_scale_stride * m
+                voffset_scale[B_horz // 4 + m] = voffset_scale[B_horz // 4] + 32 * k_scale_stride * m
+        else:
+            voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride)) + J.threadIdx.x * sizeof_f32
+            for m in range(1, B_horz // 2):
+                voffset_scale[m] = voffset_scale[0] + 32 * k_scale_stride * m
+    elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+        voffset_scale = J.gpr(B_horz, 'vu32')
         p_w_scale[:] += (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * sizeof_f32 * J.blockIdx.x
         voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_mod_16 * sizeof_f32
         if with_silu:
@@ -474,8 +531,8 @@ def moe_2stage_splitk(J:JIT,
             for m in range(1, B_horz):
                 voffset_scale[m] = voffset_scale[0] + 16 * sizeof_f32 * m
 
-    p_weight[:] = p_weight[:] + s_e_id * (N * K * sizeof_w)
-    buff_b = J.Buffer(p_weight, K * N * sizeof_w)
+    p_weight[:] = p_weight[:] + s_e_id * (N * get_k_bytes(K))
+    buff_b = J.Buffer(p_weight, N * get_k_bytes(K))
 
     gemm_splitk(J, weight_dtype, K, N, num_split_k,
                 buff_a, buff_b, p_w_scale,
@@ -1315,6 +1372,12 @@ def _run_aiter(hidden_states,
             ):
     from aiter.fused_moe import fused_moe
     from aiter import QuantType
+    if w1.dtype == torch.float4_e2m1fn_x2:
+        quant_type = QuantType.per_1x32
+    elif w1.dtype == torch.bfloat16:
+        quant_type = QuantType.No
+    else:
+        quant_type = QuantType.per_Token
     return fused_moe(
         hidden_states,
         w1,
@@ -1323,7 +1386,7 @@ def _run_aiter(hidden_states,
         topk_ids,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        quant_type=QuantType.No if w1.dtype == torch.bfloat16 else QuantType.per_Token
+        quant_type=quant_type
     )
 
 # https://github.com/huggingface/transformers/blob/1fed6166c00b800330fcda8494f78cbcad8e4e3b/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L235-L263
@@ -1359,14 +1422,7 @@ def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids):
         final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
     return final_hidden_states
 
-def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10):
-    HIDDEN_SIZE = 2048
-    TP = 4
-    INTER_SIZE = 768
-    TP = 8
-    INTER_SIZE = 1024
-    E = 128
-    TOPK = 8
+def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8):
     INTER_SIZE_TP = INTER_SIZE // TP
     BUF_COPY = 32
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
@@ -1379,6 +1435,30 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w2 = [w_.clone() for _ in range(BUF_COPY)]
         w1_scale = [None] * BUF_COPY
         w2_scale = [None] * BUF_COPY
+    elif weight_type == torch.float4_e2m1fn_x2:
+        import aiter
+        from aiter.utility import fp4_utils
+        # w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
+        w_ = torch.randint(-2, 3, [E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16) / 2
+        w1_qt, w1_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
+        w1_f32 = fp4_utils.mxfp4_to_f32(w1_qt).to(dtype=torch.bfloat16).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE // 32, 32)
+        w1_scale_f32 = fp4_utils.e8m0_to_f32(w1_qt_scale_).to(dtype=torch.bfloat16).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE // 32, 1)
+        w1_ref = (w1_f32 * w1_scale_f32).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE)
+        w1_qt_scale = fp4_utils.e8m0_shuffle(w1_qt_scale_)
+        w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
+        w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
+        # w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
+        w_ = torch.randint(-1, 3, [E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16) / 2
+        w2_qt, w2_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
+        w2_f32 = fp4_utils.mxfp4_to_f32(w2_qt).to(dtype=torch.bfloat16).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP // 32, 32)
+        w2_scale_f32 = fp4_utils.e8m0_to_f32(w2_qt_scale_).to(dtype=torch.bfloat16).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP // 32, 1)
+        w2_ref = (w2_f32 * w2_scale_f32).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP)
+        # pad scale
+        w2_qt_scale_pad = torch.zeros(w2_qt_scale_.shape[0], div_up(w2_qt_scale_.shape[1], 8) * 8, dtype=w2_qt_scale_.dtype)
+        w2_qt_scale_pad[:, :w2_qt_scale_.shape[1]] = w2_qt_scale_
+        w2_qt_scale = fp4_utils.e8m0_shuffle(w2_qt_scale_pad)
+        w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
+        w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
     else:
         import aiter
         torch_quant = aiter.get_torch_quant(aiter.QuantType.per_Token)
@@ -1404,7 +1484,13 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     access_expert = access_expert.shape[0]
 
     flops = 2 * B * TOPK * (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP)
-    mem_size = B * HIDDEN_SIZE * 2 + (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * access_expert * (2 if weight_type == torch.bfloat16 else 1)
+    if weight_type == torch.bfloat16:
+        ele_size = 2
+    elif weight_type == torch.float4_e2m1fn_x2:
+        ele_size = 0.5
+    else:
+        ele_size = 1
+    mem_size = B * HIDDEN_SIZE * 2 + (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * access_expert * ele_size
 
     import aiter
     from aiter.ops.shuffle import shuffle_weight
@@ -1441,6 +1527,9 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                             gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, N2, K2, TOPK)
         elif kernel_type == 'mxn_splitk_2s':
             # test moe_gemm_batch_vmn: 2 stages, m/n can be set
+            if weight_type == torch.float4_e2m1fn_x2:
+                K1 *= 2
+                K2 *= 2
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
                 topk_ids,
                 topk_weight,
@@ -1481,6 +1570,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                cur_out.data_ptr(), 
                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
         elif kernel_type == 'mxn_2s':
+            assert weight_type == torch.bfloat16, f'mxn_2s only support bfloat16, but got {weight_type}'
             # test moe_gemm_batch_vmn: 2 stages, m/n can be set
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
                 topk_ids,
@@ -1493,14 +1583,44 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 None,
                 0,
             )
-            BLOCK_TILE_SIZE_M = TILE_M
-            BLOCK_TILE_SIZE_N = TILE_N
-            moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
-                               w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                               hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-            moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
-                             w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                             gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+            if weight_type == torch.float4_e2m1fn_x2:
+                # if B <= 1024:
+                #     a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
+                #         hidden_states,
+                #         sorted_ids=sorted_ids,
+                #         num_valid_ids=num_valid_ids,
+                #         token_num=token_num,
+                #         topk=1,
+                #         block_size=block_size_M,
+                #     )
+                # else:
+                from aiter import get_hip_quant as get_quant
+                from aiter.utility.fp4_utils import moe_mxfp4_sort
+                quant_func = get_quant(aiter.QuantType.per_1x32)
+                hidden_states_q, hidden_states_scale = quant_func(
+                    hidden_states,
+                    scale=None,
+                    quant_dtype=torch.float4_e2m1fn_x2,
+                    num_rows=None,
+                )
+                # TODO: it seems assume using 8(x32)blocks
+                hidden_states_scale = moe_mxfp4_sort(
+                    hidden_states_scale,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=B,
+                    block_size=TILE_M,
+                )
+                # TODO: call kernel
+            else:
+                BLOCK_TILE_SIZE_M = TILE_M
+                BLOCK_TILE_SIZE_N = TILE_N
+                moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
+                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
+                moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
+                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
 
             # BLOCK_TILE_SIZE_N = 64
             # moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
@@ -1524,8 +1644,13 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             latencies.append(p.dt())
             bw.append(p.bw())
     else:
-        w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
-        w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
+        if weight_type == torch.float4_e2m1fn_x2:
+            # fp4 no shuffle
+            w1_qt_aiter = w1[0]
+            w2_qt_aiter = w2[0]
+        else:
+            w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
+            w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
         ref_out = get_torch_ref(hidden_states=hidden_states[0], w1=w1_ref, w2=w2_ref, topk_weight=topk_weight[0], topk_ids=topk_ids[0])
         cur_out = run(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
@@ -1557,34 +1682,39 @@ def is_arch_type(arch):
 def get_fp8type():
     return torch.float8_e4m3fn if is_arch_type('950') else torch.float8_e4m3fnuz
 
+def get_fp4type_if_valid():
+    return torch.float4_e2m1fn_x2 if is_arch_type('950') else None
+
 # special path for batch1 
-def entry_b1(test_fp8=True, run_count=10):
+def entry_b1(prec=[torch.bfloat16], HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, run_count=10):
     kernel_type = '16x32_2s_b1'
     perf = {}
     perf[kernel_type] = {}
-    perf_bf16 = {}
+    perf_prec = {}
 
-    perf_bf16[1] = _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, run_count=run_count)
-    perf[kernel_type]['bf16'] = perf_bf16
-    if test_fp8:
-        perf_fp8 = {}
-        perf_fp8[1] = _run_batch(kernel_type, B=1, weight_type=get_fp8type(), run_count=run_count)
-        perf[kernel_type]['fp8'] = perf_fp8
+    for weight_type in prec:
+        if weight_type is None: continue
+        perf_prec[1] = _run_batch(kernel_type, B=1, weight_type=weight_type, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP)
+        perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, test_fp8=True, TILE_M=None, TILE_N=None, run_count=10):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, run_count=10):
     perf = {}
     perf[kernel_type] = {}
-    perf_bf16 = {}
-    for i in batch:
-        perf_bf16[i] = _run_batch(kernel_type, B=i, weight_type=torch.bfloat16, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count)
-    perf[kernel_type]['bf16'] = perf_bf16
+    for weight_type in prec:
+        if weight_type is None: continue
+        perf_prec = {}
+        org_INTER_SIZE = INTER_SIZE
 
-    if test_fp8:
-        perf_fp8 = {}
-        for i in batch: 
-            perf_fp8[i] = _run_batch(kernel_type, B=i, weight_type=get_fp8type(), TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count)
-        perf[kernel_type]['fp8'] = perf_fp8
+        if (weight_type == torch.float8_e4m3fn or weight_type == torch.float8_e4m3fnuz) and INTER_SIZE // TP % 128 != 0:
+            INTER_SIZE = div_up(INTER_SIZE // TP, 128) * 128 * TP
+        for i in batch:
+            if org_INTER_SIZE != INTER_SIZE:
+                key = f'{i} (adjusted INTER_SIZE={INTER_SIZE})'
+            else:
+                key = f'{i}'
+            perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP)
+        perf[kernel_type][str(weight_type)] = perf_prec
     
     return perf
 
@@ -1593,24 +1723,26 @@ def init_env():
     torch.set_default_device('cuda')
     torch.manual_seed(0)
 
-def test_acc():
+def test_acc(TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
     init_env()
-    #entry_common('mxn_splitk_2s', batch=[8192], test_fp8=False, TILE_M=32, TILE_N=64, run_count=0)
+    #entry_common('aiter', batch=[8192], prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, run_count=2, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8)
+    #entry_common('mxn_splitk_2s', batch=[16], prec=[torch.float4_e2m1fn_x2], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
+
     #entry_common('mxn_2s', batch=[8192], test_fp8=False, TILE_M=128, TILE_N=128, run_count=0)
     #assert 0,"========================"
     batch = list(range(2, 64))
     # fix TILE_M=16, TILE_N=32
-    entry_b1(run_count=0)
-    entry_common('16x32_2s_b', batch=batch, test_fp8=True, run_count=0)
+    entry_b1(run_count=0, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)           # batch 1
+    entry_common('16x32_2s_b', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=16, TILE_N=32, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
     batch += list(range(128, 256))
     batch += [i * 256 for i in range(1, 4)]
     batch += [i * 2048 for i in range(1, 5)]
     batch += list(range(2048 * 3, 2048 * 3 + 256))
     # TILE_M/N is configurable
-    entry_common('mxn_splitk_2s', batch=batch, test_fp8=True, TILE_M=32, TILE_N=64, run_count=0)
+    entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
     # TODO: support fp8
-    entry_common('mxn_splitk_1s', batch=batch, test_fp8=False, TILE_M=32, TILE_N=128, run_count=0)
-    entry_common('mxn_2s', batch=batch, test_fp8=False, TILE_M=128, TILE_N=128, run_count=0)
+    entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
+    entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
 
 def show_perf(perf):
     print('\nsummary:')
@@ -1620,31 +1752,38 @@ def show_perf(perf):
                 print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
 
 @pytest.mark.parametrize("batch", [[1, 2, 4, 8, 12, 16, 32, 64]])
-def test_small_batch_perf(batch):
+def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
     init_env()
     perf = {}
-    perf.update(entry_common('aiter', batch, test_fp8=is_arch_type('942')))
+    if is_arch_type('942'):
+        perf.update(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
+    else:
+        perf.update(entry_common('aiter', batch, prec=[torch.bfloat16], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     # fix TILE_M=16, TILE_N=32
-    perf.update(entry_b1())           # batch 1
-    perf.update(entry_common('16x32_2s_b', batch=batch, test_fp8=True))
+    perf.update(entry_b1(prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))           # batch 1
+    perf.update(entry_common('16x32_2s_b', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=16, TILE_N=32, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     show_perf(perf)
 
 @pytest.mark.parametrize("batch", [[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]])
-def test_perf(batch):
+def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
     init_env()
     perf = {}
-    test_fp8 = False
-    perf.update(entry_common('aiter', batch, test_fp8=test_fp8))
+    perf.update(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
     # TODO: support fp8
-    perf.update(entry_common('mxn_splitk_1s', batch=batch, test_fp8=False, TILE_M=32, TILE_N=128))
-    perf.update(entry_common('mxn_2s', batch=batch, test_fp8=False, TILE_M=128, TILE_N=128))
+    perf.update(entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
+    perf.update(entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     # TILE_M/N is configurable
-    perf.update(entry_common('mxn_splitk_2s', batch=batch, test_fp8=test_fp8, TILE_M=32, TILE_N=128))
+    perf.update(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     show_perf(perf)
 
 if __name__ == '__main__':
-    #test_acc()
+    TILE_M = 16
+    TILE_N = 128
+    HIDDEN_SIZE = 4096
+    INTER_SIZE = 1536
+    TP = 8
+    test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
     batch = [1, 2, 4, 8, 12, 16, 32, 64]
-    test_small_batch_perf(batch)
+    test_small_batch_perf(batch, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
     batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-    test_perf(batch)
+    test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)

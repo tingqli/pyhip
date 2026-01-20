@@ -2177,7 +2177,7 @@ class JIT:
         self.debug_cond_sgpr = self.gpr("su32")
         self.debug_cond_sgpr[0] = cond
 
-    def debug_log(self, gprs:Union[GPRs, GPRExpr], torch_dtype, gpr_layout=""):
+    def debug_log(self, gprs:Union[GPRs, GPRExpr], torch_dtype, gpr_layout="", message=""):
         """
         cond : filter the kernel instance to enable log
         """
@@ -2200,6 +2200,8 @@ class JIT:
                 args = src_line.split(".debug_log(")[-1].split(",")
                 if len(args) >= 1:
                     name = args[0].strip()
+        if message:
+            name = f'{name}("{message}")'
         # gprs
         gprs = gprs[...]
         if isinstance(gprs, GPRExpr):
