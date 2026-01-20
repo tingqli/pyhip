@@ -91,10 +91,10 @@ def gemm_splitk(J:JIT,
         for m in range(A_vert):
             buff_a.load_dwordx4(A_reg[pp_reg_id, m, 0], voffset_a[m], soffset_ka)
             if weight_dtype != torch.bfloat16:
-                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 1], voffset_a[m], soffset_ka + 16)
+                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 1], voffset_a[m], soffset_ka, offset12=16)
             if weight_dtype == torch.float4_e2m1fn_x2:
-                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 2], voffset_a[m], soffset_ka + 32)
-                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 3], voffset_a[m], soffset_ka + 48)
+                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 2], voffset_a[m], soffset_ka, offset12=32)
+                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 3], voffset_a[m], soffset_ka, offset12=48)
         for n in range(B_horz):
             yield buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
 
@@ -125,10 +125,13 @@ def gemm_splitk(J:JIT,
                         J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[n, 1], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n], mod='op_sel:[1,0,0]')
                         J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[n, 2], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n], mod='op_sel:[0,1,0]')
                         J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[n, 3], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n], mod='op_sel:[1,1,0]')
-                    # 2, A_vert, A_rep=4, 2, 2
-                    for n in range(B_horz):
+                        # 2, A_vert, A_rep=4, 2, 2
+                        if n > 0:
+                            for m in range(A_vert):
+                                yield J.v_mfma_f32_16x16x32_bf16(C_reg[n - 1, m], v_w_bf16[n - 1], A_reg[pp_reg_id, m, i * 2 + j], C_reg[n - 1, m])
+                    else:
                         for m in range(A_vert):
-                            yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i * 2 + j], C_reg[n, m])
+                            yield J.v_mfma_f32_16x16x32_bf16(C_reg[B_horz - 1, m], v_w_bf16[B_horz - 1], A_reg[pp_reg_id, m, i * 2 + j], C_reg[B_horz - 1, m])
         elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
             # decompress
             v_w_f32 = J.gpr(2, 2, 'vf32', align=4)
@@ -174,6 +177,12 @@ def gemm_splitk(J:JIT,
 
     def tail(pp_reg_id, k=None):
         J.s_waitcnt(mod=f"vmcnt(0)")
+        if isinstance(K, int) and K % k_step_wg:
+            assert K % k_step_wg % (8 * A_rep) == 0, f'K tail must be multiple of {8 * A_rep}, current K={K}, k_step_wg={k_step_wg}'
+            with J.ExecMask(J.lane_id // 16 >= K % k_step_wg / (8 * A_rep), early_skip=False):
+                for m in range(A_vert):
+                    for r in range(A_rep):
+                            A_reg[pp_reg_id, m, r] = 0
         mfma = mfma_gen(pp_reg_id, k)
         J.emitter()([mfma])
 
