@@ -10,10 +10,10 @@ import torch
 from functools import cache
 try:
     # work as package
-    from .common.gemm import UGEMM, tb_swizzle
+    from .common.gemm import UGEMM
     from .common.gemm_splitk import gemm_splitk
 except:
-    from common.gemm import UGEMM, tb_swizzle
+    from common.gemm import UGEMM
     from common.gemm_splitk import gemm_splitk
 #####################################################################
 # kernel define
@@ -1643,7 +1643,7 @@ def test_perf(batch):
     show_perf(perf)
 
 if __name__ == '__main__':
-    test_acc()
+    #test_acc()
     batch = [1, 2, 4, 8, 12, 16, 32, 64]
     test_small_batch_perf(batch)
     batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]

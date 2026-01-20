@@ -612,6 +612,8 @@ class Buffer:
         if offset12 > 0:
             assert offset12.bit_length() <= 12
             mod += f" offset:{offset12}"
+        if vdst is None:
+            return self.J.buffer_load_dwordx4(voffset, self.desc, soffset, mod = mod + " lds")
         return self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
 
     def load_dwordx2(self, vdst, voffset, soffset, offset12=0):
@@ -628,6 +630,8 @@ class Buffer:
         mod = f"offen"
         if offset12 > 0:
             mod += f" offset:{offset12}"
+        if vdst is None:
+            return self.J.buffer_load_dword(voffset, self.desc, soffset, mod = mod + " lds")
         return self.J.buffer_load_dword(vdst, voffset, self.desc, soffset, mod=mod)
 
     def store_dwordx4(self, vdata, voffset, soffset, offset12=0):
@@ -783,6 +787,7 @@ PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
 PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_DUMP_DIR = os.getenv("PYHIP_DUMP_DIR", "")
 PYHIP_RECOMPILE = int(os.getenv("PYHIP_RECOMPILE", "0"))
+PYHIP_NOPASS = os.getenv("PYHIP_NOPASS", "").split(":")
 
 if len(PYHIP_DUMP_DIR):
     # remove temp-cache to force recompile once 
@@ -792,8 +797,16 @@ if len(PYHIP_DUMP_DIR):
 if PYHIP_RECOMPILE:
     os.system(f'rm -rf {PYHIP_CACHE_DIR}/*')
 
+_arch_lds_size = {
+    "gfx950": 160*1024
+}
 class JIT:
-    def __init__(self, kernel_tag = ""):
+    def __init__(self, kernel_tag = "", no_pass = None):
+        self.arch = amdgpu_arch()
+        assert self.arch.startswith("gfx")
+        self.gfx = int(self.arch[3:])
+
+        self.no_pass = PYHIP_NOPASS if no_pass is None else no_pass
         self.blocks = []
         # increased freely
         self.free_gpr_id = {'s':0, 'v':0, 'a': 0}
@@ -805,7 +818,7 @@ class JIT:
         self.mark_idx = 0
         self.debug_cond_sgpr = None
         self.debug_log_ptr = None
-        self.lds_allocator = SimpleMemoryAllocator(64*1024)
+        self.lds_allocator = SimpleMemoryAllocator(_arch_lds_size.get(self.arch, 64*1024))
         self.special_vars = {}
         self.kernel_tag = kernel_tag
         # sizeof mnemonics
@@ -862,7 +875,6 @@ class JIT:
             # torch.float8_e4m3fnuz:1,
             # torch.float8_e5m2fnuz:1,
         }
-        self.arch = amdgpu_arch()
 
     def sizeof(self, dtype):
         if isinstance(dtype ,str):
@@ -913,6 +925,11 @@ class JIT:
                 print(color0, f"[PYHIP_DEBUG_LOG: {caller_name}] ", *args, color1, **kwargs)
                 return True
         return False
+
+    def is_no_pass(self, *args, **kwargs):
+        if len(self.no_pass) == 0: return
+        caller_name = inspect.currentframe().f_back.f_code.co_name
+        return caller_name in self.no_pass
 
     def Buffer(self, sgpr_base, sgpr_size):
         buff = Buffer(self)
@@ -1188,6 +1205,7 @@ class JIT:
 
     # Dead Store Elimination
     def pass_dse(self):
+        if self.is_no_pass(): return
         # if a register is written multiple times w/o any read, all such writes can be removed
         # dead loads, if a load dst is used by no one, remove such loads
         gpr_stores = {}
@@ -1235,6 +1253,7 @@ class JIT:
                     bb.instructions.pop(i)
 
     def pass_dce(self):
+        if self.is_no_pass(): return
         inst_list = []
         serial_index = 0
         for bb in self.blocks:
@@ -1309,6 +1328,7 @@ class JIT:
                     bb.instructions.pop(i)
 
     def pass_break_down_gprs(self):
+        if self.is_no_pass(): return
         # gprs are allocate in unit of GPRs, break GPRs into smaller pieces
         # can help to reduce register space fragmentation issue.
         # each instruction operand reference to gpr represents a 
@@ -2396,6 +2416,7 @@ class JIT:
                 sgpr_loading.append(inst.operands[0])
 
     def pass_cse(self):
+        if self.is_no_pass(): return
         debug_enabled = self.debug_print()
 
         def is_gpr(op):
@@ -3086,6 +3107,47 @@ r'''
     def pk_f32_to_bf16(self, vdst, vsrc0, vsrc1):
         self.v_perm_b32(vdst, vsrc0, vsrc1, self.get_sgpr_const(0x03_02_07_06))
 
+    def tb_swizzle(self, block_1d_id:"sgpr", M:"sgpr", wg_M:int, wg_N:int, N:int, M01:int, GroupNum:int):
+        J = self
+        if GroupNum <= 1 and M01 <= 1:
+            N0 = J.div_up(N, wg_N)
+            blk_m = J.gpr(block_1d_id // N0)
+            blk_n = J.gpr(block_1d_id - blk_m*N0)
+            return blk_m, blk_n
+
+        M0 = J.gpr(J.div_up(M, wg_M))
+        N0 = J.div_up(N, wg_N)
+        group_size    = J.div_up(M0 * N0, GroupNum)
+        big_group_num = J.gpr(GroupNum - (group_size * GroupNum - M0 * N0))
+        group_id_y    = J.gpr(block_1d_id // GroupNum)
+        group_id_x    = J.gpr(block_1d_id - group_id_y * GroupNum) 
+
+        remap_block_1d_id = J.gpr(group_id_x * group_size + group_id_y)
+
+        with J.If(group_id_x > big_group_num):
+            remap_block_1d_id[0] += (big_group_num - group_id_x)
+
+        idx_M0 = J.gpr(remap_block_1d_id // N0)
+        idx_N0 = J.gpr(remap_block_1d_id - idx_M0 * N0)
+
+        M0_tmp     = J.gpr(M0 // M01)
+        M0_mod_M01 = J.gpr(M0 - M0_tmp * M01)
+
+        # M01_adapt = (idx_M0 < M0 - M0_mod_M01) ? M01 : M0_mod_M01;
+        M01_adapt = J.gpr("su32")
+        J.SetMask("scc", idx_M0 < M0 - M0_mod_M01)
+        J.s_cselect_b32(M01_adapt, M01, M0_mod_M01)
+
+        idx_M00          = J.gpr(idx_M0 // M01)
+        idx_M01          = J.gpr(idx_M0 - idx_M00 * M01)
+        idx_N0_M01_local = J.gpr(idx_N0 + idx_M01 * N0)
+
+        N_out           = J.gpr(idx_N0_M01_local // M01_adapt)
+        idx_loc_mod_M01 = J.gpr(idx_N0_M01_local - N_out * M01_adapt)
+
+        M_out = J.gpr(idx_loc_mod_M01 + idx_M00 * M01)
+        return M_out, N_out
+
     @property
     def warp_id(self):
         if "warp_id" not in self.special_vars:
@@ -3110,7 +3172,7 @@ class Idx3D:
 
 _jit_kernel_unique_id = {}
 class jit_kernel:
-    def __init__(self, gen_func, extra_compiler_options, with_debug_log = False, dump_stat = False, force_recompile = False):
+    def __init__(self, gen_func, extra_compiler_options, with_debug_log = False, dump_stat = False, force_recompile = False, no_pass = None):
         assert callable(gen_func)
         self.extra_compiler_options = extra_compiler_options
         self.dump_stat = dump_stat
@@ -3119,6 +3181,7 @@ class jit_kernel:
         self.with_debug_log = with_debug_log
         self.gen_func = gen_func
         self.func_name = gen_func.__name__
+        self.no_pass = no_pass
         argspec = inspect.getfullargspec(gen_func)
         argtypes = gen_func.__annotations__
         compile_time_args = []
@@ -3180,7 +3243,7 @@ class jit_kernel:
         # put all generated files under $HOME/.pyhip
         cpp_src_fpath = f"{PYHIP_CACHE_DIR}/{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}.cpp"
 
-        J = JIT(f"{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}")
+        J = JIT(f"{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}", self.no_pass)
 
         with filelock.FileLock('.compile.lock'):
             # skip compilation process when target file already exists
@@ -3279,14 +3342,15 @@ class jit_kernel:
         return artifact
 
 class jit:
-    def __init__(self, extra_compiler_options = "", with_debug_log=False, dump_stat = False, force_recompile = False):
+    def __init__(self, extra_compiler_options = "", with_debug_log=False, dump_stat = False, force_recompile = False, no_pass = None):
         self.extra_compiler_options = extra_compiler_options
         self.with_debug_log = with_debug_log
         self.dump_stat = dump_stat
         self.force_recompile = force_recompile
+        self.no_pass = no_pass
 
     def __call__(self, gen_func):
-        return jit_kernel(gen_func, self.extra_compiler_options, self.with_debug_log, self.dump_stat, self.force_recompile)
+        return jit_kernel(gen_func, self.extra_compiler_options, self.with_debug_log, self.dump_stat, self.force_recompile, self.no_pass)
 
 class Addr2D:
     def __init__(self, J:JIT, base, row_init, col_init, stride):
