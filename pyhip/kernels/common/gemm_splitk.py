@@ -128,7 +128,8 @@ def gemm_splitk(J:JIT,
                     for i in range(2):
                         for j in range(2):
                             for m in range(A_vert):
-                                yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[j], A_reg[pp_reg_id, m, i * 2 + j], C_reg[n, m])
+                                J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[j], A_reg[pp_reg_id, m, i * 2 + j], C_reg[n, m])
+                            yield
 
             is_first_fma = True
             gen = delayed_fma()
