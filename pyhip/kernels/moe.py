@@ -15,6 +15,8 @@ try:
 except:
     from common.gemm import UGEMM
     from common.gemm_splitk import gemm_splitk
+
+USE_FP4_SHUFFLE_WEIGHT = 1
 #####################################################################
 # kernel define
 @cache
@@ -443,8 +445,12 @@ def moe_2stage_splitk(J:JIT,
     voffset_b = J.gpr(B_horz, 'vu32')
     if with_silu:
         if weight_dtype == torch.float4_e2m1fn_x2:
-            # not shuffled
-            voffset_b[0] = (BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x + lane_mod_16) * stride_B + lane_div_16 * 16 + J.warp_id * get_k_bytes(K // 4)
+            if USE_FP4_SHUFFLE_WEIGHT:
+                # shffled
+                voffset_b[0] = (BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x) * stride_B + J.lane_id * 16 + J.warp_id * (16 * get_k_bytes(K) // 4)
+            else:
+                # not shuffled
+                voffset_b[0] = (BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x + lane_mod_16) * stride_B + lane_div_16 * 16 + J.warp_id * get_k_bytes(K // 4)
         else:
             # shffled
             voffset_b[0] = BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x * stride_B + J.threadIdx.x * 16
@@ -456,8 +462,12 @@ def moe_2stage_splitk(J:JIT,
         p_sorted_weights[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
         v_weight = J.gpr(A_vert, 'vf32')
         if weight_dtype == torch.float4_e2m1fn_x2:
-            # not shuffled
-            voffset_b[0] = (BLOCK_TILE_SIZE_N * J.blockIdx.x + lane_mod_16) * stride_B + lane_div_16 * 16
+            if USE_FP4_SHUFFLE_WEIGHT:
+                # shffled
+                voffset_b[0] = (BLOCK_TILE_SIZE_N * J.blockIdx.x) * stride_B + J.lane_id * 16
+            else:
+                # not shuffled
+                voffset_b[0] = (BLOCK_TILE_SIZE_N * J.blockIdx.x + lane_mod_16) * stride_B + lane_div_16 * 16
         else:
             # shffled
             voffset_b[0] = BLOCK_TILE_SIZE_N * J.blockIdx.x * stride_B + J.threadIdx.x * 16
@@ -536,10 +546,67 @@ def moe_2stage_splitk(J:JIT,
 
     gemm_splitk(J, weight_dtype, K, N, num_split_k,
                 buff_a, buff_b, p_w_scale,
-                voffset_a, voffset_b, voffset_scale, C_reg, BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M)
+                voffset_a, voffset_b, voffset_scale, C_reg, BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M, USE_FP4_SHUFFLE_WEIGHT=USE_FP4_SHUFFLE_WEIGHT)
 
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
+
+    ###############################################
+    if with_silu and BLOCK_TILE_SIZE_N % 64 == 0 and"gfx950" in J.arch:
+        # use more lds
+        lds_buff = J.LDSTensor([4 * BLOCK_TILE_SIZE_M, 64], torch.float32)
+        # each 32 N as a group to compute gate*up
+        n_groups = BLOCK_TILE_SIZE_N // 32
+        n_half0 = 0
+        n_half1 = B_horz // 2
+        # each wave holds [4, 16, A_vert] floats
+        vouts = J.gpr(A_vert, "vf32")
+        vrow = J.gpr(lane_div_16 + J.warp_id * 4)
+        for n in range(n_groups // 2):
+            vaddr = J.gpr("vu32")
+            for m in range(A_vert):
+                lds_buff.write("b128", C_reg[n * 2 + 0 + n_half0, m], lane_mod_16 + J.warp_id * 16 + m * 64, lane_div_16 * 4)
+                lds_buff.write("b128", C_reg[n * 2 + 1 + n_half0, m], lane_mod_16 + J.warp_id * 16 + m * 64, lane_div_16 * 4 + 16)
+                lds_buff.write("b128", C_reg[n * 2 + 0 + n_half1, m], lane_mod_16 + J.warp_id * 16 + m * 64, lane_div_16 * 4 + 32)
+                lds_buff.write("b128", C_reg[n * 2 + 1 + n_half1, m], lane_mod_16 + J.warp_id * 16 + m * 64, lane_div_16 * 4 + 48)
+
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.s_barrier()
+            v_sorted_id_permute = J.gpr("vu32")
+            for m in range(A_vert):
+                J.ds_bpermute_b32(v_sorted_id_permute, vrow * 4, v_sorted_id[m]) 
+                gate_up = J.gpr(4, 2, 2, "vf32")
+                # interleave 
+                lds_buff.read("b64", gate_up[0], vrow + (0 * 16 + m * 64), lane_mod_16 * 2, offset1 = 16)
+                lds_buff.read("b64", gate_up[1], vrow + (1 * 16 + m * 64), lane_mod_16 * 2, offset1 = 16)
+                lds_buff.read("b64", gate_up[2], vrow + (2 * 16 + m * 64), lane_mod_16 * 2, offset1 = 16)
+                lds_buff.read("b64", gate_up[3], vrow + (3 * 16 + m * 64), lane_mod_16 * 2, offset1 = 16)
+
+                J.s_waitcnt(mod=f"lgkmcnt(2)")
+                J.v_pk_add_f32(gate_up[0, 0], gate_up[0, 0], gate_up[1, 0])
+                J.v_pk_add_f32(gate_up[0, 1], gate_up[0, 1], gate_up[1, 1])
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+                J.v_pk_add_f32(gate_up[2, 0], gate_up[2, 0], gate_up[3, 0])
+                J.v_pk_add_f32(gate_up[2, 1], gate_up[2, 1], gate_up[3, 1])
+                J.v_pk_add_f32(gate_up[0, 0], gate_up[0, 0], gate_up[2, 0])
+                J.v_pk_add_f32(gate_up[0, 1], gate_up[0, 1], gate_up[2, 1])
+
+                out0 = J.gpr(gate_up[0, 1, 0] * J.silu(gate_up[0, 0, 0]))
+                out1 = J.gpr(gate_up[0, 1, 1] * J.silu(gate_up[0, 0, 1]))
+                J.v_add_u32(out0[0], out0[0], s_cvt_bf16_bias)
+                J.v_add_u32(out1[0], out1[0], s_cvt_bf16_bias)
+                J.pk_f32_to_bf16(vouts[m], out0[0], out1[0])
+                # output: [B, TOPK, N]
+                v_token_id = J.gpr(v_sorted_id_permute[0] & 0xffffff)
+                v_topk_id = J.gpr(v_sorted_id_permute[0] >> 24)
+                vaddr = J.gpr(v_token_id * (N // 2 * J.sizeof_bf16 * TOPK) + v_topk_id * (N // 2 * J.sizeof_bf16) + lane_mod_16 * sizeof_f32 + n * 16 * sizeof_f32)
+                with J.ExecMask(v_token_id < M[0], early_skip=False):
+                    J.global_store_dword(vaddr, vouts[m], p_output)
+
+            J.s_barrier()
+
+        return
+    ###############################################
     if use_split_k:
         # split K
         lds_buff = J.LDSTensor([4 * BLOCK_TILE_SIZE_M, 32], torch.float)
@@ -579,7 +646,7 @@ def moe_2stage_splitk(J:JIT,
                 v_topk_id = J.gpr(v_sorted_id_permute[0] >> 24)
                 J.v_add_u32(out[0], out[0], s_cvt_bf16_bias)
                 vaddr = J.gpr(v_token_id * (N // 2 * sizeof_bf16 * TOPK) + v_topk_id * (N // 2 * sizeof_bf16) + lane_mod_16 * sizeof_bf16 + n * 16 * sizeof_bf16)
-                with J.ExecMask(v_token_id < M[0]):
+                with J.ExecMask(v_token_id < M[0], early_skip=False):
                     J.global_store_short_d16_hi(vaddr, out[0], p_output)
             J.s_barrier()
     else:
@@ -590,13 +657,12 @@ def moe_2stage_splitk(J:JIT,
             for m in range(A_vert):
                 vaddr = J.gpr(v_token_id[m] * (N * sizeof_bf16) + lane_div_16 * (4 * sizeof_bf16) + n * 4 * (4 * sizeof_bf16))
                 creg_low = J.gpr(2, "vbf16x2", align=2)
-                J.s_waitcnt(mod=f"lgkmcnt(0)")
                 for j in range(4):
                     C_reg[n, m, j] = C_reg[n, m, j] * v_weight[m]
                     J.v_add_u32(C_reg[n, m, j], C_reg[n, m, j], s_cvt_bf16_bias)
                 creg_low[0] = (C_reg[n, m, 0] >> 16) | (C_reg[n, m, 1] & 0xFFFF0000)
                 creg_low[1] = (C_reg[n, m, 2] >> 16) | (C_reg[n, m, 3] & 0xFFFF0000)
-                with J.ExecMask(v_token_id[m] < M[0]):
+                with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
                     J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
                     J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
 
@@ -1438,6 +1504,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     elif weight_type == torch.float4_e2m1fn_x2:
         import aiter
         from aiter.utility import fp4_utils
+        from aiter.ops.shuffle import shuffle_weight
         # w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
         w_ = torch.randint(-2, 3, [E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16) / 2
         w1_qt, w1_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
@@ -1445,7 +1512,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w1_scale_f32 = fp4_utils.e8m0_to_f32(w1_qt_scale_).to(dtype=torch.bfloat16).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE // 32, 1)
         w1_ref = (w1_f32 * w1_scale_f32).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE)
         w1_qt_scale = fp4_utils.e8m0_shuffle(w1_qt_scale_)
-        w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
+        if USE_FP4_SHUFFLE_WEIGHT:
+            w1 = [shuffle_weight(w1_qt) for _ in range(BUF_COPY)]
+        else:
+            w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
         w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
         # w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
         w_ = torch.randint(-1, 3, [E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16) / 2
@@ -1457,7 +1527,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w2_qt_scale_pad = torch.zeros(w2_qt_scale_.shape[0], div_up(w2_qt_scale_.shape[1], 8) * 8, dtype=w2_qt_scale_.dtype)
         w2_qt_scale_pad[:, :w2_qt_scale_.shape[1]] = w2_qt_scale_
         w2_qt_scale = fp4_utils.e8m0_shuffle(w2_qt_scale_pad)
-        w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
+        if USE_FP4_SHUFFLE_WEIGHT:
+            w2 = [shuffle_weight(w2_qt) for _ in range(BUF_COPY)]
+        else:
+            w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
         w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
     else:
         import aiter
@@ -1543,10 +1616,13 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             )
             BLOCK_TILE_SIZE_M = TILE_M
             BLOCK_TILE_SIZE_N = TILE_N
-            moe_2stage_splitk([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
+            grid = sorted_expert_ids.shape[0]
+            if B * TOPK <= E:
+                grid = B * TOPK
+            moe_2stage_splitk([N1 // BLOCK_TILE_SIZE_N, grid], [256],
                                w1.dtype, TOPK, K1, N1, True, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-            moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
+            moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
         elif kernel_type == 'mxn_splitk_1s':
@@ -1708,6 +1784,8 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64
 
         if (weight_type == torch.float8_e4m3fn or weight_type == torch.float8_e4m3fnuz) and INTER_SIZE // TP % 128 != 0:
             INTER_SIZE = div_up(INTER_SIZE // TP, 128) * 128 * TP
+        if kernel_type == 'aiter' and weight_type == torch.float4_e2m1fn_x2 and INTER_SIZE // TP % 128 != 0:
+            INTER_SIZE = div_up(INTER_SIZE // TP, 128) * 128 * TP
         for i in batch:
             if org_INTER_SIZE != INTER_SIZE:
                 key = f'{i} (adjusted INTER_SIZE={INTER_SIZE})'
@@ -1715,6 +1793,7 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64
                 key = f'{i}'
             perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP)
         perf[kernel_type][str(weight_type)] = perf_prec
+        INTER_SIZE = org_INTER_SIZE
     
     return perf
 

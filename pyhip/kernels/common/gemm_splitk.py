@@ -21,6 +21,7 @@ def gemm_splitk(J:JIT,
                 soffset_b = 0,
                 BLOCK_TILE_SIZE_N = 32,
                 BLOCK_TILE_SIZE_M = 16,
+                USE_FP4_SHUFFLE_WEIGHT=False
                 ):
     assert BLOCK_TILE_SIZE_M % 16 == 0, f'BLOCK_TILE_SIZE_M must be multiple of 16, current {BLOCK_TILE_SIZE_M=}'
     assert BLOCK_TILE_SIZE_N % 32 == 0, f'BLOCK_TILE_SIZE_N must be multiple of 32, current {BLOCK_TILE_SIZE_N=}'
@@ -54,7 +55,7 @@ def gemm_splitk(J:JIT,
     elif weight_dtype == torch.float4_e2m1fn_x2:
         A_rep = 4
     else:
-        raise ValueError(f"Unsupported weight dtype: {weight_dtype}")   
+        raise ValueError(f"Unsupported weight dtype: {weight_dtype}")
     # A_reg layout:
     # pinpong  index for vert direction                 index for different mem read(x16bytes)   index for different mfma   minimal for one mfma
     # pinpong  dword4x[?]                               dword4[?]                                dword2[?]                  dword[?](for mfma)
@@ -68,9 +69,7 @@ def gemm_splitk(J:JIT,
         # the column of scale is K//32
         k_scale_n = div_up(div_up(K, 32), 8) // num_split_k
         v_w_scale = J.gpr(B_horz // 2, k_scale_n, 'vf32', align=4)
-        for n in range(B_horz // 2):
-            for k in range(k_scale_n):
-                J.global_load_dword(v_w_scale[n, k], voffset_scale[n] + k * 64 * sizeof_f32, p_w_scale)
+        k_scale_n_next_read_idx = 0
     elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
         v_w_scale = J.gpr(B_horz, 2, 'vf32')
         for n in range(B_horz):
@@ -87,7 +86,16 @@ def gemm_splitk(J:JIT,
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
 
-    def load_gen(pp_reg_id):
+    def load_gen(pp_reg_id, k=None):
+        k_scale_wip = 0
+        if weight_dtype == torch.float4_e2m1fn_x2:
+            nonlocal k_scale_n_next_read_idx
+            if k % 2 == 0 and k_scale_n_next_read_idx < k_scale_n:
+                for n in range(B_horz // 2):
+                    # prefetch next scale
+                    J.global_load_dword(v_w_scale[n, k_scale_n_next_read_idx], voffset_scale[n], p_w_scale, mod=f'offset:{k_scale_n_next_read_idx * 64 * sizeof_f32}')
+                k_scale_n_next_read_idx += 1
+                k_scale_wip = B_horz // 2
         for m in range(A_vert):
             buff_a.load_dwordx4(A_reg[pp_reg_id, m, 0], voffset_a[m], soffset_ka)
             if weight_dtype != torch.bfloat16:
@@ -99,39 +107,50 @@ def gemm_splitk(J:JIT,
             yield buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
 
         if weight_dtype == torch.float4_e2m1fn_x2:
-            soffset_kb[0] = soffset_kb[0] + 64
+            if USE_FP4_SHUFFLE_WEIGHT:
+                soffset_kb[0] = soffset_kb[0] + 64 * 16
+            else:
+                soffset_kb[0] = soffset_kb[0] + 64
             soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * sizeof_bf16
         else:
             soffset_kb[0] = soffset_kb[0] + 16 * 64 * num_split_k
             soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * num_split_k * sizeof_bf16
-        J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * A_rep})")
+        J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * A_rep + k_scale_wip})")
     
     def mfma_gen(pp_reg_id, k=None):
         if weight_dtype == torch.float4_e2m1fn_x2:
             # decompress
-            v_w_bf16 = J.gpr(B_horz, 4, 'vf32', align=4)
+            v_w_bf16 = J.gpr(2, 4, 'vf32', align=4)
             pos_in_scale = (k & 1) * 16
-            v_w_scale_f32 = J.gpr(B_horz, 'vu32')
-            for n in range(B_horz // 2):
-                J.v_bfe_u32(v_w_scale_f32[2 * n + 0], v_w_scale[n, k // 2], pos_in_scale, 8)
-                J.v_bfe_u32(v_w_scale_f32[2 * n + 1], v_w_scale[n, k // 2], pos_in_scale + 8, 8)
-                v_w_scale_f32[2 * n + 0] = v_w_scale_f32[2 * n + 0] << 23
-                v_w_scale_f32[2 * n + 1] = v_w_scale_f32[2 * n + 1] << 23
-            for i in range(2):
-                for j in range(2):
-                    for n in range(B_horz):
-                        # https://github.com/vosen/llvm-project/blob/f83ee1070d25768518391cbfee1b4412179a5b0a/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.cvt.scalef32.pk.gfx950.ll#L840
-                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[n, 0], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n], mod='op_sel:[0,0,0]')
-                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[n, 1], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n], mod='op_sel:[1,0,0]')
-                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[n, 2], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n], mod='op_sel:[0,1,0]')
-                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[n, 3], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n], mod='op_sel:[1,1,0]')
-                        # 2, A_vert, A_rep=4, 2, 2
-                        if n > 0:
+            v_w_scale_f32 = J.gpr(2, 'vu32')
+            def delayed_fma():
+                for n in range(B_horz):
+                    for i in range(2):
+                        for j in range(2):
                             for m in range(A_vert):
-                                yield J.v_mfma_f32_16x16x32_bf16(C_reg[n - 1, m], v_w_bf16[n - 1], A_reg[pp_reg_id, m, i * 2 + j], C_reg[n - 1, m])
-                    else:
-                        for m in range(A_vert):
-                            yield J.v_mfma_f32_16x16x32_bf16(C_reg[B_horz - 1, m], v_w_bf16[B_horz - 1], A_reg[pp_reg_id, m, i * 2 + j], C_reg[B_horz - 1, m])
+                                yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[j], A_reg[pp_reg_id, m, i * 2 + j], C_reg[n, m])
+
+            is_first_fma = True
+            gen = delayed_fma()
+            for n in range(B_horz):
+                if n % 2 == 0:
+                    J.v_bfe_u32(v_w_scale_f32[0], v_w_scale[n // 2, k // 2], pos_in_scale, 8)
+                    J.v_bfe_u32(v_w_scale_f32[1], v_w_scale[n // 2, k // 2], pos_in_scale + 8, 8)
+                    v_w_scale_f32[0] = v_w_scale_f32[0] << 23
+                    v_w_scale_f32[1] = v_w_scale_f32[1] << 23
+                for i in range(2):
+                    for j in range(2):
+                        # https://github.com/vosen/llvm-project/blob/f83ee1070d25768518391cbfee1b4412179a5b0a/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.cvt.scalef32.pk.gfx950.ll#L840
+                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[j, 0], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n & 1], mod='op_sel:[0,0,0]')
+                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[j, 1], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n & 1], mod='op_sel:[1,0,0]')
+                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[j, 2], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n & 1], mod='op_sel:[0,1,0]')
+                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[j, 3], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n & 1], mod='op_sel:[1,1,0]')
+                        if is_first_fma:
+                            is_first_fma = False
+                        else:
+                            next(gen)
+            next(gen)
+            
         elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
             # decompress
             v_w_f32 = J.gpr(2, 2, 'vf32', align=4)
@@ -160,7 +179,7 @@ def gemm_splitk(J:JIT,
                     yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 1], A_reg[pp_reg_id, m, 0, 1], C_reg[n, m])
 
     def loop(pp_reg_id, k=None):
-        loader = load_gen(pp_reg_id)
+        loader = load_gen(pp_reg_id, k)
         mfma = mfma_gen(1 - pp_reg_id, k)
 
         J.emitter()([loader])
@@ -168,7 +187,7 @@ def gemm_splitk(J:JIT,
         J.emitter()([mfma])
 
     # prolog
-    loader = load_gen(0)
+    loader = load_gen(0, 0)
     J.emitter()([loader])
     if weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
         for n in range(B_horz):
