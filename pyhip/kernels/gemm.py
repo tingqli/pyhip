@@ -352,16 +352,16 @@ if __name__ == '__main__':
     # qwen3 235b/a22b qkv projection
     N, K = 9216, 4096
     # qwen3 235b/a22b qkv projection
-    #N, K = 4096, 8192
+    N, K = 4096, 8192
     num_CU = torch.cuda.get_device_properties().multi_processor_count
-    Ms = [2, 4, 8, 12, 16, 32, 64, 128, 256]
+    Ms = [16, 32, 64, 128, 256]
     perf = {}
     dict_tile_mn = {}
     for M in Ms:
         TILE_M = None
         TILE_N = None
-        for tile_n in [128, 64, 32]:
-            for tile_m in [64, 32, 16]:
+        for tile_m in [16, 32, 64]:
+            for tile_n in [128, 64, 32]:
                 if div_up(M, tile_m) * (N // tile_n) >= num_CU:
                     TILE_M = tile_m
                     TILE_N = tile_n
