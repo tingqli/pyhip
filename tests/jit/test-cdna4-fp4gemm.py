@@ -8,6 +8,7 @@ torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.set_default_device('cuda')
 torch.manual_seed(0)
 
+
 def pre_shuffle(x, mfma_MN):
     M, K = x.shape
     K_bytes = K * x.itemsize
@@ -24,27 +25,8 @@ def pre_shuffle(x, mfma_MN):
     x = x.permute(0,2,3,1,4)
     return x.contiguous()
 
-# M,N,K = 24000,4096,8192
-
-use_pre_shuffle = 0
 wg_M = 256
 wg_N = 256
-M = wg_M * 94
-N = wg_N * 16
-K = 8192//4
-
-blk_cnt = (M // wg_M) * (N // wg_N)
-
-A0 = torch.randn(M, K).to(dtype=torch.bfloat16)
-B0 = torch.randn(N, K).to(dtype=torch.bfloat16)
-C0 = A0 @ B0.t()
-
-if use_pre_shuffle:
-    A = pre_shuffle(A0, 16)
-    B = pre_shuffle(B0, 16)
-else:
-    A = A0
-    B = B0
 
 def get_loader(J, buff, use_pre_shuffle, nbM, nbK, stride_b, ibM0):
     num_warps = 4
@@ -113,7 +95,6 @@ def get_loader(J, buff, use_pre_shuffle, nbM, nbK, stride_b, ibM0):
                 buff.load_dwordx4(None, voff, 0, offset12=0)
                 J.s_addk_i32("m0", 256*J.sizeof_DW4)
                 voff[0] += (8*num_warps) * stride_b
-
             vmem_voff[0] += nbK * 4 * J.sizeof_DW4
 
         col = J.lane_id // 16
@@ -133,26 +114,40 @@ def get_loader(J, buff, use_pre_shuffle, nbM, nbK, stride_b, ibM0):
                 voffset = voff[k]
             J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
 
+    
     return vm_load, vm_load_cnt, ds_read_1kb
 
 
 @pyhip.jit()
-def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC:"void*", M:"int"):
-    # 128 bytes
-    wg_K = J.div(128, J.sizeof_bf16)
+def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, use_pre_shuffleA, use_pre_shuffleB,
+                     pA:"void*", pAscale:"void*",
+                     pB:"void*", pBscale:"void*",
+                     pC:"void*", M:"int"):
+    # K in unit of fp4x2 128 bytes
+    wg_K = J.div(128, J.sizeof_fp4x2)
 
-    A_dtype = "bf16"
-    B_dtype = "bf16"
+    A_dtype = "fp4x2"
+    B_dtype = "fp4x2"
     C_dtype = "bf16"
     M01 = 8
     GroupNum = 8
 
-    stride_k = K * J.sizeof_bf16
+    stride_k = K * J.sizeof_fp4x2
 
     blk_m, blk_n = J.tb_swizzle(J.blockIdx.x, M, wg_M, wg_N, N, M01, GroupNum)
-    pA[:] += blk_m * (wg_M * K * J.sizeof(A_dtype))
-    pB[:] += blk_n * (wg_N * K * J.sizeof(B_dtype))
+    pA[:] += blk_m * (wg_M * stride_k)
+    pB[:] += blk_n * (wg_N * stride_k)
     pC[:] += (blk_m * (wg_M * N * J.sizeof(C_dtype)) + blk_n * (wg_N * J.sizeof(C_dtype)))
+
+    stride_scale = J.div(K, 128) * J.sizeof_DW * 64
+    pAscale[:] += blk_m * J.div(wg_M, 32) * stride_scale
+    pBscale[:] += blk_n * J.div(wg_N, 32) * stride_scale
+
+    pAscale[:] += (J.warp_id[0] // 2) * (J.div(wg_M//2, 32) * stride_scale)
+    pBscale[:] += (J.warp_id[0] % 2) * (J.div(wg_N//2, 32) * stride_scale)
+
+    sbuff_a = J.Buffer(pAscale, J.div(wg_M//2, 32) * stride_scale)
+    sbuff_b = J.Buffer(pBscale, J.div(wg_N//2, 32) * stride_scale)
 
     assert N % wg_N == 0
     num_warps = 4
@@ -171,34 +166,66 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
     warp_m = J.gpr((J.warp_id[0] // 2)*nrM)
     warp_n = J.gpr((J.warp_id[0] % 2)*nrN)
 
-    vm_load_a, vm_load_cnt_a, ds_read_a = get_loader(J, buff_a, use_pre_shuffle, nbM, nbK, stride_k, warp_m)
-    vm_load_b, vm_load_cnt_b, ds_read_b = get_loader(J, buff_b, use_pre_shuffle, nbN, nbK, stride_k, warp_n)
+    vm_load_a, vm_load_cnt_a, ds_read_a = get_loader(J, buff_a, use_pre_shuffleA, nbM, nbK, stride_k, warp_m)
+    vm_load_b, vm_load_cnt_b, ds_read_b = get_loader(J, buff_b, use_pre_shuffleB, nbN, nbK, stride_k, warp_n)
 
     print(f"============={nbM=}, {nbN=}, {nbK=} {nrM=} {nrN=} {nrK=}")
 
     mfma_A = J.gpr(2, nrM, 4, "vbf16x2")
     mfma_B = J.gpr(2, nrN, 4, "vbf16x2")
     mfma_C = J.gpr(nrM, nrN, 4, "af32")
+    
+    mfma_Ascale = J.gpr(2, J.div(nrM, 2), "vu32") # 4
+    mfma_Bscale = J.gpr(2, J.div(nrN, 2), "vu32") # 4
 
-    def mfma(reg_id):
+    def mfma(reg_id, lds_id):
+        # lds_id : scale register is grouped by lds_id
+        # src0: Matrix A scale {OP_SEL_HI [0], OP_SEL[0]} defines which part of scale is used by the Matrix A of MFMA instruction.
+        # src1: Matrix B scale {OP_SEL_HI [1], OP_SEL[1]} defines which part of scale is used by the Matrix B of MFMA instruction.
         for m in range(nrM):
             for n in range(nrN):
-                J.v_mfma_f32_16x16x32_bf16(mfma_C[m,n], mfma_B[reg_id, n], mfma_A[reg_id, m], mfma_C[m,n])
+                sel_scale_B = (n & 1) + (reg_id & 1)*2
+                sel_scale_A = (m & 1) + (reg_id & 1)*2
+                mod = f"op_sel:[{sel_scale_B & 1}, {sel_scale_A & 1},0] op_sel_hi:[{sel_scale_B//2}, {sel_scale_A//2}, 0] cbsz:4 blgp:4"
+
+                # J.v_mfma_f32_16x16x32_bf16(mfma_C[m,n], mfma_B[reg_id, n], mfma_A[reg_id, m], mfma_C[m,n])
+                J.v_mfma_scale_f32_16x16x128_f8f6f4(mfma_C[m,n], mfma_B[reg_id, n], mfma_A[reg_id, m], mfma_C[m,n],
+                                                    mfma_Bscale[lds_id, n//2],
+                                                    mfma_Ascale[lds_id, m//2],
+                                                    mod=mod)
                 yield 16
 
     J.emit(vm_load_a(ldsA[0]))
     J.emit(vm_load_b(ldsB[0]))
+
+    # load scales
+    vaddr_scale = J.gpr("vu32", J.lane_id[0] * J.sizeof_DW)
+
+    def load_next_scales(index):
+        vaddr = J.gpr("vu32", vaddr_scale[0])
+        for ii in range(J.div(nrM, 2)):
+            sbuff_a.load_dword(mfma_Ascale[index & 1, ii], vaddr, 0)
+            vaddr[0] += stride_scale
+            yield 1
+        vaddr = J.gpr("vu32", vaddr_scale[0])
+        for ii in range(J.div(nrN, 2)):
+            sbuff_b.load_dword(mfma_Bscale[index & 1, ii], vaddr, 0)
+            vaddr[0] += stride_scale
+            yield 1
+        vaddr_scale[0] += J.sizeof_DW * 64
+
+    J.emit(load_next_scales(0))
 
     J.emit(vm_load_a(ldsA[1]))
     J.emit(vm_load_b(ldsB[1]))
     mfma_C[...] = 0
 
     '''
-    ab0: mfma ab0 | ds_read ab1; wait_lgkmcnt(0), barrier; vm-load a01
-    ab1: mfma ab1 | vm-load b01; wait_vmcnt, barrier, ds_read ab2
+    ab0: mfma ab0 | ds_read ab1; wait_lgkmcnt(0), barrier; vm-load a01 | load mfma_Ascale[1]
+    ab1: mfma ab1 | vm-load b01; wait_vmcnt, barrier, ds_read ab2      | load mfma_Bscale[1]
 
-    ab2: mfma ab2 | ds_read ab3; wait_lgkmcnt(0), barrier; vm-load  a23
-    ab3: mfma ab3 | vm-load b23;  wait_vmcnt, barrier, ds_read ab0
+    ab2: mfma ab2 | ds_read ab3; wait_lgkmcnt(0), barrier; vm-load  a23 | load mfma_Ascale[0]
+    ab3: mfma ab3 | vm-load b23;  wait_vmcnt, barrier, ds_read ab0      | load mfma_Bscale[0]
     '''
     J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_b + vm_load_cnt_a})")
     J.s_barrier()
@@ -210,23 +237,31 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
 
     def loop_body(lds_id):
         # mfma ab0
-        mfma_ab0 = mfma(0)
+        mfma_ab0 = mfma(0, lds_id)
+
+        load_s = load_next_scales(lds_id + 1)
 
         # ds_read ab1
         for m in range(nrM):
             J.emit(mfma_ab0, 16)
             ds_read_a(ldsA[lds_id], mfma_A[1, m], m, 1)
+            J.emit(load_s, 1)
         for n in range(nrN):
             J.emit(mfma_ab0, 16)
             ds_read_b(ldsB[lds_id], mfma_B[1, n], n, 1)
+            J.emit(load_s, 1)
 
-        J.emit(mfma_ab0, 64)
+        for ii in range(4):
+            J.emit(mfma_ab0, 16)
+            J.emit(load_s, 1)
+
+        J.emit(load_s)
 
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit(mfma_ab0, 16)
         J.s_barrier()
 
-        mfma_ab1 = mfma(1)
+        mfma_ab1 = mfma(1, lds_id)
 
         # vm-load a01
         vm_load = vm_load_a(ldsA[lds_id])
@@ -302,45 +337,149 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             J.global_store_dwordx2(vaddr, vbf16, pC, mod=f"offset:{n*4*J.sizeof_DW2}")
         vaddr[0] += 16*stride_c
 
-C = torch.zeros(M, N, dtype=torch.bfloat16)
-
-gemm_kernel([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle, A.data_ptr(), B.data_ptr(), C.data_ptr(), M)
 
 
-ref_out = C0
-cur_out = C
-acc = "pass"
-if not torch.allclose(ref_out, cur_out, rtol=0.01, atol=0.01):
-    print(f"================= ref_out : {ref_out.shape} ")
-    print(ref_out)
-    print(f"================= cur_out : {cur_out.shape} ")
-    print(cur_out)
-    idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
-    if len(idx[0]):
-        print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
+M,N,K = 24000,4096,8192
+
+# https://github.com/ROCm/aiter/tree/main/csrc/ck_gemm_a4w4_blockscale
+# AITER_REBUILD=1
+
+# mxfp4 
+BUF_COPY = 32
+weight_type = torch.float4_e2m1fn_x2
+import aiter
+from aiter.utility import fp4_utils
+from aiter.ops.shuffle import shuffle_weight
+w_ = torch.randint(-2, 3, [N, K], dtype=torch.bfloat16) / 2
+w_qt, w_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
+
+w_qt_scale_[...] = 1.0
+
+w_f32 = fp4_utils.mxfp4_to_f32(w_qt).to(dtype=torch.bfloat16).reshape(N, K // 32, 32)
+w_scale_f32 = fp4_utils.e8m0_to_f32(w_qt_scale_).to(dtype=torch.bfloat16).reshape(N, K // 32, 1)
+w_ref = (w_f32 * w_scale_f32).reshape(N, K)
+assert K % 256 == 0, f'e8m0_shuffle assume there will be 8 groups of 32 elements in K dim, current K={K} is not supported'
+w_qt_scale = fp4_utils.e8m0_shuffle(w_qt_scale_)
+w = [shuffle_weight(w_qt) for _ in range(BUF_COPY)]
+w_scale = [w_qt_scale.clone() for _ in range(BUF_COPY)]
+A = (torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16) + 1)*0.01
+ref_out = A[0] @ w_ref.t()
+
+from aiter import gemm_a4w4, per_1x32_f4_quant_hip
+def _run_aiter(
+                x: "Tensor",  # A:[M, K] bf16
+                weight: "Tensor",  # B:[N, K/2] f4x2
+                weight_scale: "Tensor",  # B_scale:[N, K/32] e8m0 paded
+            ):
+    M = x.shape[0]
+    N = weight.shape[0]
+    K = weight.shape[1]
+    # use hip quant kernel for performance
+    x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
+
+    #print(f"{x.shape}{x.dtype},  {x_q.shape}{x_q.dtype},    {x_s.shape}{x_s.dtype} ")
+    #print(f"{weight.shape}{weight.dtype},   {weight_scale.shape}{weight_scale.dtype}")
     #assert 0
-    acc = "failed"
+    # 32 alignment is enough for dim0 padding of output for
+    # gemm_a4w4 kernel
+    y = torch.empty(
+        (M + 31) // 32 * 32,
+        weight.shape[0],
+        device=x_q.device,
+        dtype=x.dtype,
+    )
+
+    gemm_a4w4(
+        x_q, weight, x_s, weight_scale.view(x_s.dtype), y, bpreshuffle=True
+    )
+    return y[:M]
+
+def _run_fp4gemm(
+                x: "Tensor",  # A:[M, K] bf16
+                weight: "Tensor",  # B:[N, K/2] f4x2
+                weight_scale: "Tensor",  # B_scale:[N, K/32] e8m0 paded
+            ):
+    M = x.shape[0]
+    N = weight.shape[0]
+    K = weight.shape[1]
+    # use hip quant kernel for performance
+    x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
+
+    '''
+        m, n = x.shape
+        assert quant_dtype == dtypes.fp4x2
+        assert n % 2 == 0    
+
+        scale = (
+            torch.empty(
+                (
+                    (m + 255) // 256 * 256,     # round-up (m) to 256
+                    (n // 32 + 7) // 8 * 8,     # round-up (n//32) to 8
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            # .fill_(0x7F)
+            .view(dtypes.fp8_e8m0)
+    '''
+
+    # 32 alignment is enough for dim0 padding of output for
+    # gemm_a4w4 kernel
+    y = torch.empty(
+        (M + 31) // 32 * 32,
+        weight.shape[0],
+        device=x_q.device,
+        dtype=x.dtype,
+    )
+
+    blk_cnt = ((M + wg_M - 1) // wg_M) * ((N + wg_N - 1) // wg_N)
+
+    gemm_a4w4_kernel(
+        [blk_cnt], [256],
+        wg_M, wg_N, N, K, False, True,
+        x_q.data_ptr(), x_s.data_ptr(),
+        weight.data_ptr(), weight_scale.data_ptr(),
+        y.data_ptr(), M)
+
+    return y[:M]
+
+# https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/testing/numeric.py#L5
+def calc_diff(x: torch.Tensor, y: torch.Tensor):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    if denominator == 0:    # Which means that all elements in x and y are 0
+        return 0.0
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+
+y = _run_aiter(A[0], weight=w[0], weight_scale=w_scale[0])
+y2 = _run_fp4gemm(A[0], weight=w[0], weight_scale=w_scale[0])
+assert calc_diff(y2, y) < 0.01
+
+print(f"{A[0].shape} {A[0].dtype} x  {w[0].shape}  {w[0].dtype} , {w_scale[0].shape} {w_scale[0].dtype} =>  {y.shape} {y.dtype}")
 
 
-DATA_CLONES = 40
-As = [torch.clone(A) for _ in range(DATA_CLONES)]
-Bs = [torch.clone(B) for _ in range(DATA_CLONES)]
-Cs = [torch.clone(C) for _ in range(DATA_CLONES)]
+diff = calc_diff(ref_out, y)
+diff2 = calc_diff(ref_out, y2)
+print(ref_out)
+print(y)
+print(diff, diff2)
+assert diff < 0.01, diff
+assert diff2 < 0.01, diff2
 
-A0s = [torch.clone(A0) for _ in range(DATA_CLONES)]
-B0s = [torch.clone(B0) for _ in range(DATA_CLONES)]
 
-di = 0
-for i in range(10):
-    di = (di + 1)%DATA_CLONES
-    with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"torch_{di}") as p0:
-        ref = torch.nn.functional.linear(A0s[di], B0s[di])
 
-for i in range(10):
-    di = (di + 1)%DATA_CLONES
-    with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"gemm_{di}") as p0:
-        gemm_kernel([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle,
-                    As[di].data_ptr(),
-                    Bs[di].data_ptr(),
-                    Cs[di].data_ptr(), M)
-print(f"{acc=}")
+flops = 2 * M * N * K
+mem_size = M * K * 2 + N * K * 0.5
+with pyhip.torchPerf("./111"):
+    di = 0
+    for i in range(10):
+        with pyhip.cudaPerf(flops, mem_size, name="aiter"):
+            _run_aiter(A[di], weight=w[di], weight_scale=w_scale[di])
+            di += 1
+    for i in range(10):
+        with pyhip.cudaPerf(flops, mem_size, name="fp4gemm"):
+            _run_fp4gemm(A[di], weight=w[di], weight_scale=w_scale[di])
+            di += 1
+
+assert 0

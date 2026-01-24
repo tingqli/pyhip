@@ -836,6 +836,7 @@ class JIT:
         self.sizeof_fp16 = 2
         self.sizeof_fp8 = 1
         self.sizeof_bf8 = 1
+        self.sizeof_fp4x2 = 1
         # allows J.sizeof(dtype), dtype can be string or torch dtype
         self._sizeof = {
             "dw4" : 16,
@@ -879,13 +880,17 @@ class JIT:
             #    fp8/float8_e4m3fnuz & bf8/float8_e5m2fnuz
             # torch.float8_e4m3fnuz:1,
             # torch.float8_e5m2fnuz:1,
+            "fp4x2" : 1
         }
 
-    def sizeof(self, dtype):
+    def sizeof(self, dtype, cnt=1):
+        if str(dtype) in ["torch.float4_e2m1fn_x2", "fp4x2"]:
+            assert cnt % 2 == 0
+            return cnt//2
         if isinstance(dtype ,str):
-            return self._sizeof[dtype]
+            return self._sizeof[dtype] * cnt
         # assume it's torch dype
-        return dtype.itemsize
+        return dtype.itemsize * cnt
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -3102,7 +3107,7 @@ r'''
 
     # a unified instruction for f32=>bf16 conversion
     def uni_cvt_pk_bf16_f32(self, vdst, vsrc0, vsrc1):
-        if "gfx950" in self.arch:
+        if self.cdna >= 4:
             return self.v_cvt_pk_bf16_f32(vdst, vsrc0, vsrc1)
         else:
             # this is simple but less accurate, no round to even
