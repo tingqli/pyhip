@@ -2029,6 +2029,14 @@ class JIT:
                             self.log(f"insert s_nop({n_nops}) at #{loc} : [VALU Trans op, Non-trans VALU op consumes result of that op]")
                             break
 
+                if prev.opcode.startswith("v_") and cur.opcode.startswith("v_permlane"):
+                    vdst = prev.operands[0]
+                    for op in cur.operands:
+                        if isinstance(op, GPRExpr) and vdst.overlap(op):
+                            n_nops = 2
+                            self.log(f"insert s_nop({n_nops}) at #{loc} : [VALU* writes vdst, V_PERMLANE* reads vdst]")
+                            break
+
                 if n_nops >= 0:
                     inst = Instruction(bb, "s_nop")
                     inst(n_nops, insert_bb_pos = i)

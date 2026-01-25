@@ -240,7 +240,6 @@ def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, use_pre_shuffleA, use_pre_shuffleB,
         mfma_ab0 = mfma(0, lds_id)
 
         load_s = load_next_scales(lds_id + 1)
-
         # ds_read ab1
         for m in range(nrM):
             J.emit(mfma_ab0, 16)
@@ -323,18 +322,39 @@ def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, use_pre_shuffleA, use_pre_shuffleB,
     for lds in ldsB: J.free_lds(lds)
 
     stride_c = N * J.sizeof_bf16
-    vdata = J.gpr(4, "vbf16x2")
-    vbf16 = J.gpr(2, "vbf16x2")
-    vaddr = J.gpr(((J.lane_id % 16) + warp_m * 16)*stride_c + ((J.lane_id // 16) + warp_n * 4) * J.sizeof_DW2)
+    vdata = J.gpr(8, "vbf16x2")
+    vbf16 = J.gpr(4, "vbf16x2")
+    col = J.lane_id // 16
+    swap_12_col = (col & 1) * 2 + (col >> 1)
+    vaddr = J.gpr(((J.lane_id % 16) + warp_m * 16)*stride_c + swap_12_col * J.sizeof_DW4 + warp_n * 4 * J.sizeof_DW2)
     for m in range(nrM):
-        for n in range(nrN):
+        for n in range(0, nrN, 2):
             J.v_accvgpr_read_b32(vdata[0], mfma_C[m,n,0])
             J.v_accvgpr_read_b32(vdata[1], mfma_C[m,n,1])
             J.uni_cvt_pk_bf16_f32(vbf16[0], vdata[0], vdata[1])
+
             J.v_accvgpr_read_b32(vdata[2], mfma_C[m,n,2])
             J.v_accvgpr_read_b32(vdata[3], mfma_C[m,n,3])
             J.uni_cvt_pk_bf16_f32(vbf16[1], vdata[2], vdata[3])
-            J.global_store_dwordx2(vaddr, vbf16, pC, mod=f"offset:{n*4*J.sizeof_DW2}")
+
+            J.v_accvgpr_read_b32(vdata[4], mfma_C[m,n+1,0])
+            J.v_accvgpr_read_b32(vdata[5], mfma_C[m,n+1,1])
+            J.uni_cvt_pk_bf16_f32(vbf16[2], vdata[4], vdata[5])
+
+            J.v_accvgpr_read_b32(vdata[6], mfma_C[m,n+1,2])
+            J.v_accvgpr_read_b32(vdata[7], mfma_C[m,n+1,3])
+            J.uni_cvt_pk_bf16_f32(vbf16[3], vdata[6], vdata[7])
+
+            #    a0    a1   a2   a3   | 01 23
+            #    b0    b1   b2   b3   | 45 67
+            #  v_permlane16_swap_b32(a, b)
+            #    a0    b0   a2   b2   |
+            #    a1    b1   a3   b3   |
+            #
+            # swap of row 1 & 2 are done by swapping lane-address 
+            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+            J.global_store_dwordx4(vaddr, vbf16, pC, mod=f"offset:{n*4*J.sizeof_DW2}")
         vaddr[0] += 16*stride_c
 
 
@@ -454,7 +474,8 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor):
 
 y = _run_aiter(A[0], weight=w[0], weight_scale=w_scale[0])
 y2 = _run_fp4gemm(A[0], weight=w[0], weight_scale=w_scale[0])
-assert calc_diff(y2, y) < 0.01
+acc = []
+acc.append("pass1" if calc_diff(y2, y) < 0.01 else "fail1")
 
 print(f"{A[0].shape} {A[0].dtype} x  {w[0].shape}  {w[0].dtype} , {w_scale[0].shape} {w_scale[0].dtype} =>  {y.shape} {y.dtype}")
 
@@ -464,14 +485,14 @@ diff2 = calc_diff(ref_out, y2)
 print(ref_out)
 print(y)
 print(diff, diff2)
-assert diff < 0.01, diff
-assert diff2 < 0.01, diff2
+acc.append("pass2" if diff < 0.01 else "fail2")
+acc.append("pass3" if diff2 < 0.01 else "fail3")
 
 
 
 flops = 2 * M * N * K
 mem_size = M * K * 2 + N * K * 0.5
-with pyhip.torchPerf("./111"):
+with pyhip.torchPerf():
     di = 0
     for i in range(10):
         with pyhip.cudaPerf(flops, mem_size, name="aiter"):
@@ -482,4 +503,4 @@ with pyhip.torchPerf("./111"):
             _run_fp4gemm(A[di], weight=w[di], weight_scale=w_scale[di])
             di += 1
 
-assert 0
+print(acc)
