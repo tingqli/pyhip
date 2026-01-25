@@ -295,24 +295,12 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
     vaddr = J.gpr(((J.lane_id % 16) + warp_m * 16)*stride_c + swap_12_col * J.sizeof_DW4 + warp_n * 4 * J.sizeof_DW2)
     for m in range(nrM):
         for n in range(0, nrN, 2):
-            J.v_accvgpr_read_b32(vdata[0], mfma_C[m,n,0])
-            J.v_accvgpr_read_b32(vdata[1], mfma_C[m,n,1])
-            J.uni_cvt_pk_bf16_f32(vbf16[0], vdata[0], vdata[1])
-
-            J.v_accvgpr_read_b32(vdata[2], mfma_C[m,n,2])
-            J.v_accvgpr_read_b32(vdata[3], mfma_C[m,n,3])
-            J.uni_cvt_pk_bf16_f32(vbf16[1], vdata[2], vdata[3])
-
-            J.v_accvgpr_read_b32(vdata[4], mfma_C[m,n+1,0])
-            J.v_accvgpr_read_b32(vdata[5], mfma_C[m,n+1,1])
-            J.uni_cvt_pk_bf16_f32(vbf16[2], vdata[4], vdata[5])
-
-            J.v_accvgpr_read_b32(vdata[6], mfma_C[m,n+1,2])
-            J.v_accvgpr_read_b32(vdata[7], mfma_C[m,n+1,3])
-            J.uni_cvt_pk_bf16_f32(vbf16[3], vdata[6], vdata[7])
-
+            J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[m,n,0], mfma_C[m,n,1])
+            J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[m,n,2], mfma_C[m,n,3])
+            J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[m,n+1,0], mfma_C[m,n+1,1])
+            J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[m,n+1,2], mfma_C[m,n+1,3])
             #    a0    a1   a2   a3   | 01 23
-            #    b0    b1   b2   b3   | 45 67
+            #    b0    b1   b2   b3   | 45 67 
             #  v_permlane16_swap_b32(a, b)
             #    a0    b0   a2   b2   |
             #    a1    b1   a3   b3   |

@@ -85,6 +85,28 @@ def _utils_is_simple_operand0_store(opcode, mod):
 
     return False
 
+@cache
+def _utils_accept_accvgpr(opcode, mod):
+    if opcode.startswith("v_accvgpr_"):
+        return True
+    if opcode.startswith("v_mfma_"):
+        return True
+    if opcode.startswith("v_smfmac_"):
+        return True
+    if opcode.startswith("flat_"):
+        return True
+    if opcode.startswith("ds_"):
+        return True
+    if opcode.startswith("buffer_"):
+        return True
+    if opcode.startswith("tbuffer_"):
+        return True
+    if opcode.startswith("global_"):
+        return True
+    if opcode.startswith("scratch_"):
+        return True
+    return False
+
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
     def __init__(self, parent_bb:'BasicBlock', opcode, loc=""):
@@ -784,11 +806,12 @@ os.makedirs(PYHIP_CACHE_DIR, exist_ok=True)
 
 PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
-PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_DUMP_DIR = os.getenv("PYHIP_DUMP_DIR", "")
 PYHIP_RECOMPILE = int(os.getenv("PYHIP_RECOMPILE", "0"))
 PYHIP_NOPASS = os.getenv("PYHIP_NOPASS", "").split(":")
 
+if len(PYHIP_DEBUG_LOG):
+    PYHIP_RECOMPILE = 1
 if len(PYHIP_DUMP_DIR):
     # remove temp-cache to force recompile once 
     PYHIP_RECOMPILE = 1
@@ -1303,6 +1326,7 @@ class JIT:
                     useless_gprs[gpr_repr] = ivs
 
             if len(useless_gprs) == 0: break
+            self.debug_print("useless_gprs: ", useless_gprs)
 
             for gpr_repr in useless_gprs:
                 del live_intervals[gpr_repr]
@@ -1716,7 +1740,10 @@ class JIT:
             # assign
             src_cnt = expr.src2 - expr.src1 + 1
             assert src_cnt == 1
-            new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
+            if rtype == "v" and expr.src0.rtype == "a":
+                new_inst = Instruction(bb, f"v_accvgpr_read_b32", loc=loc)
+            else:
+                new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
             new_inst(dst_expr, expr)
             return
 
@@ -2004,6 +2031,25 @@ class JIT:
                 if inst.opcode == "expression_place_holder":
                     expr_insts.append(inst)
             self.compile_bb_expr(bb, expr_insts)
+
+    def pass_a2v(self):
+        # each operand must be gpr, not expression
+        for bb in self.blocks:
+            i = 0
+            while i < len(bb.instructions):
+                cur = bb.instructions[i]
+                if not _utils_accept_accvgpr(cur.opcode, cur.mod):
+                    for opid, op in enumerate(cur.operands):
+                        if isinstance(op, GPRExpr) and op.find_rtype() == "a":
+                            assert opid != 0, f"destination for {cur} cannot be accvgpr"
+                            cnt = len(op)
+                            vgpr = self.gpr(cnt, "vu32")
+                            for j in range(cnt):
+                                inst = Instruction(bb, "v_accvgpr_read_b32")
+                                inst(vgpr[j], op[j], insert_bb_pos = i)
+                            cur.operands[opid] = vgpr[...]
+                            i += 1
+                i += 1
 
     def pass_insert_nop(self):
         for bb in self.blocks:
@@ -2707,11 +2753,7 @@ class JIT:
                 print(self.current_bb.debug_str(), file=f)
         dump_serial_id += 1
 
-    def build(self, kernel_name, signature, extra_compiler_options, cpp_src_fpath, dump_stat):
-        self.asm_debug_info = ""
-        self._finish_bb(self.current_bb)
-
-        # remove unreachable bb
+    def pass_remove_dead_bb(self):
         bb_to_remove = []
         for bb in self.blocks[1:]:
             if len(bb.predecessors) == 0:
@@ -2747,6 +2789,18 @@ class JIT:
         for empty_bb in bb_to_remove:
             self.blocks.remove(empty_bb)   
         '''
+
+    def build(self, kernel_name, signature, extra_compiler_options, cpp_src_fpath, dump_stat):
+        self.asm_debug_info = ""
+        self._finish_bb(self.current_bb)
+
+        self.dump_code(f"after_nothing")
+
+        self.pass_remove_dead_bb()
+        self.dump_code(f"after_pass_remove_dead_bb")
+
+        self.pass_a2v()
+        self.dump_code(f"after_pass_a2v")
 
         # use following way only
         # if we want to do multi-expression optimization (like common expr extraction...)
