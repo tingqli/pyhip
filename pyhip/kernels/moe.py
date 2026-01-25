@@ -565,10 +565,22 @@ def moe_2stage_splitk(J:JIT,
         for n in range(n_groups // 2):
             vaddr = J.gpr("vu32")
             for m in range(A_vert):
-                lds_buff.write("b128", C_reg[n * 2 + 0 + n_half0, m], lane_mod_16 + J.warp_id * 16 + m * 64, lane_div_16 * 4)
-                lds_buff.write("b128", C_reg[n * 2 + 1 + n_half0, m], lane_mod_16 + J.warp_id * 16 + m * 64, lane_div_16 * 4 + 16)
-                lds_buff.write("b128", C_reg[n * 2 + 0 + n_half1, m], lane_mod_16 + J.warp_id * 16 + m * 64, lane_div_16 * 4 + 32)
-                lds_buff.write("b128", C_reg[n * 2 + 1 + n_half1, m], lane_mod_16 + J.warp_id * 16 + m * 64, lane_div_16 * 4 + 48)
+                col = lane_div_16
+                row = lane_mod_16
+                col = (row ^ col) % 8
+                lds_buff.write("b128", C_reg[n * 2 + 0 + n_half0, m], lane_mod_16 + J.warp_id * 16 + m * 64, col * 4)
+                col = lane_div_16 + 4
+                row = lane_mod_16
+                col = (row ^ col) % 8
+                lds_buff.write("b128", C_reg[n * 2 + 1 + n_half0, m], lane_mod_16 + J.warp_id * 16 + m * 64, col * 4)
+                col = lane_div_16
+                row = lane_mod_16
+                col = (row ^ col) % 8
+                lds_buff.write("b128", C_reg[n * 2 + 0 + n_half1, m], lane_mod_16 + J.warp_id * 16 + m * 64, col * 4 + 32)
+                col = lane_div_16 + 4
+                row = lane_mod_16
+                col = (row ^ col) % 8
+                lds_buff.write("b128", C_reg[n * 2 + 1 + n_half1, m], lane_mod_16 + J.warp_id * 16 + m * 64, col * 4 + 32)
 
             J.s_waitcnt(mod=f"lgkmcnt(0)")
             J.s_barrier()
@@ -577,10 +589,13 @@ def moe_2stage_splitk(J:JIT,
                 J.ds_bpermute_b32(v_sorted_id_permute, vrow * 4, v_sorted_id[m]) 
                 gate_up = J.gpr(4, 2, 2, "vf32")
                 # interleave 
-                lds_buff.read("b64", gate_up[0], vrow + (0 * 16 + m * 64), lane_mod_16 * 2, offset1 = 16)
-                lds_buff.read("b64", gate_up[1], vrow + (1 * 16 + m * 64), lane_mod_16 * 2, offset1 = 16)
-                lds_buff.read("b64", gate_up[2], vrow + (2 * 16 + m * 64), lane_mod_16 * 2, offset1 = 16)
-                lds_buff.read("b64", gate_up[3], vrow + (3 * 16 + m * 64), lane_mod_16 * 2, offset1 = 16)
+                col = lane_mod_16 // 2
+                row = vrow
+                col = (row ^ col) % 8
+                lds_buff.read("b64", gate_up[0], vrow + (0 * 16 + m * 64), col * 4 + (lane_mod_16 & 1) * 2, offset1 = 16)
+                lds_buff.read("b64", gate_up[1], vrow + (1 * 16 + m * 64), col * 4 + (lane_mod_16 & 1) * 2, offset1 = 16)
+                lds_buff.read("b64", gate_up[2], vrow + (2 * 16 + m * 64), col * 4 + (lane_mod_16 & 1) * 2, offset1 = 16)
+                lds_buff.read("b64", gate_up[3], vrow + (3 * 16 + m * 64), col * 4 + (lane_mod_16 & 1) * 2, offset1 = 16)
 
                 J.s_waitcnt(mod=f"lgkmcnt(2)")
                 J.v_pk_add_f32(gate_up[0, 0], gate_up[0, 0], gate_up[1, 0])

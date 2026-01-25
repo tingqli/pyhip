@@ -137,8 +137,7 @@ def gemm_splitk(J:JIT,
                 if n % 2 == 0:
                     J.v_bfe_u32(v_w_scale_f32[0], v_w_scale[n // 2, k // 2], pos_in_scale, 8)
                     J.v_bfe_u32(v_w_scale_f32[1], v_w_scale[n // 2, k // 2], pos_in_scale + 8, 8)
-                    v_w_scale_f32[0] = v_w_scale_f32[0] << 23
-                    v_w_scale_f32[1] = v_w_scale_f32[1] << 23
+                    J.v_lshlrev_b64(v_w_scale_f32, 23, v_w_scale_f32)
                 for i in range(2):
                     for j in range(2):
                         # https://github.com/vosen/llvm-project/blob/f83ee1070d25768518391cbfee1b4412179a5b0a/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.cvt.scalef32.pk.gfx950.ll#L840

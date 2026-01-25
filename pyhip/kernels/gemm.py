@@ -141,19 +141,27 @@ def gemm_splitk_wd(J:JIT,
     s_c_offset[0] = 0
     for n in range(n_groups):
         for m in range(A_vert):
-            lds_buff.write("b128", C_reg[2 * n + 0, m], lane_mod_16 + warp_id * 16 + m * 64, lane_div_16 * 4)
-            lds_buff.write("b128", C_reg[2 * n + 1, m], lane_mod_16 + warp_id * 16 + m * 64, lane_div_16 * 4 + 16)
+            col = lane_div_16
+            row = lane_mod_16
+            col = (row ^ col) % 8
+            lds_buff.write("b128", C_reg[2 * n + 0, m], lane_mod_16 + warp_id * 16 + m * 64, col * 4)
+            col = lane_div_16 + 4
+            col = (row ^ col) % 8
+            lds_buff.write("b128", C_reg[2 * n + 1, m], lane_mod_16 + warp_id * 16 + m * 64, col * 4)
 
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.s_barrier()
         # each wave reduce 4 rows once
         for m in range(A_vert):
             c_in_wave = J.gpr(4, 2, "vf32", align=2)
-            # interleave 
-            lds_buff.read("b64", c_in_wave[0], vrow + (0 * 16 + m * 64), lane_mod_16 * 2)
-            lds_buff.read("b64", c_in_wave[1], vrow + (1 * 16 + m * 64), lane_mod_16 * 2)
-            lds_buff.read("b64", c_in_wave[2], vrow + (2 * 16 + m * 64), lane_mod_16 * 2)
-            lds_buff.read("b64", c_in_wave[3], vrow + (3 * 16 + m * 64), lane_mod_16 * 2)
+            # interleave
+            col = lane_mod_16 // 2
+            row = vrow
+            col = (row ^ col) % 8
+            lds_buff.read("b64", c_in_wave[0], vrow + (0 * 16 + m * 64), col * 4 + (lane_mod_16 & 1) * 2)
+            lds_buff.read("b64", c_in_wave[1], vrow + (1 * 16 + m * 64), col * 4 + (lane_mod_16 & 1) * 2)
+            lds_buff.read("b64", c_in_wave[2], vrow + (2 * 16 + m * 64), col * 4 + (lane_mod_16 & 1) * 2)
+            lds_buff.read("b64", c_in_wave[3], vrow + (3 * 16 + m * 64), col * 4 + (lane_mod_16 & 1) * 2)
 
             J.s_waitcnt(mod=f"lgkmcnt(2)")
             J.v_pk_add_f32(c_in_wave[0], c_in_wave[0], c_in_wave[1])
@@ -352,25 +360,42 @@ if __name__ == '__main__':
     # qwen3 235b/a22b qkv projection
     N, K = 9216, 4096
     # qwen3 235b/a22b qkv projection
-    N, K = 4096, 8192
-    num_CU = torch.cuda.get_device_properties().multi_processor_count
+    #N, K = 4096, 8192
     Ms = [16, 32, 64, 128, 256]
     perf = {}
     dict_tile_mn = {}
-    for M in Ms:
-        TILE_M = None
-        TILE_N = None
+
+    def get_tile_mn(M):
+        num_CU = torch.cuda.get_device_properties().multi_processor_count
+        solutions = []
         for tile_m in [16, 32, 64]:
-            for tile_n in [128, 64, 32]:
-                if div_up(M, tile_m) * (N // tile_n) >= num_CU:
-                    TILE_M = tile_m
-                    TILE_N = tile_n
-                    break
-            if TILE_M is not None:
-                break
-        if TILE_M is None or TILE_N is None:
-            TILE_M = 16
-            TILE_N = 32
+            for tile_n in [32, 64, 128]:
+                works = div_up(M, tile_m) * div_up(N, tile_n)
+                if works >= num_CU:
+                    round = works // num_CU
+                    reminder = works % num_CU
+                    solutions.append((round, reminder, tile_m, tile_n))
+                else:
+                    reminder = num_CU - works % num_CU
+                    solutions.append((100000, reminder, tile_m, tile_n))
+        # prefer less rounds; then less reminder
+        TILE_M, TILE_N = sorted(solutions)[0][2:]
+        return TILE_M, TILE_N
+
+    TILE_M, TILE_N = get_tile_mn(64)
+    for M in Ms:
+        TILE_M, TILE_N = get_tile_mn(M)
+        # if N == 9216 and K == 4096:
+        #     if M in [16]:
+        #         TILE_M = 16
+        #         TILE_N = 64
+        #     elif M in [32]:
+        #         TILE_M = 32
+        #         TILE_N = 64
+        #     elif M in [64, 128]:
+        #         TILE_M = 32
+        #         TILE_N = 128
+
         print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
         dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
         test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
