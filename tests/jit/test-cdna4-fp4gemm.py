@@ -3,11 +3,9 @@ import pytest
 import functools
 import torch
 
-
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.set_default_device('cuda')
 torch.manual_seed(0)
-
 
 def pre_shuffle(x, mfma_MN):
     M, K = x.shape
@@ -24,9 +22,6 @@ def pre_shuffle(x, mfma_MN):
     x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L)
     x = x.permute(0,2,3,1,4)
     return x.contiguous()
-
-wg_M = 256
-wg_N = 256
 
 def get_loader(J, buff, use_pre_shuffle, nbM, nbK, stride_b, ibM0):
     num_warps = 4
@@ -119,12 +114,14 @@ def get_loader(J, buff, use_pre_shuffle, nbM, nbK, stride_b, ibM0):
 
 
 @pyhip.jit()
-def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, use_pre_shuffleA, use_pre_shuffleB,
+def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, a_preshuffle, b_preshuffle,
                      pA:"void*", pAscale:"void*",
                      pB:"void*", pBscale:"void*",
                      pC:"void*", M:"int"):
     # K in unit of fp4x2 128 bytes
     wg_K = J.div(128, J.sizeof_fp4x2)
+
+    J.show_gemm_buf(mfma_MN = 16, n_mfma_K = 4, wave_CNT = [2,2], wave_Size = [128, 128])
 
     A_dtype = "fp4x2"
     B_dtype = "fp4x2"
@@ -166,8 +163,8 @@ def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, use_pre_shuffleA, use_pre_shuffleB,
     warp_m = J.gpr((J.warp_id[0] // 2)*nrM)
     warp_n = J.gpr((J.warp_id[0] % 2)*nrN)
 
-    vm_load_a, vm_load_cnt_a, ds_read_a = get_loader(J, buff_a, use_pre_shuffleA, nbM, nbK, stride_k, warp_m)
-    vm_load_b, vm_load_cnt_b, ds_read_b = get_loader(J, buff_b, use_pre_shuffleB, nbN, nbK, stride_k, warp_n)
+    vm_load_a, vm_load_cnt_a, ds_read_a = get_loader(J, buff_a, a_preshuffle, nbM, nbK, stride_k, warp_m)
+    vm_load_b, vm_load_cnt_b, ds_read_b = get_loader(J, buff_b, b_preshuffle, nbN, nbK, stride_k, warp_n)
 
     print(f"============={nbM=}, {nbN=}, {nbK=} {nrM=} {nrN=} {nrK=}")
 
@@ -306,19 +303,15 @@ def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, use_pre_shuffleA, use_pre_shuffleB,
         J.emit(mfma_ab1)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
 
-    if 0:
-        for koff in range(J.div(K, wg_K)):
-            loop_body(koff & 1)
-    else:
-        koff = J.gpr("su32", 0)
-        loop_cnt = K // (2*wg_K)
-        with J.While(koff[0] < loop_cnt):
-            loop_body(0)
-            loop_body(1)
-            koff[0] += 1
+    koff = J.gpr("su32", 0)
+    loop_cnt = K // (2*wg_K)
+    with J.While(koff[0] < loop_cnt):
+        loop_body(0)
+        loop_body(1)
+        koff[0] += 1
 
-        if K % (2*wg_K):
-            loop_body(0)
+    if K % (2*wg_K):
+        loop_body(0)
 
     for lds in ldsA: J.free_lds(lds) 
     for lds in ldsB: J.free_lds(lds)
@@ -347,8 +340,11 @@ def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, use_pre_shuffleA, use_pre_shuffleB,
         vaddr[0] += 16*stride_c
 
 
-
+wg_M = 256
+wg_N = 256
 M,N,K = 24000,4096,8192
+#M,N,K = 24000,3072,4096
+#M,N,K = 24000,4096,1536
 
 # https://github.com/ROCm/aiter/tree/main/csrc/ck_gemm_a4w4_blockscale
 # AITER_REBUILD=1
@@ -359,32 +355,32 @@ weight_type = torch.float4_e2m1fn_x2
 import aiter
 from aiter.utility import fp4_utils
 from aiter.ops.shuffle import shuffle_weight
-w_ = torch.randint(-2, 3, [N, K], dtype=torch.bfloat16) / 2
+w_ = torch.randint(-2, 3, [N, K], dtype=torch.bfloat16)
+
 w_qt, w_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
-
-w_qt_scale_[...] = 1.0
-
 w_f32 = fp4_utils.mxfp4_to_f32(w_qt).to(dtype=torch.bfloat16).reshape(N, K // 32, 32)
 w_scale_f32 = fp4_utils.e8m0_to_f32(w_qt_scale_).to(dtype=torch.bfloat16).reshape(N, K // 32, 1)
 w_ref = (w_f32 * w_scale_f32).reshape(N, K)
+
 assert K % 256 == 0, f'e8m0_shuffle assume there will be 8 groups of 32 elements in K dim, current K={K} is not supported'
 w_qt_scale = fp4_utils.e8m0_shuffle(w_qt_scale_)
-w = [shuffle_weight(w_qt) for _ in range(BUF_COPY)]
+w_qt = shuffle_weight(w_qt)
+w = [w_qt.clone() for _ in range(BUF_COPY)]
 w_scale = [w_qt_scale.clone() for _ in range(BUF_COPY)]
-A = (torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16) + 1)*0.01
+A = torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16)
 ref_out = A[0] @ w_ref.t()
 
-from aiter import gemm_a4w4, per_1x32_f4_quant_hip
-def _run_aiter(
+def _run_gemm_a4w4(
                 x: "Tensor",  # A:[M, K] bf16
                 weight: "Tensor",  # B:[N, K/2] f4x2
                 weight_scale: "Tensor",  # B_scale:[N, K/32] e8m0 paded
+                use_jit
             ):
     M = x.shape[0]
     N = weight.shape[0]
     K = weight.shape[1]
     # use hip quant kernel for performance
-    x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
+    x_q, x_s = aiter.per_1x32_f4_quant_hip(x, shuffle=True)
 
     #print(f"{x.shape}{x.dtype},  {x_q.shape}{x_q.dtype},    {x_s.shape}{x_s.dtype} ")
     #print(f"{weight.shape}{weight.dtype},   {weight_scale.shape}{weight_scale.dtype}")
@@ -397,60 +393,18 @@ def _run_aiter(
         device=x_q.device,
         dtype=x.dtype,
     )
-
-    gemm_a4w4(
-        x_q, weight, x_s, weight_scale.view(x_s.dtype), y, bpreshuffle=True
-    )
+    if use_jit:
+        blk_cnt = ((M + wg_M - 1) // wg_M) * ((N + wg_N - 1) // wg_N)
+        gemm_a4w4_kernel(
+            [blk_cnt], [256],
+            wg_M, wg_N, N, K, False, True,
+            x_q.data_ptr(), x_s.data_ptr(),
+            weight.data_ptr(), weight_scale.data_ptr(),
+            y.data_ptr(), M)
+    else:
+        aiter.gemm_a4w4(x_q, weight, x_s, weight_scale.view(x_s.dtype), y, bpreshuffle=True)
     return y[:M]
 
-def _run_fp4gemm(
-                x: "Tensor",  # A:[M, K] bf16
-                weight: "Tensor",  # B:[N, K/2] f4x2
-                weight_scale: "Tensor",  # B_scale:[N, K/32] e8m0 paded
-            ):
-    M = x.shape[0]
-    N = weight.shape[0]
-    K = weight.shape[1]
-    # use hip quant kernel for performance
-    x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
-
-    '''
-        m, n = x.shape
-        assert quant_dtype == dtypes.fp4x2
-        assert n % 2 == 0    
-
-        scale = (
-            torch.empty(
-                (
-                    (m + 255) // 256 * 256,     # round-up (m) to 256
-                    (n // 32 + 7) // 8 * 8,     # round-up (n//32) to 8
-                ),
-                dtype=torch.uint8,
-                device=device,
-            )
-            # .fill_(0x7F)
-            .view(dtypes.fp8_e8m0)
-    '''
-
-    # 32 alignment is enough for dim0 padding of output for
-    # gemm_a4w4 kernel
-    y = torch.empty(
-        (M + 31) // 32 * 32,
-        weight.shape[0],
-        device=x_q.device,
-        dtype=x.dtype,
-    )
-
-    blk_cnt = ((M + wg_M - 1) // wg_M) * ((N + wg_N - 1) // wg_N)
-
-    gemm_a4w4_kernel(
-        [blk_cnt], [256],
-        wg_M, wg_N, N, K, False, True,
-        x_q.data_ptr(), x_s.data_ptr(),
-        weight.data_ptr(), weight_scale.data_ptr(),
-        y.data_ptr(), M)
-
-    return y[:M]
 
 # https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/testing/numeric.py#L5
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -461,8 +415,8 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor):
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
 
-y = _run_aiter(A[0], weight=w[0], weight_scale=w_scale[0])
-y2 = _run_fp4gemm(A[0], weight=w[0], weight_scale=w_scale[0])
+y = _run_gemm_a4w4(A[0], weight=w[0], weight_scale=w_scale[0], use_jit=False)
+y2 = _run_gemm_a4w4(A[0], weight=w[0], weight_scale=w_scale[0], use_jit=True)
 acc = []
 acc.append("pass1" if calc_diff(y2, y) < 0.01 else "fail1")
 
@@ -477,19 +431,17 @@ print(diff, diff2)
 acc.append("pass2" if diff < 0.01 else "fail2")
 acc.append("pass3" if diff2 < 0.01 else "fail3")
 
-
-
 flops = 2 * M * N * K
 mem_size = M * K * 2 + N * K * 0.5
 with pyhip.torchPerf():
     di = 0
     for i in range(10):
         with pyhip.cudaPerf(flops, mem_size, name="aiter"):
-            _run_aiter(A[di], weight=w[di], weight_scale=w_scale[di])
+            _run_gemm_a4w4(A[di], weight=w[di], weight_scale=w_scale[di], use_jit=False)
             di += 1
     for i in range(10):
         with pyhip.cudaPerf(flops, mem_size, name="fp4gemm"):
-            _run_fp4gemm(A[di], weight=w[di], weight_scale=w_scale[di])
+            _run_gemm_a4w4(A[di], weight=w[di], weight_scale=w_scale[di], use_jit=True)
             di += 1
 
 print(acc)

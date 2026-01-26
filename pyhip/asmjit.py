@@ -3311,6 +3311,71 @@ r'''
                 print(f"bank{bank}: {conflict} conflicts : lane-groups {bank_lg[bank]} ")
         print()
 
+    @classmethod
+    def show_gemm_buf(cls, mfma_MN = 16, n_mfma_K = 4, wave_CNT = [2,2], wave_Size = [128, 128]):
+        mfma_Klanes = cls.warp_size // mfma_MN       # 4 or 2
+        sizeof_DW4 = 16
+        mfma_Kbytes = mfma_Klanes * sizeof_DW4  # 64 or 32
+
+        wave_cnt_M, wave_cnt_N = wave_CNT
+        wg_M, wg_N = wave_Size[0] * wave_cnt_M, wave_Size[1] * wave_cnt_N
+        assert wg_M % mfma_MN == 0
+        assert wg_N % mfma_MN == 0
+        wave_mfma_M = wave_Size[0] // mfma_MN
+        wave_mfma_N = wave_Size[1] // mfma_MN
+
+        n_mfma_M = wave_mfma_M * wave_cnt_M
+        n_mfma_N = wave_mfma_N * wave_cnt_N
+
+        wg_Kbytes = n_mfma_K * mfma_Kbytes
+
+        lds_buff_a_size = wg_M * wg_Kbytes
+        lds_buff_b_size = wg_N * wg_Kbytes
+
+        print(f"MFMA block: {mfma_MN} x {mfma_Kbytes} bytes ({mfma_Klanes} x DW4)")
+        print(f"LDS buff A: {wg_M} x {n_mfma_K*mfma_Kbytes} bytes, {n_mfma_M} x {n_mfma_K} mfmas,  {lds_buff_a_size/1024:.1f} KB")
+        print(f"LDS buff B: {wg_N} x {n_mfma_K*mfma_Kbytes} bytes, {n_mfma_N} x {n_mfma_K} mfmas,  {lds_buff_b_size/1024:.1f} KB")
+        print(f"     total:                 {(lds_buff_a_size + lds_buff_b_size)/1024:.1f} KB")
+
+        def str_mfma(i, color_id = 1, sep=""):
+            color0 = f"\033[0;{100+(color_id)}m"
+            color1 = f"\033[0m"
+            s = hex(i)[2:]
+            if len(s) == 1:
+                s = f" {s}{sep}"
+            else:
+                s = f"{s}{sep}"
+            return f"{color0}{s}{color1}"
+
+        for k in range(n_mfma_K):
+            for h in range(n_mfma_K):
+                if h == k:
+                    print(f" {h} ", end="")
+                else:
+                    print("   ", end="")
+            for wn in range(wave_cnt_N):
+                for n in range(wave_mfma_N):
+                    i = wn * wave_mfma_N + n
+                    print(f"{str_mfma(i,k,"|")}", end="")
+            print()
+
+        for wm in range(wave_cnt_M):
+            for m in range(wave_mfma_M):
+                for k in range(n_mfma_K):
+                    i = wm*wave_mfma_M + m
+                    print(f"{str_mfma(i,k,"|")}", end="")
+
+                for wn in range(wave_cnt_N):
+                    for n in range(wave_mfma_N):
+                        cid = wm * wave_cnt_N + wn
+                        if n == wave_mfma_N - 1:
+                            sep = "|"
+                        else:
+                            sep = " "
+                        print(f" {cid}{sep}", end="")
+                print()
+
+
     @property
     def warp_id(self):
         if "warp_id" not in self.special_vars:
