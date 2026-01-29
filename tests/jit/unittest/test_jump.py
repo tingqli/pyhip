@@ -47,6 +47,28 @@ def test_loop():
     torch.cuda.synchronize()
     assert OUT[0] == 21, f"{OUT=}"
 
+def test_ifelse():
+    @pyhip.jit()
+    def kernel(J, N:"int", input:"int*", output:"int*"):
+        s_i = J.gpr("su32", 0)
+        s_cnt = J.gpr(2, "su32", 0, 0)
+        with J.While(s_i[0] < N) as loop:
+            with J.If((s_i[0] & 1)==0) as If:
+                s_cnt[0] += 1
+                If.Else()
+                s_cnt[1] += 1
+            s_i[0] += 1
+        J.s_store_dwordx2(s_cnt, output, 0, mod="glc")
+        J.s_waitcnt(mod=f"lgkmcnt({0})")
+
+    IN = torch.arange(0,32, dtype=torch.int)
+    OUT = torch.empty(2, dtype=torch.int)
+    kernel([1],[64], 31, IN.data_ptr(), OUT.data_ptr())
+    torch.cuda.synchronize()
+    assert OUT[0] == 16
+    assert OUT[1] == 15
+
 if __name__ == "__main__":
     test_if()
     test_loop()
+    test_ifelse()
