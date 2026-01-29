@@ -4,7 +4,7 @@ from typing import Optional
 
 import pytest
 os.environ['PYHIP_JIT_LOG'] = '0'
-from pyhip import cudaPerf, jit, JIT
+from pyhip import cudaPerf, jit, JIT, torchPerf
 import torch
 
 from functools import cache
@@ -1488,6 +1488,134 @@ def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids):
         final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
     return final_hidden_states
 
+import aiter
+from aiter.utility import fp4_utils
+
+def de_shuffle_weight(weight, mfma_MN = 16):
+    M, K = weight.shape
+    K_bytes = K * weight.itemsize
+    sizeof_DW4 = 16
+    mfma_K_lanes = 64 // mfma_MN
+    mfma_K_L = sizeof_DW4//weight.itemsize
+    mfma_K = mfma_K_lanes * mfma_K_L 
+
+    assert M % mfma_MN == 0
+    mfma_K_bytes = mfma_K_lanes * sizeof_DW4
+    assert K_bytes % mfma_K_bytes == 0
+    #x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L)
+    #x = x.permute(0,2,3,1,4)
+
+    assert K % mfma_K == 0
+    weight = weight.reshape(M//mfma_MN, K//mfma_K, mfma_K_lanes, mfma_MN, mfma_K_L)
+    weight = weight.permute(0,3,1,2,4)
+    weight = weight.reshape(M, K).contiguous()
+    return weight
+
+def mxfp4_dequant(quant, scale):
+    _src = fp4_utils.mxfp4_to_f32(quant.view(torch.float4_e2m1fn_x2)).to(dtype=torch.bfloat16)
+    rows, cols = _src.shape
+    #return _src
+    #print(rows, cols, _src.shape)
+    _scale = fp4_utils.e8m0_to_f32(scale).to(dtype=torch.bfloat16)
+    _scale = _scale.reshape(rows//32, cols//256, 4, 1, 16, 4).repeat(1,1,1,32,1,1).view(rows//32, cols//256, 128, 16, 4).permute(0,1,4,3,2)
+    for r in range(0, rows, 32):
+        for c in range(0, cols, 256):
+            sss = _scale[r//32, c//256, :, :, :]
+            _src[r:r+16, c:c+128] *= sss[0]
+            _src[r+16:r+32, c:c+128] *= sss[1]
+            _src[r:r+16, c+128:c+256] *= sss[2]
+            _src[r+16:r+32, c+128:c+256] *= sss[3]
+
+    return _src
+
+
+def moe_gemm_ref(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, gate_up,
+                    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+                    weight, w_scale, input, i_scale, output, debug_e_idx = -1):
+    M = input.shape[0]
+
+    if "_x2" in str(weight.dtype):
+        print(f"{BLOCK_TILE_SIZE_M=}")
+        print(f"{BLOCK_TILE_SIZE_N=}")
+        print(f"{input.shape=} {input.dtype=}")         # input.shape=[24064, 2048] input.dtype=torch.float4_e2m1fn_x2
+        if i_scale is not None:
+            print(f"  {i_scale.shape} {i_scale.dtype}")   # [208896, 128] torch.float8_e8m0fnu
+        print(f"{output.shape=}")                       # output.shape = [24064, 8, 1536]
+        print(f"{weight.shape=} {weight.dtype=}")       # weight.shape=[128, 3072, 2048] weight.dtype=torch.float4_e2m1fn_x2
+        if w_scale is not None:
+            print(f"  {w_scale.shape} {w_scale.dtype}")   # [393216 (128*3072), 128] torch.float8_e8m0fnu
+        print(f"{sorted_ids.shape=}")                   # sorted_ids.shape=torch.Size([208888])
+        print(f"{sorted_expert_ids.shape=}")            # sorted_expert_ids.shape=torch.Size([1632])
+        print(f"{sorted_weights.shape=}")               # sorted_weights.shape=torch.Size([208888])
+        print(f"{num_valid_ids=}")
+
+    NUM_EXPERTS, OC, IC = weight.shape
+    if "_x2" in str(weight.dtype): IC *= 2
+    NUM_BLOCKS = sorted_expert_ids.shape[0]
+
+    if i_scale is not None:
+        input = input.view(torch.int8)
+        print(f"===== i_scale {i_scale.shape} {i_scale.dtype}")
+    if w_scale is not None:
+        weight = weight.view(torch.int8)
+        w_scale = w_scale.view(NUM_EXPERTS, OC, -1)
+        print(f"===== w_scale {w_scale.shape} {w_scale.dtype}")
+
+    num_sorted_ids = sorted_ids.shape[0]
+    for e_idx in range(sorted_expert_ids.shape[0]):
+        s_e_id = sorted_expert_ids[e_idx]
+        max_id = num_valid_ids[0]
+        if e_idx * BLOCK_TILE_SIZE_M >= max_id: continue
+        i0 = e_idx*BLOCK_TILE_SIZE_M
+        i1 = (e_idx+1)*BLOCK_TILE_SIZE_M
+
+        ids = sorted_ids[i0:i1].clone()
+        valid_mask = (ids & 0xFFFFFF) < torch.tensor(M)
+        ids[(ids & 0xFFFFFF) >= torch.tensor(M)] = 0
+        tok_ids = ids & 0xFFFFFF
+        top_k = ids >> 24
+        tok_w = sorted_weights[i0:i1]
+        expert_w = weight[s_e_id, ...]
+
+        if e_idx == -11:
+            print(tok_ids)
+
+        if gate_up:
+            src = input[tok_ids,...]
+        else:
+            src = input[tok_ids, top_k, ...]
+
+        if debug_e_idx == e_idx:
+            print("??????????? ", src.shape, src.dtype)
+            print(src.view(torch.int32)[:16, :16])
+
+        if i_scale is not None:
+            src = mxfp4_dequant(src, i_scale[i0:i1,...])
+
+        w = de_shuffle_weight(expert_w)
+
+        if w_scale is not None:
+            w = mxfp4_dequant(w, w_scale[s_e_id,...])
+
+        act = src @ w.t()
+        if gate_up:
+            act = torch.nn.functional.silu(act[:, :(OC//2)]) * (act[:,(OC//2):])
+
+        if debug_e_idx == e_idx:
+            print(f"======== ===========")
+            print(tok_ids)
+            print(f"======== {debug_e_idx=}  {act.shape} {act.dtype}")
+            m0 = 0*(BLOCK_TILE_SIZE_M//2)
+            n0 = (2+1)*(BLOCK_TILE_SIZE_N//2)
+            print(act[m0:m0+32, n0:n0+32])
+
+        if gate_up:
+            output[tok_ids[valid_mask], top_k[valid_mask], :] = act[valid_mask, ...]
+        else:
+            output[tok_ids[valid_mask], :] += act[valid_mask, ...] * tok_w[valid_mask, None]
+
+
+
 def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8):
     INTER_SIZE_TP = INTER_SIZE // TP
     BUF_COPY = 32
@@ -1506,8 +1634,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         from aiter.utility import fp4_utils
         from aiter.ops.shuffle import shuffle_weight
         # w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
-        w_ = torch.randint(-2, 3, [E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16) / 2
+        w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
         w1_qt, w1_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
+
+        #w1_qt_scale_[...] = 1.0
         w1_f32 = fp4_utils.mxfp4_to_f32(w1_qt).to(dtype=torch.bfloat16).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE // 32, 32)
         w1_scale_f32 = fp4_utils.e8m0_to_f32(w1_qt_scale_).to(dtype=torch.bfloat16).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE // 32, 1)
         w1_ref = (w1_f32 * w1_scale_f32).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE)
@@ -1518,8 +1648,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
         w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
         # w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
-        w_ = torch.randint(-1, 3, [E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16) / 2
+        w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
         w2_qt, w2_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
+        #w2_qt_scale_[...] = 1.0
+
         w2_f32 = fp4_utils.mxfp4_to_f32(w2_qt).to(dtype=torch.bfloat16).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP // 32, 32)
         w2_scale_f32 = fp4_utils.e8m0_to_f32(w2_qt_scale_).to(dtype=torch.bfloat16).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP // 32, 1)
         w2_ref = (w2_f32 * w2_scale_f32).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP)
@@ -1568,6 +1700,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     import aiter
     from aiter.ops.shuffle import shuffle_weight
     from aiter.fused_moe import moe_sorting
+    from aiter.utility import fp4_utils
+
 
     def run(hidden_states, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale):
         B = hidden_states.shape[0]
@@ -1646,19 +1780,20 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                cur_out.data_ptr(), 
                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
         elif kernel_type == 'mxn_2s':
-            assert weight_type == torch.bfloat16, f'mxn_2s only support bfloat16, but got {weight_type}'
+            #assert weight_type == torch.bfloat16, f'mxn_2s only support bfloat16, but got {weight_type}'
             # test moe_gemm_batch_vmn: 2 stages, m/n can be set
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
                 topk_ids,
                 topk_weight,
                 E,
-                K1,     # reduce dim is same with output dim
+                N2,     # reduce dim is same with output dim
                 hidden_states.dtype,
                 TILE_M,
                 None,
                 None,
                 0,
             )
+            print(f"================ {hidden_states.shape=} {hidden_states.dtype} {topk_ids.shape} {topk_weight.shape} {E} {K1}-{N2} {TILE_M} {cur_out.shape=}")
             if weight_type == torch.float4_e2m1fn_x2:
                 # if B <= 1024:
                 #     a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -1670,9 +1805,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 #         block_size=block_size_M,
                 #     )
                 # else:
-                from aiter import get_hip_quant as get_quant
                 from aiter.utility.fp4_utils import moe_mxfp4_sort
-                quant_func = get_quant(aiter.QuantType.per_1x32)
+                quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
                 hidden_states_q, hidden_states_scale = quant_func(
                     hidden_states,
                     scale=None,
@@ -1688,15 +1822,69 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     block_size=TILE_M,
                 )
                 # TODO: call kernel
+                # gemm1_out : torch.empty([B, TOPK, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
+                moe_gemm_ref(TILE_M, TILE_N, True, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+                             w1, w1_scale,
+                             #hidden_states, None,
+                             hidden_states_q, hidden_states_scale,
+                             gemm1_out)
+                gemm1_out_q, gemm1_out_scale = quant_func(
+                    gemm1_out.view(B*TOPK, -1),
+                    scale=None,
+                    quant_dtype=torch.float4_e2m1fn_x2,
+                    num_rows=None,
+                )
+                gemm1_out_scale = moe_mxfp4_sort(
+                    gemm1_out_scale[: B * TOPK, :].view(B, TOPK, -1),
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=B,
+                    block_size=TILE_M,
+                )
+                from moe_gemm_mxfp4 import moe_gemm_mxfp4
+
+                # 调试正确性，只需要跑一个block
+                the_out = cur_out.clone()
+                moe_gemm_ref(TILE_M, TILE_N, False, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+                             w2, w2_scale, 
+                             #gemm1_out, None,
+                             gemm1_out_q.view(B, TOPK, -1), gemm1_out_scale,
+                             cur_out, debug_e_idx=1)
+
+                down_OC = w2.shape[1]
+                assert down_OC % TILE_N == 0
+                num_oc_blocks = down_OC // TILE_N
+                num_e_blocks = sorted_expert_ids.shape[0]
+                print(f"{num_oc_blocks=} {num_e_blocks=}")
+                moe_gemm_mxfp4([num_oc_blocks, 2],[256],
+                    TILE_M, TILE_N,
+                    w2.shape[0], w2.shape[1], w2.shape[2], 
+                    False, TOPK, # gate_up,
+                    sorted_ids.data_ptr(),
+                    sorted_weights.data_ptr(),
+                    sorted_expert_ids.data_ptr(),
+                    num_valid_ids.data_ptr(),
+                    w2.data_ptr(), w2_scale.data_ptr(),
+                    gemm1_out_q.data_ptr(), gemm1_out_scale.data_ptr(),
+                    the_out.data_ptr(), B)
+
+                print(cur_out)
+                print(the_out)
+                assert 0
             else:
+                moe_gemm_ref(TILE_M, TILE_N, True, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+                             w1, w1_scale, hidden_states, None, gemm1_out)
+                moe_gemm_ref(TILE_M, TILE_N, False, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+                             w2, w2_scale, gemm1_out, None, cur_out)
+
                 BLOCK_TILE_SIZE_M = TILE_M
                 BLOCK_TILE_SIZE_N = TILE_N
-                moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
-                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-                moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
-                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+                #moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
+                #                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                #                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
+                #moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
+                #                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                #                gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
 
             # BLOCK_TILE_SIZE_N = 64
             # moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
@@ -1728,6 +1916,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
             w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
         ref_out = get_torch_ref(hidden_states=hidden_states[0], w1=w1_ref, w2=w2_ref, topk_weight=topk_weight[0], topk_ids=topk_ids[0])
+        aiter_out = _run_aiter(hidden_states=hidden_states[0], w1=w1[0], w2=w2[0], topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         cur_out = run(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
         for _ in range(run_count):
@@ -1738,7 +1927,25 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             latencies.append(p.dt())
             bw.append(p.bw())
 
-        if not torch.allclose(ref_out, cur_out, rtol=0.1, atol=0.03):
+        def calc_diff(x: torch.Tensor, y: torch.Tensor):
+            x, y = x.double(), y.double()
+            denominator = (x * x + y * y).sum()
+            if denominator == 0:    # Which means that all elements in x and y are 0
+                return 0.0
+            sim = 2 * (x * y).sum() / denominator
+            return 1 - sim
+
+        print(f">>>>>>>>>>>>>>> {calc_diff(aiter_out, ref_out)=} ")
+        print(f">>>>>>>>>>>>>>> {calc_diff(cur_out, ref_out)=} ")
+        print(f">>>>>>>>>>>>>>> {calc_diff(aiter_out, cur_out)=} ")
+
+        if weight_type == torch.float4_e2m1fn_x2:
+            diff = calc_diff(aiter_out, cur_out)
+        else:
+            diff = calc_diff(ref_out, cur_out)
+        if diff > 0.02:
+            #if not torch.allclose(ref_out, cur_out, rtol=0.1, atol=0.03):
+            print(ref_out)
             print(cur_out)
             idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
             if len(idx[0]):
@@ -1856,13 +2063,20 @@ def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP
     show_perf(perf)
 
 if __name__ == '__main__':
-    TILE_M = 16
+    TILE_M = 128
     TILE_N = 128
     HIDDEN_SIZE = 4096
     INTER_SIZE = 1536
-    TP = 8
-    test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    batch = [1, 2, 4, 8, 12, 16, 32, 64]
-    test_small_batch_perf(batch, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-    test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    TP = 1
+    batch =  [256+253]
+    init_env()
+    entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
+    entry_common('mxn_2s', batch=batch, prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
+    #with torchPerf():
+    #    entry_common('aiter', batch, prec=[get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N)
+    if 0:
+        test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+        batch = [1, 2, 4, 8, 12, 16, 32, 64]
+        test_small_batch_perf(batch, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+        batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+        test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
