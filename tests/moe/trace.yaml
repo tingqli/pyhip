@@ -1,0 +1,14 @@
+jobs:
+    -
+        kernel_include_regex: (.*moe_gemm_mxfp4_gateup.*)
+        kernel_iteration_range: "[5,6]"
+        output_file: out
+        output_directory: ck_test
+        output_format: [pftrace]
+        truncate_kernels: true
+        sys_trace: false # enable for pftrace and otf2
+        advanced_thread_trace: true # enable for att and ui folder
+        att_target_cu: 0
+        att_shader_engine_mask: "0xf" # collect one CU from 4 SEs
+        att_simd_select: "0xf" # collect 4 SIMDs on single CU
+        att_buffer_size: "0x7f000000"
