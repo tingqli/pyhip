@@ -158,16 +158,21 @@ def gemm_splitk(J:JIT,
             for i in range(2):
                 for j in range(2):
                     for n in range(B_horz):
-                        J.v_cvt_pk_f32_fp8(v_w_f32[0], B_reg[pp_reg_id, n, i, j])
-                        J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
-                        J.v_pk_mul_f32(v_w_f32[0], v_w_f32[0], v_w_scale[n])
-                        J.v_pk_mul_f32(v_w_f32[1], v_w_f32[1], v_w_scale[n])
-                        J.v_add_u32(v_w_f32[0, 0], v_w_f32[0, 0], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[0, 1], v_w_f32[0, 1], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[1, 0], v_w_f32[1, 0], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[1, 1], v_w_f32[1, 1], s_cvt_bf16_bias)
-                        J.v_perm_b32(v_w_bf16[n, 0], v_w_f32[0, 0], v_w_f32[0, 1], pattern_cvt_bf16)
-                        J.v_perm_b32(v_w_bf16[n, 1], v_w_f32[1, 0], v_w_f32[1, 1], pattern_cvt_bf16)
+                        if 1:
+                            J.v_cvt_pk_f32_fp8(v_w_f32[0], B_reg[pp_reg_id, n, i, j])
+                            J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
+                            J.v_pk_mul_f32(v_w_f32[0], v_w_f32[0], v_w_scale[n])
+                            J.v_pk_mul_f32(v_w_f32[1], v_w_f32[1], v_w_scale[n])
+                            J.v_add_u32(v_w_f32[0, 0], v_w_f32[0, 0], s_cvt_bf16_bias)
+                            J.v_add_u32(v_w_f32[0, 1], v_w_f32[0, 1], s_cvt_bf16_bias)
+                            J.v_add_u32(v_w_f32[1, 0], v_w_f32[1, 0], s_cvt_bf16_bias)
+                            J.v_add_u32(v_w_f32[1, 1], v_w_f32[1, 1], s_cvt_bf16_bias)
+                            J.v_perm_b32(v_w_bf16[n, 0], v_w_f32[0, 0], v_w_f32[0, 1], pattern_cvt_bf16)
+                            J.v_perm_b32(v_w_bf16[n, 1], v_w_f32[1, 0], v_w_f32[1, 1], pattern_cvt_bf16)
+                        else:
+                            J.v_cvt_scalef32_pk_bf16_fp8(v_w_bf16[n, 0],  B_reg[pp_reg_id, n, i, j], v_w_scale[n, 0], mod='op_sel:[0,0,0]')
+                            J.v_cvt_scalef32_pk_bf16_fp8(v_w_bf16[n, 1],  B_reg[pp_reg_id, n, i, j], v_w_scale[n, 0], mod='op_sel:[1,0,0]')
+
                     # 2, A_vert, A_rep=2, 2, 2
                     for n in range(B_horz):
                         for m in range(A_vert):
