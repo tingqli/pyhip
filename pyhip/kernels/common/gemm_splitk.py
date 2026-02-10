@@ -70,11 +70,17 @@ def gemm_splitk(J:JIT,
         k_scale_n = div_up(div_up(K, 32), 8) // num_split_k
         v_w_scale = J.gpr(B_horz // 2, k_scale_n, 'vf32', align=4)
         k_scale_n_next_read_idx = 0
+    # elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+    #     v_w_scale = J.gpr(B_horz, 2, 'vf32')
+    #     for n in range(B_horz):
+    #         J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
     elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
-        v_w_scale = J.gpr(B_horz, 2, 'vf32')
+        k_scale_n = div_up(K, 128) // num_split_k
+        v_w_scale = J.gpr(B_horz, k_scale_n, 2, 'vf32')
         for n in range(B_horz):
-            J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
-
+            for k_idx in range(k_scale_n):
+                J.global_load_dword(v_w_scale[n, k_idx, 0], voffset_scale[n], p_w_scale, mod=f'offset:{k_idx * sizeof_f32}')
+    
     # ping pong register buffer id
     pp_reg_id = 0
     k_step_wg = num_split_k * 32 * A_rep
@@ -118,6 +124,7 @@ def gemm_splitk(J:JIT,
         J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * A_rep + k_scale_wip})")
     
     def mfma_gen(pp_reg_id, k=None):
+        kstep = k
         if weight_dtype == torch.float4_e2m1fn_x2:
             # decompress
             v_w_bf16 = J.gpr(2, 4, 'vf32', align=4)
@@ -160,8 +167,10 @@ def gemm_splitk(J:JIT,
                     for n in range(B_horz):
                         J.v_cvt_pk_f32_fp8(v_w_f32[0], B_reg[pp_reg_id, n, i, j])
                         J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
-                        J.v_pk_mul_f32(v_w_f32[0], v_w_f32[0], v_w_scale[n])
-                        J.v_pk_mul_f32(v_w_f32[1], v_w_f32[1], v_w_scale[n])
+                        # J.v_pk_mul_f32(v_w_f32[0], v_w_f32[0], v_w_scale[n])
+                        # J.v_pk_mul_f32(v_w_f32[1], v_w_f32[1], v_w_scale[n])
+                        J.v_pk_mul_f32(v_w_f32[0], v_w_f32[0], v_w_scale[n, kstep//2])
+                        J.v_pk_mul_f32(v_w_f32[1], v_w_f32[1], v_w_scale[n, kstep//2])
                         J.v_add_u32(v_w_f32[0, 0], v_w_f32[0, 0], s_cvt_bf16_bias)
                         J.v_add_u32(v_w_f32[0, 1], v_w_f32[0, 1], s_cvt_bf16_bias)
                         J.v_add_u32(v_w_f32[1, 0], v_w_f32[1, 0], s_cvt_bf16_bias)
@@ -189,9 +198,13 @@ def gemm_splitk(J:JIT,
     # prolog
     loader = load_gen(0, 0)
     J.emitter()([loader])
+    # if weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+    #     for n in range(B_horz):
+    #         J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
     if weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
         for n in range(B_horz):
-            J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
+            for k_idx in range(K//128//num_split_k):
+                J.v_mov_b32(v_w_scale[n, k_idx, 1], v_w_scale[n, k_idx, 0])
     pp_reg_id = 1
 
     def tail(pp_reg_id, k=None):
