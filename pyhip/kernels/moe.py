@@ -225,7 +225,7 @@ def moe_2stage_splitk(J:JIT,
     elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
         # the scale layout is [E, N//128, K//128]
         k_scale_stride = K // 128 * sizeof_f32
-        voffset_scale = J.gpr(B_horz, 'vu32')
+        voffset_scale = J.gpr(2, 'vu32')
         # N_wg scale offset
         p_w_scale[:] += (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * J.blockIdx.x * k_scale_stride //128
         if with_silu:
@@ -233,15 +233,11 @@ def moe_2stage_splitk(J:JIT,
             # Expert wg offset + 64 lane offset + warp offset
             voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride //128)) + J.warp_id * (k_scale_stride // 4)
             # N tile offset within wave offset
-            voffset_scale[B_horz // 2] = voffset_scale[0] + (N // 2 * k_scale_stride // 128)
-            for m in range(1, B_horz // 2):
-                voffset_scale[m] = voffset_scale[0] 
-                voffset_scale[B_horz // 2 + m] = voffset_scale[B_horz // 2]
+            voffset_scale[1] = voffset_scale[0] + (N // 2 * k_scale_stride // 128)
         else:
             # Expert wg offset + 64 lane offset 
             voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride //128)) 
-            for m in range(1, B_horz):
-                voffset_scale[m] = voffset_scale[0]
+            voffset_scale[1] = voffset_scale[0]
     
     p_weight[:] = p_weight[:] + s_e_id * (N * get_k_bytes(K))
     buff_b = J.Buffer(p_weight, N * get_k_bytes(K))
