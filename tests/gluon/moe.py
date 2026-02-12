@@ -14,26 +14,25 @@ from triton.experimental.gluon.language.amd.cdna3 import (
 )
 
 @gluon.jit
-def moe_2stage_splitk(
-                      p_input,            # bf16 [M, K]
-                      p_weight,           # bf16 [K/8 * 16 * 8, N/16]
-                      p_output,           # bf16 [M, N]
-                      # sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
-                      p_sorted_ids,
-                      p_sorted_weights,
-                      p_sorted_expert_ids,
-                      p_num_valid_ids,
-                      p_w_scale,
-                      M,
-                      weight_dtype: gl.constexpr,
-                      TOPK: gl.constexpr,
-                      K: gl.constexpr,
-                      N: gl.constexpr,
-                      BLOCK_TILE_SIZE_M: gl.constexpr,
-                      BLOCK_TILE_SIZE_N: gl.constexpr,
-                      num_warps: gl.constexpr = 4,
-                      ):
-    with_silu: gl.constexpr = num_warps == 4
+def moe_2stage_splitk_gateup(
+                             p_input,            # bf16 [M, K]
+                             p_weight,           # bf16 [K/8 * 16 * 8, N/16]
+                             p_output,           # bf16 [M, N]
+                             # sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
+                             p_sorted_ids,
+                             p_sorted_weights,
+                             p_sorted_expert_ids,
+                             p_num_valid_ids,
+                             p_w_scale,
+                             M,
+                             weight_dtype: gl.constexpr,
+                             TOPK: gl.constexpr,
+                             K: gl.constexpr,
+                             N: gl.constexpr,
+                             BLOCK_TILE_SIZE_M: gl.constexpr,
+                             BLOCK_TILE_SIZE_N: gl.constexpr,
+                             num_warps: gl.constexpr = 4,
+                             ):
     tile_n = gl.program_id(0)
     e_idx = gl.program_id(1)
     sorted_id_layout: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 1],
@@ -54,7 +53,7 @@ def moe_2stage_splitk(
     elif BLOCK_TILE_SIZE_M == 32:
         reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 4], [16, 0]]
     else:
-        gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_M")    
+        gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_M")
     if num_warps == 1:
         warp_bases:gl.constexpr = []
     else:
@@ -70,17 +69,162 @@ def moe_2stage_splitk(
                                     threads_per_warp=[64, 1],
                                     warps_per_cta=[num_warps, 1],
                                     order=[0, 1])
-        sorted_weights_offsets = sorted_id_offsets
-        sorted_weights = gl.amd.cdna3.buffer_load(p_sorted_weights, sorted_weights_offsets)
+    sorted_ids_org = sorted_ids
     sorted_ids = gl.convert_layout(sorted_ids.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_a_layout), assert_trivial=True)
     sorted_topk = sorted_ids >> 24
     sorted_ids = sorted_ids & 0xffffff
     sorted_topk = gl.where(sorted_topk < TOPK, sorted_topk, 0)
     sorted_ids = gl.where(sorted_ids < M, sorted_ids, 0)
-    if with_silu:...
+    mem_a_offsets = (sorted_ids * K)[:, None] + \
+                    gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
+    mem_b_offsets_top = tile_n * BLOCK_TILE_SIZE_N // 2 * K + gl.arange(0, BLOCK_TILE_SIZE_N // 2 // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * (K // 8 * 16 * 8) + \
+                    gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
+    mem_b_offsets_bot = N // 2 * K + tile_n * BLOCK_TILE_SIZE_N // 2 * K + gl.arange(0, BLOCK_TILE_SIZE_N // 2 // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * (K // 8 * 16 * 8) + \
+                    gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
+    c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4, 
+                                                  instr_shape=[16, 16, 32],
+                                                  transposed=True,
+                                                  tiles_per_warp=[1, BLOCK_TILE_SIZE_M // 16, BLOCK_TILE_SIZE_N // 16 // 2],
+                                                  warps_per_cta=[num_warps, 1, 1])
+    a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
+    b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
+    acc_top = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
+    acc_bot = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
+    for k_start in gl.static_range(0, K, BLOCK_TILE_SIZE_K):
+        a_offsets = mem_a_offsets + k_start
+        a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
+        b_offsets_top = mem_b_offsets_top + (k_start // 8) * 16 * 8
+        b_offsets_bot = mem_b_offsets_bot + (k_start // 8) * 16 * 8
+        if weight_dtype == torch.bfloat16:
+            b_top = gl.amd.cdna3.buffer_load(p_weight, b_offsets_top)
+            b_bot = gl.amd.cdna3.buffer_load(p_weight, b_offsets_bot)
+        else:
+            assert 0, "only bf16 weight is supported in this kernel"
+        a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
+        a_fma = gl.convert_layout(a, a_fma_layout, assert_trivial=True)
+        b_top = b_top.reshape(num_warps, 4, 16, 8, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N // 2)
+        b_fma_top = gl.convert_layout(b_top, b_fma_layout, assert_trivial=True)
+        b_bot = b_bot.reshape(num_warps, 4, 16, 8, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N // 2)
+        b_fma_bot = gl.convert_layout(b_bot, b_fma_layout, assert_trivial=True)
+        acc_top = gl.amd.cdna4.mfma(a_fma, b_fma_top, acc_top)
+        acc_bot = gl.amd.cdna4.mfma(a_fma, b_fma_bot, acc_bot)
+
+    # (num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N) --> (BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N)
+    acc_top = acc_top.permute(1, 0, 2)
+    acc_bot = acc_bot.permute(1, 0, 2)
+    lds_layout_write: gl.constexpr = gl.SwizzledSharedLayout(vec=4, per_phase=1, max_phase=8, order=[2, 1, 0])
+    if BLOCK_TILE_SIZE_N == 64:
+        lds_layout_read: gl.constexpr = gl.DistributedLinearLayout(
+                                    reg_bases=[[0, 0, 1], [0, 1, 0], [0, 2, 0]],
+                                    lane_bases=[[0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16], [1, 0, 0], [2, 0, 0]],
+                                    warp_bases=[[4, 0, 0], [8, 0, 0]],
+                                    block_bases=[],
+                                    shape=[BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N // 2])
     else:
-        mem_a_offsets = (sorted_ids * K * TOPK + sorted_topk * K)[:, None] + \
-                        gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
+        gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_N")
+    lds_c_top = gl.allocate_shared_memory(gl.float32, [BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N // 2], layout=lds_layout_write)
+    lds_c_top.store(acc_top)
+    acc_top = lds_c_top.load(layout=lds_layout_read)
+    lds_c_bot = gl.allocate_shared_memory(gl.float32, [BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N // 2], layout=lds_layout_write)
+    lds_c_bot.store(acc_bot)
+    acc_bot = lds_c_bot.load(layout=lds_layout_read)
+    # -> [BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N]
+    acc_top = acc_top.sum(axis=1)
+    acc_bot = acc_bot.sum(axis=1)
+    log2_exp1: gl.constexpr = -1.4426950408889634
+    acc = (acc_top * (1.0 / (1.0 + gl.exp2(acc_top * log2_exp1)))) * acc_bot
+    acc:gl.tensor = acc.to(gl.bfloat16)
+
+    if BLOCK_TILE_SIZE_M == 16 and BLOCK_TILE_SIZE_N == 64:
+        mem_c_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 2],
+            threads_per_warp=[4, 16],
+            warps_per_cta=[num_warps, 1],
+            order=[1, 0],
+        )
+    elif BLOCK_TILE_SIZE_M == 32 and BLOCK_TILE_SIZE_N == 64:
+        mem_c_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 4],
+            threads_per_warp=[8, 8],
+            warps_per_cta=[num_warps, 1],
+            order=[1, 0],
+        )
+    else:
+        gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_M or BLOCK_TILE_SIZE_N")
+
+    sorted_ids_org = gl.convert_layout(sorted_ids_org.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_c_layout), assert_trivial=False)
+    sorted_ids = sorted_ids_org & 0xffffff
+    sorted_topk = sorted_ids_org >> 24
+    out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N // 2 + gl.arange(0, BLOCK_TILE_SIZE_N // 2, layout=gl.SliceLayout(0, mem_c_layout)))
+    out_offsets = sorted_ids[:, None] * N // 2 * TOPK + sorted_topk[:, None] * N // 2 + out_offsets_n[None, :]
+    mask = (sorted_ids < M)[:, None]
+    gl.amd.cdna3.buffer_store(gl.convert_layout(acc, mem_c_layout, assert_trivial=True), p_output, out_offsets, mask=mask)
+
+@gluon.jit
+def moe_2stage_splitk_down(
+                           p_input,            # bf16 [M, K]
+                           p_weight,           # bf16 [K/8 * 16 * 8, N/16]
+                           p_output,           # bf16 [M, N]
+                           # sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
+                           p_sorted_ids,
+                           p_sorted_weights,
+                           p_sorted_expert_ids,
+                           p_num_valid_ids,
+                           p_w_scale,
+                           M,
+                           weight_dtype: gl.constexpr,
+                           TOPK: gl.constexpr,
+                           K: gl.constexpr,
+                           N: gl.constexpr,
+                           BLOCK_TILE_SIZE_M: gl.constexpr,
+                           BLOCK_TILE_SIZE_N: gl.constexpr,
+                           num_warps: gl.constexpr = 1,
+                           ):
+    tile_n = gl.program_id(0)
+    e_idx = gl.program_id(1)
+    sorted_id_layout: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 1],
+                                                      threads_per_warp=[16, 4],
+                                                      warps_per_cta=[num_warps, 1],
+                                                      order=[0, 1])
+    sorted_id_offsets = e_idx * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, sorted_id_layout))[:, None]
+    sorted_ids = gl.amd.cdna3.buffer_load(p_sorted_ids, sorted_id_offsets)
+    num_valid_ids = gl.load(p_num_valid_ids)
+    sorted_expert_id = gl.load(p_sorted_expert_ids + e_idx)
+    if e_idx * BLOCK_TILE_SIZE_M >= num_valid_ids:
+        return
+    p_weight = p_weight + sorted_expert_id * K * N
+    # input layout
+    BLOCK_TILE_SIZE_K: gl.constexpr = 4 * 8 * num_warps
+    if BLOCK_TILE_SIZE_M == 16:
+        reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
+    elif BLOCK_TILE_SIZE_M == 32:
+        reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 4], [16, 0]]
+    else:
+        gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_M")
+    if num_warps == 1:
+        warp_bases:gl.constexpr = []
+    else:
+        warp_bases:gl.constexpr = [[0, 32], [0, 64]]
+    mem_a_layout: gl.constexpr = gl.DistributedLinearLayout(
+                                reg_bases=reg_bases,
+                                lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 8], [0, 16]],
+                                warp_bases=warp_bases,
+                                block_bases=[],
+                                shape=[BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K])
+    sorted_weights_offsets = sorted_id_offsets
+    sorted_weights = gl.amd.cdna3.buffer_load(p_sorted_weights, sorted_weights_offsets)
+    if weight_dtype == torch.bfloat16:
+        mem_b_layout: gl.constexpr = gl.BlockedLayout(size_per_thread=[8, 1],
+                                    threads_per_warp=[64, 1],
+                                    warps_per_cta=[num_warps, 1],
+                                    order=[0, 1])
+    sorted_ids = gl.convert_layout(sorted_ids.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_a_layout), assert_trivial=True)
+    sorted_topk = sorted_ids >> 24
+    sorted_ids = sorted_ids & 0xffffff
+    sorted_topk = gl.where(sorted_topk < TOPK, sorted_topk, 0)
+    sorted_ids = gl.where(sorted_ids < M, sorted_ids, 0)
+    mem_a_offsets = (sorted_ids * K * TOPK + sorted_topk * K)[:, None] + \
+                    gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
     mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * (K // 8 * 16 * 8) + \
                     gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
     c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4, 
@@ -93,8 +237,8 @@ def moe_2stage_splitk(
     acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
     for k_start in gl.static_range(0, K, BLOCK_TILE_SIZE_K):
         a_offsets = mem_a_offsets + k_start
-        b_offsets = mem_b_offsets + (k_start // 8) * 16 * 8
         a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
+        b_offsets = mem_b_offsets + (k_start // 8) * 16 * 8
         if weight_dtype == torch.bfloat16:
             b = gl.amd.cdna3.buffer_load(p_weight, b_offsets)
         else:
@@ -105,80 +249,39 @@ def moe_2stage_splitk(
         b_fma = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
         acc = gl.amd.cdna4.mfma(a_fma, b_fma, acc)
 
-    if num_warps == 1:
-        out_warp_bases:gl.constexpr = []
-        if BLOCK_TILE_SIZE_M == 16:
-            if BLOCK_TILE_SIZE_N == 32:
-                out_reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 16]]
-            elif BLOCK_TILE_SIZE_N == 64:
-                out_reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 16], [0, 32]]
-            else:
-                gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_N")    
-        elif BLOCK_TILE_SIZE_M == 32:
-            if BLOCK_TILE_SIZE_N == 32:
-                out_reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 16], [16, 0]]
-            elif BLOCK_TILE_SIZE_N == 64:
-                out_reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 16], [0, 32], [16, 0]]
-            else:
-                gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_N")
-        else:
-            gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_M")
-        mem_c_layout: gl.constexpr = gl.DistributedLinearLayout(
-                                    reg_bases=out_reg_bases,
-                                    lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]],
-                                    warp_bases=out_warp_bases,
-                                    block_bases=[],
-                                    shape=[BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N],)
-        sorted_ids = gl.convert_layout(sorted_ids, gl.SliceLayout(1, mem_c_layout), assert_trivial=True)
-        out_offsets_m = sorted_ids
-        out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout)))
-        out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
-        acc = acc.reshape(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)
-        acc = gl.convert_layout(acc, mem_c_layout, assert_trivial=True)
-        sorted_weights = gl.convert_layout(sorted_weights.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_c_layout), assert_trivial=True)[:, None]
-        acc = (acc * sorted_weights).to(gl.bfloat16)
-        mask = (out_offsets_m < M)[:, None]
-        gl.atomic_add(p_output + out_offsets, acc, mask=mask)
-    else:
-        # (num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N) --> (BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N)
-        acc = acc.permute(1, 0, 2)
+    out_warp_bases:gl.constexpr = []
+    if BLOCK_TILE_SIZE_M == 16:
         if BLOCK_TILE_SIZE_N == 32:
-            lds_layout_write: gl.constexpr = gl.SwizzledSharedLayout(vec=4, per_phase=8, max_phase=8, order=[2, 1, 0])
-            lds_layout_read: gl.constexpr = gl.DistributedLinearLayout(
-                                        reg_bases=[[0, 0, 1], [0, 1, 0], [0, 2, 0]],
-                                        lane_bases=[[0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16], [1, 0, 0], [2, 0, 0]],
-                                        warp_bases=[[4, 0, 0], [8, 0, 0]],
-                                        block_bases=[],
-                                        shape=[BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N])
+            out_reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 16]]
+        elif BLOCK_TILE_SIZE_N == 64:
+            out_reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 16], [0, 32]]
         else:
             gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_N")
-        lds_c = gl.allocate_shared_memory(gl.float32, [BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N], layout=lds_layout_write)
-        lds_c.store(acc)
-        acc_r = lds_c.load(layout=lds_layout_read)
-        gl.static_print('acc_r shape:', acc_r.shape)
-        
-        acc_r = acc_r.sum(axis=1).to(gl.bfloat16)
-        if BLOCK_TILE_SIZE_M == 16 and BLOCK_TILE_SIZE_N == 32:
-            mem_c_layout: gl.constexpr = gl.BlockedLayout(
-                size_per_thread=[1, 2],
-                threads_per_warp=[4, 16],
-                warps_per_cta=[num_warps, 1],
-                order=[1, 0],
-            )
-        elif BLOCK_TILE_SIZE_M == 32 and BLOCK_TILE_SIZE_N == 32:
-            mem_c_layout: gl.constexpr = gl.BlockedLayout(
-                size_per_thread=[1, 4],
-                threads_per_warp=[8, 8],
-                warps_per_cta=[num_warps, 1],
-                order=[1, 0],
-            )
+    elif BLOCK_TILE_SIZE_M == 32:
+        if BLOCK_TILE_SIZE_N == 32:
+            out_reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 16], [16, 0]]
+        elif BLOCK_TILE_SIZE_N == 64:
+            out_reg_bases: gl.constexpr = [[0, 1], [0, 2], [0, 16], [0, 32], [16, 0]]
         else:
-            gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_M or BLOCK_TILE_SIZE_N")
-
-        out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
-        out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout))) % N
-        out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
-        gl.amd.cdna3.buffer_store(gl.convert_layout(acc_r, mem_c_layout, assert_trivial=True), p_output, out_offsets)
+            gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_N")
+    else:
+        gl.static_assert(False, "Unsupported BLOCK_TILE_SIZE_M")
+    mem_c_layout: gl.constexpr = gl.DistributedLinearLayout(
+                                reg_bases=out_reg_bases,
+                                lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]],
+                                warp_bases=out_warp_bases,
+                                block_bases=[],
+                                shape=[BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N],)
+    sorted_ids = gl.convert_layout(sorted_ids, gl.SliceLayout(1, mem_c_layout), assert_trivial=True)
+    out_offsets_m = sorted_ids
+    out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout)))
+    out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
+    acc = acc.reshape(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)
+    acc = gl.convert_layout(acc, mem_c_layout, assert_trivial=True)
+    sorted_weights = gl.convert_layout(sorted_weights.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_c_layout), assert_trivial=True)[:, None]
+    acc = (acc * sorted_weights).to(gl.bfloat16)
+    mask = (out_offsets_m < M)[:, None]
+    gl.atomic_add(p_output + out_offsets, acc, mask=mask)
 
 #####################################################################
 import pytest
@@ -368,18 +471,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             grid = sorted_expert_ids.shape[0]
             if B * TOPK <= E:
                 grid = B * TOPK
-            import pyhip
-            pyhip.kernels.moe.moe_2stage_splitk([N1 // BLOCK_TILE_SIZE_N, grid], [256],
-                               w1.dtype, TOPK, K1, N1, True, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                               hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-            # pyhip.kernels.moe.moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
-            #                    w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-            #                    gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
-
-            # moe_2stage_splitk[(N1 // BLOCK_TILE_SIZE_N, grid)](
-            #                     hidden_states, w1, gemm1_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w1_scale[0] if w1_scale is not None else None, B,
-            #                    w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
-            x=moe_2stage_splitk[(N2 // BLOCK_TILE_SIZE_N, grid)](
+            x=moe_2stage_splitk_gateup[(N1 // BLOCK_TILE_SIZE_N, grid)](
+                                hidden_states, w1, gemm1_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w1_scale[0] if w1_scale is not None else None, B,
+                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
+            # print(x.asm['amdgcn'])
+            # assert 0
+            x=moe_2stage_splitk_down[(N2 // BLOCK_TILE_SIZE_N, grid)](
                                 gemm1_out, w2, cur_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w2_scale[0] if w2_scale is not None else None, B,
                                 w1.dtype, TOPK, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps=1)
             # print(x.asm['amdgcn'])
