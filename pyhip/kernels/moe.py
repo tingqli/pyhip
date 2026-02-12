@@ -518,7 +518,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             w_ = torch.randn([E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // QUAN_BLOCK_SZ, QUAN_BLOCK_SZ], dtype=torch.bfloat16)
         else:
             w_ = torch.randint(-3, 5,[E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // QUAN_BLOCK_SZ, QUAN_BLOCK_SZ]).to(dtype=torch.bfloat16) / 100.0
-            w_[:, 0:-1:3] += 0.04
+            # ensure every 3 adjacent rows(each row is QUAN_BLOCK_SZ) would have different 3 quantization scales.
+            w_[1:-1:3, :] *= 2
+            w_[2:-1:3, :] *= 3
+            #random change data in QUAN_BLOCK_SZ dimension.
+            w_[:, 0:-1:3] *= 2
+            
         w1_qt, w1_qt_scale = torch_quant(w_, quant_dtype=weight_type)
         w1_qt_scale.view(-1, 1)
         w1_qt_scale = w1_qt_scale.repeat(1, QUAN_BLOCK_SZ//128)
