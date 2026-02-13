@@ -131,9 +131,32 @@ def compare_perf(m, n, k, ck_preshuffle=True):
 
 
 if __name__ == "__main__":
-    M,N,K = 256*94, 256*16, 8192
-    test_gemm(dtypes.bf16, M, N, K, False)
-    compare_perf(M,N,K, False)
+    '''
+    MI350X: 
+           M,N,K = 256*94, 256*16, 8192 
+           ck_preshuffle=False: ck_kernel 1376.1 TFLOPS (跟相同shape的bf16的gemm性能相当)
+           ck_preshuffle=True:  ck_kernel 1698.2 TFLOPS asm_kernel 862.2 TFLOPS
+    CK:  kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffle
+            LDS_Block_Size 8192
+            VGPR_Count 128
+            Accum_VGPR_Count 0
+            SGPR_Count 64
+            workgroup_size 256
+            grid_size 1540096
+
+            v_mfma_f32_16x16x128_f8f6f4 v[248:251]
+            v_mfma_f32_16x16x128_f8f6f4 v[244:247]
+            v_mfma_f32_16x16x128_f8f6f4 v[240:243]
+            buffer_load_dwordx4 没有使用LDS?
+            v_pk_fma_f32
+            v_fma_f32
+
+    ASM: _ZN5aiter43fp8gemm_bf16_blockscale_BpreShuffle_128x128E.kd
+    '''
+    #
+    M,N,K = 256*94, 256*16, 8192 
+    #test_gemm(dtypes.bf16, M, N, K, True)
+    compare_perf(M,N,K, True)
 
 """
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
