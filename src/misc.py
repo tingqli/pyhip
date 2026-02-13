@@ -1,3 +1,8 @@
+""" Some useful helpers """
+
+__all__ = [
+    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up'
+]
 
 class cudaPerf(object):
     def __init__(self, flops = 0, rw_bytes = 0, name="", verbose=1):
@@ -71,6 +76,7 @@ class torchPerf(object):
             self.profiler.stop()
             print(self.profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
 
+# https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/testing/numeric.py#L5
 def calc_diff(x: "torch.Tensor", y: "torch.Tensor"):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
