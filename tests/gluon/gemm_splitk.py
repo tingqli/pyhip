@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from functools import cache
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -13,6 +14,7 @@ from triton.experimental.gluon.language.amd.cdna3 import (
     sched_group_barrier as _amd_iglp_sched_group_barrier,
 )
 
+@cache
 def gemm_splitk(
         BLOCK_TILE_SIZE_M: gl.constexpr,
         BLOCK_TILE_SIZE_N: gl.constexpr,
@@ -81,27 +83,44 @@ def gemm_splitk(
     else:
         # lds layout
         # process 16x32 tile each
-        lds_layout_write: gl.constexpr = gl.SwizzledSharedLayout(vec=4, per_phase=1, max_phase=8, order=[3, 2, 1, 0])
-        reg_bases=[[0, 0, 0, 1], [0, 1, 0, 0], [0, 2, 0, 0]]
+        # acc will be written to lds using the pyhical layout of [num_warps, BLOCK_TILE_SIZE_N // 32, BLOCK_TILE_SIZE_M, 32], 
+        #   the column will apply the swizzle decribled in lds_layout_write(assume BLOCK_TILE_SIZE_M = 16, BLOCK_TILE_SIZE_N = 128):
+        #       v_lshlrev_b32_e32 v38, 7, v2                    ; v2 = threadid, v38 = threadid * 128
+        #       v_lshlrev_b32_e32 v39, 4, v0                    ; v0 = threadid, v39 = threadid * 16
+        #       v_and_b32_e32 v38, 0x6780, v38                  ; v38 = threadid * 128 & 0x6780, which is (lane_id_mod_16 * 32 * size_f32) + (wave_id * 4 * 16 * 32 * size_f32)
+        #                                                       ; `& 0x6780` will clear the bit position of `BLOCK_TILE_SIZE_N // 32` and `32`
+        #       .loc	1 205 20                        ; gemm_splitk.py:205:20
+        #       v_and_b32_e32 v39, 0x70, v39                    ; v39 = threadid * 16 & 0x70, -> threadid << 4 & 0x70, which is the (lane_id_mod_16 % 8) * 16 
+        #       v_and_b32_e32 v0, 48, v0                        ; v0 = threadid, v0 = threadid & 48, which is the lane_id_div_16 * 16
+        #       bitop3 `0x36` means:
+        #         tmp |= ~a & ~b & c        ; cur+next lines is:
+        #         tmp |= ~a & b & ~c        ; tmp |= ~a & (b ^ c)
+        #         tmp |= a & ~b & ~c        ; cur+next lines is:
+        #         tmp |= a & ~b & c         ; tmp |= a & ~b
+        #       v_bitop3_b32 v0, v38, v0, v39 bitop3:0x36       ; col = v0 ^ v39, aka (lane_id_div_16 ^ (lane_id_mod_16 % 8)) * 16
+        #       v_add_u32_e32 v38, 0, v0
+        #       ds_write_b128 v38, v[6:9]
+        lds_layout_write: gl.constexpr = gl.SwizzledSharedLayout(vec=4, per_phase=1, max_phase=16, order=[3, 2, 1, 0])
+        reg_bases=[[0, 0, 0, 1], [1, 0, 0, 0], [2, 0, 0, 0]]
         n = BLOCK_TILE_SIZE_N // 32
         bit_pos = 1
         while n // 2:
-            reg_bases.append([0, 0, bit_pos, 0])
+            reg_bases.append([0, bit_pos, 0, 0])
             bit_pos *= 2
             n = n // 2
         m = BLOCK_TILE_SIZE_M // 16
         bit_pos = 16
         while m // 2:
-            reg_bases.append([bit_pos, 0, 0, 0])
+            reg_bases.append([0, 0, bit_pos, 0])
             bit_pos *= 2
             m = m // 2
         # thread: [4wave, 2], lane: [4, 16], wave[4, 1], rep thread: [N/32, M/2]
         lds_layout_read: gl.constexpr = gl.DistributedLinearLayout(
                                     reg_bases=reg_bases,
-                                    lane_bases=[[0, 0, 0, 2], [0, 0, 0, 4], [0, 0, 0, 8], [0, 0, 0, 16], [1, 0, 0, 0], [2, 0, 0, 0]],
-                                    warp_bases=[[4, 0, 0, 0], [8, 0, 0, 0]],
+                                    lane_bases=[[0, 0, 0, 2], [0, 0, 0, 4], [0, 0, 0, 8], [0, 0, 0, 16], [0, 0, 1, 0], [0, 0, 2, 0]],
+                                    warp_bases=[[0, 0, 4, 0], [0, 0, 8, 0]],
                                     block_bases=[],
-                                    shape=[BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N // 32, 32])
+                                    shape=[num_warps, BLOCK_TILE_SIZE_N // 32, BLOCK_TILE_SIZE_M, 32])
         mem_c_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 2],
             threads_per_warp=[4, 16],
@@ -114,7 +133,6 @@ def gemm_splitk(
         p_input,            # bf16 [M, K]
         p_weight,           # bf16 [K/8 * 16 * 8, N/16]
         p_output,           # bf16 [M, N]
-        p_w_scale,
         M,
         weight_dtype: gl.constexpr,
         K: gl.constexpr,
@@ -145,13 +163,21 @@ def gemm_splitk(
                                                       warps_per_cta=[num_warps, 1, 1])
         a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
         b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
+        a = gl.amd.cdna3.buffer_load(p_input, mem_a_offsets)
+        b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offsets)
         acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
-        for k_start in gl.static_range(0, K, BLOCK_TILE_SIZE_K):
-            a_offsets = mem_a_offsets + k_start
-            b_offsets = mem_b_offsets + (k_start // 8) * 16 * 8
-            a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
+        s_vmem_read: gl.constexpr = 0x0020
+        s_mfma: gl.constexpr = 0x0008
+        s_ds_read: gl.constexpr = 0x0100
+        s_ds_write: gl.constexpr = 0x0200
+
+        for k_start in gl.static_range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
+            _amd_iglp_sched_barrier(0)
+            a_offsets = mem_a_offsets + k_start + BLOCK_TILE_SIZE_K
+            b_offsets = mem_b_offsets + (k_start // 8) * 16 * 8 + BLOCK_TILE_SIZE_K * 16
+            next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
             if weight_dtype == torch.bfloat16:
-                b = gl.amd.cdna3.buffer_load(p_weight, b_offsets)
+                next_b = gl.amd.cdna3.buffer_load(p_weight, b_offsets)
             else:
                 assert 0, "only bf16 weight is supported in this kernel"
             a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
@@ -159,6 +185,18 @@ def gemm_splitk(
             b = b.reshape(num_warps, 4, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N)
             b_fma = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
             acc = gl.amd.cdna4.mfma(a_fma, b_fma, acc)
+            a = next_a
+            b = next_b
+            _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
+            _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
+
+        _amd_iglp_sched_barrier(0)
+        # tail
+        a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
+        a_fma = gl.convert_layout(a, a_fma_layout, assert_trivial=True)
+        b = b.reshape(num_warps, 4, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N)
+        b_fma = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
+        acc = gl.amd.cdna4.mfma(a_fma, b_fma, acc)
 
         if num_warps == 1:
             out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
@@ -166,13 +204,14 @@ def gemm_splitk(
             out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
             gl.amd.cdna3.buffer_store(gl.convert_layout(acc.reshape(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), mem_c_layout, assert_trivial=True).to(gl.bfloat16), p_output, out_offsets)
         else:
-            # (num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N) --> (BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N)
-            acc = acc.permute(1, 0, 2).reshape(BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N // 32, 32)
-            lds_c = gl.allocate_shared_memory(gl.float32, [BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N // 32, 32], layout=lds_layout_write)
+            # (num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N) --> (num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 32, 32) -->
+            #   (num_warps, BLOCK_TILE_SIZE_N // 32, BLOCK_TILE_SIZE_M, 32)
+            acc = acc.reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 32, 32).permute(0, 2, 1, 3)
+            lds_c = gl.allocate_shared_memory(gl.float32, [num_warps, BLOCK_TILE_SIZE_N // 32, BLOCK_TILE_SIZE_M, 32], layout=lds_layout_write)
             lds_c.store(acc)
-            acc_r = lds_c.load(layout=lds_layout_read).reshape(BLOCK_TILE_SIZE_M, num_warps, BLOCK_TILE_SIZE_N)
-            
-            acc_r = acc_r.sum(axis=1).to(gl.bfloat16)
+            acc_r = lds_c.load(layout=lds_layout_read).permute(0, 2, 1, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)
+
+            acc_r = acc_r.sum(axis=0).to(gl.bfloat16)
 
             out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
             out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout))) % N
@@ -192,10 +231,15 @@ def _run_aiter(
                 weight: Tensor,  # B:[N, K/2] f4x2
                 weight_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
             ):
-    from aiter import gemm_a4w4, per_1x32_f4_quant_hip
+    from aiter import gemm_a4w4, per_1x32_f4_quant_hip, gemm_a16w16
     M = x.shape[0]
     N = weight.shape[0]
     K = weight.shape[1]
+    if x.dtype == torch.bfloat16:
+        out = torch.empty([M, N], dtype=torch.bfloat16, device=x.device)
+        gemm_a16w16(x, weight, out, splitK=4, bpreshuffle=True)
+        return out
+
     # use hip quant kernel for performance
     x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
 
@@ -261,7 +305,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 A,                # bf16 [M, K]
                 weight.T,           # bf16 [K/8 * 16 * 8, N/16]
                 gemm_out,         # bf16 [M, N]
-                weight_scale,
+                # weight_scale,
                 M,
                 weight_type,
                 K,
@@ -367,7 +411,7 @@ def show_perf(perf, dict_tile_mn):
 def test_perf(M, TILE_M=32, TILE_N=64, N=4096, K=4096):
     init_env()
     perf = {}
-    #perf.update(entry_common('aiter', M, prec=[get_fp4type_if_valid()], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
+    #perf.update(entry_common('aiter', M, prec=[torch.bfloat16], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
     # TILE_M/N is configurable
     perf.update(entry_common('mxn_splitk_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     return perf
@@ -389,7 +433,7 @@ if __name__ == '__main__':
     # qwen3 235b/a22b qkv projection
     N, K = 9216, 4096
     # qwen3 235b/a22b qkv projection
-    #N, K = 4096, 8192
+    N, K = 4096*8*2, 8192 # 4096*8*2 /128 = 512
     Ms = [16, 32, 64, 128, 256]
     perf = {}
     dict_tile_mn = {}
@@ -426,6 +470,7 @@ if __name__ == '__main__':
         #         TILE_N = 128
 
         print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
+        #TILE_M, TILE_N = 16, 64
         dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
         #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
         perf = merge(perf, test_perf([M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
