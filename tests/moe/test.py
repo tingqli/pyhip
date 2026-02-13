@@ -11,7 +11,7 @@ import os
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.set_default_device('cuda')
 torch.manual_seed(0)
-torch.cuda.set_device(4)
+#torch.cuda.set_device(4)
 
 EIDX = int(os.getenv("EIDX","0"))
 
@@ -484,7 +484,7 @@ def test_moe_gemm_final_reduce_bf16():
             assert 0
     
     for _ in range(10):
-        with pyhip.cuPerf(name="moe_gemm_final_reduce_bf16"):
+        with pyhip.cudaPerf(name="moe_gemm_final_reduce_bf16"):
             moe_gemm_final_reduce_bf16([num_WG], [64], TOPK, OC,
                                     input.data_ptr(),
                                     output.data_ptr(),

@@ -5,17 +5,13 @@ from torch import Tensor
 
 import pytest
 os.environ['PYHIP_JIT_LOG'] = '0'
-from pyhip import cudaPerf, jit, JIT
+from pyhip import jit, JIT
 import torch
 
 from functools import cache
-try:
-    # work as package
-    from .common.gemm import UGEMM
-    from .common.gemm_splitk import gemm_splitk
-except:
-    from common.gemm import UGEMM
-    from common.gemm_splitk import gemm_splitk
+# work as package
+from .common.gemm import UGEMM
+from .common.gemm_splitk import gemm_splitk
 
 USE_FP4_SHUFFLE_WEIGHT = 1
 #####################################################################
@@ -205,6 +201,7 @@ def _run_aiter(
     return y[:M]
 
 def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, N=4096, K=4096):
+    from pyhip import cudaPerf
     BUF_COPY = 32
     A = (torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16) + 1)*0.001
     if weight_type == torch.float4_e2m1fn_x2:

@@ -1498,7 +1498,7 @@ def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids):
 
 import aiter
 from aiter.utility import fp4_utils
-from pyhip import moe_gemm_mxfp4, moe_gemm_final_reduce_bf16
+from .moe_gemm_mxfp4 import moe_gemm_mxfp4, moe_gemm_final_reduce_bf16
 
 def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8):
     INTER_SIZE_TP = INTER_SIZE // TP

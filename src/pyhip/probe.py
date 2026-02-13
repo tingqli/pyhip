@@ -153,27 +153,27 @@ def probe_vmem_bandwidth():
     dtype = "dword"
 
     for r in range(10):
-        with pyhip.cuPerf(rw_bytes=bytes_per_WG*num_CU, name=f"load-{dtype}-{r}"):
+        with pyhip.cudaPerf(rw_bytes=bytes_per_WG*num_CU, name=f"load-{dtype}-{r}"):
             dummy_load([num_CU], [256], bytes_per_WG, "load", dtype, data[r].data_ptr(), cycles.data_ptr())
 
     for r in range(10):
-        with pyhip.cuPerf(rw_bytes=bytes_per_WG*num_CU, name=f"load-dwordx2-{r}"):
+        with pyhip.cudaPerf(rw_bytes=bytes_per_WG*num_CU, name=f"load-dwordx2-{r}"):
             dummy_load([num_CU], [256], bytes_per_WG, "load", "dwordx2", data[r].data_ptr(), cycles.data_ptr())
 
     for r in range(10):
-        with pyhip.cuPerf(rw_bytes=bytes_per_WG*num_CU, name=f"load-dwordx4-{r}"):
+        with pyhip.cudaPerf(rw_bytes=bytes_per_WG*num_CU, name=f"load-dwordx4-{r}"):
             dummy_load([num_CU], [256], bytes_per_WG, "load", "dwordx4", data[r].data_ptr(), cycles.data_ptr())
 
     for r in range(10):
-        with pyhip.cuPerf(rw_bytes=bytes_per_WG*num_CU, name=f"store-{dtype}-{r}"):
+        with pyhip.cudaPerf(rw_bytes=bytes_per_WG*num_CU, name=f"store-{dtype}-{r}"):
             dummy_load([num_CU], [256], bytes_per_WG, "store", dtype, data[r].data_ptr(), cycles.data_ptr())
 
     for r in range(10):
-        with pyhip.cuPerf(rw_bytes=bytes_per_WG*num_CU, name=f"atomic_pk_add_bf16-{dtype}-{r}"):
+        with pyhip.cudaPerf(rw_bytes=bytes_per_WG*num_CU, name=f"atomic_pk_add_bf16-{dtype}-{r}"):
             dummy_load([num_CU], [256], bytes_per_WG, "atomic_pk_add_bf16", "dword", data[r].data_ptr(), cycles.data_ptr())
 
     for r in range(10):
-        with pyhip.cuPerf(rw_bytes=bytes_per_WG*num_CU, name=f"global_atomic_xor-{dtype}-{r}"):
+        with pyhip.cudaPerf(rw_bytes=bytes_per_WG*num_CU, name=f"global_atomic_xor-{dtype}-{r}"):
             dummy_load([num_CU], [256], bytes_per_WG, "atomic_xor", "dword", data[r].data_ptr(), cycles.data_ptr())
 
 @pyhip.jit(no_pass = ["pass_dse","pass_dce"])

@@ -1,4 +1,4 @@
-from pyhip import cudaPerf, jit, JIT
+from pyhip import jit, JIT
 import torch
 
 def div_up(x, y):
