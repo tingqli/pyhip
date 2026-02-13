@@ -925,6 +925,19 @@ class LDSTensor:
         # other vdst
         return issue
 
+class _Addr2D:
+    def __init__(self, J:"JIT", base, row_init, col_init, stride):
+        self.vaddr = J.gpr('vu32')
+        # TODO: use shift to simplify
+        # TODO: remove zero add/mul
+        if isinstance(base, int) and base == 0:
+            self.vaddr[0] = row_init * stride + col_init
+        else:
+            self.vaddr[0] = base + row_init * stride + col_init
+
+    def get_addr(self):
+        return self.vaddr
+
 # JIT emits instructions into BBs
 all_kernel_hip_src_names = {}
 replace_index = 0
@@ -1109,6 +1122,9 @@ class JIT:
         buff = Buffer(self)
         buff.setup(sgpr_base, sgpr_size)
         return buff
+
+    def Addr2D(self, base, row_init, col_init, stride):
+        return _Addr2D(self, base, row_init, col_init, stride)
 
     '''
     # scalar jump (wave level, no divergent)
@@ -3820,16 +3836,3 @@ class jit:
 
     def __call__(self, gen_func):
         return jit_kernel(gen_func, self.extra_compiler_options, self.with_debug_log, self.dump_stat, self.force_recompile, self.no_pass)
-
-class Addr2D:
-    def __init__(self, J:JIT, base, row_init, col_init, stride):
-        self.vaddr = J.gpr('vu32')
-        # TODO: use shift to simplify
-        # TODO: remove zero add/mul
-        if isinstance(base, int) and base == 0:
-            self.vaddr[0] = row_init * stride + col_init
-        else:
-            self.vaddr[0] = base + row_init * stride + col_init
-
-    def get_addr(self):
-        return self.vaddr

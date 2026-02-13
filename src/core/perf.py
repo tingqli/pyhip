@@ -70,3 +70,16 @@ class torchPerf(object):
         if self.profiler is not None:
             self.profiler.stop()
             print(self.profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+
+def calc_diff(x: "torch.Tensor", y: "torch.Tensor"):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    if denominator == 0:    # Which means that all elements in x and y are 0
+        return 0.0
+    sim = 2 * (x * y).sum() / denominator
+    diff = (1 - sim).item()
+    assert diff == diff, "diff is nan!"
+    return diff
+
+def div_up(x, y):
+    return (x + y - 1) // y

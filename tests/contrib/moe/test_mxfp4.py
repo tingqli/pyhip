@@ -1,7 +1,8 @@
 import pyhip
 import torch
 
-from pyhip.kernels import moe_gemm_mxfp4, moe_gemm_mxfp4_gateup_4wave, moe_gemm_mxfp4_gateup_8wave, moe_gemm_final_reduce_bf16
+from pyhip import calc_diff
+from pyhip.contrib.moe_gemm_mxfp4 import *
 
 import aiter
 from aiter.utility import fp4_utils
@@ -233,18 +234,6 @@ def moe_gemm_ref(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, gate_up,
             output[tok_ids[valid_mask], top_k[valid_mask], :] = act[valid_mask, :]
         else:
             output[tok_ids[valid_mask], ...] += act[valid_mask, ...] * tok_w[valid_mask, None]
-
-def calc_diff(x: torch.Tensor, y: torch.Tensor):
-    x, y = x.double(), y.double()
-    denominator = (x * x + y * y).sum()
-    if denominator == 0:    # Which means that all elements in x and y are 0
-        return 0.0
-    sim = 2 * (x * y).sum() / denominator
-    diff = (1 - sim).item()
-    assert diff == diff, "diff is nan!"
-    return diff
-
-
 
 def test_gateup(B, HIDDEN_SIZE, INTER_SIZE_TP, EXPERTS, TOPK, TILE_M=128, TILE_N=128, test_acc=True):
     from aiter.utility.fp4_utils import moe_mxfp4_sort

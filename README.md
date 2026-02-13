@@ -63,7 +63,6 @@ The build process will call jit kernel to generate IR (which is just a structure
  - pass_break_down_gprs: break logical VGPR array into smaller blocks according to instructions actually accessing needs
  - register_allocation_linear_scan: allocate physical register to logic registers
 
-
 # Usage - HIP kernels
 
 It can also invoke ROCM tools to compile HIP source into co file and then using `ctypes` to call HIP runtime API (from libamdhip64) to load & launch kernels from .co file.
@@ -103,6 +102,21 @@ test_kernel([gridDim_x, gridDim_y, gridDim_z],    # grid dimensions
             v.data_ptr(), # v is a torch cuda tensor, data_ptr() get it's device side pointer
             n             # normal argument
             )
+
+```
+
+# Tests
+
+```bash
+# ensure core functionality correctness
+./tests/core/run_unittests.sh
+
+# tests for contrib
+./tests/contrib/run_test.sh
+# run individual test for contrib
+python tests/contrib/pa/test.py
+python tests/contrib/moe/test_moe.py
+python tests/contrib/moe/test_mxfp4.py
 
 ```
 

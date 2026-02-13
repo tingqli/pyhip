@@ -1,6 +1,13 @@
 from pyhip import jit, JIT
 import torch
 
+__all__ = [
+    "moe_gemm_final_reduce_bf16",
+    "moe_gemm_mxfp4_gateup_8wave",
+    "moe_gemm_mxfp4_gateup_4wave",
+    "moe_gemm_mxfp4"
+]
+
 def get_loader_b_preshuffled(J, weight, wg_N, nbM, nbK, stride_b, ibM0, gate_up, stride_gate_up, lds_woff=None):
     # 4 waprs load weight coorperatively into LDS
     #

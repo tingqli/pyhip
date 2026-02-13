@@ -13,9 +13,5 @@ license = "MIT"
 license-files = ["LICEN[CS]E.*"]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["*"]
-exclude = ["tests*"]
+packages = ["pyhip"]
+package-dir = {"pyhip" = "src"}
