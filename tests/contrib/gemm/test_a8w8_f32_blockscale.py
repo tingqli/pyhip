@@ -1,0 +1,159 @@
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from einops import repeat as eirp
+from typing_extensions import List
+
+import aiter
+from aiter import dtypes
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, perftest
+
+import pyhip
+
+block_shape = (128, 128)
+
+@perftest()
+def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+    block_shape_n, block_shape_k = block_shape
+    m, k = x.shape
+    n = weight.shape[0]
+    scale_n = (n + block_shape_n - 1) // block_shape_n
+    scale_k = (k + block_shape_k - 1) // block_shape_k
+    x = x.to(x_scale.dtype).view(
+        m, k // block_shape[1], block_shape[1]
+    ) * x_scale.unsqueeze(-1)
+    x = x.view(m, k)
+
+    w_scale = rearrange(
+        w_scale.view(-1, 1)
+        .repeat(1, block_shape_n * block_shape_k)
+        .view(scale_n, scale_k, block_shape_n, block_shape_k),
+        "num_blk_n num_blk_k blk_n blk_k -> (num_blk_n blk_n) (num_blk_k blk_k)",
+    )
+    w_scale = w_scale[:n, :k]
+    weight = weight.to(w_scale.dtype) * w_scale
+
+    out = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
+    return out.to(dtype)
+
+@perftest()
+def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
+
+@perftest()
+def run_gemm_bpreshuffle_ck(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_blockscale_bpreshuffle(
+        x, weightshuffle, x_scale, w_scale, dtype
+    )
+
+@perftest()
+def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
+    m, k = x.shape
+    n, _ = weight.shape
+    out = torch.empty((m, n), dtype=dtype, device=x.device)
+    return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)
+
+def test_gemm(dtype, m, n, k, ck_preshuffle=True):
+    ret = {}
+    dim = (m, n, k)
+    block_shape_n, block_shape_k = block_shape
+    scale_m = m
+    scale_n = (n + block_shape_n - 1) // block_shape_n
+    scale_k = (k + block_shape_k - 1) // block_shape_k
+    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+
+    a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
+
+    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
+    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
+    run_func = run_gemm_bpreshuffle_ck if ck_preshuffle else run_gemm_ck
+    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
+
+    err_ck = checkAllclose(a, b, msg="ck")
+    ret["ck us"] = avg_b
+    ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
+    ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
+    ret["ck err"] = err_ck
+
+    tag = "asm"
+    weight_asm = shuffle_weight(weight, layout=(32, 16))
+    # kernel_name = "_ZN5aiter43fp8gemm_bf16_blockscale_BpreShuffle_128x128E"
+    # c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype, kernel_name=kernel_name)
+    c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype)
+
+    err_asm = checkAllclose(a, c, msg=f"{tag}")
+    ret[f"{tag} us"] = avg_c
+    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+    ret[f"{tag} err"] = err_asm
+    ret["asm/ck"] = avg_c / avg_b
+
+    for k,v in ret.items():
+        print(f"\t{k}:{v}")
+    return ret
+
+def compare_perf(m, n, k, ck_preshuffle=True):
+    dim = (m, n, k)
+    block_shape_n, block_shape_k = block_shape
+    scale_m = m
+    scale_n = (n + block_shape_n - 1) // block_shape_n
+    scale_k = (k + block_shape_k - 1) // block_shape_k
+    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+
+    BUF_COPY = 32
+    As = [x.clone() for _ in range(BUF_COPY)]
+    Ascales = [x_scale.clone() for _ in range(BUF_COPY)]
+    Bs = [weight.clone() for _ in range(BUF_COPY)]
+    Bscales = [w_scale.clone() for _ in range(BUF_COPY)]
+    
+    output_dtype = dtypes.bf16
+    ck_kernel = aiter.gemm_a8w8_blockscale_bpreshuffle if ck_preshuffle else aiter.gemm_a8w8_blockscale
+    di = 0
+    for i in range(16):
+        with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"ck_kernel_{di}") as p0:
+            out = ck_kernel(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype)
+            di = (di + 1) % BUF_COPY
+
+    if ck_preshuffle:
+        out = torch.empty((m, n), dtype=output_dtype, device=x.device)
+        for i in range(16):
+            with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"asm_kernel_{di}") as p0:
+                aiter.gemm_a8w8_blockscale_bpreshuffle_asm(As[di], Bs[di], out, Ascales[di], Bscales[di])
+            di = (di + 1) % BUF_COPY
+
+
+if __name__ == "__main__":
+    M,N,K = 256*94, 256*16, 8192
+    test_gemm(dtypes.bf16, M, N, K, False)
+    compare_perf(M,N,K, False)
+
+"""
+def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+    x = x.to(dtypes.fp32) * x_scale
+    weight = weight.to(dtypes.fp32) * w_scale
+    out = F.linear(x, weight)
+    if bias is not None:
+        out = out.to(bias) + bias
+    return out.to(dtype)
+
+quantDtype=dtypes.fp8
+dim = (m, n, k)
+x = torch.randn((m, k), dtype=dtype, device="cuda")
+weight = torch.randn((n, k), dtype=dtype, device="cuda")
+x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
+weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=quantDtype)
+weightshuffle = shuffle_weight(weight, layout=(16, 16))
+
+a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+
+aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias, dtype)
+aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
+"""
