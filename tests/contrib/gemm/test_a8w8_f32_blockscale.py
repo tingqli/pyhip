@@ -8,6 +8,9 @@ import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+)
 
 import pyhip
 
@@ -130,12 +133,18 @@ def compare_perf(m, n, k, ck_preshuffle=True):
             di = (di + 1) % BUF_COPY
 
 
+    out = torch.empty((m, n), dtype=output_dtype, device=x.device)
+    for i in range(16):
+        with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"gluon_kernel_{di}") as p0:
+            gluon_gemm_a8w8_blockscale(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype, out)
+        di = (di + 1) % BUF_COPY
+
 if __name__ == "__main__":
     '''
     MI350X: 
            M,N,K = 256*94, 256*16, 8192 
-           ck_preshuffle=False: ck_kernel 1376.1 TFLOPS (跟相同shape的bf16的gemm性能相当)
-           ck_preshuffle=True:  ck_kernel 1698.2 TFLOPS asm_kernel 862.2 TFLOPS
+           ck_preshuffle=False: ck 1376.1 TFLOPS (跟相同shape的bf16的gemm性能相当)
+           ck_preshuffle=True:  ck 1698.2 TFLOPS    asm 862.2 TFLOPS   gluon 527.7 TFLOPS  
     CK:  kernel_gemm_xdl_cshuffle_v3_multi_d_blockscale_b_preshuffle
             LDS_Block_Size 8192
             VGPR_Count 128
@@ -154,6 +163,8 @@ if __name__ == "__main__":
     ASM: _ZN5aiter43fp8gemm_bf16_blockscale_BpreShuffle_128x128E.kd
     '''
     #
+    print(type(dtypes.fp8), dtypes.fp8)
+
     M,N,K = 256*94, 256*16, 8192 
     #test_gemm(dtypes.bf16, M, N, K, True)
     compare_perf(M,N,K, True)

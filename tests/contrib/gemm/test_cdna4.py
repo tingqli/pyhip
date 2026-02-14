@@ -73,7 +73,7 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
         idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
         if len(idx[0]):
             print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
-        #assert 0
+        assert 0
         acc = "failed"
 
     DATA_CLONES = 40
@@ -101,5 +101,5 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
 
 if __name__ == "__main__":
     test_accuracy(2400, 256*4, 256*6)
-    #test_accuracy(256, 256, 256)
-    #compare_perf(M = 256*94, N = 256*16, K=8192)
+    test_accuracy(256, 256, 256)
+    compare_perf(M = 256*94, N = 256*16, K=8192)

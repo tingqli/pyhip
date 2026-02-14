@@ -5,6 +5,7 @@ from pyhip import calc_diff
 import pytest
 import torch
 import aiter
+from aiter import dtypes
 from aiter.utility import fp4_utils
 from aiter.ops.shuffle import shuffle_weight
 
@@ -126,6 +127,6 @@ if __name__ == "__main__":
     #M,N,K = 24000,4096,8192
     #M,N,K = 24000,3072,4096
     #M,N,K = 24000,4096,1536
-    #test_accuracy(256, 256*4, 256*6)
-    #test_accuracy(24000, 4096, 8192)
+    test_accuracy(256, 256*4, 256*6)
+    test_accuracy(24000, 4096, 8192)
     compare_perf(M=24000,N=4096,K=8192)

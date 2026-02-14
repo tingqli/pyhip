@@ -20,96 +20,6 @@ def pre_shuffle(x, mfma_MN):
     x = x.permute(0,2,3,1,4)
     return x.contiguous()
 
-def get_loader(J, buff, use_pre_shuffle, nbM, nbK, stride_b, ibM0):
-    num_warps = 4
-    #stride_b = 0
-    if use_pre_shuffle:
-        stride_1kb = J.div(16*stride_b, 1024)
-        warp_k = J.warp_id[0] % nbK
-        warp_m = J.warp_id[0] // nbK
-        vmem_warp_off = warp_m * (stride_1kb * 1024) + warp_k * 1024
-        vmem_voff = J.gpr(J.lane_id[0] * J.sizeof_DW4 + vmem_warp_off)
-        lds_warp_off = J.gpr("su32", warp_m * (nbK * 1024) + warp_k * 1024)
-
-        voff = J.gpr(J.lane_id[0] * J.sizeof_DW4 + ibM0 * (nbK * 1024))
-        voff2 = J.gpr("vu32", voff[0] + 64*1024)
-        def ds_read_1kb(lds, vdst, m, k):
-            offset = lds + m*(nbK * 1024) + k*1024
-            if offset >= 64*1024:
-                voffset = voff2
-                offset -= 64*1024
-            else:
-                voffset = voff
-            J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
-
-        vm_load_cnt = len(range(J.div(nbM, num_warps//nbK)))
-        # return a loader constructor which can emit
-        def vm_load(lds_offset):
-            J.s_mov_b32("m0", lds_warp_off + lds_offset)
-            voff = J.gpr("vu32", vmem_voff[0])
-
-            for m in range(J.div(nbM, num_warps//nbK)):
-                yield 1
-                buff.load_dwordx4(None, voff, 0, offset12=0)
-                J.s_addk_i32("m0", 256*J.sizeof_DW4)
-                voff[0] += (num_warps//nbK)*(stride_1kb)*1024
-
-            vmem_voff[0] += nbK * 1024
-    else:
-        if 0:
-            # 通过下面的可视化得知swizzle可以解决读入数据使用mfma格式ds_read时潜在的bank-conflict问题
-            J.show_mfma_in_lds(mfma_MN=16, num_mfmas=2)
-            J.show_mfma_in_lds(mfma_MN=16, num_mfmas=2, swizzle_1=1)
-            J.show_mfma_in_lds(mfma_MN=16, num_mfmas=2, swizzle_2=1)
-            J.show_mfma_in_lds(mfma_MN=16, num_mfmas=2, swizzle_2=2)
-            print(f"{wg_M=} {wg_K=} {nbM=} {nbK=}")
-            assert 0
-        # each wave load 8x128 bytes , 4 waves loads 32x128 bytes
-        lds_stride_b = nbK * 4 * J.sizeof_DW4
-        warp_m_off = J.warp_id[0] * 8
-
-        def swizzle(row, col):
-            #return col
-            return (col ^ row) % 8
-        col = J.threadIdx.x % 8
-        row = J.threadIdx.x // 8
-        swizzle_col = swizzle(row, col)
-        vmem_voff = J.gpr(row * stride_b + swizzle_col * J.sizeof_DW4)
-        lds_warp_off = J.gpr("su32", warp_m_off * lds_stride_b)
-
-        vm_load_cnt = len(range(0, nbM * 16, 8*num_warps))
-
-        def vm_load(lds_offset):
-            J.s_mov_b32("m0", lds_warp_off + lds_offset)
-            voff = J.gpr("vu32", vmem_voff[0])
-            for m in range(0, nbM * 16, 8*num_warps):
-                yield 1
-                buff.load_dwordx4(None, voff, 0, offset12=0)
-                J.s_addk_i32("m0", 256*J.sizeof_DW4)
-                voff[0] += (8*num_warps) * stride_b
-
-            vmem_voff[0] += nbK * 4 * J.sizeof_DW4
-
-        col = J.lane_id // 16
-        row = J.lane_id % 16
-        swizzle_col = swizzle(row, col)
-        voff = J.gpr(2, "vu32",
-                     (row + ibM0*16) * lds_stride_b + swizzle(row, col) * J.sizeof_DW4,
-                     (row + ibM0*16) * lds_stride_b + swizzle(row, col + 4) * J.sizeof_DW4)
-        # ds_read_b128's offset is just 16bits 
-        voff2 = J.gpr(2, "vu32", voff[0] + 64*1024, voff[1] + 64*1024)
-        def ds_read_1kb(lds, vdst, m, k):
-            offset = lds + m*16*lds_stride_b
-            if offset >= 64*1024:
-                voffset = voff2[k]
-                offset -= 64*1024
-            else:
-                voffset = voff[k]
-            J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
-
-    return vm_load, vm_load_cnt, ds_read_1kb
-
-
 @pyhip.jit()
 def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC:"void*", M:"int"):
     # 128 bytes
@@ -151,8 +61,9 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
     warp_m = J.gpr((J.warp_id[0] // 2)*nrM)
     warp_n = J.gpr((J.warp_id[0] % 2)*nrN)
 
-    vm_load_a, vm_load_cnt_a, ds_read_a = get_loader(J, buff_a, use_pre_shuffle, nbM, nbK, stride_k, warp_m)
-    vm_load_b, vm_load_cnt_b, ds_read_b = get_loader(J, buff_b, use_pre_shuffle, nbN, nbK, stride_k, warp_n)
+    num_warps = 4
+    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = J.get_mfma_loader(use_pre_shuffle, num_warps, wg_M, 128, stride_k, warp_m*16)
+    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = J.get_mfma_loader(use_pre_shuffle, num_warps, wg_N, 128, stride_k, warp_n*16)
 
     print(f"============={nbM=}, {nbN=}, {nbK=} {nrM=} {nrN=} {nrK=}")
 
@@ -166,11 +77,18 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
                 J.v_mfma_f32_16x16x32_bf16(mfma_C[m,n], mfma_B[reg_id, n], mfma_A[reg_id, m], mfma_C[m,n])
                 yield 16
 
-    J.emit(vm_load_a(ldsA[0]))
-    J.emit(vm_load_b(ldsB[0]))
+    koffset_a = J.gpr("su32", 0)
+    koffset_b = J.gpr("su32", 0)
+    J.emit(vm_load_a(ldsA[0], buff_a, koffset_a))
+    J.emit(vm_load_b(ldsB[0], buff_b, koffset_b))
+    koffset_a[0] += vm_offset_inc_a
+    koffset_b[0] += vm_offset_inc_b
 
-    J.emit(vm_load_a(ldsA[1]))
-    J.emit(vm_load_b(ldsB[1]))
+    J.emit(vm_load_a(ldsA[1], buff_a, koffset_a))
+    J.emit(vm_load_b(ldsB[1], buff_b, koffset_b))
+    koffset_a[0] += vm_offset_inc_a
+    koffset_b[0] += vm_offset_inc_b
+
     mfma_C[...] = 0
 
     '''
@@ -209,7 +127,7 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
         mfma_ab1 = mfma(1)
 
         # vm-load a01
-        vm_load = vm_load_a(ldsA[lds_id])
+        vm_load = vm_load_a(ldsA[lds_id], buff_a, koffset_a)
         J.emit([mfma_ab0, mfma_ab1], 16)
         J.emit(vm_load, 1) # first emit produce preparing instructions
         J.emit([mfma_ab0, mfma_ab1], 16)
@@ -219,7 +137,7 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
         J.emit(vm_load)
 
         # vm-load b01
-        vm_load = vm_load_b(ldsB[lds_id])
+        vm_load = vm_load_b(ldsB[lds_id], buff_b, koffset_b)
         J.emit([mfma_ab0, mfma_ab1], 16)
         J.emit(vm_load, 1) # first emit produce preparing instructions
         J.emit([mfma_ab0, mfma_ab1], 16)
@@ -248,6 +166,10 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
         J.emit(mfma_ab1, 96)
         J.emit(vm_load, 1)
         J.emit(mfma_ab1)
+
+        koffset_a[0] += vm_offset_inc_a
+        koffset_b[0] += vm_offset_inc_b
+
         J.s_waitcnt(mod=f"lgkmcnt(0)")
 
     if 0:
