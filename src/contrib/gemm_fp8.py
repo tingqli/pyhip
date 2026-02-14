@@ -5,77 +5,6 @@ __all__ = [
 ]
 
 
-def get_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
-    if 0:
-        # 通过下面的可视化得知swizzle可以解决读入数据使用mfma格式ds_read时潜在的bank-conflict问题
-        mfma_MN = 16
-        mfma_K = 64//mfma_MN
-        num_mfmas = K // (mfma_K * J.sizeof_DW4)
-        J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas)
-        J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_1=1)
-        J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_2=1)
-        J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_2=2)
-        print(f"{wg_M=} {wg_K=} {M=} {K=}")
-        assert 0
-
-    # each wave load 8x128 bytes , 8 waves loads 64x128 bytes
-    lds_stride = K
-    num_lanes_per_row = J.div(lds_stride, J.sizeof_DW4)
-    num_rows_per_load = J.div(64, num_lanes_per_row)
-    warp_m_off = J.warp_id[0] * num_rows_per_load
-
-    def swizzle(row, col):
-        return (col ^ row) % num_lanes_per_row
-
-    row = J.threadIdx.x // num_lanes_per_row
-    col = J.threadIdx.x % num_lanes_per_row
-    swizzle_col = swizzle(row, col)
-    vmem_voff = J.gpr(row * vm_stride + swizzle_col * J.sizeof_DW4)
-    lds_warp_off = J.gpr("su32", warp_m_off * lds_stride)
-
-    vm_load_cnt = len(range(0, M, num_rows_per_load * num_warps))
-
-    # WG-level coorperative loader (closure & generator):
-    #   loads [M x K] bytes from specified buff+offset into lds
-    def vm_load(lds_offset, buff, vm_offset):
-        J.s_mov_b32("m0", lds_warp_off + lds_offset)
-        voff = J.gpr("vu32", vmem_voff[0] + vm_offset)
-        for m in range(0, M, 8*num_warps):
-            yield 1
-            buff.load_dwordx4(None, voff, 0, offset12=0)
-            J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
-            voff[0] += (num_rows_per_load * num_warps) * vm_stride
-
-    # the [M x K] bytes LDS buffer is accessed by following closure
-    # this closure using ds_read_b128 to load a 16x64 bytes MFMA data
-    # thus LDS buffer's layout is blocked as [M//16,K//64] x [16,64]
-    # each warp has its own row offsets specified in warp_row0
-    assert M % 16 == 0
-    assert K % 64 == 0
-
-    col = J.lane_id // 16
-    row = J.lane_id % 16
-    num_regs_K = J.div(K, 64)
-    voff = J.gpr(num_regs_K, "vu32")
-    voff2 = J.gpr(num_regs_K, "vu32")
-    for k in range(num_regs_K):
-        # each ds_read_b128 took 4 x DW-lanes
-        voff[k] = (row + warp_row0) * lds_stride + swizzle(row + warp_row0, col + k*4) * J.sizeof_DW4
-        # ds_read_b128's imm offset is limited to 16bits, this additional voffset handles
-        # the overflow case
-        voff2[k] = voff[k] + 64*1024
-
-    def ds_read_16x64(lds_offset, vdst, m, k):
-        offset = lds_offset + m*16*lds_stride
-        if offset >= 64*1024:
-            voffset = voff2[k]
-            offset -= 64*1024
-        else:
-            voffset = voff[k]
-        J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
-    return vm_load, vm_load_cnt, ds_read_16x64
-
-
 @pyhip.jit()
 def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
                    pA:"void*", # [M, K]  torch.float8_e4m3fn   row-major
@@ -110,7 +39,7 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
     J.s_min_u32(M1, M0 + wg_M, M)
 
     assert N % wg_N == 0
-    num_warps = 4
+    num_warps = 8
     nbN = J.div(wg_N, 16)
     nbM = J.div(wg_M, 16)
     nbK = 2 # 2 MFMA 16x16 
@@ -126,7 +55,7 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
     HALF_BLOCK_SIZE_ROW = BLOCK_SIZE_ROW // 2
     HALF_BLOCK_SIZE_COL = BLOCK_SIZE_COL // 2
     
-    lds_base = J.alloc_lds(HALF_BLOCK_SIZE_ROW * BLOCK_K * 4 * 2)
+    lds_base = J.alloc_lds(HALF_BLOCK_SIZE_ROW * BLOCK_K * 4 + HALF_BLOCK_SIZE_COL * BLOCK_K * 4)
     ldsA = {}
     ldsB = {}
     lds = lds_base
@@ -136,10 +65,10 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
     ldsA[1,0] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
     ldsA[1,1] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
 
-    ldsB[0,0] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
-    ldsB[0,1] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
-    ldsB[1,0] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
-    ldsB[1,1] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
+    ldsB[0,0] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
+    ldsB[0,1] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
+    ldsB[1,0] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
+    ldsB[1,1] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
 
     nrM = J.div(nbM, WARPS_ROW, 2) # 4
     nrN = J.div(nbN, WARPS_COL, 2) # 2
@@ -148,24 +77,104 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
     warp_m = J.gpr(J.warp_id[0] // WARPS_COL) # warp row: 0 to 1
     warp_n = J.gpr(J.warp_id[0] % WARPS_COL)  # warp col: 0 to 3
 
-    vm_load_a, vm_load_cnt_a, ds_read_a = get_loader_row_major(J, buff_a, nbM, nbK, stride_k, warp_m)
-    vm_load_b, vm_load_cnt_b, ds_read_b = get_loader_row_major(J, buff_b, nbN, nbK, stride_k, warp_n)
+    use_pre_shuffle = False
+    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = J.get_mfma_loader(use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*64)
+    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = J.get_mfma_loader(use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*32)
 
     # v_mfma_f32_16x16x128_f8f6f4: 
-    mfma_A = J.gpr(nrM, 8, "vfp8x4")            # 4x16x128
-    mfma_B = J.gpr(nrN, 8, "vfp8x4")            # 2x16x128
-    mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 
+    mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
+    mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")            # 2x[16,128]
+    mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 4x[4,2]x[16,16]
+    mfma_C[...] = 0
+
+    def mfma(c_index):
+        b_index = c_index % 1
+        for m in range(nrM):
+            for n in range(nrN):
+                J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n], mfma_B[b_index, n], mfma_A[m], mfma_C[c_index, m, n])
+                yield 16
+
 
     # 第一步确保基础设施正确，使用最低效简单的pipeline，8-wave一起读入LDS，一起读出到寄存器，计算
     loop_cnt = J.div(K, wg_K)
+    assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
+
+    koffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
+
+    def vm_loadA(m, k):
+        assert m in [0, 1]
+        assert k in [0, 1]
+        return vm_load_a(ldsA[m,k], buff_a, koffsets[k])
+
+    def vm_loadB(m, k):
+        assert m in [0, 1]
+        assert k in [0, 1]
+        return vm_load_b(ldsB[m,k], buff_b, koffsets[k])
+
     for k in range(loop_cnt):
-        J.emit(vm_load_a(ldsA[0]))
-        J.emit(vm_load_b(ldsB[0]))
+        J.emit(vm_loadB(0,0))
+        J.emit(vm_loadA(0,0))
+        J.s_waitcnt(mod="vmcnt(0)")
 
-        for m in range(nrM): ds_read_a(ldsA[0], mfma_A[0, m], m, 0)
-        for n in range(nrN): ds_read_b(ldsB[0], mfma_B[0, n], n, 0)
+        for m in range(nrM):
+            ds_read_a(ldsA[0,0], mfma_A[m, 0], m, 0)
+            ds_read_a(ldsA[0,0], mfma_A[m, 1], m, 1)
+        for n in range(nrN):
+            ds_read_b(ldsB[0,0], mfma_B[0, n, 0], n, 0)
+            ds_read_b(ldsB[0,0], mfma_B[0, n, 1], n, 1)
 
+        J.s_waitcnt(mod="lgkmcnt(0)")
+        J.emit(mfma(0))
 
+        J.emit(vm_loadB(0,1))
+        J.s_waitcnt(mod="vmcnt(0)")
+        for n in range(nrN):
+            ds_read_b(ldsB[0,1], mfma_B[1, n, 0], n, 0)
+            ds_read_b(ldsB[0,1], mfma_B[1, n, 1], n, 1)
+        J.s_waitcnt(mod="lgkmcnt(0)")
+        J.emit(mfma(1))
+
+        J.emit(vm_loadA(0,1))
+        J.s_waitcnt(mod="vmcnt(0)")
+        for m in range(nrM):
+            ds_read_a(ldsA[0,1], mfma_A[m, 0], m, 0)
+            ds_read_a(ldsA[0,1], mfma_A[m, 1], m, 1)
+        J.s_waitcnt(mod="lgkmcnt(0)")
+        J.emit(mfma(2))
+        J.emit(mfma(3))
+
+        koffsets[0] += BLOCK_K
+        koffsets[1] += BLOCK_K
+
+    stride_c = N * J.sizeof_bf16
+    vbf16 = J.gpr(4, "vbf16x2")
+    col = J.lane_id // 16
+    swap_12_col = (col & 1) * 2 + (col >> 1)
+
+    vaddr0 = J.gpr(((J.lane_id % 16) + warp_m * 64)*stride_c + swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + \
+            blk_n * (wg_N * J.sizeof(C_dtype)))
+
+    for cindex in range(4):
+        cm = cindex // 2
+        cn = cindex % 2
+        vaddr = J.gpr("vu32", vaddr0[0] + cm*HALF_BLOCK_SIZE_ROW*stride_c)
+        for m in range(nrM):
+            for n in range(0, nrN, 2):
+                J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
+                J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
+                J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
+                J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
+                #    a0    a1   a2   a3   | 01 23
+                #    b0    b1   b2   b3   | 45 67
+                #  v_permlane16_swap_b32(a, b)
+                #    a0    b0   a2   b2   |
+                #    a1    b1   a3   b3   |
+                #
+                # swap of row 1 & 2 are done by swapping lane-address 
+                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*4*J.sizeof_DW2 + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
+            vaddr[0] += 16*stride_c
 
 @pyhip.jit()
 def gemm_fp8_blockscale(J, wg_M, wg_N, N, K,
