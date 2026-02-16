@@ -1,11 +1,12 @@
 import pyhip
+import torch
 
 __all__ = [
     "gemm_fp8_8wave",
 ]
 
 
-@pyhip.jit()
+@pyhip.jit(with_debug_log = False)
 def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
                    pA:"void*", # [M, K]  torch.float8_e4m3fn   row-major
                    pB:"void*", # [N, K]  torch.float8_e4m3fn   row-major
@@ -54,7 +55,7 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
     BLOCK_K = 128
     HALF_BLOCK_SIZE_ROW = BLOCK_SIZE_ROW // 2
     HALF_BLOCK_SIZE_COL = BLOCK_SIZE_COL // 2
-    
+
     lds_base = J.alloc_lds(HALF_BLOCK_SIZE_ROW * BLOCK_K * 4 + HALF_BLOCK_SIZE_COL * BLOCK_K * 4)
     ldsA = {}
     ldsB = {}
@@ -85,10 +86,9 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
     mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
     mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")            # 2x[16,128]
     mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 4x[4,2]x[16,16]
-    mfma_C[...] = 0
 
     def mfma(c_index):
-        b_index = c_index % 1
+        b_index = c_index % 2
         for m in range(nrM):
             for n in range(nrN):
                 J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n], mfma_B[b_index, n], mfma_A[m], mfma_C[c_index, m, n])
@@ -99,52 +99,145 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
     loop_cnt = J.div(K, wg_K)
     assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
 
-    koffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
+    moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
+    #moffsets[1] = stride_k * HALF_BLOCK_SIZE_ROW
 
-    def vm_loadA(m, k):
+    def step_k():
+        moffsets[0] += BLOCK_K
+        moffsets[1] += BLOCK_K
+
+    def vm_loadA(k, m):
         assert m in [0, 1]
         assert k in [0, 1]
-        return vm_load_a(ldsA[m,k], buff_a, koffsets[k])
+        return vm_load_a(ldsA[k,m], buff_a, moffsets[m])
 
-    def vm_loadB(m, k):
+    def vm_loadB(k, m):
         assert m in [0, 1]
         assert k in [0, 1]
-        return vm_load_b(ldsB[m,k], buff_b, koffsets[k])
+        return vm_load_b(ldsB[k,m], buff_b, moffsets[m])
 
-    for k in range(loop_cnt):
-        J.emit(vm_loadB(0,0))
-        J.emit(vm_loadA(0,0))
+    def ds_readA(k, m):
+        for i in range(nrM):
+            ds_read_a(ldsA[k,m], mfma_A[i, 0], i, 0)
+            ds_read_a(ldsA[k,m], mfma_A[i, 1], i, 1)
+
+    def ds_readB(k, m):
+        for i in range(nrN):
+            ds_read_b(ldsB[k,m], mfma_B[m, i, 0], i, 0)
+            ds_read_b(ldsB[k,m], mfma_B[m, i, 1], i, 1)
+
+    if 1:
+        tic = 0
+        toc = 1
+        J.emit(vm_loadB(tic,0))
+        J.emit(vm_loadA(tic,0))
+        J.emit(vm_loadB(tic,1))
+        J.emit(vm_loadA(tic,1))
+        
+        with J.If(warp_m[0] == 1):
+            J.s_barrier()
+
+        mfma_C[...] = 0
+
+        J.s_waitcnt(mod="vmcnt(4)"); J.s_barrier()
+
+        step_k()
+
+        J.emit(vm_loadA(toc,0))
+        J.emit(vm_loadB(toc,0))
+        J.emit(vm_loadB(toc,1))
+
+        J.s_waitcnt(mod="vmcnt(6)"); J.s_barrier()
+
+        for k in range(loop_cnt):
+            ds_readB(tic, 0)
+            ds_readA(tic, 0)
+            J.emit(vm_loadA(toc,1))
+            step_k()
+            J.s_waitcnt(mod="lgkmcnt(8)"); J.s_barrier()
+
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
+            J.emit(mfma(0))
+            J.s_setprio(0); J.s_barrier()
+
+            ds_readB(tic, 1)
+            J.emit(vm_loadA(tic,0))
+            J.s_barrier()
+
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
+            J.emit(mfma(1))
+            J.s_setprio(0); J.s_barrier()
+
+            ds_readA(tic, 1)
+            J.emit(vm_loadB(tic,0))
+            J.s_barrier()
+
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
+            J.emit(mfma(2))
+            J.s_setprio(0); J.s_barrier()
+
+            J.emit(vm_loadB(tic,1))
+            J.s_waitcnt(mod="vmcnt(6)"); J.s_barrier()
+
+            J.s_setprio(1)
+            J.emit(mfma(3))
+            J.s_setprio(0); J.s_barrier()
+
+            tic ^= 1
+            toc ^= 1
         J.s_waitcnt(mod="vmcnt(0)")
 
-        for m in range(nrM):
-            ds_read_a(ldsA[0,0], mfma_A[m, 0], m, 0)
-            ds_read_a(ldsA[0,0], mfma_A[m, 1], m, 1)
-        for n in range(nrN):
-            ds_read_b(ldsB[0,0], mfma_B[0, n, 0], n, 0)
-            ds_read_b(ldsB[0,0], mfma_B[0, n, 1], n, 1)
+        with J.If(warp_m[0] == 0):
+            J.s_barrier()
 
-        J.s_waitcnt(mod="lgkmcnt(0)")
-        J.emit(mfma(0))
+    else:
+        mfma_C[...] = 0
 
-        J.emit(vm_loadB(0,1))
-        J.s_waitcnt(mod="vmcnt(0)")
-        for n in range(nrN):
-            ds_read_b(ldsB[0,1], mfma_B[1, n, 0], n, 0)
-            ds_read_b(ldsB[0,1], mfma_B[1, n, 1], n, 1)
-        J.s_waitcnt(mod="lgkmcnt(0)")
-        J.emit(mfma(1))
+        J.debug_setup((J.warp_id[0] == 0) & (J.blockIdx.x[0] == 0))
+        for k in range(loop_cnt):
+            J.emit(vm_loadB(0,0))
+            J.emit(vm_loadA(0,0))
+            J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
+            
+            ds_readA(0,0)
+            ds_readB(0,0)
 
-        J.emit(vm_loadA(0,1))
-        J.s_waitcnt(mod="vmcnt(0)")
-        for m in range(nrM):
-            ds_read_a(ldsA[0,1], mfma_A[m, 0], m, 0)
-            ds_read_a(ldsA[0,1], mfma_A[m, 1], m, 1)
-        J.s_waitcnt(mod="lgkmcnt(0)")
-        J.emit(mfma(2))
-        J.emit(mfma(3))
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
+            J.emit(mfma(0))
 
-        koffsets[0] += BLOCK_K
-        koffsets[1] += BLOCK_K
+            #J.debug_log(mfma_A[0,0], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.debug_log(mfma_A[0,1], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.s_endpgm()
+
+            J.emit(vm_loadB(0,1))
+            J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
+
+            ds_readB(0,1)
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
+            J.emit(mfma(1))
+
+            #J.debug_log(mfma_B[1,0,0], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.debug_log(mfma_B[1,0,1], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.s_endpgm()
+
+            J.emit(vm_loadA(0,1))
+            J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
+
+            ds_readA(0,1)
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
+
+            #J.debug_log(mfma_A[0,0], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.debug_log(mfma_A[0,1], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.s_endpgm()
+
+            J.emit(mfma(2))
+            J.emit(mfma(3))
+
+            moffsets[0] += BLOCK_K
+            moffsets[1] += BLOCK_K
+
+    #J.debug_log(mfma_C[1,0,0], torch.float, "4h.16v.4h")
+    #J.s_endpgm()
 
     stride_c = N * J.sizeof_bf16
     vbf16 = J.gpr(4, "vbf16x2")
@@ -198,11 +291,7 @@ def gemm_fp8_blockscale(J, wg_M, wg_N, N, K,
 
     this means we cannot use 4-wave for 256 x 256 block size, HipKitten's 8-wave methods allows
     all GPRs to be VGPR, thus it's a better way.
-
-
-
     """
-
 
     assert scale_BM == 1
     assert scale_BN == 128
