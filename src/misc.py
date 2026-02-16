@@ -1,7 +1,7 @@
 """ Some useful helpers """
 
 __all__ = [
-    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up'
+    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle"
 ]
 
 class cudaPerf(object):
@@ -75,6 +75,23 @@ class torchPerf(object):
         if self.profiler is not None:
             self.profiler.stop()
             print(self.profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+
+# type-less preshuffle
+def pre_shuffle(x, mfma_MN):
+    M, K = x.shape
+    K_bytes = K * x.itemsize
+    sizeof_DW4 = 16
+    mfma_K_lanes = 64 // mfma_MN
+    mfma_K_L = sizeof_DW4//x.itemsize
+    mfma_K = mfma_K_lanes * mfma_K_L 
+
+    assert M % mfma_MN == 0
+    mfma_K_bytes = mfma_K_lanes * sizeof_DW4
+    assert K_bytes % mfma_K_bytes == 0
+
+    x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L)
+    x = x.permute(0,2,3,1,4)
+    return x.contiguous()
 
 # https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/testing/numeric.py#L5
 def calc_diff(x: "torch.Tensor", y: "torch.Tensor"):

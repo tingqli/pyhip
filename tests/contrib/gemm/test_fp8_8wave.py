@@ -4,6 +4,7 @@ import pyhip
 import pytest
 from pyhip.contrib.gemm_fp8 import *
 
+
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.set_default_device('cuda')
 torch.manual_seed(0)
@@ -11,7 +12,8 @@ torch.manual_seed(0)
 @pytest.mark.parametrize("M", [32, 256, 2400])
 @pytest.mark.parametrize("N", [256, 256*6])
 @pytest.mark.parametrize("K", [256])
-def test(M, N, K):
+@pytest.mark.parametrize("bpreshuffle", [True, False])
+def test(M, N, K, bpreshuffle):
     out_dtype = torch.bfloat16
     x = (torch.randn((M, K))).to(torch.float8_e4m3fn)
     w = (torch.randn((N, K))).to(torch.float8_e4m3fn)
@@ -35,7 +37,11 @@ def test(M, N, K):
     num_block_M = pyhip.div_up(M, wg_M)
     num_block_N = pyhip.div_up(N, wg_N)
 
-    gemm_fp8_8wave([num_block_N*num_block_M],[64*8],
+    if bpreshuffle:
+        w = pyhip.pre_shuffle(w, mfma_MN=16)
+        # w = shuffle_weight(w, layout=(16, 16))
+
+    gemm_fp8_8wave([num_block_N*num_block_M],[64*8], bpreshuffle,
                    wg_M, wg_N, N, K, x.data_ptr(), w.data_ptr(), y1.data_ptr(), M)
 
     torch.cuda.synchronize()
@@ -68,8 +74,8 @@ def test(M, N, K):
     Cs = [torch.empty((M, N), dtype = out_dtype) for _ in range(BUF_COPY)]
     di = 0
     for i in range(32):
-        with pyhip.cudaPerf(M*N*K*2, name="gemm_fp8_8wave"):
-            gemm_fp8_8wave([num_block_N*num_block_M],[64*8],
+        with pyhip.cudaPerf(M*N*K*2, name=f"gemm_fp8_8wave-{M}_{N}_{K}_{bpreshuffle=}"):
+            gemm_fp8_8wave([num_block_N*num_block_M],[64*8], bpreshuffle,
                            wg_M, wg_N, N, K, As[di].data_ptr(), Bs[di].data_ptr(), Cs[di].data_ptr(), M)
         di = (di + 1)%BUF_COPY
     
@@ -86,6 +92,8 @@ def test(M, N, K):
 if __name__ == "__main__":
     M,N,K = 8192,8192,8192
     #M,N,K = 512,512,8192
-    test(M=226,N=256,K=128)
-    test(M=256,N=256,K=128)
-    test(M=8192,N=8192,K=8192)
+    test(M=256,N=256,K=256, bpreshuffle = False)
+    test(M=256,N=256,K=256, bpreshuffle = True)
+
+    test(M=8192,N=8192,K=8192, bpreshuffle = False)
+    test(M=8192,N=8192,K=8192, bpreshuffle = True)

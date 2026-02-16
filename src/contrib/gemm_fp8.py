@@ -5,9 +5,8 @@ __all__ = [
     "gemm_fp8_8wave",
 ]
 
-
 @pyhip.jit(with_debug_log = False)
-def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
+def gemm_fp8_8wave(J, bpreshuffle, wg_M, wg_N, N, K,
                    pA:"void*", # [M, K]  torch.float8_e4m3fn   row-major
                    pB:"void*", # [N, K]  torch.float8_e4m3fn   row-major
                    pC:"void*", # [M, N]  torch.bfloat16        row-major
@@ -80,7 +79,7 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
 
     use_pre_shuffle = False
     vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = J.get_mfma_loader(use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*64)
-    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = J.get_mfma_loader(use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*32)
+    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = J.get_mfma_loader(bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*32)
 
     # v_mfma_f32_16x16x128_f8f6f4: 
     mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
@@ -94,27 +93,33 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
                 J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n], mfma_B[b_index, n], mfma_A[m], mfma_C[c_index, m, n])
                 yield 16
 
-
     # 第一步确保基础设施正确，使用最低效简单的pipeline，8-wave一起读入LDS，一起读出到寄存器，计算
     loop_cnt = J.div(K, wg_K)
     assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
 
-    moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
-    #moffsets[1] = stride_k * HALF_BLOCK_SIZE_ROW
+    a_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
+    if bpreshuffle:
+        b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
 
     def step_k():
-        moffsets[0] += BLOCK_K
-        moffsets[1] += BLOCK_K
+        a_moffsets[0] += vm_offset_inc_a
+        a_moffsets[1] += vm_offset_inc_a
+        if bpreshuffle:
+            b_moffsets[0] += vm_offset_inc_b
+            b_moffsets[1] += vm_offset_inc_b
 
     def vm_loadA(k, m):
         assert m in [0, 1]
         assert k in [0, 1]
-        return vm_load_a(ldsA[k,m], buff_a, moffsets[m])
+        return vm_load_a(ldsA[k,m], buff_a, a_moffsets[m])
 
     def vm_loadB(k, m):
         assert m in [0, 1]
         assert k in [0, 1]
-        return vm_load_b(ldsB[k,m], buff_b, moffsets[m])
+        if bpreshuffle:
+            return vm_load_b(ldsB[k,m], buff_b, b_moffsets[m])
+        else:
+            return vm_load_b(ldsB[k,m], buff_b, a_moffsets[m])
 
     def ds_readA(k, m):
         for i in range(nrM):
@@ -127,6 +132,7 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
             ds_read_b(ldsB[k,m], mfma_B[m, i, 1], i, 1)
 
     if 1:
+        # 8-wave pipeline invented by HipKittens
         tic = 0
         toc = 1
         J.emit(vm_loadB(tic,0))
@@ -191,6 +197,7 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
             J.s_barrier()
 
     else:
+        # naive pipeline, for debugging basic building blocks
         mfma_C[...] = 0
 
         J.debug_setup((J.warp_id[0] == 0) & (J.blockIdx.x[0] == 0))
@@ -233,8 +240,7 @@ def gemm_fp8_8wave(J, wg_M, wg_N, N, K,
             J.emit(mfma(2))
             J.emit(mfma(3))
 
-            moffsets[0] += BLOCK_K
-            moffsets[1] += BLOCK_K
+            step_k()
 
     #J.debug_log(mfma_C[1,0,0], torch.float, "4h.16v.4h")
     #J.s_endpgm()
@@ -291,6 +297,8 @@ def gemm_fp8_blockscale(J, wg_M, wg_N, N, K,
 
     this means we cannot use 4-wave for 256 x 256 block size, HipKitten's 8-wave methods allows
     all GPRs to be VGPR, thus it's a better way.
+
+    MFMA's output will needs extra 
     """
 
     assert scale_BM == 1

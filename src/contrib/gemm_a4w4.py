@@ -1,24 +1,8 @@
 import pyhip
 
 __all__ = [
-    "gemm_a4w4_kernel", "pre_shuffle"
+    "gemm_a4w4_kernel"
 ]
-
-def pre_shuffle(x, mfma_MN):
-    M, K = x.shape
-    K_bytes = K * x.itemsize
-    sizeof_DW4 = 16
-    mfma_K_lanes = 64 // mfma_MN
-    mfma_K_L = sizeof_DW4//x.itemsize
-    mfma_K = mfma_K_lanes * mfma_K_L 
-
-    assert M % mfma_MN == 0
-    mfma_K_bytes = mfma_K_lanes * sizeof_DW4
-    assert K_bytes % mfma_K_bytes == 0
-
-    x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L)
-    x = x.permute(0,2,3,1,4)
-    return x.contiguous()
 
 @pyhip.jit()
 def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, a_preshuffle, b_preshuffle,

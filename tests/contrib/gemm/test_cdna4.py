@@ -12,7 +12,7 @@ torch.manual_seed(0)
 @pytest.mark.parametrize("M", [32, 256, 2400])
 @pytest.mark.parametrize("N", [256, 256*6])
 @pytest.mark.parametrize("K", [256])
-def test_accuracy(M, N, K, use_pre_shuffle = 0):
+def test_accuracy(M, N, K, use_pre_shuffle = 1):
     wg_M = 256
     wg_N = 256
     blk_cnt = pyhip.div_up(M, wg_M) * pyhip.div_up(N, wg_N)
@@ -22,8 +22,8 @@ def test_accuracy(M, N, K, use_pre_shuffle = 0):
     ref_out = A0 @ B0.t()
 
     if use_pre_shuffle:
-        A = pre_shuffle(A0, 16)
-        B = pre_shuffle(B0, 16)
+        A = pyhip.pre_shuffle(A0, 16)
+        B = pyhip.pre_shuffle(B0, 16)
     else:
         A = A0
         B = B0

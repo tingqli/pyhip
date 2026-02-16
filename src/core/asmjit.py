@@ -3459,7 +3459,7 @@ r'''
             for m in range(vm_load_cnt):
                 yield 1
                 buff.load_dwordx4(None, voff, 0, offset12=0)
-                J.s_addk_i32("m0", 256*J.sizeof_DW4)
+                J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
                 voff[0] += (num_warps//nbK)*(stride_1kb)*1024
             #vmem_voff[0] += nbK * 1024
 
