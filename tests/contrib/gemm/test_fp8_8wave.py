@@ -41,8 +41,9 @@ def test(M, N, K, bpreshuffle):
         w = pyhip.pre_shuffle(w, mfma_MN=16)
         # w = shuffle_weight(w, layout=(16, 16))
 
-    gemm_fp8_8wave([num_block_N*num_block_M],[64*8], bpreshuffle,
-                   wg_M, wg_N, N, K, x.data_ptr(), w.data_ptr(), y1.data_ptr(), M)
+    gemm_fp8_8wave([num_block_N*num_block_M],[64*8], bpreshuffle, False,
+                   wg_M, wg_N, N, K, x.data_ptr(), w.data_ptr(), y1.data_ptr(),
+                   None, None, M)
 
     torch.cuda.synchronize()
 
@@ -75,8 +76,10 @@ def test(M, N, K, bpreshuffle):
     di = 0
     for i in range(32):
         with pyhip.cudaPerf(M*N*K*2, name=f"gemm_fp8_8wave-{M}_{N}_{K}_{bpreshuffle=}"):
-            gemm_fp8_8wave([num_block_N*num_block_M],[64*8], bpreshuffle,
-                           wg_M, wg_N, N, K, As[di].data_ptr(), Bs[di].data_ptr(), Cs[di].data_ptr(), M)
+            gemm_fp8_8wave([num_block_N*num_block_M],[64*8], bpreshuffle, False,
+                           wg_M, wg_N, N, K,
+                           As[di].data_ptr(), Bs[di].data_ptr(), Cs[di].data_ptr(),
+                           None, None, M)
         di = (di + 1)%BUF_COPY
     
     print(f"{diff_all=:.2f}")

@@ -6,10 +6,15 @@ __all__ = [
 ]
 
 @pyhip.jit(with_debug_log = False)
-def gemm_fp8_8wave(J, bpreshuffle, wg_M, wg_N, N, K,
+def gemm_fp8_8wave(J, bpreshuffle,
+                   use_f32_blockscales_128, # scale_BM,scale_BN,scale_BK = 1,128,128 
+                   wg_M, wg_N, N, K, 
                    pA:"void*", # [M, K]  torch.float8_e4m3fn   row-major
                    pB:"void*", # [N, K]  torch.float8_e4m3fn   row-major
                    pC:"void*", # [M, N]  torch.bfloat16        row-major
+                   pScaleA:"float*", #    [div_up(M,scale_BM), div_up(K, scale_BK)]
+                                     # or [div_up(K, scale_BK), div_up(M,scale_BM)] if bpreshuffle
+                   pScaleB:"float*", # [div_up(N,scale_BN), div_up(K, scale_BK) ]
                    M:"int"):
     """
     https://github.com/HazyResearch/HipKittens/blob/.../kernels/gemm/fp8fp32/FP8_8wave/8_wave.cu
@@ -37,15 +42,16 @@ def gemm_fp8_8wave(J, bpreshuffle, wg_M, wg_N, N, K,
     M0 = J.gpr("su32", blk_m * wg_M)
     M1 = J.gpr("su32")
     J.s_min_u32(M1, M0 + wg_M, M)
+    Mc = J.gpr("su32", M1 - M0)
 
     assert N % wg_N == 0
     num_warps = 8
     nbN = J.div(wg_N, 16)
     nbM = J.div(wg_M, 16)
     nbK = 2 # 2 MFMA 16x16 
-    buff_a = J.Buffer(pA, (M1 - M0) * stride_k)
+    buff_a = J.Buffer(pA, Mc * stride_k)
     buff_b = J.Buffer(pB, wg_N * stride_k)
-    buff_c = J.Buffer(pC, (M1 - M0) * stride_C)
+    buff_c = J.Buffer(pC, Mc * stride_C)
 
     WARPS_COL = 4
     WARPS_ROW = 2
@@ -81,19 +87,102 @@ def gemm_fp8_8wave(J, bpreshuffle, wg_M, wg_N, N, K,
     vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = J.get_mfma_loader(use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*64)
     vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = J.get_mfma_loader(bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*32)
 
+    if use_f32_blockscales_128:
+        assert bpreshuffle == True, "exepct scaleA in [k,m] layout"
+        scale_BM, scale_BN, scale_BK = 1,128,128 
+        # tic-toc LDS buffer for 256 per-token per-k-128 scales
+        # 1-warp is enough to load this buffer
+        lds_scaleA = [J.alloc_lds(wg_M * J.sizeof_f32),
+                      J.alloc_lds(wg_M * J.sizeof_f32)]
+        # if pScaleA in [m,k] layout
+        # pScaleA[:] += blk_m * (wg_M * J.div(K, scale_BK) * J.sizeof_f32)
+        # buff_sa = J.Buffer(pScaleA, (M1 - M0) * J.div(K, scale_BK) * J.sizeof_f32)
+        pScaleA[:] += blk_m * (wg_M * J.sizeof_f32)
+        voffset_scaleA = J.gpr(J.threadIdx.x[0] * J.sizeof_f32)
+        assert wg_M < num_warps * 64 * 4
+        # vm_load_scaleA(lds_scaleA[toc])
+        # ds_read scaleA must be in MFMA_16x4 format
+        # ds_read scaleB broad-cast in to 16x4 too
+        def vm_load_scaleA(lds, bk):
+            # bk: index of k block with size of 128
+            # use execmask to ensure same impact on vmcnt for all warps
+            J.s_mov_b32("m0", lds)
+            voff = J.gpr("vu32", voffset_scaleA[0] + M[0]*(bk*J.sizeof_f32))
+            with J.ExecMask(J.threadIdx.x[0] < Mc, early_skip=False):
+                J.global_load_lds_dword(voff, pScaleA)
+
+        # scale of B(weights) are very small, can be all loaded into LDS
+        lds_scaleB = J.alloc_lds(J.div(K, scale_BK) * J.div(wg_N, scale_BN) * J.sizeof_f32)
+        pScaleB[:] += blk_n * (J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32)
+
+        J.wg_load_lds(lds_scaleB, pScaleB, J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
+                      num_warps, wait_barrier = True)
+
+        mfma_scaleA = J.gpr(nrM, "vf32")
+        mfma_scaleB = J.gpr(2, "vf32")
+        vaddr_scaleA = J.gpr("vu32", (J.lane_id[0] % 16)*J.sizeof_f32 + warp_m * (64 * J.sizeof_f32))
+        def ds_read_scaleA(lds, m0):
+            assert m0 in [0, 1]
+            vaddr = J.gpr("vu32", vaddr_scaleA[0] + lds)
+            for m in range(nrM):
+                off = m0*HALF_BLOCK_SIZE_ROW + m*16*J.sizeof_f32
+                J.ds_read_b32(mfma_scaleA[m], vaddr, mod=f"offset:{off}")
+
+        vaddr_scaleB0 = J.gpr("vu32", lds_scaleB)
+        vaddr_scaleB1 = J.gpr("vu32", lds_scaleB + J.div(K, scale_BK)*J.sizeof_f32)
+        def ds_read_scaleB(bk, n0):
+            # k0: in unit of scale_BK
+            # n0: in unit of scale_BN
+            # all warps share the same scaleB
+            assert n0 in [0, 1]
+            assert scale_BN >= nrN * 16 * 4
+            off = (n0 * J.div(K, scale_BK) + bk) * J.sizeof_f32
+            J.ds_read_b32(mfma_scaleB[0], vaddr_scaleB0, mod=f"offset:{off}")
+            J.ds_read_b32(mfma_scaleB[1], vaddr_scaleB1, mod=f"offset:{off}")
+
     # v_mfma_f32_16x16x128_f8f6f4: 
     mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
     mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")            # 2x[16,128]
     mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 4x[4,2]x[16,16]
 
-    def mfma(c_index):
-        b_index = c_index % 2
-        for m in range(nrM):
-            for n in range(nrN):
-                J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n], mfma_B[b_index, n], mfma_A[m], mfma_C[c_index, m, n])
-                yield 16
+    if use_f32_blockscales_128:
+        mfma_tmp = J.gpr(2, 4, "vf32")
+        def mfma(c_index):
+            b_index = c_index % 2
+            # 交织反量化累加和mfma计算
+            # 同时还需要保证数据依赖关系
+            # 例如 mfma1 同时 合并scaleA和scaleB反量化系数 4个v_mul
+            # mfma2 时反量化 mfma1 的结果
+            # mfma3 时反量化 mfma2 的结果
+            i = 0
+            for m in range(nrM):
+                for n in range(nrN):
+                    J.v_mfma_f32_16x16x128_f8f6f4(mfma_tmp[i], mfma_B[b_index, n], mfma_A[m], 0)
+                    if m == 0 and n == 0:
+                        for tm in range(nrM):
+                            mfma_scaleA[tm] *= mfma_scaleB[b_index]
+                    else:
+                        J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 0], mfma_tmp[i^1, 0], mfma_scaleA[prev_m])
+                        J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 1], mfma_tmp[i^1, 1], mfma_scaleA[prev_m])
+                        J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 2], mfma_tmp[i^1, 2], mfma_scaleA[prev_m])
+                        J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 3], mfma_tmp[i^1, 3], mfma_scaleA[prev_m])
+                    prev_m = m
+                    prev_n = n
+                    i = i^1
+                    yield 16
+            
+            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 0], mfma_tmp[i^1, 0], mfma_scaleA[prev_m])
+            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 1], mfma_tmp[i^1, 1], mfma_scaleA[prev_m])
+            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 2], mfma_tmp[i^1, 2], mfma_scaleA[prev_m])
+            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 3], mfma_tmp[i^1, 3], mfma_scaleA[prev_m])
+    else:
+        def mfma(c_index):
+            b_index = c_index % 2
+            for m in range(nrM):
+                for n in range(nrN):
+                    J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n], mfma_B[b_index, n], mfma_A[m], mfma_C[c_index, m, n])
+                    yield 16
 
-    # 第一步确保基础设施正确，使用最低效简单的pipeline，8-wave一起读入LDS，一起读出到寄存器，计算
     loop_cnt = J.div(K, wg_K)
     assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
 
@@ -131,7 +220,8 @@ def gemm_fp8_8wave(J, bpreshuffle, wg_M, wg_N, N, K,
             ds_read_b(ldsB[k,m], mfma_B[m, i, 0], i, 0)
             ds_read_b(ldsB[k,m], mfma_B[m, i, 1], i, 1)
 
-    if 1:
+    #print(nrM, nrN); assert 0
+    if 0:
         # 8-wave pipeline invented by HipKittens
         tic = 0
         toc = 1
@@ -139,13 +229,13 @@ def gemm_fp8_8wave(J, bpreshuffle, wg_M, wg_N, N, K,
         J.emit(vm_loadA(tic,0))
         J.emit(vm_loadB(tic,1))
         J.emit(vm_loadA(tic,1))
-        
+
         with J.If(warp_m[0] == 1):
             J.s_barrier()
 
         mfma_C[...] = 0
 
-        J.s_waitcnt(mod="vmcnt(4)"); J.s_barrier()
+        J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b})"); J.s_barrier()
 
         step_k()
 
@@ -153,21 +243,24 @@ def gemm_fp8_8wave(J, bpreshuffle, wg_M, wg_N, N, K,
         J.emit(vm_loadB(toc,0))
         J.emit(vm_loadB(toc,1))
 
-        J.s_waitcnt(mod="vmcnt(6)"); J.s_barrier()
+        J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2})"); J.s_barrier()
 
         for k in range(loop_cnt):
-            ds_readB(tic, 0)
-            ds_readA(tic, 0)
+            ds_readB(tic, 0)    # lgkmcnt += nrN*2 (2*2)
+            ds_readA(tic, 0)    # lgkmcnt += nrM*2 (4*2)
             J.emit(vm_loadA(toc,1))
             step_k()
-            J.s_waitcnt(mod="lgkmcnt(8)"); J.s_barrier()
+            J.s_waitcnt(mod=f"lgkmcnt(0)"); J.s_barrier()
 
             J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
             J.emit(mfma(0))
             J.s_setprio(0); J.s_barrier()
+            #===============================================================
+            # after this s_barrier, lgkmcnt(8) ensures all 8-waves has finished
+            # accessing B[tic,0], so next vm_load can overwrite A[toc,0],B[toc,0],B[toc,1],A[toc,1]
 
             ds_readB(tic, 1)
-            J.emit(vm_loadA(tic,0))
+            J.emit(vm_loadA(tic,0))                         # vm_load_cnt_a
             J.s_barrier()
 
             J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
@@ -175,28 +268,33 @@ def gemm_fp8_8wave(J, bpreshuffle, wg_M, wg_N, N, K,
             J.s_setprio(0); J.s_barrier()
 
             ds_readA(tic, 1)
-            J.emit(vm_loadB(tic,0))
+            J.emit(vm_loadB(tic,0))                         # vm_load_cnt_b
             J.s_barrier()
 
             J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
             J.emit(mfma(2))
             J.s_setprio(0); J.s_barrier()
 
-            J.emit(vm_loadB(tic,1))
-            J.s_waitcnt(mod="vmcnt(6)"); J.s_barrier()
+            J.emit(vm_loadB(tic,1))                         # vm_load_cnt_b
+            J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2})"); J.s_barrier()
 
             J.s_setprio(1)
             J.emit(mfma(3))
             J.s_setprio(0); J.s_barrier()
+            #===============================================================
+            # after this s_barrier, we have all A[toc] & B[toc] loaded in LDS
+            # so in next iteration, we can ds_read A[tic] & B[tic] w/o waitting for any vmcnt
 
             tic ^= 1
             toc ^= 1
+
         J.s_waitcnt(mod="vmcnt(0)")
 
         with J.If(warp_m[0] == 0):
             J.s_barrier()
 
     else:
+        # 第一步确保基础设施正确，使用最低效简单的pipeline，8-wave一起读入LDS，一起读出到寄存器，计算
         # naive pipeline, for debugging basic building blocks
         mfma_C[...] = 0
 
@@ -204,11 +302,14 @@ def gemm_fp8_8wave(J, bpreshuffle, wg_M, wg_N, N, K,
         for k in range(loop_cnt):
             J.emit(vm_loadB(0,0))
             J.emit(vm_loadA(0,0))
+            if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[0], k)
             J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
-            
+
             ds_readA(0,0)
             ds_readB(0,0)
-
+            if use_f32_blockscales_128:
+                ds_read_scaleA(lds_scaleA[0], 0)
+                ds_read_scaleB(k, 0)
             J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
             J.emit(mfma(0))
 

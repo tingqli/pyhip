@@ -13,6 +13,11 @@ from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
 )
 
 import pyhip
+from pyhip.contrib.gemm_fp8 import *
+
+torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
+torch.set_default_device('cuda')
+torch.manual_seed(0)
 
 block_shape = (128, 128)
 
@@ -100,6 +105,29 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
         print(f"\t{k}:{v}")
     return ret
 
+def show_diff(y0, y1):
+    diff_all = pyhip.calc_diff(y0, y1)
+    if diff_all > 0.01:
+        print(f"{diff_all=}")
+        diff_map = torch.empty([M//16, N//16], dtype=torch.float)
+        for y in range(0,M,16):
+            for x in range(0,N,16):
+                diff = pyhip.calc_diff(y0[y:y+16,x:x+16], y1[y:y+16,x:x+16])
+                diff_map[y//16,x//16] = diff
+
+        print("====================== diff_map")
+        print(diff_map)
+        print("====================== y0 vs y1")
+        print(y0[:16,128+0:128+16])
+        print(y1[:16,128+0:128+16])
+        for i in range(M):
+            diff = pyhip.calc_diff(y0[i], y1[i])
+            if diff > 0.01:
+                print("======================", i, diff)
+                print(y0[i].view(-1,8))
+                print(y1[i].view(-1,8))
+                assert 0    
+
 def compare_perf(m, n, k, ck_preshuffle=True):
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
@@ -122,22 +150,40 @@ def compare_perf(m, n, k, ck_preshuffle=True):
     di = 0
     for i in range(16):
         with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"ck_kernel_{di}") as p0:
-            out = ck_kernel(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype)
+            out_ck = ck_kernel(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype)
             di = (di + 1) % BUF_COPY
 
     if ck_preshuffle:
-        out = torch.empty((m, n), dtype=output_dtype, device=x.device)
+        out_asm = torch.empty((m, n), dtype=output_dtype, device=x.device)
         for i in range(16):
             with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"asm_kernel_{di}") as p0:
-                aiter.gemm_a8w8_blockscale_bpreshuffle_asm(As[di], Bs[di], out, Ascales[di], Bscales[di])
+                aiter.gemm_a8w8_blockscale_bpreshuffle_asm(As[di], Bs[di], out_asm, Ascales[di], Bscales[di])
             di = (di + 1) % BUF_COPY
 
 
-    out = torch.empty((m, n), dtype=output_dtype, device=x.device)
+    out_gluon = torch.empty((m, n), dtype=output_dtype, device=x.device)
     for i in range(16):
         with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"gluon_kernel_{di}") as p0:
-            gluon_gemm_a8w8_blockscale(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype, out)
+            gluon_gemm_a8w8_blockscale(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype, out_gluon)
         di = (di + 1) % BUF_COPY
+
+    if ck_preshuffle:
+        wg_M, wg_N = 256, 256
+        num_block_M = pyhip.div_up(m, wg_M)
+        num_block_N = pyhip.div_up(n, wg_N)
+        out_jit = torch.empty((m, n), dtype=output_dtype, device=x.device)
+        for i in range(16):
+            with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"asmjit_kernel_{di}") as p0:
+                gemm_fp8_8wave([num_block_N * num_block_M],[64*8], True, True,
+                                wg_M, wg_N, N, K, As[di].data_ptr(), Bs[di].data_ptr(), out_jit.data_ptr(),
+                                Ascales[di].data_ptr(), Bscales[di].data_ptr(), m)
+
+        di = (di + 1) % BUF_COPY
+
+    print(f"{pyhip.calc_diff(out_ck, out_asm)=:.2f}")
+    print(f"{pyhip.calc_diff(out_ck, out_gluon)=:.2f}")
+    print(f"{pyhip.calc_diff(out_ck, out_jit)=:.2f}")
+    show_diff(out_ck, out_jit)
 
 if __name__ == "__main__":
     '''
@@ -166,6 +212,7 @@ if __name__ == "__main__":
     print(type(dtypes.fp8), dtypes.fp8)
 
     M,N,K = 256*94, 256*16, 8192 
+    M,N,K=256,256,128
     #test_gemm(dtypes.bf16, M, N, K, True)
     compare_perf(M,N,K, True)
 
