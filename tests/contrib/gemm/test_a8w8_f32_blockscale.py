@@ -129,6 +129,7 @@ def show_diff(y0, y1):
                 assert 0    
 
 def compare_perf(m, n, k, ck_preshuffle=True):
+    output_dtype = dtypes.bf16
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     scale_m = m
@@ -138,6 +139,16 @@ def compare_perf(m, n, k, ck_preshuffle=True):
     weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    #x_scale[...] = 1
+    #w_scale[...] = 1
+    print(w_scale.shape)
+
+    out_torch, _ = run_torch(x, weight, x_scale, w_scale, output_dtype)
+
+
+    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    if ck_preshuffle:
+        x_scale = x_scale_t
 
     BUF_COPY = 32
     As = [x.clone() for _ in range(BUF_COPY)]
@@ -145,7 +156,6 @@ def compare_perf(m, n, k, ck_preshuffle=True):
     Bs = [weight.clone() for _ in range(BUF_COPY)]
     Bscales = [w_scale.clone() for _ in range(BUF_COPY)]
     
-    output_dtype = dtypes.bf16
     ck_kernel = aiter.gemm_a8w8_blockscale_bpreshuffle if ck_preshuffle else aiter.gemm_a8w8_blockscale
     di = 0
     for i in range(16):
@@ -180,10 +190,11 @@ def compare_perf(m, n, k, ck_preshuffle=True):
 
         di = (di + 1) % BUF_COPY
 
-    print(f"{pyhip.calc_diff(out_ck, out_asm)=:.2f}")
-    print(f"{pyhip.calc_diff(out_ck, out_gluon)=:.2f}")
-    print(f"{pyhip.calc_diff(out_ck, out_jit)=:.2f}")
-    show_diff(out_ck, out_jit)
+    print(f"{pyhip.calc_diff(out_torch, out_ck)=:.2f}")
+    print(f"{pyhip.calc_diff(out_torch, out_asm)=:.2f}")
+    print(f"{pyhip.calc_diff(out_torch, out_gluon)=:.2f}")
+    print(f"{pyhip.calc_diff(out_torch, out_jit)=:.2f}")
+    show_diff(out_torch, out_jit)
 
 if __name__ == "__main__":
     '''
@@ -212,7 +223,7 @@ if __name__ == "__main__":
     print(type(dtypes.fp8), dtypes.fp8)
 
     M,N,K = 256*94, 256*16, 8192 
-    M,N,K=256,256,128
+    #M,N,K=256*2,256,256*10
     #test_gemm(dtypes.bf16, M, N, K, True)
     compare_perf(M,N,K, True)
 
