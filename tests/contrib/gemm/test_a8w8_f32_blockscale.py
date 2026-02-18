@@ -223,7 +223,8 @@ if __name__ == "__main__":
     print(type(dtypes.fp8), dtypes.fp8)
 
     M,N,K = 256*94, 256*16, 8192 
-    #M,N,K=256*2,256,256*10
+    #M,N,K=8192,8192,8192
+    #M,N,K=256,256,128
     #test_gemm(dtypes.bf16, M, N, K, True)
     compare_perf(M,N,K, True)
 

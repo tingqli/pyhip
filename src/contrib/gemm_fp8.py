@@ -122,7 +122,7 @@ def gemm_fp8_8wave(J, bpreshuffle,
 
         num_scaleB = J.div(wg_N, scale_BN)
         mfma_scaleA = J.gpr(nrM, "vf32")
-        mfma_scaleB = J.gpr(num_scaleB, "vf32")
+        mfma_scaleB = J.gpr(num_scaleB, 2, "vf32")
         vaddr_scaleA = J.gpr("vu32", (J.lane_id[0] % 16)*J.sizeof_f32 + warp_m * (16*nrM * J.sizeof_f32))
         def ds_read_scaleA(lds, m0):
             assert m0 in [0, 1]
@@ -141,7 +141,8 @@ def gemm_fp8_8wave(J, bpreshuffle,
             assert scale_BN >= nrN * 16 * 4
             off = bk * J.sizeof_f32
             for i in range(num_scaleB):
-                J.ds_read_b32(mfma_scaleB[i], vaddr_scaleB[i], mod=f"offset:{off}")
+                J.ds_read_b32(mfma_scaleB[i,0], vaddr_scaleB[i], mod=f"offset:{off}")
+                #J.ds_read_b32(mfma_scaleB[i,1], vaddr_scaleB[i], mod=f"offset:{off}")
 
     # v_mfma_f32_16x16x128_f8f6f4: 
     mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
@@ -163,8 +164,10 @@ def gemm_fp8_8wave(J, bpreshuffle,
                 for n in range(nrN):
                     J.v_mfma_f32_16x16x128_f8f6f4(mfma_tmp[i], mfma_B[b_index, n], mfma_A[m], 0)
                     if m == 0 and n == 0:
-                        for tm in range(nrM):
-                            mfma_scale[tm] = mfma_scaleA[tm] * mfma_scaleB[b_index]
+                        # v_pk_mul_f32 is slower than v_mul_f32
+                        for tm in range(0,nrM,1):
+                            #J.v_pk_mul_f32(mfma_scale[tm:tm+1], mfma_scaleA[tm:tm+1], mfma_scaleB[b_index])
+                            mfma_scale[tm] = mfma_scaleA[tm] * mfma_scaleB[b_index,0]
                     else:
                         J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 0], mfma_tmp[i^1, 0], mfma_scale[prev_m])
                         J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 1], mfma_tmp[i^1, 1], mfma_scale[prev_m])
@@ -224,10 +227,11 @@ def gemm_fp8_8wave(J, bpreshuffle,
             ds_read_b(ldsB[k,m], mfma_B[m, i, 1], i, 1)
 
     #print(nrM, nrN); assert 0
-    if 0:
+    if 1:
         # 8-wave pipeline invented by HipKittens
         tic = 0
         toc = 1
+        if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], 0)
         J.emit(vm_loadB(tic,0))
         J.emit(vm_loadA(tic,0))
         J.emit(vm_loadB(tic,1))
@@ -242,15 +246,25 @@ def gemm_fp8_8wave(J, bpreshuffle,
 
         step_k()
 
+        if use_f32_blockscales_128:
+            vm_load_scaleA(lds_scaleA[tic], 1)
+            vm_load_cnt_scaleA = 1
+        else:
+            vm_load_cnt_scaleA = 0
         J.emit(vm_loadA(toc,0))
         J.emit(vm_loadB(toc,0))
         J.emit(vm_loadB(toc,1))
 
-        J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2})"); J.s_barrier()
+        J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
 
         for k in range(loop_cnt):
             ds_readB(tic, 0)    # lgkmcnt += nrN*2 (2*2)
             ds_readA(tic, 0)    # lgkmcnt += nrM*2 (4*2)
+
+            if use_f32_blockscales_128:
+                ds_read_scaleA(lds_scaleA[tic], 0)
+                ds_read_scaleB(k)
+
             J.emit(vm_loadA(toc,1))
             step_k()
             J.s_waitcnt(mod=f"lgkmcnt(0)"); J.s_barrier()
@@ -263,6 +277,7 @@ def gemm_fp8_8wave(J, bpreshuffle,
             # accessing B[tic,0], so next vm_load can overwrite A[toc,0],B[toc,0],B[toc,1],A[toc,1]
 
             ds_readB(tic, 1)
+            if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], k+2)
             J.emit(vm_loadA(tic,0))                         # vm_load_cnt_a
             J.s_barrier()
 
@@ -271,6 +286,8 @@ def gemm_fp8_8wave(J, bpreshuffle,
             J.s_setprio(0); J.s_barrier()
 
             ds_readA(tic, 1)
+            if use_f32_blockscales_128:
+                ds_read_scaleA(lds_scaleA[tic], 1)
             J.emit(vm_loadB(tic,0))                         # vm_load_cnt_b
             J.s_barrier()
 
@@ -279,7 +296,7 @@ def gemm_fp8_8wave(J, bpreshuffle,
             J.s_setprio(0); J.s_barrier()
 
             J.emit(vm_loadB(tic,1))                         # vm_load_cnt_b
-            J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2})"); J.s_barrier()
+            J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
 
             J.s_setprio(1)
             J.emit(mfma(3))
