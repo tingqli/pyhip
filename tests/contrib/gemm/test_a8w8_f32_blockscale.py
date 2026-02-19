@@ -194,7 +194,7 @@ def compare_perf(m, n, k, ck_preshuffle=True):
     print(f"{pyhip.calc_diff(out_torch, out_asm)=:.2f}")
     print(f"{pyhip.calc_diff(out_torch, out_gluon)=:.2f}")
     print(f"{pyhip.calc_diff(out_torch, out_jit)=:.2f}")
-    show_diff(out_torch, out_jit)
+    #show_diff(out_torch, out_jit)
 
 if __name__ == "__main__":
     '''
