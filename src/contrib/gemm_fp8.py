@@ -279,7 +279,7 @@ def gemm_fp8_8wave(J, bpreshuffle,
             # accessing B[tic,0], so next vm_load can overwrite A[toc,0],B[toc,0],B[toc,1],A[toc,1]
 
             ds_readB(tic, 1)
-            if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], k+2)
+            if use_f32_blockscales_128 and (k + 2) < loop_cnt: vm_load_scaleA(lds_scaleA[tic], k+2)
             J.emit(vm_loadA(tic,0))                         # vm_load_cnt_a
             J.s_barrier()
 
