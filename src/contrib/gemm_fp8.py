@@ -92,16 +92,17 @@ def gemm_fp8_8wave(J, bpreshuffle,
         scale_BM, scale_BN, scale_BK = 1,128,128 
         # tic-toc LDS buffer for 256 per-token per-k-128 scales
         # 1-warp is enough to load this buffer
-        lds_scaleA = [J.alloc_lds(wg_M * J.sizeof_f32),
-                      J.alloc_lds(wg_M * J.sizeof_f32)]
+        lds_scaleA = [J.alloc_lds(num_warps * 64 * J.sizeof_f32),
+                      J.alloc_lds(num_warps * 64 * J.sizeof_f32)]
         # if pScaleA in [m,k] layout
         # pScaleA[:] += blk_m * (wg_M * J.div(K, scale_BK) * J.sizeof_f32)
         # buff_sa = J.Buffer(pScaleA, (M1 - M0) * J.div(K, scale_BK) * J.sizeof_f32)
         # scaleA : [div_up(K, scale_BK), div_up(M,scale_BM)]
         #   
-        pScaleA[:] += blk_m * (wg_M * J.sizeof_f32)
-        voffset_scaleA = J.gpr(J.threadIdx.x[0] * J.sizeof_f32)
-        assert wg_M < num_warps * 64 * 4
+        # pScaleA[:] += blk_m * (wg_M * J.sizeof_f32)
+        buff_sa = J.Buffer(pScaleA, M[0] * J.div(K, scale_BK) * J.sizeof_f32)
+        voffset_scaleA = J.gpr(J.threadIdx.x[0] * J.sizeof_f32 + blk_m * (wg_M * J.sizeof_f32))
+        assert wg_M <= num_warps * 64
         # vm_load_scaleA(lds_scaleA[toc])
         # ds_read scaleA must be in MFMA_16x4 format
         # ds_read scaleB broad-cast in to 16x4 too
@@ -110,8 +111,8 @@ def gemm_fp8_8wave(J, bpreshuffle,
             # use execmask to ensure same impact on vmcnt for all warps
             J.s_mov_b32("m0", lds + J.warp_id[0]*(64*J.sizeof_f32))
             voff = J.gpr("vu32", voffset_scaleA[0] + J.gpr("su32", M[0]*(bk*J.sizeof_f32)))
-            with J.ExecMask(J.threadIdx.x[0] < Mc, early_skip=False):
-                J.global_load_lds_dword(voff, pScaleA)
+            #with J.ExecMask(J.threadIdx.x[0] < wg_M, early_skip=False):
+            buff_sa.load_dword(None, voff, 0)
 
         # scale of B(weights) are very small, can be all loaded into LDS
         lds_scaleB = J.alloc_lds(J.div(K, scale_BK) * J.div(wg_N, scale_BN) * J.sizeof_f32)
@@ -139,10 +140,15 @@ def gemm_fp8_8wave(J, bpreshuffle,
             # n0: in unit of scale_BN
             # all warps share the same scaleB
             assert scale_BN >= nrN * 16 * 4
-            off = bk * J.sizeof_f32
-            for i in range(num_scaleB):
-                J.ds_read_b32(mfma_scaleB[i,0], vaddr_scaleB[i], mod=f"offset:{off}")
-                #J.ds_read_b32(mfma_scaleB[i,1], vaddr_scaleB[i], mod=f"offset:{off}")
+            if isinstance(bk, int):
+                off = bk * J.sizeof_f32
+                for i in range(num_scaleB):
+                    J.ds_read_b32(mfma_scaleB[i,0], vaddr_scaleB[i], mod=f"offset:{off}")
+                    #J.ds_read_b32(mfma_scaleB[i,1], vaddr_scaleB[i], mod=f"offset:{off}")
+            else:
+                for i in range(num_scaleB):
+                    J.ds_read_b32(mfma_scaleB[i,0], vaddr_scaleB[i] + bk * J.sizeof_f32)
+
 
     # v_mfma_f32_16x16x128_f8f6f4: 
     mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
@@ -259,7 +265,8 @@ def gemm_fp8_8wave(J, bpreshuffle,
 
         J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
 
-        for k in range(loop_cnt):
+        def loop_body(k, loop_cnt):
+            nonlocal tic, toc
             ds_readB(tic, 0)    # lgkmcnt += nrN*2 (2*2)
             ds_readA(tic, 0)    # lgkmcnt += nrM*2 (4*2)
 
@@ -279,7 +286,7 @@ def gemm_fp8_8wave(J, bpreshuffle,
             # accessing B[tic,0], so next vm_load can overwrite A[toc,0],B[toc,0],B[toc,1],A[toc,1]
 
             ds_readB(tic, 1)
-            if use_f32_blockscales_128 and (k + 2) < loop_cnt: vm_load_scaleA(lds_scaleA[tic], k+2)
+            if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], k+2)
             J.emit(vm_loadA(tic,0))                         # vm_load_cnt_a
             J.s_barrier()
 
@@ -309,6 +316,19 @@ def gemm_fp8_8wave(J, bpreshuffle,
 
             tic ^= 1
             toc ^= 1
+
+        if 1:
+            for k in range(loop_cnt):
+                loop_body(k, loop_cnt)
+        else:
+            k = J.gpr("su32", 0)
+            with J.While(k[0] < loop_cnt):
+                loop_body(k, loop_cnt)
+                k[0] += 1
+                loop_body(k, loop_cnt)
+                k[0] += 1
+            if loop_cnt % 2:
+                loop_body(k, loop_cnt)
 
         J.s_waitcnt(mod="vmcnt(0)")
 
@@ -399,35 +419,3 @@ def gemm_fp8_8wave(J, bpreshuffle,
                 J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
                 buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*4*J.sizeof_DW2 + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
             vaddr[0] += 16*stride_c
-
-@pyhip.jit()
-def gemm_fp8_blockscale(J, wg_M, wg_N, N, K,
-                     scale_BM,
-                     scale_BN,
-                     scale_BK,
-                     pA:"void*", pAscale:"float*",
-                     pB:"void*", pBscale:"float*",
-                     pC:"void*", M:"int"):
-    """
-    A/B scale is float, so it's not MXFP8
-        pA      : [M, K]  torch.float8_e4m3fn   row-major
-        pB      : [N, K]  torch.float8_e4m3fn   pre-shuffled
-        pAscale : [div_up(M,scale_BM), div_up(K, scale_BK) ] x [scale_BM, scale_BK] float
-        pBscale : [div_up(N,scale_BN), div_up(K, scale_BK) ] x [scale_BN, scale_BK] float
-    
-    to use v_mfma_f32_16x16x128_f8f6f4(32 cycles), each MFMA's output must be scaled before accumulation
-    so MFMA's accumulation is not used.
-
-    It also implies that accumulation register needs to be VGPR instead of AccVGPR.
-
-    this means we cannot use 4-wave for 256 x 256 block size, HipKitten's 8-wave methods allows
-    all GPRs to be VGPR, thus it's a better way.
-
-    MFMA's output will needs extra 
-    """
-
-    assert scale_BM == 1
-    assert scale_BN == 128
-    assert scale_BK == 128
-
-    pass
