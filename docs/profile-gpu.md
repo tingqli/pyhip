@@ -51,13 +51,20 @@ thread trace: https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/amd-mainline
 $ docker run -it --rm --cap-add=SYS_ADMIN --network=host --device=/dev/kfd --device=/dev/dri  --cap-add=SYS_PTRACE --shm-size=4G --security-opt seccomp=unconfined --security-opt apparmor=unconfined -v ~/pyhip/:/pyhip --entrypoint /bin/bash rocm/pytorch:rocm7.0_ubuntu22.04_py3.10_pytorch_release_2.8.0 
 ```
  - manually install [ROCprof trace decoder](https://github.com/ROCm/rocprof-trace-decoder/releases)
+ 
+```bash
+wget https://github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.6/rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
+bash ./rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh --skip-license --prefix=./
+
+```
+
  - manually install [ROCprof Compute Viewer](https://github.com/ROCm/rocprof-compute-viewer/releases) on Windows to view results
  - use following example configs
 
 ```yaml
 jobs:
     -
-        kernel_exclude_regex:
+        kernel_include_regex: (.*name_patten1.*)|(.*name_patten2.*)
         kernel_iteration_range: "[1, [3-4]]"
         output_file: out
         output_directory: ck_test
@@ -74,5 +81,5 @@ jobs:
 ``` 
 
 ```bash
-rocprofv3 -i config.yaml -- python myapp.py
+rocprofv3 -i trace.yaml -- python myapp.py
 ```

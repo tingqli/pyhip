@@ -8,9 +8,12 @@ import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
-)
+try:
+    from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+        gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+    )
+except:
+    gluon_gemm_a8w8_blockscale = None
 
 import pyhip
 from pyhip.contrib.gemm_fp8 import *
@@ -171,11 +174,12 @@ def compare_perf(m, n, k, ck_preshuffle=True):
             di = (di + 1) % BUF_COPY
 
 
-    out_gluon = torch.empty((m, n), dtype=output_dtype, device=x.device)
-    for i in range(16):
-        with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"gluon_kernel_{di}") as p0:
-            gluon_gemm_a8w8_blockscale(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype, out_gluon)
-        di = (di + 1) % BUF_COPY
+    if gluon_gemm_a8w8_blockscale is not None:
+        out_gluon = torch.empty((m, n), dtype=output_dtype, device=x.device)
+        for i in range(16):
+            with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"gluon_kernel_{di}") as p0:
+                gluon_gemm_a8w8_blockscale(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype, out_gluon)
+            di = (di + 1) % BUF_COPY
 
     if ck_preshuffle:
         wg_M, wg_N = 256, 256
@@ -188,11 +192,12 @@ def compare_perf(m, n, k, ck_preshuffle=True):
                                 wg_M, wg_N, N, K, As[di].data_ptr(), Bs[di].data_ptr(), out_jit.data_ptr(),
                                 Ascales[di].data_ptr(), Bscales[di].data_ptr(), m)
 
-        di = (di + 1) % BUF_COPY
+            di = (di + 1) % BUF_COPY
 
     print(f"{pyhip.calc_diff(out_torch, out_ck)=:.2f}")
     print(f"{pyhip.calc_diff(out_torch, out_asm)=:.2f}")
-    print(f"{pyhip.calc_diff(out_torch, out_gluon)=:.2f}")
+    if gluon_gemm_a8w8_blockscale is not None:
+        print(f"{pyhip.calc_diff(out_torch, out_gluon)=:.2f}")
     print(f"{pyhip.calc_diff(out_torch, out_jit)=:.2f}")
     #show_diff(out_torch, out_jit)
 
