@@ -248,7 +248,24 @@ def s_or_saveexec_b64(op, sdst, ssrc):
 @gfx_inst
 def s_cbranch_(opcodes, label):
     cond = opcodes[-1]
-    return f"jump to {label} if {cond}"
+    
+    # execz:=(exec mask is zero)
+    # vccz:=(vector condition code is zero)
+    cond_map = {
+        "scc0": ("jump if scc is 0 (scc == 0)"),
+        "scc1": ("jump if scc is 1 (scc == 1)"),
+        "vccz": ("jump if vccz is 1 (vcc == 0)"),
+        "vccnz": ("jump if vccnz is 1 (vcc != 0)"),
+        "execz": ("jump if execz is 1 (exec mask == 0)"),
+        "execnz":("jump if execnz is 1 (exec mask != 0)"),
+    }
+
+    if cond in cond_map:
+        msg = cond_map[cond]
+    else:
+        msg = f"jump to {label} if {cond}"
+
+    return msg
 
 @gfx_inst
 def s_mov_(op, dst, src):
@@ -416,6 +433,16 @@ def v_mbcnt_(opcodes, vdst, src0, src1):
     else:
         lanes = f"(laneId-32):0"
     return f"{vdst} = {src1} + number_of_1bits_for({src0}[{lanes}])"
+
+@gfx_inst
+def s_nop(opcodes, imm16):
+    return f"s_nop {opcodes[0]} wait {int(imm16, 0)+1} cycles"
+
+@gfx_inst
+def v_bfe_(opcodes,  vdst, src0, src1, src2):
+    dtype = opcodes[0]
+    one = "1U" if dtype == "u32" else "1"
+    return f"{vdst} = (({src0}.{dtype} >> {src1}[4:0].{dtype}) & (({one} << {src2}[4:0].{dtype}) - {one}))"
 
 def prettify(asm_file_in, asm_file_out, do_demangle = False):
 
