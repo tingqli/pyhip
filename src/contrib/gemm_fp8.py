@@ -123,7 +123,7 @@ def gemm_fp8_8wave(J, bpreshuffle,
 
         num_scaleB = J.div(wg_N, scale_BN)
         mfma_scaleA = J.gpr(nrM, "vf32")
-        mfma_scaleB = J.gpr(num_scaleB, 2, "vf32")
+        mfma_scaleB = J.gpr(num_scaleB, "vf32")
         vaddr_scaleA = J.gpr("vu32", (J.lane_id[0] % 16)*J.sizeof_f32 + warp_m * (16*nrM * J.sizeof_f32))
         def ds_read_scaleA(lds, m0):
             assert m0 in [0, 1]
@@ -143,11 +143,10 @@ def gemm_fp8_8wave(J, bpreshuffle,
             if isinstance(bk, int):
                 off = bk * J.sizeof_f32
                 for i in range(num_scaleB):
-                    J.ds_read_b32(mfma_scaleB[i,0], vaddr_scaleB[i], mod=f"offset:{off}")
-                    #J.ds_read_b32(mfma_scaleB[i,1], vaddr_scaleB[i], mod=f"offset:{off}")
+                    J.ds_read_b32(mfma_scaleB[i], vaddr_scaleB[i], mod=f"offset:{off}")
             else:
                 for i in range(num_scaleB):
-                    J.ds_read_b32(mfma_scaleB[i,0], vaddr_scaleB[i] + bk * J.sizeof_f32)
+                    J.ds_read_b32(mfma_scaleB[i], vaddr_scaleB[i] + bk * J.sizeof_f32)
 
 
     # v_mfma_f32_16x16x128_f8f6f4: 
@@ -161,42 +160,40 @@ def gemm_fp8_8wave(J, bpreshuffle,
         # prepare scales for next round
         mfma_fifo_scale = J.gpr(2, nrM, "vf32")
         mfma_fifo = J.gpr(MFMA_FIFO_CNT, 4, "vf32")
-        mfma_fifo_c_index = None
-        mfma_fifo_read_id = 0
-        mfma_fifo_write_id = 0
+        mfma_fifo_scale[...] = 0
+        mfma_fifo[...] = 0
+        mfma_fifo_c_index = 0
 
         def mfma(c_index):
-            nonlocal mfma_fifo_scale, mfma_fifo, mfma_fifo_c_index, mfma_fifo_read_id, mfma_fifo_write_id
+            nonlocal mfma_fifo_scale, mfma_fifo, mfma_fifo_c_index
             b_index = c_index % 2
 
-            mfma_fifo_next_read_id = mfma_fifo_write_id
-            fifo_read_id = mfma_fifo_read_id
+            fifo_read_id = 0
+            fifo_write_id = 0
             for m in range(nrM):
                 for n in range(nrN):
                     if n == 0:
-                        mfma_fifo_scale[c_index%2, m] = mfma_scaleA[m] * mfma_scaleB[b_index,0]
-                    if mfma_fifo_c_index is not None:
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 0], mfma_fifo[fifo_read_id % MFMA_FIFO_CNT, 0], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 1], mfma_fifo[fifo_read_id % MFMA_FIFO_CNT, 1], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 2], mfma_fifo[fifo_read_id % MFMA_FIFO_CNT, 2], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 3], mfma_fifo[fifo_read_id % MFMA_FIFO_CNT, 3], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        fifo_read_id += 1
+                        mfma_fifo_scale[c_index%2, m] = mfma_scaleA[m] * mfma_scaleB[b_index]
+                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 0], mfma_fifo[fifo_read_id, 0], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 1], mfma_fifo[fifo_read_id, 1], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 2], mfma_fifo[fifo_read_id, 2], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 3], mfma_fifo[fifo_read_id, 3], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                    fifo_read_id += 1
 
-                    J.v_mfma_f32_16x16x128_f8f6f4(mfma_fifo[mfma_fifo_write_id % MFMA_FIFO_CNT], mfma_B[b_index, n], mfma_A[m], 0)
-                    mfma_fifo_write_id += 1
+                    J.v_mfma_f32_16x16x128_f8f6f4(mfma_fifo[fifo_write_id % MFMA_FIFO_CNT], mfma_B[b_index, n], mfma_A[m], 0)
+                    fifo_write_id += 1
                     yield 16
-            mfma_fifo_read_id = mfma_fifo_next_read_id
             mfma_fifo_c_index = c_index
         
         def mfma_tail():
-            fifo_read_id = mfma_fifo_read_id
+            fifo_read_id = 0
             for m in range(nrM):
                 for n in range(nrN):
                     if mfma_fifo_c_index is not None:
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 0], mfma_fifo[fifo_read_id % MFMA_FIFO_CNT, 0], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 1], mfma_fifo[fifo_read_id % MFMA_FIFO_CNT, 1], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 2], mfma_fifo[fifo_read_id % MFMA_FIFO_CNT, 2], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 3], mfma_fifo[fifo_read_id % MFMA_FIFO_CNT, 3], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 0], mfma_fifo[fifo_read_id, 0], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 1], mfma_fifo[fifo_read_id, 1], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 2], mfma_fifo[fifo_read_id, 2], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 3], mfma_fifo[fifo_read_id, 3], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
                         fifo_read_id += 1
 
     else:
@@ -334,14 +331,15 @@ def gemm_fp8_8wave(J, bpreshuffle,
             for k in range(loop_cnt):
                 loop_body(k, loop_cnt)
         else:
+            assert not use_f32_blockscales_128, "there is an unknown accuracy issue for f32 blockscale-128 case"
+            assert (loop_cnt % 2) == 0
             k = J.gpr("su32", 0)
+
             with J.While(k[0] < loop_cnt):
                 loop_body(k, loop_cnt)
                 k[0] += 1
                 loop_body(k, loop_cnt)
                 k[0] += 1
-            if loop_cnt % 2:
-                loop_body(k, loop_cnt)
 
         mfma_tail()
         J.s_waitcnt(mod="vmcnt(0)")
