@@ -156,39 +156,64 @@ def gemm_fp8_8wave(J, bpreshuffle,
     mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 4x[4,2]x[16,16]
 
     if use_f32_blockscales_128:
-        MFMA_TMP_CNT = 4
-        mfma_tmp = J.gpr(MFMA_TMP_CNT, 4, "vf32")
-        def mfma(c_index):
-            b_index = c_index % 2
-            # 交织反量化累加和mfma计算
-            # 同时还需要保证数据依赖关系
-            # 例如 mfma1 同时 合并scaleA和scaleB反量化系数 4个v_mul
-            # mfma2 时反量化 mfma1 的结果
-            # mfma3 时反量化 mfma2 的结果
-            mfma_scale = J.gpr(nrM, "vf32")
-            #mfma_scale = mfma_scaleA
-            i = 0
-            for m in range(nrM):
-                for n in range(nrN):
-                    if m == 0 and n == 0:
-                        # v_pk_mul_f32 is slower than v_mul_f32
-                        for tm in range(0,nrM,1):
-                            #J.v_pk_mul_f32(mfma_scale[tm:tm+1], mfma_scaleA[tm:tm+1], mfma_scaleB[b_index])
-                            mfma_scale[tm] = mfma_scaleA[tm] * mfma_scaleB[b_index,0]
-                    else:
-                        J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 0], mfma_tmp[(i-1)%MFMA_TMP_CNT, 0], mfma_scale[prev_m])
-                        J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 1], mfma_tmp[(i-1)%MFMA_TMP_CNT, 1], mfma_scale[prev_m])
-                        J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 2], mfma_tmp[(i-1)%MFMA_TMP_CNT, 2], mfma_scale[prev_m])
-                        J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 3], mfma_tmp[(i-1)%MFMA_TMP_CNT, 3], mfma_scale[prev_m])
-                    J.v_mfma_f32_16x16x128_f8f6f4(mfma_tmp[i%MFMA_TMP_CNT], mfma_B[b_index, n], mfma_A[m], 0)
-                    prev_m = m
-                    prev_n = n
-                    i += 1
-                    yield 16
-            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 0], mfma_tmp[(i-1)%MFMA_TMP_CNT, 0], mfma_scale[prev_m])
-            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 1], mfma_tmp[(i-1)%MFMA_TMP_CNT, 1], mfma_scale[prev_m])
-            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 2], mfma_tmp[(i-1)%MFMA_TMP_CNT, 2], mfma_scale[prev_m])
-            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 3], mfma_tmp[(i-1)%MFMA_TMP_CNT, 3], mfma_scale[prev_m])
+        if 1:
+            mfma_tmp = J.gpr(4, "vf32")
+            def mfma(c_index):
+                b_index = c_index % 2
+
+                mfma_scale = J.gpr(nrM, "vf32")
+                for m in range(nrM):
+                    #J.v_pk_mul_f32(mfma_scale[tm:tm+1], mfma_scaleA[tm:tm+1], mfma_scaleB[b_index])
+                    #mfma_scale[m] = mfma_scaleB[b_index,0]
+                    #mfma_scale[m] = mfma_scaleA[m]
+                    mfma_scale[m] = mfma_scaleA[m] * mfma_scaleB[b_index,0]
+                    #mfma_scale[m] = 1.0
+
+                for m in range(nrM):
+                    for n in range(nrN):
+                        #J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n], mfma_B[b_index, n], mfma_A[m], mfma_C[c_index, m, n])
+                        J.v_mfma_f32_16x16x128_f8f6f4(mfma_tmp, mfma_B[b_index, n], mfma_A[m], 0)
+                        J.s_nop(12)
+                        J.v_fmac_f32(mfma_C[c_index, m, n, 0], mfma_tmp[0], mfma_scale[m])
+                        J.v_fmac_f32(mfma_C[c_index, m, n, 1], mfma_tmp[1], mfma_scale[m])
+                        J.v_fmac_f32(mfma_C[c_index, m, n, 2], mfma_tmp[2], mfma_scale[m])
+                        J.v_fmac_f32(mfma_C[c_index, m, n, 3], mfma_tmp[3], mfma_scale[m])                        
+                        yield 16
+        else:
+            MFMA_TMP_CNT = 4
+            mfma_tmp = J.gpr(MFMA_TMP_CNT, 4, "vf32")
+            def mfma(c_index):
+                b_index = c_index % 2
+                # 交织反量化累加和mfma计算
+                # 同时还需要保证数据依赖关系
+                # 例如 mfma1 同时 合并scaleA和scaleB反量化系数 4个v_mul
+                # mfma2 时反量化 mfma1 的结果
+                # mfma3 时反量化 mfma2 的结果
+                mfma_scale = J.gpr(nrM, "vf32")
+                #mfma_scale = mfma_scaleA
+                i = 0
+                for m in range(nrM):
+                    for n in range(nrN):
+                        if m == 0 and n == 0:
+                            # v_pk_mul_f32 is slower than v_mul_f32
+                            for tm in range(0,nrM,1):
+                                #J.v_pk_mul_f32(mfma_scale[tm:tm+1], mfma_scaleA[tm:tm+1], mfma_scaleB[b_index])
+                                mfma_scale[tm] = mfma_scaleA[tm] * mfma_scaleB[b_index,0]
+                        else:
+                            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 0], mfma_tmp[(i-1)%MFMA_TMP_CNT, 0], mfma_scale[prev_m])
+                            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 1], mfma_tmp[(i-1)%MFMA_TMP_CNT, 1], mfma_scale[prev_m])
+                            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 2], mfma_tmp[(i-1)%MFMA_TMP_CNT, 2], mfma_scale[prev_m])
+                            J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 3], mfma_tmp[(i-1)%MFMA_TMP_CNT, 3], mfma_scale[prev_m])
+
+                        J.v_mfma_f32_16x16x128_f8f6f4(mfma_tmp[i%MFMA_TMP_CNT], mfma_B[b_index, n], mfma_A[m], 0)
+                        prev_m = m
+                        prev_n = n
+                        i += 1
+                        yield 16
+                J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 0], mfma_tmp[(i-1)%MFMA_TMP_CNT, 0], mfma_scale[prev_m])
+                J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 1], mfma_tmp[(i-1)%MFMA_TMP_CNT, 1], mfma_scale[prev_m])
+                J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 2], mfma_tmp[(i-1)%MFMA_TMP_CNT, 2], mfma_scale[prev_m])
+                J.v_fmac_f32(mfma_C[c_index, prev_m, prev_n, 3], mfma_tmp[(i-1)%MFMA_TMP_CNT, 3], mfma_scale[prev_m])
     else:
         def mfma(c_index):
             b_index = c_index % 2
@@ -255,7 +280,7 @@ def gemm_fp8_8wave(J, bpreshuffle,
         step_k()
 
         if use_f32_blockscales_128:
-            vm_load_scaleA(lds_scaleA[tic], 1)
+            vm_load_scaleA(lds_scaleA[toc], 1)
             vm_load_cnt_scaleA = 1
         else:
             vm_load_cnt_scaleA = 0
@@ -286,7 +311,6 @@ def gemm_fp8_8wave(J, bpreshuffle,
             # accessing B[tic,0], so next vm_load can overwrite A[toc,0],B[toc,0],B[toc,1],A[toc,1]
 
             ds_readB(tic, 1)
-            if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], k+2)
             J.emit(vm_loadA(tic,0))                         # vm_load_cnt_a
             J.s_barrier()
 
@@ -305,6 +329,8 @@ def gemm_fp8_8wave(J, bpreshuffle,
             J.s_setprio(0); J.s_barrier()
 
             J.emit(vm_loadB(tic,1))                         # vm_load_cnt_b
+            if use_f32_blockscales_128:
+                vm_load_scaleA(lds_scaleA[tic], k+2)
             J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
 
             J.s_setprio(1)
