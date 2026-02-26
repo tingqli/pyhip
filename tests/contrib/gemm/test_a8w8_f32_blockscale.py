@@ -171,7 +171,7 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
         out_jit = torch.empty((m, n), dtype=output_dtype, device=x.device)
         for i in range(num_repeats):
             with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"asmjit_kernel_{di}") as p0:
-                gemm_fp8_8wave([num_block_N * num_block_M],[64*8], True, True,
+                gemm_8wave_fp8bf16([num_block_N * num_block_M],[64*8], "fp8", True, True,
                                 wg_M, wg_N, n, k, As[di].data_ptr(), Bs[di].data_ptr(), out_jit.data_ptr(),
                                 Ascales[di].data_ptr(), Bscales[di].data_ptr(), m)
 
@@ -209,14 +209,15 @@ if __name__ == "__main__":
     '''
     #
     print(type(dtypes.fp8), dtypes.fp8)
-
-    test_perf(256,256,128, num_repeats=1, ck_preshuffle=True)
-    test_perf(256,256,256, num_repeats=1, ck_preshuffle=True)
-    test_perf(8192,8192,4096, num_repeats=1, ck_preshuffle=True)
+    if 0:
+        test_perf(256,256,128, num_repeats=1, ck_preshuffle=True)
+        test_perf(256,256,256, num_repeats=1, ck_preshuffle=True)
+        test_perf(8192,8192,4096, num_repeats=1, ck_preshuffle=True)
 
     #M,N,K = 256*94, 256*16, 8192 
     #M,N,K=8192,8192,8192
-    M,N,K=32768,9216,4096
+    #M,N,K=32768,9216,4096
+    M,N,K=4096,7168,2048 
     #M,N,K=256,256,128
     #test_gemm(dtypes.bf16, M, N, K, True)
     test_perf(M,N,K, num_repeats=16, ck_preshuffle=True)
