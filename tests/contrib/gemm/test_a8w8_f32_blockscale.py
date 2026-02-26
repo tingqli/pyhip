@@ -171,7 +171,7 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
         out_jit = torch.empty((m, n), dtype=output_dtype, device=x.device)
         for i in range(num_repeats):
             with pyhip.cudaPerf(m*n*k*2, (m*k+k*n), name=f"asmjit_kernel_{di}") as p0:
-                gemm_8wave_fp8bf16([num_block_N * num_block_M],[64*8], "fp8", True, True,
+                gemm_8wave_fp8bf16fp16([num_block_N * num_block_M],[64*8], "fp8", True, True,
                                 wg_M, wg_N, n, k, As[di].data_ptr(), Bs[di].data_ptr(), out_jit.data_ptr(),
                                 Ascales[di].data_ptr(), Bscales[di].data_ptr(), m)
 

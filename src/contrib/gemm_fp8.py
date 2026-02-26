@@ -2,11 +2,11 @@ import pyhip
 import torch
 
 __all__ = [
-    "gemm_8wave_fp8bf16",
+    "gemm_8wave_fp8bf16fp16",
 ]
 
 @pyhip.jit(with_debug_log = False)
-def gemm_8wave_fp8bf16(J, AB_dtype, bpreshuffle,
+def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
                    use_f32_blockscales_128, # scale_BM,scale_BN,scale_BK = 1,128,128 
                    wg_M, wg_N, N, K, 
                    pA:"void*", # [M, K]  torch.float8_e4m3fn   row-major
@@ -20,7 +20,7 @@ def gemm_8wave_fp8bf16(J, AB_dtype, bpreshuffle,
     https://github.com/HazyResearch/HipKittens/blob/.../kernels/gemm/fp8fp32/FP8_8wave/8_wave.cu
     """
 
-    assert AB_dtype in ["fp8", "bf16"]
+    assert AB_dtype in ["fp8", "bf16", "fp16", "f16"]
     C_dtype = "bf16"
     M01 = 8
     GroupNum = 8
@@ -211,7 +211,18 @@ def gemm_8wave_fp8bf16(J, AB_dtype, bpreshuffle,
                         J.v_mfma_f32_16x16x32_bf16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
                         yield 16
         def mfma_tail():
-            pass        
+            pass
+    else:
+        assert AB_dtype == "fp16" or AB_dtype == "f16" 
+        def mfma(c_index):
+            b_index = c_index % 2
+            for k in range(2):
+                for m in range(nrM):
+                    for n in range(nrN):
+                        J.v_mfma_f32_16x16x32_f16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
+                        yield 16
+        def mfma_tail():
+            pass
 
     loop_cnt = J.div(K, wg_K)
     assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL

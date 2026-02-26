@@ -13,14 +13,16 @@ torch.manual_seed(0)
 @pytest.mark.parametrize("N", [256, 256*6])
 @pytest.mark.parametrize("K", [256])
 @pytest.mark.parametrize("bpreshuffle", [True, False])
-@pytest.mark.parametrize("AB_dtype", ["fp8", "bf16"])
+@pytest.mark.parametrize("AB_dtype", ["fp8", "bf16","fp16"])
 def test(M, N, K, AB_dtype, bpreshuffle):
     out_dtype = torch.bfloat16
     if AB_dtype == "fp8":
         in_dtype = torch.float8_e4m3fn
-    else:
-        assert AB_dtype == "bf16"
+    elif AB_dtype == "bf16":
         in_dtype = torch.bfloat16
+    else:
+        assert AB_dtype == "fp16"
+        in_dtype = torch.float16
     x = (torch.randn((M, K))).to(in_dtype)
     w = (torch.randn((N, K))).to(in_dtype)
 
@@ -47,7 +49,7 @@ def test(M, N, K, AB_dtype, bpreshuffle):
         w = pyhip.pre_shuffle(w, mfma_MN=16)
         # w = shuffle_weight(w, layout=(16, 16))
 
-    gemm_8wave_fp8bf16([num_block_N*num_block_M],[64*8], AB_dtype, bpreshuffle, False,
+    gemm_8wave_fp8bf16fp16([num_block_N*num_block_M],[64*8], AB_dtype, bpreshuffle, False,
                    wg_M, wg_N, N, K, x.data_ptr(), w.data_ptr(), y1.data_ptr(),
                    None, None, M)
 
@@ -81,8 +83,8 @@ def test(M, N, K, AB_dtype, bpreshuffle):
     Cs = [torch.empty((M, N), dtype = out_dtype) for _ in range(BUF_COPY)]
     di = 0
     for i in range(32):
-        with pyhip.cudaPerf(M*N*K*2, name=f"gemm_8wave_fp8bf16-{M}_{N}_{K}_{bpreshuffle=}"):
-            gemm_8wave_fp8bf16([num_block_N*num_block_M],[64*8], AB_dtype, bpreshuffle, False,
+        with pyhip.cudaPerf(M*N*K*2, name=f"gemm_8wave_fp8bf16fp16-{M}_{N}_{K}_{bpreshuffle=}"):
+            gemm_8wave_fp8bf16fp16([num_block_N*num_block_M],[64*8], AB_dtype, bpreshuffle, False,
                            wg_M, wg_N, N, K,
                            As[di].data_ptr(), Bs[di].data_ptr(), Cs[di].data_ptr(),
                            None, None, M)
