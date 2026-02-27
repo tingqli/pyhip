@@ -97,16 +97,16 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
         else:
             src = input[tok_ids[valid_mask], tok_topk[valid_mask], ...]
 
-        act = src.to(torch.bfloat16) @ expert_w.t().to(torch.bfloat16)
+        act = src.to(torch.float) @ expert_w.t().to(torch.float)
 
         if is_gateup:
             act_gate = act[:, :(OC//2)]
             act_up = act[:,(OC//2):]
             act = torch.nn.functional.silu(act_gate) * act_up
-            output[tok_ids[valid_mask], tok_topk[valid_mask], :] = act
+            output[tok_ids[valid_mask], tok_topk[valid_mask], :] = act.to(output.dtype)
         else:
             tok_w = sorted_weights[i0:i1]
-            output[tok_ids[valid_mask], ...] += act[...] * tok_w[valid_mask, None]
+            output[tok_ids[valid_mask], ...] += act[...].to(output.dtype) * tok_w[valid_mask, None]
 
 
 def fused_moe_asmjit(
@@ -203,7 +203,6 @@ def fused_moe_asmjit(
     assert isG1U1 == True
     assert isShuffled == True
 
-
     # determine block_size_M
     block_size_M = 256
 
@@ -237,6 +236,11 @@ def fused_moe_asmjit(
         assert quant_type == aiter.QuantType.No
         act_quant_func = dummy_quant_func
 
+    token_num, _ = hidden_states.shape
+
+    if num_local_tokens is None:
+        num_local_tokens = torch.tensor(token_num, dtype=torch.int)
+
     a1, a1_scale = act_quant_func(
         hidden_states,
         scale=a1_scale,
@@ -249,8 +253,6 @@ def fused_moe_asmjit(
         print("\ta1        :", list(a1.shape), a1.dtype)
         print("\ta1_scale  :", list(a1_scale.shape), a1_scale.dtype)
         assert 0
-
-    token_num, _ = hidden_states.shape
 
     """
     ratio = a1_scale.element_size() // a1.element_size()

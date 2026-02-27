@@ -28,6 +28,7 @@ from aiter.ops.shuffle import (
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
+torch.manual_seed(0)
 
 @benchmark()
 def test_fmoe(
