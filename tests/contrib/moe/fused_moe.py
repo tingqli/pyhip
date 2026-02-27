@@ -70,7 +70,7 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
         # dequantize
         # print(input_scale.dtype, input_scale.shape, NUM_TOKENS, NUM_STATES)
         if is_gateup:
-            input = input.view(NUM_TOKENS, NUM_STATES//128, 128).to(input_scale.dtype) * input_scale.t().contiguous().view(NUM_TOKENS, NUM_STATES//128, 1)
+            input = input.view(NUM_TOKENS, NUM_STATES//128, 128).to(input_scale.dtype) * input_scale.view(-1, NUM_TOKENS).t().contiguous().view(NUM_TOKENS, NUM_STATES//128, 1)
             input = input.view(NUM_TOKENS, NUM_STATES)
         else:
             input = input.view(NUM_TOKENS*TOPK, NUM_STATES//128, 128).to(input_scale.dtype) * input_scale.view(NUM_STATES//128, NUM_TOKENS*TOPK).t().contiguous().view(NUM_TOKENS*TOPK, NUM_STATES//128, 1)
@@ -108,6 +108,7 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
             tok_w = sorted_weights[i0:i1]
             output[tok_ids[valid_mask], ...] += act[...].to(output.dtype) * tok_w[valid_mask, None]
 
+moe_gemm = moe_gemm_ref
 
 def fused_moe_asmjit(
     hidden_states,
@@ -207,15 +208,9 @@ def fused_moe_asmjit(
     block_size_M = 256
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = aiter.fused_moe.moe_sorting(
-        topk_ids,
-        topk_weight,
-        global_E,
-        model_dim,
-        dtype,
+        topk_ids, topk_weight, global_E, model_dim,  dtype,
         block_size_M,
-        expert_mask,
-        num_local_tokens,
-        moe_sorting_dispatch_policy,
+        expert_mask, num_local_tokens, moe_sorting_dispatch_policy,
     )
     if verbose:
         print("sorted_ids        :", list(sorted_ids.shape), sorted_ids.dtype)
@@ -262,42 +257,15 @@ def fused_moe_asmjit(
         device=device,
     )
     """
-
-    def moe_stage1(a1, w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, topk, block_m, a1_scale, w1_scale, sorted_weights, **kwargs):
-        a2_bf16 = torch.empty(
-            (token_num, topk, inter_dim),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
-                    a1, a1_scale,
-                    w1, w1_scale, a2_bf16, is_gateup=True)
-        return a2_bf16
-    def moe_stage2(a2, w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, moe_out, topk, w2_scale, a2_scale, block_m, sorted_weights, **kwargs):
-        moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
-                    a2, a2_scale,
-                    w2, w2_scale, moe_out, is_gateup=False)
-        return moe_out
-
-    extra_stage1_args = {}
-    extra_stage2_args = {}
-
-    a2 = moe_stage1(
-        a1,
-        w1,
-        w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        topk,
-        block_m=block_size_M,
-        a1_scale=a1_scale,
-        w1_scale=(
-            w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
-        ),
-        sorted_weights = sorted_weights,
-        **extra_stage1_args,
+    a2 = torch.empty(
+        (token_num, topk, inter_dim),
+        dtype=torch.bfloat16,
+        device=device,
     )
+    w1_scale = w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
+    moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+             a1, a1_scale,
+             w1, w1_scale, a2, is_gateup=True)
 
     a2, a2_scale = act_quant_func(
         a2, #a2.view(token_num*topk, -1),
@@ -309,22 +277,9 @@ def fused_moe_asmjit(
     )
     a2 = a2.view(token_num, topk, inter_dim)
 
-    moe_stage2(
-        a2,
-        w1,
-        w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_out,
-        topk,
-        w2_scale=(
-            w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
-        ),
-        a2_scale=a2_scale,
-        block_m=block_size_M,
-        sorted_weights = sorted_weights,
-        **extra_stage2_args,
-    )
+    w2_scale = w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
+    moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+             a2, a2_scale,
+             w2, w2_scale, moe_out, is_gateup=False)
 
     return moe_out
