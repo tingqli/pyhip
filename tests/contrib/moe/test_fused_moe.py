@@ -536,23 +536,25 @@ for (
                     )
                     df.append(ret)
     else:
-        for act_type in l_act:
-            for m in l_tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    act_type,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                )
-                df.append(ret)
+        for preshuffle in l_preshuffle:
+            for act_type in l_act:
+                for m in l_tokenNum:
+                    ret = test_fmoe(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        args.expert,
+                        args.topk,
+                        act_type,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        use_g1u1=True,
+                        doweight_stage1=doweight_stage1,
+                        preshuffle=preshuffle,
+                    )
+                    df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)

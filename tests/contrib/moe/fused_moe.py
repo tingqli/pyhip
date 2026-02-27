@@ -18,7 +18,78 @@ stage2: down
 
 MXFP requires special scheduling
 
+Here we focus on EP, which means each GPU handles a full gate/up/down MLP.
+
+num_local_tokens:
+    actual token count in hidden_states is this one instead of shape[0], to adapt to CUDA graph
+
+从最简化的方式逐渐逼近目标，例如先实现一个直接调用gemm组合实现目标的版本
+必须先有一个参考版本
 """
+def de_shuffle_weight(weight, mfma_MN = 16):
+    M, K = weight.shape
+    K_bytes = K * weight.itemsize
+    sizeof_DW4 = 16
+    mfma_K_lanes = 64 // mfma_MN
+    mfma_K_L = sizeof_DW4//weight.itemsize
+    mfma_K = mfma_K_lanes * mfma_K_L 
+
+    assert M % mfma_MN == 0
+    mfma_K_bytes = mfma_K_lanes * sizeof_DW4
+    assert K_bytes % mfma_K_bytes == 0
+    #x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L)
+    #x = x.permute(0,2,3,1,4)
+
+    assert K % mfma_K == 0
+    weight = weight.reshape(M//mfma_MN, K//mfma_K, mfma_K_lanes, mfma_MN, mfma_K_L)
+    weight = weight.permute(0,3,1,2,4)
+    weight = weight.reshape(M, K).contiguous()
+    return weight
+
+def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+                 input, input_scale, weight, w_scale, output, is_gateup):
+    assert weight.dtype == torch.bfloat16
+    num_tokens = input.shape[0]
+    
+    NUM_EXPERTS, OC, IC = weight.shape
+    NUM_BLOCKS = sorted_expert_ids.shape[0]
+
+    weight_de_shuffle = torch.empty_like(weight)
+    for i in range(NUM_EXPERTS):
+        weight_de_shuffle[i,...] = de_shuffle_weight(weight[i, ...])
+
+    for e_idx in range(NUM_BLOCKS):
+        max_id = num_valid_ids[0]
+        if e_idx * block_m >= max_id:
+            break
+
+        s_e_id = sorted_expert_ids[e_idx]
+        i0 = e_idx*block_m
+        i1 = i0 + block_m
+
+        ids = sorted_ids[i0:i1].clone()
+        tok_ids = ids & 0xFFFFFF
+        tok_topk = ids >> 24
+
+        valid_mask = tok_topk < torch.tensor(topk)
+
+        tok_w = sorted_weights[i0:i1]
+        expert_w = weight_de_shuffle[s_e_id, ...]
+        if is_gateup:
+            src = input[tok_ids[valid_mask],...]
+        else:
+            src = input[tok_ids[valid_mask], tok_topk[valid_mask], ...]
+
+        act = src.to(torch.bfloat16) @ expert_w.t().to(torch.bfloat16)
+
+        if is_gateup:
+            act_gate = act[:, :(OC//2)]
+            act_up = act[:,(OC//2):]
+            act = torch.nn.functional.silu(act_gate) * act_up
+            output[tok_ids[valid_mask], tok_topk[valid_mask], :] = act
+        else:
+            output[tok_ids[valid_mask], ...] += act[...] * tok_w[valid_mask, None]
+
 
 def fused_moe_asmjit(
     hidden_states,
@@ -73,7 +144,7 @@ def fused_moe_asmjit(
     q_dtype_w = w1.dtype
     q_dtype_a = dtype if quant_type == aiter.QuantType.No else w1.dtype
 
-    verbose = 1
+    verbose = 0
 
     if verbose:
         print(f"============================================= {device=} ")
@@ -111,9 +182,6 @@ def fused_moe_asmjit(
     assert bias2 is None
     assert splitk == 0
 
-    assert w1_scale is not None
-    assert w2_scale is not None
-
     assert isG1U1 == True
     assert isShuffled == True
 
@@ -142,8 +210,16 @@ def fused_moe_asmjit(
         print("num_valid_ids     :", list(num_valid_ids.shape), num_valid_ids.dtype, num_valid_ids.tolist())
         print("moe_out           :", list(moe_out.shape), moe_out.dtype)
 
-    quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x128)
-    a1, a1_scale = quant_func(
+    def dummy_quant_func(input, scale, quant_dtype=None, num_rows = 0, num_rows_factor = 0, transpose_scale = False):
+        return input, None
+
+    if quant_type == aiter.QuantType.per_128x128:
+        act_quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x128)
+    else:
+        assert quant_type == aiter.QuantType.No
+        act_quant_func = dummy_quant_func
+
+    a1, a1_scale = act_quant_func(
         hidden_states,
         scale=a1_scale,
         quant_dtype=q_dtype_a,
@@ -153,21 +229,31 @@ def fused_moe_asmjit(
 
     token_num, _ = hidden_states.shape
 
+    """
     ratio = a1_scale.element_size() // a1.element_size()
     a2 = torch.empty(
         (token_num + (token_num * ratio + 127) // 128, topk, inter_dim),
         dtype=q_dtype_a,
         device=device,
     )
+    """
 
-    def moe_stage1(a1, w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, a2, topk, block_m, a1_scale, w1_scale, sorted_weights, **kwargs):
+
+
+    def moe_stage1(a1, w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, topk, block_m, a1_scale, w1_scale, sorted_weights, **kwargs):
         a2_bf16 = torch.empty(
             (token_num, topk, inter_dim),
             dtype=torch.bfloat16,
             device=device,
         )
+        moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+                    a1, a1_scale,
+                    w1, w1_scale, a2_bf16, is_gateup=True)
         return a2_bf16
     def moe_stage2(a2, w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, moe_out, topk, w2_scale, a2_scale, block_m, sorted_weights, **kwargs):
+        moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+                    a2, a2_scale,
+                    w2, w2_scale, moe_out, is_gateup=False)
         return moe_out
 
     extra_stage1_args = {}
@@ -180,26 +266,24 @@ def fused_moe_asmjit(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
         w1_scale=(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
-        sorted_weights=sorted_weights if doweight_stage1 else None,
+        sorted_weights = sorted_weights,
         **extra_stage1_args,
     )
 
-    if quant_type != aiter.QuantType.No:
-        a2, a2_scale = quant_func(
-            a2,
-            scale=a2_scale,
-            quant_dtype=q_dtype_a,
-            num_rows=num_local_tokens,
-            num_rows_factor=topk,
-        )
-        a2 = a2.view(token_num, topk, inter_dim)
+    a2, a2_scale = act_quant_func(
+        a2,
+        scale=a2_scale,
+        quant_dtype=q_dtype_a,
+        num_rows=num_local_tokens,
+        num_rows_factor=topk,
+    )
+    a2 = a2.view(token_num, topk, inter_dim)
 
     moe_stage2(
         a2,
@@ -215,7 +299,7 @@ def fused_moe_asmjit(
         ),
         a2_scale=a2_scale,
         block_m=block_size_M,
-        sorted_weights=sorted_weights if not doweight_stage1 else None,
+        sorted_weights = sorted_weights,
         **extra_stage2_args,
     )
 
