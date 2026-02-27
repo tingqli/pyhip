@@ -48,8 +48,11 @@ def de_shuffle_weight(weight, mfma_MN = 16):
 
 def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                  input, input_scale, weight, w_scale, output, is_gateup):
-    assert weight.dtype == torch.bfloat16
-    num_tokens = input.shape[0]
+    #assert weight.dtype == torch.bfloat16
+    if is_gateup:
+        NUM_TOKENS, NUM_STATES = input.shape
+    else:
+        NUM_TOKENS, TOPK, NUM_STATES = input.shape
     
     NUM_EXPERTS, OC, IC = weight.shape
     NUM_BLOCKS = sorted_expert_ids.shape[0]
@@ -57,6 +60,21 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
     weight_de_shuffle = torch.empty_like(weight)
     for i in range(NUM_EXPERTS):
         weight_de_shuffle[i,...] = de_shuffle_weight(weight[i, ...])
+
+    if w_scale is not None:
+        # dequantize
+        weight_de_shuffle = weight_de_shuffle.view(NUM_EXPERTS, OC//128, 128, IC//128, 128).to(w_scale.dtype) * w_scale.view(NUM_EXPERTS, OC//128, 1, IC//128, 1)
+        weight_de_shuffle = weight_de_shuffle.view(NUM_EXPERTS, OC, IC)
+
+    if input_scale is not None:
+        # dequantize
+        # print(input_scale.dtype, input_scale.shape, NUM_TOKENS, NUM_STATES)
+        if is_gateup:
+            input = input.view(NUM_TOKENS, NUM_STATES//128, 128).to(input_scale.dtype) * input_scale.t().contiguous().view(NUM_TOKENS, NUM_STATES//128, 1)
+            input = input.view(NUM_TOKENS, NUM_STATES)
+        else:
+            input = input.view(NUM_TOKENS*TOPK, NUM_STATES//128, 128).to(input_scale.dtype) * input_scale.view(NUM_STATES//128, NUM_TOKENS*TOPK).t().contiguous().view(NUM_TOKENS*TOPK, NUM_STATES//128, 1)
+            input = input.view(NUM_TOKENS, TOPK, NUM_STATES)
 
     for e_idx in range(NUM_BLOCKS):
         max_id = num_valid_ids[0]
@@ -73,7 +91,6 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
 
         valid_mask = tok_topk < torch.tensor(topk)
 
-        tok_w = sorted_weights[i0:i1]
         expert_w = weight_de_shuffle[s_e_id, ...]
         if is_gateup:
             src = input[tok_ids[valid_mask],...]
@@ -88,6 +105,7 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
             act = torch.nn.functional.silu(act_gate) * act_up
             output[tok_ids[valid_mask], tok_topk[valid_mask], :] = act
         else:
+            tok_w = sorted_weights[i0:i1]
             output[tok_ids[valid_mask], ...] += act[...] * tok_w[valid_mask, None]
 
 
@@ -227,6 +245,11 @@ def fused_moe_asmjit(
         transpose_scale=True
     )
 
+    if verbose:
+        print("\ta1        :", list(a1.shape), a1.dtype)
+        print("\ta1_scale  :", list(a1_scale.shape), a1_scale.dtype)
+        assert 0
+
     token_num, _ = hidden_states.shape
 
     """
@@ -237,8 +260,6 @@ def fused_moe_asmjit(
         device=device,
     )
     """
-
-
 
     def moe_stage1(a1, w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, topk, block_m, a1_scale, w1_scale, sorted_weights, **kwargs):
         a2_bf16 = torch.empty(
@@ -277,11 +298,12 @@ def fused_moe_asmjit(
     )
 
     a2, a2_scale = act_quant_func(
-        a2,
+        a2, #a2.view(token_num*topk, -1),
         scale=a2_scale,
         quant_dtype=q_dtype_a,
         num_rows=num_local_tokens,
         num_rows_factor=topk,
+        transpose_scale=True
     )
     a2 = a2.view(token_num, topk, inter_dim)
 
