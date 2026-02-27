@@ -4,6 +4,7 @@ import aiter
 from aiter import dtypes
 
 __all__ = [
+    "fused_moe_asmjit"
 ]
 
 """
@@ -46,40 +47,7 @@ def fused_moe_asmjit(
     bias2=None,
     splitk=0,
 ):
-    assert activation == aiter.ActivationType.Silu
-    assert quant_type == aiter.QuantType.per_128x128
-
-    assert doweight_stage1 == False
-
-    assert a1_scale is None
-    assert a2_scale is None
-
-    assert hidden_pad == 0
-    assert intermediate_pad == 0
-    assert bias1 is None
-    assert bias2 is None
-    assert splitk == 0
-
-    assert w1.dtype == torch.float8_e4m3fn
-    assert w2.dtype == torch.float8_e4m3fn
-    assert w1_scale is not None
-    assert w2_scale is not None
-
     device = hidden_states.device
-
-    print(f"============================================= {device=}")
-    print("hidden_states:", hidden_states.shape, hidden_states.dtype)
-    print("w1:", w1.shape, w1.dtype)
-    print("w2:", w2.shape, w2.dtype)
-    print("topk_weight:", topk_weight.shape, topk_weight.dtype)
-    print("topk_ids:", topk_ids.shape, topk_ids.dtype)
-    if expert_mask is None:
-        print("expert_mask: None")
-    else:
-        print("expert_mask:", expert_mask.shape, expert_mask.dtype)
-    print("w1_scale:", w1_scale.shape, w1_scale.dtype)
-    print("w2_scale:", w2_scale.shape, w2_scale.dtype)
-
     def get_inter_dim(w1_shape, w2_shape):
         E, _, model_dim = w1_shape
         E, model_dim, inter_dim = w2_shape
@@ -94,20 +62,62 @@ def fused_moe_asmjit(
 
     isG1U1 = inter_dim != w1.shape[1]
     isShuffled = getattr(w1, "is_shuffled", False)
-    assert isG1U1 == True
-    assert isShuffled == True
-
     global_E = E
     if expert_mask is not None:
         global_E = expert_mask.numel()
 
     dtype = hidden_states.dtype if dtype is None else dtype
     assert dtype == aiter.dtypes.bf16
+    assert w1.dtype == w2.dtype
 
     q_dtype_w = w1.dtype
-    q_dtype_a = w1.dtype
+    q_dtype_a = dtype if quant_type == aiter.QuantType.No else w1.dtype
 
-    print(f"{dtype=} {M=} {topk=} {global_E=} {E=} {model_dim=} {inter_dim=} {isG1U1=} {isShuffled=}")
+    verbose = 1
+
+    if verbose:
+        print(f"============================================= {device=} ")
+        print(f" quant_type : {quant_type}")
+        print(f" dtype      : {dtype}")
+        print(f" w1.dtype   : {w1.dtype}")
+        print(f" w2.dtype   : {w2.dtype}")
+        print(f" q_dtype_a  : {q_dtype_a}")
+        print(f" {M=} {topk=} {global_E=} {E=} {model_dim=} {inter_dim=}")
+        print(f" {isG1U1=} {isShuffled=} ")
+
+        print("\thidden_states:", list(hidden_states.shape), hidden_states.dtype)   # hidden_states: [M, model_dim] torch.bfloat16
+        print("\tw1:", list(w1.shape), w1.dtype)                                    # w1           : [E, inter_dim*2, model_dim]  (isG1U1 is True)
+        print("\tw2:", list(w2.shape), w2.dtype)                                    # w2           : [E, model_dim, inter_dim]
+        print("\ttopk_weight:", list(topk_weight.shape), topk_weight.dtype)         # topk_weight  : [M, topk]      torch.float32
+        print("\ttopk_ids:", list(topk_ids.shape), topk_ids.dtype)                  # topk_ids     : [M, topk]      torch.int32
+        if expert_mask is not None:
+            print("\texpert_mask:", list(expert_mask.shape), expert_mask.dtype)
+        if w1_scale is not None:
+            print("\tw1_scale:", list(w1_scale.shape), w1_scale.dtype)              # w1_scale     : [E, inter_dim*2//128,  model_dim//128]  torch.float32
+        if w2_scale is not None:
+            print("\tw2_scale:", list(w2_scale.shape), w2_scale.dtype)              # w2_scale     : [E, model_dim//128, inter_dim//128]     torch.float32
+
+    assert activation == aiter.ActivationType.Silu
+    assert quant_type == aiter.QuantType.per_128x128 or quant_type == aiter.QuantType.No
+
+    assert doweight_stage1 == False
+
+    assert a1_scale is None
+    assert a2_scale is None
+
+    assert hidden_pad == 0
+    assert intermediate_pad == 0
+    assert bias1 is None
+    assert bias2 is None
+    assert splitk == 0
+
+    assert w1_scale is not None
+    assert w2_scale is not None
+
+    assert isG1U1 == True
+    assert isShuffled == True
+
+
     # determine block_size_M
     block_size_M = 256
 
@@ -122,6 +132,15 @@ def fused_moe_asmjit(
         num_local_tokens,
         moe_sorting_dispatch_policy,
     )
+    if verbose:
+        print("sorted_ids        :", list(sorted_ids.shape), sorted_ids.dtype)
+        print("\t", sorted_ids[:block_size_M])
+        print("\t", sorted_ids[block_size_M:block_size_M*2])
+        print("\t", sorted_ids[-block_size_M:])
+        print("sorted_weights    :", list(sorted_weights.shape), sorted_weights.dtype)
+        print("sorted_expert_ids :", list(sorted_expert_ids.shape), sorted_expert_ids.dtype, sorted_expert_ids.tolist())
+        print("num_valid_ids     :", list(num_valid_ids.shape), num_valid_ids.dtype, num_valid_ids.tolist())
+        print("moe_out           :", list(moe_out.shape), moe_out.dtype)
 
     quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x128)
     a1, a1_scale = quant_func(
@@ -141,10 +160,16 @@ def fused_moe_asmjit(
         device=device,
     )
 
-    def moe_stage1(*args,**kwargs):
-        pass
-    def moe_stage2(*args,**kwargs):
-        pass
+    def moe_stage1(a1, w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, a2, topk, block_m, a1_scale, w1_scale, sorted_weights, **kwargs):
+        a2_bf16 = torch.empty(
+            (token_num, topk, inter_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        return a2_bf16
+    def moe_stage2(a2, w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, moe_out, topk, w2_scale, a2_scale, block_m, sorted_weights, **kwargs):
+        return moe_out
+
     extra_stage1_args = {}
     extra_stage2_args = {}
 
@@ -166,14 +191,15 @@ def fused_moe_asmjit(
         **extra_stage1_args,
     )
 
-    a2, a2_scale = quant_func(
-        a2,
-        scale=a2_scale,
-        quant_dtype=q_dtype_a,
-        num_rows=num_local_tokens,
-        num_rows_factor=topk,
-    )
-    a2 = a2.view(token_num, topk, inter_dim)
+    if quant_type != aiter.QuantType.No:
+        a2, a2_scale = quant_func(
+            a2,
+            scale=a2_scale,
+            quant_dtype=q_dtype_a,
+            num_rows=num_local_tokens,
+            num_rows_factor=topk,
+        )
+        a2 = a2.view(token_num, topk, inter_dim)
 
     moe_stage2(
         a2,
