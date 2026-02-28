@@ -4,6 +4,7 @@ __all__ = [
     "get_mfma_loader_preshuffled",
     "get_mfma_loader_row_major",
     "get_mfma_loader",
+    "get_mfma_loader_sorted_tok",
     "tb_swizzle"
 ]
 
@@ -67,7 +68,7 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
         num_warps (int)      : how many warps are used for cooperatively loading data from VMEM into LDS
         M, K      (int)      : dimension of 2D tiles loaded, M rows and K columns of uint8/bytes
         vm_stride (int/sgpr) : the stride (in bytes) of external 2D VMEM tensor to be loaded
-        warp_row0 : 
+        warp_row0            : per-warp row offset when ds_read_16x64() loads from LDS to VGPRs
     
     Returns:
         vm_load(lds_offset, buff, vm_offset) : [M, K] u8-VMEM-tile to [M, K] u8-LDS-tile loader generator function
@@ -200,9 +201,117 @@ def get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0):
     vm_offset_inc = nbK * 1024
     return vm_load, vm_load_cnt, vm_offset_inc, ds_read_1kb
 
-
 def get_mfma_loader(J, use_pre_shuffle, num_warps, M, K, vm_stride, warp_row0):
     if use_pre_shuffle:
         return get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0)
     else:
         return get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0)
+
+def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sorted_ids, TOPK, num_tokens):
+    """
+    Args:
+        num_warps       (int) : how many warps are used for cooperatively loading data from VMEM into LDS
+        M, K      (int)       : dimension of 2D tiles loaded, M rows and K columns of uint8/bytes
+        vm_stride (int/sgpr)  : the stride (in bytes) of external 2D VMEM tensor to be loaded
+        warp_row0             : per-warp row offset when ds_read_16x64() loads from LDS to VGPRs
+
+        lds_sorted_ids  (int) : LDS offset where sorted_ids u32-vector is stored, each u32 item has token
+                                row index stored in its low 24bits and topk index stored in its high 8bits.
+
+        TOPK                  : > 0 : input layout [num_tokens, topk, dims]
+                                <=0 : input layout [num_tokens, dims]
+        num_tokens            : total number of valid tokens in external VMEM
+    
+    Returns:
+        vm_load(lds_offset, buff, vm_offset) : [M, K] u8-VMEM-tile to [M, K] u8-LDS-tile loader generator function
+                        lds_offset      (int) : target u8-LDS-tile offset
+                        buff         (Buffer) : VMEM buffer object
+                        vm_offset  (int/sgpr) : offset relative to buff base
+
+        vm_load_cnt                          : number of vm load instructions issued by each vm_load()
+
+        vm_offset_inc                        : increamental offsets after each vm_load (which is K)
+
+        ds_read_16x64(lds_offset, vdst, m, k) : load a [16, 64] u8-LDS-tile into VGPRs
+            lds_offset   (int) : source u8-LDS-tile offset
+            vdst       (vgprs) : dest VGPRs
+            m            (int) : m*16 is row offset of [16,64] tile inside [M, K] u8-LDS-tile
+            k            (int) : k*64 is col offset of [16,64] tile inside [M, K] u8-LDS-tile
+    """
+    nbM = J.div(M, 16)
+    nbK = J.div(K, 64)
+    if 0:
+        # check bank-conflict
+        J.show_mfma_in_lds(mfma_MN=16, num_mfmas=2) 
+        J.show_mfma_in_lds(mfma_MN=16, num_mfmas=2, swizzle_1=1)
+        J.show_mfma_in_lds(mfma_MN=16, num_mfmas=2, swizzle_2=1)
+        J.show_mfma_in_lds(mfma_MN=16, num_mfmas=2, swizzle_2=2)
+        assert 0
+
+    # each wave load 8x128 bytes , 4 waves loads 32x128 bytes
+    lds_stride = K
+    num_lanes_per_row = J.div(lds_stride, J.sizeof_DW4) # 8 when K==128
+    num_rows_per_load = J.div(64, num_lanes_per_row)    # 8 when K==128
+    warp_m_off = J.warp_id[0] * num_rows_per_load
+
+    def swizzle(row, col):
+        return (col ^ row) % num_lanes_per_row
+
+    col = J.threadIdx.x % num_lanes_per_row
+    row = J.threadIdx.x // num_lanes_per_row
+    swizzle_col = swizzle(row, col)
+
+    lds_warp_off = J.gpr("su32", warp_m_off * lds_stride)
+
+    # each vm-load-dw4 can load 8 rows (since K=128bytes)
+    # since tok-ids are discrete, we need a vmem_off for each load
+    vm_load_cnt = len(range(0, M, 8*num_warps))
+    vmem_voff = J.gpr(vm_load_cnt, "vu32")
+
+    ds_vaddr = J.gpr(row * J.sizeof_DW + lds_sorted_ids)
+
+    for m in range(vm_load_cnt):
+        J.ds_read_b32(vmem_voff[m], ds_vaddr + m*num_warps*8*J.sizeof_DW)
+
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+    for m in range(vm_load_cnt):
+        tokid = J.gpr(2, "vu32", vmem_voff[m] & 0xFFFFFF, vmem_voff[m] >> 24)
+        if TOPK > 0:
+            vmem_voff[m] = tokid[0]*(TOPK*vm_stride) + tokid[1]*vm_stride + swizzle_col * J.sizeof_DW4
+        else:
+            vmem_voff[m] = tokid[0]*vm_stride + swizzle_col * J.sizeof_DW4
+
+        # maybe don't need following code, since Buffer size ensures no read overflow can happen
+        with J.ExecMask(tokid[0] >= num_tokens[0]):
+            vmem_voff[m] = 0
+
+    def vm_load(lds_offset, buff, vm_offset):
+        J.s_mov_b32("m0", lds_warp_off + lds_offset)
+        for m in range(vm_load_cnt):
+            yield 1
+            buff.load_dwordx4(None, vmem_voff[m] + vm_offset, 0, offset12=0)
+            J.s_addk_i32("m0", 256*J.sizeof_DW4)
+            # vmem_voff[m] += nbK * 4 * J.sizeof_DW4
+
+    col = J.lane_id // 16
+    row = J.lane_id % 16
+    swizzle_col = swizzle(row, col)
+    num_regs_K = J.div(K, 64)
+    voff = J.gpr(num_regs_K, "vu32")
+    voff2 = J.gpr(num_regs_K, "vu32")
+    for k in range(num_regs_K):
+        voff[k] = (row + warp_row0) * lds_stride + swizzle(row, col + k*4) * J.sizeof_DW4
+        voff2[k] = voff[k] + 64*1024 # # ds_read_b128's offset is just 16bits
+
+    def ds_read_16x64(lds, vdst, m, k):
+        offset = lds + m*16*lds_stride
+        if offset >= 64*1024:
+            voffset = voff2[k]
+            offset -= 64*1024
+        else:
+            voffset = voff[k]
+        J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
+    vm_offset_inc = K
+
+    return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64

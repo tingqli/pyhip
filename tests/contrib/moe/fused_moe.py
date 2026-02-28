@@ -3,6 +3,8 @@ import torch
 import aiter
 from aiter import dtypes
 
+from pyhip.contrib.moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
+
 __all__ = [
     "fused_moe_asmjit"
 ]
@@ -24,7 +26,8 @@ num_local_tokens:
     actual token count in hidden_states is this one instead of shape[0], to adapt to CUDA graph
 
 从最简化的方式逐渐逼近目标，例如先实现一个直接调用gemm组合实现目标的版本
-必须先有一个参考版本
+必须先有一个参考版本, 逐步替换为优化版本，在更小的修改粒度上保持正确性
+先实现bf16-8wave版本，降低复杂度，保证一些基本逻辑正确性
 """
 def de_shuffle_weight(weight, mfma_MN = 16):
     M, K = weight.shape
@@ -106,7 +109,9 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
             output[tok_ids[valid_mask], tok_topk[valid_mask], :] = act.to(output.dtype)
         else:
             tok_w = sorted_weights[i0:i1]
-            output[tok_ids[valid_mask], ...] += act[...].to(output.dtype) * tok_w[valid_mask, None]
+            cur_out = act[...].to(output.dtype) * tok_w[valid_mask, None]
+            #output[tok_ids[valid_mask], ...] += cur_out
+            output[tok_ids[valid_mask], tok_topk[valid_mask], :] = cur_out.to(output.dtype)
 
 moe_gemm = moe_gemm_ref
 
@@ -278,8 +283,45 @@ def fused_moe_asmjit(
     a2 = a2.view(token_num, topk, inter_dim)
 
     w2_scale = w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
-    moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
-             a2, a2_scale,
-             w2, w2_scale, moe_out, is_gateup=False)
+
+    stage2_out = torch.empty(
+        (token_num, topk, model_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    if 0:
+        moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+                a2, a2_scale,
+                w2, w2_scale, stage2_out, is_gateup=False)
+    else:
+        if q_dtype_a == torch.bfloat16:
+            AB_dtype = "bf16"
+        else:
+            assert 0
+        wg_M, wg_N = 256, 256
+        num_oc_blocks = model_dim//256
+        num_e_blocks = sorted_expert_ids.shape[0]
+        moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
+                   AB_dtype, wg_M, wg_N,
+                   E, model_dim, inter_dim, 
+                   False, topk,
+                   sorted_ids.data_ptr(),
+                   sorted_weights.data_ptr(),
+                   sorted_expert_ids.data_ptr(),
+                   num_valid_ids.data_ptr(),
+                   w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
+                   a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
+                   stage2_out.data_ptr(),
+                   token_num) # num_local_tokens.data_ptr() ?
+
+    if 1:
+        num_WG = 256 * 2
+        num_tokens_wg = num_local_tokens // num_WG
+        num_extra_tokens = num_local_tokens % num_WG
+        moe_gemm_final_reduce_bf16([num_WG], [64], topk, model_dim,
+                                stage2_out.data_ptr(),
+                                moe_out.data_ptr(),
+                                num_tokens_wg, num_extra_tokens, num_local_tokens)
 
     return moe_out
