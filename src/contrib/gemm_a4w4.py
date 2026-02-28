@@ -1,5 +1,7 @@
 import pyhip
 
+from .common.loaders import get_mfma_loader, tb_swizzle
+
 __all__ = [
     "gemm_a4w4_kernel"
 ]
@@ -23,7 +25,7 @@ def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, a_preshuffle, b_preshuffle,
     stride_k = K * J.sizeof_fp4x2
     stride_C = N * J.sizeof(C_dtype)
 
-    blk_m, blk_n = J.tb_swizzle(J.blockIdx.x, M, wg_M, wg_N, N, M01, GroupNum)
+    blk_m, blk_n = tb_swizzle(J, J.blockIdx.x, M, wg_M, wg_N, N, M01, GroupNum)
     pA[:] += blk_m * (wg_M * stride_k)
     pB[:] += blk_n * (wg_N * stride_k)
     pC[:] += blk_m * (wg_M * stride_C) # + blk_n * (wg_N * J.sizeof(C_dtype)))
@@ -64,8 +66,8 @@ def gemm_a4w4_kernel(J, wg_M, wg_N, N, K, a_preshuffle, b_preshuffle,
     #vm_load_b, vm_load_cnt_b, ds_read_b = get_loader(J, buff_b, b_preshuffle, nbN, nbK, stride_k, warp_n)
 
     num_warps = 4
-    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = J.get_mfma_loader(use_pre_shuffle, num_warps, wg_M, 128, stride_k, warp_m*16)
-    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = J.get_mfma_loader(use_pre_shuffle, num_warps, wg_N, 128, stride_k, warp_n*16)
+    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader(J, a_preshuffle, num_warps, wg_M, 128, stride_k, warp_m*16)
+    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, b_preshuffle, num_warps, wg_N, 128, stride_k, warp_n*16)
 
     print(f"============={nbM=}, {nbN=}, {nbK=} {nrM=} {nrN=} {nrK=}")
 

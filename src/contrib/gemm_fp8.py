@@ -1,6 +1,8 @@
 import pyhip
 import torch
 
+from .common.loaders import get_mfma_loader, tb_swizzle
+
 __all__ = [
     "gemm_8wave_fp8bf16fp16",
 ]
@@ -31,7 +33,7 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
     stride_k = K * J.sizeof(AB_dtype)
     stride_C = N * J.sizeof(C_dtype)
 
-    blk_m, blk_n = J.tb_swizzle(J.blockIdx.x, M, wg_M, wg_N, N, M01, GroupNum)
+    blk_m, blk_n = tb_swizzle(J, J.blockIdx.x, M, wg_M, wg_N, N, M01, GroupNum)
     pA[:] += blk_m * (wg_M * stride_k)
     pB[:] += blk_n * (wg_N * stride_k)
     pC[:] += blk_m * (wg_M * stride_C) # + blk_n * (wg_N * J.sizeof(C_dtype)))
@@ -81,8 +83,8 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
     warp_n = J.gpr(J.warp_id[0] % WARPS_COL)  # warp col: 0 to 3
 
     use_pre_shuffle = False
-    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = J.get_mfma_loader(use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*64)
-    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = J.get_mfma_loader(bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*32)
+    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader(J, use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*64)
+    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*32)
 
     if use_f32_blockscales_128:
         assert bpreshuffle == True, "exepct scaleA in [k,m] layout"
