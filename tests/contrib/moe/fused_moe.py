@@ -302,18 +302,21 @@ def fused_moe_asmjit(
         wg_M, wg_N = 256, 256
         num_oc_blocks = model_dim//256
         num_e_blocks = sorted_expert_ids.shape[0]
-        moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
-                   AB_dtype, wg_M, wg_N,
-                   E, model_dim, inter_dim, 
-                   False, topk,
-                   sorted_ids.data_ptr(),
-                   sorted_weights.data_ptr(),
-                   sorted_expert_ids.data_ptr(),
-                   num_valid_ids.data_ptr(),
-                   w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
-                   a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
-                   stage2_out.data_ptr(),
-                   token_num) # num_local_tokens.data_ptr() ?
+        #sorted_expert_ids[...] = 0
+        valid_e_blocks = num_valid_ids[0].item()//wg_M
+        with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2, name="moe_gemm_8wave_down"):
+            moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
+                    AB_dtype, wg_M, wg_N,
+                    E, model_dim, inter_dim, 
+                    False, topk,
+                    sorted_ids.data_ptr(),
+                    sorted_weights.data_ptr(),
+                    sorted_expert_ids.data_ptr(),
+                    num_valid_ids.data_ptr(),
+                    w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
+                    a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
+                    stage2_out.data_ptr(),
+                    token_num) # num_local_tokens.data_ptr() ?
 
     if 1:
         num_WG = 256 * 2

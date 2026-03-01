@@ -245,6 +245,8 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
 
     vm_load_cnt_a = vm_load_cnt_a // 2
 
+    use_f32_blockscales_128 = False
+
     mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
     mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")            # 2x[16,128]
     mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 4x[4,2]x[16,16]
@@ -295,104 +297,209 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             ds_read_b(ldsB[k,m], mfma_B[m, i, 0], i, 0)
             ds_read_b(ldsB[k,m], mfma_B[m, i, 1], i, 1)
 
-    mfma_C[...] = 0
-    for k in range(loop_cnt):
-        J.emit(vm_loadB(0,0))
-        J.emit(vm_loadA(0,0))
-        #if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[0], k)
-        J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
+    if 1:
+        # 8-wave pipeline invented by HipKittens
+        tic = 0
+        toc = 1
+        #if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], 0)
+        J.emit(vm_loadB(tic,0))
+        J.emit(vm_loadA(tic,0))
+        J.emit(vm_loadB(tic,1))
+        J.emit(vm_loadA(tic,1))
 
-        ds_readA(0,0)
-        ds_readB(0,0)
-        #if use_f32_blockscales_128:
-        #    ds_read_scaleA(lds_scaleA[0], 0)
-        #    ds_read_scaleB(k)
-        J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
-        J.emit(mfma(0))
+        with J.If(warp_m[0] == 1):
+            J.s_barrier()
 
-        #J.debug_log(mfma_A[0,0], torch.float8_e4m3fn, "4h.16v.16h")
-        #J.debug_log(mfma_A[0,1], torch.float8_e4m3fn, "4h.16v.16h")
-        #J.s_endpgm()
+        mfma_C[...] = 0
 
-        J.emit(vm_loadB(0,1))
-        J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
-
-        ds_readB(0,1)
-        J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
-        J.emit(mfma(1))
-
-        #J.debug_log(mfma_B[1,0,0], torch.float8_e4m3fn, "4h.16v.16h")
-        #J.debug_log(mfma_B[1,0,1], torch.float8_e4m3fn, "4h.16v.16h")
-        #J.s_endpgm()
-
-        J.emit(vm_loadA(0,1))
-        J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
-
-        ds_readA(0,1)
-        #if use_f32_blockscales_128:
-        #    ds_read_scaleA(lds_scaleA[0], 1)
-        J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
-
-        #J.debug_log(mfma_A[0,0], torch.float8_e4m3fn, "4h.16v.16h")
-        #J.debug_log(mfma_A[0,1], torch.float8_e4m3fn, "4h.16v.16h")
-        #J.s_endpgm()
-
-        J.emit(mfma(2))
-        J.emit(mfma(3))
+        J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b})"); J.s_barrier()
 
         step_k()
 
-    # scatter output to : [num_tokens, topk, dims]
-    vrows = J.gpr(2, nrM, "vu32")
-    vweights = J.gpr(2, nrM, "vf32")
-    for cm in range(2):
-        row = J.gpr("vu32", ((J.lane_id % 16) + (cm * HALF_BLOCK_SIZE_ROW) + (warp_m * MINI_BLOCK_M))  * J.sizeof_u32)
-        for m in range(nrM):
-            J.ds_read_b32(vrows[cm, m], row + lds_sorted_ids)
-            J.ds_read_b32(vweights[cm, m], row + lds_sorted_weights)
-            row[0] += 16*J.sizeof_u32
+        #if use_f32_blockscales_128:
+        #    vm_load_scaleA(lds_scaleA[toc], 1)
+        #    vm_load_cnt_scaleA = 1
+        #else:
+        vm_load_cnt_scaleA = 0
+        J.emit(vm_loadA(toc,0))
+        J.emit(vm_loadB(toc,0))
+        J.emit(vm_loadB(toc,1))
 
-    J.s_waitcnt(mod=f"lgkmcnt(0)")
+        J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
 
-    stride_c = OC * J.sizeof(C_dtype)
-    vbf16 = J.gpr(4, "vbf16x2") # DWORDx4
-    col = J.lane_id // 16
-    swap_12_col = (col & 1) * 2 + (col >> 1)
+        def loop_body(k, loop_cnt):
+            nonlocal tic, toc
+            ds_readB(tic, 0)    # lgkmcnt += nrN*2 (2*2)
+            ds_readA(tic, 0)    # lgkmcnt += nrM*2 (4*2)
 
-    vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + blk_n * (wg_N * J.sizeof(C_dtype)))
+            #if use_f32_blockscales_128:
+            #    ds_read_scaleA(lds_scaleA[tic], 0)
+            #    ds_read_scaleB(k)
 
-    for cindex in range(4):
-        cm = cindex // 2
-        cn = cindex % 2
-        for m in range(nrM):
-            vaddr = J.gpr("vu32",
-                          vaddr0 + \
-                          (vrows[cm, m] & 0xFFFFFF) * (TOPK * stride_c) + \
-                          (vrows[cm, m] >> 24) * (stride_c))
+            J.emit(vm_loadA(toc,1))
+            step_k()
+            J.s_waitcnt(mod=f"lgkmcnt(0)"); J.s_barrier()
 
-            for n in range(0, nrN, 2):
-                J.v_mul_f32(mfma_C[cindex,m,n,0], mfma_C[cindex,m,n,0], vweights[cm, m])
-                J.v_mul_f32(mfma_C[cindex,m,n,1], mfma_C[cindex,m,n,1], vweights[cm, m])
-                J.v_mul_f32(mfma_C[cindex,m,n,2], mfma_C[cindex,m,n,2], vweights[cm, m])
-                J.v_mul_f32(mfma_C[cindex,m,n,3], mfma_C[cindex,m,n,3], vweights[cm, m])
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
+            J.emit(mfma(0))
+            J.s_setprio(0); J.s_barrier()
+            #===============================================================
+            # after this s_barrier, lgkmcnt(8) ensures all 8-waves has finished
+            # accessing B[tic,0], so next vm_load can overwrite A[toc,0],B[toc,0],B[toc,1],A[toc,1]
 
-                J.v_mul_f32(mfma_C[cindex,m,n+1,0], mfma_C[cindex,m,n+1,0], vweights[cm, m])
-                J.v_mul_f32(mfma_C[cindex,m,n+1,1], mfma_C[cindex,m,n+1,1], vweights[cm, m])
-                J.v_mul_f32(mfma_C[cindex,m,n+1,2], mfma_C[cindex,m,n+1,2], vweights[cm, m])
-                J.v_mul_f32(mfma_C[cindex,m,n+1,3], mfma_C[cindex,m,n+1,3], vweights[cm, m])
+            ds_readB(tic, 1)
+            J.emit(vm_loadA(tic,0))                         # vm_load_cnt_a
+            J.s_barrier()
 
-                J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
-                J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
-                J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
-                J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
-                #    a0    a1   a2   a3   | 01 23
-                #    b0    b1   b2   b3   | 45 67
-                #  v_permlane16_swap_b32(a, b)
-                #    a0    b0   a2   b2   |
-                #    a1    b1   a3   b3   |
-                #
-                # swap of row 1 & 2 are done by swapping lane-address 
-                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-                buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
+            J.emit(mfma(1))
+            J.s_setprio(0); J.s_barrier()
+
+            ds_readA(tic, 1)
+            #if use_f32_blockscales_128: ds_read_scaleA(lds_scaleA[tic], 1)
+            J.emit(vm_loadB(tic,0))                         # vm_load_cnt_b
+            J.s_barrier()
+
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
+            J.emit(mfma(2))
+            J.s_setprio(0); J.s_barrier()
+
+            J.emit(vm_loadB(tic,1))                         # vm_load_cnt_b
+            #if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], k+2)
+            J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
+
+            J.s_setprio(1)
+            J.emit(mfma(3))
+            J.s_setprio(0); J.s_barrier()
+            #===============================================================
+            # after this s_barrier, we have all A[toc] & B[toc] loaded in LDS
+            # so in next iteration, we can ds_read A[tic] & B[tic] w/o waitting for any vmcnt
+
+            tic ^= 1
+            toc ^= 1
+
+        if 1:
+            for k in range(loop_cnt):
+                loop_body(k, loop_cnt)
+        else:
+            assert not use_f32_blockscales_128, "there is an unknown accuracy issue for f32 blockscale-128 case"
+            assert (loop_cnt % 2) == 0
+            k = J.gpr("su32", 0)
+
+            with J.While(k[0] < loop_cnt):
+                loop_body(k, loop_cnt)
+                k[0] += 1
+                loop_body(k, loop_cnt)
+                k[0] += 1
+
+        mfma_tail()
+        J.s_waitcnt(mod="vmcnt(0)")
+
+        with J.If(warp_m[0] == 0):
+            J.s_barrier()
+
+    else:
+        mfma_C[...] = 0
+        for k in range(loop_cnt):
+            J.emit(vm_loadB(0,0))
+            J.emit(vm_loadA(0,0))
+            #if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[0], k)
+            J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
+
+            ds_readA(0,0)
+            ds_readB(0,0)
+            #if use_f32_blockscales_128:
+            #    ds_read_scaleA(lds_scaleA[0], 0)
+            #    ds_read_scaleB(k)
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
+            J.emit(mfma(0))
+
+            #J.debug_log(mfma_A[0,0], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.debug_log(mfma_A[0,1], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.s_endpgm()
+
+            J.emit(vm_loadB(0,1))
+            J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
+
+            ds_readB(0,1)
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
+            J.emit(mfma(1))
+
+            #J.debug_log(mfma_B[1,0,0], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.debug_log(mfma_B[1,0,1], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.s_endpgm()
+
+            J.emit(vm_loadA(0,1))
+            J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
+
+            ds_readA(0,1)
+            #if use_f32_blockscales_128:
+            #    ds_read_scaleA(lds_scaleA[0], 1)
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
+
+            #J.debug_log(mfma_A[0,0], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.debug_log(mfma_A[0,1], torch.float8_e4m3fn, "4h.16v.16h")
+            #J.s_endpgm()
+
+            J.emit(mfma(2))
+            J.emit(mfma(3))
+
+            step_k()
+
+    if gate_up:
+        assert 0
+    else:
+        # scatter output to : [num_tokens, topk, dims]
+        vrows = J.gpr(2, nrM, "vu32")
+        vweights = J.gpr(2, nrM, "vf32")
+        for cm in range(2):
+            row = J.gpr("vu32", ((J.lane_id % 16) + (cm * HALF_BLOCK_SIZE_ROW) + (warp_m * MINI_BLOCK_M))  * J.sizeof_u32)
+            for m in range(nrM):
+                J.ds_read_b32(vrows[cm, m], row + lds_sorted_ids)
+                J.ds_read_b32(vweights[cm, m], row + lds_sorted_weights)
+                row[0] += 16*J.sizeof_u32
+
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        stride_c = OC * J.sizeof(C_dtype)
+        vbf16 = J.gpr(4, "vbf16x2") # DWORDx4
+        col = J.lane_id // 16
+        swap_12_col = (col & 1) * 2 + (col >> 1)
+
+        vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + blk_n * (wg_N * J.sizeof(C_dtype)))
+
+        for cindex in range(4):
+            cm = cindex // 2
+            cn = cindex % 2
+            for m in range(nrM):
+                vaddr = J.gpr("vu32",
+                            vaddr0 + \
+                            (vrows[cm, m] & 0xFFFFFF) * (TOPK * stride_c) + \
+                            (vrows[cm, m] >> 24) * (stride_c))
+
+                for n in range(0, nrN, 2):
+                    J.v_mul_f32(mfma_C[cindex,m,n,0], mfma_C[cindex,m,n,0], vweights[cm, m])
+                    J.v_mul_f32(mfma_C[cindex,m,n,1], mfma_C[cindex,m,n,1], vweights[cm, m])
+                    J.v_mul_f32(mfma_C[cindex,m,n,2], mfma_C[cindex,m,n,2], vweights[cm, m])
+                    J.v_mul_f32(mfma_C[cindex,m,n,3], mfma_C[cindex,m,n,3], vweights[cm, m])
+
+                    J.v_mul_f32(mfma_C[cindex,m,n+1,0], mfma_C[cindex,m,n+1,0], vweights[cm, m])
+                    J.v_mul_f32(mfma_C[cindex,m,n+1,1], mfma_C[cindex,m,n+1,1], vweights[cm, m])
+                    J.v_mul_f32(mfma_C[cindex,m,n+1,2], mfma_C[cindex,m,n+1,2], vweights[cm, m])
+                    J.v_mul_f32(mfma_C[cindex,m,n+1,3], mfma_C[cindex,m,n+1,3], vweights[cm, m])
+
+                    J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
+                    J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
+                    J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
+                    J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
+                    #    a0    a1   a2   a3   | 01 23
+                    #    b0    b1   b2   b3   | 45 67
+                    #  v_permlane16_swap_b32(a, b)
+                    #    a0    b0   a2   b2   |
+                    #    a1    b1   a3   b3   |
+                    #
+                    # swap of row 1 & 2 are done by swapping lane-address 
+                    J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                    J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                    buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
     return
