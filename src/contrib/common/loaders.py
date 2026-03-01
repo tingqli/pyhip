@@ -266,6 +266,7 @@ def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sor
     # each vm-load-dw4 can load 8 rows (since K=128bytes)
     # since tok-ids are discrete, we need a vmem_off for each load
     vm_load_cnt = len(range(0, M, 8*num_warps))
+
     vmem_voff = J.gpr(vm_load_cnt, "vu32")
 
     ds_vaddr = J.gpr(row * J.sizeof_DW + lds_sorted_ids)
@@ -283,15 +284,23 @@ def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sor
             vmem_voff[m] = tokid[0]*vm_stride + swizzle_col * J.sizeof_DW4
 
         # maybe don't need following code, since Buffer size ensures no read overflow can happen
-        with J.ExecMask(tokid[0] >= num_tokens[0]):
-            vmem_voff[m] = 0
+        #with J.ExecMask(tokid[0] >= num_tokens[0]):
+        #    vmem_voff[m] = 0
 
-    def vm_load(lds_offset, buff, vm_offset):
+    def vm_load(lds_offset, buff, vm_offset, half=None):
         J.s_mov_b32("m0", lds_warp_off + lds_offset)
-        for m in range(vm_load_cnt):
+        if half is None:
+            m_range = range(vm_load_cnt)
+        elif half == 0:
+            m_range = range(0, J.div(vm_load_cnt,2))
+        elif half == 1:
+            m_range = range(J.div(vm_load_cnt,2), vm_load_cnt)
+        else:
+            assert 0
+        for m in m_range:
             yield 1
             buff.load_dwordx4(None, vmem_voff[m] + vm_offset, 0, offset12=0)
-            J.s_addk_i32("m0", 256*J.sizeof_DW4)
+            J.s_addk_i32("m0", num_warps*64*J.sizeof_DW4)
             # vmem_voff[m] += nbK * 4 * J.sizeof_DW4
 
     col = J.lane_id // 16

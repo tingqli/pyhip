@@ -148,7 +148,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
 
     stride_k = IC * J.sizeof(AB_dtype)
     stride_n = OC * J.sizeof(C_dtype)
-    stride_gate_up = J.div(J.div(OC, wg_N), 2) * wg_N * stride_k
+    #stride_gate_up = J.div(J.div(OC, wg_N), 2) * wg_N * stride_k
 
     blk_n = J.blockIdx.x # split along OC
     blk_m = J.blockIdx.y
@@ -201,7 +201,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     WARPS_ROW = 2
     BLOCK_SIZE_ROW = wg_M
     BLOCK_SIZE_COL = wg_N
-    BLOCK_K = 128
+    BLOCK_K = 128 # in bytes
     HALF_BLOCK_SIZE_ROW = J.div(BLOCK_SIZE_ROW, 2)
     HALF_BLOCK_SIZE_COL = J.div(BLOCK_SIZE_COL, 2)
     MINI_BLOCK_M = J.div(HALF_BLOCK_SIZE_ROW, WARPS_ROW) # 64
@@ -240,8 +240,10 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
 
     bpreshuffle = True
 
-    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, HALF_BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, TOPK, num_tokens)
+    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, TOPK, num_tokens)
     vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*MINI_BLOCK_N)
+
+    vm_load_cnt_a = vm_load_cnt_a // 2
 
     mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
     mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")            # 2x[16,128]
@@ -260,13 +262,12 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     loop_cnt = J.div(K, wg_K)
     assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
 
-    a_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
+    a_moffset = J.gpr("su32", 0)
     if bpreshuffle:
         b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
 
     def step_k():
-        a_moffsets[0] += vm_offset_inc_a
-        a_moffsets[1] += vm_offset_inc_a
+        a_moffset[0] += vm_offset_inc_a
         if bpreshuffle:
             b_moffsets[0] += vm_offset_inc_b
             b_moffsets[1] += vm_offset_inc_b
@@ -274,7 +275,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     def vm_loadA(k, m):
         assert m in [0, 1]
         assert k in [0, 1]
-        return vm_load_a(ldsA[k,m], buff_a, a_moffsets[m])
+        return vm_load_a(ldsA[k,m], buff_a, a_moffset, half=m)
 
     def vm_loadB(k, m):
         assert m in [0, 1]
@@ -341,15 +342,15 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
 
         step_k()
 
-
     # scatter output to : [num_tokens, topk, dims]
-    vrows = J.gpr(WARPS_ROW, nrM, "vu32")
-    vweights = J.gpr(WARPS_ROW, nrM, "vf32")
-    for m0 in range(2):
+    vrows = J.gpr(2, nrM, "vu32")
+    vweights = J.gpr(2, nrM, "vf32")
+    for cm in range(2):
+        row = J.gpr("vu32", ((J.lane_id % 16) + (cm * HALF_BLOCK_SIZE_ROW) + (warp_m * MINI_BLOCK_M))  * J.sizeof_u32)
         for m in range(nrM):
-            row = (J.lane_id % 16) + (m0 * HALF_BLOCK_SIZE_ROW) + (warp_m * MINI_BLOCK_M) + m*16
-            J.ds_read_b32(vrows[m0, m], row * J.sizeof_u32 + lds_sorted_ids)
-            J.ds_read_b32(vweights[m0, m], row * J.sizeof_f32 + lds_sorted_weights)
+            J.ds_read_b32(vrows[cm, m], row + lds_sorted_ids)
+            J.ds_read_b32(vweights[cm, m], row + lds_sorted_weights)
+            row[0] += 16*J.sizeof_u32
 
     J.s_waitcnt(mod=f"lgkmcnt(0)")
 

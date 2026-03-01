@@ -26,6 +26,8 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
 )
 
+from pyhip import calc_diff
+
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 torch.manual_seed(0)
@@ -255,13 +257,14 @@ def test_fmoe(
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
+    """
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
         x, y = x.double(), y.double()
         denominator = (x * x + y * y).sum()
         sim = 2 * (x * y).sum() / denominator
         return 1 - sim
-
-    logits_diff = calc_diff(out2_ref, out2_ck)
+    """
+    logits_diff = calc_diff(out2_ref, out2_ck, diff_thr=1e-3)
     if logits_diff > 1e-3:
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
