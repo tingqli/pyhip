@@ -477,11 +477,15 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
                 row[0] += 16*J.sizeof_u32
         J.s_waitcnt(mod=f"lgkmcnt(0)")
 
-        vbf16 = J.gpr(4, "vbf16x2") # DWORDx4
-        col = J.lane_id // 16
-        swap_12_col = (col & 1) * 2 + (col >> 1)
-
-        vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + blk_n * (J.div(wg_N,2) * J.sizeof(C_dtype)))
+        if nrN == 1:
+            vbf16 = J.gpr(2, "vbf16x2") # DWORDx4
+            col = J.lane_id // 16
+            vaddr0 = J.gpr("vu32", col * J.sizeof_DW2 + warp_n * 16 * J.sizeof_bf16 + blk_n * (J.div(wg_N,2) * J.sizeof(C_dtype)))
+        else:
+            vbf16 = J.gpr(4, "vbf16x2") # DWORDx4
+            col = J.lane_id // 16
+            swap_12_col = (col & 1) * 2 + (col >> 1)
+            vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * nrN * 16 * J.sizeof_bf16 + blk_n * (J.div(wg_N,2) * J.sizeof(C_dtype)))
 
         for cm in range(2):
             igate = cm*2 + 0
@@ -496,14 +500,19 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
                     mfma_C[igate,m,n,1] = J.silu(mfma_C[igate,m,n,1]) * mfma_C[iup,m,n,1]
                     mfma_C[igate,m,n,2] = J.silu(mfma_C[igate,m,n,2]) * mfma_C[iup,m,n,2]
                     mfma_C[igate,m,n,3] = J.silu(mfma_C[igate,m,n,3]) * mfma_C[iup,m,n,3]
-                assert nrN == 2
-                J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[igate, m,0,0], mfma_C[igate, m,0,1])
-                J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[igate, m,0,2], mfma_C[igate, m,0,3])
-                J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[igate, m,1,0], mfma_C[igate, m,1,1])
-                J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[igate, m,1,2], mfma_C[igate, m,1,3])
-                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-                buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = 0*16*J.sizeof(C_dtype))
+                assert nrN in [1, 2], f"{nrN=}"
+                if nrN == 1:
+                    J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[igate, m,0,0], mfma_C[igate, m,0,1])
+                    J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[igate, m,0,2], mfma_C[igate, m,0,3])
+                    buff_c.store_dwordx2(vbf16[0:1], vaddr, 0, offset12 = 0*16*J.sizeof(C_dtype))
+                else:
+                    J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[igate, m,0,0], mfma_C[igate, m,0,1])
+                    J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[igate, m,0,2], mfma_C[igate, m,0,3])
+                    J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[igate, m,1,0], mfma_C[igate, m,1,1])
+                    J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[igate, m,1,2], mfma_C[igate, m,1,3])
+                    J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                    J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                    buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = 0*16*J.sizeof(C_dtype))
     else:
         # scatter output to : [num_tokens, topk, dims]
         vrows = J.gpr(2, nrM, "vu32")
@@ -518,11 +527,15 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
         J.s_waitcnt(mod=f"lgkmcnt(0)")
 
         stride_c = OC * J.sizeof(C_dtype)
-        vbf16 = J.gpr(4, "vbf16x2") # DWORDx4
-        col = J.lane_id // 16
-        swap_12_col = (col & 1) * 2 + (col >> 1)
-
-        vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + blk_n * (wg_N * J.sizeof(C_dtype)))
+        if nrN == 1:
+            vbf16 = J.gpr(2, "vbf16x2") # DWORDx4
+            col = J.lane_id // 16
+            vaddr0 = J.gpr("vu32", col * J.sizeof_DW2 + warp_n * 16 * J.sizeof_bf16 + blk_n * (wg_N * J.sizeof(C_dtype)))
+        else:
+            vbf16 = J.gpr(4, "vbf16x2") # DWORDx4
+            col = J.lane_id // 16
+            swap_12_col = (col & 1) * 2 + (col >> 1)
+            vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + blk_n * (wg_N * J.sizeof(C_dtype)))
 
         for cindex in range(4):
             cm = cindex // 2
@@ -532,31 +545,41 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
                             vaddr0 + \
                             (vrows[cm, m] & 0xFFFFFF) * (TOPK * stride_c) + \
                             (vrows[cm, m] >> 24) * (stride_c))
-
-                for n in range(0, nrN, 2):
+                assert nrN in [1, 2], f"{nrN=}"
+                if nrN == 1:
+                    n = 0
                     J.v_mul_f32(mfma_C[cindex,m,n,0], mfma_C[cindex,m,n,0], vweights[cm, m])
                     J.v_mul_f32(mfma_C[cindex,m,n,1], mfma_C[cindex,m,n,1], vweights[cm, m])
                     J.v_mul_f32(mfma_C[cindex,m,n,2], mfma_C[cindex,m,n,2], vweights[cm, m])
                     J.v_mul_f32(mfma_C[cindex,m,n,3], mfma_C[cindex,m,n,3], vweights[cm, m])
-
-                    J.v_mul_f32(mfma_C[cindex,m,n+1,0], mfma_C[cindex,m,n+1,0], vweights[cm, m])
-                    J.v_mul_f32(mfma_C[cindex,m,n+1,1], mfma_C[cindex,m,n+1,1], vweights[cm, m])
-                    J.v_mul_f32(mfma_C[cindex,m,n+1,2], mfma_C[cindex,m,n+1,2], vweights[cm, m])
-                    J.v_mul_f32(mfma_C[cindex,m,n+1,3], mfma_C[cindex,m,n+1,3], vweights[cm, m])
-
                     J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
                     J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
-                    J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
-                    J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
-                    #    a0    a1   a2   a3   | 01 23
-                    #    b0    b1   b2   b3   | 45 67
-                    #  v_permlane16_swap_b32(a, b)
-                    #    a0    b0   a2   b2   |
-                    #    a1    b1   a3   b3   |
-                    #
-                    # swap of row 1 & 2 are done by swapping lane-address 
-                    J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-                    J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-                    buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
+                    buff_c.store_dwordx2(vbf16[0:1], vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
+                else:
+                    for n in range(0, nrN, 2):
+                        J.v_mul_f32(mfma_C[cindex,m,n,0], mfma_C[cindex,m,n,0], vweights[cm, m])
+                        J.v_mul_f32(mfma_C[cindex,m,n,1], mfma_C[cindex,m,n,1], vweights[cm, m])
+                        J.v_mul_f32(mfma_C[cindex,m,n,2], mfma_C[cindex,m,n,2], vweights[cm, m])
+                        J.v_mul_f32(mfma_C[cindex,m,n,3], mfma_C[cindex,m,n,3], vweights[cm, m])
+
+                        J.v_mul_f32(mfma_C[cindex,m,n+1,0], mfma_C[cindex,m,n+1,0], vweights[cm, m])
+                        J.v_mul_f32(mfma_C[cindex,m,n+1,1], mfma_C[cindex,m,n+1,1], vweights[cm, m])
+                        J.v_mul_f32(mfma_C[cindex,m,n+1,2], mfma_C[cindex,m,n+1,2], vweights[cm, m])
+                        J.v_mul_f32(mfma_C[cindex,m,n+1,3], mfma_C[cindex,m,n+1,3], vweights[cm, m])
+
+                        J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
+                        J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
+                        J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
+                        J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
+                        #    a0    a1   a2   a3   | 01 23
+                        #    b0    b1   b2   b3   | 45 67
+                        #  v_permlane16_swap_b32(a, b)
+                        #    a0    b0   a2   b2   |
+                        #    a1    b1   a3   b3   |
+                        #
+                        # swap of row 1 & 2 are done by swapping lane-address 
+                        J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                        J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                        buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
 
     return

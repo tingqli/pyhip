@@ -209,11 +209,27 @@ def fused_moe_asmjit(
     assert isG1U1 == True
     assert isShuffled == True
 
-    # determine block_size_M
-    block_size_M = 256 # 
+    token_num, _ = hidden_states.shape
+
+    a2 = torch.empty(
+        (token_num, topk, inter_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    # determine block_size_M:
+    #   set to 128 if num_local_tokens is too small to use all available CUs
+    block_size_M = 256
     block_size_N = 256
+
+    estimated_oc_blocks = min(inter_dim*2, model_dim)//block_size_N
+    estimated_num_e_blocks = ((token_num * topk) // block_size_M) * E
+    if estimated_num_e_blocks * estimated_oc_blocks < torch.cuda.get_device_properties().multi_processor_count:
+        block_size_M = 128
+        block_size_N = 128
+        print(f"{block_size_M=} {block_size_N=}")
     assert block_size_M in [128,256]
-    assert block_size_N == 256
+    assert block_size_N in [128,256]
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = aiter.fused_moe.moe_sorting(
         topk_ids, topk_weight, global_E, model_dim,  dtype,
         block_size_M,
@@ -238,11 +254,6 @@ def fused_moe_asmjit(
         assert quant_type == aiter.QuantType.No
         act_quant_func = dummy_quant_func
 
-    token_num, _ = hidden_states.shape
-
-    if num_local_tokens is None:
-        num_local_tokens = torch.tensor(token_num, dtype=torch.int)
-
     a1, a1_scale = act_quant_func(
         hidden_states,
         scale=a1_scale,
@@ -264,18 +275,14 @@ def fused_moe_asmjit(
         device=device,
     )
     """
-    a2 = torch.empty(
-        (token_num, topk, inter_dim),
-        dtype=torch.bfloat16,
-        device=device,
-    )
+
     w1_scale = w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
 
     wg_M, wg_N = block_size_M, block_size_N
     assert inter_dim*2 % wg_N == 0
     num_oc_blocks = inter_dim*2//wg_N
     num_e_blocks = sorted_expert_ids.shape[0]
-    valid_e_blocks = num_valid_ids[0].item()//wg_M
+    #valid_e_blocks = num_valid_ids[0].item()//wg_M
     if 0:
         moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a1, a1_scale,
@@ -351,7 +358,7 @@ def fused_moe_asmjit(
                     a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
                     stage2_out.data_ptr(),
                     token_num) # num_local_tokens.data_ptr() ?
-        
+
         if 0:
             moe_out = stage2_out[:,0,:]
             for i in range(1, topk):
