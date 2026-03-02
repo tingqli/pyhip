@@ -110,8 +110,8 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
         else:
             tok_w = sorted_weights[i0:i1]
             cur_out = act[...].to(output.dtype) * tok_w[valid_mask, None]
-            #output[tok_ids[valid_mask], ...] += cur_out
-            output[tok_ids[valid_mask], tok_topk[valid_mask], :] = cur_out.to(output.dtype)
+            output[tok_ids[valid_mask], ...] += cur_out
+            #output[tok_ids[valid_mask], tok_topk[valid_mask], :] = cur_out.to(output.dtype)
 
 moe_gemm = moe_gemm_ref
 
@@ -210,8 +210,10 @@ def fused_moe_asmjit(
     assert isShuffled == True
 
     # determine block_size_M
-    block_size_M = 256
-
+    block_size_M = 256 # 
+    block_size_N = 256
+    assert block_size_M in [128,256]
+    assert block_size_N == 256
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = aiter.fused_moe.moe_sorting(
         topk_ids, topk_weight, global_E, model_dim,  dtype,
         block_size_M,
@@ -269,8 +271,9 @@ def fused_moe_asmjit(
     )
     w1_scale = w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
 
-    wg_M, wg_N = 256, 256
-    num_oc_blocks = inter_dim*2//256
+    wg_M, wg_N = block_size_M, block_size_N
+    assert inter_dim*2 % wg_N == 0
+    num_oc_blocks = inter_dim*2//wg_N
     num_e_blocks = sorted_expert_ids.shape[0]
     valid_e_blocks = num_valid_ids[0].item()//wg_M
     if 0:
@@ -282,7 +285,10 @@ def fused_moe_asmjit(
             AB_dtype = "bf16"
         else:
             assert 0
-        #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2*2, name="moe_gemm_8wave_gateup"):
+        #print(sorted_ids)
+        #print(sorted_expert_ids)
+        #print(f"{num_oc_blocks=} {num_valid_ids[0].item()=} {valid_e_blocks=} / {num_e_blocks=} {inter_dim=}")
+        #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name="moe_gemm_8wave_gateup"):
         if 1:
             moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
                     AB_dtype, wg_M, wg_N,
@@ -315,18 +321,19 @@ def fused_moe_asmjit(
         device=device,
     )
 
-    wg_M, wg_N = 256, 256
-    num_oc_blocks = model_dim//256
+    assert model_dim % wg_N == 0
+    num_oc_blocks = model_dim//wg_N
     num_e_blocks = sorted_expert_ids.shape[0]
 
     #with pyhip.torchPerf("./xxx"):
-    #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2, name="moe_gemm_8wave_down"):
-    if 1:
-        if 0:
-            moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
-                    a2, a2_scale,
-                    w2, w2_scale, stage2_out, is_gateup=False)
-        else:
+    if 0:
+        moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+                a2, a2_scale,
+                w2, w2_scale, moe_out, is_gateup=False)
+    else:
+        #print(f"{num_oc_blocks=} {valid_e_blocks=} {inter_dim=}")
+        #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2, name="moe_gemm_8wave_down"):
+        if 1:
             if q_dtype_a == torch.bfloat16:
                 AB_dtype = "bf16"
             else:
@@ -344,13 +351,18 @@ def fused_moe_asmjit(
                     a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
                     stage2_out.data_ptr(),
                     token_num) # num_local_tokens.data_ptr() ?
-
-        num_WG = 256 * 2
-        num_tokens_wg = token_num // num_WG
-        num_extra_tokens = token_num % num_WG
-        moe_gemm_final_reduce_bf16([num_WG], [64], topk, model_dim,
-                                stage2_out.data_ptr(),
-                                moe_out.data_ptr(),
-                                num_tokens_wg, num_extra_tokens, token_num)
+        
+        if 0:
+            moe_out = stage2_out[:,0,:]
+            for i in range(1, topk):
+                moe_out += stage2_out[:,i,:]
+        else:
+            num_WG = 256 * 2
+            num_tokens_wg = token_num // num_WG
+            num_extra_tokens = token_num % num_WG
+            moe_gemm_final_reduce_bf16([num_WG], [64], topk, model_dim,
+                                    stage2_out.data_ptr(),
+                                    moe_out.data_ptr(),
+                                    num_tokens_wg, num_extra_tokens, token_num)
 
     return moe_out

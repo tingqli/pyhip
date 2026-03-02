@@ -247,7 +247,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     if gate_up:
         J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
     else:
-        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
+        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
         J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
 
     vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, LOADER_TOPK, num_tokens)
@@ -272,14 +272,14 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
         pass
 
     loop_cnt = J.div(K, wg_K)
-    assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
+    #assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
 
     a_moffset = J.gpr("su32", 0)
     if bpreshuffle:
         if gate_up:
             b_moffsets = J.gpr(2, "su32", 0, 0)
         else:
-            b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
+            b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_COL)
 
     def step_k():
         a_moffset[0] += vm_offset_inc_a
@@ -410,10 +410,9 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
 
         mfma_tail()
         J.s_waitcnt(mod="vmcnt(0)")
-
+        #J.s_waitcnt(mod="lgkmcnt(0)")
         with J.If(warp_m[0] == 0):
             J.s_barrier()
-
     else:
         mfma_C[...] = 0
         for k in range(loop_cnt):
@@ -461,6 +460,9 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             J.emit(mfma(3))
 
             step_k()
+
+        J.s_waitcnt(mod="lgkmcnt(0)")
+        J.s_waitcnt(mod="vmcnt(0)")
 
     if gate_up:
         # silu(c[0])*c[1]   64*32
@@ -556,4 +558,5 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
                     J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
                     J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
                     buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
+
     return
