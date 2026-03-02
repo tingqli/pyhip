@@ -222,12 +222,28 @@ def fused_moe_asmjit(
     block_size_M = 256
     block_size_N = 256
 
-    estimated_oc_blocks = min(inter_dim*2, model_dim)//block_size_N
-    estimated_num_e_blocks = ((token_num * topk) // block_size_M) * E
-    if estimated_num_e_blocks * estimated_oc_blocks < torch.cuda.get_device_properties().multi_processor_count:
-        block_size_M = 128
-        block_size_N = 128
-        print(f"{block_size_M=} {block_size_N=}")
+    while True:
+        estimated_oc_blocks = min(inter_dim*2, model_dim)//block_size_N
+        estimated_num_e_blocks = ((token_num * topk) // block_size_M) * E
+        estimated_work_groups = estimated_num_e_blocks * estimated_oc_blocks
+
+        cu_usage = estimated_work_groups / torch.cuda.get_device_properties().multi_processor_count
+        if cu_usage != int(cu_usage):
+            wasted_usage = (1 - (cu_usage - int(cu_usage))) / cu_usage
+        else:
+            wasted_usage = 0
+        #print(f"{estimated_work_groups=} {torch.cuda.get_device_properties().multi_processor_count=} {cu_usage=} {wasted_usage=}")
+
+        if cu_usage < 1 or wasted_usage > 0.05:
+            if block_size_M > 128:
+                block_size_M = 128
+            else:
+                block_size_N = 128
+                break
+        else:
+            break
+    #print(f"{block_size_M=} {block_size_N=}")
+    
     assert block_size_M in [128,256]
     assert block_size_N in [128,256]
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = aiter.fused_moe.moe_sorting(
