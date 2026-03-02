@@ -133,7 +133,7 @@ def moe_2stage_splitk(J:JIT,
                 # not shuffled
                 voffset_b[0] = (BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x + lane_mod_16) * stride_B + lane_div_16 * 16 + J.warp_id * get_k_bytes(K // 4)
         else:
-            # shffled
+            # shffled [E, N/16, K/32, 2k, 16n, 16k]
             voffset_b[0] = BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x * stride_B + J.threadIdx.x * 16
         voffset_b[B_horz // 2] = voffset_b[0] + (N // 2) * get_k_bytes(K)
         for m in range(1, B_horz // 2):
@@ -223,21 +223,25 @@ def moe_2stage_splitk(J:JIT,
     #             voffset_scale[m] = voffset_scale[0] + 16 * sizeof_f32 * m
 
     elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+        assert K %(num_split_k*128) == 0 ,f' K %(num_split_k*128) must be 0'
         # the scale layout is [E, N//128, K//128]
         k_scale_stride = K // 128 * sizeof_f32
+        # would need BLOCK_TILE_SIZE_N//128 *2 scale offset register for 1st stage. 
         voffset_scale = J.gpr(2, 'vu32')
-        # N_wg scale offset
-        p_w_scale[:] += (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * J.blockIdx.x * k_scale_stride //128
+        # N_wg scale offset on expert wg and N wg.
         if with_silu:
-            #[E, INTER_SIZE_TP*2, HIDDEN_SIZE//128]
-            # Expert wg offset + 64 lane offset + warp offset
-            voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride //128)) + J.warp_id * (k_scale_stride // 4)
-            # N tile offset within wave offset
-            voffset_scale[1] = voffset_scale[0] + (N // 2 * k_scale_stride // 128)
+            p_w_scale[:] +=  BLOCK_TILE_SIZE_N_HALF* J.blockIdx.x // 128 * k_scale_stride + s_e_id * (N//128 * k_scale_stride)
         else:
-            # Expert wg offset + 64 lane offset 
-            voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride //128)) 
-            voffset_scale[1] = voffset_scale[0]
+            p_w_scale[:] +=  BLOCK_TILE_SIZE_N * J.blockIdx.x //128 * k_scale_stride + s_e_id * (N//128 * k_scale_stride )
+        if with_silu:
+            #[E, INTER_SIZE_TP*2//128, HIDDEN_SIZE//128]
+            voffset_scale[0] = J.threadIdx.x //128 * sizeof_f32
+            # N tile offset within wave offset
+            voffset_scale[1] = voffset_scale[0] + (N//2//128 * k_scale_stride )
+        else:
+            #  64 lane offset 
+            voffset_scale[0] = 0
+            voffset_scale[1] = 0
     
     p_weight[:] = p_weight[:] + s_e_id * (N * get_k_bytes(K))
     buff_b = J.Buffer(p_weight, N * get_k_bytes(K))
@@ -444,8 +448,9 @@ def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids):
 # weigth shape is [E, N, K]
 def weight_per_128x128_quant(weight, quant_dtype):
     from aiter.ops.quant import pertoken_quant
-
     E, dim1, dim2 = weight.shape
+    assert dim1 % 128 == 0 and dim2 % 128 == 0, f"weight shape {weight.shape} is not aligned to 128 for per 128x128 quantization"
+
     weight_blocks = weight.view(
         E, dim1 // 128, 128, dim2 // 128, 128
     )  # [E, num_blocks_dim1, 128, num_blocks_dim2, 128]
@@ -471,12 +476,6 @@ def weight_per_128x128_quant(weight, quant_dtype):
     return weight_qt, weight_scale
         
 def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8):
-    fake_scale = False
-    if 'FAKE_SCALE' in os.environ:
-        fake_scale = True
-        INTMAX=3
-        INTMIN=-2
-        DIVISOR=100
     INTER_SIZE_TP = INTER_SIZE // TP
     BUF_COPY = 32
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
@@ -534,44 +533,41 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     #     w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
     #     w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
     elif weight_type == torch.float8_e4m3fn or weight_type == torch.float8_e4m3fnuz: 
-        assert  HIDDEN_SIZE//(128) and INTER_SIZE//(128*TP), "HIDDEN_SIZE and INTER_SIZE//TP must be multiples of 128  for per block quantization"
+        assert  HIDDEN_SIZE//(128) and INTER_SIZE_TP//128, "HIDDEN_SIZE and INTER_SIZE/TP must be multiples of 128  for per block quantization"
         import aiter
-        torch_quant = aiter.get_torch_quant(aiter.QuantType.per_Token)
-        if 0:
-            w_ = torch.randn([E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // 128, 128], dtype=torch.bfloat16)
+        if 1:
+            w_ = torch.randn([E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // 128, 128], dtype=torch.bfloat16) / 2.0
         else:
-            w_ = torch.randint(-3, 5,[E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // 128, 128]).to(dtype=torch.bfloat16) / 100.0
-            # ensure every 3 adjacent rows(each row is QUAN_BLOCK_SZ) would have different 3 quantization scales.
-            w_[1:-1:3, :] *= 2
-            w_[2:-1:3, :] *= 3
+            w_ = torch.randint(-3, 6,[E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // 128, 128]).to(dtype=torch.bfloat16) / 100.0
+            # ensure adjacent rows(each row is QUAN_BLOCK_SZ) would have different 3 quantization scales.
+            w_[0:-1:5, :] *= 2
+            w_[1:-1:3, :] /= 3
             #random change data in QUAN_BLOCK_SZ dimension.
             w_[:, 0:-1:3] *= 2
         w1_qt, w1_qt_scale = weight_per_128x128_quant(w_.view(E, INTER_SIZE_TP * 2, HIDDEN_SIZE), quant_dtype=weight_type)
-        # w1_qt, w1_qt_scale = torch_quant(w_, quant_dtype=weight_type)
+        # print(w1_qt_scale)
 
         print(f'==========={w1_qt.shape=}, {w1_qt_scale.shape=}')
         w1_ref = (w1_qt.to(dtype=torch.bfloat16).view(E, INTER_SIZE_TP * 2//128, 128, HIDDEN_SIZE//128,  128) * w1_qt_scale.view((E, INTER_SIZE_TP * 2//128, 1, HIDDEN_SIZE//128,  1))).to(dtype=torch.bfloat16)
+        #w1_ref = w_
         w1_ref = w1_ref.view(E, INTER_SIZE_TP * 2, HIDDEN_SIZE)
         w1_qt = w1_qt.view(E, INTER_SIZE_TP * 2, HIDDEN_SIZE)
         w1_qt_scale = w1_qt_scale.view(E, INTER_SIZE_TP * 2//128, HIDDEN_SIZE//128)
         w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
         w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
-        if 0:
-            w_ = torch.randn([E*HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
-        else:
-            w_ = torch.randint(-3, 5,[E*HIDDEN_SIZE, INTER_SIZE_TP]).to(dtype=torch.bfloat16) / 100.0
-            w_[:, 0:-1:3] += 0.04
+        w_ = torch.randn([E*HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16) / 2.0
+
 
         w2_qt, w2_qt_scale = weight_per_128x128_quant(w_.view(E, HIDDEN_SIZE, INTER_SIZE_TP), quant_dtype=weight_type)
 
-        w2_qt = w2_qt.view(E, HIDDEN_SIZE, INTER_SIZE_TP)
-        w2_qt_scale = w2_qt_scale.view(E, HIDDEN_SIZE//128, INTER_SIZE_TP//128)
+
 
         print(f'==========={w2_qt.shape=}, {w2_qt_scale.shape=}')
         
         w2_ref = (w2_qt.to(dtype=torch.bfloat16).view(E, HIDDEN_SIZE//128, 128, INTER_SIZE_TP//128,  128) * w2_qt_scale.view(E, HIDDEN_SIZE//128, 1, INTER_SIZE_TP//128,  1)).to(dtype=torch.bfloat16)
         w2_ref = w2_ref.view(E, HIDDEN_SIZE, INTER_SIZE_TP)
-
+        w2_qt = w2_qt.view(E, HIDDEN_SIZE, INTER_SIZE_TP)
+        w2_qt_scale = w2_qt_scale.view(E, HIDDEN_SIZE//128, INTER_SIZE_TP//128)
         w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
         w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
 
@@ -757,10 +753,10 @@ def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP
 if __name__ == '__main__':
     TILE_M = 16
     TILE_N = 128
-    HIDDEN_SIZE = 6144
-    INTER_SIZE = 2560
-    TP = 4
+    HIDDEN_SIZE = 4096
+    INTER_SIZE = 1536
+    TP = 1
     test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    # batch = [16]
+    batch = [16]
     batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)

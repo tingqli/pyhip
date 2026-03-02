@@ -3356,14 +3356,14 @@ r'''
             for wn in range(wave_cnt_N):
                 for n in range(wave_mfma_N):
                     i = wn * wave_mfma_N + n
-                    print(f"{str_mfma(i,k,"|")}", end="")
+                    print(f"{str_mfma(i,k,'|')}", end="")
             print()
 
         for wm in range(wave_cnt_M):
             for m in range(wave_mfma_M):
                 for k in range(n_mfma_K):
                     i = wm*wave_mfma_M + m
-                    print(f"{str_mfma(i,k,"|")}", end="")
+                    print(f"{str_mfma(i,k,'|')}", end="")
 
                 for wn in range(wave_cnt_N):
                     for n in range(wave_mfma_N):
