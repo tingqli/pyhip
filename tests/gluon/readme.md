@@ -9,7 +9,7 @@ pip install .
 # debug
 dump asm code:
 ```
-#MLIR_ENABLE_DUMP=1 MLIR_DUMP_PATH=.
+#MLIR_ENABLE_DUMP=1 MLIR_DUMP_PATH=. TRITON_DISABLE_LINE_INFO=1
 AMDGCN_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 python moe.py > a.asm
 ```
 

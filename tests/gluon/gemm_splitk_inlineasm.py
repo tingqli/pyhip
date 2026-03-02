@@ -76,7 +76,8 @@ def gemm_splitk(
                                     warps_per_cta=[num_warps, 1],
                                     order=[0, 1])
     else:
-        reg_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [1024, 0]]
+        # weight is bitcasted to bf16 for inline asm
+        reg_bases = [[1, 0], [2, 0], [4, 0], [512, 0]]
         n = BLOCK_TILE_SIZE_N // 16
         bit_pos = 1
         while n // 2:
@@ -85,10 +86,10 @@ def gemm_splitk(
             n = n // 2
         mem_b_layout: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=reg_bases,
-            lane_bases=[[16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [512, 0]],
-            warp_bases=[[2048, 0], [4096, 0]] if num_warps > 1 else [],
+            lane_bases=[[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0]],
+            warp_bases=[[1024, 0], [2048, 0]] if num_warps > 1 else [],
             block_bases=[],
-            shape=[BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16]
+            shape=[BLOCK_TILE_SIZE_K // 2 * 16, BLOCK_TILE_SIZE_N // 16]
         )
 
     if num_warps == 1:
@@ -185,9 +186,9 @@ def gemm_splitk(
         mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_a_layout))) % M
         mem_a_offsets = mem_a_offset_m[:, None] * K + \
                         gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
-        mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * (K * 16) + \
-                        gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
         if weight_dtype == torch.bfloat16:
+            mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * (K * 16) + \
+                            gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
             c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
                                                         instr_shape=[16, 16, 32],
                                                         transposed=True,
@@ -196,6 +197,8 @@ def gemm_splitk(
             a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
             b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
         else:
+            mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K // 2 + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * (K // 2 * 16) + \
+                            gl.arange(0, BLOCK_TILE_SIZE_K // 2 * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
             c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
                                                         instr_shape=[16, 16, 32],
                                                         transposed=True,
@@ -216,7 +219,10 @@ def gemm_splitk(
         for k_start in range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
             _amd_iglp_sched_barrier(0)
             a_offsets = mem_a_offsets + k_start + BLOCK_TILE_SIZE_K
-            b_offsets = mem_b_offsets + k_start * 16 + BLOCK_TILE_SIZE_K * 16
+            if weight_dtype == torch.float8_e4m3fn:
+                b_offsets = mem_b_offsets + k_start * 16 // 2 + BLOCK_TILE_SIZE_K * 16 // 2
+            else:
+                b_offsets = mem_b_offsets + k_start * 16 + BLOCK_TILE_SIZE_K * 16
             next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
             next_b = gl.amd.cdna3.buffer_load(p_weight, b_offsets)
             if weight_dtype == torch.float8_e4m3fn:
@@ -230,27 +236,28 @@ def gemm_splitk(
                 a1 = a1.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
                 a0_fma = gl.convert_layout(a0, a_fma_layout, assert_trivial=True)
                 a1_fma = gl.convert_layout(a1, a_fma_layout, assert_trivial=True)
-                #gl.static_print('b type', b.dtype, b.shape)
-                # (b,) = gl.inline_asm_elementwise(asm='''
-                #                           v_cvt_scalef32_pk_bf16_fp8 $0, %1, 1.0;
-                #                           v_cvt_scalef32_pk_bf16_fp8 $1, $1, 1.0 op_sel:[1,0,0];
-                #                           ''',
-                #                           constraints='=v,=v,r',
-                #                           args=[b],
-                #                           dtype=[gl.bfloat16],
-                #                           is_pure=False,
-                #                           pack=4)
-                # gl.static_print('b type', b.dtype, b.shape)
-                b = b.to(gl.bfloat16)
+                (bx, ) = tl.inline_asm_elementwise(asm='''v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2''',
+                                          constraints='=v,r,r,r',
+                                          args=[b, weight_scale],
+                                          dtype=[gl.bfloat16],
+                                          is_pure=True,
+                                          pack=2)
+                (by,) = tl.inline_asm_elementwise(asm='''v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2 op_sel:[1,0,0]''',
+                                          constraints='=v,r,r,r',
+                                          args=[b, weight_scale],
+                                          dtype=[gl.bfloat16],
+                                          is_pure=True,
+                                          pack=2)
+                # shape: [BLOCK_TILE_SIZE_K * 16 // 2, BLOCK_TILE_SIZE_N // 16, 2]
+                b = gl.join(bx, by)
+                b = b.reshape(BLOCK_TILE_SIZE_K * 16 // 2 // 2, 2, BLOCK_TILE_SIZE_N // 16, 2).permute(0, 3, 1, 2).reshape(BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16)
                 b0, b1 = gl.split(b.reshape(num_warps, 2, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 4, 5, 1))
                 b0 = b0.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N)
                 b1 = b1.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N)
                 b0_fma = gl.convert_layout(b0, b_fma_layout, assert_trivial=True)
                 b1_fma = gl.convert_layout(b1, b_fma_layout, assert_trivial=True)
-                local_acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
-                local_acc = gl.amd.cdna4.mfma(a0_fma, b0_fma, local_acc)
-                local_acc = gl.amd.cdna4.mfma(a1_fma, b1_fma, local_acc)
-                acc += local_acc * weight_scale
+                acc = gl.amd.cdna4.mfma(a0_fma, b0_fma, acc)
+                acc = gl.amd.cdna4.mfma(a1_fma, b1_fma, acc)
             else:
                 a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
                 a_fma = gl.convert_layout(a, a_fma_layout, assert_trivial=True)
@@ -272,16 +279,42 @@ def gemm_splitk(
             a1 = a1.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
             a0_fma = gl.convert_layout(a0, a_fma_layout, assert_trivial=True)
             a1_fma = gl.convert_layout(a1, a_fma_layout, assert_trivial=True)
-            b = b.to(gl.bfloat16)
+            # inline asm limitation:
+            #   1, not support 8bit dtype: https://github.com/llvm/llvm-project/blob/c9a098b314ecb206f439aa70a893c1620fb2e96b/llvm/test/CodeGen/AMDGPU/inlineasm-illegal-type.ll#L9, WA: load 8bit as 16bit+
+            #   2, the output regs may be overlapped of input, it will be a problem if there are multiple lines of assembly in one call for inline_asm_elementwise:
+            #        v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2
+            #        v_cvt_scalef32_pk_bf16_fp8 $3, $1, $2 op_sel:[1,0,0]
+            #      the compiler may assign $0=$1=v0, it will cause the $1 to be overwrited, WA: put the two lines of assembly in two calls of inline_asm_elementwise
+            #   3, there is no reinterpret op to do the bitcast, no WA yet
+            #   4, there is no slice op for tensor, WA: use split/join to simulate
+            # tips:
+            #   1, the input/output #reg is computed by: ceil(pack*sizeof(dtype)/32)
+            #   2, prefer `is_pure=True`
+            (bx, ) = tl.inline_asm_elementwise(asm='''
+                                        v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2
+                                        ''',
+                                        constraints='=v,r,r,r',
+                                        args=[b, weight_scale],
+                                        dtype=[gl.bfloat16],
+                                        is_pure=True,
+                                        pack=2)
+            (by,) = tl.inline_asm_elementwise(asm='''
+                                        v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2 op_sel:[1,0,0]
+                                        ''',
+                                        constraints='=v,r,r,r',
+                                        args=[b, weight_scale],
+                                        dtype=[gl.bfloat16],
+                                        is_pure=True,
+                                        pack=2)
+            b = gl.join(bx, by)
+            b = b.reshape(BLOCK_TILE_SIZE_K * 16 // 2 // 2, 2, BLOCK_TILE_SIZE_N // 16, 2).permute(0, 3, 1, 2).reshape(BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16)
             b0, b1 = gl.split(b.reshape(num_warps, 2, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 4, 5, 1))
             b0 = b0.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N)
             b1 = b1.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N)
             b0_fma = gl.convert_layout(b0, b_fma_layout, assert_trivial=True)
             b1_fma = gl.convert_layout(b1, b_fma_layout, assert_trivial=True)
-            local_acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
-            local_acc = gl.amd.cdna4.mfma(a0_fma, b0_fma, local_acc)
-            local_acc = gl.amd.cdna4.mfma(a1_fma, b1_fma, local_acc)
-            acc += local_acc * weight_scale
+            acc = gl.amd.cdna4.mfma(a0_fma, b0_fma, acc)
+            acc = gl.amd.cdna4.mfma(a1_fma, b1_fma, acc)
         else:
             a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
             a_fma = gl.convert_layout(a, a_fma_layout, assert_trivial=True)
@@ -374,8 +407,9 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     elif weight_type == torch.float8_e4m3fn:
         w_qt = torch.randint(-2, 3, [N, K], dtype=torch.float32).to(weight_type)
         w_qt_scale = torch.randint(-2, 3, [N // 128, K // 128], dtype=torch.float32)
-        # # TODO
-        # w_qt_scale[:] = 1
+        # for exponent only
+        tmp = w_qt_scale.to('cpu').view(torch.uint32) & 0x7f800000
+        w_qt_scale = tmp.view(torch.float32).to('cuda')
         w_f32 = w_qt.to(dtype=torch.float32).reshape(N // 128, 128, K // 128, 128)
         w_scale_f32 = w_qt_scale.reshape(N // 128, 1, K // 128, 1)
         w_ref = (w_f32 * w_scale_f32).reshape(N, K).to(dtype=torch.bfloat16)
@@ -393,7 +427,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         ele_size = 1
     mem_size = M * K * 2 + N * K * ele_size
 
-    def run(A, weight, weight_scale):
+    def run(A, weight:torch.Tensor, weight_scale):
         M, K = A.shape
         N = w_ref.shape[0]
         gemm_out = torch.empty([M, N], dtype=A.dtype, device=A.device)
@@ -402,9 +436,10 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             BLOCK_TILE_SIZE_M = TILE_M
             BLOCK_TILE_SIZE_N = TILE_N
 
+            weight_t = weight.view(torch.bfloat16).T if weight_type != torch.bfloat16 else weight.T
             x = gemm_splitk(weight_type, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps)[(div_up(N, BLOCK_TILE_SIZE_N) * div_up(M, BLOCK_TILE_SIZE_M),)](
                 A,                # bf16 [M, K]
-                weight.T,         # bf16 [K/8 * 16 * 8, N/16]
+                weight_t,         # bf16 [K/8 * 16 * 8, N/16]
                 gemm_out,         # bf16 [M, N]
                 weight_scale,
                 M,
