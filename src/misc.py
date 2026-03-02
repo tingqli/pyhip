@@ -37,7 +37,8 @@ class cudaPerf(object):
         return self.rw_bytes*1e-6/avg_dt_ms
 
     def show(self, flops = None, rw_bytes = None):
-        msg = f"{self.name} dt = {self.dt_ms*1e3:.3f} us"
+        if flops is None: flops = 0
+        msg = f"{self.name} : {flops*1e-6:.0f} MFLOP / {self.dt_ms*1e3:.3f} us "
         if flops and flops > 0:
             msg += f"  {flops*1e-9/self.dt_ms:.1f} TFLOPS "
         if rw_bytes and rw_bytes > 0:

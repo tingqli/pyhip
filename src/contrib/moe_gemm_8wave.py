@@ -120,6 +120,7 @@ num_warps 这么多个warp，协同发起加载指令
 每次调用 ds_read 都会从
 
 loader函数如何单独调试正确性？可以从实现最简单的moe_gemm开始 (bf16类型的down_proj)
+优化是循序渐进的过程，逐渐寻找和逼近到最佳性能设计，经常需要尝试各种不同的手段
 
 """
 
@@ -147,7 +148,6 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     wg_K = J.div(128, J.sizeof(AB_dtype))
 
     stride_k = IC * J.sizeof(AB_dtype)
-    stride_n = OC * J.sizeof(C_dtype)
     #stride_gate_up = J.div(J.div(OC, wg_N), 2) * wg_N * stride_k
 
     blk_n = J.blockIdx.x # split along OC
@@ -163,38 +163,12 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     with J.If(blk_m[0] * wg_M >= max_id[0]):
         J.s_endpgm()
     
-    #if gate_up:
-    #    output[:] += blk_n * (wg_N//2 * J.sizeof(C_dtype))
-    #else:
-    #    output[:] += blk_n * (wg_N * J.sizeof(C_dtype))
-
-
     sorted_ids[:] += blk_m * (wg_M * J.sizeof_u32)
     sorted_weights[:] += blk_m * (wg_M * J.sizeof_u32)
 
     #i_scale[:] += blk_m * (J.div(wg_M,32) * stride_scale32x256)
     #w_scale[:] += expert_id * (J.div(OC,32) * stride_scale32x256)
     #i_scale[:] += (J.warp_id[0] // 2) * (J.div(wg_M//2, 32) * stride_scale32x256)
-
-    if gate_up:
-        """
-        weight[:] += expert_id * (OC * stride_k) + blk_n * (wg_N//2 * stride_k)
-        w_scale[:] += blk_n * (J.div(wg_N//2, 32) * stride_scale32x256) + (J.warp_id[0] % 2) * (J.div(wg_N//4, 32) * stride_scale32x256)
-        # gate-scale buff + up-scale buff
-        sbuff_b = [None, None]
-        sbuff_b[0] = J.Buffer(w_scale, J.div(wg_N//4, 32) * stride_scale32x256)
-        w_scale[:] += J.div(OC//2, 32) * stride_scale32x256
-        sbuff_b[1] = J.Buffer(w_scale, J.div(wg_N//4, 32) * stride_scale32x256)
-        """
-        assert 0
-        buff_a = J.Buffer(input, num_tokens * stride_k)
-    else:
-        weight[:] += expert_id * (OC * stride_k) + blk_n * (wg_N * stride_k)
-        # w_scale[:] += blk_n * (J.div(wg_N, 32) * stride_scale32x256) + (J.warp_id[0] % 2) * (J.div(wg_N//2, 32) * stride_scale32x256)
-        # sbuff_b = J.Buffer(w_scale, J.div(wg_N//2, 32) * stride_scale32x256)
-        buff_a = J.Buffer(input, num_tokens * TOPK * stride_k)
-        buff_b = J.Buffer(weight, wg_N * stride_k)
-        buff_c = J.Buffer(output, num_tokens * TOPK * stride_n)
 
     # basic configuration for 8-wave
     WARPS_COL = 4
@@ -206,6 +180,41 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     HALF_BLOCK_SIZE_COL = J.div(BLOCK_SIZE_COL, 2)
     MINI_BLOCK_M = J.div(HALF_BLOCK_SIZE_ROW, WARPS_ROW) # 64
     MINI_BLOCK_N = J.div(HALF_BLOCK_SIZE_COL, WARPS_COL) # 32
+
+    bpreshuffle = True
+
+    if gate_up:
+        """
+        weight[:] += expert_id * (OC * stride_k) + blk_n * (wg_N//2 * stride_k)
+        w_scale[:] += blk_n * (J.div(wg_N//2, 32) * stride_scale32x256) + (J.warp_id[0] % 2) * (J.div(wg_N//4, 32) * stride_scale32x256)
+        # gate-scale buff + up-scale buff
+        sbuff_b = [None, None]
+        sbuff_b[0] = J.Buffer(w_scale, J.div(wg_N//4, 32) * stride_scale32x256)
+        w_scale[:] += J.div(OC//2, 32) * stride_scale32x256
+        sbuff_b[1] = J.Buffer(w_scale, J.div(wg_N//4, 32) * stride_scale32x256)
+        """
+        LOADER_TOPK = 0
+        # B matrix needs to be interleaved by HALF_BLOCK_SIZE_COL
+        # vm_load_b(k, m=0) loads from gate-weight
+        # vm_load_b(k, m=1) loads from up-weight
+        buff_a = J.Buffer(input, num_tokens * stride_k)
+        buff_b = {}
+        weight[:] += expert_id * (OC * stride_k) + blk_n * (J.div(wg_N, 2) * stride_k) # gate-weight
+        buff_b[0] = J.Buffer(weight, J.div(wg_N, 2) * stride_k)
+        weight[:] += J.div(OC, 2) * stride_k # up-weights
+        buff_b[1] = J.Buffer(weight, J.div(wg_N, 2) * stride_k)
+        stride_n = J.div(OC,2) * J.sizeof(C_dtype)
+        buff_c = J.Buffer(output, num_tokens * TOPK * stride_n)
+        assert bpreshuffle
+    else:
+        LOADER_TOPK = TOPK
+        weight[:] += expert_id * (OC * stride_k) + blk_n * (wg_N * stride_k)
+        # w_scale[:] += blk_n * (J.div(wg_N, 32) * stride_scale32x256) + (J.warp_id[0] % 2) * (J.div(wg_N//2, 32) * stride_scale32x256)
+        # sbuff_b = J.Buffer(w_scale, J.div(wg_N//2, 32) * stride_scale32x256)
+        buff_a = J.Buffer(input, num_tokens * TOPK * stride_k)
+        buff_b = J.Buffer(weight, wg_N * stride_k)
+        stride_n = OC * J.sizeof(C_dtype)
+        buff_c = J.Buffer(output, num_tokens * TOPK * stride_n)
 
     lds_base = J.alloc_lds(HALF_BLOCK_SIZE_ROW * BLOCK_K * 4 + HALF_BLOCK_SIZE_COL * BLOCK_K * 4)
     ldsA = {}
@@ -235,12 +244,13 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     # prefetch sorted ids into LDS
     lds_sorted_ids = J.alloc_lds(wg_M * J.sizeof_u32)
     lds_sorted_weights = J.alloc_lds(wg_M * J.sizeof_DW)
-    J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
-    J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
+    if gate_up:
+        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
+    else:
+        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
+        J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
 
-    bpreshuffle = True
-
-    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, TOPK, num_tokens)
+    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, LOADER_TOPK, num_tokens)
     vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*MINI_BLOCK_N)
 
     vm_load_cnt_a = vm_load_cnt_a // 2
@@ -266,7 +276,10 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
 
     a_moffset = J.gpr("su32", 0)
     if bpreshuffle:
-        b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
+        if gate_up:
+            b_moffsets = J.gpr(2, "su32", 0, 0)
+        else:
+            b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
 
     def step_k():
         a_moffset[0] += vm_offset_inc_a
@@ -283,9 +296,12 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
         assert m in [0, 1]
         assert k in [0, 1]
         if bpreshuffle:
-            return vm_load_b(ldsB[k,m], buff_b, b_moffsets[m])
+            if gate_up:
+                return vm_load_b(ldsB[k,m], buff_b[m], b_moffsets[m])
+            else:
+                return vm_load_b(ldsB[k,m], buff_b, b_moffsets[m])
         else:
-            return vm_load_b(ldsB[k,m], buff_b, a_moffsets[m])
+            return vm_load_b(ldsB[k,m], buff_b, a_moffset)
 
     def ds_readA(k, m):
         for i in range(nrM):
@@ -447,7 +463,45 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             step_k()
 
     if gate_up:
-        assert 0
+        # silu(c[0])*c[1]   64*32
+        # silu(c[2])*c[3]   64*32
+        # convert to bfloat16 and
+        # scatter output to : [num_tokens, topk, dims]
+        vrows = J.gpr(2, nrM, "vu32")
+        for cm in range(2):
+            row = J.gpr("vu32", ((J.lane_id % 16) + (cm * HALF_BLOCK_SIZE_ROW) + (warp_m * MINI_BLOCK_M))  * J.sizeof_u32)
+            for m in range(nrM):
+                J.ds_read_b32(vrows[cm, m], row + lds_sorted_ids)
+                row[0] += 16*J.sizeof_u32
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        vbf16 = J.gpr(4, "vbf16x2") # DWORDx4
+        col = J.lane_id // 16
+        swap_12_col = (col & 1) * 2 + (col >> 1)
+
+        vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + blk_n * (J.div(wg_N,2) * J.sizeof(C_dtype)))
+
+        for cm in range(2):
+            igate = cm*2 + 0
+            iup = cm*2 + 1
+            for m in range(nrM):
+                vaddr = J.gpr("vu32",
+                            vaddr0 + \
+                            (vrows[cm, m] & 0xFFFFFF) * (TOPK * stride_n) + \
+                            (vrows[cm, m] >> 24) * (stride_n))
+                for n in range(nrN):
+                    mfma_C[igate,m,n,0] = J.silu(mfma_C[igate,m,n,0]) * mfma_C[iup,m,n,0]
+                    mfma_C[igate,m,n,1] = J.silu(mfma_C[igate,m,n,1]) * mfma_C[iup,m,n,1]
+                    mfma_C[igate,m,n,2] = J.silu(mfma_C[igate,m,n,2]) * mfma_C[iup,m,n,2]
+                    mfma_C[igate,m,n,3] = J.silu(mfma_C[igate,m,n,3]) * mfma_C[iup,m,n,3]
+                assert nrN == 2
+                J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[igate, m,0,0], mfma_C[igate, m,0,1])
+                J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[igate, m,0,2], mfma_C[igate, m,0,3])
+                J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[igate, m,1,0], mfma_C[igate, m,1,1])
+                J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[igate, m,1,2], mfma_C[igate, m,1,3])
+                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = 0*16*J.sizeof(C_dtype))
     else:
         # scatter output to : [num_tokens, topk, dims]
         vrows = J.gpr(2, nrM, "vu32")
