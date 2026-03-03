@@ -181,8 +181,8 @@ def fused_moe_asmjit(
         print(f" {isG1U1=} {isShuffled=} ")
 
         print("\thidden_states:", list(hidden_states.shape), hidden_states.dtype)   # hidden_states: [M, model_dim] torch.bfloat16
-        print("\tw1:", list(w1.shape), w1.dtype)                                    # w1           : [E, inter_dim*2, model_dim]  (isG1U1 is True)
-        print("\tw2:", list(w2.shape), w2.dtype)                                    # w2           : [E, model_dim, inter_dim]
+        print("\tw1:", list(w1.shape), w1.dtype)                                    # w1           : [E, inter_dim*2, model_dim]  (isG1U1 is True)  torch.float8_e4m3fn/torch.bfloat16
+        print("\tw2:", list(w2.shape), w2.dtype)                                    # w2           : [E, model_dim, inter_dim]                      torch.float8_e4m3fn/torch.bfloat16
         print("\ttopk_weight:", list(topk_weight.shape), topk_weight.dtype)         # topk_weight  : [M, topk]      torch.float32
         print("\ttopk_ids:", list(topk_ids.shape), topk_ids.dtype)                  # topk_ids     : [M, topk]      torch.int32
         if expert_mask is not None:
@@ -238,7 +238,9 @@ def fused_moe_asmjit(
             if block_size_M > 128:
                 block_size_M = 128
             else:
-                block_size_N = 128
+                # quant fp8 has some limitations in block size
+                if quant_type == aiter.QuantType.No:
+                    block_size_N = 128
                 break
         else:
             break
@@ -279,9 +281,9 @@ def fused_moe_asmjit(
     )
 
     if verbose:
-        print("\ta1        :", list(a1.shape), a1.dtype)
-        print("\ta1_scale  :", list(a1_scale.shape), a1_scale.dtype)
-        assert 0
+        print("\ta1        :", list(a1.shape), a1.dtype)                # [token_num, model_dim]        torch.float8_e4m3fn
+        if a1_scale:
+            print("\ta1_scale  :", list(a1_scale.shape), a1_scale.dtype)    # [token_num, model_dim//128]   torch.float32
 
     """
     ratio = a1_scale.element_size() // a1.element_size()
@@ -304,10 +306,12 @@ def fused_moe_asmjit(
                 a1, a1_scale,
                 w1, w1_scale, a2, is_gateup=True)
     else:
-        if q_dtype_a == torch.bfloat16:
+        if a1.dtype == torch.bfloat16:
             AB_dtype = "bf16"
+        elif a1.dtype == torch.float8_e4m3fn and w1.dtype == torch.float8_e4m3fn:
+            AB_dtype = "fp8"
         else:
-            assert 0
+            assert 0, f"{a1.dtype=} {w1.dtype=}"
         #print(sorted_ids)
         #print(sorted_expert_ids)
         #print(f"{num_oc_blocks=} {num_valid_ids[0].item()=} {valid_e_blocks=} / {num_e_blocks=} {inter_dim=}")
@@ -344,6 +348,10 @@ def fused_moe_asmjit(
         device=device,
     )
 
+    if verbose:
+        print("\ta2        :", list(a2.shape), a2.dtype)                # [token_num, topk, inter_dim]        torch.float8_e4m3fn
+        print("\ta2_scale  :", list(a2_scale.shape), a2_scale.dtype)    # [token_num, topk, inter_dim//128]   torch.float32
+
     assert model_dim % wg_N == 0
     num_oc_blocks = model_dim//wg_N
     num_e_blocks = sorted_expert_ids.shape[0]
@@ -357,10 +365,12 @@ def fused_moe_asmjit(
         #print(f"{num_oc_blocks=} {valid_e_blocks=} {inter_dim=}")
         #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2, name="moe_gemm_8wave_down"):
         if 1:
-            if q_dtype_a == torch.bfloat16:
+            if a2.dtype == torch.bfloat16:
                 AB_dtype = "bf16"
+            elif a2.dtype == torch.float8_e4m3fn and w2.dtype == torch.float8_e4m3fn:
+                AB_dtype = "fp8"
             else:
-                assert 0
+                assert 0, f"{a2.dtype=} {w2.dtype=}"
             #sorted_expert_ids[...] = 0
             moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
                     AB_dtype, wg_M, wg_N,

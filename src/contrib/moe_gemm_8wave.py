@@ -134,8 +134,8 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
                    sorted_weights:"float*",
                    sorted_expert_ids:"uint*",
                    num_valid_ids:"uint*",
-                   weight:"void*",w_scale:"void*",
-                   input:"void*", i_scale:"void*",
+                   weight:"void*",pScaleB:"void*",
+                   input:"void*", pScaleA:"void*",
                    output:"void*",
                    num_tokens:"uint"):
     num_warps = 8
@@ -252,15 +252,160 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
 
     vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, LOADER_TOPK, num_tokens)
     vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*MINI_BLOCK_N)
-
     vm_load_cnt_a = vm_load_cnt_a // 2
 
-    use_f32_blockscales_128 = False
+    use_f32_blockscales_128 = (AB_dtype == "fp8")
+
+    if use_f32_blockscales_128:
+
+        assert bpreshuffle == True, "exepct scaleA in [k,m] layout"
+        scale_BM, scale_BN, scale_BK = 1,128,128 
+        # tic-toc LDS buffer for 256 per-token per-k-128 scales
+        # 1-load per warp is enough to load this buffer
+        lds_scaleA = [J.alloc_lds(num_warps * 64 * J.sizeof_f32),
+                      J.alloc_lds(num_warps * 64 * J.sizeof_f32)]
+
+        vrows = J.gpr("vu32")
+        J.ds_read_b32(vrows, J.threadIdx.x[0] * J.sizeof_u32 + lds_sorted_ids)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        if gate_up:
+            buff_sa = J.Buffer(pScaleA, num_tokens[0] * (J.div(K, scale_BK) * J.sizeof_u32))
+            voffset_scaleA = J.gpr((vrows[0] & 0xFFFFFF) * J.sizeof_u32)
+        else:
+            buff_sa = J.Buffer(pScaleA, num_tokens[0] * (TOPK * J.div(K, scale_BK) * J.sizeof_u32))
+            voffset_scaleA = J.gpr((vrows[0] & 0xFFFFFF) * (TOPK * J.sizeof_u32) + \
+                                   (vrows[0] >> 24) * J.sizeof_u32)
+
+        assert wg_M <= num_warps * 64
+        # vm_load_scaleA(lds_scaleA[toc])
+        # ds_read scaleA must be in MFMA_16x4 format
+        # ds_read scaleB broad-cast in to 16x4 too
+        def vm_load_scaleA(lds, bk):
+            # bk: index of k block with size of 128
+            # use execmask to ensure same impact on vmcnt for all warps
+            J.s_mov_b32("m0", lds + J.warp_id[0]*(64*J.sizeof_f32))
+            if gate_up:
+                voff = J.gpr("vu32", voffset_scaleA[0] + J.gpr("su32", num_tokens[0]*(bk*J.sizeof_u32)))
+            else:
+                voff = J.gpr("vu32", voffset_scaleA[0] + J.gpr("su32", num_tokens[0]*(TOPK*bk*J.sizeof_u32)))
+            #with J.ExecMask(J.threadIdx.x[0] < wg_M, early_skip=False):
+            buff_sa.load_dword(None, voff, 0)
+
+        # scale of B(weights) are very small, can be all loaded into LDS
+        pScaleB[:] += expert_id * J.div(OC, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32
+        lds_scaleB = J.alloc_lds(J.div(K, scale_BK) * J.div(wg_N, scale_BN) * J.sizeof_f32)
+        if gate_up:
+            # first half from gate, second half from up
+            assert wg_N >= 2 * scale_BN
+            pScaleB[:] += blk_n * (J.div(wg_N, 2, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32)
+            J.wg_load_lds(lds_scaleB, pScaleB, J.div(wg_N, 2, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
+                        num_warps, wait_barrier = True)
+
+            pScaleB[:] += J.div(OC, 2, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32
+            J.wg_load_lds(lds_scaleB + J.div(wg_N, 2, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
+                          pScaleB, J.div(wg_N, 2, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
+                          num_warps, wait_barrier = True)
+        else:
+            pScaleB[:] += blk_n * (J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32)
+            J.wg_load_lds(lds_scaleB, pScaleB, J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
+                        num_warps, wait_barrier = True)
+
+        num_scaleB = J.div(wg_N, scale_BN)
+        mfma_scaleA = J.gpr(nrM, "vf32")
+        mfma_scaleB = J.gpr(num_scaleB, "vf32")
+        vaddr_scaleA = J.gpr("vu32", (J.lane_id[0] % 16)*J.sizeof_f32 + warp_m * (16*nrM * J.sizeof_f32))
+        def ds_read_scaleA(lds, m0):
+            assert m0 in [0, 1]
+            vaddr = J.gpr("vu32", vaddr_scaleA[0] + lds)
+            for m in range(nrM):
+                off = (m0*HALF_BLOCK_SIZE_ROW + m*16)*J.sizeof_f32
+                J.ds_read_b32(mfma_scaleA[m], vaddr, mod=f"offset:{off}")
+
+        vaddr_scaleB = J.gpr(num_scaleB, "vu32")
+        for i in range(num_scaleB):
+            vaddr_scaleB[i] = lds_scaleB + i*J.div(K, scale_BK)*J.sizeof_f32
+        def ds_read_scaleB(bk):
+            # k0: in unit of scale_BK
+            # n0: in unit of scale_BN
+            # all warps share the same scaleB
+            assert scale_BN >= nrN * 16 * 4
+            if isinstance(bk, int):
+                off = bk * J.sizeof_f32
+                for i in range(num_scaleB):
+                    J.ds_read_b32(mfma_scaleB[i], vaddr_scaleB[i], mod=f"offset:{off}")
+            else:
+                for i in range(num_scaleB):
+                    J.ds_read_b32(mfma_scaleB[i], vaddr_scaleB[i] + bk * J.sizeof_f32)
+
 
     mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
     mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")            # 2x[16,128]
     mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 4x[4,2]x[16,16]
 
+    if use_f32_blockscales_128:
+        MFMA_FIFO_CNT = nrM * nrN
+        # circular fifo buffer for post-processing
+        # prepare scales for next round
+        mfma_fifo_scale = J.gpr(2, nrM, "vf32")
+        mfma_fifo = J.gpr(MFMA_FIFO_CNT, 4, "vf32")
+        mfma_fifo_scale[...] = 0
+        mfma_fifo[...] = 0
+        mfma_fifo_c_index = 0
+
+        def mfma(c_index):
+            nonlocal mfma_fifo_scale, mfma_fifo, mfma_fifo_c_index
+            b_index = c_index % 2
+
+            fifo_read_id = 0
+            fifo_write_id = 0
+            for m in range(nrM):
+                for n in range(nrN):
+                    if n == 0:
+                        mfma_fifo_scale[c_index%2, m] = mfma_scaleA[m] * mfma_scaleB[b_index]
+                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 0], mfma_fifo[fifo_read_id, 0], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 1], mfma_fifo[fifo_read_id, 1], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 2], mfma_fifo[fifo_read_id, 2], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                    J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 3], mfma_fifo[fifo_read_id, 3], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                    fifo_read_id += 1
+
+                    J.v_mfma_f32_16x16x128_f8f6f4(mfma_fifo[fifo_write_id % MFMA_FIFO_CNT], mfma_B[b_index, n], mfma_A[m], 0)
+                    fifo_write_id += 1
+                    yield 16
+            mfma_fifo_c_index = c_index
+        
+        def mfma_tail():
+            fifo_read_id = 0
+            for m in range(nrM):
+                for n in range(nrN):
+                    if mfma_fifo_c_index is not None:
+                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 0], mfma_fifo[fifo_read_id, 0], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 1], mfma_fifo[fifo_read_id, 1], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 2], mfma_fifo[fifo_read_id, 2], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 3], mfma_fifo[fifo_read_id, 3], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
+                        fifo_read_id += 1
+    elif AB_dtype == "bf16":
+        def mfma(c_index):
+            b_index = c_index % 2
+            for k in range(2):
+                for m in range(nrM):
+                    for n in range(nrN):
+                        J.v_mfma_f32_16x16x32_bf16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
+                        yield 16
+        def mfma_tail():
+            pass
+    else:
+        assert AB_dtype == "fp16" or AB_dtype == "f16" 
+        def mfma(c_index):
+            b_index = c_index % 2
+            for k in range(2):
+                for m in range(nrM):
+                    for n in range(nrN):
+                        J.v_mfma_f32_16x16x32_f16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
+                        yield 16
+        def mfma_tail():
+            pass
+    """
     def mfma(c_index):
         b_index = c_index % 2
         for k in range(2):
@@ -270,6 +415,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
                     yield 16
     def mfma_tail():
         pass
+    """
 
     loop_cnt = J.div(K, wg_K)
     #assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
@@ -317,7 +463,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
         # 8-wave pipeline invented by HipKittens
         tic = 0
         toc = 1
-        #if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], 0)
+        if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], 0)
         J.emit(vm_loadB(tic,0))
         J.emit(vm_loadA(tic,0))
         J.emit(vm_loadB(tic,1))
@@ -332,11 +478,11 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
 
         step_k()
 
-        #if use_f32_blockscales_128:
-        #    vm_load_scaleA(lds_scaleA[toc], 1)
-        #    vm_load_cnt_scaleA = 1
-        #else:
-        vm_load_cnt_scaleA = 0
+        if use_f32_blockscales_128:
+            vm_load_scaleA(lds_scaleA[toc], 1)
+            vm_load_cnt_scaleA = 1
+        else:
+            vm_load_cnt_scaleA = 0
         J.emit(vm_loadA(toc,0))
         J.emit(vm_loadB(toc,0))
         J.emit(vm_loadB(toc,1))
@@ -348,9 +494,9 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             ds_readB(tic, 0)    # lgkmcnt += nrN*2 (2*2)
             ds_readA(tic, 0)    # lgkmcnt += nrM*2 (4*2)
 
-            #if use_f32_blockscales_128:
-            #    ds_read_scaleA(lds_scaleA[tic], 0)
-            #    ds_read_scaleB(k)
+            if use_f32_blockscales_128:
+                ds_read_scaleA(lds_scaleA[tic], 0)
+                ds_read_scaleB(k)
 
             J.emit(vm_loadA(toc,1))
             step_k()
@@ -372,7 +518,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             J.s_setprio(0); J.s_barrier()
 
             ds_readA(tic, 1)
-            #if use_f32_blockscales_128: ds_read_scaleA(lds_scaleA[tic], 1)
+            if use_f32_blockscales_128: ds_read_scaleA(lds_scaleA[tic], 1)
             J.emit(vm_loadB(tic,0))                         # vm_load_cnt_b
             J.s_barrier()
 
@@ -381,7 +527,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             J.s_setprio(0); J.s_barrier()
 
             J.emit(vm_loadB(tic,1))                         # vm_load_cnt_b
-            #if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], k+2)
+            if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[tic], k+2)
             J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
 
             J.s_setprio(1)
@@ -418,14 +564,14 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
         for k in range(loop_cnt):
             J.emit(vm_loadB(0,0))
             J.emit(vm_loadA(0,0))
-            #if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[0], k)
+            if use_f32_blockscales_128: vm_load_scaleA(lds_scaleA[0], k)
             J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
 
             ds_readA(0,0)
             ds_readB(0,0)
-            #if use_f32_blockscales_128:
-            #    ds_read_scaleA(lds_scaleA[0], 0)
-            #    ds_read_scaleB(k)
+            if use_f32_blockscales_128:
+                ds_read_scaleA(lds_scaleA[0], 0)
+                ds_read_scaleB(k)
             J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
             J.emit(mfma(0))
 
@@ -448,8 +594,8 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             J.s_waitcnt(mod="vmcnt(0)"); J.s_barrier()
 
             ds_readA(0,1)
-            #if use_f32_blockscales_128:
-            #    ds_read_scaleA(lds_scaleA[0], 1)
+            if use_f32_blockscales_128:
+                ds_read_scaleA(lds_scaleA[0], 1)
             J.s_waitcnt(mod="lgkmcnt(0)"); J.s_barrier()
 
             #J.debug_log(mfma_A[0,0], torch.float8_e4m3fn, "4h.16v.16h")
@@ -461,6 +607,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
 
             step_k()
 
+        mfma_tail()
         J.s_waitcnt(mod="lgkmcnt(0)")
         J.s_waitcnt(mod="vmcnt(0)")
 
