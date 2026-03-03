@@ -101,8 +101,8 @@ def fused_sigmoid_mul_add_gluon(
         shared_output: [num_tokens, hidden_size].
         final_hidden_states: [num_tokens, hidden_size], modified in-place.
     """
-   # num_tokens, hidden_size = shared_output.shape
-    num_tokens,hidden_size = 4, 1024
+    num_tokens, hidden_size = shared_output.shape
+    #num_tokens,hidden_size = 4, 1024
     gate_flat = gate.view(-1)
 
     num_col_blocks = triton.cdiv(hidden_size, BLOCK_SIZE)
