@@ -142,9 +142,11 @@ def test():
             idx = torch.where(torch.abs(ref[i] - output[i]) > 0.05)
             print(f'{idx=}, {ref[i][idx]=}, {output[i][idx]=}')
             assert 0
-    
+
+    # bf16: 2 bytes; read input [num_tokens_total, TOPK, OC], write output [num_tokens_total, OC]
+    rw_bytes = num_tokens_total * TOPK * OC * 2 + num_tokens_total * OC * 2
     for _ in range(10):
-        with pyhip.cuPerf(name="moe_gemm_final_reduce_bf16"):
+        with pyhip.cudaPerf(0, rw_bytes, name="moe_gemm_final_reduce_bf16"):
             moe_gemm_final_reduce_bf16[(num_WG,)](
                                     input,
                                     output,
