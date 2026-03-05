@@ -60,9 +60,11 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
     NUM_EXPERTS, OC, IC = weight.shape
     NUM_BLOCKS = sorted_expert_ids.shape[0]
 
-    weight_de_shuffle = torch.empty_like(weight)
-    for i in range(NUM_EXPERTS):
-        weight_de_shuffle[i,...] = de_shuffle_weight(weight[i, ...])
+    weight_de_shuffle = weight.clone()
+    is_shuffled = getattr(weight, "is_shuffled", False)
+    if is_shuffled:
+        for i in range(NUM_EXPERTS):
+            weight_de_shuffle[i, ...] = de_shuffle_weight(weight[i, ...])
 
     if w_scale is not None:
         # dequantize
@@ -114,6 +116,59 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
             #output[tok_ids[valid_mask], tok_topk[valid_mask], :] = cur_out.to(output.dtype)
 
 moe_gemm = moe_gemm_ref
+
+def moe_sorting_ref(topk_ids,       # [num_tokens, topk]
+                    topk_weights,   # [num_tokens, topk]
+                    num_experts,    # number of global experts
+                    model_dim,      # for returning output buffer [num_tokens, model_dim] moebuf_dtype
+                    moebuf_dtype,   # 
+                    block_size,     # 
+                    expert_mask=None,       # 
+                    num_local_tokens=None,  # 
+                    dispatch_policy=0):
+    assert expert_mask is None
+    assert num_local_tokens is None
+    num_tokens, topk = topk_ids.shape
+
+    # 
+    def div_up(x, y):
+        return (x + y - 1) // y
+
+    num_e_blocks = div_up(num_tokens * topk + num_experts * (block_size - 1), block_size)
+
+    sorted_ids = torch.empty([num_e_blocks * block_size], dtype=torch.uint32)
+    sorted_weights = torch.empty([num_e_blocks * block_size], dtype=torch.float)
+    sorted_expert_ids = torch.empty([num_e_blocks], dtype=torch.uint32)
+    num_valid_ids = torch.empty([2], dtype=torch.uint32)
+    moe_out = torch.empty([num_tokens, model_dim], dtype=moebuf_dtype)
+
+    # [512, 8] 
+    """
+    topk_ids [num_tokens, topk] 均匀分配一下到各个CU, CU把分配到的部分进行局部
+    分组（在LDS里面），分组完毕之后，用 atomic 争抢任务来决定每个expert的最终摆入位置
+    这些位置记录到外存之后，更新一个标记，每个CU会读取这些位置以决定自己每个
+    """
+    index = 0
+    for expert_id in range(num_experts):
+        for i in range(num_tokens):
+            for t in range(topk):
+                if topk_ids[i, t] == expert_id:
+                    if index % block_size == 0:
+                        sorted_expert_ids[index//block_size] = expert_id
+                    sorted_ids[index] = (t << 24)|(i)
+                    sorted_weights[index] = topk_weights[i, t]
+                    index += 1
+        i0 = index % 256
+        if i0:
+            for i in range(i0, 256):
+                sorted_ids[index] = (topk << 24)|(num_tokens)
+                sorted_weights[index] = 0
+                index += 1
+
+    num_valid_ids[0] = index
+
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out
+
 
 def fused_moe_asmjit(
     hidden_states,
@@ -207,7 +262,6 @@ def fused_moe_asmjit(
     assert splitk == 0
 
     assert isG1U1 == True
-    assert isShuffled == True
 
     token_num, _ = hidden_states.shape
 
@@ -222,7 +276,7 @@ def fused_moe_asmjit(
     block_size_M = 256
     block_size_N = 256
 
-    while True:
+    while False:
         estimated_oc_blocks = min(inter_dim*2, model_dim)//block_size_N
         estimated_num_e_blocks = ((token_num * topk) // block_size_M) * E
         estimated_work_groups = estimated_num_e_blocks * estimated_oc_blocks
@@ -248,11 +302,15 @@ def fused_moe_asmjit(
     
     assert block_size_M in [128,256]
     assert block_size_N in [128,256]
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = aiter.fused_moe.moe_sorting(
-        topk_ids, topk_weight, global_E, model_dim,  dtype,
-        block_size_M,
-        expert_mask, num_local_tokens, moe_sorting_dispatch_policy,
-    )
+    #moe_sorting = moe_sorting_ref
+    moe_sorting = aiter.fused_moe.moe_sorting
+    #with pyhip.cudaPerf(0, name="moe_sorting"):
+    if 1:
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = moe_sorting(
+            topk_ids, topk_weight, global_E, model_dim,  dtype,
+            block_size_M,
+            expert_mask, num_local_tokens, moe_sorting_dispatch_policy,
+        )
     if verbose:
         print("sorted_ids        :", list(sorted_ids.shape), sorted_ids.dtype)
         print("\t", sorted_ids[:block_size_M])
@@ -282,7 +340,7 @@ def fused_moe_asmjit(
 
     if verbose:
         print("\ta1        :", list(a1.shape), a1.dtype)                # [token_num, model_dim]        torch.float8_e4m3fn
-        if a1_scale:
+        if a1_scale is not None:
             print("\ta1_scale  :", list(a1_scale.shape), a1_scale.dtype)    # [token_num, model_dim//128]   torch.float32
 
     """
@@ -320,7 +378,7 @@ def fused_moe_asmjit(
             moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
                     AB_dtype, wg_M, wg_N,
                     E, inter_dim*2, model_dim, 
-                    True, topk,
+                    True, getattr(w1, "is_shuffled", False), topk,
                     sorted_ids.data_ptr(),
                     sorted_weights.data_ptr(),
                     sorted_expert_ids.data_ptr(),
@@ -375,7 +433,7 @@ def fused_moe_asmjit(
             moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
                     AB_dtype, wg_M, wg_N,
                     E, model_dim, inter_dim, 
-                    False, topk,
+                    False, getattr(w2, "is_shuffled", False), topk,
                     sorted_ids.data_ptr(),
                     sorted_weights.data_ptr(),
                     sorted_expert_ids.data_ptr(),

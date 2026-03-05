@@ -129,7 +129,7 @@ loader函数如何单独调试正确性？可以从实现最简单的moe_gemm开
 @jit(with_debug_log=False)
 def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
                    NUM_EXPERTS, OC, IC, 
-                   gate_up, TOPK,
+                   gate_up, bpreshuffle, TOPK,
                    sorted_ids:"uint*",
                    sorted_weights:"float*",
                    sorted_expert_ids:"uint*",
@@ -181,8 +181,6 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     MINI_BLOCK_M = J.div(HALF_BLOCK_SIZE_ROW, WARPS_ROW) # 64
     MINI_BLOCK_N = J.div(HALF_BLOCK_SIZE_COL, WARPS_COL) # 32
 
-    bpreshuffle = True
-
     if gate_up:
         """
         weight[:] += expert_id * (OC * stride_k) + blk_n * (wg_N//2 * stride_k)
@@ -205,7 +203,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
         buff_b[1] = J.Buffer(weight, J.div(wg_N, 2) * stride_k)
         stride_n = J.div(OC,2) * J.sizeof(C_dtype)
         buff_c = J.Buffer(output, num_tokens * TOPK * stride_n)
-        assert bpreshuffle
+        # assert bpreshuffle
     else:
         LOADER_TOPK = TOPK
         weight[:] += expert_id * (OC * stride_k) + blk_n * (wg_N * stride_k)
@@ -257,8 +255,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     use_f32_blockscales_128 = (AB_dtype == "fp8")
 
     if use_f32_blockscales_128:
-
-        assert bpreshuffle == True, "exepct scaleA in [k,m] layout"
+        # "exepct scaleA in [k,m] layout"
         scale_BM, scale_BN, scale_BK = 1,128,128 
         # tic-toc LDS buffer for 256 per-token per-k-128 scales
         # 1-load per warp is enough to load this buffer
@@ -421,17 +418,15 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     #assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
 
     a_moffset = J.gpr("su32", 0)
-    if bpreshuffle:
-        if gate_up:
-            b_moffsets = J.gpr(2, "su32", 0, 0)
-        else:
-            b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_COL)
+    if gate_up:
+        b_moffsets = J.gpr(2, "su32", 0, 0)
+    else:
+        b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_COL)
 
     def step_k():
         a_moffset[0] += vm_offset_inc_a
-        if bpreshuffle:
-            b_moffsets[0] += vm_offset_inc_b
-            b_moffsets[1] += vm_offset_inc_b
+        b_moffsets[0] += vm_offset_inc_b
+        b_moffsets[1] += vm_offset_inc_b
 
     def vm_loadA(k, m):
         assert m in [0, 1]
@@ -441,13 +436,10 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     def vm_loadB(k, m):
         assert m in [0, 1]
         assert k in [0, 1]
-        if bpreshuffle:
-            if gate_up:
-                return vm_load_b(ldsB[k,m], buff_b[m], b_moffsets[m])
-            else:
-                return vm_load_b(ldsB[k,m], buff_b, b_moffsets[m])
+        if gate_up:
+            return vm_load_b(ldsB[k,m], buff_b[m], b_moffsets[m])
         else:
-            return vm_load_b(ldsB[k,m], buff_b, a_moffset)
+            return vm_load_b(ldsB[k,m], buff_b, b_moffsets[m])
 
     def ds_readA(k, m):
         for i in range(nrM):

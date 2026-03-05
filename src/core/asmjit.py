@@ -3166,7 +3166,7 @@ r'''
     def div(self, x, *ys):
         for y in ys:
             assert x % y == 0, f"{x=} {ys=}"
-            assert x >= y
+            assert x >= y, f"{x=} {y=} {ys=}"
             x = x // y
         return x
 
