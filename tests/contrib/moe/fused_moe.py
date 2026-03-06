@@ -142,12 +142,6 @@ def moe_sorting_ref(topk_ids,       # [num_tokens, topk]
     num_valid_ids = torch.empty([2], dtype=torch.uint32)
     moe_out = torch.empty([num_tokens, model_dim], dtype=moebuf_dtype)
 
-    # [512, 8] 
-    """
-    topk_ids [num_tokens, topk] 均匀分配一下到各个CU, CU把分配到的部分进行局部
-    分组（在LDS里面），分组完毕之后，用 atomic 争抢任务来决定每个expert的最终摆入位置
-    这些位置记录到外存之后，更新一个标记，每个CU会读取这些位置以决定自己每个
-    """
     index = 0
     for expert_id in range(num_experts):
         for i in range(num_tokens):
@@ -178,7 +172,7 @@ def fused_moe_asmjit(
     topk_ids,
     expert_mask = None,  # EP
     activation = aiter.ActivationType.Silu,
-    quant_type = aiter.QuantType.per_128x128,
+    quant_type = aiter.QuantType.No,
     doweight_stage1 = False,
     # following for quant
     w1_scale = None,  # [expert(local_expert:EP), inter_dim, 1]
@@ -276,7 +270,7 @@ def fused_moe_asmjit(
     block_size_M = 256
     block_size_N = 256
 
-    while False:
+    while True:
         estimated_oc_blocks = min(inter_dim*2, model_dim)//block_size_N
         estimated_num_e_blocks = ((token_num * topk) // block_size_M) * E
         estimated_work_groups = estimated_num_e_blocks * estimated_oc_blocks
