@@ -4,6 +4,7 @@ import aiter
 from aiter import dtypes
 
 from pyhip.contrib.moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
+from pyhip.contrib.moe import moe_2stage_splitk
 
 __all__ = [
     "fused_moe_asmjit"
@@ -50,7 +51,7 @@ def de_shuffle_weight(weight, mfma_MN = 16):
     return weight
 
 def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
-                 input, input_scale, weight, w_scale, output, is_gateup):
+                 input, input_scale, weight, w_scale, output, is_gateup, is_shuffled):
     #assert weight.dtype == torch.bfloat16
     if is_gateup:
         NUM_TOKENS, NUM_STATES = input.shape
@@ -61,7 +62,6 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
     NUM_BLOCKS = sorted_expert_ids.shape[0]
 
     weight_de_shuffle = weight.clone()
-    is_shuffled = getattr(weight, "is_shuffled", False)
     if is_shuffled:
         for i in range(NUM_EXPERTS):
             weight_de_shuffle[i, ...] = de_shuffle_weight(weight[i, ...])
@@ -115,7 +115,6 @@ def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, n
             output[tok_ids[valid_mask], ...] += cur_out
             #output[tok_ids[valid_mask], tok_topk[valid_mask], :] = cur_out.to(output.dtype)
 
-moe_gemm = moe_gemm_ref
 
 def moe_sorting_ref(topk_ids,       # [num_tokens, topk]
                     topk_weights,   # [num_tokens, topk]
@@ -203,9 +202,28 @@ def fused_moe_asmjit(
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     assert w1.shape[1] == inter_dim * 2
+    assert expert_mask is None
+
+    """
+    /sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py
+        : after wrapping shuffled tensor with torch.nn.Parameter(), the "is_shuffled" attributes is missing
+    layer.w13_weight = torch.nn.Parameter(
+        shuffle_weight(layer.w13_weight.data, (16, 16)),
+        requires_grad=False,
+    ) 
+    """
+    if isinstance(w1, torch.nn.parameter.Parameter):
+        w1_is_shuffled = True
+    else:
+        w1_is_shuffled = getattr(w1, "is_shuffled", False)
+
+    if isinstance(w2, torch.nn.parameter.Parameter):
+        w2_is_shuffled = True
+    else:
+        w2_is_shuffled = getattr(w2, "is_shuffled", False)
 
     isG1U1 = inter_dim != w1.shape[1]
-    isShuffled = getattr(w1, "is_shuffled", False)
+
     global_E = E
     if expert_mask is not None:
         global_E = expert_mask.numel()
@@ -226,8 +244,7 @@ def fused_moe_asmjit(
         print(f" w1.dtype   : {w1.dtype}")
         print(f" w2.dtype   : {w2.dtype}")
         print(f" q_dtype_a  : {q_dtype_a}")
-        print(f" {M=} {topk=} {global_E=} {E=} {model_dim=} {inter_dim=}")
-        print(f" {isG1U1=} {isShuffled=} ")
+        print(f" {M=} {topk=} {global_E=} {E=} {model_dim=} {inter_dim=} {isG1U1=}")
 
         print("\thidden_states:", list(hidden_states.shape), hidden_states.dtype)   # hidden_states: [M, model_dim] torch.bfloat16
         print("\tw1:", list(w1.shape), w1.dtype)                                    # w1           : [E, inter_dim*2, model_dim]  (isG1U1 is True)  torch.float8_e4m3fn/torch.bfloat16
@@ -354,9 +371,9 @@ def fused_moe_asmjit(
     num_e_blocks = sorted_expert_ids.shape[0]
     #valid_e_blocks = num_valid_ids[0].item()//wg_M
     if 0:
-        moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+        moe_gemm_ref(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a1, a1_scale,
-                w1, w1_scale, a2, is_gateup=True)
+                w1, w1_scale, a2, True, w1_is_shuffled)
     else:
         if a1.dtype == torch.bfloat16:
             AB_dtype = "bf16"
@@ -372,7 +389,7 @@ def fused_moe_asmjit(
             moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
                     AB_dtype, wg_M, wg_N,
                     E, inter_dim*2, model_dim, 
-                    True, getattr(w1, "is_shuffled", False), topk,
+                    True, w1_is_shuffled, topk,
                     sorted_ids.data_ptr(),
                     sorted_weights.data_ptr(),
                     sorted_expert_ids.data_ptr(),
@@ -412,7 +429,7 @@ def fused_moe_asmjit(
     if 0:
         moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a2, a2_scale,
-                w2, w2_scale, moe_out, is_gateup=False)
+                w2, w2_scale, moe_out, False, w2_is_shuffled)
     else:
         #print(f"{num_oc_blocks=} {valid_e_blocks=} {inter_dim=}")
         #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2, name="moe_gemm_8wave_down"):
@@ -427,7 +444,7 @@ def fused_moe_asmjit(
             moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
                     AB_dtype, wg_M, wg_N,
                     E, model_dim, inter_dim, 
-                    False, getattr(w2, "is_shuffled", False), topk,
+                    False, w2_is_shuffled, topk,
                     sorted_ids.data_ptr(),
                     sorted_weights.data_ptr(),
                     sorted_expert_ids.data_ptr(),

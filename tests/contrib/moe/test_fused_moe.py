@@ -560,7 +560,8 @@ for (
                         preshuffle=preshuffle,
                     )
                     df.append(ret)
-
+time_us = float(df[-1]["us"])
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+print(f"last-time-us: {time_us:.3f}")
