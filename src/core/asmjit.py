@@ -3401,7 +3401,7 @@ r'''
             num_loads = self.div_up(num_load_lanes, num_warps * self.warp_size)
             ioff = 0
             voff = self.gpr("vu32", self.threadIdx.x[0] * self.sizeof_DW4)
-            limit_dw4 = self.gpr("vu32", nbytes - self.sizeof_DW4)
+            limit_dw4 = self.gpr("vu32", nbytes0 - self.sizeof_DW4)
             self.s_mov_b32("m0", warp_off_cnt * self.sizeof_DW4 + lds)
             for i in range(num_loads):
                 ioff += num_warps * self.warp_size * self.sizeof_DW4

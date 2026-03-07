@@ -245,7 +245,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     if gate_up:
         J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
     else:
-        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
+        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
         J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
 
     vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, LOADER_TOPK, num_tokens)
@@ -297,7 +297,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             assert wg_N >= 2 * scale_BN
             pScaleB[:] += blk_n * (J.div(wg_N, 2, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32)
             J.wg_load_lds(lds_scaleB, pScaleB, J.div(wg_N, 2, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
-                        num_warps, wait_barrier = True)
+                        num_warps, wait_barrier = False)
 
             pScaleB[:] += J.div(OC, 2, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32
             J.wg_load_lds(lds_scaleB + J.div(wg_N, 2, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,

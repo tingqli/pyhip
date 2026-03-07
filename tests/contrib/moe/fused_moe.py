@@ -287,8 +287,8 @@ def fused_moe_asmjit(
     moe_sorting = aiter.fused_moe.moe_sorting
 
     estimated_tokens_per_expert = token_num * topk / E
-    if estimated_tokens_per_expert < 128:
-        # decoding phase kernel
+    if estimated_tokens_per_expert < 32 and quant_type == aiter.QuantType.No:
+        # mem-bound case : very small num_tokens
         block_size_M = 32
         block_size_N = 128
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = moe_sorting(
@@ -329,7 +329,7 @@ def fused_moe_asmjit(
 
     while True:
         estimated_oc_blocks = min(inter_dim*2, model_dim)//block_size_N
-        estimated_num_e_blocks = ((token_num * topk) // block_size_M) * E
+        estimated_num_e_blocks = ((token_num * topk) // block_size_M)
         estimated_work_groups = estimated_num_e_blocks * estimated_oc_blocks
 
         cu_usage = estimated_work_groups / torch.cuda.get_device_properties().multi_processor_count
@@ -349,10 +349,14 @@ def fused_moe_asmjit(
                 break
         else:
             break
-    #print(f"{block_size_M=} {block_size_N=}")
+    
+    # keep block_size_N at 256 in most-case, only fallback to 128 on extream cases?
+    block_size_N = 256
     
     assert block_size_M in [128,256]
     assert block_size_N in [128,256]
+
+    #print(f"{block_size_M=} {block_size_N=}")
 
     #with pyhip.cudaPerf(0, name="moe_sorting"):
     if 1:
@@ -466,7 +470,7 @@ def fused_moe_asmjit(
 
     #with pyhip.torchPerf("./xxx"):
     if 0:
-        moe_gemm(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+        moe_gemm_ref(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a2, a2_scale,
                 w2, w2_scale, moe_out, False, w2_is_shuffled)
     else:

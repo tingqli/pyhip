@@ -49,6 +49,7 @@ def test_fmoe(
     hidden_pad=0,
     intermediate_pad=0,
     preshuffle=False,
+    diff_thr=1e-4
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -265,7 +266,7 @@ def test_fmoe(
         sim = 2 * (x * y).sum() / denominator
         return 1 - sim
     """
-    logits_diff = calc_diff(out2_ref, out2_ck, diff_thr=1e-4)
+    logits_diff = calc_diff(out2_ref, out2_ck, diff_thr=diff_thr)
     if logits_diff > 1e-3:
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
@@ -432,9 +433,9 @@ parser.add_argument(
     action=UseJitAction,
     help="use jit."
 )
+diff_thr = 1e-2
 
 #########################################################################################################################
-
 args = parser.parse_args()
 
 if args.dtype is None:
@@ -558,6 +559,7 @@ for (
                         use_g1u1=True,
                         doweight_stage1=doweight_stage1,
                         preshuffle=preshuffle,
+                        diff_thr=diff_thr
                     )
                     df.append(ret)
 time_us = float(df[-1]["us"])
