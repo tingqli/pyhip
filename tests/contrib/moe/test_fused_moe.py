@@ -422,7 +422,7 @@ fused_moe_impl = fused_moe
 class UseJitAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         global fused_moe_impl
-        from fused_moe import fused_moe_asmjit
+        from pyhip.contrib.fused_moe import fused_moe as fused_moe_asmjit
         fused_moe_impl = fused_moe_asmjit
         setattr(namespace, self.dest, True)
 

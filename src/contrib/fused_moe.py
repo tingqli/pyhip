@@ -3,11 +3,11 @@ import torch
 import aiter
 from aiter import dtypes
 
-from pyhip.contrib.moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
-from pyhip.contrib.moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
+from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
+from .moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
 
 __all__ = [
-    "fused_moe_asmjit"
+    "fused_moe"
 ]
 
 """
@@ -163,7 +163,7 @@ def moe_sorting_ref(topk_ids,       # [num_tokens, topk]
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out
 
 
-def fused_moe_asmjit(
+def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
     w2,  # [expert(local_expert:EP), dim, inter_dim]

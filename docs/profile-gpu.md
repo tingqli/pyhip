@@ -55,6 +55,7 @@ $ docker run -it --rm --cap-add=SYS_ADMIN --network=host --device=/dev/kfd --dev
 ```bash
 wget https://github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.6/rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
 bash ./rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh --skip-license --prefix=./
+cp ./opt/rocm/lib/librocprof-trace-decoder.so /opt/rocm/lib/
 
 ```
 
