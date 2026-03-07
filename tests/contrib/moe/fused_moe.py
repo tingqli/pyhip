@@ -4,7 +4,7 @@ import aiter
 from aiter import dtypes
 
 from pyhip.contrib.moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
-from pyhip.contrib.moe import moe_2stage_splitk
+from pyhip.contrib.moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
 
 __all__ = [
     "fused_moe_asmjit"
@@ -282,6 +282,46 @@ def fused_moe_asmjit(
         device=device,
     )
 
+
+    #moe_sorting = moe_sorting_ref
+    moe_sorting = aiter.fused_moe.moe_sorting
+
+    estimated_tokens_per_expert = token_num * topk / E
+    if estimated_tokens_per_expert < 128:
+        # decoding phase kernel
+        block_size_M = 32
+        block_size_N = 128
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = moe_sorting(
+            topk_ids, topk_weight, global_E, model_dim,  dtype,
+            block_size_M,
+            expert_mask, num_local_tokens, moe_sorting_dispatch_policy,
+        )
+        grid = sorted_expert_ids.shape[0]
+        if token_num * topk <= E:
+            grid = token_num * topk
+        if 1:
+            moe_2stage_splitk([inter_dim*2 // block_size_N, grid], [256],
+                                w1.dtype, topk, model_dim, inter_dim*2, True, block_size_M, block_size_N,
+                                hidden_states.data_ptr(), w1.data_ptr(), a2.data_ptr(),
+                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num)
+            moe_2stage_splitk([model_dim // block_size_N, grid], [64],
+                                w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
+                                a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
+                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num)
+        else:
+            # wrong results ???
+            moe_2stage_gateup([inter_dim*2 // block_size_N, grid], [256],
+                                w1.dtype, topk, model_dim, inter_dim*2, block_size_M, block_size_N,
+                                hidden_states.data_ptr(), w1.data_ptr(), a2.data_ptr(),
+                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num)
+            moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
+                                w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
+                                a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
+                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num)
+        return moe_out
+
+
+    # prefill phase kernels, estimated num-tokens per expert is big enough
     # determine block_size_M:
     #   set to 128 if num_local_tokens is too small to use all available CUs
     block_size_M = 256
@@ -313,8 +353,7 @@ def fused_moe_asmjit(
     
     assert block_size_M in [128,256]
     assert block_size_N in [128,256]
-    #moe_sorting = moe_sorting_ref
-    moe_sorting = aiter.fused_moe.moe_sorting
+
     #with pyhip.cudaPerf(0, name="moe_sorting"):
     if 1:
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = moe_sorting(

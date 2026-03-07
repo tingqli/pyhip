@@ -14,11 +14,17 @@ def get_fused_moe_time(model_dim, inter_dim, num_tokens, experts, topk, quant_mo
 
 df = []
 test_cases = [
+    # EP num-tokens reducing
     (4096, 1536, 512, 8, 8, 0),
-    (4096, 128, 512, 8, 8, 0),
+    (4096, 1536, 256, 8, 8, 0),
+    (4096, 1536, 128, 8, 8, 0),
+    (4096, 1536, 64, 8, 8, 0),
+    # TP1
     (4096, 1536, 512, 128, 8, 0),
-    (4096, 128, 512, 128, 8, 0),
     (4096, 1536, 5120, 128, 8, 0),
+    # TP8
+    (4096, 128, 512, 8, 8, 0),
+    (4096, 128, 512, 128, 8, 0),
     (4096, 128, 5120, 128, 8, 0),
 ]
 for model_dim,inter_dim,num_tokens,experts,topk,quant_mode in tqdm(test_cases):
