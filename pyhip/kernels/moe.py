@@ -66,9 +66,9 @@ def moe_2stage_splitk(J:JIT,
             assert BLOCK_TILE_SIZE_N % 32 == 0, f'due to scale is packed with [2*16, 8*32], current BLOCK_TILE_SIZE_N={BLOCK_TILE_SIZE_N} is not supported'
             assert K % 32 == 0, f'will read 16*4 bytes once in main loop, aka 64*2=128 elements; tails support K%32==0; current K={K} is not supported'
     elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
-        assert K % 128 == 0, f'will read 16*4 bytes once in main loop, aka 64 elements; current K={K} is not supported'
+        assert K % (256 if with_silu else 64) == 0, f'will read 16*4 bytes once in main loop, aka 64 elements; current K={K} is not supported'        
     else:
-        assert K % 128 == 0, f'will read 16*4 bytes once in main loop, aka 64/2=32 elements; current K={K} is not supported'
+        assert K % 32 == 0, f'will read 16*4 bytes once in main loop, aka 64/2=32 elements; current K={K} is not supported'
     assert BLOCK_TILE_SIZE_M % 16 == 0
     assert BLOCK_TILE_SIZE_N % 32 == 0
     assert N % BLOCK_TILE_SIZE_N == 0
@@ -532,18 +532,14 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     #     w2_ref = (w2_qt.to(dtype=torch.bfloat16) * w2_qt_scale).to(dtype=torch.bfloat16)
     #     w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
     #     w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
-    elif weight_type == torch.float8_e4m3fn or weight_type == torch.float8_e4m3fnuz: 
-        assert  HIDDEN_SIZE//(128) and INTER_SIZE_TP//128, "HIDDEN_SIZE and INTER_SIZE/TP must be multiples of 128  for per block quantization"
+    elif weight_type == torch.float8_e4m3fn or weight_type == torch.float8_e4m3fnuz:
+        QUAN_BLOCK_SZ=128
+        assert  HIDDEN_SIZE%QUAN_BLOCK_SZ == 0 and INTER_SIZE_TP%QUAN_BLOCK_SZ==0, f"HIDDEN_SIZE and INTER_SIZE/TP must be multiples of {QUAN_BLOCK_SZ}  for per block quantization"
+        assert  QUAN_BLOCK_SZ%TILE_N == 0, f"{QUAN_BLOCK_SZ=}  must be multiples of {TILE_N=}  for per block quantization"
+
         import aiter
-        if 1:
-            w_ = torch.randn([E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // 128, 128], dtype=torch.bfloat16) / 2.0
-        else:
-            w_ = torch.randint(-3, 6,[E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // 128, 128]).to(dtype=torch.bfloat16) / 100.0
-            # ensure adjacent rows(each row is QUAN_BLOCK_SZ) would have different 3 quantization scales.
-            w_[0:-1:5, :] *= 2
-            w_[1:-1:3, :] /= 3
-            #random change data in QUAN_BLOCK_SZ dimension.
-            w_[:, 0:-1:3] *= 2
+        w_ = torch.randn([E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // 128, 128], dtype=torch.bfloat16) / 2.0
+
         w1_qt, w1_qt_scale = weight_per_128x128_quant(w_.view(E, INTER_SIZE_TP * 2, HIDDEN_SIZE), quant_dtype=weight_type)
         # print(w1_qt_scale)
 
@@ -555,23 +551,16 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w1_qt_scale = w1_qt_scale.view(E, INTER_SIZE_TP * 2//128, HIDDEN_SIZE//128)
         w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
         w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
+    
         w_ = torch.randn([E*HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16) / 2.0
-
-
         w2_qt, w2_qt_scale = weight_per_128x128_quant(w_.view(E, HIDDEN_SIZE, INTER_SIZE_TP), quant_dtype=weight_type)
-
-
-
         print(f'==========={w2_qt.shape=}, {w2_qt_scale.shape=}')
-        
         w2_ref = (w2_qt.to(dtype=torch.bfloat16).view(E, HIDDEN_SIZE//128, 128, INTER_SIZE_TP//128,  128) * w2_qt_scale.view(E, HIDDEN_SIZE//128, 1, INTER_SIZE_TP//128,  1)).to(dtype=torch.bfloat16)
         w2_ref = w2_ref.view(E, HIDDEN_SIZE, INTER_SIZE_TP)
         w2_qt = w2_qt.view(E, HIDDEN_SIZE, INTER_SIZE_TP)
         w2_qt_scale = w2_qt_scale.view(E, HIDDEN_SIZE//128, INTER_SIZE_TP//128)
         w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
         w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
-
-
     else:
         assert 0, f'not support weight type "{weight_type}"'
 
@@ -752,7 +741,7 @@ def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP
 
 if __name__ == '__main__':
     TILE_M = 16
-    TILE_N = 128
+    TILE_N = 64
     HIDDEN_SIZE = 4096
     INTER_SIZE = 1536
     TP = 1

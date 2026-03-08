@@ -80,10 +80,11 @@ def gemm_splitk(J:JIT,
     #         J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
     elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
         k_scale_n = k_max
+        QUAN_BLK_SZ=128
         v_w_scale = J.gpr(2, k_scale_n, 'vf32')
         for n_block in range(2):
             for k_idx in range(k_scale_n):
-                J.global_load_dword(v_w_scale[n_block, k_idx], voffset_scale[n_block], p_w_scale, mod=f'offset:{k_idx * k_step_wg // 128 * sizeof_f32}')
+                J.global_load_dword(v_w_scale[n_block, k_idx], voffset_scale[n_block], p_w_scale, mod=f'offset:{k_idx * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
     
     # ping pong register buffer id
     pp_reg_id = 0
