@@ -376,7 +376,8 @@ def moe_2stage_splitk(J:JIT,
                       p_sorted_expert_ids:"void*",
                       p_num_valid_ids:"void*",
                       p_w_scale:"float*",
-                      M:"int",):
+                      M:"int",
+                      fp8_ptpc,):
     assert weight_dtype == torch.bfloat16 or weight_dtype == torch.float4_e2m1fn_x2 or weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz
     if weight_dtype == torch.float4_e2m1fn_x2:
         if with_silu:
@@ -386,7 +387,10 @@ def moe_2stage_splitk(J:JIT,
             assert BLOCK_TILE_SIZE_N % 32 == 0, f'due to scale is packed with [2*16, 8*32], current BLOCK_TILE_SIZE_N={BLOCK_TILE_SIZE_N} is not supported'
             assert K % 32 == 0, f'will read 16*4 bytes once in main loop, aka 64*2=128 elements; tails support K%32==0; current K={K} is not supported'
     elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
-        assert K % 64 == 0, f'will read 16*4 bytes once in main loop, aka 64 elements; current K={K} is not supported'
+        if fp8_ptpc:
+            assert K % 64 == 0, f'will read 16*4 bytes once in main loop, aka 64 elements; current K={K} is not supported'
+        else:
+            assert K % (256 if with_silu else 64) == 0, f'fp8 blockwise K{K} should be multiple of {256 if with_silu else 64}, {with_silu=}'        
     else:
         assert K % 32 == 0, f'will read 16*4 bytes once in main loop, aka 64/2=32 elements; current K={K} is not supported'
     assert BLOCK_TILE_SIZE_M % 16 == 0
@@ -528,7 +532,7 @@ def moe_2stage_splitk(J:JIT,
             voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride)) + J.threadIdx.x * sizeof_f32
             for m in range(1, B_horz // 2):
                 voffset_scale[m] = voffset_scale[0] + 32 * k_scale_stride * m
-    elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+    elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
         voffset_scale = J.gpr(B_horz, 'vu32')
         p_w_scale[:] += (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * sizeof_f32 * J.blockIdx.x
         voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_mod_16 * sizeof_f32
@@ -540,13 +544,32 @@ def moe_2stage_splitk(J:JIT,
         else:
             for m in range(1, B_horz):
                 voffset_scale[m] = voffset_scale[0] + 16 * sizeof_f32 * m
-
+    elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
+        assert K %(num_split_k*128) == 0 ,f' K %(num_split_k*128) must be 0'
+        # the scale layout is [E, N//128, K//128]
+        k_scale_stride = K // 128 * sizeof_f32
+        # would need BLOCK_TILE_SIZE_N//128 *2 scale offset register for 1st stage. 
+        voffset_scale = J.gpr(2, 'vu32')
+        # N_wg scale offset on expert wg and N wg.
+        if with_silu:
+            p_w_scale[:] +=  BLOCK_TILE_SIZE_N_HALF* J.blockIdx.x // 128 * k_scale_stride + s_e_id * (N//128 * k_scale_stride)
+        else:
+            p_w_scale[:] +=  BLOCK_TILE_SIZE_N * J.blockIdx.x //128 * k_scale_stride + s_e_id * (N//128 * k_scale_stride )
+        if with_silu:
+            #[E, INTER_SIZE_TP*2//128, HIDDEN_SIZE//128]
+            voffset_scale[0] = J.threadIdx.x //128 * sizeof_f32
+            # N tile offset within wave offset
+            voffset_scale[1] = voffset_scale[0] + (N//2//128 * k_scale_stride )
+        else:
+            #  64 lane offset 
+            voffset_scale[0] = 0
+            voffset_scale[1] = 0
     p_weight[:] = p_weight[:] + s_e_id * (N * get_k_bytes(K))
     buff_b = J.Buffer(p_weight, N * get_k_bytes(K))
 
     gemm_splitk(J, weight_dtype, K, N, num_split_k,
                 buff_a, buff_b, p_w_scale,
-                voffset_a, voffset_b, voffset_scale, C_reg, BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M, USE_FP4_SHUFFLE_WEIGHT=USE_FP4_SHUFFLE_WEIGHT)
+                voffset_a, voffset_b, voffset_scale, C_reg, BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M, USE_FP4_SHUFFLE_WEIGHT=USE_FP4_SHUFFLE_WEIGHT, fp8_ptpc=fp8_ptpc)
 
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000

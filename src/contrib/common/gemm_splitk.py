@@ -21,7 +21,8 @@ def gemm_splitk(J:JIT,
                 soffset_b = 0,
                 BLOCK_TILE_SIZE_N = 32,
                 BLOCK_TILE_SIZE_M = 16,
-                USE_FP4_SHUFFLE_WEIGHT=False
+                USE_FP4_SHUFFLE_WEIGHT=False,
+                fp8_ptpc=True
                 ):
     assert BLOCK_TILE_SIZE_M % 16 == 0, f'BLOCK_TILE_SIZE_M must be multiple of 16, current {BLOCK_TILE_SIZE_M=}'
     assert BLOCK_TILE_SIZE_N % 32 == 0, f'BLOCK_TILE_SIZE_N must be multiple of 32, current {BLOCK_TILE_SIZE_N=}'
@@ -65,24 +66,33 @@ def gemm_splitk(J:JIT,
     # fp8:  ..       ..                                                ..                        index for different mfma
     B_reg = J.gpr(2, B_horz, 2, 2, "vbf16x2") # 8-bf16 == DWORDx4
 
+    k_step_wg = num_split_k * 32 * A_rep
+    k_max = div_up(K, k_step_wg)
+
+
     if weight_dtype == torch.float4_e2m1fn_x2:
         # the column of scale is K//32
         k_scale_n = div_up(div_up(K, 32), 8) // num_split_k
         v_w_scale = J.gpr(B_horz // 2, k_scale_n, 'vf32', align=4)
         k_scale_n_next_read_idx = 0
-    elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+    elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
         v_w_scale = J.gpr(B_horz, 2, 'vf32')
         for n in range(B_horz):
             J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
-
+    elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
+            k_scale_n = k_max
+            QUAN_BLK_SZ=128
+            v_w_scale = J.gpr(2, k_scale_n, 'vf32')
+            for n_block in range(2):
+                for k_idx in range(k_scale_n):
+                    J.global_load_dword(v_w_scale[n_block, k_idx], voffset_scale[n_block], p_w_scale, mod=f'offset:{k_idx * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
+        
     # ping pong register buffer id
     pp_reg_id = 0
-    k_step_wg = num_split_k * 32 * A_rep
 
     # (A0.B0.C0.D0.A1.B1.C1.D1)[3, 2, 7, 6] = (A1.B1.A0.B0)
     pattern_cvt_bf16 = J.gpr("su32")
     pattern_cvt_bf16[0] = 0x03_02_07_06
-    k_max = div_up(K, k_step_wg)
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
 
@@ -118,6 +128,7 @@ def gemm_splitk(J:JIT,
         J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * A_rep + k_scale_wip})")
     
     def mfma_gen(pp_reg_id, k=None):
+        kstep = k
         if weight_dtype == torch.float4_e2m1fn_x2:
             # decompress
             v_w_bf16 = J.gpr(2, 4, 'vf32', align=4)
@@ -151,7 +162,7 @@ def gemm_splitk(J:JIT,
                             next(gen)
             next(gen)
             
-        elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+        elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
             # decompress
             v_w_f32 = J.gpr(2, 2, 'vf32', align=4)
             v_w_bf16 = J.gpr(B_horz, 2, 'vf32', align=4)
@@ -172,6 +183,36 @@ def gemm_splitk(J:JIT,
                     for n in range(B_horz):
                         for m in range(A_vert):
                             yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i, j], C_reg[n, m])
+        elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
+            # decompress
+            v_w_f32 = J.gpr(2, 2, 2, 'vf32', align=4)
+            v_w_bf16 = J.gpr(B_horz, 2, 2, 'vf32', align=4)
+            v_tmp_scale_pk = J.gpr(2, 2, 'vf32', align=4)
+            J.v_mov_b32(v_tmp_scale_pk[0, 0], v_w_scale[0, kstep])
+            J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[0, kstep])
+            J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[1, kstep])
+            J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[1, kstep])
+            # loop with ktep = 8 elements per lane.
+            for i in range(2):
+                for n in range(B_horz):
+                        scale_idx = 0 if n < B_horz// 2  else 1
+                        # loop with ktep=4
+                        for j in range(2):
+                            J.v_cvt_pk_f32_fp8(v_w_f32[j, 0], B_reg[pp_reg_id, n, i, j])
+                            J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[j, 1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
+                            J.v_pk_mul_f32(v_w_f32[j, 0], v_w_f32[j, 0], v_tmp_scale_pk[scale_idx])
+                            J.v_pk_mul_f32(v_w_f32[j, 1], v_w_f32[j, 1], v_tmp_scale_pk[scale_idx])
+                            J.v_add_u32(v_w_f32[j, 0, 0], v_w_f32[j, 0, 0], s_cvt_bf16_bias)
+                            J.v_add_u32(v_w_f32[j, 0, 1], v_w_f32[j, 0, 1], s_cvt_bf16_bias)
+                            J.v_add_u32(v_w_f32[j, 1, 0], v_w_f32[j, 1, 0], s_cvt_bf16_bias)
+                            J.v_add_u32(v_w_f32[j, 1, 1], v_w_f32[j, 1, 1], s_cvt_bf16_bias)
+                            
+                            J.v_perm_b32(v_w_bf16[n, j, 0], v_w_f32[j, 0, 0], v_w_f32[j, 0, 1], pattern_cvt_bf16)
+                            J.v_perm_b32(v_w_bf16[n, j, 1], v_w_f32[j, 1, 0], v_w_f32[j, 1, 1], pattern_cvt_bf16)
+                    # 2, A_vert, A_rep=2, 2, 2
+                for n in range(B_horz):
+                    for m in range(A_vert):
+                        yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i], C_reg[n, m])
         else:
             for m in range(A_vert):
                 for n in range(B_horz):
@@ -189,7 +230,7 @@ def gemm_splitk(J:JIT,
     # prolog
     loader = load_gen(0, 0)
     J.emitter()([loader])
-    if weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+    if (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
         for n in range(B_horz):
             J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
     pp_reg_id = 1
