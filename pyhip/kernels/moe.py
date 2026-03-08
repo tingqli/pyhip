@@ -134,7 +134,7 @@ def moe_2stage_splitk(J:JIT,
                 voffset_b[0] = (BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x + lane_mod_16) * stride_B + lane_div_16 * 16 + J.warp_id * get_k_bytes(K // 4)
         else:
             # shffled [E, N/16, K/32, 2k, 16n, 16k]
-            voffset_b[0] = BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x * stride_B + J.lane_id * 16 + J.warp_id * (16 * get_k_bytes(K//4))
+            voffset_b[0] = BLOCK_TILE_SIZE_N_HALF * J.blockIdx.x * stride_B + J.threadIdx.x * 16
         voffset_b[B_horz // 2] = voffset_b[0] + (N // 2) * get_k_bytes(K)
         for m in range(1, B_horz // 2):
             voffset_b[m] = voffset_b[0] + get_k_bytes(K) * 16 * m
@@ -184,7 +184,7 @@ def moe_2stage_splitk(J:JIT,
         v_token_id[m] = v_sorted_id[m] & 0xffffff
         if with_silu:
             if weight_dtype != torch.float4_e2m1fn_x2:
-                voffset_a[m] = J.gpr(v_token_id[m] * stride_A + (lane_div_16) * (a_element_num_per_thread * sizeof_bf16) + J.warp_id * (K // 4 * sizeof_bf16))
+                voffset_a[m] = J.gpr(v_token_id[m] * stride_A + (J.threadIdx.x // 16) * (a_element_num_per_thread * sizeof_bf16))
             else:
                 voffset_a[m] = J.gpr(v_token_id[m] * stride_A + (lane_div_16) * (a_element_num_per_thread * sizeof_bf16) + J.warp_id * (K // 4 * sizeof_bf16))
         else:
@@ -235,7 +235,7 @@ def moe_2stage_splitk(J:JIT,
             p_w_scale[:] +=  BLOCK_TILE_SIZE_N * J.blockIdx.x //128 * k_scale_stride + s_e_id * (N//128 * k_scale_stride )
         if with_silu:
             #[E, INTER_SIZE_TP*2//128, HIDDEN_SIZE//128]
-            voffset_scale[0] = J.warp_id * (k_scale_stride //num_split_k) 
+            voffset_scale[0] = J.threadIdx.x //128 * sizeof_f32
             # N tile offset within wave offset
             voffset_scale[1] = voffset_scale[0] + (N//2//128 * k_scale_stride )
         else:
@@ -256,11 +256,11 @@ def moe_2stage_splitk(J:JIT,
     ###############################################
     if with_silu and BLOCK_TILE_SIZE_N % 64 == 0 and"gfx950" in J.arch:
         # use more lds
-        lds_buff = J.LDSTensor([4 * BLOCK_TILE_SIZE_M, 64], torch.float32) #[4*16, 64]
+        lds_buff = J.LDSTensor([4 * BLOCK_TILE_SIZE_M, 64], torch.float32)
         # each 32 N as a group to compute gate*up
-        n_groups = BLOCK_TILE_SIZE_N // 32 # =128//32 = 4
+        n_groups = BLOCK_TILE_SIZE_N // 32
         n_half0 = 0
-        n_half1 = B_horz // 2 # = 8//2=4
+        n_half1 = B_horz // 2
         # each wave holds [4, 16, A_vert] floats
         vouts = J.gpr(A_vert, "vf32")
         vrow = J.gpr(lane_div_16 + J.warp_id * 4)

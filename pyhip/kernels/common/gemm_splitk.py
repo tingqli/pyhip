@@ -79,11 +79,11 @@ def gemm_splitk(J:JIT,
     #     for n in range(B_horz):
     #         J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
     elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
-        k_scale_n = div_up(K, 128) // num_split_k
+        k_scale_n = k_max
         v_w_scale = J.gpr(2, k_scale_n, 'vf32')
         for n_block in range(2):
             for k_idx in range(k_scale_n):
-                J.global_load_dword(v_w_scale[n_block, k_idx], voffset_scale[n_block], p_w_scale, mod=f'offset:{k_idx * sizeof_f32}')
+                J.global_load_dword(v_w_scale[n_block, k_idx], voffset_scale[n_block], p_w_scale, mod=f'offset:{k_idx * k_step_wg // 128 * sizeof_f32}')
     
     # ping pong register buffer id
     pp_reg_id = 0
@@ -121,8 +121,8 @@ def gemm_splitk(J:JIT,
                 soffset_kb[0] = soffset_kb[0] + 64
             soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * sizeof_bf16
         else:
-            soffset_kb[0] = soffset_kb[0] + 16 * 64
-            soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * sizeof_bf16
+            soffset_kb[0] = soffset_kb[0] + 16 * 64 * num_split_k
+            soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * num_split_k * sizeof_bf16
         J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * A_rep + k_scale_wip})")
     
     def mfma_gen(pp_reg_id, k=None):
@@ -165,10 +165,10 @@ def gemm_splitk(J:JIT,
             v_w_f32 = J.gpr(2, 2, 2, 'vf32', align=4)
             v_w_bf16 = J.gpr(B_horz, 2, 2, 'vf32', align=4)
             v_tmp_scale_pk = J.gpr(2, 2, 'vf32', align=4)
-            J.v_mov_b32(v_tmp_scale_pk[0, 0], v_w_scale[0, kstep//2])
-            J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[0, kstep//2])
-            J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[1, kstep//2])
-            J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[1, kstep//2])
+            J.v_mov_b32(v_tmp_scale_pk[0, 0], v_w_scale[0, kstep])
+            J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[0, kstep])
+            J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[1, kstep])
+            J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[1, kstep])
             # loop with ktep = 8 elements per lane.
             for i in range(2):
                 for n in range(B_horz):
