@@ -95,7 +95,7 @@ def gemm_splitk(J:JIT,
     pattern_cvt_bf16[0] = 0x03_02_07_06
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
-
+    is_cdna4 = "gfx950" in J.arch
     def load_gen(pp_reg_id, k=None):
         k_scale_wip = 0
         if weight_dtype == torch.float4_e2m1fn_x2:
@@ -162,28 +162,32 @@ def gemm_splitk(J:JIT,
             next(gen)
             
         elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
-            # decompress
-            v_w_f32 = J.gpr(2, 2, 'vf32', align=4)
-            v_w_bf16 = J.gpr(B_horz, 2, 'vf32', align=4)
+            v_w_f32 = J.gpr(2, 2, 2, 'vf32', align=4)
+            v_w_bf16 = J.gpr(B_horz, 2, 2, 'vf32', align=4)
+             # kl = 16  would be divided into 2 steps. Each accumulate 8 in K dimension.
             for i in range(2):
-                for j in range(2):
-                    for n in range(B_horz):
-                        J.v_cvt_pk_f32_fp8(v_w_f32[0], B_reg[pp_reg_id, n, i, j])
-                        J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
-                        J.v_pk_mul_f32(v_w_f32[0], v_w_f32[0], v_w_scale[n])
-                        J.v_pk_mul_f32(v_w_f32[1], v_w_f32[1], v_w_scale[n])
-                        J.v_add_u32(v_w_f32[0, 0], v_w_f32[0, 0], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[0, 1], v_w_f32[0, 1], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[1, 0], v_w_f32[1, 0], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[1, 1], v_w_f32[1, 1], s_cvt_bf16_bias)
-                        J.v_perm_b32(v_w_bf16[n, 0], v_w_f32[0, 0], v_w_f32[0, 1], pattern_cvt_bf16)
-                        J.v_perm_b32(v_w_bf16[n, 1], v_w_f32[1, 0], v_w_f32[1, 1], pattern_cvt_bf16)
-                    # 2, A_vert, A_rep=2, 2, 2
-                    for n in range(B_horz):
-                        for m in range(A_vert):
-                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i, j], C_reg[n, m])
+                for n in range(B_horz):
+                    for j in range(2):
+                        J.v_cvt_pk_f32_fp8(v_w_f32[j, 0], B_reg[pp_reg_id, n, i, j])
+                        J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[j, 1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
+                        J.v_pk_mul_f32(v_w_f32[j, 0], v_w_f32[j, 0], v_w_scale[n])
+                        J.v_pk_mul_f32(v_w_f32[j, 1], v_w_f32[j, 1], v_w_scale[n])
+                        J.v_add_u32(v_w_f32[j, 0, 0], v_w_f32[j, 0, 0], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[j, 0, 1], v_w_f32[j, 0, 1], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[j, 1, 0], v_w_f32[j, 1, 0], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[j, 1, 1], v_w_f32[j, 1, 1], s_cvt_bf16_bias)
+                        J.v_perm_b32(v_w_bf16[n, j, 0], v_w_f32[j, 0, 0], v_w_f32[j, 0, 1], pattern_cvt_bf16)
+                        J.v_perm_b32(v_w_bf16[n, j, 1], v_w_f32[j, 1, 0], v_w_f32[j, 1, 1], pattern_cvt_bf16)
+                # 2, A_vert, A_rep=2, 2, 2
+                for n in range(B_horz):
+                    for m in range(A_vert):
+                        if is_cdna4:
+                            yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i], C_reg[n, m])
+                        else:
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 0], A_reg[pp_reg_id, m, i, 0], C_reg[n, m])
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[pp_reg_id, m, i, 1], C_reg[n, m])
+
         elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
-            # decompress
             v_w_f32 = J.gpr(2, 2, 2, 'vf32', align=4)
             v_w_bf16 = J.gpr(B_horz, 2, 2, 'vf32', align=4)
             v_tmp_scale_pk = J.gpr(2, 2, 'vf32', align=4)
@@ -191,32 +195,37 @@ def gemm_splitk(J:JIT,
             J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[0, k])
             J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[1, k])
             J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[1, k])
-            # loop with ktep = 8 elements per lane.
+            # kl = 16  would be divided into 2 steps. Each accumulate 8 in K dimension.
             for i in range(2):
                 for n in range(B_horz):
-                        scale_idx = 0 if n < B_horz// 2  else 1
-                        # loop with ktep=4
-                        for j in range(2):
-                            J.v_cvt_pk_f32_fp8(v_w_f32[j, 0], B_reg[pp_reg_id, n, i, j])
-                            J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[j, 1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
-                            J.v_pk_mul_f32(v_w_f32[j, 0], v_w_f32[j, 0], v_tmp_scale_pk[scale_idx])
-                            J.v_pk_mul_f32(v_w_f32[j, 1], v_w_f32[j, 1], v_tmp_scale_pk[scale_idx])
-                            J.v_add_u32(v_w_f32[j, 0, 0], v_w_f32[j, 0, 0], s_cvt_bf16_bias)
-                            J.v_add_u32(v_w_f32[j, 0, 1], v_w_f32[j, 0, 1], s_cvt_bf16_bias)
-                            J.v_add_u32(v_w_f32[j, 1, 0], v_w_f32[j, 1, 0], s_cvt_bf16_bias)
-                            J.v_add_u32(v_w_f32[j, 1, 1], v_w_f32[j, 1, 1], s_cvt_bf16_bias)
-                            
-                            J.v_perm_b32(v_w_bf16[n, j, 0], v_w_f32[j, 0, 0], v_w_f32[j, 0, 1], pattern_cvt_bf16)
-                            J.v_perm_b32(v_w_bf16[n, j, 1], v_w_f32[j, 1, 0], v_w_f32[j, 1, 1], pattern_cvt_bf16)
-                    # 2, A_vert, A_rep=2, 2, 2
+                    scale_idx = 0 if n < B_horz// 2  else 1
+                    for j in range(2):
+                        J.v_cvt_pk_f32_fp8(v_w_f32[j, 0], B_reg[pp_reg_id, n, i, j])
+                        J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[j, 1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
+                        J.v_pk_mul_f32(v_w_f32[j, 0], v_w_f32[j, 0], v_tmp_scale_pk[scale_idx])
+                        J.v_pk_mul_f32(v_w_f32[j, 1], v_w_f32[j, 1], v_tmp_scale_pk[scale_idx])
+                        J.v_add_u32(v_w_f32[j, 0, 0], v_w_f32[j, 0, 0], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[j, 0, 1], v_w_f32[j, 0, 1], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[j, 1, 0], v_w_f32[j, 1, 0], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[j, 1, 1], v_w_f32[j, 1, 1], s_cvt_bf16_bias)
+                        J.v_perm_b32(v_w_bf16[n, j, 0], v_w_f32[j, 0, 0], v_w_f32[j, 0, 1], pattern_cvt_bf16)
+                        J.v_perm_b32(v_w_bf16[n, j, 1], v_w_f32[j, 1, 0], v_w_f32[j, 1, 1], pattern_cvt_bf16)
                 for n in range(B_horz):
+                    # 2, A_vert, A_rep=2, 2, 2
                     for m in range(A_vert):
-                        yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i], C_reg[n, m])
+                        if is_cdna4:
+                            yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i], C_reg[n, m])
+                        else:
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 0], A_reg[pp_reg_id, m, i, 0], C_reg[n, m])
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[pp_reg_id, m, i, 1], C_reg[n, m])
         else:
             for m in range(A_vert):
                 for n in range(B_horz):
-                    yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 0], A_reg[pp_reg_id, m, 0, 0], C_reg[n, m])
-                    yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 1], A_reg[pp_reg_id, m, 0, 1], C_reg[n, m])
+                    if is_cdna4:
+                        yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], B_reg[pp_reg_id, n], A_reg[pp_reg_id, m, 0], C_reg[n, m])
+                    else:
+                        yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 0], A_reg[pp_reg_id, m, 0, 0], C_reg[n, m])
+                        yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 1], A_reg[pp_reg_id, m, 0, 1], C_reg[n, m])
 
     def loop(pp_reg_id, k=None):
         loader = load_gen(pp_reg_id, k)
