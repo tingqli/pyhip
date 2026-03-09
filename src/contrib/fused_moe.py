@@ -310,19 +310,20 @@ def fused_moe(
         if token_num * topk <= E:
             grid = token_num * topk
 
+        fp8_ptpc = False
         #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 2 * 2), name="moe_2stage_splitk(12)"):
         if 1:
             moe_2stage_splitk([inter_dim*2 // block_size_N, grid], [256],
                                 w1.dtype, topk, model_dim, inter_dim*2, True, block_size_M, block_size_N,
                                 hidden_states.data_ptr(), w1.data_ptr(), a2.data_ptr(),
-                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num)
+                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num, fp8_ptpc)
         #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 1 * 2), name=f"moe_2stage_splitk(3)-{block_size_M}-{num_valid_ids[0].item()//block_size_M}"):
         if 1:
             if 1:
                 moe_2stage_splitk([model_dim // block_size_N, grid], [64],
                             w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
                             a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
-                            sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num)
+                            sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num, fp8_ptpc)
             else:
                 moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
                             w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
