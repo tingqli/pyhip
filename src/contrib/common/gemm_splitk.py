@@ -128,7 +128,6 @@ def gemm_splitk(J:JIT,
         J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * A_rep + k_scale_wip})")
     
     def mfma_gen(pp_reg_id, k=None):
-        kstep = k
         if weight_dtype == torch.float4_e2m1fn_x2:
             # decompress
             v_w_bf16 = J.gpr(2, 4, 'vf32', align=4)
@@ -188,10 +187,10 @@ def gemm_splitk(J:JIT,
             v_w_f32 = J.gpr(2, 2, 2, 'vf32', align=4)
             v_w_bf16 = J.gpr(B_horz, 2, 2, 'vf32', align=4)
             v_tmp_scale_pk = J.gpr(2, 2, 'vf32', align=4)
-            J.v_mov_b32(v_tmp_scale_pk[0, 0], v_w_scale[0, kstep])
-            J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[0, kstep])
-            J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[1, kstep])
-            J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[1, kstep])
+            J.v_mov_b32(v_tmp_scale_pk[0, 0], v_w_scale[0, k])
+            J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[0, k])
+            J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[1, k])
+            J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[1, k])
             # loop with ktep = 8 elements per lane.
             for i in range(2):
                 for n in range(B_horz):
