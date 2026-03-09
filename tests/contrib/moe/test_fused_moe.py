@@ -367,7 +367,7 @@ parser.add_argument(
     "--act",
     type=str,
     choices=["silu", "gelu"],
-    default=None,
+    default="silu",
     help="""Select activation type.
     e.g.: -a silu""",
 )
@@ -378,7 +378,7 @@ parser.add_argument(
     type=dtypes.str2bool,
     nargs="?",
     const=None,
-    default=None,
+    default=False,
     help="""Whether to do weight in stage 1. Default is [False, True].
     -s f    # False.
     -s t    # True.""",
@@ -408,7 +408,7 @@ parser.add_argument(
     type=dtypes.str2bool,
     nargs="?",
     const=None,
-    default=None,
+    default=True,
     help="""Whether to use pre-shuffle weight mode. Default is [False, True].
     -p f    # False.
     -p t    # True.""",

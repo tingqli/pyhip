@@ -296,28 +296,40 @@ def fused_moe(
             block_size_M,
             expert_mask, num_local_tokens, moe_sorting_dispatch_policy,
         )
+        if verbose:
+            print("sorted_ids        :", list(sorted_ids.shape), sorted_ids.dtype)
+            print("\t", sorted_ids[:block_size_M])
+            print("\t", sorted_ids[block_size_M:block_size_M*2])
+            print("\t", sorted_ids[-block_size_M:])
+            print("sorted_weights    :", list(sorted_weights.shape), sorted_weights.dtype)
+            print("sorted_expert_ids :", list(sorted_expert_ids.shape), sorted_expert_ids.dtype, sorted_expert_ids.tolist())
+            print("num_valid_ids     :", list(num_valid_ids.shape), num_valid_ids.dtype, num_valid_ids.tolist())
+            print("moe_out           :", list(moe_out.shape), moe_out.dtype)
+
         grid = sorted_expert_ids.shape[0]
         if token_num * topk <= E:
             grid = token_num * topk
+
+        #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 2 * 2), name="moe_2stage_splitk(12)"):
         if 1:
             moe_2stage_splitk([inter_dim*2 // block_size_N, grid], [256],
                                 w1.dtype, topk, model_dim, inter_dim*2, True, block_size_M, block_size_N,
                                 hidden_states.data_ptr(), w1.data_ptr(), a2.data_ptr(),
                                 sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num)
-            moe_2stage_splitk([model_dim // block_size_N, grid], [64],
-                                w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
-                                a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
-                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num)
-        else:
-            # wrong results ???
-            moe_2stage_gateup([inter_dim*2 // block_size_N, grid], [256],
-                                w1.dtype, topk, model_dim, inter_dim*2, block_size_M, block_size_N,
-                                hidden_states.data_ptr(), w1.data_ptr(), a2.data_ptr(),
-                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num)
-            moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
-                                w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
-                                a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
-                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num)
+        #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 1 * 2), name=f"moe_2stage_splitk(3)-{block_size_M}-{num_valid_ids[0].item()//block_size_M}"):
+        if 1:
+            if 1:
+                moe_2stage_splitk([model_dim // block_size_N, grid], [64],
+                            w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
+                            a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
+                            sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num)
+            else:
+                moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
+                            w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
+                            a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
+                            sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num)
+
+
         return moe_out
 
 
@@ -327,7 +339,7 @@ def fused_moe(
     block_size_M = 256
     block_size_N = 256
 
-    while True:
+    while estimated_tokens_per_expert < 128:
         estimated_oc_blocks = min(inter_dim*2, model_dim)//block_size_N
         estimated_num_e_blocks = ((token_num * topk) // block_size_M)
         estimated_work_groups = estimated_num_e_blocks * estimated_oc_blocks

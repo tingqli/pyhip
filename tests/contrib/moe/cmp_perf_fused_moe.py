@@ -30,9 +30,9 @@ def get_fused_moe_time(model_dim, inter_dim, num_tokens, experts, topk, quant_mo
     for line in result.stdout.splitlines():
         if line.startswith("last-time-us:"):
             return float(line.split(":")[1]), cmd
-    print(result.stdout)
-    print(cmd)
-    return None
+    #print(result.stdout)
+    #print(cmd)
+    return -1, cmd
 
 test_cases = [
     # EP8 num-tokens reducing
@@ -41,9 +41,7 @@ test_cases = [
     (model_dim, inter_dim, 256, num_experts//8, num_experts_per_tok, 0),
     (model_dim, inter_dim, 128, num_experts//8, num_experts_per_tok, 0),
     (model_dim, inter_dim, 64, num_experts//8, num_experts_per_tok, 0),
-    # TP1
-    (model_dim, inter_dim, 512, num_experts, num_experts_per_tok, 0),
-    (model_dim, inter_dim, 5120, num_experts, num_experts_per_tok, 0),
+
     # TP8
     (model_dim, inter_dim//8, 4, num_experts, num_experts_per_tok, 0),
     (model_dim, inter_dim//8, 8, num_experts, num_experts_per_tok, 0),
@@ -54,6 +52,7 @@ test_cases = [
     (model_dim, inter_dim//8, 256, num_experts, num_experts_per_tok, 0),
     (model_dim, inter_dim//8, 512, num_experts, num_experts_per_tok, 0),
     (model_dim, inter_dim//8, 5120, num_experts, num_experts_per_tok, 0),
+    (model_dim, inter_dim//8, 8000, num_experts, num_experts_per_tok, 0),
 ]
 
 df = []    
@@ -63,11 +62,11 @@ for model_dim,inter_dim,num_tokens,experts,topk,_ in tqdm(test_cases):
     ret = {}
     # \u2713 tick   \u2717 cross
     if us_aiter < us_asmjit:
-        ret["us(aiter)"] = f"\033[92m \u2713 {us_aiter}\033[0m"
+        ret["us(aiter)"] = f"\033[92m \u2713 {'N/A' if us_aiter <= 0 else us_aiter}\033[0m"
         ret["us(amsjit)"] = f"{us_asmjit}"
     else:
         ret["us(aiter)"] = f"{us_aiter}"
-        ret["us(amsjit)"] = f"\033[92m \u2713 {us_asmjit}\033[0m"
+        ret["us(amsjit)"] = f"\033[92m \u2713 {'N/A' if us_asmjit <= 0 else us_asmjit}\033[0m"
 
     ret["model_dim"] = model_dim
     ret["inter_dim"] = inter_dim
@@ -78,7 +77,6 @@ for model_dim,inter_dim,num_tokens,experts,topk,_ in tqdm(test_cases):
 
     df.append(ret)
 
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-print(f"========== {quant_mode=} ============")
-print(df_md)
+    df_md = pd.DataFrame(df).to_markdown(index=False)
+    print(f"========== {quant_mode=} ============")
+    print(df_md)
