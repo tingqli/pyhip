@@ -11,6 +11,7 @@ dump asm code:
 ```
 #MLIR_ENABLE_DUMP=1 MLIR_DUMP_PATH=. TRITON_DISABLE_LINE_INFO=1
 AMDGCN_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 python moe.py > a.asm
+TRITON_DUMP_DIR=./dump TRITON_ALWAYS_COMPILE=1 TRITON_KERNEL_DUMP=1 python moe.py
 ```
 
 check if there is bankconflict:
