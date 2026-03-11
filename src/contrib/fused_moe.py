@@ -312,7 +312,7 @@ def fused_moe(
     estimated_tokens_per_expert = token_num * topk / global_E
     if estimated_tokens_per_expert < 32 and quant_type == aiter.QuantType.No:
         # mem-bound case : very small num_tokens
-        block_size_M = 16
+        block_size_M = 32
         block_size_N = 128
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = moe_sorting(
             topk_ids, topk_weight, global_E, model_dim,  dtype,

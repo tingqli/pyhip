@@ -90,9 +90,9 @@ def moe_2stage_splitk_gateup(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N):
         tile_n = gl.program_id(0)
         e_idx = gl.program_id(1)
         sorted_id_layout: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 1],
-                                                        threads_per_warp=[16, 4],
-                                                        warps_per_cta=[1, num_warps],
-                                                        order=[0, 1])
+                                                          threads_per_warp=[16, 4],
+                                                          warps_per_cta=[1, num_warps],
+                                                          order=[0, 1])
         sorted_id_offsets = e_idx * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, sorted_id_layout))[:, None]
         sorted_ids = gl.amd.cdna3.buffer_load(p_sorted_ids, sorted_id_offsets)
         num_valid_ids = gl.load(p_num_valid_ids)
@@ -106,12 +106,12 @@ def moe_2stage_splitk_gateup(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N):
                                         warps_per_cta=[num_warps, 1],
                                         order=[0, 1])
         sorted_ids_org = sorted_ids
-        sorted_ids = gl.convert_layout(sorted_ids.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_a_layout), assert_trivial=True)
+        sorted_ids = gl.convert_layout(sorted_ids, mem_a_layout, assert_trivial=True)
         sorted_topk = sorted_ids >> 24
         sorted_ids = sorted_ids & 0xffffff
         sorted_topk = gl.where(sorted_topk < TOPK, sorted_topk, 0)
         sorted_ids = gl.where(sorted_ids < M, sorted_ids, 0)
-        mem_a_offsets = (sorted_ids * K)[:, None] + \
+        mem_a_offsets = (sorted_ids * K) + \
                         gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
         mem_b_offsets_top = tile_n * BLOCK_TILE_SIZE_N // 2 * K + gl.arange(0, BLOCK_TILE_SIZE_N // 2 // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * (K // 8 * 16 * 8) + \
                         gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
@@ -169,12 +169,12 @@ def moe_2stage_splitk_gateup(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N):
             warps_per_cta=[num_warps, 1],
             order=[1, 0],
         )
-        sorted_ids_org = gl.convert_layout(sorted_ids_org.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_c_layout), assert_trivial=False)
+        sorted_ids_org = gl.convert_layout(sorted_ids_org, mem_c_layout, assert_trivial=False)
         sorted_ids = sorted_ids_org & 0xffffff
         sorted_topk = sorted_ids_org >> 24
         out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N // 2 + gl.arange(0, BLOCK_TILE_SIZE_N // 2, layout=gl.SliceLayout(0, mem_c_layout)))
-        out_offsets = sorted_ids[:, None] * N // 2 * TOPK + sorted_topk[:, None] * N // 2 + out_offsets_n[None, :]
-        mask = (sorted_ids < M)[:, None]
+        out_offsets = sorted_ids * N // 2 * TOPK + sorted_topk * N // 2 + out_offsets_n[None, :]
+        mask = (sorted_ids < M)
         gl.amd.cdna3.buffer_store(gl.convert_layout(acc, mem_c_layout, assert_trivial=True), p_output, out_offsets, mask=mask)
     
     return moe_up
@@ -281,12 +281,12 @@ def moe_2stage_splitk_down(
                                         warps_per_cta=[num_warps, 1],
                                         order=[0, 1])
         sorted_ids_org = sorted_ids
-        sorted_ids = gl.convert_layout(sorted_ids.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_a_layout), assert_trivial=True)
+        sorted_ids = gl.convert_layout(sorted_ids, mem_a_layout, assert_trivial=True)
         sorted_topk = sorted_ids >> 24
         sorted_ids = sorted_ids & 0xffffff
         sorted_topk = gl.where(sorted_topk < TOPK, sorted_topk, 0)
         sorted_ids = gl.where(sorted_ids < M, sorted_ids, 0)
-        mem_a_offsets = (sorted_ids * K * TOPK + sorted_topk * K)[:, None] + \
+        mem_a_offsets = (sorted_ids * K * TOPK + sorted_topk * K) + \
                         gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
         mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * (K // 8 * 16 * 8) + \
                         gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
@@ -340,21 +340,21 @@ def moe_2stage_splitk_down(
         b_fma = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
         acc = gl.amd.cdna4.mfma(a_fma, b_fma, acc)
 
-        sorted_ids_org = gl.convert_layout(sorted_ids_org.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_c_layout), assert_trivial=False)
+        sorted_ids_org = gl.convert_layout(sorted_ids_org, mem_c_layout, assert_trivial=False)
         sorted_ids = sorted_ids_org & 0xffffff
         out_offsets_m = sorted_ids
         out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout)))
-        out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
+        out_offsets = out_offsets_m * N + out_offsets_n[None, :]
         acc = acc.reshape(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)
         # `broadcasting in Triton is special: the operands for broadcast must come from a reduction of the same tensor.` from:
         #   https://github.com/triton-lang/triton/issues/8580
-        sorted_weights = gl.convert_layout(sorted_weights.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, acc.type.layout), assert_trivial=True)[:, None]
+        sorted_weights = gl.convert_layout(sorted_weights, acc.type.layout, assert_trivial=True)
         acc = (acc * sorted_weights).to(gl.bfloat16)
         acc = gl.convert_layout(acc, mem_c_layout, assert_trivial=False)
         # the following will trigger lds to shuffle sorted_weights
-        # sorted_weights = gl.convert_layout(sorted_weights.reshape(BLOCK_TILE_SIZE_M), gl.SliceLayout(1, mem_c_layout), assert_trivial=False)[:, None]
+        # sorted_weights = gl.convert_layout(sorted_weights, mem_c_layout, assert_trivial=False)
         # acc = (acc * sorted_weights).to(gl.bfloat16)
-        mask = (out_offsets_m < M)[:, None]
+        mask = (out_offsets_m < M)
         #gl.atomic_add(p_output + out_offsets, acc, sem='relaxed', mask=mask)
         gl.amd.cdna4.buffer_atomic_add(p_output, out_offsets, acc, sem='relaxed', mask=mask)
         for _ in gl.static_range(BLOCK_TILE_SIZE_M * BLOCK_TILE_SIZE_N // 64 // 2):
