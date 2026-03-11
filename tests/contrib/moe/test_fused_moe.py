@@ -15,6 +15,7 @@ import logging
 from aiter.fused_moe import (
     fused_topk,
     fused_moe,
+    torch_moe,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -30,7 +31,19 @@ from pyhip import calc_diff
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
+# torch.cuda.set_device(0)
 torch.manual_seed(0)
+
+def generate_data(total_token, num_global_expert, num_local_expert, model_dim, topk, dtype):
+    total_x = torch.randn((total_token, model_dim), dtype=dtype)
+    score = torch.randn((total_token, num_global_expert), dtype=dtype)
+    total_topk_weights, total_topk_ids = fused_topk(total_x, score, topk, True)
+    local_expert_mask = torch.any(total_topk_ids < num_local_expert, dim=1)
+    selected_indices = torch.nonzero(local_expert_mask, as_tuple=True)[0]
+    topk_ids = total_topk_ids[selected_indices]
+    input_x = total_x[selected_indices]
+    topk_weights = total_topk_weights[selected_indices]
+    return input_x, topk_ids, topk_weights
 
 @benchmark()
 def test_fmoe(
@@ -49,12 +62,33 @@ def test_fmoe(
     hidden_pad=0,
     intermediate_pad=0,
     preshuffle=False,
-    diff_thr=1e-4
+    diff_thr=1e-4,
+    ep_size=1
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
-    input = torch.randn((token, model_dim), dtype=dtype)
+
+    if ep_size > 1:
+        num_global_expert = E
+        assert num_global_expert % ep_size == 0
+        num_local_expert = num_global_expert // ep_size
+
+        E = num_local_expert
+        # ensure each EP rank get roughly same number of tokens
+        total_token = token * ep_size
+        input, topk_ids, topk_weights = generate_data(total_token, num_global_expert, num_local_expert, model_dim, topk, dtype)
+        token = input.shape[0]
+        expert_mask = torch.zeros(size=(num_global_expert,), dtype=torch.int32)
+        expert_mask[:num_local_expert] = 1        
+    else:
+        num_global_expert = E
+        num_local_expert = E
+        input = torch.randn((token, model_dim), dtype=dtype)
+        score = torch.randn((token, E), dtype=dtype)
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+        expert_mask = None
+
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         if hidden_pad != 0 and intermediate_pad != 0:
@@ -70,8 +104,6 @@ def test_fmoe(
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
-    score = torch.randn((token, E), dtype=dtype)
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -186,52 +218,69 @@ def test_fmoe(
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
-    # # ######################## stage 1 start ###########
-    out1_ref = torch_moe_stage1(
-        a1_qt,
-        w1_qt,
-        w2_qt,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        activation=actType,
-        quant_type=qType,
-        a1_scale=a1_scale,
-        w1_scale=w1_scale,
-        w1_bias=exp_bias1,
-        doweight=doweight_stage1,
-    )
-
-    # ######################## stage 2 start ###########
-    if qType == aiter.QuantType.per_128x128:
-        a2_qt, a2_scale = aiter.pertoken_quant(
-            out1_ref.view(token, -1, 128), quant_dtype=AQDType
+    if ep_size > 1:
+        # reference impl which do not simulate quant-behaviour but support expert_mask
+        out2_ref = torch_moe(
+            input,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            # following for int8 quant
+            fc1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
+            fc2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
+            fc1_smooth_scale=None,  # [expert(local_expert:EP), 1, model_dim]
+            fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+            expert_mask=expert_mask,
+            activation=actType,
         )
-        a2_scale = a2_scale.view(token, topk, -1)
-    elif (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
-        and (WQDType == dtypes.fp4x2)
-    ):  # a16w4 & a8w4
-        a2_qt = out1_ref
-        a2_scale = None
     else:
-        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
-    a2_qt = a2_qt.view(token, topk, -1)
+        # # ######################## stage 1 start ###########
+        out1_ref = torch_moe_stage1(
+            a1_qt,
+            w1_qt,
+            w2_qt,
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            activation=actType,
+            quant_type=qType,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+            w1_bias=exp_bias1,
+            doweight=doweight_stage1,
+        )
 
-    out2_ref = torch_moe_stage2(
-        a2_qt,
-        w1_qt,  # E, inter_dim*2, model_dim
-        w2_qt,  # E, model_dim, inter_dim
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        quant_type=qType,
-        w2_scale=w2_scale,
-        a2_scale=a2_scale,
-        w2_bias=exp_bias2,
-        doweight=not doweight_stage1,
-    )
+        # ######################## stage 2 start ###########
+        if qType == aiter.QuantType.per_128x128:
+            a2_qt, a2_scale = aiter.pertoken_quant(
+                out1_ref.view(token, -1, 128), quant_dtype=AQDType
+            )
+            a2_scale = a2_scale.view(token, topk, -1)
+        elif (
+            qType == aiter.QuantType.per_1x32
+            and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+            and (WQDType == dtypes.fp4x2)
+        ):  # a16w4 & a8w4
+            a2_qt = out1_ref
+            a2_scale = None
+        else:
+            a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
+        a2_qt = a2_qt.view(token, topk, -1)
+
+        out2_ref = torch_moe_stage2(
+            a2_qt,
+            w1_qt,  # E, inter_dim*2, model_dim
+            w2_qt,  # E, model_dim, inter_dim
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            quant_type=qType,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            w2_bias=exp_bias2,
+            doweight=not doweight_stage1,
+        )
 
     # ######################## stage 2 end ###########
     out2_ck, us2 = pyhip.run_perftest(
@@ -250,6 +299,7 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
+        expert_mask=expert_mask,
         num_iters=5,
         num_warmup=2,
     )
@@ -394,6 +444,14 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "-ep",
+    type=int,
+    default=1,
+    help="""EP: expert-parallel number
+    e.g.: -ep 8""",
+)
+
+parser.add_argument(
     "-k",
     "--topk",
     type=int,
@@ -433,7 +491,7 @@ parser.add_argument(
     action=UseJitAction,
     help="use jit."
 )
-diff_thr = 1e-2
+diff_thr = 0.01
 
 #########################################################################################################################
 args = parser.parse_args()
@@ -559,7 +617,8 @@ for (
                         use_g1u1=True,
                         doweight_stage1=doweight_stage1,
                         preshuffle=preshuffle,
-                        diff_thr=diff_thr
+                        diff_thr=diff_thr,
+                        ep_size=args.ep
                     )
                     df.append(ret)
 time_us = float(df[-1]["us"])

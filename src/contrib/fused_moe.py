@@ -9,6 +9,7 @@ from .gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_d
 
 import os
 USE_GLUON = int(os.getenv("USE_GLUON", "1"))
+VERBOSE = int(os.getenv("VERBOSE", "0"))
 
 __all__ = [
     "fused_moe"
@@ -166,6 +167,26 @@ def moe_sorting_ref(topk_ids,       # [num_tokens, topk]
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out
 
+def debug_verbose_moe_sorting(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out, token_num, topk, block_size_M, estimated_tokens_per_expert):
+    if VERBOSE:
+        num_expert_blocks = num_valid_ids[0].item()//block_size_M
+        print("estimated_tokens_per_expert        :", estimated_tokens_per_expert)
+        print("num_expert_blocks :", num_expert_blocks)
+        print("hit_experts       :", len(set(sorted_expert_ids.tolist()[:num_expert_blocks])))
+        print("sorted_ids        :", list(sorted_ids.shape), sorted_ids.dtype)
+        for n in [0,1, num_expert_blocks-1]:
+            n0 = n*block_size_M
+            n1 = n0 + block_size_M
+            print("\t", (sorted_ids[n0:n1] & 0xFFFFFF).tolist())
+
+        hit_tokens = len(set(sorted_ids[:num_expert_blocks*block_size_M]))
+        total_tokens = token_num * topk
+        print(f"hit tokens        :{hit_tokens} / {total_tokens} = {hit_tokens/total_tokens*100:.1f} %", )
+
+        print("sorted_weights    :", list(sorted_weights.shape), sorted_weights.dtype)
+        print("sorted_expert_ids :", list(sorted_expert_ids.shape), sorted_expert_ids.dtype, sorted_expert_ids.tolist()[:num_expert_blocks])
+        print("num_valid_ids     :", list(num_valid_ids.shape), num_valid_ids.dtype, num_valid_ids.tolist())
+        print("moe_out           :", list(moe_out.shape), moe_out.dtype)
 
 def fused_moe(
     hidden_states,
@@ -206,7 +227,6 @@ def fused_moe(
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     assert w1.shape[1] == inter_dim * 2
-    assert expert_mask is None
 
     """
     /sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py
@@ -239,9 +259,7 @@ def fused_moe(
     q_dtype_w = w1.dtype
     q_dtype_a = dtype if quant_type == aiter.QuantType.No else w1.dtype
 
-    verbose = 0
-
-    if verbose:
+    if VERBOSE:
         print(f"============================================= {device=} ")
         print(f" quant_type : {quant_type}")
         print(f" dtype      : {dtype}")
@@ -257,6 +275,7 @@ def fused_moe(
         print("\ttopk_ids:", list(topk_ids.shape), topk_ids.dtype)                  # topk_ids     : [M, topk]      torch.int32
         if expert_mask is not None:
             print("\texpert_mask:", list(expert_mask.shape), expert_mask.dtype)
+            print("\t", expert_mask)
         if w1_scale is not None:
             print("\tw1_scale:", list(w1_scale.shape), w1_scale.dtype)              # w1_scale     : [E, inter_dim*2//128,  model_dim//128]  torch.float32
         if w2_scale is not None:
@@ -290,7 +309,7 @@ def fused_moe(
     #moe_sorting = moe_sorting_ref
     moe_sorting = aiter.fused_moe.moe_sorting
 
-    estimated_tokens_per_expert = token_num * topk / E
+    estimated_tokens_per_expert = token_num * topk / global_E
     if estimated_tokens_per_expert < 32 and quant_type == aiter.QuantType.No:
         # mem-bound case : very small num_tokens
         block_size_M = 16
@@ -300,15 +319,7 @@ def fused_moe(
             block_size_M,
             expert_mask, num_local_tokens, moe_sorting_dispatch_policy,
         )
-        if verbose:
-            print("sorted_ids        :", list(sorted_ids.shape), sorted_ids.dtype)
-            print("\t", sorted_ids[:block_size_M])
-            print("\t", sorted_ids[block_size_M:block_size_M*2])
-            print("\t", sorted_ids[-block_size_M:])
-            print("sorted_weights    :", list(sorted_weights.shape), sorted_weights.dtype)
-            print("sorted_expert_ids :", list(sorted_expert_ids.shape), sorted_expert_ids.dtype, sorted_expert_ids.tolist())
-            print("num_valid_ids     :", list(num_valid_ids.shape), num_valid_ids.dtype, num_valid_ids.tolist())
-            print("moe_out           :", list(moe_out.shape), moe_out.dtype)
+        debug_verbose_moe_sorting(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out, token_num, topk, block_size_M, estimated_tokens_per_expert)
 
         grid = sorted_expert_ids.shape[0]
         if token_num * topk <= E:
@@ -403,15 +414,7 @@ def fused_moe(
             block_size_M,
             expert_mask, num_local_tokens, moe_sorting_dispatch_policy,
         )
-    if verbose:
-        print("sorted_ids        :", list(sorted_ids.shape), sorted_ids.dtype)
-        print("\t", sorted_ids[:block_size_M])
-        print("\t", sorted_ids[block_size_M:block_size_M*2])
-        print("\t", sorted_ids[-block_size_M:])
-        print("sorted_weights    :", list(sorted_weights.shape), sorted_weights.dtype)
-        print("sorted_expert_ids :", list(sorted_expert_ids.shape), sorted_expert_ids.dtype, sorted_expert_ids.tolist())
-        print("num_valid_ids     :", list(num_valid_ids.shape), num_valid_ids.dtype, num_valid_ids.tolist())
-        print("moe_out           :", list(moe_out.shape), moe_out.dtype)
+    debug_verbose_moe_sorting(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out, token_num, topk, block_size_M, estimated_tokens_per_expert)
 
     def dummy_quant_func(input, scale, quant_dtype=None, num_rows = 0, num_rows_factor = 0, transpose_scale = False):
         return input, None
@@ -430,7 +433,7 @@ def fused_moe(
         transpose_scale=True
     )
 
-    if verbose:
+    if VERBOSE:
         print("\ta1        :", list(a1.shape), a1.dtype)                # [token_num, model_dim]        torch.float8_e4m3fn
         if a1_scale is not None:
             print("\ta1_scale  :", list(a1_scale.shape), a1_scale.dtype)    # [token_num, model_dim//128]   torch.float32
@@ -498,9 +501,10 @@ def fused_moe(
         device=device,
     )
 
-    if verbose:
+    if VERBOSE:
         print("\ta2        :", list(a2.shape), a2.dtype)                # [token_num, topk, inter_dim]        torch.float8_e4m3fn
-        print("\ta2_scale  :", list(a2_scale.shape), a2_scale.dtype)    # [token_num, topk, inter_dim//128]   torch.float32
+        if a2_scale is not None:
+            print("\ta2_scale  :", list(a2_scale.shape), a2_scale.dtype)    # [token_num, topk, inter_dim//128]   torch.float32
 
     assert model_dim % wg_N == 0
     num_oc_blocks = model_dim//wg_N

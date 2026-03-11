@@ -43,8 +43,8 @@ args = parser.parse_args()
 
 model_dim, inter_dim, num_experts, num_experts_per_tok, quant_mode = args.dim
 
-def get_fused_moe_time(model_dim, inter_dim, num_tokens, experts, topk, quant_mode, use_jit):
-    cmd = f"python test_fused_moe.py -dim {model_dim},{inter_dim} -t {num_tokens} -a silu -s f -e {experts} -k {topk} -p t -q {quant_mode}"
+def get_fused_moe_time(model_dim, inter_dim, num_tokens, experts, topk, quant_mode, ep_size, use_jit):
+    cmd = f"python test_fused_moe.py -dim {model_dim},{inter_dim} -t {num_tokens} -a silu -s f -e {experts} -k {topk} -p t -q {quant_mode} -ep {ep_size}"
     if use_jit:
         cmd += " -j"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -56,11 +56,11 @@ def get_fused_moe_time(model_dim, inter_dim, num_tokens, experts, topk, quant_mo
     return -1, cmd
 
 
-def do_test(test_cases):
+def do_test(test_cases, ep_size=1):
     df = []
     for model_dim,inter_dim,num_tokens,experts,topk in tqdm(test_cases):
-        us_aiter, cmd_aiter = get_fused_moe_time(model_dim, inter_dim, num_tokens, experts, topk, quant_mode, False)
-        us_asmjit, cmd_jit = get_fused_moe_time(model_dim, inter_dim, num_tokens, experts, topk, quant_mode, True)
+        us_aiter, cmd_aiter = get_fused_moe_time(model_dim, inter_dim, num_tokens, experts, topk, quant_mode, ep_size, False)
+        us_asmjit, cmd_jit = get_fused_moe_time(model_dim, inter_dim, num_tokens, experts, topk, quant_mode, ep_size, True)
         ret = {}
         quant_2_wdtype_size = {0:2, 5:1}
         wdtype_size = quant_2_wdtype_size[quant_mode] 
@@ -97,12 +97,13 @@ def do_test(test_cases):
 
 if args.ep > 0:
     do_test([
-        (model_dim, inter_dim, 1024, num_experts//args.ep, num_experts_per_tok),
-        (model_dim, inter_dim, 512, num_experts//args.ep, num_experts_per_tok),
-        (model_dim, inter_dim, 256, num_experts//args.ep, num_experts_per_tok),
-        (model_dim, inter_dim, 128, num_experts//args.ep, num_experts_per_tok),
-        (model_dim, inter_dim, 64, num_experts//args.ep, num_experts_per_tok),
-    ])
+        (model_dim, inter_dim, 1024, num_experts, num_experts_per_tok),
+        (model_dim, inter_dim, 512, num_experts, num_experts_per_tok),
+        (model_dim, inter_dim, 256, num_experts, num_experts_per_tok),
+        (model_dim, inter_dim, 128, num_experts, num_experts_per_tok),
+        (model_dim, inter_dim, 64, num_experts, num_experts_per_tok),
+    ],
+    ep_size=args.ep)
 
 if args.tp > 0:
     do_test([
@@ -116,4 +117,5 @@ if args.tp > 0:
         (model_dim, inter_dim//args.tp, 512, num_experts, num_experts_per_tok),
         (model_dim, inter_dim//args.tp, 5120, num_experts, num_experts_per_tok),
         (model_dim, inter_dim//args.tp, 8000, num_experts, num_experts_per_tok),
-    ])
+    ],
+    ep_size=1)
