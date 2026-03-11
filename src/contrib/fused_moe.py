@@ -5,6 +5,10 @@ from aiter import dtypes
 
 from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
 from .moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
+from .gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_down
+
+import os
+USE_GLUON = int(os.getenv("USE_GLUON", "1"))
 
 __all__ = [
     "fused_moe"
@@ -289,7 +293,7 @@ def fused_moe(
     estimated_tokens_per_expert = token_num * topk / E
     if estimated_tokens_per_expert < 32 and quant_type == aiter.QuantType.No:
         # mem-bound case : very small num_tokens
-        block_size_M = 32
+        block_size_M = 16
         block_size_N = 128
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = moe_sorting(
             topk_ids, topk_weight, global_E, model_dim,  dtype,
@@ -311,24 +315,45 @@ def fused_moe(
             grid = token_num * topk
 
         fp8_ptpc = False
-        #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 2 * 2), name="moe_2stage_splitk(12)"):
-        if 1:
-            moe_2stage_splitk([inter_dim*2 // block_size_N, grid], [256],
-                                w1.dtype, topk, model_dim, inter_dim*2, True, block_size_M, block_size_N,
-                                hidden_states.data_ptr(), w1.data_ptr(), a2.data_ptr(),
-                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num, fp8_ptpc)
-        #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 1 * 2), name=f"moe_2stage_splitk(3)-{block_size_M}-{num_valid_ids[0].item()//block_size_M}"):
-        if 1:
+        moe_2stage_splitk_gateup
+        moe_2stage_splitk_down
+
+        if USE_GLUON:
+            BLOCK_TILE_SIZE_M = block_size_M
+            BLOCK_TILE_SIZE_N = block_size_N
+            grid = sorted_expert_ids.shape[0]
+            B = token_num
+            N1, K1 = inter_dim * 2, model_dim
+            N2, K2 = model_dim, inter_dim
+            if B * topk <= E:
+                grid = B * topk
+            x=moe_2stage_splitk_gateup(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)[(N1 // BLOCK_TILE_SIZE_N, grid)](
+                                hidden_states, w1, a2, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w1_scale[0] if w1_scale is not None else None, B,
+                                w1.dtype, topk, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
+            # print(x.asm['amdgcn'])
+            # assert 0
+            x=moe_2stage_splitk_down(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)[(N2 // BLOCK_TILE_SIZE_N, grid)](
+                                a2, w2, moe_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w2_scale[0] if w2_scale is not None else None, B,
+                                w1.dtype, topk, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps=1)
+        else:
+            #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 2 * 2), name="moe_2stage_splitk(12)"):
             if 1:
-                moe_2stage_splitk([model_dim // block_size_N, grid], [64],
-                            w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
-                            a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
-                            sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num, fp8_ptpc)
-            else:
-                moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
-                            w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
-                            a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
-                            sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num)
+                moe_2stage_splitk([inter_dim*2 // block_size_N, grid], [256],
+                                    w1.dtype, topk, model_dim, inter_dim*2, True, block_size_M, block_size_N,
+                                    hidden_states.data_ptr(), w1.data_ptr(), a2.data_ptr(),
+                                    sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num, fp8_ptpc)
+            #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 1 * 2), name=f"moe_2stage_splitk(3)-{block_size_M}-{num_valid_ids[0].item()//block_size_M}"):
+            if 1:
+                if 1:
+                    moe_2stage_splitk([model_dim // block_size_N, grid], [64],
+                                w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
+                                a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
+                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num, fp8_ptpc)
+                else:
+                    moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
+                                w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
+                                a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
+                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num)
 
 
         return moe_out

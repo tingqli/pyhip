@@ -1,8 +1,9 @@
 """ Some useful helpers """
 
 __all__ = [
-    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle"
+    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle", "run_perftest"
 ]
+
 
 class cudaPerf(object):
     def __init__(self, flops = 0, rw_bytes = 0, name="", verbose=1):
@@ -127,3 +128,47 @@ def calc_diff(x: "torch.Tensor", y: "torch.Tensor", diff_thr=None):
 
 def div_up(x, y):
     return (x + y - 1) // y
+
+def run_perftest(kernel, *args, **kwargs):
+    global torch
+    import torch
+    import copy
+    perf = cudaPerf(verbose=False)
+
+    def extract_attr(obj, name, default):
+        nonlocal kwargs
+        attr = kwargs.get(name, None)
+        if attr is not None:
+            del kwargs[name]
+        else:
+            attr = default
+        return attr
+
+    num_iters = extract_attr(kwargs, 'num_iters', 10)
+    num_warmup = extract_attr(kwargs, 'num_warmup', 2)
+    num_copies = extract_attr(kwargs, 'num_copies', 0)
+
+    if num_copies == 0:
+        copy_size = 0
+        for a in args:
+            if isinstance(a, torch.Tensor):
+                print(a.shape, a.dtype)
+                copy_size += a.numel() * a.element_size()
+        for k in kwargs:
+            if isinstance(kwargs[k], torch.Tensor):
+                print(kwargs[k].shape, kwargs[k].dtype)
+                copy_size += kwargs[k].numel() * kwargs[k].element_size()
+        # up-to 4GB
+        num_copies = max(int(4e9 / copy_size), num_warmup + num_iters)
+
+    args_copies = []
+    kwarg_copies = []
+    for _ in range(num_copies):
+        args_copies.append(copy.deepcopy(args))
+        kwarg_copies.append(copy.deepcopy(kwargs))
+
+    for i in range(num_warmup + num_iters):
+        with perf:
+            out = kernel(*args_copies[i], **kwarg_copies[i])
+
+    return out, perf.dt(excludes=num_warmup)*1e6

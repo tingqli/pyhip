@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
 import torch
 import itertools
 import aiter
@@ -26,6 +25,7 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
 )
 
+import pyhip
 from pyhip import calc_diff
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
@@ -234,7 +234,7 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    out2_ck, us2 = run_perftest(
+    out2_ck, us2 = pyhip.run_perftest(
         fused_moe_impl,
         input,
         w1_qt_aiter,
