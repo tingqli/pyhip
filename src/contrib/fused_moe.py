@@ -6,6 +6,7 @@ from aiter import dtypes
 from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
 from .moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
 from .gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_down
+from .moe_gemm_down_tp import *
 
 import os
 USE_GLUON = int(os.getenv("USE_GLUON", "1"))
@@ -389,32 +390,6 @@ def fused_moe(
     block_size_M = 256
     block_size_N = 256
 
-    while estimated_tokens_per_expert < 128:
-        estimated_oc_blocks = min(inter_dim*2, model_dim)//block_size_N
-        estimated_num_e_blocks = ((token_num * topk) // block_size_M)
-        estimated_work_groups = estimated_num_e_blocks * estimated_oc_blocks
-
-        cu_usage = estimated_work_groups / torch.cuda.get_device_properties().multi_processor_count
-        if cu_usage != int(cu_usage):
-            wasted_usage = (1 - (cu_usage - int(cu_usage))) / cu_usage
-        else:
-            wasted_usage = 0
-        #print(f"{estimated_work_groups=} {torch.cuda.get_device_properties().multi_processor_count=} {cu_usage=} {wasted_usage=}")
-
-        if cu_usage < 1 or wasted_usage > 0.05:
-            if block_size_M > 128:
-                block_size_M = 128
-            else:
-                # quant fp8 has some limitations in block size
-                if quant_type == aiter.QuantType.No:
-                    block_size_N = 128
-                break
-        else:
-            break
-    
-    # keep block_size_N at 256 in most-case, only fallback to 128 on extream cases?
-    block_size_N = 256
-    
     assert block_size_M in [128,256]
     assert block_size_N in [128,256]
 
@@ -530,7 +505,10 @@ def fused_moe(
                 w2, w2_scale, moe_out, False, w2_is_shuffled)
     else:
         #print(f"{num_oc_blocks=} {valid_e_blocks=} {inter_dim=}")
-        #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2, name="moe_gemm_8wave_down"):
+        #print(w2.dtype, w2.shape, a2.dtype, a2.shape)
+        rw_bytes = w2.numel() * w2.element_size() + a2.numel() * a2.element_size() + stage2_out.numel()*stage2_out.element_size()
+        flops = 0# num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2
+        #with pyhip.cudaPerf(flops=flops, rw_bytes=rw_bytes, name="moe_gemm_down_tp"):
         if 1:
             if a2.dtype == torch.bfloat16:
                 AB_dtype = "bf16"
@@ -539,18 +517,38 @@ def fused_moe(
             else:
                 assert 0, f"{a2.dtype=} {w2.dtype=}"
             #sorted_expert_ids[...] = 0
-            moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
-                    AB_dtype, wg_M, wg_N,
-                    E, model_dim, inter_dim, 
-                    False, w2_is_shuffled, topk,
-                    sorted_ids.data_ptr(),
-                    sorted_weights.data_ptr(),
-                    sorted_expert_ids.data_ptr(),
-                    num_valid_ids.data_ptr(),
-                    w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
-                    a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
-                    stage2_out.data_ptr(),
-                    token_num) # num_local_tokens.data_ptr() ?
+            if quant_type == aiter.QuantType.No:
+                if VERBOSE:
+                    print(a2.dtype, a2.shape)
+                    tok_index = sorted_ids[:wg_M]&0xFFFFFF
+                    tok_topk = sorted_ids[:wg_M]>>24
+                    print(tok_index)
+                    print(a2[tok_index[tok_index<token_num], tok_topk[tok_index<token_num], ...])
+                moe_gemm_down_tp([1, num_e_blocks], [4*64],
+                                AB_dtype, wg_M, 64,
+                                E, model_dim, inter_dim, 
+                                False, w2_is_shuffled, topk,
+                                sorted_ids.data_ptr(),
+                                sorted_weights.data_ptr(),
+                                sorted_expert_ids.data_ptr(),
+                                num_valid_ids.data_ptr(),
+                                w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
+                                a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
+                                stage2_out.data_ptr(),
+                                token_num)
+            else:
+                moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
+                                AB_dtype, wg_M, wg_N,
+                                E, model_dim, inter_dim, 
+                                False, w2_is_shuffled, topk,
+                                sorted_ids.data_ptr(),
+                                sorted_weights.data_ptr(),
+                                sorted_expert_ids.data_ptr(),
+                                num_valid_ids.data_ptr(),
+                                w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
+                                a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
+                                stage2_out.data_ptr(),
+                                token_num) # num_local_tokens.data_ptr() ?
 
         if 0:
             moe_out = stage2_out[:,0,:]

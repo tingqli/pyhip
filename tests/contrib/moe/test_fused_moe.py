@@ -31,6 +31,7 @@ from pyhip import calc_diff
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
+torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 # torch.cuda.set_device(0)
 torch.manual_seed(0)
 
@@ -88,6 +89,8 @@ def test_fmoe(
         score = torch.randn((token, E), dtype=dtype)
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
         expert_mask = None
+
+    input *= 0.1
 
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
@@ -491,7 +494,13 @@ parser.add_argument(
     action=UseJitAction,
     help="use jit."
 )
-diff_thr = 0.01
+
+parser.add_argument(
+    "-diff",
+    type=float,
+    default=0.01,
+    help="diff threshold."
+)
 
 #########################################################################################################################
 args = parser.parse_args()
@@ -617,7 +626,7 @@ for (
                         use_g1u1=True,
                         doweight_stage1=doweight_stage1,
                         preshuffle=preshuffle,
-                        diff_thr=diff_thr,
+                        diff_thr=None if args.diff < 0 else args.diff,
                         ep_size=args.ep
                     )
                     df.append(ret)
