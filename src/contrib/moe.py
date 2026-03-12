@@ -673,6 +673,13 @@ def moe_2stage_splitk(J:JIT,
                     J.global_store_short_d16_hi(vaddr, out[0], p_output)
             J.s_barrier()
     else:
+        lds_buff = J.LDSTensor([BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N], torch.bfloat16)
+        # toke_id_buff = J.LDSTensor([1, BLOCK_TILE_SIZE_M], torch.uint32)
+        toke_id_buff = J.alloc_lds(BLOCK_TILE_SIZE_M*4)
+        for m in range(A_vert):
+            voffset_tokenid = J.gpr(lane_mod_16*4+m*64)
+            J.ds_write_b32(voffset_tokenid, v_token_id[m], mod=f"offset:{toke_id_buff}")
+            # toke_id_buff.write("b32", v_token_id[m], 0,  lane_mod_16)
         for n in range(B_horz):
             # split N
             assert not with_silu
@@ -685,9 +692,40 @@ def moe_2stage_splitk(J:JIT,
                     J.v_add_u32(C_reg[n, m, j], C_reg[n, m, j], s_cvt_bf16_bias)
                 creg_low[0] = (C_reg[n, m, 0] >> 16) | (C_reg[n, m, 1] & 0xFFFF0000)
                 creg_low[1] = (C_reg[n, m, 2] >> 16) | (C_reg[n, m, 3] & 0xFFFF0000)
-                with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
-                    J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
-                    J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
+        
+                # with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
+                #     J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
+                #     J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
+                lds_buff.write("b64", creg_low, lane_mod_16 + m * 16, lane_div_16*4 + n*16)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        J.s_barrier()
+        if 0:
+            for n in range(B_horz):
+                for m in range(A_vert):
+                    vaddr1 = J.gpr(v_token_id[m] * (N * sizeof_bf16) + lane_div_16 * (4 * sizeof_bf16) + n * 4 * (4 * sizeof_bf16))
+                    creg_low_rd = J.gpr(2, "vbf16x2", align=2)
+                    lds_buff.read("b64", creg_low_rd, lane_mod_16 + m * 16, lane_div_16*4 + n*16)
+                    J.s_waitcnt(mod=f"lgkmcnt(0)")
+                    with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
+                        J.global_atomic_pk_add_bf16(vaddr1    , creg_low_rd[0], p_output)
+                        J.global_atomic_pk_add_bf16(vaddr1 + 4, creg_low_rd[1], p_output)
+        else:
+            lane_row = get_lane_id_div(J, 32)
+            lane_col = get_lane_id_mod(J, 32)
+            v_token_id_tr = J.gpr(1, 'vu32')
+            # need to use Mtiles
+            for m in range(16//2):
+                creg_low_rd = J.gpr(2, "vbf16x2", align=2)
+                lds_buff.read("b64", creg_low_rd, lane_row + m * 2, lane_col*4)
+                voffset_tokenid = J.gpr(m*8 + lane_row*4)
+                J.ds_read_b32(v_token_id_tr[0], voffset_tokenid, mod=f"offset:{toke_id_buff}")
+                # toke_id_buff.read("b32", v_token_id_tr[0], 0,  lane_row)
+
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+                vaddr1 = J.gpr(v_token_id_tr[0] * (N * sizeof_bf16) + lane_col * (4 * sizeof_bf16))
+                with J.ExecMask(v_token_id_tr[0] < M[0], early_skip=False):
+                        J.global_atomic_pk_add_bf16(vaddr1    , creg_low_rd[0], p_output)
+                        J.global_atomic_pk_add_bf16(vaddr1 + 4, creg_low_rd[1], p_output)
 
 @jit()
 def moe_2stage_gateup(J:JIT,
