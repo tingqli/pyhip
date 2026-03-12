@@ -188,6 +188,9 @@ def debug_verbose_moe_sorting(sorted_ids, sorted_weights, sorted_expert_ids, num
         print("num_valid_ids     :", list(num_valid_ids.shape), num_valid_ids.dtype, num_valid_ids.tolist())
         print("moe_out           :", list(moe_out.shape), moe_out.dtype)
 
+def wei_is_fp8(weight_type):
+    return weight_type == dtypes.fp8
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -310,10 +313,20 @@ def fused_moe(
     moe_sorting = aiter.fused_moe.moe_sorting
 
     estimated_tokens_per_expert = token_num * topk / global_E
-    if estimated_tokens_per_expert < 32 and quant_type == aiter.QuantType.No:
+
+    if estimated_tokens_per_expert < 32 and (
+        quant_type == aiter.QuantType.No or
+        # (wei_is_fp8(w1.dtype) and quant_type == aiter.QuantType.per_Token) or
+        (wei_is_fp8(w1.dtype) and quant_type == aiter.QuantType.per_128x128)
+        ):
         # mem-bound case : very small num_tokens
-        block_size_M = 32
-        block_size_N = 128
+        def blk_sz_heuristics():
+            #base on Qwen 3.5 TP8 case tested result
+            if model_dim == 4096 and inter_dim == 128 and wei_is_fp8(w1.dtype):
+                return 16, 128
+            else:
+                return 32, 128
+        block_size_M, block_size_N = blk_sz_heuristics()
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = moe_sorting(
             topk_ids, topk_weight, global_E, model_dim,  dtype,
             block_size_M,
@@ -325,7 +338,7 @@ def fused_moe(
         if token_num * topk <= E:
             grid = token_num * topk
 
-        fp8_ptpc = False
+        fp8_is_ptpc =  (quant_type == aiter.QuantType.per_Token and wei_is_fp8(w1.dtype))
         moe_2stage_splitk_gateup
         moe_2stage_splitk_down
 
@@ -352,14 +365,14 @@ def fused_moe(
                 moe_2stage_splitk([inter_dim*2 // block_size_N, grid], [256],
                                     w1.dtype, topk, model_dim, inter_dim*2, True, block_size_M, block_size_N,
                                     hidden_states.data_ptr(), w1.data_ptr(), a2.data_ptr(),
-                                    sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num, fp8_ptpc)
+                                    sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, token_num, fp8_is_ptpc)
             #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 1 * 2), name=f"moe_2stage_splitk(3)-{block_size_M}-{num_valid_ids[0].item()//block_size_M}"):
             if 1:
                 if 1:
                     moe_2stage_splitk([model_dim // block_size_N, grid], [64],
                                 w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
                                 a2.data_ptr(), w2.data_ptr(), moe_out.data_ptr(),
-                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num, fp8_ptpc)
+                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, token_num, fp8_is_ptpc)
                 else:
                     moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
                                 w1.dtype, topk, inter_dim, model_dim, False, block_size_M, block_size_N,
