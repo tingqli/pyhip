@@ -696,7 +696,8 @@ def moe_2stage_splitk(J:JIT,
                 # with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
                 #     J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
                 #     J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
-                lds_buff.write("b64", creg_low, lane_mod_16 + m * 16, lane_div_16*4 + n*16)
+                swizzle_col = ((lane_mod_16 + m * 16))^(n*4+lane_div_16) % (BLOCK_TILE_SIZE_N // 4)
+                lds_buff.write("b64", creg_low, lane_mod_16 + m * 16, swizzle_col*4)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.s_barrier()
         if 0:
@@ -716,7 +717,8 @@ def moe_2stage_splitk(J:JIT,
             # need to use Mtiles
             for m in range(16//2):
                 creg_low_rd = J.gpr(2, "vbf16x2", align=2)
-                lds_buff.read("b64", creg_low_rd, lane_row + m * 2, lane_col*4)
+                swizzle_col = (((lane_row + m*2))^(lane_col)) % (BLOCK_TILE_SIZE_N // 4)
+                lds_buff.read("b64", creg_low_rd, lane_row + m * 2, swizzle_col*4)
                 voffset_tokenid = J.gpr(m*8 + lane_row*4)
                 J.ds_read_b32(v_token_id_tr[0], voffset_tokenid, mod=f"offset:{toke_id_buff}")
                 # toke_id_buff.read("b32", v_token_id_tr[0], 0,  lane_row)
