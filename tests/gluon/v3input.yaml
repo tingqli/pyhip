@@ -1,6 +1,6 @@
 jobs:
     -
-        kernel_include_regex: ".*moe.*"
+        kernel_include_regex: ".*kernel.*"
         kernel_iteration_range: "[8,9]"
         output_file: out
         output_directory: ck_test
@@ -8,7 +8,15 @@ jobs:
         truncate_kernels: true
         sys_trace: false # enable for pftrace and otf2
         advanced_thread_trace: true # enable for att and ui folder
+        # att-perfcounter-ctrl: 1
+        #att-perfcounters: "SQ_LDS_BANK_CONFLICT"
+        #att_perfcounters: SQ_INSTS_MFMA # "SQ_IFETCH_LEVEL, SQ_IFETCH, SQ_WAIT_IFETCH, SQ_WAIT_ANY" #"SQ_LDS_BANK_CONFLICT,SQ_LDS_DATA_FIFO_FULL" #"SQ_IFETCH_LEVEL, SQ_IFETCH, SQ_WAIT_IFETCH, SQ_WAIT_ANY",
+        #att_perfcounter_ctrl: 1
+        #att_gpu_index: 0
         att_target_cu: 1
         att_shader_engine_mask: "0xf" # collect one CU from 4 SEs
         att_simd_select: "0xf" # collect 4 SIMDs on single CU
         att_buffer_size: "0x6000000"
+        # pmc:
+        #     - SQ_LDS_BANK_CONFLICT
+        #     - SQ_LDS_DATA_FIFO_FULL
