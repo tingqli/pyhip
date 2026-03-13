@@ -100,7 +100,7 @@ def dummy_load(J, bytes_per_WG, access_type, dtype, data:"int*", p_cycles:"void*
     # work-group/thread-block cooperately loads data (but not use them at all)
     ele_size = J.sizeof(dtype)
     num_ele = bytes_per_WG // ele_size
-    dw_count = J.div(ele_size, 4)
+    dw_count = J.div_up(ele_size, 4)
 
     data[:] += J.blockIdx.x[0] * bytes_per_WG
 
@@ -151,6 +151,10 @@ def probe_vmem_bandwidth():
     cycles = torch.zeros(num_CU, dtype=torch.uint64)
     data = torch.zeros([num_rounds, num_CU, bytes_per_WG//4], dtype=torch.int32)
     dtype = "dword"
+
+    for r in range(10):
+        with pyhip.cudaPerf(rw_bytes=bytes_per_WG*num_CU, name=f"load-ushort-{r}"):
+            dummy_load([num_CU], [256], bytes_per_WG, "load", "ushort", data[r].data_ptr(), cycles.data_ptr())
 
     for r in range(10):
         with pyhip.cudaPerf(rw_bytes=bytes_per_WG*num_CU, name=f"load-{dtype}-{r}"):
@@ -377,6 +381,7 @@ if __name__ == "__main__":
     probe_cycles(num_threads=256)
 
     probe_vmem_bandwidth()
+    assert 0
 
     probe_lds_banks()
 

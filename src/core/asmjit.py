@@ -1041,6 +1041,7 @@ class JIT:
             "f16":2,
             "s16": 2,
             "u16": 2,
+            "ushort": 2,
 
             "s8": 1,
             "u8": 1,
@@ -3416,7 +3417,7 @@ r'''
 
         if nbytes > 0:
             # load in DW
-            assert nbytes % self.sizeof_DW == 0
+            #assert nbytes % self.sizeof_DW == 0, nbytes
             num_loads = self.div_up(nbytes, num_warps * self.warp_size * self.sizeof_DW)
             voff = self.gpr("vu32", offset0 + self.threadIdx.x[0] * self.sizeof_DW)
             self.s_mov_b32("m0", warp_off_cnt * self.sizeof_DW + (lds + offset0))
