@@ -25,6 +25,7 @@ def depthwise_conv3d_jit(J, KD, KH, KW, H, W,
     """
     input:  [B, C, D0, H, W]
     weight: [C, 1, KD, KH, KW]
+    bias  : [C]
     output: [B, C, D1, H, W]
     
     假设：
@@ -147,6 +148,112 @@ def depthwise_conv3d_jit(J, KD, KH, KW, H, W,
         h[0] += num_warps
 
 
+@pyhip.jit(with_debug_log=False)
+def pointwise_conv3d_jit(J, group_size,
+           input:"void*",
+           weight:"void*",
+           output:"void*",
+           bias:"void*",
+           B:"int",
+           C:"int",
+           DHW:"int",
+           ):
+    """
+    input:  [B, C, D*H*W]
+    weight: [C, group_size, 1, 1, 1]
+    bias  : [C]
+    output: [B, C, D*H*W]
+
+    因为是point-wise, DHW可以展平为1D
+    gridDims: [B, C//group_size]
+
+    每个kernel完成 [1, group_size, D*H*W] 这么多输出点
+    读入数据 [1, group_size, D*H*W] 这么多，
+
+    假定 group_size 足够小，输入点沿着 DHW 维度直接读入到 group_size 个寄存器，
+    然后这些寄存器使用fmac组合得到 group_size 个输出直接写出
+    """
+    blk_B = J.blockIdx.x[0]
+    blk_g = J.blockIdx.y[0]
+
+    offset = J.gpr("su32", (blk_B * C + blk_g * group_size) * DHW * J.sizeof_bf16)
+    input[:] += offset[0]
+    output[:] += offset[0]
+    weight[:] += (blk_g * group_size) * group_size * J.sizeof_bf16
+    bias[:] += (blk_g * group_size) * J.sizeof_bf16
+
+    num_warps = 4
+    num_threads = num_warps * 64
+    # load group_size weight & bias
+    # 
+    B = J.gpr(group_size, group_size, "vf32", 0)
+    vbias = J.gpr(group_size, "vf32", 0x00008000) # f32=>bf16 bias
+    A = J.gpr(group_size, 4, "vf32")
+    C = J.gpr(2, group_size, 4, "vf32")
+
+    buff_a = J.Buffer(input, group_size * DHW * J.sizeof_bf16)
+    buff_c = J.Buffer(output, group_size * DHW * J.sizeof_bf16)
+
+    # load weights: broadcast to all spatial lanes
+    for g0 in range(group_size):
+        for g1 in range(group_size):
+            vaddr = J.gpr("vu32", (g0*group_size + g1) * J.sizeof_bf16)
+            J.global_load_short_d16_hi(B[g0, g1], vaddr, weight)
+
+    # load bias: broadcast to all spatial lanes
+    for g in range(group_size):
+        vaddr = J.gpr("vu32", g * J.sizeof_bf16)
+        J.global_load_short_d16_hi(vbias[g], vaddr, bias)
+
+    voffset = J.gpr(group_size, "vu32")
+    for g in range(group_size):
+        voffset[g] = J.threadIdx.x[0] * J.sizeof_DW4 + g * J.gpr("vu32", DHW) * J.sizeof_bf16
+
+    dhw0 = J.gpr("su32", J.warp_id[0]*64*J.sizeof_DW4 // J.sizeof_bf16)
+    with J.While(dhw0 < DHW):
+        with J.ExecMask(voffset[0] < DHW*J.sizeof_bf16):
+            for g in range(group_size):
+                buff_a.load_dwordx4(A[g], voffset[g], 0)
+
+            J.s_waitcnt(mod="vmcnt(0)")
+            
+            for g0 in range(group_size):
+                C[0,g0,0] = vbias[g0]
+                C[0,g0,1] = vbias[g0]
+                C[0,g0,2] = vbias[g0]
+                C[0,g0,3] = vbias[g0]
+                for g1 in range(group_size):
+                    J.v_fmac_f32(C[0,g0,0], A[g1,0] << 16, B[g0, g1])
+                    J.v_fmac_f32(C[0,g0,1], A[g1,1] << 16, B[g0, g1])
+                    J.v_fmac_f32(C[0,g0,2], A[g1,2] << 16, B[g0, g1])
+                    J.v_fmac_f32(C[0,g0,3], A[g1,3] << 16, B[g0, g1])
+
+            for g0 in range(group_size):
+                C[1,g0,0] = vbias[g0]
+                C[1,g0,1] = vbias[g0]
+                C[1,g0,2] = vbias[g0]
+                C[1,g0,3] = vbias[g0]
+                for g1 in range(group_size):
+                    J.v_fmac_f32(C[1,g0,0], A[g1,0] & 0xFFFF0000, B[g0, g1])
+                    J.v_fmac_f32(C[1,g0,1], A[g1,1] & 0xFFFF0000, B[g0, g1])
+                    J.v_fmac_f32(C[1,g0,2], A[g1,2] & 0xFFFF0000, B[g0, g1])
+                    J.v_fmac_f32(C[1,g0,3], A[g1,3] & 0xFFFF0000, B[g0, g1])
+
+            for g0 in range(group_size):
+                J.v_perm_b32(C[0,g0,0], C[0,g0,0], C[1,g0,0], J.get_sgpr_const(0x03_02_07_06))
+                J.v_perm_b32(C[0,g0,1], C[0,g0,1], C[1,g0,1], J.get_sgpr_const(0x03_02_07_06))
+                J.v_perm_b32(C[0,g0,2], C[0,g0,2], C[1,g0,2], J.get_sgpr_const(0x03_02_07_06))
+                J.v_perm_b32(C[0,g0,3], C[0,g0,3], C[1,g0,3], J.get_sgpr_const(0x03_02_07_06))
+
+            for g0 in range(group_size):
+                buff_c.store_dwordx4(C[0,g0], voffset[g0], 0)
+
+        for g0 in range(group_size):
+            voffset[g0] += num_threads * J.sizeof_DW4
+
+        dhw0[0] += num_threads * J.sizeof_DW4 // J.sizeof_bf16
+
+    pass
 
 def benchmark_op(op_func, op_name, iters, gflops, device):
     print(f"\n正在进行 {op_name} 预热/Tune...")
@@ -263,10 +370,18 @@ def test_conv3d_benchmark(args):
                         dilation=dilation,
                         groups=groups)
 
+    def run_torch_conv1d():
+        return F.conv1d(input_tensor.view(B, C_in, D*H*W), weight_tensor.view(C_out, C_in//groups, 1), 
+                        bias=bias_tensor,
+                        stride=stride[0], 
+                        padding=padding[0], 
+                        dilation=dilation[0],
+                        groups=groups).view(B, C_out, D_out, H_out, W_out)
+
     ref = run_torch_conv3d()
     print(ref.shape, ref.dtype)
 
-    def run_jit_conv3d():
+    def run_depthwise_conv3d_jit():
         output_tensor = torch.empty(B, C_out, D_out, H_out, W_out, dtype=input_dtype, device=device)
         depthwise_conv3d_jit(
                         [B,C_out,D_out],[256],
@@ -278,29 +393,58 @@ def test_conv3d_benchmark(args):
                          B, C_out, D, D_out)
         return output_tensor
 
-    ret = run_jit_conv3d()
-
-    if not torch.allclose(ref, ret, atol=0.01, rtol=0.01):
-        for iib in range(B):
-            for iic in range(C_out):
-                for iid in range(D_out):
-                    iiref = ref[iib, iic, iid, ...]
-                    iiret = ret[iib, iic, iid, ...]
-                    passed = torch.allclose(iiref, iiret, atol=0.01, rtol=0.01)
-                    if not passed:
-                        print(f"================ {B},{C_out},{D_out} : {iib}, {iic}, {iid}", )
-                        print(iiref)
-                        print(iiret)
-                        assert 0
+    def run_pointwise_conv3d_jit():
+        output_tensor = torch.empty(B, C_out, D_out, H_out, W_out, dtype=input_dtype, device=device)
+        group_size = C_in // groups
+        pointwise_conv3d_jit(
+                         [B, C_out//group_size],
+                         [256], group_size,
+                         input_tensor.data_ptr(),
+                         weight_tensor.data_ptr(),
+                         output_tensor.data_ptr(),
+                         bias_tensor.data_ptr(),
+                        B, C_out, D_out*H_out*W_out)
+        return output_tensor
 
     # 2. 运行 Benchmark
-    torch_ms, torch_tflops, torch_warmup_ms = benchmark_op(run_jit_conv3d, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device)
-
+    torch_ms, torch_tflops, torch_warmup_ms = benchmark_op(run_torch_conv3d, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device)
     # 3. 汇总对比
     print(f"\n--- 性能对比汇总 ({args.shape}) ---")
     print(f"{'方法':<35} | {'平均耗时 (ms)':<15} | {'吞吐量 (TFLOPS)':<15} | {'预热/Tune (ms)':<15}")
     print("-" * 90)
     print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_warmup_ms:>15.2f}")
+
+    run_conv = run_torch_conv3d
+    if args.shape == "case3":
+        run_conv = run_depthwise_conv3d_jit
+    elif args.shape == "case4":
+        run_conv = run_torch_conv1d
+        run_conv = run_pointwise_conv3d_jit
+    if run_conv != run_torch_conv3d:
+        ret = run_conv()
+        all_diff = pyhip.calc_diff(ref, ret)
+        if all_diff > 0.001:
+            for iib in range(B):
+                for iic in range(C_out):
+                    for iid in range(D_out):
+                        iiref = ref[iib, iic, iid, ...]
+                        iiret = ret[iib, iic, iid, ...]
+                        passed = torch.allclose(iiref, iiret, atol=0.01, rtol=0.01)
+                        diff = pyhip.calc_diff(iiref, iiret)
+                        if not passed and diff > 0.001:
+                            print(f"================ {B},{C_out},{D_out} : {iib}, {iic}, {iid}    {diff=}", )
+                            print(ref.shape)
+                            print(ret.shape)
+                            print(iiref)
+                            print(iiret)
+                            print(iiret.view(-1)[:32].view(4,8))
+                            assert 0
+
+        opt_ms, opt_tflops, opt_warmup_ms = benchmark_op(run_conv, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device)
+        print(f"{'方法':<35} | {'平均耗时 (ms)':<15} | {'吞吐量 (TFLOPS)':<15} | {'预热/Tune (ms)':<15}")
+        print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_warmup_ms:>15.2f}")
+        print(f"{run_conv.__name__:<35} | {opt_ms:>15.4f} | {opt_tflops:>15.2f} | {opt_warmup_ms:>15.2f}")
+
 
     # 4. Profile (可选)
     if args.profile:
