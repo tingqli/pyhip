@@ -14,7 +14,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="?",
     const=None,
-    default=(4096,1024,512,10,0),
+    default=(4096,1024,512,10,5),
     help="""Model dimension.
     e.g.: -dim 6144,4096""",
 )

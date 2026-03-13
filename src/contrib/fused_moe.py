@@ -343,7 +343,7 @@ def fused_moe(
         moe_2stage_splitk_gateup
         moe_2stage_splitk_down
 
-        if USE_GLUON:
+        if USE_GLUON and quant_type == aiter.QuantType.No:
             BLOCK_TILE_SIZE_M = block_size_M
             BLOCK_TILE_SIZE_N = block_size_N
             grid = sorted_expert_ids.shape[0]
