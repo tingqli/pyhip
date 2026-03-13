@@ -116,7 +116,7 @@ def depthwise_conv3d_jit(J, KD, KH, KW, H, W,
                 J.ds_read_u16_d16_hi(B[kd, kh, kw], vaddr, mod=f"offset:{((kd*KH + kh)*KW + kw) * J.sizeof_bf16}")
     J.s_waitcnt(mod=f"lgkmcnt(0)")
 
-    A = J.gpr(KD, KH, KW, "f32", 0)
+    A = J.gpr(KD, KH, J.div_up(KW,2), "f32", 0)
     conv_tasks = []
     for kd in range(KD):
         for kh in range(KH):
@@ -124,27 +124,32 @@ def depthwise_conv3d_jit(J, KD, KH, KW, H, W,
 
     h = J.gpr("su32", J.warp_id[0])
     with J.While(h < H):
-        for w in range(0, W, 64):
+        for w in range(0, W, 128): 
             # process 1x64 outputs per warp
             vaddr = J.gpr("vu32", lds_input + \
                                     J.gpr("vu32", J.gpr("su32", h[0] * (padded_W * J.sizeof_bf16))) + \
-                                    (w + J.lane_id[0]) * J.sizeof_bf16)
-            C = J.gpr("f32", 0)
+                                    w * J.sizeof_bf16 + J.lane_id[0] * J.sizeof_u32)
+            C = J.gpr(2, "f32", vbias) 
             for kd, kh in conv_tasks:
-                for kw in range(KW):
-                    J.ds_read_u16_d16_hi(A[kd, kh, kw], vaddr, mod=f"offset:{((kd*padded_H + kh)*padded_W + kw) * J.sizeof_bf16}")
+                for kw in range(0,KW,2):
+                    J.ds_read_b32(A[kd, kh, kw//2], vaddr, mod=f"offset:{((kd*padded_H + kh)*padded_W + kw) * J.sizeof_bf16}")
 
             J.s_waitcnt(mod=f"lgkmcnt({0})")
 
-            for ready_kd, ready_kh in conv_tasks:
+            for kd, kh in conv_tasks:
                 for kw in range(KW):
-                    J.v_fmac_f32(C, A[ready_kd, ready_kh, kw], B[ready_kd, ready_kh, kw])
+                    if kw & 1:
+                        J.v_fmac_f32(C[0], A[kd, kh, kw//2] & 0xFFFF0000, B[kd, kh, kw])
+                        J.v_fmac_f32(C[1], A[kd, kh, (kw+1)//2] << 16, B[kd, kh, kw])
+                    else:
+                        J.v_fmac_f32(C[0], A[kd, kh, kw//2] << 16, B[kd, kh, kw])
+                        J.v_fmac_f32(C[1], A[kd, kh, kw//2] & 0xFFFF0000, B[kd, kh, kw])
 
-            C[0] += vbias
+            J.v_perm_b32(C[0], C[0], C[1], J.get_sgpr_const(0x03_02_07_06))
 
-            vcol_addr = J.gpr("vu32", (w + J.lane_id[0]) * J.sizeof_bf16)
+            vcol_addr = J.gpr("vu32", w * J.sizeof_bf16 + J.lane_id[0]*J.sizeof_u32)
             with J.ExecMask(vcol_addr < W * J.sizeof_bf16):
-                J.global_store_short_d16_hi(vcol_addr + J.gpr("su32", h[0] * (W*J.sizeof_bf16)), C, output)
+                J.global_store_dword(vcol_addr + J.gpr("su32", h[0] * (W*J.sizeof_bf16)), C[0], output)
         h[0] += num_warps
 
 
