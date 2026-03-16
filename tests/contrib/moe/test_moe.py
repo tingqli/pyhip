@@ -22,13 +22,15 @@ def _run_aiter(hidden_states,
             topk_ids,
             w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
             w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
-            ):
+            fp8_ptpc=True):
     from aiter.fused_moe import fused_moe
     from aiter import QuantType
     if w1.dtype == torch.float4_e2m1fn_x2:
         quant_type = QuantType.per_1x32
     elif w1.dtype == torch.bfloat16:
         quant_type = QuantType.No
+    elif not fp8_ptpc and wei_is_fp8(w1.dtype):
+        quant_type = QuantType.per_128x128
     else:
         quant_type = QuantType.per_Token
     return fused_moe(
@@ -470,11 +472,17 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     latencies = []
     bw = []
     if kernel_type == 'aiter':
-        # aiter needs preshuffle weights
+        # aiter preshuffle seems doesn't help much for fp8
+        # if wei_is_fp8(w1[0].dtype):
+        #     j = 0
+        #     for _ in range(run_count):
+        #         w1[j] = shuffle_weight(w1[j], layout=(16, 16))
+        #         w2[j] = shuffle_weight(w2[j], layout=(16, 16))
+        #         j = (j + 1) % BUF_COPY
         i = 0
         for _ in range(run_count):
             with cudaPerf(flops, mem_size, name=f"{kernel_type}[{B=},{str(weight_type).split('.')[1]}]") as p:
-                _run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
+                _run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i], fp8_ptpc=fp8_ptpc)
             i = (i + 1) % BUF_COPY
             tflops_res.append(p.tflops())
             latencies.append(p.dt())
@@ -636,8 +644,10 @@ def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
 def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
     init_env()
     perf = []
-    perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
-    # perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
+    # perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
+    perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
+    perf.append(entry_common('aiter', batch, prec=[get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, fp8_ptpc=False))
+
     # # TODO: support fp8
     perf.append(entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     # perf.append(entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
@@ -651,8 +661,8 @@ if __name__ == '__main__':
     TILE_M = 16
     TILE_N = 128
     HIDDEN_SIZE = 4096
-    INTER_SIZE = 1536
-    TP = 4
+    INTER_SIZE = 1024
+    TP = 8
     batch =  [256*2+253]
     batch =  [94*256]
     batch =  [24000]
@@ -670,5 +680,5 @@ if __name__ == '__main__':
         test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
         batch = [1, 2, 4, 8, 12, 16, 32, 64]
         test_small_batch_perf(batch, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-        batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+        batch = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
         test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
