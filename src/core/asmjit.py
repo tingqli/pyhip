@@ -177,6 +177,10 @@ class GPRExpr:
         # some instructions only support const on operand src0
         if op in ["+", "*", "&", "|", "^"] and (isinstance(src1, int) or isinstance(src1, float)):
             src0, src1 = src1, src0
+        # canonicalize item's type to GPRExpr
+        if op != "getitem":
+            if isinstance(src0, GPRs): src0 = src0[...]
+            if isinstance(src1, GPRs): src1 = src1[...]
         self.src0 = src0
         self.src1 = src1
         self.src2 = src2
@@ -463,6 +467,8 @@ class GPRs:
         dst = self[key]
         #inst = Instruction(self.jit.current_bb, "expression_place_holder")
         #inst(dst, value)
+        if isinstance(value, GPRs):
+            value = value[...]
         self.jit.recursive_expr_gen(self.jit.current_bb, dst, value, loc=get_caller_loc())
         # expression_place_holder will be compiled later when all program is ready
         # all expressions within same BB can be processed together
@@ -473,6 +479,10 @@ class GPRs:
     '''
     def to_expr(self):
         return self[...]
+
+    def __iadd__(self, other):
+        self[...] = self.to_expr() + other
+        return self
 
     def __add__(self, other):
         return GPRExpr("+", self.to_expr(), other)

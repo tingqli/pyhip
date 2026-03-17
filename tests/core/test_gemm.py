@@ -3,6 +3,8 @@ import pytest
 import functools
 import torch
 
+from pyhip.contrib.common.loaders import tb_swizzle
+
 """
 work-group协作，每次预取 wg_M * row_bytes 大小的内容到预取寄存器，写入LDS
 """
@@ -472,7 +474,7 @@ def gemm_kernel(J, K, N, M01, GroupNum,
 
     wg_M = wave_size[0]*wave_cnt[0]
     wg_N = wave_size[1]*wave_cnt[1]
-    blk_m, blk_n = J.tb_swizzle(block_1d_id, M,
+    blk_m, blk_n = tb_swizzle(J, block_1d_id, M,
                                 wg_M, wg_N, N, M01, GroupNum)
     if not skip_load:
         pA[:] = pA[:] + blk_m * (wg_M * K * J.sizeof_bf16)

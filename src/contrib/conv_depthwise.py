@@ -5,7 +5,7 @@ __all__ = [
 ]
 
 import os
-USE_GLUON = int(os.getenv("USE_GLUON", "0"))
+USE_GLUON = int(os.getenv("USE_GLUON", "1"))
 
 # https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.conv3d.html
 def conv_depthwise_3d(input, weight, bias,
@@ -84,18 +84,18 @@ def conv_depthwise_3d_jit(J, KD, KH, KW, H, W,
     H0, W0 = H,W
     H1, W1 = H,W
     
-    blk_B = J.blockIdx.x[0]
-    blk_C = J.blockIdx.y[0]
-    blk_D = J.blockIdx.z[0]
+    blk_B = J.blockIdx.x
+    blk_C = J.blockIdx.y
+    blk_D = J.blockIdx.z
 
     blk_in = J.gpr("su32", (blk_B * C + blk_C) * D0 + blk_D)
     blk_out = J.gpr("su32", (blk_B * C + blk_C) * D1 + blk_D)
 
     # each WG handles W output elements
-    input[:] += blk_in * H0 * W0 * J.sizeof_bf16
-    output[:] += blk_out * H1 * W1 * J.sizeof_bf16
-    weight[:] += blk_C * KD * KH * KW * J.sizeof_bf16
-    bias[:] += blk_C * J.sizeof_bf16
+    input += blk_in * H0 * W0 * J.sizeof_bf16
+    output += blk_out * H1 * W1 * J.sizeof_bf16
+    weight += blk_C * KD * KH * KW * J.sizeof_bf16
+    bias += blk_C * J.sizeof_bf16
 
     vbias = J.gpr("vf32", 0x00008000)
     J.global_load_short_d16_hi(vbias, J.gpr("vu32", 0), bias)
@@ -117,10 +117,10 @@ def conv_depthwise_3d_jit(J, KD, KH, KW, H, W,
 
     # fill the padding part in LDS [KD, padded_H, padded_W]
     vzeros = J.gpr(4, "vu32", 0)
-    voff = J.gpr("vu32", lds_input + J.threadIdx.x[0]*J.sizeof_DW4)
+    voff = J.gpr("vu32", lds_input + J.threadIdx.x*J.sizeof_DW4)
     for i in range(0, input_size, num_threads*J.sizeof_DW4):
         J.ds_write_b128(voff, vzeros)
-        voff[0] += num_threads*J.sizeof_DW4
+        voff += num_threads*J.sizeof_DW4
 
     J.s_waitcnt(mod=f"lgkmcnt(0)")
     J.s_barrier()
@@ -129,21 +129,21 @@ def conv_depthwise_3d_jit(J, KD, KH, KW, H, W,
     for d in range(KD):
         d_off_lds = ((d * padded_H + KH//2) * padded_W + KW//2) * J.sizeof_bf16
         d_off_vmem = d*H*W*J.sizeof_bf16
-        h_off_lds = J.warp_id[0] * (padded_W * J.sizeof_bf16)
-        h_off_vmem = J.gpr("vu32", J.warp_id[0]) * (W * J.sizeof_bf16)
+        h_off_lds = J.warp_id * (padded_W * J.sizeof_bf16)
+        h_off_vmem = J.gpr("vu32", J.warp_id) * (W * J.sizeof_bf16)
 
         m0_base = J.gpr("su32", lds_input + d_off_lds + h_off_lds)
-        vm_base = J.gpr("vu32", d_off_vmem + h_off_vmem + J.lane_id[0] * J.sizeof_DW)
-        h = J.gpr("su32", J.warp_id[0])
-        with J.While(h[0] < H):
+        vm_base = J.gpr("vu32", d_off_vmem + h_off_vmem + J.lane_id * J.sizeof_DW)
+        h = J.gpr("su32", J.warp_id)
+        with J.While(h < H):
             J.s_mov_b32("m0", m0_base)
             for w in range(0, W, 128):
-                with J.ExecMask(J.lane_id[0]*2 < (W-w)):
+                with J.ExecMask(J.lane_id*2 < (W-w)):
                     buff_a.load_dword(None, vm_base, 0, offset12=w*J.sizeof_bf16)
 
-            m0_base[0] += num_warps * padded_W * J.sizeof_bf16
-            vm_base[0] += num_warps * W * J.sizeof_bf16
-            h[0] += num_warps
+            m0_base += num_warps * padded_W * J.sizeof_bf16
+            vm_base += num_warps * W * J.sizeof_bf16
+            h += num_warps
 
     J.s_waitcnt(mod=f"vmcnt(0)")
     J.s_barrier()
@@ -166,13 +166,13 @@ def conv_depthwise_3d_jit(J, KD, KH, KW, H, W,
         for kh in range(KH):
             conv_tasks.append((kd, kh))
 
-    h = J.gpr("su32", J.warp_id[0])
+    h = J.gpr("su32", J.warp_id)
     with J.While(h < H):
         for w in range(0, W, 128): 
             # process 1x64 outputs per warp
             vaddr = J.gpr("vu32", lds_input + \
-                                    J.gpr("vu32", J.gpr("su32", h[0] * (padded_W * J.sizeof_bf16))) + \
-                                    w * J.sizeof_bf16 + J.lane_id[0] * J.sizeof_u32)
+                                    J.gpr("vu32", J.gpr("su32", h * (padded_W * J.sizeof_bf16))) + \
+                                    w * J.sizeof_bf16 + J.lane_id * J.sizeof_u32)
             C = J.gpr(2, "f32", vbias) 
             for kd, kh in conv_tasks:
                 for kw in range(0,KW,2):
@@ -191,10 +191,10 @@ def conv_depthwise_3d_jit(J, KD, KH, KW, H, W,
 
             J.v_perm_b32(C[0], C[0], C[1], J.get_sgpr_const(0x03_02_07_06))
 
-            vcol_addr = J.gpr("vu32", w * J.sizeof_bf16 + J.lane_id[0]*J.sizeof_u32)
+            vcol_addr = J.gpr("vu32", w * J.sizeof_bf16 + J.lane_id * J.sizeof_u32)
             with J.ExecMask(vcol_addr < W * J.sizeof_bf16):
-                J.global_store_dword(vcol_addr + J.gpr("su32", h[0] * (W*J.sizeof_bf16)), C[0], output)
-        h[0] += num_warps
+                J.global_store_dword(vcol_addr + J.gpr("su32", h * (W*J.sizeof_bf16)), C[0], output)
+        h += num_warps
 
 try:
     from triton.experimental import gluon
@@ -259,9 +259,9 @@ try:
         offsets_kw = gl.arange(0, XBLOCK, layout=layout)
         mask = offsets < xnumel
 
-        smem_input.slice(start, length, dim=0)
+        smem2 = smem_input.slice(KH//2, length, dim=1)
 
-        cp.async_copy_global_to_shared(smem_input, input_ptr + offsets, mask=mask)
+        cp.async_copy_global_to_shared(smem2, input_ptr + offsets, mask=mask)
         cp.commit_group()
         cp.wait_group(0)
 

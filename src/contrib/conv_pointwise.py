@@ -74,14 +74,14 @@ def conv_pointwise_jit(J, group_size,
     假定 group_size 足够小，输入点沿着 DHW 维度直接读入到 group_size 个寄存器，
     然后这些寄存器使用fmac组合得到 group_size 个输出直接写出
     """
-    blk_B = J.blockIdx.x[0]
-    blk_g = J.blockIdx.y[0]
+    blk_B = J.blockIdx.x
+    blk_g = J.blockIdx.y
 
     offset = J.gpr("su32", (blk_B * C + blk_g * group_size) * DHW * J.sizeof_bf16)
-    input[:] += offset[0]
-    output[:] += offset[0]
-    weight[:] += (blk_g * group_size) * group_size * J.sizeof_bf16
-    bias[:] += (blk_g * group_size) * J.sizeof_bf16
+    input += offset
+    output += offset
+    weight += (blk_g * group_size) * group_size * J.sizeof_bf16
+    bias += (blk_g * group_size) * J.sizeof_bf16
 
     num_warps = 4
     num_threads = num_warps * 64
@@ -108,9 +108,9 @@ def conv_pointwise_jit(J, group_size,
 
     voffset = J.gpr(group_size, "vu32")
     for g in range(group_size):
-        voffset[g] = J.threadIdx.x[0] * J.sizeof_DW4 + g * J.gpr("vu32", DHW) * J.sizeof_bf16
+        voffset[g] = J.threadIdx.x * J.sizeof_DW4 + DHW * (g * J.sizeof_bf16)
 
-    dhw0 = J.gpr("su32", J.warp_id[0]*64*J.sizeof_DW4 // J.sizeof_bf16)
+    dhw0 = J.gpr("su32", J.warp_id*64*J.sizeof_DW4 // J.sizeof_bf16)
     with J.While(dhw0 < DHW):
         with J.ExecMask(voffset[0] < DHW*J.sizeof_bf16):
             for g in range(group_size):
@@ -152,7 +152,7 @@ def conv_pointwise_jit(J, group_size,
         for g0 in range(group_size):
             voffset[g0] += num_threads * J.sizeof_DW4
 
-        dhw0[0] += num_threads * J.sizeof_DW4 // J.sizeof_bf16
+        dhw0 += num_threads * J.sizeof_DW4 // J.sizeof_bf16
 
     pass
 
