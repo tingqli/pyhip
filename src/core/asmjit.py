@@ -428,7 +428,7 @@ class GPRs:
         last_dim_id = len(key) - 1
         for i,k in enumerate(key[:-1]):
             assert isinstance(k, int)
-            assert k < self.shape[i]
+            assert k < self.shape[i], f"{self.name=} {k=} {i=} {self.shape[i]=}"
             base_idx += k * self.strides[i]
 
         last_k = key[-1]

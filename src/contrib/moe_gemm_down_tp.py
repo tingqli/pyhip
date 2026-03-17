@@ -50,8 +50,6 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
 
     assert gate_up == False
     num_warps = 4
-    BLOCK_K = 128
-    num_k_loops = J.div(IC * J.sizeof(AB_dtype), BLOCK_K)
     stride_k = IC * J.sizeof(AB_dtype)
 
     # all 4 warps distributed in 4x1
@@ -87,6 +85,9 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
     mfma_A = J.gpr(nrM, nrK, 4, "abf16x2")          # 4 b32 regs in MFMA-16 layout : 16x16xfp32/16x32xbf16/16x64xfp8
     mfma_B = J.gpr(nrN, nrK, 4, "abf16x2")
     mfma_C = J.gpr(2, nrM, nrN, 4, "vf32")          # mfma_C is ping-pong buffered for storing output  
+
+    if AB_dtype == "fp8":
+        assert nrK >= 2 and (nrK % 2) == 0, f"v_mfma_f32_16x16x128_f8f6f4 needs K=128, but {nrK=}"
 
     # load whole mfma_A matrix into register & reuse them for different output tiles
     warp_offset_m = J.warp_id[0] * (warp_M * J.sizeof_u32)
@@ -150,7 +151,6 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
             offset -= 64*1024
         else:
             voffset = voff
-        # mfma_B = J.gpr(nrN, nrK, 4, "abf16x2")
         J.ds_read_b128(mfma_B[n, k], voffset, mod=f"offset:{offset}")
 
     if AB_dtype == "bf16":
@@ -163,12 +163,43 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
                                                 mfma_A[m, k],
                                                 0 if k == 0 else mfma_C[c_index, m, n])
                         yield 16
+        def ds_read_scaleB():
+            pass
     else:
         assert AB_dtype == "fp8"
-        # due to mem-bound, we just dequant firectly after MFMA
-        num_scaleB = J.div(wg_N, scale_BN) if wg_N >= scale_BN else 1
-        mfma_scaleA = J.gpr(nrM, "vf32")
-        mfma_scaleB = J.gpr(num_scaleB, "vf32")
+        scale_BM, scale_BN, scale_BK = 1,128,128 
+        # due to mem-bound, we dequant directly after MFMA
+        num_scales_K = J.div(IC, scale_BK)
+        nrsN = J.div(wg_N, scale_BN) if wg_N >= scale_BN else 1
+        mfma_scaleA = J.gpr(nrM, num_scales_K, "vf32")
+        mfma_scaleB = J.gpr(nrsN, num_scales_K, "vf32")
+
+        # since IC is small, load all scaleA into registers
+        # expecting scaleA to be in [k,m] layout
+        buff_sa = J.Buffer(pScaleA, num_scales_K * (num_tokens[0] * TOPK) * J.sizeof_f32)
+
+        vridx = J.gpr(nrM, "vu32")
+        for bm in range(nrM):
+            _voff = J.gpr("vu32")
+            _voff[0] = J.gpr("vu32", J.warp_id[0] * (warp_M * J.sizeof_u32) + \
+                      (bm * 16 * J.sizeof_u32) + \
+                      (J.lane_id[0] % 16) * J.sizeof_u32)
+            J.ds_read_b32(vridx[bm], _voff, mod=f"offset:{lds_sorted_ids}")
+
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        for bm in range(nrM):
+            vridx[bm] = (vridx[bm] & 0xFFFFFF) * (TOPK * J.sizeof_f32) + \
+                        (vridx[bm] >> 24) * J.sizeof_f32
+
+        for bk in range(num_scales_K):
+            for bm in range(nrM):
+                buff_sa.load_dword(mfma_scaleA[bm, bk], vridx[bm], 0, offset12=0)
+                vridx[bm] += num_tokens[0] * TOPK * J.sizeof_f32
+
+        # rely on load-B-scales to do the vm_wait & sync
+        J.s_waitcnt(mod=f"vmcnt({0})")
+        J.s_barrier()
 
         # since IC is small, load all B scales into LDS: 
         sizeof_scaleB = J.div(OC, scale_BN) * J.div(IC, scale_BK) * J.sizeof_f32
@@ -176,38 +207,44 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
         lds_scaleB = J.alloc_lds(sizeof_scaleB)
         J.wg_load_lds(lds_scaleB, pScaleB, sizeof_scaleB, num_warps, wait_barrier = True)
 
-        def ds_read_scaleB(bk, bn):
-            # bk: in unit of scale_BK
-            # bn: in unit of scale_BN
-            vaddr_scaleB = J.gpr(num_scaleB, "vu32")
-            for i in range(num_scaleB):
-                vaddr_scaleB[i] = lds_scaleB + (bn + i)*(J.div(IC, scale_BK)*J.sizeof_f32)
+        def ds_read_scaleB():
+            # each scale is broadcasted to all lanes
+            for bn in range(nrsN):
+                for bk in range(num_scales_K):
+                    vaddr = J.gpr("vu32", lds_scaleB + bn*J.div(IC, scale_BK)*J.sizeof_f32 + bk * J.sizeof_f32)
+                    J.ds_read_b32(mfma_scaleB[bn, bk], vaddr)
 
-            assert scale_BN >= nrN * 16 * 4
-            if isinstance(bk, int):
-                off = bk * J.sizeof_f32
-                for i in range(num_scaleB):
-                    J.ds_read_b32(mfma_scaleB[i], vaddr_scaleB[i], mod=f"offset:{off}")
-            else:
-                for i in range(num_scaleB):
-                    J.ds_read_b32(mfma_scaleB[i], vaddr_scaleB[i] + bk * J.sizeof_f32)
-
-
-        mfma_scale = J.gpr(2, nrM, "vf32")
         def mfma(c_index):
-            for k in range(nrK):
+            for m in range(nrM):
+                for n in range(nrN):
+                    mfma_C[c_index,m,n,0] = 0
+                    mfma_C[c_index,m,n,1] = 0
+                    mfma_C[c_index,m,n,2] = 0
+                    mfma_C[c_index,m,n,3] = 0
+            
+            for k in range(0,nrK,2):
                 for m in range(nrM):
                     for n in range(nrN):
-                        J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n],
-                                                      mfma_B[n, k],
-                                                      mfma_A[m, k],
+                        mfma_scaleAB = J.gpr("vf32", mfma_scaleA[m, k*64//scale_BK] * mfma_scaleB[n*16//scale_BN, k*64//scale_BK])
+                        temp = J.gpr(4, "vf32")
+                        J.v_mfma_f32_16x16x128_f8f6f4(temp,
+                                                      mfma_B[n, k:k+1],
+                                                      mfma_A[m, k:k+1],
                                                       0)
-                        J.v_fmac_f32(mfma_C[c_index, m, n, 0], mfma_fifo[fifo_read_id, 0], mfma_fifo_scale[c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[c_index, m, n, 1], mfma_fifo[fifo_read_id, 1], mfma_fifo_scale[c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[c_index, m, n, 2], mfma_fifo[fifo_read_id, 2], mfma_fifo_scale[c_index % 2,m])
-                        J.v_fmac_f32(mfma_C[c_index, m, n, 3], mfma_fifo[fifo_read_id, 3], mfma_fifo_scale[c_index % 2,m])
+                        J.s_nop(15)
+                        J.v_fmac_f32(mfma_C[c_index, m, n, 0], temp[0], mfma_scaleAB)
+                        J.v_fmac_f32(mfma_C[c_index, m, n, 1], temp[1], mfma_scaleAB)
+                        J.v_fmac_f32(mfma_C[c_index, m, n, 2], temp[2], mfma_scaleAB)
+                        J.v_fmac_f32(mfma_C[c_index, m, n, 3], temp[3], mfma_scaleAB)
                         yield 16
-
+            # mfma_B = J.gpr(nrN, nrK, 4, "abf16x2")
+            #J.debug_log(mfma_A[0], torch.float8_e4m3fn)
+            #J.debug_log(mfma_B[0], torch.float8_e4m3fn)
+            #J.debug_log(mfma_A[0, 0], torch.float8_e4m3fn)
+            #J.debug_log(mfma_C[c_index, 0, 0], torch.float)
+            #J.debug_log(mfma_scaleAB, torch.float)
+            #J.s_endpgm()
+            
     # prepare output offsets
     stride_c = OC * J.sizeof(C_dtype)
     buff_c = J.Buffer(output, num_tokens * TOPK * stride_c)
@@ -263,6 +300,7 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
             for n in range(nrN):
                 for k in range(nrK):
                     ds_read_B(ldsB[toc], n, k)
+            ds_read_scaleB()
             J.s_waitcnt(mod=f"lgkmcnt({0})")
             J.s_barrier()
 
@@ -293,6 +331,7 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
             for n in range(nrN):
                 for k in range(nrK):
                     ds_read_B(ldsB[0], n, k)
+            ds_read_scaleB()
             J.s_waitcnt(mod=f"lgkmcnt({0})")
             J.s_barrier()
 

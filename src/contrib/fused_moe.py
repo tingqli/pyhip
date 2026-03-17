@@ -517,7 +517,7 @@ def fused_moe(
             else:
                 assert 0, f"{a2.dtype=} {w2.dtype=}"
             #sorted_expert_ids[...] = 0
-            if quant_type == aiter.QuantType.No:
+            if 1: #quant_type == aiter.QuantType.No:
                 if VERBOSE:
                     print(a2.dtype, a2.shape)
                     tok_index = sorted_ids[:wg_M]&0xFFFFFF

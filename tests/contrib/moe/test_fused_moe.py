@@ -221,6 +221,7 @@ def test_fmoe(
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
+    out2_ref = None
     if ep_size > 1:
         # reference impl which do not simulate quant-behaviour but support expert_mask
         out2_ref = torch_moe(
@@ -237,7 +238,7 @@ def test_fmoe(
             expert_mask=expert_mask,
             activation=actType,
         )
-    else:
+    elif 1:
         # # ######################## stage 1 start ###########
         out1_ref = torch_moe_stage1(
             a1_qt,
@@ -305,25 +306,29 @@ def test_fmoe(
         expert_mask=expert_mask,
         num_iters=5,
         num_warmup=2,
+        num_copies=1
     )
-    err = checkAllclose(
-        out2_ref,
-        out2_ck,
-        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
-    )
-
-    """
-    def calc_diff(x: torch.Tensor, y: torch.Tensor):
-        x, y = x.double(), y.double()
-        denominator = (x * x + y * y).sum()
-        sim = 2 * (x * y).sum() / denominator
-        return 1 - sim
-    """
-    logits_diff = calc_diff(out2_ref, out2_ck, diff_thr=diff_thr)
-    if logits_diff > 1e-3:
-        logging.warning(
-            f"logits_diff: {logits_diff} is too large, please check the implementation"
+    if out2_ref is not None:
+        err = checkAllclose(
+            out2_ref,
+            out2_ck,
+            msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
         )
+
+        """
+        def calc_diff(x: torch.Tensor, y: torch.Tensor):
+            x, y = x.double(), y.double()
+            denominator = (x * x + y * y).sum()
+            sim = 2 * (x * y).sum() / denominator
+            return 1 - sim
+        """
+        logits_diff = calc_diff(out2_ref, out2_ck, diff_thr=diff_thr)
+        if logits_diff > 1e-3:
+            logging.warning(
+                f"logits_diff: {logits_diff} is too large, please check the implementation"
+            )
+    else:
+        logits_diff = -1
 
     return {"us": us2, "logits_diff": logits_diff}
 

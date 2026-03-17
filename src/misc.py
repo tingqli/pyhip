@@ -169,6 +169,6 @@ def run_perftest(kernel, *args, **kwargs):
 
     for i in range(num_warmup + num_iters):
         with perf:
-            out = kernel(*args_copies[i], **kwarg_copies[i])
+            out = kernel(*args_copies[i%num_copies], **kwarg_copies[i%num_copies])
 
     return out, perf.dt(excludes=num_warmup)*1e6
