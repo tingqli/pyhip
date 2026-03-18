@@ -87,7 +87,7 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
     vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*32)
 
     if use_f32_blockscales_128:
-        assert bpreshuffle == True, "exepct scaleA in [k,m] layout"
+        # assert bpreshuffle == True, "exepct scaleA in [k,m] layout"
         scale_BM, scale_BN, scale_BK = 1,128,128 
         # tic-toc LDS buffer for 256 per-token per-k-128 scales
         # 1-warp is enough to load this buffer

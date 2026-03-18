@@ -147,16 +147,19 @@ def run_perftest(kernel, *args, **kwargs):
     num_iters = extract_attr(kwargs, 'num_iters', 10)
     num_warmup = extract_attr(kwargs, 'num_warmup', 2)
     num_copies = extract_attr(kwargs, 'num_copies', 0)
+    num_flops = extract_attr(kwargs, 'num_flops', 0)
+    num_bytes = extract_attr(kwargs, 'num_bytes', 0)
+    num_spec_tag = extract_attr(kwargs, 'num_spec_tag', '')
 
     if num_copies == 0:
         copy_size = 0
         for a in args:
             if isinstance(a, torch.Tensor):
-                print(a.shape, a.dtype)
+                #print(a.shape, a.dtype)
                 copy_size += a.numel() * a.element_size()
         for k in kwargs:
             if isinstance(kwargs[k], torch.Tensor):
-                print(kwargs[k].shape, kwargs[k].dtype)
+                #print(kwargs[k].shape, kwargs[k].dtype)
                 copy_size += kwargs[k].numel() * kwargs[k].element_size()
         # up-to 4GB
         num_copies = max(int(4e9 / copy_size), num_warmup + num_iters)
@@ -171,4 +174,13 @@ def run_perftest(kernel, *args, **kwargs):
         with perf:
             out = kernel(*args_copies[i%num_copies], **kwarg_copies[i%num_copies])
 
-    return out, perf.dt(excludes=num_warmup)*1e6
+    dt = perf.dt(excludes=num_warmup)
+
+    if num_flops or num_bytes:
+        msg = f"{kernel.__name__} {num_spec_tag} :  {dt*1e6:.0f} us"
+        if num_flops:
+            msg += f" {num_flops/dt*1e-12:.3f} TFLOPS"
+        if num_bytes:
+            msg += f" {num_bytes/dt*1e-12:.3f} TB/s"
+        print(msg)
+    return out, dt*1e6
