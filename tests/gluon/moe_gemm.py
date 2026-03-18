@@ -78,7 +78,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     BUF_COPY = 10
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
     if weight_type == torch.bfloat16:
-        w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=weight_type)
+        w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=weight_type)*0.1
         w1_ref = w_
         w_shuffled = shuffle_weight(w_).reshape(E, INTER_SIZE_TP * 2 // 16, -1)
         w1 = [w_shuffled.clone() for _ in range(BUF_COPY)]
