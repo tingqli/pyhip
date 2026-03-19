@@ -22,10 +22,15 @@ __all__ = [
 def gemm_splitk(input: torch.Tensor,
                 weight: torch.Tensor,
                 output: torch.Tensor,
-                weight_scale: torch.Tensor):
+                weight_scale: torch.Tensor,
+                b_preshuffle = True):
     K = input.shape[-1]
     M = input.numel() // K
     N = weight.shape[0]
+
+    if not b_preshuffle:
+        # so far only support preshuffled weights
+        return False
 
     def get_tile_mn(M):
         num_CU = torch.cuda.get_device_properties().multi_processor_count
@@ -63,6 +68,7 @@ def gemm_splitk(input: torch.Tensor,
                 BLOCK_TILE_SIZE_N,
                 SHUFFLE=1,
                 num_warps=num_warps)
+    return True
 
 @triton.language.core._aggregate
 class Args:

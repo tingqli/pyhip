@@ -226,13 +226,13 @@ class GPRExpr:
     def __rsub__(self, other):
         return GPRExpr("-", other, self)
     def __mul__(self, other):
-        if isinstance(other, int) and other >= 0:
+        if isinstance(other, int) and other > 0:
             if (other & (other - 1)) == 0:
                 shift_left_bits = other.bit_length() - 1
                 return GPRExpr("<<", self, shift_left_bits)
         return GPRExpr("*", self, other)
     def __rmul__(self, other):
-        if isinstance(other, int) and other >= 0:
+        if isinstance(other, int) and other > 0:
             if (other & (other - 1)) == 0:
                 shift_left_bits = other.bit_length() - 1
                 return GPRExpr("<<", self, shift_left_bits)

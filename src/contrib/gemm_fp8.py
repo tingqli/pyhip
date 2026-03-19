@@ -99,7 +99,7 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
         # scaleA : [div_up(K, scale_BK), div_up(M,scale_BM)]
         #   
         # pScaleA[:] += blk_m * (wg_M * J.sizeof_f32)
-        buff_sa = J.Buffer(pScaleA, M[0] * J.div(K, scale_BK) * J.sizeof_f32)
+        buff_sa = J.Buffer(pScaleA, M * J.div(K, scale_BK) * J.sizeof_f32)
         voffset_scaleA = J.gpr(J.threadIdx.x[0] * J.sizeof_f32 + blk_m * (wg_M * J.sizeof_f32))
         assert wg_M <= num_warps * 64
         # vm_load_scaleA(lds_scaleA[toc])
@@ -109,7 +109,7 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
             # bk: index of k block with size of 128
             # use execmask to ensure same impact on vmcnt for all warps
             J.s_mov_b32("m0", lds + J.warp_id[0]*(64*J.sizeof_f32))
-            voff = J.gpr("vu32", voffset_scaleA[0] + J.gpr("su32", M[0]*(bk*J.sizeof_f32)))
+            voff = J.gpr("vu32", voffset_scaleA[0] + J.gpr("su32", M * (bk*J.sizeof_f32)))
             #with J.ExecMask(J.threadIdx.x[0] < wg_M, early_skip=False):
             buff_sa.load_dword(None, voff, 0)
 
@@ -418,7 +418,7 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
             J.emit(mfma(3))
 
             step_k()
-
+        mfma_tail()
     #J.debug_log(mfma_C[1,0,0], torch.float, "4h.16v.4h")
     #J.s_endpgm()
 

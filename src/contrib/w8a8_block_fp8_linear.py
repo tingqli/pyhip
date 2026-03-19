@@ -23,6 +23,7 @@ def w8a8_block_fp8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    b_preshuffle = True,
     method = "auto"
 ) -> torch.Tensor:
     if method == "aiter":
@@ -60,25 +61,30 @@ def w8a8_block_fp8_linear(
     K = input.shape[-1]
     M = input.numel() // K
     N = weight.shape[0]
-    output = torch.empty([*input.shape[:-1], N], dtype = input.dtype)
+    output = torch.empty([*input.shape[:-1], N], dtype = input.dtype, device = input.device)
 
     if (M <= 512 and method != "jit") or method == "gluon":
-        gemm_splitk(input, weight, output, weight_scale)
-        if bias is not None:
-            output += bias
-        return output
+        if input.device.index == 0:
+            #print("=========================input ", input.shape, input.dtype, input.device)
+            #print("=========================weight ", weight.shape, weight.dtype, weight.device)
+            #print("=========================output ", output.shape, output.dtype, output.device)
+            #print("=========================weight_scale ", weight_scale.shape, weight_scale.dtype, weight_scale.device, b_preshuffle)
+
+            if gemm_splitk(input, weight, output, weight_scale, b_preshuffle):
+                if bias is not None:
+                    output += bias
+                return output
 
     q_input, x_scale = aiter_per1x128_quant(input.view(M, K), quant_dtype=aiter.dtypes.fp8, transpose_scale=True)
 
+    #print(M,K,N, input.shape, q_input.shape, x_scale.shape)
     #print("pyhip_gemm_a8w8_blockscale: ", input.dtype, q_input.dtype, q_input.shape, weight.dtype, weight.shape, block_size, input_scale is None)
-
-    bpreshuffle = False
     use_f32_blockscales_128 = True
     wg_M, wg_N = 256, 256
     num_block_M = pyhip.div_up(M, wg_M)
     num_block_N = pyhip.div_up(N, wg_N)
-    gemm_8wave_fp8bf16fp16([num_block_N * num_block_M],[64*8],
-                    "fp8", bpreshuffle, use_f32_blockscales_128,
+    gemm_8wave_fp8bf16fp16([num_block_M * num_block_N],[64*8],
+                    "fp8", b_preshuffle, use_f32_blockscales_128,
                     wg_M, wg_N, N, K,
                     q_input.data_ptr(),
                     weight.data_ptr(),
