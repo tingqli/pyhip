@@ -3,13 +3,15 @@ import triton
 import triton.language as tl
 from functools import cache
 
-from pyhip.contrib.gluon.gemm_splitk import get_gemm_splitk
+from pyhip.contrib.gluon.gemm_splitk import gemm_splitk_kernel
 
 #####################################################################
 from pyhip import cudaPerf
 from torch import Tensor
 import pytest
 
+# bf16 support no shuffle, but performance is worse than shuffled
+SHUFFLE = 1
 def div_up(x, y):
     return (x + y - 1) // y
 def _run_aiter(
@@ -62,7 +64,10 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w_scale = [w_qt_scale.clone() for _ in range(BUF_COPY)]
     elif weight_type == torch.bfloat16:
         w_ = torch.randint(-2, 3, [N, K], dtype=torch.bfloat16) / 2
-        w_shuffled = shuffle_weight(w_).reshape(N // 16, -1)
+        if SHUFFLE:
+            w_shuffled = shuffle_weight(w_).reshape(N // 16, -1)
+        else:
+            w_shuffled = w_
         w = [w_shuffled.clone() for _ in range(BUF_COPY)]
         w_scale = [None] * BUF_COPY
         w_ref = w_
@@ -74,7 +79,10 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w_f32 = w_qt.to(dtype=torch.float32).reshape(N // 128, 128, K // 128, 128)
         w_scale_f32 = w_qt_scale.reshape(N // 128, 1, K // 128, 1)
         w_ref = (w_f32 * w_scale_f32).reshape(N, K).to(dtype=torch.bfloat16)
-        w = [shuffle_weight(w_qt) for _ in range(BUF_COPY)]
+        if SHUFFLE:
+            w = [shuffle_weight(w_qt) for _ in range(BUF_COPY)]
+        else:
+            w = [w_qt.clone() for _ in range(BUF_COPY)]
         w_scale = [w_qt_scale.clone() for _ in range(BUF_COPY)]
     else:
         assert 0, f'Only fp4 weight is supported in this test, current weight_type={weight_type}'
@@ -97,7 +105,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             BLOCK_TILE_SIZE_M = TILE_M
             BLOCK_TILE_SIZE_N = TILE_N
 
-            x = get_gemm_splitk(weight_type, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps)[(div_up(N, BLOCK_TILE_SIZE_N) * div_up(M, BLOCK_TILE_SIZE_M),)](
+            x = gemm_splitk_kernel[(div_up(N, BLOCK_TILE_SIZE_N) * div_up(M, BLOCK_TILE_SIZE_M),)](
                 A,                # bf16 [M, K]
                 weight.T,         # bf16 [K/8 * 16 * 8, N/16]
                 gemm_out,         # bf16 [M, N]
@@ -108,6 +116,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 N,
                 BLOCK_TILE_SIZE_M,
                 BLOCK_TILE_SIZE_N,
+                SHUFFLE,
                 num_warps=num_warps
                 )
             # print(x.asm['amdgcn'])
@@ -211,7 +220,7 @@ def test_perf(M, TILE_M=32, TILE_N=64, N=4096, K=4096):
     # TILE_M/N is configurable
     # perf.update(entry_common('mxn_splitk_2s', M=M, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     # perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     return perf
 
 def merge(a: dict, b: dict, path=[]):
