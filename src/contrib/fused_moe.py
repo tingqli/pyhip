@@ -5,7 +5,12 @@ from aiter import dtypes
 
 from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
 from .moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
-from .gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_down
+try:
+    from .gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_down
+except:
+    moe_2stage_splitk_gateup = None
+    moe_2stage_splitk_down = None
+
 from .moe_gemm_down_tp import *
 
 import os
@@ -192,6 +197,8 @@ def debug_verbose_moe_sorting(sorted_ids, sorted_weights, sorted_expert_ids, num
 def wei_is_fp8(weight_type):
     return weight_type == dtypes.fp8
 
+_call_times = 0
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -262,6 +269,15 @@ def fused_moe(
 
     q_dtype_w = w1.dtype
     q_dtype_a = dtype if quant_type == aiter.QuantType.No else w1.dtype
+
+    if hidden_states.device.index == 0:
+        global _call_times
+        if hidden_states.shape[0] == 16384 and _call_times == 0:
+            # torch.save(topk_ids, "topk_ids.pt")
+            # torch.load("/root/sglang/topk_ids.pt")
+            _call_times += 1
+        #print("==== ", list(hidden_states.shape), list(w1.shape), w1.dtype, list(w2.shape), w2.dtype)
+        
 
     if VERBOSE:
         print(f"============================================= {device=} ")
@@ -518,12 +534,6 @@ def fused_moe(
                 assert 0, f"{a2.dtype=} {w2.dtype=}"
             #sorted_expert_ids[...] = 0
             if 1: #quant_type == aiter.QuantType.No:
-                if VERBOSE:
-                    print(a2.dtype, a2.shape)
-                    tok_index = sorted_ids[:wg_M]&0xFFFFFF
-                    tok_topk = sorted_ids[:wg_M]>>24
-                    print(tok_index)
-                    print(a2[tok_index[tok_index<token_num], tok_topk[tok_index<token_num], ...])
                 moe_gemm_down_tp([1, num_e_blocks], [4*64],
                                 AB_dtype, wg_M, 64,
                                 E, model_dim, inter_dim, 

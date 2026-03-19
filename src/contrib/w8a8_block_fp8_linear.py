@@ -10,6 +10,8 @@ from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale as aiter_
 aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
 from .gemm_fp8 import gemm_8wave_fp8bf16fp16
+from .gluon.gemm_splitk import gemm_splitk
+from pyhip import div_up
 
 __all__ = ["w8a8_block_fp8_linear"]
 
@@ -21,9 +23,9 @@ def w8a8_block_fp8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    use_aiter = False
+    method = "auto"
 ) -> torch.Tensor:
-    if use_aiter:
+    if method == "aiter":
         assert input_scale is None
         # assert input_scale is None
         input_2d = input.view(-1, input.shape[-1])
@@ -51,14 +53,20 @@ def w8a8_block_fp8_linear(
             dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
         ).view(*output_shape)
 
+
     assert input_scale is None
     assert block_size == [128, 128] or block_size == (128, 128), block_size
     assert input.dtype == torch.bfloat16
     K = input.shape[-1]
     M = input.numel() // K
     N = weight.shape[0]
-
     output = torch.empty([*input.shape[:-1], N], dtype = input.dtype)
+
+    if (M <= 512 and method != "jit") or method == "gluon":
+        gemm_splitk(input, weight, output, weight_scale)
+        if bias is not None:
+            output += bias
+        return output
 
     q_input, x_scale = aiter_per1x128_quant(input.view(M, K), quant_dtype=aiter.dtypes.fp8, transpose_scale=True)
 

@@ -179,8 +179,8 @@ def run_perftest(kernel, *args, **kwargs):
     if num_flops or num_bytes:
         msg = f"{kernel.__name__} {num_spec_tag} :  {dt*1e6:.0f} us"
         if num_flops:
-            msg += f" {num_flops/dt*1e-12:.3f} TFLOPS"
+            msg += f", {num_flops/dt*1e-12:.3f} TFLOPS"
         if num_bytes:
-            msg += f" {num_bytes/dt*1e-12:.3f} TB/s"
+            msg += f", {num_bytes/dt*1e-12:.3f} TB/s"
         print(msg)
     return out, dt*1e6

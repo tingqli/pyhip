@@ -26,20 +26,10 @@ def test(m, n, k):
                weight_scale.numel() * weight_scale.itemsize + \
                input.numel() * input.itemsize
 
-    ref = input @ w.t()
-    ret, dt = pyhip.run_perftest(
-            w8a8_block_fp8_linear,
-            input,
-            weight,
-            block_size,
-            weight_scale,
-            input_scale = None,
-            bias = None,
-            use_aiter = True,
-            num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"aiter {m},{n},{k}")
-    print(f"{pyhip.calc_diff(ref, ret, diff_thr=0.01)=:.6f}")
+    w8a8_block_fp8_linear(input, weight, block_size, weight_scale, input_scale = None, bias = None, method = "jit")
 
-    ret, dt = pyhip.run_perftest(
+    ref = input @ w.t()
+    ret_aiter, dt = pyhip.run_perftest(
             w8a8_block_fp8_linear,
             input,
             weight,
@@ -47,9 +37,46 @@ def test(m, n, k):
             weight_scale,
             input_scale = None,
             bias = None,
-            use_aiter = False,
-            num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"pyhip {m},{n},{k}")
-    print(f"{pyhip.calc_diff(ref, ret, diff_thr=0.01)=:.6f}")
+            method = "aiter",
+            num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"aiter {m},{n},{k}")
+
+    ret_jit, dt = pyhip.run_perftest(
+            w8a8_block_fp8_linear,
+            input,
+            weight,
+            block_size,
+            weight_scale,
+            input_scale = None,
+            bias = None,
+            method = "jit",
+            num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"  jit {m},{n},{k}")
+
+    ret_gluon, dt = pyhip.run_perftest(
+            w8a8_block_fp8_linear,
+            input,
+            weight,
+            block_size,
+            weight_scale,
+            input_scale = None,
+            bias = None,
+            method = "gluon",
+            num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"gluon {m},{n},{k}")
+
+    ret_auto, dt = pyhip.run_perftest(
+            w8a8_block_fp8_linear,
+            input,
+            weight,
+            block_size,
+            weight_scale,
+            input_scale = None,
+            bias = None,
+            method = "auto",
+            num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f" auto {m},{n},{k}")
+
+    print(f"{pyhip.calc_diff(ref, ret_aiter, diff_thr=0.01)=:.6f}")
+    print(f"{pyhip.calc_diff(ref, ret_jit, diff_thr=0.01)=:.6f}")
+    print(f"{pyhip.calc_diff(ref, ret_gluon, diff_thr=0.01)=:.6f}")
+    print(f"{pyhip.calc_diff(ref, ret_auto, diff_thr=0.01)=:.6f}")
 
 if __name__ == "__main__":
     """
@@ -60,11 +87,15 @@ if __name__ == "__main__":
     gemm_a8w8_blockscale:  torch.float8_e4m3fn torch.Size([16384, 4096]) torch.float8_e4m3fn torch.Size([1536, 4096])
     gemm_a8w8_blockscale:  torch.float8_e4m3fn torch.Size([16384, 4096]) torch.float8_e4m3fn torch.Size([1024, 4096])
     """
-    M = 16384
-    test(M, 256, 4096)
-    test(M, 1024, 4096)
-    test(M, 1536, 4096)
-    test(M, 2560, 4096)
-    test(M, 4096, 1024)
 
-    test(32, 1024, 4096)
+    for m in [32,64,128,256,512,1024,2048,4096]:
+        test(m, 2560, 4096)
+    if 0:
+        M = 16384
+        M = 32
+        test(M, 256, 4096)
+        test(M, 1024, 4096)
+        test(M, 1536, 4096)
+        test(M, 2560, 4096)
+        test(M, 4096, 1024)
+
