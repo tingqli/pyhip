@@ -19,6 +19,10 @@ check if there is bankconflict:
 ROCPROF=/opt/rocm/bin/rocprofv3 rocprof-compute profile --no-roof  --name mytest -b 12 -k moe_up -- python moe.py
 ROCPROF=/opt/rocm/bin/rocprofv3 rocprof-compute analyze -p workloads/mytest/MI355/
 ```
+or 
+```
+rocprofv3 --pmc "SQ_LDS_BANK_CONFLICT,SQ_LDS_DATA_FIFO_FULL" --kernel-include-regex kernel_2x2_lds -d mycounter --output-format csv -- python gemm.py
+```
 
 profile timing:
 ```
