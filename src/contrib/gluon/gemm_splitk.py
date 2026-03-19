@@ -45,7 +45,11 @@ def gemm_splitk(input: torch.Tensor,
         return TILE_M, TILE_N
 
     BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N = get_tile_mn(M)
-    num_warps = 4
+    if weight.dtype == torch.bfloat16:
+        num_warps = 4 if K > 4 * 8 * 4 else 1
+    else:
+        num_warps = 4 if K > 4 * 128 else 1
+
     get_gemm_splitk(weight.dtype,
                 BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps)[(div_up(N, BLOCK_TILE_SIZE_N) * div_up(M, BLOCK_TILE_SIZE_M),)](
                 input,           # bf16 [M, K]
@@ -224,6 +228,7 @@ def get_gemm_splitk(
         BLOCK_TILE_SIZE_N: gl.constexpr,
         num_warps: gl.constexpr = 4,
     ):
+        gl.static_assert(K % BLOCK_TILE_SIZE_K == 0, f"{K=} must be multiple of {BLOCK_TILE_SIZE_K=}")
         pid = gl.program_id(0)
         max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
         tile_m = pid // max_tile_n
