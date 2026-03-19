@@ -2,18 +2,22 @@ import pyhip
 import torch
 import aiter
 from aiter import dtypes
+import os
 
 from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
 from .moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
 try:
-    from .gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_down
+    SPLITK = int(os.getenv("USE_GLUON_SPLITK", "1"))
+    if SPLITK:
+        from .gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_down
+    else:
+        from .gluon.moe_gemm import moe_2stage_gateup as moe_2stage_splitk_gateup, moe_2stage_down as moe_2stage_splitk_down
 except:
     moe_2stage_splitk_gateup = None
     moe_2stage_splitk_down = None
 
 from .moe_gemm_down_tp import *
 
-import os
 USE_GLUON = int(os.getenv("USE_GLUON", "1"))
 VERBOSE = int(os.getenv("VERBOSE", "0"))
 
@@ -373,7 +377,7 @@ def fused_moe(
                                 w1.dtype, topk, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
             moe_2stage_splitk_down[(N2 // BLOCK_TILE_SIZE_N, grid)](
                                 a2, w2, moe_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w2_scale[0] if w2_scale is not None else None, B,
-                                w1.dtype, topk, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps=1)
+                                w1.dtype, topk, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps=1 if SPLITK else 4)
         else:
             #with pyhip.cudaPerf(rw_bytes=num_valid_ids[0]/block_size_M*(model_dim * inter_dim * 2 * 2), name="moe_2stage_splitk(12)"):
             if 1:
