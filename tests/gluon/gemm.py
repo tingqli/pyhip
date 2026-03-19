@@ -19,93 +19,155 @@ from common.utils import gen_timing
 
 SHUFFLE = 0
 
-@cache
-def gemm(
-        weight_dtype: gl.constexpr,
-        BLOCK_TILE_SIZE_M: gl.constexpr,
-        BLOCK_TILE_SIZE_N: gl.constexpr,
-        num_warps: gl.constexpr = 4,
-        ):
-    if weight_dtype == torch.bfloat16:
-        # 64 * sizeof(bf16) = 256 bytes
-        BLOCK_TILE_SIZE_K: gl.constexpr = gl.constexpr(4 * 8 * 2)
-    else:
-        BLOCK_TILE_SIZE_K: gl.constexpr = gl.constexpr(128 * num_warps)    # for fp8 weight, we use 128 as K tile size to better utilize the shared memory bandwidth, since each thread can only load 32 bytes of weight each time, using smaller K tile size will reduce the efficiency of shared memory bandwidth   
+@triton.language.core._aggregate
+class Args:
+    BLOCK_TILE_SIZE_M: gl.constexpr
+    BLOCK_TILE_SIZE_N: gl.constexpr
+    weight_dtype: gl.constexpr
+    num_warps: gl.constexpr
+    BLOCK_TILE_SIZE_K: gl.constexpr
+    SHUFFLE: gl.constexpr
 
-    assert BLOCK_TILE_SIZE_M.bit_count() == 1, "BLOCK_TILE_SIZE_M must be power of 2"
-    assert BLOCK_TILE_SIZE_N.bit_count() == 1, "BLOCK_TILE_SIZE_N must be power of 2"
-    assert BLOCK_TILE_SIZE_M % 32 == 0, "BLOCK_TILE_SIZE_M must be multiple of 32"
-    assert BLOCK_TILE_SIZE_N % 32 == 0, "BLOCK_TILE_SIZE_N must be multiple of 32"
-    USE_SHUFFLE = gl.constexpr(SHUFFLE)
+    @gluon.constexpr_function
+    def __init__(self, BLOCK_TILE_SIZE_M: gl.constexpr, BLOCK_TILE_SIZE_N: gl.constexpr, weight_dtype: gl.constexpr, num_warps: gl.constexpr, SHUFFLE: gl.constexpr):
+        assert BLOCK_TILE_SIZE_M.bit_count() == 1, "BLOCK_TILE_SIZE_M must be power of 2"
+        assert BLOCK_TILE_SIZE_N.bit_count() == 1, "BLOCK_TILE_SIZE_N must be power of 2"
+        assert BLOCK_TILE_SIZE_M % 32 == 0, "BLOCK_TILE_SIZE_M must be multiple of 32"
+        assert BLOCK_TILE_SIZE_N % 32 == 0, "BLOCK_TILE_SIZE_N must be multiple of 32"
 
-    # base: [32, 64]
-    reg_bases = [[0, 1], [0, 2], [0, 4]]
-    m = BLOCK_TILE_SIZE_M // 32
-    bit_pos = 32
-    while m // 2:
-        reg_bases.append([bit_pos, 0])
-        bit_pos *= 2
-        m = m // 2
-    mem_a_layout = gl.DistributedLinearLayout(reg_bases=reg_bases,
-                                              lane_bases=[[0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0]],
-                                              warp_bases=[[1, 0], [2, 0]],
-                                              block_bases=[],
-                                              shape=[BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K])
-    # B: preshuffle layout
-    if weight_dtype == torch.bfloat16:
-        if USE_SHUFFLE:
-            mem_b_layout = gl.BlockedLayout(size_per_thread=[8, 1],
-                                        threads_per_warp=[64, 1],
-                                        warps_per_cta=[1, num_warps],
-                                        order=[0, 1])
+        if not SHUFFLE:
+            assert weight_dtype == torch.bfloat16, 'only bf16 support no shuffle'
+
+        self.BLOCK_TILE_SIZE_M = gl.constexpr(BLOCK_TILE_SIZE_M)
+        self.BLOCK_TILE_SIZE_N = gl.constexpr(BLOCK_TILE_SIZE_N)
+        self.weight_dtype = gl.constexpr(weight_dtype)
+        self.num_warps = gl.constexpr(num_warps)
+        if weight_dtype == torch.bfloat16:
+            self.BLOCK_TILE_SIZE_K = gl.constexpr(64)
         else:
-            # [64, 32]
-            reg_bases = [[1, 0], [2, 0], [4, 0]]
-            n = BLOCK_TILE_SIZE_N // 32
+            self.BLOCK_TILE_SIZE_K = gl.constexpr(128)
+        self.SHUFFLE = gl.constexpr(SHUFFLE)
+
+    @gluon.constexpr_function
+    def get_mem_a_layout(self):
+        # base: [32, 64]
+        reg_bases = [[0, 1], [0, 2], [0, 4]]
+        m = self.BLOCK_TILE_SIZE_M // 32
+        bit_pos = 32
+        while m // 2:
+            reg_bases.append([bit_pos, 0])
+            bit_pos *= 2
+            m = m // 2
+        mem_a_layout = gl.DistributedLinearLayout(reg_bases=reg_bases,
+                                                lane_bases=[[0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0]],
+                                                warp_bases=[[1, 0], [2, 0]],
+                                                block_bases=[],
+                                                shape=[self.BLOCK_TILE_SIZE_M, self.BLOCK_TILE_SIZE_K])
+        return mem_a_layout
+
+    @gluon.constexpr_function
+    def get_mem_b_layout(self):
+        # B: preshuffle layout
+        if self.weight_dtype == torch.bfloat16:
+            if self.SHUFFLE:
+                mem_b_layout = gl.BlockedLayout(size_per_thread=[8, 1],
+                                            threads_per_warp=[64, 1],
+                                            warps_per_cta=[1, self.num_warps],
+                                            order=[0, 1])
+            else:
+                # [64, 32]
+                reg_bases = [[1, 0], [2, 0], [4, 0]]
+                n = self.BLOCK_TILE_SIZE_N // 32
+                bit_pos = 32
+                while n // 2:
+                    reg_bases.append([0, bit_pos])
+                    bit_pos *= 2
+                    n = n // 2
+                mem_b_layout = gl.DistributedLinearLayout(reg_bases=reg_bases,
+                                                        lane_bases=[[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]],
+                                                        warp_bases=[[0, 1], [0, 2]],
+                                                        block_bases=[],
+                                                        shape=[self.BLOCK_TILE_SIZE_K, self.BLOCK_TILE_SIZE_N])
+        else:
+            ...
+        return mem_b_layout
+
+    @gluon.constexpr_function
+    def get_mem_c_layout(self):
+        mem_c_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[4, 16],
+            warps_per_cta=[self.num_warps, 1],
+            order=[1, 0],
+        )
+        return mem_c_layout
+
+    @gluon.constexpr_function
+    def get_lds_layout_a(self):
+        offset_bases = []
+        m = self.BLOCK_TILE_SIZE_M // 32
+        bit_pos = 32
+        while m // 2:
+            offset_bases.append([bit_pos, 0])
+            bit_pos *= 2
+            m = m // 2
+        lds_a_layout = gl.PaddedSharedLayout(
+            [[512, 16]],
+            [
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 16],
+                [0, 32],
+                [4, 0],
+                [8, 0],
+                [16, 0],
+                [1, 0],
+                [2, 0],
+            ] + offset_bases,
+            [],
+            [self.BLOCK_TILE_SIZE_M, self.BLOCK_TILE_SIZE_K]
+        )
+        return lds_a_layout
+
+    @gluon.constexpr_function
+    def get_lds_layout_b(self):
+        if self.SHUFFLE:
+            lds_b_layout = gl.SwizzledSharedLayout(1, 1, 1, [0, 1])
+        else:
+            offset_bases = []
+            n = self.BLOCK_TILE_SIZE_N // 32
             bit_pos = 32
             while n // 2:
-                reg_bases.append([0, bit_pos])
+                offset_bases.append([0, bit_pos])
                 bit_pos *= 2
                 n = n // 2
-            mem_b_layout = gl.DistributedLinearLayout(reg_bases=reg_bases,
-                                                    lane_bases=[[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]],
-                                                    warp_bases=[[0, 1], [0, 2]],
-                                                    block_bases=[],
-                                                    shape=[BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N])
-    else:
-        ...
+            lds_b_layout = gl.PaddedSharedLayout(
+                [[512, 16]],
+                [
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [0, 4],
+                    [0, 8],
+                    [0, 16],
+                    [0, 1],
+                    [0, 2],
+                ] + offset_bases,
+                [],
+                [self.BLOCK_TILE_SIZE_K, self.BLOCK_TILE_SIZE_N]
+            )
+        return lds_b_layout
 
-    # lds layout
-    offset_bases = []
-    m = BLOCK_TILE_SIZE_M // 32
-    bit_pos = 32
-    while m // 2:
-        offset_bases.append([bit_pos, 0])
-        bit_pos *= 2
-        m = m // 2
-    lds_a_layout = gl.PaddedSharedLayout(
-        [[512, 16]],
-        [
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-            [0, 16],
-            [0, 32],
-            [4, 0],
-            [8, 0],
-            [16, 0],
-            [1, 0],
-            [2, 0],
-        ] + offset_bases,
-        [],
-        [BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K]
-    )
-    if USE_SHUFFLE:
-        lds_b_layout = gl.SwizzledSharedLayout(1, 1, 1, [0, 1])
+    @gluon.constexpr_function
+    def get_lds_layout_b_read(self):
         # [64, 32]
         reg_bases=[[1, 0], [2, 0], [4, 0], [512, 0]]
-        n = BLOCK_TILE_SIZE_N // 32
+        n = self.BLOCK_TILE_SIZE_N // 32
         bit_pos = 2
         while n // 2:
             reg_bases.append([0, bit_pos])
@@ -115,523 +177,525 @@ def gemm(
                                                                     lane_bases=[[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0]],
                                                                     warp_bases=[[0, 1], [0, 0]],
                                                                     block_bases=[],
-                                                                    shape=[BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16])
+                                                                    shape=[self.BLOCK_TILE_SIZE_K * 16, self.BLOCK_TILE_SIZE_N // 16])
+        return lds_b_read_layout
+
+# pro :  p0->
+# loop:  p1->w0->l0->c0 -> p2->w1->l1->c1 ...
+# epi :  wn->ln->cn
+# stage1: p, stage2: l->c
+@gluon.jit
+def bf16_2stage_1(
+    p_input,            # bf16 [M, K]
+    p_weight,           # bf16 [K/8 * 16 * 8, N/16]
+    p_output,           # bf16 [M, N]
+    p_weight_scale,     # f32 [N/128, K/128] or None
+    M,
+    weight_dtype: gl.constexpr,
+    K: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK_TILE_SIZE_M: gl.constexpr,
+    BLOCK_TILE_SIZE_N: gl.constexpr,
+    p_debug_buf,
+    SHUFFLE: gl.constexpr = 1,
+    enable_debug: gl.constexpr = False,
+    num_warps: gl.constexpr = 4,
+):
+    if enable_debug:
+        _amd_iglp_sched_barrier(0)
+        start = read_realtime()
+        start_cycle = read_cycle()
+        _amd_iglp_sched_barrier(0)
+    args = Args(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, weight_dtype, num_warps, SHUFFLE)
+    BLOCK_TILE_SIZE_K: gl.constexpr = args.BLOCK_TILE_SIZE_K
+    mem_a_layout: gl.constexpr = args.get_mem_a_layout()
+    mem_b_layout: gl.constexpr = args.get_mem_b_layout()
+    mem_c_layout: gl.constexpr = args.get_mem_c_layout()
+    lds_a_layout: gl.constexpr = args.get_lds_layout_a()
+    lds_b_layout: gl.constexpr = args.get_lds_layout_b()
+    if SHUFFLE:
+        lds_b_read_layout: gl.constexpr = args.get_lds_layout_b_read()
+
+    pid = gl.program_id(0)
+    max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
+    tile_m = pid // max_tile_n
+    tile_n = pid % max_tile_n
+    num_pid = gl.num_programs(0)
+    mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_a_layout))) % M
+    mem_a_offsets = mem_a_offset_m[:, None] * K + gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
+    if SHUFFLE:
+        mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K * 16 + \
+                        gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
     else:
-        offset_bases = []
-        n = BLOCK_TILE_SIZE_N // 32
-        bit_pos = 32
-        while n // 2:
-            offset_bases.append([0, bit_pos])
-            bit_pos *= 2
-            n = n // 2
-        lds_b_layout = gl.PaddedSharedLayout(
-            [[512, 16]],
-            [
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [8, 0],
-                [16, 0],
-                [32, 0],
-                [0, 4],
-                [0, 8],
-                [0, 16],
-                [0, 1],
-                [0, 2],
-            ] + offset_bases,
-            [],
-            [BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N]
-        )
-        lds_b_read_layout:gl.constexpr = None
+        mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K + \
+                        gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
+    if weight_dtype == torch.bfloat16:
+        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
+                                                    instr_shape=[16, 16, 32],
+                                                    transposed=True,
+                                                    warps_per_cta=[2, 2])
+        a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
+        b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
+    else:
+        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
+                                                    instr_shape=[16, 16, 32],
+                                                    transposed=True,
+                                                    tiles_per_warp=[1, BLOCK_TILE_SIZE_M // 16, BLOCK_TILE_SIZE_N // 16],
+                                                    warps_per_cta=[num_warps, 1, 1])
+        a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
+        b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
+        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id()
+        weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
+    lds_a = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K], lds_a_layout)
+    if SHUFFLE:
+        lds_b = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16], lds_b_layout)
+    else:
+        lds_b = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N], lds_b_layout)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(0), p_input, mem_a_offsets)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(0), p_weight, mem_b_offsets, cache_modifier=".cg")
+    gl.amd.cdna4.async_copy.commit_group()
+    acc = gl.zeros((BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
+    s_vmem_read: gl.constexpr = 0x0020
+    s_mfma: gl.constexpr = 0x0008
+    s_ds_read: gl.constexpr = 0x0100
+    s_ds_write: gl.constexpr = 0x0200
+    if enable_debug:
+        _amd_iglp_sched_barrier(0)
+        loop_start = read_realtime()
+        loop_start_cycle = read_cycle()
+        _amd_iglp_sched_barrier(0)
 
-    mem_c_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[4, 16],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
-    )
-    # pro :  p0->
-    # loop:  p1->w0->l0->c0 -> p2->w1->l1->c1 ...
-    # epi :  wn->ln->cn
-    # stage1: p, stage2: l->c
-    @gluon.jit
-    def bf16_2stage_1(
-        p_input,            # bf16 [M, K]
-        p_weight,           # bf16 [K/8 * 16 * 8, N/16]
-        p_output,           # bf16 [M, N]
-        p_weight_scale,     # f32 [N/128, K/128] or None
-        M,
-        weight_dtype: gl.constexpr,
-        K: gl.constexpr,
-        N: gl.constexpr,
-        BLOCK_TILE_SIZE_M: gl.constexpr,
-        BLOCK_TILE_SIZE_N: gl.constexpr,
-        p_debug_buf,
-        enable_debug: gl.constexpr = False,
-        num_warps: gl.constexpr = 4,
-    ):
-        if enable_debug:
-            _amd_iglp_sched_barrier(0)
-            start = read_realtime()
-            start_cycle = read_cycle()
-            _amd_iglp_sched_barrier(0)
-        pid = gl.program_id(0)
-        max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
-        tile_m = pid // max_tile_n
-        tile_n = pid % max_tile_n
-        num_pid = gl.num_programs(0)
-        mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_a_layout))) % M
-        mem_a_offsets = mem_a_offset_m[:, None] * K + gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
-        if USE_SHUFFLE:
-            mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K * 16 + \
-                            gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
+    lds_buff_idx = 1
+    for k_start in range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
+        # _amd_iglp_sched_barrier(0)
+        a_offsets = mem_a_offsets + k_start + BLOCK_TILE_SIZE_K
+        if SHUFFLE:
+            b_offsets = mem_b_offsets + k_start * 16 + BLOCK_TILE_SIZE_K * 16
         else:
-            mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K + \
-                            gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
-        if weight_dtype == torch.bfloat16:
-            c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
-                                                        instr_shape=[16, 16, 32],
-                                                        transposed=True,
-                                                        warps_per_cta=[2, 2])
-            a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
-            b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
-        else:
-            c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
-                                                        instr_shape=[16, 16, 32],
-                                                        transposed=True,
-                                                        tiles_per_warp=[1, BLOCK_TILE_SIZE_M // 16, BLOCK_TILE_SIZE_N // 16],
-                                                        warps_per_cta=[num_warps, 1, 1])
-            a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
-            b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
-            mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id()
-            weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
-        lds_a = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K], lds_a_layout)
-        if USE_SHUFFLE:
-            lds_b = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16], lds_b_layout)
-        else:
-            lds_b = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N], lds_b_layout)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(0), p_input, mem_a_offsets)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(0), p_weight, mem_b_offsets, cache_modifier=".cg")
+            b_offsets = mem_b_offsets + k_start + BLOCK_TILE_SIZE_K
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(lds_buff_idx), p_input, a_offsets)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(lds_buff_idx), p_weight, b_offsets, cache_modifier=".cg")
         gl.amd.cdna4.async_copy.commit_group()
-        acc = gl.zeros((BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
-        s_vmem_read: gl.constexpr = 0x0020
-        s_mfma: gl.constexpr = 0x0008
-        s_ds_read: gl.constexpr = 0x0100
-        s_ds_write: gl.constexpr = 0x0200
-        if enable_debug:
-            _amd_iglp_sched_barrier(0)
-            loop_start = read_realtime()
-            loop_start_cycle = read_cycle()
-            _amd_iglp_sched_barrier(0)
-
-        lds_buff_idx = 1
-        for k_start in range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
-            # _amd_iglp_sched_barrier(0)
-            a_offsets = mem_a_offsets + k_start + BLOCK_TILE_SIZE_K
-            if USE_SHUFFLE:
-                b_offsets = mem_b_offsets + k_start * 16 + BLOCK_TILE_SIZE_K * 16
-            else:
-                b_offsets = mem_b_offsets + k_start + BLOCK_TILE_SIZE_K
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(lds_buff_idx), p_input, a_offsets)
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(lds_buff_idx), p_weight, b_offsets, cache_modifier=".cg")
-            gl.amd.cdna4.async_copy.commit_group()
-            lds_buff_idx = 1 - lds_buff_idx
-            gl.amd.cdna4.async_copy.wait_group(1)
-            a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
-            if USE_SHUFFLE:
-                b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
-                b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
-                b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
-            else:
-                b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
-            acc = gl.amd.cdna4.mfma(a, b, acc)
-
-            # _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
-            # _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
-
-        _amd_iglp_sched_barrier(0)
-        if enable_debug:
-            loop_end = read_realtime()
-            loop_end_cycle = read_cycle()
-            _amd_iglp_sched_barrier(0)        # tail
-        if weight_dtype == torch.float8_e4m3fn:...
-        else:
-            lds_buff_idx = 1 - lds_buff_idx
-            gl.amd.cdna4.async_copy.wait_group(0)
-            a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
-            if USE_SHUFFLE:
-                b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
-                b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
-                b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
-            else:
-                b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
-            acc = gl.amd.cdna4.mfma(a, b, acc)
-
-            out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
-            out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout))) % N
-            out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
-            acc = acc.to(gl.bfloat16)
-            gl.amd.cdna3.buffer_store(gl.convert_layout(acc, mem_c_layout, assert_trivial=False), p_output, out_offsets)
-        if enable_debug:
-            _amd_iglp_sched_barrier(0)
-            end = read_realtime()
-            end_cycle = read_cycle()
-            cu_id, se_id, xcc_id, slot_id = get_cu_id()
-            gl.store(p_debug_buf + pid * 9 + 0, start)
-            gl.store(p_debug_buf + pid * 9 + 1, start_cycle)
-            gl.store(p_debug_buf + pid * 9 + 2, loop_start)
-            gl.store(p_debug_buf + pid * 9 + 3, loop_start_cycle)
-            gl.store(p_debug_buf + pid * 9 + 4, loop_end)
-            gl.store(p_debug_buf + pid * 9 + 5, loop_end_cycle)
-            gl.store(p_debug_buf + pid * 9 + 6, end)
-            gl.store(p_debug_buf + pid * 9 + 7, end_cycle)
-            gl.store(p_debug_buf + pid * 9 + 8,  (slot_id & 0xff) | ((cu_id & 0xff) << 8) | ((se_id & 0xff) << 16) | ((xcc_id & 0xff) << 24))
-
-    # pro :  p0->p1->
-    # loop:  w0->l0->p2->c0 -> w1->l1->p3->c1 -> w2->l2->p4->c2...
-    # epi:   w(n-1)->l(n-1)->c(n-1) -> w(n)->l(n)->c(n)
-    # stage1: l->c, stage2: p
-    @gluon.jit
-    def bf16_2stage(
-        p_input,            # bf16 [M, K]
-        p_weight,           # bf16 [K/8 * 16 * 8, N/16]
-        p_output,           # bf16 [M, N]
-        p_weight_scale,     # f32 [N/128, K/128] or None
-        M,
-        weight_dtype: gl.constexpr,
-        K: gl.constexpr,
-        N: gl.constexpr,
-        BLOCK_TILE_SIZE_M: gl.constexpr,
-        BLOCK_TILE_SIZE_N: gl.constexpr,
-        p_debug_buf,
-        enable_debug: gl.constexpr = False,
-        num_warps: gl.constexpr = 4,
-    ):
-        if enable_debug:
-            _amd_iglp_sched_barrier(0)
-            start = read_realtime()
-            start_cycle = read_cycle()
-            _amd_iglp_sched_barrier(0)
-        pid = gl.program_id(0)
-        max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
-        tile_m = pid // max_tile_n
-        tile_n = pid % max_tile_n
-        num_pid = gl.num_programs(0)
-        mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_a_layout))) % M
-        mem_a_offsets = mem_a_offset_m[:, None] * K + gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
-        if USE_SHUFFLE:
-            mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K * 16 + \
-                            gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
-        else:
-            mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K + \
-                            gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
-        if weight_dtype == torch.bfloat16:
-            c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
-                                                        instr_shape=[16, 16, 32],
-                                                        transposed=True,
-                                                        warps_per_cta=[2, 2])
-            a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
-            b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
-        else:
-            c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
-                                                        instr_shape=[16, 16, 32],
-                                                        transposed=True,
-                                                        tiles_per_warp=[1, BLOCK_TILE_SIZE_M // 16, BLOCK_TILE_SIZE_N // 16],
-                                                        warps_per_cta=[num_warps, 1, 1])
-            a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
-            b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
-            mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id()
-            weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
-        NUM_STAGES: gl.constexpr = 2
-        lds_a = gl.allocate_shared_memory(gl.bfloat16, [NUM_STAGES, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K], lds_a_layout)
-        if USE_SHUFFLE:
-            lds_b = gl.allocate_shared_memory(gl.bfloat16, [NUM_STAGES, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16], lds_b_layout)
-        else:
-            lds_b = gl.allocate_shared_memory(gl.bfloat16, [NUM_STAGES, BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N], lds_b_layout)
-        for i in gl.static_range(NUM_STAGES):
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(i), p_input, mem_a_offsets)
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(i), p_weight, mem_b_offsets, cache_modifier=".cg")
-            gl.amd.cdna4.async_copy.commit_group()
-            mem_a_offsets += BLOCK_TILE_SIZE_K
-            if USE_SHUFFLE:
-                mem_b_offsets += BLOCK_TILE_SIZE_K * 16
-            else:
-                mem_b_offsets += BLOCK_TILE_SIZE_K
-        acc = gl.zeros((BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
-        s_vmem_read: gl.constexpr = 0x0020
-        s_mfma: gl.constexpr = 0x0008
-        s_ds_read: gl.constexpr = 0x0100
-        s_ds_write: gl.constexpr = 0x0200
-        if enable_debug:
-            _amd_iglp_sched_barrier(0)
-            loop_start = read_realtime()
-            loop_start_cycle = read_cycle()
-            _amd_iglp_sched_barrier(0)
-
-        lds_buff_idx = 0
-        for k_start in range(0, K - BLOCK_TILE_SIZE_K * NUM_STAGES, BLOCK_TILE_SIZE_K):
-            # _amd_iglp_sched_barrier(0)
-            gl.amd.cdna4.async_copy.wait_group(NUM_STAGES - 1)
-            a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
-            if USE_SHUFFLE:
-                b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
-                b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
-                b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
-            else:
-                b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
-            gl.amd.cdna3.s_barrier()
-
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(lds_buff_idx), p_input, mem_a_offsets)
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(lds_buff_idx), p_weight, mem_b_offsets, cache_modifier=".cg")
-            gl.amd.cdna4.async_copy.commit_group()
-            mem_a_offsets += BLOCK_TILE_SIZE_K
-            if USE_SHUFFLE:
-                mem_b_offsets += BLOCK_TILE_SIZE_K * 16
-            else:
-                mem_b_offsets += BLOCK_TILE_SIZE_K
-            lds_buff_idx = (lds_buff_idx + 1) % NUM_STAGES
-            acc = gl.amd.cdna4.mfma(a, b, acc)
-
-            # _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
-            # _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
-
-        _amd_iglp_sched_barrier(0)
-        if enable_debug:
-            loop_end = read_realtime()
-            loop_end_cycle = read_cycle()
-            _amd_iglp_sched_barrier(0)
-        # tail
-        if weight_dtype == torch.float8_e4m3fn:...
-        else:
-            for i in gl.static_range(NUM_STAGES):
-                gl.amd.cdna4.async_copy.wait_group(NUM_STAGES - 1 - i)
-                a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
-                if USE_SHUFFLE:
-                    b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
-                    b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
-                    b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
-                else:
-                    b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
-                lds_buff_idx = (lds_buff_idx + 1) % NUM_STAGES
-                acc = gl.amd.cdna4.mfma(a, b, acc)
-
-            out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
-            out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout)))# % N
-            out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
-            acc = acc.to(gl.bfloat16)
-            gl.amd.cdna3.buffer_store(gl.convert_layout(acc, mem_c_layout, assert_trivial=False), p_output, out_offsets)
-        if enable_debug:
-            _amd_iglp_sched_barrier(0)
-            end = read_realtime()
-            end_cycle = read_cycle()
-            cu_id, se_id, xcc_id, slot_id = get_cu_id()
-            gl.store(p_debug_buf + pid * 9 + 0, start)
-            gl.store(p_debug_buf + pid * 9 + 1, start_cycle)
-            gl.store(p_debug_buf + pid * 9 + 2, loop_start)
-            gl.store(p_debug_buf + pid * 9 + 3, loop_start_cycle)
-            gl.store(p_debug_buf + pid * 9 + 4, loop_end)
-            gl.store(p_debug_buf + pid * 9 + 5, loop_end_cycle)
-            gl.store(p_debug_buf + pid * 9 + 6, end)
-            gl.store(p_debug_buf + pid * 9 + 7, end_cycle)
-            gl.store(p_debug_buf + pid * 9 + 8,  (slot_id & 0xff) | ((cu_id & 0xff) << 8) | ((se_id & 0xff) << 16) | ((xcc_id & 0xff) << 24))
-
-    # pro :  p0->p1->w0->l0
-    # loop:  c0->p2->w1->l1 -> c1->p3->w2->l2 -> c2->p4->w3->l3...
-    #                        |==> l1 c1 are too close and will not hide the local load latency. if swap p2 and w1->l1, 
-    #                             there is no prefetch in the duration of w1->l1 and not suitable for memory bound case
-    # epi:   w(n-1)->l(n-1)->c(n-1) -> w(n)->l(n)->c(n)
-    # stage1: c, stage2: p, stage3: l
-    @gluon.jit
-    def bf16_3stage(
-        p_input,            # bf16 [M, K]
-        p_weight,           # bf16 [K/8 * 16 * 8, N/16]
-        p_output,           # bf16 [M, N]
-        p_weight_scale,     # f32 [N/128, K/128] or None
-        M,
-        weight_dtype: gl.constexpr,
-        K: gl.constexpr,
-        N: gl.constexpr,
-        BLOCK_TILE_SIZE_M: gl.constexpr,
-        BLOCK_TILE_SIZE_N: gl.constexpr,
-        p_debug_buf,
-        enable_debug: gl.constexpr = False,
-        num_warps: gl.constexpr = 4,
-    ):
-        if enable_debug:
-            _amd_iglp_sched_barrier(0)
-            start = read_realtime()
-            start_cycle = read_cycle()
-            _amd_iglp_sched_barrier(0)
-        pid = gl.program_id(0)
-        max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
-        tile_m = pid // max_tile_n
-        tile_n = pid % max_tile_n
-        num_pid = gl.num_programs(0)
-        mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_a_layout))) % M
-        mem_a_offsets = mem_a_offset_m[:, None] * K + gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
-        if USE_SHUFFLE:
-            mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K * 16 + \
-                            gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
-        else:
-            mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K + \
-                            gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
-        if weight_dtype == torch.bfloat16:
-            c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
-                                                        instr_shape=[16, 16, 32],
-                                                        transposed=True,
-                                                        warps_per_cta=[2, 2])
-            a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
-            b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
-        else:
-            c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
-                                                        instr_shape=[16, 16, 32],
-                                                        transposed=True,
-                                                        tiles_per_warp=[1, BLOCK_TILE_SIZE_M // 16, BLOCK_TILE_SIZE_N // 16],
-                                                        warps_per_cta=[num_warps, 1, 1])
-            a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
-            b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
-            mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id()
-            weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
-        lds_a = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K], lds_a_layout)
-        if USE_SHUFFLE:
-            lds_b = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16], lds_b_layout)
-        else:
-            lds_b = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N], lds_b_layout)
-        # global prefetch 0, 1
-        for i in gl.static_range(2):
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(i), p_input, mem_a_offsets)
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(i), p_weight, mem_b_offsets, cache_modifier=".cg")
-            gl.amd.cdna4.async_copy.commit_group()
-            mem_a_offsets += BLOCK_TILE_SIZE_K
-            if USE_SHUFFLE:
-                mem_b_offsets += BLOCK_TILE_SIZE_K * 16
-            else:
-                mem_b_offsets += BLOCK_TILE_SIZE_K
-        acc = gl.zeros((BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
-        s_vmem_read: gl.constexpr = 0x0020
-        s_mfma: gl.constexpr = 0x0008
-        s_ds_read: gl.constexpr = 0x0100
-        s_ds_write: gl.constexpr = 0x0200
-        if enable_debug:
-            _amd_iglp_sched_barrier(0)
-            loop_start = read_realtime()
-            loop_start_cycle = read_cycle()
-            _amd_iglp_sched_barrier(0)
-
-        lds_buff_idx = 0
+        lds_buff_idx = 1 - lds_buff_idx
         gl.amd.cdna4.async_copy.wait_group(1)
-        # local prefetch 0
-        a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(0), a_fma_layout)
-        if USE_SHUFFLE:
-            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(0), lds_b_read_layout)
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
+        if SHUFFLE:
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
             b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
             b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
         else:
-            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(0), b_fma_layout)
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
+        acc = gl.amd.cdna4.mfma(a, b, acc)
 
+        # _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
+        # _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
+
+    _amd_iglp_sched_barrier(0)
+    if enable_debug:
+        loop_end = read_realtime()
+        loop_end_cycle = read_cycle()
+        _amd_iglp_sched_barrier(0)        # tail
+    if weight_dtype == torch.float8_e4m3fn:...
+    else:
+        lds_buff_idx = 1 - lds_buff_idx
+        gl.amd.cdna4.async_copy.wait_group(0)
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
+        if SHUFFLE:
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
+            b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
+            b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
+        else:
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
+        acc = gl.amd.cdna4.mfma(a, b, acc)
+
+        out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
+        out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout))) % N
+        out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
+        acc = acc.to(gl.bfloat16)
+        gl.amd.cdna3.buffer_store(gl.convert_layout(acc, mem_c_layout, assert_trivial=False), p_output, out_offsets)
+    if enable_debug:
         _amd_iglp_sched_barrier(0)
-        lds_buff_idx = 1
-        for k_start in range(0, (K - BLOCK_TILE_SIZE_K * 2) // (2 * BLOCK_TILE_SIZE_K)):
-            # _amd_iglp_sched_barrier(0)
-            # compute 0
-            acc = gl.amd.cdna4.mfma(a, b, acc)
-            # global prefetch 2
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(1 - lds_buff_idx), p_input, mem_a_offsets)
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(1 - lds_buff_idx), p_weight, mem_b_offsets, cache_modifier=".cg")
-            gl.amd.cdna4.async_copy.commit_group()
-            gl.amd.cdna4.async_copy.wait_group(1)
-            # local prefetch 1
-            a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
-            if USE_SHUFFLE:
-                b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
-                b_next = b_next.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
-                b_next = gl.convert_layout(b_next, b_fma_layout, assert_trivial=True)
-            else:
-                b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
-            mem_a_offsets += BLOCK_TILE_SIZE_K
-            if USE_SHUFFLE:
-                mem_b_offsets += BLOCK_TILE_SIZE_K * 16
-            else:
-                mem_b_offsets += BLOCK_TILE_SIZE_K
-            lds_buff_idx = 1 - lds_buff_idx
-            for _ in gl.static_range(BLOCK_TILE_SIZE_M // 32 + BLOCK_TILE_SIZE_N // 32):
-                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
-                _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
-            for _ in gl.static_range(BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16):
-                _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
-                _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+        end = read_realtime()
+        end_cycle = read_cycle()
+        cu_id, se_id, xcc_id, slot_id = get_cu_id()
+        gl.store(p_debug_buf + pid * 9 + 0, start)
+        gl.store(p_debug_buf + pid * 9 + 1, start_cycle)
+        gl.store(p_debug_buf + pid * 9 + 2, loop_start)
+        gl.store(p_debug_buf + pid * 9 + 3, loop_start_cycle)
+        gl.store(p_debug_buf + pid * 9 + 4, loop_end)
+        gl.store(p_debug_buf + pid * 9 + 5, loop_end_cycle)
+        gl.store(p_debug_buf + pid * 9 + 6, end)
+        gl.store(p_debug_buf + pid * 9 + 7, end_cycle)
+        gl.store(p_debug_buf + pid * 9 + 8,  (slot_id & 0xff) | ((cu_id & 0xff) << 8) | ((se_id & 0xff) << 16) | ((xcc_id & 0xff) << 24))
 
-            _amd_iglp_sched_barrier(0)
-            # compute 1
-            acc = gl.amd.cdna4.mfma(a_next, b_next, acc)
-            # global prefetch 3
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(1 - lds_buff_idx), p_input, mem_a_offsets)
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(1 - lds_buff_idx), p_weight, mem_b_offsets, cache_modifier=".cg")
-            gl.amd.cdna4.async_copy.commit_group()
-            gl.amd.cdna4.async_copy.wait_group(1)
-            #gl.amd.cdna3.s_barrier()
-            # local prefetch 2
+# pro :  p0->p1->
+# loop:  w0->l0->p2->c0 -> w1->l1->p3->c1 -> w2->l2->p4->c2...
+# epi:   w(n-1)->l(n-1)->c(n-1) -> w(n)->l(n)->c(n)
+# stage1: l->c, stage2: p
+@gluon.jit
+def bf16_2stage(
+    p_input,            # bf16 [M, K]
+    p_weight,           # bf16 [K/8 * 16 * 8, N/16]
+    p_output,           # bf16 [M, N]
+    p_weight_scale,     # f32 [N/128, K/128] or None
+    M,
+    weight_dtype: gl.constexpr,
+    K: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK_TILE_SIZE_M: gl.constexpr,
+    BLOCK_TILE_SIZE_N: gl.constexpr,
+    p_debug_buf,
+    SHUFFLE: gl.constexpr = 1,
+    enable_debug: gl.constexpr = False,
+    num_warps: gl.constexpr = 4,
+):
+    if enable_debug:
+        _amd_iglp_sched_barrier(0)
+        start = read_realtime()
+        start_cycle = read_cycle()
+        _amd_iglp_sched_barrier(0)
+    args = Args(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, weight_dtype, num_warps, SHUFFLE)
+    BLOCK_TILE_SIZE_K: gl.constexpr = args.BLOCK_TILE_SIZE_K
+    mem_a_layout: gl.constexpr = args.get_mem_a_layout()
+    mem_b_layout: gl.constexpr = args.get_mem_b_layout()
+    mem_c_layout: gl.constexpr = args.get_mem_c_layout()
+    lds_a_layout: gl.constexpr = args.get_lds_layout_a()
+    lds_b_layout: gl.constexpr = args.get_lds_layout_b()
+    if SHUFFLE:
+        lds_b_read_layout: gl.constexpr = args.get_lds_layout_b_read()
+
+    pid = gl.program_id(0)
+    max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
+    tile_m = pid // max_tile_n
+    tile_n = pid % max_tile_n
+    num_pid = gl.num_programs(0)
+    mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_a_layout))) % M
+    mem_a_offsets = mem_a_offset_m[:, None] * K + gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
+    if SHUFFLE:
+        mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K * 16 + \
+                        gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
+    else:
+        mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K + \
+                        gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
+    if weight_dtype == torch.bfloat16:
+        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
+                                                    instr_shape=[16, 16, 32],
+                                                    transposed=True,
+                                                    warps_per_cta=[2, 2])
+        a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
+        b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
+    else:
+        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
+                                                    instr_shape=[16, 16, 32],
+                                                    transposed=True,
+                                                    tiles_per_warp=[1, BLOCK_TILE_SIZE_M // 16, BLOCK_TILE_SIZE_N // 16],
+                                                    warps_per_cta=[num_warps, 1, 1])
+        a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
+        b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
+        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id()
+        weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
+    NUM_STAGES: gl.constexpr = 2
+    lds_a = gl.allocate_shared_memory(gl.bfloat16, [NUM_STAGES, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K], lds_a_layout)
+    if SHUFFLE:
+        lds_b = gl.allocate_shared_memory(gl.bfloat16, [NUM_STAGES, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16], lds_b_layout)
+    else:
+        lds_b = gl.allocate_shared_memory(gl.bfloat16, [NUM_STAGES, BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N], lds_b_layout)
+    for i in gl.static_range(NUM_STAGES):
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(i), p_input, mem_a_offsets)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(i), p_weight, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.commit_group()
+        mem_a_offsets += BLOCK_TILE_SIZE_K
+        if SHUFFLE:
+            mem_b_offsets += BLOCK_TILE_SIZE_K * 16
+        else:
+            mem_b_offsets += BLOCK_TILE_SIZE_K
+    acc = gl.zeros((BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
+    s_vmem_read: gl.constexpr = 0x0020
+    s_mfma: gl.constexpr = 0x0008
+    s_ds_read: gl.constexpr = 0x0100
+    s_ds_write: gl.constexpr = 0x0200
+    if enable_debug:
+        _amd_iglp_sched_barrier(0)
+        loop_start = read_realtime()
+        loop_start_cycle = read_cycle()
+        _amd_iglp_sched_barrier(0)
+
+    lds_buff_idx = 0
+    for k_start in range(0, K - BLOCK_TILE_SIZE_K * NUM_STAGES, BLOCK_TILE_SIZE_K):
+        # _amd_iglp_sched_barrier(0)
+        gl.amd.cdna4.async_copy.wait_group(NUM_STAGES - 1)
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
+        if SHUFFLE:
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
+            b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
+            b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
+        else:
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
+        gl.amd.cdna3.s_barrier()
+
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(lds_buff_idx), p_input, mem_a_offsets)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(lds_buff_idx), p_weight, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.commit_group()
+        mem_a_offsets += BLOCK_TILE_SIZE_K
+        if SHUFFLE:
+            mem_b_offsets += BLOCK_TILE_SIZE_K * 16
+        else:
+            mem_b_offsets += BLOCK_TILE_SIZE_K
+        lds_buff_idx = (lds_buff_idx + 1) % NUM_STAGES
+        acc = gl.amd.cdna4.mfma(a, b, acc)
+
+        # _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
+        # _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
+
+    _amd_iglp_sched_barrier(0)
+    if enable_debug:
+        loop_end = read_realtime()
+        loop_end_cycle = read_cycle()
+        _amd_iglp_sched_barrier(0)
+    # tail
+    if weight_dtype == torch.float8_e4m3fn:...
+    else:
+        for i in gl.static_range(NUM_STAGES):
+            gl.amd.cdna4.async_copy.wait_group(NUM_STAGES - 1 - i)
             a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
-            if USE_SHUFFLE:
+            if SHUFFLE:
                 b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
                 b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
                 b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
             else:
                 b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
-            mem_a_offsets += BLOCK_TILE_SIZE_K
-            if USE_SHUFFLE:
-                mem_b_offsets += BLOCK_TILE_SIZE_K * 16
-            else:
-                mem_b_offsets += BLOCK_TILE_SIZE_K
-            lds_buff_idx = 1 - lds_buff_idx
-            for _ in gl.static_range(BLOCK_TILE_SIZE_M // 32 + BLOCK_TILE_SIZE_N // 32):
-                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
-                _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
-            for _ in gl.static_range(BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16):
-                _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
-                _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+            lds_buff_idx = (lds_buff_idx + 1) % NUM_STAGES
+            acc = gl.amd.cdna4.mfma(a, b, acc)
+
+        out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
+        out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout)))# % N
+        out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
+        acc = acc.to(gl.bfloat16)
+        gl.amd.cdna3.buffer_store(gl.convert_layout(acc, mem_c_layout, assert_trivial=False), p_output, out_offsets)
+    if enable_debug:
+        _amd_iglp_sched_barrier(0)
+        end = read_realtime()
+        end_cycle = read_cycle()
+        cu_id, se_id, xcc_id, slot_id = get_cu_id()
+        gl.store(p_debug_buf + pid * 9 + 0, start)
+        gl.store(p_debug_buf + pid * 9 + 1, start_cycle)
+        gl.store(p_debug_buf + pid * 9 + 2, loop_start)
+        gl.store(p_debug_buf + pid * 9 + 3, loop_start_cycle)
+        gl.store(p_debug_buf + pid * 9 + 4, loop_end)
+        gl.store(p_debug_buf + pid * 9 + 5, loop_end_cycle)
+        gl.store(p_debug_buf + pid * 9 + 6, end)
+        gl.store(p_debug_buf + pid * 9 + 7, end_cycle)
+        gl.store(p_debug_buf + pid * 9 + 8,  (slot_id & 0xff) | ((cu_id & 0xff) << 8) | ((se_id & 0xff) << 16) | ((xcc_id & 0xff) << 24))
+
+# pro :  p0->p1->w0->l0
+# loop:  c0->p2->w1->l1 -> c1->p3->w2->l2 -> c2->p4->w3->l3...
+#                        |==> l1 c1 are too close and will not hide the local load latency. if swap p2 and w1->l1, 
+#                             there is no prefetch in the duration of w1->l1 and not suitable for memory bound case
+# epi:   w(n-1)->l(n-1)->c(n-1) -> w(n)->l(n)->c(n)
+# stage1: c, stage2: p, stage3: l
+@gluon.jit
+def bf16_3stage(
+    p_input,            # bf16 [M, K]
+    p_weight,           # bf16 [K/8 * 16 * 8, N/16]
+    p_output,           # bf16 [M, N]
+    p_weight_scale,     # f32 [N/128, K/128] or None
+    M,
+    weight_dtype: gl.constexpr,
+    K: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK_TILE_SIZE_M: gl.constexpr,
+    BLOCK_TILE_SIZE_N: gl.constexpr,
+    p_debug_buf,
+    SHUFFLE: gl.constexpr = 1,
+    enable_debug: gl.constexpr = False,
+    num_warps: gl.constexpr = 4,
+):
+    if enable_debug:
+        _amd_iglp_sched_barrier(0)
+        start = read_realtime()
+        start_cycle = read_cycle()
+        _amd_iglp_sched_barrier(0)
+
+    args = Args(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, weight_dtype, num_warps, SHUFFLE)
+    BLOCK_TILE_SIZE_K: gl.constexpr = args.BLOCK_TILE_SIZE_K
+    mem_a_layout: gl.constexpr = args.get_mem_a_layout()
+    mem_b_layout: gl.constexpr = args.get_mem_b_layout()
+    mem_c_layout: gl.constexpr = args.get_mem_c_layout()
+    lds_a_layout: gl.constexpr = args.get_lds_layout_a()
+    lds_b_layout: gl.constexpr = args.get_lds_layout_b()
+    if SHUFFLE:
+        lds_b_read_layout: gl.constexpr = args.get_lds_layout_b_read()
+
+    pid = gl.program_id(0)
+    max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
+    tile_m = pid // max_tile_n
+    tile_n = pid % max_tile_n
+    num_pid = gl.num_programs(0)
+    mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_a_layout))) % M
+    mem_a_offsets = mem_a_offset_m[:, None] * K + gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
+    if SHUFFLE:
+        mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N // 16, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K * 16 + \
+                        gl.arange(0, BLOCK_TILE_SIZE_K * 16, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
+    else:
+        mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * K + \
+                        gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
+    if weight_dtype == torch.bfloat16:
+        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
+                                                    instr_shape=[16, 16, 32],
+                                                    transposed=True,
+                                                    warps_per_cta=[2, 2])
+        a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
+        b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
+    else:
+        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
+                                                    instr_shape=[16, 16, 32],
+                                                    transposed=True,
+                                                    tiles_per_warp=[1, BLOCK_TILE_SIZE_M // 16, BLOCK_TILE_SIZE_N // 16],
+                                                    warps_per_cta=[num_warps, 1, 1])
+        a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
+        b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
+        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id()
+        weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
+    lds_a = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K], lds_a_layout)
+    if SHUFFLE:
+        lds_b = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 16], lds_b_layout)
+    else:
+        lds_b = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N], lds_b_layout)
+    # global prefetch 0, 1
+    for i in gl.static_range(2):
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(i), p_input, mem_a_offsets)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(i), p_weight, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.commit_group()
+        mem_a_offsets += BLOCK_TILE_SIZE_K
+        if SHUFFLE:
+            mem_b_offsets += BLOCK_TILE_SIZE_K * 16
+        else:
+            mem_b_offsets += BLOCK_TILE_SIZE_K
+    acc = gl.zeros((BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
+    s_vmem_read: gl.constexpr = 0x0020
+    s_mfma: gl.constexpr = 0x0008
+    s_ds_read: gl.constexpr = 0x0100
+    s_ds_write: gl.constexpr = 0x0200
+    if enable_debug:
+        _amd_iglp_sched_barrier(0)
+        loop_start = read_realtime()
+        loop_start_cycle = read_cycle()
+        _amd_iglp_sched_barrier(0)
+
+    lds_buff_idx = 0
+    gl.amd.cdna4.async_copy.wait_group(1)
+    # local prefetch 0
+    a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(0), a_fma_layout)
+    if SHUFFLE:
+        b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(0), lds_b_read_layout)
+        b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
+        b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
+    else:
+        b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(0), b_fma_layout)
+
+    _amd_iglp_sched_barrier(0)
+    lds_buff_idx = 1
+    for k_start in range(0, (K - BLOCK_TILE_SIZE_K * 2) // (2 * BLOCK_TILE_SIZE_K)):
+        # _amd_iglp_sched_barrier(0)
+        # compute 0
+        acc = gl.amd.cdna4.mfma(a, b, acc)
+        # global prefetch 2
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(1 - lds_buff_idx), p_input, mem_a_offsets)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(1 - lds_buff_idx), p_weight, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(1)
+        # local prefetch 1
+        a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
+        if SHUFFLE:
+            b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
+            b_next = b_next.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
+            b_next = gl.convert_layout(b_next, b_fma_layout, assert_trivial=True)
+        else:
+            b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
+        mem_a_offsets += BLOCK_TILE_SIZE_K
+        if SHUFFLE:
+            mem_b_offsets += BLOCK_TILE_SIZE_K * 16
+        else:
+            mem_b_offsets += BLOCK_TILE_SIZE_K
+        lds_buff_idx = 1 - lds_buff_idx
+        for _ in gl.static_range(BLOCK_TILE_SIZE_M // 32 + BLOCK_TILE_SIZE_N // 32):
+            _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
+            _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+        for _ in gl.static_range(BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16):
+            _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
+            _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
 
         _amd_iglp_sched_barrier(0)
-        if enable_debug:
-            loop_end = read_realtime()
-            loop_end_cycle = read_cycle()
-            _amd_iglp_sched_barrier(0)
-        # tail
-        if weight_dtype == torch.float8_e4m3fn:...
+        # compute 1
+        acc = gl.amd.cdna4.mfma(a_next, b_next, acc)
+        # global prefetch 3
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(1 - lds_buff_idx), p_input, mem_a_offsets)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b.index(1 - lds_buff_idx), p_weight, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(1)
+        #gl.amd.cdna3.s_barrier()
+        # local prefetch 2
+        a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
+        if SHUFFLE:
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
+            b = b.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
+            b = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
         else:
-            acc = gl.amd.cdna4.mfma(a, b, acc)
-            gl.amd.cdna4.async_copy.wait_group(0)
-            a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
-            if USE_SHUFFLE:
-                b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
-                b_next = b_next.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
-                b_next = gl.convert_layout(b_next, b_fma_layout, assert_trivial=True)
-            else:
-                b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
+            b = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
+        mem_a_offsets += BLOCK_TILE_SIZE_K
+        if SHUFFLE:
+            mem_b_offsets += BLOCK_TILE_SIZE_K * 16
+        else:
+            mem_b_offsets += BLOCK_TILE_SIZE_K
+        lds_buff_idx = 1 - lds_buff_idx
+        for _ in gl.static_range(BLOCK_TILE_SIZE_M // 32 + BLOCK_TILE_SIZE_N // 32):
+            _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
+            _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+        for _ in gl.static_range(BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16):
+            _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
+            _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
 
-            acc = gl.amd.cdna4.mfma(a_next, b_next, acc)
+    _amd_iglp_sched_barrier(0)
+    if enable_debug:
+        loop_end = read_realtime()
+        loop_end_cycle = read_cycle()
+        _amd_iglp_sched_barrier(0)
+    # tail
+    if weight_dtype == torch.float8_e4m3fn:...
+    else:
+        acc = gl.amd.cdna4.mfma(a, b, acc)
+        gl.amd.cdna4.async_copy.wait_group(0)
+        a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(lds_buff_idx), a_fma_layout)
+        if SHUFFLE:
+            b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), lds_b_read_layout)
+            b_next = b_next.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N)
+            b_next = gl.convert_layout(b_next, b_fma_layout, assert_trivial=True)
+        else:
+            b_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b.index(lds_buff_idx), b_fma_layout)
 
-            out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
-            out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout)))# % N
-            out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
-            acc = acc.to(gl.bfloat16)
-            gl.amd.cdna3.buffer_store(gl.convert_layout(acc, mem_c_layout, assert_trivial=False), p_output, out_offsets)
-        if enable_debug:
-            _amd_iglp_sched_barrier(0)
-            end = read_realtime()
-            end_cycle = read_cycle()
-            cu_id, se_id, xcc_id, slot_id = get_cu_id()
-            gl.store(p_debug_buf + pid * 9 + 0, start)
-            gl.store(p_debug_buf + pid * 9 + 1, start_cycle)
-            gl.store(p_debug_buf + pid * 9 + 2, loop_start)
-            gl.store(p_debug_buf + pid * 9 + 3, loop_start_cycle)
-            gl.store(p_debug_buf + pid * 9 + 4, loop_end)
-            gl.store(p_debug_buf + pid * 9 + 5, loop_end_cycle)
-            gl.store(p_debug_buf + pid * 9 + 6, end)
-            gl.store(p_debug_buf + pid * 9 + 7, end_cycle)
-            gl.store(p_debug_buf + pid * 9 + 8,  (slot_id & 0xff) | ((cu_id & 0xff) << 8) | ((se_id & 0xff) << 16) | ((xcc_id & 0xff) << 24))
+        acc = gl.amd.cdna4.mfma(a_next, b_next, acc)
 
-    return bf16_2stage_1 # bf16_2stage_1 bf16_2stage bf16_3stage
+        out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
+        out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout)))# % N
+        out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
+        acc = acc.to(gl.bfloat16)
+        gl.amd.cdna3.buffer_store(gl.convert_layout(acc, mem_c_layout, assert_trivial=False), p_output, out_offsets)
+    if enable_debug:
+        _amd_iglp_sched_barrier(0)
+        end = read_realtime()
+        end_cycle = read_cycle()
+        cu_id, se_id, xcc_id, slot_id = get_cu_id()
+        gl.store(p_debug_buf + pid * 9 + 0, start)
+        gl.store(p_debug_buf + pid * 9 + 1, start_cycle)
+        gl.store(p_debug_buf + pid * 9 + 2, loop_start)
+        gl.store(p_debug_buf + pid * 9 + 3, loop_start_cycle)
+        gl.store(p_debug_buf + pid * 9 + 4, loop_end)
+        gl.store(p_debug_buf + pid * 9 + 5, loop_end_cycle)
+        gl.store(p_debug_buf + pid * 9 + 6, end)
+        gl.store(p_debug_buf + pid * 9 + 7, end_cycle)
+        gl.store(p_debug_buf + pid * 9 + 8,  (slot_id & 0xff) | ((cu_id & 0xff) << 8) | ((se_id & 0xff) << 16) | ((xcc_id & 0xff) << 24))
+
+gemm = bf16_2stage_1 # bf16_2stage_1 bf16_2stage bf16_3stage
 #####################################################################
 from pyhip import cudaPerf
 from torch import Tensor
@@ -728,7 +792,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             BLOCK_TILE_SIZE_N = TILE_N
             grids = div_up(N, BLOCK_TILE_SIZE_N) * div_up(M, BLOCK_TILE_SIZE_M)
 
-            x = gemm(weight_type, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps)[(grids,)](
+            x = gemm[(grids,)](
                 A,                # bf16 [M, K]
                 weight.T,         # bf16 [K, N]
                 gemm_out,         # bf16 [M, N]
@@ -740,6 +804,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 BLOCK_TILE_SIZE_M,
                 BLOCK_TILE_SIZE_N,
                 p_debug_buf,
+                SHUFFLE,
                 enable_debug=p_debug_buf is not None,
                 num_warps=num_warps
                 )

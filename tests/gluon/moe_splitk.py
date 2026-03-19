@@ -189,16 +189,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             grid = sorted_expert_ids.shape[0]
             if B * TOPK <= E:
                 grid = B * TOPK
-            x=moe_2stage_splitk_gateup(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)[(N1 // BLOCK_TILE_SIZE_N, grid)](
+            moe_2stage_splitk_gateup[(N1 // BLOCK_TILE_SIZE_N, grid)](
                                 hidden_states, w1, gemm1_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w1_scale[0] if w1_scale is not None else None, B,
                                 w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
-            # print(x.asm['amdgcn'])
-            # assert 0
-            x=moe_2stage_splitk_down(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)[(N2 // BLOCK_TILE_SIZE_N, grid)](
+            moe_2stage_splitk_down[(N2 // BLOCK_TILE_SIZE_N, grid)](
                                 gemm1_out, w2, cur_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w2_scale[0] if w2_scale is not None else None, B,
                                 w1.dtype, TOPK, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps=1)
-            # print(x.asm['amdgcn'])
-            # assert 0
         else:
             assert 0, f'not support kernel type "{kernel_type}"'
         return cur_out

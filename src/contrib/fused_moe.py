@@ -368,12 +368,10 @@ def fused_moe(
             N2, K2 = model_dim, inter_dim
             if B * topk <= E:
                 grid = B * topk
-            x=moe_2stage_splitk_gateup(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)[(N1 // BLOCK_TILE_SIZE_N, grid)](
+            moe_2stage_splitk_gateup[(N1 // BLOCK_TILE_SIZE_N, grid)](
                                 hidden_states, w1, a2, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w1_scale[0] if w1_scale is not None else None, B,
                                 w1.dtype, topk, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
-            # print(x.asm['amdgcn'])
-            # assert 0
-            x=moe_2stage_splitk_down(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)[(N2 // BLOCK_TILE_SIZE_N, grid)](
+            moe_2stage_splitk_down[(N2 // BLOCK_TILE_SIZE_N, grid)](
                                 a2, w2, moe_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w2_scale[0] if w2_scale is not None else None, B,
                                 w1.dtype, topk, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_warps=1)
         else:
