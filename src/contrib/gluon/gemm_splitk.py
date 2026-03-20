@@ -318,7 +318,7 @@ def gemm_splitk_kernel(
         mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id()
         weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
     a = gl.amd.cdna3.buffer_load(p_input, mem_a_offsets)
-    b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offsets)
+    b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offsets, cache='.cg')
     acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
     s_vmem_read: gl.constexpr = 0x0020
     s_mfma: gl.constexpr = 0x0008
@@ -333,7 +333,7 @@ def gemm_splitk_kernel(
         else:
             b_offsets = mem_b_offsets + k_start + BLOCK_TILE_SIZE_K
         next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
-        next_b = gl.amd.cdna3.buffer_load(p_weight, b_offsets)
+        next_b = gl.amd.cdna3.buffer_load(p_weight, b_offsets, cache='.cg')
         if weight_dtype == torch.float8_e4m3fn:
             mem_scale_offsets += num_warps
             next_weight_scale = gl.load(p_weight_scale + mem_scale_offsets)

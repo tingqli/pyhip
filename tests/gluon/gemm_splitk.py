@@ -220,7 +220,7 @@ def test_perf(M, TILE_M=32, TILE_N=64, N=4096, K=4096):
     # TILE_M/N is configurable
     # perf.update(entry_common('mxn_splitk_2s', M=M, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     # perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type(), torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     return perf
 
 def merge(a: dict, b: dict, path=[]):
