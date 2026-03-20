@@ -344,7 +344,7 @@ def fused_moe(
         def blk_sz_heuristics():
             #base on Qwen 3.5 TP8 case tested result
             if model_dim == 4096 and inter_dim == 128 and wei_is_fp8(w1.dtype):
-                return 16, 128
+                return 16, 64
             else:
                 return 32, 128
         block_size_M, block_size_N = blk_sz_heuristics()

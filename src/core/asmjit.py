@@ -640,13 +640,15 @@ class Buffer:
         self.base[1] = base[1]
         self.range[0] = size # size可以是GPRExpr
 
-    def load_dwordx4(self, vdst, voffset, soffset, offset12=0):
+    def load_dwordx4(self, vdst, voffset, soffset, offset12=0, non_temporal=False):
         # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
         assert isinstance(offset12 , int) # must be compile time constant
         mod = f"offen"
         if offset12 > 0:
             assert offset12.bit_length() <= 12
             mod += f" offset:{offset12}"
+        if non_temporal:
+            mod += f" sc0 nt"
         if vdst is None:
             return self.J.buffer_load_dwordx4(voffset, self.desc, soffset, mod = mod + " lds")
         return self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)

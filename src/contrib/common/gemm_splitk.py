@@ -114,7 +114,7 @@ def gemm_splitk(J:JIT,
                 yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 2], voffset_a[m], soffset_ka, offset12=32)
                 yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 3], voffset_a[m], soffset_ka, offset12=48)
         for n in range(B_horz):
-            yield buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
+            yield buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb, non_temporal=True)
 
         if weight_dtype == torch.float4_e2m1fn_x2:
             if USE_FP4_SHUFFLE_WEIGHT:
