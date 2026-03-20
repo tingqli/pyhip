@@ -64,16 +64,16 @@ def w8a8_block_fp8_linear(
     output = torch.empty([*input.shape[:-1], N], dtype = input.dtype, device = input.device)
 
     if (M <= 512 and method != "jit") or method == "gluon":
-        if input.device.index == 0:
-            #print("=========================input ", input.shape, input.dtype, input.device)
-            #print("=========================weight ", weight.shape, weight.dtype, weight.device)
-            #print("=========================output ", output.shape, output.dtype, output.device)
-            #print("=========================weight_scale ", weight_scale.shape, weight_scale.dtype, weight_scale.device, b_preshuffle)
+        #if input.device.index == 0:
+        #    print("=========================input ", input.shape, input.dtype, input.device)
+        #    print("=========================weight ", weight.shape, weight.dtype, weight.device)
+        #    print("=========================output ", output.shape, output.dtype, output.device)
+        #    print("=========================weight_scale ", weight_scale.shape, weight_scale.dtype, weight_scale.device, b_preshuffle)
 
-            if gemm_splitk(input, weight, output, weight_scale, b_preshuffle):
-                if bias is not None:
-                    output += bias
-                return output
+        if gemm_splitk(input, weight, output, weight_scale, b_preshuffle):
+            if bias is not None:
+                output += bias
+            return output
 
     q_input, x_scale = aiter_per1x128_quant(input.view(M, K), quant_dtype=aiter.dtypes.fp8, transpose_scale=True)
 
