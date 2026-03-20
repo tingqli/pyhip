@@ -207,11 +207,13 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
         lds_scaleB = J.alloc_lds(sizeof_scaleB)
         J.wg_load_lds(lds_scaleB, pScaleB, sizeof_scaleB, num_warps, wait_barrier = True)
 
-        def ds_read_scaleB():
+        def ds_read_scaleB(idx_wgN):
             # each scale is broadcasted to all lanes
+            assert wg_N <= scale_BN
+            bn_wgN = (idx_wgN * wg_N // scale_BN)
             for bn in range(nrsN):
                 for bk in range(num_scales_K):
-                    vaddr = J.gpr("vu32", lds_scaleB + bn*J.div(IC, scale_BK)*J.sizeof_f32 + bk * J.sizeof_f32)
+                    vaddr = J.gpr("vu32", lds_scaleB + (bn + bn_wgN)*J.div(IC, scale_BK)*J.sizeof_f32 + bk * J.sizeof_f32)
                     J.ds_read_b32(mfma_scaleB[bn, bk], vaddr)
 
         def mfma(c_index):
@@ -300,7 +302,7 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
             for n in range(nrN):
                 for k in range(nrK):
                     ds_read_B(ldsB[toc], n, k)
-            ds_read_scaleB()
+            ds_read_scaleB(loop_n)
             J.s_waitcnt(mod=f"lgkmcnt({0})")
             J.s_barrier()
 
@@ -331,7 +333,7 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
             for n in range(nrN):
                 for k in range(nrK):
                     ds_read_B(ldsB[0], n, k)
-            ds_read_scaleB()
+            ds_read_scaleB(loop_n)
             J.s_waitcnt(mod=f"lgkmcnt({0})")
             J.s_barrier()
 

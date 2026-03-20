@@ -503,7 +503,7 @@ parser.add_argument(
 parser.add_argument(
     "-diff",
     type=float,
-    default=0.01,
+    default=0.001,
     help="diff threshold."
 )
 
