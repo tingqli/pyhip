@@ -163,7 +163,7 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
                                                 mfma_A[m, k],
                                                 0 if k == 0 else mfma_C[c_index, m, n])
                         yield 16
-        def ds_read_scaleB():
+        def ds_read_scaleB(idx_wgN):
             pass
     else:
         assert AB_dtype == "fp8"
