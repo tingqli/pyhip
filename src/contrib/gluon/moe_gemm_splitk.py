@@ -161,8 +161,8 @@ def moe_2stage_splitk_gateup(p_input,            # bf16 [M, K]
         b_offsets_top = mem_b_offsets_top + (k_start // 8) * 16 * 8
         b_offsets_bot = mem_b_offsets_bot + (k_start // 8) * 16 * 8
         if weight_dtype == torch.bfloat16:
-            b_top = gl.amd.cdna3.buffer_load(p_weight, b_offsets_top)
-            b_bot = gl.amd.cdna3.buffer_load(p_weight, b_offsets_bot)
+            b_top = gl.amd.cdna3.buffer_load(p_weight, b_offsets_top, cache='.cg')
+            b_bot = gl.amd.cdna3.buffer_load(p_weight, b_offsets_bot, cache='.cg')
         else:
             assert 0, "only bf16 weight is supported in this kernel"
         a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
@@ -330,7 +330,7 @@ def moe_2stage_splitk_down(p_input,            # bf16 [M, K]
     # prefetch first tile
     a = gl.amd.cdna3.buffer_load(p_input, mem_a_offsets)
     if weight_dtype == torch.bfloat16:
-        b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offsets)
+        b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offsets, cache='.cg')
     # https://github.com/llvm/llvm-project/blob/84ce7b1f1d2997d1880f9b24ee6e6a75d4045e0a/llvm/include/llvm/IR/IntrinsicsAMDGPU.td#L350-L362
     s_vemm: gl.constexpr = 0x0010
     s_vmem_read: gl.constexpr = 0x0020
@@ -348,7 +348,7 @@ def moe_2stage_splitk_down(p_input,            # bf16 [M, K]
         next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
         b_offsets = mem_b_offsets + (k_start // 8) * 16 * 8 + BLOCK_TILE_SIZE_K // 8 * 16 * 8
         if weight_dtype == torch.bfloat16:
-            next_b = gl.amd.cdna3.buffer_load(p_weight, b_offsets)
+            next_b = gl.amd.cdna3.buffer_load(p_weight, b_offsets, cache='.cg')
         else:
             assert 0, "only bf16 weight is supported in this kernel"
         a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)

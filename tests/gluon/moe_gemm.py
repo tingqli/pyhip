@@ -82,10 +82,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w1_ref = w_
         w_shuffled = shuffle_weight(w_).reshape(E, INTER_SIZE_TP * 2 // 16, -1)
         w1 = [w_shuffled.clone() for _ in range(BUF_COPY)]
+        w1_org = [x.reshape(E, INTER_SIZE_TP * 2, -1) for x in w1]
         w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=weight_type)
         w2_ref = w_
         w_shuffled = shuffle_weight(w_).reshape(E, HIDDEN_SIZE // 16, -1)
         w2 = [w_shuffled.clone() for _ in range(BUF_COPY)]
+        w2_org = [x.reshape(E, HIDDEN_SIZE, -1) for x in w2]
         w1_scale = [None] * BUF_COPY
         w2_scale = [None] * BUF_COPY
     elif weight_type == torch.float4_e2m1fn_x2:
@@ -209,7 +211,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         i = 0
         for _ in range(run_count):
             with cudaPerf(flops, mem_size, name=f"{kernel_type}[{B=},{str(weight_type).split('.')[1]}]") as p:
-                _run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
+                _run_aiter(hidden_states=hidden_states[i], w1=w1_org[i], w2=w2_org[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
             i = (i + 1) % BUF_COPY
             tflops_res.append(p.tflops())
             latencies.append(p.dt())
@@ -305,19 +307,19 @@ def show_perf(perf):
 def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8, E=32):
     init_env()
     perf = {}
-    # perf.update(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
+    perf.update(entry_common('aiter', batch, prec=[torch.bfloat16,], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, E=E))
     # TILE_M/N is configurable
     perf.update(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=E))
     show_perf(perf)
 
 if __name__ == '__main__':
-    TILE_M = 64
-    TILE_N = 256
+    TILE_M = 32
+    TILE_N = 128
     HIDDEN_SIZE = 4096
     INTER_SIZE = 1024
-    TP = 1
+    TP = 8
     init_env()
     batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     batch = [4, 8, 16,32,64,128,256, 512]
-    #batch = [512]
-    test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=32)
+    #batch = [4]
+    test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=512)
