@@ -96,7 +96,7 @@ class Args:
         if weight_dtype == torch.bfloat16:
             self.BLOCK_TILE_SIZE_K = gl.constexpr(4 * 8 * num_warps)
         else:
-            self.BLOCK_TILE_SIZE_K = gl.constexpr(128 * num_warps)
+            self.BLOCK_TILE_SIZE_K = gl.constexpr(64 * num_warps)
         self.SHUFFLE = gl.constexpr(SHUFFLE)
 
     @gluon.constexpr_function
@@ -106,9 +106,9 @@ class Args:
             lane_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 8], [0, 16]]
             warp_bases=[[0, 32], [0, 64]] if self.num_warps > 1 else []
         elif self.weight_dtype == torch.float8_e4m3fn:
-            reg_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 64]]
+            reg_bases = [[0, 1], [0, 2], [0, 4], [0, 8]]
             lane_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 16], [0, 32]]
-            warp_bases=[[0, 128], [0, 256]] if self.num_warps > 1 else []
+            warp_bases=[[0, 64], [0, 128]] if self.num_warps > 1 else []
         else:
             assert 0, f'unsupported weight dtype {self.weight_dtype}'
         m = self.BLOCK_TILE_SIZE_M // 16
@@ -136,7 +136,7 @@ class Args:
                                             warps_per_cta=[self.num_warps, 1],
                                             order=[0, 1])
             else:
-                reg_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [1024, 0]]
+                reg_bases = [[1, 0], [2, 0], [4, 0], [8, 0]]
                 n = self.BLOCK_TILE_SIZE_N // 16
                 bit_pos = 1
                 while n // 2:
@@ -146,7 +146,7 @@ class Args:
                 mem_b_layout: gl.constexpr = gl.DistributedLinearLayout(
                     reg_bases=reg_bases,
                     lane_bases=[[16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [512, 0]],
-                    warp_bases=[[2048, 0], [4096, 0]] if self.num_warps > 1 else [],
+                    warp_bases=[[1024, 0], [2048, 0]] if self.num_warps > 1 else [],
                     block_bases=[],
                     shape=[self.BLOCK_TILE_SIZE_K * 16, self.BLOCK_TILE_SIZE_N // 16]
                 )
@@ -315,7 +315,7 @@ def gemm_splitk_kernel(
                                                     warps_per_cta=[num_warps, 1, 1])
         a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
         b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
-        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id()
+        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id() // 2
         weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
     a = gl.amd.cdna3.buffer_load(p_input, mem_a_offsets)
     b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offsets, cache='.cg')
@@ -335,25 +335,20 @@ def gemm_splitk_kernel(
         next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
         next_b = gl.amd.cdna3.buffer_load(p_weight, b_offsets, cache='.cg')
         if weight_dtype == torch.float8_e4m3fn:
-            mem_scale_offsets += num_warps
+            mem_scale_offsets += 2
             next_weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
             # gl.static_print('a layout', a.type.layout)
             # gl.static_print('a reshaped layout', a.reshape(BLOCK_TILE_SIZE_M, num_warps, 2, 64).permute(0, 1, 3, 2).type.layout)
-            a0, a1 = gl.split(a.reshape(BLOCK_TILE_SIZE_M, num_warps, 2, 64).permute(0, 1, 3, 2))
+            a0 = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 64)
             # gl.static_print('a0 layout', a0.type.layout)
-            a0 = a0.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
-            a1 = a1.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
+            a0 = a0.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
             a0_fma = gl.convert_layout(a0, a_fma_layout, assert_trivial=True)
-            a1_fma = gl.convert_layout(a1, a_fma_layout, assert_trivial=True)
             b = b.to(gl.bfloat16)
-            b0, b1 = gl.split(b.reshape(num_warps, 2, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 4, 5, 1))
-            b0 = b0.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N)
-            b1 = b1.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N)
+            b0 = b.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16)
+            b0 = b0.permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N)
             b0_fma = gl.convert_layout(b0, b_fma_layout, assert_trivial=True)
-            b1_fma = gl.convert_layout(b1, b_fma_layout, assert_trivial=True)
             local_acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
             local_acc = gl.amd.cdna4.mfma(a0_fma, b0_fma, local_acc)
-            local_acc = gl.amd.cdna4.mfma(a1_fma, b1_fma, local_acc)
             acc += local_acc * weight_scale
         else:
             a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
@@ -374,20 +369,15 @@ def gemm_splitk_kernel(
     _amd_iglp_sched_barrier(0)
     # tail
     if weight_dtype == torch.float8_e4m3fn:
-        a0, a1 = gl.split(a.reshape(BLOCK_TILE_SIZE_M, num_warps, 2, 64).permute(0, 1, 3, 2))
-        a0 = a0.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
-        a1 = a1.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
+        a0 = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 64)
+        a0 = a0.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
         a0_fma = gl.convert_layout(a0, a_fma_layout, assert_trivial=True)
-        a1_fma = gl.convert_layout(a1, a_fma_layout, assert_trivial=True)
         b = b.to(gl.bfloat16)
-        b0, b1 = gl.split(b.reshape(num_warps, 2, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 2, 3, 4, 5, 1))
-        b0 = b0.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N)
-        b1 = b1.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N)
+        b0 = b.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16)
+        b0 = b0.permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N)
         b0_fma = gl.convert_layout(b0, b_fma_layout, assert_trivial=True)
-        b1_fma = gl.convert_layout(b1, b_fma_layout, assert_trivial=True)
         local_acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
         local_acc = gl.amd.cdna4.mfma(a0_fma, b0_fma, local_acc)
-        local_acc = gl.amd.cdna4.mfma(a1_fma, b1_fma, local_acc)
         acc += local_acc * weight_scale
     else:
         a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)

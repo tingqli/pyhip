@@ -40,7 +40,7 @@ class GateupArgs:
         if weight_dtype == torch.bfloat16:
             self.BLOCK_TILE_SIZE_K = gl.constexpr(4 * 8 * self.num_warps)
         else:
-            self.BLOCK_TILE_SIZE_K = gl.constexpr(128 * self.num_warps)
+            self.BLOCK_TILE_SIZE_K = gl.constexpr(64 * self.num_warps)
 
     @gluon.constexpr_function
     def get_a_layout(self):
@@ -51,9 +51,9 @@ class GateupArgs:
             lane_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 8], [0, 16]]
             warp_bases = [[0, 32], [0, 64]]
         elif self.weight_dtype == torch.float8_e4m3fn:
-            reg_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 64]]
+            reg_bases = [[0, 1], [0, 2], [0, 4], [0, 8]]
             lane_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 16], [0, 32]]
-            warp_bases = [[0, 128], [0, 256]]
+            warp_bases = [[0, 64], [0, 128]]
         else:
             assert 0, f'unsupported weight dtype {self.weight_dtype}'
         m = self.BLOCK_TILE_SIZE_M // 16
@@ -79,7 +79,7 @@ class GateupArgs:
                                         warps_per_cta=[self.num_warps, 1],
                                         order=[0, 1])
         else:
-            reg_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [1024, 0]]
+            reg_bases = [[1, 0], [2, 0], [4, 0], [8, 0]]
             n = self.BLOCK_TILE_SIZE_N // 2 // 16
             bit_pos = 1
             while n // 2:
@@ -89,7 +89,7 @@ class GateupArgs:
             mem_b_layout: gl.constexpr = gl.DistributedLinearLayout(
                 reg_bases=reg_bases,
                 lane_bases=[[16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [512, 0]],
-                warp_bases=[[2048, 0], [4096, 0]],
+                warp_bases=[[1024, 0], [2048, 0]],
                 block_bases=[],
                 shape=[self.BLOCK_TILE_SIZE_K * 16, self.BLOCK_TILE_SIZE_N // 2 // 16]
             )
@@ -196,7 +196,7 @@ def moe_2stage_splitk_gateup(p_input,            # bf16 [M, K]
                                                     warps_per_cta=[num_warps, 1, 1])
         a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
         b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
-        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 2 // 128) * (K // 128) + gl.amd.cdna3.warp_id()
+        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 2 // 128) * (K // 128) + gl.amd.cdna3.warp_id() // 2
     acc_top = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
     acc_bot = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
     # prefetch first tile
@@ -215,16 +215,15 @@ def moe_2stage_splitk_gateup(p_input,            # bf16 [M, K]
     s_ds_write: gl.constexpr = 0x0200
     s_valu: gl.constexpr = 0x0002
     s_salu: gl.constexpr = 0x0004
-
-    for k_start in gl.static_range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
-        _amd_iglp_sched_barrier(0)
-        a_offsets = mem_a_offsets + k_start + BLOCK_TILE_SIZE_K
-        next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
-        b_offsets_top = mem_b_offsets_top + (k_start // 8) * 16 * 8 + BLOCK_TILE_SIZE_K // 8 * 16 * 8
-        b_offsets_bot = mem_b_offsets_bot + (k_start // 8) * 16 * 8 + BLOCK_TILE_SIZE_K // 8 * 16 * 8
-        next_b_top = gl.amd.cdna3.buffer_load(p_weight, b_offsets_top, cache='.cg')
-        next_b_bot = gl.amd.cdna3.buffer_load(p_weight, b_offsets_bot, cache='.cg')
-        if weight_dtype == torch.bfloat16:
+    if weight_dtype == torch.bfloat16:
+        for k_start in gl.static_range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
+            _amd_iglp_sched_barrier(0)
+            a_offsets = mem_a_offsets + k_start + BLOCK_TILE_SIZE_K
+            next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
+            b_offsets_top = mem_b_offsets_top + (k_start // 8) * 16 * 8 + BLOCK_TILE_SIZE_K // 8 * 16 * 8
+            b_offsets_bot = mem_b_offsets_bot + (k_start // 8) * 16 * 8 + BLOCK_TILE_SIZE_K // 8 * 16 * 8
+            next_b_top = gl.amd.cdna3.buffer_load(p_weight, b_offsets_top, cache='.cg')
+            next_b_bot = gl.amd.cdna3.buffer_load(p_weight, b_offsets_bot, cache='.cg')
             a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
             a_fma = gl.convert_layout(a, a_fma_layout, assert_trivial=True)
             b_top = b_top.reshape(num_warps, 4, 16, 8, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N // 2)
@@ -233,78 +232,69 @@ def moe_2stage_splitk_gateup(p_input,            # bf16 [M, K]
             b_fma_bot = gl.convert_layout(b_bot, b_fma_layout, assert_trivial=True)
             acc_top = gl.amd.cdna4.mfma(a_fma, b_fma_top, acc_top)
             acc_bot = gl.amd.cdna4.mfma(a_fma, b_fma_bot, acc_bot)
-        else:
-            mem_scale_offsets += num_warps
+            a = next_a
+            b_top = next_b_top
+            b_bot = next_b_bot
+            _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
+            _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
+    else:
+        for k_start in range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
+            _amd_iglp_sched_barrier(0)
+            a_offsets = mem_a_offsets + k_start + BLOCK_TILE_SIZE_K
+            next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
+            b_offsets_top = mem_b_offsets_top + (k_start // 8) * 16 * 8 + BLOCK_TILE_SIZE_K // 8 * 16 * 8
+            b_offsets_bot = mem_b_offsets_bot + (k_start // 8) * 16 * 8 + BLOCK_TILE_SIZE_K // 8 * 16 * 8
+            next_b_top = gl.amd.cdna3.buffer_load(p_weight, b_offsets_top, cache='.cg')
+            next_b_bot = gl.amd.cdna3.buffer_load(p_weight, b_offsets_bot, cache='.cg')
+            mem_scale_offsets += 2
             next_weight_scale_top = gl.load(p_w_scale_top + mem_scale_offsets)
             next_weight_scale_bot = gl.load(p_w_scale_bot + mem_scale_offsets)
-            a0, a1 = gl.split(a.reshape(BLOCK_TILE_SIZE_M, num_warps, 2, 64).permute(0, 1, 3, 2))
-            a0 = a0.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
-            a1 = a1.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
+            a0 = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 64)
+            a0 = a0.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
             a0_fma = gl.convert_layout(a0, a_fma_layout, assert_trivial=True)
-            a1_fma = gl.convert_layout(a1, a_fma_layout, assert_trivial=True)
             b_top = b_top.to(gl.bfloat16)
-            b0_top, b1_top = gl.split(b_top.reshape(num_warps, 2, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 2, 3, 4, 5, 1))
-            b0_top = b0_top.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N // 2)
-            b1_top = b1_top.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N // 2)
+            b0_top = b_top.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2)
+            b0_top = b0_top.permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N // 2)
             b0_fma_top = gl.convert_layout(b0_top, b_fma_layout, assert_trivial=True)
-            b1_fma_top = gl.convert_layout(b1_top, b_fma_layout, assert_trivial=True)
             b_bot = b_bot.to(gl.bfloat16)
-            b0_bot, b1_bot = gl.split(b_bot.reshape(num_warps, 2, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 2, 3, 4, 5, 1))
-            b0_bot = b0_bot.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N // 2)
-            b1_bot = b1_bot.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N // 2)
+            b0_bot = b_bot.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2)
+            b0_bot = b0_bot.permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N // 2)
             b0_fma_bot = gl.convert_layout(b0_bot, b_fma_layout, assert_trivial=True)
-            b1_fma_bot = gl.convert_layout(b1_bot, b_fma_layout, assert_trivial=True)
             local_acc_top = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
             local_acc_top = gl.amd.cdna4.mfma(a0_fma, b0_fma_top, local_acc_top)
-            local_acc_top = gl.amd.cdna4.mfma(a1_fma, b1_fma_top, local_acc_top)
             acc_top += local_acc_top * weight_scale_top
             local_acc_bot = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
             local_acc_bot = gl.amd.cdna4.mfma(a0_fma, b0_fma_bot, local_acc_bot)
-            local_acc_bot = gl.amd.cdna4.mfma(a1_fma, b1_fma_bot, local_acc_bot)
             acc_bot += local_acc_bot * weight_scale_bot
             weight_scale_top = next_weight_scale_top
             weight_scale_bot = next_weight_scale_bot
-        a = next_a
-        b_top = next_b_top
-        b_bot = next_b_bot
-        if weight_dtype == torch.bfloat16:
-            _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
+            a = next_a
+            b_top = next_b_top
+            b_bot = next_b_bot
+            _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16 + 1, 0)
             _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
-        else:
-            _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
+            _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16 + 1, 0)
             _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
-            _amd_iglp_sched_group_barrier(s_valu, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
-            _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
-            _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
-            _amd_iglp_sched_group_barrier(s_valu, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
 
     _amd_iglp_sched_barrier(0)
     # tail
     if weight_dtype == torch.float8_e4m3fn:
-        a0, a1 = gl.split(a.reshape(BLOCK_TILE_SIZE_M, num_warps, 2, 64).permute(0, 1, 3, 2))
-        a0 = a0.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
-        a1 = a1.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // 2 // num_warps)
+        a0 = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 64)
+        a0 = a0.permute(1, 0, 2).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
         a0_fma = gl.convert_layout(a0, a_fma_layout, assert_trivial=True)
-        a1_fma = gl.convert_layout(a1, a_fma_layout, assert_trivial=True)
         b_top = b_top.to(gl.bfloat16)
-        b0_top, b1_top = gl.split(b_top.reshape(num_warps, 2, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 2, 3, 4, 5, 1))
-        b0_top = b0_top.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N // 2)
-        b1_top = b1_top.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N // 2)
+        b0_top = b_top.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2)
+        b0_top = b0_top.permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N // 2)
         b0_fma_top = gl.convert_layout(b0_top, b_fma_layout, assert_trivial=True)
-        b1_fma_top = gl.convert_layout(b1_top, b_fma_layout, assert_trivial=True)
         b_bot = b_bot.to(gl.bfloat16)
-        b0_bot, b1_bot = gl.split(b_bot.reshape(num_warps, 2, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 2, 3, 4, 5, 1))
-        b0_bot = b0_bot.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N // 2)
-        b1_bot = b1_bot.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2).permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // 2 // num_warps, BLOCK_TILE_SIZE_N // 2)
+        b0_bot = b_bot.reshape(num_warps, 4, 16, 16, BLOCK_TILE_SIZE_N // 16 // 2)
+        b0_bot = b0_bot.permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N // 2)
         b0_fma_bot = gl.convert_layout(b0_bot, b_fma_layout, assert_trivial=True)
-        b1_fma_bot = gl.convert_layout(b1_bot, b_fma_layout, assert_trivial=True)
         local_acc_top = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
         local_acc_top = gl.amd.cdna4.mfma(a0_fma, b0_fma_top, local_acc_top)
-        local_acc_top = gl.amd.cdna4.mfma(a1_fma, b1_fma_top, local_acc_top)
         acc_top += local_acc_top * weight_scale_top
         local_acc_bot = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
         local_acc_bot = gl.amd.cdna4.mfma(a0_fma, b0_fma_bot, local_acc_bot)
-        local_acc_bot = gl.amd.cdna4.mfma(a1_fma, b1_fma_bot, local_acc_bot)
         acc_bot += local_acc_bot * weight_scale_bot
     else:
         a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
@@ -561,12 +551,9 @@ def moe_2stage_splitk_down(p_input,            # bf16 [M, K]
             _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
             _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
         else:
-            _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16 + 1, 0)
-            _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
-            _amd_iglp_sched_group_barrier(s_valu, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
-            _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16 + 1, 0)
-            _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
-            _amd_iglp_sched_group_barrier(s_valu, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
+            for _ in range(4):
+                _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16 + 1, 0)
+                _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
 
     _amd_iglp_sched_barrier(0)
     # tail
