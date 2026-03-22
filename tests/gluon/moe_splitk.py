@@ -125,6 +125,23 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         else:
             w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
         w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
+    elif weight_type == torch.float8_e4m3fn:
+        from aiter.ops.shuffle import shuffle_weight as shuffle_weight_fp8
+        w1_qt = (torch.randint(-2, 3, [E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.float32) * 0.1).to(weight_type)
+        w1_qt_scale = torch.randint(-2, 3, [E, INTER_SIZE_TP * 2 // 128, HIDDEN_SIZE // 128], dtype=torch.float32)
+        w1_f32 = w1_qt.to(dtype=torch.float32).reshape(E, INTER_SIZE_TP * 2 // 128, 128, HIDDEN_SIZE // 128, 128)
+        w1_scale_f32 = w1_qt_scale.reshape(E, INTER_SIZE_TP * 2 // 128, 1, HIDDEN_SIZE // 128, 1)
+        w1_ref = (w1_f32 * w1_scale_f32).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE).to(dtype=torch.bfloat16)
+        w1 = [shuffle_weight_fp8(w1_qt) for _ in range(BUF_COPY)]
+        w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
+
+        w2_qt = torch.randint(-2, 3, [E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.float32).to(weight_type)
+        w2_qt_scale = torch.randint(-2, 3, [E, HIDDEN_SIZE // 128, INTER_SIZE_TP // 128], dtype=torch.float32)
+        w2_f32 = w2_qt.to(dtype=torch.float32).reshape(E, HIDDEN_SIZE // 128, 128, INTER_SIZE_TP // 128, 128)
+        w2_scale_f32 = w2_qt_scale.reshape(E, HIDDEN_SIZE // 128, 1, INTER_SIZE_TP // 128, 1)
+        w2_ref = (w2_f32 * w2_scale_f32).reshape(E, HIDDEN_SIZE, INTER_SIZE_TP).to(dtype=torch.bfloat16)
+        w2 = [shuffle_weight_fp8(w2_qt) for _ in range(BUF_COPY)]
+        w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
     else:
         import aiter
         torch_quant = aiter.get_torch_quant(aiter.QuantType.per_Token)
@@ -307,7 +324,7 @@ def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP
     perf = {}
     perf.update(entry_common('aiter', batch, prec=[torch.bfloat16,], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, E=E))
     # TILE_M/N is configurable
-    perf.update(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=E))
+    perf.update(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=E))
     show_perf(perf)
 
 if __name__ == '__main__':
