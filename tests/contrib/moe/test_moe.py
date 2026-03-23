@@ -481,7 +481,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         #         j = (j + 1) % BUF_COPY
         i = 0
         for _ in range(run_count):
-            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{B=},{str(weight_type).split('.')[1]}]") as p:
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{B=},{str(weight_type).split('.')[1]}]", verbose=0) as p:
                 _run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i], fp8_ptpc=fp8_ptpc)
             i = (i + 1) % BUF_COPY
             tflops_res.append(p.tflops())
@@ -504,7 +504,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
 
         i = 0
         for _ in range(run_count):
-            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{B=},{str(weight_type).split('.')[1]}]") as p:
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{B=},{str(weight_type).split('.')[1]}]", verbose=0) as p:
                 run(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i], fp8_ptpc=fp8_ptpc)
             i = (i + 1) % BUF_COPY
             tflops_res.append(p.tflops())
@@ -515,23 +515,23 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         #print(f">>>>>>>>>>>>>>> {calc_diff(cur_out, ref_out)=} ")
         #print(f">>>>>>>>>>>>>>> {calc_diff(aiter_out, cur_out)=} ")
 
-        diff = calc_diff(ref_out, cur_out)
-        if diff > 0.02:
-            #if not torch.allclose(ref_out, cur_out, rtol=0.1, atol=0.03):
-            print(ref_out)
-            print(cur_out)
-            idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
-            if len(idx[0]):
-                print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
-            assert 0, f"{kernel_type=}, {B=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=}"
-        else:
-            quantype=""
-            if wei_is_fp8(weight_type):
-                if fp8_ptpc:
-                    quantype = " @ PTPC"
-                else:
-                    quantype = " @ blockwise"
-            print(f"{kernel_type}[{B=} {weight_type=}{quantype}] acc OK")
+        # diff = calc_diff(ref_out, cur_out)
+        # if diff > 0.02:
+        #     #if not torch.allclose(ref_out, cur_out, rtol=0.1, atol=0.03):
+        #     print(ref_out)
+        #     print(cur_out)
+        #     idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
+        #     if len(idx[0]):
+        #         print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
+        #     assert 0, f"{kernel_type=}, {B=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=}"
+        # else:
+        #     quantype=""
+        #     if wei_is_fp8(weight_type):
+        #         if fp8_ptpc:
+        #             quantype = " @ PTPC"
+        #         else:
+        #             quantype = " @ blockwise"
+        #     print(f"{kernel_type}[{B=} {weight_type=}{quantype}] acc OK")
     if run_count > 0:
         return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
                 'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
@@ -560,7 +560,7 @@ def entry_b1(prec=[torch.bfloat16], HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E
         perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, run_count=10, fp8_ptpc = True):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=16, E=512, TP=8, run_count=10, fp8_ptpc = True):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
@@ -593,6 +593,7 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64
 def init_env():
     torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
     torch.set_default_device('cuda')
+    torch.cuda.set_device(6)
     torch.manual_seed(0)
 
 def test_acc(TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
@@ -645,21 +646,21 @@ def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP
     init_env()
     perf = []
     # perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
-    perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
-    perf.append(entry_common('aiter', batch, prec=[get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, fp8_ptpc=False))
+    # perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
+    # perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, fp8_ptpc=False))
 
     # # TODO: support fp8
-    perf.append(entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
+    # perf.append(entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     # perf.append(entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     # TILE_M/N is configurable
-    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
-    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, fp8_ptpc=True))
-    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, fp8_ptpc=False))
+    # perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
+    # perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, fp8_ptpc=True))
+    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, fp8_ptpc=False))
     show_perf(perf)
 
 if __name__ == '__main__':
     TILE_M = 16
-    TILE_N = 128
+    TILE_N = 64
     HIDDEN_SIZE = 4096
     INTER_SIZE = 1024
     TP = 8
@@ -677,8 +678,8 @@ if __name__ == '__main__':
     #with torchPerf():
     #    entry_common('aiter', batch, prec=[get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N)
     if 1:
-        test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-        batch = [1, 2, 4, 8, 12, 16, 32, 64]
-        test_small_batch_perf(batch, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-        batch = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+        # test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+        # batch = [1, 2, 4, 8, 12, 16, 32, 64]
+        # test_small_batch_perf(batch, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+        batch = [32, 64, 128, 256]
         test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)

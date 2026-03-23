@@ -24,6 +24,11 @@ def gemm_splitk(J:JIT,
                 USE_FP4_SHUFFLE_WEIGHT=False,
                 fp8_ptpc=True
                 ):
+    import os
+    SKIP_SCALE_LOAD = int(os.getenv("SKIP_SCALE_LOAD", "0"))
+    SKIP_DQ = int(os.getenv("SKIP_DQ", "0"))
+    SKIP_FMA = int(os.getenv("SKIP_FMA", "0"))
+
     assert BLOCK_TILE_SIZE_M % 16 == 0, f'BLOCK_TILE_SIZE_M must be multiple of 16, current {BLOCK_TILE_SIZE_M=}'
     assert BLOCK_TILE_SIZE_N % 32 == 0, f'BLOCK_TILE_SIZE_N must be multiple of 32, current {BLOCK_TILE_SIZE_N=}'
     sizeof_f32 = 4
@@ -83,9 +88,11 @@ def gemm_splitk(J:JIT,
             k_scale_n = k_max
             QUAN_BLK_SZ=128
             v_w_scale = J.gpr(2, k_scale_n, 'vf32')
-            for n_block in range(2):
-                for k_idx in range(k_scale_n):
-                    J.global_load_dword(v_w_scale[n_block, k_idx], voffset_scale[n_block], p_w_scale, mod=f'offset:{k_idx * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
+            
+            if SKIP_SCALE_LOAD == 0:
+                for n_block in range(2):
+                    for k_idx in range(k_scale_n):
+                        J.global_load_dword(v_w_scale[n_block, k_idx], voffset_scale[n_block], p_w_scale, mod=f'offset:{k_idx * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
         
     # ping pong register buffer id
     pp_reg_id = 0
@@ -176,6 +183,10 @@ def gemm_splitk(J:JIT,
                         J.v_add_u32(v_w_f32[j, 0, 1], v_w_f32[j, 0, 1], s_cvt_bf16_bias)
                         J.v_add_u32(v_w_f32[j, 1, 0], v_w_f32[j, 1, 0], s_cvt_bf16_bias)
                         J.v_add_u32(v_w_f32[j, 1, 1], v_w_f32[j, 1, 1], s_cvt_bf16_bias)
+                        
+                            # (A0.B0.C0.D0.A1.B1.C1.D1)[3, 2, 7, 6] = (A1.B1.A0.B0)
+    # pattern_cvt_bf16 = J.gpr("su32")
+    # pattern_cvt_bf16[0] = 0x03_02_07_06
                         J.v_perm_b32(v_w_bf16[n, j, 0], v_w_f32[j, 0, 0], v_w_f32[j, 0, 1], pattern_cvt_bf16)
                         J.v_perm_b32(v_w_bf16[n, j, 1], v_w_f32[j, 1, 0], v_w_f32[j, 1, 1], pattern_cvt_bf16)
                 # 2, A_vert, A_rep=2, 2, 2
@@ -200,24 +211,29 @@ def gemm_splitk(J:JIT,
                 for n in range(B_horz):
                     scale_idx = 0 if n < B_horz// 2  else 1
                     for j in range(2):
-                        J.v_cvt_pk_f32_fp8(v_w_f32[j, 0], B_reg[pp_reg_id, n, i, j])
-                        J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[j, 1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
-                        J.v_pk_mul_f32(v_w_f32[j, 0], v_w_f32[j, 0], v_tmp_scale_pk[scale_idx])
-                        J.v_pk_mul_f32(v_w_f32[j, 1], v_w_f32[j, 1], v_tmp_scale_pk[scale_idx])
-                        J.v_add_u32(v_w_f32[j, 0, 0], v_w_f32[j, 0, 0], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[j, 0, 1], v_w_f32[j, 0, 1], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[j, 1, 0], v_w_f32[j, 1, 0], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[j, 1, 1], v_w_f32[j, 1, 1], s_cvt_bf16_bias)
-                        J.v_perm_b32(v_w_bf16[n, j, 0], v_w_f32[j, 0, 0], v_w_f32[j, 0, 1], pattern_cvt_bf16)
-                        J.v_perm_b32(v_w_bf16[n, j, 1], v_w_f32[j, 1, 0], v_w_f32[j, 1, 1], pattern_cvt_bf16)
-                for n in range(B_horz):
-                    # 2, A_vert, A_rep=2, 2, 2
-                    for m in range(A_vert):
-                        if is_cdna4:
-                            yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i], C_reg[n, m])
+                        if SKIP_DQ == 0:
+                            J.v_cvt_pk_f32_fp8(v_w_f32[j, 0], B_reg[pp_reg_id, n, i, j])
+                            J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[j, 1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
+                            J.v_pk_mul_f32(v_w_f32[j, 0], v_w_f32[j, 0], v_tmp_scale_pk[scale_idx])
+                            J.v_pk_mul_f32(v_w_f32[j, 1], v_w_f32[j, 1], v_tmp_scale_pk[scale_idx])
+                            J.v_add_u32(v_w_f32[j, 0, 0], v_w_f32[j, 0, 0], s_cvt_bf16_bias)
+                            J.v_add_u32(v_w_f32[j, 0, 1], v_w_f32[j, 0, 1], s_cvt_bf16_bias)
+                            J.v_add_u32(v_w_f32[j, 1, 0], v_w_f32[j, 1, 0], s_cvt_bf16_bias)
+                            J.v_add_u32(v_w_f32[j, 1, 1], v_w_f32[j, 1, 1], s_cvt_bf16_bias)
+                            J.v_perm_b32(v_w_bf16[n, j, 0], v_w_f32[j, 0, 0], v_w_f32[j, 0, 1], pattern_cvt_bf16)
+                            J.v_perm_b32(v_w_bf16[n, j, 1], v_w_f32[j, 1, 0], v_w_f32[j, 1, 1], pattern_cvt_bf16)
                         else:
-                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 0], A_reg[pp_reg_id, m, i, 0], C_reg[n, m])
-                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[pp_reg_id, m, i, 1], C_reg[n, m])
+                            J.v_mov_b32(v_w_bf16[n, j, 0], B_reg[pp_reg_id, n, i, j])
+                            J.v_mov_b32(v_w_bf16[n, j, 1], B_reg[pp_reg_id, n, i, j])
+                if SKIP_FMA == 0:
+                    for n in range(B_horz):
+                        # 2, A_vert, A_rep=2, 2, 2
+                        for m in range(A_vert):
+                            if is_cdna4:
+                                yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i], C_reg[n, m])
+                            else:
+                                yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 0], A_reg[pp_reg_id, m, i, 0], C_reg[n, m])
+                                yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[pp_reg_id, m, i, 1], C_reg[n, m])
         else:
             for m in range(A_vert):
                 for n in range(B_horz):

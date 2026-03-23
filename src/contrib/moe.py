@@ -379,6 +379,9 @@ def moe_2stage_splitk(J:JIT,
                       M:"int",
                       fp8_ptpc,):
     assert weight_dtype == torch.bfloat16 or weight_dtype == torch.float4_e2m1fn_x2 or weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz
+    import os
+    SKIP_POST_GEMM = int(os.getenv("SKIP_POST_GEMM", "0"))
+    SKIP_DOWN_STORE= int(os.getenv("SKIP_DOWN_STORE", "0"))
     if weight_dtype == torch.float4_e2m1fn_x2:
         if with_silu:
             assert BLOCK_TILE_SIZE_N % 64 == 0, f'due to scale is packed with [2*16, 8*32], gate/up each needs 2*16 rows; current BLOCK_TILE_SIZE_N={BLOCK_TILE_SIZE_N} is not supported'
@@ -582,7 +585,8 @@ def moe_2stage_splitk(J:JIT,
 
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
-
+    if (SKIP_POST_GEMM):
+        return
     ###############################################
     if with_silu and BLOCK_TILE_SIZE_N % 64 == 0 and"gfx950" in J.arch:
         # use more lds
@@ -728,6 +732,8 @@ def moe_2stage_splitk(J:JIT,
                     creg_low[1] = (creg_f32[2] >> 16) | (creg_f32[3] & 0xFFFF0000)   
                 
                     vaddr = J.gpr(v_token_id_tr[0] * (N * sizeof_bf16) + rd_col_idx * (4 * sizeof_bf16) + n * rd_column_lanes *(4 * sizeof_bf16))
+                    if (SKIP_DOWN_STORE):
+                        return
                     with J.ExecMask(v_token_id_tr[0] < M[0], early_skip=False):
                             J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
                             J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
@@ -742,6 +748,8 @@ def moe_2stage_splitk(J:JIT,
                         J.v_add_u32(C_reg[n, m, j], C_reg[n, m, j], s_cvt_bf16_bias)
                     creg_low[0] = (C_reg[n, m, 0] >> 16) | (C_reg[n, m, 1] & 0xFFFF0000)
                     creg_low[1] = (C_reg[n, m, 2] >> 16) | (C_reg[n, m, 3] & 0xFFFF0000)
+                    if (SKIP_DOWN_STORE):
+                        return
                     with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
                         J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
                         J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
