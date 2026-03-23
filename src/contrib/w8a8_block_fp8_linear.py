@@ -11,6 +11,7 @@ aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
 from .gemm_fp8 import gemm_8wave_fp8bf16fp16
 from .gluon.gemm_splitk import gemm_splitk
+from .gemm import gemm_splitk_jit
 from pyhip import div_up
 
 __all__ = ["w8a8_block_fp8_linear"]
@@ -63,14 +64,15 @@ def w8a8_block_fp8_linear(
     N = weight.shape[0]
     output = torch.empty([*input.shape[:-1], N], dtype = input.dtype, device = input.device)
 
-    if (M <= 512 and method != "jit") or method == "gluon":
+    if (M <= 64 and method == "jit"):
         #if input.device.index == 0:
-        #    print("=========================input ", input.shape, input.dtype, input.device)
-        #    print("=========================weight ", weight.shape, weight.dtype, weight.device)
-        #    print("=========================output ", output.shape, output.dtype, output.device)
-        #    print("=========================weight_scale ", weight_scale.shape, weight_scale.dtype, weight_scale.device, b_preshuffle)
+        # print("=========================input ", input.shape, input.dtype, input.device)
+        # print("=========================weight ", weight.shape, weight.dtype, weight.device)
+        # print("=========================output ", output.shape, output.dtype, output.device)
+        # print("=========================weight_scale ", weight_scale.shape, weight_scale.dtype, weight_scale.device, b_preshuffle)
 
-        if gemm_splitk(input, weight, output, weight_scale, b_preshuffle):
+        # if gemm_splitk(input, weight, output, weight_scale, b_preshuffle):
+        if gemm_splitk_jit(input, weight, output, weight_scale, b_preshuffle):
             if bias is not None:
                 output += bias
             return output

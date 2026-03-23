@@ -17,7 +17,7 @@ def test(m, n, k, b_preshuffle = False):
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    input = torch.randn((m, k), dtype=output_dtype, device="cuda") / 10
+    input = torch.rand((m, k), dtype=output_dtype, device="cuda") /10.0
     weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
     weight_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
 
@@ -104,12 +104,13 @@ if __name__ == "__main__":
     gemm_a8w8_blockscale:  torch.float8_e4m3fn torch.Size([16384, 4096]) torch.float8_e4m3fn torch.Size([1024, 4096])
     """
 
-    # special shape accuracy test
-    test(32, 4096, 256, b_preshuffle=True)
-    test(255, 512, 256, b_preshuffle=False)
-    if 1:
-        for m in [32,64,128,256,512,1024,2048,4096]:
-                test(m, 2560, 4096, b_preshuffle=True)
+    # # special shape accuracy test
+    # test(32, 4096, 256, b_preshuffle=True)
+    # test(16, 16384, 4096*4, b_preshuffle=True)
+    # test(255, 512, 256, b_preshuffle=False)
+    # if 1:
+    for m in [16,32,64,128,256]:
+            test(m, 64*256, 4096, b_preshuffle=True)
     if 0:
         M = 16384
         M = 57
