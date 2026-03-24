@@ -5,7 +5,6 @@ __all__ = [
 ]
 
 import os
-USE_GLUON = int(os.getenv("USE_GLUON", "1"))
 
 # https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.conv3d.html
 def conv_depthwise_3d(input, weight, bias,
@@ -13,7 +12,7 @@ def conv_depthwise_3d(input, weight, bias,
                     padding, 
                     dilation,
                     groups,
-                    use_gluon = None):
+                    method = None):
     for s in stride: assert s == 1, s
     for d in dilation: assert d == 1, d
 
@@ -39,13 +38,24 @@ def conv_depthwise_3d(input, weight, bias,
 
     output = torch.zeros(B, C_out, D_out, H_out, W_out, dtype=input.dtype, device=input.device)
 
-    if use_gluon is None:
-        use_gluon = USE_GLUON
-    if use_gluon:
-        grid = (B, C_out, D_out)
-        conv_depthwise_3d_gl[grid](KD, KH, KW, H_out, W_out,
-                                   input, weight, output, bias, B, C_out, D, D_out)
-    else:
+    if method is None:
+        method = "hip"
+
+    if method == "hip":
+        pyhip.module("conv_depthwise3d_hip.cpp", "-O2").conv_depthwise3d_hip(
+            [B, C_out, D_out], [256],
+            input.data_ptr(),
+            output.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            C_in, D, H, W,
+            C_out, D_out, H_out, W_out,
+            IO_DTYPE="__half" if input.dtype == torch.float16 else "__hip_bfloat16",
+            BLOCK_H=H_out,
+            BLOCK_W=W_out,
+            PaddingD=padding[0],PaddingH=padding[1],PaddingW=padding[2],
+            KD=KD, KH=KH, KW=KW)
+    elif method == "jit":
         conv_depthwise_3d_jit([B, C_out,D_out], [256],
                         KD, KH, KW, H_out, W_out,
                         input.data_ptr(),
@@ -53,6 +63,9 @@ def conv_depthwise_3d(input, weight, bias,
                         output.data_ptr(),
                         bias.data_ptr(),
                         B, C_out, D, D_out)
+    else:
+        assert False, f"unsupported method : {method}"
+
     return output
 
 @pyhip.jit(with_debug_log=False)

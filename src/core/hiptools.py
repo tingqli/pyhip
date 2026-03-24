@@ -106,9 +106,24 @@ def amdgpu_arch():
     index = 0
     return gfx_archs.splitlines()[index].strip()
 
-def compile_hip_device_only(src_path, extra_compiler_options):
+PYHIP_CACHE_DIR = os.getenv("PYHIP_CACHE_DIR", os.path.expanduser("~/.pyhip"))
+os.makedirs(PYHIP_CACHE_DIR, exist_ok=True)
+
+def compile_hip_device_only(src_path, extra_compiler_options, macros=None):
     src_mtime = os.path.getmtime(src_path)
-    pre, ext = os.path.splitext(src_path)
+
+    src_folder, src_filename = os.path.split(src_path)
+    pre, ext = os.path.splitext(src_filename)
+
+    # put all intermedite file under cache
+    pre = f"{PYHIP_CACHE_DIR}/{pre}"
+
+    if macros is not None:
+        assert isinstance(macros, tuple)
+        for k,v in macros:
+            extra_compiler_options += f" -D{k}={v}"
+            pre += f"-{k}={v}"
+
     assert ext == ".cpp" or ext == ".s"
     ll_path = pre + ".ll"
     asm_path = pre + ".s"
@@ -171,6 +186,40 @@ Compile .s into .co and expose test_kernel as a python function
 
 '''
 
+@functools.cache
+def _build_hip_src(src_fpath, extra_compiler_options, macros):
+    if src_fpath.endswith(".cpp") or src_fpath.endswith(".s"):
+        module_fpath = compile_hip_device_only(src_fpath, extra_compiler_options, macros)
+    else:
+        assert src_fpath.endswith(".co")
+        module_fpath = src_fpath
+
+    kargs = get_all_kernel_args(module_fpath)
+    return module_fpath, kargs
+
+@functools.cache
+def _build_hip_func(src_fpath, extra_compiler_options, macros, func_name):
+    module_fpath, kargs = _build_hip_src(src_fpath, extra_compiler_options, macros)
+    sym_name, arg_types = kargs[func_name]
+    wrapper = amdhip_func(module_fpath, sym_name, func_name, arg_types)
+    wrapper.__name__ = func_name
+    return wrapper
+
+class callable_kernel:
+    def __init__(self, src_fpath, extra_compiler_options, func_name):
+        self.src_fpath = src_fpath
+        self.extra_compiler_options = extra_compiler_options
+        self.func_name = func_name
+
+    def __call__(self, *args, **kwargs):
+        # macro's name must start with UPPER letter
+        macros = []
+        for key in list(kwargs.keys()):
+            if key[0].isupper():
+                macros.append((key, kwargs.pop(key)))
+
+        _build_hip_func(self.src_fpath, self.extra_compiler_options, tuple(macros), self.func_name)(*args, **kwargs)
+
 class module:
     def __init__(self, src_file_path, extra_compiler_options = ""):
         if os.path.isabs(src_file_path):
@@ -179,50 +228,19 @@ class module:
             base_dir = os.path.dirname(inspect.getframeinfo(sys._getframe(1)).filename)
             src_fpath = os.path.join(base_dir, src_file_path)
 
-        if src_fpath.endswith(".cpp") or src_fpath.endswith(".s"):
-            module_fpath = compile_hip_device_only(src_fpath, extra_compiler_options)
-        else:
-            module_fpath = src_fpath
-
         self.src_fpath = src_fpath
-        self.module_fpath = module_fpath
-        self.kargs = get_all_kernel_args(module_fpath)
-        self.funcs = {}
-    
+        self.extra_compiler_options = extra_compiler_options
+
     def __call__(self, func):
         '''
         decorator on func
         '''
         assert callable(func)
         func_name = func.__name__
-
-        if func_name not in self.kargs:
-            raise Exception(f"Cannot find {func_name} in {self.module_fpath}, only found {list(self.kargs.keys())}")
-
-        sym_name, arg_types = self.kargs[func_name]
-
-        print(f"\033[0;32m Kernel {func_name}({arg_types})  {self.src_fpath} : {self.module_fpath} : {sym_name} \033[0m")
-
-        wrapper = amdhip_func(self.module_fpath, sym_name, func_name, arg_types)
-        functools.update_wrapper(wrapper, func) 
-        return wrapper
+        return callable_kernel(self.src_fpath, self.extra_compiler_options, func_name)
 
     def __getattr__(self, func_name):
         '''
         w/o decorator on func, directly build wrapper from name
         '''
-        if func_name in self.funcs:
-            return self.funcs[func_name]
-
-        if func_name not in self.kargs:
-            raise Exception(f"Cannot find {func_name} in {self.module_fpath}, only found {list(self.kargs.keys())}")
-
-        sym_name, arg_types = self.kargs[func_name]
-
-        print(f"\033[0;32m Kernel {func_name}({arg_types})  {self.src_fpath} : {self.module_fpath} : {sym_name} \033[0m")
-
-        wrapper = amdhip_func(self.module_fpath, sym_name, func_name, arg_types)
-        wrapper.__name__ = func_name
-
-        self.funcs[func_name] = wrapper
-        return wrapper
+        return callable_kernel(self.src_fpath, self.extra_compiler_options, func_name)
