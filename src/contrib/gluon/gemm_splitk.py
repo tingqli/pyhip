@@ -325,7 +325,7 @@ def gemm_splitk_kernel(
     s_ds_read: gl.constexpr = 0x0100
     s_ds_write: gl.constexpr = 0x0200
 
-    for k_start in range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
+    for k_start in gl.static_range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
         _amd_iglp_sched_barrier(0)
         a_offsets = mem_a_offsets + k_start + BLOCK_TILE_SIZE_K
         if SHUFFLE:
@@ -335,8 +335,15 @@ def gemm_splitk_kernel(
         next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
         next_b = gl.amd.cdna3.buffer_load(p_weight, b_offsets, cache='.cg')
         if weight_dtype == torch.float8_e4m3fn:
-            mem_scale_offsets += 2
-            next_weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
+            if num_warps == 1:
+                if k_start // BLOCK_TILE_SIZE_K % 2 == 1:
+                    mem_scale_offsets += 1
+                    next_weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
+                else:
+                    next_weight_scale = weight_scale
+            else:
+                mem_scale_offsets += 2
+                next_weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
             # gl.static_print('a layout', a.type.layout)
             # gl.static_print('a reshaped layout', a.reshape(BLOCK_TILE_SIZE_M, num_warps, 2, 64).permute(0, 1, 3, 2).type.layout)
             a0 = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 64)
