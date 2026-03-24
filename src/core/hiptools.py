@@ -211,14 +211,17 @@ class callable_kernel:
         self.extra_compiler_options = extra_compiler_options
         self.func_name = func_name
 
-    def __call__(self, *args, **kwargs):
-        # macro's name must start with UPPER letter
+    def build(self, kwargs = None):
         macros = []
-        for key in list(kwargs.keys()):
-            if key[0].isupper():
-                macros.append((key, kwargs.pop(key)))
+        if kwargs is not None:
+            for key in list(kwargs.keys()):
+                if key[0].isupper():
+                    macros.append((key, kwargs.pop(key)))
+        return _build_hip_func(self.src_fpath, self.extra_compiler_options, tuple(macros), self.func_name)
 
-        _build_hip_func(self.src_fpath, self.extra_compiler_options, tuple(macros), self.func_name)(*args, **kwargs)
+    def __call__(self, *args, **kwargs):
+        func = self.build(kwargs)
+        func(*args, **kwargs)
 
 class module:
     def __init__(self, src_file_path, extra_compiler_options = ""):

@@ -3174,6 +3174,7 @@ r'''
     def compile(self, kernel_name, cpp_src_fpath, extra_compiler_options):
         hip = module(cpp_src_fpath, extra_compiler_options)
         hip_func = getattr(hip, kernel_name)
+        hip_func.build()
         return hip_func
 
     def div(self, x, *ys):
