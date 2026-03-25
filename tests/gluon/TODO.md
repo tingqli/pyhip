@@ -13,3 +13,9 @@
     - 8 wave(4x2), TILE: 256x256x64
     - same with base
 - change test data to random data: 1.44 Pflops, torch: 1.58 Pflops
+- 8 wave alternate executions: 1.11 Pflops
+    - reason: there are 24 scratch dwords which damaged the prefetching structure. Regs needed(max 256 per wave):
+        - A: 256(M)/4(wave) * 64(K) * sizeof(bf16) * 2(copy) / sizeof(float) / 64 = 64
+        - B: 256(N)/2(wave)/2(part) * 64(K) * sizeof(bf16) * 2(copy) / sizeof(float) / 64 = 64
+        - C: 64x128/64 = 128
+        - all: 64 + 64 + 128 = 256, no reg room for necessary vars. need to refactor the tile division.
