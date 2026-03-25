@@ -181,6 +181,56 @@ class Args:
                                                                     shape=[self.BLOCK_TILE_SIZE_K * 16, BLOCK_N // 16])
         return lds_b_read_layout
 
+# copy from https://github.com/ROCm/gfx9-gluon-tutorials/blob/main/kernels/gemm/a16w16/v8_beyond_hotloop/matmul_kernel.py
+@gluon.jit
+def get_pids(
+    M,
+    N: gl.constexpr,
+    BM: gl.constexpr,
+    BN: gl.constexpr,
+    GRID_MN,
+    NUM_XCDS: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+):
+    pid = gl.program_id(axis=0)
+    num_pid_m = gl.cdiv(M, BM)
+    num_pid_n = gl.cdiv(N, BN)
+
+    if NUM_XCDS != 1:
+        ## pid remapping on xcds
+        # Number of pids per XCD in the new arrangement
+        pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+        # When GRID_MN cannot divide NUM_XCDS, some xcds will have
+        # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
+        # We calculate the number of xcds that have pids_per_xcd pids as
+        # tall_xcds
+        tall_xcds = GRID_MN % NUM_XCDS
+        tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+        # Compute current XCD and local pid within the XCD
+        xcd = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        # Calculate new pid based on the new grouping
+        # Note that we need to consider the following two cases:
+        # 1. the current pid is on a tall xcd
+        # 2. the current pid is on a short xcd
+        if xcd < tall_xcds:
+            pid = xcd * pids_per_xcd + local_pid
+        else:
+            pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+
+    if GROUP_SIZE_M == 1:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+    return pid_m, pid_n
+
 # p: prefetch, w: wait, t: top, b: bottom, c: compute, l: local prefetch
 # pro :  p0->p1->w0t->l0t
 # loop:  [c0t->w0b->l0b->p2t == c0b->w1t->l1t->p2b] ->
@@ -225,10 +275,14 @@ def bf16_3stage_2(
         lds_b_read_layout: gl.constexpr = args.get_lds_layout_b_read(half_N=True)
 
     pid = gl.program_id(0)
-    max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
-    tile_m = pid // max_tile_n
-    tile_n = pid % max_tile_n
-    num_pid = gl.num_programs(0)
+    if 1:
+        max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
+        tile_m = pid // max_tile_n
+        tile_n = pid % max_tile_n
+    else:
+        num_pid = gl.num_programs(0)
+        tile_m, tile_n = get_pids(M, N, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_pid,
+                                8, 4)
     mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_a_layout))) % M
     mem_a_offsets = mem_a_offset_m[:, None] * K + gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
     gl.static_assert(SHUFFLE == 1, "not support SHUFFLE == 0")
@@ -263,10 +317,10 @@ def bf16_3stage_2(
     # global prefetch 0, 1
     for i in gl.static_range(2):
         gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(i), p_input, mem_a_offsets)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_top.index(i), p_weight_top, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_top.index(i), p_weight_top, mem_b_offsets)
         gl.amd.cdna4.async_copy.commit_group()
 
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_bot.index(i), p_weight_bot, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_bot.index(i), p_weight_bot, mem_b_offsets)
         gl.amd.cdna4.async_copy.commit_group()
         mem_a_offsets += BLOCK_TILE_SIZE_K
         if SHUFFLE:
@@ -305,7 +359,7 @@ def bf16_3stage_2(
         b_bot = gl.convert_layout(b_bot, b_fma_layout, assert_trivial=True)
         # prefetch 2t
         gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(0), p_input, mem_a_offsets)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_top.index(0), p_weight_top, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_top.index(0), p_weight_top, mem_b_offsets)
         gl.amd.cdna4.async_copy.commit_group()
         #### c0b->w1t->l1t->p2b
         # compute 0b
@@ -317,7 +371,7 @@ def bf16_3stage_2(
         b_top = b_top.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
         b_top = gl.convert_layout(b_top, b_fma_layout, assert_trivial=True)
         # prefetch 2b
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_bot.index(0), p_weight_bot, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_bot.index(0), p_weight_bot, mem_b_offsets)
         gl.amd.cdna4.async_copy.commit_group()
         mem_a_offsets += BLOCK_TILE_SIZE_K
         if SHUFFLE:
@@ -336,7 +390,7 @@ def bf16_3stage_2(
         b_bot = gl.convert_layout(b_bot, b_fma_layout, assert_trivial=True)
         # prefetch 3t
         gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(1), p_input, mem_a_offsets)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_top.index(1), p_weight_top, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_top.index(1), p_weight_top, mem_b_offsets)
         gl.amd.cdna4.async_copy.commit_group()
         #### c1b->w2t->l2t->p3b
         # compute 1b
@@ -348,7 +402,7 @@ def bf16_3stage_2(
         b_top = b_top.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
         b_top = gl.convert_layout(b_top, b_fma_layout, assert_trivial=True)
         # prefetch 3b
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_bot.index(1), p_weight_bot, mem_b_offsets, cache_modifier=".cg")
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_bot.index(1), p_weight_bot, mem_b_offsets)
         gl.amd.cdna4.async_copy.commit_group()
         mem_a_offsets += BLOCK_TILE_SIZE_K
         if SHUFFLE:
