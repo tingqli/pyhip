@@ -9,3 +9,7 @@
     - remove '.cg'
 - padded layout: 1.36 Pflops
     - stride: from 4 rows -> 16 rows 
+- 8 waves: 1.57 Pflops
+    - 8 wave(4x2), TILE: 256x256x64
+    - same with base
+- change test data to random data: 1.44 Pflops, torch: 1.58 Pflops

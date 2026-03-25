@@ -34,6 +34,8 @@ class Args:
         assert BLOCK_TILE_SIZE_N.bit_count() == 1, "BLOCK_TILE_SIZE_N must be power of 2"
         assert BLOCK_TILE_SIZE_M % 32 == 0, "BLOCK_TILE_SIZE_M must be multiple of 32"
         assert BLOCK_TILE_SIZE_N % 32 == 0, "BLOCK_TILE_SIZE_N must be multiple of 32"
+        assert num_warps == 4 or num_warps == 8, "only support 4 or 8 warps"
+        assert BLOCK_TILE_SIZE_M % 128 == 0, "BLOCK_TILE_SIZE_M must be >= 128"
 
         if not SHUFFLE:
             assert weight_dtype == torch.bfloat16, 'only bf16 support no shuffle'
@@ -50,8 +52,15 @@ class Args:
 
     @gluon.constexpr_function
     def get_mem_a_layout(self):
-        # base: [128, 64]
-        reg_bases = [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]]
+        if self.num_warps == 4:
+            # base: [128, 64]
+            reg_bases = [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]]
+            lane_bases = [[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]]
+            warp_bases = [[1, 0], [2, 0]]
+        else:
+            reg_bases = [[0, 1], [0, 2], [0, 4], [8, 0]]
+            lane_bases = [[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]]
+            warp_bases = [[1, 0], [2, 0], [4, 0]]
         m = self.BLOCK_TILE_SIZE_M // 128
         bit_pos = 128
         while m // 2:
@@ -59,8 +68,8 @@ class Args:
             bit_pos *= 2
             m = m // 2
         mem_a_layout = gl.DistributedLinearLayout(reg_bases=reg_bases,
-                                                lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
-                                                warp_bases=[[1, 0], [2, 0]],
+                                                lane_bases=lane_bases,
+                                                warp_bases=warp_bases,
                                                 block_bases=[],
                                                 shape=[self.BLOCK_TILE_SIZE_M, self.BLOCK_TILE_SIZE_K])
         return mem_a_layout
@@ -166,8 +175,9 @@ class Args:
         return lds_b_layout
 
     @gluon.constexpr_function
-    def get_lds_layout_b_read(self, half_N=False):
-        BLOCK_N = self.BLOCK_TILE_SIZE_N // 2 if half_N else self.BLOCK_TILE_SIZE_N
+    def get_lds_layout_b_read(self):
+        BLOCK_N = self.BLOCK_TILE_SIZE_N // 2
+        warp_bases=[[0, 1], [0, 0]] if self.num_warps == 4 else [[0, 1], [0, 0], [0, 0]]
         # [64, 32]
         reg_bases=[[1, 0], [2, 0], [4, 0], [512, 0]]
         n = BLOCK_N // 32
@@ -178,7 +188,7 @@ class Args:
             n = n // 2
         lds_b_read_layout:gl.constexpr = gl.DistributedLinearLayout(reg_bases=reg_bases,
                                                                     lane_bases=[[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0]],
-                                                                    warp_bases=[[0, 1], [0, 0]],
+                                                                    warp_bases=warp_bases,
                                                                     block_bases=[],
                                                                     shape=[self.BLOCK_TILE_SIZE_K * 16, BLOCK_N // 16])
         return lds_b_read_layout
@@ -274,7 +284,7 @@ def bf16_3stage_2(
     lds_a_layout: gl.constexpr = args.get_lds_layout_a()
     lds_b_layout: gl.constexpr = args.get_lds_layout_b()
     if SHUFFLE:
-        lds_b_read_layout: gl.constexpr = args.get_lds_layout_b_read(half_N=True)
+        lds_b_read_layout: gl.constexpr = args.get_lds_layout_b_read()
 
     pid = gl.program_id(0)
     if 1:
@@ -298,7 +308,7 @@ def bf16_3stage_2(
         c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
                                                     instr_shape=[16, 16, 32],
                                                     transposed=True,
-                                                    warps_per_cta=[2, 2])
+                                                    warps_per_cta=[4, 2])
         a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
         b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
     else:
@@ -524,7 +534,7 @@ def _run_aiter(
 
 def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, N=4096, K=4096):
     BUF_COPY = 32
-    A = (torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16) + 1)*0.001
+    A = torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16)
     from aiter.ops.shuffle import shuffle_weight
     import aiter
     if weight_type == torch.float4_e2m1fn_x2:
@@ -539,10 +549,11 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w = [shuffle_weight(w_qt) for _ in range(BUF_COPY)]
         w_scale = [w_qt_scale.clone() for _ in range(BUF_COPY)]
     elif weight_type == torch.bfloat16:
-        w_ = torch.randint(-2, 3, [N, K], dtype=torch.bfloat16) / 2
+        w_ = torch.randn([N, K], dtype=torch.bfloat16)
         if SHUFFLE:
             w_shuffled = shuffle_weight(w_).reshape(N // 16, -1)
             w = [w_shuffled.clone() for _ in range(BUF_COPY)]
+            w_org = [x.reshape([N, K]) for x in w]
         else:
             w = [w_ for _ in range(BUF_COPY)]
         w_scale = [None] * BUF_COPY
@@ -573,7 +584,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         M, K = A.shape
         N = w_ref.shape[0]
         gemm_out = torch.empty([M, N], dtype=A.dtype, device=A.device)
-        num_warps = 4
+        num_warps = 8
         if kernel_type == 'mxn_2s':
             BLOCK_TILE_SIZE_M = TILE_M
             BLOCK_TILE_SIZE_N = TILE_N
@@ -604,12 +615,20 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     tflops_res = []
     latencies = []
     bw = []
-    if kernel_type == 'aiter':
+    if kernel_type == 'torch':
+        i = 0
+        for _ in range(run_count):
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
+                ref = torch.nn.functional.linear(A[i], w_org[i])
+            tflops_res.append(p.tflops())
+            latencies.append(p.dt())
+            bw.append(p.bw())
+    elif kernel_type == 'aiter':
         # aiter needs preshuffle weights
         i = 0
         for _ in range(run_count):
             with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
-                _run_aiter(x=A[i], weight=w[i], weight_scale=w_scale[i])
+                _run_aiter(x=A[i], weight=w_org[i], weight_scale=w_scale[i])
             i = (i + 1) % BUF_COPY
             tflops_res.append(p.tflops())
             latencies.append(p.dt())
@@ -699,7 +718,7 @@ def show_perf(perf, dict_tile_mn):
 def test_perf(M, TILE_M=32, TILE_N=64, N=4096, K=4096):
     init_env()
     perf = {}
-    #perf.update(entry_common('aiter', M, prec=[torch.bfloat16], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
+    perf.update(entry_common('torch', M, prec=[torch.bfloat16], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
     # TILE_M/N is configurable
     # perf.update(entry_common('mxn_2s', M=M, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     # perf.update(entry_common('mxn_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
