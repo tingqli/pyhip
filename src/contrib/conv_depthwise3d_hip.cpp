@@ -54,7 +54,9 @@ __device__ __inline__ float ds_read_u16_d16_hi(__hip_bfloat16* psrc, int imm_off
     as3_uint32_ptr vaddr = (as3_uint32_ptr)(psrc);
     asm volatile("ds_read_u16_d16_hi %[vdst], %[vaddr] offset:%[offset]"
                 : [vdst]"=v"((float&)(v))
-                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset));
+                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset)
+                : "memory"
+            );
     return v;
 }
 
@@ -63,7 +65,9 @@ __device__ __inline__ uint32_t ds_read_b32(IO_DTYPE* psrc, int imm_offset=0) {
     as3_uint32_ptr vaddr = (as3_uint32_ptr)(psrc);
     asm volatile("ds_read_b32 %[vdst], %[vaddr] offset:%[offset]"
                 : [vdst]"=v"((uint32_t&)(v))
-                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset));
+                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset)
+                : "memory"
+            );
     return v;
 }
 
@@ -87,7 +91,9 @@ __device__ __inline__ void set_m0(void* base) {
 __device__ __inline__ void global_load_lds_dword(int vaddr, const void* saddr, int imm_offset = 0) {
     //void * saddr = __builtin_amdgcn_readfirstlane(_saddr);
     asm volatile("global_load_lds_dword %[vaddr], %[saddr] offset:%[offset]"
-                :: [vaddr]"v"(vaddr), [saddr]"s"(saddr), [offset]"i"(imm_offset));
+                :: [vaddr]"v"(vaddr), [saddr]"s"(saddr), [offset]"i"(imm_offset)
+                : "memory"
+            );
 }
 
 __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
