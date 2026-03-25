@@ -7,6 +7,7 @@ from pyhip.contrib.gluon.gemm_splitk import gemm_splitk_kernel
 
 #####################################################################
 from pyhip import cudaPerf
+from common.utils import gen_timing
 from torch import Tensor
 import pytest
 
@@ -96,7 +97,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         ele_size = 1
     mem_size = M * K * 2 + N * K * ele_size
 
-    def run(A, weight, weight_scale):
+    def run(A, weight, weight_scale, p_debug_buf=None):
         M, K = A.shape
         N = w_ref.shape[0]
         gemm_out = torch.empty([M, N], dtype=A.dtype, device=A.device)
@@ -116,7 +117,9 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 N,
                 BLOCK_TILE_SIZE_M,
                 BLOCK_TILE_SIZE_N,
+                p_debug_buf,
                 SHUFFLE,
+                enable_debug=p_debug_buf is not None,
                 num_warps=num_warps
                 )
             # print(x.asm['amdgcn'])
@@ -150,6 +153,13 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             latencies.append(p.dt())
             bw.append(p.bw())
 
+        grids = div_up(N, TILE_N) * div_up(M, TILE_M)
+        p_debug_buf = torch.zeros([grids * 9], dtype=torch.int64)
+        for _ in range(2):
+            with cudaPerf(flops, mem_size, name=f"D{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
+                run(A=A[i], weight=w[i], weight_scale=w_scale[i], p_debug_buf=p_debug_buf)
+            i = (i + 1) % BUF_COPY
+        gen_timing(p_debug_buf, TILE_N * K * 2, TILE_N * K * TILE_M * 2)
         if not torch.allclose(ref_out, cur_out, rtol=0.1, atol=0.03):
             print(cur_out)
             idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
