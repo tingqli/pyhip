@@ -7,3 +7,5 @@
 - xcd/l2 aware: 1.34 Pflops
     - get_pids
     - remove '.cg'
+- padded layout: 1.36 Pflops
+    - stride: from 4 rows -> 16 rows 
