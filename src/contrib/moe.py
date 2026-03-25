@@ -700,37 +700,56 @@ def moe_2stage_splitk(J:JIT,
                 for m in range(A_vert):
                     swizzle_col_wr = ((lane_mod_16 + m * 16)^(n*4+lane_div_16)) % (BLOCK_TILE_SIZE_N // 4)
                     lds_buff.write("b128", C_reg[n, m], lane_mod_16 + m * 16, swizzle_col_wr*4)   
-            J.s_waitcnt(mod=f"lgkmcnt(0)")
-            J.s_barrier()    
-            # 4 row x 16 columns has similiar performance with 2 rows x 32 columns
-            rd_column_lanes = 16
-            rd_row_lanes = 64 // rd_column_lanes
-            rd_row_idx = get_lane_id_div(J, rd_column_lanes)
-            rd_col_idx = get_lane_id_mod(J, rd_column_lanes)
+  
+            # # 4 row x 16 columns has similiar performance with 2 rows x 32 columns
+            # rd_column_lanes = 16
+            # rd_row_lanes = 64 // rd_column_lanes
+            # rd_row_idx = get_lane_id_div(J, rd_column_lanes)
+            # rd_col_idx = get_lane_id_mod(J, rd_column_lanes)
 
+            rd_column_lanes = 32
+            rd_row_lanes = 2
+            rd_row_idx = get_lane_id_div(J, rd_column_lanes)
+            #writing: one column lane has 128 bits. reading: one column lane has 64 bits. so 2 lanes would be in one column.
+            rd_col_idx = get_lane_id_mod(J, rd_column_lanes) // 2
+            rd_col_b32_offset = get_lane_id_mod(J, rd_column_lanes) % 2
             v_token_id_tr = J.gpr(1, 'vu32')
             v_weight_tr = J.gpr(1, 'vf32')
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.s_barrier()  
             for m in range(BLOCK_TILE_SIZE_M//rd_row_lanes):
                 voffset_tokenid = J.gpr(m*rd_row_lanes*4 + rd_row_idx*4)
                 J.ds_read_b32(v_token_id_tr[0], voffset_tokenid, mod=f"offset:{toke_id_buff}")
                 J.ds_read_b32(v_weight_tr[0], voffset_tokenid, mod=f"offset:{toke_id_buff+BLOCK_TILE_SIZE_M*4}")
-                    
-                for n in range(BLOCK_TILE_SIZE_N//(4*rd_column_lanes)):
-                    creg_f32 = J.gpr(4, "vf32")
+
+                for n in range(BLOCK_TILE_SIZE_N//(rd_column_lanes*2)):
+                    creg_f32 = J.gpr(2, "vf32")
                     creg_low = J.gpr(2, "vbf16x2", align=2)
-                    swizzle_col_rd = ((rd_row_idx + m*rd_row_lanes)^(rd_col_idx+n*rd_column_lanes)) % (BLOCK_TILE_SIZE_N // 4)
-                    lds_buff.read("b128", creg_f32, rd_row_idx + m * rd_row_lanes, swizzle_col_rd*4)
+                    swizzle_col_rd = ((rd_row_idx + m*rd_row_lanes)^(rd_col_idx+n*rd_column_lanes//2)) % (BLOCK_TILE_SIZE_N // 4)
+                    lds_buff.read("b64", creg_f32, rd_row_idx + m * rd_row_lanes, swizzle_col_rd*4+rd_col_b32_offset*2)
                     J.s_waitcnt(mod=f"lgkmcnt(0)")
-                    for j in range(4):
-                            creg_f32[j] = creg_f32[j] * v_weight_tr[0]
-                            J.v_add_u32(creg_f32[j], creg_f32[j], s_cvt_bf16_bias)
+                    for j in range(2):
+                        creg_f32[j] = creg_f32[j] * v_weight_tr[0]
+                        J.v_add_u32(creg_f32[j], creg_f32[j], s_cvt_bf16_bias)
                     creg_low[0] = (creg_f32[0] >> 16) | (creg_f32[1] & 0xFFFF0000)
-                    creg_low[1] = (creg_f32[2] >> 16) | (creg_f32[3] & 0xFFFF0000)   
-                
-                    vaddr = J.gpr(v_token_id_tr[0] * (N * sizeof_bf16) + rd_col_idx * (4 * sizeof_bf16) + n * rd_column_lanes *(4 * sizeof_bf16))
+                    vaddr = J.gpr(v_token_id_tr[0] * (N * sizeof_bf16) + (rd_col_idx*4+rd_col_b32_offset*2)*(sizeof_bf16) + n * rd_column_lanes *(2 * sizeof_bf16))
                     with J.ExecMask(v_token_id_tr[0] < M[0], early_skip=False):
-                            J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
-                            J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
+                             J.global_atomic_pk_add_bf16(vaddr, creg_low[0], p_output)
+                    # creg_f32 = J.gpr(4, "vf32")
+                    # creg_low = J.gpr(2, "vbf16x2", align=2)
+                    # swizzle_col_rd = ((rd_row_idx + m*rd_row_lanes)^(rd_col_idx+n*rd_column_lanes)) % (BLOCK_TILE_SIZE_N // 4)
+                    # lds_buff.read("b128", creg_f32, rd_row_idx + m * rd_row_lanes, swizzle_col_rd*4)
+                    # J.s_waitcnt(mod=f"lgkmcnt(0)")
+                    # for j in range(4):
+                    #         creg_f32[j] = creg_f32[j] * v_weight_tr[0]
+                    #         J.v_add_u32(creg_f32[j], creg_f32[j], s_cvt_bf16_bias)
+                    # creg_low[0] = (creg_f32[0] >> 16) | (creg_f32[1] & 0xFFFF0000)
+                    # creg_low[1] = (creg_f32[2] >> 16) | (creg_f32[3] & 0xFFFF0000)   
+                
+                    # vaddr = J.gpr(v_token_id_tr[0] * (N * sizeof_bf16) + rd_col_idx * (4 * sizeof_bf16) + n * rd_column_lanes *(4 * sizeof_bf16))
+                    # with J.ExecMask(v_token_id_tr[0] < M[0], early_skip=False):
+                    #         J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
+                    #         J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
         else:
             for n in range(B_horz):
                 # output layout: [B, N]
