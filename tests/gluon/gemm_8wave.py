@@ -50,16 +50,16 @@ class Args:
 
     @gluon.constexpr_function
     def get_mem_a_layout(self):
-        # base: [32, 64]
-        reg_bases = [[0, 1], [0, 2], [0, 4]]
-        m = self.BLOCK_TILE_SIZE_M // 32
-        bit_pos = 32
+        # base: [128, 64]
+        reg_bases = [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]]
+        m = self.BLOCK_TILE_SIZE_M // 128
+        bit_pos = 128
         while m // 2:
             reg_bases.append([bit_pos, 0])
             bit_pos *= 2
             m = m // 2
         mem_a_layout = gl.DistributedLinearLayout(reg_bases=reg_bases,
-                                                lane_bases=[[0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0]],
+                                                lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
                                                 warp_bases=[[1, 0], [2, 0]],
                                                 block_bases=[],
                                                 shape=[self.BLOCK_TILE_SIZE_M, self.BLOCK_TILE_SIZE_K])
@@ -105,8 +105,8 @@ class Args:
     @gluon.constexpr_function
     def get_lds_layout_a(self):
         offset_bases = []
-        m = self.BLOCK_TILE_SIZE_M // 32
-        bit_pos = 32
+        m = self.BLOCK_TILE_SIZE_M // 128
+        bit_pos = 128
         while m // 2:
             offset_bases.append([bit_pos, 0])
             bit_pos *= 2
@@ -120,11 +120,13 @@ class Args:
                 [0, 8],
                 [0, 16],
                 [0, 32],
-                [4, 0],
-                [8, 0],
                 [16, 0],
+                [32, 0],
+                [64, 0],
                 [1, 0],
                 [2, 0],
+                [4, 0],
+                [8, 0],
             ] + offset_bases,
             [],
             [self.BLOCK_TILE_SIZE_M, self.BLOCK_TILE_SIZE_K]
