@@ -322,19 +322,19 @@ def show_perf(perf):
 def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8, E=32):
     init_env()
     perf = {}
-    perf.update(entry_common('aiter', batch, prec=[torch.bfloat16,], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, E=E))
+    # perf.update(entry_common('aiter', batch, prec=[torch.bfloat16,], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, E=E))
     # TILE_M/N is configurable
-    perf.update(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=E))
+    perf.update(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=E, TOPK=16))
     show_perf(perf)
 
 if __name__ == '__main__':
-    TILE_M = 32
-    TILE_N = 128
+    TILE_M = 16
+    TILE_N = 64
     HIDDEN_SIZE = 4096
     INTER_SIZE = 1024
     TP = 8
     init_env()
     batch = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-    batch = [4, 8, 16,32,64,128,256, 512]
+    batch = [8, 16,32,64,128,256]
     #batch = [4]
     test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=512)

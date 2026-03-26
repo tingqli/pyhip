@@ -230,7 +230,7 @@ def test_perf(M, TILE_M=32, TILE_N=64, N=4096, K=4096):
     # TILE_M/N is configurable
     # perf.update(entry_common('mxn_splitk_2s', M=M, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     # perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type(), torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     return perf
 
 def merge(a: dict, b: dict, path=[]):
@@ -251,7 +251,13 @@ if __name__ == '__main__':
     N, K = 9216, 4096
     # qwen3 235b/a22b qkv projection
     N, K = 4096*8*2, 8192 # 4096*8*2 /128 = 512
-    Ms = [16, 32, 64, 128, 256]
+    if 1:
+        # UP&GATE: [2*intemediate*experts//tp8, hidden_states],
+        N, K = 256*512, 2048
+    else:
+        # DOWN:[hiddenstates*experts, intemediate//tp8],
+        N, K = 4096*512, 128*4
+    # Ms = [1,2, 4, 8, 16, 32, 64]
     Ms = [16]
     perf = {}
     dict_tile_mn = {}
