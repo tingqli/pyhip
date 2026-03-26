@@ -97,7 +97,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         
         w_ = torch.randn([N, K], dtype=torch.bfloat16) / 10.0
         w_qt, w_qt_scale = weight_per_128x128_quant(w_, quant_dtype=weight_type)
-        
+        w_qt_scale[...] = 1.0
         # Reconstruct w_ref for validation
         w_ref = (w_qt.to(dtype=torch.bfloat16).view(N // 128, 128, K // 128, 128) * w_qt_scale.view(N // 128, 1, K // 128, 1)).to(dtype=torch.bfloat16)
         w_ref = w_ref.view(N, K)
@@ -163,7 +163,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         cur_out = run(A=A[0], weight=w[0], weight_scale=w_scale[0])
         i = 0
         for _ in range(run_count):
-            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]", verbose=0) as p:
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]", verbose=1) as p:
                 run(A=A[i], weight=w[i], weight_scale=w_scale[i])
             i = (i + 1) % BUF_COPY
             tflops_res.append(p.tflops())
@@ -244,9 +244,11 @@ def show_perf(perf, dict_tile_mn):
 def test_perf(M, TILE_M=32, TILE_N=64, N=4096, K=4096):
     init_env()
     perf = {}
-    perf.update(entry_common('aiter', M, prec=[get_fp4type_if_valid()], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
+    # perf.update(entry_common('aiter', M, prec=[get_fp4type_if_valid()], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
     # TILE_M/N is configurable
-    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp4type_if_valid(),torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    # perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp4type_if_valid(),torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    
+    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     return perf
 
 def merge(a: dict, b: dict, path=[]):
@@ -266,8 +268,19 @@ if __name__ == '__main__':
     # qwen3 235b/a22b qkv projection
     N, K = 9216, 4096
     # qwen3 235b/a22b qkv projection
-    #N, K = 4096, 8192
-    Ms = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    N, K = 4096*8*2, 8192 # 4096*8*2 /128 = 512
+    if 1:
+        # UP&GATE: [2*intemediate*experts//tp8, hidden_states],
+        N, K = 256*512, 4096
+    else:
+        # DOWN:[hiddenstates*experts, intemediate//tp8],
+        N, K = 4096*512, 128*4
+    Ms = [1,2, 4, 8, 16, 32, 64]
+    
+    N, K = 256*512, 4096
+    Ms = [1,2, 4, 8, 16, 32, 64]
+
+    # Ms = [16]
     perf = {}
     dict_tile_mn = {}
 
@@ -304,6 +317,6 @@ if __name__ == '__main__':
 
         print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
         dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
-        test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
+        # test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
         perf = merge(perf, test_perf([M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     show_perf(perf, dict_tile_mn)

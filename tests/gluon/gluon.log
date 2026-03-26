@@ -1,0 +1,35 @@
+#N, K = 4096*512, 128*4
+mxn_splitk_2s[torch.float8_e4m3fn B=1   (16x128)]:   162 us, 6646.8 GB/s, 13.3 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=2   (16x128)]:   167 us, 6445.1 GB/s, 25.8 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=4   (16x128)]:   170 us, 6299.5 GB/s, 50.4 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=8   (16x128)]:   179 us, 6000.7 GB/s, 96.0 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=16  (16x128)]:   186 us, 5772.7 GB/s, 184.7 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=32  (32x128)]:   221 us, 4853.3 GB/s, 310.6 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=64  (64x128)]:   382 us, 2809.3 GB/s, 359.6 tflops
+
+#N, K = 256*512, 4096
+mxn_splitk_2s[torch.float8_e4m3fn B=1   (16x128)]:   102 us, 5260.9 GB/s, 10.5 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=2   (16x128)]:   102 us, 5247.4 GB/s, 21.0 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=4   (16x128)]:   102 us, 5239.8 GB/s, 41.9 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=8   (16x128)]:   104 us, 5151.2 GB/s, 82.4 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=16  (16x128)]:   105 us, 5138.9 GB/s, 164.4 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=32  (32x128)]:   115 us, 4678.0 GB/s, 299.2 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=64  (64x128)]:   136 us, 3964.3 GB/s, 506.9 tflops
+
+#TOPK=16, expert=512
+mxn_splitk_2s[torch.float8_e4m3fn B=8   ]:    52 us, 3861.2 GB/s,  7.7 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=16  ]:    77 us, 5262.7 GB/s, 10.5 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=32  ]:   136 us, 5929.3 GB/s, 11.9 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=64  ]:   138 us, 5849.7 GB/s, 23.4 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=128 ]:   138 us, 5831.8 GB/s, 46.6 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=256 ]:   143 us, 5644.3 GB/s, 90.1 tflops
+
+#TOPK=10, expert=512
+mxn_splitk_2s[torch.float8_e4m3fn B=8   ]:    42 us, 3030.0 GB/s,  6.1 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=16  ]:    55 us, 4539.3 GB/s,  9.1 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=32  ]:    90 us, 5565.0 GB/s, 11.1 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=64  ]:   138 us, 5861.1 GB/s, 14.6 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=128 ]:   138 us, 5839.4 GB/s, 29.2 tflops
+mxn_splitk_2s[torch.float8_e4m3fn B=256 ]:   140 us, 5772.2 GB/s, 57.6 tflops
+
+

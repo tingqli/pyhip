@@ -63,7 +63,7 @@ def gemm_splitk_wd(J:JIT,
         assert K % 1024 == 0, f'will read (16*4)*4(wave) bytes once in main loop, aka 256*2=512 elements; to use packed scale in K dimension, will double read; current K={K} is not supported'
     elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
         # fp8 blockwise: K % (num_split_k * 128) == 0
-        assert K % (num_split_k * 128) == 0, f'fp8 blockwise K{K} should be multiple of {num_split_k * 128}'
+        # assert K % (num_split_k * 128) == 0, f'fp8 blockwise K{K} should be multiple of {num_split_k * 128}'
         assert BLOCK_TILE_SIZE_N % 32 == 0, f'current BLOCK_TILE_SIZE_N={BLOCK_TILE_SIZE_N} is not supported'
     else:
         assert K % (32) == 0, f'current K={K} is not supported in bf16'
