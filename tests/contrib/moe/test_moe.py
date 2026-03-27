@@ -179,7 +179,6 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w_ = torch.randn([E*INTER_SIZE_TP * 2 * HIDDEN_SIZE // 128, 128], dtype=torch.bfloat16) / 2.0
 
         w1_qt, w1_qt_scale = weight_per_128x128_quant(w_.view(E, INTER_SIZE_TP * 2, HIDDEN_SIZE), quant_dtype=weight_type)
-        w1_qt = (w1_qt.to(dtype=torch.bfloat16) / 200.0).to(dtype=weight_type)
         # w1_qt_scale[...] = 1.0
         # print(w1_qt_scale)
 
@@ -194,7 +193,6 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     
         w_ = torch.randn([E*HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16) / 2.0
         w2_qt, w2_qt_scale = weight_per_128x128_quant(w_.view(E, HIDDEN_SIZE, INTER_SIZE_TP), quant_dtype=weight_type)
-        w2_qt = (w2_qt.to(dtype=torch.bfloat16) / 200.0).to(dtype=weight_type)
         # w2_qt_scale[...] = 1.0
         # print(f'==========={w2_qt.shape=}, {w2_qt_scale.shape=}')
         w2_ref = (w2_qt.to(dtype=torch.bfloat16).view(E, HIDDEN_SIZE//128, 128, INTER_SIZE_TP//128,  128) * w2_qt_scale.view(E, HIDDEN_SIZE//128, 1, INTER_SIZE_TP//128,  1)).to(dtype=torch.bfloat16)
@@ -608,12 +606,12 @@ def test_acc(TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
     #assert 0,"========================"
     batch = list(range(2, 64))
     # fix TILE_M=16, TILE_N=32
-    # entry_b1(run_count=0, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)           # batch 1
-    # entry_common('16x32_2s_b', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=16, TILE_N=32, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
-    # batch += list(range(128, 256))
-    # batch += [i * 256 for i in range(1, 4)]
-    # batch += [i * 2048 for i in range(1, 5)]
-    # batch += list(range(2048 * 3, 2048 * 3 + 256))
+    entry_b1(run_count=0, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)           # batch 1
+    entry_common('16x32_2s_b', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=16, TILE_N=32, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
+    batch += list(range(128, 256))
+    batch += [i * 256 for i in range(1, 4)]
+    batch += [i * 2048 for i in range(1, 5)]
+    batch += list(range(2048 * 3, 2048 * 3 + 256))
     entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
     # TILE_M/N is configurable
     entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
@@ -650,15 +648,15 @@ def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP
     perf = []
     # perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
     # perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
-    # perf.append(entry_common('aiter', batch, prec=[get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, fp8_ptpc=False))
+    # perf.append(entry_common('aiter', batch, prec=[get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, TOPK=10, E=512, fp8_ptpc=False))
 
-    # # TODO: support fp8
+    # TODO: support fp8
     # perf.append(entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     # perf.append(entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     # TILE_M/N is configurable
-    # perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
-    # perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, fp8_ptpc=True))
-    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[ get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE,TOPK=10, E=512,  TP=TP, fp8_ptpc=False))
+    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, TOPK=10, E=512, INTER_SIZE=INTER_SIZE, TP=TP))
+    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=10, E=512, TP=TP, fp8_ptpc=True))
+    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[ get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=10, E=512,  TP=TP, fp8_ptpc=False))
     show_perf(perf)
 
 if __name__ == '__main__':
@@ -682,5 +680,5 @@ if __name__ == '__main__':
         # batch = [1, 2, 4, 8, 12, 16, 32, 64]
         # test_small_batch_perf(batch, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
         # batch = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-        batch = [8, 16,32,64,128, 256]
+        batch = [1, 2, 4, 8, 16, 32,64,128, 256]
         test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)

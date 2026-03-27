@@ -84,7 +84,7 @@ def gemm_splitk_wd(J:JIT,
     A_vert = BLOCK_TILE_SIZE_M // 16
     B_horz = BLOCK_TILE_SIZE_N // 16
 
-    C_reg = J.gpr(B_horz, A_vert, 4, "af32")
+    C_reg = J.gpr(B_horz, A_vert, 4, "vf32")
 
     C_reg[:] = 0
 
