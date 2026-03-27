@@ -287,7 +287,7 @@ if __name__ == '__main__':
     def get_tile_mn(M):
         num_CU = torch.cuda.get_device_properties().multi_processor_count
         solutions = []
-        for tile_m in [16, 32, 64]:
+        for tile_m in [16, 32]:
             for tile_n in [32, 64, 128]:
                 works = div_up(M, tile_m) * div_up(N, tile_n)
                 if works >= num_CU:

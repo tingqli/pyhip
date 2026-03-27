@@ -69,6 +69,8 @@ def gemm_splitk(J:JIT,
     k_step_wg = num_split_k * 32 * A_rep
     k_max = div_up(K, k_step_wg)
 
+    # ping pong register buffer id
+    pp_reg_id = 0
 
     if weight_dtype == torch.float4_e2m1fn_x2:
         # the column of scale is K//32
@@ -80,15 +82,12 @@ def gemm_splitk(J:JIT,
         for n in range(B_horz):
             J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
     elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
-            k_scale_n = k_max
             QUAN_BLK_SZ=128
-            v_w_scale = J.gpr(2, k_scale_n, 'vf32')
-            for n_block in range(2):
-                # for k_idx in range(k_scale_n):
-                J.global_load_dword(v_w_scale[n_block, 0], voffset_scale[n_block], p_w_scale, mod=f'offset:{0 * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
-        
-    # ping pong register buffer id
-    pp_reg_id = 0
+            #[ping-pong, ngroups]
+            v_w_scale = J.gpr(2, 2, 'vf32')
+            # pre-load first 2 groups of scale
+            for n_grp_idx in range(2):
+                J.global_load_dword(v_w_scale[pp_reg_id, n_grp_idx], voffset_scale[n_grp_idx], p_w_scale, mod=f'offset:{0 * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
 
     # (A0.B0.C0.D0.A1.B1.C1.D1)[3, 2, 7, 6] = (A1.B1.A0.B0)
     pattern_cvt_bf16 = J.gpr("su32")
@@ -96,8 +95,6 @@ def gemm_splitk(J:JIT,
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
     is_cdna4 = "gfx950" in J.arch
-    
-
     
     def load_gen(pp_reg_id, k=None):
         k_scale_wip = 0
@@ -110,8 +107,8 @@ def gemm_splitk(J:JIT,
                 k_scale_n_next_read_idx += 1
                 k_scale_wip = B_horz // 2
         elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
-            J.global_load_dword(v_w_scale[0, k+1], voffset_scale[0], p_w_scale, mod=f'offset:{(k+1) * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
-            J.global_load_dword(v_w_scale[1, k+1], voffset_scale[1], p_w_scale, mod=f'offset:{(k+1) * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
+            J.global_load_dword(v_w_scale[pp_reg_id, 0], voffset_scale[0], p_w_scale, mod=f'offset:{(k+1) * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
+            J.global_load_dword(v_w_scale[pp_reg_id, 1], voffset_scale[1], p_w_scale, mod=f'offset:{(k+1) * k_step_wg // QUAN_BLK_SZ * sizeof_f32}')
             k_scale_wip = 2
         for m in range(A_vert):
             buff_a.load_dwordx4(A_reg[pp_reg_id, m, 0], voffset_a[m], soffset_ka)
@@ -195,14 +192,15 @@ def gemm_splitk(J:JIT,
                             yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[pp_reg_id, m, i, 1], C_reg[n, m])
 
         elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
-            if 0:
+            # cdna3 path:
+            if is_cdna4 == False:
                 v_w_f32 = J.gpr(2, 2, 2, 'vf32', align=4)
                 v_w_bf16 = J.gpr(B_horz, 2, 2, 'vf32', align=4)
                 v_tmp_scale_pk = J.gpr(2, 2, 'vf32', align=4)
-                J.v_mov_b32(v_tmp_scale_pk[0, 0], v_w_scale[0, k])
-                J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[0, k])
-                J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[1, k])
-                J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[1, k])
+                J.v_mov_b32(v_tmp_scale_pk[0, 0], v_w_scale[pp_reg_id, 0])
+                J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[pp_reg_id, 0])
+                J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[pp_reg_id, 1])
+                J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[pp_reg_id, 1])
                 # kl = 16  would be divided into 2 steps. Each accumulate 8 in K dimension.
                 for i in range(2):
                     for n in range(B_horz):
@@ -221,22 +219,18 @@ def gemm_splitk(J:JIT,
                     for n in range(B_horz):
                         # 2, A_vert, A_rep=2, 2, 2
                         for m in range(A_vert):
-                            if is_cdna4:
-                                yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i], C_reg[n, m])
-                            else:
-                                yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 0], A_reg[pp_reg_id, m, i, 0], C_reg[n, m])
-                                yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[pp_reg_id, m, i, 1], C_reg[n, m])
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 0], A_reg[pp_reg_id, m, i, 0], C_reg[n, m])
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n, 1], A_reg[pp_reg_id, m, i, 1], C_reg[n, m])
+            # cdna4 path:
             else:
-                
                 local_C_reg = J.gpr(B_horz, A_vert, 4, "vf32")
-
                 local_C_reg[:] = 0
                 v_w_bf16 = J.gpr(B_horz, 4, 'vf32', align=4)
                 v_tmp_scale_pk = J.gpr(2, 2,  'vf32', align=4)
-                J.v_mov_b32(v_tmp_scale_pk[0, 0], v_w_scale[0, k])
-                J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[0, k])
-                J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[1, k])
-                J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[1, k])
+                J.v_mov_b32(v_tmp_scale_pk[0, 0], v_w_scale[pp_reg_id, 0])
+                J.v_mov_b32(v_tmp_scale_pk[0, 1], v_w_scale[pp_reg_id, 0])
+                J.v_mov_b32(v_tmp_scale_pk[1, 0], v_w_scale[pp_reg_id, 1])
+                J.v_mov_b32(v_tmp_scale_pk[1, 1], v_w_scale[pp_reg_id, 1])
                 
                 for i in range(2):
                     for n in range(B_horz):
@@ -248,18 +242,14 @@ def gemm_splitk(J:JIT,
                     for n in range(B_horz):
                         # 2, A_vert, A_rep=2, 2, 2
                         for m in range(A_vert):
-                            if is_cdna4:
-                                yield J.v_mfma_f32_16x16x32_bf16(local_C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i], local_C_reg[n, m])
-                            else:
-                                yield J.v_mfma_f32_16x16x16_bf16(local_C_reg[n, m], v_w_bf16[n, 0], A_reg[pp_reg_id, m, i, 0], local_C_reg[n, m])
-                                yield J.v_mfma_f32_16x16x16_bf16(local_C_reg[n, m], v_w_bf16[n, 1], A_reg[pp_reg_id, m, i, 1], local_C_reg[n, m])
+                            yield J.v_mfma_f32_16x16x32_bf16(local_C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i], local_C_reg[n, m])
                 for n in range(B_horz):
                         # 2, A_vert, A_rep=2, 2, 2
                         scale_idx = 0 if n < B_horz// 2  else 1
                         for m in range(A_vert):
                             J.v_pk_fma_f32(C_reg[n, m, 0:1], local_C_reg[n, m, 0:1],  v_tmp_scale_pk[scale_idx], C_reg[n, m, 0:1])
                             J.v_pk_fma_f32(C_reg[n, m, 2:3], local_C_reg[n, m, 2:3],  v_tmp_scale_pk[scale_idx], C_reg[n, m, 2:3])
-                
+        # weight_dtype = bf16        
         else:
             for m in range(A_vert):
                 for n in range(B_horz):
