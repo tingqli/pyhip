@@ -49,7 +49,7 @@ __device__ __inline__ void s_waitcnt_vmcnt() {
     asm volatile ("s_waitcnt vmcnt(%0)\n"::"i"(cnt));
 }
 
-__device__ __inline__ float ds_read_u16_d16_hi(__hip_bfloat16* psrc, int imm_offset) {
+__device__ __inline__ float ds_read_u16_d16_hi(IO_DTYPE* psrc, int imm_offset) {
     float v;
     as3_uint32_ptr vaddr = (as3_uint32_ptr)(psrc);
     asm volatile("ds_read_u16_d16_hi %[vdst], %[vaddr] offset:%[offset]"

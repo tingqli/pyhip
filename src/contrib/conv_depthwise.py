@@ -16,7 +16,7 @@ def conv_depthwise_3d(input, weight, bias,
     for s in stride: assert s == 1, s
     for d in dilation: assert d == 1, d
 
-    assert str(input.dtype) == 'torch.bfloat16'
+    assert str(input.dtype) == 'torch.bfloat16' or str(input.dtype) == 'torch.float16'
 
     global torch
     import torch
@@ -32,9 +32,9 @@ def conv_depthwise_3d(input, weight, bias,
     assert C_g * groups == C_in
     assert C_g == 1, f"depthwise assumes C_g == 1 but got {C_g}"
 
-    D_out = (D + 2 * padding[0] - dilation[0] * (KD - 1) - 1) // stride[0] + 1
-    H_out = (H + 2 * padding[1] - dilation[1] * (KH - 1) - 1) // stride[1] + 1
-    W_out = (W + 2 * padding[2] - dilation[2] * (KW - 1) - 1) // stride[2] + 1
+    D_out = (D + 2 * padding[0] - dilation[0] * (KD - 1) - 1) // stride[0] + 1  # case3: (61+0-2-1)//1+1 = 59
+    H_out = (H + 2 * padding[1] - dilation[1] * (KH - 1) - 1) // stride[1] + 1  # case3: (45+4-4-1)//1+1 = 45
+    W_out = (W + 2 * padding[2] - dilation[2] * (KW - 1) - 1) // stride[2] + 1  # case3: (80+4-4-1)//1+1 = 80
 
     output = torch.zeros(B, C_out, D_out, H_out, W_out, dtype=input.dtype, device=input.device)
 

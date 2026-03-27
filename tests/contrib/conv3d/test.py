@@ -79,7 +79,7 @@ def test_conv3d_benchmark(args):
     stride = (1, 1, 1)
     dilation = (1, 1, 1)
 
-    input_dtype = torch.bfloat16
+    input_dtype = torch.bfloat16 # or torch.float16
     #input_dtype = torch.float32
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
