@@ -254,7 +254,7 @@ def get_pids(
 #        [c(n  )t->w(n  )b->l(n  )b-> == c(n  )b]   -> end
 # stage1: c, stage2: p, stage3: l
 @gluon.jit
-def bf16_3stage_2(
+def bf16_3stage_4wave(
     p_input,            # bf16 [M, K]
     p_weight,           # bf16 [K/8 * 16 * 8, N/16]
     p_output,           # bf16 [M, N]
@@ -287,7 +287,7 @@ def bf16_3stage_2(
         lds_b_read_layout: gl.constexpr = args.get_lds_layout_b_read()
 
     pid = gl.program_id(0)
-    if 1:
+    if 0:
         max_tile_n: gl.constexpr = N // BLOCK_TILE_SIZE_N
         tile_m = pid // max_tile_n
         tile_n = pid % max_tile_n
@@ -363,7 +363,7 @@ def bf16_3stage_2(
 
     _amd_iglp_sched_barrier(0)
     for k_start in range(0, (K - BLOCK_TILE_SIZE_K * 2) // (2 * BLOCK_TILE_SIZE_K)):
-        # _amd_iglp_sched_barrier(0)
+        _amd_iglp_sched_barrier(0)
         ##### c0t->w0b->l0b->p2t
         # compute 0t
         acc_top = gl.amd.cdna4.mfma(a, b_top, acc_top)
@@ -384,6 +384,22 @@ def bf16_3stage_2(
         if num_warps == 8:
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
+        else:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_top],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=32)
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
+            for _ in gl.static_range(12):
+                _amd_iglp_sched_group_barrier(s_mfma, 4, 0)
+                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
+            _amd_iglp_sched_group_barrier(s_mfma, 64 - 8 - 12*4, 0)
+            _amd_iglp_sched_barrier(0)
+
         acc_bot = gl.amd.cdna4.mfma(a, b_bot, acc_bot)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
@@ -402,6 +418,19 @@ def bf16_3stage_2(
             mem_b_offsets += BLOCK_TILE_SIZE_K * 16
         else:
             mem_b_offsets += BLOCK_TILE_SIZE_K
+        if num_warps == 4:
+            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[b_top, b_bot],
+                                    dtype=gl.bfloat16, is_pure=False, pack=8)
+            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[a, a_next],
+                                    dtype=gl.bfloat16, is_pure=False, pack=8)
+            for _ in gl.static_range(24):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 1)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 1)
+            for _ in gl.static_range(4):
+                _amd_iglp_sched_group_barrier(s_mfma, 4, 1)
+                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 1)
+            _amd_iglp_sched_group_barrier(s_mfma, 64 - 24 - 4*4, 1)
+            _amd_iglp_sched_barrier(0)
 
         ############## unroll ######################
         ##### c1t->w1b->l1b->p3t
@@ -427,6 +456,20 @@ def bf16_3stage_2(
         if num_warps == 8:
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
+        else:
+            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[b_top, b_bot],
+                                    dtype=gl.bfloat16, is_pure=False, pack=8)
+            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[a, a_next],
+                                    dtype=gl.bfloat16, is_pure=False, pack=8)
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 2)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 2)
+            for _ in gl.static_range(12):
+                _amd_iglp_sched_group_barrier(s_mfma, 4, 2)
+                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 2)
+            _amd_iglp_sched_group_barrier(s_mfma, 64 - 8 - 12*4, 2)
+            _amd_iglp_sched_barrier(0)
+    
         acc_bot = gl.amd.cdna4.mfma(a_next, b_bot, acc_bot)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
@@ -450,12 +493,47 @@ def bf16_3stage_2(
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         else:
-            for _ in gl.static_range(BLOCK_TILE_SIZE_M // 32 + BLOCK_TILE_SIZE_N // 32):
-                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
-                _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
-            for _ in gl.static_range(BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16):
-                _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
-                _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[b_top, b_bot],
+                                    dtype=gl.bfloat16, is_pure=False, pack=8)
+            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[a, a_next],
+                                    dtype=gl.bfloat16, is_pure=False, pack=8)
+            for _ in gl.static_range(24):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 3)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 3)
+            for _ in gl.static_range(4):
+                _amd_iglp_sched_group_barrier(s_mfma, 4, 3)
+                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 3)
+            _amd_iglp_sched_group_barrier(s_mfma, 64 - 24 - 4*4, 3)
+            _amd_iglp_sched_barrier(0)
+            # # BLOCK_M // 4 wave * 2(=BLOCK_K//32)
+            # k0_t_vmem_read_num: gl.constexpr = BLOCK_TILE_SIZE_M // 4 // 16 * 2 + BLOCK_TILE_SIZE_N // 4 // 16 * 2 // 2
+            # # BLOCK_N // 2 wave * 2(=BLOCK_K//16) // 2
+            # k0_t_lds_read_num: gl.constexpr = BLOCK_TILE_SIZE_N // 2 // 16 * 2 // 2
+            # gl.static_print("k0_t_vmem_read_num:", k0_t_vmem_read_num, k_start)
+            # gl.static_print("k0_t_lds_read_num:", k0_t_lds_read_num)
+            # # BLOCK_M // 4 wave * 2(=BLOCK_K//32)
+            # k0_b_vmem_read_num: gl.constexpr = BLOCK_TILE_SIZE_N // 4 // 16 * 2 // 2
+            # # BLOCK_M // 2 wave * 2(=BLOCK_K//16) + BLOCK_N // 2 wave * 2(=BLOCK_K//16) // 2
+            # k0_b_lds_read_num: gl.constexpr = BLOCK_TILE_SIZE_M // 2 // 16 * 2 + BLOCK_TILE_SIZE_N // 2 // 16 * 2 // 2
+            # gl.static_print("k0_b_vmem_read_num:", k0_b_vmem_read_num)
+            # gl.static_print("k0_b_lds_read_num:", k0_b_lds_read_num)
+            # for _ in gl.static_range(2):
+            #     for _ in gl.static_range(k0_t_vmem_read_num):
+            #         _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
+            #         _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+            #     for _ in gl.static_range(k0_t_lds_read_num):
+            #         _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
+            #         _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+            #     _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 2 // 16 * BLOCK_TILE_SIZE_N // 2 // 16 // 2 * 2 - k0_t_lds_read_num - k0_t_vmem_read_num, 0)
+
+            #     for _ in gl.static_range(k0_b_vmem_read_num):
+            #         _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
+            #         _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+            #     for _ in gl.static_range(k0_b_lds_read_num):
+            #         _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
+            #         _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+            #     _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 2 // 16 * BLOCK_TILE_SIZE_N // 2 // 16 // 2 * 2 - k0_b_lds_read_num - k0_b_vmem_read_num, 0)
+            # _amd_iglp_sched_barrier(0)
 
     _amd_iglp_sched_barrier(0)
     if enable_debug:
@@ -540,7 +618,7 @@ def bf16_3stage_2(
         gl.store(p_debug_buf + pid * 9 + 7, end_cycle)
         gl.store(p_debug_buf + pid * 9 + 8,  (slot_id & 0xff) | ((cu_id & 0xff) << 8) | ((se_id & 0xff) << 16) | ((xcc_id & 0xff) << 24))
 
-gemm = bf16_3stage_2 # bf16_2stage_1 bf16_2stage bf16_3stage bf16_3stage_2
+gemm = bf16_3stage_4wave # bf16_3stage_4wave
 #####################################################################
 from pyhip import cudaPerf
 from torch import Tensor
@@ -632,7 +710,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         M, K = A.shape
         N = w_ref.shape[0]
         gemm_out = torch.empty([M, N], dtype=A.dtype, device=A.device)
-        num_warps = 8
+        num_warps = 4
         if kernel_type == 'mxn_2s':
             BLOCK_TILE_SIZE_M = TILE_M
             BLOCK_TILE_SIZE_N = TILE_N

@@ -19,3 +19,7 @@
         - B: 256(N)/2(wave)/2(part) * 64(K) * sizeof(bf16) * 2(copy) / sizeof(float) / 64 = 64
         - C: 64x128/64 = 128
         - all: 64 + 64 + 128 = 256, no reg room for necessary vars. need to refactor the tile division.
+- back to 4 wave using `sched_group` to interleave ds/mem/mfma: 1.579 Pfops, torch: 1.585 Pflops
+    - use env 'TRITON_ENABLE_AMDGCN_AS=1' to enable 'amdgpu-mfma-vgpr-form=0' and 'amdgpu-agpr-alloc=256' (should use trion repo:https://github.com/luocheng25/triton/tree/gluon_ext, original code from: https://github.com/ROCm/triton/commits/matmul_4waves)
+    - use `_amd_iglp_sched_group_barrier` to interleave ds/mem/mfma
+    - use `gl.inline_asm_elementwise` to force a, b pin-pong buffer

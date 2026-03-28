@@ -1,10 +1,14 @@
 # setup
 ```
-git clone https://github.com/ROCm/triton -b gluon_ext
+#git clone https://github.com/ROCm/triton -b gluon_ext
+git clone https://github.com/luocheng25/triton -b gluon_ext
 cd triton
 pip install -r python/requirements.txt
 pip install .
 ```
+
+# run
+TRITON_ENABLE_AMDGCN_AS=1 python gemm_8wave.py
 
 # debug
 dump asm code:
