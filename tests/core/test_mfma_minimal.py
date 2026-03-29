@@ -318,11 +318,11 @@ def test_mfma_16x16x32_fp8():
         A = torch.randn(16, 32, device="cuda").to(torch.float8_e4m3fn)
         B = torch.randn(16, 32, device="cuda").to(torch.float8_e4m3fn)
     else:
-        print("SKIP: test_mfma_32x32x16_fp8 (no torch.float8_e4m3fnuz or torch.float8_e4m3fn)")
+        print("SKIP: test_mfma_16x16x32_fp8 (no torch.float8_e4m3fnuz or torch.float8_e4m3fn)")
         return
 
     @pyhip.jit()
-    def mfma_32x32x16_fp8(J: pyhip.JIT,
+    def mfma_16x16x32_fp8(J: pyhip.JIT,
            pA: "void*",
            pB: "void*",
            pC: "void*"):
@@ -368,7 +368,7 @@ def test_mfma_16x16x32_fp8():
         return
 
     C = torch.zeros(16, 16, dtype=torch.float32, device="cuda")
-    mfma_32x32x16_fp8([1], [64], A.data_ptr(), B.data_ptr(), C.data_ptr())
+    mfma_16x16x32_fp8([1], [64], A.data_ptr(), B.data_ptr(), C.data_ptr())
     torch.cuda.synchronize()
     ref = torch.mm(A.to(torch.float32), B.to(torch.float32).T)
     if not torch.allclose(ref, C, atol=0.1, rtol=0.1):
