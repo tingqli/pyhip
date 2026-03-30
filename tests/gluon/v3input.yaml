@@ -1,6 +1,6 @@
 jobs:
     -
-        kernel_include_regex: ".*kernel.*"
+        kernel_include_regex: ".*bf16_3stage_.*"
         kernel_iteration_range: "[8,9]"
         output_file: out
         output_directory: ck_test

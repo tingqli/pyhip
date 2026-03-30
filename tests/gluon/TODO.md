@@ -1,0 +1,25 @@
+# 8 waves
+- base: 1.37 Pflops
+    - 4 wave(2x2), TILE: 256x256x64
+    - 3 stage: global prefetch + local prefetch + compute
+    - 2 pinpong lds
+    - N tile splits to top+bot
+- xcd/l2 aware: 1.34 Pflops
+    - get_pids
+    - remove '.cg'
+- padded layout: 1.36 Pflops
+    - stride: from 4 rows -> 16 rows 
+- 8 waves: 1.57 Pflops
+    - 8 wave(4x2), TILE: 256x256x64
+    - same with base
+- change test data to random data: 1.44 Pflops, torch: 1.58 Pflops
+- 8 wave alternate executions: 1.11 Pflops
+    - reason: there are 24 scratch dwords which damaged the prefetching structure. Regs needed(max 256 per wave):
+        - A: 256(M)/4(wave) * 64(K) * sizeof(bf16) * 2(copy) / sizeof(float) / 64 = 64
+        - B: 256(N)/2(wave)/2(part) * 64(K) * sizeof(bf16) * 2(copy) / sizeof(float) / 64 = 64
+        - C: 64x128/64 = 128
+        - all: 64 + 64 + 128 = 256, no reg room for necessary vars. need to refactor the tile division.
+- back to 4 wave using `sched_group` to interleave ds/mem/mfma: 1.579 Pfops, torch: 1.585 Pflops
+    - use env 'TRITON_ENABLE_AMDGCN_AS=1' to enable 'amdgpu-mfma-vgpr-form=0' and 'amdgpu-agpr-alloc=256' (should use trion repo:https://github.com/luocheng25/triton/tree/gluon_ext, original code from: https://github.com/ROCm/triton/commits/matmul_4waves)
+    - use `_amd_iglp_sched_group_barrier` to interleave ds/mem/mfma
+    - use `gl.inline_asm_elementwise` to force a, b pin-pong buffer
