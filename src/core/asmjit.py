@@ -189,7 +189,13 @@ class GPRExpr:
         # number of registers
         if self.op == "getitem":
             return self.src2 - self.src1 + 1
-        return None
+        
+        len1 = len2 = 0
+        if isinstance(self.src1, GPRExpr): len1 = len(self.src1)
+        if isinstance(self.src2, GPRExpr): len2 = len(self.src2)
+        len0 = max(len1, len2)
+        assert len0 > 0
+        return len0
 
     def __iter__(self):
         assert self.op == "getitem"
@@ -650,7 +656,15 @@ class Buffer:
         if non_temporal:
             mod += f" sc0 nt"
         if vdst is None:
-            return self.J.buffer_load_dwordx4(voffset, self.desc, soffset, mod = mod + " lds")
+            if len(voffset) == 1:
+                return self.J.buffer_load_dwordx4(voffset, self.desc, soffset, mod = mod + " lds")
+            elif len(voffset) == 2:
+                # 64-bits voffsets, we use non-buffer loads to support it (side-effect, lost overflow avoidence)
+                # global_load_lds_dword   v[0:1], s[0:1] offset13s sc0,nt,sc1   GFX942
+                # global_load_lds_dwordx4 v[0:1], s[0:1] offset13s sc0,nt,sc1   GFX950
+                return self.J.global_load_lds_dwordx4(voffset, self.desc[0:1])
+            else:
+                assert 0
         return self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
 
     def load_dwordx2(self, vdst, voffset, soffset, offset12=0):
@@ -677,7 +691,15 @@ class Buffer:
         mod = f"offen"
         if offset12 > 0:
             mod += f" offset:{offset12}"
-        return self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
+        
+        if len(voffset) == 1:
+            return self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
+        elif  len(voffset) == 2:
+            # WARNNING: use 64bit voffset, here we need final address, no way to provide base,
+            # offset12 is actually offset13s
+            return self.J.global_store_dwordx4(voffset, vdata, "off", mod = f"offset:{offset12}")
+        else:
+            assert 0
 
     def store_dwordx2(self, vdata, voffset, soffset, offset12=0):
         # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1

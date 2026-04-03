@@ -3,6 +3,7 @@ import torch
 import aiter
 from aiter import dtypes
 import os
+import contextlib
 
 from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
 from .moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
@@ -335,7 +336,7 @@ def fused_moe(
 
     estimated_tokens_per_expert = token_num * topk / global_E
 
-    if estimated_tokens_per_expert < 32 and (
+    if estimated_tokens_per_expert < 0 and (
         quant_type == aiter.QuantType.No or
         # (wei_is_fp8(w1.dtype) and quant_type == aiter.QuantType.per_Token) or
         (wei_is_fp8(w1.dtype) and quant_type == aiter.QuantType.per_128x128)
@@ -459,7 +460,9 @@ def fused_moe(
     assert inter_dim*2 % wg_N == 0
     num_oc_blocks = inter_dim*2//wg_N
     num_e_blocks = sorted_expert_ids.shape[0]
-    #valid_e_blocks = num_valid_ids[0].item()//wg_M
+    do_perf = False
+    if do_perf:
+        valid_e_blocks = num_valid_ids[0].item()//wg_M
     if 0:
         moe_gemm_ref(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a1, a1_scale,
@@ -474,8 +477,7 @@ def fused_moe(
         #print(sorted_ids)
         #print(sorted_expert_ids)
         #print(f"{num_oc_blocks=} {num_valid_ids[0].item()=} {valid_e_blocks=} / {num_e_blocks=} {inter_dim=}")
-        #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name=f"moe_gemm_8wave_gateup"):
-        if 1:
+        with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name=f"moe_gemm_8wave_gateup"):
             moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
                     AB_dtype, wg_M, wg_N,
                     E, inter_dim*2, model_dim, 
@@ -524,10 +526,10 @@ def fused_moe(
     else:
         #print(f"{num_oc_blocks=} {valid_e_blocks=} {inter_dim=}")
         #print(w2.dtype, w2.shape, a2.dtype, a2.shape)
-        rw_bytes = w2.numel() * w2.element_size() + a2.numel() * a2.element_size() + stage2_out.numel()*stage2_out.element_size()
-        #flops = num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2
-        #with pyhip.cudaPerf(flops=flops, rw_bytes=rw_bytes, name="moe_gemm_down         "):
-        if 1:
+        if do_perf:
+            rw_bytes = w2.numel() * w2.element_size() + a2.numel() * a2.element_size() + stage2_out.numel()*stage2_out.element_size()
+            flops = num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2
+        with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(flops=flops, rw_bytes=rw_bytes, name="moe_gemm_down         "):
             if a2.dtype == torch.bfloat16:
                 AB_dtype = "bf16"
             elif a2.dtype == torch.float8_e4m3fn and w2.dtype == torch.float8_e4m3fn:
