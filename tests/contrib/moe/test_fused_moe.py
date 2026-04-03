@@ -224,10 +224,19 @@ def test_fmoe(
     out2_ref = None
     if ep_size > 1:
         # reference impl which do not simulate quant-behaviour but support expert_mask
+        if qType == aiter.QuantType.per_128x128:
+            # use dequantized weights to get more accurate reference results
+            NUM_EXPERTS, OC, IC = w1_qt.shape
+            w1_ref = (w1_qt.view(NUM_EXPERTS, OC//128, 128, IC//128, 128).to(w1_scale.dtype) * w1_scale.view(NUM_EXPERTS, OC//128, 1, IC//128, 1)).view(NUM_EXPERTS, OC, IC).to(input.dtype)
+            NUM_EXPERTS, OC, IC = w2_qt.shape
+            w2_ref = (w2_qt.view(NUM_EXPERTS, OC//128, 128, IC//128, 128).to(w2_scale.dtype) * w2_scale.view(NUM_EXPERTS, OC//128, 1, IC//128, 1)).view(NUM_EXPERTS, OC, IC).to(input.dtype)
+        else:
+            w1_ref = w1
+            w2_ref = w2
         out2_ref = torch_moe(
             input,
-            w1,
-            w2,
+            w1_ref,
+            w2_ref,
             topk_weights,
             topk_ids,
             # following for int8 quant
