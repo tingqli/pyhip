@@ -363,7 +363,7 @@ def fused_moe(
         moe_2stage_splitk_gateup
         moe_2stage_splitk_down
 
-        if USE_GLUON and quant_type == aiter.QuantType.No:
+        if USE_GLUON:
             BLOCK_TILE_SIZE_M = block_size_M
             BLOCK_TILE_SIZE_N = block_size_N
             grid = sorted_expert_ids.shape[0]
@@ -474,7 +474,7 @@ def fused_moe(
         #print(sorted_ids)
         #print(sorted_expert_ids)
         #print(f"{num_oc_blocks=} {num_valid_ids[0].item()=} {valid_e_blocks=} / {num_e_blocks=} {inter_dim=}")
-        #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name="moe_gemm_8wave_gateup"):
+        #with pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name=f"moe_gemm_8wave_gateup"):
         if 1:
             moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
                     AB_dtype, wg_M, wg_N,
@@ -525,8 +525,8 @@ def fused_moe(
         #print(f"{num_oc_blocks=} {valid_e_blocks=} {inter_dim=}")
         #print(w2.dtype, w2.shape, a2.dtype, a2.shape)
         rw_bytes = w2.numel() * w2.element_size() + a2.numel() * a2.element_size() + stage2_out.numel()*stage2_out.element_size()
-        flops = 0# num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2
-        #with pyhip.cudaPerf(flops=flops, rw_bytes=rw_bytes, name="moe_gemm_down_tp"):
+        #flops = num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2
+        #with pyhip.cudaPerf(flops=flops, rw_bytes=rw_bytes, name="moe_gemm_down         "):
         if 1:
             if a2.dtype == torch.bfloat16:
                 AB_dtype = "bf16"
@@ -535,7 +535,7 @@ def fused_moe(
             else:
                 assert 0, f"{a2.dtype=} {w2.dtype=}"
             #sorted_expert_ids[...] = 0
-            if 1: #quant_type == aiter.QuantType.No:
+            if inter_dim <= 256:
                 moe_gemm_down_tp([1, num_e_blocks], [4*64],
                                 AB_dtype, wg_M, 64,
                                 E, model_dim, inter_dim, 

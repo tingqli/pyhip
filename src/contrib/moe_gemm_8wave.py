@@ -181,6 +181,11 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
     MINI_BLOCK_M = J.div(HALF_BLOCK_SIZE_ROW, WARPS_ROW) # 64
     MINI_BLOCK_N = J.div(HALF_BLOCK_SIZE_COL, WARPS_COL) # 32
 
+    offset_64bit = J.gpr(2,"su32")
+    J.s_mul_hi_u32(offset_64bit[1], expert_id, (OC * stride_k))
+    J.s_mul_i32(offset_64bit[0], expert_id, (OC * stride_k))
+    weight[:] += offset_64bit
+
     if gate_up:
         """
         weight[:] += expert_id * (OC * stride_k) + blk_n * (wg_N//2 * stride_k)
@@ -197,7 +202,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
         # vm_load_b(k, m=1) loads from up-weight
         buff_a = J.Buffer(input, num_tokens * stride_k)
         buff_b = {}
-        weight[:] += expert_id * (OC * stride_k) + blk_n * (J.div(wg_N, 2) * stride_k) # gate-weight
+        weight[:] += blk_n * (J.div(wg_N, 2) * stride_k) # gate-weight
         buff_b[0] = J.Buffer(weight, J.div(wg_N, 2) * stride_k)
         weight[:] += J.div(OC, 2) * stride_k # up-weights
         buff_b[1] = J.Buffer(weight, J.div(wg_N, 2) * stride_k)
@@ -206,7 +211,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
         # assert bpreshuffle
     else:
         LOADER_TOPK = TOPK
-        weight[:] += expert_id * (OC * stride_k) + blk_n * (wg_N * stride_k)
+        weight[:] += blk_n * (wg_N * stride_k)
         # w_scale[:] += blk_n * (J.div(wg_N, 32) * stride_scale32x256) + (J.warp_id[0] % 2) * (J.div(wg_N//2, 32) * stride_scale32x256)
         # sbuff_b = J.Buffer(w_scale, J.div(wg_N//2, 32) * stride_scale32x256)
         buff_a = J.Buffer(input, num_tokens * TOPK * stride_k)
