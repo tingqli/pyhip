@@ -207,7 +207,7 @@ def get_mfma_loader(J, use_pre_shuffle, num_warps, M, K, vm_stride, warp_row0):
     else:
         return get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0)
 
-def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sorted_ids, TOPK, num_tokens):
+def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sorted_ids, TOPK, num_tokens, input, is_input_over_4GB):
     """
     Args:
         num_warps       (int) : how many warps are used for cooperatively loading data from VMEM into LDS
@@ -221,7 +221,8 @@ def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sor
         TOPK                  : > 0 : input layout [num_tokens, topk, dims]
                                 <=0 : input layout [num_tokens, dims]
         num_tokens            : total number of valid tokens in external VMEM
-    
+        input                 : input tensor base address
+        is_input_over_4GB     : if input tensor size > 4GB, if so, need 64bit addressing mode
     Returns:
         vm_load(lds_offset, buff, vm_offset) : [M, K] u8-VMEM-tile to [M, K] u8-LDS-tile loader generator function
                         lds_offset      (int) : target u8-LDS-tile offset
@@ -259,6 +260,7 @@ def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sor
 
     col = J.threadIdx.x % num_lanes_per_row
     row = J.threadIdx.x // num_lanes_per_row
+
     swizzle_col = swizzle(row, col)
 
     lds_warp_off = J.gpr("su32", warp_m_off * lds_stride)
@@ -267,25 +269,49 @@ def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sor
     # since tok-ids are discrete, we need a vmem_off for each load
     vm_load_cnt = len(range(0, M, 8*num_warps))
 
-    vmem_voff = J.gpr(vm_load_cnt, "vu32")
-
-    ds_vaddr = J.gpr(row * J.sizeof_DW + lds_sorted_ids)
-
-    for m in range(vm_load_cnt):
-        J.ds_read_b32(vmem_voff[m], ds_vaddr + m*num_warps*8*J.sizeof_DW)
-
-    J.s_waitcnt(mod=f"lgkmcnt(0)")
-
-    for m in range(vm_load_cnt):
-        tokid = J.gpr(2, "vu32", vmem_voff[m] & 0xFFFFFF, vmem_voff[m] >> 24)
+    if is_input_over_4GB:
+        assert vm_load_cnt <= 8 and num_lanes_per_row == 8
+        # when size of input tensor is bigger than 4GB
+        # pack vmem addresses in DPP format (4-rows x 4-banks)
+        # thanks to row_newbcast(0..15) & bank_mask(4-bits), DPP allows bcast in unit of 4/8/16-lanes
+        # here we use 8-lanes unit:
+        #   J.v_mov_b64_dpp(vdst, vsrc, mod=f"row_newbcast:{0} bank_mask:0b0011")
+        #   J.v_mov_b64_dpp(vdst, vsrc, mod=f"row_newbcast:{1} bank_mask:0b1100")
+        #
+        dpp_bank_id = J.threadIdx.x // num_lanes_per_row
+        dpp_lane_id = (J.threadIdx.x % vm_load_cnt)
+        ds_vaddr = J.gpr(dpp_bank_id * J.sizeof_DW + dpp_lane_id * (num_warps*8*J.sizeof_DW) + lds_sorted_ids)
+        sorted_ids = J.gpr("vu32")
+        J.ds_read_b32(sorted_ids, ds_vaddr)
+        vmem_addr_dpp = J.gpr(2, "vu32", input[0], input[1])
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
         if TOPK > 0:
-            vmem_voff[m] = tokid[0]*(TOPK*vm_stride) + tokid[1]*vm_stride + swizzle_col * J.sizeof_DW4
+            tokid = (sorted_ids & 0xFFFFFF) * TOPK + (sorted_ids >> 24)
         else:
-            vmem_voff[m] = tokid[0]*vm_stride + swizzle_col * J.sizeof_DW4
+            tokid = (sorted_ids & 0xFFFFFF)
+        saddr_dummy = J.gpr(2, "su32", 0)
+        J.v_mad_u64_u32(vmem_addr_dpp, saddr_dummy, tokid, J.gpr("su32", vm_stride), vmem_addr_dpp)
+        vswizzle_col_off = J.gpr("vu32", swizzle_col * J.sizeof_DW4)
 
-        # maybe don't need following code, since Buffer size ensures no read overflow can happen
-        #with J.ExecMask(tokid[0] >= num_tokens[0]):
-        #    vmem_voff[m] = 0
+        # avoid read overflow
+        with J.ExecMask((sorted_ids & 0xFFFFFF) >= num_tokens[0]):
+            vmem_addr_dpp[0] = input[0]
+            vmem_addr_dpp[1] = input[1]
+    else:
+        vmem_voff = J.gpr(vm_load_cnt, "vu32")
+        ds_vaddr = J.gpr(row * J.sizeof_DW + lds_sorted_ids)
+        for m in range(vm_load_cnt):
+            J.ds_read_b32(vmem_voff[m], ds_vaddr + m*num_warps*8*J.sizeof_DW)
+
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        for m in range(vm_load_cnt):
+            tokid = J.gpr(2, "vu32", vmem_voff[m] & 0xFFFFFF, vmem_voff[m] >> 24)
+            if TOPK > 0:
+                vmem_voff[m] = (tokid[0]*TOPK + tokid[1]) * vm_stride + swizzle_col * J.sizeof_DW4
+            else:
+                vmem_voff[m] = tokid[0]*vm_stride + swizzle_col * J.sizeof_DW4
+
 
     def vm_load(lds_offset, buff, vm_offset, half=None):
         J.s_mov_b32("m0", lds_warp_off + lds_offset)
@@ -297,11 +323,22 @@ def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sor
             m_range = range(J.div(vm_load_cnt,2), vm_load_cnt)
         else:
             assert 0
+
         for m in m_range:
             yield 1
-            buff.load_dwordx4(None, vmem_voff[m] + vm_offset, 0, offset12=0)
+            if is_input_over_4GB:
+                # performance drops a lot in this mode, so it's conditionally used
+                vaddr_64bits = J.gpr(2,"vu32")
+                J.v_mov_b64_dpp(vaddr_64bits, vmem_addr_dpp, mod=f"row_newbcast:{m} bank_mask:0b0011")
+                vtemp = J.gpr("vu32", vswizzle_col_off + vm_offset)
+                J.v_mov_b64_dpp(vaddr_64bits, vmem_addr_dpp, mod=f"row_newbcast:{8+m} bank_mask:0b1100")
+                J.v_add_co_u32(vaddr_64bits[0], "vcc", vtemp, vaddr_64bits[0])
+                J.v_addc_co_u32(vaddr_64bits[1], "vcc", 0, vaddr_64bits[1], "vcc")
+                J.global_load_lds_dwordx4(vaddr_64bits, "off")
+            else:
+                buff.load_dwordx4(None, vmem_voff[m] + vm_offset, 0, offset12=0)
             J.s_addk_i32("m0", num_warps*64*J.sizeof_DW4)
-            # vmem_voff[m] += nbK * 4 * J.sizeof_DW4
+
 
     col = J.lane_id // 16
     row = J.lane_id % 16

@@ -230,6 +230,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    method="auto", # jit, gluon, auto
 ):
     device = hidden_states.device
     def get_inter_dim(w1_shape, w2_shape):
@@ -336,7 +337,7 @@ def fused_moe(
 
     estimated_tokens_per_expert = token_num * topk / global_E
 
-    if estimated_tokens_per_expert < 0 and (
+    if method in ["gluon", "auto"] and estimated_tokens_per_expert < 32 and (
         quant_type == aiter.QuantType.No or
         # (wei_is_fp8(w1.dtype) and quant_type == aiter.QuantType.per_Token) or
         (wei_is_fp8(w1.dtype) and quant_type == aiter.QuantType.per_128x128)
@@ -479,6 +480,7 @@ def fused_moe(
         #print(f"{num_oc_blocks=} {num_valid_ids[0].item()=} {valid_e_blocks=} / {num_e_blocks=} {inter_dim=}")
         with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name=f"moe_gemm_8wave_gateup"):
             moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
+                    a1.element_size() * a1.numel() > (1<<32),
                     AB_dtype, wg_M, wg_N,
                     E, inter_dim*2, model_dim, 
                     True, w1_is_shuffled, topk,
@@ -537,8 +539,9 @@ def fused_moe(
             else:
                 assert 0, f"{a2.dtype=} {w2.dtype=}"
             #sorted_expert_ids[...] = 0
-            if inter_dim <= 256:
+            if inter_dim <= 256 and w2_is_shuffled:
                 moe_gemm_down_tp([1, num_e_blocks], [4*64],
+                                stage2_out.element_size() * stage2_out.numel() > (1<<32),
                                 AB_dtype, wg_M, 64,
                                 E, model_dim, inter_dim, 
                                 False, w2_is_shuffled, topk,
@@ -552,6 +555,7 @@ def fused_moe(
                                 token_num)
             else:
                 moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
+                                a2.element_size() * a2.numel() > (1<<32),
                                 AB_dtype, wg_M, wg_N,
                                 E, model_dim, inter_dim, 
                                 False, w2_is_shuffled, topk,
@@ -564,10 +568,8 @@ def fused_moe(
                                 stage2_out.data_ptr(),
                                 token_num) # num_local_tokens.data_ptr() ?
 
-        if 0:
-            moe_out = stage2_out[:,0,:]
-            for i in range(1, topk):
-                moe_out += stage2_out[:,i,:]
+        if 1:
+            moe_out = stage2_out.sum(dim=1)
         else:
             num_WG = 256 * 2
             num_tokens_wg = token_num // num_WG

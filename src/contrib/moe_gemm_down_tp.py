@@ -1,7 +1,6 @@
 from pyhip import jit, JIT
 import torch
-
-from .common.loaders import get_mfma_loader, get_mfma_loader_sorted_tok
+import contextlib
 
 __all__ = [
     "moe_gemm_down_tp"
@@ -33,7 +32,7 @@ rules:
 """
 
 @jit(with_debug_log=False)
-def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
+def moe_gemm_down_tp(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
                    NUM_EXPERTS, OC, IC, 
                    gate_up, bpreshuffle, TOPK,
                    sorted_ids:"uint*",
@@ -52,6 +51,7 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
     num_warps = 4
     stride_k = IC * J.sizeof(AB_dtype)
 
+    num_token_topks = J.gpr(num_tokens * TOPK)
     # all 4 warps distributed in 4x1
     # there is no share of mfma_A matrix, each warp loads directly their own part from VMEM
 
@@ -101,13 +101,17 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
 
     J.s_waitcnt(mod=f"lgkmcnt(0)")
 
-    buff_a = J.Buffer(input, num_tokens * TOPK * stride_k)
     for m in range(nrM):
-        row_off = (vrows[m] & 0xFFFFFF) * (TOPK * stride_k) + (vrows[m] >> 24) * (stride_k)
-        col_off = (J.lane_id // 16) * J.sizeof_DW4
-        vaddr = J.gpr("vu32", row_off + col_off)
-        for k in range(nrK):
-            buff_a.load_dwordx4(mfma_A[m, k], vaddr, 0, offset12=k*64)
+        vrows[m] = (vrows[m] & 0xFFFFFF) * TOPK + (vrows[m] >> 24)
+        with J.ExecMask(vrows[m] < num_token_topks):
+            vaddr = J.gpr(2, "vu32")
+            vaddr[0] = (J.lane_id // 16) * J.sizeof_DW4 # col_off
+            vaddr[1] = 0
+            J.v_lshl_add_u64(vaddr, input, 0, vaddr)
+            J.v_mad_u64_u32(vaddr, "vcc", vrows[m], J.gpr("su32", stride_k), vaddr)
+            for k in range(nrK):
+                J.global_load_dwordx4(mfma_A[m, k], vaddr, "off", mod=f"offset:{k*64}")
+
     J.s_waitcnt(mod=f"vmcnt(0)")
 
     # wait before first use
@@ -176,7 +180,7 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
 
         # since IC is small, load all scaleA into registers
         # expecting scaleA to be in [k,m] layout
-        buff_sa = J.Buffer(pScaleA, num_scales_K * (num_tokens[0] * TOPK) * J.sizeof_f32)
+        buff_sa = J.Buffer(pScaleA, num_scales_K * num_token_topks * J.sizeof_f32)
 
         vridx = J.gpr(nrM, "vu32")
         for bm in range(nrM):
@@ -195,7 +199,7 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
         for bk in range(num_scales_K):
             for bm in range(nrM):
                 buff_sa.load_dword(mfma_scaleA[bm, bk], vridx[bm], 0, offset12=0)
-                vridx[bm] += num_tokens[0] * TOPK * J.sizeof_f32
+                vridx[bm] += num_token_topks * J.sizeof_f32
 
         # rely on load-B-scales to do the vm_wait & sync
         J.s_waitcnt(mod=f"vmcnt({0})")
@@ -249,33 +253,47 @@ def moe_gemm_down_tp(J, AB_dtype, wg_M, wg_N,
             
     # prepare output offsets
     stride_c = OC * J.sizeof(C_dtype)
-    buff_c = J.Buffer(output, num_tokens * TOPK * stride_c)
+    buff_c = J.Buffer(output, num_token_topks * stride_c)
+    vaddr_rows = J.gpr(nrM, 2, "vu32")
     for m in range(nrM):
-        row_off = (vrows[m] & 0xFFFFFF) * (TOPK * stride_c) + (vrows[m] >> 24) * (stride_c)
-        col = (J.lane_id // 16)
-        swap_12_col = (col & 1) * 2 + (col >> 1)
-        vrows[m] = row_off + swap_12_col * J.sizeof_DW4
+        if is_output_over_4GB:
+            J.v_mad_u64_u32(vaddr_rows[m], "vcc", vrows[m], J.gpr("su32", stride_c), 0)
+            J.v_lshl_add_u64(vaddr_rows[m], output, 0, vaddr_rows[m])
+            col = (J.lane_id // 16)
+            swap_12_col = (col & 1) * 2 + (col >> 1)
+            J.v_lshl_add_u64(vaddr_rows[m], J.gpr(2, "vu32", swap_12_col*J.sizeof_DW4, 0), 0, vaddr_rows[m])
+        else:
+            row_off = vrows[m] * stride_c
+            col = (J.lane_id // 16)
+            swap_12_col = (col & 1) * 2 + (col >> 1)
+            vaddr_rows[m,0] = row_off + swap_12_col * J.sizeof_DW4
 
     num_vm_stores = nrM * (nrN//2)
     def storeC(c_index, soffset):
         vbf16 = J.gpr(4, "vbf16x2")
         for m in range(nrM):
-            for n in range(0, nrN, 2):
-                for i in range(4):
-                    J.v_mul_f32(mfma_C[c_index,m,n,i], mfma_C[c_index,m,n,i], vweights[m])
-                yield 16
-                for i in range(4):
-                    J.v_mul_f32(mfma_C[c_index,m,n+1,i], mfma_C[c_index,m,n+1,i], vweights[m])
-                yield 16
-                J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[c_index, m,n,0], mfma_C[c_index, m,n,1])
-                J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[c_index, m,n,2], mfma_C[c_index, m,n,3])
-                J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[c_index, m,n+1,0], mfma_C[c_index, m,n+1,1])
-                J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[c_index, m,n+1,2], mfma_C[c_index, m,n+1,3])
-                yield 16
-                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-                buff_c.store_dwordx4(vbf16, vrows[m], soffset, offset12 = n*16*J.sizeof(C_dtype))
-                yield 64
+            with J.ExecMask(vrows[m] < num_token_topks, early_skip=False) if is_output_over_4GB else contextlib.nullcontext():
+                for n in range(0, nrN, 2):
+                    for i in range(4):
+                        J.v_mul_f32(mfma_C[c_index,m,n,i], mfma_C[c_index,m,n,i], vweights[m])
+                    yield 16
+                    for i in range(4):
+                        J.v_mul_f32(mfma_C[c_index,m,n+1,i], mfma_C[c_index,m,n+1,i], vweights[m])
+                    yield 16
+                    J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[c_index, m,n,0], mfma_C[c_index, m,n,1])
+                    J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[c_index, m,n,2], mfma_C[c_index, m,n,3])
+                    J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[c_index, m,n+1,0], mfma_C[c_index, m,n+1,1])
+                    J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[c_index, m,n+1,2], mfma_C[c_index, m,n+1,3])
+                    yield 16
+                    J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                    J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                    if is_output_over_4GB:
+                        vaddr_64bits = J.gpr(2, "vu32", soffset[0], 0)
+                        J.v_lshl_add_u64(vaddr_64bits, vaddr_64bits, 0, vaddr_rows[m])
+                        J.global_store_dwordx4(vaddr_64bits, vbf16, "off", mod=f"offset:{n*16*J.sizeof(C_dtype)}")
+                    else:
+                        buff_c.store_dwordx4(vbf16, vaddr_rows[m,0], soffset, offset12 = n*16*J.sizeof(C_dtype))
+                    yield 64
 
     # perf-experiment
     loop_cnt = J.div(OC, wg_N)

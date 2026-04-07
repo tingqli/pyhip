@@ -30,10 +30,7 @@ import pyhip
 from pyhip import calc_diff
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
-torch.set_default_device("cuda")
-torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
-# torch.cuda.set_device(0)
-torch.manual_seed(0)
+pyhip.set_device()
 
 def generate_data(total_token, num_global_expert, num_local_expert, model_dim, topk, dtype):
     total_x = torch.randn((total_token, model_dim), dtype=dtype)
@@ -47,7 +44,7 @@ def generate_data(total_token, num_global_expert, num_local_expert, model_dim, t
     return input_x, topk_ids, topk_weights
 
 @benchmark()
-def test_fmoe(
+def do_test_fmoe(
     dtype,
     token,
     model_dim,
@@ -64,7 +61,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=False,
     diff_thr=1e-4,
-    ep_size=1
+    ep_size=1,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -341,311 +338,353 @@ def test_fmoe(
 
     return {"us": us2, "logits_diff": logits_diff}
 
-
-l_dtype = ["bf16", "fp16"][:1]
-# l_dim = [(6144, 4096)]
-l_dim = [(7168, 256)]
-# l_dim = [(3072, 3072)]
-l_tokenNum = [
-    1,
-    3,
-    5,
-    16,
-    32,
-    64,
-    128,
-    256,
-    1024,
-    4096,
-    163840,
-]
-l_quant = [
-    (aiter.QuantType.No, None, None),  # a16w16
-    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
-    (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
-]
-l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
-l_doweight_stage1 = [False, True][:1]
-# l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
-l_hidden_intermediate_pad = [(0, 0), (192, 128), (129, 191)][1:2]
-l_preshuffle = [False, True]
-
-
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""Data type.
-    e.g.: -d bf16""",
-)
-
-parser.add_argument(
-    "-dim",
-    type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""Model dimension.
-    e.g.: -dim 6144,4096""",
-)
-
-parser.add_argument(
-    "-t",
-    "--tokenNum",
-    type=int,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""Number of tokens.
-    e.g.: -t 1024""",
-)
-
-parser.add_argument(
-    "-q",
-    "--quant",
-    type=int,
-    choices=range(len(l_quant)),
-    help="""select quantization type:
-    0 : aiter.QuantType.No, None, None),  # a16w16
-    1: aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8  # a8w8
-    2: aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8
-    3: aiter.QuantType.per_Token, dtypes.fp8, torch.int4  # a8w4
-    4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
-    5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
-    6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
-    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,""",
-)
-
-parser.add_argument(
-    "-a",
-    "--act",
-    type=str,
-    choices=["silu", "gelu"],
-    default="silu",
-    help="""Select activation type.
-    e.g.: -a silu""",
-)
-
-parser.add_argument(
-    "-s",
-    "--doweight_stage1",
-    type=dtypes.str2bool,
-    nargs="?",
-    const=None,
-    default=False,
-    help="""Whether to do weight in stage 1. Default is [False, True].
-    -s f    # False.
-    -s t    # True.""",
-)
-
-parser.add_argument(
-    "-e",
-    "--expert",
-    type=int,
-    default=8,
-    help="""Number of experts.
-    e.g.: -e 8""",
-)
-
-parser.add_argument(
-    "-ep",
-    type=int,
-    default=1,
-    help="""EP: expert-parallel number
-    e.g.: -ep 8""",
-)
-
-parser.add_argument(
-    "-k",
-    "--topk",
-    type=int,
-    default=2,
-    help="""Number of top experts.
-    e.g.: -k 2""",
-)
-
-parser.add_argument(
-    "-p",
-    "--preshuffle",
-    type=dtypes.str2bool,
-    nargs="?",
-    const=None,
-    default=True,
-    help="""Whether to use pre-shuffle weight mode. Default is [False, True].
-    -p f    # False.
-    -p t    # True.""",
-)
+import pytest
+@pytest.mark.parametrize("dtype",[dtypes.bf16])
+@pytest.mark.parametrize("num_tokens",[1, 32, 64, 128, 256, 512, 1024, 2048, 16000, 32000, 64000, 128000])
+@pytest.mark.parametrize("model_dim, inter_dim, expert, topk,", [(4096, 128, 400, 20), (4096, 1536, 400, 20)])
+@pytest.mark.parametrize("act_type", [aiter.ActivationType.Silu])
+@pytest.mark.parametrize("quant_type, aq_dtype, wq_dtype", [
+    (aiter.QuantType.No, None, None),
+    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8)
+])
+@pytest.mark.parametrize("preshuffle", [True, False])
+@pytest.mark.parametrize("ep_size", [1])
+@pytest.mark.parametrize("diff_thr", [0.001])
+@pytest.mark.parametrize("method", ["auto"])
+def test_fmoe(dtype, num_tokens, model_dim, inter_dim, expert, topk, act_type, quant_type, aq_dtype, wq_dtype, preshuffle, ep_size, diff_thr, method):
+    doweight_stage1 = False
+    global fused_moe_impl
+    from pyhip.contrib.fused_moe import fused_moe as fused_moe_asmjit
+    import functools
+    fused_moe_impl = functools.partial(fused_moe_asmjit, method="jit")
+    ret = do_test_fmoe(
+                dtype,
+                num_tokens,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                act_type,
+                quant_type,
+                aq_dtype,
+                wq_dtype,
+                use_g1u1=True,
+                doweight_stage1=doweight_stage1,
+                preshuffle=preshuffle,
+                diff_thr=diff_thr,
+                ep_size=ep_size,
+            )
+    del ret
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache() 
 
 
-#########################################################################################################################
-# the rest of code is copied from aiter/op_tests/test_moe_2stage.py
-fused_moe_impl = fused_moe
+if __name__ == "__main__":
+    l_dtype = ["bf16", "fp16"][:1]
+    # l_dim = [(6144, 4096)]
+    l_dim = [(7168, 256)]
+    # l_dim = [(3072, 3072)]
+    l_tokenNum = [
+        1,
+        3,
+        5,
+        16,
+        32,
+        64,
+        128,
+        256,
+        1024,
+        4096,
+        163840,
+    ]
+    l_quant = [
+        (aiter.QuantType.No, None, None),  # a16w16
+        (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+        (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+        (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+        (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
+        (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+        (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+        (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
+    ]
+    l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
+    l_doweight_stage1 = [False, True][:1]
+    # l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+    l_hidden_intermediate_pad = [(0, 0), (192, 128), (129, 191)][1:2]
+    l_preshuffle = [False, True]
 
-class UseJitAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        global fused_moe_impl
-        from pyhip.contrib.fused_moe import fused_moe as fused_moe_asmjit
-        fused_moe_impl = fused_moe_asmjit
-        setattr(namespace, self.dest, True)
 
-parser.add_argument(
-    "-j",
-    "--jit",
-    nargs = 0,
-    action=UseJitAction,
-    help="use jit."
-)
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=l_dtype,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Data type.
+        e.g.: -d bf16""",
+    )
 
-parser.add_argument(
-    "-diff",
-    type=float,
-    default=0.001,
-    help="diff threshold."
-)
+    parser.add_argument(
+        "-dim",
+        type=dtypes.str2tuple,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Model dimension.
+        e.g.: -dim 6144,4096""",
+    )
 
-#########################################################################################################################
-args = parser.parse_args()
+    parser.add_argument(
+        "-t",
+        "--tokenNum",
+        type=int,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Number of tokens.
+        e.g.: -t 1024""",
+    )
 
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
+    parser.add_argument(
+        "-q",
+        "--quant",
+        type=int,
+        choices=range(len(l_quant)),
+        help="""select quantization type:
+        0 : aiter.QuantType.No, None, None),  # a16w16
+        1: aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8  # a8w8
+        2: aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8
+        3: aiter.QuantType.per_Token, dtypes.fp8, torch.int4  # a8w4
+        4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
+        5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
+        6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
+        7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,""",
+    )
 
-if args.dim is not None:
-    l_dim = [args.dim]
+    parser.add_argument(
+        "-a",
+        "--act",
+        type=str,
+        choices=["silu", "gelu"],
+        default="silu",
+        help="""Select activation type.
+        e.g.: -a silu""",
+    )
 
-if args.tokenNum is not None:
-    l_tokenNum = [args.tokenNum]
+    parser.add_argument(
+        "-s",
+        "--doweight_stage1",
+        type=dtypes.str2bool,
+        nargs="?",
+        const=None,
+        default=False,
+        help="""Whether to do weight in stage 1. Default is [False, True].
+        -s f    # False.
+        -s t    # True.""",
+    )
 
-l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
+    parser.add_argument(
+        "-e",
+        "--expert",
+        type=int,
+        default=8,
+        help="""Number of experts.
+        e.g.: -e 8""",
+    )
 
-if args.act is not None:
-    l_act = [getattr(aiter.ActivationType, args.act.capitalize())]
+    parser.add_argument(
+        "-ep",
+        type=int,
+        default=1,
+        help="""EP: expert-parallel number
+        e.g.: -ep 8""",
+    )
 
-if args.doweight_stage1 is not None:
-    l_doweight_stage1 = [args.doweight_stage1]
+    parser.add_argument(
+        "-k",
+        "--topk",
+        type=int,
+        default=2,
+        help="""Number of top experts.
+        e.g.: -k 2""",
+    )
 
-if args.preshuffle is not None:
-    l_preshuffle = [args.preshuffle]
+    parser.add_argument(
+        "-p",
+        "--preshuffle",
+        type=dtypes.str2bool,
+        nargs="?",
+        const=None,
+        default=True,
+        help="""Whether to use pre-shuffle weight mode. Default is [False, True].
+        -p f    # False.
+        -p t    # True.""",
+    )
 
-df = []
-for (
-    dtype,
-    (quant_type, aq_dtype, wq_dtype),
-    (model_dim, inter_dim),
-    doweight_stage1,
-) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1):
-    if (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.bf16,
-        dtypes.fp4x2,
-    ):
-        for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
-            for m in l_tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    aiter.ActivationType.Swiglu,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                    hidden_pad=hidden_pad,
-                    intermediate_pad=intermediate_pad,
-                )
-                df.append(ret)
-    elif (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.fp8,
-        dtypes.fp4x2,
-    ):
-        for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
-            for m in l_tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    aiter.ActivationType.Swiglu,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                    hidden_pad=hidden_pad,
-                    intermediate_pad=intermediate_pad,
-                )
-                df.append(ret)
-    elif (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.fp4x2,
-        dtypes.fp4x2,
-    ):
-        for preshuffle in l_preshuffle:
-            for act_type in l_act:
-                for m in l_tokenNum:
-                    ret = test_fmoe(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        args.expert,
-                        args.topk,
-                        act_type,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        use_g1u1=True,
-                        doweight_stage1=doweight_stage1,
-                        preshuffle=preshuffle,
-                        hidden_pad=0,
-                        intermediate_pad=0,
-                    )
-                    df.append(ret)
+
+    #########################################################################################################################
+    # the rest of code is copied from aiter/op_tests/test_moe_2stage.py
+    fused_moe_impl = fused_moe
+
+    class UseJitAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            global fused_moe_impl
+            from pyhip.contrib.fused_moe import fused_moe as fused_moe_asmjit
+            fused_moe_impl = fused_moe_asmjit
+            setattr(namespace, self.dest, True)
+
+    parser.add_argument(
+        "-j",
+        "--jit",
+        nargs = 0,
+        action=UseJitAction,
+        help="use jit."
+    )
+
+    parser.add_argument(
+        "-diff",
+        type=float,
+        default=0.001,
+        help="diff threshold."
+    )
+
+    #########################################################################################################################
+    args = parser.parse_args()
+
+    if args.dtype is None:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
     else:
-        for preshuffle in l_preshuffle:
-            for act_type in l_act:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+
+    if args.dim is not None:
+        l_dim = [args.dim]
+
+    if args.tokenNum is not None:
+        l_tokenNum = [args.tokenNum]
+
+    l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
+
+    if args.act is not None:
+        l_act = [getattr(aiter.ActivationType, args.act.capitalize())]
+
+    if args.doweight_stage1 is not None:
+        l_doweight_stage1 = [args.doweight_stage1]
+
+    if args.preshuffle is not None:
+        l_preshuffle = [args.preshuffle]
+
+    df = []
+    for (
+        dtype,
+        (quant_type, aq_dtype, wq_dtype),
+        (model_dim, inter_dim),
+        doweight_stage1,
+    ) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1):
+        if (quant_type, aq_dtype, wq_dtype) == (
+            aiter.QuantType.per_1x32,
+            dtypes.bf16,
+            dtypes.fp4x2,
+        ):
+            for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
                 for m in l_tokenNum:
-                    ret = test_fmoe(
+                    ret = do_test_fmoe(
                         dtype,
                         m,
                         model_dim,
                         inter_dim,
                         args.expert,
                         args.topk,
-                        act_type,
+                        aiter.ActivationType.Swiglu,
                         quant_type,
                         aq_dtype,
                         wq_dtype,
                         use_g1u1=True,
                         doweight_stage1=doweight_stage1,
-                        preshuffle=preshuffle,
-                        diff_thr=None if args.diff < 0 else args.diff,
-                        ep_size=args.ep
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
                     )
                     df.append(ret)
-time_us = float(df[-1]["us"])
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
-print(f"last-time-us: {time_us:.3f}")
+        elif (quant_type, aq_dtype, wq_dtype) == (
+            aiter.QuantType.per_1x32,
+            dtypes.fp8,
+            dtypes.fp4x2,
+        ):
+            for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
+                for m in l_tokenNum:
+                    ret = do_test_fmoe(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        args.expert,
+                        args.topk,
+                        aiter.ActivationType.Swiglu,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        use_g1u1=True,
+                        doweight_stage1=doweight_stage1,
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
+                    )
+                    df.append(ret)
+        elif (quant_type, aq_dtype, wq_dtype) == (
+            aiter.QuantType.per_1x32,
+            dtypes.fp4x2,
+            dtypes.fp4x2,
+        ):
+            for preshuffle in l_preshuffle:
+                for act_type in l_act:
+                    for m in l_tokenNum:
+                        ret = do_test_fmoe(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            args.expert,
+                            args.topk,
+                            act_type,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            use_g1u1=True,
+                            doweight_stage1=doweight_stage1,
+                            preshuffle=preshuffle,
+                            hidden_pad=0,
+                            intermediate_pad=0,
+                        )
+                        df.append(ret)
+        else:
+            for preshuffle in l_preshuffle:
+                for act_type in l_act:
+                    for m in l_tokenNum:
+                        ret = do_test_fmoe(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            args.expert,
+                            args.topk,
+                            act_type,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            use_g1u1=True,
+                            doweight_stage1=doweight_stage1,
+                            preshuffle=preshuffle,
+                            diff_thr=None if args.diff < 0 else args.diff,
+                            ep_size=args.ep
+                        )
+                        df.append(ret)
+    time_us = float(df[-1]["us"])
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+    print(f"last-time-us: {time_us:.3f}")

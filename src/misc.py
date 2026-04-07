@@ -1,7 +1,7 @@
 """ Some useful helpers """
 
 __all__ = [
-    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle", "run_perftest"
+    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle", "run_perftest", "set_device"
 ]
 
 
@@ -105,22 +105,30 @@ def calc_diff(x: "torch.Tensor", y: "torch.Tensor", diff_thr=None):
         sim = 2 * (x * y).sum() / denominator
         diff = (1 - sim).item()
         return diff
+
     diff = get_diff(x, y)
     if diff != diff or (diff_thr is not None and diff > diff_thr):
+        if diff_thr is None or diff_thr < 0: return diff
         print(x)
         print(y)
         print(x.shape)
         print(y.shape)
         if len(x.shape) == 2:
+            print_count = 0
             M, N = x.shape
             for m in range(0,M,16):
-                for n in range(0,N,16):
-                    d = get_diff(x[m:m+16,n:n+16], y[m:m+16,n:n+16])
-                    if d < diff_thr:
-                        print(f"_.__ ", end="")
-                    else:
-                        print(f"{d:.2f} ", end="")
-                print()
+                dm = get_diff(x[m:m+16,:], y[m:m+16,:])
+                if dm >= diff_thr:
+                    print_count += 1
+                    assert print_count < 16, f"Too many errors in calc_diff with {diff_thr=:.3f}"
+                    print(f"[{m:6}]: ", end="")
+                    for n in range(0,N,16):
+                        d = get_diff(x[m:m+16,n:n+16], y[m:m+16,n:n+16])
+                        if d < diff_thr:
+                            print(f"_.__ ", end="")
+                        else:
+                            print(f"{d:.2f} ", end="")
+                    print()
             print()
         assert 0, f"{diff=} > {diff_thr=} !!!"
     assert diff == diff, "diff is nan!"
@@ -184,3 +192,28 @@ def run_perftest(kernel, *args, **kwargs):
             msg += f", {num_bytes/dt*1e-12:.3f} TB/s"
         print(msg)
     return out, dt*1e6
+
+def set_device(selected_device = -1):
+    global torch
+    import torch
+    if not torch.cuda.is_available():
+        assert 0, "No CUDA device found in torch"
+
+    if selected_device < 0:
+        max_free_mem = -1
+        for device_id in range(torch.cuda.device_count()):
+            free_mem, total_mem = torch.cuda.mem_get_info(device_id)
+            free_mem_gb = free_mem / (1024 ** 3)
+            total_mem_gb = total_mem / (1024 ** 3)
+            if free_mem > max_free_mem:
+                max_free_mem = free_mem
+                max_total_mem = total_mem
+                selected_device = device_id
+
+    torch.set_default_device("cuda")
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
+    torch.cuda.set_device(selected_device)
+    torch.manual_seed(0)
+    free_mem, total_mem = torch.cuda.mem_get_info(selected_device)
+    print(f"Use cuda device {selected_device} with {free_mem*100/total_mem:.1f}% Free mem : {free_mem/(1024**3):.0f}GB / {total_mem/(1024**3):.0f} GB")
+    return selected_device

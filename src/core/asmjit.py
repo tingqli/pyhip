@@ -656,15 +656,8 @@ class Buffer:
         if non_temporal:
             mod += f" sc0 nt"
         if vdst is None:
-            if len(voffset) == 1:
-                return self.J.buffer_load_dwordx4(voffset, self.desc, soffset, mod = mod + " lds")
-            elif len(voffset) == 2:
-                # 64-bits voffsets, we use non-buffer loads to support it (side-effect, lost overflow avoidence)
-                # global_load_lds_dword   v[0:1], s[0:1] offset13s sc0,nt,sc1   GFX942
-                # global_load_lds_dwordx4 v[0:1], s[0:1] offset13s sc0,nt,sc1   GFX950
-                return self.J.global_load_lds_dwordx4(voffset, self.desc[0:1])
-            else:
-                assert 0
+            assert len(voffset) == 1
+            return self.J.buffer_load_dwordx4(voffset, self.desc, soffset, mod = mod + " lds")
         return self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
 
     def load_dwordx2(self, vdst, voffset, soffset, offset12=0):
@@ -3404,6 +3397,23 @@ r'''
     def silu(self, vgpr_src):
         return self.gpr(self.sigmoid(vgpr_src) * vgpr_src)
 
+    def s_mul_u32_u64(self, a, b):
+        """
+        one way to look at positive & negative integer x in Two's complement binary form is:
+             (2^32 + x) mod (2^32)
+        we can prove `s_mul_i32` can perform both u32*u32 and i32*i32
+        but for high 32bits part of result, sign-extend of source operand is required
+        """
+        s64bits = self.gpr(2, "su32")
+        self.s_mul_hi_u32(s64bits[1], a, b)
+        self.s_mul_i32(s64bits[0], a, b)
+        return s64bits
+
+    def s_mul_i32_i64(self, a, b):
+        s64bits = self.gpr(2, "su32")
+        self.s_mul_hi_i32(s64bits[1], a, b)
+        self.s_mul_i32(s64bits[0], a, b)
+        return s64bits
 
     # a unified instruction for f32=>bf16 conversion
     def uni_cvt_pk_bf16_f32(self, vdst, vsrc0, vsrc1):

@@ -32,9 +32,9 @@ def moe_gemm_final_reduce_bf16(J, TOPK, OC,
         tok1[0] = tok0 + num_tokens_wg
 
     J.s_min_u32(tok1, tok1[0], num_tokens_total[0])
-    
-    input[:] += tok0[0] * (TOPK * OC * J.sizeof_bf16)
-    output[:] += tok0[0] * (OC * J.sizeof_bf16)
+
+    input[:] += J.s_mul_u32_u64(tok0, (TOPK * OC * J.sizeof_bf16))
+    output[:] += J.s_mul_u32_u64(tok0, (OC * J.sizeof_bf16))
 
     buff = J.Buffer(input, (tok1[0] - tok0[0]) * (TOPK * OC * J.sizeof_bf16))
     buff_out = J.Buffer(output, (tok1[0] - tok0[0]) * (OC * J.sizeof_bf16))
@@ -127,7 +127,8 @@ loader函数如何单独调试正确性？可以从实现最简单的moe_gemm开
 
 
 @jit(with_debug_log=False)
-def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
+def moe_gemm_8wave(J, is_input_over_4GB,
+                   AB_dtype, wg_M, wg_N,
                    NUM_EXPERTS, OC, IC, 
                    gate_up, bpreshuffle, TOPK,
                    sorted_ids:"uint*",
@@ -251,7 +252,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
         J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
         J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
 
-    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, LOADER_TOPK, num_tokens)
+    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, LOADER_TOPK, num_tokens, input, is_input_over_4GB)
     vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*MINI_BLOCK_N)
     vm_load_cnt_a = vm_load_cnt_a // 2
 
@@ -454,7 +455,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             ds_read_b(ldsB[k,m], mfma_B[m, i, 0], i, 0)
             ds_read_b(ldsB[k,m], mfma_B[m, i, 1], i, 1)
 
-    if 1:
+    if 1: 
         # 8-wave pipeline invented by HipKittens
         tic = 0
         toc = 1
@@ -629,7 +630,6 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             swap_12_col = (col & 1) * 2 + (col >> 1)
             vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * nrN * 16 * J.sizeof_bf16 + blk_n * (J.div(wg_N,2) * J.sizeof(C_dtype)))
 
-        saddr_dummy = J.gpr(2, "su32", 0)
         for cm in range(2):
             igate = cm*2 + 0
             iup = cm*2 + 1
@@ -639,7 +639,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
                     # to support (num_tokens * TOPK * stride_n) > 4GB, we can only use global_store_dword
                     vaddr = J.gpr(2, "vu32", output[0], output[1])
                     J.v_lshl_add_u64(vaddr, J.gpr(2, "vu32", vaddr0 + vrows_topk * (stride_n), 0), 0, vaddr)
-                    J.v_mad_u64_u32(vaddr, saddr_dummy, (vrows[cm, m] & 0xFFFFFF), J.gpr("vu32", TOPK * stride_n), vaddr)
+                    J.v_mad_u64_u32(vaddr, "vcc", (vrows[cm, m] & 0xFFFFFF), J.gpr("vu32", TOPK * stride_n), vaddr)
                     for n in range(nrN):
                         mfma_C[igate,m,n,0] = J.silu(mfma_C[igate,m,n,0]) * mfma_C[iup,m,n,0]
                         mfma_C[igate,m,n,1] = J.silu(mfma_C[igate,m,n,1]) * mfma_C[iup,m,n,1]
@@ -684,7 +684,6 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
             swap_12_col = (col & 1) * 2 + (col >> 1)
             vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + blk_n * (wg_N * J.sizeof(C_dtype)))
 
-        saddr_dummy = J.gpr(2, "su32", 0)
         for cindex in range(4):
             cm = cindex // 2
             cn = cindex % 2
@@ -693,7 +692,7 @@ def moe_gemm_8wave(J, AB_dtype, wg_M, wg_N,
                 with J.ExecMask(vrows_topk < TOPK):
                     vaddr = J.gpr(2, "vu32", output[0], output[1])
                     J.v_lshl_add_u64(vaddr, J.gpr(2, "vu32", vaddr0 + vrows_topk * (stride_c), 0), 0, vaddr)
-                    J.v_mad_u64_u32(vaddr, saddr_dummy, (vrows[cm, m] & 0xFFFFFF), J.gpr("vu32", TOPK * stride_c), vaddr)                
+                    J.v_mad_u64_u32(vaddr, "vcc", (vrows[cm, m] & 0xFFFFFF), J.gpr("vu32", TOPK * stride_c), vaddr)                
 
                     assert nrN in [1, 2], f"{nrN=}"
                     if nrN == 1:
