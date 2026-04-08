@@ -569,7 +569,12 @@ def moe_2stage_splitk(J:JIT,
             #  64 lane offset 
             voffset_scale[0] = 0
             voffset_scale[1] = 0
-    p_weight[:] = p_weight[:] + s_e_id * (N * get_k_bytes(K))
+
+    offset_64bit = J.gpr(2,"su32")
+    offset_64bit = J.s_mul_u32_u64(s_e_id, (N * get_k_bytes(K)))
+    # J.s_mul_hi_u32(offset_64bit[1], s_e_id, (N * get_k_bytes(K)))
+    # J.s_mul_i32(offset_64bit[0], s_e_id, (N * get_k_bytes(K)))
+    p_weight[:] += offset_64bit
     buff_b = J.Buffer(p_weight, N * get_k_bytes(K))
 
     gemm_splitk(J, weight_dtype, K, N, num_split_k,

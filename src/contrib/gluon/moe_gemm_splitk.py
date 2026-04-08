@@ -160,7 +160,9 @@ def moe_2stage_splitk_gateup(p_input,            # bf16 [M, K]
     sorted_expert_id = gl.load(p_sorted_expert_ids + e_idx)
     if e_idx * BLOCK_TILE_SIZE_M >= num_valid_ids:
         return
-    p_weight = p_weight + sorted_expert_id * K * N
+
+    sorted_expert_id_64bit = sorted_expert_id.to(gl.int64)
+    p_weight = p_weight + ((sorted_expert_id_64bit) * (K * N))
     if weight_dtype == torch.float8_e4m3fn:
         p_w_scale_top = p_w_scale + sorted_expert_id * (N // 128) * (K // 128)
         p_w_scale_bot = p_w_scale_top + (N // 2 // 128) * (K // 128)
@@ -465,7 +467,8 @@ def moe_2stage_splitk_down(p_input,            # bf16 [M, K]
     sorted_expert_id = gl.load(p_sorted_expert_ids + e_idx)
     if e_idx * BLOCK_TILE_SIZE_M >= num_valid_ids:
         return
-    p_weight = p_weight + sorted_expert_id * K * N
+    sorted_expert_id_64bit = sorted_expert_id.to(gl.int64)
+    p_weight = p_weight + sorted_expert_id_64bit * K * N
     if weight_dtype == torch.float8_e4m3fn:
         p_w_scale = p_w_scale + sorted_expert_id * (N // 128) * (K // 128)
     sorted_weights_offsets = sorted_id_offsets
