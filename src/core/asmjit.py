@@ -3397,6 +3397,30 @@ r'''
     def silu(self, vgpr_src):
         return self.gpr(self.sigmoid(vgpr_src) * vgpr_src)
 
+    def tanh(self, vgpr):
+        # choose exp(x) for x < 0 form to avoid overflow
+        sign_mask = self.get_sgpr_const(0x80000000)
+        vsign = self.gpr("vf32", (vgpr & sign_mask) | (1.0))
+        vexp = self.gpr("vf32")
+        vrcp = self.gpr("vf32")
+        # math.log2(math.e) = 1.4426950408889634
+        log2_e = 1.4426950408889634
+        self.v_exp_f32(vexp, (log2_e * (-2.0)) * vsign * vgpr)
+        self.v_rcp_f32(vrcp, 1.0 + vexp)
+        vtanh = self.gpr("vf32", (vsign - vsign * vexp) * vrcp)
+        return vtanh
+
+    def gelu(self, vgpr):
+        v3 = self.gpr("vf32")
+        self.v_mul_f32(v3, 0x3d372713, vgpr)  	# 0.044715 * xi
+        self.v_mul_f32(v3, vgpr, v3)			# 0.044715 * xi * xi
+        self.v_fma_f32(v3, vgpr, v3, vgpr)		# (0.044715 * xi * xi * xi + xi)
+        self.v_mul_f32(v3, 0x3f4c4229, v3)      # GELU_SCALING_FACTOR = 0.7978845 = sqrt(2/math.pi) 
+        vtanh = self.tanh(v3)
+        vgelu = self.gpr("vf32", vgpr * 0.5 * (1.0 + vtanh))
+        return vgelu
+
+
     def s_mul_u32_u64(self, a, b):
         """
         one way to look at positive & negative integer x in Two's complement binary form is:

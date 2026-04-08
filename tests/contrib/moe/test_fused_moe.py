@@ -215,6 +215,25 @@ def do_test_fmoe(
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     else:
+        # a4w4: mxfp4 V_MFMA_SCALE_F32_16X16X128_F8F6F4:
+        #       16x128 (MxK) input/weight => 16x4 1x32-e8m0-scales
+        #   each 4 e8m0 scales are interleaved & packed into a u32
+        #       2x2 16x128 => 2x2 16x4 => (2*16)x(2*4) e8m0-scales
+        """
+            m, n = scale.shape
+            scale_padded = torch.empty(
+                (m + 255) // 256 * 256,
+                (n + 7) // 8 * 8,
+                dtype=scale.dtype,
+                device=scale.device,
+            )
+            scale_padded[:m, :n] = scale
+            scale = scale_padded
+            sm, sn = scale.shape
+            scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
+            scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()   # sm//32, sn//8, [(4n,16m), (2n,2m)]
+            scale = scale.view(sm, sn)
+        """
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
@@ -528,6 +547,16 @@ if __name__ == "__main__":
         -p t    # True.""",
     )
 
+    parser.add_argument(
+        "--g1u1",
+        type=dtypes.str2bool,
+        nargs="?",
+        const=None,
+        default=True,
+        help="""Whether to use act(gate)*up or just act(up). Default is [False, True].
+        --g1u1 f    # False.
+        --g1u1 t    # True.""",
+    )
 
     #########################################################################################################################
     # the rest of code is copied from aiter/op_tests/test_moe_2stage.py
@@ -605,7 +634,7 @@ if __name__ == "__main__":
                         quant_type,
                         aq_dtype,
                         wq_dtype,
-                        use_g1u1=True,
+                        use_g1u1=args.g1u1,
                         doweight_stage1=doweight_stage1,
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
@@ -629,7 +658,7 @@ if __name__ == "__main__":
                         quant_type,
                         aq_dtype,
                         wq_dtype,
-                        use_g1u1=True,
+                        use_g1u1=args.g1u1,
                         doweight_stage1=doweight_stage1,
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
@@ -654,11 +683,12 @@ if __name__ == "__main__":
                             quant_type,
                             aq_dtype,
                             wq_dtype,
-                            use_g1u1=True,
+                            use_g1u1=args.g1u1,
                             doweight_stage1=doweight_stage1,
                             preshuffle=preshuffle,
                             hidden_pad=0,
                             intermediate_pad=0,
+                            diff_thr=None if args.diff < 0 else args.diff,
                         )
                         df.append(ret)
         else:
@@ -676,7 +706,7 @@ if __name__ == "__main__":
                             quant_type,
                             aq_dtype,
                             wq_dtype,
-                            use_g1u1=True,
+                            use_g1u1=args.g1u1,
                             doweight_stage1=doweight_stage1,
                             preshuffle=preshuffle,
                             diff_thr=None if args.diff < 0 else args.diff,

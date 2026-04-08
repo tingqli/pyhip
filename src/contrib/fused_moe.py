@@ -5,7 +5,7 @@ from aiter import dtypes
 import os
 import contextlib
 
-from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave
+from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave_g1u1
 from .moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
 try:
     SPLITK = int(os.getenv("USE_GLUON_SPLITK", "1"))
@@ -18,6 +18,10 @@ except:
     moe_2stage_splitk_down = None
 
 from .moe_gemm_down_tp import *
+
+from .fused_moe_gelu import fused_moe_gelu
+
+from .moe_gemm_ref import moe_gemm_ref
 
 USE_GLUON = int(os.getenv("USE_GLUON", "1"))
 VERBOSE = int(os.getenv("VERBOSE", "0"))
@@ -46,91 +50,6 @@ num_local_tokens:
 必须先有一个参考版本, 逐步替换为优化版本，在更小的修改粒度上保持正确性
 先实现bf16-8wave版本，降低复杂度，保证一些基本逻辑正确性
 """
-def de_shuffle_weight(weight, mfma_MN = 16):
-    M, K = weight.shape
-    K_bytes = K * weight.itemsize
-    sizeof_DW4 = 16
-    mfma_K_lanes = 64 // mfma_MN
-    mfma_K_L = sizeof_DW4//weight.itemsize
-    mfma_K = mfma_K_lanes * mfma_K_L 
-
-    assert M % mfma_MN == 0
-    mfma_K_bytes = mfma_K_lanes * sizeof_DW4
-    assert K_bytes % mfma_K_bytes == 0
-    #x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L)
-    #x = x.permute(0,2,3,1,4)
-
-    assert K % mfma_K == 0
-    weight = weight.reshape(M//mfma_MN, K//mfma_K, mfma_K_lanes, mfma_MN, mfma_K_L)
-    weight = weight.permute(0,3,1,2,4)
-    weight = weight.reshape(M, K).contiguous()
-    return weight
-
-def moe_gemm_ref(topk, block_m, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
-                 input, input_scale, weight, w_scale, output, is_gateup, is_shuffled):
-    #assert weight.dtype == torch.bfloat16
-    if is_gateup:
-        NUM_TOKENS, NUM_STATES = input.shape
-    else:
-        NUM_TOKENS, TOPK, NUM_STATES = input.shape
-    
-    NUM_EXPERTS, OC, IC = weight.shape
-    NUM_BLOCKS = sorted_expert_ids.shape[0]
-
-    weight_de_shuffle = weight.clone()
-    if is_shuffled:
-        for i in range(NUM_EXPERTS):
-            weight_de_shuffle[i, ...] = de_shuffle_weight(weight[i, ...])
-
-    if w_scale is not None:
-        # dequantize
-        weight_de_shuffle = weight_de_shuffle.view(NUM_EXPERTS, OC//128, 128, IC//128, 128).to(w_scale.dtype) * w_scale.view(NUM_EXPERTS, OC//128, 1, IC//128, 1)
-        weight_de_shuffle = weight_de_shuffle.view(NUM_EXPERTS, OC, IC)
-
-    if input_scale is not None:
-        # dequantize
-        # print(input_scale.dtype, input_scale.shape, NUM_TOKENS, NUM_STATES)
-        if is_gateup:
-            input = input.view(NUM_TOKENS, NUM_STATES//128, 128).to(input_scale.dtype) * input_scale.view(-1, NUM_TOKENS).t().contiguous().view(NUM_TOKENS, NUM_STATES//128, 1)
-            input = input.view(NUM_TOKENS, NUM_STATES)
-        else:
-            input = input.view(NUM_TOKENS*TOPK, NUM_STATES//128, 128).to(input_scale.dtype) * input_scale.view(NUM_STATES//128, NUM_TOKENS*TOPK).t().contiguous().view(NUM_TOKENS*TOPK, NUM_STATES//128, 1)
-            input = input.view(NUM_TOKENS, TOPK, NUM_STATES)
-
-    for e_idx in range(NUM_BLOCKS):
-        max_id = num_valid_ids[0]
-        if e_idx * block_m >= max_id:
-            break
-
-        s_e_id = sorted_expert_ids[e_idx]
-        i0 = e_idx*block_m
-        i1 = i0 + block_m
-
-        ids = sorted_ids[i0:i1].clone()
-        tok_ids = ids & 0xFFFFFF
-        tok_topk = ids >> 24
-
-        valid_mask = tok_topk < torch.tensor(topk)
-
-        expert_w = weight_de_shuffle[s_e_id, ...]
-        if is_gateup:
-            src = input[tok_ids[valid_mask],...]
-        else:
-            src = input[tok_ids[valid_mask], tok_topk[valid_mask], ...]
-
-        act = src.to(torch.float) @ expert_w.t().to(torch.float)
-
-        if is_gateup:
-            act_gate = act[:, :(OC//2)]
-            act_up = act[:,(OC//2):]
-            act = torch.nn.functional.silu(act_gate) * act_up
-            output[tok_ids[valid_mask], tok_topk[valid_mask], :] = act.to(output.dtype)
-        else:
-            tok_w = sorted_weights[i0:i1]
-            cur_out = act[...].to(output.dtype) * tok_w[valid_mask, None]
-            output[tok_ids[valid_mask], ...] += cur_out
-            #output[tok_ids[valid_mask], tok_topk[valid_mask], :] = cur_out.to(output.dtype)
-
 
 def moe_sorting_ref(topk_ids,       # [num_tokens, topk]
                     topk_weights,   # [num_tokens, topk]
@@ -232,6 +151,27 @@ def fused_moe(
     splitk=0,
     method="auto", # jit, gluon, auto
 ):
+    if activation == aiter.ActivationType.Gelu:
+        return fused_moe_gelu(hidden_states, w1, w2, topk_weight, topk_ids, 
+                                expert_mask = expert_mask,
+                                activation = activation,
+                                quant_type = quant_type,
+                                doweight_stage1 = doweight_stage1,
+                                w1_scale = w1_scale,
+                                w2_scale = w2_scale,
+                                a1_scale = a1_scale,
+                                a2_scale = a2_scale,
+                                block_size_M = block_size_M,
+                                num_local_tokens = num_local_tokens,
+                                moe_sorting_dispatch_policy = moe_sorting_dispatch_policy,
+                                dtype = dtype,
+                                hidden_pad = hidden_pad,
+                                intermediate_pad = intermediate_pad,
+                                bias1 = bias1,
+                                bias2 = bias2,
+                                splitk = splitk,
+                                method = method)
+
     device = hidden_states.device
     def get_inter_dim(w1_shape, w2_shape):
         E, _, model_dim = w1_shape
@@ -243,7 +183,7 @@ def fused_moe(
 
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    assert w1.shape[1] == inter_dim * 2
+    assert w1.shape[1] == inter_dim * 2 or w1.shape[1] == inter_dim
 
     """
     /sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py
@@ -331,13 +271,19 @@ def fused_moe(
         device=device,
     )
 
+    if quant_type == aiter.QuantType.per_128x128:
+        # 128x128 block-scale quant on weights, 1x128 per-token quant on act
+        act_quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x128)
+    else:
+        act_quant_func = aiter.get_hip_quant(quant_type)
 
     #moe_sorting = moe_sorting_ref
     moe_sorting = aiter.fused_moe.moe_sorting
 
     estimated_tokens_per_expert = token_num * topk / global_E
 
-    if method in ["gluon", "auto"] and estimated_tokens_per_expert < 32 and (
+    if method in ["gluon", "auto"] and \
+        estimated_tokens_per_expert < 32 and (
         quant_type == aiter.QuantType.No or
         # (wei_is_fp8(w1.dtype) and quant_type == aiter.QuantType.per_Token) or
         (wei_is_fp8(w1.dtype) and quant_type == aiter.QuantType.per_128x128)
@@ -424,15 +370,6 @@ def fused_moe(
         )
     debug_verbose_moe_sorting(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out, token_num, topk, block_size_M, estimated_tokens_per_expert)
 
-    def dummy_quant_func(input, scale, quant_dtype=None, num_rows = 0, num_rows_factor = 0, transpose_scale = False):
-        return input, None
-
-    if quant_type == aiter.QuantType.per_128x128:
-        act_quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x128)
-    else:
-        assert quant_type == aiter.QuantType.No
-        act_quant_func = dummy_quant_func
-
     a1, a1_scale = act_quant_func(
         hidden_states,
         scale=a1_scale,
@@ -465,7 +402,7 @@ def fused_moe(
     if do_perf:
         valid_e_blocks = num_valid_ids[0].item()//wg_M
     if 0:
-        moe_gemm_ref(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+        moe_gemm_ref(activation, quant_type, topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a1, a1_scale,
                 w1, w1_scale, a2, True, w1_is_shuffled)
     else:
@@ -479,7 +416,7 @@ def fused_moe(
         #print(sorted_expert_ids)
         #print(f"{num_oc_blocks=} {num_valid_ids[0].item()=} {valid_e_blocks=} / {num_e_blocks=} {inter_dim=}")
         with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name=f"moe_gemm_8wave_gateup"):
-            moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
+            moe_gemm_8wave_g1u1([num_oc_blocks, num_e_blocks], [8*64],
                     a1.element_size() * a1.numel() > (1<<32),
                     AB_dtype, wg_M, wg_N,
                     E, inter_dim*2, model_dim, 
@@ -491,7 +428,7 @@ def fused_moe(
                     w1.data_ptr(), None if w1_scale is None else w1_scale.data_ptr(),
                     a1.data_ptr(), None if a1_scale is None else a1_scale.data_ptr(),
                     a2.data_ptr(),
-                    token_num) # num_local_tokens.data_ptr() ?        
+                    token_num) # num_local_tokens.data_ptr() ?
 
     a2, a2_scale = act_quant_func(
         a2, #a2.view(token_num*topk, -1),
@@ -522,7 +459,7 @@ def fused_moe(
 
     #with pyhip.torchPerf("./xxx"):
     if 0:
-        moe_gemm_ref(topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
+        moe_gemm_ref(activation, quant_type, topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a2, a2_scale,
                 w2, w2_scale, moe_out, False, w2_is_shuffled)
     else:
@@ -554,7 +491,7 @@ def fused_moe(
                                 stage2_out.data_ptr(),
                                 token_num)
             else:
-                moe_gemm_8wave([num_oc_blocks, num_e_blocks], [8*64],
+                moe_gemm_8wave_g1u1([num_oc_blocks, num_e_blocks], [8*64],
                                 a2.element_size() * a2.numel() > (1<<32),
                                 AB_dtype, wg_M, wg_N,
                                 E, model_dim, inter_dim, 
