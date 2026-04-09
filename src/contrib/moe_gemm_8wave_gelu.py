@@ -38,7 +38,7 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
 
     assert not is_input_over_4GB
 
-    assert AB_dtype in ["bf16"]
+    assert AB_dtype in ["bf16", "s8"]
     C_dtype = "bf16"
 
     K = IC
@@ -96,11 +96,17 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
         w_scale[:] += J.div(OC//2, 32) * stride_scale32x256
         sbuff_b[1] = J.Buffer(w_scale, J.div(wg_N//4, 32) * stride_scale32x256)
         """
-        LOADER_TOPK = 0
+
         # B matrix needs to be interleaved by HALF_BLOCK_SIZE_COL
         # vm_load_b(k, m=0) loads from gate-weight
         # vm_load_b(k, m=1) loads from up-weight
-        buff_a = J.Buffer(input, num_tokens * stride_k)
+        # AB_dtype == "s8" means smooth-quant, input is also of shape [num_tokens, TOPK, dims]
+        if AB_dtype == "s8":
+            LOADER_TOPK = TOPK
+            buff_a = J.Buffer(input, num_tokens * TOPK * stride_k)
+        else:
+            LOADER_TOPK = 0        
+            buff_a = J.Buffer(input, num_tokens * stride_k)
         weight[:] += blk_n * (wg_N * stride_k) # gate-weight
         buff_b = J.Buffer(weight, wg_N * stride_k)
         stride_n = OC * J.sizeof(C_dtype)

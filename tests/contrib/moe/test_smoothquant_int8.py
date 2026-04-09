@@ -6,6 +6,8 @@ from aiter import ActivationType
 from aiter.jit.utils.chip_info import get_gfx
 from aiter import QuantType
 
+from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
+
 import pyhip
 
 pyhip.set_device()
@@ -195,17 +197,43 @@ def fused_moe_gelu_sqi8(
 
             output[tok_id, topk_id, :] = cur_out.to(output.dtype)
 
+    def moe_gemm_jit(output, input, pt_scale, weight, pc_scale, stage_index):
+        AB_dtype = "s8"
+        is_input_over_4GB = input.numel() * input.element_size() > (1<<32)
+        wg_M, wg_N = 256, 256
+        is_gate_up = (stage_index == 1)
+        bpreshuffle = False
+        num_tokens = input.shape[0]
+        num_oc_blocks = output.shape[-1] // wg_N
+        num_e_blocks = sorted_expert_ids.shape[0]
+        moe_gemm_8wave_gelu([num_oc_blocks, num_e_blocks],[8*64], is_input_over_4GB,
+                        AB_dtype, wg_M, wg_N,
+                        E, output.shape[-1], input.shape[-1], 
+                        is_gate_up, bpreshuffle, topk,
+                        sorted_ids.data_ptr(),
+                        sorted_weights.data_ptr(),
+                        sorted_expert_ids.data_ptr(),
+                        num_valid_ids.data_ptr(),
+                        weight.data_ptr(), pc_scale.data_ptr(),
+                        input.data_ptr(), pt_scale.data_ptr(),
+                        output.data_ptr(),
+                        num_tokens)
+
+    moe_gemm = moe_gemm_jit
+
     num_tokens, _ = hidden_states.shape
     a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
     a2_bf16 = torch.empty((num_tokens, topk, inter_dim), dtype=torch.bfloat16, device=device,)
 
-    moe_gemm_ref(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
+    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[  up]"):
+        moe_gemm(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
 
     a2, a2_scale = smoothquant_per_tok(a2_bf16, a2_smooth_scale, topk)
 
     stage2_out = torch.empty((num_tokens, topk, model_dim), dtype=torch.bfloat16, device=device)
 
-    moe_gemm_ref(stage2_out, a2, a2_scale, w2, w2_scale, 2)
+    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[down]"):
+        moe_gemm(stage2_out, a2, a2_scale, w2, w2_scale, 2)
 
     moe_out = stage2_out.sum(dim=1)
 
@@ -269,7 +297,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
                 fc1_smooth_scale,
                 fc2_smooth_scale,
                 num_verbose = 1,
-                num_iters = 1
+                num_iters = 4
             )
 
     ret_asm, dt_asm = pyhip.run_perftest(
