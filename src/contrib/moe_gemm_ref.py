@@ -28,6 +28,7 @@ def moe_gemm_ref(activation, quant_type, topk, block_m, sorted_ids, sorted_exper
     import torch
     import aiter
     assert quant_type in [aiter.QuantType.No, aiter.QuantType.per_128x128, aiter.QuantType.per_1x32]
+    from aiter.utility import fp4_utils
 
     #assert weight.dtype == torch.bfloat16
     if is_gateup:

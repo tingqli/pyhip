@@ -118,7 +118,11 @@ def calc_diff(x: "torch.Tensor", y: "torch.Tensor", diff_thr=None):
             M, N = x.shape
             for m in range(0,M,16):
                 dm = get_diff(x[m:m+16,:], y[m:m+16,:])
-                if dm >= diff_thr:
+                if dm != dm:
+                    print(x[m:m+16,:])
+                    print(y[m:m+16,:])
+                    assert 0
+                elif dm >= diff_thr:
                     print_count += 1
                     assert print_count < 16, f"Too many errors in calc_diff with {diff_thr=:.3f}"
                     print(f"[{m:6}]: ", end="")
@@ -141,7 +145,6 @@ def run_perftest(kernel, *args, **kwargs):
     global torch
     import torch
     import copy
-    perf = cudaPerf(verbose=False)
 
     def extract_attr(obj, name, default):
         nonlocal kwargs
@@ -151,6 +154,10 @@ def run_perftest(kernel, *args, **kwargs):
         else:
             attr = default
         return attr
+
+    num_verbose = extract_attr(kwargs, 'num_verbose', 0)
+    kernel_name = getattr(kernel, "__name__", "kernel?")
+    perf = cudaPerf(name = kernel_name, verbose=num_verbose)
 
     num_iters = extract_attr(kwargs, 'num_iters', 10)
     num_warmup = extract_attr(kwargs, 'num_warmup', 2)
@@ -185,7 +192,7 @@ def run_perftest(kernel, *args, **kwargs):
     dt = perf.dt(excludes=num_warmup)
 
     if num_flops or num_bytes:
-        msg = f"{kernel.__name__} {num_spec_tag} :  {dt*1e6:.0f} us"
+        msg = f"{kernel_name} {num_spec_tag} :  {dt*1e6:.0f} us"
         if num_flops:
             msg += f", {num_flops/dt*1e-12:.3f} TFLOPS"
         if num_bytes:

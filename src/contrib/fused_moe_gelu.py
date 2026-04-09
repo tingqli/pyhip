@@ -80,7 +80,7 @@ def fused_moe_gelu(
 
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    assert w1.shape[1] == inter_dim * 2 or w1.shape[1] == inter_dim
+    assert w1.shape[1] == inter_dim
 
     """
     /sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py
@@ -183,6 +183,7 @@ def fused_moe_gelu(
             quant_dtype=q_dtype_a,
             num_rows=num_local_tokens
         )
+        a1_scale = fp4_utils.moe_mxfp4_sort(a1_scale, sorted_ids=sorted_ids, num_valid_ids=num_valid_ids, token_num=token_num, block_size=block_size_M)
     else:
         a1, a1_scale = act_quant_func(
             hidden_states,
@@ -191,9 +192,6 @@ def fused_moe_gelu(
             num_rows=num_local_tokens,
             transpose_scale=True
         )
-
-    if quant_type == aiter.QuantType.per_1x32:
-        a1_scale = fp4_utils.moe_mxfp4_sort(a1_scale, sorted_ids=sorted_ids, num_valid_ids=num_valid_ids, token_num=token_num, block_size=block_size_M)
 
     do_perf = 0
 
@@ -204,7 +202,7 @@ def fused_moe_gelu(
     valid_e_blocks = num_valid_ids[0].item()//wg_M if do_perf else 0
     AB_dtype = "bf16"
 
-    if 0:
+    if quant_type == aiter.QuantType.per_1x32:
         moe_gemm_ref(activation, quant_type, topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                     a1, a1_scale, w1, w1_scale, a2, True, w1_is_shuffled)
     else:
@@ -247,7 +245,7 @@ def fused_moe_gelu(
     if quant_type == aiter.QuantType.per_1x32:
         a2_scale = fp4_utils.moe_mxfp4_sort(a2_scale[: token_num * topk, :].view(token_num, topk, -1), sorted_ids=sorted_ids, num_valid_ids=num_valid_ids, token_num=token_num,block_size=block_size_M,)
 
-    if 0:
+    if quant_type == aiter.QuantType.per_1x32:
         moe_gemm_ref(activation, quant_type, topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                     a2, a2_scale, w2, w2_scale, moe_out, False, w2_is_shuffled)
     else:

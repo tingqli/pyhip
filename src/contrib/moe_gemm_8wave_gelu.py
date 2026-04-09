@@ -36,6 +36,8 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
                    num_tokens:"uint"):
     num_warps = 8
 
+    assert not is_input_over_4GB
+
     assert AB_dtype in ["bf16"]
     C_dtype = "bf16"
 
@@ -58,7 +60,7 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
     J.debug_setup((blk_m[0] == 0) & (blk_n[0] == 0) & (J.warp_id[0] == 0))
     with J.If(blk_m[0] * wg_M >= max_id[0]):
         J.s_endpgm()
-    
+
     sorted_ids[:] += blk_m * (wg_M * J.sizeof_u32)
     sorted_weights[:] += blk_m * (wg_M * J.sizeof_u32)
 
@@ -76,6 +78,8 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
     HALF_BLOCK_SIZE_COL = J.div(BLOCK_SIZE_COL, 2)
     MINI_BLOCK_M = J.div(HALF_BLOCK_SIZE_ROW, WARPS_ROW) # 64
     MINI_BLOCK_N = J.div(HALF_BLOCK_SIZE_COL, WARPS_COL) # 32
+
+    # expert_id[0] = 0
 
     offset_64bit = J.gpr(2,"su32")
     J.s_mul_hi_u32(offset_64bit[1], expert_id, (OC * stride_k))
@@ -138,6 +142,16 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
     # prefetch sorted ids into LDS
     lds_sorted_ids = J.alloc_lds(wg_M * J.sizeof_u32)
     lds_sorted_weights = J.alloc_lds(wg_M * J.sizeof_DW)
+    if AB_dtype == "s8":
+        # load weight per-OC scales into LDS
+        lds_pc_scales = J.alloc_lds(wg_N * J.sizeof_DW)
+        pScaleB[:] += (expert_id * OC  + blk_n * wg_N) * J.sizeof_DW
+        J.wg_load_lds(lds_pc_scales, pScaleB, wg_N * J.sizeof_DW, num_warps = num_warps, wait_barrier = False)
+
+        lds_pt_scales = J.alloc_lds(wg_M * J.sizeof_DW)
+        pScaleA[:] += blk_m * (wg_M * J.sizeof_DW)
+        J.wg_load_lds(lds_pt_scales, pScaleA, wg_M * J.sizeof_DW, num_warps = num_warps, wait_barrier = False)
+
     if gate_up:
         J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
     else:
@@ -161,6 +175,14 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
                 for m in range(nrM):
                     for n in range(nrN):
                         J.v_mfma_f32_16x16x32_bf16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
+                        yield 16
+    elif AB_dtype == "s8":
+        def mfma(c_index):
+            b_index = c_index % 2
+            for k in range(2):
+                for m in range(nrM):
+                    for n in range(nrN):
+                        J.v_mfma_i32_16x16x64_i8(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
                         yield 16
     else:
         assert AB_dtype == "fp16" or AB_dtype == "f16" 
@@ -353,6 +375,49 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
 
         J.s_waitcnt(mod="lgkmcnt(0)")
         J.s_waitcnt(mod="vmcnt(0)")
+
+
+    if AB_dtype == "s8":
+        # PTPC dequantize : mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")
+        # scales are loaded into LDS lds_pt_scales/lds_pc_scales, load them from LDS is fast & flexible
+        for cindex in range(4):
+            cm = cindex // 2
+            cn = cindex % 2
+            # issue load scales
+            scale_pt = J.gpr(nrM, "vf32")
+            scale_pc = J.gpr(nrN, 4, "vf32")
+
+            ds_vaddr = (J.lane_id % 16 + cm * HALF_BLOCK_SIZE_ROW + warp_m * MINI_BLOCK_M) * J.sizeof_DW + lds_pt_scales
+            for m in range(nrM):
+                J.ds_read_b32(scale_pt[m], ds_vaddr, mod=f"offset:{m*16*J.sizeof_DW}")
+
+            ds_vaddr = (J.lane_id // 16) * J.sizeof_DW4 + (cn * HALF_BLOCK_SIZE_COL + warp_n * MINI_BLOCK_N)* J.sizeof_DW + lds_pc_scales
+            for n in range(nrN):
+                J.ds_read_b128(scale_pc[n], ds_vaddr, mod=f"offset:{n*16*J.sizeof_DW}")
+
+            for m in range(nrM):
+                for n in range(nrN):
+                    J.v_cvt_f32_i32(mfma_C[cindex,m,n,0], mfma_C[cindex,m,n,0])
+                    J.v_cvt_f32_i32(mfma_C[cindex,m,n,1], mfma_C[cindex,m,n,1])
+                    J.v_cvt_f32_i32(mfma_C[cindex,m,n,2], mfma_C[cindex,m,n,2])
+                    J.v_cvt_f32_i32(mfma_C[cindex,m,n,3], mfma_C[cindex,m,n,3])
+
+            J.s_waitcnt(mod="lgkmcnt(0)")
+
+            # dequant
+            scale_ptpc = J.gpr(nrN, 4, "vf32")
+            for m in range(nrM):
+                for n in range(nrN):
+                    scale_ptpc[n, 0] = scale_pt[m] * scale_pc[n, 0]
+                    scale_ptpc[n, 1] = scale_pt[m] * scale_pc[n, 1]
+                    scale_ptpc[n, 2] = scale_pt[m] * scale_pc[n, 2]
+                    scale_ptpc[n, 3] = scale_pt[m] * scale_pc[n, 3]
+
+                for n in range(nrN):
+                    mfma_C[cindex,m,n,0] *= scale_ptpc[n, 0]
+                    mfma_C[cindex,m,n,1] *= scale_ptpc[n, 1]
+                    mfma_C[cindex,m,n,2] *= scale_ptpc[n, 2]
+                    mfma_C[cindex,m,n,3] *= scale_ptpc[n, 3]
 
     if gate_up:
         # gelu(c[0]) gelu(c[1])   64*32
