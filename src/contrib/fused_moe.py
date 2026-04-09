@@ -13,6 +13,7 @@ try:
         from .gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_down
     else:
         from .gluon.moe_gemm import moe_2stage_gateup as moe_2stage_splitk_gateup, moe_2stage_down as moe_2stage_splitk_down
+    from .gluon.moe_gemm_4wave import moe_2stage_gateup as moe_2stage_gateup_4w, moe_2stage_down as moe_2stage_down_4w
 except:
     moe_2stage_splitk_gateup = None
     moe_2stage_splitk_down = None
@@ -24,6 +25,7 @@ from .fused_moe_gelu import fused_moe_gelu
 from .moe_gemm_ref import moe_gemm_ref
 
 USE_GLUON = int(os.getenv("USE_GLUON", "1"))
+USE_GLUON2 = int(os.getenv("USE_GLUON2", "0"))
 VERBOSE = int(os.getenv("VERBOSE", "0"))
 
 __all__ = [
@@ -416,19 +418,32 @@ def fused_moe(
         #print(sorted_expert_ids)
         #print(f"{num_oc_blocks=} {num_valid_ids[0].item()=} {valid_e_blocks=} / {num_e_blocks=} {inter_dim=}")
         with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name=f"moe_gemm_8wave_gateup"):
-            moe_gemm_8wave_g1u1([num_oc_blocks, num_e_blocks], [8*64],
-                    a1.element_size() * a1.numel() > (1<<32),
-                    AB_dtype, wg_M, wg_N,
-                    E, inter_dim*2, model_dim, 
-                    True, w1_is_shuffled, topk,
-                    sorted_ids.data_ptr(),
-                    sorted_weights.data_ptr(),
-                    sorted_expert_ids.data_ptr(),
-                    num_valid_ids.data_ptr(),
-                    w1.data_ptr(), None if w1_scale is None else w1_scale.data_ptr(),
-                    a1.data_ptr(), None if a1_scale is None else a1_scale.data_ptr(),
-                    a2.data_ptr(),
-                    token_num) # num_local_tokens.data_ptr() ?
+            if USE_GLUON2:
+                BLOCK_TILE_SIZE_M = block_size_M
+                BLOCK_TILE_SIZE_N = block_size_N
+                grid = sorted_expert_ids.shape[0]
+                B = token_num
+                N1, K1 = inter_dim * 2, model_dim
+                N2, K2 = model_dim, inter_dim
+                if B * topk <= E:
+                    grid = B * topk
+                moe_2stage_gateup_4w[(N1 // BLOCK_TILE_SIZE_N, grid)](
+                                    hidden_states, w1, a2, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w1_scale[0] if w1_scale is not None else None, B,
+                                    w1.dtype, topk, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
+            else:
+                moe_gemm_8wave_g1u1([num_oc_blocks, num_e_blocks], [8*64],
+                        a1.element_size() * a1.numel() > (1<<32),
+                        AB_dtype, wg_M, wg_N,
+                        E, inter_dim*2, model_dim, 
+                        True, w1_is_shuffled, topk,
+                        sorted_ids.data_ptr(),
+                        sorted_weights.data_ptr(),
+                        sorted_expert_ids.data_ptr(),
+                        num_valid_ids.data_ptr(),
+                        w1.data_ptr(), None if w1_scale is None else w1_scale.data_ptr(),
+                        a1.data_ptr(), None if a1_scale is None else a1_scale.data_ptr(),
+                        a2.data_ptr(),
+                        token_num) # num_local_tokens.data_ptr() ?
 
     a2, a2_scale = act_quant_func(
         a2, #a2.view(token_num*topk, -1),
@@ -491,19 +506,32 @@ def fused_moe(
                                 stage2_out.data_ptr(),
                                 token_num)
             else:
-                moe_gemm_8wave_g1u1([num_oc_blocks, num_e_blocks], [8*64],
-                                a2.element_size() * a2.numel() > (1<<32),
-                                AB_dtype, wg_M, wg_N,
-                                E, model_dim, inter_dim, 
-                                False, w2_is_shuffled, topk,
-                                sorted_ids.data_ptr(),
-                                sorted_weights.data_ptr(),
-                                sorted_expert_ids.data_ptr(),
-                                num_valid_ids.data_ptr(),
-                                w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
-                                a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
-                                stage2_out.data_ptr(),
-                                token_num) # num_local_tokens.data_ptr() ?
+                if USE_GLUON2:
+                    BLOCK_TILE_SIZE_M = block_size_M
+                    BLOCK_TILE_SIZE_N = block_size_N
+                    grid = sorted_expert_ids.shape[0]
+                    B = token_num
+                    N1, K1 = inter_dim * 2, model_dim
+                    N2, K2 = model_dim, inter_dim
+                    if B * topk <= E:
+                        grid = B * topk
+                    moe_2stage_down_4w[(N2 // BLOCK_TILE_SIZE_N, grid)](
+                                        a2, w2, stage2_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w2_scale[0] if w2_scale is not None else None, B,
+                                        w1.dtype, topk, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
+                else:
+                    moe_gemm_8wave_g1u1([num_oc_blocks, num_e_blocks], [8*64],
+                                    a2.element_size() * a2.numel() > (1<<32),
+                                    AB_dtype, wg_M, wg_N,
+                                    E, model_dim, inter_dim, 
+                                    False, w2_is_shuffled, topk,
+                                    sorted_ids.data_ptr(),
+                                    sorted_weights.data_ptr(),
+                                    sorted_expert_ids.data_ptr(),
+                                    num_valid_ids.data_ptr(),
+                                    w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
+                                    a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
+                                    stage2_out.data_ptr(),
+                                    token_num) # num_local_tokens.data_ptr() ?
 
         if 1:
             moe_out = stage2_out.sum(dim=1)
