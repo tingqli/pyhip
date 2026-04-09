@@ -9,10 +9,36 @@ from aiter import QuantType
 from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
 
 import pyhip
+import os
 
 pyhip.set_device()
 
 device = "cuda"
+
+BLOCK_SIZE_M = 256
+ROW_PER_BLOCK = 4
+TOPK = 20
+NUM_THREADS = 64
+DEBUG = True
+current_dir = os.path.dirname(os.path.abspath(__file__))
+hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{NUM_THREADS=}")
+quant = hip.quant
+
+def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True):
+    device = x.device
+    DEBUG = True
+    if DEBUG:
+        x_quant = torch.ones((M, topk, model_dim), dtype=torch.int8, device=device)
+        x_quant_scale = torch.ones([sorted_ids.shape[0]], dtype=torch.float32, device=device)
+    else:
+        x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
+        x_quant_scale = torch.empty([sorted_ids.shape[0]], dtype=torch.float32, device=device)
+    quant([sorted_expert_ids.shape[0], BLOCK_SIZE_M // ROW_PER_BLOCK], [64], 
+           x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
+           sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+           M, model_dim, 1 if is_gemm1 else 0
+           )
+    return x_quant, x_quant_scale
 
 def smooth_quant_w(weight,         # [num_experts, OC, IC]
                    smooth_scale,   # [num_experts, IC]
@@ -222,13 +248,19 @@ def fused_moe_gelu_sqi8(
     moe_gemm = moe_gemm_jit
 
     num_tokens, _ = hidden_states.shape
-    a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
+    if 1:
+        a1, a1_scale = quant_act(hidden_states, topk, hidden_states.shape[0], hidden_states.shape[1], a1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True)
+    else:
+        a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
     a2_bf16 = torch.empty((num_tokens, topk, inter_dim), dtype=torch.bfloat16, device=device,)
 
     with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[  up]"):
         moe_gemm(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
 
-    a2, a2_scale = smoothquant_per_tok(a2_bf16, a2_smooth_scale, topk)
+    if 1:
+        a2, a2_scale = quant_act(a2_bf16, topk, a2_bf16.shape[0], a2_bf16.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False)
+    else:
+        a2, a2_scale = smoothquant_per_tok(a2_bf16, a2_smooth_scale, topk)
 
     stage2_out = torch.empty((num_tokens, topk, model_dim), dtype=torch.bfloat16, device=device)
 
