@@ -121,50 +121,60 @@ def fused_moe_gelu_sqi8(
     )
 
     # quantize hidden_states in sorted_ids [tok_topk]
-    print(sorted_ids.shape)
+    # print(sorted_ids.dtype, sorted_ids.shape)
 
     def smoothquant_per_tok(x, x_smooth_scale, topk):
-        print(x_smooth_scale.shape)
+        # print(x_smooth_scale.shape, num_valid_ids)
         num_tokens = x.shape[0]
         dims = x.shape[-1]
         quant_x = torch.empty([num_tokens, topk, dims], dtype=torch.int8)
-        pt_scales = torch.empty([len(sorted_ids)], dtype=torch.float32)
+        pt_scales = torch.zeros([len(sorted_ids)], dtype=torch.float32)
         for eblock_i, expert_id in enumerate(sorted_expert_ids):
-            if expert_id >= E or expert_id < 0: break
             i0 = eblock_i * block_size_M
             i1 = i0 + block_size_M
 
+            if i0 >= num_valid_ids[0]: break
+            if expert_id >= E or expert_id < 0: break
+
             ids = sorted_ids[i0:i1]
-            topk_id = ids >> 24
-            ids = ids[topk_id < topk]
+            ids = ids[((ids >> 24) & 0xFF) < topk]
+
             cur_num_toks = len(ids)
 
             tok_id = ids & 0xFFFFFF
-            topk_id = ids >> 24
+            topk_id = (ids >> 24 & 0xFF)
+
             if x.ndim == 3:
                 tok_states = x[tok_id, topk_id, :]
             else:
                 tok_states = x[tok_id, :]
-            
-            tok_states = tok_states * x_smooth_scale[expert_id, 0, :]
-            pts = torch.maximum(tok_states.abs().max(dim=1, keepdim=True)[0] / 128, torch.tensor(0.00001))
-            quant_x[tok_id, topk_id, :] = (tok_states / pts).round().clamp(-128, 127).to(quant_x.dtype)
+
+            # [cur_num_toks, dims] * [expert, 1, dims]
+            tok_states = tok_states * x_smooth_scale[expert_id, 0:1, :] 
+            pts = torch.maximum(tok_states.abs().max(dim=1, keepdim=True)[0] / 128, torch.tensor(0.0000001))
+            quant_x[tok_id, topk_id, :] = (tok_states / pts).round().clamp(-128, 127).to(torch.int8)
+
             pt_scales[i0:i0+cur_num_toks] = pts.view(-1)
+
         return quant_x, pt_scales
 
-    def moe_gemm_ref(output, input, pt_scale, weight, pc_scale, do_gelu):
+
+    def moe_gemm_ref(output, input, pt_scale, weight, pc_scale, stage_index):
+        assert input.ndim == 3
         for eblock_i, expert_id in enumerate(sorted_expert_ids):
-            if expert_id >= E or expert_id < 0: break
             i0 = eblock_i * block_size_M
             i1 = i0 + block_size_M
             ids = sorted_ids[i0:i1]
-            topk_id = ids >> 24
-            ids = ids[topk_id < topk]
+            if i0 >= num_valid_ids[0]: break
+            if expert_id >= E or expert_id < 0: break
+
+            ids = ids[((ids >> 24) & 0xFF) < topk]
             cur_num_toks = len(ids)
-            if input.ndim == 3:
-                cur_input = input[ids & 0xFFFFFF, ids >> 24, :]
-            else:
-                cur_input = input[ids & 0xFFFFFF, :]
+
+            tok_id = ids & 0xFFFFFF
+            topk_id = (ids >> 24 & 0xFF)
+
+            cur_input = input[tok_id, topk_id, :]
             cur_weight = weight[expert_id,...]
 
             cur_out = cur_input.to(torch.float32) @ cur_weight.to(torch.float32).t()
@@ -174,25 +184,28 @@ def fused_moe_gelu_sqi8(
                 print(cur_out.shape)
                 print(pt_scale[i0:(i0+cur_num_toks), None].shape)
                 print(pc_scale[expert_id, None, :, 0].shape)
+                assert 0
 
             cur_out = cur_out * pt_scale[i0:(i0+cur_num_toks), None] * pc_scale[expert_id, None, :, 0]
 
-            if do_gelu: cur_out = torch.nn.functional.gelu(cur_out)
+            if stage_index == 1:
+                cur_out = torch.nn.functional.gelu(cur_out)
+            else:
+                cur_out = cur_out * sorted_weights[i0:i0+cur_num_toks, None]
 
-            output[ids & 0xFFFFFF, ids >> 24, :] = cur_out.to(output.dtype)
+            output[tok_id, topk_id, :] = cur_out.to(output.dtype)
 
     num_tokens, _ = hidden_states.shape
     a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
-
     a2_bf16 = torch.empty((num_tokens, topk, inter_dim), dtype=torch.bfloat16, device=device,)
 
-    moe_gemm_ref(a2_bf16, a1, a1_scale, w1, w1_scale, True)
+    moe_gemm_ref(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
 
     a2, a2_scale = smoothquant_per_tok(a2_bf16, a2_smooth_scale, topk)
 
     stage2_out = torch.empty((num_tokens, topk, model_dim), dtype=torch.bfloat16, device=device)
 
-    moe_gemm_ref(stage2_out, a2, a2_scale, w2, w2_scale, False)
+    moe_gemm_ref(stage2_out, a2, a2_scale, w2, w2_scale, 2)
 
     moe_out = stage2_out.sum(dim=1)
 
@@ -211,9 +224,14 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
     w1,fc1_scale = smooth_quant_w(w1_f32, fc1_smooth_scale)
     w2,fc2_scale = smooth_quant_w(w2_f32, fc2_smooth_scale)
 
-    x1 = torch.randn(num_tokens, topk, dtype=torch.float32, device=device)
+    router_weights = torch.randn(num_tokens, num_experts, dtype=torch.float32)
+    ret_topk = torch.topk(router_weights, topk)
+    x1 = ret_topk.values.to(torch.float32)
+    x2 = ret_topk.indices.to(torch.int32)
+    
+    #x1 = torch.randn(num_tokens, topk, dtype=torch.float32, device=device)
     # x2 = torch.load("/data02/leifanding.lfd/seedance-v2-amd/tests/inference/topk_ids.pt", weights_only=False) # torch.Size([seq_len, 20]), torch.int32
-    x2 = torch.randint(low=0, high=num_experts, size=(num_tokens, topk), dtype=torch.int32) # torch.Size([seq_len, 20]), torch.int32
+    #x2 = torch.topk(x1, low=0, high=num_experts, size=(num_tokens, topk), dtype=torch.int32) # torch.Size([seq_len, 20]), torch.int32
 
     # fused_moe(
     #     # hidden_states=x0.to(torch.int8),
@@ -279,8 +297,8 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
     print(f"{pyhip.calc_diff(ref0, ret_asm)=:.6f}")
     if ret_jit is not None:
         print(f"{pyhip.calc_diff(ref0, ret_jit)=:.6f}")
+        print(f"{pyhip.calc_diff(ref2, ret_jit, 0.01)=:.6f}")
 
 
 if __name__ == "__main__":
-    #test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
-    test_fmoe_sqi8(num_tokens = 40, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
+    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
