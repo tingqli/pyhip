@@ -13,7 +13,7 @@ from pyhip.contrib.conv_pointwise import *
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.manual_seed(0)
 
-def benchmark_op(op_func, op_name, iters, gflops, device):
+def benchmark_op(op_func, op_name, iters, gflops, device, mem_bytes=None):
     print(f"\n正在进行 {op_name} 预热/Tune...")
     
     # 统计预热/Tune 耗时
@@ -41,9 +41,15 @@ def benchmark_op(op_func, op_name, iters, gflops, device):
     end_time = time.time()
     
     avg_time_ms = (end_time - start_time) / iters * 1000
+
     tflops = (gflops / 1000.0) / (avg_time_ms / 1000.0) if avg_time_ms > 0 else 0
-    
-    return avg_time_ms, tflops, warmup_time_ms
+
+    if mem_bytes is not None and avg_time_ms > 0:
+        gbps = (mem_bytes / 1e9) / (avg_time_ms / 1000.0)
+    else:
+        gbps = float("nan")
+
+    return avg_time_ms, tflops, warmup_time_ms, gbps
 
 def test_conv3d_benchmark(args):
     # 1. 准备数据
@@ -110,6 +116,11 @@ def test_conv3d_benchmark(args):
     W_out = (W + 2 * padding[2] - dilation[2] * (kernel_size[2] - 1) - 1) // stride[2] + 1
     print(f"输出尺寸: [{B}, {C_out}, {D_out}, {H_out}, {W_out}]")
 
+    # 读 input、weight、bias，写 output
+    mem_bytes = (
+        input_tensor.numel() + weight_tensor.numel() + B * C_out * D_out * H_out * W_out + bias_tensor.numel()
+    ) * input_tensor.element_size()
+
     # 计算量 (GFLOPs)
     gflops = (2.0 * B * C_out * D_out * H_out * W_out * (C_in // groups) * kernel_size[0] * kernel_size[1] * kernel_size[2]) / 1e9
     print(f"理论计算量: {gflops:.4f} GFLOPs")
@@ -149,12 +160,15 @@ def test_conv3d_benchmark(args):
                               use_gluon=False)
 
     # 2. 运行 Benchmark
-    torch_ms, torch_tflops, torch_warmup_ms = benchmark_op(run_torch_conv3d, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device)
+    torch_ms, torch_tflops, torch_warmup_ms, torch_gbps = benchmark_op(
+        run_torch_conv3d, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device, mem_bytes
+    )
     # 3. 汇总对比
     print(f"\n--- 性能对比汇总 ({args.shape}) ---")
-    print(f"{'方法':<35} | {'平均耗时 (ms)':<15} | {'吞吐量 (TFLOPS)':<15} | {'预热/Tune (ms)':<15}")
-    print("-" * 90)
-    print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_warmup_ms:>15.2f}")
+    hdr = f"{'方法':<35} | {'平均耗时 (ms)':<15} | {'吞吐量 (TFLOPS)':<15} | {'带宽 (GB/s)':<15} | {'预热/Tune (ms)':<15}"
+    print(hdr)
+    print("-" * len(hdr))
+    print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_gbps:>15.2f} | {torch_warmup_ms:>15.2f}")
 
     run_conv = run_torch_conv3d
     if args.shape == "case3":
@@ -184,10 +198,14 @@ def test_conv3d_benchmark(args):
                                 assert 0
             check()
 
-        opt_ms, opt_tflops, opt_warmup_ms = benchmark_op(run_conv, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device)
-        print(f"{'方法':<35} | {'平均耗时 (ms)':<15} | {'吞吐量 (TFLOPS)':<15} | {'预热/Tune (ms)':<15}")
-        print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_warmup_ms:>15.2f}")
-        print(f"{run_conv.__name__:<35} | {opt_ms:>15.4f} | {opt_tflops:>15.2f} | {opt_warmup_ms:>15.2f} | {all_diff:.6f}")
+        opt_ms, opt_tflops, opt_warmup_ms, opt_gbps = benchmark_op(
+            run_conv, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device, mem_bytes
+        )
+        print(hdr)
+        print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_gbps:>15.2f} | {torch_warmup_ms:>15.2f}")
+        print(
+            f"{run_conv.__name__:<35} | {opt_ms:>15.4f} | {opt_tflops:>15.2f} | {opt_gbps:>15.2f} | {opt_warmup_ms:>15.2f} | max_diff={all_diff:.6f}"
+        )
 
 
     # 4. Profile (可选)
