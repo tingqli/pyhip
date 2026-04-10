@@ -6,13 +6,14 @@ from functools import cache
 from pyhip.contrib.gluon.fused_mlp import mlp_fused_gate_up
 
 #####################################################################
-from pyhip import cudaPerf
+from pyhip import cudaPerf, calc_diff
 from common.utils import gen_timing
 from torch import Tensor
 import pytest
 
 # bf16 support no shuffle, but performance is worse than shuffled
 SHUFFLE = 1
+PROFILE = 0
 def div_up(x, y):
     return (x + y - 1) // y
 def _run_aiter(
@@ -62,7 +63,19 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         w = [w_shuffled.clone() for _ in range(BUF_COPY)]
         w_scale = [None] * BUF_COPY
         w_ref = w_
-
+    elif weight_type == torch.float8_e4m3fn:
+        w_qt = torch.randint(-2, 4, [INTER_SIZE*2, HIDDEN_SIZE], dtype=torch.float32).to(weight_type)
+        w_qt_scale = torch.randint(-2, 3, [INTER_SIZE*2 // 128, HIDDEN_SIZE // 128], dtype=torch.float32) / 5.0
+        # # TODO
+        # w_qt_scale[:] = 1
+        w_f32 = w_qt.to(dtype=torch.float32).reshape(INTER_SIZE*2 // 128, 128, HIDDEN_SIZE // 128, 128)
+        w_scale_f32 = w_qt_scale.reshape(INTER_SIZE*2 // 128, 1, HIDDEN_SIZE // 128, 1)
+        w_ref = (w_f32 * w_scale_f32).reshape(INTER_SIZE*2, HIDDEN_SIZE).to(dtype=torch.bfloat16)
+        if SHUFFLE:
+            w = [shuffle_weight(w_qt) for _ in range(BUF_COPY)]
+        else:
+            w = [w_qt.clone() for _ in range(BUF_COPY)]
+        w_scale = [w_qt_scale.clone() for _ in range(BUF_COPY)]
     else:
         assert 0, f'Only fp4 weight is supported in this test, current weight_type={weight_type}'
 
@@ -97,8 +110,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 BLOCK_TILE_SIZE_N,
                 p_debug_buf,
                 SHUFFLE,
-                enable_debug=False,
-                # enable_debug=p_debug_buf is not None,
+                enable_debug = (p_debug_buf is not None and PROFILE),
                 num_warps=num_warps
                 )
             # print(x.asm['amdgcn'])
@@ -141,15 +153,18 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             with cudaPerf(flops, mem_size, name=f"D{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
                 run(A=A[i], weight=w[i], weight_scale=w_scale[i], p_debug_buf=p_debug_buf)
             i = (i + 1) % BUF_COPY
-        # gen_timing(p_debug_buf, TILE_N * HIDDEN_SIZE * 2, TILE_N * HIDDEN_SIZE * TILE_M * 2)
-        if not torch.allclose(ref_out, cur_out, rtol=0.1, atol=0.03):
-            print(cur_out)
+        if PROFILE:
+            gen_timing(p_debug_buf, TILE_N * HIDDEN_SIZE * 2, TILE_N * HIDDEN_SIZE * TILE_M * 2)
+            
+            
+        diff = calc_diff(ref_out, cur_out)
+        if diff > 0.001:
             idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
             if len(idx[0]):
                 print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
             assert 0, f"{kernel_type=}, {M=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=}"
         else:
-            print(f"{kernel_type}[{M=} {weight_type=}] acc OK")
+            print(f"{kernel_type}[{M=} {weight_type=}] acc OK {diff=}")
     if run_count > 0:
         return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
                 'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
@@ -184,14 +199,14 @@ def init_env():
 
 def test_acc(TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024):
     init_env()
-    M = list(range(1, 64))
+    M = list(range(1, 16))
     # fix TILE_M=16, TILE_N=32
     M += list(range(128, 256))
     M += [i * 256 for i in range(1, 4)]
     M += [i * 2048 for i in range(1, 5)]
     M += list(range(2048 * 3, 2048 * 3 + 256))
     # TILE_M/N is configurable
-    entry_common('mxn_splitk_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, run_count=0)
+    entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, run_count=0)
 
 def show_perf(perf, dict_tile_mn):
     print('\nsummary:')
@@ -205,14 +220,14 @@ def show_perf(perf, dict_tile_mn):
                     print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
 
 @pytest.mark.parametrize("M", [[1, 2, 4, 8, 12, 16, 32, 64]])
-def test_perf(M, TILE_M=16, TILE_N=64, N=4096, K=4096):
+def test_perf(M, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024):
     init_env()
     perf = {}
     #perf.update(entry_common('aiter', M, prec=[torch.bfloat16], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
     # TILE_M/N is configurable
     # perf.update(entry_common('mxn_splitk_2s', M=M, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     # perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    perf.update(entry_common('mxn_splitk_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE))
     return perf
 
 def merge(a: dict, b: dict, path=[]):
@@ -229,15 +244,16 @@ def merge(a: dict, b: dict, path=[]):
 if __name__ == '__main__':
     TP = 1
     HIDDEN_SIZE = 4096
-    INTER_SIZE = 4096 // TP
+    INTER_SIZE = 1024 // 4
 
-    Ms = [16]
+    Ms = [16, 32, 64,128]
     perf = {}
     dict_tile_mn = {}
 
     def get_tile_mn(M):
         num_CU = torch.cuda.get_device_properties().multi_processor_count
         solutions = []
+        N = INTER_SIZE *2
         for tile_m in [16, 32, 64]:
             for tile_n in [64, 128]:
                 works = div_up(M, tile_m) * div_up(N, tile_n)
@@ -252,26 +268,14 @@ if __name__ == '__main__':
         TILE_M, TILE_N = sorted(solutions)[0][2:]
         return TILE_M, TILE_N
 
-    # TILE_M, TILE_N = get_tile_mn(64)
-    
     TILE_M = 16
     TILE_N = 128
-    for M in Ms:
-        # TILE_M, TILE_N = get_tile_mn(M)
-        # if N == 9216 and K == 4096:
-        #     if M in [16]:
-        #         TILE_M = 16
-        #         TILE_N = 64
-        #     elif M in [32]:
-        #         TILE_M = 32
-        #         TILE_N = 64
-        #     elif M in [64, 128]:
-        #         TILE_M = 32
-        #         TILE_N = 128
-        test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE)
+    test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE)
 
-        # print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
-        # dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
-        # #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
-        # perf = merge(perf, test_perf([M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    # for M  in Ms:
+    #     TILE_M, TILE_N = get_tile_mn(M)
+    #     print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
+    #     dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
+    #     #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
+    #     perf = merge(perf, test_perf([M], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE))
     # show_perf(perf, dict_tile_mn)
