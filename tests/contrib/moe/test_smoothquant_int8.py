@@ -239,7 +239,7 @@ def fused_moe_gelu_sqi8(
         num_tokens = input.shape[0]
         num_oc_blocks = output.shape[-1] // wg_N
         num_e_blocks = sorted_expert_ids.shape[0]
-        moe_gemm_8wave_gelu([num_oc_blocks, num_e_blocks],[8*64], is_input_over_4GB,
+        moe_gemm_8wave_gelu([num_oc_blocks * num_e_blocks],[8*64], is_input_over_4GB,
                         AB_dtype, wg_M, wg_N,
                         E, output.shape[-1], input.shape[-1], 
                         is_gate_up, bpreshuffle, topk,
@@ -250,35 +250,30 @@ def fused_moe_gelu_sqi8(
                         weight.data_ptr(), pc_scale.data_ptr(),
                         input.data_ptr(), pt_scale.data_ptr(),
                         output.data_ptr(),
-                        num_tokens)
+                        num_tokens, num_oc_blocks * num_e_blocks)
 
     moe_gemm = moe_gemm_jit
 
     num_tokens, _ = hidden_states.shape
-    if 1:
-        a1, a1_scale = quant_act(hidden_states, topk, hidden_states.shape[0], hidden_states.shape[1], a1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True)
-    else:
-        a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
+    with pyhip.cudaPerf(name=f"quant_act_up"):
+        if 1:
+            a1, a1_scale = quant_act(hidden_states, topk, hidden_states.shape[0], hidden_states.shape[1], a1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True)
+        else:
+            a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
     a2_bf16 = torch.empty((num_tokens, topk, inter_dim), dtype=torch.bfloat16, device=device,)
 
-    DEBUG = False
-    if DEBUG:
-        with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[  up]"):
-            moe_gemm(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
-    else:
+    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[  up]"):
         moe_gemm(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
 
-    if 1:
-        a2, a2_scale = quant_act(a2_bf16, topk, a2_bf16.shape[0], a2_bf16.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False)
-    else:
-        a2, a2_scale = smoothquant_per_tok(a2_bf16, a2_smooth_scale, topk)
+    with pyhip.cudaPerf(name=f"quant_act_down"):
+        if 1:
+            a2, a2_scale = quant_act(a2_bf16, topk, a2_bf16.shape[0], a2_bf16.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False)
+        else:
+            a2, a2_scale = smoothquant_per_tok(a2_bf16, a2_smooth_scale, topk)
 
     stage2_out = torch.empty((num_tokens, topk, model_dim), dtype=torch.bfloat16, device=device)
 
-    if DEBUG:
-        with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[down]"):
-            moe_gemm(stage2_out, a2, a2_scale, w2, w2_scale, 2)
-    else:
+    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[down]"):
         moe_gemm(stage2_out, a2, a2_scale, w2, w2_scale, 2)
 
     moe_out = stage2_out.sum(dim=1)

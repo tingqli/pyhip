@@ -4,25 +4,38 @@ __all__ = [
     'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle", "run_perftest", "set_device"
 ]
 
+import os
+# keyword used to filter cudaPerf according to name
+CUDAPERF = os.getenv("CUDAPERF","")
 
 class cudaPerf(object):
+    nested_depth = 0
+
     def __init__(self, flops = 0, rw_bytes = 0, name="", verbose=1):
         global torch
         import torch
+        self.enable = (CUDAPERF in name)
         self.flops = flops
         self.name = name
         self.verbose = verbose
         self.rw_bytes = rw_bytes
-        self.ev_start = torch.cuda.Event(enable_timing=True)
-        self.ev_end = torch.cuda.Event(enable_timing=True)
+        if self.enable:
+            self.ev_start = torch.cuda.Event(enable_timing=True)
+            self.ev_end = torch.cuda.Event(enable_timing=True)
         self.latencies = []
+        self.depth = cudaPerf.nested_depth
 
     def __enter__(self):
+        if not self.enable: return self
+        self.depth = cudaPerf.nested_depth
+        cudaPerf.nested_depth += 1
         torch.cuda._sleep(1_000_000)
         self.ev_start.record()
         return self
 
     def __exit__(self, type, value, traceback):
+        if not self.enable: return
+        cudaPerf.nested_depth -= 1
         self.ev_end.record()
         torch.cuda.synchronize()
         self.dt_ms = self.ev_start.elapsed_time(self.ev_end)
@@ -31,15 +44,18 @@ class cudaPerf(object):
             self.show(self.flops, self.rw_bytes)
 
     def dt(self, excludes=0):
+        if len(self.latencies) == 0: return 0
         return sum(self.latencies[excludes:])/len(self.latencies[excludes:])
 
     def bw(self, excludes=0):
+        if len(self.latencies) == 0: return 0
         avg_dt_ms = self.dt(excludes) * 1e3
         return self.rw_bytes*1e-6/avg_dt_ms
 
     def show(self, flops = None, rw_bytes = None):
         if flops is None: flops = 0
-        msg = f"{self.name} : {flops*1e-6:.0f} MFLOP / {self.dt_ms*1e3:.3f} us "
+        disp_name = self.depth*'    ' + self.name
+        msg = f"{disp_name:32} : {flops*1e-6:.0f} MFLOP / {self.dt_ms*1e3:.3f} us "
         if flops and flops > 0:
             msg += f"  {flops*1e-9/self.dt_ms:.1f} TFLOPS "
         if rw_bytes and rw_bytes > 0:
@@ -47,6 +63,7 @@ class cudaPerf(object):
         print(msg)
 
     def tflops(self, excludes=0):
+        if len(self.latencies) == 0: return 0
         avg_dt_ms = self.dt(excludes) * 1e3
         return self.flops*1e-9/avg_dt_ms
 

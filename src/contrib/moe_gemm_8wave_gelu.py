@@ -33,7 +33,8 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
                    weight:"void*",pScaleB:"void*",
                    input:"void*", pScaleA:"void*",
                    output:"void*",
-                   num_tokens:"uint"):
+                   num_tokens:"uint",
+                   num_blocks:"uint"):
     num_warps = 8
 
     assert not is_input_over_4GB
@@ -48,9 +49,40 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
     stride_k = IC * J.sizeof(AB_dtype)
     #stride_gate_up = J.div(J.div(OC, wg_N), 2) * wg_N * stride_k
 
-    blk_n = J.blockIdx.x # split along OC
-    blk_m = J.blockIdx.y
+    blk1d = J.blockIdx.x
+
+    # map 1d index to e_block_id & oc_block_id
+    # in unit of NUM_CU=32x8, the remainder part is evenly distributed
+    """
+       cu_id 0  1  2  3  4  5  6  7 | 8  9 10 11 12 13 14 15 |
+      xcd_id 0  1  2  3  4  5  6  7 | 0  1  2  3  4  5  6  7 |
+      xcd_cu 0                      | 1  1  1  1  1  1  1  1
+             0 32 64      . . . . . | 1  33 65  .. .... ...| 
+
+    """
+    NUM_CU = 256
+    num_oc_blocks = J.div(OC, wg_N)
+    num_groupped_blocks = num_blocks - (num_blocks % NUM_CU)
+    blk_m = J.gpr("su32")
+    blk_n = J.gpr("su32")
+    with J.If(blk1d < num_groupped_blocks) as If:
+        blk_base = (blk1d // NUM_CU) * NUM_CU
+        cu_id = blk1d % NUM_CU
+        xcd_id = cu_id % 8
+        xcd_cu = cu_id // 8
+        task_id = xcd_id * 32 + xcd_cu
+        new_blk1d = blk_base + task_id
+        blk_m[0] = new_blk1d // num_oc_blocks
+        blk_n[0] = new_blk1d - blk_m * num_oc_blocks
+
+        If.Else()
+        blk_m[0] = blk1d // num_oc_blocks
+        blk_n[0] = blk1d - blk_m * num_oc_blocks
+
+    #blk_n = J.blockIdx.x # split along OC
+    #blk_m = J.blockIdx.y
     #blk_m[0] *= 0
+    #blk_n[0] *= 0
     expert_id = J.gpr(1, 'su32')
     J.s_load_dword(expert_id, sorted_expert_ids, blk_m[0] * J.sizeof_u32)
     max_id = J.gpr(1, 'su32')
@@ -86,7 +118,7 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
     J.s_mul_i32(offset_64bit[0], expert_id, (OC * stride_k))
     weight[:] += offset_64bit
 
-    if gate_up:
+    if gate_up and AB_dtype != "s8":
         """
         weight[:] += expert_id * (OC * stride_k) + blk_n * (wg_N//2 * stride_k)
         w_scale[:] += blk_n * (J.div(wg_N//2, 32) * stride_scale32x256) + (J.warp_id[0] % 2) * (J.div(wg_N//4, 32) * stride_scale32x256)
@@ -101,24 +133,17 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
         # vm_load_b(k, m=0) loads from gate-weight
         # vm_load_b(k, m=1) loads from up-weight
         # AB_dtype == "s8" means smooth-quant, input is also of shape [num_tokens, TOPK, dims]
-        if AB_dtype == "s8":
-            LOADER_TOPK = TOPK
-            buff_a = J.Buffer(input, num_tokens * TOPK * stride_k)
-        else:
-            LOADER_TOPK = 0        
-            buff_a = J.Buffer(input, num_tokens * stride_k)
-        weight[:] += blk_n * (wg_N * stride_k) # gate-weight
-        buff_b = J.Buffer(weight, wg_N * stride_k)
-        stride_n = OC * J.sizeof(C_dtype)
-        # assert bpreshuffle
+        LOADER_TOPK = 0
+        buff_a = J.Buffer(input, num_tokens * stride_k)
     else:
         LOADER_TOPK = TOPK
-        weight[:] += blk_n * (wg_N * stride_k)
-        # w_scale[:] += blk_n * (J.div(wg_N, 32) * stride_scale32x256) + (J.warp_id[0] % 2) * (J.div(wg_N//2, 32) * stride_scale32x256)
-        # sbuff_b = J.Buffer(w_scale, J.div(wg_N//2, 32) * stride_scale32x256)
         buff_a = J.Buffer(input, num_tokens * TOPK * stride_k)
-        buff_b = J.Buffer(weight, wg_N * stride_k)
-        stride_n = OC * J.sizeof(C_dtype)
+
+    weight[:] += blk_n * (wg_N * stride_k)
+    # w_scale[:] += blk_n * (J.div(wg_N, 32) * stride_scale32x256) + (J.warp_id[0] % 2) * (J.div(wg_N//2, 32) * stride_scale32x256)
+    # sbuff_b = J.Buffer(w_scale, J.div(wg_N//2, 32) * stride_scale32x256)
+    buff_b = J.Buffer(weight, wg_N * stride_k)
+    stride_n = OC * J.sizeof(C_dtype)
 
     lds_base = J.alloc_lds(HALF_BLOCK_SIZE_ROW * BLOCK_K * 4 + HALF_BLOCK_SIZE_COL * BLOCK_K * 4)
     ldsA = {}
@@ -569,6 +594,6 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
                             J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
                             J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
                             # buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
-                            J.global_store_dwordx4(vaddr, vbf16, "off", mod=f"offset:{0*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16}")
+                            J.global_store_dwordx4(vaddr, vbf16, "off", mod=f"offset:{0*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16} sc1 nt")
 
     return

@@ -209,7 +209,7 @@ def fused_moe_gelu(
         flops = num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2
         #flops = token_num * topk * inter_dim * model_dim * 2
         with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(flops, name=f"moe_gemm_8wave_gelu[up  ]"):
-            moe_gemm_8wave_gelu([num_oc_blocks, num_e_blocks], [8*64],
+            moe_gemm_8wave_gelu([num_oc_blocks * num_e_blocks], [8*64],
                     a1.element_size() * a1.numel() > (1<<32),
                     AB_dtype, wg_M, wg_N,
                     E, inter_dim, model_dim, 
@@ -221,7 +221,7 @@ def fused_moe_gelu(
                     w1.data_ptr(), None if w1_scale is None else w1_scale.data_ptr(),
                     a1.data_ptr(), None if a1_scale is None else a1_scale.data_ptr(),
                     a2.data_ptr(),
-                    token_num) # num_local_tokens.data_ptr() ?
+                    token_num, num_oc_blocks * num_e_blocks) # num_local_tokens.data_ptr() ?
 
     if quant_type == aiter.QuantType.per_1x32:
         a2, a2_scale = act_quant_func(
@@ -255,7 +255,7 @@ def fused_moe_gelu(
         flops = num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2
         # flops = token_num * topk * inter_dim * model_dim * 2
         with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(flops, name=f"moe_gemm_8wave_gelu[down]"):
-            moe_gemm_8wave_gelu([num_oc_blocks, num_e_blocks], [8*64],
+            moe_gemm_8wave_gelu([num_oc_blocks * num_e_blocks], [8*64],
                             a2.element_size() * a2.numel() > (1<<32),
                             AB_dtype, wg_M, wg_N,
                             E, model_dim, inter_dim, 
@@ -267,7 +267,7 @@ def fused_moe_gelu(
                             w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
                             a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
                             stage2_out.data_ptr(),
-                            token_num) # num_local_tokens.data_ptr() ?
+                            token_num, num_oc_blocks * num_e_blocks) # num_local_tokens.data_ptr() ?
         moe_out = stage2_out.sum(dim=1)
 
     # moe_out = stage2_out.sum(dim=1)
