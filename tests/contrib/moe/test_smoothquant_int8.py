@@ -33,11 +33,18 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
     else:
         x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
         x_quant_scale = torch.empty([sorted_ids.shape[0]], dtype=torch.float32, device=device)
-    quant([sorted_expert_ids.shape[0], BLOCK_SIZE_M // ROW_PER_BLOCK], [64], 
-           x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
-           sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
-           M, model_dim, 1 if is_gemm1 else 0
-           )
+    if is_gemm1:
+        quant([sorted_expert_ids.shape[0], BLOCK_SIZE_M // ROW_PER_BLOCK], [64], 
+            x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
+            sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+            M, model_dim, 1
+            )
+    else:
+        hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // 8], [256], 
+            x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
+            sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+            M, model_dim, 0
+            )
     return x_quant, x_quant_scale
 
 def smooth_quant_w(weight,         # [num_experts, OC, IC]
