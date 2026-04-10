@@ -14,6 +14,7 @@ torch.manual_seed(0)
 
 BLOCK_SIZE_M = 256
 ROW_PER_BLOCK = 4
+ROW_PER_BLOCK1 = 2
 ROW_PER_BLOCK2 = 4
 TOPK = 20
 NUM_THREADS = 64
@@ -24,7 +25,7 @@ model_dim, inter_dim = 4096, 1536
 num_experts, topk = 400, TOPK
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{NUM_THREADS=} -D{ROW_PER_BLOCK2=}")
+hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{NUM_THREADS=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=}")
 quant = hip.quant
 
 def int8_ptpc(a):
@@ -54,7 +55,7 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
                 M, model_dim, 1
                 )
         else:
-            hip.quant1([div_up(M, 4)], [64], 
+            hip.quant1([div_up(M, ROW_PER_BLOCK1)], [64], 
                 x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
                 topk_ids.data_ptr(),
                 M, model_dim, 1
@@ -186,7 +187,7 @@ sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sort
 cur_act, cur_scale = quant_act(x, topk, M, model_dim, fc1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True, topk_ids)
 ref_act, ref_scale = torch_ref(x, topk, M, model_dim, fc1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids)
 # torch.testing.assert_close(cur_scale, ref_scale)
-torch.testing.assert_close(cur_act, ref_act, atol=1.1, rtol=200)
+torch.testing.assert_close(cur_act, ref_act, atol=1.1, rtol=2.1)
 print('done.')
 
 mem_size = x.numel() * x.element_size() + fc1_smooth_scale.numel() * fc1_smooth_scale.element_size() + sorted_ids.numel() * sorted_ids.element_size() + sorted_expert_ids.numel() * sorted_expert_ids.element_size() + num_valid_ids.numel() * num_valid_ids.element_size() + cur_act.numel() * cur_act.element_size() + cur_scale.numel() * cur_scale.element_size()
