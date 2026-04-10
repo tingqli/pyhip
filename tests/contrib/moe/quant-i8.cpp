@@ -276,7 +276,9 @@ __global__ void quant(
     }
 }
 
-#define ROW_PER_BLOCK2 8
+#ifndef ROW_PER_BLOCK2
+#define ROW_PER_BLOCK2 4
+#endif
 #define COL_PER_WAVE (64 / ROW_PER_BLOCK2)
 #define NUM_THREADS2 256
 __global__ void quant2(
@@ -296,6 +298,91 @@ __global__ void quant2(
     sorted_ids += e_idx * BLOCK_SIZE_M;
     S = 1536;
     __shared__ __bf16 lds[ROW_PER_BLOCK2][1536];
+    __shared__ float max_wave[ROW_PER_BLOCK2][4];
+
+    uint lane_id = threadIdx.x % 64;
+    uint wave_id = threadIdx.x / 64;
+    uint lane_r = lane_id / COL_PER_WAVE;
+    uint lane_c = lane_id % COL_PER_WAVE;
+    uint row_id = r_idx * ROW_PER_BLOCK2 + lane_r;
+    auto raw_id = sorted_ids[row_id];
+    auto tok_id = raw_id & 0xffffff;
+    auto topk_id = raw_id >> 24;
+    auto org_tok_id = tok_id;
+    tok_id = tok_id >= M ? 0 : tok_id; // oob
+    smooth_scale += eid * S;
+    auto p_x = x + (int64_t)tok_id * TOPK * S + topk_id * S;
+    float cur_max = -FLT_MAX;
+    int i = lane_c + wave_id * COL_PER_WAVE;
+    auto scale = global_load_dwordx4<float32x8>(smooth_scale, i * 8 * sizeof(float));
+    auto x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
+    for (; i < S / 8 - COL_PER_WAVE * 4; i += COL_PER_WAVE * 4) {
+        auto next_scale = global_load_dwordx4<float32x8>(smooth_scale, (i + COL_PER_WAVE * 4) * 8 * sizeof(float));
+        auto next_x_val = global_load_dwordx4<bfloat16x8>(p_x, (i + COL_PER_WAVE * 4) * 8 * sizeof(__bf16));
+        for (int j = 0; j < 8; j++) {
+            auto tmp = (scale[j] * (float)x_val[j]);
+            lds[lane_r][i * 8 + j] = tmp;
+            cur_max = fmaxf(cur_max, abs(tmp));
+        }
+        scale = next_scale;
+        x_val = next_x_val;
+    }
+    for (int j = 0; j < 8; j++) {
+        auto tmp = (scale[j] * (float)x_val[j]);
+        lds[lane_r][i * 8 + j] = tmp;
+        cur_max = fmaxf(cur_max, abs(tmp));
+    }
+    for(int mask = COL_PER_WAVE / 2; mask >= 1; mask /= 2) {
+        cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
+    }
+    if (lane_c == 0) {
+        max_wave[lane_r][wave_id] = cur_max;
+    }
+    __syncthreads();
+    for (int i = 0; i < 4; i++) {
+        cur_max = fmaxf(cur_max, max_wave[lane_r][i]);
+    }
+    if (org_tok_id >= M) return; // oob write
+    auto row_scale = cur_max / 128.0f;
+    row_scale = fmaxf(row_scale, 1e-6f);
+    auto inv_row_scale = 1.0f / row_scale;
+    // if (e_idx==1096 &&row_id == 166) {
+    //     auto offset = tok_id * TOPK * S + topk_id * S;
+    //     printf("x %d lanec %d wave_id %d e_idx %d, row_id %d, tok_id %ld, topk_id %d, max %f org_tok_id %d row_scale %f\n", threadIdx.x, lane_c, wave_id, e_idx, row_id, tok_id, topk_id, cur_max, org_tok_id, row_scale);
+    // }
+
+    charx16* p_x_out = reinterpret_cast<charx16*>(x_out + tok_id * TOPK * S + topk_id * S);
+    #pragma unroll
+    for (int i = lane_c + wave_id * COL_PER_WAVE; i < S / 16; i += COL_PER_WAVE * 4) {
+        charx16 qv;
+        for (int j = 0; j < 16; j++) {
+            auto val = lds[lane_r][i * 16 + j] * inv_row_scale;
+            qv[j] = max(-128, min(127, (int)roundf(val)));
+        }
+        p_x_out[i] = qv;
+    }
+    if (lane_c == 0 && wave_id == 0) {
+        x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
+    }
+}
+
+__global__ void quant1(
+            __bf16* x,                  // [M, S]
+            float* smooth_scale,        // [E, S]
+            char* x_out,                // [M, TOPK, S]
+            float* x_quant_scale,       // [sorted_expert_ids.shape[0], 256]
+            uint* sorted_ids,           // [sorted_expert_ids.shape[0], 256]
+            uint* sorted_expert_ids,    // [sorted_expert_ids.shape[0]]
+            uint* num_valid_ids,        // [2]
+            uint M, uint S, int is_gemm1) {
+    // wg: [sorted_expert_ids.shape[0], 32]
+    uint e_idx = blockIdx.x;
+    uint r_idx = blockIdx.y;
+    uint eid = sorted_expert_ids[e_idx];
+    if (e_idx * BLOCK_SIZE_M >= num_valid_ids[0]) return;
+    sorted_ids += e_idx * BLOCK_SIZE_M;
+    S = 4096;
+    __shared__ __bf16 lds[ROW_PER_BLOCK2][4096];
     __shared__ float max_wave[ROW_PER_BLOCK2][4];
 
     uint lane_id = threadIdx.x % 64;

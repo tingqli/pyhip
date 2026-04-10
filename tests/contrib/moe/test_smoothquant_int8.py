@@ -26,7 +26,7 @@ quant = hip.quant
 
 def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True):
     device = x.device
-    DEBUG = True
+    DEBUG = False
     if DEBUG:
         x_quant = torch.ones((M, topk, model_dim), dtype=torch.int8, device=device)
         x_quant_scale = torch.ones([sorted_ids.shape[0]], dtype=torch.float32, device=device)
@@ -40,7 +40,7 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
             M, model_dim, 1
             )
     else:
-        hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // 8], [256], 
+        hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // 4], [256], 
             x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
             sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
             M, model_dim, 0
@@ -261,7 +261,11 @@ def fused_moe_gelu_sqi8(
         a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
     a2_bf16 = torch.empty((num_tokens, topk, inter_dim), dtype=torch.bfloat16, device=device,)
 
-    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[  up]"):
+    DEBUG = False
+    if DEBUG:
+        with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[  up]"):
+            moe_gemm(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
+    else:
         moe_gemm(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
 
     if 1:
@@ -271,7 +275,10 @@ def fused_moe_gelu_sqi8(
 
     stage2_out = torch.empty((num_tokens, topk, model_dim), dtype=torch.bfloat16, device=device)
 
-    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[down]"):
+    if DEBUG:
+        with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[down]"):
+            moe_gemm(stage2_out, a2, a2_scale, w2, w2_scale, 2)
+    else:
         moe_gemm(stage2_out, a2, a2_scale, w2, w2_scale, 2)
 
     moe_out = stage2_out.sum(dim=1)
