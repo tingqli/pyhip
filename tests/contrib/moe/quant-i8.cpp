@@ -99,24 +99,29 @@ __device__ DWORDX4 read_dwordx4(BufferResource& buffer, int soffset, int nstride
     return data;
 }
 
-template<typename T>
-__device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffset, bool is_asm=false) {
-    T v;
-    if (is_asm) {
-        auto r = amd_wave_read_first_lane(buffer.descriptor);
-        asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], %[soffset] offen\n"
-            :[vdst]"=v"(v)
-            :[vaddr]"v"(voffset), [srsrc]"s"(r), [soffset]"s"(soffset));
-    } else {
-        v = *(T*)((char*)buffer.address + soffset + voffset);
-    }
-    return v;
-}
-
 __device__ float llvm_amdgcn_raw_buffer_load_fp32(int32x4_t srsrc,
                                  int voffset,
                                  int soffset,
                                  int glc_slc) __asm("llvm.amdgcn.raw.buffer.load.f32");
+
+__device__ float32x4 llvm_amdgcn_raw_buffer_load_fp32x4(int32x4_t srsrc,
+                                   int voffset,
+                                   int soffset,
+                                   int glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v4f32");
+
+__device__ void
+llvm_amdgcn_raw_buffer_store_fp32x2(float32x2 vdata,
+                                    int32x4_t rsrc,
+                                    int voffset,
+                                    int soffset,
+                                    int glc_slc) __asm("llvm.amdgcn.raw.buffer.store.v2f32");
+
+__device__ void
+llvm_amdgcn_raw_buffer_store_fp32x4(float32x4 vdata,
+                                    int32x4_t rsrc,
+                                    int voffset,
+                                    int soffset,
+                                    int glc_slc) __asm("llvm.amdgcn.raw.buffer.store.v4f32");
 
 __device__ __inline__
 void llvm_amdgcn_raw_buffer_load_lds(int32x4_t rsrc,    //
@@ -150,6 +155,63 @@ __device__ T buffer_load_dword(BufferResource& buffer, int soffset, int voffset,
         //v = *(T*)((char*)buffer.address + soffset + voffset + coffset);
     }
     return v;
+}
+
+enum struct amd_buffer_coherence_enum
+{
+    coherence_default = 0, // default value
+    glc               = 1,
+    slc               = 2,
+    glc_slc           = 3,
+    // gfx94: bit 0 = sc0, bit 1 = nt, bit 3 = swz, bit 4 = sc1
+    // SC[1:0] System Cache level: 0=wave, 1=group, 2=device, 3=system
+    // NT Non-Temporal: 0=expect temporal reuse; 1=do not expect temporal reuse
+    WAVE_NT0   = 0,
+    WAVE_NT1   = 2,
+    GROUP_NT0  = 1,
+    GROUP_NT1  = 3,
+    DEVICE_NT0 = 8,
+    DEVICE_NT1 = 10,
+    SYSTEM_NT0 = 9,
+    SYSTEM_NT1 = 11,
+};
+
+template<typename T>
+__device__ inline T buffer_load_dwordx4(BufferResource& buffer, uint soffset, uint voffset, uint coffset, int coherence=0, bool is_asm=false) {
+    T v;
+    if (is_asm) {
+        int32x4_t r = __builtin_bit_cast(int32x4_t, buffer);
+        r.x         = __builtin_amdgcn_readfirstlane(r.x);
+        r.y         = __builtin_amdgcn_readfirstlane(r.y);
+        r.z         = __builtin_amdgcn_readfirstlane(r.z);
+        r.w         = __builtin_amdgcn_readfirstlane(r.w);
+
+        //auto r = amd_wave_read_first_lane(buffer.descriptor);
+        asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], 0 offen offset:%[coffset]\n"
+            :[vdst]"=v"(v)
+            :[vaddr]"v"(voffset), [srsrc]"s"(r), [coffset]"n"(coffset)
+            : "memory");
+    } else {
+        int32x4_t r = __builtin_bit_cast(int32x4_t, buffer);
+        auto d = llvm_amdgcn_raw_buffer_load_fp32x4(r, voffset + coffset, soffset, static_cast<int>(coherence));
+        v = __builtin_bit_cast(T, d);
+        // v = *(T*)((char*)buffer.address + soffset + voffset + coffset);
+    }
+    return v;
+}
+
+template<typename T>
+__device__ void buffer_store_dwordx4(T& v, BufferResource& buffer, int soffset, int voffset, int coffset, amd_buffer_coherence_enum coherence=amd_buffer_coherence_enum::coherence_default) {
+    auto d = __builtin_bit_cast(float32x4, v);
+    int32x4_t r = __builtin_bit_cast(int32x4_t, buffer);
+    llvm_amdgcn_raw_buffer_store_fp32x4(d, r, voffset + coffset, soffset, static_cast<int>(coherence));
+}
+
+template<typename T>
+__device__ inline void buffer_store_dwordx2(T& v, BufferResource& buffer, int soffset, int voffset, int coffset, amd_buffer_coherence_enum coherence=amd_buffer_coherence_enum::coherence_default) {
+    auto d = __builtin_bit_cast(float32x2, v);
+    int32x4_t r = __builtin_bit_cast(int32x4_t, buffer);
+    llvm_amdgcn_raw_buffer_store_fp32x2(d, r, voffset + coffset, soffset, static_cast<int>(coherence));
 }
 
 template<typename T>
@@ -204,7 +266,6 @@ constexpr void compile_time_loop(F&& f) {
 #define BLOCK_SIZE_M 256
 #define TOPK 20
 #define ROW_PER_BLOCK 4
-#define NUM_THREADS 64
 #endif
 
 //__launch_bounds__(NUM_THREADS, 2) 
@@ -224,7 +285,7 @@ __global__ void quant(
     if (e_idx * BLOCK_SIZE_M >= num_valid_ids[0]) return;
     sorted_ids += e_idx * BLOCK_SIZE_M;
     smooth_scale += eid * S;
-    __shared__ __bf16 lds[4096];
+    __shared__ __bf16 lds[QUANT1_K];
 
     for (int r = 0; r < ROW_PER_BLOCK; r++) {
         uint row_id = r_idx * ROW_PER_BLOCK + r;
@@ -238,7 +299,7 @@ __global__ void quant(
 
         auto p_x = is_gemm1 ? x + tok_id * S : x + tok_id * TOPK * S + topk_id * S;
         float cur_max = -FLT_MAX;
-        for (int i = threadIdx.x; i < S / 8; i += NUM_THREADS) {
+        for (int i = threadIdx.x; i < S / 8; i += 64) {
             auto scale = global_load_dwordx4<float32x8>(smooth_scale, i * 8 * sizeof(float));
             auto x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
             for (int j = 0; j < 8; j++) {
@@ -263,7 +324,7 @@ __global__ void quant(
         //     printf("e_idx %d, row_id %d, tok_id %ld, topk_id %d, max %f, scale %f\n", e_idx, row_id, tok_id, topk_id, cur_max, row_scale);
         // }
         charx16* p_x_out = reinterpret_cast<charx16*>(x_out + tok_id * TOPK * S + topk_id * S);
-        for (int i = threadIdx.x; i < S / 16; i += NUM_THREADS) {
+        for (int i = threadIdx.x; i < S / 16; i += 64) {
             charx16 qv;
             for (int j = 0; j < 16; j++) {
                 auto val = lds[i * 16 + j] * inv_row_scale;
@@ -281,7 +342,6 @@ __global__ void quant(
 #define ROW_PER_BLOCK2 4
 #endif
 #define COL_PER_WAVE (64 / ROW_PER_BLOCK2)
-#define NUM_THREADS2 256
 __global__ void quant2(
             __bf16* x,                  // [M, S]
             float* smooth_scale,        // [E, S]
@@ -290,86 +350,223 @@ __global__ void quant2(
             uint* sorted_ids,           // [sorted_expert_ids.shape[0], 256]
             uint* sorted_expert_ids,    // [sorted_expert_ids.shape[0]]
             uint* num_valid_ids,        // [2]
-            uint M, uint S, int is_gemm1) {
+            uint M) {
     // wg: [sorted_expert_ids.shape[0], 32]
     uint e_idx = blockIdx.x;
     uint r_idx = blockIdx.y;
     uint eid = sorted_expert_ids[e_idx];
     if (e_idx * BLOCK_SIZE_M >= num_valid_ids[0]) return;
     sorted_ids += e_idx * BLOCK_SIZE_M;
-    S = 1536;
-    // __shared__ __bf16 lds[ROW_PER_BLOCK2][1536];
+    auto S = QUANT2_K;
+    // __shared__ __bf16 lds[ROW_PER_BLOCK2][QUANT2_K];
     __shared__ float max_wave[ROW_PER_BLOCK2][4];
 
     uint lane_id = threadIdx.x % 64;
     uint wave_id = threadIdx.x / 64;
     uint lane_r = lane_id / COL_PER_WAVE;
     uint lane_c = lane_id % COL_PER_WAVE;
-    uint row_id = r_idx * ROW_PER_BLOCK2 + lane_r;
-    auto raw_id = sorted_ids[row_id];
-    auto tok_id = raw_id & 0xffffff;
-    auto topk_id = raw_id >> 24;
-    auto org_tok_id = tok_id;
-    tok_id = tok_id >= M ? 0 : tok_id; // oob
     smooth_scale += eid * S;
-    auto p_x = x + (int64_t)tok_id * TOPK * S + topk_id * S;
-    float cur_max = -FLT_MAX;
-    float32x8 scales[1536 / 8 / (COL_PER_WAVE * 4)];
-    bfloat16x8 x_vals[1536 / 8 / (COL_PER_WAVE * 4)];
-    float32x8 x_smooth[1536 / 8 / (COL_PER_WAVE * 4)];
-    auto load = [&](float32x8& scale, bfloat16x8& x_val, int i) {
-        scale = global_load_dwordx4<float32x8>(smooth_scale, i * 8 * sizeof(float));
-        x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
+    //auto p_x = x + (int64_t)tok_id * TOPK * S + topk_id * S;
+    static constexpr int ITEM_PER_LANE = QUANT2_K / 8 / (COL_PER_WAVE * 4);
+    float32x8 scales[ITEM_PER_LANE];
+    bfloat16x8 x_vals[ITEM_PER_LANE];
+    float32x8 x_smooth[ITEM_PER_LANE];
+    for (int i = 0; i < ITEM_PER_LANE; i++) {
+        scales[i] = global_load_dwordx4<float32x8>(smooth_scale, (i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE) * 8 * sizeof(float));
+    }
+    // TODO: < 4G
+    BufferResource x_res(x, M * S * TOPK * sizeof(__bf16));
+    BufferResource x_out_res(x_out, 0xffffffff);
+    auto load_token = [&](bfloat16x8& x_val, uint tok_id, uint topk_id, uint i) {
+        // x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
+        x_val = buffer_load_dwordx4<bfloat16x8>(x_res, 
+            0,
+            (tok_id * TOPK * S + topk_id * S) * sizeof(__bf16), 
+            i * 8 * sizeof(__bf16),
+            (int)amd_buffer_coherence_enum::SYSTEM_NT1);//0x1f);
     };
-    for (int i = 0; i < 1536 / 8 / (COL_PER_WAVE * 4); i++) {
-        load(scales[i], x_vals[i], lane_c + wave_id * COL_PER_WAVE + i * COL_PER_WAVE * 4);
-    }
-    auto find_max = [&] (float32x8& scale, bfloat16x8& x_val, int i) {
-        float32x8 tmp;
+    for (int block_i = 0; block_i < BLOCK_M2 / ROW_PER_BLOCK2; block_i++) {
+        uint row_id = r_idx * BLOCK_M2 + block_i * ROW_PER_BLOCK2 + lane_r;
+        auto raw_id = sorted_ids[row_id];
+        auto tok_id = raw_id & 0xffffff;
+        auto topk_id = raw_id >> 24;
+        auto org_tok_id = tok_id;
+        //tok_id = tok_id >= M ? 0 : tok_id; // oob
+        float cur_max = -FLT_MAX;
+
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            auto tmp = (scale[j] * (float)x_val[j]);
-            x_smooth[i][j] = tmp;
-            cur_max = fmaxf(cur_max, abs(tmp));
+        for (int i = 0; i < ITEM_PER_LANE; i++) {
+            load_token(x_vals[i], tok_id, topk_id, lane_c + wave_id * COL_PER_WAVE + i * COL_PER_WAVE * 4);
         }
+        auto find_max = [&] (float32x8& scale, bfloat16x8& x_val, int i) {
+            float32x8 tmp;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                auto tmp = (scale[j] * (float)x_val[j]);
+                x_smooth[i][j] = tmp;
+                cur_max = fmaxf(cur_max, abs(tmp));
+            }
+        };
+        for (int i = 0; i < ITEM_PER_LANE; i++) {
+            find_max(scales[i], x_vals[i], i);
+        }
+
+        for(int mask = COL_PER_WAVE / 2; mask >= 1; mask /= 2) {
+            cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
+        }
+        if (lane_c == 0) {
+            max_wave[lane_r][wave_id] = cur_max;
+        }
+        __syncthreads();
+        for (int i = 0; i < 4; i++) {
+            cur_max = fmaxf(cur_max, max_wave[lane_r][i]);
+        }
+        __syncthreads();
+        if (org_tok_id >= M) return; // oob write
+        auto row_scale = cur_max / 128.0f;
+        row_scale = fmaxf(row_scale, 1e-6f);
+        auto inv_row_scale = 1.0f / row_scale;
+        // if (e_idx==1096 &&row_id == 166) {
+        //     auto offset = tok_id * TOPK * S + topk_id * S;
+        //     printf("x %d lanec %d wave_id %d e_idx %d, row_id %d, tok_id %ld, topk_id %d, max %f org_tok_id %d row_scale %f\n", threadIdx.x, lane_c, wave_id, e_idx, row_id, tok_id, topk_id, cur_max, org_tok_id, row_scale);
+        // }
+
+        // charx8* p_x_out = reinterpret_cast<charx8*>(x_out + tok_id * TOPK * S + topk_id * S);
+        #pragma unroll
+        for (int i = 0; i < ITEM_PER_LANE; i++) {
+            charx8 qv;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                //auto val = lds[lane_r][i * 16 + j] * inv_row_scale;
+                auto val = x_smooth[i][j] * inv_row_scale;
+                qv[j] = val + 0.5f;
+            }
+
+            buffer_store_dwordx2(qv, 
+                x_out_res, 
+                0, 
+                tok_id * TOPK * S + topk_id * S + (i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE) * 8, 
+                0,
+                amd_buffer_coherence_enum::SYSTEM_NT1);
+            // p_x_out[i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE] = qv;
+        }
+        if (lane_c == 0 && wave_id == 0) {
+            x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
+        }
+    }
+}
+
+__global__ void quant2_seq(
+            __bf16* x,                  // [M, S]
+            float* smooth_scale,        // [E, S]
+            char* x_out,                // [M, TOPK, S]
+            float* x_quant_scale,       // [sorted_expert_ids.shape[0], 256]
+            uint* sorted_ids,           // [sorted_expert_ids.shape[0], 256]
+            uint* sorted_expert_ids,    // [sorted_expert_ids.shape[0]]
+            uint* num_valid_ids,        // [2]
+            uint M) {
+    // wg: [sorted_expert_ids.shape[0], 32]
+    uint e_idx = blockIdx.x;
+    uint r_idx = blockIdx.y;
+    uint eid = sorted_expert_ids[e_idx];
+    if (e_idx * BLOCK_SIZE_M >= num_valid_ids[0]) return;
+    sorted_ids += e_idx * BLOCK_SIZE_M;
+    auto S = QUANT2_K;
+    // __shared__ __bf16 lds[ROW_PER_BLOCK2][QUANT2_K];
+    __shared__ float max_wave[ROW_PER_BLOCK2][4];
+
+    uint lane_id = threadIdx.x % 64;
+    uint wave_id = threadIdx.x / 64;
+    uint lane_r = lane_id / COL_PER_WAVE;
+    uint lane_c = lane_id % COL_PER_WAVE;
+    smooth_scale += eid * S;
+    //auto p_x = x + (int64_t)tok_id * TOPK * S + topk_id * S;
+    static constexpr int ITEM_PER_LANE = QUANT2_K / 8 / (COL_PER_WAVE * 4);
+    float32x8 scales[ITEM_PER_LANE];
+    bfloat16x8 x_vals[ITEM_PER_LANE];
+    float32x8 x_smooth[ITEM_PER_LANE];
+    for (int i = 0; i < ITEM_PER_LANE; i++) {
+        scales[i] = global_load_dwordx4<float32x8>(smooth_scale, (i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE) * 8 * sizeof(float));
+    }
+    // TODO: < 4G
+    BufferResource x_res(x, M * S * TOPK * sizeof(__bf16));
+    BufferResource x_out_res(x_out, 0xffffffff);
+    auto load_token = [&](bfloat16x8& x_val, uint tok_id, uint topk_id, uint i) {
+        // x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
+        x_val = buffer_load_dwordx4<bfloat16x8>(x_res, 
+            0,
+            (tok_id * TOPK * S + topk_id * S) * sizeof(__bf16), 
+            i * 8 * sizeof(__bf16),
+            (int)amd_buffer_coherence_enum::SYSTEM_NT1);//0x1f);
     };
-    for (int i = 0; i < 1536 / 8 / (COL_PER_WAVE * 4); i++) {
-        find_max(scales[i], x_vals[i], i);
-    }
+    for (int block_i = 0; block_i < BLOCK_M2 / ROW_PER_BLOCK2; block_i++) {
+        uint row_id = r_idx * BLOCK_M2 + block_i * ROW_PER_BLOCK2 + lane_r;
+        auto raw_id = sorted_ids[row_id];
+        auto tok_id = raw_id & 0xffffff;
+        auto topk_id = raw_id >> 24;
+        auto org_tok_id = tok_id;
+        //tok_id = tok_id >= M ? 0 : tok_id; // oob
+        float cur_max = -FLT_MAX;
 
-    for(int mask = COL_PER_WAVE / 2; mask >= 1; mask /= 2) {
-        cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
-    }
-    if (lane_c == 0) {
-        max_wave[lane_r][wave_id] = cur_max;
-    }
-    __syncthreads();
-    for (int i = 0; i < 4; i++) {
-        cur_max = fmaxf(cur_max, max_wave[lane_r][i]);
-    }
-    if (org_tok_id >= M) return; // oob write
-    auto row_scale = cur_max / 128.0f;
-    row_scale = fmaxf(row_scale, 1e-6f);
-    auto inv_row_scale = 1.0f / row_scale;
-    // if (e_idx==1096 &&row_id == 166) {
-    //     auto offset = tok_id * TOPK * S + topk_id * S;
-    //     printf("x %d lanec %d wave_id %d e_idx %d, row_id %d, tok_id %ld, topk_id %d, max %f org_tok_id %d row_scale %f\n", threadIdx.x, lane_c, wave_id, e_idx, row_id, tok_id, topk_id, cur_max, org_tok_id, row_scale);
-    // }
-
-    charx8* p_x_out = reinterpret_cast<charx8*>(x_out + tok_id * TOPK * S + topk_id * S);
-    #pragma unroll
-    for (int i = 0; i < S / 8 / (COL_PER_WAVE * 4); i++) {
-        charx8 qv;
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            //auto val = lds[lane_r][i * 16 + j] * inv_row_scale;
-            auto val = x_smooth[i][j] * inv_row_scale;
-            qv[j] = val + 0.5f;
+        for (int i = 0; i < ITEM_PER_LANE; i++) {
+            load_token(x_vals[i], tok_id, topk_id, lane_c + wave_id * COL_PER_WAVE + i * COL_PER_WAVE * 4);
         }
-        p_x_out[i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE] = qv;
-    }
-    if (lane_c == 0 && wave_id == 0) {
-        x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
+        auto find_max = [&] (float32x8& scale, bfloat16x8& x_val, int i) {
+            float32x8 tmp;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                auto tmp = (scale[j] * (float)x_val[j]);
+                x_smooth[i][j] = tmp;
+                cur_max = fmaxf(cur_max, abs(tmp));
+            }
+        };
+        for (int i = 0; i < ITEM_PER_LANE; i++) {
+            find_max(scales[i], x_vals[i], i);
+        }
+
+        for(int mask = COL_PER_WAVE / 2; mask >= 1; mask /= 2) {
+            cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
+        }
+        if (lane_c == 0) {
+            max_wave[lane_r][wave_id] = cur_max;
+        }
+        __syncthreads();
+        for (int i = 0; i < 4; i++) {
+            cur_max = fmaxf(cur_max, max_wave[lane_r][i]);
+        }
+        __syncthreads();
+        if (org_tok_id >= M) return; // oob write
+        auto row_scale = cur_max / 128.0f;
+        row_scale = fmaxf(row_scale, 1e-6f);
+        auto inv_row_scale = 1.0f / row_scale;
+        // if (e_idx==1096 &&row_id == 166) {
+        //     auto offset = tok_id * TOPK * S + topk_id * S;
+        //     printf("x %d lanec %d wave_id %d e_idx %d, row_id %d, tok_id %ld, topk_id %d, max %f org_tok_id %d row_scale %f\n", threadIdx.x, lane_c, wave_id, e_idx, row_id, tok_id, topk_id, cur_max, org_tok_id, row_scale);
+        // }
+
+        // charx8* p_x_out = reinterpret_cast<charx8*>(x_out + tok_id * TOPK * S + topk_id * S);
+        #pragma unroll
+        for (int i = 0; i < ITEM_PER_LANE; i++) {
+            charx8 qv;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                //auto val = lds[lane_r][i * 16 + j] * inv_row_scale;
+                auto val = x_smooth[i][j] * inv_row_scale;
+                qv[j] = val + 0.5f;
+            }
+
+            buffer_store_dwordx2(qv, 
+                x_out_res, 
+                0, 
+                tok_id * TOPK * S + topk_id * S + (i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE) * 8, 
+                0,
+                amd_buffer_coherence_enum::SYSTEM_NT1);
+            // p_x_out[i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE] = qv;
+        }
+        if (lane_c == 0 && wave_id == 0) {
+            x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
+        }
     }
 }
 
@@ -379,24 +576,24 @@ __global__ __launch_bounds__(64, 1) void quant1(
             char* x_out,                // [M, TOPK, S]
             float* x_quant_scale,       // [M, TOPK]
             uint* expert_ids,           // [M, TOPK]
-            uint M, uint S, int is_gemm1) {
+            uint M) {
     // wg: [M//4]
     uint m_block = blockIdx.x;
     uint lane_id = threadIdx.x % 64;
     uint wave_id = threadIdx.x / 64;
     uint lane_r = lane_id / COL_PER_WAVE;
     uint lane_c = lane_id % COL_PER_WAVE;
-    S = 4096;
-    //__shared__ __bf16 lds[4096];
-    bfloat16x8 x_org_buf[4096 / 64 / 8];
-    float32x8 x_smooth_buf[4096 / 64 / 8];
-    // __bf16 x_smooth_buf[4096 / 64 / 8][8];
+    auto S = QUANT1_K;
+    //__shared__ __bf16 lds[QUANT1_K];
+    bfloat16x8 x_org_buf[QUANT1_K / 64 / 8];
+    float32x8 x_smooth_buf[QUANT1_K / 64 / 8];
+    // __bf16 x_smooth_buf[QUANT1_K / 64 / 8][8];
 
     auto loop_row = [&] (__bf16* p_x, uint token_id, uint topk_id) {
         auto p_smooth_scale = smooth_scale + expert_ids[token_id * TOPK + topk_id] * S;
         float cur_max = -FLT_MAX;
-        float32x8 scale_buf[4096 / 64 / 8];
-        for (int i = 0; i < 4096 / 64 / 8; i++) {
+        float32x8 scale_buf[QUANT1_K / 64 / 8];
+        for (int i = 0; i < QUANT1_K / 64 / 8; i++) {
             scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
         }
         # pragma unroll
@@ -442,7 +639,7 @@ __global__ __launch_bounds__(64, 1) void quant1(
         uint token_id = m_block * ROW_PER_BLOCK1 + t;
         if (token_id >= M) return;
         auto p_x = x + token_id * S;
-        for (int i = 0; i < 4096 / 64 / 8; i++) {
+        for (int i = 0; i < QUANT1_K / 64 / 8; i++) {
             load_token(p_x, x_org_buf[i], threadIdx.x + i * 64);
         }
         for (int topk_id = 0; topk_id < TOPK; topk_id++) {

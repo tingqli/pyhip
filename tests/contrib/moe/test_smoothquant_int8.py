@@ -15,13 +15,24 @@ pyhip.set_device()
 
 device = "cuda"
 
+model_dim = 4096
+inter_dim = 1536
+num_tokens = 19147
+num_experts = 400
+topk = 20
+
 BLOCK_SIZE_M = 256
-ROW_PER_BLOCK = 4
-TOPK = 20
-NUM_THREADS = 64
+ROW_PER_BLOCK = 4       # rows for quant
+ROW_PER_BLOCK1 = 2      # rows for quant1
+ROW_PER_BLOCK2 = 4      # rows for quant2, threads: 4(x16)
+BLOCK_M2 = 8            # rows for quant2, workgroup size in M
 DEBUG = True
+QUANT1_K = model_dim
+QUANT2_K = inter_dim
+TOPK = topk
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
-hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{NUM_THREADS=}")
+hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=}")
 quant = hip.quant
 
 def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True):
@@ -40,11 +51,10 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
             M, model_dim, 1
             )
     else:
-        hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // 4], [256], 
+        hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // BLOCK_M2], [256], 
             x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
             sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
-            M, model_dim, 0
-            )
+            M)
     return x_quant, x_quant_scale
 
 def smooth_quant_w(weight,         # [num_experts, OC, IC]
@@ -370,4 +380,4 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
 
 
 if __name__ == "__main__":
-    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
+    test_fmoe_sqi8(num_tokens = num_tokens, model_dim = model_dim, inter_dim = inter_dim, num_experts = num_experts, topk = topk)

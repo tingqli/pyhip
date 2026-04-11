@@ -13,19 +13,21 @@ torch.set_default_device('cuda')
 torch.manual_seed(0)
 
 BLOCK_SIZE_M = 256
-ROW_PER_BLOCK = 4
-ROW_PER_BLOCK1 = 2
-ROW_PER_BLOCK2 = 4
+ROW_PER_BLOCK = 4       # rows for quant
+ROW_PER_BLOCK1 = 2      # rows for quant1
+ROW_PER_BLOCK2 = 4      # rows for quant2, threads: 4(x16)
+BLOCK_M2 = 8            # rows for quant2, workgroup size in M
 TOPK = 20
-NUM_THREADS = 64
 DEBUG = True
 num_tokens = 19149
 # num_tokens = 1
 model_dim, inter_dim = 4096, 1536
 num_experts, topk = 400, TOPK
+QUANT1_K = model_dim
+QUANT2_K = inter_dim
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{NUM_THREADS=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=}")
+hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=}")
 quant = hip.quant
 
 def int8_ptpc(a):
@@ -58,13 +60,13 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
             hip.quant1([div_up(M, ROW_PER_BLOCK1)], [64], 
                 x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
                 topk_ids.data_ptr(),
-                M, model_dim, 1
+                M
                 )
     else:
-        hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // ROW_PER_BLOCK2], [256], 
+        hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // BLOCK_M2], [256], 
             x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
             sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
-            M, model_dim, 0
+            M
             )
     return x_quant, x_quant_scale
 
