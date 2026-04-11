@@ -36,7 +36,10 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=} -D{ROW_PER_BLOCK2_SEQ=}")
 quant = hip.quant
 
-def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True):
+def div_up(x, y):
+    return (x + y - 1) // y
+
+def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True, topk_ids=None):
     device = x.device
     DEBUG = False
     if DEBUG:
@@ -46,11 +49,19 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
         x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
         x_quant_scale = torch.empty([sorted_ids.shape[0]], dtype=torch.float32, device=device)
     if is_gemm1:
-        quant([sorted_expert_ids.shape[0], BLOCK_SIZE_M // ROW_PER_BLOCK], [64], 
-            x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
-            sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
-            M, model_dim, 1
-            )
+        # TODO: quant1 use topk_ids
+        if 1:
+            quant([sorted_expert_ids.shape[0], BLOCK_SIZE_M // ROW_PER_BLOCK], [64], 
+                x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
+                sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+                M, model_dim, 1
+                )
+        else:
+            hip.quant1([div_up(M, ROW_PER_BLOCK1)], [64], 
+                x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
+                topk_ids.data_ptr(),
+                M
+                )
     else:
         hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // BLOCK_M2], [256], 
             x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
@@ -268,7 +279,7 @@ def fused_moe_gelu_sqi8(
     num_tokens, _ = hidden_states.shape
     with pyhip.cudaPerf(name=f"quant_act_up"):
         if 1:
-            a1, a1_scale = quant_act(hidden_states, topk, hidden_states.shape[0], hidden_states.shape[1], a1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True)
+            a1, a1_scale = quant_act(hidden_states, topk, hidden_states.shape[0], hidden_states.shape[1], a1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True, topk_ids)
         else:
             a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
     a2_bf16 = torch.empty((num_tokens, topk, inter_dim), dtype=torch.bfloat16, device=device,)
@@ -278,7 +289,7 @@ def fused_moe_gelu_sqi8(
 
     with pyhip.cudaPerf(name=f"quant_act_down"):
         if 1:
-            a2, a2_scale = quant_act(a2_bf16, topk, a2_bf16.shape[0], a2_bf16.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False)
+            a2, a2_scale = quant_act(a2_bf16, topk, a2_bf16.shape[0], a2_bf16.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids)
         else:
             a2, a2_scale = smoothquant_per_tok(a2_bf16, a2_smooth_scale, topk)
 

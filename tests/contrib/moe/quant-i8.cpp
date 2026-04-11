@@ -374,7 +374,7 @@ __global__ void quant(
 #define ROW_PER_BLOCK2 4
 #endif
 #define COL_PER_WAVE (64 / ROW_PER_BLOCK2)
-__global__ void quant2(
+__global__ void __launch_bounds__(256, 1)quant2(
             __bf16* x,                  // [M, S]
             float* smooth_scale,        // [E, S]
             char* x_out,                // [M, TOPK, S]
@@ -392,6 +392,7 @@ __global__ void quant2(
     auto S = QUANT2_K;
     // __shared__ __bf16 lds[ROW_PER_BLOCK2][QUANT2_K];
     __shared__ float max_wave[ROW_PER_BLOCK2][4];
+    __shared__ uint sorted_id_lds[BLOCK_SIZE_M];
 
     uint lane_id = threadIdx.x % 64;
     uint wave_id = threadIdx.x / 64;
@@ -401,11 +402,13 @@ __global__ void quant2(
     //auto p_x = x + (int64_t)tok_id * TOPK * S + topk_id * S;
     static constexpr int ITEM_PER_LANE = QUANT2_K / 8 / (COL_PER_WAVE * 4);
     float32x8 scales[ITEM_PER_LANE];
-    bfloat16x8 x_vals[ITEM_PER_LANE];
+    bfloat16x8 x_vals[ITEM_PER_LANE], x_nex_vals[ITEM_PER_LANE];
     float32x8 x_smooth[ITEM_PER_LANE];
+    sorted_id_lds[threadIdx.x] = sorted_ids[threadIdx.x];
     for (int i = 0; i < ITEM_PER_LANE; i++) {
         scales[i] = global_load_dwordx4<float32x8>(smooth_scale, (i * COL_PER_WAVE * 4 + lane_c + wave_id * COL_PER_WAVE) * 8 * sizeof(float));
     }
+
     // TODO: < 4G
     BufferResource x_res(x, M * S * TOPK * sizeof(__bf16));
     BufferResource x_out_res(x_out, 0xffffffff);
@@ -417,30 +420,32 @@ __global__ void quant2(
             i * 8 * sizeof(__bf16),
             (int)amd_buffer_coherence_enum::SYSTEM_NT1);//0x1f);
     };
-    for (int block_i = 0; block_i < BLOCK_M2 / ROW_PER_BLOCK2; block_i++) {
-        uint row_id = r_idx * BLOCK_M2 + block_i * ROW_PER_BLOCK2 + lane_r;
-        auto raw_id = sorted_ids[row_id];
-        auto tok_id = raw_id & 0xffffff;
-        auto topk_id = raw_id >> 24;
-        auto org_tok_id = tok_id;
-        //tok_id = tok_id >= M ? 0 : tok_id; // oob
-        float cur_max = -FLT_MAX;
-
+    auto find_max = [&] (float& cur_max, float32x8& scale, bfloat16x8& x_val, int i) {
+        float32x8 tmp;
         #pragma unroll
-        for (int i = 0; i < ITEM_PER_LANE; i++) {
-            load_token(x_vals[i], tok_id, topk_id, lane_c + wave_id * COL_PER_WAVE + i * COL_PER_WAVE * 4);
+        for (int j = 0; j < 8; j++) {
+            auto tmp = (scale[j] * (float)x_val[j]);
+            x_smooth[i][j] = tmp;
+            cur_max = fmaxf(cur_max, abs(tmp));
         }
-        auto find_max = [&] (float32x8& scale, bfloat16x8& x_val, int i) {
-            float32x8 tmp;
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                auto tmp = (scale[j] * (float)x_val[j]);
-                x_smooth[i][j] = tmp;
-                cur_max = fmaxf(cur_max, abs(tmp));
-            }
-        };
+    };
+
+    uint row_id = r_idx * BLOCK_M2 + 0 * ROW_PER_BLOCK2 + lane_r;
+    __syncthreads();
+    auto raw_id = sorted_id_lds[row_id];
+    auto tok_id = raw_id & 0xffffff;
+    auto topk_id = raw_id >> 24;
+
+    #pragma unroll
+    for (int i = 0; i < ITEM_PER_LANE; i++) {
+        load_token(x_vals[i], tok_id, topk_id, lane_c + wave_id * COL_PER_WAVE + i * COL_PER_WAVE * 4);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    auto loop = [&] () {
+        float cur_max = -FLT_MAX;
         for (int i = 0; i < ITEM_PER_LANE; i++) {
-            find_max(scales[i], x_vals[i], i);
+            find_max(cur_max, scales[i], x_vals[i], i);
         }
 
         if (COL_PER_WAVE / 2 == 8) {
@@ -461,7 +466,8 @@ __global__ void quant2(
             cur_max = fmaxf(cur_max, max_wave[lane_r][i]);
         }
         __syncthreads();
-        if (org_tok_id >= M) return; // oob write
+        //if (org_tok_id >= M) return; // oob write
+        if (tok_id >= M) return;
         auto row_scale = cur_max / 128.0f;
         row_scale = fmaxf(row_scale, 1e-6f);
         auto inv_row_scale = __builtin_amdgcn_rcpf(row_scale); //1.0f / row_scale;
@@ -513,10 +519,32 @@ __global__ void quant2(
                 0,
                 amd_buffer_coherence_enum::SYSTEM_NT1);
         }
-        if (lane_c == 0 && wave_id == 0) {
-            x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
+        x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
+    };
+
+    #pragma unroll
+    for (int block_i = 0; block_i < BLOCK_M2 / ROW_PER_BLOCK2 - 1; block_i++) {
+        uint next_row_id = r_idx * BLOCK_M2 + (block_i + 1) * ROW_PER_BLOCK2 + lane_r;
+        auto next_raw_id = sorted_id_lds[next_row_id];
+        auto next_tok_id = next_raw_id & 0xffffff;
+        auto next_topk_id = next_raw_id >> 24;
+        auto next_org_tok_id = next_tok_id;
+        //tok_id = tok_id >= M ? 0 : tok_id; // oob
+
+        #pragma unroll
+        for (int i = 0; i < ITEM_PER_LANE; i++) {
+            load_token(x_nex_vals[i], next_tok_id, next_topk_id, lane_c + wave_id * COL_PER_WAVE + i * COL_PER_WAVE * 4);
         }
+        __builtin_amdgcn_sched_barrier(0);
+        loop();
+        for (int i = 0; i < ITEM_PER_LANE; i++) {
+            x_vals[i] = x_nex_vals[i];
+        }
+        topk_id = next_topk_id;
+        tok_id = next_tok_id;
+        row_id = next_row_id;
     }
+    loop();
 }
 
 __global__ __launch_bounds__(64, 1) void quant2_seq(

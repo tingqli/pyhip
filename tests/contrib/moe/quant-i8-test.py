@@ -212,7 +212,7 @@ x1 = torch.randn(num_tokens, topk, inter_dim, dtype=torch.bfloat16)
 
 cur_act, cur_scale = quant_act(x1, topk, M, inter_dim, fc2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids)
 ref_act, ref_scale = torch_ref(x1, topk, M, inter_dim, fc2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids)
-# torch.testing.assert_close(cur_scale, ref_scale)
+torch.testing.assert_close(cur_scale, ref_scale)
 torch.testing.assert_close(cur_act, ref_act, atol=1.1, rtol=200)
 
 mem_size = x1.numel() * x1.element_size() + fc2_smooth_scale.numel() * fc2_smooth_scale.element_size() + sorted_ids.numel() * sorted_ids.element_size() + sorted_expert_ids.numel() * sorted_expert_ids.element_size() + num_valid_ids.numel() * num_valid_ids.element_size() + cur_act.numel() * cur_act.element_size() + cur_scale.numel() * cur_scale.element_size()
