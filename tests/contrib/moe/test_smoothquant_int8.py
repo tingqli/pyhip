@@ -26,13 +26,14 @@ ROW_PER_BLOCK = 4       # rows for quant
 ROW_PER_BLOCK1 = 2      # rows for quant1
 ROW_PER_BLOCK2 = 4      # rows for quant2, threads: 4(x16)
 BLOCK_M2 = 8            # rows for quant2, workgroup size in M
+ROW_PER_BLOCK2_SEQ = 1  # rows for quant2_seq
 DEBUG = True
 QUANT1_K = model_dim
 QUANT2_K = inter_dim
 TOPK = topk
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=}")
+hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=} -D{ROW_PER_BLOCK2_SEQ=}")
 quant = hip.quant
 
 def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True):
