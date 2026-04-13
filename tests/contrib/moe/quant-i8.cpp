@@ -497,20 +497,21 @@ __global__ void __launch_bounds__(256, 1)quant2(
         // }
         #pragma unroll
         for (int i = 0; i < ITEM_PER_LANE; i++) {
-            uint32x2_t qv;
-            float32x2 result[4]; 
-            //#pragma unroll
-            // for (int j = 0; j < 8; j++) {
-            //     //auto val = lds[i * 8 + j] * inv_row_scale;
-            //     result[j] = x_smooth_buf[i][j] * inv_row_scale + 0.5f;
-            //     //qv[j] = max(-128, min(127, (int)roundf(val)));
-            // }
-            result[0] = mul_add_half2(x_smooth[i][0], x_smooth[i][1], inv_row_scale);
-            result[1] = mul_add_half2(x_smooth[i][2], x_smooth[i][3], inv_row_scale);
-            result[2] = mul_add_half2(x_smooth[i][4], x_smooth[i][5], inv_row_scale);
-            result[3] = mul_add_half2(x_smooth[i][6], x_smooth[i][7], inv_row_scale);
-            qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
-            qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
+            charx8 qv;
+            // uint32x2_t qv;
+            // float32x2 result[4]; 
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                auto val = x_smooth[i][j] * inv_row_scale;
+                // result[j] = x_smooth[i][j] * inv_row_scale + 0.5f;
+                qv[j] = max(-128, min(127, (int)roundf(val)));
+            }
+            // result[0] = mul_add_half2(x_smooth[i][0], x_smooth[i][1], inv_row_scale);
+            // result[1] = mul_add_half2(x_smooth[i][2], x_smooth[i][3], inv_row_scale);
+            // result[2] = mul_add_half2(x_smooth[i][4], x_smooth[i][5], inv_row_scale);
+            // result[3] = mul_add_half2(x_smooth[i][6], x_smooth[i][7], inv_row_scale);
+            // qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
+            // qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
             //p_x_out[i * 64 + threadIdx.x] = qv;
             buffer_store_dwordx2(qv, 
                 x_out_res, 
@@ -546,119 +547,6 @@ __global__ void __launch_bounds__(256, 1)quant2(
     }
     loop();
 }
-
-__global__ __launch_bounds__(64, 1) void quant2_seq(
-            __bf16* x,                  // [M, S]
-            float* smooth_scale,        // [E, S]
-            char* x_out,                // [M, TOPK, S]
-            float* x_quant_scale,       // [M, TOPK]
-            uint* expert_ids,           // [M, TOPK]
-            uint M) {
-    // wg: [M//4]
-    uint m_block = blockIdx.x;
-    uint lane_id = threadIdx.x % 64;
-    uint wave_id = threadIdx.x / 64;
-    uint lane_r = lane_id / COL_PER_WAVE;
-    uint lane_c = lane_id % COL_PER_WAVE;
-    auto S = QUANT2_K;
-    //__shared__ __bf16 lds[QUANT2_K];
-    float32x8 x_org_buf[QUANT2_K / 64 / 8];
-    float32x8 x_smooth_buf[QUANT2_K / 64 / 8];
-    __shared__ uint expert_ids_lds[TOPK];
-    if (threadIdx.x < TOPK) {
-        expert_ids_lds[threadIdx.x] = expert_ids[m_block * ROW_PER_BLOCK2_SEQ * TOPK + threadIdx.x];
-    }
-    // __bf16 x_smooth_buf[QUANT2_K / 64 / 8][8];
-    BufferResource x_res(x + (int64_t)m_block * ROW_PER_BLOCK2_SEQ * TOPK * S, 0xffffffff);
-    BufferResource x_out_res(x_out + (int64_t)m_block * ROW_PER_BLOCK2_SEQ * TOPK * S, 0xffffffff);
-
-    auto loop_row = [&] (uint token_id, uint token_id_in_block, uint topk_id) {
-        auto p_smooth_scale = smooth_scale + expert_ids_lds[topk_id] * S;
-        float cur_max = -FLT_MAX;
-        float32x8 scale_buf[QUANT2_K / 64 / 8];
-        for (int i = 0; i < QUANT2_K / 64 / 8; i++) {
-            scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
-        }
-        # pragma unroll
-        for (int i = 0; i < S / 8 / 64; i++) {
-            auto& scale = scale_buf[i];
-            auto x_val = x_org_buf[i];
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                auto tmp = (scale[j] * x_val[j]);
-                //lds[(i * 64 + threadIdx.x) * 8 + j] = tmp;
-                x_smooth_buf[i][j] = tmp;
-                cur_max = fmaxf(cur_max, abs(tmp));
-            }
-        }
-        cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, cur_max), 0xb1, 0xf, 0xf, true))); // 2 3 0 1
-        cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, cur_max), 0x1b, 0xf, 0xf, true))); // 0 1 2 3
-        cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, cur_max), 0x141, 0xf, 0xf, true))); //mirror 8 threads
-        cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, cur_max), 0x140, 0xf, 0xf, true))); //mirror 16 threads
-        // auto tmp = __builtin_bit_cast(int, cur_max);
-        // auto ret = __builtin_amdgcn_permlane16_swap(tmp, tmp, 0, 0);
-        // cur_max = fmaxf(__builtin_bit_cast(float, ret[1]), __builtin_bit_cast(float, ret[0]));
-        // tmp = __builtin_bit_cast(int, cur_max);
-        // cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_permlane32_swap(tmp, tmp, 0, 0)[0]));
-        for(int mask = 64 / 2; mask >= 16; mask /= 2) {
-            cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
-        }
-        auto row_scale = cur_max / 128.0f;
-        row_scale = fmaxf(row_scale, 1e-6f);
-        auto inv_row_scale = __builtin_amdgcn_rcpf(row_scale); //1.0f / row_scale;
-        //charx8* p_x_out = reinterpret_cast<charx8*>(x_out + token_id * TOPK * S + topk_id * S);
-        #pragma unroll
-        for (int i = 0; i < S / 8 / 64; i++) {
-            uint32x2_t qv;
-            float32x2 result[4];
-            //#pragma unroll
-            // for (int j = 0; j < 8; j++) {
-            //     //auto val = lds[i * 8 + j] * inv_row_scale;
-            //     result[j] = x_smooth_buf[i][j] * inv_row_scale + 0.5f;
-            //     //qv[j] = max(-128, min(127, (int)roundf(val)));
-            // }
-            result[0] = mul_add_half2(x_smooth_buf[i][0], x_smooth_buf[i][1], inv_row_scale);
-            result[1] = mul_add_half2(x_smooth_buf[i][2], x_smooth_buf[i][3], inv_row_scale);
-            result[2] = mul_add_half2(x_smooth_buf[i][4], x_smooth_buf[i][5], inv_row_scale);
-            result[3] = mul_add_half2(x_smooth_buf[i][6], x_smooth_buf[i][7], inv_row_scale);
-            qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
-            qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
-            //p_x_out[i * 64 + threadIdx.x] = qv;
-            buffer_store_dwordx2(qv, 
-                x_out_res, 
-                token_id_in_block * TOPK * S + topk_id * S, 
-                (i * 64 + threadIdx.x) * 8, 
-                0,
-                amd_buffer_coherence_enum::SYSTEM_NT1);
-        }
-        x_quant_scale[token_id * TOPK + topk_id] = row_scale;
-        // if (threadIdx.x == 0) {
-        //     x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
-        // }
-    };
-
-    auto load_token = [&] (bfloat16x8& x_val, uint token_id_in_block, uint topk_id, int i) {
-        //x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
-        x_val = buffer_load_dwordx4<bfloat16x8>(x_res, 0, token_id_in_block * TOPK * S * sizeof(__bf16) + topk_id * S * sizeof(__bf16), i * 8 * sizeof(__bf16), (int)amd_buffer_coherence_enum::SYSTEM_NT1);
-    };
-    #pragma unroll
-    for (int t = 0; t < ROW_PER_BLOCK2_SEQ; t++) {
-        uint token_id = m_block * ROW_PER_BLOCK2_SEQ + t;
-        if (token_id >= M) return;
-        #pragma unroll(0)
-        for (int topk_id = 0; topk_id < TOPK; topk_id++) {
-            for (int i = 0; i < QUANT2_K / 64 / 8; i++) {
-                bfloat16x8 tmp;
-                load_token(tmp, t, topk_id, threadIdx.x + i * 64);
-                for (int j = 0; j < 8; j++) {
-                    x_org_buf[i][j] = tmp[j];
-                }
-            }
-            loop_row(token_id, t, topk_id);
-        }
-    }
-}
-
 
 __global__ __launch_bounds__(64, 1) void quant1(
             __bf16* x,                  // [M, S]
@@ -722,20 +610,21 @@ __global__ __launch_bounds__(64, 1) void quant1(
         //charx8* p_x_out = reinterpret_cast<charx8*>(x_out + token_id * TOPK * S + topk_id * S);
         #pragma unroll
         for (int i = 0; i < S / 8 / 64; i++) {
-            uint32x2_t qv;
+            // uint32x2_t qv;
             float32x2 result[4];
-            //#pragma unroll
-            // for (int j = 0; j < 8; j++) {
-            //     //auto val = lds[i * 8 + j] * inv_row_scale;
-            //     result[j] = x_smooth_buf[i][j] * inv_row_scale + 0.5f;
-            //     //qv[j] = max(-128, min(127, (int)roundf(val)));
-            // }
-            result[0] = mul_add_half2(x_smooth_buf[i][0], x_smooth_buf[i][1], inv_row_scale);
-            result[1] = mul_add_half2(x_smooth_buf[i][2], x_smooth_buf[i][3], inv_row_scale);
-            result[2] = mul_add_half2(x_smooth_buf[i][4], x_smooth_buf[i][5], inv_row_scale);
-            result[3] = mul_add_half2(x_smooth_buf[i][6], x_smooth_buf[i][7], inv_row_scale);
-            qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
-            qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
+            charx8 qv;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                auto val = x_smooth_buf[i][j] * inv_row_scale;
+                //result[j] = x_smooth_buf[i][j] * inv_row_scale + 0.5f;
+                qv[j] = max(-128, min(127, (int)roundf(val)));
+            }
+            // result[0] = mul_add_half2(x_smooth_buf[i][0], x_smooth_buf[i][1], inv_row_scale);
+            // result[1] = mul_add_half2(x_smooth_buf[i][2], x_smooth_buf[i][3], inv_row_scale);
+            // result[2] = mul_add_half2(x_smooth_buf[i][4], x_smooth_buf[i][5], inv_row_scale);
+            // result[3] = mul_add_half2(x_smooth_buf[i][6], x_smooth_buf[i][7], inv_row_scale);
+            // qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
+            // qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
             //p_x_out[i * 64 + threadIdx.x] = qv;
             buffer_store_dwordx2(qv, 
                 x_out_res, 
@@ -754,6 +643,7 @@ __global__ __launch_bounds__(64, 1) void quant1(
         //x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
         x_val = buffer_load_dwordx4<bfloat16x8>(x_res, 0, token_id_in_block * S * sizeof(__bf16), i * 8 * sizeof(__bf16), (int)amd_buffer_coherence_enum::SYSTEM_NT1);
     };
+    __syncthreads();
     #pragma unroll
     for (int t = 0; t < ROW_PER_BLOCK1; t++) {
         uint token_id = m_block * ROW_PER_BLOCK1 + t;

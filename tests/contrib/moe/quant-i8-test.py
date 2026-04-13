@@ -17,9 +17,7 @@ ROW_PER_BLOCK = 4       # rows for quant
 ROW_PER_BLOCK1 = 1      # rows for quant1
 ROW_PER_BLOCK2 = 4      # rows for quant2, threads: 4(x16)
 BLOCK_M2 = 8            # rows for quant2, workgroup size in M
-ROW_PER_BLOCK2_SEQ = 1  # rows for quant2_seq
 TOPK = 20
-DEBUG = True
 num_tokens = 19149
 # num_tokens = 1
 model_dim, inter_dim = 4096, 1536
@@ -28,7 +26,7 @@ QUANT1_K = model_dim
 QUANT2_K = inter_dim
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=} -D{ROW_PER_BLOCK2_SEQ=}")
+hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=}")
 quant = hip.quant
 
 def int8_ptpc(a):
@@ -42,7 +40,7 @@ def int8_ptpc(a):
 def div_up(x, y):
     return (x + y - 1) // y
 
-def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True, topk_ids=None):
+def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True, topk_ids=None, DEBUG=True):
     device = x.device
     if DEBUG:
         x_quant = torch.ones((M, topk, model_dim), dtype=torch.int8, device=device)
@@ -64,30 +62,19 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
                 M
                 )
     else:
-        if 1:
-            assert inter_dim * TOPK * num_tokens * 2 < 2**32-1, "quant2 kernel use buffer load, not greater than 4GB"
-            hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // BLOCK_M2], [256], 
-                x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
-                sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
-                M
-                )
-        else:
-            hip.quant2_seq([div_up(M, ROW_PER_BLOCK2_SEQ)], [64], 
-                x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
-                topk_ids.data_ptr(),
-                M
-                )
+        assert inter_dim * TOPK * num_tokens * 2 < 2**32-1, "quant2 kernel use buffer load, not greater than 4GB"
+        hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // BLOCK_M2], [256], 
+            x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
+            sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+            M
+            )
 
     return x_quant, x_quant_scale
 
 def torch_ref(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids):
     device = x.device
-    if DEBUG:
-        x_quant = torch.ones((M, topk, model_dim), dtype=torch.int8, device=device)
-        x_quant_scale = torch.ones([sorted_expert_ids.shape[0], BLOCK_SIZE_M], dtype=torch.float32, device=device)
-    else:
-        x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
-        x_quant_scale = torch.empty([sorted_expert_ids.shape[0], BLOCK_SIZE_M], dtype=torch.float32, device=device)
+    x_quant = torch.ones((M, topk, model_dim), dtype=torch.int8, device=device)
+    x_quant_scale = torch.ones([sorted_expert_ids.shape[0], BLOCK_SIZE_M], dtype=torch.float32, device=device)
 
     def smoothquant_per_tok(x, x_smooth_scale, topk):
         # print(x_smooth_scale.shape, num_valid_ids)
@@ -206,7 +193,7 @@ mem_size = x.numel() * x.element_size() + fc1_smooth_scale.numel() * fc1_smooth_
 print(f'gemm1 quantization, mem size {mem_size/1000/1000:.2f} MB')
 for _ in range(10):
     with pyhip.cudaPerf(0, mem_size, name=f"quant1") as p:
-        quant_act(x, topk, M, model_dim, fc1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True, topk_ids)
+        quant_act(x, topk, M, model_dim, fc1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True, topk_ids, DEBUG=False)
 
 x1 = torch.randn(num_tokens, topk, inter_dim, dtype=torch.bfloat16)
 
@@ -219,4 +206,4 @@ mem_size = x1.numel() * x1.element_size() + fc2_smooth_scale.numel() * fc2_smoot
 print(f"gemm2 input size {mem_size/1000/1000:.2f} MB")
 for _ in range(10):
     with pyhip.cudaPerf(0, mem_size, name=f"quant2") as p:
-        quant_act(x1, topk, M, inter_dim, fc2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids)
+        quant_act(x1, topk, M, inter_dim, fc2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids, DEBUG=False)

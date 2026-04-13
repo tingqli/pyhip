@@ -23,17 +23,16 @@ topk = 20
 
 BLOCK_SIZE_M = 256
 ROW_PER_BLOCK = 4       # rows for quant
-ROW_PER_BLOCK1 = 2      # rows for quant1
+ROW_PER_BLOCK1 = 1      # rows for quant1
 ROW_PER_BLOCK2 = 4      # rows for quant2, threads: 4(x16)
 BLOCK_M2 = 8            # rows for quant2, workgroup size in M
-ROW_PER_BLOCK2_SEQ = 1  # rows for quant2_seq
 DEBUG = True
 QUANT1_K = model_dim
 QUANT2_K = inter_dim
 TOPK = topk
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=} -D{ROW_PER_BLOCK2_SEQ=}")
+hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=}")
 quant = hip.quant
 
 def div_up(x, y):
@@ -49,7 +48,6 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
         x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
         x_quant_scale = torch.empty([sorted_ids.shape[0]], dtype=torch.float32, device=device)
     if is_gemm1:
-        # TODO: quant1 use topk_ids
         if 0:
             quant([sorted_expert_ids.shape[0], BLOCK_SIZE_M // ROW_PER_BLOCK], [64], 
                 x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
