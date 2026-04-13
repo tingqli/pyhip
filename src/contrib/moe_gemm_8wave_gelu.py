@@ -67,17 +67,37 @@ def moe_gemm_8wave_gelu(J,
     num_groupped_blocks = num_blocks - (num_blocks % NUM_CU)
     blk_m = J.gpr("su32")
     blk_n = J.gpr("su32")
-    with J.If(blk1d < num_groupped_blocks) as If:
-        blk_base = (blk1d // NUM_CU) * NUM_CU
-        cu_id = blk1d % NUM_CU
-        xcd_id = cu_id % 8
-        xcd_cu = cu_id // 8
-        task_id = xcd_id * 32 + xcd_cu
-        new_blk1d = blk_base + task_id
-        blk_m[0] = new_blk1d // num_oc_blocks
-        blk_n[0] = new_blk1d - blk_m * num_oc_blocks
+    if num_oc_blocks == 16:
+        # in unit of 4x8 [256x256] blocks
+        with J.If(blk1d < num_groupped_blocks) as If:
+            blk_base = (blk1d // NUM_CU) * NUM_CU
+            cu_id = blk1d % NUM_CU
+            xcd_id = cu_id % 8  # 0~8
+            xcd_cu = cu_id // 8 # 0~31
+            coord_n = (xcd_id % 2)*8 + (xcd_cu % 8)
+            coord_m = (xcd_id // 2)*4 + (xcd_cu // 8)
+            task_id = coord_m * num_oc_blocks + coord_n
+            new_blk1d = blk_base + task_id
+            blk_m[0] = new_blk1d // num_oc_blocks
+            blk_n[0] = new_blk1d - blk_m * num_oc_blocks            
+            If.Else()
+            blk_m[0] = blk1d // num_oc_blocks
+            blk_n[0] = blk1d - blk_m * num_oc_blocks
+    elif 1:
+        with J.If(blk1d < num_groupped_blocks) as If:
+            blk_base = (blk1d // NUM_CU) * NUM_CU
+            cu_id = blk1d % NUM_CU
+            xcd_id = cu_id % 8
+            xcd_cu = cu_id // 8
+            task_id = xcd_id * 32 + xcd_cu
+            new_blk1d = blk_base + task_id
+            blk_m[0] = new_blk1d // num_oc_blocks
+            blk_n[0] = new_blk1d - blk_m * num_oc_blocks
 
-        If.Else()
+            If.Else()
+            blk_m[0] = blk1d // num_oc_blocks
+            blk_n[0] = blk1d - blk_m * num_oc_blocks
+    else:
         blk_m[0] = blk1d // num_oc_blocks
         blk_n[0] = blk1d - blk_m * num_oc_blocks
 
