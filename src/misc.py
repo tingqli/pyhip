@@ -14,7 +14,7 @@ cudaPerf may be nested, env CUDAPERF:
 CUDAPERF = os.getenv("CUDAPERF", None)
 try:
     CUDAPERF = int(CUDAPERF)
-except ValueError:
+except:
     pass
 
 class cudaPerf(object):
