@@ -4,7 +4,7 @@ import triton.language as tl
 from functools import cache
 
 from pyhip.contrib.gluon.fuse_sigmoid_mul_gemm import fuse_sigmoid_mul_gemm_kernel
-from pyhip.contrib.gluon.gemm_splitk import gemm_splitk_kernel
+#from pyhip.contrib.gluon.gemm_splitk import gemm_splitk_kernel
 
 #####################################################################
 from pyhip import cudaPerf
@@ -72,8 +72,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     attn = (torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16) + 1) * 0.001
     gate = (torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16) + 1) * 0.001
     # 融合后的左矩阵，供 gemm / aiter；gate 保持未 sigmoid，供 torch_ref
-    g = torch.sigmoid(gate.to(torch.bfloat16))
-    # A = attn * g
+   
     from aiter.ops.shuffle import shuffle_weight
     import aiter
     if weight_type == torch.float4_e2m1fn_x2:
@@ -135,7 +134,6 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             BLOCK_TILE_SIZE_N = TILE_N
 
             x = fuse_sigmoid_mul_gemm_kernel[(div_up(N, BLOCK_TILE_SIZE_N) * div_up(M, BLOCK_TILE_SIZE_M),)](
-                #A,                # bf16 [M, K]
                 attn,
                 gate,
                 weight.T,         # bf16 [K/8 * 16 * 8, N/16]
@@ -303,7 +301,7 @@ if __name__ == '__main__':
     # N, K = 4096*8*2, 8192 # 4096*8*2 /128 = 512
    # Ms = [16, 32, 64, 128, 256]
     M, N ,K = 1,4096,1024
-    Ms = [1]
+    Ms = [1,4,16]
     perf = {}
     dict_tile_mn = {}
 
