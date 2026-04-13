@@ -50,18 +50,20 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
         x_quant_scale = torch.empty([sorted_ids.shape[0]], dtype=torch.float32, device=device)
     if is_gemm1:
         # TODO: quant1 use topk_ids
-        if 1:
+        if 0:
             quant([sorted_expert_ids.shape[0], BLOCK_SIZE_M // ROW_PER_BLOCK], [64], 
                 x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
                 sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
                 M, model_dim, 1
                 )
+            x_quant_scale.is_sorted = True
         else:
             hip.quant1([div_up(M, ROW_PER_BLOCK1)], [64], 
                 x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
                 topk_ids.data_ptr(),
                 M
                 )
+            x_quant_scale.is_sorted = False
     else:
         hip.quant2([sorted_expert_ids.shape[0], BLOCK_SIZE_M // BLOCK_M2], [256], 
             x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
@@ -243,7 +245,11 @@ def fused_moe_gelu_sqi8(
                 print(pc_scale[expert_id, None, :, 0].shape)
                 assert 0
 
-            cur_out = cur_out * pt_scale[i0:(i0+cur_num_toks), None] * pc_scale[expert_id, None, :, 0]
+            if getattr(pt_scale, "is_sorted", True):
+                cur_pt_scale = pt_scale[i0:(i0+cur_num_toks), None]
+            else:
+                cur_pt_scale = pt_scale.view(-1, topk)[tok_id, topk_id, None]
+            cur_out = cur_out * cur_pt_scale * pc_scale[expert_id, None, :, 0]
 
             if stage_index == 1:
                 cur_out = torch.nn.functional.gelu(cur_out)
@@ -255,13 +261,16 @@ def fused_moe_gelu_sqi8(
     def moe_gemm_jit(output, input, pt_scale, weight, pc_scale, stage_index):
         AB_dtype = "s8"
         is_input_over_4GB = input.numel() * input.element_size() > (1<<32)
+        is_pt_scale_sorted = getattr(pt_scale, "is_sorted", True)
         wg_M, wg_N = 256, 256
         is_gate_up = (stage_index == 1)
         bpreshuffle = False
         num_tokens = input.shape[0]
         num_oc_blocks = output.shape[-1] // wg_N
         num_e_blocks = sorted_expert_ids.shape[0]
-        moe_gemm_8wave_gelu([num_oc_blocks * num_e_blocks],[8*64], is_input_over_4GB,
+        moe_gemm_8wave_gelu([num_oc_blocks * num_e_blocks],[8*64],
+                        is_input_over_4GB,
+                        is_pt_scale_sorted,
                         AB_dtype, wg_M, wg_N,
                         E, output.shape[-1], input.shape[-1], 
                         is_gate_up, bpreshuffle, topk,
@@ -388,7 +397,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
     print(f"{pyhip.calc_diff(ref0, ret_asm)=:.6f}")
     if ret_jit is not None:
         print(f"{pyhip.calc_diff(ref0, ret_jit)=:.6f}")
-        print(f"{pyhip.calc_diff(ref2, ret_jit, 0.01)=:.6f}")
+        print(f"{pyhip.calc_diff(ref2, ret_jit, -0.01)=:.6f}")
 
 
 if __name__ == "__main__":

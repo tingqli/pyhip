@@ -22,7 +22,9 @@ support bf16/int8_PTPC/mxfp4
 """
 
 @jit(with_debug_log=False)
-def moe_gemm_8wave_gelu(J, is_input_over_4GB,
+def moe_gemm_8wave_gelu(J,
+                   is_input_over_4GB,
+                   is_pt_scale_sorted,
                    AB_dtype, wg_M, wg_N,
                    NUM_EXPERTS, OC, IC, 
                    gate_up, bpreshuffle, TOPK,
@@ -180,14 +182,26 @@ def moe_gemm_8wave_gelu(J, is_input_over_4GB,
         J.wg_load_lds(lds_pc_scales, pScaleB, wg_N * J.sizeof_DW, num_warps = num_warps, wait_barrier = False)
 
         lds_pt_scales = J.alloc_lds(wg_M * J.sizeof_DW)
-        pScaleA[:] += blk_m * (wg_M * J.sizeof_DW)
-        J.wg_load_lds(lds_pt_scales, pScaleA, wg_M * J.sizeof_DW, num_warps = num_warps, wait_barrier = False)
+        if is_pt_scale_sorted:
+            pScaleA[:] += blk_m * (wg_M * J.sizeof_DW)
+            J.wg_load_lds(lds_pt_scales, pScaleA, wg_M * J.sizeof_DW, num_warps = num_warps, wait_barrier = False)
 
     if gate_up:
         J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
     else:
         J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
         J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
+
+    if AB_dtype == "s8" and (not is_pt_scale_sorted):
+        # unsorted per-token scale of shape of [num_tokens, topk]
+        with J.ExecMask(J.threadIdx.x < wg_M):
+            vrow = J.gpr("vu32")
+            vaddr = J.gpr("vu32", J.threadIdx.x  * J.sizeof_u32 + lds_sorted_ids)
+            J.ds_read_b32(vrow, vaddr)
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            voff = J.gpr("vu32", (vrow & 0xFFFFFF) * (TOPK * J.sizeof_f32) + (vrow >> 24) * J.sizeof_f32)
+            J.s_mov_b32("m0", J.warp_id[0] * (64 * J.sizeof_f32) + lds_pt_scales)
+            J.global_load_lds_dword(voff, pScaleA)
 
     vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, LOADER_TOPK, num_tokens, input, is_input_over_4GB)
     vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*MINI_BLOCK_N)
