@@ -1,3 +1,4 @@
+#define HIP_ENABLE_EXTRA_WARP_SYNC_TYPES
 #include <__clang_hip_runtime_wrapper.h>
 #include <bit>
 #include <cfloat>
@@ -237,13 +238,47 @@ __device__ void amdgcn_mfma_f32_16x16x16bf16(bfloat16x4 a, bfloat16x4 b, float32
 
 __device__ uint float4_to_uint(float f0, float f1, float f2, float f3) {
     uint out;
-    asm ("v_cvt_i32_f32_sdwa %0, %1 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD\n\t"
-                : "+v"(out)
+    float low = -128.0f;
+    float high = 127.0f;
+    asm ("v_rndne_f32 %0, %1 \n\t"
+                : "+v"(f0)
+                : "v"(f0)
+                : );
+    asm ("v_rndne_f32 %0, %1 \n\t"
+                : "+v"(f1)
                 : "v"(f1)
+                : );
+    asm ("v_rndne_f32 %0, %1 \n\t"
+                : "+v"(f2)
+                : "v"(f2)
+                : );
+    asm ("v_rndne_f32 %0, %1 \n\t"
+                : "+v"(f3)
+                : "v"(f3)
+                : );
+    asm ("v_med3_f32 %0, %1, %2, %3 \n\t"
+                : "+v"(f0)
+                : "v"(f0), "v"(high), "v"(low)
+                : );
+    asm ("v_med3_f32 %0, %1, %2, %3 \n\t"
+                : "+v"(f1)
+                : "v"(f1), "v"(high), "v"(low)
+                : );
+    asm ("v_med3_f32 %0, %1, %2, %3 \n\t"
+                : "+v"(f2)
+                : "v"(f2), "v"(high), "v"(low)
+                : );
+    asm ("v_med3_f32 %0, %1, %2, %3 \n\t"
+                : "+v"(f3)
+                : "v"(f3), "v"(high), "v"(low)
                 : );
     asm ("v_cvt_i32_f32_sdwa %0, %1 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD\n\t"
                 : "+v"(out)
                 : "v"(f0)
+                : );
+    asm ("v_cvt_i32_f32_sdwa %0, %1 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD\n\t"
+                : "+v"(out)
+                : "v"(f1)
                 : );
     asm ("v_cvt_i32_f32_sdwa %0, %1 dst_sel:BYTE_2 dst_unused:UNUSED_PRESERVE src0_sel:DWORD\n\t"
                 : "+v"(out)
@@ -256,11 +291,11 @@ __device__ uint float4_to_uint(float f0, float f1, float f2, float f3) {
     return out;
 }
 
-__device__ float32x2 mul_add_half2(float f0_0, float f0_1, float f2) {
+__device__ float32x2 mul_f32x2(float f0_0, float f0_1, float f2) {
     float32x2 out;
     float32x2 f0 = {f0_0, f0_1};
     float32x2 f2_dup = {f2, f2};
-    asm ("v_pk_fma_f32 %0, %1, %2, 0.5 \n\t"
+    asm ("v_pk_mul_f32 %0, %1, %2\n\t"
                 : "=v"(out)
                 : "v"(f0), "v"(f2_dup)
                 : );
@@ -497,21 +532,14 @@ __global__ void __launch_bounds__(256, 1)quant2(
         // }
         #pragma unroll
         for (int i = 0; i < ITEM_PER_LANE; i++) {
-            charx8 qv;
-            // uint32x2_t qv;
-            // float32x2 result[4]; 
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                auto val = x_smooth[i][j] * inv_row_scale;
-                // result[j] = x_smooth[i][j] * inv_row_scale + 0.5f;
-                qv[j] = max(-128, min(127, (int)roundf(val)));
-            }
-            // result[0] = mul_add_half2(x_smooth[i][0], x_smooth[i][1], inv_row_scale);
-            // result[1] = mul_add_half2(x_smooth[i][2], x_smooth[i][3], inv_row_scale);
-            // result[2] = mul_add_half2(x_smooth[i][4], x_smooth[i][5], inv_row_scale);
-            // result[3] = mul_add_half2(x_smooth[i][6], x_smooth[i][7], inv_row_scale);
-            // qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
-            // qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
+            uint32x2_t qv;
+            float32x2 result[4]; 
+            result[0] = mul_f32x2(x_smooth[i][0], x_smooth[i][1], inv_row_scale);
+            result[1] = mul_f32x2(x_smooth[i][2], x_smooth[i][3], inv_row_scale);
+            result[2] = mul_f32x2(x_smooth[i][4], x_smooth[i][5], inv_row_scale);
+            result[3] = mul_f32x2(x_smooth[i][6], x_smooth[i][7], inv_row_scale);
+            qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
+            qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
             //p_x_out[i * 64 + threadIdx.x] = qv;
             buffer_store_dwordx2(qv, 
                 x_out_res, 
@@ -572,13 +600,28 @@ __global__ __launch_bounds__(64, 1) void quant1(
     // __bf16 x_smooth_buf[QUANT1_K / 64 / 8][8];
     BufferResource x_res(x + (int64_t)m_block * ROW_PER_BLOCK1 * S, 0xffffffff);
     BufferResource x_out_res(x_out + (int64_t)m_block * ROW_PER_BLOCK1 * TOPK * S, 0xffffffff);
+    BufferResource smooth_scale_res(smooth_scale, 0xffffffff);//M * S * sizeof(float));
 
     auto loop_row = [&] (__bf16* p_x, uint token_id, uint token_id_in_block, uint topk_id) {
-        auto p_smooth_scale = smooth_scale + expert_ids_lds[topk_id] * S;
+        //auto p_smooth_scale = smooth_scale + expert_ids_lds[topk_id] * S;
+        auto p_smooth_scale = smooth_scale + expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id] * S;
         float cur_max = -FLT_MAX;
         float32x8 scale_buf[QUANT1_K / 64 / 8];
+        #pragma unroll
         for (int i = 0; i < QUANT1_K / 64 / 8; i++) {
-            scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
+            //scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
+            float32x4 tmp[2];
+            tmp[0] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                 0,
+                 (expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id] * S) * sizeof(float) + (threadIdx.x + i * 64) * 8 * sizeof(float),
+                 0,
+                 (int)amd_buffer_coherence_enum::glc);
+            tmp[1] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                 0,
+                 (expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id] * S) * sizeof(float) + (threadIdx.x + i * 64) * 8 * sizeof(float) + 4 * sizeof(float),
+                 0,
+                 (int)amd_buffer_coherence_enum::glc);
+            scale_buf[i] = {tmp[0][0], tmp[0][1], tmp[0][2], tmp[0][3], tmp[1][0], tmp[1][1], tmp[1][2], tmp[1][3]};
         }
         # pragma unroll
         for (int i = 0; i < S / 8 / 64; i++) {
@@ -592,39 +635,21 @@ __global__ __launch_bounds__(64, 1) void quant1(
                 cur_max = fmaxf(cur_max, abs(tmp));
             }
         }
-        cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, cur_max), 0xb1, 0xf, 0xf, true))); // 2 3 0 1
-        cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, cur_max), 0x1b, 0xf, 0xf, true))); // 0 1 2 3
-        cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, cur_max), 0x141, 0xf, 0xf, true))); //mirror 8 threads
-        cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, cur_max), 0x140, 0xf, 0xf, true))); //mirror 16 threads
-        // auto tmp = __builtin_bit_cast(int, cur_max);
-        // auto ret = __builtin_amdgcn_permlane16_swap(tmp, tmp, 0, 0);
-        // cur_max = fmaxf(__builtin_bit_cast(float, ret[1]), __builtin_bit_cast(float, ret[0]));
-        // tmp = __builtin_bit_cast(int, cur_max);
-        // cur_max = fmaxf(cur_max, __builtin_bit_cast(float, __builtin_amdgcn_permlane32_swap(tmp, tmp, 0, 0)[0]));
-        for(int mask = 64 / 2; mask >= 16; mask /= 2) {
-            cur_max = fmaxf(cur_max, __shfl_xor(cur_max, mask));
-        }
+        cur_max = __reduce_max_sync(0xffffffffffffffff, cur_max);
         auto row_scale = cur_max / 128.0f;
         row_scale = fmaxf(row_scale, 1e-6f);
         auto inv_row_scale = __builtin_amdgcn_rcpf(row_scale); //1.0f / row_scale;
         //charx8* p_x_out = reinterpret_cast<charx8*>(x_out + token_id * TOPK * S + topk_id * S);
         #pragma unroll
         for (int i = 0; i < S / 8 / 64; i++) {
-            // uint32x2_t qv;
             float32x2 result[4];
-            charx8 qv;
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                auto val = x_smooth_buf[i][j] * inv_row_scale;
-                //result[j] = x_smooth_buf[i][j] * inv_row_scale + 0.5f;
-                qv[j] = max(-128, min(127, (int)roundf(val)));
-            }
-            // result[0] = mul_add_half2(x_smooth_buf[i][0], x_smooth_buf[i][1], inv_row_scale);
-            // result[1] = mul_add_half2(x_smooth_buf[i][2], x_smooth_buf[i][3], inv_row_scale);
-            // result[2] = mul_add_half2(x_smooth_buf[i][4], x_smooth_buf[i][5], inv_row_scale);
-            // result[3] = mul_add_half2(x_smooth_buf[i][6], x_smooth_buf[i][7], inv_row_scale);
-            // qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
-            // qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
+            uint32x2_t qv;
+            result[0] = mul_f32x2(x_smooth_buf[i][0], x_smooth_buf[i][1], inv_row_scale);
+            result[1] = mul_f32x2(x_smooth_buf[i][2], x_smooth_buf[i][3], inv_row_scale);
+            result[2] = mul_f32x2(x_smooth_buf[i][4], x_smooth_buf[i][5], inv_row_scale);
+            result[3] = mul_f32x2(x_smooth_buf[i][6], x_smooth_buf[i][7], inv_row_scale);
+            qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
+            qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
             //p_x_out[i * 64 + threadIdx.x] = qv;
             buffer_store_dwordx2(qv, 
                 x_out_res, 
@@ -643,7 +668,7 @@ __global__ __launch_bounds__(64, 1) void quant1(
         //x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
         x_val = buffer_load_dwordx4<bfloat16x8>(x_res, 0, token_id_in_block * S * sizeof(__bf16), i * 8 * sizeof(__bf16), (int)amd_buffer_coherence_enum::SYSTEM_NT1);
     };
-    __syncthreads();
+    // __syncthreads();
     #pragma unroll
     for (int t = 0; t < ROW_PER_BLOCK1; t++) {
         uint token_id = m_block * ROW_PER_BLOCK1 + t;
@@ -656,7 +681,7 @@ __global__ __launch_bounds__(64, 1) void quant1(
                 x_org_buf[i][j] = tmp[j];
             }
         }
-        #pragma unroll(0)
+        #pragma unroll
         for (int topk_id = 0; topk_id < TOPK; topk_id++) {
             loop_row(p_x, token_id, t, topk_id);
         }
