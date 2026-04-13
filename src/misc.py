@@ -5,8 +5,17 @@ __all__ = [
 ]
 
 import os
-# keyword used to filter cudaPerf according to name
-CUDAPERF = os.getenv("CUDAPERF","")
+"""
+cudaPerf may be nested, env CUDAPERF:
+ - string : keyword used to filter cudaPerf according to name
+ - int(0,1,...): nest level euqal or below this is enabled
+ - Undef: all is enabled
+"""
+CUDAPERF = os.getenv("CUDAPERF", None)
+try:
+    CUDAPERF = int(CUDAPERF)
+except ValueError:
+    pass
 
 class cudaPerf(object):
     nested_depth = 0
@@ -14,7 +23,12 @@ class cudaPerf(object):
     def __init__(self, flops = 0, rw_bytes = 0, name="", verbose=1):
         global torch
         import torch
-        self.enable = (CUDAPERF in name)
+        if CUDAPERF is None:
+            self.enable = True
+        elif isinstance(CUDAPERF, int):
+            self.enable = cudaPerf.nested_depth <= CUDAPERF
+        else:
+            self.enable = (CUDAPERF in name)
         self.flops = flops
         self.name = name
         self.verbose = verbose
