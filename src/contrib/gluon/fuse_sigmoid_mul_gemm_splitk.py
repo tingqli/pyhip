@@ -16,7 +16,7 @@ from triton.experimental.gluon.language.amd.cdna3 import (
 from pyhip import div_up
 
 __all__ = [
-    'fuse_sigmoid_mul_gemm_kernel','get_fuse_sigmoid_mul_gemm'
+    'fuse_sigmoid_mul_gemm_kernel_splitk','get_fuse_sigmoid_mul_gemm_splitk'
 ]
 
 def fuse_sigmoid_mul_gemm(input: torch.Tensor,
@@ -265,7 +265,7 @@ class Args:
         return lds_layout_write
     
 @gluon.jit
-def fuse_sigmoid_mul_gemm_kernel(
+def fuse_sigmoid_mul_gemm_splitk_kernel(
     #p_input,            # bf16 [M, K]
     p_attn,             # bf16 [M, K]
     p_gate,             # bf16 [M, K]

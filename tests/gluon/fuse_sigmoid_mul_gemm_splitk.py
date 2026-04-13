@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from functools import cache
 
-from pyhip.contrib.gluon.fuse_sigmoid_mul_gemm import fuse_sigmoid_mul_gemm_kernel
+from pyhip.contrib.gluon.fuse_sigmoid_mul_gemm_splitk import fuse_sigmoid_mul_gemm_splitk_kernel
 #from pyhip.contrib.gluon.gemm_splitk import gemm_splitk_kernel
 
 #####################################################################
@@ -133,7 +133,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             BLOCK_TILE_SIZE_M = TILE_M
             BLOCK_TILE_SIZE_N = TILE_N
 
-            x = fuse_sigmoid_mul_gemm_kernel[(div_up(N, BLOCK_TILE_SIZE_N) * div_up(M, BLOCK_TILE_SIZE_M),)](
+            x = fuse_sigmoid_mul_gemm_splitk_kernel[(div_up(N, BLOCK_TILE_SIZE_N) * div_up(M, BLOCK_TILE_SIZE_M),)](
                 attn,
                 gate,
                 weight.T,         # bf16 [K/8 * 16 * 8, N/16]
