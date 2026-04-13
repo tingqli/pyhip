@@ -321,11 +321,12 @@ def fuse_sigmoid_mul_gemm_kernel(
         weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
     
     b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offsets, cache='.cg')
-    acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
     attn = gl.amd.cdna3.buffer_load(p_attn, mem_a_offsets).to(gl.float32)
     gate_val =  gl.amd.cdna3.buffer_load(p_gate, mem_a_offsets).to(gl.float32)
-    sig = 1.0 / (1.0 + gl.exp(-gate_val))
-    a = (sig*attn).to(gl.bfloat16)
+    acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
+   
+    # sig = 1.0 / (1.0 + gl.exp(-gate_val))
+    # a = (sig*attn).to(gl.bfloat16)
     #a = gl.amd.cdna3.buffer_load(p_input, mem_a_offsets)
     
     s_vmem_read: gl.constexpr = 0x0020
@@ -341,12 +342,15 @@ def fuse_sigmoid_mul_gemm_kernel(
         else:
             b_offsets = mem_b_offsets + k_start + BLOCK_TILE_SIZE_K
         #next_a = gl.amd.cdna3.buffer_load(p_input, a_offsets)
-        mext_attn = gl.amd.cdna3.buffer_load(p_attn, a_offsets).to(gl.float32)
+        next_attn = gl.amd.cdna3.buffer_load(p_attn, a_offsets).to(gl.float32)
         next_gate_val =  gl.amd.cdna3.buffer_load(p_gate, a_offsets).to(gl.float32)
-        next_sig = 1.0 / (1.0 + gl.exp(-next_gate_val))
-        next_a = (next_sig *mext_attn).to(gl.bfloat16)
-        
+        # next_sig = 1.0 / (1.0 + gl.exp(-next_gate_val))
+        # next_a = (next_sig *mext_attn).to(gl.bfloat16)
+  
         next_b = gl.amd.cdna3.buffer_load(p_weight, b_offsets, cache='.cg')
+        _amd_iglp_sched_barrier(0)
+        sig = 1.0 / (1.0 + gl.exp(-gate_val))
+        a = (sig*attn).to(gl.bfloat16)
         if weight_dtype == torch.float8_e4m3fn:
             mem_scale_offsets += num_warps
             next_weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
@@ -377,7 +381,9 @@ def fuse_sigmoid_mul_gemm_kernel(
                 b = b.reshape(num_warps, 4, 8, BLOCK_TILE_SIZE_N).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N)
             b_fma = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
             acc = gl.amd.cdna4.mfma(a_fma, b_fma, acc)
-        a = next_a
+        #a = next_a
+        attn = next_attn
+        gate_val = next_gate_val
         b = next_b
         if weight_dtype == torch.float8_e4m3fn:
             weight_scale = next_weight_scale
@@ -403,6 +409,8 @@ def fuse_sigmoid_mul_gemm_kernel(
         local_acc = gl.amd.cdna4.mfma(a1_fma, b1_fma, local_acc)
         acc += local_acc * weight_scale
     else:
+        sig = 1.0 / (1.0 + gl.exp(-gate_val))
+        a = (sig*attn).to(gl.bfloat16)
         a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
         a_fma = gl.convert_layout(a, a_fma_layout, assert_trivial=True)
         if SHUFFLE:

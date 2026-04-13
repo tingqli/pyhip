@@ -73,7 +73,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     gate = (torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16) + 1) * 0.001
     # 融合后的左矩阵，供 gemm / aiter；gate 保持未 sigmoid，供 torch_ref
     g = torch.sigmoid(gate.to(torch.bfloat16))
-    A = attn * g
+    # A = attn * g
     from aiter.ops.shuffle import shuffle_weight
     import aiter
     if weight_type == torch.float4_e2m1fn_x2:
@@ -128,7 +128,7 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         assert attn.shape==gate.shape
         # print("M",M ,"K",K)
         N = w_ref.shape[0]
-        gemm_out = torch.empty([M, N], dtype=A.dtype, device=A.device)
+        gemm_out = torch.empty([M, N], dtype=attn.dtype, device=attn.device)
         num_warps = 4
         if kernel_type == 'mxn_splitk_2s':
             BLOCK_TILE_SIZE_M = TILE_M
