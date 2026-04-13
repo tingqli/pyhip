@@ -138,7 +138,8 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
                    weight:"void*",pScaleB:"void*",
                    input:"void*", pScaleA:"void*",
                    output:"void*",
-                   num_tokens:"uint"):
+                   num_tokens:"uint",
+                   num_blocks:"uint"):
     num_warps = 8
 
     assert AB_dtype in ["fp8", "bf16", "fp16", "f16"]
@@ -151,8 +152,35 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
     stride_k = IC * J.sizeof(AB_dtype)
     #stride_gate_up = J.div(J.div(OC, wg_N), 2) * wg_N * stride_k
 
-    blk_n = J.blockIdx.x # split along OC
-    blk_m = J.blockIdx.y
+    #blk_n = J.blockIdx.x # split along OC
+    #blk_m = J.blockIdx.y
+
+    blk1d = J.blockIdx.x
+    NUM_CU = 256
+    num_oc_blocks = J.div(OC, wg_N)
+    num_groupped_blocks = num_blocks - (num_blocks % NUM_CU)
+    blk_m = J.gpr("su32")
+    blk_n = J.gpr("su32")
+    use_xcd_swizzle = 1
+    if use_xcd_swizzle:
+        with J.If(blk1d < num_groupped_blocks) as If:
+            blk_base = (blk1d // NUM_CU) * NUM_CU
+            cu_id = blk1d % NUM_CU
+            xcd_id = cu_id % 8
+            xcd_cu = cu_id // 8
+            task_id = xcd_id * 32 + xcd_cu
+            new_blk1d = blk_base + task_id
+            blk_m[0] = new_blk1d // num_oc_blocks
+            blk_n[0] = new_blk1d - blk_m * num_oc_blocks
+
+            If.Else()
+            blk_m[0] = blk1d // num_oc_blocks
+            blk_n[0] = blk1d - blk_m * num_oc_blocks
+    else:
+        blk_m[0] = blk1d // num_oc_blocks
+        blk_n[0] = blk1d - blk_m * num_oc_blocks
+
+
     #blk_m[0] *= 0
     expert_id = J.gpr(1, 'su32')
     J.s_load_dword(expert_id, sorted_expert_ids, blk_m[0] * J.sizeof_u32)

@@ -431,7 +431,7 @@ def fused_moe(
                                     hidden_states, w1, a2, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w1_scale[0] if w1_scale is not None else None, B,
                                     w1.dtype, topk, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
             else:
-                moe_gemm_8wave_g1u1([num_oc_blocks, num_e_blocks], [8*64],
+                moe_gemm_8wave_g1u1([num_oc_blocks * num_e_blocks], [8*64],
                         a1.element_size() * a1.numel() > (1<<32),
                         AB_dtype, wg_M, wg_N,
                         E, inter_dim*2, model_dim, 
@@ -443,7 +443,7 @@ def fused_moe(
                         w1.data_ptr(), None if w1_scale is None else w1_scale.data_ptr(),
                         a1.data_ptr(), None if a1_scale is None else a1_scale.data_ptr(),
                         a2.data_ptr(),
-                        token_num) # num_local_tokens.data_ptr() ?
+                        token_num, num_oc_blocks * num_e_blocks) # num_local_tokens.data_ptr() ?
 
     a2, a2_scale = act_quant_func(
         a2, #a2.view(token_num*topk, -1),
@@ -519,8 +519,8 @@ def fused_moe(
                                         a2, w2, stage2_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w2_scale[0] if w2_scale is not None else None, B,
                                         w1.dtype, topk, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, 4)
                 else:
-                    moe_gemm_8wave_g1u1([num_oc_blocks, num_e_blocks], [8*64],
-                                    a2.element_size() * a2.numel() > (1<<32),
+                    moe_gemm_8wave_g1u1([num_oc_blocks * num_e_blocks], [8*64],
+                                    a2.element_size() * a2.numel() > (1<<32), 
                                     AB_dtype, wg_M, wg_N,
                                     E, model_dim, inter_dim, 
                                     False, w2_is_shuffled, topk,
@@ -531,7 +531,7 @@ def fused_moe(
                                     w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
                                     a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
                                     stage2_out.data_ptr(),
-                                    token_num) # num_local_tokens.data_ptr() ?
+                                    token_num, num_oc_blocks * num_e_blocks) # num_local_tokens.data_ptr() ?
 
         if 1:
             moe_out = stage2_out.sum(dim=1)
