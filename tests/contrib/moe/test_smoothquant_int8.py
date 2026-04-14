@@ -39,7 +39,7 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
                 )
             x_quant_scale.is_sorted = True
         else:
-            hip.quant1([div_up(M, kwargs["ROW_PER_BLOCK1"])], [64], 
+            hip.quant1([2*div_up(M, kwargs["ROW_PER_BLOCK1"])], [64], 
                 x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
                 topk_ids.data_ptr(), M, **kwargs)
             x_quant_scale.is_sorted = False

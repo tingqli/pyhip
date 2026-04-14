@@ -584,7 +584,7 @@ __global__ __launch_bounds__(64, 1) void quant1(
             uint* expert_ids,           // [M, TOPK]
             uint M) {
     // wg: [M//4]
-    uint m_block = blockIdx.x;
+    uint m_block = blockIdx.x >= M ? blockIdx.x - M : blockIdx.x;
     uint lane_id = threadIdx.x % 64;
     uint wave_id = threadIdx.x / 64;
     uint lane_r = lane_id / COL_PER_WAVE;
@@ -607,18 +607,28 @@ __global__ __launch_bounds__(64, 1) void quant1(
         auto p_smooth_scale = smooth_scale + expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id] * S;
         float cur_max = -FLT_MAX;
         float32x8 scale_buf[QUANT1_K / 64 / 8];
+        auto e_id = expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id];
+        if (e_id & 1) {
+            if (blockIdx.x < M) {
+                return;
+            }
+        } else {
+            if (blockIdx.x >= M) {
+                return;
+            }
+        }
         #pragma unroll
         for (int i = 0; i < QUANT1_K / 64 / 8; i++) {
             //scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
             float32x4 tmp[2];
             tmp[0] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
                  0,
-                 (expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id] * S) * sizeof(float) + (threadIdx.x + i * 64) * 8 * sizeof(float),
+                 (e_id * S) * sizeof(float) + (threadIdx.x + i * 64) * 8 * sizeof(float),
                  0,
                  (int)amd_buffer_coherence_enum::glc);
             tmp[1] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
                  0,
-                 (expert_ids[m_block * ROW_PER_BLOCK1 * TOPK + topk_id] * S) * sizeof(float) + (threadIdx.x + i * 64) * 8 * sizeof(float) + 4 * sizeof(float),
+                 (e_id * S) * sizeof(float) + (threadIdx.x + i * 64) * 8 * sizeof(float) + 4 * sizeof(float),
                  0,
                  (int)amd_buffer_coherence_enum::glc);
             scale_buf[i] = {tmp[0][0], tmp[0][1], tmp[0][2], tmp[0][3], tmp[1][0], tmp[1][1], tmp[1][2], tmp[1][3]};
