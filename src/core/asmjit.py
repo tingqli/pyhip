@@ -130,7 +130,7 @@ class Instruction:
                 rtype = op.find_rtype(allow_accvgpr=True)
                 dtype = op.find_dtype()
                 dst_gprs = jit.new_gpr(rtype, 1, dtype=dtype, align=1, name="idst")
-                dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
+                dst_expr = GPRExpr("getitem", dst_gprs, 0, 0, op.op_mod)
                 jit.recursive_expr_gen(self.parent_bb, dst_expr, op, loc=self.loc)
                 self.operands.append(dst_expr)
                 continue
@@ -172,7 +172,7 @@ class Instruction:
         return f"{self.opcode} {','.join([self.op_repr(op) for op in self.operands])} {self.mod} ; {self.debug_info}"
 
 class GPRExpr:
-    def __init__(self, op:str, src0=None, src1=None, src2=None):
+    def __init__(self, op:str, src0=None, src1=None, src2=None, op_mod=""):
         self.op=op
         # some instructions only support const on operand src0
         if op in ["+", "*", "&", "|", "^"] and (isinstance(src1, int) or isinstance(src1, float)):
@@ -184,6 +184,7 @@ class GPRExpr:
         self.src0 = src0
         self.src1 = src1
         self.src2 = src2
+        self.op_mod = op_mod
 
     def __len__(self):
         # number of registers
@@ -198,7 +199,7 @@ class GPRExpr:
         return len0
 
     def __iter__(self):
-        assert self.op == "getitem"
+        assert self.op == "getitem", self.op
         gprs = self.src0
         for i in range(self.src1, self.src2 + 1):
             yield GPRExpr("getitem", gprs, i, i)
@@ -222,6 +223,10 @@ class GPRExpr:
                 continue
             break
         return const_terms, cur_expr
+    def __abs__(self):
+        return GPRExpr(self.op, self.src0, self.src1, self.src2, op_mod=self.op_mod + " abs")
+    def __neg__(self):
+        return GPRExpr(self.op, self.src0, self.src1, self.src2, op_mod=self.op_mod + " neg")
 
     def __add__(self, other):
         return GPRExpr("+", self, other)
@@ -377,9 +382,14 @@ class GPRExpr:
             first = self.src1
             last = self.src2
             if last > first:
-                return f"{self.src0.rtype}[{base_id + first}:{base_id + last}]"  # s[0:1] v[16:20]
+                ret = f"{self.src0.rtype}[{base_id + first}:{base_id + last}]"  # s[0:1] v[16:20]
             else:
-                return f"{self.src0.rtype}{base_id + first}"  # v9, a9, s9
+                ret = f"{self.src0.rtype}{base_id + first}"  # v9, a9, s9
+            # allowed op mod is " abs neg", " abs", "neg"
+            for om in self.op_mod.strip().split(" "):
+                if om != "":
+                    ret = f"{om}({ret})"
+            return ret
         elif (self.src1 is None) and (self.src2 is None):
             return f"{self.op} {self.src0}"
         elif (self.src2 is None):
