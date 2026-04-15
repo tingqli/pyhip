@@ -216,13 +216,13 @@ def test_reduce():
     out = torch.empty([num_tokens, model_dim], dtype=torch.bfloat16)
     ref = scale.unsqueeze(3) * x.view(num_tokens, topk, model_dim // BLOCK_QUANT, BLOCK_QUANT).float()
     ref = ref.view(num_tokens, topk, model_dim).sum(dim=[1]).to(torch.bfloat16)
-    hip.reduce_i8([num_tokens], [64], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
+    hip.reduce_i8([num_tokens], [256], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
     torch.testing.assert_close(out, ref, atol=1.1, rtol=2.1)
     print('reduce test passed.')
     mem_size = x.numel() * x.element_size() + scale.numel() * scale.element_size() + out.numel() * out.element_size()
     print(f"reduce input size {mem_size/1000/1000:.2f} MB")
     for _ in range(10):
         with pyhip.cudaPerf(0, mem_size, name=f"reduce") as p:
-            hip.reduce_i8([num_tokens], [64], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
+            hip.reduce_i8([num_tokens], [256], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
 
 test_reduce()

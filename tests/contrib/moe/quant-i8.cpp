@@ -27,6 +27,7 @@ using float32x8 = float  __attribute__ ((ext_vector_type(8)));
 using int32x4_t = int  __attribute__ ((ext_vector_type(4)));
 using int32x16_t = int  __attribute__ ((ext_vector_type(16)));
 using uint32x2_t = uint  __attribute__ ((ext_vector_type(2)));
+using uint32x4_t = uint  __attribute__ ((ext_vector_type(4)));
 using charx16 = char __attribute__ ((ext_vector_type(16)));
 using charx8 = char __attribute__ ((ext_vector_type(8)));
 
@@ -287,6 +288,27 @@ __device__ uint float4_to_uint(float f0, float f1, float f2, float f3) {
     asm ("v_cvt_i32_f32_sdwa %0, %1 dst_sel:BYTE_3 dst_unused:UNUSED_PRESERVE src0_sel:DWORD\n\t"
                 : "+v"(out)
                 : "v"(f3)
+                : );
+    return out;
+}
+
+__device__ float32x4 uint_to_float4(uint u) {
+    float32x4 out;
+    asm ("v_cvt_f32_i32_sdwa %0, sext(%1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0\n\t"
+                : "=v"(out[0])
+                : "v"(u)
+                : );
+    asm ("v_cvt_f32_i32_sdwa %0, sext(%1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1\n\t"
+                : "=v"(out[1])
+                : "v"(u)
+                : );
+    asm ("v_cvt_f32_i32_sdwa %0, sext(%1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2\n\t"
+                : "=v"(out[2])
+                : "v"(u)
+                : );
+    asm ("v_cvt_f32_i32_sdwa %0, sext(%1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3\n\t"
+                : "=v"(out[3])
+                : "v"(u)
                 : );
     return out;
 }
@@ -698,7 +720,7 @@ __global__ __launch_bounds__(64, 1) void quant1(
     }
 }
 
-__global__ void reduce_i8(
+__global__ void __launch_bounds__(256, 1) reduce_i8(
             char* p_x,        // [M, topk, REDUCE_K]
             float* p_scale,   // [M, topk, REDUCE_K//BLOCK_QUANT]
             __bf16* p_out,    // [M, REDUCE_K]
@@ -715,7 +737,7 @@ __global__ void reduce_i8(
     BufferResource x_res(p_x, 0xffffffff);
     BufferResource x_out_res(p_out, 0xffffffff);
     #pragma unroll
-    for (int i = threadIdx.x; i < REDUCE_K / 16; i += 64) {
+    for (int i = threadIdx.x; i < REDUCE_K / 16; i += 256) {
         float result[16] = {0};
         #pragma unroll
         for (int t = 0; t < TOPK; t++) {
@@ -725,6 +747,16 @@ __global__ void reduce_i8(
             for (int k = 0; k < 16; k++) {
                 result[k] += (float)x_val[k] * scale;
             }
+            // float32x4 tmp;
+            // uint32x4_t x_val = buffer_load_dwordx4<uint32x4_t>(x_res, 0, t * REDUCE_K + i * 16, 0, (int)amd_buffer_coherence_enum::SYSTEM_NT1);
+            // #pragma unroll
+            // for (int k = 0; k < 4; k++) {
+            //     tmp = uint_to_float4(x_val[k]);
+            //     result[4 * k + 0] += tmp[0] * scale;
+            //     result[4 * k + 1] += tmp[1] * scale;
+            //     result[4 * k + 2] += tmp[2] * scale;
+            //     result[4 * k + 3] += tmp[3] * scale;
+            // }
         }
         bfloat16x8 result_bf[2];
         #pragma unroll

@@ -27,7 +27,7 @@ def reduce_i8(x, scale, block_quant=256):
               "BLOCK_QUANT":block_quant,}
     hip = pyhip.module(f"quant-i8.cpp")
     out = torch.empty((x.shape[0], x.shape[2]), dtype=torch.bfloat16, device=x.device)
-    hip.reduce_i8([x.shape[0]], [64], x, scale, out, x.shape[0], **kwargs)
+    hip.reduce_i8([x.shape[0]], [256], x, scale, out, x.shape[0], **kwargs)
     return out
 
 def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True, topk_ids=None):
