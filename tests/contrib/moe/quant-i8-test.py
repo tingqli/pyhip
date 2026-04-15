@@ -24,9 +24,11 @@ model_dim, inter_dim = 4096, 1536
 num_experts, topk = 400, TOPK
 QUANT1_K = model_dim
 QUANT2_K = inter_dim
+REDUCE_K = model_dim
+BLOCK_QUANT = 256
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=}")
+hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=} -D{BLOCK_QUANT=} -D{REDUCE_K=}")
 quant = hip.quant
 
 def int8_ptpc(a):
@@ -207,3 +209,20 @@ print(f"gemm2 input size {mem_size/1000/1000:.2f} MB")
 for _ in range(10):
     with pyhip.cudaPerf(0, mem_size, name=f"quant2") as p:
         quant_act(x1, topk, M, inter_dim, fc2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids, DEBUG=False)
+
+def test_reduce():
+    x = torch.randint(low=-128, high=127, size=[num_tokens, topk, model_dim], dtype=torch.int8)
+    scale = torch.randn(num_tokens, topk, model_dim // BLOCK_QUANT, dtype=torch.float32)
+    out = torch.empty([num_tokens, model_dim], dtype=torch.bfloat16)
+    ref = scale.unsqueeze(3) * x.view(num_tokens, topk, model_dim // BLOCK_QUANT, BLOCK_QUANT).float()
+    ref = ref.view(num_tokens, topk, model_dim).sum(dim=[1]).to(torch.bfloat16)
+    hip.reduce_i8([num_tokens], [64], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
+    torch.testing.assert_close(out, ref, atol=1.1, rtol=2.1)
+    print('reduce test passed.')
+    mem_size = x.numel() * x.element_size() + scale.numel() * scale.element_size() + out.numel() * out.element_size()
+    print(f"reduce input size {mem_size/1000/1000:.2f} MB")
+    for _ in range(10):
+        with pyhip.cudaPerf(0, mem_size, name=f"reduce") as p:
+            hip.reduce_i8([num_tokens], [64], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
+
+test_reduce()

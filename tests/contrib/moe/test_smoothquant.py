@@ -14,6 +14,22 @@ from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
 def div_up(x, y):
     return (x + y - 1) // y
 
+def reduce_i8(x, scale, block_quant=256):
+    kwargs = {"BLOCK_SIZE_M":256,
+              "TOPK":x.shape[1],
+              "ROW_PER_BLOCK":4,
+              "ROW_PER_BLOCK2":4,
+              "ROW_PER_BLOCK1":1,
+              "BLOCK_M2":8,
+              "QUANT1_K":x.shape[2],
+              "QUANT2_K":x.shape[2],
+              "REDUCE_K":x.shape[2],
+              "BLOCK_QUANT":block_quant,}
+    hip = pyhip.module(f"quant-i8.cpp")
+    out = torch.empty((x.shape[0], x.shape[2]), dtype=torch.bfloat16, device=x.device)
+    hip.reduce_i8([x.shape[0]], [64], x, scale, out, x.shape[0], **kwargs)
+    return out
+
 def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, is_gemm1=True, topk_ids=None):
     hip = pyhip.module(f"quant-i8.cpp")
     kwargs = {"BLOCK_SIZE_M":256,
@@ -23,7 +39,9 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
               "ROW_PER_BLOCK1":1,
               "BLOCK_M2":8,
               "QUANT1_K":model_dim,
-              "QUANT2_K":model_dim}
+              "QUANT2_K":model_dim,
+              "REDUCE_K":model_dim,
+              "BLOCK_QUANT":256,}
     device = x.device
     DEBUG = False
     if DEBUG:
@@ -332,12 +350,16 @@ def fused_moe_gelu_sqi8(
     with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[down]"):
         stage2_out, stage2_out_scale = moe_gemm(a2, a2_scale, w2, w2_scale, 2, oquant_block_size)
 
-    if oquant_block_size:
-        # dequantize & sum
-        stage2_out = (stage2_out.view(-1, oquant_block_size).to(torch.bfloat16) * stage2_out_scale.to(torch.bfloat16).view(-1, 1))
-        moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
-    else:
-        moe_out = stage2_out.sum(dim=1)
+    with pyhip.cudaPerf(name=f"reduce"):
+        if oquant_block_size:
+            if 0:
+                # dequantize & sum
+                stage2_out = (stage2_out.view(-1, oquant_block_size).to(torch.bfloat16) * stage2_out_scale.to(torch.bfloat16).view(-1, 1))
+                moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
+            else:
+                moe_out = reduce_i8(stage2_out.view(num_tokens, topk, model_dim), stage2_out_scale.view(num_tokens, topk, model_dim//oquant_block_size), oquant_block_size)
+        else:
+            moe_out = stage2_out.sum(dim=1)
 
     return moe_out
 

@@ -697,3 +697,43 @@ __global__ __launch_bounds__(64, 1) void quant1(
         }
     }
 }
+
+__global__ void reduce_i8(
+            char* p_x,        // [M, topk, REDUCE_K]
+            float* p_scale,   // [M, topk, REDUCE_K//BLOCK_QUANT]
+            __bf16* p_out,    // [M, REDUCE_K]
+            uint M) {
+    uint m = blockIdx.x;
+    // static constexpr int BLOCK_C = BLOCK_QUANT / 16;
+    // static constexpr int BLOCK_R = 64 / BLOCK_C;
+    // auto lane_c = threadIdx.x % BLOCK_C;
+    // auto lane_r = threadIdx.x / BLOCK_C;
+    p_x += m * TOPK * REDUCE_K;
+    p_scale += m * TOPK * (REDUCE_K / BLOCK_QUANT);
+    p_out += m * REDUCE_K;
+
+    BufferResource x_res(p_x, 0xffffffff);
+    BufferResource x_out_res(p_out, 0xffffffff);
+    #pragma unroll
+    for (int i = threadIdx.x; i < REDUCE_K / 16; i += 64) {
+        float result[16] = {0};
+        #pragma unroll
+        for (int t = 0; t < TOPK; t++) {
+            float scale = p_scale[t * (REDUCE_K / BLOCK_QUANT) + i * 16 / BLOCK_QUANT];
+            charx16 x_val = buffer_load_dwordx4<charx16>(x_res, 0, t * REDUCE_K + i * 16, 0, (int)amd_buffer_coherence_enum::SYSTEM_NT1);
+            #pragma unroll
+            for (int k = 0; k < 16; k++) {
+                result[k] += (float)x_val[k] * scale;
+            }
+        }
+        bfloat16x8 result_bf[2];
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            result_bf[j / 8][j % 8] = result[j];
+        }
+        buffer_store_dwordx4(result_bf[0], x_out_res, 0, 
+            (i * 16) * sizeof(__bf16), 0, amd_buffer_coherence_enum::SYSTEM_NT1);
+        buffer_store_dwordx4(result_bf[1], x_out_res, 0,
+            (i * 16 + 8) * sizeof(__bf16), 0, amd_buffer_coherence_enum::SYSTEM_NT1);
+    }
+}
