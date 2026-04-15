@@ -91,7 +91,7 @@ class amdhip_func:
             LDS_bytes = 64*1024
             sharedMemBytes = LDS_bytes//force_occupancy
         for i,a in enumerate(args):
-            setattr(self.args, f"arg_{i}", a)
+            setattr(self.args, f"arg_{i}", a.data_ptr() if (getattr(a, "data_ptr", None) is not None) else a)
         while len(gridDims) < 3:
             gridDims.append(1)
         while len(blockDims) < 3:

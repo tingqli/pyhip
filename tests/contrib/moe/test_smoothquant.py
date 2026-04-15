@@ -35,20 +35,20 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
     if is_gemm1:
         if 0:
             hip.quant([sorted_expert_ids.shape[0], kwargs["BLOCK_SIZE_M"] // kwargs["ROW_PER_BLOCK"]], [64], 
-                x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
-                sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+                x, smooth_scale, x_quant, x_quant_scale, 
+                sorted_ids, sorted_expert_ids, num_valid_ids,
                 M, model_dim, 1, **kwargs
                 )
             x_quant_scale.is_sorted = True
         else:
             hip.quant1([2*div_up(M, kwargs["ROW_PER_BLOCK1"])], [64], 
-                x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
-                topk_ids.data_ptr(), M, **kwargs)
+                x, smooth_scale, x_quant, x_quant_scale, 
+                topk_ids, M, **kwargs)
             x_quant_scale.is_sorted = False
     else:
         hip.quant2([sorted_expert_ids.shape[0], kwargs["BLOCK_SIZE_M"] // kwargs["BLOCK_M2"]], [256], 
-            x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
-            sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+            x, smooth_scale, x_quant, x_quant_scale, 
+            sorted_ids, sorted_expert_ids, num_valid_ids,
             M, **kwargs)
     return x_quant, x_quant_scale
 
@@ -207,7 +207,17 @@ def fused_moe_gelu_sqi8(
         return quant_x, pt_scales
 
 
-    def moe_gemm_ref(output, input, pt_scale, weight, pc_scale, stage_index):
+    def moe_gemm_ref(input, pt_scale, weight, pc_scale, stage_index, oquant_block_size):
+        num_tokens, topk, dims = input.shape
+        num_experts, odims, idims = weight.shape
+        if oquant_block_size:
+            assert odims % oquant_block_size == 0
+            output = torch.empty((num_tokens, topk, odims), dtype=torch.int8, device=device)
+            o_scales = torch.empty((num_tokens, topk, odims//oquant_block_size), dtype=torch.float32, device=device)
+        else:
+            output = torch.empty((num_tokens, topk, odims), dtype=torch.bfloat16, device=device)
+            o_scales = None
+
         assert input.ndim == 3
         for eblock_i, expert_id in enumerate(sorted_expert_ids):
             i0 = eblock_i * block_size_M
@@ -245,9 +255,24 @@ def fused_moe_gelu_sqi8(
             else:
                 cur_out = cur_out * sorted_weights[i0:i0+cur_num_toks, None]
 
-            output[tok_id, topk_id, :] = cur_out.to(output.dtype)
+            if oquant_block_size:
+                scales = torch.maximum((cur_out.view(-1, oquant_block_size).abs().max(dim=1, keepdim=True)[0]), torch.tensor(0.0000001))/127
+                output[tok_id, topk_id, :] = (cur_out.view(-1, oquant_block_size) / scales).round().clamp(-128, 127).to(torch.int8).view(-1, odims)
+                o_scales[tok_id, topk_id, :] = scales.view(-1, odims//oquant_block_size)
+            else:
+                output[tok_id, topk_id, :] = cur_out.to(output.dtype)
+        return output, o_scales
 
-    def moe_gemm_jit(output, input, pt_scale, weight, pc_scale, stage_index):
+    def moe_gemm_jit(input, pt_scale, weight, pc_scale, stage_index, oquant_block_size):
+        num_tokens, topk, dims = input.shape
+        num_experts, odims, idims = weight.shape        
+        if oquant_block_size:
+            assert odims % oquant_block_size == 0
+            output = torch.empty((num_tokens, topk, odims), dtype=torch.int8, device=device)
+            o_scales = torch.empty((num_tokens, topk, odims//oquant_block_size), dtype=torch.float32, device=device)
+        else:
+            output = torch.empty((num_tokens, topk, odims), dtype=torch.bfloat16, device=device)
+            o_scales = None
         AB_dtype = "s8"
         is_input_over_4GB = input.numel() * input.element_size() > (1<<32)
         is_pt_scale_sorted = getattr(pt_scale, "is_sorted", True)
@@ -263,16 +288,22 @@ def fused_moe_gelu_sqi8(
                         AB_dtype, wg_M, wg_N,
                         E, output.shape[-1], input.shape[-1], 
                         is_gate_up, bpreshuffle, topk,
-                        sorted_ids.data_ptr(),
-                        sorted_weights.data_ptr(),
-                        sorted_expert_ids.data_ptr(),
-                        num_valid_ids.data_ptr(),
-                        weight.data_ptr(), pc_scale.data_ptr(),
-                        input.data_ptr(), pt_scale.data_ptr(),
-                        output.data_ptr(),
+                        sorted_ids,
+                        sorted_weights,
+                        sorted_expert_ids,
+                        num_valid_ids,
+                        weight, pc_scale,
+                        input, pt_scale,
+                        output,
+                        o_scales,
                         num_tokens, num_oc_blocks * num_e_blocks)
+        return output, o_scales
 
-    moe_gemm = moe_gemm_jit
+    def fake_quant(x, block_size = 256):
+        RANG = 127
+        scale = torch.maximum(x.view(-1, block_size).abs().max(dim=1, keepdim=True)[0]/(RANG-1), torch.tensor(0.0000001))
+        x_i8 = (x.view(-1, block_size) / scale).round().clamp(-RANG, RANG-1)
+        return (x_i8.to(x.dtype) * scale).view(x.shape)
 
     num_tokens, _ = hidden_states.shape
     with pyhip.cudaPerf(name=f"quant_act_up"):
@@ -280,23 +311,33 @@ def fused_moe_gelu_sqi8(
             a1, a1_scale = quant_act(hidden_states, topk, hidden_states.shape[0], hidden_states.shape[1], a1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True, topk_ids)
         else:
             a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
-    a2_bf16 = torch.empty((num_tokens, topk, inter_dim), dtype=torch.bfloat16, device=device,)
 
+    moe_gemm = moe_gemm_jit
     with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[  up]"):
-        moe_gemm(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
+        a2_v, a2_s = moe_gemm(a1, a1_scale, w1, w1_scale, 1, 0)
+
+    #a2_bf16 = fake_quant(a2_bf16)
 
     with pyhip.cudaPerf(name=f"quant_act_down"):
         if 1:
-            a2, a2_scale = quant_act(a2_bf16, topk, a2_bf16.shape[0], a2_bf16.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids)
+            a2, a2_scale = quant_act(a2_v, topk, a2_v.shape[0], a2_v.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids)
         else:
-            a2, a2_scale = smoothquant_per_tok(a2_bf16, a2_smooth_scale, topk)
+            a2, a2_scale = smoothquant_per_tok(a2_v, a2_smooth_scale, topk)
 
-    stage2_out = torch.empty((num_tokens, topk, model_dim), dtype=torch.bfloat16, device=device)
+    # quantize output to int8 in unit of 1x256
+    oquant_block_size = 256
 
+    # only ref supports this so-far
+    moe_gemm = moe_gemm_ref if oquant_block_size > 0 else moe_gemm_jit
     with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[down]"):
-        moe_gemm(stage2_out, a2, a2_scale, w2, w2_scale, 2)
+        stage2_out, stage2_out_scale = moe_gemm(a2, a2_scale, w2, w2_scale, 2, oquant_block_size)
 
-    moe_out = stage2_out.sum(dim=1)
+    if oquant_block_size:
+        # dequantize & sum
+        stage2_out = (stage2_out.view(-1, oquant_block_size).to(torch.bfloat16) * stage2_out_scale.to(torch.bfloat16).view(-1, 1))
+        moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
+    else:
+        moe_out = stage2_out.sum(dim=1)
 
     return moe_out
 
@@ -520,7 +561,8 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
             fc1_smooth_scale,
             fc2_smooth_scale,
             num_verbose = 1,
-            num_iters = 4
+            num_warmup = 2,
+            num_iters = 10
         )
 
     ret_fp4, dt_fp4 = pyhip.run_perftest(
