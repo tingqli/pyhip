@@ -1039,6 +1039,8 @@ class JIT:
         self.sizeof_fp16 = 2
         self.sizeof_fp8 = 1
         self.sizeof_bf8 = 1
+        self.sizeof_s8 = 1
+        self.sizeof_u8 = 1
         self.sizeof_fp4x2 = 1
         # allows J.sizeof(dtype), dtype can be string or torch dtype
         self._sizeof = {
@@ -1245,6 +1247,11 @@ class JIT:
         dst_is_vcc = isinstance(dst, str) and dst == "vcc"
         dst_is_exec = isinstance(dst, str) and dst == "exec"
         dst_is_scc = isinstance(dst, str) and dst == "scc"
+        
+        if isinstance(cond, int):
+            self.s_mov_b64(dst, cond)
+            return
+
         #assert dst_is_vcc or dst_is_sgprx2
         rtype = "v"
         if dst_is_scc:
@@ -2306,6 +2313,12 @@ class JIT:
                             n_nops = 2
                             self.log(f"insert s_nop({n_nops}) at #{loc} : [VALU* writes vdst, V_PERMLANE* reads vdst]")
                             break
+                
+                if (prev.opcode.startswith("buffer_store") or prev.opcode.startswith("flat_store")):
+                    if "x3" in prev.opcode or "x4" in prev.opcode or "format" in prev.opcode:
+                        if prev.operands[0].overlap(cur.operands[0]):
+                            n_nops = 2
+                            self.log(f"insert s_nop({n_nops}) at #{loc} : [BUFFER_STORE* writes vdst, another write vdst]")
 
                 if n_nops >= 0:
                     inst = Instruction(bb, "s_nop")

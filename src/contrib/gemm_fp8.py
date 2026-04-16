@@ -8,7 +8,8 @@ __all__ = [
 ]
 
 @pyhip.jit(with_debug_log = False)
-def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
+def gemm_8wave_fp8bf16fp16(J,
+                   AB_dtype, bpreshuffle,
                    use_f32_blockscales_128, # scale_BM,scale_BN,scale_BK = 1,128,128 
                    wg_M, wg_N, N, K, 
                    pA:"void*", # [M, K]  torch.float8_e4m3fn   row-major
@@ -21,6 +22,7 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
     """
     https://github.com/HazyResearch/HipKittens/blob/.../kernels/gemm/fp8fp32/FP8_8wave/8_wave.cu
     """
+    rotate_mfma_C = 0
 
     assert AB_dtype in ["fp8", "bf16", "fp16", "f16"]
     C_dtype = "bf16"
@@ -83,8 +85,13 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
     warp_n = J.gpr(J.warp_id[0] % WARPS_COL)  # warp col: 0 to 3
 
     use_pre_shuffle = False
-    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader(J, use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*64)
-    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*32)
+    if rotate_mfma_C:
+        vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_n*32)
+        vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_m*64)
+        buff_a, buff_b = buff_b, buff_a
+    else:
+        vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader(J, use_pre_shuffle, num_warps, HALF_BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*64)
+        vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*32)
 
     if use_f32_blockscales_128:
         # assert bpreshuffle == True, "exepct scaleA in [k,m] layout"
@@ -200,7 +207,10 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
             b_index = c_index % 2
             for m in range(nrM):
                 for n in range(nrN):
-                    J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n], mfma_B[b_index, n], mfma_A[m], mfma_C[c_index, m, n])
+                    if rotate_mfma_C:
+                        J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n], mfma_A[m], mfma_B[b_index, n], mfma_C[c_index, m, n])
+                    else:
+                        J.v_mfma_f32_16x16x128_f8f6f4(mfma_C[c_index, m, n], mfma_B[b_index, n], mfma_A[m], mfma_C[c_index, m, n])
                     yield 16
         def mfma_tail():
             pass
@@ -210,7 +220,10 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
             for k in range(2):
                 for m in range(nrM):
                     for n in range(nrN):
-                        J.v_mfma_f32_16x16x32_bf16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
+                        if rotate_mfma_C:
+                            J.v_mfma_f32_16x16x32_bf16(mfma_C[c_index, m, n], mfma_A[m, k], mfma_B[b_index, n, k], mfma_C[c_index, m, n])
+                        else:
+                            J.v_mfma_f32_16x16x32_bf16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
                         yield 16
         def mfma_tail():
             pass
@@ -221,7 +234,10 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
             for k in range(2):
                 for m in range(nrM):
                     for n in range(nrN):
-                        J.v_mfma_f32_16x16x32_f16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
+                        if rotate_mfma_C:
+                            J.v_mfma_f32_16x16x32_f16(mfma_C[c_index, m, n], mfma_A[m, k], mfma_B[b_index, n, k], mfma_C[c_index, m, n])
+                        else:
+                            J.v_mfma_f32_16x16x32_f16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
                         yield 16
         def mfma_tail():
             pass
@@ -230,15 +246,15 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
     assert HALF_BLOCK_SIZE_ROW == HALF_BLOCK_SIZE_COL
 
     a_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
-    if bpreshuffle:
-        b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
+    b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_ROW)
 
     def step_k():
         a_moffsets[0] += vm_offset_inc_a
         a_moffsets[1] += vm_offset_inc_a
-        if bpreshuffle:
-            b_moffsets[0] += vm_offset_inc_b
-            b_moffsets[1] += vm_offset_inc_b
+        b_moffsets[0] += vm_offset_inc_b
+        b_moffsets[1] += vm_offset_inc_b
+
+    bb_moffset = b_moffsets if bpreshuffle else a_moffsets
 
     def vm_loadA(k, m):
         assert m in [0, 1]
@@ -248,10 +264,7 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
     def vm_loadB(k, m):
         assert m in [0, 1]
         assert k in [0, 1]
-        if bpreshuffle:
-            return vm_load_b(ldsB[k,m], buff_b, b_moffsets[m])
-        else:
-            return vm_load_b(ldsB[k,m], buff_b, a_moffsets[m])
+        return vm_load_b(ldsB[k,m], buff_b, bb_moffset[m])
 
     def ds_readA(k, m):
         for i in range(nrM):
@@ -423,31 +436,60 @@ def gemm_8wave_fp8bf16fp16(J, AB_dtype, bpreshuffle,
     #J.s_endpgm()
 
     stride_c = N * J.sizeof_bf16
-    vbf16 = J.gpr(4, "vbf16x2")
-    col = J.lane_id // 16
-    swap_12_col = (col & 1) * 2 + (col >> 1)
 
-    vaddr0 = J.gpr(((J.lane_id % 16) + warp_m * 64)*stride_c + swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + \
-            blk_n * (wg_N * J.sizeof(C_dtype)))
+    if not rotate_mfma_C:
+        vbf16 = J.gpr(4, "vbf16x2")
+        col = J.lane_id // 16
+        swap_12_col = (col & 1) * 2 + (col >> 1)
 
-    for cindex in range(4):
-        cm = cindex // 2
-        cn = cindex % 2
-        vaddr = J.gpr("vu32", vaddr0[0] + cm*HALF_BLOCK_SIZE_ROW*stride_c)
-        for m in range(nrM):
-            for n in range(0, nrN, 2):
-                J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
-                J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
-                J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
-                J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
-                #    a0    a1   a2   a3   | 01 23
-                #    b0    b1   b2   b3   | 45 67
-                #  v_permlane16_swap_b32(a, b)
-                #    a0    b0   a2   b2   |
-                #    a1    b1   a3   b3   |
-                #
-                # swap of row 1 & 2 are done by swapping lane-address 
-                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-                buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*4*J.sizeof_DW2 + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
-            vaddr[0] += 16*stride_c
+        vaddr0 = J.gpr(((J.lane_id % 16) + warp_m * 64)*stride_c + swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + \
+                blk_n * (wg_N * J.sizeof(C_dtype)))
+
+        for cindex in range(4):
+            cm = cindex // 2
+            cn = cindex % 2
+            vaddr = J.gpr("vu32", vaddr0[0] + cm*HALF_BLOCK_SIZE_ROW*stride_c)
+            for m in range(nrM):
+                for n in range(0, nrN, 2):
+                    J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
+                    J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
+                    J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
+                    J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
+                    #    a0    a1   a2   a3   | 01 23
+                    #    b0    b1   b2   b3   | 45 67
+                    #  v_permlane16_swap_b32(a, b)
+                    #    a0    b0   a2   b2   |
+                    #    a1    b1   a3   b3   |
+                    #
+                    # swap of row 1 & 2 are done by swapping lane-address 
+                    J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                    J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                    buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*4*J.sizeof_DW2 + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
+                vaddr[0] += 16*stride_c
+    else: # rotate_mfma_C
+        #
+        # [2, 4] warp  [4, 2i]x[16, 16] mfma_C  `i means inner-most dimension`
+        #     when rotate_mfma_C=1
+        # [4, 2] warp  [2i, 4]x[16, 16] mfma_C
+        #
+        # cindex is also rotated, cn determines A's row
+        #
+        vbf16 = J.gpr(4, "vbf16x2")
+        col = J.lane_id // 16
+        swap_12_col = (col & 1) * 2 + (col >> 1)
+        vaddr0 = J.gpr(((J.lane_id % 16) + warp_n * 32)*stride_c + swap_12_col * J.sizeof_DW4 + warp_m * 64 * J.sizeof_bf16 + \
+                        blk_n * (wg_N * J.sizeof(C_dtype)))
+        for cindex in range(4):
+            cm = cindex // 2
+            cn = cindex % 2
+            vaddr = J.gpr("vu32", vaddr0[0] + cn*HALF_BLOCK_SIZE_ROW*stride_c)
+            for n in range(nrN):
+                for m in range(0, nrM, 2):
+                    J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
+                    J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
+                    J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m+1,n,0], mfma_C[cindex, m+1,n,1])
+                    J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m+1,n,2], mfma_C[cindex, m+1,n,3])
+                    J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                    J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                    buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = m*16*J.sizeof_bf16 + cm*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
+                vaddr[0] += 16*stride_c
