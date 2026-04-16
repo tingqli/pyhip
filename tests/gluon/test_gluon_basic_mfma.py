@@ -57,7 +57,7 @@ def gemm_test(bpreshuffle = False, transposeB = False):
                 preshffuleB = bpreshuffle,
                 num_warps=1)
     assert torch.allclose(C_ref.to(dtype=torch.float32), C, rtol=0.1, atol=0.03)
-    print(f"pass {M=} {N=} {K=} {bpreshuffle}")
+    print(f"pass {M=} {N=} {K=} {bpreshuffle=}")
 
 
 #linear layout， 根据reg_bases->lane_bases->warp_base顺序tile数据，在每一层里，描述
@@ -65,23 +65,32 @@ def gemm_test(bpreshuffle = False, transposeB = False):
 # b.t(),都采用同样的linear layout, b和b.t()实际是物理内存的排布是不变的。
 # 这里的表述是对于64个lane,先用16个lane 排布dimention[0],然后是dimmention[1].由于 b和b.t()
 # 有相同的物理内存排布（[N,K]），可以使用相同的linear layout.
+
+
 @gluon.constexpr_function
-def get_mem_ab_layout(tiles:gl.constexpr):
+def get_mem_ab_layout(tilemn:gl.constexpr, tilek:gl.constexpr=1):
     reg_bases = [[0, 1], [0, 2], [0, 4]]
     lane_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 8], [0, 16]]
     warp_bases= []
+    bit_pos = 32
+    blkk: gl.constexpr = tilek *32
+    while tilek // 2:
+        reg_bases.append([0, bit_pos])
+        bit_pos *= 2
+        tilek = tilek // 2
+    
     bit_pos = 16
-    blk: gl.constexpr = tiles *16
-    while tiles // 2:
+    blkmn: gl.constexpr = tilemn *16
+    while tilemn // 2:
         reg_bases.append([bit_pos, 0])
         bit_pos *= 2
-        tiles = tiles // 2
+        tilemn = tilemn // 2
     mem_ab_layout: gl.constexpr = gl.DistributedLinearLayout(
                                         reg_bases=reg_bases,
                                         lane_bases=lane_bases,
                                         warp_bases=warp_bases,
                                         block_bases=[],
-                                        shape=[blk, 32])
+                                        shape=[blkmn, blkk])
     return mem_ab_layout
 
 # [ n//16 ,K//32,4k,16n,8k,]
@@ -220,3 +229,161 @@ gemm_test(bpreshuffle=False, transposeB = True)
 gemm_test(bpreshuffle=False, transposeB = False)
 gemm_test(bpreshuffle=True)
 
+
+
+###########################################################################################################################
+###########################################################################################################################
+###########################################################################################################################
+###########################################################################################################################
+@gluon.constexpr_function
+def buffer_load_layout(k_lanes:gl.constexpr):
+    mn_lanes: gl.constexpr = 64 // k_lanes
+    load_layout: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 8],
+                                            threads_per_warp=[mn_lanes, k_lanes],
+                                            warps_per_cta=[1, 1],
+                                            order=[1, 0])
+
+    return load_layout
+
+@gluon.constexpr_function
+def get_lds_layout_write():
+    lds_layout_write: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=1, max_phase=16, order=[1, 0]
+    )
+    return lds_layout_write
+
+@gluon.constexpr_function
+def get_lds_layout_read(mn:gl.constexpr, k:gl.constexpr):
+    reg_bases = [[0, 1], [0, 2], [0, 4]]
+    ktile:gl.constexp = k // 32
+    bit_pos:gl.constexp = 32
+    while ktile // 2:
+        reg_bases.append([0, bit_pos])
+        bit_pos *= 2
+        ktile = ktile // 2
+
+    mtile:gl.constexp = mn // 16
+    bit_pos:gl.constexp = 16
+    while mtile // 2:
+        reg_bases.append([bit_pos, 0])
+        bit_pos *= 2
+        mtile = mtile // 2
+
+    lds_layout_read: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=reg_bases,
+        lane_bases=[
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [0, 8],
+            [0, 16],
+        ],
+        warp_bases=[],
+        block_bases=[],
+        shape=[
+            mn,
+            k,
+        ],
+    )
+    return lds_layout_read
+
+
+@gluon.jit
+def gemm_test_kernel_lds(
+    p_input,            # bf16 [M, K]
+    p_weight,           # bf16 [N,K]
+    p_output,           # float32 [M, N],
+    K:gl.constexpr,
+    N:gl.constexpr,
+    tileM:gl.constexpr,
+    tileN:gl.constexpr,
+    preshffuleB: gl.constexpr,
+    num_warps: gl.constexpr = 1,
+):
+    BK : gl.constexpr = 64
+    tileK : gl.constexpr = BK // 32
+    assert preshffuleB == False
+    mem_a_layout: gl.constexpr = get_mem_ab_layout(tilemn=tileM, tilek=tileK)
+    mem_b_layout: gl.constexpr = buffer_load_layout(k_lanes=8)
+
+    #获得每个lane mapping的 m, k，并根据mk以及实际的layout计算offset, 从HBM中读取。
+    mem_a_offset_m = gl.arange(0, 16*tileM, layout=gl.SliceLayout(1, mem_a_layout))
+    mem_a_offset_k = gl.arange(0, BK, layout=gl.SliceLayout(0, mem_a_layout))
+    mem_a_offset = mem_a_offset_m[:,None] * K + mem_a_offset_k[None,:]
+    
+
+    mem_b_offset_n = gl.arange(0, 16*tileN, layout=gl.SliceLayout(1, mem_b_layout))
+    mem_b_offset_k = gl.arange(0, BK, layout=gl.SliceLayout(0, mem_b_layout))
+    mem_b_offset = mem_b_offset_n[:,None] * K + mem_b_offset_k[None,:]
+
+    mem_c_layout: gl.constexpr = get_mem_c_layout(tileM=tileM, tileN=tileN)
+    c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
+                                            instr_shape=[16, 16, 32],
+                                            transposed=True,
+                                            tiles_per_warp=[tileM, tileN],
+                                            warps_per_cta=[1, 1])
+    a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
+    b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
+    acc = gl.zeros((16*tileM, 16*tileN), dtype=gl.float32, layout=c_layout)
+    
+    
+    lds_layout_write: gl.constexpr = get_lds_layout_write()
+    lds_layout_read: gl.constexpr = get_lds_layout_read(mn=16*tileN, k=BK)
+    lds_b = gl.allocate_shared_memory(gl.bfloat16, [tileN*16, BK], layout=lds_layout_write,)
+
+    for k_start in gl.static_range(0, K, BK):
+        a = gl.amd.cdna3.buffer_load(p_input, mem_a_offset)
+        a = a.reshape(16*tileM, BK)
+        a_fma = gl.convert_layout(a, a_fma_layout, assert_trivial=True)
+        b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offset)
+        b = b.reshape(16*tileN, BK)
+        lds_b.store(b)
+        b = (
+                lds_b.load(layout=lds_layout_read)
+                .permute(1, 0)
+                .reshape(BK,16*tileN)
+            )
+
+        b_fma = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
+        acc = gl.amd.cdna4.mfma(a_fma, b_fma, acc)
+        mem_a_offset += BK
+        mem_b_offset += BK
+        
+    out_offsets_m = (gl.arange(0, 16*tileM, layout=gl.SliceLayout(1, mem_c_layout)))
+    out_offsets_n = (gl.arange(0, 16*tileN, layout=gl.SliceLayout(0, mem_c_layout)))
+    out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
+    gl.amd.cdna3.buffer_store(gl.convert_layout(acc.reshape(16*tileM, 16*tileN), mem_c_layout, assert_trivial=True), p_output, out_offsets)
+
+def gemm_test_lds():
+    mfaM = 16
+    mfaN = 16
+    mfaK = 32
+    tileM = 2
+    tileN = 2
+    tileK = 40
+    M = mfaM * tileM
+    N = mfaN * tileN
+    K = mfaK * tileK
+    A = torch.randn([M, K], dtype=torch.bfloat16)*0.1
+    B = torch.randn([N, K], dtype=torch.bfloat16)*0.1
+
+
+    weight =  B
+    C = torch.zeros([M, N], dtype=torch.float32)
+    C_ref = A @ B.T
+
+    gemm_test_kernel_lds[(1,)](
+                A,
+                weight,
+                C,
+                K=K,
+                N=N,
+                tileM = tileM,
+                tileN = tileN,
+                preshffuleB = False,
+                num_warps=1)
+    assert torch.allclose(C_ref.to(dtype=torch.float32), C, rtol=0.1, atol=0.03)
+    print(f"[LDS]pass {M=} {N=} {K=} ")
+
+gemm_test_lds()
