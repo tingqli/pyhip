@@ -994,6 +994,8 @@ dump_serial_id = 0
 PYHIP_CACHE_DIR = os.getenv("PYHIP_CACHE_DIR", os.path.expanduser("~/.pyhip"))
 os.makedirs(PYHIP_CACHE_DIR, exist_ok=True)
 
+PYHIP_SIMPLE_GEN_FILENAME = int(os.getenv("PYHIP_SIMPLE_GEN_FILENAME", "0"))
+
 PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "0"))
 PYHIP_DUMP_DIR = os.getenv("PYHIP_DUMP_DIR", "")
@@ -3798,7 +3800,10 @@ class jit_kernel:
 
     def build(self, compile_args, kernel_key):
         # put all generated files under $HOME/.pyhip
-        cpp_src_fpath = f"{PYHIP_CACHE_DIR}/{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}.cpp"
+        if PYHIP_SIMPLE_GEN_FILENAME:
+            cpp_src_fpath = f"{PYHIP_CACHE_DIR}/{self.func_name}-{kernel_key}.cpp"
+        else:
+            cpp_src_fpath = f"{PYHIP_CACHE_DIR}/{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}.cpp"
 
         J = JIT(f"{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}", self.no_pass)
 

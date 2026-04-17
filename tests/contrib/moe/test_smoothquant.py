@@ -8,6 +8,10 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter import QuantType
 from aiter.utility import fp4_utils
 
+# to export co kernels to aiter
+import os
+os.environ["PYHIP_SIMPLE_GEN_FILENAME"] = "1"
+
 import pyhip
 from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
 
@@ -682,13 +686,52 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
         print(f"\t{pyhip.calc_diff(ref0, ret_asm)=:.6f}  {dt_asm:.0f} us")
     print(f"\t{pyhip.calc_diff(ref0, ret_i8)=:.6f}  {dt_i8:.0f} us")
     print(f"\t{pyhip.calc_diff(ref1, ret_i8, -0.01)=:.6f}  {dt_i8:.0f} us")
+
+    if use_smoothquant:
+        smooth_info = "shared-up" if shared_smoothquant_up else "per-expert"
+    else:
+        smooth_info = "unused"
+    ret = {
+        "num_tokens":num_tokens,
+        "model_dim":model_dim,
+        "inter_dim":inter_dim,
+        "num_experts":num_experts,
+        "topk":topk,
+        "smooth": smooth_info,
+        "diff": pyhip.calc_diff(ref1, ret_i8),
+        "time(us)":f"{dt_i8:.0f}"
+    }
+
     if ret_fp4 is not None:
         print(f"\t{pyhip.calc_diff(ref0, ret_fp4)=:.6f}  {dt_fp4:.0f} us")
         print(f"\t{pyhip.calc_diff(ref1, ret_fp4, -0.01)=:.6f}  {dt_fp4:.0f} us")
 
+    return ret
 
 if __name__ == "__main__":
     pyhip.set_device()
+
+    if 1:
+        summary = []
+        for num_experts, topk in [(800, 25), (400, 20)]:
+            for num_tokens in [40960, 20480, 19147]:
+                for use_smoothquant, shared_smooth_up in [(1, 0), (1, 1), (0, 0)]:
+                    ret = test_fmoe_sqi8(num_tokens = num_tokens,
+                                       model_dim = 4096, inter_dim = 1536,
+                                       num_experts = num_experts,
+                                       topk = topk, 
+                                       use_smoothquant = use_smoothquant,
+                                       shared_smoothquant_up = shared_smooth_up)
+                    summary.append(ret)
+        try:
+            import pandas as pd
+            print(pd.DataFrame(summary).to_markdown(index=False))
+        except:
+            pass
+
+        import sys
+        sys.exit(0)
+
 
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 800, topk = 25)
