@@ -14,6 +14,7 @@ import hashlib
 import subprocess
 
 import types
+from collections.abc import Iterable
 
 def get_caller_loc():
     frame = inspect.currentframe().f_back.f_back
@@ -813,7 +814,7 @@ class Layout:
         return voffset, offset0
 
 class LDSTensor:
-    def __init__(self, J, shape, dtype, lds_base=None):
+    def __init__(self, J, shape, dtype="s8", lds_base=None):
         self.J = J
         self.shape = shape
         stride_bytes = [J.sizeof(dtype)]
@@ -829,6 +830,16 @@ class LDSTensor:
         else:
             self.lds_base = lds_base
             self.own = False
+
+    # compile-time constexpr accessing LDS offset
+    def __getitem__(self, key):
+        lds_offset = self.lds_base
+        if not isinstance(key, Iterable):
+            key = [key]
+        for i,x in enumerate(key):
+            assert x < self.shape[i]
+            lds_offset += x*self.stride_bytes[i]
+        return lds_offset
 
     # Python do not guarantee `__del__` happens immediatly at `del obj`
     # it may delay which is not intended. call free instead
@@ -2468,9 +2479,9 @@ class JIT:
     def free_lds(self, offset):
         self.lds_allocator.free(offset)
 
-    def LDSTensor(self, shape, dtype):
-        return LDSTensor(self, shape, dtype)
-    
+    def LDSTensor(self, shape, dtype="s8", base=None):
+        return LDSTensor(self, shape, dtype, base)
+
     def Layout(self, shape, dtype, offset_bits = 12):
         return Layout(self, shape, dtype, offset_bits)
 

@@ -285,10 +285,11 @@ def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sor
         J.ds_read_b32(sorted_ids, ds_vaddr)
         vmem_addr_dpp = J.gpr(2, "vu32", input[0], input[1])
         J.s_waitcnt(mod=f"lgkmcnt(0)")
-        if TOPK > 0:
-            tokid = (sorted_ids & 0xFFFFFF) * TOPK + (sorted_ids >> 24)
-        else:
-            tokid = (sorted_ids & 0xFFFFFF)
+        tokid = J.gpr("su32")
+        with J.If(TOPK > 0) as If:
+            tokid[0] = (sorted_ids & 0xFFFFFF) * TOPK + (sorted_ids >> 24)
+            If.Else()
+            tokid[0] = (sorted_ids & 0xFFFFFF)
         saddr_dummy = J.gpr(2, "su32", 0)
         J.v_mad_u64_u32(vmem_addr_dpp, saddr_dummy, tokid, J.gpr("su32", vm_stride), vmem_addr_dpp)
         vswizzle_col_off = J.gpr("vu32", swizzle_col * J.sizeof_DW4)
@@ -305,11 +306,16 @@ def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sor
 
         J.s_waitcnt(mod=f"lgkmcnt(0)")
 
-        for m in range(vm_load_cnt):
-            tokid = J.gpr(2, "vu32", vmem_voff[m] & 0xFFFFFF, vmem_voff[m] >> 24)
-            if TOPK > 0:
+        with J.If(TOPK > 0) as If:
+
+            for m in range(vm_load_cnt):
+                tokid = J.gpr(2, "vu32", vmem_voff[m] & 0xFFFFFF, vmem_voff[m] >> 24)
                 vmem_voff[m] = (tokid[0]*TOPK + tokid[1]) * vm_stride + swizzle_col * J.sizeof_DW4
-            else:
+
+            If.Else()
+
+            for m in range(vm_load_cnt):
+                tokid = J.gpr(2, "vu32", vmem_voff[m] & 0xFFFFFF, vmem_voff[m] >> 24)
                 vmem_voff[m] = tokid[0]*vm_stride + swizzle_col * J.sizeof_DW4
 
 
