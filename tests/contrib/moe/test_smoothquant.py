@@ -43,26 +43,25 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
               "REDUCE_K":model_dim,
               "BLOCK_QUANT":256,}
     device = x.device
-    DEBUG = False
-    if DEBUG:
-        x_quant = torch.ones((M, topk, model_dim), dtype=torch.int8, device=device)
-        x_quant_scale = torch.ones([sorted_ids.shape[0]], dtype=torch.float32, device=device)
-    else:
-        x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
-        x_quant_scale = torch.empty([sorted_ids.shape[0]], dtype=torch.float32, device=device)
     if is_gemm1:
         if smooth_scale.shape[0] == 1:
+            x_quant = torch.empty((M, model_dim), dtype=torch.int8, device=device)
+            x_quant_scale = torch.empty([M, 1], dtype=torch.float32, device=device)
             hip.quant1_notopk([M], [64], 
                 x, smooth_scale, x_quant, x_quant_scale, 
                 topk_ids, M, **kwargs
                 )
-            x_quant_scale.is_sorted = True
+            x_quant_scale.is_sorted = False
         else:
+            x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
+            x_quant_scale = torch.empty([M, topk, 1], dtype=torch.float32, device=device)
             hip.quant1([2*div_up(M, kwargs["ROW_PER_BLOCK1"])], [64], 
                 x, smooth_scale, x_quant, x_quant_scale, 
                 topk_ids, M, **kwargs)
             x_quant_scale.is_sorted = False
     else:
+        x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
+        x_quant_scale = torch.empty([sorted_ids.shape[0]], dtype=torch.float32, device=device)        
         hip.quant2([sorted_expert_ids.shape[0], kwargs["BLOCK_SIZE_M"] // kwargs["BLOCK_M2"]], [256], 
             x, smooth_scale, x_quant, x_quant_scale, 
             sorted_ids, sorted_expert_ids, num_valid_ids,
@@ -355,7 +354,7 @@ def fused_moe_gelu_sqi8(
                 quant_dtype=torch.int8,
             )
             a1_scale.is_sorted = False
-        elif 0:
+        elif 1:
             a1, a1_scale = quant_act(hidden_states, topk, hidden_states.shape[0], hidden_states.shape[1], a1_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, True, topk_ids)
         else:
             a1, a1_scale = smoothquant_i8_per_tok(hidden_states, a1_smooth_scale, topk, sorted_ids, sorted_expert_ids, num_valid_ids, block_size_M)
@@ -632,7 +631,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
             fc2_scale,
             fc1_smooth_scale if use_smoothquant else None,
             fc2_smooth_scale if use_smoothquant else None,
-            num_verbose = 1,
+            num_verbose = 0,
             num_flops = num_flops,
         )
 
@@ -650,7 +649,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
                 fc2_scale_mxfp4,
                 fc1_smooth_scale.expand(num_experts, -1, -1),
                 fc2_smooth_scale,
-                num_verbose = 1,
+                num_verbose = 0,
                 num_warmup = 0,
                 num_iters = 1
             )
@@ -693,6 +692,7 @@ if __name__ == "__main__":
 
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 800, topk = 25)
-    #test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=0)
-    #test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=0, shared_smoothquant_up=0)
+    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=0)
     test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=1)
+    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=0, shared_smoothquant_up=0)
+    
