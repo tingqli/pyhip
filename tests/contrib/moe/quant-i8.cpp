@@ -720,6 +720,114 @@ __global__ __launch_bounds__(64, 1) void quant1(
     }
 }
 
+__global__ __launch_bounds__(64, 1) void quant1_notopk(
+            __bf16* x,                  // [M, S]
+            float* smooth_scale,        // [E, S]
+            char* x_out,                // [M, S]
+            float* x_quant_scale,       // [M, ]
+            uint* expert_ids,           // [M, TOPK]
+            uint M) {
+    // wg: [M//4]
+    uint m_block = blockIdx.x;
+    uint lane_id = threadIdx.x % 64;
+    uint wave_id = threadIdx.x / 64;
+    uint lane_r = lane_id / COL_PER_WAVE;
+    uint lane_c = lane_id % COL_PER_WAVE;
+    auto S = QUANT1_K;
+    //__shared__ __bf16 lds[QUANT1_K];
+    float32x8 x_org_buf[QUANT1_K / 64 / 8];
+    float32x8 x_smooth_buf[QUANT1_K / 64 / 8];
+    // __bf16 x_smooth_buf[QUANT1_K / 64 / 8][8];
+    BufferResource x_res(x + (int64_t)m_block * ROW_PER_BLOCK1 * S, 0xffffffff);
+    BufferResource x_out_res(x_out + (int64_t)m_block * ROW_PER_BLOCK1 * S, 0xffffffff);
+    BufferResource smooth_scale_res(smooth_scale, 0xffffffff);//M * S * sizeof(float));
+
+    auto loop_row = [&] (__bf16* p_x, uint token_id, uint token_id_in_block) {
+        float cur_max = -FLT_MAX;
+        float32x8 scale_buf[QUANT1_K / 64 / 8];
+        #pragma unroll
+        for (int i = 0; i < QUANT1_K / 64 / 8; i++) {
+            //scale_buf[i] = global_load_dwordx4<float32x8>(p_smooth_scale, (threadIdx.x + i * 64) * 8 * sizeof(float));
+            float32x4 tmp[2];
+            tmp[0] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                 0,
+                 (threadIdx.x + i * 64) * 8 * sizeof(float),
+                 0,
+                 (int)amd_buffer_coherence_enum::glc);
+            tmp[1] = buffer_load_dwordx4<float32x4>(smooth_scale_res,
+                 0,
+                 (threadIdx.x + i * 64) * 8 * sizeof(float) + 4 * sizeof(float),
+                 0,
+                 (int)amd_buffer_coherence_enum::glc);
+            scale_buf[i] = {tmp[0][0], tmp[0][1], tmp[0][2], tmp[0][3], tmp[1][0], tmp[1][1], tmp[1][2], tmp[1][3]};
+        }
+        # pragma unroll
+        for (int i = 0; i < S / 8 / 64; i++) {
+            auto& scale = scale_buf[i];
+            auto x_val = x_org_buf[i];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                auto tmp = (scale[j] * x_val[j]);
+                //lds[(i * 64 + threadIdx.x) * 8 + j] = tmp;
+                x_smooth_buf[i][j] = tmp;
+                cur_max = fmaxf(cur_max, abs(tmp));
+            }
+        }
+        cur_max = __reduce_max_sync(0xffffffffffffffff, cur_max);
+        auto row_scale = cur_max / 128.0f;
+        row_scale = fmaxf(row_scale, 1e-6f);
+        auto inv_row_scale = __builtin_amdgcn_rcpf(row_scale); //1.0f / row_scale;
+        #pragma unroll
+        for (int i = 0; i < S / 8 / 64; i++) {
+            // float32x2 result[4];
+            // uint32x2_t qv;
+            // result[0] = mul_f32x2(x_smooth_buf[i][0], x_smooth_buf[i][1], inv_row_scale);
+            // result[1] = mul_f32x2(x_smooth_buf[i][2], x_smooth_buf[i][3], inv_row_scale);
+            // result[2] = mul_f32x2(x_smooth_buf[i][4], x_smooth_buf[i][5], inv_row_scale);
+            // result[3] = mul_f32x2(x_smooth_buf[i][6], x_smooth_buf[i][7], inv_row_scale);
+            // qv[0] = float4_to_uint(result[0][0], result[0][1], result[1][0], result[1][1]);
+            // qv[1] = float4_to_uint(result[2][0], result[2][1], result[3][0], result[3][1]);
+            //p_x_out[i * 64 + threadIdx.x] = qv;
+            charx8 qv;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                auto val = x_smooth_buf[i][j] * inv_row_scale;
+                qv[j] = max(-128, min(127, (int)roundf(val)));
+            }
+            buffer_store_dwordx2(qv, 
+                x_out_res, 
+                token_id_in_block * S, 
+                (i * 64 + threadIdx.x) * 8, 
+                0,
+                amd_buffer_coherence_enum::SYSTEM_NT1);
+        }
+        x_quant_scale[token_id] = row_scale;
+        // if (threadIdx.x == 0) {
+        //     x_quant_scale[e_idx * BLOCK_SIZE_M + row_id] = row_scale;
+        // }
+    };
+
+    auto load_token = [&] (__bf16* p_x, bfloat16x8& x_val, uint token_id_in_block, int i) {
+        //x_val = global_load_dwordx4<bfloat16x8>(p_x, i * 8 * sizeof(__bf16));
+        x_val = buffer_load_dwordx4<bfloat16x8>(x_res, 0, token_id_in_block * S * sizeof(__bf16), i * 8 * sizeof(__bf16), (int)amd_buffer_coherence_enum::SYSTEM_NT1);
+    };
+    // __syncthreads();
+    #pragma unroll
+    for (int t = 0; t < ROW_PER_BLOCK1; t++) {
+        uint token_id = m_block * ROW_PER_BLOCK1 + t;
+        if (token_id >= M) return;
+        auto p_x = x + token_id * S;
+        for (int i = 0; i < QUANT1_K / 64 / 8; i++) {
+            bfloat16x8 tmp;
+            load_token(p_x, tmp, t, threadIdx.x + i * 64);
+            for (int j = 0; j < 8; j++) {
+                x_org_buf[i][j] = tmp[j];
+            }
+        }
+        loop_row(p_x, token_id, t);
+    }
+}
+
 __global__ void __launch_bounds__(256, 1) reduce_i8(
             char* p_x,        // [M, topk, REDUCE_K]
             float* p_scale,   // [M, topk, REDUCE_K//BLOCK_QUANT]

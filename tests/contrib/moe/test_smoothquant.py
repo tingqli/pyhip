@@ -51,11 +51,10 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
         x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
         x_quant_scale = torch.empty([sorted_ids.shape[0]], dtype=torch.float32, device=device)
     if is_gemm1:
-        if 0:
-            hip.quant([sorted_expert_ids.shape[0], kwargs["BLOCK_SIZE_M"] // kwargs["ROW_PER_BLOCK"]], [64], 
+        if smooth_scale.shape[0] == 1:
+            hip.quant1_notopk([M], [64], 
                 x, smooth_scale, x_quant, x_quant_scale, 
-                sorted_ids, sorted_expert_ids, num_valid_ids,
-                M, model_dim, 1, **kwargs
+                topk_ids, M, **kwargs
                 )
             x_quant_scale.is_sorted = True
         else:
@@ -217,7 +216,10 @@ def fused_moe_gelu_sqi8(
                 tok_states = x[tok_id, :]
 
             # [cur_num_toks, dims] * [expert, 1, dims]
-            tok_states = tok_states * x_smooth_scale[expert_id, 0:1, :] 
+            if x_smooth_scale.shape[0] == 1:
+                tok_states = tok_states * x_smooth_scale[0, 0:1, :]
+            else:
+                tok_states = tok_states * x_smooth_scale[expert_id, 0:1, :] 
             pts = torch.maximum(tok_states.abs().max(dim=1, keepdim=True)[0] / 128, torch.tensor(0.0000001))
             quant_x[tok_id, topk_id, :] = (tok_states / pts).round().clamp(-128, 127).to(torch.int8)
 
@@ -349,7 +351,7 @@ def fused_moe_gelu_sqi8(
             a1, a1_scale = smoothquant_per_tok(hidden_states, a1_smooth_scale, topk)
 
     moe_gemm = moe_gemm_jit
-    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}_up"):
+    with pyhip.cudaPerf(num_tokens * topk * model_dim * inter_dim * 2, name=f"{moe_gemm.__name__}_up"):
         a2_v, a2_s = moe_gemm(a1, a1_scale, w1, w1_scale, 1, 0)
 
     #a2_bf16 = fake_quant(a2_bf16)
@@ -372,7 +374,7 @@ def fused_moe_gelu_sqi8(
 
     # only ref supports this so-far
     moe_gemm = moe_gemm_jit if oquant_block_size > 0 else moe_gemm_jit
-    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}_down"):
+    with pyhip.cudaPerf(num_tokens * topk * model_dim * inter_dim * 2, name=f"{moe_gemm.__name__}_down"):
         stage2_out, stage2_out_scale = moe_gemm(a2, a2_scale, w2, w2_scale, 2, oquant_block_size)
 
     with pyhip.cudaPerf(name=f"reduce"):
@@ -533,7 +535,7 @@ def fused_moe_gelu_sq_mxfp4(
 
     a2_bf16 = torch.empty((num_tokens, topk, inter_dim), dtype=torch.bfloat16, device=device,)
 
-    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[  up]"):
+    with pyhip.cudaPerf(num_tokens * topk * model_dim * inter_dim * 2, name=f"{moe_gemm.__name__}[  up]"):
         moe_gemm(a2_bf16, a1, a1_scale, w1, w1_scale, 1)
 
     with pyhip.cudaPerf(name=f"quant_act_down"):
@@ -541,14 +543,14 @@ def fused_moe_gelu_sq_mxfp4(
 
     stage2_out = torch.empty((num_tokens, topk, model_dim), dtype=torch.bfloat16, device=device)
 
-    with pyhip.cudaPerf(name=f"{moe_gemm.__name__}[down]"):
+    with pyhip.cudaPerf(num_tokens * topk * model_dim * inter_dim * 2, name=f"{moe_gemm.__name__}[down]"):
         moe_gemm(stage2_out, a2, a2_scale, w2, w2_scale, 2)
 
     moe_out = stage2_out.sum(dim=1)
 
     return moe_out
 
-def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoothquant):
+def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoothquant, shared_smoothquant_up):
     device = "cuda"
 
     x0 = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16, device=device)
@@ -557,7 +559,11 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
     w2_f32 = torch.randn(num_experts, model_dim, inter_dim, dtype=torch.float32)
 
     if use_smoothquant:
-        fc1_smooth_scale = 1.0/torch.randint(low=1, high=5, size=[num_experts, 1, model_dim], dtype=torch.float32, device=device)
+        if shared_smoothquant_up:
+            smooth_dim = 1
+        else:
+            smooth_dim = num_experts
+        fc1_smooth_scale = 1.0/torch.randint(low=1, high=5, size=[smooth_dim, 1, model_dim], dtype=torch.float32, device=device)
         fc2_smooth_scale = 1.0/torch.randint(low=1, high=5, size=[num_experts, 1, inter_dim], dtype=torch.float32, device=device)
     else:
         fc1_smooth_scale = torch.ones([num_experts, 1, model_dim], dtype=torch.float32, device=device)
@@ -598,8 +604,10 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
     # )
 
     ref0 = torch_moe(x0, w1_f32, w2_f32, x1, x2, None, None, None, None, activation=ActivationType.Gelu)
-    ref1 = torch_moe(x0, w1, w2, x1, x2, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, activation=ActivationType.Gelu)
-    ref2 = moe_smoothquant_gelu_ref(x0, w1, w2, x1, x2, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
+    ref1 = torch_moe(x0, w1, w2, x1, x2, fc1_scale, fc2_scale,
+                     fc1_smooth_scale.expand(num_experts, -1, -1),
+                     fc2_smooth_scale, activation=ActivationType.Gelu)
+    ref2 = moe_smoothquant_gelu_ref(x0, w1, w2, x1, x2, fc1_scale, fc2_scale, fc1_smooth_scale.expand(num_experts, -1, -1), fc2_smooth_scale)
 
     ret_i8, dt_i8 = pyhip.run_perftest(
             fused_moe_gelu_sqi8,
@@ -629,7 +637,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
                 x2,
                 fc1_scale_mxfp4,
                 fc2_scale_mxfp4,
-                fc1_smooth_scale,
+                fc1_smooth_scale.expand(num_experts, -1, -1),
                 fc2_smooth_scale,
                 num_verbose = 1,
                 num_warmup = 0,
@@ -645,7 +653,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
             x2,
             fc1_scale,
             fc2_scale,
-            fc1_smooth_scale,
+            fc1_smooth_scale.expand(num_experts, -1, -1),
             fc2_smooth_scale,
             get_gfx() != "gfx942",
             #False,
@@ -671,5 +679,6 @@ if __name__ == "__main__":
 
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 800, topk = 25)
-    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1)
-    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=0)
+    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=0)
+    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=0, shared_smoothquant_up=0)
+    # test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=1)

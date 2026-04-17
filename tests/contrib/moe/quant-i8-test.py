@@ -26,6 +26,7 @@ QUANT1_K = model_dim
 QUANT2_K = inter_dim
 REDUCE_K = model_dim
 BLOCK_QUANT = 256
+QUANT1_TOPK = TOPK
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 hip = pyhip.module(f"{current_dir}/quant-i8.cpp", f"-D{BLOCK_SIZE_M=} -D{TOPK=} -D{ROW_PER_BLOCK=} -D{ROW_PER_BLOCK2=} -D{ROW_PER_BLOCK1=} -D{BLOCK_M2=} -D{QUANT1_K=} -D{QUANT2_K=} -D{BLOCK_QUANT=} -D{REDUCE_K=}")
@@ -51,11 +52,11 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
         x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
         x_quant_scale = torch.empty([sorted_expert_ids.shape[0], BLOCK_SIZE_M], dtype=torch.float32, device=device)
     if is_gemm1:
-        if 0:
-            quant([sorted_expert_ids.shape[0], BLOCK_SIZE_M // ROW_PER_BLOCK], [64], 
+        if TOPK == 1:
+            hip.quant1_notopk([div_up(M, ROW_PER_BLOCK1)], [64], 
                 x.data_ptr(), smooth_scale.data_ptr(), x_quant.data_ptr(), x_quant_scale.data_ptr(), 
-                sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
-                M, model_dim, 1
+                topk_ids.data_ptr(),
+                M
                 )
         else:
             hip.quant1([2*div_up(M, ROW_PER_BLOCK1)], [64], 
@@ -105,7 +106,10 @@ def torch_ref(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
                 tok_states = x[tok_id, :]
 
             # [cur_num_toks, dims] * [expert, 1, dims]
-            tok_states = tok_states * x_smooth_scale[expert_id, :] 
+            if x_smooth_scale.shape[0] == 1:
+                tok_states = tok_states * x_smooth_scale[0, :]
+            else:
+                tok_states = tok_states * x_smooth_scale[expert_id, :] 
             pts = torch.maximum(tok_states.abs().max(dim=1, keepdim=True)[0] / 128, torch.tensor(0.0000001))
             quant_x[tok_id, topk_id, :] = (tok_states / pts).round().clamp(-128, 127).to(torch.int8)
 
@@ -172,7 +176,11 @@ def moe_sorting_ck(
 
 
 x = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16)
-fc1_smooth_scale = 1.0/torch.randint(low=1, high=5, size=[num_experts, model_dim], dtype=torch.float32)
+if QUANT1_TOPK > 1:
+    fc1_smooth_scale = 1.0/torch.randint(low=1, high=5, size=[num_experts, model_dim], dtype=torch.float32)
+else:
+    fc1_smooth_scale = 1.0/torch.randint(low=1, high=5, size=[1, model_dim], dtype=torch.float32)
+# fc1_smooth_scale[:] = 1
 fc2_smooth_scale = 1.0/torch.randint(low=1, high=5, size=[num_experts, inter_dim], dtype=torch.float32)
 M = num_tokens
 topk_weight = torch.randn([M, topk], dtype=torch.float32)
