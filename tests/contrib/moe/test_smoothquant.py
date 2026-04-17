@@ -14,7 +14,7 @@ os.environ["PYHIP_SIMPLE_GEN_FILENAME"] = "1"
 
 import pyhip
 from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
-
+from pyhip.contrib.moe_gemm_8wave_gelu_r import moe_gemm_8wave_gelu_r
 def div_up(x, y):
     return (x + y - 1) // y
 
@@ -321,7 +321,9 @@ def fused_moe_gelu_sqi8(
         num_oc_blocks = output.shape[-1] // wg_N
         num_e_blocks = sorted_expert_ids.shape[0]
 
-        moe_gemm_8wave_gelu([num_oc_blocks * num_e_blocks],[8*64],
+        jit_func = moe_gemm_8wave_gelu_r
+        #jit_func = moe_gemm_8wave_gelu
+        jit_func([num_oc_blocks * num_e_blocks],[8*64],
                         is_in_3d,
                         is_over_4GB,
                         is_pts_sorted,
@@ -685,7 +687,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
     if ret_asm is not None:
         print(f"\t{pyhip.calc_diff(ref0, ret_asm)=:.6f}  {dt_asm:.0f} us")
     print(f"\t{pyhip.calc_diff(ref0, ret_i8)=:.6f}  {dt_i8:.0f} us")
-    print(f"\t{pyhip.calc_diff(ref1, ret_i8, -0.01)=:.6f}  {dt_i8:.0f} us")
+    print(f"\t{pyhip.calc_diff(ref1, ret_i8, 0.01)=:.6f}  {dt_i8:.0f} us")
 
     if use_smoothquant:
         smooth_info = "shared-up" if shared_smoothquant_up else "per-expert"
@@ -710,8 +712,25 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
 
 if __name__ == "__main__":
     pyhip.set_device()
+    if 0:
+        batch = 400
+        M,N,K = 40960*20//400,4096,1536//2
 
-    if 1:
+        input = torch.randn(batch, M, K).to(torch.bfloat16)
+        mat1 = torch.randn(batch, N, K).to(torch.bfloat16)
+        mat2 = torch.randn(batch, K, N).to(torch.bfloat16)
+        #M,N,K = 8192,8192,8192
+        for _ in range(10):
+            with pyhip.cudaPerf(M*N*K*2, input.numel()*2 + mat2.numel()*2 + (M*N*2)):
+                res = torch.nn.functional.linear(input[0,...], mat1[0,...])
+
+        for _ in range(10):
+            with pyhip.cudaPerf(batch*M*N*K*2, input.numel()*2 + mat2.numel()*2 + (batch*M*N*2)):
+                res = torch.bmm(input, mat2)
+        import sys
+        sys.exit(0)
+
+    if 0:
         summary = []
         for num_experts, topk in [(800, 25), (400, 20)]:
             for num_tokens in [40960, 20480, 19147]:
@@ -736,6 +755,6 @@ if __name__ == "__main__":
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 800, topk = 25)
     test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=0)
-    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=1)
-    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=0, shared_smoothquant_up=0)
+    #test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=1)
+    #test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=0, shared_smoothquant_up=0)
     
