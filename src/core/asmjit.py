@@ -689,7 +689,7 @@ class Buffer:
             return self.J.buffer_load_dword(voffset, self.desc, soffset, mod = mod + " lds")
         return self.J.buffer_load_dword(vdst, voffset, self.desc, soffset, mod=mod)
 
-    def store_dwordx4(self, vdata, voffset, soffset, offset12=0):
+    def store_dwordx4(self, vdata, voffset, soffset, offset12=0, ext_mod=""):
         # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
         assert isinstance(offset12 , int) # must be compile time constant
         mod = f"offen"
@@ -697,11 +697,11 @@ class Buffer:
             mod += f" offset:{offset12}"
         
         if len(voffset) == 1:
-            return self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
+            return self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=" ".join([mod,ext_mod]))
         elif  len(voffset) == 2:
             # WARNNING: use 64bit voffset, here we need final address, no way to provide base,
             # offset12 is actually offset13s
-            return self.J.global_store_dwordx4(voffset, vdata, "off", mod = f"offset:{offset12}")
+            return self.J.global_store_dwordx4(voffset, vdata, "off", mod = f"offset:{offset12} {ext_mod}")
         else:
             assert 0
 
@@ -720,13 +720,13 @@ class Buffer:
         mod += " lds"
         return self.J.buffer_load_dword(voffset, self.desc, soffset, mod=mod)
 
-    def store_dword(self, vdata, voffset, soffset, offset12=0):
+    def store_dword(self, vdata, voffset, soffset, offset12=0, ext_mod=""):
         # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
         assert isinstance(offset12 , int) # must be compile time constant
         mod = f"offen"
         if offset12 > 0:
             mod += f" offset:{offset12}"
-        return self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
+        return self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=" ".join([mod,ext_mod]))
 
 class Layout:
     def __init__(self, J, shape, dtype, offset_bits = 12):
@@ -2329,7 +2329,7 @@ class JIT:
                 
                 if (prev.opcode.startswith("buffer_store") or prev.opcode.startswith("flat_store")):
                     if "x3" in prev.opcode or "x4" in prev.opcode or "format" in prev.opcode:
-                        if prev.operands[0].overlap(cur.operands[0]):
+                        if len(cur.operands) > 0 and isinstance(cur.operands[0],GPRExpr) and prev.operands[0].overlap(cur.operands[0]):
                             n_nops = 2
                             self.log(f"insert s_nop({n_nops}) at #{loc} : [BUFFER_STORE* writes vdst, another write vdst]")
 
