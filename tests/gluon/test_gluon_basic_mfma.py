@@ -15,6 +15,7 @@ from triton.experimental.gluon.language.amd.cdna3 import (
 )
 from pyhip import div_up
 from pyhip.contrib.gluon.utils import read_cycle, read_realtime, get_cu_id
+from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
 
 def init_env():
     torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
@@ -225,9 +226,9 @@ def gemm_test_kernel(
     gl.amd.cdna3.buffer_store(gl.convert_layout(acc.reshape(16*tileM, 16*tileN), mem_c_layout, assert_trivial=True), p_output, out_offsets)
 
 init_env()
-gemm_test(bpreshuffle=False, transposeB = True)
-gemm_test(bpreshuffle=False, transposeB = False)
-gemm_test(bpreshuffle=True)
+# gemm_test(bpreshuffle=False, transposeB = True)
+# gemm_test(bpreshuffle=False, transposeB = False)
+# gemm_test(bpreshuffle=True)
 
 
 
@@ -386,4 +387,201 @@ def gemm_test_lds():
     assert torch.allclose(C_ref.to(dtype=torch.float32), C, rtol=0.1, atol=0.03)
     print(f"[LDS]pass {M=} {N=} {K=} ")
 
-gemm_test_lds()
+# gemm_test_lds()
+
+###########################################################################################################################
+###########################################################################################################################
+###########################################################################################################################
+###########################################################################################################################
+@gluon.constexpr_function
+def buffer_load_layout(k_lanes:gl.constexpr):
+    mn_lanes: gl.constexpr = 64 // k_lanes
+    load_layout: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 8],
+                                            threads_per_warp=[mn_lanes, k_lanes],
+                                            warps_per_cta=[1, 1],
+                                            order=[1, 0])
+
+    return load_layout
+
+@gluon.constexpr_function
+def get_lds_layout_write():
+    lds_layout_write: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=1, max_phase=16, order=[1, 0]
+    )
+    return lds_layout_write
+
+@gluon.constexpr_function
+def get_lds_layout_read(mn:gl.constexpr, k:gl.constexpr):
+    reg_bases = [[0, 1], [0, 2], [0, 4]]
+    ktile:gl.constexp = k // 32
+    bit_pos:gl.constexp = 32
+    while ktile // 2:
+        reg_bases.append([0, bit_pos])
+        bit_pos *= 2
+        ktile = ktile // 2
+
+    mtile:gl.constexp = mn // 16
+    bit_pos:gl.constexp = 16
+    while mtile // 2:
+        reg_bases.append([bit_pos, 0])
+        bit_pos *= 2
+        mtile = mtile // 2
+
+    lds_layout_read: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=reg_bases,
+        lane_bases=[
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [0, 8],
+            [0, 16],
+        ],
+        warp_bases=[],
+        block_bases=[],
+        shape=[
+            mn,
+            k,
+        ],
+    )
+    return lds_layout_read
+
+
+@gluon.jit
+def gemm_test_kernel_lds_padding(
+    p_input,            # bf16 [M, K]
+    p_weight,           # bf16 [N,K]
+    p_output,           # float32 [M, N],
+    M:gl.constexpr,
+    K:gl.constexpr,
+    N:gl.constexpr,
+    BM:gl.constexpr,
+    BN:gl.constexpr,
+    BK: gl.constexpr,
+    num_warps: gl.constexpr = 1,
+):
+    assert BK == 64 and BN == 128
+    tileK : gl.constexpr = BK // 32
+    tileM : gl.constexpr = BM // 16
+    tileN : gl.constexpr = BN // 16
+
+    mem_a_layout: gl.constexpr = get_mem_ab_layout(tilemn=tileM, tilek=tileK)
+    # each lane read 8 regN x 8 regK, 64 lanes are divided as 8x8,  
+    gLoadLayoutB: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[1, 0], [2, 0], [4, 0], [0, 1], [0, 2], [0, 4], [0, 8]],
+        lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
+        warp_bases=[],
+        block_bases=[],
+        shape=[BK, BN],
+    )
+    
+    ## padding info
+    padding: gl.constexpr = [[512, 8]]
+    sharedLayoutB: gl.constexpr = gl.PaddedSharedLayout(
+        padding,
+        [
+            # 8k, 4dwords
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            # 8 lanes for K
+            [8, 0],
+            [16, 0],
+            [32, 0],
+            # 8 lanes for N
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            # 16 regN per thread
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+        ],
+        [],
+        [BK, BN],
+    )
+        
+    #获得每个lane mapping的 m, k，并根据mk以及实际的layout计算offset, 从HBM中读取。
+    mem_a_offset_m = gl.arange(0, BM, layout=gl.SliceLayout(1, mem_a_layout))
+    mem_a_offset_k = gl.arange(0, BK, layout=gl.SliceLayout(0, mem_a_layout))
+    mem_a_offset = mem_a_offset_m[:,None] * K + mem_a_offset_k[None,:]
+    
+
+    mem_b_offset_n = gl.arange(0, BN, layout=gl.SliceLayout(0, gLoadLayoutB))
+    mem_b_offset_k = gl.arange(0, BK, layout=gl.SliceLayout(1, gLoadLayoutB))
+    mem_b_offset = mem_b_offset_n[None, :] * K + mem_b_offset_k[:,None]
+
+    mem_c_layout: gl.constexpr = get_mem_c_layout(tileM=tileM, tileN=tileN)
+    c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
+                                            instr_shape=[16, 16, 32],
+                                            transposed=True,
+                                            tiles_per_warp=[tileM, tileN],
+                                            warps_per_cta=[1, 1])
+    a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
+    b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
+    acc = gl.zeros((16*tileM, 16*tileN), dtype=gl.float32, layout=c_layout)
+    
+    
+    smemB = gl.allocate_shared_memory(
+        p_weight.dtype.element_ty, [2, BK, BN], sharedLayoutB
+    )
+        
+    # lds_layout_write: gl.constexpr = get_lds_layout_write()
+    # lds_layout_read: gl.constexpr = get_lds_layout_read(mn=16*tileN, k=BK)
+    # lds_b = gl.allocate_shared_memory(gl.bfloat16, [tileN*16, BK], layout=lds_layout_write,)
+
+    for k_start in gl.static_range(0, K, BK):
+        a = gl.amd.cdna3.buffer_load(p_input, mem_a_offset)
+        a = a.reshape(16*tileM, BK)
+        a_fma = gl.convert_layout(a, a_fma_layout, assert_trivial=True)
+    
+        cdna4_async_copy.buffer_load_to_shared(smemB.index(0), p_weight, mem_b_offset)
+        cdna4_async_copy.commit_group()
+        cdna4_async_copy.wait_group(0)
+
+        b_fma = cdna4_async_copy.load_shared_relaxed(smemB.index(0), b_fma_layout)
+
+        acc = gl.amd.cdna4.mfma(a_fma, b_fma, acc)
+        mem_a_offset += BK
+        mem_b_offset += BK
+        
+    out_offsets_m = (gl.arange(0, 16*tileM, layout=gl.SliceLayout(1, mem_c_layout)))
+    out_offsets_n = (gl.arange(0, 16*tileN, layout=gl.SliceLayout(0, mem_c_layout)))
+    out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
+    gl.amd.cdna3.buffer_store(gl.convert_layout(acc.reshape(16*tileM, 16*tileN), mem_c_layout, assert_trivial=True), p_output, out_offsets)
+
+def gemm_test_lds_padding():
+    mfaM = 16
+    mfaN = 16
+    mfaK = 32
+    BK = 2 * mfaK
+    tileM = 1
+    tileN = 8
+    tileK = 1
+    M = mfaM * tileM
+    N = mfaN * tileN
+    K = BK * tileK
+    A = torch.randn([M, K], dtype=torch.bfloat16)*0.1
+    B = torch.randn([N, K], dtype=torch.bfloat16)*0.1
+
+
+    weight =  B
+    C = torch.zeros([M, N], dtype=torch.float32)
+    C_ref = A @ B.T
+
+    gemm_test_kernel_lds_padding[(1,)](
+                A,
+                weight,
+                C,
+                M=M,
+                K=K,
+                N=N,
+                BM = tileM*mfaM,
+                BN = tileN*mfaN,
+                BK = BK,
+                num_warps=1)
+    assert torch.allclose(C_ref.to(dtype=torch.float32), C, rtol=0.1, atol=0.03)
+    print(f"[LDS PADDING]pass {M=} {N=} {K=} ")
+
+gemm_test_lds_padding()
