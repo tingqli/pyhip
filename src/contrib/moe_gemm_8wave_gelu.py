@@ -520,34 +520,39 @@ def moe_gemm_8wave_gelu(J,
         # scatter output to : [num_tokens, topk, dims]
         J.Jump("non_quant_output", (o_scales[0] | o_scales[1]) == 0)
 
+        vrows_scales = J.gpr(2, "vu32")
         vrows = J.gpr(2, nrM, "vu32")
         vweights = J.gpr(2, nrM, "vf32")
-        for cm in range(2): 
+        row_scales = J.gpr("vu32", (J.lane_id + (warp_m * MINI_BLOCK_M))  * J.sizeof_u32 + lds_sorted_ids)
+        for cm in range(2):
             row = J.gpr("vu32", ((J.lane_id % 16) + (cm * HALF_BLOCK_SIZE_ROW) + (warp_m * MINI_BLOCK_M))  * J.sizeof_u32)
             for m in range(nrM):
                 J.ds_read_b32(vrows[cm, m], row + lds_sorted_ids)
                 J.ds_read_b32(vweights[cm, m], row + lds_sorted_weights)
                 row[0] += 16*J.sizeof_u32
+            # row-scales are not in MFMA layout, all 64 MINI_BLOCK_M are loaded
+            J.ds_read_b32(vrows_scales[cm], row_scales, mod=f"offset:{cm * HALF_BLOCK_SIZE_ROW * J.sizeof_u32}")
+
         J.s_waitcnt(mod=f"lgkmcnt(0)")
 
         C_dtype = "s8"
         stride_c = OC * J.sizeof(C_dtype)
         vs8x4 = J.gpr(2, 2, "vu32") # DWORDx4
         col = J.lane_id // 16
-        swap_12_col = (col & 1) * 2 + (col >> 1)
-        vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * 64 * J.sizeof(C_dtype) + blk_n * (wg_N * J.sizeof(C_dtype)))
+        # swap_12_col = (col & 1) * 2 + (col >> 1)
+        vaddr0 = J.gpr("vu32", col * J.sizeof_DW4 + warp_n * 64 * J.sizeof(C_dtype) + blk_n * (wg_N * J.sizeof(C_dtype)))
 
         # o_scales : stored in sorted order [wg_M, ]
-        S_dtype = "f32"
-        o_scales[:] += blk_m * (wg_M * OC//32 * J.sizeof(S_dtype)) + blk_n * (wg_M * wg_N//32 * J.sizeof(S_dtype))
-        buff_s = J.Buffer(o_scales, wg_M * wg_N//32 * J.sizeof(S_dtype))
+        S_dtype = "bf16x2"
+        o_scales[:] += blk_n * (wg_N//32//2 * J.sizeof(S_dtype))
+        stride_s = OC//32//2 * J.sizeof(S_dtype)
+        buff_s = J.Buffer(o_scales, num_tokens * TOPK * stride_s)
+
         vflow = J.gpr("vf32", -128.0)
         vfhigh = J.gpr("vf32", 127.0)
         vnz_guard = J.gpr("vf32", 1e-6)
-        
-        vaddr = J.gpr("vu32", J.threadIdx.x * J.sizeof_DW4)
 
-        voscales = J.gpr(4, "vf32")
+        voscales = J.gpr(2, 2, "vf32")
         for cm in range(2):
             for m in range(nrM):
                 vrows_topk = J.gpr(vrows[cm, m] >> 24)
@@ -601,8 +606,8 @@ def moe_gemm_8wave_gelu(J,
                     J.v_rcp_f32(inv_row_scale[1], row_scale[1])
 
                     # since we got absmax range on output w/o applying router weights, we merge weights into dequant-process
-                    J.v_mul_f32_dpp(voscales[cm*2+0], vweights[cm,m], row_scale[0], mod=f"quad_perm:[0, 1, 2, 3] row_mask:{1<<m}")
-                    J.v_mul_f32_dpp(voscales[cm*2+1], vweights[cm,m], row_scale[1], mod=f"quad_perm:[0, 1, 2, 3] row_mask:{1<<m}")
+                    J.v_mul_f32_dpp(voscales[cm,0], vweights[cm,m], row_scale[0], mod=f"quad_perm:[0, 1, 2, 3] row_mask:{1<<m}")
+                    J.v_mul_f32_dpp(voscales[cm,1], vweights[cm,m], row_scale[1], mod=f"quad_perm:[0, 1, 2, 3] row_mask:{1<<m}")
 
                     for k in range(4):
                         mfma_C[cm*2+0, m, n, k] *= inv_row_scale[0]
@@ -616,6 +621,7 @@ def moe_gemm_8wave_gelu(J,
                         J.v_med3_f32(mfma_C[cm*2+1, m, n,   k], mfma_C[cm*2+1, m, n,   k], vflow, vfhigh)
                         J.v_med3_f32(mfma_C[cm*2+1, m, n+1, k], mfma_C[cm*2+1, m, n+1, k], vflow, vfhigh)
 
+                    # 
                     for k in range(4):
                         J.v_cvt_i32_f32_sdwa(vs8x4[0, 0], mfma_C[cm*2+0, m, n, k], mod=f"dst_sel:BYTE_{k} dst_unused:UNUSED_PRESERVE src0_sel:DWORD")
                         J.v_cvt_i32_f32_sdwa(vs8x4[0, 1], mfma_C[cm*2+0, m, n+1, k], mod=f"dst_sel:BYTE_{k} dst_unused:UNUSED_PRESERVE src0_sel:DWORD")
@@ -624,9 +630,20 @@ def moe_gemm_8wave_gelu(J,
 
                     #buff_c.store_dwordx4(vs8x4, vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16, ext_mod = "sc1 nt")
                     J.global_store_dwordx4(vaddr, vs8x4, "off", mod=f"offset:{0} sc1 nt")
+            
+            assert nrM == 4
 
-        vaddr_scales = J.gpr("vu32", J.threadIdx.x * J.sizeof_DW4)
-        buff_s.store_dwordx4(voscales, vaddr_scales, 0, ext_mod="sc1 nt")
+            # n32[0]|[4]  n32[1]|[5]  n32[2]|[6]  n32[3]|[7]
+            
+            # combine 64 output scales of cn=0 & cn=1, voscales[cm,0] voscales[cm,1]
+            J.uni_cvt_pk_bf16_f32(voscales[cm,0], voscales[cm,0], voscales[cm,1]) 
+
+            vaddr_scales = J.gpr("vu32", warp_n * J.sizeof_DW)
+            vaddr_scales += ((vrows_scales[cm] & 0xFFFFFF) * TOPK + (vrows_scales[cm] >> 24)) * stride_s
+
+            # streaming output scales with "sc1 nt" causes a big drop in performance, cache can avoid it? WHY?
+            buff_s.store_dword(voscales[cm,0], vaddr_scales, 0, offset12 = 0) #, ext_mod="sc1 nt")
+
         J.s_endpgm()
 
         J.Label("non_quant_output")

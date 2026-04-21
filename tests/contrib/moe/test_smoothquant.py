@@ -303,23 +303,24 @@ def fused_moe_gelu_sqi8(
         else:
             num_tokens, dims = input.shape
             is_in_3d = 0
+
         num_experts, odims, idims = weight.shape
-        if oquant_block_size:
-            assert odims % oquant_block_size == 0
-            output = torch.empty((num_tokens, topk, odims), dtype=torch.int8, device=device)
-            o_scales = torch.empty((num_tokens, topk, odims//oquant_block_size), dtype=torch.float32, device=device)
-        else:
-            output = torch.empty((num_tokens, topk, odims), dtype=torch.bfloat16, device=device)
-            o_scales = None
         AB_dtype = "s8"
         is_over_4GB = input.numel() * input.element_size() > (1<<32)
         is_pts_sorted = getattr(pt_scale, "is_sorted", False)
         wg_M, wg_N = 256, 256
         is_gate_up = (stage_index == 1)
         bpreshuffle = False
-        num_tokens = input.shape[0]
-        num_oc_blocks = output.shape[-1] // wg_N
+        num_oc_blocks = odims // wg_N
         num_e_blocks = sorted_expert_ids.shape[0]
+
+        if oquant_block_size:
+            assert odims % oquant_block_size == 0
+            output = torch.empty((num_tokens, topk, odims), dtype=torch.int8, device=device)
+            o_scales = torch.empty((num_tokens, topk, odims//oquant_block_size), dtype=torch.bfloat16, device=device)
+        else:
+            output = torch.empty((num_tokens, topk, odims), dtype=torch.bfloat16, device=device)
+            o_scales = None
 
         moe_gemm_8wave_gelu([num_oc_blocks * num_e_blocks],[8*64],
                         is_in_3d,
@@ -383,16 +384,41 @@ def fused_moe_gelu_sqi8(
             a2, a2_scale = smoothquant_i8_per_tok(a2_v, a2_smooth_scale, topk, sorted_ids, sorted_expert_ids, num_valid_ids, block_size_M)
 
     # quantize output to int8 in unit of 1x256
-    oquant_block_size = 0
+    oquant_block_size = 32
 
     # only ref supports this so-far
     moe_gemm = moe_gemm_jit if oquant_block_size > 0 else moe_gemm_jit
     with pyhip.cudaPerf(num_tokens * topk * model_dim * inter_dim * 2, name=f"{moe_gemm.__name__}_down"):
         stage2_out, stage2_out_scale = moe_gemm(a2, a2_scale, w2, w2_scale, 2, oquant_block_size)
 
+
+    def unpack_dequant32(output, o_scales):
+        # output   [num_tokens, topk, odims] torch.int8
+        # o_scales [num_tokens, topk, odims//oquant_block_size] torch.bfloat16
+        num_tokens, topk, odims = output.shape
+        
+        order = [0 for _ in range(256)]
+        for i in range(256):
+            cn = i // 128            # 0,1
+            warp_n = (i % 128)//32   # 0,1,2,3
+            ni = (i % 32)//16        # 0,1
+            n_off = i % 16
+            no = cn*2 + ni           # 0,1,2,3 x 16
+            j = warp_n * 64 + (no*4) + (n_off%4) + (n_off//4)*16
+            order[i] = j
+
+        output = output.view(-1, 256)[:, order].view(num_tokens, topk, odims//32, 32)
+        o_scales = o_scales.view(-1, 256//32)[:,(0,2,4,6,1,3,5,7)].view(num_tokens, topk, odims//32, 1)
+        return (output.to(o_scales.dtype) * o_scales).view(num_tokens, topk, odims)
+
+
     with pyhip.cudaPerf(name=f"reduce"):
         if oquant_block_size:
-            if 0:
+            if oquant_block_size == 32:
+                # dequantize & sum, each 
+                stage2_out = unpack_dequant32(stage2_out, stage2_out_scale)
+                moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
+            elif 0:
                 # dequantize & sum
                 stage2_out = (stage2_out.view(-1, oquant_block_size).to(torch.bfloat16) * stage2_out_scale.to(torch.bfloat16).view(-1, 1))
                 moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
@@ -711,7 +737,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
 if __name__ == "__main__":
     pyhip.set_device()
 
-    if 1:
+    if 0:
         summary = []
         for num_experts, topk in [(800, 25), (400, 20)]:
             for num_tokens in [40960, 20480, 19147]:
@@ -736,6 +762,6 @@ if __name__ == "__main__":
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 800, topk = 25)
     test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=0)
-    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=1)
-    test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=0, shared_smoothquant_up=0)
+    #test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=1)
+    #test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=0, shared_smoothquant_up=0)
     
