@@ -420,15 +420,16 @@ def fused_moe_gelu_sqi8(
     with pyhip.cudaPerf(name=f"reduce"):
         if oquant_block_size:
             if oquant_block_size == 32:
-                # dequantize & sum, each 
-                stage2_out = unpack_dequant32(stage2_out, stage2_out_scale)
-                moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
+                if 0:
+                    # dequantize & sum, each 
+                    stage2_out = unpack_dequant32(stage2_out, stage2_out_scale)
+                    moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
+                else:
+                    moe_out = reduce_i8(stage2_out.view(num_tokens, topk, model_dim), stage2_out_scale.view(num_tokens, topk, model_dim//oquant_block_size), oquant_block_size)
             elif 0:
                 # dequantize & sum
                 stage2_out = (stage2_out.view(-1, oquant_block_size).to(torch.bfloat16) * stage2_out_scale.to(torch.bfloat16).view(-1, 1))
                 moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
-            else:
-                moe_out = reduce_i8(stage2_out.view(num_tokens, topk, model_dim), stage2_out_scale.view(num_tokens, topk, model_dim//oquant_block_size), oquant_block_size)
         else:
             moe_out = stage2_out.sum(dim=1)
 
