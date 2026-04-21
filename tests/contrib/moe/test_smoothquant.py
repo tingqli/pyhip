@@ -397,17 +397,22 @@ def fused_moe_gelu_sqi8(
         # o_scales [num_tokens, topk, odims//oquant_block_size] torch.bfloat16
         num_tokens, topk, odims = output.shape
         
-        order = [0 for _ in range(256)]
-        for i in range(256):
-            cn = i // 128            # 0,1
-            warp_n = (i % 128)//32   # 0,1,2,3
-            ni = (i % 32)//16        # 0,1
-            n_off = i % 16
-            no = cn*2 + ni           # 0,1,2,3 x 16
-            j = warp_n * 64 + (no*4) + (n_off%4) + (n_off//4)*16
-            order[i] = j
+        if 1:
+            # reorder in unit of 16bytes (DWORDx4)
+            order = [0,1,4,5,8,9,12,13, 2,3,6,7,10,11,14,15]
+            output = output.view(-1, 16, 16)[:, order, :].view(num_tokens, topk, odims//32, 32)
+        else:
+            order = [i for i in range(256)]
+            for i in range(256):
+                cn = i // 128            # 0,1
+                warp_n = (i % 128)//32   # 0,1,2,3
+                ni = (i % 32)//16        # 0,1
+                n_off = i % 16
+                no = cn*2 + ni           # 0,1,2,3 x 16
+                j = warp_n * 64 + (no*4) + (n_off%4) + (n_off//4)*16
+                order[i] = j
+            output = output.view(-1, 256)[:, order].view(num_tokens, topk, odims//32, 32)
 
-        output = output.view(-1, 256)[:, order].view(num_tokens, topk, odims//32, 32)
         o_scales = o_scales.view(-1, 256//32)[:,(0,2,4,6,1,3,5,7)].view(num_tokens, topk, odims//32, 1)
         return (output.to(o_scales.dtype) * o_scales).view(num_tokens, topk, odims)
 

@@ -628,6 +628,12 @@ def moe_gemm_8wave_gelu(J,
                         J.v_cvt_i32_f32_sdwa(vs8x4[1, 0], mfma_C[cm*2+1, m, n, k], mod=f"dst_sel:BYTE_{k} dst_unused:UNUSED_PRESERVE src0_sel:DWORD")
                         J.v_cvt_i32_f32_sdwa(vs8x4[1, 1], mfma_C[cm*2+1, m, n+1, k], mod=f"dst_sel:BYTE_{k} dst_unused:UNUSED_PRESERVE src0_sel:DWORD")
 
+                    J.v_permlane16_swap_b32(vs8x4[0, 0], vs8x4[0, 1]) # 00 22 | 11 33
+                    J.v_permlane16_swap_b32(vs8x4[1, 0], vs8x4[1, 1]) # 00 22 | 11 33
+                    J.s_nop(1)
+                    J.v_permlane32_swap_b32(vs8x4[0, 0], vs8x4[1, 0]) # 00 00 | 22 22
+                    J.v_permlane32_swap_b32(vs8x4[0, 1], vs8x4[1, 1]) # 11 11 | 33 33
+
                     #buff_c.store_dwordx4(vs8x4, vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16, ext_mod = "sc1 nt")
                     J.global_store_dwordx4(vaddr, vs8x4, "off", mod=f"offset:{0} sc1 nt")
             
