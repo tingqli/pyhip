@@ -42,7 +42,20 @@ def conv_depthwise_3d(input, weight, bias,
         method = "hip"
 
     if method == "hip":
-        pyhip.module("conv_depthwise3d_hip.cpp", "-O2").conv_depthwise3d_hip(
+        # pyhip.module("conv_depthwise3d_hip.cpp", "-O2").conv_depthwise3d_hip(
+        #     [B, C_out, D_out], [256],
+        #     input.data_ptr(),
+        #     output.data_ptr(),
+        #     weight.data_ptr(),
+        #     bias.data_ptr(),
+        #     C_in, D, H, W,
+        #     C_out, D_out, H_out, W_out,
+        #     IO_DTYPE="__half" if input.dtype == torch.float16 else "__hip_bfloat16",
+        #     BLOCK_H=H_out,
+        #     BLOCK_W=W_out,
+        #     PaddingD=padding[0],PaddingH=padding[1],PaddingW=padding[2],
+        #     KD=KD, KH=KH, KW=KW)
+        pyhip.module("conv_depthwise3d_hip_sgb.cpp", "-O2").conv_depthwise3d_hip(
             [B, C_out, D_out], [256],
             input.data_ptr(),
             output.data_ptr(),
@@ -55,6 +68,7 @@ def conv_depthwise_3d(input, weight, bias,
             BLOCK_W=W_out,
             PaddingD=padding[0],PaddingH=padding[1],PaddingW=padding[2],
             KD=KD, KH=KH, KW=KW)
+
     elif method == "jit":
         conv_depthwise_3d_jit([B, C_out,D_out], [256],
                         KD, KH, KW, H_out, W_out,
