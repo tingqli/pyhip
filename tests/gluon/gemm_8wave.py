@@ -385,12 +385,6 @@ def bf16_3stage_4wave(
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         else:
-            gl.inline_asm_elementwise(asm=';',
-                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
-                                      args=[b_top],
-                                      dtype=gl.bfloat16,
-                                      is_pure=False,
-                                      pack=32)
             for _ in gl.static_range(8):
                 _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
                 _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
@@ -398,6 +392,13 @@ def bf16_3stage_4wave(
                 _amd_iglp_sched_group_barrier(s_mfma, 4, 0)
                 _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
             _amd_iglp_sched_group_barrier(s_mfma, 64 - 8 - 12*4, 0)
+            _amd_iglp_sched_barrier(0)
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_top],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
             _amd_iglp_sched_barrier(0)
 
         acc_bot = gl.amd.cdna4.mfma(a, b_bot, acc_bot)
@@ -419,10 +420,6 @@ def bf16_3stage_4wave(
         else:
             mem_b_offsets += BLOCK_TILE_SIZE_K
         if num_warps == 4:
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[b_top, b_bot],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[a, a_next],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
             for _ in gl.static_range(24):
                 _amd_iglp_sched_group_barrier(s_mfma, 1, 1)
                 _amd_iglp_sched_group_barrier(s_ds_read, 1, 1)
@@ -430,6 +427,19 @@ def bf16_3stage_4wave(
                 _amd_iglp_sched_group_barrier(s_mfma, 4, 1)
                 _amd_iglp_sched_group_barrier(s_vmem_read, 1, 1)
             _amd_iglp_sched_group_barrier(s_mfma, 64 - 24 - 4*4, 1)
+            _amd_iglp_sched_barrier(0)
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_bot],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[a],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
             _amd_iglp_sched_barrier(0)
 
         ############## unroll ######################
@@ -457,10 +467,6 @@ def bf16_3stage_4wave(
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         else:
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[b_top, b_bot],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[a, a_next],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
             for _ in gl.static_range(8):
                 _amd_iglp_sched_group_barrier(s_mfma, 1, 2)
                 _amd_iglp_sched_group_barrier(s_ds_read, 1, 2)
@@ -468,6 +474,13 @@ def bf16_3stage_4wave(
                 _amd_iglp_sched_group_barrier(s_mfma, 4, 2)
                 _amd_iglp_sched_group_barrier(s_vmem_read, 1, 2)
             _amd_iglp_sched_group_barrier(s_mfma, 64 - 8 - 12*4, 2)
+            _amd_iglp_sched_barrier(0)
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_top],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
             _amd_iglp_sched_barrier(0)
     
         acc_bot = gl.amd.cdna4.mfma(a_next, b_bot, acc_bot)
@@ -493,10 +506,6 @@ def bf16_3stage_4wave(
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         else:
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[b_top, b_bot],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[a, a_next],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
             for _ in gl.static_range(24):
                 _amd_iglp_sched_group_barrier(s_mfma, 1, 3)
                 _amd_iglp_sched_group_barrier(s_ds_read, 1, 3)
@@ -505,6 +514,20 @@ def bf16_3stage_4wave(
                 _amd_iglp_sched_group_barrier(s_vmem_read, 1, 3)
             _amd_iglp_sched_group_barrier(s_mfma, 64 - 24 - 4*4, 3)
             _amd_iglp_sched_barrier(0)
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_bot],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[a_next],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            _amd_iglp_sched_barrier(0)
+
             # # BLOCK_M // 4 wave * 2(=BLOCK_K//32)
             # k0_t_vmem_read_num: gl.constexpr = BLOCK_TILE_SIZE_M // 4 // 16 * 2 + BLOCK_TILE_SIZE_N // 4 // 16 * 2 // 2
             # # BLOCK_N // 2 wave * 2(=BLOCK_K//16) // 2
