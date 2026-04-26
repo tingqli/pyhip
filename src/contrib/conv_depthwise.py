@@ -12,7 +12,8 @@ def conv_depthwise_3d(input, weight, bias,
                     padding, 
                     dilation,
                     groups,
-                    method = None):
+                    method = None,
+                    hip_impl = "sgb"):
     for s in stride: assert s == 1, s
     for d in dilation: assert d == 1, d
 
@@ -42,20 +43,12 @@ def conv_depthwise_3d(input, weight, bias,
         method = "hip"
 
     if method == "hip":
-        # pyhip.module("conv_depthwise3d_hip.cpp", "-O2").conv_depthwise3d_hip(
-        #     [B, C_out, D_out], [256],
-        #     input.data_ptr(),
-        #     output.data_ptr(),
-        #     weight.data_ptr(),
-        #     bias.data_ptr(),
-        #     C_in, D, H, W,
-        #     C_out, D_out, H_out, W_out,
-        #     IO_DTYPE="__half" if input.dtype == torch.float16 else "__hip_bfloat16",
-        #     BLOCK_H=H_out,
-        #     BLOCK_W=W_out,
-        #     PaddingD=padding[0],PaddingH=padding[1],PaddingW=padding[2],
-        #     KD=KD, KH=KH, KW=KW)
-        pyhip.module("conv_depthwise3d_hip_sgb.cpp", "-O2").conv_depthwise3d_hip(
+        hip_cpp = (
+            "conv_depthwise3d_hip.cpp"
+            if hip_impl == "original"
+            else "conv_depthwise3d_hip_sgb.cpp"
+        )
+        pyhip.module(hip_cpp, "-O2").conv_depthwise3d_hip(
             [B, C_out, D_out], [256],
             input.data_ptr(),
             output.data_ptr(),

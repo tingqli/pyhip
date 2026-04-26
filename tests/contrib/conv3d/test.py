@@ -153,7 +153,7 @@ def test_conv3d_benchmark(args):
     def run_conv_depthwise_3d_pyhip():
         return conv_depthwise_3d(input_tensor, weight_tensor, bias_tensor,
                                  stride, padding, dilation, groups=groups,
-                                 method="hip")
+                                 method="hip", hip_impl=args.depthwise_hip)
 
     def run_pointwise_conv_jit():
         return conv_pointwise(input_tensor, weight_tensor, bias_tensor, groups=groups,
@@ -232,6 +232,8 @@ if __name__ == "__main__":
     parser.add_argument("--profile", action="store_true", help="是否启用 profile")
     parser.add_argument("--shape", type=str, default="case3", choices=["case1", "case2", "case3", "case4"], 
                         help="选择测试的 shape 选项: case1 ([1, 64, 63, 45, 80]), case2 ([1, 512, 61, 45, 80]), case3 ([1, 512, 61, 45, 80], groups=512), case4 ([1, 2048, 61, 45, 80], groups=4)")
+    parser.add_argument("--depthwise-hip", type=str, default="sgb", choices=["sgb", "original"],
+                        help="case3 HIP: sgb=conv_depthwise3d_hip_sgb.cpp, original=conv_depthwise3d_hip.cpp")
     args = parser.parse_args()
     
     test_conv3d_benchmark(args)
