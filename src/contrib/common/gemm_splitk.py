@@ -78,9 +78,9 @@ def gemm_splitk(J:JIT,
         v_w_scale = J.gpr(B_horz // 2, k_scale_n, 'vf32', align=4)
         k_scale_n_next_read_idx = 0
     elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
-        v_w_scale = J.gpr(B_horz, 2, 'vf32')
-        for n in range(B_horz):
-            J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
+        v_w_scale = J.gpr(B_horz, 4, 'vf32')
+        # for n in range(B_horz):
+        #     J.global_load_dwordx4(v_w_scale[n], voffset_scale[n], p_w_scale)
     elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
             QUAN_BLK_SZ=128
             #[ping-pong, ngroups]
@@ -172,14 +172,21 @@ def gemm_splitk(J:JIT,
             for i in range(2):
                 for n in range(B_horz):
                     for j in range(2):
+                        # for shape [32, 64]
+                        #   original fp8->bf16 in 308 will cost:
+                        #     8 * 4 * (10) = 320
+                        #   mfma cost:
+                        #     16 * 64/16 * 32/16 = 128
+                        #   memory cost(use 4T/s, 1.4G):
+                        #     32*64/(4T/1.4G/80/4) = 229
+                        #   229 < 320+128, indicate it becomes computation bound
+                        #
+                        # fp8->bf16 simplification: all fp8 can sit in bf16 exactly except nan which indicates error
+                        # so move the scale to the end and fp8->bf16 cost will be:
+                        #      8 * 4 * 4 = 128
+                        # although 229 < 128 + 128, but closer
                         J.v_cvt_pk_f32_fp8(v_w_f32[j, 0], B_reg[pp_reg_id, n, i, j])
                         J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[j, 1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
-                        J.v_pk_mul_f32(v_w_f32[j, 0], v_w_f32[j, 0], v_w_scale[n])
-                        J.v_pk_mul_f32(v_w_f32[j, 1], v_w_f32[j, 1], v_w_scale[n])
-                        J.v_add_u32(v_w_f32[j, 0, 0], v_w_f32[j, 0, 0], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[j, 0, 1], v_w_f32[j, 0, 1], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[j, 1, 0], v_w_f32[j, 1, 0], s_cvt_bf16_bias)
-                        J.v_add_u32(v_w_f32[j, 1, 1], v_w_f32[j, 1, 1], s_cvt_bf16_bias)
                         J.v_perm_b32(v_w_bf16[n, j, 0], v_w_f32[j, 0, 0], v_w_f32[j, 0, 1], pattern_cvt_bf16)
                         J.v_perm_b32(v_w_bf16[n, j, 1], v_w_f32[j, 1, 0], v_w_f32[j, 1, 1], pattern_cvt_bf16)
                 # 2, A_vert, A_rep=2, 2, 2
@@ -270,13 +277,21 @@ def gemm_splitk(J:JIT,
     # prolog
     loader = load_gen(0, 0)
     J.emitter()([loader])
-    if (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
-        for n in range(B_horz):
-            J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
+    # if (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
+    #     for n in range(B_horz):
+    #         J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
     pp_reg_id = 1
 
     def tail(pp_reg_id, k=None):
-        J.s_waitcnt(mod=f"vmcnt(0)")
+        # delay load
+        if (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
+            nonlocal v_w_scale
+            for n in range(B_horz):
+                J.global_load_dwordx4(v_w_scale[n], voffset_scale[n], p_w_scale)
+            J.s_waitcnt(mod=f"vmcnt({B_horz})")
+        else:
+            J.s_waitcnt(mod=f"vmcnt(0)")
+
         if isinstance(K, int) and K % k_step_wg:
             assert K % k_step_wg % (8 * A_rep) == 0, f'K tail must be multiple of {8 * A_rep}, current K={K}, k_step_wg={k_step_wg}'
             with J.ExecMask(J.lane_id // 16 >= K % k_step_wg / (8 * A_rep), early_skip=False):
@@ -322,3 +337,10 @@ def gemm_splitk(J:JIT,
         # tail
         tail(0)
         J.Label("k_block_end")
+
+    if (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
+        J.s_waitcnt(mod=f"vmcnt(0)")
+        for n in range(B_horz):
+            for m in range(A_vert):
+                J.v_pk_mul_f32(C_reg[n, m, 0:1], C_reg[n, m, 0:1], v_w_scale[n, 0:1])
+                J.v_pk_mul_f32(C_reg[n, m, 2:3], C_reg[n, m, 2:3], v_w_scale[n, 2:3])

@@ -118,7 +118,7 @@ def moe_gemm_batch1(J:JIT,
 
     voffset_scale = J.gpr(2, 'vu32')
     if weight_dtype != torch.bfloat16:
-        voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_mod_16 * sizeof_f32
+        voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_div_16 * (4 * sizeof_f32)
         voffset_scale[1] = voffset_scale[0] + (N // 2 * sizeof_f32 if with_silu else 16 * sizeof_f32)
 
     gemm_splitk(J, weight_dtype, K, N, num_split_k,
@@ -284,7 +284,7 @@ def moe_gemm_batch(J:JIT,
     voffset_scale = J.gpr(2, 'vu32')
     if weight_dtype != torch.bfloat16:
         p_w_scale[:] += (16 if with_silu else 32) * sizeof_f32 * J.blockIdx.x
-        voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_mod_16 * sizeof_f32
+        voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_div_16 * (4 * sizeof_f32)
         voffset_scale[1] = voffset_scale[0] + (N // 2 * sizeof_f32 if with_silu else 16 * sizeof_f32)
 
     gemm_splitk(J, weight_dtype, K, N, num_split_k,
@@ -294,7 +294,7 @@ def moe_gemm_batch(J:JIT,
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
     if use_split_k:
-        assert with_silu
+        assert with_silu 
         # split K
         lds_buff = J.LDSTensor([4 * 16, 32], torch.float)
 
@@ -469,7 +469,12 @@ def moe_2stage_splitk(J:JIT,
             voffset_b[B_horz // 2 + m] = voffset_b[B_horz // 2] + get_k_bytes(K) * 16 * m
     else:
         p_sorted_weights[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
-        v_weight = J.gpr(A_vert, 'vf32')
+        if (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
+            v_weight = J.gpr(A_vert, 2, 'vf32')
+            is_v_weight_2d = True
+        else:
+            is_v_weight_2d = False
+            v_weight = J.gpr(A_vert, 'vf32')
         if weight_dtype == torch.float4_e2m1fn_x2:
             if USE_FP4_SHUFFLE_WEIGHT:
                 # shffled
@@ -480,12 +485,18 @@ def moe_2stage_splitk(J:JIT,
         else:
             # shffled
             voffset_b[0] = BLOCK_TILE_SIZE_N * J.blockIdx.x * stride_B + J.threadIdx.x * 16
-        J.global_load_dword(v_weight[0], lane_mod_16 << 2, p_sorted_weights)
+        if is_v_weight_2d:
+            J.global_load_dword(v_weight[0, 0], lane_mod_16 << 2, p_sorted_weights)
+        else:
+            J.global_load_dword(v_weight[0], lane_mod_16 << 2, p_sorted_weights)
         for m in range(1, B_horz):
             voffset_b[m] = voffset_b[0] + get_k_bytes(K) * 16 * m
         for m in range(1, A_vert):
             p_sorted_weights[:] += 16 * 4
-            J.global_load_dword(v_weight[m], lane_mod_16 << 2, p_sorted_weights)
+            if is_v_weight_2d:
+                J.global_load_dword(v_weight[m, 0], lane_mod_16 << 2, p_sorted_weights)
+            else:
+                J.global_load_dword(v_weight[m], lane_mod_16 << 2, p_sorted_weights)
 
     p_output[:] = p_output[:] + (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * J.blockIdx.x * sizeof_bf16
 
@@ -540,13 +551,15 @@ def moe_2stage_splitk(J:JIT,
     elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
         voffset_scale = J.gpr(B_horz, 'vu32')
         p_w_scale[:] += (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * sizeof_f32 * J.blockIdx.x
-        voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_mod_16 * sizeof_f32
+        voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_div_16 * (4 * sizeof_f32)
         if with_silu:
             voffset_scale[B_horz // 2] = voffset_scale[0] + N // 2 * sizeof_f32
             for m in range(1, B_horz // 2):
                 voffset_scale[m] = voffset_scale[0] + 16 * sizeof_f32 * m
                 voffset_scale[B_horz // 2 + m] = voffset_scale[B_horz // 2] + 16 * sizeof_f32 * m
         else:
+            for m in range(A_vert):
+                v_weight[m, 1] = v_weight[m, 0]
             for m in range(1, B_horz):
                 voffset_scale[m] = voffset_scale[0] + 16 * sizeof_f32 * m
     elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
@@ -583,6 +596,9 @@ def moe_2stage_splitk(J:JIT,
 
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
+    s_cvt_bf16_bias_dup = J.gpr(2, "su32")
+    s_cvt_bf16_bias_dup[0] = 0x00008000
+    s_cvt_bf16_bias_dup[1] = 0x00008000
 
     ###############################################
     if with_silu and BLOCK_TILE_SIZE_N % 64 == 0 and"gfx950" in J.arch:
@@ -685,7 +701,7 @@ def moe_2stage_splitk(J:JIT,
     else:
         assert not with_silu
         # Optimize the down-projection store and LDS is needed.
-        if down_proj_with_lds:
+        if not fp8_ptpc and down_proj_with_lds:
             # can only support rd_elements_per_lane = 2, 4
             rd_elements_per_lane = 2
             # save BF16 into LDS
@@ -755,19 +771,18 @@ def moe_2stage_splitk(J:JIT,
                     assert 0, f'rd_elements_per_lane should be 2 or 4. Others not supported'
             return
         else:
-            for n in range(B_horz):
-                # output layout: [B, N]
-                for m in range(A_vert):
-                    vaddr = J.gpr(v_token_id[m] * (N * sizeof_bf16) + lane_div_16 * (4 * sizeof_bf16) + n * 4 * (4 * sizeof_bf16))
-                    creg_low = J.gpr(2, "vbf16x2", align=2)
-                    for j in range(4):
-                        C_reg[n, m, j] = C_reg[n, m, j] * v_weight[m]
-                        J.v_add_u32(C_reg[n, m, j], C_reg[n, m, j], s_cvt_bf16_bias)
-                    creg_low[0] = (C_reg[n, m, 0] >> 16) | (C_reg[n, m, 1] & 0xFFFF0000)
-                    creg_low[1] = (C_reg[n, m, 2] >> 16) | (C_reg[n, m, 3] & 0xFFFF0000)
-                    with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
-                        J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
-                        J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
+            for m in range(A_vert):
+                with J.ExecMask(v_token_id[m] < M[0], early_skip=False):
+                    for n in range(B_horz):
+                    # output layout: [B, N]
+                        vaddr = J.gpr(v_token_id[m] * (N * sizeof_bf16) + lane_div_16 * (4 * sizeof_bf16) + n * 4 * (4 * sizeof_bf16))
+                        creg_low = J.gpr(2, "vbf16x2", align=2)
+                        J.v_pk_fma_f32(C_reg[n, m, 0:1], C_reg[n, m, 0:1], v_weight[m], s_cvt_bf16_bias_dup)
+                        J.v_pk_fma_f32(C_reg[n, m, 2:3], C_reg[n, m, 2:3], v_weight[m], s_cvt_bf16_bias_dup)
+                        J.pk_f32_to_bf16(creg_low[0], C_reg[n, m, 0], C_reg[n, m, 1])
+                        J.pk_f32_to_bf16(creg_low[1], C_reg[n, m, 2], C_reg[n, m, 3])
+                        J.global_atomic_pk_add_bf16(vaddr, creg_low[0], p_output)
+                        J.global_atomic_pk_add_bf16(vaddr, creg_low[1], p_output, mod='offset:4')
 
 @jit()
 def moe_2stage_gateup(J:JIT,
