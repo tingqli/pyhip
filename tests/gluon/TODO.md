@@ -25,6 +25,9 @@
     - use `gl.inline_asm_elementwise` to force a, b pin-pong buffer
 - simplifiy `gl.inline_asm_elementwise` to reduce `s_nop`, `s_waitcnt lgkmcnt`: 1.56 Pflops, torch: 1.58 Pflops, problem:
     - there are periodic stalls for `buffer_load_dwordx4(lds)` in thread trace, should try [slice M](https://github.com/ROCm/gfx9-gluon-tutorials/tree/main/kernels/gemm/a16w16/v8_sliceMN).
-- use slice N + slice M, 1.57 Pfps, torch 1.57Pflops
+- use slice N + slice M, 1.57 Pfps, torch 1.58Pflops(command: TRITON_DUMP_DIR=./dump TRITON_ALWAYS_COMPILE=1 TRITON_KERNEL_DUMP=1 TRITON_ENABLE_AMDGCN_AS=1 python gemm_8wave.py)
     - there are still periodic stalls
     - #regs from 256+221 to 256+164
+- 8 wave performance: 1.53 Pflops
+    - occasionally appear 2k+ buffer load stall(command: TRITON_DUMP_DIR=./dump TRITON_ALWAYS_COMPILE=1 TRITON_KERNEL_DUMP=1 python gemm_8wave.py -w 8)
+    - #regs 250

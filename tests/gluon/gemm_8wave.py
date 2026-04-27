@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import triton
 import triton.language as tl
@@ -11,7 +13,7 @@ from triton.experimental.gluon.language.amd.cdna3 import (
     )
 
 from triton.experimental.gluon.language.amd.cdna3 import (
-    sched_group_barrier as _amd_iglp_sched_group_barrier,
+    sched_group_barrier as _amd_iglp_sched_group_barrier, s_set_prio as _amd_iglp_sched_set_prio
 )
 
 from pyhip.contrib.gluon.utils import read_cycle, read_realtime, get_cu_id
@@ -374,13 +376,14 @@ def bf16_3stage_4wave(
         loop_start_cycle = read_cycle()
         _amd_iglp_sched_barrier(0)
 
-    gl.amd.cdna4.async_copy.wait_group(6)
+    gl.amd.cdna4.async_copy.wait_group(4)
     # local prefetch 0
     a_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_top.index(0), a_fma_layout)
     b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_left.index(0), lds_b_read_layout)
     b_left = b_left.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
     b_left = gl.convert_layout(b_left, b_fma_layout, assert_trivial=True)
 
+    _amd_iglp_sched_barrier(0)
     if num_warps == 8:
         gl.inline_asm_elementwise(asm=';',
                                     constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
@@ -402,13 +405,18 @@ def bf16_3stage_4wave(
         _amd_iglp_sched_barrier(0)
         ##### c0tl->w b0->l b0->p l2
         # compute 0tl
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_top_left = gl.amd.cdna4.mfma(a_top, b_left, acc_top_left)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch 0b
-        gl.amd.cdna4.async_copy.wait_group(5)
+        #gl.amd.cdna4.async_copy.wait_group(5)
         a_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_bot.index(0), a_fma_layout)
         # prefetch 2l
         gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_left.index(0), p_weight_left, mem_b_offsets)
@@ -439,7 +447,7 @@ def bf16_3stage_4wave(
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch 1t
-        gl.amd.cdna4.async_copy.wait_group(5)
+        #gl.amd.cdna4.async_copy.wait_group(5)
         b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_right.index(0), lds_b_read_layout)
         b_right = b_right.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
         b_right = gl.convert_layout(b_right, b_fma_layout, assert_trivial=True)
@@ -474,13 +482,18 @@ def bf16_3stage_4wave(
 
         ##### c0 tr->w l1->l l1->p b2
         # compute 0tr
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_top_right = gl.amd.cdna4.mfma(a_top, b_right, acc_top_right)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch l1
-        gl.amd.cdna4.async_copy.wait_group(5)
+        #gl.amd.cdna4.async_copy.wait_group(5)
         b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_left.index(1), lds_b_read_layout)
         b_left = b_left.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
         b_left = gl.convert_layout(b_left, b_fma_layout, assert_trivial=True)
@@ -508,13 +521,18 @@ def bf16_3stage_4wave(
     
         #### c0br->w t1->l t1->p r2
         # compute 0br
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_bottom_right = gl.amd.cdna4.mfma(a_bot, b_right, acc_bottom_right)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch t1
-        gl.amd.cdna4.async_copy.wait_group(5)
+        #gl.amd.cdna4.async_copy.wait_group(5)
         a_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_top.index(1), a_fma_layout)
         # prefetch r2
         gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_right.index(0), p_weight_right, mem_b_offsets)
@@ -524,7 +542,7 @@ def bf16_3stage_4wave(
             mem_b_offsets += BLOCK_TILE_SIZE_K * 16
         else:
             mem_b_offsets += BLOCK_TILE_SIZE_K
-
+        
         if num_warps == 8:
             gl.inline_asm_elementwise(asm=';',
                                       constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
@@ -532,7 +550,8 @@ def bf16_3stage_4wave(
                                       dtype=gl.bfloat16,
                                       is_pure=False,
                                       pack=64)
-            gl.amd.cdna3.s_barrier()
+            gl.amd.cdna4.async_copy.wait_group(4)
+            #gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         else:
             for _ in gl.static_range(8):
@@ -542,18 +561,26 @@ def bf16_3stage_4wave(
                 _amd_iglp_sched_group_barrier(s_mfma, 4, 3)
                 _amd_iglp_sched_group_barrier(s_vmem_read, 1, 3)
             _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 3)
+
+            gl.amd.cdna4.async_copy.wait_group(4)
+            #gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
 
         ############# unroll ##############
         ##### c0tl->w b0->l b0->p l2
         # compute 0tl
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_top_left = gl.amd.cdna4.mfma(a_top, b_left, acc_top_left)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch 0b
-        gl.amd.cdna4.async_copy.wait_group(5)
+        #gl.amd.cdna4.async_copy.wait_group(5)
         a_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_bot.index(1), a_fma_layout)
         gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_left.index(1), p_weight_left, mem_b_offsets)
         gl.amd.cdna4.async_copy.commit_group()
@@ -577,13 +604,18 @@ def bf16_3stage_4wave(
             _amd_iglp_sched_barrier(0)
 
         ##### c0bl->w r0->l r0->p 2t
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_bottom_left = gl.amd.cdna4.mfma(a_bot, b_left, acc_bottom_left)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch 1t
-        gl.amd.cdna4.async_copy.wait_group(5)
+        #gl.amd.cdna4.async_copy.wait_group(5)
         b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_right.index(1), lds_b_read_layout)
         b_right = b_right.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
         b_right = gl.convert_layout(b_right, b_fma_layout, assert_trivial=True)
@@ -618,13 +650,18 @@ def bf16_3stage_4wave(
 
         ##### c0 tr->w l1->l l1->p b2
         # compute 0tr
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_top_right = gl.amd.cdna4.mfma(a_top, b_right, acc_top_right)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch l1
-        gl.amd.cdna4.async_copy.wait_group(5)
+        #gl.amd.cdna4.async_copy.wait_group(5)
         b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_left.index(0), lds_b_read_layout)
         b_left = b_left.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
         b_left = gl.convert_layout(b_left, b_fma_layout, assert_trivial=True)
@@ -652,13 +689,18 @@ def bf16_3stage_4wave(
     
         #### c0br->w t1->l t1->p r2
         # compute 0br
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_bottom_right = gl.amd.cdna4.mfma(a_bot, b_right, acc_bottom_right)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch t1
-        gl.amd.cdna4.async_copy.wait_group(5)
+        #gl.amd.cdna4.async_copy.wait_group(5)
         a_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_top.index(0), a_fma_layout)
         # prefetch r2
         gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_right.index(1), p_weight_right, mem_b_offsets)
@@ -676,7 +718,8 @@ def bf16_3stage_4wave(
                                       dtype=gl.bfloat16,
                                       is_pure=False,
                                       pack=64)
-            gl.amd.cdna3.s_barrier()
+            gl.amd.cdna4.async_copy.wait_group(4)
+            #gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         else:
             for _ in gl.static_range(8):
@@ -686,6 +729,8 @@ def bf16_3stage_4wave(
                 _amd_iglp_sched_group_barrier(s_mfma, 4, 7)
                 _amd_iglp_sched_group_barrier(s_vmem_read, 1, 7)
             _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 7)
+            gl.amd.cdna4.async_copy.wait_group(4)
+            #gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
 
     _amd_iglp_sched_barrier(0)
@@ -698,9 +743,14 @@ def bf16_3stage_4wave(
     else:
         ##### c0tl->w b0->l b0->p l2
         # compute 0tl
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_top_left = gl.amd.cdna4.mfma(a_top, b_left, acc_top_left)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch 0b
@@ -722,9 +772,14 @@ def bf16_3stage_4wave(
             _amd_iglp_sched_group_barrier(s_mfma, 32 - 8, 0)
 
         ##### c0bl->w r0->l r0->p 2t
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_bottom_left = gl.amd.cdna4.mfma(a_bot, b_left, acc_bottom_left)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch 1t
@@ -750,9 +805,14 @@ def bf16_3stage_4wave(
 
         ##### c0 tr->w l1->l l1->p b2
         # compute 0tr
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_top_right = gl.amd.cdna4.mfma(a_top, b_right, acc_top_right)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch l1
@@ -778,9 +838,14 @@ def bf16_3stage_4wave(
     
         #### c0br->w t1->l t1->p r2
         # compute 0br
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
         acc_bottom_right = gl.amd.cdna4.mfma(a_bot, b_right, acc_bottom_right)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         # local prefetch t1
@@ -928,7 +993,7 @@ def _run_aiter(
 
     return y[:M]
 
-def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, N=4096, K=4096):
+def _run_batch(num_warps, kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, N=4096, K=4096):
     BUF_COPY = 32
     A = torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16)
     from aiter.ops.shuffle import shuffle_weight
@@ -980,7 +1045,6 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         M, K = A.shape
         N = w_ref.shape[0]
         gemm_out = torch.empty([M, N], dtype=A.dtype, device=A.device)
-        num_warps = 4
         if kernel_type == 'mxn_2s':
             BLOCK_TILE_SIZE_M = TILE_M
             BLOCK_TILE_SIZE_N = TILE_N
@@ -1080,14 +1144,14 @@ def get_fp8type():
 def get_fp4type_if_valid():
     return torch.float4_e2m1fn_x2 if is_arch_type('950') else None
 
-def entry_common(kernel_type, M, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, N=4096, K=4096, run_count=10):
+def entry_common(num_warps, kernel_type, M, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, N=4096, K=4096, run_count=10):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
         if weight_type is None: continue
         perf_prec = {}
         for i in M:
-            perf_prec[i] = _run_batch(kernel_type, M=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, N=N, K=K)
+            perf_prec[i] = _run_batch(num_warps, kernel_type, M=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, N=N, K=K)
         perf[kernel_type][str(weight_type)] = perf_prec
     
     return perf
@@ -1120,14 +1184,14 @@ def show_perf(perf, dict_tile_mn):
                     print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
 
 @pytest.mark.parametrize("M", [[1, 2, 4, 8, 12, 16, 32, 64]])
-def test_perf(M, TILE_M=32, TILE_N=64, N=4096, K=4096):
+def test_perf(num_warps, M, TILE_M=32, TILE_N=64, N=4096, K=4096):
     init_env()
     perf = {}
-    perf.update(entry_common('torch', M, prec=[torch.bfloat16], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
+    perf.update(entry_common(num_warps, 'torch', M, prec=[torch.bfloat16], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
     # TILE_M/N is configurable
     # perf.update(entry_common('mxn_2s', M=M, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     # perf.update(entry_common('mxn_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-    perf.update(entry_common('mxn_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    perf.update(entry_common(num_warps, 'mxn_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     return perf
 
 def merge(a: dict, b: dict, path=[]):
@@ -1142,6 +1206,21 @@ def merge(a: dict, b: dict, path=[]):
     return a
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-w",
+        "--wave",
+        type=int,
+        choices=[4, 8],
+        default=4,
+        help="""select wave number 4 or 8""",
+    )
+    args = parser.parse_args()
+    print(f'selected num_warps={args.wave}')
+
     #TILE_M = 16
     #TILE_N = 128
     N, K = 4096*1, 1024*16 # 4096*8*2 /128 = 512
@@ -1187,5 +1266,5 @@ if __name__ == '__main__':
         dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
         print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
         #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
-        perf = merge(perf, test_perf([M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+        perf = merge(perf, test_perf(num_warps=args.wave, M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     show_perf(perf, dict_tile_mn)
