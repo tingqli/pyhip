@@ -269,9 +269,17 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 BLOCK_TILE_SIZE_M = 16
                 BLOCK_TILE_SIZE_N = 16
                 assert N2 % BLOCK_N == 0
+                use_atomic_write = B < 8
+                gemm2_out = cur_out
+                if not use_atomic_write:
+                    gemm2_out = torch.empty([B, TOPK, HIDDEN_SIZE], dtype=torch.bfloat16)
                 moe_2stage_down_loopn([N2 // BLOCK_N, grid], [256],
                                 w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc, BLOCK_N)
+                                gemm1_out.data_ptr(), w2.data_ptr(), gemm2_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+                                w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc, BLOCK_N, use_atomic_write)
+                if not use_atomic_write:
+                    cur_out = torch.sum(gemm2_out, dim=1)
+
             else:
                 BLOCK_TILE_SIZE_M = 16
                 BLOCK_TILE_SIZE_N = 64
