@@ -126,6 +126,18 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
             J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
             voff[0] += (num_rows_per_load * num_warps) * vm_stride
 
+    def vm_load_idx(lds_offset, buff, vm_offset, idx):
+        J.s_mov_b32("m0", lds_warp_off + lds_offset)
+        if idx == 0:
+            voff = J.gpr("vu32", vmem_voff[0] + vm_offset)
+        else:
+            voff = J.gpr("vu32", vmem_voff[0] + vm_offset + (M//2)*vm_stride)
+        for m in range(0, M//2, 8*num_warps):
+            yield 1
+            buff.load_dwordx4(None, voff, 0, offset12=0)
+            J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
+            voff[0] += (num_rows_per_load * num_warps) * vm_stride
+
     # the [M x K] bytes LDS buffer is accessed by following closure
     # this closure using ds_read_b128 to load a 16x64 bytes MFMA data
     # thus LDS buffer's layout is blocked as [M//16,K//64] x [16,64]
@@ -140,7 +152,7 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
     voff2 = J.gpr(num_regs_K, "vu32")
     for k in range(num_regs_K):
         # each ds_read_b128 took 4 x DW-lanes
-        voff[k] = (row + warp_row0) * lds_stride + swizzle(row + warp_row0, col + k*4) * J.sizeof_DW4
+        voff[k] = (row + warp_row0) * lds_stride + swizzle((row + warp_row0), col + k*4) * J.sizeof_DW4
         # ds_read_b128's imm offset is limited to 16bits, this additional voffset handles
         # the overflow case
         voff2[k] = voff[k] + 64*1024
@@ -153,8 +165,21 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
         else:
             voffset = voff[k]
         J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
+    def ds_read_16x64_idx(lds_offset, vdst, m, k):
+        offset = lds_offset + m*16*lds_stride
+        if offset >= 64*1024:
+            voffset = voff2[k]
+            offset -= 64*1024
+        else:
+            voffset = voff[k]
+        J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
     vm_offset_inc = K
-    return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64
+    if 0:
+        return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64
+    else:
+        return vm_load_idx, vm_load_cnt//2, vm_offset_inc, ds_read_16x64_idx
+
+
 
 def get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0):
     """

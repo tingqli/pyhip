@@ -12,7 +12,7 @@ torch.manual_seed(0)
 @pytest.mark.parametrize("M", [32, 256, 2400])
 @pytest.mark.parametrize("N", [256, 256*6])
 @pytest.mark.parametrize("K", [256])
-def test_accuracy(M, N, K, use_pre_shuffle = 1):
+def test_accuracy(M, N, K, use_pre_shuffle = 0):
     wg_M = 256
     wg_N = 256
     blk_cnt = pyhip.div_up(M, wg_M) * pyhip.div_up(N, wg_N)
@@ -101,5 +101,5 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
 
 if __name__ == "__main__":
     # test_accuracy(2400, 256*4, 256*6)
-    test_accuracy(256, 256, 256)
-    compare_perf(M = 256*94, N = 256*16, K=8192)
+    test_accuracy(256, 256, 64)
+    # compare_perf(M = 256*94, N = 256*16, K=8192)
