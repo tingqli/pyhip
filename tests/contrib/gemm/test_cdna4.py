@@ -32,11 +32,15 @@ def test_accuracy(M, N, K, use_pre_shuffle = 0):
 
     gemm_kernel([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle,
                 A.data_ptr(), B.data_ptr(), cur_out.data_ptr(), M)
-    
+
     if not torch.allclose(ref_out, cur_out, rtol=0.01, atol=0.01):
-        print(ref_out)
-        print(cur_out)
-        print(cur_out[0].tolist())
+        # print(ref_out)
+        # print(cur_out)
+        # print(ref_out[0].tolist())
+        # print(cur_out[0].tolist())
+        # idx = torch.where(torch.abs(ref - cur) > 0.03)
+        # if len(idx[0]):
+        #     print(f'idx = {idx}\nref={ref[idx]}\ncur={cur[idx]}\n{len(idx[0])}')
         assert 0
 
 
@@ -101,5 +105,5 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
 
 if __name__ == "__main__":
     # test_accuracy(2400, 256*4, 256*6)
-    test_accuracy(256, 256, 64)
+    test_accuracy(1024, 512, 128)
     # compare_perf(M = 256*94, N = 256*16, K=8192)
