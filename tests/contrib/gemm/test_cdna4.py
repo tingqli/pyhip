@@ -38,9 +38,9 @@ def test_accuracy(M, N, K, use_pre_shuffle = 0):
         # print(cur_out)
         # print(ref_out[0].tolist())
         # print(cur_out[0].tolist())
-        # idx = torch.where(torch.abs(ref - cur) > 0.03)
-        # if len(idx[0]):
-        #     print(f'idx = {idx}\nref={ref[idx]}\ncur={cur[idx]}\n{len(idx[0])}')
+        idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
+        if len(idx[0]):
+            print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
         assert 0
 
 
