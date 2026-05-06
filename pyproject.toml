@@ -13,5 +13,13 @@ license = "MIT"
 license-files = ["LICEN[CS]E.*"]
 
 [tool.setuptools]
-packages = ["pyhip"]
+# `package-dir` maps the `pyhip` package root to `src/`. Declaring only `pyhip`
+# installs flat modules there and skips subdirs; `core`/`contrib` must be listed.
+packages = [
+    "pyhip",
+    "pyhip.core",
+    "pyhip.contrib",
+    "pyhip.contrib.common",
+    "pyhip.contrib.gluon",
+]
 package-dir = {"pyhip" = "src"}

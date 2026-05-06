@@ -39,7 +39,9 @@ parser.add_argument(
     e.g.: -ep 8""",
 )
 
-args = parser.parse_args()
+# Use parse_known_args so pytest (or other runners) can pass extra argv without
+# failing collection when this file lives under tests/.
+args, _unknown = parser.parse_known_args()
 
 model_dim, inter_dim, num_experts, num_experts_per_tok, quant_mode = args.dim
 

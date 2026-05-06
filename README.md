@@ -1,4 +1,4 @@
-# pyhib
+# pyhip
 
 PyHIP provides a one-stop toolkit for Python-based CDNA Assembly kernel development.
 
