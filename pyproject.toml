@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyhip"
-version = "1.0.0"
+dynamic = ["version"]
 requires-python = ">=3.8"
 dependencies = ["filelock", "numpy"]
 description = "Python AMDGPU kernel developing tool"
@@ -12,6 +12,18 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICEN[CS]E.*"]
 
+[tool.setuptools_scm]
+# Used when building from an sdist or tree without VCS metadata.
+fallback_version = "1.0.0"
+
 [tool.setuptools]
-packages = ["pyhip"]
+# `package-dir` maps the `pyhip` package root to `src/`. Declaring only `pyhip`
+# installs flat modules there and skips subdirs; `core`/`contrib` must be listed.
+packages = [
+    "pyhip",
+    "pyhip.core",
+    "pyhip.contrib",
+    "pyhip.contrib.common",
+    "pyhip.contrib.gluon",
+]
 package-dir = {"pyhip" = "src"}
