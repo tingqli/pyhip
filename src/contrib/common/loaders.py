@@ -133,8 +133,8 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
         else:
             voff = J.gpr("vu32", vmem_voff[0] + vm_offset + (M//2)*vm_stride)
         for m in range(0, M//2, 8*num_warps):
-            yield 1
             buff.load_dwordx4(None, voff, 0, offset12=0)
+            yield 1
             J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
             voff[0] += (num_rows_per_load * num_warps) * vm_stride
 
