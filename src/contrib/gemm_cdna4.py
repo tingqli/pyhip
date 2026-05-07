@@ -59,8 +59,10 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
 
     print(f"============={nbM=}, {nbN=}, {nbK=} {nrM=} {nrN=} {nrK=}")
 
-    mfma_A = J.gpr(2, 2, nrM//2, 4, "vbf16x2") # 2 is 64k is divided into 2 part
+    #[2, 2] is for [a/b_idx, bk_idx]
+    mfma_A = J.gpr(2, 2, nrM//2, 4, "vbf16x2") 
     mfma_B = J.gpr(2, 2, nrN//2, 4, "vbf16x2")
+    #[2, 2] is for [a_idx, b_idx]
     mfma_C = J.gpr(2, 2, nrM//2, nrN//2, 4, "af32")
 
     def mfma(a_idx, b_idx, reg_id):
@@ -75,9 +77,19 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
         ####################################prelog:
         # ping prefetch
         #AC B0
-        J.emit(vm_load_b_idx(ldsB0[0], buff_b, koffset_b, 0))
+        # J.emit(vm_load_b_idx(ldsB0[0], buff_b, koffset_b, 0))
+        # #AC A0
+        # J.emit(vm_load_a_idx(ldsA0[0], buff_a, koffset_a, 0))
+        # #AC A1
+        # J.emit(vm_load_a_idx(ldsA1[0], buff_a, koffset_a, 1))
+        # #AC B1
+        # J.emit(vm_load_b_idx(ldsB1[0], buff_b, koffset_b, 1))
+        
+        
         #AC A0
         J.emit(vm_load_a_idx(ldsA0[0], buff_a, koffset_a, 0))
+        #AC B0
+        J.emit(vm_load_b_idx(ldsB0[0], buff_b, koffset_b, 0))
         #AC A1
         J.emit(vm_load_a_idx(ldsA1[0], buff_a, koffset_a, 1))
         #AC B1
@@ -87,9 +99,17 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
     
         # pong prefetch
         #AC B0
-        J.emit(vm_load_b_idx(ldsB0[1], buff_b, koffset_b, 0))
-        #AC A0
+        # J.emit(vm_load_b_idx(ldsB0[1], buff_b, koffset_b, 0))
+        # #AC A0
+        # J.emit(vm_load_a_idx(ldsA0[1], buff_a, koffset_a, 0))
+        # #AC A1
+        # J.emit(vm_load_a_idx(ldsA1[1], buff_a, koffset_a, 1))
+        # #AC B1
+        # J.emit(vm_load_b_idx(ldsB1[1], buff_b, koffset_b, 1))
+        
         J.emit(vm_load_a_idx(ldsA0[1], buff_a, koffset_a, 0))
+        #AC B0
+        J.emit(vm_load_b_idx(ldsB0[1], buff_b, koffset_b, 0))
         #AC A1
         J.emit(vm_load_a_idx(ldsA1[1], buff_a, koffset_a, 1))
         #AC B1
@@ -98,16 +118,15 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
         koffset_b[0] += vm_offset_inc_b
         
         J.s_waitcnt(mod=f"vmcnt({0})")
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        # J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.s_barrier()
         
-        for n in range(0, nrN//2): 
-            ds_read_b(ldsB0[0], mfma_B[0, 0, n], n, 0)
-            ds_read_b(ldsB0[0], mfma_B[0, 1, n], n, 1)          
+        for n in range(nrN//2): ds_read_b(ldsB0[0], mfma_B[0, 0, n], n, 0)
+        for n in range(nrN//2): ds_read_b(ldsB0[0], mfma_B[0, 1, n], n, 1)
 
-        for m in range(0, nrM//2):
-            ds_read_a(ldsA0[0], mfma_A[0, 0, m], m, 0)
-            ds_read_a(ldsA0[0], mfma_A[0, 1, m], m, 1)
+
+        for m in range(nrM//2): ds_read_a(ldsA0[0], mfma_A[0, 0, m], m, 0)
+        for m in range(nrM//2): ds_read_a(ldsA0[0], mfma_A[0, 1, m], m, 1)
 
         mfma_a0b0_k0=mfma(0, 0, 0)
         mfma_a0b1_k0=mfma(0, 1, 0)
@@ -178,58 +197,56 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
         # next_lds = (((K//wg_K) - 1)) % 2
         cur_lds = 0
         next_lds = 1
+        #part 0
         J.s_waitcnt(mod=f"vmcnt({0})")
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.s_barrier()
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
 
         J.emit(mfma_a0b0_k0)
         J.emit(mfma_a0b0_k1)
-        for m in range(0, nrM//2):
-            ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
-            ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
+        for m in range(nrM//2): ds_read_a(ldsA1[0], mfma_A[1, 0, m], m, 0)
+        for m in range(nrM//2): ds_read_a(ldsA1[0], mfma_A[1, 1, m], m, 1)
+
 
         # part 1:
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit(mfma_a1b0_k0)
         J.emit(mfma_a1b0_k1)
-        for n in range(0, nrN//2):
-            ds_read_a(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
-            ds_read_a(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1)
+        for n in range(nrN//2): ds_read_b(ldsB1[0], mfma_B[1, 0, n], n, 0)
+        for n in range(nrN//2): ds_read_b(ldsB1[0], mfma_B[1, 1, n], n, 1)   
+
         
         # part 2:
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit(mfma_a0b1_k0)
         J.emit(mfma_a0b1_k1)
-        for n in range(0, nrN//2): 
-            ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
-            ds_read_b(ldsB0[next_lds], mfma_B[0, 1, n], n, 1)          
+        for n in range(nrN//2): ds_read_b(ldsB0[1], mfma_B[0, 0, n], n, 0)
+        for n in range(nrN//2): ds_read_b(ldsB0[1], mfma_B[0, 1, n], n, 1)        
 
         # part 3:
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit(mfma_a1b1_k0)
         J.emit(mfma_a1b1_k1)
-        for m in range(0, nrM//2):
-            ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
-            ds_read_a(ldsA0[next_lds], mfma_A[0, 1, m], m, 1)
+
+        for m in range(nrM//2): ds_read_a(ldsA0[1], mfma_A[0, 0, m], m, 0)
+        for m in range(nrM//2): ds_read_a(ldsA0[1], mfma_A[0, 1, m], m, 1)
         ####################################epologue 1:
+        # part 0:
 
         cur_lds = next_lds
-        
-        
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit(mfma_a0b0_k0)
         J.emit(mfma_a0b0_k1)
-        for m in range(0, nrM//2):
-            ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
-            ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
+        for m in range(nrM//2): ds_read_a(ldsA1[1], mfma_A[1, 0, m], m, 0)
+        for m in range(nrM//2): ds_read_a(ldsA1[1], mfma_A[1, 1, m], m, 1)
 
         # part 1:
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit(mfma_a1b0_k0)
         J.emit(mfma_a1b0_k1)
-        for n in range(0, nrN//2):
-            ds_read_a(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
-            ds_read_a(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1)
+        for n in range(nrN//2): ds_read_b(ldsB1[1], mfma_B[1, 0, n], n, 0)
+        for n in range(nrN//2): ds_read_b(ldsB1[1], mfma_B[1, 1, n], n, 1)   
+
         
         # part 2:
         J.s_waitcnt(mod=f"lgkmcnt(0)")
@@ -240,116 +257,6 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit(mfma_a1b1_k0)
         J.emit(mfma_a1b1_k1)
-
-    else:
-        koffset_a = J.gpr("su32", 0)
-        koffset_b = J.gpr("su32", 0)
-        # J.emit(vm_load_a(ldsA[0], buff_a, koffset_a))
-        # J.emit(vm_load_b(ldsB[0], buff_b, koffset_b))
-        # koffset_a[0] += vm_offset_inc_a
-        # koffset_b[0] += vm_offset_inc_b
-
-        # J.emit(vm_load_a(ldsA[1], buff_a, koffset_a))
-        # J.emit(vm_load_b(ldsB[1], buff_b, koffset_b))
-        # koffset_a[0] += vm_offset_inc_a
-        # koffset_b[0] += vm_offset_inc_b
-
-        # mfma_C[...] = 0
-
-        # '''
-        # ab0: mfma ab0 | ds_read ab1; wait_lgkmcnt(0), barrier; vm-load a01
-        # ab1: mfma ab1 | vm-load b01; wait_vmcnt, barrier, ds_read ab2
-
-        # ab2: mfma ab2 | ds_read ab3; wait_lgkmcnt(0), barrier; vm-load  a23
-        # ab3: mfma ab3 | vm-load b23;  wait_vmcnt, barrier, ds_read ab0
-        # '''
-        # J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_b + vm_load_cnt_a})")
-        # J.s_barrier()
-
-        # # ds_read ab0
-        # for m in range(nrM): ds_read_a(ldsA[0], mfma_A[0, m], m, 0)
-        # for n in range(nrN): ds_read_b(ldsB[0], mfma_B[0, n], n, 0)
-        # J.s_waitcnt(mod=f"lgkmcnt(0)")
-
-        # def loop_body(lds_id):
-        #     # mfma ab0
-        #     mfma_ab0 = mfma(0)
-
-        #     # ds_read ab1
-        #     for m in range(nrM):
-        #         J.emit(mfma_ab0, 16)
-        #         ds_read_a(ldsA[lds_id], mfma_A[1, m], m, 1)
-        #     for n in range(nrN):
-        #         J.emit(mfma_ab0, 16)
-        #         ds_read_b(ldsB[lds_id], mfma_B[1, n], n, 1)
-
-        #     J.emit(mfma_ab0, 64)
-
-        #     J.s_waitcnt(mod=f"lgkmcnt(0)")
-        #     J.emit(mfma_ab0, 16)
-        #     J.s_barrier()
-
-        #     mfma_ab1 = mfma(1)
-
-        #     # vm-load a01
-        #     vm_load = vm_load_a(ldsA[lds_id], buff_a, koffset_a)
-        #     J.emit([mfma_ab0, mfma_ab1], 16)
-        #     J.emit(vm_load, 1) # first emit produce preparing instructions
-        #     J.emit([mfma_ab0, mfma_ab1], 16)
-        #     for _ in range(vm_load_cnt_a):
-        #         J.emit(vm_load, 1)
-        #         J.emit([mfma_ab0, mfma_ab1], 96)
-        #     J.emit(vm_load)
-
-        #     # vm-load b01
-        #     vm_load = vm_load_b(ldsB[lds_id], buff_b, koffset_b)
-        #     J.emit([mfma_ab0, mfma_ab1], 16)
-        #     J.emit(vm_load, 1) # first emit produce preparing instructions
-        #     J.emit([mfma_ab0, mfma_ab1], 16)
-        #     for _ in range(vm_load_cnt_b - 4):
-        #         J.emit(vm_load, 1)
-        #         J.emit([mfma_ab0, mfma_ab1], 96)
-
-        #     J.emit(mfma_ab0) # emit all MFMA using AB register0 (since ds_read will override it)
-
-        #     # wait vm-load a23/b23 to finish
-        #     J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_b + vm_load_cnt_a - 4})")
-        #     J.s_barrier()
-
-        #     J.emit(vm_load, 1)
-        #     # ds_read ab2
-        #     for m in range(nrM):
-        #         J.emit(mfma_ab1, 16)
-        #         ds_read_a(ldsA[(lds_id + 1)&1], mfma_A[0, m], m, 0)
-
-        #     J.emit(vm_load, 1)
-        #     for n in range(nrN):
-        #         J.emit(mfma_ab1, 16)
-        #         ds_read_b(ldsB[(lds_id + 1)&1], mfma_B[0, n], n, 0)
-
-        #     J.emit(vm_load, 1)
-        #     J.emit(mfma_ab1, 96)
-        #     J.emit(vm_load, 1)
-        #     J.emit(mfma_ab1)
-
-        #     koffset_a[0] += vm_offset_inc_a
-        #     koffset_b[0] += vm_offset_inc_b
-
-        #     J.s_waitcnt(mod=f"lgkmcnt(0)")
-
-        if 1:
-            for koff in range(J.div(K, wg_K)):
-                loop_body(koff & 1)
-        else:
-            koff = J.gpr("su32", 0)
-            loop_cnt = K // (2*wg_K)
-            with J.While(koff[0] < loop_cnt):
-                loop_body(0)
-                loop_body(1)
-                koff[0] += 1
-
-            if K % (2*wg_K):
-                loop_body(0)
 
     for lds in ldsA0: J.free_lds(lds) 
     for lds in ldsB0: J.free_lds(lds)
