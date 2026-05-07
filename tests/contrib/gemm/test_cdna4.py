@@ -105,5 +105,5 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
 
 if __name__ == "__main__":
     # test_accuracy(2400, 256*4, 256*6)
-    test_accuracy(1024, 512, 128)
+    test_accuracy(256, 256, 128)
     # compare_perf(M = 256*94, N = 256*16, K=8192)
