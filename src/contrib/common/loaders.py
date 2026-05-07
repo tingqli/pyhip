@@ -134,9 +134,11 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
             voff = J.gpr("vu32", vmem_voff[0] + vm_offset + (M//2)*vm_stride)
         for m in range(0, M//2, 8*num_warps):
             buff.load_dwordx4(None, voff, 0, offset12=0)
-            yield 1
             J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
             voff[0] += (num_rows_per_load * num_warps) * vm_stride
+            yield 1
+
+
 
     # the [M x K] bytes LDS buffer is accessed by following closure
     # this closure using ds_read_b128 to load a 16x64 bytes MFMA data

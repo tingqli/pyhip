@@ -189,7 +189,6 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             vm_load = vm_load_b_idx(ldsB1[cur_lds], buff_b, koffset_b, 1)
             J.s_waitcnt(mod=f"vmcnt({20})")
             J.s_barrier()
-            J.s_waitcnt(mod=f"lgkmcnt(0)")
 
             for m in range(nrM//2):
                 J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
@@ -265,8 +264,6 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
         # part 3:
         J.s_waitcnt(mod=f"vmcnt({8})")
         J.s_barrier()
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
-
 
         for m in range(nrM//2):
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)

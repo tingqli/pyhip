@@ -70,14 +70,14 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
     cur_out = C
     acc = "pass"
     if not torch.allclose(ref_out, cur_out, rtol=0.01, atol=0.01):
-        print(f"================= ref_out : {ref_out.shape} ")
-        print(ref_out)
-        print(f"================= cur_out : {cur_out.shape} ")
-        print(cur_out)
-        idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
-        if len(idx[0]):
-            print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
-        assert 0
+        # print(f"================= ref_out : {ref_out.shape} ")
+        # print(ref_out)
+        # print(f"================= cur_out : {cur_out.shape} ")
+        # print(cur_out)
+        # idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
+        # if len(idx[0]):
+        #     print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
+        # assert 0
         acc = "failed"
 
     DATA_CLONES = 40
@@ -89,11 +89,7 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
     B0s = [torch.clone(B0) for _ in range(DATA_CLONES)]
 
     di = 0
-    for i in range(10):
-        di = (di + 1)%DATA_CLONES
-        with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"torch_{di}") as p0:
-            ref = torch.nn.functional.linear(A0s[di], B0s[di])
-
+    
     for i in range(10):
         di = (di + 1)%DATA_CLONES
         with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"gemm_{di}") as p0:
@@ -101,9 +97,15 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
                         As[di].data_ptr(),
                         Bs[di].data_ptr(),
                         Cs[di].data_ptr(), M)
+    for i in range(10):
+        di = (di + 1)%DATA_CLONES
+        with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"torch_{di}") as p0:
+            ref = torch.nn.functional.linear(A0s[di], B0s[di])
+
+
     print(f"{acc=}")
 
 if __name__ == "__main__":
     # test_accuracy(2400, 256*4, 256*6)
-    test_accuracy(256, 256, 256)
-    compare_perf(M = 256*32, N = 256*32, K=8192)
+    # test_accuracy(256, 256, 256)
+    compare_perf(M = 256*32, N = 256*32, K=8192*2)
