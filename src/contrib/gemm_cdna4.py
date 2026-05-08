@@ -133,8 +133,8 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             mfma_a1b1_k1=mfma(1, 1, 1)
 
             J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-            vm_load = vm_load_b_idx(ldsB0[cur_lds], buff_b, koffset_b, 0)
-            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 80)
+            vm_load = vm_load_b_idx(ldsB0[cur_lds], buff_b, koffset_b, 0, mfma_a0b0_k1)
+            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 48)
             for m in range(nrM//2):
                 J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
                 ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
@@ -151,14 +151,14 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
                 J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
 
             # part 1:
-            vm_load = vm_load_a_idx(ldsA0[cur_lds], buff_a, koffset_a, 0)
             J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-
             J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
             J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
             J.s_barrier()
-
-            J.emit([mfma_a1b0_k0, mfma_a1b0_k1],96)
+    
+            J.emit([mfma_a1b0_k0, mfma_a1b0_k1],16)
+            vm_load = vm_load_a_idx(ldsA0[cur_lds], buff_a, koffset_a, 0, mfma_a1b0_k0)
+            J.emit([mfma_a1b0_k0, mfma_a1b0_k1],48)
             for n in range(nrN//2):
                 J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
                 ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
@@ -178,13 +178,13 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             # J.emit(mfma_a1b0_k1)
 
             # part 2:
-            vm_load = vm_load_a_idx(ldsA1[cur_lds], buff_a, koffset_a, 1)
             J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
             J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
             J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
             J.s_barrier()
-
-            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 96)
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+            vm_load = vm_load_a_idx(ldsA1[cur_lds], buff_a, koffset_a, 1, mfma_a0b1_k0)
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 48)
             for n in range(nrN//2):
                 J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
                 ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
@@ -204,13 +204,13 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             # J.emit(mfma_a0b1_k0)
             # J.emit(mfma_a0b1_k1)
             # part 3:
-            vm_load = vm_load_b_idx(ldsB1[cur_lds], buff_b, koffset_b, 1)
             J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
             J.s_waitcnt(mod=f"vmcnt({20})")
             J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
             J.s_barrier()
-
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 64)
+            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+            vm_load = vm_load_b_idx(ldsB1[cur_lds], buff_b, koffset_b, 1, mfma_a1b1_k0)
+            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
             for m in range(nrM//2):
                 J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
                 ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
