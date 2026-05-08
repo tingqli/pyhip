@@ -126,16 +126,33 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
             J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
             voff[0] += (num_rows_per_load * num_warps) * vm_stride
 
-    def vm_load_idx(lds_offset, buff, vm_offset, idx):
-        J.s_mov_b32("m0", lds_warp_off + lds_offset)
+    def vm_load_idx(lds_offset, buff, vm_offset, idx, emitter=None):
+        temp = J.gpr("su32", lds_warp_off[0] + lds_offset)
+        if emitter is not None:
+            J.emit(emitter, 16)
+        J.s_mov_b32("m0", temp[0])
+        if emitter is not None:
+            J.emit(emitter, 16)
         if idx == 0:
             voff = J.gpr("vu32", vmem_voff[0] + vm_offset)
         else:
             voff = J.gpr("vu32", vmem_voff[0] + vm_offset + (M//2)*vm_stride)
-        for m in range(0, M//2, 8*num_warps):
+        load_stride = (num_rows_per_load * num_warps) * vm_stride
+        
+        # soffset = J.gpr(4, "su32")
+        # for m in range(0,M//2//(8*num_warps)):
+        #     soffset[m] = load_stride*m
+
+        for m in range(0, M//2//(8*num_warps)):
             buff.load_dwordx4(None, voff, 0, offset12=0)
+            yield 1
+            # soffset[0] += load_stride
+            # soffset[0] = 0
+
+            # J.s_add_u32(soffset[0], load_stride, soffset[0])
             J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
-            voff[0] += (num_rows_per_load * num_warps) * vm_stride
+            yield 1
+            voff[0] += load_stride
             yield 1
 
 
