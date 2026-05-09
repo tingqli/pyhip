@@ -34,10 +34,10 @@ def test_accuracy(M, N, K, use_pre_shuffle = 0):
                 A.data_ptr(), B.data_ptr(), cur_out.data_ptr(), M)
 
     if not torch.allclose(ref_out, cur_out, rtol=0.01, atol=0.01):
-        # print(ref_out)
-        # print(cur_out)
-        # print(ref_out[0].tolist())
-        # print(cur_out[0].tolist())
+        print(ref_out)
+        print(cur_out)
+        print(ref_out[0].tolist())
+        print(cur_out[0].tolist())
         idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
         if len(idx[0]):
             print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')

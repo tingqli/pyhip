@@ -50,7 +50,8 @@ def tb_swizzle(J, block_1d_id:"sgpr", M:"sgpr", wg_M:int, wg_N:int, N:int, M01:i
     return M_out, N_out
 
 
-def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
+# get_mfma_loader(J, use_pre_shuffle, num_warps, wg_M, 128, stride_k, warp_m//2*16)
+def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m):
     """
     return loaders for loading a [M, K] u8-tile data from VMEM (with stride of vm_stride)
     into [M, K] u8-LDS-tile and from LDS into VGPRs
@@ -103,28 +104,27 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
     num_lanes_per_row = J.div(lds_stride, J.sizeof_DW4)
     num_rows_per_load = J.div(64, num_lanes_per_row)
     warp_m_off = J.warp_id[0] * num_rows_per_load
+    vm_load_cnt = len(range(0, M, num_rows_per_load * num_warps))
+    vm_load_cnt_slice = vm_load_cnt // 2
 
-    def swizzle(row, col):
-        return (col ^ row) % num_lanes_per_row
 
-    row = J.threadIdx.x // num_lanes_per_row
-    col = J.threadIdx.x % num_lanes_per_row
-    swizzle_col = swizzle(row, col)
-    vmem_voff = J.gpr(row * vm_stride + swizzle_col * J.sizeof_DW4)
+    lane_row = J.lane_id // num_lanes_per_row
+    lane_col = J.lane_id % num_lanes_per_row
+    lane_row_stride = vm_stride*num_warps*vm_load_cnt_slice
+    vmem_voff = J.gpr(lane_row * lane_row_stride + J.warp_id[0] * vm_stride + lane_col * J.sizeof_DW4)
     lds_warp_off = J.gpr("su32", warp_m_off * lds_stride)
 
-    vm_load_cnt = len(range(0, M, num_rows_per_load * num_warps))
 
     # WG-level coorperative loader (closure & generator):
     #   loads [M x K] bytes from specified buff+offset into lds
-    def vm_load(lds_offset, buff, vm_offset):
-        J.s_mov_b32("m0", lds_warp_off + lds_offset)
-        voff = J.gpr("vu32", vmem_voff[0] + vm_offset)
-        for m in range(0, M, 8*num_warps):
-            yield 1
-            buff.load_dwordx4(None, voff, 0, offset12=0)
-            J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
-            voff[0] += (num_rows_per_load * num_warps) * vm_stride
+    # def vm_load(lds_offset, buff, vm_offset):
+    #     J.s_mov_b32("m0", lds_warp_off + lds_offset)
+    #     voff = J.gpr("vu32", vmem_voff[0] + vm_offset)
+    #     for m in range(0, M, 8*num_warps):
+    #         yield 1
+    #         buff.load_dwordx4(None, voff, 0, offset12=0)
+    #         J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
+    #         voff[0] += (num_rows_per_load * num_warps) * vm_stride
 
     def vm_load_idx(lds_offset, buff, vm_offset, idx):
         J.s_mov_b32("m0", lds_warp_off + lds_offset)
@@ -136,7 +136,7 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
             yield 1
             buff.load_dwordx4(None, voff, 0, offset12=0)
             J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
-            voff[0] += (num_rows_per_load * num_warps) * vm_stride
+            voff[0] += (num_warps) * vm_stride
 
     # the [M x K] bytes LDS buffer is accessed by following closure
     # this closure using ds_read_b128 to load a 16x64 bytes MFMA data
@@ -145,28 +145,32 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
     assert M % 16 == 0
     assert K % 64 == 0
 
+    m_number_warps = num_warps // 2
     col = J.lane_id // 16
     row = J.lane_id % 16
-    num_regs_K = J.div(K, 64)
+    num_regs_K = K // 64
+    # LDS load count = 2*vm_load_cnt_slice, but one row is divided into 2 lds read. So row is same 
+    lds_rlane_stride = lds_stride * m_number_warps * vm_load_cnt_slice
+
     voff = J.gpr(num_regs_K, "vu32")
     voff2 = J.gpr(num_regs_K, "vu32")
+
     for k in range(num_regs_K):
         # each ds_read_b128 took 4 x DW-lanes
-        voff[k] = (row + warp_row0) * lds_stride + swizzle((row + warp_row0), col + k*4) * J.sizeof_DW4
-        # ds_read_b128's imm offset is limited to 16bits, this additional voffset handles
-        # the overflow case
+        # voff[k] = (row + warp_row0) * lds_stride + swizzle((row + warp_row0), col + k*4) * J.sizeof_DW4
+        voff[k] = row * lds_rlane_stride + warpid_m*lds_stride + (col + k*4) * J.sizeof_DW4
         voff2[k] = voff[k] + 64*1024
 
-    def ds_read_16x64(lds_offset, vdst, m, k):
-        offset = lds_offset + m*16*lds_stride
-        if offset >= 64*1024:
-            voffset = voff2[k]
-            offset -= 64*1024
-        else:
-            voffset = voff[k]
-        J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
+    # def ds_read_16x64(lds_offset, vdst, m, k):
+    #     offset = lds_offset + m*16*lds_stride
+    #     if offset >= 64*1024:
+    #         voffset = voff2[k]
+    #         offset -= 64*1024
+    #     else:
+    #         voffset = voff[k]
+    #     J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
     def ds_read_16x64_idx(lds_offset, vdst, m, k):
-        offset = lds_offset + m*16*lds_stride
+        offset = lds_offset + m_number_warps* lds_stride*m
         if offset >= 64*1024:
             voffset = voff2[k]
             offset -= 64*1024
@@ -174,10 +178,9 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0):
             voffset = voff[k]
         J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
     vm_offset_inc = K
-    if 0:
-        return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64
-    else:
-        return vm_load_idx, vm_load_cnt//2, vm_offset_inc, ds_read_16x64_idx
+    # if 0:
+    #     return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64
+    return vm_load_idx, vm_load_cnt_slice, vm_offset_inc, ds_read_16x64_idx
 
 
 
@@ -226,11 +229,11 @@ def get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0):
     vm_offset_inc = nbK * 1024
     return vm_load, vm_load_cnt, vm_offset_inc, ds_read_1kb
 
-def get_mfma_loader(J, use_pre_shuffle, num_warps, M, K, vm_stride, warp_row0):
+def get_mfma_loader(J, use_pre_shuffle, num_warps, M, K, vm_stride, warpid_m):
     if use_pre_shuffle:
-        return get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warp_row0)
+        return get_mfma_loader_preshuffled(J, num_warps, M, K, vm_stride, warpid_m)
     else:
-        return get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warp_row0)
+        return get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m)
 
 def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sorted_ids, TOPK, num_tokens, input, is_input_over_4GB):
     """
