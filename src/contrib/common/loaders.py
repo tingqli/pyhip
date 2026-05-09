@@ -98,7 +98,8 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m):
         J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_2=2)
         print(f"{wg_M=} {wg_K=} {M=} {K=}")
         assert 0
-
+    #1K bytes is 8 rows in LDS. 1024/2/54 = 8 rows. 64 thread lds write would be 8 rows.
+    padding_on_1K = 32
     # each wave load 8x128 bytes , 8 waves loads 64x128 bytes
     lds_stride = K
     num_lanes_per_row = J.div(lds_stride, J.sizeof_DW4)
@@ -112,7 +113,7 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m):
     lane_col = J.lane_id % num_lanes_per_row
     lane_row_stride = vm_stride*num_warps*vm_load_cnt_slice
     vmem_voff = J.gpr(lane_row * lane_row_stride + J.warp_id[0] * vm_stride + lane_col * J.sizeof_DW4)
-    lds_warp_off = J.gpr("su32", warp_m_off * lds_stride)
+    lds_warp_off = J.gpr("su32", warp_m_off * lds_stride + J.warp_id[0] * padding_on_1K)
 
 
     # WG-level coorperative loader (closure & generator):
@@ -150,7 +151,7 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m):
             # soffset[0] = 0
 
             # J.s_add_u32(soffset[0], load_stride, soffset[0])
-            J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
+           J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4+padding_on_1K*num_warps)
             yield 1
             voff[0] += (num_warps) * vm_stride
             yield 1
@@ -177,7 +178,7 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m):
     for k in range(num_regs_K):
         # each ds_read_b128 took 4 x DW-lanes
         # voff[k] = (row + warp_row0) * lds_stride + swizzle((row + warp_row0), col + k*4) * J.sizeof_DW4
-        voff[k] = row * lds_rlane_stride + warpid_m*lds_stride + (col + k*4) * J.sizeof_DW4
+        voff[k] = row * (lds_rlane_stride+padding_on_1K) + warpid_m*lds_stride + (col + k*4) * J.sizeof_DW4
         voff2[k] = voff[k] + 64*1024
 
     # def ds_read_16x64(lds_offset, vdst, m, k):

@@ -41,10 +41,11 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
     # ldsA = [J.alloc_lds(nbM * nbK * 1024), J.alloc_lds(nbM * nbK * 1024)]
     # ldsB = [J.alloc_lds(nbN * nbK * 1024), J.alloc_lds(nbN * nbK * 1024)]
     
-    ldsA0 = [J.alloc_lds(nbM//2 * nbK * 1024), J.alloc_lds(nbM//2 * nbK * 1024)]
-    ldsB0 = [J.alloc_lds(nbN//2 * nbK * 1024), J.alloc_lds(nbN//2 * nbK * 1024)]
-    ldsA1 = [J.alloc_lds(nbM//2 * nbK * 1024), J.alloc_lds(nbM//2 * nbK * 1024)]
-    ldsB1 = [J.alloc_lds(nbN//2 * nbK * 1024), J.alloc_lds(nbN//2 * nbK * 1024)]
+    padding_on_1K = 32
+    ldsA0 = [J.alloc_lds(nbM//2 * nbK * (1024+padding_on_1K)), J.alloc_lds(nbM//2 * nbK * (1024+padding_on_1K))]
+    ldsB0 = [J.alloc_lds(nbN//2 * nbK * (1024+padding_on_1K)), J.alloc_lds(nbN//2 * nbK * (1024+padding_on_1K))]
+    ldsA1 = [J.alloc_lds(nbM//2 * nbK *(1024+padding_on_1K)), J.alloc_lds(nbM//2 * nbK * (1024+padding_on_1K))]
+    ldsB1 = [J.alloc_lds(nbN//2 * nbK * (1024+padding_on_1K)), J.alloc_lds(nbN//2 * nbK * (1024+padding_on_1K))]
     
     nrM = J.div(nbM, 2) # the N tile number per warp, each N tile 16n
     nrN = J.div(nbN, 2) # the N tile number per warp, each M tile 16n
