@@ -662,7 +662,7 @@ class Buffer:
         assert isinstance(offset12 , int) # must be compile time constant
         mod = f"offen"
         if offset12 > 0:
-            assert offset12.bit_length() <= 12
+            assert offset12.bit_length() <= 12, f'{offset12=}'
             mod += f" offset:{offset12}"
         if non_temporal:
             mod += f" sc0 nt"

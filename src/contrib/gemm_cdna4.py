@@ -138,7 +138,6 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             for m in range(nrM//2):
                 J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
                 ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
-            for m in range(nrM//2):
                 J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
                 ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
             for _ in range(vm_load_cnt_b):
@@ -162,7 +161,6 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             for n in range(nrN//2):
                 J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
                 ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
-            for n in range(nrN//2):
                 J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
                 ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1) 
             for _ in range(vm_load_cnt_a):
@@ -188,7 +186,6 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             for n in range(nrN//2):
                 J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
                 ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
-            for n in range(nrN//2):
                 J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
                 ds_read_b(ldsB0[next_lds], mfma_B[0, 1, n], n, 1)
             for _ in range(vm_load_cnt_a):
@@ -214,7 +211,6 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             for m in range(nrM//2):
                 J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
                 ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
-            for m in range(nrM//2):
                 J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
                 ds_read_a(ldsA0[next_lds], mfma_A[0, 1, m], m, 1)
             for _ in range(vm_load_cnt_b):
@@ -238,10 +234,17 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
             koffset_b[0] += vm_offset_inc_b
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-
-            
-        for k_idx in range((K//wg_K) - 2):
-            loop_body(k_idx)
+        if 0:
+            for k_idx in range((K//wg_K) - 2):
+                loop_body(k_idx)
+        else:
+            koff = J.gpr("su32", 0)
+            loop_cnt = ((K//wg_K) - 2)//2
+            kidx = 0
+            with J.While(koff[0] < loop_cnt):
+                loop_body(0)
+                loop_body(1)
+                koff[0] += 1
         ####################################epologue 0:
 
         mfma_a0b0_k0=mfma(0, 0, 0)
