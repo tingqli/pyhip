@@ -151,7 +151,7 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m):
             # soffset[0] = 0
 
             # J.s_add_u32(soffset[0], load_stride, soffset[0])
-           J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4+padding_on_1K*num_warps)
+            J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4+padding_on_1K*num_warps)
             yield 1
             voff[0] += (num_warps) * vm_stride
             yield 1
@@ -178,7 +178,7 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m):
     for k in range(num_regs_K):
         # each ds_read_b128 took 4 x DW-lanes
         # voff[k] = (row + warp_row0) * lds_stride + swizzle((row + warp_row0), col + k*4) * J.sizeof_DW4
-        voff[k] = row * (lds_rlane_stride+padding_on_1K) + warpid_m*lds_stride + (col + k*4) * J.sizeof_DW4
+        voff[k] = row * (lds_rlane_stride+padding_on_1K) + warpid_m*lds_stride*vm_load_cnt_slice + (col + k*4) * J.sizeof_DW4
         voff2[k] = voff[k] + 64*1024
 
     # def ds_read_16x64(lds_offset, vdst, m, k):
@@ -190,7 +190,7 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m):
     #         voffset = voff[k]
     #     J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
     def ds_read_16x64_idx(lds_offset, vdst, m, k):
-        offset = lds_offset + m_number_warps* lds_stride*m
+        offset = lds_offset + lds_stride*m
         if offset >= 64*1024:
             voffset = voff2[k]
             offset -= 64*1024

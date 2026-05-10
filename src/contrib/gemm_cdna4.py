@@ -370,32 +370,33 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
     
     vbf16 = J.gpr(2, "vbf16x2")
     col = J.lane_id // 16
-    vaddr_org = J.gpr(((J.lane_id % 16) + warpid_m * 16)*stride_c + col * J.sizeof_DW2 + warpid_n * 4 * J.sizeof_DW2 + \
+    vaddr_org = J.gpr(((J.lane_id % 16) + warpid_m * 16 * nrM//2)*stride_c + col * J.sizeof_DW2 + warpid_n * 4 * J.sizeof_DW2 * nrN//2 + \
             blk_n * (wg_N * J.sizeof(C_dtype)))
     vaddr = J.gpr("vu32", 0)
+    
     vaddr[0] = vaddr_org[0]
     for m in range(nrM//2):
         for n in range(0, nrN//2):
             J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[0,0, m , n, 0], mfma_C[0,0, m , n, 1])
             J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[0,0, m , n, 2], mfma_C[0,0, m , n, 3])
-            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=(num_warps//2)*n*4*J.sizeof_DW2)
-        vaddr[0] += (num_warps//2)*16*stride_c
+            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
+        vaddr[0] += 16*stride_c
         
     vaddr[0] = vaddr_org[0] + 256
     for m in range(nrM//2):
         for n in range(0, nrN//2):
             J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[0,1, m , n, 0], mfma_C[0,1, m , n, 1])
             J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[0,1, m , n,2], mfma_C[0,1, m , n, 3])
-            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=(num_warps//2)*n*4*J.sizeof_DW2)
-        vaddr[0] += (num_warps//2)*16*stride_c
+            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
+        vaddr[0] += 16*stride_c
         
     vaddr[0] = vaddr_org[0] + stride_c *128
     for m in range(nrM//2):
         for n in range(0, nrN//2):
             J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[1, 0, m , n, 0], mfma_C[1, 0, m , n, 1])
             J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[1, 0, m , n,2], mfma_C[1, 0, m , n, 3])
-            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=(num_warps//2)*n*4*J.sizeof_DW2)
-        vaddr[0] += (num_warps//2)*16*stride_c
+            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
+        vaddr[0] += 16*stride_c
         
             
     vaddr[0] = vaddr_org[0] + stride_c *128 + 256
@@ -403,5 +404,5 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
         for n in range(0, nrN//2):
             J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[1,1, m , n, 0], mfma_C[1,1, m , n, 1])
             J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[1,1, m , n,2], mfma_C[1,1, m , n, 3])
-            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=(num_warps//2)*n*4*J.sizeof_DW2)
-        vaddr[0] += (num_warps//2)*16*stride_c
+            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
+        vaddr[0] += 16*stride_c
