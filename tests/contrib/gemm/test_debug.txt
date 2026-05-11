@@ -1,0 +1,5 @@
+
+
+rocprofv3 -i input.yaml --att-library-path=./rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux -- python test_cdna4.py
+
+TRITON_ENABLE_LLIR_SCHED=1 TRITON_ENABLE_AMDGCN_AS=1 python ./bench.py --dtype bf16 --K 8192 --version 9 --pyhip-perf
