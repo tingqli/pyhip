@@ -6,13 +6,23 @@ from functools import cache
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from triton.experimental.gluon.language.amd.cdna3 import (
-    sched_barrier as _amd_iglp_sched_barrier,
-)
+try:
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_barrier as _amd_iglp_sched_barrier,
+    )
+except ImportError:
+    @gluon.jit
+    def _amd_iglp_sched_barrier(mask):
+        pass
 
-from triton.experimental.gluon.language.amd.cdna3 import (
-    sched_group_barrier as _amd_iglp_sched_group_barrier,
-)
+try:
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_group_barrier as _amd_iglp_sched_group_barrier,
+    )
+except ImportError:
+    @gluon.jit
+    def _amd_iglp_sched_group_barrier(mask, size, group_id):
+        pass
 from pyhip import div_up
 from pyhip.contrib.gluon.utils import read_cycle, read_realtime, get_cu_id
 
