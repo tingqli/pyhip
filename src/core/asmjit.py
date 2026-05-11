@@ -1018,7 +1018,7 @@ _arch_lds_size = {
 class JIT:
     arch = amdgpu_arch()
     assert arch.startswith("gfx")
-    gfx = int(arch[3:])
+    gfx = int(arch.split(":")[0][3:])
     cdna = 4 if gfx >= 950 else 3
     warp_size = 64
 
