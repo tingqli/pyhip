@@ -1,5 +1,5 @@
 
-from .hiptools import module
+from .core.hiptools import module
 import argparse
 import os
 import tempfile

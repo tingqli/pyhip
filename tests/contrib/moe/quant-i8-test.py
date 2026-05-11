@@ -25,7 +25,7 @@ num_experts, topk = 400, TOPK
 QUANT1_K = model_dim
 QUANT2_K = inter_dim
 REDUCE_K = model_dim
-BLOCK_QUANT = 256
+BLOCK_QUANT = 32
 QUANT1_TOPK = TOPK
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -218,19 +218,108 @@ for _ in range(10):
     with pyhip.cudaPerf(0, mem_size, name=f"quant2") as p:
         quant_act(x1, topk, M, inter_dim, fc2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids, DEBUG=False)
 
+# def test_reduce():
+#     x = torch.randint(low=-128, high=127, size=[num_tokens, topk, model_dim], dtype=torch.int8)
+#     scale = torch.randn(num_tokens, topk, model_dim // BLOCK_QUANT, dtype=torch.float32)
+#     out = torch.empty([num_tokens, model_dim], dtype=torch.bfloat16)
+#     ref = scale.unsqueeze(3) * x.view(num_tokens, topk, model_dim // BLOCK_QUANT, BLOCK_QUANT).float()
+#     ref = ref.view(num_tokens, topk, model_dim).sum(dim=[1]).to(torch.bfloat16)
+#     hip.reduce_i8([num_tokens], [256], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
+#     torch.testing.assert_close(out, ref, atol=1.1, rtol=2.1)
+#     print('reduce test passed.')
+#     mem_size = x.numel() * x.element_size() + scale.numel() * scale.element_size() + out.numel() * out.element_size()
+#     print(f"reduce input size {mem_size/1000/1000:.2f} MB")
+#     for _ in range(10):
+#         with pyhip.cudaPerf(0, mem_size, name=f"reduce") as p:
+#             hip.reduce_i8([num_tokens], [256], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
+
+# test_reduce()
+
 def test_reduce():
-    x = torch.randint(low=-128, high=127, size=[num_tokens, topk, model_dim], dtype=torch.int8)
-    scale = torch.randn(num_tokens, topk, model_dim // BLOCK_QUANT, dtype=torch.float32)
+    def unpack_dequant32(output, o_scales):
+        # output   [num_tokens, topk, odims] torch.int8
+        # o_scales [num_tokens, topk, odims//oquant_block_size] torch.bfloat16
+        num_tokens, topk, odims = output.shape
+        
+        if 1:
+            # reorder in unit of 16bytes (DWORDx4)
+            order = [0,1,4,5,8,9,12,13, 2,3,6,7,10,11,14,15]
+            output = output.view(-1, 16, 16)[:, order, :].view(num_tokens, topk, odims//32, 32)
+        else:
+            order = [i for i in range(256)]
+            for i in range(256):
+                cn = i // 128            # 0,1
+                warp_n = (i % 128)//32   # 0,1,2,3
+                ni = (i % 32)//16        # 0,1
+                n_off = i % 16
+                no = cn*2 + ni           # 0,1,2,3 x 16
+                j = warp_n * 64 + (no*4) + (n_off%4) + (n_off//4)*16
+                order[i] = j
+
+            output = output.view(-1, 256)[:, order].view(num_tokens, topk, odims//32, 32)
+        o_scales = o_scales.view(-1, 256//32)[:,(0,2,4,6,1,3,5,7)].view(num_tokens, topk, odims//32, 1).to(torch.float32)
+        return (output.to(o_scales.dtype) * o_scales).view(num_tokens, topk, odims).to(torch.bfloat16)
+    
+    def pack(input, i_scales):
+        # input    [num_tokens, topk, idims] torch.float32
+        # i_scales [num_tokens, topk, idims//iquant_block_size] torch.bfloat16
+        num_tokens, topk, idims = input.shape
+        torch.set_printoptions(linewidth=400)
+        if 1:
+            # reorder in unit of 16bytes (DWORDx4)
+            order = [0,1,4,5,8,9,12,13, 2,3,6,7,10,11,14,15]
+            order_inv = [0 for _ in range(16)]
+            for i in range(16):
+                order_inv[order[i]] = i
+            input = input.view(-1, 16, 16)[:, order_inv, :].view(num_tokens, topk, idims)
+        else:
+            order = [0 for _ in range(256)]
+            for i in range(256):
+                cn = i // 128            # 0,1
+                warp_n = (i % 128)//32   # 0,1,2,3
+                ni = (i % 32)//16        # 0,1
+                n_off = i % 16
+                no = cn*2 + ni           # 0,1,2,3 x 16
+                j = warp_n * 64 + (no*4) + (n_off%4) + (n_off//4)*16
+                order[i] = j
+
+            order_inv = [0 for _ in range(256)]
+            for i in range(256):
+                order_inv[order[i]] = i
+        
+            print(torch.tensor(order_inv).reshape(-1, 32))
+            input = input.view(-1, 256)[:, order_inv].view(num_tokens, topk, idims)
+        #i_scales = i_scales.view(-1, 256//32)[:,(0,2,4,6,1,3,5,7)].view(num_tokens, topk, idims//32)
+        i_scales = i_scales.view(-1, 256//32)[:,(0,4,1,5,2,6,3,7)].view(num_tokens, topk, idims//32, 1)
+        return input, i_scales
+
+    x = torch.randint(low=-9, high=10, size=[num_tokens, topk, model_dim], dtype=torch.int8)
+    scale = torch.randn(num_tokens, topk, model_dim // BLOCK_QUANT, dtype=torch.bfloat16) * 0.1
+    x_packed, scale_packed = pack(x, scale)
+    x_unpacked = unpack_dequant32(x_packed, scale_packed)
+    ref = (scale.unsqueeze(3) * x.view(num_tokens, topk, model_dim // BLOCK_QUANT, BLOCK_QUANT).to(scale.dtype)).view(num_tokens, topk, model_dim)
+    if not torch.allclose(x_unpacked.to(ref.dtype), ref, atol=0.01, rtol=0.01):
+        print("unpack error")
+        idx = torch.where(torch.abs(x_unpacked.to(ref.dtype)- ref)>0.001)
+        print(f"{idx=}\n{x_unpacked[idx]=}\n{ref[idx]=}\n")
+        assert False
+    torch.testing.assert_close(x_unpacked.to(ref.dtype), ref, atol=0.01, rtol=0.01)
+
     out = torch.empty([num_tokens, model_dim], dtype=torch.bfloat16)
-    ref = scale.unsqueeze(3) * x.view(num_tokens, topk, model_dim // BLOCK_QUANT, BLOCK_QUANT).float()
-    ref = ref.view(num_tokens, topk, model_dim).sum(dim=[1]).to(torch.bfloat16)
-    hip.reduce_i8([num_tokens], [256], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
-    torch.testing.assert_close(out, ref, atol=1.1, rtol=2.1)
+    ref = x_unpacked.sum(dim=[1]).to(torch.bfloat16)
+    hip.reduce_i8([num_tokens], [256], x_packed.data_ptr(), scale_packed.data_ptr(), out.data_ptr(), num_tokens)
+    #torch.testing.assert_close(out, ref, atol=0.01, rtol=0.01)
+    if not torch.allclose(out, ref, atol=0.03, rtol=0.03):
+        print("reduce error")
+        idx = torch.where(torch.abs(out - ref) > 0.03)
+        print(f"{idx=}\n{out[idx]=}\n{ref[idx]=}\n")
+        assert False
+
     print('reduce test passed.')
     mem_size = x.numel() * x.element_size() + scale.numel() * scale.element_size() + out.numel() * out.element_size()
     print(f"reduce input size {mem_size/1000/1000:.2f} MB")
     for _ in range(10):
         with pyhip.cudaPerf(0, mem_size, name=f"reduce") as p:
-            hip.reduce_i8([num_tokens], [256], x.data_ptr(), scale.data_ptr(), out.data_ptr(), num_tokens)
+            hip.reduce_i8([num_tokens], [256], x_packed.data_ptr(), scale_packed.data_ptr(), out.data_ptr(), num_tokens)
 
 test_reduce()

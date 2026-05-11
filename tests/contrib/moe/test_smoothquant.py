@@ -18,7 +18,9 @@ from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
 def div_up(x, y):
     return (x + y - 1) // y
 
-def reduce_i8(x, scale, block_quant=256):
+oquant_block_size = 32
+
+def reduce_i8(x, scale):
     kwargs = {"BLOCK_SIZE_M":256,
               "TOPK":x.shape[1],
               "ROW_PER_BLOCK":4,
@@ -28,7 +30,7 @@ def reduce_i8(x, scale, block_quant=256):
               "QUANT1_K":x.shape[2],
               "QUANT2_K":x.shape[2],
               "REDUCE_K":x.shape[2],
-              "BLOCK_QUANT":block_quant,}
+              "BLOCK_QUANT":oquant_block_size,}
     hip = pyhip.module(f"quant-i8.cpp")
     out = torch.empty((x.shape[0], x.shape[2]), dtype=torch.bfloat16, device=x.device)
     hip.reduce_i8([x.shape[0]], [256], x, scale, out, x.shape[0], **kwargs)
@@ -45,7 +47,7 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
               "QUANT1_K":model_dim,
               "QUANT2_K":model_dim,
               "REDUCE_K":model_dim,
-              "BLOCK_QUANT":256,}
+              "BLOCK_QUANT":oquant_block_size,}
     device = x.device
     if is_gemm1:
         if smooth_scale.shape[0] == 1:
@@ -201,6 +203,7 @@ def fused_moe_gelu_sqi8(
         w2_scale, # [expert, model_dim, 1] torch.float32
         a1_smooth_scale, # [expert/1, 1, model_dim] torch.float32
         a2_smooth_scale, # [expert/1, 1, inter_dim] torch.float32):
+        quantize_output=False, # whether to quantize the output tensor between the second GEMM to ReduceSum into int8 internally. If False, the output will be in bfloat16.
     ):
     device = hidden_states.device
     dtype = hidden_states.dtype
@@ -240,10 +243,10 @@ def fused_moe_gelu_sqi8(
     # quantize hidden_states in sorted_ids [tok_topk]
     # print(sorted_ids.dtype, sorted_ids.shape)
 
-    def moe_gemm_ref(input, pt_scale, weight, pc_scale, stage_index, oquant_block_size):
+    def moe_gemm_ref(input, pt_scale, weight, pc_scale, stage_index):
         num_tokens, topk, dims = input.shape
         num_experts, odims, idims = weight.shape
-        if oquant_block_size:
+        if quantize_output:
             assert odims % oquant_block_size == 0
             output = torch.empty((num_tokens, topk, odims), dtype=torch.int8, device=device)
             o_scales = torch.empty((num_tokens, topk, odims//oquant_block_size), dtype=torch.float32, device=device)
@@ -288,7 +291,7 @@ def fused_moe_gelu_sqi8(
             else:
                 cur_out = cur_out * sorted_weights[i0:i0+cur_num_toks, None]
 
-            if oquant_block_size:
+            if quantize_output:
                 scales = torch.maximum((cur_out.view(-1, oquant_block_size).abs().max(dim=1, keepdim=True)[0]), torch.tensor(0.0000001))/127
                 output[tok_id, topk_id, :] = (cur_out.view(-1, oquant_block_size) / scales).round().clamp(-128, 127).to(torch.int8).view(-1, odims)
                 o_scales[tok_id, topk_id, :] = scales.view(-1, odims//oquant_block_size)
@@ -296,7 +299,7 @@ def fused_moe_gelu_sqi8(
                 output[tok_id, topk_id, :] = cur_out.to(output.dtype)
         return output, o_scales
 
-    def moe_gemm_jit(input, pt_scale, weight, pc_scale, stage_index, oquant_block_size):
+    def moe_gemm_jit(input, pt_scale, weight, pc_scale, stage_index):
         if input.ndim == 3:
             num_tokens, _, dims = input.shape
             is_in_3d = 1
@@ -314,7 +317,7 @@ def fused_moe_gelu_sqi8(
         num_oc_blocks = odims // wg_N
         num_e_blocks = sorted_expert_ids.shape[0]
 
-        if oquant_block_size:
+        if quantize_output and stage_index == 2:
             assert odims % oquant_block_size == 0
             output = torch.empty((num_tokens, topk, odims), dtype=torch.int8, device=device)
             o_scales = torch.empty((num_tokens, topk, odims//oquant_block_size), dtype=torch.bfloat16, device=device)
@@ -365,8 +368,9 @@ def fused_moe_gelu_sqi8(
             a1, a1_scale = smoothquant_i8_per_tok(hidden_states, a1_smooth_scale, topk, sorted_ids, sorted_expert_ids, num_valid_ids, block_size_M)
 
     moe_gemm = moe_gemm_jit
+
     with pyhip.cudaPerf(num_tokens * topk * model_dim * inter_dim * 2, name=f"{moe_gemm.__name__}_up"):
-        a2_v, a2_s = moe_gemm(a1, a1_scale, w1, w1_scale, 1, 0)
+        a2_v, a2_s = moe_gemm(a1, a1_scale, w1, w1_scale, 1)
 
     #a2_bf16 = fake_quant(a2_bf16)
 
@@ -384,51 +388,28 @@ def fused_moe_gelu_sqi8(
             a2, a2_scale = smoothquant_i8_per_tok(a2_v, a2_smooth_scale, topk, sorted_ids, sorted_expert_ids, num_valid_ids, block_size_M)
 
     # quantize output to int8 in unit of 1x256
-    oquant_block_size = 32
-
-    # only ref supports this so-far
-    moe_gemm = moe_gemm_jit if oquant_block_size > 0 else moe_gemm_jit
     with pyhip.cudaPerf(num_tokens * topk * model_dim * inter_dim * 2, name=f"{moe_gemm.__name__}_down"):
-        stage2_out, stage2_out_scale = moe_gemm(a2, a2_scale, w2, w2_scale, 2, oquant_block_size)
-
+        stage2_out, stage2_out_scale = moe_gemm(a2, a2_scale, w2, w2_scale, 2)
 
     def unpack_dequant32(output, o_scales):
         # output   [num_tokens, topk, odims] torch.int8
         # o_scales [num_tokens, topk, odims//oquant_block_size] torch.bfloat16
         num_tokens, topk, odims = output.shape
-        
-        if 1:
-            # reorder in unit of 16bytes (DWORDx4)
-            order = [0,1,4,5,8,9,12,13, 2,3,6,7,10,11,14,15]
-            output = output.view(-1, 16, 16)[:, order, :].view(num_tokens, topk, odims//32, 32)
-        else:
-            order = [i for i in range(256)]
-            for i in range(256):
-                cn = i // 128            # 0,1
-                warp_n = (i % 128)//32   # 0,1,2,3
-                ni = (i % 32)//16        # 0,1
-                n_off = i % 16
-                no = cn*2 + ni           # 0,1,2,3 x 16
-                j = warp_n * 64 + (no*4) + (n_off%4) + (n_off//4)*16
-                order[i] = j
-            output = output.view(-1, 256)[:, order].view(num_tokens, topk, odims//32, 32)
-
+        # reorder in unit of 16bytes (DWORDx4)
+        order = [0,1,4,5,8,9,12,13, 2,3,6,7,10,11,14,15]
+        output = output.view(-1, 16, 16)[:, order, :].view(num_tokens, topk, odims//32, 32)
         o_scales = o_scales.view(-1, 256//32)[:,(0,2,4,6,1,3,5,7)].view(num_tokens, topk, odims//32, 1)
         return (output.to(o_scales.dtype) * o_scales).view(num_tokens, topk, odims)
 
-
     with pyhip.cudaPerf(name=f"reduce"):
-        if oquant_block_size:
-            if oquant_block_size == 32:
+        if quantize_output:
+            assert oquant_block_size == 32
+            if 0:
                 # dequantize & sum, each 
                 stage2_out = unpack_dequant32(stage2_out, stage2_out_scale)
                 moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
-            elif 0:
-                # dequantize & sum
-                stage2_out = (stage2_out.view(-1, oquant_block_size).to(torch.bfloat16) * stage2_out_scale.to(torch.bfloat16).view(-1, 1))
-                moe_out = stage2_out.view(-1, topk, model_dim).sum(dim=1)
             else:
-                moe_out = reduce_i8(stage2_out.view(num_tokens, topk, model_dim), stage2_out_scale.view(num_tokens, topk, model_dim//oquant_block_size), oquant_block_size)
+                moe_out = reduce_i8(stage2_out, stage2_out_scale)
         else:
             moe_out = stage2_out.sum(dim=1)
 
@@ -666,6 +647,23 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
             fc2_scale,
             fc1_smooth_scale if use_smoothquant else None,
             fc2_smooth_scale if use_smoothquant else None,
+            quantize_output = 0,
+            num_verbose = 0,
+            num_flops = num_flops,
+        )
+
+    ret_i8q, dt_i8q = pyhip.run_perftest(
+            fused_moe_gelu_sqi8,
+            x0,
+            w1,
+            w2,
+            x1,
+            x2,
+            fc1_scale,
+            fc2_scale,
+            fc1_smooth_scale if use_smoothquant else None,
+            fc2_smooth_scale if use_smoothquant else None,
+            quantize_output = 1,
             num_verbose = 0,
             num_flops = num_flops,
         )
@@ -717,6 +715,8 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
         print(f"\t{pyhip.calc_diff(ref0, ret_asm)=:.6f}  {dt_asm:.0f} us")
     print(f"\t{pyhip.calc_diff(ref0, ret_i8)=:.6f}  {dt_i8:.0f} us")
     print(f"\t{pyhip.calc_diff(ref1, ret_i8, -0.01)=:.6f}  {dt_i8:.0f} us")
+    print(f"\t{pyhip.calc_diff(ref0, ret_i8q)=:.6f}  {dt_i8q:.0f} us")
+    print(f"\t{pyhip.calc_diff(ref1, ret_i8q, -0.01)=:.6f}  {dt_i8q:.0f} us")
 
     if use_smoothquant:
         smooth_info = "shared-up" if shared_smoothquant_up else "per-expert"
@@ -730,7 +730,9 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
         "topk":topk,
         "smooth": smooth_info,
         "diff": pyhip.calc_diff(ref1, ret_i8),
-        "time(us)":f"{dt_i8:.0f}"
+        "time(us)":f"{dt_i8:.0f}",
+        "diff-quant_out": pyhip.calc_diff(ref1, ret_i8q),
+        "time-quant_out(us)":f"{dt_i8q:.0f}"
     }
 
     if ret_fp4 is not None:
@@ -742,7 +744,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
 if __name__ == "__main__":
     pyhip.set_device()
 
-    if 0:
+    if 1:
         summary = []
         for num_experts, topk in [(800, 25), (400, 20)]:
             for num_tokens in [40960, 20480, 19147]:
@@ -757,8 +759,8 @@ if __name__ == "__main__":
         try:
             import pandas as pd
             print(pd.DataFrame(summary).to_markdown(index=False))
-        except:
-            pass
+        except Exception as e:
+            print(e)
 
         import sys
         sys.exit(0)
@@ -767,6 +769,7 @@ if __name__ == "__main__":
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 800, topk = 25)
     test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=0)
+    #test_fmoe_sqi8(num_tokens = 20480, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=0)
     #test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=1, shared_smoothquant_up=1)
     #test_fmoe_sqi8(num_tokens = 19147, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20,  use_smoothquant=0, shared_smoothquant_up=0)
     

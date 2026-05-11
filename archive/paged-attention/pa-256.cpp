@@ -183,12 +183,17 @@ __device__ void s_waitcnt_lgkmcnt() {
 #ifndef HQ
 #define HQ 32 
 #define HK 4
-#define S 128 
+// #define HQ 12
+// #define HK 2
+#define S 256
 #define BLOCK_SIZE 1
 #define SCALE 1.0 
 #define KV_PART_SIZE 256
 #endif
 #define KV_MIN_PART_SIZE 256
+
+// 本文件当前按 S=256 的 K/V 分段与写回调试；与 PyTorch 参考对齐时请勿混用 S=128。
+static_assert(S == 256, "pa.cpp: K/V LDS 与合并写回仅实现 S=256");
 
 template<typename TS, typename TD>
 TD& cast(TS& t) {
@@ -261,6 +266,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     uint last_kv_idx = kv_indptr[b + 1];
     uint kv_len = last_kv_idx - kv_indptr[b];
     if (kv_part * KV_PART_SIZE >= kv_len) return;
+    //if( lane_id==0)
+    //printf("=========kv_len %d\n",kv_len);
     uint kv_len_start = std::min(kv_part * KV_PART_SIZE + warp_id * KV_PART_SIZE_WARP, kv_len);
     uint kv_len_end = std::min(kv_part * KV_PART_SIZE + KV_PART_SIZE, kv_len);
     kv_page_indices += kv_indptr[b];
@@ -306,7 +313,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     uint* idx_lds = share_buf.get_idx_buf(warp_id);
     uint idx_global = lane_id + cur_kv_len_start;
     idx_lds[lane_id] = (idx_global < kv_len_end) ? kv_page_indices[idx_global] : 0;
-    // llvm_amdgcn_raw_buffer_load_lds是原始用法先保留 
+    // 这条是原始用法先保留 
     // 似乎该api在rocm7.2 不生效 hipcc -O2 -c -std=c++20 --offload-arch=gfx942 -S -emit-llvm pa.cpp -o k72.ll 
     // 检查到 llvm ir中无法生成 @llvm.amdgcn.raw.buffer.load.lds
     //llvm_amdgcn_raw_buffer_load_lds(idx_buf.descriptor, (as3_uint32_ptr)idx_lds, 4, (lane_id + cur_kv_len_start) * sizeof(uint), 0, 0, 0);
@@ -317,7 +324,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         if (part_idx == 0)
         if (BLOCK_SIZE == 1) {
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-    #if FAKE_K_IDX
+    #if FAKE_K_IDX // 这个不用的
                 uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
                 global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
                 k_idxs[n] = global_row_id + 1 + kv_indptr[b];
@@ -330,17 +337,20 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         // key -> reg
         float32x4 acc[KV_PART_SIZE_WARP / 16] = {0};
 
-        bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4], v_reg_caches[KV_PART_SIZE_WARP / 4];
+        bfloat16x8 k_reg_caches[KV_PART_SIZE_WARP / 4], k_reg_hi[KV_PART_SIZE_WARP / 4];
+        bfloat16x8 v_reg_caches[KV_PART_SIZE_WARP / 4], v_reg_hi[KV_PART_SIZE_WARP / 4];
 
         if (part_idx == 0) {
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
                 auto offset = k_idxs[n] * (HK * S * sizeof(__bf16)) + 8 * sizeof(__bf16) * key_load_col_id;
                 k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset);
+                k_reg_hi[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset + 128 * sizeof(__bf16));
             }
         }
         for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
             auto offset = k_idxs[n] * (HK * S * sizeof(__bf16)) + 8 * sizeof(__bf16) * key_load_col_id;
             v_reg_caches[n] = global_load_dwordx4<bfloat16x8>(value_cache, offset, false);
+            v_reg_hi[n] = global_load_dwordx4<bfloat16x8>(value_cache, offset + 128 * sizeof(__bf16), false);
         }
         __bf16* cur_k_buff_lds = share_buf.get_key_buf(warp_id);
         //4 times
@@ -350,10 +360,15 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + (key_load_col_id ^ (key_load_row_id + 4)) * 8]) = k_reg_caches[4 * n + 1];
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + (key_load_col_id ^ (key_load_row_id + 8)) * 8]) = k_reg_caches[4 * n + 2];
             *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + (key_load_col_id ^ (key_load_row_id + 12))* 8]) = k_reg_caches[4 * n + 3];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 0 * 4) * S + 128 + (key_load_col_id ^ (key_load_row_id + 0)) * 8]) = k_reg_hi[4 * n + 0];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 1 * 4) * S + 128 + (key_load_col_id ^ (key_load_row_id + 4)) * 8]) = k_reg_hi[4 * n + 1];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 2 * 4) * S + 128 + (key_load_col_id ^ (key_load_row_id + 8)) * 8]) = k_reg_hi[4 * n + 2];
+            *(bfloat16x8*)(&cur_k_buff_lds[(key_load_row_id + 3 * 4) * S + 128 + (key_load_col_id ^ (key_load_row_id + 12))* 8]) = k_reg_hi[4 * n + 3];
 
-            //4
             for (int k = 0; k < S / 32; k++) {
-                auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + (fma_row_id ^ (fma_col_id + 4 * k)) * 8]);
+                const uint half = (k < S / 64) ? 0u : 128u;
+                const uint kk = k & (S / 64 - 1);
+                auto k_cur = *(bfloat16x8*)(&cur_k_buff_lds[fma_row_id * S + half + (fma_row_id ^ (fma_col_id + 4 * kk)) * 8]);
                 amdgcn_mfma_f32_16x16x16bf16(k_cur.lo, q_cur[k].lo, acc[n]);
                 amdgcn_mfma_f32_16x16x16bf16(k_cur.hi, q_cur[k].hi, acc[n]);
             }
@@ -417,6 +432,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
                 auto offset = k_idxs[n] * (HK * S * sizeof(__bf16)) + 8 * sizeof(__bf16) * key_load_col_id;
                 k_reg_caches[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset);
+                k_reg_hi[n] = global_load_dwordx4<bfloat16x8>(key_cache, offset + 128 * sizeof(__bf16));
             }
         }
         // ----------------------------------
@@ -444,6 +460,10 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
             *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 1 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 1];
             *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 2 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 2];
             *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 3 * 4) * S + key_load_col_id * 8]) = v_reg_caches[4 * n + 3];
+            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 0 * 4) * S + 128 + key_load_col_id * 8]) = v_reg_hi[4 * n + 0];
+            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 1 * 4) * S + 128 + key_load_col_id * 8]) = v_reg_hi[4 * n + 1];
+            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 2 * 4) * S + 128 + key_load_col_id * 8]) = v_reg_hi[4 * n + 2];
+            *(bfloat16x8*)(&cur_v_buff_lds[(key_load_row_id + 3 * 4) * S + 128 + key_load_col_id * 8]) = v_reg_hi[4 * n + 3];
 
             // layout: [4tx4, 16tx4k]-> 16 tokens, 64 of head size used for one iter
             // K/N 0 1 2 3   4 5 6 7   8 9 10 11  12 13 14 15 ...  56 57 58 59  60 61 62 63 
@@ -491,27 +511,35 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         *share_buf.get_sum_buf(fma_row_id, warp_id) = cur_sum;
     }
     __syncthreads();
-    // each wave will process HQ / HK / 4 tokens of output, each
-    float maxs[HQ / HK], sums[HQ / HK];
-    float real_max[HQ / HK / 4], real_sum[HQ / HK / 4];
-    for (uint i = 0; i < HQ / HK / 4; i++) {
-        uint m_token_id = HQ / HK / 4 * warp_id + i;
-        maxs[4 * i + 0] = *share_buf.get_max_buf(m_token_id, 0);
-        maxs[4 * i + 1] = *share_buf.get_max_buf(m_token_id, 1);
-        maxs[4 * i + 2] = *share_buf.get_max_buf(m_token_id, 2);
-        maxs[4 * i + 3] = *share_buf.get_max_buf(m_token_id, 3);
-        real_max[i] = fmaxf(
-            fmaxf(maxs[4 * i + 0], maxs[4 * i + 1]),
-            fmaxf(maxs[4 * i + 2], maxs[4 * i + 3]));
+    // 开始写回
+    // each wave processes up to ceil(HQ/HK, 4) query tokens (TOKENS_PER_WARP); must match the write-back loop below
+    constexpr uint M = HQ / HK; // gqa ratio
+    constexpr uint TOKENS_PER_WARP = (M + 3) / 4; // ceil_div(M, 4) warp 负责的 query token 数目
 
-        sums[4 * i + 0] = *share_buf.get_sum_buf(m_token_id, 0);
-        sums[4 * i + 1] = *share_buf.get_sum_buf(m_token_id, 1);
-        sums[4 * i + 2] = *share_buf.get_sum_buf(m_token_id, 2);
-        sums[4 * i + 3] = *share_buf.get_sum_buf(m_token_id, 3);
-        real_sum[i] = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) + 
-                      sums[4 * i + 1] * __expf(maxs[4 * i + 1] - real_max[i]) + 
-                      sums[4 * i + 2] * __expf(maxs[4 * i + 2] - real_max[i]) + 
-                      sums[4 * i + 3] * __expf(maxs[4 * i + 3] - real_max[i]);
+    float maxs[4 * TOKENS_PER_WARP], sums[4 * TOKENS_PER_WARP];
+    float real_max[TOKENS_PER_WARP], real_sum[TOKENS_PER_WARP];
+
+
+    for (uint i = 0; i < TOKENS_PER_WARP; i++) {
+        uint m_token_id = TOKENS_PER_WARP * warp_id + i;
+        if (m_token_id < M) {
+            maxs[4 * i + 0] = *share_buf.get_max_buf(m_token_id, 0);
+            maxs[4 * i + 1] = *share_buf.get_max_buf(m_token_id, 1);
+            maxs[4 * i + 2] = *share_buf.get_max_buf(m_token_id, 2);
+            maxs[4 * i + 3] = *share_buf.get_max_buf(m_token_id, 3);
+            real_max[i] = fmaxf(
+                fmaxf(maxs[4 * i + 0], maxs[4 * i + 1]),
+                fmaxf(maxs[4 * i + 2], maxs[4 * i + 3]));
+
+            sums[4 * i + 0] = *share_buf.get_sum_buf(m_token_id, 0);
+            sums[4 * i + 1] = *share_buf.get_sum_buf(m_token_id, 1);
+            sums[4 * i + 2] = *share_buf.get_sum_buf(m_token_id, 2);
+            sums[4 * i + 3] = *share_buf.get_sum_buf(m_token_id, 3);
+            real_sum[i] = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) + 
+                          sums[4 * i + 1] * __expf(maxs[4 * i + 1] - real_max[i]) + 
+                          sums[4 * i + 2] * __expf(maxs[4 * i + 2] - real_max[i]) + 
+                          sums[4 * i + 3] * __expf(maxs[4 * i + 3] - real_max[i]);
+        }
     }
 
     bfloat16x4 vout_low[S / 64 * 4];
@@ -531,29 +559,35 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 3) ^ fma_row_id] = vout_low[k * 4 + 3];
     }
     __syncthreads();
-    for (uint i = 0; i < HQ / HK / 4; i++) {
-        uint m_token_id = HQ / HK / 4 * warp_id + i;
-        if (m_token_id < HQ / HK) {
-            bfloat16x2 tmp = ((bfloat16x2*)(share_buf.get_out_buf(0) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
-            float32x2 out_v;
-            out_v[0] = tmp[0];
-            out_v[1] = tmp[1];
-            out_v = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) * out_v;
-
-            for (int w = 1; w < 4; w++) {
-                auto tmp = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
-                float32x2 next_v;
-                next_v[0] = tmp[0];
-                next_v[1] = tmp[1];
-                next_v = sums[4 * i + w] * __expf(maxs[4 * i + w] - real_max[i]) * next_v;
-                out_v += next_v;
+    for (uint i = 0; i < TOKENS_PER_WARP; i++) {
+        uint m_token_id = TOKENS_PER_WARP * warp_id + i;
+        if (m_token_id < M) {
+            const uint idx2 = (m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1);
+            float32x2 out_lo = {};
+            float32x2 out_hi = {};
+            for (int w = 0; w < 4; w++) {
+                bfloat16x2 t_lo = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S))[idx2];
+                bfloat16x2 t_hi = ((bfloat16x2*)(share_buf.get_out_buf(w) + m_token_id * S + 128))[idx2];
+                const float sw = sums[4 * i + w] * __expf(maxs[4 * i + w] - real_max[i]);
+                out_lo[0] += (float)t_lo[0] * sw;
+                out_lo[1] += (float)t_lo[1] * sw;
+                out_hi[0] += (float)t_hi[0] * sw;
+                out_hi[1] += (float)t_hi[1] * sw;
             }
             const float inv_sum_scale = 1.f / (real_sum[i] + 1e-6f);
-            out_v = out_v * inv_sum_scale;
-            bfloat16x2 tmp_out;
-            tmp_out[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_v[0]) >> 16));
-            tmp_out[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_v[1]) >> 16));
-            ((bfloat16x2*)(out_seg + m_token_id * gridDim.z * S))[lane_id] = tmp_out;
+            out_lo[0] *= inv_sum_scale;
+            out_lo[1] *= inv_sum_scale;
+            out_hi[0] *= inv_sum_scale;
+            out_hi[1] *= inv_sum_scale;
+            bfloat16x2 tmp_lo;
+            tmp_lo[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_lo[0]) >> 16));
+            tmp_lo[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_lo[1]) >> 16));
+            bfloat16x2 tmp_hi;
+            tmp_hi[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_hi[0]) >> 16));
+            tmp_hi[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(out_hi[1]) >> 16));
+            __bf16* row_base = out_seg + m_token_id * gridDim.z * S;
+            ((bfloat16x2*)row_base)[lane_id] = tmp_lo;
+            ((bfloat16x2*)(row_base + 128))[lane_id] = tmp_hi;
             max_out[m_token_id * gridDim.z] = real_max[i];
             sum_out[m_token_id * gridDim.z] = real_sum[i];
         }
@@ -587,17 +621,22 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
         real_max = fmaxf(real_max, __shfl_xor(real_max, mask));
     }
 
-    float32x2 cur_val = 0;
+    float32x4 cur = {};
     float warp_sum = 0;
     for (uint i = warp_id; i < part_num; i += 4) {
         auto cur_max = max_out[i];
         auto cur_out_seg = out_seg + i * S;
-        // TODO: support S is not 128
-        auto cur_val_low = ((bfloat16x2*)cur_out_seg)[lane_id];
-        float32x2 tmp_val;
-        tmp_val[0] = cur_val_low[0];
-        tmp_val[1] = cur_val_low[1];
-        cur_val += tmp_val * sum_out[i] * __expf(cur_max - real_max);
+        auto v = ((bfloat16x4*)cur_out_seg)[lane_id];
+        float32x4 tmp;
+        tmp[0] = (float)v[0];
+        tmp[1] = (float)v[1];
+        tmp[2] = (float)v[2];
+        tmp[3] = (float)v[3];
+        const float w = sum_out[i] * __expf(cur_max - real_max);
+        cur[0] += tmp[0] * w;
+        cur[1] += tmp[1] * w;
+        cur[2] += tmp[2] * w;
+        cur[3] += tmp[3] * w;
         warp_sum += sum_out[i] * __expf(cur_max - real_max);
     }
 
@@ -606,19 +645,21 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
     if (lane_id == 0) {
         sum_lds[warp_id] = warp_sum;
     }
-    if (warp_id != 0)
-        *(float32x2*)(&out_lds[warp_id * S + lane_id * 2]) = cur_val;
+    if (warp_id != 0) {
+        *(float32x4*)(&out_lds[warp_id * S + lane_id * 4 + 0]) = cur;
+    }
     __syncthreads();
     if (warp_id == 0) {
         warp_sum += sum_lds[1] + sum_lds[2] + sum_lds[3];
-        for (int i = 1; i < 4; i++) {
-            cur_val += *(float32x2*)(&out_lds[i * S + lane_id * 2]);
+        for (int wi = 1; wi < 4; wi++) {
+            cur += *(float32x4*)(&out_lds[wi * S + lane_id * 4 + 0]);
         }
         const float inv_sum_scale = 1.f / (warp_sum + 1e-6f);
-        cur_val *= inv_sum_scale;
-        bfloat16x2 tmp_val;
-        tmp_val[0] = cur_val[0];
-        tmp_val[1] = cur_val[1];
-        ((bfloat16x2*)out)[lane_id] = tmp_val;
+        bfloat16x4 o;
+        o[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[0] * inv_sum_scale) >> 16));
+        o[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[1] * inv_sum_scale) >> 16));
+        o[2] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[2] * inv_sum_scale) >> 16));
+        o[3] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[3] * inv_sum_scale) >> 16));
+        ((bfloat16x4*)out)[lane_id] = o;
     }
 }

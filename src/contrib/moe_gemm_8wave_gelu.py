@@ -550,7 +550,7 @@ def moe_gemm_8wave_gelu(J,
 
         vflow = J.gpr("vf32", -128.0)
         vfhigh = J.gpr("vf32", 127.0)
-        vnz_guard = J.gpr("vf32", 1e-6)
+        vnz_guard = J.gpr("vf32", 1e-9)
 
         voscales = J.gpr(2, 2, "vf32")
         for cm in range(2):
@@ -577,24 +577,14 @@ def moe_gemm_8wave_gelu(J,
 
                     vmax[1] = vmax[0]
                     vmax[3] = vmax[2]
-
-                    #J.s_nop(2)
-                    for k in range(4):
-                        J.v_rndne_f32(mfma_C[cm*2+0, m, n,   k], mfma_C[cm*2+0, m, n,   k])
-                        J.v_rndne_f32(mfma_C[cm*2+0, m, n+1, k], mfma_C[cm*2+0, m, n+1, k])
-
+                    J.s_nop(1)
                     J.v_permlane16_swap_b32(vmax[0], vmax[1])
                     J.v_permlane16_swap_b32(vmax[2], vmax[3])
                     J.v_max_f32(vmax[0], vmax[0], vmax[1])
                     J.v_max_f32(vmax[2], vmax[2], vmax[3])
                     vmax[1] = vmax[0]
                     vmax[3] = vmax[2]
-
-                    #J.s_nop(2)
-                    for k in range(4):
-                        J.v_rndne_f32(mfma_C[cm*2+1, m, n,   k], mfma_C[cm*2+1, m, n,   k])
-                        J.v_rndne_f32(mfma_C[cm*2+1, m, n+1, k], mfma_C[cm*2+1, m, n+1, k])
-
+                    J.s_nop(1)
                     J.v_permlane32_swap_b32(vmax[0], vmax[1])
                     J.v_permlane32_swap_b32(vmax[2], vmax[3])
                     J.v_max_f32(vmax[0], vmax[0], vmax[1])
@@ -614,6 +604,12 @@ def moe_gemm_8wave_gelu(J,
                         mfma_C[cm*2+0, m, n + 1, k] *= inv_row_scale[0]
                         mfma_C[cm*2+1, m, n, k] *= inv_row_scale[1]
                         mfma_C[cm*2+1, m, n + 1, k] *= inv_row_scale[1]
+
+                    for k in range(4):
+                        J.v_rndne_f32(mfma_C[cm*2+0, m, n,   k], mfma_C[cm*2+0, m, n,   k])
+                        J.v_rndne_f32(mfma_C[cm*2+0, m, n+1, k], mfma_C[cm*2+0, m, n+1, k])
+                        J.v_rndne_f32(mfma_C[cm*2+1, m, n,   k], mfma_C[cm*2+1, m, n,   k])
+                        J.v_rndne_f32(mfma_C[cm*2+1, m, n+1, k], mfma_C[cm*2+1, m, n+1, k])
 
                     for k in range(4):
                         J.v_med3_f32(mfma_C[cm*2+0, m, n,   k], mfma_C[cm*2+0, m, n,   k], vflow, vfhigh)

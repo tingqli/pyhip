@@ -830,7 +830,7 @@ __global__ __launch_bounds__(64, 1) void quant1_notopk(
 
 __global__ void __launch_bounds__(256, 1) reduce_i8(
             char* p_x,        // [M, topk, REDUCE_K]
-            float* p_scale,   // [M, topk, REDUCE_K//BLOCK_QUANT]
+            __bf16* p_scale,   // [M, topk, REDUCE_K//BLOCK_QUANT]
             __bf16* p_out,    // [M, REDUCE_K]
             uint M) {
     uint m = blockIdx.x;
@@ -849,8 +849,19 @@ __global__ void __launch_bounds__(256, 1) reduce_i8(
         float result[16] = {0};
         #pragma unroll
         for (int t = 0; t < TOPK; t++) {
-            float scale = p_scale[t * (REDUCE_K / BLOCK_QUANT) + i * 16 / BLOCK_QUANT];
-            charx16 x_val = buffer_load_dwordx4<charx16>(x_res, 0, t * REDUCE_K + i * 16, 0, (int)amd_buffer_coherence_enum::SYSTEM_NT1);
+            auto i_block = i / 16;
+            auto i_block_rem = i % 16;
+            // [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] ->
+            // [0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15]
+            uint data_idx = (i_block_rem % 2) + (i_block_rem / 2 % 4) * 4 + (i_block_rem / 8) * 2;
+            auto data_pos = i_block * 16 + data_idx;
+            charx16 x_val = buffer_load_dwordx4<charx16>(x_res, 0, t * REDUCE_K + data_pos * 16, 0, (int)amd_buffer_coherence_enum::SYSTEM_NT1);
+            auto scale_idx = i * 16 / BLOCK_QUANT;
+            constexpr int SCALE_BLOCK = 256 / BLOCK_QUANT;
+            constexpr int SCALE_BLOCK_HALF = SCALE_BLOCK / 2;
+            auto scale_rem = scale_idx % SCALE_BLOCK;
+            scale_idx = (scale_idx / SCALE_BLOCK) * SCALE_BLOCK + (scale_rem / SCALE_BLOCK_HALF + (scale_rem % SCALE_BLOCK_HALF) * 2);
+            float scale = p_scale[t * (REDUCE_K / BLOCK_QUANT) + scale_idx];
             #pragma unroll
             for (int k = 0; k < 16; k++) {
                 result[k] += (float)x_val[k] * scale;

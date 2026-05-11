@@ -1,4 +1,4 @@
-# pyhib
+# pyhip
 
 PyHIP provides a one-stop toolkit for Python-based CDNA Assembly kernel development.
 
@@ -114,7 +114,7 @@ test_kernel([gridDim_x, gridDim_y, gridDim_z],    # grid dimensions
 # tests for contrib
 ./tests/contrib/run_test.sh
 # run individual test for contrib
-python tests/contrib/pa/test.py
+python tests/contrib/pa/test_pa.py
 python tests/contrib/moe/test_moe.py
 python tests/contrib/moe/test_mxfp4.py
 

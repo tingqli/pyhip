@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import triton
 import triton.language as tl
@@ -11,7 +13,7 @@ from triton.experimental.gluon.language.amd.cdna3 import (
     )
 
 from triton.experimental.gluon.language.amd.cdna3 import (
-    sched_group_barrier as _amd_iglp_sched_group_barrier,
+    sched_group_barrier as _amd_iglp_sched_group_barrier, s_set_prio as _amd_iglp_sched_set_prio
 )
 
 from pyhip.contrib.gluon.utils import read_cycle, read_realtime, get_cu_id
@@ -61,17 +63,18 @@ class Args:
             reg_bases = [[0, 1], [0, 2], [0, 4], [8, 0]]
             lane_bases = [[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]]
             warp_bases = [[1, 0], [2, 0], [4, 0]]
-        m = self.BLOCK_TILE_SIZE_M // 128
-        bit_pos = 128
-        while m // 2:
-            reg_bases.append([bit_pos, 0])
-            bit_pos *= 2
-            m = m // 2
+        # A will have 2 halves in M dimension, each half is [128, 64]
+        # m = self.BLOCK_TILE_SIZE_M // 128
+        # bit_pos = 128
+        # while m // 2:
+        #     reg_bases.append([bit_pos, 0])
+        #     bit_pos *= 2
+        #     m = m // 2
         mem_a_layout = gl.DistributedLinearLayout(reg_bases=reg_bases,
                                                 lane_bases=lane_bases,
                                                 warp_bases=warp_bases,
                                                 block_bases=[],
-                                                shape=[self.BLOCK_TILE_SIZE_M, self.BLOCK_TILE_SIZE_K])
+                                                shape=[self.BLOCK_TILE_SIZE_M // 2, self.BLOCK_TILE_SIZE_K])
         return mem_a_layout
 
     @gluon.constexpr_function
@@ -114,12 +117,12 @@ class Args:
     @gluon.constexpr_function
     def get_lds_layout_a(self):
         offset_bases = []
-        m = self.BLOCK_TILE_SIZE_M // 128
-        bit_pos = 128
-        while m // 2:
-            offset_bases.append([bit_pos, 0])
-            bit_pos *= 2
-            m = m // 2
+        # m = self.BLOCK_TILE_SIZE_M // 128
+        # bit_pos = 128
+        # while m // 2:
+        #     offset_bases.append([bit_pos, 0])
+        #     bit_pos *= 2
+        #     m = m // 2
         lds_a_layout = gl.PaddedSharedLayout(
             [[512, 16]],
             [
@@ -138,7 +141,7 @@ class Args:
                 [8, 0],
             ] + offset_bases,
             [],
-            [self.BLOCK_TILE_SIZE_M, self.BLOCK_TILE_SIZE_K]
+            [self.BLOCK_TILE_SIZE_M // 2, self.BLOCK_TILE_SIZE_K]
         )
         return lds_a_layout
 
@@ -295,7 +298,7 @@ def bf16_3stage_4wave(
         num_pid = gl.num_programs(0)
         tile_m, tile_n = get_pids(M, N, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, num_pid,
                                 8, 4)
-    mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_a_layout))) % M
+    mem_a_offset_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M // 2, layout=gl.SliceLayout(1, mem_a_layout))) % M
     mem_a_offsets = mem_a_offset_m[:, None] * K + gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(0, mem_a_layout))[None, :]
     gl.static_assert(SHUFFLE == 1, "not support SHUFFLE == 0")
     if SHUFFLE:
@@ -321,26 +324,48 @@ def bf16_3stage_4wave(
         b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
         mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id()
         weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
-    lds_a = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K], lds_a_layout)
-    lds_b_top = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 2 // 16], lds_b_layout)
-    lds_b_bot = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 2 // 16], lds_b_layout)
-    p_weight_top = p_weight
-    p_weight_bot = p_weight + (BLOCK_TILE_SIZE_N // 2) * K
+    lds_a_top = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_K], lds_a_layout)
+    lds_a_bot = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_K], lds_a_layout)
+    lds_b_left = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 2 // 16], lds_b_layout)
+    lds_b_right = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_TILE_SIZE_K * 16, BLOCK_TILE_SIZE_N // 2 // 16], lds_b_layout)
+    p_input_top = p_input
+    p_input_bot = p_input + (BLOCK_TILE_SIZE_M // 2) * K
+    p_weight_left = p_weight
+    p_weight_right = p_weight + (BLOCK_TILE_SIZE_N // 2) * K
     # global prefetch 0, 1
-    for i in gl.static_range(2):
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(i), p_input, mem_a_offsets)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_top.index(i), p_weight_top, mem_b_offsets)
-        gl.amd.cdna4.async_copy.commit_group()
+    # block 0
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_left.index(0), p_weight_left, mem_b_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a_top.index(0), p_input_top, mem_a_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a_bot.index(0), p_input_bot, mem_a_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_right.index(0), p_weight_right, mem_b_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    mem_a_offsets += BLOCK_TILE_SIZE_K
+    if SHUFFLE:
+        mem_b_offsets += BLOCK_TILE_SIZE_K * 16
+    else:
+        mem_b_offsets += BLOCK_TILE_SIZE_K
+    # block 1
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_left.index(1), p_weight_left, mem_b_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a_top.index(1), p_input_top, mem_a_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a_bot.index(1), p_input_bot, mem_a_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_right.index(1), p_weight_right, mem_b_offsets)
+    gl.amd.cdna4.async_copy.commit_group()
+    mem_a_offsets += BLOCK_TILE_SIZE_K
+    if SHUFFLE:
+        mem_b_offsets += BLOCK_TILE_SIZE_K * 16
+    else:
+        mem_b_offsets += BLOCK_TILE_SIZE_K
 
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_bot.index(i), p_weight_bot, mem_b_offsets)
-        gl.amd.cdna4.async_copy.commit_group()
-        mem_a_offsets += BLOCK_TILE_SIZE_K
-        if SHUFFLE:
-            mem_b_offsets += BLOCK_TILE_SIZE_K * 16
-        else:
-            mem_b_offsets += BLOCK_TILE_SIZE_K
-    acc_top = gl.zeros((BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
-    acc_bot = gl.zeros((BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
+    acc_top_left = gl.zeros((BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
+    acc_top_right = gl.zeros((BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
+    acc_bottom_left = gl.zeros((BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
+    acc_bottom_right = gl.zeros((BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2), dtype=gl.float32, layout=c_layout)
     s_vmem_read: gl.constexpr = 0x0020
     s_mfma: gl.constexpr = 0x0008
     s_ds_read: gl.constexpr = 0x0100
@@ -351,137 +376,334 @@ def bf16_3stage_4wave(
         loop_start_cycle = read_cycle()
         _amd_iglp_sched_barrier(0)
 
-    gl.amd.cdna4.async_copy.wait_group(3)
+    gl.amd.cdna4.async_copy.wait_group(4)
     # local prefetch 0
-    a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(0), a_fma_layout)
-    b_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_top.index(0), lds_b_read_layout)
-    b_top = b_top.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
-    b_top = gl.convert_layout(b_top, b_fma_layout, assert_trivial=True)
+    a_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_top.index(0), a_fma_layout)
+    b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_left.index(0), lds_b_read_layout)
+    b_left = b_left.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
+    b_left = gl.convert_layout(b_left, b_fma_layout, assert_trivial=True)
 
-    if num_warps == 8 and gl.amd.cdna3.warp_id() >= 4:
-        gl.amd.cdna3.s_barrier()
+    _amd_iglp_sched_barrier(0)
+    if num_warps == 8:
+        gl.inline_asm_elementwise(asm=';',
+                                    constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                    args=[a_top],
+                                    dtype=gl.bfloat16,
+                                    is_pure=False,
+                                    pack=64)
+        gl.inline_asm_elementwise(asm=';',
+                                    constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                    args=[b_left],
+                                    dtype=gl.bfloat16,
+                                    is_pure=False,
+                                    pack=64)
+        if gl.amd.cdna3.warp_id() >= 4:
+            gl.amd.cdna3.s_barrier()
 
     _amd_iglp_sched_barrier(0)
     for k_start in range(0, (K - BLOCK_TILE_SIZE_K * 2) // (2 * BLOCK_TILE_SIZE_K)):
         _amd_iglp_sched_barrier(0)
-        ##### c0t->w0b->l0b->p2t
-        # compute 0t
-        acc_top = gl.amd.cdna4.mfma(a, b_top, acc_top)
+        ##### c0tl->w b0->l b0->p l2
+        # compute 0tl
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
-            gl.amd.cdna3.s_barrier()
-        # local prefetch 0b
-        gl.amd.cdna4.async_copy.wait_group(2)
-        b_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_bot.index(0), lds_b_read_layout)
-        b_bot = b_bot.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
-        b_bot = gl.convert_layout(b_bot, b_fma_layout, assert_trivial=True)
-        # prefetch 2t
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(0), p_input, mem_a_offsets)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_top.index(0), p_weight_top, mem_b_offsets)
-        gl.amd.cdna4.async_copy.commit_group()
-        #### c0b->w1t->l1t->p2b
-        # compute 0b
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_top_left = gl.amd.cdna4.mfma(a_top, b_left, acc_top_left)
         if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        # local prefetch 0b
+        #gl.amd.cdna4.async_copy.wait_group(5)
+        a_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_bot.index(0), a_fma_layout)
+        # prefetch 2l
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_left.index(0), p_weight_left, mem_b_offsets)
+        gl.amd.cdna4.async_copy.commit_group()
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[a_bot],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         else:
-            gl.inline_asm_elementwise(asm=';',
-                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
-                                      args=[b_top],
-                                      dtype=gl.bfloat16,
-                                      is_pure=False,
-                                      pack=32)
             for _ in gl.static_range(8):
                 _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
                 _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
-            for _ in gl.static_range(12):
+            for _ in gl.static_range(4):
                 _amd_iglp_sched_group_barrier(s_mfma, 4, 0)
                 _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
-            _amd_iglp_sched_group_barrier(s_mfma, 64 - 8 - 12*4, 0)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 0)
             _amd_iglp_sched_barrier(0)
 
-        acc_bot = gl.amd.cdna4.mfma(a, b_bot, acc_bot)
+        ##### c0bl->w r0->l r0->p 2t
+        acc_bottom_left = gl.amd.cdna4.mfma(a_bot, b_left, acc_bottom_left)
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
             gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
         # local prefetch 1t
-        gl.amd.cdna4.async_copy.wait_group(2)
-        a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(1), a_fma_layout)
-        b_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_top.index(1), lds_b_read_layout)
-        b_top = b_top.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
-        b_top = gl.convert_layout(b_top, b_fma_layout, assert_trivial=True)
-        # prefetch 2b
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_bot.index(0), p_weight_bot, mem_b_offsets)
+        #gl.amd.cdna4.async_copy.wait_group(5)
+        b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_right.index(0), lds_b_read_layout)
+        b_right = b_right.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
+        b_right = gl.convert_layout(b_right, b_fma_layout, assert_trivial=True)
+        # prefetch 2t
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a_top.index(0), p_input_top, mem_a_offsets)
         gl.amd.cdna4.async_copy.commit_group()
-        mem_a_offsets += BLOCK_TILE_SIZE_K
-        if SHUFFLE:
-            mem_b_offsets += BLOCK_TILE_SIZE_K * 16
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_right],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
         else:
-            mem_b_offsets += BLOCK_TILE_SIZE_K
-        if num_warps == 4:
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[b_top, b_bot],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[a, a_next],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
-            for _ in gl.static_range(24):
+            for _ in gl.static_range(8):
                 _amd_iglp_sched_group_barrier(s_mfma, 1, 1)
                 _amd_iglp_sched_group_barrier(s_ds_read, 1, 1)
             for _ in gl.static_range(4):
                 _amd_iglp_sched_group_barrier(s_mfma, 4, 1)
                 _amd_iglp_sched_group_barrier(s_vmem_read, 1, 1)
-            _amd_iglp_sched_group_barrier(s_mfma, 64 - 24 - 4*4, 1)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 1)
+            _amd_iglp_sched_barrier(0)
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_left],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
             _amd_iglp_sched_barrier(0)
 
-        ############## unroll ######################
-        ##### c1t->w1b->l1b->p3t
-        # compute 1t
-        if num_warps == 8:
-            gl.amd.cdna3.s_barrier()
-            _amd_iglp_sched_barrier(0)
-        acc_top = gl.amd.cdna4.mfma(a_next, b_top, acc_top)
+        ##### c0 tr->w l1->l l1->p b2
+        # compute 0tr
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_top_right = gl.amd.cdna4.mfma(a_top, b_right, acc_top_right)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
-        # local prefetch 1b
-        gl.amd.cdna4.async_copy.wait_group(2)
-        b_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_bot.index(1), lds_b_read_layout)
-        b_bot = b_bot.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
-        b_bot = gl.convert_layout(b_bot, b_fma_layout, assert_trivial=True)
-        # prefetch 3t
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a.index(1), p_input, mem_a_offsets)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_top.index(1), p_weight_top, mem_b_offsets)
+            _amd_iglp_sched_barrier(0)
+        # local prefetch l1
+        #gl.amd.cdna4.async_copy.wait_group(5)
+        b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_left.index(1), lds_b_read_layout)
+        b_left = b_left.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
+        b_left = gl.convert_layout(b_left, b_fma_layout, assert_trivial=True)
+        # prefetch b2
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a_bot.index(0), p_input_bot, mem_a_offsets)
         gl.amd.cdna4.async_copy.commit_group()
-        #### c1b->w2t->l2t->p3b
-        # compute 1b
         if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_left],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
             gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         else:
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[b_top, b_bot],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[a, a_next],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
             for _ in gl.static_range(8):
                 _amd_iglp_sched_group_barrier(s_mfma, 1, 2)
                 _amd_iglp_sched_group_barrier(s_ds_read, 1, 2)
-            for _ in gl.static_range(12):
+            for _ in gl.static_range(4):
                 _amd_iglp_sched_group_barrier(s_mfma, 4, 2)
                 _amd_iglp_sched_group_barrier(s_vmem_read, 1, 2)
-            _amd_iglp_sched_group_barrier(s_mfma, 64 - 8 - 12*4, 2)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 2)
             _amd_iglp_sched_barrier(0)
     
-        acc_bot = gl.amd.cdna4.mfma(a_next, b_bot, acc_bot)
+        #### c0br->w t1->l t1->p r2
+        # compute 0br
         if num_warps == 8:
             _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_bottom_right = gl.amd.cdna4.mfma(a_bot, b_right, acc_bottom_right)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
-        # local prefetch 2t
-        gl.amd.cdna4.async_copy.wait_group(2)
-        a = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(0), a_fma_layout)
-        b_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_top.index(0), lds_b_read_layout)
-        b_top = b_top.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
-        b_top = gl.convert_layout(b_top, b_fma_layout, assert_trivial=True)
-        # prefetch 3b
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_bot.index(1), p_weight_bot, mem_b_offsets)
+            _amd_iglp_sched_barrier(0)
+        # local prefetch t1
+        #gl.amd.cdna4.async_copy.wait_group(5)
+        a_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_top.index(1), a_fma_layout)
+        # prefetch r2
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_right.index(0), p_weight_right, mem_b_offsets)
+        gl.amd.cdna4.async_copy.commit_group()
+        mem_a_offsets += BLOCK_TILE_SIZE_K
+        if SHUFFLE:
+            mem_b_offsets += BLOCK_TILE_SIZE_K * 16
+        else:
+            mem_b_offsets += BLOCK_TILE_SIZE_K
+        
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[a_top],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna4.async_copy.wait_group(4)
+            #gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        else:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 3)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 3)
+            for _ in gl.static_range(4):
+                _amd_iglp_sched_group_barrier(s_mfma, 4, 3)
+                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 3)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 3)
+
+            gl.amd.cdna4.async_copy.wait_group(4)
+            #gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+
+        ############# unroll ##############
+        ##### c0tl->w b0->l b0->p l2
+        # compute 0tl
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_top_left = gl.amd.cdna4.mfma(a_top, b_left, acc_top_left)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        # local prefetch 0b
+        #gl.amd.cdna4.async_copy.wait_group(5)
+        a_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_bot.index(1), a_fma_layout)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_left.index(1), p_weight_left, mem_b_offsets)
+        gl.amd.cdna4.async_copy.commit_group()
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[a_bot],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        else:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 4)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 4)
+            for _ in gl.static_range(4):
+                _amd_iglp_sched_group_barrier(s_mfma, 4, 4)
+                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 4)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 4)
+            _amd_iglp_sched_barrier(0)
+
+        ##### c0bl->w r0->l r0->p 2t
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_bottom_left = gl.amd.cdna4.mfma(a_bot, b_left, acc_bottom_left)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        # local prefetch 1t
+        #gl.amd.cdna4.async_copy.wait_group(5)
+        b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_right.index(1), lds_b_read_layout)
+        b_right = b_right.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
+        b_right = gl.convert_layout(b_right, b_fma_layout, assert_trivial=True)
+        # prefetch 2t
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a_top.index(1), p_input_top, mem_a_offsets)
+        gl.amd.cdna4.async_copy.commit_group()
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_right],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        else:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 5)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 5)
+            for _ in gl.static_range(4):
+                _amd_iglp_sched_group_barrier(s_mfma, 4, 5)
+                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 5)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 5)
+            _amd_iglp_sched_barrier(0)
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_left],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            _amd_iglp_sched_barrier(0)
+
+        ##### c0 tr->w l1->l l1->p b2
+        # compute 0tr
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_top_right = gl.amd.cdna4.mfma(a_top, b_right, acc_top_right)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        # local prefetch l1
+        #gl.amd.cdna4.async_copy.wait_group(5)
+        b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_left.index(0), lds_b_read_layout)
+        b_left = b_left.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
+        b_left = gl.convert_layout(b_left, b_fma_layout, assert_trivial=True)
+        # prefetch b2
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_a_bot.index(1), p_input_bot, mem_a_offsets)
+        gl.amd.cdna4.async_copy.commit_group()
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_left],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        else:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 6)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 6)
+            for _ in gl.static_range(4):
+                _amd_iglp_sched_group_barrier(s_mfma, 4, 6)
+                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 6)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 6)
+            _amd_iglp_sched_barrier(0)
+    
+        #### c0br->w t1->l t1->p r2
+        # compute 0br
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_bottom_right = gl.amd.cdna4.mfma(a_bot, b_right, acc_bottom_right)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        # local prefetch t1
+        #gl.amd.cdna4.async_copy.wait_group(5)
+        a_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_top.index(0), a_fma_layout)
+        # prefetch r2
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(lds_b_right.index(1), p_weight_right, mem_b_offsets)
         gl.amd.cdna4.async_copy.commit_group()
         mem_a_offsets += BLOCK_TILE_SIZE_K
         if SHUFFLE:
@@ -490,50 +712,26 @@ def bf16_3stage_4wave(
             mem_b_offsets += BLOCK_TILE_SIZE_K
 
         if num_warps == 8:
-            gl.amd.cdna3.s_barrier()
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[a_top],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna4.async_copy.wait_group(4)
+            #gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
         else:
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[b_top, b_bot],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
-            gl.inline_asm_elementwise(asm=';', constraints='=r,=r,=r,=r,r,r,r,r,r,r,r,r', args=[a, a_next],
-                                    dtype=gl.bfloat16, is_pure=False, pack=8)
-            for _ in gl.static_range(24):
-                _amd_iglp_sched_group_barrier(s_mfma, 1, 3)
-                _amd_iglp_sched_group_barrier(s_ds_read, 1, 3)
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 7)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 7)
             for _ in gl.static_range(4):
-                _amd_iglp_sched_group_barrier(s_mfma, 4, 3)
-                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 3)
-            _amd_iglp_sched_group_barrier(s_mfma, 64 - 24 - 4*4, 3)
+                _amd_iglp_sched_group_barrier(s_mfma, 4, 7)
+                _amd_iglp_sched_group_barrier(s_vmem_read, 1, 7)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8 - 4*4, 7)
+            gl.amd.cdna4.async_copy.wait_group(4)
+            #gl.amd.cdna3.s_barrier()
             _amd_iglp_sched_barrier(0)
-            # # BLOCK_M // 4 wave * 2(=BLOCK_K//32)
-            # k0_t_vmem_read_num: gl.constexpr = BLOCK_TILE_SIZE_M // 4 // 16 * 2 + BLOCK_TILE_SIZE_N // 4 // 16 * 2 // 2
-            # # BLOCK_N // 2 wave * 2(=BLOCK_K//16) // 2
-            # k0_t_lds_read_num: gl.constexpr = BLOCK_TILE_SIZE_N // 2 // 16 * 2 // 2
-            # gl.static_print("k0_t_vmem_read_num:", k0_t_vmem_read_num, k_start)
-            # gl.static_print("k0_t_lds_read_num:", k0_t_lds_read_num)
-            # # BLOCK_M // 4 wave * 2(=BLOCK_K//32)
-            # k0_b_vmem_read_num: gl.constexpr = BLOCK_TILE_SIZE_N // 4 // 16 * 2 // 2
-            # # BLOCK_M // 2 wave * 2(=BLOCK_K//16) + BLOCK_N // 2 wave * 2(=BLOCK_K//16) // 2
-            # k0_b_lds_read_num: gl.constexpr = BLOCK_TILE_SIZE_M // 2 // 16 * 2 + BLOCK_TILE_SIZE_N // 2 // 16 * 2 // 2
-            # gl.static_print("k0_b_vmem_read_num:", k0_b_vmem_read_num)
-            # gl.static_print("k0_b_lds_read_num:", k0_b_lds_read_num)
-            # for _ in gl.static_range(2):
-            #     for _ in gl.static_range(k0_t_vmem_read_num):
-            #         _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
-            #         _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
-            #     for _ in gl.static_range(k0_t_lds_read_num):
-            #         _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
-            #         _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
-            #     _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 2 // 16 * BLOCK_TILE_SIZE_N // 2 // 16 // 2 * 2 - k0_t_lds_read_num - k0_t_vmem_read_num, 0)
-
-            #     for _ in gl.static_range(k0_b_vmem_read_num):
-            #         _amd_iglp_sched_group_barrier(s_vmem_read, 1, 0)
-            #         _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
-            #     for _ in gl.static_range(k0_b_lds_read_num):
-            #         _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
-            #         _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
-            #     _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 2 // 16 * BLOCK_TILE_SIZE_N // 2 // 16 // 2 * 2 - k0_b_lds_read_num - k0_b_vmem_read_num, 0)
-            # _amd_iglp_sched_barrier(0)
 
     _amd_iglp_sched_barrier(0)
     if enable_debug:
@@ -543,66 +741,203 @@ def bf16_3stage_4wave(
     # tail
     if weight_dtype == torch.float8_e4m3fn:...
     else:
-        ##### c0t->w0b->l0b->
-        # compute 0t
-        acc_top = gl.amd.cdna4.mfma(a, b_top, acc_top)
+        ##### c0tl->w b0->l b0->p l2
+        # compute 0tl
         if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_top_left = gl.amd.cdna4.mfma(a_top, b_left, acc_top_left)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
-            # _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_barrier(0)
         # local prefetch 0b
-        gl.amd.cdna4.async_copy.wait_group(2)
-        b_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_bot.index(0), lds_b_read_layout)
-        b_bot = b_bot.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
-        b_bot = gl.convert_layout(b_bot, b_fma_layout, assert_trivial=True)
-        #### c0b->w1t->l1t->
-        # compute 0b
+        gl.amd.cdna4.async_copy.wait_group(5)
+        a_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_bot.index(0), a_fma_layout)
         if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[a_bot],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
             gl.amd.cdna3.s_barrier()
-            # _amd_iglp_sched_barrier(0)
-        acc_bot = gl.amd.cdna4.mfma(a, b_bot, acc_bot)
-        if num_warps == 8:
-            gl.amd.cdna3.s_barrier()
-            # _amd_iglp_sched_barrier(0)
-        # local prefetch 1t
-        gl.amd.cdna4.async_copy.wait_group(1)
-        a_next = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a.index(1), a_fma_layout)
-        b_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_top.index(1), lds_b_read_layout)
-        b_top = b_top.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
-        b_top = gl.convert_layout(b_top, b_fma_layout, assert_trivial=True)
+            _amd_iglp_sched_barrier(0)
+        else:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 0)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 0)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8, 0)
 
-        ############## unroll ######################
-        ##### c1t->w1b->l1b->
-        # compute 1t
+        ##### c0bl->w r0->l r0->p 2t
         if num_warps == 8:
-            gl.amd.cdna3.s_barrier()
-            # _amd_iglp_sched_barrier(0)
-        acc_top = gl.amd.cdna4.mfma(a_next, b_top, acc_top)
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_bottom_left = gl.amd.cdna4.mfma(a_bot, b_left, acc_bottom_left)
         if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
             gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        # local prefetch 1t
+        gl.amd.cdna4.async_copy.wait_group(4)
+        b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_right.index(0), lds_b_read_layout)
+        b_right = b_right.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
+        b_right = gl.convert_layout(b_right, b_fma_layout, assert_trivial=True)
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_right],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        else:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 1)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 1)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8, 1)
             # _amd_iglp_sched_barrier(0)
-        # local prefetch 1b
+
+        ##### c0 tr->w l1->l l1->p b2
+        # compute 0tr
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_top_right = gl.amd.cdna4.mfma(a_top, b_right, acc_top_right)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        # local prefetch l1
+        gl.amd.cdna4.async_copy.wait_group(3)
+        b_left = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_left.index(1), lds_b_read_layout)
+        b_left = b_left.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
+        b_left = gl.convert_layout(b_left, b_fma_layout, assert_trivial=True)
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[b_left],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        else:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 2)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 2)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8, 2)
+            # _amd_iglp_sched_barrier(0)
+    
+        #### c0br->w t1->l t1->p r2
+        # compute 0br
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(1)
+            _amd_iglp_sched_barrier(0)
+        acc_bottom_right = gl.amd.cdna4.mfma(a_bot, b_right, acc_bottom_right)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            _amd_iglp_sched_set_prio(0)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        # local prefetch t1
+        gl.amd.cdna4.async_copy.wait_group(2)
+        a_top = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_top.index(1), a_fma_layout)
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[a_top],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        else:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 3)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 3)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8, 3)
+            # _amd_iglp_sched_barrier(0)
+
+        ############# unroll ##############
+        ##### c0tl->w b0->l b0->p l2
+        # compute 0tl
+        acc_top_left = gl.amd.cdna4.mfma(a_top, b_left, acc_top_left)
+        if num_warps == 8:
+            _amd_iglp_sched_barrier(0)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        # local prefetch 0b
+        gl.amd.cdna4.async_copy.wait_group(1)
+        a_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_a_bot.index(1), a_fma_layout)
+        if num_warps == 8:
+            gl.inline_asm_elementwise(asm=';',
+                                      constraints='=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r',
+                                      args=[a_bot],
+                                      dtype=gl.bfloat16,
+                                      is_pure=False,
+                                      pack=64)
+            gl.amd.cdna3.s_barrier()
+            _amd_iglp_sched_barrier(0)
+        else:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 4)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 4)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8, 4)
+            # _amd_iglp_sched_barrier(0)
+
+        ##### c0bl->w r0->l r0->p 2t
+        acc_bottom_left = gl.amd.cdna4.mfma(a_bot, b_left, acc_bottom_left)
+        if num_warps == 8:
+            #_amd_iglp_sched_barrier(0)
+            gl.amd.cdna3.s_barrier()
+        # local prefetch 1t
         gl.amd.cdna4.async_copy.wait_group(0)
-        b_bot = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_bot.index(1), lds_b_read_layout)
-        b_bot = b_bot.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
-        b_bot = gl.convert_layout(b_bot, b_fma_layout, assert_trivial=True)
-        #### c1b->
-        # compute 1b
+        b_right = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_b_right.index(1), lds_b_read_layout)
+        b_right = b_right.reshape(BLOCK_TILE_SIZE_K // 8, 16, 8, BLOCK_TILE_SIZE_N // 2 // 16).permute(0, 2, 3, 1).reshape(BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_N // 2)
+        b_right = gl.convert_layout(b_right, b_fma_layout, assert_trivial=True)
+        if num_warps == 4:
+            for _ in gl.static_range(8):
+                _amd_iglp_sched_group_barrier(s_mfma, 1, 5)
+                _amd_iglp_sched_group_barrier(s_ds_read, 1, 5)
+            _amd_iglp_sched_group_barrier(s_mfma, 32 - 8, 5)
+            # _amd_iglp_sched_barrier(0)
+
+        ##### c0 tr->w l1->l l1->p b2
+        # compute 0tr
         if num_warps == 8:
             gl.amd.cdna3.s_barrier()
-            # _amd_iglp_sched_barrier(0)
-        acc_bot = gl.amd.cdna4.mfma(a_next, b_bot, acc_bot)
+            #_amd_iglp_sched_barrier(0)
+        acc_top_right = gl.amd.cdna4.mfma(a_top, b_right, acc_top_right)
+        #### c0br->w t1->l t1->p r2
+        # compute 0br
+        acc_bottom_right = gl.amd.cdna4.mfma(a_bot, b_right, acc_bottom_right)
         if num_warps == 8 and gl.amd.cdna3.warp_id() < 4:
             gl.amd.cdna3.s_barrier()
             # _amd_iglp_sched_barrier(0)
 
-        out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
+        out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M // 2, layout=gl.SliceLayout(1, mem_c_layout))) % M
         out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N // 2, layout=gl.SliceLayout(0, mem_c_layout)))# % N
         out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
-        acc_top = acc_top.to(gl.bfloat16)
-        gl.amd.cdna3.buffer_store(gl.convert_layout(acc_top, mem_c_layout, assert_trivial=False), p_output, out_offsets)
-        acc_bot = acc_bot.to(gl.bfloat16)
-        out_offsets += BLOCK_TILE_SIZE_N // 2
-        gl.amd.cdna3.buffer_store(gl.convert_layout(acc_bot, mem_c_layout, assert_trivial=False), p_output, out_offsets)
+        acc_top_left = acc_top_left.to(gl.bfloat16)
+        gl.amd.cdna3.buffer_store(gl.convert_layout(acc_top_left, mem_c_layout, assert_trivial=False), p_output, out_offsets)
+        acc_top_right = acc_top_right.to(gl.bfloat16)
+        offsets = out_offsets + BLOCK_TILE_SIZE_N // 2
+        gl.amd.cdna3.buffer_store(gl.convert_layout(acc_top_right, mem_c_layout, assert_trivial=False), p_output, offsets)
+        acc_bottom_left = acc_bottom_left.to(gl.bfloat16)
+        offsets = out_offsets + BLOCK_TILE_SIZE_M // 2 * N
+        gl.amd.cdna3.buffer_store(gl.convert_layout(acc_bottom_left, mem_c_layout, assert_trivial=False), p_output, offsets)
+        acc_bottom_right = acc_bottom_right.to(gl.bfloat16)
+        offsets = out_offsets + BLOCK_TILE_SIZE_M // 2 * N + BLOCK_TILE_SIZE_N // 2
+        gl.amd.cdna3.buffer_store(gl.convert_layout(acc_bottom_right, mem_c_layout, assert_trivial=False), p_output, offsets)
     if enable_debug:
         _amd_iglp_sched_barrier(0)
         end = read_realtime()
@@ -658,7 +993,7 @@ def _run_aiter(
 
     return y[:M]
 
-def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, N=4096, K=4096):
+def _run_batch(num_warps, kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, N=4096, K=4096):
     BUF_COPY = 32
     A = torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16)
     from aiter.ops.shuffle import shuffle_weight
@@ -710,7 +1045,6 @@ def _run_batch(kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         M, K = A.shape
         N = w_ref.shape[0]
         gemm_out = torch.empty([M, N], dtype=A.dtype, device=A.device)
-        num_warps = 4
         if kernel_type == 'mxn_2s':
             BLOCK_TILE_SIZE_M = TILE_M
             BLOCK_TILE_SIZE_N = TILE_N
@@ -810,14 +1144,14 @@ def get_fp8type():
 def get_fp4type_if_valid():
     return torch.float4_e2m1fn_x2 if is_arch_type('950') else None
 
-def entry_common(kernel_type, M, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, N=4096, K=4096, run_count=10):
+def entry_common(num_warps, kernel_type, M, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, N=4096, K=4096, run_count=10):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
         if weight_type is None: continue
         perf_prec = {}
         for i in M:
-            perf_prec[i] = _run_batch(kernel_type, M=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, N=N, K=K)
+            perf_prec[i] = _run_batch(num_warps, kernel_type, M=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, N=N, K=K)
         perf[kernel_type][str(weight_type)] = perf_prec
     
     return perf
@@ -850,14 +1184,14 @@ def show_perf(perf, dict_tile_mn):
                     print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
 
 @pytest.mark.parametrize("M", [[1, 2, 4, 8, 12, 16, 32, 64]])
-def test_perf(M, TILE_M=32, TILE_N=64, N=4096, K=4096):
+def test_perf(num_warps, M, TILE_M=32, TILE_N=64, N=4096, K=4096):
     init_env()
     perf = {}
-    perf.update(entry_common('torch', M, prec=[torch.bfloat16], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
+    perf.update(entry_common(num_warps, 'torch', M, prec=[torch.bfloat16], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
     # TILE_M/N is configurable
     # perf.update(entry_common('mxn_2s', M=M, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     # perf.update(entry_common('mxn_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-    perf.update(entry_common('mxn_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    perf.update(entry_common(num_warps, 'mxn_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     return perf
 
 def merge(a: dict, b: dict, path=[]):
@@ -872,6 +1206,21 @@ def merge(a: dict, b: dict, path=[]):
     return a
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-w",
+        "--wave",
+        type=int,
+        choices=[4, 8],
+        default=4,
+        help="""select wave number 4 or 8""",
+    )
+    args = parser.parse_args()
+    print(f'selected num_warps={args.wave}')
+
     #TILE_M = 16
     #TILE_N = 128
     N, K = 4096*1, 1024*16 # 4096*8*2 /128 = 512
@@ -917,5 +1266,5 @@ if __name__ == '__main__':
         dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
         print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
         #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
-        perf = merge(perf, test_perf([M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+        perf = merge(perf, test_perf(num_warps=args.wave, M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     show_perf(perf, dict_tile_mn)

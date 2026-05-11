@@ -310,7 +310,7 @@ def test_mfma_16x16x32_fp8():
     14  : 14 14 14 14 14 14 14 14 | 30 30 30 30 30 30 30 30 | 46 46 46 46 46 46 46 46 | 62 62 62 62 62 62 62 62
     15  : 15 15 15 15 15 15 15 15 | 31 31 31 31 31 31 31 31 | 47 47 47 47 47 47 47 47 | 63 63 63 63 63 63 63 63
     """
-    arch = torch.cuda.get_device_properties().gcnArchName
+
     if "gfx942" in arch:
         A = torch.randn(16, 32, device="cuda").to(torch.float8_e4m3fnuz)
         B = torch.randn(16, 32, device="cuda").to(torch.float8_e4m3fnuz)
@@ -401,6 +401,10 @@ def test_mfma_16x16x32_fp16():
     }
 
     """
+    if not "gfx950" in arch:
+        print("SKIP: test_mfma_16x16x32_fp16 (no gfx950)")
+        return
+
     @pyhip.jit()
     def mfma_16x16x32_fp16(J: pyhip.JIT,
            pA: "void*",
