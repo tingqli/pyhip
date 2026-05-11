@@ -74,335 +74,390 @@ def gemm_kernel(J, wg_M, wg_N, N, K, use_pre_shuffle, pA:"void*", pB:"void*", pC
             for n in range(nrN//2):
                 J.v_mfma_f32_16x16x32_bf16(mfma_C[a_idx, b_idx, m,n], mfma_B[b_idx, reg_id, n], mfma_A[a_idx, reg_id, m], mfma_C[a_idx, b_idx, m,n])
                 yield 16
-    if 1:
-        koffset_a = J.gpr("su32", 0)
-        koffset_b = J.gpr("su32", 0)
-        mfma_C[...] = 0
-        ####################################prelog:
-        # ping prefetch
-        #AC B0 to ping
-        J.emit(vm_load_b_idx(ldsB0[0], buff_b, koffset_b, 0))
-        #AC A0 to ping
-        J.emit(vm_load_a_idx(ldsA0[0], buff_a, koffset_a, 0))
-        #AC A1 to ping
-        J.emit(vm_load_a_idx(ldsA1[0], buff_a, koffset_a, 1))
-        #AC B1 to ping
-        J.emit(vm_load_b_idx(ldsB1[0], buff_b, koffset_b, 1))
-        
-        koffset_a[0] += vm_offset_inc_a
-        koffset_b[0] += vm_offset_inc_b
+    koffset_a = J.gpr("su32", 0)
+    koffset_b = J.gpr("su32", 0)
+    mfma_C[...] = 0
+    ####################################prelog:
+    # ping prefetch
+    #AC B0 to ping
+    J.emit(vm_load_b_idx(ldsB0[0], buff_b, koffset_b, 0))
+    #AC A0 to ping
+    J.emit(vm_load_a_idx(ldsA0[0], buff_a, koffset_a, 0))
+    #AC A1 to ping
+    J.emit(vm_load_a_idx(ldsA1[0], buff_a, koffset_a, 1))
+    #AC B1 to ping
+    J.emit(vm_load_b_idx(ldsB1[0], buff_b, koffset_b, 1))
     
-        # pong prefetch
-        #AC B0 to pong
-        J.emit(vm_load_b_idx(ldsB0[1], buff_b, koffset_b, 0))
-        #AC A0 to pong
-        J.emit(vm_load_a_idx(ldsA0[1], buff_a, koffset_a, 0))
-        #AC A1 to pong
-        J.emit(vm_load_a_idx(ldsA1[1], buff_a, koffset_a, 1))
-        #AC B1 to pong
-        J.emit(vm_load_b_idx(ldsB1[1], buff_b, koffset_b, 1))
-        
-        koffset_a[0] += vm_offset_inc_a
-        koffset_b[0] += vm_offset_inc_b
-        
-        # readiness: AC B0 and A0 to LDS0
-        J.s_waitcnt(mod=f"vmcnt({24})")
-        J.s_barrier() 
-        
-        # B0 in LDS0 into Reg. 
-        for n in range(nrN//2): ds_read_b(ldsB0[0], mfma_B[0, 0, n], n, 0)
-        for n in range(nrN//2): ds_read_b(ldsB0[0], mfma_B[0, 1, n], n, 1)
-        # A0 in LDS0 into Reg. 
-        for m in range(nrM//2): ds_read_a(ldsA0[0], mfma_A[0, 0, m], m, 0)
-        for m in range(nrM//2): ds_read_a(ldsA0[0], mfma_A[0, 1, m], m, 1)
+    koffset_a[0] += vm_offset_inc_a
+    koffset_b[0] += vm_offset_inc_b
 
-        # part 0: Matmul(0)(A0xB0), LR(cur) A[1] form LDS[cur%2], prefetch AC(cur+2) B[0] to LDS[cur%2]
-        # readiness: AC A1[cur] to LDS[cur%2],      readiness: B0 and A0[cur] into reg 
-
-        J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
-        J.s_barrier()
-        ###################################main loop:
-        def loop_body(idx):
-            cur_lds = idx % 2
-            next_lds = (idx + 1) % 2
-            # initiliaze generator
-            mfma_a0b0_k0=mfma(0, 0, 0)
-            mfma_a0b1_k0=mfma(0, 1, 0)
-            mfma_a1b0_k0=mfma(1, 0, 0)
-            mfma_a1b1_k0=mfma(1, 1, 0)
-        
-            mfma_a0b0_k1=mfma(0, 0, 1)
-            mfma_a0b1_k1=mfma(0, 1, 1)
-            mfma_a1b0_k1=mfma(1, 0, 1)
-            mfma_a1b1_k1=mfma(1, 1, 1)
-
-            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-            vm_load = vm_load_b_idx(ldsB0[cur_lds], buff_b, koffset_b, 0, mfma_a0b0_k1)
-            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 48)
-            for m in range(nrM//2):
-                J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-                ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
-                J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-                ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
-            for _ in range(vm_load_cnt_b):
-                J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-                J.emit(vm_load, 1)                
-                J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-                J.emit(vm_load, 1)                
-                J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-                J.emit(vm_load, 1)                
-                J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-
-            # part 1:
-            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-            J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
-            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-            J.s_barrier()
+    # pong prefetch
+    #AC B0 to pong
+    J.emit(vm_load_b_idx(ldsB0[1], buff_b, koffset_b, 0))
+    #AC A0 to pong
+    J.emit(vm_load_a_idx(ldsA0[1], buff_a, koffset_a, 0))
+    #AC A1 to pong
+    J.emit(vm_load_a_idx(ldsA1[1], buff_a, koffset_a, 1))
+    #AC B1 to pong
+    J.emit(vm_load_b_idx(ldsB1[1], buff_b, koffset_b, 1))
     
-            J.emit([mfma_a1b0_k0, mfma_a1b0_k1],16)
-            vm_load = vm_load_a_idx(ldsA0[cur_lds], buff_a, koffset_a, 0, mfma_a1b0_k0)
-            J.emit([mfma_a1b0_k0, mfma_a1b0_k1],48)
-            for n in range(nrN//2):
-                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-                ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
-                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-                ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1) 
-            for _ in range(vm_load_cnt_a):
-                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-                J.emit(vm_load, 1)
-                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-                J.emit(vm_load, 1)
-                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-                J.emit(vm_load, 1)
-                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+    koffset_a[0] += vm_offset_inc_a
+    koffset_b[0] += vm_offset_inc_b
+    
+    # readiness: AC B0 and A0 to LDS0
+    J.s_waitcnt(mod=f"vmcnt({24})")
+    J.s_barrier() 
+    
+    # B0 in LDS0 into Reg. 
+    for n in range(nrN//2): ds_read_b(ldsB0[0], mfma_B[0, 0, n], n, 0)
+    for n in range(nrN//2): ds_read_b(ldsB0[0], mfma_B[0, 1, n], n, 1)
+    # A0 in LDS0 into Reg. 
+    for m in range(nrM//2): ds_read_a(ldsA0[0], mfma_A[0, 0, m], m, 0)
+    for m in range(nrM//2): ds_read_a(ldsA0[0], mfma_A[0, 1, m], m, 1)
 
-            # J.emit(mfma_a1b0_k0)
-            # J.emit(mfma_a1b0_k1)
+    # part 0: Matmul(0)(A0xB0), LR(cur) A[1] form LDS[cur%2], prefetch AC(cur+2) B[0] to LDS[cur%2]
+    # readiness: AC A1[cur] to LDS[cur%2],      readiness: B0 and A0[cur] into reg 
 
-            # part 2:
-            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-            J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
-            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-            J.s_barrier()
-            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-            vm_load = vm_load_a_idx(ldsA1[cur_lds], buff_a, koffset_a, 1, mfma_a0b1_k0)
-            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 48)
-            for n in range(nrN//2):
-                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-                ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
-                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-                ds_read_b(ldsB0[next_lds], mfma_B[0, 1, n], n, 1)
-            for _ in range(vm_load_cnt_a):
-                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-                J.emit(vm_load, 1)
-                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-                J.emit(vm_load, 1)
-                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-                J.emit(vm_load, 1)
-                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-
-
-            # J.emit(mfma_a0b1_k0)
-            # J.emit(mfma_a0b1_k1)
-            # part 3:
-            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-            J.s_waitcnt(mod=f"vmcnt({20})")
-            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-            J.s_barrier()
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-            vm_load = vm_load_b_idx(ldsB1[cur_lds], buff_b, koffset_b, 1, mfma_a1b1_k0)
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-            for m in range(nrM//2):
-                J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-                ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
-                J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-                ds_read_a(ldsA0[next_lds], mfma_A[0, 1, m], m, 1)
-            for _ in range(vm_load_cnt_b):
-                J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-                J.emit(vm_load, 1)
-                J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-                J.emit(vm_load, 1)
-                J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-                J.emit(vm_load, 1)
-                J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-
-            # J.emit(mfma_a1b1_k0)
-            # J.emit(mfma_a1b1_k1)
-            # readiness: AC A1[cur] to LDS[cur%2],      readiness: B0 and A0[cur] into reg 
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-            J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-            J.s_barrier()
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-            koffset_a[0] += vm_offset_inc_a
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-            koffset_b[0] += vm_offset_inc_b
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-        if 0:
-            for k_idx in range((K//wg_K) - 2):
-                loop_body(k_idx)
-        else:
-            koff = J.gpr("su32", 0)
-            loop_cnt = ((K//wg_K) - 2)//2
-            kidx = 0
-            with J.While(koff[0] < loop_cnt):
-                loop_body(0)
-                loop_body(1)
-                koff[0] += 1
-        ####################################epologue 0:
-
+    J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
+    J.s_barrier()
+    ###################################main loop:
+    def loop_body(idx):
+        cur_lds = idx % 2
+        next_lds = (idx + 1) % 2
+        # initiliaze generator
         mfma_a0b0_k0=mfma(0, 0, 0)
         mfma_a0b1_k0=mfma(0, 1, 0)
         mfma_a1b0_k0=mfma(1, 0, 0)
         mfma_a1b1_k0=mfma(1, 1, 0)
+    
         mfma_a0b0_k1=mfma(0, 0, 1)
         mfma_a0b1_k1=mfma(0, 1, 1)
         mfma_a1b0_k1=mfma(1, 0, 1)
         mfma_a1b1_k1=mfma(1, 1, 1)
 
-        cur_lds = ((K//wg_K) - 2) % 2
-        next_lds = (cur_lds+1) % 2
-        #part 0
-        # J.s_waitcnt(mod=f"vmcnt({20})")
-        # J.s_barrier()
-        # J.s_waitcnt(mod=f"lgkmcnt(0)")
-
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+        vm_load = vm_load_b_idx(ldsB0[cur_lds], buff_b, koffset_b, 0, mfma_a0b0_k1)
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 48)
         for m in range(nrM//2):
             J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
             ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
-        for m in range(nrM//2):
             J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
             ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
-        J.emit(mfma_a0b0_k0)
-        J.emit(mfma_a0b0_k1)
-        # part 1:
-        J.s_waitcnt(mod=f"vmcnt({16})")
-        J.s_barrier()
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        for _ in range(vm_load_cnt_b):
+            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+            J.emit(vm_load, 1)                
+            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+            J.emit(vm_load, 1)                
+            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+            J.emit(vm_load, 1)                
+            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
 
+        # part 1:
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+        J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+        J.s_barrier()
+
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1],16)
+        vm_load = vm_load_a_idx(ldsA0[cur_lds], buff_a, koffset_a, 0, mfma_a1b0_k0)
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1],48)
         for n in range(nrN//2):
             J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
             ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
-        for n in range(nrN//2):
             J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-            ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1)   
-        J.emit(mfma_a1b0_k0)
-        J.emit(mfma_a1b0_k1)
-        
-        # part 2:
-        J.s_waitcnt(mod=f"vmcnt({12})")
-        J.s_barrier()
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
+            ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1) 
+        for _ in range(vm_load_cnt_a):
+            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+            J.emit(vm_load, 1)
+            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+            J.emit(vm_load, 1)
+            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+            J.emit(vm_load, 1)
+            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
 
+        # J.emit(mfma_a1b0_k0)
+        # J.emit(mfma_a1b0_k1)
+
+        # part 2:
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+        J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+        J.s_barrier()
+        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+        vm_load = vm_load_a_idx(ldsA1[cur_lds], buff_a, koffset_a, 1, mfma_a0b1_k0)
+        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 48)
         for n in range(nrN//2):
             J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
             ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
-        for n in range(nrN//2):
             J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-            ds_read_b(ldsB0[next_lds], mfma_B[0, 1, n], n, 1)        
-        J.emit(mfma_a0b1_k0)
-        J.emit(mfma_a0b1_k1)
-        # part 3:
-        J.s_waitcnt(mod=f"vmcnt({8})")
-        J.s_barrier()
+            ds_read_b(ldsB0[next_lds], mfma_B[0, 1, n], n, 1)
+        for _ in range(vm_load_cnt_a):
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+            J.emit(vm_load, 1)
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+            J.emit(vm_load, 1)
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+            J.emit(vm_load, 1)
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
 
+
+        # J.emit(mfma_a0b1_k0)
+        # J.emit(mfma_a0b1_k1)
+        # part 3:
+        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+        J.s_waitcnt(mod=f"vmcnt({20})")
+        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+        J.s_barrier()
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        vm_load = vm_load_b_idx(ldsB1[cur_lds], buff_b, koffset_b, 1, mfma_a1b1_k0)
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         for m in range(nrM//2):
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
             ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
-        for m in range(nrM//2):
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
             ds_read_a(ldsA0[next_lds], mfma_A[0, 1, m], m, 1)
-        J.emit(mfma_a1b1_k0)
-        J.emit(mfma_a1b1_k1)
-        
-        
-        ####################################epologue 1:
-        # part 0:
+        for _ in range(vm_load_cnt_b):
+            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+            J.emit(vm_load, 1)
+            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+            J.emit(vm_load, 1)
+            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+            J.emit(vm_load, 1)
+            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
 
-        mfma_a0b0_k0=mfma(0, 0, 0)
-        mfma_a0b1_k0=mfma(0, 1, 0)
-        mfma_a1b0_k0=mfma(1, 0, 0)
-        mfma_a1b1_k0=mfma(1, 1, 0)
-        mfma_a0b0_k1=mfma(0, 0, 1)
-        mfma_a0b1_k1=mfma(0, 1, 1)
-        mfma_a1b0_k1=mfma(1, 0, 1)
-        mfma_a1b1_k1=mfma(1, 1, 1)
+        # J.emit(mfma_a1b1_k0)
+        # J.emit(mfma_a1b1_k1)
+        # readiness: AC A1[cur] to LDS[cur%2],      readiness: B0 and A0[cur] into reg 
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        J.s_barrier()
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        koffset_a[0] += vm_offset_inc_a
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        koffset_b[0] += vm_offset_inc_b
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+    if 0:
+        for k_idx in range((K//wg_K) - 2):
+            loop_body(k_idx)
+    else:
+        koff = J.gpr("su32", 0)
+        loop_cnt = ((K//wg_K) - 2)//2
+        kidx = 0
+        with J.While(koff[0] < loop_cnt):
+            loop_body(0)
+            loop_body(1)
+            koff[0] += 1
+    ####################################epologue 0:
+
+    mfma_a0b0_k0=mfma(0, 0, 0)
+    mfma_a0b1_k0=mfma(0, 1, 0)
+    mfma_a1b0_k0=mfma(1, 0, 0)
+    mfma_a1b1_k0=mfma(1, 1, 0)
+    mfma_a0b0_k1=mfma(0, 0, 1)
+    mfma_a0b1_k1=mfma(0, 1, 1)
+    mfma_a1b0_k1=mfma(1, 0, 1)
+    mfma_a1b1_k1=mfma(1, 1, 1)
+
+    cur_lds = ((K//wg_K) - 2) % 2
+    next_lds = (cur_lds+1) % 2
+    #part 0
+    J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
+    J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+    J.s_barrier()
+
+    for m in range(nrM//2):
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+        ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
+    for m in range(nrM//2):
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+        ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
+    J.emit(mfma_a0b0_k0)
+    J.emit(mfma_a0b0_k1)
+    # part 1:
+    J.s_waitcnt(mod=f"vmcnt({16}) lgkmcnt(0)")
+    J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+    J.s_barrier()
+
+    for n in range(nrN//2):
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+        ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
+    for n in range(nrN//2):
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+        ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1)   
+    J.emit(mfma_a1b0_k0)
+    J.emit(mfma_a1b0_k1)
     
-        cur_lds = next_lds
-        J.s_waitcnt(mod=f"vmcnt({4})")
-        J.s_barrier()
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
+    # part 2:
+    J.s_waitcnt(mod=f"vmcnt({12}) lgkmcnt(0)")
+    J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+    J.s_barrier()
 
-        for m in range(nrM//2):
-            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-            ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
-        for m in range(nrM//2):
-            J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-            ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
-        J.emit(mfma_a0b0_k0)
-        J.emit(mfma_a0b0_k1)
-        # part 1:
-        J.s_waitcnt(mod=f"vmcnt({0})")
-        J.s_barrier()
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
+    for n in range(nrN//2):
+        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+        ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
+    for n in range(nrN//2):
+        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+        ds_read_b(ldsB0[next_lds], mfma_B[0, 1, n], n, 1)        
+    J.emit(mfma_a0b1_k0)
+    J.emit(mfma_a0b1_k1)
+    # part 3:
+    J.s_waitcnt(mod=f"vmcnt({8})")
+    J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+    J.s_barrier()
 
-        for n in range(nrN//2):
+    for m in range(nrM//2):
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
+    for m in range(nrM//2):
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        ds_read_a(ldsA0[next_lds], mfma_A[0, 1, m], m, 1)
+    J.emit(mfma_a1b1_k0)
+    J.emit(mfma_a1b1_k1)
+    
+    ####################################epologue 1:
+    # part 0:
+
+    mfma_a0b0_k0=mfma(0, 0, 0)
+    mfma_a0b1_k0=mfma(0, 1, 0)
+    mfma_a1b0_k0=mfma(1, 0, 0)
+    mfma_a1b1_k0=mfma(1, 1, 0)
+    mfma_a0b0_k1=mfma(0, 0, 1)
+    mfma_a0b1_k1=mfma(0, 1, 1)
+    mfma_a1b0_k1=mfma(1, 0, 1)
+    mfma_a1b1_k1=mfma(1, 1, 1)
+
+    cur_lds = next_lds
+    J.s_waitcnt(mod=f"vmcnt({4}) lgkmcnt(0)")
+    J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+    J.s_barrier()
+
+    for m in range(nrM//2):
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+        ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
+    for m in range(nrM//2):
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+        ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
+    J.emit(mfma_a0b0_k0)
+    J.emit(mfma_a0b0_k1)
+    # part 1:
+    J.s_waitcnt(mod=f"vmcnt({0}) lgkmcnt(0)")
+    J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+    J.s_barrier()
+    J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+
+    vdata = J.gpr(8, "vbf16x2")
+    vbf16 = J.gpr(4, "vbf16x2")
+    col = J.lane_id // 16
+    swap_12_col = (col & 1) * 2 + (col >> 1)
+    vaddr_org = J.gpr(((J.lane_id % 16) + warp_m//2 * 16)*stride_c + swap_12_col * J.sizeof_DW4 + warp_n//2 * 4 * J.sizeof_DW2 + \
+            blk_n * (wg_N * J.sizeof(C_dtype)))
+    vaddr = J.gpr("vu32", 0)
+    vaddr[0] = vaddr_org[0]
+
+    for n in range(nrN//2):
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+        ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
+    for n in range(nrN//2):
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+        ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1)
+    for m in range(nrM//2):
+        for n in range(0, nrN//2, 2):
             J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-            ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
-        for n in range(nrN//2):
+            J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[0,0, m , n, 0], mfma_C[0,0, m , n, 1])
+            J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[0,0, m , n,2], mfma_C[0,0, m , n, 3])
+            J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[0,0, m , n+1,0], mfma_C[0,0, m , n+1,1])
             J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-            ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1)
-        J.emit(mfma_a1b0_k0)
-        J.emit(mfma_a1b0_k1)
-        # part 2:
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
-        J.emit(mfma_a0b1_k0)
-        J.emit(mfma_a0b1_k1)
+            J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[0,0, m , n+1,2], mfma_C[0,0, m , n+1,3])
+            #    a0    a1   a2   a3   | 01 23
+            #    b0    b1   b2   b3   | 45 67 
+            #  v_permlane16_swap_b32(a, b)
+            #    a0    b0   a2   b2   |
+            #    a1    b1   a3   b3   |
+            #
+            # swap of row 1 & 2 are done by swapping lane-address
+            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+            buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
+        vaddr[0] += 16*stride_c
+    
+    J.emit(mfma_a1b0_k0)
+    J.emit(mfma_a1b0_k1)
+    # part 2:
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
+    J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+    vaddr[0] = vaddr_org[0] + stride_c *128
+    for m in range(nrM//2):
+        for n in range(0, nrN//2, 2):
+            J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[1, 0, m , n, 0], mfma_C[1, 0, m , n, 1])
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+            J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[1, 0, m , n,2], mfma_C[1, 0, m , n, 3])
+            J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[1, 0, m , n+1,0], mfma_C[1, 0, m , n+1,1])
+            J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[1, 0, m , n+1,2], mfma_C[1, 0, m , n+1,3])
+            #    a0    a1   a2   a3   | 01 23
+            #    b0    b1   b2   b3   | 45 67 
+            #  v_permlane16_swap_b32(a, b)S
+            #    a0    b0   a2   b2   |
+            #    a1    b1   a3   b3   |
+            #
+            # swap of row 1 & 2 are done by swapping lane-address
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+
+            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+            buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
+        vaddr[0] += 16*stride_c
+    J.emit(mfma_a0b1_k0)
+    J.emit(mfma_a0b1_k1)
+    # part 3:
+    vaddr[0] = vaddr_org[0] + 256
+    J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+    for m in range(nrM//2):
+        for n in range(0, nrN//2, 2):
+            J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[0,1, m , n, 0], mfma_C[0,1, m , n, 1])
+            J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[0,1, m , n,2], mfma_C[0,1, m , n, 3])
+            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+            J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[0,1, m , n+1,0], mfma_C[0,1, m , n+1,1])
+            J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[0,1, m , n+1,2], mfma_C[0,1, m , n+1,3])
+            #    a0    a1   a2   a3   | 01 23
+            #    b0    b1   b2   b3   | 45 67 
+            #  v_permlane16_swap_b32(a, b)S
+            #    a0    b0   a2   b2   |
+            #    a1    b1   a3   b3   |
+            #
+            # swap of row 1 & 2 are done by swapping lane-address
+            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+            buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
+        vaddr[0] += 16*stride_c
         
-        # part 3:
-        J.emit(mfma_a1b1_k0)
-        J.emit(mfma_a1b1_k1)
+    J.emit(mfma_a1b1_k0)
+    J.emit(mfma_a1b1_k1)
 
     for lds in ldsA0: J.free_lds(lds) 
     for lds in ldsB0: J.free_lds(lds)
     for lds in ldsA1: J.free_lds(lds) 
     for lds in ldsB1: J.free_lds(lds)
-    
-    vbf16 = J.gpr(2, "vbf16x2")
-    col = J.lane_id // 16
-    vaddr_org = J.gpr(((J.lane_id % 16) + warpid_m * 16 * nrM//2)*stride_c + col * J.sizeof_DW2 + warpid_n * 4 * J.sizeof_DW2 * nrN//2 + \
-            blk_n * (wg_N * J.sizeof(C_dtype)))
-    vaddr = J.gpr("vu32", 0)
-    
-    vaddr[0] = vaddr_org[0]
-    for m in range(nrM//2):
-        for n in range(0, nrN//2):
-            J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[0,0, m , n, 0], mfma_C[0,0, m , n, 1])
-            J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[0,0, m , n, 2], mfma_C[0,0, m , n, 3])
-            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
-        vaddr[0] += 16*stride_c
-        
-    vaddr[0] = vaddr_org[0] + 256
-    for m in range(nrM//2):
-        for n in range(0, nrN//2):
-            J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[0,1, m , n, 0], mfma_C[0,1, m , n, 1])
-            J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[0,1, m , n,2], mfma_C[0,1, m , n, 3])
-            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
-        vaddr[0] += 16*stride_c
-        
-    vaddr[0] = vaddr_org[0] + stride_c *128
-    for m in range(nrM//2):
-        for n in range(0, nrN//2):
-            J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[1, 0, m , n, 0], mfma_C[1, 0, m , n, 1])
-            J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[1, 0, m , n,2], mfma_C[1, 0, m , n, 3])
-            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
-        vaddr[0] += 16*stride_c
-        
             
     vaddr[0] = vaddr_org[0] + stride_c *128 + 256
     for m in range(nrM//2):
-        for n in range(0, nrN//2):
+        for n in range(0, nrN//2, 2):
             J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[1,1, m , n, 0], mfma_C[1,1, m , n, 1])
             J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[1,1, m , n,2], mfma_C[1,1, m , n, 3])
-            buff_c.store_dwordx2(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
+            J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[1,1, m , n+1,0], mfma_C[1,1, m , n+1,1])
+            J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[1,1, m , n+1,2], mfma_C[1,1, m , n+1,3])
+            #    a0    a1   a2   a3   | 01 23
+            #    b0    b1   b2   b3   | 45 67 
+            #  v_permlane16_swap_b32(a, b)S
+            #    a0    b0   a2   b2   |
+            #    a1    b1   a3   b3   |
+            #
+            # swap of row 1 & 2 are done by swapping lane-address 
+            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+            buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n*4*J.sizeof_DW2)
         vaddr[0] += 16*stride_c
