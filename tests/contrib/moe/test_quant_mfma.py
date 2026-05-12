@@ -15,17 +15,6 @@ def quant_mfma_output(J,
     warp_m = J.gpr(J.warp_id[0] // WARPS_COL) # warp row: 0 to 1
     warp_n = J.gpr(J.warp_id[0] % WARPS_COL)  # warp col: 0 to 3
 
-    lds = J.LDSTensor([2,2,16], base=1000)
-
-    print(f"{lds[0,0]=}")
-    print(f"{lds[0]=}")
-    print(f"{lds[0,1]=}")
-    print(f"{lds[1,0]=}")
-    print(f"{lds[1]=}")
-    print(f"{lds[1,1]=}")
-    print(f"{lds[0,2]=}")
-    assert 0
-
     wg_M = 256
     wg_N = 256
     nbN = J.div(wg_N, 16)
@@ -266,37 +255,27 @@ def quant_mfma_output(J,
                 J.s_nop(1)
                 #J.global_store_dwordx2(vmem_offset, vs8x4, output, mod=f"offset:{cn*128*J.sizeof_s8}")
 
+if __name__ == "__main__":
+    pyhip.set_device()
+
+    input = torch.randn([256, 256], dtype=torch.float32)
+    input[...] = 0
+    #input[...] = -2
+    for r in range(256):
+        input[r,0] = 2
+        input[r,1] = -2
+
+    output = torch.ones([256, 256], dtype=torch.int8)
+    o_scale = torch.ones([256], dtype=torch.float32)
+
+    method = 2
+    quant_mfma_output([1],[8*64], 100+method, input, output, o_scale)
+
+    print(input)
+    for r in range(256):
+        print(r, output[r,:16].tolist())
+    print(o_scale)
 
 
-
-
-
-
-
-
-
-
-
-pyhip.set_device()
-
-input = torch.randn([256, 256], dtype=torch.float32)
-input[...] = 0
-#input[...] = -2
-for r in range(256):
-    input[r,0] = 2
-    input[r,1] = -2
-
-output = torch.ones([256, 256], dtype=torch.int8)
-o_scale = torch.ones([256], dtype=torch.float32)
-
-method = 2
-quant_mfma_output([1],[8*64], 100+method, input, output, o_scale)
-
-print(input)
-for r in range(256):
-    print(r, output[r,:16].tolist())
-print(o_scale)
-
-
-pyhip.run_perftest(quant_mfma_output, [1896*16],[8*64], method, input, output, o_scale, num_verbose=1)
-#pyhip.run_perftest(quant_mfma_output, [256],[8*64], method, input, output, o_scale, num_verbose=1)
+    pyhip.run_perftest(quant_mfma_output, [1896*16],[8*64], method, input, output, o_scale, num_verbose=1)
+    #pyhip.run_perftest(quant_mfma_output, [256],[8*64], method, input, output, o_scale, num_verbose=1)
