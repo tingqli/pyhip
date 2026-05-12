@@ -1,7 +1,7 @@
 import pyhip
 import torch
 import aiter
-
+import pytest
 from pyhip.contrib.moe_sorting import moe_sorting
 
 def div_up(x, y):
@@ -51,7 +51,7 @@ def moe_sorting_ref(topk_ids,       # [num_tokens, topk]
 
 
 
-def test_sorting(num_experts, topk, num_tokens, block_size):
+def run_moe_sorting(num_experts, topk, num_tokens, block_size):
     """
     def moe_sorting(J,num_experts,       # number of global experts
                  num_workgroups,    # number of work-groups
@@ -68,6 +68,9 @@ def test_sorting(num_experts, topk, num_tokens, block_size):
                  num_valid_ids:"int*"
                  ):
     """
+    arch = torch.cuda.get_device_properties().gcnArchName
+    if "gfx942" in arch:
+        pytest.skip(f"Skipping moe_sorting on gfx942, since the num_workgroups (CU count) is not a power of 2")
     torch.set_default_device("cuda")
     torch.manual_seed(0)
 
@@ -135,4 +138,5 @@ def test_sorting(num_experts, topk, num_tokens, block_size):
         print(f"{i} : {tmp_table[i+1].item()}")
     print(f"sync-flag : {tmp_table[0].item()}")    
 
-test_sorting(8, 8, 512, 256)
+if __name__ == "__main__":
+    run_moe_sorting(8, 8, 512, 256)
