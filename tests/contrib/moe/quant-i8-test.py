@@ -322,4 +322,5 @@ def test_reduce():
         with pyhip.cudaPerf(0, mem_size, name=f"reduce") as p:
             hip.reduce_i8([num_tokens], [256], x_packed.data_ptr(), scale_packed.data_ptr(), out.data_ptr(), num_tokens)
 
-test_reduce()
+if __name__ == "__main__":
+    test_reduce()
