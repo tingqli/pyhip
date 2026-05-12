@@ -15,6 +15,7 @@ __all__ = [
     "moe_2stage_splitk",
     "moe_2stage_gateup",
     "moe_2stage_down",
+    "moe_2stage_down_ref",
     "moe_1stage_splitk",
     "moe_2stage_down_loopn",
 ]
@@ -1429,6 +1430,69 @@ def moe_2stage_gateup(J:JIT,
                 J.global_store_dwordx4(voffset, vdata, p_output)
 
 
+
+def de_shuffle_weight(weight_, mfma_MN = 16):
+    org_dtype = weight_.dtype
+    if org_dtype == torch.float4_e2m1fn_x2:
+        weight_ = weight_.view(torch.int8)
+
+    K = weight_.shape[-1]
+    M = weight_.numel() // K
+
+    weight = weight_.view(M, K)
+    K_bytes = K * weight.itemsize
+    sizeof_DW4 = 16
+    mfma_K_lanes = 64 // mfma_MN
+    mfma_K_L = sizeof_DW4//weight.itemsize
+    mfma_K = mfma_K_lanes * mfma_K_L 
+
+    assert M % mfma_MN == 0
+    mfma_K_bytes = mfma_K_lanes * sizeof_DW4
+    assert K_bytes % mfma_K_bytes == 0
+    #x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L)
+    #x = x.permute(0,2,3,1,4)
+
+    assert K % mfma_K == 0
+    weight = weight.reshape(M//mfma_MN, K//mfma_K, mfma_K_lanes, mfma_MN, mfma_K_L)
+    weight = weight.permute(0,3,1,2,4)
+    weight = weight.reshape(M, K).contiguous().view(weight_.shape)
+    return weight.view(org_dtype)
+
+def moe_2stage_down_ref(gemm1_out_q, gemm1_out_scale,
+                        w2, w2_scale,
+                        cur_out,
+                        TILE_M, 
+                        sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids):
+    w2_deshuffle = de_shuffle_weight(w2)
+    B, TOPK, _ = gemm1_out_q.shape
+    gemm1_out_scale = gemm1_out_scale.view(B, TOPK)
+    max_id = num_valid_ids[0]
+    for e_idx in range(sorted_expert_ids.shape[0]):
+        if e_idx * TILE_M >= max_id:
+            break
+        i0 = e_idx*TILE_M
+        i1 = i0 + TILE_M
+        s_e_id = sorted_expert_ids[e_idx]
+
+        ids = sorted_ids[i0:i1].clone()
+        tok_ids = ids & 0xFFFFFF
+        tok_topk = ids >> 24
+        valid_mask = tok_topk < torch.tensor(TOPK)
+
+        scales_pt = gemm1_out_scale[tok_ids[valid_mask], tok_topk[valid_mask]].flatten()
+        scales_pc = w2_scale[s_e_id].flatten()
+
+        src = gemm1_out_q[tok_ids[valid_mask], tok_topk[valid_mask], ...]
+
+        src = src.to(torch.float)
+        wei = w2_deshuffle[s_e_id, ...].to(torch.float)
+
+        act = src.to(torch.float) @ wei.t().to(torch.float)
+
+        act *= scales_pt[:, None] * scales_pc[None, :]
+
+        cur_out[tok_ids[valid_mask], ...] += act * sorted_weights[i0:i1][valid_mask, None]
+
 @jit()
 def moe_2stage_down(J:JIT,
                     weight_dtype,
@@ -1443,10 +1507,17 @@ def moe_2stage_down(J:JIT,
                     p_sorted_weights:"float*",   # [69624]
                     p_sorted_expert_ids:"void*", # [2176]
                     p_num_valid_ids:"void*",     # [2]  value: [65536,  8192]
-                    p_w_scale:"float*",
+                    pt_scale: "float*",
+                    pc_scale:"float*",
                     M:"int",):
     sizeof_w = J.sizeof(weight_dtype)
     dtype_A = "bf16"
+    is_fp8_ptpc = str(weight_dtype).startswith("torch.float8_e4m3")
+    assert is_fp8_ptpc or str(weight_dtype) == "torch.bfloat16", str(weight_dtype)
+    if is_fp8_ptpc:
+        fp8_ptpc = {}
+    else:
+        fp8_ptpc = None
 
     e_idx = J.blockIdx.y
     s_e_id = J.gpr(1, 'su32')
@@ -1462,6 +1533,7 @@ def moe_2stage_down(J:JIT,
     p_sorted_ids[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
     p_sorted_weights[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
     p_weight[:] += s_e_id * (N * K * sizeof_w)
+    pc_scale[:] += s_e_id * (N * J.sizeof_DW) # per-channel scales for weights
 
     mfma_MN = 16
     mfma_K = (64//mfma_MN) * (J.sizeof_DW4//J.sizeof(dtype_A))
@@ -1482,6 +1554,15 @@ def moe_2stage_down(J:JIT,
     vaddr = J.gpr(num_mfma_m, "vu32")
     for m in range(num_mfma_m):
         vaddr[m] = (v_sorted_id[m] & 0xFFFFFF) * (TOPK * K * sizeof_w) + (v_sorted_id[m]>>24) *(K * sizeof_w) + col * J.sizeof_DW4
+
+    if is_fp8_ptpc:
+        buff_sa = J.Buffer(pt_scale, M * TOPK * J.sizeof("fp32"))
+        v_pt_scales = J.gpr(num_mfma_m, 'vf32')
+        for m in range(num_mfma_m):
+            voffset_sa = J.gpr("vu32", (v_sorted_id[m] & 0xFFFFFF) * (TOPK * J.sizeof_DW) + (v_sorted_id[m]>>24) * J.sizeof_DW)
+            buff_sa.load_dword(v_pt_scales[m], voffset_sa, 0)
+        fp8_ptpc["v_pt_scales"] = v_pt_scales
+        fp8_ptpc["pc_scale"] = pc_scale
 
     buff_a = J.Buffer(p_input, M * TOPK * K * J.sizeof(dtype_A))
     for m in range(num_mfma_m):
@@ -1508,10 +1589,10 @@ def moe_2stage_down(J:JIT,
     J.s_barrier()
 
     num_mfma_n = 1 if BLOCK_TILE_SIZE_M > 64 else 2
-    
+
     down_kernel(J, mfma_MN, num_mfma_n, BLOCK_TILE_SIZE_M, N, K,
                 A, lds_token_ids, lds_weights,
-                p_weight, p_output, M)
+                p_weight, p_output, M, fp8_ptpc)
 
 def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 A, # A = J.gpr(num_mfma_m, num_mfma_k, 4, "abf16x2")
@@ -1519,33 +1600,49 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 lds_weights,    # 256 fp32 weights 
                 pB:"void*",
                 pC:"void*",
-                M):
+                M,
+                fp8_ptpc):
+
+    sizeof_w = J.sizeof_bf16 if fp8_ptpc is None else J.sizeof("fp8")
     # given DW4 lane size, how many bf16 items along K direction
-    mfma_K = (64//mfma_MN) * (J.sizeof_DW4//J.sizeof_bf16) # mfma_K = 32
+    mfma_K = (64//mfma_MN) * (J.sizeof_DW4//sizeof_w) # each DW4 vgpr holds a mfma_K=32(bf16) or 64(fp8)
 
     # load A [BM x K] bf16 into AccGPRs 
     num_mfma_m = J.div(BM, mfma_MN)
     num_mfma_k = J.div(K, mfma_K)  # K=96, num_mfma_k=3
 
     # 4 warps work in parallel along N dimension
-    buff_b = J.Buffer(pB, N * K * J.sizeof_bf16)
+    buff_b = J.Buffer(pB, N * K * sizeof_w)
     # ping-pong buffer
-    B = J.gpr(2, num_mfma_n, num_mfma_k, 4, "vbf16x2")
+    B = J.gpr(2, num_mfma_n, num_mfma_k, 4, "vbf16x2") # 4 x (8,bf16) or (16,fp8)
     C = J.gpr(2, num_mfma_m, num_mfma_n, 4, "vf32")
 
     # prelog0, load Bn0
     # prelog1, load Bn1, compute Cn0
     # loop:    load Bn2, compute Cn1, store Cn0 to LDS & load Cn0 & store to HBM
-    voff_b = J.gpr(J.lane_id * J.sizeof_DW4 + J.gpr(J.warp_id * (mfma_MN * K * J.sizeof_bf16)))
+    voff_b = J.gpr(J.lane_id * J.sizeof_DW4 + J.gpr(J.warp_id * (mfma_MN * K * sizeof_w)))
     soff_b = J.gpr("su32")
     soff_b[0] = 0
+
+    if fp8_ptpc is not None:
+        vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4)
+        scales_pc = J.gpr(2, num_mfma_n, 4, "vf32")
+
     def loadB_generator(index):
         for n in range(num_mfma_n):
             for k in range(num_mfma_k):
                 yield 1
                 buff_b.load_dwordx4(B[index,n,k], voff_b, soff_b)
-                soff_b[0] = soff_b[0] + mfma_MN * mfma_K * J.sizeof_bf16
-            soff_b[0] = soff_b[0] + (3*num_mfma_k * mfma_MN * mfma_K * J.sizeof_bf16)
+                soff_b[0] = soff_b[0] + mfma_MN * mfma_K * sizeof_w
+            soff_b[0] = soff_b[0] + (3*num_mfma_k * mfma_MN * mfma_K * sizeof_w)
+        if fp8_ptpc is not None:
+            # load scales_pc for next block, each MFMA 16x16 block-B needs 16 scales
+            # fp8_ptpc["v_pt_scales"] = v_pt_scales
+            # fp8_ptpc["pc_scale"] = pc_scale
+            for n in range(num_mfma_n):
+                yield 1
+                J.global_load_dwordx4(scales_pc[index, n], vaddr_pc_scale, fp8_ptpc["pc_scale"], mod=f"offset:{n*16*J.sizeof_DW}")
+            vaddr_pc_scale[0] += num_mfma_n * 16 * J.sizeof_DW
 
     def mfma_generator(index):
         for k in range(num_mfma_k):
@@ -1553,12 +1650,32 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 for n in range(num_mfma_n):
                     Ci = 0 if k == 0 else C[index,m,n]
                     yield 16
-                    J.v_mfma_f32_16x16x16_bf16(C[index,m,n], B[index,n,k,0:1], A[m,k,0:1], Ci)
+                    if fp8_ptpc is not None:
+                        J.v_mfma_f32_16x16x32_fp8_fp8(C[index,m,n], B[index,n,k,0:1], A[m,k,0:1], Ci)
+                    else:
+                        J.v_mfma_f32_16x16x16_bf16(C[index,m,n], B[index,n,k,0:1], A[m,k,0:1], Ci)
         for k in range(num_mfma_k):
             for m in range(num_mfma_m):
                 for n in range(num_mfma_n):
                     yield 16
-                    J.v_mfma_f32_16x16x16_bf16(C[index,m,n], B[index,n,k,2:3], A[m,k,2:3], C[index,m,n])
+                    if fp8_ptpc is not None:
+                        J.v_mfma_f32_16x16x32_fp8_fp8(C[index,m,n], B[index,n,k,2:3], A[m,k,2:3], C[index,m,n])
+                    else:
+                        J.v_mfma_f32_16x16x16_bf16(C[index,m,n], B[index,n,k,2:3], A[m,k,2:3], C[index,m,n])
+        if fp8_ptpc is not None:
+            # dequantize C here since all computations over K have finished
+            # scales_pt are resident, scales_pc are 
+            for m in range(num_mfma_m):
+                for n in range(num_mfma_n):
+                    yield 16
+                    C[index,m,n,0] *= fp8_ptpc["v_pt_scales"][m]
+                    C[index,m,n,1] *= fp8_ptpc["v_pt_scales"][m]
+                    C[index,m,n,2] *= fp8_ptpc["v_pt_scales"][m]
+                    C[index,m,n,3] *= fp8_ptpc["v_pt_scales"][m]
+                    C[index,m,n,0] *= scales_pc[index, n, 0]
+                    C[index,m,n,1] *= scales_pc[index, n, 1]
+                    C[index,m,n,2] *= scales_pc[index, n, 2]
+                    C[index,m,n,3] *= scales_pc[index, n, 3]
 
     # prelog0, load Bn0
     J.emit(loadB_generator(0))

@@ -486,8 +486,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
                 moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
-                               w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                               gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+                            w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                            gemm1_out, w2, cur_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, None, w2_scale, B)
             elif fp8_ptpc:
                 BLOCK_TILE_SIZE_M = TILE_M
                 BLOCK_TILE_SIZE_N = TILE_N
@@ -495,7 +495,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 if 1:
                     moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
                                    w1_ref.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                   hidden_states.data_ptr(), shuffle_weight(w1_ref, layout=(16, 16)).data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
+                                   hidden_states, shuffle_weight(w1_ref, layout=(16, 16)), 
+                                   gemm1_out, 
+                                   sorted_ids, 
+                                   sorted_expert_ids, 
+                                   num_valid_ids, 
+                                   w1_scale, B)
                 else:
                     hidden_states_q, hidden_states_scale = quant_func(
                         hidden_states,
@@ -504,18 +509,31 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         num_rows=None,
                     )
                     assert 0, 'add fp8 up kernel'
-                if 1:
-                    moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
-                                   w1_ref.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                   gemm1_out.data_ptr(), shuffle_weight(w2_ref, layout=(16, 16)).data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+                # down
+                gemm1_out_q, gemm1_out_scale = quant_func(
+                    gemm1_out.view(B * TOPK, -1),
+                    scale=None,
+                    quant_dtype=w2.dtype,
+                    num_rows=None,
+                )
+                if 0:
+                    moe_2stage_down_ref(gemm1_out_q.view(B, TOPK, -1), gemm1_out_scale,
+                                        w2, w2_scale,
+                                        cur_out,
+                                        TILE_M, 
+                                        sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids)
                 else:
-                    gemm1_out_q, gemm1_out_scale = quant_func(
-                        gemm1_out.view(B * TOPK, -1),
-                        scale=None,
-                        quant_dtype=torch.weight_type,
-                        num_rows=None,
-                    )
-                    assert 0, 'add fp8 down kernel'
+                    moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
+                                w2.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                gemm1_out_q, w2, 
+                                cur_out,
+                                sorted_ids,
+                                sorted_weights,
+                                sorted_expert_ids,
+                                num_valid_ids,
+                                gemm1_out_scale,
+                                w2_scale,
+                                B)
 
         else:
             assert 0, f'not support kernel type "{kernel_type}"'
@@ -647,6 +665,7 @@ def init_env():
     torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
     torch.set_default_device('cuda')
     torch.manual_seed(0)
+    #pyhip.set_device()
 
 def test_acc(TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
     init_env()
