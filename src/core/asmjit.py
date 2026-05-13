@@ -592,6 +592,7 @@ class BasicBlock:
         if instr.is_branch:
             # one possible successor
             self.jit._finish_bb(self)
+            self.jit.current_bb = BasicBlock(self.jit, "")
             target_lable_str = instr.mod
             self.add_successor(target_lable_str)
         elif instr.is_cbranch:
@@ -1182,10 +1183,12 @@ class JIT:
     '''
     # scalar jump (wave level, no divergent)
     '''
-    def Jump(self, label:str, cond:GPRExpr = None, reverse = False):
+    def Jump(self, label:str, cond:Union[GPRExpr, bool] = None, reverse = False):
         if cond is None:
             self.s_branch(mod=label)
-            # generate expression into scc
+        elif isinstance(cond, bool):
+            if (cond and (not reverse)) or ((not cond) and reverse):
+                self.s_branch(mod=label)
         else:
             dtype = cond.find_dtype()
             dst_gprs = self.new_gpr("s", 1, dtype=dtype, align=1, name="Jump_cond")

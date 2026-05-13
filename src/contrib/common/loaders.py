@@ -285,7 +285,7 @@ def get_mfma_loader_sorted_tok(J, num_warps, M, K, vm_stride, warp_row0, lds_sor
         J.ds_read_b32(sorted_ids, ds_vaddr)
         vmem_addr_dpp = J.gpr(2, "vu32", input[0], input[1])
         J.s_waitcnt(mod=f"lgkmcnt(0)")
-        tokid = J.gpr("su32")
+        tokid = J.gpr("vu32")
         with J.If(TOPK > 0) as If:
             tokid[0] = (sorted_ids & 0xFFFFFF) * TOPK + (sorted_ids >> 24)
             If.Else()
