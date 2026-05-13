@@ -500,16 +500,23 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         quant_dtype=weight_type,
                         num_rows=None,
                     )
-                with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP * 2, HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size * 2, name=f"up") as p:
-                    moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
-                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                hidden_states_q, w1, 
-                                gemm1_out, 
-                                sorted_ids, 
-                                sorted_expert_ids, 
-                                num_valid_ids, 
-                                hidden_states_scale,
-                                w1_scale, B)
+                if 0:
+                    moe_2stage_gateup_ref(hidden_states_q, hidden_states_scale,
+                                        w1, w1_scale,
+                                        gemm1_out,
+                                        TILE_M, 
+                                        sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids, TOPK)
+                else:
+                    with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP * 2, HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size * 2, name=f"up") as p:
+                        moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
+                                    w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                    hidden_states_q, w1, 
+                                    gemm1_out, 
+                                    sorted_ids, 
+                                    sorted_expert_ids, 
+                                    num_valid_ids, 
+                                    hidden_states_scale,
+                                    w1_scale, B)
                 # down
                 with cudaPerf(0, 0, name=f"quant_down") as p:
                     gemm1_out_q, gemm1_out_scale = quant_func(

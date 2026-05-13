@@ -14,6 +14,7 @@ __all__ = [
     "moe_gemm_batch",
     "moe_2stage_splitk",
     "moe_2stage_gateup",
+    "moe_2stage_gateup_ref",
     "moe_2stage_down",
     "moe_2stage_down_ref",
     "moe_1stage_splitk",
@@ -1489,6 +1490,41 @@ def de_shuffle_weight(weight_, mfma_MN = 16):
     weight = weight.permute(0,3,1,2,4)
     weight = weight.reshape(M, K).contiguous().view(weight_.shape)
     return weight.view(org_dtype)
+
+def moe_2stage_gateup_ref(gemm1_in_q, gemm1_in_scale,
+                        w1, w1_scale,
+                        cur_out,
+                        TILE_M, 
+                        sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids, TOPK):
+    w2_deshuffle = de_shuffle_weight(w1)
+    max_id = num_valid_ids[0]
+    for e_idx in range(sorted_expert_ids.shape[0]):
+        if e_idx * TILE_M >= max_id:
+            break
+        i0 = e_idx*TILE_M
+        i1 = i0 + TILE_M
+        s_e_id = sorted_expert_ids[e_idx]
+
+        ids = sorted_ids[i0:i1].clone()
+        tok_ids = ids & 0xFFFFFF
+        tok_topk = ids >> 24
+        valid_mask = tok_topk < torch.tensor(TOPK)
+
+        scales_pt = gemm1_in_scale[tok_ids[valid_mask]]
+        scales_pc = w1_scale[s_e_id]
+
+        src = gemm1_in_q[tok_ids[valid_mask], ...]
+
+        src = src.to(torch.float)
+        wei = w2_deshuffle[s_e_id, ...].to(torch.float)
+
+        act = src.to(torch.float) @ wei.t().to(torch.float)
+
+        act *= (scales_pt[:, None] * scales_pc[None, :]).squeeze(dim=-1)
+        gate, up = act.chunk(2, dim=-1)
+        act = torch.nn.functional.silu(gate) * up
+
+        cur_out[tok_ids[valid_mask], tok_topk[valid_mask], ...] = act.to(cur_out.dtype)
 
 def moe_2stage_down_ref(gemm1_out_q, gemm1_out_scale,
                         w2, w2_scale,
