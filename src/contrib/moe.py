@@ -1634,7 +1634,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 pC:"void*",
                 M,
                 fp8_ptpc):
-
+    num_warps = 4
     sizeof_w = J.sizeof_bf16 if fp8_ptpc is None else J.sizeof("fp8")
     # given DW4 lane size, how many bf16 items along K direction
     mfma_K = (64//mfma_MN) * (J.sizeof_DW4//sizeof_w) # each DW4 vgpr holds a mfma_K=32(bf16) or 64(fp8)
@@ -1657,7 +1657,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     soff_b[0] = 0
 
     if fp8_ptpc is not None:
-        vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4)
+        vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4 + J.warp_id * (num_mfma_n * mfma_MN * J.sizeof_DW)) # point to the start of pc scales for this WG
         scales_pc = J.gpr(2, num_mfma_n, 4, "vf32")
 
     def loadB_generator(index):
@@ -1674,7 +1674,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
             for n in range(num_mfma_n):
                 yield 1
                 J.global_load_dwordx4(scales_pc[index, n], vaddr_pc_scale, fp8_ptpc["pc_scale"], mod=f"offset:{n*16*J.sizeof_DW}")
-            vaddr_pc_scale[0] += num_mfma_n * 16 * J.sizeof_DW
+            vaddr_pc_scale[0] += num_warps * num_mfma_n * mfma_MN * J.sizeof_DW
 
     def mfma_generator(index):
         for k in range(num_mfma_k):
