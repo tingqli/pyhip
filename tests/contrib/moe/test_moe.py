@@ -492,38 +492,32 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 BLOCK_TILE_SIZE_M = TILE_M
                 BLOCK_TILE_SIZE_N = TILE_N
                 quant_func = aiter.get_hip_quant(aiter.QuantType.per_Token)
-                if 0:
-                    moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
-                                   w1_ref.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                   hidden_states, shuffle_weight(w1_ref, layout=(16, 16)), 
-                                   gemm1_out, 
-                                   sorted_ids, 
-                                   sorted_expert_ids, 
-                                   num_valid_ids, 
-                                   w1_scale, B)
-                else:
+
+                with cudaPerf(0, 0, name=f"quant_up") as p:
                     hidden_states_q, hidden_states_scale = quant_func(
                         hidden_states,
                         scale=None,
                         quant_dtype=weight_type,
                         num_rows=None,
                     )
+                with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP * 2, HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size * 2, name=f"up") as p:
                     moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
-                                   w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                   hidden_states_q, w1, 
-                                   gemm1_out, 
-                                   sorted_ids, 
-                                   sorted_expert_ids, 
-                                   num_valid_ids, 
-                                   hidden_states_scale,
-                                   w1_scale, B)
+                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                hidden_states_q, w1, 
+                                gemm1_out, 
+                                sorted_ids, 
+                                sorted_expert_ids, 
+                                num_valid_ids, 
+                                hidden_states_scale,
+                                w1_scale, B)
                 # down
-                gemm1_out_q, gemm1_out_scale = quant_func(
-                    gemm1_out.view(B * TOPK, -1),
-                    scale=None,
-                    quant_dtype=w2.dtype,
-                    num_rows=None,
-                )
+                with cudaPerf(0, 0, name=f"quant_down") as p:
+                    gemm1_out_q, gemm1_out_scale = quant_func(
+                        gemm1_out.view(B * TOPK, -1),
+                        scale=None,
+                        quant_dtype=w2.dtype,
+                        num_rows=None,
+                    )
                 if 0:
                     moe_2stage_down_ref(gemm1_out_q.view(B, TOPK, -1), gemm1_out_scale,
                                         w2, w2_scale,
@@ -531,17 +525,18 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                         TILE_M, 
                                         sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids)
                 else:
-                    moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
-                                w2.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                gemm1_out_q, w2, 
-                                cur_out,
-                                sorted_ids,
-                                sorted_weights,
-                                sorted_expert_ids,
-                                num_valid_ids,
-                                gemm1_out_scale,
-                                w2_scale,
-                                B)
+                    with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP, HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size, name=f"down") as p:
+                        moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
+                                    w2.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                    gemm1_out_q, w2, 
+                                    cur_out,
+                                    sorted_ids,
+                                    sorted_weights,
+                                    sorted_expert_ids,
+                                    num_valid_ids,
+                                    gemm1_out_scale,
+                                    w2_scale,
+                                    B)
 
         else:
             assert 0, f'not support kernel type "{kernel_type}"'
@@ -610,7 +605,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     quantype = " @ PTPC"
                 else:
                     quantype = " @ blockwise"
-            print(f"{kernel_type}[{B=} {weight_type=}{quantype}] acc OK")
+            print(f"{kernel_type}[{B=} {weight_type=}{quantype}] acc OK err {diff=:.6f}")
     if run_count > 0:
         return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
                 'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
@@ -765,6 +760,7 @@ if __name__ == '__main__':
         # batch = [1, 2, 4, 8, 16, 32,64,128, 256]
         # test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
     else:
-        batch = [8192]
+        batch = [i * 8192 for i in range(1, 11)]
+        #batch = [i * 6554 for i in range(1, 11)]
         entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
         test_perf(batch, TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, test_sets=['aiter', 'mxn_2s'])
