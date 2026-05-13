@@ -1548,6 +1548,7 @@ def moe_2stage_down(J:JIT,
     assert is_fp8_ptpc or str(weight_dtype) == "torch.bfloat16", str(weight_dtype)
     if is_fp8_ptpc:
         fp8_ptpc = {}
+        dtype_A = "fp8"
     else:
         fp8_ptpc = None
 
@@ -1600,7 +1601,7 @@ def moe_2stage_down(J:JIT,
     for m in range(num_mfma_m):
         for k in range(num_mfma_k):
             buff_a.load_dwordx4(A[m,k], vaddr[m], 0, offset12=k*mfma_K*J.sizeof(dtype_A))
-    
+
     v_sorted_weights = J.gpr('vf32')
     assert BLOCK_TILE_SIZE_M <= 256
     with J.ExecMask(J.threadIdx.x < BLOCK_TILE_SIZE_M):
@@ -1620,8 +1621,32 @@ def moe_2stage_down(J:JIT,
     J.s_waitcnt(mod=f"lgkmcnt(0)")
     J.s_barrier()
 
-    num_mfma_n = 1 if BLOCK_TILE_SIZE_M > 64 else 2
+    # 0,1,2,3,4,5,6,7, num_mfma_m
+    if 0:
+        s_sorted_ids = J.gpr(num_mfma_m, 'su32')
+        for m in range(num_mfma_m):
+            J.v_readfirstlane_b32(s_sorted_ids[m], v_sorted_id[m])
+        J.s_nop(8)
+        if 0:
+            with J.If((s_sorted_ids[num_mfma_m//4]>>24) == TOPK):
+                VALIE_TILE_SIZE_M = (num_mfma_m//4)*mfma_MN
+                num_mfma_n = 1 if VALIE_TILE_SIZE_M > 64 else 2
+                num_mfma_n = 1
+                down_kernel(J, mfma_MN, num_mfma_n, VALIE_TILE_SIZE_M, N, K,
+                            A, lds_token_ids, lds_weights,
+                            p_weight, p_output, M, fp8_ptpc)
+                J.s_endpgm()
 
+        with J.If((s_sorted_ids[4]>>24) == TOPK):
+            VALIE_TILE_SIZE_M = 4*16
+            num_mfma_n = 1 if VALIE_TILE_SIZE_M > 64 else 2
+            num_mfma_n = 1
+            down_kernel(J, mfma_MN, num_mfma_n, VALIE_TILE_SIZE_M, N, K,
+                        A, lds_token_ids, lds_weights,
+                        p_weight, p_output, M, fp8_ptpc)
+            J.s_endpgm()
+
+    num_mfma_n = 1 if BLOCK_TILE_SIZE_M > 64 else 2
     down_kernel(J, mfma_MN, num_mfma_n, BLOCK_TILE_SIZE_M, N, K,
                 A, lds_token_ids, lds_weights,
                 p_weight, p_output, M, fp8_ptpc)
@@ -1660,6 +1685,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
         vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4 + J.warp_id * (num_mfma_n * mfma_MN * J.sizeof_DW)) # point to the start of pc scales for this WG
         scales_pc = J.gpr(2, num_mfma_n, 4, "vf32")
 
+    buff_sb = J.Buffer(fp8_ptpc["pc_scale"], N * J.sizeof_DW)
     def loadB_generator(index):
         for n in range(num_mfma_n):
             for k in range(num_mfma_k):
@@ -1673,7 +1699,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
             # fp8_ptpc["pc_scale"] = pc_scale
             for n in range(num_mfma_n):
                 yield 1
-                J.global_load_dwordx4(scales_pc[index, n], vaddr_pc_scale, fp8_ptpc["pc_scale"], mod=f"offset:{n*16*J.sizeof_DW}")
+                buff_sb.load_dwordx4(scales_pc[index, n], vaddr_pc_scale, 0, offset12=n*16*J.sizeof_DW)
             vaddr_pc_scale[0] += num_warps * num_mfma_n * mfma_MN * J.sizeof_DW
 
     def mfma_generator(index):
