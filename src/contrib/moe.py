@@ -1154,7 +1154,8 @@ def moe_2stage_gateup(J:JIT,
                       p_sorted_ids:"void*",
                       p_sorted_expert_ids:"void*",
                       p_num_valid_ids:"void*",
-                      p_w_scale:"float*",
+                      pt_scale: "float*",
+                      pc_scale:"float*",
                       M:"int",):
     class MFMA_DW4Loader:
         def __init__(self, J:JIT, ptr, buff_size, row_index,
@@ -1296,11 +1297,15 @@ def moe_2stage_gateup(J:JIT,
 
     BLOCK_TILE_SIZE_N_HALF = BLOCK_TILE_SIZE_N // 2
 
+    is_fp8_ptpc = str(weight_dtype).startswith("torch.float8_e4m3")
+    assert is_fp8_ptpc or str(weight_dtype) == "torch.bfloat16", str(weight_dtype)
+
     sizeof_bf16 = 2
     sizeof_f32 = 4
     sizeof_DWORDX4 = 16
+    sizeof_a = sizeof_bf16 if weight_dtype == torch.bfloat16 else 1
     sizeof_w = sizeof_bf16 if weight_dtype == torch.bfloat16 else 1
-    stride_A = K * sizeof_bf16
+    stride_A = K * sizeof_a
     stride_B = K * sizeof_w
     # 4(mfma columns) * 16(dwordx4) * 2(unroll 2 times)
     BLOCK_TILE_SIZE_K = 4 * 16 * 2 / sizeof_w
@@ -1347,10 +1352,14 @@ def moe_2stage_gateup(J:JIT,
     A_vert_write = BLOCK_TILE_SIZE_M // 2 // write_row_lanes_per_wave
     v_sorted_id_write = J.gpr(A_vert_write, 'vu32')
     v_sorted_id_write_off = J.gpr((J.lane_id // write_col_lanes_per_wave + J.warp_id // 2 * (A_vert_write * write_row_lanes_per_wave)) * 4)
-    J.global_load_dword(v_sorted_id_write[0], v_sorted_id_write_off, p_sorted_ids)
-    for n in range(1, A_vert_write):
-        p_sorted_ids[:] += write_row_lanes_per_wave * sizeof_f32
-        J.global_load_dword(v_sorted_id_write[n], v_sorted_id_write_off, p_sorted_ids)
+    for n in range(A_vert_write):
+        J.global_load_dword(v_sorted_id_write[n], v_sorted_id_write_off, p_sorted_ids, mod=f'offset:{n * write_row_lanes_per_wave * sizeof_f32}')
+
+    if is_fp8_ptpc:
+        v_sorted_id_scale = J.gpr(BLOCK_TILE_SIZE_M // 2 // 16, 'vu32')
+        v_sorted_id_scale_off = J.gpr((lane_mod_16 + J.warp_id // 2 * (BLOCK_TILE_SIZE_M // 2)) * 4)
+        for n in range(BLOCK_TILE_SIZE_M // 2 // 16):
+            J.global_load_dword(v_sorted_id_scale[n], v_sorted_id_scale_off, p_sorted_ids, mod=f'offset:{n * 16 * sizeof_f32}')
 
     p_output[:] = p_output[:] + BLOCK_TILE_SIZE_N_HALF * sizeof_bf16 * J.blockIdx.x
 
@@ -1362,17 +1371,35 @@ def moe_2stage_gateup(J:JIT,
 
     p_weight[:] = p_weight[:] + s_e_id * (N * K * sizeof_w)
 
-    gemm = UGEMM(J, 16, [BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2], [2, 2], K, N)
+    gemm = UGEMM(J, 16, [BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2], [2, 2], K, N, is_fp8_ptpc)
     swizzle_row_div = 1
     total_wave_cnt = 4
-    loaderA = MFMA_DW4Loader(J, p_input, M * (K * sizeof_bf16), v_token_id,
-                             gemm.wg_M, sizeof_bf16*gemm.wg_K, stride_A,
+    loaderA = MFMA_DW4Loader(J, p_input, M * (K * sizeof_a), v_token_id,
+                             gemm.wg_M, sizeof_a*gemm.wg_K, stride_A,
                              total_wave_cnt, swizzle_row_div, False)
-    loaderB = MFMA_DW4Loader_preshuffled(J, p_weight, N * K * sizeof_bf16, 16,
-                                         gemm.wg_N, sizeof_bf16*gemm.wg_K, stride_B,
+    loaderB = MFMA_DW4Loader_preshuffled(J, p_weight, N * K * sizeof_w, 16,
+                                         gemm.wg_N, sizeof_w*gemm.wg_K, stride_B,
                                          total_wave_cnt, swizzle_row_div, False, N)
+
     # C_reg: [wave_nCM, wave_nCN]
     C_reg = gemm.run(loaderA, loaderB, None, M, 0, 0)
+
+    if is_fp8_ptpc:
+        buff_sa = J.Buffer(pt_scale, M * J.sizeof("fp32"))
+        v_pt_scales = J.gpr(gemm.wave_nCM, 'vf32')
+        for m in range(gemm.wave_nCM):
+            voffset_sa = J.gpr("vu32", (v_sorted_id_scale[m] & 0xffffff) * J.sizeof_DW)
+            buff_sa.load_dword(v_pt_scales[m], voffset_sa, 0)
+        pc_scale[:] += s_e_id * (N * J.sizeof_DW) + BLOCK_TILE_SIZE_N_HALF * J.sizeof_DW * J.blockIdx.x  + J.warp_id % 2 * BLOCK_TILE_SIZE_N_HALF // 2 * J.sizeof_DW # per-channel scales for weights
+        vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4)
+        scales_pc = J.gpr(gemm.wave_nCN, 4, "vf32")
+        for n in range(0, gemm.wave_nCN, 2):
+            J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
+        vaddr_pc_scale += N // 2 * J.sizeof_DW
+        for n in range(1, gemm.wave_nCN, 2):
+            J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
+        # vaddr_pc_scale[0] += num_mfma_n * 16 * J.sizeof_DW
+        J.s_waitcnt(mod=f"vmcnt(0)")
 
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
@@ -1398,6 +1425,11 @@ def moe_2stage_gateup(J:JIT,
                 tmp = J.gpr(2, "vf32", align=2)
                 J.v_accvgpr_read_b32(tmp[0], C_reg[m, 2 * n + 0, i])
                 J.v_accvgpr_read_b32(tmp[1], C_reg[m, 2 * n + 1, i])
+                if is_fp8_ptpc:
+                    tmp[0] *= v_pt_scales[m]
+                    tmp[1] *= v_pt_scales[m]
+                    tmp[0] *= scales_pc[2 * n + 0, i]
+                    tmp[1] *= scales_pc[2 * n + 1, i]
                 tmp[0] = J.gpr(tmp[1] * J.silu(tmp[0]))
                 J.v_add_u32(vdata[i], tmp[0], s_cvt_bf16_bias)
             vouts = J.gpr(2, "vf32")

@@ -134,7 +134,8 @@ class UGEMM:
                  mfma_MN:int,
                  wave_size:list,
                  wave_cnt:list,
-                 K, N):
+                 K, N,
+                 is_fp8_ptpc):
         self.K = K
         self.N = N
         
@@ -144,7 +145,11 @@ class UGEMM:
         assert wave_size_M % mfma_MN == 0
         assert wave_size_N % mfma_MN == 0
         # *2 for 8-bf16/fp16 so DWORDx4 lane-size can be used
-        self.mfma_K = (2*8 if mfma_MN == 32 else 2*16)
+        if is_fp8_ptpc:
+            assert mfma_MN == 16, 'fp8 ptpc only support 16x16x16'
+            self.mfma_K = 2 * 32
+        else:
+            self.mfma_K = (2*8 if mfma_MN == 32 else 2*16)
 
         # number of C/D regs per wave
         wave_nCM = wave_size_M // mfma_MN
@@ -171,18 +176,25 @@ class UGEMM:
         self.wave_nCM = wave_nCM
         self.wave_nCN = wave_nCN
         self.wave_nCK = wave_nCK
+        self.is_fp8_ptpc = is_fp8_ptpc
+        if is_fp8_ptpc:
+            self.sizeof_a = 1
+            self.sizeof_b = 1
+        else:
+            self.sizeof_a = J.sizeof_bf16
+            self.sizeof_b = J.sizeof_bf16
 
     def run(self, loaderA, loaderB, buff_c, M, debug_warp, skip_load):
         J = self.J
 
-        LDSA_size = self.wg_M * self.wg_K * J.sizeof_bf16
-        LDSB_size = self.wg_N * self.wg_K * J.sizeof_bf16
+        LDSA_size = self.wg_M * self.wg_K * self.sizeof_a
+        LDSB_size = self.wg_N * self.wg_K * self.sizeof_b
         ldsA = J.alloc_lds(LDSA_size)
         ldsB = J.alloc_lds(LDSB_size)
 
         # prefetch in memory-coalescing way
         # each lane prefetch DWORDx4 which is 8xhalf
-        num_lanes_per_row = J.div(J.sizeof_bf16 * self.wg_K, J.sizeof_DW4)
+        num_lanes_per_row = J.div(self.sizeof_a * self.wg_K, J.sizeof_DW4)
         dw4_prefetch_MN = self.wave_cnt * J.div(64, num_lanes_per_row)
         assert dw4_prefetch_MN >= 1
         print(f"{self.wg_M=} {num_lanes_per_row=} {dw4_prefetch_MN=}")
@@ -204,20 +216,20 @@ class UGEMM:
         for m in range(self.wave_nCM):
             for k in range(self.wave_nCK):
                 row = J.lane_id % self.mfma_MN + warp_offset_m + m*self.mfma_MN
-                col = J.lane_id // self.mfma_MN + (k * self.mfma_K * J.sizeof_bf16) // J.sizeof_DW4
+                col = J.lane_id // self.mfma_MN + (k * self.mfma_K * self.sizeof_a) // J.sizeof_DW4
                 swizzle_col = swizzle(row, col) % (num_lanes_per_row)
-                ds_readA_vaddr[m, k] = J.gpr((row * (self.wg_K * J.sizeof_bf16)) + swizzle_col*(J.sizeof_DW4))
+                ds_readA_vaddr[m, k] = J.gpr((row * (self.wg_K * self.sizeof_a)) + swizzle_col*(J.sizeof_DW4))
 
         for n in range(self.wave_nCN):
             for k in range(self.wave_nCK):
                 row = J.lane_id % self.mfma_MN + warp_offset_n + n*self.mfma_MN
-                col = J.lane_id // self.mfma_MN + (k * self.mfma_K * J.sizeof_bf16) // J.sizeof_DW4
+                col = J.lane_id // self.mfma_MN + (k * self.mfma_K * self.sizeof_b) // J.sizeof_DW4
                 swizzle_col = swizzle(row, col) % (num_lanes_per_row)
-                ds_readB_vaddr[n, k] = J.gpr((row * (self.wg_K * J.sizeof_bf16)) + swizzle_col*(J.sizeof_DW4))
+                ds_readB_vaddr[n, k] = J.gpr((row * (self.wg_K * self.sizeof_b)) + swizzle_col*(J.sizeof_DW4))
 
         Creg_size = (self.mfma_MN * self.mfma_MN)//64
         mfma_C = self.J.gpr(self.wave_nCM, self.wave_nCN, Creg_size, f"af32")
-        ABReg_size = (self.mfma_MN * self.mfma_K * 2//4)//64
+        ABReg_size = (self.mfma_MN * self.mfma_K * self.sizeof_a//4)//64
         mfma_A = J.gpr(self.wave_nCM, self.wave_nCK, ABReg_size, "vbf16x2")
         mfma_B = J.gpr(self.wave_nCN, self.wave_nCK, ABReg_size, "vbf16x2")
 
@@ -256,7 +268,7 @@ class UGEMM:
         mfma_C[:] = 0 
 
         # prelog 1: ds_write + prefetch
-        k_offset[0] = 0 if skip_load else (k_offset[0] + self.wg_K * J.sizeof_bf16)
+        k_offset[0] = 0 if skip_load else (k_offset[0] + self.wg_K * self.sizeof_a)
         loaderA.reset_offset(k_offset)
         loaderB.reset_offset(k_offset)
 
@@ -297,6 +309,8 @@ class UGEMM:
             16:("v_mfma_f32_16x16x32_bf16",16) if is_cdna4 else ("v_mfma_f32_16x16x16_bf16",16),
             32:("v_mfma_f32_32x32x16_bf16",32) if is_cdna4 else ("v_mfma_f32_32x32x8_bf16",32)
         }
+        if self.is_fp8_ptpc:
+            mfma_info[16] = ("v_mfma_f32_16x16x32_fp8_fp8", 16)
         mfma_name = mfma_info[self.mfma_MN][0]
         mfma_cycles = mfma_info[self.mfma_MN][1]
 
@@ -331,7 +345,7 @@ class UGEMM:
         with J.While(cur_k[0] < k_loop_cnt):
             #for unroll in range(k_loop_cnt):
 
-            k_offset[0] = 0 if skip_load else (k_offset[0] + self.wg_K * J.sizeof_bf16)
+            k_offset[0] = 0 if skip_load else (k_offset[0] + self.wg_K * self.sizeof_a)
             loaderA.reset_offset(k_offset)
             loaderB.reset_offset(k_offset)
 
