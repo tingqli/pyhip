@@ -1652,16 +1652,18 @@ def moe_2stage_down(J:JIT,
         J.ds_write_b32(J.threadIdx.x * 4, v_sorted_weights, mod=f"offset:{lds_weights}")
     with J.ExecMask(J.threadIdx.x < 16):
         for m in range(num_mfma_m):
-            J.ds_write_b32(J.lane_id * 4, v_sorted_id[m] & 0xffffff, mod=f"offset:{lds_token_ids + m*16*4}")
+            J.ds_write_b32(J.lane_id * 4, (v_sorted_id[m] & 0xffffff) * TOPK + (v_sorted_id[m]>>24), mod=f"offset:{lds_token_ids + m*16*4}")
 
     J.s_waitcnt(mod=f"lgkmcnt(0)")
     J.s_barrier()
+
+    M[0] *= TOPK
 
     J.get_sgpr_const(0x8000)
     J.get_sgpr_const(0x3020706)
     # 0,1,2,3,4,5,6,7, num_mfma_m
     if 1:
-        VALID_TILE_SIZES = [s for s in [32, 64] if s < BLOCK_TILE_SIZE_M]
+        VALID_TILE_SIZES = [s for s in [64] if s < BLOCK_TILE_SIZE_M]
         s_sorted_ids = J.gpr(len(VALID_TILE_SIZES), 'su32')
         for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
             J.v_readfirstlane_b32(s_sorted_ids[i], v_sorted_id[TILE_SIZE//mfma_MN])
@@ -1777,7 +1779,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     # loop:    load Bn2, compute Cn1, store Cn0 to LDS & load Cn0 & store to HBM
     s_cvt_bf16_bias = J.get_sgpr_const(0x00008000)
 
-    vmem_lane_size = J.sizeof_DW
+    vmem_lane_size = J.sizeof_DW4
 
     lds_padding = (4 if vmem_lane_size == J.sizeof_DW else 8) * J.sizeof_bf16 # to avoid bank-conflict
     lds_width = num_mfma_n * 4 * mfma_MN * J.sizeof_bf16
@@ -1798,7 +1800,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     voff_c_lds_r = J.gpr(row * lds_stride + col * (vmem_lane_size))
     vmem_stride = N * J.sizeof_bf16
     v_weights = J.gpr(num_mfma_m, 2, "vf32") # pkmul
-    voff_vmem = J.gpr(num_loads, "vu32")
+    voff_vmem = J.gpr(num_loads, 2, "vu32")
     for m in range(num_mfma_m):
         J.ds_read_b32(v_weights[m,0], (m*mfma_MN + (J.lane_id % mfma_MN))*4, mod=f"offset:{lds_weights}")
 
@@ -1813,10 +1815,16 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     for m in range(num_mfma_m):
         v_weights[m,1] = v_weights[m,0]
 
+    saddr_dummy = J.gpr(2, "su32", 0)
+    voff_vmem_base = J.gpr(2, "vu32", pC[0], pC[1])
+    J.v_lshl_add_u64(voff_vmem_base, J.gpr(2, "vu32", col * (vmem_lane_size), 0), 0, voff_vmem_base)
     for i in range(num_loads):
-        voff_vmem[i] = voff_vmem_row[i] * vmem_stride + col * (vmem_lane_size)
+        #voff_vmem[i] = voff_vmem_row[i] * vmem_stride + col * (vmem_lane_size)
+        J.v_mad_u64_u32(voff_vmem[i], saddr_dummy, voff_vmem_row[i], J.gpr("su32", vmem_stride), voff_vmem_base)
 
     temp_c = J.gpr(num_loads, vmem_lane_size//J.sizeof_DW, "vbf16x2")
+
+    voff_vmem_step = J.gpr(2, "vu32", 4 * num_mfma_n * mfma_MN * J.sizeof_bf16, 0)
 
     def loop_body(ni):
         J.s_waitcnt(mod=f"vmcnt({num_loads})")
@@ -1867,16 +1875,20 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
         for i in range(num_loads):
             J.s_waitcnt(mod=f"lgkmcnt({min(15,num_loads - i - 1)})")
             if vmem_lane_size == J.sizeof_DW4:
-                J.global_store_dwordx4(voff_vmem[i], temp_c[i], pC)      # this is fast:  (48us)
+                with J.ExecMask(voff_vmem_row[i] < M[0], early_skip=False):
+                    J.global_store_dwordx4(voff_vmem[i], temp_c[i], "off")      # this is fast:  (48us)
             else:
                 assert vmem_lane_size == J.sizeof_DW
                 # the bigger the M is, the bigger the perf-diff is
                 with J.ExecMask(voff_vmem_row[i] < M[0], early_skip=False):
                     J.global_atomic_pk_add_bf16(voff_vmem[i], temp_c[i], pC) # this is much slower than directly store      (60us)
             J.emit(mfma1, 32)
+            if vmem_lane_size == J.sizeof_DW4:
+                J.v_lshl_add_u64(voff_vmem[i], voff_vmem_step, 0, voff_vmem[i])
 
         J.emit(mfma1)
-        pC[:] += (4 * num_mfma_n * mfma_MN * J.sizeof_bf16) 
+        if vmem_lane_size != J.sizeof_DW4:
+            pC[:] += (4 * num_mfma_n * mfma_MN * J.sizeof_bf16) 
 
     loop_i = J.gpr("su32")
     loop_i[0] = 0

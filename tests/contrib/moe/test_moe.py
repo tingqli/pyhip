@@ -485,9 +485,17 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), None, w1_scale, B)
+                gemm2_out = torch.empty(B, TOPK, N2, dtype=torch.bfloat16, device=hidden_states.device)
                 moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
                             w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                            gemm1_out, w2, cur_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, None, w2_scale, B)
+                            gemm1_out, w2, gemm2_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, None, w2_scale, B)
+                num_WG = 80 * 4
+                num_tokens_wg = B // num_WG
+                num_extra_tokens = B % num_WG
+                moe_gemm_final_reduce_bf16([num_WG], [64], TOPK, N2,
+                                        gemm2_out.data_ptr(),
+                                        cur_out.data_ptr(),
+                                        num_tokens_wg, num_extra_tokens, B)
             elif fp8_ptpc:
                 BLOCK_TILE_SIZE_M = TILE_M
                 BLOCK_TILE_SIZE_N = TILE_N
@@ -525,6 +533,18 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         quant_dtype=w2.dtype,
                         num_rows=None,
                     )
+
+                if 0:
+                    print(sorted_expert_ids)
+                    total_wasted = 0
+                    for k in range(0, sorted_ids.numel(), BLOCK_TILE_SIZE_M):
+                        wasted = ((sorted_ids[k:k+BLOCK_TILE_SIZE_M] >> 24) == TOPK).sum().item()
+                        if wasted > 0:
+                            print(f"{wasted/BLOCK_TILE_SIZE_M*100:.2f} %")
+                            total_wasted += wasted
+                    print(f"Total wasted: {total_wasted/sorted_ids.numel()*100:.2f} %")
+                    assert 0
+
                 if 0:
                     moe_2stage_down_ref(gemm1_out_q.view(B, TOPK, -1), gemm1_out_scale,
                                         w2, w2_scale,
@@ -532,11 +552,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                         TILE_M, 
                                         sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids)
                 else:
+                    gemm2_out = torch.empty(B, TOPK, N2, dtype=torch.bfloat16, device=gemm1_out_q.device)
                     with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP, HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size, name=f"down") as p:
                         moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
                                     w2.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                     gemm1_out_q, w2, 
-                                    cur_out,
+                                    gemm2_out, #cur_out,
                                     sorted_ids,
                                     sorted_weights,
                                     sorted_expert_ids,
@@ -544,6 +565,17 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                     gemm1_out_scale,
                                     w2_scale,
                                     B)
+                        #with cudaPerf(rw_bytes=B*(TOPK+1)*N2*2, name="reduce") as p:
+                        if 0:
+                            cur_out = gemm2_out.sum(dim=1)
+                        else:
+                            num_WG = 80 * 4
+                            num_tokens_wg = B // num_WG
+                            num_extra_tokens = B % num_WG
+                            moe_gemm_final_reduce_bf16([num_WG], [64], TOPK, N2,
+                                                    gemm2_out.data_ptr(),
+                                                    cur_out.data_ptr(),
+                                                    num_tokens_wg, num_extra_tokens, B)
 
         else:
             assert 0, f'not support kernel type "{kernel_type}"'
@@ -568,6 +600,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             tflops_res.append(p.tflops())
             latencies.append(p.dt())
             bw.append(p.bw())
+        diff = 0
     else:
         if weight_type == torch.float4_e2m1fn_x2:
             # fp4 no shuffle
@@ -596,7 +629,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         #print(f">>>>>>>>>>>>>>> {calc_diff(cur_out, ref_out)=} ")
         #print(f">>>>>>>>>>>>>>> {calc_diff(aiter_out, cur_out)=} ")
 
-        diff = calc_diff(ref_out, cur_out)
+        diff = calc_diff(ref_out, cur_out)#, diff_thr=0.01)
         if 1 and diff > 0.02:
         #if not torch.allclose(ref_out, cur_out, rtol=0.02, atol=0.02):
             print(ref_out)
@@ -616,7 +649,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
     if run_count > 0:
         return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
                 'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
-                'bw': sum(bw[1:]) / len(bw[1:])}                               # GB/s
+                'bw': sum(bw[1:]) / len(bw[1:]),
+                "diff" : diff}                               # GB/s
 
 def is_arch_type(arch):
     props = torch.cuda.get_device_properties()
@@ -707,7 +741,7 @@ def show_perf(perflist):
         for kernel, vals in perf.items():
             for prec, vals_ in vals.items():
                 for b, data in vals_.items():
-                    print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
+                    print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops,  diff : {data["diff"]:.6f}')
 
 @pytest.mark.parametrize("batch", [[1, 2, 4, 8, 12, 16, 32, 64]])
 def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
@@ -768,6 +802,7 @@ if __name__ == '__main__':
         # test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
     else:
         batch = [i * 8192 for i in range(1, 11)]
+        #batch = [8192]
         #batch = [i * 6554 for i in range(1, 11)]
         entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
         test_perf(batch, TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, test_sets=['aiter', 'mxn_2s'])

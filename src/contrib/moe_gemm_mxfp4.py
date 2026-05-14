@@ -216,8 +216,14 @@ def moe_gemm_final_reduce_bf16(J, TOPK, OC, input:"void*", output:"void*", num_t
 
     J.s_min_u32(tok1, tok1[0], num_tokens_total[0])
     
-    input[:] += tok0[0] * (TOPK * OC * J.sizeof_bf16)
-    output[:] += tok0[0] * (OC * J.sizeof_bf16)
+    offset_64bit = J.gpr(2,"su32")
+    J.s_mul_hi_u32(offset_64bit[1], tok0[0], (TOPK * OC * J.sizeof_bf16))
+    J.s_mul_i32(offset_64bit[0], tok0[0], (TOPK * OC * J.sizeof_bf16))
+    input[:] += offset_64bit
+
+    J.s_mul_hi_u32(offset_64bit[1], tok0[0], (OC * J.sizeof_bf16))
+    J.s_mul_i32(offset_64bit[0], tok0[0], (OC * J.sizeof_bf16))
+    output[:] += offset_64bit
 
     buff = J.Buffer(input, (tok1[0] - tok0[0]) * (TOPK * OC * J.sizeof_bf16))
     buff_out = J.Buffer(output, (tok1[0] - tok0[0]) * (OC * J.sizeof_bf16))
