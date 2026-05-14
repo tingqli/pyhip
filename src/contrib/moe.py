@@ -1140,6 +1140,46 @@ def moe_2stage_down_loopn(J:JIT,
 
         loop_body()
 
+def xcd_swizzle(J, blk1d, num_blocks, num_oc_blocks, NUM_XCD, NUM_CU_PER_XCD):
+    NUM_CU = NUM_XCD * NUM_CU_PER_XCD
+    num_groupped_blocks = num_blocks // NUM_CU * NUM_CU
+    blk_m = J.gpr("su32")
+    blk_n = J.gpr("su32")
+    if 0 and num_oc_blocks == 16:
+        # in unit of 4x8 [256x256] blocks
+        with J.If(blk1d < num_groupped_blocks) as If:
+            blk_base = (blk1d // NUM_CU) * NUM_CU
+            cu_id = blk1d % NUM_CU
+            xcd_id = cu_id % 8  # 0~8
+            xcd_cu = cu_id // 8 # 0~31
+            coord_n = (xcd_id % 2)*8 + (xcd_cu % 8)
+            coord_m = (xcd_id // 2)*4 + (xcd_cu // 8)
+            task_id = coord_m * num_oc_blocks + coord_n
+            new_blk1d = blk_base + task_id
+            blk_m[0] = new_blk1d // num_oc_blocks
+            blk_n[0] = new_blk1d - blk_m * num_oc_blocks            
+            If.Else()
+            blk_m[0] = blk1d // num_oc_blocks
+            blk_n[0] = blk1d - blk_m * num_oc_blocks
+    elif num_oc_blocks <= 4:
+        with J.If(blk1d < num_groupped_blocks) as If:
+            blk_base = (blk1d // NUM_CU) * NUM_CU
+            cu_id = blk1d - blk1d // NUM_CU * NUM_CU
+            xcd_id = cu_id % NUM_XCD
+            xcd_cu = cu_id // NUM_XCD
+            task_id = xcd_id * NUM_CU_PER_XCD + xcd_cu
+            new_blk1d = blk_base + task_id
+            blk_m[0] = new_blk1d // num_oc_blocks
+            blk_n[0] = new_blk1d - blk_m * num_oc_blocks
+
+            If.Else()
+            blk_m[0] = blk1d // num_oc_blocks
+            blk_n[0] = blk1d - blk_m * num_oc_blocks
+    else:
+        blk_m[0] = blk1d // num_oc_blocks
+        blk_n[0] = blk1d - blk_m * num_oc_blocks
+    return blk_m, blk_n
+
 @jit()
 def moe_2stage_gateup(J:JIT,
                       weight_dtype,
@@ -1157,7 +1197,8 @@ def moe_2stage_gateup(J:JIT,
                       p_num_valid_ids:"void*",
                       pt_scale: "float*",
                       pc_scale:"float*",
-                      M:"int",):
+                      M:"int",
+                      num_blocks:"int",):
     class MFMA_DW4Loader:
         def __init__(self, J:JIT, ptr, buff_size, row_index,
                     wg_M:int, row_bytes:int, stride_bytes:int,
@@ -1216,7 +1257,7 @@ def moe_2stage_gateup(J:JIT,
     class MFMA_DW4Loader_preshuffled:
         def __init__(self, J:JIT, ptr, buff_size, mfma_MN,
                     wg_M:int, row_bytes:int, stride_bytes:int,
-                    wave_cnt:int, swizzle_row_div:int,
+                    wave_cnt:int, swizzle_row_div:int, blockn_idx,
                     skip_load:bool = False, N=0):
             self.buff = J.Buffer(ptr, buff_size)
             sizeof_DWORDX4 = 16
@@ -1239,7 +1280,7 @@ def moe_2stage_gateup(J:JIT,
             self.prefetch_reg = J.gpr(wave_prefetches, 4, "vu32")
             self.prefetch_sbase = J.gpr("su32")
             self.prefetch_offsets = J.gpr(wave_prefetches, "su32")
-            self.prefetch_voffset = lane_id * sizeof_DWORDX4 + BLOCK_TILE_SIZE_N // 2 * stride_bytes * J.blockIdx.x
+            self.prefetch_voffset = lane_id * sizeof_DWORDX4 + BLOCK_TILE_SIZE_N // 2 * stride_bytes * blockn_idx
             prefetch_id = 0
             for wave in range(wave_cnt):
                 with J.If(warp_id[0] == wave):
@@ -1312,12 +1353,10 @@ def moe_2stage_gateup(J:JIT,
     BLOCK_TILE_SIZE_K = 4 * 16 * 2 / sizeof_w
     read_col_lanes_per_wave = 4 * 16 * 2 // 16
     read_row_lanes_per_wave = 64 // read_col_lanes_per_wave
-    assert BLOCK_TILE_SIZE_M % (4 * read_row_lanes_per_wave) == 0
-    A_vert = BLOCK_TILE_SIZE_M // 4 // read_row_lanes_per_wave
 
     # grid: N // 32, sorted_expert_ids.shape[0]
     # expert index in p_sorted_expert_ids
-    e_idx = J.blockIdx.y
+    e_idx, blockn_idx = xcd_swizzle(J, J.blockIdx.x, num_blocks, N // BLOCK_TILE_SIZE_N, 8, 10)
     s_e_id = J.gpr(1, 'su32')
     J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
     max_id = J.gpr(1, 'su32')
@@ -1327,7 +1366,7 @@ def moe_2stage_gateup(J:JIT,
     J.Jump("continue_following", e_idx * BLOCK_TILE_SIZE_M < max_id)
     J.s_endpgm()
     J.Label("continue_following")
-    J.debug_setup((J.warp_id[0] == 0) & (J.blockIdx.x[0] == 0) & (e_idx[0] == 0))
+    J.debug_setup((J.warp_id[0] == 0) & (blockn_idx[0] == 0) & (e_idx[0] == 0))
 
     # hide following initialization into s_waitcnt
     p_sorted_ids[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
@@ -1337,15 +1376,12 @@ def moe_2stage_gateup(J:JIT,
     warp_id = J.gpr("su32")
     J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
 
+    assert BLOCK_TILE_SIZE_M % (4 * read_row_lanes_per_wave) == 0
+    A_vert = BLOCK_TILE_SIZE_M // 4 // read_row_lanes_per_wave
     v_sorted_id = J.gpr(A_vert, 'vu32')
     v_sorted_id_off = J.gpr((J.lane_id // read_col_lanes_per_wave + J.warp_id * read_row_lanes_per_wave) * 4)
-    J.global_load_dword(v_sorted_id[0], v_sorted_id_off, p_sorted_ids)
-    p_sorted_ids_tmp = J.gpr(2, 'su32')
-    p_sorted_ids_tmp[0] = p_sorted_ids[0]
-    p_sorted_ids_tmp[1] = p_sorted_ids[1]
-    for n in range(1, A_vert):
-        p_sorted_ids_tmp[:] += read_row_lanes_per_wave * 4 * sizeof_f32
-        J.global_load_dword(v_sorted_id[n], v_sorted_id_off, p_sorted_ids_tmp)
+    for n in range(A_vert):
+        J.global_load_dword(v_sorted_id[n], v_sorted_id_off, p_sorted_ids, mod=f'offset:{n * read_row_lanes_per_wave * 4 * sizeof_f32}')
     # for write, thread layout [64 // 4(=thread lanes of N), 4(=TILE_N // 2wave // 2(gate+up) * sizeof_bf16) // 16]
     write_col_lanes_per_wave = BLOCK_TILE_SIZE_N // 2 // 2 * sizeof_bf16 // 16
     write_row_lanes_per_wave = 64 // write_col_lanes_per_wave
@@ -1362,7 +1398,7 @@ def moe_2stage_gateup(J:JIT,
         for n in range(BLOCK_TILE_SIZE_M // 2 // 16):
             J.global_load_dword(v_sorted_id_scale[n], v_sorted_id_scale_off, p_sorted_ids, mod=f'offset:{n * 16 * sizeof_f32}')
 
-    p_output[:] = p_output[:] + BLOCK_TILE_SIZE_N_HALF * sizeof_bf16 * J.blockIdx.x
+    p_output[:] = p_output[:] + BLOCK_TILE_SIZE_N_HALF * sizeof_bf16 * blockn_idx
 
     # wait for v_sorted_id
     J.s_waitcnt(mod=f"vmcnt(0)")
@@ -1380,7 +1416,7 @@ def moe_2stage_gateup(J:JIT,
                              total_wave_cnt, swizzle_row_div, False)
     loaderB = MFMA_DW4Loader_preshuffled(J, p_weight, N * K * sizeof_w, 16,
                                          gemm.wg_N, sizeof_w*gemm.wg_K, stride_B,
-                                         total_wave_cnt, swizzle_row_div, False, N)
+                                         total_wave_cnt, swizzle_row_div, blockn_idx, False, N)
 
     # C_reg: [wave_nCM, wave_nCN]
     C_reg = gemm.run(loaderA, loaderB, None, M, 0, 0)
@@ -1391,7 +1427,7 @@ def moe_2stage_gateup(J:JIT,
         for m in range(gemm.wave_nCM):
             voffset_sa = J.gpr("vu32", (v_sorted_id_scale[m] & 0xffffff) * J.sizeof_DW)
             buff_sa.load_dword(v_pt_scales[m], voffset_sa, 0)
-        pc_scale[:] += s_e_id * (N * J.sizeof_DW) + BLOCK_TILE_SIZE_N_HALF * J.sizeof_DW * J.blockIdx.x  + J.warp_id % 2 * BLOCK_TILE_SIZE_N_HALF // 2 * J.sizeof_DW # per-channel scales for weights
+        pc_scale[:] += s_e_id * (N * J.sizeof_DW) + BLOCK_TILE_SIZE_N_HALF * J.sizeof_DW * blockn_idx  + J.warp_id % 2 * BLOCK_TILE_SIZE_N_HALF // 2 * J.sizeof_DW # per-channel scales for weights
         vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4)
         scales_pc = J.gpr(gemm.wave_nCN, 4, "vf32")
         for n in range(0, gemm.wave_nCN, 2):
@@ -1577,7 +1613,8 @@ def moe_2stage_down(J:JIT,
                     p_num_valid_ids:"void*",     # [2]  value: [65536,  8192]
                     pt_scale: "float*",
                     pc_scale:"float*",
-                    M:"int",):
+                    M:"int",
+                    num_blocks:"int",):
     sizeof_w = J.sizeof(weight_dtype)
     dtype_A = "bf16"
     is_fp8_ptpc = str(weight_dtype).startswith("torch.float8_e4m3")
@@ -1588,7 +1625,7 @@ def moe_2stage_down(J:JIT,
     else:
         fp8_ptpc = None
 
-    e_idx = J.blockIdx.y
+    e_idx, _ = xcd_swizzle(J, J.blockIdx.y, num_blocks, 1, 8, 10)
     s_e_id = J.gpr(1, 'su32')
     J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
     max_id = J.gpr(1, 'su32')

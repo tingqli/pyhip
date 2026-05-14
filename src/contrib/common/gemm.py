@@ -135,7 +135,7 @@ class UGEMM:
                  wave_size:list,
                  wave_cnt:list,
                  K, N,
-                 is_fp8_ptpc):
+                 is_fp8_ptpc=False):
         self.K = K
         self.N = N
         
@@ -206,21 +206,21 @@ class UGEMM:
 
         # each swizzle generates a new vaddr pattern, precompute all of them
         # each wave reads its own part
-        ds_readA_vaddr = J.gpr(self.wave_nCM, self.wave_nCK, "vu32")
-        ds_readB_vaddr = J.gpr(self.wave_nCN, self.wave_nCK, "vu32")
+        ds_readA_vaddr = J.gpr(1, self.wave_nCK, "vu32")
+        ds_readB_vaddr = J.gpr(1, self.wave_nCK, "vu32")
         # wave location
         warp_id_m = J.warp_id // self.wave_cnt_N
         warp_id_n = J.warp_id % self.wave_cnt_N
         warp_offset_m = warp_id_m * self.wave_size_M
         warp_offset_n = warp_id_n * self.wave_size_N
-        for m in range(self.wave_nCM):
+        for m in range(1):
             for k in range(self.wave_nCK):
                 row = J.lane_id % self.mfma_MN + warp_offset_m + m*self.mfma_MN
                 col = J.lane_id // self.mfma_MN + (k * self.mfma_K * self.sizeof_a) // J.sizeof_DW4
                 swizzle_col = swizzle(row, col) % (num_lanes_per_row)
                 ds_readA_vaddr[m, k] = J.gpr((row * (self.wg_K * self.sizeof_a)) + swizzle_col*(J.sizeof_DW4))
 
-        for n in range(self.wave_nCN):
+        for n in range(1):
             for k in range(self.wave_nCK):
                 row = J.lane_id % self.mfma_MN + warp_offset_n + n*self.mfma_MN
                 col = J.lane_id // self.mfma_MN + (k * self.mfma_K * self.sizeof_b) // J.sizeof_DW4
@@ -234,10 +234,10 @@ class UGEMM:
         mfma_B = J.gpr(self.wave_nCN, self.wave_nCK, ABReg_size, "vbf16x2")
 
         def ds_readA(m, k):
-            J.ds_read_b128(mfma_A[m,k], ds_readA_vaddr[m, k], mod=f"offset:{ldsA}") #  vaddr, vdata offset gds
+            J.ds_read_b128(mfma_A[m,k], ds_readA_vaddr[0, k], mod=f"offset:{ldsA + m*self.mfma_MN*self.wg_K * self.sizeof_a}") #  vaddr, vdata offset gds
 
         def ds_readB(n, k):
-            J.ds_read_b128(mfma_B[n,k], ds_readB_vaddr[n,k], mod=f"offset:{ldsB}") #  vaddr, vdata offset gds
+            J.ds_read_b128(mfma_B[n,k], ds_readB_vaddr[0,k], mod=f"offset:{ldsB+n*self.mfma_MN*self.wg_K * self.sizeof_b}") #  vaddr, vdata offset gds
 
         J.debug_setup((J.blockIdx.x[0] == 0) & (J.blockIdx.y[0] == 0) & (J.warp_id == debug_warp))
 

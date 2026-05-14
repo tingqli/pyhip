@@ -482,13 +482,14 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
 
                 BLOCK_TILE_SIZE_M = TILE_M
                 BLOCK_TILE_SIZE_N = TILE_N
-                moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
+                moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0]], [256],
                                w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                               hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), None, w1_scale, B)
+                               hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+                               None, w1_scale, B, N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0])
                 gemm2_out = torch.empty(B, TOPK, N2, dtype=torch.bfloat16, device=hidden_states.device)
                 moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
                             w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                            gemm1_out, w2, gemm2_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, None, w2_scale, B)
+                            gemm1_out, w2, gemm2_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, None, w2_scale, B, sorted_expert_ids.shape[0])
                 num_WG = 80 * 4
                 num_tokens_wg = B // num_WG
                 num_extra_tokens = B % num_WG
@@ -516,7 +517,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                         sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids, TOPK)
                 else:
                     with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP * 2, HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size * 2, name=f"up") as p:
-                        moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
+                        moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0]], [256],
                                     w1.dtype, TOPK, K1, N1, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                     hidden_states_q, w1, 
                                     gemm1_out, 
@@ -524,7 +525,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                     sorted_expert_ids, 
                                     num_valid_ids, 
                                     hidden_states_scale,
-                                    w1_scale, B)
+                                    w1_scale, B, N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0])
                 # down
                 with cudaPerf(0, 0, name=f"quant_down") as p:
                     gemm1_out_q, gemm1_out_scale = quant_func(
@@ -553,7 +554,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                         sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids)
                 else:
                     gemm2_out = torch.empty(B, TOPK, N2, dtype=torch.bfloat16, device=gemm1_out_q.device)
-                    with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP, HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size, name=f"down") as p:
+                    down_mem_size = HIDDEN_SIZE * INTER_SIZE_TP * access_expert * ele_size + B * TOPK * INTER_SIZE_TP * 2 + B * TOPK * HIDDEN_SIZE * 2
+                    with cudaPerf(2 * B * TOPK * HIDDEN_SIZE * INTER_SIZE_TP, down_mem_size, name=f"down") as p:
                         moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
                                     w2.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                     gemm1_out_q, w2, 
@@ -564,8 +566,9 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                     num_valid_ids,
                                     gemm1_out_scale,
                                     w2_scale,
-                                    B)
-                        #with cudaPerf(rw_bytes=B*(TOPK+1)*N2*2, name="reduce") as p:
+                                    B,
+                                    sorted_expert_ids.shape[0])
+                    with cudaPerf(rw_bytes=B*(TOPK+1)*N2*2, name="reduce") as p:
                         if 0:
                             cur_out = gemm2_out.sum(dim=1)
                         else:
@@ -642,9 +645,9 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             quantype=""
             if wei_is_fp8(weight_type):
                 if fp8_ptpc:
-                    quantype = " @ PTPC"
+                    quantype = "@PTPC"
                 else:
-                    quantype = " @ blockwise"
+                    quantype = "@blockwise"
             print(f"{kernel_type}[{B=} {weight_type=}{quantype}] acc OK err {diff=:.6f}")
     if run_count > 0:
         return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
@@ -697,9 +700,9 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64
         quan_type=""
         if wei_is_fp8(weight_type):
             if fp8_ptpc:
-                quan_type = " @ PTPC"
+                quan_type = "@PTPC"
             else:
-                quan_type = " @ blockwise"
+                quan_type = "@blockwise"
         perf[kernel_type][str(weight_type)+quan_type] = perf_prec
         INTER_SIZE = org_INTER_SIZE
     
@@ -768,7 +771,7 @@ def test_perf(batch, TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP
     # TODO: support fp8
     # perf.append(entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     if 'mxn_2s' in test_sets:
-        perf.append(entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
+        perf.append(entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     if 'mxn_splitk_2s' in test_sets:
         # TILE_M/N is configurable
         perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, TOPK=10, E=512, INTER_SIZE=INTER_SIZE, TP=TP))
@@ -804,5 +807,5 @@ if __name__ == '__main__':
         batch = [i * 8192 for i in range(1, 11)]
         #batch = [8192]
         #batch = [i * 6554 for i in range(1, 11)]
-        entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
+        entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
         test_perf(batch, TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, test_sets=['aiter', 'mxn_2s'])
