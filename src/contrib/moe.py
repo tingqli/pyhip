@@ -1657,32 +1657,25 @@ def moe_2stage_down(J:JIT,
     J.s_waitcnt(mod=f"lgkmcnt(0)")
     J.s_barrier()
 
+    J.get_sgpr_const(0x8000)
+    J.get_sgpr_const(0x3020706)
     # 0,1,2,3,4,5,6,7, num_mfma_m
-    if 0:
-        s_sorted_ids = J.gpr(num_mfma_m, 'su32')
-        for m in range(num_mfma_m):
-            J.v_readfirstlane_b32(s_sorted_ids[m], v_sorted_id[m])
-        J.s_nop(8)
-        if 0:
-            with J.If((s_sorted_ids[num_mfma_m//4]>>24) == TOPK):
-                VALIE_TILE_SIZE_M = (num_mfma_m//4)*mfma_MN
-                num_mfma_n = 1 if VALIE_TILE_SIZE_M > 64 else 2
+    if 1:
+        VALID_TILE_SIZES = [s for s in [32, 64] if s < BLOCK_TILE_SIZE_M]
+        s_sorted_ids = J.gpr(len(VALID_TILE_SIZES), 'su32')
+        for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
+            J.v_readfirstlane_b32(s_sorted_ids[i], v_sorted_id[TILE_SIZE//mfma_MN])
+
+        for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
+            with J.If((s_sorted_ids[i] >> 24) == TOPK):
                 num_mfma_n = 1
-                down_kernel(J, mfma_MN, num_mfma_n, VALIE_TILE_SIZE_M, N, K,
+                down_kernel(J, mfma_MN, num_mfma_n, TILE_SIZE, N, K,
                             A, lds_token_ids, lds_weights,
                             p_weight, p_output, M, fp8_ptpc)
                 J.s_endpgm()
 
-        with J.If((s_sorted_ids[4]>>24) == TOPK):
-            VALIE_TILE_SIZE_M = 4*16
-            num_mfma_n = 1 if VALIE_TILE_SIZE_M > 64 else 2
-            num_mfma_n = 1
-            down_kernel(J, mfma_MN, num_mfma_n, VALIE_TILE_SIZE_M, N, K,
-                        A, lds_token_ids, lds_weights,
-                        p_weight, p_output, M, fp8_ptpc)
-            J.s_endpgm()
-
     num_mfma_n = 1 if BLOCK_TILE_SIZE_M > 64 else 2
+    num_mfma_n = 1 # num_mfma_n has accuracy issue when using fp8, need to investigate more
     down_kernel(J, mfma_MN, num_mfma_n, BLOCK_TILE_SIZE_M, N, K,
                 A, lds_token_ids, lds_weights,
                 p_weight, p_output, M, fp8_ptpc)
@@ -1720,8 +1713,8 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     if fp8_ptpc is not None:
         vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4 + J.warp_id * (num_mfma_n * mfma_MN * J.sizeof_DW)) # point to the start of pc scales for this WG
         scales_pc = J.gpr(2, num_mfma_n, 4, "vf32")
+        buff_sb = J.Buffer(fp8_ptpc["pc_scale"], N * J.sizeof_DW)
 
-    buff_sb = J.Buffer(fp8_ptpc["pc_scale"], N * J.sizeof_DW)
     def loadB_generator(index):
         for n in range(num_mfma_n):
             for k in range(num_mfma_k):
@@ -1895,6 +1888,8 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
         loop_i[0] = loop_i[0] + 1
     if loop_cnt % 2:
         loop_body(0)
+
+    J.free_lds(lds)
 
 @jit(with_debug_log=False)
 def moe_1stage_splitk(J:JIT,

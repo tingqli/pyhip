@@ -3281,6 +3281,15 @@ r'''
 
     @cache
     def get_sgpr_const(self, value):
+        """
+        if it's cached at jit-generation time inside a conditional branch, if we also initialize it here,
+        then the other references outside the conditional branch may got a sgpr w/o proper initialization.
+        a standard compiler can guarantee the initialization happens at proper places, but jit is not that smart
+        what we can do here is check if we are inside a branch, if so, give an error
+        """
+        YELLOW = "\033[1;33m"
+        END = "\033[0m"
+        print(f"{YELLOW} Caution: get_sgpr_const({hex(value)}) inside branch could lead to uninitialized sgpr {END}")
         sgpr = self.gpr("su32", name=f"sgpr_const_{value}")
         sgpr[0] = value
         return sgpr
