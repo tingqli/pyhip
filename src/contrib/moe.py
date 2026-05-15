@@ -1361,6 +1361,12 @@ def moe_2stage_gateup(J:JIT,
     J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
     max_id = J.gpr(1, 'su32')
     J.s_load_dword(max_id, p_num_valid_ids, 0)
+
+    VALID_TILE_SIZES = [s for s in [64, 128] if s < BLOCK_TILE_SIZE_M]
+    s_sorted_id_tile = J.gpr(len(VALID_TILE_SIZES), 'su32')
+    for n in range(len(VALID_TILE_SIZES)):
+        J.s_load_dword(s_sorted_id_tile[n], p_sorted_ids, VALID_TILE_SIZES[n] * J.sizeof_DW)
+
     J.s_waitcnt(mod=f"lgkmcnt(0)")
     # invalid padding section
     J.Jump("continue_following", e_idx * BLOCK_TILE_SIZE_M < max_id)
@@ -1376,128 +1382,140 @@ def moe_2stage_gateup(J:JIT,
     warp_id = J.gpr("su32")
     J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
 
-    assert BLOCK_TILE_SIZE_M % (4 * read_row_lanes_per_wave) == 0
-    A_vert = BLOCK_TILE_SIZE_M // 4 // read_row_lanes_per_wave
-    v_sorted_id = J.gpr(A_vert, 'vu32')
-    v_sorted_id_off = J.gpr((J.lane_id // read_col_lanes_per_wave + J.warp_id * read_row_lanes_per_wave) * 4)
-    for n in range(A_vert):
-        J.global_load_dword(v_sorted_id[n], v_sorted_id_off, p_sorted_ids, mod=f'offset:{n * read_row_lanes_per_wave * 4 * sizeof_f32}')
-    # for write, thread layout [64 // 4(=thread lanes of N), 4(=TILE_N // 2wave // 2(gate+up) * sizeof_bf16) // 16]
-    write_col_lanes_per_wave = BLOCK_TILE_SIZE_N // 2 // 2 * sizeof_bf16 // 16
-    write_row_lanes_per_wave = 64 // write_col_lanes_per_wave
-    assert BLOCK_TILE_SIZE_M % (4 * write_row_lanes_per_wave) == 0
-    A_vert_write = BLOCK_TILE_SIZE_M // 2 // write_row_lanes_per_wave
-    v_sorted_id_write = J.gpr(A_vert_write, 'vu32')
-    v_sorted_id_write_off = J.gpr((J.lane_id // write_col_lanes_per_wave + J.warp_id // 2 * (A_vert_write * write_row_lanes_per_wave)) * 4)
-    for n in range(A_vert_write):
-        J.global_load_dword(v_sorted_id_write[n], v_sorted_id_write_off, p_sorted_ids, mod=f'offset:{n * write_row_lanes_per_wave * sizeof_f32}')
-
-    if is_fp8_ptpc:
-        v_sorted_id_scale = J.gpr(BLOCK_TILE_SIZE_M // 2 // 16, 'vu32')
-        v_sorted_id_scale_off = J.gpr((lane_mod_16 + J.warp_id // 2 * (BLOCK_TILE_SIZE_M // 2)) * 4)
-        for n in range(BLOCK_TILE_SIZE_M // 2 // 16):
-            J.global_load_dword(v_sorted_id_scale[n], v_sorted_id_scale_off, p_sorted_ids, mod=f'offset:{n * 16 * sizeof_f32}')
-
     p_output[:] = p_output[:] + BLOCK_TILE_SIZE_N_HALF * sizeof_bf16 * blockn_idx
 
-    # wait for v_sorted_id
-    J.s_waitcnt(mod=f"vmcnt(0)")
-    v_token_id = J.gpr(A_vert, 'vu32')
-    for m in range(A_vert):
-        v_token_id[m] = v_sorted_id[m] & 0xffffff
+    def kernel(CUR_BLOCK_TILE_SIZE_M):
+        assert CUR_BLOCK_TILE_SIZE_M % (4 * read_row_lanes_per_wave) == 0
+        A_vert = CUR_BLOCK_TILE_SIZE_M // 4 // read_row_lanes_per_wave
+        v_sorted_id = J.gpr(A_vert, 'vu32')
+        v_sorted_id_off = J.gpr((J.lane_id // read_col_lanes_per_wave + J.warp_id * read_row_lanes_per_wave) * 4)
+        for n in range(A_vert):
+            J.global_load_dword(v_sorted_id[n], v_sorted_id_off, p_sorted_ids, mod=f'offset:{n * read_row_lanes_per_wave * 4 * sizeof_f32}')
+        # for write, thread layout [64 // 4(=thread lanes of N), 4(=TILE_N // 2wave // 2(gate+up) * sizeof_bf16) // 16]
+        write_col_lanes_per_wave = BLOCK_TILE_SIZE_N // 2 // 2 * sizeof_bf16 // 16
+        write_row_lanes_per_wave = 64 // write_col_lanes_per_wave
+        assert CUR_BLOCK_TILE_SIZE_M % (4 * write_row_lanes_per_wave) == 0
+        A_vert_write = CUR_BLOCK_TILE_SIZE_M // 2 // write_row_lanes_per_wave
+        v_sorted_id_write = J.gpr(A_vert_write, 'vu32')
+        v_sorted_id_write_off = J.gpr((J.lane_id // write_col_lanes_per_wave + J.warp_id // 2 * (A_vert_write * write_row_lanes_per_wave)) * 4)
+        for n in range(A_vert_write):
+            J.global_load_dword(v_sorted_id_write[n], v_sorted_id_write_off, p_sorted_ids, mod=f'offset:{n * write_row_lanes_per_wave * sizeof_f32}')
 
-    p_weight[:] = p_weight[:] + s_e_id * (N * K * sizeof_w)
+        if is_fp8_ptpc:
+            v_sorted_id_scale = J.gpr(CUR_BLOCK_TILE_SIZE_M // 2 // 16, 'vu32')
+            v_sorted_id_scale_off = J.gpr((lane_mod_16 + J.warp_id // 2 * (CUR_BLOCK_TILE_SIZE_M // 2)) * 4)
+            for n in range(CUR_BLOCK_TILE_SIZE_M // 2 // 16):
+                J.global_load_dword(v_sorted_id_scale[n], v_sorted_id_scale_off, p_sorted_ids, mod=f'offset:{n * 16 * sizeof_f32}')
 
-    gemm = UGEMM(J, 16, [BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2], [2, 2], K, N, is_fp8_ptpc)
-    swizzle_row_div = 1
-    total_wave_cnt = 4
-    loaderA = MFMA_DW4Loader(J, p_input, M * (K * sizeof_a), v_token_id,
-                             gemm.wg_M, sizeof_a*gemm.wg_K, stride_A,
-                             total_wave_cnt, swizzle_row_div, False)
-    loaderB = MFMA_DW4Loader_preshuffled(J, p_weight, N * K * sizeof_w, 16,
-                                         gemm.wg_N, sizeof_w*gemm.wg_K, stride_B,
-                                         total_wave_cnt, swizzle_row_div, blockn_idx, False, N)
-
-    # C_reg: [wave_nCM, wave_nCN]
-    C_reg = gemm.run(loaderA, loaderB, None, M, 0, 0)
-
-    if is_fp8_ptpc:
-        buff_sa = J.Buffer(pt_scale, M * J.sizeof("fp32"))
-        v_pt_scales = J.gpr(gemm.wave_nCM, 'vf32')
-        for m in range(gemm.wave_nCM):
-            voffset_sa = J.gpr("vu32", (v_sorted_id_scale[m] & 0xffffff) * J.sizeof_DW)
-            buff_sa.load_dword(v_pt_scales[m], voffset_sa, 0)
-        pc_scale[:] += s_e_id * (N * J.sizeof_DW) + BLOCK_TILE_SIZE_N_HALF * J.sizeof_DW * blockn_idx  + J.warp_id % 2 * BLOCK_TILE_SIZE_N_HALF // 2 * J.sizeof_DW # per-channel scales for weights
-        vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4)
-        scales_pc = J.gpr(gemm.wave_nCN, 4, "vf32")
-        for n in range(0, gemm.wave_nCN, 2):
-            J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
-        vaddr_pc_scale += N // 2 * J.sizeof_DW
-        for n in range(1, gemm.wave_nCN, 2):
-            J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
-        # vaddr_pc_scale[0] += num_mfma_n * 16 * J.sizeof_DW
+        # wait for v_sorted_id
         J.s_waitcnt(mod=f"vmcnt(0)")
+        v_token_id = J.gpr(A_vert, 'vu32')
+        for m in range(A_vert):
+            v_token_id[m] = v_sorted_id[m] & 0xffffff
 
-    s_cvt_bf16_bias = J.gpr(1, "su32")
-    s_cvt_bf16_bias[0] = 0x00008000
+        p_weight[:] = p_weight[:] + s_e_id * (N * K * sizeof_w)
 
-    # swizzle-LDS to form better memory-coelascing VMEM
-    # each warp has its own [mfma_M x wave_size_N] output buffer
-    wave_size_N = BLOCK_TILE_SIZE_N // 2 // 2
-    lds_out = J.alloc_lds(4 * 16 * wave_size_N * sizeof_bf16)
-    lds_warp_offset = warp_id * (16 * wave_size_N * sizeof_bf16)
-    num_lanes_per_row = write_col_lanes_per_wave
-    assert 64 % num_lanes_per_row == 0
-    rows_per_read = 64 // num_lanes_per_row
-    assert rows_per_read > 0
-    assert 16 % rows_per_read == 0
+        gemm = UGEMM(J, 16, [CUR_BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2], [2, 2], K, N, is_fp8_ptpc)
+        swizzle_row_div = 1
+        total_wave_cnt = 4
+        loaderA = MFMA_DW4Loader(J, p_input, M * (K * sizeof_a), v_token_id,
+                                gemm.wg_M, sizeof_a*gemm.wg_K, stride_A,
+                                total_wave_cnt, swizzle_row_div, False)
+        loaderB = MFMA_DW4Loader_preshuffled(J, p_weight, N * K * sizeof_w, 16,
+                                            gemm.wg_N, sizeof_w*gemm.wg_K, stride_B,
+                                            total_wave_cnt, swizzle_row_div, blockn_idx, False, N)
 
-    vdata = J.gpr(4, "vu32", align=4)
+        # C_reg: [wave_nCM, wave_nCN]
+        C_reg = gemm.run(loaderA, loaderB, None, M, 0, 0)
 
-    assert A_vert_write % gemm.wave_nCM == 0
-    write_times16 = A_vert_write // gemm.wave_nCM
-    for m in range(gemm.wave_nCM):
-        for n in range(gemm.wave_nCN // 2):
-            for i in range(4):
-                tmp = J.gpr(2, "vf32", align=2)
-                J.v_accvgpr_read_b32(tmp[0], C_reg[m, 2 * n + 0, i])
-                J.v_accvgpr_read_b32(tmp[1], C_reg[m, 2 * n + 1, i])
-                if is_fp8_ptpc:
-                    tmp[0] *= v_pt_scales[m]
-                    tmp[1] *= v_pt_scales[m]
-                    tmp[0] *= scales_pc[2 * n + 0, i]
-                    tmp[1] *= scales_pc[2 * n + 1, i]
-                tmp[0] = J.gpr(tmp[1] * J.silu(tmp[0]))
-                J.v_add_u32(vdata[i], tmp[0], s_cvt_bf16_bias)
-            vouts = J.gpr(2, "vf32")
-            J.pk_f32_to_bf16(vouts[0], vdata[0], vdata[1])
-            J.pk_f32_to_bf16(vouts[1], vdata[2], vdata[3])
+        if is_fp8_ptpc:
+            buff_sa = J.Buffer(pt_scale, M * J.sizeof("fp32"))
+            v_pt_scales = J.gpr(gemm.wave_nCM, 'vf32')
+            for m in range(gemm.wave_nCM):
+                voffset_sa = J.gpr("vu32", (v_sorted_id_scale[m] & 0xffffff) * J.sizeof_DW)
+                buff_sa.load_dword(v_pt_scales[m], voffset_sa, 0)
+            pc_scale[:] += s_e_id * (N * J.sizeof_DW) + BLOCK_TILE_SIZE_N_HALF * J.sizeof_DW * blockn_idx  + J.warp_id % 2 * BLOCK_TILE_SIZE_N_HALF // 2 * J.sizeof_DW # per-channel scales for weights
+            vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4)
+            scales_pc = J.gpr(gemm.wave_nCN, 4, "vf32")
+            for n in range(0, gemm.wave_nCN, 2):
+                J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
+            vaddr_pc_scale += N // 2 * J.sizeof_DW
+            for n in range(1, gemm.wave_nCN, 2):
+                J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
+            # vaddr_pc_scale[0] += num_mfma_n * 16 * J.sizeof_DW
+            J.s_waitcnt(mod=f"vmcnt(0)")
 
-            row = lane_mod_16
-            col = lane_div_16 + n * (16 * sizeof_bf16 // 8)
-            # writing unit is 8 bytes while reading unit is 16 bytes
-            swizzle_col = (col // 2 ^ row) % (num_lanes_per_row)
-            vaddr_w = J.gpr((row) * (wave_size_N * sizeof_bf16) + \
-                            lds_warp_offset + \
-                            (swizzle_col * 16 + (col & 1) * 8))
-            J.ds_write_b64(vaddr_w, vouts, mod=f"offset:{lds_out}")
+        s_cvt_bf16_bias = J.gpr(1, "su32")
+        s_cvt_bf16_bias[0] = 0x00008000
 
-        for r in range(0, 16, rows_per_read):
-            cur_m = v_sorted_id_write[m * write_times16 + r // rows_per_read] & 0xffffff
-            voffset = J.gpr(cur_m * (N // 2 * sizeof_bf16 * TOPK) +
-                            (v_sorted_id_write[m * write_times16 + r // rows_per_read] >> 24) * (N // 2 * sizeof_bf16) + 
-                            (J.lane_id % write_col_lanes_per_wave) * sizeof_DWORDX4 + J.warp_id % 2 * (write_col_lanes_per_wave * sizeof_DWORDX4))
-            row = J.lane_id // num_lanes_per_row + r
-            col = J.lane_id % num_lanes_per_row
-            swizzle_col = (row ^ col) % num_lanes_per_row
-            vaddr_r = J.gpr((swizzle_col) * sizeof_DWORDX4 + \
-                            (row) * (wave_size_N * sizeof_bf16) + \
-                            lds_warp_offset)
-            J.ds_read_b128(vdata, vaddr_r, mod=f"offset:{lds_out}")
-            J.s_waitcnt(mod=f"lgkmcnt(0)")
-            with J.ExecMask(cur_m < M[0]):
-                J.global_store_dwordx4(voffset, vdata, p_output)
+        # swizzle-LDS to form better memory-coelascing VMEM
+        # each warp has its own [mfma_M x wave_size_N] output buffer
+        wave_size_N = BLOCK_TILE_SIZE_N // 2 // 2
+        lds_out = J.alloc_lds(4 * 16 * wave_size_N * sizeof_bf16)
+        lds_warp_offset = warp_id * (16 * wave_size_N * sizeof_bf16)
+        num_lanes_per_row = write_col_lanes_per_wave
+        assert 64 % num_lanes_per_row == 0
+        rows_per_read = 64 // num_lanes_per_row
+        assert rows_per_read > 0
+        assert 16 % rows_per_read == 0
 
+        vdata = J.gpr(4, "vu32", align=4)
+
+        assert A_vert_write % gemm.wave_nCM == 0
+        write_times16 = A_vert_write // gemm.wave_nCM
+        for m in range(gemm.wave_nCM):
+            for n in range(gemm.wave_nCN // 2):
+                for i in range(4):
+                    tmp = J.gpr(2, "vf32", align=2)
+                    J.v_accvgpr_read_b32(tmp[0], C_reg[m, 2 * n + 0, i])
+                    J.v_accvgpr_read_b32(tmp[1], C_reg[m, 2 * n + 1, i])
+                    if is_fp8_ptpc:
+                        tmp[0] *= v_pt_scales[m]
+                        tmp[1] *= v_pt_scales[m]
+                        tmp[0] *= scales_pc[2 * n + 0, i]
+                        tmp[1] *= scales_pc[2 * n + 1, i]
+                    tmp[0] = J.gpr(tmp[1] * J.silu(tmp[0]))
+                    J.v_add_u32(vdata[i], tmp[0], s_cvt_bf16_bias)
+                vouts = J.gpr(2, "vf32")
+                J.pk_f32_to_bf16(vouts[0], vdata[0], vdata[1])
+                J.pk_f32_to_bf16(vouts[1], vdata[2], vdata[3])
+
+                row = lane_mod_16
+                col = lane_div_16 + n * (16 * sizeof_bf16 // 8)
+                # writing unit is 8 bytes while reading unit is 16 bytes
+                swizzle_col = (col // 2 ^ row) % (num_lanes_per_row)
+                vaddr_w = J.gpr((row) * (wave_size_N * sizeof_bf16) + \
+                                lds_warp_offset + \
+                                (swizzle_col * 16 + (col & 1) * 8))
+                J.ds_write_b64(vaddr_w, vouts, mod=f"offset:{lds_out}")
+
+            for r in range(0, 16, rows_per_read):
+                cur_m = v_sorted_id_write[m * write_times16 + r // rows_per_read] & 0xffffff
+                voffset = J.gpr(cur_m * (N // 2 * sizeof_bf16 * TOPK) +
+                                (v_sorted_id_write[m * write_times16 + r // rows_per_read] >> 24) * (N // 2 * sizeof_bf16) + 
+                                (J.lane_id % write_col_lanes_per_wave) * sizeof_DWORDX4 + J.warp_id % 2 * (write_col_lanes_per_wave * sizeof_DWORDX4))
+                row = J.lane_id // num_lanes_per_row + r
+                col = J.lane_id % num_lanes_per_row
+                swizzle_col = (row ^ col) % num_lanes_per_row
+                vaddr_r = J.gpr((swizzle_col) * sizeof_DWORDX4 + \
+                                (row) * (wave_size_N * sizeof_bf16) + \
+                                lds_warp_offset)
+                J.ds_read_b128(vdata, vaddr_r, mod=f"offset:{lds_out}")
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+                with J.ExecMask(cur_m < M[0], early_skip=False):
+                    J.global_store_dwordx4(voffset, vdata, p_output)
+
+        J.free_lds(lds_out)
+
+    J.get_sgpr_const(0x8000)
+    J.get_sgpr_const(0x3020706)
+    if 1:
+        for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
+            with J.If((s_sorted_id_tile[i] >> 24) == TOPK):
+                kernel(TILE_SIZE)
+                J.s_endpgm()
+
+    kernel(BLOCK_TILE_SIZE_M)
 
 
 def de_shuffle_weight(weight_, mfma_MN = 16):
