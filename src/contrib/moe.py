@@ -1700,7 +1700,7 @@ def moe_2stage_down(J:JIT,
     J.get_sgpr_const(0x3020706)
     # 0,1,2,3,4,5,6,7, num_mfma_m
     if 1:
-        VALID_TILE_SIZES = [s for s in [64] if s < BLOCK_TILE_SIZE_M]
+        VALID_TILE_SIZES = [s for s in [64,96,128] if s < BLOCK_TILE_SIZE_M]
         s_sorted_ids = J.gpr(len(VALID_TILE_SIZES), 'su32')
         for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
             J.v_readfirstlane_b32(s_sorted_ids[i], v_sorted_id[TILE_SIZE//mfma_MN])
@@ -1739,7 +1739,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     # 4 warps work in parallel along N dimension
     buff_b = J.Buffer(pB, N * K * sizeof_w)
     # ping-pong buffer
-    B = J.gpr(2, num_mfma_n, num_mfma_k, 4, "vbf16x2") # 4 x (8,bf16) or (16,fp8)
+    B = J.gpr(2, num_mfma_n, num_mfma_k, 4, "abf16x2") # 4 x (8,bf16) or (16,fp8)
     C = J.gpr(2, num_mfma_m, num_mfma_n, 4, "vf32")
 
     # prelog0, load Bn0
