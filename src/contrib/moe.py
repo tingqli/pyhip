@@ -1725,14 +1725,13 @@ def moe_2stage_down(J:JIT,
 
         for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
             with J.If((s_sorted_ids[i] >> 24) == TOPK):
-                num_mfma_n = 1
+                num_mfma_n = 1 if TILE_SIZE > 64 else 2
                 down_kernel(J, mfma_MN, num_mfma_n, TILE_SIZE, N, K,
                             A, lds_token_ids, lds_weights,
                             p_weight, p_output, M, fp8_ptpc)
                 J.s_endpgm()
 
     num_mfma_n = 1 if BLOCK_TILE_SIZE_M > 64 else 2
-    num_mfma_n = 1 # num_mfma_n has accuracy issue when using fp8, need to investigate more
     down_kernel(J, mfma_MN, num_mfma_n, BLOCK_TILE_SIZE_M, N, K,
                 A, lds_token_ids, lds_weights,
                 p_weight, p_output, M, fp8_ptpc)
@@ -1768,7 +1767,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     soff_b[0] = 0
 
     if fp8_ptpc is not None:
-        vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4 + J.warp_id * (num_mfma_n * mfma_MN * J.sizeof_DW)) # point to the start of pc scales for this WG
+        vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4 + J.warp_id * (mfma_MN * J.sizeof_DW)) # point to the start of pc scales for this WG
         scales_pc = J.gpr(2, num_mfma_n, 4, "vf32")
         buff_sb = J.Buffer(fp8_ptpc["pc_scale"], N * J.sizeof_DW)
 
@@ -1785,7 +1784,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
             # fp8_ptpc["pc_scale"] = pc_scale
             for n in range(num_mfma_n):
                 yield 1
-                buff_sb.load_dwordx4(scales_pc[index, n], vaddr_pc_scale, 0, offset12=n*16*J.sizeof_DW)
+                buff_sb.load_dwordx4(scales_pc[index, n], vaddr_pc_scale, 0, offset12=n*num_warps*mfma_MN*J.sizeof_DW)
             vaddr_pc_scale[0] += num_warps * num_mfma_n * mfma_MN * J.sizeof_DW
 
     def mfma_generator(index):
@@ -1816,6 +1815,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                     C[index,m,n,1] *= fp8_ptpc["v_pt_scales"][m]
                     C[index,m,n,2] *= fp8_ptpc["v_pt_scales"][m]
                     C[index,m,n,3] *= fp8_ptpc["v_pt_scales"][m]
+                    yield 16
                     C[index,m,n,0] *= scales_pc[index, n, 0]
                     C[index,m,n,1] *= scales_pc[index, n, 1]
                     C[index,m,n,2] *= scales_pc[index, n, 2]
@@ -1931,13 +1931,13 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
             J.s_waitcnt(mod=f"lgkmcnt({min(15,num_loads - i - 1)})")
             if vmem_lane_size == J.sizeof_DW4:
                 with J.ExecMask(voff_vmem_row[i] < M[0], early_skip=False):
-                    J.global_store_dwordx4(voff_vmem[i], temp_c[i], "off")      # this is fast:  (48us)
+                    J.global_store_dwordx4(voff_vmem[i], temp_c[i], "off", mod="nt sc1")      # this is fast:  (48us)
             else:
                 assert vmem_lane_size == J.sizeof_DW
                 # the bigger the M is, the bigger the perf-diff is
                 with J.ExecMask(voff_vmem_row[i] < M[0], early_skip=False):
                     J.global_atomic_pk_add_bf16(voff_vmem[i], temp_c[i], pC) # this is much slower than directly store      (60us)
-            J.emit(mfma1, 32)
+            J.emit(mfma1, 128)
             if vmem_lane_size == J.sizeof_DW4:
                 J.v_lshl_add_u64(voff_vmem[i], voff_vmem_step, 0, voff_vmem[i])
 

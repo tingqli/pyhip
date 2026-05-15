@@ -804,8 +804,10 @@ if __name__ == '__main__':
         # batch = [1, 2, 4, 8, 16, 32,64,128, 256]
         # test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
     else:
-        batch = [i * 8192 for i in range(1, 11)]
-        #batch = [8192]
-        #batch = [i * 6554 for i in range(1, 11)]
-        entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
-        test_perf(batch, TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, test_sets=['aiter', 'mxn_2s'])
+        #batch = [i * 8192 for i in range(1, 11)]
+        batch = [i * 1024 for i in range(1, 9)] + [8192*2, 8192*4, 8192*8]
+        #batch = [i * 6553 for i in range(1, 11)]
+        #entry_common('mxn_2s', batch=batch, prec=[get_fp8type()], TILE_M=64, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
+        test_perf(batch, TILE_M=64, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, test_sets=['aiter', 'mxn_2s'])
+
+
