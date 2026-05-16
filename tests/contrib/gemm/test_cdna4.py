@@ -30,7 +30,7 @@ def test_accuracy(M, N, K, use_pre_shuffle = 0):
 
     cur_out = torch.ones(M, N, dtype=torch.bfloat16)
 
-    gemm_kernel([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle,
+    gemm_kernel_slicing([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle,
                 A.data_ptr(), B.data_ptr(), cur_out.data_ptr(), M)
 
     if not torch.allclose(ref_out, cur_out, rtol=0.01, atol=0.01):
@@ -63,7 +63,7 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
 
     C = torch.zeros(M, N, dtype=torch.bfloat16)
 
-    gemm_kernel([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle, A.data_ptr(), B.data_ptr(), C.data_ptr(), M)
+    gemm_kernel_slicing([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle, A.data_ptr(), B.data_ptr(), C.data_ptr(), M)
 
 
     ref_out = C0
@@ -94,7 +94,7 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
     for i in range(10):
         di = (di + 1)%DATA_CLONES
         with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"gemm_{di}") as p0:
-            gemm_kernel([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle,
+            gemm_kernel_slicing([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle,
                         As[di].data_ptr(),
                         Bs[di].data_ptr(),
                         Cs[di].data_ptr(), M)

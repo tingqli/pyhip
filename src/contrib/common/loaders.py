@@ -87,17 +87,6 @@ def get_mfma_loader_row_major(J, num_warps, M, K, vm_stride, warpid_m):
             m            (int) : m*16 is row offset of [16,64] tile inside [M, K] u8-LDS-tile
             k            (int) : k*64 is col offset of [16,64] tile inside [M, K] u8-LDS-tile
     """
-    if 0:
-        # 通过下面的可视化得知swizzle可以解决读入数据使用mfma格式ds_read时潜在的bank-conflict问题
-        mfma_MN = 16
-        mfma_K = 64//mfma_MN
-        num_mfmas = K // (mfma_K * J.sizeof_DW4)
-        J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas)
-        J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_1=1)
-        J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_2=1)
-        J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_2=2)
-        print(f"{wg_M=} {wg_K=} {M=} {K=}")
-        assert 0
     #1K bytes is 8 rows in LDS. 1024/2/54 = 8 rows. 64 thread lds write would be 8 rows.
     padding_on_1K = 32
     # each wave load 8x128 bytes , 8 waves loads 64x128 bytes
