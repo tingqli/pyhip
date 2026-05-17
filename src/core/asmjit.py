@@ -658,6 +658,10 @@ class Buffer:
         self.base[1] = base[1]
         self.range[0] = size # size可以是GPRExpr
 
+    def advance(self, offset):
+        self.J.s_add_u32(self.base[0], self.base[0], offset[0])
+        self.J.s_addc_u32(self.base[1], self.base[1], 0)
+        self.J.s_sub_u32(self.range[0], self.range[0], offset[0])
     def load_dwordx4(self, vdst, voffset, soffset, offset12=0, non_temporal=False):
         # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
         assert isinstance(offset12 , int) # must be compile time constant
