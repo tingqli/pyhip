@@ -235,7 +235,7 @@ def moe_gemm_ref(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, gate_up,
         else:
             output[tok_ids[valid_mask], ...] += act[valid_mask, ...] * tok_w[valid_mask, None]
 
-def test_gateup(B, HIDDEN_SIZE, INTER_SIZE_TP, EXPERTS, TOPK, TILE_M=128, TILE_N=128, test_acc=True):
+def run_test_gateup(B, HIDDEN_SIZE, INTER_SIZE_TP, EXPERTS, TOPK, TILE_M=128, TILE_N=128, test_acc=True):
     from aiter.utility.fp4_utils import moe_mxfp4_sort
     from aiter.fused_moe import moe_sorting
 
@@ -337,7 +337,7 @@ def test_gateup(B, HIDDEN_SIZE, INTER_SIZE_TP, EXPERTS, TOPK, TILE_M=128, TILE_N
         print(f"{gateup_IC=} {num_valid_ids=}")
 
 
-def test_down():
+def run_test_down():
 
     E = 128
     TOPK = 8
@@ -431,7 +431,7 @@ def test_down():
             assert 0
 
 
-def test_moe_gemm_final_reduce_bf16():
+def run_test_moe_gemm_final_reduce_bf16():
     TOPK = 8
     OC = 4096
     num_tokens_total = 24000
@@ -482,8 +482,8 @@ def test_moe_gemm_final_reduce_bf16():
 
 if __name__ == "__main__":
 
-    #test_moe_gemm_final_reduce_bf16()
-    #test_down()
+    #run_test_moe_gemm_final_reduce_bf16()
+    #run_test_down()
     if 1:
         #test_gateup(256*8, 4096, 1536, 128, 8, TILE_M=128, TILE_N=128, test_acc=True)
         #test_gateup(256*8, 4096, 1536, 128, 8, TILE_M=256, TILE_N=128, test_acc=True)
@@ -491,7 +491,7 @@ if __name__ == "__main__":
         test_gateup(256*8, 4096, 1536, 128, 8, TILE_M=256, TILE_N=256, test_acc=True)
 
     B = 2048*32
-    #test_gateup(B, 4096, 1536, 128, 8, TILE_M=128, TILE_N=128, use_8wave=use_8wave, test_acc=False)
-    #test_gateup(B, 4096, 1536, 128, 8, TILE_M=256, TILE_N=128, use_8wave=use_8wave, test_acc=False)
-    #test_gateup(B, 4096, 1536, 128, 8, TILE_M=128, TILE_N=256, use_8wave=use_8wave, test_acc=False)
-    test_gateup(B, 4096, 1536, 128, 8, TILE_M=256, TILE_N=256, test_acc=False)
+    #run_test_gateup(B, 4096, 1536, 128, 8, TILE_M=128, TILE_N=128, use_8wave=use_8wave, test_acc=False)
+    #run_test_gateup(B, 4096, 1536, 128, 8, TILE_M=256, TILE_N=128, use_8wave=use_8wave, test_acc=False)
+    #run_test_gateup(B, 4096, 1536, 128, 8, TILE_M=128, TILE_N=256, use_8wave=use_8wave, test_acc=False)
+    run_test_gateup(B, 4096, 1536, 128, 8, TILE_M=256, TILE_N=256, test_acc=False)
