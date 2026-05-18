@@ -1356,16 +1356,11 @@ def moe_2stage_gateup(J:JIT,
 
     # grid: N // 32, sorted_expert_ids.shape[0]
     # expert index in p_sorted_expert_ids
-    e_idx, blockn_idx = xcd_swizzle(J, J.blockIdx.x, num_blocks, N // BLOCK_TILE_SIZE_N, 8, 10)
+    e_idx, blockn_idx = xcd_swizzle(J, J.blockIdx.x, num_blocks, N // BLOCK_TILE_SIZE_N, 4, 20)
     s_e_id = J.gpr(1, 'su32')
     J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
     max_id = J.gpr(1, 'su32')
     J.s_load_dword(max_id, p_num_valid_ids, 0)
-
-    VALID_TILE_SIZES = [s for s in [64, 128] if s < BLOCK_TILE_SIZE_M]
-    s_sorted_id_tile = J.gpr(len(VALID_TILE_SIZES), 'su32')
-    for n in range(len(VALID_TILE_SIZES)):
-        J.s_load_dword(s_sorted_id_tile[n], p_sorted_ids, VALID_TILE_SIZES[n] * J.sizeof_DW)
 
     J.s_waitcnt(mod=f"lgkmcnt(0)")
     # invalid padding section
@@ -1376,6 +1371,13 @@ def moe_2stage_gateup(J:JIT,
 
     # hide following initialization into s_waitcnt
     p_sorted_ids[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
+    VALID_TILE_SIZES = [s for s in [64, 128] if s < BLOCK_TILE_SIZE_M]
+    s_sorted_id_tile = J.gpr(len(VALID_TILE_SIZES), 'su32')
+    for n in range(len(VALID_TILE_SIZES)):
+        J.s_load_dword(s_sorted_id_tile[n], p_sorted_ids, VALID_TILE_SIZES[n] * J.sizeof_DW)
+
+    if len(VALID_TILE_SIZES):
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
     # one WG per CU,  4 waves split on K
     lane_mod_16 = get_lane_id_mod(J, 16)
     lane_div_16 = get_lane_id_div(J, 16)
@@ -1643,7 +1645,7 @@ def moe_2stage_down(J:JIT,
     else:
         fp8_ptpc = None
 
-    e_idx, _ = xcd_swizzle(J, J.blockIdx.y, num_blocks, 1, 8, 10)
+    e_idx, _ = xcd_swizzle(J, J.blockIdx.y, num_blocks, 1, 4, 20)
     s_e_id = J.gpr(1, 'su32')
     J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
     max_id = J.gpr(1, 'su32')
