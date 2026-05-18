@@ -7,7 +7,7 @@ from pyhip.contrib.gluon.gemm_splitk import gemm_splitk_kernel
 
 #####################################################################
 from pyhip import cudaPerf
-from common.utils import gen_timing
+from pyhip.contrib.gluon.utils import gen_timing
 from torch import Tensor
 import pytest
 

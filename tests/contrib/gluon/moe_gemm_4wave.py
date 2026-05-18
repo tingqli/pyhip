@@ -181,7 +181,8 @@ def show_perf(perf):
 def test_perf(batch, TILE_M=128, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8, E=32, TOPK=8):
     init_env()
     perf = {}
-    perf.update(entry_common('aiter', batch, prec=[torch.bfloat16,], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, E=E, TOPK=TOPK))
+    # aiter kernel type core dump on cdna4
+    #perf.update(entry_common('aiter', batch, prec=[torch.bfloat16,], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, E=E, TOPK=TOPK))
     perf.update(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=E, TOPK=TOPK))
     show_perf(perf)
 
