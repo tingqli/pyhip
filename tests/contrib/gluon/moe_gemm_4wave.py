@@ -38,7 +38,9 @@ def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids):
 def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=128, TILE_N=64, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8):
     from aiter.ops.shuffle import shuffle_weight
     INTER_SIZE_TP = INTER_SIZE // TP
-    BUF_COPY = 10
+    # acc (run_count=0): only hidden_states[0] etc. are used; smaller BUF_COPY saves VRAM.
+    # perf (run_count>0): rotate buffers to reduce L2 reuse across timed iterations.
+    BUF_COPY = 2 if run_count == 0 else 10
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
     if weight_type == torch.bfloat16:
         w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=weight_type)*0.1
@@ -149,14 +151,32 @@ def init_env():
     torch.set_default_device('cuda')
     torch.manual_seed(0)
 
-def test_acc(TILE_M=128, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
-    init_env()
+def _acc_batch_sizes():
     batch = list(range(2, 64))
     batch += list(range(128, 256))
     batch += [i * 256 for i in range(1, 4)]
     batch += [i * 2048 for i in range(1, 5)]
     batch += list(range(2048 * 3, 2048 * 3 + 256))
-    entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
+    return batch
+
+
+ACC_BATCH_SIZES = _acc_batch_sizes()
+
+
+@pytest.mark.parametrize("B", ACC_BATCH_SIZES, ids=[f"B={b}" for b in ACC_BATCH_SIZES])
+def test_acc(B, TILE_M=256, TILE_N=256, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
+    init_env()
+    entry_common(
+        "mxn_splitk_2s",
+        batch = [B],
+        prec=[torch.bfloat16],
+        TILE_M=TILE_M,
+        TILE_N=TILE_N,
+        HIDDEN_SIZE=HIDDEN_SIZE,
+        INTER_SIZE=INTER_SIZE,
+        TP=TP,
+        run_count=0,
+    )
 
 def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=512, TP=8, run_count=10):
     perf = {}
@@ -178,10 +198,9 @@ def show_perf(perf):
 
 
 @pytest.mark.parametrize("batch", [[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]])
-def test_perf(batch, TILE_M=128, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8, E=32, TOPK=8):
+def test_perf(batch, TILE_M=256, TILE_N=256, HIDDEN_SIZE=4096, INTER_SIZE=1536, TP=8, E=32, TOPK=8):
     init_env()
     perf = {}
-    # aiter kernel type core dump on cdna4
     #perf.update(entry_common('aiter', batch, prec=[torch.bfloat16,], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N, E=E, TOPK=TOPK))
     perf.update(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=E, TOPK=TOPK))
     show_perf(perf)
