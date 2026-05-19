@@ -235,7 +235,7 @@ for _ in range(10):
 
 # test_reduce()
 
-def test_reduce():
+def run_test_reduce():
     def unpack_dequant32(output, o_scales):
         # output   [num_tokens, topk, odims] torch.int8
         # o_scales [num_tokens, topk, odims//oquant_block_size] torch.bfloat16
@@ -323,4 +323,4 @@ def test_reduce():
             hip.reduce_i8([num_tokens], [256], x_packed.data_ptr(), scale_packed.data_ptr(), out.data_ptr(), num_tokens)
 
 if __name__ == "__main__":
-    test_reduce()
+    run_test_reduce()
