@@ -11,6 +11,7 @@ from pyhip.contrib.moe import *
 
 import aiter
 from aiter.utility import fp4_utils
+import gc
 
 USE_FP4_SHUFFLE_WEIGHT = 1
 
@@ -679,7 +680,6 @@ def test_acc_mxn_splitk_2s_fp8(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_S
     init_env()
     entry_common('mxn_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0, fp8_ptpc=fp8_ptpc)
 
-
 @pytest.mark.parametrize("batch", [get_batch_list('mxn_splitk_2s')])
 @pytest.mark.parametrize("prec", [[get_fp4type_if_valid()]])
 @pytest.mark.parametrize("HIDDEN_SIZE", [4096])
@@ -730,6 +730,10 @@ def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
     perf.append(entry_b1(prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))           # batch 1
     perf.append(entry_common('16x32_2s_b', batch=batch, prec=[get_fp8type()], TILE_M=16, TILE_N=32, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     show_perf(perf)
+    del perf
+    torch.cuda.empty_cache()
+    gc.collect()
+
 
 @pytest.mark.parametrize("batch", [[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]])
 def test_perf(batch, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
@@ -747,6 +751,9 @@ def test_perf(batch, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP
     perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=10, E=512, TP=TP, fp8_ptpc=True))
     perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=10, E=512,  TP=TP, fp8_ptpc=False))
     show_perf(perf)
+    del perf
+    torch.cuda.empty_cache()
+    gc.collect()
 
 if __name__ == '__main__':
     TILE_M = 16

@@ -14,6 +14,13 @@ os.environ["PYHIP_SIMPLE_GEN_FILENAME"] = "1"
 
 import pyhip
 from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
+import pytest
+
+
+def init_env():
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
+    torch.set_default_device('cuda')
+    torch.manual_seed(0)
 
 def div_up(x, y):
     return (x + y - 1) // y
@@ -575,7 +582,14 @@ def fused_moe_gelu_sq_mxfp4(
 
     return moe_out
 
+
+@pytest.mark.parametrize("num_experts, topk", [(800, 25), (400, 20)])
+@pytest.mark.parametrize("num_tokens", [20480, 19147])
+@pytest.mark.parametrize("use_smoothquant, shared_smoothquant_up", [(1, 0), (1, 1), (0, 0)])
+@pytest.mark.parametrize("model_dim", [4096])
+@pytest.mark.parametrize("inter_dim", [1536])
 def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoothquant, shared_smoothquant_up):
+    init_env()
     device = "cuda"
 
     x0 = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16, device=device)
@@ -739,6 +753,15 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
         print(f"\t{pyhip.calc_diff(ref0, ret_fp4)=:.6f}  {dt_fp4:.0f} us")
         print(f"\t{pyhip.calc_diff(ref1, ret_fp4, -0.01)=:.6f}  {dt_fp4:.0f} us")
 
+    del ref0, ref1
+    del ret_i8, dt_i8
+    del ret_i8q, dt_i8q
+    del ret_fp4, dt_fp4
+    del ret_asm, dt_asm
+    import gc
+    torch.cuda.empty_cache()
+    gc.collect()
+
     return ret
 
 if __name__ == "__main__":
@@ -747,8 +770,11 @@ if __name__ == "__main__":
     if 1:
         summary = []
         for num_experts, topk in [(800, 25), (400, 20)]:
-            for num_tokens in [40960, 20480, 19147]:
+            # for num_tokens in [40960, 20480, 19147]:
+            # (TODO) Xiake: 40960 cause 4GB OOM issue during python compilation, skip it first, need to double check
+            for num_tokens in [20480, 19147]:
                 for use_smoothquant, shared_smooth_up in [(1, 0), (1, 1), (0, 0)]:
+                    # print(f"num_experts: {num_experts}, topk: {topk}, num_tokens: {num_tokens}, use_smoothquant: {use_smoothquant}, shared_smooth_up: {shared_smooth_up}")
                     ret = test_fmoe_sqi8(num_tokens = num_tokens,
                                        model_dim = 4096, inter_dim = 1536,
                                        num_experts = num_experts,
