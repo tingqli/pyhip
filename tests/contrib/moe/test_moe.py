@@ -214,10 +214,12 @@ class TestCase:
             w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
             w1_qt, w1_qt_scale, w1_ref = quant_expert_weights(w_, fp8_quant_type, weight_type)
             w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
+            for e in w1: e.is_shuffled = True
             w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
             w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
             w2_qt, w2_qt_scale, w2_ref = quant_expert_weights(w_, fp8_quant_type, weight_type)
             w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
+            for e in w2: e.is_shuffled = True
             w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
         elif wei_is_fp8(weight_type):
             def weight_per_128x128_quant(weight, quant_dtype):
