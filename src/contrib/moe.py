@@ -55,6 +55,7 @@ def moe_gemm_batch1(J:JIT,
                     M:"int",
                     N:"int",
                     K:"int",
+                    quant_type_str,
                     ):
 
     BLOCK_TILE_SIZE_M = 16  # nBM * 16
@@ -105,7 +106,7 @@ def moe_gemm_batch1(J:JIT,
         p_input[:] = p_input[:] + e_idx * (K * sizeof_bf16)
         voffset_b[1] = voffset_b[0] + K * (16 * sizeof_w)
     p_output[:] = p_output[:] + output_offset
-    if weight_dtype != torch.bfloat16:
+    if weight_dtype != torch.bfloat16 and quant_type_str == 'per_Token':
         p_w_scale[:] += (16 if with_silu else 32) * sizeof_f32 * J.blockIdx.x
 
     # 16 elements for a if fp8
@@ -121,12 +122,15 @@ def moe_gemm_batch1(J:JIT,
 
     voffset_scale = J.gpr(2, 'vu32')
     if weight_dtype != torch.bfloat16:
-        voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_div_16 * (4 * sizeof_f32)
-        voffset_scale[1] = voffset_scale[0] + (N // 2 * sizeof_f32 if with_silu else 16 * sizeof_f32)
+        if quant_type_str == 'per_Tensor':
+            voffset_scale[0] = J.gpr(s_e_id * sizeof_f32)
+        else:
+            voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_div_16 * (4 * sizeof_f32)
+            voffset_scale[1] = voffset_scale[0] + (N // 2 * sizeof_f32 if with_silu else 16 * sizeof_f32)
 
     gemm_splitk(J, weight_dtype, K, N, num_split_k,
                 buff_a, buff_b, p_w_scale,
-                voffset_a, voffset_b, voffset_scale, C_reg)
+                voffset_a, voffset_b, voffset_scale, C_reg, quant_type_str=quant_type_str)
 
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
@@ -208,7 +212,8 @@ def moe_gemm_batch(J:JIT,
                    M:"int",
                    N:"int",
                    K:"int",
-                   TOPK:"int"):
+                   TOPK:"int",
+                   quant_type_str,):
     BLOCK_TILE_SIZE_M = 16  # nBM * 16
     BLOCK_TILE_SIZE_N = 32  # nBN * 32
     BLOCK_SIZE_K = 32
@@ -286,13 +291,16 @@ def moe_gemm_batch(J:JIT,
 
     voffset_scale = J.gpr(2, 'vu32')
     if weight_dtype != torch.bfloat16:
-        p_w_scale[:] += (16 if with_silu else 32) * sizeof_f32 * J.blockIdx.x
-        voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_div_16 * (4 * sizeof_f32)
-        voffset_scale[1] = voffset_scale[0] + (N // 2 * sizeof_f32 if with_silu else 16 * sizeof_f32)
+        if quant_type_str == 'per_Tensor':
+            voffset_scale[0] = J.gpr(s_e_id * sizeof_f32)
+        else:
+            p_w_scale[:] += (16 if with_silu else 32) * sizeof_f32 * J.blockIdx.x
+            voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_div_16 * (4 * sizeof_f32)
+            voffset_scale[1] = voffset_scale[0] + (N // 2 * sizeof_f32 if with_silu else 16 * sizeof_f32)
 
     gemm_splitk(J, weight_dtype, K, N, num_split_k,
                 buff_a, buff_b, p_w_scale,
-                voffset_a, voffset_b, voffset_scale, C_reg)
+                voffset_a, voffset_b, voffset_scale, C_reg, quant_type_str=quant_type_str)
 
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
@@ -380,7 +388,9 @@ def moe_2stage_splitk(J:JIT,
                       p_num_valid_ids:"void*",
                       p_w_scale:"float*",
                       M:"int",
-                      fp8_ptpc,):
+                      quant_type_str,):
+    fp8_ptpc = True if quant_type_str == 'per_Token' else False
+    fp8_per_tensor = True if quant_type_str == 'per_Tensor' else False
     assert weight_dtype == torch.bfloat16 or weight_dtype == torch.float4_e2m1fn_x2 or weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz
     if weight_dtype == torch.float4_e2m1fn_x2:
         if with_silu:
@@ -551,38 +561,42 @@ def moe_2stage_splitk(J:JIT,
             voffset_scale[0] = J.gpr(s_e_id * (N * k_scale_stride)) + J.threadIdx.x * sizeof_f32
             for m in range(1, B_horz // 2):
                 voffset_scale[m] = voffset_scale[0] + 32 * k_scale_stride * m
-    elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc:
-        voffset_scale = J.gpr(B_horz, 'vu32')
-        p_w_scale[:] += (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * sizeof_f32 * J.blockIdx.x
-        voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_div_16 * (4 * sizeof_f32)
-        if with_silu:
-            voffset_scale[B_horz // 2] = voffset_scale[0] + N // 2 * sizeof_f32
-            for m in range(1, B_horz // 2):
-                voffset_scale[m] = voffset_scale[0] + 16 * sizeof_f32 * m
-                voffset_scale[B_horz // 2 + m] = voffset_scale[B_horz // 2] + 16 * sizeof_f32 * m
+    elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz):
+        if fp8_per_tensor:
+            voffset_scale = J.gpr(B_horz, 'vu32')
+            voffset_scale[0] = J.gpr(s_e_id * sizeof_f32)
+        elif fp8_ptpc:
+            voffset_scale = J.gpr(B_horz, 'vu32')
+            p_w_scale[:] += (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * sizeof_f32 * J.blockIdx.x
+            voffset_scale[0] = J.gpr(s_e_id * (N * sizeof_f32)) + lane_div_16 * (4 * sizeof_f32)
+            if with_silu:
+                voffset_scale[B_horz // 2] = voffset_scale[0] + N // 2 * sizeof_f32
+                for m in range(1, B_horz // 2):
+                    voffset_scale[m] = voffset_scale[0] + 16 * sizeof_f32 * m
+                    voffset_scale[B_horz // 2 + m] = voffset_scale[B_horz // 2] + 16 * sizeof_f32 * m
+            else:
+                for m in range(1, B_horz):
+                    voffset_scale[m] = voffset_scale[0] + 16 * sizeof_f32 * m
         else:
-            for m in range(1, B_horz):
-                voffset_scale[m] = voffset_scale[0] + 16 * sizeof_f32 * m
-    elif (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and not fp8_ptpc:
-        assert K %(num_split_k*128) == 0 ,f' K %(num_split_k*128) must be 0'
-        # the scale layout is [E, N//128, K//128]
-        k_scale_stride = K // 128 * sizeof_f32
-        # would need BLOCK_TILE_SIZE_N//128 *2 scale offset register for 1st stage. 
-        voffset_scale = J.gpr(2, 'vu32')
-        # N_wg scale offset on expert wg and N wg.
-        if with_silu:
-            p_w_scale[:] +=  BLOCK_TILE_SIZE_N_HALF* J.blockIdx.x // 128 * k_scale_stride + s_e_id * (N//128 * k_scale_stride)
-        else:
-            p_w_scale[:] +=  BLOCK_TILE_SIZE_N * J.blockIdx.x //128 * k_scale_stride + s_e_id * (N//128 * k_scale_stride )
-        if with_silu:
-            #[E, INTER_SIZE_TP*2//128, HIDDEN_SIZE//128]
-            voffset_scale[0] = J.threadIdx.x //128 * sizeof_f32
-            # N tile offset within wave offset
-            voffset_scale[1] = voffset_scale[0] + (N//2//128 * k_scale_stride )
-        else:
-            #  64 lane offset 
-            voffset_scale[0] = 0
-            voffset_scale[1] = 0
+            assert K %(num_split_k*128) == 0 ,f' K %(num_split_k*128) must be 0'
+            # the scale layout is [E, N//128, K//128]
+            k_scale_stride = K // 128 * sizeof_f32
+            # would need BLOCK_TILE_SIZE_N//128 *2 scale offset register for 1st stage. 
+            voffset_scale = J.gpr(2, 'vu32')
+            # N_wg scale offset on expert wg and N wg.
+            if with_silu:
+                p_w_scale[:] +=  BLOCK_TILE_SIZE_N_HALF* J.blockIdx.x // 128 * k_scale_stride + s_e_id * (N//128 * k_scale_stride)
+            else:
+                p_w_scale[:] +=  BLOCK_TILE_SIZE_N * J.blockIdx.x //128 * k_scale_stride + s_e_id * (N//128 * k_scale_stride )
+            if with_silu:
+                #[E, INTER_SIZE_TP*2//128, HIDDEN_SIZE//128]
+                voffset_scale[0] = J.threadIdx.x //128 * sizeof_f32
+                # N tile offset within wave offset
+                voffset_scale[1] = voffset_scale[0] + (N//2//128 * k_scale_stride )
+            else:
+                #  64 lane offset 
+                voffset_scale[0] = 0
+                voffset_scale[1] = 0
     if (weight_dtype == torch.bfloat16 or weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) and fp8_ptpc and not with_silu:
         for m in range(A_vert):
             v_weight[m, 1] = v_weight[m, 0]
@@ -596,7 +610,7 @@ def moe_2stage_splitk(J:JIT,
 
     gemm_splitk(J, weight_dtype, K, N, num_split_k,
                 buff_a, buff_b, p_w_scale,
-                voffset_a, voffset_b, voffset_scale, C_reg, BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M, USE_FP4_SHUFFLE_WEIGHT=USE_FP4_SHUFFLE_WEIGHT, fp8_ptpc=fp8_ptpc)
+                voffset_a, voffset_b, voffset_scale, C_reg, BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M, USE_FP4_SHUFFLE_WEIGHT=USE_FP4_SHUFFLE_WEIGHT, quant_type_str=quant_type_str)
 
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000

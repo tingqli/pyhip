@@ -16,6 +16,29 @@ USE_FP4_SHUFFLE_WEIGHT = 1
 
 DDD = int(os.getenv("DDD", "0"))
 
+def is_arch_type(arch):
+    props = torch.cuda.get_device_properties()
+    return arch in props.gcnArchName
+
+def get_fp8type():
+    return torch.float8_e4m3fn if is_arch_type('950') else torch.float8_e4m3fnuz
+
+def get_fp4type_if_valid():
+    return torch.float4_e2m1fn_x2 if is_arch_type('950') else None
+
+prec_bf16 = (torch.bfloat16, aiter.QuantType.No)
+prec_fp8_ptpc = (get_fp8type(), aiter.QuantType.per_Token)
+prec_fp8_b = (get_fp8type(), aiter.QuantType.per_1x128)
+prec_fp8_t = (get_fp8type(), aiter.QuantType.per_Tensor)
+prec_mxfp4 = (get_fp4type_if_valid(), aiter.QuantType.per_1x32)
+
+quant2str_dict = {
+    aiter.QuantType.per_Token: 'per_Token',
+    aiter.QuantType.per_1x128: 'per_1x128',
+    aiter.QuantType.per_Tensor: 'per_Tensor',
+    aiter.QuantType.per_1x32: 'per_1x32',
+}
+
 def _run_aiter(hidden_states,
             w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
             w2,  # [expert(local_expert:EP), dim, inter_dim]
@@ -91,15 +114,6 @@ from aiter.utility import fp4_utils
 from aiter.ops.quant import pertoken_quant
 
 ext_topk_ids = None
-def is_arch_type(arch):
-    props = torch.cuda.get_device_properties()
-    return arch in props.gcnArchName
-
-def get_fp8type():
-    return torch.float8_e4m3fn if is_arch_type('950') else torch.float8_e4m3fnuz
-
-def get_fp4type_if_valid():
-    return torch.float4_e2m1fn_x2 if is_arch_type('950') else None
 
 def quant_expert_weights(w1, quant_type, dtype):
     if quant_type == aiter.QuantType.per_Token:
@@ -289,6 +303,7 @@ class TestCase:
 
         def run(hidden_states, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale, fp8_quant_type):
             fp8_ptpc = (fp8_quant_type == aiter.QuantType.per_Token)
+            quant_type_str = quant2str_dict.get(fp8_quant_type, 'no')
             B = hidden_states.shape[0]
             E, N1, K1 = w1.shape
             N2, K2 = w2.shape[1], w2.shape[2]
@@ -298,8 +313,8 @@ class TestCase:
             if kernel_type == '16x32_2s_b1':
                 # test moe_gemm_batch: 2 stages, BLOCK_TILE_M=16, BLOCK_TILE_N=32, batch == 1
                 cur_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
-                moe_gemm_batch1([N1 // 32, TOPK],[256], w1.dtype, True, hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, 1, N1, K1)
-                moe_gemm_batch1([N2 // 32, TOPK],[64], w1.dtype, False, gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, 1, N2, K2)
+                moe_gemm_batch1([N1 // 32, TOPK],[256], w1.dtype, True, hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, 1, N1, K1, quant_type_str)
+                moe_gemm_batch1([N2 // 32, TOPK],[64], w1.dtype, False, gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, 1, N2, K2, quant_type_str)
             elif kernel_type == '16x32_2s_b':
                 # test moe_gemm_batch: 2 stages, BLOCK_TILE_M=16, BLOCK_TILE_N=32
                 sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
@@ -318,7 +333,7 @@ class TestCase:
                     grid = B * TOPK
                 moe_gemm_batch([N1 // 32, grid], [256],
                                 w1.dtype, True,
-                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B, N1, K1, TOPK)
+                                hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B, N1, K1, TOPK, quant_type_str)
                 # moe_gemm_batch([N2 // 32, grid], [64],
                 #                 w1.dtype, False,
                 #                 gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, N2, K2, TOPK)
@@ -345,7 +360,7 @@ class TestCase:
                     BLOCK_TILE_SIZE_N = 64
                     moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
                                     w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                    gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc)
+                                    gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, quant_type_str)
             elif kernel_type == 'mxn_splitk_2s':
                 # test moe_gemm_batch_vmn: 2 stages, m/n can be set
                 if weight_type == torch.float4_e2m1fn_x2:
@@ -770,12 +785,6 @@ class TestCase:
                         print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops,  diff : {data["diff"]:.6f}')
 
 
-prec_bf16 = (torch.bfloat16, aiter.QuantType.No)
-prec_fp8_ptpc = (get_fp8type(), aiter.QuantType.per_Token)
-prec_fp8_b = (get_fp8type(), aiter.QuantType.per_1x128)
-prec_fp8_t = (get_fp8type(), aiter.QuantType.per_Tensor)
-prec_mxfp4 = (get_fp4type_if_valid(), aiter.QuantType.per_1x32)
-
 def init_env():
     torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
     torch.set_default_device('cuda')
@@ -865,11 +874,6 @@ if __name__ == '__main__':
         # batch = [1, 2, 4, 8, 16, 32,64,128, 256]
         # test_perf(batch, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
     else:
-        #batch = [i * 8192 for i in range(1, 11)]
-        #batch = [i * 1024 for i in range(1, 9)] + [8192*2, 8192*4, 8192*8]
-        batch = [i * 128 for i in range(1, 9)]
-        batch = [64,128,256,512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
-        #batch = [8192, 16384, 32768, 65536, 131072]
         batch = [512, 1024, 2048]
         #batch = [8192,]
         if 0:
@@ -877,12 +881,22 @@ if __name__ == '__main__':
             print(ext_topk_ids.shape)
             batch[0] = ext_topk_ids.shape[0]
 
-        TILE_M, TILE_N = 128, 128
         HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK = 4096, 192, 192, 8
-        test = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
-        test.entry_common('aiter', batch, prec=[prec_fp8_ptpc])
-        test.entry_common('mxn_2s', batch, prec=[prec_fp8_t])
-        test.show_perf()
+        #decoding
+        TILE_M, TILE_N = 16, 64
+        batch = [2, 4, 8, 16, 32, 64, 128, 256]
+        test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
+        test_dec.entry_common('aiter', [1] + batch, prec=[prec_fp8_t])
+        test_dec.entry_common('16x32_2s_b1', [1], prec=[prec_fp8_t])
+        test_dec.entry_common('16x32_2s_b', batch, prec=[prec_fp8_t])
+
+        TILE_M, TILE_N = 128, 128
+        batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
+        test_prefill = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
+        test_prefill.entry_common('aiter', batch, prec=[prec_fp8_t])
+        test_prefill.entry_common('mxn_2s', batch, prec=[prec_fp8_t])
+        test_dec.show_perf()
+        test_prefill.show_perf()
         #entry_common('mxn_2s', batch=batch, prec=[get_fp8type()], E=E, TOPK=TOPK, TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
         #test_perf(batch, TILE_M=128, TILE_N=256, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE_TP=INTER_SIZE_TP, E=E, TOPK=TOPK, test_sets=['aiter', 'mxn_2s'])
 
