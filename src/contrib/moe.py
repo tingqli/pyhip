@@ -1188,6 +1188,7 @@ def moe_2stage_gateup(J:JIT,
                       N,            # compile-time args
                       BLOCK_TILE_SIZE_M,
                       BLOCK_TILE_SIZE_N,
+                      quant_type_w, # weight-quantization methods, activation is always per-token
                       p_input:"void*",
                       p_weight:"void*",
                       p_output:"void*",
@@ -1339,8 +1340,9 @@ def moe_2stage_gateup(J:JIT,
 
     BLOCK_TILE_SIZE_N_HALF = BLOCK_TILE_SIZE_N // 2
 
-    is_fp8_ptpc = str(weight_dtype).startswith("torch.float8_e4m3")
-    assert is_fp8_ptpc or str(weight_dtype) == "torch.bfloat16", str(weight_dtype)
+    is_fp8 = str(weight_dtype).startswith("torch.float8_e4m3")
+    if is_fp8:
+        assert quant_type_w == "QuantType.per_Token" or quant_type_w == "QuantType.per_Tensor"
 
     sizeof_bf16 = 2
     sizeof_f32 = 4
@@ -1403,7 +1405,7 @@ def moe_2stage_gateup(J:JIT,
         for n in range(A_vert_write):
             J.global_load_dword(v_sorted_id_write[n], v_sorted_id_write_off, p_sorted_ids, mod=f'offset:{n * write_row_lanes_per_wave * sizeof_f32}')
 
-        if is_fp8_ptpc:
+        if is_fp8:
             v_sorted_id_scale = J.gpr(CUR_BLOCK_TILE_SIZE_M // 2 // 16, 'vu32')
             v_sorted_id_scale_off = J.gpr((lane_mod_16 + J.warp_id // 2 * (CUR_BLOCK_TILE_SIZE_M // 2)) * 4)
             for n in range(CUR_BLOCK_TILE_SIZE_M // 2 // 16):
@@ -1417,7 +1419,7 @@ def moe_2stage_gateup(J:JIT,
 
         p_weight[:] = p_weight[:] + s_e_id * (N * K * sizeof_w)
 
-        gemm = UGEMM(J, 16, [CUR_BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2], [2, 2], K, N, is_fp8_ptpc)
+        gemm = UGEMM(J, 16, [CUR_BLOCK_TILE_SIZE_M // 2, BLOCK_TILE_SIZE_N // 2], [2, 2], K, N, is_fp8)
         swizzle_row_div = 1
         total_wave_cnt = 4
         loaderA = MFMA_DW4Loader(J, p_input, M * (K * sizeof_a), v_token_id,
@@ -1430,20 +1432,29 @@ def moe_2stage_gateup(J:JIT,
         # C_reg: [wave_nCM, wave_nCN]
         C_reg = gemm.run(loaderA, loaderB, None, M, 0, 0)
 
-        if is_fp8_ptpc:
+        if is_fp8:
             buff_sa = J.Buffer(pt_scale, M * J.sizeof("fp32"))
             v_pt_scales = J.gpr(gemm.wave_nCM, 'vf32')
             for m in range(gemm.wave_nCM):
                 voffset_sa = J.gpr("vu32", (v_sorted_id_scale[m] & 0xffffff) * J.sizeof_DW)
                 buff_sa.load_dword(v_pt_scales[m], voffset_sa, 0)
-            pc_scale[:] += s_e_id * (N * J.sizeof_DW) + BLOCK_TILE_SIZE_N_HALF * J.sizeof_DW * blockn_idx  + J.warp_id % 2 * BLOCK_TILE_SIZE_N_HALF // 2 * J.sizeof_DW # per-channel scales for weights
-            vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4)
-            scales_pc = J.gpr(gemm.wave_nCN, 4, "vf32")
-            for n in range(0, gemm.wave_nCN, 2):
-                J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
-            vaddr_pc_scale += N // 2 * J.sizeof_DW
-            for n in range(1, gemm.wave_nCN, 2):
-                J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
+            
+            if quant_type_w == "QuantType.per_Token":
+                pc_scale[:] += s_e_id * (N * J.sizeof_DW) + BLOCK_TILE_SIZE_N_HALF * J.sizeof_DW * blockn_idx  + J.warp_id % 2 * BLOCK_TILE_SIZE_N_HALF // 2 * J.sizeof_DW # per-channel scales for weights
+                vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4)
+                scales_pc = J.gpr(gemm.wave_nCN, 4, "vf32")
+                for n in range(0, gemm.wave_nCN, 2):
+                    J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
+                vaddr_pc_scale += N // 2 * J.sizeof_DW
+                for n in range(1, gemm.wave_nCN, 2):
+                    J.global_load_dwordx4(scales_pc[n], vaddr_pc_scale, pc_scale, mod=f"offset:{n // 2 * 16 * J.sizeof_DW}")
+
+            if quant_type_w == "QuantType.per_Tensor":
+                scales_pc = J.gpr("vf32")
+                voffset_sa = J.gpr('vu32', 0)
+                pc_scale[:] += s_e_id * J.sizeof_DW # each expert has a per-tensor scale
+                J.global_load_dword(scales_pc[0], voffset_sa, pc_scale)
+
             # vaddr_pc_scale[0] += num_mfma_n * 16 * J.sizeof_DW
             J.s_waitcnt(mod=f"vmcnt(0)")
 
@@ -1471,11 +1482,15 @@ def moe_2stage_gateup(J:JIT,
                     tmp = J.gpr(2, "vf32", align=2)
                     J.v_accvgpr_read_b32(tmp[0], C_reg[m, 2 * n + 0, i])
                     J.v_accvgpr_read_b32(tmp[1], C_reg[m, 2 * n + 1, i])
-                    if is_fp8_ptpc:
+                    if is_fp8:
                         tmp[0] *= v_pt_scales[m]
                         tmp[1] *= v_pt_scales[m]
-                        tmp[0] *= scales_pc[2 * n + 0, i]
-                        tmp[1] *= scales_pc[2 * n + 1, i]
+                        if quant_type_w == "QuantType.per_Token":
+                            tmp[0] *= scales_pc[2 * n + 0, i]
+                            tmp[1] *= scales_pc[2 * n + 1, i]
+                        if quant_type_w == "QuantType.per_Tensor":
+                            tmp[0] *= scales_pc[0]
+                            tmp[1] *= scales_pc[0]
                     tmp[0] = J.gpr(tmp[1] * J.silu(tmp[0]))
                     J.v_add_u32(vdata[i], tmp[0], s_cvt_bf16_bias)
                 vouts = J.gpr(2, "vf32")
@@ -1624,6 +1639,7 @@ def moe_2stage_down(J:JIT,
                     with_silu,           #
                     BLOCK_TILE_SIZE_M,   # 32
                     BLOCK_TILE_SIZE_N,   # 64
+                    quant_type_w,
                     p_input:"void*",     # [8192, 8, 128]
                     p_weight:"void*",    # [128, 2048, 128]
                     p_output:"void*",    # [8192, 2048]
@@ -1637,10 +1653,10 @@ def moe_2stage_down(J:JIT,
                     num_blocks:"int",):
     sizeof_w = J.sizeof(weight_dtype)
     dtype_A = "bf16"
-    is_fp8_ptpc = str(weight_dtype).startswith("torch.float8_e4m3")
-    assert is_fp8_ptpc or str(weight_dtype) == "torch.bfloat16", str(weight_dtype)
-    if is_fp8_ptpc:
-        fp8_ptpc = {}
+    is_fp8 = str(weight_dtype).startswith("torch.float8_e4m3")
+    
+    if is_fp8:
+        fp8_ptpc = {"quant_type_w":quant_type_w}
         dtype_A = "fp8"
     else:
         fp8_ptpc = None
@@ -1659,7 +1675,10 @@ def moe_2stage_down(J:JIT,
     p_sorted_ids[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
     p_sorted_weights[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
     p_weight[:] += s_e_id * (N * K * sizeof_w)
-    pc_scale[:] += s_e_id * (N * J.sizeof_DW) # per-channel scales for weights
+    if quant_type_w == "QuantType.per_Tensor":
+        pc_scale[:] += s_e_id * (1 * J.sizeof_DW) # per-tensor scales for weights
+    else:
+        pc_scale[:] += s_e_id * (N * J.sizeof_DW) # per-channel scales for weights
 
     mfma_MN = 16
     mfma_K = (64//mfma_MN) * (J.sizeof_DW4//J.sizeof(dtype_A))
@@ -1681,14 +1700,22 @@ def moe_2stage_down(J:JIT,
     for m in range(num_mfma_m):
         vaddr[m] = (v_sorted_id[m] & 0xFFFFFF) * (TOPK * K * sizeof_w) + (v_sorted_id[m]>>24) *(K * sizeof_w) + col * J.sizeof_DW4
 
-    if is_fp8_ptpc:
+    if is_fp8:
         buff_sa = J.Buffer(pt_scale, M * TOPK * J.sizeof("fp32"))
         v_pt_scales = J.gpr(num_mfma_m, 'vf32')
         for m in range(num_mfma_m):
             voffset_sa = J.gpr("vu32", (v_sorted_id[m] & 0xFFFFFF) * (TOPK * J.sizeof_DW) + (v_sorted_id[m]>>24) * J.sizeof_DW)
             buff_sa.load_dword(v_pt_scales[m], voffset_sa, 0)
         fp8_ptpc["v_pt_scales"] = v_pt_scales
-        fp8_ptpc["pc_scale"] = pc_scale
+
+        if quant_type_w == "QuantType.per_Token":
+            fp8_ptpc["pc_scale"] = pc_scale
+
+        if quant_type_w == "QuantType.per_Tensor":
+            v_pc_scales = J.gpr('vf32')
+            v_offset_zero = J.gpr('vu32', 0)
+            J.global_load_dword(v_pc_scales[0], v_offset_zero, pc_scale)
+            fp8_ptpc["v_pc_scales"] = v_pc_scales
 
     buff_a = J.Buffer(p_input, M * TOPK * K * J.sizeof(dtype_A))
     for m in range(num_mfma_m):
@@ -1769,9 +1796,10 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
     soff_b[0] = 0
 
     if fp8_ptpc is not None:
-        vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4 + J.warp_id * (mfma_MN * J.sizeof_DW)) # point to the start of pc scales for this WG
-        scales_pc = J.gpr(2, num_mfma_n, 4, "vf32")
-        buff_sb = J.Buffer(fp8_ptpc["pc_scale"], N * J.sizeof_DW)
+        if fp8_ptpc['quant_type_w'] == "QuantType.per_Token":
+            vaddr_pc_scale = J.gpr("vu32", (J.lane_id // 16) * J.sizeof_DW4 + J.warp_id * (mfma_MN * J.sizeof_DW)) # point to the start of pc scales for this WG
+            scales_pc = J.gpr(2, num_mfma_n, 4, "vf32")
+            buff_sb = J.Buffer(fp8_ptpc["pc_scale"], N * J.sizeof_DW)
 
     def loadB_generator(index):
         for n in range(num_mfma_n):
@@ -1780,7 +1808,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 buff_b.load_dwordx4(B[index,n,k], voff_b, soff_b)
                 soff_b[0] = soff_b[0] + mfma_MN * mfma_K * sizeof_w
             soff_b[0] = soff_b[0] + (3*num_mfma_k * mfma_MN * mfma_K * sizeof_w)
-        if fp8_ptpc is not None:
+        if fp8_ptpc is not None and fp8_ptpc['quant_type_w'] == "QuantType.per_Token":
             # load scales_pc for next block, each MFMA 16x16 block-B needs 16 scales
             # fp8_ptpc["v_pt_scales"] = v_pt_scales
             # fp8_ptpc["pc_scale"] = pc_scale
@@ -1818,10 +1846,16 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                     C[index,m,n,2] *= fp8_ptpc["v_pt_scales"][m]
                     C[index,m,n,3] *= fp8_ptpc["v_pt_scales"][m]
                     yield 16
-                    C[index,m,n,0] *= scales_pc[index, n, 0]
-                    C[index,m,n,1] *= scales_pc[index, n, 1]
-                    C[index,m,n,2] *= scales_pc[index, n, 2]
-                    C[index,m,n,3] *= scales_pc[index, n, 3]
+                    if fp8_ptpc['quant_type_w'] == "QuantType.per_Token":
+                        C[index,m,n,0] *= scales_pc[index, n, 0]
+                        C[index,m,n,1] *= scales_pc[index, n, 1]
+                        C[index,m,n,2] *= scales_pc[index, n, 2]
+                        C[index,m,n,3] *= scales_pc[index, n, 3]
+                    if fp8_ptpc['quant_type_w'] == "QuantType.per_Tensor":
+                        C[index,m,n,0] *= fp8_ptpc["v_pc_scales"][0]
+                        C[index,m,n,1] *= fp8_ptpc["v_pc_scales"][0]
+                        C[index,m,n,2] *= fp8_ptpc["v_pc_scales"][0]
+                        C[index,m,n,3] *= fp8_ptpc["v_pc_scales"][0]
 
     # prelog0, load Bn0
     J.emit(loadB_generator(0))

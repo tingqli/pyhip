@@ -135,7 +135,7 @@ class UGEMM:
                  wave_size:list,
                  wave_cnt:list,
                  K, N,
-                 is_fp8_ptpc=False):
+                 is_fp8=False):
         self.K = K
         self.N = N
         
@@ -145,8 +145,8 @@ class UGEMM:
         assert wave_size_M % mfma_MN == 0
         assert wave_size_N % mfma_MN == 0
         # *2 for 8-bf16/fp16 so DWORDx4 lane-size can be used
-        if is_fp8_ptpc:
-            assert mfma_MN == 16, 'fp8 ptpc only support 16x16x16'
+        if is_fp8:
+            assert mfma_MN == 16, 'fp8 only support 16x16x16'
             self.mfma_K = 2 * 32
         else:
             self.mfma_K = (2*8 if mfma_MN == 32 else 2*16)
@@ -176,8 +176,8 @@ class UGEMM:
         self.wave_nCM = wave_nCM
         self.wave_nCN = wave_nCN
         self.wave_nCK = wave_nCK
-        self.is_fp8_ptpc = is_fp8_ptpc
-        if is_fp8_ptpc:
+        self.is_fp8 = is_fp8
+        if is_fp8:
             self.sizeof_a = 1
             self.sizeof_b = 1
         else:
@@ -309,7 +309,7 @@ class UGEMM:
             16:("v_mfma_f32_16x16x32_bf16",16) if is_cdna4 else ("v_mfma_f32_16x16x16_bf16",16),
             32:("v_mfma_f32_32x32x16_bf16",32) if is_cdna4 else ("v_mfma_f32_32x32x8_bf16",32)
         }
-        if self.is_fp8_ptpc:
+        if self.is_fp8:
             mfma_info[16] = ("v_mfma_f32_16x16x32_fp8_fp8", 16)
         mfma_name = mfma_info[self.mfma_MN][0]
         mfma_cycles = mfma_info[self.mfma_MN][1]
