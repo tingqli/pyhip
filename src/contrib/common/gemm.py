@@ -364,6 +364,7 @@ class UGEMM:
                     J.emit(mfma0, 16*2)
 
             # ensure all waves has been finished reading LDS, so ds_write can overwrite it
+            J.emit(mfma0, 16*2)
             J.s_waitcnt(mod=f"lgkmcnt(0)")
             J.s_barrier()
 
@@ -372,17 +373,17 @@ class UGEMM:
                 J.emit([mfma0, mfma1], 16)
                 J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
                 loaderA.ds_write(r, ldsA)
-                J.emit([mfma0, mfma1], 16*2)
+                J.emit([mfma0, mfma1], 16*3)
                 loaderA.prefetch(r)
-                J.emit([mfma0, mfma1], 16*8)
+                J.emit([mfma0, mfma1], 16*3)
 
             for r in range(num_prefetch_N):
                 J.emit([mfma0, mfma1], 16)
                 J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
                 loaderB.ds_write(r, ldsB)
-                J.emit([mfma0, mfma1], 16*2)
+                J.emit([mfma0, mfma1], 16*3)
                 loaderB.prefetch(r)
-                J.emit([mfma0, mfma1], 16*8)
+                J.emit([mfma0, mfma1], 16*3)
 
             # enure mfma0 finished using part0 of mfma_A/mfma_B, before ds_read0 overwrites them
             # (most likely already empty and some part of mfma1 has been consumed)
