@@ -1677,8 +1677,10 @@ def moe_2stage_down(J:JIT,
                     TOPK, K, N,          # 8,  128, 2048
                     with_silu,           #
                     BLOCK_TILE_SIZE_M,   # 32
+                    SUB_M,
                     BLOCK_TILE_SIZE_N,   # 64
                     quant_type_w,
+                    p_id:"void*",
                     p_input:"void*",     # [8192, 8, 128]
                     p_weight:"void*",    # [128, 2048, 128]
                     p_output:"void*",    # [8192, 2048]
@@ -1700,28 +1702,12 @@ def moe_2stage_down(J:JIT,
     else:
         fp8_ptpc = None
 
-    e_idx, _ = xcd_swizzle(J, J.blockIdx.y, num_blocks, 1, 4, 20)
-    s_e_id = J.gpr(1, 'su32')
-    J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
     max_id = J.gpr(1, 'su32')
     J.s_load_dword(max_id, p_num_valid_ids, 0)
-    J.s_waitcnt(mod=f"lgkmcnt(0)")
-    # invalid padding section
-    J.Jump("continue_following", e_idx * BLOCK_TILE_SIZE_M < max_id)
-    J.s_endpgm()
-    J.Label("continue_following")
-
-    p_sorted_ids[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
-    p_sorted_weights[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
-    p_weight[:] += s_e_id * (N * K * sizeof_w)
-    if quant_type_w == "QuantType.per_Tensor":
-        pc_scale[:] += s_e_id * (1 * J.sizeof_DW) # per-tensor scales for weights
-    else:
-        pc_scale[:] += s_e_id * (N * J.sizeof_DW) # per-channel scales for weights
 
     mfma_MN = 16
     mfma_K = (64//mfma_MN) * (J.sizeof_DW4//J.sizeof(dtype_A))
-    num_mfma_m = J.div(BLOCK_TILE_SIZE_M, mfma_MN)
+    num_mfma_m = J.div(SUB_M, mfma_MN)
     num_mfma_k = J.div(K, mfma_K)
 
     A = J.gpr(num_mfma_m, num_mfma_k, 4, "abf16x2")
@@ -1729,80 +1715,124 @@ def moe_2stage_down(J:JIT,
     # collect token id
     row = J.lane_id % mfma_MN
     col = J.lane_id // mfma_MN
-    v_sorted_id = J.gpr(num_mfma_m, 'vu32')
-    for m in range(num_mfma_m):
-        J.global_load_dword(v_sorted_id[m], row*J.sizeof_DW + m*mfma_MN*J.sizeof_DW, p_sorted_ids)
-
-    J.s_waitcnt(mod=f"vmcnt(0)")
-
-    vaddr = J.gpr(num_mfma_m, "vu32")
-    for m in range(num_mfma_m):
-        vaddr[m] = (v_sorted_id[m] & 0xFFFFFF) * (TOPK * K * sizeof_w) + (v_sorted_id[m]>>24) *(K * sizeof_w) + col * J.sizeof_DW4
-
-    if is_fp8:
-        buff_sa = J.Buffer(pt_scale, M * TOPK * J.sizeof("fp32"))
-        v_pt_scales = J.gpr(num_mfma_m, 'vf32')
-        for m in range(num_mfma_m):
-            voffset_sa = J.gpr("vu32", (v_sorted_id[m] & 0xFFFFFF) * (TOPK * J.sizeof_DW) + (v_sorted_id[m]>>24) * J.sizeof_DW)
-            buff_sa.load_dword(v_pt_scales[m], voffset_sa, 0)
-        fp8_ptpc["v_pt_scales"] = v_pt_scales
-
-        if quant_type_w == "QuantType.per_Token":
-            fp8_ptpc["pc_scale"] = pc_scale
-
-        if quant_type_w == "QuantType.per_Tensor":
-            v_pc_scales = J.gpr('vf32')
-            v_offset_zero = J.gpr('vu32', 0)
-            J.global_load_dword(v_pc_scales[0], v_offset_zero, pc_scale)
-            fp8_ptpc["v_pc_scales"] = v_pc_scales
-
-    buff_a = J.Buffer(p_input, M * TOPK * K * J.sizeof(dtype_A))
-    for m in range(num_mfma_m):
-        for k in range(num_mfma_k):
-            buff_a.load_dwordx4(A[m,k], vaddr[m], 0, offset12=k*mfma_K*J.sizeof(dtype_A))
-
-    v_sorted_weights = J.gpr('vf32')
-    assert BLOCK_TILE_SIZE_M <= 256
-    with J.ExecMask(J.threadIdx.x < BLOCK_TILE_SIZE_M):
-        J.global_load_dword(v_sorted_weights, J.threadIdx.x * 4, p_sorted_weights)
-
-    J.s_waitcnt(mod=f"vmcnt(0)")
-
-    lds_weights = J.alloc_lds(256*4)
-    lds_token_ids = J.alloc_lds(256*4)
-
-    with J.ExecMask(J.threadIdx.x < BLOCK_TILE_SIZE_M):
-        J.ds_write_b32(J.threadIdx.x * 4, v_sorted_weights, mod=f"offset:{lds_weights}")
-    with J.ExecMask(J.threadIdx.x < 16):
-        for m in range(num_mfma_m):
-            J.ds_write_b32(J.lane_id * 4, (v_sorted_id[m] & 0xffffff) * TOPK + (v_sorted_id[m]>>24), mod=f"offset:{lds_token_ids + m*16*4}")
-
-    J.s_waitcnt(mod=f"lgkmcnt(0)")
-    J.s_barrier()
-
     M[0] *= TOPK
 
     J.get_sgpr_const(0x8000)
     J.get_sgpr_const(0x3020706)
-    # 0,1,2,3,4,5,6,7, num_mfma_m
-    if 1:
-        VALID_TILE_SIZES = [s for s in [64,96,128] if s < BLOCK_TILE_SIZE_M]
-        s_sorted_ids = J.gpr(len(VALID_TILE_SIZES), 'su32')
-        for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
-            J.v_readfirstlane_b32(s_sorted_ids[i], v_sorted_id[TILE_SIZE//mfma_MN])
 
-        for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
-            with J.If((s_sorted_ids[i] >> 24) == TOPK):
-                num_mfma_n = 1 if TILE_SIZE > 64 else 2
-                down_kernel(J, mfma_MN, num_mfma_n, TILE_SIZE, N, K,
+    with J.While():
+        idx = J.gpr(1, 'su32')
+        idx[0] = 0xffffffff
+        v_idx = J.gpr(1, 'vu32')
+        J.s_barrier()
+        with J.If(J.warp_id[0] == 0):
+            J.s_atomic_inc(idx, p_id, 0, mod='glc')
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            v_idx[0] = idx[0]
+            J.ds_write_b32(0 * row, v_idx, mod=f"offset:{0}")
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+        J.s_barrier()
+        J.ds_read_b32(v_idx, 0 * row, mod=f"offset:{0}")
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        J.v_readfirstlane_b32(idx, v_idx)
+        J.s_barrier()
+
+        e_idx, sub_m = xcd_swizzle(J, idx, num_blocks, BLOCK_TILE_SIZE_M // SUB_M, 4, 20)
+        # sub_m = J.blockIdx.x
+        s_e_id = J.gpr(1, 'su32')
+        J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        # invalid padding section
+        J.Jump("continue_following", e_idx * BLOCK_TILE_SIZE_M < max_id)
+        J.s_endpgm()
+        J.Label("continue_following")
+
+        p_cur_sorted_ids = J.gpr(2, 'su32')
+        p_cur_sorted_ids[:] = p_sorted_ids[:] + (e_idx * (BLOCK_TILE_SIZE_M * 4) + sub_m * (SUB_M * 4))
+        p_cur_sorted_weights = J.gpr(2, 'su32')
+        p_cur_sorted_weights[:] = p_sorted_weights[:] + (e_idx * (BLOCK_TILE_SIZE_M * 4) + sub_m * (SUB_M * 4))
+        p_cur_weight = J.gpr(2, 'su32')
+        p_cur_weight[:] = p_weight[:] + s_e_id * (N * K * sizeof_w)
+        cur_pc_scale = J.gpr(2, 'su32')
+        if quant_type_w == "QuantType.per_Tensor":
+            cur_pc_scale[:] = pc_scale[:] + s_e_id * (1 * J.sizeof_DW) # per-tensor scales for weights
+        else:
+            cur_pc_scale[:] = pc_scale[:] + s_e_id * (N * J.sizeof_DW) # per-channel scales for weights
+
+        v_sorted_id = J.gpr(num_mfma_m, 'vu32')
+        for m in range(num_mfma_m):
+            J.global_load_dword(v_sorted_id[m], row*J.sizeof_DW + m*mfma_MN*J.sizeof_DW, p_cur_sorted_ids)
+
+        J.s_waitcnt(mod=f"vmcnt(0)")
+
+        vaddr = J.gpr(num_mfma_m, "vu32")
+        for m in range(num_mfma_m):
+            vaddr[m] = (v_sorted_id[m] & 0xFFFFFF) * (TOPK * K * sizeof_w) + (v_sorted_id[m]>>24) *(K * sizeof_w) + col * J.sizeof_DW4
+
+        if is_fp8:
+            buff_sa = J.Buffer(pt_scale, M * TOPK * J.sizeof("fp32"))
+            v_pt_scales = J.gpr(num_mfma_m, 'vf32')
+            for m in range(num_mfma_m):
+                voffset_sa = J.gpr("vu32", (v_sorted_id[m] & 0xFFFFFF) * (TOPK * J.sizeof_DW) + (v_sorted_id[m]>>24) * J.sizeof_DW)
+                buff_sa.load_dword(v_pt_scales[m], voffset_sa, 0)
+            fp8_ptpc["v_pt_scales"] = v_pt_scales
+
+            if quant_type_w == "QuantType.per_Token":
+                fp8_ptpc["pc_scale"] = cur_pc_scale
+
+            if quant_type_w == "QuantType.per_Tensor":
+                v_pc_scales = J.gpr('vf32')
+                v_offset_zero = J.gpr('vu32', 0)
+                J.global_load_dword(v_pc_scales[0], v_offset_zero, cur_pc_scale)
+                fp8_ptpc["v_pc_scales"] = v_pc_scales
+
+        buff_a = J.Buffer(p_input, M * TOPK * K * J.sizeof(dtype_A))
+        for m in range(num_mfma_m):
+            for k in range(num_mfma_k):
+                buff_a.load_dwordx4(A[m,k], vaddr[m], 0, offset12=k*mfma_K*J.sizeof(dtype_A))
+
+        v_sorted_weights = J.gpr('vf32')
+        assert SUB_M <= 256
+        with J.ExecMask(J.threadIdx.x < SUB_M):
+            J.global_load_dword(v_sorted_weights, J.threadIdx.x * 4, p_cur_sorted_weights)
+
+        J.s_waitcnt(mod=f"vmcnt(0)")
+
+        lds_weights = J.alloc_lds(256*4)
+        lds_token_ids = J.alloc_lds(256*4)
+
+        with J.ExecMask(J.threadIdx.x < SUB_M):
+            J.ds_write_b32(J.threadIdx.x * 4, v_sorted_weights, mod=f"offset:{lds_weights}")
+        with J.ExecMask(J.threadIdx.x < 16):
+            for m in range(num_mfma_m):
+                J.ds_write_b32(J.lane_id * 4, (v_sorted_id[m] & 0xffffff) * TOPK + (v_sorted_id[m]>>24), mod=f"offset:{lds_token_ids + m*16*4}")
+
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        J.s_barrier()
+
+        # 0,1,2,3,4,5,6,7, num_mfma_m
+        if 0:
+            VALID_TILE_SIZES = [s for s in [64,96,128] if s < BLOCK_TILE_SIZE_M]
+            s_sorted_ids = J.gpr(len(VALID_TILE_SIZES), 'su32')
+            for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
+                J.v_readfirstlane_b32(s_sorted_ids[i], v_sorted_id[TILE_SIZE//mfma_MN])
+
+            for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
+                with J.If((s_sorted_ids[i] >> 24) == TOPK):
+                    num_mfma_n = 1 if TILE_SIZE > 64 else 2
+                    down_kernel(J, mfma_MN, num_mfma_n, TILE_SIZE, N, K,
+                                A, lds_token_ids, lds_weights,
+                                p_weight, p_output, M, fp8_ptpc)
+                    J.s_endpgm()
+
+        if 1:
+            s_sorted_ids = J.gpr(1, 'su32')
+            J.v_readfirstlane_b32(s_sorted_ids[0], v_sorted_id[0])
+            with J.If((s_sorted_ids[0] >> 24) != TOPK):
+                num_mfma_n = 1 if SUB_M > 64 else 2
+                down_kernel(J, mfma_MN, num_mfma_n, SUB_M, N, K,
                             A, lds_token_ids, lds_weights,
-                            p_weight, p_output, M, fp8_ptpc)
-                J.s_endpgm()
-
-    num_mfma_n = 1 if BLOCK_TILE_SIZE_M > 64 else 2
-    down_kernel(J, mfma_MN, num_mfma_n, BLOCK_TILE_SIZE_M, N, K,
-                A, lds_token_ids, lds_weights,
-                p_weight, p_output, M, fp8_ptpc)
+                            p_cur_weight, p_output, M, fp8_ptpc)
 
 def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 A, # A = J.gpr(num_mfma_m, num_mfma_k, 4, "abf16x2")
