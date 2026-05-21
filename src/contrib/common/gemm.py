@@ -341,6 +341,24 @@ class UGEMM:
                                             mfma_C[m,n])
         cur_k = J.gpr("su32", 0)
         k_loop_cnt = self.K//self.wg_K
+        mfma_cnt_dict = {
+            (256, 256) : {
+                'ds_read': 2,
+                'ds_write': 2,
+                'prefetch': 8
+            },
+            (128, 256) : {
+                'ds_read': 2,
+                'ds_write': 3,
+                'prefetch': 3
+            },
+            (64, 256) : {
+                'ds_read': 1,
+                'ds_write': 2,
+                'prefetch': 1
+            }
+        }
+        mfma_cnt = mfma_cnt_dict.get((self.wg_M, self.wg_N), mfma_cnt_dict[(256, 256)])
 
         with J.While(cur_k[0] < k_loop_cnt):
             #for unroll in range(k_loop_cnt):
@@ -358,10 +376,10 @@ class UGEMM:
             for k in range(self.wave_nCK//2, self.wave_nCK):
                 for m in range(self.wave_nCM):
                     ds_readA(m, k)
-                    J.emit(mfma0, 16*2)
+                    J.emit(mfma0, 16*mfma_cnt['ds_read'])
                 for n in range(self.wave_nCN):
                     ds_readB(n, k)
-                    J.emit(mfma0, 16*2)
+                    J.emit(mfma0, 16*mfma_cnt['ds_read'])
 
             # ensure all waves has been finished reading LDS, so ds_write can overwrite it
             J.emit(mfma0, 16*2)
@@ -373,17 +391,17 @@ class UGEMM:
                 J.emit([mfma0, mfma1], 16)
                 J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
                 loaderA.ds_write(r, ldsA)
-                J.emit([mfma0, mfma1], 16*3)
+                J.emit([mfma0, mfma1], 16*mfma_cnt['ds_write'])
                 loaderA.prefetch(r)
-                J.emit([mfma0, mfma1], 16*3)
+                J.emit([mfma0, mfma1], 16*mfma_cnt['prefetch'])
 
             for r in range(num_prefetch_N):
                 J.emit([mfma0, mfma1], 16)
                 J.s_waitcnt(mod=f"vmcnt({num_prefetch_N + num_prefetch_M - 1})")
                 loaderB.ds_write(r, ldsB)
-                J.emit([mfma0, mfma1], 16*3)
+                J.emit([mfma0, mfma1], 16*mfma_cnt['ds_write'])
                 loaderB.prefetch(r)
-                J.emit([mfma0, mfma1], 16*3)
+                J.emit([mfma0, mfma1], 16*mfma_cnt['prefetch'])
 
             # enure mfma0 finished using part0 of mfma_A/mfma_B, before ds_read0 overwrites them
             # (most likely already empty and some part of mfma1 has been consumed)
@@ -394,10 +412,10 @@ class UGEMM:
             for k in range(0,self.wave_nCK//2):
                 for m in range(self.wave_nCM):
                     ds_readA(m, k)
-                    J.emit([mfma1], 16*2)
+                    J.emit([mfma1], 16*mfma_cnt['ds_read'])
                 for n in range(self.wave_nCN):
                     ds_readB(n, k)
-                    J.emit([mfma1], 16*2)
+                    J.emit([mfma1], 16*mfma_cnt['ds_read'])
             J.emit(mfma1)
             cur_k[0] += 1
 
@@ -471,7 +489,7 @@ class UGEMM:
                 for n in range(self.wave_nCN):
                     row = J.lane_id % self.mfma_MN + warp_offset_m + m*self.mfma_MN
                     col = J.lane_id // self.mfma_MN + n * (self.mfma_MN * J.sizeof_fp32 // J.sizeof_DW4)
-                    voffset = J.gpr(row * (N*J.sizeof_fp32) + warp_offset_n*J.sizeof_fp32 + col*J.sizeof_DW4)
+                    voffset = J.gpr(row * (self.N*J.sizeof_fp32) + warp_offset_n*J.sizeof_fp32 + col*J.sizeof_DW4)
                     if self.mfma_MN == 16:
                         buff_c.store_dwordx4(mfma_C[m,n], voffset, 0)
                     elif self.mfma_MN == 32:
@@ -518,7 +536,7 @@ def gemm_kernel(J, K, N, M01, GroupNum,
                                 gemm.wg_N, J.sizeof_bf16*gemm.wg_K, stride_bytes,
                                 total_wave_cnt, swizzle_row_div, skip_load)
     else:
-        loaderB = MFMA_DW4Loader_preshuffled(J, pB, actual_wg_M * K * J.sizeof_bf16, mfma_MN,
+        loaderB = MFMA_DW4Loader_preshuffled(J, pB, gemm.wg_N * K * J.sizeof_bf16, mfma_MN,
                                 gemm.wg_N, J.sizeof_bf16*gemm.wg_K, stride_bytes,
                                 total_wave_cnt, swizzle_row_div, skip_load)
     
@@ -680,7 +698,7 @@ if __name__ == "__main__":
     #assert 0
     #test_gemm(32, [128, 128], [2, 2], A_preshuffled = False, B_preshuffled = False) 
     #test_gemm(16, [128, 128], [2, 2], A_preshuffled = False, B_preshuffled = False)
-    test_gemm(16, [64, 64], [2, 2], A_preshuffled = False, B_preshuffled = True)
+    test_gemm(16, [32, 128], [2, 2], A_preshuffled = False, B_preshuffled = True)
     #test_gemm(16, [128, 128], [2, 2], A_preshuffled = True, B_preshuffled = True)
     #test_gemm(32, [128, 128], [2, 2], A_preshuffled = True, B_preshuffled = True)
     assert 0

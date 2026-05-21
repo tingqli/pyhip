@@ -1214,7 +1214,8 @@ def moe_2stage_gateup(J:JIT,
                       pt_scale: "float*",
                       pc_scale:"float*",
                       M:"int",
-                      num_blocks:"int",):
+                      num_blocks:"int",
+                      dyn,):
     class MFMA_DW4Loader:
         def __init__(self, J:JIT, ptr, buff_size, row_index,
                     wg_M:int, row_bytes:int, stride_bytes:int,
@@ -1378,23 +1379,7 @@ def moe_2stage_gateup(J:JIT,
     warp_id = J.gpr("su32")
     J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
 
-    with J.While():
-        idx = J.gpr(1, 'su32')
-        idx[0] = 0xffffffff
-        v_idx = J.gpr(1, 'vu32')
-        J.s_barrier()
-        with J.If(warp_id[0] == 0):
-            J.s_atomic_inc(idx, p_id, 0, mod='glc')
-            J.s_waitcnt(mod=f"lgkmcnt(0)")
-            v_idx[0] = idx[0]
-            J.ds_write_b32(0 * lane_mod_16, v_idx, mod=f"offset:{0}")
-            J.s_waitcnt(mod=f"lgkmcnt(0)")
-        J.s_barrier()
-        J.ds_read_b32(v_idx, 0 * lane_mod_16, mod=f"offset:{0}")
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
-        J.v_readfirstlane_b32(idx, v_idx)
-        J.s_barrier()
-
+    def loop_body(idx):
         # grid: N // 32, sorted_expert_ids.shape[0]
         # expert index in p_sorted_expert_ids
         e_idx, blockn_idx = xcd_swizzle(J, idx, num_blocks, N // BLOCK_TILE_SIZE_N, 4, 20)
@@ -1573,6 +1558,27 @@ def moe_2stage_gateup(J:JIT,
             assert len(VALID_TILE_SIZES) == 0
             kernel(BLOCK_TILE_SIZE_M)
 
+    if dyn:
+        with J.While():
+            idx = J.gpr(1, 'su32')
+            idx[0] = 0xffffffff
+            v_idx = J.gpr(1, 'vu32')
+            J.s_barrier()
+            with J.If(warp_id[0] == 0):
+                J.s_atomic_inc(idx, p_id, 0, mod='glc')
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+                v_idx[0] = idx[0]
+                J.ds_write_b32(0 * lane_mod_16, v_idx, mod=f"offset:{0}")
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.s_barrier()
+            J.ds_read_b32(v_idx, 0 * lane_mod_16, mod=f"offset:{0}")
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.v_readfirstlane_b32(idx, v_idx)
+            J.s_barrier()
+
+            loop_body(idx)
+    else:
+        loop_body(J.blockIdx.x)
 
 def de_shuffle_weight(weight_, mfma_MN = 16):
     org_dtype = weight_.dtype
@@ -1677,7 +1683,6 @@ def moe_2stage_down(J:JIT,
                     TOPK, K, N,          # 8,  128, 2048
                     with_silu,           #
                     BLOCK_TILE_SIZE_M,   # 32
-                    SUB_M,
                     BLOCK_TILE_SIZE_N,   # 64
                     quant_type_w,
                     p_id:"void*",
@@ -1691,7 +1696,13 @@ def moe_2stage_down(J:JIT,
                     pt_scale: "float*",
                     pc_scale:"float*",
                     M:"int",
-                    num_blocks:"int",):
+                    num_blocks:"int",
+                    dyn,):
+    if dyn:
+        SUB_M = 64
+        assert BLOCK_TILE_SIZE_M % SUB_M == 0
+    else:
+        SUB_M = BLOCK_TILE_SIZE_M
     sizeof_w = J.sizeof(weight_dtype)
     dtype_A = "bf16"
     is_fp8 = str(weight_dtype).startswith("torch.float8_e4m3")
@@ -1715,29 +1726,15 @@ def moe_2stage_down(J:JIT,
     # collect token id
     row = J.lane_id % mfma_MN
     col = J.lane_id // mfma_MN
-    M[0] *= TOPK
+    M_TOPK = J.gpr(M[0] * TOPK)
 
     J.get_sgpr_const(0x8000)
     J.get_sgpr_const(0x3020706)
 
-    with J.While():
-        idx = J.gpr(1, 'su32')
-        idx[0] = 0xffffffff
-        v_idx = J.gpr(1, 'vu32')
-        J.s_barrier()
-        with J.If(J.warp_id[0] == 0):
-            J.s_atomic_inc(idx, p_id, 0, mod='glc')
-            J.s_waitcnt(mod=f"lgkmcnt(0)")
-            v_idx[0] = idx[0]
-            J.ds_write_b32(0 * row, v_idx, mod=f"offset:{0}")
-            J.s_waitcnt(mod=f"lgkmcnt(0)")
-        J.s_barrier()
-        J.ds_read_b32(v_idx, 0 * row, mod=f"offset:{0}")
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
-        J.v_readfirstlane_b32(idx, v_idx)
-        J.s_barrier()
-
+    def loop_body(idx, run_in_m_sub_tiles):
         e_idx, sub_m = xcd_swizzle(J, idx, num_blocks, BLOCK_TILE_SIZE_M // SUB_M, 4, 20)
+        if not run_in_m_sub_tiles:
+            sub_m = 0
         # sub_m = J.blockIdx.x
         s_e_id = J.gpr(1, 'su32')
         J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
@@ -1810,8 +1807,16 @@ def moe_2stage_down(J:JIT,
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.s_barrier()
 
-        # 0,1,2,3,4,5,6,7, num_mfma_m
-        if 0:
+        if run_in_m_sub_tiles:
+            s_sorted_ids = J.gpr(1, 'su32')
+            J.v_readfirstlane_b32(s_sorted_ids[0], v_sorted_id[0])
+            with J.If((s_sorted_ids[0] >> 24) != TOPK):
+                num_mfma_n = 1 if SUB_M > 64 else 2
+                down_kernel(J, mfma_MN, num_mfma_n, SUB_M, N, K,
+                            A, lds_token_ids, lds_weights,
+                            p_cur_weight, p_output, M_TOPK, fp8_ptpc)
+        else:
+            # 0,1,2,3,4,5,6,7, num_mfma_m
             VALID_TILE_SIZES = [s for s in [64,96,128] if s < BLOCK_TILE_SIZE_M]
             s_sorted_ids = J.gpr(len(VALID_TILE_SIZES), 'su32')
             for i, TILE_SIZE in enumerate(VALID_TILE_SIZES):
@@ -1822,17 +1827,34 @@ def moe_2stage_down(J:JIT,
                     num_mfma_n = 1 if TILE_SIZE > 64 else 2
                     down_kernel(J, mfma_MN, num_mfma_n, TILE_SIZE, N, K,
                                 A, lds_token_ids, lds_weights,
-                                p_weight, p_output, M, fp8_ptpc)
+                                p_cur_weight, p_output, M_TOPK, fp8_ptpc)
                     J.s_endpgm()
 
-        if 1:
-            s_sorted_ids = J.gpr(1, 'su32')
-            J.v_readfirstlane_b32(s_sorted_ids[0], v_sorted_id[0])
-            with J.If((s_sorted_ids[0] >> 24) != TOPK):
-                num_mfma_n = 1 if SUB_M > 64 else 2
-                down_kernel(J, mfma_MN, num_mfma_n, SUB_M, N, K,
-                            A, lds_token_ids, lds_weights,
-                            p_cur_weight, p_output, M, fp8_ptpc)
+            num_mfma_n = 1 if BLOCK_TILE_SIZE_M > 64 else 2
+            down_kernel(J, mfma_MN, num_mfma_n, BLOCK_TILE_SIZE_M, N, K,
+                        A, lds_token_ids, lds_weights,
+                        p_cur_weight, p_output, M_TOPK, fp8_ptpc)
+    if dyn:
+        with J.While():
+            idx = J.gpr(1, 'su32')
+            idx[0] = 0xffffffff
+            v_idx = J.gpr(1, 'vu32')
+            J.s_barrier()
+            with J.If(J.warp_id[0] == 0):
+                J.s_atomic_inc(idx, p_id, 0, mod='glc')
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+                v_idx[0] = idx[0]
+                J.ds_write_b32(0 * row, v_idx, mod=f"offset:{0}")
+                J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.s_barrier()
+            J.ds_read_b32(v_idx, 0 * row, mod=f"offset:{0}")
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.v_readfirstlane_b32(idx, v_idx)
+            J.s_barrier()
+
+            loop_body(idx, True)
+    else:
+        loop_body(J.blockIdx.x, False)
 
 def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
                 A, # A = J.gpr(num_mfma_m, num_mfma_k, 4, "abf16x2")
