@@ -1,19 +1,24 @@
 import pyhip
 
 from pyhip.contrib.gemm_4wave_slicing import *
+from pyhip.contrib.gemm_cdna4 import *
 import pytest
 import functools
 import torch
 
-
-torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
-torch.set_default_device('cuda')
+torch.set_printoptions(
+    linewidth=3000,
+    sci_mode=False,
+    edgeitems=8,
+)
+torch.set_default_device("cuda")
 torch.manual_seed(0)
 
+
 @pytest.mark.parametrize("M", [32, 256, 2400])
-@pytest.mark.parametrize("N", [256, 256*6])
+@pytest.mark.parametrize("N", [256, 256 * 6])
 @pytest.mark.parametrize("K", [256])
-def test_accuracy(M, N, K, use_pre_shuffle = 0):
+def test_accuracy(M, N, K, use_pre_shuffle=0):
     wg_M = 256
     wg_N = 256
     blk_cnt = pyhip.div_up(M, wg_M) * pyhip.div_up(N, wg_N)
@@ -31,8 +36,19 @@ def test_accuracy(M, N, K, use_pre_shuffle = 0):
 
     cur_out = torch.ones(M, N, dtype=torch.bfloat16)
 
-    gemm_kernel_slicing([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle,
-                A.data_ptr(), B.data_ptr(), cur_out.data_ptr(), M)
+    gemm_kernel_slicing(
+        [blk_cnt],
+        [4 * 64],
+        wg_M,
+        wg_N,
+        N,
+        K,
+        use_pre_shuffle,
+        A.data_ptr(),
+        B.data_ptr(),
+        cur_out.data_ptr(),
+        M,
+    )
 
     if not torch.allclose(ref_out, cur_out, rtol=0.01, atol=0.01):
         print(ref_out)
@@ -41,11 +57,11 @@ def test_accuracy(M, N, K, use_pre_shuffle = 0):
         print(cur_out[0].tolist())
         idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
         if len(idx[0]):
-            print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
+            print(f"idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}")
         assert 0
 
 
-def compare_perf(M, N, K, use_pre_shuffle = 0):
+def compare_perf(M, N, K, use_pre_shuffle=0):
     wg_M = 256
     wg_N = 256
 
@@ -64,8 +80,19 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
 
     C = torch.zeros(M, N, dtype=torch.bfloat16)
 
-    gemm_kernel_slicing([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle, A.data_ptr(), B.data_ptr(), C.data_ptr(), M)
-
+    gemm_kernel_slicing(
+        [blk_cnt],
+        [4 * 64],
+        wg_M,
+        wg_N,
+        N,
+        K,
+        use_pre_shuffle,
+        A.data_ptr(),
+        B.data_ptr(),
+        C.data_ptr(),
+        M,
+    )
 
     ref_out = C0
     cur_out = C
@@ -90,28 +117,55 @@ def compare_perf(M, N, K, use_pre_shuffle = 0):
     B0s = [torch.clone(B0) for _ in range(DATA_CLONES)]
 
     di = 0
-    latency=[]
-    torch_latncy=[]
+    latency = []
+    torch_latncy = []
     for i in range(10):
-        di = (di + 1)%DATA_CLONES
-        with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"gemm_{di}") as p0:
-            gemm_kernel_slicing([blk_cnt],[4*64], wg_M, wg_N, N, K, use_pre_shuffle,
-                        As[di].data_ptr(),
-                        Bs[di].data_ptr(),
-                        Cs[di].data_ptr(), M)
+        di = (di + 1) % DATA_CLONES
+        with pyhip.cudaPerf(
+            M * N * K * 2, (M * K * 2 + K * N * 2), name=f"gemm_{di}"
+        ) as p0:
+            gemm_kernel_slicing(
+                [blk_cnt],
+                [4 * 64],
+                wg_M,
+                wg_N,
+                N,
+                K,
+                use_pre_shuffle,
+                As[di].data_ptr(),
+                Bs[di].data_ptr(),
+                Cs[di].data_ptr(),
+                M,
+            )
         latency.append(p0.dt_ms)
     for i in range(10):
-        di = (di + 1)%DATA_CLONES
-        with pyhip.cudaPerf(M*N*K*2, (M*K*2+K*N*2), name=f"torch_{di}") as p0:
-            ref = torch.nn.functional.linear(A0s[di], B0s[di])
+        di = (di + 1) % DATA_CLONES
+        with pyhip.cudaPerf(
+            M * N * K * 2, (M * K * 2 + K * N * 2), name=f"torch_{di}"
+        ) as p0:
+            # ref = torch.nn.functional.linear(A0s[di], B0s[di])
+            gemm_kernel(
+                [blk_cnt],
+                [4 * 64],
+                wg_M,
+                wg_N,
+                N,
+                K,
+                use_pre_shuffle,
+                As[di].data_ptr(),
+                Bs[di].data_ptr(),
+                Cs[di].data_ptr(),
+                M,
+            )
         torch_latncy.append(p0.dt_ms)
     latency.sort()
     torch_latncy.sort()
-    print(f'ratio:{torch_latncy[0]/latency[0]}')
+    print(f"ratio:{torch_latncy[0]/latency[0]}")
 
     print(f"{acc=}")
+
 
 if __name__ == "__main__":
     # test_accuracy(2400, 256*4, 256*6)
     # test_accuracy(256, 256, 256)
-    compare_perf(M = 256*32, N = 256*32, K=8192)
+    compare_perf(M=256 * 32, N=256 * 32, K=8192)
