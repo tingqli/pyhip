@@ -346,7 +346,7 @@ class TestCase:
                 #                 gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, N2, K2, TOPK)
                 num_CU = torch.cuda.get_device_properties().multi_processor_count
                 BLOCK_N = 1024
-                if (w1.dtype == torch.float8_e4m3fn or w1.dtype == torch.float8_e4m3fnuz) and fp8_ptpc and N2 // BLOCK_N * grid >= num_CU:
+                if (w1.dtype == torch.float8_e4m3fn or w1.dtype == torch.float8_e4m3fnuz) and fp8_ptpc and N2 // BLOCK_N * grid >= num_CU and 32 >= B >= 16:
                     BLOCK_TILE_SIZE_M = 16
                     BLOCK_TILE_SIZE_N = 16
                     assert N2 % BLOCK_N == 0
@@ -807,8 +807,8 @@ class TestCase:
             perf[kernel_type][str(weight_type)+"@"+str(quant_type)] = perf_prec
         self.perf.append(perf)
 
-    def show_perf(self):
-        print('\nsummary:')
+    def show_perf(self, desc=''):
+        print(f'\nsummary[{desc}]:')
         for perf in self.perf:
             for kernel, vals in perf.items():
                 for prec, vals_ in vals.items():
@@ -912,40 +912,42 @@ if __name__ == '__main__':
             print(ext_topk_ids.shape)
             batch[0] = ext_topk_ids.shape[0]
 
-        HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK = 4096, 192, 192, 8
-        #decoding
-        TILE_M, TILE_N = 16, 64
-        batch = [2, 4, 8, 16, 32, 64, 128, 256]
-        test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
-        test_dec.entry_common('aiter', [1] + batch, prec=[prec_fp8_t])
-        test_dec.entry_common('16x32_2s_b1', [1], prec=[prec_fp8_t])
-        test_dec.entry_common('16x32_2s_b', batch, prec=[prec_fp8_t])
+        # Hunyuan
+        for prec in [prec_fp8_t]:
+            TILE_M, TILE_N = 16, 64
+            batch = [2, 4, 8, 16, 32, 64, 128, 256]
+            test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
+            test_dec.entry_common('aiter', [1] + batch, prec=[prec])
+            test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
+            test_dec.entry_common('16x32_2s_b', batch, prec=[prec])
 
-        # prefill per tensor
-        TILE_M, TILE_N = 128, 128
-        batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
-        test_prefill = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
-        test_prefill.entry_common('aiter', batch, prec=[prec_fp8_t])
-        test_prefill.entry_common('mxn_2s', batch, prec=[prec_fp8_t])
+            for TILE_M in [64, 128]:
+                TILE_N = 128
+                batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
+                test_prefill = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
+                test_prefill.entry_common('aiter', batch, prec=[prec])
+                test_prefill.entry_common('mxn_2s', batch, prec=[prec])
+                test_dec.show_perf('hunyuan dec')
+                test_prefill.show_perf('hunyuan prefill')
 
-        # prefill ptpc(with dynamic scheduler)
-        TILE_M, TILE_N, STAGE2_TILE_N = 128, 256, 128
+        # Qwen3.5
         HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK = 4096, 128, 512, 10
-        batch = [i * 1024 for i in range(1, 9)] + [16 * 1024, 32 * 1024, 64 * 1024]
-        test_ptpc_dyn = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK, DYN_SCHEDULE=True, STAGE2_TILE_N=STAGE2_TILE_N)
-        test_ptpc_dyn.entry_common('aiter', batch, prec=[prec_bf16, prec_fp8_ptpc])
-        test_ptpc_dyn.entry_common('mxn_2s', batch, prec=[prec_bf16, prec_fp8_ptpc])
+        for prec in [prec_fp8_ptpc]:
+            TILE_M, TILE_N = 16, 64
+            batch = [2, 4, 8, 16, 32, 64, 128, 256]
+            test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
+            test_dec.entry_common('aiter', [1] + batch, prec=[prec])
+            test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
+            test_dec.entry_common('16x32_2s_b', batch, prec=[prec])
 
-        # prefill ptpc(with default scheduler)
-        TILE_M, TILE_N = 64, 128
-        test_ptpc = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK, DYN_SCHEDULE=False)
-        test_ptpc.entry_common('mxn_2s', batch, prec=[prec_bf16, prec_fp8_ptpc])
-        
-        test_dec.show_perf()
-        test_prefill.show_perf()
-        test_ptpc_dyn.show_perf()
-        test_ptpc.show_perf()
-        #entry_common('mxn_2s', batch=batch, prec=[get_fp8type()], E=E, TOPK=TOPK, TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
-        #test_perf(batch, TILE_M=128, TILE_N=256, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE_TP=INTER_SIZE_TP, E=E, TOPK=TOPK, test_sets=['aiter', 'mxn_2s'])
-
-
+            for DYN in [True, False]:
+                GATE_TILE_N, DOWN_TILE_N = 128, 128
+                if DYN:
+                    GATE_TILE_N = 256
+                for TILE_M in [64, 128]:
+                    batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
+                    test_prefill = TestCase(TILE_M, GATE_TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK, DYN_SCHEDULE=DYN, STAGE2_TILE_N=DOWN_TILE_N)
+                    test_prefill.entry_common('aiter', batch, prec=[prec])
+                    test_prefill.entry_common('mxn_2s', batch, prec=[prec])
+                    test_dec.show_perf(f'qwen dec {TILE_M=} {DYN=}')
+                    test_prefill.show_perf(f'qwen prefill {TILE_M=} {DYN=}')
