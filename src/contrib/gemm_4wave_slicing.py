@@ -248,7 +248,10 @@ def gemm_kernel_slicing(
 
         for k in range(num_regs_K):
             # each ds_read_b128 took 4 x DW-lanes
-            # voff[k] = (row + warp_row0) * lds_stride + swizzle((row + warp_row0), col + k*4) * J.sizeof_DW4
+            # MFMA 1st row lane: [m0,m16,m32,m48,m64,m80,m96,m112] would be firsted read into regA, regB. Then to wave.
+            #                    [m0,m16,m32,m48]  4 x lds_read_b128 by wave0 & wave 1
+            #                    [m64,m80,m96,m112]  4 x lds_read_b128 by wave2 & wave 3
+
             voff[k] = (
                 row * (lds_rlane_stride + padding_sz)
                 + warpid_m * lds_stride * vm_load_cnt
@@ -266,8 +269,6 @@ def gemm_kernel_slicing(
             J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
 
         vm_offset_inc = K
-        # if 0:
-        #     return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64
         return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64_idx
 
     # In the 4 wave case:
