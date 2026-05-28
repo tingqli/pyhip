@@ -1297,7 +1297,9 @@ def moe_2stage_gateup(J:JIT,
             self.prefetch_reg = J.gpr(wave_prefetches, 4, "vu32")
             self.prefetch_sbase = J.gpr("su32")
             self.prefetch_offsets = J.gpr(wave_prefetches, "su32")
-            self.prefetch_voffset = lane_id * sizeof_DWORDX4 + BLOCK_TILE_SIZE_N // 2 * stride_bytes * blockn_idx
+            blockn_idx_v = J.gpr(1, "vu32")
+            blockn_idx_v[0] = blockn_idx
+            self.prefetch_voffset = lane_id * sizeof_DWORDX4 + BLOCK_TILE_SIZE_N // 2 * stride_bytes * blockn_idx_v
             prefetch_id = 0
             for wave in range(wave_cnt):
                 with J.If(warp_id[0] == wave):
