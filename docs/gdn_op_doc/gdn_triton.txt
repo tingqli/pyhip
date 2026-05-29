@@ -1,0 +1,40 @@
+
+
+
+    Implementation notes / naming map (math <-> code <-> shape):[B, Hv, T] prefilled split by trunk, becomes[B, Hv, N, C]
+        ##chunk_local_cumsum(), parallel on B, Hv, N, 每个CU负责C个元素的cumulative sum.
+        gamma_j         <->  exp(g.cumsum(-1))           [B, Hv, N, C]          (per-chunk cumulative sum decay)
+
+        ##chunk_gated_delta_rule_fwd_kkt_solve_kernel(), [B, Hv, N] parallel.每个CU负责的是[C, Dk]@[Dk, C], inverse the [C, C] trigangular matrix.
+        Gamma           <->  ``decay_mask``              [B, Hv, N, C, C]       (lower triangular   decay matrix)
+        diag(beta) K    <->  ``k_beta``                  [B, Hv, N, C, Dk]      (beta-scaled keys, input to W/L)
+        L               <->  -``attn`` (before loop)     [B, Hv, N, C, C]       L = strictLower(k_beta @ K^T * Gamma)
+        (I + L)^{-1}    <->  ``attn`` (after loop)       [B, Hv, N, C, C]       (triangular inverse via forward-sub loop)
+
+        ## recompute_w_u_fwd(), [B, H, N] parallel. each trunk would handle [C, C]@[C, Dv]   U~ 
+                                                                      and [C, C] @[C, Dk]   W<-  
+        diag(beta) V    <->  ``v_beta``                  [B, Hv, N, C, Dv]      (beta-scaled values, input to U~)
+        U~              <->  ``value`` after attn@v_beta [B, Hv, N, C, Dv]      U~=(I+L)^{-1} diag(beta) V = attn@v_beta
+        W<-             <->  ``k_cumdecay``              [B, Hv, N, C, Dk]      W<-=diag(gamma)(I+L)^{-1}diag(beta)K = attn@(k_beta*gamma), rescale W
+
+        ## chunk_gated_delta_rule_fwd_kernel_h_blockdim64(), [B, Hv, Dv/BV]. SST state would have trunk-wise store. 
+        ## would store into [B, Hv, N, Dk, Dv] to ensure O can be calculate in parallel between trunks.
+        ## In one WG, Each trunk would [C,Dk]@[Dk, Bv] = [C, Bv]             ΔV
+                                  and [Dk, C]@[C, Bv] = [Dk, Bv]             S_{[t+1]}
+                                  there would be N trunks in sequence.
+        S_{[t]}         <->  ``last_recurrent_state``    [B, Hv, Dk, Dv]        (recurrent memory)
+        ΔV = U~ - W<- S <-> ``v_new``                    [B, Hv, N, C, Dv]       ΔV = U~ - W<- @ S_{[t]}                              need S_{[t]}, seqentially updated per chunk
+        Update state:
+        S_{[t+1]}   = S->_{[t]}  +  K->^T @ΔV                                                                                            need S_{[t]}, seqentially updated per chunk
+        K->_{[t]}   = diag(gamma_C/gamma_i) K  [C,Dk], code: k_i * exp(G_C - G_i), rescale K to chunk-end decay
+        K->^T@ΔV        <->  ``(k_i*exp(G_C-G_i))^T @ v_new``  [B, Hv, Dk, Dv] (state update term)
+
+
+        #chunk_fwd_o(), [B, Hv, N] parallel, Each WG would [C, Dk]@[Dk, Dv] = [C, Dv]
+                                                           [C, Dk]@[Dk, C]@[C, Dv] = [C, Dv]
+        Calculate O path:
+        O_x=Q<- @ S{[t]}             <->  ``attn_inter``      [B, Hv, N, C, Dv]         (inter-chunk readout) Q<- @ S                   need S_{[t]}, seqentially updated per chunk
+        O_y=(Q @ K^T * Gamma)ΔV      <-> ``attn @ v_new``     [B, Hv, N, C, Dv]         (intra-chunk readout) (Q@K^T * Gamma)@ ΔV       need ΔV,ΔV need S_{[t]},  seqentially updated per chunk
+        O = O_x + O_y                <->  ``o_chunk``         [B, Hv, N, C, Dv]         (chunk output) sum of inter+intra readout
+
+
