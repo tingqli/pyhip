@@ -13,14 +13,32 @@ import os
 os.environ["PYHIP_SIMPLE_GEN_FILENAME"] = "1"
 
 import pyhip
+from pyhip.core.asmjit import JIT
 from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
 import pytest
+import gc
+
+# fused_moe_gelu_sqi8 -> moe_gemm_jit uses wg_M=wg_N=256; moe_gemm_8wave_gelu ping-pong LDS
+_MOE_GEMM_JIT_WG_M = 256
+_MOE_GEMM_JIT_WG_N = 256
+_MOE_GEMM_JIT_BLOCK_K = 128  # bytes
+_MOE_GEMM_SQI8_LDS_BYTES = (
+    (_MOE_GEMM_JIT_WG_M // 2) * _MOE_GEMM_JIT_BLOCK_K * 4
+    + (_MOE_GEMM_JIT_WG_N // 2) * _MOE_GEMM_JIT_BLOCK_K * 4
+)
 
 
-def init_env():
-    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
-    torch.set_default_device('cuda')
-    torch.manual_seed(0)
+@pytest.fixture(scope="module", autouse=True)
+def _select_cuda_device():
+    pyhip.set_device()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _cuda_cleanup_after_test():
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def div_up(x, y):
     return (x + y - 1) // y
@@ -589,7 +607,13 @@ def fused_moe_gelu_sq_mxfp4(
 @pytest.mark.parametrize("model_dim", [4096])
 @pytest.mark.parametrize("inter_dim", [1536])
 def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoothquant, shared_smoothquant_up):
-    init_env()
+    lds_limit = JIT().lds_size_limit
+    if _MOE_GEMM_SQI8_LDS_BYTES > lds_limit:
+        pytest.skip(
+            f"Skipping test_fmoe_sqi8 on {get_gfx()}: "
+            f"moe_gemm_8wave_gelu needs {_MOE_GEMM_SQI8_LDS_BYTES}B LDS, limit is {lds_limit}B"
+        )
+
     device = "cuda"
 
     x0 = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16, device=device)
@@ -612,8 +636,10 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
     w1,fc1_scale = smooth_quant_w_i8(w1_f32, fc1_smooth_scale)
     w2,fc2_scale = smooth_quant_w_i8(w2_f32, fc2_smooth_scale)
 
-    w1_mxfp4,fc1_scale_mxfp4 = smooth_quant_w_mxfp4(w1_f32, fc1_smooth_scale)
-    w2_mxfp4,fc2_scale_mxfp4 = smooth_quant_w_mxfp4(w2_f32, fc2_smooth_scale)
+    w1_mxfp4 = fc1_scale_mxfp4 = w2_mxfp4 = fc2_scale_mxfp4 = None
+    if 0:  # mxfp4 path disabled below (if 1: ret_fp4 = None)
+        w1_mxfp4, fc1_scale_mxfp4 = smooth_quant_w_mxfp4(w1_f32, fc1_smooth_scale)
+        w2_mxfp4, fc2_scale_mxfp4 = smooth_quant_w_mxfp4(w2_f32, fc2_smooth_scale)
 
     router_weights = torch.randn(num_tokens, num_experts, dtype=torch.float32)
     ret_topk = torch.topk(router_weights, topk)
@@ -648,6 +674,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
                      fc2_smooth_scale.expand(num_experts,-1,-1),
                      activation=ActivationType.Gelu)
     # ref2 = moe_smoothquant_gelu_ref(x0, w1, w2, x1, x2, fc1_scale, fc2_scale, fc1_smooth_scale.expand(num_experts, -1, -1), fc2_smooth_scale)
+    del w1_f32, w2_f32, router_weights
 
     num_flops = num_tokens * topk * model_dim * inter_dim * 2 * 2
     ret_i8, dt_i8 = pyhip.run_perftest(
@@ -758,9 +785,6 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
     del ret_i8q, dt_i8q
     del ret_fp4, dt_fp4
     del ret_asm, dt_asm
-    import gc
-    torch.cuda.empty_cache()
-    gc.collect()
 
     return ret
 
