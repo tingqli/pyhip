@@ -83,7 +83,9 @@ def wei_is_fp8(weight_type):
 
 def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, fp8_ptpc=True):
     INTER_SIZE_TP = INTER_SIZE // TP
-    BUF_COPY = 32
+    # acc (run_count=0): only hidden_states[0] etc. are used; smaller BUF_COPY saves VRAM.
+    # perf (run_count>0): rotate buffers to reduce L2 reuse across timed iterations.
+    BUF_COPY = 2 if run_count == 0 else 10
     hidden_states = (torch.randn([BUF_COPY, B, HIDDEN_SIZE], dtype=torch.bfloat16) + 1)*0.001
     if weight_type == torch.bfloat16:
         w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=weight_type)
