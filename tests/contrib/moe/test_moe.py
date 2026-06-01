@@ -623,8 +623,19 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64
     
     return perf
 
+@pytest.fixture(scope="module", autouse=True)
+def _init_env():
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8)
+    torch.set_default_device('cuda')
+    torch.manual_seed(0)
+    yield
+    torch.set_default_device(None)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def init_env():
-    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8)
     torch.set_default_device('cuda')
     torch.manual_seed(0)
 
@@ -646,7 +657,6 @@ def get_batch_list(kernel_name):
 @pytest.mark.parametrize("INTER_SIZE", [1024])
 @pytest.mark.parametrize("TP", [8])
 def test_acc_batch_size_1(prec, HIDDEN_SIZE, INTER_SIZE, TP):
-    init_env()
     entry_b1(run_count=0, prec=prec, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
 
 @pytest.mark.parametrize("batch", [get_batch_list('16x32_2s_b')])
@@ -655,7 +665,6 @@ def test_acc_batch_size_1(prec, HIDDEN_SIZE, INTER_SIZE, TP):
 @pytest.mark.parametrize("INTER_SIZE", [1024])
 @pytest.mark.parametrize("TP", [8])
 def test_acc_16x32_2s_b(batch, prec, HIDDEN_SIZE, INTER_SIZE, TP):
-    init_env()
     entry_common('16x32_2s_b', batch=batch, prec=prec, TILE_M=16, TILE_N=32, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
 
 @pytest.mark.parametrize("batch", [get_batch_list('mxn_splitk_2s')])
@@ -666,7 +675,6 @@ def test_acc_16x32_2s_b(batch, prec, HIDDEN_SIZE, INTER_SIZE, TP):
 @pytest.mark.parametrize("INTER_SIZE", [1024])
 @pytest.mark.parametrize("TP", [8])
 def test_acc_mxn_splitk_2s_bf16(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP):
-    init_env()
     entry_common('mxn_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
 
 @pytest.mark.parametrize("batch", [get_batch_list('mxn_splitk_2s')])
@@ -679,7 +687,6 @@ def test_acc_mxn_splitk_2s_bf16(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_
 @pytest.mark.parametrize("fp8_ptpc", [True, False])
 def test_acc_mxn_splitk_2s_fp8(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP, fp8_ptpc):
     # TILE_M/N is configurable
-    init_env()
     entry_common('mxn_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0, fp8_ptpc=fp8_ptpc)
 
 @pytest.mark.parametrize("batch", [get_batch_list('mxn_splitk_2s')])
@@ -690,7 +697,6 @@ def test_acc_mxn_splitk_2s_fp8(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_S
 @pytest.mark.parametrize("TILE_M", [16])
 @pytest.mark.parametrize("TILE_N", [64])
 def test_acc_mxn_splitk_2s_fp4(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP):
-    init_env()
     entry_common('mxn_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
 
 # def test_acc(TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
@@ -722,7 +728,6 @@ def show_perf(perflist):
 
 @pytest.mark.parametrize("batch", [[1, 2, 4, 8, 12, 16, 32, 64]])
 def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
-    init_env()
     perf = []
     if is_arch_type('942'):
         perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
@@ -739,7 +744,6 @@ def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
 
 @pytest.mark.parametrize("batch", [[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]])
 def test_perf(batch, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
-    init_env()
     perf = []
     # perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))
     # perf.append(entry_common('aiter', batch, prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N))

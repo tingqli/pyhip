@@ -31,6 +31,9 @@ _MOE_GEMM_SQI8_LDS_BYTES = (
 @pytest.fixture(scope="module", autouse=True)
 def _select_cuda_device():
     pyhip.set_device()
+    torch.set_default_device(None)
+    gc.collect()
+    torch.cuda.empty_cache()
     yield
 
 
@@ -613,13 +616,12 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
             f"Skipping test_fmoe_sqi8 on {get_gfx()}: "
             f"moe_gemm_8wave_gelu needs {_MOE_GEMM_SQI8_LDS_BYTES}B LDS, limit is {lds_limit}B"
         )
-
     device = "cuda"
 
     x0 = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16, device=device)
 
-    w1_f32 = torch.randn(num_experts, inter_dim, model_dim, dtype=torch.float32)
-    w2_f32 = torch.randn(num_experts, model_dim, inter_dim, dtype=torch.float32)
+    w1_f32 = torch.randn(num_experts, inter_dim, model_dim, dtype=torch.float32, device=device)
+    w2_f32 = torch.randn(num_experts, model_dim, inter_dim, dtype=torch.float32, device=device)
 
     if use_smoothquant:
         if shared_smoothquant_up:
@@ -641,7 +643,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
         w1_mxfp4, fc1_scale_mxfp4 = smooth_quant_w_mxfp4(w1_f32, fc1_smooth_scale)
         w2_mxfp4, fc2_scale_mxfp4 = smooth_quant_w_mxfp4(w2_f32, fc2_smooth_scale)
 
-    router_weights = torch.randn(num_tokens, num_experts, dtype=torch.float32)
+    router_weights = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
     ret_topk = torch.topk(router_weights, topk)
     x1 = ret_topk.values.to(torch.float32)
     x2 = ret_topk.indices.to(torch.int32)
