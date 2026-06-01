@@ -43,7 +43,7 @@ def chunk_gated_delta_rule_fwd(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    initial_state: torch.Tensor,
+    initial_state: torch.Tensor,  # the state shape should be (B, H, Dv, Dk)
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
@@ -80,6 +80,7 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
     # Step 3: chunk-sequential memory recurrence -> v_new=DeltaV, h[t]=S_{[t]}.
+    # the state shape should be (B, H, Dv, Dk)
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -91,6 +92,7 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
     # Step 4: per-chunk readout -> O.
+    # the state shape should be (B, H, Dv, Dk)
     o = chunk_fwd_o(
         q=q,
         k=k,
@@ -165,10 +167,13 @@ def torch_chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel=False,
 ):
     """Reference impl (see modeling_qwen3_5_moe.torch_chunk_gated_delta_rule).
-
-    Args layout (head_first=False):
-        query/key: [B, L, H, Dk]    value: [B, L, H, Dv]
-        g/beta:    [B, L, H]        initial_state: [B, H, Dk, Dv] or None
+    Arguments:
+        query:              : [B, H, T, K]   bf16/fp16
+        key:                : [B, H, T, K]    bf16/fp16
+        value:              : [B, H, T, V]    bf16/fp16
+        g                   : [B, H, T]       fp32 log-decays
+        beta                : [B, H, T]       bf16/fp16    (in (0,1) via sigmoid)
+        initial_state       : [N, H, K, V]    bf16/fp16    (N == B for equal-length)
     Returns:
         core_attn_out:        [B, L, H, Dv]
         last_recurrent_state: [B, H, Dk, Dv] or None
@@ -177,6 +182,7 @@ def torch_chunk_gated_delta_rule(
     if use_qk_l2norm_in_kernel:
         query = _l2norm(query, dim=-1)
         key = _l2norm(key, dim=-1)
+
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32)
         for x in (query, key, value, beta, g)
@@ -194,50 +200,74 @@ def torch_chunk_gated_delta_rule(
 
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
+    # v_beta = diag(β)@V
     v_beta = value * beta.unsqueeze(-1)
+    # k_beta = diag(β)@K
     k_beta = key * beta.unsqueeze(-1)
 
+    # reorder from [[B, H, T, ...] to [B, H, chuank_num, chuank_size, ...]
     query, key, value, k_beta, v_beta = [
         x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
         for x in (query, key, value, k_beta, v_beta)
     ]
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    # mask是上三角矩阵，包含对角线
     mask = torch.triu(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=0,
     )
-
+    #
     g = g.cumsum(dim=-1)
+    # decay_mask下三角矩阵，对角线都为1. g = strict_low_triangular (exp(g.cumsum(-1)))
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
 
+    # attn is -L, atten被mask成下三角矩阵，对角线为0，
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    # attn is (I + L)^{-1}， 严格下三角矩阵逐行求逆。
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    # attn is (I + L)^{-1}， 严格下三角矩阵逐行求逆。
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
 
+    # 这里的value被重薪赋值了，value是公式的U~. U~= (1+L)^-1 @ diag(beta) @ V
     value = attn @ v_beta
+    # W← = (I + L)^{-1}@diag(beta)@diag(gamma_i)@K
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
 
+    # state = (B, H, Dk, Dv)
     last_recurrent_state = (
         torch.zeros(B, H, Dk, Dv, dtype=value.dtype, device=value.device)
         if initial_state is None
         else initial_state.to(value)
     )
     core_attn_out = torch.zeros_like(value)
+    # 上三角矩阵，对角线为0
     mask = torch.triu(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=1,
     )
 
+    # 这里更新state是逐chunk更新的。
     for i in range(0, Lp // chunk_size):
+        # v_i 这里是U~
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        # Q @ Kt * Gamma,  *是 elementwise, 这里是为Oy做准备。
         attn = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
+        # v_new 是deltaV, v_i是U~, v_prime是W<- @ S[t], deltaV= U~ - W<- @ S[t]
+        # W<- @ S[t]
         v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+        # U~ - W<- @ S[t]
         v_new = v_i - v_prime
+
+        # 上面的是为了计算O的准备工作，现在开始计算O
+        # Ox = Q<- @ S[t], Q-< = (q_i * g[:, :, i, :, None].exp())
         attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        # Oy = Q @ Kt * Gamma @ DeltaV
+        # O = Ox + Oy
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        # 更新状态 S[t+1]
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
             + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(
@@ -267,10 +297,15 @@ def run_case(
     scale = K**-0.5
     NT = T // CHUNK_SIZE
 
-    # Use ZERO initial state to keep layout-agnostic comparison
-    # (sglang uses [B,H,V,K]; reference uses [B,H,K,V] -- avoid mismatch).
-    h0_sglang = torch.zeros(B, H, V, K, device=device, dtype=dtype)
+    if 0:
+        # Use ZERO initial state to keep layout-agnostic comparison
+        # (sglang uses [B,H,V,K]; reference uses [B,H,K,V] -- avoid mismatch).
+        h0_sglang = torch.zeros(B, H, V, K, device=device, dtype=dtype)
 
+    # use none zero states, sglang triton kernel current support [B,H,Dv,Dk] layout states.
+    h0_sglang = torch.rand(B, H, V, K, device=device, dtype=dtype)
+    # torch reference kernel current support [B,H,Dk,Dv] layout states
+    h0_trans = h0_sglang.transpose(-1, -2).contiguous()
     # ----- Triton path (sglang) -----
     g_out, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
         q=q,
@@ -293,7 +328,7 @@ def run_case(
         g=g,
         beta=beta,
         chunk_size=CHUNK_SIZE,
-        initial_state=None,
+        initial_state=h0_trans,
         output_final_state=False,
         use_qk_l2norm_in_kernel=False,
     )
@@ -344,11 +379,12 @@ def main():
 
     # A few shape cases (small enough to run quickly).
     run_case(B=1, T=128, H=1, K=16, V=16, label="small")
+
     # run_case(B=1, T=1024, H=8, K=128, V=128, label="medium")
     # run_case(B=2, T=512, H=4, K=64, V=128, label="K!=V")
 
-    # # Qwen3.5-MoE-ish config (small T for speed).
-    # run_case(B=1, T=512, H=8, K=128, V=128, seed=42, label="qwen3.5_moe_like")
+    # Qwen3.5-MoE-ish config (small T for speed).
+    run_case(B=1, T=512, H=8, K=128, V=128, seed=42, label="qwen3.5_moe_like")
 
     print("All cases passed.")
 

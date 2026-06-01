@@ -12,7 +12,7 @@ $`S_t = S_{t-1} \bigl(\alpha_t (I - \beta_t k_t k_t^T)\bigr) + \beta_t v_t k_t^T
 $`= \alpha_t S_{t-1} + \Delta v_t \, k_t^T, \quad \Delta v_t = \beta_t (v_t - \alpha_t S_{t-1} k_t)`$
 
 
-$`o_t = S_t \, q_t \tag{Eq. GDN-out}`$
+$`o_t = q_t \, S_t \tag{Eq. GDN-out}`$
 
 ## Chunk-level View
 
@@ -79,8 +79,8 @@ $`= \underbrace{[C, D_k] \times [D_k, D_v]}_{\text{inter-chunk}} + \underbrace{(
 
 | Term | Code | Shape | Notes |
 |------|------|-------|-------|
-| $K^\rightarrow$ | `k_i * exp(G_C - G_i)` | `[C, Dk]` | rescale $K$ to chunk-end decay |
-| ${K^\rightarrow}^T @ \Delta V$ | `(k_i * exp(G_C - G_i))^T @ v_new` | `[B, Hv, Dk, Dv]` | state update term |
+| $K^\rightarrow$ | `k_i * Gamma` | `[C, Dk]` | rescale $K$ to chunk-end decay |
+| ${K^\rightarrow}^T @ \Delta V$ | `(k_i * Gamma)^T @ v_new` | `[B, Hv, Dk, Dv]` | state update term |
 | $S_{[t+1]}$ | $S^\rightarrow_{[t]} + {K^\rightarrow}^T @ \Delta V$ | `[B, Hv, Dk, Dv]` | needs $S_{[t]}$, sequentially updated |
 
 ## Complexity
