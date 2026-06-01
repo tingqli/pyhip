@@ -699,17 +699,6 @@ def test_acc_mxn_splitk_2s_fp8(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_S
 def test_acc_mxn_splitk_2s_fp4(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP):
     entry_common('mxn_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
 
-# def test_acc(TILE_M=32, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8):
-#     # TODO(xiake): check if we need keep following test case
-#     init_env()
-#     #entry_common('aiter', batch=[8192], prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, run_count=2, HIDDEN_SIZE=4096, INTER_SIZE=2048, TP=8)
-#     #entry_common('mxn_2s', batch=[8192], test_fp8=False, TILE_M=128, TILE_N=128, run_count=0)
-#     #assert 0,"========================"
-
-#     # TODO: support fp8
-#     # entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
-#     # entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
-
 def run_acc_test(TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
     test_acc_batch_size_1(prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
     test_acc_16x32_2s_b(batch=get_batch_list('16x32_2s_b'), prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
