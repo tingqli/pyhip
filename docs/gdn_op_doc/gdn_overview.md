@@ -34,7 +34,7 @@ Per chunk $[t]$ of length $C$, indices $i, j \in 1..C$, with:
 | $K^\rightarrow_{[t]}$ | $\text{diag}(\gamma_C / \gamma_i)\,K_{[t]}$ | $[C, D_k]$ |
 | $Q^\leftarrow_{[t]}$ | $\text{diag}(\gamma_i)\,Q_{[t]}$ | $[C, D_k]$ |
 | $S^\rightarrow_{[t]}$ | $\gamma_C \cdot S_{[t]}$ | $[D_k, D_v]$ |
-| $\Delta V_{[t]}$ | $\tilde{U}_{[t]} - W^\leftarrow_{[t]}\,S_{[t]}^T$ | $[C, D_v]$ |
+| $\Delta V_{[t]}$ | $`\tilde{U}_{[t]} - W^\leftarrow_{[t]}\,S_{[t]}^T`$ | $[C, D_v]$ |
 
 ### State Update
 
@@ -58,8 +58,8 @@ $`= \underbrace{[C, D_k] \times [D_k, D_v]}_{\text{inter-chunk}} + \underbrace{(
 |------|------|-------|-------|
 | $\gamma_j$ | `exp(g.cumsum(-1))` | `[B, Hv, N, C]` | per-chunk cumulative decay |
 | $\Gamma$ | `decay_mask` | `[B, Hv, N, C, C]` | lower triangular decay matrix |
-| $\text{diag}(\beta) @ K$ | `k_beta` | `[B, Hv, N, C, Dk]` | beta-scaled keys, input to $W$/$L$ |
-| $L$ | `-attn` (before loop) | `[B, Hv, N, C, C]` | $L = \text{strictLower}(k\_beta @ K^T \odot \Gamma)$ |
+| $\text{diag}(\beta) @ K$ | `k_beta` | `[B, Hv, N, C, Dk]` | beta-scaled keys, input to $`W`$/$`L`$ |
+| $L$ | `-attn` (before loop) | `[B, Hv, N, C, C]` | $`L = \text{strictLower}(k\_beta @ K^T \odot \Gamma)`$ |
 | $(I + L)^{-1}$ | `attn` (after loop) | `[B, Hv, N, C, C]` | triangular inverse via forward-sub loop |
 | $\text{diag}(\beta) @ V$ | `v_beta` | `[B, Hv, N, C, Dv]` | beta-scaled values, input to $\tilde{U}$ |
 | $\tilde{U}$ | `value` after `attn @ v_beta` | `[B, Hv, N, C, Dv]` | $\tilde{U} = (I+L)^{-1} @ \text{diag}(\beta) @ V$ |
