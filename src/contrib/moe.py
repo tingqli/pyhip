@@ -1380,19 +1380,20 @@ def moe_2stage_gateup(J:JIT,
     lane_div_16 = get_lane_id_div(J, 16)
     warp_id = J.gpr("su32")
     J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
 
     def loop_body(idx):
         # grid: N // 32, sorted_expert_ids.shape[0]
         # expert index in p_sorted_expert_ids
         e_idx, blockn_idx = xcd_swizzle(J, idx, num_blocks, N // BLOCK_TILE_SIZE_N, 4, 20)
-        s_e_id = J.gpr(1, 'su32')
-        J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
-
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
         # invalid padding section
         J.Jump("continue_following", e_idx * BLOCK_TILE_SIZE_M < max_id)
         J.s_endpgm()
         J.Label("continue_following")
+        s_e_id = J.gpr(1, 'su32')
+        J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
+
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.debug_setup((J.warp_id[0] == 0) & (blockn_idx[0] == 0) & (e_idx[0] == 0))
 
         # hide following initialization into s_waitcnt
@@ -1732,19 +1733,20 @@ def moe_2stage_down(J:JIT,
 
     J.get_sgpr_const(0x8000)
     J.get_sgpr_const(0x3020706)
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
 
     def loop_body(idx, run_in_m_sub_tiles):
         e_idx, sub_m = xcd_swizzle(J, idx, num_blocks, BLOCK_TILE_SIZE_M // SUB_M, 4, 20)
         if not run_in_m_sub_tiles:
             sub_m = 0
-        # sub_m = J.blockIdx.x
-        s_e_id = J.gpr(1, 'su32')
-        J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
         # invalid padding section
         J.Jump("continue_following", e_idx * BLOCK_TILE_SIZE_M < max_id)
         J.s_endpgm()
         J.Label("continue_following")
+        # sub_m = J.blockIdx.x
+        s_e_id = J.gpr(1, 'su32')
+        J.s_load_dword(s_e_id, p_sorted_expert_ids, e_idx[0] * 4)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
 
         p_cur_sorted_ids = J.gpr(2, 'su32')
         p_cur_sorted_ids[:] = p_sorted_ids[:] + (e_idx * (BLOCK_TILE_SIZE_M * 4) + sub_m * (SUB_M * 4))
