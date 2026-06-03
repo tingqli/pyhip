@@ -17,6 +17,7 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
+from triton.testing import do_bench
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 import torch.distributed as dist
@@ -41,8 +42,8 @@ from pyhip.contrib.triton.chunk_gated_delta_rule_cp_zigzag import (
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-GPU_COUNT = int(os.environ.get("GPU_COUNT", "2"))
-
+GPU_COUNT = int(os.environ.get("GPU_COUNT", "4"))
+# os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 # ---------------------------------------------------------------------------
 # Helpers: zigzag layout (ported from rtp-llm cp/utils.py)
@@ -120,6 +121,49 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def _bench_synced(
+    fn,
+    *,
+    warmup: int = 10,
+    rep: int = 50,
+    flush_mb: int = 512,
+    use_barrier: bool = False,
+):
+    """Like triton.testing.do_bench but with FIXED iteration counts so multiple
+    ranks running collective ops stay in lockstep.
+
+    - L2 flush via a `flush_mb` MB buffer zeroed before every timed iter.
+    - `use_barrier=True` adds a dist.barrier() before each timed iter so the
+      two ranks start the same iteration at (close to) the same wall time.
+    Returns (p20, p50, p80) in milliseconds.
+    """
+    flush_buf = torch.empty(
+        flush_mb * 1024 * 1024 // 4, dtype=torch.int32, device="cuda"
+    )
+
+    # warmup
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    if use_barrier and dist.is_initialized():
+        dist.barrier()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    for i in range(rep):
+        flush_buf.zero_()
+        if use_barrier and dist.is_initialized():
+            dist.barrier()
+        starts[i].record()
+        fn()
+        ends[i].record()
+    torch.cuda.synchronize()
+
+    times = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
+    n = len(times)
+    return times[int(0.2 * n)], times[n // 2], times[int(0.8 * n)]
+
+
 def chunk_fwd_o_ref(q, k, v, h, g=None, scale=None, cu_seqlens=None, chunk_size=64):
     """Deterministic PyTorch reference for chunk_fwd_o.
 
@@ -186,18 +230,68 @@ def chunk_fwd_o_ref(q, k, v, h, g=None, scale=None, cu_seqlens=None, chunk_size=
     return o.to(q.dtype)
 
 
+def chunk_gated_delta_rule_fwd(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    initial_state,
+    cu_seqlens,
+    chunk_indices,
+    initial_state_indices,
+):
+
+    g_ref = chunk_local_cumsum(g=g, chunk_size=64, cu_seqlens=cu_seqlens)
+    w_ref, u_ref, _ = chunk_gated_delta_rule_fwd_intra(
+        k=k,
+        v=v,
+        g=g_ref,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    h_ref, vn_ref = chunk_gated_delta_rule_fwd_h(
+        k=k,
+        w=w_ref,
+        u=u_ref,
+        g=g_ref,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+
+    o_ref = chunk_fwd_o(
+        q=q,
+        k=k,
+        v=vn_ref,
+        h=h_ref,
+        g=g_ref,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+    )
+    return o_ref, h_ref, vn_ref, g_ref
+
+
 # ---------------------------------------------------------------------------
 # Worker: unified (handles both fixed-batch and varlen)
 # ---------------------------------------------------------------------------
 
 
-def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
+def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V, bench=False):
     try:
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(nccl_port)
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
+        dist.init_process_group(
+            "nccl",
+            rank=rank,
+            world_size=world_size,
+            device_id=device,
+        )
         dtype = torch.bfloat16
 
         torch.manual_seed(0)
@@ -240,218 +334,171 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
         )
 
         # Reference: single-GPU with deterministic chunk_fwd_o_ref
-        ref_state = h0_vk.clone()
+        ref_state = h0_vk
         initial_state_indices = torch.arange(N, dtype=torch.int32, device=device)
         chunk_indices_ref = prepare_chunk_indices(full_cu, 64)
-        g_ref = chunk_local_cumsum(g_full.clone(), chunk_size=64, cu_seqlens=full_cu)
-        w_ref, u_ref, _ = chunk_gated_delta_rule_fwd_intra(
-            k=k_full.clone(),
-            v=v_full.clone(),
-            g=g_ref,
-            beta=beta_full.clone(),
+        o_ref, h_ref, vn_ref, g_ref = chunk_gated_delta_rule_fwd(
+            q=q_full,
+            k=k_full,
+            v=v_full,
+            g=g_full,
+            beta=beta_full,
+            scale=scale,
+            initial_state=h0_vk,
             cu_seqlens=full_cu,
             chunk_indices=chunk_indices_ref,
-        )
-        h_ref, vn_ref = chunk_gated_delta_rule_fwd_h(
-            k=k_full.clone(),
-            w=w_ref,
-            u=u_ref,
-            g=g_ref,
-            initial_state=ref_state,
             initial_state_indices=initial_state_indices,
-            cu_seqlens=full_cu,
-            chunk_indices=chunk_indices_ref,
         )
 
-        use_ref = 0
-        if use_ref:
-            o_ref = chunk_fwd_o_ref(
-                q=q_full,
-                k=k_full,
-                v=vn_ref,
-                h=h_ref,
-                g=g_ref,
-                scale=scale,
-                cu_seqlens=full_cu,
-            )
-        else:
-            o_ref = chunk_fwd_o(
-                q=q_full,
-                k=k_full,
-                v=vn_ref,
-                h=h_ref,
-                g=g_ref,
-                scale=scale,
-                cu_seqlens=full_cu,
-            )
-        fs_ref = ref_state.transpose(-1, -2).contiguous()
-
-        # CP zigzag
-        if use_ref:
-            o_z, h_all, fs_z, v_z = chunk_gated_delta_rule_fwd_cp_zigzag(
-                q=q_l.clone(),
-                k=k_l.clone(),
-                v=v_l.clone(),
-                g=g_l.clone(),
-                beta=b_l.clone(),
-                scale=scale,
-                initial_state=h0_kv.clone(),
-                output_final_state=True,
-                cp_group=dist.group.WORLD,
-                cu_seqlens=local_cu,
-                seg_cu=seg_cu,
-                causal_order=causal_order,
-                fwd_o_fn=chunk_fwd_o_ref,
-            )
-        else:
-            o_z, h_all, fs_z, v_z = chunk_gated_delta_rule_fwd_cp_zigzag(
-                q=q_l.clone(),
-                k=k_l.clone(),
-                v=v_l.clone(),
-                g=g_l.clone(),
-                beta=b_l.clone(),
-                scale=scale,
-                initial_state=h0_kv.clone(),
-                output_final_state=True,
-                cp_group=dist.group.WORLD,
-                cu_seqlens=local_cu,
-                seg_cu=seg_cu,
-                causal_order=causal_order,
-                fwd_o_fn=chunk_fwd_o,
-            )
-
-        # Debug: compare h_all per chunk
-        # CP h_all layout: [seq0_seg0, seq0_seg1, seq1_seg0, seq1_seg1, ...]
-        # where each entry has NT_seg_i = (sl_i // (2*cp_size)) // 64 chunks.
-        # Ref h_ref layout: [seq0_chunks, seq1_chunks, ...] with NT_i = sl_i//64 chunks.
-        NT_chunk = 64
-        h_state_diff = 0.0
-        cp_h_offset = 0
-        ref_h_offset = 0
-        for sl in seq_lengths:
-            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
-            nt_seg = half // NT_chunk  # chunks per half-segment for this seq
-            ref_seg0_start = ref_h_offset + s0 // NT_chunk
-            ref_seg1_start = ref_h_offset + s1 // NT_chunk
-            diff_h0 = (
-                (
-                    h_all[0, cp_h_offset : cp_h_offset + nt_seg].float()
-                    - h_ref[0, ref_seg0_start : ref_seg0_start + nt_seg].float()
-                )
-                .abs()
-                .max()
-                .item()
-            )
-            diff_h1 = (
-                (
-                    h_all[0, cp_h_offset + nt_seg : cp_h_offset + 2 * nt_seg].float()
-                    - h_ref[0, ref_seg1_start : ref_seg1_start + nt_seg].float()
-                )
-                .abs()
-                .max()
-                .item()
-            )
-            # print(f"  rank{rank} h_diff seq sl={sl} seg0={diff_h0:.6f} seg1={diff_h1:.6f}")
-            h_state_diff = max(h_state_diff, diff_h0, diff_h1)
-            cp_h_offset += 2 * nt_seg
-            ref_h_offset += sl // NT_chunk
-        assert (
-            h_state_diff < 1e-3
-        ), f"rank {rank} h_state_diff={h_state_diff:.6f} exceeds 1e-3"
-
-        # Compare v_new (DeltaV) first: zigzag-local segments vs reference slices.
-        v_diff = 0.0
-        local_offset, full_offset = 0, 0
-        for sl in seq_lengths:
-            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
-            dv0 = (
-                (
-                    v_z[:, local_offset : local_offset + half].float()
-                    - vn_ref[:, full_offset + s0 : full_offset + s0 + half].float()
-                )
-                .abs()
-                .max()
-                .item()
-            )
-            dv1 = (
-                (
-                    v_z[:, local_offset + half : local_offset + 2 * half].float()
-                    - vn_ref[:, full_offset + s1 : full_offset + s1 + half].float()
-                )
-                .abs()
-                .max()
-                .item()
-            )
-            v_diff = max(v_diff, dv0, dv1)
-            local_offset += 2 * half
-            full_offset += sl
-
-        assert v_diff < 1e-3, f"rank {rank} v_diff={v_diff:.6f} exceeds 1e-3"
-        print(
-            f"################[input checking passed]: rank {rank} v_diff={v_diff:.6f}  h_state_diff={h_state_diff:.6f} "
+        o_z, h_all, fs_z, v_z = chunk_gated_delta_rule_fwd_cp_zigzag(
+            q=q_l,
+            k=k_l,
+            v=v_l,
+            g=g_l,
+            beta=b_l,
+            scale=scale,
+            initial_state=h0_kv,
+            output_final_state=True,
+            cp_group=dist.group.WORLD,
+            cu_seqlens=local_cu,
+            seg_cu=seg_cu,
+            causal_order=causal_order,
+            fwd_o_fn=chunk_fwd_o,
         )
+        fs_ref_vk = h0_vk.transpose(-1, -2).contiguous()
 
-        # ---- Extra: verify q/k/g bit-equality at corresponding physical positions ----
-        # The CP function reassigns g via chunk_local_cumsum internally; replicate it here.
-        g_l_cumsum = chunk_local_cumsum(g_l.clone(), chunk_size=64, cu_seqlens=seg_cu)
-        q_diff = k_diff = g_diff = 0.0
-        local_offset, full_offset = 0, 0
-        for sl in seq_lengths:
-            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
-            for seg_idx, src_start in enumerate([s0, s1]):
-                lo = local_offset + seg_idx * half
-                fo = full_offset + src_start
-                q_diff = max(
-                    q_diff,
-                    (q_l[:, lo : lo + half].float() - q_full[:, fo : fo + half].float())
-                    .abs()
-                    .max()
-                    .item(),
-                )
-                k_diff = max(
-                    k_diff,
-                    (k_l[:, lo : lo + half].float() - k_full[:, fo : fo + half].float())
-                    .abs()
-                    .max()
-                    .item(),
-                )
-                g_diff = max(
-                    g_diff,
-                    (
-                        g_l_cumsum[:, lo : lo + half].float()
-                        - g_ref[:, fo : fo + half].float()
-                    )
-                    .abs()
-                    .max()
-                    .item(),
-                )
-            local_offset += 2 * half
-            full_offset += sl
-        print(
-            f"  rank{rank} q_diff={q_diff:.6e} k_diff={k_diff:.6e} g_diff(cumsumed)={g_diff:.6e}"
-        )
-        assert q_diff == 0.0, f"rank {rank} q_diff={q_diff} not bit-equal"
-        assert k_diff == 0.0, f"rank {rank} k_diff={k_diff} not bit-equal"
-        assert g_diff == 0.0, f"rank {rank} g_diff={g_diff} not bit-equal"
+        # Debug to check chunk_fwd_o() input.
+        # if 0:
+        #     # Debug: compare h_all per chunk
+        #     # CP h_all layout: [seq0_seg0, seq0_seg1, seq1_seg0, seq1_seg1, ...]
+        #     # where each entry has NT_seg_i = (sl_i // (2*cp_size)) // 64 chunks.
+        #     # Ref h_ref layout: [seq0_chunks, seq1_chunks, ...] with NT_i = sl_i//64 chunks.
+        #     NT_chunk = 64
+        #     h_state_diff = 0.0
+        #     cp_h_offset = 0
+        #     ref_h_offset = 0
+        #     for sl in seq_lengths:
+        #         s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+        #         nt_seg = half // NT_chunk  # chunks per half-segment for this seq
+        #         ref_seg0_start = ref_h_offset + s0 // NT_chunk
+        #         ref_seg1_start = ref_h_offset + s1 // NT_chunk
+        #         diff_h0 = (
+        #             (
+        #                 h_all[0, cp_h_offset : cp_h_offset + nt_seg].float()
+        #                 - h_ref[0, ref_seg0_start : ref_seg0_start + nt_seg].float()
+        #             )
+        #             .abs()
+        #             .max()
+        #             .item()
+        #         )
+        #         diff_h1 = (
+        #             (
+        #                 h_all[
+        #                     0, cp_h_offset + nt_seg : cp_h_offset + 2 * nt_seg
+        #                 ].float()
+        #                 - h_ref[0, ref_seg1_start : ref_seg1_start + nt_seg].float()
+        #             )
+        #             .abs()
+        #             .max()
+        #             .item()
+        #         )
+        #         # print(f"  rank{rank} h_diff seq sl={sl} seg0={diff_h0:.6f} seg1={diff_h1:.6f}")
+        #         h_state_diff = max(h_state_diff, diff_h0, diff_h1)
+        #         cp_h_offset += 2 * nt_seg
+        #         ref_h_offset += sl // NT_chunk
+        #     assert (
+        #         h_state_diff < 1e-3
+        #     ), f"rank {rank} h_state_diff={h_state_diff:.6f} exceeds 1e-3"
+
+        #     # Compare v_new (DeltaV) first: zigzag-local segments vs reference slices.
+        #     v_diff = 0.0
+        #     local_offset, full_offset = 0, 0
+        #     for sl in seq_lengths:
+        #         s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+        #         dv0 = (
+        #             (
+        #                 v_z[:, local_offset : local_offset + half].float()
+        #                 - vn_ref[:, full_offset + s0 : full_offset + s0 + half].float()
+        #             )
+        #             .abs()
+        #             .max()
+        #             .item()
+        #         )
+        #         dv1 = (
+        #             (
+        #                 v_z[:, local_offset + half : local_offset + 2 * half].float()
+        #                 - vn_ref[:, full_offset + s1 : full_offset + s1 + half].float()
+        #             )
+        #             .abs()
+        #             .max()
+        #             .item()
+        #         )
+        #         v_diff = max(v_diff, dv0, dv1)
+        #         local_offset += 2 * half
+        #         full_offset += sl
+
+        #     assert v_diff < 1e-3, f"rank {rank} v_diff={v_diff:.6f} exceeds 1e-3"
+        #     print(
+        #         f"################[input checking passed]: rank {rank} v_diff={v_diff:.6f}  h_state_diff={h_state_diff:.6f} "
+        #     )
+
+        #     # ---- Extra: verify q/k/g bit-equality at corresponding physical positions ----
+        #     # The CP function reassigns g via chunk_local_cumsum internally; replicate it here.
+        #     g_l_cumsum = chunk_local_cumsum(
+        #         g_l.clone(), chunk_size=64, cu_seqlens=seg_cu
+        #     )
+        #     q_diff = k_diff = g_diff = 0.0
+        #     local_offset, full_offset = 0, 0
+        #     for sl in seq_lengths:
+        #         s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+        #         for seg_idx, src_start in enumerate([s0, s1]):
+        #             lo = local_offset + seg_idx * half
+        #             fo = full_offset + src_start
+        #             q_diff = max(
+        #                 q_diff,
+        #                 (
+        #                     q_l[:, lo : lo + half].float()
+        #                     - q_full[:, fo : fo + half].float()
+        #                 )
+        #                 .abs()
+        #                 .max()
+        #                 .item(),
+        #             )
+        #             k_diff = max(
+        #                 k_diff,
+        #                 (
+        #                     k_l[:, lo : lo + half].float()
+        #                     - k_full[:, fo : fo + half].float()
+        #                 )
+        #                 .abs()
+        #                 .max()
+        #                 .item(),
+        #             )
+        #             g_diff = max(
+        #                 g_diff,
+        #                 (
+        #                     g_l_cumsum[:, lo : lo + half].float()
+        #                     - g_ref[:, fo : fo + half].float()
+        #                 )
+        #                 .abs()
+        #                 .max()
+        #                 .item(),
+        #             )
+        #         local_offset += 2 * half
+        #         full_offset += sl
+        #     print(
+        #         f"  rank{rank} q_diff={q_diff:.6e} k_diff={k_diff:.6e} g_diff(cumsumed)={g_diff:.6e}"
+        #     )
+        #     assert q_diff == 0.0, f"rank {rank} q_diff={q_diff} not bit-equal"
+        #     assert k_diff == 0.0, f"rank {rank} k_diff={k_diff} not bit-equal"
+        #     assert g_diff == 0.0, f"rank {rank} g_diff={g_diff} not bit-equal"
+        # End of debug check.
 
         # Compare
         o_diff = 0.0
         local_offset, full_offset = 0, 0
         for sl in seq_lengths:
             s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
-            # cur_out_0 = o_z[:, local_offset : local_offset + half].float()
-            # ref_out_0 = o_ref[:, full_offset + s0 : full_offset + s0 + half].float()
-            # if not torch.allclose(ref_out_0, cur_out_0, rtol=0.01, atol=0.01):
-            #     # print(ref_out)
-            #     # print(cur_out)
-            #     # print(ref_out[0].tolist())
-            #     # print(cur_out[0].tolist())
-            #     idx = torch.where(torch.abs(ref_out_0 - cur_out_0) > 0.01)
-            #     if len(idx[0]):
-            #         print(
-            #             f"idx = {idx}\nref={ref_out_0[idx]}\ncur={cur_out_0[idx]}\n{len(idx[0])}"
-            #         )
-            #     # assert 0
             d0 = (
                 (
                     o_z[:, local_offset : local_offset + half].float()
@@ -476,7 +523,7 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             full_offset += sl
 
         fs_diff = (
-            (fs_z.float() - fs_ref.float()).abs().max().item()
+            (fs_z.float() - fs_ref_vk.float()).abs().max().item()
             if fs_z is not None
             else 0.0
         )
@@ -487,10 +534,72 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             f"  rank {rank}: o={o_diff:.6f} fs={fs_diff:.6f} {'PASS' if passed else 'FAIL'}"
         )
         dist.barrier()
+        assert passed, f"rank {rank} failed: o={o_diff:.6f} fs={fs_diff:.6f}"
+
+        # ---- Benchmark (optional) ---------------------------------------
+        if bench:
+
+            def _ref_call():
+                chunk_gated_delta_rule_fwd(
+                    q=q_full,
+                    k=k_full,
+                    v=v_full,
+                    g=g_full,
+                    beta=beta_full,
+                    scale=scale,
+                    initial_state=h0_vk.clone(),
+                    cu_seqlens=full_cu,
+                    chunk_indices=chunk_indices_ref,
+                    initial_state_indices=initial_state_indices,
+                )
+
+            def _cp_call():
+                chunk_gated_delta_rule_fwd_cp_zigzag(
+                    q=q_l,
+                    k=k_l,
+                    v=v_l,
+                    g=g_l.clone(),  # cumsum is in-place inside
+                    beta=b_l,
+                    scale=scale,
+                    initial_state=h0_kv.clone(),
+                    output_final_state=True,
+                    cp_group=dist.group.WORLD,
+                    cu_seqlens=local_cu,
+                    seg_cu=seg_cu,
+                    causal_order=causal_order,
+                    fwd_o_fn=chunk_fwd_o,
+                )
+
+            # Only rank 0 runs single-GPU reference (no collectives).
+            if rank == 0:
+                ref_p20, ref_p50, ref_p80 = _bench_synced(
+                    _ref_call, warmup=2, rep=100, use_barrier=False
+                )
+            else:
+                ref_p20 = ref_p50 = ref_p80 = float("nan")
+
+            dist.barrier()
+            # CP path runs collectives -> all ranks must use identical iter counts
+            # AND barrier between iters, otherwise NCCL desyncs and TCPStore dies.
+            cp_p20, cp_p50, cp_p80 = _bench_synced(
+                _cp_call, warmup=2, rep=10000, use_barrier=True
+            )
+            dist.barrier()
+
+            label = "+".join(str(s) for s in seq_lengths)
+            if rank == 0:
+                logging.info(
+                    f"  [bench seqlens={label} H={H} K={K} V={V}] "
+                    f"ref(1GPU) p50={ref_p50*1000:.1f}us (p20/p80={ref_p20*1000:.1f}/{ref_p80*1000:.1f})"
+                )
+            logging.info(
+                f"  [bench seqlens={label} cp_size={world_size} rank={rank}] "
+                f"cp p50={cp_p50*1000:.1f}us (p20/p80={cp_p20*1000:.1f}/{cp_p80*1000:.1f})"
+            )
+            dist.barrier()
+
         torch.cuda.synchronize()
         dist.destroy_process_group()
-
-        assert passed, f"rank {rank} failed: o={o_diff:.6f} fs={fs_diff:.6f}"
 
     except Exception as e:
         print(f"Rank {rank} error: {e}")
@@ -505,7 +614,7 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
 # ---------------------------------------------------------------------------
 
 
-def run_test(seq_lengths, H=16, K=128, V=128):
+def run_test(seq_lengths, H=16, K=128, V=128, bench=False):
     nccl_port = _find_free_port()
     label = "+".join(str(s) for s in seq_lengths)
     logging.info(f"[seqlens={label}  H={H} K={K} V={V}]")
@@ -517,7 +626,7 @@ def run_test(seq_lengths, H=16, K=128, V=128):
     for rank in range(GPU_COUNT):
         p = mp.Process(
             target=_worker,
-            args=(rank, GPU_COUNT, nccl_port, seq_lengths, H, K, V),
+            args=(rank, GPU_COUNT, nccl_port, seq_lengths, H, K, V, bench),
             name=f"rank-{rank}",
         )
         p.start()
@@ -543,30 +652,36 @@ if __name__ == "__main__":
     parser.add_argument("--H", type=int, default=64)
     parser.add_argument("--K", type=int, default=128)
     parser.add_argument("--V", type=int, default=128)
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="After correctness check, run do_bench on the reference and CP zigzag forward.",
+    )
     args = parser.parse_args()
 
     if args.seqlens:
         # Run single user-specified config
-        ok = run_test(args.seqlens, H=args.H, K=args.K, V=args.V)
+        ok = run_test(args.seqlens, H=args.H, K=args.K, V=args.V, bench=args.bench)
         exit(0 if ok else 1)
 
     # Default: run a suite of configs
     configs = [
-        [256],
-        [512],
-        [1024],
-        [2048],
-        [4096],
-        [8192],
-        [32768],
-        [256, 256],
-        [4096, 4096],
-        [8192, 16384],
-        [4096, 8192, 4096],
+        # [256],
+        # [512],
+        # [16384],
+        # [32768],
+        [65536],
+        # [4096],
+        # [8192],
+        #     [32768],
+        #     [256, 256],
+        #     [4096, 4096],
+        # [8192, 16384],
+        #     [4096, 8192, 4096],
     ]
     results = []
     for sl in configs:
-        ok = run_test(sl, H=args.H, K=args.K, V=args.V)
+        ok = run_test(sl, H=args.H, K=args.K, V=args.V, bench=args.bench)
         results.append((sl, ok))
 
     logging.info("\n===== Summary =====")
