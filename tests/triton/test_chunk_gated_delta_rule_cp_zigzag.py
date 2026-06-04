@@ -17,6 +17,12 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
+from torch.profiler import (
+    ProfilerActivity,
+    profile,
+    schedule,
+    tensorboard_trace_handler,
+)
 from triton.testing import do_bench
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
@@ -334,6 +340,7 @@ def prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V):
     )
     initial_state_indices = torch.arange(N, dtype=torch.int32, device=device)
     chunk_indices_ref = prepare_chunk_indices(full_cu, 64)
+    chunk_indices_l = prepare_chunk_indices(seg_cu, 64)
     return (
         scale,
         q_full,
@@ -354,6 +361,7 @@ def prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V):
         causal_order,
         initial_state_indices,
         chunk_indices_ref,
+        chunk_indices_l,
         device,
     )
 
@@ -517,6 +525,7 @@ def acc_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             causal_order,
             initial_state_indices,
             chunk_indices_ref,
+            chunk_indices_l,
             device,
         ) = prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V)
 
@@ -551,6 +560,7 @@ def acc_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
                 cu_seqlens=local_cu,
                 seg_cu=seg_cu,
                 causal_order=causal_order,
+                chunk_indices=chunk_indices_l,
                 fwd_o_fn=chunk_fwd_o_ref,
             )
         else:
@@ -648,7 +658,9 @@ def acc_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
         raise
 
 
-def bench_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
+def bench_worker(
+    rank, world_size, nccl_port, seq_lengths, H, K, V, profile_trace=False
+):
     try:
         (
             scale,
@@ -670,6 +682,7 @@ def bench_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             causal_order,
             initial_state_indices,
             chunk_indices_ref,
+            chunk_indices_l,
             device,
         ) = prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V)
 
@@ -701,6 +714,7 @@ def bench_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
                 cu_seqlens=local_cu,
                 seg_cu=seg_cu,
                 causal_order=causal_order,
+                chunk_indices=chunk_indices_l,
                 fwd_o_fn=chunk_fwd_o,
             )
 
@@ -716,7 +730,7 @@ def bench_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
         # CP path runs collectives -> all ranks must use identical iter counts
         # AND barrier between iters, otherwise NCCL desyncs and TCPStore dies.
         cp_p20, cp_p50, cp_p80 = _bench_synced(
-            _cp_call, warmup=2, rep=10000, use_barrier=True
+            _cp_call, warmup=2, rep=100, use_barrier=True
         )
         dist.barrier()
 
@@ -731,6 +745,71 @@ def bench_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             f"cp p50={cp_p50*1000:.1f}us (p20/p80={cp_p20*1000:.1f}/{cp_p80*1000:.1f})"
         )
         dist.barrier()
+
+        # ------------------------------------------------------------------
+        # Optional torch.profiler pass: dump per-rank Chrome trace + print
+        # per-kernel CUDA-time table.  Active iters are kept small to avoid
+        # huge traces; this is independent of the timing bench above.
+        # ------------------------------------------------------------------
+        if profile_trace:
+            trace_dir = os.environ.get(
+                "PROFILE_DIR",
+                f"./traces_seqlens{label}_cp{world_size}",
+            )
+            os.makedirs(trace_dir, exist_ok=True)
+            sched = schedule(wait=1, warmup=2, active=5, repeat=1)
+            n_steps = 1 + 2 + 5  # wait + warmup + active
+
+            # ---- CP profile (all ranks) ----
+            dist.barrier()
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=sched,
+                on_trace_ready=tensorboard_trace_handler(
+                    trace_dir, worker_name=f"cp_rank{rank}"
+                ),
+                record_shapes=False,
+                with_stack=False,
+            ) as prof_cp:
+                for _ in range(n_steps):
+                    dist.barrier()
+                    _cp_call()
+                    prof_cp.step()
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            if rank == 0:
+                logging.info(
+                    f"\n[profile cp seqlens={label} cp_size={world_size} rank=0] "
+                    f"top kernels:\n"
+                    + prof_cp.key_averages().table(
+                        sort_by="cuda_time_total", row_limit=20
+                    )
+                )
+
+            # ---- Reference profile (rank 0 only, no collectives) ----
+            if rank == 0:
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    schedule=sched,
+                    on_trace_ready=tensorboard_trace_handler(
+                        trace_dir, worker_name="ref_rank0"
+                    ),
+                    record_shapes=False,
+                    with_stack=False,
+                ) as prof_ref:
+                    for _ in range(n_steps):
+                        _ref_call()
+                        prof_ref.step()
+                torch.cuda.synchronize()
+                logging.info(
+                    f"\n[profile ref(1GPU) seqlens={label}] top kernels:\n"
+                    + prof_ref.key_averages().table(
+                        sort_by="cuda_time_total", row_limit=20
+                    )
+                )
+                logging.info(f"\n[profile] traces written to: {trace_dir}")
+            dist.barrier()
 
         torch.cuda.synchronize()
         dist.destroy_process_group()
@@ -751,7 +830,7 @@ def bench_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
 # ---------------------------------------------------------------------------
 
 
-def run_test(seq_lengths, H=16, K=128, V=128, bench=False):
+def run_test(seq_lengths, H=16, K=128, V=128, bench=False, profile_trace=False):
     nccl_port = _find_free_port()
     label = "+".join(str(s) for s in seq_lengths)
     logging.info(f"[seqlens={label}  H={H} K={K} V={V}]")
@@ -763,7 +842,8 @@ def run_test(seq_lengths, H=16, K=128, V=128, bench=False):
     for rank in range(GPU_COUNT):
         p = mp.Process(
             target=bench_worker if bench else acc_worker,
-            args=(rank, GPU_COUNT, nccl_port, seq_lengths, H, K, V),
+            args=(rank, GPU_COUNT, nccl_port, seq_lengths, H, K, V)
+            + ((profile_trace,) if bench else ()),
             name=f"rank-{rank}",
         )
         p.start()
@@ -794,11 +874,23 @@ if __name__ == "__main__":
         action="store_true",
         help="After correctness check, run do_bench on the reference and CP zigzag forward.",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="With --bench, also dump per-rank torch.profiler Chrome traces and per-kernel CUDA-time tables. Set PROFILE_DIR to override the output dir.",
+    )
     args = parser.parse_args()
 
     if args.seqlens:
         # Run single user-specified config
-        ok = run_test(args.seqlens, H=args.H, K=args.K, V=args.V, bench=args.bench)
+        ok = run_test(
+            args.seqlens,
+            H=args.H,
+            K=args.K,
+            V=args.V,
+            bench=args.bench,
+            profile_trace=args.profile,
+        )
         exit(0 if ok else 1)
 
     # Default: run a suite of configs
@@ -818,7 +910,14 @@ if __name__ == "__main__":
     ]
     results = []
     for sl in configs:
-        ok = run_test(sl, H=args.H, K=args.K, V=args.V, bench=args.bench)
+        ok = run_test(
+            sl,
+            H=args.H,
+            K=args.K,
+            V=args.V,
+            bench=args.bench,
+            profile_trace=args.profile,
+        )
         results.append((sl, ok))
 
     logging.info("\n===== Summary =====")

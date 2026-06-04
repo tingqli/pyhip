@@ -39,7 +39,7 @@ from sglang.srt.layers.attention.fla.op import exp
 CHUNK_SIZE = 64
 
 
-__all__ = ["chunk_gated_delta_rule_fwd_cp_zigzag"]
+__all__ = ["chunk_gated_delta_rule_fwd_cp_zigzag", "build_segment_cu_seqlens"]
 
 
 from typing import Tuple
@@ -584,6 +584,7 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     cu_seqlens: Optional[torch.LongTensor] = None,
     seg_cu: Optional[torch.LongTensor] = None,
     causal_order: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.Tensor] = None,
     fwd_o_fn=None,
 ):
     """
@@ -616,7 +617,8 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=seg_cu)
 
     # Reuse sglang's fused intra kernel (kkt + solve_tril + recompute_w_u)
-    chunk_indices = prepare_chunk_indices(seg_cu, CHUNK_SIZE)
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(seg_cu, CHUNK_SIZE)
     w, u, A = chunk_gated_delta_rule_fwd_intra(
         k=k,
         v=v,
