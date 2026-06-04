@@ -14,6 +14,24 @@ $`= \alpha_t S_{t-1} + \Delta v_t \, k_t^T, \quad \Delta v_t = \beta_t (v_t - \a
 
 $`o_t = q_t \, S_t \tag{Eq. GDN-out}`$
 
+其中 $`\alpha_t\in(0,1),\beta_t\in(0,1)`$
+### gate $`\alpha`$ 和 $`\beta`$
+
+$`\alpha_t S_{t-1}`$ 这步控制整体记忆衰减 $`\alpha`$趋近于1几乎不忘，趋近于0几乎全忘。
+
+$`(I-\beta_t k_t k_t^\top)`$ 可以理解为删除 memory 在当前key也就是$`k_t`$方向上的旧信息。$`k_t k_t^\top`$是当前key的投影矩阵，
+
+有趣的是 如果$`\beta=1`$ 意义是memory在$`k_t`$方向被完全清空(会类似施密特正交化 Gram–Schmidt orthogonalization)，通过$`\beta_t v_t k_t^\top`$写入新的value，从而实现该key的完全覆盖。
+
+反之$`\beta=0`$退化成$`S_t={\alpha}S_{t-1}`$完全没记忆更新。
+
+总结一下两个gate系数的作用
+
+| 参数 | 作用                  |
+| -- | ------------------- |
+| β  | 控制 **当前 key 的更新强度** |
+| α  | 控制 **整体记忆衰减**       |
+
 ## Chunk-level View
 
 Per chunk $[t]$ of length $C$, indices $i, j \in 1..C$, with:
@@ -23,17 +41,19 @@ Per chunk $[t]$ of length $C$, indices $i, j \in 1..C$, with:
 - $S_{[t]} \in \mathbb{R}^{D_k \times D_v}$ — chunk-start memory
 - $K_{[t]} \in \mathbb{R}^{C \times D_k}$, $Q_{[t]} \in \mathbb{R}^{C \times D_k}$, $V_{[t]} \in \mathbb{R}^{C \times D_v}$ — per-chunk stacks
 
+
+
 ### Core Chunk Equations
 
 | Quantity | Formula | Shape |
 |----------|---------|-------|
 | $L$ | $\text{strictLower}\bigl(\text{diag}(\beta)\,(\Gamma \odot K K^T)\bigr)$ | $[C, C]$ |
-| $\tilde{U}_{[t]}$ | $(I + L)^{-1}\,\text{diag}(\beta)\,V$ | $[C, D_v]$ |
-| $W_{[t]}$ | $(I + L)^{-1}\,\text{diag}(\beta)\,K$ | $[C, D_k]$ |
-| $W^\leftarrow_{[t]}$ | $(I + L)^{-1}\,\text{diag}(\gamma_i)\,\text{diag}(\beta)\,K$ | $[C, D_k]$ |
-| $K^\rightarrow_{[t]}$ | $\text{diag}(\gamma_C / \gamma_i)\,K_{[t]}$ | $[C, D_k]$ |
-| $Q^\leftarrow_{[t]}$ | $\text{diag}(\gamma_i)\,Q_{[t]}$ | $[C, D_k]$ |
-| $S^\rightarrow_{[t]}$ | $\gamma_C \cdot S_{[t]}$ | $[D_k, D_v]$ |
+| $\tilde{U}_{[t]}$ | $(I + L)^{-1}\text{diag}(\beta)V$ | $[C, D_v]$ |
+| $W_{[t]}$ | $(I + L)^{-1}\text{diag}(\beta)K$ | $[C, D_k]$ |
+| $W^\leftarrow_{[t]}$ | $(I + L)^{-1}\text{diag}(\gamma_i)\text{diag}(\beta)K$ | $[C, D_k]$ |
+| $K^\rightarrow_{[t]}$ | $\text{diag}(\gamma_C / \gamma_i)K_{[t]}$ | $[C, D_k]$ |
+| $Q^\leftarrow_{[t]}$ | $\text{diag}(\gamma_i)Q_{[t]}$ | $[C, D_k]$ |
+| $S^\rightarrow_{[t]}$ | $`{\gamma_{C}}{S_{[t]}}`$ | $[D_k, D_v]$ |
 | $\Delta V_{[t]}$ | $`\tilde{U}_{[t]} - W^\leftarrow_{[t]}\,S_{[t]}^T`$ | $[C, D_v]$ |
 
 ### State Update
