@@ -571,33 +571,39 @@ def cp_merge(ag_hm, h0, num_ranks, N, H, K, V, causal_order):
 
 
 def chunk_gated_delta_rule_fwd_cp_zigzag(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: Optional[torch.Tensor],
+    q: torch.Tensor,  # [B,H, L,Dk]
+    k: torch.Tensor,  # [B,H, L,Dk]
+    v: torch.Tensor,  # [B,H, L,Dv]
+    g: torch.Tensor,  # [B,H, L]
+    beta: torch.Tensor,  # [B,H, L]
+    initial_state: Optional[torch.Tensor],  # [B, H, K, V]
     output_final_state: bool,
     cp_group: dist.ProcessGroup,
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = False,
+    # [0, L0, L0+L1, ...]  batch+1 entries , [batch+1]
     cu_seqlens: Optional[torch.LongTensor] = None,
+    # [0, L0/2, L0, L0+L1/2, L0+L1, ...]  2*batch+1 entries, [2*batch+1]
     seg_cu: Optional[torch.LongTensor] = None,
-    causal_order: Optional[torch.Tensor] = None,
+    # NCCL all_gather 顺序：[r0_seg0, r0_seg1, r1_seg0, r1_seg1, ...]，不是因果顺序
+    # causal_order 是一张查找表，让 kernel 内部按因果顺序遍历 gathered 行
+    # cp_size=2 时 causal_order = [0, 2, 3, 1]，意思是因果位置 0/1/2/3 分别对应 gathered 的第 0/2/3/1 行, 因果关系mapping到seg 里面是r0_seg0->r1_seg0->r1_seg1->r0_seg1
+    causal_order: Optional[torch.Tensor] = None,  # [cpsize*2]
     chunk_indices: Optional[torch.Tensor] = None,
+    # chunk_indices是根据local的seg_cu 生成，假设batch=2, 每个batch都有1024 tokens, 一共有token = 2048, CP_SIZE=2, 这个rank上的 seg_cu = [0,256,512,768,1024]
+    # 这里的chunk_indices是，shape[num_chunks_in_all_segs, 2]
+    # tensor([[0, 0], [0, 1], [0, 2], [0, 3],   # seg0 = seq0 前半 256 tok 的 4 个 chunk
+    #         [1, 0], [1, 1], [1, 2], [1, 3],   # seg1 = seq0 后半
+    #         [2, 0], [2, 1], [2, 2], [2, 3],   # seg2 = seq1 前半
+    #         [3, 0], [3, 1], [3, 2], [3, 3]])  # seg3 = seq1 后半
     fwd_o_fn=None,
 ):
     """
     CP-parallel gated delta rule forward — zigzag variant.
-
-    Args:
-        initial_state: [N, H, K, V] float32.
-        All other args match sglang's chunk_gated_delta_rule_fwd.
-
     Returns:
-        o: output tensor
-        h_all: per-chunk hidden states
-        final_state: [N, H, K, V] if output_final_state else None
+        o: output tensor. [B, H, L,Dv]
+        h_all: 输出每个chunk的hiddne state. 用于check accuracy. [B, NT, H, V, K], NT = DIV_UP(L, chunk_size)
+        final_state: [N, H, K, V] if output_final_state else None ????
     """
     rank = dist.get_rank(cp_group)
     cp_size = dist.get_world_size(cp_group)
@@ -613,12 +619,24 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     # ---- Phase 1: local compute for both segments ----
     if seg_cu is None:
         seg_cu = build_segment_cu_seqlens(cu_seqlens)
-
+    # 输出g: [B, H, L] -> [B, H, NT, 64], parallel on B, Hv, N
     g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=seg_cu)
 
     # Reuse sglang's fused intra kernel (kkt + solve_tril + recompute_w_u)
     if chunk_indices is None:
         chunk_indices = prepare_chunk_indices(seg_cu, CHUNK_SIZE)
+    # decay_mask, Γ[i,j] = Exp(g[i] - g[j]) if i>=j else 0,  也可以表达为decay_mask[64, 64]的下三角矩阵。
+    # k_beta = k * beta
+    # L = k_beta@k^T * decay_mask
+    # L是下三角阵， 求（I  + L ）的逆，  (I + L)^（-1）
+    # chunk_gated_delta_rule_fwd_kkt_solve_kernel() — [B, Hv, N] parallel，每个CU负责 [C, Dk]@[Dk, C], inverse the [C, C] triangular matrix
+    # 这里可以把(I + L)^（-1） atten.
+
+    # U~= atten @ (beta * V)
+    # W← = atten@ (beta* gamma_i* K)
+    # recompute_w_u_fwd() — [B, H, N] parallel. Each chunk: [C, C]@[C, Dv] → Ũ, [C, C]@[C, Dk] → W←
+    # `w`, [ B, H, N, 64, Dk]
+    # 'u',  [B, Hv, N, 64, Dv]
     w, u, A = chunk_gated_delta_rule_fwd_intra(
         k=k,
         v=v,
@@ -628,10 +646,14 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
         chunk_indices=chunk_indices,
     )
 
-    # Compute affine pairs (b, M) for each segment — [2*N, H, K, V] / [2*N, H, K, K]
+    # Compute affine pairs (b, M) for each segment
+    # Br: [2*B, H, K, V], `B`通常是batch, 代表有多少个sequence. `2`是seg(zigzag的两半)
+    # M:  [2*B, H, K, K], 同上，只是M的最后两个维度是[K, K]
     b = compute_br(k=k, w=w, u=u, g=g, cu_seqlens=seg_cu)
     M = compute_M_total(k=k, w=w, g=g, cu_seqlens=seg_cu)
-
+    # ·B· 维度 排列[seq0_seg0_br, seq0_seg1_br, seq1_seg0_br, seq1_seg1_br, ...]
+    # b0, M0 是所有batchseg0的系数。 b0[B,H,K,V], M0[B,H,K,K]
+    # b1 ,M1 是所有batch seg1的系数。
     b0 = b[0::2].contiguous()
     b1 = b[1::2].contiguous()
     M0 = M[0::2].contiguous()
@@ -642,14 +664,14 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     K = k.shape[3]
     V = v.shape[-1]
 
-    # ---- Phase 2: all-gather affine pairs ----
+    # ---- Phase 2: all-gather 仿射对 ----
     packed = torch.stack(
         [
             torch.cat([b0, M0], dim=-1),
             torch.cat([b1, M1], dim=-1),
         ],
         dim=0,
-    )  # [2, N, H, K, V+K]
+    )  # [2, B, H, K, V+K]
 
     gathered = torch.empty(
         num_segs, *packed.shape[1:], device=packed.device, dtype=packed.dtype
@@ -683,6 +705,11 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     h0_combined_vk = h0_combined_kv.transpose(-1, -2).contiguous()
     seg_indices = torch.arange(2 * N, dtype=torch.int32, device=k.device)
 
+    # compute the h_all, v_new_all for every chunk.
+    # For each trunk:
+    # v_new = U~ - W← @ h_in,
+    # K-> = k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]), i 是trunk index
+    # h_out = h_in + K->^T@v_new
     h_all, v_new_all = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -693,6 +720,10 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
         cu_seqlens=seg_cu,
         chunk_indices=chunk_indices,
     )
+
+    # [B, H, L//64] parallel, so need every chunk sstate(h_all) and every chunk new value to compute o in parallel
+    # Ox = Q<- @ S[t], Q-< = (q * g.exp()), q的每个token与对应token的g相乘。[64, Dk]@[Dk, Dv] = [64, Dv]
+    # Oy = (q @ k^T * decay_mask) @ v_new_all,   [64, Dk]@[Dk, 64]@[64, Dv]
     _fwd_o = fwd_o_fn if fwd_o_fn is not None else chunk_fwd_o
     o = _fwd_o(
         q=q,

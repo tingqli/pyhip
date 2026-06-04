@@ -314,10 +314,13 @@ def prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V):
     v_full = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
     g_full = F.logsigmoid(torch.rand(1, T_total, H, dtype=dtype, device=device))
     beta_full = torch.rand(1, T_total, H, dtype=dtype, device=device).sigmoid()
+    # [B, H, K, V] state
     h0_kv = torch.randn(N, H, K, V, dtype=torch.float32, device=device)
+    # transpose to [B,H, V, K] state
     h0_vk = h0_kv.transpose(-1, -2).contiguous()
-    full_cu = torch.zeros(N + 1, dtype=torch.long, device=device)
+    full_cu = torch.zeros(N + 1, dtype=torch.long, device=device)  # [batch + 1]
 
+    # [batch + 1]
     for i, sl in enumerate(seq_lengths):
         full_cu[i + 1] = full_cu[i] + sl
 
@@ -328,10 +331,14 @@ def prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V):
     g_l = _build_local_from_full(g_full, seq_lengths, world_size, rank)
     b_l = _build_local_from_full(beta_full, seq_lengths, world_size, rank)
 
-    local_lengths = [sl // world_size for sl in seq_lengths]
+    local_lengths = [
+        sl // world_size for sl in seq_lengths
+    ]  # [batch], local length for each batch
     local_cu = torch.zeros(N + 1, dtype=torch.long, device=device)
+    # [batch + 1], cumulative lengh for each batch.
     for i, ll in enumerate(local_lengths):
         local_cu[i + 1] = local_cu[i] + ll
+    # [2*batch + 1], cumulative length for each half-segment.
     seg_cu = build_segment_cu_seqlens(local_cu)
     causal_order = torch.tensor(
         zigzag_causal_order(world_size),
