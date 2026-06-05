@@ -22,7 +22,7 @@ kernel 3: recompute w, u  (A @ diag(beta) V/K)    → 读 A
 
 把 $64 \times 64$ 的下三角矩阵切成 $4 \times 4$ 个 $16 \times 16$ 的子块：
 
-$$\begin{bmatrix} A_{00} & & & \\ A_{10} & A_{11} & & \\ A_{20} & A_{21} & A_{22} & \\ A_{30} & A_{31} & A_{32} & A_{33} \end{bmatrix}$$
+$`\begin{bmatrix} A_{00} & & & \\ A_{10} & A_{11} & & \\ A_{20} & A_{21} & A_{22} & \\ A_{30} & A_{31} & A_{32} & A_{33} \end{bmatrix}`$
 
 4 个对角块 + 6 个非对角块 = **10 个 $16 \times 16$ 块**，全部放在寄存器中。
 
@@ -84,7 +84,7 @@ $`M_{i,:} = e_i - \sum_{j<i} L_{i,j} \cdot M_{j,:}`$
 
 **初始化** `b_Ai = -L`：
 
-$$b\_Ai = \begin{pmatrix} 0 & 0 & 0 & 0 \\ -a & 0 & 0 & 0 \\ -b & -c & 0 & 0 \\ -d & -e & -f & 0 \end{pmatrix}$$
+$`b\_Ai = \begin{pmatrix} 0 & 0 & 0 & 0 \\ -a & 0 & 0 & 0 \\ -b & -c & 0 & 0 \\ -d & -e & -f & 0 \end{pmatrix}`$
 
 **i=2**（修正第 2 行）：
 
@@ -124,7 +124,7 @@ b_Ai += I                                 # 加单位阵
 
 Step 3 已求出 4 个对角块的逆 $D_i^{-1}$（其中 $D_i = I + L_{ii}$）。整个 $64 \times 64$ 矩阵的分块结构：
 
-$$I + L = \begin{pmatrix} D_0 & & & \\ A_{10} & D_1 & & \\ A_{20} & A_{21} & D_2 & \\ A_{30} & A_{31} & A_{32} & D_3 \end{pmatrix}$$
+$`I + L = \begin{pmatrix} D_0 & & & \\ A_{10} & D_1 & & \\ A_{20} & A_{21} & D_2 & \\ A_{30} & A_{31} & A_{32} & D_3 \end{pmatrix}`$
 
 设 $M = (I+L)^{-1}$，由 $(I+L) \cdot M = I$ 逐块展开，对非对角块 $(i, j)$：
 
@@ -136,7 +136,7 @@ $$M_{ij} = -D_i^{-1} \sum_{k=j}^{i-1} A_{ik} \cdot M_{kj}$$
 
 #### 3×3 分块例子
 
-$$I + L = \begin{pmatrix} 1 & 0 & 0 \\ 2 & 1 & 0 \\ 3 & 4 & 1 \end{pmatrix}$$
+$`I + L = \begin{pmatrix} 1 & 0 & 0 \\ 2 & 1 & 0 \\ 3 & 4 & 1 \end{pmatrix}`$
 
 对角逆：$`D_i^{-1} = 1`$
 
@@ -144,7 +144,7 @@ $$I + L = \begin{pmatrix} 1 & 0 & 0 \\ 2 & 1 & 0 \\ 3 & 4 & 1 \end{pmatrix}$$
 - $M_{21} = -D_2^{-1} \cdot A_{21} \cdot D_1^{-1} = -1 \times 4 \times 1 = -4$
 - $M_{20} = -D_2^{-1} (A_{20} D_0^{-1} + A_{21} M_{10}) = -(3 + 4 \times (-2)) = 5$
 
-$$M = \begin{pmatrix} 1 & 0 & 0 \\ -2 & 1 & 0 \\ 5 & -4 & 1 \end{pmatrix}$$
+$`M = \begin{pmatrix} 1 & 0 & 0 \\ -2 & 1 & 0 \\ 5 & -4 & 1 \end{pmatrix}`$
 
 验证：$`(I+L) \cdot M = I`$ ✓
 
