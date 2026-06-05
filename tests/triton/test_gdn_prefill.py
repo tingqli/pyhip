@@ -217,23 +217,27 @@ def torch_chunk_gated_delta_rule(
         diagonal=0,
     )
     # g shape : [B, H, chunk_num, chunk_size],
-    # 假设 chunk_size=4: 原始 g = [g0, g1, g2, g3]
-    # 经过 g.cumsum(-1) 之后:  g = [g0, g0+g1, g0+g1+g2, g0+g1+g2+g3]
-    #
-    # D[i,j] = G_i - G_j  (G0 在差分中被消掉, 所以下三角里只剩 g1..g3 的累加):
-    #   D = [[ 0,         -g1,        -(g1+g2),    -(g1+g2+g3)],
+    # 假设 chunk_size=4: 原始 g = [g0, g1, g2, g3]，衰减系数的对数。
+    # 经过 G = g.cumsum(-1) 之后:  G = [g0, g0+g1, g0+g1+g2, g0+g1+g2+g3],
+    # G[:]       ： 当前chunk从第一个token到每个token的累计衰减。
+    # G[-1]      ： 当前chunk从第一个token到最后一个token累计衰减。
+    # G[-1] -G[:]： 当前chunk从每个token到最后一个token的衰减。
+    # 用decay_mask可以更加灵活的表达衰减的关系：
+    # decay[i,j] = G_i - G_j  (G0 在差分中被消掉, 所以下三角里只剩 g1..g3 的累加):
+    # decay = [[ 0,         -g1,        -(g1+g2),    -(g1+g2+g3)],
     #        [ g1,         0,         -g2,         -(g2+g3)   ],
     #        [ g1+g2,      g2,         0,          -g3        ],
     #        [ g1+g2+g3,   g2+g3,      g3,          0         ]]
     #
-    # D.tril() 清零严格上三角, 保留下三角和对角线:
-    # D.tril() = [[ 0,         0,      0,    0 ],
+    # decay.tril() 清零严格上三角, 保留下三角和对角线:
+    # decay.tril() = [[ 0,         0,      0,    0 ],
     #               [ g1,        0,      0,    0 ],
     #               [ g1+g2,     g2,     0,    0 ],
     #               [ g1+g2+g3,  g2+g3,  g3,   0 ]]
     #
-    # 含义: D.tril()[i,j] = sum_{r=j+1..i} g_r = log(gamma_i / gamma_j),
-    # 所以 D.tril().exp() 就是下三角的 Gamma_{i,j} = gamma_i/gamma_j (对角线=1).
+    # 含义:decay_mask{i,j}= decay.tril()[i,j].exp().tril() . 当i > j是， 每个trunk里面第j个token到第i个token一共衰减了多少。
+    # 对应spec: gamma_i = G_i.exp()??
+    # 就是下三角的 decay_mask{i,j} = gamma_i/gamma_j (对角线=1).
     g = g.cumsum(dim=-1)
     # decay_mask下三角矩阵[64, 64]，对角线都为1. g = strict_low_triangular (exp(g.cumsum(-1)))
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
@@ -251,10 +255,11 @@ def torch_chunk_gated_delta_rule(
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
 
     # 这里的value被重薪赋值了，不再是传进来的value, value是公式的U~. U~= (1+L)^-1 @ diag(beta) @ V
-    # value shape还是[B, H, chunk_num, 64, V]
+    # U~/value shape还是[B, H, chunk_num, 64, V]
     value = attn @ v_beta
-    # W← = (I + L)^{-1}@diag(beta)@diag(gamma_i)@K, k_beta[B, H, chunk_num, 64, K], g.unsqueeze(-1) [B, H, chunk_num, 64, 1]
+    # W<- = (I + L)^{-1}@diag(beta)@diag(gamma_i)@K, k_beta[B, H, chunk_num, 64, K], g.unsqueeze(-1) [B, H, chunk_num, 64, 1]
     # k_cumdecay： [B, H, chunk_num, 64, K]
+    # k_cumdecay 就是W<-
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
 
     # state = (B, H, Dk, Dv)
@@ -270,11 +275,14 @@ def torch_chunk_gated_delta_rule(
         diagonal=1,
     )
 
+    # deltaV= U~ - W<- @ h_in
+    # h_out = h_in * gamma_C + K<-^T @ deltaV
     # 这里更新state是逐chunk更新的。
     for i in range(0, Lp // chunk_size):
         # v_i 这里是U~
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        # Q @ Kt * Gamma,  *是 elementwise, 这里是为Oy做准备。
+        # Q @ Kt * Gamma,  *是 elementwise, 这里是为后面Oy做准备。
+        # attn代表的token里面第i个元素和第j个元素的关系，自然要与衰减矩阵相关联。
         attn = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
         # v_new 是deltaV, v_i是U~, v_prime是W<- @ S[t], deltaV= U~ - W<- @ S[t]
         # W<- @ S[t], k_cumdecay： [B, H, chunk_num, 64, Dk],  state = (B, H, Dk, Dv)
@@ -291,8 +299,9 @@ def torch_chunk_gated_delta_rule(
         # 更新状态 S[t+1]
         # g shape [B, H, chunk_num, chunk_size],
         last_recurrent_state = (
-            # g[:, :, i, -1] 是当前chunk最后一个位置的累积衰减（gamma_C），
+            # g[:, :, i, -1] 是当前chunk从第一个token到最后一个token的衰减（gamma_C），
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            # (g[:, :, i, -1, None] - g[:, :, i]) 是当前chunk每个位置到最后一个位置的衰减（gamma_C/gamma_i），
             + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(
                 -1, -2
             )

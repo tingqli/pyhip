@@ -292,6 +292,16 @@ def compute_br(k, w, u, g, cu_seqlens=None):
 # ---------------------------------------------------------------------------
 
 
+# M:  [2*B, H, Dk, Dk], 同上，只是h state 的初值不再是 0，而是单位阵 I_{Dk}
+# [B, H, dK/BK] parallel,每个WG负责2个seg的Dk列条的计算。在
+# 注意：这里 U~ 当作 0（compute_M_total 不接 u），h_in 的最后一维由 Dv 换成 Dk
+# iterate for each trunk in the zig/zag, i 是trunk index :
+#   h_in = I_{Dk} if i==0 else h_out                                       [Dk, Bk]
+#   v_new[:,:,i] = 0 - W←[:,:,i] @ h_in[:,:,i]                             [64, Bk] = [64, Dk]@[Dk,Bk]， 在输出列维度parallel
+#   K-> = k[:,:,i] * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]),[64, Bk] * [64] = [64, bk]
+#   h_in-> = h_in * gamma_C                                                [Dk,Bk] * [1] = [Dk, Bk]
+#   h_out = h_in-> + K->^T@v_new                                           [Dk,Bk] + [Dk,64]@[64,bk] = [Dk, Dk]
+# 最终的h_out 就是 segment 的仿射矩阵 M = M_{NT-1}···M_0 · I = M_{NT-1}···M_0
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -314,15 +324,25 @@ def chunk_cp_compute_M_total_kernel(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """
+    计算每个 segment 的仿射矩阵 M ∈ R^{K×K}，使得整段 chunk 递推满足
+        h_seg_out = M · h_seg_in + b
+    的线性部分(b 由 chunk_cp_compute_br_kernel 计算
+    """
+
     i_col, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
+
+    # ---------- 2. 计算当前 segment 的 token 范围 [bos, eos) ----------
     if IS_VARLEN:
+        # 变长: 从 cu_seqlens 里查 segment i_n 的起止 token offset
         bos = tl.load(cu_seqlens + i_n).to(tl.int32)
         eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
     else:
+        # 等长: segment i_n 占据 [i_n*T, (i_n+1)*T)
         bos = i_n * T
-    NT = tl.cdiv(T, BT)
+    NT = tl.cdiv(T, BT)  # 当前 segment 的 chunk 数
 
     o_row = tl.arange(0, 64)
     o_col = tl.arange(0, BK) + i_col * BK
@@ -336,10 +356,14 @@ def chunk_cp_compute_M_total_kernel(
 
     k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
     w += ((bos * H + i_h) * K).to(tl.int64)
-    stride_k = Hg * K
-    stride_w = H * K
+    stride_k = Hg * K  # k 的 token-axis stride
+    stride_w = H * K  # w 的 token-axis stride
 
+    # ---------- 5. 主循环: 跑 NT 个 chunk 的递推, 每次实现 dh ← M_t · dh ----------
     for i_t in range(NT):
+        # ===== 5.1 计算 b_wdh = w_t @ dh, shape [BT, BK] =====
+        # 因为 dh 是 K×BK, 沿 K 维度切成 4 段 (b_dh1..b_dh4), 这里把对应
+        # w_t 的 [BT, 64] 列分块各取一份做 dot 累加
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
         )
@@ -368,15 +392,23 @@ def chunk_cp_compute_M_total_kernel(
                 tl.load(p_w, boundary_check=(0, 1)), b_dh4.to(w.dtype.element_ty)
             )
 
+        # ===== 5.2 应用 gate 衰减 =====
+        # b_g[i] 是 chunk 内位置 i 的累积 log-decay G_i; b_g_last = G_{C-1} (chunk 末端)
+        # K_decay 的衰减系数 exp(g_C - g_i) 直接乘到 b_wdh 上 (等价于 K_decay^T @ b_wdh)
+        # dh 整体乘 γ_C = exp(g_C), 对应单 chunk 递推中 γ_C · h_{t-1} 那一项
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
-            m_t = (i_t * BT + tl.arange(0, BT)) < T
-            b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
+            m_t = (
+                i_t * BT + tl.arange(0, BT)
+            ) < T  # 越界 mask (最后一个 chunk 可能不满)
+            b_g_last = tl.load(g + bos * H + last_idx * H + i_h)  # 标量 g_C^(t)
             p_g = tl.make_block_ptr(
                 g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
             )
-            b_g = tl.load(p_g, boundary_check=(0,))
+            b_g = tl.load(p_g, boundary_check=(0,))  # 当前 chunk 内 BT 个位置的 g_i
+            # b_wdh: 把 K_decay 的衰减搬过来, 同时把越界位置清零
             b_wdh = b_wdh * tl.where(m_t, exp(b_g_last - b_g), 0)[:, None]
+            # dh: 整体乘 γ_C^(t)
             b_g_last_exp = exp(b_g_last)
             b_dh1 = b_dh1 * b_g_last_exp
             if K > 64:
@@ -386,6 +418,10 @@ def chunk_cp_compute_M_total_kernel(
             if K > 192:
                 b_dh4 = b_dh4 * b_g_last_exp
 
+        # ===== 5.3 dh ← γ_C · dh − K^T · (w · dh) =====
+        # 注意是 -=, 与 compute_br 的 += 相反. 因为这里 u=0, v_new = -w·dh
+        # 所以 K^T · v_new = -K^T · w · dh
+        # k 的 layout 是 (K, T), 所以这里 load 的是 [64, BT]
         b_wdh = b_wdh.to(k.dtype.element_ty)
         p_k = tl.make_block_ptr(
             k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
@@ -406,7 +442,10 @@ def chunk_cp_compute_M_total_kernel(
                 k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
             )
             b_dh4 -= tl.dot(tl.load(p_k, boundary_check=(0, 1)), b_wdh)
+        # 此时 b_dh* 已经更新为 M_t · b_dh*_prev. NT 步后 = M_{NT-1}··M_0 · I = M.
 
+    # ---------- 6. 写回 M_total[i_n, i_h, :, i_col*BK:(i_col+1)*BK] ----------
+    # 4 个行分块各写一次, 拼起来构成完整的列条 (K 行 × BK 列)
     M_base = M_total + i_nh * K * K
     tl.store(
         tl.make_block_ptr(M_base, (K, K), (K, 1), (0, i_col * BK), (64, BK), (1, 0)),
@@ -645,12 +684,31 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
         cu_seqlens=seg_cu,
         chunk_indices=chunk_indices,
     )
+    # iterate for each trunk in the zig/zag, i 是trunk index :
+    #   h_in = 0 if i==0 else h_out                                            [Dk, Dv]
+    #   v_new[:,:,i] = U~[:,:,i] - W←[:,:,i] @ h_in[:,:,i]                     [64, Dv] - [64, Dk]@[Dk,Dv] = [64, Dv]
+    #   K-> = k[:,:,i] * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]),[64, Dk] * [64] = [64, Dk]
+    #   h_in-> = h_in * gamma_C                                                [Dk,Dv] * [1] = [Dk, Dv]
+    #   h_out = h_in-> + K->^T@v_new                                           [Dk,Dv] + [Dk,64]@[64,Dv] = [Dk, Dv]
+    # 最终的h_out就是B
 
-    # Compute affine pairs (b, M) for each segment
-    # Br: [2*B, H, K, V], `B`通常是batch, 代表有多少个sequence. `2`是seg(zigzag的两半)
-    # M:  [2*B, H, K, K], 同上，只是M的最后两个维度是[K, K]
+    # Compute affine pairs (b, M) on 1 GPU:
+    # Br: [2*B, H, Dk, Dv], `B`通常是batch, 代表有多少个sequence. `2`是seg(zigzag的两半)
+    # [B, H, dV/BV] parallel,每个WG负责2个seg的所有chunk B系数的计算。
     b = compute_br(k=k, w=w, u=u, g=g, cu_seqlens=seg_cu)
+    # M:  [2*B, H, Dk, Dk], 同上，只是h state 的初值不再是 0，而是单位阵 I_{Dk}
+    # [B, H, dK/BK] parallel,每个WG负责2个seg的Dk列条的计算。在
+    # 注意：这里 U~ 当作 0（compute_M_total 不接 u），h_in 的最后一维由 Dv 换成 Dk
+    # iterate for each trunk in the zig/zag, i 是trunk index :
+    #   h_in = I_{Dk} if i==0 else h_out                                       [Dk, Dk]
+    #   v_new[:,:,i] = 0 - W←[:,:,i] @ h_in[:,:,i]                             [64, Dk] = [64, Dk]@[Dk,Dk]， 在输出列维度parallel
+    #   K-> = k[:,:,i] * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]),[64, Dk] * [64] = [64, Dk]
+    #   h_in-> = h_in * gamma_C                                                [Dk,Dk] * [1] = [Dk, Dk]
+    #   h_out = h_in-> + K->^T@v_new                                           [Dk,Dk] + [Dk,64]@[64,Dk] = [Dk, Dk]
+    # 最终的h_out 就是 segment 的仿射矩阵 M = M_{NT-1}···M_0 · I = M_{NT-1}···M_0
+
     M = compute_M_total(k=k, w=w, g=g, cu_seqlens=seg_cu)
+
     # ·B· 维度 排列[seq0_seg0_br, seq0_seg1_br, seq1_seg0_br, seq1_seg1_br, ...]
     # b0, M0 是所有batchseg0的系数。 b0[B,H,K,V], M0[B,H,K,K]
     # b1 ,M1 是所有batch seg1的系数。
@@ -676,12 +734,19 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     gathered = torch.empty(
         num_segs, *packed.shape[1:], device=packed.device, dtype=packed.dtype
     )
+    # Gather B and M if CP_SIZE=2
+    # gathered[0] = r0_seg0      ← 因果位置 0
+    # gathered[1] = r0_seg1      ← 因果位置 3
+    # gathered[2] = r1_seg0      ← 因果位置 1
+    # gathered[3] = r1_seg1      ← 因果位置 2
     dist.all_gather_into_tensor(
         gathered.view(num_segs, -1),
         packed.view(2, -1),
         group=cp_group,
     )
-
+    # 生成因果关系查找表
+    # cp_size=2 时 causal_order = [0, 2, 3, 1]，
+    # 意思是因果位置 0/1/2/3 分别对应 gathered 的第 0/2/3/1 行
     if causal_order is None:
         causal_order = torch.tensor(
             zigzag_causal_order(cp_size), dtype=torch.long, device=packed.device
@@ -690,8 +755,10 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     # ---- Phase 3: cp_merge to get h0 for each segment ----
     # initial_state is [N, H, K, V] — used directly by cp_merge (same layout)
     h0_global = initial_state.float() if initial_state is not None else None
+    # 返回每个sgement对应的因果关系的index. 以cp_size=2为例，rank0返回[0, 3]，rank1 返回[1,2].
     seg0_pos, seg1_pos = causal_positions(rank, cp_size)
 
+    # 根据segment的因果位置，计算出这个segment的初始状态。
     h0_seg0 = cp_merge(gathered, h0_global, seg0_pos, N, H, K, V, causal_order)
     h0_seg1 = cp_merge(gathered, h0_global, seg1_pos, N, H, K, V, causal_order)
 
@@ -708,8 +775,9 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     # compute the h_all, v_new_all for every chunk.
     # For each trunk:
     # v_new = U~ - W← @ h_in,
-    # K-> = k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]), i 是trunk index
-    # h_out = h_in + K->^T@v_new
+    # K-> = k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]), i 是trunk index ,
+    # h_in-> = h_in * gamma_C
+    # h_out = h_in-> + K->^T@v_new
     h_all, v_new_all = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -735,6 +803,8 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
         cu_seqlens=seg_cu,
     )
 
+    # 根据初始状态计算出最后一个segment的final statue,
+    # 应该可以根据第num_segs-1来推吧。但是这部分kernel占的时间不长。
     # final_state in [N, H, K, V] layout
     final_state = (
         cp_merge(gathered, h0_global, num_segs, N, H, K, V, causal_order)
