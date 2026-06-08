@@ -1,0 +1,516 @@
+import argparse
+import os
+
+import torch
+from functools import cache
+
+import flydsl.compiler as flyc  # noqa: E402
+from flydsl.compiler.kernel_function import CompilationContext  # noqa: E402
+import flydsl.expr as fx
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr.typing import BFloat16, Float32, T, Float8E4M3FNUZ
+from flydsl.expr.typing import Vector as Vec
+from flydsl.runtime.device import get_rocm_arch  # noqa: E402
+from flydsl.utils.env import DebugEnvManager
+from flydsl._mlir import ir
+import flydsl
+
+# debug
+if 1:
+    DebugEnvManager.enable_debug_info = True
+    ir._globals.register_traceback_file_inclusion(__file__)
+    ir._globals.register_traceback_file_exclusion(os.path.dirname(flydsl.__file__))
+    ir._globals.set_loc_tracebacks_frame_limit(40)
+    ir._globals.set_loc_tracebacks_enabled(True)
+    os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+
+def div_up(x, y):
+    return (x + y - 1) // y
+
+def compile_gemm_splitk(TILE_M, TILE_N, N, K):
+    TILE_K = 64
+    c_lds_size = TILE_M * TILE_N * 4
+    @fx.struct
+    class SharedStorage:
+        C_lds: fx.Array[fx.Float32, c_lds_size, 16]
+
+    @flyc.kernel
+    def gemm_splitk(arg_c_: fx.Tensor,
+                    arg_a_: fx.Tensor,
+                    arg_b_: fx.Tensor,
+                    M: int):
+        tid = fx.thread_idx.x
+        blk_x, blk_y, _ = fx.block_idx
+        arg_a = fx.Tensor(fx.make_view(
+            fx.get_iter(arg_a_),
+            fx.make_layout((M, K), (K, 1))
+        ))
+        # pre-shuffled
+        arg_b = fx.Tensor(fx.make_view(
+            fx.get_iter(arg_b_),
+            # layout分成两部分：第一部分(m, n)描述一个wave内部划分为16行，(8列每组)x4组；第二部分为重复第一部分的次数
+            # shape: (16, (8, 4)),   (N//16, K//32)
+            # stride:(8,  (1, 128)), (K*16, 512))
+            # 重新排列为第0维、第1维
+            fx.make_layout(((16, N // 16), (8, 4, K // 32)), ((8, 16 * K), (1, 128, 512)))
+        ))
+        arg_c = fx.Tensor(fx.make_view(
+            fx.get_iter(arg_c_),
+            fx.make_layout((M, N), (N, 1))
+        ))
+        a_tensor = fx.rocdl.make_buffer_tensor(arg_a, max_size=False)
+        b_tensor = fx.rocdl.make_buffer_tensor(arg_b, max_size=False)
+        c_tensor = fx.rocdl.make_buffer_tensor(arg_c, max_size=False)
+        # shape: [m_in_tile, k_in_tile, k_tile]
+        a_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M, TILE_K * 4))[None, None, blk_x, None]
+        # shape: [n_in_tile, k_in_tile, k_tile]
+        b_tile = fx.flat_divide(b_tensor, fx.make_tile(TILE_N, TILE_K * 4))[None, None, blk_y, None]
+        # shape: [m_in_tile, n_in_tile]
+        c_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M, TILE_N))[None, None, blk_x, blk_y]
+        cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+
+        tiled_mma = fx.make_tiled_mma(
+            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+            # splitk, 4个wave分布在K维度
+            fx.make_layout((1, 1, 4), (0, 0, 1)),
+            # K维度((4*2)*4)*4，线程分布依次为：连续的4点为一个lane，跳过8点为一组并重复4组*4wave，最后为重复第二次调用
+            fx.make_tile(None, None, fx.make_layout((4, 4 * 4, 2), (1, 8, 4)))
+        )
+        # fx.utils.print_typst(tiled_mma.tv_layout_A_tiled, file="layout_tiled_mma.typ")
+        a_tiled_thr = fx.make_tiled_copy_A(cp_atom_r, tiled_mma).get_slice(tid)
+        b_tiled_thr = fx.make_tiled_copy_B(cp_atom_r, tiled_mma).get_slice(tid)
+
+        a_tensor_thr = a_tiled_thr.partition_S(a_tile)
+        b_tensor_thr = b_tiled_thr.partition_S(b_tile)
+        # 等价于如下显示生成的layout
+        if const_expr(0):
+            g2r_ab = fx.make_tiled_copy(cp_atom_r,
+                                        # tv，第一部分为(16x4)x4wave=256 线程分布；第二部分为value的布局；坐标换算时是以column first的方式进行
+                                        fx.make_layout(((16, 4 * 4), 8), ((1, 128), 16)),
+                                        fx.make_tile(16, 32 * 4))
+            ab_thr = g2r_ab.get_slice(tid)
+            # shape: [v, m_rep, k_rep, k_tile]
+            a_tensor_thr = ab_thr.partition_S(a_tile)
+            # shape: [v, n_rep, k_rep, k_tile]
+            b_tensor_thr = ab_thr.partition_S(b_tile)
+
+        # tiled_mma.make_fragment_A 与 fx.make_fragment_like(a_tensor_thr[None, None, None, 0])不等价，区别：
+        #  layout按照mma_atom要求切分，比如value维度为4（mfma_16x16x16时），但a_tensor_thr是按照tiled_copy切分的，value很可能为8
+        a_frag = tiled_mma.make_fragment_A(a_tile[None, None, 0])
+        b_frag = tiled_mma.make_fragment_B(b_tile[None, None, 0])
+        # 1, 矩阵乘法从a*b变为b*a，c的layout不能直接用make_fragment_C
+        # 2, splitk需要reduce，因此c_tile每个wave都有一份，使用make_tiled_copy来构造layout但最终又不用于copy，并且还要特殊处理broadcast。
+        #    下面使用make_tiled_copy是错误的示例，没有考虑broadcast；简单的做法是基于tiledmma来构造layout
+        #    layout_c = fx.make_tiled_copy(fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16),
+        #                            fx.make_layout((16, (4, 4)), (1, (16, 64))),
+        #                            fx.make_tile(16, 16))
+        c_frag = fx.make_rmem_tensor(
+            # 未交换a*b时16x16排布规则：4个连续的M为dim0，步长为1，然后N方向跳过16个元素为dim2，步长为4，最后在M方向重复4次，为dim1，步长为64；
+            # shape(c=b*a): [value, n_req, m_req]
+            fx.make_layout(((4, 1), TILE_N // 16, TILE_M // 16), ((1, 0), TILE_M // 16 * 4, 4)), fx.Float32)
+        c_frag.store(Vec.filled(TILE_M * TILE_N // 64, 0, fx.Float32))
+
+        a_frag_retile = a_tiled_thr.retile(a_frag)
+        b_frag_retile = b_tiled_thr.retile(b_frag)
+
+        acc_init = c_frag.load()
+        loop_start = fx.Index(0)
+        loop_end = fx.Index(K // TILE_K // 4)
+        loop_step = fx.Index(1)
+        if const_expr(0):
+            # 完全展开
+            for k in range_constexpr(0, K // TILE_K // 4):
+                fx.copy(cp_atom_r, a_tensor_thr[None, None, None, k], a_frag_retile)
+                fx.copy(cp_atom_r, b_tensor_thr[None, None, None, k], b_frag_retile)
+                for sub_k in range_constexpr(TILE_K // 32):
+                    fx.gemm(tiled_mma, c_frag, b_frag[None, None, (None, sub_k)], a_frag[None, None, (None, sub_k)], c_frag)
+        else:
+            for k, state in range(loop_start, loop_end, loop_step, init=[acc_init]):
+                c_frag.store(state[0])
+                k_i32 = fx.Int32(k)
+                fx.copy(cp_atom_r, a_tensor_thr[None, None, None, k_i32], a_frag_retile)
+                fx.copy(cp_atom_r, b_tensor_thr[None, None, None, k_i32], b_frag_retile)
+                for sub_k in range_constexpr(TILE_K // 32):
+                    fx.gemm(tiled_mma, c_frag, b_frag[None, None, (None, sub_k)], a_frag[None, None, (None, sub_k)], c_frag)
+                results = yield [c_frag.load()]
+            c_frag.store(results)
+        # [v, n, m] -> [v, m, n]
+        c_frag = fx.select(c_frag, [0, 2, 1])
+
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        swz = fx.SwizzleType.get(3, 3, 3)
+        c_lds = fx.make_view(lds.C_lds,
+                             fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M * 4, TILE_N), order=(1, 0))))
+        cp_atom_lds = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
+        c_tiled_lds = fx.make_tiled_copy(cp_atom_lds,
+                                         # 线程划分: 16x4，4 wave切分m方向64行，每个线程写入n方向连续4个点
+                                         fx.make_layout(((16, 4, 4), 4), ((1, 256, 16), 64)),
+                                         fx.make_tile(16 * 4, 16))
+        #fx.utils.print_typst(c_tiled_lds, file="layout.typ")
+        c_tensor_thr_lds_w = c_tiled_lds.get_slice(tid).partition_D(c_lds)
+        fx.copy(cp_atom_lds, c_frag, c_tensor_thr_lds_w)
+        gpu.barrier()
+
+        # 一次写出凑够128字节，128/2=64个元素
+        assert TILE_N % 64 == 0, "TILE_N needs to be multiple of 64 for coalesced store(64x2=128 bytes) to global memory"
+
+        c_tiled_lds = fx.make_tiled_copy(cp_atom_lds,
+                                         # 线程划分: 4x16，4 wave切分m方向16行，每个线程读取n方向连续4个点，在m方向重复4次
+                                         fx.make_layout(((16, 4, 4), (4, 4)), ((256, 1, 4), (64, 16))),
+                                         fx.make_tile(16 * 4, 16 * 4))
+        #fx.utils.print_typst(c_tiled_lds, file="layout-c-tiled.typ")
+        c_tensor_thr_lds_r = c_tiled_lds.get_slice(tid).partition_S(c_lds)
+        c_frag_reduce =fx.make_fragment_like(c_tensor_thr_lds_r)
+        fx.copy(cp_atom_lds, c_tensor_thr_lds_r, c_frag_reduce)
+        acc = c_frag_reduce[(None, 0), None, None].load()
+        for i in range_constexpr(1, 4):
+            acc += c_frag_reduce[(None, i), None, None].load()
+        # if tid < 16:
+        #     fx.printf("---------tid = {} acc[0]={}", tid, acc)
+
+        c_frag_bf16 = fx.make_fragment_like(c_frag_reduce[(None, 0), None, None], dtype=fx.BFloat16)
+        c_frag_bf16.store(acc.to(fx.BFloat16))
+
+        cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+        c_tiled_g = fx.make_tiled_copy(cp_atom_w,
+                                       # 线程划分: 4x16，4 wave切分m方向16行，每个线程写入n方向连续4个点
+                                       fx.make_layout(((16, 4, 4), 4), ((64, 1, 4), 16)),
+                                       fx.make_tile(16, 16 * 4))
+        # fx.utils.print_typst(c_tiled_g, file="layout-c-out.typ")
+        c_tensor_thr_g = c_tiled_g.get_slice(tid).partition_D(c_tile)
+        fx.copy(cp_atom_w, c_tiled_g.get_slice(tid).retile(c_frag_bf16), c_tensor_thr_g)
+
+    @flyc.jit
+    def launch(
+        arg_c: fx.Tensor,
+        arg_a: fx.Tensor,
+        arg_b: fx.Tensor,
+        M: int,
+        stream: fx.Stream
+    ):
+        CompilationContext.get_current()
+        gemm_splitk(arg_c, arg_a, arg_b, M).launch(grid=(div_up(M, TILE_M), div_up(N, TILE_N), 1), block=(256, 1, 1), stream=stream)
+    
+    return launch
+
+#####################################################################
+from pyhip import cudaPerf
+from torch import Tensor
+import pytest
+
+SHUFFLE = True
+
+def div_up(x, y):
+    return (x + y - 1) // y
+def _run_aiter(
+                x: Tensor,  # A:[M, K] bf16
+                weight: Tensor,  # B:[N, K/2] f4x2
+                weight_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
+            ):
+    from aiter import gemm_a4w4, per_1x32_f4_quant_hip, gemm_a16w16
+    M = x.shape[0]
+    N = weight.shape[0]
+    K = weight.shape[1]
+    if x.dtype == torch.bfloat16:
+        out = torch.empty([M, N], dtype=torch.bfloat16, device=x.device)
+        gemm_a16w16(x, weight, out, splitK=4, bpreshuffle=True)
+        return out
+
+    # use hip quant kernel for performance
+    x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
+
+    # 32 alignment is enough for dim0 padding of output for
+    # gemm_a4w4 kernel
+    y = torch.empty(
+        (M + 31) // 32 * 32,
+        weight.shape[0],
+        device=x_q.device,
+        dtype=x.dtype,
+    )
+
+    gemm_a4w4(
+        x_q, weight, x_s, weight_scale.view(x_s.dtype), y, bpreshuffle=True
+    )
+
+    return y[:M]
+
+def _run_batch(num_warps, kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, N=4096, K=4096):
+    BUF_COPY = 32
+    A = torch.randn([BUF_COPY, M, K], dtype=torch.bfloat16)
+    from aiter.ops.shuffle import shuffle_weight
+    import aiter
+    if weight_type == torch.float4_e2m1fn_x2:
+        from aiter.utility import fp4_utils
+        w_ = torch.randint(-2, 3, [N, K], dtype=torch.bfloat16) / 2
+        w_qt, w_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
+        w_f32 = fp4_utils.mxfp4_to_f32(w_qt).to(dtype=torch.bfloat16).reshape(N, K // 32, 32)
+        w_scale_f32 = fp4_utils.e8m0_to_f32(w_qt_scale_).to(dtype=torch.bfloat16).reshape(N, K // 32, 1)
+        w_ref = (w_f32 * w_scale_f32).reshape(N, K)
+        assert K % 256 == 0, f'e8m0_shuffle assume there will be 8 groups of 32 elements in K dim, current K={K} is not supported'
+        w_qt_scale = fp4_utils.e8m0_shuffle(w_qt_scale_)
+        w = [shuffle_weight(w_qt) for _ in range(BUF_COPY)]
+        w_scale = [w_qt_scale.clone() for _ in range(BUF_COPY)]
+    elif weight_type == torch.bfloat16:
+        w_ = torch.randn([N, K], dtype=torch.bfloat16)
+        if SHUFFLE:
+            w_shuffled = shuffle_weight(w_).reshape(N // 16, -1)
+            w = [w_shuffled.clone() for _ in range(BUF_COPY)]
+            w_org = [x.reshape([N, K]) for x in w]
+        else:
+            w = [w_ for _ in range(BUF_COPY)]
+        w_scale = [None] * BUF_COPY
+        w_ref = w_
+    elif weight_type == torch.float8_e4m3fn:
+        w_qt = torch.randint(-2, 3, [N, K], dtype=torch.float32).to(weight_type)
+        w_qt_scale = torch.randint(-2, 3, [N // 128, K // 128], dtype=torch.float32)
+        # # TODO
+        # w_qt_scale[:] = 1
+        w_f32 = w_qt.to(dtype=torch.float32).reshape(N // 128, 128, K // 128, 128)
+        w_scale_f32 = w_qt_scale.reshape(N // 128, 1, K // 128, 1)
+        w_ref = (w_f32 * w_scale_f32).reshape(N, K).to(dtype=torch.bfloat16)
+        w = [shuffle_weight(w_qt) for _ in range(BUF_COPY)]
+        w_scale = [w_qt_scale.clone() for _ in range(BUF_COPY)]
+    else:
+        assert 0, f'Only fp4 weight is supported in this test, current weight_type={weight_type}'
+
+    flops = 2 * M * N * K
+    if weight_type == torch.bfloat16:
+        ele_size = 2
+    elif weight_type == torch.float4_e2m1fn_x2:
+        ele_size = 0.5
+    else:
+        ele_size = 1
+    mem_size = M * K * 2 + N * K * ele_size
+
+    def run(kernel, stream, A, weight, weight_scale, p_debug_buf=None):
+        M, K = A.shape
+        N = w_ref.shape[0]
+        gemm_out = torch.empty([M, N], dtype=A.dtype, device=A.device)
+        if kernel_type == 'mxn_2s':
+
+            kernel(
+                gemm_out.view(-1),         # bf16 [M, N]
+                A.view(-1),                # bf16 [M, K]
+                weight.view(-1),           # bf16 [K, N]
+                M,
+                stream)
+
+        else:
+            assert 0, f'not support kernel type "{kernel_type}"'
+        return gemm_out
+
+    tflops_res = []
+    latencies = []
+    bw = []
+    if kernel_type == 'torch':
+        i = 0
+        for _ in range(run_count):
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
+                ref = torch.nn.functional.linear(A[i], w_org[i])
+            tflops_res.append(p.tflops())
+            latencies.append(p.dt())
+            bw.append(p.bw())
+        ref_out = A[0] @ w_org[0].t()
+        cur_out = torch.nn.functional.linear(A[0], w_org[0])
+        if not torch.allclose(ref_out, cur_out, rtol=0.1, atol=0.03):
+            print(cur_out)
+            idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
+            if len(idx[0]):
+                print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
+            assert 0, f"{kernel_type=}, {M=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=}"
+
+    elif kernel_type == 'aiter':
+        # aiter needs preshuffle weights
+        i = 0
+        for _ in range(run_count):
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
+                _run_aiter(x=A[i], weight=w_org[i], weight_scale=w_scale[i])
+            i = (i + 1) % BUF_COPY
+            tflops_res.append(p.tflops())
+            latencies.append(p.dt())
+            bw.append(p.bw())
+    else:
+        def _as_i8(t):
+            return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+        def _make_args(c, a, b_shuf, M, include_bias=False):
+            args = [
+                c.view(-1),
+                _as_i8(a.view(-1)),
+                _as_i8(b_shuf.view(-1)),
+                #sa.view(-1) if sa.numel() > 0 else sa,
+                #sb.view(-1) if sb.numel() > 0 else sb,
+            ]
+            if include_bias:
+                args.append(torch.empty(0, device=c.device, dtype=c.dtype))
+            args.extend([M, torch.cuda.current_stream()])
+            return tuple(args)
+        ref_out = A[0] @ w_ref.t()
+        hints = {
+            #"maxnreg": 256,
+            "opt_level": 2,
+            #"llvm_options": ""
+        }
+        args = _make_args(torch.zeros_like(ref_out), A[0], w[0], M)
+        launcher = compile_gemm_splitk(TILE_M, TILE_N, N, K)
+        gemm = flyc.compile[hints](launcher, *args)
+
+        cur_out = run(gemm, torch.cuda.current_stream(), A=A[0], weight=w[0], weight_scale=w_scale[0])
+        i = 0
+        for _ in range(run_count):
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
+                run(gemm, torch.cuda.current_stream(), A=A[i], weight=w[i], weight_scale=w_scale[i])
+            i = (i + 1) % BUF_COPY
+            tflops_res.append(p.tflops())
+            latencies.append(p.dt())
+            bw.append(p.bw())
+
+        if not torch.allclose(ref_out, cur_out, rtol=0.1, atol=0.03):
+            print(cur_out)
+            idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
+            if len(idx[0]):
+                print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
+            assert 0, f"{kernel_type=}, {M=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=}"
+        else:
+            print(f"{kernel_type}[{M=} {weight_type=}] acc OK")
+    if run_count > 0:
+        return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
+                'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
+                'bw': sum(bw[1:]) / len(bw[1:])}                               # GB/s
+
+def is_arch_type(arch):
+    props = torch.cuda.get_device_properties()
+    return arch in props.gcnArchName
+
+def get_fp8type():
+    return torch.float8_e4m3fn if is_arch_type('950') else torch.float8_e4m3fnuz
+
+def get_fp4type_if_valid():
+    return torch.float4_e2m1fn_x2 if is_arch_type('950') else None
+
+def entry_common(num_warps, kernel_type, M, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, N=4096, K=4096, run_count=10):
+    perf = {}
+    perf[kernel_type] = {}
+    for weight_type in prec:
+        if weight_type is None: continue
+        perf_prec = {}
+        for i in M:
+            perf_prec[i] = _run_batch(num_warps, kernel_type, M=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, N=N, K=K)
+        perf[kernel_type][str(weight_type)] = perf_prec
+    
+    return perf
+
+def init_env():
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
+    torch.set_default_device('cuda')
+    torch.manual_seed(0)
+
+def test_acc(TILE_M=32, TILE_N=64, N=4096, K=4096):
+    init_env()
+    M = list(range(2, 64))
+    # fix TILE_M=16, TILE_N=32
+    M += list(range(128, 256))
+    M += [i * 256 for i in range(1, 4)]
+    M += [i * 2048 for i in range(1, 5)]
+    M += list(range(2048 * 3, 2048 * 3 + 256))
+    # TILE_M/N is configurable
+    entry_common('mxn_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K, run_count=0)
+
+def show_perf(perf, dict_tile_mn):
+    print('\nsummary:')
+    for kernel, vals in perf.items():
+        for prec, vals_ in vals.items():
+            for b, data in vals_.items():
+                if kernel != 'aiter':
+                    TILE_M, TILE_N = dict_tile_mn[f'{b}']
+                    print(f'{kernel}[{prec:<4} B={b:<4}({TILE_M}x{TILE_N})]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
+                else:
+                    print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
+
+@pytest.mark.parametrize("M", [[1, 2, 4, 8, 12, 16, 32, 64]])
+def test_perf(num_warps, M, TILE_M=32, TILE_N=64, N=4096, K=4096):
+    init_env()
+    perf = {}
+    # perf.update(entry_common(num_warps, 'torch', M, prec=[torch.bfloat16], N=N, K=K, TILE_M=TILE_M, TILE_N=TILE_N))
+    # TILE_M/N is configurable
+    # perf.update(entry_common('mxn_2s', M=M, prec=[torch.bfloat16, get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    # perf.update(entry_common('mxn_2s', M=M, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    perf.update(entry_common(num_warps, 'mxn_2s', M=M, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    return perf
+
+def merge(a: dict, b: dict, path=[]):
+    for key in b:
+        if key in a:
+            if isinstance(a[key], dict) and isinstance(b[key], dict):
+                merge(a[key], b[key], path + [str(key)])
+            elif a[key] != b[key]:
+                raise Exception('Conflict at ' + '.'.join(path + [str(key)]))
+        else:
+            a[key] = b[key]
+    return a
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-w",
+        "--wave",
+        type=int,
+        choices=[4, 8],
+        default=4,
+        help="""select wave number 4 or 8""",
+    )
+    args = parser.parse_args()
+    print(f'selected num_warps={args.wave}')
+
+    #TILE_M = 16
+    #TILE_N = 128
+    N, K = 4096*1, 1024*16 # 4096*8*2 /128 = 512
+    #N, K = 64*1024*1, 1024*16
+    Ms = [16, 32, 64, 128, 256]
+    Ms = [4096,] # 64, 128]
+    Ms = [13, 64, 257]
+    # N, K = 64*4, 256*4
+    perf = {}
+    dict_tile_mn = {}
+
+    def get_tile_mn(M):
+        num_CU = torch.cuda.get_device_properties().multi_processor_count
+        solutions = []
+        for tile_m in [16, 32, 64]:
+            for tile_n in [32, 64, 128]:
+                works = div_up(M, tile_m) * div_up(N, tile_n)
+                if works >= num_CU:
+                    round = works // num_CU
+                    reminder = works % num_CU
+                    solutions.append((round, reminder, tile_m, tile_n))
+                else:
+                    reminder = num_CU - works % num_CU
+                    solutions.append((100000, reminder, tile_m, tile_n))
+        # prefer less rounds; then less reminder
+        TILE_M, TILE_N = sorted(solutions)[0][2:]
+        return TILE_M, TILE_N
+
+    TILE_M, TILE_N = get_tile_mn(64)
+    for M in Ms:
+        TILE_M, TILE_N = get_tile_mn(M)
+        # if N == 9216 and K == 4096:
+        #     if M in [16]:
+        #         TILE_M = 16
+        #         TILE_N = 64
+        #     elif M in [32]:
+        #         TILE_M = 32
+        #         TILE_N = 64
+        #     elif M in [64, 128]:
+        #         TILE_M = 32
+        #         TILE_N = 128
+
+        #TILE_M, TILE_N = 16, 64
+        TILE_M, TILE_N = 16, 64
+        dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
+        print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
+        #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
+        perf = merge(perf, test_perf(num_warps=args.wave, M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+    show_perf(perf, dict_tile_mn)
