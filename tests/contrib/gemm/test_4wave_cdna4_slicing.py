@@ -50,9 +50,15 @@ def test_accuracy(M, N, K, use_pre_shuffle=0):
         M,
     )
 
+    # ref_out = ref_out[:130, 128:192]
+    # dbg_out = cur_out[132:135, 128:192]
+    # # print(f"--------------------------------------------------\n{dbg_out=}\n")
+    # ref_out = ref_out[128:256, 128:256]
+    # cur_out = cur_out[128:256, 128:256]
+    # print(f"{ref_out=}\n{cur_out=}")
     if not torch.allclose(ref_out, cur_out, rtol=0.01, atol=0.01):
-        print(ref_out)
-        print(cur_out)
+        # print(ref_out)
+        # print(cur_out)
         print(ref_out[0].tolist())
         print(cur_out[0].tolist())
         idx = torch.where(torch.abs(ref_out - cur_out) > 0.03)
@@ -119,7 +125,7 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
     di = 0
     latency = []
     torch_latncy = []
-    for i in range(10):
+    for i in range(30):
         di = (di + 1) % DATA_CLONES
         with pyhip.cudaPerf(
             M * N * K * 2, (M * K * 2 + K * N * 2), name=f"gemm_{di}"
@@ -138,7 +144,7 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
                 M,
             )
         latency.append(p0.dt_ms)
-    for i in range(10):
+    for i in range(30):
         di = (di + 1) % DATA_CLONES
         with pyhip.cudaPerf(
             M * N * K * 2, (M * K * 2 + K * N * 2), name=f"torch_{di}"
@@ -168,4 +174,4 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
 if __name__ == "__main__":
     # test_accuracy(2400, 256*4, 256*6)
     # test_accuracy(256, 256, 256)
-    compare_perf(M=256 * 32, N=256 * 32, K=8192)
+    compare_perf(M=4096, N=4096, K=8192)
