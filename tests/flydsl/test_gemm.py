@@ -7,7 +7,7 @@ from functools import cache
 import flydsl.compiler as flyc  # noqa: E402
 from flydsl.compiler.kernel_function import CompilationContext  # noqa: E402
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
 from flydsl.expr.typing import BFloat16, Float32, T, Float8E4M3FNUZ
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
@@ -169,7 +169,11 @@ def compile_gemm_splitk(TILE_M, TILE_N, N, K):
         #     fx.printf("---------tid = {} acc[0]={}", tid, acc)
 
         c_frag_bf16 = fx.make_fragment_like(c_frag_reduce[(None, 0), None, None], dtype=fx.BFloat16)
-        c_frag_bf16.store(acc.to(fx.BFloat16))
+        # 快速计算f32->bf16
+        round_bit = fx.Uint32(0x8000).ir_value().bitcast(fx.Float32.ir_type)
+        acc = ((acc + round_bit).bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+        # acc = acc.to(fx.BFloat16)
+        c_frag_bf16.store(acc)
 
         cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
         c_tiled_g = fx.make_tiled_copy(cp_atom_w,
@@ -472,7 +476,7 @@ if __name__ == '__main__':
     Ms = [16, 32, 64, 128, 256]
     Ms = [4096,] # 64, 128]
     Ms = [13, 64, 257]
-    # N, K = 64*4, 256*4
+    N, K = 64*4, 256*4
     perf = {}
     dict_tile_mn = {}
 
@@ -508,7 +512,7 @@ if __name__ == '__main__':
         #         TILE_N = 128
 
         #TILE_M, TILE_N = 16, 64
-        TILE_M, TILE_N = 16, 64
+        TILE_M, TILE_N = 32, 64
         dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
         print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
         #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
