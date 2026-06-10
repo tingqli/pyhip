@@ -624,8 +624,11 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
 
         # gr1: all
         fx.copy(buf_cp_atom_r, bl_mem_tensor_thr[None, None, None, 1], bl_cp_frag)
+        rocdl.sched_barrier(0)
         fx.copy(buf_cp_atom_r, at_mem_tensor_thr[None, None, None, 1], at_cp_frag)
+        rocdl.sched_barrier(0)
         fx.copy(buf_cp_atom_r, ab_mem_tensor_thr[None, None, None, 1], ab_cp_frag)
+        rocdl.sched_barrier(0)
         fx.copy(buf_cp_atom_r, br_mem_tensor_thr[None, None, None, 1], br_cp_frag)
         gpu.barrier()
 
@@ -636,6 +639,8 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
         if wave_id >= 4:
             gpu.barrier()
 
+        b_half_cnt = bl_cp_frag.load().numel * fx.BFloat16.width // 8 // 16
+        a_half_cnt = at_cp_frag.load().numel * fx.BFloat16.width // 8 // 16
         assert K // TILE_K >= 2, "this kernel requires at least 2 iterations"
         for k, state in range(0, K // TILE_K - 0, 1, init=acc_init):
             c_tl_frag.store(state[0])
@@ -657,6 +662,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
             # lr: ab0
             fx.copy(uni_cp_atom, ab_lds_tensor_thr_r, ab_frag_retile)
             # lw: bl1
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=a_half_cnt + a_half_cnt + b_half_cnt))
             fx.copy(uni_cp_atom, bl_cp_frag, bl_lds_tensor_thr_w)
             # gr: bl2
             fx.copy(buf_cp_atom_r, bl_mem_tensor_thr[None, None, None, k_i32 + 2], bl_cp_frag)
@@ -676,6 +682,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
             # lr: br0
             fx.copy(uni_cp_atom, br_lds_tensor_thr_r, br_frag_retile)
             # lw: at1
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=a_half_cnt + b_half_cnt + b_half_cnt))
             fx.copy(uni_cp_atom, at_cp_frag, at_lds_tensor_thr_w)
             # gr: at2
             fx.copy(buf_cp_atom_r, at_mem_tensor_thr[None, None, None, k_i32 + 2], at_cp_frag)
@@ -695,6 +702,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
             # lr: bl1
             fx.copy(uni_cp_atom, bl_lds_tensor_thr_r, bl_frag_retile)
             # lw: ab1
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=b_half_cnt + b_half_cnt + a_half_cnt))
             fx.copy(uni_cp_atom, ab_cp_frag, ab_lds_tensor_thr_w)
             # gr: ab2
             fx.copy(buf_cp_atom_r, ab_mem_tensor_thr[None, None, None, k_i32 + 2], ab_cp_frag)
@@ -714,6 +722,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
             # lr: at1
             fx.copy(uni_cp_atom, at_lds_tensor_thr_r, at_frag_retile)
             # lw: br1
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=b_half_cnt + a_half_cnt + a_half_cnt))
             fx.copy(uni_cp_atom, br_cp_frag, br_lds_tensor_thr_w)
             # gr: br2
             fx.copy(buf_cp_atom_r, br_mem_tensor_thr[None, None, None, k_i32 + 2], br_cp_frag)
