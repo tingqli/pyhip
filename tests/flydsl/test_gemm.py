@@ -27,12 +27,12 @@ if 1:
 def div_up(x, y):
     return (x + y - 1) // y
 
-def compile_gemm(TILE_M, TILE_N, N, K, splitk=True):
+def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
     gpu_arch = get_rocm_arch()
     is_gfx942 = str(gpu_arch).startswith("gfx942")
 
     TILE_K = 64
-    if splitk:
+    if alg == 'splitk':
         c_lds_size = TILE_M * TILE_N * 4
         @fx.struct
         class SharedStorage:
@@ -198,13 +198,70 @@ def compile_gemm(TILE_M, TILE_N, N, K, splitk=True):
         c_tensor_thr_g = c_tiled_g.get_slice(tid).partition_D(c_tile)
         fx.copy(cp_atom_w, c_tiled_g.get_slice(tid).retile(c_frag_bf16), c_tensor_thr_g)
 
+    # copy from https://github.com/ROCm/gfx9-gluon-tutorials/blob/main/kernels/gemm/a16w16/v8_beyond_hotloop/matmul_kernel.py
+    def get_pids(
+        pid,
+        M,
+        N,
+        BM,
+        BN,
+        GRID_MN,
+        NUM_XCDS,
+        GROUP_SIZE_M,
+    ):
+        num_pid_m = (M + BM - 1) // BM
+        num_pid_n = (N + BN - 1) // BN
+
+        if const_expr(NUM_XCDS != 1):
+            ## pid remapping on xcds
+            # Number of pids per XCD in the new arrangement
+            pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+            # When GRID_MN cannot divide NUM_XCDS, some xcds will have
+            # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
+            # We calculate the number of xcds that have pids_per_xcd pids as
+            # tall_xcds
+            tall_xcds = GRID_MN % NUM_XCDS
+            # TODO
+            # tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+            tall_xcds = (tall_xcds == 0).select(NUM_XCDS, tall_xcds)
+            # Compute current XCD and local pid within the XCD
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            # Calculate new pid based on the new grouping
+            # Note that we need to consider the following two cases:
+            # 1. the current pid is on a tall xcd
+            # 2. the current pid is on a short xcd
+            # TODO
+            # if xcd < tall_xcds:
+            #     pid = xcd * pids_per_xcd + local_pid
+            # else:
+            #     pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+            pid = (xcd < tall_xcds).select(xcd * pids_per_xcd + local_pid,
+                                           tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
+
+        if const_expr(GROUP_SIZE_M == 1):
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
+        else:
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            # TODO
+            #group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+            group_size_m = (num_pid_m - first_pid_m < GROUP_SIZE_M).select(num_pid_m - first_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+            pid_n = (pid % num_pid_in_group) // group_size_m
+
+        return pid_m, pid_n
+
     @flyc.kernel
     def gemm_4wave(arg_c_: fx.Tensor,
                    arg_a_: fx.Tensor,
                    arg_b_: fx.Tensor,
                    M: int):
         tid = fx.thread_idx.x
-        blk_x, blk_y, _ = fx.block_idx
+        # 308 has 4 xcds
+        blk_x, blk_y = get_pids(fx.block_idx.x, M, N, TILE_M, TILE_N, fx.grid_dim.x, 4, 4)
         arg_a = fx.Tensor(fx.make_view(
             fx.get_iter(arg_a_),
             fx.make_layout((M, K), (K, 1))
@@ -443,7 +500,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, splitk=True):
         stream: fx.Stream
     ):
         CompilationContext.get_current()
-        if const_expr(splitk):
+        if const_expr(alg == 'splitk'):
             gemm_splitk(arg_c, arg_a, arg_b, M).launch(grid=(div_up(M, TILE_M), div_up(N, TILE_N), 1), block=(256, 1, 1), stream=stream)
         else:
             value_attrs = None
@@ -453,7 +510,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, splitk=True):
                               }
             gemm_4wave(arg_c, arg_a, arg_b, M,
                        value_attrs=value_attrs,
-                       ).launch(grid=(div_up(M, TILE_M), div_up(N, TILE_N), 1), block=(256, 1, 1), stream=stream)
+                       ).launch(grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1), block=(256, 1, 1), stream=stream)
     
     return launch
 
@@ -614,11 +671,11 @@ def _run_batch(num_warps, kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=1
         }
         args = _make_args(torch.zeros_like(ref_out), A[0], w[0], M)
         if kernel_type == 'splitk':
-            launcher = compile_gemm(TILE_M, TILE_N, N, K, splitk=True)
+            launcher = compile_gemm(TILE_M, TILE_N, N, K, alg='splitk')
             gemm = flyc.compile[hints](launcher, *args)
 
         elif kernel_type == '4wave':
-            launcher = compile_gemm(TILE_M, TILE_N, N, K, splitk=False)
+            launcher = compile_gemm(TILE_M, TILE_N, N, K, alg='4wave')
             hints['llvm_options'] = {
                 "amdgpu-mfma-vgpr-form": False,
             }
