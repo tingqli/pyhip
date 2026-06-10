@@ -1,0 +1,612 @@
+from pyhip import jit, JIT
+import torch
+
+from .common.loaders import get_mfma_loader, get_mfma_loader_sorted_tok
+
+__all__ = [
+    "moe_gemm_8wave_g1u1_i8",
+]
+
+"""
+
+8-wave MoE GEMM kernel for int8 (smooth-quant PTPC) with g1u1 (gate-up + SiLU) structure:
+
+    gate = gemm_gate(x)
+    up   = gemm_up(x)
+    act  = SiLU(gate) * up
+    down = gemm_down(act)
+
+Combines:
+  - g1u1 weight layout and SiLU activation from moe_gemm_8wave_g1u1
+  - int8 PTPC compute and dequantization from moe_gemm_8wave_gelu
+
+"""
+
+
+@jit(with_debug_log=False)
+def moe_gemm_8wave_g1u1_i8(J,
+                   is_in_3d, #1 is_in_3d, 0 [num_tokens, dims]
+                   is_over_4GB,
+                   is_pts_sorted,
+                   AB_dtype, wg_M, wg_N,
+                   NUM_EXPERTS, OC, IC,
+                   gate_up, bpreshuffle, TOPK,
+                   sorted_ids:"uint*",
+                   sorted_weights:"float*",
+                   sorted_expert_ids:"uint*",
+                   num_valid_ids:"uint*",
+                   weight:"void*",pScaleB:"void*",
+                   input:"void*", pScaleA:"void*",
+                   output:"void*",      # [num_tokens, topk, odims] bf16 or int8 if quant_out
+                   o_scales:"void*",    # [num_tokens, topk, odims//wg_N] float32
+                   num_tokens:"uint",
+                   num_blocks:"uint"):
+    num_warps = 8
+
+    assert not is_over_4GB
+    assert AB_dtype in ["s8", "bf16"]
+    C_dtype = "bf16"
+
+    K = IC
+    # loader always load 128bytes (8 x DW4-lanes) along K dimension
+    wg_K = J.div(128, J.sizeof(AB_dtype))
+
+    stride_k = IC * J.sizeof(AB_dtype)
+
+    # XCD swizzle block mapping
+    NUM_CU = 256
+    num_oc_blocks = J.div(OC, wg_N)
+    num_groupped_blocks = num_blocks - (num_blocks % NUM_CU)
+    blk_m = J.gpr("su32")
+    blk_n = J.gpr("su32")
+
+    with J.If(J.blockIdx.x < num_groupped_blocks) as If:
+        blk_base = (J.blockIdx.x // NUM_CU) * NUM_CU
+        cu_id = J.blockIdx.x % NUM_CU
+        xcd_id = cu_id % 8
+        xcd_cu = cu_id // 8
+        task_id = xcd_id * 32 + xcd_cu
+        new_blk1d = blk_base + task_id
+        blk_m[0] = new_blk1d // num_oc_blocks
+        blk_n[0] = new_blk1d - blk_m * num_oc_blocks
+
+        If.Else()
+        blk_m[0] = J.blockIdx.x // num_oc_blocks
+        blk_n[0] = J.blockIdx.x - blk_m * num_oc_blocks
+
+    expert_id = J.gpr('su32')
+    max_id = J.gpr('su32')
+    J.s_load_dword(expert_id, sorted_expert_ids, blk_m[0] * J.sizeof_u32)
+    J.s_load_dword(max_id, num_valid_ids, 0)
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+    J.debug_setup((blk_m[0] == 0) & (blk_n[0] == 0) & (J.warp_id[0] == 0))
+    with J.If(blk_m[0] * wg_M >= max_id[0]):
+        J.s_endpgm()
+
+    sorted_ids[:] += blk_m * (wg_M * J.sizeof_u32)
+    sorted_weights[:] += blk_m * (wg_M * J.sizeof_u32)
+
+    # basic configuration for 8-wave
+    WARPS_COL = 4
+    WARPS_ROW = 2
+    BLOCK_SIZE_ROW = wg_M
+    BLOCK_SIZE_COL = wg_N
+    BLOCK_K = 128 # in bytes
+    HALF_BLOCK_SIZE_ROW = J.div(BLOCK_SIZE_ROW, 2)
+    HALF_BLOCK_SIZE_COL = J.div(BLOCK_SIZE_COL, 2)
+    MINI_BLOCK_M = J.div(HALF_BLOCK_SIZE_ROW, WARPS_ROW) # 64
+    MINI_BLOCK_N = J.div(HALF_BLOCK_SIZE_COL, WARPS_COL) # 32
+
+    # 64-bit offset for expert weight
+    offset_64bit = J.gpr(2,"su32")
+    J.s_mul_hi_u32(offset_64bit[1], expert_id, (OC * stride_k))
+    J.s_mul_i32(offset_64bit[0], expert_id, (OC * stride_k))
+    weight[:] += offset_64bit
+
+    if gate_up:
+        if not is_in_3d:
+            LOADER_TOPK = J.gpr("su32",0)
+            buff_a = J.Buffer(input, num_tokens * stride_k)
+        else:
+            LOADER_TOPK = TOPK
+            buff_a = J.Buffer(input, num_tokens * TOPK * stride_k)
+
+        buff_b = {}
+        weight[:] += blk_n * (J.div(wg_N, 2) * stride_k) # gate-weight
+        buff_b[0] = J.Buffer(weight, J.div(wg_N, 2) * stride_k)
+        weight[:] += J.div(OC, 2) * stride_k # up-weights
+        buff_b[1] = J.Buffer(weight, J.div(wg_N, 2) * stride_k)
+        stride_n = J.div(OC, 2) * J.sizeof(C_dtype)
+    else:
+        if not is_in_3d:
+            LOADER_TOPK = J.gpr("su32",0)
+            buff_a = J.Buffer(input, num_tokens * stride_k)
+        else:
+            LOADER_TOPK = TOPK
+            buff_a = J.Buffer(input, num_tokens * TOPK * stride_k)
+
+        weight[:] += blk_n * (wg_N * stride_k)
+        buff_b = J.Buffer(weight, wg_N * stride_k)
+        stride_n = OC * J.sizeof(C_dtype)
+
+    lds_base = J.alloc_lds(HALF_BLOCK_SIZE_ROW * BLOCK_K * 4 + HALF_BLOCK_SIZE_COL * BLOCK_K * 4)
+    ldsA = {}; ldsB = {}; lds = lds_base
+    ldsA[0,0] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
+    ldsA[0,1] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
+    ldsA[1,0] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
+    ldsA[1,1] = lds; lds += HALF_BLOCK_SIZE_ROW * BLOCK_K
+    ldsB[0,0] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
+    ldsB[0,1] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
+    ldsB[1,0] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
+    ldsB[1,1] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
+
+    nbN = J.div(wg_N, 16)
+    nbM = J.div(wg_M, 16)
+    nbK = 2 # 2 MFMA 16x16
+    nrM = J.div(nbM, WARPS_ROW, 2) # 4
+    nrN = J.div(nbN, WARPS_COL, 2) # 2
+    nrK = nbK
+
+    warp_m = J.gpr(J.warp_id[0] // WARPS_COL) # warp row: 0 to 1
+    warp_n = J.gpr(J.warp_id[0] % WARPS_COL)  # warp col: 0 to 3
+
+    # prefetch sorted ids into LDS
+    lds_sorted_ids = J.alloc_lds(wg_M * J.sizeof_u32)
+    lds_sorted_weights = J.alloc_lds(wg_M * J.sizeof_DW)
+
+    if AB_dtype == "s8":
+        # load weight per-OC scales into LDS
+        lds_pc_scales = J.alloc_lds(wg_N * J.sizeof_DW)
+        if gate_up:
+            # gate scales: [expert_id, blk_n * wg_N/2] from gate half of OC
+            pScaleB[:] += (expert_id * OC + blk_n * J.div(wg_N, 2)) * J.sizeof_DW
+            J.wg_load_lds(lds_pc_scales, pScaleB, J.div(wg_N, 2) * J.sizeof_DW, num_warps=num_warps, wait_barrier=False)
+            # up scales: offset by OC/2 from gate position
+            pScaleB[:] += J.div(OC, 2) * J.sizeof_DW
+            J.wg_load_lds(lds_pc_scales + J.div(wg_N, 2) * J.sizeof_DW, pScaleB, J.div(wg_N, 2) * J.sizeof_DW, num_warps=num_warps, wait_barrier=False)
+        else:
+            pScaleB[:] += (expert_id * OC + blk_n * wg_N) * J.sizeof_DW
+            J.wg_load_lds(lds_pc_scales, pScaleB, wg_N * J.sizeof_DW, num_warps=num_warps, wait_barrier=False)
+
+        lds_pt_scales = J.alloc_lds(wg_M * J.sizeof_DW)
+        if is_pts_sorted:
+            pScaleA[:] += blk_m * (wg_M * J.sizeof_DW)
+            J.wg_load_lds(lds_pt_scales, pScaleA, wg_M * J.sizeof_DW, num_warps=num_warps, wait_barrier=False)
+
+    if gate_up:
+        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps=num_warps, wait_barrier=True)
+    else:
+        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps=num_warps, wait_barrier=False)
+        J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps=num_warps, wait_barrier=True)
+
+    if AB_dtype == "s8" and (not is_pts_sorted):
+        # unsorted per-token scale of shape [num_tokens, topk]
+        with J.ExecMask(J.threadIdx.x < wg_M):
+            vrow = J.gpr("vu32")
+            vaddr = J.gpr("vu32", J.threadIdx.x * J.sizeof_u32 + lds_sorted_ids)
+            J.ds_read_b32(vrow, vaddr)
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            if is_in_3d:
+                voff = J.gpr("vu32", (vrow & 0xFFFFFF) * (TOPK * J.sizeof_f32) + (vrow >> 24) * J.sizeof_f32)
+            else:
+                voff = J.gpr("vu32", (vrow & 0xFFFFFF) * J.sizeof_f32)
+            J.s_mov_b32("m0", J.warp_id[0] * (64 * J.sizeof_f32) + lds_pt_scales)
+            J.global_load_lds_dword(voff, pScaleA)
+
+    vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, LOADER_TOPK, num_tokens, input, is_over_4GB)
+    vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*MINI_BLOCK_N)
+    vm_load_cnt_a = vm_load_cnt_a // 2
+
+    mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
+    mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")          # 2x[16,128]
+    mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")           # 4x[4,2]x[16,16]
+
+    if AB_dtype == "s8":
+        def mfma(c_index):
+            b_index = c_index % 2
+            for k in range(2):
+                for m in range(nrM):
+                    for n in range(nrN):
+                        J.v_mfma_i32_16x16x64_i8(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
+                        yield 16
+        def mfma_tail():
+            pass
+    elif AB_dtype == "bf16":
+        def mfma(c_index):
+            b_index = c_index % 2
+            for k in range(2):
+                for m in range(nrM):
+                    for n in range(nrN):
+                        J.v_mfma_f32_16x16x32_bf16(mfma_C[c_index, m, n], mfma_B[b_index, n, k], mfma_A[m, k], mfma_C[c_index, m, n])
+                        yield 16
+        def mfma_tail():
+            pass
+
+    loop_cnt = J.div(K, wg_K)
+
+    a_moffset = J.gpr("su32", 0)
+    if gate_up:
+        b_moffsets = J.gpr(2, "su32", 0, 0)
+    else:
+        b_moffsets = J.gpr(2, "su32", 0, stride_k * HALF_BLOCK_SIZE_COL)
+
+    def step_k():
+        a_moffset[0] += vm_offset_inc_a
+        b_moffsets[0] += vm_offset_inc_b
+        b_moffsets[1] += vm_offset_inc_b
+
+    def vm_loadA(k, m):
+        assert m in [0, 1]
+        assert k in [0, 1]
+        return vm_load_a(ldsA[k,m], buff_a, a_moffset, half=m)
+
+    def vm_loadB(k, m):
+        assert m in [0, 1]
+        assert k in [0, 1]
+        if gate_up:
+            return vm_load_b(ldsB[k,m], buff_b[m], b_moffsets[m])
+        else:
+            return vm_load_b(ldsB[k,m], buff_b, b_moffsets[m])
+
+    def ds_readA(k, m):
+        for i in range(nrM):
+            ds_read_a(ldsA[k,m], mfma_A[i, 0], i, 0)
+            ds_read_a(ldsA[k,m], mfma_A[i, 1], i, 1)
+
+    def ds_readB(k, m):
+        for i in range(nrN):
+            ds_read_b(ldsB[k,m], mfma_B[m, i, 0], i, 0)
+            ds_read_b(ldsB[k,m], mfma_B[m, i, 1], i, 1)
+
+    if 1:
+        # 8-wave pipeline
+        tic = 0
+        toc = 1
+        J.emit(vm_loadB(tic,0))
+        J.emit(vm_loadA(tic,0))
+        J.emit(vm_loadB(tic,1))
+        J.emit(vm_loadA(tic,1))
+
+        with J.If(warp_m[0] == 1):
+            J.s_barrier()
+
+        mfma_C[...] = 0
+
+        J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b})"); J.s_barrier()
+
+        step_k()
+
+        vm_load_cnt_scaleA = 0
+        J.emit(vm_loadA(toc,0))
+        J.emit(vm_loadB(toc,0))
+        J.emit(vm_loadB(toc,1))
+
+        J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
+
+        def loop_body(k, loop_cnt):
+            nonlocal tic, toc
+            ds_readB(tic, 0)
+            ds_readA(tic, 0)
+
+            J.emit(vm_loadA(toc,1))
+            step_k()
+            J.s_waitcnt(mod=f"lgkmcnt(0)"); J.s_barrier()
+
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
+            J.emit(mfma(0))
+            J.s_setprio(0); J.s_barrier()
+
+            ds_readB(tic, 1)
+            J.emit(vm_loadA(tic,0))
+            J.s_barrier()
+
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
+            J.emit(mfma(1))
+            J.s_setprio(0); J.s_barrier()
+
+            ds_readA(tic, 1)
+            J.emit(vm_loadB(tic,0))
+            J.s_barrier()
+
+            J.s_waitcnt(mod="lgkmcnt(0)"); J.s_setprio(1)
+            J.emit(mfma(2))
+            J.s_setprio(0); J.s_barrier()
+
+            J.emit(vm_loadB(tic,1))
+            J.s_waitcnt(mod=f"vmcnt({vm_load_cnt_a + vm_load_cnt_b*2 + vm_load_cnt_scaleA})"); J.s_barrier()
+
+            J.s_setprio(1)
+            J.emit(mfma(3))
+            J.s_setprio(0); J.s_barrier()
+
+            tic ^= 1
+            toc ^= 1
+
+        for k in range(loop_cnt):
+            loop_body(k, loop_cnt)
+
+        mfma_tail()
+        J.s_waitcnt(mod="vmcnt(0)")
+        with J.If(warp_m[0] == 0):
+            J.s_barrier()
+
+    # ============================================================
+    # PTPC dequantization for int8
+    # ============================================================
+    if AB_dtype == "s8":
+        # mfma_C contains i32 accumulators, dequantize with per-token x per-channel scales
+        for cindex in range(4):
+            cm = cindex // 2
+            cn = cindex % 2
+            scale_pt = J.gpr(nrM, "vf32")
+            scale_pc = J.gpr(nrN, 4, "vf32")
+
+            ds_vaddr = (J.lane_id % 16 + cm * HALF_BLOCK_SIZE_ROW + warp_m * MINI_BLOCK_M) * J.sizeof_DW + lds_pt_scales
+            for m in range(nrM):
+                J.ds_read_b32(scale_pt[m], ds_vaddr, mod=f"offset:{m*16*J.sizeof_DW}")
+
+            ds_vaddr = (J.lane_id // 16) * J.sizeof_DW4 + (cn * HALF_BLOCK_SIZE_COL + warp_n * MINI_BLOCK_N) * J.sizeof_DW + lds_pc_scales
+            for n in range(nrN):
+                J.ds_read_b128(scale_pc[n], ds_vaddr, mod=f"offset:{n*16*J.sizeof_DW}")
+
+            for m in range(nrM):
+                for n in range(nrN):
+                    J.v_cvt_f32_i32(mfma_C[cindex,m,n,0], mfma_C[cindex,m,n,0])
+                    J.v_cvt_f32_i32(mfma_C[cindex,m,n,1], mfma_C[cindex,m,n,1])
+                    J.v_cvt_f32_i32(mfma_C[cindex,m,n,2], mfma_C[cindex,m,n,2])
+                    J.v_cvt_f32_i32(mfma_C[cindex,m,n,3], mfma_C[cindex,m,n,3])
+
+            J.s_waitcnt(mod="lgkmcnt(0)")
+
+            scale_ptpc = J.gpr(nrN, 4, "vf32")
+            for m in range(nrM):
+                for n in range(nrN):
+                    scale_ptpc[n, 0] = scale_pt[m] * scale_pc[n, 0]
+                    scale_ptpc[n, 1] = scale_pt[m] * scale_pc[n, 1]
+                    scale_ptpc[n, 2] = scale_pt[m] * scale_pc[n, 2]
+                    scale_ptpc[n, 3] = scale_pt[m] * scale_pc[n, 3]
+
+                for n in range(nrN):
+                    if 1:
+                        J.v_pk_mul_f32(mfma_C[cindex,m,n,0:1], mfma_C[cindex,m,n,0:1], scale_ptpc[n, 0:1])
+                        J.v_pk_mul_f32(mfma_C[cindex,m,n,2:3], mfma_C[cindex,m,n,2:3], scale_ptpc[n, 2:3])
+                    else:
+                        mfma_C[cindex,m,n,0] *= scale_ptpc[n, 0]
+                        mfma_C[cindex,m,n,1] *= scale_ptpc[n, 1]
+                        mfma_C[cindex,m,n,2] *= scale_ptpc[n, 2]
+                        mfma_C[cindex,m,n,3] *= scale_ptpc[n, 3]
+
+    # ============================================================
+    # Output stage
+    # ============================================================
+    if gate_up:
+        # silu(gate) * up → bf16, scatter to [num_tokens, topk, dims]
+        vrows = J.gpr(2, nrM, "vu32")
+        for cm in range(2):
+            row = J.gpr("vu32", ((J.lane_id % 16) + (cm * HALF_BLOCK_SIZE_ROW) + (warp_m * MINI_BLOCK_M)) * J.sizeof_u32)
+            for m in range(nrM):
+                J.ds_read_b32(vrows[cm, m], row + lds_sorted_ids)
+                row[0] += 16*J.sizeof_u32
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        if nrN == 1:
+            vbf16 = J.gpr(2, "vbf16x2")
+            col = J.lane_id // 16
+            vaddr0 = J.gpr("vu32", col * J.sizeof_DW2 + warp_n * 16 * J.sizeof_bf16 + blk_n * (J.div(wg_N,2) * J.sizeof(C_dtype)))
+        else:
+            vbf16 = J.gpr(4, "vbf16x2")
+            col = J.lane_id // 16
+            swap_12_col = (col & 1) * 2 + (col >> 1)
+            vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * nrN * 16 * J.sizeof_bf16 + blk_n * (J.div(wg_N,2) * J.sizeof(C_dtype)))
+
+        for cm in range(2):
+            igate = cm*2 + 0
+            iup = cm*2 + 1
+            for m in range(nrM):
+                vrows_topk = J.gpr(vrows[cm, m] >> 24)
+                with J.ExecMask(vrows_topk < TOPK):
+                    vaddr = J.gpr(2, "vu32", output[0], output[1])
+                    J.v_lshl_add_u64(vaddr, J.gpr(2, "vu32", vaddr0 + vrows_topk * (stride_n), 0), 0, vaddr)
+                    J.v_mad_u64_u32(vaddr, "vcc", (vrows[cm, m] & 0xFFFFFF), J.gpr("vu32", TOPK * stride_n), vaddr)
+                    for n in range(nrN):
+                        mfma_C[igate,m,n,0] = J.silu(mfma_C[igate,m,n,0]) * mfma_C[iup,m,n,0]
+                        mfma_C[igate,m,n,1] = J.silu(mfma_C[igate,m,n,1]) * mfma_C[iup,m,n,1]
+                        mfma_C[igate,m,n,2] = J.silu(mfma_C[igate,m,n,2]) * mfma_C[iup,m,n,2]
+                        mfma_C[igate,m,n,3] = J.silu(mfma_C[igate,m,n,3]) * mfma_C[iup,m,n,3]
+                    assert nrN in [1, 2], f"{nrN=}"
+                    if nrN == 1:
+                        J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[igate, m,0,0], mfma_C[igate, m,0,1])
+                        J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[igate, m,0,2], mfma_C[igate, m,0,3])
+                        J.global_store_dwordx2(vaddr, vbf16[0:1], "off", mod=f"offset:{0*16*J.sizeof(C_dtype)}")
+                    else:
+                        J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[igate, m,0,0], mfma_C[igate, m,0,1])
+                        J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[igate, m,0,2], mfma_C[igate, m,0,3])
+                        J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[igate, m,1,0], mfma_C[igate, m,1,1])
+                        J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[igate, m,1,2], mfma_C[igate, m,1,3])
+                        J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                        J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                        J.global_store_dwordx4(vaddr, vbf16, "off", mod=f"offset:{0*16*J.sizeof(C_dtype)}")
+    else:
+        # down projection: apply router weights, scatter to [num_tokens, topk, dims]
+        # check if quantized output is requested
+        J.Jump("non_quant_output", (o_scales[0] | o_scales[1]) == 0)
+
+        # ---- quantized i8 output path ----
+        vrows_scales = J.gpr(2, "vu32")
+        vrows = J.gpr(2, nrM, "vu32")
+        vweights = J.gpr(2, nrM, "vf32")
+        row_scales = J.gpr("vu32", (J.lane_id + (warp_m * MINI_BLOCK_M)) * J.sizeof_u32 + lds_sorted_ids)
+        for cm in range(2):
+            row = J.gpr("vu32", ((J.lane_id % 16) + (cm * HALF_BLOCK_SIZE_ROW) + (warp_m * MINI_BLOCK_M)) * J.sizeof_u32)
+            for m in range(nrM):
+                J.ds_read_b32(vrows[cm, m], row + lds_sorted_ids)
+                J.ds_read_b32(vweights[cm, m], row + lds_sorted_weights)
+                row[0] += 16*J.sizeof_u32
+            J.ds_read_b32(vrows_scales[cm], row_scales, mod=f"offset:{cm * HALF_BLOCK_SIZE_ROW * J.sizeof_u32}")
+
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        C_dtype = "s8"
+        stride_c = OC * J.sizeof(C_dtype)
+        vs8x4 = J.gpr(2, 2, "vu32")
+        col = J.lane_id // 16
+        vaddr0 = J.gpr("vu32", col * J.sizeof_DW4 + warp_n * 64 * J.sizeof(C_dtype) + blk_n * (wg_N * J.sizeof(C_dtype)))
+
+        oquant_block_size = 32
+        S_dtype = "bf16x2"
+        o_scales[:] += blk_n * (wg_N//oquant_block_size//2 * J.sizeof(S_dtype))
+        stride_s = OC//oquant_block_size//2 * J.sizeof(S_dtype)
+        buff_s = J.Buffer(o_scales, num_tokens * TOPK * stride_s)
+
+        vflow = J.gpr("vf32", -128.0)
+        vfhigh = J.gpr("vf32", 127.0)
+        vnz_guard = J.gpr("vf32", 1e-9)
+
+        voscales = J.gpr(2, 2, "vf32")
+        for cm in range(2):
+            for m in range(nrM):
+                vrows_topk = J.gpr(vrows[cm, m] >> 24)
+                with J.ExecMask(vrows_topk < TOPK):
+                    vaddr = J.gpr(2, "vu32", output[0], output[1])
+                    J.v_lshl_add_u64(vaddr, J.gpr(2, "vu32", vaddr0 + vrows_topk * (stride_c), 0), 0, vaddr)
+                    J.v_mad_u64_u32(vaddr, "vcc", (vrows[cm, m] & 0xFFFFFF), J.gpr("vu32", TOPK * stride_c), vaddr)
+
+                    assert nrN == 2
+                    n = 0
+                    vmax = J.gpr(4, "vf32")
+                    J.v_max3_f32(vmax[0], abs(mfma_C[cm*2+0, m,n,0]), abs(mfma_C[cm*2+0, m,n,1]), abs(mfma_C[cm*2+0, m,n,2]))
+                    J.v_max3_f32(vmax[1], abs(mfma_C[cm*2+0, m,n+1,0]), abs(mfma_C[cm*2+0, m,n+1,1]), abs(mfma_C[cm*2+0, m,n+1,2]))
+                    J.v_max3_f32(vmax[2], abs(mfma_C[cm*2+1, m,n,0]), abs(mfma_C[cm*2+1, m,n,1]), abs(mfma_C[cm*2+1, m,n,2]))
+                    J.v_max3_f32(vmax[3], abs(mfma_C[cm*2+1, m,n+1,0]), abs(mfma_C[cm*2+1, m,n+1,1]), abs(mfma_C[cm*2+1, m,n+1,2]))
+
+                    J.v_max3_f32(vmax[0], vmax[0], abs(mfma_C[cm*2+0, m,n,3]), abs(mfma_C[cm*2+0, m,n+1,3]))
+                    J.v_max3_f32(vmax[2], vmax[2], abs(mfma_C[cm*2+1, m,n,3]), abs(mfma_C[cm*2+1, m,n+1,3]))
+
+                    J.v_max3_f32(vmax[0], vmax[0], vmax[1], vnz_guard)
+                    J.v_max3_f32(vmax[2], vmax[2], vmax[3], vnz_guard)
+
+                    vmax[1] = vmax[0]
+                    vmax[3] = vmax[2]
+                    J.s_nop(1)
+                    J.v_permlane16_swap_b32(vmax[0], vmax[1])
+                    J.v_permlane16_swap_b32(vmax[2], vmax[3])
+                    J.v_max_f32(vmax[0], vmax[0], vmax[1])
+                    J.v_max_f32(vmax[2], vmax[2], vmax[3])
+                    vmax[1] = vmax[0]
+                    vmax[3] = vmax[2]
+                    J.s_nop(1)
+                    J.v_permlane32_swap_b32(vmax[0], vmax[1])
+                    J.v_permlane32_swap_b32(vmax[2], vmax[3])
+                    J.v_max_f32(vmax[0], vmax[0], vmax[1])
+                    J.v_max_f32(vmax[2], vmax[2], vmax[3])
+
+                    row_scale = J.gpr(2, "vf32", vmax[0] * (1/127), vmax[2] * (1/127))
+                    inv_row_scale = J.gpr(2, "vf32")
+                    J.v_rcp_f32(inv_row_scale[0], row_scale[0])
+                    J.v_rcp_f32(inv_row_scale[1], row_scale[1])
+
+                    J.v_mul_f32_dpp(voscales[cm,0], vweights[cm,m], row_scale[0], mod=f"quad_perm:[0, 1, 2, 3] row_mask:{1<<m}")
+                    J.v_mul_f32_dpp(voscales[cm,1], vweights[cm,m], row_scale[1], mod=f"quad_perm:[0, 1, 2, 3] row_mask:{1<<m}")
+
+                    for k in range(4):
+                        mfma_C[cm*2+0, m, n, k] *= inv_row_scale[0]
+                        mfma_C[cm*2+0, m, n + 1, k] *= inv_row_scale[0]
+                        mfma_C[cm*2+1, m, n, k] *= inv_row_scale[1]
+                        mfma_C[cm*2+1, m, n + 1, k] *= inv_row_scale[1]
+
+                    for k in range(4):
+                        J.v_rndne_f32(mfma_C[cm*2+0, m, n,   k], mfma_C[cm*2+0, m, n,   k])
+                        J.v_rndne_f32(mfma_C[cm*2+0, m, n+1, k], mfma_C[cm*2+0, m, n+1, k])
+                        J.v_rndne_f32(mfma_C[cm*2+1, m, n,   k], mfma_C[cm*2+1, m, n,   k])
+                        J.v_rndne_f32(mfma_C[cm*2+1, m, n+1, k], mfma_C[cm*2+1, m, n+1, k])
+
+                    for k in range(4):
+                        J.v_med3_f32(mfma_C[cm*2+0, m, n,   k], mfma_C[cm*2+0, m, n,   k], vflow, vfhigh)
+                        J.v_med3_f32(mfma_C[cm*2+0, m, n+1, k], mfma_C[cm*2+0, m, n+1, k], vflow, vfhigh)
+                        J.v_med3_f32(mfma_C[cm*2+1, m, n,   k], mfma_C[cm*2+1, m, n,   k], vflow, vfhigh)
+                        J.v_med3_f32(mfma_C[cm*2+1, m, n+1, k], mfma_C[cm*2+1, m, n+1, k], vflow, vfhigh)
+
+                    for k in range(4):
+                        J.v_cvt_i32_f32_sdwa(vs8x4[0, 0], mfma_C[cm*2+0, m, n, k], mod=f"dst_sel:BYTE_{k} dst_unused:UNUSED_PRESERVE src0_sel:DWORD")
+                        J.v_cvt_i32_f32_sdwa(vs8x4[0, 1], mfma_C[cm*2+0, m, n+1, k], mod=f"dst_sel:BYTE_{k} dst_unused:UNUSED_PRESERVE src0_sel:DWORD")
+                        J.v_cvt_i32_f32_sdwa(vs8x4[1, 0], mfma_C[cm*2+1, m, n, k], mod=f"dst_sel:BYTE_{k} dst_unused:UNUSED_PRESERVE src0_sel:DWORD")
+                        J.v_cvt_i32_f32_sdwa(vs8x4[1, 1], mfma_C[cm*2+1, m, n+1, k], mod=f"dst_sel:BYTE_{k} dst_unused:UNUSED_PRESERVE src0_sel:DWORD")
+
+                    J.v_permlane16_swap_b32(vs8x4[0, 0], vs8x4[0, 1])
+                    J.v_permlane16_swap_b32(vs8x4[1, 0], vs8x4[1, 1])
+                    J.s_nop(1)
+                    J.v_permlane32_swap_b32(vs8x4[0, 0], vs8x4[1, 0])
+                    J.v_permlane32_swap_b32(vs8x4[0, 1], vs8x4[1, 1])
+
+                    J.global_store_dwordx4(vaddr, vs8x4, "off", mod=f"offset:{0} sc1 nt")
+
+            assert nrM == 4
+
+            J.uni_cvt_pk_bf16_f32(voscales[cm,0], voscales[cm,0], voscales[cm,1])
+
+            vaddr_scales = J.gpr("vu32", warp_n * J.sizeof_DW)
+            vaddr_scales += ((vrows_scales[cm] & 0xFFFFFF) * TOPK + (vrows_scales[cm] >> 24)) * stride_s
+
+            buff_s.store_dword(voscales[cm,0], vaddr_scales, 0, offset12 = 0)
+
+        J.s_endpgm()
+
+        # ---- non-quantized bf16 output path ----
+        J.Label("non_quant_output")
+
+        vrows = J.gpr(2, nrM, "vu32")
+        vweights = J.gpr(2, nrM, "vf32")
+        for cm in range(2):
+            row = J.gpr("vu32", ((J.lane_id % 16) + (cm * HALF_BLOCK_SIZE_ROW) + (warp_m * MINI_BLOCK_M)) * J.sizeof_u32)
+            for m in range(nrM):
+                J.ds_read_b32(vrows[cm, m], row + lds_sorted_ids)
+                J.ds_read_b32(vweights[cm, m], row + lds_sorted_weights)
+                row[0] += 16*J.sizeof_u32
+
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+
+        C_dtype = "bf16"
+        stride_c = OC * J.sizeof(C_dtype)
+        if nrN == 1:
+            vbf16 = J.gpr(2, "vbf16x2")
+            col = J.lane_id // 16
+            vaddr0 = J.gpr("vu32", col * J.sizeof_DW2 + warp_n * 16 * J.sizeof_bf16 + blk_n * (wg_N * J.sizeof(C_dtype)))
+        else:
+            vbf16 = J.gpr(4, "vbf16x2")
+            col = J.lane_id // 16
+            swap_12_col = (col & 1) * 2 + (col >> 1)
+            vaddr0 = J.gpr("vu32", swap_12_col * J.sizeof_DW4 + warp_n * 32 * J.sizeof_bf16 + blk_n * (wg_N * J.sizeof(C_dtype)))
+
+        for cm in range(2):
+            for m in range(nrM):
+                vrows_topk = J.gpr(vrows[cm, m] >> 24)
+                with J.ExecMask(vrows_topk < TOPK):
+                    vaddr = J.gpr(2, "vu32", output[0], output[1])
+                    J.v_lshl_add_u64(vaddr, J.gpr(2, "vu32", vaddr0 + vrows_topk * (stride_c), 0), 0, vaddr)
+                    J.v_mad_u64_u32(vaddr, "vcc", (vrows[cm, m] & 0xFFFFFF), J.gpr("vu32", TOPK * stride_c), vaddr)
+
+                    for cn in range(2):
+                        cindex = cn + cm*2
+                        for n in range(0, nrN, 2):
+                            J.v_mul_f32(mfma_C[cindex,m,n,0], mfma_C[cindex,m,n,0], vweights[cm, m])
+                            J.v_mul_f32(mfma_C[cindex,m,n,1], mfma_C[cindex,m,n,1], vweights[cm, m])
+                            J.v_mul_f32(mfma_C[cindex,m,n,2], mfma_C[cindex,m,n,2], vweights[cm, m])
+                            J.v_mul_f32(mfma_C[cindex,m,n,3], mfma_C[cindex,m,n,3], vweights[cm, m])
+
+                            J.v_mul_f32(mfma_C[cindex,m,n+1,0], mfma_C[cindex,m,n+1,0], vweights[cm, m])
+                            J.v_mul_f32(mfma_C[cindex,m,n+1,1], mfma_C[cindex,m,n+1,1], vweights[cm, m])
+                            J.v_mul_f32(mfma_C[cindex,m,n+1,2], mfma_C[cindex,m,n+1,2], vweights[cm, m])
+                            J.v_mul_f32(mfma_C[cindex,m,n+1,3], mfma_C[cindex,m,n+1,3], vweights[cm, m])
+
+                            J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1])
+                            J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
+                            J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
+                            J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
+
+                            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+
+                            J.global_store_dwordx4(vaddr, vbf16, "off", mod=f"offset:{0*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16} sc1 nt")
+
+    return
