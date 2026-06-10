@@ -4,6 +4,97 @@ from .common.loaders import tb_swizzle
 
 __all__ = ["gemm_kernel_slicing"]
 
+USE_GLUON_SWIZZLE = 1
+
+
+# def get_pids(
+#     M,
+#     N,
+#     BM: gl.constexpr,
+#     BN: gl.constexpr,
+#     GRID_MN: gl.constexpr,
+#     NUM_XCDS: gl.constexpr,
+#     GROUP_SIZE_M: gl.constexpr,
+# ):
+#     pid = gl.program_id(axis=0)
+#     num_pid_m = gl.cdiv(M, BM)
+#     num_pid_n = gl.cdiv(N, BN)
+
+#     if NUM_XCDS != 1:
+#         ## pid remapping on xcds
+#         pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+#         tall_xcds = GRID_MN % NUM_XCDS
+#         tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+#         xcd = pid % NUM_XCDS
+#         local_pid = pid // NUM_XCDS
+#         if xcd < tall_xcds:
+#             pid = xcd * pids_per_xcd + local_pid
+#         else:
+#             pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+
+#     if GROUP_SIZE_M == 1:
+#         pid_m = pid // num_pid_n
+#         pid_n = pid % num_pid_n
+#     else:
+#         num_pid_in_group = GROUP_SIZE_M * num_pid_n
+#         group_id = pid // num_pid_in_group
+#         first_pid_m = group_id * GROUP_SIZE_M
+#         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+#         pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+#         pid_n = (pid % num_pid_in_group) // group_size_m
+
+
+#     return pid_m, pid_n
+def get_pids(
+    J,
+    pid: "sgpr",
+    M: "sgpr",
+    N: int,
+    BM: int,
+    BN: int,
+    NUM_XCDS: int,
+    GROUP_SIZE_M: int,
+    GRID_MN: int,
+):
+
+    num_pid_m = J.gpr(J.div_up(M[0], BM))
+    num_pid_n = J.div_up(N, BN)
+
+    if NUM_XCDS != 1:
+        ## pid remapping on xcds
+        pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+        tall_xcds = GRID_MN % NUM_XCDS
+        tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+        xcd = J.gpr(pid[0] % NUM_XCDS)
+        local_pid = J.gpr(pid[0] // NUM_XCDS)
+
+        pid[0] = (
+            tall_xcds * pids_per_xcd
+            + (xcd[0] - tall_xcds) * (pids_per_xcd - 1)
+            + local_pid[0]
+        )
+        with J.If(xcd[0] < tall_xcds):
+            pid[0] = xcd[0] * pids_per_xcd + local_pid[0]
+
+    pid_m = J.gpr("su32")
+    pid_n = J.gpr("su32")
+    if GROUP_SIZE_M == 1:
+        pid_m[0] = pid[0] // num_pid_n
+        pid_n[0] = pid[0] % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = J.gpr(pid[0] // num_pid_in_group)
+        first_pid_m = J.gpr(group_id[0] * GROUP_SIZE_M)
+        group_size_m = J.gpr("su32")
+        group_size_m[0] = num_pid_m[0] - first_pid_m[0]
+        with J.If(group_size_m[0] > GROUP_SIZE_M):
+            group_size_m[0] = GROUP_SIZE_M
+        reg0 = J.gpr(pid[0] % num_pid_in_group)
+        pid_n[0] = reg0[0] // group_size_m[0]
+        pid_m[0] = first_pid_m[0] + (reg0[0] - group_size_m[0] * pid_n[0])
+
+    return pid_m, pid_n
+
 
 @pyhip.jit()
 def gemm_kernel_slicing(
@@ -13,6 +104,7 @@ def gemm_kernel_slicing(
     N,
     K,
     use_pre_shuffle,
+    GRID_MN,
     pA: "void*",
     pB: "void*",
     pC: "void*",
@@ -30,8 +122,23 @@ def gemm_kernel_slicing(
 
     stride_k = K * J.sizeof_bf16
     stride_c = N * J.sizeof(C_dtype)
+    if USE_GLUON_SWIZZLE:
+        NUM_XCDS = 8
+        GROUP_SIZE_M = 4
+        blk_m, blk_n = get_pids(
+            J,
+            J.blockIdx.x,
+            M,
+            N,
+            wg_M,
+            wg_N,
+            NUM_XCDS,
+            GROUP_SIZE_M,
+            GRID_MN,
+        )
+    else:
+        blk_m, blk_n = tb_swizzle(J, J.blockIdx.x, M, wg_M, wg_N, N, M01, GroupNum)
 
-    blk_m, blk_n = tb_swizzle(J, J.blockIdx.x, M, wg_M, wg_N, N, M01, GroupNum)
     pA[:] += blk_m * (wg_M * K * J.sizeof(A_dtype))
     pB[:] += blk_n * (wg_N * K * J.sizeof(B_dtype))
     pC[:] += blk_m * (wg_M * stride_c)  # + blk_n * (wg_N * J.sizeof(C_dtype)))
@@ -140,7 +247,7 @@ def gemm_kernel_slicing(
 
     # [[ping,pong], [B0,A0,A1,B1], 4]
     lds_soff_precal = J.gpr(2, 4, 4, "su32")
-    # 128 is LDS row in bytes.
+    # 128 is LDS row in bytes. 8 rows per wap.
     lds_warp_offset = J.gpr("su32", J.warp_id[0] * 8 * 128 + J.warp_id[0] * padding_sz)
     store_stride = 64 * num_warps * J.sizeof_DW4 + padding_sz * num_warps
     for cnt in range(4):

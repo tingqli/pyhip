@@ -168,12 +168,12 @@ def torch_chunk_gated_delta_rule(
 ):
     """Reference impl (see modeling_qwen3_5_moe.torch_chunk_gated_delta_rule).
     Arguments:
-        query:              : [B, H, T, K]   bf16/fp16
-        key:                : [B, H, T, K]    bf16/fp16
-        value:              : [B, H, T, V]    bf16/fp16
-        g                   : [B, H, T]       fp32 log-decays
-        beta                : [B, H, T]       bf16/fp16    (in (0,1) via sigmoid)
-        initial_state       : [N, H, K, V]    bf16/fp16    (N == B for equal-length)
+        query:              : [B, L, H, K]   bf16/fp16
+        key:                : [B, L, H, K]    bf16/fp16
+        value:              : [B, L, H, V]    bf16/fp16
+        g                   : [B, L, H]       fp32 log-decays
+        beta                : [B, L, H]       bf16/fp16    (in (0,1) via sigmoid)
+        initial_state       : [B, H, K, V]    bf16/fp16    (N == B for equal-length)
     Returns:
         core_attn_out:        [B, L, H, Dv]
         last_recurrent_state: [B, H, Dk, Dv] or None
@@ -183,6 +183,7 @@ def torch_chunk_gated_delta_rule(
         query = _l2norm(query, dim=-1)
         key = _l2norm(key, dim=-1)
 
+    # transpose from [B, L , H, ...] to [B, H, L, ...] and make contiguous for the reference.
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32)
         for x in (query, key, value, beta, g)
@@ -205,7 +206,7 @@ def torch_chunk_gated_delta_rule(
     # k_beta = diag(β)@K
     k_beta = key * beta.unsqueeze(-1)
 
-    # reorder from [[B, H, T, ...] to [B, H, chuank_num, chuank_size, ...]
+    # reorder from [[B, H, T, ...] to [B, H, chunk_num, chunk_size, ...]
     query, key, value, k_beta, v_beta = [
         x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
         for x in (query, key, value, k_beta, v_beta)
@@ -236,7 +237,7 @@ def torch_chunk_gated_delta_rule(
     #               [ g1+g2+g3,  g2+g3,  g3,   0 ]]
     #
     # 含义:decay_mask{i,j}= decay.tril()[i,j].exp().tril() . 当i > j是， 每个trunk里面第j个token到第i个token一共衰减了多少。
-    # 对应spec: gamma_i = G_i.exp()??
+    # 对应spec: gamma_i = G_i.exp()?
     # 就是下三角的 decay_mask{i,j} = gamma_i/gamma_j (对角线=1).
     g = g.cumsum(dim=-1)
     # decay_mask下三角矩阵[64, 64]，对角线都为1. g = strict_low_triangular (exp(g.cumsum(-1)))
