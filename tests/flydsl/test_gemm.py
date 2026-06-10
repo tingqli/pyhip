@@ -14,6 +14,7 @@ from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 from flydsl.utils.env import DebugEnvManager
 from flydsl._mlir import ir
 import flydsl
+from flydsl._mlir.dialects import llvm
 
 # debug
 if 1:
@@ -296,7 +297,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
 
         # memory->lds layout
         buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        assert TILE_M % (32 * 2) == 0 and TILE_N % (32 * 2) == 0, "TILE_M and TILE_N need to be multiple of 64 for loading scheme: (8x4wave)x8"
+        assert TILE_M % 32 == 0 and TILE_N % 32 == 0, "TILE_M and TILE_N need to be multiple of 32 for loading scheme: (8x4wave)x8"
         ab_mem_cp_layout_g2r = fx.make_tiled_copy(buf_cp_atom_r,
                                                   # 线程划分[8 * 4 wave, 8]
                                                   fx.make_layout(((8, 8, 4), 8), ((256, 1, 8), 32)),
@@ -491,6 +492,267 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
         c_frag_bf16.store(((c_br_frag.load() + round_bit).bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16))
         fx.copy(buf_atom_w64, c_layout_w.get_slice(tid).retile(c_frag_bf16), c_layout_w.get_slice(tid).partition_D(c_br_tile))
 
+    def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
+        """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
+        vm_lo = vmcnt & 0xF
+        vm_hi = (vmcnt >> 4) & 0x3
+        return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def gemm_8wave(arg_c_: fx.Tensor,
+                   arg_a_: fx.Tensor,
+                   arg_b_: fx.Tensor,
+                   M: int):
+        tid = fx.thread_idx.x
+        wave_id = tid // 64
+        # 308 has 4 xcds
+        blk_x, blk_y = get_pids(fx.block_idx.x, M, N, TILE_M, TILE_N, fx.grid_dim.x, 4, 4)
+        arg_a = fx.Tensor(fx.make_view(
+            fx.get_iter(arg_a_),
+            fx.make_layout((M, K), (K, 1))
+        ))
+        # pre-shuffled
+        arg_b = fx.Tensor(fx.make_view(
+            fx.get_iter(arg_b_),
+            # layout分成两部分：第一部分(m, n)描述一个wave内部划分为16行，(8列每组)x4组；第二部分为重复第一部分的次数
+            # shape: (16, (8, 4)),   (N//16, K//32)
+            # stride:(8,  (1, 128)), (K*16, 512))
+            # 重新排列为第0维、第1维
+            fx.make_layout(((16, N // 16), (8, 4, K // 32)), ((8, 16 * K), (1, 128, 512)))
+        ))
+        arg_c = fx.Tensor(fx.make_view(
+            fx.get_iter(arg_c_),
+            fx.make_layout((M, N), (N, 1))
+        ))
+        a_tensor = fx.rocdl.make_buffer_tensor(arg_a, max_size=False)
+        b_tensor = fx.rocdl.make_buffer_tensor(arg_b, max_size=False)
+        c_tensor = fx.rocdl.make_buffer_tensor(arg_c, max_size=False)
+        # shape: [m_in_tile, k_in_tile, k_tile]
+        at_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M // 2, TILE_K))[None, None, blk_x * 2 + 0, None]
+        ab_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M // 2, TILE_K))[None, None, blk_x * 2 + 1, None]
+        # shape: [n_in_tile, k_in_tile, k_tile]
+        bl_tile = fx.flat_divide(b_tensor, fx.make_tile(TILE_N // 2, TILE_K))[None, None, blk_y * 2 + 0, None]
+        br_tile = fx.flat_divide(b_tensor, fx.make_tile(TILE_N // 2, TILE_K))[None, None, blk_y * 2 + 1, None]
+        # shape: [m_in_tile, n_in_tile]
+        c_tl_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, 2 * blk_x + 0, 2 * blk_y + 0]
+        c_tr_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, 2 * blk_x + 0, 2 * blk_y + 1]
+        c_bl_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, 2 * blk_x + 1, 2 * blk_y + 0]
+        c_br_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, 2 * blk_x + 1, 2 * blk_y + 1]
+
+        # memory->lds layout
+        buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        assert TILE_M % (32 * 2) == 0 and TILE_N % (32 * 2) == 0, "TILE_M/TILE_N need to be multiple of 64 for loading scheme"
+        ab_mem_cp_layout_g2r = fx.make_tiled_copy(buf_cp_atom_r,
+                                                  # 线程划分[8 * 8 wave, 8]
+                                                  fx.make_layout(((8, 8, 8), 8), ((512, 1, 8), 64)),
+                                                  fx.make_tile(8 * 8, TILE_K))
+        # fx.utils.print_typst(ab_mem_cp_layout_g2r, file="layout-ab_mem_cp_layout_g2r.typ")
+        at_mem_tensor_thr = ab_mem_cp_layout_g2r.get_slice(tid).partition_S(at_tile)
+        ab_mem_tensor_thr = ab_mem_cp_layout_g2r.get_slice(tid).partition_S(ab_tile)
+        bl_mem_tensor_thr = ab_mem_cp_layout_g2r.get_slice(tid).partition_S(bl_tile)
+        br_mem_tensor_thr = ab_mem_cp_layout_g2r.get_slice(tid).partition_S(br_tile)
+        at_cp_frag = fx.make_fragment_like(at_mem_tensor_thr[None, None, None, 0])
+        ab_cp_frag = fx.make_fragment_like(ab_mem_tensor_thr[None, None, None, 0])
+        bl_cp_frag = fx.make_fragment_like(bl_mem_tensor_thr[None, None, None, 0])
+        br_cp_frag = fx.make_fragment_like(br_mem_tensor_thr[None, None, None, 0])
+
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        swz = fx.SwizzleType.get(3, 3, 3)
+        at_lds = fx.make_view(lds.at_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M // 2, TILE_K), order=(1, 0))))
+        ab_lds = fx.make_view(lds.ab_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M // 2, TILE_K), order=(1, 0))))
+        bl_lds = fx.make_view(lds.bl_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))))
+        br_lds = fx.make_view(lds.br_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))))
+
+        uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+        ab_lds_cp_layout_g2r = fx.make_tiled_copy(uni_cp_atom,
+                                                  # 线程划分[8 * 8 wave, 8]
+                                                  fx.make_layout(((8, 8, 8), 8), ((512, 1, 8), 64)),
+                                                  fx.make_tile(8 * 8, TILE_K))
+        at_lds_tensor_thr_w = ab_lds_cp_layout_g2r.get_slice(tid).partition_D(at_lds)
+        ab_lds_tensor_thr_w = ab_lds_cp_layout_g2r.get_slice(tid).partition_D(ab_lds)
+        bl_lds_tensor_thr_w = ab_lds_cp_layout_g2r.get_slice(tid).partition_D(bl_lds)
+        br_lds_tensor_thr_w = ab_lds_cp_layout_g2r.get_slice(tid).partition_D(br_lds)
+
+        # lds -> reg layout
+        tiled_mma = fx.make_tiled_mma(
+            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+            # wave 为2x4
+            fx.make_layout((2, 4, 1), (1, 2, 0)),
+            # K维度重复两次
+            fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4)))
+        )
+        # fx.utils.print_typst(tiled_mma, file="layout_tiled_mma.typ")
+
+        at_lds_tensor_thr_r = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(at_lds)
+        ab_lds_tensor_thr_r = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(ab_lds)
+        bl_lds_tensor_thr_r = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(bl_lds)
+        br_lds_tensor_thr_r = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(br_lds)
+
+        at_frag = tiled_mma.make_fragment_A(at_lds)
+        ab_frag = tiled_mma.make_fragment_A(ab_lds)
+        bl_frag = tiled_mma.make_fragment_B(bl_lds)
+        br_frag = tiled_mma.make_fragment_B(br_lds)
+
+        at_frag_retile = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).retile(at_frag)
+        ab_frag_retile = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).retile(ab_frag)
+        bl_frag_retile = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).retile(bl_frag)
+        br_frag_retile = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).retile(br_frag)
+
+        c_tl_frag = fx.select(tiled_mma.make_fragment_C(c_tl_tile), [0, 2, 1])
+        c_tr_frag = fx.select(tiled_mma.make_fragment_C(c_tr_tile), [0, 2, 1])
+        c_bl_frag = fx.select(tiled_mma.make_fragment_C(c_bl_tile), [0, 2, 1])
+        c_br_frag = fx.select(tiled_mma.make_fragment_C(c_br_tile), [0, 2, 1])
+
+        c_tl_frag.store(Vec.filled(TILE_M * TILE_N // 64 // 8, 0, fx.Float32))
+        c_tr_frag.store(Vec.filled(TILE_M * TILE_N // 64 // 8, 0, fx.Float32))
+        c_bl_frag.store(Vec.filled(TILE_M * TILE_N // 64 // 8, 0, fx.Float32))
+        c_br_frag.store(Vec.filled(TILE_M * TILE_N // 64 // 8, 0, fx.Float32))
+
+        acc_init = [c_tl_frag.load(), c_tr_frag.load(), c_bl_frag.load(), c_br_frag.load()]
+
+        # prefetch
+        # gr0: all
+        fx.copy(buf_cp_atom_r, bl_mem_tensor_thr[None, None, None, 0], bl_cp_frag)
+        fx.copy(buf_cp_atom_r, at_mem_tensor_thr[None, None, None, 0], at_cp_frag)
+        fx.copy(buf_cp_atom_r, ab_mem_tensor_thr[None, None, None, 0], ab_cp_frag)
+        fx.copy(buf_cp_atom_r, br_mem_tensor_thr[None, None, None, 0], br_cp_frag)
+        # lw0: all
+        fx.copy(uni_cp_atom, bl_cp_frag, bl_lds_tensor_thr_w)
+        fx.copy(uni_cp_atom, at_cp_frag, at_lds_tensor_thr_w)
+        fx.copy(uni_cp_atom, ab_cp_frag, ab_lds_tensor_thr_w)
+        fx.copy(uni_cp_atom, br_cp_frag, br_lds_tensor_thr_w)
+
+        # gr1: all
+        fx.copy(buf_cp_atom_r, bl_mem_tensor_thr[None, None, None, 1], bl_cp_frag)
+        fx.copy(buf_cp_atom_r, at_mem_tensor_thr[None, None, None, 1], at_cp_frag)
+        fx.copy(buf_cp_atom_r, ab_mem_tensor_thr[None, None, None, 1], ab_cp_frag)
+        fx.copy(buf_cp_atom_r, br_mem_tensor_thr[None, None, None, 1], br_cp_frag)
+        gpu.barrier()
+
+        # lr: bl0, at0
+        fx.copy(uni_cp_atom, bl_lds_tensor_thr_r, bl_frag_retile)
+        fx.copy(uni_cp_atom, at_lds_tensor_thr_r, at_frag_retile)
+        rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+        if wave_id >= 4:
+            gpu.barrier()
+
+        assert K // TILE_K >= 2, "this kernel requires at least 2 iterations"
+        for k, state in range(0, K // TILE_K - 0, 1, init=acc_init):
+            c_tl_frag.store(state[0])
+            c_tr_frag.store(state[1])
+            c_bl_frag.store(state[2])
+            c_br_frag.store(state[3])
+            k_i32 = fx.Int32(k)
+
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
+            rocdl.sched_barrier(0)
+            # bl0 @ at0
+            for sub_k in range_constexpr(TILE_K // 32):
+                fx.gemm(tiled_mma, c_tl_frag, bl_frag[None, None, (None, sub_k)], at_frag[None, None, (None, sub_k)], c_tl_frag)
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(0)
+            gpu.barrier()
+            rocdl.sched_barrier(0)
+            # lr: ab0
+            fx.copy(uni_cp_atom, ab_lds_tensor_thr_r, ab_frag_retile)
+            # lw: bl1
+            fx.copy(uni_cp_atom, bl_cp_frag, bl_lds_tensor_thr_w)
+            # gr: bl2
+            fx.copy(buf_cp_atom_r, bl_mem_tensor_thr[None, None, None, k_i32 + 2], bl_cp_frag)
+            gpu.barrier()
+            rocdl.sched_barrier(0)
+
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
+            rocdl.sched_barrier(0)
+            # bl0 @ ab0
+            for sub_k in range_constexpr(TILE_K // 32):
+                fx.gemm(tiled_mma, c_bl_frag, bl_frag[None, None, (None, sub_k)], ab_frag[None, None, (None, sub_k)], c_bl_frag)
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(0)
+            gpu.barrier()
+            rocdl.sched_barrier(0)
+            # lr: br0
+            fx.copy(uni_cp_atom, br_lds_tensor_thr_r, br_frag_retile)
+            # lw: at1
+            fx.copy(uni_cp_atom, at_cp_frag, at_lds_tensor_thr_w)
+            # gr: at2
+            fx.copy(buf_cp_atom_r, at_mem_tensor_thr[None, None, None, k_i32 + 2], at_cp_frag)
+            gpu.barrier()
+            rocdl.sched_barrier(0)
+
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
+            rocdl.sched_barrier(0)
+            # br0 @ at0
+            for sub_k in range_constexpr(TILE_K // 32):
+                fx.gemm(tiled_mma, c_tr_frag, br_frag[None, None, (None, sub_k)], at_frag[None, None, (None, sub_k)], c_tr_frag)
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(0)
+            gpu.barrier()
+            rocdl.sched_barrier(0)
+            # lr: bl1
+            fx.copy(uni_cp_atom, bl_lds_tensor_thr_r, bl_frag_retile)
+            # lw: ab1
+            fx.copy(uni_cp_atom, ab_cp_frag, ab_lds_tensor_thr_w)
+            # gr: ab2
+            fx.copy(buf_cp_atom_r, ab_mem_tensor_thr[None, None, None, k_i32 + 2], ab_cp_frag)
+            gpu.barrier()
+            rocdl.sched_barrier(0)
+
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
+            rocdl.sched_barrier(0)
+            # br0 @ ab0
+            for sub_k in range_constexpr(TILE_K // 32):
+                fx.gemm(tiled_mma, c_br_frag, br_frag[None, None, (None, sub_k)], ab_frag[None, None, (None, sub_k)], c_br_frag)
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(0)
+            gpu.barrier()
+            rocdl.sched_barrier(0)
+            # lr: at1
+            fx.copy(uni_cp_atom, at_lds_tensor_thr_r, at_frag_retile)
+            # lw: br1
+            fx.copy(uni_cp_atom, br_cp_frag, br_lds_tensor_thr_w)
+            # gr: br2
+            fx.copy(buf_cp_atom_r, br_mem_tensor_thr[None, None, None, k_i32 + 2], br_cp_frag)
+            gpu.barrier()
+            rocdl.sched_barrier(0)
+
+            results = yield [c_tl_frag.load(), c_tr_frag.load(), c_bl_frag.load(), c_br_frag.load()]
+
+        c_tl_frag.store(results[0])
+        c_tr_frag.store(results[1])
+        c_bl_frag.store(results[2])
+        c_br_frag.store(results[3])        
+        c_tl_frag = fx.select(c_tl_frag, [0, 2, 1])
+        c_tr_frag = fx.select(c_tr_frag, [0, 2, 1])
+        c_bl_frag = fx.select(c_bl_frag, [0, 2, 1])
+        c_br_frag = fx.select(c_br_frag, [0, 2, 1])
+
+        if wave_id < 4:
+            gpu.barrier()
+
+        c_frag_bf16 = fx.make_fragment_like(c_tl_frag, dtype=fx.BFloat16)
+        round_bit = fx.Uint32(0x8000).ir_value().bitcast(fx.Float32.ir_type)
+        buf_atom_w64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+        c_layout_w = fx.make_tiled_copy(buf_atom_w64,
+                                        # wave先M，再N（匹配mma中的设置）
+                                        fx.make_layout(((16, 4, 2, 4), 4), ((1, 128, 16, 512), 32)),
+                                        fx.make_tile(32, 64))
+        # fx.utils.print_typst(c_layout_w, file="layout-c-out.typ")
+
+        # acc = acc.to(fx.BFloat16)
+        c_frag_bf16.store(((c_tl_frag.load() + round_bit).bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16))
+        fx.copy(buf_atom_w64, c_layout_w.get_slice(tid).retile(c_frag_bf16), c_layout_w.get_slice(tid).partition_D(c_tl_tile))
+        c_frag_bf16.store(((c_tr_frag.load() + round_bit).bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16))
+        fx.copy(buf_atom_w64, c_layout_w.get_slice(tid).retile(c_frag_bf16), c_layout_w.get_slice(tid).partition_D(c_tr_tile))
+        c_frag_bf16.store(((c_bl_frag.load() + round_bit).bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16))
+        fx.copy(buf_atom_w64, c_layout_w.get_slice(tid).retile(c_frag_bf16), c_layout_w.get_slice(tid).partition_D(c_bl_tile))
+        c_frag_bf16.store(((c_br_frag.load() + round_bit).bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16))
+        fx.copy(buf_atom_w64, c_layout_w.get_slice(tid).retile(c_frag_bf16), c_layout_w.get_slice(tid).partition_D(c_br_tile))
+
     @flyc.jit
     def launch(
         arg_c: fx.Tensor,
@@ -502,7 +764,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
         CompilationContext.get_current()
         if const_expr(alg == 'splitk'):
             gemm_splitk(arg_c, arg_a, arg_b, M).launch(grid=(div_up(M, TILE_M), div_up(N, TILE_N), 1), block=(256, 1, 1), stream=stream)
-        else:
+        elif const_expr(alg == '4wave'):
             value_attrs = None
             if const_expr((TILE_M >= 128 and TILE_N > 128) or (TILE_M > 128 and TILE_N >= 128)):
                 value_attrs = {"rocdl.waves_per_eu": 1,
@@ -511,6 +773,11 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
             gemm_4wave(arg_c, arg_a, arg_b, M,
                        value_attrs=value_attrs,
                        ).launch(grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1), block=(256, 1, 1), stream=stream)
+        else:
+            value_attrs = None
+            gemm_8wave(arg_c, arg_a, arg_b, M,
+                       value_attrs=value_attrs,
+                       ).launch(grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1), block=(512, 1, 1), stream=stream)
     
     return launch
 
@@ -680,6 +947,9 @@ def _run_batch(num_warps, kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=1
                 "amdgpu-mfma-vgpr-form": False,
             }
             gemm = flyc.compile[hints](launcher, *args)
+        elif kernel_type == '8wave':
+            launcher = compile_gemm(TILE_M, TILE_N, N, K, alg='8wave')
+            gemm = flyc.compile[hints](launcher, *args)
         else:
             assert 0, f"unsupported kernel type {kernel_type}"
 
@@ -795,11 +1065,11 @@ if __name__ == '__main__':
 
     #TILE_M = 16
     #TILE_N = 128
-    N, K = 4096*1, 1024*16 # 4096*8*2 /128 = 512
+    N, K = 4096*1, 1024*8 # 4096*8*2 /128 = 512
     #N, K = 64*1024*1, 1024*16
     Ms = [16, 32, 64, 128, 256]
     Ms = [4096,] # 64, 128]
-    Ms = [13, 64, 257, 1024, 4096, 4096*2, 4096*4]
+    #Ms = [13, 64, 257, 1024, 4096, 4096*2, 4096*4]
     # N, K = 64*4, 256*4
     perf = {}
     dict_tile_mn = {}
@@ -836,11 +1106,14 @@ if __name__ == '__main__':
         #         TILE_N = 128
 
         #TILE_M, TILE_N = 16, 64
-        TILE_M, TILE_N = 256, 256
+        TILE_M, TILE_N = 256, 128
         dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
         print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
         #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
         # perf = merge(perf, test_perf(num_warps=args.wave, alg='splitk', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
         perf = merge(perf, test_perf(num_warps=args.wave, alg='torch', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+        TILE_M, TILE_N = 256, 256
         perf = merge(perf, test_perf(num_warps=args.wave, alg='4wave', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+        TILE_M, TILE_N = 256, 128
+        perf = merge(perf, test_perf(num_warps=args.wave, alg='8wave', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     show_perf(perf, dict_tile_mn)
