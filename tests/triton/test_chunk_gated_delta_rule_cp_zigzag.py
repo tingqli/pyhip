@@ -3,9 +3,7 @@
 Test chunk_gated_delta_rule CP zigzag correctness.
 
 Usage:
-    GPU_COUNT=2 python test_chunk_gated_delta_rule_cp_zigzag.py
-    GPU_COUNT=2 python test_chunk_gated_delta_rule_cp_zigzag.py --seqlens 4096 8192
-    GPU_COUNT=2 python test_chunk_gated_delta_rule_cp_zigzag.py --seqlens 256 --H 8 --K 64 --V 64
+    GPU_COUNT=2 python test_chunk_gated_delta_rule_cp_zigzag.py --seqlens 4096 --H 32 --Hg 8 --K 128 --V 128
 """
 
 import argparse
@@ -287,7 +285,10 @@ def sglang_chunk_gated_delta_rule_fwd(
 # ---------------------------------------------------------------------------
 # Worker: unified (handles both fixed-batch and varlen)
 # ---------------------------------------------------------------------------
-def prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V):
+def prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V, Hg=None):
+    if Hg is None:
+        Hg = H
+    assert H % Hg == 0, f"H ({H}) must be divisible by Hg ({Hg})"
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(nccl_port)
     torch.cuda.set_device(rank)
@@ -305,9 +306,9 @@ def prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V):
     T_total = sum(seq_lengths)
     scale = K**-0.5
 
-    q_full = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
+    q_full = torch.randn(1, T_total, Hg, K, dtype=dtype, device=device)
     k_full = F.normalize(
-        torch.randn(1, T_total, H, K, dtype=torch.float32, device=device),
+        torch.randn(1, T_total, Hg, K, dtype=torch.float32, device=device),
         p=2,
         dim=-1,
     ).to(dtype)
@@ -510,7 +511,7 @@ def acc_check_qkvg(
     assert g_diff == 0.0, f"rank {rank} g_diff={g_diff} not bit-equal"
 
 
-def acc_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
+def acc_worker(rank, world_size, nccl_port, seq_lengths, H, K, V, Hg=None):
     try:
         (
             scale,
@@ -534,7 +535,7 @@ def acc_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             chunk_indices_ref,
             chunk_indices_l,
             device,
-        ) = prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V)
+        ) = prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V, Hg)
 
         use_ref_o_func = False
         o_ref, h_ref, vn_ref, g_ref, w_ref, u_ref = sglang_chunk_gated_delta_rule_fwd(
@@ -666,7 +667,7 @@ def acc_worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
 
 
 def bench_worker(
-    rank, world_size, nccl_port, seq_lengths, H, K, V, profile_trace=False
+    rank, world_size, nccl_port, seq_lengths, H, K, V, Hg=None, profile_trace=False
 ):
     try:
         (
@@ -691,7 +692,7 @@ def bench_worker(
             chunk_indices_ref,
             chunk_indices_l,
             device,
-        ) = prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V)
+        ) = prepare_input(rank, world_size, nccl_port, seq_lengths, H, K, V, Hg)
 
         def _ref_call():
             sglang_chunk_gated_delta_rule_fwd(
@@ -725,13 +726,13 @@ def bench_worker(
                 fwd_o_fn=chunk_fwd_o,
             )
 
-        # Only rank 0 runs single-GPU reference (no collectives).
-        if rank == 0:
-            ref_p20, ref_p50, ref_p80 = _bench_synced(
-                _ref_call, warmup=2, rep=100, use_barrier=False
-            )
-        else:
-            ref_p20 = ref_p50 = ref_p80 = float("nan")
+        # # Only rank 0 runs single-GPU reference (no collectives).
+        # if rank == 0:
+        #     ref_p20, ref_p50, ref_p80 = _bench_synced(
+        #         _ref_call, warmup=2, rep=100, use_barrier=False
+        #     )
+        # else:
+        #     ref_p20 = ref_p50 = ref_p80 = float("nan")
 
         dist.barrier()
         # CP path runs collectives -> all ranks must use identical iter counts
@@ -742,11 +743,11 @@ def bench_worker(
         dist.barrier()
 
         label = "+".join(str(s) for s in seq_lengths)
-        if rank == 0:
-            logging.info(
-                f"  [bench seqlens={label} H={H} K={K} V={V}] "
-                f"ref(1GPU) p50={ref_p50*1000:.1f}us (p20/p80={ref_p20*1000:.1f}/{ref_p80*1000:.1f})"
-            )
+        # if rank == 0:
+        #     logging.info(
+        #         f"  [bench seqlens={label} H={H} K={K} V={V}] "
+        #         f"ref(1GPU) p50={ref_p50*1000:.1f}us (p20/p80={ref_p20*1000:.1f}/{ref_p80*1000:.1f})"
+        #     )
         logging.info(
             f"  [bench seqlens={label} cp_size={world_size} rank={rank}] "
             f"cp p50={cp_p50*1000:.1f}us (p20/p80={cp_p20*1000:.1f}/{cp_p80*1000:.1f})"
@@ -837,10 +838,13 @@ def bench_worker(
 # ---------------------------------------------------------------------------
 
 
-def run_test(seq_lengths, H=16, K=128, V=128, bench=False, profile_trace=False):
+def run_test(
+    seq_lengths, H=16, K=128, V=128, Hg=None, bench=False, profile_trace=False
+):
     nccl_port = _find_free_port()
     label = "+".join(str(s) for s in seq_lengths)
-    logging.info(f"[seqlens={label}  H={H} K={K} V={V}]")
+    hg_str = f" Hg={Hg}" if Hg is not None and Hg != H else ""
+    logging.info(f"[seqlens={label}  H={H}{hg_str} K={K} V={V}]")
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
@@ -849,7 +853,7 @@ def run_test(seq_lengths, H=16, K=128, V=128, bench=False, profile_trace=False):
     for rank in range(GPU_COUNT):
         p = mp.Process(
             target=bench_worker if bench else acc_worker,
-            args=(rank, GPU_COUNT, nccl_port, seq_lengths, H, K, V)
+            args=(rank, GPU_COUNT, nccl_port, seq_lengths, H, K, V, Hg)
             + ((profile_trace,) if bench else ()),
             name=f"rank-{rank}",
         )
@@ -873,7 +877,15 @@ if __name__ == "__main__":
         default=None,
         help="Sequence lengths (e.g. --seqlens 4096 8192)",
     )
-    parser.add_argument("--H", type=int, default=64)
+    parser.add_argument(
+        "--H", type=int, default=64, help="Number of V heads (num_v_heads)"
+    )
+    parser.add_argument(
+        "--Hg",
+        type=int,
+        default=None,
+        help="Number of Q/K heads (num_qk_heads). Defaults to H if not set.",
+    )
     parser.add_argument("--K", type=int, default=128)
     parser.add_argument("--V", type=int, default=128)
     parser.add_argument(
@@ -895,43 +907,43 @@ if __name__ == "__main__":
             H=args.H,
             K=args.K,
             V=args.V,
+            Hg=args.Hg,
             bench=args.bench,
             profile_trace=args.profile,
         )
         exit(0 if ok else 1)
 
     # Default: run a suite of configs
+    # Each config: (seq_lengths, H, Hg) — Hg=None means Hg==H
     configs = [
-        # [256],
-        # [512],
-        # [16384],
-        # [32768],
-        [65536],
-        # [4096],
-        # [8192],
-        #     [32768],
-        #     [256, 256],
-        #     [4096, 4096],
-        # [8192, 16384],
-        #     [4096, 8192, 4096],
+        # Hg == H (no GQA)
+        # ([256], args.H, None),
+        # ([512], args.H, None),
+        # ([4096], args.H, None),
+        # Hg < H (GQA-like, matching Qwen3.5 head ratio)
+        ([8192], 64, 16),
+        ([64000], 64, 16),
+        # ([4096, 8192], 32, 8),
     ]
     results = []
-    for sl in configs:
+    for sl, H, Hg in configs:
         ok = run_test(
             sl,
-            H=args.H,
+            H=H,
             K=args.K,
             V=args.V,
+            Hg=Hg,
             bench=args.bench,
             profile_trace=args.profile,
         )
-        results.append((sl, ok))
+        results.append((sl, H, Hg, ok))
 
     logging.info("\n===== Summary =====")
     all_pass = True
-    for sl, ok in results:
+    for sl, H, Hg, ok in results:
         label = "+".join(str(s) for s in sl)
-        logging.info(f"  {label}: {'PASS' if ok else 'FAIL'}")
+        hg_str = f" Hg={Hg}" if Hg is not None and Hg != H else ""
+        logging.info(f"  {label} H={H}{hg_str}: {'PASS' if ok else 'FAIL'}")
         if not ok:
             all_pass = False
     exit(0 if all_pass else 1)

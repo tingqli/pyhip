@@ -614,8 +614,8 @@ def gemm_kernel_slicing(
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 48)
 
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-        buff_b.advance(s_offset_inc_b[0])
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        buff_b.advance(s_offset_inc_b[0])
         J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         J.s_barrier()

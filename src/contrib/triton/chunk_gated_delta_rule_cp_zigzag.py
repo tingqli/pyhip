@@ -610,11 +610,11 @@ def cp_merge(ag_hm, h0, num_ranks, N, H, K, V, causal_order):
 
 
 def chunk_gated_delta_rule_fwd_cp_zigzag(
-    q: torch.Tensor,  # [B,H, L,Dk]
-    k: torch.Tensor,  # [B,H, L,Dk]
-    v: torch.Tensor,  # [B,H, L,Dv]
-    g: torch.Tensor,  # [B,H, L]
-    beta: torch.Tensor,  # [B,H, L]
+    q: torch.Tensor,  # [B,L, H, Dk]
+    k: torch.Tensor,  # [B,L, H, Dk]
+    v: torch.Tensor,  # [B,L, H,Dv]
+    g: torch.Tensor,  # [B,L, H]
+    beta: torch.Tensor,  # [B,L,H]
     initial_state: Optional[torch.Tensor],  # [B, H, K, V]
     output_final_state: bool,
     cp_group: dist.ProcessGroup,
@@ -690,14 +690,14 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     #   K-> = k[:,:,i] * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]),[64, Dk] * [64] = [64, Dk]
     #   h_in-> = h_in * gamma_C                                                [Dk,Dv] * [1] = [Dk, Dv]
     #   h_out = h_in-> + K->^T@v_new                                           [Dk,Dv] + [Dk,64]@[64,Dv] = [Dk, Dv]
-    # 最终的h_out就是B
+    # 最终的h_out就是Br
 
     # Compute affine pairs (b, M) on 1 GPU:
     # Br: [2*B, H, Dk, Dv], `B`通常是batch, 代表有多少个sequence. `2`是seg(zigzag的两半)
-    # [B, H, dV/BV] parallel,每个WG负责2个seg的所有chunk B系数的计算。
+    # [B, H, dV/BV] parallel,每个WG负责2个seg的所有chunk B系数的计算。 BV = 32
     b = compute_br(k=k, w=w, u=u, g=g, cu_seqlens=seg_cu)
     # M:  [2*B, H, Dk, Dk], 同上，只是h state 的初值不再是 0，而是单位阵 I_{Dk}
-    # [B, H, dK/BK] parallel,每个WG负责2个seg的Dk列条的计算。在
+    # [B, H, dK/BK] parallel,每个WG负责2个seg的Dk列条的计算。BK = 64
     # 注意：这里 U~ 当作 0（compute_M_total 不接 u），h_in 的最后一维由 Dv 换成 Dk
     # iterate for each trunk in the zig/zag, i 是trunk index :
     #   h_in = I_{Dk} if i==0 else h_out                                       [Dk, Dk]
