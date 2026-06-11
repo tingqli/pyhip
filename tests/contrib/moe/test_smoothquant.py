@@ -25,7 +25,7 @@ def reduce_i8(x, scale):
     kwargs = {"BLOCK_SIZE_M":256,
               "TOPK":x.shape[1],
               "ROW_PER_BLOCK":4,
-              "ROW_PER_BLOCK2":4,
+              "ROW_PER_BLOCK2":8,
               "ROW_PER_BLOCK1":1,
               "BLOCK_M2":8,
               "QUANT1_K":x.shape[2],
@@ -42,7 +42,7 @@ def quant_act(x, topk, M, model_dim, smooth_scale, sorted_ids, sorted_expert_ids
     kwargs = {"BLOCK_SIZE_M":256,
               "TOPK":topk,
               "ROW_PER_BLOCK":4,
-              "ROW_PER_BLOCK2":4,
+              "ROW_PER_BLOCK2":8,
               "ROW_PER_BLOCK1":1,
               "BLOCK_M2":8,
               "QUANT1_K":model_dim,
@@ -442,10 +442,15 @@ def fused_moe_gelu_sqi8(
                 quant_dtype=torch.int8,
             )
             a2_scale.is_sorted = False
-        elif a2_v.shape[2] % 512 == 0:
+        elif 1:
             a2, a2_scale = quant_act(a2_v, topk, a2_v.shape[0], a2_v.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids)
         else:
             a2, a2_scale = smoothquant_i8_per_tok(a2_v, a2_smooth_scale, topk, sorted_ids, sorted_expert_ids, num_valid_ids, block_size_M)
+        '''elif a2_v.shape[2] % 512 == 0:
+            a2, a2_scale = quant_act(a2_v, topk, a2_v.shape[0], a2_v.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids)
+        else:
+            a2, a2_scale = smoothquant_i8_per_tok(a2_v, a2_smooth_scale, topk, sorted_ids, sorted_expert_ids, num_valid_ids, block_size_M)
+        '''
 
     # quantize output to int8 in unit of 1x256
     with pyhip.cudaPerf(num_tokens * topk * model_dim * inter_dim * 2, name=f"{moe_gemm.__name__}_down"):
@@ -599,7 +604,7 @@ def fused_moe_silu_sqi8(
                 quant_dtype=torch.int8,
             )
             a2_scale.is_sorted = False
-        elif a2_v.shape[2] % 512 == 0:
+        elif 1: #elif a2_v.shape[2] % 512 == 0:
             a2, a2_scale = quant_act(a2_v, topk, a2_v.shape[0], a2_v.shape[2], a2_smooth_scale, sorted_ids, sorted_expert_ids, num_valid_ids, False, topk_ids)
         else:
             a2, a2_scale = smoothquant_i8_per_tok(a2_v, a2_smooth_scale, topk, sorted_ids, sorted_expert_ids, num_valid_ids, block_size_M)
@@ -1042,7 +1047,7 @@ if __name__ == "__main__":
         summary = []
         for num_experts, topk in [(384,8)]: #[(800, 25), (400, 20)]:
             for num_tokens in [1024, 2048]: #[40960, 20480, 19147]:
-                for use_smoothquant, shared_smooth_up in [(1, 0), (1, 1), (0, 0)]:
+                for use_smoothquant, shared_smooth_up in [(1, 0),(1, 1),(0,0)]:
                     if test_mode in ["g1u0", "both"]:
                         ret = test_fmoe_sqi8(num_tokens = num_tokens,
                                            model_dim = 3584, inter_dim = 1280,
@@ -1069,6 +1074,8 @@ if __name__ == "__main__":
         sys.exit(0)
     
     #test_fmoe_sqi8(num_tokens = 2048, model_dim = 3584, inter_dim = 1280, num_experts = 384, topk = 8,  use_smoothquant=1, shared_smoothquant_up=0)
+    
+    #CUDAPERF=0 TEST_MOE_MODE=g1u1 python test_smoothquant.py
     test_fmoe_sqi8_g1u1(num_tokens = 2048, model_dim = 3584, inter_dim = 1280, num_experts = 384, topk = 8,  use_smoothquant=1, shared_smoothquant_up=0)
 
     #test_fmoe_sqi8(num_tokens = 40960, model_dim = 4096, inter_dim = 1536, num_experts = 400, topk = 20)
