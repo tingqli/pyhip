@@ -13,7 +13,35 @@ import os
 os.environ["PYHIP_SIMPLE_GEN_FILENAME"] = "1"
 
 import pyhip
+from pyhip.core.asmjit import JIT
 from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
+import pytest
+import gc
+
+# fused_moe_gelu_sqi8 -> moe_gemm_jit uses wg_M=wg_N=256; moe_gemm_8wave_gelu ping-pong LDS
+_MOE_GEMM_JIT_WG_M = 256
+_MOE_GEMM_JIT_WG_N = 256
+_MOE_GEMM_JIT_BLOCK_K = 128  # bytes
+_MOE_GEMM_SQI8_LDS_BYTES = (
+    (_MOE_GEMM_JIT_WG_M // 2) * _MOE_GEMM_JIT_BLOCK_K * 4
+    + (_MOE_GEMM_JIT_WG_N // 2) * _MOE_GEMM_JIT_BLOCK_K * 4
+)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _select_cuda_device():
+    pyhip.set_device()
+    torch.set_default_device(None)
+    gc.collect()
+    torch.cuda.empty_cache()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _cuda_cleanup_after_test():
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def div_up(x, y):
     return (x + y - 1) // y
@@ -575,13 +603,25 @@ def fused_moe_gelu_sq_mxfp4(
 
     return moe_out
 
+
+@pytest.mark.parametrize("num_experts, topk", [(800, 25), (400, 20)])
+@pytest.mark.parametrize("num_tokens", [20480, 19147])
+@pytest.mark.parametrize("use_smoothquant, shared_smoothquant_up", [(1, 0), (1, 1), (0, 0)])
+@pytest.mark.parametrize("model_dim", [4096])
+@pytest.mark.parametrize("inter_dim", [1536])
 def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoothquant, shared_smoothquant_up):
+    lds_limit = JIT().lds_size_limit
+    if _MOE_GEMM_SQI8_LDS_BYTES > lds_limit:
+        pytest.skip(
+            f"Skipping test_fmoe_sqi8 on {get_gfx()}: "
+            f"moe_gemm_8wave_gelu needs {_MOE_GEMM_SQI8_LDS_BYTES}B LDS, limit is {lds_limit}B"
+        )
     device = "cuda"
 
     x0 = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16, device=device)
 
-    w1_f32 = torch.randn(num_experts, inter_dim, model_dim, dtype=torch.float32)
-    w2_f32 = torch.randn(num_experts, model_dim, inter_dim, dtype=torch.float32)
+    w1_f32 = torch.randn(num_experts, inter_dim, model_dim, dtype=torch.float32, device=device)
+    w2_f32 = torch.randn(num_experts, model_dim, inter_dim, dtype=torch.float32, device=device)
 
     if use_smoothquant:
         if shared_smoothquant_up:
@@ -598,10 +638,12 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
     w1,fc1_scale = smooth_quant_w_i8(w1_f32, fc1_smooth_scale)
     w2,fc2_scale = smooth_quant_w_i8(w2_f32, fc2_smooth_scale)
 
-    w1_mxfp4,fc1_scale_mxfp4 = smooth_quant_w_mxfp4(w1_f32, fc1_smooth_scale)
-    w2_mxfp4,fc2_scale_mxfp4 = smooth_quant_w_mxfp4(w2_f32, fc2_smooth_scale)
+    w1_mxfp4 = fc1_scale_mxfp4 = w2_mxfp4 = fc2_scale_mxfp4 = None
+    if 0:  # mxfp4 path disabled below (if 1: ret_fp4 = None)
+        w1_mxfp4, fc1_scale_mxfp4 = smooth_quant_w_mxfp4(w1_f32, fc1_smooth_scale)
+        w2_mxfp4, fc2_scale_mxfp4 = smooth_quant_w_mxfp4(w2_f32, fc2_smooth_scale)
 
-    router_weights = torch.randn(num_tokens, num_experts, dtype=torch.float32)
+    router_weights = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
     ret_topk = torch.topk(router_weights, topk)
     x1 = ret_topk.values.to(torch.float32)
     x2 = ret_topk.indices.to(torch.int32)
@@ -634,6 +676,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
                      fc2_smooth_scale.expand(num_experts,-1,-1),
                      activation=ActivationType.Gelu)
     # ref2 = moe_smoothquant_gelu_ref(x0, w1, w2, x1, x2, fc1_scale, fc2_scale, fc1_smooth_scale.expand(num_experts, -1, -1), fc2_smooth_scale)
+    del w1_f32, w2_f32, router_weights
 
     num_flops = num_tokens * topk * model_dim * inter_dim * 2 * 2
     ret_i8, dt_i8 = pyhip.run_perftest(
@@ -739,6 +782,12 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk, use_smoo
         print(f"\t{pyhip.calc_diff(ref0, ret_fp4)=:.6f}  {dt_fp4:.0f} us")
         print(f"\t{pyhip.calc_diff(ref1, ret_fp4, -0.01)=:.6f}  {dt_fp4:.0f} us")
 
+    del ref0, ref1
+    del ret_i8, dt_i8
+    del ret_i8q, dt_i8q
+    del ret_fp4, dt_fp4
+    del ret_asm, dt_asm
+
     return ret
 
 if __name__ == "__main__":
@@ -747,8 +796,11 @@ if __name__ == "__main__":
     if 1:
         summary = []
         for num_experts, topk in [(800, 25), (400, 20)]:
-            for num_tokens in [40960, 20480, 19147]:
+            # for num_tokens in [40960, 20480, 19147]:
+            # (TODO) Xiake: 40960 cause 4GB OOM issue during python compilation, skip it first, need to double check
+            for num_tokens in [20480, 19147]:
                 for use_smoothquant, shared_smooth_up in [(1, 0), (1, 1), (0, 0)]:
+                    # print(f"num_experts: {num_experts}, topk: {topk}, num_tokens: {num_tokens}, use_smoothquant: {use_smoothquant}, shared_smooth_up: {shared_smooth_up}")
                     ret = test_fmoe_sqi8(num_tokens = num_tokens,
                                        model_dim = 4096, inter_dim = 1536,
                                        num_experts = num_experts,

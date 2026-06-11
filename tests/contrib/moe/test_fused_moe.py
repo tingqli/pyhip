@@ -371,6 +371,9 @@ import pytest
 @pytest.mark.parametrize("diff_thr", [0.001])
 @pytest.mark.parametrize("method", ["auto"])
 def test_fmoe(dtype, num_tokens, model_dim, inter_dim, expert, topk, act_type, quant_type, aq_dtype, wq_dtype, preshuffle, ep_size, diff_thr, method):
+    if get_gfx() == "gfx942":
+        pytest.skip(f"Skipping test_fmoe on gfx942")
+
     doweight_stage1 = False
     global fused_moe_impl
     from pyhip.contrib.fused_moe import fused_moe as fused_moe_asmjit

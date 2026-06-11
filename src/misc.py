@@ -207,8 +207,14 @@ def run_perftest(kernel, *args, **kwargs):
             if isinstance(kwargs[k], torch.Tensor):
                 #print(kwargs[k].shape, kwargs[k].dtype)
                 copy_size += kwargs[k].numel() * kwargs[k].element_size()
-        # up-to 4GB
-        num_copies = max(int(4e9 / copy_size), num_warmup + num_iters)
+        # cap total deep-copied size to ~4 GB so large MoE weights cause OOM
+        # NOTE: previous formula was `max(int(4e9 / copy_size), num_warmup + num_iters)`,
+        #       which silently fell back to 12 copies whenever copy_size > 4 GB and ignored
+        #       the 4 GB cap entirely (causing OOM MoE tests).
+        if copy_size > 0:
+            num_copies = min(num_warmup + num_iters, max(int(4e9 / copy_size), 1))
+        else:
+            num_copies = num_warmup + num_iters
 
     args_copies = []
     kwarg_copies = []
