@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 import torch
 from functools import cache
@@ -319,15 +320,22 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
         bl_lds = fx.make_view(lds.bl_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))))
         br_lds = fx.make_view(lds.br_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))))
 
-        uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
-        ab_lds_cp_layout_g2r = fx.make_tiled_copy(uni_cp_atom,
+        uni_cp_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+        # mi308 32bit写入延迟为8cycle，可以被16x16mfma的16cycle隐藏；128bit写入延迟为20cycle
+        uni_cp_atom_w = fx.make_copy_atom(fx.UniversalCopy32b(), fx.BFloat16)
+        ab_lds_cp_layout_r2s = fx.make_tiled_copy(uni_cp_atom_w,
                                                   # 线程划分[8 * 4 wave, 8]
                                                   fx.make_layout(((8, 8, 4), 8), ((256, 1, 8), 32)),
                                                   fx.make_tile(8 * 4, TILE_K))
-        at_lds_tensor_thr_w = ab_lds_cp_layout_g2r.get_slice(tid).partition_D(at_lds)
-        ab_lds_tensor_thr_w = ab_lds_cp_layout_g2r.get_slice(tid).partition_D(ab_lds)
-        bl_lds_tensor_thr_w = ab_lds_cp_layout_g2r.get_slice(tid).partition_D(bl_lds)
-        br_lds_tensor_thr_w = ab_lds_cp_layout_g2r.get_slice(tid).partition_D(br_lds)
+        at_lds_tensor_thr_w = ab_lds_cp_layout_r2s.get_slice(tid).partition_D(at_lds)
+        ab_lds_tensor_thr_w = ab_lds_cp_layout_r2s.get_slice(tid).partition_D(ab_lds)
+        bl_lds_tensor_thr_w = ab_lds_cp_layout_r2s.get_slice(tid).partition_D(bl_lds)
+        br_lds_tensor_thr_w = ab_lds_cp_layout_r2s.get_slice(tid).partition_D(br_lds)
+
+        at_cp_frag_retile = ab_lds_cp_layout_r2s.get_slice(tid).retile(at_cp_frag)
+        ab_cp_frag_retile = ab_lds_cp_layout_r2s.get_slice(tid).retile(ab_cp_frag)
+        bl_cp_frag_retile = ab_lds_cp_layout_r2s.get_slice(tid).retile(bl_cp_frag)
+        br_cp_frag_retile = ab_lds_cp_layout_r2s.get_slice(tid).retile(br_cp_frag)
 
         # lds -> reg layout
         tiled_mma = fx.make_tiled_mma(
@@ -339,20 +347,20 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
         )
         # fx.utils.print_typst(tiled_mma, file="layout_tiled_mma.typ")
 
-        at_lds_tensor_thr_r = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(at_lds)
-        ab_lds_tensor_thr_r = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(ab_lds)
-        bl_lds_tensor_thr_r = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(bl_lds)
-        br_lds_tensor_thr_r = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(br_lds)
+        at_lds_tensor_thr_r = fx.make_tiled_copy_A(uni_cp_atom_r, tiled_mma).get_slice(tid).partition_S(at_lds)
+        ab_lds_tensor_thr_r = fx.make_tiled_copy_A(uni_cp_atom_r, tiled_mma).get_slice(tid).partition_S(ab_lds)
+        bl_lds_tensor_thr_r = fx.make_tiled_copy_B(uni_cp_atom_r, tiled_mma).get_slice(tid).partition_S(bl_lds)
+        br_lds_tensor_thr_r = fx.make_tiled_copy_B(uni_cp_atom_r, tiled_mma).get_slice(tid).partition_S(br_lds)
 
         at_frag = tiled_mma.make_fragment_A(at_lds)
         ab_frag = tiled_mma.make_fragment_A(ab_lds)
         bl_frag = tiled_mma.make_fragment_B(bl_lds)
         br_frag = tiled_mma.make_fragment_B(br_lds)
 
-        at_frag_retile = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).retile(at_frag)
-        ab_frag_retile = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).retile(ab_frag)
-        bl_frag_retile = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).retile(bl_frag)
-        br_frag_retile = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).retile(br_frag)
+        at_frag_retile = fx.make_tiled_copy_A(uni_cp_atom_r, tiled_mma).get_slice(tid).retile(at_frag)
+        ab_frag_retile = fx.make_tiled_copy_A(uni_cp_atom_r, tiled_mma).get_slice(tid).retile(ab_frag)
+        bl_frag_retile = fx.make_tiled_copy_B(uni_cp_atom_r, tiled_mma).get_slice(tid).retile(bl_frag)
+        br_frag_retile = fx.make_tiled_copy_B(uni_cp_atom_r, tiled_mma).get_slice(tid).retile(br_frag)
 
         c_tl_frag = fx.select(tiled_mma.make_fragment_C(c_tl_tile), [0, 2, 1])
         c_tr_frag = fx.select(tiled_mma.make_fragment_C(c_tr_tile), [0, 2, 1])
@@ -373,35 +381,60 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
         fx.copy(buf_cp_atom_r, ab_mem_tensor_thr[None, None, None, 0], ab_cp_frag)
         fx.copy(buf_cp_atom_r, br_mem_tensor_thr[None, None, None, 0], br_cp_frag)
         # lw0: all
-        fx.copy(uni_cp_atom, bl_cp_frag, bl_lds_tensor_thr_w)
-        fx.copy(uni_cp_atom, at_cp_frag, at_lds_tensor_thr_w)
-        fx.copy(uni_cp_atom, ab_cp_frag, ab_lds_tensor_thr_w)
-        fx.copy(uni_cp_atom, br_cp_frag, br_lds_tensor_thr_w)
+        fx.copy(uni_cp_atom_w, bl_cp_frag_retile, bl_lds_tensor_thr_w)
+        fx.copy(uni_cp_atom_w, at_cp_frag_retile, at_lds_tensor_thr_w)
+        fx.copy(uni_cp_atom_w, ab_cp_frag_retile, ab_lds_tensor_thr_w)
+        fx.copy(uni_cp_atom_w, br_cp_frag_retile, br_lds_tensor_thr_w)
 
         # gr1: all
         fx.copy(buf_cp_atom_r, bl_mem_tensor_thr[None, None, None, 1], bl_cp_frag)
+        rocdl.sched_barrier(0)
         fx.copy(buf_cp_atom_r, at_mem_tensor_thr[None, None, None, 1], at_cp_frag)
+        rocdl.sched_barrier(0)
         fx.copy(buf_cp_atom_r, ab_mem_tensor_thr[None, None, None, 1], ab_cp_frag)
+        rocdl.sched_barrier(0)
         fx.copy(buf_cp_atom_r, br_mem_tensor_thr[None, None, None, 1], br_cp_frag)
+        rocdl.sched_barrier(0)
         gpu.barrier()
 
         # lr: bl0, at0
-        fx.copy(uni_cp_atom, bl_lds_tensor_thr_r, bl_frag_retile)
-        fx.copy(uni_cp_atom, at_lds_tensor_thr_r, at_frag_retile)
+        fx.copy(uni_cp_atom_r, bl_lds_tensor_thr_r, bl_frag_retile)
+        fx.copy(uni_cp_atom_r, at_lds_tensor_thr_r, at_frag_retile)
+        rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
 
-        def hot_loop_scheduler():
+        mem_b_half_cnt = bl_cp_frag.load().numel * fx.BFloat16.width // 8 // 16
+        mem_a_half_cnt = at_cp_frag.load().numel * fx.BFloat16.width // 8 // 16
+        lds_b_half_cnt = bl_frag.load().numel * fx.BFloat16.width // 8 // 16
+        lds_a_half_cnt = at_frag.load().numel * fx.BFloat16.width // 8 // 16
+        def hot_loop_scheduler(vmem_cnt, dsrd_cnt):
             if const_expr(is_gfx942):
-                for _ in range_constexpr(4):
-                    rocdl.sched_dswr(1)
-                    rocdl.sched_mfma(4)
-                for _ in range_constexpr(4):
-                    rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(4)
-                for _ in range_constexpr(8):
-                    rocdl.sched_mfma(1)
-                    rocdl.sched_dsrd(1)
-                rocdl.sched_mfma(64 - 16 - 16 - 8)
-
+                mfma_cnt = (TILE_M // 2 // 2 // 16) * (TILE_M // 2 // 2 // 16) * (TILE_K // 16)
+                dswr_cnt = vmem_cnt
+                if const_expr(TILE_M == 256 and TILE_N == 256):
+                    rocdl.sched_mfma(2)
+                    # ds write按照32bit计算
+                    for _ in range_constexpr(dswr_cnt * 4):
+                        rocdl.sched_dswr(1)
+                        rocdl.sched_mfma(2)
+                    for _ in range_constexpr(vmem_cnt):
+                        rocdl.sched_vmem(1)
+                        rocdl.sched_mfma(4)
+                    for _ in range_constexpr(dsrd_cnt):
+                        rocdl.sched_dsrd(1)
+                        rocdl.sched_mfma(2)
+                    rocdl.sched_mfma(mfma_cnt - 2 - dsrd_cnt * 2 - vmem_cnt * 4 - dswr_cnt * 8)
+                else:
+                    for _ in range_constexpr(dswr_cnt):
+                        rocdl.sched_dswr(1)
+                        rocdl.sched_mfma(2)
+                        rocdl.sched_vmem(1)
+                        rocdl.sched_mfma(2)
+                    # for _ in range_constexpr(vmem_cnt):
+                    #     rocdl.sched_mfma(4)
+                    for _ in range_constexpr(dsrd_cnt):
+                        rocdl.sched_dsrd(1)
+                        rocdl.sched_mfma(1)
+                    rocdl.sched_mfma(mfma_cnt - dsrd_cnt - vmem_cnt * 4 - dswr_cnt * 0)
         assert K // TILE_K >= 2, "this kernel requires at least 2 iterations"
         for k, state in range(0, K // TILE_K - 0, 1, init=acc_init):
             c_tl_frag.store(state[0])
@@ -411,55 +444,55 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
             k_i32 = fx.Int32(k)
 
             # bl0 @ at0
-            for sub_k in range_constexpr(TILE_K // 32):
-                fx.gemm(tiled_mma, c_tl_frag, bl_frag[None, None, (None, sub_k)], at_frag[None, None, (None, sub_k)], c_tl_frag)
+            fx.gemm(tiled_mma, c_tl_frag, bl_frag, at_frag, c_tl_frag)
             # lw: bl1
-            fx.copy(uni_cp_atom, bl_cp_frag, bl_lds_tensor_thr_w)
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_a_half_cnt + mem_a_half_cnt + mem_b_half_cnt))
+            fx.copy(uni_cp_atom_w, bl_cp_frag_retile, bl_lds_tensor_thr_w)
             # gr: bl2
             fx.copy(buf_cp_atom_r, bl_mem_tensor_thr[None, None, None, k_i32 + 2], bl_cp_frag)
             # lr: ab0
             gpu.barrier()
-            fx.copy(uni_cp_atom, ab_lds_tensor_thr_r, ab_frag_retile)
-            hot_loop_scheduler()
+            fx.copy(uni_cp_atom_r, ab_lds_tensor_thr_r, ab_frag_retile)
+            hot_loop_scheduler(mem_b_half_cnt, lds_a_half_cnt)
             rocdl.sched_barrier(0)
 
             # bl0 @ ab0
-            for sub_k in range_constexpr(TILE_K // 32):
-                fx.gemm(tiled_mma, c_bl_frag, bl_frag[None, None, (None, sub_k)], ab_frag[None, None, (None, sub_k)], c_bl_frag)
+            fx.gemm(tiled_mma, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
             # lw: at1
-            fx.copy(uni_cp_atom, at_cp_frag, at_lds_tensor_thr_w)
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_a_half_cnt + mem_b_half_cnt + mem_b_half_cnt))
+            fx.copy(uni_cp_atom_w, at_cp_frag_retile, at_lds_tensor_thr_w)
             # gr: at2
             fx.copy(buf_cp_atom_r, at_mem_tensor_thr[None, None, None, k_i32 + 2], at_cp_frag)
             # lr: br0
             gpu.barrier()
-            fx.copy(uni_cp_atom, br_lds_tensor_thr_r, br_frag_retile)
-            hot_loop_scheduler()
+            fx.copy(uni_cp_atom_r, br_lds_tensor_thr_r, br_frag_retile)
+            hot_loop_scheduler(mem_a_half_cnt, lds_b_half_cnt)
             rocdl.sched_barrier(1)
 
             # br0 @ at0
-            for sub_k in range_constexpr(TILE_K // 32):
-                fx.gemm(tiled_mma, c_tr_frag, br_frag[None, None, (None, sub_k)], at_frag[None, None, (None, sub_k)], c_tr_frag)
+            fx.gemm(tiled_mma, c_tr_frag, br_frag, at_frag, c_tr_frag)
             # lw: ab1
-            fx.copy(uni_cp_atom, ab_cp_frag, ab_lds_tensor_thr_w)
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_b_half_cnt + mem_b_half_cnt + mem_a_half_cnt))
+            fx.copy(uni_cp_atom_w, ab_cp_frag_retile, ab_lds_tensor_thr_w)
             # gr: ab2
             fx.copy(buf_cp_atom_r, ab_mem_tensor_thr[None, None, None, k_i32 + 2], ab_cp_frag)
             # lr: bl1
             gpu.barrier()
-            fx.copy(uni_cp_atom, bl_lds_tensor_thr_r, bl_frag_retile)
-            hot_loop_scheduler()
+            fx.copy(uni_cp_atom_r, bl_lds_tensor_thr_r, bl_frag_retile)
+            hot_loop_scheduler(mem_a_half_cnt, lds_b_half_cnt)
             rocdl.sched_barrier(2)
 
             # br0 @ ab0
-            for sub_k in range_constexpr(TILE_K // 32):
-                fx.gemm(tiled_mma, c_br_frag, br_frag[None, None, (None, sub_k)], ab_frag[None, None, (None, sub_k)], c_br_frag)
+            fx.gemm(tiled_mma, c_br_frag, br_frag, ab_frag, c_br_frag)
             # lw: br1
-            fx.copy(uni_cp_atom, br_cp_frag, br_lds_tensor_thr_w)
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_b_half_cnt + mem_a_half_cnt + mem_a_half_cnt))
+            fx.copy(uni_cp_atom_w, br_cp_frag_retile, br_lds_tensor_thr_w)
             # gr: br2
             fx.copy(buf_cp_atom_r, br_mem_tensor_thr[None, None, None, k_i32 + 2], br_cp_frag)
             # lr: at1
             gpu.barrier()
-            fx.copy(uni_cp_atom, at_lds_tensor_thr_r, at_frag_retile)
-            hot_loop_scheduler()
+            fx.copy(uni_cp_atom_r, at_lds_tensor_thr_r, at_frag_retile)
+            hot_loop_scheduler(mem_b_half_cnt, lds_a_half_cnt)
             rocdl.sched_barrier(3)
 
             results = yield [c_tl_frag.load(), c_tr_frag.load(), c_bl_frag.load(), c_br_frag.load()]
@@ -923,6 +956,58 @@ def _run_batch(num_warps, kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=1
             tflops_res.append(p.tflops())
             latencies.append(p.dt())
             bw.append(p.bw())
+    elif kernel_type == 'fly':
+        sa = sb = torch.empty(0, dtype=torch.float32)
+        def _make_args(c, a, b_shuf, M, N, include_bias=False):
+            args = [
+                c.view(-1),
+                a.view(-1),
+                b_shuf.view(-1),
+                sa,
+                sb,
+            ]
+            if include_bias:
+                args.append(torch.empty(0, device=c.device, dtype=c.dtype))
+            args.extend([M, N, torch.cuda.current_stream()])
+            return tuple(args)
+        torch_out_dtype = torch.bfloat16
+        c = torch.zeros(M, N, dtype=torch_out_dtype)
+        args = _make_args(c, A[0], w[0], M, N)
+
+        hints = {}
+
+        import time
+        repo_dir = os.path.dirname(os.path.abspath(flydsl.__file__))
+        sys.path.insert(0, f'{repo_dir}/../../')
+        from kernels.preshuffle_gemm_v2 import compile_preshuffle_gemm_v2  # noqa: E402
+
+        t0 = time.time()
+        TILE_M = 64   # 128
+        TILE_N = 256  # 128
+        TILE_K = 128  # 64
+        fn_v2 = compile_preshuffle_gemm_v2(
+            N=N,
+            K=K,
+            tile_m=TILE_M,
+            tile_n=TILE_N,
+            tile_k=TILE_K,
+            in_dtype='bf16',
+            out_dtype='bf16',
+            waves_per_eu=None,
+            enable_scheduler=True,
+        )
+        _compiled_v2 = flyc.compile[hints](fn_v2, *args) if hints else flyc.compile(fn_v2, *args)
+
+        # fly needs preshuffle weights and scales for fp4
+        i = 0
+        for _ in range(run_count):
+            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
+                gemm_out = torch.empty([M, N], dtype=A.dtype, device=A.device)
+                _compiled_v2(gemm_out.view(-1), A[i].view(-1), w[i].view(-1), sa, sb, M, N, torch.cuda.current_stream())
+            i = (i + 1) % BUF_COPY
+            tflops_res.append(p.tflops())
+            latencies.append(p.dt())
+            bw.append(p.bw())
     else:
         def _as_i8(t):
             return t.view(torch.int8) if "float8" in str(t.dtype) else t
@@ -1074,10 +1159,10 @@ if __name__ == '__main__':
 
     #TILE_M = 16
     #TILE_N = 128
-    N, K = 4096*1, 1024*8 # 4096*8*2 /128 = 512
+    N, K = 256*10*2, 1024*8 # 4096*8*2 /128 = 512
     #N, K = 64*1024*1, 1024*16
     Ms = [16, 32, 64, 128, 256]
-    Ms = [4096,] # 64, 128]
+    Ms = [256*8*2,] # 64, 128]
     #Ms = [13, 64, 257, 1024, 4096, 4096*2, 4096*4]
     # N, K = 64*4, 256*4
     perf = {}
@@ -1121,8 +1206,9 @@ if __name__ == '__main__':
         #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
         # perf = merge(perf, test_perf(num_warps=args.wave, alg='splitk', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
         perf = merge(perf, test_perf(num_warps=args.wave, alg='torch', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-        TILE_M, TILE_N = 256, 256
+        perf = merge(perf, test_perf(num_warps=args.wave, alg='fly', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+        TILE_M, TILE_N = 128*2, 128*2
         perf = merge(perf, test_perf(num_warps=args.wave, alg='4wave', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-        TILE_M, TILE_N = 256, 128
-        perf = merge(perf, test_perf(num_warps=args.wave, alg='8wave', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+        # TILE_M, TILE_N = 256, 128
+        # perf = merge(perf, test_perf(num_warps=args.wave, alg='8wave', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     show_perf(perf, dict_tile_mn)
