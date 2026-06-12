@@ -1,11 +1,11 @@
 import pyhip
-
+import torch
 from .common.loaders import tb_swizzle
 
 __all__ = ["gemm_kernel_slicing"]
 
 USE_GLUON_SWIZZLE = 0
-
+USE_LDS_STORE = 0
 
 # def get_pids(
 #     M,
@@ -441,9 +441,21 @@ def gemm_kernel_slicing(
     # lds_soff_precal = J.gpr(2, 4, 4, "vu32")
     # ping prefetch
     # AC B0 to ping
+    if USE_LDS_STORE:
+        def swizzle(row, col, max_cols):
+            return (col ^ (row)) % max_cols
+    if USE_LDS_STORE:
+        lane_mod_16 = J.lane_id % 16
+        lane_div_16 = J.lane_id // 16
     J.emit(vm_load_b(0, lds_soff_precal[0, 0], buff_b, koffset_b))
     # AC A0 to ping
     J.emit(vm_load_a(0, lds_soff_precal[0, 1], buff_a, koffset_a))
+    if USE_LDS_STORE:
+        lane_mod_8 = J.lane_id % 8
+        lane_div_8 = J.lane_id // 8
+        mfma_C_bf16 = J.gpr(slice_nrM, slice_nrN, 2, "vf32")
+        vlds_wr_addr = J.gpr(slice_nrM, slice_nrN, "vu32")
+        vlds_rd_addr = J.gpr(slice_nrM * 2, "vu32")
     # AC A1 to ping
     J.emit(vm_load_a(1, lds_soff_precal[0, 2], buff_a, koffset_a))
     # AC B1 to ping
@@ -455,18 +467,38 @@ def gemm_kernel_slicing(
 
     # pong prefetch
     # AC B0 to pong
-    J.emit(vm_load_b(0, lds_soff_precal[1, 0], buff_b, koffset_b))
+    b0_emit = vm_load_b(0, lds_soff_precal[1, 0], buff_b, koffset_b)
     # AC A0 to pong
-    J.emit(vm_load_a(0, lds_soff_precal[1, 1], buff_a, koffset_a))
+    a0_emit = vm_load_a(0, lds_soff_precal[1, 1], buff_a, koffset_a)
     # AC A1 to pong
-    J.emit(vm_load_a(1, lds_soff_precal[1, 2], buff_a, koffset_a))
+    a1_emit = vm_load_a(1, lds_soff_precal[1, 2], buff_a, koffset_a)
     # AC B1 to pong
-    J.emit(vm_load_b(1, lds_soff_precal[1, 3], buff_b, koffset_b))
-
+    b1_emit = vm_load_b(1, lds_soff_precal[1, 3], buff_b, koffset_b)
+    
+    if USE_LDS_STORE:
+        J.emit([b0_emit, a0_emit, a1_emit, b1_emit], 1)
+        J.emit([b0_emit, a0_emit, a1_emit, b1_emit], 1)
+        for m in range(slice_nrM):
+            wr_row = J.warp_id * 64 + m * 16 + lane_mod_16
+            for n in range(0, slice_nrN, 1):
+                J.emit([b0_emit, a0_emit, a1_emit, b1_emit], 1)
+                J.emit([b0_emit, a0_emit, a1_emit, b1_emit], 1)
+                col = n * 4 + lane_div_16
+                wr_col = col // 2
+                wr_off = col % 2
+                swizzle_wr_col = swizzle(lane_mod_16, wr_col, 8)
+                vlds_wr_addr[m, n] = wr_row * 128 + (swizzle_wr_col * 2 + wr_off) * 8
+    J.emit([b0_emit, a0_emit, a1_emit, b1_emit])
+    
     # A, B advance BK
     buff_a.advance(s_offset_inc_a[0])
     buff_b.advance(s_offset_inc_b[0])
-
+    if USE_LDS_STORE:
+        for m in range(slice_nrM * 2):
+            rd_row = J.warp_id * 64 + m * 8 + lane_div_8
+            rd_col = lane_mod_8
+            swizzle_rd_col = swizzle(rd_row % 16, rd_col, 8)
+            vlds_rd_addr[m] = rd_row * 128 + swizzle_rd_col * 16
     # readiness: B0 and A0 to LDS0
     J.s_waitcnt(mod=f"vmcnt({24})")
     J.s_barrier()
@@ -614,8 +646,8 @@ def gemm_kernel_slicing(
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 48)
 
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         buff_b.advance(s_offset_inc_b[0])
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         J.s_barrier()
@@ -710,7 +742,10 @@ def gemm_kernel_slicing(
     J.emit(mfma_a1b1_k1, 16)
     J.s_barrier()
     J.emit(mfma_a1b1_k1, 16)
-
+    for lds in ldsA0:
+        J.free_lds(lds)
+    for lds in ldsB0:
+        J.free_lds(lds)
     ####################################epologue 1:
     # epologue1 part 0:
 
@@ -739,7 +774,10 @@ def gemm_kernel_slicing(
     J.emit(mfma_a0b0_k0)
     J.emit(mfma_a0b0_k1)
     # part 1:
+    ldsCC = J.LDSTensor([4 * 64, 64], torch.bfloat16)
     J.s_waitcnt(mod=f"vmcnt({0}) lgkmcnt(0)")
+    for lds in ldsA1:
+        J.free_lds(lds)
     J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
     J.s_barrier()
     J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
@@ -763,139 +801,324 @@ def gemm_kernel_slicing(
     for n in range(slice_nrN):
         J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
         ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1)
-    for m in range(slice_nrM):
-        for n in range(0, slice_nrN, 2):
-            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[0], mfma_C[0, 0, m, n, 0], mfma_C[0, 0, m, n, 1]
-            )
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[1], mfma_C[0, 0, m, n, 2], mfma_C[0, 0, m, n, 3]
-            )
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[2], mfma_C[0, 0, m, n + 1, 0], mfma_C[0, 0, m, n + 1, 1]
-            )
-            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[3], mfma_C[0, 0, m, n + 1, 2], mfma_C[0, 0, m, n + 1, 3]
-            )
-            #    a0    a1   a2   a3   | 01 23
-            #    b0    b1   b2   b3   | 45 67
-            #  v_permlane16_swap_b32(a, b)
-            #    a0    b0   a2   b2   |
-            #    a1    b1   a3   b3   |
-            #
-            # swap of row 1 & 2 are done by swapping lane-address
-            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-            buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
-        vaddr[0] += 16 * stride_c
+    
+    if USE_LDS_STORE:
+        vaddr_org_bak = J.gpr(
+            (lane_div_8 + warp_nrM * 16) * stride_c
+            + lane_mod_8 * J.sizeof_DW4
+            + warp_nrN * 4 * J.sizeof_DW2
+            + blk_n * (wg_N * J.sizeof(C_dtype))
+        )
 
-    J.emit(mfma_a1b0_k0)
-    J.emit(mfma_a1b0_k1)
+        for m in range(slice_nrM):
+            for n in range(0, slice_nrN, 1):
+                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+                J.uni_cvt_pk_bf16_f32(
+                    mfma_C_bf16[m, n, 0],
+                    mfma_C[0, 0, m, n, 0],
+                    mfma_C[0, 0, m, n, 1],
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    mfma_C_bf16[m, n, 1],
+                    mfma_C[0, 0, m, n, 2],
+                    mfma_C[0, 0, m, n, 3],
+                )
+                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+                J.ds_write_b64(
+                    vlds_wr_addr[m, n],
+                    mfma_C_bf16[m, n],
+                    mod=f"offset:{ldsCC.lds_base}",
+                )
+        # J.s_waitcnt(mod=f"lgkmcnt(0)")
+        mfma_C_bf16_rd = J.gpr(slice_nrM * 2, 4, "vf32")
+
+        vaddr[0] = vaddr_org_bak[0]
+        for mm in range(slice_nrM * 2):
+            lds_cnt = slice_nrM * slice_nrN - (mm // 2 + 1) * slice_nrN
+            J.s_waitcnt(mod=f"lgkmcnt({lds_cnt})")
+            J.ds_read_b128(
+                mfma_C_bf16_rd[mm],
+                vlds_rd_addr[mm],
+                mod=f"offset:{ldsCC.lds_base}",
+            )
+        for mm in range(slice_nrM * 2):
+            J.s_waitcnt(mod=f"lgkmcnt({slice_nrM * 2 - mm - 1})")
+            J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+            buff_c.store_dwordx4(
+                mfma_C_bf16_rd[mm],
+                vaddr,
+                0,
+                offset12=0,
+            )
+            vaddr[0] += 8 * stride_c
+        J.emit(mfma_a1b0_k0)
+        J.emit(mfma_a1b0_k1)
+    else:
+        for m in range(slice_nrM):
+            for n in range(0, slice_nrN, 2):
+                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[0], mfma_C[0, 0, m, n, 0], mfma_C[0, 0, m, n, 1]
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[1], mfma_C[0, 0, m, n, 2], mfma_C[0, 0, m, n, 3]
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[2], mfma_C[0, 0, m, n + 1, 0], mfma_C[0, 0, m, n + 1, 1]
+                )
+                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[3], mfma_C[0, 0, m, n + 1, 2], mfma_C[0, 0, m, n + 1, 3]
+                )
+                #    a0    a1   a2   a3   | 01 23
+                #    b0    b1   b2   b3   | 45 67
+                #  v_permlane16_swap_b32(a, b)
+                #    a0    b0   a2   b2   |
+                #    a1    b1   a3   b3   |
+                #
+                # swap of row 1 & 2 are done by swapping lane-address
+                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+                buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
+            vaddr[0] += 16 * stride_c
+
+        J.emit(mfma_a1b0_k0)
+        J.emit(mfma_a1b0_k1)
     # part 2:
     J.s_waitcnt(mod=f"lgkmcnt(0)")
     J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-    vaddr[0] = vaddr_org[0] + stride_c * 128
-    for m in range(slice_nrM):
-        for n in range(0, slice_nrN, 2):
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[0], mfma_C[1, 0, m, n, 0], mfma_C[1, 0, m, n, 1]
-            )
-            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[1], mfma_C[1, 0, m, n, 2], mfma_C[1, 0, m, n, 3]
-            )
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[2], mfma_C[1, 0, m, n + 1, 0], mfma_C[1, 0, m, n + 1, 1]
-            )
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[3], mfma_C[1, 0, m, n + 1, 2], mfma_C[1, 0, m, n + 1, 3]
-            )
-            #    a0    a1   a2   a3   | 01 23
-            #    b0    b1   b2   b3   | 45 67
-            #  v_permlane16_swap_b32(a, b)S
-            #    a0    b0   a2   b2   |
-            #    a1    b1   a3   b3   |
-            #
-            # swap of row 1 & 2 are done by swapping lane-address
-            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-
-            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-            buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
-        vaddr[0] += 16 * stride_c
-    J.emit(mfma_a0b1_k0)
-    J.emit(mfma_a0b1_k1)
-    # part 3:
-    vaddr[0] = vaddr_org[0] + 256
-    J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-    for m in range(slice_nrM):
-        for n in range(0, slice_nrN, 2):
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[0], mfma_C[0, 1, m, n, 0], mfma_C[0, 1, m, n, 1]
-            )
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[1], mfma_C[0, 1, m, n, 2], mfma_C[0, 1, m, n, 3]
-            )
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[2], mfma_C[0, 1, m, n + 1, 0], mfma_C[0, 1, m, n + 1, 1]
-            )
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[3], mfma_C[0, 1, m, n + 1, 2], mfma_C[0, 1, m, n + 1, 3]
-            )
-            #    a0    a1   a2   a3   | 01 23
-            #    b0    b1   b2   b3   | 45 67
-            #  v_permlane16_swap_b32(a, b)S
-            #    a0    b0   a2   b2   |
-            #    a1    b1   a3   b3   |
-            #
-            # swap of row 1 & 2 are done by swapping lane-address
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-            J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-            buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
-        vaddr[0] += 16 * stride_c
-
-    J.emit(mfma_a1b1_k0)
-    J.emit(mfma_a1b1_k1)
-
-    for lds in ldsA0:
-        J.free_lds(lds)
-    for lds in ldsB0:
-        J.free_lds(lds)
-    for lds in ldsA1:
-        J.free_lds(lds)
     for lds in ldsB1:
         J.free_lds(lds)
+    if USE_LDS_STORE:
+        for m in range(slice_nrM):
+            for n in range(0, slice_nrN, 1):
+                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+                J.uni_cvt_pk_bf16_f32(
+                    mfma_C_bf16[m, n, 0],
+                    mfma_C[1, 0, m, n, 0],
+                    mfma_C[1, 0, m, n, 1],
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    mfma_C_bf16[m, n, 1],
+                    mfma_C[1, 0, m, n, 2],
+                    mfma_C[1, 0, m, n, 3],
+                )
+                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+                J.ds_write_b64(
+                    vlds_wr_addr[m, n],
+                    mfma_C_bf16[m, n],
+                    mod=f"offset:{ldsCC.lds_base}",
+                )
+        # J.s_waitcnt(mod=f"lgkmcnt(0)")
+        mfma_C_bf16_rd = J.gpr(slice_nrM * 2, 4, "vf32")
 
-    vaddr[0] = vaddr_org[0] + stride_c * 128 + 256
-    for m in range(slice_nrM):
-        for n in range(0, slice_nrN, 2):
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[0], mfma_C[1, 1, m, n, 0], mfma_C[1, 1, m, n, 1]
+        vaddr[0] = vaddr_org_bak[0] + +stride_c * 128
+        for mm in range(slice_nrM * 2):
+            lds_cnt = slice_nrM * slice_nrN - (mm // 2 + 1) * slice_nrN
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+            J.s_waitcnt(mod=f"lgkmcnt({lds_cnt})")
+            J.ds_read_b128(
+                mfma_C_bf16_rd[mm],
+                vlds_rd_addr[mm],
+                mod=f"offset:{ldsCC.lds_base}",
             )
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[1], mfma_C[1, 1, m, n, 2], mfma_C[1, 1, m, n, 3]
+        for mm in range(slice_nrM * 2):
+            J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+            J.s_waitcnt(mod=f"lgkmcnt({slice_nrM * 2 - mm - 1})")
+            buff_c.store_dwordx4(
+                mfma_C_bf16_rd[mm],
+                vaddr,
+                0,
+                offset12=0,
             )
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[2], mfma_C[1, 1, m, n + 1, 0], mfma_C[1, 1, m, n + 1, 1]
+            vaddr[0] += 8 * stride_c
+        J.emit(mfma_a0b1_k0)
+        J.emit(mfma_a0b1_k1)
+    else:
+        vaddr[0] = vaddr_org[0] + stride_c * 128
+        for m in range(slice_nrM):
+            for n in range(0, slice_nrN, 2):
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[0], mfma_C[1, 0, m, n, 0], mfma_C[1, 0, m, n, 1]
+                )
+                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[1], mfma_C[1, 0, m, n, 2], mfma_C[1, 0, m, n, 3]
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[2], mfma_C[1, 0, m, n + 1, 0], mfma_C[1, 0, m, n + 1, 1]
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[3], mfma_C[1, 0, m, n + 1, 2], mfma_C[1, 0, m, n + 1, 3]
+                )
+                #    a0    a1   a2   a3   | 01 23
+                #    b0    b1   b2   b3   | 45 67
+                #  v_permlane16_swap_b32(a, b)S
+                #    a0    b0   a2   b2   |
+                #    a1    b1   a3   b3   |
+                #
+                # swap of row 1 & 2 are done by swapping lane-address
+                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+
+                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+                buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
+            vaddr[0] += 16 * stride_c
+            J.emit(mfma_a0b1_k0)
+            J.emit(mfma_a0b1_k1)
+    # part 3:
+    if USE_LDS_STORE:
+        for m in range(slice_nrM):
+            for n in range(0, slice_nrN, 1):
+                J.emit(mfma_a1b1_k0, 16)
+                J.uni_cvt_pk_bf16_f32(
+                    mfma_C_bf16[m, n, 0],
+                    mfma_C[0, 1, m, n, 0],
+                    mfma_C[0, 1, m, n, 1],
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    mfma_C_bf16[m, n, 1],
+                    mfma_C[0, 1, m, n, 2],
+                    mfma_C[0, 1, m, n, 3],
+                )
+                J.ds_write_b64(
+                    vlds_wr_addr[m, n],
+                    mfma_C_bf16[m, n],
+                    mod=f"offset:{ldsCC.lds_base}",
+                )
+
+        mfma_C_bf16_rd = J.gpr(slice_nrM * 2, 4, "vf32")
+
+        vaddr[0] = vaddr_org_bak[0] + 256
+        for mm in range(slice_nrM * 2):
+            lds_cnt = slice_nrM * slice_nrN - (mm // 2 + 1) * slice_nrN
+            J.s_waitcnt(mod=f"lgkmcnt({lds_cnt})")
+            J.emit(mfma_a1b1_k1, 16)
+            # ldsCC.read("b128", mfma_C_bf16_rd[mm], rd_row, swizzle_rd_col * 8)
+            J.ds_read_b128(
+                mfma_C_bf16_rd[mm],
+                vlds_rd_addr[mm],
+                mod=f"offset:{ldsCC.lds_base}",
             )
-            J.uni_cvt_pk_bf16_f32(
-                vbf16[3], mfma_C[1, 1, m, n + 1, 2], mfma_C[1, 1, m, n + 1, 3]
+        # J.s_waitcnt(mod=f"lgkmcnt(0)")
+        for mm in range(slice_nrM * 2):
+            cnt = slice_nrM * 2 - mm - 1
+            J.s_waitcnt(mod=f"lgkmcnt({cnt})")
+            J.emit(mfma_a1b1_k1, 16)
+            buff_c.store_dwordx4(
+                mfma_C_bf16_rd[mm],
+                vaddr,
+                0,
+                offset12=0,
             )
-            #    a0    a1   a2   a3   | 01 23
-            #    b0    b1   b2   b3   | 45 67
-            #  v_permlane16_swap_b32(a, b)S
-            #    a0    b0   a2   b2   |
-            #    a1    b1   a3   b3   |
-            #
-            # swap of row 1 & 2 are done by swapping lane-address
-            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-            buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
-        vaddr[0] += 16 * stride_c
+            vaddr[0] += 8 * stride_c
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1])
+
+    else:
+        vaddr[0] = vaddr_org[0] + 256
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        for m in range(slice_nrM):
+            for n in range(0, slice_nrN, 2):
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[0], mfma_C[0, 1, m, n, 0], mfma_C[0, 1, m, n, 1]
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[1], mfma_C[0, 1, m, n, 2], mfma_C[0, 1, m, n, 3]
+                )
+                J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[2], mfma_C[0, 1, m, n + 1, 0], mfma_C[0, 1, m, n + 1, 1]
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[3], mfma_C[0, 1, m, n + 1, 2], mfma_C[0, 1, m, n + 1, 3]
+                )
+                #    a0    a1   a2   a3   | 01 23
+                #    b0    b1   b2   b3   | 45 67
+                #  v_permlane16_swap_b32(a, b)S
+                #    a0    b0   a2   b2   |
+                #    a1    b1   a3   b3   |
+                #
+                # swap of row 1 & 2 are done by swapping lane-address
+                J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+                buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
+            vaddr[0] += 16 * stride_c
+
+        J.emit(mfma_a1b1_k0)
+        J.emit(mfma_a1b1_k1)
+
+    # Tail store
+    if USE_LDS_STORE:
+        for m in range(slice_nrM):
+            for n in range(0, slice_nrN, 1):
+                J.uni_cvt_pk_bf16_f32(
+                    mfma_C_bf16[m, n, 0],
+                    mfma_C[1, 1, m, n, 0],
+                    mfma_C[1, 1, m, n, 1],
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    mfma_C_bf16[m, n, 1],
+                    mfma_C[1, 1, m, n, 2],
+                    mfma_C[1, 1, m, n, 3],
+                )
+
+        for mm in range(slice_nrM):
+            for nn in range(slice_nrN):
+                J.ds_write_b64(
+                    vlds_wr_addr[mm, nn],
+                    mfma_C_bf16[mm, nn],
+                    mod=f"offset:{ldsCC.lds_base}",
+                )
+        # J.s_waitcnt(mod=f"lgkmcnt(0)")
+        mfma_C_bf16_rd = J.gpr(slice_nrM * 2, 4, "vf32")
+
+        vaddr[0] = vaddr_org_bak[0] + stride_c * 128 + 256
+        for mm in range(slice_nrM * 2):
+            lds_cnt = slice_nrM * slice_nrN - (mm // 2 + 1) * slice_nrN
+            J.s_waitcnt(mod=f"lgkmcnt({lds_cnt})")
+            J.ds_read_b128(
+                mfma_C_bf16_rd[mm],
+                vlds_rd_addr[mm],
+                mod=f"offset:{ldsCC.lds_base}",
+            )
+        for mm in range(slice_nrM * 2):
+            J.s_waitcnt(mod=f"lgkmcnt({slice_nrM * 2 - mm - 1})")
+            buff_c.store_dwordx4(
+                mfma_C_bf16_rd[mm],
+                vaddr,
+                0,
+                offset12=0,
+            )
+            vaddr[0] += 8 * stride_c
+
+    else:
+        vaddr[0] = vaddr_org[0] + stride_c * 128 + 256
+        for m in range(slice_nrM):
+            for n in range(0, slice_nrN, 2):
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[0], mfma_C[1, 1, m, n, 0], mfma_C[1, 1, m, n, 1]
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[1], mfma_C[1, 1, m, n, 2], mfma_C[1, 1, m, n, 3]
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[2], mfma_C[1, 1, m, n + 1, 0], mfma_C[1, 1, m, n + 1, 1]
+                )
+                J.uni_cvt_pk_bf16_f32(
+                    vbf16[3], mfma_C[1, 1, m, n + 1, 2], mfma_C[1, 1, m, n + 1, 3]
+                )
+                #    a0    a1   a2   a3   | 01 23
+                #    b0    b1   b2   b3   | 45 67
+                #  v_permlane16_swap_b32(a, b)S
+                #    a0    b0   a2   b2   |
+                #    a1    b1   a3   b3   |
+                #
+                # swap of row 1 & 2 are done by swapping lane-address
+                J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
+            vaddr[0] += 16 * stride_c
