@@ -4,7 +4,7 @@ from .common.loaders import tb_swizzle
 
 __all__ = ["gemm_kernel_slicing"]
 
-USE_GLUON_SWIZZLE = 0
+USE_GLUON_SWIZZLE = 1
 
 
 # def get_pids(
@@ -528,7 +528,7 @@ def gemm_kernel_slicing(
         #
         # ISA interleaving:
         # ISAs number in each part of pipeline: MFMA ISAs:32, read_lds_b128:  8, vm_load: 4. others. The 32 MFMAs ISA would be distributed for each part:
-        #  4MFMA + 8x(read_lds + MFMA) + (s_addk_i32 + 2MFMA) + 4x(3MFMA+buffer_load+s_addk_i32) + 4xMFMA + (2xMFMA+barrier+s_waitcnt)
+        #  6MFMA + 8x(read_lds + MFMA)  + 4x(3MFMA+buffer_load+s_mov+1MFMA) +  (2xMFMA+barrier+s_waitcnt)
 
         # mainloop part 0:
         J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
@@ -599,7 +599,7 @@ def gemm_kernel_slicing(
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         vm_load = vm_load_b(1, lds_soff_precal[cur_lds, 3], buff_b, koffset_b)
 
-        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 64)
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 80)
         for m in range(slice_nrM):
             ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
@@ -612,10 +612,8 @@ def gemm_kernel_slicing(
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
             J.emit(vm_load, 1)
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 48)
-
-        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         buff_b.advance(s_offset_inc_b[0])
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         J.s_barrier()
@@ -713,7 +711,6 @@ def gemm_kernel_slicing(
 
     ####################################epologue 1:
     # epologue1 part 0:
-
     ####################################epologue 1:
     # part 0:
     mfma_a0b0_k0 = mfma(0, 0, 0)
