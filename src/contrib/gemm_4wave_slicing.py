@@ -144,7 +144,7 @@ def gemm_kernel_slicing(
     ts1 = J.gpr(2, "su32")
     ts2 = J.gpr(2, "su32")
     ts3 = J.gpr(2, "su32")
-    J.s_memtime(ts0)
+    J.s_memrealtime(ts0)
 
     pA[:] += blk_m * (wg_M * K * J.sizeof(A_dtype))
     pB[:] += blk_n * (wg_N * K * J.sizeof(B_dtype))
@@ -742,13 +742,13 @@ def gemm_kernel_slicing(
         koff = J.gpr("su32", 0)
         loop_cnt = ((K // wg_K) - 2) // 2
         kidx = 0
-        J.s_memtime(ts1)
+        J.s_memrealtime(ts1)
         with J.If(loop_cnt > 0):
             with J.dowhile(koff[0] < loop_cnt):
                 # unroll the ping-pong
                 loop_body(0)
                 koff[0] += 1
-    J.s_memtime(ts2)
+    J.s_memrealtime(ts2)
     ####################################epologue 0:
 
     mfma_a0b0_k0 = mfma(0, 0, 0)
@@ -1028,7 +1028,7 @@ def gemm_kernel_slicing(
             buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
         vaddr[0] += 16 * stride_c
 
-    J.s_memtime(ts3)
+    J.s_memrealtime(ts3)
     blk_id = J.gpr("su32", J.blockIdx.x[0])
     with J.If((blk_id[0] == 0) & (J.warp_id[0] == 0)):
         J.s_store_dwordx2(ts0, p_timestamps, 0, mod="glc")
