@@ -15,6 +15,10 @@ torch.set_default_device("cuda")
 torch.manual_seed(0)
 
 
+def u64_diff(newer, older):
+    return (int(newer) - int(older)) & ((1 << 64) - 1)
+
+
 @pytest.mark.parametrize("M", [32, 256, 2400])
 @pytest.mark.parametrize("N", [256, 256 * 6])
 @pytest.mark.parametrize("K", [256])
@@ -35,6 +39,7 @@ def test_accuracy(M, N, K, use_pre_shuffle=0):
         B = B0
 
     cur_out = torch.ones(M, N, dtype=torch.bfloat16)
+    timestamps = torch.zeros(4, dtype=torch.uint64)
 
     gemm_kernel_slicing(
         [blk_cnt],
@@ -48,6 +53,7 @@ def test_accuracy(M, N, K, use_pre_shuffle=0):
         A.data_ptr(),
         B.data_ptr(),
         cur_out.data_ptr(),
+        timestamps.data_ptr(),
         M,
     )
 
@@ -86,6 +92,7 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
         B = B0
 
     C = torch.zeros(M, N, dtype=torch.bfloat16)
+    timestamps = torch.zeros(4, dtype=torch.uint64)
 
     gemm_kernel_slicing(
         [blk_cnt],
@@ -99,6 +106,7 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
         A.data_ptr(),
         B.data_ptr(),
         C.data_ptr(),
+        timestamps.data_ptr(),
         M,
     )
 
@@ -123,10 +131,14 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
 
     A0s = [torch.clone(A0) for _ in range(DATA_CLONES)]
     B0s = [torch.clone(B0) for _ in range(DATA_CLONES)]
+    timestamps_list = [torch.zeros(4, dtype=torch.uint64) for _ in range(DATA_CLONES)]
 
     di = 0
     latency = []
     torch_latncy = []
+    pre_cycles = []
+    main_cycles = []
+    epilog_cycles = []
     for i in range(30):
         di = (di + 1) % DATA_CLONES
         with pyhip.cudaPerf(
@@ -144,8 +156,14 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
                 As[di].data_ptr(),
                 Bs[di].data_ptr(),
                 Cs[di].data_ptr(),
+                timestamps_list[di].data_ptr(),
                 M,
             )
+        # torch.cuda.synchronize()
+        t0, t1, t2, t3 = [x.item() for x in timestamps_list[di]]
+        pre_cycles.append(u64_diff(t1, t0))
+        main_cycles.append(u64_diff(t2, t1))
+        epilog_cycles.append(u64_diff(t3, t2))
         latency.append(p0.dt_ms)
     for i in range(30):
         di = (di + 1) % DATA_CLONES
@@ -172,6 +190,25 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
     print(f"ratio:{torch_latncy[0]/latency[0]}")
 
     print(f"{acc=}")
+
+    print("\nPer-run phase ratios (pre/main/epilog):")
+    for i, (pre, main, epilog) in enumerate(zip(pre_cycles, main_cycles, epilog_cycles), start=1):
+        total = pre + main + epilog
+        if total == 0:
+            continue
+        print(
+            f"  Run {i:2d}: {100.0*pre/total:6.2f}% / {100.0*main/total:6.2f}% / {100.0*epilog/total:6.2f}%"
+        )
+
+    avg_pre = sum(pre_cycles) / len(pre_cycles)
+    avg_main = sum(main_cycles) / len(main_cycles)
+    avg_epilog = sum(epilog_cycles) / len(epilog_cycles)
+    avg_total = avg_pre + avg_main + avg_epilog
+    print("\nAverage phase cycles:")
+    print(f"  pre:    {avg_pre:,.0f} ({100.0*avg_pre/avg_total:.2f}%)")
+    print(f"  main:   {avg_main:,.0f} ({100.0*avg_main/avg_total:.2f}%)")
+    print(f"  epilog: {avg_epilog:,.0f} ({100.0*avg_epilog/avg_total:.2f}%)")
+    print(f"  total:  {avg_total:,.0f}")
 
 
 if __name__ == "__main__":
