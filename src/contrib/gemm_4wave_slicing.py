@@ -485,13 +485,12 @@ def gemm_kernel_slicing(
         ds_read_a(ldsA0[0], mfma_A[0, 1, m], m, 1)
     mfma_C[...] = 0
 
-    # readiness: vm:AC A1[cur] to LDS[cur%2], lds:B0 and A0[cur] into reg
-    J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
-    J.s_barrier()
+
 
     ###################################main loop:
     # https://github.com/ROCm/gfx950-gluon-tutorials/tree/main/kernels/gemm/a16w16/v8_sliceMN
     def loop_body(idx):
+        # readiness: vm:AC A1[cur] to LDS[cur%2], lds:B0 and A0[cur] into reg
 
         cur_lds = idx % 2
         next_lds = (idx + 1) % 2
@@ -531,16 +530,18 @@ def gemm_kernel_slicing(
         #  6MFMA + 8x(read_lds + MFMA)  + 4x(3MFMA+buffer_load+s_mov+1MFMA) +  (2xMFMA+barrier+s_waitcnt)
 
         # mainloop part 0:
-        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
         vm_load = vm_load_b(0, lds_soff_precal[cur_lds, 0], buff_b, koffset_b)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 80)
+        J.s_waitcnt(mod=f"vmcnt({20})")
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+        J.s_barrier()
         for m in range(slice_nrM):
             ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
             J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
         for m in range(slice_nrM):
             ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
             J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-
         for _ in range(vm_load_cnt_b):
             J.emit(vm_load, 1)
             J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
@@ -548,14 +549,14 @@ def gemm_kernel_slicing(
             J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 48)
 
         J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-        J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
         J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
-        J.s_barrier()
-
         # mainloop part 1:
-        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
         vm_load = vm_load_a(0, lds_soff_precal[cur_lds, 1], buff_a, koffset_a)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 80)
+        J.s_waitcnt(mod=f"vmcnt({20})")
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+        J.s_barrier()
         for n in range(slice_nrN):
             ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
             J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
@@ -569,14 +570,14 @@ def gemm_kernel_slicing(
             J.emit(vm_load, 1)
             J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 48)
         J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-        J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
         J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
-        J.s_barrier()
-
         # mainloop part 2:
-        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
         vm_load = vm_load_a(1, lds_soff_precal[cur_lds, 2], buff_a, koffset_a)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 80)
+        J.s_waitcnt(mod=f"vmcnt({20})")
+        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+        J.s_barrier()
         for n in range(slice_nrN):
             ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
             J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
@@ -591,15 +592,15 @@ def gemm_kernel_slicing(
             J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 48)
         buff_a.advance(s_offset_inc_a[0])
         J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-        J.s_waitcnt(mod=f"vmcnt({20})")
         J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
-        J.s_barrier()
 
         # mainloop part 3:
-        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
         vm_load = vm_load_b(1, lds_soff_precal[cur_lds, 3], buff_b, koffset_b)
-
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 80)
+        J.s_waitcnt(mod=f"vmcnt({20})")
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+        J.s_barrier()
         for m in range(slice_nrM):
             ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
@@ -614,10 +615,8 @@ def gemm_kernel_slicing(
             J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 48)
         buff_b.advance(s_offset_inc_b[0])
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-        J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
         J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
-        J.s_barrier()
-        # endof mainloop
+
 
     if 0:
         for k_idx in range((K // wg_K) - 2):
@@ -641,74 +640,69 @@ def gemm_kernel_slicing(
     mfma_a0b1_k1 = mfma(0, 1, 1)
     mfma_a1b0_k1 = mfma(1, 0, 1)
     mfma_a1b1_k1 = mfma(1, 1, 1)
-
+    
     cur_lds = ((K // wg_K) - 2) % 2
     next_lds = (cur_lds + 1) % 2
+    
     # epologue0 part 0
-    J.emit([mfma_a0b0_k0], 16)
-    J.s_waitcnt(mod=f"vmcnt({20}) lgkmcnt(0)")
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
+    J.emit([mfma_a0b0_k0], 64)
+    J.s_waitcnt(mod=f"vmcnt({20})")
     J.emit([mfma_a0b0_k0], 16)
     J.s_barrier()
-    J.emit(mfma_a0b0_k0, 64)
+    J.emit(mfma_a0b0_k0, 16)
     for m in range(slice_nrM):
-        J.emit([mfma_a0b0_k0], 16)
         ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
     for m in range(slice_nrM):
-        J.emit([mfma_a0b0_k0], 16)
         ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
-    J.emit(mfma_a0b0_k0)
-    J.emit(mfma_a0b0_k1, 16 * (16 - 2))
-    J.s_waitcnt(mod=f"vmcnt({16}) lgkmcnt(0)")
-    J.emit(mfma_a0b0_k1, 16)
-    J.s_barrier()
-    J.emit(mfma_a0b0_k1, 16)
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+    J.emit([mfma_a0b0_k0, mfma_a0b0_k1])
 
     # epologue0 part 1:
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
     J.emit([mfma_a1b0_k0], 64)
+    J.s_waitcnt(mod=f"vmcnt({16})")
+    J.emit([mfma_a1b0_k0], 16)
+    J.s_barrier()
+    J.emit([mfma_a1b0_k0], 16)
     for n in range(slice_nrN):
-        J.emit([mfma_a1b0_k0], 16)
         ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
     for n in range(slice_nrN):
-        J.emit([mfma_a1b0_k0], 16)
         ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1)
-    J.emit(mfma_a1b0_k0)
-    J.emit(mfma_a1b0_k1, 16 * (16 - 2))
-    J.s_waitcnt(mod=f"vmcnt({12}) lgkmcnt(0)")
-    J.emit(mfma_a1b0_k1, 16)
-    J.s_barrier()
-    J.emit(mfma_a1b0_k1, 16)
-
+        J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)
+    J.emit([mfma_a1b0_k0, mfma_a1b0_k1])
+    
+    
     # epologue0 part 2:
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
     J.emit([mfma_a0b1_k0], 64)
-    for n in range(slice_nrN):
-        J.emit([mfma_a0b1_k0], 16)
-        ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
-    for n in range(slice_nrN):
-        J.emit([mfma_a0b1_k0], 16)
-        ds_read_b(ldsB0[next_lds], mfma_B[0, 1, n], n, 1)
-    J.emit(mfma_a0b1_k0)
-    J.emit(mfma_a0b1_k1, 16 * (16 - 2))
-
-    J.s_waitcnt(mod=f"vmcnt({8})")
-    J.emit(mfma_a0b1_k1, 16)
+    J.s_waitcnt(mod=f"vmcnt({12})")
+    J.emit([mfma_a0b1_k0], 16)
     J.s_barrier()
-    J.emit(mfma_a0b1_k1, 16)
+    J.emit([mfma_a0b1_k0], 16)
+    for n in range(slice_nrN):
+        ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
+        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+    for n in range(slice_nrN):
+        ds_read_b(ldsB0[next_lds], mfma_B[0, 1, n], n, 1)
+        J.emit([mfma_a0b1_k0, mfma_a0b1_k1], 16)
+    J.emit([mfma_a0b1_k0, mfma_a0b1_k1])
+
 
     # epologue0 part 3:
     J.emit([mfma_a1b1_k0], 64)
-    for m in range(slice_nrM):
-        J.emit([mfma_a1b1_k0], 16)
-        ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
-    for m in range(slice_nrM):
-        J.emit([mfma_a1b1_k0], 16)
-        ds_read_a(ldsA0[next_lds], mfma_A[0, 1, m], m, 1)
-    J.emit(mfma_a1b1_k0)
-    J.emit(mfma_a1b1_k1, 16 * (16 - 2))
-    J.s_waitcnt(mod=f"vmcnt({4}) lgkmcnt(0)")
-    J.emit(mfma_a1b1_k1, 16)
+    J.s_waitcnt(mod=f"vmcnt({8})")
+    J.emit([mfma_a1b1_k0], 16)
     J.s_barrier()
-    J.emit(mfma_a1b1_k1, 16)
-
+    for m in range(slice_nrM):
+        ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+    for m in range(slice_nrM):
+        ds_read_a(ldsA0[next_lds], mfma_A[0, 1, m], m, 1)
+        J.emit([mfma_a1b1_k0, mfma_a1b1_k1], 16)
+    J.emit([mfma_a1b1_k0, mfma_a1b1_k1])
     ####################################epologue 1:
     # epologue1 part 0:
     ####################################epologue 1:
@@ -723,18 +717,21 @@ def gemm_kernel_slicing(
     mfma_a1b1_k1 = mfma(1, 1, 1)
 
     cur_lds = next_lds
-    J.s_waitcnt(mod=f"vmcnt({4}) lgkmcnt(0)")
+
+    J.s_waitcnt(mod=f"lgkmcnt(0)")
+    J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 64)
+    J.s_waitcnt(mod=f"vmcnt({4})")
     J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
     J.s_barrier()
+    J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
 
     for m in range(slice_nrM):
-        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
         ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
-    for m in range(slice_nrM):
         J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+    for m in range(slice_nrM):
         ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
-    J.emit(mfma_a0b0_k0)
-    J.emit(mfma_a0b0_k1)
+        J.emit([mfma_a0b0_k0, mfma_a0b0_k1], 16)
+    J.emit([mfma_a0b0_k0, mfma_a0b0_k1])
     # part 1:
     J.s_waitcnt(mod=f"vmcnt({0}) lgkmcnt(0)")
     J.emit([mfma_a1b0_k0, mfma_a1b0_k1], 16)

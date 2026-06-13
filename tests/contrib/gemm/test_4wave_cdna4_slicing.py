@@ -152,20 +152,20 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
         with pyhip.cudaPerf(
             M * N * K * 2, (M * K * 2 + K * N * 2), name=f"torch_{di}"
         ) as p0:
-            # ref = torch.nn.functional.linear(A0s[di], B0s[di])
-            gemm_kernel(
-                [blk_cnt],
-                [4 * 64],
-                wg_M,
-                wg_N,
-                N,
-                K,
-                use_pre_shuffle,
-                As[di].data_ptr(),
-                Bs[di].data_ptr(),
-                Cs[di].data_ptr(),
-                M,
-            )
+            ref = torch.nn.functional.linear(A0s[di], B0s[di])
+            # # gemm_kernel(
+            #     [blk_cnt],
+            #     [4 * 64],
+            #     wg_M,
+            #     wg_N,
+            #     N,
+            #     K,
+            #     use_pre_shuffle,
+            #     As[di].data_ptr(),
+            #     Bs[di].data_ptr(),
+            #     Cs[di].data_ptr(),
+            #     M,
+            # )
         torch_latncy.append(p0.dt_ms)
     latency.sort()
     torch_latncy.sort()
