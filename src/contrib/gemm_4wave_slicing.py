@@ -735,10 +735,11 @@ def gemm_kernel_slicing(
         koff = J.gpr("su32", 0)
         loop_cnt = ((K // wg_K) - 2) // 2
         kidx = 0
-        with J.While(koff[0] < loop_cnt):
-            # unroll the ping-pong
-            loop_body(0)
-            koff[0] += 1
+        with J.If(loop_cnt > 0):
+            with J.dowhile(koff[0] < loop_cnt):
+                # unroll the ping-pong
+                loop_body(0)
+                koff[0] += 1
     ####################################epologue 0:
 
     mfma_a0b0_k0 = mfma(0, 0, 0)
