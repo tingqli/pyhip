@@ -658,10 +658,17 @@ class Buffer:
         self.base[1] = base[1]
         self.range[0] = size # size可以是GPRExpr
 
+    def get_base(self):
+        return self.base
+
+    def set_base(self, base):
+        self.base[0] = base[0]
+        self.base[1] = base[1]
+
     def advance(self, offset):
         self.J.s_add_u32(self.base[0], self.base[0], offset[0])
         self.J.s_addc_u32(self.base[1], self.base[1], 0)
-        self.J.s_sub_u32(self.range[0], self.range[0], offset[0])
+        # self.J.s_sub_u32(self.range[0], self.range[0], offset[0])
     def load_dwordx4(self, vdst, voffset, soffset, offset12=0, non_temporal=False):
         # vdst,     vaddr,           srsrc, soffset          idxen offen offset12 sc0 nt sc1
         assert isinstance(offset12 , int) # must be compile time constant
@@ -1232,6 +1239,30 @@ class JIT:
         finally:
             self.Jump(label_begin)
             self.Label(label_end)
+
+    @contextmanager
+    def DoWhile(self, cond:GPRExpr = None):
+        current_frame = inspect.currentframe()
+        caller_frame = current_frame.f_back.f_back
+        lineno = caller_frame.f_lineno
+        label_begin = f"_dowhile_begin_{lineno}_{self.mark_idx}"
+        label_check = f"_dowhile_check_{lineno}_{self.mark_idx}"
+        label_end = f"_dowhile_end_{lineno}_{self.mark_idx}"
+        self.mark_idx += 1
+        self.Label(label_begin)
+        try:
+            # "continue" should jump to "check" for do-while semantics.
+            yield {"begin":label_begin, "check":label_check, "end":label_end}
+        finally:
+            self.Label(label_check)
+            if cond is None:
+                self.Jump(label_begin)
+            else:
+                self.Jump(label_begin, cond)
+            self.Label(label_end)
+
+    def dowhile(self, cond:GPRExpr = None):
+        return self.DoWhile(cond)
 
     @contextmanager
     def If(self, cond:GPRExpr):
