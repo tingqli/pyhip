@@ -1240,29 +1240,29 @@ class JIT:
             self.Jump(label_begin)
             self.Label(label_end)
 
-    @contextmanager
-    def DoWhile(self, cond:GPRExpr = None):
-        current_frame = inspect.currentframe()
-        caller_frame = current_frame.f_back.f_back
-        lineno = caller_frame.f_lineno
-        label_begin = f"_dowhile_begin_{lineno}_{self.mark_idx}"
-        label_check = f"_dowhile_check_{lineno}_{self.mark_idx}"
-        label_end = f"_dowhile_end_{lineno}_{self.mark_idx}"
-        self.mark_idx += 1
-        self.Label(label_begin)
-        try:
-            # "continue" should jump to "check" for do-while semantics.
-            yield {"begin":label_begin, "check":label_check, "end":label_end}
-        finally:
-            self.Label(label_check)
-            if cond is None:
-                self.Jump(label_begin)
-            else:
-                self.Jump(label_begin, cond)
-            self.Label(label_end)
+    # @contextmanager
+    # def DoWhile(self, cond:GPRExpr = None):
+    #     current_frame = inspect.currentframe()
+    #     caller_frame = current_frame.f_back.f_back
+    #     lineno = caller_frame.f_lineno
+    #     label_begin = f"_dowhile_begin_{lineno}_{self.mark_idx}"
+    #     label_check = f"_dowhile_check_{lineno}_{self.mark_idx}"
+    #     label_end = f"_dowhile_end_{lineno}_{self.mark_idx}"
+    #     self.mark_idx += 1
+    #     self.Label(label_begin)
+    #     try:
+    #         # "continue" should jump to "check" for do-while semantics.
+    #         yield {"begin":label_begin, "check":label_check, "end":label_end}
+    #     finally:
+    #         self.Label(label_check)
+    #         if cond is None:
+    #             self.Jump(label_begin)
+    #         else:
+    #             self.Jump(label_begin, cond)
+    #         self.Label(label_end)
 
-    def dowhile(self, cond:GPRExpr = None):
-        return self.DoWhile(cond)
+    # def dowhile(self, cond:GPRExpr = None):
+    #     return self.DoWhile(cond)
 
     @contextmanager
     def If(self, cond:GPRExpr):

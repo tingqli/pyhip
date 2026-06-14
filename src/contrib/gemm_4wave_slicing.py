@@ -313,7 +313,6 @@ def gemm_kernel_slicing(
                             idx             (int) : the slice index for current load. [256, 64] is divided into 2 slice.
                             lds_offset      (int) : pre-calculated LDS offset for current load. Used to mov into M0.
                             buff         (Buffer) : VMEM buffer descriptor
-                            bk_idx(int)           : 2xBK would be handle in one hot-loop iteration. So specify which BK in 2xBK is loaded to get pre-calculated vmem offset.
 
             vm_load_cnt                          : number of vm load instructions issued by each vm_load()
 
@@ -340,33 +339,25 @@ def gemm_kernel_slicing(
 
         # Pre-calculate all the voffset for 2 BK iteration.
         # [slice_parts, vm_load_cnt]
-        vmem_voff_bk0 = J.gpr(2, vm_load_cnt, "vu32")
-        vmem_voff_bk1 = J.gpr(2, vm_load_cnt, "vu32")
+        vmem_voff = J.gpr(2, vm_load_cnt, "vu32")
 
 
-        vmem_voff_bk0[0, 0] = (
+        vmem_voff[0, 0] = (
             lane_row * lane_row_stride
             + J.warp_id[0] * vm_stride
             + lane_col * J.sizeof_DW4
         )
-        vmem_voff_bk0[1, 0] = vmem_voff_bk0[0, 0] + M * vm_stride
-        vmem_voff_bk1[0, 0] = vmem_voff_bk0[0, 0] + K
-        vmem_voff_bk1[1, 0] = vmem_voff_bk0[1, 0] + K
+        vmem_voff[1, 0] = vmem_voff[0, 0] + M * vm_stride
 
         for cnt in range(1, vm_load_cnt):
-            vmem_voff_bk0[0, cnt] = vmem_voff_bk0[0, 0] + (vm_stride * num_warps) * cnt
-            vmem_voff_bk0[1, cnt] = vmem_voff_bk0[0, cnt] + M * vm_stride
-            vmem_voff_bk1[0, cnt] = vmem_voff_bk1[0, 0] + (vm_stride * num_warps) * cnt
-            vmem_voff_bk1[1, cnt] = vmem_voff_bk1[0, cnt] + M * vm_stride
+            vmem_voff[0, cnt] = vmem_voff[0, 0] + (vm_stride * num_warps) * cnt
+            vmem_voff[1, cnt] = vmem_voff[0, cnt] + M * vm_stride
 
-        def vm_load(idx, lds_offset, buff, bk_idx):
+        def vm_load(idx, lds_offset, buff):
             for m in range(0, vm_load_cnt):
                 J.s_mov_b32("m0", lds_offset[m])
                 yield 1
-                if bk_idx == 0:
-                    buff.load_dwordx4(None, vmem_voff_bk0[idx, m], 0, offset12=0)
-                else:
-                    buff.load_dwordx4(None, vmem_voff_bk1[idx, m], 0, offset12=0)
+                buff.load_dwordx4(None, vmem_voff[idx, m], 0, offset12=0)
                 yield 1
 
         # the [M x K] bytes LDS buffer is accessed by following closure
@@ -414,7 +405,7 @@ def gemm_kernel_slicing(
                 voffset = voff[k]
             J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
 
-        vm_offset_inc = K*2
+        vm_offset_inc = K
         return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64_idx
 
     # In the 4 wave case:
@@ -465,27 +456,27 @@ def gemm_kernel_slicing(
     # lds_soff_precal = J.gpr(2, 4, 4, "vu32")
     # ping prefetch
     # AC B0 to ping
-    J.emit(vm_load_b(0, lds_soff_precal[0, 0], buff_b, 0))
+    J.emit(vm_load_b(0, lds_soff_precal[0, 0], buff_b))
     # AC A0 to ping
-    J.emit(vm_load_a(0, lds_soff_precal[0, 1], buff_a, 0))
+    J.emit(vm_load_a(0, lds_soff_precal[0, 1], buff_a))
     # AC A1 to ping
-    J.emit(vm_load_a(1, lds_soff_precal[0, 2], buff_a, 0))
+    J.emit(vm_load_a(1, lds_soff_precal[0, 2], buff_a))
     # AC B1 to ping
-    J.emit(vm_load_b(1, lds_soff_precal[0, 3], buff_b, 0))
+    J.emit(vm_load_b(1, lds_soff_precal[0, 3], buff_b))
 
     # # A, B advance BK
-    # buff_a.advance(s_offset_inc_a[0])
-    # buff_b.advance(s_offset_inc_b[0])
+    buff_b.advance(s_offset_inc_b[0])
+    buff_a.advance(s_offset_inc_a[0])
 
     # pong prefetch
     # AC B0 to pong
-    J.emit(vm_load_b(0, lds_soff_precal[1, 0], buff_b, 1))
+    J.emit(vm_load_b(0, lds_soff_precal[1, 0], buff_b))
     # AC A0 to pong
-    J.emit(vm_load_a(0, lds_soff_precal[1, 1], buff_a, 1))
+    J.emit(vm_load_a(0, lds_soff_precal[1, 1], buff_a))
     # AC A1 to pong
-    J.emit(vm_load_a(1, lds_soff_precal[1, 2], buff_a, 1))
+    J.emit(vm_load_a(1, lds_soff_precal[1, 2], buff_a))
     # AC B1 to pong
-    J.emit(vm_load_b(1, lds_soff_precal[1, 3], buff_b, 1))
+    J.emit(vm_load_b(1, lds_soff_precal[1, 3], buff_b))
 
     # A, B advance BK
 
@@ -513,9 +504,7 @@ def gemm_kernel_slicing(
 
 
     # https://github.com/ROCm/gfx950-gluon-tutorials/tree/main/kernels/gemm/a16w16/v8_sliceMN
-    # unroll the 2xBK step into loop_body_2xBK(). buffer descriptor would be only update once in 2xBK advance.
-    # precalculate 2 set of vmem offset for buffer load usuage. 
-    def loop_body_2xBK(idx):
+    def loop_body(idx):
         # will prefech vmem into ping LDS.
         # readiness: vm:AC A1[cur] to LDS[cur%2], lds:B0 and A0[cur] into reg
         cur_lds = idx % 2
@@ -552,7 +541,7 @@ def gemm_kernel_slicing(
         #  6MFMA + 8x(read_lds + MFMA)  + 4x(3MFMA+buffer_load+s_mov+1MFMA) +  (2xMFMA+barrier+s_waitcnt)
 
         # mainloop ping part 0:
-        vm_load = vm_load_b(0, lds_soff_precal[cur_lds, 0], buff_b, 0)
+        vm_load = vm_load_b(0, lds_soff_precal[cur_lds, 0], buff_b)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a0b0], 80)
         J.s_waitcnt(mod=f"vmcnt({20})")
@@ -573,7 +562,7 @@ def gemm_kernel_slicing(
         J.emit([mfma_a0b0], 16)
         J.emit([mfma_a0b0], 16)
         # mainloop ping part 1:
-        vm_load = vm_load_a(0, lds_soff_precal[cur_lds, 1], buff_a, 0)
+        vm_load = vm_load_a(0, lds_soff_precal[cur_lds, 1], buff_a)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a1b0], 80)
         J.s_waitcnt(mod=f"vmcnt({20})")
@@ -594,7 +583,7 @@ def gemm_kernel_slicing(
         J.emit([mfma_a1b0], 16)
         J.emit([mfma_a1b0], 16)
         # mainloop poping  part 2:
-        vm_load = vm_load_a(1, lds_soff_precal[cur_lds, 2], buff_a, 0)
+        vm_load = vm_load_a(1, lds_soff_precal[cur_lds, 2], buff_a)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a0b1], 80)
         J.s_waitcnt(mod=f"vmcnt({20})")
@@ -613,10 +602,11 @@ def gemm_kernel_slicing(
             J.emit(vm_load, 1)
             J.emit([mfma_a0b1], 48)
         J.emit([mfma_a0b1], 16)
+        buff_a.advance(s_offset_inc_a[0])
         J.emit([mfma_a0b1], 16)
 
         # mainloop ping part 3:
-        vm_load = vm_load_b(1, lds_soff_precal[cur_lds, 3], buff_b, 0)
+        vm_load = vm_load_b(1, lds_soff_precal[cur_lds, 3], buff_b)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a1b1], 80)
         J.s_waitcnt(mod=f"vmcnt({20})")
@@ -634,110 +624,13 @@ def gemm_kernel_slicing(
             J.emit([mfma_a1b1], 16)
             J.emit(vm_load, 1)
             J.emit([mfma_a1b1], 48)
+  
         J.emit([mfma_a1b1], 16)
-        J.emit([mfma_a1b1], 16)
-
-        # will prefech vmem into pong LDS.
-        tmp = cur_lds
-        cur_lds = next_lds
-        next_lds = tmp
-        # initiliaze generator
-        mfma_a0b0 = mfma(0, 0)
-        mfma_a0b1 = mfma(0, 1)
-        mfma_a1b0 = mfma(1, 0)
-        mfma_a1b1 = mfma(1, 1)
-        vm_load = vm_load_b(0, lds_soff_precal[cur_lds, 0], buff_b, 1)
-        # mainloop pong part 0:
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
-        J.emit([mfma_a0b0], 80)
-        J.s_waitcnt(mod=f"vmcnt({20})")
-        J.emit([mfma_a0b0], 16)
-        J.s_barrier()
-        for m in range(slice_nrM):
-            ds_read_a(ldsA1[cur_lds], mfma_A[1, 0, m], m, 0)
-            J.emit([mfma_a0b0], 16)
-        for m in range(slice_nrM):
-            ds_read_a(ldsA1[cur_lds], mfma_A[1, 1, m], m, 1)
-            J.emit([mfma_a0b0], 16)
-        for _ in range(vm_load_cnt_b):
-            J.emit(vm_load, 1)
-            J.emit([mfma_a0b0], 16)
-            J.emit(vm_load, 1)
-            J.emit([mfma_a0b0], 48)
-
-        J.emit([mfma_a0b0], 16)
-        J.emit([mfma_a0b0], 16)
-        # mainloop pong part 1:
-        vm_load = vm_load_a(0, lds_soff_precal[cur_lds, 1], buff_a, 1)
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
-        J.emit([mfma_a1b0], 80)
-        J.s_waitcnt(mod=f"vmcnt({20})")
-        J.emit([mfma_a1b0], 16)
-        J.s_barrier()
-        for n in range(slice_nrN):
-            ds_read_b(ldsB1[cur_lds], mfma_B[1, 0, n], n, 0)
-            J.emit([mfma_a1b0], 16)
-        for n in range(slice_nrN):
-            ds_read_b(ldsB1[cur_lds], mfma_B[1, 1, n], n, 1)
-            J.emit([mfma_a1b0], 16)
-
-        for _ in range(vm_load_cnt_a):
-            J.emit(vm_load, 1)
-            J.emit([mfma_a1b0], 16)
-            J.emit(vm_load, 1)
-            J.emit([mfma_a1b0], 48)
-        J.emit([mfma_a1b0], 16)
-        J.emit([mfma_a1b0], 16)
-        # mainloop pong part 2:
-        vm_load = vm_load_a(1, lds_soff_precal[cur_lds, 2], buff_a, 1)
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
-        J.emit([mfma_a0b1], 80)
-        J.s_waitcnt(mod=f"vmcnt({20})")
-        J.emit([mfma_a0b1], 16)
-        J.s_barrier()
-        for n in range(slice_nrN):
-            ds_read_b(ldsB0[next_lds], mfma_B[0, 0, n], n, 0)
-            J.emit([mfma_a0b1], 16)
-        for n in range(slice_nrN):
-            ds_read_b(ldsB0[next_lds], mfma_B[0, 1, n], n, 1)
-            J.emit([mfma_a0b1], 16)
-
-        for _ in range(vm_load_cnt_a):
-            J.emit(vm_load, 1)
-            J.emit([mfma_a0b1], 16)
-            J.emit(vm_load, 1)
-            J.emit([mfma_a0b1], 48)
-        J.emit([mfma_a0b1], 16)
-        J.emit([mfma_a0b1], 16)
-
-        # mainloop pong part 3:
-        vm_load = vm_load_b(1, lds_soff_precal[cur_lds, 3], buff_b, 1)
-        J.s_waitcnt(mod=f"lgkmcnt(0)")
-        J.emit([mfma_a1b1], 80)
-        J.s_waitcnt(mod=f"vmcnt({20})")
-        J.emit([mfma_a1b1], 16)
-        J.s_barrier()
-        for m in range(slice_nrM):
-            ds_read_a(ldsA0[next_lds], mfma_A[0, 0, m], m, 0)
-            J.emit([mfma_a1b1], 16)
-        for m in range(slice_nrM):
-            ds_read_a(ldsA0[next_lds], mfma_A[0, 1, m], m, 1)
-            J.emit([mfma_a1b1], 16)
-
-        for _ in range(vm_load_cnt_b):
-            J.emit(vm_load, 1)
-            J.emit([mfma_a1b1], 16)
-            J.emit(vm_load, 1)
-            J.emit([mfma_a1b1], 48)
         buff_b.advance(s_offset_inc_b[0])
         J.emit([mfma_a1b1], 16)
-        buff_a.advance(s_offset_inc_a[0])
-        J.emit([mfma_a1b1], 16)
-
-
     if 0:
         for k_idx in range((K // wg_K) - 2):
-            loop_body_2xBK(k_idx)
+            loop_body(k_idx)
     else:
         koff = J.gpr("su32", 0)
         loop_cnt = ((K // wg_K) - 2) // 2
@@ -747,7 +640,8 @@ def gemm_kernel_slicing(
         # with J.dowhile(koff[0] < loop_cnt):
         with J.While(koff[0] < loop_cnt):
             # unroll the ping-pong
-            loop_body_2xBK(0)
+            loop_body(0)
+            loop_body(1)
             koff[0] += 1
     if PROFILE_CYCLE:
         J.s_memrealtime(ts2)
