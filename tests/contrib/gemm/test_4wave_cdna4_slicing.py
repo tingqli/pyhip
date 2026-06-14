@@ -6,6 +6,7 @@ import pytest
 import functools
 import torch
 
+PROFILE_CYCLE = 0
 torch.set_printoptions(
     linewidth=3000,
     sci_mode=False,
@@ -50,6 +51,7 @@ def test_accuracy(M, N, K, use_pre_shuffle=0):
         K,
         use_pre_shuffle,
         blk_cnt,
+        
         A.data_ptr(),
         B.data_ptr(),
         cur_out.data_ptr(),
@@ -103,6 +105,7 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
         K,
         use_pre_shuffle,
         blk_cnt,
+        PROFILE_CYCLE,
         A.data_ptr(),
         B.data_ptr(),
         C.data_ptr(),
@@ -153,6 +156,7 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
                 K,
                 use_pre_shuffle,
                 blk_cnt,
+                PROFILE_CYCLE,
                 As[di].data_ptr(),
                 Bs[di].data_ptr(),
                 Cs[di].data_ptr(),
@@ -190,25 +194,25 @@ def compare_perf(M, N, K, use_pre_shuffle=0):
     print(f"ratio:{torch_latncy[0]/latency[0]}")
 
     print(f"{acc=}")
+    if PROFILE_CYCLE:
+        print("\nPer-run phase ratios (pre/main/epilog):")
+        for i, (pre, main, epilog) in enumerate(zip(pre_cycles, main_cycles, epilog_cycles), start=1):
+            total = pre + main + epilog
+            if total == 0:
+                continue
+            print(
+                f"  Run {i:2d}: {100.0*pre/total:6.2f}% / {100.0*main/total:6.2f}% / {100.0*epilog/total:6.2f}%"
+            )
 
-    print("\nPer-run phase ratios (pre/main/epilog):")
-    for i, (pre, main, epilog) in enumerate(zip(pre_cycles, main_cycles, epilog_cycles), start=1):
-        total = pre + main + epilog
-        if total == 0:
-            continue
-        print(
-            f"  Run {i:2d}: {100.0*pre/total:6.2f}% / {100.0*main/total:6.2f}% / {100.0*epilog/total:6.2f}%"
-        )
-
-    avg_pre = sum(pre_cycles) / len(pre_cycles)
-    avg_main = sum(main_cycles) / len(main_cycles)
-    avg_epilog = sum(epilog_cycles) / len(epilog_cycles)
-    avg_total = avg_pre + avg_main + avg_epilog
-    print("\nAverage phase cycles:")
-    print(f"  pre:    {avg_pre:,.0f} ({100.0*avg_pre/avg_total:.2f}%)")
-    print(f"  main:   {avg_main:,.0f} ({100.0*avg_main/avg_total:.2f}%)")
-    print(f"  epilog: {avg_epilog:,.0f} ({100.0*avg_epilog/avg_total:.2f}%)")
-    print(f"  total:  {avg_total:,.0f}")
+        avg_pre = sum(pre_cycles) / len(pre_cycles)
+        avg_main = sum(main_cycles) / len(main_cycles)
+        avg_epilog = sum(epilog_cycles) / len(epilog_cycles)
+        avg_total = avg_pre + avg_main + avg_epilog
+        print("\nAverage phase cycles:")
+        print(f"  pre:    {avg_pre:,.0f} ({100.0*avg_pre/avg_total:.2f}%)")
+        print(f"  main:   {avg_main:,.0f} ({100.0*avg_main/avg_total:.2f}%)")
+        print(f"  epilog: {avg_epilog:,.0f} ({100.0*avg_epilog/avg_total:.2f}%)")
+        print(f"  total:  {avg_total:,.0f}")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ __all__ = ["gemm_kernel_slicing"]
 
 USE_GLUON_SWIZZLE = 1
 
-
 # def get_pids(
 #     M,
 #     N,
@@ -105,6 +104,7 @@ def gemm_kernel_slicing(
     K,
     use_pre_shuffle,
     GRID_MN,
+    PROFILE_CYCLE, 
     pA: "void*",
     pB: "void*",
     pC: "void*",
@@ -144,7 +144,8 @@ def gemm_kernel_slicing(
     ts1 = J.gpr(2, "su32")
     ts2 = J.gpr(2, "su32")
     ts3 = J.gpr(2, "su32")
-    J.s_memrealtime(ts0)
+    if PROFILE_CYCLE:
+        J.s_memrealtime(ts0)
 
     pA[:] += blk_m * (wg_M * K * J.sizeof(A_dtype))
     pB[:] += blk_n * (wg_N * K * J.sizeof(B_dtype))
@@ -313,11 +314,10 @@ def gemm_kernel_slicing(
                             lds_offset      (int) : pre-calculated LDS offset for current load. Used to mov into M0.
                             buff         (Buffer) : VMEM buffer object
                             vm_offset  (int/sgpr) : offset relative to buff base
-                            emitter               : The emmitter ISAs would be inserted when having some scalar instructions. Any better way?
 
             vm_load_cnt                          : number of vm load instructions issued by each vm_load()
 
-            vm_offset_inc                        : increamental offsets after each vm_load (which is K)
+            vm_offset_inc                        : increamental offsets after each vm_load (which is K*2, 2 BK unrolled)
 
             ds_read_16x64(lds_offset, vdst, m, k) : load a [16, 64] u8-LDS-tile into VGPRs
                 lds_offset   (int) : source u8-LDS-tile offset
@@ -340,22 +340,22 @@ def gemm_kernel_slicing(
 
         # Pre-calculate all the voffset.
         # [slice_parts, vm_load_cnt]
-        vmem_voff = J.gpr(2, vm_load_cnt, "vu32")
+        vmem_voff_ping = J.gpr(2, vm_load_cnt, "vu32")
         vmem_voff_pong = J.gpr(2, vm_load_cnt, "vu32")
 
 
-        vmem_voff[0, 0] = (
+        vmem_voff_ping[0, 0] = (
             lane_row * lane_row_stride
             + J.warp_id[0] * vm_stride
             + lane_col * J.sizeof_DW4
         )
-        vmem_voff[1, 0] = vmem_voff[0, 0] + M * vm_stride
-        vmem_voff_pong[0, 0] = vmem_voff[0, 0] + K
-        vmem_voff_pong[1, 0] = vmem_voff[1, 0] + K
+        vmem_voff_ping[1, 0] = vmem_voff_ping[0, 0] + M * vm_stride
+        vmem_voff_pong[0, 0] = vmem_voff_ping[0, 0] + K
+        vmem_voff_pong[1, 0] = vmem_voff_ping[1, 0] + K
 
         for cnt in range(1, vm_load_cnt):
-            vmem_voff[0, cnt] = vmem_voff[0, 0] + (vm_stride * num_warps) * cnt
-            vmem_voff[1, cnt] = vmem_voff[0, cnt] + M * vm_stride
+            vmem_voff_ping[0, cnt] = vmem_voff_ping[0, 0] + (vm_stride * num_warps) * cnt
+            vmem_voff_ping[1, cnt] = vmem_voff_ping[0, cnt] + M * vm_stride
             vmem_voff_pong[0, cnt] = vmem_voff_pong[0, 0] + (vm_stride * num_warps) * cnt
             vmem_voff_pong[1, cnt] = vmem_voff_pong[0, cnt] + M * vm_stride
 
@@ -364,7 +364,7 @@ def gemm_kernel_slicing(
                 J.s_mov_b32("m0", lds_offset[m])
                 yield 1
                 if ping_pong_idx == 0:
-                    buff.load_dwordx4(None, vmem_voff[idx, m], 0, offset12=0)
+                    buff.load_dwordx4(None, vmem_voff_ping[idx, m], 0, offset12=0)
                 else:
                     buff.load_dwordx4(None, vmem_voff_pong[idx, m], 0, offset12=0)
                 yield 1
@@ -511,11 +511,13 @@ def gemm_kernel_slicing(
 
 
 
-    ###################################main loop:
-    # https://github.com/ROCm/gfx950-gluon-tutorials/tree/main/kernels/gemm/a16w16/v8_sliceMN
-    def loop_body(idx):
-        # readiness: vm:AC A1[cur] to LDS[cur%2], lds:B0 and A0[cur] into reg
 
+    # https://github.com/ROCm/gfx950-gluon-tutorials/tree/main/kernels/gemm/a16w16/v8_sliceMN
+    # unroll the 2xBK step into loop_body_2xBK(). buffer descriptor would be only update once in 2xBK advance.
+    # precalculate 2 set of vmem offset for buffer load usuage. 
+    def loop_body_2xBK(idx):
+        # will prefech vmem into ping LDS.
+        # readiness: vm:AC A1[cur] to LDS[cur%2], lds:B0 and A0[cur] into reg
         cur_lds = idx % 2
         next_lds = (idx + 1) % 2
         # initiliaze generator
@@ -549,7 +551,7 @@ def gemm_kernel_slicing(
         # ISAs number in each part of pipeline: MFMA ISAs:32, read_lds_b128:  8, vm_load: 4. others. The 32 MFMAs ISA would be distributed for each part:
         #  6MFMA + 8x(read_lds + MFMA)  + 4x(3MFMA+buffer_load+s_mov+1MFMA) +  (2xMFMA+barrier+s_waitcnt)
 
-        # mainloop part 0:
+        # mainloop ping part 0:
         vm_load = vm_load_b(0, lds_soff_precal[cur_lds, 0], buff_b, 0)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a0b0], 80)
@@ -570,7 +572,7 @@ def gemm_kernel_slicing(
 
         J.emit([mfma_a0b0], 16)
         J.emit([mfma_a0b0], 16)
-        # mainloop part 1:
+        # mainloop ping part 1:
         vm_load = vm_load_a(0, lds_soff_precal[cur_lds, 1], buff_a, 0)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a1b0], 80)
@@ -591,7 +593,7 @@ def gemm_kernel_slicing(
             J.emit([mfma_a1b0], 48)
         J.emit([mfma_a1b0], 16)
         J.emit([mfma_a1b0], 16)
-        # mainloop part 2:
+        # mainloop poping  part 2:
         vm_load = vm_load_a(1, lds_soff_precal[cur_lds, 2], buff_a, 0)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a0b1], 80)
@@ -610,11 +612,10 @@ def gemm_kernel_slicing(
             J.emit([mfma_a0b1], 16)
             J.emit(vm_load, 1)
             J.emit([mfma_a0b1], 48)
-        # buff_a.advance(s_offset_inc_a[0])
         J.emit([mfma_a0b1], 16)
         J.emit([mfma_a0b1], 16)
 
-        # mainloop part 3:
+        # mainloop ping part 3:
         vm_load = vm_load_b(1, lds_soff_precal[cur_lds, 3], buff_b, 0)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a1b1], 80)
@@ -633,11 +634,10 @@ def gemm_kernel_slicing(
             J.emit([mfma_a1b1], 16)
             J.emit(vm_load, 1)
             J.emit([mfma_a1b1], 48)
-        # buff_b.advance(s_offset_inc_b[0])
         J.emit([mfma_a1b1], 16)
         J.emit([mfma_a1b1], 16)
 
-
+        # will prefech vmem into pong LDS.
         tmp = cur_lds
         cur_lds = next_lds
         next_lds = tmp
@@ -647,6 +647,7 @@ def gemm_kernel_slicing(
         mfma_a1b0 = mfma(1, 0)
         mfma_a1b1 = mfma(1, 1)
         vm_load = vm_load_b(0, lds_soff_precal[cur_lds, 0], buff_b, 1)
+        # mainloop pong part 0:
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a0b0], 80)
         J.s_waitcnt(mod=f"vmcnt({20})")
@@ -666,7 +667,7 @@ def gemm_kernel_slicing(
 
         J.emit([mfma_a0b0], 16)
         J.emit([mfma_a0b0], 16)
-        # mainloop part 1:
+        # mainloop pong part 1:
         vm_load = vm_load_a(0, lds_soff_precal[cur_lds, 1], buff_a, 1)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a1b0], 80)
@@ -687,7 +688,7 @@ def gemm_kernel_slicing(
             J.emit([mfma_a1b0], 48)
         J.emit([mfma_a1b0], 16)
         J.emit([mfma_a1b0], 16)
-        # mainloop part 2:
+        # mainloop pong part 2:
         vm_load = vm_load_a(1, lds_soff_precal[cur_lds, 2], buff_a, 1)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a0b1], 80)
@@ -709,7 +710,7 @@ def gemm_kernel_slicing(
         J.emit([mfma_a0b1], 16)
         J.emit([mfma_a0b1], 16)
 
-        # mainloop part 3:
+        # mainloop pong part 3:
         vm_load = vm_load_b(1, lds_soff_precal[cur_lds, 3], buff_b, 1)
         J.s_waitcnt(mod=f"lgkmcnt(0)")
         J.emit([mfma_a1b1], 80)
@@ -736,18 +737,20 @@ def gemm_kernel_slicing(
 
     if 0:
         for k_idx in range((K // wg_K) - 2):
-            loop_body(k_idx)
+            loop_body_2xBK(k_idx)
     else:
         koff = J.gpr("su32", 0)
         loop_cnt = ((K // wg_K) - 2) // 2
         kidx = 0
-        J.s_memrealtime(ts1)
-        with J.If(loop_cnt > 0):
-            with J.dowhile(koff[0] < loop_cnt):
-                # unroll the ping-pong
-                loop_body(0)
-                koff[0] += 1
-    J.s_memrealtime(ts2)
+        if PROFILE_CYCLE:
+            J.s_memrealtime(ts1)
+        # with J.dowhile(koff[0] < loop_cnt):
+        with J.While(koff[0] < loop_cnt):
+            # unroll the ping-pong
+            loop_body_2xBK(0)
+            koff[0] += 1
+    if PROFILE_CYCLE:
+        J.s_memrealtime(ts2)
     ####################################epologue 0:
 
     # initiliaze generator
@@ -818,20 +821,6 @@ def gemm_kernel_slicing(
         ds_read_a(ldsA0[next_lds], mfma_A[0, 1, m], m, 1)
         J.emit([mfma_a1b1], 16)
     J.emit([mfma_a1b1])
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     
     ####################################epologue 1:
     # epologue1 part 0:
@@ -1018,10 +1007,12 @@ def gemm_kernel_slicing(
             buff_c.store_dwordx4(vbf16, vaddr, 0, offset12=n * 4 * J.sizeof_DW2)
         vaddr[0] += 16 * stride_c
 
-    J.s_memrealtime(ts3)
-    blk_id = J.gpr("su32", J.blockIdx.x[0])
-    with J.If((blk_id[0] == 0) & (J.warp_id[0] == 0)):
-        J.s_store_dwordx2(ts0, p_timestamps, 0, mod="glc")
-        J.s_store_dwordx2(ts1, p_timestamps, 8, mod="glc")
-        J.s_store_dwordx2(ts2, p_timestamps, 16, mod="glc")
-        J.s_store_dwordx2(ts3, p_timestamps, 24, mod="glc")
+    if PROFILE_CYCLE:
+        J.s_memrealtime(ts3)
+    if PROFILE_CYCLE:
+        blk_id = J.gpr("su32", J.blockIdx.x[0])
+        with J.If((blk_id[0] == 0) & (J.warp_id[0] == 0)):
+            J.s_store_dwordx2(ts0, p_timestamps, 0, mod="glc")
+            J.s_store_dwordx2(ts1, p_timestamps, 8, mod="glc")
+            J.s_store_dwordx2(ts2, p_timestamps, 16, mod="glc")
+            J.s_store_dwordx2(ts3, p_timestamps, 24, mod="glc")
