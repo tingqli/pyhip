@@ -307,13 +307,13 @@ def gemm_kernel_slicing(
 
         Returns:
 
-            vm_load(idx, lds_offset, buff, vm_offset, emitter=None) : [M, K] u8-VMEM-tile to [M, K] u8-LDS-tile loader generator function.
+            vm_load(idx, lds_offset, buff, vm_offset, kidx) : [M, K] u8-VMEM-tile to [M, K] u8-LDS-tile loader generator function.
                                                                      would have vm_load_cnt*2 yield in the vm_load. buffer_load, and s_addk_i32
                                                                      both need to be interleaved with
                             idx             (int) : the slice index for current load. [256, 64] is divided into 2 slice.
                             lds_offset      (int) : pre-calculated LDS offset for current load. Used to mov into M0.
-                            buff         (Buffer) : VMEM buffer object
-                            vm_offset  (int/sgpr) : offset relative to buff base
+                            buff         (Buffer) : VMEM buffer descriptor
+                            bk_idx(int)           : 2xBK would be handle in one hot-loop iteration. So specify which BK in 2xBK is loaded to get pre-calculated vmem offset.
 
             vm_load_cnt                          : number of vm load instructions issued by each vm_load()
 
@@ -338,35 +338,35 @@ def gemm_kernel_slicing(
         # The stride between 2 consecutive rows for vmem loading.
         lane_row_stride = vm_stride * num_warps * vm_load_cnt
 
-        # Pre-calculate all the voffset.
+        # Pre-calculate all the voffset for 2 BK iteration.
         # [slice_parts, vm_load_cnt]
-        vmem_voff_ping = J.gpr(2, vm_load_cnt, "vu32")
-        vmem_voff_pong = J.gpr(2, vm_load_cnt, "vu32")
+        vmem_voff_bk0 = J.gpr(2, vm_load_cnt, "vu32")
+        vmem_voff_bk1 = J.gpr(2, vm_load_cnt, "vu32")
 
 
-        vmem_voff_ping[0, 0] = (
+        vmem_voff_bk0[0, 0] = (
             lane_row * lane_row_stride
             + J.warp_id[0] * vm_stride
             + lane_col * J.sizeof_DW4
         )
-        vmem_voff_ping[1, 0] = vmem_voff_ping[0, 0] + M * vm_stride
-        vmem_voff_pong[0, 0] = vmem_voff_ping[0, 0] + K
-        vmem_voff_pong[1, 0] = vmem_voff_ping[1, 0] + K
+        vmem_voff_bk0[1, 0] = vmem_voff_bk0[0, 0] + M * vm_stride
+        vmem_voff_bk1[0, 0] = vmem_voff_bk0[0, 0] + K
+        vmem_voff_bk1[1, 0] = vmem_voff_bk0[1, 0] + K
 
         for cnt in range(1, vm_load_cnt):
-            vmem_voff_ping[0, cnt] = vmem_voff_ping[0, 0] + (vm_stride * num_warps) * cnt
-            vmem_voff_ping[1, cnt] = vmem_voff_ping[0, cnt] + M * vm_stride
-            vmem_voff_pong[0, cnt] = vmem_voff_pong[0, 0] + (vm_stride * num_warps) * cnt
-            vmem_voff_pong[1, cnt] = vmem_voff_pong[0, cnt] + M * vm_stride
+            vmem_voff_bk0[0, cnt] = vmem_voff_bk0[0, 0] + (vm_stride * num_warps) * cnt
+            vmem_voff_bk0[1, cnt] = vmem_voff_bk0[0, cnt] + M * vm_stride
+            vmem_voff_bk1[0, cnt] = vmem_voff_bk1[0, 0] + (vm_stride * num_warps) * cnt
+            vmem_voff_bk1[1, cnt] = vmem_voff_bk1[0, cnt] + M * vm_stride
 
-        def vm_load(idx, lds_offset, buff, ping_pong_idx):
+        def vm_load(idx, lds_offset, buff, bk_idx):
             for m in range(0, vm_load_cnt):
                 J.s_mov_b32("m0", lds_offset[m])
                 yield 1
-                if ping_pong_idx == 0:
-                    buff.load_dwordx4(None, vmem_voff_ping[idx, m], 0, offset12=0)
+                if bk_idx == 0:
+                    buff.load_dwordx4(None, vmem_voff_bk0[idx, m], 0, offset12=0)
                 else:
-                    buff.load_dwordx4(None, vmem_voff_pong[idx, m], 0, offset12=0)
+                    buff.load_dwordx4(None, vmem_voff_bk1[idx, m], 0, offset12=0)
                 yield 1
 
         # the [M x K] bytes LDS buffer is accessed by following closure
