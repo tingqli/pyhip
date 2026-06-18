@@ -16,6 +16,7 @@ from flydsl.utils.env import DebugEnvManager
 from flydsl._mlir import ir
 import flydsl
 from flydsl._mlir.dialects import llvm
+from flydsl.compiler.ast_rewriter import ASTRewriter
 
 # debug
 if 1:
@@ -201,7 +202,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
         fx.copy(cp_atom_w, c_tiled_g.get_slice(tid).retile(c_frag_bf16), c_tensor_thr_g)
 
     # copy from https://github.com/ROCm/gfx9-gluon-tutorials/blob/main/kernels/gemm/a16w16/v8_beyond_hotloop/matmul_kernel.py
-    def get_pids(
+    def _get_pids(
         pid,
         M,
         N,
@@ -233,13 +234,10 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
             # Note that we need to consider the following two cases:
             # 1. the current pid is on a tall xcd
             # 2. the current pid is on a short xcd
-            # TODO
-            # if xcd < tall_xcds:
-            #     pid = xcd * pids_per_xcd + local_pid
-            # else:
-            #     pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
-            pid = (xcd < tall_xcds).select(xcd * pids_per_xcd + local_pid,
-                                           tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
+            if xcd < tall_xcds:
+                pid = xcd * pids_per_xcd + local_pid
+            else:
+                pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
 
         if const_expr(GROUP_SIZE_M == 1):
             pid_m = pid // num_pid_n
@@ -255,6 +253,8 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
             pid_n = (pid % num_pid_in_group) // group_size_m
 
         return pid_m, pid_n
+
+    get_pids = ASTRewriter.transform(_get_pids)
 
     @flyc.kernel
     def gemm_4wave(arg_c_: fx.Tensor,

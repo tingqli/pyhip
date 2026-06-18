@@ -338,6 +338,46 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                hidden_states.data_ptr(), w1.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, w2.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0,
                                cur_out.data_ptr(), 
                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
+        elif kernel_type == 'fly_splitk_2s':
+            # FlyDSL moe_gemm_splitk: gateup stage
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+                topk_ids,
+                topk_weight,
+                E,
+                K1,
+                hidden_states.dtype,
+                TILE_M,
+                None,
+                None,
+                0,
+            )
+            BLOCK_TILE_SIZE_M = TILE_M
+            BLOCK_TILE_SIZE_N = TILE_N
+            grid = sorted_expert_ids.shape[0]
+            if B * TOPK <= E:
+                grid = B * TOPK
+            import sys as _sys
+            _src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../src")
+            if _src_dir not in _sys.path:
+                _sys.path.insert(0, _src_dir)
+            from contrib.flydsl.moe_gemm_splitk import compile_gemm as _fly_compile
+            _launch = _fly_compile(
+                N=N1, K=K1, weight_dtype=w1.dtype, TOPK=TOPK,
+                BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
+                BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
+                stage='gateup', alg='splitk',
+            )
+            _launch(
+                hidden_states, w1, gemm1_out,
+                sorted_ids, sorted_weights, sorted_expert_ids,
+                num_valid_ids,
+                w1_scale if w1_scale is not None else torch.zeros(1, dtype=torch.float32, device=hidden_states.device),
+                B, torch.cuda.current_stream(),
+            )
+            # down stage using existing pyhip splitk kernel
+            moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
+                               w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                               gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc)
         elif kernel_type == 'mxn_2s':
             #assert weight_type == torch.bfloat16, f'mxn_2s only support bfloat16, but got {weight_type}'
             # test moe_gemm_batch_vmn: 2 stages, m/n can be set
@@ -593,7 +633,7 @@ def entry_b1(prec=[torch.bfloat16], HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E
         perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=512, TP=8, run_count=10, fp8_ptpc = True):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=64, TP=8, run_count=10, fp8_ptpc = True):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
@@ -677,6 +717,16 @@ def test_acc_16x32_2s_b(batch, prec, HIDDEN_SIZE, INTER_SIZE, TP):
 def test_acc_mxn_splitk_2s_bf16(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP):
     entry_common('mxn_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
 
+@pytest.mark.parametrize("batch", [[2, 4, 16]])
+@pytest.mark.parametrize("prec", [[torch.bfloat16]])
+@pytest.mark.parametrize("TILE_M", [16])
+@pytest.mark.parametrize("TILE_N", [128])
+@pytest.mark.parametrize("HIDDEN_SIZE", [4096])
+@pytest.mark.parametrize("INTER_SIZE", [1024])
+@pytest.mark.parametrize("TP", [8])
+def test_acc_fly_splitk_2s_bf16(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP):
+    entry_common('fly_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
+
 @pytest.mark.parametrize("batch", [get_batch_list('mxn_splitk_2s')])
 @pytest.mark.parametrize("prec", [[get_fp8type()]])
 @pytest.mark.parametrize("TILE_M", [16])
@@ -751,10 +801,10 @@ def test_perf(batch, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP
     gc.collect()
 
 if __name__ == '__main__':
-    TILE_M = 16
-    TILE_N = 64
+    TILE_M = 32
+    TILE_N = 128
     HIDDEN_SIZE = 4096
-    INTER_SIZE = 1024
+    INTER_SIZE = 1024*2
     TP = 8
 
     init_env()
@@ -765,8 +815,9 @@ if __name__ == '__main__':
     #entry_common('mxn_2s', batch=batch, prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
     #with torchPerf():
     #    entry_common('aiter', batch, prec=[get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N)
-    if 1:
+    if 0:
         run_acc_test(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
         #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
         test_small_batch_perf(batch=[1, 2, 4, 8, 12, 16, 32, 64], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
         test_perf(batch=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    test_acc_fly_splitk_2s_bf16(batch=[1, 2, 4, 8, 16, 17], prec=[torch.bfloat16], TILE_M=16, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
