@@ -387,14 +387,23 @@ class Layout:
             for name_size in stride_names.split():
                 names.append(name_size[0])
                 sizes.append(int(name_size[1:]))
-            def offset_name(offset):
+            last_coord = []
+            def offset_name(offset, n):
+                nonlocal last_coord
+                if n == 0:
+                    last_coord = [-1 for _ in range(len(sizes))]
                 name_str = ""
-                for name, size in zip(names, sizes):
-                    name_str += f"{name}{offset%size}"
+                for i, (name, size) in enumerate(zip(names, sizes)):
+                    cur_coord = offset % size
+                    if last_coord[i] == cur_coord:
+                        name_str += ".."
+                    else:
+                        name_str += f"{name}{offset%size}"
                     offset //= size
-                return f"{name_str:>6s}"
+                    last_coord[i] = cur_coord
+                return f"{name_str:>8s}"
         else:
-            def offset_name(offset):
+            def offset_name(offset, n):
                 return f"{offset:6d}"
 
         caller_frame = inspect.stack()[1]
@@ -406,25 +415,33 @@ class Layout:
 
         print(src_line)
         print(self, f"{stride_names=}")
-        if self.rank == 1:
+        if self.rank >= 1:
             for i in range(self.size):
-                print(f"{offset_name(self(i))}", end=",")
+                print(f"{offset_name(self(i), i)}", end=",")
                 if i >= 16:
                     print(end=" ... ")
             print()
-            return
+            return self
         if self.rank == 2:
             for m in range(self.shape[0].size):
+                m_coord = idx2crd(m, self.shape[0])
+                print(f"{m:>4d}", end="")
+                if self.shape[0].depth > 0:
+                    print(f"={m_coord}", end="")
+                print(f": ", end="")
                 for n in range(self.shape[1].size):
-                    print(f"{offset_name(self(m, n))}", end=",")
+                    cur_name = offset_name(self(m, n), n)
+                    print(f"{cur_name}", end=",")
                 print()
-            return
-        assert 0
+            return self
+        return self
 
 def concatenation(*layouts):
     new_shape = []
     new_stride = []
     for l in layouts:
+        if isinstance(l, list) or isinstance(l, tuple):
+            l = concatenation(*l)
         if l.shape.is_leaf:
             new_shape.append(l.shape.get_leaf())
             new_stride.append(l.stride.get_leaf())
@@ -434,6 +451,7 @@ def concatenation(*layouts):
     return Layout(Shape(*new_shape), Stride(*new_stride))
 
 assert concatenation(Layout(4,3), Layout((2,2),(1,2))) == Layout((4,(2,2)), (3,(1,2)))
+assert concatenation([Layout(1,2), Layout(3,4)], Layout((2,2),(1,2))) == Layout(((1, 3), (2, 2)),((2, 4), (1, 2)))
 
 def test_layout():
     L = Layout(((2,2),(4,2)), ((1,8),(2,16)))
@@ -593,8 +611,12 @@ def composition_1d(S, D, s, d0):
             assert d % Sr == 0, f"stride divisibility condition voilated S{r}={Sr} and d={d}"
             # current mode has no contribution to the offset， but it makes d smaller
             d = d // Sr
-    S2.append(S[-1]//d)
-    D2.append(D[-1]*d)
+    if d == 0:
+        S2.append(S[-1])
+        D2.append(0)
+    else:
+        S2.append(S[-1]//d)
+        D2.append(D[-1]*d)
 
     # now make shape compatible with s
     sz = 1
@@ -630,7 +652,7 @@ B is a Tiler type which can be:
  - layout
  - tuple of Tilers : apply composition mode by mode
 """
-def composition(A, B, verify=True):
+def composition(A, B, verify=False):
     if isinstance(B, int):
         B = Layout(B, 1)
 
@@ -717,6 +739,8 @@ def complement(layout, cosize):
     new_strides = []
     next_stride = 1
     for i, (s, d) in enumerate(pairs):
+        if d == 0:
+            continue
         if d == next_stride:
             next_stride *= s
             continue
@@ -801,7 +825,7 @@ def logical_divide(A, B, tiler_mode=None):
     if isinstance(B, int):
         B = Layout(B, 1)
     if isinstance(B, Layout):
-        return composition(A, concatenation(B, complement(B, A.size)))
+        return composition(A, concatenation(B, complement(B, A.size)), verify=False)
     else:
         assert isinstance(B, tuple) or isinstance(B, list), "Tiler must be either int, Layout, or tuple/list of Tilers"
         div_layouts = []
@@ -814,6 +838,10 @@ def logical_divide(A, B, tiler_mode=None):
                 # no tiler provided for this mode, keep it as is (the L,... part)
                 keep_layouts.append(A[i])
         return rearrange_layouts(div_layouts, keep_layouts, method=tiler_mode)
+
+def zipped_divide(A, B): return logical_divide(A, B, "zipped")
+def tiled_divide(A, B): return logical_divide(A, B, "tiled")
+def flat_divide(A, B): return logical_divide(A, B, "flat")
 
 def test_div():
     assert logical_divide(Layout((4,2,3),(2,1,8)), Layout(4,2)) == Layout(((2, 2), (2, 3)),((4, 1), (2, 8)))
@@ -844,7 +872,7 @@ def logical_product(A, B, tiler_mode=None):
     if isinstance(B, int):
         B = Layout(B, 1)
     if isinstance(B, Layout):
-        return concatenation(A, composition(complement(A, A.size * B.cosize), B))
+        return concatenation(A, composition(complement(A, A.size * B.cosize), B), verify=False)
     else:
         assert isinstance(B, tuple) or isinstance(B, list), "Tiler must be either int, Layout, or tuple/list of Tilers"
         prod_layouts = []
@@ -970,14 +998,14 @@ def test_tv_layout():
 
     # (T8,V4) -> (M4,N8)
     tv_layout = Layout(((2,4),(2,2)),((8,1),(4,16)))
-    tv_layout.show() # tv_layout is not good for understanding
+    tv_layout.show("m4 ,8") # tv_layout is not good for understanding
 
     # right-inverse can not keep the profile, that's why we always see a composition following it
     # to get a real inverse with correct profile, we need to do composition with a Identity layout
     # to group modes correctly:
     rinv = composition(right_inverse(tv_layout), Layout((4,8),(1,4)))
     rinv.show("T8 .4") # inverse of tv_layout is good for understanding if we know target shape
-
+    assert 0
     # most natural way to get tv_layout is to construct Inverse TV Layout, then call make_layout_tv()
     # Inverse TV Layout: (M4,N8) -> (T8,V4)
     """
@@ -990,19 +1018,13 @@ def test_tv_layout():
     raked_product(A,B)   : ((m, M), (n, N))   m*M, n*N
 
     """
-    thr_layout = Layout((4,64),(64,1))
-    val_layout = Layout((16,4),(4,1))
+    thr_layout = Layout((4,2),(2,1)).show("T8")
+    val_layout = Layout((2,4),(4,1)).show("V8")
 
-
-    print("thr_layout:", thr_layout)
-    print("val_layout:", val_layout)
-    # tiler_mn, tv_layout = fx.make_layout_tv(thr_layout, val_layout)
-
-    mn_layout_tv = raked_product(thr_layout, val_layout)
-    #layout_mn.show()
+    # each thread holds a 2x4 rect of values now
+    mn_layout_tv = raked_product(thr_layout, val_layout).show("T8 v8")
 
     # layout_mn: (M64, N256) -> (T256, V64)
-    print("mn_layout_tv:", mn_layout_tv)
     """
     mn_layout_tv: Layout(((16, 4), (4, 64)):((1024, 64), (256, 1)))
 
@@ -1028,31 +1050,59 @@ def test_tv_layout():
         
     thr_layout = Layout((4,64),(64,1)) = (4, 64):(64T, 1T) maps (M4, N64) -> T256
     val_layout = Layout((16,4),(4,1))  = (16, 4):( 4V, 1V) maps (M16, N4) -> V64
-
     """
     thr_size = thr_layout.size
     val_size = val_layout.size
+    tmp = Layout((thr_size,val_size),(1,thr_size))
+    tv_layout = composition(right_inverse(mn_layout_tv), tmp).show("M8 n8")
 
-    tv_layout = composition(right_inverse(mn_layout_tv), Layout((thr_size,val_size),(1,thr_size)))
+    thr_layout = Layout((4,2),(2,1)).show("T8")
+    val_layout = Layout((1,2),(2,1)).show("V8")
 
-    """
-    tv_layout: Layout(((64, 4), (4, 16)):((256, 16), (64, 1)))
+    # each thread holds a 2x4 rect of values now
+    mn_layout_tv = raked_product(thr_layout, val_layout).show("T8 v8")
+    
+    tv_layout = Layout(((2,4),(2,2)),((8,1),(4,16))).show("M4 n8")
+    mn = Layout((4, 8),(1, 4))
+    composition(right_inverse(tv_layout), mn).show("T8 v4")
 
-    (T256, V256)->(M64, N256)
+test_tv_layout()
 
-    so 
-        ((64, 4), (4, 16)):
-        ((256, 16), (64, 1))
+if 0:
+    N = 256
+    K = 128
+    preshuffled_B = Layout(((16, N // 16), (8, 4, K // 32)), ((8, 16 * K), (1, 128, 512)))
+    print(preshuffled_B)
 
-    can be:
-        ((64, 4),   (4, 16)):
-        ((4n, 16m), (1n, 1m))
-    """
-    print("tv_layout:", tv_layout)
+    M32 = 1
+    N64 = 32
+    tv_layout = Layout(((8, 8, 4), 8), ((8*N64, 1, 8), N64)).show("M32 .64")
+    mn = Layout((32, 64),(1, 32))
+    composition(right_inverse(tv_layout), mn).show("T256 .8")
 
-#test_tv_layout()
+    Layout((3,2),(2,12)).show()
+                                                #   fx.make_tile(8 * 4, TILE_K)
 
-N = 256
-K = 128
-preshuffled_B = Layout(((16, N // 16), (8, 4, K // 32)), ((8, 16 * K), (1, 128, 512)))
-print(preshuffled_B)
+print(flat_divide(Layout((512,8192),(8192,1)), [256]))
+
+at_block = Layout((128,64,128),(8192,1,64)) # (m128, k64, num_TileK) -> offsets
+tv_layout = Layout(((8, 8, 4), 8), ((256, 1, 8), 32)) # (T256, v8) -> (M32, n64)
+at_subtile = tiled_divide(at_block, [32, 64]) # Layout(((32, 64), 4, 1, 128):((8192, 1), 262144, 0, 64))
+subtile_tv = composition(at_subtile[0], tv_layout)
+at_subtile_tv = concatenation(subtile_tv, *[at_subtile[k] for k in range(1, at_subtile.rank)])
+
+print(tv_layout)
+print(at_subtile)
+print(at_subtile_tv)
+"""
+Tensor<Value(%191 = "fly.tiled_copy.partition_src"(%189, %111, %190) : 
+(!fly.tiled_copy<!fly.copy_atom<!fly_rocdl.cdna3.buffer_copy<128>, 16>,
+ !fly.layout<((8,8,4),8):((256,1,8),32)>,
+ !fly.tile<[32|64]>>, 
+ !fly.memref<bf16, #fly_rocdl.buffer_desc, (128,64,128):(8192,1,64)>, !fly.int_tuple<?>) -> 
+ !fly.memref<bf16, #fly_rocdl.buffer_desc, ((8,1),4,1,128):((1,0),262144,0,64)>)>
+                                  
+                                  Layout(((32, 64), 4, 1, 128):((8192, 1), 262144, 0, 64))
+                                  Layout(((8, 8, 4), 8):((8, 8192, 65536), 1))
+
+"""
