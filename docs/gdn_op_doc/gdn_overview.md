@@ -48,13 +48,16 @@ Per chunk $[t]$ of length $C$, indices $i, j \in 1..C$, with:
 | Quantity | Formula | Shape |
 |----------|---------|-------|
 | $L$ | $\text{strictLower}\bigl(\text{diag}(\beta)\,(\Gamma \odot K K^T)\bigr)$ | $[C, C]$ |
+| $L^{(1)}$ | $\text{strictLower}\bigl(\text{diag}(\beta)\,K K^T\bigr)$ | $[C, C]$ |
 | $\tilde{U}_{[t]}$ | $(I + L)^{-1}\text{diag}(\beta)V$ | $[C, D_v]$ |
-| $W_{[t]}$ | $(I + L)^{-1}\text{diag}(\beta)K$ | $[C, D_k]$ |
-| $W^\leftarrow_{[t]}$ | $(I + L)^{-1}\text{diag}(\gamma_i)\text{diag}(\beta)K$ | $[C, D_k]$ |
+| $W_{[t]}$ | $(I + L^{(1)})^{-1}\text{diag}(\beta)K$ | $[C, D_k]$ |
+| $W^\leftarrow_{[t]}$ | $(I + L)^{-1}\text{diag}(\gamma)\text{diag}(\beta)K$ | $[C, D_k]$ |
 | $K^\rightarrow_{[t]}$ | $\text{diag}(\gamma_C / \gamma_i)K_{[t]}$ | $[C, D_k]$ |
 | $Q^\leftarrow_{[t]}$ | $\text{diag}(\gamma_i)Q_{[t]}$ | $[C, D_k]$ |
 | $S^\rightarrow_{[t]}$ | $`{\gamma_{C}}{S_{[t]}}`$ | $[D_k, D_v]$ |
 | $\Delta V_{[t]}$ | $`\tilde{U}_{[t]} - W^\leftarrow_{[t]}\,S_{[t]}^T`$ | $[C, D_v]$ |
+
+> 注：$L$ 是带 decay 的（含 $\Gamma$），$L^{(1)}$ 是不带 decay 的。论文 Eq.(6-7) 用 $L^{(1)}$ 的逆算 $W$，再乘 $\text{diag}(\gamma)$ 得 $W^{\leftarrow}$（两次求解）。Transformers 实现中 $W$ 和 $L^{(1)}$ **未被使用**——利用对角相似变换，$W^{\leftarrow}$ 直接由 $L$ 的逆一步算出（一次求解）。两者等价，详见 [gdn_kkt_solve_one_vs_two.md](gdn_kkt_solve_one_vs_two.md)。
 
 ### State Update
 
@@ -83,7 +86,7 @@ $`= \underbrace{[C, D_k] \times [D_k, D_v]}_{\text{inter-chunk}} + \underbrace{(
 | $(I + L)^{-1}$ | `attn` (after loop) | `[B, Hv, N, C, C]` | triangular inverse via forward-sub loop |
 | $\text{diag}(\beta) @ V$ | `v_beta` | `[B, Hv, N, C, Dv]` | beta-scaled values, input to $\tilde{U}$ |
 | $\tilde{U}$ | `value` after `attn @ v_beta` | `[B, Hv, N, C, Dv]` | $\tilde{U} = (I+L)^{-1} @ \text{diag}(\beta) @ V$ |
-| $W^\leftarrow$ | `k_cumdecay` | `[B, Hv, N, C, Dk]` | $W^\leftarrow = \text{diag}(\gamma) @ (I+L)^{-1} @ \text{diag}(\beta) @ K$ |
+| $W^\leftarrow$ | `k_cumdecay` | `[B, Hv, N, C, Dk]` | $W^\leftarrow = (I+L)^{-1} @ \text{diag}(\gamma) @ \text{diag}(\beta) @ K$ |
 | $S_{[t]}$ | `last_recurrent_state` | `[B, Hv, Dk, Dv]` | recurrent memory |
 | $\Delta V$ | `v_new` | `[B, Hv, C, Dv]` | $\Delta V = \tilde{U} - W^\leftarrow @ S_{[t]}$ |
 
