@@ -38,7 +38,7 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
     if alg == 'splitk':
         assert BLOCK_TILE_SIZE_N % 64 == 0, "For split-k, BLOCK_TILE_SIZE_N needs to be multiple of 64 due to reduce layout."
         assert K % (32 * 4) == 0, "K must be a multiple of 128 for split-k algorithm."
-        c_reduce_lds_size = BLOCK_TILE_SIZE_M * BLOCK_TILE_SIZE_N * 4
+        c_reduce_lds_size = 16 * 64 * 4 # save LDS size instead of BLOCK_TILE_SIZE_M * BLOCK_TILE_SIZE_N * 4
         @fx.union
         class SharedStorage:
             sorted_lds: fx.Array[fx.Int32, 256, 16]
@@ -154,7 +154,7 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
         c_frag = fx.make_rmem_tensor(
             # shape(c=b*a): [value, n_req, m_req]
             fx.make_layout(((4, 1), TILE_N // 16, TILE_M // 16), ((1, 0), TILE_M // 16 * 4, 4)), fx.Float32)
-        c_frag.store(Vec.filled(fx.size(c_frag).to_py_value(), 0, fx.Float32))
+        c_frag.fill(0)
 
         a_frag_retile = fx.make_tiled_copy_A(cp_atom_r, tiled_mma).get_slice(tid).retile(a_frag)
         b_frag_retile = b_tiled_thr.retile(b_frag)
@@ -171,44 +171,62 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
         # [v, n, m] -> [v, m, n]
         c_frag = fx.select(c_frag, [0, 2, 1])
 
-        # reduce
+        # Reduce across 4 waves. To save lds size, will reuse (16*4)x64 floats for one loop
         swz = fx.SwizzleType.get(3, 3, 3)
         c_lds = fx.make_view(lds.c_reduce_lds,
-                             fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M * 4, TILE_N), order=(1, 0))))
-        cp_atom_lds = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
-        c_tiled_lds = fx.make_tiled_copy(cp_atom_lds,
+                             fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((16 * 4, 64), order=(1, 0))))
+        cp_atom_lds_w = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
+        c_tiled_lds_w = fx.make_tiled_copy(cp_atom_lds_w,
                                          # (4wave*16)*4
-                                         fx.make_layout(((16, 4, 4), 4), ((1, 256, 16), 64)),
-                                         fx.make_tile(16 * 4, 16))
-        #fx.utils.print_typst(c_tiled_lds, file="layout.typ")
-        c_tensor_thr_lds_w = c_tiled_lds.get_slice(tid).partition_D(c_lds)
+                                         fx.make_layout(((16, 4, 4), (4, 4)), ((1, 256, 16), (64, 1024))),
+                                         fx.make_tile(16 * 4, 16 * 4))
+        c_tensor_thr_lds_w = c_tiled_lds_w.get_slice(tid).partition_D(c_lds)
 
         if const_expr(TILE_N == 64):
-            cp_atom_lds = fx.make_copy_atom(fx.UniversalCopy64b(), fx.Float32)
-            c_tiled_lds = fx.make_tiled_copy(cp_atom_lds,
+            cp_atom_lds_r = fx.make_copy_atom(fx.UniversalCopy64b(), fx.Float32)
+            c_tiled_lds_r = fx.make_tiled_copy(cp_atom_lds_r,
                                             # thread mapping: (4wavex4)x16, repeat 4 times in m dimension for reduce
                                             fx.make_layout(((16, 4, 4), (2, 4)), ((64 * 2, 1, 4), (64, 16))),
                                             fx.make_tile(16 * 4, 16 * 2))
+            tile_sub_n = 32
         else:
-            cp_atom_lds = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
-            c_tiled_lds = fx.make_tiled_copy(cp_atom_lds,
+            cp_atom_lds_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
+            c_tiled_lds_r = fx.make_tiled_copy(cp_atom_lds_r,
                                             # thread mapping: (4wavex4)x16, repeat 4 times in m dimension for reduce
                                             fx.make_layout(((16, 4, 4), (4, 4)), ((256, 1, 4), (64, 16))),
                                             fx.make_tile(16 * 4, 16 * 4))
-        #fx.utils.print_typst(c_tiled_lds, file="layout-c-tiled.typ")
-        c_tensor_thr_lds_r = c_tiled_lds.get_slice(tid).partition_S(c_lds)
+            tile_sub_n = 64
+        c_tensor_thr_lds_r = c_tiled_lds_r.get_slice(tid).partition_S(c_lds)
 
-        fx.copy(cp_atom_lds, c_frag, c_tensor_thr_lds_w)
-        gpu.barrier()
+        # shape: [(4, 1), rep_m, rep_n]
+        c_frag_vec = c_frag.load()
+        # shape: [v, rm, rn]
+        shape_v = fx.size(fx.get_shape(c_tensor_thr_lds_r)[0][0]).to_py_value()
+        stride_v = 1
+        stride_sub_rn = shape_v * stride_v
+        stride_rn = stride_sub_rn * (64 // tile_sub_n)
+        stride_rm = stride_rn * TILE_N // tile_sub_n
+        c_frag_reduce = fx.make_rmem_tensor(
+            fx.make_layout((shape_v, TILE_M // (4 * 4), (64 // tile_sub_n, TILE_N // 64)),
+                           (stride_v, stride_rm, (stride_sub_rn, stride_rn))), fx.Float32)
+        for m in range_constexpr(TILE_M // 16):
+            for n in range_constexpr(TILE_N // 64):
+                items = []
+                for i in range_constexpr(16):
+                    idx = fx.get_scalar(fx.crd2idx((i % 4, m, n * 4 + i // 4), c_frag.layout))
+                    items.append(c_frag_vec[idx])
+                sub_c_frag = fx.make_fragment_like(c_tensor_thr_lds_w)
+                sub_c_frag.store(Vec.from_elements(items, fx.Float32))
+                fx.copy(cp_atom_lds_w, sub_c_frag, c_tensor_thr_lds_w)
+                gpu.barrier()
 
-        c_frag_reduce =fx.make_fragment_like(c_tensor_thr_lds_r)
-        fx.copy(cp_atom_lds, c_tensor_thr_lds_r, c_frag_reduce)
-        acc = c_frag_reduce[(None, 0), None, None].load()
-        for i in range_constexpr(1, 4):
-            acc += c_frag_reduce[(None, i), None, None].load()
+                sub_c_frag_reduce = fx.make_fragment_like(c_tensor_thr_lds_r)
+                fx.copy(cp_atom_lds_r, c_tensor_thr_lds_r, sub_c_frag_reduce)
+                acc = sub_c_frag_reduce[(None, 0), None, None].load()
+                for i in range_constexpr(1, 4):
+                    acc += sub_c_frag_reduce[(None, i), None, None].load()
 
-        c_frag_reduce = fx.make_fragment_like(c_frag_reduce[(None, 0), None, None], dtype=fx.Float32)
-        c_frag_reduce.store(acc)
+                c_frag_reduce[None, m, (None, n)].store(acc)
 
         return c_frag_reduce
 
@@ -297,10 +315,9 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
 
             # silu: gate/up are interleaved in the N dimension
             # c_frag has shape (value, M_reps, N_reps) after reduce
-            c_frag_shape = fx.get_shape(c_frag).to_py_value()
-            v_reps = c_frag_shape[0]
-            m_reps = c_frag_shape[1]
-            n_reps = c_frag_shape[2] if len(c_frag_shape) > 2 else 1
+            v_reps = fx.size(fx.get_shape(c_frag)[0]).to_py_value()
+            m_reps = fx.size(fx.get_shape(c_frag)[1]).to_py_value()
+            n_reps = fx.size(fx.get_shape(c_frag)[2]).to_py_value()
 
             # c_frag_bf16 stores the silu result (half the N dimension since gate+up → 1 output)
             c_frag_bf16 = fx.make_rmem_tensor(
@@ -314,7 +331,7 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                 acc = []
                 for j in range_constexpr(gate.numel):
                     tmp = rocdl.exp2(T.f32, _raw(gate_log2[j]))
-                    acc.append((gate[j] * (1.0 / (1.0 + tmp))) * up[j])
+                    acc.append((gate[j] * rocdl.rcp(T.f32, 1.0 + tmp)) * up[j])
                 acc = vector.from_elements(T.vec(gate.numel, fx.Float32.ir_type), acc)
                 # failed: acc = (gate * (1.0 / (1.0 + flydsl.expr.math.exp2(gate * log2_exp1, fastmath=flydsl.expr.arith.FastMathFlags.fast)))) * up
                 round_bit = fx.Uint32(0x8000).ir_value().bitcast(fx.Float32.ir_type)
