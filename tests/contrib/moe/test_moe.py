@@ -356,28 +356,46 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             grid = sorted_expert_ids.shape[0]
             if B * TOPK <= E:
                 grid = B * TOPK
-            import sys as _sys
-            _src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../src")
-            if _src_dir not in _sys.path:
-                _sys.path.insert(0, _src_dir)
-            from contrib.flydsl.moe_gemm_splitk import compile_gemm as _fly_compile
-            _launch = _fly_compile(
+            from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
+            gateup = _moe_compile(
                 N=N1, K=K1, weight_dtype=w1.dtype, TOPK=TOPK,
                 BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
                 BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
                 stage='gateup', alg='splitk',
             )
-            _launch(
+            gateup(
                 hidden_states, w1, gemm1_out,
                 sorted_ids, sorted_weights, sorted_expert_ids,
                 num_valid_ids,
                 w1_scale if w1_scale is not None else torch.zeros(1, dtype=torch.float32, device=hidden_states.device),
                 B, torch.cuda.current_stream(),
             )
-            # down stage using existing pyhip splitk kernel
-            moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
-                               w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                               gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc)
+            if 0:
+                # down stage using existing pyhip splitk kernel
+                moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
+                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc)
+            else:
+                USE_ATOMIC_WRITE = True
+                if USE_ATOMIC_WRITE:
+                    gemm2_out = cur_out
+                else:
+                    gemm2_out = torch.empty([B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+                down = _moe_compile(
+                    N=N2, K=K2, weight_dtype=w1.dtype, TOPK=TOPK,
+                    BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
+                    BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
+                    stage='down', alg='splitk',
+                )
+                down(
+                    gemm1_out, w2, gemm2_out,
+                    sorted_ids, sorted_weights, sorted_expert_ids,
+                    num_valid_ids,
+                    w2_scale if w2_scale is not None else torch.zeros(1, dtype=torch.float32, device=hidden_states.device),
+                    B, torch.cuda.current_stream(),
+                )
+                if not USE_ATOMIC_WRITE:
+                    cur_out = torch.sum(gemm2_out, dim=1)
         elif kernel_type == 'mxn_2s':
             #assert weight_type == torch.bfloat16, f'mxn_2s only support bfloat16, but got {weight_type}'
             # test moe_gemm_batch_vmn: 2 stages, m/n can be set

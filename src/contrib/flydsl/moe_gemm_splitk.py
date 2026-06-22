@@ -35,7 +35,7 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
 
     TILE_K = 64
     assert BLOCK_TILE_SIZE_M <= 256, "BLOCK_SIZE_M must be less than or equal to 256 due to LDS size limit for sorted ids."
-    if alg == 'splitk':
+    if stage == 'gateup' and alg == 'splitk':
         assert BLOCK_TILE_SIZE_N % 64 == 0, "For split-k, BLOCK_TILE_SIZE_N needs to be multiple of 64 due to reduce layout."
         assert K % (32 * 4) == 0, "K must be a multiple of 128 for split-k algorithm."
         c_reduce_lds_size = 16 * 64 * 4 # save LDS size instead of BLOCK_TILE_SIZE_M * BLOCK_TILE_SIZE_N * 4
@@ -43,6 +43,11 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
         class SharedStorage:
             sorted_lds: fx.Array[fx.Int32, 256, 16]
             c_reduce_lds: fx.Array[fx.Float32, c_reduce_lds_size, 16]
+    elif stage == 'down' and alg == 'splitk':
+        @fx.struct
+        class SharedStorage:
+            sorted_lds: fx.Array[fx.Int32, 256, 16]
+
 
     def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
         """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
@@ -58,20 +63,10 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
         # tiled_copy: thread mapping for copy
         # tid: thread id for copy
         # lds_index: index tensor in LDS buffer which contains m index of view
-        def __init__(self, view, tile_m, tile_k, tile_m_in_copy, tile_k_in_copy, tiled_copy_index:fx.TiledCopy, tiled_copy:fx.TiledCopy, tid, lds_index, is_read_from_mem=True):
+        def __init__(self, view, tile_m, tile_k, tiled_copy_index:fx.TiledCopy, tiled_copy:fx.TiledCopy, tid, lds_index, is_read_from_mem=True):
             self.view = view
             self.tile_m = tile_m
             self.tile_k = tile_k
-            self.tile_m_in_copy = tile_m_in_copy
-            self.tile_k_in_copy = tile_k_in_copy
-            self.tid = tid
-            self.tile_copy_mn = tiled_copy.tile_mn
-            # split (tile_m, tile_k) by tile_copy_mn, shape: [(tile_m_in_copy, tile_k_in_copy), (rep_m, rep_k)]
-            tile_layout = fx.zipped_divide(fx.make_layout((tile_m, tile_k), (1, tile_m)), self.tile_copy_mn)
-            _, rep_shape  = tile_layout.shape
-            _, rep_stride = tile_layout.stride
-            self.rep_layout = fx.make_layout(rep_shape, rep_stride)
-            self.tiled_copy_tv_layout = tiled_copy.layout_src_tv_tiled if is_read_from_mem else tiled_copy.layout_dst_tv_tiled
             self.is_read_from_mem = is_read_from_mem
 
             # split into (1, tile_k) blocks
@@ -87,17 +82,21 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
             self.index_frag = fx.make_fragment_like(lds_thr)
             fx.copy(cp_atom_lds, lds_thr, self.index_frag)
 
-            offset_thread = fx.get_scalar(fx.crd2idx((self.tid, fx.Int32(0)), self.tiled_copy_tv_layout))
-            self.offset_thread_k = offset_thread // tile_m_in_copy
+            dtype = fx.PointerType.get(fx.Int8.ir_type, 1, 512)
+            ptr = fx.inttoptr(dtype, fx.Int32(0))
+            self.fake_tensor = fx.Tensor(fx.make_view(ptr, fx.make_layout((tile_m, tile_k), (1, tile_m))))
+            self.fake_tensor_thr = tiled_copy.get_slice(tid).partition_S(self.fake_tensor) if is_read_from_mem else tiled_copy.get_slice(tid).partition_D(self.fake_tensor)
+            # since init ptr is zero, it will be the offset of the thread in the tile after partition_S
+            offset_thread = fx.Int32(fx.ptrtoint(fx.get_iter(self.fake_tensor_thr)))
+            self.offset_thread_k = offset_thread // tile_m
 
         def copy(self, copy_atom, k_idx, frag:fx.Tensor):
-            shape = fx.get_shape(self.rep_layout)
-            rep_m = fx.size(shape[0]).to_py_value()
-            rep_k = fx.size(shape[1]).to_py_value()
-            m_size_in_copy = self.tile_m_in_copy
-            value_size = fx.get_shape(frag)[0][0].to_py_value()
-            # is there repeat in value dimension for frag?
-            assert fx.get_shape(frag)[0][1].to_py_value() == 1, "rep for value dimension should be 1"
+            layout = fx.get_layout(self.fake_tensor_thr)
+            shape = fx.get_shape(self.fake_tensor_thr)
+            rep_m = fx.size(shape[1]).to_py_value()
+            rep_k = fx.size(shape[2]).to_py_value()
+            value_size = fx.get_shape(frag)[0].to_py_value()
+            stride_size = fx.get_stride(frag)[0].to_py_value()
 
             rank = fx.get_shape(self.view).rank
             block_cord = [None] * (rank - 1) + [k_idx]
@@ -111,16 +110,16 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                     tensor_sub_block = tensor_block[None, self.index_frag[0, m] & 0xffffff, (self.index_frag[0, m] >> 24)]
                 for k in range_constexpr(rep_k):
                     # get block k index
-                    offset_block = fx.crd2idx((m, k), self.rep_layout).to_py_value()
+                    offset_block = fx.crd2idx((0, m, k), layout).to_py_value()
                     offset_block_k = offset_block // self.tile_m
                     # NOTE: assum K is linear in memory
                     offset_k_in_tile = offset_block_k + self.offset_thread_k
                     reg = frag[None, m, k]
-                    mem = fx.make_view(fx.add_offset(fx.get_iter(tensor_sub_block), offset_k_in_tile), fx.make_layout(value_size, 1))
+                    mem = fx.make_view(fx.add_offset(fx.get_iter(tensor_sub_block), offset_k_in_tile), fx.make_layout(value_size, stride_size))
                     if const_expr(self.is_read_from_mem):
-                        fx.copy_atom_call(copy_atom, mem, reg)
+                        fx.copy(copy_atom, mem, reg)
                     else:
-                        fx.copy_atom_call(copy_atom, reg, mem)
+                        fx.copy(copy_atom, reg, mem)
 
     def _gemm_splitk(TILE_M, TILE_N, TILE_K,
                      blk_n: int,                        # block index for N dimension
@@ -144,16 +143,14 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
         b_tiled_thr = fx.make_tiled_copy_B(cp_atom_r, tiled_mma).get_slice(tid)
         cp_atom_lds = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
         tiled_copy_sortid_lds = fx.make_tiled_copy(cp_atom_lds, fx.make_layout(((16, 16), 1), ((1, 0), 0)), fx.make_tile(16))
-        a_tensor_thr = TensorWithIndex(a_tensor, TILE_M, TILE_K * 4, 16, 32, tiled_copy_sortid_lds, fx.make_tiled_copy_A(cp_atom_r, tiled_mma), tid, lds.sorted_lds)
+        a_tensor_thr = TensorWithIndex(a_tensor, TILE_M, TILE_K * 4, tiled_copy_sortid_lds, fx.make_tiled_copy_A(cp_atom_r, tiled_mma), tid, lds.sorted_lds)
 
         b_tensor_thr = b_tiled_thr.partition_S(b_tile)
-        b_frag = fx.make_rmem_tensor(
-            fx.make_layout((4, TILE_N // 16, (2, TILE_K // 32)), (1, TILE_K // 32 * 8, (4, 8))), fx.BFloat16)
-        a_frag = fx.make_rmem_tensor(
-            fx.make_layout((4, TILE_M // 16, (2, TILE_K // 32)), (1, TILE_K // 32 * 8, (4, 8))), fx.BFloat16)
-        c_frag = fx.make_rmem_tensor(
-            # shape(c=b*a): [value, n_req, m_req]
-            fx.make_layout(((4, 1), TILE_N // 16, TILE_M // 16), ((1, 0), TILE_M // 16 * 4, 4)), fx.Float32)
+        b_frag = tiled_mma.make_fragment_B(b_tile[None, None, 0])
+        a_fake_tensor = fx.Tensor(fx.make_view(fx.get_iter(arg_p_input), fx.make_layout((BLOCK_TILE_SIZE_M, TILE_K * 4), (TILE_K * 4, 1))))
+        a_frag = tiled_mma.make_fragment_A(a_fake_tensor)
+        c_fake_tensor = fx.Tensor(fx.make_view(fx.get_iter(arg_p_input), fx.make_layout((BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M), (BLOCK_TILE_SIZE_M, 1))))
+        c_frag = tiled_mma.make_fragment_C(c_fake_tensor)
         c_frag.fill(0)
 
         a_frag_retile = fx.make_tiled_copy_A(cp_atom_r, tiled_mma).get_slice(tid).retile(a_frag)
@@ -235,7 +232,7 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
     @flyc.kernel
     def moe_2stage_gateup(p_input: fx.Tensor,            # bf16 [M, K]
                           p_weight: fx.Tensor,           # bf16 [N/16, K/8 * 16 * 8,]
-                          p_output: fx.Tensor,           # bf16 [M, N]
+                          p_output: fx.Tensor,           # bf16 [M, TOPK, N//2]
                           # sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
                           p_sorted_ids: fx.Tensor,
                           p_sorted_weights: fx.Tensor,
@@ -292,8 +289,6 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                                 # 线程划分: 4x16，4 wave切分m方向16行，每个线程写入n方向连续4个点
                                                 fx.make_layout(((16, 4, 4), 4), ((64, 1, 4), 16)),
                                                 fx.make_tile(16, 16 * 4))
-                    tile_m_copy = 16
-                    tile_n_copy = 64
                 else:
                     # due to silu, actually the N block is only 32 points=(16x2)32b
                     cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.BFloat16)
@@ -301,15 +296,13 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                                 # 线程划分: 4x16，4 wave切分m方向16行，每个线程写入n方向连续2个点
                                                 fx.make_layout(((16, 4, 4), 2), ((32, 1, 4), 16)),
                                                 fx.make_tile(16, 16 * 2))
-                    tile_m_copy = 16
-                    tile_n_copy = 32
 
             arg_p_output = fx.Tensor(fx.make_view(fx.get_iter(p_output), fx.make_layout((M, TOPK, N // 2), (TOPK * N // 2, N // 2, 1))))
             out_tensor = fx.rocdl.make_buffer_tensor(arg_p_output, max_size=False, num_records_bytes=M * TOPK * N // 2 * fx.BFloat16.width // 8)
             tiled_copy_sortid_lds = fx.make_tiled_copy(fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
                                                        fx.make_layout(((16, 16), 1), ((0, 1), 0)),
                                                        fx.make_tile(16))
-            c_tensor = TensorWithIndex(out_tensor, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2, tile_m_copy, tile_n_copy, tiled_copy_sortid_lds, c_tiled_g, tid, lds.sorted_lds, is_read_from_mem=False)
+            c_tensor = TensorWithIndex(out_tensor, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2, tiled_copy_sortid_lds, c_tiled_g, tid, lds.sorted_lds, is_read_from_mem=False)
 
             c_frag = gemm_splitk(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, TILE_K, blk_n, arg_p_input, arg_p_weight, lds)
 
@@ -341,6 +334,118 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
 
             c_tensor.copy(cp_atom_w, blk_n, c_tiled_g.get_slice(tid).retile(c_frag_bf16))
 
+    @flyc.kernel
+    def moe_2stage_down(p_input: fx.Tensor,            # bf16 [M, TOPK, K]
+                        p_weight: fx.Tensor,           # bf16 [N/16, K/8 * 16 * 8]
+                        p_output: fx.Tensor,           # bf16 [M, N]
+                        # sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
+                        p_sorted_ids: fx.Tensor,
+                        p_sorted_weights: fx.Tensor,
+                        p_sorted_expert_ids: fx.Tensor,
+                        p_num_valid_ids: fx.Tensor,
+                        p_w_scale: fx.Tensor,
+                        M: int,
+                        ):
+        tid = gpu.thread_idx.x
+        blk_n = gpu.block_idx.x
+        e_idx = gpu.block_idx.y
+
+        arg_p_input = fx.Tensor(fx.make_view(fx.get_iter(p_input), fx.make_layout((M, TOPK, K), (TOPK * K, K, 1))))
+        num_valid_buf = fx.Tensor(fx.make_view(fx.recast_iter(fx.Int32, fx.get_iter(p_num_valid_ids)), fx.make_layout(1, 1)))
+        max_valid_id = num_valid_buf[0]
+        if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
+            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+            arg_p_sorted_ids = fx.Tensor(fx.make_view(fx.recast_iter(fx.Int32, fx.add_offset(fx.get_iter(p_sorted_ids), e_idx * BLOCK_TILE_SIZE_M)), fx.make_layout(BLOCK_TILE_SIZE_M, 1)))
+            arg_p_sorted_expert_ids = fx.recast_iter(fx.Int32, fx.get_iter(p_sorted_expert_ids))
+            expert_id = arg_p_sorted_expert_ids[e_idx]
+            arg_p_weight = fx.Tensor(fx.make_view(fx.add_offset(fx.get_iter(p_weight), fx.Int64(expert_id * N * K)),
+                                                  fx.make_layout(((16, N // 16), (8, K // 8)), ((8, 16 * K), (1, 128)))))   # preshuffle layout: [16, (8, K // 8)]
+            
+            # sorted ids: global -> LDS (scalar load/store, only first BLOCK_TILE_SIZE_M threads participate)
+            sorted_ids_buf = fx.rocdl.make_buffer_tensor(arg_p_sorted_ids, max_size=False)
+            lds_view = fx.make_view(lds.sorted_lds, fx.make_layout(BLOCK_TILE_SIZE_M, 1))
+            for idx in range(tid, BLOCK_TILE_SIZE_M, 64):
+                # fx.memref_store(val, lds_view, tid)
+                lds_view[idx] = sorted_ids_buf[idx]
+            gpu.barrier()
+
+            # gemm
+            a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
+            b_tensor = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
+            # shape: [n_in_tile, k_in_tile, k_tile]
+            b_tile = fx.flat_divide(b_tensor, fx.make_tile(BLOCK_TILE_SIZE_N, TILE_K))[None, None, blk_n, None]
+            cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+
+            tiled_mma = fx.make_tiled_mma(
+                fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+                fx.make_layout((1, 1, 1), (0, 0, 1)),
+                fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4)))
+            )
+            b_tiled_thr = fx.make_tiled_copy_B(cp_atom_r, tiled_mma).get_slice(tid)
+            cp_atom_lds = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
+            tiled_copy_sortid_lds = fx.make_tiled_copy(cp_atom_lds, fx.make_layout(((16, 4), 1), ((1, 0), 0)), fx.make_tile(16))
+            a_tensor_thr = TensorWithIndex(a_tensor, BLOCK_TILE_SIZE_M, TILE_K, tiled_copy_sortid_lds, fx.make_tiled_copy_A(cp_atom_r, tiled_mma), tid, lds.sorted_lds)
+            
+            cp_atom_weight = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            arg_p_sorted_weights = fx.Tensor(fx.make_view(fx.recast_iter(fx.Float32, fx.add_offset(fx.get_iter(p_sorted_weights), e_idx * BLOCK_TILE_SIZE_M)), fx.make_layout(BLOCK_TILE_SIZE_M, 1)))
+            sorted_weights_buf = fx.rocdl.make_buffer_tensor(arg_p_sorted_weights, max_size=False)
+            sorted_weights_tensor = tiled_copy_sortid_lds.get_slice(tid).partition_S(sorted_weights_buf)
+            sorted_weight_frag = fx.make_fragment_like(sorted_weights_tensor, fx.Float32)
+            fx.copy(cp_atom_weight, sorted_weights_tensor, sorted_weight_frag)
+
+            b_tensor_thr = b_tiled_thr.partition_S(b_tile)
+            b_frag = tiled_mma.make_fragment_B(b_tile[None, None, 0])
+            a_fake_tensor = fx.Tensor(fx.make_view(fx.get_iter(arg_p_input), fx.make_layout((BLOCK_TILE_SIZE_M, TILE_K), (TILE_K, 1))))
+            a_frag = tiled_mma.make_fragment_A(a_fake_tensor)
+            c_fake_tensor = fx.Tensor(fx.make_view(fx.get_iter(arg_p_input), fx.make_layout((BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M), (1, BLOCK_TILE_SIZE_N))))
+            c_frag = tiled_mma.make_fragment_C(c_fake_tensor)
+            c_frag.fill(0)
+
+            a_frag_retile = fx.make_tiled_copy_A(cp_atom_r, tiled_mma).get_slice(tid).retile(a_frag)
+            b_frag_retile = b_tiled_thr.retile(b_frag)
+            acc_init = c_frag.load()
+            for k, state in range(0, K // TILE_K, 1, init=[acc_init]):
+                c_frag.store(state[0])
+                k_i32 = fx.Int32(k)
+                a_tensor_thr.copy(cp_atom_r, k_i32, a_frag_retile)
+                fx.copy(cp_atom_r, b_tensor_thr[None, None, None, k_i32], b_frag_retile)
+                fx.gemm(tiled_mma, c_frag, b_frag, a_frag, c_frag)
+
+                results = yield [c_frag.load()]
+            c_frag.store(results)
+            # [v, n, m] -> [v, m, n]
+            c_frag = fx.select(c_frag, [0, 2, 1])
+
+            # mul weight
+            sorted_weight_frag_vec = sorted_weight_frag.load()
+            for m in range_constexpr(BLOCK_TILE_SIZE_M // 16):
+                w = sorted_weight_frag_vec[m]
+                v = c_frag[None, m, None].load()
+                v *= w
+                c_frag[None, m, None].store(v)
+
+            # f32 -> bf16
+            c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
+            round_bit = fx.Uint32(0x8000).ir_value().bitcast(fx.Float32.ir_type)
+            c_frag_bf16.store(((c_frag.load() + round_bit).bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16))
+
+            # write to mem
+            if const_expr(p_output.shape.rank == 3):  # gateup output shape: [M, TOPK, N]
+                arg_p_output = fx.Tensor(fx.make_view(fx.get_iter(p_output), fx.make_layout((M, TOPK, N), (TOPK * N, N, 1))))
+                arg_p_output = fx.rocdl.make_buffer_tensor(arg_p_output, max_size=False, num_records_bytes=M * TOPK * N * fx.BFloat16.width // 8)
+                cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.BFloat16)
+            else:
+                arg_p_output = fx.Tensor(fx.make_view(fx.get_iter(p_output), fx.make_layout((M, N), (N, 1))))
+                # arg_p_output = fx.rocdl.make_buffer_tensor(arg_p_output, max_size=False, num_records_bytes=M * TOPK * N * fx.BFloat16.width // 8)
+                # cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferAtomicAdd(fx.BFloat16), fx.BFloat16)
+                cp_atom_w = fx.make_copy_atom(fx.UniversalAtomic(fx.AtomicOp.Add, fx.BFloat16), fx.BFloat16)
+            c_tiled_g = fx.make_tiled_copy(cp_atom_w,
+                                        # 16x4 threads, each writes 4 points in N dimension
+                                        fx.make_layout(((16, 4), 4), ((1, 64), 16)),
+                                        fx.make_tile(16, 16))
+            c_tensor = TensorWithIndex(arg_p_output, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, tiled_copy_sortid_lds, c_tiled_g, tid, lds.sorted_lds, is_read_from_mem=False)
+            c_tensor.copy(cp_atom_w, blk_n, c_tiled_g.get_slice(tid).retile(c_frag_bf16))
+
     @flyc.jit
     def launch(
         p_input: fx.Tensor,
@@ -361,14 +466,25 @@ def compile_gemm(N, K, weight_dtype, TOPK, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
         E = p_weight.shape[0].to_py_value()
         if B * TOPK <= E:
             grid = B * TOPK
-        moe_2stage_gateup(
-            p_input, p_weight, p_output,
-            p_sorted_ids, p_sorted_weights, p_sorted_expert_ids,
-            p_num_valid_ids, p_w_scale, M,
-        ).launch(
-            grid=(num_n_blocks, grid, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
+        if const_expr(stage == 'gateup'):
+            moe_2stage_gateup(
+                p_input, p_weight, p_output,
+                p_sorted_ids, p_sorted_weights, p_sorted_expert_ids,
+                p_num_valid_ids, p_w_scale, M,
+            ).launch(
+                grid=(num_n_blocks, grid, 1),
+                block=(256, 1, 1),
+                stream=stream,
+            )
+        else:
+            moe_2stage_down(
+                p_input, p_weight, p_output,
+                p_sorted_ids, p_sorted_weights, p_sorted_expert_ids,
+                p_num_valid_ids, p_w_scale, M,
+            ).launch(
+                grid=(num_n_blocks, grid, 1),
+                block=(64, 1, 1),
+                stream=stream,
+            )
 
     return launch
