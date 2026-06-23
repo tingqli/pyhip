@@ -367,7 +367,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 hidden_states, w1, gemm1_out,
                 sorted_ids, sorted_weights, sorted_expert_ids,
                 num_valid_ids,
-                w1_scale if w1_scale is not None else torch.zeros(1, dtype=torch.float32, device=hidden_states.device),
+                w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device),
                 B, torch.cuda.current_stream(),
             )
             if 0:
@@ -391,7 +391,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     gemm1_out, w2, gemm2_out,
                     sorted_ids, sorted_weights, sorted_expert_ids,
                     num_valid_ids,
-                    w2_scale if w2_scale is not None else torch.zeros(1, dtype=torch.float32, device=hidden_states.device),
+                    w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device),
                     B, torch.cuda.current_stream(),
                 )
                 if not USE_ATOMIC_WRITE:
