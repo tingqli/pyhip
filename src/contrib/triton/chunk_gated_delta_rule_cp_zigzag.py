@@ -658,7 +658,7 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     # ---- Phase 1: local compute for both segments ----
     if seg_cu is None:
         seg_cu = build_segment_cu_seqlens(cu_seqlens)
-    # 输出g: [B, H, L] -> [B, H, NT, 64], parallel on B, Hv, N
+    # 输出g: [B, H, L] -> [B, H, NT, 64], parallel on B, Hv, NT
     g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=seg_cu)
 
     # Reuse sglang's fused intra kernel (kkt + solve_tril + recompute_w_u)

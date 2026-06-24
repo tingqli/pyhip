@@ -67,10 +67,24 @@ def chunk_gated_delta_rule_fwd(
         4. chunk_fwd_o                       -> O_{[t]}
     """
     # Step 1: cumulative log-gates per chunk -> G_i.
+    # parallel on [[B, H, chunks]]，每个CU负责C个元素的cumulative sum
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
     # Step 2: fused kkt + solve_tril + recompute_w_u -> A, u, w.
+
+    # chunk_gated_delta_rule_fwd_kkt_solve_kernel()
+    # k_beta = k * beta
+    # L = k_beta@k^T * decay_mask
+    # L是下三角阵， 求（I  + L ）的逆，  (I + L)^（-1）
+    # [B, Hv, N] parallel，每个CU负责 [64, Dk]@[Dk, 64], inverse the [64, 64] triangular matrix
+
+    # recompute_w_u_fwd() — [B, H, N] parallel. Each chunk: [64, 64]@[64, Dv] → Ũ, [64, 64]@[64, Dk] → W←
+    # U~= atten @ (beta * V)
+    # W← = atten@ (beta* gamma_i* K)
+    # `w`, [ B, H, N, 64, Dk]
+    # 'u',  [B, Hv, N, 64, Dv]
+    # both can parallel on [B, Hv, N]
     w, u, A = chunk_gated_delta_rule_fwd_intra(
         k=k,
         v=v,
@@ -79,8 +93,14 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    # Step 3: chunk-sequential memory recurrence -> v_new=DeltaV, h[t]=S_{[t]}.
-    # the state shape should be (B, H, Dv, Dk)
+    # Step 3: chunk-sequential memory recurrence -> v_new/deltaV 是所有的trunk的state[B, H, chunks, 64, Dv], h是所有trunk的state, shape [B, H, chunks, Dv, Dk]
+    # compute the h_all, v_new_all for every chunk.
+    # For each trunk:
+    # v_new = U~ - W← @ h_in,           [64,Dv] - [64,Dk]@[Dk,Dv]
+    # K-> = k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]), i 是trunk index ,
+    # h_in-> = h_in * gamma_C
+    # h_out = h_in-> + K->^T@v_new     [Dk,Dv] + [Dk,64]@[64, Dv]
+    # parallel on [B, Hv, V/Dv]. each WG needs to iterate all the chunks.
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -91,8 +111,10 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    # Step 4: per-chunk readout -> O.
-    # the state shape should be (B, H, Dv, Dk)
+    # Step 4: per-chunk Ot.
+    # [B, H, chunks] parallel, so need every chunk sstate(h_all) and every chunk new value to compute o in parallel
+    # Ox = Q<- @ S[t], Q-< = (q * g.exp()), q的每个token与对应token的g相乘。[64, Dk]@[Dk, Dv] = [64, Dv]
+    # Oy = (q @ k^T * decay_mask) @ v_new_all,   [64, Dk]@[Dk, 64]@[64, Dv]
     o = chunk_fwd_o(
         q=q,
         k=k,
@@ -175,7 +197,7 @@ def torch_chunk_gated_delta_rule(
         beta                : [B, L, H]       bf16/fp16    (in (0,1) via sigmoid)
         initial_state       : [B, H, K, V]    bf16/fp16    (N == B for equal-length)
     Returns:
-        core_attn_out:        [B, L, H, Dv]
+        Ot:        [B, L, H, Dv]
         last_recurrent_state: [B, H, Dk, Dv] or None
     """
     initial_dtype = query.dtype
@@ -247,7 +269,6 @@ def torch_chunk_gated_delta_rule(
     # 这个矩阵与decay_mask逐元素相乘，得到的attn是下三角矩阵（包含对角线），再mask掉上三角（包含对角线）得到严格下三角矩阵, 对角线为0
     # 这里attn is -L,
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    # attn is (I + L)^{-1}， 严格下三角矩阵逐行求逆。
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
@@ -255,21 +276,21 @@ def torch_chunk_gated_delta_rule(
     # attn is (I + L)^{-1}，shape是【64， 64】，严格下三角矩阵逐行求逆。
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
 
-    # 这里的value被重薪赋值了，不再是传进来的value, value是公式的U~. U~= (1+L)^-1 @ diag(beta) @ V
-    # U~/value shape还是[B, H, chunk_num, 64, V]
-    value = attn @ v_beta
+    # U~= (1+L)^-1 @ diag(beta) @ V
+    # U~/U_Tilde shape还是[B, H, chunk_num, 64, V]
+    U_Tilde = attn @ v_beta
     # W<- = (I + L)^{-1}@diag(beta)@diag(gamma_i)@K, k_beta[B, H, chunk_num, 64, K], g.unsqueeze(-1) [B, H, chunk_num, 64, 1]
-    # k_cumdecay： [B, H, chunk_num, 64, K]
-    # k_cumdecay 就是W<-
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    # W_Arrow： [B, H, chunk_num, 64, K]
+    # W_Arrow is W<-
+    W_Arrow = attn @ (k_beta * g.exp().unsqueeze(-1))
 
     # state = (B, H, Dk, Dv)
     last_recurrent_state = (
-        torch.zeros(B, H, Dk, Dv, dtype=value.dtype, device=value.device)
+        torch.zeros(B, H, Dk, Dv, dtype=U_Tilde.dtype, device=U_Tilde.device)
         if initial_state is None
-        else initial_state.to(value)
+        else initial_state.to(U_Tilde)
     )
-    core_attn_out = torch.zeros_like(value)
+    Ot = torch.zeros_like(U_Tilde)
     # 上三角矩阵，对角线为0
     mask = torch.triu(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
@@ -281,22 +302,22 @@ def torch_chunk_gated_delta_rule(
     # 这里更新state是逐chunk更新的。
     for i in range(0, Lp // chunk_size):
         # v_i 这里是U~
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], U_Tilde[:, :, i]
         # Q @ Kt * Gamma,  *是 elementwise, 这里是为后面Oy做准备。
         # attn代表的token里面第i个元素和第j个元素的关系，自然要与衰减矩阵相关联。
         attn = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
-        # v_new 是deltaV, v_i是U~, v_prime是W<- @ S[t], deltaV= U~ - W<- @ S[t]
-        # W<- @ S[t], k_cumdecay： [B, H, chunk_num, 64, Dk],  state = (B, H, Dk, Dv)
-        v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+        # v_i是U~, v_prime是W<- @ S[t], deltaV= U~ - W<- @ S[t]
+        # W<- @ S[t], W_Arrow： [B, H, chunk_num, 64, Dk],  state = (B, H, Dk, Dv)
+        v_prime = W_Arrow[:, :, i] @ last_recurrent_state
         # U~ - W<- @ S[t]
-        v_new = v_i - v_prime
+        delta_V = v_i - v_prime
 
         # 上面的是为了计算O的准备工作，现在开始计算O
         # Ox = Q<- @ S[t], Q-< = (q_i * g[:, :, i, :, None].exp())
         attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
         # Oy = Q @ Kt * Gamma @ DeltaV
         # O = Ox + Oy
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        Ot[:, :, i] = attn_inter + attn @ delta_V
         # 更新状态 S[t+1]
         # g shape [B, H, chunk_num, chunk_size],
         last_recurrent_state = (
@@ -306,17 +327,15 @@ def torch_chunk_gated_delta_rule(
             + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(
                 -1, -2
             )
-            @ v_new
+            @ delta_V
         )
 
     if not output_final_state:
         last_recurrent_state = None
-    core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
-    )
-    core_attn_out = core_attn_out[:, :, :L]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out, last_recurrent_state
+    Ot = Ot.reshape(Ot.shape[0], Ot.shape[1], -1, Ot.shape[-1])
+    Ot = Ot[:, :, :L]
+    Ot = Ot.transpose(1, 2).contiguous().to(initial_dtype)
+    return Ot, last_recurrent_state
 
 
 def run_case(
@@ -406,6 +425,7 @@ def run_case(
     print("  -> OK\n")
 
 
+# Limitation: Q, K, V would have same head number in the test.
 def main():
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required.")
@@ -416,7 +436,6 @@ def main():
     # run_case(B=1, T=1024, H=8, K=128, V=128, label="medium")
     # run_case(B=2, T=512, H=4, K=64, V=128, label="K!=V")
 
-    # Qwen3.5-MoE-ish config (small T for speed).
     run_case(B=1, T=512, H=8, K=128, V=128, seed=42, label="qwen3.5_moe_like")
 
     print("All cases passed.")
