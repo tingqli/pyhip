@@ -1,4 +1,5 @@
 import os
+import flydsl
 import pytest
 import torch
 
@@ -8,9 +9,22 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly
 
 import pyhip
-import fx_utils as fxu
+import pyhip.contrib.flydsl as fxu
 
-# fxu.enable_dump_ir(True)
+if 1:
+    make_tiled_copy = fxu.make_tiled_copy
+    make_tiled_mma = fxu.make_tiled_mma
+    make_tiled_copy_A = fxu.make_tiled_copy_A
+    make_tiled_copy_B = fxu.make_tiled_copy_B
+    make_tiled_copy_C = fxu.make_tiled_copy_C
+else:
+    make_tiled_copy = fx.make_tiled_copy
+    make_tiled_mma = fx.make_tiled_mma
+    make_tiled_copy_A = fx.make_tiled_copy_A
+    make_tiled_copy_B = fx.make_tiled_copy_B
+    make_tiled_copy_C = fx.make_tiled_copy_C    
+
+#fxu.enable_dump_ir(True)
 
 
 # 描述 pipeline 时常常需要多个线程合作，按照 tile 访问数据
@@ -51,11 +65,11 @@ import fx_utils as fxu
 ])
 @pytest.mark.parametrize("tileM", [64, 128, 256])
 @pytest.mark.parametrize("tileN", [64, 128, 256])
-def test_tiled_copy_basic(M, N, tileM, tileN, num_waves):
+def test_tiled_copy_basic(M, N, tileM, tileN, num_waves, expand_copy):
     num_threads = num_waves * 64
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1]) # known_block_size at compile time
-    def kernel(A: fx.Tensor, B: fx.Tensor, expand_copy: fx.Constexpr[bool]):
+    def cp_kernel_basic(A: fx.Tensor, B: fx.Tensor, expand_copy: fx.Constexpr[bool]):
         bx = fx.block_idx.x
         by = fx.block_idx.y
         tid = fx.thread_idx.x
@@ -66,38 +80,35 @@ def test_tiled_copy_basic(M, N, tileM, tileN, num_waves):
         B = B[None, (bx, by)] # Tensor<f32, global, (tileM,tileN):(?{i64},1)>
 
         copy_bits = 128
-
         copy_atom = fx.make_copy_atom(fx.UniversalCopy(copy_bits), A.dtype)
-        vect_width = fxu.div_e(copy_bits, A.dtype.width)
-        vect_width = 8
-        print("vect_width: ", vect_width)
-        tv_layout = fxu.get_coalescing_tv_layout(tileM, tileN, vect_width, num_threads)
+        VECT_WIDTH = fxu.div_e(copy_bits, A.dtype.width)
+        print("VECT_WIDTH: ", VECT_WIDTH)
 
-        # tv_layout.show()
-        tiled_copy = fx.make_tiled_copy(copy_atom, tv_layout,
-                                        fx.make_tile(tv_layout.tvM, tv_layout.tvN))
-
+        tv_layout, tv_tilemn = fxu.make_mem_coalescing_2d_tv_layout(num_threads, VECT_WIDTH, tileN)
+        
+        #tiled_copy = fx.make_tiled_copy(copy_atom, tv_layout, tv_tilemn)
+        tiled_copy = make_tiled_copy(copy_atom, tv_layout, tv_tilemn)
         part_A = tiled_copy.get_slice(tid).partition_S(A)
         part_B = tiled_copy.get_slice(tid).partition_D(B)
 
-        print("part_A: ", part_A)
         if expand_copy:
-            # fxu.recurisve_apply(lambda pA, pB: fx.copy(copy_atom, pA, pB), part_A, part_B)
+            fxu.recurisve_apply(lambda pA, pB: fx.copy(copy_atom, pA, pB), part_A, part_B)
             #=========================================================================
             # faster version
-            frag = fx.make_fragment_like(part_A)
-            fxu.recurisve_apply(lambda a, b: fx.copy(copy_atom, a, b), part_A, frag)
-            fxu.recurisve_apply(lambda a, b: fx.copy(copy_atom, a, b), frag, part_B)
+            #frag = fx.make_fragment_like(part_A)
+            #fxu.recurisve_apply(lambda a, b: fx.copy(copy_atom, a, b), part_A, frag)
+            #fxu.recurisve_apply(lambda a, b: fx.copy(copy_atom, a, b), frag, part_B)
         else:
-            # fx.copy(copy_atom, part_A, part_B)
+            fx.copy(copy_atom, part_A, part_B)
             #=========================================================================
             # directly copy from global to global like above cannot hide load-latency
             # need to issue all copies from global to register w/o waitting each-other(no dependency),
             # then from register to global(wait before each store inserted by AMDGPU backend)
             #=========================================================================
-            frag = fx.make_fragment_like(part_A)
-            fx.copy(copy_atom, part_A, frag)
-            fx.copy(copy_atom, frag, part_B)
+            #frag = fx.make_fragment_like(part_A)
+            #print(">>>>>>>>>>>> ", frag)
+            #fx.copy(copy_atom, part_A, frag)
+            #fx.copy(copy_atom, frag, part_B)
     
     @flyc.jit
     def test(A: fx.Tensor, B: fx.Tensor, expand_copy: fx.Constexpr[bool],stream):
@@ -117,7 +128,7 @@ def test_tiled_copy_basic(M, N, tileM, tileN, num_waves):
         grid_m = fx.get_scalar(A.shape[1][0])
         grid_n = fx.get_scalar(A.shape[1][1])
 
-        kernel(A, B, expand_copy).launch(
+        cp_kernel_basic(A, B, expand_copy).launch(
             grid=(grid_m, grid_n, 1),
             block=(num_threads, 1, 1), stream=stream
         )
@@ -125,18 +136,13 @@ def test_tiled_copy_basic(M, N, tileM, tileN, num_waves):
     _, stream = pyhip.set_device()
     A = torch.randn(M, N, dtype=torch.float32, device="cuda")
     B = torch.zeros(M, N, dtype=torch.float32, device="cuda")
-    test(A, B, False, stream)
+    test(A, B, expand_copy, stream)
     assert torch.allclose(A, B, atol=1e-5)
-    B[...] = 0
-    test(A, B, True, torch.cuda.Stream())
-    assert torch.allclose(A, B, atol=1e-5)
-
-    _, us = pyhip.run_perftest(test, A, B, False, stream, num_iters=10, num_warmup=2, num_bytes=M*N*4*2)
-    assert torch.allclose(A, B, atol=1e-5)
-    _, us = pyhip.run_perftest(test, A, B, True, stream, num_iters=10, num_warmup=2, num_bytes=M*N*4*2)
+    _, us = pyhip.run_perftest(test, A, B, expand_copy, stream, num_iters=10, num_warmup=2, num_bytes=M*N*4*2)
     assert torch.allclose(A, B, atol=1e-5)
 
 #test_tiled_copy_basic(2*4096, 4096, 64, 128, 4)
+
 
 
 """
@@ -144,6 +150,7 @@ what happens inside partition_S/D ?
  - divide src tile into tv-layout tile
  - divide tv-layout tile into copy-atom tile
 """
+
 def test_partion():
     @flyc.jit
     def partition():
@@ -156,129 +163,96 @@ def test_partion():
 
         blockA = fx.flat_divide(A, fx.make_tile(TILE_M, TILE_K))
         at_block = fx.slice(blockA, ((None, None, bid, None)))
+
+        # STEP.1 divide block/tile into tv-layout sub-tiles
         tv_layout = fx.make_layout(((8, 8, 4), 8), ((256, 1, 8), 32))
         at_subtile = fx.tiled_divide(at_block, fx.make_tile(32, 64))
         print("at_subtile", at_subtile)
+
+        # STEP.2 divide tv-layout tile into copy-atom tile
         atomNumThr, atomNumVal = copy_atom.layout_ref_tv.shape.to_py_value()
         atomTile = fx.make_tile(atomNumThr, atomNumVal)      # tv_layout = Layout<((8,8,4),8):((256,1,8),32)> Tile<[1|8]>
         atomLayoutTV = fx.zipped_divide(tv_layout, atomTile) #             Layout<((1,8),((8,32),1)):((0,32),((256,1),0))>
+
+        # STEP.3 view copy-atom sub-tile part (atomLayoutTV[0]) as layout_src_tv/layout_dst_tv
         refInv = fx.right_inverse(copy_atom.layout_ref_tv)
-        ref2trg = fx.composition(refInv, copy_atom.layout_src_tv) # Layout<(1,8):(0,1)>
-        print("ref2trg: ", ref2trg)
-        copy_atom_tv = fx.composition(atomLayoutTV[0], ref2trg) #  Layout<(1,8):(0,32)> o Layout<(1,8):(0,1)> => Layout<(1,8):(0,32)>
-        print("atomLayoutTV[0]: ", atomLayoutTV[0])
-        print("copy_atom_tv: ", copy_atom_tv)
+        ref2trg = fx.composition(refInv, copy_atom.layout_src_tv)
+        print("ref2trg: ", ref2trg)                 # Layout<(1,4):(0,1)>
 
+        copy_atom_tv = fx.composition(atomLayoutTV[0], ref2trg) #
+        print("atomLayoutTV[0]: ", atomLayoutTV[0]) # Layout<(1,4):(0,32)>
+        print("copy_atom_tv: ", copy_atom_tv)       # Layout<(1,4):(0,32)>
+
+        # STEP.4 from (t1,v1),(t2,v2) -> (t1,t2),(v1,v2)
         thrval2mn = fxu.concat_modes((copy_atom_tv[0], atomLayoutTV[1][0]),
-                                     (copy_atom_tv[1], atomLayoutTV[1][1]))
-        print("thrval2mn: ", thrval2mn) # Layout<((1,(8,32)),(8,1)):((0,(256,1)),(32,0))>
-        thrval2mn = fx.coalesce(thrval2mn, fx.make_int_tuple((1, fx.make_int_tuple((1,1))))) # Layout<((8,32),(8,1)):((256,1),(32,0))>
-        print("thrval2mn coalesce : ", thrval2mn)
+                                    (copy_atom_tv[1], atomLayoutTV[1][1]))
 
-        thrval2mn_mode0 = fly.static(fly.TileType.get([thrval2mn.type,])) # make_tile has issue
-        at_subtile_tv = fx.composition(at_subtile, thrval2mn_mode0) # Layout<(((8,32),(8,1)),4,1,128) : (((8,8192),(1,0)),262144,0,64)>
-        print("at_subtile_tv", at_subtile_tv)
+        print("thrval2mn: ", thrval2mn)           # Layout<((1,(8,32)),(4,2)):((0,(256,1)),(32,128))>
+        thrval2mn = fx.coalesce(thrval2mn, fx.make_int_tuple((1, fx.make_int_tuple((1,1))))) # Layout<((8,32),(8,1)):((256,1),(32,0))>
+        print("thrval2mn coalesce : ", thrval2mn) # Layout<((8,32),(4,2)):((256,1),(32,128))>
+
+        at_subtile_tv = fx.composition(at_subtile, make_tile(thrval2mn))
+        print("at_subtile_tv", at_subtile_tv)         # Layout<(((8,32),(4,2)),4,1,128):(((8,8192),(1,4)),262144,0,64)>
         at_subtile_thread = fx.slice(at_subtile_tv, ((1, None), None, None, None))
-        print("at_subtile_thread", at_subtile_thread) # Layout<((8,1),4,1,128):((1,0),262144,0,64)>
+        print("at_subtile_thread", at_subtile_thread) # Layout<((4,2),4,1,128):((1,4),262144,0,64)>
         
-        # first mode is (copy-atom-value, tv-layout-value), for example, tv-layout allocate 8 values per thread
-        # copy-atom can only copy 4 values per thread, the first-mode will be (4,2)
+        # first mode is (num_values_copyatom, num_values_tvlayout//num_values_copyatom),
+        # for example, tv-layout allocate 8 values per thread copy-atom can only copy 4
+        # values per thread, the first-mode will be (4,2)
+        #
+        # the rest modes (4,1,128) are tv-layout-tile repeats from tiled_divide(block, tile(tv_layout_m, tv_layout_n))
 
     partition()
 
 # test_partion()
 
 
-def test_tiled_gather_rows(M, N, tileM, tileN, num_waves):
+def test_custom_copy_basic(M, N, tileM, tileN, num_waves):
     num_threads = num_waves * 64
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1]) # known_block_size at compile time
-    def kernel(A: fx.Tensor, B: fx.Tensor, sorted_row_idx: fx.Tensor):
+    def cp_kernel_custom(A: fx.Tensor, B: fx.Tensor):
         bx = fx.block_idx.x
         by = fx.block_idx.y
         tid = fx.thread_idx.x
-
-        assert A.dtype == B.dtype
-
-        print(sorted_row_idx)
-        sorted_row_idx = sorted_row_idx[None, bx] # Tensor<f32, global, (tileM,tileN):(?{i64},1)>
-        print(sorted_row_idx)
-
+        A = A[None, (bx, by)] # Tensor<f32, global, (tileM,tileN):(?{i64},1)>
         B = B[None, (bx, by)] # Tensor<f32, global, (tileM,tileN):(?{i64},1)>
 
         copy_bits = 128
-
         copy_atom = fx.make_copy_atom(fx.UniversalCopy(copy_bits), A.dtype)
-        vect_width = fxu.div_e(copy_bits, A.dtype.width)
+        VECT_WIDTH = fxu.div_e(copy_bits, A.dtype.width)
 
-        tv_layout = fxu.get_coalescing_tv_layout(tileM, tileN, vect_width, num_threads)
+        # ======= coealescing TV-layout =======
+        tv_layout, tv_tilemn = fxu.make_mem_coalescing_2d_tv_layout(num_threads, VECT_WIDTH*1, tileN)
+        
+        A = fxu.tv_partition(A, tv_layout, tv_tilemn)
+        B = fxu.tv_partition(B, tv_layout, tv_tilemn)
+        frag = fx.make_fragment_like(A[(tid, None), None])
+        print(">>>>>>>>>>>>2 ", A[(tid, None), None], B[(tid, None), None], frag)
 
-        # tv_layout.show()
-        tiled_copy = fx.make_tiled_copy(copy_atom, tv_layout,
-                                        fx.make_tile(tv_layout.tvM, tv_layout.tvN))
-
-        coord_tensor = fx.Tensor(fx.make_view(fx.make_int_tuple(0),
-                                              fx.make_layout((tileM, tileN), (1, tileM))))
-
-        part_crd = tiled_copy.get_slice(tid).partition_S(coord_tensor)
-        part_B = tiled_copy.get_slice(tid).partition_D(B)
-
-        # since make_tiled_copy() is applied to static layout, all partitions can be known at compile time, 
-        # so we can collect all real row-numbers for each atom.
-        row_idx = {}
-        def collect_rows(pc, idx):
-            m = fx.get_scalar(pc[0]) % tileM
-            row_idx[idx] = sorted_row_idx[m]
-        fxu.recurisve_apply(collect_rows, part_crd, idx=0)
-
-        print("part_A: ", part_crd)
-        def copy_atom_call(pc, pB, idx):
-            nonlocal A
-            # recover coordinate from coord_tensor
-            # print("pc: ", pc, "pB: ", pB)
-            m, n = fx.get_scalar(pc[0]) % tileM, fx.get_scalar(pc[0]) // tileM
-            coord = fx.make_coord(row_idx[idx], n + by* tileN)
-            iter = fx.add_offset(fx.get_iter(A), fx.crd2idx(coord, A.layout))
-            # here we assume atom copy is 1d continous
-            atom_A = fx.make_view(iter, copy_atom.layout_src_tv)
-            fx.copy_atom_call(copy_atom, atom_A, pB)
-            idx += 1
-
-        # fxu.recurisve_apply(copy_atom_call, part_crd, part_B)
-        # ==========================================================
-        # faster version, first copy from global to register, then from register to global
-        frag = fx.make_fragment_like(part_B)
-        print(frag)
-        assert 0
-        fxu.recurisve_apply(copy_atom_call, part_crd, frag, idx=0)
-        fxu.recurisve_apply(lambda a, b: fx.copy(copy_atom, a, b), frag, part_B)
-
+        print(A.layout)
+        frags = []
+        num_iters = fx.size(A.layout[1]).get_static_leaf_int
+        for i in fx.range_constexpr(num_iters):
+            part_A = A[(tid, None), i]
+            part_B = B[(tid, None), i]
+            frags.append(fx.make_fragment_like(part_A))
+            fx.copy(copy_atom, part_A, frags[-1])
+            fx.copy(copy_atom, frags[-1], part_B)
+            
     @flyc.jit
-    def test(A: fx.Tensor, B: fx.Tensor, sorted_row_idx: fx.Tensor, stream):
-
-        assert A.stride[1].get_static_leaf_int == 1 and B.stride[1].get_static_leaf_int == 1, \
-              "kernel assumes 2nd mode is contiguous"
-
-        assert A.leading_dim == 1 and B.leading_dim == 1, \
-              "kernel assumes 2nd mode is contiguous"
-        sorted_row_idx = fx.zipped_divide(sorted_row_idx, fx.make_tile(tileM))
+    def test(A: fx.Tensor, B: fx.Tensor, stream):
+        assert A.dtype == B.dtype
+        assert A.leading_dim == 1 and B.leading_dim == 1, "kernel assumes 2nd mode is contiguous"
+        A = fx.zipped_divide(A, fx.make_tile(tileM, tileN))
         B = fx.zipped_divide(B, fx.make_tile(tileM, tileN))
+        assert A.stride[0][1].get_static_leaf_int == 1 and B.stride[0][1].get_static_leaf_int == 1, \
+              "kernel assumes 2nd mode is contiguous"
 
-        print("before recast_iter: ", sorted_row_idx)
-        sorted_row_idx = fx.Tensor(
-            fx.make_view(fx.recast_iter(fx.Int32, fx.get_iter(sorted_row_idx)), sorted_row_idx.layout)
-        )
-        print("after recast_iter: ", sorted_row_idx)
+        grid_m = fx.get_scalar(A.shape[1][0])
+        grid_n = fx.get_scalar(A.shape[1][1])
 
-        print("========", sorted_row_idx)
-        print("========", B)
-
-        grid_m = fx.get_scalar(B.shape[1][0])
-        grid_n = fx.get_scalar(B.shape[1][1])
-
-        # fx.printf("grid_m: {}, grid_n: {}", grid_m, grid_n)
-
-        kernel(A, B, sorted_row_idx).launch(
+        cp_kernel_custom(A, B).launch(
             grid=(grid_m, grid_n, 1),
             block=(num_threads, 1, 1), stream=stream
         )
@@ -286,14 +260,33 @@ def test_tiled_gather_rows(M, N, tileM, tileN, num_waves):
     _, stream = pyhip.set_device()
     A = torch.randn(M, N, dtype=torch.float32, device="cuda")
     B = torch.zeros(M, N, dtype=torch.float32, device="cuda")
-    sorted_row_idx = torch.randint(low=0, high=M, size=(M,), dtype=torch.int32, device="cuda")
-    print("sorted_row_idx: ", sorted_row_idx.shape)
-    print(sorted_row_idx)
-    test(A, B, sorted_row_idx, stream)
-    assert torch.allclose(A[sorted_row_idx], B)
+    test(A, B, stream)
+    assert torch.allclose(A, B, atol=1e-5)
+    _, us = pyhip.run_perftest(test, A, B, stream, num_iters=10, num_warmup=2, num_verbose=0, num_name = "kerne_copy",
+                               num_bytes=A.numel()*A.element_size()+B.numel()*B.element_size())
+    assert torch.allclose(A, B, atol=1e-5)
 
-    _, us = pyhip.run_perftest(test, A, B, sorted_row_idx, stream, num_iters=10, num_warmup=2, num_bytes=M*N*4*2)
-    assert torch.allclose(A[sorted_row_idx], B)
+    torch_copy = lambda A, B: B.copy_(A)
+    _, us = pyhip.run_perftest(torch_copy, A, B, num_iters=10, num_warmup=2, num_verbose=0, num_name = "torch_copy",
+                               num_bytes=A.numel()*A.element_size()+B.numel()*B.element_size())    
 
-#test_tiled_gather_rows(128, 128, 128, 128, 4)
-test_tiled_gather_rows(4096, 4096, 128, 128, 4)
+if 0:
+    test_custom_copy_basic(2*4096, 4096, 64, 256, 4)
+    test_tiled_copy_basic(2*4096, 4096, 64, 256, 4, True)
+    test_tiled_copy_basic(2*4096, 4096, 64, 256, 4, False)
+    test_tiled_copy_basic(1024, 256*256, 1, 256*256, 4, False)
+
+# more waves/threads per work-group allows more coalescing
+# but if tileN is bigger enough, 1 wave per WG is also good
+if 0:
+    test_custom_copy_basic(2*4096, 4096, 64, 256, 4)    # 2.8TB/s 
+    test_custom_copy_basic(2*4096, 4096, 64, 256, 1)    # 2.9TB/s
+    test_custom_copy_basic(2*4096, 4096, 1, 4096, 1)    # 3.1TB/s
+    test_custom_copy_basic(2*4096, 4096, 1, 4096, 4)    # 3.3TB/s
+    test_custom_copy_basic(2*4096, 4096, 1, 4096, 8)    # 3.1TB/s
+
+test_custom_copy_basic(4*4096, 8192, 1, 8192, 4)    # 3.4TB/s
+test_custom_copy_basic(1, 400*80*8192, 1, 8192, 8)  # 3.5TB/s
+
+# Why we can't reach 4TB/s ?
+# torch copy was even slower.

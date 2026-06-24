@@ -25,5 +25,6 @@ packages = [
     "pyhip.contrib",
     "pyhip.contrib.common",
     "pyhip.contrib.gluon",
+    "pyhip.contrib.flydsl",
 ]
 package-dir = {"pyhip" = "src"}

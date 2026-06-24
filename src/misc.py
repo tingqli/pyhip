@@ -188,7 +188,6 @@ def run_perftest(kernel, *args, **kwargs):
 
     num_verbose = extract_attr(kwargs, 'num_verbose', 0)
     kernel_name = getattr(kernel, "__name__", "kernel?")
-    perf = cudaPerf(name = kernel_name, verbose=num_verbose)
 
     num_iters = extract_attr(kwargs, 'num_iters', 10)
     num_warmup = extract_attr(kwargs, 'num_warmup', 2)
@@ -196,6 +195,9 @@ def run_perftest(kernel, *args, **kwargs):
     num_flops = extract_attr(kwargs, 'num_flops', 0)
     num_bytes = extract_attr(kwargs, 'num_bytes', 0)
     num_spec_tag = extract_attr(kwargs, 'num_spec_tag', '')
+    kernel_name = extract_attr(kwargs, 'num_name', kernel_name)
+
+    perf = cudaPerf(name = kernel_name, flops=num_flops, rw_bytes=num_bytes, verbose=num_verbose)
 
     if num_copies == 0:
         copy_size = 0
@@ -216,11 +218,30 @@ def run_perftest(kernel, *args, **kwargs):
         else:
             num_copies = num_warmup + num_iters
 
+    copy_bytes = 0
     args_copies = []
     kwarg_copies = []
     for _ in range(num_copies):
-        args_copies.append(copy.deepcopy(args))
-        kwarg_copies.append(copy.deepcopy(kwargs))
+        new_args = []
+        for i in range(len(args)):
+            if isinstance(args[i], torch.Tensor):
+                new_args.append(args[i].clone())
+                copy_bytes += args[i].numel() * args[i].element_size()
+            else:
+                new_args.append(args[i])
+        args_copies.append(new_args)
+
+        new_kwargs = {}
+        for k,v in kwargs.items():
+            if isinstance(args[i], torch.Tensor):
+                new_kwargs[k] = args[i].clone()
+                copy_bytes += args[i].numel() * args[i].element_size()
+            else:
+                new_kwargs[k] = args[i]
+        kwarg_copies.append(new_kwargs)
+
+    # first run on original inputs to return the output, then run on copies for perf
+    out = kernel(*args, **kwargs)
 
     for i in range(num_warmup + num_iters):
         with perf:
@@ -229,7 +250,7 @@ def run_perftest(kernel, *args, **kwargs):
     dt = perf.dt(excludes=num_warmup)
 
     if num_flops or num_bytes:
-        msg = f"{kernel_name} {num_spec_tag} :  {dt*1e6:.0f} us"
+        msg = f"{kernel_name} {num_spec_tag} : copied x{num_copies}={copy_bytes/(1024**3):.2f} GB, {dt*1e6:.0f} us"
         if num_flops:
             msg += f", {num_flops/dt*1e-12:.3f} TFLOPS"
         if num_bytes:
@@ -260,4 +281,4 @@ def set_device(selected_device = -1):
     torch.manual_seed(0)
     free_mem, total_mem = torch.cuda.mem_get_info(selected_device)
     print(f"Use cuda device {selected_device} with {free_mem*100/total_mem:.1f}% Free mem : {free_mem/(1024**3):.0f}GB / {total_mem/(1024**3):.0f} GB")
-    return selected_device
+    return selected_device, torch.cuda.current_stream()
