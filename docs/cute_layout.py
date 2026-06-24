@@ -9,23 +9,34 @@ class HTuple:
     # this creation process will recursively convert nested tuples/lists/ints into HTuple, 
     # and also compute the size attribute for each node in the process
     @classmethod
-    def create(cls, tuple_or_int_or_htuple):
-        if isinstance(tuple_or_int_or_htuple, int):
-            return cls(tuple_or_int_or_htuple)
-        elif isinstance(tuple_or_int_or_htuple, tuple) or isinstance(tuple_or_int_or_htuple, list):
-            return cls(*tuple_or_int_or_htuple)
-        elif isinstance(tuple_or_int_or_htuple, HTuple):
-            return tuple_or_int_or_htuple
+    def get_dtype(cls, h):
+        if isinstance(h, HTuple):
+            return h.dtype
+        if isinstance(h, (tuple,list)):
+            return cls.get_dtype(h[0])
+        else:
+            return type(h)
+    @classmethod
+    def create(cls, h, dtype=int):
+        if dtype is None:
+            dtype = cls.get_dtype(h)
+        if isinstance(h, dtype):
+            return cls(h, dtype=dtype)
+        elif isinstance(h, (tuple,list)):
+            return cls(*h, dtype=dtype)
+        elif isinstance(h, HTuple):
+            return h
         else:
             raise ValueError("Invalid input type for HTuple.create")
 
-    def __init__(self, *args):
-        if len(args) == 1 and isinstance(args[0], int):
+    def __init__(self, *args, dtype=int): # dtype is element type
+        self.dtype = dtype
+        if len(args) == 1 and isinstance(args[0], dtype):
             self.is_leaf = True
             self.children = [args[0]]
         else:
             self.is_leaf = False
-            self.children = [HTuple.create(arg) for arg in args]
+            self.children = [HTuple.create(arg, dtype=dtype) for arg in args]
 
         self.depth = self._depth()
         self.rank = len(self.children)
@@ -265,19 +276,19 @@ def test_coordinate():
         print(f"idx={i}, crd={crd}, idx2={idx}")
         assert idx == i
 
-shape1 = Shape(12)
-shape2 = Shape(6, 2)
-shape3 = Shape((2,3), 2)
-for i in range(12):
-    crd1 = idx2crd(i, shape1)
-    crd2 = idx2crd(i, shape2)
-    crd3 = idx2crd(i, shape3)
-    print(f"idx={i}, crd1={crd1}, crd2={crd2}, crd3={crd3}")
-    expect2 = (i % 6, i // 6)
-    expect3 = (((i % 6) % 2, (i % 6) // 2), i // 6)
-    assert crd1 == i
-    assert crd2 == expect2, f"{crd2} != {expect2}"
-    assert crd3 == expect3, f"{crd3} != {expect3}"
+    shape1 = Shape(12)
+    shape2 = Shape(6, 2)
+    shape3 = Shape((2,3), 2)
+    for i in range(12):
+        crd1 = idx2crd(i, shape1)
+        crd2 = idx2crd(i, shape2)
+        crd3 = idx2crd(i, shape3)
+        print(f"idx={i}, crd1={crd1}, crd2={crd2}, crd3={crd3}")
+        expect2 = (i % 6, i // 6)
+        expect3 = (((i % 6) % 2, (i % 6) // 2), i // 6)
+        assert crd1 == i
+        assert crd2 == expect2, f"{crd2} != {expect2}"
+        assert crd3 == expect3, f"{crd3} != {expect3}"
 
 # 2.3 Stride
 # Definition2.15. A stride D for a shape S is an HTuple(D) that is congruent with the shape, S∼D. This stride
@@ -300,60 +311,133 @@ Stride is essentially a "generator" of an integer semimodule, and the index → 
 
 Section 2.4.4, "Semi-Linearity," further expresses the stride form in matrix form as a linear form.
 """
-class IntegerSemimodule:
-    # (Z,+,.)
-    @staticmethod
-    def add(stride0, stride1): return stride0 + stride1
 
-    @staticmethod
-    def mul(scalar, stride): return scalar * stride
+class IntegerSemimodule_ZXORm:
+    def __init__(self, v): self.v = v
+    def __add__(self, other):
+        v = other if isinstance(other, int) else other.v
+        return IntegerSemimodule_ZXORm(self.v ^ v)
+    def __sub__(self, other):
+        v = -other if isinstance(other, int) else -other.v
+        return IntegerSemimodule_ZXORm(self.v ^ v)        
+    def __mul__(self, scalar): return IntegerSemimodule_ZXORm(self.v * scalar)
+    def __rmul__(self, scalar): return IntegerSemimodule_ZXORm(self.v * scalar)
+    def __abs__(self): return IntegerSemimodule_ZXORm(abs(self.v))
+    def __repr__(self): return f"{self.v}_zxor."
 
-    # (Z, XOR, .)
-    @staticmethod
-    def xor(stride0, stride1): return stride0 ^ stride1
+class IntegerSemimodule_Vector:
+    def __init__(self, *values):
+        self.v = values
+        self.ndims = len(values)
 
+    def size(self):
+        sz = 1
+        for a in self.v:
+            sz *= abs(a)
+        return sz
 
-def inner_product(crd:HTuple, stride:HTuple, add = IntegerSemimodule.add, mul = IntegerSemimodule.mul):
+    def __add__(self, other):
+        assert isinstance(other, (int, IntegerSemimodule_Vector)), other
+        if isinstance(other, int):
+            v = []
+            for a in self.v:
+                v.append(a + other)
+            return IntegerSemimodule_Vector(*v)
+
+        assert self.ndims == other.ndims, "Vector must have the same number of dimensions to be added"
+        v = []
+        for a, b in zip(self.v, other.v):
+            v.append(a + b)
+        return IntegerSemimodule_Vector(*v)
+
+    def __sub__(self, other):
+        return self.__add__(-other)
+
+    def __mul__(self, scalar):
+        v = []
+        for a in self.v:
+            v.append(a * scalar)
+        return IntegerSemimodule_Vector(*v)
+
+    def __rmul__(self, scalar): return self.__mul__(scalar)
+
+    def __abs__(self):
+        v = []
+        for a in self.v:
+            v.append(abs(a))
+        return IntegerSemimodule_Vector(*v)
+
+    def __repr__(self):
+        return "<" + ",".join([f"{a}" for a in self.v]) + ">"
+
+ZXORm = IntegerSemimodule_ZXORm
+Vector = IntegerSemimodule_Vector
+
+def inner_product(crd:HTuple, stride:HTuple):
     if crd.is_leaf and stride.is_leaf:
-        return mul(crd.get_leaf(), stride.get_leaf())
+        return crd.get_leaf() * stride.get_leaf()
     elif not crd.is_leaf and not stride.is_leaf:
         assert crd.rank == stride.rank
         offset = None
         for c, s in zip(crd.children, stride.children):
-            off = inner_product(c, s, add, mul)
+            off = inner_product(c, s)
             if offset is None:
                 offset = off
             else:
-                offset = add(offset, off)
+                offset = offset + off
         return offset
     else:
         raise ValueError("crd and stride must have the same structure")
 
+def coshape(layout):
+    if layout.shape.is_leaf:
+        c = layout.shape.get_leaf() - 1
+        return c * abs(layout.stride.get_leaf()) + 1
+    else:
+        ret = layout(0)
+        for i in range(layout.rank):
+            ret += coshape(layout[i]) - 1
+        return ret + 1
+
+def cosize(codomain_shape):
+    if isinstance(codomain_shape, (int, IntegerSemimodule_ZXORm)):
+        return codomain_shape
+    if isinstance(codomain_shape, IntegerSemimodule_Vector):
+        return codomain_shape.size()
+    raise ValueError("codomain_shape must be an integer, IntegerSemimodule_ZXORm, or IntegerSemimodule_Vector")
 
 class Layout:
-    def __init__(self, shape:Shape, stride:Stride, _inner_product = inner_product):
+    def __init__(self, shape:Shape, stride:Stride):
         shape = Shape.create(shape)
-        stride = Stride.create(stride)
+        stride = Stride.create(stride, dtype=None)
         assert Congruence(shape, stride)
         self.shape = shape
         self.stride = stride
         self.rank = shape.rank
         self.depth = shape.depth
         self.size = shape.size
-        self.inner_product = _inner_product
         # how to get codomain size?
-        # given strides are positive, integral coordinate (shape.size-1) ensures 
-        # each dimension of natural coordinates are max, thus the max valid physical offset
-        # note self(shape.size) is not correct since out-bounds coordinates's behavior is determined by strides
+        # it's the minimal size of surrounding box in codomain, which
+        # can enclose all valid projections of layout() function
+        # for example :
+        #   for Layout (2,2):(1,-4), codomain is {0, 1, -4, -3}, so coshape == cosize == 4
+        #   for Layout (2,2):(e0,-4*e1)
+        #        codomain is {0*e0 + 0*e1,
+        #                     1*e0 + 0*e1,
+        #                     0*e0 - 4*e1,
+        #                     1*e0 - 4*e1}, so coshape is (2*e0, 5*e1), and cosize is 10
+        # 
         self.cosize = self(shape.size - 1) + 1
+        self.coshape = coshape(self)
+        self.cosize = cosize(self.coshape)
 
     def __call__(self, *crd):
         idx = crd2idx(crd, self.shape)
         natural_crd = idx2crd(idx, self.shape)                      # S : Z ↔ZS, ∀Z ∈Z(S) 
         if isinstance(natural_crd, int):
-            addr = self.inner_product(HTuple(natural_crd), self.stride)     # D : ZS →D
+            addr = inner_product(HTuple(natural_crd), self.stride)     # D : ZS →D
         else:
-            addr = self.inner_product(HTuple(*natural_crd), self.stride)     # D : ZS →D
+            addr = inner_product(HTuple(*natural_crd), self.stride)     # D : ZS →D
         return addr
 
     def Coarsens(self, other):
@@ -376,7 +460,7 @@ class Layout:
     def __eq__(self, value):
         return self.shape == value.shape and self.stride == value.stride
     
-    def show(self, stride_names = None):
+    def show(self, stride_names = None, verbose=1):
         if stride_names is not None:
             # stride_names = "T4 V8"
             # reinterpret offset 6 according to shape (4, 8):
@@ -406,22 +490,22 @@ class Layout:
             def offset_name(offset, n):
                 return f"{offset:6d}"
 
-        caller_frame = inspect.stack()[1]
-        if caller_frame.code_context:
-            src_line = f"\033[32m{caller_frame.filename}:{caller_frame.lineno}" \
-              + "  " + caller_frame.code_context[0].strip() + "\033[0m"
-        else:
-            src_line = "?"
+        if verbose:
+            caller_frame = inspect.stack()[1]
+            if caller_frame.code_context:
+                src_line = f"\033[32m{caller_frame.filename}:{caller_frame.lineno}\n" \
+                + "  " + caller_frame.code_context[0].strip() + "\033[0m"
+            else:
+                src_line = "?"
 
-        print(src_line)
-        print(self, f"{stride_names=}")
-        if self.rank >= 1:
+            print(src_line)
+        print(self, f"shape(size)->coshape(cosize) {repr(self.shape)}({self.size})->{repr(self.coshape)}({self.cosize}) rank:{self.rank} depth:{self.depth}")
+        if self.rank != 2:
             for i in range(self.size):
-                print(f"{offset_name(self(i), i)}", end=",")
+                print(f"{offset_name(self(i),i)}", end=",")
                 if i >= 16:
                     print(end=" ... ")
             print()
-            return self
         if self.rank == 2:
             for m in range(self.shape[0].size):
                 m_coord = idx2crd(m, self.shape[0])
@@ -435,6 +519,20 @@ class Layout:
                 print()
             return self
         return self
+
+if 0:
+    layout = Layout((2,2), (1,4))
+    print(layout, layout.cosize, layout.coshape, layout(3))
+    layout = Layout((2,2), (1,-4))
+    print(layout, layout.cosize, layout.coshape, layout(3))
+
+    a = Layout((2,2), (ZXORm(1), ZXORm(5)))
+    print(a, a(0,0), a(1,0), a(0,1), a(1,1))
+
+    e0 = Vector(1, 0)
+    e1 = Vector(0, 1)
+    layout = Layout((2,2), (e0,-4*e1))
+    print(layout, layout.cosize, layout.coshape, layout(3))
 
 def concatenation(*layouts):
     new_shape = []
@@ -477,8 +575,8 @@ def test_layout():
         assert layout(3, n) == 9 + n_off
 
     # reproduce Figure4 (c) Binary Swizzle
-    layout = Layout((4,(4,3)), (1,(5,16)),
-                    lambda crd, stride: inner_product(crd, stride, add=IntegerSemimodule.xor, mul=IntegerSemimodule.mul))
+    
+    layout = Layout((4,(4,3)), (ZXORm(1),(ZXORm(5),ZXORm(16))))
 
     answer = ((0, 5, 10, 15, 16, 21, 26, 31, 32, 37, 42, 47, ),
               (1, 4, 11, 14, 17, 20, 27, 30, 33, 36, 43, 46, ),
@@ -487,7 +585,7 @@ def test_layout():
     for m in range(4):
         print("(", end="")
         for n in range(12):
-            offset = layout(m, n)
+            offset = layout(m, n).v
             print(f"{offset}, ", end="")
             assert offset == answer[m][n], f"layout({m}, {n})={offset} != {answer[m][n]}"
         print("),")
@@ -826,8 +924,10 @@ def logical_divide(A, B, tiler_mode=None):
         B = Layout(B, 1)
     if isinstance(B, Layout):
         return composition(A, concatenation(B, complement(B, A.size)), verify=False)
+    elif B is None:
+        return A
     else:
-        assert isinstance(B, tuple) or isinstance(B, list), "Tiler must be either int, Layout, or tuple/list of Tilers"
+        assert isinstance(B, tuple) or isinstance(B, list), f"Tiler must be either int, Layout, or tuple/list of Tilers, got {type(B)}"
         div_layouts = []
         keep_layouts = []
         for i in range(A.rank):
@@ -872,7 +972,7 @@ def logical_product(A, B, tiler_mode=None):
     if isinstance(B, int):
         B = Layout(B, 1)
     if isinstance(B, Layout):
-        return concatenation(A, composition(complement(A, A.size * B.cosize), B), verify=False)
+        return concatenation(A, composition(complement(A, A.size * B.cosize), B))
     else:
         assert isinstance(B, tuple) or isinstance(B, list), "Tiler must be either int, Layout, or tuple/list of Tilers"
         prod_layouts = []
@@ -1005,7 +1105,7 @@ def test_tv_layout():
     # to group modes correctly:
     rinv = composition(right_inverse(tv_layout), Layout((4,8),(1,4)))
     rinv.show("T8 .4") # inverse of tv_layout is good for understanding if we know target shape
-    assert 0
+
     # most natural way to get tv_layout is to construct Inverse TV Layout, then call make_layout_tv()
     # Inverse TV Layout: (M4,N8) -> (T8,V4)
     """
@@ -1066,7 +1166,7 @@ def test_tv_layout():
     mn = Layout((4, 8),(1, 4))
     composition(right_inverse(tv_layout), mn).show("T8 v4")
 
-test_tv_layout()
+# test_tv_layout()
 
 if 0:
     N = 256
@@ -1083,17 +1183,20 @@ if 0:
     Layout((3,2),(2,12)).show()
                                                 #   fx.make_tile(8 * 4, TILE_K)
 
-print(flat_divide(Layout((512,8192),(8192,1)), [256]))
+    print(flat_divide(Layout((512,8192),(8192,1)), [256]))
 
-at_block = Layout((128,64,128),(8192,1,64)) # (m128, k64, num_TileK) -> offsets
-tv_layout = Layout(((8, 8, 4), 8), ((256, 1, 8), 32)) # (T256, v8) -> (M32, n64)
-at_subtile = tiled_divide(at_block, [32, 64]) # Layout(((32, 64), 4, 1, 128):((8192, 1), 262144, 0, 64))
-subtile_tv = composition(at_subtile[0], tv_layout)
-at_subtile_tv = concatenation(subtile_tv, *[at_subtile[k] for k in range(1, at_subtile.rank)])
+    at_block = Layout((128,64,128),(8192,1,64)) # (m128, k64, num_TileK) -> offsets
+    tv_layout = Layout(((8, 8, 4), 8), ((256, 1, 8), 32)) # (T256, v8) -> (M32, n64)
+    at_subtile = tiled_divide(at_block, [32, 64]) # Layout(((32, 64), 4, 1, 128):((8192, 1), 262144, 0, 64))
+    subtile_tv = composition(at_subtile[0], tv_layout)
+    at_subtile_tv = concatenation(subtile_tv, *[at_subtile[k] for k in range(1, at_subtile.rank)])
 
-print(tv_layout)
-print(at_subtile)
-print(at_subtile_tv)
+    print(tv_layout)
+    print(at_subtile)
+    print(at_subtile_tv)
+
+# mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+
 """
 Tensor<Value(%191 = "fly.tiled_copy.partition_src"(%189, %111, %190) : 
 (!fly.tiled_copy<!fly.copy_atom<!fly_rocdl.cdna3.buffer_copy<128>, 16>,

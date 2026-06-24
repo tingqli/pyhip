@@ -62,6 +62,66 @@ def hip_check_error(err):
     if err != 0:
         raise Exception("HIP error:" + get_amdhip().hipGetErrorString(err).decode("utf-8"))
 
+class HSACO:
+    def __init__(self, p_lib):
+        hip = get_amdhip()
+        self.p_lib = p_lib
+
+        kernel_cnt = ctypes.c_uint32()
+        hip_check_error(hip.hipLibraryGetKernelCount(ctypes.byref(kernel_cnt), p_lib))
+
+        assert kernel_cnt.value > 0
+        self.kernels = (ctypes.c_void_p * kernel_cnt.value)()
+
+        hip_check_error(hip.hipLibraryEnumerateKernels(self.kernels, kernel_cnt, p_lib))
+
+        self.kernel_names = []
+        for k in self.kernels:
+            p_name = ctypes.c_char_p()
+            hip_check_error(hip.hipKernelGetName(ctypes.byref(p_name), k))
+            assert p_name.value is not None
+            cur_kernel_name = p_name.value.decode('utf-8')
+            self.kernel_names.append(cur_kernel_name)
+    
+    def __getattr__(self, name):
+        hip = get_amdhip()
+        p_func = self.kernels[self.kernel_names.index(name)]
+        def CallableKernel(gridDims:list[int], blockDims:list[int], *args, sharedMemBytes = 0, ):
+            fields = []
+            for i,arg in enumerate(args):
+                if isinstance(arg, torch.Tensor):
+                    fields.append((f"arg_{i}", ctypes.c_void_p))
+                elif isinstance(arg, int):
+                    # ctypes.c_uint/ctypes.c_ulong
+                    fields.append((f"arg_{i}", ctypes.c_int))
+                elif isinstance(arg, float):
+                    fields.append((f"arg_{i}", ctypes.c_float))
+                else:
+                    raise Exception(f"Unsupported arg type: {arg}")
+            class Args(ctypes.Structure):
+                _fields_ = fields
+            kernel_args = Args()
+            for i,a in enumerate(args):
+                setattr(kernel_args, f"arg_{i}", a.data_ptr() if isinstance(a, torch.Tensor) else a)
+            ExtraType = ctypes.c_void_p * 5
+            kernel_args_size = ctypes.c_uint64(ctypes.sizeof(kernel_args))
+            kernel_config = ExtraType(1, ctypes.addressof(kernel_args), 2, ctypes.addressof(kernel_args_size), 3)
+            stream = ctypes.cast(torch.cuda.current_stream(), ctypes.c_void_p)
+            while len(gridDims) < 3:
+                gridDims.append(1)
+            while len(blockDims) < 3:
+                blockDims.append(1)
+            hip_check_error(hip.hipModuleLaunchKernel(p_func, *gridDims, *blockDims, sharedMemBytes, stream, 0, ctypes.byref(kernel_config)))
+        return CallableKernel
+
+@functools.cache
+def get_lib(lib_fpath):
+    hip = get_amdhip()
+    p_lib = ctypes.c_void_p()
+    hip_check_error(hip.hipLibraryLoadFromFile(ctypes.byref(p_lib), lib_fpath.encode('utf-8'), None, None,0, None,None, 0))
+    return HSACO(p_lib)
+
+"""
 @functools.cache
 def get_lib(lib_fpath):
     hip = get_amdhip()
@@ -71,9 +131,8 @@ def get_lib(lib_fpath):
 
 @functools.cache
 def get_kernel(kernel_path_prefix, constexpr_args:tuple = ()):
-    """
-    constexpr_args is compile-time args which are part of co-file name
-    """
+    #constexpr_args is compile-time args which are part of co-file name
+
     kernel_path_base, kernel_name = os.path.split(kernel_path_prefix)
     if len(kernel_path_base) == 0:
         kernel_path_base = "" # default path base
@@ -145,3 +204,4 @@ def get_kernel(kernel_path_prefix, constexpr_args:tuple = ()):
     return CallableKernel
 
 
+"""
