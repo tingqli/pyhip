@@ -62,11 +62,11 @@ def torch_recurrent_gated_delta_rule(
         g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
         beta_t = beta[:, :, i].unsqueeze(-1)
 
-        last_recurrent_state = last_recurrent_state * g_t
-        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
-        delta = (v_t - kv_mem) * beta_t
-        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
+        last_recurrent_state = last_recurrent_state * g_t # S = α·S_{t-1}
+        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2) # = (α S_{t-1})^T k_t
+        delta = (v_t - kv_mem) * beta_t # = β(v_t - α S_{t-1} k_t)
+        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2) # S += k ⊗ delta
+        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2) # o = S^T q
 
     if not output_final_state:
         last_recurrent_state = None
