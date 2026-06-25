@@ -357,8 +357,14 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             if B * TOPK <= E:
                 grid = B * TOPK
             from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
+            if weight_type == torch.bfloat16:
+                weight_dtype = 'bf16'
+                quant_type = 'no'
+            else:
+                weight_dtype = 'fp8'
+                quant_type = 'ptpc' if fp8_ptpc else 'per_token'
             gateup = _moe_compile(
-                N=N1, K=K1, weight_dtype=w1.dtype, TOPK=TOPK,
+                N=N1, K=K1, weight_dtype=weight_dtype, quant_type=quant_type, TOPK=TOPK,
                 BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
                 BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
                 stage='gateup', alg='splitk',
@@ -382,7 +388,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 else:
                     gemm2_out = torch.empty([B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device)
                 down = _moe_compile(
-                    N=N2, K=K2, weight_dtype=w1.dtype, TOPK=TOPK,
+                    N=N2, K=K2, weight_dtype=weight_dtype, quant_type=quant_type, TOPK=TOPK,
                     BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
                     BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
                     stage='down', alg='splitk',
@@ -609,12 +615,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         diff = calc_diff(ref_out, cur_out)
         if 1 and diff > 0.02:
         #if not torch.allclose(ref_out, cur_out, rtol=0.02, atol=0.02):
-            print(ref_out)
-            print(cur_out)
+            print('ref', ref_out)
+            print('cur', cur_out)
             idx = torch.where(torch.abs(ref_out - cur_out) > 0.01)
             if len(idx[0]):
                 print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
-            assert 0, f"{kernel_type=}, {B=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=}"
+            assert 0, f"{kernel_type=}, {B=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=} {diff=:.8f}"
         else:
             quantype=""
             if wei_is_fp8(weight_type):
@@ -622,11 +628,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     quantype = " @ PTPC"
                 else:
                     quantype = " @ blockwise"
-            print(f"{kernel_type}[{B=} {weight_type=}{quantype}] acc OK")
+            print(f"{kernel_type}[{B=} {weight_type=}{quantype}] acc OK({diff=:.8f})")
     if run_count > 0:
         return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
                 'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
-                'bw': sum(bw[1:]) / len(bw[1:])}                               # GB/s
+                'bw': sum(bw[1:]) / len(bw[1:]),
+                'diff': diff}                               # GB/s
 
 def is_arch_type(arch):
     props = torch.cuda.get_device_properties()
@@ -742,7 +749,7 @@ def test_acc_mxn_splitk_2s_bf16(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_
 @pytest.mark.parametrize("HIDDEN_SIZE", [4096])
 @pytest.mark.parametrize("INTER_SIZE", [1024])
 @pytest.mark.parametrize("TP", [8])
-def test_acc_fly_splitk_2s_bf16(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP):
+def test_acc_fly_splitk_2s(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP):
     entry_common('fly_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
 
 @pytest.mark.parametrize("batch", [get_batch_list('mxn_splitk_2s')])
@@ -838,4 +845,7 @@ if __name__ == '__main__':
         #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
         test_small_batch_perf(batch=[1, 2, 4, 8, 12, 16, 32, 64], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
         test_perf(batch=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    test_acc_fly_splitk_2s_bf16(batch=[1, 2, 4, 8, 16, 17], prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    prec = [torch.bfloat16]
+    prec = [get_fp8type()]
+    prec = [torch.bfloat16, get_fp8type()]
+    test_acc_fly_splitk_2s(batch=[1, 2, 4, 8, 16, 17], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
