@@ -36,7 +36,7 @@ def compile_gemm(N, K, weight_dtype, quant_type, TOPK, BLOCK_TILE_SIZE_M, BLOCK_
     TILE_K = 64
     assert BLOCK_TILE_SIZE_M <= 256, "BLOCK_SIZE_M must be less than or equal to 256 due to LDS size limit for sorted ids."
     assert weight_dtype in ['bf16', 'fp8'], "weight_dtype must be either 'bf16' or 'fp8'"
-    assert quant_type in ['no', 'ptpc', 'per_token'], "quant_type must be either 'no', 'ptpc' or 'per_token'"
+    assert quant_type in ['no', 'ptpc', 'per_tensor'], "quant_type must be either 'no', 'ptpc' or 'per_tensor'"
 
     if stage == 'gateup' and alg == 'splitk':
         assert BLOCK_TILE_SIZE_N % 64 == 0, "For split-k, BLOCK_TILE_SIZE_N needs to be multiple of 64 due to reduce layout."
@@ -405,11 +405,11 @@ def compile_gemm(N, K, weight_dtype, quant_type, TOPK, BLOCK_TILE_SIZE_M, BLOCK_
             n_reps = fx.size(fx.get_shape(c_frag)[2]).to_py_value()
 
             if const_expr(weight_dtype != fx.BFloat16):
-                if const_expr(alg == 'splitk'):
+                if const_expr(alg == 'splitk' and quant_type == 'ptpc'):
                     group_layout_silu = fx.make_layout(((continous_n, 2, N // (2 * continous_n)), 1), ((1, N // 2, continous_n), 0))
-                    arg_p_weight = fx.make_view(fx.get_iter(p_w_scale) + expert_id * N,
+                    arg_p_scale = fx.make_view(fx.get_iter(p_w_scale) + expert_id * N,
                                                 fx.composition(fx.make_layout(N, 1), group_layout_silu))
-                    scale_tile = fx.flat_divide(arg_p_weight, fx.make_tile(BLOCK_TILE_SIZE_N, 1))[None, None, blk_n, 0]
+                    scale_tile = fx.flat_divide(arg_p_scale, fx.make_tile(BLOCK_TILE_SIZE_N, 1))[None, None, blk_n, 0]
                     cp_atom_scale = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
                     tiled_copy_scale = fx.make_tiled_copy(cp_atom_scale,
                                                           fx.make_layout(((16, 4, 4), continous_n // 16), ((continous_n // 16, 0, 0), 1)),
@@ -423,6 +423,10 @@ def compile_gemm(N, K, weight_dtype, quant_type, TOPK, BLOCK_TILE_SIZE_M, BLOCK_
                             c_vec = c_frag[None, m, n].load()
                             vec = c_vec * scale_vec
                             c_frag[None, m, n].store(vec)
+                elif const_expr(alg == 'splitk' and quant_type == 'per_tensor'):
+                    arg_p_scale = fx.make_view(fx.get_iter(p_w_scale) + expert_id, fx.make_layout(1, 1))
+                    scale = arg_p_scale[0]
+                    c_frag.store(c_frag.load() * scale)
 
             # c_frag_bf16 stores the silu result (half the N dimension since gate+up → 1 output)
             c_frag_bf16 = fx.make_rmem_tensor(
@@ -557,9 +561,9 @@ def compile_gemm(N, K, weight_dtype, quant_type, TOPK, BLOCK_TILE_SIZE_M, BLOCK_
             c_frag = select(c_frag, [0, 2, 1])
 
             if const_expr(weight_dtype != fx.BFloat16):
-                if const_expr(alg == 'splitk'):
-                    arg_p_weight = fx.make_view(fx.get_iter(p_w_scale) + expert_id * N, fx.make_layout(N, 1))
-                    scale_tile = fx.flat_divide(arg_p_weight, fx.make_tile(BLOCK_TILE_SIZE_N))[None, blk_n]
+                if const_expr(alg == 'splitk' and quant_type == 'ptpc'):
+                    arg_p_scale = fx.make_view(fx.get_iter(p_w_scale) + expert_id * N, fx.make_layout(N, 1))
+                    scale_tile = fx.flat_divide(arg_p_scale, fx.make_tile(BLOCK_TILE_SIZE_N))[None, blk_n]
                     cp_atom_scale = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
                     tiled_copy_scale = fx.make_tiled_copy(cp_atom_scale,
                                                           fx.make_layout(((16, 4), 4), ((0, 4), 1)),
@@ -575,6 +579,10 @@ def compile_gemm(N, K, weight_dtype, quant_type, TOPK, BLOCK_TILE_SIZE_M, BLOCK_
                             c_vec = c_frag[None, m, n].load()
                             vec = c_vec * scale_vec
                             c_frag[None, m, n].store(vec)
+                elif const_expr(alg == 'splitk' and quant_type == 'per_tensor'):
+                    arg_p_scale = fx.make_view(fx.get_iter(p_w_scale) + expert_id, fx.make_layout(1, 1))
+                    scale = arg_p_scale[0]
+                    c_frag.store(c_frag.load() * scale)
 
             # mul weight
             sorted_weight_frag_vec = sorted_weight_frag.load()
