@@ -16,6 +16,29 @@ import gc
 USE_FP4_SHUFFLE_WEIGHT = 1
 
 
+# Module-level cache of FlyDSL compiled launchers (persists across run() calls).
+# Maps a static-config key -> flyc.compile() CompiledFunction, which dispatches
+# through a prebuilt CallState (~6 us/call) instead of the full JitFunction
+# __call__ path (~140 us: sig.bind + cache-key rebuild + globals/runtime checks).
+_FLY_COMPILED_CACHE = {}
+
+
+def _fly_dispatch(cache_key, build_jit, args):
+    """Run a FlyDSL launch via a prebuilt CallState (flyc.compile).
+
+    On the first use (cache miss) ``flyc.compile`` traces, compiles AND executes
+    the kernel once with ``args`` -- so we must NOT call it again here (the down
+    stage uses atomic-add accumulation; a second call would double the output).
+    On every later use we invoke the cached fast-dispatch callable exactly once.
+    """
+    import flydsl.compiler as flyc
+    compiled = _FLY_COMPILED_CACHE.get(cache_key)
+    if compiled is None:
+        _FLY_COMPILED_CACHE[cache_key] = flyc.compile(build_jit(), *args)
+    else:
+        compiled(*args)
+
+
 def _run_aiter(hidden_states,
             w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
             w2,  # [expert(local_expert:EP), dim, inter_dim]
@@ -355,6 +378,18 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
         elif kernel_type == 'fly_splitk_2s':
             from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
+            import flydsl.expr as fx
+            import flydsl.compiler as flyc
+            _TORCH_TO_FX = {
+                torch.bfloat16: fx.BFloat16,
+                torch.float32: fx.Float32,
+                torch.int32: fx.Int32,
+                torch.float8_e4m3fnuz: fx.Uint8,
+                torch.float8_e4m3fn: fx.Uint8,
+            }
+            def _ptr(t):
+                return flyc.from_c_void_p(_TORCH_TO_FX[t.dtype], t.data_ptr())
+            stream = torch.cuda.current_stream()
             if weight_type == torch.bfloat16:
                 weight_dtype = 'bf16'
                 compile_quant_type = 'no'
@@ -362,28 +397,27 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 weight_dtype = 'fp8'
                 compile_quant_type = quant_type
             if B == 1:
-                gateup = _moe_compile(
-                    N=N1, K=K1, weight_dtype=weight_dtype, quant_type=compile_quant_type, TOPK=TOPK,
-                    BLOCK_TILE_SIZE_M=16,
-                    BLOCK_TILE_SIZE_N=TILE_N,
-                    stage='gateup', alg='batch1',
+                grid = topk_ids.numel()
+                w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+                g_kwargs = (
+                    ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
+                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 64), ('stage', 'gateup'), ('alg', 'batch1'), ('E', E),
                 )
-                gateup(
-                    hidden_states, w1, gemm1_out, topk_ids, topk_weight,
-                    w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device),
-                    torch.cuda.current_stream(),
-                )
-                down = _moe_compile(
-                    N=N2, K=K2, weight_dtype=weight_dtype, quant_type=compile_quant_type, TOPK=TOPK,
-                    BLOCK_TILE_SIZE_M=16,
-                    BLOCK_TILE_SIZE_N=TILE_N,
-                    stage='down', alg='batch1',
+                _fly_dispatch(
+                    g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
+                    (_ptr(hidden_states), _ptr(w1), _ptr(gemm1_out), _ptr(topk_ids), _ptr(topk_weight), _ptr(w1_scale_arg),
+                     grid, stream),
                 )
                 cur_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
-                down(
-                    gemm1_out, w2, cur_out, topk_ids, topk_weight,
-                    w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device),
-                    torch.cuda.current_stream(),
+                w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+                d_kwargs = (
+                    ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
+                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 64), ('stage', 'down'), ('alg', 'batch1'), ('E', E),
+                )
+                _fly_dispatch(
+                    d_kwargs, lambda: _moe_compile(**dict(d_kwargs)),
+                    (_ptr(gemm1_out), _ptr(w2), _ptr(cur_out), _ptr(topk_ids), _ptr(topk_weight), _ptr(w2_scale_arg),
+                     grid, stream),
                 )
             else:
                 # FlyDSL moe_gemm_splitk: gateup stage
@@ -399,20 +433,16 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     0,
                 )
                 grid = sorted_expert_ids.shape[0]
-                if B * TOPK <= E:
-                    grid = B * TOPK
-                gateup = _moe_compile(
-                    N=N1, K=K1, weight_dtype=weight_dtype, quant_type=compile_quant_type, TOPK=TOPK,
-                    BLOCK_TILE_SIZE_M=TILE_M,
-                    BLOCK_TILE_SIZE_N=TILE_N,
-                    stage='gateup', alg='splitk',
+                w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+                g_kwargs = (
+                    ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
+                    ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'gateup'), ('alg', 'splitk'), ('E', E),
                 )
-                gateup(
-                    hidden_states, w1, gemm1_out,
-                    sorted_ids, sorted_weights, sorted_expert_ids,
-                    num_valid_ids,
-                    w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device),
-                    B, torch.cuda.current_stream(),
+                _fly_dispatch(
+                    g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
+                    (_ptr(hidden_states), _ptr(w1), _ptr(gemm1_out),
+                     _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
+                     _ptr(w1_scale_arg), B, grid, stream),
                 )
                 if 0:
                     # down stage using existing pyhip splitk kernel
@@ -425,18 +455,17 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         gemm2_out = cur_out
                     else:
                         gemm2_out = torch.empty([B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device)
-                    down = _moe_compile(
-                        N=N2, K=K2, weight_dtype=weight_dtype, quant_type=compile_quant_type, TOPK=TOPK,
-                        BLOCK_TILE_SIZE_M=TILE_M,
-                        BLOCK_TILE_SIZE_N=TILE_N,
-                        stage='down', alg='splitk',
+                    w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+                    d_kwargs = (
+                        ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
+                        ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'down'), ('alg', 'splitk'), ('E', E),
+                        ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),
                     )
-                    down(
-                        gemm1_out, w2, gemm2_out,
-                        sorted_ids, sorted_weights, sorted_expert_ids,
-                        num_valid_ids,
-                        w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device),
-                        B, torch.cuda.current_stream(),
+                    _fly_dispatch(
+                        d_kwargs, lambda: _moe_compile(**dict(d_kwargs)),
+                        (_ptr(gemm1_out), _ptr(w2), _ptr(gemm2_out),
+                         _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
+                         _ptr(w2_scale_arg), B, grid, stream),
                     )
                     if not USE_ATOMIC_WRITE:
                         cur_out = torch.sum(gemm2_out, dim=1)
@@ -794,9 +823,9 @@ def test_acc_mxn_splitk_2s_bf16(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_
 def test_acc_fly_splitk_2s(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP):
     if get_fp8type() in prec:
         prec.remove(get_fp8type())
-        entry_common('fly_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0, quant_type='ptpc')
-        entry_common('fly_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0, quant_type='per_tensor')
-    entry_common('fly_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
+        entry_common('fly_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10, quant_type='ptpc')
+        entry_common('fly_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10, quant_type='per_tensor')
+    entry_common('fly_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
 
 @pytest.mark.parametrize("batch", [get_batch_list('mxn_splitk_2s')])
 @pytest.mark.parametrize("prec", [[get_fp8type()]])
