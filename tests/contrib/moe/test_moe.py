@@ -401,7 +401,9 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                 g_kwargs = (
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
-                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 64), ('stage', 'gateup'), ('alg', 'batch1'), ('E', E),
+                    # gateup batch1 runs faster at BN=32 (more N-blocks/parallelism on the underutilized
+                    # GPU, split-K reduce preserved via the full-fragment reduce); down stays at 64.
+                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 32), ('stage', 'gateup'), ('alg', 'batch1'), ('E', E),
                 )
                 _fly_dispatch(
                     g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
