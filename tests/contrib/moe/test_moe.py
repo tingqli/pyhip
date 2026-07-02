@@ -436,16 +436,46 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 )
                 grid = sorted_expert_ids.shape[0]
                 w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+                # gateup: 'prefill_2x2' (4-wave 2x2 tiled MMA, no reduce) for B>32 when the
+                # sorting tile (TILE_M, shared with the down stage) is >=64 and a 64-multiple
+                # (the 4-wave load scheme needs each M-half >=32); 'splitk' otherwise.
+                use_prefill_2x2 = B > 32 and TILE_M >= 64 and TILE_M % 64 == 0
+                gateup_alg = 'prefill_2x2' if use_prefill_2x2 else 'splitk'
+                gateup_tn = 128 if gateup_alg == 'prefill_2x2' else TILE_N
                 g_kwargs = (
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
-                    ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'gateup'), ('alg', 'splitk'), ('E', E),
+                    ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', gateup_tn), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
                 )
-                _fly_dispatch(
-                    g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
-                    (_ptr(hidden_states), _ptr(w1), _ptr(gemm1_out),
-                     _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
-                     _ptr(w1_scale_arg), B, grid, stream),
-                )
+                if gateup_alg == 'prefill_2x2':
+                    # The 'prefill_2x2' (native fp8 MFMA) gateup needs an fp8 input plus its
+                    # dequant scale: quantize the activation per-token (ptpc) or per-tensor.
+                    # bf16 passes through with a dummy scale (unused by the bf16 kernel path).
+                    if weight_dtype == 'fp8':
+                        if quant_type == 'ptpc':
+                            gateup_in, a_scale = aiter.get_hip_quant(aiter.QuantType.per_Token)(
+                                hidden_states, quant_dtype=weight_type)
+                            a_scale = a_scale.to(torch.float32).contiguous()
+                        else:
+                            fmax = torch.finfo(weight_type).max
+                            a_scale = hidden_states.float().abs().amax() / fmax
+                            gateup_in = (hidden_states.float() / a_scale).clamp(-fmax, fmax).to(weight_type)
+                            a_scale = a_scale.reshape(1).to(torch.float32)
+                    else:
+                        gateup_in = hidden_states
+                        a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+                    _fly_dispatch(
+                        g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
+                        (_ptr(gateup_in), _ptr(w1), _ptr(gemm1_out),
+                         _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
+                         _ptr(w1_scale_arg), _ptr(a_scale), B, grid, stream),
+                    )
+                else:
+                    _fly_dispatch(
+                        g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
+                        (_ptr(hidden_states), _ptr(w1), _ptr(gemm1_out),
+                         _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
+                         _ptr(w1_scale_arg), B, grid, stream),
+                    )
                 if 0:
                     # down stage using existing pyhip splitk kernel
                     moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
@@ -903,7 +933,7 @@ def test_perf(batch, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP
     gc.collect()
 
 if __name__ == '__main__':
-    TILE_M = 32
+    TILE_M = 64
     TILE_N = 128
     HIDDEN_SIZE = 4096
     INTER_SIZE = 1024*2
@@ -925,4 +955,4 @@ if __name__ == '__main__':
     prec = [torch.bfloat16]
     prec = [get_fp8type()]
     prec = [torch.bfloat16, get_fp8type()]
-    test_acc_fly_splitk_2s(batch=[1, 2, 4, 8, 16, 17], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    test_acc_fly_splitk_2s(batch=[8192], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
