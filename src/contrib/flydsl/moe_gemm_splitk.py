@@ -139,6 +139,43 @@ def compile_gemm(
             f"{_gemm_lds_bytes} B (BM={BLOCK_TILE_SIZE_M}, BN={BLOCK_TILE_SIZE_N})"
         )
 
+    elif stage == "gateup" and alg == "prefill_1x4":
+        # 1x4: the 4 waves tile the N(channel) direction (vs prefill_2x2's 2x2 wave grid),
+        # and the full TILE_M is shared across all waves (no M-split). B (weight gate/up)
+        # loads direct global->register (no LDS); only A (activation) is staged through LDS
+        # with a ping-pong double buffer (a_ping / a_pong). Same BN/BM range as prefill_2x2.
+        assert 128 <= BLOCK_TILE_SIZE_N <= 256 and BLOCK_TILE_SIZE_N % 128 == 0, (
+            "For prefill_1x4 alg, BLOCK_TILE_SIZE_N must be in [128, 256] and a multiple of 128 "
+            "(each wave owns contiguous_n//4 = BN//8 output channels, a multiple of 16)"
+        )
+        assert 64 <= BLOCK_TILE_SIZE_M <= 256 and BLOCK_TILE_SIZE_M % 64 == 0, (
+            "For prefill_1x4 alg, BLOCK_TILE_SIZE_M must be in [64, 256] and a multiple of 64"
+        )
+        # fp8 issues 128-bit g2r loads (16 fp8/thread) -> widen K-tile to 128; bf16 keeps 64.
+        TILE_K = 128 if weight_dtype == "fp8" else 64
+        a_lds_size = BLOCK_TILE_SIZE_M * TILE_K  # full A tile; ping-pong needs two buffers
+        lds_elem = fx.Float8E4M3FNUZ if weight_dtype == "fp8" else fx.BFloat16
+
+        @fx.struct
+        class GemmBuffers:
+            a_ping: fx.Array[lds_elem, a_lds_size, 16]
+            a_pong: fx.Array[lds_elem, a_lds_size, 16]
+
+        @fx.union
+        class SharedStorage:
+            sorted_lds: fx.Array[fx.Int32, 256, 16]
+            gemm: GemmBuffers
+
+        # The CShuffle epilogue stages the single (BM x contiguous_n) bf16 output into the
+        # A LDS (reused after the main loop). Confirm it fits.
+        _cshuffle_elem_bytes = 1 if weight_dtype == "fp8" else 2
+        _gemm_lds_bytes = 2 * a_lds_size * _cshuffle_elem_bytes
+        _cshuffle_bytes = BLOCK_TILE_SIZE_M * (BLOCK_TILE_SIZE_N // 2) * 2
+        assert _cshuffle_bytes <= _gemm_lds_bytes, (
+            f"CShuffle needs {_cshuffle_bytes} B of LDS but GemmBuffers only allocates "
+            f"{_gemm_lds_bytes} B (BM={BLOCK_TILE_SIZE_M}, BN={BLOCK_TILE_SIZE_N})"
+        )
+
     if weight_dtype == "bf16":
         weight_dtype = fx.BFloat16
     elif weight_dtype == "fp8":
@@ -1039,6 +1076,183 @@ def compile_gemm(
 
     gemm_4wave = ASTRewriter.transform(_gemm_4wave)
 
+    def _gemm_1x4(
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        blk_n: int,  # block index for N dimension (in units of TILE_N)
+        arg_p_input: fx.Tensor,  # [M, K]; A rows are gathered via lds.sorted_lds
+        arg_p_weight: fx.Tensor,  # preshuffle layout with group_layout_silu composed
+        lds,  # SharedStorage with sorted_lds, a_ping, a_pong
+    ):
+        """1x4 tiled GEMM: the 4 waves tile N(channel); the full TILE_M is shared across
+        all waves (no M-split). Each wave owns contiguous_n//4 output channels of BOTH the
+        gate and the up projection (two C fragments) so silu stays wave-internal. A
+        (activation) is gathered via sorted_lds and staged through an LDS ping-pong
+        (a_ping/a_pong); B (weight gate/up) loads direct global->register (no LDS). Pipeline
+        mirrors preshuffle_gemm_v2 (A 2-stage LDS ping-pong; standard A-first MFMA)."""
+        tid = gpu.thread_idx.x
+        contiguous_n = TILE_N // 2
+
+        a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
+        b_tensor = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
+
+        # tiled_mma: standard A-first (mma_M=token, mma_N=channel); 4 waves along N(channel).
+        if const_expr(weight_dtype == fx.BFloat16):
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+            k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
+        else:
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, weight_dtype))
+            k_perm = fx.make_layout((8, 4, 2), (1, 16, 8))
+        tiled_mma = fx.make_tiled_mma(
+            mma_atom,
+            fx.make_layout((1, 4, 1), (0, 1, 0)),
+            fx.make_tile(None, None, k_perm),
+        )
+
+        # ---- A (activation): gather + LDS ping-pong ----
+        # Static (TILE_M, K) fake keeps flat_divide static; real rows gathered below.
+        a_size_buf = fx.rocdl.make_buffer_tensor(
+            fx.make_view(fx.get_iter(arg_p_input), fx.make_layout((TILE_M, K), (K, 1))),
+            max_size=False,
+        )
+        a_tile = fx.flat_divide(a_size_buf, fx.make_tile(TILE_M, TILE_K))[None, None, 0, None]
+        if const_expr(weight_dtype == fx.BFloat16):
+            buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+            g2r_tv_layout = fx.make_layout(((8, 8, 4), 8), ((256, 1, 8), 32))
+        else:
+            buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), weight_dtype)
+            g2r_tv_layout = fx.make_layout(((8, 8, 4), 16), ((512, 1, 8), 32))
+        a_mem_cp_g2r = fx.make_tiled_copy(buf_cp_atom_r, g2r_tv_layout, fx.make_tile(8 * 4, TILE_K))
+        # index copy for A gather: M-row = (lane//8) + 8*wave, replicated across the 8
+        # K-lanes; rep_m at M-stride 32 (full TILE_M).
+        cp_atom_sortid_a = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
+        tiled_copy_sortid_a = fx.make_tiled_copy(
+            cp_atom_sortid_a,
+            fx.make_layout(((8, 8, 4), 1), ((0, 1, 8), 0)),
+            fx.make_tile(32),
+        )
+        a_idx = TensorWithIndex(
+            a_tensor, TILE_M, TILE_K, tiled_copy_sortid_a, a_mem_cp_g2r, tid,
+            lds.sorted_lds, index_size=TILE_M, index_offset=0,
+        )
+        a_mem_thr = a_mem_cp_g2r.get_slice(tid).partition_S(a_tile)
+        a_cp_frag = fx.make_fragment_like(a_mem_thr[None, None, None, 0])
+
+        # sorted_lds is unioned with a_ping: seed all index_frag reads (caller's c_out index
+        # + a_idx above) before overwriting that LDS region with the A tile below.
+        gpu.barrier()
+
+        if const_expr(weight_dtype == fx.BFloat16):
+            swz = fx.SwizzleType.get(3, 3, 3)
+        else:
+            swz = fx.SwizzleType.get(3, 4, 3)
+        a_ping = fx.make_view(lds.gemm.a_ping.ptr, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M, TILE_K), order=(1, 0))))
+        a_pong = fx.make_view(lds.gemm.a_pong.ptr, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M, TILE_K), order=(1, 0))))
+
+        uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), weight_dtype)
+        a_r2s = fx.make_tiled_copy(uni_cp_atom, g2r_tv_layout, fx.make_tile(8 * 4, TILE_K))
+        a_lds_w = [a_r2s.get_slice(tid).partition_D(a_ping), a_r2s.get_slice(tid).partition_D(a_pong)]
+        a_cp_frag_retile = a_r2s.get_slice(tid).retile(a_cp_frag)
+        a_lds_r = [
+            fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(a_ping),
+            fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(a_pong),
+        ]
+        a_frag = tiled_mma.make_fragment_A(a_ping)
+        a_frag_retile = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).retile(a_frag)
+
+        # ---- B (weight gate/up): direct global->register (no LDS), 2-stage double buffer ----
+        bl_tile = fx.flat_divide(b_tensor, fx.make_tile(contiguous_n, TILE_K))[None, None, blk_n * 2 + 0, None]
+        br_tile = fx.flat_divide(b_tensor, fx.make_tile(contiguous_n, TILE_K))[None, None, blk_n * 2 + 1, None]
+        b_g2r = fx.make_tiled_copy_B(buf_cp_atom_r, tiled_mma).get_slice(tid)
+        bl_g2r = b_g2r.partition_S(bl_tile)
+        br_g2r = b_g2r.partition_S(br_tile)
+        bl_frag_st = [tiled_mma.make_fragment_B(bl_tile[None, None, 0]), tiled_mma.make_fragment_B(bl_tile[None, None, 0])]
+        br_frag_st = [tiled_mma.make_fragment_B(br_tile[None, None, 0]), tiled_mma.make_fragment_B(br_tile[None, None, 0])]
+        bl_ret_st = [b_g2r.retile(bl_frag_st[0]), b_g2r.retile(bl_frag_st[1])]
+        br_ret_st = [b_g2r.retile(br_frag_st[0]), b_g2r.retile(br_frag_st[1])]
+
+        # ---- C fragments (gate + up), one make_fragment_C each ----
+        c_fake_buf = fx.rocdl.make_buffer_tensor(
+            fx.make_view(fx.get_iter(arg_p_input), fx.make_layout((TILE_M, contiguous_n), (contiguous_n, 1))),
+            max_size=False,
+        )
+        c_fake = fx.flat_divide(c_fake_buf, fx.make_tile(TILE_M, contiguous_n))[None, None, 0, 0]
+        c_gate = tiled_mma.make_fragment_C(c_fake)
+        c_up = tiled_mma.make_fragment_C(c_fake)
+        c_gate.fill(0)
+        c_up.fill(0)
+
+        num_tiles = K // TILE_K
+
+        # ---- instruction-scheduling hints ----
+        # 128-bit loads / ds ops per stage; MFMA count for the two gemms.
+        k_per_mma = 16 if const_expr(weight_dtype == fx.BFloat16) else 32
+        _m_reps = fx.size(fx.get_shape(c_gate)[1]).to_py_value()
+        _n_reps = fx.size(fx.get_shape(c_gate)[2]).to_py_value()
+        mfma_per_gemm = _m_reps * _n_reps * (TILE_K // k_per_mma)
+        mem_a_cnt = a_cp_frag.load().numel * weight_dtype.width // 8 // 16
+        mem_b_cnt = bl_frag_st[0].load().numel * weight_dtype.width // 8 // 16
+
+        def hot_loop_scheduler():
+            # Interleave the next-tile prefetch (B gate/up + A g2r vmem) and the A staging->LDS
+            # store (ds_write) with the two gemms' MFMAs so the global-load latency is hidden.
+            mfma_cnt = 2 * mfma_per_gemm
+            for _ in range_constexpr(mem_a_cnt):
+                rocdl.sched_dswr(1)
+                rocdl.sched_mfma(2)
+                rocdl.sched_vmem(1)
+                rocdl.sched_mfma(1)
+            for _ in range_constexpr(2 * mem_b_cnt):
+                rocdl.sched_vmem(1)
+                rocdl.sched_mfma(2)
+            rocdl.sched_mfma(mfma_cnt)
+
+        def pipeline_stage(read_i, k_next, do_prefetch):
+            write_i = read_i ^ 1
+            # prefetch next B (gate/up) + A (all vmem) so they overlap the current gemms
+            if const_expr(do_prefetch):
+                fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, k_next], bl_ret_st[write_i])
+                fx.copy(buf_cp_atom_r, br_g2r[None, None, None, k_next], br_ret_st[write_i])
+                a_idx.copy(buf_cp_atom_r, k_next, a_cp_frag)
+            # A(k_cur) LDS[read] -> register (ds_read feeds the gemms)
+            fx.copy(uni_cp_atom, a_lds_r[read_i], a_frag_retile)
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+            # 2 gemms with the current (previously prefetched) B stage
+            fx.gemm(tiled_mma, c_gate, a_frag, bl_frag_st[read_i], c_gate)
+            fx.gemm(tiled_mma, c_up, a_frag, br_frag_st[read_i], c_up)
+            # A(k_next) staging -> LDS[write] (ds_write)
+            if const_expr(do_prefetch):
+                fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[write_i])
+                hot_loop_scheduler()
+            rocdl.sched_barrier(0)
+            gpu.barrier()
+
+        # Prologue: gather A(0) -> LDS[0]; load B(0) -> stage 0.
+        a_idx.copy(buf_cp_atom_r, fx.Int32(0), a_cp_frag)
+        fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, fx.Int32(0)], bl_ret_st[0])
+        fx.copy(buf_cp_atom_r, br_g2r[None, None, None, fx.Int32(0)], br_ret_st[0])
+        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+        fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[0])
+        gpu.barrier()
+
+        acc_init = [c_gate.load(), c_up.load()]
+        for iv, state in range(0, num_tiles // 2 - 1, 1, init=acc_init):
+            c_gate.store(state[0])
+            c_up.store(state[1])
+            kb = fx.Int32(iv * 2)
+            pipeline_stage(0, kb + 1, True)
+            pipeline_stage(1, kb + 2, True)
+            results = yield [c_gate.load(), c_up.load()]
+        c_gate.store(results[0])
+        c_up.store(results[1])
+        kb = fx.Int32(num_tiles - 2)
+        pipeline_stage(0, kb + 1, True)
+        pipeline_stage(1, fx.Int32(0), False)
+        return c_gate, c_up
+
+    gemm_1x4 = ASTRewriter.transform(_gemm_1x4)
+
     @flyc.kernel
     def moe_2stage_gateup(
         p_input: fx.Pointer,  # bf16 [M, K]
@@ -1706,6 +1920,242 @@ def compile_gemm(
             c_bot.copy(buf_atom_w128, blk_n, rd_bot)
 
     @flyc.kernel
+    def moe_2stage_gateup_prefill_1x4(
+        p_input: fx.Pointer,  # bf16 or native-fp8 [M, K]
+        p_weight: fx.Pointer,  # bf16/fp8 [N/16, K/8 * 16 * 8]
+        p_output: fx.Pointer,  # bf16 [M, TOPK, N//2]
+        p_sorted_ids: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_sorted_expert_ids: fx.Pointer,
+        p_num_valid_ids: fx.Pointer,
+        p_w_scale: fx.Pointer,  # weight fp8 scale (per-output-channel ptpc / per-tensor)
+        p_a_scale: fx.Pointer,  # input fp8 scale (per-token ptpc / per-tensor)
+        M: fx.Int32,
+    ):
+        tid = gpu.thread_idx.x
+        blk_n = gpu.block_idx.x
+        e_idx = gpu.block_idx.y
+
+        if const_expr(weight_dtype != fx.BFloat16):
+            in_ptr = fx.recast_iter(weight_dtype, _as_ptr(p_input))
+        else:
+            in_ptr = _as_ptr(p_input)
+        arg_p_input = fx.make_view(in_ptr, fx.make_layout((M, K), (K, 1)))
+        num_valid_buf = fx.make_view(
+            fx.recast_iter(fx.Int32, _as_ptr(p_num_valid_ids)), fx.make_layout(1, 1)
+        )
+        max_valid_id = num_valid_buf[0]
+        if const_expr(weight_dtype != fx.BFloat16):
+            p_weight = fx.recast_iter(weight_dtype, _as_ptr(p_weight))
+        if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
+            lds = fx.SharedAllocator().allocate(SharedStorage)
+            lds.sorted_lds = lds.sorted_lds.peek()
+            lds.gemm = lds.gemm.peek()
+            arg_p_sorted_ids = fx.make_view(
+                fx.recast_iter(
+                    fx.Int32, _as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M
+                ),
+                fx.make_layout(BLOCK_TILE_SIZE_M, 1),
+            )
+            arg_p_sorted_expert_ids = fx.recast_iter(
+                fx.Int32, _as_ptr(p_sorted_expert_ids)
+            )
+            expert_id = arg_p_sorted_expert_ids[e_idx]
+
+            contiguous_n = BLOCK_TILE_SIZE_N // 2
+            group_layout_silu = fx.make_layout(
+                ((contiguous_n, 2, N // (contiguous_n * 2)), K),
+                ((1, N // 2, contiguous_n), N),
+            )
+            element_num = 16 // (p_weight.dtype.width // 8)
+            arg_p_weight = fx.make_view(
+                p_weight + fx.Int64(expert_id * N * K),
+                fx.composition(
+                    fx.make_layout(
+                        ((16, N // 16), (element_num, K // element_num)),
+                        ((element_num, 16 * K), (1, 16 * element_num)),
+                    ),
+                    group_layout_silu,
+                ),
+            )
+
+            sorted_ids_buf = fx.rocdl.make_buffer_tensor(
+                arg_p_sorted_ids, max_size=False
+            )
+            if tid < BLOCK_TILE_SIZE_M:
+                lds_view = fx.make_view(
+                    lds.sorted_lds.ptr, fx.make_layout(BLOCK_TILE_SIZE_M, 1)
+                )
+                lds_view[tid] = sorted_ids_buf[tid]
+            gpu.barrier()
+
+            # Output [M, TOPK, N//2] + the per-row scatter index, built BEFORE gemm_1x4:
+            # sorted_lds is unioned with a_ping, so c_out must seed its index_frag from
+            # sorted_lds now; gemm_1x4 then overwrites that LDS region with the A tile.
+            arg_p_output = fx.make_view(
+                _as_ptr(p_output),
+                fx.make_layout((M, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
+            )
+            out_tensor = fx.rocdl.make_buffer_tensor(
+                arg_p_output,
+                max_size=False,
+                num_records_bytes=M * TOPK * N // 2 * fx.BFloat16.width // 8,
+            )
+            buf_atom_w128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+            # CShuffle read/scatter over the single (BM x contiguous_n) region: reuse the
+            # 2x2-wave read layout (token = lane//4 + 16*waveM, 8 contiguous channels/lane,
+            # 128b). The read is decoupled from the gemm's 1x4 wave layout (it just walks the
+            # staged LDS), so rep_token = BM//32 and rep_channel = contiguous_n//64.
+            c_rw_copy = fx.make_tiled_copy(
+                buf_atom_w128,
+                fx.make_layout(((4, 16, 2, 2), 8), ((256, 1, 16, 1024), 32)),
+                fx.make_tile(32, 64),
+            )
+            c_index_copy = fx.make_tiled_copy(
+                fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
+                fx.make_layout(((4, 16, 2, 2), 1), ((0, 1, 16, 0), 0)),
+                fx.make_tile(32),
+            )
+            c_out = TensorWithIndex(
+                out_tensor,
+                BLOCK_TILE_SIZE_M,
+                contiguous_n,
+                c_index_copy,
+                c_rw_copy,
+                tid,
+                lds.sorted_lds,
+                is_read_from_mem=False,
+                TOPK=TOPK,
+                index_size=BLOCK_TILE_SIZE_M,
+                index_offset=0,
+            )
+
+            # ptpc a_scale is per-token; the 1x4 A-first C fragment packs 4 CONSECUTIVE
+            # tokens per lane in the value dim (token = 4*(lane//16) + v + 16*rep_m). Gather
+            # the 4 sorted ids per rep_m so the per-token act scale can be folded per value.
+            # Read before gemm_1x4 overwrites sorted_lds.
+            if const_expr(weight_dtype != fx.BFloat16 and quant_type == "ptpc"):
+                asc_index_copy = fx.make_tiled_copy(
+                    fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
+                    fx.make_layout(((16, 4, 4), 4), ((0, 4, 0), 1)),
+                    fx.make_tile(16),
+                )
+                cp_atom_idx = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
+                asc_lds = fx.make_view(
+                    lds.sorted_lds.ptr, fx.make_layout(BLOCK_TILE_SIZE_M, 1)
+                )
+                asc_thr = asc_index_copy.get_slice(tid).partition_S(asc_lds)
+                asc_idx = fx.make_fragment_like(asc_thr)
+                fx.copy(cp_atom_idx, asc_thr, asc_idx)
+
+            c_gate_frag, c_up_frag = gemm_1x4(
+                BLOCK_TILE_SIZE_M,
+                BLOCK_TILE_SIZE_N,
+                TILE_K,
+                blk_n,
+                arg_p_input,
+                arg_p_weight,
+                lds,
+            )
+
+            m_reps = fx.size(fx.get_shape(c_gate_frag)[1]).to_py_value()
+            n_reps = fx.size(fx.get_shape(c_gate_frag)[2]).to_py_value()
+
+            if const_expr(weight_dtype != fx.BFloat16 and quant_type == "ptpc"):
+                # A-first dequant: c *= a_scale[token] * b_scale[channel]. b_scale (weight) is
+                # per output channel = channel(mma_N) = lane%16 + 16*wave + 64*rep_n, one
+                # scalar per rep_n per thread (constant across the 4 token-values). a_scale
+                # (act) is per token = one per value. Fold both in before the plain silu.
+                scale_gate = fx.make_view(
+                    _as_ptr(p_w_scale) + expert_id * N + blk_n * contiguous_n,
+                    fx.make_layout(contiguous_n, 1),
+                )
+                scale_up = fx.make_view(
+                    _as_ptr(p_w_scale) + expert_id * N + N // 2 + blk_n * contiguous_n,
+                    fx.make_layout(contiguous_n, 1),
+                )
+                cp_atom_scale = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+                scale_copy = fx.make_tiled_copy(
+                    cp_atom_scale,
+                    fx.make_layout(((16, 4, 4), 1), ((1, 0, 16), 0)),
+                    fx.make_tile(64),
+                )
+                sg_thr = scale_copy.get_slice(tid).partition_S(scale_gate)
+                su_thr = scale_copy.get_slice(tid).partition_S(scale_up)
+                gate_scale = fx.make_fragment_like(sg_thr)
+                up_scale = fx.make_fragment_like(su_thr)
+                fx.copy(cp_atom_scale, sg_thr, gate_scale)
+                fx.copy(cp_atom_scale, su_thr, up_scale)
+
+                a_scale_tensor = fx.rocdl.make_buffer_tensor(
+                    fx.make_view(
+                        fx.recast_iter(fx.Float32, _as_ptr(p_a_scale)),
+                        fx.make_layout(M, 1),
+                    ),
+                    max_size=False,
+                )
+                for m in range_constexpr(m_reps):
+                    a_sc_v = [
+                        a_scale_tensor[asc_idx[v, m] & 0xFFFFFF]
+                        for v in range_constexpr(4)
+                    ]
+                    for n in range_constexpr(n_reps):
+                        cg = c_gate_frag[None, m, n].load()
+                        cu = c_up_frag[None, m, n].load()
+                        sg = gate_scale[0, n]
+                        su = up_scale[0, n]
+                        cg_items = []
+                        cu_items = []
+                        for v in range_constexpr(4):
+                            cg_items.append(cg[v] * sg * a_sc_v[v])
+                            cu_items.append(cu[v] * su * a_sc_v[v])
+                        c_gate_frag[None, m, n].store(Vec.from_elements(cg_items, fx.Float32))
+                        c_up_frag[None, m, n].store(Vec.from_elements(cu_items, fx.Float32))
+            elif const_expr(weight_dtype != fx.BFloat16 and quant_type == "per_tensor"):
+                b_scale = fx.make_view(
+                    _as_ptr(p_w_scale) + expert_id, fx.make_layout(1, 1)
+                )[0]
+                a_scale0 = fx.make_view(
+                    fx.recast_iter(fx.Float32, _as_ptr(p_a_scale)), fx.make_layout(1, 1)
+                )[0]
+                scale = b_scale * a_scale0
+                c_gate_frag.store(c_gate_frag.load() * scale)
+                c_up_frag.store(c_up_frag.load() * scale)
+
+            c_out_bf16 = _silu_pair_bf16(c_gate_frag, c_up_frag)
+
+            # 128-bit CShuffle epilogue (single region). Reconstruct the 1x4 tiled_mma and
+            # stage c_out_bf16 into the A LDS via make_tiled_copy_C (framework-consistent with
+            # the make_fragment_C layout), then read it back channel-contiguous (8 bf16/lane)
+            # so the scatter issues 128-bit writes.
+            if const_expr(weight_dtype == fx.BFloat16):
+                _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+                _k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
+            else:
+                _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, weight_dtype))
+                _k_perm = fx.make_layout((8, 4, 2), (1, 16, 8))
+            _tiled_mma = fx.make_tiled_mma(
+                _mma_atom,
+                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_tile(None, None, _k_perm),
+            )
+            cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16)
+            cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+            cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
+            lds_c = fx.make_view(
+                cshuf_ptr,
+                fx.make_layout((BLOCK_TILE_SIZE_M, contiguous_n), (contiguous_n, 1)),
+            )
+
+            gpu.barrier()  # gemm_1x4's LDS reads must finish before reusing GemmBuffers
+            store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
+            fx.copy(cshuf_atom_w, store_c.retile(c_out_bf16), store_c.partition_D(lds_c))
+            gpu.barrier()
+            rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
+            fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
+            c_out.copy(buf_atom_w128, blk_n, rd)
+
+    @flyc.kernel
     def moe_2stage_down_batch1(
         p_input: fx.Pointer,  # bf16 [M, TOPK, K]
         p_weight: fx.Pointer,  # quantized/bf16 [N/16, K/8 * 16 * 8]
@@ -1919,6 +2369,45 @@ def compile_gemm(
             stream=stream,
         )
 
+    @flyc.jit
+    def launch_prefill_1x4(
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
+        p_sorted_ids: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_sorted_expert_ids: fx.Pointer,
+        p_num_valid_ids: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_a_scale: fx.Pointer,
+        M: fx.Int32,
+        task_num: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        num_n_blocks = div_up(N, BLOCK_TILE_SIZE_N)
+        if const_expr(E is not None):
+            if M * TOPK <= E:
+                task_num = M * TOPK
+        moe_2stage_gateup_prefill_1x4(
+            p_input,
+            p_weight,
+            p_output,
+            p_sorted_ids,
+            p_sorted_weights,
+            p_sorted_expert_ids,
+            p_num_valid_ids,
+            p_w_scale,
+            p_a_scale,
+            M,
+        ).launch(
+            grid=(num_n_blocks, task_num, 1),
+            block=(256, 1, 1),
+            stream=stream,
+        )
+
+    if const_expr(alg == "prefill_1x4"):
+        return launch_prefill_1x4
     if const_expr(alg == "prefill_2x2"):
         return launch_prefill_2x2
     if const_expr(alg == "batch1"):
