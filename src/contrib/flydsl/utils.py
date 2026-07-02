@@ -173,8 +173,12 @@ def recurisve_apply(atom_op, *tensors, idx=None):
             idx = recurisve_apply(atom_op, *[fx.get_(t,0) for t in tensors], idx=idx)
     else:
         tensors = [fx.group(t, 1, -1) for t in tensors]
-        size = fx.size(tensors[0].layout[1])
-        assert size.is_static, f"Expected static size, got {size}"
+
+        for t in tensors:
+            size = fx.size(t.layout[1])
+            if size.is_static:
+                break
+        assert size.is_static, f"Cannot find a static size, got {size}"
         for i in fx.range_constexpr(size.get_static_leaf_int):
             idx = recurisve_apply(atom_op, *[t[None, i] for t in tensors], idx=idx)
     return idx
@@ -431,7 +435,7 @@ def inspect(x):
 
 import types
 
-class Fragment:
+class Fragment(fx.Tensor):
     """
     Fragment 是一个寄存器Tensor的 per-thread view，背后隐含 tv-layout 的 tiling
     下面的构造参数中都显式指定了 (s0, s1) 作为 2D block 的shape, 代表所有线程
@@ -470,40 +474,26 @@ class Fragment:
     使用的不同的 tiled-copy 对象，并且保存其 retile 后的 fragment view, 以供后继
     copy_from/copy_to 使用。
 
-    这些方法被动态附加到原始 fragment Tensor 对象上，因此如果将这些对象进一步加工，例如
-    对其进行 layout algebra 操作后，附加的方法就会丢失。但是好在目前没有发现需要对 fragment
-    进行进一步加工的需求，因此暂时不考虑这个问题。
+    load_gather_rows/load_scatter_rows 允许copy的源/目的矩阵的行由 gather/scatter indicies 里面的值指定
+    调用 copy_from/copy_to 时传入额外的rows + cols参数辅助定位每个 copy-atom 的实际位置。
     """
+    def __init__(self, tensor, copy_ops, block_shape, tile_size, tiled_mma=None):
+        super().__init__(tensor)
+        self._copy_ops = copy_ops
+        self._block_shape = block_shape
+        self._tile_size = tile_size
+        self.tiled_mma = tiled_mma
 
-    @staticmethod
-    def _attach_methods(frag):
-        frag.copy_from  = types.MethodType(Fragment.copy_from, frag)
-        frag.copy_to    = types.MethodType(Fragment.copy_to, frag)
-        frag._check_is_unpartioned = types.MethodType(Fragment._check_is_unpartioned, frag)
-        frag._check_is_partioned   = types.MethodType(Fragment._check_is_partioned, frag)
-        frag.partition_S = types.MethodType(Fragment.partition_S, frag)
-        frag.partition_D = types.MethodType(Fragment.partition_D, frag)
-        frag.selfclone = types.MethodType(Fragment.selfclone, frag)
-
-    @staticmethod
-    def selfclone(self):
-        frag = fx.make_fragment_like(self)
-        copy_ops = {}
-        for copy_atom, v in self._copy_ops.items():
-            thr_copy, _ = v
-            copy_ops[copy_atom] = (thr_copy, thr_copy.retile(frag))
-        frag._copy_ops = copy_ops
-        frag._block_shape = self._block_shape
-        frag._tile_size = self._tile_size
-        if hasattr(self, "tiled_mma"):
-            frag.tiled_mma = self.tiled_mma
-        Fragment._attach_methods(frag)
-        return frag
-
-    @staticmethod
-    def from_tvlayout(dtype, s0:int, s1:int,
+    @classmethod
+    def from_tvlayout(cls, dtype, s0:int, s1:int,
                       tv_layout, tile_size, copy_atoms: list[fx.CopyAtom]):
-
+        """
+        just 1 copy_atom:
+            used for both loading & storing
+        2 or more copy_atoms:
+            first is default for loading copy_from/partition_S
+            last is default for storing copy_to/partition_D
+        """
         if not isinstance(copy_atoms, (tuple, list)):
             assert isinstance(copy_atoms, fx.CopyAtom)
             copy_atoms = [copy_atoms]
@@ -531,14 +521,17 @@ class Fragment:
             tcopy = fx.make_tiled_copy(copy_atom, tv_layout, tile_size)
             thr_copy = tcopy.get_slice(fx.thread_idx.x)
             copy_ops[copy_atom] = (thr_copy, thr_copy.retile(fragS))
-        fragS._copy_ops = copy_ops
-        fragS._block_shape = (s0, s1)
-        fragS._tile_size = tile_size
-        Fragment._attach_methods(fragS)
-        return fragS
+        return cls(fragS, copy_ops, (s0, s1), tile_size)
 
-    @staticmethod
-    def from_tiledmma(tiled_mma: fx.TiledMma, s0:int, s1:int, abc: str, copy_atoms: list[fx.CopyAtom], dtype=None):
+    @classmethod
+    def from_tiledmma(cls, tiled_mma: fx.TiledMma, s0:int, s1:int, abc: str, copy_atoms: list[fx.CopyAtom], dtype=None):
+        """
+        just 1 copy_atom:
+            used for both loading & storing
+        2 or more copy_atoms:
+            first is default for loading copy_from/partition_S
+            last is default for storing copy_to/partition_D
+        """        
         assert abc in ["A", "B", "C"]
 
         if not isinstance(copy_atoms, (tuple, list)):
@@ -584,28 +577,34 @@ class Fragment:
 
             thr_copy = tcopy.get_slice(fx.thread_idx.x)
             copy_ops[copy_atom] = (thr_copy, thr_copy.retile(frag))
-        frag._copy_ops = copy_ops
-        frag._block_shape = (s0, s1)
-        frag._tile_size = tile_size
-        frag.tiled_mma = tiled_mma
+        return cls(frag, copy_ops, (s0, s1), tile_size, tiled_mma=tiled_mma)
 
-        Fragment._attach_methods(frag)
-        return frag
+    def selfclone(self):
+        frag = fx.make_fragment_like(self)
+        copy_ops = {}
+        for copy_atom, v in self._copy_ops.items():
+            thr_copy, _ = v
+            copy_ops[copy_atom] = (thr_copy, thr_copy.retile(frag))
+        return Fragment(frag, copy_ops, self._block_shape, self._tile_size, tiled_mma=self.tiled_mma)
 
-    """
-    avoid using load/store as name, these are Tensor's methods
-    copy_atom: optional copy atom to use for the copy operation
-                for example： fx.rocdl.BufferCopy128b vs fx.UniversalCopy128b()
-                if copy_atom is not none, it must be compatible with the copy_atom
-                used to create the Fragment
-    """
-    @staticmethod    
-    def copy_from(self, src: fx.Tensor, copy_atom = None):
+    def _get_copy_assets(self, idx, copy_atom = None):
         if copy_atom is None:
-            copy_atom = next(iter(self._copy_ops))
+            copy_atom = list(self._copy_ops)[idx]
         else:
             assert copy_atom in self._copy_ops
         thr_copy, copy_frag = self._copy_ops[copy_atom]
+        return copy_atom, thr_copy, copy_frag
+
+    def copy_from(self, src: fx.Tensor, copy_atom = None, rows = None, cols = None):
+        copy_atom, thr_copy, copy_frag = self._get_copy_assets(0, copy_atom)
+        if rows is not None:
+            def gather_atom(dst, row, col):
+                index = src.layout(row[0], col[0])
+                iter = fx.add_offset(fx.get_iter(src), index)
+                atom_A = fx.make_view(iter, copy_atom.layout_src_tv[1])
+                fx.copy(copy_atom, atom_A, dst)
+            recurisve_apply(gather_atom, copy_frag, rows, cols)
+            return
 
         if fx.const_expr(self._check_is_unpartioned(src)):
             copy_src = thr_copy.partition_S(src)
@@ -615,13 +614,17 @@ class Fragment:
             raise RuntimeError(f"src tensor {src} is not partitioned or unpartitioned")
         fx.copy(copy_atom, copy_src, copy_frag, pred=None)
 
-    @staticmethod
-    def copy_to(self, dst: fx.Tensor, copy_atom = None):
-        if copy_atom is None:
-            copy_atom = next(iter(self._copy_ops))
-        else:
-            assert copy_atom in self._copy_ops
-        thr_copy, copy_frag = self._copy_ops[copy_atom]
+    def copy_to(self, dst: fx.Tensor, copy_atom = None, rows = None, cols = None):
+        copy_atom, thr_copy, copy_frag = self._get_copy_assets(-1, copy_atom)
+        if rows is not None:
+            def scatter_atom(src, row, col):
+                index = dst.layout(row[0], col[0])
+                iter = fx.add_offset(fx.get_iter(dst), index)
+                atom_D = fx.make_view(iter, copy_atom.layout_dst_tv[1])
+                fx.copy(copy_atom, src, atom_D)
+            recurisve_apply(scatter_atom, copy_frag, rows, cols)
+            return
+
         if fx.const_expr(self._check_is_unpartioned(dst)):
             copy_dst = thr_copy.partition_D(dst)
         elif fx.const_expr(self._check_is_partioned(dst)):
@@ -630,7 +633,6 @@ class Fragment:
             raise RuntimeError(f"dst tensor {dst} is not partitioned or unpartitioned")
         fx.copy(copy_atom, copy_frag, copy_dst, pred=None)
 
-    @staticmethod
     def _check_is_unpartioned(self, t: fx.Tensor):
         # compiled time check if a tensor has not been partitioned into tiles
         if t.layout.rank != 2: return False
@@ -638,7 +640,6 @@ class Fragment:
         s1 = fx.size(t.shape[1]).to_py_value()
         return s0 == self._block_shape[0] and s1 == self._block_shape[1]
 
-    @staticmethod
     def _check_is_partioned(self, t: fx.Tensor):
         # compiled time check if a tensor has been partitioned into tiles
         if t.layout.rank != 3: return False
@@ -647,7 +648,6 @@ class Fragment:
         return num_mma_tiles_s0 == self._block_shape[0] //self._tile_size[0] and \
                 num_mma_tiles_s1 == self._block_shape[1] //self._tile_size[1]
 
-    @staticmethod
     def partition_S(self, src: fx.Tensor, copy_atom = None):
         """ 
         input src:  (BLOCK_M, BLOCK_K, num_blocks_k, ...)
@@ -666,28 +666,76 @@ class Fragment:
             - RestN : N/tv_tilemn[1]
             - ...   : the other dimensions are the same as input tensor
         """
-        if copy_atom is None:
-            copy_atom = next(iter(self._copy_ops))
-        else:
-            assert copy_atom in self._copy_ops
-        thr_copy, copy_frag = self._copy_ops[copy_atom]        
+        copy_atom, thr_copy, copy_frag = self._get_copy_assets(0, copy_atom)
         s0 = fx.size(src.shape[0]).to_py_value()
         s1 = fx.size(src.shape[1]).to_py_value()
         assert s0 == self._block_shape[0] and s1 == self._block_shape[1]
         return thr_copy.partition_S(src)
 
-    @staticmethod
     def partition_D(self, dst: fx.Tensor, copy_atom = None):
-        if copy_atom is None:
-            copy_atom = next(iter(self._copy_ops))
-        else:
-            assert copy_atom in self._copy_ops
-        thr_copy, copy_frag = self._copy_ops[copy_atom]          
+        copy_atom, thr_copy, copy_frag = self._get_copy_assets(-1, copy_atom)         
         s0 = fx.size(dst.shape[0]).to_py_value()
         s1 = fx.size(dst.shape[1]).to_py_value()
         assert s0 == self._block_shape[0] and s1 == self._block_shape[1]
         return thr_copy.partition_D(dst)
 
+    def load_gather_rows(self, row_indicies_1d: fx.Tensor):
+        return self._load_row_indicies(row_indicies_1d, for_D=False)
+
+    def load_scatter_rows(self, row_indicies_1d: fx.Tensor):
+        return self._load_row_indicies(row_indicies_1d, for_D=True)
+
+    def _load_row_indicies(self, row_indicies_1d: fx.Tensor, for_D: bool = False):
+        BLOCK_M, BLOCK_K = self._block_shape
+        # 
+        row_indicies_2d = fx.make_view(fx.get_iter(row_indicies_1d), fx.make_layout((BLOCK_M, BLOCK_K), (1, 0)))
+        row_indicies_tview = self.partition_S(row_indicies_2d) if not for_D else self.partition_D(row_indicies_2d)
+
+        tview_shape = row_indicies_tview.shape.to_py_value()
+        tview_stride = row_indicies_tview.stride.to_py_value()
+
+        # make_fragment_layout_like() reserves space for dimension with 0 stride ???
+        # frg_layout = fx.make_fragment_layout_like(row_indicies_tview)
+        # print(" frg_layout: ", frg_layout, row_indicies_tview.layout)
+
+        # only pick mode with non-zero stride
+        nz_shape = []
+        nz_stride = []
+        fstride = 1
+        def collect_nz_modes(shape, stride):
+            nonlocal nz_shape, nz_stride, fstride
+            frag_stride = [] # fragment stride is compact
+            for s, d in zip(shape,stride):
+                if isinstance(d, int):
+                    if d != 0:
+                        nz_shape.append(s)
+                        nz_stride.append(d)
+                        frag_stride.append(fstride)
+                        fstride *= s
+                    else:
+                        frag_stride.append(0)
+                else:
+                    frag_stride.append(collect_nz_modes(s, d))
+            return frag_stride
+        frag_stride = collect_nz_modes(tview_shape, tview_stride)
+        nz_cnt = fstride
+        # print(" row_indicies_tview shape: ", nz_shape, " stride: ", nz_stride, " frag_stride: ", frag_stride, " nz_cnt: ", nz_cnt)
+
+        row_indicies_sview = fx.make_view(fx.get_iter(row_indicies_tview), fx.make_layout(nz_shape, nz_stride))
+        row_indicies_frag = fx.make_fragment_like(row_indicies_sview)
+        # print(" row_indicies_frag: ", row_indicies_frag)
+
+        row_indicies_vec = row_indicies_sview.load()
+
+        # store to rmem tensor usually do nothing after lowering?
+        row_indicies_frag.store(row_indicies_vec)
+
+        # reshape into partition_S thread-view form
+        row_indicies_frag = fx.composition(row_indicies_frag, fx.make_layout(tview_shape, frag_stride))
+        #row_indicies_frag = fx.make_view(fx.get_iter(row_indicies_frag), fx.make_layout(row_indicies_tview.shape, frag_stride))
+
+        #print(" row_indicies_frag: ", row_indicies_frag)
+        return row_indicies_frag
 
 def enable_dump_ir(enable_debug_info = True):
     import os
