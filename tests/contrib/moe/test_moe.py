@@ -393,14 +393,22 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             if weight_type == torch.bfloat16:
                 weight_dtype = 'bf16'
                 compile_quant_type = 'no'
+                compile_act_quant_type = 'no'
             else:
                 weight_dtype = 'fp8'
                 compile_quant_type = quant_type
+                # activation quant type for native-fp8 prefill: env-switchable (default ptpc).
+                # weight ptpc requires act ptpc; weight per_tensor allows ptpc or per_tensor.
+                compile_act_quant_type = (
+                    'ptpc'
+                    if quant_type == 'ptpc'
+                    else os.environ.get("ACT_QUANT_TYPE", "ptpc")
+                )
             if B == 1:
                 grid = topk_ids.numel()
                 w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                 g_kwargs = (
-                    ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
+                    ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
                     # gateup batch1 runs faster at BN=32 (more N-blocks/parallelism on the underutilized
                     # GPU, split-K reduce preserved via the full-fragment reduce); down stays at 64.
                     ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 32), ('stage', 'gateup'), ('alg', 'batch1'), ('E', E),
@@ -413,7 +421,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 cur_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
                 w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                 d_kwargs = (
-                    ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
+                    ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
                     ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 64), ('stage', 'down'), ('alg', 'batch1'), ('E', E),
                 )
                 _fly_dispatch(
@@ -439,16 +447,16 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 # gateup: 'prefill_2x2' / 'prefill_1x4' (4-wave tiled MMA, no reduce) for
                 # B>32 when the sorting tile (TILE_M, shared with the down stage) is >=64 and
                 # a 64-multiple; the wave arrangement (2x2 vs 1x4-along-N) is picked by the
-                # MOE_GATEUP_WAVE env var (default 2x2). 'splitk' otherwise.
+                # MOE_GATEUP_WAVE env var (default 1x4). 'splitk' otherwise.
                 use_prefill = B > 32 and TILE_M >= 64 and TILE_M % 64 == 0
-                _gateup_wave = os.environ.get("MOE_GATEUP_WAVE", "2x2")
+                _gateup_wave = os.environ.get("MOE_GATEUP_WAVE", "1x4")
                 if use_prefill:
                     gateup_alg = 'prefill_1x4' if _gateup_wave == '1x4' else 'prefill_2x2'
                 else:
                     gateup_alg = 'splitk'
                 gateup_tn = 128 if gateup_alg in ('prefill_2x2', 'prefill_1x4') else TILE_N
                 g_kwargs = (
-                    ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
+                    ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('act_quant_type', compile_act_quant_type), ('TOPK', TOPK),
                     ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', gateup_tn), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
                 )
                 if gateup_alg in ('prefill_2x2', 'prefill_1x4'):
@@ -456,7 +464,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     # dequant scale: quantize the activation per-token (ptpc) or per-tensor.
                     # bf16 passes through with a dummy scale (unused by the bf16 kernel path).
                     if weight_dtype == 'fp8':
-                        if quant_type == 'ptpc':
+                        if compile_act_quant_type == 'ptpc':
                             gateup_in, a_scale = aiter.get_hip_quant(aiter.QuantType.per_Token)(
                                 hidden_states, quant_dtype=weight_type)
                             a_scale = a_scale.to(torch.float32).contiguous()
@@ -494,7 +502,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         gemm2_out = torch.empty([B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device)
                     w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                     d_kwargs = (
-                        ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('quant_type', compile_quant_type), ('TOPK', TOPK),
+                        ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
                         ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'down'), ('alg', 'splitk'), ('E', E),
                         ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),
                     )
@@ -960,4 +968,4 @@ if __name__ == '__main__':
     prec = [torch.bfloat16]
     prec = [get_fp8type()]
     prec = [torch.bfloat16, get_fp8type()]
-    test_acc_fly_splitk_2s(batch=[8192], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    test_acc_fly_splitk_2s(batch=[1, 4, 17, 8192], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
