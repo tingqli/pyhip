@@ -35,6 +35,18 @@ tile级别的API应该表达以tile为单位的一些操作，至少是以tile�
 cute DSL应该是做到了一定的类似torch那样的功能，就是可以slice/index来获取tile的引用，但是一旦读入寄存器了（arith.value）
 就不能看作tile了，因为不像tensor，这样的arith.value没有layout.
 
+为什么这套接口给人一种割裂感，TiledCopy和TiledMMA其实都只是描述layout罢了，描述好layout剩下的其实就是用这个layout读取
+数据到fragment tensor然后计算而已，但是用layout读取这个操作，在gluon中是通过计算offset显式表达，而flydsl中则是通过使用
+tid + slicing 隐式表达，不论如何，tv-layout才是连接运算到代码的关键，tv-layout 连接到运算的方式是：
+  - tv-layout 构造 tiled_copy
+  - 使用 tiled_copy.get_slice().partition_S/D() 获取 thrView
+  - 使用 fx.make_fragment_like(thrView[]) 申请 fragment-tensor, (或者从别的地方申请的 fragment tensor，经过retile获取适合 copy 使用的 view)
+    其中 thrView可以全部映射到 fragment， 或者仅仅是头若干维度（需要是 tile_mn 维度的整数倍，也就是第一个维度是必选的最小大小）降低对 fragment大小的要求，后面留给loop
+  - 调用 fx.copy(copy_atom, )
+
+可以认为 fragment 是核心资产，thrView 是地址计算表达，retiled_frag 是API兼容接口
+
+  
 # Fly的一些理念
 
 Fly里面避免使用指针，因此数据的搬运都是通过tensor切片，加上copy_atom完成的，类似torch跟C++的区别。

@@ -205,15 +205,15 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
         c_bl_tile = fx.composition(c_bl_tile, trans_layout)
         c_br_tile = fx.composition(c_br_tile, trans_layout)
 
-        at_mem_tensor_thr = at_cp_frag.partition_S(at_tile, buf_cp_atom_r)
-        ab_mem_tensor_thr = ab_cp_frag.partition_S(ab_tile, buf_cp_atom_r)
-        bl_mem_tensor_thr = bl_cp_frag.partition_S(bl_tile, buf_cp_atom_r)
-        br_mem_tensor_thr = br_cp_frag.partition_S(br_tile, buf_cp_atom_r)
+        at_mem_tensor_thr = at_cp_frag.partition_S(at_tile)
+        ab_mem_tensor_thr = ab_cp_frag.partition_S(ab_tile)
+        bl_mem_tensor_thr = bl_cp_frag.partition_S(bl_tile)
+        br_mem_tensor_thr = br_cp_frag.partition_S(br_tile)
 
-        at_lds_tensor_thr_w = at_cp_frag.partition_D(at_lds, uni_cp_atom_w)
-        ab_lds_tensor_thr_w = ab_cp_frag.partition_D(ab_lds, uni_cp_atom_w)
-        bl_lds_tensor_thr_w = bl_cp_frag.partition_D(bl_lds, uni_cp_atom_w)
-        br_lds_tensor_thr_w = br_cp_frag.partition_D(br_lds, uni_cp_atom_w)
+        at_lds_tensor_thr_w = at_cp_frag.partition_D(at_lds)
+        ab_lds_tensor_thr_w = ab_cp_frag.partition_D(ab_lds)
+        bl_lds_tensor_thr_w = bl_cp_frag.partition_D(bl_lds)
+        br_lds_tensor_thr_w = br_cp_frag.partition_D(br_lds)
 
         at_lds_tensor_thr_r = at_frag.partition_S(at_lds)
         ab_lds_tensor_thr_r = ab_frag.partition_S(ab_lds)
@@ -222,15 +222,15 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
 
         # prefetch
         # gr0: all
-        bl_cp_frag.copy_from(bl_mem_tensor_thr[None, None, None, 0], buf_cp_atom_r)
-        at_cp_frag.copy_from(at_mem_tensor_thr[None, None, None, 0], buf_cp_atom_r)
-        ab_cp_frag.copy_from(ab_mem_tensor_thr[None, None, None, 0], buf_cp_atom_r)
-        br_cp_frag.copy_from(br_mem_tensor_thr[None, None, None, 0], buf_cp_atom_r)
+        bl_cp_frag.copy_from(bl_mem_tensor_thr[None, None, None, 0])
+        at_cp_frag.copy_from(at_mem_tensor_thr[None, None, None, 0])
+        ab_cp_frag.copy_from(ab_mem_tensor_thr[None, None, None, 0])
+        br_cp_frag.copy_from(br_mem_tensor_thr[None, None, None, 0])
         # lw0: all
-        bl_cp_frag.copy_to(bl_lds_tensor_thr_w, uni_cp_atom_w)
-        at_cp_frag.copy_to(at_lds_tensor_thr_w, uni_cp_atom_w)
-        ab_cp_frag.copy_to(ab_lds_tensor_thr_w, uni_cp_atom_w)
-        br_cp_frag.copy_to(br_lds_tensor_thr_w, uni_cp_atom_w)
+        bl_cp_frag.copy_to(bl_lds_tensor_thr_w)
+        at_cp_frag.copy_to(at_lds_tensor_thr_w)
+        ab_cp_frag.copy_to(ab_lds_tensor_thr_w)
+        br_cp_frag.copy_to(br_lds_tensor_thr_w)
 
         rocdl = fx.rocdl
         gpu = fx.gpu
@@ -238,13 +238,13 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
         range_constexpr = fx.range_constexpr
 
         # gr1: all
-        bl_cp_frag.copy_from(bl_mem_tensor_thr[None, None, None, 1], buf_cp_atom_r)
+        bl_cp_frag.copy_from(bl_mem_tensor_thr[None, None, None, 1])
         rocdl.sched_barrier(0)
-        at_cp_frag.copy_from(at_mem_tensor_thr[None, None, None, 1], buf_cp_atom_r)
+        at_cp_frag.copy_from(at_mem_tensor_thr[None, None, None, 1])
         rocdl.sched_barrier(0)
-        ab_cp_frag.copy_from(ab_mem_tensor_thr[None, None, None, 1], buf_cp_atom_r)
+        ab_cp_frag.copy_from(ab_mem_tensor_thr[None, None, None, 1])
         rocdl.sched_barrier(0)
-        br_cp_frag.copy_from(br_mem_tensor_thr[None, None, None, 1], buf_cp_atom_r)
+        br_cp_frag.copy_from(br_mem_tensor_thr[None, None, None, 1])
         rocdl.sched_barrier(0)
         
         gpu.barrier()
@@ -295,9 +295,9 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
             fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
             # lw: bl1
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_a_half_cnt + mem_a_half_cnt + mem_b_half_cnt))
-            bl_cp_frag.copy_to(bl_lds_tensor_thr_w, uni_cp_atom_w)
+            bl_cp_frag.copy_to(bl_lds_tensor_thr_w)
             # gr: bl2
-            bl_cp_frag.copy_from(bl_mem_tensor_thr[None, None, None, k + 2], buf_cp_atom_r)
+            bl_cp_frag.copy_from(bl_mem_tensor_thr[None, None, None, k + 2])
             # lr: ab0
             gpu.barrier()
             ab_frag.copy_from(ab_lds_tensor_thr_r, uni_cp_atom_r)
@@ -308,9 +308,9 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
             fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
             # lw: at1
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_a_half_cnt + mem_b_half_cnt + mem_b_half_cnt))
-            at_cp_frag.copy_to(at_lds_tensor_thr_w, uni_cp_atom_w)
+            at_cp_frag.copy_to(at_lds_tensor_thr_w)
             # gr: at2
-            at_cp_frag.copy_from(at_mem_tensor_thr[None, None, None, k + 2], buf_cp_atom_r)
+            at_cp_frag.copy_from(at_mem_tensor_thr[None, None, None, k + 2])
             # lr: br0
             gpu.barrier()
             br_frag.copy_from(br_lds_tensor_thr_r, uni_cp_atom_r)
@@ -321,12 +321,12 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
             fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
             # lw: ab1
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_b_half_cnt + mem_b_half_cnt + mem_a_half_cnt))
-            ab_cp_frag.copy_to(ab_lds_tensor_thr_w, uni_cp_atom_w)
+            ab_cp_frag.copy_to(ab_lds_tensor_thr_w)
             # gr: ab2
-            ab_cp_frag.copy_from(ab_mem_tensor_thr[None, None, None, k + 2], buf_cp_atom_r)
+            ab_cp_frag.copy_from(ab_mem_tensor_thr[None, None, None, k + 2])
             # lr: bl1
             gpu.barrier()
-            bl_frag.copy_from(bl_lds_tensor_thr_r, uni_cp_atom_r)
+            bl_frag.copy_from(bl_lds_tensor_thr_r)
             hot_loop_scheduler(mem_a_half_cnt, lds_b_half_cnt)
             rocdl.sched_barrier(2)
 
@@ -334,12 +334,12 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
             fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
             # lw: br1
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_b_half_cnt + mem_a_half_cnt + mem_a_half_cnt))
-            br_cp_frag.copy_to(br_lds_tensor_thr_w, uni_cp_atom_w)
+            br_cp_frag.copy_to(br_lds_tensor_thr_w)
             # gr: br2
-            br_cp_frag.copy_from(br_mem_tensor_thr[None, None, None, k + 2], buf_cp_atom_r)
+            br_cp_frag.copy_from(br_mem_tensor_thr[None, None, None, k + 2])
             # lr: at1
             gpu.barrier()
-            at_frag.copy_from(at_lds_tensor_thr_r, uni_cp_atom_r)
+            at_frag.copy_from(at_lds_tensor_thr_r)
             hot_loop_scheduler(mem_b_half_cnt, lds_a_half_cnt)
             rocdl.sched_barrier(3)
 
