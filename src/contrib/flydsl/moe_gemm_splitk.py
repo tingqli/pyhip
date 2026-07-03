@@ -50,9 +50,15 @@ def compile_gemm(
     E=None,
     USE_ATOMIC_WRITE=True,
     act_quant_type=None,
+    tile_k=None,
 ):
 
     TILE_K = 64
+    # Optional TILE_K override for the prefill_1x4 alg. The env fallback lets test_moe.py /
+    # profile scripts pick BK without threading a kwarg through every caller. bf16 prefill_1x4
+    # supports BK in {64, 128} (the per-ki gemm loop); fp8 stays 128.
+    if tile_k is None and os.environ.get("MOE_PREFILL_TILE_K"):
+        tile_k = int(os.environ["MOE_PREFILL_TILE_K"])
     # weight_quant_type governs the WEIGHT scale form; act_quant_type governs the ACTIVATION
     # scale form (native-fp8 prefill only) and defaults to weight_quant_type (legacy behavior
     # where a single quant_type drove both).
@@ -173,7 +179,14 @@ def compile_gemm(
             "For prefill_1x4 alg, BLOCK_TILE_SIZE_M must be in [64, 256] and a multiple of 64"
         )
         # fp8 issues 128-bit g2r loads (16 fp8/thread) -> widen K-tile to 128; bf16 keeps 64.
-        TILE_K = 128 if weight_dtype == "fp8" else 64
+        # tile_k override (default 64 for bf16 / 128 for fp8) enables the BK sweep; the per-ki
+        # gemm loop in _gemm_1x4 handles bf16 TILE_K in {64, 128} and fp8 TILE_K in {128, 256}.
+        TILE_K = tile_k if tile_k is not None else (128 if weight_dtype == "fp8" else 64)
+        if weight_dtype == "fp8":
+            assert TILE_K in (128, 256), f"prefill_1x4 fp8 TILE_K must be 128 or 256, got {TILE_K}"
+        else:
+            assert TILE_K in (64, 128), f"prefill_1x4 bf16 TILE_K must be 64 or 128, got {TILE_K}"
+        assert K % TILE_K == 0, f"prefill_1x4 K={K} must be a multiple of TILE_K={TILE_K}"
         a_lds_size = BLOCK_TILE_SIZE_M * TILE_K  # full A tile; ping-pong needs two buffers
         lds_elem = fx.Float8E4M3FNUZ if weight_dtype == "fp8" else fx.BFloat16
 
@@ -1111,14 +1124,17 @@ def compile_gemm(
         gate and the up projection (two C fragments) so silu stays wave-internal. A
         (activation) is gathered via sorted_lds and staged through an LDS ping-pong
         (a_ping/a_pong); B (weight gate/up) loads direct global->register (no LDS). Pipeline
-        mirrors preshuffle_gemm_v2 (A 2-stage LDS ping-pong; standard A-first MFMA)."""
+        mirrors preshuffle_gemm_v2 (A 2-stage LDS ping-pong). B-first MFMA (weight is the
+        MFMA M-side) so each C fragment's value dim runs along channel (4 contiguous
+        channels/lane), letting the epilogue store 64-bit instead of the A-first 16-bit."""
         tid = gpu.thread_idx.x
         contiguous_n = TILE_N // 2
 
         a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
         b_tensor = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
 
-        # tiled_mma: standard A-first (mma_M=token, mma_N=channel); 4 waves along N(channel).
+        # tiled_mma: B-first (mma_M=channel from weight, mma_N=token from activation); the 4
+        # waves tile M(channel) so each wave still owns contiguous_n//4 output channels.
         if const_expr(weight_dtype == fx.BFloat16):
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
             k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
@@ -1127,7 +1143,7 @@ def compile_gemm(
             k_perm = fx.make_layout((8, 4, 2), (1, 16, 8))
         tiled_mma = fx.make_tiled_mma(
             mma_atom,
-            fx.make_layout((1, 4, 1), (0, 1, 0)),
+            fx.make_layout((4, 1, 1), (1, 0, 0)),
             fx.make_tile(None, None, k_perm),
         )
 
@@ -1140,10 +1156,22 @@ def compile_gemm(
         a_tile = fx.flat_divide(a_size_buf, fx.make_tile(TILE_M, TILE_K))[None, None, 0, None]
         if const_expr(weight_dtype == fx.BFloat16):
             buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-            g2r_tv_layout = fx.make_layout(((8, 8, 4), 8), ((256, 1, 8), 32))
+            # value = contiguous K-elements per thread over the (32, TILE_K) A sub-tile:
+            # TILE_K=64 -> 8 bf16 (one ds/buffer 128b op); TILE_K=128 -> 16 bf16 (two 128b
+            # ops, rep=2) with sub0 stride widened to 512 so K-blocks step by 16 not 8.
+            if const_expr(TILE_K == 128):
+                g2r_tv_layout = fx.make_layout(((8, 8, 4), 16), ((512, 1, 8), 32))
+            else:
+                g2r_tv_layout = fx.make_layout(((8, 8, 4), 8), ((256, 1, 8), 32))
         else:
             buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), weight_dtype)
-            g2r_tv_layout = fx.make_layout(((8, 8, 4), 16), ((512, 1, 8), 32))
+            # fp8: contiguous K-elems/thread over the (32, TILE_K) A sub-tile. TILE_K=128 -> 16
+            # fp8 (one 128b op); TILE_K=256 -> 32 fp8 (two 128b ops, rep=2) with sub0 stride
+            # widened to 1024 so K-blocks step by 32 not 16.
+            if const_expr(TILE_K == 256):
+                g2r_tv_layout = fx.make_layout(((8, 8, 4), 32), ((1024, 1, 8), 32))
+            else:
+                g2r_tv_layout = fx.make_layout(((8, 8, 4), 16), ((512, 1, 8), 32))
         a_mem_cp_g2r = fx.make_tiled_copy(buf_cp_atom_r, g2r_tv_layout, fx.make_tile(8 * 4, TILE_K))
         # index copy for A gather: M-row = (lane//8) + 8*wave, replicated across the 8
         # K-lanes; rep_m at M-stride 32 (full TILE_M).
@@ -1172,33 +1200,39 @@ def compile_gemm(
         a_pong = fx.make_view(lds.gemm.a_pong.ptr, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M, TILE_K), order=(1, 0))))
 
         uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), weight_dtype)
-        a_r2s = fx.make_tiled_copy(uni_cp_atom, g2r_tv_layout, fx.make_tile(8 * 4, TILE_K))
+        # A LDS write (r2s): 128-bit -> ds_write_b128; LDS read below stays 128-bit -> ds_read_b128.
+        uni_cp_atom_w = fx.make_copy_atom(fx.UniversalCopy128b(), weight_dtype)
+        a_r2s = fx.make_tiled_copy(uni_cp_atom_w, g2r_tv_layout, fx.make_tile(8 * 4, TILE_K))
         a_lds_w = [a_r2s.get_slice(tid).partition_D(a_ping), a_r2s.get_slice(tid).partition_D(a_pong)]
         a_cp_frag_retile = a_r2s.get_slice(tid).retile(a_cp_frag)
+        # B-first: activation is the MFMA B-operand (make_fragment_B / make_tiled_copy_B).
         a_lds_r = [
-            fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(a_ping),
-            fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(a_pong),
+            fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(a_ping),
+            fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).partition_S(a_pong),
         ]
-        a_frag = tiled_mma.make_fragment_A(a_ping)
-        a_frag_retile = fx.make_tiled_copy_A(uni_cp_atom, tiled_mma).get_slice(tid).retile(a_frag)
+        a_frag = tiled_mma.make_fragment_B(a_ping)
+        a_frag_retile = fx.make_tiled_copy_B(uni_cp_atom, tiled_mma).get_slice(tid).retile(a_frag)
 
         # ---- B (weight gate/up): direct global->register (no LDS), 2-stage double buffer ----
+        # B-first: weight is the MFMA A-operand (make_fragment_A / make_tiled_copy_A).
         bl_tile = fx.flat_divide(b_tensor, fx.make_tile(contiguous_n, TILE_K))[None, None, blk_n * 2 + 0, None]
         br_tile = fx.flat_divide(b_tensor, fx.make_tile(contiguous_n, TILE_K))[None, None, blk_n * 2 + 1, None]
-        b_g2r = fx.make_tiled_copy_B(buf_cp_atom_r, tiled_mma).get_slice(tid)
+        b_g2r = fx.make_tiled_copy_A(buf_cp_atom_r, tiled_mma).get_slice(tid)
         bl_g2r = b_g2r.partition_S(bl_tile)
         br_g2r = b_g2r.partition_S(br_tile)
-        bl_frag_st = [tiled_mma.make_fragment_B(bl_tile[None, None, 0]), tiled_mma.make_fragment_B(bl_tile[None, None, 0])]
-        br_frag_st = [tiled_mma.make_fragment_B(br_tile[None, None, 0]), tiled_mma.make_fragment_B(br_tile[None, None, 0])]
+        bl_frag_st = [tiled_mma.make_fragment_A(bl_tile[None, None, 0]), tiled_mma.make_fragment_A(bl_tile[None, None, 0])]
+        br_frag_st = [tiled_mma.make_fragment_A(br_tile[None, None, 0]), tiled_mma.make_fragment_A(br_tile[None, None, 0])]
         bl_ret_st = [b_g2r.retile(bl_frag_st[0]), b_g2r.retile(bl_frag_st[1])]
         br_ret_st = [b_g2r.retile(br_frag_st[0]), b_g2r.retile(br_frag_st[1])]
 
         # ---- C fragments (gate + up), one make_fragment_C each ----
+        # B-first: make_fragment_C over the (channel, token) tile; the value dim then runs
+        # along channel (4 contiguous channels/lane) for a 64-bit epilogue store.
         c_fake_buf = fx.rocdl.make_buffer_tensor(
-            fx.make_view(fx.get_iter(arg_p_input), fx.make_layout((TILE_M, contiguous_n), (contiguous_n, 1))),
+            fx.make_view(fx.get_iter(arg_p_input), fx.make_layout((contiguous_n, TILE_M), (TILE_M, 1))),
             max_size=False,
         )
-        c_fake = fx.flat_divide(c_fake_buf, fx.make_tile(TILE_M, contiguous_n))[None, None, 0, 0]
+        c_fake = fx.flat_divide(c_fake_buf, fx.make_tile(contiguous_n, TILE_M))[None, None, 0, 0]
         c_gate = tiled_mma.make_fragment_C(c_fake)
         c_up = tiled_mma.make_fragment_C(c_fake)
         c_gate.fill(0)
@@ -1214,37 +1248,66 @@ def compile_gemm(
         mfma_per_gemm = _m_reps * _n_reps * (TILE_K // k_per_mma)
         mem_a_cnt = a_cp_frag.load().numel * weight_dtype.width // 8 // 16
         mem_b_cnt = bl_frag_st[0].load().numel * weight_dtype.width // 8 // 16
+        # per-ki interleave: k_perm groups 2 MFMA-K atoms, so k_iters = TILE_K / (2*k_per_mma).
+        # fragment K dim is (2 atoms, k_iters) -> gemm coord = (None, ki); the retile/LDS-read
+        # views have a flat k_iters dim -> coord = ki. This is what lets TILE_K scale to 128.
+        k_iters = TILE_K // (2 * k_per_mma)
+        # full A(tile) LDS read (ds_read), done once per stage (cross-stage rotation)
+        lds_a_cnt = a_frag.load().numel * weight_dtype.width // 8 // 16
 
         def hot_loop_scheduler():
-            # Interleave the next-tile prefetch (B gate/up + A g2r vmem) and the A staging->LDS
-            # store (ds_write) with the two gemms' MFMAs so the global-load latency is hidden.
+            # Fixed interleave: each buffer_load(vmem)+4 mfma; each ds_read(dsrd)+1 mfma;
+            # each ds_write(dswr)+2 mfma (dsrd before dswr); then the remaining mfma.
             mfma_cnt = 2 * mfma_per_gemm
-            for _ in range_constexpr(mem_a_cnt):
+            n_vmem = mem_a_cnt + 2 * mem_b_cnt   # A g2r + B gate/up g2r (buffer_load)
+            n_dswr = mem_a_cnt                    # A staging -> LDS store (ds_write)
+            n_dsrd = lds_a_cnt                    # A LDS -> register full tile (ds_read)
+            used = 0
+            rocdl.sched_dsrd(2)
+            for _ in range_constexpr(n_vmem):
+                rocdl.sched_dsrd(1)
+                rocdl.sched_vmem(1)
+                rocdl.sched_mfma(4)
+                used += 4
+            for _ in range_constexpr(n_dsrd - n_vmem - 2):
+                rocdl.sched_dsrd(1)
+                rocdl.sched_mfma(1)
+                used += 1
+            rocdl.sched_mfma(mfma_cnt - n_dswr * 2 - used)
+            for _ in range_constexpr(n_dswr):
                 rocdl.sched_dswr(1)
                 rocdl.sched_mfma(2)
-                rocdl.sched_vmem(1)
-                rocdl.sched_mfma(1)
-            for _ in range_constexpr(2 * mem_b_cnt):
-                rocdl.sched_vmem(1)
-                rocdl.sched_mfma(2)
-            rocdl.sched_mfma(mfma_cnt)
+                used += 2
+            if const_expr(mfma_cnt - used > 0):
+                rocdl.sched_mfma(mfma_cnt - used)
 
         def pipeline_stage(read_i, k_next, do_prefetch):
             write_i = read_i ^ 1
-            # prefetch next B (gate/up) + A (all vmem) so they overlap the current gemms
+            # prefetch next B (gate/up) + A (global -> register)
             if const_expr(do_prefetch):
+                a_idx.copy(buf_cp_atom_r, k_next, a_cp_frag)
                 fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, k_next], bl_ret_st[write_i])
                 fx.copy(buf_cp_atom_r, br_g2r[None, None, None, k_next], br_ret_st[write_i])
-                a_idx.copy(buf_cp_atom_r, k_next, a_cp_frag)
-            # A(k_cur) LDS[read] -> register (ds_read feeds the gemms)
+            # read this stage's own A tile LDS[read_i] -> a_frag at the head, then compute
             fx.copy(uni_cp_atom, a_lds_r[read_i], a_frag_retile)
-            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-            # 2 gemms with the current (previously prefetched) B stage
-            fx.gemm(tiled_mma, c_gate, a_frag, bl_frag_st[read_i], c_gate)
-            fx.gemm(tiled_mma, c_up, a_frag, br_frag_st[read_i], c_up)
-            # A(k_next) staging -> LDS[write] (ds_write)
+            for ki in range_constexpr(k_iters):
+                fx.gemm(
+                    tiled_mma,
+                    c_gate,
+                    bl_frag_st[read_i][None, None, (None, ki)],
+                    a_frag[None, None, (None, ki)],
+                    c_gate,
+                )
+                fx.gemm(
+                    tiled_mma,
+                    c_up,
+                    br_frag_st[read_i][None, None, (None, ki)],
+                    a_frag[None, None, (None, ki)],
+                    c_up,
+                )
             if const_expr(do_prefetch):
-                fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[write_i])
+                # A(k_next) staging -> LDS[write] for a later stage's head read
+                fx.copy(uni_cp_atom_w, a_cp_frag_retile, a_lds_w[write_i])
                 hot_loop_scheduler()
             rocdl.sched_barrier(0)
             gpu.barrier()
@@ -1254,7 +1317,7 @@ def compile_gemm(
         fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, fx.Int32(0)], bl_ret_st[0])
         fx.copy(buf_cp_atom_r, br_g2r[None, None, None, fx.Int32(0)], br_ret_st[0])
         rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
-        fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[0])
+        fx.copy(uni_cp_atom_w, a_cp_frag_retile, a_lds_w[0])
         gpu.barrier()
 
         acc_init = [c_gate.load(), c_up.load()]
@@ -1909,14 +1972,25 @@ def compile_gemm(
             )
             cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.at_lds.ptr)
             # Two LDS tiles (token, channel), channel-contiguous, back-to-back in GemmBuffers.
+            # The 64-bit store's token stride (contiguous_n bf16 elems) is bank-aligned -> the
+            # plain layout is 16-way bank-conflicted; XOR-swizzle both tiles (same view used by
+            # the 64-bit store AND the 128-bit read -> consistent) to de-conflict. C-staging is
+            # bf16, so the swizzle is bf16's (3,3,3). Needs no extra LDS (unlike padding).
+            swz_c = fx.SwizzleType.get(3, 3, 3)
             _cshuf_half = BLOCK_TILE_SIZE_M // 2 * contiguous_n
             lds_top = fx.make_view(
                 cshuf_ptr,
-                fx.make_layout((BLOCK_TILE_SIZE_M // 2, contiguous_n), (contiguous_n, 1)),
+                fx.make_composed_layout(
+                    fx.static(swz_c),
+                    fx.make_ordered_layout((BLOCK_TILE_SIZE_M // 2, contiguous_n), order=(1, 0)),
+                ),
             )
             lds_bot = fx.make_view(
                 cshuf_ptr + _cshuf_half,
-                fx.make_layout((BLOCK_TILE_SIZE_M // 2, contiguous_n), (contiguous_n, 1)),
+                fx.make_composed_layout(
+                    fx.static(swz_c),
+                    fx.make_ordered_layout((BLOCK_TILE_SIZE_M // 2, contiguous_n), order=(1, 0)),
+                ),
             )
 
             # gemm_2x2's LDS reads must finish before we overwrite GemmBuffers.
@@ -2052,14 +2126,14 @@ def compile_gemm(
                 index_offset=0,
             )
 
-            # ptpc a_scale is per-token; the 1x4 A-first C fragment packs 4 CONSECUTIVE
-            # tokens per lane in the value dim (token = 4*(lane//16) + v + 16*rep_m). Gather
-            # the 4 sorted ids per rep_m so the per-token act scale can be folded per value.
-            # Read before gemm_1x4 overwrites sorted_lds.
+            # ptpc a_scale is per-token; B-first packs 4 CONTIGUOUS channels per lane in the
+            # value dim, so token = lane%16 + 16*token_rep (one id per token_rep, shared by
+            # the 4 channel values). Gather the per-token_rep sorted id here, before gemm_1x4
+            # overwrites sorted_lds.
             if const_expr(weight_dtype != fx.BFloat16 and act_quant_type == "ptpc"):
                 asc_index_copy = fx.make_tiled_copy(
                     fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
-                    fx.make_layout(((16, 4, 4), 4), ((0, 4, 0), 1)),
+                    fx.make_layout(((16, 4, 4), 1), ((1, 0, 0), 0)),
                     fx.make_tile(16),
                 )
                 cp_atom_idx = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
@@ -2084,10 +2158,11 @@ def compile_gemm(
             n_reps = fx.size(fx.get_shape(c_gate_frag)[2]).to_py_value()
 
             if const_expr(weight_dtype != fx.BFloat16 and act_quant_type == "ptpc"):
-                # A-first dequant with per-token act scale: a_scale is per token = one per
-                # value v (4 consecutive tokens/lane). b_scale is per-output-channel (one
-                # scalar per rep_n) when weight is ptpc, else a single per_tensor scalar. Fold
-                # both into c before the plain silu.
+                # B-first dequant with per-token act scale: value dim = 4 contiguous channels,
+                # m_rep = channel_rep, n_rep = token_rep. a_scale is per token (one scalar per
+                # token_rep, shared by the 4 channel values). b_scale is per-output-channel
+                # (one per value + channel_rep) when weight is ptpc, else a per_tensor scalar.
+                # Fold both into c before the plain silu.
                 if const_expr(weight_quant_type == "ptpc"):
                     scale_gate = fx.make_view(
                         _as_ptr(p_w_scale) + expert_id * N + blk_n * contiguous_n,
@@ -2098,9 +2173,11 @@ def compile_gemm(
                         fx.make_layout(contiguous_n, 1),
                     )
                     cp_atom_scale = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+                    # channel = v + 4*(lane//16) + 16*wave (+ 64*channel_rep): gather 4 per
+                    # value into [v, channel_rep] to match the C fragment channel layout.
                     scale_copy = fx.make_tiled_copy(
                         cp_atom_scale,
-                        fx.make_layout(((16, 4, 4), 1), ((1, 0, 16), 0)),
+                        fx.make_layout(((16, 4, 4), 4), ((0, 4, 16), 1)),
                         fx.make_tile(64),
                     )
                     sg_thr = scale_copy.get_slice(tid).partition_S(scale_gate)
@@ -2121,25 +2198,32 @@ def compile_gemm(
                     ),
                     max_size=False,
                 )
+                # a_scale is per token = per token_rep n (independent of channel_rep m), so
+                # gather all n up front: removes the redundant gather across m and lets the
+                # indexed loads issue together instead of serializing inside the inner loop.
+                a_sc_n = [
+                    a_scale_tensor[asc_idx[0, n] & 0xFFFFFF]
+                    for n in range_constexpr(n_reps)
+                ]
                 for m in range_constexpr(m_reps):
-                    a_sc_v = [
-                        a_scale_tensor[asc_idx[v, m] & 0xFFFFFF]
-                        for v in range_constexpr(4)
-                    ]
+                    if const_expr(weight_quant_type == "ptpc"):
+                        sg_v = gate_scale[None, m].load()
+                        su_v = up_scale[None, m].load()
                     for n in range_constexpr(n_reps):
+                        a_sc = a_sc_n[n]
                         cg = c_gate_frag[None, m, n].load()
                         cu = c_up_frag[None, m, n].load()
-                        if const_expr(weight_quant_type == "ptpc"):
-                            sg = gate_scale[0, n]
-                            su = up_scale[0, n]
-                        else:
-                            sg = b_scalar
-                            su = b_scalar
                         cg_items = []
                         cu_items = []
                         for v in range_constexpr(4):
-                            cg_items.append(cg[v] * sg * a_sc_v[v])
-                            cu_items.append(cu[v] * su * a_sc_v[v])
+                            if const_expr(weight_quant_type == "ptpc"):
+                                sg = sg_v[v]
+                                su = su_v[v]
+                            else:
+                                sg = b_scalar
+                                su = b_scalar
+                            cg_items.append(cg[v] * sg * a_sc)
+                            cu_items.append(cu[v] * su * a_sc)
                         c_gate_frag[None, m, n].store(Vec.from_elements(cg_items, fx.Float32))
                         c_up_frag[None, m, n].store(Vec.from_elements(cu_items, fx.Float32))
             elif const_expr(weight_dtype != fx.BFloat16 and act_quant_type == "per_tensor"):
@@ -2157,8 +2241,9 @@ def compile_gemm(
 
             # 128-bit CShuffle epilogue (single region). Reconstruct the 1x4 tiled_mma and
             # stage c_out_bf16 into the A LDS via make_tiled_copy_C (framework-consistent with
-            # the make_fragment_C layout), then read it back channel-contiguous (8 bf16/lane)
-            # so the scatter issues 128-bit writes.
+            # the make_fragment_C layout). B-first makes the value dim 4 contiguous channels,
+            # so the store is 64-bit; read it back channel-contiguous (8 bf16/lane) so the
+            # scatter issues 128-bit writes.
             if const_expr(weight_dtype == fx.BFloat16):
                 _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
                 _k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
@@ -2167,20 +2252,40 @@ def compile_gemm(
                 _k_perm = fx.make_layout((8, 4, 2), (1, 16, 8))
             _tiled_mma = fx.make_tiled_mma(
                 _mma_atom,
-                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_layout((4, 1, 1), (1, 0, 0)),
                 fx.make_tile(None, None, _k_perm),
             )
-            cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16)
+            cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
             cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
             cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
+            # B-first: store through the (channel=M, token=N) transpose view so the value dim
+            # (4 contiguous channels) is channel-contiguous -> 64-bit ds_write; read back the
+            # aliased (token, channel) view channel-contiguous (8 bf16/lane) for the 128b
+            # scatter. Both views share the same LDS bytes AND linear-offset formula, so the
+            # same XOR swizzle keeps them consistent. The swizzle is required: the token stride
+            # (contiguous_n elems) is bank-aligned, so an unswizzled 64-bit store is 16-way
+            # bank-conflicted; the swizzle spreads it (needs no extra LDS, unlike padding).
+            # C-staging is bf16 in both the bf16 and fp8 paths (it holds the bf16 output), so
+            # the de-conflict swizzle is bf16's (3,3,3) in both cases -- NOT the fp8 input swz.
+            swz_c = fx.SwizzleType.get(3, 3, 3)
+            lds_c_store = fx.make_view(
+                cshuf_ptr,
+                fx.make_composed_layout(
+                    fx.static(swz_c),
+                    fx.make_ordered_layout((contiguous_n, BLOCK_TILE_SIZE_M), order=(0, 1)),
+                ),
+            )
             lds_c = fx.make_view(
                 cshuf_ptr,
-                fx.make_layout((BLOCK_TILE_SIZE_M, contiguous_n), (contiguous_n, 1)),
+                fx.make_composed_layout(
+                    fx.static(swz_c),
+                    fx.make_ordered_layout((BLOCK_TILE_SIZE_M, contiguous_n), order=(1, 0)),
+                ),
             )
 
             gpu.barrier()  # gemm_1x4's LDS reads must finish before reusing GemmBuffers
             store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
-            fx.copy(cshuf_atom_w, store_c.retile(c_out_bf16), store_c.partition_D(lds_c))
+            fx.copy(cshuf_atom_w, store_c.retile(c_out_bf16), store_c.partition_D(lds_c_store))
             gpu.barrier()
             rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
             fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
