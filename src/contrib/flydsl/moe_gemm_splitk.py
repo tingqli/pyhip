@@ -1154,32 +1154,22 @@ def compile_gemm(
             max_size=False,
         )
         a_tile = fx.flat_divide(a_size_buf, fx.make_tile(TILE_M, TILE_K))[None, None, 0, None]
-        if const_expr(weight_dtype == fx.BFloat16):
-            buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-            # value = contiguous K-elements per thread over the (32, TILE_K) A sub-tile:
-            # TILE_K=64 -> 8 bf16 (one ds/buffer 128b op); TILE_K=128 -> 16 bf16 (two 128b
-            # ops, rep=2) with sub0 stride widened to 512 so K-blocks step by 16 not 8.
-            if const_expr(TILE_K == 128):
-                g2r_tv_layout = fx.make_layout(((8, 8, 4), 16), ((512, 1, 8), 32))
-            else:
-                g2r_tv_layout = fx.make_layout(((8, 8, 4), 8), ((256, 1, 8), 32))
-        else:
-            buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), weight_dtype)
-            # fp8: contiguous K-elems/thread over the (32, TILE_K) A sub-tile. TILE_K=128 -> 16
-            # fp8 (one 128b op); TILE_K=256 -> 32 fp8 (two 128b ops, rep=2) with sub0 stride
-            # widened to 1024 so K-blocks step by 32 not 16.
-            if const_expr(TILE_K == 256):
-                g2r_tv_layout = fx.make_layout(((8, 8, 4), 32), ((1024, 1, 8), 32))
-            else:
-                g2r_tv_layout = fx.make_layout(((8, 8, 4), 16), ((512, 1, 8), 32))
-        a_mem_cp_g2r = fx.make_tiled_copy(buf_cp_atom_r, g2r_tv_layout, fx.make_tile(8 * 4, TILE_K))
-        # index copy for A gather: M-row = (lane//8) + 8*wave, replicated across the 8
-        # K-lanes; rep_m at M-stride 32 (full TILE_M).
+        buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), weight_dtype)
+        _val_per_thr = 8 if const_expr(weight_dtype == fx.BFloat16) else 16
+        _thrs_k = TILE_K // _val_per_thr
+        _thrs_m = 256 // _thrs_k
+        g2r_tv_layout = fx.make_layout(
+            ((_thrs_k, _thrs_m), (1, _val_per_thr)),
+            ((_thrs_m * _val_per_thr, 1), (1, _thrs_m)),
+        )
+        a_mem_cp_g2r = fx.make_tiled_copy(buf_cp_atom_r, g2r_tv_layout, fx.make_tile(_thrs_m, TILE_K))
+        # index copy for A gather: M-row mapping matches g2r M-tile (_thrs_m).
+        _m_per_wave = _thrs_m // 4
         cp_atom_sortid_a = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
         tiled_copy_sortid_a = fx.make_tiled_copy(
             cp_atom_sortid_a,
-            fx.make_layout(((8, 8, 4), 1), ((0, 1, 8), 0)),
-            fx.make_tile(32),
+            fx.make_layout(((_thrs_k, _m_per_wave, 4), 1), ((0, 1, _m_per_wave), 0)),
+            fx.make_tile(_thrs_m),
         )
         a_idx = TensorWithIndex(
             a_tensor, TILE_M, TILE_K, tiled_copy_sortid_a, a_mem_cp_g2r, tid,
@@ -1202,7 +1192,7 @@ def compile_gemm(
         uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), weight_dtype)
         # A LDS write (r2s): 128-bit -> ds_write_b128; LDS read below stays 128-bit -> ds_read_b128.
         uni_cp_atom_w = fx.make_copy_atom(fx.UniversalCopy128b(), weight_dtype)
-        a_r2s = fx.make_tiled_copy(uni_cp_atom_w, g2r_tv_layout, fx.make_tile(8 * 4, TILE_K))
+        a_r2s = fx.make_tiled_copy(uni_cp_atom_w, g2r_tv_layout, fx.make_tile(_thrs_m, TILE_K))
         a_lds_w = [a_r2s.get_slice(tid).partition_D(a_ping), a_r2s.get_slice(tid).partition_D(a_pong)]
         a_cp_frag_retile = a_r2s.get_slice(tid).retile(a_cp_frag)
         # B-first: activation is the MFMA B-operand (make_fragment_B / make_tiled_copy_B).
@@ -1267,9 +1257,11 @@ def compile_gemm(
             for _ in range_constexpr(n_vmem):
                 rocdl.sched_dsrd(1)
                 rocdl.sched_vmem(1)
-                rocdl.sched_mfma(4)
+                rocdl.sched_mfma(2)
+                rocdl.sched_dsrd(1)
+                rocdl.sched_mfma(2)
                 used += 4
-            for _ in range_constexpr(n_dsrd - n_vmem - 2):
+            for _ in range_constexpr(n_dsrd - 2 * n_vmem - 2):
                 rocdl.sched_dsrd(1)
                 rocdl.sched_mfma(1)
                 used += 1
@@ -1289,22 +1281,21 @@ def compile_gemm(
                 fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, k_next], bl_ret_st[write_i])
                 fx.copy(buf_cp_atom_r, br_g2r[None, None, None, k_next], br_ret_st[write_i])
             # read this stage's own A tile LDS[read_i] -> a_frag at the head, then compute
-            fx.copy(uni_cp_atom, a_lds_r[read_i], a_frag_retile)
             for ki in range_constexpr(k_iters):
-                fx.gemm(
-                    tiled_mma,
-                    c_gate,
-                    bl_frag_st[read_i][None, None, (None, ki)],
-                    a_frag[None, None, (None, ki)],
-                    c_gate,
-                )
-                fx.gemm(
-                    tiled_mma,
-                    c_up,
-                    br_frag_st[read_i][None, None, (None, ki)],
-                    a_frag[None, None, (None, ki)],
-                    c_up,
-                )
+                fx.copy(uni_cp_atom, a_lds_r[read_i][None, None, ki], a_frag_retile[None, None, ki])
+                for n in range_constexpr(_n_reps):
+                    for m in range_constexpr(_m_reps):
+                        for k in range_constexpr(2):
+                            fx.mma_atom_call(mma_atom,
+                                c_gate[None, m, n],
+                                bl_frag_st[read_i][None, m, (k, ki)],
+                                a_frag[None, n, (k, ki)],
+                                c_gate[None, m, n])
+                            fx.mma_atom_call(mma_atom,
+                                c_up[None, m, n],
+                                br_frag_st[read_i][None, m, (k, ki)],
+                                a_frag[None, n, (k, ki)],
+                                c_up[None, m, n])
             if const_expr(do_prefetch):
                 # A(k_next) staging -> LDS[write] for a later stage's head read
                 fx.copy(uni_cp_atom_w, a_cp_frag_retile, a_lds_w[write_i])
