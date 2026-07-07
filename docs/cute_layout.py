@@ -694,6 +694,17 @@ def composition_1d(S, D, s, d0):
     # there is no nested structure in S or D, all flattend
     _Sr = 1
     div_up = lambda x, y: (x + y - 1) // y
+
+    # Per paper Section 3.3.2: "we can assume that the layout A has been coalesced"
+    Sc, Dc = [S[0]], [D[0]]
+    for i in range(1, len(S)):
+        if D[i] == Sc[-1] * Dc[-1]:
+            Sc[-1] *= S[i]
+        else:
+            Sc.append(S[i])
+            Dc.append(D[i])
+    S, D = Sc, Dc
+
     S2 = []
     D2 = []
     d = d0
@@ -1209,3 +1220,9 @@ Tensor<Value(%191 = "fly.tiled_copy.partition_src"(%189, %111, %190) :
                                   Layout(((8, 8, 4), 8):((8, 8192, 65536), 1))
 
 """
+
+# $$A = (4, 3) : (2, 8) \qquad B = s:d = 3 : 2$$
+A = Layout((4,3),(2,8)).show(verbose=0)
+B = Layout(3,2).show(verbose=0)
+
+R = composition(A,B).show(verbose=0)
