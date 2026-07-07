@@ -376,11 +376,14 @@ def compile_gemm(
         return fx.make_view(fx.get_iter(tensor), new_layout)
 
     def cvt_fp8_bf16(src_tensor: fx.Tensor, dst_tensor: fx.Tensor):
-        size = fx.size(fx.get_shape(src_tensor)).to_py_value()
+        # src_tensor is a packed-uint32 fragment (4 fp8 per dword) loaded straight from
+        # memory, so each dword feeds v_cvt_pk_f32_fp8 directly -- no whole-vector load +
+        # bitcast, which would emit shufflevector / v_lshrrev to repack the bytes.
+        n_dwords = fx.size(fx.get_shape(src_tensor)).to_py_value()
 
         items = []
-        src_vec = src_tensor.load().bitcast(fx.Uint32)
-        for i in range_constexpr(size // 4):
+        src_vec = src_tensor.load()
+        for i in range_constexpr(n_dwords):
             src_val = src_vec[i]
             pk0_f32 = llvm.inline_asm(
                 T.f32x2,
@@ -404,7 +407,7 @@ def compile_gemm(
             items.append(tmp[1])
         vec = Vec.from_elements(items, fx.BFloat16)
         layout = fx.get_layout(dst_tensor)
-        for i in range_constexpr(size):
+        for i in range_constexpr(4 * n_dwords):
             crd = fx.idx2crd(i, layout)
             dst_tensor[crd] = vec[i]
 
@@ -594,13 +597,7 @@ def compile_gemm(
         tile_k_per_wg = TILE_K * splitk_waves
 
         a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
-        b_tensor = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
-        # shape: [n_in_tile, k_in_tile, k_tile]
-        b_tile = fx.flat_divide(b_tensor, fx.make_tile(TILE_N, tile_k_per_wg))[
-            None, None, blk_n, None
-        ]
         a_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), arg_p_input.dtype)
-        b_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), weight_dtype)
 
         # tiled copy is created based on the tiled_mma, so the tiled_mma should be same size for tiled copy
         rep_k_per_lane = 4 if const_expr(weight_dtype != fx.BFloat16) else 2
@@ -637,69 +634,167 @@ def compile_gemm(
                 fx.get_iter(arg_p_input),
                 fx.make_layout((TILE_M, tile_k_per_wg), (tile_k_per_wg, 1)),
             )
-            a_frag = tiled_mma.make_fragment_A(a_fake_tensor)
+            a_frag = [tiled_mma.make_fragment_A(a_fake_tensor), tiled_mma.make_fragment_A(a_fake_tensor)]
         else:
             a_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M, tile_k_per_wg))[
                 None, None, 0, None
             ]
             a_tiled_thr = fx.make_tiled_copy_A(a_cp_atom_r, tiled_mma).get_slice(tid)
             a_tensor_thr = a_tiled_thr.partition_S(a_tile)
-            a_frag = tiled_mma.make_fragment_A(a_tile[None, None, 0])
+            a_frag = [tiled_mma.make_fragment_A(a_tile[None, None, 0]), tiled_mma.make_fragment_A(a_tile[None, None, 0])]
 
-        a_frag_retile = (
-            fx.make_tiled_copy_A(a_cp_atom_r, tiled_mma).get_slice(tid).retile(a_frag)
-        )
+        a_frag_retile = [
+            fx.make_tiled_copy_A(a_cp_atom_r, tiled_mma).get_slice(tid).retile(a_frag[0]),
+            fx.make_tiled_copy_A(a_cp_atom_r, tiled_mma).get_slice(tid).retile(a_frag[1]),
+        ]
 
         if const_expr(weight_dtype == fx.BFloat16):
+            b_tensor = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
+            # shape: [n_in_tile, k_in_tile, k_tile]
+            b_tile = fx.flat_divide(b_tensor, fx.make_tile(TILE_N, tile_k_per_wg))[
+                None, None, blk_n, None
+            ]
+            b_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), weight_dtype)
             b_tiled_thr = fx.make_tiled_copy_B(b_cp_atom_r, tiled_mma).get_slice(tid)
             b_tensor_thr = b_tiled_thr.partition_S(b_tile)
-            b_frag = tiled_mma.make_fragment_B(b_tile[None, None, 0])
-            b_frag_retile = b_tiled_thr.retile(b_frag)
+            b_frag = [tiled_mma.make_fragment_B(b_tile[None, None, 0]), tiled_mma.make_fragment_B(b_tile[None, None, 0])]
+            b_frag_retile = [b_tiled_thr.retile(b_frag[0]), b_tiled_thr.retile(b_frag[1])]
         else:
             # b_frag will be decompressed from fp8
             b_fake_tensor = fx.make_view(
                 fx.get_iter(arg_p_input),
                 fx.make_layout((TILE_N, tile_k_per_wg), (tile_k_per_wg, 1)),
             )
-            b_frag = tiled_mma.make_fragment_B(b_fake_tensor)
+            b_frag = [tiled_mma.make_fragment_B(b_fake_tensor), tiled_mma.make_fragment_B(b_fake_tensor)]
 
-            tile_size = tiled_mma.tile_size_mnk
+            # Load the fp8 weights as packed uint32 dwords (4 fp8 / dword) so cvt_fp8_bf16 can
+            # feed each dword straight into v_cvt_pk_f32_fp8 -- avoids the whole-vector load +
+            # bitcast that LLVM lowers to shufflevector / v_lshrrev byte repacking.
+            #
+            # Recast fp8 -> uint32 at the SOURCE (before make_buffer_tensor): arg_p_weight's
+            # iter is a plain pointer whose expert offset is already a byte address, so
+            # recast_iter (reinterpret_cast) keeps the address while recast_layout collapses
+            # the contiguous 16 fp8 into 4 dwords (/4 on every stride). Recasting the buffer
+            # descriptor AFTER partition is wrong: the block/thread offset is baked into the
+            # descriptor in fp8 ELEMENTS, and recast_iter would not divide it by 4 (-> 4x
+            # address error). The fp8 pointer is align=1, so build the uint32 pointer
+            # explicitly with a 16B alignment (the 128b tiles are already 16B-aligned).
+            _w_it = fx.get_iter(arg_p_weight)
+            _w_u32_ptr = fx.PointerType.get(fx.Uint32.ir_type, _w_it.memspace, 16)
+            arg_w_u32 = fx.make_view(
+                fx.recast_iter(_w_u32_ptr, _w_it),
+                fx.recast_layout(fx.get_layout(arg_p_weight), 8, 32),
+            )
+            b_tensor_u32 = fx.rocdl.make_buffer_tensor(arg_w_u32, max_size=False)
+            b_tile = fx.flat_divide(b_tensor_u32, fx.make_tile(TILE_N, tile_k_per_wg // 4))[
+                None, None, blk_n, None
+            ]
+            b_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Uint32)
+            # uint32 thread-value layout mirrors the fp8 tv_layout_B_tiled. Recasting the fp8
+            # weight to uint32 keeps the thread's contiguous-inner stride (1) but divides the
+            # K-group stride by 4 (4 fp8 = 1 dword), so derive the uint32 thread strides from
+            # the fp8 tv (divide any stride >= 4 by 4). value = 4 contiguous uint32 (= the 16
+            # fp8 each thread loads with one 128b buffer_load). Using tile_k_per_wg//4 for the
+            # K-group stride is wrong for splitk_waves=1 (the preshuffle K stride is fixed by
+            # the weight layout, not the tile width).
+            n_mma = fx.get_scalar(fx.size(fx.select(tiled_mma.tile_size_mnk, [1])))
+            _tvB = tiled_mma.tv_layout_B_tiled
+            _n0 = fx.get_scalar(_tvB.shape[0][0])
+            _n1 = fx.get_scalar(_tvB.shape[0][1])
+            _s0 = fx.get_scalar(_tvB.stride[0][0])
+            _s1 = fx.get_scalar(_tvB.stride[0][1])
+            _s0 = _s0 if _s0 < 4 else _s0 // 4
+            _s1 = _s1 if _s1 < 4 else _s1 // 4
+            tv_u32 = fx.make_layout(((_n0, _n1), 4), ((_s0, _s1), n_mma))
             tile_mn = fx.make_tile(
-                fx.make_layout(fx.select(tile_size, [1]), 1),
-                fx.make_layout(fx.select(tile_size, [2]), 1),
+                fx.make_layout(n_mma, 1),
+                fx.make_layout(tile_k_per_wg // 4, 1),
             )
-            b_tiled_thr = fx.make_tiled_copy(
-                b_cp_atom_r, tiled_mma.tv_layout_B_tiled, tile_mn
-            ).get_slice(tid)
+            b_tiled_thr = fx.make_tiled_copy(b_cp_atom_r, tv_u32, tile_mn).get_slice(tid)
             b_tensor_thr = b_tiled_thr.partition_S(b_tile)
-            b_frag_retile = fx.make_fragment_like(
-                b_tensor_thr[None, None, None, 0], fx.Uint8
-            )
+            b_frag_retile = [
+                fx.make_fragment_like(b_tensor_thr[None, None, None, 0], fx.Uint32),
+                fx.make_fragment_like(b_tensor_thr[None, None, None, 0], fx.Uint32),
+            ]
 
         c_fake_tensor = fx.make_view(
             fx.get_iter(arg_p_input), fx.make_layout((TILE_N, TILE_M), (TILE_M, 1))
         )
         c_frag = tiled_mma.make_fragment_C(c_fake_tensor)
         c_frag.fill(0)
+
+        num_k_iters = K // TILE_K // splitk_waves
+
+        # Prefetch iteration 0 into buffer 0
+        if const_expr(a_with_index):
+            a_tensor_thr.copy(a_cp_atom_r, fx.Int32(0), a_frag_retile[0])
+        else:
+            fx.copy(a_cp_atom_r, a_tensor_thr[None, None, None, fx.Int32(0)], a_frag_retile[0])
+        fx.copy(b_cp_atom_r, b_tensor_thr[None, None, None, fx.Int32(0)], b_frag_retile[0])
+
         acc_init = c_frag.load()
 
-        for k, state in range(0, K // TILE_K // splitk_waves, 1, init=[acc_init]):
+        # Instruction counts for scheduling
+        # 128-bit buffer_loads per prefetch: A loads + B loads
+        a_load_bytes = arg_p_input.dtype.width // 8
+        a_vmem_cnt = a_frag_retile[0].load().numel * a_load_bytes // 16
+        if const_expr(weight_dtype == fx.BFloat16):
+            b_vmem_cnt = b_frag_retile[0].load().numel * weight_dtype.width // 8 // 16
+        else:
+            b_vmem_cnt = b_frag_retile[0].load().numel * 4 // 16  # uint32 dwords -> 128b loads
+        vmcnt_per_prefetch = a_vmem_cnt + b_vmem_cnt
+        # MFMA count per half-iteration
+        mfma_per_iter = fx.size(fx.get_shape(c_frag)).to_py_value() // 4  # 4 acc per mfma
+
+        rocdl.sched_barrier(0)
+
+        # Main loop: 2x unrolled ping-pong (even iter uses buf 0, odd iter uses buf 1)
+        for k2, state in range(0, num_k_iters // 2, 1, init=[acc_init]):
             c_frag.store(state[0])
-            k_i32 = fx.Int32(k)
+            k_base = fx.Int32(k2 * 2)
+            # --- even iteration: compute buf[0], prefetch into buf[1] ---
             if const_expr(a_with_index):
-                a_tensor_thr.copy(a_cp_atom_r, k_i32, a_frag_retile)
+                a_tensor_thr.copy(a_cp_atom_r, k_base + 1, a_frag_retile[1])
             else:
-                fx.copy(
-                    a_cp_atom_r, a_tensor_thr[None, None, None, k_i32], a_frag_retile
-                )
-            fx.copy(b_cp_atom_r, b_tensor_thr[None, None, None, k_i32], b_frag_retile)
+                fx.copy(a_cp_atom_r, a_tensor_thr[None, None, None, k_base + 1], a_frag_retile[1])
+            fx.copy(b_cp_atom_r, b_tensor_thr[None, None, None, k_base + 1], b_frag_retile[1])
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+            rocdl.sched_barrier(0)
             if const_expr(weight_dtype != fx.BFloat16):
-                # decompress fp8 to bf16
-                cvt_fp8_bf16(b_frag_retile, b_frag)
-            fx.gemm(tiled_mma, c_frag, b_frag, a_frag, c_frag)
+                cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
+            fx.gemm(tiled_mma, c_frag, b_frag[0], a_frag[0], c_frag)
+            # mask_valu = 0x0001
+            # rocdl.sched_group_barrier(mask_valu, 8, 0)
+            # for _ in range_constexpr(mfma_per_iter // 2):
+            #     rocdl.sched_mfma(2)
+            #     rocdl.sched_group_barrier(mask_valu, 4, 0)
+            rocdl.sched_barrier(0)
+            # --- odd iteration: compute buf[1], prefetch into buf[0] ---
+            if const_expr(a_with_index):
+                a_tensor_thr.copy(a_cp_atom_r, k_base + 2, a_frag_retile[0])
+            else:
+                fx.copy(a_cp_atom_r, a_tensor_thr[None, None, None, k_base + 2], a_frag_retile[0])
+            fx.copy(b_cp_atom_r, b_tensor_thr[None, None, None, k_base + 2], b_frag_retile[0])
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+            rocdl.sched_barrier(0)
+            if const_expr(weight_dtype != fx.BFloat16):
+                cvt_fp8_bf16(b_frag_retile[1], b_frag[1])
+            fx.gemm(tiled_mma, c_frag, b_frag[1], a_frag[1], c_frag)
+            # rocdl.sched_group_barrier(mask_valu, 8, 0)
+            # for _ in range_constexpr(mfma_per_iter // 2):
+            #     rocdl.sched_mfma(2)
+            #     rocdl.sched_group_barrier(mask_valu, 4, 0)
+            rocdl.sched_barrier(0)
 
             results = yield [c_frag.load()]
         c_frag.store(results)
+
+        # Tail: if num_k_iters is odd, process the last iteration with buf[0]
+        if const_expr(num_k_iters % 2 == 1):
+            if const_expr(weight_dtype != fx.BFloat16):
+                cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
+            fx.gemm(tiled_mma, c_frag, b_frag[0], a_frag[0], c_frag)
+
         # [v, n, m] -> [v, m, n]
         c_frag = select(c_frag, [0, 2, 1])
 
