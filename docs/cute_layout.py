@@ -694,6 +694,17 @@ def composition_1d(S, D, s, d0):
     # there is no nested structure in S or D, all flattend
     _Sr = 1
     div_up = lambda x, y: (x + y - 1) // y
+
+    # Per paper Section 3.3.2: "we can assume that the layout A has been coalesced"
+    Sc, Dc = [S[0]], [D[0]]
+    for i in range(1, len(S)):
+        if D[i] == Sc[-1] * Dc[-1]:
+            Sc[-1] *= S[i]
+        else:
+            Sc.append(S[i])
+            Dc.append(D[i])
+    S, D = Sc, Dc
+
     S2 = []
     D2 = []
     d = d0
@@ -805,6 +816,8 @@ def test_composition():
 
     assert composition(Layout((5, 3), (8, 7)),(Layout(2, 5), Layout(4, 1))) == Layout((2, 4),(40, 7))
 
+    # coalesce-before-composition: A's modes merge before divisibility checks
+    assert composition(Layout((4,3),(2,8)), Layout(3,2)) == Layout(3,4)
 """
 3.5 Complement : fill the dimensional gaps (by adding the missing replications one-by-one)
 
