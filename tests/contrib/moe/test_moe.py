@@ -444,22 +444,19 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 )
                 grid = sorted_expert_ids.shape[0]
                 w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
-                # gateup: 'prefill_2x2' / 'prefill_1x4' (4-wave tiled MMA, no reduce) for
-                # B>32 when the sorting tile (TILE_M, shared with the down stage) is >=64 and
-                # a 64-multiple; the wave arrangement (2x2 vs 1x4-along-N) is picked by the
-                # MOE_GATEUP_WAVE env var (default 1x4). 'splitk' otherwise.
-                use_prefill = B > 32 and TILE_M >= 64 and TILE_M % 64 == 0
-                _gateup_wave = os.environ.get("MOE_GATEUP_WAVE", "1x4")
+                # gateup: 'prefill_1x4' (4-wave tiled MMA along N, no reduce) for B>32 when the
+                # sorting tile (TILE_M, shared with the down stage) is >=32 and a 32-multiple;
+                # 'splitk' otherwise.
+                use_prefill = B > 32 and TILE_M >= 32 and TILE_M % 32 == 0
                 if use_prefill:
-                    gateup_alg = 'prefill_1x4' if _gateup_wave == '1x4' else 'prefill_2x2'
+                    gateup_alg = 'prefill_1x4'
                 else:
                     gateup_alg = 'splitk'
-                gateup_tn = 128 if gateup_alg in ('prefill_2x2', 'prefill_1x4') else TILE_N
                 g_kwargs = (
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('act_quant_type', compile_act_quant_type), ('TOPK', TOPK),
-                    ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', gateup_tn), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
+                    ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
                 )
-                if gateup_alg in ('prefill_2x2', 'prefill_1x4'):
+                if gateup_alg == 'prefill_1x4':
                     # The prefill (native fp8 MFMA) gateup needs an fp8 input plus its
                     # dequant scale: quantize the activation per-token (ptpc) or per-tensor.
                     # bf16 passes through with a dummy scale (unused by the bf16 kernel path).
