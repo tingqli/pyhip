@@ -816,6 +816,8 @@ def test_composition():
 
     assert composition(Layout((5, 3), (8, 7)),(Layout(2, 5), Layout(4, 1))) == Layout((2, 4),(40, 7))
 
+    # coalesce-before-composition: A's modes merge before divisibility checks
+    assert composition(Layout((4,3),(2,8)), Layout(3,2)) == Layout(3,4)
 """
 3.5 Complement : fill the dimensional gaps (by adding the missing replications one-by-one)
 
@@ -1220,9 +1222,3 @@ Tensor<Value(%191 = "fly.tiled_copy.partition_src"(%189, %111, %190) :
                                   Layout(((8, 8, 4), 8):((8, 8192, 65536), 1))
 
 """
-
-# $$A = (4, 3) : (2, 8) \qquad B = s:d = 3 : 2$$
-A = Layout((4,3),(2,8)).show(verbose=0)
-B = Layout(3,2).show(verbose=0)
-
-R = composition(A,B).show(verbose=0)
