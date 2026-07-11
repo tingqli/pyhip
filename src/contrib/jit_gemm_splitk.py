@@ -203,7 +203,7 @@ def gemm_splitk_wd(J:JIT,
 
             tmp = J.gpr(1, 'vu32')
             tmp[0] = c_offset[0] + m * 16 * stride_C + n * 32 * J.sizeof_bf16
-            J.v_cvt_pk_bf16_f32(c_in_wave[0, 0], c_in_wave[0, 0], c_in_wave[0, 1])
+            J.uni_cvt_pk_bf16_f32(c_in_wave[0, 0], c_in_wave[0, 0], c_in_wave[0, 1])
             J.debug_log(c_in_wave[0, 0], torch_dtype=torch.bfloat16, message=f'{m=}{n=}')
             buff_c.store_dword(c_in_wave[0, 0], tmp, s_c_offset)
         J.s_barrier()
