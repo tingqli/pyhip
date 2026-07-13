@@ -1,8 +1,10 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from . import utils as fxu
-import magichash
-hash_printer = magichash.register(mark="###", callback=magichash.do_print)
+# import magichash
+# hash_printer = magichash.register(mark="###", callback=magichash.do_print)
+
+hash_printer = lambda func: func
 
 def make_tiled_copy(copy_atom, layout_thr_val, tile_mn):
     return TiledCopy(copy_atom, layout_thr_val, tile_mn)

@@ -3,8 +3,8 @@ import flydsl.expr as fx
 from . import utils as fxu
 from .tiled_copy import TiledCopy
 import re
-import magichash
-hash_printer = magichash.register(mark="###", callback=magichash.do_print)
+#import magichash
+#hash_printer = magichash.register(mark="###", callback=magichash.do_print)
 hash_printer = lambda func: func
 def make_tiled_mma(mma_atom, thr_layout_mnk, permutation_mnk):
     return TiledMMA(mma_atom, thr_layout_mnk, permutation_mnk)

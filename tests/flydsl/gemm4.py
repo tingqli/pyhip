@@ -150,10 +150,18 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
         VECT_WIDTH = 128//A.dtype.width
         tv_layout, tv_tilemn = fxu.make_mem_coalescing_2d_tv_layout(
                                             num_threads, VECT_WIDTH, BLOCK_K)
-        at_cp_frag = fxu.Fragment.from_tvlayout(A.dtype, BLOCK_M//2, BLOCK_K, tv_layout, tv_tilemn, (buf_cp_atom_r, uni_cp_atom_w))
-        ab_cp_frag = at_cp_frag.selfclone()
-        bl_cp_frag = fxu.Fragment.from_tvlayout(B.dtype, BLOCK_N//2, BLOCK_K, tv_layout, tv_tilemn, (buf_cp_atom_r, uni_cp_atom_w))
-        br_cp_frag = bl_cp_frag.selfclone()
+        
+        tcopyAB_ld = fxu.TCopy(buf_cp_atom_r, tv_layout, tv_tilemn)
+        tcopyAB_st = fxu.TCopy(uni_cp_atom_w, tv_layout, tv_tilemn)
+
+        tcopyAB_ld.prepare_S(at_tile, ab_tile, bl_tile, br_tile)
+        tcopyAB_st.prepare_D(at_lds, ab_lds, bl_lds, br_lds)
+
+        at_cp_frag = tcopyAB_ld.make_fragment_like(at_tile, [None, None, 0])
+        ab_cp_frag = tcopyAB_ld.make_fragment_like(ab_tile, [None, None, 0])
+        bl_cp_frag = tcopyAB_ld.make_fragment_like(bl_tile, [None, None, 0])
+        br_cp_frag = tcopyAB_ld.make_fragment_like(br_tile, [None, None, 0])
+
 
         num_blocks_k = fx.get_scalar(fx.size(bA.layout[2]))
         print("num_blocks_k:", num_blocks_k)
@@ -182,21 +190,22 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
         进一步转置 c mem tensor 的layout，就能使得本来分布在 M 方向非物理连续的 4 个值
         变为 N 方向上物理连续的 4 个值，从而可以被 buffer_store_dwordx4 一次性写入
         """
-        at_frag = fxu.Fragment.from_tiledmma(tiled_mma, BLOCK_M//2, BLOCK_K, "B", uni_cp_atom_r)
-        ab_frag = at_frag.selfclone()
-        bl_frag = fxu.Fragment.from_tiledmma(tiled_mma, BLOCK_N//2, BLOCK_K, "A", uni_cp_atom_r)
-        br_frag = bl_frag.selfclone()
+        ld_mmA = fxu.TCopy(uni_cp_atom_r, tiled_copy = fx.make_tiled_copy_B(uni_cp_atom_r, tiled_mma))
+        ld_mmB = fxu.TCopy(uni_cp_atom_r, tiled_copy = fx.make_tiled_copy_A(uni_cp_atom_r, tiled_mma))
 
-        buf_cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), C.dtype)
-        c_tl_frag = fxu.Fragment.from_tiledmma(tiled_mma, BLOCK_N//2, BLOCK_M//2, "C", [buf_cp_atom_w])
-        c_tr_frag = c_tl_frag.selfclone()
-        c_bl_frag = c_tl_frag.selfclone()
-        c_br_frag = c_tl_frag.selfclone()
+        ld_mmA.prepare_S(at_lds, ab_lds)
+        ld_mmB.prepare_S(bl_lds, br_lds)
+        
+        at_frag = tiled_mma.make_fragment_B(at_lds)
+        ab_frag = tiled_mma.make_fragment_B(ab_lds)
+        bl_frag = tiled_mma.make_fragment_A(bl_lds)
+        br_frag = tiled_mma.make_fragment_A(br_lds)
 
-        c_tl_frag.fill(0)
-        c_tr_frag.fill(0)
-        c_bl_frag.fill(0)
-        c_br_frag.fill(0)
+        if fx.const_expr(C.dtype.width == 16):
+            buf_cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), C.dtype)
+        else:
+            buf_cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), C.dtype)
+        st_mmC = fxu.TCopy(buf_cp_atom_w, tiled_copy = fx.make_tiled_copy_C(buf_cp_atom_w, tiled_mma))
 
         """ 存出转置的 Ct 时使用转置的 c mem layout, 实际上mem中得到的仍然是 C 而非 Ct """
         trans_layout = fx.make_ordered_layout((BLOCK_N//2, BLOCK_M//2), (1, 0))
@@ -205,32 +214,29 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
         c_bl_tile = fx.composition(c_bl_tile, trans_layout)
         c_br_tile = fx.composition(c_br_tile, trans_layout)
 
-        at_mem_tensor_thr = at_cp_frag.partition_S(at_tile)
-        ab_mem_tensor_thr = ab_cp_frag.partition_S(ab_tile)
-        bl_mem_tensor_thr = bl_cp_frag.partition_S(bl_tile)
-        br_mem_tensor_thr = br_cp_frag.partition_S(br_tile)
+        st_mmC.prepare_D(c_tl_tile, c_tr_tile, c_bl_tile, c_br_tile)
+        c_tl_frag = tiled_mma.make_fragment_C(c_tl_tile)
+        c_tr_frag = tiled_mma.make_fragment_C(c_tr_tile)
+        c_bl_frag = tiled_mma.make_fragment_C(c_bl_tile)
+        c_br_frag = tiled_mma.make_fragment_C(c_br_tile)
 
-        at_lds_tensor_thr_w = at_cp_frag.partition_D(at_lds)
-        ab_lds_tensor_thr_w = ab_cp_frag.partition_D(ab_lds)
-        bl_lds_tensor_thr_w = bl_cp_frag.partition_D(bl_lds)
-        br_lds_tensor_thr_w = br_cp_frag.partition_D(br_lds)
-
-        at_lds_tensor_thr_r = at_frag.partition_S(at_lds)
-        ab_lds_tensor_thr_r = ab_frag.partition_S(ab_lds)
-        bl_lds_tensor_thr_r = bl_frag.partition_S(bl_lds)
-        br_lds_tensor_thr_r = br_frag.partition_S(br_lds)
+        c_tl_frag.fill(0)
+        c_tr_frag.fill(0)
+        c_bl_frag.fill(0)
+        c_br_frag.fill(0)
 
         # prefetch
         # gr0: all
-        bl_cp_frag.copy_from(bl_mem_tensor_thr[None, None, None, 0])
-        at_cp_frag.copy_from(at_mem_tensor_thr[None, None, None, 0])
-        ab_cp_frag.copy_from(ab_mem_tensor_thr[None, None, None, 0])
-        br_cp_frag.copy_from(br_mem_tensor_thr[None, None, None, 0])
+        tcopyAB_ld.load(bl_tile, [None, None, 0], bl_cp_frag)
+        tcopyAB_ld.load(at_tile, [None, None, 0], at_cp_frag)
+        tcopyAB_ld.load(ab_tile, [None, None, 0], ab_cp_frag)
+        tcopyAB_ld.load(br_tile, [None, None, 0], br_cp_frag)
+
         # lw0: all
-        bl_cp_frag.copy_to(bl_lds_tensor_thr_w)
-        at_cp_frag.copy_to(at_lds_tensor_thr_w)
-        ab_cp_frag.copy_to(ab_lds_tensor_thr_w)
-        br_cp_frag.copy_to(br_lds_tensor_thr_w)
+        tcopyAB_st.store(bl_cp_frag, bl_lds)
+        tcopyAB_st.store(at_cp_frag, at_lds)
+        tcopyAB_st.store(ab_cp_frag, ab_lds)
+        tcopyAB_st.store(br_cp_frag, br_lds)
 
         rocdl = fx.rocdl
         gpu = fx.gpu
@@ -238,20 +244,16 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
         range_constexpr = fx.range_constexpr
 
         # gr1: all
-        bl_cp_frag.copy_from(bl_mem_tensor_thr[None, None, None, 1])
-        rocdl.sched_barrier(0)
-        at_cp_frag.copy_from(at_mem_tensor_thr[None, None, None, 1])
-        rocdl.sched_barrier(0)
-        ab_cp_frag.copy_from(ab_mem_tensor_thr[None, None, None, 1])
-        rocdl.sched_barrier(0)
-        br_cp_frag.copy_from(br_mem_tensor_thr[None, None, None, 1])
-        rocdl.sched_barrier(0)
-        
+        tcopyAB_ld.load(bl_tile, [None, None, 1], bl_cp_frag); rocdl.sched_barrier(0)
+        tcopyAB_ld.load(at_tile, [None, None, 1], at_cp_frag); rocdl.sched_barrier(0)
+        tcopyAB_ld.load(ab_tile, [None, None, 1], ab_cp_frag); rocdl.sched_barrier(0)
+        tcopyAB_ld.load(br_tile, [None, None, 1], br_cp_frag); rocdl.sched_barrier(0)
+
         gpu.barrier()
 
         # lr: bl0, at0
-        bl_frag.copy_from(bl_lds_tensor_thr_r)
-        at_frag.copy_from(at_lds_tensor_thr_r)
+        ld_mmB.load(bl_lds, None, bl_frag)
+        ld_mmA.load(at_lds, None, at_frag)
         rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
 
         mem_b_half_cnt = bl_cp_frag.load().numel * A.dtype.width // 8 // 16
@@ -289,18 +291,21 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
                         rocdl.sched_mfma(1)
                     rocdl.sched_mfma(mfma_cnt - dsrd_cnt - vmem_cnt * 4 - dswr_cnt * 0)        
         assert K // TILE_K >= 2, "this kernel requires at least 2 iterations"
-        for k, state in range(0, K // TILE_K - 0, 1, init=[]):
 
+        for k, state in range(0, K // TILE_K - 0, 1, init=[]):
             # bl0 @ at0
+
             fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
             # lw: bl1
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_a_half_cnt + mem_a_half_cnt + mem_b_half_cnt))
-            bl_cp_frag.copy_to(bl_lds_tensor_thr_w)
+            tcopyAB_st.store(bl_cp_frag, bl_lds)
+
             # gr: bl2
-            bl_cp_frag.copy_from(bl_mem_tensor_thr[None, None, None, k + 2])
+            tcopyAB_ld.load(bl_tile, [None, None, k+2], bl_cp_frag)
+
             # lr: ab0
             gpu.barrier()
-            ab_frag.copy_from(ab_lds_tensor_thr_r, uni_cp_atom_r)
+            ld_mmA.load(ab_lds, None, ab_frag)
             hot_loop_scheduler(mem_b_half_cnt, lds_a_half_cnt)
             rocdl.sched_barrier(0)
 
@@ -308,12 +313,12 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
             fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
             # lw: at1
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_a_half_cnt + mem_b_half_cnt + mem_b_half_cnt))
-            at_cp_frag.copy_to(at_lds_tensor_thr_w)
+            tcopyAB_st.store(at_cp_frag, at_lds)
             # gr: at2
-            at_cp_frag.copy_from(at_mem_tensor_thr[None, None, None, k + 2])
+            tcopyAB_ld.load(at_tile, [None, None, k+2], at_cp_frag)
             # lr: br0
             gpu.barrier()
-            br_frag.copy_from(br_lds_tensor_thr_r, uni_cp_atom_r)
+            ld_mmB.load(br_lds, None, br_frag)
             hot_loop_scheduler(mem_a_half_cnt, lds_b_half_cnt)
             rocdl.sched_barrier(1)
 
@@ -321,12 +326,12 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
             fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
             # lw: ab1
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_b_half_cnt + mem_b_half_cnt + mem_a_half_cnt))
-            ab_cp_frag.copy_to(ab_lds_tensor_thr_w)
+            tcopyAB_st.store(ab_cp_frag, ab_lds)
             # gr: ab2
-            ab_cp_frag.copy_from(ab_mem_tensor_thr[None, None, None, k + 2])
+            tcopyAB_ld.load(ab_tile, [None, None, k+2], ab_cp_frag)
             # lr: bl1
             gpu.barrier()
-            bl_frag.copy_from(bl_lds_tensor_thr_r)
+            ld_mmB.load(bl_lds, None, bl_frag)
             hot_loop_scheduler(mem_a_half_cnt, lds_b_half_cnt)
             rocdl.sched_barrier(2)
 
@@ -334,20 +339,20 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
             fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
             # lw: br1
             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=mem_b_half_cnt + mem_a_half_cnt + mem_a_half_cnt))
-            br_cp_frag.copy_to(br_lds_tensor_thr_w)
+            tcopyAB_st.store(br_cp_frag, br_lds)
             # gr: br2
-            br_cp_frag.copy_from(br_mem_tensor_thr[None, None, None, k + 2])
+            tcopyAB_ld.load(br_tile, [None, None, k+2], br_cp_frag)
             # lr: at1
             gpu.barrier()
-            at_frag.copy_from(at_lds_tensor_thr_r)
+            ld_mmA.load(at_lds, None, at_frag)
             hot_loop_scheduler(mem_b_half_cnt, lds_a_half_cnt)
             rocdl.sched_barrier(3)
 
         if fx.const_expr(C.dtype == c_tl_frag.dtype):
-            c_tl_frag.copy_to(c_tl_tile)
-            c_tr_frag.copy_to(c_tr_tile)
-            c_bl_frag.copy_to(c_bl_tile)
-            c_br_frag.copy_to(c_br_tile)
+            st_mmC.store(c_tl_frag, c_tl_tile)
+            st_mmC.store(c_tr_frag, c_tr_tile)
+            st_mmC.store(c_bl_frag, c_bl_tile)
+            st_mmC.store(c_br_frag, c_br_tile)
         else:
             def f32_to_dtype(x):
                 if fx.const_expr(C.dtype == fx.BFloat16):
@@ -355,16 +360,15 @@ def compile_v4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, b_preshuffle):
                     return ((x + round_bit).bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
                 if fx.const_expr(C.dtype == fx.Float16):
                     return x.to(fx.Float16)
-            buf_cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), C.dtype)
-            c_frag_bf16 = fxu.Fragment.from_tiledmma(tiled_mma, BLOCK_N//2, BLOCK_M//2, "C", buf_cp_atom_w, dtype=C.dtype)
+            c_frag_bf16 = fx.make_fragment_like(c_tl_frag, dtype=C.dtype)
             c_frag_bf16.store(f32_to_dtype(c_tl_frag.load()))
-            c_frag_bf16.copy_to(c_tl_tile)
+            st_mmC.store(c_frag_bf16, c_tl_tile)
             c_frag_bf16.store(f32_to_dtype(c_tr_frag.load()))
-            c_frag_bf16.copy_to(c_tr_tile)
+            st_mmC.store(c_frag_bf16, c_tr_tile)
             c_frag_bf16.store(f32_to_dtype(c_bl_frag.load()))
-            c_frag_bf16.copy_to(c_bl_tile)
+            st_mmC.store(c_frag_bf16, c_bl_tile)
             c_frag_bf16.store(f32_to_dtype(c_br_frag.load()))
-            c_frag_bf16.copy_to(c_br_tile)
+            st_mmC.store(c_frag_bf16, c_br_tile)
 
     @flyc.jit
     def launcher(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor,stream: fx.Stream):

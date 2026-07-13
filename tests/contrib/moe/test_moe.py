@@ -492,23 +492,80 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                     w1.dtype, TOPK, K2, N2, False, TILE_M, TILE_N,
                                     gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, quant_type == 'ptpc')
                 else:
-                    USE_ATOMIC_WRITE = True
+                    if use_prefill:
+                        down_alg = "prefill_1x4"
+                        USE_ATOMIC_WRITE = False
+                    else:
+                        down_alg = "splitk"
+                        USE_ATOMIC_WRITE = True
                     if USE_ATOMIC_WRITE:
                         gemm2_out = cur_out
                     else:
                         gemm2_out = torch.empty([B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+
+                    if weight_dtype == 'fp8' and use_prefill:
+                        if compile_act_quant_type == 'ptpc':
+                            down_in, a_scale = aiter.get_hip_quant(aiter.QuantType.per_Token)(
+                                gemm1_out.view(B * TOPK, -1), quant_dtype=weight_type)
+                            a_scale = a_scale.to(torch.float32).contiguous()
+                        else:
+                            fmax = torch.finfo(weight_type).max
+                            a_scale = gemm1_out.float().abs().amax() / fmax
+                            down_in = (gemm1_out.float() / a_scale).clamp(-fmax, fmax).to(weight_type)
+                            a_scale = a_scale.reshape(1).to(torch.float32)
+                    else:
+                        down_in = gemm1_out
+                        a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+
                     w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                     d_kwargs = (
                         ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
-                        ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'down'), ('alg', 'splitk'), ('E', E),
-                        ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),
+                        ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'down'), ('alg', down_alg), ('E', E),
+                        ('USE_ATOMIC_WRITE', USE_ATOMIC_WRITE),('act_quant_type', compile_act_quant_type)
                     )
-                    _fly_dispatch(
-                        d_kwargs, lambda: _moe_compile(**dict(d_kwargs)),
-                        (_ptr(gemm1_out), _ptr(w2), _ptr(gemm2_out),
-                         _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
-                         _ptr(w2_scale_arg), B, grid, stream),
-                    )
+                    if down_alg == "prefill_1x4":
+                        #idx = (sorted_ids[:64] & 0xFFFFFF) * TOPK + (sorted_ids[:64] >> 24)
+                        #print(idx.view(-1,16))
+                        _fly_dispatch(
+                            d_kwargs, lambda: _moe_compile(**dict(d_kwargs)),
+                            (_ptr(down_in), _ptr(w2), _ptr(gemm2_out),
+                            _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
+                            _ptr(w2_scale_arg), _ptr(a_scale), B, grid, stream),
+                        )
+                    else:
+                        # sorted_weights[...] = 1
+                        _fly_dispatch(
+                            d_kwargs, lambda: _moe_compile(**dict(d_kwargs)),
+                            (_ptr(down_in), _ptr(w2), _ptr(gemm2_out),
+                            _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
+                            _ptr(w2_scale_arg), B, grid, stream),
+                        )
+
+                        if 0:
+                            fname = f'moe_down_data_{weight_dtype}_{compile_quant_type}_{compile_act_quant_type}.pt'
+                            if not os.path.exists(fname):
+                                torch.cuda.synchronize()
+                                moe_down_data = {
+                                    'down_in': down_in,
+                                    'w2': w2,
+                                    'gemm2_out': gemm2_out,
+                                    'sorted_ids': sorted_ids,
+                                    'sorted_weights': sorted_weights,
+                                    'sorted_expert_ids': sorted_expert_ids,
+                                    'num_valid_ids': num_valid_ids,
+                                    'w2_scale_arg': w2_scale_arg,
+                                    "a_scale": a_scale,
+                                    'B': B,
+                                    'grid': grid,
+                                }
+                                for name, value in d_kwargs:
+                                    moe_down_data[name] = value
+                                torch.save(moe_down_data, fname)
+                                print(f"================ Saved {fname} for debugging")
+                        if 0:
+                            moe_down_data = torch.load('moe_down_data.pt')
+                            gemm2_out[...] = moe_down_data["gemm2_out"]
+
                     if not USE_ATOMIC_WRITE:
                         cur_out = torch.sum(gemm2_out, dim=1)
         elif kernel_type == 'mxn_2s':
@@ -965,4 +1022,7 @@ if __name__ == '__main__':
     prec = [torch.bfloat16]
     prec = [get_fp8type()]
     prec = [torch.bfloat16, get_fp8type()]
-    test_acc_fly_splitk_2s(batch=[1, 4, 17, 8192], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    #test_acc_fly_splitk_2s(batch=[1, 4, 17, 8192], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+
+    test_acc_fly_splitk_2s(batch=[8192], prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    test_acc_fly_splitk_2s(batch=[8192], prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)

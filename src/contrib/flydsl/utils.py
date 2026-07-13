@@ -183,6 +183,23 @@ def recurisve_apply(atom_op, *tensors, idx=None):
             idx = recurisve_apply(atom_op, *[t[None, i] for t in tensors], idx=idx)
     return idx
 
+# generator form of recurisve_apply, more pythonic
+def all_elements(*tensors):
+    if tensors[0].layout.rank == 1:
+        if tensors[0].layout.shape.is_leaf:
+            yield tensors
+        else:
+            yield from all_elements(*[fx.get_(t,0) for t in tensors])
+    else:
+        tensors = [fx.group(t, 1, -1) for t in tensors]
+        for t in tensors:
+            size = fx.size(t.layout[1])
+            if size.is_static:
+                break
+        assert size.is_static, f"Cannot find a static size, got {size}"
+        for i in fx.range_constexpr(size.get_static_leaf_int):
+            yield from all_elements(*[t[None, i] for t in tensors])
+
 def view_as(tensor, new_layout, dtype=None):
     iter = fx.get_iter(tensor)
     if dtype is not None:
@@ -433,6 +450,74 @@ def inspect(x):
     print(f"inspect: unsupported type {type(x)}")
 
 
+def printv(*args, **kwargs):
+    import inspect
+    import re
+    """
+    Print variable names and their values.
+    Usage: printv(var1, var2, ...)
+    """
+    # Get the caller's frame
+    frame = inspect.currentframe().f_back
+    
+    # Get the source line
+    import linecache
+    filename = frame.f_code.co_filename
+    lineno = frame.f_lineno
+    line = linecache.getline(filename, lineno).strip()
+    
+    # Extract argument names from the call
+    # This handles: printv(var1, var2) 
+    # and also: printv(var1, var2, sep=' ') etc.
+    match = re.match(r'.*printv\s*\((.*)\)', line)
+    if not match:
+        # Fallback to generic names
+        arg_names = [f'arg{i}' for i in range(len(args))]
+    else:
+        # Parse the arguments, handling nested parentheses and strings
+        args_text = match.group(1)
+        arg_names = []
+        depth = 0
+        current = ''
+        in_string = False
+        string_char = None
+        
+        for char in args_text:
+            if char in ('"', "'") and (not current or current[-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                current += char
+            elif char == '(' and not in_string:
+                depth += 1
+                current += char
+            elif char == ')' and not in_string:
+                depth -= 1
+                current += char
+            elif char == ',' and depth == 0 and not in_string:
+                # Found a top-level comma
+                clean_name = current.strip()
+                if clean_name and not clean_name.startswith('**') and not clean_name.startswith('*'):
+                    arg_names.append(clean_name)
+                current = ''
+            else:
+                current += char
+        
+        # Add the last argument
+        if current.strip():
+            clean_name = current.strip()
+            if clean_name and not clean_name.startswith('**') and not clean_name.startswith('*'):
+                arg_names.append(clean_name)
+    
+    # Print each variable with its name
+    print(f"{filename}:{lineno}")
+    for i, (name, value) in enumerate(zip(arg_names, args)):
+        if isinstance(value, torch.Tensor):
+            value = f"{value.shape}_{value.dtype}"
+        print(f"{name:>20} = {value}")
+
 import types
 
 class Fragment(fx.Tensor):
@@ -524,7 +609,7 @@ class Fragment(fx.Tensor):
         return cls(fragS, copy_ops, (s0, s1), tile_size)
 
     @classmethod
-    def from_tiledmma(cls, tiled_mma: fx.TiledMma, s0:int, s1:int, abc: str, copy_atoms: list[fx.CopyAtom], dtype=None):
+    def from_tiledmma(cls, tiled_mma: fx.TiledMma, s0:int, s1:int, abc: str, copy_atoms: list[fx.CopyAtom] = (), dtype=None):
         """
         just 1 copy_atom:
             used for both loading & storing
@@ -688,7 +773,12 @@ class Fragment(fx.Tensor):
     def _load_row_indicies(self, row_indicies_1d: fx.Tensor, for_D: bool = False):
         BLOCK_M, BLOCK_K = self._block_shape
         # 
-        row_indicies_2d = fx.make_view(fx.get_iter(row_indicies_1d), fx.make_layout((BLOCK_M, BLOCK_K), (1, 0)))
+        if row_indicies_1d.layout.rank == 1:
+            row_indicies_2d = fx.make_view(fx.get_iter(row_indicies_1d), fx.make_layout((BLOCK_M, BLOCK_K), (1, 0)))
+        else:
+            assert row_indicies_1d.layout.rank == 2, f"row_indicies_1d must be rank-1 or rank-2, got {row_indicies_1d.layout.rank}"
+            row_indicies_2d = row_indicies_1d
+
         row_indicies_tview = self.partition_S(row_indicies_2d) if not for_D else self.partition_D(row_indicies_2d)
 
         tview_shape = row_indicies_tview.shape.to_py_value()
@@ -721,6 +811,9 @@ class Fragment(fx.Tensor):
         nz_cnt = fstride
         # print(" row_indicies_tview shape: ", nz_shape, " stride: ", nz_stride, " frag_stride: ", frag_stride, " nz_cnt: ", nz_cnt)
 
+        if len(nz_shape) == 0:
+            nz_shape = 1
+            nz_stride = 0
         row_indicies_sview = fx.make_view(fx.get_iter(row_indicies_tview), fx.make_layout(nz_shape, nz_stride))
         row_indicies_frag = fx.make_fragment_like(row_indicies_sview)
         # print(" row_indicies_frag: ", row_indicies_frag)
@@ -736,6 +829,234 @@ class Fragment(fx.Tensor):
 
         #print(" row_indicies_frag: ", row_indicies_frag)
         return row_indicies_frag
+
+"""
+subclass of fx.ThrCopy, more friendly to use, keep thread-views inside
+provide load/store API work with mem-tensors which are more easier to understand
+"""
+class TCopy(fx.ThrCopy):
+    def __init__(self, copy_atom, tv_layout = None, tile_mn = None, tiled_copy = None):
+        if tiled_copy is None:
+            assert tv_layout is not None and tile_mn is not None
+            tiled_copy = fx.make_tiled_copy(copy_atom, tv_layout, tile_mn)
+        super().__init__(tiled_copy, fx.thread_idx.x)
+        self.copy_atom = copy_atom
+        self.thrview_S = {}
+        self.thrview_D = {}
+
+    def get_thrview(self, tensor: fx.Tensor, default=None):
+        if tensor in self.thrview_S:
+            return self.thrview_S[tensor]
+        elif tensor in self.thrview_D:
+            return self.thrview_D[tensor]
+        else:
+            if default is not None:
+                return default
+            assert False, f"tensor {tensor} is not prepared for copy"
+
+    def make_fragment_like(self, t: fx.Tensor, coord: list = None, dtype = None):
+        thrv = self.get_thrview(t)
+        if coord is not None:
+            coord.insert(0, None)
+            return fx.make_fragment_like(thrv[coord], dtype=dtype)
+        else:
+            return fx.make_fragment_like(thrv, dtype=dtype)
+
+    # prepare thread-view for source tensor, to be used in load()
+    def prepare_S(self, *src: fx.Tensor):
+        ret = []
+        for s in src:
+            assert s not in self.thrview_S
+            thrv = self.partition_S(s)
+            self.thrview_S[s] = thrv
+            ret.append(thrv)
+        return ret if len(ret) > 1 else ret[0]
+
+    # prepare thread-view for destination tensor, to be used in store()
+    def prepare_D(self, *dst: fx.Tensor):
+        ret = []
+        for d in dst:
+            assert d not in self.thrview_D
+            thrv = self.partition_D(d)
+            self.thrview_D[d] = thrv
+            ret.append(thrv)
+        return ret if len(ret) > 1 else ret[0]
+
+    def load(self, src: fx.Tensor, coord: list = None, frag = None):
+        assert src in self.thrview_S, f"please call prepare_S(src) before load"
+        thrv = self.thrview_S[src]
+        if frag is None:
+            frag = fx.make_fragment_like(thrv) # this is a purely compile-time OP
+        else:
+            frag = self.retile(frag) # this is a purely compile-time OP
+        if coord is None:
+            fx.copy(self.copy_atom, thrv, frag)
+        else:
+            coord.insert(0, None) # select FrgV
+            fx.copy(self.copy_atom, thrv[coord], frag)
+        return frag
+    
+    def store(self, frag, dst: fx.Tensor, coord: list = None):
+        assert dst in self.thrview_D, f"please call prepare_D(dst) before store"
+        thrv = self.thrview_D[dst]
+        frag = self.retile(frag)
+        if coord is None:
+            fx.copy(self.copy_atom, frag, thrv)
+        else:
+            coord.insert(0, None) # select FrgV
+            fx.copy(self.copy_atom, frag, thrv[coord])
+
+    def custom(self, func, *args):
+        new_args = []
+        for i, v in enumerate(args):
+            if isinstance(v, (tuple, list)):
+                tensor, coord = v
+                coord.insert(0, None) # select FrgV
+                if tensor in self.thrview_S:
+                    new_args.append(self.thrview_S[tensor][coord])
+                elif tensor in self.thrview_D:
+                    new_args.append(self.thrview_D[tensor][coord])
+                else:
+                    assert False, f"{i}'th input is not prepared for copy"
+            elif isinstance(v, fx.Tensor):
+                thrv = self.get_thrview(v, default=v)
+                new_args.append(thrv)
+            else:
+                new_args.append(v)
+        recurisve_apply(func, *new_args)
+
+# load small amount of data into fragment with possible broadcast modes generating no redundant copy
+# using memref_load_vec instead of copy-atom
+def load_fragment(thr_view: fx.Tensor):
+    # make_fragment_layout_like() reserves space for dimension with 0 stride, which is unexpected.
+    tview_shape = thr_view.shape.to_py_value()
+    tview_stride = thr_view.stride.to_py_value()
+    nz_shape = []
+    nz_stride = []
+    nz_frag_stride = []
+    fstride = 1
+    def collect_nz_modes(shape, stride):
+        nonlocal nz_shape, nz_stride, fstride
+        frag_stride = []
+        for s, d in zip(shape,stride):
+            if isinstance(d, int):
+                if d != 0:
+                    nz_shape.append(s)
+                    nz_stride.append(d)
+                    nz_frag_stride.append(fstride)
+                    frag_stride.append(fstride) # fragment stride is compact
+                    fstride *= s
+                else:
+                    frag_stride.append(0) # fragment stride keeps all modes, even those with 0 stride
+            else:
+                frag_stride.append(collect_nz_modes(s, d))
+        return frag_stride
+    frag_stride = collect_nz_modes(tview_shape, tview_stride)
+    nz_cnt = fstride
+    # print(" thr_view shape: ", nz_shape, " stride: ", nz_stride, " frag_stride: ", frag_stride, " nz_cnt: ", nz_cnt)
+
+    if len(nz_shape) == 0:
+        nz_shape = 1
+        nz_stride = 0
+    thr_view_nz = fx.make_view(fx.get_iter(thr_view), fx.make_layout(nz_shape, nz_stride))
+    frag = fx.make_rmem_tensor(fx.make_layout(nz_shape, nz_frag_stride), thr_view.dtype)
+
+    vec = thr_view_nz.load()
+    frag.store(vec) # store to rmem tensor usually do nothing after lowering
+
+    # reshape back to thread-view domain
+    #frag = fx.composition(frag, fx.make_layout(tview_shape, frag_stride))
+    frag = fx.make_view(fx.get_iter(frag), fx.make_layout(tview_shape, frag_stride))
+
+    return frag
+"""
+
+@fxu.fly
+def kernel(a,b,c):
+    # your flydsl kernel code
+
+# directly invoke the kernel
+kernel((1,1,1), (64,1,1), a, b, c)
+
+"""
+def fly(fun):
+    import inspect
+    from flydsl.compiler.ast_rewriter import ASTRewriter
+    sig = inspect.signature(fun)
+    params = sig.parameters
+    nargs = len(params)
+    fun = ASTRewriter.transform(fun)
+    def call(grid, block, *args):
+        # only at first invoke we got args
+        # recover args to fx.Tensor with original static shape/stride
+        def recover_static_shape_stride(fx_args):
+            new_args = []
+            for fx_a, orig_a in zip(fx_args, args):
+                if isinstance(orig_a, torch.Tensor):
+                    shape = list(orig_a.shape)
+                    stride  = list(orig_a.stride())
+                    if len(shape) == 1:
+                        shape = shape[0]
+                        stride = stride[0]
+                    #print(fx_a.shape, fx_a.stride)
+                    #print(">>>", shape, stride)
+                    fx_a = fx.Tensor(fx.make_view(fx.get_iter(fx_a), fx.make_layout(shape, stride)))
+                new_args.append(fx_a)
+            return new_args
+
+        @flyc.kernel
+        def fly_kernel(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15):
+            args = [a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15][0:nargs]
+            args = recover_static_shape_stride(args)
+            fun(*args)
+
+        value_attrs = {"rocdl.waves_per_eu": 1,
+                        "passthrough": [["amdgpu-agpr-alloc", "256,256"],]
+                        }
+        value_attrs = None
+
+        @flyc.jit
+        def launcher(
+            grid0, grid1, grid2,
+            block0, block1, block2,
+            a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+            stream = None):
+            fly_kernel(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15).launch(grid=(grid0,grid1,grid2),block=(block0,block1,block2),stream=stream)
+
+        a = list(args)
+        while(len(a) < 16):
+            a.append(0)
+        grid = list(grid)
+        while(len(grid) < 3):
+            grid.append(1)
+        block = list(block)
+        while(len(block) < 3):
+            block.append(1)
+        launcher(*grid, *block,
+                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+                stream=torch.cuda.current_stream())
+        
+        def pre_compiled_launch(grid, block, *args):
+            a = list(args)
+            while(len(a) < 16):a.append(0)
+            grid = list(grid)
+            while(len(grid) < 3):grid.append(1)
+            block = list(block)
+            while(len(block) < 3): block.append(1)
+            launcher(*grid, *block,
+                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+                stream=torch.cuda.current_stream())
+            return pre_compiled_launch        
+
+        return pre_compiled_launch
+
+    return call
+
+def asm_mark(mark: str):
+    from flydsl._mlir.dialects import fly, llvm, vector, gpu, scf, rocdl
+    rocdl.sched_barrier(0)
+    llvm.inline_asm(ir.Type.parse("!llvm.void"), [], f"s_nop 8; {mark}", "", has_side_effects=True)
+    rocdl.sched_barrier(0)
 
 def enable_dump_ir(enable_debug_info = True):
     import os

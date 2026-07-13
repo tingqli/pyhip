@@ -1,7 +1,7 @@
 """ Some useful helpers """
 
 __all__ = [
-    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle", "run_perftest", "set_device"
+    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle", "run_perftest", "set_device", "allclose"
 ]
 
 import os
@@ -233,11 +233,11 @@ def run_perftest(kernel, *args, **kwargs):
 
         new_kwargs = {}
         for k,v in kwargs.items():
-            if isinstance(args[i], torch.Tensor):
-                new_kwargs[k] = args[i].clone()
-                copy_bytes += args[i].numel() * args[i].element_size()
+            if isinstance(v, torch.Tensor):
+                new_kwargs[k] = v.clone()
+                copy_bytes += v.numel() * v.element_size()
             else:
-                new_kwargs[k] = args[i]
+                new_kwargs[k] = v
         kwarg_copies.append(new_kwargs)
 
     # first run on original inputs to return the output, then run on copies for perf
@@ -282,3 +282,19 @@ def set_device(selected_device = -1):
     free_mem, total_mem = torch.cuda.mem_get_info(selected_device)
     print(f"Use cuda device {selected_device} with {free_mem*100/total_mem:.1f}% Free mem : {free_mem/(1024**3):.0f}GB / {total_mem/(1024**3):.0f} GB")
     return selected_device, torch.cuda.current_stream()
+
+
+def allclose(a, b, atol=1e-5, rtol=1e-5):
+    diff = calc_diff(a, b)
+    close_mask = torch.isclose(a, b, atol, rtol)
+    failed_indices = torch.where(~close_mask)
+    num_failed = len(failed_indices[0])
+    if num_failed == 0:
+        print(f"\033[32m allcose({atol=}, {rtol=}) passed with {diff=}. \033[0m")
+        return True
+    else:
+        print(f"\033[31m allcose({a.shape}_{a.dtype}, {b.shape}_{b.dtype}, {atol=}, {rtol=}) failed with {diff=}. \033[0m")
+        for i in range(min(8,num_failed)):
+            coord = tuple(dim[i].item() for dim in failed_indices)
+            print(f"\033[31m {i}/{num_failed}  {coord}: a={a[coord]}, b={b[coord]}, abs_diff={torch.abs(a[coord]-b[coord])} \033[0m")
+        return False
