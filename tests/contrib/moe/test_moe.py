@@ -786,7 +786,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             idx = torch.where(torch.abs(ref_out - cur_out) > 0.01)
             if len(idx[0]):
                 print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
-            assert 0, f"{kernel_type=}, {B=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=} {diff=:.8f}"
+            assert 0, f"{kernel_type=}, {B=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=} {quant_type=} {diff=:.8f}"
         else:
             quantype=""
             if wei_is_fp8(weight_type):

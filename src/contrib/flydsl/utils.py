@@ -1052,12 +1052,6 @@ def fly(fun):
 
     return call
 
-def asm_mark(mark: str):
-    from flydsl._mlir.dialects import fly, llvm, vector, gpu, scf, rocdl
-    rocdl.sched_barrier(0)
-    llvm.inline_asm(ir.Type.parse("!llvm.void"), [], f"s_nop 8; {mark}", "", has_side_effects=True)
-    rocdl.sched_barrier(0)
-
 def enable_dump_ir(enable_debug_info = True):
     import os
     import flydsl

@@ -84,3 +84,27 @@ jobs:
 ```bash
 rocprofv3 -i trace.yaml -- python myapp.py
 ```
+
+# AMDGPU: performance counters
+
+ - https://rocm.docs.amd.com/en/latest/conceptual/gpu-arch/mi300-mi200-performance-counters.html#
+ - https://github.com/ROCm/ROCm/blob/develop/docs/conceptual/gpu-arch/mi300-mi200-performance-counters.rst
+
+Some memory related PMC:
+| PMC    | meaning |
+| -------- | ------- |
+| TCP_TCC_WRITE_REQ_sum  | Total number of write requests to L2 cache    |
+| TCC_READ_sum	| Total number of L2 cache read requests (including compressed reads but not metadata reads).|
+| TCC_WRITE_sum	| Total number of L2 cache write requests. |
+| TCP_TCC_READ_REQ_sum | Total number of read requests to L2 cache |
+| TCP_TCC_WRITE_REQ_sum | Total number of write requests to L2 cache |
+|TCC_HIT_sum	|Total number of L2 cache hits.|
+|TCC_MISS_sum	|Total number of L2 cache misses.|
+| TCC_EA0_RDREQ_DRAM_sum |Total number of 32-byte or 64-byte efficiency arbiter read requests to HBM.|
+| TCC_EA0_WRREQ_DRAM_sum |Total number of 32-byte or 64-byte efficiency arbiter write requests to HBM.|
+
+
+```bash
+# it may crash when two PMC are specified together, in that case, split them into a separate round
+rocprofv3 --pmc  TCC_MISS_sum TCC_READ_sum TCC_WRITE_sum TCP_TCC_WRITE_REQ_sum  -f csv -d pmc_out  -- python3 test_your_kernel.py
+```
