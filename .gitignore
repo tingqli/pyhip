@@ -1,5 +1,6 @@
 *.s
 *.co
+*.pftrace
 *.egg-info/
 __pycache__/
 .cache
@@ -8,3 +9,4 @@ ck_test/
 .venv/
 .compile.lock
 my_ir_dumps/
+.rocprofv3/
