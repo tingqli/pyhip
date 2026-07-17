@@ -7,10 +7,11 @@ from flydsl._mlir import ir
 import functools
 import types
 import inspect
-import os
+
 
 def div_up(x, y):
     return (x + y - 1) // y
+
 
 def fly_ast_rewrite(member):
     """Apply ASTRewriter.transform to a class member callable.
@@ -23,6 +24,7 @@ def fly_ast_rewrite(member):
     if isinstance(member, classmethod):
         return classmethod(ASTRewriter.transform(member.__func__))
     return ASTRewriter.transform(member)
+
 
 def load_fragment(thr_view: fx.Tensor):
     """
@@ -76,6 +78,7 @@ def load_fragment(thr_view: fx.Tensor):
     frag = fx.make_view(fx.get_iter(frag), fx.make_layout(tview_shape, frag_stride))
 
     return frag
+
 
 def all_elements(*tensors, scalar=False):
     """Iterate broadcasted element views from multiple FlyDSL tensors.
@@ -174,16 +177,19 @@ def all_elements(*tensors, scalar=False):
             coord[r] = 0
             r += 1
 
+
 def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
     """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
     vm_lo = vmcnt & 0xF
     vm_hi = (vmcnt >> 4) & 0x3
     return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
 
+
 def get_d1_shape(tensor):
     return [
         fx.size(tensor.layout.shape[i]).to_py_value() for i in range(tensor.layout.rank)
     ]
+
 
 def all_element_of_tensors(*tensors, tiled_copy):
     """
@@ -212,6 +218,7 @@ def all_element_of_tensors(*tensors, tiled_copy):
 
     yield from all_elements(*thrviews, scalar=False)
 
+
 def _as_ptr(p, dtype=None):
     """Convert memref or pointer to a pointer/iterator suitable for fx.make_view.
     Handles both raw fx.Pointer values and memref values passed by flydsl runtime."""
@@ -222,12 +229,14 @@ def _as_ptr(p, dtype=None):
             p = fx.recast_iter(dtype, p)
         return p
 
+
 def make_1d_coord_tensor(target, target_mode_index, iter0):
     shape = get_d1_shape(target)
     stride = [
         1 if r == target_mode_index else 0 for r in fx.range_constexpr(len(shape))
     ]
     return fx.make_view(iter0, fx.make_layout(shape, stride))
+
 
 def sub_tensor(tensor, coord, shape):
     if len(shape) == 1:
@@ -236,16 +245,16 @@ def sub_tensor(tensor, coord, shape):
         layout = fx.composition(tensor.layout, fx.make_tile(*shape))
     return fx.make_view(fx.get_iter(tensor) + tensor.layout(*coord), layout)
 
+
 def atom_tensor(tensor, coord, copy_bits):
     assert copy_bits % tensor.dtype.width == 0
     num_values = copy_bits // tensor.dtype.width
     if isinstance(tensor, fx.Pointer):
-        return fx.make_view(
-            tensor + coord, fx.make_layout(num_values, 1)
-        )
+        return fx.make_view(tensor + coord, fx.make_layout(num_values, 1))
     return fx.make_view(
         fx.get_iter(tensor) + tensor.layout(*coord), fx.make_layout(num_values, 1)
     )
+
 
 def torch_layout(*shape):
     if len(shape) == 1:
@@ -253,9 +262,11 @@ def torch_layout(*shape):
     order = [i for i in range(len(shape) - 1, -1, -1)]
     return fx.make_ordered_layout(shape, order)
 
+
 def view_as_torch_tensor(ptr, shape, dtype=None):
     ptr = _as_ptr(ptr, dtype)
     return fx.make_view(ptr, torch_layout(*shape))
+
 
 # MLIR values are all SSA which is naturally different from each other
 # and once defined, will stay unchanged in the rest life time, so they
@@ -264,16 +275,16 @@ class FlyObjCache:
     def __init__(self):
         self._cached_methods = {}
         self._register_methods()
-    
+
     def _register_methods(self):
         for name, attr in self.__class__.__dict__.items():
             # method attr from class object instead of self, to avoid binding
-            if callable(attr) and hasattr(attr, '_use_cache') and attr._use_cache:
+            if callable(attr) and hasattr(attr, "_use_cache") and attr._use_cache:
                 cached_func = functools.cache(attr)
-                #setattr(self, name, cached_func)
+                # setattr(self, name, cached_func)
                 setattr(self, name, types.MethodType(cached_func, self))
                 self._cached_methods[name] = cached_func
-    
+
     def clear_all(self):
         for func in self._cached_methods.values():
             func.cache_clear()
@@ -287,9 +298,12 @@ class FlyObjCache:
     def create_thr_mma(self, dtype, wave_mnk):
         mfma_M = 16
         mfma_N = 16
-        mfma_K = {fx.Float8E4M3FNUZ: 32, fx.BFloat16: 16, fx.Float16: 16, fx.Float32: 4}[
-            dtype
-        ]
+        mfma_K = {
+            fx.Float8E4M3FNUZ: 32,
+            fx.BFloat16: 16,
+            fx.Float16: 16,
+            fx.Float32: 4,
+        }[dtype]
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(mfma_M, mfma_N, mfma_K, dtype))
 
         wave_m, wave_n, wave_k = wave_mnk
@@ -324,11 +338,17 @@ class FlyObjCache:
     def get_tiled_mma_copy(self, copy_atom, mm, abc, tid=None):
         assert abc in ["A", "B", "C"]
         if fx.const_expr(abc == "A"):
-            return fx.make_tiled_copy_A(copy_atom, mm).get_slice(tid if tid is not None else fx.thread_idx.x)
+            return fx.make_tiled_copy_A(copy_atom, mm).get_slice(
+                tid if tid is not None else fx.thread_idx.x
+            )
         elif fx.const_expr(abc == "B"):
-            return fx.make_tiled_copy_B(copy_atom, mm).get_slice(tid if tid is not None else fx.thread_idx.x)
+            return fx.make_tiled_copy_B(copy_atom, mm).get_slice(
+                tid if tid is not None else fx.thread_idx.x
+            )
         else:
-            return fx.make_tiled_copy_C(copy_atom, mm).get_slice(tid if tid is not None else fx.thread_idx.x)
+            return fx.make_tiled_copy_C(copy_atom, mm).get_slice(
+                tid if tid is not None else fx.thread_idx.x
+            )
 
     @local_cache
     def get_partition_S(self, thrcopy, src):
@@ -339,18 +359,26 @@ class FlyObjCache:
         return thrcopy.partition_D(src)
 
     @local_cache
-    def get_tiled_mma_partition_S(self, mm, src, abc, copy_atom_bits = 128, dtype = None, copy_atom = None):
+    def get_tiled_mma_partition_S(
+        self, mm, src, abc, copy_atom_bits=128, dtype=None, copy_atom=None
+    ):
         assert abc in ["A", "B", "C"]
         if copy_atom is None:
-            copy_atom = self.get_universal_copy_atom(src.dtype if dtype is None else dtype, copy_atom_bits)
+            copy_atom = self.get_universal_copy_atom(
+                src.dtype if dtype is None else dtype, copy_atom_bits
+            )
         tcopy = self.get_tiled_mma_copy(copy_atom, mm, abc)
         return self.get_partition_S(tcopy, src)
 
     @local_cache
-    def get_tiled_mma_retile(self, mm, frag, abc, copy_atom_bits = 128, dtype = None, copy_atom = None):
+    def get_tiled_mma_retile(
+        self, mm, frag, abc, copy_atom_bits=128, dtype=None, copy_atom=None
+    ):
         assert abc in ["A", "B", "C"]
         if copy_atom is None:
-            copy_atom = self.get_universal_copy_atom(frag.dtype if dtype is None else dtype, copy_atom_bits)
+            copy_atom = self.get_universal_copy_atom(
+                frag.dtype if dtype is None else dtype, copy_atom_bits
+            )
         tcopy = self.get_tiled_mma_copy(copy_atom, mm, abc)
         return self.get_retile(tcopy, frag)
 
@@ -359,7 +387,7 @@ class FlyObjCache:
         return thrcopy.retile(frag)
 
     @fly_ast_rewrite
-    def load_tiled_mma_frag(self, mm, src, slice_coord, dst, abc, copy_atom_bits = 128):
+    def load_tiled_mma_frag(self, mm, src, slice_coord, dst, abc, copy_atom_bits=128):
         assert abc in ["A", "B", "C"]
         if fx.const_expr(src.address_space == TargetAddressSpace.BufferDesc):
             copy_atom = self.get_buffer_copy_atom(src.dtype, copy_atom_bits)
@@ -383,28 +411,34 @@ class FlyObjCache:
 
             thrv = self.get_partition_S(tcopy, src)
             frg = self.get_retile(tcopy, frag)
-            #if self.bid == 0:
+            # if self.bid == 0:
             #    fx.printf(" {}: {}", fx.thread_idx.x, fx.ptrtoint(fx.get_iter(thrv)) - fx.ptrtoint(fx.get_iter(src)))
             # fxu.asm_mark(f"xxx  {src} {slice_coord} {thrv} {thrv_slice_coord} {frg}")
-            fx.copy(
-                copy_atom, thrv[thrv_slice_coord], frg
-            )
+            fx.copy(copy_atom, thrv[thrv_slice_coord], frg)
         else:
             fx.copy(
-                copy_atom, self.get_partition_S(tcopy, src), self.get_retile(tcopy, frag)
+                copy_atom,
+                self.get_partition_S(tcopy, src),
+                self.get_retile(tcopy, frag),
             )
         return frag
 
-    def load_tiled_mma_fragA(self, mm, src, slice_coord = None, dst = None, copy_atom_bits = 128):
+    def load_tiled_mma_fragA(
+        self, mm, src, slice_coord=None, dst=None, copy_atom_bits=128
+    ):
         return self.load_tiled_mma_frag(mm, src, slice_coord, dst, "A", copy_atom_bits)
 
-    def load_tiled_mma_fragB(self, mm, src, slice_coord = None, dst = None, copy_atom_bits = 128):
+    def load_tiled_mma_fragB(
+        self, mm, src, slice_coord=None, dst=None, copy_atom_bits=128
+    ):
         return self.load_tiled_mma_frag(mm, src, slice_coord, dst, "B", copy_atom_bits)
 
-    def load_tiled_mma_fragC(self, mm, src, slice_coord = None, dst = None, copy_atom_bits = 128):
+    def load_tiled_mma_fragC(
+        self, mm, src, slice_coord=None, dst=None, copy_atom_bits=128
+    ):
         return self.load_tiled_mma_frag(mm, src, slice_coord, dst, "C", copy_atom_bits)
 
-    def store_tiled_mma_fragC(self, mm, frag, dst, copy_atom_bits = 128):
+    def store_tiled_mma_fragC(self, mm, frag, dst, copy_atom_bits=128):
         copy_atom = self.get_universal_copy_atom(frag.dtype, copy_atom_bits)
         tcopy = self.get_tiled_mma_copy(copy_atom, mm, "C")
         fx.copy(
@@ -412,7 +446,7 @@ class FlyObjCache:
         )
 
     @local_cache
-    def get_tiled_copy_coalesced_mn(self, tensor, copy_atom_bits = 128, num_threads = 256):
+    def get_tiled_copy_coalesced_mn(self, tensor, copy_atom_bits=128, num_threads=256):
         """
         this helper assumes tensor of shape [M, N, K, ....] with N as inner-most mode
         and M as the second inner-most mode, all the rest modes are batches
@@ -421,7 +455,7 @@ class FlyObjCache:
             copy_atom = self.get_buffer_copy_atom(tensor.dtype, copy_atom_bits)
         else:
             copy_atom = self.get_universal_copy_atom(tensor.dtype, copy_atom_bits)
-        
+
         shape = get_d1_shape(tensor)
         num_rows = shape[0]
         num_cols = shape[1]
@@ -443,20 +477,29 @@ class FlyObjCache:
         )
         return tiled_copy.get_slice(fx.thread_idx.x), copy_atom
 
+
 def asm_mark(mark: str):
     caller_frame = inspect.currentframe().f_back
     filename = caller_frame.f_code.co_filename
     lineno = caller_frame.f_lineno
 
     rocdl.sched_barrier(0)
-    llvm.inline_asm(ir.Type.parse("!llvm.void"), [], f"s_nop 1; {mark}  {filename}:{lineno}", "", has_side_effects=True)
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"),
+        [],
+        f"s_nop 1; {mark}  {filename}:{lineno}",
+        "",
+        has_side_effects=True,
+    )
     rocdl.sched_barrier(0)
 
-def dump_ir(enable_debug_info = True):
+
+def dump_ir(enable_debug_info=True):
     import os
     import flydsl
     from flydsl.utils.env import DebugEnvManager
     from flydsl._mlir import ir
+
     DebugEnvManager.enable_debug_info = enable_debug_info
     DebugEnvManager.dump_asm = True
     DebugEnvManager.dump_ir = True
