@@ -1453,7 +1453,7 @@ def compile_gemm(
             out_tensor = fx.rocdl.make_buffer_tensor(
                 arg_p_output,
                 max_size=False,
-                num_records_bytes=M * TOPK * N // 2 * fx.BFloat16.width // 8,
+                num_records_bytes=fx.Int64(M) * (TOPK * N // 2 * fx.BFloat16.width // 8),
             )
             tiled_copy_sortid_lds = fx.make_tiled_copy(
                 fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
@@ -1597,7 +1597,7 @@ def compile_gemm(
                 arg_p_output = fx.rocdl.make_buffer_tensor(
                     arg_p_output,
                     max_size=False,
-                    num_records_bytes=M * TOPK * N * fx.BFloat16.width // 8,
+                    num_records_bytes=fx.Int64(M) * (TOPK * N * fx.BFloat16.width // 8),
                 )
                 cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.BFloat16)
                 is_atomic_write = False
@@ -1781,7 +1781,7 @@ def compile_gemm(
             out_tensor = fx.rocdl.make_buffer_tensor(
                 arg_p_output,
                 max_size=False,
-                num_records_bytes=M * TOPK * N // 2 * fx.BFloat16.width // 8,
+                num_records_bytes=fx.Int64(M) * (TOPK * N // 2 * fx.BFloat16.width // 8),
             )
             buf_atom_w128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
             # CShuffle read/scatter over the single (BM x contiguous_n) region. The read uses a
