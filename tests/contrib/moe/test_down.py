@@ -2,9 +2,10 @@
 import pyhip
 import aiter
 import torch
-from fly_moe_down import compile_gemm
+#from fly_moe_down import compile_gemm
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm
 
 def xcd_swizzle(J, blk1d, num_blocks, num_oc_blocks, NUM_XCD, NUM_CU_PER_XCD):
     NUM_CU = NUM_XCD * NUM_CU_PER_XCD
@@ -499,7 +500,7 @@ def test_down(pt_file):
         BLOCK_TILE_SIZE_M,
         BLOCK_TILE_SIZE_N,
         stage=stage,
-        alg=alg,
+        alg="prefill_1x4",
         E=E,
         USE_ATOMIC_WRITE=USE_ATOMIC_WRITE,
         act_quant_type=act_quant_type,
@@ -615,6 +616,6 @@ def test_down(pt_file):
         num_verbose=1,
     )
 
-#test_down("moe_down_data_bf16_no_no.pt")
-#test_down("moe_down_data_fp8_ptpc_ptpc.pt")
-test_down("moe_down_data_fp8_per_tensor_ptpc.pt")
+test_down("moe_down_data_bf16_no_no_16k.pt")
+#test_down("moe_down_data_fp8_ptpc_ptpc_16k.pt")
+#test_down("moe_down_data_fp8_per_tensor_ptpc.pt")

@@ -1,5 +1,6 @@
 import os
 os.environ['PYHIP_JIT_LOG'] = '0'
+DUMP_DOWN = int(os.getenv("DUMP_DOWN", "0"))
 
 import torch
 import pytest
@@ -492,6 +493,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                     w1.dtype, TOPK, K2, N2, False, TILE_M, TILE_N,
                                     gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, quant_type == 'ptpc')
                 else:
+                    if DUMP_DOWN: use_prefill = False
                     if use_prefill:
                         down_alg = "prefill_1x4"
                         USE_ATOMIC_WRITE = False
@@ -541,7 +543,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                             _ptr(w2_scale_arg), B, grid, stream),
                         )
 
-                        if 0:
+                        if DUMP_DOWN:
                             fname = f'moe_down_data_{weight_dtype}_{compile_quant_type}_{compile_act_quant_type}.pt'
                             if not os.path.exists(fname):
                                 torch.cuda.synchronize()
@@ -826,7 +828,7 @@ def entry_b1(prec=[torch.bfloat16], HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E
         perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=64, TP=8, run_count=10, quant_type='ptpc'):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=64, TP=8, run_count=10, quant_type='ptpc'):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
@@ -1023,6 +1025,9 @@ if __name__ == '__main__':
     prec = [get_fp8type()]
     prec = [torch.bfloat16, get_fp8type()]
     #test_acc_fly_splitk_2s(batch=[1, 4, 17, 8192], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    HIDDEN_SIZE = 4096
+    INTER_SIZE = 256*8
+    batch = 65536*2
 
-    test_acc_fly_splitk_2s(batch=[8192], prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    test_acc_fly_splitk_2s(batch=[8192], prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    test_acc_fly_splitk_2s(batch=[batch], prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    #test_acc_fly_splitk_2s(batch=[batch], prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)

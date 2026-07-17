@@ -2319,7 +2319,7 @@ def compile_gemm(
             thrv_ldsCt = flyobj.get_partition_D(tcopy, ldsCt)
 
             def postprocess_store2lds(fragC, ldsc_idx):
-                for fc, fsw in fxh.all_elements(fragC, frag_sorted_weight):
+                for fc, fsw in fxh.all_elements(fragC, frag_sorted_weight, scalar=True):
                     fc.store(fc.load() * fsw.load())
                 vec_f32 = fragC.load()
                 fragC_bf16.store(f32_to_bf16(vec_f32))
@@ -2327,25 +2327,41 @@ def compile_gemm(
 
             fragOut = fx.make_fragment_like(thrv_ldsC[None, None, None, 0])
 
+            def to_i64(x):
+                return fx.arith.extsi(fx.T.i64(), fx.arith.unwrap(x))
+
+            # prepare pointers for each token
+            frag_row_addr = fx.make_fragment_like(frag_row, fx.Int64)
+            frag_topk = fx.make_fragment_like(frag_row, fx.Uint32)
+            for raddr, row, ftopk in fxh.all_elements(frag_row_addr, frag_row, frag_topk):
+                sorted_id = row[0].to(fx.Uint32)
+                topk = sorted_id >> 24
+                token_id = sorted_id & 0x7FFFFF # workaround for backend bug
+                ftopk[0] = topk
+                part1 = to_i64(topk * N)
+                part2 = fx.arith.muli(to_i64(token_id), to_i64(TOPK*N))
+                offset_64bit = fx.arith.addi(part1, part2)
+                raddr[0] = fx.ptrtoint(fx.get_iter(arg_p_output) + offset_64bit)
+
             def postprocess_store2vmem(n, ldsc_idx):
                 fx.copy(cp_atom_128b, thrv_ldsC[None, None, None, ldsc_idx], fragOut)
 
-                for src, row, col in fxh.all_elements(
+                for src, row_addr, col, ftopk in fxh.all_elements(
                     fragOut,
-                    frag_row,
+                    frag_row_addr,
                     thrv_dst_col[None, None, None, 0, n],
+                    frag_topk
                 ):
-                    sorted_id = row[0].bitcast(fx.Uint32)
-                    topk = sorted_id >> 24
                     atom_C = fxh.atom_tensor(
-                        arg_p_output, (sorted_id & 0xFFFFFF, topk, col[0]), 128
+                        fx.inttoptr(fx.get_iter(arg_p_output).type, row_addr[0]),
+                        fx.Int64(col[0].to_py_value()),
+                        128
                     )
                     if fx.const_expr(1):
-                        valid = topk < TOPK
                         dummy = llvm.inline_asm(
                             ir.Type.parse("i64"),
                             [
-                                topk.ir_value(),
+                                ftopk[0].ir_value(),
                                 fx.ptrtoint(fx.get_iter(atom_C)).ir_value(),
                                 src.load().ir_value(),
                             ],
@@ -2357,7 +2373,7 @@ def compile_gemm(
                             has_side_effects=True,
                         )
                     else:
-                        if topk < TOPK:
+                        if ftopk[0] < TOPK:
                             fx.copy(cp_atom_128b, src, atom_C)
 
             """
