@@ -752,6 +752,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             tflops_res.append(p.tflops())
             latencies.append(p.dt())
             bw.append(p.bw())
+        diff = 0
     else:
         if weight_type == torch.float4_e2m1fn_x2:
             # fp4 no shuffle
@@ -1025,10 +1026,36 @@ if __name__ == '__main__':
     prec = [get_fp8type()]
     prec = [torch.bfloat16, get_fp8type()]
     #test_acc_fly_splitk_2s(batch=[1, 4, 17, 8192], prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    HIDDEN_SIZE = 4096
-    INTER_SIZE = 256*8
-    batch = 65536     # works well
-    batch = 65536 * 2 # accuracy issue
 
-    test_acc_fly_splitk_2s(batch=[batch], prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-    test_acc_fly_splitk_2s(batch=[batch], prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    tile_mn = {
+        "TILE_M":64,
+        "TILE_N":256,}
+    hy3_args = {
+        "HIDDEN_SIZE":4096,
+        "INTER_SIZE":192*8,
+        "TP":8,
+        "E":192,
+        "TOPK":8,
+        "run_count":10,
+        "quant_type":'ptpc'
+    }
+    qwen35_args = {
+        "HIDDEN_SIZE":4096,
+        "INTER_SIZE":128*8,
+        "TP":8,
+        "E":512,
+        "TOPK":10,
+        "run_count":10,
+        "quant_type":'ptpc'
+    }
+
+    model_args = hy3_args
+    model_args = qwen35_args
+    batch = [65536]
+    prec = [get_fp8type()]
+    entry_common('aiter', batch, prec, **tile_mn, **model_args)
+    entry_common('fly_splitk_2s', batch, prec, **tile_mn, **model_args)
+
+    #batch = 131072 # accuracy issue
+    #test_acc_fly_splitk_2s(batch=[batch], prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    #test_acc_fly_splitk_2s(batch=[batch], prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)

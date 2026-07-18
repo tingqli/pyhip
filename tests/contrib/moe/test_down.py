@@ -556,7 +556,7 @@ def test_down(pt_file):
     pyhip.run_perftest(
         compiled,
         *args,
-        num_name=f"fly-moe-down-{weight_dtype}-{weight_quant_type}-{act_quant_type}",
+        num_name=f"fly-moe-down-{B}-{weight_dtype}-{weight_quant_type}-{act_quant_type}",
         num_flops=num_flops,
         num_bytes=num_bytes,
         num_verbose=1,
@@ -610,12 +610,15 @@ def test_down(pt_file):
         B,
         sorted_expert_ids.shape[0],
         dyn_schedule,
-        num_name=f"jit-moe-down-{weight_dtype}-{fp8_quant_type}-{fp8_quant_type}",
+        num_name=f"jit-moe-down-{B}-{weight_dtype}-{fp8_quant_type}-{fp8_quant_type}",
         num_flops=num_flops,
         num_bytes=num_bytes,
         num_verbose=1,
     )
-
-test_down("moe_down_data_bf16_no_no_16k.pt")
+test_down("moe_down_data_fp8_ptpc_ptpc.pt")
+#test_down("moe_down_data_bf16_no_no_16k.pt")
+#test_down("moe_down_data_bf16_no_no_64k.pt")
+#test_down("moe_down_data_bf16_no_no_16k.pt")
+#test_down("moe_down_data_bf16_no_no_64k.pt")
 #test_down("moe_down_data_fp8_ptpc_ptpc_16k.pt")
 #test_down("moe_down_data_fp8_per_tensor_ptpc.pt")
