@@ -1,7 +1,7 @@
 """ Some useful helpers """
 
 __all__ = [
-    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle", "run_perftest", "set_device", "allclose"
+    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle", "run_perftest", "set_device", "allclose", "mark"
 ]
 
 import os
@@ -283,6 +283,14 @@ def set_device(selected_device = -1):
     print(f"Use cuda device {selected_device} with {free_mem*100/total_mem:.1f}% Free mem : {free_mem/(1024**3):.0f}GB / {total_mem/(1024**3):.0f} GB")
     return selected_device, torch.cuda.current_stream()
 
+def mark(msg:str = ""):
+    import inspect
+    caller_frame = inspect.currentframe().f_back
+    filename = caller_frame.f_code.co_filename
+    lineno = caller_frame.f_lineno
+    
+    torch.cuda.synchronize()
+    print(f"MARK: {filename}:{lineno}  {msg}")
 
 def allclose(a, b, atol=1e-5, rtol=1e-5):
     diff = calc_diff(a, b)

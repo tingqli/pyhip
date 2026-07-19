@@ -6,6 +6,7 @@ import torch
 import pytest
 from typing import Optional
 
+import pyhip
 from pyhip import cudaPerf, torchPerf, calc_diff, div_up
 from pyhip.contrib.moe_gemm_mxfp4 import *
 from pyhip.contrib.moe import *
@@ -380,6 +381,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         elif kernel_type == 'fly_splitk_2s':
             from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
             from pyhip.contrib.flydsl.moe_gemm_splitk import compile_sum as _moe_sum_compile
+            from pyhip.contrib.flydsl.moe_gemm_splitk import compile_sorted_sum as _moe_sorted_sum_compile
+            from pyhip.contrib.flydsl.moe_gemm_splitk import compile_invert_sorted_ids as _moe_invert_sorted_ids_compile
             import flydsl.expr as fx
             import flydsl.compiler as flyc
             _TORCH_TO_FX = {
@@ -495,6 +498,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                     gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, quant_type == 'ptpc')
                 else:
                     if DUMP_DOWN: use_prefill = False
+                    #print(sorted_expert_ids.view(-1, 32).tolist())
+
                     if use_prefill:
                         down_alg = "prefill_1x4"
                         USE_ATOMIC_WRITE = False
@@ -504,7 +509,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     if USE_ATOMIC_WRITE:
                         gemm2_out = cur_out
                     else:
-                        gemm2_out = torch.empty([B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+                        gemm2_out = torch.empty([sorted_expert_ids.shape[0]*TILE_M, N2], dtype=hidden_states.dtype, device=hidden_states.device)
 
                     if weight_dtype == 'fp8' and use_prefill:
                         if compile_act_quant_type == 'ptpc':
@@ -571,11 +576,40 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
 
                     if not USE_ATOMIC_WRITE:
                         #cur_out = torch.sum(gemm2_out, dim=1)
+                        # gemm2_out = torch.empty([sorted_expert_ids.shape[0]*TILE_M, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+
+                        # sorted_ids[loc] => (b, topk)
+                        # we need to build a reverse table: loc[B, TOPK] => loc
+                        loc_ids = torch.zeros([B, TOPK], dtype=torch.int32, device=hidden_states.device)
+                        d_kwargs = (('TOPK', TOPK),)
+                        _fly_dispatch(
+                            d_kwargs, lambda: _moe_invert_sorted_ids_compile(**dict(d_kwargs)),
+                            (_ptr(sorted_ids), _ptr(loc_ids), sorted_ids.shape[0], stream),
+                        )
+
+                        d_kwargs = (('TOPK', TOPK),('N', N2))
+                        _fly_dispatch(
+                            d_kwargs, lambda: _moe_sorted_sum_compile(**dict(d_kwargs)),
+                            (_ptr(loc_ids), _ptr(gemm2_out), _ptr(cur_out), B, stream),
+                        )
+
+                        """
+                        gemm2_out_r = torch.empty([B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+                        for blk in range(sorted_expert_ids.shape[0]):
+                            blk_start = blk * TILE_M
+                            blk_end = blk_start + TILE_M
+                            batch_id = sorted_ids[blk_start:blk_end] & 0xFFFFFF
+                            topk_id = sorted_ids[blk_start:blk_end] >> 24
+                            blk_end = blk_start + len(batch_id)
+                            gemm2_out_r[batch_id, topk_id, :] = gemm2_out[blk_start:blk_end, :]
+
                         d_kwargs = (('TOPK', TOPK),('N', N2))
                         _fly_dispatch(
                             d_kwargs, lambda: _moe_sum_compile(**dict(d_kwargs)),
-                            (_ptr(gemm2_out), _ptr(cur_out), B, stream),
+                            (_ptr(gemm2_out_r), _ptr(cur_out), B, stream),
                         )
+                        """
+
         elif kernel_type == 'mxn_2s':
             #assert weight_type == torch.bfloat16, f'mxn_2s only support bfloat16, but got {weight_type}'
             # test moe_gemm_batch_vmn: 2 stages, m/n can be set
@@ -1040,7 +1074,7 @@ if __name__ == '__main__':
         "HIDDEN_SIZE":4096,
         "INTER_SIZE":192*8,
         "TP":8,
-        "E":192,
+        "E":64,
         "TOPK":8,
         "run_count":10,
         "quant_type":'ptpc'
@@ -1056,9 +1090,10 @@ if __name__ == '__main__':
     }
 
     model_args = hy3_args
-    #model_args = qwen35_args
+    model_args = qwen35_args
     batch = [32768*4]
     prec = [get_fp8type()]
+    #prec = [torch.bfloat16]
     entry_common('aiter', batch, prec, **tile_mn, **model_args)
     entry_common('fly_splitk_2s', batch, prec, **tile_mn, **model_args)
 

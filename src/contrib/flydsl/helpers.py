@@ -12,6 +12,7 @@ import inspect
 def div_up(x, y):
     return (x + y - 1) // y
 
+
 def div_e(x, y):
     assert x % y == 0, f"expect {x} % {y} == 0"
     return x // y
@@ -194,6 +195,7 @@ def get_d1_shape(tensor):
         fx.size(tensor.layout.shape[i]).to_py_value() for i in range(tensor.layout.rank)
     ]
 
+
 def inner_most_stride(tensor_or_stride):
     layout = getattr(tensor_or_stride, "layout", None)
     if layout is not None:
@@ -208,6 +210,7 @@ def inner_most_stride(tensor_or_stride):
     if stride.depth > 1:
         return inner_most_stride(stride[0])
     return fx.size(stride).to_py_value()
+
 
 def all_copy_atoms(*tensors, atom_bits, num_threads: int):
     """
@@ -241,8 +244,12 @@ def all_copy_atoms(*tensors, atom_bits, num_threads: int):
             shape0 = t.layout.shape
         neles = fx.size(shape0).get_static_leaf_int
         stride = inner_most_stride(t)
-        assert stride <= 1, f"{i=} expect all tensors to have stride=1/0 in 1st mode, but got {stride} {t} {rank}"
-        assert neles == num_elements, f"{i=} expect all tensors to have same 1st mode size, but got {num_elements} vs {neles}"
+        assert (
+            stride <= 1
+        ), f"{i=} expect all tensors to have stride=1/0 in 1st mode, but got {stride} {t} {rank}"
+        assert (
+            neles == num_elements
+        ), f"{i=} expect all tensors to have same 1st mode size, but got {num_elements} vs {neles}"
         if rank < 2:
             div = fx.logical_divide(t, fx.make_layout(num_values, 1))
         else:
