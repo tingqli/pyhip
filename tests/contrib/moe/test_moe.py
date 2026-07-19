@@ -379,6 +379,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
         elif kernel_type == 'fly_splitk_2s':
             from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
+            from pyhip.contrib.flydsl.moe_gemm_splitk import compile_sum as _moe_sum_compile
             import flydsl.expr as fx
             import flydsl.compiler as flyc
             _TORCH_TO_FX = {
@@ -569,7 +570,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                             gemm2_out[...] = moe_down_data["gemm2_out"]
 
                     if not USE_ATOMIC_WRITE:
-                        cur_out = torch.sum(gemm2_out, dim=1)
+                        #cur_out = torch.sum(gemm2_out, dim=1)
+                        d_kwargs = (('TOPK', TOPK),('N', N2))
+                        _fly_dispatch(
+                            d_kwargs, lambda: _moe_sum_compile(**dict(d_kwargs)),
+                            (_ptr(gemm2_out), _ptr(cur_out), B, stream),
+                        )
         elif kernel_type == 'mxn_2s':
             #assert weight_type == torch.bfloat16, f'mxn_2s only support bfloat16, but got {weight_type}'
             # test moe_gemm_batch_vmn: 2 stages, m/n can be set
@@ -1029,7 +1035,7 @@ if __name__ == '__main__':
 
     tile_mn = {
         "TILE_M":64,
-        "TILE_N":256,}
+        "TILE_N":128,}
     hy3_args = {
         "HIDDEN_SIZE":4096,
         "INTER_SIZE":192*8,
@@ -1050,8 +1056,8 @@ if __name__ == '__main__':
     }
 
     model_args = hy3_args
-    model_args = qwen35_args
-    batch = [65536]
+    #model_args = qwen35_args
+    batch = [32768*4]
     prec = [get_fp8type()]
     entry_common('aiter', batch, prec, **tile_mn, **model_args)
     entry_common('fly_splitk_2s', batch, prec, **tile_mn, **model_args)
