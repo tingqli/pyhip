@@ -329,9 +329,9 @@ v12 之后瓶颈已均衡、无单一大头,且 kernel **死死卡在 2 waves/SI
 ## 12. v13:突破天花板 —— perm_M 挪到全局 K + K-prefetch(235 TFLOPS)
 
 §11 判断 v12(229.8)是 2-wave VGPR 预算下的平台,任何"加寄存器的流水"都回退。**但按「先腾寄存器、再上流水」
-这条主线,v13 打破了天花板:235.8 TFLOPS(空闲 GPU 复测中位数,1.92x rocBLAS 122.7),rel_l2=0.00019,
-VGPR 216,2 waves/SIMD。** 三步缺一不可,`KLDS=gpermswz` 现为默认;`KLDS=swz` 走 v12 路径(在本文件的
-unroll+K-prefetch 结构下 =168,见下)。
+这条主线,v13 打破了天花板:同尺寸 M=N=20480 下 235.8 TFLOPS(1.92x,> v12 的 229.8);放大到 M=N=40960
+达 266.0 TFLOPS(2.24x rocBLAS 119)。rel_l2=0.00021,VGPR 204,2 waves/SIMD。** 三步缺一不可,
+`KLDS=gpermswz` 现为默认;`KLDS=swz` 走 v12 路径(此结构下 20480=168 / 40960=219.6,见下)。
 
 ### v13a — perm_M 从 MMA 挪到全局 K(gpermswz):直接看是负优化,实为腾寄存器
 
@@ -378,8 +378,11 @@ frag_K]`)。GEMM1 于是直接用已就绪的 `frag_K`,LDS 读延迟被上一步
 | **v13c** | **+ K-prefetch(= 当前默认 `gpermswz`)** | **235.8** | 216 |
 | 参照 | 当前文件 `KLDS=swz`(v13 结构但 perm_M 在 MMA) | 168 | — |
 
-> 数据为空闲 GPU 复测中位数(cudaPerf 多 buffer 轮换,M=N=20480);torch(rocBLAS)= 122.7 → **1.92x**。
-> 注意 `KLDS=swz` 在 v13 的 unroll+K-prefetch 结构下 =168(perm_M + frag_K 撑爆寄存器);干净 v12 的 swz 才是 229.8。
+> 上表 TFLOPS 为空闲 GPU 复测中位数(cudaPerf 多 buffer 轮换,**M=N=20480**);torch(rocBLAS)= 122.7 → **1.92x**。
+> **放大到 M=N=40960(当前 main 默认):gpermswz = 266.0 TFLOPS(2.24x rocBLAS 119),swz = 219.6,rel_l2=0.00021**
+> ——更大问题摊薄 host/prologue 开销;`hot_loop_scheduler` 手工微调(is_first_gemm 先排 8×(vmem+3mfma),else 用 mfma(7))
+> 把 gpermswz 从初版 248.7 逐步抬到 266.0(VGPR 216→204),sched 指令数按 tile 尺寸(BN·D)自动算。
+> 注意 `KLDS=swz`(20480=168 / 40960=219.6)因 perm_M+frag_K 撑爆寄存器而慢于 gpermswz;干净 v12 的 swz 才是 229.8。
 
 
 

@@ -24,6 +24,7 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl._mlir.dialects import llvm
 
 # debug
 if 1:
@@ -100,8 +101,8 @@ def _make_ktiles(K_, Kb, N, D, BN, mode):
 def build(M, N, D, BM, BN, klds_mode="gpermswz"):
     """构造融合 attention kernel(无 softmax, register-resident S),返回 launch 包装。
 
-    klds_mode: "gpermswz"(默认, perm_M 挪全局 K + 展开2x + K-prefetch, 235.8/1.92x)/
-               "swz"(perm_M 在 MMA=v12 路径;本文件的 unroll+K-prefetch 结构下 =168)。
+    klds_mode: "gpermswz"(默认, perm_M 挪全局 K + 展开2x + K-prefetch, 266.0 TFLOPS @M=N=40960, 2.24x)/
+               "swz"(perm_M 在 MMA=v12 路径;此 unroll+K-prefetch 结构下 =219.6,慢于 gpermswz)。
     """
     assert BM % 32 == 0 and BN % 16 == 0 and D % 16 == 0 and N % BN == 0 and M % BM == 0
     assert (N // BN) % 2 == 0, "KV tile 数需为偶数(循环展开 2 次)"
@@ -205,34 +206,31 @@ def build(M, N, D, BM, BN, klds_mode="gpermswz"):
         frag_ldK_next = fx.make_fragment_like(coop_g.partition_S(k_tiles[None, None, 0, 0]))  # coop 预取 K(kv+2)
         frag_V = thr2.make_fragment_A(v_fake)                                               # V 直读 -> frag_V
 
-        def hot_loop_scheduler():
-            # Fixed interleave: each buffer_load(vmem)+4 mfma; each ds_read(dsrd)+1 mfma;
-            # each ds_write(dswr)+2 mfma (dsrd before dswr); then the remaining mfma.
-            # mfma_cnt = 2 * mfma_per_gemm
-            # n_vmem = mem_a_cnt + 2 * mem_b_cnt  # A g2r + B gate/up g2r (buffer_load)
-            # n_dswr = mem_a_cnt  # A staging -> LDS store (ds_write)
-            # n_dsrd = lds_a_cnt  # A LDS -> register full tile (ds_read)
-            used = 0
-            # rocdl.sched_dsrd(2)
-            # for _ in range_constexpr(n_vmem):
-            #     rocdl.sched_dsrd(1)
-            #     rocdl.sched_vmem(1)
-            #     rocdl.sched_mfma(2)
-            #     rocdl.sched_dsrd(1)
-            #     rocdl.sched_mfma(2)
-            #     used += 4
-            # for _ in range_constexpr(n_dsrd - 2 * n_vmem - 2):
-            #     rocdl.sched_dsrd(1)
-            #     rocdl.sched_mfma(1)
-            #     used += 1
-            # if const_expr(mfma_cnt - n_dswr * 2 - used > 0):
-            #     rocdl.sched_mfma(mfma_cnt - n_dswr * 2 - used)
-            # for _ in range_constexpr(n_dswr):
-            #     rocdl.sched_dswr(1)
-            #     rocdl.sched_mfma(2)
-            #     used += 2
-            # if const_expr(mfma_cnt - used > 0):
-            #     rocdl.sched_mfma(mfma_cnt - used)
+        # hot_loop_scheduler 的指令数按实际 tile 尺寸算(BN=32,D=128 -> 8 dsrd / 2 dswr / 2 vmem / 32 mfma/GEMM)
+        WARP = NT // WAVES  # 64
+        mfma_per_gemm = (BN // 16) * ((BM // WAVES) // 16) * (D // 16)  # 每个 GEMM 的 MFMA 数
+        n_dsrd = BN * D // (WARP * VECN)    # K LDS 读(frag_K,每 wave 读 [BN,D],128-bit)
+        n_dswr = BN * D // (NT * VECN)      # coop K LDS 写(NT 线程协作)
+        n_vmem = n_dswr                     # coop K global 读(与 coop 写同数)
+
+        def hot_loop_scheduler(is_first_gemm):
+            if is_first_gemm:
+                for _ in range_constexpr(8):
+                    rocdl.sched_vmem(1)
+                    rocdl.sched_mfma(3)
+
+                rocdl.sched_vmem(100)
+                rocdl.sched_mfma(100)
+            else:
+                for _ in range_constexpr(n_vmem):
+                    rocdl.sched_vmem(1)
+                    rocdl.sched_dswr(1)
+                    rocdl.sched_mfma(7)
+                    # rocdl.sched_group_barrier(2, 4, 0)
+                #rocdl.sched_mfma(mfma_per_gemm - 4 * n_dswr - n_dsrd)
+                for _ in range_constexpr(n_dsrd):
+                    rocdl.sched_dsrd(1)
+                    rocdl.sched_mfma(1)
             rocdl.sched_barrier(0)
 
         # 展开 2 次:偶/奇两步 LDS stage(wr)变编译期常量,消掉 kv%2;fragment 全部复用
@@ -243,6 +241,7 @@ def build(M, N, D, BM, BN, klds_mode="gpermswz"):
             # GEMM1 = K@Q^T(frag_K 已在上一步/prologue prefetch)
             frag_St.fill(0)
             fx.gemm(mma, frag_St, frag_K, frag_Q, frag_St)
+            hot_loop_scheduler(True)
             fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 2, 0]), ld_next)
             # register trick:S^T 直接作 GEMM2 的 B
             frag_Stb = _cvt_f32_to_bf16(frag_St)  # add-0x8000 舍入,省 RNE+NaN 指令
@@ -253,7 +252,7 @@ def build(M, N, D, BM, BN, klds_mode="gpermswz"):
             gpu.barrier()  # k_lds[wr] 写完可见
             # prefetch 下一步 K:读 k_lds[wr] -> frag_K(移到 GEMM2 之后,藏 LDS 读延迟)
             fx.copy(cp_kr, tcK.partition_S(k_lds2[wr, None, None]), tcK.retile(frag_K))
-            rocdl.sched_barrier(0)
+            hot_loop_scheduler(False)
 
         # prologue:prefetch 第一个 frag_K = k_lds[0]
         fx.copy(cp_kr, tcK.partition_S(k_lds2[0, None, None]), tcK.retile(frag_K))
@@ -304,7 +303,7 @@ def main():
     # BN=32 + K LDS 双缓冲:VGPR 190(<256, 2 waves/SIMD),双缓冲藏 K LDS 读延迟 -> 229.8 TFLOPS。
     # (BN=64 单缓冲=183;BN=64 双缓冲 VGPR 265->1 wave 反而慢;BN=32 才有双缓冲的寄存器预算。)
     BM, BN = 128, 32
-    M, N, D = BM * 80 * 2, BM * 80 * 2, 128
+    M, N, D = BM * 80 * 4, BM * 80 * 4, 128
 
     Q = torch.randn(M, D, dtype=torch.bfloat16)
     K = torch.randn(N, D, dtype=torch.bfloat16)
@@ -316,7 +315,7 @@ def main():
     o_fly = torch.empty(M, D, dtype=torch.bfloat16)
     args = (Q, K, V_shuf, o_fly, stream)
 
-    # KLDS 环境变量选布局:"gpermswz"(默认, perm_M 挪全局 K + K-prefetch, 235.8/1.92x)/ "swz"(v12 路径, 此结构下=168)
+    # KLDS 环境变量选布局:"gpermswz"(默认, 266.0 TFLOPS @M=N=40960, 2.24x)/ "swz"(v12 路径, 此结构下=219.6)
     _klds_mode = os.environ.get("KLDS", "gpermswz")
     print(f"[cfg] klds_mode={_klds_mode}")
 
@@ -337,7 +336,7 @@ def main():
     mem_bytes = (Q.numel() + K.numel() + V_shuf.numel() + o_fly.numel()) * 2  # bf16 读写
 
     # 轮换 BUF_COPY 组输入:每次计时读不同显存 -> L2 冷 -> 测真实 HBM(而非 L2 命中的虚高)
-    BUF_COPY = 10
+    BUF_COPY = 60
     Qs = [torch.randn(M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
     Ks = [torch.randn(N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
     Vs = [torch.randn(N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
