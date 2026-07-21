@@ -7,10 +7,11 @@
 - register trick:GEMM1 算 S^T=K@Q^T,其 C 累加器经 fx.select 重排后直接作 GEMM2 的 A,S 不入 LDS。
 - perm_M(GEMM1 的 M=Nk 维加 k_perm):C 累加器每 lane 持 8 连续 Nk,对齐 GEMM2 的 k_perm A。
 - 全 128-bit 读:K/Q 沿 D 加 k_perm(ds_read/buffer_load 128-bit);V 预 shuffle 成 paged
-  布局 [N//8,D,8],协作加载到 v_lds(保留 v-连续),再从 v_lds paged 视图读(ds_read 128-bit)。
+  布局 [N//8,D,8],直接从 global paged 视图 buffer_load 到 frag_V(不经 LDS,128-bit)。
 - f32→bf16 用 _cvt_f32_to_bf16(add-0x8000 舍入+截断),省 .to(bf16) 的 RNE+NaN 指令。
-- 软件流水线:prologue 预取 K(0);循环里 loop-carried K ping-pong,V 循环内预取,S*V 前预取下一轮 K
-  -> global load 延迟藏在 GEMM 后面。→ M=N=20480: 163.6 TFLOPS(超 rocBLAS 122),VGPR 184。
+- 软件流水线:prologue 预取 K(0);K 走 LDS 双缓冲 ping-pong(读 k_lds[kv%2]=上轮写好,写 K(kv+1) 到
+  k_lds[(kv+1)%2],write+barrier 与 GEMM2 重叠 -> 移出 GEMM1 关键路径);V 直读 global。
+  BN=32(腾 VGPR 预算供双缓冲)-> M=N=20480: 229.8 TFLOPS(1.9x rocBLAS 122),VGPR 190。2 waves/SIMD。
 精度 bf16。
 """
 
@@ -90,17 +91,14 @@ def build(M, N, D, BM, BN):
         K = fx.Tensor(fx.make_view(fx.get_iter(K_), fx.make_layout((N, D), (D, 1))))
         # V paged: V_shuf[nb,d,v]=V[nb*8+v,d]。每 kv-tile 在 global 是连续 [BN*D] 块 -> 按 [N,D] 连续视图协作加载
         NB = BN // 8
-        V_lin = fx.Tensor(fx.make_view(fx.get_iter(V_), fx.make_layout((N, D), (D, 1))))  # V_shuf 字节的连续 [N,D] 视图
         # O 存成转置视图 O^T[D,M]:stride (1,D) -> O[m,d] 连续 D;GEMM2 转置后 C=O^T,4/lane 沿 D 连续 -> 64-bit 写
         O = fx.Tensor(fx.make_view(fx.get_iter(O_), fx.make_layout((D, M), (1, D))))
         Qb = fx.rocdl.make_buffer_tensor(Q, max_size=False)
         Kb = fx.rocdl.make_buffer_tensor(K, max_size=False)
-        Vb = fx.rocdl.make_buffer_tensor(V_lin, max_size=False)
         Ob = fx.rocdl.make_buffer_tensor(O, max_size=False)
 
         q_tile = fx.flat_divide(Qb, fx.make_tile(BM, D))[None, None, bm, 0]  # [BM, D]
         k_tiles = fx.flat_divide(Kb, fx.make_tile(BN, D))                    # [BN, D, N//BN, 1]
-        v_tiles = fx.flat_divide(Vb, fx.make_tile(BN, D))                    # [BN, D, N//BN, 1] 连续块(paged 字节)
         o_tile = fx.flat_divide(Ob, fx.make_tile(D, BM))[None, None, 0, bm]  # [D, BM] = O^T tile
 
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
@@ -117,22 +115,24 @@ def build(M, N, D, BM, BN):
         cp_cg = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)  # 协作 global -> reg(合并)
         cp_cs = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)     # reg -> LDS
         cp_kr = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)     # k_lds -> frag_K(k_perm -> 128-bit)
-        cp_vr = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)     # v_lds paged -> frag_V(8 连续 -> 128-bit ds_read)
+        cp_vg = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)  # V paged global -> frag_V(直读,不经 LDS)
         cp_qg = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)   # Q global -> frag_Q(k_perm -> 128-bit)
         cp_oc = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)   # O 输出(GEMM2 转置 -> C=O^T,4/lane 沿 D 连续 -> 64-bit 写出)
 
-        # LDS: K、V 各一块([BN,D]);S 不入 LDS(register trick)
+        # LDS: K 双缓冲(ping-pong),2*[BN,D];S 不入 LDS(register trick)
         @fx.struct
         class SharedStorage:
-            k_lds: fx.Array[fx.BFloat16, BN * D, 16]
-            v_lds: fx.Array[fx.BFloat16, BN * D, 16]
+            k_lds: fx.Array[fx.BFloat16, 2 * BN * D, 16]
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        swz = fx.SwizzleType.get(3, 3, 3)  # LDS bank 去冲突(bf16);(3,3,3) 实测最优,弱 swizzle 消 2st64 反而 bank 冲突暴跌
-        k_lds = fx.make_view(lds.k_lds.ptr, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((BN, D), order=(1, 0))))
-        v_lds = fx.make_view(lds.v_lds.ptr, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((BN, D), order=(1, 0))))  # 协作写视图
-        # V^T paged 读视图:v(8) 在 inner(stride 1)-> B 读 8 连续 Nk = 128-bit ds_read
-        v_lds_T = fx.make_view(lds.v_lds.ptr, fx.make_composed_layout(fx.static(swz), fx.make_layout((D, (8, NB)), (8, (1, D * 8)))))
+        swz = fx.SwizzleType.get(3, 3, 3)  # K LDS bank 去冲突(bf16);(3,3,3) 实测最优
+        # 双缓冲视图 [2, BN, D];stage 偏移 BN*D 是 swizzle period(512)整数倍 -> 两 buffer swz 一致
+        k_lds2 = fx.make_view(lds.k_lds.ptr, fx.make_composed_layout(fx.static(swz), fx.make_layout((2, BN, D), (BN * D, D, 1))))
+        # V 直读 paged global 读源:每 kv-tile [D,(8,NB)], v(8) inner(stride 1)-> 128-bit buffer_load(不经 LDS)
+        v_g = fx.rocdl.make_buffer_tensor(
+            fx.make_view(fx.get_iter(V_), fx.make_layout((D, (8, NB), N // BN), (8, (1, D * 8), BN * D))),
+            max_size=False,
+        )
         # frag_V 的 B 模板:干净 [D,BN] tile(非 paged 嵌套),读取源才用 paged 分区
         v_fake = fx.flat_divide(
             fx.rocdl.make_buffer_tensor(
@@ -155,53 +155,53 @@ def build(M, N, D, BM, BN):
         # fragment(形状固定)
         frag_O = thr2.make_fragment_C(o_tile)                             # C=O[M,D](跨 KV 循环累加)
         tcK = fx.make_tiled_copy_A(cp_kr, tmma1).get_slice(tid)            # k_lds -> frag_K
-        tcV = fx.make_tiled_copy_A(cp_vr, tmma2).get_slice(tid)            # v_lds paged -> frag_V(现为 A=V^T)
+        tcV = fx.make_tiled_copy_A(cp_vg, tmma2).get_slice(tid)            # paged global -> frag_V(直读)
 
         frag_O.fill(0)
 
-        # 流水线 prologue:先发起 K(0) 协作加载(global->frag,异步)
+        # 双缓冲 prologue:coop K(0)->frag; 写 k_lds[0]; coop K(1)->frag; barrier
         frag_ldK = fx.make_fragment_like(coop_g.partition_S(k_tiles[None, None, 0, 0]))
         fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, 0, 0]), frag_ldK)
+        fx.copy(cp_cs, frag_ldK, coop_s.partition_D(k_lds2[0, None, None]))              # 写 stage 0
+        fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, 1, 0]), frag_ldK)          # 预取 K(1) coop
+        gpu.barrier()
 
         acc_init = frag_O.load()
-        kcar_init = frag_ldK.load()  # K(i) 协作数据作 loop-carried ping-pong
+        kcar_init = frag_ldK.load()  # frag_ldK 持 K(kv+1) coop 数据(loop-carried)
+
+        # 循环内 fragment 提到循环外:形状固定,只分配一次,循环内复用(fill/store/copy 仍在循环内)
+        frag_K = thr1.make_fragment_A(k_lds2[0, None, None])                                # k_lds -> frag_K
+        frag_St = thr1.make_fragment_C(fx.make_rmem_tensor(fx.make_layout((BN, BM), (BM, 1)), fx.Float32))  # GEMM1 C=S^T
+        frag_Sb = thr2.make_fragment_B(fx.make_rmem_tensor(fx.make_layout((BM, BN), (BN, 1)), fx.BFloat16))  # GEMM2 B=S^T
+        frag_ldK_next = fx.make_fragment_like(coop_g.partition_S(k_tiles[None, None, 0, 0]))  # coop 预取 K(kv+2)
+        frag_V = thr2.make_fragment_A(v_fake)                                               # V 直读 -> frag_V
+
         _encode_waitcnt(vmcnt=0)
         rocdl.sched_barrier(0)
         for kv, state in range(fx.Index(0), fx.Index(N // BN), fx.Index(1), init=[acc_init, kcar_init]):
             frag_O.store(state[0])
-            frag_ldK.store(state[1])  # 恢复本轮 K(i) 协作数据(prologue / 上一轮预取)
+            frag_ldK.store(state[1])  # 恢复 frag_ldK = K(kv+1) coop 数据
             kv_i = fx.Int32(kv)
+            rd = kv_i % 2          # 本轮读 k_lds[rd](上一轮写好,barrier 已过)
+            wr = (kv_i + 1) % 2    # 本轮写 K(kv+1) 到 k_lds[wr](供下一轮读)
 
-            # (1) 发起 V(i) 协作加载(global->frag,异步,与下面 K->LDS + GEMM1 重叠)
-            frag_ldV = fx.make_fragment_like(coop_g.partition_S(k_tiles[None, None, 0, 0]))
-            fx.copy(cp_cg, coop_g.partition_S(v_tiles[None, None, kv_i, 0]), frag_ldV)
-
-            # (2)(3) 预取的 K frag -> LDS -> frag_K;(4) GEMM1 = K@Q^T(各 wave 从 LDS 读全部 Nk)
-            fx.copy(cp_cs, frag_ldK, coop_s.partition_D(k_lds))
-            gpu.barrier()
-            frag_K = thr1.make_fragment_A(k_lds)
-            fx.copy(cp_kr, tcK.partition_S(k_lds), tcK.retile(frag_K))
-            frag_St = thr1.make_fragment_C(fx.make_rmem_tensor(fx.make_layout((BN, BM), (BM, 1)), fx.Float32))
+            # (双缓冲)读 K(kv) from k_lds[rd] -> frag_K -> GEMM1 = K@Q^T(write/barrier 不在关键路径)
+            fx.copy(cp_kr, tcK.partition_S(k_lds2[rd, None, None]), tcK.retile(frag_K))
             frag_St.fill(0)
             fx.gemm(mma, frag_St, frag_K, frag_Q, frag_St)
 
-            # register trick:GEMM2 转置后 S^T 直接作 B 操作数;make_fragment_B 模板取 [N,K]=[Mq,Nk]=[BM,BN]
-            # tmma1/tmma2 同 wave 布局(1,WAVES,1)+同 k_perm -> C(S^T) 与 B(S^T) 布局一致
-            frag_Sb = thr2.make_fragment_B(fx.make_rmem_tensor(fx.make_layout((BM, BN), (BN, 1)), fx.BFloat16))
+            # register trick:GEMM2 转置后 S^T 直接作 B 操作数(C(S^T) 与 B(S^T) 布局一致)
             frag_Stb = _cvt_f32_to_bf16(frag_St)  # add-0x8000 舍入,省 RNE+NaN 指令
             frag_Sb.store(fx.select(frag_Stb, [0, 2, 1]).load())
 
-            # (5) 在 S*V 之前发起 K(i+1) 协作加载(预取下一轮,异步,与 V->LDS + GEMM2 重叠;
-            #     末轮 kv_i+1 越界,buffer_load 返回 0 且不被消费,安全)
-            frag_ldK_next = fx.make_fragment_like(coop_g.partition_S(k_tiles[None, None, 0, 0]))
-            fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 1, 0]), frag_ldK_next)
+            # (双缓冲)写 K(kv+1) -> k_lds[wr] + 预取 coop K(kv+2)(与下面 GEMM2 重叠)
+            fx.copy(cp_cs, frag_ldK, coop_s.partition_D(k_lds2[wr, None, None]))
+            fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 2, 0]), frag_ldK_next)
 
-            # V frag -> LDS -> frag_V -> GEMM2 = S@V
-            fx.copy(cp_cs, frag_ldV, coop_s.partition_D(v_lds))
-            gpu.barrier()
-            frag_V = thr2.make_fragment_A(v_fake)
-            fx.copy(cp_vr, tcV.partition_S(v_lds_T), tcV.retile(frag_V))
+            # V 直读 paged global -> frag_V -> GEMM2 = V^T @ S^T(与上面 K->LDS 写重叠)
+            fx.copy(cp_vg, tcV.partition_S(v_g[None, None, kv_i]), tcV.retile(frag_V))
             fx.gemm(mma, frag_O, frag_V, frag_Sb, frag_O)  # O^T = V^T @ S^T(交换 A/B)
+            gpu.barrier()  # k_lds[wr] 写完可见 -> 下一轮读
 
             results = yield [frag_O.load(), frag_ldK_next.load()]
         frag_O.store(results[0])
@@ -234,9 +234,9 @@ def main():
     #   ``V = [NumBlocks, NumKVHeads, PageSize / kVectorSize, HeadDim, kVectorSize]``.
 
     M, N, D = 8192, 8192, 128
-    # BN=64: frag_K/frag_V 操作数各 = Nk*D/128 VGPR,Nk=64 时各 64 -> 总 VGPR 198(<256, 2 waves/SIMD)。
-    # BN=128(128x128)操作数各 128 VGPR -> 总 ~300,超 256。详见 docs/attn_gemm_optimization.md。
-    BM, BN = 128, 64
+    # BN=32 + K LDS 双缓冲:VGPR 190(<256, 2 waves/SIMD),双缓冲藏 K LDS 读延迟 -> 229.8 TFLOPS。
+    # (BN=64 单缓冲=183;BN=64 双缓冲 VGPR 265->1 wave 反而慢;BN=32 才有双缓冲的寄存器预算。)
+    BM, BN = 128, 32
     M, N, D = BM * 80 * 2, BM * 80 * 2, 128
 
     Q = torch.randn(M, D, dtype=torch.bfloat16)
