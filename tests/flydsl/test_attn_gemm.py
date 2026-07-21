@@ -23,7 +23,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl._mlir.dialects import llvm
 
 # debug
@@ -76,33 +76,62 @@ def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
     return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
 
 
+LOG2E = 1.4426950408889634  # log2(e):exp(x)=exp2(x*LOG2E),flash softmax 用 exp2 走单 v_exp_f32
+
+
+def _maxnumf(a, b):
+    """非 NaN 传播 max(单 v_max_f32),移植自 pa_decode_fp8.py。softmax 输入有限或 -inf,不会 NaN。"""
+    return type(a)(arith.maxnumf(arith.unwrap(a), arith.unwrap(b)))
+
+
+def _exp2_amdgcn(x):
+    """标量 f32 = 2^x:llvm.amdgcn.exp2.f32(单 v_exp_f32,省 OCML 的 v_ldexp)。指数须在 fast-range(≤0)。"""
+    from flydsl._mlir.ir import F32Type
+
+    return fx.Float32(llvm.call_intrinsic(F32Type.get(), "llvm.amdgcn.exp2.f32", [arith.unwrap(x)], [], []))
+
+
+def _exp2_vec_amdgcn(vec):
+    """fx.Vector f32 逐元素 2^vec(amdgcn intrinsic)。"""
+    from flydsl._mlir.dialects import vector as _vd
+    from flydsl._mlir.ir import F32Type, VectorType
+
+    raw = arith.unwrap(vec)
+    n = raw.type.shape[0]
+    f32 = F32Type.get()
+    outs = [
+        llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [_vd.extract(raw, static_position=[i], dynamic_position=[])], [], [])
+        for i in range(n)
+    ]
+    return fx.Vector(_vd.from_elements(VectorType.get([n], f32), outs))
+
+
 def _make_klds_view(ptr, BN, D):
     """K LDS 视图 [2,BN,D](D 连续,stage 偏移 BN*D):SwizzleType(3,3,3) 组合行主序去 bank 冲突
-    -> K 读 ds_read2st64_b64。swz(默认=v12)与 gpermswz 共用此 LDS 布局。"""
+    -> K 读 ds_read2st64_b64。"""
     base = fx.make_layout((2, BN, D), (BN * D, D, 1))
     swz = fx.SwizzleType.get(3, 3, 3)
     return fx.make_view(ptr, fx.make_composed_layout(fx.static(swz), base))
 
 
-def _make_ktiles(K_, Kb, N, D, BN, mode):
-    """K coop 读源 tile [BN,D,N//BN,1]。mode="gpermswz":把 perm_M 施加在全局 K cache 而非 MMA:
+def _make_ktiles(K_, N, D, BN, koff):
+    """K coop 读源 tile [BN,D,N//BN,1](head 偏移 koff=h*N*D 元素)。perm_M 施加在全局 K cache 而非 MMA:
     每 tile 内 Nk 按正向 k_perm (4,4,2):(D,8D,4D) 重排 -> plain 读入 LDS 后,GEMM1 不加 perm_M 也能
-    得到相同的 8-连续-Nk C 布局(N 方向已 shuffle)。否则自然 flat_divide。假设 BN=32。"""
-    if mode == "gpermswz":
-        return fx.rocdl.make_buffer_tensor(
-            fx.make_view(
-                fx.get_iter(K_),
-                fx.make_layout(((4, 4, 2), D, N // BN, 1), ((D, 8 * D, 4 * D), 1, BN * D, 0)),
-            ),
-            max_size=False,
-        )
-    return fx.flat_divide(Kb, fx.make_tile(BN, D))
+    得到相同的 8-连续-Nk C 布局(N 方向已 shuffle)。假设 BN=32。"""
+    return fx.rocdl.make_buffer_tensor(
+        fx.make_view(
+            fx.get_iter(K_) + koff,
+            fx.make_layout(((4, 4, 2), D, N // BN, 1), ((D, 8 * D, 4 * D), 1, BN * D, 0)),
+        ),
+        max_size=False,
+    )
 
-def build(M, N, D, BM, BN, klds_mode="gpermswz"):
-    """构造融合 attention kernel(无 softmax, register-resident S),返回 launch 包装。
+def build(M, N, D, BM, BN, H=1, softmax=True):
+    """构造融合 MHA kernel(flash softmax + multi-head),返回 launch 包装。
 
-    klds_mode: "gpermswz"(默认, perm_M 挪全局 K + 展开2x + K-prefetch, 266.0 TFLOPS @M=N=40960, 2.24x)/
-               "swz"(perm_M 在 MMA=v12 路径;此 unroll+K-prefetch 结构下 =219.6,慢于 gpermswz)。
+    perm_M 挪到全局 K(_make_ktiles)+ 展开2x + K-prefetch:266.0 TFLOPS @M=N=40960(2.24x rocBLAS)。
+    H: head 数(multi-head,grid.y=head)。
+    softmax: 编译时开关。True=在线 flash softmax;False=纯双 GEMM(S@V,无 softmax/scale)-> ~260T 基线。
     """
     assert BM % 32 == 0 and BN % 16 == 0 and D % 16 == 0 and N % BN == 0 and M % BM == 0
     assert (N // BN) % 2 == 0, "KV tile 数需为偶数(循环展开 2 次)"
@@ -110,33 +139,34 @@ def build(M, N, D, BM, BN, klds_mode="gpermswz"):
     NT = WAVES * 64                     # 线程数
     VECN = 128 // fx.BFloat16.width     # 协作加载向量宽度(8 bf16 = 128b)
     assert BM // 32 == WAVES and D % VECN == 0 and BN % 16 == 0
+    sm_scale = float(1.0 / (D**0.5))         # softmax 缩放 1/sqrt(D)
+    sm_scale_log2 = float(sm_scale * LOG2E)  # 把 LOG2E 折进缩放:exp2(S*sm_scale*LOG2E-m) 省掉逐元素 *LOG2E
 
     @flyc.kernel
     def attn_kernel(Q_: fx.Tensor, K_: fx.Tensor, V_: fx.Tensor, O_: fx.Tensor):
         tid = fx.thread_idx.x
         bm = fx.block_idx.x  # 第几个 query tile
+        h = fx.block_idx.y  # head 索引(multi-head)
+        qo_off = h * (M * D)  # Q/O 的 head 偏移(元素)
+        kv_off = h * (N * D)  # K/V 的 head 偏移(元素)
 
-        Q = fx.Tensor(fx.make_view(fx.get_iter(Q_), fx.make_layout((M, D), (D, 1))))
-        K = fx.Tensor(fx.make_view(fx.get_iter(K_), fx.make_layout((N, D), (D, 1))))
-        # V paged: V_shuf[nb,d,v]=V[nb*8+v,d]。每 kv-tile 在 global 是连续 [BN*D] 块 -> 按 [N,D] 连续视图协作加载
+        # 多头:每 head 的 Q/K/V/O 在全局按 head 偏移基址(iter+offset)
+        Q = fx.Tensor(fx.make_view(fx.get_iter(Q_) + qo_off, fx.make_layout((M, D), (D, 1))))
         NB = BN // 8
-        # O 存成转置视图 O^T[D,M]:stride (1,D) -> O[m,d] 连续 D;GEMM2 转置后 C=O^T,4/lane 沿 D 连续 -> 64-bit 写
-        O = fx.Tensor(fx.make_view(fx.get_iter(O_), fx.make_layout((D, M), (1, D))))
+        # O 存成转置视图 O^T[D,M]:GEMM2 转置后 C=O^T,4/lane 沿 D 连续 -> 64-bit 写
+        O = fx.Tensor(fx.make_view(fx.get_iter(O_) + qo_off, fx.make_layout((D, M), (1, D))))
         Qb = fx.rocdl.make_buffer_tensor(Q, max_size=False)
-        Kb = fx.rocdl.make_buffer_tensor(K, max_size=False)
         Ob = fx.rocdl.make_buffer_tensor(O, max_size=False)
 
         q_tile = fx.flat_divide(Qb, fx.make_tile(BM, D))[None, None, bm, 0]  # [BM, D]
-        k_tiles = _make_ktiles(K_, Kb, N, D, BN, klds_mode)                  # [BN, D, N//BN, 1](gpermswz=全局重排)
+        k_tiles = _make_ktiles(K_, N, D, BN, kv_off)                         # [BN, D, N//BN, 1](perm_M 已全局重排)
         o_tile = fx.flat_divide(Ob, fx.make_tile(D, BM))[None, None, 0, bm]  # [D, BM] = O^T tile
 
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
         k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
-        # gpermswz: perm_M 挪到全局 K(_make_ktiles) -> MMA 不再加 perm_M(N 方向已 shuffle);否则 perm_M=k_perm
-        _pm = None if klds_mode == "gpermswz" else k_perm
-        # GEMM1 = K@Q^T: wave 沿 query-M(MFMA 的 N 维)-> (1,WAVES,1);K 维(D)加 k_perm -> K 128-bit;
-        # M 维(Nk)加 perm_M -> C 累加器 frag_St 每 lane 8 连续 Nk(对齐 GEMM2 的 k_perm A)
-        tmma1 = fx.make_tiled_mma(mma, fx.make_layout((1, WAVES, 1), (1, 1, 0)), fx.make_tile(_pm, None, k_perm))
+        # perm_M 挪到全局 K(_make_ktiles) -> MMA 不加 perm_M(N 方向已 shuffle)
+        # GEMM1 = K@Q^T: wave 沿 query-M(MFMA 的 N 维)-> (1,WAVES,1);K 维(D)加 k_perm -> K 128-bit
+        tmma1 = fx.make_tiled_mma(mma, fx.make_layout((1, WAVES, 1), (1, 1, 0)), fx.make_tile(None, None, k_perm))
         # GEMM2 = (S@V)^T = V^T@S^T:交换 A/B -> C=O^T[D,Mq];wave 沿 query-M(现为 N 维)-> (1,WAVES,1);
         # K 维(Nk)加 k_perm -> A(V^T)每 lane 8 Nk -> 128-bit;C 累加器 4/lane 沿 D 连续 -> O 64-bit 写出
         tmma2 = fx.make_tiled_mma(mma, fx.make_layout((1, WAVES, 1), (1, 1, 0)), fx.make_tile(None, None, k_perm))
@@ -158,15 +188,15 @@ def build(M, N, D, BM, BN, klds_mode="gpermswz"):
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         # K LDS 视图:swizzle(3,3,3) 去 bank 冲突(swz 默认 / gpermswz 共用)
         k_lds2 = _make_klds_view(lds.k_lds.ptr, BN, D)
-        # V 直读 paged global 读源:每 kv-tile [D,(8,NB)], v(8) inner(stride 1)-> 128-bit buffer_load(不经 LDS)
+        # V 直读 paged global 读源(head 偏移 kv_off):每 kv-tile [D,(8,NB)], v(8) inner -> 128-bit buffer_load
         v_g = fx.rocdl.make_buffer_tensor(
-            fx.make_view(fx.get_iter(V_), fx.make_layout((D, (8, NB), N // BN), (8, (1, D * 8), BN * D))),
+            fx.make_view(fx.get_iter(V_) + kv_off, fx.make_layout((D, (8, NB), N // BN), (8, (1, D * 8), BN * D))),
             max_size=False,
         )
         # frag_V 的 B 模板:干净 [D,BN] tile(非 paged 嵌套),读取源才用 paged 分区
         v_fake = fx.flat_divide(
             fx.rocdl.make_buffer_tensor(
-                fx.make_view(fx.get_iter(V_), fx.make_layout((D, BN), (BN, 1))), max_size=False
+                fx.make_view(fx.get_iter(V_) + kv_off, fx.make_layout((D, BN), (BN, 1))), max_size=False
             ),
             fx.make_tile(D, BN),
         )[None, None, 0, 0]
@@ -235,7 +265,7 @@ def build(M, N, D, BM, BN, klds_mode="gpermswz"):
 
         # 展开 2 次:偶/奇两步 LDS stage(wr)变编译期常量,消掉 kv%2;fragment 全部复用
         # K 读做成 prefetch:frag_K 在上一步 GEMM2 之后就读好,GEMM1 直接用(藏 LDS 读延迟)
-        def kv_step(kv_i, wr, ld_cur, ld_next):
+        def kv_step(kv_i, wr, ld_cur, ld_next, m0, m1, l0, l1):
             # V 直读 paged global -> frag_V
             fx.copy(cp_vg, tcV.partition_S(v_g[None, None, kv_i]), tcV.retile(frag_V))
             # GEMM1 = K@Q^T(frag_K 已在上一步/prologue prefetch)
@@ -243,34 +273,74 @@ def build(M, N, D, BM, BN, klds_mode="gpermswz"):
             fx.gemm(mma, frag_St, frag_K, frag_Q, frag_St)
             hot_loop_scheduler(True)
             fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 2, 0]), ld_next)
-            # register trick:S^T 直接作 GEMM2 的 B
+            if const_expr(softmax):
+                # ---- 在线 flash softmax(frag_St=S^T[Nk,Mq],C 布局 mode2=Mq-tile,每 lane 2 个 Mq)----
+                m_in, l_in = [m0, m1], [l0, l1]
+                m_out, l_out, corr = [None, None], [None, None], [None, None]
+                for mt in range_constexpr(2):
+                    v = frag_St[None, None, mt].load() * sm_scale_log2  # S*sm_scale*LOG2E(LOG2E 已折入,log2 域)
+                    tmax = v.reduce("max")                         # lane 内 8 Nk 求 max
+                    for sh in (16, 32):                           # 跨 lane 归约 Nk(l//16 的 4 组)
+                        tmax = _maxnumf(tmax, tmax.shuffle_xor(sh, 64))
+                    nm = _maxnumf(m_in[mt], tmax)                 # 新 running max(log2 域)
+                    corr[mt] = _exp2_amdgcn(m_in[mt] - nm)        # exp2(Δm):LOG2E 已折入,免 *LOG2E
+                    p = _exp2_vec_amdgcn(v - nm)                  # P^T=exp2(v-nm)(8 Nk),f32;免逐元素 *LOG2E
+                    ts = p.reduce("add")                          # lane 内 8 Nk 求和
+                    for sh in (16, 32):
+                        ts = ts + ts.shuffle_xor(sh, 64)          # 跨 lane 归约
+                    l_out[mt] = l_in[mt] * corr[mt] + ts          # running sum 在线更新
+                    m_out[mt] = nm
+                    frag_St[None, None, mt].store(p)              # 覆盖 frag_St=P(register trick 复用)
+                for mt in range_constexpr(2):                     # 旧 O 按 correction 缩放(GEMM2 累加前)
+                    ot = frag_O[None, None, mt]
+                    ot.store(ot.load() * corr[mt])
+                m0, m1, l0, l1 = m_out[0], m_out[1], l_out[0], l_out[1]
+            # register trick:S^T(启 softmax 时=P^T)直接作 GEMM2 的 B
             frag_Stb = _cvt_f32_to_bf16(frag_St)  # add-0x8000 舍入,省 RNE+NaN 指令
             frag_Sb.store(fx.select(frag_Stb, [0, 2, 1]).load())
             # 写 K(kv+1)=ld_cur -> k_lds[wr] + 预取 coop K(kv+2) -> ld_next(与 GEMM2 重叠)
             fx.copy(cp_cs, ld_cur, coop_s.partition_D(k_lds2[wr, None, None]))
-            fx.gemm(mma, frag_O, frag_V, frag_Sb, frag_O)  # O^T = V^T @ S^T(交换 A/B)
+            fx.gemm(mma, frag_O, frag_V, frag_Sb, frag_O)  # O^T = V^T @ P^T(交换 A/B)
             gpu.barrier()  # k_lds[wr] 写完可见
             # prefetch 下一步 K:读 k_lds[wr] -> frag_K(移到 GEMM2 之后,藏 LDS 读延迟)
             fx.copy(cp_kr, tcK.partition_S(k_lds2[wr, None, None]), tcK.retile(frag_K))
             hot_loop_scheduler(False)
+            return m0, m1, l0, l1
 
         # prologue:prefetch 第一个 frag_K = k_lds[0]
         fx.copy(cp_kr, tcK.partition_S(k_lds2[0, None, None]), tcK.retile(frag_K))
         fragK_init = frag_K.load()
+        # flash softmax 在线统计初值(per Mq-tile,每 lane 冗余):m=-inf, l=0（仅 softmax 时携带）
+        loop_init = [acc_init, kcar_init, fragK_init]
+        if const_expr(softmax):
+            loop_init += [fx.Float32(float("-inf")), fx.Float32(float("-inf")), fx.Float32(0.0), fx.Float32(0.0)]
 
         _encode_waitcnt(vmcnt=0)
         rocdl.sched_barrier(0)
         # 每轮处理 2 个 kv(偶=2*kv, 奇=2*kv+1);frag_ldK/frag_ldK_next 做 coop ping-pong;frag_K 携带 prefetch
-        for kv, state in range(fx.Index(0), fx.Index(N // BN // 2), fx.Index(1), init=[acc_init, kcar_init, fragK_init]):
+        for kv, state in range(fx.Index(0), fx.Index(N // BN // 2), fx.Index(1), init=loop_init):
             frag_O.store(state[0])
             frag_ldK.store(state[1])  # 恢复 frag_ldK = K(2*kv+1) coop 数据
             frag_K.store(state[2])    # 恢复上一步 prefetch 的 frag_K = K(2*kv)
+            if const_expr(softmax):
+                m0, m1, l0, l1 = state[3], state[4], state[5], state[6]  # 恢复 softmax 在线统计
+            else:
+                m0 = m1 = l0 = l1 = None
             kv0 = fx.Int32(kv) * 2
-            kv_step(kv0, 1, frag_ldK, frag_ldK_next)      # 偶:写 k_lds[1],prefetch 读 k_lds[1]
-            kv_step(kv0 + 1, 0, frag_ldK_next, frag_ldK)  # 奇:写 k_lds[0],prefetch 读 k_lds[0]
+            m0, m1, l0, l1 = kv_step(kv0, 1, frag_ldK, frag_ldK_next, m0, m1, l0, l1)      # 偶:写 k_lds[1]
+            m0, m1, l0, l1 = kv_step(kv0 + 1, 0, frag_ldK_next, frag_ldK, m0, m1, l0, l1)  # 奇:写 k_lds[0]
 
-            results = yield [frag_O.load(), frag_ldK.load(), frag_K.load()]  # frag_K = K(2*kv+2)
+            yield_vals = [frag_O.load(), frag_ldK.load(), frag_K.load()]  # frag_K = K(2*kv+2)
+            if const_expr(softmax):
+                yield_vals += [m0, m1, l0, l1]
+            results = yield yield_vals
         frag_O.store(results[0])
+        if const_expr(softmax):
+            # ---- epilogue:O /= l(每 Mq-tile 用最终 running sum 归一化)----
+            l_final = [results[5], results[6]]
+            for mt in range_constexpr(2):
+                ot = frag_O[None, None, mt]
+                ot.store(ot.load() * (fx.Float32(1.0) / l_final[mt]))
 
         # O: f32 -> bf16 -> global(每 wave 写自己的 32 行;_cvt_f32_to_bf16 省 RNE+NaN 指令)
         frag_Ob = _cvt_f32_to_bf16(frag_O)
@@ -279,15 +349,25 @@ def build(M, N, D, BM, BN, klds_mode="gpermswz"):
 
     @flyc.jit
     def launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, stream: fx.Stream):
-        attn_kernel(Q, K, V, O).launch(grid=(M // BM, 1, 1), block=(NT, 1, 1), stream=stream)
+        attn_kernel(Q, K, V, O).launch(grid=(M // BM, H, 1), block=(NT, 1, 1), stream=stream)
 
     return launch
 
 
-def torch_ref(Q, K, V):
-    """torch bf16 参考: S=Q@K^T 舍入到 bf16, 再 O=S@V 舍入到 bf16(与 kernel 数值路径一致)。"""
-    S = (Q @ K.transpose(0, 1)).to(torch.bfloat16)  # bf16 matmul, f32 内部累加
-    O = (S @ V).to(torch.bfloat16)
+def torch_ref(Q, K, V, causal=False, softmax=True):
+    """完整 MHA 参考(多头):Q/K/V = [H,M,D]/[H,N,D]/[H,N,D],O = softmax(Q@K^T/sqrt(D))@V。
+    softmax=False 时退化为 (Q@K^T)@V(不 scale),用于阶段A 单独验证多头布线。"""
+    S = torch.einsum("hmd,hnd->hmn", Q.float(), K.float())  # [H,M,N] f32
+    if softmax:
+        S = S * (1.0 / (Q.shape[-1] ** 0.5))
+        if causal:
+            Mq, Nk = S.shape[-2:]
+            mask = torch.arange(Nk)[None, :] > (torch.arange(Mq)[:, None] + (Nk - Mq))
+            S = S.masked_fill(mask[None], float("-inf"))
+        P = torch.softmax(S, dim=-1)  # softmax over N(KV),f32
+    else:
+        P = S  # 阶段A:无 softmax、无 scale
+    O = torch.einsum("hmn,hnd->hmd", P.to(torch.bfloat16).float(), V.float()).to(torch.bfloat16)
     return S, O
 
 
@@ -295,77 +375,71 @@ def main():
     torch.manual_seed(0)
     torch.set_default_device("cuda")
 
-
-    # 实际使用的layout:  ``K = [NumBlocks, NumKVHeads, HeadDim / kVectorSize, PageSize, kVectorSize]`` and
-    #   ``V = [NumBlocks, NumKVHeads, PageSize / kVectorSize, HeadDim, kVectorSize]``.
-
-    M, N, D = 8192, 8192, 128
-    # BN=32 + K LDS 双缓冲:VGPR 190(<256, 2 waves/SIMD),双缓冲藏 K LDS 读延迟 -> 229.8 TFLOPS。
-    # (BN=64 单缓冲=183;BN=64 双缓冲 VGPR 265->1 wave 反而慢;BN=32 才有双缓冲的寄存器预算。)
+    # multi-head flash MHA(kernel 内含在线 softmax);non-causal。H/MULT 可用环境变量扫尺寸。
+    H = int(os.environ.get("H", "8"))
     BM, BN = 128, 32
-    M, N, D = BM * 80 * 4, BM * 80 * 4, 128
+    _mult = int(os.environ.get("MULT", "16"))
+    M, N, D = BM * _mult, BM * _mult, 128  # 每 head M=N=BM*MULT(默认 2048)
 
-    Q = torch.randn(M, D, dtype=torch.bfloat16)
-    K = torch.randn(N, D, dtype=torch.bfloat16)
-    V = torch.randn(N, D, dtype=torch.bfloat16)
-    # 方案A: 预 shuffle V 成 paged 布局 [N//8, D, 8];torch_ref 仍用原始 V
-    V_shuf = V.reshape(N // 8, 8, D).permute(0, 2, 1).contiguous()
+    Q = torch.randn(H, M, D, dtype=torch.bfloat16)
+    K = torch.randn(H, N, D, dtype=torch.bfloat16)
+    V = torch.randn(H, N, D, dtype=torch.bfloat16)
+    # 预 shuffle V 成 paged 布局 [H, N//8, D, 8];torch_ref 仍用原始 V
+    V_shuf = V.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous()
 
     stream = torch.cuda.current_stream()
-    o_fly = torch.empty(M, D, dtype=torch.bfloat16)
+    o_fly = torch.empty(H, M, D, dtype=torch.bfloat16)
     args = (Q, K, V_shuf, o_fly, stream)
 
-    # KLDS 环境变量选布局:"gpermswz"(默认, 266.0 TFLOPS @M=N=40960, 2.24x)/ "swz"(v12 路径, 此结构下=219.6)
-    _klds_mode = os.environ.get("KLDS", "gpermswz")
-    print(f"[cfg] klds_mode={_klds_mode}")
+    _softmax = os.environ.get("SOFTMAX", "1") == "1"  # 编译时开关:0=无 softmax 纯双 GEMM(应 ~260T)
+    print(f"[cfg] H={H} M={M} N={N} D={D} softmax={_softmax}")
 
-    # flyc.compile 编译并缓存:首次编译 + 执行一次(填充 o_fly),返回快速派发 callable
-    compiled = fly_compiled((M, N, D, BM, BN, _klds_mode), lambda: build(M, N, D, BM, BN, klds_mode=_klds_mode), args)
+    compiled = fly_compiled(
+        (M, N, D, BM, BN, H, _softmax),
+        lambda: build(M, N, D, BM, BN, H=H, softmax=_softmax),
+        args,
+    )
     torch.cuda.synchronize()
 
     # ---- 精度 ----
-    _, o_ref = torch_ref(Q, K, V)
+    _, o_ref = torch_ref(Q, K, V, softmax=_softmax)
     diff = (o_fly.float() - o_ref.float()).abs()
     rel = diff.norm() / o_ref.float().norm().clamp_min(1e-6)
     print(f"[acc] max_abs={diff.max().item():.4f} mean_abs={diff.mean().item():.5f} rel_l2={rel.item():.5f}")
 
-    # ---- 性能:多 buffer 轮换避免 L2 命中 + cudaPerf 计时(参考 tests/contrib/moe/test_moe.py)----
+    # ---- 性能:多 buffer 轮换 + cudaPerf 计时 ----
     from pyhip import cudaPerf
 
-    flops = 4 * M * N * D  # gemm1 + gemm2, 各 2*M*N*D
-    mem_bytes = (Q.numel() + K.numel() + V_shuf.numel() + o_fly.numel()) * 2  # bf16 读写
+    flops = H * 4 * M * N * D  # 每 head gemm1+gemm2 各 2*M*N*D
+    mem_bytes = (Q.numel() + K.numel() + V_shuf.numel() + o_fly.numel()) * 2
 
-    # 轮换 BUF_COPY 组输入:每次计时读不同显存 -> L2 冷 -> 测真实 HBM(而非 L2 命中的虚高)
-    BUF_COPY = 60
-    Qs = [torch.randn(M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    Ks = [torch.randn(N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    Vs = [torch.randn(N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    V_shufs = [v.reshape(N // 8, 8, D).permute(0, 2, 1).contiguous() for v in Vs]
-    o_flys = [torch.empty(M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
+    BUF_COPY = 10
+    Qs = [torch.randn(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
+    Ks = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
+    Vs = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
+    V_shufs = [v.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous() for v in Vs]
+    o_flys = [torch.empty(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
 
     run_count = 50
 
     def perf(fn, name):
-        for _ in range(10):  # warmup(稳频)
+        for _ in range(10):  # warmup
             fn(0)
         torch.cuda.synchronize()
         tfs, uss = [], []
         i = 0
         for _ in range(run_count):
-            # cudaPerf: 进入时 GPU sleep 掩盖 host 派发,再用 CUDA event 计 kernel 时间
             with cudaPerf(flops, mem_bytes, name=name, verbose=0) as p:
                 fn(i)
-            i = (i + 1) % BUF_COPY  # 轮换 buffer
+            i = (i + 1) % BUF_COPY
             tfs.append(p.tflops())
             uss.append(p.dt() * 1e6)
         tfs.sort()
         uss.sort()
-        return uss[run_count // 2], tfs[run_count // 2]  # 中位数
+        return uss[run_count // 2], tfs[run_count // 2]
 
     us_fly, tf_fly = perf(lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream), "attn_fly")
-    us_ref, tf_ref = perf(lambda i: torch_ref(Qs[i], Ks[i], Vs[i]), "attn_torch")
     print(f"[perf] fly  : {us_fly:8.1f} us  {tf_fly:7.1f} TFLOPS  ({mem_bytes / us_fly / 1e3:.0f} GB/s)")
-    print(f"[perf] torch: {us_ref:8.1f} us  {tf_ref:7.1f} TFLOPS")
 
 
 if __name__ == "__main__":

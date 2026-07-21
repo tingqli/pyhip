@@ -385,6 +385,150 @@ frag_K]`)。GEMM1 于是直接用已就绪的 `frag_K`,LDS 读延迟被上一步
 > 注意 `KLDS=swz`(20480=168 / 40960=219.6)因 perm_M+frag_K 撑爆寄存器而慢于 gpermswz;干净 v12 的 swz 才是 229.8。
 
 
+## 13. 完整 MHA:multi-head + flash softmax
+
+在 v13(266 TFLOPS 无 softmax 双 GEMM)之上加完整的多头注意力(non-causal)。分两阶段落地:
+
+### 阶段 A — multi-head 布线
+
+- `build(..., H)` 加 head 维;`launch` grid `(M//BM, H, 1)`,`h = block_idx.y`。
+- 每 head 的 Q/K/V/O 按 head 偏移基址:**用 `fx.make_view(fx.get_iter(X_) + off, layout)`**(`qo_off=h*M*D`,
+  `kv_off=h*N*D`)。**坑:`fx.Tensor(view)[h]` 返回标量元素,不是 head 子视图**——必须用 iter 偏移。
+- `_make_ktiles(..., koff)` / `v_g` / `v_fake` 内部都 `get_iter(X_) + koff`。
+- 验证:8 头无 softmax vs `(Q@K^T)@V` 逐头参考,rel_l2 = **0.00012**。
+
+### 阶段 B — 在线 flash softmax
+
+GEMM1 出 `frag_St`(= S^T[Nk, Mq],C 累加器 3 mode `((4 Nk),(2 Nk-tile),(2 Mq-tile))`)后,register trick 前插在线 softmax:
+
+```python
+for mt in range_constexpr(2):                 # 按 Mq-tile 切片(mode2)
+    v    = frag_St[None, None, mt].load() * sm_scale   # 该 Mq-tile 的 8 个 Nk
+    tmax = v.reduce("max")                     # lane 内 8 Nk 求 max(v_max3 链)
+    for sh in (16, 32):                        # 跨 lane:合并 l//16 的 4 行组
+        tmax = _maxnumf(tmax, tmax.shuffle_xor(sh, 64))
+    nm   = _maxnumf(m[mt], tmax)               # 新 running max
+    corr = _exp2_amdgcn((m[mt] - nm) * LOG2E)  # 旧统计的校正因子
+    p    = _exp2_vec_amdgcn((v - nm) * LOG2E)  # P^T 片段(exp2 用 amdgcn 单 v_exp_f32)
+    ts   = p.reduce("add") + 跨lane(16,32)     # tile 内 P 求和
+    l[mt] = l[mt]*corr + ts;  m[mt] = nm
+    frag_St[None,None,mt].store(p)             # 就地覆盖 frag_St = P,复用原 register trick
+frag_O[None,None,mt] *= corr                    # GEMM2 累加前 rescale 旧 O
+# 循环携带 m0,m1,l0,l1;epilogue: frag_O[None,None,mt] *= 1/l_final[mt]
+```
+
+- **`m`/`l` 循环携带**(每 lane 2 个 Mq-tile 标量,冗余存 4 行组);`frag_O` 与 `frag_St` 共享 Mq=col 结构,
+  所以 correction 按 Mq-tile 正确广播到 `frag_O` 的 D 元素。
+- **exp2 用 `llvm.amdgcn.exp2.f32`**(单 `v_exp_f32`,省 OCML 的 `v_ldexp`);指数 ≤ 0 在 fast-range,安全。
+  相比 `.exp2()`(OCML):2048 尺寸 98.9 → 119.6 TFLOPS(+21%),精度不变。
+- 精度:rel_l2 = **0.00311**(bf16 attention 正常范围),多尺寸一致。
+
+### 性能(空闲 GPU,cudaPerf CUDA-event 计时)
+
+| 配置 | per-head M=N | TFLOPS | 备注 |
+|---|---|---:|---|
+| H=8 | 8192 | 150 | |
+| **H=8** | **16384** | **~164** | **最佳(3 次 156/164/164)** |
+| H=4 | 20480 | 162 | |
+| H=1 | 40960 | 160 | 单头,直接对比无 softmax 266 |
+| H=8 | 20480 | 143 | 超长跑降频 |
+
+- 好尺寸 plateau **160–164 TFLOPS**;vs 无 softmax 266@40960 → softmax 约 **−38%**。
+- VGPR **204 → 247**(m/l 携带 + exp 中间量),但 `512/247 = 2 waves/SIMD` **occupancy 仍保住**,无 spill,LDS 16KB。
+
+### 跨-lane reduce 的硬件约束(为何仍是 ds_swizzle/ds_bpermute)
+
+softmax 的跨-lane 归约是**列向的跨-row all-reduce**:`frag_St` 的 C 布局里 Nk = `4*(l//16)+reg`(行组),
+Mq = `l%16`(列)。over Nk 归约 = 合并 4 个行组(l//16),即 `xor 16` + `xor 32`。当前分别降为
+`ds_swizzle_b32 SWAP,16`(xor16,32-lane 组内)和 `ds_bpermute_b32`(xor32,跨 32-lane)。
+
+**gfx942(CDNA3)无法用 DPP 消掉它们**:
+- `permlane16` / `v_permlanex16` / `row_xmask` DPP 都是 `isGFX10Plus`(RDNA)特性,CDNA3 没有。
+- DPP row 操作只在 **16-lane 行内**(offset 1/2/4/8);`row_bcast:15/31` 是**单 lane 广播**,会混掉不同 Mq 列,
+  不能做列向归约。
+- 因此 gfx942 上寄存器级的列向跨-row 归约无 DPP 通路;LDS(ds_swizzle/ds_bpermute)或 readlane/writelane 是仅有选项。
+
+**要彻底去掉 ds 归约,只能让归约变成行内(intra-row)**:即 GEMM1 改算 S[Mq, Nk](Nk 成为列 `l%16`)→ over Nk
+= 行内 DPP(xor 1/2/4/8)。但这要求 GEMM2 也转置成 O[Mq,D](A=S、B=V),连带改 V 的 B-operand 布局与 O 的存出
+(丢掉当前 O^T 的 64-bit 连续写)。属整核重构,权衡:去掉热循环里每步的 ds 归约 vs. V/O 通路重写 + 存出可能变散。
+
+**但实测证明不值得**:临时去掉两句 `shuffle_xor`(perf probe,结果故意算错只测速),H=8/8192 同会话同 GPU 对比:
+
+| 版本 | rel_l2 | TFLOPS |
+|---|---|---:|
+| baseline(有 ds 归约) | 0.00311(正确) | 150.5 |
+| probe(去掉 ds 归约) | 错(仅测速) | 151.1 |
+
+**差 +0.4%** ——`ds_swizzle`/`ds_bpermute` 已被 MFMA 流水完全掩盖,**不是瓶颈**;而且 gfx942 上 DPP 也做不了列向跨-row
+归约(`dpp_xor_f32` 只有 1/2/4/8,够不到 xor16/32)。所以 DPP 重构对本核**无收益**,不做。
+softmax 的 −38% 开销来自别处:VGPR 204→247(挤压调度)、`v_exp_f32`、以及在线 softmax 的 `v_pk_mul`/`v_sub`/`v_add`
+(缩放/correction/rescale)占用 VALU 发射槽 —— 优化要往**压 VGPR / 减 VALU / 调度**方向,而非跨-lane 归约。
+
+### VALU 优化 1:LOG2E 折进缩放(+6.6%)
+
+既然 softmax 是 VALU-bound,先砍 `* LOG2E`。指数 `(S·sm_scale − m)·LOG2E = S·(sm_scale·LOG2E) − m·LOG2E`。
+定义 `sm_scale_log2 = sm_scale * LOG2E`,开头就用它缩放(`v = S * sm_scale_log2`,把 `m` 也带进 log2 域):
+
+```python
+sm_scale_log2 = float(sm_scale * LOG2E)     # build 内
+corr[mt] = _exp2_amdgcn(m_in[mt] - nm)      # 免标量 *LOG2E
+p        = _exp2_vec_amdgcn(v - nm)          # 免逐元素(8 Nk)*LOG2E
+```
+
+`m` 只用于差值(corr/p)、`l` 是 exp 之和、`O/=l` 不变,放 log2 域完全等价。消掉每 kv-step 的 8 个
+`v_pk_mul`(向量 *LOG2E)+ 2 个标量 *LOG2E。**H=8/8192:150.5 → 160.4 TFLOPS(+6.6%),rel_l2 不变 0.00311**
+(3× 稳定);单头 40960 = 160 → 164.4。对比去 ds 的 +0.4%,坐实了“softmax 是 VALU-bound”。
+
+> 注:large-size(16384/20480)在共享机上连续跑会热降频(同一配置多次跑递减),短跑的 8192(~1.7ms)才稳定可信。
+
+### 回退的尝试(均为负优化)
+
+下面两个"减 VALU/VGPR"的直觉改动**实测变慢**,已回退(请勿重试):
+- **合并 O-rescale 进 softmax 循环**(`frag_O *= corr` 从独立循环挪到主循环内、corr 即用即弃):同 GPU
+  156.0→152.4(−2~5%)。指令数不变,纯因重排——**独立的 rescale 循环反而调度更好**(编译器把 32 个
+  `v_pk_mul` 批量与 MFMA 重叠;交织进 exp/reduce 依赖链反而上关键路径)。
+- **预缩放 Q**(`frag_Q *= sm_scale_log2` 一次,免循环内 `v=S*scale`):158.5(−)且 rel_l2 0.00311→0.00358
+  (bf16 乘常数掉精度)。且初始 `v=S*scale` 那批 mul 也被 MFMA 掩盖,去掉不帮忙。
+
+**经验**:此核对指令顺序极敏感、已被编译器排得很好;只有**减关键路径上的 VALU**(如 LOG2E 折入 exp 前的乘法)才有效,
+而重排/搬动那些已被 MFMA 掩盖的 VALU 反而打乱调度。VGPR 247 仍 2 waves(512/247),降到 ≤170 才能 3 waves,softmax 微调达不到。
+
+### Profile 总结 + FA3/scheduler 结论
+
+ISA 指令统计(LOG2E-fold 版,VGPR 238;每轮循环 = 2 kv-step):
+
+| 指令 | 数 | 归属 |
+|---|---:|---|
+| `v_mfma_16x16x16_bf16` | 128 | 计算(有效功) |
+| `v_pk_mul_f32` | 99 | **O-rescale ~64** + scale ~16 |
+| `v_perm_b32` | 48 | register trick + O 存出 |
+| `v_exp_f32` | 36 | softmax exp |
+| `v_sub_f32` | 36 | v−nm, m−nm |
+| `ds_swizzle+ds_bpermute` | 16 | 跨-lane 归约(已确认被 MFMA 掩盖) |
+
+- **VALU-bound**:128 MFMA vs ~300 VALU/轮;最大 VALU 是 **O-rescale(64 v_pk_mul)**,其次 exp(36),二者均为 online softmax 固有,难降。
+- **hot_loop_scheduler 无效(实测)**:`SCHED=0`(编译器默认)vs `SCHED=1`(手工)= 156.5 完全相同。无 softmax 时手工调度把 GEMM 从初值抬到 266;softmax 后瓶颈变 VALU 吞吐,mfma 调度 hint 不再起作用。
+- **FA3 不适用**:FA3 核心(异步/warp-specialization/wgmma/FP8)是 Hopper 专属,CDNA3 无对应硬件;可迁移的"softmax-VALU 与 MFMA overlap"被 register-trick(GEMM1→softmax→GEMM2 硬依赖)+ `gpu.barrier`(串行化 kv-step)挡住,且本核 mfma 不是瓶颈(overlap GEMM 无益);FA3-FP8 只降 mfma、反而更 VALU-bound。
+- **结论**:softmax 核 156~164 TFLOPS 已接近此在线-softmax 公式在 CDNA3 的 **VALU roofline**;本轮净胜 = LOG2E 折叠(+6.6%)。唯一(高风险)剩余杠杆:用 LDS 承载 S 替 register-trick,卸掉 48 perm+32 add 的 VALU(代价:加 LDS 流量,收益不确定)。
+
+### 编译时 softmax 开关
+
+`build(..., softmax=True)`(环境变量 `SOFTMAX`,默认 1)。关闭时退化为纯双 GEMM(`S@V`,无 softmax/scale),用于对照无 softmax 基线。
+
+- **必须用 `if const_expr(softmax):`**,不能用裸 `if softmax:`——FlyDSL `@flyc.kernel` 里裸 `if` 被当运行时分支,内部赋值不传播(报 `UnboundLocalError: m0`)。共 5 处:kv_step 的 softmax 块、`loop_init`、state 解包、`yield_vals`、epilogue;loop-carried/yield/epilogue 全部按 `softmax` 条件化(关闭时只 carry `[frag_O, frag_ldK, frag_K]`,不带 `m/l`)。
+- 关闭时是纯编译期分支,**零** softmax 指令,精确回到 266 基线路径。
+- 验证:`SOFTMAX=1` @8192 = 160.6(rel_l2 0.00311);`SOFTMAX=0` @8192 = 250.1 / **@40960 = 265.2**(rel_l2 0.00023)。
+
+同尺寸(H=1, M=N=40960)直接对比 softmax 开销:
+
+| 模式 | rel_l2 | TFLOPS | 相对 |
+|---|---|---:|---|
+| `SOFTMAX=0`(纯双 GEMM) | 0.00023 | 265.2 | 基线 |
+| `SOFTMAX=1`(flash softmax) | 0.00317 | 164.1 | **−38%** |
+
+softmax 开销 −38%,与 profile 结论一致(VALU-bound,O-rescale + exp 主导,已接近 CDNA3 上此在线-softmax 公式的 VALU roofline)。
+
+
 
 
 
