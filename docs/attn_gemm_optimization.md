@@ -323,6 +323,65 @@ v12 之后瓶颈已均衡、无单一大头,且 kernel **死死卡在 2 waves/SI
 **天花板**:v12 = 229.8 TFLOPS 是当前结构在 2-wave VGPR 预算下的平台。再往上需要**根本上更省寄存器的
 结构**(如 FP8 K/V 减半带宽+VGPR)或换 MMA 指令(32×32×8),属大改、非增量。
 
+> **后续被 §12 推翻**:v12 不是终点。找到一个"省寄存器的等价变换"(把 perm_M 挪到全局 K)腾出预算后,
+> 就能继续上流水(K-prefetch),v13 达到 235 TFLOPS。见 §12。
+
+## 12. v13:突破天花板 —— perm_M 挪到全局 K + K-prefetch(235 TFLOPS)
+
+§11 判断 v12(229.8)是 2-wave VGPR 预算下的平台,任何"加寄存器的流水"都回退。**但按「先腾寄存器、再上流水」
+这条主线,v13 打破了天花板:235.8 TFLOPS(空闲 GPU 复测中位数,1.92x rocBLAS 122.7),rel_l2=0.00019,
+VGPR 216,2 waves/SIMD。** 三步缺一不可,`KLDS=gpermswz` 现为默认;`KLDS=swz` 走 v12 路径(在本文件的
+unroll+K-prefetch 结构下 =168,见下)。
+
+### v13a — perm_M 从 MMA 挪到全局 K(gpermswz):直接看是负优化,实为腾寄存器
+
+v12 的 perm_M(GEMM1 在 M=Nk 维加 k_perm)让 C 累加器每 lane 8 连续 Nk;它同时占着 MMA 的寄存器/寻址。
+v13a 把这个 Nk 重排**预先做进全局 K**:coop 读源按**正向** k_perm `make_layout((4,4,2):(D,8D,4D))` 重排,
+GEMM1 的 MMA **去掉 perm_M**(`make_tile(None, None, k_perm)`)。plain 读入 LDS 后,不加 perm_M 也能得到
+**同样的 8-连续-Nk C 布局**(N 方向已在全局 shuffle)→ register trick 与 GEMM2 **完全不变**,正确。
+
+- **单独看是负优化:197 < 230**。原因:(a) 全局 K 的 coop 读从连续变成嵌套 (4,4,2) 散读、合并度差;
+  (b) 去 perm_M 后 LDS 读退回 `ds_read_b128`(swizzle 只能部分去冲突),不如 v12 的 `ds_read2st64_b64`。
+- **但它腾出了 MMA 的寄存器预算**——这是后两步的关键铺垫。
+- 正确性坑:方向必须是**正向 k_perm**(用逆 `(4,2,4)` → rel_l2≈1.2);且**必须同时去掉 perm_M**
+  (只挪全局不去 perm_M = 双重 shuffle,也是 1.2)。
+
+### v13b — 循环展开 2 次
+
+每轮处理 2 个 kv,LDS stage 的 rd/wr 变编译期常量(0/1),消掉运行时 `kv%2`。展开本身不是收益点
+(单独在 v12 上展开 = 175 回退,VGPR 190→254;在 gpermswz 上 = 194),它是为 K-prefetch 铺路——
+静态 stage 让预取地址简单、`frag_ldK`/`frag_ldK_next` 做 coop ping-pong。
+
+### v13c — K 读做成 prefetch(关键收益)
+
+v12 的 K 读是 `coop → LDS 写 → barrier → LDS 读 → GEMM1` 串行,LDS 读延迟暴露在 GEMM1 前(v11 ATT 里这是
+#1 停顿 54.9%,v12 用双缓冲把 write+barrier 移出关键路径,但**读**仍在 GEMM1 前)。v13c 把 `LDS 读 → frag_K`
+从 GEMM1 **之前**移到 GEMM2+barrier **之后**:读 `k_lds[wr]`(刚写好且 barrier 过的 buffer)供**下一步**的
+GEMM1;prologue 先预取第一个 `frag_K`;**`frag_K` 变成第 3 个 loop-carried 值**(`init=[frag_O, frag_ldK,
+frag_K]`)。GEMM1 于是直接用已就绪的 `frag_K`,LDS 读延迟被上一步的 GEMM2 掩盖。→ **197 → 235.8**。
+
+### 核心洞见:先砍寄存器,再上流水
+
+- K-prefetch 单独加在 **swz** 上 = **168**(回退):swz 的 perm_M 还占着寄存器,多携带 `frag_K` 撑爆调度。
+- **gpermswz 去了 perm_M → 216 VGPR 仍 2 waves → 装得下 `frag_K` + 流水 → 235.8。**
+- 所以**把 perm_M 挪到全局的真正价值不是直接提速**(那步 197 反而更慢),而是**腾出寄存器,让下游的
+  K-prefetch 流水成为可能**。这和 §11 里 v11→v12(先 BN=32 砍 VGPR 才装得下 K 双缓冲)是**同一条主线**:
+  在 2-wave VGPR 预算下,任何"加寄存器的流水"都必须先在别处**省出等量寄存器**。
+- **修正 §11 的"天花板":** v12 不是终点。只要能找到"省寄存器的等价变换",就能继续叠流水。下一步方向:
+  把全局 K 的嵌套散读变回连续合并(host 侧物理预 shuffle K),或对 V 也做同样的 prefetch。
+
+| 版本 | 方法 | TFLOPS | VGPR |
+|---|---|---:|---:|
+| v12 | swz(perm_M 在 MMA + K LDS 双缓冲,干净 v12) | 229.8 | 190 |
+| v13a | + perm_M 挪全局 K(gpermswz) | 197 | — |
+| v13b | + 展开 2 次 | 194 | — |
+| **v13c** | **+ K-prefetch(= 当前默认 `gpermswz`)** | **235.8** | 216 |
+| 参照 | 当前文件 `KLDS=swz`(v13 结构但 perm_M 在 MMA) | 168 | — |
+
+> 数据为空闲 GPU 复测中位数(cudaPerf 多 buffer 轮换,M=N=20480);torch(rocBLAS)= 122.7 → **1.92x**。
+> 注意 `KLDS=swz` 在 v13 的 unroll+K-prefetch 结构下 =168(perm_M + frag_K 撑爆寄存器);干净 v12 的 swz 才是 229.8。
+
+
 
 
 

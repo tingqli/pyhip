@@ -74,9 +74,37 @@ def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
     vm_hi = (vmcnt >> 4) & 0x3
     return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
 
-def build(M, N, D, BM, BN):
-    """构造融合 attention kernel(无 softmax, register-resident S),返回 launch 包装。"""
+
+def _make_klds_view(ptr, BN, D):
+    """K LDS 视图 [2,BN,D](D 连续,stage 偏移 BN*D):SwizzleType(3,3,3) 组合行主序去 bank 冲突
+    -> K 读 ds_read2st64_b64。swz(默认=v12)与 gpermswz 共用此 LDS 布局。"""
+    base = fx.make_layout((2, BN, D), (BN * D, D, 1))
+    swz = fx.SwizzleType.get(3, 3, 3)
+    return fx.make_view(ptr, fx.make_composed_layout(fx.static(swz), base))
+
+
+def _make_ktiles(K_, Kb, N, D, BN, mode):
+    """K coop 读源 tile [BN,D,N//BN,1]。mode="gpermswz":把 perm_M 施加在全局 K cache 而非 MMA:
+    每 tile 内 Nk 按正向 k_perm (4,4,2):(D,8D,4D) 重排 -> plain 读入 LDS 后,GEMM1 不加 perm_M 也能
+    得到相同的 8-连续-Nk C 布局(N 方向已 shuffle)。否则自然 flat_divide。假设 BN=32。"""
+    if mode == "gpermswz":
+        return fx.rocdl.make_buffer_tensor(
+            fx.make_view(
+                fx.get_iter(K_),
+                fx.make_layout(((4, 4, 2), D, N // BN, 1), ((D, 8 * D, 4 * D), 1, BN * D, 0)),
+            ),
+            max_size=False,
+        )
+    return fx.flat_divide(Kb, fx.make_tile(BN, D))
+
+def build(M, N, D, BM, BN, klds_mode="gpermswz"):
+    """构造融合 attention kernel(无 softmax, register-resident S),返回 launch 包装。
+
+    klds_mode: "gpermswz"(默认, perm_M 挪全局 K + 展开2x + K-prefetch, 235.8/1.92x)/
+               "swz"(perm_M 在 MMA=v12 路径;本文件的 unroll+K-prefetch 结构下 =168)。
+    """
     assert BM % 32 == 0 and BN % 16 == 0 and D % 16 == 0 and N % BN == 0 and M % BM == 0
+    assert (N // BN) % 2 == 0, "KV tile 数需为偶数(循环展开 2 次)"
     WAVES = BM // 32                    # 每 wave 负责 32 行 query
     NT = WAVES * 64                     # 线程数
     VECN = 128 // fx.BFloat16.width     # 协作加载向量宽度(8 bf16 = 128b)
@@ -98,14 +126,16 @@ def build(M, N, D, BM, BN):
         Ob = fx.rocdl.make_buffer_tensor(O, max_size=False)
 
         q_tile = fx.flat_divide(Qb, fx.make_tile(BM, D))[None, None, bm, 0]  # [BM, D]
-        k_tiles = fx.flat_divide(Kb, fx.make_tile(BN, D))                    # [BN, D, N//BN, 1]
+        k_tiles = _make_ktiles(K_, Kb, N, D, BN, klds_mode)                  # [BN, D, N//BN, 1](gpermswz=全局重排)
         o_tile = fx.flat_divide(Ob, fx.make_tile(D, BM))[None, None, 0, bm]  # [D, BM] = O^T tile
 
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
         k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
+        # gpermswz: perm_M 挪到全局 K(_make_ktiles) -> MMA 不再加 perm_M(N 方向已 shuffle);否则 perm_M=k_perm
+        _pm = None if klds_mode == "gpermswz" else k_perm
         # GEMM1 = K@Q^T: wave 沿 query-M(MFMA 的 N 维)-> (1,WAVES,1);K 维(D)加 k_perm -> K 128-bit;
-        # M 维(Nk)也加 perm_M=k_perm -> C 累加器 frag_St 每 lane 8 连续 Nk(对齐 GEMM2 的 k_perm A)
-        tmma1 = fx.make_tiled_mma(mma, fx.make_layout((1, WAVES, 1), (1, 1, 0)), fx.make_tile(k_perm, None, k_perm))
+        # M 维(Nk)加 perm_M -> C 累加器 frag_St 每 lane 8 连续 Nk(对齐 GEMM2 的 k_perm A)
+        tmma1 = fx.make_tiled_mma(mma, fx.make_layout((1, WAVES, 1), (1, 1, 0)), fx.make_tile(_pm, None, k_perm))
         # GEMM2 = (S@V)^T = V^T@S^T:交换 A/B -> C=O^T[D,Mq];wave 沿 query-M(现为 N 维)-> (1,WAVES,1);
         # K 维(Nk)加 k_perm -> A(V^T)每 lane 8 Nk -> 128-bit;C 累加器 4/lane 沿 D 连续 -> O 64-bit 写出
         tmma2 = fx.make_tiled_mma(mma, fx.make_layout((1, WAVES, 1), (1, 1, 0)), fx.make_tile(None, None, k_perm))
@@ -125,9 +155,8 @@ def build(M, N, D, BM, BN):
             k_lds: fx.Array[fx.BFloat16, 2 * BN * D, 16]
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        swz = fx.SwizzleType.get(3, 3, 3)  # K LDS bank 去冲突(bf16);(3,3,3) 实测最优
-        # 双缓冲视图 [2, BN, D];stage 偏移 BN*D 是 swizzle period(512)整数倍 -> 两 buffer swz 一致
-        k_lds2 = fx.make_view(lds.k_lds.ptr, fx.make_composed_layout(fx.static(swz), fx.make_layout((2, BN, D), (BN * D, D, 1))))
+        # K LDS 视图:swizzle(3,3,3) 去 bank 冲突(swz 默认 / gpermswz 共用)
+        k_lds2 = _make_klds_view(lds.k_lds.ptr, BN, D)
         # V 直读 paged global 读源:每 kv-tile [D,(8,NB)], v(8) inner(stride 1)-> 128-bit buffer_load(不经 LDS)
         v_g = fx.rocdl.make_buffer_tensor(
             fx.make_view(fx.get_iter(V_), fx.make_layout((D, (8, NB), N // BN), (8, (1, D * 8), BN * D))),
@@ -176,34 +205,72 @@ def build(M, N, D, BM, BN):
         frag_ldK_next = fx.make_fragment_like(coop_g.partition_S(k_tiles[None, None, 0, 0]))  # coop 预取 K(kv+2)
         frag_V = thr2.make_fragment_A(v_fake)                                               # V 直读 -> frag_V
 
-        _encode_waitcnt(vmcnt=0)
-        rocdl.sched_barrier(0)
-        for kv, state in range(fx.Index(0), fx.Index(N // BN), fx.Index(1), init=[acc_init, kcar_init]):
-            frag_O.store(state[0])
-            frag_ldK.store(state[1])  # 恢复 frag_ldK = K(kv+1) coop 数据
-            kv_i = fx.Int32(kv)
-            rd = kv_i % 2          # 本轮读 k_lds[rd](上一轮写好,barrier 已过)
-            wr = (kv_i + 1) % 2    # 本轮写 K(kv+1) 到 k_lds[wr](供下一轮读)
+        def hot_loop_scheduler():
+            # Fixed interleave: each buffer_load(vmem)+4 mfma; each ds_read(dsrd)+1 mfma;
+            # each ds_write(dswr)+2 mfma (dsrd before dswr); then the remaining mfma.
+            # mfma_cnt = 2 * mfma_per_gemm
+            # n_vmem = mem_a_cnt + 2 * mem_b_cnt  # A g2r + B gate/up g2r (buffer_load)
+            # n_dswr = mem_a_cnt  # A staging -> LDS store (ds_write)
+            # n_dsrd = lds_a_cnt  # A LDS -> register full tile (ds_read)
+            used = 0
+            # rocdl.sched_dsrd(2)
+            # for _ in range_constexpr(n_vmem):
+            #     rocdl.sched_dsrd(1)
+            #     rocdl.sched_vmem(1)
+            #     rocdl.sched_mfma(2)
+            #     rocdl.sched_dsrd(1)
+            #     rocdl.sched_mfma(2)
+            #     used += 4
+            # for _ in range_constexpr(n_dsrd - 2 * n_vmem - 2):
+            #     rocdl.sched_dsrd(1)
+            #     rocdl.sched_mfma(1)
+            #     used += 1
+            # if const_expr(mfma_cnt - n_dswr * 2 - used > 0):
+            #     rocdl.sched_mfma(mfma_cnt - n_dswr * 2 - used)
+            # for _ in range_constexpr(n_dswr):
+            #     rocdl.sched_dswr(1)
+            #     rocdl.sched_mfma(2)
+            #     used += 2
+            # if const_expr(mfma_cnt - used > 0):
+            #     rocdl.sched_mfma(mfma_cnt - used)
+            rocdl.sched_barrier(0)
 
-            # (双缓冲)读 K(kv) from k_lds[rd] -> frag_K -> GEMM1 = K@Q^T(write/barrier 不在关键路径)
-            fx.copy(cp_kr, tcK.partition_S(k_lds2[rd, None, None]), tcK.retile(frag_K))
+        # 展开 2 次:偶/奇两步 LDS stage(wr)变编译期常量,消掉 kv%2;fragment 全部复用
+        # K 读做成 prefetch:frag_K 在上一步 GEMM2 之后就读好,GEMM1 直接用(藏 LDS 读延迟)
+        def kv_step(kv_i, wr, ld_cur, ld_next):
+            # V 直读 paged global -> frag_V
+            fx.copy(cp_vg, tcV.partition_S(v_g[None, None, kv_i]), tcV.retile(frag_V))
+            # GEMM1 = K@Q^T(frag_K 已在上一步/prologue prefetch)
             frag_St.fill(0)
             fx.gemm(mma, frag_St, frag_K, frag_Q, frag_St)
-
-            # register trick:GEMM2 转置后 S^T 直接作 B 操作数(C(S^T) 与 B(S^T) 布局一致)
+            fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 2, 0]), ld_next)
+            # register trick:S^T 直接作 GEMM2 的 B
             frag_Stb = _cvt_f32_to_bf16(frag_St)  # add-0x8000 舍入,省 RNE+NaN 指令
             frag_Sb.store(fx.select(frag_Stb, [0, 2, 1]).load())
-
-            # (双缓冲)写 K(kv+1) -> k_lds[wr] + 预取 coop K(kv+2)(与下面 GEMM2 重叠)
-            fx.copy(cp_cs, frag_ldK, coop_s.partition_D(k_lds2[wr, None, None]))
-            fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 2, 0]), frag_ldK_next)
-
-            # V 直读 paged global -> frag_V -> GEMM2 = V^T @ S^T(与上面 K->LDS 写重叠)
-            fx.copy(cp_vg, tcV.partition_S(v_g[None, None, kv_i]), tcV.retile(frag_V))
+            # 写 K(kv+1)=ld_cur -> k_lds[wr] + 预取 coop K(kv+2) -> ld_next(与 GEMM2 重叠)
+            fx.copy(cp_cs, ld_cur, coop_s.partition_D(k_lds2[wr, None, None]))
             fx.gemm(mma, frag_O, frag_V, frag_Sb, frag_O)  # O^T = V^T @ S^T(交换 A/B)
-            gpu.barrier()  # k_lds[wr] 写完可见 -> 下一轮读
+            gpu.barrier()  # k_lds[wr] 写完可见
+            # prefetch 下一步 K:读 k_lds[wr] -> frag_K(移到 GEMM2 之后,藏 LDS 读延迟)
+            fx.copy(cp_kr, tcK.partition_S(k_lds2[wr, None, None]), tcK.retile(frag_K))
+            rocdl.sched_barrier(0)
 
-            results = yield [frag_O.load(), frag_ldK_next.load()]
+        # prologue:prefetch 第一个 frag_K = k_lds[0]
+        fx.copy(cp_kr, tcK.partition_S(k_lds2[0, None, None]), tcK.retile(frag_K))
+        fragK_init = frag_K.load()
+
+        _encode_waitcnt(vmcnt=0)
+        rocdl.sched_barrier(0)
+        # 每轮处理 2 个 kv(偶=2*kv, 奇=2*kv+1);frag_ldK/frag_ldK_next 做 coop ping-pong;frag_K 携带 prefetch
+        for kv, state in range(fx.Index(0), fx.Index(N // BN // 2), fx.Index(1), init=[acc_init, kcar_init, fragK_init]):
+            frag_O.store(state[0])
+            frag_ldK.store(state[1])  # 恢复 frag_ldK = K(2*kv+1) coop 数据
+            frag_K.store(state[2])    # 恢复上一步 prefetch 的 frag_K = K(2*kv)
+            kv0 = fx.Int32(kv) * 2
+            kv_step(kv0, 1, frag_ldK, frag_ldK_next)      # 偶:写 k_lds[1],prefetch 读 k_lds[1]
+            kv_step(kv0 + 1, 0, frag_ldK_next, frag_ldK)  # 奇:写 k_lds[0],prefetch 读 k_lds[0]
+
+            results = yield [frag_O.load(), frag_ldK.load(), frag_K.load()]  # frag_K = K(2*kv+2)
         frag_O.store(results[0])
 
         # O: f32 -> bf16 -> global(每 wave 写自己的 32 行;_cvt_f32_to_bf16 省 RNE+NaN 指令)
@@ -249,8 +316,12 @@ def main():
     o_fly = torch.empty(M, D, dtype=torch.bfloat16)
     args = (Q, K, V_shuf, o_fly, stream)
 
+    # KLDS 环境变量选布局:"gpermswz"(默认, perm_M 挪全局 K + K-prefetch, 235.8/1.92x)/ "swz"(v12 路径, 此结构下=168)
+    _klds_mode = os.environ.get("KLDS", "gpermswz")
+    print(f"[cfg] klds_mode={_klds_mode}")
+
     # flyc.compile 编译并缓存:首次编译 + 执行一次(填充 o_fly),返回快速派发 callable
-    compiled = fly_compiled((M, N, D, BM, BN), lambda: build(M, N, D, BM, BN), args)
+    compiled = fly_compiled((M, N, D, BM, BN, _klds_mode), lambda: build(M, N, D, BM, BN, klds_mode=_klds_mode), args)
     torch.cuda.synchronize()
 
     # ---- 精度 ----
