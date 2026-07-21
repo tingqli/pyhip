@@ -233,11 +233,11 @@ def run_perftest(kernel, *args, **kwargs):
 
         new_kwargs = {}
         for k,v in kwargs.items():
-            if isinstance(args[i], torch.Tensor):
-                new_kwargs[k] = args[i].clone()
-                copy_bytes += args[i].numel() * args[i].element_size()
+            if isinstance(v, torch.Tensor):
+                new_kwargs[k] = v.clone()
+                copy_bytes += v.numel() * v.element_size()
             else:
-                new_kwargs[k] = args[i]
+                new_kwargs[k] = v
         kwarg_copies.append(new_kwargs)
 
     # first run on original inputs to return the output, then run on copies for perf
