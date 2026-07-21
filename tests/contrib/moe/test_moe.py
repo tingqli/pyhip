@@ -380,9 +380,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
         elif kernel_type == 'fly_splitk_2s':
             from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
-            from pyhip.contrib.flydsl.moe_gemm_splitk import compile_sum as _moe_sum_compile
-            from pyhip.contrib.flydsl.moe_gemm_splitk import compile_sorted_sum as _moe_sorted_sum_compile
-            from pyhip.contrib.flydsl.moe_gemm_splitk import compile_invert_sorted_ids as _moe_invert_sorted_ids_compile
+            from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
+            from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             import flydsl.expr as fx
             import flydsl.compiler as flyc
             _TORCH_TO_FX = {
@@ -581,17 +580,14 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                         # sorted_ids[loc] => (b, topk)
                         # we need to build a reverse table: loc[B, TOPK] => loc
                         loc_ids = torch.zeros([B, TOPK], dtype=torch.int32, device=hidden_states.device)
-                        d_kwargs = (('TOPK', TOPK),)
-                        _fly_dispatch(
-                            d_kwargs, lambda: _moe_invert_sorted_ids_compile(**dict(d_kwargs)),
-                            (_ptr(sorted_ids), _ptr(loc_ids), sorted_ids.shape[0], stream),
+                        # invert_sorted_ids 只扫描 [0, num_valid) 区域（边界在设备端读取，
+                        # 无需 host 同步）：sorted_ids 尾部 (>= num_valid) 未初始化，其垃圾值
+                        # 会把真实 token 错误映射到未写入的 gemm2_out 行，导致 sorted_sum
+                        # gather 出 NaN，所以必须传入 num_valid_ids 和 batch B。
+                        _moe_invert_sorted_ids(TOPK)(
+                            sorted_ids, loc_ids, num_valid_ids, sorted_ids.shape[0], B
                         )
-
-                        d_kwargs = (('TOPK', TOPK),('N', N2))
-                        _fly_dispatch(
-                            d_kwargs, lambda: _moe_sorted_sum_compile(**dict(d_kwargs)),
-                            (_ptr(loc_ids), _ptr(gemm2_out), _ptr(cur_out), B, stream),
-                        )
+                        _moe_sorted_sum(TOPK, N2)(loc_ids, gemm2_out, cur_out, B)
 
                         """
                         gemm2_out_r = torch.empty([B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device)
