@@ -11,6 +11,7 @@ __all__ = [
 def gemm_8wave_fp8bf16fp16(J,
                    AB_dtype, bpreshuffle,
                    use_f32_blockscales_128, # scale_BM,scale_BN,scale_BK = 1,128,128 
+                   use_ptpc,
                    wg_M, wg_N, N, K, 
                    pA:"void*", # [M, K]  torch.float8_e4m3fn   row-major
                    pB:"void*", # [N, K]  torch.float8_e4m3fn   row-major
@@ -23,7 +24,7 @@ def gemm_8wave_fp8bf16fp16(J,
     https://github.com/HazyResearch/HipKittens/blob/.../kernels/gemm/fp8fp32/FP8_8wave/8_wave.cu
     """
     rotate_mfma_C = 0
-
+    use_f32_blockscales_128 = False
     assert AB_dtype in ["fp8", "bf16", "fp16", "f16"]
     C_dtype = "bf16"
     M01 = 8
@@ -47,8 +48,8 @@ def gemm_8wave_fp8bf16fp16(J,
 
     assert N % wg_N == 0
     num_warps = 8
-    nbN = J.div(wg_N, 16)
-    nbM = J.div(wg_M, 16)
+    nbN = J.div(wg_N, 16) # 16
+    nbM = J.div(wg_M, 16) # 16
     nbK = 2 # 2 MFMA 16x16 
     buff_a = J.Buffer(pA, Mc * stride_k)
     buff_b = J.Buffer(pB, wg_N * stride_k)
@@ -77,8 +78,8 @@ def gemm_8wave_fp8bf16fp16(J,
     ldsB[1,0] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
     ldsB[1,1] = lds; lds += HALF_BLOCK_SIZE_COL * BLOCK_K
 
-    nrM = J.div(nbM, WARPS_ROW, 2) # 4
-    nrN = J.div(nbN, WARPS_COL, 2) # 2
+    nrM = J.div(nbM, WARPS_ROW, 2) # 4  16//2//2
+    nrN = J.div(nbN, WARPS_COL, 2) # 2  16//4//2
     nrK = nbK
 
     warp_m = J.gpr(J.warp_id[0] // WARPS_COL) # warp row: 0 to 1
@@ -376,7 +377,6 @@ def gemm_8wave_fp8bf16fp16(J,
 
         mfma_tail()
         J.s_waitcnt(mod="vmcnt(0)")
-
         with J.If(warp_m[0] == 0):
             J.s_barrier()
 
@@ -437,6 +437,75 @@ def gemm_8wave_fp8bf16fp16(J,
 
     stride_c = N * J.sizeof_bf16
 
+
+    if use_ptpc:
+        scale_A = J.gpr(2, nrM, "vf32")
+        scale_B = J.gpr(2, nrN, 4, "vf32",align=4)
+
+        #nrM = 4,
+        # mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
+        # mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")            # 2x[16,128]
+        # mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 4x[4,2]x[16,16]
+        if 1:
+            warp_thread = J.gpr("vu32")
+            warp_thread[0] = J.threadIdx.x[0] % 64
+            # load A scales
+            buff_sa = J.Buffer(pScaleA, M * J.sizeof_f32)
+            # 2 M slice * nrM
+            lane_m = J.gpr("vu32")
+            lane_m[0] = warp_thread[0] % 16 
+            voffset_m = J.gpr("vu32")
+            voffset_m[0] = (blk_m * wg_M + warp_m[0]*64 + lane_m[0]) * J.sizeof_f32
+            #[256, 256], m, n is 1K bytes.
+            m_offset12 = 0
+            for sid in range(2):
+                for m in range(nrM):
+                    buff_sa.load_dword(scale_A[sid,  m], voffset_m, 0, offset12=m_offset12)
+                    m_offset12 += 16 * J.sizeof_f32
+                m_offset12 = 128*J.sizeof_f32
+            # load B scales
+            # for i in range(2):
+            #     for n in range(nrN):
+            #         for j in range(4):
+            #             scale_B[i, n, j] = float(1.0)
+            # 2 N slicd * nrN * 4
+            buff_sb = J.Buffer(pScaleB, N * J.sizeof_f32)
+            lane_n = J.gpr("vu32")
+            lane_n[0] = warp_thread[0] // 16 * 4
+            voffset_n = J.gpr("vu32")
+            voffset_n[0] = (blk_n * wg_N +  warp_n[0]*32 + lane_n[0]) * J.sizeof_f32
+            n_offset12 = 0
+            for sid in range(2):
+                for n in range(nrN):
+                    buff_sb.load_dwordx4(scale_B[sid, n], voffset_n, 0, offset12=n_offset12)
+                    n_offset12 +=  16 * J.sizeof_f32
+                n_offset12 = 128*J.sizeof_f32
+        else:
+            for i in range(2):
+                for m in range(nrM):
+                    scale_A[i, m] = float(1.0)
+            for i in range(2):
+                for n in range(nrN):
+                    for j in range(4):
+                        scale_B[i, n, j] = float(1.0)
+        
+        
+        J.s_waitcnt(mod="vmcnt(0)")
+        for sid in range(4):
+            for m in range(nrM):
+                for n in range(nrN):
+                    # sid_m = sid //2, sid_n = sid % 2
+                    # m scale
+                    J.v_mul_f32(mfma_C[sid,m,n,0] , mfma_C[sid,m,n,0] , scale_A[sid//2, m] )
+                    J.v_mul_f32(mfma_C[sid,m,n,1] , mfma_C[sid,m,n,1] , scale_A[sid//2, m] )
+                    J.v_mul_f32(mfma_C[sid,m,n,2] , mfma_C[sid,m,n,2] , scale_A[sid//2, m] )
+                    J.v_mul_f32(mfma_C[sid,m,n,3] , mfma_C[sid,m,n,3] , scale_A[sid//2, m] )
+                    # n scale
+                    J.v_mul_f32(mfma_C[sid,m,n,0] , mfma_C[sid,m,n,0] , scale_B[sid%2, n, 0] )
+                    J.v_mul_f32(mfma_C[sid,m,n,1] , mfma_C[sid,m,n,1] , scale_B[sid%2, n, 1] )
+                    J.v_mul_f32(mfma_C[sid,m,n,2] , mfma_C[sid,m,n,2] , scale_B[sid%2, n, 2] )
+                    J.v_mul_f32(mfma_C[sid,m,n,3] , mfma_C[sid,m,n,3] , scale_B[sid%2, n, 3] )
+    
     if not rotate_mfma_C:
         vbf16 = J.gpr(4, "vbf16x2")
         col = J.lane_id // 16

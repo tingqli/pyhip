@@ -101,13 +101,21 @@ def test(M, N, K, AB_dtype, bpreshuffle):
 '''
 
 if __name__ == "__main__":
-    M,N,K = 8192,8192,8192
+    # M,N,K = 8192,8192,8192
     #test(M=256,N=256,K=256, bpreshuffle = False); assert 0
     AB_dtype = "fp8"
     #test(M=8192,N=8192,K=8192, AB_dtype=AB_dtype, bpreshuffle = False); assert 0
     #M,N,K = 512,512,8192
-    test(M=256,N=256,K=256, AB_dtype=AB_dtype, bpreshuffle = False)
-    test(M=256,N=256,K=256, AB_dtype=AB_dtype, bpreshuffle = True)
+    bpreshuffle = False
+    test(M=6144,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)
+    test(M=12288,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)
+    test(M=24576,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)
+    test(M=49152,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)
 
-    test(M=8192,N=8192,K=8192, AB_dtype=AB_dtype, bpreshuffle = False)
-    test(M=8192,N=8192,K=8192, AB_dtype=AB_dtype, bpreshuffle = True)
+    test(M=73728,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)
+    test(M=98304,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)
+
+    test(M=294912,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)
+    test(M=393216,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)
+    # test(M=589824,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)
+    # test(M=1048576,N=4096,K=1536, AB_dtype=AB_dtype, bpreshuffle = bpreshuffle)

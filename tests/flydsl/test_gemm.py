@@ -41,12 +41,28 @@ if 1:
     ir._globals.set_loc_tracebacks_enabled(True)
     os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
+def enable_dump_ir(enable_debug_info=True):
+    if enable_debug_info:
+        import flydsl
+        from flydsl.utils.env import DebugEnvManager
+        from flydsl._mlir import ir
+
+        DebugEnvManager.enable_debug_info = enable_debug_info
+        DebugEnvManager.dump_asm = True
+        DebugEnvManager.dump_ir = True
+        DebugEnvManager.dump_dir = "my_ir_dumps"
+        ir._globals.register_traceback_file_inclusion(__file__)
+        ir._globals.register_traceback_file_exclusion(os.path.dirname(flydsl.__file__))
+        ir._globals.set_loc_tracebacks_frame_limit(40)
+        ir._globals.set_loc_tracebacks_enabled(True)
+        os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    
 def div_up(x, y):
     return (x + y - 1) // y
 
 def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
     gpu_arch = get_rocm_arch()
-    is_gfx942 = str(gpu_arch).startswith("gfx942")
+    is_gfx942 = str(gpu_arch).startswith("gfx950")
 
     TILE_K = 64
     if alg == 'splitk':
@@ -963,16 +979,16 @@ def _run_batch(num_warps, kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=1
                 print(f'idx = {idx}\nref={ref_out[idx]}\ncur={cur_out[idx]}\n{len(idx[0])}')
             assert 0, f"{kernel_type=}, {M=}, {weight_type=}, {TILE_M=}, {TILE_N=}, {run_count=}"
 
-    elif kernel_type == 'aiter':
-        # aiter needs preshuffle weights
-        i = 0
-        for _ in range(run_count):
-            with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
-                _run_aiter(x=A[i], weight=w_org[i], weight_scale=w_scale[i])
-            i = (i + 1) % BUF_COPY
-            tflops_res.append(p.tflops())
-            latencies.append(p.dt())
-            bw.append(p.bw())
+    # elif kernel_type == 'aiter':
+    #     # aiter needs preshuffle weights
+    #     i = 0
+    #     for _ in range(run_count):
+    #         with cudaPerf(flops, mem_size, name=f"{kernel_type}[{M=},{str(weight_type).split('.')[1]}]") as p:
+    #             _run_aiter(x=A[i], weight=w_org[i], weight_scale=w_scale[i])
+    #         i = (i + 1) % BUF_COPY
+    #         tflops_res.append(p.tflops())
+    #         latencies.append(p.dt())
+    #         bw.append(p.bw())
     elif kernel_type == 'fly':
         sa = sb = torch.empty(0, dtype=torch.float32)
         def _make_args(c, a, b_shuf, M, N, include_bias=False):
@@ -1058,6 +1074,7 @@ def _run_batch(num_warps, kernel_type, M=1, weight_type=torch.bfloat16, TILE_M=1
                 "amdgpu-mfma-vgpr-form": False,
             }
             gemm = flyc.compile[hints](launcher, *args)
+            print("########################################")
         elif kernel_type == '8wave':
             launcher = compile_gemm(TILE_M, TILE_N, N, K, alg='8wave')
             gemm = flyc.compile[hints](launcher, *args)
@@ -1159,6 +1176,7 @@ def merge(a: dict, b: dict, path=[]):
     return a
 
 if __name__ == '__main__':
+    enable_dump_ir(True)
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",

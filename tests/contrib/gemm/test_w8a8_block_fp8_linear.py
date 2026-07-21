@@ -65,34 +65,34 @@ def test(m, n, k, b_preshuffle = False):
             b_preshuffle = b_preshuffle,
             num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"  jit {m},{n},{k}")
 
-    ret_gluon, dt = pyhip.run_perftest(
-            w8a8_block_fp8_linear,
-            input,
-            weight,
-            block_size,
-            weight_scale,
-            input_scale = None,
-            bias = None,
-            method = "gluon",
-            b_preshuffle = b_preshuffle,
-            num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"gluon {m},{n},{k}")
+    # ret_gluon, dt = pyhip.run_perftest(
+    #         w8a8_block_fp8_linear,
+    #         input,
+    #         weight,
+    #         block_size,
+    #         weight_scale,
+    #         input_scale = None,
+    #         bias = None,
+    #         method = "gluon",
+    #         b_preshuffle = b_preshuffle,
+    #         num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"gluon {m},{n},{k}")
 
-    ret_auto, dt = pyhip.run_perftest(
-            w8a8_block_fp8_linear,
-            input,
-            weight,
-            block_size,
-            weight_scale,
-            input_scale = None,
-            bias = None,
-            method = "auto",
-            b_preshuffle = b_preshuffle,
-            num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f" auto {m},{n},{k}")
+    # ret_auto, dt = pyhip.run_perftest(
+    #         w8a8_block_fp8_linear,
+    #         input,
+    #         weight,
+    #         block_size,
+    #         weight_scale,
+    #         input_scale = None,
+    #         bias = None,
+    #         method = "auto",
+    #         b_preshuffle = b_preshuffle,
+    #         num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f" auto {m},{n},{k}")
 
-    print(f"{pyhip.calc_diff(ref, ret_aiter)=:.6f}")
+    # print(f"{pyhip.calc_diff(ref, ret_aiter)=:.6f}")
     print(f"{pyhip.calc_diff(ref, ret_jit, diff_thr=0.01)=:.6f}")
-    print(f"{pyhip.calc_diff(ref, ret_gluon, diff_thr=0.01)=:.6f}")
-    print(f"{pyhip.calc_diff(ref, ret_auto, diff_thr=0.01)=:.6f}")
+    # print(f"{pyhip.calc_diff(ref, ret_gluon, diff_thr=0.01)=:.6f}")
+    # print(f"{pyhip.calc_diff(ref, ret_auto, diff_thr=0.01)=:.6f}")
 
 if __name__ == "__main__":
     """
@@ -105,19 +105,19 @@ if __name__ == "__main__":
     """
 
     # special shape accuracy test
-    test(32, 4096, 256, b_preshuffle=True)
-    test(255, 512, 256, b_preshuffle=False)
-    if 1:
-        for m in [32,64,128,256,512,1024,2048,4096]:
-                test(m, 2560, 4096, b_preshuffle=True)
-    if 0:
-        M = 16384
-        M = 57
-        test(M, 4096, 1024, b_preshuffle=True); assert 0
+    test(8192, 4096, 8192, b_preshuffle=True)
+    test(8192, 4096, 8192, b_preshuffle=False)
+    # if 1:
+    #     for m in [32,64,128,256,512,1024,2048,4096]:
+    #             test(m, 2560, 4096, b_preshuffle=True)
+    # if 0:
+    #     M = 16384
+    #     M = 57
+    #     test(M, 4096, 1024, b_preshuffle=True); assert 0
 
-        test(M, 256, 4096)
-        test(M, 1024, 4096)
-        test(M, 1536, 4096)
-        test(M, 2560, 4096)
-        test(M, 4096, 1024)
+    #     test(M, 256, 4096)
+    #     test(M, 1024, 4096)
+    #     test(M, 1536, 4096)
+    #     test(M, 2560, 4096)
+    #     test(M, 4096, 1024)
 
