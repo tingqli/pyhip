@@ -221,11 +221,19 @@ def run_perftest(kernel, *args, **kwargs):
     copy_bytes = 0
     args_copies = []
     kwarg_copies = []
+
+    def clone_tensor(x):
+        y = x.clone()
+        is_shuffled = getattr(x, "is_shuffled", None) 
+        if is_shuffled is not None:
+            y.is_shuffled = is_shuffled
+        return y
+
     for _ in range(num_copies):
         new_args = []
         for i in range(len(args)):
             if isinstance(args[i], torch.Tensor):
-                new_args.append(args[i].clone())
+                new_args.append(clone_tensor(args[i]))
                 copy_bytes += args[i].numel() * args[i].element_size()
             else:
                 new_args.append(args[i])
@@ -234,7 +242,7 @@ def run_perftest(kernel, *args, **kwargs):
         new_kwargs = {}
         for k,v in kwargs.items():
             if isinstance(v, torch.Tensor):
-                new_kwargs[k] = v.clone()
+                new_kwargs[k] = clone_tensor(v)
                 copy_bytes += v.numel() * v.element_size()
             else:
                 new_kwargs[k] = v
