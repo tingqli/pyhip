@@ -1775,21 +1775,12 @@ def compile_gemm(
                 lds_view[tid] = sorted_ids_buf[tid]
             gpu.barrier()
 
-            # Output [M, TOPK, N//2] + the per-row scatter index, built BEFORE gemm_1x4:
-            # sorted_lds is unioned with a_ping, so c_out must seed its index_frag from
-            # sorted_lds now; gemm_1x4 then overwrites that LDS region with the A tile.
-            arg_p_output = fx.make_view(
-                _as_ptr(p_output),
-                fx.make_layout((M, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
-            )
-            out_tensor = fx.rocdl.make_buffer_tensor(
-                arg_p_output,
-                max_size=False,
-                num_records_bytes=fx.Int64(M)
-                * (TOPK * N // 2 * fx.BFloat16.width // 8),
-            )
+            # Output [num_blocks, BM, N//2]: block e_idx writes its BM rows contiguously (no
+            # per-token scatter), so the down stage reads them back contiguously by e_idx. No
+            # index_frag is needed, so the sorted_lds pre-read for the output is gone (asc_idx
+            # below still reads sorted_lds before gemm_1x4 overwrites it).
             buf_atom_w128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-            # CShuffle read/scatter over the single (BM x contiguous_n) region. The read uses a
+            # CShuffle read over the single (BM x contiguous_n) region. The read uses a
             # 4-wave 2x2 thread grid (token = lane//4 + 16*waveM, 8 contiguous channels/lane,
             # 128b), decoupled from the gemm's 1x4 wave layout (it just walks the staged LDS),
             # so rep_token = BM//32 and rep_channel = contiguous_n//64.
@@ -1798,21 +1789,21 @@ def compile_gemm(
                 fx.make_layout(((4, 16, 2, 2), 8), ((256, 1, 16, 1024), 32)),
                 fx.make_tile(32, 64),
             )
-            c_index_copy = fx.make_tiled_copy(
-                fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
-                fx.make_layout(((4, 16, 2, 2), 1), ((0, 1, 16, 0), 0)),
-                fx.make_tile(32),
+            # Contiguous destination slice for this (e_idx, blk_n) block: the BM rows of sorted
+            # block e_idx, columns = the blk_n-th contiguous_n channels of the N//2 output.
+            out_offset = fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * (N // 2)) + fx.Int64(
+                blk_n
+            ) * contiguous_n
+            out_blk = fx.make_view(
+                _as_ptr(p_output, fx.BFloat16) + out_offset,
+                fx.make_layout((BLOCK_TILE_SIZE_M, contiguous_n), (N // 2, 1)),
             )
-            c_out_index_frag = _read_sorted_index(c_index_copy, tid, lds.sorted_lds)
-            c_out = TensorWithIndex(
-                out_tensor,
-                BLOCK_TILE_SIZE_M,
-                contiguous_n,
-                c_out_index_frag,
-                c_rw_copy,
-                tid,
-                is_read_from_mem=False,
-                TOPK=TOPK,
+            out_blk = fx.rocdl.make_buffer_tensor(
+                out_blk,
+                max_size=False,
+                num_records_bytes=fx.Int64(BLOCK_TILE_SIZE_M)
+                * (N // 2)
+                * (fx.BFloat16.width // 8),
             )
 
             # ptpc a_scale is per-token; B-first packs 4 CONTIGUOUS channels per lane in the
@@ -1908,7 +1899,7 @@ def compile_gemm(
             gpu.barrier()
             rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
             fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
-            c_out.copy(buf_atom_w128, blk_n, rd)
+            fx.copy(buf_atom_w128, rd, c_rw_copy.get_slice(tid).partition_D(out_blk))
 
     @flyc.kernel
     def moe_2stage_down_batch1(
@@ -2004,7 +1995,13 @@ def compile_gemm(
         max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
 
         if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
-            arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
+            # Input [num_blocks, BM, K]: read block e_idx's BM rows contiguously (no gather),
+            # matching the gateup stage's contiguous [num_blocks, BM, N//2] output.
+            arg_p_input = fxh.view_as_torch_tensor(
+                _as_ptr(p_input, weight_dtype)
+                + fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * K),
+                (BLOCK_TILE_SIZE_M, K),
+            )
             arg_p_output = fxh.view_as_torch_tensor(
                 _as_ptr(p_output, fx.BFloat16)
                 + fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * N),
@@ -2069,8 +2066,8 @@ def compile_gemm(
             arg_p_input = fx.rocdl.make_buffer_tensor(
                 arg_p_input,
                 max_size=False,
-                num_records_bytes=fx.Int64(M)
-                * (TOPK * K)
+                num_records_bytes=fx.Int64(BLOCK_TILE_SIZE_M)
+                * K
                 * (arg_p_input.dtype.width // 8),
             )
             cp_atom = flyobj.get_buffer_copy_atom(arg_p_input.dtype, 128)
@@ -2082,8 +2079,10 @@ def compile_gemm(
                 return fx.group(x, 0, -1)
 
             cp_ldsA0 = flatten_A(ldsA0)
+            # Contiguous read: row coord is the identity block-local token index (0..BM-1),
+            # not the sorted_id, so A rows load straight from input[e_idx, row, col].
             cp_rows = flatten_A(
-                fxh.make_1d_coord_tensor(ldsA0, 0, fx.get_iter(arg_p_sorted_ids))
+                fxh.make_1d_coord_tensor(ldsA0, 0, fx.make_int_tuple(0))
             )
             cp_cols = flatten_A(
                 fxh.make_1d_coord_tensor(ldsA0, 1, fx.make_int_tuple(0))
@@ -2091,10 +2090,7 @@ def compile_gemm(
             for dst, row, col in fxh.all_copy_atoms(
                 cp_ldsA0, cp_rows, cp_cols, atom_bits=128, num_threads=256
             ):
-                sorted_id = row[0].bitcast(fx.Uint32)
-                atom_A = fxh.atom_tensor(
-                    arg_p_input, (sorted_id & 0xFFFFFF, sorted_id >> 24, col[0]), 128
-                )
+                atom_A = fxh.atom_tensor(arg_p_input, (row[0], col[0]), 128)
                 fx.copy(cp_atom, atom_A, dst)
             fx.gpu.barrier()
 
@@ -2136,26 +2132,20 @@ def compile_gemm(
 
             arg_a_scale = None
             if const_expr(act_quant_type == "per_tensor"):
+                # per-tensor scale is a broadcast scalar (unused path; kept compilable).
                 arg_a_scale = fx.make_view(
                     fx.recast_iter(fx.Float32, _as_ptr(p_a_scale)),
-                    fx.make_layout((M, TOPK), (0, 0)),
-                )
-                arg_a_scale = fx.rocdl.make_buffer_tensor(
-                    arg_a_scale,
-                    max_size=False,
-                    num_records_bytes=fx.Int64(1) * (arg_a_scale.dtype.width // 8),
+                    fx.make_layout((BLOCK_N, BLOCK_M), (0, 0)),
                 )
             if const_expr(act_quant_type == "ptpc"):
+                # a_scale is the per-token quant scale of gemm1_out (the gateup output), which
+                # the gateup stage now writes CONTIGUOUSLY by sorted block. So a_scale is laid
+                # out per sorted slot [num_blocks*BM]: offset to block e_idx and load it by
+                # block-local token (stride (0, 1)), exactly like sorted_weights -- no gather.
                 arg_a_scale = fx.make_view(
-                    fx.recast_iter(fx.Float32, _as_ptr(p_a_scale)),
-                    fx.make_layout((M, TOPK), (TOPK, 1)),
-                )
-                arg_a_scale = fx.rocdl.make_buffer_tensor(
-                    arg_a_scale,
-                    max_size=False,
-                    num_records_bytes=fx.Int64(M)
-                    * TOPK
-                    * (arg_a_scale.dtype.width // 8),
+                    fx.recast_iter(fx.Float32, _as_ptr(p_a_scale))
+                    + fx.Int64(e_idx) * BLOCK_TILE_SIZE_M,
+                    fx.make_layout((BLOCK_N, BLOCK_M), (0, 1)),
                 )
 
             sorted_weights = fx.make_view(
@@ -2168,30 +2158,11 @@ def compile_gemm(
             )
 
             if fx.const_expr(arg_a_scale is not None):
-                """load & combine per-token scales with per-token weights, and store into lds.C"""
-                cp_atom = flyobj.get_buffer_copy_atom(p_a_scale.dtype, 32)
-                coord_tensor = fx.make_view(
-                    fx.get_iter(arg_p_sorted_ids),
-                    fx.make_layout((BLOCK_N, BLOCK_M), (0, 1)),
+                # a_scale is contiguous per block, so load it directly by block-local token
+                # (like sorted_weights) instead of a sorted_id gather, then fold into weights.
+                frag_pt_scales = flyobj.load_tiled_mma_fragC(
+                    mm, arg_a_scale, copy_atom_bits=32
                 )
-                frag_coord = flyobj.load_tiled_mma_fragC(
-                    mm, coord_tensor, copy_atom_bits=32
-                )
-                frag_pt_scales = mm.make_fragment_C(coord_tensor)
-                frag_pt_scalesr = flyobj.get_tiled_mma_retile(
-                    mm, frag_pt_scales, "C", copy_atom=cp_atom
-                )
-
-                for dst, coord in fxh.all_elements(frag_pt_scalesr, frag_coord):
-                    sorted_id = coord[0].bitcast(fx.Uint32)
-                    atom_A = fxh.atom_tensor(
-                        arg_a_scale,
-                        (sorted_id & 0xFFFFFF, sorted_id >> 24),
-                        32,
-                    )
-                    fx.copy(cp_atom, atom_A, dst)
-
-                # combine per-token scales with per-token weights
                 for frag_pt, frag_sw in fxh.all_elements(
                     frag_pt_scales, frag_sorted_weight
                 ):

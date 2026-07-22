@@ -454,6 +454,13 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                 use_prefill = B > 32 and TILE_M >= 32 and TILE_M % 32 == 0
                 if use_prefill:
                     gateup_alg = 'prefill_1x4'
+                    # prefill_1x4 gateup now writes contiguously by sorted block:
+                    # [num_blocks*TILE_M, N1//2] with row = e_idx*TILE_M + block-local token,
+                    # replacing the token-scattered [B, TOPK, N1//2]. Size with
+                    # sorted_expert_ids.shape[0] (same as gemm2_out; > B*TOPK so no overflow;
+                    # NOT grid, whose value can differ). zeros: padding blocks
+                    # (e_idx*TILE_M >= num_valid) are never written and must not perturb amax.
+                    gemm1_out = torch.empty([sorted_expert_ids.shape[0] * TILE_M, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
                 else:
                     gateup_alg = 'splitk'
                 g_kwargs = (
@@ -512,8 +519,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
 
                     if weight_dtype == 'fp8' and use_prefill:
                         if compile_act_quant_type == 'ptpc':
+                            # gemm1_out is already [num_blocks*TILE_M, N1//2] (contiguous by
+                            # sorted block); per-token quant yields a matching per-row scale.
                             down_in, a_scale = aiter.get_hip_quant(aiter.QuantType.per_Token)(
-                                gemm1_out.view(B * TOPK, -1), quant_dtype=weight_type)
+                                gemm1_out, quant_dtype=weight_type)
                             a_scale = a_scale.to(torch.float32).contiguous()
                         else:
                             fmax = torch.finfo(weight_type).max
