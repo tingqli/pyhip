@@ -126,6 +126,31 @@ loader函数如何单独调试正确性？可以从实现最简单的moe_gemm开
 
 
 
+def _get_block_indices(J, OC, wg_N, num_blocks):
+    blk1d = J.blockIdx.x
+    NUM_CU = 256
+    num_oc_blocks = J.div(OC, wg_N)
+    num_groupped_blocks = num_blocks - (num_blocks % NUM_CU)
+    blk_m = J.gpr("su32")
+    blk_n = J.gpr("su32")
+
+    with J.If(blk1d < num_groupped_blocks) as If:
+        blk_base = (blk1d // NUM_CU) * NUM_CU
+        cu_id = blk1d % NUM_CU
+        xcd_id = cu_id % 8
+        xcd_cu = cu_id // 8
+        task_id = xcd_id * 32 + xcd_cu
+        new_blk1d = blk_base + task_id
+        blk_m[0] = new_blk1d // num_oc_blocks
+        blk_n[0] = new_blk1d - blk_m * num_oc_blocks
+
+        If.Else()
+        blk_m[0] = blk1d // num_oc_blocks
+        blk_n[0] = blk1d - blk_m * num_oc_blocks
+
+    return blk_m, blk_n
+
+
 @jit(with_debug_log=False)
 def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
                    AB_dtype, wg_M, wg_N,
@@ -143,45 +168,10 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
     num_warps = 8
 
     assert AB_dtype in ["fp8", "bf16", "fp16", "f16"]
-    C_dtype = "bf16"
+    assert wg_M in [128, 256]
 
-    K = IC
-    # loader always load 128bytes (8 x DW4-lanes) along K dimension
-    wg_K = J.div(128, J.sizeof(AB_dtype))
+    blk_m, blk_n = _get_block_indices(J, OC, wg_N, num_blocks)
 
-    stride_k = IC * J.sizeof(AB_dtype)
-    #stride_gate_up = J.div(J.div(OC, wg_N), 2) * wg_N * stride_k
-
-    #blk_n = J.blockIdx.x # split along OC
-    #blk_m = J.blockIdx.y
-
-    blk1d = J.blockIdx.x
-    NUM_CU = 256
-    num_oc_blocks = J.div(OC, wg_N)
-    num_groupped_blocks = num_blocks - (num_blocks % NUM_CU)
-    blk_m = J.gpr("su32")
-    blk_n = J.gpr("su32")
-    use_xcd_swizzle = 1
-    if use_xcd_swizzle:
-        with J.If(blk1d < num_groupped_blocks) as If:
-            blk_base = (blk1d // NUM_CU) * NUM_CU
-            cu_id = blk1d % NUM_CU
-            xcd_id = cu_id % 8
-            xcd_cu = cu_id // 8
-            task_id = xcd_id * 32 + xcd_cu
-            new_blk1d = blk_base + task_id
-            blk_m[0] = new_blk1d // num_oc_blocks
-            blk_n[0] = new_blk1d - blk_m * num_oc_blocks
-
-            If.Else()
-            blk_m[0] = blk1d // num_oc_blocks
-            blk_n[0] = blk1d - blk_m * num_oc_blocks
-    else:
-        blk_m[0] = blk1d // num_oc_blocks
-        blk_n[0] = blk1d - blk_m * num_oc_blocks
-
-
-    #blk_m[0] *= 0
     expert_id = J.gpr(1, 'su32')
     J.s_load_dword(expert_id, sorted_expert_ids, blk_m[0] * J.sizeof_u32)
     max_id = J.gpr(1, 'su32')
@@ -195,9 +185,53 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
     sorted_ids[:] += blk_m * (wg_M * J.sizeof_u32)
     sorted_weights[:] += blk_m * (wg_M * J.sizeof_u32)
 
-    #i_scale[:] += blk_m * (J.div(wg_M,32) * stride_scale32x256)
-    #w_scale[:] += expert_id * (J.div(OC,32) * stride_scale32x256)
-    #i_scale[:] += (J.warp_id[0] // 2) * (J.div(wg_M//2, 32) * stride_scale32x256)
+    lds_sorted_ids = J.alloc_lds(wg_M * J.sizeof_u32)
+    lds_sorted_weights = J.alloc_lds(wg_M * J.sizeof_DW)
+    if gate_up:
+        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
+    else:
+        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
+        J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
+
+    if wg_M == 256 and gate_up:
+        vrows = J.gpr("vu32")
+        vaddr = J.gpr("vu32", 128 * J.sizeof_u32 + lds_sorted_ids)
+        J.ds_read_b32(vrows, vaddr)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        srow = J.gpr("su32")
+        J.v_readfirstlane_b32(srow, vrows)
+        with J.If((srow[0] >> 24) == TOPK):
+            _emit_moe_gemm_8wave_g1u1(
+                J, is_input_over_4GB, AB_dtype, 128, wg_N, OC, IC,
+                gate_up, bpreshuffle, TOPK, weight, pScaleB, input, pScaleA,
+                output, num_tokens, blk_m, blk_n, expert_id,
+                lds_sorted_ids, lds_sorted_weights)
+            J.s_endpgm()
+
+    _emit_moe_gemm_8wave_g1u1(
+        J, is_input_over_4GB, AB_dtype, wg_M, wg_N, OC, IC,
+        gate_up, bpreshuffle, TOPK, weight, pScaleB, input, pScaleA,
+        output, num_tokens, blk_m, blk_n, expert_id,
+        lds_sorted_ids, lds_sorted_weights)
+
+    J.free_lds(lds_sorted_ids)
+    J.free_lds(lds_sorted_weights)
+
+
+def _emit_moe_gemm_8wave_g1u1(J, is_input_over_4GB,
+                   AB_dtype, wg_M, wg_N, OC, IC,
+                   gate_up, bpreshuffle, TOPK,
+                   weight, pScaleB, input, pScaleA, output, num_tokens,
+                   blk_m, blk_n, expert_id,
+                   lds_sorted_ids, lds_sorted_weights):
+    num_warps = 8
+    C_dtype = "bf16"
+
+    K = IC
+    # loader always load 128bytes (8 x DW4-lanes) along K dimension
+    wg_K = J.div(128, J.sizeof(AB_dtype))
+
+    stride_k = IC * J.sizeof(AB_dtype)
 
     # basic configuration for 8-wave
     WARPS_COL = 4
@@ -270,15 +304,6 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
 
     warp_m = J.gpr(J.warp_id[0] // WARPS_COL) # warp row: 0 to 1
     warp_n = J.gpr(J.warp_id[0] % WARPS_COL)  # warp col: 0 to 3
-
-    # prefetch sorted ids into LDS
-    lds_sorted_ids = J.alloc_lds(wg_M * J.sizeof_u32)
-    lds_sorted_weights = J.alloc_lds(wg_M * J.sizeof_DW)
-    if gate_up:
-        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
-    else:
-        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
-        J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
 
     vm_load_a, vm_load_cnt_a, vm_offset_inc_a, ds_read_a = get_mfma_loader_sorted_tok(J, num_warps, BLOCK_SIZE_ROW, BLOCK_K, stride_k, warp_m*MINI_BLOCK_M, lds_sorted_ids, LOADER_TOPK, num_tokens, input, is_input_over_4GB)
     vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, HALF_BLOCK_SIZE_COL, BLOCK_K, stride_k, warp_n*MINI_BLOCK_N)
@@ -380,7 +405,9 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
         mfma_fifo = J.gpr(MFMA_FIFO_CNT, 4, "vf32")
         mfma_fifo_scale[...] = 0
         mfma_fifo[...] = 0
-        mfma_fifo_c_index = 0
+        # Runtime loop backedges carry the final c_index=3 FIFO entry into
+        # the first mfma(0) call of the next iteration.
+        mfma_fifo_c_index = 3
 
         def mfma(c_index):
             nonlocal mfma_fifo_scale, mfma_fifo, mfma_fifo_c_index
@@ -568,7 +595,6 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
             for k in range(loop_cnt):
                 loop_body(k, loop_cnt)
         else:
-            assert not use_f32_blockscales_128, "there is an unknown accuracy issue for f32 blockscale-128 case"
             assert (loop_cnt % 2) == 0
             k = J.gpr("su32", 0)
 
@@ -761,4 +787,8 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
                             # buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
                             J.global_store_dwordx4(vaddr, vbf16, "off", mod=f"offset:{0*16*J.sizeof(C_dtype) + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16}")
 
-    return
+    J.free_lds(lds_base)
+    if use_f32_blockscales_128:
+        J.free_lds(lds_scaleA[0])
+        J.free_lds(lds_scaleA[1])
+        J.free_lds(lds_scaleB)
