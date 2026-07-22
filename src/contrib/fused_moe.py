@@ -400,9 +400,10 @@ def fused_moe(
     assert inter_dim*2 % wg_N == 0
     num_oc_blocks = inter_dim*2//wg_N
     num_e_blocks = sorted_expert_ids.shape[0]
-    do_perf = False
+    do_perf = True
     if do_perf:
         valid_e_blocks = num_valid_ids[0].item()//wg_M
+        print(f"block_size_M:{block_size_M} valid_e_blocks = {valid_e_blocks}")
     if 0:
         moe_gemm_ref(activation, quant_type, topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a1, a1_scale,
@@ -505,6 +506,33 @@ def fused_moe(
                                 a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
                                 stage2_out.data_ptr(),
                                 token_num)
+                import os
+                target_file = f"moe_gemm_down_{token_num}_{inter_dim}_{model_dim}_{wg_M}_{w2_is_shuffled}.pt"
+                if not os.path.exists(target_file):
+                    args_dict = {
+                        "num_e_blocks": num_e_blocks,
+                        "is_output_over_4GB": stage2_out.element_size() * stage2_out.numel() > (1<<32),
+                        "AB_dtype":AB_dtype,
+                        "wg_M": wg_M,
+                        "E": E,
+                        "model_dim": model_dim,
+                        "inter_dim": inter_dim,
+                        "w2_is_shuffled": w2_is_shuffled,
+                        "topk":topk,
+                        "sorted_ids":sorted_ids,
+                        "sorted_weights":sorted_weights,
+                        "sorted_expert_ids":sorted_expert_ids,
+                        "num_valid_ids":num_valid_ids,
+                        "w2":w2,
+                        "w2_scale":w2_scale,
+                        "a2":a2,
+                        "a2_scale":a2_scale,
+                        "stage2_out":stage2_out,
+                        "token_num":token_num
+                    }
+                    torch.save(args_dict, target_file)
+                    assert 0,f"================================= {target_file} is saved!"
+
             else:
                 if USE_GLUON2:
                     BLOCK_TILE_SIZE_M = block_size_M
