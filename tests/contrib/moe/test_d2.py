@@ -5,20 +5,20 @@ import torch
 
 import contextlib
 
-
+pyhip.set_device()
 
 @pyhip.jit(with_debug_log=False)
-def moe_gemm_down_8wave(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
-                   NUM_EXPERTS, OC, IC, 
-                   gate_up, bpreshuffle, TOPK,
-                   sorted_ids:"uint*",
-                   sorted_weights:"float*",
-                   sorted_expert_ids:"uint*",
-                   num_valid_ids:"uint*",
-                   weight:"void*",pScaleB:"void*",
-                   input:"void*", pScaleA:"void*",
-                   output:"void*",
-                   num_tokens:"uint"):
+def moe_gemm_down_8wave(J, do_ref, is_output_over_4GB, AB_dtype, wg_M, wg_N,
+                        NUM_EXPERTS, OC, IC,
+                        gate_up, bpreshuffle, TOPK,
+                        sorted_ids:"uint*",
+                        sorted_weights:"float*",
+                        sorted_expert_ids:"uint*",
+                        num_valid_ids:"uint*",
+                        weight:"void*",pScaleB:"void*",
+                        input:"void*", pScaleA:"void*",
+                        output:"void*",
+                        num_tokens:"uint"):
     C_dtype = "bf16"
     assert AB_dtype in ["fp8", "bf16"]
     assert C_dtype == "bf16"
@@ -58,8 +58,8 @@ def moe_gemm_down_8wave(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
     nrM = J.div(warp_M, 16)     # 4 @ wg_M=256
     nrN = J.div(wg_N, 16)       # 4 @ wg_N=64
     nrK = J.div_up(IC*J.sizeof(AB_dtype), 64)     # always use 64-bytes in K dims (due to dwordx4/b128)
-    mfma_A = J.gpr(nrM, nrK, 4, "abf16x2")          # 4 b32 regs in MFMA-16 layout : 16x16xfp32/16x32xbf16/16x64xfp8
-    mfma_B = J.gpr(nrN, nrK, 4, "abf16x2")
+    mfma_A = J.gpr(nrM, nrK, 4, "vbf16x2")          # 4 b32 regs in MFMA-16 layout : 16x16xfp32/16x32xbf16/16x64xfp8
+    mfma_B = J.gpr(nrN, nrK, 4, "vbf16x2")
     mfma_C = J.gpr(2, nrM, nrN, 4, "vf32")          # mfma_C is ping-pong buffered for storing output  
 
     if AB_dtype == "fp8":
@@ -101,8 +101,7 @@ def moe_gemm_down_8wave(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
     num_16x64b_K = J.div_up(IC * J.sizeof(AB_dtype), 64)  # 4 @ IC=128xbf16
     num_bytes_B = num_16x64b_wg_N * num_16x64b_K * 16*64
 
-    ldsB = [J.alloc_lds(num_bytes_B),
-            J.alloc_lds(num_bytes_B)]
+    ldsB = [J.alloc_lds(num_bytes_B) for _ in range(4)]
 
     num_vm_loads = J.div(num_16x64b_wg_N * num_16x64b_K, num_warps) # 4 @ num_warps=4
     vm_load_voff = J.gpr("vu32", J.threadIdx.x[0] * J.sizeof_DW4)
@@ -203,30 +202,34 @@ def moe_gemm_down_8wave(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
                     mfma_C[c_index,m,n,1] = 0
                     mfma_C[c_index,m,n,2] = 0
                     mfma_C[c_index,m,n,3] = 0
-            
+
+            # C & mfma_scaleAB & (m,n)
+            dequant_queue = []
             for k in range(0,nrK,2):
                 for m in range(nrM):
                     for n in range(nrN):
-                        mfma_scaleAB = J.gpr("vf32", mfma_scaleA[m, k*64//scale_BK] * mfma_scaleB[n*16//scale_BN, k*64//scale_BK])
                         temp = J.gpr(4, "vf32")
+                        mfma_scaleAB = J.gpr("vf32", mfma_scaleA[m, k*64//scale_BK] * mfma_scaleB[n*16//scale_BN, k*64//scale_BK])
                         J.v_mfma_f32_16x16x128_f8f6f4(temp,
                                                       mfma_B[n, k:k+1],
                                                       mfma_A[m, k:k+1],
                                                       0)
-                        J.s_nop(15)
-                        J.v_fmac_f32(mfma_C[c_index, m, n, 0], temp[0], mfma_scaleAB)
-                        J.v_fmac_f32(mfma_C[c_index, m, n, 1], temp[1], mfma_scaleAB)
-                        J.v_fmac_f32(mfma_C[c_index, m, n, 2], temp[2], mfma_scaleAB)
-                        J.v_fmac_f32(mfma_C[c_index, m, n, 3], temp[3], mfma_scaleAB)
+                        dequant_queue.append([temp, mfma_scaleAB, (m,n)])
+                        if len(dequant_queue) > 2:
+                            tc, ts, (tm,tn) = dequant_queue.pop(0)
+                            J.v_fmac_f32(mfma_C[c_index, tm, tn, 0], tc[0], ts)
+                            J.v_fmac_f32(mfma_C[c_index, tm, tn, 1], tc[1], ts)
+                            J.v_fmac_f32(mfma_C[c_index, tm, tn, 2], tc[2], ts)
+                            J.v_fmac_f32(mfma_C[c_index, tm, tn, 3], tc[3], ts)
                         yield 16
-            # mfma_B = J.gpr(nrN, nrK, 4, "abf16x2")
-            #J.debug_log(mfma_A[0], torch.float8_e4m3fn)
-            #J.debug_log(mfma_B[0], torch.float8_e4m3fn)
-            #J.debug_log(mfma_A[0, 0], torch.float8_e4m3fn)
-            #J.debug_log(mfma_C[c_index, 0, 0], torch.float)
-            #J.debug_log(mfma_scaleAB, torch.float)
-            #J.s_endpgm()
-            
+
+            while len(dequant_queue):
+                tc, ts, (tm,tn) = dequant_queue.pop(0)
+                J.v_fmac_f32(mfma_C[c_index, tm, tn, 0], tc[0], ts)
+                J.v_fmac_f32(mfma_C[c_index, tm, tn, 1], tc[1], ts)
+                J.v_fmac_f32(mfma_C[c_index, tm, tn, 2], tc[2], ts)
+                J.v_fmac_f32(mfma_C[c_index, tm, tn, 3], tc[3], ts)
+
     # prepare output offsets
     stride_c = OC * J.sizeof(C_dtype)
     buff_c = J.Buffer(output, num_token_topks * stride_c)
@@ -273,75 +276,132 @@ def moe_gemm_down_8wave(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
 
     # perf-experiment
     loop_cnt = J.div(OC, wg_N)
-    if 1:
-        # num_vm_loads = 4
-        # num_vm_stores = 8
-        # num_mfmas=64
-        num_mfmas = nrK * nrM * nrN
-        print(f"{num_vm_loads=} {num_vm_stores=} {num_mfmas=}")
 
-        J.emit(vm_load_B(ldsB[1], 0*num_bytes_B))
+    # num_vm_loads = 4
+    # num_vm_stores = 8
+    # num_mfmas=64
+    num_mfmas = nrK * nrM * nrN
+    print(f"{num_vm_loads=} {num_vm_stores=} {num_mfmas=} {loop_cnt=}")
 
+    """
+    ----------------------------------------------------: conditional-displacement-barrier
+
+    global_read     B0         |  global_read     B0
+    global_read     B1         |  global_read     B1
+
+    
+    wave-0123                  |  wave-4567 (with extra initial barrirer)
+                               |
+    ----------------------------BBBBBBBBBBBBBBBBBBBBBBBB  wait B0 in LDS (BBBB... is extra initial barrirer)
+    ds_read         B0         |
+    global_read     B2         |
+    ----------------------------------------------------  wait ds_read finished
+    compute A,B0,Ctop0         | ds_read         B0
+                               | global_read     B2
+
+                          Loop body
+    ----------------------------------------------------  wait B1 in LDS
+    ds_read         B1         |
+    global_store    Ctop0      | compute A,B0,Cbut0
+    global_read     B3         |
+    ----------------------------------------------------  wait ds_read finished
+    compute A,B1,Ctop1         | ds_read         B1
+                               | global_store    Cbut0
+                               | global_read     B3
+    ----------------------------------------------------  wait B2 in LDS
+    ds_read         B2         | compute A,B1,Cbut1
+    global_store    Ctop1      |
+    global_read     B4         |
+    ---------------------------------------------------- wait ds_read finished
+    compute A,B2,Ctop2         | ds_read         B2
+                               | global_store    Cbut1
+                               | global_read     B4
+    ---------------------------------------------------- wait B3 in LDS
+    """
+    def ds_readB(block_n):
+        for n in range(nrN):
+            for k in range(nrK):
+                ds_read_B(ldsB[block_n%len(ldsB)], n, k)
+        ds_read_scaleB(block_n)
+
+    def global_readB(block_n):
+        J.emit(vm_load_B(ldsB[block_n%len(ldsB)], block_n*num_bytes_B))
+
+    def compute(block_n):
+        J.emit(mfma(block_n & 1))
+
+    def global_store(block_n):
+        soffset = J.gpr("su32", block_n*wg_N*J.sizeof(C_dtype))
+        J.emit(storeC(block_n & 1, soffset))
+
+    if do_ref:
         for loop_n in range(loop_cnt):
-            tic = loop_n&1
-            toc = tic ^ 1
-            J.emit(vm_load_B(ldsB[tic], (loop_n + 1)*num_bytes_B))
-
-            if loop_n > 1:
-                J.s_waitcnt(mod=f"vmcnt({num_vm_loads + num_vm_stores})")
-            else:
-                J.s_waitcnt(mod=f"vmcnt({num_vm_loads})")
+            global_readB(loop_n)
+            J.s_waitcnt(mod=f"vmcnt(0)")
             J.s_barrier()
 
-            for n in range(nrN):
-                for k in range(nrK):
-                    ds_read_B(ldsB[toc], n, k)
-            ds_read_scaleB(loop_n)
-            J.s_waitcnt(mod=f"lgkmcnt({0})")
+            ds_readB(loop_n)
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
             J.s_barrier()
+            compute(loop_n)
 
-            compute = mfma(toc)
-
-            # store mfma_C interleaving with MFMA
-            if loop_n > 0:
-                soffset = J.gpr("su32", (loop_n-1)*wg_N*J.sizeof(C_dtype))
-                storer_C = storeC(tic, soffset)
-                while True:
-                    e1 = J.emit(compute, 64)
-                    e0 = J.emit(storer_C, 32)
-                    if not e0:
-                        break
-
-            J.emit(compute)
-
-        soffset = J.gpr("su32", (loop_cnt-1)*wg_N*J.sizeof(C_dtype))
-        J.emit(storeC(toc, soffset))
+            global_store(loop_n)
+            J.s_waitcnt(mod=f"vmcnt(0)")
+            J.s_barrier()
     else:
-        for loop_n in range(loop_cnt):
-            J.emit(vm_load_B(ldsB[0], loop_n*num_bytes_B))
-            J.s_waitcnt(mod=f"vmcnt({0})")
+                
+        global_readB(0)
+        global_readB(1)
+        J.s_waitcnt(mod=f"vmcnt({num_vm_loads})")
+
+        # (BBBB... is extra initial barrirer for wave 4567)
+        with J.If(J.warp_id[0] > 3):
             J.s_barrier()
 
-            # we only load B once, so with B-tile ready in LDS
-            # we would like to load all A
-            for n in range(nrN):
-                for k in range(nrK):
-                    ds_read_B(ldsB[0], n, k)
-            ds_read_scaleB(loop_n)
-            J.s_waitcnt(mod=f"lgkmcnt({0})")
+        J.s_barrier()
+        ds_readB(0)
+        global_readB(2)
+
+        J.s_waitcnt(mod=f"lgkmcnt(0) vmcnt({num_vm_loads})")
+        J.s_barrier()
+        compute(0)
+
+        for loop_n in range(loop_cnt - 3):
             J.s_barrier()
+            ds_readB(loop_n + 1)
+            global_store(loop_n)
+            global_readB(loop_n + 3)
 
-            J.emit(mfma(0))
+            J.s_waitcnt(mod=f"lgkmcnt(0) vmcnt({num_vm_loads + num_vm_stores})")
+            J.s_barrier()
+            compute(loop_n + 1)
 
-            #J.debug_log(mfma_C[0,0,0], torch.float, "4h.16v.4h")
+        loop_n = (loop_cnt - 3)
+        J.s_barrier()
+        ds_readB(loop_n + 1)
+        global_store(loop_n)
+        J.s_waitcnt(mod=f"lgkmcnt(0) vmcnt({num_vm_stores})")
+        J.s_barrier()
+        compute(loop_n + 1)
 
-            # store mfma_C
-            soffset = J.gpr("su32", loop_n*wg_N*J.sizeof(C_dtype))
-            J.emit(storeC(0, soffset))
+        loop_n = (loop_cnt - 2)
+        J.s_barrier()
+        ds_readB(loop_n + 1)
+        global_store(loop_n)
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        J.s_barrier()
+        compute(loop_n + 1)
 
+        J.s_barrier()
+        loop_n = (loop_cnt - 1)
+        global_store(loop_n)
+
+        with J.If(J.warp_id[0] < 4):
+            J.s_barrier()
 
 
 def test_down(target_file):
+
     args_dict = torch.load(target_file)
     num_e_blocks = args_dict["num_e_blocks"]
     is_output_over_4GB = args_dict["is_output_over_4GB"]
@@ -364,8 +424,9 @@ def test_down(target_file):
     token_num = args_dict["token_num"]
 
     ref = stage2_out
+
     """
-    ret = torch.empty_like(ref)
+    ret1 = torch.empty_like(ref)
     pyhip.run_perftest(moe_gemm_down_tp, [1, num_e_blocks], [4*64],
                     is_output_over_4GB,
                     AB_dtype, wg_M, 64,
@@ -377,31 +438,48 @@ def test_down(target_file):
                     num_valid_ids.data_ptr(),
                     w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
                     a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
-                    ret.data_ptr(),
+                    ret1.data_ptr(),
                     token_num,
                     num_verbose=True,
                     num_name="moe_gemm_down_tp")
-    
-    print(calc_diff(ref, ret))
     """
     ret0 = ref
     for k in range(10):
-        ret = torch.empty_like(ref)
-        with pyhip.cudaPerf():
-            moe_gemm_down_8wave([1, num_e_blocks], [8*64],
-                            is_output_over_4GB,
-                            AB_dtype, wg_M, 64,
-                            E, model_dim, inter_dim, 
-                            False, w2_is_shuffled, topk,
-                            sorted_ids.data_ptr(),
-                            sorted_weights.data_ptr(),
-                            sorted_expert_ids.data_ptr(),
-                            num_valid_ids.data_ptr(),
-                            w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
-                            a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
-                            ret.data_ptr(),
-                            token_num)
-        print(k, calc_diff(ret, ret0))
-        ret0 = ret
+        ret1 = torch.empty_like(ref)
+        moe_gemm_down_8wave([1, num_e_blocks], [8*64],
+                        False,
+                        is_output_over_4GB,
+                        AB_dtype, wg_M, 64,
+                        E, model_dim, inter_dim, 
+                        False, w2_is_shuffled, topk,
+                        sorted_ids.data_ptr(),
+                        sorted_weights.data_ptr(),
+                        sorted_expert_ids.data_ptr(),
+                        num_valid_ids.data_ptr(),
+                        w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
+                        a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
+                        ret1.data_ptr(),
+                        token_num)
+        print(k, calc_diff(ret0, ret1))
+        ret0 = ret1
+        #print("ret2 vs  ref: ", calc_diff(ref, ret2))
+        #print("ret1 vs ret2: ", calc_diff(ret1, ret2))
+
+    """
+    print(ret1.shape)
+    print(ret2.shape)
+    cnt = 0
+    for b in range(token_num):
+        for t in range(topk):
+            d = calc_diff(ret1[b,t], ret2[b,t])
+            if d > 0:
+                print(f"============ {b},{t} {d}")
+
+                print(ret1[b,t,48:])
+                print(ret2[b,t,48:])
+                #assert pyhip.allclose(ret1[b,t], ret2[b,t])
+                cnt += 1
+                assert cnt < 2
+    """
 
 test_down("moe_gemm_down_16384_256_6144_256_True.pt")
