@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -19,6 +21,7 @@ gluon_gemm_a8w8_blockscale = None
 
 import pyhip
 from pyhip.contrib.gemm_fp8 import *
+from pyhip.contrib.w8a8_block_fp8_linear import *
 
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.set_default_device('cuda')
@@ -111,10 +114,9 @@ def txest_gemm(dtype, m, n, k, ck_preshuffle=True):
     return ret
 
 
-@pytest.mark.parametrize("k", [256])
-@pytest.mark.parametrize("n", [256, 256*6])
-@pytest.mark.parametrize("m", [32, 256, 2400])
-def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
+
+def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=False):
+    assert ck_preshuffle is False
     output_dtype = dtypes.bf16
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
@@ -125,6 +127,17 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
     weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    use_dump = os.environ.get("USE_DUMP")
+    if use_dump:
+        tensor_dir = "/mywork/"
+        load_path = os.path.join(tensor_dir, f"gemm_{m}_{n}_{k}.pt")
+        data = torch.load(load_path, map_location="cuda")
+        x = data["x"].to("cuda")
+        weight = data["weight"].to("cuda")
+        x_scale = data["x_scale"].to("cuda")
+        w_scale = data["w_scale"].to("cuda")
+        print(f"###############Loaded GEMM tensors from {load_path}", flush=True)
+
     #x_scale[...] = 1
     #w_scale[...] = 1
     print(w_scale.shape)
@@ -163,12 +176,6 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
             di = (di + 1) % BUF_COPY
 
 
-    if gluon_gemm_a8w8_blockscale is not None:
-        out_gluon = torch.empty((m, n), dtype=output_dtype, device=x.device)
-        for i in range(num_repeats):
-            with pyhip.cudaPerf(flops, rw_bytes, name=f"gluon_kernel_{di}") as p0:
-                gluon_gemm_a8w8_blockscale(As[di], Bs[di], Ascales[di], Bscales[di], output_dtype, out_gluon)
-            di = (di + 1) % BUF_COPY
 
     # gemm_8wave_fp8bf16fp16 requires  x_scale_t
     wg_M, wg_N = 256, 256
@@ -178,16 +185,13 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
     for i in range(num_repeats):
         with pyhip.cudaPerf(m*n*k*2, rw_bytes, name=f"asmjit_kernel_{di}") as p0:
             gemm_8wave_fp8bf16fp16([num_block_N * num_block_M],[64*8], "fp8", ck_preshuffle, True,
-                            wg_M, wg_N, n, k, As[di].data_ptr(), Bs[di].data_ptr(), out_jit.data_ptr(),
-                            ATscales[di].data_ptr(), Bscales[di].data_ptr(), m)
-
+                                wg_M, wg_N, n, k, As[di].data_ptr(), Bs[di].data_ptr(), out_jit.data_ptr(),
+                                ATscales[di].data_ptr(), Bscales[di].data_ptr(), m)
         di = (di + 1) % BUF_COPY
 
     print(f"{pyhip.calc_diff(out_torch, out_ck, diff_thr=0.01)=:.6f}")
     if ck_preshuffle:
         print(f"{pyhip.calc_diff(out_torch, out_asm, diff_thr=0.4)=:.6f}")
-    if gluon_gemm_a8w8_blockscale is not None:
-        print(f"{pyhip.calc_diff(out_torch, out_gluon, diff_thr=0.01)=:.2f}")
     print(f"{pyhip.calc_diff(out_torch, out_jit, diff_thr=0.04)=:.6f}")
     #show_diff(out_torch, out_jit)
 
@@ -225,10 +229,10 @@ if __name__ == "__main__":
     #M,N,K=8192,8192,8192
     #M,N,K=32768,9216,4096
     # pyhip_gemm_a8w8_blockscale:  torch.bfloat16 torch.float8_e4m3fn torch.Size([32, 4096]) torch.float8_e4m3fn torch.Size([1024, 4096]) [128, 128] True
-    M,N,K=32,1024,4096 
+    M,N,K=16384, 3584, 6144
     #M,N,K=256,256,128
     #test_gemm(dtypes.bf16, M, N, K, True)
-    test_perf(M,N,K, num_repeats=16, ck_preshuffle=False)
+    test_perf(M,N,K, num_repeats=1, ck_preshuffle=False)
     print(M,N,K)
 """
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):

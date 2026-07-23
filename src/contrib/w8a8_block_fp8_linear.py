@@ -5,7 +5,7 @@ import pyhip
 import torch
 import aiter
 from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
-from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale as aiter_gemm_a8w8_blockscale
+from aiter import gemm_a8w8_blockscale as aiter_gemm_a8w8_blockscale
 
 aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -61,20 +61,30 @@ def w8a8_block_fp8_linear(
     K = input.shape[-1]
     M = input.numel() // K
     N = weight.shape[0]
-    output = torch.empty([*input.shape[:-1], N], dtype = input.dtype, device = input.device)
 
-    if (M <= 512 and method != "jit") or method == "gluon":
-        #if input.device.index == 0:
-        #    print("=========================input ", input.shape, input.dtype, input.device)
-        #    print("=========================weight ", weight.shape, weight.dtype, weight.device)
-        #    print("=========================output ", output.shape, output.dtype, output.device)
-        #    print("=========================weight_scale ", weight_scale.shape, weight_scale.dtype, weight_scale.device, b_preshuffle)
+    N_need_padding = (N % 256 != 0)
+    padding_N = 256 - N % 256 if N_need_padding else 0
+    scale_need_padding = (N%256 <= 128)
+    #[m, n] padding n
+    output = torch.empty(*input.shape[:-1], N+padding_N, dtype = input.dtype, device = input.device)
+    #[n, k] padding n
+    padded_weight = torch.torch.nn.functional.pad(weight, (0, 0, 0, padding_N), value=0) if N_need_padding else weight
+    padded_w_scale = torch.torch.nn.functional.pad(weight_scale, (0, 0, 0, 1), value=0) if scale_need_padding else weight_scale
 
-        if gemm_splitk(input, weight, output, weight_scale, b_preshuffle):
-            if bias is not None:
-                output += bias
-            return output
+    # if (M <= 512 and method != "jit") or method == "gluon":
+    #     #if input.device.index == 0:
+    #     #    print("=========================input ", input.shape, input.dtype, input.device)
+    #     #    print("=========================weight ", weight.shape, weight.dtype, weight.device)
+    #     #    print("=========================output ", output.shape, output.dtype, output.device)
+    #     #    print("=========================weight_scale ", weight_scale.shape, weight_scale.dtype, weight_scale.device, b_preshuffle)
 
+    #     if gemm_splitk(input, weight, output, weight_scale, b_preshuffle):
+    #         if bias is not None:
+    #             output += bias
+    #         return output
+
+
+                
     q_input, x_scale = aiter_per1x128_quant(input.view(M, K), quant_dtype=aiter.dtypes.fp8, transpose_scale=True)
 
     #print(M,K,N, input.shape, q_input.shape, x_scale.shape)
@@ -85,11 +95,13 @@ def w8a8_block_fp8_linear(
     num_block_N = pyhip.div_up(N, wg_N)
     gemm_8wave_fp8bf16fp16([num_block_M * num_block_N],[64*8],
                     "fp8", b_preshuffle, use_f32_blockscales_128,
-                    wg_M, wg_N, N, K,
+                    wg_M, wg_N, N+padding_N, K,
                     q_input.data_ptr(),
-                    weight.data_ptr(),
+                    padded_weight.data_ptr(),
                     output.data_ptr(),
-                    x_scale.data_ptr(), weight_scale.data_ptr(), M)
+                    x_scale.data_ptr(), padded_w_scale.data_ptr(), M)
+    if N_need_padding:
+        output = output[..., :N].contiguous()
     if bias is not None:
         output += bias
 
