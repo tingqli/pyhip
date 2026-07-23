@@ -5,7 +5,7 @@ import torch
 
 import contextlib
 
-pyhip.set_device()
+pyhip.set_device(0)
 
 @pyhip.jit(with_debug_log=False)
 def moe_gemm_down_8wave(J, do_ref, is_output_over_4GB, AB_dtype, wg_M, wg_N,
@@ -214,8 +214,9 @@ def moe_gemm_down_8wave(J, do_ref, is_output_over_4GB, AB_dtype, wg_M, wg_N,
                                                       mfma_B[n, k:k+1],
                                                       mfma_A[m, k:k+1],
                                                       0)
+                        #J.s_nop(4)
                         dequant_queue.append([temp, mfma_scaleAB, (m,n)])
-                        if len(dequant_queue) > 2:
+                        if len(dequant_queue) > 3:
                             tc, ts, (tm,tn) = dequant_queue.pop(0)
                             J.v_fmac_f32(mfma_C[c_index, tm, tn, 0], tc[0], ts)
                             J.v_fmac_f32(mfma_C[c_index, tm, tn, 1], tc[1], ts)
@@ -348,15 +349,13 @@ def moe_gemm_down_8wave(J, do_ref, is_output_over_4GB, AB_dtype, wg_M, wg_N,
             global_store(loop_n)
             J.s_waitcnt(mod=f"vmcnt(0)")
             J.s_barrier()
-    else:
-                
+    else: 
         global_readB(0)
         global_readB(1)
         J.s_waitcnt(mod=f"vmcnt({num_vm_loads})")
 
         # (BBBB... is extra initial barrirer for wave 4567)
-        with J.If(J.warp_id[0] > 3):
-            J.s_barrier()
+        with J.If(J.warp_id[0] > 3): J.s_barrier()
 
         J.s_barrier()
         ds_readB(0)
@@ -396,9 +395,23 @@ def moe_gemm_down_8wave(J, do_ref, is_output_over_4GB, AB_dtype, wg_M, wg_N,
         loop_n = (loop_cnt - 1)
         global_store(loop_n)
 
-        with J.If(J.warp_id[0] < 4):
-            J.s_barrier()
+        J.s_waitcnt(mod=f"lgkmcnt(0) vmcnt(0)")
+        with J.If(J.warp_id[0] < 4): J.s_barrier()
 
+def check_diff(ret1, ret2):
+    print(ret1.shape)
+    print(ret2.shape)
+    cnt = 0
+    for b in range(ret1.shape[0]):
+        for t in range(ret1.shape[1]):
+            d = calc_diff(ret1[b,t], ret2[b,t])
+            if d > 0:
+                print(f"============ {b},{t} {d}")
+                print(ret1[b,t,48:])
+                print(ret2[b,t,48:])
+                assert pyhip.allclose(ret1[b,t], ret2[b,t])
+                cnt += 1
+                assert cnt < 2
 
 def test_down(target_file):
 
@@ -423,31 +436,11 @@ def test_down(target_file):
     stage2_out = args_dict["stage2_out"]
     token_num = args_dict["token_num"]
 
-    ref = stage2_out
-
-    """
-    ret1 = torch.empty_like(ref)
-    pyhip.run_perftest(moe_gemm_down_tp, [1, num_e_blocks], [4*64],
-                    is_output_over_4GB,
-                    AB_dtype, wg_M, 64,
-                    E, model_dim, inter_dim, 
-                    False, w2_is_shuffled, topk,
-                    sorted_ids.data_ptr(),
-                    sorted_weights.data_ptr(),
-                    sorted_expert_ids.data_ptr(),
-                    num_valid_ids.data_ptr(),
-                    w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
-                    a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
-                    ret1.data_ptr(),
-                    token_num,
-                    num_verbose=True,
-                    num_name="moe_gemm_down_tp")
-    """
-    ret0 = ref
-    for k in range(10):
-        ret1 = torch.empty_like(ref)
-        moe_gemm_down_8wave([1, num_e_blocks], [8*64],
-                        False,
+    ref_new = stage2_out
+    if 0:
+        ref_new = torch.zeros_like(stage2_out)
+        #w2[...] = 0.125
+        moe_gemm_down_tp([1, num_e_blocks], [4*64],
                         is_output_over_4GB,
                         AB_dtype, wg_M, 64,
                         E, model_dim, inter_dim, 
@@ -458,28 +451,53 @@ def test_down(target_file):
                         num_valid_ids.data_ptr(),
                         w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
                         a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
-                        ret1.data_ptr(),
+                        ref_new.data_ptr(),
                         token_num)
-        print(k, calc_diff(ret0, ret1))
+
+        print("ref_new: ", calc_diff(ref, ref_new))
+    if 0:
+        ref_new[...] = 0
+        moe_gemm_down_8wave([1, num_e_blocks], [8*64],
+                        True,
+                        is_output_over_4GB,
+                        AB_dtype, wg_M, 64,
+                        E, model_dim, inter_dim, 
+                        False, w2_is_shuffled, topk,
+                        sorted_ids.data_ptr(),
+                        sorted_weights.data_ptr(),
+                        sorted_expert_ids.data_ptr(),
+                        num_valid_ids.data_ptr(),
+                        w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
+                        a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
+                        ref_new.data_ptr(),
+                        token_num)
+
+    ret0 = ref_new
+    for k in range(10):
+        ret1 = torch.zeros_like(ref_new)
+        with pyhip.cudaPerf():
+            moe_gemm_down_8wave([1, num_e_blocks], [8*64],
+                            False,
+                            is_output_over_4GB,
+                            AB_dtype, wg_M, 64,
+                            E, model_dim, inter_dim, 
+                            False, w2_is_shuffled, topk,
+                            sorted_ids.data_ptr(),
+                            sorted_weights.data_ptr(),
+                            sorted_expert_ids.data_ptr(),
+                            num_valid_ids.data_ptr(),
+                            w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
+                            a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
+                            ret1.data_ptr(),
+                            token_num)
+        print(k, calc_diff(ref_new, ret1), calc_diff(ret0, ret1))
+
+        #check_diff(ref_new, ret1)
+        #assert 0
         ret0 = ret1
+
         #print("ret2 vs  ref: ", calc_diff(ref, ret2))
         #print("ret1 vs ret2: ", calc_diff(ret1, ret2))
 
-    """
-    print(ret1.shape)
-    print(ret2.shape)
-    cnt = 0
-    for b in range(token_num):
-        for t in range(topk):
-            d = calc_diff(ret1[b,t], ret2[b,t])
-            if d > 0:
-                print(f"============ {b},{t} {d}")
-
-                print(ret1[b,t,48:])
-                print(ret2[b,t,48:])
-                #assert pyhip.allclose(ret1[b,t], ret2[b,t])
-                cnt += 1
-                assert cnt < 2
-    """
 
 test_down("moe_gemm_down_16384_256_6144_256_True.pt")
