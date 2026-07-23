@@ -5,7 +5,7 @@ from aiter import dtypes
 import os
 import contextlib
 
-from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave_g1u1
+from .moe_gemm_8wave import moe_gemm_final_reduce_bf16, moe_gemm_8wave_g1u1, moe_gemm_8wave_down
 from .moe import moe_2stage_splitk, moe_2stage_gateup, moe_2stage_down
 try:
     SPLITK = int(os.getenv("USE_GLUON_SPLITK", "1"))
@@ -403,6 +403,7 @@ def fused_moe(
     do_perf = False
     if do_perf:
         valid_e_blocks = num_valid_ids[0].item()//wg_M
+        print(f"block_size_M:{block_size_M} valid_e_blocks = {valid_e_blocks}")
     if 0:
         moe_gemm_ref(activation, quant_type, topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a1, a1_scale,
@@ -492,7 +493,8 @@ def fused_moe(
                 assert 0, f"{a2.dtype=} {w2.dtype=}"
             #sorted_expert_ids[...] = 0
             if inter_dim <= 256 and w2_is_shuffled:
-                moe_gemm_down_tp([1, num_e_blocks], [4*64],
+                #moe_gemm_down_tp([1, num_e_blocks], [4*64],
+                moe_gemm_8wave_down([1, num_e_blocks], [8*64],
                                 stage2_out.element_size() * stage2_out.numel() > (1<<32),
                                 AB_dtype, wg_M, 64,
                                 E, model_dim, inter_dim, 
@@ -505,6 +507,33 @@ def fused_moe(
                                 a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
                                 stage2_out.data_ptr(),
                                 token_num)
+                import os
+                target_file = f"moe_gemm_down_{token_num}_{inter_dim}_{model_dim}_{wg_M}_{w2_is_shuffled}.pt"
+                if not os.path.exists(target_file):
+                    args_dict = {
+                        "num_e_blocks": num_e_blocks,
+                        "is_output_over_4GB": stage2_out.element_size() * stage2_out.numel() > (1<<32),
+                        "AB_dtype":AB_dtype,
+                        "wg_M": wg_M,
+                        "E": E,
+                        "model_dim": model_dim,
+                        "inter_dim": inter_dim,
+                        "w2_is_shuffled": w2_is_shuffled,
+                        "topk":topk,
+                        "sorted_ids":sorted_ids,
+                        "sorted_weights":sorted_weights,
+                        "sorted_expert_ids":sorted_expert_ids,
+                        "num_valid_ids":num_valid_ids,
+                        "w2":w2,
+                        "w2_scale":w2_scale,
+                        "a2":a2,
+                        "a2_scale":a2_scale,
+                        "stage2_out":stage2_out,
+                        "token_num":token_num
+                    }
+                    torch.save(args_dict, target_file)
+                    assert 0,f"================================= {target_file} is saved!"
+
             else:
                 if USE_GLUON2:
                     BLOCK_TILE_SIZE_M = block_size_M
