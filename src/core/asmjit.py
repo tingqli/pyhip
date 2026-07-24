@@ -3528,6 +3528,63 @@ r'''
     def pk_f32_to_bf16(self, vdst, vsrc0, vsrc1):
         self.v_perm_b32(vdst, vsrc0, vsrc1, self.get_sgpr_const(0x03_02_07_06))
 
+
+    # J.wg_load_lds(lds_scaleB, pScaleB, J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
+    #               num_warps, wait_barrier = True)
+    def wg_buffer_load_lds(self, lds, pbuff, s_offset, nbytes0, num_warps = 4, wait_barrier = True):
+        # global_load_lds_dwordx4
+        assert isinstance(nbytes0, int)
+        nbytes = nbytes0
+        offset0 = 0
+        limit_dw = self.gpr("vu32", nbytes)
+
+        warp_off_cnt = self.gpr(self.warp_id[0] * self.warp_size)
+        if self.cdna >= 4:
+            # load in DW4
+            num_load_lanes = nbytes // self.sizeof_DW4
+            nbytes -= num_load_lanes * self.sizeof_DW4
+            offset0 += num_load_lanes * self.sizeof_DW4
+
+            num_loads = self.div_up(num_load_lanes, num_warps * self.warp_size)
+            ioff = 0
+            voffset = self.gpr("vu32", self.threadIdx.x[0] * self.sizeof_DW4 + s_offset[0])
+            voff = self.gpr("vu32", self.threadIdx.x[0] * self.sizeof_DW4)
+            limit_dw4 = self.gpr("vu32", nbytes0 - self.sizeof_DW4)
+            self.s_mov_b32("m0", warp_off_cnt * self.sizeof_DW4 + lds)
+            for i in range(num_loads):
+                ioff += num_warps * self.warp_size * self.sizeof_DW4
+                if ioff <= nbytes0:
+                    pbuff.load_dwordx4(None, voffset, 0)
+                    # self.global_load_lds_dwordx4(voff, pdata)
+                else:
+                    with self.ExecMask(voff[0] <= limit_dw4, early_skip = False):
+                        # self.global_load_lds_dwordx4(voff, pdata)
+                        pbuff.load_dwordx4(None, voffset, 0)
+                if i + 1 < num_loads:
+                    voff[0] += num_warps * self.warp_size * self.sizeof_DW4
+                    voffset[0] += num_warps * self.warp_size * self.sizeof_DW4
+                    self.s_addk_i32("m0", num_warps * self.warp_size * self.sizeof_DW4)
+
+        if nbytes > 0:
+            # load in DW
+            #assert nbytes % self.sizeof_DW == 0, nbytes
+            num_loads = self.div_up(nbytes, num_warps * self.warp_size * self.sizeof_DW)
+            voff = self.gpr("vu32", offset0 + self.threadIdx.x[0] * self.sizeof_DW)
+            voffset = self.gpr("vu32", offset0 + self.threadIdx.x[0] * self.sizeof_DW+s_offset[0])
+            self.s_mov_b32("m0", warp_off_cnt * self.sizeof_DW + (lds + offset0))
+            for i in range(num_loads):
+                with self.ExecMask(voff[0] < limit_dw, early_skip = False):
+                    pbuff.load_dword(None, voffset, 0)
+                    # self.global_load_lds_dword(voff, pdata)
+                if i + 1 < num_loads:
+                    voff[0] += num_warps * self.warp_size * self.sizeof_DW
+                    voffset[0] += num_warps * self.warp_size * self.sizeof_DW
+                    self.s_addk_i32("m0", num_warps * self.warp_size * self.sizeof_DW)
+
+        if wait_barrier:
+            self.s_waitcnt(mod="vmcnt(0)")
+            self.s_barrier()
+
     def wg_load_lds(self, lds, pdata, nbytes0, num_warps = 4, wait_barrier = True):
         # global_load_lds_dwordx4
         assert isinstance(nbytes0, int)

@@ -44,14 +44,25 @@ def gemm_8wave_fp8bf16fp16(J,
     M1 = J.gpr("su32")
     J.s_min_u32(M1, M0 + wg_M, M)
     Mc = J.gpr("su32", M1 - M0)
+    
 
-    assert N % wg_N == 0
+    
+    if rotate_mfma_C:
+        assert N % wg_N == 0
+    else:
+        assert N % 32 == 0
     num_warps = 8
     nbN = J.div(wg_N, 16)
     nbM = J.div(wg_M, 16)
     nbK = 2 # 2 MFMA 16x16 
     buff_a = J.Buffer(pA, Mc * stride_k)
     buff_b = J.Buffer(pB, wg_N * stride_k)
+    if N % 256 != 0:
+        N0 = J.gpr("su32", blk_n * wg_N)
+        N1 = J.gpr("su32")
+        J.s_min_u32(N1, N0 + wg_M, N)
+        Nc = J.gpr("su32", N1 - N0)
+        buff_b = J.Buffer(pB, Nc * stride_k)
     buff_c = J.Buffer(pC, Mc * stride_C)
 
     WARPS_COL = 4
@@ -122,10 +133,17 @@ def gemm_8wave_fp8bf16fp16(J,
 
         # scale of B(weights) are very small, can be all loaded into LDS
         lds_scaleB = J.alloc_lds(J.div(K, scale_BK) * J.div(wg_N, scale_BN) * J.sizeof_f32)
-        pScaleB[:] += blk_n * (J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32)
+        if 0:
+            pScaleB[:] += blk_n * (J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32)
 
-        J.wg_load_lds(lds_scaleB, pScaleB, J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
-                      num_warps, wait_barrier = True)
+            J.wg_load_lds(lds_scaleB, pScaleB, J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
+                        num_warps, wait_barrier = True)
+        else:
+            buff_sb = J.Buffer(pScaleB, J.div_up(N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32)
+            soffset = J.gpr("su32", blk_n * (J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32))
+            J.wg_buffer_load_lds(lds_scaleB, buff_sb, soffset, J.div(wg_N, scale_BN) * J.div(K, scale_BK) * J.sizeof_f32,
+            num_warps, wait_barrier = True)
+        
 
         num_scaleB = J.div(wg_N, scale_BN)
         mfma_scaleA = J.gpr(nrM, "vf32")
@@ -156,9 +174,9 @@ def gemm_8wave_fp8bf16fp16(J,
 
 
     # v_mfma_f32_16x16x128_f8f6f4: 
-    mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4x[16,128]
-    mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")            # 2x[16,128]
-    mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 4x[4,2]x[16,16]
+    mfma_A = J.gpr(nrM, 2, 4, "vfp8x4")            # 4nrMx  x [16,128]
+    mfma_B = J.gpr(2, nrN, 2, 4, "vfp8x4")            # 2slicNx 4nrN x [16,128]
+    mfma_C = J.gpr(4, nrM, nrN, 4, "vf32")      # 4slicex[4nrM,2nrN]x[16,16]
 
     if use_f32_blockscales_128:
         MFMA_FIFO_CNT = nrM * nrN
@@ -438,6 +456,7 @@ def gemm_8wave_fp8bf16fp16(J,
     stride_c = N * J.sizeof_bf16
 
     if not rotate_mfma_C:
+        N_tail = N % 256
         vbf16 = J.gpr(4, "vbf16x2")
         col = J.lane_id // 16
         swap_12_col = (col & 1) * 2 + (col >> 1)
@@ -449,23 +468,45 @@ def gemm_8wave_fp8bf16fp16(J,
             cm = cindex // 2
             cn = cindex % 2
             vaddr = J.gpr("vu32", vaddr0[0] + cm*HALF_BLOCK_SIZE_ROW*stride_c)
-            for m in range(nrM):
-                for n in range(0, nrN, 2):
-                    J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
-                    J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
-                    J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
-                    J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
-                    #    a0    a1   a2   a3   | 01 23
-                    #    b0    b1   b2   b3   | 45 67
-                    #  v_permlane16_swap_b32(a, b)
-                    #    a0    b0   a2   b2   |
-                    #    a1    b1   a3   b3   |
-                    #
-                    # swap of row 1 & 2 are done by swapping lane-address 
-                    J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
-                    J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
-                    buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*4*J.sizeof_DW2 + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
-                vaddr[0] += 16*stride_c
+            
+            if N_tail == 0:
+                for m in range(nrM):
+                    for n in range(0, nrN, 2):
+                        J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
+                        J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
+                        J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
+                        J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
+                        #    a0    a1   a2   a3   | 01 23
+                        #    b0    b1   b2   b3   | 45 67
+                        #  v_permlane16_swap_b32(a, b)
+                        #    a0    b0   a2   b2   |
+                        #    a1    b1   a3   b3   |
+                        #
+                        # swap of row 1 & 2 are done by swapping lane-address 
+                        J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                        J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                        buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*4*J.sizeof_DW2 + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
+                    vaddr[0] += 16*stride_c
+            else:
+                warp_N_start = J.gpr("su32", blk_n * wg_N + cn * HALF_BLOCK_SIZE_COL + warp_n * 32)
+                with J.If(warp_N_start[0] <= (N -32)):
+                    for m in range(nrM):
+                        for n in range(0, nrN, 2):
+                            J.uni_cvt_pk_bf16_f32(vbf16[0], mfma_C[cindex, m,n,0], mfma_C[cindex, m,n,1]) 
+                            J.uni_cvt_pk_bf16_f32(vbf16[1], mfma_C[cindex, m,n,2], mfma_C[cindex, m,n,3])
+                            J.uni_cvt_pk_bf16_f32(vbf16[2], mfma_C[cindex, m,n+1,0], mfma_C[cindex, m,n+1,1])
+                            J.uni_cvt_pk_bf16_f32(vbf16[3], mfma_C[cindex, m,n+1,2], mfma_C[cindex, m,n+1,3])
+                            #    a0    a1   a2   a3   | 01 23
+                            #    b0    b1   b2   b3   | 45 67
+                            #  v_permlane16_swap_b32(a, b)
+                            #    a0    b0   a2   b2   |
+                            #    a1    b1   a3   b3   |
+                            #
+                            # swap of row 1 & 2 are done by swapping lane-address 
+                            J.v_permlane16_swap_b32(vbf16[0], vbf16[2])
+                            J.v_permlane16_swap_b32(vbf16[1], vbf16[3])
+                            buff_c.store_dwordx4(vbf16, vaddr, 0, offset12 = n*4*J.sizeof_DW2 + cn*HALF_BLOCK_SIZE_COL*J.sizeof_bf16)
+                        vaddr[0] += 16*stride_c
     else: # rotate_mfma_C
         #
         # [2, 4] warp  [4, 2i]x[16, 16] mfma_C  `i means inner-most dimension`

@@ -14,7 +14,7 @@ torch.manual_seed(0)
 @pytest.mark.parametrize("K", [256])
 @pytest.mark.parametrize("bpreshuffle", [True, False])
 @pytest.mark.parametrize("AB_dtype", ["fp8", "bf16","fp16"])
-def test(M, N, K, AB_dtype, bpreshuffle):
+def test(M, N, K, AB_dtype, bpreshuffle, rep=32):
     out_dtype = torch.bfloat16
     if AB_dtype == "fp8":
         in_dtype = torch.float8_e4m3fn
@@ -77,19 +77,18 @@ def test(M, N, K, AB_dtype, bpreshuffle):
                 print(y1[i].view(-1,8))
                 assert 0
 
-    BUF_COPY = 64
+    BUF_COPY = 1
     As = [x.clone() for _ in range(BUF_COPY)]
     Bs = [w.clone() for _ in range(BUF_COPY)]
     Cs = [torch.empty((M, N), dtype = out_dtype) for _ in range(BUF_COPY)]
     di = 0
-    for i in range(32):
+    for i in range(rep):
         with pyhip.cudaPerf(M*N*K*2, name=f"gemm_8wave_fp8bf16fp16-{M}_{N}_{K}_{bpreshuffle=}"):
             gemm_8wave_fp8bf16fp16([num_block_N*num_block_M],[64*8], AB_dtype, bpreshuffle, False,
                            wg_M, wg_N, N, K,
                            As[di].data_ptr(), Bs[di].data_ptr(), Cs[di].data_ptr(),
                            None, None, M)
         di = (di + 1)%BUF_COPY
-    
     print(f"{diff_all=:.2f}")
 '''
     HipKittens/kernels/gemm/fp8fp32/FP8_8wave# ./tk_kernel 
@@ -101,13 +100,30 @@ def test(M, N, K, AB_dtype, bpreshuffle):
 '''
 
 if __name__ == "__main__":
-    M,N,K = 8192,8192,8192
+    # M,N,K = 8192,8192,8192
     #test(M=256,N=256,K=256, bpreshuffle = False); assert 0
     AB_dtype = "fp8"
     #test(M=8192,N=8192,K=8192, AB_dtype=AB_dtype, bpreshuffle = False); assert 0
     #M,N,K = 512,512,8192
-    test(M=256,N=256,K=256, AB_dtype=AB_dtype, bpreshuffle = False)
-    test(M=256,N=256,K=256, AB_dtype=AB_dtype, bpreshuffle = True)
+    # test(M=16384,N=3584,K=6144, AB_dtype=AB_dtype, bpreshuffle = True)
+    # test(M=16384,N=3392,K=6144, AB_dtype=AB_dtype, bpreshuffle = True)
+    # test(M=4096,N=3072+32,K=6144, AB_dtype=AB_dtype, bpreshuffle = True)
+    # test(M=4096,N=3072+64,K=6144, AB_dtype=AB_dtype, bpreshuffle = True)
+    # test(M=4096,N=3072+128,K=6144, AB_dtype=AB_dtype, bpreshuffle = True)
+    # test(M=4096,N=3072+192,K=6144, AB_dtype=AB_dtype, bpreshuffle = True)
+    
+    for m in range(16384,16384+40,4):
+        for n in [3392,]:
+            for k in [6144,]:
+                print(f"#########################pyhip_gemm_a8w8_blockscale: {m=} {n=} {k=} preshuffle: False")
+                test(M=m,N=n,K=k, AB_dtype=AB_dtype, bpreshuffle = False, rep=5)
 
-    test(M=8192,N=8192,K=8192, AB_dtype=AB_dtype, bpreshuffle = False)
-    test(M=8192,N=8192,K=8192, AB_dtype=AB_dtype, bpreshuffle = True)
+
+
+
+
+
+    # test(M=256,N=256,K=256, AB_dtype=AB_dtype, bpreshuffle = True)
+
+    # test(M=8192,N=8192,K=8192, AB_dtype=AB_dtype, bpreshuffle = False)
+    # test(M=8192,N=8192,K=8192, AB_dtype=AB_dtype, bpreshuffle = True)
