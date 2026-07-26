@@ -132,7 +132,9 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
     perm_M 挪到全局 K(_make_ktiles)+ 展开2x + K-prefetch:266.0 TFLOPS @M=N=40960(2.24x rocBLAS)。
     H: head 数(multi-head,grid.y=head)。
     softmax: 编译时开关。True=在线 flash softmax;False=纯双 GEMM(S@V,无 softmax/scale)-> ~260T 基线。
+    softmax=True 时固定使用 lazy rebase:局部最大值超过参考值 8(log2 域)时才重缩放 l/O。
     """
+    assert BN == 32
     assert BM % 32 == 0 and BN % 16 == 0 and D % 16 == 0 and N % BN == 0 and M % BM == 0
     assert (N // BN) % 2 == 0, "KV tile 数需为偶数(循环展开 2 次)"
     WAVES = BM // 32                    # 每 wave 负责 32 行 query
@@ -263,37 +265,64 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
                     rocdl.sched_mfma(1)
             rocdl.sched_barrier(0)
 
+        def gemm1_mt(mt):
+            # GEMM1 fragments are [value, m_rep=2, n_rep=2, k_rep=8].
+            # Fixing n_rep=mt gives one independent 16-row query accumulator group.
+            for k in range_constexpr(D // 16):
+                for m in range_constexpr(BN // 16):
+                    acc = frag_St[None, m, mt]
+                    fx.mma_atom_call(
+                        mma,
+                        acc,
+                        frag_K[None, m, k],
+                        frag_Q[None, mt, k],
+                        acc,
+                    )
+
         # 展开 2 次:偶/奇两步 LDS stage(wr)变编译期常量,消掉 kv%2;fragment 全部复用
         # K 读做成 prefetch:frag_K 在上一步 GEMM2 之后就读好,GEMM1 直接用(藏 LDS 读延迟)
         def kv_step(kv_i, wr, ld_cur, ld_next, m0, m1, l0, l1):
             # V 直读 paged global -> frag_V
             fx.copy(cp_vg, tcV.partition_S(v_g[None, None, kv_i]), tcV.retile(frag_V))
-            # GEMM1 = K@Q^T(frag_K 已在上一步/prologue prefetch)
+            # Split GEMM1 by its two independent query-row accumulator groups.
             frag_St.fill(0)
-            fx.gemm(mma, frag_St, frag_K, frag_Q, frag_St)
+            for mt in range_constexpr(2):
+                gemm1_mt(mt)
             hot_loop_scheduler(True)
             fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 2, 0]), ld_next)
             if const_expr(softmax):
-                # ---- 在线 flash softmax(frag_St=S^T[Nk,Mq],C 布局 mode2=Mq-tile,每 lane 2 个 Mq)----
                 m_in, l_in = [m0, m1], [l0, l1]
                 m_out, l_out, corr = [None, None], [None, None], [None, None]
                 for mt in range_constexpr(2):
-                    v = frag_St[None, None, mt].load() * sm_scale_log2  # S*sm_scale*LOG2E(LOG2E 已折入,log2 域)
-                    tmax = v.reduce("max")                         # lane 内 8 Nk 求 max
-                    for sh in (16, 32):                           # 跨 lane 归约 Nk(l//16 的 4 组)
-                        tmax = _maxnumf(tmax, tmax.shuffle_xor(sh, 64))
-                    nm = _maxnumf(m_in[mt], tmax)                 # 新 running max(log2 域)
-                    corr[mt] = _exp2_amdgcn(m_in[mt] - nm)        # exp2(Δm):LOG2E 已折入,免 *LOG2E
-                    p = _exp2_vec_amdgcn(v - nm)                  # P^T=exp2(v-nm)(8 Nk),f32;免逐元素 *LOG2E
-                    ts = p.reduce("add")                          # lane 内 8 Nk 求和
+                    v = frag_St[None, None, mt].load() * sm_scale_log2
+                    tmax = v.reduce("max")
                     for sh in (16, 32):
-                        ts = ts + ts.shuffle_xor(sh, 64)          # 跨 lane 归约
-                    l_out[mt] = l_in[mt] * corr[mt] + ts          # running sum 在线更新
+                        tmax = _maxnumf(tmax, tmax.shuffle_xor(sh, 64))
+                    nm = m_in[mt]
+                    corr_mt = fx.Float32(1.0)
+                    if tmax > m_in[mt] + fx.Float32(8.0):
+                        nm = tmax
+                        corr_mt = _exp2_amdgcn(m_in[mt] - nm)
+                    corr[mt] = corr_mt
+                    p = _exp2_vec_amdgcn(v - nm)
+                    ts = p.reduce("add")
+                    for sh in (16, 32):
+                        ts = ts + ts.shuffle_xor(sh, 64)
+                    # 用一次舍入的两条 scalar FMA 替代 packed MUL + 两条 ADD；精度由回归测试约束。
+                    l_out[mt] = fx.fma(l_in[mt], corr[mt], ts)
                     m_out[mt] = nm
-                    frag_St[None, None, mt].store(p)              # 覆盖 frag_St=P(register trick 复用)
+                    frag_St[None, None, mt].store(p)
                 for mt in range_constexpr(2):                     # 旧 O 按 correction 缩放(GEMM2 累加前)
                     ot = frag_O[None, None, mt]
-                    ot.store(ot.load() * corr[mt])
+                    def rescale_output():
+                        ot.store(ot.load() * corr[mt])
+
+                    @flyc.jit
+                    def rescale_if_needed():
+                        if corr[mt] < fx.Float32(1.0):
+                            rescale_output()
+
+                    rescale_if_needed()
                 m0, m1, l0, l1 = m_out[0], m_out[1], l_out[0], l_out[1]
             # register trick:S^T(启 softmax 时=P^T)直接作 GEMM2 的 B
             frag_Stb = _cvt_f32_to_bf16(frag_St)  # add-0x8000 舍入,省 RNE+NaN 指令
@@ -323,7 +352,7 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
             frag_ldK.store(state[1])  # 恢复 frag_ldK = K(2*kv+1) coop 数据
             frag_K.store(state[2])    # 恢复上一步 prefetch 的 frag_K = K(2*kv)
             if const_expr(softmax):
-                m0, m1, l0, l1 = state[3], state[4], state[5], state[6]  # 恢复 softmax 在线统计
+                m0, m1, l0, l1 = state[3], state[4], state[5], state[6]
             else:
                 m0 = m1 = l0 = l1 = None
             kv0 = fx.Int32(kv) * 2
@@ -392,7 +421,7 @@ def main():
     args = (Q, K, V_shuf, o_fly, stream)
 
     _softmax = os.environ.get("SOFTMAX", "1") == "1"  # 编译时开关:0=无 softmax 纯双 GEMM(应 ~260T)
-    print(f"[cfg] H={H} M={M} N={N} D={D} softmax={_softmax}")
+    print(f"[cfg] H={H} M={M} N={N} D={D} softmax={_softmax} softmax_impl=lazy_delta8")
 
     compiled = fly_compiled(
         (M, N, D, BM, BN, H, _softmax),
