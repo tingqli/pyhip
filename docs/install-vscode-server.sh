@@ -1,6 +1,6 @@
 #!/bin/bash
 
-COMMIT_ID="7e7950df89d055b5a378379db9ee14290772148a"
+COMMIT_ID="4fe60c8b1cdac1c4c174f2fb180d0d758272d713"
 
 INSTALL_DIR="$HOME/.vscode-server/bin/$COMMIT_ID"
 mkdir -p "$INSTALL_DIR"

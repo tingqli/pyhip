@@ -470,10 +470,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                 hidden_states, quant_dtype=weight_type)
                             a_scale = a_scale.to(torch.float32).contiguous()
                         else:
-                            fmax = torch.finfo(weight_type).max
-                            a_scale = hidden_states.float().abs().amax() / fmax
-                            gateup_in = (hidden_states.float() / a_scale).clamp(-fmax, fmax).to(weight_type)
-                            a_scale = a_scale.reshape(1).to(torch.float32)
+                            gateup_in, a_scale = flydsl_quant_fp8_per_tensor(hidden_states, quant_dtype=weight_type)
                     else:
                         gateup_in = hidden_states
                         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
@@ -516,10 +513,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                                 gemm1_out.view(B * TOPK, -1), quant_dtype=weight_type)
                             a_scale = a_scale.to(torch.float32).contiguous()
                         else:
-                            fmax = torch.finfo(weight_type).max
-                            a_scale = gemm1_out.float().abs().amax() / fmax
-                            down_in = (gemm1_out.float() / a_scale).clamp(-fmax, fmax).to(weight_type)
-                            a_scale = a_scale.reshape(1).to(torch.float32)
+                            down_in, a_scale = flydsl_quant_fp8_per_tensor(gemm1_out, quant_dtype=weight_type)
                     else:
                         down_in = gemm1_out
                         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
@@ -1073,21 +1067,38 @@ if __name__ == '__main__':
         "E":64,
         "TOPK":8,
         "run_count":10,
-        "quant_type":'ptpc'
+        "quant_type":'per_tensor'
     }
-    qwen35_args = {
+    qwen35_397B_args = {
         "HIDDEN_SIZE":4096,
-        "INTER_SIZE":128*8,
+        "INTER_SIZE":512*8,
         "TP":8,
         "E":512,
         "TOPK":10,
         "run_count":10,
         "quant_type":'ptpc'
     }
-
-    model_args = hy3_args
-    model_args = qwen35_args
-    batch = [32768*4]
+    qwen35_35B_args = {
+        "HIDDEN_SIZE":2048,
+        "INTER_SIZE":512,
+        "TP":1,
+        "E":256,
+        "TOPK":8,
+        "run_count":10,
+        "quant_type":'ptpc'
+    }
+    xiaomi_args = {
+        "HIDDEN_SIZE":6144,
+        "INTER_SIZE":256*8,
+        "TP":8,
+        "E":384,
+        "TOPK":8,
+        "run_count":10,
+        "quant_type":'ptpc'
+    }    
+    #model_args = hy3_args
+    model_args = qwen35_35B_args
+    batch = [16384]
     prec = [get_fp8type()]
     #prec = [torch.bfloat16]
     entry_common('aiter', batch, prec, **tile_mn, **model_args)

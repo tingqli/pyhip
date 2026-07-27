@@ -18,6 +18,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr.utils.arith import _to_raw as _raw
 import pyhip.contrib.flydsl.helpers as fxh
 
+#fxh.dump_ir(True)
 
 # debug
 if 0:

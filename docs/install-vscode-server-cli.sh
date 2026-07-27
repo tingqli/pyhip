@@ -1,6 +1,6 @@
 #!/bin/bash
 
-COMMIT_ID=7e7950df89d055b5a378379db9ee14290772148a
+COMMIT_ID=4fe60c8b1cdac1c4c174f2fb180d0d758272d713
 
 SERVER_DIR="$HOME/.vscode-server/cli/servers/Stable-$COMMIT_ID/server"
 mkdir -p "$SERVER_DIR"
@@ -18,5 +18,5 @@ mv code "$HOME/.vscode-server/code-$COMMIT_ID"
 
 rm "$CLI_TAR"
 
-echo "安装完成！请重新尝试连接 Remote-SSH。"
+echo "$HOME/.vscode-server/code-$COMMIT_ID tunnel"
 

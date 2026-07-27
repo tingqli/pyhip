@@ -429,7 +429,7 @@ def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
         for i in range(num_loads):
             J.s_waitcnt(mod=f"lgkmcnt({min(15,num_loads - i - 1)})")
             with J.ExecMask(voff_vmem_row[i] < M[0], early_skip=False):
-                J.global_store_dwordx4(voff_vmem[i], temp_c[i], "off", mod="nt sc1")      # this is fast:  (48us)
+                J.global_store_dwordx4(voff_vmem[i], temp_c[i], "off", mod="")      # this is fast:  (48us)
             J.emit(mfma1, 128)
             J.v_lshl_add_u64(voff_vmem[i], voff_vmem_step, 0, voff_vmem[i])
 

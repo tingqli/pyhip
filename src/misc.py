@@ -293,6 +293,7 @@ def set_device(selected_device = -1):
 
 def mark(msg:str = ""):
     import inspect
+    import torch
     caller_frame = inspect.currentframe().f_back
     filename = caller_frame.f_code.co_filename
     lineno = caller_frame.f_lineno
@@ -301,6 +302,7 @@ def mark(msg:str = ""):
     print(f"MARK: {filename}:{lineno}  {msg}")
 
 def allclose(a, b, atol=1e-5, rtol=1e-5):
+    import torch
     diff = calc_diff(a, b)
     close_mask = torch.isclose(a, b, atol, rtol)
     failed_indices = torch.where(~close_mask)
@@ -310,7 +312,10 @@ def allclose(a, b, atol=1e-5, rtol=1e-5):
         return True
     else:
         print(f"\033[31m allcose({a.shape}_{a.dtype}, {b.shape}_{b.dtype}, {atol=}, {rtol=}) failed with {diff=}. \033[0m")
-        for i in range(min(8,num_failed)):
+        for i in range(num_failed):
             coord = tuple(dim[i].item() for dim in failed_indices)
-            print(f"\033[31m {i}/{num_failed}  {coord}: a={a[coord]}, b={b[coord]}, abs_diff={torch.abs(a[coord]-b[coord])} \033[0m")
+            abs_diff = torch.abs(a[coord]-b[coord])
+            rel_diff = abs_diff / max(torch.abs(a[coord]), torch.abs(b[coord]), torch.tensor(1e-12, device=a.device))
+            if rel_diff > rtol:
+                print(f"\033[31m {i}/{num_failed}  {coord}: a={a[coord]}, b={b[coord]}, abs_diff={abs_diff}, rel_diff={rel_diff} \033[0m")
         return False
