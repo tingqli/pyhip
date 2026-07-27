@@ -31,6 +31,11 @@ this method can be extended to multi-dimension cases by grouping all modes into 
         fx.copy(copy_atomB, frag2, dst)
 ```
 
+tiled_copy repeate same TV-layout for whole 2D src/dst tensor, in some case it's not applicable:
+
+for exmaple, 2D `[64,192] bf16` data, using 128bit copy-atom, each row has `192*sizeof(bf16)/128 = 24` copy-atoms running in parallel in 24 threads, 256 threads covers `10 rows` + `16 copy-atoms`, which is not a 2D sub-tensor, but the whole data tensor contains `64*24 = 1536 = 256*6` copy-atoms which is divisable by 256, in this case, above method still works while tiled_copy is not.
+
+
 ## avoid atomic instructions
 
 per-tensor-quant in aiter is extreamly slow due to huge work-groups and each work-group uses global atomic to update per-tensor abs-max value, this atomic instruction is very expensive and shold avoid as much as possible. in `flydsl_absmax`, we start just enough number of work-groups (number CU/SM * 8-occupancy), which incur just one global atomic update per work-group.
