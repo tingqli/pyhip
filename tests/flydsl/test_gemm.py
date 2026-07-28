@@ -1936,17 +1936,15 @@ def compile_gemm_950(
                 prev_vmem = cur_vmem
             rocdl.sched_barrier(0)
 
-        def begin_compute_phase(vmcnt=-1):
+        def begin_compute_phase():
             rocdl.sched_barrier(0)
-            rocdl.s_setprio(0)
-            if const_expr(vmcnt >= 0):
-                rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt, lgkmcnt=0))
-                rocdl.s_barrier()
+            rocdl.s_setprio(1)
+            rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
         def end_compute_phase():
             rocdl.sched_barrier(0)
-            rocdl.s_setprio(1)
+            rocdl.s_setprio(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
@@ -2260,7 +2258,8 @@ def compile_gemm_950(
             k_i32 = fx.Int32(k)
 
             # Region 0: TL(stage 0), read AB0, prefetch BL(k+2).
-            begin_compute_phase(ab_br_vmcnt)
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=ab_br_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
             fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
             end_compute_phase()
             copy_lds_to_frag_8wave(ab_lds_src[0], ab_frag_dst)
@@ -2274,7 +2273,8 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 1: BL(stage 0), read BR0, prefetch AT(k+2).
-            begin_compute_phase(ab_br_vmcnt)
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=ab_br_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
             fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
             end_compute_phase()
             copy_b_lds_to_frag_8wave(br_lds[0], br_frag_dst)
@@ -2291,7 +2291,8 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 2: TR(stage 0), read BL1, prefetch AB(k+2).
-            begin_compute_phase(bl_at_vmcnt)
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=bl_at_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
             fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
             end_compute_phase()
             copy_b_lds_to_frag_8wave(bl_lds[1], bl_frag_dst)
@@ -2308,7 +2309,8 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 3: BR(stage 0), read AT1, prefetch BR(k+2).
-            begin_compute_phase(bl_at_vmcnt)
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=bl_at_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
             fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
             end_compute_phase()
             copy_lds_to_frag_8wave(at_lds_src[1], at_frag_dst)
@@ -2322,7 +2324,8 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 4: TL(stage 1), read AB1, prefetch BL(k+3).
-            begin_compute_phase(ab_br_vmcnt)
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=ab_br_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
             fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
             end_compute_phase()
             copy_lds_to_frag_8wave(ab_lds_src[1], ab_frag_dst)
@@ -2336,7 +2339,8 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 5: BL(stage 1), read BR1, prefetch AT(k+3).
-            begin_compute_phase(ab_br_vmcnt)
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=ab_br_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
             fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
             end_compute_phase()
             copy_b_lds_to_frag_8wave(br_lds[1], br_frag_dst)
@@ -2353,7 +2357,8 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 6: TR(stage 1), read BL0(k+2), prefetch AB(k+3).
-            begin_compute_phase(bl_at_vmcnt)
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=bl_at_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
             fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
             end_compute_phase()
             copy_b_lds_to_frag_8wave(bl_lds[0], bl_frag_dst)
@@ -2370,7 +2375,8 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 7: BR(stage 1), read AT0(k+2), prefetch BR(k+3).
-            begin_compute_phase(bl_at_vmcnt)
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=bl_at_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
             fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
             end_compute_phase()
             copy_lds_to_frag_8wave(at_lds_src[0], at_frag_dst)
@@ -2468,35 +2474,48 @@ def compile_gemm_950(
                 )
 
         # Two-tile tail, preserving the same eight-region order without future prefetches.
-        begin_compute_phase(2 * a_vmem_count + 3 * b_vmem_count)
+        rocdl.s_waitcnt(
+            encode_waitcnt_950(vmcnt=2 * a_vmem_count + 3 * b_vmem_count, lgkmcnt=0)
+        )
+        begin_compute_phase()
         fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
         end_compute_phase()
         copy_lds_to_frag_8wave(ab_lds_src[0], ab_frag_dst)
         hot_loop_scheduler(a_dsrd_count, 0)
         end_memory_phase()
 
-        begin_compute_phase(2 * a_vmem_count + 2 * b_vmem_count)
+        rocdl.s_waitcnt(
+            encode_waitcnt_950(vmcnt=2 * a_vmem_count + 2 * b_vmem_count, lgkmcnt=0)
+        )
+        begin_compute_phase()
         fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
         end_compute_phase()
         copy_b_lds_to_frag_8wave(br_lds[0], br_frag_dst)
         hot_loop_scheduler(b_dsrd_count, 0)
         end_memory_phase()
 
-        begin_compute_phase(2 * a_vmem_count + b_vmem_count)
+        rocdl.s_waitcnt(
+            encode_waitcnt_950(vmcnt=2 * a_vmem_count + b_vmem_count, lgkmcnt=0)
+        )
+        begin_compute_phase()
         fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
         end_compute_phase()
         copy_b_lds_to_frag_8wave(bl_lds[1], bl_frag_dst)
         hot_loop_scheduler(b_dsrd_count, 0)
         end_memory_phase()
 
-        begin_compute_phase(a_vmem_count + b_vmem_count)
+        rocdl.s_waitcnt(
+            encode_waitcnt_950(vmcnt=a_vmem_count + b_vmem_count, lgkmcnt=0)
+        )
+        begin_compute_phase()
         fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
         end_compute_phase()
         copy_lds_to_frag_8wave(at_lds_src[1], at_frag_dst)
         hot_loop_scheduler(a_dsrd_count, 0)
         end_memory_phase()
 
-        begin_compute_phase(b_vmem_count)
+        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=b_vmem_count, lgkmcnt=0))
+        begin_compute_phase()
         fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
         end_compute_phase()
         copy_lds_to_frag_8wave(ab_lds_src[1], ab_frag_dst)
@@ -2504,7 +2523,8 @@ def compile_gemm_950(
         end_memory_phase()
         store_c_quadrant(c_tl_frag, c_tl_tile, 0, 0)
 
-        begin_compute_phase(0)
+        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+        begin_compute_phase()
         fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
         end_compute_phase()
         copy_b_lds_to_frag_8wave(br_lds[1], br_frag_dst)
