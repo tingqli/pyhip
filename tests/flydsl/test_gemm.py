@@ -1115,9 +1115,9 @@ def compile_gemm_950(
         lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
         if const_expr(is_fp8):
             mma_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, element_type))
-            scale_ones = fx.Int32(0x7F7F7F7F)
-            mma_atom = fx.atom_set_value(mma_atom, "scale_a", scale_ones)
-            mma_atom = fx.atom_set_value(mma_atom, "scale_b", scale_ones)
+            plain_scale = fx.Int32(0)
+            mma_atom = fx.atom_set_value(mma_atom, "scale_a", plain_scale)
+            mma_atom = fx.atom_set_value(mma_atom, "scale_b", plain_scale)
             k_perm = fx.make_layout((32, 4), (1, 32))
         else:
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, element_type))
@@ -1331,6 +1331,9 @@ def compile_gemm_950(
         b_dsrd_count = bl_frag.load().numel * element_type.width // 8 // 16
         a_vmem_count = (TILE_M // 2 * TILE_K * element_type.width // 8) // (256 * 16)
         b_vmem_count = (TILE_N // 2 * TILE_K * element_type.width // 8) // (256 * 16)
+        prologue_vmcnt = 3 * a_vmem_count + 3 * b_vmem_count
+        ab_br_vmcnt = 2 * a_vmem_count + 3 * b_vmem_count
+        bl_at_vmcnt = 3 * a_vmem_count + 2 * b_vmem_count
 
         def hot_loop_scheduler(dsrd_count, vmem_count, group_id):
             if const_expr(not is_fp8 and mfma_per_region == 32 and dsrd_count == 8 and vmem_count == 4):
@@ -1432,7 +1435,9 @@ def compile_gemm_950(
             1,
         )
         copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, 1], br_g2s_dst[1], br_lds[1], blk_y * TILE_N + TILE_N // 2, br_src_base, 1)
-        wait_vmem_barrier(2 * a_vmem_count + 2 * b_vmem_count)
+        # Eight prologue groups are ordered BL/AT/AB/BR for each stage.  The
+        # first BL/AT pair must complete while the six younger groups remain.
+        wait_vmem_barrier(prologue_vmcnt)
         copy_lds_to_frag(at_lds_src[0], at_frag_dst)
         copy_b_lds_to_frag(bl_lds_src[0], bl_lds[0], bl_frag_dst)
         rocdl.sched_barrier(0)
@@ -1450,6 +1455,7 @@ def compile_gemm_950(
                 fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
             else:
                 gemm_bf16_agpr(c_tl_frag, bl_frag, at_frag)
+            wait_vmem_barrier(ab_br_vmcnt)
             copy_lds_to_frag(ab_lds_src[0], ab_frag_dst)
             copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, k_i32 + 2], bl_g2s_dst[0], bl_lds[0], blk_y * TILE_N, bl_src_base, k_i32 + 2)
             hot_loop_scheduler(a_dsrd_count, b_vmem_count, 0)
@@ -1459,6 +1465,7 @@ def compile_gemm_950(
                 fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
             else:
                 gemm_bf16_agpr(c_bl_frag, bl_frag, ab_frag)
+            wait_vmem_barrier(ab_br_vmcnt)
             copy_b_lds_to_frag(br_lds_src[0], br_lds[0], br_frag_dst)
             copy_a_gmem_to_lds(
                 a_dma_rsrc,
@@ -1479,7 +1486,7 @@ def compile_gemm_950(
                 fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
             else:
                 gemm_bf16_agpr(c_tr_frag, br_frag, at_frag)
-            wait_vmem_barrier(a_vmem_count + b_vmem_count)
+            wait_vmem_barrier(bl_at_vmcnt)
             copy_b_lds_to_frag(bl_lds_src[1], bl_lds[1], bl_frag_dst)
             copy_a_gmem_to_lds(
                 a_dma_rsrc,
@@ -1497,6 +1504,7 @@ def compile_gemm_950(
                 fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
             else:
                 gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
+            wait_vmem_barrier(bl_at_vmcnt)
             copy_lds_to_frag(at_lds_src[1], at_frag_dst)
             copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, k_i32 + 2], br_g2s_dst[0], br_lds[0], blk_y * TILE_N + TILE_N // 2, br_src_base, k_i32 + 2)
             hot_loop_scheduler(a_dsrd_count, b_vmem_count, 3)
@@ -1510,6 +1518,7 @@ def compile_gemm_950(
                 fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
             else:
                 gemm_bf16_agpr(c_tl_frag, bl_frag, at_frag)
+            wait_vmem_barrier(ab_br_vmcnt)
             copy_lds_to_frag(ab_lds_src[1], ab_frag_dst)
             copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, k_i32 + 3], bl_g2s_dst[1], bl_lds[1], blk_y * TILE_N, bl_src_base, k_i32 + 3)
             hot_loop_scheduler(a_dsrd_count, b_vmem_count, 4)
@@ -1519,6 +1528,7 @@ def compile_gemm_950(
                 fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
             else:
                 gemm_bf16_agpr(c_bl_frag, bl_frag, ab_frag)
+            wait_vmem_barrier(ab_br_vmcnt)
             copy_b_lds_to_frag(br_lds_src[1], br_lds[1], br_frag_dst)
             copy_a_gmem_to_lds(
                 a_dma_rsrc,
@@ -1539,7 +1549,7 @@ def compile_gemm_950(
                 fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
             else:
                 gemm_bf16_agpr(c_tr_frag, br_frag, at_frag)
-            wait_vmem_barrier(a_vmem_count + b_vmem_count)
+            wait_vmem_barrier(bl_at_vmcnt)
             copy_b_lds_to_frag(bl_lds_src[0], bl_lds[0], bl_frag_dst)
             copy_a_gmem_to_lds(
                 a_dma_rsrc,
@@ -1557,6 +1567,7 @@ def compile_gemm_950(
                 fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
             else:
                 gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
+            wait_vmem_barrier(bl_at_vmcnt)
             copy_lds_to_frag(at_lds_src[0], at_frag_dst)
             copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, k_i32 + 3], br_g2s_dst[1], br_lds[1], blk_y * TILE_N + TILE_N // 2, br_src_base, k_i32 + 3)
             hot_loop_scheduler(a_dsrd_count, b_vmem_count, 7)
@@ -1854,9 +1865,9 @@ def compile_gemm_950(
         lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
         if const_expr(is_fp8):
             mma_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, element_type))
-            scale_ones = fx.Int32(0x7F7F7F7F)
-            mma_atom = fx.atom_set_value(mma_atom, "scale_a", scale_ones)
-            mma_atom = fx.atom_set_value(mma_atom, "scale_b", scale_ones)
+            plain_scale = fx.Int32(0)
+            mma_atom = fx.atom_set_value(mma_atom, "scale_a", plain_scale)
+            mma_atom = fx.atom_set_value(mma_atom, "scale_b", plain_scale)
             k_perm = fx.make_layout((32, 4), (1, 32))
         else:
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, element_type))
@@ -1903,6 +1914,9 @@ def compile_gemm_950(
         b_dsrd_count = bl_frag.load().numel * element_type.width // 8 // 16
         a_vmem_count = (TILE_M // 2 * TILE_K * element_type.width // 8) // (512 * 16)
         b_vmem_count = (TILE_N // 2 * TILE_K * element_type.width // 8) // (512 * 16)
+        prologue_vmcnt = 3 * a_vmem_count + 3 * b_vmem_count
+        ab_br_vmcnt = 2 * a_vmem_count + 3 * b_vmem_count
+        bl_at_vmcnt = 3 * a_vmem_count + 2 * b_vmem_count
 
         def hot_loop_scheduler(dsrd_count, vmem_count):
             # 较密集类别每步恰好发一条，较稀疏类别按比例分布，因此max是无空步且
@@ -1922,19 +1936,24 @@ def compile_gemm_950(
                 prev_vmem = cur_vmem
             rocdl.sched_barrier(0)
 
-        def begin_compute_phase():
+        def begin_compute_phase(vmcnt=-1):
             rocdl.sched_barrier(0)
-            rocdl.s_setprio(1)
+            rocdl.s_setprio(0)
+            if const_expr(vmcnt >= 0):
+                rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt, lgkmcnt=0))
+                rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
         def end_compute_phase():
             rocdl.sched_barrier(0)
-            rocdl.s_setprio(0)
+            rocdl.s_setprio(1)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
-        def end_memory_phase(wait_for_prefetch=False):
-            vmcnt = 2 * a_vmem_count + 2 * b_vmem_count if wait_for_prefetch else 63
+        def end_memory_phase():
+            rocdl.sched_barrier(0)
+
+        def wait_vmem_barrier(vmcnt):
             rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt, lgkmcnt=0))
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -2164,6 +2183,12 @@ def compile_gemm_950(
                 copy_b_lds_to_frag_bf16_8wave(root, dst)
 
         rocdl.sched_barrier(0)
+        copy_b_gmem_to_lds_8wave(
+            b_dma_rsrc,
+            bl_dst_ptr[0],
+            blk_y * TILE_N,
+            0,
+        )
         copy_a_gmem_to_lds_8wave(
             a_dma_rsrc,
             at_dst_ptr[0],
@@ -2184,15 +2209,15 @@ def compile_gemm_950(
         )
         copy_b_gmem_to_lds_8wave(
             b_dma_rsrc,
-            bl_dst_ptr[0],
-            blk_y * TILE_N,
+            br_dst_ptr[0],
+            blk_y * TILE_N + TILE_N // 2,
             0,
         )
         copy_b_gmem_to_lds_8wave(
             b_dma_rsrc,
-            br_dst_ptr[0],
-            blk_y * TILE_N + TILE_N // 2,
-            0,
+            bl_dst_ptr[1],
+            blk_y * TILE_N,
+            1,
         )
         copy_a_gmem_to_lds_8wave(
             a_dma_rsrc,
@@ -2214,20 +2239,14 @@ def compile_gemm_950(
         )
         copy_b_gmem_to_lds_8wave(
             b_dma_rsrc,
-            bl_dst_ptr[1],
-            blk_y * TILE_N,
-            1,
-        )
-        copy_b_gmem_to_lds_8wave(
-            b_dma_rsrc,
             br_dst_ptr[1],
             blk_y * TILE_N + TILE_N // 2,
             1,
         )
-        gpu.barrier()
+        wait_vmem_barrier(prologue_vmcnt)
         copy_lds_to_frag_8wave(at_lds_src[0], at_frag_dst)
         copy_b_lds_to_frag_8wave(bl_lds[0], bl_frag_dst)
-        rocdl.s_waitcnt(0)
+        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
         if wave_id >= 4:
             rocdl.s_barrier()
         rocdl.sched_barrier(0)
@@ -2241,7 +2260,7 @@ def compile_gemm_950(
             k_i32 = fx.Int32(k)
 
             # Region 0: TL(stage 0), read AB0, prefetch BL(k+2).
-            begin_compute_phase()
+            begin_compute_phase(ab_br_vmcnt)
             fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
             end_compute_phase()
             copy_lds_to_frag_8wave(ab_lds_src[0], ab_frag_dst)
@@ -2255,7 +2274,7 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 1: BL(stage 0), read BR0, prefetch AT(k+2).
-            begin_compute_phase()
+            begin_compute_phase(ab_br_vmcnt)
             fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
             end_compute_phase()
             copy_b_lds_to_frag_8wave(br_lds[0], br_frag_dst)
@@ -2272,7 +2291,7 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 2: TR(stage 0), read BL1, prefetch AB(k+2).
-            begin_compute_phase()
+            begin_compute_phase(bl_at_vmcnt)
             fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
             end_compute_phase()
             copy_b_lds_to_frag_8wave(bl_lds[1], bl_frag_dst)
@@ -2289,7 +2308,7 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 3: BR(stage 0), read AT1, prefetch BR(k+2).
-            begin_compute_phase()
+            begin_compute_phase(bl_at_vmcnt)
             fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
             end_compute_phase()
             copy_lds_to_frag_8wave(at_lds_src[1], at_frag_dst)
@@ -2300,10 +2319,10 @@ def compile_gemm_950(
                 k_i32 + 2,
             )
             hot_loop_scheduler(a_dsrd_count, b_vmem_count)
-            end_memory_phase(wait_for_prefetch=True)
+            end_memory_phase()
 
             # Region 4: TL(stage 1), read AB1, prefetch BL(k+3).
-            begin_compute_phase()
+            begin_compute_phase(ab_br_vmcnt)
             fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
             end_compute_phase()
             copy_lds_to_frag_8wave(ab_lds_src[1], ab_frag_dst)
@@ -2317,7 +2336,7 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 5: BL(stage 1), read BR1, prefetch AT(k+3).
-            begin_compute_phase()
+            begin_compute_phase(ab_br_vmcnt)
             fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
             end_compute_phase()
             copy_b_lds_to_frag_8wave(br_lds[1], br_frag_dst)
@@ -2334,7 +2353,7 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 6: TR(stage 1), read BL0(k+2), prefetch AB(k+3).
-            begin_compute_phase()
+            begin_compute_phase(bl_at_vmcnt)
             fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
             end_compute_phase()
             copy_b_lds_to_frag_8wave(bl_lds[0], bl_frag_dst)
@@ -2351,7 +2370,7 @@ def compile_gemm_950(
             end_memory_phase()
 
             # Region 7: BR(stage 1), read AT0(k+2), prefetch BR(k+3).
-            begin_compute_phase()
+            begin_compute_phase(bl_at_vmcnt)
             fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
             end_compute_phase()
             copy_lds_to_frag_8wave(at_lds_src[0], at_frag_dst)
@@ -2362,7 +2381,7 @@ def compile_gemm_950(
                 k_i32 + 3,
             )
             hot_loop_scheduler(a_dsrd_count, b_vmem_count)
-            end_memory_phase(wait_for_prefetch=True)
+            end_memory_phase()
 
             results = yield [c_tl_frag.load(), c_tr_frag.load(), c_bl_frag.load(), c_br_frag.load()]
 
@@ -2449,48 +2468,48 @@ def compile_gemm_950(
                 )
 
         # Two-tile tail, preserving the same eight-region order without future prefetches.
-        begin_compute_phase()
+        begin_compute_phase(2 * a_vmem_count + 3 * b_vmem_count)
         fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
         end_compute_phase()
         copy_lds_to_frag_8wave(ab_lds_src[0], ab_frag_dst)
         hot_loop_scheduler(a_dsrd_count, 0)
-        gpu.barrier()
+        end_memory_phase()
 
-        begin_compute_phase()
+        begin_compute_phase(2 * a_vmem_count + 2 * b_vmem_count)
         fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
         end_compute_phase()
         copy_b_lds_to_frag_8wave(br_lds[0], br_frag_dst)
         hot_loop_scheduler(b_dsrd_count, 0)
-        gpu.barrier()
+        end_memory_phase()
 
-        begin_compute_phase()
+        begin_compute_phase(2 * a_vmem_count + b_vmem_count)
         fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
         end_compute_phase()
         copy_b_lds_to_frag_8wave(bl_lds[1], bl_frag_dst)
         hot_loop_scheduler(b_dsrd_count, 0)
-        gpu.barrier()
+        end_memory_phase()
 
-        begin_compute_phase()
+        begin_compute_phase(a_vmem_count + b_vmem_count)
         fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
         end_compute_phase()
         copy_lds_to_frag_8wave(at_lds_src[1], at_frag_dst)
         hot_loop_scheduler(a_dsrd_count, 0)
-        gpu.barrier()
+        end_memory_phase()
 
-        begin_compute_phase()
+        begin_compute_phase(b_vmem_count)
         fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
         end_compute_phase()
         copy_lds_to_frag_8wave(ab_lds_src[1], ab_frag_dst)
         hot_loop_scheduler(a_dsrd_count, 0)
-        gpu.barrier()
+        end_memory_phase()
         store_c_quadrant(c_tl_frag, c_tl_tile, 0, 0)
 
-        begin_compute_phase()
+        begin_compute_phase(0)
         fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
         end_compute_phase()
         copy_b_lds_to_frag_8wave(br_lds[1], br_frag_dst)
         hot_loop_scheduler(b_dsrd_count, 0)
-        gpu.barrier()
+        end_memory_phase()
         store_c_quadrant(c_bl_frag, c_bl_tile, 1, 0)
 
         begin_compute_phase()
@@ -2904,6 +2923,28 @@ def test_gemm_950_8wave_permlane_multiblock(dtype):
         torch.testing.assert_close(output, ref, rtol=0.1, atol=0.03)
     else:
         torch.testing.assert_close(output.float(), ref, rtol=0.05, atol=0.5)
+
+
+@pytest.mark.parametrize("num_waves", [4, 8])
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_gemm_950_small_tile_repeated(num_waves, dtype):
+    if not torch.cuda.is_available() or not is_arch_type("950"):
+        pytest.skip("gemm_4wave_950/gemm_8wave_950 require gfx950")
+
+    torch.manual_seed(20260726)
+    M = N = K = 4096
+    _, _, output, ref, args = _make_gemm_950_problem(dtype, M, N, K)
+    launcher = compile_gemm_950(128, 128, N, K, num_waves, dtype)
+    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
+
+    for _ in range(3):
+        output.fill_(float("nan"))
+        kernel(*args)
+        torch.cuda.synchronize()
+        if dtype == "bf16":
+            torch.testing.assert_close(output, ref, rtol=0.1, atol=0.03)
+        else:
+            torch.testing.assert_close(output.float(), ref, rtol=0.05, atol=0.5)
 
 def entry_common(num_warps, kernel_type, M, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, N=4096, K=4096, run_count=10):
     perf = {}

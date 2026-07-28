@@ -9,11 +9,11 @@
 - 输入：BF16 或 FP8 E4M3FN 的 A/B 矩阵。
 - B 布局：AIter/aiter 的 16 行 preshuffle 布局。
 - 输出：BF16。
-- FP8 暂不接收外部 scale；scaled MFMA 的 A/B scale 都设置为 E8M0 单位值
-  `0x7f7f7f7f`。
+- FP8 暂不接收外部 scale。4/8-wave都复用现有stateful `MFMA_Scale` atom，并通过
+  `atom_set_value`把A/B scale显式设为`i32 0`；LLVM据此选择无scale的plain MFMA。
 - 测试环境：`gfx950:sramecc+:xnack-`、256 CU、288 GiB VRAM，PyTorch
   `2.11.0+gitd0c8b1f`，ROCm `7.2.53211`。
-- 最新性能数据采集于 2026-07-26，源码基于提交 `1c51019` 加当前工作树修改。
+- 最新性能与汇编数据采集于 2026-07-27，源码基于提交 `4ac0205` 加当前工作树修改。
 - 除特别说明外，性能表使用 `M=N=K=4096`、输出 tile `256 x 256`、默认
   XCD-aware `get_pids`。同一表的候选先全部编译并预热20轮，再在同一进程中轮换执行
   20组、每组100次，报告中位数和Q1/Q3。case顺序逐轮循环shift，并在完成一整轮位置
@@ -28,7 +28,8 @@ GFX950 使用 CDNA4 原生指令宽度：
 | 输入 | FlyDSL atom | 最终 ISA |
 |---|---|---|
 | BF16 | `MFMA(16, 16, 32, BFloat16)` | `v_mfma_f32_16x16x32_bf16` |
-| FP8 | `cdna4.MFMA_Scale(16, 16, 128, Float8E4M3FN)` | `v_mfma_scale_f32_16x16x128_f8f6f4` |
+| FP8 4-wave | `cdna4.MFMA_Scale(...)` + A/B state `i32 0` | `v_mfma_f32_16x16x128_f8f6f4` |
+| FP8 8-wave | `cdna4.MFMA_Scale(...)` + A/B state `i32 0` | `v_mfma_f32_16x16x128_f8f6f4` |
 
 BF16 的 K permutation 为 `(8, 4):(1, 8)`；FP8 为
 `(32, 4):(1, 32)`，都与单条硬件指令消费的操作数宽度一致。
@@ -54,9 +55,9 @@ GMem 通过 `BufferCopyLDS128b` 直接写 LDS。Prologue 先装入 K tile 0 和 
 再把 `AT0`、`BL0` 从 LDS 预取到寄存器。
 
 Prologue 的 DMA 发射顺序与 `bf16_3stage_4wave` 完全一致：每个 stage 都是
-`BL -> AT -> AB -> BR`，两个 stage 合计八组。每个逻辑 async group 实际生成 4 条
-`buffer_load_dwordx4 ... lds`，所以 `wait_group(4)` 在 ISA 中对应 `vmcnt(16)`，不是
-`vmcnt(4)`。
+`BL -> AT -> AB -> BR`，两个 stage 合计八组。4-wave每个逻辑async group生成4条
+`buffer_load_dwordx4 ... lds`，8-wave生成2条；同一个group计数在两条路径上必须分别
+换算为4倍和2倍的物理`vmcnt`。
 
 运行时循环每次前进两个 K tile。stage 选择和边界在编译期固定，因此生成代码没有
 `k % 2` 或“是否存在 next tile”的动态分支。当前要求 K tile 数量至少为 2 且是偶数。
@@ -77,11 +78,55 @@ Prologue 的 DMA 发射顺序与 `bf16_3stage_4wave` 完全一致：每个 stage
 最后固定处理两个 K tile 的 tail，不再发出未来 tile 的预取。区域顺序参考 Gluon
 `bf16_3stage_4wave`，同时保留 FlyDSL 的 LDS ping-pong 表达。
 
-Gluon参考在区域3和7等待；FlyDSL为支持短tile，把两次等待前移到区域2和6的LDS read
-之前，确保下一stage的DMA已经完成。新鲜ISA中FlyDSL形成两组
-`s_waitcnt vmcnt(8) lgkmcnt(0)`加`s_barrier`，位于分类指令索引89和265；Gluon参考
-仍为`vmcnt(16)`，位于168和344。Tail的六次逻辑等待为
-`wait_group(5,4,3,2,1,0)`，对应物理VMEM计数`20,16,12,8,4,0`。
+令一个A/BL逻辑组分别展开为`A=a_vmem_count`、`B=b_vmem_count`条物理DMA。4-wave按
+FIFO中仍允许在途的年轻组逐区域计算阈值：
+
+| 阶段 | 必须完成的组 | 允许保持在途的组 | `vmcnt` |
+|---|---|---|---:|
+| Prologue | `BL0, AT0` | `AB0, BR0, BL1, AT1, AB1, BR1` | `3A+3B` |
+| Region 0/4 | `AB0/AB1` | `BR, BL, AT, AB, BR` | `2A+3B` |
+| Region 1/5 | `BR0/BR1` | `BL, AT, AB, BR, BL` | `2A+3B` |
+| Region 2/6 | `BL1/BL0` | `AT, AB, BR, BL, AT` | `3A+2B` |
+| Region 3/7 | `AT1/AT0` | `AB, BR, BL, AT, AB` | `3A+2B` |
+
+每个wait都紧贴对应LDS read之前。默认`256x256`中`A=B=4`，所以prologue为
+`vmcnt(24)`，八个region均为`vmcnt(20)`。矩形tile会显出公式差异：`128x256`为
+`16,16,14,14`重复，`256x128`为`14,14,16,16`重复。4-wave tail继续按剩余队列使用
+`2A+3B,2A+2B,2A+B,A+B,B,0`；默认值为`20,16,12,8,4,0`。
+
+8-wave采用同一组公式，但每个默认group只展开2条物理DMA：prologue为`3A+3B=12`，
+八个region为`2A+3B`或`3A+2B`，默认都等于10，tail为`10,8,6,4,2,0`。wait的位置
+必须保持上游相位：`wait+barrier -> MFMA -> barrier -> LDS read/DMA`。把同样数值放到
+MFMA之后会使小tile从第二次launch开始错误，即数值和位置必须同时匹配。
+
+这里“矩形tile通过汇编断言”特指`TILE_M != TILE_N`的`128x256`和`256x128`。此时
+`A != B`，因此不能用方形tile中恰好相等的常数掩盖公式错误。从最终ISA热循环回边直接
+提取到：
+
+- `128x256`：prologue为9，main为`8,8,7,7,8,8,7,7`；
+- `256x128`：prologue为9，main为`7,7,8,8,7,7,8,8`。
+
+BF16和FP8结果一致。8份完整tile/dtype汇编保存在
+`tests/flydsl/asm/gfx950_8wave_tiles/`；其中`VMCOUNTS.csv`记录从汇编抽取的
+prologue/main/tail数值，`SHA256SUMS`校验完整`.s`文件。
+
+同配置重新编译上游Gluon提交`8686f59`后，精确依赖模型是：prologue提交8组并执行
+`wait_group(6)`，主循环八个region都执行`wait_group(5)`，tail再执行
+`wait_group(5,4,3,2,1,0)`。4-wave full每组展开4条
+`buffer_load_dwordx4 ... lds`，主循环八次均为`vmcnt(20)`；8-wave base每组展开2条，
+八次均为`vmcnt(10)`。因此对应关系是`5 groups x 4 loads = 20`和
+`5 groups x 2 loads = 10`。
+
+4-wave最终ISA验证了物理group边界：方形tile每两个wait之间恰好4条DMA，矩形tile按
+`B,A,A,B,B,A,A,B`对应的2/4条展开，没有DMA跨wait串组。因此物理`vmcnt`可在4-wave
+稳定重建Gluon group语义。8-wave则不同：直接加入显式`vmcnt(10)`会与后端根据LDS
+依赖插入的wait叠加，每轮出现16次wait且仍有非确定性错误；`asyncmark`版本又会被
+machine scheduler跨barrier重排。因此8-wave没有保留不稳定的Gluon分支。
+
+四份当前完整ISA及SHA256保存在`tests/flydsl/asm/gfx950_current/`，均来自
+`M=N=K=4096`、`256x256` tile、关闭cache后的新鲜编译。
+对应的上游Gluon AMDGCN、LLIR和SHA256保存在
+`tests/flydsl/asm/gfx950_gluon_8686f59/`。
 
 当前实现把 `AT/AB/BL/BR` 的两个 stage 拆成 8 个独立 `SharedStorage950` leaf。
 `SharedAllocator(static=True)` 因此生成 8 个独立 LDS global，而不是从 4 个大数组用
@@ -532,9 +577,10 @@ sched_barrier -> s_setprio(1) -> MFMA -> s_setprio(0) -> raw s_barrier
 ```
 
 每个memory区域显式发出`s_waitcnt`再执行raw `rocdl.s_barrier()`。普通区域只等待
-`lgkmcnt(0)`；区域3和7与Gluon一样使用`vmcnt(8) lgkmcnt(0)`，保留8个VMEM操作
-在途并跨半循环重叠。主循环最终包含128 MFMA、48 `ds_read_b128`、16 GMem-to-LDS
-VMEM和16个`s_barrier`，与Gluon数量一致。
+`lgkmcnt(0)`；FlyDSL主循环固定使用`vmcnt(8)`，保留8个VMEM操作在途并跨半循环
+重叠。最新上游Gluon 8-wave base的八个region则固定使用`vmcnt(10)`。FlyDSL主循环
+最终包含128 MFMA、48 `ds_read_b128`、16 GMem-to-LDS VMEM和16个`s_barrier`，指令
+类别数量与Gluon一致，但wait阈值不同。
 
 这里必须使用raw `s_barrier`。`gpu.barrier()`携带内存语义，LLVM会在其前面保守插入
 `vmcnt(0)`，把下一tile的DMA全部等完；早期版本因此只有约628 TFLOPS。改用显式
@@ -586,8 +632,9 @@ epilogue差异：
 写出，避免四个象限同时存活到统一epilogue。该调整把private segment从76 B降到44 B；
 后续绝对地址预计算阶段进一步降到20 B。permlane优化前的memory-only scheduler版本中，
 BF16为0 B且没有scratch，FP8为52 B并在tail中有3对scratch load/store。采用
-permlane16 + 128-bit epilogue后，当前BF16 ISA为40 B和3对scratch，FP8为24 B和2对
-scratch；两者都由32条`buffer_store_dwordx2`降为16条`buffer_store_dwordx4`。
+permlane16 + 128-bit epilogue后，当前BF16 ISA为40 B和3对scratch；FP8再切换到plain
+MFMA后为0 B且零scratch。两者都由32条`buffer_store_dwordx2`降为16条
+`buffer_store_dwordx4`。
 热循环本身的MFMA/DSRD/VMEM类别序列保持不变。
 
 早期尝试误把相邻16列作为8-wave epilogue的打包单位，因此转而测试了Gluon式
@@ -600,100 +647,110 @@ scratch；两者都由32条`buffer_store_dwordx2`降为16条`buffer_store_dwordx
 
 ### 9.1 当前主结果
 
-同一`benchmark_gemm_950`配置的前后结果。当前值来自本轮K sweep中
-`M=N=K=4096`、`256x256` tile的20组x100次平衡轮换测试：
+当前值取自本轮完整tile sweep中`M=N=K=4096`、`256x256` tile的数据。每种dtype的
+8个`wave x tile`候选先全部编译并通过全输出检查，再预热20轮，执行24组、每组100次
+的位置平衡计时：
 
 | Kernel | 初始延迟 | 当前延迟 | Q1/Q3 | 当前性能 | 总加速 |
 |---|---:|---:|---:|---:|---:|
-| 4-wave BF16 | 0.2861 ms | 0.097076 ms | 0.096830/0.097275 ms | 1415.8 TFLOPS | 2.95x |
-| 8-wave BF16 | 0.2366 ms | 0.099465 ms | 0.099172/0.099698 ms | 1381.8 TFLOPS | 2.38x |
-| 4-wave FP8 | 0.1500 ms | 0.048150 ms | 0.048111/0.048405 ms | 2854.4 TFLOPS | 3.12x |
-| 8-wave FP8 | 0.1269 ms | 0.047725 ms | 0.047671/0.047860 ms | 2879.8 TFLOPS | 2.66x |
+| 4-wave BF16 | 0.2861 ms | 0.097158 ms | 0.096847/0.097493 ms | 1414.6 TFLOPS | 2.94x |
+| 8-wave BF16 | 0.2366 ms | 0.097613 ms | 0.097240/0.097962 ms | 1408.0 TFLOPS | 2.42x |
+| 4-wave FP8 | 0.1500 ms | 0.047266 ms | 0.047178/0.047357 ms | 2907.8 TFLOPS | 3.17x |
+| 8-wave FP8 | 0.1269 ms | 0.045764 ms | 0.045734/0.045882 ms | 3003.2 TFLOPS | 2.77x |
 
-本表当前值为独立stage object + 显式wave-relative GEP + 无alias metadata，并包含
-8-wave permlane16 + 128-bit epilogue。与旧实现和历史阶段的比较保留在后续小节。
-本轮同表比较中，8-wave BF16比4-wave慢2.46%，8-wave FP8则快0.88%。
+本表当前值包含独立stage object、显式wave-relative GEP、plain FP8 MFMA，以及4/8-wave
+逐区`wait_group(5)`物理阈值。本轮同表比较中，8-wave BF16比4-wave慢0.47%，
+8-wave FP8快3.18%。原始结果保存在
+`tests/flydsl/results/gfx950_current/tile_sweep.csv`。
 
 ### 9.2 K sweep
 
-固定`M=N=4096`、`256x256` tile。表中20个路径点均先以NaN预填输出并通过全输出
-数值检查，再进入计时：
+以下K sweep保留自前一轮专项采集，并未在本轮完整功能/tile性能验收中重跑。固定
+`M=N=4096`、`256x256` tile；表中20个路径点均先以NaN预填输出并通过全输出数值检查，
+再进入计时：
 
 | DType | K | 4-wave ms（Q1/Q3） | 4-wave TFLOPS | 8-wave ms（Q1/Q3） | 8-wave TFLOPS | 8-wave延迟差 |
 |---|---:|---:|---:|---:|---:|---:|
-| BF16 | 1024 | 0.031661（0.031589/0.031908） | 1085.2 | 0.031951（0.031835/0.032048） | 1075.4 | +0.92% |
-| BF16 | 2048 | 0.053268（0.053215/0.053321） | 1290.1 | 0.054218（0.054126/0.054262） | 1267.5 | +1.78% |
-| BF16 | 4096 | 0.097076（0.096830/0.097275） | 1415.8 | 0.099465（0.099172/0.099698） | 1381.8 | +2.46% |
-| BF16 | 8192 | 0.184099（0.183617/0.184283） | 1493.1 | 0.189637（0.189073/0.189943） | 1449.5 | +3.01% |
-| BF16 | 16384 | 0.353041（0.352164/0.353984） | 1557.2 | 0.360476（0.358888/0.361844） | 1525.1 | +2.11% |
-| FP8 | 1024 | 0.019525（0.019403/0.019870） | 1759.7 | 0.019319（0.019188/0.019656） | 1778.5 | -1.06% |
-| FP8 | 2048 | 0.029589（0.029465/0.029751） | 2322.5 | 0.028843（0.028811/0.029176） | 2382.5 | -2.52% |
-| FP8 | 4096 | 0.048150（0.048111/0.048405） | 2854.4 | 0.047725（0.047671/0.047860） | 2879.8 | -0.88% |
-| FP8 | 8192 | 0.086214（0.086079/0.086429） | 3188.3 | 0.086075（0.085763/0.086370） | 3193.5 | -0.16% |
-| FP8 | 16384 | 0.163020（0.162404/0.164293） | 3372.3 | 0.162902（0.162786/0.163164） | 3374.8 | -0.07% |
+| BF16 | 1024 | 0.031723（0.031686/0.031909） | 1083.1 | 0.031970（0.031939/0.032083） | 1074.8 | +0.78% |
+| BF16 | 2048 | 0.053330（0.053222/0.053415） | 1288.6 | 0.054377（0.054286/0.054451） | 1263.8 | +1.96% |
+| BF16 | 4096 | 0.097177（0.096930/0.097284） | 1414.3 | 0.099521（0.099331/0.099770） | 1381.0 | +2.41% |
+| BF16 | 8192 | 0.183255（0.182951/0.183619） | 1500.0 | 0.189171（0.188547/0.189934） | 1453.1 | +3.23% |
+| BF16 | 16384 | 0.353681（0.352713/0.354157） | 1554.4 | 0.361684（0.360464/0.362033） | 1520.0 | +2.26% |
+| FP8 | 1024 | 0.019455（0.019185/0.019735） | 1766.1 | 0.018669（0.018490/0.019065） | 1840.5 | -4.04% |
+| FP8 | 2048 | 0.029073（0.029008/0.029430） | 2363.6 | 0.027856（0.027764/0.027973） | 2466.9 | -4.19% |
+| FP8 | 4096 | 0.047461（0.047375/0.047703） | 2895.8 | 0.046517（0.046443/0.046588） | 2954.6 | -1.99% |
+| FP8 | 8192 | 0.084833（0.084761/0.084982） | 3240.2 | 0.084067（0.083935/0.084456） | 3269.7 | -0.90% |
+| FP8 | 16384 | 0.159797（0.159052/0.160173） | 3440.3 | 0.158509（0.158222/0.159063） | 3468.3 | -0.81% |
 
 按`latency = fixed + slope * (K / 1024)`拟合：
 
 | 路径 | fixed | 每增加1024 K的延迟 |
 |---|---:|---:|
-| 4-wave BF16 | 10.94 us | 21.43 us |
-| 8-wave BF16 | 11.26 us | 21.92 us |
-| 4-wave FP8 | 10.09 us | 9.55 us |
-| 8-wave FP8 | 9.61 us | 9.58 us |
+| 4-wave BF16 | 10.78 us | 21.46 us |
+| 8-wave BF16 | 11.03 us | 21.99 us |
+| 4-wave FP8 | 10.16 us | 9.35 us |
+| 8-wave FP8 | 9.28 us | 9.33 us |
 
-BF16中4-wave同时有更低固定项和更低斜率，五个K点均领先。permlane epilogue使FP8
-8-wave固定项从旧拟合的12.92 us降至9.61 us，比4-wave低0.48 us；两者斜率只差0.3%，
-因此8-wave在五个K点均持平或领先0.07%到2.52%。
+BF16中4-wave同时有更低固定项和更低斜率，五个K点均领先。FP8两条路径都启用plain
+MFMA后，8-wave固定项比4-wave低0.89 us，斜率基本相同；因此8-wave在五个K点领先
+0.81%到4.19%。
 
 ### 9.3 Tile sweep
 
-固定`4096^3`，只统计第10节全尺寸数值验证通过的配置：
+固定`4096^3`。这是当前代码的本轮重测结果：每种dtype同时计时8个`wave x tile`候选，
+预热20轮后执行24组、每组100次的位置平衡测试；所有case在计时前均通过全输出检查：
 
 | DType | 路径 / tile | Grid | 中位延迟 | Q1/Q3 | TFLOPS |
 |---|---|---:|---:|---:|---:|
-| BF16 | 4-wave `256x256` | 256 | 0.096645 ms | 0.096329/0.097040 ms | 1422.1 |
-| BF16 | 8-wave `128x128` | 1024 | 0.133658 ms | 0.133378/0.134654 ms | 1028.3 |
-| BF16 | 8-wave `128x256` | 512 | 0.121745 ms | 0.120051/0.123390 ms | 1128.9 |
-| BF16 | 8-wave `256x128` | 512 | 0.118902 ms | 0.118546/0.120265 ms | 1155.9 |
-| BF16 | 8-wave `256x256` | 256 | 0.099342 ms | 0.098940/0.099704 ms | 1383.5 |
-| FP8 | 4-wave `256x256` | 256 | 0.048090 ms | 0.048066/0.048220 ms | 2857.9 |
-| FP8 | 8-wave `128x128` | 1024 | 0.065071 ms | 0.064738/0.065232 ms | 2112.1 |
-| FP8 | 8-wave `128x256` | 512 | 0.062209 ms | 0.061825/0.062721 ms | 2209.3 |
-| FP8 | 8-wave `256x128` | 512 | 0.060349 ms | 0.060033/0.060753 ms | 2277.4 |
-| FP8 | 8-wave `256x256` | 256 | 0.047582 ms | 0.047535/0.047678 ms | 2888.5 |
+| BF16 | 4-wave `128x128` | 1024 | 0.112825 ms | 0.112135/0.113784 ms | 1218.2 |
+| BF16 | 4-wave `128x256` | 512 | 0.109300 ms | 0.108503/0.110963 ms | 1257.4 |
+| BF16 | 4-wave `256x128` | 512 | 0.106544 ms | 0.106002/0.107231 ms | 1290.0 |
+| BF16 | 4-wave `256x256` | 256 | 0.097158 ms | 0.096847/0.097493 ms | 1414.6 |
+| BF16 | 8-wave `128x128` | 1024 | 0.134956 ms | 0.133786/0.135455 ms | 1018.4 |
+| BF16 | 8-wave `128x256` | 512 | 0.126197 ms | 0.125063/0.127321 ms | 1089.1 |
+| BF16 | 8-wave `256x128` | 512 | 0.120408 ms | 0.119399/0.121106 ms | 1141.4 |
+| BF16 | 8-wave `256x256` | 256 | 0.097613 ms | 0.097240/0.097962 ms | 1408.0 |
+| FP8 | 4-wave `128x128` | 1024 | 0.056449 ms | 0.056001/0.057041 ms | 2434.8 |
+| FP8 | 4-wave `128x256` | 512 | 0.051526 ms | 0.051305/0.051936 ms | 2667.4 |
+| FP8 | 4-wave `256x128` | 512 | 0.051056 ms | 0.050893/0.051268 ms | 2691.9 |
+| FP8 | 4-wave `256x256` | 256 | 0.047266 ms | 0.047178/0.047357 ms | 2907.8 |
+| FP8 | 8-wave `128x128` | 1024 | 0.063257 ms | 0.062873/0.063581 ms | 2172.7 |
+| FP8 | 8-wave `128x256` | 512 | 0.057926 ms | 0.057628/0.058922 ms | 2372.7 |
+| FP8 | 8-wave `256x128` | 512 | 0.057323 ms | 0.057071/0.057658 ms | 2397.6 |
+| FP8 | 8-wave `256x256` | 256 | 0.045764 ms | 0.045734/0.045882 ms | 3003.2 |
 
-8-wave中`256x256`在两种dtype都最快。相对该配置，BF16三个较小tile慢19.7%到
-34.5%，FP8慢26.8%到36.8%；更多workgroup没有抵消更小tile带来的重复加载与固定开销。
-`256x256`下8-wave BF16比4-wave慢2.79%，8-wave FP8则快1.06%。
+4/8-wave中`256x256`在两种dtype都最快。相对各自的`256x256`，4-wave小tile慢
+8.0%到19.4%，8-wave小tile慢23.4%到38.3%；更多workgroup没有抵消更小tile带来的
+重复加载与固定开销。`256x256`下8-wave BF16比4-wave慢0.47%，8-wave FP8快3.18%。
+原始16行数据保存在`tests/flydsl/results/gfx950_current/tile_sweep.csv`。
 
 ### 9.4 Problem size与PID映射
 
-固定`K=4096`、`256x256` tile的方形问题规模。16个规模/路径组合均通过全输出
-数值检查：
+以下problem-size sweep保留自前一轮专项采集，并未在本轮重跑。固定`K=4096`、
+`256x256` tile；16个规模/路径组合均通过全输出数值检查：
 
 | M=N | Grid | 4w BF16 ms / TFLOPS | 8w BF16 ms / TFLOPS | 4w FP8 ms / TFLOPS | 8w FP8 ms / TFLOPS |
 |---:|---:|---:|---:|---:|---:|
-| 1024 | 16 | 0.067208 / 127.8 | **0.066804 / 128.6** | 0.038889 / 220.9 | **0.035724 / 240.5** |
-| 2048 | 64 | 0.068242 / 503.5 | **0.067771 / 507.0** | 0.039294 / 874.4 | **0.037612 / 913.5** |
-| 4096 | 256 | 0.097126 / 1415.1 | 0.100063 / 1373.5 | 0.048249 / 2848.5 | **0.047753 / 2878.1** |
-| 8192 | 1024 | 0.373751 / 1470.9 | 0.386015 / 1424.2 | 0.183202 / 3000.8 | **0.180909 / 3038.9** |
+| 1024 | 16 | 0.067186 / 127.9 | **0.067136 / 127.9** | 0.038331 / 224.1 | **0.035328 / 243.1** |
+| 2048 | 64 | 0.068388 / 502.4 | **0.068215 / 503.7** | 0.038871 / 883.9 | **0.036610 / 938.5** |
+| 4096 | 256 | 0.097023 / 1416.6 | 0.099512 / 1381.1 | 0.047408 / 2899.1 | **0.046509 / 2955.1** |
+| 8192 | 1024 | 0.373208 / 1473.1 | 0.386681 / 1421.7 | 0.180282 / 3049.4 | **0.176255 / 3119.1** |
 
-BF16在`1024^2`和`2048^2`欠填充规模由8-wave快0.60%/0.69%，在`4096^2`和`8192^2`
-则由4-wave快3.02%/3.28%。FP8四个规模均由8-wave领先，优势从欠填充`1024^2`的
-8.14%收窄到其余规模的1.03%到4.28%。
+BF16在`1024^2`和`2048^2`欠填充规模由8-wave快0.07%/0.25%，在`4096^2`和`8192^2`
+则由4-wave快2.57%/3.61%。FP8四个规模均由8-wave领先，幅度为1.90%到7.83%。
 
-`4096^3`下默认`get_pids`相对row-major的16组x100次配对结果：
+`4096^3`下默认`get_pids`相对row-major的20组x100次配对结果：
 
 | 路径 | row-major | `get_pids` | 延迟变化 |
 |---|---:|---:|---:|
-| 4-wave BF16 | 0.096978 ms | 0.096757 ms | -0.228% |
-| 8-wave BF16 | 0.099822 ms | 0.099761 ms | -0.061% |
-| 4-wave FP8 | 0.048534 ms | 0.048204 ms | -0.679% |
-| 8-wave FP8 | 0.081099 ms | 0.048303 ms | -40.440% |
+| 4-wave BF16 | 0.097069 ms | 0.096681 ms | -0.400% |
+| 8-wave BF16 | 0.099724 ms | 0.099511 ms | -0.213% |
+| 4-wave FP8 | 0.047786 ms | 0.047522 ms | -0.552% |
+| 8-wave FP8 | 0.046737 ms | 0.046490 ms | -0.527% |
 
-四条路径均受益，因此继续默认启用XCD-aware映射。8-wave FP8的幅度不是单纯cache
-locality：独立进程和手工ABBA均复现约81 us对48 us，最终ISA显示row-major路径产生
-84 B private segment，而`get_pids`仅24 B。其余三条路径收益为0.06%到0.68%。
+四条路径均受益，因此继续默认启用XCD-aware映射。plain MFMA消除了8-wave FP8
+row-major路径此前的84 B spill，当前row-major/get-pids都为零scratch，映射收益为
+0.53%；其余路径收益为0.21%到0.55%。
 
 ### 9.5 与Gluon和本地FP8 8-wave统一对比
 
@@ -719,50 +776,48 @@ case在每个计时位置出现次数相同。旧的“每轮shift后再按奇�
 
 | 路径 | 输入/输出 | 中位延迟 | Q1/Q3 | TFLOPS | 相对同wave FlyDSL |
 |---|---|---:|---:|---:|---:|
-| FlyDSL 4-wave BF16 | BF16/BF16 | 0.096564 ms | 0.096292/0.096933 ms | 1423.3 | - |
-| Gluon 4-wave BF16 full | BF16/BF16 | 0.107574 ms | 0.107365/0.108125 ms | 1277.6 | +11.40%延迟 |
-| FlyDSL 4-wave FP8 | E4M3FN/BF16 | 0.050544 ms | 0.049827/0.051056 ms | 2719.2 | - |
-| Gluon 4-wave BF8 full | E5M2/FP16 | 0.106751 ms | 0.106472/0.107275 ms | 1287.5 | +111.20%延迟 |
-| FlyDSL 8-wave BF16 | BF16/BF16 | 0.099292 ms | 0.099010/0.099439 ms | 1384.2 | - |
-| Gluon 8-wave BF16 base | BF16/BF16 | 0.095732 ms | 0.095369/0.095874 ms | 1435.7 | -3.59%延迟 |
-| FlyDSL 8-wave FP8 | E4M3FN/BF16 | 0.047487 ms | 0.047405/0.047653 ms | 2894.3 | - |
-| Gluon 8-wave BF8 base | E5M2/FP16 | 0.050111 ms | 0.050081/0.050183 ms | 2742.7 | +5.53%延迟 |
-| pyhip JIT 8-wave preshuffle | E4M3FN/BF16 | 0.044933 ms | 0.044860/0.045021 ms | 3058.8 | -5.38%延迟 |
-| pyhip JIT 8-wave row-major | E4M3FN/BF16 | 0.044924 ms | 0.044855/0.045010 ms | 3059.3 | -5.40%延迟 |
+| FlyDSL 4-wave BF16 | BF16/BF16 | 0.096897 ms | 0.096740/0.097102 ms | 1418.4 | - |
+| Gluon 4-wave BF16 full | BF16/BF16 | 0.108995 ms | 0.108591/0.109464 ms | 1261.0 | +12.49%延迟 |
+| FlyDSL 4-wave FP8 | E4M3FN/BF16 | 0.050378 ms | 0.048595/0.050987 ms | 2728.2 | - |
+| Gluon 4-wave BF8 full | E5M2/FP16 | 0.107181 ms | 0.106522/0.107322 ms | 1282.3 | +112.76%延迟 |
+| FlyDSL 8-wave BF16 | BF16/BF16 | 0.098235 ms | 0.098077/0.098520 ms | 1399.1 | - |
+| Gluon 8-wave BF16 base | BF16/BF16 | 0.095818 ms | 0.095663/0.096012 ms | 1434.4 | -2.46%延迟 |
+| FlyDSL 8-wave FP8 | E4M3FN/BF16 | 0.045831 ms | 0.045787/0.046011 ms | 2998.8 | - |
+| Gluon 8-wave BF8 base | E5M2/FP16 | 0.050203 ms | 0.050123/0.050306 ms | 2737.7 | +9.54%延迟 |
 
 4-wave Gluon把256个accumulator AGPR的初始化/回读成本集中在固定项，短K下并不占优；
 缓存元数据确认`amdgpu-agpr-alloc=256`、LLIR scheduler barrier和零scratch均已生效。
+本轮原始对比保存在`tests/flydsl/results/gfx950_current/default_vs_gluon.csv`。
 在教程用于报告峰值的长K形状，Gluon重新领先：
 
 | 形状 | FlyDSL | Gluon full | Gluon延迟优势 |
 |---|---:|---:|---:|
-| BF16 `4096x4096x8192` | 0.184416 ms / 1490.5 TFLOPS | 0.178148 ms / 1543.0 TFLOPS | 3.40% |
-| FP8/BF8 `4096x4096x16384` | 0.162135 ms / 3390.7 TFLOPS | 0.157202 ms / 3497.1 TFLOPS | 3.04% |
+| BF16 `4096x4096x8192` | 0.183790 ms / 1495.6 TFLOPS | 0.178238 ms / 1542.2 TFLOPS | 3.02% |
+| FP8/BF8 `4096x4096x16384` | 0.159931 ms / 3437.5 TFLOPS | 0.157145 ms / 3498.4 TFLOPS | 1.74% |
 
-本地对比项直接调用`tests/contrib/gemm/test_fp8_8wave.py`使用的
+本地pyhip JIT对比使用前一轮同协议数据，未混入上述最终FlyDSL/Gluon双case轮换。
+它直接调用`tests/contrib/gemm/test_fp8_8wave.py`使用的
 `pyhip.contrib.gemm_fp8.gemm_8wave_fp8bf16fp16`，分别覆盖`bpreshuffle=True/False`。
-两条路径都通过相同输入的正确性检查；preshuffle与row-major自身只差0.02%，属于同一
-性能档。采用permlane16 + 128-bit epilogue后，FlyDSL与pyhip JIT在`4096^3`下的差距
-已由优化前约11%缩小到5.38%/5.40%；同时FlyDSL 8-wave FP8从略慢于Gluon 8-wave转为
-低5.24%延迟。
+两条路径都通过相同输入的正确性检查。采用permlane16 + 128-bit epilogue和plain MFMA
+后，FlyDSL与pyhip JIT在`4096^3`下的差距已由优化前约11%缩小到3.38%/3.45%；同时
+FlyDSL 8-wave FP8比Gluon 8-wave低7.37%延迟。
 
 按Gluon BF8官方headline形状`M=N=4096, K=16384`补测同一组8-wave实现：
 
 | 路径 | 输入/输出 | 中位延迟 | Q1/Q3 | TFLOPS | 相对FlyDSL | 相对Gluon |
 |---|---|---:|---:|---:|---:|---:|
-| FlyDSL 8-wave FP8 | E4M3FN/BF16 | 0.162738 ms | 0.162517/0.163264 ms | 3378.2 | - | -2.27%延迟 |
-| Gluon 8-wave BF8 base | E5M2/FP16 | 0.166518 ms | 0.165886/0.166940 ms | 3301.5 | +2.32%延迟 | - |
-| pyhip JIT 8-wave preshuffle | E4M3FN/BF16 | 0.158808 ms | 0.158276/0.159076 ms | 3461.8 | -2.42%延迟 | -4.63%延迟 |
-| pyhip JIT 8-wave row-major | E4M3FN/BF16 | 0.159153 ms | 0.158633/0.159540 ms | 3454.3 | -2.20%延迟 | -4.42%延迟 |
+| FlyDSL 8-wave FP8 | E4M3FN/BF16 | 0.158726 ms | 0.158299/0.159028 ms | 3463.6 | - | -4.37%延迟 |
+| Gluon 8-wave BF8 base | E5M2/FP16 | 0.165978 ms | 0.165625/0.166540 ms | 3312.2 | +4.57%延迟 | - |
+| pyhip JIT 8-wave preshuffle | E4M3FN/BF16 | 0.158461 ms | 0.157880/0.158880 ms | 3469.3 | -0.17%延迟 | -4.53%延迟 |
+| pyhip JIT 8-wave row-major | E4M3FN/BF16 | 0.159051 ms | 0.158615/0.159477 ms | 3456.5 | +0.21%延迟 | -4.17%延迟 |
 
-长K下FlyDSL 8-wave比Gluon 8-wave低2.27%延迟；pyhip JIT仍领先，但相对FlyDSL的
-优势进一步收窄为2.20%到2.42%。preshuffle比row-major低0.22%延迟，差异仍在很小的
+长K下FlyDSL 8-wave比Gluon 8-wave低4.37%延迟；pyhip preshuffle只领先0.17%，而
+FlyDSL比pyhip row-major低0.21%延迟。preshuffle比row-major低0.37%，差异仍在很小的
 范围内。该表延续前述格式边界：Gluon使用E5M2/FP16，另外三条路径使用E4M3FN/BF16。
 
-把同形状下4-wave结果也纳入排名，Gluon 4-wave full以0.157202 ms最快；pyhip JIT
-preshuffle/row-major只慢1.02%/1.24%，同时比FlyDSL 4-wave快2.05%/1.84%，比FlyDSL
-8-wave快2.42%/2.20%。FlyDSL 4-wave比8-wave低0.37%延迟。因此在该官方长K形状，
-pyhip JIT仍位于4-wave Gluon之后、两条FlyDSL和Gluon 8-wave之前。
+把同形状下4-wave结果也纳入排名，Gluon 4-wave full以0.157145 ms最快；随后依次是
+pyhip preshuffle、FlyDSL 8-wave、pyhip row-major、FlyDSL 4-wave和Gluon 8-wave。
+FlyDSL 8-wave比4-wave低0.75%延迟。
 
 复现一次完整对比：
 
@@ -787,10 +842,9 @@ full配置的LLIR插件与Triton LLVM pin有ABI绑定。脚本会先编译FlyDSL
    `gemm_bf16_agpr`和permlane epilogue按`[M-repeat, N-repeat]`索引。方形tile掩盖
    了mode交换；矩形BF16会在`vector.extract_strided_slice`越界，FP8会写错或只写
    一半输出。
-2. Region 2/6首次读取下一stage的LDS fragment时，尚未等待对应GMem-to-LDS DMA；
-   `256x256`靠较长MFMA段偶然隐藏延迟，`128x128`多block主循环会非确定性读到未完成
-   数据。修复将`wait_vmem_barrier(a_vmem_count + b_vmem_count)`前移到Region 2/6的
-   LDS read之前，Region 3/7不再做滞后的等待。
+2. 旧实现只在Region 2/6等待，其他region依赖裸barrier和偶然延迟，不能表示每个LDS
+  consumer对应的FIFO group。最终修复在Region 0--7每次LDS read前都放置精确物理
+  wait：Region 0/1/4/5使用`2A+3B`，Region 2/3/6/7使用`3A+2B`。
 
 新增`test_gemm_950_4wave_multiblock`，覆盖4种tile x BF16/FP8，使用至少2x2
 workgroup、四个K tile并以NaN预填输出。加上原4项smoke测试共`12 passed`；进一步在
@@ -1061,10 +1115,10 @@ pyhip将编译期K循环完全展开，并手工固定每阶段的DSRD/VMEM/wait
 N repeat打包成4个i32后发出一条`buffer_store_dwordx4`。`TILE_N`不能成对打包时仍回退
 到原64-bit copy路径。
 
-最终FP8 ISA中C写回从32条`buffer_store_dwordx2`降为16条
+permlane优化后、plain MFMA之前的FP8 ISA中，C写回从32条`buffer_store_dwordx2`降为16条
 `buffer_store_dwordx4`，新增32条`v_permlane16_swap_b32`。private segment从52 B降为
 24 B，scratch从3 store + 3 load降为2 + 2；因此写回已显著缩短accumulator live range，
-但尚未完全消除spill。同进程交替A/B、丢弃前2轮后的结果为：
+但当时尚未完全消除spill。同进程交替A/B、丢弃前2轮后的结果为：
 
 | 形状/类型 | 64-bit fallback | permlane + 128-bit | 配对中位变化 |
 |---|---:|---:|---:|
@@ -1073,10 +1127,87 @@ N repeat打包成4个i32后发出一条`buffer_store_dwordx4`。`TILE_N`不能�
 | FP8 `4096x4096x16384` | 166.550 us | 163.852 us | -2.711 us（-1.6%） |
 
 新增`test_gemm_950_8wave_permlane_multiblock`以`256x256` tile、2x2 workgroups和NaN预填
-覆盖BF16/FP8新路径。后续优先级变为：先定位剩余24 B tail spill，再为gfx950补充普通
-`v_mfma_f32_16x16x128_f8f6f4` atom做A/B，最后测试K循环部分展开和DSRD/VMEM/wait
-重排。旧PMC显示每K tile约1.36%的`SQ_WAVE_CYCLES`斜率差，但当前wall-time拟合只差
-0.3%；继续优化热循环前应先用permlane版本重新采集PMC确认。
+覆盖BF16/FP8新路径。
+
+### 9.12 Plain MFMA与当前pyhip JIT差异
+
+不需要修改FlyDSL或新增atom。现有stateful `cdna4.MFMA_Scale`的lowering本来就调用
+LLVM已建模的`amdgcn.mfma.scale` intrinsic；4/8-wave只需用`atom_set_value`把
+`scale_a`和`scale_b`显式设为`i32 0`。LLVM的`UnscaledMFMAOptimizationPat`据此选择
+最终plain `v_mfma_f32_16x16x128_f8f6f4`。这里的0表示“不使用scale”的编译器状态，
+不会把A/B数值乘以0。直接手写同一intrinsic会绕过atom的layout/SSA接口而没有收益；
+opaque inline asm虽然也能发出plain opcode，但会破坏调度/寄存器优化，产生104 B
+private segment和25对scratch，并在长K上计算错误，因此没有采用。
+
+同输入、4/8-wave四路位置平衡的20轮identity-state/zero-state对比：
+
+| 形状 / 路径 | Identity state / scaled ISA | Zero state / plain ISA | 中位变化 |
+|---|---:|---:|---:|
+| `4096x4096x4096` / 4-wave | 48.243 us | 47.472 us | -0.771 us（-1.60%） |
+| `4096x4096x4096` / 8-wave | 47.418 us | 46.416 us | -1.002 us（-2.11%） |
+| `4096x4096x16384` / 4-wave | 161.832 us | 159.330 us | -2.502 us（-1.55%） |
+| `4096x4096x16384` / 8-wave | 161.718 us | 158.766 us | -2.952 us（-1.83%） |
+
+8-wave K4096最终ISA资源从identity-state版的24 B和2对scratch降为zero-state版的
+0 B和零scratch；16条`buffer_store_dwordx4`保持不变。LLVM IR中的128次调用仍全部是
+modeled scale intrinsic，但scale operand均为常量0；最终ISA为128条plain、0条scaled
+MFMA。归一化后的988条机器指令与此前新增atom实验逐条相同，因此删除了FlyDSL改动。
+PMC中两版MFMA数量和MFMA busy cycle完全相同；plain版`SQ_WAVE_CYCLES`降低2.39%、
+`SQ_BUSY_CYCLES`降低1.77%，VMEM降低1.45%。
+
+用当前plain版与pyhip JIT preshuffle重采PMC，关键结果为：
+
+| Counter | FlyDSL plain | pyhip JIT | FlyDSL/pyhip |
+|---|---:|---:|---:|
+| `SQ_INSTS_MFMA` | 2,097,152 | 2,097,152 | 1.000 |
+| `SQ_VALU_MFMA_BUSY_CYCLES` | 67,108,864 | 67,108,864 | 1.000 |
+| `SQ_INSTS_LDS` | 1,572,864 | 1,572,864 | 1.000 |
+| `SQ_INSTS_VMEM` | 557,056 | 585,728 | 0.951 |
+| `SQ_INSTS_VALU` | 3,715,072 | 3,545,088 | 1.048 |
+| `SQ_WAIT_ANY` | 16,703,915 | 11,831,114 | 1.412 |
+| `SQ_WAIT_INST_ANY` | 18,696,634 | 20,568,950 | 0.909 |
+| `SQ_WAVE_CYCLES` | 42,657,143 | 40,451,270 | 1.055 |
+| LDS bank conflict / FIFO full | 0 / 0 | 0 / 0 | - |
+
+MFMA吞吐、LDS和内存带宽已排除：FlyDSL反而少14条VMEM/wave，L2 miss和DRAM请求也更少。
+IFETCH请求/level分别为pyhip的0.968/0.889，SMEM level更低，指令前端和SMEM也不是
+瓶颈。剩余差异集中在`SQ_WAIT_ANY`和约4.8%额外VALU地址/打包指令。
+
+K4096与K16384的`SQ_WAVE_CYCLES`增量显示主循环每K128 tile只比pyhip高0.26%；
+K4096总差值中约**95.9%是固定项**。等价的“最后两个K tile + epilogue”ISA对比中，
+FlyDSL有21条`s_nop`（至少34个等待cycle），pyhip为0；FlyDSL还多16条
+`v_add_lshl_u32`及若干OR/shift地址组合。运行时K循环确实多出branch，但
+`SQ_ACTIVE_INST_MISC`只高约5%，且取指更少。所以下一步优先级是缩短固定tail的MFMA到
+convert/store依赖链和简化C地址生成；完全展开K循环不是首要方向。
+
+### 9.13 Gluon依赖迁移与逐区域同步修复
+
+上游Gluon依靠`commit_group/wait_group`保持DMA组身份，而FlyDSL当前kernel使用raw
+GMem-to-LDS DMA和普通LDS load。直接迁移逻辑group模型的实验出现两个问题：
+
+1. 真正的`asyncmark/wait_asyncmark`会被当前machine scheduler跨barrier重排；
+2. 把物理`vmcnt(10)`放到MFMA之前、但保留旧memory-phase barrier，会与后端LDS依赖
+  wait叠加成16次；放到MFMA之后虽只剩8次，barrier相位仍错误，小tile会失败。
+
+因此在“不修改FlyDSL”的约束下，4-wave与8-wave都采用可由最终ISA验证的逻辑组策略：
+
+- 8-wave使用与4-wave相同的`3A+3B`、`2A+3B`、`3A+2B`公式，并把每区拓扑旋转为
+  `wait+barrier -> MFMA -> barrier -> LDS read/DMA`。默认ISA对应
+  `12 -> 8x10 -> 10,8,6,4,2,0`；
+- 4-wave prologue使用`3A+3B`，八个region分别使用`2A+3B`或`3A+2B`，tail逐级清空。
+  默认ISA对应`24 -> 8x20 -> 20,16,12,8,4,0`；
+- 新的`test_gemm_950_small_tile_repeated`同时覆盖4/8-wave、BF16/FP8的`4096^3`
+  三连launch。
+
+最终4-wave与8-wave默认ISA分别严格断言八次20和八次10。本轮从当前源码重新执行：
+
+- 完整gfx950 pytest suite：18/18通过；
+- `4096^3`长循环矩阵：4/8-wave x 4种tile x BF16/FP8共16个配置，每项连续10次，
+  160/160次全输出检查通过；
+- 两K-tile矩阵：同样16个配置，每项连续20次，320/320次prologue/tail-only检查通过。
+
+总计498次功能检查全部通过。最终平衡性能见第9.1、9.3和9.5节，原始CSV及测试协议
+保存在`tests/flydsl/results/gfx950_current/`。
 
 ## 10. 正确性与汇编验证
 
@@ -1087,12 +1218,14 @@ N repeat打包成4个i32后发出一条`buffer_store_dwordx4`。`TILE_N`不能�
 pytest -q \
   tests/flydsl/test_gemm.py::test_gemm_950_correctness \
   tests/flydsl/test_gemm.py::test_gemm_950_4wave_multiblock \
-  tests/flydsl/test_gemm.py::test_gemm_950_8wave_permlane_multiblock
+  tests/flydsl/test_gemm.py::test_gemm_950_8wave_permlane_multiblock \
+  tests/flydsl/test_gemm.py::test_gemm_950_small_tile_repeated
 ```
 
-gfx950上期望结果为`14 passed`。多block测试以NaN预填输出，既检查数值误差也能捕获
+gfx950上期望结果为`18 passed`。多block测试以NaN预填输出，既检查数值误差也能捕获
 未写区域；它覆盖4-wave矩形mode交换和短tile DMA竞态，以及8-wave permlane16 +
-128-bit epilogue的`256x256` BF16/FP8路径。
+128-bit epilogue的`256x256` BF16/FP8路径。重复launch测试同时覆盖4/8-wave
+`128x128`的stage复用同步。
 
 当前全尺寸支持矩阵：
 
@@ -1102,26 +1235,28 @@ gfx950上期望结果为`14 passed`。多block测试以NaN预填输出，既检�
 | 4 | `128x256` | 通过 | 通过 | 支持 |
 | 4 | `256x128` | 通过 | 通过 | 支持 |
 | 4 | `256x256` | 通过 | 通过 | 当前最优4-wave路径 |
-| 8 | `128x128` | 通过 | 通过 | 支持 |
+| 8 | `128x128` | 通过 | 通过 | 支持；已修复stage复用等待 |
 | 8 | `128x256` | 通过 | 通过 | 支持 |
 | 8 | `256x128` | 通过 | 通过 | 支持 |
 | 8 | `256x256` | 通过 | 通过 | 当前最优8-wave路径 |
 
-除2x2 workgroup回归外，4-wave和8-wave的4种tile x BF16/FP8都在`4096^3`上用
-NaN预填C做过全输出检查，全部没有未写元素或容差外结果。第9.6节记录4-wave修复前的
-具体失败模式、根因和性能回归数据。
+除2x2 workgroup回归外，4/8-wave的4种tile x BF16/FP8共16个配置都在`4096^3`上以
+NaN预填C连续运行10次并做全输出检查，全部通过；相同16个配置的两K-tile版本各连续
+运行20次，也全部通过。第9.6节记录4-wave修复前的具体失败模式，第9.13节记录
+逐区域同步修复。
 
 标准`256x256`路径的tail-only和长K检查覆盖：
 
 - BF16 `K=128/8192`，4-wave和8-wave均通过；
 - FP8 `K=256/8192`，4-wave和8-wave均通过；
-- 4-wave四种tile的BF16/FP8多block`4096^3`均通过；
-- 8-wave四种tile的BF16/FP8多block`4096^3`均通过。
+- 4-wave四种tile的BF16/FP8多block`4096^3`均连续10次通过；
+- 8-wave四种tile的BF16/FP8多block`4096^3`均连续10次通过；
+- 两条路径的全部tile/dtype两K-tile配置均连续20次通过。
 
-第9节所有K sweep、tile sweep和problem-size sweep性能点都遵循相同准入规则：先用
-NaN预填C，运行一次当前kernel，要求没有未写元素且全部输出满足BF16/FP8对应容差，
-再进行预热和轮换计时。PID映射对照中的标准`256x256`路径也分别验证了row-major和
-`get_pids`结果。
+第9节所有性能点都先用NaN预填C，要求没有未写元素且全部输出满足BF16/FP8对应容差，
+再进行预热和轮换计时。本轮tile sweep的16个配置另以`4096^3`连续10次作为功能准入；
+历史problem-size和PID对照保留各自原始的连续3次准入。PID映射对照中的标准
+`256x256`路径分别验证了row-major和`get_pids`结果。
 
 检查热循环交织和 AGPR 搬运：
 
@@ -1135,16 +1270,22 @@ awk '/^\.LBB0_1:/{inloop=1} /s_cbranch_vccnz \.LBB0_1/{inloop=0} inloop' "$asm" 
 
 ```bash
 python3 tests/flydsl/verify_gemm_950_pipeline.py
+python3 tests/flydsl/verify_gemm_950_8wave_pipeline.py
 ```
 
-脚本同时解析 Gluon/FlyDSL Python AST 和两份保存的最终 ISA，并要求：
+该脚本针对仓库内历史`tests/gluon/gemm_8wave.py`模板和对应保存ISA，用于验证4-wave
+逐位调度类别；它不是当前上游`gfx950-gluon-tutorials@8686f59`的验证器。脚本要求：
 
 - prologue DMA 顺序为两次 `BL -> AT -> AB -> BR`；
-- FlyDSL源码的两次主循环wait位于Region 2/6的LDS read之前；Gluon参考源码仍在
-  Region 3/7等待，二者分别报告而不再强求源码位置相同；
+- FlyDSL源码的八次主循环wait分别位于Region 0--7的LDS read之前，参数顺序为
+  `AB/BR, AB/BR, BL/AT, BL/AT`重复；
 - 4-wave参考的每个子块恰好包含对应来源的32 MFMA、8 LDS read和4 GMem-to-LDS
   prefetch；
 - 4-wave八个子块的352个`MFMA/DSRD/VMEM`类别位置逐位一致；
-- FlyDSL主循环的`vmcnt`为`[8,8]`、位置为`89/265`；Gluon参考为`[16,16]`、
-  位置为`168/344`；两边barrier都为2，AGPR搬运都为`0/0`；
+- FlyDSL主循环为八次`vmcnt(20)`和八次barrier，每两个wait之间恰好4条物理DMA；
+  历史Gluon参考模板仍为两次`vmcnt(16)`，仅用于逐位M/D/V调度对照；
 - tail 逻辑等待顺序为 `5,4,3,2,1,0`。
+
+当前上游提交的精确JIT产物应检查`tests/flydsl/asm/gfx950_gluon_8686f59/`：4-wave
+full主循环为八次`vmcnt(20)`，8-wave base主循环为八次`vmcnt(10)`，详见该目录
+`README.md`和`SHA256SUMS`。
