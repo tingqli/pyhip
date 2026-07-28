@@ -9,17 +9,18 @@ import flydsl.compiler as flyc  # noqa: E402
 from flydsl.compiler.kernel_function import CompilationContext  # noqa: E402
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
-from flydsl.expr.typing import BFloat16, Float32, T, Float8E4M3FNUZ
+from flydsl.expr.typing import BFloat16, Float32, T, Float8E4M3FN, Float8E4M3FNUZ
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 from flydsl.utils.env import DebugEnvManager
 from flydsl._mlir import ir
 import flydsl
+from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 import pyhip.contrib.flydsl as fxu
 
-if 1:
+if 0:
     make_tiled_copy = fxu.make_tiled_copy
     make_tiled_mma = fxu.make_tiled_mma
     make_tiled_copy_A = fxu.make_tiled_copy_A
@@ -840,6 +841,1742 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
     
     return launch
 
+
+def compile_gemm_950(
+    TILE_M,
+    TILE_N,
+    N,
+    K,
+    num_waves,
+    dtype="bf16",
+    pin_bf16_agpr=True,
+    lds_padding=True,
+    pid_swizzle=True,
+    permlane_epilogue=True,
+):
+    assert dtype in ("bf16", "fp8"), "dtype must be bf16 or fp8"
+
+    is_fp8 = dtype == "fp8"
+    element_type = fx.Float8E4M3FN if is_fp8 else fx.BFloat16
+    elements_per_128b = 128 // element_type.width
+    preshuffle_k = 4 * elements_per_128b
+    TILE_K = 128 if is_fp8 else 64
+
+    assert num_waves in (4, 8), "num_waves must be 4 or 8"
+    assert TILE_M % 64 == 0 and TILE_N % 64 == 0
+    assert K % TILE_K == 0
+
+    def encode_waitcnt_950(vmcnt=63, expcnt=7, lgkmcnt=63):
+        vm_lo = vmcnt & 0xF
+        vm_hi = (vmcnt >> 4) & 0x3
+        return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
+
+    a_lds_size_half = TILE_M // 2 * TILE_K
+    b_lds_size_half = TILE_N // 2 * TILE_K
+    use_4wave_lds_padding = num_waves == 4 and lds_padding
+    use_8wave_b_padding = num_waves == 8 and not is_fp8 and lds_padding
+    use_8wave_fp8_a_padding = num_waves == 8 and is_fp8 and lds_padding
+    lds_padding_interval = 512
+    lds_padding_elements = 16
+
+    def padded_lds_size(logical_size):
+        if is_fp8:
+            assert logical_size % 2048 == 0
+            return logical_size + logical_size // 1024 * 16 + logical_size // 2048 * 32
+        assert logical_size % lds_padding_interval == 0
+        return logical_size + logical_size // lds_padding_interval * lds_padding_elements
+
+    def _get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
+        num_pid_m = (M + TILE_M - 1) // TILE_M
+        num_pid_n = div_up(N, TILE_N)
+
+        if const_expr(NUM_XCDS != 1):
+            pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+            tall_xcds = GRID_MN % NUM_XCDS
+            tall_xcds = (tall_xcds == 0).select(NUM_XCDS, tall_xcds)
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            if xcd < tall_xcds:
+                pid = xcd * pids_per_xcd + local_pid
+            else:
+                pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+
+        if const_expr(GROUP_SIZE_M == 1):
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
+        else:
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            remaining_pid_m = num_pid_m - first_pid_m
+            group_size_m = (remaining_pid_m < GROUP_SIZE_M).select(remaining_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+            pid_n = (pid % num_pid_in_group) // group_size_m
+
+        return pid_m, pid_n
+
+    get_pids_950 = ASTRewriter.transform(_get_pids_950)
+
+    use_a_lds_padding = lds_padding and (num_waves == 4 or not is_fp8 or use_8wave_fp8_a_padding)
+    a_lds_stage_size = padded_lds_size(a_lds_size_half) if use_a_lds_padding else a_lds_size_half
+    b_lds_stage_size = padded_lds_size(b_lds_size_half) if use_8wave_b_padding else b_lds_size_half
+
+    @fx.struct
+    class SharedStorage950:
+        at_lds0: fx.Array[element_type, a_lds_stage_size, 16]
+        at_lds1: fx.Array[element_type, a_lds_stage_size, 16]
+        ab_lds0: fx.Array[element_type, a_lds_stage_size, 16]
+        ab_lds1: fx.Array[element_type, a_lds_stage_size, 16]
+        bl_lds0: fx.Array[element_type, b_lds_stage_size, 16]
+        bl_lds1: fx.Array[element_type, b_lds_stage_size, 16]
+        br_lds0: fx.Array[element_type, b_lds_stage_size, 16]
+        br_lds1: fx.Array[element_type, b_lds_stage_size, 16]
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def gemm_4wave_950(arg_c_: fx.Tensor,
+                       arg_a_: fx.Tensor,
+                       arg_b_: fx.Tensor,
+                       M: int):
+        tid = fx.thread_idx.x
+        num_pid_n = div_up(N, TILE_N)
+        if const_expr(pid_swizzle):
+            blk_x, blk_y = get_pids_950(fx.block_idx.x, M, fx.grid_dim.x, 8, 4)
+        else:
+            blk_x = fx.block_idx.x // num_pid_n
+            blk_y = fx.block_idx.x % num_pid_n
+
+        a_iter = fx.recast_iter(element_type, fx.get_iter(arg_a_)) if const_expr(is_fp8) else fx.get_iter(arg_a_)
+        b_iter = fx.recast_iter(element_type, fx.get_iter(arg_b_)) if const_expr(is_fp8) else fx.get_iter(arg_b_)
+        arg_a = fx.Tensor(fx.make_view(
+            a_iter,
+            fx.make_layout((M, K), (K, 1)),
+        ))
+        arg_b = fx.Tensor(fx.make_view(
+            b_iter,
+            fx.make_layout(
+                ((16, N // 16), (elements_per_128b, 4, K // preshuffle_k)),
+                ((elements_per_128b, 16 * K),
+                 (1, 16 * elements_per_128b, 16 * preshuffle_k)),
+            ),
+        ))
+        arg_c = fx.Tensor(fx.make_view(
+            fx.get_iter(arg_c_),
+            fx.make_layout((M, N), (N, 1)),
+        ))
+
+        a_tensor = fx.rocdl.make_buffer_tensor(arg_a, max_size=False)
+        b_tensor = fx.rocdl.make_buffer_tensor(arg_b, max_size=False)
+        c_tensor = fx.rocdl.make_buffer_tensor(arg_c, max_size=False)
+        a_dma_rsrc = fx.buffer_ops.create_buffer_resource(arg_a_, max_size=True)
+        b_dma_rsrc = fx.buffer_ops.create_buffer_resource(arg_b_, max_size=True)
+        c_store_rsrc = fx.buffer_ops.create_buffer_resource(arg_c_, max_size=True)
+
+        element_bytes = element_type.width // 8
+        dma_lane_row = tid // 8
+        dma_lane_k = (tid % 8) * elements_per_128b
+        a_local_row = dma_lane_row % 8 * (TILE_M // 2 // 8) + dma_lane_row // 8
+        at_src_base = fx.Int32(((blk_x * TILE_M + a_local_row) * K + dma_lane_k) * element_bytes)
+        ab_src_base = fx.Int32(
+            ((blk_x * TILE_M + TILE_M // 2 + a_local_row) * K + dma_lane_k) * element_bytes
+        )
+
+        b_n_inner = tid % 16
+        b_k_group = tid // 16 % 4
+        b_k_block = tid // 64 % (TILE_K // preshuffle_k)
+        b_n_block = tid // 128
+        b_lane_elem_offset = (
+            b_n_inner * elements_per_128b
+            + b_n_block * 16 * K
+            + b_k_group * 16 * elements_per_128b
+            + b_k_block * 16 * preshuffle_k
+        )
+        bl_src_base = fx.Int32((blk_y * TILE_N * K + b_lane_elem_offset) * element_bytes)
+        br_src_base = fx.Int32(
+            ((blk_y * TILE_N + TILE_N // 2) * K + b_lane_elem_offset) * element_bytes
+        )
+        at_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M // 2, TILE_K))[None, None, blk_x * 2, None]
+        ab_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M // 2, TILE_K))[None, None, blk_x * 2 + 1, None]
+        bl_tile = fx.flat_divide(b_tensor, fx.make_tile(TILE_N // 2, TILE_K))[None, None, blk_y * 2, None]
+        br_tile = fx.flat_divide(b_tensor, fx.make_tile(TILE_N // 2, TILE_K))[None, None, blk_y * 2 + 1, None]
+
+        c_tl_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, blk_x * 2, blk_y * 2]
+        c_tr_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, blk_x * 2, blk_y * 2 + 1]
+        c_bl_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, blk_x * 2 + 1, blk_y * 2]
+        c_br_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, blk_x * 2 + 1, blk_y * 2 + 1]
+
+        lds = fx.SharedAllocator().allocate(SharedStorage950).peek()
+        if const_expr(use_4wave_lds_padding):
+            if const_expr(is_fp8):
+                # a8w8 kWidth=32: [[1024, 16], [2048, 32]] dual padding.
+                a_lds_write_layout = fx.make_layout(
+                    ((8, 2, TILE_M // 32), TILE_K),
+                    ((TILE_K, 8 * TILE_K + 16, 2 * (8 * TILE_K + 16) + 32), 1),
+                )
+                a_lds_read_layout = fx.make_layout(
+                    ((2, TILE_M // 32, 8), (32, TILE_K // 32)),
+                    ((8 * TILE_K + 16, 2 * (8 * TILE_K + 16) + 32, TILE_K), (1, 32)),
+                )
+                b_lds_storage_layout = fx.make_layout(b_lds_size_half, 1)
+                b_fragment_layout = fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))
+            else:
+                # Match asycn_copy_padding: grouped rows for DMA writes, transposed groups for MFMA reads.
+                a_lds_rows_per_group = TILE_M // 2 // 8
+                a_lds_write_layout = fx.make_layout(
+                    ((8, TILE_M // 16), TILE_K),
+                    ((TILE_K, 8 * TILE_K + lds_padding_elements), 1),
+                )
+                a_lds_read_layout = fx.make_layout(
+                    ((a_lds_rows_per_group, 8), (32, TILE_K // 32)),
+                    ((8 * TILE_K + lds_padding_elements, TILE_K), (1, 32)),
+                )
+                b_lds_storage_layout = fx.make_layout(b_lds_size_half, 1)
+                b_fragment_layout = fx.make_layout(
+                    ((8, TILE_N // 16), TILE_K),
+                    ((TILE_K, 8 * TILE_K + lds_padding_elements), 1),
+                )
+        else:
+            a_lds_write_layout = fx.make_ordered_layout((TILE_M // 2, TILE_K), order=(1, 0))
+            a_lds_read_layout = a_lds_write_layout
+            b_lds_storage_layout = fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))
+            b_fragment_layout = b_lds_storage_layout
+        at_lds_write = [
+            fx.make_view(lds.at_lds0.ptr, a_lds_write_layout),
+            fx.make_view(lds.at_lds1.ptr, a_lds_write_layout),
+        ]
+        ab_lds_write = [
+            fx.make_view(lds.ab_lds0.ptr, a_lds_write_layout),
+            fx.make_view(lds.ab_lds1.ptr, a_lds_write_layout),
+        ]
+        at_lds = [
+            fx.make_view(lds.at_lds0.ptr, a_lds_read_layout),
+            fx.make_view(lds.at_lds1.ptr, a_lds_read_layout),
+        ]
+        ab_lds = [
+            fx.make_view(lds.ab_lds0.ptr, a_lds_read_layout),
+            fx.make_view(lds.ab_lds1.ptr, a_lds_read_layout),
+        ]
+        bl_lds = [
+            fx.make_view(lds.bl_lds0.ptr, b_lds_storage_layout),
+            fx.make_view(lds.bl_lds1.ptr, b_lds_storage_layout),
+        ]
+        br_lds = [
+            fx.make_view(lds.br_lds0.ptr, b_lds_storage_layout),
+            fx.make_view(lds.br_lds1.ptr, b_lds_storage_layout),
+        ]
+        bl_fragment_view = [
+            fx.make_view(lds.bl_lds0.ptr, b_fragment_layout),
+            fx.make_view(lds.bl_lds1.ptr, b_fragment_layout),
+        ]
+        br_fragment_view = [
+            fx.make_view(lds.br_lds0.ptr, b_fragment_layout),
+            fx.make_view(lds.br_lds1.ptr, b_fragment_layout),
+        ]
+
+        g2s_tile, g2s_tv_layout = fx.make_layout_tv(
+            fx.make_layout((8 * 4, 8), (8, 1)),
+            fx.make_layout((1, elements_per_128b), (1, 1)),
+        )
+        layout_g2s = fx.make_tiled_copy(
+            fx.make_copy_atom(fx.rocdl.BufferCopy128b(), element_type),
+            g2s_tv_layout,
+            g2s_tile,
+        )
+        copy_g2s = layout_g2s.get_slice(tid)
+        at_g2s_src = copy_g2s.partition_S(at_tile)
+        ab_g2s_src = copy_g2s.partition_S(ab_tile)
+        bl_g2s_src = copy_g2s.partition_S(bl_tile)
+        br_g2s_src = copy_g2s.partition_S(br_tile)
+        at_g2s_dst = [copy_g2s.partition_D(at_lds_write[0]), copy_g2s.partition_D(at_lds_write[1])]
+        ab_g2s_dst = [copy_g2s.partition_D(ab_lds_write[0]), copy_g2s.partition_D(ab_lds_write[1])]
+        bl_g2s_dst = [copy_g2s.partition_D(bl_fragment_view[0]), copy_g2s.partition_D(bl_fragment_view[1])]
+        br_g2s_dst = [copy_g2s.partition_D(br_fragment_view[0]), copy_g2s.partition_D(br_fragment_view[1])]
+        async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+
+        wave_id = tid // 64
+        if const_expr(is_fp8 and use_a_lds_padding):
+            a_wave_offset_elements = (
+                wave_id % 2 * (8 * TILE_K + 16)
+                + wave_id // 2 * (2 * (8 * TILE_K + 16) + 32)
+            )
+        else:
+            a_wave_stride_elements = 8 * TILE_K + (
+                lds_padding_elements if use_a_lds_padding else 0
+            )
+            a_wave_offset_elements = wave_id * a_wave_stride_elements
+        a_wave_offset_bytes = rocdl.readfirstlane(
+            T.i32,
+            arith._to_raw(fx.Int32(a_wave_offset_elements * element_bytes)),
+        )
+        b_wave_offset_bytes = rocdl.readfirstlane(
+            T.i32,
+            arith._to_raw(fx.Int32(wave_id * 64 * 16)),
+        )
+
+        lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
+        if const_expr(is_fp8):
+            mma_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, element_type))
+            plain_scale = fx.Int32(0)
+            mma_atom = fx.atom_set_value(mma_atom, "scale_a", plain_scale)
+            mma_atom = fx.atom_set_value(mma_atom, "scale_b", plain_scale)
+            k_perm = fx.make_layout((32, 4), (1, 32))
+        else:
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, element_type))
+            k_perm = fx.make_layout((8, 4), (1, 8))
+        tiled_mma = fx.make_tiled_mma(
+            mma_atom,
+            fx.make_layout((2, 2, 1), (1, 2, 0)),
+            (None, None, k_perm),
+        )
+        thr_mma = tiled_mma.thr_slice(tid)
+
+        copy_a = fx.make_tiled_copy_B(lds_copy_atom, tiled_mma).get_slice(tid)
+        copy_b = fx.make_tiled_copy_A(lds_copy_atom, tiled_mma).get_slice(tid)
+        at_lds_src = [copy_a.partition_S(at_lds[0]), copy_a.partition_S(at_lds[1])]
+        ab_lds_src = [copy_a.partition_S(ab_lds[0]), copy_a.partition_S(ab_lds[1])]
+        bl_lds_src = [copy_b.partition_S(bl_fragment_view[0]), copy_b.partition_S(bl_fragment_view[1])]
+        br_lds_src = [copy_b.partition_S(br_fragment_view[0]), copy_b.partition_S(br_fragment_view[1])]
+
+        at_frag = thr_mma.make_fragment_B(at_lds[0])
+        ab_frag = thr_mma.make_fragment_B(ab_lds[0])
+        bl_frag = thr_mma.make_fragment_A(bl_fragment_view[0])
+        br_frag = thr_mma.make_fragment_A(br_fragment_view[0])
+        at_frag_dst = copy_a.retile(at_frag)
+        ab_frag_dst = copy_a.retile(ab_frag)
+        bl_frag_dst = copy_b.retile(bl_frag)
+        br_frag_dst = copy_b.retile(br_frag)
+
+        # B 在 LDS 中保持 host preshuffle 字节序，当前普通 B view 不能表达 MFMA 所需的
+        # 物理地址映射，直接改用 fx.copy 会产生错误结果。完整 preshuffle LDS view 虽然
+        # 正确，但会增加 VGPR 和 wait，并使 BF16 K=8192 稳定回退约 0.33%。
+        def copy_contiguous_b_lds_to_frag(root, dst):
+            ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            base_ptr = fly_dialect.extract_aligned_pointer_as_index(ptr_type, arith._to_raw(root))
+            lane_id = tid % 64
+            wave_id = tid // 64
+            # B stays in host preshuffle order; consecutive lanes therefore read consecutive 16-byte vectors.
+            if const_expr(is_fp8):
+                base_row = lane_id % 16 + wave_id % 2 * 16
+                base_k = lane_id // 16 * 32
+                major_count = TILE_N // 2 // 32
+                stage_count = 2
+            else:
+                base_row = lane_id % 16 + wave_id % 2 * 16
+                base_k = lane_id // 16 * elements_per_128b
+                major_count = TILE_N // 2 // 32
+                stage_count = TILE_K // 32
+            assembled = fx.Vector.filled(
+                elements_per_128b * major_count * stage_count,
+                0,
+                element_type,
+            ).ir_value()
+            chunk_idx = 0
+            for outer in range_constexpr(stage_count if not is_fp8 else major_count):
+                for inner in range_constexpr(major_count if not is_fp8 else stage_count):
+                    stage = outer if const_expr(not is_fp8) else inner
+                    major = inner if const_expr(not is_fp8) else outer
+                    row = base_row + major * 32
+                    k = base_k + stage * (elements_per_128b if is_fp8 else 32)
+                    elem_offset = (
+                        row // 16 * 16 * TILE_K
+                        + k // preshuffle_k * 16 * preshuffle_k
+                        + k // elements_per_128b % 4 * 16 * elements_per_128b
+                        + row % 16 * elements_per_128b
+                        + k % elements_per_128b
+                    )
+                    ptr = fx.buffer_ops.get_element_ptr(
+                        base_ptr,
+                        byte_offset=elem_offset * element_bytes,
+                        elem_type=T.i8,
+                    )
+                    if const_expr(is_fp8):
+                        loaded_i32 = llvm.LoadOp(
+                            T.vec(4, T.i32),
+                            ptr,
+                            alignment=16,
+                        ).result
+                        loaded = Vec(loaded_i32).bitcast(element_type).ir_value()
+                    else:
+                        loaded = llvm.LoadOp(
+                            T.vec(elements_per_128b, element_type.ir_type),
+                            ptr,
+                            alignment=16,
+                        ).result
+                    assembled = vector.insert_strided_slice(
+                        loaded,
+                        assembled,
+                        [chunk_idx * elements_per_128b],
+                        [1],
+                    )
+                    chunk_idx += 1
+            fx.memref_store_vec(assembled, dst)
+
+        # 4-wave padding 路径需要同时实现 A 的分组行重排和 B 的 preshuffle 原样复制。
+        # 直接使用 generic async copy 会产生错误结果；等价的 A source layout 虽然正确，
+        # 但 BF16 增加 16 个架构 VGPR，并在 BF16/FP8 长 K 上稳定回退约 0.2%~0.3%。
+        def copy_bf16_gmem_to_lds(rsrc, dst, root, row_base, src_base, k_tile, is_b):
+            dst_ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            dst_stride = dst.stride.to_py_value()
+            chunk_count = (TILE_N // 2 if is_b else TILE_M // 2) // 32
+            lane_row = tid // 8
+            lane_k = (tid % 8) * elements_per_128b
+            root_base = fly_dialect.extract_aligned_pointer_as_index(dst_ptr_type, arith._to_raw(root))
+            dst_base = fx.buffer_ops.get_element_ptr(
+                root_base,
+                byte_offset=b_wave_offset_bytes if is_b else a_wave_offset_bytes,
+                elem_type=T.i8,
+            )
+            for chunk in range_constexpr(chunk_count):
+                src_soffset = fx.Int32(0)
+
+                if const_expr(is_b and use_4wave_lds_padding):
+                    # Copy the preshuffled tile byte-for-byte: thread tid owns one 16-byte vector per round.
+                    local_elem_offset = tid * elements_per_128b + chunk * 256 * elements_per_128b
+                    k_inner = local_elem_offset % elements_per_128b
+                    n_inner = local_elem_offset // elements_per_128b % 16
+                    k_group = local_elem_offset // (16 * elements_per_128b) % 4
+                    k_block = local_elem_offset // (16 * preshuffle_k) % (TILE_K // preshuffle_k)
+                    n_block = local_elem_offset // (16 * TILE_K)
+                    elem_offset = (
+                        n_inner * elements_per_128b
+                        + (row_base // 16 + n_block) * 16 * K
+                        + k_inner
+                        + k_group * 16 * elements_per_128b
+                        + (k_tile * (TILE_K // preshuffle_k) + k_block) * 16 * preshuffle_k
+                    )
+                    src_offset = fx.Int32(elem_offset * element_bytes)
+                    dst_ptr = fx.buffer_ops.get_element_ptr(
+                        dst_base,
+                        byte_offset=(tid % 64 * elements_per_128b + chunk * 256 * elements_per_128b)
+                        * element_bytes,
+                        elem_type=T.i8,
+                    )
+                    rocdl.raw_ptr_buffer_load_lds(
+                        rsrc,
+                        dst_ptr,
+                        fx.Int32(16),
+                        src_offset,
+                        src_soffset,
+                        fx.Int32(0),
+                        fx.Int32(0),
+                    )
+                    continue
+
+                logical_row = lane_row + chunk * 32
+                local_row = logical_row % 8 * (TILE_M // 2 // 8) + logical_row // 8
+                row = row_base + local_row
+                k = k_tile * TILE_K + lane_k
+                src_offset = fx.Int32((row * K + k) * element_bytes)
+                dst_ptr = fx.buffer_ops.get_element_ptr(
+                    dst_base,
+                    static_byte_offset=chunk * dst_stride[1] * element_bytes,
+                    elem_type=T.i8,
+                )
+                rocdl.raw_ptr_buffer_load_lds(
+                    rsrc,
+                    dst_ptr,
+                    fx.Int32(16),
+                    src_offset,
+                    src_soffset,
+                    fx.Int32(0),
+                    fx.Int32(0),
+                )
+
+        def copy_a_gmem_to_lds(rsrc, src, dst, root, row_base, src_base, k_tile):
+            if const_expr(use_4wave_lds_padding):
+                copy_bf16_gmem_to_lds(rsrc, dst, root, row_base, src_base, k_tile, False)
+            else:
+                fx.copy(async_copy_atom, src, dst)
+
+        def copy_b_gmem_to_lds(rsrc, src, dst, root, row_base, src_base, k_tile):
+            if const_expr(use_4wave_lds_padding):
+                copy_bf16_gmem_to_lds(rsrc, root, root, row_base, src_base, k_tile, True)
+            else:
+                fx.copy(async_copy_atom, src, dst)
+
+        def copy_lds_to_frag(src, dst):
+            # src layout 已完整描述 A operand 的 padding/重排；generic copy 可生成相同数量
+            # 的 ds_read_b128，且资源、调度、正确性和性能均与原手工 reader 等价。
+            fx.copy(lds_copy_atom, src, dst)
+
+        def copy_b_lds_to_frag(src, root, dst):
+            if const_expr(use_4wave_lds_padding):
+                copy_contiguous_b_lds_to_frag(root, dst)
+            else:
+                fx.copy(lds_copy_atom, src, dst)
+
+        transposed_c_layout = fx.make_ordered_layout((TILE_N // 2, TILE_M // 2), (1, 0))
+        c_tl_tile = fx.composition(c_tl_tile, transposed_c_layout)
+        c_tr_tile = fx.composition(c_tr_tile, transposed_c_layout)
+        c_bl_tile = fx.composition(c_bl_tile, transposed_c_layout)
+        c_br_tile = fx.composition(c_br_tile, transposed_c_layout)
+
+        c_tl_frag = thr_mma.make_fragment_C(c_tl_tile)
+        c_tr_frag = thr_mma.make_fragment_C(c_tr_tile)
+        c_bl_frag = thr_mma.make_fragment_C(c_bl_tile)
+        c_br_frag = thr_mma.make_fragment_C(c_br_tile)
+        c_tl_frag.fill(0)
+        c_tr_frag.fill(0)
+        c_bl_frag.fill(0)
+        c_br_frag.fill(0)
+
+        num_tiles = K // TILE_K
+        assert num_tiles >= 2 and num_tiles % 2 == 0, "gfx950 pipeline requires an even number of at least two K tiles"
+        mfma_k = 128 if is_fp8 else 32
+        mfma_per_region = (
+            (TILE_M // 2 // (2 * 16))
+            * (TILE_N // 2 // (2 * 16))
+            * (TILE_K // mfma_k)
+        )
+        a_dsrd_count = at_frag.load().numel * element_type.width // 8 // 16
+        b_dsrd_count = bl_frag.load().numel * element_type.width // 8 // 16
+        a_vmem_count = (TILE_M // 2 * TILE_K * element_type.width // 8) // (256 * 16)
+        b_vmem_count = (TILE_N // 2 * TILE_K * element_type.width // 8) // (256 * 16)
+        prologue_vmcnt = 3 * a_vmem_count + 3 * b_vmem_count
+        ab_br_vmcnt = 2 * a_vmem_count + 3 * b_vmem_count
+        bl_at_vmcnt = 3 * a_vmem_count + 2 * b_vmem_count
+
+        def hot_loop_scheduler(dsrd_count, vmem_count, group_id):
+            if const_expr(not is_fp8 and mfma_per_region == 32 and dsrd_count == 8 and vmem_count == 4):
+                for _ in range_constexpr(8):
+                    rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
+                for _ in range_constexpr(4):
+                    rocdl.sched_group_barrier(rocdl.mask_mfma, 4, group_id)
+                    rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
+                rocdl.sched_group_barrier(rocdl.mask_mfma, 8, group_id)
+            elif const_expr(not is_fp8 and mfma_per_region == 32 and dsrd_count == 8 and vmem_count == 0):
+                for _ in range_constexpr(8):
+                    rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
+                rocdl.sched_group_barrier(rocdl.mask_mfma, 24, group_id)
+            elif const_expr(not is_fp8 and mfma_per_region == 32 and dsrd_count == 0 and vmem_count == 0):
+                rocdl.sched_group_barrier(rocdl.mask_mfma, 32, group_id)
+            else:
+                prev_dsrd = 0
+                prev_vmem = 0
+                for sched_idx in range_constexpr(mfma_per_region):
+                    rocdl.sched_mfma(1)
+                    cur_dsrd = ((sched_idx + 1) * dsrd_count + mfma_per_region - 1) // mfma_per_region
+                    cur_vmem = ((sched_idx + 1) * vmem_count + mfma_per_region - 1) // mfma_per_region
+                    if const_expr(cur_dsrd > prev_dsrd):
+                        rocdl.sched_dsrd(cur_dsrd - prev_dsrd)
+                    if const_expr(cur_vmem > prev_vmem):
+                        rocdl.sched_vmem(cur_vmem - prev_vmem)
+                    prev_dsrd = cur_dsrd
+                    prev_vmem = cur_vmem
+            rocdl.sched_barrier(0)
+
+        # 不直接使用 fx.gemm：宽 C fragment 的 loop-carried SSA 会触发 AGPR 槽置换，
+        # 在热循环引入 AGPR/VGPR 往返和 spill。按 f32x4 slice 显式构造原生 MFMA 链，
+        # 既保持热循环零 AGPR 搬运，也让 sched_group 能按原生 MFMA opcode 分类。
+        def gemm_bf16_agpr(c_frag, a_frag, b_frag):
+            """Use native K32 MFMA ops with explicit per-slice accumulator chains."""
+            for n in range_constexpr(TILE_N // 2 // (2 * 16)):
+                for m in range_constexpr(TILE_M // 2 // (2 * 16)):
+                    c_slice = c_frag[None, n, m]
+                    acc = arith._to_raw(c_slice.load())
+                    for k in range_constexpr(TILE_K // 32):
+                        a = a_frag[None, n, k].load()
+                        b = b_frag[None, m, k].load()
+                        acc = rocdl.mfma_f32_16x16x32_bf16(
+                            T.vec(4, T.f32),
+                            [arith._to_raw(a), arith._to_raw(b), arith._to_raw(acc), 0, 0, 0],
+                        )
+                    c_slice.store(acc)
+
+        # 该空 asm 只用于延长 B fragment 的 VGPR live range，防止后续 LDS read 过早复用
+        # 仍被 MFMA 消费的寄存器并破坏目标交织。删除不影响正确性，但会使 M/D/V 连续段
+        # 从 193 降至 156，并在 K=2048/4096/8192 上造成约 1.3%~1.9% 的稳定回退。
+        def anchor_b_frag(b_frag):
+            b_words = b_frag.load().bitcast(fx.Int32)
+            num_words = b_words.numel
+            result_type = ir.Type.parse(f"!llvm.struct<({', '.join(['i32'] * num_words)})>")
+            operands = [arith._to_raw(b_words[i]) for i in range_constexpr(num_words)]
+            constraints = ",".join(["=r"] * num_words + ["r"] * num_words)
+            llvm.inline_asm(
+                result_type,
+                operands,
+                ";",
+                constraints,
+                has_side_effects=True,
+            )
+
+        def wait_vmem_barrier(vmcnt):
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
+            rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+            rocdl.s_barrier()
+
+        rocdl.sched_barrier(0)
+        copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, 0], bl_g2s_dst[0], bl_lds[0], blk_y * TILE_N, bl_src_base, 0)
+        copy_a_gmem_to_lds(
+            a_dma_rsrc, at_g2s_src[None, None, None, 0], at_g2s_dst[0], at_lds_write[0], blk_x * TILE_M, at_src_base, 0
+        )
+        copy_a_gmem_to_lds(
+            a_dma_rsrc,
+            ab_g2s_src[None, None, None, 0],
+            ab_g2s_dst[0],
+            ab_lds_write[0],
+            blk_x * TILE_M + TILE_M // 2,
+            ab_src_base,
+            0,
+        )
+        copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, 0], br_g2s_dst[0], br_lds[0], blk_y * TILE_N + TILE_N // 2, br_src_base, 0)
+        copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, 1], bl_g2s_dst[1], bl_lds[1], blk_y * TILE_N, bl_src_base, 1)
+        copy_a_gmem_to_lds(
+            a_dma_rsrc, at_g2s_src[None, None, None, 1], at_g2s_dst[1], at_lds_write[1], blk_x * TILE_M, at_src_base, 1
+        )
+        copy_a_gmem_to_lds(
+            a_dma_rsrc,
+            ab_g2s_src[None, None, None, 1],
+            ab_g2s_dst[1],
+            ab_lds_write[1],
+            blk_x * TILE_M + TILE_M // 2,
+            ab_src_base,
+            1,
+        )
+        copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, 1], br_g2s_dst[1], br_lds[1], blk_y * TILE_N + TILE_N // 2, br_src_base, 1)
+        # Eight prologue groups are ordered BL/AT/AB/BR for each stage.  The
+        # first BL/AT pair must complete while the six younger groups remain.
+        wait_vmem_barrier(prologue_vmcnt)
+        copy_lds_to_frag(at_lds_src[0], at_frag_dst)
+        copy_b_lds_to_frag(bl_lds_src[0], bl_lds[0], bl_frag_dst)
+        rocdl.sched_barrier(0)
+
+        acc_init = [c_tl_frag.load(), c_tr_frag.load(), c_bl_frag.load(), c_br_frag.load()]
+        for k, state in range(0, num_tiles - 2, 2, init=acc_init):
+            c_tl_frag.store(state[0])
+            c_tr_frag.store(state[1])
+            c_bl_frag.store(state[2])
+            c_br_frag.store(state[3])
+            k_i32 = fx.Int32(k)
+
+            # Region 0: TL(stage 0), read AB0, prefetch BL(k+2).
+            if const_expr(is_fp8 or not pin_bf16_agpr):
+                fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
+            else:
+                gemm_bf16_agpr(c_tl_frag, bl_frag, at_frag)
+            wait_vmem_barrier(ab_br_vmcnt)
+            copy_lds_to_frag(ab_lds_src[0], ab_frag_dst)
+            copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, k_i32 + 2], bl_g2s_dst[0], bl_lds[0], blk_y * TILE_N, bl_src_base, k_i32 + 2)
+            hot_loop_scheduler(a_dsrd_count, b_vmem_count, 0)
+
+            # Region 1: BL(stage 0), read BR0, prefetch AT(k+2).
+            if const_expr(is_fp8 or not pin_bf16_agpr):
+                fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
+            else:
+                gemm_bf16_agpr(c_bl_frag, bl_frag, ab_frag)
+            wait_vmem_barrier(ab_br_vmcnt)
+            copy_b_lds_to_frag(br_lds_src[0], br_lds[0], br_frag_dst)
+            copy_a_gmem_to_lds(
+                a_dma_rsrc,
+                at_g2s_src[None, None, None, k_i32 + 2],
+                at_g2s_dst[0],
+                at_lds_write[0],
+                blk_x * TILE_M,
+                at_src_base,
+                k_i32 + 2,
+            )
+            hot_loop_scheduler(b_dsrd_count, a_vmem_count, 1)
+            if const_expr(not is_fp8):
+                anchor_b_frag(bl_frag)
+                rocdl.sched_barrier(0)
+
+            # Region 2: TR(stage 0), read BL1, prefetch AB(k+2).
+            if const_expr(is_fp8 or not pin_bf16_agpr):
+                fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
+            else:
+                gemm_bf16_agpr(c_tr_frag, br_frag, at_frag)
+            wait_vmem_barrier(bl_at_vmcnt)
+            copy_b_lds_to_frag(bl_lds_src[1], bl_lds[1], bl_frag_dst)
+            copy_a_gmem_to_lds(
+                a_dma_rsrc,
+                ab_g2s_src[None, None, None, k_i32 + 2],
+                ab_g2s_dst[0],
+                ab_lds_write[0],
+                blk_x * TILE_M + TILE_M // 2,
+                ab_src_base,
+                k_i32 + 2,
+            )
+            hot_loop_scheduler(b_dsrd_count, a_vmem_count, 2)
+
+            # Region 3: BR(stage 0), read AT1, prefetch BR(k+2).
+            if const_expr(is_fp8 or not pin_bf16_agpr):
+                fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
+            else:
+                gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
+            wait_vmem_barrier(bl_at_vmcnt)
+            copy_lds_to_frag(at_lds_src[1], at_frag_dst)
+            copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, k_i32 + 2], br_g2s_dst[0], br_lds[0], blk_y * TILE_N + TILE_N // 2, br_src_base, k_i32 + 2)
+            hot_loop_scheduler(a_dsrd_count, b_vmem_count, 3)
+            if const_expr(not is_fp8):
+                anchor_b_frag(ab_frag)
+                anchor_b_frag(br_frag)
+                rocdl.sched_barrier(0)
+
+            # Region 4: TL(stage 1), read AB1, prefetch BL(k+3).
+            if const_expr(is_fp8 or not pin_bf16_agpr):
+                fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
+            else:
+                gemm_bf16_agpr(c_tl_frag, bl_frag, at_frag)
+            wait_vmem_barrier(ab_br_vmcnt)
+            copy_lds_to_frag(ab_lds_src[1], ab_frag_dst)
+            copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, k_i32 + 3], bl_g2s_dst[1], bl_lds[1], blk_y * TILE_N, bl_src_base, k_i32 + 3)
+            hot_loop_scheduler(a_dsrd_count, b_vmem_count, 4)
+
+            # Region 5: BL(stage 1), read BR1, prefetch AT(k+3).
+            if const_expr(is_fp8 or not pin_bf16_agpr):
+                fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
+            else:
+                gemm_bf16_agpr(c_bl_frag, bl_frag, ab_frag)
+            wait_vmem_barrier(ab_br_vmcnt)
+            copy_b_lds_to_frag(br_lds_src[1], br_lds[1], br_frag_dst)
+            copy_a_gmem_to_lds(
+                a_dma_rsrc,
+                at_g2s_src[None, None, None, k_i32 + 3],
+                at_g2s_dst[1],
+                at_lds_write[1],
+                blk_x * TILE_M,
+                at_src_base,
+                k_i32 + 3,
+            )
+            hot_loop_scheduler(b_dsrd_count, a_vmem_count, 5)
+            if const_expr(not is_fp8):
+                anchor_b_frag(bl_frag)
+                rocdl.sched_barrier(0)
+
+            # Region 6: TR(stage 1), read BL0(k+2), prefetch AB(k+3).
+            if const_expr(is_fp8 or not pin_bf16_agpr):
+                fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
+            else:
+                gemm_bf16_agpr(c_tr_frag, br_frag, at_frag)
+            wait_vmem_barrier(bl_at_vmcnt)
+            copy_b_lds_to_frag(bl_lds_src[0], bl_lds[0], bl_frag_dst)
+            copy_a_gmem_to_lds(
+                a_dma_rsrc,
+                ab_g2s_src[None, None, None, k_i32 + 3],
+                ab_g2s_dst[1],
+                ab_lds_write[1],
+                blk_x * TILE_M + TILE_M // 2,
+                ab_src_base,
+                k_i32 + 3,
+            )
+            hot_loop_scheduler(b_dsrd_count, a_vmem_count, 6)
+
+            # Region 7: BR(stage 1), read AT0(k+2), prefetch BR(k+3).
+            if const_expr(is_fp8 or not pin_bf16_agpr):
+                fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
+            else:
+                gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
+            wait_vmem_barrier(bl_at_vmcnt)
+            copy_lds_to_frag(at_lds_src[0], at_frag_dst)
+            copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, k_i32 + 3], br_g2s_dst[1], br_lds[1], blk_y * TILE_N + TILE_N // 2, br_src_base, k_i32 + 3)
+            hot_loop_scheduler(a_dsrd_count, b_vmem_count, 7)
+
+            results = yield [c_tl_frag.load(), c_tr_frag.load(), c_bl_frag.load(), c_br_frag.load()]
+
+        c_tl_frag.store(results[0])
+        c_tr_frag.store(results[1])
+        c_bl_frag.store(results[2])
+        c_br_frag.store(results[3])
+
+        # Two-tile tail, preserving the same eight-region order without future prefetches.
+        rocdl.sched_barrier(0)
+        if const_expr(is_fp8 or not pin_bf16_agpr):
+            fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
+        else:
+            gemm_bf16_agpr(c_tl_frag, bl_frag, at_frag)
+        wait_vmem_barrier(2 * a_vmem_count + 3 * b_vmem_count)
+        copy_lds_to_frag(ab_lds_src[0], ab_frag_dst)
+        hot_loop_scheduler(a_dsrd_count, 0, 0)
+
+        rocdl.sched_barrier(0)
+        if const_expr(is_fp8 or not pin_bf16_agpr):
+            fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
+        else:
+            gemm_bf16_agpr(c_bl_frag, bl_frag, ab_frag)
+        wait_vmem_barrier(2 * a_vmem_count + 2 * b_vmem_count)
+        copy_b_lds_to_frag(br_lds_src[0], br_lds[0], br_frag_dst)
+        hot_loop_scheduler(b_dsrd_count, 0, 1)
+
+        rocdl.sched_barrier(0)
+        if const_expr(is_fp8 or not pin_bf16_agpr):
+            fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
+        else:
+            gemm_bf16_agpr(c_tr_frag, br_frag, at_frag)
+        wait_vmem_barrier(2 * a_vmem_count + b_vmem_count)
+        copy_b_lds_to_frag(bl_lds_src[1], bl_lds[1], bl_frag_dst)
+        hot_loop_scheduler(b_dsrd_count, 0, 2)
+
+        rocdl.sched_barrier(0)
+        if const_expr(is_fp8 or not pin_bf16_agpr):
+            fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
+        else:
+            gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
+        wait_vmem_barrier(a_vmem_count + b_vmem_count)
+        copy_lds_to_frag(at_lds_src[1], at_frag_dst)
+        hot_loop_scheduler(a_dsrd_count, 0, 3)
+
+        rocdl.sched_barrier(0)
+        if const_expr(is_fp8 or not pin_bf16_agpr):
+            fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
+        else:
+            gemm_bf16_agpr(c_tl_frag, bl_frag, at_frag)
+        wait_vmem_barrier(b_vmem_count)
+        copy_lds_to_frag(ab_lds_src[1], ab_frag_dst)
+        hot_loop_scheduler(a_dsrd_count, 0, 4)
+
+        rocdl.sched_barrier(0)
+        if const_expr(is_fp8 or not pin_bf16_agpr):
+            fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
+        else:
+            gemm_bf16_agpr(c_bl_frag, bl_frag, ab_frag)
+        wait_vmem_barrier(0)
+        copy_b_lds_to_frag(br_lds_src[1], br_lds[1], br_frag_dst)
+        hot_loop_scheduler(b_dsrd_count, 0, 5)
+
+        rocdl.sched_barrier(0)
+        if const_expr(is_fp8 or not pin_bf16_agpr):
+            fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
+        else:
+            gemm_bf16_agpr(c_tr_frag, br_frag, at_frag)
+        hot_loop_scheduler(0, 0, 6)
+
+        rocdl.sched_barrier(0)
+        if const_expr(is_fp8 or not pin_bf16_agpr):
+            fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
+        else:
+            gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
+        hot_loop_scheduler(0, 0, 7)
+
+        if const_expr(permlane_epilogue):
+            pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
+            lane_id = tid % 64
+            wave_id = tid // 64
+            wave_m = wave_id // 2
+            wave_n = wave_id % 2
+            lane_group = lane_id // 16
+            store_group = lane_group % 2 * 2 + lane_group // 2
+            fragment_mode_0_repeat = TILE_N // 64
+            fragment_mode_1_repeat = TILE_M // 64
+
+            def store_c_quadrant(c_frag, quadrant_m, quadrant_n):
+                for row_repeat in range_constexpr(fragment_mode_1_repeat):
+                    for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
+                        acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
+                        acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
+                        d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
+                        d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
+                        d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
+                        d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+                        swap0 = rocdl.permlane16_swap(
+                            pair_type,
+                            arith._to_raw(d0_a),
+                            arith._to_raw(d0_b),
+                            False,
+                            False,
+                        )
+                        swap1 = rocdl.permlane16_swap(
+                            pair_type,
+                            arith._to_raw(d1_a),
+                            arith._to_raw(d1_b),
+                            False,
+                            False,
+                        )
+                        packed = Vec.from_elements(
+                            [
+                                fx.Int32(llvm.extractvalue(T.i32, swap0, [0])),
+                                fx.Int32(llvm.extractvalue(T.i32, swap1, [0])),
+                                fx.Int32(llvm.extractvalue(T.i32, swap0, [1])),
+                                fx.Int32(llvm.extractvalue(T.i32, swap1, [1])),
+                            ],
+                            fx.Int32,
+                        )
+                        row = (
+                            blk_x * TILE_M
+                            + quadrant_m * (TILE_M // 2)
+                            + row_repeat * 32
+                            + wave_m * 16
+                            + lane_id % 16
+                        )
+                        col = (
+                            blk_y * TILE_N
+                            + quadrant_n * (TILE_N // 2)
+                            + col_repeat * 32
+                            + lane_group % 2 * 32
+                            + wave_n * 16
+                            + lane_group // 2 * 8
+                        )
+                        byte_offset = (row * N + col) * 2
+                        fx.buffer_ops.buffer_store(
+                            packed,
+                            c_store_rsrc,
+                            byte_offset,
+                            offset_is_bytes=True,
+                        )
+
+            store_c_quadrant(c_tl_frag, 0, 0)
+            store_c_quadrant(c_tr_frag, 0, 1)
+            store_c_quadrant(c_bl_frag, 1, 0)
+            store_c_quadrant(c_br_frag, 1, 1)
+        else:
+            c_frag_bf16 = fx.make_fragment_like(c_tl_frag, dtype=fx.BFloat16)
+            store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+            store_thr = fx.make_tiled_copy_C(store_atom, tiled_mma).get_slice(tid)
+
+            c_frag_bf16.store(c_tl_frag.load().to(fx.BFloat16))
+            fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_tl_tile))
+            c_frag_bf16.store(c_tr_frag.load().to(fx.BFloat16))
+            fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_tr_tile))
+            c_frag_bf16.store(c_bl_frag.load().to(fx.BFloat16))
+            fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_bl_tile))
+            c_frag_bf16.store(c_br_frag.load().to(fx.BFloat16))
+            fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_br_tile))
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def gemm_8wave_950(arg_c_: fx.Tensor,
+                       arg_a_: fx.Tensor,
+                       arg_b_: fx.Tensor,
+                       M: int):
+        tid = fx.thread_idx.x
+        wave_id = tid // 64
+        num_pid_n = div_up(N, TILE_N)
+        if const_expr(pid_swizzle):
+            blk_x, blk_y = get_pids_950(fx.block_idx.x, M, fx.grid_dim.x, 8, 4)
+        else:
+            blk_x = fx.block_idx.x // num_pid_n
+            blk_y = fx.block_idx.x % num_pid_n
+
+        a_iter = fx.recast_iter(element_type, fx.get_iter(arg_a_)) if const_expr(is_fp8) else fx.get_iter(arg_a_)
+        arg_a = fx.Tensor(fx.make_view(
+            a_iter,
+            fx.make_layout((M, K), (K, 1)),
+        ))
+        arg_c = fx.Tensor(fx.make_view(
+            fx.get_iter(arg_c_),
+            fx.make_layout((M, N), (N, 1)),
+        ))
+
+        a_tensor = fx.rocdl.make_buffer_tensor(arg_a, max_size=False)
+        c_tensor = fx.rocdl.make_buffer_tensor(arg_c, max_size=False)
+        a_dma_rsrc = fx.buffer_ops.create_buffer_resource(arg_a_, max_size=True)
+        b_dma_rsrc = fx.buffer_ops.create_buffer_resource(arg_b_, max_size=True)
+        c_store_rsrc = fx.buffer_ops.create_buffer_resource(arg_c_, max_size=True)
+
+        element_bytes = element_type.width // 8
+        a_lane_row = tid // 8
+        a_lane_k = tid % 8 * elements_per_128b
+        a_local_row = (
+            a_lane_row % 8 * (TILE_M // 2 // 8)
+            + a_lane_row // 8
+        )
+        at_src_base = fx.Int32(((blk_x * TILE_M + a_local_row) * K + a_lane_k) * element_bytes)
+        ab_src_base = fx.Int32(
+            ((blk_x * TILE_M + TILE_M // 2 + a_local_row) * K + a_lane_k) * element_bytes
+        )
+
+        at_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M // 2, TILE_K))[None, None, blk_x * 2, None]
+        ab_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M // 2, TILE_K))[None, None, blk_x * 2 + 1, None]
+
+        c_tl_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, blk_x * 2, blk_y * 2]
+        c_tr_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, blk_x * 2, blk_y * 2 + 1]
+        c_bl_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, blk_x * 2 + 1, blk_y * 2]
+        c_br_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, blk_x * 2 + 1, blk_y * 2 + 1]
+
+        lds = fx.SharedAllocator().allocate(SharedStorage950).peek()
+        if const_expr(is_fp8 and use_8wave_fp8_a_padding):
+            a_lds_write_layout = fx.make_layout(
+                ((8, 2, TILE_M // 32), TILE_K),
+                ((TILE_K, 8 * TILE_K + 16, 2 * (8 * TILE_K + 16) + 32), 1),
+            )
+            a_lds_read_layout = fx.make_layout(
+                ((2, TILE_M // 32, 8), (32, TILE_K // 32)),
+                ((8 * TILE_K + 16, 2 * (8 * TILE_K + 16) + 32, TILE_K), (1, 32)),
+            )
+        elif const_expr(not is_fp8):
+            a_lds_write_layout = fx.make_layout(
+                ((8, TILE_M // 16), TILE_K),
+                ((TILE_K, 8 * TILE_K + lds_padding_elements), 1),
+            )
+            a_lds_read_layout = fx.make_layout(
+                ((TILE_M // 16, 8), (32, TILE_K // 32)),
+                ((8 * TILE_K + lds_padding_elements, TILE_K), (1, 32)),
+            )
+        else:
+            a_lds_write_layout = fx.make_ordered_layout((TILE_M // 2, TILE_K), order=(1, 0))
+            a_lds_read_layout = a_lds_write_layout
+        if const_expr(is_fp8):
+            b_lds_layout = fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))
+            b_fragment_layout = b_lds_layout
+        else:
+            b_lds_layout = fx.make_layout(b_lds_size_half, 1)
+            b_fragment_layout = fx.make_layout(
+                ((8, TILE_N // 16), TILE_K),
+                ((TILE_K, 8 * TILE_K + lds_padding_elements), 1),
+            )
+        at_lds_write = [
+            fx.make_view(lds.at_lds0.ptr, a_lds_write_layout),
+            fx.make_view(lds.at_lds1.ptr, a_lds_write_layout),
+        ]
+        ab_lds_write = [
+            fx.make_view(lds.ab_lds0.ptr, a_lds_write_layout),
+            fx.make_view(lds.ab_lds1.ptr, a_lds_write_layout),
+        ]
+        at_lds = [
+            fx.make_view(lds.at_lds0.ptr, a_lds_read_layout),
+            fx.make_view(lds.at_lds1.ptr, a_lds_read_layout),
+        ]
+        ab_lds = [
+            fx.make_view(lds.ab_lds0.ptr, a_lds_read_layout),
+            fx.make_view(lds.ab_lds1.ptr, a_lds_read_layout),
+        ]
+        bl_lds = [
+            fx.make_view(lds.bl_lds0.ptr, b_lds_layout),
+            fx.make_view(lds.bl_lds1.ptr, b_lds_layout),
+        ]
+        br_lds = [
+            fx.make_view(lds.br_lds0.ptr, b_lds_layout),
+            fx.make_view(lds.br_lds1.ptr, b_lds_layout),
+        ]
+        bl_fragment_view = [
+            fx.make_view(lds.bl_lds0.ptr, b_fragment_layout),
+            fx.make_view(lds.bl_lds1.ptr, b_fragment_layout),
+        ]
+        br_fragment_view = [
+            fx.make_view(lds.br_lds0.ptr, b_fragment_layout),
+            fx.make_view(lds.br_lds1.ptr, b_fragment_layout),
+        ]
+
+        g2s_tile, g2s_tv_layout = fx.make_layout_tv(
+            fx.make_layout((8 * 8, 8), (8, 1)),
+            fx.make_layout((1, elements_per_128b), (1, 1)),
+        )
+        layout_g2s = fx.make_tiled_copy(
+            fx.make_copy_atom(fx.rocdl.BufferCopy128b(), element_type),
+            g2s_tv_layout,
+            g2s_tile,
+        )
+        copy_g2s = layout_g2s.get_slice(tid)
+        at_g2s_src = copy_g2s.partition_S(at_tile)
+        ab_g2s_src = copy_g2s.partition_S(ab_tile)
+        at_g2s_dst = [copy_g2s.partition_D(at_lds_write[0]), copy_g2s.partition_D(at_lds_write[1])]
+        ab_g2s_dst = [copy_g2s.partition_D(ab_lds_write[0]), copy_g2s.partition_D(ab_lds_write[1])]
+        async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+
+        lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
+        if const_expr(is_fp8):
+            mma_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, element_type))
+            plain_scale = fx.Int32(0)
+            mma_atom = fx.atom_set_value(mma_atom, "scale_a", plain_scale)
+            mma_atom = fx.atom_set_value(mma_atom, "scale_b", plain_scale)
+            k_perm = fx.make_layout((32, 4), (1, 32))
+        else:
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, element_type))
+            k_perm = fx.make_layout((8, 4), (1, 8))
+        tiled_mma = fx.make_tiled_mma(
+            mma_atom,
+            fx.make_layout((4, 2, 1), (1, 4, 0)),
+            (None, None, k_perm),
+        )
+        thr_mma = tiled_mma.thr_slice(tid)
+
+        copy_a = fx.make_tiled_copy_B(lds_copy_atom, tiled_mma).get_slice(tid)
+        copy_b = fx.make_tiled_copy_A(lds_copy_atom, tiled_mma).get_slice(tid)
+        at_lds_src = [copy_a.partition_S(at_lds[0]), copy_a.partition_S(at_lds[1])]
+        ab_lds_src = [copy_a.partition_S(ab_lds[0]), copy_a.partition_S(ab_lds[1])]
+
+        at_frag = thr_mma.make_fragment_B(at_lds[0])
+        ab_frag = thr_mma.make_fragment_B(ab_lds[0])
+        bl_frag = thr_mma.make_fragment_A(bl_fragment_view[0])
+        br_frag = thr_mma.make_fragment_A(br_fragment_view[0])
+        at_frag_dst = copy_a.retile(at_frag)
+        ab_frag_dst = copy_a.retile(ab_frag)
+        bl_frag_dst = copy_b.retile(bl_frag)
+        br_frag_dst = copy_b.retile(br_frag)
+
+        transposed_c_layout = fx.make_ordered_layout((TILE_N // 2, TILE_M // 2), (1, 0))
+        c_tl_tile = fx.composition(c_tl_tile, transposed_c_layout)
+        c_tr_tile = fx.composition(c_tr_tile, transposed_c_layout)
+        c_bl_tile = fx.composition(c_bl_tile, transposed_c_layout)
+        c_br_tile = fx.composition(c_br_tile, transposed_c_layout)
+
+        c_tl_frag = thr_mma.make_fragment_C(c_tl_tile)
+        c_tr_frag = thr_mma.make_fragment_C(c_tr_tile)
+        c_bl_frag = thr_mma.make_fragment_C(c_bl_tile)
+        c_br_frag = thr_mma.make_fragment_C(c_br_tile)
+        c_tl_frag.fill(0)
+        c_tr_frag.fill(0)
+        c_bl_frag.fill(0)
+        c_br_frag.fill(0)
+
+        num_tiles = K // TILE_K
+        assert num_tiles >= 2 and num_tiles % 2 == 0, "gfx950 pipeline requires an even number of at least two K tiles"
+        a_dsrd_count = at_frag.load().numel * element_type.width // 8 // 16
+        b_dsrd_count = bl_frag.load().numel * element_type.width // 8 // 16
+        a_vmem_count = (TILE_M // 2 * TILE_K * element_type.width // 8) // (512 * 16)
+        b_vmem_count = (TILE_N // 2 * TILE_K * element_type.width // 8) // (512 * 16)
+        prologue_vmcnt = 3 * a_vmem_count + 3 * b_vmem_count
+        ab_br_vmcnt = 2 * a_vmem_count + 3 * b_vmem_count
+        bl_at_vmcnt = 3 * a_vmem_count + 2 * b_vmem_count
+
+        def hot_loop_scheduler(dsrd_count, vmem_count):
+            # 较密集类别每步恰好发一条，较稀疏类别按比例分布，因此max是无空步且
+            # 保持精确总数的循环值。同一步先DSRD后VMEM可保留旧调度的memory相对
+            # 顺序，并在128/256 tile的BF16/FP8对照中优于VMEM先行和居中放置。
+            schedule_steps = max(dsrd_count, vmem_count)
+            prev_dsrd = 0
+            prev_vmem = 0
+            for sched_idx in range_constexpr(schedule_steps):
+                cur_dsrd = ((sched_idx + 1) * dsrd_count + schedule_steps - 1) // schedule_steps
+                cur_vmem = ((sched_idx + 1) * vmem_count + schedule_steps - 1) // schedule_steps
+                if const_expr(cur_dsrd > prev_dsrd):
+                    rocdl.sched_dsrd(cur_dsrd - prev_dsrd)
+                if const_expr(cur_vmem > prev_vmem):
+                    rocdl.sched_vmem(cur_vmem - prev_vmem)
+                prev_dsrd = cur_dsrd
+                prev_vmem = cur_vmem
+            rocdl.sched_barrier(0)
+
+        def begin_compute_phase():
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+
+        def end_compute_phase():
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+
+        def end_memory_phase():
+            rocdl.sched_barrier(0)
+
+        def wait_vmem_barrier(vmcnt):
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt, lgkmcnt=0))
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+
+        def dma_dst_ptr(root, byte_offset):
+            ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            root_ptr = fly_dialect.extract_aligned_pointer_as_index(ptr_type, arith._to_raw(root))
+            return fx.buffer_ops.get_element_ptr(
+                root_ptr,
+                byte_offset=byte_offset,
+                elem_type=T.i8,
+            )
+
+        b_wave_stride_bytes = 64 * 16 + (
+            lds_padding_elements * element_bytes if use_8wave_b_padding else 0
+        )
+        if const_expr(is_fp8 and use_a_lds_padding):
+            a_wave_offset_elements = (
+                wave_id % 2 * (8 * TILE_K + 16)
+                + wave_id // 2 * (2 * (8 * TILE_K + 16) + 32)
+            )
+        else:
+            a_wave_stride_elements = 8 * TILE_K + (
+                lds_padding_elements if use_a_lds_padding else 0
+            )
+            a_wave_offset_elements = wave_id * a_wave_stride_elements
+        a_wave_offset_bytes = rocdl.readfirstlane(
+            T.i32,
+            arith._to_raw(fx.Int32(a_wave_offset_elements * element_bytes)),
+        )
+        b_wave_offset_bytes = rocdl.readfirstlane(
+            T.i32,
+            arith._to_raw(fx.Int32(wave_id * b_wave_stride_bytes)),
+        )
+        at_dst_ptr = [
+            dma_dst_ptr(at_lds_write[0], a_wave_offset_bytes),
+            dma_dst_ptr(at_lds_write[1], a_wave_offset_bytes),
+        ]
+        ab_dst_ptr = [
+            dma_dst_ptr(ab_lds_write[0], a_wave_offset_bytes),
+            dma_dst_ptr(ab_lds_write[1], a_wave_offset_bytes),
+        ]
+        bl_dst_ptr = [
+            dma_dst_ptr(bl_lds[0], b_wave_offset_bytes),
+            dma_dst_ptr(bl_lds[1], b_wave_offset_bytes),
+        ]
+        br_dst_ptr = [
+            dma_dst_ptr(br_lds[0], b_wave_offset_bytes),
+            dma_dst_ptr(br_lds[1], b_wave_offset_bytes),
+        ]
+
+        # raw A DMA 显式实现8行分组重排和padding目标步长。直接generic copy会读错；
+        # 把重排编码进source layout虽正确，但BF16产生48 B private segment和scratch，
+        # K=4096/8192分别回退约24%/18%，因此保留raw路径及其wrapper。
+        def copy_a_gmem_to_lds_raw_8wave(rsrc, dst_base, dst_stride, src_base, k_tile):
+            for chunk in range_constexpr((TILE_M // 2) // 64):
+                dst_ptr = fx.buffer_ops.get_element_ptr(
+                    dst_base,
+                    static_byte_offset=chunk * dst_stride * element_bytes,
+                    elem_type=T.i8,
+                )
+                src_offset = src_base + fx.Int32(
+                    k_tile * TILE_K * element_bytes
+                    + chunk * 8 * K * element_bytes
+                )
+                rocdl.raw_ptr_buffer_load_lds(
+                    rsrc,
+                    dst_ptr,
+                    fx.Int32(16),
+                    src_offset,
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                )
+
+        # wrapper在编译期选择raw padding路径或无paddingFP8的generic路径，本身不增加
+        # 运行时分支，并集中维护8个pipeline调用点的相同选择逻辑。
+        def copy_a_gmem_to_lds_8wave(rsrc, dst_base, dst_stride, src_base, k_tile, src, dst):
+            if const_expr(is_fp8 and not use_8wave_fp8_a_padding):
+                fx.copy(async_copy_atom, src, dst)
+            else:
+                copy_a_gmem_to_lds_raw_8wave(rsrc, dst_base, dst_stride, src_base, k_tile)
+
+        # B DMA与下方BF16/FP8 reader共同维护host preshuffle物理格式。单独替换任一端
+        # 会计算错误；两端一起generic化虽正确，但会重新引入BF16 4,194,304次、FP8
+        # 6,291,456次LDS bank conflict，并分别回退约6.4%和8.6%~9.1%。
+        def copy_b_gmem_to_lds_8wave(rsrc, dst_base, row_base, k_tile):
+            for chunk in range_constexpr((TILE_N // 2) // 64):
+                chunk_elements = chunk * 512 * elements_per_128b
+                if const_expr(use_8wave_b_padding):
+                    chunk_elements += chunk_elements // lds_padding_interval * lds_padding_elements
+                dst_ptr = fx.buffer_ops.get_element_ptr(
+                    dst_base,
+                    byte_offset=chunk_elements * element_bytes,
+                    elem_type=T.i8,
+                )
+                local_elem_offset = (
+                    tid * elements_per_128b
+                    + chunk * 512 * elements_per_128b
+                )
+                k_inner = local_elem_offset % elements_per_128b
+                n_inner = local_elem_offset // elements_per_128b % 16
+                k_group = local_elem_offset // (16 * elements_per_128b) % 4
+                k_block = local_elem_offset // (16 * preshuffle_k) % (TILE_K // preshuffle_k)
+                n_block = local_elem_offset // (16 * TILE_K)
+                elem_offset = (
+                    n_inner * elements_per_128b
+                    + (row_base // 16 + n_block) * 16 * K
+                    + k_inner
+                    + k_group * 16 * elements_per_128b
+                    + (k_tile * (TILE_K // preshuffle_k) + k_block) * 16 * preshuffle_k
+                )
+                src_offset = fx.Int32(elem_offset * element_bytes)
+                rocdl.raw_ptr_buffer_load_lds(
+                    rsrc,
+                    dst_ptr,
+                    fx.Int32(16),
+                    src_offset,
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                )
+
+        def copy_lds_to_frag_8wave(src, dst):
+            # A operand 的 padding/重排已完整编码在 src layout 中，generic copy 对
+            # BF16/FP8 都会生成等价的 ds_read_b128，资源和调度不变。
+            fx.copy(lds_copy_atom, src, dst)
+
+        # BF16 B还要应用每512元素插16元素的padding，必须与B DMA的目标offset一致。
+        def copy_b_lds_to_frag_bf16_8wave(root, dst):
+            ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            base_ptr = fly_dialect.extract_aligned_pointer_as_index(ptr_type, arith._to_raw(root))
+            lane_id = tid % 64
+            n_wave = wave_id % 4
+            base_row = lane_id % 16 + n_wave * 16
+            base_k = lane_id // 16 * elements_per_128b
+            major_count = TILE_N // 2 // 64
+            stage_count = TILE_K // 32
+            assembled = fx.Vector.filled(
+                elements_per_128b * major_count * stage_count,
+                0,
+                element_type,
+            ).ir_value()
+            chunk_idx = 0
+            for stage in range_constexpr(stage_count):
+                for major in range_constexpr(major_count):
+                    row = base_row + major * 64
+                    k = base_k + stage * 32
+                    elem_offset = (
+                        row // 16 * 16 * TILE_K
+                        + k // preshuffle_k * 16 * preshuffle_k
+                        + k // elements_per_128b % 4 * 16 * elements_per_128b
+                        + row % 16 * elements_per_128b
+                        + k % elements_per_128b
+                    )
+                    if const_expr(use_8wave_b_padding):
+                        elem_offset += elem_offset // lds_padding_interval * lds_padding_elements
+                    ptr = fx.buffer_ops.get_element_ptr(
+                        base_ptr,
+                        byte_offset=elem_offset * element_bytes,
+                        elem_type=T.i8,
+                    )
+                    loaded = llvm.LoadOp(
+                        T.vec(elements_per_128b, element_type.ir_type),
+                        ptr,
+                        alignment=16,
+                    ).result
+                    assembled = vector.insert_strided_slice(
+                        loaded,
+                        assembled,
+                        [chunk_idx * elements_per_128b],
+                        [1],
+                    )
+                    chunk_idx += 1
+            fx.memref_store_vec(assembled, dst)
+
+        # FP8 B保持未padding的host preshuffle格式，并按每个wave的N/K lane映射组装fragment。
+        def copy_b_lds_to_frag_fp8_8wave(root, dst):
+            ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            base_ptr = fly_dialect.extract_aligned_pointer_as_index(ptr_type, arith._to_raw(root))
+            lane_id = tid % 64
+            base_row = lane_id % 16 + wave_id % 4 * 16
+            base_k = lane_id // 16 * 32
+            major_count = TILE_N // 2 // 64
+            stage_count = 2
+            assembled = fx.Vector.filled(
+                elements_per_128b * major_count * stage_count,
+                0,
+                element_type,
+            ).ir_value()
+            chunk_idx = 0
+            for major in range_constexpr(major_count):
+                for stage in range_constexpr(stage_count):
+                    row = base_row + major * 64
+                    k = base_k + stage * elements_per_128b
+                    elem_offset = (
+                        row // 16 * 16 * TILE_K
+                        + k // preshuffle_k * 16 * preshuffle_k
+                        + k // elements_per_128b % 4 * 16 * elements_per_128b
+                        + row % 16 * elements_per_128b
+                        + k % elements_per_128b
+                    )
+                    ptr = fx.buffer_ops.get_element_ptr(
+                        base_ptr,
+                        byte_offset=elem_offset * element_bytes,
+                        elem_type=T.i8,
+                    )
+                    loaded_i32 = llvm.LoadOp(
+                        T.vec(4, T.i32),
+                        ptr,
+                        alignment=16,
+                    ).result
+                    loaded = Vec(loaded_i32).bitcast(element_type).ir_value()
+                    assembled = vector.insert_strided_slice(
+                        loaded,
+                        assembled,
+                        [chunk_idx * elements_per_128b],
+                        [1],
+                    )
+                    chunk_idx += 1
+            fx.memref_store_vec(assembled, dst)
+
+        def copy_b_lds_to_frag_8wave(root, dst):
+            if const_expr(is_fp8):
+                copy_b_lds_to_frag_fp8_8wave(root, dst)
+            else:
+                copy_b_lds_to_frag_bf16_8wave(root, dst)
+
+        rocdl.sched_barrier(0)
+        copy_b_gmem_to_lds_8wave(
+            b_dma_rsrc,
+            bl_dst_ptr[0],
+            blk_y * TILE_N,
+            0,
+        )
+        copy_a_gmem_to_lds_8wave(
+            a_dma_rsrc,
+            at_dst_ptr[0],
+            at_g2s_dst[0].stride[1].to_py_value(),
+            at_src_base,
+            0,
+            at_g2s_src[None, None, None, 0],
+            at_g2s_dst[0],
+        )
+        copy_a_gmem_to_lds_8wave(
+            a_dma_rsrc,
+            ab_dst_ptr[0],
+            ab_g2s_dst[0].stride[1].to_py_value(),
+            ab_src_base,
+            0,
+            ab_g2s_src[None, None, None, 0],
+            ab_g2s_dst[0],
+        )
+        copy_b_gmem_to_lds_8wave(
+            b_dma_rsrc,
+            br_dst_ptr[0],
+            blk_y * TILE_N + TILE_N // 2,
+            0,
+        )
+        copy_b_gmem_to_lds_8wave(
+            b_dma_rsrc,
+            bl_dst_ptr[1],
+            blk_y * TILE_N,
+            1,
+        )
+        copy_a_gmem_to_lds_8wave(
+            a_dma_rsrc,
+            at_dst_ptr[1],
+            at_g2s_dst[1].stride[1].to_py_value(),
+            at_src_base,
+            1,
+            at_g2s_src[None, None, None, 1],
+            at_g2s_dst[1],
+        )
+        copy_a_gmem_to_lds_8wave(
+            a_dma_rsrc,
+            ab_dst_ptr[1],
+            ab_g2s_dst[1].stride[1].to_py_value(),
+            ab_src_base,
+            1,
+            ab_g2s_src[None, None, None, 1],
+            ab_g2s_dst[1],
+        )
+        copy_b_gmem_to_lds_8wave(
+            b_dma_rsrc,
+            br_dst_ptr[1],
+            blk_y * TILE_N + TILE_N // 2,
+            1,
+        )
+        wait_vmem_barrier(prologue_vmcnt)
+        copy_lds_to_frag_8wave(at_lds_src[0], at_frag_dst)
+        copy_b_lds_to_frag_8wave(bl_lds[0], bl_frag_dst)
+        rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+        if wave_id >= 4:
+            rocdl.s_barrier()
+        rocdl.sched_barrier(0)
+
+        acc_init = [c_tl_frag.load(), c_tr_frag.load(), c_bl_frag.load(), c_br_frag.load()]
+        for k, state in range(0, num_tiles - 2, 2, init=acc_init):
+            c_tl_frag.store(state[0])
+            c_tr_frag.store(state[1])
+            c_bl_frag.store(state[2])
+            c_br_frag.store(state[3])
+            k_i32 = fx.Int32(k)
+
+            # Region 0: TL(stage 0), read AB0, prefetch BL(k+2).
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=ab_br_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
+            fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
+            end_compute_phase()
+            copy_lds_to_frag_8wave(ab_lds_src[0], ab_frag_dst)
+            copy_b_gmem_to_lds_8wave(
+                b_dma_rsrc,
+                bl_dst_ptr[0],
+                blk_y * TILE_N,
+                k_i32 + 2,
+            )
+            hot_loop_scheduler(a_dsrd_count, b_vmem_count)
+            end_memory_phase()
+
+            # Region 1: BL(stage 0), read BR0, prefetch AT(k+2).
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=ab_br_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
+            fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
+            end_compute_phase()
+            copy_b_lds_to_frag_8wave(br_lds[0], br_frag_dst)
+            copy_a_gmem_to_lds_8wave(
+                a_dma_rsrc,
+                at_dst_ptr[0],
+                at_g2s_dst[0].stride[1].to_py_value(),
+                at_src_base,
+                k_i32 + 2,
+                at_g2s_src[None, None, None, k_i32 + 2],
+                at_g2s_dst[0],
+            )
+            hot_loop_scheduler(b_dsrd_count, a_vmem_count)
+            end_memory_phase()
+
+            # Region 2: TR(stage 0), read BL1, prefetch AB(k+2).
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=bl_at_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
+            fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
+            end_compute_phase()
+            copy_b_lds_to_frag_8wave(bl_lds[1], bl_frag_dst)
+            copy_a_gmem_to_lds_8wave(
+                a_dma_rsrc,
+                ab_dst_ptr[0],
+                ab_g2s_dst[0].stride[1].to_py_value(),
+                ab_src_base,
+                k_i32 + 2,
+                ab_g2s_src[None, None, None, k_i32 + 2],
+                ab_g2s_dst[0],
+            )
+            hot_loop_scheduler(b_dsrd_count, a_vmem_count)
+            end_memory_phase()
+
+            # Region 3: BR(stage 0), read AT1, prefetch BR(k+2).
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=bl_at_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
+            fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
+            end_compute_phase()
+            copy_lds_to_frag_8wave(at_lds_src[1], at_frag_dst)
+            copy_b_gmem_to_lds_8wave(
+                b_dma_rsrc,
+                br_dst_ptr[0],
+                blk_y * TILE_N + TILE_N // 2,
+                k_i32 + 2,
+            )
+            hot_loop_scheduler(a_dsrd_count, b_vmem_count)
+            end_memory_phase()
+
+            # Region 4: TL(stage 1), read AB1, prefetch BL(k+3).
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=ab_br_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
+            fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
+            end_compute_phase()
+            copy_lds_to_frag_8wave(ab_lds_src[1], ab_frag_dst)
+            copy_b_gmem_to_lds_8wave(
+                b_dma_rsrc,
+                bl_dst_ptr[1],
+                blk_y * TILE_N,
+                k_i32 + 3,
+            )
+            hot_loop_scheduler(a_dsrd_count, b_vmem_count)
+            end_memory_phase()
+
+            # Region 5: BL(stage 1), read BR1, prefetch AT(k+3).
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=ab_br_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
+            fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
+            end_compute_phase()
+            copy_b_lds_to_frag_8wave(br_lds[1], br_frag_dst)
+            copy_a_gmem_to_lds_8wave(
+                a_dma_rsrc,
+                at_dst_ptr[1],
+                at_g2s_dst[1].stride[1].to_py_value(),
+                at_src_base,
+                k_i32 + 3,
+                at_g2s_src[None, None, None, k_i32 + 3],
+                at_g2s_dst[1],
+            )
+            hot_loop_scheduler(b_dsrd_count, a_vmem_count)
+            end_memory_phase()
+
+            # Region 6: TR(stage 1), read BL0(k+2), prefetch AB(k+3).
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=bl_at_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
+            fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
+            end_compute_phase()
+            copy_b_lds_to_frag_8wave(bl_lds[0], bl_frag_dst)
+            copy_a_gmem_to_lds_8wave(
+                a_dma_rsrc,
+                ab_dst_ptr[1],
+                ab_g2s_dst[1].stride[1].to_py_value(),
+                ab_src_base,
+                k_i32 + 3,
+                ab_g2s_src[None, None, None, k_i32 + 3],
+                ab_g2s_dst[1],
+            )
+            hot_loop_scheduler(b_dsrd_count, a_vmem_count)
+            end_memory_phase()
+
+            # Region 7: BR(stage 1), read AT0(k+2), prefetch BR(k+3).
+            rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=bl_at_vmcnt, lgkmcnt=0))
+            begin_compute_phase()
+            fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
+            end_compute_phase()
+            copy_lds_to_frag_8wave(at_lds_src[0], at_frag_dst)
+            copy_b_gmem_to_lds_8wave(
+                b_dma_rsrc,
+                br_dst_ptr[1],
+                blk_y * TILE_N + TILE_N // 2,
+                k_i32 + 3,
+            )
+            hot_loop_scheduler(a_dsrd_count, b_vmem_count)
+            end_memory_phase()
+
+            results = yield [c_tl_frag.load(), c_tr_frag.load(), c_bl_frag.load(), c_br_frag.load()]
+
+        c_tl_frag.store(results[0])
+        c_tr_frag.store(results[1])
+        c_bl_frag.store(results[2])
+        c_br_frag.store(results[3])
+
+        if const_expr(permlane_epilogue and TILE_N % 256 == 0):
+            pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
+            lane_id = tid % 64
+            wave_m = wave_id // 4
+            wave_n = wave_id % 4
+            lane_group = lane_id // 16
+            fragment_mode_0_repeat = TILE_N // 128
+            fragment_mode_1_repeat = TILE_M // 64
+
+            def store_c_quadrant(c_frag, c_tile, quadrant_m, quadrant_n):
+                for row_repeat in range_constexpr(fragment_mode_1_repeat):
+                    for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
+                        acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
+                        acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
+                        d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
+                        d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
+                        d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
+                        d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+                        swap0 = rocdl.permlane16_swap(
+                            pair_type,
+                            arith._to_raw(d0_a),
+                            arith._to_raw(d0_b),
+                            False,
+                            False,
+                        )
+                        swap1 = rocdl.permlane16_swap(
+                            pair_type,
+                            arith._to_raw(d1_a),
+                            arith._to_raw(d1_b),
+                            False,
+                            False,
+                        )
+                        packed = Vec.from_elements(
+                            [
+                                fx.Int32(llvm.extractvalue(T.i32, swap0, [0])),
+                                fx.Int32(llvm.extractvalue(T.i32, swap1, [0])),
+                                fx.Int32(llvm.extractvalue(T.i32, swap0, [1])),
+                                fx.Int32(llvm.extractvalue(T.i32, swap1, [1])),
+                            ],
+                            fx.Int32,
+                        )
+                        row = (
+                            blk_x * TILE_M
+                            + quadrant_m * (TILE_M // 2)
+                            + row_repeat * 32
+                            + wave_m * 16
+                            + lane_id % 16
+                        )
+                        col = (
+                            blk_y * TILE_N
+                            + quadrant_n * (TILE_N // 2)
+                            + col_repeat * 64
+                            + lane_group % 2 * 64
+                            + wave_n * 16
+                            + lane_group // 2 * 8
+                        )
+                        byte_offset = (row * N + col) * 2
+                        fx.buffer_ops.buffer_store(
+                            packed,
+                            c_store_rsrc,
+                            byte_offset,
+                            offset_is_bytes=True,
+                        )
+
+        else:
+            c_frag_bf16 = fx.make_fragment_like(c_tl_frag, dtype=fx.BFloat16)
+            store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+            store_thr = fx.make_tiled_copy_C(store_atom, tiled_mma).get_slice(tid)
+
+            def store_c_quadrant(c_frag, c_tile, quadrant_m, quadrant_n):
+                c_frag_bf16.store(c_frag.load().to(fx.BFloat16))
+                fx.copy(
+                    store_atom,
+                    store_thr.retile(c_frag_bf16),
+                    store_thr.partition_D(c_tile),
+                )
+
+        # Two-tile tail, preserving the same eight-region order without future prefetches.
+        rocdl.s_waitcnt(
+            encode_waitcnt_950(vmcnt=2 * a_vmem_count + 3 * b_vmem_count, lgkmcnt=0)
+        )
+        begin_compute_phase()
+        fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
+        end_compute_phase()
+        copy_lds_to_frag_8wave(ab_lds_src[0], ab_frag_dst)
+        hot_loop_scheduler(a_dsrd_count, 0)
+        end_memory_phase()
+
+        rocdl.s_waitcnt(
+            encode_waitcnt_950(vmcnt=2 * a_vmem_count + 2 * b_vmem_count, lgkmcnt=0)
+        )
+        begin_compute_phase()
+        fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
+        end_compute_phase()
+        copy_b_lds_to_frag_8wave(br_lds[0], br_frag_dst)
+        hot_loop_scheduler(b_dsrd_count, 0)
+        end_memory_phase()
+
+        rocdl.s_waitcnt(
+            encode_waitcnt_950(vmcnt=2 * a_vmem_count + b_vmem_count, lgkmcnt=0)
+        )
+        begin_compute_phase()
+        fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
+        end_compute_phase()
+        copy_b_lds_to_frag_8wave(bl_lds[1], bl_frag_dst)
+        hot_loop_scheduler(b_dsrd_count, 0)
+        end_memory_phase()
+
+        rocdl.s_waitcnt(
+            encode_waitcnt_950(vmcnt=a_vmem_count + b_vmem_count, lgkmcnt=0)
+        )
+        begin_compute_phase()
+        fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
+        end_compute_phase()
+        copy_lds_to_frag_8wave(at_lds_src[1], at_frag_dst)
+        hot_loop_scheduler(a_dsrd_count, 0)
+        end_memory_phase()
+
+        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=b_vmem_count, lgkmcnt=0))
+        begin_compute_phase()
+        fx.gemm(mma_atom, c_tl_frag, bl_frag, at_frag, c_tl_frag)
+        end_compute_phase()
+        copy_lds_to_frag_8wave(ab_lds_src[1], ab_frag_dst)
+        hot_loop_scheduler(a_dsrd_count, 0)
+        end_memory_phase()
+        store_c_quadrant(c_tl_frag, c_tl_tile, 0, 0)
+
+        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0, lgkmcnt=0))
+        begin_compute_phase()
+        fx.gemm(mma_atom, c_bl_frag, bl_frag, ab_frag, c_bl_frag)
+        end_compute_phase()
+        copy_b_lds_to_frag_8wave(br_lds[1], br_frag_dst)
+        hot_loop_scheduler(b_dsrd_count, 0)
+        end_memory_phase()
+        store_c_quadrant(c_bl_frag, c_bl_tile, 1, 0)
+
+        begin_compute_phase()
+        fx.gemm(mma_atom, c_tr_frag, br_frag, at_frag, c_tr_frag)
+        end_compute_phase()
+        hot_loop_scheduler(0, 0)
+        store_c_quadrant(c_tr_frag, c_tr_tile, 0, 1)
+
+        begin_compute_phase()
+        fx.gemm(mma_atom, c_br_frag, br_frag, ab_frag, c_br_frag)
+        end_compute_phase()
+        hot_loop_scheduler(0, 0)
+        store_c_quadrant(c_br_frag, c_br_tile, 1, 1)
+
+        if wave_id < 4:
+            rocdl.s_barrier()
+
+    @flyc.jit
+    def launch(arg_c: fx.Tensor,
+               arg_a: fx.Tensor,
+               arg_b: fx.Tensor,
+               M: int,
+               stream: fx.Stream):
+        CompilationContext.get_current()
+        if const_expr(num_waves == 4):
+            value_attrs = {
+                "passthrough": [["amdgpu-agpr-alloc", "256,256"]],
+            }
+            gemm_4wave_950(arg_c, arg_a, arg_b, M, value_attrs=value_attrs).launch(
+                grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1),
+                block=(256, 1, 1),
+                stream=stream,
+            )
+        else:
+            gemm_8wave_950(arg_c, arg_a, arg_b, M).launch(
+                grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1),
+                block=(512, 1, 1),
+                stream=stream,
+            )
+
+    if num_waves == 4:
+        launch.compile_hints["llvm_options"] = {
+            "amdgpu-mfma-vgpr-form": False,
+        }
+
+    return launch
+
 #####################################################################
 from pyhip import cudaPerf
 from torch import Tensor
@@ -1096,6 +2833,138 @@ def get_fp8type():
 
 def get_fp4type_if_valid():
     return torch.float4_e2m1fn_x2 if is_arch_type('950') else None
+
+def _make_gemm_950_problem(dtype, M, N, K):
+    from aiter.ops.shuffle import shuffle_weight
+
+    if dtype == "bf16":
+        a = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+        b = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+        ref = a @ b.t()
+    else:
+        assert dtype == "fp8"
+        a = torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
+        b = torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)
+        ref = a.float() @ b.float().t()
+
+    b_shuffled = shuffle_weight(b).reshape(N // 16, -1)
+    output = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    a_arg = a.view(torch.int8).view(-1) if dtype == "fp8" else a.view(-1)
+    b_arg = b_shuffled.view(torch.int8).view(-1) if dtype == "fp8" else b_shuffled.view(-1)
+    args = (output.view(-1), a_arg, b_arg, M, torch.cuda.current_stream())
+    return a, b, output, ref, args
+
+def benchmark_gemm_950(num_waves, dtype="bf16", M=4096, N=4096, K=4096,
+                       TILE_M=256, TILE_N=256, warmup=5, iterations=20, pid_swizzle=True):
+    assert is_arch_type("950"), "gemm_4wave_950/gemm_8wave_950 require gfx950"
+    _, _, output, _, args = _make_gemm_950_problem(dtype, M, N, K)
+    launcher = compile_gemm_950(TILE_M, TILE_N, N, K, num_waves, dtype, pid_swizzle=pid_swizzle)
+    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
+
+    for _ in range(warmup):
+        kernel(*args)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        kernel(*args)
+    end.record()
+    torch.cuda.synchronize()
+
+    latency_ms = start.elapsed_time(end) / iterations
+    return {
+        "output": output,
+        "latency_ms": latency_ms,
+        "tflops": 2 * M * N * K / (latency_ms * 1e9),
+    }
+
+@pytest.mark.parametrize("num_waves", [4, 8])
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_gemm_950_correctness(num_waves, dtype):
+    if not torch.cuda.is_available() or not is_arch_type("950"):
+        pytest.skip("gemm_4wave_950/gemm_8wave_950 require gfx950")
+
+    torch.manual_seed(0)
+    M = N = 128
+    K = 512 if dtype == "fp8" else 256
+    _, _, output, ref, args = _make_gemm_950_problem(dtype, M, N, K)
+    launcher = compile_gemm_950(128, 128, N, K, num_waves, dtype)
+    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
+    kernel(*args)
+    torch.cuda.synchronize()
+
+    if dtype == "bf16":
+        torch.testing.assert_close(output, ref, rtol=0.1, atol=0.03)
+    else:
+        torch.testing.assert_close(output.float(), ref, rtol=0.05, atol=0.5)
+
+
+@pytest.mark.parametrize("tile_m,tile_n", [(128, 128), (128, 256), (256, 128), (256, 256)])
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_gemm_950_4wave_multiblock(tile_m, tile_n, dtype):
+    if not torch.cuda.is_available() or not is_arch_type("950"):
+        pytest.skip("gemm_4wave_950 requires gfx950")
+
+    torch.manual_seed(0)
+    M, N = tile_m * 2, tile_n * 2
+    K = 512 if dtype == "fp8" else 256
+    _, _, output, ref, args = _make_gemm_950_problem(dtype, M, N, K)
+    output.fill_(float("nan"))
+    launcher = compile_gemm_950(tile_m, tile_n, N, K, 4, dtype)
+    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
+    kernel(*args)
+    torch.cuda.synchronize()
+
+    if dtype == "bf16":
+        torch.testing.assert_close(output, ref, rtol=0.1, atol=0.03)
+    else:
+        torch.testing.assert_close(output.float(), ref, rtol=0.05, atol=0.5)
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_gemm_950_8wave_permlane_multiblock(dtype):
+    if not torch.cuda.is_available() or not is_arch_type("950"):
+        pytest.skip("gemm_8wave_950 requires gfx950")
+
+    torch.manual_seed(0)
+    tile_m = tile_n = 256
+    M, N = tile_m * 2, tile_n * 2
+    K = 512 if dtype == "fp8" else 256
+    _, _, output, ref, args = _make_gemm_950_problem(dtype, M, N, K)
+    output.fill_(float("nan"))
+    launcher = compile_gemm_950(tile_m, tile_n, N, K, 8, dtype)
+    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
+    kernel(*args)
+    torch.cuda.synchronize()
+
+    if dtype == "bf16":
+        torch.testing.assert_close(output, ref, rtol=0.1, atol=0.03)
+    else:
+        torch.testing.assert_close(output.float(), ref, rtol=0.05, atol=0.5)
+
+
+@pytest.mark.parametrize("num_waves", [4, 8])
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_gemm_950_small_tile_repeated(num_waves, dtype):
+    if not torch.cuda.is_available() or not is_arch_type("950"):
+        pytest.skip("gemm_4wave_950/gemm_8wave_950 require gfx950")
+
+    torch.manual_seed(20260726)
+    M = N = K = 4096
+    _, _, output, ref, args = _make_gemm_950_problem(dtype, M, N, K)
+    launcher = compile_gemm_950(128, 128, N, K, num_waves, dtype)
+    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
+
+    for _ in range(3):
+        output.fill_(float("nan"))
+        kernel(*args)
+        torch.cuda.synchronize()
+        if dtype == "bf16":
+            torch.testing.assert_close(output, ref, rtol=0.1, atol=0.03)
+        else:
+            torch.testing.assert_close(output.float(), ref, rtol=0.05, atol=0.5)
 
 def entry_common(num_warps, kernel_type, M, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, N=4096, K=4096, run_count=10):
     perf = {}
