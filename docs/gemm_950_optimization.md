@@ -12,7 +12,8 @@
 - FP8 暂不接收外部 scale；scaled MFMA 的 A/B scale 都设置为 E8M0 单位值
   `0x7f7f7f7f`。
 - 性能表使用 `M=N=K=4096`、输出 tile `256 x 256`。
-- 基准默认预热 5 次，正式数据另外使用了 3 组、每组 60 次运行取中位数。
+- 最新性能数据采集于 2026-07-25：预热20次，5组、每组60次运行取中位数；
+  四个FlyDSL变体按正序/逆序交替执行，降低温度和频率漂移带来的顺序偏差。
 
 ## 2. GFX950 指令选择
 
@@ -112,6 +113,25 @@ B 不做 padding 或 XOR swizzle。GMem-to-LDS 直接按 host preshuffle 顺序�
 
 参考 `asycn_copy_padding` 在相同访问负载下从 `3,670,016` 降到 `0`，证明这套 A
 参数本身能完全移除 bank conflict。
+
+### 3.2 XCD-aware PID 映射
+
+GFX950 有 8 个 XCD，每个 XCD 有独立 L2。`compile_gemm_950` 默认使用从 Gluon
+`get_pids` 移植的映射：先按 `pid % 8` 把连续硬件 block分配到 8 个 XCD，再以
+`GROUP_SIZE_M=4` 对 M tile分组。访问相同 B tile的四个 M block因此更可能落在同一
+XCD并复用 L2。`pid_swizzle=False` 可恢复原 row-major映射用于 A/B测试。
+
+`M=N=K=4096`、4-wave、`256 x 256 x 64` 的 PMC：
+
+| 映射 | L2 hit rate | `TCC_MISS_sum` | DRAM read requests |
+|---|---:|---:|---:|
+| FlyDSL row-major | 72.32% | 2,622,656 | 2,361,576 |
+| FlyDSL `get_pids` | 80.63% | 1,836,212 | 1,575,164 |
+| Gluon `get_pids` | 79.33% | 1,872,159 | 1,602,284 |
+
+总 `TCC_READ_sum` 基本不变。FlyDSL `get_pids` 相对 row-major减少 30.0% L2 miss和
+33.3% DRAM read request，证明映射生效。不过该尺寸已经偏 compute-bound，交替 12 轮、
+每轮 100 次的中位延迟只从 `0.100815 ms` 降到 `0.100640 ms`，提升 0.17%。
 
 ## 4. `hot_loop_scheduler` 的目标排布
 
@@ -347,16 +367,51 @@ c_frag_bf16.store(c_frag.load().to(fx.BFloat16))
 
 它替代手工加 `0x8000`、移位和截断的实现，使用正常浮点转换语义。
 
+最新K sweep中FlyDSL和Gluon已进入约1.2%以内的波动区间。对
+`K=1024..16384` 拟合 `latency = fixed + slope * K`：
+
+| 实现 | fixed | 每增加 1024 K 的延迟 |
+|---|---:|---:|
+| FlyDSL `get_pids` | 12.62 us | 21.16 us |
+| Gluon | 11.72 us | 21.42 us |
+
+两边K斜率相差约1.2%，拟合固定项相差约0.90 us。此前较大的固定开销差异对应到明确的
+epilogue差异：
+旧 FlyDSL C fragment产生 64 条 `buffer_store_dwordx2`，Gluon经过
+`convert_layout(..., mem_c_layout)` 后产生 32 条 `buffer_store_dwordx4`。直接把
+`make_tiled_copy_C` 的 atom换成 `BufferCopy128b` 会在 lowering 中产生越界
+`vector.extract_strided_slice`，因为相邻两个 64-bit fragment在线程内并不对应相邻地址。
+
+最终实现沿用 pyhip CDNA4 GEMM和 FlyDSL gfx950 FlashAttention的 proven pattern：每次取
+相邻两个 N accumulator slice，分别用 `cvt_pk_bf16_f32` 打成四个 dword，再调用
+`rocdl.permlane16_swap` 交换相差 16 lane的数据，重组成一个 `i32x4`，最后用
+`buffer_ops.buffer_store`直接发出 128-bit store。由于 C tile在本 kernel中先做过
+`transposed_c_layout`，地址计算使用 `repeat * 2 + wave` 的 16x16 block顺序。
+
+最终 epilogue ISA为：
+
+```text
+64 x v_permlane16_swap_b32
+32 x buffer_store_dwordx4
+```
+
+同进程交替 12 轮、每轮 100 次，`4096^3` 中位延迟从 `0.10060 ms` 降到
+`0.09839 ms`，提升 2.25%，吞吐从 `1366.2` 提升到 `1396.9 TFLOPS`。
+
 ## 9. 性能结果
 
-同一 `benchmark_gemm_950` 配置的前后结果：
+同一 `benchmark_gemm_950` 配置的前后结果。当前值为5组×60次的中位数：
 
 | Kernel | 初始延迟 | 初始性能 | 当前延迟 | 当前性能 | 总加速 |
 |---|---:|---:|---:|---:|---:|
-| 4-wave BF16 | 0.2861 ms | 480.4 TFLOPS | 0.10083 ms | 1363.1 TFLOPS | 2.84x |
-| 8-wave BF16 | 0.2366 ms | 581.0 TFLOPS | 0.1865 ms | 737.1 TFLOPS | 1.27x |
-| 4-wave FP8 | 0.1500 ms | 916.2 TFLOPS | 0.0754 ms | 1822.4 TFLOPS | 1.99x |
-| 8-wave FP8 | 0.1269 ms | 1083.2 TFLOPS | 0.0951 ms | 1445.2 TFLOPS | 1.33x |
+| 4-wave BF16 | 0.2861 ms | 480.4 TFLOPS | 0.09687 ms | 1418.8 TFLOPS | 2.95x |
+| 8-wave BF16 | 0.2366 ms | 581.0 TFLOPS | 0.15680 ms | 876.5 TFLOPS | 1.51x |
+| 4-wave FP8 | 0.1500 ms | 916.2 TFLOPS | 0.05520 ms | 2489.8 TFLOPS | 2.72x |
+| 8-wave FP8 | 0.1269 ms | 1083.2 TFLOPS | 0.08424 ms | 1631.6 TFLOPS | 1.51x |
+
+当前5组的Q1/Q3区间分别为：4-wave BF16 `0.09680/0.09702 ms`、8-wave BF16
+`0.15623/0.15714 ms`、4-wave FP8 `0.05480/0.05534 ms`、8-wave FP8
+`0.08418/0.08428 ms`。
 
 4-wave BF16 的分阶段结果：
 
@@ -377,17 +432,111 @@ native-anchor 比 tied-inline 延迟低约 2.2%，并恢复了 MFMA mask 分类�
 live-range 和同步形式对齐后，FlyDSL 与真实 Gluon ISA 的八区 `M/D/V` 类别串达到
 `352/352` 逐位一致，同步位置也完全一致。
 
-同一组 `4096^3` BF16 输入、4-wave、`256x256` tile，预热 20 次，7 轮、每轮 100 次：
+同一组 `4096^3` BF16 输入、4-wave、`256x256` tile。最终对比采用预热20次、
+7组×60次并丢弃前2组后取中位数：
 
 | 实现 | 中位延迟 | 性能 | Q1/Q3 |
 |---|---:|---:|---:|
-| Gluon | 0.09521 ms | 1443.5 TFLOPS | - |
+| Gluon `get_pids` | 0.09663 ms | 1422.3 TFLOPS | 0.09649/0.09666 ms |
 | FlyDSL，无 padding | 0.10890 ms | 1262.0 TFLOPS | - |
-| FlyDSL，A padding + B 连续 | 0.10083 ms | 1363.1 TFLOPS | - |
+| FlyDSL，A padding + B 连续 + row-major PID | 0.10081 ms | 1363.3 TFLOPS | - |
+| FlyDSL，A padding + B 连续 + `get_pids` | 0.10060 ms | 1366.2 TFLOPS | - |
+| FlyDSL，以上配置 + permlane16 epilogue | 0.09839 ms | 1396.9 TFLOPS | - |
+| FlyDSL，以上配置 + DMA地址预计算（最终） | 0.09724 ms | 1413.5 TFLOPS | 0.09719/0.09745 ms |
 
-修正 LDS 地址后，FlyDSL 相比自身无 padding 基线快 8.0%，与 Gluon 的延迟差距从
-约 14% 缩小到 5.9%。核心交织和 LDS bank conflict 都已经对齐，剩余差异来自额外的
-地址计算、普通 VALU 和寄存器压力。
+最终FlyDSL相比自身无padding基线快10.7%，与同批Gluon结果相差0.60 us（0.62%）。
+核心交织、LDS bank conflict和L2命中率都已对齐；permlane16 epilogue和DMA地址预计算
+分别消除了固定存储开销和热循环地址开销。
+
+最终 `get_pids` K sweep采用相同的预热20次、7组×60次、丢弃前2组方法：
+
+| K | FlyDSL | Gluon | 绝对差值 | 相对差值 |
+|---:|---:|---:|---:|---:|
+| 1024 | 0.03332 ms | 0.03356 ms | -0.24 us | -0.72% |
+| 2048 | 0.05416 ms | 0.05447 ms | -0.31 us | -0.57% |
+| 4096 | 0.09724 ms | 0.09663 ms | +0.60 us | +0.62% |
+| 8192 | 0.18416 ms | 0.18369 ms | +0.47 us | +0.25% |
+| 16384 | 0.35016 ms | 0.35439 ms | -4.24 us | -1.20% |
+
+正差值表示FlyDSL较慢，负差值表示FlyDSL较快。五个K点均在约1.2%以内，已没有旧版本
+随K稳定存在的数微秒差距。
+
+### 9.1 DMA地址优化前的PMC定位
+
+对完成permlane16 epilogue、尚未进行DMA地址预计算的版本和Gluon使用相同
+`4096^3`、256 workgroups、每个workgroup 4 waves，按不超过4个counter一组分别采集
+PMC。该表用于定位后续DMA地址优化，关键结果如下：
+
+| Counter | FlyDSL | Gluon | FlyDSL/Gluon |
+|---|---:|---:|---:|
+| `SQ_INSTS_MFMA` | 8,388,608 | 8,388,608 | 1.000 |
+| `SQ_VALU_MFMA_BUSY_CYCLES` | 134,217,728 | 134,217,728 | 1.000 |
+| `SQ_INSTS_VMEM` | 1,081,344 | 1,091,584 | 0.991 |
+| `SQ_ACTIVE_INST_VMEM` | 1,081,344 | 1,081,344 | 1.000 |
+| `SQ_INSTS_LDS` | 2,097,152 | 2,162,688 | 0.970 |
+| `SQ_WAIT_ANY` | 3,902,282 | 5,052,678 | 0.772 |
+| `SQ_WAIT_INST_LDS` | 1,634,659 | 2,051,756 | 0.797 |
+| `SQ_INSTS` | 18,859,008 | 17,259,520 | 1.093 |
+| `SQ_INSTS_VALU` | 13,338,624 | 11,058,176 | 1.206 |
+| `SQ_INSTS_VALU_INT32` | 2,744,320 | 1,068,032 | **2.570** |
+| `SQ_THREAD_CYCLES_VALU` | 791,806,976 | 707,725,312 | 1.119 |
+| `SQ_WAVE_CYCLES` | 42,228,324 | 41,718,814 | 1.012 |
+| `SQ_BUSY_CYCLES` | 5,293,318 | 5,236,743 | 1.011 |
+
+这些 counter排除了 MFMA吞吐、VMEM数量、LDS bank conflict、L2命中率和等待时间：
+FlyDSL的 wait反而更少，MFMA busy完全相同。差异集中在普通 VALU，尤其 INT32地址运算。
+按 1024 waves和 64 个 K tile归一化，FlyDSL每 wave、每 K tile多约 25.6 条 INT32
+VALU，并多约 7.8 wave cycles。
+
+最终 ISA的热循环也给出相同结论：FlyDSL有 116 条普通 VALU，Gluon只有 29 条。
+FlyDSL热点集中在 `copy_bf16_gmem_to_lds`：
+
+- B preshuffle地址每次 DMA都重新做 `//`、`%` 和 byte offset组合；
+- A padding路径每次重新计算 row permutation和 `row * K + k`；
+- 每个动态 LDS目标指针都会生成 `v_readfirstlane_b32 -> s_mov_b32 m0`。
+
+Gluon则在 prologue建立 `mem_a_offsets` / `mem_b_offsets`，主循环只做统一递增。对应的
+FlyDSL优化已经完成：prologue预计算 lane-local A/B源 offset，主循环仅叠加 K tile和
+chunk常量；每组4条 `raw_ptr_buffer_load_lds`只对第一个LDS目标地址执行一次
+`readfirstlane`，后3个地址在SGPR中按固定stride递增。
+
+### 9.2 DMA地址预计算结果
+
+最终ISA保持352条 `MFMA/DSRD/VMEM` 类别逐位不变，热循环
+`v_readfirstlane_b32` 从32条降到8条，VGPR/AGPR/SGPR allocation仍为
+`220/256/96`。相对仅预计算源 `voffset` 的版本，`4096^3` PMC如下：
+
+| Counter | 源 `voffset` 预计算 | + LDS目标scalarize | 变化 |
+|---|---:|---:|---:|
+| `SQ_INSTS_VALU_INT32` | 1,256,448 | 1,231,872 | -2.0% |
+| `SQ_INSTS_VALU` | 11,738,112 | 10,927,104 | -6.9% |
+| `SQ_WAVE_CYCLES` | 41,471,251 | 40,931,398 | -1.3% |
+| `SQ_BUSY_CYCLES` | 5,197,080 | 5,129,224 | -1.3% |
+
+同一进程内交替运行两版，12组、每组80次的配对测试中，LDS目标scalarize版12/12
+更快；配对中位延迟降低0.354 us。两版独立中位数为0.097570 ms和0.097227 ms，
+对应1408.6和1413.6 TFLOPS。
+
+也测试了把AT/AB/BL/BR象限基址分别编码到4个buffer descriptor。该方案将热循环
+`v_add_u32` 从36条降到16条、`SQ_INSTS_VALU_INT32`降到579,584，但没有保留：
+`K=8192` 的16组ABBA配对测试全部回退，中位慢0.562 us。说明减少地址指令不能替代
+依赖链和descriptor切换的实际cycle验证。
+
+指令前端不是独立瓶颈：FlyDSL `SQ_IFETCH` 比 Gluon多 5.3%，但
+`SQ_IFETCH_LEVEL/SQ_IFETCH` 分别约为 0.232和 0.230，平均取指等待几乎相同；只是较多
+地址指令带来的自然取指增量。
+
+资源压力是次要因素。最终 ISA元数据为：
+
+| 实现 | arch VGPR | AGPR | combined | SGPR |
+|---|---:|---:|---:|---:|
+| FlyDSL | 220 | 256 | 476 | 49 |
+| Gluon | 168 | 256 | 424 | 87 |
+
+两者 combined VGPR都大于256且不超过512，因此都处于1 wave/SIMD档，不存在 occupancy
+跳档；`SQ_WAVE_CYCLES/SQ_BUSY_CU_CYCLES` 两边也都为1.0。FlyDSL多52个 arch VGPR
+不会进一步降低 occupancy，但会压缩调度和地址临时值的空间，与额外 INT32 VALU来自同一
+组复杂地址表达式。
 
 运行基准：
 

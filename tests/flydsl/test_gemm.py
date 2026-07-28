@@ -852,6 +852,9 @@ def compile_gemm_950(
     pin_bf16_agpr=True,
     native_bf16_agpr_anchor=True,
     lds_padding=True,
+    pid_swizzle=True,
+    permlane_epilogue=True,
+    precompute_dma_offsets=True,
 ):
     assert dtype in ("bf16", "fp8"), "dtype must be bf16 or fp8"
 
@@ -873,12 +876,44 @@ def compile_gemm_950(
     a_lds_size_half = TILE_M // 2 * TILE_K
     b_lds_size_half = TILE_N // 2 * TILE_K
     use_4wave_lds_padding = num_waves == 4 and not is_fp8 and lds_padding
+    use_precomputed_dma_offsets = precompute_dma_offsets and use_4wave_lds_padding
     lds_padding_interval = 512
     lds_padding_elements = 16
 
     def padded_lds_size(logical_size):
         assert logical_size % lds_padding_interval == 0
         return logical_size + logical_size // lds_padding_interval * lds_padding_elements
+
+    def _get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
+        num_pid_m = (M + TILE_M - 1) // TILE_M
+        num_pid_n = div_up(N, TILE_N)
+
+        if const_expr(NUM_XCDS != 1):
+            pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+            tall_xcds = GRID_MN % NUM_XCDS
+            tall_xcds = (tall_xcds == 0).select(NUM_XCDS, tall_xcds)
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            if xcd < tall_xcds:
+                pid = xcd * pids_per_xcd + local_pid
+            else:
+                pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+
+        if const_expr(GROUP_SIZE_M == 1):
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
+        else:
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            remaining_pid_m = num_pid_m - first_pid_m
+            group_size_m = (remaining_pid_m < GROUP_SIZE_M).select(remaining_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+            pid_n = (pid % num_pid_in_group) // group_size_m
+
+        return pid_m, pid_n
+
+    get_pids_950 = ASTRewriter.transform(_get_pids_950)
 
     a_lds_stage_size = padded_lds_size(a_lds_size_half) if use_4wave_lds_padding else a_lds_size_half
     b_lds_stage_size = b_lds_size_half
@@ -897,8 +932,11 @@ def compile_gemm_950(
                        M: int):
         tid = fx.thread_idx.x
         num_pid_n = div_up(N, TILE_N)
-        blk_x = fx.block_idx.x // num_pid_n
-        blk_y = fx.block_idx.x % num_pid_n
+        if const_expr(pid_swizzle):
+            blk_x, blk_y = get_pids_950(fx.block_idx.x, M, fx.grid_dim.x, 8, 4)
+        else:
+            blk_x = fx.block_idx.x // num_pid_n
+            blk_y = fx.block_idx.x % num_pid_n
 
         a_iter = fx.recast_iter(element_type, fx.get_iter(arg_a_)) if const_expr(is_fp8) else fx.get_iter(arg_a_)
         b_iter = fx.recast_iter(element_type, fx.get_iter(arg_b_)) if const_expr(is_fp8) else fx.get_iter(arg_b_)
@@ -924,7 +962,31 @@ def compile_gemm_950(
         c_tensor = fx.rocdl.make_buffer_tensor(arg_c, max_size=False)
         a_dma_rsrc = fx.buffer_ops.create_buffer_resource(arg_a_, max_size=True)
         b_dma_rsrc = fx.buffer_ops.create_buffer_resource(arg_b_, max_size=True)
+        c_store_rsrc = fx.buffer_ops.create_buffer_resource(arg_c_, max_size=True)
 
+        element_bytes = element_type.width // 8
+        dma_lane_row = tid // 8
+        dma_lane_k = (tid % 8) * elements_per_128b
+        a_local_row = dma_lane_row % 8 * (TILE_M // 2 // 8) + dma_lane_row // 8
+        at_src_base = fx.Int32(((blk_x * TILE_M + a_local_row) * K + dma_lane_k) * element_bytes)
+        ab_src_base = fx.Int32(
+            ((blk_x * TILE_M + TILE_M // 2 + a_local_row) * K + dma_lane_k) * element_bytes
+        )
+
+        b_n_inner = tid % 16
+        b_k_group = tid // 16 % 4
+        b_k_block = tid // 64 % (TILE_K // preshuffle_k)
+        b_n_block = tid // 128
+        b_lane_elem_offset = (
+            b_n_inner * elements_per_128b
+            + b_n_block * 16 * K
+            + b_k_group * 16 * elements_per_128b
+            + b_k_block * 16 * preshuffle_k
+        )
+        bl_src_base = fx.Int32((blk_y * TILE_N * K + b_lane_elem_offset) * element_bytes)
+        br_src_base = fx.Int32(
+            ((blk_y * TILE_N + TILE_N // 2) * K + b_lane_elem_offset) * element_bytes
+        )
         at_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M // 2, TILE_K))[None, None, blk_x * 2, None]
         ab_tile = fx.flat_divide(a_tensor, fx.make_tile(TILE_M // 2, TILE_K))[None, None, blk_x * 2 + 1, None]
         bl_tile = fx.flat_divide(b_tensor, fx.make_tile(TILE_N // 2, TILE_K))[None, None, blk_y * 2, None]
@@ -1141,7 +1203,7 @@ def compile_gemm_950(
                     chunk_idx += 1
             fx.memref_store_vec(assembled, dst)
 
-        def copy_bf16_gmem_to_lds(rsrc, dst, row_base, k_tile, is_b):
+        def copy_bf16_gmem_to_lds(rsrc, dst, row_base, src_base, k_tile, is_b):
             async_domain = '#llvm.alias_scope_domain<id = "pyhip.gemm950.async">'
             async_scopes = ir.Attribute.parse(
                 f'[#llvm.alias_scope<id = "async_copies", domain = {async_domain}>]'
@@ -1152,98 +1214,135 @@ def compile_gemm_950(
             chunk_count = (TILE_N // 2 if is_b else TILE_M // 2) // 32
             lane_row = tid // 8
             lane_k = (tid % 8) * elements_per_128b
-            for chunk in range_constexpr(chunk_count):
-                if const_expr(is_b and use_4wave_lds_padding):
-                    # Copy the preshuffled tile byte-for-byte: thread tid owns one 16-byte vector per round.
-                    local_elem_offset = (
-                        tid * elements_per_128b
-                        + chunk * 256 * elements_per_128b
-                    )
-                    k_inner = local_elem_offset % elements_per_128b
-                    n_inner = local_elem_offset // elements_per_128b % 16
-                    k_group = local_elem_offset // (16 * elements_per_128b) % 4
-                    k_block = local_elem_offset // (16 * preshuffle_k) % (TILE_K // preshuffle_k)
-                    n_block = local_elem_offset // (16 * TILE_K)
-                    elem_offset = (
-                        n_inner * elements_per_128b
-                        + (row_base // 16 + n_block) * 16 * K
-                        + k_inner
-                        + k_group * 16 * elements_per_128b
-                        + (k_tile * (TILE_K // preshuffle_k) + k_block) * 16 * preshuffle_k
-                    )
-                    src_offset = fx.Int32(elem_offset * element_type.width // 8)
-                    dst_ptr = fx.buffer_ops.get_element_ptr(
+            if const_expr(use_precomputed_dma_offsets):
+                if const_expr(is_b):
+                    first_dst_ptr = fx.buffer_ops.get_element_ptr(
                         dst_base,
-                        byte_offset=local_elem_offset * 2,
+                        byte_offset=tid * elements_per_128b * element_bytes,
                         elem_type=T.i8,
                     )
+                    dst_chunk_byte_stride = 256 * elements_per_128b * element_bytes
+                else:
+                    first_dst_ptr = dst_base
+                    dst_chunk_byte_stride = dst_stride[1] * element_bytes
+                dst_addr_lane0 = rocdl.readfirstlane(T.i32, llvm.ptrtoint(T.i32, first_dst_ptr))
+            for chunk in range_constexpr(chunk_count):
+                if const_expr(use_precomputed_dma_offsets):
+                    if const_expr(chunk > 0):
+                        dst_addr_lane0 += dst_chunk_byte_stride
+                    dst_ptr = llvm.inttoptr(dst_ptr_type, dst_addr_lane0)
+                if const_expr(use_precomputed_dma_offsets):
+                    if const_expr(is_b):
+                        src_increment = fx.Int32(
+                            k_tile * TILE_K * 16 * element_bytes
+                            + chunk * 32 * K * element_bytes
+                        )
+                    else:
+                        src_increment = fx.Int32(
+                            k_tile * TILE_K * element_bytes
+                            + chunk * 4 * K * element_bytes
+                        )
+                    src_offset = src_base + src_increment
+                    src_soffset = fx.Int32(0)
+                else:
+                    src_soffset = fx.Int32(0)
+
+                if const_expr(is_b and use_4wave_lds_padding):
+                    # Copy the preshuffled tile byte-for-byte: thread tid owns one 16-byte vector per round.
+                    if const_expr(not use_precomputed_dma_offsets):
+                        local_elem_offset = (
+                            tid * elements_per_128b
+                            + chunk * 256 * elements_per_128b
+                        )
+                    if const_expr(not use_precomputed_dma_offsets):
+                        k_inner = local_elem_offset % elements_per_128b
+                        n_inner = local_elem_offset // elements_per_128b % 16
+                        k_group = local_elem_offset // (16 * elements_per_128b) % 4
+                        k_block = local_elem_offset // (16 * preshuffle_k) % (TILE_K // preshuffle_k)
+                        n_block = local_elem_offset // (16 * TILE_K)
+                        elem_offset = (
+                            n_inner * elements_per_128b
+                            + (row_base // 16 + n_block) * 16 * K
+                            + k_inner
+                            + k_group * 16 * elements_per_128b
+                            + (k_tile * (TILE_K // preshuffle_k) + k_block) * 16 * preshuffle_k
+                        )
+                        src_offset = fx.Int32(elem_offset * element_bytes)
+                    if const_expr(not use_precomputed_dma_offsets):
+                        dst_ptr = fx.buffer_ops.get_element_ptr(
+                            dst_base,
+                            byte_offset=local_elem_offset * element_bytes,
+                            elem_type=T.i8,
+                        )
                     rocdl.raw_ptr_buffer_load_lds(
                         rsrc,
                         dst_ptr,
                         fx.Int32(16),
                         src_offset,
-                        fx.Int32(0),
+                        src_soffset,
                         fx.Int32(0),
                         fx.Int32(0),
                         alias_scopes=async_scopes,
                     )
                     continue
 
-                logical_row = lane_row + chunk * 32
-                if const_expr(not is_b and use_4wave_lds_padding):
-                    local_row = (
-                        logical_row % 8 * (TILE_M // 2 // 8)
-                        + logical_row // 8
+                if const_expr(not use_precomputed_dma_offsets):
+                    logical_row = lane_row + chunk * 32
+                    if const_expr(not is_b and use_4wave_lds_padding):
+                        local_row = (
+                            logical_row % 8 * (TILE_M // 2 // 8)
+                            + logical_row // 8
+                        )
+                    else:
+                        local_row = logical_row
+                    row = row_base + local_row
+                    k = k_tile * TILE_K + lane_k
+                    if const_expr(is_b):
+                        n_inner = row % 16
+                        n_block = row // 16
+                        k_inner = k % elements_per_128b
+                        k_group = (k // elements_per_128b) % 4
+                        k_block = k // preshuffle_k
+                        elem_offset = (
+                            n_inner * elements_per_128b
+                            + n_block * 16 * K
+                            + k_inner
+                            + k_group * 16 * elements_per_128b
+                            + k_block * 16 * preshuffle_k
+                        )
+                    else:
+                        elem_offset = row * K + k
+                    src_offset = fx.Int32(elem_offset * element_bytes)
+                if const_expr(not use_precomputed_dma_offsets):
+                    dst_ptr = fx.buffer_ops.get_element_ptr(
+                        dst_base,
+                        static_byte_offset=chunk * dst_stride[1] * element_bytes,
+                        elem_type=T.i8,
                     )
-                else:
-                    local_row = logical_row
-                row = row_base + local_row
-                k = k_tile * TILE_K + lane_k
-                if const_expr(is_b):
-                    n_inner = row % 16
-                    n_block = row // 16
-                    k_inner = k % elements_per_128b
-                    k_group = (k // elements_per_128b) % 4
-                    k_block = k // preshuffle_k
-                    elem_offset = (
-                        n_inner * elements_per_128b
-                        + n_block * 16 * K
-                        + k_inner
-                        + k_group * 16 * elements_per_128b
-                        + k_block * 16 * preshuffle_k
-                    )
-                else:
-                    elem_offset = row * K + k
-                src_offset = fx.Int32(elem_offset * element_type.width // 8)
-                dst_ptr = fx.buffer_ops.get_element_ptr(
-                    dst_base,
-                    static_byte_offset=chunk * dst_stride[1] * 2,
-                    elem_type=T.i8,
-                )
                 rocdl.raw_ptr_buffer_load_lds(
                     rsrc,
                     dst_ptr,
                     fx.Int32(16),
                     src_offset,
-                    fx.Int32(0),
+                    src_soffset,
                     fx.Int32(0),
                     fx.Int32(0),
                     alias_scopes=async_scopes,
                 )
 
-        def copy_a_gmem_to_lds(rsrc, src, dst, row_base, k_tile):
+        def copy_a_gmem_to_lds(rsrc, src, dst, row_base, src_base, k_tile):
             if const_expr(is_fp8):
                 fx.copy(async_copy_atom, src, dst)
             else:
-                copy_bf16_gmem_to_lds(rsrc, dst, row_base, k_tile, False)
+                copy_bf16_gmem_to_lds(rsrc, dst, row_base, src_base, k_tile, False)
 
-        def copy_b_gmem_to_lds(rsrc, src, dst, root, row_base, k_tile):
+        def copy_b_gmem_to_lds(rsrc, src, dst, root, row_base, src_base, k_tile):
             if const_expr(is_fp8):
                 fx.copy(async_copy_atom, src, dst)
             elif const_expr(use_4wave_lds_padding):
-                copy_bf16_gmem_to_lds(rsrc, root, row_base, k_tile, True)
+                copy_bf16_gmem_to_lds(rsrc, root, row_base, src_base, k_tile, True)
             else:
-                copy_bf16_gmem_to_lds(rsrc, dst, row_base, k_tile, True)
+                copy_bf16_gmem_to_lds(rsrc, dst, row_base, src_base, k_tile, True)
 
         def copy_lds_to_frag(src, dst, scope_name):
             if const_expr(is_fp8):
@@ -1391,14 +1490,14 @@ def compile_gemm_950(
             rocdl.s_barrier()
 
         rocdl.sched_barrier(0)
-        copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, 0], bl_g2s_dst[0], bl_lds[0], blk_y * TILE_N, 0)
-        copy_a_gmem_to_lds(a_dma_rsrc, at_g2s_src[None, None, None, 0], at_g2s_dst[0], blk_x * TILE_M, 0)
-        copy_a_gmem_to_lds(a_dma_rsrc, ab_g2s_src[None, None, None, 0], ab_g2s_dst[0], blk_x * TILE_M + TILE_M // 2, 0)
-        copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, 0], br_g2s_dst[0], br_lds[0], blk_y * TILE_N + TILE_N // 2, 0)
-        copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, 1], bl_g2s_dst[1], bl_lds[1], blk_y * TILE_N, 1)
-        copy_a_gmem_to_lds(a_dma_rsrc, at_g2s_src[None, None, None, 1], at_g2s_dst[1], blk_x * TILE_M, 1)
-        copy_a_gmem_to_lds(a_dma_rsrc, ab_g2s_src[None, None, None, 1], ab_g2s_dst[1], blk_x * TILE_M + TILE_M // 2, 1)
-        copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, 1], br_g2s_dst[1], br_lds[1], blk_y * TILE_N + TILE_N // 2, 1)
+        copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, 0], bl_g2s_dst[0], bl_lds[0], blk_y * TILE_N, bl_src_base, 0)
+        copy_a_gmem_to_lds(a_dma_rsrc, at_g2s_src[None, None, None, 0], at_g2s_dst[0], blk_x * TILE_M, at_src_base, 0)
+        copy_a_gmem_to_lds(a_dma_rsrc, ab_g2s_src[None, None, None, 0], ab_g2s_dst[0], blk_x * TILE_M + TILE_M // 2, ab_src_base, 0)
+        copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, 0], br_g2s_dst[0], br_lds[0], blk_y * TILE_N + TILE_N // 2, br_src_base, 0)
+        copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, 1], bl_g2s_dst[1], bl_lds[1], blk_y * TILE_N, bl_src_base, 1)
+        copy_a_gmem_to_lds(a_dma_rsrc, at_g2s_src[None, None, None, 1], at_g2s_dst[1], blk_x * TILE_M, at_src_base, 1)
+        copy_a_gmem_to_lds(a_dma_rsrc, ab_g2s_src[None, None, None, 1], ab_g2s_dst[1], blk_x * TILE_M + TILE_M // 2, ab_src_base, 1)
+        copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, 1], br_g2s_dst[1], br_lds[1], blk_y * TILE_N + TILE_N // 2, br_src_base, 1)
         wait_vmem_barrier(2 * a_vmem_count + 2 * b_vmem_count)
         copy_lds_to_frag(at_lds_src[0], at_frag_dst, "at0")
         copy_b_lds_to_frag(bl_lds_src[0], bl_lds[0], bl_frag_dst, "bl0")
@@ -1418,7 +1517,7 @@ def compile_gemm_950(
             else:
                 gemm_bf16_agpr(c_tl_frag, bl_frag, at_frag)
             copy_lds_to_frag(ab_lds_src[0], ab_frag_dst, "ab0")
-            copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, k_i32 + 2], bl_g2s_dst[0], bl_lds[0], blk_y * TILE_N, k_i32 + 2)
+            copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, k_i32 + 2], bl_g2s_dst[0], bl_lds[0], blk_y * TILE_N, bl_src_base, k_i32 + 2)
             hot_loop_scheduler(a_dsrd_count, b_vmem_count, 0)
 
             # Region 1: BL(stage 0), read BR0, prefetch AT(k+2).
@@ -1427,7 +1526,7 @@ def compile_gemm_950(
             else:
                 gemm_bf16_agpr(c_bl_frag, bl_frag, ab_frag)
             copy_b_lds_to_frag(br_lds_src[0], br_lds[0], br_frag_dst, "br0")
-            copy_a_gmem_to_lds(a_dma_rsrc, at_g2s_src[None, None, None, k_i32 + 2], at_g2s_dst[0], blk_x * TILE_M, k_i32 + 2)
+            copy_a_gmem_to_lds(a_dma_rsrc, at_g2s_src[None, None, None, k_i32 + 2], at_g2s_dst[0], blk_x * TILE_M, at_src_base, k_i32 + 2)
             hot_loop_scheduler(b_dsrd_count, a_vmem_count, 1)
             if const_expr(not is_fp8):
                 anchor_b_frag(bl_frag)
@@ -1439,7 +1538,7 @@ def compile_gemm_950(
             else:
                 gemm_bf16_agpr(c_tr_frag, br_frag, at_frag)
             copy_b_lds_to_frag(bl_lds_src[1], bl_lds[1], bl_frag_dst, "bl1")
-            copy_a_gmem_to_lds(a_dma_rsrc, ab_g2s_src[None, None, None, k_i32 + 2], ab_g2s_dst[0], blk_x * TILE_M + TILE_M // 2, k_i32 + 2)
+            copy_a_gmem_to_lds(a_dma_rsrc, ab_g2s_src[None, None, None, k_i32 + 2], ab_g2s_dst[0], blk_x * TILE_M + TILE_M // 2, ab_src_base, k_i32 + 2)
             hot_loop_scheduler(b_dsrd_count, a_vmem_count, 2)
 
             # Region 3: BR(stage 0), read AT1, prefetch BR(k+2).
@@ -1448,7 +1547,7 @@ def compile_gemm_950(
             else:
                 gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
             copy_lds_to_frag(at_lds_src[1], at_frag_dst, "at1")
-            copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, k_i32 + 2], br_g2s_dst[0], br_lds[0], blk_y * TILE_N + TILE_N // 2, k_i32 + 2)
+            copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, k_i32 + 2], br_g2s_dst[0], br_lds[0], blk_y * TILE_N + TILE_N // 2, br_src_base, k_i32 + 2)
             hot_loop_scheduler(a_dsrd_count, b_vmem_count, 3, wait_for_prefetch=True)
             if const_expr(not is_fp8):
                 anchor_b_frag(ab_frag)
@@ -1461,7 +1560,7 @@ def compile_gemm_950(
             else:
                 gemm_bf16_agpr(c_tl_frag, bl_frag, at_frag)
             copy_lds_to_frag(ab_lds_src[1], ab_frag_dst, "ab1")
-            copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, k_i32 + 3], bl_g2s_dst[1], bl_lds[1], blk_y * TILE_N, k_i32 + 3)
+            copy_b_gmem_to_lds(b_dma_rsrc, bl_g2s_src[None, None, None, k_i32 + 3], bl_g2s_dst[1], bl_lds[1], blk_y * TILE_N, bl_src_base, k_i32 + 3)
             hot_loop_scheduler(a_dsrd_count, b_vmem_count, 4)
 
             # Region 5: BL(stage 1), read BR1, prefetch AT(k+3).
@@ -1470,7 +1569,7 @@ def compile_gemm_950(
             else:
                 gemm_bf16_agpr(c_bl_frag, bl_frag, ab_frag)
             copy_b_lds_to_frag(br_lds_src[1], br_lds[1], br_frag_dst, "br1")
-            copy_a_gmem_to_lds(a_dma_rsrc, at_g2s_src[None, None, None, k_i32 + 3], at_g2s_dst[1], blk_x * TILE_M, k_i32 + 3)
+            copy_a_gmem_to_lds(a_dma_rsrc, at_g2s_src[None, None, None, k_i32 + 3], at_g2s_dst[1], blk_x * TILE_M, at_src_base, k_i32 + 3)
             hot_loop_scheduler(b_dsrd_count, a_vmem_count, 5)
             if const_expr(not is_fp8):
                 anchor_b_frag(bl_frag)
@@ -1482,7 +1581,7 @@ def compile_gemm_950(
             else:
                 gemm_bf16_agpr(c_tr_frag, br_frag, at_frag)
             copy_b_lds_to_frag(bl_lds_src[0], bl_lds[0], bl_frag_dst, "bl0")
-            copy_a_gmem_to_lds(a_dma_rsrc, ab_g2s_src[None, None, None, k_i32 + 3], ab_g2s_dst[1], blk_x * TILE_M + TILE_M // 2, k_i32 + 3)
+            copy_a_gmem_to_lds(a_dma_rsrc, ab_g2s_src[None, None, None, k_i32 + 3], ab_g2s_dst[1], blk_x * TILE_M + TILE_M // 2, ab_src_base, k_i32 + 3)
             hot_loop_scheduler(b_dsrd_count, a_vmem_count, 6)
 
             # Region 7: BR(stage 1), read AT0(k+2), prefetch BR(k+3).
@@ -1491,7 +1590,7 @@ def compile_gemm_950(
             else:
                 gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
             copy_lds_to_frag(at_lds_src[0], at_frag_dst, "at0")
-            copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, k_i32 + 3], br_g2s_dst[1], br_lds[1], blk_y * TILE_N + TILE_N // 2, k_i32 + 3)
+            copy_b_gmem_to_lds(b_dma_rsrc, br_g2s_src[None, None, None, k_i32 + 3], br_g2s_dst[1], br_lds[1], blk_y * TILE_N + TILE_N // 2, br_src_base, k_i32 + 3)
             hot_loop_scheduler(a_dsrd_count, b_vmem_count, 7, wait_for_prefetch=True)
 
             if const_expr(not is_fp8 and native_bf16_agpr_anchor):
@@ -1576,18 +1675,89 @@ def compile_gemm_950(
             gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
         hot_loop_scheduler(0, 0, 7)
 
-        c_frag_bf16 = fx.make_fragment_like(c_tl_frag, dtype=fx.BFloat16)
-        store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
-        store_thr = fx.make_tiled_copy_C(store_atom, tiled_mma).get_slice(tid)
+        if const_expr(not is_fp8 and permlane_epilogue):
+            pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
+            lane_id = tid % 64
+            wave_id = tid // 64
+            wave_m = wave_id // 2
+            wave_n = wave_id % 2
+            lane_group = lane_id // 16
+            store_group = lane_group % 2 * 2 + lane_group // 2
+            fragment_mode_0_repeat = TILE_M // 64
+            fragment_mode_1_repeat = TILE_N // 64
 
-        c_frag_bf16.store(c_tl_frag.load().to(fx.BFloat16))
-        fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_tl_tile))
-        c_frag_bf16.store(c_tr_frag.load().to(fx.BFloat16))
-        fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_tr_tile))
-        c_frag_bf16.store(c_bl_frag.load().to(fx.BFloat16))
-        fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_bl_tile))
-        c_frag_bf16.store(c_br_frag.load().to(fx.BFloat16))
-        fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_br_tile))
+            def store_c_quadrant(c_frag, quadrant_m, quadrant_n):
+                for row_repeat in range_constexpr(fragment_mode_1_repeat):
+                    for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
+                        acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
+                        acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
+                        d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
+                        d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
+                        d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
+                        d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+                        swap0 = rocdl.permlane16_swap(
+                            pair_type,
+                            arith._to_raw(d0_a),
+                            arith._to_raw(d0_b),
+                            False,
+                            False,
+                        )
+                        swap1 = rocdl.permlane16_swap(
+                            pair_type,
+                            arith._to_raw(d1_a),
+                            arith._to_raw(d1_b),
+                            False,
+                            False,
+                        )
+                        packed = Vec.from_elements(
+                            [
+                                fx.Int32(llvm.extractvalue(T.i32, swap0, [0])),
+                                fx.Int32(llvm.extractvalue(T.i32, swap1, [0])),
+                                fx.Int32(llvm.extractvalue(T.i32, swap0, [1])),
+                                fx.Int32(llvm.extractvalue(T.i32, swap1, [1])),
+                            ],
+                            fx.Int32,
+                        )
+                        row = (
+                            blk_x * TILE_M
+                            + quadrant_m * (TILE_M // 2)
+                            + row_repeat * 32
+                            + wave_m * 16
+                            + lane_id % 16
+                        )
+                        col = (
+                            blk_y * TILE_N
+                            + quadrant_n * (TILE_N // 2)
+                            + col_repeat * 32
+                            + lane_group % 2 * 32
+                            + wave_n * 16
+                            + lane_group // 2 * 8
+                        )
+                        byte_offset = (row * N + col) * 2
+                        fx.buffer_ops.buffer_store(
+                            packed,
+                            c_store_rsrc,
+                            byte_offset,
+                            offset_is_bytes=True,
+                        )
+
+            store_c_quadrant(c_tl_frag, 0, 0)
+            store_c_quadrant(c_tr_frag, 0, 1)
+            store_c_quadrant(c_bl_frag, 1, 0)
+            store_c_quadrant(c_br_frag, 1, 1)
+        else:
+            c_frag_bf16 = fx.make_fragment_like(c_tl_frag, dtype=fx.BFloat16)
+            store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+            store_thr = fx.make_tiled_copy_C(store_atom, tiled_mma).get_slice(tid)
+
+            c_frag_bf16.store(c_tl_frag.load().to(fx.BFloat16))
+            fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_tl_tile))
+            c_frag_bf16.store(c_tr_frag.load().to(fx.BFloat16))
+            fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_tr_tile))
+            c_frag_bf16.store(c_bl_frag.load().to(fx.BFloat16))
+            fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_bl_tile))
+            c_frag_bf16.store(c_br_frag.load().to(fx.BFloat16))
+            fx.copy(store_atom, store_thr.retile(c_frag_bf16), store_thr.partition_D(c_br_tile))
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def gemm_8wave_950(arg_c_: fx.Tensor,
@@ -1596,8 +1766,11 @@ def compile_gemm_950(
                        M: int):
         tid = fx.thread_idx.x
         num_pid_n = div_up(N, TILE_N)
-        blk_x = fx.block_idx.x // num_pid_n
-        blk_y = fx.block_idx.x % num_pid_n
+        if const_expr(pid_swizzle):
+            blk_x, blk_y = get_pids_950(fx.block_idx.x, M, fx.grid_dim.x, 8, 4)
+        else:
+            blk_x = fx.block_idx.x // num_pid_n
+            blk_y = fx.block_idx.x % num_pid_n
 
         a_iter = fx.recast_iter(element_type, fx.get_iter(arg_a_)) if const_expr(is_fp8) else fx.get_iter(arg_a_)
         b_iter = fx.recast_iter(element_type, fx.get_iter(arg_b_)) if const_expr(is_fp8) else fx.get_iter(arg_b_)
@@ -2212,10 +2385,10 @@ def _make_gemm_950_problem(dtype, M, N, K):
     return a, b, output, ref, args
 
 def benchmark_gemm_950(num_waves, dtype="bf16", M=4096, N=4096, K=4096,
-                       TILE_M=256, TILE_N=256, warmup=5, iterations=20):
+                       TILE_M=256, TILE_N=256, warmup=5, iterations=20, pid_swizzle=True):
     assert is_arch_type("950"), "gemm_4wave_950/gemm_8wave_950 require gfx950"
     _, _, output, _, args = _make_gemm_950_problem(dtype, M, N, K)
-    launcher = compile_gemm_950(TILE_M, TILE_N, N, K, num_waves, dtype)
+    launcher = compile_gemm_950(TILE_M, TILE_N, N, K, num_waves, dtype, pid_swizzle=pid_swizzle)
     kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
 
     for _ in range(warmup):
