@@ -878,6 +878,7 @@ def compile_gemm_950(
     use_4wave_lds_padding = num_waves == 4 and lds_padding
     use_precomputed_dma_offsets = precompute_dma_offsets and use_4wave_lds_padding
     use_8wave_b_padding = num_waves == 8 and not is_fp8 and lds_padding
+    use_8wave_fp8_a_padding = num_waves == 8 and is_fp8 and lds_padding
     lds_padding_interval = 512
     lds_padding_elements = 16
 
@@ -919,7 +920,7 @@ def compile_gemm_950(
 
     get_pids_950 = ASTRewriter.transform(_get_pids_950)
 
-    use_a_lds_padding = lds_padding and (num_waves == 4 or not is_fp8)
+    use_a_lds_padding = lds_padding and (num_waves == 4 or not is_fp8 or use_8wave_fp8_a_padding)
     a_lds_stage_size = padded_lds_size(a_lds_size_half) if use_a_lds_padding else a_lds_size_half
     b_lds_stage_size = padded_lds_size(b_lds_size_half) if use_8wave_b_padding else b_lds_size_half
 
@@ -1855,7 +1856,16 @@ def compile_gemm_950(
         c_br_tile = fx.flat_divide(c_tensor, fx.make_tile(TILE_M // 2, TILE_N // 2))[None, None, blk_x * 2 + 1, blk_y * 2 + 1]
 
         lds = fx.SharedAllocator().allocate(SharedStorage950).peek()
-        if const_expr(not is_fp8):
+        if const_expr(is_fp8 and use_8wave_fp8_a_padding):
+            a_lds_write_layout = fx.make_layout(
+                ((8, 2, TILE_M // 32), TILE_K),
+                ((TILE_K, 8 * TILE_K + 16, 2 * (8 * TILE_K + 16) + 32), 1),
+            )
+            a_lds_read_layout = fx.make_layout(
+                ((2, TILE_M // 32, 8), (32, TILE_K // 32)),
+                ((8 * TILE_K + 16, 2 * (8 * TILE_K + 16) + 32, TILE_K), (1, 32)),
+            )
+        elif const_expr(not is_fp8):
             a_lds_write_layout = fx.make_layout(
                 ((8, TILE_M // 16), TILE_K),
                 ((TILE_K, 8 * TILE_K + lds_padding_elements), 1),
@@ -2050,7 +2060,7 @@ def compile_gemm_950(
             dma_dst_addr(br_lds[1], wave_id * b_wave_stride_bytes),
         ]
 
-        def copy_a_gmem_to_lds_bf16_8wave(rsrc, dst_addr, dst_stride, src_base, k_tile):
+        def copy_a_gmem_to_lds_raw_8wave(rsrc, dst_addr, dst_stride, src_base, k_tile):
             async_domain = '#llvm.alias_scope_domain<id = "pyhip.gemm950.8wave.async">'
             async_scopes = ir.Attribute.parse(
                 f'[#llvm.alias_scope<id = "async_copies", domain = {async_domain}>]'
@@ -2077,12 +2087,12 @@ def compile_gemm_950(
                 )
 
         def copy_a_gmem_to_lds_8wave(rsrc, dst_addr, dst_stride, src_base, k_tile, src, dst):
-            if const_expr(is_fp8):
+            if const_expr(is_fp8 and not use_8wave_fp8_a_padding):
                 fx.copy(async_copy_atom, src, dst)
             else:
-                copy_a_gmem_to_lds_bf16_8wave(rsrc, dst_addr, dst_stride, src_base, k_tile)
+                copy_a_gmem_to_lds_raw_8wave(rsrc, dst_addr, dst_stride, src_base, k_tile)
 
-        def copy_b_gmem_to_lds_bf16_8wave(rsrc, dst_addr, row_base, k_tile):
+        def copy_b_gmem_to_lds_raw_8wave(rsrc, dst_addr, row_base, k_tile):
             async_domain = '#llvm.alias_scope_domain<id = "pyhip.gemm950.8wave.async">'
             async_scopes = ir.Attribute.parse(
                 f'[#llvm.alias_scope<id = "async_copies", domain = {async_domain}>]'
@@ -2127,10 +2137,7 @@ def compile_gemm_950(
                 )
 
         def copy_b_gmem_to_lds_8wave(rsrc, dst_addr, row_base, k_tile, src, dst):
-            if const_expr(is_fp8):
-                fx.copy(async_copy_atom, src, dst)
-            else:
-                copy_b_gmem_to_lds_bf16_8wave(rsrc, dst_addr, row_base, k_tile)
+            copy_b_gmem_to_lds_raw_8wave(rsrc, dst_addr, row_base, k_tile)
 
         def copy_lds_to_frag_bf16_8wave(src, dst, scope_name):
             alias_domain = '#llvm.alias_scope_domain<id = "pyhip.gemm950.8wave.lds">'
@@ -2241,9 +2248,64 @@ def compile_gemm_950(
                     chunk_idx += 1
             fx.memref_store_vec(assembled, dst)
 
+        def copy_b_lds_to_frag_fp8_8wave(root, dst, scope_name):
+            alias_domain = '#llvm.alias_scope_domain<id = "pyhip.gemm950.8wave.lds">'
+            alias_scopes = ir.Attribute.parse(
+                f'[#llvm.alias_scope<id = "{scope_name}", domain = {alias_domain}>]'
+            )
+            async_domain = '#llvm.alias_scope_domain<id = "pyhip.gemm950.8wave.async">'
+            async_noalias = ir.Attribute.parse(
+                f'[#llvm.alias_scope<id = "async_copies", domain = {async_domain}>]'
+            )
+            ptr_type = ir.Type.parse("!llvm.ptr<3>")
+            base_ptr = fly_dialect.extract_aligned_pointer_as_index(ptr_type, arith._to_raw(root))
+            lane_id = tid % 64
+            base_row = lane_id % 16 + wave_id % 4 * 16
+            base_k = lane_id // 16 * 32
+            major_count = TILE_N // 2 // 64
+            stage_count = 2
+            assembled = fx.Vector.filled(
+                elements_per_128b * major_count * stage_count,
+                0,
+                element_type,
+            ).ir_value()
+            chunk_idx = 0
+            for major in range_constexpr(major_count):
+                for stage in range_constexpr(stage_count):
+                    row = base_row + major * 64
+                    k = base_k + stage * elements_per_128b
+                    elem_offset = (
+                        row // 16 * 16 * TILE_K
+                        + k // preshuffle_k * 16 * preshuffle_k
+                        + k // elements_per_128b % 4 * 16 * elements_per_128b
+                        + row % 16 * elements_per_128b
+                        + k % elements_per_128b
+                    )
+                    ptr = fx.buffer_ops.get_element_ptr(
+                        base_ptr,
+                        byte_offset=elem_offset * element_bytes,
+                        elem_type=T.i8,
+                    )
+                    loaded_i32 = llvm.LoadOp(
+                        T.vec(4, T.i32),
+                        ptr,
+                        alignment=16,
+                        alias_scopes=alias_scopes,
+                        noalias_scopes=async_noalias,
+                    ).result
+                    loaded = Vec(loaded_i32).bitcast(element_type).ir_value()
+                    assembled = vector.insert_strided_slice(
+                        loaded,
+                        assembled,
+                        [chunk_idx * elements_per_128b],
+                        [1],
+                    )
+                    chunk_idx += 1
+            fx.memref_store_vec(assembled, dst)
+
         def copy_b_lds_to_frag_8wave(src, root, dst, scope_name):
             if const_expr(is_fp8):
-                fx.copy(lds_copy_atom, src, dst)
+                copy_b_lds_to_frag_fp8_8wave(root, dst, scope_name)
             else:
                 copy_b_lds_to_frag_bf16_8wave(root, dst, scope_name)
 

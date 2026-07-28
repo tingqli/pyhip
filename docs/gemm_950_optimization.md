@@ -156,6 +156,23 @@ offset变换。每个B stage因此从8192增长到8448个BF16，kernel总LDS为1
 
 FlyDSL四次采样的bank conflict和FIFO full均为0；cycle列取多次dispatch中位数。
 
+8-wave FP8在相同两组4-wave调度框架上移植了A8W8的双padding A布局。A的write/read
+view继续使用`[[1024,16],[2048,32]]`，GMem源行按8行分组重排；B按host preshuffle
+字节序通过raw DMA直接复制，并由每个wave按`row = lane%16 + (wave%4)*16`读取两个
+连续K16向量。生产`256x256` tile还包含第二个64-row N repeat。
+
+`4096^3` PMC显示优化过程为：
+
+| 8-wave FP8配置 | `SQ_LDS_BANK_CONFLICT` | `SQ_WAVE_CYCLES` | `SQ_BUSY_CYCLES` |
+|---|---:|---:|---:|
+| 原generic A/B LDS布局 | 18,874,368 | 78,417,450 | 4,968,092 |
+| A8W8双padding A | 6,291,456 | 65,184,150 | 4,136,550 |
+| + 连续preshuffle B（最终） | **0** | **47,986,713** | **3,056,110** |
+
+最终四次dispatch的`SQ_LDS_BANK_CONFLICT`和`SQ_LDS_DATA_FIFO_FULL`均为0。ISA使用
+133,120 B LDS、250个VGPR和96个SGPR，private segment为0，整个kernel没有scratch
+load/store。
+
 ### 3.2 XCD-aware PID 映射
 
 GFX950 有 8 个 XCD，每个 XCD 有独立 L2。`compile_gemm_950` 默认使用从 Gluon
@@ -474,12 +491,14 @@ FlyDSL中试验了同类LDS CShuffle，ISA从32条`buffer_store_dwordx2`变为16
 | 4-wave BF16 | 0.2861 ms | 480.4 TFLOPS | 0.09736 ms | 1411.6 TFLOPS | 2.94x |
 | 8-wave BF16 | 0.2366 ms | 581.0 TFLOPS | 0.10215 ms | 1345.5 TFLOPS | 2.32x |
 | 4-wave FP8 | 0.1500 ms | 916.2 TFLOPS | 0.05209 ms | 2638.5 TFLOPS | 2.88x |
-| 8-wave FP8 | 0.1269 ms | 1083.2 TFLOPS | 0.08424 ms | 1631.6 TFLOPS | 1.51x |
+| 8-wave FP8 | 0.1269 ms | 1083.2 TFLOPS | 0.05010 ms | 2743.5 TFLOPS | 2.53x |
 
 最终Q1/Q3区间为：4-wave BF16 `0.09728/0.09751 ms`、8-wave BF16
 `0.10195/0.10227 ms`。8-wave延迟比同批4-wave高4.9%，吞吐为4-wave的95.3%，达到
 相同性能量级。单独测得Gluon 8-wave为`0.09607 ms / 1430.6 TFLOPS`，当前FlyDSL
-仍慢约6.3%。4-wave FP8最终结果来自
+仍慢约6.3%。8-wave FP8的Q1/Q3为`0.04977/0.05100 ms`；同批4-wave FP8中位数为
+`0.05242 ms / 2622.0 TFLOPS`，8-wave快约4.6%。它相对移植前的受控baseline
+`0.06921 ms / 1985.7 TFLOPS`提升约38.2%。4-wave FP8最终结果来自
 10组交替顺序、每组80次的受控测试，中位数为`0.05209 ms / 2638.5 TFLOPS`；同一
 进程中的无padding版本为`0.05206 ms / 2640.3 TFLOPS`，说明零冲突padding没有引入
 可测性能回退。
