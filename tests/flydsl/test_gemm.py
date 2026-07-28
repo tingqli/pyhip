@@ -172,7 +172,7 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         swz = fx.SwizzleType.get(3, 3, 3)
-        c_lds = fx.make_view(lds.C_lds,
+        c_lds = fx.make_view(lds.C_lds.ptr,
                              fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M * 4, TILE_N), order=(1, 0))))
         cp_atom_lds = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
         c_tiled_lds = make_tiled_copy(cp_atom_lds,
