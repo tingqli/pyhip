@@ -12,8 +12,9 @@
 - FP8 暂不接收外部 scale；scaled MFMA 的 A/B scale 都设置为 E8M0 单位值
   `0x7f7f7f7f`。
 - 性能表使用 `M=N=K=4096`、输出 tile `256 x 256`。
-- 最新性能数据采集于 2026-07-25：预热20次，5组、每组60次运行取中位数；
-  四个FlyDSL变体按正序/逆序交替执行，降低温度和频率漂移带来的顺序偏差。
+- 最新性能数据采集于 2026-07-25。BF16最终对比预热30轮，4/8-wave交替执行
+  12组、每组80次并取中位数；FP8最终数据采用同进程交替执行，降低温度和频率漂移
+  带来的顺序偏差。
 
 ## 2. GFX950 指令选择
 
@@ -130,6 +131,30 @@ B。加入连续B写入/读取后，三次dispatch的结果均为：
 | `SQ_LDS_DATA_FIFO_FULL` | 0 | **0** |
 
 因此a8w8双padding和连续B布局共同消除了4-wave FP8热循环的全部LDS bank conflict。
+
+8-wave BF16也需要A/B两侧共同变换。A沿用BF16的512元素间隔padding，但针对
+`(4,2)` wave布局使用转置read view，并同步重排GMem源行：
+
+```text
+write: ((8,16),64):((64,528),1)
+read:  ((16,8),(32,2)):((528,64),(1,32))
+source row: (row % 8) * 16 + row // 8
+```
+
+每个线程负责的第二个A chunk在重排后只前进8个源行。B仍保持host preshuffle顺序，
+但每512个BF16元素插入16个元素；raw DMA目标地址和手工LDS reader应用同一个物理
+offset变换。每个B stage因此从8192增长到8448个BF16，kernel总LDS为135,168 B。
+
+最终`4096^3`、256 workgroups、每个workgroup 8 waves的新PMC采集结果为：
+
+| Counter | FlyDSL 8-wave BF16 | Gluon 8-wave BF16 |
+|---|---:|---:|
+| `SQ_LDS_BANK_CONFLICT` | **0** | 393,216 |
+| `SQ_LDS_DATA_FIFO_FULL` | **0** | 162,787 |
+| `SQ_WAVE_CYCLES` | 82,904,344 | 76,449,929 |
+| `SQ_BUSY_CYCLES` | 5,239,993 | 4,800,956 |
+
+FlyDSL四次采样的bank conflict和FIFO full均为0；cycle列取多次dispatch中位数。
 
 ### 3.2 XCD-aware PID 映射
 
@@ -370,9 +395,25 @@ hot loop: 256 MFMA, 0 accvgpr_read, 0 accvgpr_write
 
 ## 7. 8-wave 同步
 
-`sched_barrier` 只是编译器调度 fence，不是 workgroup 同步。8-wave kernel 每个 MFMA
-区域之后仍需要 `gpu.barrier()`，与 Gluon 的 8-wave 同步结构一致。遗漏该 barrier 时，
-只跑两个 K tile 的 tail 测试可能通过，但进入展开主循环后会产生错误结果。
+`sched_barrier`只是编译器调度fence，不是workgroup同步。8-wave kernel把8个wave
+分为两组，每组4个wave交错执行：prologue中`wave_id >= 4`的组先执行一次条件
+`s_barrier`，tail结束时由`wave_id < 4`的组补上对应barrier。
+
+每个计算区域使用以下协议：
+
+```text
+sched_barrier -> s_setprio(1) -> MFMA -> s_setprio(0) -> raw s_barrier
+```
+
+每个memory区域显式发出`s_waitcnt`再执行raw `rocdl.s_barrier()`。普通区域只等待
+`lgkmcnt(0)`；区域3和7与Gluon一样使用`vmcnt(8) lgkmcnt(0)`，保留8个VMEM操作
+在途并跨半循环重叠。主循环最终包含128 MFMA、48 `ds_read_b128`、16 GMem-to-LDS
+VMEM和16个`s_barrier`，与Gluon数量一致。
+
+这里必须使用raw `s_barrier`。`gpu.barrier()`携带内存语义，LLVM会在其前面保守插入
+`vmcnt(0)`，把下一tile的DMA全部等完；早期版本因此只有约628 TFLOPS。改用显式
+waitcnt + raw barrier后，最终ISA保留`vmcnt(8)`，性能先恢复到约1082 TFLOPS，随后
+再通过padding、连续B和地址预计算继续提升。
 
 ## 8. Epilogue
 
@@ -415,19 +456,30 @@ epilogue差异：
 同进程交替 12 轮、每轮 100 次，`4096^3` 中位延迟从 `0.10060 ms` 降到
 `0.09839 ms`，提升 2.25%，吞吐从 `1366.2` 提升到 `1396.9 TFLOPS`。
 
+8-wave采用natural-pipeline epilogue：在TL、BL、TR、BR各自最后一次MFMA后立即转换并
+写出，避免四个象限同时存活到统一epilogue。该调整把private segment从76 B降到44 B；
+DMA目标地址预计算后最终为20 B，且热循环内没有scratch load/store。
+
+当前8-wave C fragment相邻的16列由不同wave持有，不能只靠wave内`permlane16`合并。
+Gluon的`convert_layout`实际生成跨wave的`ds_write_b128 -> barrier -> ds_read_b128`交换。
+FlyDSL中试验了同类LDS CShuffle，ISA从32条`buffer_store_dwordx2`变为16条
+`buffer_store_dwordx4`，但受控性能从约1348.5降到1330.4 TFLOPS，因此没有保留。
+
 ## 9. 性能结果
 
-同一 `benchmark_gemm_950` 配置的前后结果。当前值为5组×60次的中位数：
+同一`benchmark_gemm_950`配置的前后结果。BF16当前值来自12组×80次交替测试：
 
 | Kernel | 初始延迟 | 初始性能 | 当前延迟 | 当前性能 | 总加速 |
 |---|---:|---:|---:|---:|---:|
-| 4-wave BF16 | 0.2861 ms | 480.4 TFLOPS | 0.09687 ms | 1418.8 TFLOPS | 2.95x |
-| 8-wave BF16 | 0.2366 ms | 581.0 TFLOPS | 0.15680 ms | 876.5 TFLOPS | 1.51x |
+| 4-wave BF16 | 0.2861 ms | 480.4 TFLOPS | 0.09736 ms | 1411.6 TFLOPS | 2.94x |
+| 8-wave BF16 | 0.2366 ms | 581.0 TFLOPS | 0.10215 ms | 1345.5 TFLOPS | 2.32x |
 | 4-wave FP8 | 0.1500 ms | 916.2 TFLOPS | 0.05209 ms | 2638.5 TFLOPS | 2.88x |
 | 8-wave FP8 | 0.1269 ms | 1083.2 TFLOPS | 0.08424 ms | 1631.6 TFLOPS | 1.51x |
 
-当前5组的Q1/Q3区间分别为：4-wave BF16 `0.09680/0.09702 ms`、8-wave BF16
-`0.15623/0.15714 ms`、8-wave FP8 `0.08418/0.08428 ms`。4-wave FP8最终结果来自
+最终Q1/Q3区间为：4-wave BF16 `0.09728/0.09751 ms`、8-wave BF16
+`0.10195/0.10227 ms`。8-wave延迟比同批4-wave高4.9%，吞吐为4-wave的95.3%，达到
+相同性能量级。单独测得Gluon 8-wave为`0.09607 ms / 1430.6 TFLOPS`，当前FlyDSL
+仍慢约6.3%。4-wave FP8最终结果来自
 10组交替顺序、每组80次的受控测试，中位数为`0.05209 ms / 2638.5 TFLOPS`；同一
 进程中的无padding版本为`0.05206 ms / 2640.3 TFLOPS`，说明零冲突padding没有引入
 可测性能回退。
