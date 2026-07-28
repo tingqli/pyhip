@@ -102,6 +102,12 @@ B 不做 padding 或 XOR swizzle。GMem-to-LDS 直接按 host preshuffle 顺序�
 `256 * 16` 字节。LDS read 使用同一 preshuffle物理地址规则，因此同一 wave 的连续
 线程自然访问连续 bank。
 
+4-wave FP8沿用相同的双view和连续B策略，但A的 `kWidth=32` 需要采用a8w8教程的
+双padding规则 `[[1024, 16], [2048, 32]]`。每1024个FP8元素插入16个元素，并在每
+2048个元素处额外插入32个元素。A的DMA写view和MFMA读view分别表达物理写入顺序与
+operand读取顺序；B保持host preshuffle字节序，DMA直接复制，LDS读取按FP8 tiled-copy
+对应的lane坐标重组两个连续K16向量。
+
 `M=N=K=4096`、`256 x 256 x 64`、256 workgroups 的 PMC 结果：
 
 | 配置 | `SQ_LDS_BANK_CONFLICT` | 每 workgroup | LDS |
@@ -113,6 +119,17 @@ B 不做 padding 或 XOR swizzle。GMem-to-LDS 直接按 host preshuffle 顺序�
 
 参考 `asycn_copy_padding` 在相同访问负载下从 `3,670,016` 降到 `0`，证明这套 A
 参数本身能完全移除 bank conflict。
+
+FP8使用 `4096^3`、`256 x 256 x 128`、256 workgroups采集PMC。只加入A双padding时，
+`SQ_LDS_BANK_CONFLICT`从无padding版本的`12,582,912`降到`6,291,456`；剩余冲突来自
+B。加入连续B写入/读取后，三次dispatch的结果均为：
+
+| Counter | A双padding | A双padding + B连续布局 |
+|---|---:|---:|
+| `SQ_LDS_BANK_CONFLICT` | 6,291,456 | **0** |
+| `SQ_LDS_DATA_FIFO_FULL` | 0 | **0** |
+
+因此a8w8双padding和连续B布局共同消除了4-wave FP8热循环的全部LDS bank conflict。
 
 ### 3.2 XCD-aware PID 映射
 
@@ -406,12 +423,14 @@ epilogue差异：
 |---|---:|---:|---:|---:|---:|
 | 4-wave BF16 | 0.2861 ms | 480.4 TFLOPS | 0.09687 ms | 1418.8 TFLOPS | 2.95x |
 | 8-wave BF16 | 0.2366 ms | 581.0 TFLOPS | 0.15680 ms | 876.5 TFLOPS | 1.51x |
-| 4-wave FP8 | 0.1500 ms | 916.2 TFLOPS | 0.05520 ms | 2489.8 TFLOPS | 2.72x |
+| 4-wave FP8 | 0.1500 ms | 916.2 TFLOPS | 0.05209 ms | 2638.5 TFLOPS | 2.88x |
 | 8-wave FP8 | 0.1269 ms | 1083.2 TFLOPS | 0.08424 ms | 1631.6 TFLOPS | 1.51x |
 
 当前5组的Q1/Q3区间分别为：4-wave BF16 `0.09680/0.09702 ms`、8-wave BF16
-`0.15623/0.15714 ms`、4-wave FP8 `0.05480/0.05534 ms`、8-wave FP8
-`0.08418/0.08428 ms`。
+`0.15623/0.15714 ms`、8-wave FP8 `0.08418/0.08428 ms`。4-wave FP8最终结果来自
+10组交替顺序、每组80次的受控测试，中位数为`0.05209 ms / 2638.5 TFLOPS`；同一
+进程中的无padding版本为`0.05206 ms / 2640.3 TFLOPS`，说明零冲突padding没有引入
+可测性能回退。
 
 4-wave BF16 的分阶段结果：
 

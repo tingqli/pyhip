@@ -875,12 +875,15 @@ def compile_gemm_950(
 
     a_lds_size_half = TILE_M // 2 * TILE_K
     b_lds_size_half = TILE_N // 2 * TILE_K
-    use_4wave_lds_padding = num_waves == 4 and not is_fp8 and lds_padding
+    use_4wave_lds_padding = num_waves == 4 and lds_padding
     use_precomputed_dma_offsets = precompute_dma_offsets and use_4wave_lds_padding
     lds_padding_interval = 512
     lds_padding_elements = 16
 
     def padded_lds_size(logical_size):
+        if is_fp8:
+            assert logical_size % 2048 == 0
+            return logical_size + logical_size // 1024 * 16 + logical_size // 2048 * 32
         assert logical_size % lds_padding_interval == 0
         return logical_size + logical_size // lds_padding_interval * lds_padding_elements
 
@@ -999,21 +1002,34 @@ def compile_gemm_950(
 
         lds = fx.SharedAllocator().allocate(SharedStorage950).peek()
         if const_expr(use_4wave_lds_padding):
-            # Match asycn_copy_padding: grouped rows for DMA writes, transposed groups for MFMA reads.
-            a_lds_rows_per_group = TILE_M // 2 // 8
-            a_lds_write_layout = fx.make_layout(
-                ((8, TILE_M // 16), TILE_K),
-                ((TILE_K, 8 * TILE_K + lds_padding_elements), 1),
-            )
-            a_lds_read_layout = fx.make_layout(
-                ((a_lds_rows_per_group, 8), (32, TILE_K // 32)),
-                ((8 * TILE_K + lds_padding_elements, TILE_K), (1, 32)),
-            )
-            b_lds_storage_layout = fx.make_layout(b_lds_size_half, 1)
-            b_fragment_layout = fx.make_layout(
-                ((8, TILE_N // 16), TILE_K),
-                ((TILE_K, 8 * TILE_K + lds_padding_elements), 1),
-            )
+            if const_expr(is_fp8):
+                # a8w8 kWidth=32: [[1024, 16], [2048, 32]] dual padding.
+                a_lds_write_layout = fx.make_layout(
+                    ((8, 2, TILE_M // 32), TILE_K),
+                    ((TILE_K, 8 * TILE_K + 16, 2 * (8 * TILE_K + 16) + 32), 1),
+                )
+                a_lds_read_layout = fx.make_layout(
+                    ((2, TILE_M // 32, 8), (32, TILE_K // 32)),
+                    ((8 * TILE_K + 16, 2 * (8 * TILE_K + 16) + 32, TILE_K), (1, 32)),
+                )
+                b_lds_storage_layout = fx.make_layout(b_lds_size_half, 1)
+                b_fragment_layout = fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))
+            else:
+                # Match asycn_copy_padding: grouped rows for DMA writes, transposed groups for MFMA reads.
+                a_lds_rows_per_group = TILE_M // 2 // 8
+                a_lds_write_layout = fx.make_layout(
+                    ((8, TILE_M // 16), TILE_K),
+                    ((TILE_K, 8 * TILE_K + lds_padding_elements), 1),
+                )
+                a_lds_read_layout = fx.make_layout(
+                    ((a_lds_rows_per_group, 8), (32, TILE_K // 32)),
+                    ((8 * TILE_K + lds_padding_elements, TILE_K), (1, 32)),
+                )
+                b_lds_storage_layout = fx.make_layout(b_lds_size_half, 1)
+                b_fragment_layout = fx.make_layout(
+                    ((8, TILE_N // 16), TILE_K),
+                    ((TILE_K, 8 * TILE_K + lds_padding_elements), 1),
+                )
         else:
             a_lds_write_layout = fx.make_ordered_layout((TILE_M // 2, TILE_K), order=(1, 0))
             a_lds_read_layout = a_lds_write_layout
@@ -1161,20 +1177,28 @@ def compile_gemm_950(
             lane_id = tid % 64
             wave_id = tid // 64
             # B stays in host preshuffle order; consecutive lanes therefore read consecutive 16-byte vectors.
-            base_row = lane_id % 16 + wave_id % 2 * 16
-            base_k = lane_id // 16 * elements_per_128b
-            major_count = TILE_N // 2 // 32
-            stage_count = TILE_K // 32
+            if const_expr(is_fp8):
+                base_row = lane_id % 16 + wave_id % 2 * 16
+                base_k = lane_id // 16 * 32
+                major_count = TILE_N // 2 // 32
+                stage_count = 2
+            else:
+                base_row = lane_id % 16 + wave_id % 2 * 16
+                base_k = lane_id // 16 * elements_per_128b
+                major_count = TILE_N // 2 // 32
+                stage_count = TILE_K // 32
             assembled = fx.Vector.filled(
                 elements_per_128b * major_count * stage_count,
                 0,
-                fx.BFloat16,
+                element_type,
             ).ir_value()
             chunk_idx = 0
-            for stage in range_constexpr(stage_count):
-                for major in range_constexpr(major_count):
+            for outer in range_constexpr(stage_count if not is_fp8 else major_count):
+                for inner in range_constexpr(major_count if not is_fp8 else stage_count):
+                    stage = outer if const_expr(not is_fp8) else inner
+                    major = inner if const_expr(not is_fp8) else outer
                     row = base_row + major * 32
-                    k = base_k + stage * 32
+                    k = base_k + stage * (elements_per_128b if is_fp8 else 32)
                     elem_offset = (
                         row // 16 * 16 * TILE_K
                         + k // preshuffle_k * 16 * preshuffle_k
@@ -1184,16 +1208,26 @@ def compile_gemm_950(
                     )
                     ptr = fx.buffer_ops.get_element_ptr(
                         base_ptr,
-                        byte_offset=elem_offset * 2,
+                        byte_offset=elem_offset * element_bytes,
                         elem_type=T.i8,
                     )
-                    loaded = llvm.LoadOp(
-                        T.vec(elements_per_128b, T.bf16),
-                        ptr,
-                        alignment=16,
-                        alias_scopes=alias_scopes,
-                        noalias_scopes=async_noalias,
-                    ).result
+                    if const_expr(is_fp8):
+                        loaded_i32 = llvm.LoadOp(
+                            T.vec(4, T.i32),
+                            ptr,
+                            alignment=16,
+                            alias_scopes=alias_scopes,
+                            noalias_scopes=async_noalias,
+                        ).result
+                        loaded = Vec(loaded_i32).bitcast(element_type).ir_value()
+                    else:
+                        loaded = llvm.LoadOp(
+                            T.vec(elements_per_128b, element_type.ir_type),
+                            ptr,
+                            alignment=16,
+                            alias_scopes=alias_scopes,
+                            noalias_scopes=async_noalias,
+                        ).result
                     assembled = vector.insert_strided_slice(
                         loaded,
                         assembled,
@@ -1331,18 +1365,16 @@ def compile_gemm_950(
                 )
 
         def copy_a_gmem_to_lds(rsrc, src, dst, row_base, src_base, k_tile):
-            if const_expr(is_fp8):
-                fx.copy(async_copy_atom, src, dst)
-            else:
+            if const_expr(use_4wave_lds_padding):
                 copy_bf16_gmem_to_lds(rsrc, dst, row_base, src_base, k_tile, False)
+            else:
+                fx.copy(async_copy_atom, src, dst)
 
         def copy_b_gmem_to_lds(rsrc, src, dst, root, row_base, src_base, k_tile):
-            if const_expr(is_fp8):
-                fx.copy(async_copy_atom, src, dst)
-            elif const_expr(use_4wave_lds_padding):
+            if const_expr(use_4wave_lds_padding):
                 copy_bf16_gmem_to_lds(rsrc, root, row_base, src_base, k_tile, True)
             else:
-                copy_bf16_gmem_to_lds(rsrc, dst, row_base, src_base, k_tile, True)
+                fx.copy(async_copy_atom, src, dst)
 
         def copy_lds_to_frag(src, dst, scope_name):
             if const_expr(is_fp8):
@@ -1351,7 +1383,7 @@ def compile_gemm_950(
                 copy_lds_to_bf16_frag(src, dst, scope_name)
 
         def copy_b_lds_to_frag(src, root, dst, scope_name):
-            if const_expr(is_fp8):
+            if const_expr(is_fp8 and not use_4wave_lds_padding):
                 fx.copy(lds_copy_atom, src, dst)
             elif const_expr(use_4wave_lds_padding):
                 copy_contiguous_b_lds_to_frag(root, dst, scope_name)
@@ -1675,7 +1707,7 @@ def compile_gemm_950(
             gemm_bf16_agpr(c_br_frag, br_frag, ab_frag)
         hot_loop_scheduler(0, 0, 7)
 
-        if const_expr(not is_fp8 and permlane_epilogue):
+        if const_expr(permlane_epilogue):
             pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
             lane_id = tid % 64
             wave_id = tid // 64
