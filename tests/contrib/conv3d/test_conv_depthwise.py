@@ -85,7 +85,10 @@ def test_conv3d_benchmark(args):
     stride = (1, 1, 1)
     dilation = (1, 1, 1)
 
-    input_dtype = torch.bfloat16 # or torch.float16
+    input_dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }[args.dtype]
     #input_dtype = torch.float32
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -165,10 +168,11 @@ def test_conv3d_benchmark(args):
     )
     # 3. 汇总对比
     print(f"\n--- 性能对比汇总 ({args.shape}) ---")
-    hdr = f"{'方法':<35} | {'平均耗时 (ms)':<15} | {'吞吐量 (TFLOPS)':<15} | {'带宽 (GB/s)':<15} | {'预热/Tune (ms)':<15}"
+    method_width = 44
+    hdr = f"{'方法':<{method_width}} | {'平均耗时 (ms)':<15} | {'吞吐量 (TFLOPS)':<15} | {'带宽 (GB/s)':<15} | {'预热/Tune (ms)':<15}"
     print(hdr)
     print("-" * len(hdr))
-    print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_gbps:>15.2f} | {torch_warmup_ms:>15.2f}")
+    print(f"{'Standard PyTorch Conv3d':<{method_width}} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_gbps:>15.2f} | {torch_warmup_ms:>15.2f}")
 
     run_conv = run_torch_conv3d
     if args.shape == "case3":
@@ -199,12 +203,13 @@ def test_conv3d_benchmark(args):
             check()
 
         opt_ms, opt_tflops, opt_warmup_ms, opt_gbps = benchmark_op(
-            run_conv, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device, mem_bytes
+            run_conv, f"PyHIP depthwise Conv3d ({args.depthwise_hip})", args.iters, gflops, device, mem_bytes
         )
         print(hdr)
-        print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_gbps:>15.2f} | {torch_warmup_ms:>15.2f}")
+        print(f"{'Standard PyTorch Conv3d':<{method_width}} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_gbps:>15.2f} | {torch_warmup_ms:>15.2f}")
+        run_conv_label = f"{run_conv.__name__} ({args.depthwise_hip})"
         print(
-            f"{run_conv.__name__:<35} | {opt_ms:>15.4f} | {opt_tflops:>15.2f} | {opt_gbps:>15.2f} | {opt_warmup_ms:>15.2f} | max_diff={all_diff:.6f}"
+            f"{run_conv_label:<{method_width}} | {opt_ms:>15.4f} | {opt_tflops:>15.2f} | {opt_gbps:>15.2f} | {opt_warmup_ms:>15.2f} | max_diff={all_diff:.6f}"
         )
 
 
@@ -232,8 +237,11 @@ if __name__ == "__main__":
     parser.add_argument("--profile", action="store_true", help="是否启用 profile")
     parser.add_argument("--shape", type=str, default="case3", choices=["case1", "case2", "case3", "case4"], 
                         help="选择测试的 shape 选项: case1 ([1, 64, 63, 45, 80]), case2 ([1, 512, 61, 45, 80]), case3 ([1, 512, 61, 45, 80], groups=512), case4 ([1, 2048, 61, 45, 80], groups=4)")
-    parser.add_argument("--depthwise-hip", type=str, default="sgb", choices=["sgb", "original"],
-                        help="case3 HIP: sgb=conv_depthwise3d_hip_sgb.cpp, original=conv_depthwise3d_hip.cpp")
+    parser.add_argument("--depthwise-hip", type=str, default="auto",
+                        choices=["auto", "packed", "sgb", "original"],
+                        help="case3 HIP backend; auto selects packed on supported gfx950 shapes")
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"],
+                        help="input, weight, bias, and output data type")
     args = parser.parse_args()
     
     test_conv3d_benchmark(args)
