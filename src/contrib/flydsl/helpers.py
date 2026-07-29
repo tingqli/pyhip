@@ -515,7 +515,10 @@ class FlyObjCache:
         return self.load_tiled_mma_frag(mm, src, slice_coord, dst, "C", copy_atom_bits)
 
     def store_tiled_mma_fragC(self, mm, frag, dst, copy_atom_bits=128):
-        copy_atom = self.get_universal_copy_atom(frag.dtype, copy_atom_bits)
+        if fx.const_expr(dst.address_space == TargetAddressSpace.BufferDesc):
+            copy_atom = self.get_buffer_copy_atom(frag.dtype, copy_atom_bits)
+        else:
+            copy_atom = self.get_universal_copy_atom(frag.dtype, copy_atom_bits)
         tcopy = self.get_tiled_mma_copy(copy_atom, mm, "C")
         fx.copy(
             copy_atom, self.get_retile(tcopy, frag), self.get_partition_D(tcopy, dst)

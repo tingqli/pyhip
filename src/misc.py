@@ -85,29 +85,30 @@ class torchPerf(object):
     def __init__(self, dir = ""):
         global torch
         import torch
-        import os        
+        import os
         self.TP_DIR = os.getenv("TORCH_PERF_DIR", dir)
-        if self.TP_DIR != "":
-            self.profiler = torch.profiler.profile(
-                        activities=[
-                            torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.CUDA,
-                        ],
-                        with_stack=True,
-                        on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                        self.TP_DIR, use_gzip=True))
-        else:
-            self.profiler = None
+        profiler_args = {
+            "activities": [
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            "with_stack": True,
+        }
+        if isinstance(self.TP_DIR, str):
+            profiler_args["on_trace_ready"] = torch.profiler.tensorboard_trace_handler(
+                self.TP_DIR, use_gzip=True
+            )
+        self.profiler = torch.profiler.profile(**profiler_args)
+        
 
     def __enter__(self):
-        if self.profiler is not None:
-            self.profiler.start()
+        self.profiler.start()
         return self
 
     def __exit__(self, type, value, traceback):
-        if self.profiler is not None:
-            self.profiler.stop()
-            print(self.profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+        self.profiler.stop()
+        print(self.profiler.key_averages().table(sort_by="self_cuda_time_total",
+                                                 row_limit=self.TP_DIR if isinstance(self.TP_DIR, int) else 20))
 
 # type-less preshuffle
 def pre_shuffle(x, mfma_MN):
@@ -129,7 +130,7 @@ def pre_shuffle(x, mfma_MN):
 # https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/testing/numeric.py#L5
 def calc_diff(x: "torch.Tensor", y: "torch.Tensor", diff_thr=None):
     def get_diff(x, y):
-        x, y = x.double(), y.double()
+        #x, y = x.double(), y.double()
         denominator = (x * x + y * y).sum()
         if denominator == 0:    # Which means that all elements in x and y are 0
             return 0.0
@@ -312,10 +313,13 @@ def allclose(a, b, atol=1e-5, rtol=1e-5):
         return True
     else:
         print(f"\033[31m allcose({a.shape}_{a.dtype}, {b.shape}_{b.dtype}, {atol=}, {rtol=}) failed with {diff=}. \033[0m")
+        cnt = 0
         for i in range(num_failed):
             coord = tuple(dim[i].item() for dim in failed_indices)
             abs_diff = torch.abs(a[coord]-b[coord])
             rel_diff = abs_diff / max(torch.abs(a[coord]), torch.abs(b[coord]), torch.tensor(1e-12, device=a.device))
             if rel_diff > rtol:
                 print(f"\033[31m {i}/{num_failed}  {coord}: a={a[coord]}, b={b[coord]}, abs_diff={abs_diff}, rel_diff={rel_diff} \033[0m")
+                cnt += 1
+                assert cnt < 8
         return False
