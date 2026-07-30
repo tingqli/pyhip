@@ -485,7 +485,7 @@
   },
   "all_vgpr_ablation": {
     "measured_on": "2026-07-29",
-    "source": "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
+    "source": "tests/flydsl/attn_4wave/isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
     "transformation": "mechanically rename a0:a63 to unused v156:v219 and change resource metadata from 156 VGPR + 64 AGPR to 220 VGPR + 0 AGPR; preserve all executable instructions and ordering",
     "resources_before": "156 VGPR + 64 AGPR, 2 waves/SIMD, zero spill",
     "resources_after": "220 VGPR + 0 AGPR, 2 waves/SIMD, zero spill",
@@ -665,7 +665,7 @@
     "entry": "ATTN_FLY_BACKEND=compare_inline",
     "oracle_compare_entry": "ATTN_FLY_BACKEND=compare_inline_oracle",
     "source": {
-      "archive": "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
+      "archive": "tests/flydsl/attn_4wave/isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
       "sha256": "18e3fe8e48e9eaa2bc62ba6ac82e7f41c5019e216b6638c0bd8decb452139c3b",
       "transforms": ["map 64 AGPR operands to v156:v219", "use Fly tensor ABI", "replace block/head pointer arithmetic with four Fly-computed base pointers"]
     },
@@ -823,7 +823,63 @@
       "slow_slot_phase_delta_cycles": {"phase32": -182.339, "phase96": -177.315, "phase34": 86.427, "phase42": 76.205, "phase106": 124.341, "phase108": 43.776},
       "conclusion": "late-scale shortens the average single wave but accelerates only slot0; slot1 reaches the next GEMM1 before K LDS inputs are ready. Progressive K waits replace the removed softmax latency, increase outside-shadow no-issue, and determine physical SIMD completion time"
     },
-    "conclusion": "v_pk instructions and the defer_all occupancy drop are major causes of the regressions; pure inline scalar FMA removes the target packed arithmetic, but both deferred-reduction schedules remain approximately 2% slower than base, so base stays the default"
+    "periodic_setprio_rephase": {
+      "measured_on": "2026-07-30",
+      "entry": "ATTN_FLY_SUM_REDUCE=defer_all_inline_late_scale ATTN_FLY_SUM_SETPRIO_EVENTS=56:0,88:2",
+      "method": "same Fly final ISA plus two periodic post-ISA s_setprio instructions; 10 rotating buffers; C-X-X-C; 0.5% adjacent-control drift filter",
+      "coarse_scan": {
+        "start_phases": [88, 96, 104],
+        "end_phases": [40, 48, 56],
+        "first_window": {"events": "48:0,96:2", "valid_pairs": 14, "total_pairs": 16, "speedup_percent": 1.08},
+        "best": {"events": "56:0,88:2", "valid_pairs": 8, "total_pairs": 8, "speedup_percent": 4.88}
+      },
+      "fine_scan": {
+        "start_phases": [84, 88, 92],
+        "end_phases": [52, 56, 60],
+        "priority_levels_tested": [1, 2, 3],
+        "conclusion": "end 56 is a sharp optimum; start 88 is locally flat; priority levels 1/2/3 are similar",
+        "retained_events": "56:0,88:2"
+      },
+      "strict_performance": {
+        "vs_full_late": {"valid_pairs": 21, "total_pairs": 24, "speedup_percent": 4.92},
+        "vs_high_level_base_first": {"speedup_percent": 1.96},
+        "vs_high_level_base_cross_gpu": {"rounds": 32, "speedup_percent": 1.93},
+        "fast_state": {"base_tflops": 194.8, "candidate_tflops": 198.5, "speedup_percent": 1.90},
+        "correctness": "rel_l2 approximately 0.00317-0.00319"
+      },
+      "isa": {"mfma_count": 128, "setprio_count": 2, "vgpr": 248, "scratch_bytes_per_lane": 0},
+      "att": {
+        "control_dispatch": "ui_output_agent_12344_dispatch_86",
+        "candidate_dispatch": "ui_output_agent_12344_dispatch_88",
+        "physical_simds": 16,
+        "control_pc_rows": 997,
+        "candidate_pc_rows": 999,
+        "slot_cycles_per_tile": {
+          "control": {"slot0": 2360.286, "slot1": 3337.090, "completion_skew": 976.867, "active_overlap": 2360.223, "physical_makespan": 1668.576},
+          "candidate": {"slot0": 3004.311, "slot1": 3012.050, "completion_skew": 7.802, "active_overlap": 3004.248, "physical_makespan": 1506.056},
+          "delta": {"slot0": 644.025, "slot1": -325.040, "completion_skew": -969.065, "active_overlap": 644.025, "physical_makespan": -162.520}
+        },
+        "slow_slot_phase_cycles": {
+          "control": {"phase34": 104.446, "phase42": 218.590, "phase96": 1295.955, "phase106": 254.539, "phase108": 82.439},
+          "candidate": {"phase34": 21.521, "phase42": 166.388, "phase96": 1046.238, "phase106": 140.011, "phase108": 44.204}
+        },
+        "note": "ATT instrumentation perturbs absolute wall time; use ATT only for slot/phase structure and strict uninstrumented C-X-X-C for performance"
+      },
+      "fill_window_ablation": {
+        "v_load_variants": 7,
+        "result": "rejected by bitwise comparison before performance",
+        "root_cause": "the destination VGPR remains live as an intermediate MFMA input or accumulator"
+      },
+      "k_read_ablation": {
+        "variants": ["first_d1", "first_d2", "first_d4", "second_d1", "second_d2", "second_d4", "both_d1", "both_d2", "both_d4"],
+        "invariants": "128 MFMA, 2 s_setprio, 24 K ds_read, unchanged relative read order and wait count; bitwise equal output",
+        "speedup_percent_range": [-1.55, -0.27],
+        "status": "all rejected",
+        "conclusion": "the existing MFMA-DSRD interleave outperforms mechanically increasing K-read maturity distance"
+      },
+      "status": "retained as an experimental post-ISA path; does not replace the high-level base default"
+    },
+    "conclusion": "packed arithmetic and occupancy explain the initial deferred-sum regressions. A two-instruction periodic priority window can rephase the full-late path and exceed the high-level base by about 1.9%, while additional V-load filling is illegal and legal K-read prefetch moves regress"
   },
   "flydsl_p0_interleave_ablation": {
     "measured_on": "2026-07-29",
@@ -1003,7 +1059,7 @@
     {
       "name": "DPP wave_rol column max/add reduction",
       "correct": true,
-      "probe": "tests/core/test_dpp_column_reduce.py",
+      "probe": "tests/flydsl/attn_4wave/test_dpp_column_reduce.py",
       "ds_control_time_us": [4490.1, 4493.5],
       "ds_control_tflops": [191.2, 191.3],
       "dpp_time_us": 7493.7,
@@ -1015,7 +1071,7 @@
     {
       "name": "three wave_shr max steps followed by readlane",
       "correct": false,
-      "probe": "tests/core/test_dpp_column_reduce.py::test_three_wave_shr_then_readlane",
+      "probe": "tests/flydsl/attn_4wave/test_dpp_column_reduce.py::test_three_wave_shr_then_readlane",
       "lane_encoding": "100 * row + column",
       "lane20_stages": [104, 104, 104],
       "lane20_required_column_max": 304,
@@ -1264,7 +1320,7 @@
         "current_machine_code_check": "955 executable instructions equal to the archived 237.1T ISA after normalizing compiler-generated exec-mask label numbers",
         "code_object_sha256": "be9667e16e8ececfd339af68fcc88e09da240004488ee959a1d63c40e07339d8",
         "assembly_sha256": "18e3fe8e48e9eaa2bc62ba6ac82e7f41c5019e216b6638c0bd8decb452139c3b",
-        "archived_assembly": "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
+        "archived_assembly": "tests/flydsl/attn_4wave/isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
         "archived_assembly_sha256": "18e3fe8e48e9eaa2bc62ba6ac82e7f41c5019e216b6638c0bd8decb452139c3b",
         "archived_code_object_sha256": "be9667e16e8ececfd339af68fcc88e09da240004488ee959a1d63c40e07339d8"
       },

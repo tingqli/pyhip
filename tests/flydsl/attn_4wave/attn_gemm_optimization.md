@@ -1,6 +1,6 @@
 # 融合 Attention 双 GEMM 优化记录(FlyDSL, bf16, gfx942/MI3xx)
 
-对应脚本:[`tests/flydsl/test_attn_gemm.py`](../tests/flydsl/test_attn_gemm.py)
+对应脚本:[`test_attn_gemm.py`](../test_attn_gemm.py)
 
 ## 1. 问题定义
 
@@ -669,7 +669,7 @@ gfx942 不提供 `SQ_VALU_MFMA_COEXEC_CYCLES`;LLVM gfx94x 将 TRANS(`v_exp_f32`/
 add/mul 标为 never-coissue。该调度模型标记不等于组合时间必然是两条指令之和:正式微基准测得
 MFMA+EXP约20.056 cycle,相对完全串行的32.026 cycle仍有74.8% overlap。packed FP32的gap0实验则确有
 额外阻塞;普通`v_add_f32`/`v_perm_b32`无额外penalty。完整定义、方法与脚本见
-[`docs/mfma-valu-coissue.md`](mfma-valu-coissue.md)。因此 ATT 的 13.29% 是 issue 时间线 overlap 指标,
+[`mfma-valu-coissue.md`](mfma-valu-coissue.md)。因此 ATT 的 13.29% 是 issue 时间线 overlap 指标,
 不能替代缺失的硬件 co-exec counter。
 
 ### co-issue 调度实验(均已回退)
@@ -1142,7 +1142,7 @@ gfx1200+/gfx1250+。因此gfx942无法直接建立两套互不锁步的4-wave子
 
 ### 实现
 
-[`tests/core/test_attn_gemm_jit.py`](../tests/core/test_attn_gemm_jit.py)改为与Fly生产kernel相同的4-wave结构：
+[`test_attn_gemm_jit.py`](test_attn_gemm_jit.py)改为与Fly生产kernel相同的4-wave结构：
 
 - 固定`D=128,BM=128,BN=32`,一个256-thread workgroup包含4 waves,每wave负责32行query;
 - 每wave内部有两个独立16行`mt`,寄存器状态为`score[2,2,4]`、`P_bf16[2,2,2]`和
@@ -1333,7 +1333,7 @@ grid关键路径使用同一个`4 task/CU`,不再需要finite-grid修正。
 
 旧FMA/MAX3/packed约5-cycle值来自8-byte VOP3/VOP3P从$PC\bmod8=4$开始时每条跨界的对齐罚时。
 正式结果提高到1M指令,并为每opcode选择不跨8-byte边界的hot-loop对齐;完整方法见
-[`docs/mfma-valu-coissue.md`](mfma-valu-coissue.md)。
+[`mfma-valu-coissue.md`](mfma-valu-coissue.md)。
 当前生产JIT每pair的实际机器码并非统一对齐:40条FMA中20条跨界、12条MAX3中6条跨界;
 条件64条packed MUL中32条跨界。理论上限采用canonical 4-cycle值,实际混合对齐成本归入实测残差。
 
@@ -1565,7 +1565,7 @@ Fly residual vs perfect            =   622,878 cycle/task = 486.6 cycle/tile
 
 不能直接累加`code.json`中的stall列。该列对每条wave分别统计,本次得到165,775,440 total cycles和
 92,161,124 stall cycles;两个resident wave在同一物理SIMD周期同时等待时会被重复计费。这里改用
-[`analyze-attn-att-cycle-ledger.py`](../archive/gemm/analyze-attn-att-cycle-ledger.py)按物理SIMD去重：
+[`analyze-attn-att-cycle-ledger.py`](tools/analyze-attn-att-cycle-ledger.py)按物理SIMD去重：
 
 1. 将同一物理SIMD上所有wave的$[issue,issue+4)$区间求并集;
 2. 并集之间的gap才计为物理no-issue cycle;
@@ -1691,7 +1691,7 @@ active wave仍阻塞在该PC,并非完整模型漏算了MFMA/EXP的静态issue�
 
 图中所有横条使用同一个$0$--$1606.166$ cycle/tile坐标轴。彩色段表示聚合时间预算,用于比较规模,
 不表示这些阶段按图中顺序连续执行。图由
-[`render-attn-cycle-axis.py`](../archive/gemm/render-attn-cycle-axis.py)直接读取ATT账本JSON生成。
+[`render-attn-cycle-axis.py`](tools/render-attn-cycle-axis.py)直接读取ATT账本JSON生成。
 图下半部用$t=100$发射MFMA的具体时间片解释hidden/MFMA-only/no-issue/alias,并用双resident-wave
 同时阻塞示例说明no-issue cycle如何按PC等分归因。
 该图对应本轮优化前的`7/4/5`连续K写基线（188.1T）;方法1/4实施后的before/after结果见§22.9。
@@ -1965,7 +1965,7 @@ $$
 同一个query列需要合并`{q,q+16,q+32,q+48}`。`row_shl/row_ror`只在16-lane row内,会改变$Mq$,
 不能直接使用。`wave_rol:1`可跨整个wave,但gfx942每条只移动1 lane,所以必须连续rotate 16、32、48步。
 
-新增[`test_dpp_column_reduce.py`](../tests/core/test_dpp_column_reduce.py)验证：
+新增[`test_dpp_column_reduce.py`](test_dpp_column_reduce.py)验证：
 
 ```text
 wave_rol:1 × 16 -> source lane (lane + 16) mod 64
@@ -2024,7 +2024,7 @@ readlane(z,63) = 315
 原因是三次`wave_shr:1`累计覆盖的是相邻lane窗口`{lane,lane-1,lane-2,lane-3}`,而不是当前布局所需的
 `{q,q+16,q+32,q+48}`。`v_readlane_b32`又只把一个指定lane读到SGPR;广播后全wave都是315,无法同时保留
 16个query列各自不同的max。因此该短方案在当前MFMA fragment布局下正确性不成立,没有接入生产attention计时。
-实测probe保留在[`test_dpp_column_reduce.py`](../tests/core/test_dpp_column_reduce.py)。
+实测probe保留在[`test_dpp_column_reduce.py`](test_dpp_column_reduce.py)。
 
 ### 22.11 三路DS fanout：200.3T
 
@@ -2457,12 +2457,12 @@ shadow no-issue -2.739 cycle/tile,与墙钟收益方向一致。
   16 VGPR/16 ADD,同样约203T。
 
 最终源码hash为`92c26d1ed86807aa12700c6cab66f542fdb24fe9eeb824ac9c06988bb054787e`,
-汇编归档为`archive/gemm/attn-gemm-jit-gfx942-m40960-n40960-208p8t.s`。随机40960
+汇编归档为`tests/flydsl/attn_4wave/isa/attn-gemm-jit-gfx942-m40960-n40960-208p8t.s`。随机40960
 `rel_l2=0.00319`,资源仍156 VGPR+64 AGPR、34 SGPR、16KB LDS、2 waves/SIMD、零spill。
 
 ### 22.19 208.8T热循环逐MFMA窗口指令账本
 
-本节以`archive/gemm/attn-gemm-jit-gfx942-m40960-n40960-208p8t.s`中的第一个偶KV tile为准,
+本节以`tests/flydsl/attn_4wave/isa/attn-gemm-jit-gfx942-m40960-n40960-208p8t.s`中的第一个偶KV tile为准,
 统计范围从该tile首条V load到最后一条GEMM2 mt1 MFMA。单位均为**单wave、单BN=32 KV tile**。
 窗口$i$表示MFMA $i$发射后、MFMA $i+1$发射前的静态指令。静态相邻不等于全部能被一个12-cycle
 MFMA shadow隐藏；特别是连续9条EXP的窗口明显跨越多个issue周期。
@@ -3195,7 +3195,7 @@ K wait/barrier + GEMM2 mt1 + next-K LDS read（normal priority）
 指令在归一化编译器自动exec-mask标签编号后，与下述237.1T归档逐条一致；harness改动没有改变kernel机器码。
 
 清理后当前源码生成的最终汇编归档为
-`archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s`，SHA256
+`tests/flydsl/attn_4wave/isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s`，SHA256
 `18e3fe8e48e9eaa2bc62ba6ac82e7f41c5019e216b6638c0bd8decb452139c3b`；可独立组装，code object SHA256
 `be9667e16e8ececfd339af68fcc88e09da240004488ee959a1d63c40e07339d8`。
 
@@ -3565,7 +3565,7 @@ max仍在log2域，先归约raw score，再用一条scalar inline FMA缩放标�
 
 图中每条横条按共享cycle轴展示一个slot的主要动态功能；紫色段同时包含max/DS归约、EXP、running-sum FMA、
 BF16 pack、future-K load和K LDS write。下方卡片给出各功能段的主要ISA，红框和括号标出决定吞吐的late-scale
-slot1及其扩大后的完成时间差。图由`archive/gemm/render-attn-slot-functions.py`从结构化ATT数据生成。
+slot1及其扩大后的完成时间差。图由`tools/render-attn-slot-functions.py`从结构化ATT数据生成。
 
 物理时间线与严格性能方向闭合：
 
@@ -3606,6 +3606,74 @@ phase扫描解释了slot1为何变慢。late-scale把两个主要softmax间隔ph
 时间，且寄存器分配/全局排程让慢resident slot更早撞上progressive K wait。后续若继续该方向，应调整
 `barrier -> K ds_read -> next GEMM1`距离，或把有用的独立工作放入phase34/42/106/108等待窗；不能只继续
 前移/缩短scale+EXP，也不应以NOP恢复距离。默认继续保留base。
+
+### 22.30 full-late上的周期setprio反相与K-read填窗反证
+
+§22.29表明`defer_all_inline_late_scale`的单wave平均更短，但slot0/slot1严重失衡，慢slot在下一轮GEMM1
+progressive K消费点暴露LDS延迟。本轮不再继续压缩scale/EXP，而是分别验证：
+
+1. 只在最终ISA增加两条周期性`s_setprio`，不改变LLVM codegen、MFMA/VMEM/LDS/wait顺序；
+2. 将已有独立工作放入phase34/42/106/108，或合法提前K `ds_read_b128`增加成熟距离；不插NOP。
+
+#### 周期priority窗口扫描
+
+`ATTN_FLY_SUM_SETPRIO_EVENTS`以128条MFMA为周期，把同一full-late最终ISA交给严格post-ISA插入器。事件
+`end:0,start:priority`表示源码顺序中先在`end`降到normal，随后在`start`升权；由于周期回边，实际高优先级
+窗口是`start -> 128 -> 0 -> end`。所有候选保持128 MFMA、原VMEM/LDS/wait和248V、零scratch，只增加两条
+`s_setprio`。
+
+首个跨回边窗口`48:0,96:2`为14/16有效，full-late约188.9T→191.0T，严格提升1.08%，证明priority可以
+修复ATT发现的slot失衡。粗扫`start=88/96/104 × end=40/48/56`后，`56:0,88:2`达到8/8有效、约+4.88%；
+换GPU长测21/24有效，严格提升约4.92%。细扫`start=84/88/92 × end=52/56/60`确认end=56是尖峰，
+start=88附近较平；priority 1/2/3结果接近，最终保留priority 2作为复现事件。
+
+最佳窗口相对高层base也转正：首次严格配对约+1.96%；32轮跨GPU复测约+1.93%，fast-state从
+194.8T提升到198.5T（+1.90%）。当前8卡重新被外部作业占满，因此不使用受干扰的绝对值更新该结论；
+性能采用上述已完成的0.5% control漂移`C-X-X-C`结果。该路径仍是实验入口，不替换高层base默认值。
+
+复现命令：
+
+```bash
+cd tests/flydsl
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 \
+  ATTN_FLY_SUM_REDUCE=defer_all_inline_late_scale \
+  ATTN_FLY_SUM_SETPRIO_EVENTS=56:0,88:2 ATTN_FLY_PAIR_COUNT=24 \
+  ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+```
+
+#### ATT：slot完成差从976.9降到7.8 cycles/tile
+
+保存的单dispatch ATT中，dispatch 86是997个PC、无`s_setprio`的full-late control；dispatch 88是999个PC、
+仅增加两条`s_setprio`的最佳候选。两份trace均覆盖16个物理`SE+SM+CU`组、每组slot0/slot1首批两条wave。
+ATT插桩显著扰动绝对墙钟，因此只用于相位/阻塞结构，性能结论仍以上述无ATT严格A/B为准。
+
+| 首批resident slot（cycles/tile） | full-late control | `56:0,88:2` | 变化 |
+|---|---:|---:|---:|
+| slot0 duration | 2360.286 | 3004.311 | +644.025 |
+| slot1 duration | 3337.090 | 3012.050 | **-325.040** |
+| slot完成时间差 | 976.867 | **7.802** | **-969.065** |
+| 两slot共同活跃区 | 2360.223 | 3004.248 | +644.025 |
+| 双任务物理makespan | 1668.576 | 1506.056 | **-162.520** |
+
+priority没有让两条wave都更快，而是有意放慢原快slot0、加速决定吞吐的slot1，使二者几乎同时完成。这正是
+“反相”的目标：物理SIMD不再被一条极慢wave拖尾。慢slot原先最严重的K-ready点也显著收缩：phase34
+`104.446→21.521`、phase42 `218.590→166.388`、phase96 `1295.955→1046.238`、phase106
+`254.539→140.011`、phase108 `82.439→44.204 cycles`。priority窗口边界自身没有形成新热点。
+
+#### 有效工作填窗与K-read前移
+
+随后尝试把phase35后的V `buffer_load_dwordx4`前移到phase34/42/106/108。首个`fill34`即不再与setprio
+control逐元素相同：load目标VGPR仍被中间MFMA作为输入/累加器使用，提前会覆盖活值。因此7个V-load
+填窗变体在live-range/逐元素检查阶段否决，不能称为独立工作。
+
+K LDS读的live-range审计显示前3条读受BF16 pack/GEMM2活值约束，后5条可合法提前。构造9个候选：
+第一组、第二组、两组对称分别提前1/2/4个phase。所有候选均保留128 MFMA、2条setprio、24条K ds-read、
+原相对顺序和wait数量，输出与最佳setprio control逐元素完全相同；严格A/B却全部回退`0.27%--1.55%`。
+结论是当前`MFMA -> DSRD -> MFMA`交织优于批量增加成熟距离；更早发读会改变LDS请求年龄、MFMA/DS管线竞争
+和两slot相位。pair-loop也没有剩余、目标VGPR已死亡且不会改变请求顺序的独立SALU/VALU可安全搬入这四个窗。
+
+最终保留`56:0,88:2`实验入口；不保留V-load填窗或K-read前移ISA。下一步若继续，应围绕该已平衡slot的
+post-setprio ATT重新寻找工作，而不是依据无priority control的phase34/42/106/108空洞机械搬指令。
 
 ## 23. 全部优化思路、决策与最终性能
 
@@ -3697,6 +3765,9 @@ phase扫描解释了slot1为何变慢。late-scale把两个主要softmax间隔ph
 | 完整后移sum + 逐元素inline FMA | 246V；目标packed恢复到base数量，38 scalar FMA | 191.1T；相对packed版+33.02% | **失败但保留实验入口** | 恢复2 waves仍比base慢1.96% |
 | shuffle-inline late-scale | 删除16 packed scale+32 SUB，新增36 scalar FMA；234V | 189.8--190.1T；相对control **+0.29--0.30%** | **局部有效，不设默认** | 两个resident slot都缩短，但仍比base慢2.24% |
 | full-inline late-scale | 同指令替换；248V | 189.4T fast态；相对control **-0.83--0.84%** | **失败** | ATT显示slot0快116.7，但慢slot1慢28.1；shadow外no-issue +24.1 cycles/tile，K LDS延迟在phase34/42/106/108暴露 |
+| full-late + 周期setprio | 248V；128 MFMA与原wait不变，仅增`56:0,88:2`两条priority | 相对full-late **+4.92%**；相对base约**+1.93%**；fast 198.5T | **实验采纳** | slot完成差976.9→7.8 cycles/tile，跨回边反相修复慢slot |
+| setprio后V-load填phase窗 | 7个phase34/42/106/108变体 | 未进入性能长测 | **正确性失败** | 目标VGPR仍被中间MFMA使用，前移会覆盖活值 |
+| setprio后K-read前移 | first/second/both × 提前1/2/4 phase，共9个逐元素一致变体 | 全部回退0.27%--1.55% | **失败** | 更长名义距离破坏DS/MFMA交织、请求年龄和slot相位 |
 
 ### 23.5 专项失败、中性结果与待验证索引
 
@@ -3757,8 +3828,10 @@ phase扫描解释了slot1为何变慢。late-scale把两个主要softmax间隔ph
 | 完整JIT主流程inline | `ATTN_FLY_BACKEND=jit_body_inline` | 3633.1us | **236.4T** | 220V/34S/0A | `rel_l2≈0.00319` | Fly外壳+JIT body，仅验证 |
 | shuffle-inline late-scale | `ATTN_FLY_SUM_REDUCE=defer_shuffle_inline_late_scale` | 约4525us | **约189.8--190.1T** | 234V | `rel_l2≈0.00319` | 相对自身control小幅转正，仍不替代base |
 | full-inline late-scale | `ATTN_FLY_SUM_REDUCE=defer_all_inline_late_scale` | 约4535us（fast态） | **约189.4T** | 248V | `rel_l2≈0.00319` | ATT闭合回退，否决 |
+| full-late + setprio反相 | 上项 + `ATTN_FLY_SUM_SETPRIO_EVENTS=56:0,88:2` | fast态约4328us | **约198.5T** | 248V、2 periodic priority | `rel_l2≈0.00317--0.00319` | 实验路径；相对full-late +4.92%，相对高层base +1.9% |
 
-最终结论：高层FlyDSL当前稳定在约194.6T，严格Fly最终ISA后处理达到205.2T；生产JIT为208.8T，
+最终结论：高层FlyDSL默认路径稳定在约194.6T；full-late+周期setprio实验路径达到约198.5T；严格Fly最终ISA
+后处理达到205.2T；生产JIT为208.8T，
 单窗口`setprio_best`达到237.1T。JIT oracle与完整body inline都约236T，证明差距来自高层Fly生成的机器调度，
 不是Fly ABI、A/V寄存器类别或launch外壳。后续原生Fly优化必须同时缩短单wave依赖并保持两resident slot平衡，
 以ATT中的physical wall和shadow外no-issue为验收指标；仅减少静态指令、wait数量或局部长团长度不足以判定收益。

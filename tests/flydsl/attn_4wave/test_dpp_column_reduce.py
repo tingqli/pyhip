@@ -1,6 +1,7 @@
-import pyhip
 import torch
 from typing import Any, cast
+
+from pyhip.core.asmjit import jit
 
 INT_POINTER = "int*"
 
@@ -19,7 +20,7 @@ def _rotate_wave(J, value, steps, wait_states):
 
 
 def test_wave_rol_column_reduce():
-    @pyhip.jit()  # pyright: ignore[reportAttributeAccessIssue]
+    @jit()
     def kernel(
         J,
         output: INT_POINTER,  # pyright: ignore[reportInvalidTypeForm]
@@ -70,7 +71,7 @@ def test_wave_rol_column_reduce():
 
 
 def _run_three_wave_shr_then_readlane():
-    @pyhip.jit()  # pyright: ignore[reportAttributeAccessIssue]
+    @jit()
     def kernel(
         J,
         output: INT_POINTER,  # pyright: ignore[reportInvalidTypeForm]

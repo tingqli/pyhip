@@ -17,7 +17,8 @@ from typing import Any, cast
 
 import torch
 
-import pyhip
+from pyhip.core.asmjit import JIT, jit
+from pyhip.misc import cudaPerf
 
 BM = 128
 BN = 32
@@ -31,9 +32,9 @@ LOG2E = math.log2(math.e)
 VOID_POINTER = "void*"
 
 
-@pyhip.jit("-g")  # pyright: ignore[reportAttributeAccessIssue]
+@jit("-g")
 def attn_gemm_jit(
-    J: pyhip.JIT,  # pyright: ignore[reportAttributeAccessIssue]
+    J: JIT,
     M,
     N,
     query: VOID_POINTER,  # pyright: ignore[reportInvalidTypeForm]
@@ -612,9 +613,9 @@ def attn_gemm_jit(
                 )
 
 
-@pyhip.jit("-g")  # pyright: ignore[reportAttributeAccessIssue]
+@jit("-g")
 def attn_gemm_jit_setprio_best(
-    J: pyhip.JIT,  # pyright: ignore[reportAttributeAccessIssue]
+    J: JIT,
     M,
     N,
     query: VOID_POINTER,  # pyright: ignore[reportInvalidTypeForm]
@@ -681,14 +682,14 @@ def run_case(H, M, N, check=True, benchmark=False):
     elif kernel_name == "setprio_best":
         kernel = cast(Any, attn_gemm_jit_setprio_best)
     elif kernel_name == "setprio_best_all_vgpr":
-        from pyhip.core.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
+        from attn_4wave.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
             build_all_vgpr_jit_attention_kernel,
         )
 
-        root = Path(__file__).resolve().parents[2]
+        bundle_dir = Path(__file__).resolve().parent
+        root = bundle_dir.parents[2]
         static_kernel, artifact = build_all_vgpr_jit_attention_kernel(
-            root
-            / "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
+            bundle_dir / "isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
             root / ".cache/jit-attn-all-vgpr",
             m=M,
             n=N,
@@ -757,9 +758,7 @@ def run_case(H, M, N, check=True, benchmark=False):
         torch.cuda.synchronize()
         samples = []
         for index in range(50):
-            with pyhip.cudaPerf(  # pyright: ignore[reportAttributeAccessIssue]
-                flops, name="attn_jit", verbose=0
-            ) as perf:
+            with cudaPerf(flops, name="attn_jit", verbose=0) as perf:
                 launch(*buffers[index % len(buffers)])
             samples.append((perf.dt() * 1e6, perf.tflops()))
         samples.sort()

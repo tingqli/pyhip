@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from pyhip.core.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
+from attn_4wave.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
     ATTN_IDENTITY_MAX_SPACERS,
     ATTN_PRIORITY_EVENTS,
     convert_accvgprs_to_vgprs,
@@ -299,9 +299,9 @@ amdhsa.kernels:
 
 
 def test_convert_archived_attention_to_all_vgpr_fly_abi():
-    root = Path(__file__).resolve().parents[2]
     source = (
-        root / "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s"
+        Path(__file__).resolve().parent
+        / "isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s"
     ).read_text()
 
     transformed = convert_jit_attention_to_fly_abi(convert_accvgprs_to_vgprs(source))

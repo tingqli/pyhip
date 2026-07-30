@@ -36,7 +36,7 @@
     "task_cycle_range": [2035340, 2036637]
   },
   "method": {
-    "analysis_script": "archive/gemm/analyze-attn-att-cycle-ledger.py",
+    "analysis_script": "tests/flydsl/attn_4wave/tools/analyze-attn-att-cycle-ledger.py",
     "physical_issue_interval": "merge [issue_timestamp, issue_timestamp + 4) across all resident waves on each physical SIMD",
     "mfma_shadow_interval": "merge [mfma_issue_timestamp + 4, mfma_issue_timestamp + 16) across all resident waves on each physical SIMD",
     "simultaneous_blockers": "split each physical no-issue interval equally across active blocked PCs",

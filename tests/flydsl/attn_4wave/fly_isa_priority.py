@@ -9,7 +9,12 @@ from pathlib import Path
 
 import torch
 
-from .hiptools import get_lib, hipModuleGetFunction, hipModuleLoad, hip_check_error
+from pyhip.core.hiptools import (
+    get_lib,
+    hipModuleGetFunction,
+    hipModuleLoad,
+    hip_check_error,
+)
 
 ATTN_MFMA_PERIOD = 64
 ATTN_MFMA_COUNT = 128

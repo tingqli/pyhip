@@ -23,7 +23,7 @@ import statistics
 
 import torch
 
-import pyhip
+from pyhip.core.asmjit import JIT, jit
 
 DEFAULT_INNER_UNROLL = 1000
 DEFAULT_OUTER_LOOPS = 1000
@@ -173,11 +173,9 @@ def emit_alignment_padding(jit, alignment_nops):
         jit.s_nop(0)
 
 
-@pyhip.jit(  # pyright: ignore[reportAttributeAccessIssue]
-    no_pass=["pass_dse", "pass_dce"]
-)
+@jit(no_pass=["pass_dse", "pass_dce"])
 def measure_instruction(
-    jit: pyhip.JIT,  # pyright: ignore[reportAttributeAccessIssue]
+    jit: JIT,
     opcode,
     outer_loops,
     inner_unroll,
@@ -205,11 +203,9 @@ def measure_instruction(
     jit.s_store_dword(sink_s, output, 8, mod="glc")
 
 
-@pyhip.jit(  # pyright: ignore[reportAttributeAccessIssue]
-    no_pass=["pass_dse", "pass_dce"]
-)
+@jit(no_pass=["pass_dse", "pass_dce"])
 def measure_coissue(
-    jit: pyhip.JIT,  # pyright: ignore[reportAttributeAccessIssue]
+    jit: JIT,
     opcode,
     valu_count,
     outer_loops,
@@ -245,11 +241,9 @@ def measure_coissue(
     jit.s_store_dword(sink_s, output, 8, mod="glc")
 
 
-@pyhip.jit(  # pyright: ignore[reportAttributeAccessIssue]
-    no_pass=["pass_dse", "pass_dce"]
-)
+@jit(no_pass=["pass_dse", "pass_dce"])
 def measure_exp_coissue(
-    jit: pyhip.JIT,  # pyright: ignore[reportAttributeAccessIssue]
+    jit: JIT,
     opcode,
     valu_count,
     outer_loops,
@@ -284,11 +278,9 @@ def measure_exp_coissue(
     jit.s_store_dword(sink_s, output, 8, mod="glc")
 
 
-@pyhip.jit(  # pyright: ignore[reportAttributeAccessIssue]
-    no_pass=["pass_dse", "pass_dce"]
-)
+@jit(no_pass=["pass_dse", "pass_dce"])
 def measure_mfma_exp_alu_bundle(
-    jit: pyhip.JIT,  # pyright: ignore[reportAttributeAccessIssue]
+    jit: JIT,
     alu_count,
     exp_first,
     outer_loops,
@@ -328,11 +320,9 @@ def measure_mfma_exp_alu_bundle(
     jit.s_store_dword(sink_s, output, 8, mod="glc")
 
 
-@pyhip.jit(  # pyright: ignore[reportAttributeAccessIssue]
-    no_pass=["pass_dse", "pass_dce"]
-)
+@jit(no_pass=["pass_dse", "pass_dce"])
 def measure_two_mfma_exp_alu_bundle(
-    jit: pyhip.JIT,  # pyright: ignore[reportAttributeAccessIssue]
+    jit: JIT,
     alu_count,
     order,
     outer_loops,
@@ -349,9 +339,7 @@ def measure_two_mfma_exp_alu_bundle(
 
     def emit_alu(slot):
         for alu_slot in range(alu_count):
-            VALU_EMITTERS["v_add_f32"](
-                jit, regs, (slot + alu_slot) % register_chains
-            )
+            VALU_EMITTERS["v_add_f32"](jit, regs, (slot + alu_slot) % register_chains)
 
     emit_alignment_padding(jit, alignment_nops)
     start = read_clock(jit)
@@ -390,11 +378,9 @@ def measure_two_mfma_exp_alu_bundle(
     jit.s_store_dword(sink_s, output, 8, mod="glc")
 
 
-@pyhip.jit(  # pyright: ignore[reportAttributeAccessIssue]
-    no_pass=["pass_dse", "pass_dce"]
-)
+@jit(no_pass=["pass_dse", "pass_dce"])
 def measure_inter_coissue(
-    jit: pyhip.JIT,  # pyright: ignore[reportAttributeAccessIssue]
+    jit: JIT,
     opcode,
     valu_count,
     outer_loops,
@@ -452,11 +438,9 @@ def measure_inter_coissue(
     jit.s_waitcnt(mod="lgkmcnt(0)")
 
 
-@pyhip.jit(  # pyright: ignore[reportAttributeAccessIssue]
-    no_pass=["pass_dse", "pass_dce"]
-)
+@jit(no_pass=["pass_dse", "pass_dce"])
 def measure_inter_exp_coissue(
-    jit: pyhip.JIT,  # pyright: ignore[reportAttributeAccessIssue]
+    jit: JIT,
     opcode,
     valu_count,
     outer_loops,

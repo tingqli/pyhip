@@ -374,16 +374,17 @@ def render(data):
 
 
 def main():
+    bundle_dir = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("docs/data/attn-jit-coissue-optimization-gfx942.json"),
+        default=bundle_dir / "data/attn-jit-coissue-optimization-gfx942.json",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("docs/images/attn-late-scale-slot-functions-gfx942.svg"),
+        default=bundle_dir / "images/attn-late-scale-slot-functions-gfx942.svg",
     )
     args = parser.parse_args()
     data = json.loads(args.input.read_text())

@@ -1,7 +1,7 @@
 # gfx94x/gfx950 MFMA/VALU intra与inter co-issue微基准
 
 统一工具为
-[`archive/gemm/analyze-kernel-mfma-valu-coissue.py`](../archive/gemm/analyze-kernel-mfma-valu-coissue.py)。
+[`tools/analyze-kernel-mfma-valu-coissue.py`](tools/analyze-kernel-mfma-valu-coissue.py)。
 它直接测量attention softmax所用指令的吞吐，并在一次运行中同时测量：
 
 - **intra co-issue:**同一wave内的`MFMA + N * VALU`;
@@ -193,10 +193,10 @@ EXP使用独立`exp_src/exp_dst`寄存器,tested-op使用原有四组寄存器,�
 ```
 
 仓库内可追踪的精简摘要为
-[`docs/data/mfma-valu-intra-inter-coissue-gfx942.json`](data/mfma-valu-intra-inter-coissue-gfx942.json)。
+[`data/mfma-valu-intra-inter-coissue-gfx942.json`](data/mfma-valu-intra-inter-coissue-gfx942.json)。
 
 MFMA、EXP和普通ALU的三元组合及“双MFMA一组”顺序实测保存在
-[`docs/data/mfma-exp-alu-bundle-gfx942.json`](data/mfma-exp-alu-bundle-gfx942.json)。关键结果是
+[`data/mfma-exp-alu-bundle-gfx942.json`](data/mfma-exp-alu-bundle-gfx942.json)。关键结果是
 `MFMA -> 3 ALU -> MFMA -> EXP`约36.053 cycles/group,相对同顺序0 ALU的36.040只增加约0.013 cycle；
 `MFMA -> MFMA -> 3 ALU -> EXP`则为48.052 cycles/group。
 
@@ -277,7 +277,7 @@ barrier、数据依赖、VGPR live range和occupancy;本微基准只测steady-st
 cd /root/workspace/luocheng/pyhip
 HIP_VISIBLE_DEVICES=2 \
 PYHIP_CACHE_DIR=/tmp/pyhip-coissue-all \
-python3 archive/gemm/analyze-kernel-mfma-valu-coissue.py \
+python3 tests/flydsl/attn_4wave/tools/analyze-kernel-mfma-valu-coissue.py \
   --ops all \
   --outer-loops 1000 \
   --inner-unroll 1000 \
@@ -291,7 +291,7 @@ python3 archive/gemm/analyze-kernel-mfma-valu-coissue.py \
 
 ```bash
 HIP_VISIBLE_DEVICES=2 \
-python3 archive/gemm/analyze-kernel-mfma-valu-coissue.py \
+python3 tests/flydsl/attn_4wave/tools/analyze-kernel-mfma-valu-coissue.py \
   --ops v_add_f32,v_fma_f32,v_exp_f32,v_pk_mul_f32
 ```
 

@@ -1,12 +1,7 @@
 import hashlib
 import re
-import sys
-from pathlib import Path
 
-FLYDSL_TEST_DIR = Path(__file__).resolve().parents[1] / "flydsl"
-sys.path.insert(0, str(FLYDSL_TEST_DIR))
-
-from attn_gemm_inline_kv import (  # noqa: E402
+from attn_4wave.attn_gemm_inline_kv import (  # pyright: ignore[reportMissingImports]
     ARCHIVED_ISA_SHA256,
     JIT_MAIN_INLINE_ASM,
     JIT_REGISTER_CONSTRAINTS,

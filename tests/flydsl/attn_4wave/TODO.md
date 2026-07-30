@@ -25,7 +25,7 @@
 - [x] 验证GEMM1填窗候选：V load中置/lookahead、future-K提前、threshold/max预计算、全offset滚动和split-K双accumulator均中性或回退,未保留。
 - [x] 验证center `J.emit`预算10→11：会多取完整第三条5-cycle FMA并回退到169.1T,不能用作细粒度填窗。
 - [x] **空闲GPU复测最佳半wavefront并填写最终结果**：发现650W功耗上限导致production在4.13/6.20 ms间切换，阶段中位数无效；改用紧邻control配对。GPU 3上50轮：全体-0.23%，fast-state +0.76%（14轮），slow-state-0.29%；收益不稳定且明显低于最终setprio方案，未保留。结果已回填§22.21/§22.23和实验JSON。
-- [x] **验证并迭代独立`s_setprio`双resident-wave流水线，超过production**：粗phase消融证明priority本身相对改善6.47%；扫描15块掩码、33个统一/邻域边界、16个per-block边界后，发现多次切换成本和高优先级窗口不连续是主因。最终每tile只切换一次：GEMM1 mt0第8条MFMA后`setprio(1)`，跨softmax0/GEMM1 mt1/softmax1，到GEMM2 mt0第16条MFMA后`setprio(0)`，GEMM2 mt1保持normal。8张冷态AUTO GPU共40/40有效配对：时间比0.90002，**+11.11%**，候选236.63T、局部control212.95T；标准GPU 3、10 buffers/50样本中位236.82T，清理后当前源码复测**3623.5 us / 237.1T**。随机40960与production逐元素相同，参考`rel_l2=0.00318646`；全1为0；156 VGPR+64 AGPR、2 waves、零spill。生产入口不变，保留独立`attn_gemm_jit_setprio_best`，最终汇编归档`archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s`。
+- [x] **验证并迭代独立`s_setprio`双resident-wave流水线，超过production**：粗phase消融证明priority本身相对改善6.47%；扫描15块掩码、33个统一/邻域边界、16个per-block边界后，发现多次切换成本和高优先级窗口不连续是主因。最终每tile只切换一次：GEMM1 mt0第8条MFMA后`setprio(1)`，跨softmax0/GEMM1 mt1/softmax1，到GEMM2 mt0第16条MFMA后`setprio(0)`，GEMM2 mt1保持normal。8张冷态AUTO GPU共40/40有效配对：时间比0.90002，**+11.11%**，候选236.63T、局部control212.95T；标准GPU 3、10 buffers/50样本中位236.82T，清理后当前源码复测**3623.5 us / 237.1T**。随机40960与production逐元素相同，参考`rel_l2=0.00318646`；全1为0；156 VGPR+64 AGPR、2 waves、零spill。生产入口不变，保留独立`attn_gemm_jit_setprio_best`，最终汇编归档`isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s`。
 - [ ] 空闲GPU上夹心扫描softmax1 prepare预执行31/35/43 cycles（再前移DS fanout/threshold/K写）；小shape精度和资源已通过,当前未进入生产文件。
 - [x] 将JIT优化移植到FlyDSL：第二条K写中置和按m_rep半量BF16转换,40960从185.1T提升到194.4T。
 - [x] 修复FlyDSL移植对8192的shape回退：`N < 32768`恢复原scheduler+整片转换,8192从166.9--167.0T恢复到170.6--170.7T；40960保持194.0--194.1T。
@@ -35,6 +35,7 @@
 - [x] **验证sum归约后移的`v_pk`阻塞并用inline消除**：只后移shuffle生成2条`v_pk_fma`，inline scalar FMA将254V降到232V并提升4.16%（182.0T→189.5T）；完整后移生成额外13条`v_pk_mul`、5条`v_pk_add`且268V跨occupancy阈值，逐元素inline FMA将其降到246V并提升33.02%（143.6T→191.1T）。两者相对base仍分别回退2.54%和1.96%，默认保持base。
 - [x] **测试两种inline sum组合延后`sm_scale_log2`**：逐元素inline `v_fma_f32(score,scale,-max)`删除16条`v_pk_mul`和32条SUB；只后移shuffle组合跨GPU稳定+0.29%--0.30%，完整后移sum组合稳定-0.83%--0.84%。前者相对base仍回退2.24%，不切换默认路径。
 - [x] **用ATT闭合late-scale回退**：完整后移sum的late-scale物理wall增加14.049 cycles/tile（+0.85%），与严格性能-0.83%闭合；issue减少7.730但shadow外no-issue增加24.121。slot0快116.680，决定吞吐的slot1却慢28.097；phase32/96长softmax缩短后，等待转移到下一GEMM1的K-LDS progressive wait（慢slot phase34/42/106/108分别+86.427/+76.205/+124.341/+43.776）。根因是双resident-slot失衡和K LDS延迟暴露，不是scalar FMA吞吐。
+- [x] **在full-late上用周期setprio恢复反相**：扫描跨回边窗口后，`56:0,88:2`相对full-late长测约+4.92%，跨GPU相对高层base约+1.93%，fast-state 194.8→198.5T。ATT仅增加2条setprio，slot完成差976.867→7.802 cycles/tile；原慢slot加速325.040。7个V-load填窗候选因覆盖MFMA活值被正确性否决；9个合法K-read前移候选逐元素一致但全部回退0.27%--1.55%，不保留。
 - [x] 拆分验证raw/formal probability交织：raw完整组合相对205T回退5.18%；单步formal完整接管回退9.67%，两步对称接管收窄到6.91%，raw-domain FMA接管回退8.59%。对称接管ATT虽使shadow内no-issue减少50.340 cycles/tile，shadow外no-issue仍增加114.829，phase32双wave长团重叠从250.356升到445.208。priority第二边界80--112、M16/M17交换、回边GEMM2链旋转、max-only fanout和删6条冗余K wait均未转正，所有候选未保留。
 - [ ] **FlyDSL codegen达到最新JIT约237T**：当前高层Fly约194.6T，严格来源于Fly的最终ISA后处理约205.2T，距离JIT ISA oracle约32T。下一步必须按完整pair重排两路softmax：p0与当前GEMM1交织，p1跨循环回边与下一轮GEMM2交织；禁止继续只搬p0局部FMA/EXP，因为这会把两resident wave锁得更同相。
 - [ ] 在存在尾批的实际shape上评估persistent grid；H=1/M=40960理论示例已有320 WG整除80 CU，不需要尾批修正。
@@ -42,7 +43,7 @@
 
 ## 当前任务
 
-- [x] 扩展`archive/gemm/analyze-kernel-mfma-valu-coissue.py`，单次运行同时报告intra co-issue和8-wave inter co-issue，并更新实测报告。
-- [x] 新增`archive/gemm/analyze-attn-att-cycle-ledger.py`，将最终ATT的VMEM/LDS/barrier/wait和依赖空洞归入BN32 tile并闭合墙钟。
+- [x] 扩展`tools/analyze-kernel-mfma-valu-coissue.py`，单次运行同时报告intra co-issue和8-wave inter co-issue，并更新实测报告。
+- [x] 新增`tools/analyze-attn-att-cycle-ledger.py`，将最终ATT的VMEM/LDS/barrier/wait和依赖空洞归入BN32 tile并闭合墙钟。
 
 > [提醒] JIT production为208.6--208.8T；最新独立`setprio_best`为236.5--237.1T，是Fly移植目标。FlyDSL高层长序列约194.6T，严格来源于Fly的最终ISA组合约205.2T；8192约170.6--170.7T。

@@ -752,16 +752,17 @@ def render(data):
 
 
 def main():
+    bundle_dir = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("docs/data/attn-jit-att-cycle-ledger-gfx942.json"),
+        default=bundle_dir / "data/attn-jit-att-cycle-ledger-gfx942.json",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("docs/images/attn-jit-cycle-axis-gfx942.svg"),
+        default=bundle_dir / "images/attn-jit-cycle-axis-gfx942.svg",
     )
     args = parser.parse_args()
     with args.input.open() as stream:

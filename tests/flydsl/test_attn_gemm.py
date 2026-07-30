@@ -3,7 +3,7 @@
   gemm1: pv = Q[M,D] @ K[N,D]^T   -> [M, N]
   gemm2: v  = pv[M,N] @ V[N,D]     -> [M, D]
 
-优化核心(见 docs/attn_gemm_optimization.md):
+优化核心(见 attn_4wave/attn_gemm_optimization.md):
 - register trick:GEMM1 算 S^T=K@Q^T,其 C 累加器经 fx.select 重排后直接作 GEMM2 的 A,S 不入 LDS。
 - perm_M(GEMM1 的 M=Nk 维加 k_perm):C 累加器每 lane 持 8 连续 Nk,对齐 GEMM2 的 k_perm A。
 - 全 128-bit 读:K/Q 沿 D 加 k_perm(ds_read/buffer_load 128-bit);V 预 shuffle 成 paged
@@ -659,6 +659,11 @@ def main():
     #   ATTN_FLY_SUM_REDUCE=defer_all_inline_late_scale \
     #   ATTN_FLY_SUM_REDUCE_CONTROL=defer_all_inline ATTN_FLY_PAIR_COUNT=24 \
     #   ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+    # 完整后移sum + late-scale上用post-ISA setprio保持跨回边反相：
+    # HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 \
+    #   ATTN_FLY_SUM_REDUCE=defer_all_inline_late_scale \
+    #   ATTN_FLY_SUM_SETPRIO_EVENTS=56:0,88:2 ATTN_FLY_PAIR_COUNT=24 \
+    #   ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
     _backend = os.environ.get("ATTN_FLY_BACKEND", "fly")
     assert _backend in (
         "fly",
@@ -686,7 +691,7 @@ def main():
         "compare_inline_oracle",
     )
     if _use_jit_layout:
-        from pyhip.core.fly_isa_priority import (
+        from attn_4wave.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
             preshuffle_jit_key,
             preshuffle_jit_value,
         )
@@ -716,6 +721,7 @@ def main():
     )
     _sum_reduce_mode = os.environ.get("ATTN_FLY_SUM_REDUCE", "base")
     _sum_reduce_control_mode = os.environ.get("ATTN_FLY_SUM_REDUCE_CONTROL")
+    _sum_setprio_events_text = os.environ.get("ATTN_FLY_SUM_SETPRIO_EVENTS")
     assert _sum_reduce_mode in _sum_reduce_modes
     assert (
         _sum_reduce_control_mode is None
@@ -723,6 +729,12 @@ def main():
     )
     if _sum_reduce_control_mode == _sum_reduce_mode:
         raise ValueError("sum-reduce control and candidate modes must differ")
+    if _sum_setprio_events_text is not None and (
+        _sum_reduce_mode == "base" or _sum_reduce_control_mode is not None
+    ):
+        raise ValueError(
+            "ATTN_FLY_SUM_SETPRIO_EVENTS requires one non-base sum-reduce candidate"
+        )
     if _use_jit_layout and not _softmax:
         raise ValueError("the archived JIT machine flow requires SOFTMAX=1")
     _priority_mode = os.environ.get("ATTN_FLY_PRIORITY", "off")
@@ -746,7 +758,11 @@ def main():
         or _sum_pack_mode != "off"
     ):
         raise ValueError("Fly post-ISA transforms require ATTN_FLY_BACKEND=fly")
-    if (_sum_reduce_mode != "base" or _sum_reduce_control_mode is not None) and (
+    if (
+        _sum_reduce_mode != "base"
+        or _sum_reduce_control_mode is not None
+        or _sum_setprio_events_text is not None
+    ) and (
         _backend != "fly"
         or not _softmax
         or _priority_mode != "off"
@@ -778,13 +794,24 @@ def main():
         / f"h{H}-m{M}-n{N}"
     )
     if _use_priority:
-        from pyhip.core.fly_isa_priority import parse_priority_events
+        from attn_4wave.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
+            parse_priority_events,
+        )
 
         _priority_period = int(os.environ.get("ATTN_FLY_PRIORITY_PERIOD", "64"))
         _priority_events = parse_priority_events(
             os.environ.get("ATTN_FLY_PRIORITY_EVENTS"), period=_priority_period
         )
-    if _use_post_isa:
+    _sum_setprio_events = None
+    if _sum_setprio_events_text is not None:
+        from attn_4wave.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
+            parse_priority_events,
+        )
+
+        _sum_setprio_events = parse_priority_events(
+            _sum_setprio_events_text, period=128
+        )
+    if _use_post_isa or _sum_setprio_events is not None:
         os.environ["FLYDSL_DUMP_IR"] = "1"
         os.environ["FLYDSL_DUMP_DIR"] = str(_dump_dir)
     print(
@@ -792,6 +819,7 @@ def main():
         f"softmax_impl=lazy_delta8 priority={_priority_mode} identity_max={_identity_max_mode} "
         f"sum_pack={_sum_pack_mode} sum_reduce={_sum_reduce_mode} "
         f"sum_reduce_control={_sum_reduce_control_mode} "
+        f"sum_setprio_events={_sum_setprio_events} "
         f"post_isa_active={_use_post_isa} "
         f"period={_priority_period} events={_priority_events}"
     )
@@ -831,7 +859,9 @@ def main():
     kernel = compiled
     inline_compiled = None
     if _use_inline_backend:
-        from attn_gemm_inline_kv import build as build_inline_kv
+        from attn_4wave.attn_gemm_inline_kv import (  # pyright: ignore[reportMissingImports]
+            build as build_inline_kv,
+        )
 
         inline_args = (Q, K_inline, V_inline, o_fly, stream)
         inline_compiled = fly_compiled(
@@ -842,12 +872,14 @@ def main():
         if _backend == "jit_body_inline":
             kernel = inline_compiled
     if _use_jit_oracle:
-        from pyhip.core.fly_isa_priority import build_all_vgpr_jit_attention_kernel
+        from attn_4wave.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
+            build_all_vgpr_jit_attention_kernel,
+        )
 
         root = Path(__file__).resolve().parents[2]
+        bundle_dir = Path(__file__).resolve().parent / "attn_4wave"
         jit_kernel, artifact = build_all_vgpr_jit_attention_kernel(
-            root
-            / "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
+            bundle_dir / "isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
             root / ".cache/jit-attn-all-vgpr",
             m=M,
             n=N,
@@ -858,9 +890,17 @@ def main():
         )
         if _backend == "jit_isa_oracle":
             kernel = jit_kernel
-    if _use_post_isa:
-        from pyhip.core.fly_isa_priority import build_attention_post_isa_kernel
+    if _use_post_isa or _sum_setprio_events is not None:
+        from attn_4wave.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
+            build_attention_post_isa_kernel,
+        )
 
+        post_priority_period = (
+            128 if _sum_setprio_events is not None else _priority_period
+        )
+        post_priority_events = (
+            _sum_setprio_events if _sum_setprio_events is not None else _priority_events
+        )
         kernel, artifact = build_attention_post_isa_kernel(
             _find_final_isa(_dump_dir),
             _dump_dir / "post-isa",
@@ -869,8 +909,8 @@ def main():
             block_m=BM,
             remove_identity_max=_use_identity_max or _use_sum_pack,
             move_sum_pack=_use_sum_pack,
-            priority_period=_priority_period,
-            priority_events=_priority_events,
+            priority_period=post_priority_period,
+            priority_events=post_priority_events,
             absolute_priority_events=((16, 0), (96, 2)) if _use_sum_pack else None,
         )
         print(
@@ -982,7 +1022,21 @@ def main():
             "ratio": ratios[middle],
         }
 
-    if sum_reduce_control is not None:
+    if _sum_setprio_events is not None:
+        paired = paired_perf(
+            lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
+            lambda i: kernel(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
+        )
+        tf_control = flops / paired["control_us"] / 1e6
+        tf_candidate = flops / paired["candidate_us"] / 1e6
+        print(
+            f"[paired-sum-setprio] valid={paired['valid']}/{paired['total']} "
+            f"control={paired['control_us']:.1f}us/{tf_control:.1f}T "
+            f"events={_sum_setprio_events} "
+            f"candidate={paired['candidate_us']:.1f}us/{tf_candidate:.1f}T "
+            f"time_ratio={paired['ratio']:.5f} speedup={1 / paired['ratio'] - 1:.2%}"
+        )
+    elif sum_reduce_control is not None:
         paired = paired_perf(
             lambda i: sum_reduce_control(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
             lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),

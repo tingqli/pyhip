@@ -9,7 +9,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith
 
-from pyhip.core.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
+from attn_4wave.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
     convert_accvgprs_to_vgprs,
     convert_jit_attention_to_fly_abi,
 )
@@ -24,8 +24,8 @@ ARCHIVED_ISA_SHA256 = "18e3fe8e48e9eaa2bc62ba6ac82e7f41c5019e216b6638c0bd8decb45
 
 def _archive_path():
     return (
-        Path(__file__).resolve().parents[2]
-        / "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s"
+        Path(__file__).resolve().parent
+        / "isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s"
     )
 
 
