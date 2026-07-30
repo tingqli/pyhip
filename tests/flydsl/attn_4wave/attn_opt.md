@@ -3,7 +3,9 @@
 状态：**ACTIVE / 唯一持续维护入口**
 更新时间：2026-07-30
 当前实现：[`../test_attn_gemm.py`](../test_attn_gemm.py)
-历史长文：[`attn_gemm_optimization.md`](attn_gemm_optimization.md)（已归档，只读）
+JIT实现：[`test_attn_gemm_jit.py`](test_attn_gemm_jit.py)
+co-issue工具：[`tools/test-coissue.py`](tools/test-coissue.py)
+co-issue说明：[`tools/mfma-valu-coissue.md`](tools/mfma-valu-coissue.md)
 
 以后所有新的优化方法、失败反证、ISA资源和严格性能结果都写入本文，不再更新归档文档。每次实验至少更新：
 
@@ -11,6 +13,87 @@
 2. 第 7 节最终性能快照；
 3. 第 8 节增量实验日志；
 4. 若改变当前实现，同时更新正确性、ISA资源和ATT结论。
+
+## 使用与复现
+
+以下命令均从仓库根目录执行。性能复现前先用`rocm-smi --showuse`选择空闲GPU，并固定使用新的
+`PYTHONPYCACHEPREFIX`/`PYHIP_CACHE_DIR`，避免旧缓存混入结果。
+
+### Fly stage-antiphase
+
+小shape正确性：
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+H=1 MULT=2 \
+PYTHONPYCACHEPREFIX=/tmp/attn-fly-small-pyc \
+FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+python3 -B tests/flydsl/test_attn_gemm.py
+```
+
+预期`rel_l2≈0.00315`。40960性能：
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+H=1 MULT=320 \
+PYTHONPYCACHEPREFIX=/tmp/attn-fly-40960-pyc \
+FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+python3 -B tests/flydsl/test_attn_gemm.py
+```
+
+当前gfx942空闲卡复现约`3907--3912 us / 219.7--219.9 TFLOPS`，`rel_l2≈0.00319`。
+
+### PyHIP JIT
+
+两个入口的小shape正确性：
+
+```bash
+HIP_VISIBLE_DEVICES=0 H=1 MULT=2 CHECK=1 \
+ATTN_JIT_KERNEL=production PYHIP_CACHE_DIR=/tmp/attn-jit-production-small \
+python3 -B tests/flydsl/attn_4wave/test_attn_gemm_jit.py
+
+HIP_VISIBLE_DEVICES=0 H=1 MULT=2 CHECK=1 \
+ATTN_JIT_KERNEL=setprio_best PYHIP_CACHE_DIR=/tmp/attn-jit-setprio-small \
+python3 -B tests/flydsl/attn_4wave/test_attn_gemm_jit.py
+```
+
+40960性能会自动跳过显存过大的torch参考；也可显式设置`CHECK=0`：
+
+```bash
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 CHECK=0 \
+ATTN_JIT_KERNEL=production PYHIP_CACHE_DIR=/tmp/attn-jit-production-40960 \
+python3 -B tests/flydsl/attn_4wave/test_attn_gemm_jit.py
+
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 CHECK=0 \
+ATTN_JIT_KERNEL=setprio_best PYHIP_CACHE_DIR=/tmp/attn-jit-setprio-40960 \
+python3 -B tests/flydsl/attn_4wave/test_attn_gemm_jit.py
+```
+
+历史稳定口径分别为`208.6--208.8T`与`236.5--237.1T`。性能测试使用10套buffer、10次预热和50次
+CUDA-event样本的中位数。
+
+### MFMA/VALU co-issue
+
+快速执行检查：
+
+```bash
+HIP_VISIBLE_DEVICES=0 PYHIP_CACHE_DIR=/tmp/attn-coissue-smoke \
+python3 -B tests/flydsl/attn_4wave/tools/test-coissue.py \
+	--ops v_add_f32 --outer-loops 2 --inner-unroll 8 \
+	--samples 1 --warmup 0 --throughput-only
+```
+
+正式gfx942复现：
+
+```bash
+HIP_VISIBLE_DEVICES=0 PYHIP_CACHE_DIR=/tmp/attn-coissue-formal \
+python3 -B tests/flydsl/attn_4wave/tools/test-coissue.py \
+	--ops all --outer-loops 1000 --inner-unroll 1000 \
+	--samples 5 --warmup 1 --tolerance 0.25 \
+	--json /tmp/attn-valu-intra-inter-coissue.json
+```
+
+完整指标定义、PC对齐要求和gfx942结果见[`tools/mfma-valu-coissue.md`](tools/mfma-valu-coissue.md)。
 
 ## 1. 问题、口径与状态定义
 

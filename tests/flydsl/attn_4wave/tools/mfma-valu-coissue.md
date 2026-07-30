@@ -1,7 +1,7 @@
 # gfx94x/gfx950 MFMA/VALU intra与inter co-issue微基准
 
 统一工具为
-[`tools/analyze-kernel-mfma-valu-coissue.py`](tools/analyze-kernel-mfma-valu-coissue.py)。
+[`test-coissue.py`](test-coissue.py)。
 它直接测量attention softmax所用指令的吞吐，并在一次运行中同时测量：
 
 - **intra co-issue:**同一wave内的`MFMA + N * VALU`;
@@ -192,11 +192,9 @@ EXP使用独立`exp_src/exp_dst`寄存器,tested-op使用原有四组寄存器,�
 /tmp/coissue-canonical-10x-gfx942.json
 ```
 
-仓库内可追踪的精简摘要为
-[`data/mfma-valu-intra-inter-coissue-gfx942.json`](data/mfma-valu-intra-inter-coissue-gfx942.json)。
+本节表格保留仓库内可追踪的正式结果；使用下文`--json`命令可重新生成完整原始样本。
 
-MFMA、EXP和普通ALU的三元组合及“双MFMA一组”顺序实测保存在
-[`data/mfma-exp-alu-bundle-gfx942.json`](data/mfma-exp-alu-bundle-gfx942.json)。关键结果是
+MFMA、EXP和普通ALU的三元组合及“双MFMA一组”关键结果是
 `MFMA -> 3 ALU -> MFMA -> EXP`约36.053 cycles/group,相对同顺序0 ALU的36.040只增加约0.013 cycle；
 `MFMA -> MFMA -> 3 ALU -> EXP`则为48.052 cycles/group。
 
@@ -271,13 +269,28 @@ barrier、数据依赖、VGPR live range和occupancy;本微基准只测steady-st
 
 ## 使用方法
 
+快速检查脚本、GPU JIT和计时路径：
+
+```bash
+cd /root/workspace/luocheng/pyhip
+HIP_VISIBLE_DEVICES=0 \
+PYHIP_CACHE_DIR=/tmp/pyhip-coissue-smoke \
+python3 -B tests/flydsl/attn_4wave/tools/test-coissue.py \
+  --ops v_add_f32 \
+  --outer-loops 2 \
+  --inner-unroll 8 \
+  --samples 1 \
+  --warmup 0 \
+  --throughput-only
+```
+
 运行全部指令：
 
 ```bash
 cd /root/workspace/luocheng/pyhip
 HIP_VISIBLE_DEVICES=2 \
 PYHIP_CACHE_DIR=/tmp/pyhip-coissue-all \
-python3 tests/flydsl/attn_4wave/tools/analyze-kernel-mfma-valu-coissue.py \
+python3 tests/flydsl/attn_4wave/tools/test-coissue.py \
   --ops all \
   --outer-loops 1000 \
   --inner-unroll 1000 \
@@ -291,7 +304,7 @@ python3 tests/flydsl/attn_4wave/tools/analyze-kernel-mfma-valu-coissue.py \
 
 ```bash
 HIP_VISIBLE_DEVICES=2 \
-python3 tests/flydsl/attn_4wave/tools/analyze-kernel-mfma-valu-coissue.py \
+python3 tests/flydsl/attn_4wave/tools/test-coissue.py \
   --ops v_add_f32,v_fma_f32,v_exp_f32,v_pk_mul_f32
 ```
 
@@ -341,4 +354,4 @@ never-coissue 问题同时存在于 gfx950，但仍需用当前脚本在 gfx950 
 
 - [ROCm Compute Profiler MFMA pipeline](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/conceptual/cdna/pipeline-descriptions.html#matrix-fused-multiply-add-mfma)
 - [LLVM `SIPreEmitPeephole.cpp`](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AMDGPU/SIPreEmitPeephole.cpp)
-- [attention 优化记录](attn_gemm_optimization.md)
+- [attention 优化记录](../attn_opt.md)

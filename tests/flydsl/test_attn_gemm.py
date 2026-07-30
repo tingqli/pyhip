@@ -4,7 +4,7 @@ GEMM1计算S^T=K@Q^T，online softmax就地生成P^T，GEMM2计算O^T=V^T@P^T。
 ping-pong，V从paged global直接进入fragment。stage0执行K global预取与softmax；stage1执行K LDS
 写读、GEMM2和下一tile的V预取/GEMM1，并跨runtime loop回边维持resident-wave反相。
 
-当前维护记录见attn_4wave/attn_gemm_optimization_current.md。
+当前维护记录见attn_4wave/attn_opt.md。
 """
 
 import os

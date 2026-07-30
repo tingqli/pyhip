@@ -6,13 +6,11 @@
 ``softmax(mt1) -> GEMM2(mt0)``，并用独立MFMA/VMEM/VALU隐藏softmax归约等待。
 
 最终40960性能口径：默认``production``为208.6--208.8T；独立
-``setprio_best``为236.5--237.1T；``setprio_best_all_vgpr``静态加载同一
-归档ISA的全VGPR/Fly-ABI变体，约236.6T。三者随机输入``rel_l2≈0.00319``。
+``setprio_best``为236.5--237.1T。两者随机输入``rel_l2≈0.00319``。
 """
 
 import math
 import os
-from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -676,37 +674,14 @@ def run_case(H, M, N, check=True, benchmark=False):
     value_shuffled = preshuffle_value(value)
     output = torch.empty_like(query)
     kernel_name = os.environ.get("ATTN_JIT_KERNEL", "production")
-    static_kernel = None
     if kernel_name == "production":
         kernel = cast(Any, attn_gemm_jit)
     elif kernel_name == "setprio_best":
         kernel = cast(Any, attn_gemm_jit_setprio_best)
-    elif kernel_name == "setprio_best_all_vgpr":
-        from attn_4wave.fly_isa_priority import (  # pyright: ignore[reportMissingImports]
-            build_all_vgpr_jit_attention_kernel,
-        )
-
-        bundle_dir = Path(__file__).resolve().parent
-        root = bundle_dir.parents[2]
-        static_kernel, artifact = build_all_vgpr_jit_attention_kernel(
-            bundle_dir / "isa/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
-            root / ".cache/jit-attn-all-vgpr",
-            m=M,
-            n=N,
-            h=H,
-        )
-        kernel = None
-        print(
-            f"[all-vgpr] assembly={artifact.assembly_path} code_object={artifact.code_object_path}"
-        )
     else:
         raise ValueError(f"unsupported ATTN_JIT_KERNEL={kernel_name!r}")
 
     def launch(q, k, v, out):
-        if static_kernel is not None:
-            static_kernel(q, k, v, out)
-            return
-        assert kernel is not None
         kernel(
             [M // BM, H],
             [THREADS],
