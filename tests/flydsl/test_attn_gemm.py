@@ -16,6 +16,7 @@
 """
 
 import os
+from pathlib import Path
 
 os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
@@ -31,6 +32,7 @@ if 1:
     from flydsl.utils.env import DebugEnvManager
     from flydsl._mlir import ir
     import flydsl
+
     DebugEnvManager.enable_debug_info = True
     ir._globals.register_traceback_file_inclusion(__file__)
     ir._globals.register_traceback_file_exclusion(os.path.dirname(flydsl.__file__))
@@ -42,6 +44,15 @@ if 1:
 # flyc.compile 返回预建 CallState 的 callable(每次调用 ~6us),避开完整 JitFunction.__call__
 # 路径(~140us:签名绑定 + 重建 cache-key + globals/runtime 检查),降低 host 侧开销。
 _FLY_COMPILED_CACHE = {}
+
+
+def _find_final_isa(dump_dir):
+    candidates = sorted((Path(dump_dir) / "attn_kernel_0").glob("*_final_isa.s"))
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"expected one final attn_kernel_0 ISA dump in {dump_dir}, found {candidates}"
+        )
+    return candidates[0]
 
 
 def fly_compiled(key, build_launch, args):
@@ -65,9 +76,12 @@ def _cvt_f32_to_bf16(c_frag):
     c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
     round_bit = fx.Uint32(0x8000)
     c_frag_bf16.store(
-        ((c_frag.load().bitcast(fx.Uint32) + round_bit) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+        ((c_frag.load().bitcast(fx.Uint32) + round_bit) >> 16)
+        .to(fx.Uint16)
+        .bitcast(fx.BFloat16)
     )
     return c_frag_bf16
+
 
 def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
     """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
@@ -88,7 +102,11 @@ def _exp2_amdgcn(x):
     """标量 f32 = 2^x:llvm.amdgcn.exp2.f32(单 v_exp_f32,省 OCML 的 v_ldexp)。指数须在 fast-range(≤0)。"""
     from flydsl._mlir.ir import F32Type
 
-    return fx.Float32(llvm.call_intrinsic(F32Type.get(), "llvm.amdgcn.exp2.f32", [arith.unwrap(x)], [], []))
+    return fx.Float32(
+        llvm.call_intrinsic(
+            F32Type.get(), "llvm.amdgcn.exp2.f32", [arith.unwrap(x)], [], []
+        )
+    )
 
 
 def _exp2_vec_amdgcn(vec):
@@ -100,7 +118,13 @@ def _exp2_vec_amdgcn(vec):
     n = raw.type.shape[0]
     f32 = F32Type.get()
     outs = [
-        llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [_vd.extract(raw, static_position=[i], dynamic_position=[])], [], [])
+        llvm.call_intrinsic(
+            f32,
+            "llvm.amdgcn.exp2.f32",
+            [_vd.extract(raw, static_position=[i], dynamic_position=[])],
+            [],
+            [],
+        )
         for i in range(n)
     ]
     return fx.Vector(_vd.from_elements(VectorType.get([n], f32), outs))
@@ -121,10 +145,13 @@ def _make_ktiles(K_, N, D, BN, koff):
     return fx.rocdl.make_buffer_tensor(
         fx.make_view(
             fx.get_iter(K_) + koff,
-            fx.make_layout(((4, 4, 2), D, N // BN, 1), ((D, 8 * D, 4 * D), 1, BN * D, 0)),
+            fx.make_layout(
+                ((4, 4, 2), D, N // BN, 1), ((D, 8 * D, 4 * D), 1, BN * D, 0)
+            ),
         ),
         max_size=False,
     )
+
 
 def build(M, N, D, BM, BN, H=1, softmax=True):
     """构造融合 MHA kernel(flash softmax + multi-head),返回 launch 包装。
@@ -137,12 +164,15 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
     assert BN == 32
     assert BM % 32 == 0 and BN % 16 == 0 and D % 16 == 0 and N % BN == 0 and M % BM == 0
     assert (N // BN) % 2 == 0, "KV tile 数需为偶数(循环展开 2 次)"
-    WAVES = BM // 32                    # 每 wave 负责 32 行 query
-    NT = WAVES * 64                     # 线程数
-    VECN = 128 // fx.BFloat16.width     # 协作加载向量宽度(8 bf16 = 128b)
+    WAVES = BM // 32  # 每 wave 负责 32 行 query
+    NT = WAVES * 64  # 线程数
+    VECN = 128 // fx.BFloat16.width  # 协作加载向量宽度(8 bf16 = 128b)
     assert BM // 32 == WAVES and D % VECN == 0 and BN % 16 == 0
-    sm_scale = float(1.0 / (D**0.5))         # softmax 缩放 1/sqrt(D)
-    sm_scale_log2 = float(sm_scale * LOG2E)  # 把 LOG2E 折进缩放:exp2(S*sm_scale*LOG2E-m) 省掉逐元素 *LOG2E
+    sm_scale = float(1.0 / (D**0.5))  # softmax 缩放 1/sqrt(D)
+    sm_scale_log2 = float(
+        sm_scale * LOG2E
+    )  # 把 LOG2E 折进缩放:exp2(S*sm_scale*LOG2E-m) 省掉逐元素 *LOG2E
+    use_long_sequence_schedule = N >= 32768
 
     @flyc.kernel
     def attn_kernel(Q_: fx.Tensor, K_: fx.Tensor, V_: fx.Tensor, O_: fx.Tensor):
@@ -153,34 +183,60 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
         kv_off = h * (N * D)  # K/V 的 head 偏移(元素)
 
         # 多头:每 head 的 Q/K/V/O 在全局按 head 偏移基址(iter+offset)
-        Q = fx.Tensor(fx.make_view(fx.get_iter(Q_) + qo_off, fx.make_layout((M, D), (D, 1))))
+        Q = fx.Tensor(
+            fx.make_view(fx.get_iter(Q_) + qo_off, fx.make_layout((M, D), (D, 1)))
+        )
         NB = BN // 8
         # O 存成转置视图 O^T[D,M]:GEMM2 转置后 C=O^T,4/lane 沿 D 连续 -> 64-bit 写
-        O = fx.Tensor(fx.make_view(fx.get_iter(O_) + qo_off, fx.make_layout((D, M), (1, D))))
+        O = fx.Tensor(
+            fx.make_view(fx.get_iter(O_) + qo_off, fx.make_layout((D, M), (1, D)))
+        )
         Qb = fx.rocdl.make_buffer_tensor(Q, max_size=False)
         Ob = fx.rocdl.make_buffer_tensor(O, max_size=False)
 
         q_tile = fx.flat_divide(Qb, fx.make_tile(BM, D))[None, None, bm, 0]  # [BM, D]
-        k_tiles = _make_ktiles(K_, N, D, BN, kv_off)                         # [BN, D, N//BN, 1](perm_M 已全局重排)
-        o_tile = fx.flat_divide(Ob, fx.make_tile(D, BM))[None, None, 0, bm]  # [D, BM] = O^T tile
+        k_tiles = _make_ktiles(
+            K_, N, D, BN, kv_off
+        )  # [BN, D, N//BN, 1](perm_M 已全局重排)
+        o_tile = fx.flat_divide(Ob, fx.make_tile(D, BM))[
+            None, None, 0, bm
+        ]  # [D, BM] = O^T tile
 
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
         k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
         # perm_M 挪到全局 K(_make_ktiles) -> MMA 不加 perm_M(N 方向已 shuffle)
         # GEMM1 = K@Q^T: wave 沿 query-M(MFMA 的 N 维)-> (1,WAVES,1);K 维(D)加 k_perm -> K 128-bit
-        tmma1 = fx.make_tiled_mma(mma, fx.make_layout((1, WAVES, 1), (1, 1, 0)), fx.make_tile(None, None, k_perm))
+        tmma1 = fx.make_tiled_mma(
+            mma,
+            fx.make_layout((1, WAVES, 1), (1, 1, 0)),
+            fx.make_tile(None, None, k_perm),
+        )
         # GEMM2 = (S@V)^T = V^T@S^T:交换 A/B -> C=O^T[D,Mq];wave 沿 query-M(现为 N 维)-> (1,WAVES,1);
         # K 维(Nk)加 k_perm -> A(V^T)每 lane 8 Nk -> 128-bit;C 累加器 4/lane 沿 D 连续 -> O 64-bit 写出
-        tmma2 = fx.make_tiled_mma(mma, fx.make_layout((1, WAVES, 1), (1, 1, 0)), fx.make_tile(None, None, k_perm))
+        tmma2 = fx.make_tiled_mma(
+            mma,
+            fx.make_layout((1, WAVES, 1), (1, 1, 0)),
+            fx.make_tile(None, None, k_perm),
+        )
         thr1 = tmma1.thr_slice(tid)
         thr2 = tmma2.thr_slice(tid)
 
-        cp_cg = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)  # 协作 global -> reg(合并)
-        cp_cs = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)     # reg -> LDS
-        cp_kr = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)     # k_lds -> frag_K(k_perm -> 128-bit)
-        cp_vg = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)  # V paged global -> frag_V(直读,不经 LDS)
-        cp_qg = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)   # Q global -> frag_Q(k_perm -> 128-bit)
-        cp_oc = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)   # O 输出(GEMM2 转置 -> C=O^T,4/lane 沿 D 连续 -> 64-bit 写出)
+        cp_cg = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(), fx.BFloat16
+        )  # 协作 global -> reg(合并)
+        cp_cs = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)  # reg -> LDS
+        cp_kr = fx.make_copy_atom(
+            fx.UniversalCopy128b(), fx.BFloat16
+        )  # k_lds -> frag_K(k_perm -> 128-bit)
+        cp_vg = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(), fx.BFloat16
+        )  # V paged global -> frag_V(直读,不经 LDS)
+        cp_qg = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(), fx.BFloat16
+        )  # Q global -> frag_Q(k_perm -> 128-bit)
+        cp_oc = fx.make_copy_atom(
+            fx.rocdl.BufferCopy64b(), fx.BFloat16
+        )  # O 输出(GEMM2 转置 -> C=O^T,4/lane 沿 D 连续 -> 64-bit 写出)
 
         # LDS: K 双缓冲(ping-pong),2*[BN,D];S 不入 LDS(register trick)
         @fx.struct
@@ -192,13 +248,19 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
         k_lds2 = _make_klds_view(lds.k_lds.ptr, BN, D)
         # V 直读 paged global 读源(head 偏移 kv_off):每 kv-tile [D,(8,NB)], v(8) inner -> 128-bit buffer_load
         v_g = fx.rocdl.make_buffer_tensor(
-            fx.make_view(fx.get_iter(V_) + kv_off, fx.make_layout((D, (8, NB), N // BN), (8, (1, D * 8), BN * D))),
+            fx.make_view(
+                fx.get_iter(V_) + kv_off,
+                fx.make_layout((D, (8, NB), N // BN), (8, (1, D * 8), BN * D)),
+            ),
             max_size=False,
         )
         # frag_V 的 B 模板:干净 [D,BN] tile(非 paged 嵌套),读取源才用 paged 分区
         v_fake = fx.flat_divide(
             fx.rocdl.make_buffer_tensor(
-                fx.make_view(fx.get_iter(V_) + kv_off, fx.make_layout((D, BN), (BN, 1))), max_size=False
+                fx.make_view(
+                    fx.get_iter(V_) + kv_off, fx.make_layout((D, BN), (BN, 1))
+                ),
+                max_size=False,
             ),
             fx.make_tile(D, BN),
         )[None, None, 0, 0]
@@ -215,35 +277,44 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
         fx.copy(cp_qg, tcQ.partition_S(q_tile), tcQ.retile(frag_Q))
 
         # fragment(形状固定)
-        frag_O = thr2.make_fragment_C(o_tile)                             # C=O[M,D](跨 KV 循环累加)
-        tcK = fx.make_tiled_copy_A(cp_kr, tmma1).get_slice(tid)            # k_lds -> frag_K
-        tcV = fx.make_tiled_copy_A(cp_vg, tmma2).get_slice(tid)            # paged global -> frag_V(直读)
+        frag_O = thr2.make_fragment_C(o_tile)  # C=O[M,D](跨 KV 循环累加)
+        tcK = fx.make_tiled_copy_A(cp_kr, tmma1).get_slice(tid)  # k_lds -> frag_K
+        tcV = fx.make_tiled_copy_A(cp_vg, tmma2).get_slice(
+            tid
+        )  # paged global -> frag_V(直读)
 
         frag_O.fill(0)
 
         # 双缓冲 prologue:coop K(0)->frag; 写 k_lds[0]; coop K(1)->frag; barrier
         frag_ldK = fx.make_fragment_like(coop_g.partition_S(k_tiles[None, None, 0, 0]))
         fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, 0, 0]), frag_ldK)
-        fx.copy(cp_cs, frag_ldK, coop_s.partition_D(k_lds2[0, None, None]))              # 写 stage 0
-        fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, 1, 0]), frag_ldK)          # 预取 K(1) coop
+        fx.copy(
+            cp_cs, frag_ldK, coop_s.partition_D(k_lds2[0, None, None])
+        )  # 写 stage 0
+        fx.copy(
+            cp_cg, coop_g.partition_S(k_tiles[None, None, 1, 0]), frag_ldK
+        )  # 预取 K(1) coop
         gpu.barrier()
 
         acc_init = frag_O.load()
         kcar_init = frag_ldK.load()  # frag_ldK 持 K(kv+1) coop 数据(loop-carried)
 
         # 循环内 fragment 提到循环外:形状固定,只分配一次,循环内复用(fill/store/copy 仍在循环内)
-        frag_K = thr1.make_fragment_A(k_lds2[0, None, None])                                # k_lds -> frag_K
-        frag_St = thr1.make_fragment_C(fx.make_rmem_tensor(fx.make_layout((BN, BM), (BM, 1)), fx.Float32))  # GEMM1 C=S^T
-        frag_Sb = thr2.make_fragment_B(fx.make_rmem_tensor(fx.make_layout((BM, BN), (BN, 1)), fx.BFloat16))  # GEMM2 B=S^T
-        frag_ldK_next = fx.make_fragment_like(coop_g.partition_S(k_tiles[None, None, 0, 0]))  # coop 预取 K(kv+2)
-        frag_V = thr2.make_fragment_A(v_fake)                                               # V 直读 -> frag_V
+        frag_K = thr1.make_fragment_A(k_lds2[0, None, None])  # k_lds -> frag_K
+        frag_St = thr1.make_fragment_C(
+            fx.make_rmem_tensor(fx.make_layout((BN, BM), (BM, 1)), fx.Float32)
+        )  # GEMM1 C=S^T
+        frag_Sb = thr2.make_fragment_B(
+            fx.make_rmem_tensor(fx.make_layout((BM, BN), (BN, 1)), fx.BFloat16)
+        )  # GEMM2 B=S^T
+        frag_ldK_next = fx.make_fragment_like(
+            coop_g.partition_S(k_tiles[None, None, 0, 0])
+        )  # coop 预取 K(kv+2)
+        frag_V = thr2.make_fragment_A(v_fake)  # V 直读 -> frag_V
 
         # hot_loop_scheduler 的指令数按实际 tile 尺寸算(BN=32,D=128 -> 8 dsrd / 2 dswr / 2 vmem / 32 mfma/GEMM)
         WARP = NT // WAVES  # 64
-        mfma_per_gemm = (BN // 16) * ((BM // WAVES) // 16) * (D // 16)  # 每个 GEMM 的 MFMA 数
-        n_dsrd = BN * D // (WARP * VECN)    # K LDS 读(frag_K,每 wave 读 [BN,D],128-bit)
-        n_dswr = BN * D // (NT * VECN)      # coop K LDS 写(NT 线程协作)
-        n_vmem = n_dswr                     # coop K global 读(与 coop 写同数)
+        n_dsrd = BN * D // (WARP * VECN)  # K LDS 读(frag_K,每 wave 读 [BN,D],128-bit)
 
         def hot_loop_scheduler(is_first_gemm):
             if is_first_gemm:
@@ -254,12 +325,19 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
                 rocdl.sched_vmem(100)
                 rocdl.sched_mfma(100)
             else:
-                for _ in range_constexpr(n_vmem):
+                if const_expr(use_long_sequence_schedule):
                     rocdl.sched_vmem(1)
                     rocdl.sched_dswr(1)
                     rocdl.sched_mfma(7)
-                    # rocdl.sched_group_barrier(2, 4, 0)
-                #rocdl.sched_mfma(mfma_per_gemm - 4 * n_dswr - n_dsrd)
+                    rocdl.sched_vmem(1)
+                    rocdl.sched_mfma(3)
+                    rocdl.sched_dswr(1)
+                    rocdl.sched_mfma(4)
+                else:
+                    for _ in range_constexpr(2):
+                        rocdl.sched_vmem(1)
+                        rocdl.sched_dswr(1)
+                        rocdl.sched_mfma(7)
                 for _ in range_constexpr(n_dsrd):
                     rocdl.sched_dsrd(1)
                     rocdl.sched_mfma(1)
@@ -289,7 +367,9 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
             for mt in range_constexpr(2):
                 gemm1_mt(mt)
             hot_loop_scheduler(True)
-            fx.copy(cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 2, 0]), ld_next)
+            fx.copy(
+                cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 2, 0]), ld_next
+            )
             if const_expr(softmax):
                 m_in, l_in = [m0, m1], [l0, l1]
                 m_out, l_out, corr = [None, None], [None, None], [None, None]
@@ -312,8 +392,9 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
                     l_out[mt] = fx.fma(l_in[mt], corr[mt], ts)
                     m_out[mt] = nm
                     frag_St[None, None, mt].store(p)
-                for mt in range_constexpr(2):                     # 旧 O 按 correction 缩放(GEMM2 累加前)
+                for mt in range_constexpr(2):  # 旧 O 按 correction 缩放(GEMM2 累加前)
                     ot = frag_O[None, None, mt]
+
                     def rescale_output():
                         ot.store(ot.load() * corr[mt])
 
@@ -324,11 +405,18 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
 
                     rescale_if_needed()
                 m0, m1, l0, l1 = m_out[0], m_out[1], l_out[0], l_out[1]
-            # register trick:S^T(启 softmax 时=P^T)直接作 GEMM2 的 B
-            frag_Stb = _cvt_f32_to_bf16(frag_St)  # add-0x8000 舍入,省 RNE+NaN 指令
-            frag_Sb.store(fx.select(frag_Stb, [0, 2, 1]).load())
-            # 写 K(kv+1)=ld_cur -> k_lds[wr] + 预取 coop K(kv+2) -> ld_next(与 GEMM2 重叠)
-            fx.copy(cp_cs, ld_cur, coop_s.partition_D(k_lds2[wr, None, None]))
+            # S^T(启softmax时=P^T)直接作GEMM2的B；长序列拆半转换以分散VALU。
+            if const_expr(use_long_sequence_schedule):
+                frag_Stb0 = _cvt_f32_to_bf16(frag_St[None, 0, None])
+                frag_Sb[None, None, 0].store(frag_Stb0.load())
+                # 写K(kv+1)=ld_cur -> k_lds[wr]，由scheduler与GEMM2重叠。
+                fx.copy(cp_cs, ld_cur, coop_s.partition_D(k_lds2[wr, None, None]))
+                frag_Stb1 = _cvt_f32_to_bf16(frag_St[None, 1, None])
+                frag_Sb[None, None, 1].store(frag_Stb1.load())
+            else:
+                frag_Stb = _cvt_f32_to_bf16(frag_St)
+                frag_Sb.store(fx.select(frag_Stb, [0, 2, 1]).load())
+                fx.copy(cp_cs, ld_cur, coop_s.partition_D(k_lds2[wr, None, None]))
             fx.gemm(mma, frag_O, frag_V, frag_Sb, frag_O)  # O^T = V^T @ P^T(交换 A/B)
             gpu.barrier()  # k_lds[wr] 写完可见
             # prefetch 下一步 K:读 k_lds[wr] -> frag_K(移到 GEMM2 之后,藏 LDS 读延迟)
@@ -342,24 +430,39 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
         # flash softmax 在线统计初值(per Mq-tile,每 lane 冗余):m=-inf, l=0（仅 softmax 时携带）
         loop_init = [acc_init, kcar_init, fragK_init]
         if const_expr(softmax):
-            loop_init += [fx.Float32(float("-inf")), fx.Float32(float("-inf")), fx.Float32(0.0), fx.Float32(0.0)]
+            loop_init += [
+                fx.Float32(float("-inf")),
+                fx.Float32(float("-inf")),
+                fx.Float32(0.0),
+                fx.Float32(0.0),
+            ]
 
         _encode_waitcnt(vmcnt=0)
         rocdl.sched_barrier(0)
         # 每轮处理 2 个 kv(偶=2*kv, 奇=2*kv+1);frag_ldK/frag_ldK_next 做 coop ping-pong;frag_K 携带 prefetch
-        for kv, state in range(fx.Index(0), fx.Index(N // BN // 2), fx.Index(1), init=loop_init):
+        for kv, state in range(
+            fx.Index(0), fx.Index(N // BN // 2), fx.Index(1), init=loop_init
+        ):
             frag_O.store(state[0])
             frag_ldK.store(state[1])  # 恢复 frag_ldK = K(2*kv+1) coop 数据
-            frag_K.store(state[2])    # 恢复上一步 prefetch 的 frag_K = K(2*kv)
+            frag_K.store(state[2])  # 恢复上一步 prefetch 的 frag_K = K(2*kv)
             if const_expr(softmax):
                 m0, m1, l0, l1 = state[3], state[4], state[5], state[6]
             else:
                 m0 = m1 = l0 = l1 = None
             kv0 = fx.Int32(kv) * 2
-            m0, m1, l0, l1 = kv_step(kv0, 1, frag_ldK, frag_ldK_next, m0, m1, l0, l1)      # 偶:写 k_lds[1]
-            m0, m1, l0, l1 = kv_step(kv0 + 1, 0, frag_ldK_next, frag_ldK, m0, m1, l0, l1)  # 奇:写 k_lds[0]
+            m0, m1, l0, l1 = kv_step(
+                kv0, 1, frag_ldK, frag_ldK_next, m0, m1, l0, l1
+            )  # 偶:写 k_lds[1]
+            m0, m1, l0, l1 = kv_step(
+                kv0 + 1, 0, frag_ldK_next, frag_ldK, m0, m1, l0, l1
+            )  # 奇:写 k_lds[0]
 
-            yield_vals = [frag_O.load(), frag_ldK.load(), frag_K.load()]  # frag_K = K(2*kv+2)
+            yield_vals = [
+                frag_O.load(),
+                frag_ldK.load(),
+                frag_K.load(),
+            ]  # frag_K = K(2*kv+2)
             if const_expr(softmax):
                 yield_vals += [m0, m1, l0, l1]
             results = yield yield_vals
@@ -377,8 +480,12 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
         fx.copy(cp_oc, tcO.retile(frag_Ob), tcO.partition_S(o_tile))
 
     @flyc.jit
-    def launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, stream: fx.Stream):
-        attn_kernel(Q, K, V, O).launch(grid=(M // BM, H, 1), block=(NT, 1, 1), stream=stream)
+    def launch(
+        Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, stream: fx.Stream
+    ):
+        attn_kernel(Q, K, V, O).launch(
+            grid=(M // BM, H, 1), block=(NT, 1, 1), stream=stream
+        )
 
     return launch
 
@@ -396,7 +503,9 @@ def torch_ref(Q, K, V, causal=False, softmax=True):
         P = torch.softmax(S, dim=-1)  # softmax over N(KV),f32
     else:
         P = S  # 阶段A:无 softmax、无 scale
-    O = torch.einsum("hmn,hnd->hmd", P.to(torch.bfloat16).float(), V.float()).to(torch.bfloat16)
+    O = torch.einsum("hmn,hnd->hmd", P.to(torch.bfloat16).float(), V.float()).to(
+        torch.bfloat16
+    )
     return S, O
 
 
@@ -416,25 +525,117 @@ def main():
     # 预 shuffle V 成 paged 布局 [H, N//8, D, 8];torch_ref 仍用原始 V
     V_shuf = V.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous()
 
+    _backend = os.environ.get("ATTN_FLY_BACKEND", "fly")
+    assert _backend in ("fly", "jit_all_vgpr", "compare_jit")
+    _use_jit_backend = _backend != "fly"
+    if _use_jit_backend:
+        from pyhip.core.fly_isa_priority import (
+            build_all_vgpr_jit_attention_kernel,
+            preshuffle_jit_key,
+            preshuffle_jit_value,
+        )
+
+        K_jit = preshuffle_jit_key(K)
+        V_jit = preshuffle_jit_value(V)
+    else:
+        K_jit = V_jit = None
+
     stream = torch.cuda.current_stream()
     o_fly = torch.empty(H, M, D, dtype=torch.bfloat16)
     args = (Q, K, V_shuf, o_fly, stream)
 
-    _softmax = os.environ.get("SOFTMAX", "1") == "1"  # 编译时开关:0=无 softmax 纯双 GEMM(应 ~260T)
-    print(f"[cfg] H={H} M={M} N={N} D={D} softmax={_softmax} softmax_impl=lazy_delta8")
-
-    compiled = fly_compiled(
-        (M, N, D, BM, BN, H, _softmax),
-        lambda: build(M, N, D, BM, BN, H=H, softmax=_softmax),
-        args,
+    _softmax = (
+        os.environ.get("SOFTMAX", "1") == "1"
+    )  # 编译时开关:0=无 softmax 纯双 GEMM(应 ~260T)
+    if _use_jit_backend and not _softmax:
+        raise ValueError("the archived jit_all_vgpr backend requires SOFTMAX=1")
+    _priority_mode = os.environ.get("ATTN_FLY_PRIORITY", "off")
+    _priority_mode = {"0": "off", "1": "post_isa", "on": "post_isa"}.get(
+        _priority_mode, _priority_mode
     )
+    assert _priority_mode in ("off", "post_isa", "compare")
+    if _backend != "fly" and _priority_mode != "off":
+        raise ValueError(
+            "ATTN_FLY_PRIORITY is only supported with ATTN_FLY_BACKEND=fly"
+        )
+    _use_post_isa = (
+        _backend == "fly" and _priority_mode != "off" and _softmax and N >= 32768
+    )
+    _priority_period = None
+    _priority_events = None
+    _dump_dir = (
+        Path(__file__).resolve().parents[2]
+        / ".cache"
+        / "fly-attn-priority"
+        / f"h{H}-m{M}-n{N}"
+    )
+    if _use_post_isa:
+        from pyhip.core.fly_isa_priority import parse_priority_events
+
+        _priority_period = int(os.environ.get("ATTN_FLY_PRIORITY_PERIOD", "64"))
+        _priority_events = parse_priority_events(
+            os.environ.get("ATTN_FLY_PRIORITY_EVENTS"), period=_priority_period
+        )
+        os.environ["FLYDSL_DUMP_IR"] = "1"
+        os.environ["FLYDSL_DUMP_DIR"] = str(_dump_dir)
+    print(
+        f"[cfg] H={H} M={M} N={N} D={D} backend={_backend} softmax={_softmax} "
+        f"softmax_impl=lazy_delta8 priority={_priority_mode} active={_use_post_isa} "
+        f"period={_priority_period} events={_priority_events}"
+    )
+
+    compiled = None
+    if _backend != "jit_all_vgpr":
+        compiled = fly_compiled(
+            (M, N, D, BM, BN, H, _softmax),
+            lambda: build(M, N, D, BM, BN, H=H, softmax=_softmax),
+            args,
+        )
+    kernel = compiled
+    if _use_jit_backend:
+        root = Path(__file__).resolve().parents[2]
+        jit_kernel, artifact = build_all_vgpr_jit_attention_kernel(
+            root
+            / "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
+            root / ".cache/jit-attn-all-vgpr",
+            m=M,
+            n=N,
+            h=H,
+        )
+        print(
+            f"[jit-all-vgpr] assembly={artifact.assembly_path} code_object={artifact.code_object_path}"
+        )
+        if _backend == "jit_all_vgpr":
+            kernel = jit_kernel
+    if _use_post_isa:
+        from pyhip.core.fly_isa_priority import build_attention_priority_kernel
+
+        kernel, artifact = build_attention_priority_kernel(
+            _find_final_isa(_dump_dir),
+            _dump_dir / "post-isa",
+            m=M,
+            h=H,
+            block_m=BM,
+            period=_priority_period,
+            events=_priority_events,
+        )
+        print(
+            f"[post-isa] assembly={artifact.assembly_path} code_object={artifact.code_object_path}"
+        )
+        kernel(Q, K, V_shuf, o_fly, stream)
+    elif _backend == "jit_all_vgpr":
+        kernel(Q, K_jit, V_jit, o_fly, stream)
+    elif _backend == "compare_jit":
+        jit_kernel(Q, K_jit, V_jit, o_fly, stream)
     torch.cuda.synchronize()
 
     # ---- 精度 ----
     _, o_ref = torch_ref(Q, K, V, softmax=_softmax)
     diff = (o_fly.float() - o_ref.float()).abs()
     rel = diff.norm() / o_ref.float().norm().clamp_min(1e-6)
-    print(f"[acc] max_abs={diff.max().item():.4f} mean_abs={diff.mean().item():.5f} rel_l2={rel.item():.5f}")
+    print(
+        f"[acc] max_abs={diff.max().item():.4f} mean_abs={diff.mean().item():.5f} rel_l2={rel.item():.5f}"
+    )
 
     # ---- 性能:多 buffer 轮换 + cudaPerf 计时 ----
     from pyhip import cudaPerf
@@ -447,6 +648,11 @@ def main():
     Ks = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
     Vs = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
     V_shufs = [v.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous() for v in Vs]
+    if _use_jit_backend:
+        K_jits = [preshuffle_jit_key(k) for k in Ks]
+        V_jits = [preshuffle_jit_value(v) for v in Vs]
+    else:
+        K_jits = V_jits = None
     o_flys = [torch.empty(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
 
     run_count = 50
@@ -467,8 +673,100 @@ def main():
         uss.sort()
         return uss[run_count // 2], tfs[run_count // 2]
 
-    us_fly, tf_fly = perf(lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream), "attn_fly")
-    print(f"[perf] fly  : {us_fly:8.1f} us  {tf_fly:7.1f} TFLOPS  ({mem_bytes / us_fly / 1e3:.0f} GB/s)")
+    def paired_perf(control, candidate):
+        pair_count = int(os.environ.get("ATTN_FLY_PAIR_COUNT", "12"))
+        max_control_drift = float(os.environ.get("ATTN_FLY_MAX_CONTROL_DRIFT", "0.05"))
+
+        def measure(fn, index, name):
+            with cudaPerf(flops, mem_bytes, name=name, verbose=0) as measurement:
+                fn(index)
+            return measurement.dt() * 1e6
+
+        ratios, controls, candidates = [], [], []
+        index = 0
+        for _ in range(pair_count):
+            control_before = measure(control, index, "attn_fly_base_before")
+            candidate_first = measure(
+                candidate, (index + 1) % BUF_COPY, "attn_fly_priority_first"
+            )
+            candidate_second = measure(
+                candidate, (index + 2) % BUF_COPY, "attn_fly_priority_second"
+            )
+            control_after = measure(
+                control, (index + 3) % BUF_COPY, "attn_fly_base_after"
+            )
+            index = (index + 4) % BUF_COPY
+
+            control_us = (control_before + control_after) / 2
+            candidate_us = (candidate_first + candidate_second) / 2
+            control_drift = abs(control_after - control_before) / control_us
+            if control_drift <= max_control_drift:
+                controls.append(control_us)
+                candidates.append(candidate_us)
+                ratios.append(candidate_us / control_us)
+
+        if not ratios:
+            raise RuntimeError(
+                f"no valid C-X-X-C pairs: all {pair_count} controls drifted by more than {max_control_drift:.1%}"
+            )
+
+        controls.sort()
+        candidates.sort()
+        ratios.sort()
+        middle = len(ratios) // 2
+        return {
+            "valid": len(ratios),
+            "total": pair_count,
+            "control_us": controls[middle],
+            "candidate_us": candidates[middle],
+            "ratio": ratios[middle],
+        }
+
+    if _backend == "compare_jit":
+        paired = paired_perf(
+            lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
+            lambda i: jit_kernel(Qs[i], K_jits[i], V_jits[i], o_flys[i], stream),
+        )
+        tf_base = flops / paired["control_us"] / 1e6
+        tf_jit = flops / paired["candidate_us"] / 1e6
+        print(
+            f"[paired-jit] valid={paired['valid']}/{paired['total']} "
+            f"fly={paired['control_us']:.1f}us/{tf_base:.1f}T "
+            f"jit_all_vgpr={paired['candidate_us']:.1f}us/{tf_jit:.1f}T "
+            f"time_ratio={paired['ratio']:.5f} speedup={1 / paired['ratio'] - 1:.2%}"
+        )
+    elif _priority_mode == "compare" and _use_post_isa:
+        paired = paired_perf(
+            lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
+            lambda i: kernel(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
+        )
+        tf_base = flops / paired["control_us"] / 1e6
+        tf_priority = flops / paired["candidate_us"] / 1e6
+        print(
+            f"[paired] valid={paired['valid']}/{paired['total']} "
+            f"base={paired['control_us']:.1f}us/{tf_base:.1f}T "
+            f"priority={paired['candidate_us']:.1f}us/{tf_priority:.1f}T "
+            f"time_ratio={paired['ratio']:.5f} speedup={1 / paired['ratio'] - 1:.2%}"
+        )
+    else:
+        if _backend == "jit_all_vgpr":
+
+            def launch(i):
+                kernel(Qs[i], K_jits[i], V_jits[i], o_flys[i], stream)
+
+        else:
+
+            def launch(i):
+                kernel(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream)
+
+        microseconds, tflops = perf(
+            launch,
+            f"attn_{_backend}",
+        )
+        print(
+            f"[perf] {_backend}: {microseconds:8.1f} us  {tflops:7.1f} TFLOPS  "
+            f"({mem_bytes / microseconds / 1e3:.0f} GB/s)"
+        )
 
 
 if __name__ == "__main__":

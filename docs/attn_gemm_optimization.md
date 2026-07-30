@@ -442,11 +442,12 @@ softmax 的跨-lane 归约是**列向的跨-row all-reduce**:`frag_St` 的 C 布
 Mq = `l%16`(列)。over Nk 归约 = 合并 4 个行组(l//16),即 `xor 16` + `xor 32`。当前分别降为
 `ds_swizzle_b32 SWAP,16`(xor16,32-lane 组内)和 `ds_bpermute_b32`(xor32,跨 32-lane)。
 
-**gfx942(CDNA3)无法用 DPP 消掉它们**:
+**gfx942(CDNA3)无法用少量 DPP 指令消掉它们**:
 - `permlane16` / `v_permlanex16` / `row_xmask` DPP 都是 `isGFX10Plus`(RDNA)特性,CDNA3 没有。
 - DPP row 操作只在 **16-lane 行内**(offset 1/2/4/8);`row_bcast:15/31` 是**单 lane 广播**,会混掉不同 Mq 列,
   不能做列向归约。
-- 因此 gfx942 上寄存器级的列向跨-row 归约无 DPP 通路;LDS(ds_swizzle/ds_bpermute)或 readlane/writelane 是仅有选项。
+- `wave_rol:1`能跨row且最终保持`lane%16`列,但每条只能rotate 1 lane。连续执行16/32/48步可以取到
+  `{lane+16,lane+32,lane+48}`,数学上能完成四row归约,代价见§22.10。
 
 **要彻底去掉 ds 归约,只能让归约变成行内(intra-row)**:即 GEMM1 改算 S[Mq, Nk](Nk 成为列 `l%16`)→ over Nk
 = 行内 DPP(xor 1/2/4/8)。但这要求 GEMM2 也转置成 O[Mq,D](A=S、B=V),连带改 V 的 B-operand 布局与 O 的存出
@@ -459,8 +460,8 @@ Mq = `l%16`(列)。over Nk 归约 = 合并 4 个行组(l//16),即 `xor 16` + `xo
 | baseline(有 ds 归约) | 0.00311(正确) | 150.5 |
 | probe(去掉 ds 归约) | 错(仅测速) | 151.1 |
 
-**差 +0.4%** ——`ds_swizzle`/`ds_bpermute` 已被 MFMA 流水完全掩盖,**不是瓶颈**;而且 gfx942 上 DPP 也做不了列向跨-row
-归约(`dpp_xor_f32` 只有 1/2/4/8,够不到 xor16/32)。所以 DPP 重构对本核**无收益**,不做。
+**差 +0.4%** ——`ds_swizzle`/`ds_bpermute` 已被 MFMA 流水大量掩盖。§22.10进一步证明连续
+`wave_rol:1`虽能正确完成列向跨-row归约,但指令膨胀使性能严重回退,因此生产kernel仍保留DS路径。
 softmax 的 −38% 开销来自别处:VGPR 204→247(挤压调度)、`v_exp_f32`、以及在线 softmax 的 `v_pk_mul`/`v_sub`/`v_add`
 (缩放/correction/rescale)占用 VALU 发射槽 —— 优化要往**压 VGPR / 减 VALU / 调度**方向,而非跨-lane 归约。
 
@@ -663,10 +664,11 @@ ATT(dispatch 86,完整 128 workgroup grid)结果:
 因此 K-LDS pipeline 的 overlap 已较好,真正不足的是 softmax VALU/EXP 与 MFMA overlap。ATT 同时显示总 stall
 48.63M/80.56M=60.4%;其中 MFMA dependency 49.6%,softmax packed add/mul 链是主要 non-MFMA stall。
 
-后续使用固定 ISA 微基准进一步区分了“时间线上落入 MFMA busy window”和“硬件允许 co-issue”:
+后续使用固定 ISA 微基准进一步区分了“时间线上落入 MFMA busy window”、fully hidden和partial co-issue:
 gfx942 不提供 `SQ_VALU_MFMA_COEXEC_CYCLES`;LLVM gfx94x 将 TRANS(`v_exp_f32`/`v_rcp_f32`)和 packed FP32
-add/mul 标为 never-coissue。实测 `v_pk_mul_f32`/`v_pk_add_f32` 在 gap0 额外阻塞约 20 clocks/MFMA,
-gap>=8 才恢复;普通 `v_add_f32`/`v_perm_b32` 无额外 penalty。完整方法与脚本见
+add/mul 标为 never-coissue。该调度模型标记不等于组合时间必然是两条指令之和:正式微基准测得
+MFMA+EXP约20.056 cycle,相对完全串行的32.026 cycle仍有74.8% overlap。packed FP32的gap0实验则确有
+额外阻塞;普通`v_add_f32`/`v_perm_b32`无额外penalty。完整定义、方法与脚本见
 [`docs/mfma-valu-coissue.md`](mfma-valu-coissue.md)。因此 ATT 的 13.29% 是 issue 时间线 overlap 指标,
 不能替代缺失的硬件 co-exec counter。
 
@@ -689,10 +691,9 @@ gap>=8 才恢复;普通 `v_add_f32`/`v_perm_b32` 无额外 penalty。完整方�
 
 1. **已完成:GEMM1 拆分两个独立 Mq accumulator group。** 结果见 §16。拆分本身小幅提升到 166.7 TFLOPS;
   但把 `softmax(mt0)` 插进两个 GEMM1 group 之间会回退到 161.8,没有形成有效 co-issue。
-2. **优先后续:真正的双 wave-specialization workgroup。** 把单 workgroup 从 4 waves 扩为 8 waves,两组 4-wave
-  pipeline 用 workgroup 内条件 barrier 打开/关闭一拍相位差,类似 gfx950 dual-wave SWP。当前两个驻留 wave
-  来自不同 workgroup,block 奇偶 sleep 无法稳定配对。风险是 Q/K/V/O fragment 或 LDS 翻倍、workgroup 数减半;
-  必须保持每组独立 K stage,否则 barrier 会重新锁步。
+2. **已验证并回退:8-wave双pipeline。** §20把单workgroup扩成8 waves,测试两组独立K stage、GEMM1后
+  两相握手和延迟GEMM2。最佳版本虽保持完整MFMA链并降低issue wait,但全组barrier使dependency wait翻倍,
+  最终从170.5T回退到150.5T。
 3. **低风险但收益有限:减少剩余 VALU/EXP,而非继续加 scheduler hint。** correction exp 会被 LLVM 投机执行;
   side-effecting inline exp 已测 160.1 TFLOPS。可尝试针对 `v_exp_f32` 的近似多项式/分段近似,但需保持
   `rel_l2 <=0.0035` 并覆盖大 logits/长序列。每 tile 固有的 16 个 probability exp 才是主要目标。
@@ -937,15 +938,16 @@ gfx942 没有 `v_cvt_pk_bf16_f32`/`v_cvt_bf16_f32`:ROCm assembler 会拒绝,LLVM
 
 ### 后续机会排序
 
-1. **结构性增加独立 wave 工作(优先):**当前 53.95% issue wait说明继续重排同一 softmax 依赖链收益有限。
-  最值得验证的是 8-wave workgroup 内两套 4-wave pipeline显式错相,让一组 softmax/EXP时另一组发 MFMA/VMEM;
-  这比跨 workgroup `s_sleep` 更能保证同一 CU 内配对。代价是 K stage/LDS ownership和 barrier必须完全独立。
+1. **8-wave双pipeline已验证并回退:**§20让两套4-wave pipeline显式错相,且保留每wave完整MFMA链。
+  issue wait仅下降1%,全workgroup barrier却使dependency wait增加120.8%,最佳版本只有150.5T。gfx942缺少
+  4-wave子组named barrier,当前结构无法低成本维持相位差。
 2. **VGPR 降档需要大改,不是微调:**LLVM gfx942 模型为 512 VGPR/SIMD、8-VGPR分配粒度。当前 240
   VGPR静态 occupancy 为 2 waves/SIMD;3 waves要求 **≤168 VGPR**,即至少减少 72。236/192/176 VGPR仍只有
   2 waves。可研究每 wave 只负责 16 query rows(减半 `frag_Q/frag_St/frag_O`)的 8-wave tile,但 K/V广播
   和访存重复可能抵消收益,必须先做资源/流量模型。
-3. **减少 probability EXP:**`v_exp_f32` 为 4,610/wave且 TRANS不能与 MFMA共发。correction EXP的条件执行
-  已因调度损失回退;剩余可研究有误差上界的 `exp2` 分段近似,门槛仍为 `rel_l2<=0.0035`,并需覆盖全1、
+3. **减少 probability EXP:**`v_exp_f32`为4,610/wave;它不能被MFMA fully hidden,但正式微基准显示约
+  74.8%的partial overlap。correction EXP的条件执行已因调度损失回退;剩余可研究有误差上界的`exp2`
+  分段近似,门槛仍为`rel_l2<=0.0035`,并需覆盖全1、
   单调 logits和长序列。多项式若需要过多 scalar VALU,可能只把 TRANS瓶颈换成更长 issue 链。
 4. **不再优先:**LDS swizzle/prefetch、L2/HBM、packed score FMA、Q BF16预缩放、BF16 truncate、
   scheduler mask/setprio/sleep。PMC 或直接 A/B 已否定这些局部方向。
@@ -967,29 +969,31 @@ GEMM1(mt1) -> softmax(mt1) -> GEMM2(mt1)
 2. `softmax(mt1) ↔ GEMM2(mt0)`。
 
 但“数据独立”只说明允许重排,不保证能免费共发。gfx942的
-`v_mfma_f32_16x16x16_bf16` shadow为16 cycles;普通scalar VALU可共发,而packed FP32、TRANS/EXP和MFMA
-本身是never-coissue。line 303的lazy条件在最终ISA中被if-convert为`v_cmp_gt_f32 + v_cndmask_b32`,没有形成
+`v_mfma_f32_16x16x16_bf16` shadow为16 cycles;普通scalar VALU可被fully hidden,packed FP32不能;
+TRANS/EXP不能被fully hidden,但与MFMA存在约74.8%的partial overlap。line 303的lazy条件在最终ISA中被
+if-convert为`v_cmp_gt_f32 + v_cndmask_b32`,没有形成
 控制流basic-block边界;假设去掉该条件只会删除比较/选择和投机correction EXP,不会解除mt0/mt1之间的依赖。
 
 ### 单mt指令预算与理论遮盖上限
 
 当前每个mt有16条GEMM1 MFMA,softmax主体的静态工作量约为:
 
-| 阶段 | 典型指令 | 可与MFMA共发 |
+| 阶段 | 典型指令 | 可被MFMA fully hidden |
 |---|---|---|
 | score scale | 8条`v_pk_mul_f32` | **否** |
 | local max | 1 `v_max_f32` + 3 `v_max3_f32` | 是 |
 | wave max | 2 DS shuffle/read + 4 scalar max | scalar max可,DS另管线 |
 | lazy选择 | cmp/cndmask;无条件假设下可删除 | 是 |
 | center | 8条`v_sub_f32` | 是 |
-| probability | 8条`v_exp_f32` | **否** |
+| probability | 8条`v_exp_f32` | **否,但有partial overlap** |
 | local/wave sum | 7 scalar add + 2 DS shuffle/read + 4 scalar add | scalar add可 |
 | running sum | 2条scalar FMA | 是 |
-| correction/O-rescale | 1 correction EXP + 条件packed MUL | **否** |
+| correction/O-rescale | 1 correction EXP + 条件packed MUL | **否;EXP有partial overlap** |
 
 在无line303条件的理想模型里,可作为MFMA shadow候选的scalar VALU约为
 `4 local-max + 4 wave-max + 8 center + 11 sum + 2 running-FMA = 29条/mt`;另有4条DS归约。
-8条packed scale、8条probability EXP以及correction/O-rescale不能由MFMA shadow遮盖。
+8条packed scale、8条probability EXP以及correction/O-rescale不能由MFMA fully hidden;其中EXP仍可与MFMA
+形成约74.8%的partial overlap。
 
 为测量容量,额外运行了固定32-cycle period、每条MFMA后0–4条独立FMAC的gfx942微基准:
 
@@ -1002,7 +1006,8 @@ GEMM1(mt1) -> softmax(mt1) -> GEMM2(mt1)
 | 4 | 20.0 | 16 | 该固定period下反而+4 |
 
 因此不能把16-cycle shadow简单解释为“每条MFMA免费塞4条VALU”。在该一wave probe中,即使普通VALU被判为
-`coissue-capable`,加入它仍增加固定period总周期;收益来自相比never-coissue指令更少的阻塞,而不是零成本。
+`coissue-capable`,加入它仍增加固定period总周期;收益来自更少的阻塞,而不是零成本。后续无固定period的
+正式微基准进一步测得MFMA+EXP也有partial overlap,因此不能把旧`never-coissue`标签解释为零overlap。
 16条mt1 MFMA最多容纳约32条实用scalar候选(每MFMA 2条后边际收益很小),数量上刚好覆盖29条,
 但理论时间收益上限很低,而且依赖链只能分阶段释放这些候选。
 
@@ -1061,13 +1066,2225 @@ line303条件保留,EXP与packed指令不进入MFMA组。最终精度正确、VG
 ### 最终结论
 
 - **合理性:**依赖分析正确,两个交织窗口都存在。
-- **可遮盖量:**数量上最多约29条scalar VALU/mt可成为候选,但packed scale、8条EXP和条件packed rescale不能
-  遮盖;微基准显示scalar插入也不是零成本。
+- **可遮盖量:**数量上最多约29条scalar VALU/mt可成为候选;packed scale、8条EXP和条件packed rescale不能
+  被MFMA fully hidden,但EXP存在约74.8%的partial overlap;微基准显示scalar插入也不是零成本。
 - **实测:**手工两窗口和LLVM IGLP都回退。前者破坏MFMA链ILP并增加dependency wait,后者扩大live range导致
   occupancy降档。
 - **softmax(mt1)的合适机会:**仍是GEMM2(mt0),但必须在**不拆MFMA accumulator链且不扩张到>256 VGPR**的
-  条件下由更强的后端全局scheduler实现;当前FlyDSL/LLVM hint均未满足。更现实的方向仍是跨wave/双pipeline
-  隐藏softmax,让一个wave的完整MFMA链与另一个wave的softmax并行。
+  条件下由更强的后端全局scheduler实现。§20进一步验证跨wave双pipeline也受gfx942全组barrier限制;
+  当前FlyDSL/LLVM hint和8-wave软件协议均未满足低成本重叠条件。
+
+## 20. 8-wave跨wave双pipeline验证
+
+### 目标与实现
+
+本轮把一个4-wave、`BM=128`的workgroup扩展成8 waves、`BM=256`,同一workgroup内形成两组4-wave
+pipeline。每个wave仍负责32行query,GEMM1/GEMM2的单wave tile和MFMA accumulator链均不变。与§19的
+同wave细粒度交织不同,这里不在源码中拆分任何GEMM MFMA链,而是让一组wave执行完整MFMA链时,另一组执行
+softmax/EXP。
+
+测试了四种相位和K ownership方案：
+
+| 8-wave变体 | K LDS | 相位方法 | VGPR | 标准性能 |
+|---|---:|---|---:|---:|
+| 仅入口整步错相 | 32KB,每组独立双缓冲 | 组B入口多等一个全组barrier | 242 | 133.6T |
+| **GEMM1后两相握手** | **32KB,每组独立双缓冲** | A的softmax/GEMM2与B的完整GEMM1交替 | **242** | **150.5T** |
+| 延迟GEMM2 | 16KB,前4 waves生产共享K | B执行`GEMM2(i-1)->GEMM1(i)->softmax(i)` | 232 | 132.3T |
+| 延迟GEMM2+8-wave协作K | 16KB,8 waves共同搬K | 同上,去掉重复K global/LDS搬运 | 232 | 125.8T |
+
+工作负载均为`H=8,M=N=8192,D=128`,精度均为`rel_l2=0.00316`。本轮4-wave基线实测
+168.9–170.5T,最终恢复后为`1612.4 us / 170.5T`;最佳8-wave版本稳定三次为
+`1826.5–1826.8 us / 150.5T`,仍回退10.9–11.7%。
+
+### MFMA链与资源核对
+
+最终ISA中4-wave基线和最佳两相8-wave版本均为128条静态MFMA,连续MFMA段的数量和长度分布完全相同：
+
+```text
+segments=64
+length histogram={1:37, 2:15, 3:7, 4:2, 10:1, 11:2}
+```
+
+因此本轮满足“每个wave内部保留完整MFMA链”的约束,没有复现§19手工拆链造成的dependency问题。最佳8-wave
+版本为242 VGPR、32KB LDS、零scratch,相对基线240 VGPR、16KB LDS、零scratch;两者都保持2 waves/SIMD,
+回退也不是VGPR occupancy降档。
+
+### PMC根因
+
+对4-wave基线和最佳“GEMM1后两相握手”版本采集相同四个counter。两版总工作量都是2048 waves：基线为
+512个4-wave workgroup,双pipeline为256个8-wave workgroup。以下是最后50个主kernel dispatch的中位数：
+
+| cycles/wave | 4-wave基线 | 8-wave双pipeline | 变化 |
+|---|---:|---:|---:|
+| total | 218,845 | 251,453 | +32,608(+14.9%) |
+| active | 72,806(33.27%) | 73,054(29.05%) | +248 |
+| dependency wait | 27,756(12.68%) | **61,286(24.37%)** | **+33,530(+120.8%)** |
+| issue wait | 118,283(54.05%) | **117,114(46.57%)** | -1,169(-1.0%) |
+
+跨wave错相确实让issue wait下降,但下降只有约1,169 cycles/wave;用于建立和维持相位的全workgroup barrier
+使dependency wait增加约33,530 cycles/wave,完全抵消重叠收益。active cycles几乎不变,也证明算术工作量没有
+实质增加。
+
+gfx942只提供全workgroup `s_barrier`;FlyDSL/LLVM中的`s_barrier_signal/wait`和named barrier标为
+gfx1200+/gfx1250+。因此gfx942无法直接建立两套互不锁步的4-wave子组barrier。两组即使拥有独立K LDS,
+仍必须经过全组barrier握手;共享K版本则必须在每个K stage边界重新会合。延迟GEMM2虽去掉额外半程barrier,
+却需要跨`scf.for`携带上一拍的V/P fragment并增加动态分支,性能进一步回退。
+
+### 结论
+
+- 跨wave双pipeline在依赖和数值上可行,并且可以完整保留每wave的MFMA链。
+- 在gfx942上,缺少4-wave子组barrier使同步成本远大于减少的issue wait;8-wave workgroup本身不能自动形成有效错相。
+- 所有实验代码均已回退,当前kernel继续保留`lazy Δ=8 + GEMM1 mt拆分 + running-sum fx.fma`最快路径。
+- 该结构更适合gfx1250等支持named barrier的平台;gfx942若继续研究,需要无barrier的持久wave协议或硬件级
+  workgroup间配对,而不是继续增加全组barrier。
+
+## 21. PyHIP JIT精确交织
+
+### 实现
+
+[`tests/core/test_attn_gemm_jit.py`](../tests/core/test_attn_gemm_jit.py)改为与Fly生产kernel相同的4-wave结构：
+
+- 固定`D=128,BM=128,BN=32`,一个256-thread workgroup包含4 waves,每wave负责32行query;
+- 每wave内部有两个独立16行`mt`,寄存器状态为`score[2,2,4]`、`P_bf16[2,2,2]`和
+  `O[2,8,4]`;
+- Q/K/V在host侧预排布为MFMA物理布局。K由4 waves协作global读取,经`S<3,3,3>`等价字节swizzle
+  写入16KB双缓冲LDS;V保持每wave直接128-bit global读取;
+- 在线softmax与Fly一致:log2域scale、lazy $\Delta=8$、running-sum FMA、条件O重缩放和BF16
+  round-half-up;
+- O转置后使用16条`buffer_store_dwordx2`,不再逐BF16 short store。
+
+最终只保留最快生产调度,不再保留8-wave barrier路径和顺序对照分支。两个合法的同wave窗口由PyHIP
+generator和`J.emit`直接决定机器码顺序：
+
+1. `softmax(mt0) -> GEMM1(mt1)`;
+2. `softmax(mt1) -> GEMM2(mt0)`。
+
+当前每个窗口把16条MFMA按`prepare/center/finish = 5/3/8`分配。`v_exp_f32`和packed
+FP32操作不能被MFMA fully hidden,仍留在两个scalar窗口之间;max、ADD、FMA、compare、cndmask和BF16打包
+按gfx942实测共发容量插入MFMA之间。GEMM1保持`k_half -> n_block`顺序,同一score accumulator之间
+至少隔一条独立MFMA;GEMM2保持`n_block -> d_block`,在8个D accumulator间轮转。
+
+访存流水也与计算窗口合并：
+
+- 8条V load与`GEMM1(mt0)`按`1 load + 2 MFMA`交错;
+- future-K的两条协作VMEM分别插入`softmax(mt0)`两次max shuffle等待窗口;
+- 两条next-K LDS写分别插入softmax1的`DS reduce -> wait -> consume`窗口,最终顺序为
+  `DS reduce -> K write -> lgkmcnt(1) -> consume`;barrier位置和数量不变;
+- barrier后8条下一K `ds_read_b128`与`GEMM2(mt1)`按`1 read + 2 MFMA`交错。
+
+### 正确性与机器码
+
+小尺寸和标准尺寸均通过同一个PyTorch BF16参考：
+
+```text
+small: rel_l2=0.00315
+8192:  rel_l2=0.00316
+```
+
+最终ISA资源和核心静态指令如下：
+
+```text
+VGPR                   = 150
+AGPR                   = 64
+LDS                    = 16384 bytes
+occupancy              = 2 waves/SIMD
+scratch / spill         = 0
+v_mfma_*               = 128
+v_exp_f32              = 36
+ds_swizzle / bpermute  = 8 / 8
+ds_read_b128           = 24
+buffer_load_dwordx4    = 32
+buffer_store_dwordx2   = 16
+```
+
+最终机器码明确出现`DS shuffle -> MFMA -> independent VALU/VMEM -> lgkmcnt wait -> consume`。例如max
+归约第一步依次发出`ds_swizzle`、一条独立MFMA、lazy-threshold ADD、future-K VMEM,最后才等待并消费
+shuffle结果;sum归约用同样窗口提前提交`running_max`更新和`correction_pk`准备。softmax1还形成
+`ds_swizzle/bpermute -> ds_write_b128 -> s_waitcnt lgkmcnt(1) -> consume`,使较新的K写保持在途,
+只等待较早的归约结果。这不是源码层面的推测,而是最终ISA中的实际顺序。
+
+### 性能（早期171.7T里程碑）
+
+`H=8,M=N=8192,D=128`,GPU 2,多buffer、50次中位数：
+
+| 版本 | 时间 | TFLOPS |
+|---|---:|---:|
+| 4-wave顺序JIT | 2172 us | 126.6 |
+| 第一交织窗口 + K协作LDS | 1830 us | 150.3 |
+| 加第二交织窗口 | 1693 us | 162.4 |
+| scalar sum进入MFMA shadow | 1661 us | 165.5 |
+| DS后插1条MFMA,独立VALU填wait | 1621 us | 169.6 |
+| future-K VMEM填max-shuffle wait | **1601 us** | **171.7** |
+| 当前FlyDSL生产路径 | 1612 us | 170.5 |
+
+最终同机各重复3次：
+
+```text
+JIT: 1601.0 / 1601.6 / 1600.8 us = 171.7 / 171.6 / 171.7 TFLOPS
+Fly: 1612.8 / 1612.6 / 1611.8 us = 170.4 / 170.5 / 170.5 TFLOPS
+```
+
+JIT中位数比Fly低约11.6 us,吞吐高约0.7%,达到“至少与Fly一致”的目标。
+
+ATT解释了最后一段收益。只在DS后插一条MFMA时,LDS/SMEM wait仍为10.32M cycles,占全部stall的
+26.2%。继续把threshold ADD、running-max move、correction打包和future-K VMEM放到shuffle与wait之间后,
+最终ATT降到6.48M cycles和16.8%;总stall为38.50M cycles。两条MFMA间隔虽然隐藏更多DS延迟,但破坏
+MFMA整体顺序并回退到167.1T,因此没有保留。
+
+最终PMC中JIT与Fly均为`16384 MFMA/wave`和`2588 VMEM/wave`;JIT用更多可共发scalar VALU换取更低
+墙钟时间。跨lane归约仍是后续可优化点,但gfx942不支持`v_permlane16[_swap]_b32`,必须继续通过DS流水
+隐藏,不能照搬gfx950专用指令。
+
+### 后续激进实验（2026-07-27）
+
+在171.7T版本上继续验证了EXP、occupancy和更细粒度调度。仅保留能证明无损的代码变化：
+
+- probability BF16打包直接覆盖已死亡的`score[...,0:2]`,删除独立概率fragment,VGPR由158降到150;
+- xor32的`ds_bpermute`字节地址提到prologue复用,减少热循环重复XOR/shift;
+- correction EXP先发射,用8条独立probability EXP隐藏其结果延迟,最后才执行cndmask;
+- prepare阶段的rebase VCC跨EXP保持有效,复用它删除第二次相同比较。
+
+空闲GPU上前两项把标准性能稳定抬到约`1599.9 us / 171.8T`;后两项精度和最终ISA已验证,但复测时
+8张GPU均被外部作业占满（约95–100% busy、每卡约178GB VRAM）,不记录受干扰的墙钟数字。
+
+已验证并回退：
+
+| 实验 | 结果 | 原因 |
+|---|---:|---|
+| correction EXP逐lane条件分支 | 170.7T | exec-mask/branch破坏调度 |
+| correction EXP wave-uniform分支 | 171.2T | basic-block开销仍超过跳过收益 |
+| 无branch exec-mask EXP | 170.5T | saveexec/restore与TRANS调度屏障 |
+| probability EXP穿插MFMA | 170.3T | 手工顺序破坏MFMA链,未兑现微基准中的partial overlap |
+| 全probability三阶range-reduced exp2 | 167.0T | 每元素floor/cvt/ldexp+3 FMA过多 |
+| 仅correction三阶近似 | 171.5T | 7条VALU与额外VGPR不值1条EXP |
+| packed score scale | 165.1T | gfx942 packed FP32 never-coissue |
+| 一次性workgroup启动错相 | ≤172.0T | 相位不能靠一次delay稳定维持 |
+| K流式（126 VGPR+64 AGPR） | 149.7T | 未跨3-wave阈值且K LDS读翻倍 |
+| K/V双流式（126+40,3 waves） | 111.8T | 重复V global与vmcnt等待过重 |
+| K流式+V协作LDS（132+32,3 waves） | 134.1T | V LDS读写与额外barrier抵消occupancy |
+
+还验证了`lazy Δ=64 + rebase时correction=0`:随机8192可到176.5T,但对抗序列
+`[0,63,63,63,63,63,63,66]`（log2 tile max）中输出`-1.0`,参考`-0.07617`,因此该近似不安全并已回退。
+
+当时进一步把max/running-max保留在raw score域,用scalar FMA融合scale+center。small、8192和上述
+对抗输入精度均通过,资源仍为150 VGPR+64 AGPR;每双tile把`28 MUL + 36 SUB`改为`36 FMA`（净减28条
+VALU）,并按`prepare/center/finish = 7/4/5`放入MFMA shadow。在8卡外部作业持续满载时,用同一进程、
+共享buffer、交替顺序做两轮各100对计时:raw/base中位比值分别为`0.99907`和`0.99915`,胜出81/100和
+73/100次。该变化方向稳定但仅约0.08–0.09%;绝对TFLOPS仍需空闲GPU复测,不得把受干扰数据描述为
+“大幅领先”。
+
+此后的空闲GPU无尾批优化将调度更新为5/3/8,并加入wait前K写;当前最终结果为194.5T,见§22.9。
+
+## 22. 基于co-issue实测吞吐的softmax+GEMM性能上限
+
+本节只分析当前BF16 4-wave JIT,不继续实现新优化。FP16 GEMM2实验已放弃并从代码删除。分析输入为：
+
+- 当前JIT最终ISA:`H=1,M=N=40960,D=128,BM=128,BN=32`;
+- gfx942正式微基准:
+  `/tmp/coissue-canonical-10x-gfx942.json`;
+- MI308X:80 CU,4 SIMD/CU;按指定主频1.8GHz计算（硬件额定上限1850MHz只作敏感性分析）;
+- 每workgroup 4 waves,恰好每SIMD一条wave;
+- FLOPs按两次GEMM计:$H\times4MND=858,993,459,200$ FLOPs。
+
+### 22.1 grid和循环工作量
+
+```text
+workgroups       = H * (M / BM) = 1 * 320 = 320
+KV tiles / task  = N / BN = 1280
+pair loops/task  = N / (2*BN) = 640
+tasks / CU       = 320 / 80 = 4
+grid remainder   = 320 % 80 = 0
+```
+
+320个4-wave workgroup恰好均匀分给80个CU,每个CU执行4个task,没有尾批。因此平均分摊时间与实际
+grid关键路径使用同一个`4 task/CU`,不再需要finite-grid修正。
+
+### 22.2 co-issue微基准
+
+微基准使用1 workgroup x 64 threads、`s_memtime`、$1000\times1000$条静态/动态指令。表中`cycle/op`
+为扣除空循环后的实测吞吐周期;`fully hidden/MFMA`表示加入tested-op后总时间相对MFMA baseline
+不增加。未达到fully hidden不等于“完全无法co-issue”;还需用实测总时间计算partial overlap。
+本机`clock64()`/`s_memtime`也用于既有LDS/HBM延迟测量;本次结果由已知的BF16 MFMA约16 cycle和普通VALU
+约4 cycle自校准到shader-cycle尺度。绝对时间换算仍显式采用指定1.8GHz,不使用空闲态`sclk`读数。
+
+| opcode | cycle/op | fully hidden/MFMA | N=1/2/3/4相对纯MFMA增量(cycle/group) |
+|---|---:|---:|---|
+| `v_add_f32` | 4.012 | 3 | 0.020 / 0.024 / 0.028 / 4.028 |
+| `v_sub_f32` | 4.012 | 3 | 0.020 / 0.024 / 0.028 / 4.028 |
+| `v_mul_f32` | 4.012 | 3 | 0.020 / 0.024 / 0.028 / 4.029 |
+| `v_fma_f32` | **4.016** | **3** | 0.020 / 0.025 / 0.029 / 4.029 |
+| `v_max_f32` | 4.012 | 3 | 0.020 / 0.024 / 0.028 / 4.028 |
+| `v_max3_f32` | **4.016** | **3** | 0.020 / 0.024 / 0.029 / 4.029 |
+| `v_exp_f32` | **16.000** | **0** | 4.028 / 20.028 / 36.028 / 52.028 |
+| `v_rcp_f32` | **16.000** | **0** | 4.028 / 20.028 / 36.028 / 52.028 |
+| `v_pk_add_f32` | **4.008** | **0** | 12.012 / 16.012 / 20.013 / 24.013 |
+| `v_pk_mul_f32` | **4.008** | **0** | 12.012 / 16.012 / 20.013 / 24.013 |
+| `v_cmp_gt_f32` | 4.016 | 3 | 0.020 / 0.024 / 0.028 / 4.028 |
+| `v_cndmask_b32` | 4.008 | 3 | 0.008 / 0.016 / 0.024 / 4.024 |
+| `v_add_u32` | 4.008 | 3 | 0.008 / 0.016 / 0.024 / 4.024 |
+| `v_perm_b32` | 4.012 | 3 | 0.008 / 0.017 / 0.025 / 4.025 |
+
+关键结论：
+
+- BF16 MFMA实测为16.024 cycle/op;
+- EXP/rcp为16 cycle,不能被MFMA fully hidden,但与MFMA存在约74.8%的partial co-issue;
+- FMA/MAX3的canonical吞吐约4 cycle,每MFMA可隐藏3条;
+- packed FP32 ADD/MUL的canonical吞吐也约4 cycle,但仍不能被MFMA fully hidden,说明限制来自pipeline冲突。
+
+旧FMA/MAX3/packed约5-cycle值来自8-byte VOP3/VOP3P从$PC\bmod8=4$开始时每条跨界的对齐罚时。
+正式结果提高到1M指令,并为每opcode选择不跨8-byte边界的hot-loop对齐;完整方法见
+[`docs/mfma-valu-coissue.md`](mfma-valu-coissue.md)。
+当前生产JIT每pair的实际机器码并非统一对齐:40条FMA中20条跨界、12条MAX3中6条跨界;
+条件64条packed MUL中32条跨界。理论上限采用canonical 4-cycle值,实际混合对齐成本归入实测残差。
+
+### 22.3 每个BN32 tile的完整指令分类
+
+当前PyHIP JIT和FlyDSL kernel每个BN32 KV tile都执行：
+
+```text
+GEMM1: 32 MFMA
+GEMM2: 32 MFMA
+total: 64 MFMA/tile
+```
+
+JIT的动态循环一次处理两个tile,所以机器码循环中有128条MFMA。下表由当前PyHIP最终reg-allocation
+机器码按源码行分类,再除以2得到单tile数据。fast path每tile执行64条MFMA、112条常驻VALU/TRANS、
+10条VMEM、18条LDS/cross-lane和28.5条SALU/同步指令;另外32条`v_pk_mul_f32`位于`execz`可跳过块。
+
+普通VALU/TRANS使用正式微基准吞吐;VMEM、LDS、SALU、wait和barrier在统一slot模型中只计最小4-cycle
+issue成本。`waitcnt`/barrier实际等待时间不在此处重复累加,而是留在模型与实测的差额中。
+
+| 功能类别 | fast-path指令/tile | raw/issue cycles |
+|---|---|---:|
+| GEMM1+GEMM2 | $64\times$ MFMA | **1025.546** |
+| max归约与lazy选择 | $6\times$MAX3+$6\times$MAX+$2\times$ADD+$2\times$CMP+$2\times$CNDMASK | 72.242 |
+| center与EXP | $2\times$MUL+$18\times$FMA+$18\times$EXP+$2\times$CNDMASK | **376.332** |
+| sum归约与online状态 | $18\times$ADD+$2\times$FMA+$6\times$MOV | 104.250 |
+| probability f32→bf16 | $16\times$`v_add_u32`+$8\times$`v_perm_b32` | **96.227** |
+| O-rescale predicate | $2\times$CMP | 8.032 |
+| LDS地址生成 | $2\times$`v_add_u32` | 8.016 |
+| V global读取 | $8\times$`buffer_load_dwordx4` | 32.000 |
+| future-K global读取 | $2\times$`buffer_load_dwordx4` | 8.000 |
+| K LDS读写 | $8\times$`ds_read_b128`+$2\times$`ds_write_b128` | 40.000 |
+| softmax跨lane归约 | $4\times$`ds_swizzle`+$4\times$`ds_bpermute` | 32.000 |
+| waitcnt | $16\times$`s_waitcnt` | 64.000 |
+| workgroup同步 | $1\times$`s_barrier` | 4.000 |
+| O-rescale EXEC控制 | $2\times$(saveexec+branch+restore) | 24.000 |
+| 循环与地址SALU | 5.5条/tile（pair循环开销除以2） | 22.000 |
+| 条件O-rescale | 最多$32\times$`v_pk_mul_f32` | 最多128.264 |
+
+这里没有`v_cvt_bf16_f32`:gfx942的probability f32→bf16使用16条round-bias `v_add_u32`和8条
+`v_perm_b32`,共96.227 cycles/tile。epilogue的O转换也使用同一策略,在固定开销表中单列。
+
+18条EXP来自两个mt各8条probability EXP和1条correction EXP：
+
+$$
+2\text{ mt}\times(8+1)=18\text{ EXP/tile}.
+$$
+
+因此示例中的38条EXP不对应当前kernel的单tile粒度。只统计常驻vector ALU/TRANS时：
+
+$$
+\begin{aligned}
+x={}&18(16.000)+20(4.016216)+6(4.016208)+20(4.012092)\\
+&+18(4.008084)+6(4.012092)+4(4.016100)+4(4.008116)\\
+&+6(4)+2(4.012100)+8(4.012216)\\
+={}&665.100\ \text{cycles/tile}.
+\end{aligned}
+$$
+
+把VMEM issue、LDS/cross-lane issue和SALU/同步的最小issue成本也加入用户要求的统一slot池：
+
+$$
+\begin{aligned}
+x_{\mathrm{all}}
+&=665.100+(10\times4)+(18\times4)+(28.5\times4)\\
+&=\boxed{891.100\ \text{cycles/tile}}.
+\end{aligned}
+$$
+
+64条MFMA的基线时间和可提供的aggregate co-issue slots分别为：
+
+$$
+C_{\mathrm{MFMA}}=64\times16.02416=1025.546\ \text{cycles/tile},
+$$
+
+$$
+S_{\mathrm{coissue}}=64\times(16.02416-4)=769.546\ \text{cycles/tile}.
+$$
+
+按统一slot池模型,完整一轮为：
+
+$$
+\begin{aligned}
+y&=C_{\mathrm{MFMA}}+\max(0,x_{\mathrm{all}}-S_{\mathrm{coissue}})\\
+ &=1025.546+\max(0,891.100-769.546)\\
+ &=\boxed{1147.100\ \text{cycles/tile}}.
+\end{aligned}
+$$
+
+完整非MFMA预算超过MFMA slots 121.554 cycles/tile。这里的aggregate slot仍是假设跨整轮可自由重排的
+理论上限,不表示每条指令都能被任意MFMA覆盖。MFMA+EXP微基准的74.8% partial overlap证明EXP可以使用
+这些slots;实际内存延迟、wait/barrier stall、数据依赖和寄存器生存期会进一步降低性能。
+
+标准random/lazy输入通常只有首tile触发32条packed O-rescale。packed FP32 intra微基准没有测到与MFMA
+overlap,因此taken path按128.264 cycles严格串行加入;对抗输入可能每tile都触发。
+
+### 22.4 prologue与epilogue固定开销
+
+以下工作每个task/workgroup只执行一次,不能乘1280 tiles。机器码分别为168/249条指令：
+表中同样只计最小issue成本;固定阶段的VMEM/store完成延迟不重复加入,由后续残差校准。
+
+| 固定阶段 | 指令组成 | cycles/task |
+|---|---|---:|
+| prologue寄存器清零/地址 | 94条vector issue | 376.000 |
+| prologue Q/K global读取 | $12\times$`buffer_load_dwordx4` | 48.000 |
+| prologue首K stage LDS | 8 read+2 write | 40.000 |
+| prologue SALU/同步 | 52条issue | 208.000 |
+| epilogue归一化 | $2\times$RCP+$64\times$MUL | 288.774 |
+| epilogue O f32→bf16 | $64\times$`v_add_u32`+$32\times$`v_perm_b32` | **384.908** |
+| epilogue per-lane转置 | $64\times$MOV | 256.000 |
+| epilogue地址/O写回/控制 | 3 ADD+2 SHIFT+16 STORE+2 NOP | 92.024 |
+| **固定开销合计** | prologue 672.000 + epilogue 1021.707 | **1693.707** |
+
+因此fast-path完整task周期为：
+
+$$
+\begin{aligned}
+C_{\mathrm{task}}^{\mathrm{perfect}}
+&=1280y+C_{\mathrm{fixed}}\\
+&=1280\times1147.100+1693.707\\
+&=\boxed{1,469,982.045\ \text{cycles/task}}.
+\end{aligned}
+$$
+
+额外构造`co-issue=0`对照:MFMA和全部非MFMA成本完全串行,不扣除任何MFMA slot：
+
+$$
+\begin{aligned}
+y_{0}&=C_{\mathrm{MFMA}}+x_{\mathrm{all}}\\
+&=1025.546+891.100\\
+&=\boxed{1916.647\ \text{cycles/tile}},\\
+C_{\mathrm{task}}^{0}
+&=1280y_0+C_{\mathrm{fixed}}\\
+&=\boxed{2,455,001.232\ \text{cycles/task}}.
+\end{aligned}
+$$
+
+### 22.5 时间和TFLOPS上限
+
+全grid累计计算量为：
+
+$$
+z=C_{\mathrm{task}}\times320\text{ workgroups}.
+$$
+
+两种模型的全grid累计cycle分别为：
+
+$$
+z_{\mathrm{perfect}}=470,394,254,
+\qquad
+z_0=785,600,394\ \text{CU-cycles}.
+$$
+
+这里$z$是所有CU累计cycle。由于grid恰好整除80 CU,墙钟时间可等价写成：
+
+$$
+T=\frac{z/80}{1.8\times10^9}
+=\frac{4C_{\mathrm{task}}}{1.8\times10^9}.
+$$
+
+| co-issue模型 | O-rescale路径 | cycles/tile | cycles/task | 时间 | 理论上限 |
+|---|---|---:|---:|---:|---:|
+| **完美co-issue** | **fast path** | **1147.100** | **1,469,982** | **3266.6 us** | **263.0T** |
+| 完美co-issue | 标准random:首tile rebase | 1147.100 | 1,470,110 | 3266.9 us | 262.9T |
+| 完美co-issue | 对抗输入:每tile rebase | 1147.100 | 1,634,161 | 3631.5 us | 236.5T |
+| **co-issue=0** | **fast path** | **1916.647** | **2,455,001** | **5455.6 us** | **157.5T** |
+| co-issue=0 | 标准random:首tile rebase | 1916.647 | 2,455,129 | 5455.8 us | 157.4T |
+| co-issue=0 | 对抗输入:每tile rebase | 1916.647 | 2,619,180 | 5820.4 us | 147.6T |
+
+完美co-issue表示全部非MFMA工作先使用769.546-cycle MFMA slot,只有溢出的121.554 cycles串行;
+`co-issue=0`则把891.100 cycles全部串行加入。两组均包含相同的prologue/epilogue固定开销。
+
+按用户指定的完整统一slot假设,无尾批grid的完美co-issue模型上限为**263.0T**,零co-issue对照为
+**157.5T**。完美模型不是硬件不可突破的绝对上界;
+若允许独立硬件管线完美并行,
+还可构造更乐观的resource roofline,用于判断哪个资源可能成为硬上限：
+
+| 资源/模型下界 | cycles/task | 依据 |
+|---|---:|---|
+| MFMA+VALU aggregate，加固定开销 | 1,314,393 | 1280×1025.546+1693.707 |
+| 全部已执行指令front-end issue | 1,192,068 | (232.5×1280+417)×4 cycles |
+| 假设L2命中89.25%的HBM流量 | 177,262 | (52,461,568B读×10.75%+32,768B写)/32B/cycle |
+| LDS吞吐保守值 | 573,760 | 1280×448+320 |
+| SALU issue | 146,136 | 1280×114+216 |
+
+资源项取最大值1,314,393 cycles/task,对应**294.1T**宽松硬件roofline。89.25%的L2命中率来自旧
+`H=8,M=N=8192` PMC,这里只作敏感性假设,不是40960配置的实测值。
+
+作为带宽敏感性检查,有效流量为Q 32KB+K 10MB+4-wave重复V 40MB+O 32KB,即52,494,336B/task。
+最后两块越界K预取会占VMEM issue slot,但buffer descriptor返回0,不计有效HBM字节。若有效流量全部落到
+HBM,按32B/cycle需1,640,448 cycles/task,理论上限降到**235.6T**。全冷值只作敏感性下界。
+
+### 22.6 实测校准与剩余空间
+
+2026-07-27在同一空闲GPU 0上,使用与推导相同的`H=1,M=N=40960`配置、10 buffers、50次中位数,
+按JIT→Fly→JIT顺序夹心复测：
+
+```text
+JIT: 4570.4 / 4566.9 us, 中位4568.65 us = 188.02 TFLOPS, rel_l2=0.00319
+Fly: 4650.8 us = 184.70 TFLOPS, rel_l2=0.00319
+```
+
+JIT按时间比Fly快约1.80%。相对完美co-issue模型263.0T：
+
+- JIT达到71.5%,还差约75.0T;
+- Fly达到70.2%,还差约78.3T;
+- JIT/Fly都超过零co-issue上限157.5T,分别高30.6T/27.2T,直接证明实际kernel存在显著co-issue。
+
+按每CU恰好4个task反推实测cycle账本：
+
+```text
+JIT: 4568.65 us * 1.8GHz / 4 = 2,055,892.5 cycle/task
+Fly: 4650.8 us * 1.8GHz / 4 = 2,092,860.0 cycle/task
+perfect co-issue fast path         = 1,469,982 cycle/task
+zero co-issue fast path            = 2,455,001 cycle/task
+JIT residual vs perfect            =   585,910 cycle/task = 457.7 cycle/tile
+Fly residual vs perfect            =   622,878 cycle/task = 486.6 cycle/tile
+```
+
+所有静态指令的最小issue成本已经进入完整模型。相对完美模型剩余457.7 cycle/tile不是漏计指令,而是
+`waitcnt`/barrier实际stall、VMEM/LDS FIFO与延迟、MFMA accumulator RAW、跨阶段依赖、寄存器生存期和无法达到理想slot
+填充率。JIT相对Fly的优势仍对应每tile约27.5 cycle。
+
+#### ATT按物理SIMD闭合cycle账本
+
+最终JIT在相同`H=1,M=N=40960`配置上采集rocprofv3 ATT。trace包含949个已解码PC且全部有源码映射;
+48条wave完整命中$48\times640=30,720$次pair热循环,按`SE/SIMD`组成12个物理SIMD样本,每个样本覆盖
+4个task。各样本的task-equivalent关键路径为2,035,340--2,036,637 cycles,离散仅0.064%。
+
+不能直接累加`code.json`中的stall列。该列对每条wave分别统计,本次得到165,775,440 total cycles和
+92,161,124 stall cycles;两个resident wave在同一物理SIMD周期同时等待时会被重复计费。这里改用
+[`analyze-attn-att-cycle-ledger.py`](../archive/gemm/analyze-attn-att-cycle-ledger.py)按物理SIMD去重：
+
+1. 将同一物理SIMD上所有wave的$[issue,issue+4)$区间求并集;
+2. 并集之间的gap才计为物理no-issue cycle;
+3. 在每个gap中查找所有active wave当时阻塞的PC,并发阻塞PC等分该gap;
+4. 若上一条指令的ATT duration已结束但仍没有新issue,归入`scheduler/ready`;
+5. trace两端无法定位到PC的305.25 cycles/task没有独立PC;它先进入闭合总量,随后随ATT总超额按内部PC
+  权重归一。
+
+物理issue/no-issue账本为：
+
+$$
+\begin{aligned}
+C_{\mathrm{ATT}}
+&=C_{\mathrm{issue\ union}}+C_{\mathrm{physical\ no\ issue}}\\
+&=1,095,555.167+940,438.000\\
+&=2,035,993.167\ \mathrm{cycles/task}.
+\end{aligned}
+$$
+
+完美模型本身已允许一部分no-issue时间,不能把940,438 cycles全部再次算作残差：
+
+$$
+\begin{aligned}
+C_{\mathrm{model\ no\ issue}}
+&=C_{\mathrm{task}}^{\mathrm{perfect}}-C_{\mathrm{issue\ union}}\\
+&=1,469,982.045-1,095,555.167\\
+&=374,426.878\ \mathrm{cycles/task},\\
+\Delta C_{\mathrm{ATT}}
+&=C_{\mathrm{ATT}}-C_{\mathrm{task}}^{\mathrm{perfect}}\\
+&=566,011.122\ \mathrm{cycles/task}.
+\end{aligned}
+$$
+
+墙钟比采样SIMD的ATT关键路径再多19,899.333 cycles/task。该项包含trace起止边界、未采样CU关键路径差异和
+launch envelope,没有可证明的PC归属,因此单列而不强行分摊：
+
+$$
+\begin{aligned}
+C_{\mathrm{wall}}
+&=C_{\mathrm{task}}^{\mathrm{perfect}}+\Delta C_{\mathrm{ATT}}+
+\Delta C_{\mathrm{outside\ ATT}}\\
+&=1,469,982.045+566,011.122+19,899.333\\
+&=2,055,892.500\ \mathrm{cycles/task},\\
+\frac{\Delta C_{\mathrm{ATT}}+\Delta C_{\mathrm{outside\ ATT}}}{1280}
+&=442.196+15.546\\
+&=\boxed{457.743\ \mathrm{cycles/tile}}.
+\end{aligned}
+$$
+
+这与4568.65 us、1.8GHz、4 task/CU反推的墙钟cycle完全一致,闭合误差小于$10^{-6}$ cycle/task。
+
+为了把ATT内部的442.196 cycles/tile归到PC,先排除不可定位的305.25 trace-edge cycles/task,再将
+566,011.122 cycles/task按940,132.75个内部阻塞权重归一,比例为：
+
+$$
+\alpha=\frac{566,011.122}{940,132.75}=0.602054.
+$$
+
+下面的类别与PC数字均为`raw physical gap weight * alpha / 1280`。这是保持总量严格闭合的accounting
+attribution,不是每类可独立消除的counterfactual speedup。特别是`MFMA`/`TRANS`表示no-issue gap发生时
+active wave仍阻塞在该PC,并非完整模型漏算了MFMA/EXP的静态issue成本。
+
+| 阻塞PC类别 | 归一残差(cycle/tile) | 含义 |
+|---|---:|---|
+| MFMA | **151.961** | GEMM依赖链或MFMA pipeline未被另一resident wave填满 |
+| TRANS | **74.256** | EXP/rcp依赖或TRANS pipeline空洞 |
+| LDS/SMEM wait | **56.979** | `s_waitcnt lgkmcnt(...)` |
+| VMEM load | **49.186** | load仍在ATT duration内,包括与MFMA并发阻塞 |
+| scheduler/ready | **43.547** | 没有长duration指令可归属但物理SIMD未issue |
+| LDS/cross-lane | **26.626** | `ds_read/write/swizzle/bpermute` |
+| VALU | **24.690** | 普通VALU的数据依赖或pipeline空洞 |
+| barrier | **13.388** | 两个热循环`s_barrier`的到达差 |
+| VMEM store | 0.765 | epilogue store |
+| VMEM wait | 0.512 | 显式`vmcnt`等待 |
+| SALU/control | 0.286 | 循环和地址控制 |
+| **ATT内部合计** | **442.196** | 566,011.122 cycles/task |
+
+同一批PC按源码阶段重组后,可直接看到残差落在哪段kernel：
+
+| 源码阶段 | 残差(cycle/tile) |
+|---|---:|
+| GEMM2/MFMA | **86.816** |
+| softmax center/EXP | **80.376** |
+| GEMM1/progressive K wait | **65.145** |
+| scheduler/ready | **43.547** |
+| V global load | **40.952** |
+| softmax sum reduction/state | **39.753** |
+| softmax max reduction | **34.495** |
+| K LDS write | 15.957 |
+| K stage write/wait/barrier | 14.921 |
+| future-K global prefetch | 8.136 |
+| probability f32→bf16 | 4.502 |
+| K LDS read | 2.784 |
+| 其他ATT内部PC | 4.812 |
+| ATT外墙钟边界 | 15.546 |
+| **墙钟残差合计** | **457.743** |
+
+按单PC排序的前十项如下。两个机器码副本来自pair循环中偶/奇tile的展开,所以同一Python行对应不同PC：
+
+| PC | Python行(采集时) | 指令/状态 | 阶段 | 残差(cycle/tile) |
+|---|---:|---|---|---:|
+| -- | -- | `scheduler/ready` | 无可归属阻塞PC | **43.547** |
+| `0x2790` | 436 | `s_barrier` | K stage barrier | 7.036 |
+| `0x20a4` | 436 | `s_barrier` | K stage barrier | 6.330 |
+| `0x1e10` | 139 | `ds_write_b128` | K LDS write | 4.973 |
+| `0x256c` | 224 | `s_waitcnt lgkmcnt(0)` | max reduction | 4.957 |
+| `0x1e80` | 224 | `s_waitcnt lgkmcnt(0)` | max reduction | 4.864 |
+| `0x24fc` | 139 | `ds_write_b128` | K LDS write | 4.763 |
+| `0x1b38` | 119 | `buffer_load_dwordx4` | V global load | 4.498 |
+| `0x1fa0` | 293 | `s_waitcnt lgkmcnt(0)` | sum reduction/state | 4.442 |
+| `0x268c` | 293 | `s_waitcnt lgkmcnt(0)` | sum reduction/state | 4.416 |
+
+完整采样元数据、闭合项和top-PC数据保存在
+[`attn-jit-att-cycle-ledger-gfx942.json`](data/attn-jit-att-cycle-ledger-gfx942.json)。分析器内部对全部PC执行归因;
+传`--topk 1000 --json <path>`可导出本次949个PC的完整账本。
+
+#### MFMA未隐藏与全流水线空洞的互斥分解
+
+“MFMA中没有隐藏的部分”和“流水线没有执行指令的部分”有交集,不能直接相加。为得到互斥账本,
+对每个物理SIMD的时间线同时标记：
+
+![Attention JIT cycle/tile共享横轴分解](images/attn-jit-cycle-axis-gfx942.svg)
+
+图中所有横条使用同一个$0$--$1606.166$ cycle/tile坐标轴。彩色段表示聚合时间预算,用于比较规模,
+不表示这些阶段按图中顺序连续执行。图由
+[`render-attn-cycle-axis.py`](../archive/gemm/render-attn-cycle-axis.py)直接读取ATT账本JSON生成。
+图下半部用$t=100$发射MFMA的具体时间片解释hidden/MFMA-only/no-issue/alias,并用双resident-wave
+同时阻塞示例说明no-issue cycle如何按PC等分归因。
+该图对应本轮优化前的`7/4/5`连续K写基线（188.1T）;方法1/4实施后的before/after结果见§22.9。
+
+- MFMA逻辑shadow:每条MFMA的$[issue+4,issue+16)$;
+- issue状态:`non-MFMA issue`、`MFMA-only issue`或`no issue`。
+
+64条MFMA提供$64\times12=768$个逻辑shadow cycles/tile。但两个resident wave的MFMA窗口会重叠,
+这些逻辑cycle不全是独立物理机会：
+
+$$
+\begin{aligned}
+C_{\mathrm{shadow}}^{\mathrm{logical}}
+&=768.000,\\
+C_{\mathrm{shadow}}^{\mathrm{physical\ union}}
+&=677.706,\\
+C_{\mathrm{shadow\ alias}}
+&=768.000-677.706=90.294\ \mathrm{cycles/tile}.
+\end{aligned}
+$$
+
+完整的$2\times3$互斥矩阵为：
+
+| 时间区域 | non-MFMA issue | MFMA-only issue | no issue | 小计(cycle/tile) |
+|---|---:|---:|---:|---:|
+| MFMA shadow内 | **255.435** | **86.923** | **335.348** | **677.706** |
+| MFMA shadow外 | 381.932 | 131.612 | **399.370** | 912.914 |
+| **ATT关键路径** | **637.367** | **218.535** | **734.717** | **1590.620** |
+
+六格精确加回ATT关键路径$2,035,993.167/1280=1590.620$ cycles/tile;两格`no issue`也精确加回
+$940,438/1280=734.717$ cycles/tile。
+
+按用户提出的两个观察量：
+
+1. **MFMA逻辑shadow未隐藏:**
+
+  $$
+  C_{\mathrm{MFMA\ unhidden}}^{\mathrm{logical}}
+  =768.000-255.435
+  =\boxed{512.565\ \mathrm{cycles/tile}}.
+  $$
+
+  其中90.294是resident-wave shadow重叠,不是独立物理优化机会;可在物理时间线上行动的部分为：
+
+  $$
+  C_{\mathrm{MFMA\ unhidden}}^{\mathrm{physical}}
+  =86.923+335.348
+  =\boxed{422.270\ \mathrm{cycles/tile}}.
+  $$
+
+2. **全流水线没有执行指令:**
+
+  $$
+  C_{\mathrm{no\ issue}}
+  =335.348+399.370
+  =\boxed{734.717\ \mathrm{cycles/tile}}.
+  $$
+
+若定义$A$为“物理MFMA shadow未隐藏”、$B$为“物理SIMD no-issue”,则：
+
+| 互斥集合 | cycle/tile | 解释 |
+|---|---:|---|
+| $A\cap B$ | **335.348** | MFMA shadow内完全没有issue,两类问题的交集 |
+| $A\setminus B$ | **86.923** | shadow内仍有MFMA issue,但没有non-MFMA工作填充 |
+| $B\setminus A$ | **399.370** | MFMA shadow外的纯流水线空洞 |
+| 逻辑shadow alias | 90.294 | 两个resident MFMA shadow重叠,从物理集合中单列 |
+
+因此不能报告$512.565+734.717$为总损失;这会重复计算335.348并把90.294个逻辑别名当成物理cycle。
+
+shadow内335.348个no-issue cycle主要仍阻塞在MFMA链：
+
+| shadow内阻塞类别 | 物理cycle/tile | 归一残差cycle/tile |
+|---|---:|---:|
+| MFMA | **233.014** | **140.287** |
+| scheduler/ready | 28.964 | 17.438 |
+| LDS/SMEM wait | 21.067 | 12.683 |
+| TRANS | 20.740 | 12.487 |
+| VMEM load | 11.834 | 7.125 |
+| LDS/cross-lane | 10.587 | 6.374 |
+| barrier | 5.293 | 3.187 |
+| VALU | 3.572 | 2.151 |
+| 其他 | 1.277 | 0.769 |
+| **合计** | **335.348** | **201.897** |
+
+按源码阶段,其中GEMM2占132.951 raw cycles/tile,GEMM1/progressive-K占100.063;两者合计233.014,
+即shadow内空洞的69.5%。这说明首要问题不是缺少静态VALU数量,而是两个resident wave经常同时位于MFMA依赖区,
+没有ready non-MFMA工作供scheduler选择。
+
+shadow外399.370个no-issue cycle则更分散：
+
+| shadow外阻塞类别 | 物理cycle/tile | 归一残差cycle/tile |
+|---|---:|---:|
+| TRANS | **102.596** | **61.769** |
+| LDS/SMEM wait | 73.575 | 44.296 |
+| VMEM load | 69.863 | 42.061 |
+| scheduler/ready | 43.377 | 26.115 |
+| VALU | 37.430 | 22.535 |
+| LDS/cross-lane | 33.638 | 20.252 |
+| MFMA | 19.390 | 11.674 |
+| barrier | 16.945 | 10.202 |
+| 其他可归因项 | 2.318 | 1.396 |
+| trace edge | 0.238 | 0.000 |
+| **合计** | **399.370** | **240.299** |
+
+两区域按同一$\alpha=0.602054$归一后,ATT内部残差精确分为：
+
+$$
+442.196=201.897\ (\mathrm{shadow\ no\ issue})
++240.299\ (\mathrm{outside\ shadow\ no\ issue}).
+$$
+
+再加ATT外墙钟边界15.546,仍得到457.743 cycles/tile总残差。
+
+##### 由分解得到的优化顺序
+
+1. **优先:不改MFMA顺序,扫描`prepare/center/finish`边界。** 分析时基线为7/4/5,shadow外仍有73.477
+  cycles/tile的probability f32→bf16实际issue工作。测试总数固定为16的窄组合（如6/4/6、7/3/6、
+  6/3/7）,目标是把scalar `v_add_u32/v_perm_b32`尾部移入335.348-cycle shadow空洞。每个候选必须保持
+  150 VGPR+64 AGPR附近、2 waves/SIMD和原MFMA accumulator次序;先比较ISA矩阵,再跑正确性/性能。
+2. **其次:双路DS归约流水,不再加MFMA间距。** shadow外max+sum阶段no-issue合计94.115 raw cycles/tile;
+  用mt0/mt1两路`DS -> lgkmcnt(1/0) -> consume`提高同时在途DS请求数。此前`DS`后插第二条MFMA已从
+  171.7T回退到167.1T,新实验不得重复拆长MFMA链。
+3. **独立候选:V跨tile寄存器双缓冲。** shadow外V-load阶段no-issue为59.547 raw cycles/tile,且另有
+  17.392 cycles/tile的V load实际issue在shadow外。增加一组32 AGPR的`value_reg`并轮换,估算资源从
+  150 VGPR+64 AGPR到约150+96=246,理论上仍低于2-wave的256总寄存器阈值,但余量只有约10;
+  必须先检查最终ISA是否spill或降occupancy。VMEM数量保持不变,只把下一tile的8条V load前移。
+4. **不再重复:**probability EXP穿插MFMA已回退到170.3T;DS后增加第二条MFMA回退到167.1T;
+  一次性workgroup错相、8-wave双pipeline和强制IGLP也已回退。barrier归一残差总共仅13.388 cycles/tile,
+  不作为第一优先级。
+
+### 22.7 对后续优化的约束
+
+1. **完美与零co-issue给出宽区间。** fast path分别为263.0T和157.5T;优化前实测188.0T位于两者之间,
+  且明显高于零co-issue上限。
+2. **完整$x$已经溢出MFMA slots。** center+EXP占376.3 cycles（42.2%）,是最大类别;SALU/同步114.0、
+  sum/state 104.3、probability f32→bf16 96.2依次是下一层开销。
+3. **EXP和f32→bf16会直接改变完美模型上限。** 理想删除2条correction EXP可从263.0T提到270.5T;
+  删除16条probability EXP可到294.1T;完全删除probability f32→bf16可到287.0T。零co-issue下对应
+  160.1T/181.7T/165.8T。
+  这些只是收益上界,替代算法的新增指令和精度约束仍必须实测。
+4. **packed O-rescale需要独立对待。** 标准random仅首tile触发,完美/零co-issue上限约262.9T/157.4T;
+  对抗输入每tile触发时降到236.5T/147.6T。
+5. **ATT已把优化顺序收窄。** 768个逻辑MFMA shadow cycles中255.4已填充、90.3为resident-window
+  重叠、422.3是物理未隐藏部分;全流水线734.7个no-issue cycles又分为shadow内335.3和shadow外399.4。
+  后续只做不破坏MFMA链的阶段边界扫描、双路DS归约和资源受控的V预取。
+
+### 22.8 待确认后再继续的尝试
+
+方法1和方法4已经实施并记录在§22.9。剩余候选为：
+
+1. **减少跨lane归约wait:**保持`ds_swizzle/ds_bpermute`数量不变,尝试同时启动mt0/mt1两路DS归约,
+  使用`lgkmcnt(1/0)`流水,避免单路`DS -> wait -> consume`。
+2. **V跨tile寄存器双缓冲:**增加一组32 AGPR的`value_reg`,保持VMEM数量不变;先确认总寄存器不超过
+  2-wave阈值且无spill,再比较V-load no-issue。
+3. **raw-domain FMA贡献拆分:**当前最终调度为5/3/8;后续与log2-domain基线同进程配对,
+  确认约1.4T总收益中哪些来自raw-FMA、概率寄存器复用和xor32地址复用。
+
+继续任何一项前先由用户确认候选和优先级。
+
+### 22.9 实施方法1和方法4：194.5T
+
+本节以优化前`7/4/5`连续K写、4566.8 us/188.10T为基线。所有候选保持：
+
+- 64条MFMA/tile、静态指令总数和MFMA accumulator次序不变;
+- 150 VGPR+64 AGPR、34 SGPR、16KB LDS、2 waves/SIMD;
+- scratch/spill为0;
+- `H=1,M=N=40960,D=128`,10 buffers、每次50个样本取中位数;
+- random输入`rel_l2=0.00319`,全1输入`rel_l2=0`。
+
+#### 方法1：重分配prepare/center/finish的MFMA窗口
+
+`prepare/center/finish`三个数表示16条独立MFMA分别与三个softmax generator交织的数量。扫描时只改变
+每个generator获得的MFMA shadow数量,不改变MFMA自身顺序和工作量。
+
+原`7/4/5`表示每个16-MFMA窗口按如下配额取softmax指令：
+
+```text
+7次: MFMA -> prepare的一小段(max/DS/compare)
+4次: MFMA -> center的一小段(scale/center FMA)
+5次: MFMA -> finish的一小段(sum/DS/state/BF16 pack)
+```
+
+`J.emit(generator, cycles)`按估计周期从对应generator取若干指令,三个配额之和始终为16。`7/4/5`把较多
+MFMA shadow给prepare,但finish尾部的ADD、`v_add_u32`和`v_perm_b32`较多落在shadow外。最终`5/3/8`
+把2个prepare窗口和1个center窗口转给finish,让更多sum/state和BF16打包VALU落入MFMA shadow。
+它不增加或删除MFMA,也不改变accumulator顺序;动态MFMA命中始终为3,932,160。
+
+代表性结果：
+
+| 调度 | K写模式 | 时间(us) | TFLOPS | 结论 |
+|---|---|---:|---:|---|
+| 7/4/5 | 连续写 | 4566.8 | 188.10 | 优化前基线 |
+| 6/4/6 | 连续写 | 4511--4520 | 190.0--190.4 | 将一条prepare MFMA移给finish有效 |
+| **5/5/6** | **连续写** | **4508.8中位** | **190.51** | 方法1单独最优区间 |
+| 3/5/8 | 连续写 | 4508--4517 | 190.2--190.5 | shadow VALU更多,但shadow外idle增加 |
+| 4/4/8 | 连续写 | 4575.7 | 187.7 | finish过多会破坏全局平衡 |
+
+`5/5/6` ATT相对7/4/5：shadow内non-MFMA从255.435增至293.700 cycles/tile,
+shadow no-issue从335.348降至312.486,ATT关键路径从1590.620降至1569.611。方法1确实增加了
+MFMA co-issue阶段的有效工作,并非只依赖墙钟噪声。
+
+#### 方法4：把K LDS写放入DS归约等待窗口
+
+原顺序在softmax1之前连续发两条K `ds_write_b128`,随后才进入两次跨lane归约。最终保留的顺序为：
+
+```text
+ds_swizzle / ds_bpermute     # 较早的softmax归约请求
+ds_write_b128 next-K         # 较新的K stage写请求
+s_waitcnt lgkmcnt(1)         # 只等待较早归约,保留K写在途
+consume reduction result
+```
+
+两次归约窗口各插入一条K写。后续softmax、`lgkmcnt(0)`和barrier仍保证K写在下一K读取前完成;
+barrier位置和数量均不变。最终ISA在两个偶/奇展开副本中均确认上述顺序。
+
+`lgkmcnt(1)`不是“等待一条请求”,而是允许1条较新的LGKM请求继续在途。归约DS先发、K写后发,
+所以wait只保证较早的归约结果可消费,不会把较新的K写重新串行化。K写最终在后续
+`lgkmcnt(0)+barrier`处完成。
+
+对照实验：
+
+| K写方案 | 5/5/6时间(us) | TFLOPS | 决定 |
+|---|---:|---:|---|
+| 连续写 | 4505--4513 | 190.3--190.7 | 对照 |
+| 写在归约`lgkmcnt(0)`之后 | 4506--4513 | 190.3--190.6 | 无稳定收益,回退 |
+| **写在wait之前 + `lgkmcnt(1)`** | **4437--4444** | **193.3--193.6** | **保留** |
+
+方法4加入后重新扫描阶段配额,局部最优从5/5/6移动到**5/3/8**。邻点5/4/7为194.1--194.3T、
+5/2/9为194.3T、4/3/9为192.5T,说明5/3/8是当前局部峰值,不是finish越多越好。
+
+#### 最终性能和ATT
+
+收敛后的默认kernel固定为`5/3/8 + DS reduce -> K write -> lgkmcnt(1) -> consume`,不保留运行时
+扫描参数或失败路径。40960无尾批三次独立运行：
+
+```text
+4415.5 us = 194.5T
+4417.2 us = 194.5T
+4415.3 us = 194.6T
+```
+
+取4415.4 us中位,相对4566.8 us基线节省151.4 us,时间加速**3.43%**,吞吐增加约**6.45T**。
+
+最终ATT覆盖949个源码映射PC、48条wave、3,932,160个动态MFMA命中。raw物理SIMD账本：
+
+| 指标(cycle/tile) | 7/4/5连续写 | 最终5/3/8 | 变化 |
+|---|---:|---:|---:|
+| ATT关键路径 | 1590.620 | **1532.769** | **-57.851(-3.64%)** |
+| shadow non-MFMA issue | 255.435 | **300.037** | **+44.602(+17.46%)** |
+| shadow MFMA-only | 86.923 | **79.171** | -7.752(-8.92%) |
+| shadow no-issue | 335.348 | **301.528** | **-33.819(-10.08%)** |
+| shadow外no-issue | 399.370 | **377.692** | -21.677(-5.43%) |
+| shadow内VALU | 167.023 | **212.619** | **+45.597(+27.30%)** |
+| shadow内TRANS | 8.554 | **10.865** | +2.311(+27.02%) |
+
+因此本轮满足“增加MFMA co-issue阶段有效VALU”的目标:shadow内VALU提高27.3%,同时shadow内外
+no-issue和全ATT关键路径均下降,没有把局部覆盖提升转化成其他阶段的更大空洞。完整before/after数据见
+[`attn-jit-coissue-optimization-gfx942.json`](data/attn-jit-coissue-optimization-gfx942.json)。
+
+### 22.10 DPP `wave_rol`列向归约实验
+
+参考GPUOpen的
+[`AMD GCN Assembly Cross-Lane Operations`](https://gpuopen.com/learn/amd-gcn-assembly-cross-lane-operations/),
+验证是否可以用`wave_shl/wave_rol`替换max/sum的`ds_swizzle/ds_bpermute`。
+本核lane布局为：
+
+$$
+Mq=lane\bmod16,\qquad row=\lfloor lane/16\rfloor.
+$$
+
+同一个query列需要合并`{q,q+16,q+32,q+48}`。`row_shl/row_ror`只在16-lane row内,会改变$Mq$,
+不能直接使用。`wave_rol:1`可跨整个wave,但gfx942每条只移动1 lane,所以必须连续rotate 16、32、48步。
+
+新增[`test_dpp_column_reduce.py`](../tests/core/test_dpp_column_reduce.py)验证：
+
+```text
+wave_rol:1 × 16 -> source lane (lane + 16) mod 64
+wave_rol:1 × 32 -> source lane (lane + 32) mod 64
+wave_rol:1 × 48 -> source lane (lane + 48) mod 64
+```
+
+四row `max`和`add`与PyTorch参考完全一致。probe同时复现GPUOpen所述DPP RAW hazard:首条DPP前若
+没有两个wait-state,16次rotate实际只前进15 lane;显式加入`s_nop 1`后结果正确。
+
+随后在attention中做真实A/B。每个pair循环有4次max/sum列向归约,最终ISA：
+
+| 指标 | DS生产路径 | DPP `wave_rol`路径 |
+|---|---:|---:|
+| `ds_swizzle_b32` | 8 | 0 |
+| `ds_bpermute_b32` | 8 | 0 |
+| `wave_rol:1` | 0 | **384** |
+| DPP hazard `s_nop 1` | 0 | **392** |
+| MFMA | 128 | 128 |
+| VGPR+AGPR | 150+64 | 149+64 |
+| occupancy/spill | 2 waves / 0 | 2 waves / 0 |
+
+40960夹心结果：
+
+| 归约实现 | rel_l2 | 时间(us) | TFLOPS |
+|---|---:|---:|---:|
+| 同实验分支DS对照 | 0.00319 | 4490--4494 | 191.2--191.3 |
+| DPP `wave_rol` | 0.00319 | **7493.7** | **114.6** |
+| 恢复后的生产DS路径 | 0.00319 | 4416.4 | 194.5 |
+
+DPP相对同分支DS对照时间增加66.8%,吞吐下降40.1%。结论不是“DPP不能表达列向归约”,而是gfx942
+缺少`xor16/xor32`或一次性rotate16/32控制,正确表达需要过多指令和hazard间隔。生产kernel已回退
+DPP分支,继续保留`ds_swizzle/ds_bpermute`以及§22.9的wait前K写优化。
+
+#### 三次`wave_shr + max`再`readlane`的专项验证
+
+另外精确实现并测试了以下更短方案：
+
+```text
+x = max(current, wave_shr(current, 1))
+y = max(x,       wave_shr(x, 1))
+z = max(y,       wave_shr(y, 1))
+s = readlane(z, 63)
+```
+
+使用`value=100*row+column`唯一编码每个lane。对lane20（`row=1,column=4`）实测：
+
+```text
+x = 104
+y = 104
+z = 104
+当前attention所需列向max = max(4,104,204,304) = 304
+readlane(z,63) = 315
+```
+
+原因是三次`wave_shr:1`累计覆盖的是相邻lane窗口`{lane,lane-1,lane-2,lane-3}`,而不是当前布局所需的
+`{q,q+16,q+32,q+48}`。`v_readlane_b32`又只把一个指定lane读到SGPR;广播后全wave都是315,无法同时保留
+16个query列各自不同的max。因此该短方案在当前MFMA fragment布局下正确性不成立,没有接入生产attention计时。
+实测probe保留在[`test_dpp_column_reduce.py`](../tests/core/test_dpp_column_reduce.py)。
+
+### 22.11 三路DS fanout：200.3T
+
+§22.9的串行跨row归约有两级依赖：
+
+```text
+xor16 DS -> wait -> consume
+xor32 DS -> wait -> consume
+```
+
+最终改为从同一个原始标量同时发三条pull请求：
+
+```text
+xor16 = ds_swizzle(source, SWAP16)
+xor32 = ds_bpermute(source, lane ^ 32)
+xor48 = ds_bpermute(source, lane ^ 48)
+wait once
+max: max3(source, xor16, xor32), then max(xor48)
+sum: source + xor16 + xor32 + xor48
+```
+
+max和sum的三路请求都fanout。softmax1还在三条归约请求之后发两条next-K写,随后使用`lgkmcnt(2)`:
+只等待更早的三条归约请求,允许较新的两条K写保持在途。这样把“DS请求数”从每次2条增加到3条,
+但把两次串行wait缩成一次。
+
+#### max/sum拆分贡献
+
+在`4/3/9`调度下做两轮交错A/B：
+
+| fanout模式 | 时间(us) | TFLOPS | 结论 |
+|---|---:|---:|---|
+| 无fanout | 4461.0 | 192.6 | 同调度串行DS对照 |
+| 仅max fanout | 4403.9--4404.3 | 195.0--195.1 | 有效 |
+| 仅sum fanout | 4353.9--4359.5 | 197.0--197.3 | 收益更大 |
+| **max+sum fanout** | **4295.3--4295.6** | **200.0** | **收益叠加,保留** |
+
+加入fanout后重新扫描阶段配额,最优点从5/3/8移动到**4/3/9**。最终收敛版本三次：
+
+```text
+4290.1 us = 200.2T
+4289.4 us = 200.3T
+4289.5 us = 200.3T
+```
+
+取4289.5 us中位,相对上一版5/3/8串行DS的4413.8 us/194.62T再快**2.90%**;
+相对最初7/4/5连续K写的4566.8 us/188.10T累计快**6.47%**。
+
+资源从150 VGPR+64 AGPR增至154+64,仍为2 waves/SIMD、零spill;MFMA仍为128条/pair。
+静态cross-lane从8条swizzle+8条bpermute变为8+16,wait从35条降到27条。
+
+#### ATT before/after
+
+| 指标(cycle/tile) | 5/3/8串行DS | 4/3/9三路fanout | 变化 |
+|---|---:|---:|---:|
+| ATT关键路径 | 1532.769 | **1492.504** | **-40.265** |
+| physical no-issue | 679.221 | **633.294** | **-45.927** |
+| shadow non-MFMA issue | 300.037 | **325.110** | **+25.073** |
+| shadow MFMA-only | 79.171 | **73.681** | -5.490 |
+| shadow no-issue | 301.528 | **286.436** | **-15.093** |
+| shadow外no-issue | 377.692 | **346.858** | **-30.834** |
+| shadow内VALU | 212.619 | **246.440** | **+33.820** |
+| shadow外LDS wait | 53.817 | **11.038** | **-42.779** |
+
+fanout同时增加有效VALU co-issue并减少shadow内外idle;最大的直接变化是把shadow外LDS wait削掉79.5%。
+
+额外测试了lane内平衡树:8值max依赖深度4→2会稳定回退;8值sum深度7→3与原串行sum性能区间重叠,
+没有稳定收益,均未保留。
+
+### 22.12 半量BF16打包填充sum DS窗口:203.3T
+
+§22.11之后,每个softmax finish仍在三路sum DS请求与`lgkmcnt(0)`之间留下可利用窗口。概率共有两个
+`n_block`;每个block、每个mt的BF16打包包含4条`v_add_u32`和2条`v_perm_b32`。先测试把两个block
+全部移到wait前:
+
+```text
+DS fanout -> pack block0 -> pack block1 -> wait -> sum merge/FMA
+```
+
+该版本正确性和资源不变,但从200.1--200.3T回退到199.1--199.2T。24条/tile打包VALU超过了DS
+延迟窗口,反而推迟wait后的sum合并和running-sum FMA。
+
+最终只前移第一个block,第二个block留在running-sum FMA之后:
+
+```text
+DS fanout -> state copy -> pack block0 -> wait -> sum merge/FMA -> pack block1
+```
+
+每个mt前移6条指令,两个mt合计前移12条/tile,不增加任何动态工作。40960夹心A/B和生产入口三次复验为:
+
+| 版本 | 时间(us) | TFLOPS | 结论 |
+|---|---:|---:|---|
+| 三路fanout基线 | 4289.9--4292.9 | 200.1--200.2 | 对照 |
+| 两个block全部前移 | 4313.0--4314.1 | 199.1--199.2 | 填窗过量,回退 |
+| 一个block前移,夹心A/B | **4226.3--4227.9** | **203.2** | 保留 |
+| 一个block前移,生产入口三次 | **4225.9--4230.1** | **203.1--203.3** | 稳定复现 |
+
+以4226.1 us为代表值,相对三路fanout的4289.5 us再快1.50%;相对最初4566.8 us/188.10T累计
+快8.06%。资源仍为154 VGPR+64 AGPR、34 SGPR、16KB LDS、2 waves/SIMD、零spill。
+
+#### 同口径ATT闭环
+
+新trace继续使用kernel iteration 20(dispatch 145)、CU1、16个物理SIMD组、每SIMD 4个task、每task 1280 tile。静态工作量
+没有变化,issue union保持在859.1 cycle/tile;收益来自相同指令的物理发射位置变化:
+
+| 指标(cycle/tile) | 三路fanout | 半量打包填窗 | 变化 |
+|---|---:|---:|---:|
+| ATT关键路径 | 1492.504 | **1470.377** | **-22.127** |
+| physical no-issue | 633.294 | **611.249** | **-22.045** |
+| issue union | 859.210 | 859.128 | -0.082 |
+| shadow non-MFMA issue | 325.110 | **340.416** | **+15.306** |
+| shadow no-issue | 286.436 | **274.173** | **-12.263** |
+| shadow外no-issue | 346.858 | **337.076** | **-9.783** |
+| shadow内VALU | 246.440 | **261.448** | **+15.008** |
+| LDS/SMEM-wait blocker | 19.699 | **1.515** | **-18.184** |
+
+总issue量几乎不变,而shadow内VALU增加15.0 cycle/tile、物理idle减少22.0 cycle/tile。尤其
+`lgkmcnt` blocker下降92.3%,说明一个block已经基本填满三路DS延迟;继续搬第二个block没有可用等待可隐藏。
+
+#### 额外否决项
+
+- V跨tile寄存器双缓冲通过正确性,154 VGPR+96 AGPR仍为2 waves/SIMD且零spill,但40960从
+  200.1--200.2T回退到196.9--197.0T。额外32 AGPR的生存期和调度压力超过VMEM前移收益。
+- 半量打包后重新扫描相邻配额:5/3/8为202.2T,3/3/10为202.7T,4/4/8为203.0--203.1T;
+  4/3/9稳定为203.1--203.3T,因此继续保留4/3/9。
+
+### 22.13 e32常量编码与循环相位:205.5T
+
+半量打包版本中,`scale_log2`、`round_bias`和`lazy_delta`最初放在SGPR。对`round_bias`而言,这使
+概率打包的`v_add_u32`采用8-byte e64编码;三个常量改为VGPR后,LLVM/汇编器可使用4-byte e32形式。
+资源从154 VGPR+64 AGPR变为156+64,仍为2 waves/SIMD、零spill。
+
+随后把循环地址状态改为字节offset并使用尾部条件分支:
+
+- 删除`pair -> pair_base`的每轮shift和独立`tile_soffset`更新;
+- 缓存偶/奇V与两组future-K字节offset;
+- 固定非空pair循环改为do-while形态,每轮少一条无条件branch;
+- 三个下一pair offset从循环头计算改为当前pair尾部滚动更新,动态SALU总数不变,但能落入尾部MFMA窗口。
+
+最终生产入口三次:
+
+```text
+4181.1 us = 205.4T
+4180.9 us = 205.5T
+4183.7 us = 205.3T
+```
+
+取4181.1 us中位,相对§22.12的4226.1 us/203.26T再快1.08%;相对最初4566.8 us/188.10T累计
+快9.22%。random输入`rel_l2=0.00319`,小尺寸`rel_l2=0.00315`。
+
+#### 205.2T最终ATT
+
+最终capture为4186.3 us/205.19T,仍使用kernel iteration 20(dispatch 145)、CU1、16个物理SIMD组、64个wave文件。与203.2T
+半量打包版本比较:
+
+| 指标(cycle/tile) | 203.2T | 205.2T | 变化 |
+|---|---:|---:|---:|
+| ATT关键路径 | 1470.377 | **1452.708** | **-17.669** |
+| wall cycle | 1486.441 | **1471.746** | **-14.695** |
+| issue union | 859.128 | **850.443** | **-8.685** |
+| physical no-issue | 611.249 | **602.265** | **-8.984** |
+| shadow non-MFMA issue | 340.416 | **344.344** | **+3.928** |
+| shadow MFMA-only | 71.831 | 71.702 | -0.130 |
+| shadow no-issue | 274.173 | **271.927** | **-2.246** |
+| shadow外no-issue | 337.076 | **330.338** | **-6.738** |
+
+本轮既减少了实际issue工作,也继续增加shadow内非MFMA发射;关键路径下降17.67 cycle/tile由issue union
+和physical idle近似各贡献一半。
+
+#### 回退项
+
+- correction寄存器别名虽然删4条pair-loop move并把VGPR降到152,但回退到202.7--202.9T。
+- block0 add/perm跨MFMA拆分、提前round-add、局部8-byte对齐均回退到202.2--202.8T。
+- 两个softmax窗口解耦配额、相邻4/4/8等没有超过4/3/9。
+- V load批量前压2/4条分别回退到201.9T/195.7T;非均匀间隔和地址组交替无收益。
+- SGPR stride/循环上界缩码虽减小机器码,但分别回退到204.4--204.5T和204.5--204.6T。
+
+### 22.14 移植到FlyDSL:185.1T到194.4T
+
+FlyDSL原路径40960为4639.5--4641.3 us/185.1--185.2T,240 VGPR、2 waves/SIMD。直接移植
+三路DS fanout会把VGPR增至250并回退到179.6--179.8T,说明高层公式不能自动复现JIT的精确wait/VALU顺序。
+
+最终保留两项可由LLVM scheduler稳定表达的移植:
+
+1. GEMM2 scheduler中第一条K写后发7条MFMA;第二个VMEM后发3条MFMA,再发第二条K写和4条MFMA。
+  第二条K写从约第7条MFMA后提前到第4条MFMA后,资源仍为240 VGPR。40960提升到
+  4429.3--4431.0 us/193.9T。
+2. 根据fragment真实布局`frag_St[V,m,n] -> frag_Sb[V,n,m]`,先转换`m=0 -> n=0`,发K copy,
+  再转换`m=1 -> n=1`。最终ISA确认两组BF16 round/perm分列K写两侧,资源仍240 VGPR。
+  40960进一步到4418.1--4418.5 us/194.4T;生产复验三次4418.5--4421.0 us/194.3--194.4T。
+
+FlyDSL两项合计相对185.08T基线快5.01%,精度保持`rel_l2=0.00319`。第二条K写位置扫描中第3条
+MFMA后是唯一明显最优点;位置1/2/5回落到184--185T,位置4为193.4T。强制scalar sum虽然消除
+`v_pk_add_f32`并把VGPR降到238,但因串行依赖回退到179.8T;AGPR后端选项对该kernel未生效。
+
+### 22.15 FlyDSL的8192回退与shape分派
+
+§22.14的两项调度不能无条件用于短序列。在空闲GPU6上用同一进程配置分别运行移植前、仅K写中置、
+K写中置+半量转换三个精确版本,`H=8,M=N=8192`的夹心结果为：
+
+| 版本 | 时间(us) | TFLOPS | 相对移植前 |
+|---|---:|---:|---:|
+| 移植前scheduler + 整片转换 | 1608.8--1609.3 | 170.8--170.9 | 基线 |
+| 仅K写中置scheduler | 1635.2--1635.5 | 168.1 | -1.6% |
+| 再加按`m_rep`半量转换 | 1646.0--1647.4 | 166.9--167.0 | -2.3% |
+
+三者`rel_l2`均为0.00316。两项改动都只重排热循环中的现有指令,资源仍为240 VGPR、2 waves/SIMD；
+因此回退不是额外计算、spill或occupancy下降,而是短序列下两个resident wave的MFMA、softmax VALU和
+barrier相位变差。长序列有足够多的KV迭代摊平相位并受益于K写中置,所以同一顺序在40960反而更快。
+
+三份8192 ATT分别采到100、108、104个wave,每个物理SIMD包含5--7个不完整task边界,不能套用40960
+的固定4 task/SIMD账本。按每个wave实际MFMA数归一化后,关键路径中位数从移植前2868.9升到
+scheduler-only的3014.1 cycle/tile,半量转换后为2950.4 cycle/tile；`v_pk_add_f32`、
+`v_pk_mul_f32`和barrier的驻留时间同步上升。该ATT只作相位/阻塞类型的定性佐证,性能归因以空闲GPU
+夹心墙钟为准。
+
+交叉点扫描显示优化路径在已验证的32768开始有正收益：
+
+| shape | 移植前 | 长序列调度 | 变化 |
+|---|---:|---:|---:|
+| `H=8,M=N=8192` | 170.8--170.9T | 166.9--167.0T | -2.3% |
+| `H=1,M=N=32768` | 151.6T | 155.0--155.3T | +2.3% |
+| `H=1,M=N=40960` | 184.9--185.0T | 194.3--194.4T | +5.1% |
+
+最终用编译期常量`use_long_sequence_schedule = N >= 32768`分派：短序列恢复原来的
+`2 x (VMEM1 -> DSWR1 -> MFMA7)`和整片BF16转换,长序列保留§22.14的K写中置与半量转换。
+kernel中只有`const_expr`分支,最终机器码没有运行时shape判断。修复后的8192严格夹心为：
+
+```text
+移植前:      1612.2 / 1612.6 us = 170.5 / 170.5T
+shape分派后: 1611.4 / 1610.4 us = 170.6 / 170.7T
+```
+
+40960复验为4425.8--4428.1 us/194.0--194.1T,仍保持长序列收益；所有shape精度不变。
+
+### 22.16 JIT的K读与VMEM等待填窗:206.5T
+
+重新检查最终JIT机器码时需要区分普通`v_fma_f32`和`v_mfma`：普通FMA本身不产生MFMA co-issue
+窗口；可填充的是每条MFMA发射后$[+4,+16)$的12 cycles。205.5T版本的物理SIMD ATT矩阵为：
+
+| 区域 | non-MFMA issue | MFMA-only | no-issue | 小计(cycle/tile) |
+|---|---:|---:|---:|---:|
+| MFMA shadow内 | 344.344 | 71.702 | 271.927 | 687.972 |
+| shadow外 | 288.900 | 145.498 | 330.338 | 764.736 |
+
+普通5-cycle FMA在center段已经按MFMA后两条分配。`J.emit(center, 10)`正好消费两条5-cycle FMA；
+改成11会继续取第三条（预算依次为11→6→1→-4）,并非只增加1 cycle。实测该变体从约206T降到
+169.1T,说明三条FMA挤占下一条MFMA发射,不能保留。逐静态MFMA PC审计还显示128个MFMA PC中
+64个平均至少有4个物理no-issue cycle,但主要集中在GEMM1/2依赖链,不能仅靠增加相邻FMA解决。
+
+#### 把下一K读放进GEMM2 shadow
+
+原来每组为：
+
+```text
+ds_read_b128 next-K
+MFMA current-GEMM2
+MFMA current-GEMM2
+```
+
+K读写下一tile的`key_reg`,当前GEMM2只读V/P/O,因此改成：
+
+```text
+MFMA current-GEMM2
+ds_read_b128 next-K
+MFMA current-GEMM2
+```
+
+同卡夹心结果为：
+
+| 版本 | 两次时间(us) | 两次TFLOPS |
+|---|---:|---:|
+| 原K读相位 | 4170.7 / 4165.3 | 206.0 / 206.2 |
+| MFMA中置K读 | **4158.9 / 4158.3** | **206.5 / 206.6** |
+
+资源保持156 VGPR+64 AGPR、34 SGPR、16KB LDS、2 waves/SIMD、零spill,`rel_l2=0.00319`。
+候选ATT相对205.5T基线：
+
+| 指标(cycle/tile) | 原相位 | K读中置 | 变化 |
+|---|---:|---:|---:|
+| ATT关键路径 | 1452.708 | **1449.083** | **-3.625** |
+| issue union | 850.443 | 850.147 | -0.297 |
+| physical no-issue | 602.265 | **598.936** | **-3.329** |
+| shadow non-MFMA issue | 344.344 | **347.657** | **+3.313** |
+| shadow MFMA-only | 71.702 | 69.904 | -1.797 |
+| shadow no-issue | 271.927 | **266.613** | **-5.314** |
+
+因此墙钟收益与“更多K读进入MFMA shadow、物理idle下降”闭合,不是静态邻接造成的假象。
+
+#### 用softmax max覆盖`vmcnt(2)`
+
+ATT中两处`s_waitcnt vmcnt(2)`合计约15.9--18.6 physical cycles/tile。score已经由GEMM1产生,
+lane-local max不依赖当前V数据,所以在原来的：
+
+```text
+s_waitcnt vmcnt(10)
+s_waitcnt vmcnt(2)
+MFMA
+max / DS fanout
+```
+
+之间逐步前移1--4条max。四条完整lane-local max链（$5+5+5+4=19$ cycles）稳定最快：
+
+```text
+s_waitcnt vmcnt(10)
+v_max3 / v_max3 / v_max3 / v_max
+s_waitcnt vmcnt(2)
+MFMA
+ds_swizzle / ds_bpermute / ds_bpermute
+MFMA
+```
+
+深度扫描中四max两次为4160.3/4161.5 us、206.5/206.4T；两max为4175.7/4182.9 us,
+三max为4170.5/4175.0 us。最终生产源码hash为
+`9d9587422b922b48094789b86a3300846e4fa0b363112fdbf17fec4c7d6b5e0f`,精度和资源不变。
+
+GPU随后被外部8卡任务全部占满（每卡约159GB、util 100%）,所以没有用之后的154--169T污染数据
+做决策。已准备但未进入生产文件的下一轮候选，是把预执行预算从19扩到31/35/43 cycles：分别再
+前移三路DS fanout、threshold add、两条K写；三者小shape精度均通过,待空闲GPU夹心后再决定。
+
+### 22.17 两MFMA共享3 ALU和1 EXP:208.3T
+
+单独的co-issue测试只能说明`MFMA+3 ALU`和`MFMA+EXP`各自的重叠,不能推导三者同时出现时的成本。
+新增精确混合bundle后,gfx942结果为：
+
+| 单MFMA bundle | 0 ALU | 1 ALU | 2 ALU | 3 ALU |
+|---|---:|---:|---:|---:|
+| `MFMA -> ALU -> EXP` | 20.056 | 24.040 | 28.041 | 32.041 |
+| `MFMA -> EXP -> ALU` | 20.056 | 24.041 | 28.427 | 32.043 |
+
+EXP与普通ALU基本串行,所以不能把3 ALU和1 EXP同时视为一个MFMA的免费16-cycle窗口。随后按用户提出的
+“每两条MFMA一组”测三种顺序：
+
+| 双MFMA bundle,3 ALU | cycle/group |
+|---|---:|
+| `MFMA -> MFMA -> 3 ALU -> EXP` | 48.052 |
+| **`MFMA -> 3 ALU -> MFMA -> EXP`** | **36.053** |
+| `MFMA -> EXP -> MFMA -> 3 ALU` | 36.053 |
+
+两条MFMA加1条EXP、0 ALU的基线约36.040 cycles；因此把3条独立ALU放在两条MFMA之间只增加约
+0.013 cycle/group,而把ALU与EXP都堆在组尾会增加12 cycles。
+
+把该pattern机械应用到每个mt的全部6组pair虽然精度正确、静态指令数不变,但40960从
+207.0--207.1T回退到200.7--201.0T：局部bundle容量不能替代完整softmax依赖链调度。最终只在center
+第2/3条MFMA之间保留一组：
+
+```text
+MFMA
+v_fma_f32
+v_fma_f32
+v_fma_f32
+MFMA
+v_exp_f32 correction
+```
+
+第1/2条MFMA位置中性略慢（4157.6--4159.5 us）,第2/3条位置稳定提升：
+
+| 版本 | 时间(us) | TFLOPS |
+|---|---:|---:|
+| 206.5T基线 | 4146.0 / 4140.8 | 207.2 / 207.4 |
+| **center pair23** | **4132.3 / 4124.7** | **207.9 / 208.3** |
+
+反向的`MFMA -> EXP -> MFMA -> 3 ALU`在真实kernel中为207.1--207.2T,低于ALU-first的207.3--207.6T,
+未保留。最终随机40960精度`rel_l2=0.00319`,资源仍为156 VGPR+64 AGPR、34 SGPR、16KB LDS、
+2 waves/SIMD、零spill。
+
+继续增加第二个局部pair（`MFMA -> cndmask+2 correction copy -> MFMA -> probability EXP0`）虽然精度、
+资源和静态指令数均不变,但单次回退到206.3T；提前p0破坏了后续probability EXP的整体相位,
+因此最终只保留center pair23这一组。
+
+pair23 ATT相对K读中置版本：
+
+| 指标(cycle/tile) | K读中置 | pair23 | 变化 |
+|---|---:|---:|---:|
+| ATT关键路径 | 1449.083 | **1441.530** | **-7.553** |
+| issue union | 850.147 | 853.901 | +3.754 |
+| physical no-issue | 598.936 | **587.629** | **-11.307** |
+| shadow TRANS issue | 11.885 | **18.518** | **+6.633** |
+| shadow外 TRANS issue | 59.218 | **52.037** | **-7.181** |
+
+虽然shadow内局部no-issue增加7.143,shadow外no-issue减少约18.45,全局净idle下降11.31 cycles/tile。
+这说明收益来自把correction EXP和相邻ALU/MFMA相位移动到更合适的位置,不是增加静态工作。
+
+### 22.18 选中GEMM1区的整体pipeline填窗:208.8T
+
+208.3T汇编的GEMM1 mt0段按8组`V load -> MFMA -> MFMA`展开。由于每个k-half有两个n_block,
+四个奇数k-half处出现连续MFMA,选中区共有4个空窗。ATT同时显示这些PC主要阻塞在两条8-deep
+score accumulator依赖链；因此“静态放入更多指令”必须保持VMEM成熟距离和请求年龄顺序。
+
+最终保留两项零工作量重排：
+
+1. K LDS写地址原来每tile在写前执行两条`base + stage*8192`的`v_add_u32`。改为持久地址每tile
+  原地`xor 8192`,并把两条`v_xor_b32`放入group1/group3的连续MFMA空窗。偶tile切到stage1,
+  奇tile切回stage0；K写前的两条地址ADD同时消失,静态指令数不变。
+2. `pair_base/odd_value_soffset`在各自最后一条V load后已无本tile用途,将对应`s_add_u32`移动到
+  group7的MFMA空窗；两个future-K offset仍留在循环尾,避免过早改变预取地址。
+
+最终选中区四个连续MFMA空窗中三个分别由`XOR/XOR/V-offset ADD`填充；group5保留为空。尝试填满
+group5需要增加临时offset状态或改变VMEM请求顺序,实测均不划算。
+
+| 版本 | 两次时间(us) | 两次TFLOPS |
+|---|---:|---:|
+| 208.3T pair23基线 | 4142.2 / 4140.6 | 207.4 / 207.5 |
+| K写地址XOR(group1/3) | 4134.3 / 4131.7 | 207.8 / 207.9 |
+| **再加V-offset滚动** | **4117.1 / 4114.9** | **208.6 / 208.8** |
+
+XOR位置扫描中group1/3最快：group1/5=207.4T、1/7=206.4T、3/5=207.6T、3/7=206.2T、
+5/7=207.0T。地址越早准备、离K写越远越有利。
+
+ATT从pair23到XOR13再到XOR+V-offset：
+
+| 指标(cycle/tile) | pair23 | XOR13 | XOR+V-offset |
+|---|---:|---:|---:|
+| ATT关键路径 | 1441.530 | 1439.736 | **1430.918** |
+| physical no-issue | 587.629 | 587.256 | **579.375** |
+| shadow non-MFMA issue | 345.970 | 356.327 | **358.632** |
+| shadow no-issue | 273.756 | 268.626 | **265.888** |
+
+最后一级相对XOR13关键路径-8.818、physical idle -7.881、shadow non-MFMA issue +2.305、
+shadow no-issue -2.739 cycle/tile,与墙钟收益方向一致。
+
+以下候选虽然增加静态交织,但均未保留：
+
+- 把V load移到两MFMA之间：缩短V到GEMM2的成熟距离,回退约0.6--0.9T。
+- V lookahead：load1--7各提前一条MFMA,仍回退约1.2T。
+- future-K提前：增加VMEM队列压力,回退到204.4--204.6T；保持V8→K2顺序但靠近尾部也仅约203T。
+- threshold预计算：填两个空窗但增加2 VGPR,回退到206.2T。
+- 单/双max前移：中性或略慢；读取未完成n_block的双max版本语义不严格,已移除。
+- 四个offset全部滚动：无稳定收益；只滚动V offsets与XOR叠加后才有收益。
+- mt0奇偶K-half双accumulator：4条短依赖链正确,但增加8 VGPR和8 ADD,约203T；双mt版本增加
+  16 VGPR/16 ADD,同样约203T。
+
+最终源码hash为`92c26d1ed86807aa12700c6cab66f542fdb24fe9eeb824ac9c06988bb054787e`,
+汇编归档为`archive/gemm/attn-gemm-jit-gfx942-m40960-n40960-208p8t.s`。随机40960
+`rel_l2=0.00319`,资源仍156 VGPR+64 AGPR、34 SGPR、16KB LDS、2 waves/SIMD、零spill。
+
+### 22.19 208.8T热循环逐MFMA窗口指令账本
+
+本节以`archive/gemm/attn-gemm-jit-gfx942-m40960-n40960-208p8t.s`中的第一个偶KV tile为准,
+统计范围从该tile首条V load到最后一条GEMM2 mt1 MFMA。单位均为**单wave、单BN=32 KV tile**。
+窗口$i$表示MFMA $i$发射后、MFMA $i+1$发射前的静态指令。静态相邻不等于全部能被一个12-cycle
+MFMA shadow隐藏；特别是连续9条EXP的窗口明显跨越多个issue周期。
+
+```mermaid
+flowchart LR
+  P["Prelude<br/>1 V load + 1 wait"] --> B1["GEMM1 mt0<br/>16 MFMA<br/>窗口内14条"]
+  B1 --> B2["GEMM1 mt1 + softmax mt0<br/>16 MFMA<br/>窗口内63条"]
+  B2 --> E2["边界<br/>28条<br/>pack / O-rescale / V wait"]
+  E2 --> B3["GEMM2 mt0 + softmax mt1<br/>16 MFMA<br/>窗口内59条"]
+  B3 --> E3["边界<br/>24条<br/>pack / O-rescale / barrier"]
+  E3 --> B4["GEMM2 mt1 + next-K read<br/>16 MFMA<br/>窗口内8条"]
+```
+
+#### 单tile静态总账
+
+| 类别 | 条数 | 主要内容 |
+|---|---:|---|
+| MFMA | **64** | GEMM1 32 + GEMM2 32 |
+| 普通VALU | **128** | FMA/ADD/MAX/PERM/CMP/CNDMASK/XOR及条件O-rescale |
+| TRANS | **18** | 每个mt 1 correction EXP + 8 probability EXP |
+| VMEM load | **10** | 当前V 8 + future-K 2 |
+| LDS | **22** | max/sum fanout 14 + next-K read 8 |
+| wait | **12** | progressive K、DS归约、VMEM及barrier前wait |
+| SALU/control | **7** | offset更新及两次条件O-rescale控制 |
+| barrier | **1** | K stage切换 |
+| **合计** | **262** | 不含prologue、epilogue和两tile一次的pair-loop尾部4条SALU |
+
+```mermaid
+pie showData
+  title 单wave单KV tile静态指令分布（262条）
+  "MFMA" : 64
+  "普通VALU" : 128
+  "TRANS" : 18
+  "VMEM load" : 10
+  "LDS" : 22
+  "wait" : 12
+  "SALU/control" : 7
+  "barrier" : 1
+```
+
+其中32条`v_pk_mul_f32`位于两个条件O-rescale块中；标准random fast path通常只在首tile执行,
+所以262是编码在该tile路径中的静态总数,不是每个动态tile必然发射的指令数。pair loop每处理两个tile
+还执行2条next-K offset更新、1条compare和1条branch,平均另加2条SALU/tile。
+
+#### Block 1:GEMM1 mt0的16条MFMA
+
+首条MFMA前先发1条V load和`lgkmcnt(7)`。随后15个MFMA间隔如下：
+
+| MFMA窗口 | 夹入指令 | 条数 |
+|---|---|---:|
+| 0→1 | `s_waitcnt lgkmcnt(3)` | 1 |
+| 1→2 | V `buffer_load_dwordx4` | 1 |
+| 2→3 | `v_xor_b32 key_write_addr0,8192` | 1 |
+| 3→4 | V load | 1 |
+| 4→5 | `s_waitcnt lgkmcnt(2)` | 1 |
+| 5→6 | V load | 1 |
+| 6→7 | `v_xor_b32 key_write_addr1,8192` | 1 |
+| 7→8 | V load | 1 |
+| 8→9 | `s_waitcnt lgkmcnt(1)` | 1 |
+| 9→10 | V load | 1 |
+| 10→11 | 空 | 0 |
+| 11→12 | V load | 1 |
+| 12→13 | `s_waitcnt lgkmcnt(0)` | 1 |
+| 13→14 | V load | 1 |
+| 14→15 | `s_add_u32`滚动V offset | 1 |
+
+窗口内合计14条：7 VMEM load、4 wait、2 VALU XOR、1 SALU；加首条MFMA前的V load和wait,
+本block为16 MFMA + 16非MFMA = 32条。原4个连续MFMA空窗中group1/group3/group7已分别由
+`XOR/XOR/V-offset`填充,只保留group5一个空窗。
+
+```mermaid
+flowchart LR
+  M0["M0"] -->|wait| M1["M1"] -->|V| M2["M2"] -->|XOR0| M3["M3"] -->|V| M4["M4"]
+  M4 -->|wait| M5["M5"] -->|V| M6["M6"] -->|XOR1| M7["M7"] -->|V| M8["M8"]
+  M8 -->|wait| M9["M9"] -->|V| M10["M10"] -->|空| M11["M11"] -->|V| M12["M12"]
+  M12 -->|wait| M13["M13"] -->|V| M14["M14"] -->|offset ADD| M15["M15"]
+```
+
+#### Block 2:GEMM1 mt1与softmax mt0
+
+| 阶段/窗口 | 夹入工作 | 条数 |
+|---|---|---:|
+| prepare 0 | 2×`v_max3_f32` | 2 VALU |
+| prepare 1 | `max3 + max` + 三路max DS fanout | 2 VALU + 3 LDS |
+| prepare 2 | threshold ADD + 2 future-K load + wait | 1 VALU + 2 VMEM + 1 wait |
+| prepare 3 | 合并DS max + compare + cndmask | 4 VALU |
+| center 4 | MUL + correction FMA + score FMA | 3 VALU |
+| center 5 | 3 score FMA | 3 VALU |
+| center 6 | correction EXP + 4 score FMA + 8 probability EXP + cndmask | 5 VALU + 9 TRANS |
+| finish 7 | 3 probability-sum ADD | 3 VALU |
+| finish 8 | 3 probability-sum ADD | 3 VALU |
+| finish 9 | 1 sum ADD + 三路sum DS fanout | 1 VALU + 3 LDS |
+| finish 10 | running-max + 2 correction copy | 3 VALU |
+| finish 11 | block0:4 round ADD + 2 PERM | 6 VALU |
+| finish 12 | wait + 2 DS-result ADD | 1 wait + 2 VALU |
+| finish 13 | 第3条DS ADD + running-sum FMA + 1 round ADD | 3 VALU |
+| finish 14 | 3 round ADD | 3 VALU |
+
+窗口内合计63条：44 VALU、9 TRANS、6 LDS、2 VMEM、2 wait。加16条MFMA后block内共79条。
+center窗口4--6中保留的局部pair为：
+
+```mermaid
+flowchart LR
+  A["MFMA center-1"] --> B["3 × v_fma_f32"] --> C["MFMA center-2"] --> D["1 × correction EXP"]
+```
+
+MFMA15后到Block 3首条MFMA还有28条边界工作：2 PERM；compare/saveexec/branch/restore共4条；
+条件O-rescale 16条`v_pk_mul_f32`；以及`vmcnt(10) + 4条mt1 local max + vmcnt(2)`共6条。
+
+#### Block 3:GEMM2 mt0与softmax mt1
+
+mt1的4条lane-local max已放在`vmcnt(10)`和`vmcnt(2)`之间,所以Block 3从DS fanout开始：
+
+| 阶段/窗口 | 夹入工作 | 条数 |
+|---|---|---:|
+| prepare 0 | 三路max DS fanout | 3 LDS |
+| prepare 1 | threshold ADD + 2 next-K LDS write | 1 VALU + 2 LDS |
+| prepare 2 | `lgkmcnt(2)` + 2条DS max合并 | 1 wait + 2 VALU |
+| prepare 3 | compare + cndmask | 2 VALU |
+| center 4 | MUL + correction FMA + score FMA | 3 VALU |
+| center 5 | 3 score FMA | 3 VALU |
+| center 6 | correction EXP + 4 score FMA + 8 probability EXP + cndmask | 5 VALU + 9 TRANS |
+| finish 7 | 3 probability-sum ADD | 3 VALU |
+| finish 8 | 3 probability-sum ADD | 3 VALU |
+| finish 9 | 1 sum ADD + 三路sum DS fanout | 1 VALU + 3 LDS |
+| finish 10 | running-max + 2 correction copy | 3 VALU |
+| finish 11 | block0:4 round ADD + 2 PERM | 6 VALU |
+| finish 12 | wait + 2 DS-result ADD | 1 wait + 2 VALU |
+| finish 13 | 第3条DS ADD + running-sum FMA + 1 round ADD | 3 VALU |
+| finish 14 | 3 round ADD | 3 VALU |
+
+窗口内合计59条：40 VALU、9 TRANS、8 LDS、2 wait；加16 MFMA后block内共75条。
+MFMA15后的24条边界工作为：2 PERM；条件O-rescale控制4条；16条条件`v_pk_mul_f32`；
+`lgkmcnt(0)`和barrier各1条。
+
+#### Block 4:GEMM2 mt1与next-K LDS读取
+
+8组固定为`MFMA -> ds_read_b128 -> MFMA`：
+
+```mermaid
+flowchart LR
+  M0["M0"] -->|DSRD0| M1["M1"] --> M2["M2"] -->|DSRD1| M3["M3"] --> M4["..."]
+  M4 -->|每两条MFMA一条DSRD| M14["M14"] -->|DSRD7| M15["M15"]
+```
+
+因此16条MFMA间夹8条LDS read,block合计24条。读入的是下一KV tile的K,当前GEMM2只读取V/P/O,
+所以K读与当前MFMA无RAW依赖；下一tile GEMM1开始时`key_reg`已经就绪。
+
+### 22.20 非MFMA周期账本与依赖约束下的理论最佳排法
+
+本节重新使用完整两tile pair-loop计数,补入§22.19为便于观察单tile而未包含的pair-loop尾部SALU。
+标准steady-state fast path每tile实际编码232条动态指令：64 MFMA和168条非MFMA；若lazy O-rescale
+taken,再执行32条`v_pk_mul_f32`。以下`raw issue cycles`表示独立指令流的canonical吞吐成本,不是把
+load latency、`waitcnt`停顿或barrier等待重复加到每条指令上。
+
+#### 非MFMA原始issue成本
+
+| 类别 | 指令/tile | 吞吐假设 | raw issue cycles/tile | 非MFMA占比 |
+|---|---:|---:|---:|---:|
+| 普通scalar VALU | 96 | 4.008--4.016 cycle/inst | **385.117** | **43.31%** |
+| TRANS/EXP | 18 | 16.000 cycle/inst | **288.000** | **32.39%** |
+| LDS/cross-lane | 22 | 最小4 cycle/issue | **88.000** | **9.90%** |
+| `s_waitcnt` | 12 | 4 cycle issue slot | **48.000** | **5.40%** |
+| VMEM load | 10 | 最小4 cycle/issue | **40.000** | **4.50%** |
+| SALU/address/control | 9 | 4 cycle issue slot | **36.000** | **4.05%** |
+| barrier | 1 | 4 cycle issue slot | **4.000** | **0.45%** |
+| **非MFMA合计** | **168** |  | **889.117** | **100%** |
+
+普通VALU的96条具体为22 ADD、20 FMA、16 `v_add_u32`、8 MAX3、8 PERM、6 MOV、4 MAX、
+4 CMP、4 CNDMASK、2 XOR和2 MUL。64条MFMA自身为：
+
+$$
+C_{\mathrm{MFMA}}=64\times16.02416=1025.546\ \text{cycles/tile}.
+$$
+
+若完全串行,核心循环成本为：
+
+$$
+C_{\mathrm{serial}}=1025.546+889.117=1914.663\ \text{cycles/tile}.
+$$
+
+O-rescale taken path额外增加：
+
+$$
+C_{\mathrm{rescale}}=32\times4.008084=128.259\ \text{cycles/tile}.
+$$
+
+`v_pk_mul_f32`在gfx942微基准中不能被MFMA fully hidden,所以该项不能按普通scalar VALU处理。
+标准random输入通常只有首tile taken,1280个tile分摊后接近0.1 cycle/tile；对抗输入每tiletaken时则必须
+完整计入。VMEM/LDS表中的40/88只表示请求发射成本；数据完成延迟会在后面的ATT no-issue账本体现。
+
+#### 208.8T最终ATT的实际物理周期
+
+对`ui_output_agent_62545_dispatch_145`重新按物理SIMD合并两个resident wave的issue区间。最终trace为：
+
+| 物理时间线 | cycles/tile |
+|---|---:|
+| 有指令issue的并集 | **851.543** |
+| 完全no-issue | **579.375** |
+| **ATT关键路径** | **1430.918** |
+| ATT外墙钟边界 | 16.113 |
+| **墙钟反推** | **1447.031** |
+
+其中非MFMA指令的物理issue区间合并后为634.563 cycles/tile：
+
+| 实际非MFMA issue类别 | 物理cycles/tile | 占非MFMA issue |
+|---|---:|---:|
+| VALU | **368.673** | **58.10%** |
+| LDS/cross-lane | 79.189 | 12.48% |
+| TRANS | 70.899 | 11.17% |
+| VMEM load | 37.651 | 5.93% |
+| LDS/SMEM wait | 36.810 | 5.80% |
+| SALU/control | 30.983 | 4.88% |
+| VMEM wait | 7.116 | 1.12% |
+| barrier | 3.194 | 0.50% |
+| 其他 | 0.048 | 0.01% |
+| **合计** | **634.563** | **100%** |
+
+这634.563是两个resident wave在物理时间轴上的non-MFMA issue并集；前面的889.117则是单wave把各类
+独立吞吐成本相加。两者之差来自MFMA/非MFMA partial co-issue、两个resident wave互相填窗和issue区间重叠,
+不能把889.117再加到1430.918上。
+
+no-issue的579.375 cycles按两个active wave当时阻塞的PC等分如下。它是stall归因,各行不能直接解释为
+单独消除该类就能得到同等加速。
+
+| no-issue阻塞类别 | cycles/tile | 占no-issue |
+|---|---:|---:|
+| MFMA依赖链 | **211.528** | **36.51%** |
+| TRANS/EXP | **126.980** | **21.92%** |
+| VMEM load未成熟 | **65.916** | **11.38%** |
+| LDS/cross-lane | **46.953** | **8.10%** |
+| scheduler/ready空洞 | **46.887** | **8.09%** |
+| 普通VALU依赖 | 35.229 | 6.08% |
+| barrier | 23.186 | 4.00% |
+| 显式VMEM wait | 16.435 | 2.84% |
+| 显式LDS/SMEM wait | 4.070 | 0.70% |
+| 其他 | 2.191 | 0.38% |
+
+64条MFMA提供768个逻辑shadow cycles；两个resident wave合并后物理shadow为693.957 cycles/tile：
+
+| MFMA物理shadow状态 | cycles/tile |
+|---|---:|
+| 已有non-MFMA issue | **358.632** |
+| 只有另一条MFMA issue | 69.437 |
+| 完全no-issue | **265.888** |
+| resident-wave shadow重叠/alias | 74.043 |
+
+因此剩余瓶颈首先是MFMA/EXP依赖波前,不是继续移动`s_waitcnt`本身：显式LDS wait只对应4.070个
+physical no-issue cycles,而MFMA+TRANS合计338.508 cycles。
+
+#### 真实依赖DAG
+
+每个mt内部不能把softmax当作一个不可拆的整体。由于pack会原地覆盖FP32 probability,
+`P[mt,nb0]`必须先完成四条score EXP、该n_block的3条local-sum ADD和nb0 pack,之后即可供8条
+GEMM2使用；它不必等待nb1或跨lane sum归约。nb1对应4条local-sum/combine ADD。online sum的
+DS fanout、跨lane合并和running-sum更新只需在下一tile使用状态前完成。
+
+```mermaid
+flowchart LR
+  K["K(i)已在key_reg"] --> G10["GEMM1 mt0<br/>16 MFMA"]
+  K --> G11["GEMM1 mt1<br/>16 MFMA"]
+  G10 --> M0["max0 + correction0"]
+  M0 --> E00["scale/EXP nb0"] --> L00["local sum nb0"] --> P00["pack P0,nb0"] --> G200["GEMM2 mt0,nb0<br/>8 MFMA"]
+  M0 --> E01["scale/EXP nb1"] --> L01["local sum nb1 + combine"] --> P01["pack P0,nb1"] --> G201["GEMM2 mt0,nb1<br/>8 MFMA"]
+  L00 --> U0["cross-lane sum/state 0<br/>下一tile前完成"]
+  L01 --> U0
+  G11 --> M1["max1 + correction1"]
+  M1 --> E10["scale/EXP nb0"] --> L10["local sum nb0"] --> P10["pack P1,nb0"] --> G210["GEMM2 mt1,nb0<br/>8 MFMA"]
+  M1 --> E11["scale/EXP nb1"] --> L11["local sum nb1 + combine"] --> P11["pack P1,nb1"] --> G211["GEMM2 mt1,nb1<br/>8 MFMA"]
+  L10 --> U1["cross-lane sum/state 1<br/>下一tile前完成"]
+  L11 --> U1
+  V["8 V(i) loads完成"] --> G200
+  V --> G201
+  V --> G210
+  V --> G211
+  R0["O mt0按需rescale"] --> G200
+  R1["O mt1按需rescale"] --> G210
+```
+
+K流水线的独立依赖为：
+
+```mermaid
+flowchart LR
+  KP["K(i+1)已在prefetch bank"] --> KW["2 LDS writes"] --> KB["wait + barrier"]
+  GC["GEMM1 mt1对key_reg[j]最后一次读取"] --> KR["LDS read K(i+1)[j]<br/>逐片覆盖key_reg[j]"]
+  KB --> KR --> GN["下一tile GEMM1使用全部8片"]
+  KF["2 VMEM loads K(i+2)"] --> KN["下一轮LDS writes"]
+```
+
+K写可以提前。K读覆盖`key_reg[j]`,只需等GEMM1 mt1对该切片的最后一次消费,理论上可按
+`j=0,4,1,5,...`逐片读入；但GEMM1 mt1的33个regular slot已全部用于release-critical softmax0工作,
+提前K读必然等量推迟P0,nb0,不会降低上述DAG下界。K读还不应让softmax reduction的`lgkmcnt`误等
+全部K读；最稳妥的位置仍是最后一组softmax DS consume之后,用
+`MFMA -> ds_read_b128 -> MFMA`覆盖。
+
+#### 两层理论下界
+
+**资源级下界。** 混合微基准给出：
+
+```text
+MFMA -> 3 scalar ALU -> MFMA -> EXP = 36.053 cycles
+2 MFMA + EXP、无ALU                  = 36.040 cycles
+```
+
+所以18条EXP理想地各与一条MFMA partial-overlap,每条只在MFMA基线上增加：
+
+$$
+\Delta C_{\mathrm{EXP}}=20.05616-16.02416=4.032\ \text{cycles}.
+$$
+
+EXP占用18个MFMA的scalar容量后,其余普通4-cycle工作可使用：
+
+$$
+N_{\mathrm{hidden}}=3(64-18)=138\ \text{instructions}.
+$$
+
+普通工作共有$96+10+22+9+12+1=150$条,仅12条溢出。因此无依赖限制的资源下界为：
+
+$$
+\begin{aligned}
+C_{\mathrm{resource}}
+&=1025.546+18\times4.032+(150-138)\times4\\
+&=\boxed{1146.122\ \text{cycles/tile}}.
+\end{aligned}
+$$
+
+该值对应约263.5T的纯核心循环roofline；它要求跨整个tile自由搬运工作,不是当前单tile数据流可达到值。
+
+**单tile DAG下界。** 为最早释放softmax0,应先完成GEMM1 mt0；过早发GEMM1 mt1只会消耗后面用于
+覆盖softmax的MFMA anchor,并不会更早产生完整score。当前排法在mt0结束前使用16条独立工作：
+
+```text
+8 V loads + 5 progressive-K waits + 2 stage-address XOR + 1 V-offset ADD
+```
+
+零延迟理论排法还可以增加12条：2 K LDS write、2 future-K load、1 future-K offset更新、K-stage
+wait+barrier、2条VMEM wait、预计算mt0/mt1 threshold,以及在GEMM1 mt0倒数第二条MFMA完成nb0 score后
+立即执行第一条partial-max,得到$E=28$。这些前移会增加live range或改变VMEM年龄,这里只用于理论下界。
+softmax0释放后还剩48条MFMA；
+18条EXP配对后只剩$3(48-18)=90$个普通工作隐藏位置。因此：
+
+$$
+C_{\mathrm{DAG}}(E)
+=1025.546+18\times4.032
++4\max(0,150-90-E).
+$$
+
+| 早期可用工作$E$ | 假设 | 下界cycles/tile | 核心循环roofline |
+|---:|---|---:|---:|
+| 16 | 当前数据流可合法前移集合 | **1274.122** | **237.0T** |
+| 23 | K写/远期预取/同步也全部提前 | **1246.122** | **242.3T** |
+| **28** | **零延迟list schedule的全部early-ready工作** | **1226.122** | **246.3T** |
+| 不受release限制 | 跨tile持续供给独立工作 | **1146.122** | **263.5T** |
+
+这些仍是乐观下界：把VMEM、LDS、wait和barrier都按普通4-cycle slot处理,且未加入请求完成延迟、
+MFMA accumulator RAW、VGPR live range和两resident-wave相位冲突。最终ATT 1430.918、墙钟1447.031
+cycles/tile分别达到约211.1T和208.7T；相对零延迟DAG最佳1226.122仍有204.796个ATT cycles/tile。
+
+#### 理论最佳wavefront排法
+
+最优目标不是固定`4/3/9`,而是按ready-time和consumer deadline做list scheduling：
+
+| 优先级 | MFMA anchor | 应夹入的工作 | 依赖/截止点 |
+|---:|---|---|---|
+| 1 | GEMM1 mt0的16条 | V(i) loads、progressive K wait、stage XOR、已预取K的LDS write | mt0尽早结束以释放softmax0；V必须早于首条GEMM2 |
+| 2 | GEMM1 mt1的16条 | softmax0 max；correction；先完成nb0的4 FMA+4 EXP、local sum与pack | mt1尽早结束以释放softmax1；P0,nb0一ready即可释放首批GEMM2 |
+| 3 | GEMM2 mt0,nb0的8条 | softmax0 nb1的FMA/EXP/local sum/pack；softmax1 max/correction/nb0 | nb1概率不应阻塞已就绪的nb0 GEMM2 |
+| 4 | 最早ready的GEMM2 8-MFMA块 | softmax1 nb1、两路sum/state、剩余probability pack | 在`G200/G201/G210/G211`之间按ready优先并轮换O accumulator链 |
+| 5 | 最后两组GEMM2 | K-stage wait/barrier后的8条next-K LDS read | 每两条MFMA间发一条DS read；保证下一tile K成熟 |
+
+按零延迟$E=28$口径,各wavefront的容量可以闭合。每个mt的softmax拆为：
+
+```text
+X(mt): shared max/correction + nb0 FMA/EXP/local-sum/pack + rescale控制 = 35 regular + 5 EXP
+Y(mt): nb1 FMA/EXP/local-sum/combine/pack                            = 14 regular + 4 EXP
+Z(mt): sum DS fanout + cross-lane combine + online state             = 9 regular
+```
+
+| wavefront | anchor | 必须优先完成的ready工作 | regular容量/使用 | 结果 |
+|---|---:|---|---:|---|
+| A | GEMM1 mt0,16 MFMA | early-ready预取/地址/K-stage/threshold/partial-max | 48 / **28** | 20个slot因softmax尚未ready而空置 |
+| B | GEMM1 mt1,16 MFMA | $X(0)$剩余$33R+5E$ | $3(16-5)=33$ / **33** | P0,nb0 ready |
+| C | GEMM2 mt0,nb0,8 MFMA | $Y(0)=14R+4E$ | $3(8-4)=12$ / **14** | 隐藏12R,串行补**2R=8 cycles**后P0,nb1 ready |
+| D | GEMM2 mt0,nb1,8 MFMA | $X(1)$剩余$34R+5E$ | $3(8-5)=9$ / **34** | 隐藏9R,串行补**25R=100 cycles**后P1,nb0 ready |
+| E | GEMM2 mt1,nb0,8 MFMA | $Y(1)=14R+4E$ | $3(8-4)=12$ / **14** | 隐藏12R,串行补**2R=8 cycles**后P1,nb1 ready |
+| F | GEMM2 mt1,nb1,8 MFMA | $Z(0/1)=18R$ + 8 K read + 1 loop control | 24 / **27** | 串行溢出**3R=12 cycles** |
+
+六段实际隐藏$28+33+12+9+12+24=118$条regular工作；150条regular中32条溢出。
+故同一结果也可直接写成：
+
+$$
+C_{\mathrm{DAG}}
+=1025.546+18\times4.032+32\times4
+=1226.122\ \text{cycles/tile}.
+$$
+
+C/D/E/F四段的串行溢出为$2+25+2+3=32$条：其中D段是主要release bottleneck,因为softmax1必须等
+GEMM1 mt1结束才ready,但P1,nb0又必须在GEMM2 mt1开始前ready。它与前述
+$150-90-E=150-90-28=32$完全一致。
+
+局部发射规则为：
+
+```text
+普通窗口: MFMA -> request/ALU -> ALU -> ALU -> MFMA
+EXP窗口 : MFMA -> 3 independent ALU -> MFMA -> EXP
+内存请求: request尽量放shadow开头；wait只放在第一个真实consumer之前
+taken rescale: 当前逐lane exec-mask块中的16条packed MUL必须全部完成并恢复exec后才能进入GEMM2
+```
+
+taken path不能直接使用“每个d-block的2条packed MUL紧贴对应GEMM2”的排法：correction predicate是逐lane
+条件,MFMA不能在部分exec mask下执行。若要逐块交织,必须为每个d-block重复saveexec/restore或改写为
+branchless masked rescale,会增加未计入的控制/VALU工作。因此固定当前指令集时,taken path在fast-path
+下界上严格串行增加128.259 cycles/tile。
+
+```mermaid
+flowchart LR
+  A["G1 mt0<br/>优先释放S0"] --> B["G1 mt1 + S0.nb0<br/>优先释放P0.nb0"]
+  B --> C["G2 0.nb0 + S0.nb1 + S1.nb0"]
+  C --> D["最早ready的8-MFMA块<br/>0.nb1或1.nb0"]
+  D --> E["剩余8-MFMA块 + sum/state/pack"]
+  E --> F["最后MFMA块 + next-K LDS reads"]
+```
+
+与当前实现相比,最值得验证的结构性变化只有一个：把softmax按`n_block`拆成
+`nb0 EXP/sum/pack -> GEMM2 nb0 -> nb1 EXP/sum/pack -> GEMM2 nb1`波前。机械地把更多EXP或VALU
+铺进任意MFMA窗口仍会破坏VMEM成熟距离和live range；最终排法必须保持156 VGPR+64 AGPR、2 waves/SIMD,
+并先用ISA确认64 MFMA、18 EXP、10 VMEM和22 LDS数量不变。
+
+### 22.21 理论wavefront实作与反证：最快204.1T，不保留
+
+按§22.20依赖图实现了三类wavefront。所有候选都保持每pair 128 MFMA、36 EXP、48 VMEM、54 LDS、
+27 wait和3 barrier，与控制组逐项完全一致；随机40960均为`rel_l2=0.00319`，小shape全1输入为
+`rel_l2=0`，且都保持2 waves/SIMD、零spill。
+
+实现过程中发现两个理论DAG必须补充的真实约束：
+
+1. probability pack原地覆盖FP32 score。对应n-block必须先执行其local-sum ADD，再round/pack，不能只按
+  `EXP -> pack -> GEMM2`计release时间。
+2. 两个mt的sum DS结果不能长期同时保存在各自`reduce_tmp`后再统一消费。首版这么做产生NaN；改为每个mt
+  在另一套DS归约覆盖/扰动LDS依赖窗口前及时`lgkmcnt(0)`并消费后，精度恢复。该约束缩短了可自由调度区间。
+
+最终在空闲GPU 0上使用10 buffers、50 samples中位数，按control→candidate→control夹心测试：
+
+| 版本 | 排法 | VGPR+AGPR | 时间(us) | TFLOPS | 相对控制均值 |
+|---|---|---:|---:|---:|---:|
+| control A | 208.8T生产调度 | 156+64 | 4135.5 | 207.7 | — |
+| control B | 同上 | 156+64 | 4131.0 | 207.9 | — |
+| 完整wavefront v2 | `0.nb0 -> 0.nb1 -> 1.nb0 -> 1.nb1` | 158+64 | 4220.7 | 203.5 | **-2.12%** |
+| 完整wavefront v3,p19 | sum/round/pack pair流水，prepare=19 | 158+64 | 4331.3 | 198.3 | -4.79% |
+| 完整wavefront v3,p43 | 同上，prepare=43 | 159+64 | 4231.5 | 203.0 | -2.38% |
+| **半wavefront** | 保留S0/G1原调度，只拆S1/G2 | **158+64** | **4207.8** | **204.1** | **-1.80%** |
+
+控制均值为4133.25 us。最快候选半wavefront仍增加74.55 us，即约26.21 cycles/tile。完整v2增加
+87.45 us，即约30.74 cycles/tile。
+
+#### 为什么零延迟DAG没有兑现
+
+完整v2虽然把概率EXP分散到MFMA中，但生成汇编出现新的release边界：
+
+```text
+M39 -> M40: 11条 = pack6 + wait + 3 sum ADD + running-sum FMA
+M47 -> M48: 35条 = 3 EXP + state/pack + 条件O-rescale
+M55 -> M56: 11条 = pack6 + wait + 3 sum ADD + running-sum FMA
+```
+
+控制组的长团总数约80条，完整v2反而为83条；v3进一步把工作移相后，长团总数升到89条。交叉拓扑
+`0.nb0 -> 1.nb0 -> 0.nb1 -> 1.nb1`只把33条边界从`M47`移动到`M39`，总量仍为89条，同时VGPR升到164，
+因此没有运行40960。
+
+主要原因是：
+
+- n-block概率release需要`scale FMA -> EXP -> local sum -> round/pack`完整链，不是只等EXP；
+- softmax1只有在GEMM1 mt1结束后才ready，仍形成不可消除的中段release bottleneck；
+- taken O-rescale必须在部分exec mask下串行完成并恢复exec，不能与MFMA交织；
+- 把sum fanout移出概率ready链不改变35条边界，说明主因是剩余EXP/state/pack/rescale，而非DS fanout；
+- wavefront延长两套softmax临时状态live range，VGPR从156增至158--164，虽不降occupancy，仍增加调度压力；
+- 理论公式把VMEM/LDS/wait都当4-cycle可搬动regular slot，也没有表示MFMA accumulator RAW和两个resident
+  wave的相位冲突。
+
+因此§22.20的1226.122 cycles/tile应视为**忽略真实release latency和live range的宽松资源roofline**，
+不是当前寄存器数据流的可实现schedule。实测表明，当前整体4/3/9 + 局部pair23 + K-read中置 +
+XOR/V-offset方案优于完整或半n-block wavefront。所有实验分支均已移除，生产源码恢复为hash
+`92c26d1ed86807aa12700c6cab66f542fdb24fe9eeb824ac9c06988bb054787e`。
+
+### 22.22 四阶段`s_setprio`双resident-wave流水线
+
+新增独立入口`attn_gemm_jit_setprio_pipeline`，不替换或改写现有`attn_gemm_jit`默认生成路径。规范化
+自动exec-mask标签编号后，生产入口新增函数前后的951条ISA逐指令完全一致。新入口按每tile四阶段执行：
+
+```text
+V(i) + K(i+2) prefetch + address VALU
+GEMM1 mt0: MFMA0 -> s_setprio(1) -> MFMA1..15 -> s_setprio(0)
+softmax mt0
+GEMM1 mt1: MFMA0 -> s_setprio(1) -> MFMA1..15 -> s_setprio(0)
+softmax mt1
+GEMM2 mt0: MFMA0 -> s_setprio(1) -> MFMA1..15 -> s_setprio(0)
+K(i+1) LDS write/wait/barrier/read
+GEMM2 mt1: MFMA0 -> s_setprio(1) -> MFMA1..15 -> s_setprio(0)
+```
+
+一个WG仍为4 waves；156 VGPR+64 AGPR使每SIMD驻留2 waves、occupancy保持2，零spill、16KB LDS。
+由于pair loop静态展开两个tile，机器码有128 MFMA和16条`s_setprio`，即每tile64 MFMA和8次优先级切换。
+所有`setprio(1)`都紧跟各GEMM块首条MFMA，`setprio(0)`紧跟第16条MFMA。
+
+正确性与资源验证：
+
+| 检查 | 结果 |
+|---|---|
+| 随机`H=1,M=N=256` | `rel_l2=0.00305139`, `max_abs=0.00195312` |
+| 全1`H=1,M=N=256` | `rel_l2=0`, `max_abs=0` |
+| 标准pytest（正确`PYTHONPATH=src`） | 1 passed |
+| 资源 | 156 VGPR+64 AGPR、34 SGPR、2 waves/SIMD、零spill |
+| 40960 code object | SHA256 `2c271bdec049bf7acf0af45fa021ed78d42a2ccef39f37e40b581189fc3fda1e` |
+
+#### 理论可行性与限制
+
+若同一SIMD的两条resident wave能够理想反相：一条处于MFMA块时，另一条处于VALU/访存块，粗资源下界为：
+
+$$
+C_{\mathrm{ideal\ antiphase}}
+=\max(C_{\mathrm{MFMA}},C_{\mathrm{nonMFMA}})
+=\max(1025.546,889.117)
+=1025.546\ \text{cycles/tile}.
+$$
+
+当前208.8T ATT为1430.918 cycles/tile，因此纯资源模型给出最多405.372 cycles/tile的宽松空间。但该数字
+忽略以下硬约束：
+
+1. 4-wave WG每个SIMD只有该WG的一条wave；同SIMD的第二条resident wave来自另一个WG，不能用WG barrier
+  对二者建立显式反相。两条wave只有在竞争同一MFMA pipeline时，第一条MFMA后的priority差异才可能自发
+  打破对称并维持错相。
+2. 阶段明显不等长：16 MFMA约256 cycles；常驻softmax raw issue约372 cycles/mt；V+K预读和地址工作仅约
+  52 issue cycles/tile。即使入口暂时反相，也可能每tile发生相位漂移。
+3. `s_setprio`只影响wave调度优先级，不创造额外MFMA/VALU执行槽；两条wave同时进入GEMM时会同时提权，
+  退化成普通竞争。每tile新增8条SALU priority指令，最小另占32 issue cycles。
+4. 历史实验中“GEMM1全块`setprio(1)`”从166.2T回退到153.7T，但它没有采用本节的四阶段粗粒度顺序，
+  因此是强烈负面先验，却不能单独否定当前反相方案。
+
+按40960候选ISA和fast path吞吐估算，priority并非覆盖整段16 MFMA，而是从首条MFMA后的`setprio(1)`
+生效，到末条后的`setprio(0)`结束。每tile约989 cycles处于priority-high，约952 cycles处于normal，
+占空比接近1:1。将两条相同阶段序列做循环相位扫描后：
+
+| 固定阶段相位指标 | 最佳值(cycles/tile) |
+|---|---:|
+| 两条wave high/high重叠 | **344.5** |
+| 两条wave normal/normal重叠 | **307.5** |
+| high/normal互补 | **1289.0** |
+| 最佳相位偏移 | **约244.25** |
+| 互补比例 | **66.4%** |
+
+即使high/normal总工作量接近1:1，固定的四段顺序仍不能做到全程反相：softmax约376--380 cycles，而
+priority-high GEMM tail约244--256 cycles，必然漂移并留下同类阶段重叠。若同类重叠完全串行、异类重叠
+完全并行，粗略乐观下界约为$344.5+307.5+1289/2\approx1296.5$ cycles/tile，仍对应约233T，
+所以理论上存在超过208.8T的空间，但远小于1025.546-cycle纯资源roofline所暗示的余量。
+
+最佳初相位约一段GEMM tail。曾经用奇数WG一次性`s_sleep(1..15)`做启动错相，性能与coverage均中性；
+且同SIMD第二条wave来自另一个WG，block奇偶不能保证物理配对。因此当前候选先依赖“第一条MFMA先发者立即
+提权”自发打破对称，不再加入未经验证的slot/WG sleep。
+
+故该方案不能仅凭资源roofline判定必胜或必败。最终标准是在稳定空闲GPU上，与production使用同一进程、
+同一10组buffer做`control -> setprio -> control`，每阶段50样本取中位数；只有超过208.6--208.8T且
+精度/资源不变才保留。目前8卡均被外部作业占满，联合自动watcher会在同一卡连续3次`gfx<=5%`且空闲显存
+`>=160GB`后，同时完成最佳半wavefront和setprio五阶段夹心，输出
+`/tmp/attn-wavefront-retest-latest.json`。
+
+### 22.23 空闲GPU复测方法修正与`s_setprio`迭代
+
+外部8卡作业第一次退出后，五阶段夹心自动触发，但control A从前40次约4.13 ms切换到约6.20 ms；
+control mid又从6.20 ms恢复到4.13 ms。独立在GPU 3运行200次production也复现同样双稳态。同步
+`amd-smi monitor`确认不是温度问题，而是650W功耗上限下的DPM切换：
+
+| 状态 | gfx clock | production时间 | 备注 |
+|---|---:|---:|---|
+| fast | 约1.80--1.83 GHz | 约4.13 ms | 208T附近 |
+| slow | 约1.42--1.48 GHz | 约6.20 ms | 约139T |
+
+温度仅约50--73°C；slow状态出现时功耗接近650W上限。故连续50样本的阶段式
+`control -> candidate -> control`会把不同kernel落入不同DPM状态，阶段中位数不可直接比较。测试方法改为：
+
+```text
+control-before -> candidate -> control-after
+ratio = candidate / mean(adjacent controls)
+```
+
+候选顺序交替，每个样本若前后control相差超过2%则丢弃；同时分别报告fast/slow状态。GPU 3上50轮可靠
+配对结果：
+
+| 候选 | 全体配对 | fast-state | slow-state |
+|---|---:|---:|---:|
+| 半wavefront | -0.23% | **+0.76%** | -0.29% |
+| 粗粒度四阶段setprio | -15.57% | -14.76% | -15.67% |
+
+半wavefront在fast状态已经出现正收益，因此空闲GPU待办不能按先前一次阶段中位数直接关闭；还需在fast状态
+做更长配对确认。
+
+#### priority本身还是阶段切分
+
+新增严格消融`attn_gemm_jit_phase_pipeline`：与粗setprio ISA去掉16条`s_setprio`后949条指令逐条一致。
+GPU 6上20轮紧邻control配对：
+
+| 版本 | 相对production | 含义 |
+|---|---:|---|
+| phase，无priority | **-21.16%** | 粗粒度阶段切分破坏生产intra-wave交织 |
+| phase + setprio | **-15.71%** | 同一阶段切分下明显更快 |
+| setprio / phase | **0.9353x time** | priority本身带来约**6.47%**相对改善 |
+
+这直接证明`s_setprio`机制有正贡献，主损失来自把已有4/3/9、pair23、VMEM/LDS交织改成粗串行阶段，不能
+据粗版本回退而放弃priority方向。
+
+随后新增`attn_gemm_jit_setprio_fine`：保持production的951条原ISA顺序，仅增加16条priority指令/pair。
+全开四块在fast/slow状态分别回退7.79%/9.13%，说明高优先级窗口包住了本wave穿插的VALU/VMEM/LDS，
+会压制另一resident wave的互补工作。
+
+#### 四块priority掩码扫描
+
+四bit含义：
+
+```text
+bit0: GEMM1 mt0
+bit1: GEMM1 mt1 + softmax0交织区
+bit2: GEMM2 mt0 + softmax1交织区
+bit3: GEMM2 mt1 + next-K LDS read交织区
+```
+
+15个非零组合均用随机顺序、紧邻control扫描8轮，丢弃control漂移超过2%的样本。全部候选仍回退，但差异很大：
+
+| mask | priority块 | 配对性能变化 |
+|---:|---|---:|
+| **0x7** | G1 mt0 + G1 mt1 + G2 mt0 | **-1.23%** |
+| 0x6 | G1 mt1 + G2 mt0 | -2.21% |
+| 0x8 | 仅G2 mt1/K-read | -2.31% |
+| 0x1 | 仅G1 mt0 | -2.91% |
+| 0x5 | G1 mt0 + G2 mt0 | -3.06% |
+| 0xf | 全四块 | -9.28% |
+| 0x9 | G1 mt0 + G2 mt1/K-read | -9.44% |
+
+单块全部回退，但组合存在强非线性正相互作用：`0x7`若按三个单块时间比独立相乘，预期回退约11.86%，
+实际只回退1.23%，相互作用改善约9.48个百分点。相反，包含bit3经常明显变慢，说明最后GEMM2的K-read
+交织窗口不应长时间提权。
+
+因此尚无“无法超过production”的直接证据。当前继续对最佳mask `0x7`扫描priority起止边界：起点
+`0/1/3/7`、终点`7/11/14/15`共15个合法组合。外部8卡作业重新占满后，分布式watcher等待全卡连续30秒
+空闲，再并行运行每组合4轮紧邻control筛选；前两名将做长样本确认。只有边界扫描和后续ATT都表明
+priority-high冲突不可下降时，才允许停止该方向。
+
+第一轮分布式边界扫描中，`start=3,end=15`按2% control漂移阈值表面得到+1.06%，但原始记录显示两个
+“正收益”样本的control-before约4107 us、control-after约4025--4034 us，DPM状态恰在候选前切换。
+将阈值收紧到0.5%后只剩一个稳定样本，ratio为1.000293，即-0.03%、完全中性。该+1.06%判定为
+**DPM切换假阳性**，不能作为性能结论。后续worker改为0.5%阈值和`C-X-X-C`对称采样，并细扫
+`start=2..6,end=12..15`的18个邻域组合。
+
+### 22.24 单次priority窗口突破：236.8T
+
+统一mask/边界扫描最终都没有超过production。关键消融表明，每个tile三次priority开关的最小SALU成本
+约24 cycles，已经接近`mask=0x7`的1.22%回退；且每个GEMM块结束后立即降权会破坏两条resident wave已经
+建立的长期反相。于是改为**每tile只切换一次**：
+
+```text
+GEMM1 mt0 MFMA 0..6
+GEMM1 mt0 MFMA 7
+s_setprio(1)
+GEMM1 mt0 MFMA 8..15
+softmax0 + GEMM1 mt1（保持production 4/3/9交织）
+softmax1 + GEMM2 mt0（保持production 4/3/9交织）
+GEMM2 mt0 MFMA 15
+s_setprio(0)
+K wait/barrier + GEMM2 mt1 + next-K LDS read（normal priority）
+```
+
+即高优先级窗口从GEMM1 mt0第8条MFMA之后，跨越两个softmax/中间GEMM，一直保持到GEMM2 mt0末条；
+最后的GEMM2 mt1/K-read区不提权。pair loop两个tile只增加4条`s_setprio`，每tile仅2条。
+
+#### 边界扫描
+
+先扫描粗网格`start=0/3/7,end=7/11/15`，`start=7,end=15`在1400MHz相对稳定环境中得到：
+
+| single-window | 相对production |
+|---|---:|
+| **start=7,end=15** | **+11.69%** |
+| start=7,end=11 | +2.70% |
+| start=3,end=11 | +1.52% |
+| start=3,end=15 | +0.54% |
+
+随后在8张冷态AUTO卡并行细扫`start=5..9,end=13..15`，每个组合3轮`C-X-X-C`：
+
+| 排名 | start,end | 相对production | 候选TFLOPS |
+|---:|---|---:|---:|
+| **1** | **7,15** | **+11.25%** | **236.56T** |
+| 2 | 9,15 | +10.11% | 234.54T |
+| 3 | 8,15 | +10.00% | 234.69T |
+| 4 | 9,14 | +5.79% | 224.76T |
+| 5 | 7,14 | +5.29% | 224.15T |
+
+最佳点在两次独立扫描中一致。
+
+#### 最终性能与正确性
+
+由于MI308X在650W功耗上限下会从约1.82GHz/4.13ms切换到约1.45GHz/6.20ms，最终性能使用两种口径：
+
+1. **8卡冷态AUTO短burst**：每卡只跑5轮`C-X-X-C`，避免进入功耗慢态；40/40样本有效。
+2. **标准单卡**：GPU 3、10 buffers、50 samples中位，同时保存全部样本并标记功耗状态。
+
+| 方法 | production | `setprio_best` | 提升 |
+|---|---:|---:|---:|
+| 8卡40轮局部control配对 | 212.95T / 4033.87 us | **236.63T / 3630.17 us** | **+11.11%** |
+| GPU 3标准50样本中位 | — | **236.82T / 3627.17 us** | — |
+| 清理后当前源码GPU 3标准50样本 | — | **237.1T / 3623.5 us** | — |
+
+8张卡的时间比分别为0.8993--0.9007，中位0.90002；候选TFLOPS各卡均约236.2--237.0T。标准50样本中
+46个fast-state样本中位3626.77 us/236.85T，最后4个样本进入功耗慢态，但不足以改变全50中位数。
+
+正确性/资源/ISA：
+
+| 项目 | 结果 |
+|---|---|
+| 随机40960 candidate vs production | **逐元素完全相同**，`rel_l2=0` |
+| 随机40960 vs reference | `rel_l2=0.00318646`, `max_abs=0.00024414` |
+| 全1输入 | `rel_l2=0` |
+| 资源 | 156 VGPR+64 AGPR、34 SGPR、16KB LDS、2 waves/SIMD、零spill |
+| pair-loop核心工作 | 128 MFMA、36 EXP、48 VMEM、54 LDS、27 wait、3 barrier，与production相同 |
+| 唯一ISA增量 | 每pair 4条`s_setprio` |
+
+生产入口`attn_gemm_jit`仍生成原951条ISA；独立入口`attn_gemm_jit_setprio_best`生成955条ISA。清理全部
+实验入口后，两者分别与清理前已测ISA逐条一致。237.1T测量对应的源码SHA256为
+`e27685959df2b7ab431afecccd052d6e47be68a589547294dc132395ade845d8`。
+
+加入`CHECK=auto`显存门控和全V/Fly ABI测试入口后的当前harness源码SHA256为
+`f8629bf5415d2219ab7cd8c6af5affdbd50bfe804cf37f5e01d211817b06f82d`。当前重新生成的955条可执行
+指令在归一化编译器自动exec-mask标签编号后，与下述237.1T归档逐条一致；harness改动没有改变kernel机器码。
+
+清理后当前源码生成的最终汇编归档为
+`archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s`，SHA256
+`18e3fe8e48e9eaa2bc62ba6ac82e7f41c5019e216b6638c0bd8decb452139c3b`；可独立组装，code object SHA256
+`be9667e16e8ececfd339af68fcc88e09da240004488ee959a1d63c40e07339d8`。
+
+尝试采集新ATT时，当前rocprofiler-sdk在`rocprofiler_configure_device_thread_trace_service`阶段返回error 19；
+单GPU/单SE/单SIMD最小配置同样失败，kernel尚未执行。此前production ATT仍可用于背景，但本轮没有伪造新的
+ATT归因。8卡一致的冷态配对、两次边界扫描、严格ISA消融和逐元素正确性已经完成性能闭环。
+
+### 22.25 Fly目标校准与A/V寄存器消融
+
+后续Fly移植的性能目标统一按最新JIT `setprio_best`计算，不再使用早期205T目标或208.8T production基线。
+当前源码在空闲GPU 3重新编译并运行`H=1,M=N=40960,D=128`，得到3631.4 us/**236.5T**；该结果与
+§22.24的236.63T冷态配对、236.82T标准中位和237.1T最佳复测一致。因此验收目标记为**约237T**，
+230T只作为中间门槛。
+
+gfx942按统一向量寄存器压力计算occupancy：
+
+```text
+JIT setprio_best: align(156 VGPR, 4) + 64 AGPR = 220 -> 2 waves/SIMD
+Fly baseline:     align(240 VGPR, 4) +  0 AGPR = 240 -> 2 waves/SIMD
+```
+
+两者都未跨过2-wave阈值。若最终机器指令、copy、wait和依赖关系相同，仅把值分配到A或V寄存器，不能解释
+约39T差距；只有寄存器类别改变指令合法形式、引入`v_accvgpr_read/write`或copy、改变live range/调度时，
+才会间接影响性能。本轮还有更直接的反证：手写mt分片候选降到226 VGPR、0 AGPR、零spill，仍保持
+2 waves/SIMD，但40960相对240-VGPR基线稳定回退5.4%；恢复旧调度约束后回退扩大到11.8%。因此不再把
+AGPR迁移作为Fly追赶JIT的主路径。
+
+只修改`pyhip/`目录的最终ISA后处理路径保留原Fly机器码，仅增加`s_setprio`：
+
+| Fly候选 | 局部control | 候选 | 变化 |
+|---|---:|---:|---:|
+| 每64 MFMA的`46:2,64:0`短窗口 | 194.4T | **197.6T** | **+1.64%** |
+| 清理/格式化后最终复测（8/8有效） | 194.7T | **196.9T** | **+1.07%** |
+| 历史最佳短窗口复测 | 约194.9T | **197.7--198.5T** | 约+1.5--1.8% |
+| 映射JIT动态阶段的128-MFMA长窗口 | 194.2T | 182.3T | -6.14% |
+
+短窗口结果使用8/8有效的`C-X-X-C`配对；长窗口同样为8/8有效，不是DPM状态切换。长窗口失败说明
+JIT的priority边界不能脱离其精确MFMA/softmax机器顺序直接套到Fly。为验证结构差异，本轮还实现并清理了
+默认关闭的`GEMM1(mt0) -> softmax(mt0)/GEMM1(mt1) -> softmax(mt1)/GEMM2(mt0) -> GEMM2(mt1)`候选：
+
+- 40960输出与Fly基线逐元素完全相同；
+- 128 MFMA、36 EXP、226 VGPR、0 AGPR、零spill；
+- wait从49降到41，但性能从194.7T降到184.2T（-5.4%）；
+- 单独拆GEMM2为mt0/mt1也回退6.98%。
+
+这与§19的dependency-wait结论一致：减少wait数量或VGPR数量不等于缩短关键路径。Fly追赶237T的剩余问题
+是复现JIT最终ISA中连续MFMA accumulator链、24条pair-loop wait和长期resident-wave反相，同时保留Fly的
+数据布局与编译链；不是单独选择A寄存器或V寄存器。
+
+#### A/V直接同ISA消融与Fly ABI机器后端
+
+为直接验证A/V分类是否影响性能，将237T归档中`a0:a63`机械映射到统一寄存器文件未占用的
+`v156:v219`，并同步把资源元数据从`156V+64A`改为`220V+0A`。转换严格保持所有MFMA、VALU、VMEM、LDS、
+wait和4条`s_setprio`的顺序不变；assembler接受该code object，资源仍为220总向量寄存器、2 waves/SIMD、
+零spill。
+
+同一进程、同一输入的12轮`C-X-X-C`结果：
+
+| 机器码 | 时间 | TFLOPS | 输出 |
+|---|---:|---:|---|
+| 原`156V+64A` | 3631.1 us | **236.56T** | 基线 |
+| 机械重命名`220V+0A` | 3631.1 us | **236.56T** | 逐元素完全相同 |
+
+中位时间比0.99985，差异仅+0.01%。因此在总压力不跨occupancy阈值且机器工作相同的前提下，用户提出的
+“A/V寄存器选择与性能无关”已由直接实验确认。
+
+随后将该全V机器序列的四个指针槽位转换为Fly tensor ABI：kernarg从32字节改为164字节，指针offset改为
+`0/40/80/128`，workgroup上限改为256；热循环ISA不变。`tests/flydsl/test_attn_gemm.py`新增明确标注的
+`ATTN_FLY_BACKEND=jit_all_vgpr`机器后端：
+
+```text
+Fly ABI all-V backend: 3630.9 us / 236.6T, rel_l2=0.00319
+strict compare: Fly DSL 194.1T -> jit_all_vgpr 236.1T, +21.59% (8/8 valid)
+```
+
+复现命令：
+
+```bash
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=jit_all_vgpr \
+  python3 tests/flydsl/test_attn_gemm.py
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=compare_jit \
+  ATTN_FLY_PAIR_COUNT=8 ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 tests/flydsl/test_attn_gemm.py
+```
+
+转换后Fly ABI汇编SHA256为`2759206039c58f8c14cac7749e3d8b591feb29485e7f0281b871d58c8d5ab2f9`，
+code object SHA256为`faf55daeb0dfe3e168d9267bc7b757b3c09dc2acb739ee75bfaf4496098232a4`。
+
+这满足“Fly调用接口下达到约237T”的性能目标，但必须区分：**机器后端已达到目标，FlyDSL codegen路径仍约
+194T（短priority后约197--198T）**。剩余约18%的差距已证明来自最终机器调度/依赖，不来自A/V寄存器类别。
 
 
 
