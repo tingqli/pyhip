@@ -15,28 +15,48 @@ _DEPTHWISE_HIP_KERNELS = {
 }
 
 
-def _packed_dot_supported(KD, KH, KW, H_out, W_out, padding):
+def _packed_dot_shape_supported(KD, KH, KW, H_out, W_out, padding):
     return (
-        amdgpu_arch().split(":", 1)[0] == "gfx950"
-        and (KD, KH, KW) == (3, 5, 5)
+        (KD, KH, KW) == (3, 5, 5)
         and tuple(padding) == (0, 2, 2)
         and H_out > 0
         and W_out % 16 == 0
     )
 
 
-def _resolve_hip_impl(hip_impl, KD, KH, KW, H_out, W_out, padding):
-    packed_supported = _packed_dot_supported(KD, KH, KW, H_out, W_out, padding)
+def _packed_dot_arch_supported(dtype):
+    arch = amdgpu_arch().split(":", 1)[0]
+    if arch == "gfx950":
+        return True
+    if arch == "gfx942":
+        return str(dtype) == "torch.float16"
+    return False
+
+
+def _packed_dot_supported(KD, KH, KW, H_out, W_out, padding, dtype):
+    return _packed_dot_shape_supported(KD, KH, KW, H_out, W_out, padding) and _packed_dot_arch_supported(dtype)
+
+
+def _resolve_hip_impl(hip_impl, KD, KH, KW, H_out, W_out, padding, dtype):
+    shape_supported = _packed_dot_shape_supported(KD, KH, KW, H_out, W_out, padding)
+    packed_supported = _packed_dot_supported(KD, KH, KW, H_out, W_out, padding, dtype)
     if hip_impl == "auto":
         return "packed" if packed_supported else "sgb"
     if hip_impl not in _DEPTHWISE_HIP_KERNELS:
         choices = ", ".join(["auto", *_DEPTHWISE_HIP_KERNELS])
         raise ValueError(f"unsupported depthwise HIP implementation {hip_impl!r}; choose from {choices}")
-    if hip_impl == "packed" and not packed_supported:
-        raise ValueError(
-            "packed depthwise Conv3D requires gfx950, kernel 3x5x5, "
-            "padding (0,2,2), and an output width divisible by 16"
-        )
+    if hip_impl == "packed":
+        if not shape_supported:
+            raise ValueError(
+                "packed depthwise Conv3D requires kernel 3x5x5, "
+                "padding (0,2,2), and an output width divisible by 16"
+            )
+        if not _packed_dot_arch_supported(dtype):
+            arch = amdgpu_arch().split(":", 1)[0]
+            raise ValueError(
+                f"packed depthwise Conv3D BF16 is not supported on {arch}; "
+                "use hip_impl='sgb' or 'auto'"
+            )
     return hip_impl
 
 # https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.conv3d.html
@@ -77,7 +97,7 @@ def conv_depthwise_3d(input, weight, bias,
 
     if method == "hip":
         resolved_hip_impl = _resolve_hip_impl(
-            hip_impl, KD, KH, KW, H_out, W_out, padding
+            hip_impl, KD, KH, KW, H_out, W_out, padding, input.dtype
         )
         hip_cpp = _DEPTHWISE_HIP_KERNELS[resolved_hip_impl]
         pyhip.module(hip_cpp, "-O2").conv_depthwise3d_hip(

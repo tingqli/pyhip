@@ -239,7 +239,7 @@ if __name__ == "__main__":
                         help="选择测试的 shape 选项: case1 ([1, 64, 63, 45, 80]), case2 ([1, 512, 61, 45, 80]), case3 ([1, 512, 61, 45, 80], groups=512), case4 ([1, 2048, 61, 45, 80], groups=4)")
     parser.add_argument("--depthwise-hip", type=str, default="auto",
                         choices=["auto", "packed", "sgb", "original"],
-                        help="case3 HIP backend; auto selects packed on supported gfx950 shapes")
+                        help="case3 HIP backend; auto selects packed on gfx950/gfx942 FP16, sgb on gfx942 BF16")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"],
                         help="input, weight, bias, and output data type")
     args = parser.parse_args()
