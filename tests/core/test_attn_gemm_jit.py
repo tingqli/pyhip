@@ -4,6 +4,10 @@
 4 个 wave，每个 wave 负责 32 行 query，即两个独立的16行 ``mt``。
 机器码同时交织 ``softmax(mt0) -> GEMM1(mt1)`` 与
 ``softmax(mt1) -> GEMM2(mt0)``，并用独立MFMA/VMEM/VALU隐藏softmax归约等待。
+
+最终40960性能口径：默认``production``为208.6--208.8T；独立
+``setprio_best``为236.5--237.1T；``setprio_best_all_vgpr``静态加载同一
+归档ISA的全VGPR/Fly-ABI变体，约236.6T。三者随机输入``rel_l2≈0.00319``。
 """
 
 import math
@@ -223,9 +227,7 @@ def attn_gemm_jit(
         yield 5
         J.v_max_f32(tile_max, tile_max, score[mt, 1, 3])
         yield 4
-        J.ds_swizzle_b32(
-            reduce_tmp[0], tile_max, mod="offset:swizzle(SWAP,16)"
-        )
+        J.ds_swizzle_b32(reduce_tmp[0], tile_max, mod="offset:swizzle(SWAP,16)")
         J.ds_bpermute_b32(reduce_tmp[1], xor32_byte_address, tile_max)
         J.ds_bpermute_b32(reduce_tmp[2], xor48_byte_address, tile_max)
         yield 12
@@ -685,14 +687,17 @@ def run_case(H, M, N, check=True, benchmark=False):
 
         root = Path(__file__).resolve().parents[2]
         static_kernel, artifact = build_all_vgpr_jit_attention_kernel(
-            root / "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
+            root
+            / "archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s",
             root / ".cache/jit-attn-all-vgpr",
             m=M,
             n=N,
             h=H,
         )
         kernel = None
-        print(f"[all-vgpr] assembly={artifact.assembly_path} code_object={artifact.code_object_path}")
+        print(
+            f"[all-vgpr] assembly={artifact.assembly_path} code_object={artifact.code_object_path}"
+        )
     else:
         raise ValueError(f"unsupported ATTN_JIT_KERNEL={kernel_name!r}")
 

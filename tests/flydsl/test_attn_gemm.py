@@ -130,6 +130,38 @@ def _exp2_vec_amdgcn(vec):
     return fx.Vector(_vd.from_elements(VectorType.get([n], f32), outs))
 
 
+def _fma_f32_inline(a, b, c, negate_c=False):
+    """强制单条scalar v_fma_f32，避免LLVM合并成不能与MFMA共发的v_pk算术。"""
+    from flydsl._mlir.ir import F32Type
+
+    instruction = (
+        "v_fma_f32 $0, $1, $2, -$3" if negate_c else "v_fma_f32 $0, $1, $2, $3"
+    )
+    return fx.Float32(
+        llvm.inline_asm(
+            F32Type.get(),
+            [arith.unwrap(a), arith.unwrap(b), arith.unwrap(c)],
+            instruction,
+            "=v,v,v,v",
+            has_side_effects=False,
+        )
+    )
+
+
+def _fma_vec_f32_inline(a, b, c):
+    values = []
+    for i in range_constexpr(a.numel):
+        values.append(_fma_f32_inline(a[i], b, c[i]))
+    return fx.Vector.from_elements(values, fx.Float32)
+
+
+def _scale_center_vec_f32_inline(score, scale, center):
+    values = []
+    for i in range_constexpr(score.numel):
+        values.append(_fma_f32_inline(score[i], scale, center, negate_c=True))
+    return fx.Vector.from_elements(values, fx.Float32)
+
+
 def _make_klds_view(ptr, BN, D):
     """K LDS 视图 [2,BN,D](D 连续,stage 偏移 BN*D):SwizzleType(3,3,3) 组合行主序去 bank 冲突
     -> K 读 ds_read2st64_b64。"""
@@ -153,7 +185,7 @@ def _make_ktiles(K_, N, D, BN, koff):
     )
 
 
-def build(M, N, D, BM, BN, H=1, softmax=True):
+def build(M, N, D, BM, BN, H=1, softmax=True, sum_reduce_mode="base"):
     """构造融合 MHA kernel(flash softmax + multi-head),返回 launch 包装。
 
     perm_M 挪到全局 K(_make_ktiles)+ 展开2x + K-prefetch:266.0 TFLOPS @M=N=40960(2.24x rocBLAS)。
@@ -161,6 +193,31 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
     softmax: 编译时开关。True=在线 flash softmax;False=纯双 GEMM(S@V,无 softmax/scale)-> ~260T 基线。
     softmax=True 时固定使用 lazy rebase:局部最大值超过参考值 8(log2 域)时才重缩放 l/O。
     """
+    assert sum_reduce_mode in (
+        "base",
+        "defer_shuffle",
+        "defer_shuffle_inline",
+        "defer_shuffle_inline_late_scale",
+        "defer_all",
+        "defer_all_inline",
+        "defer_all_inline_late_scale",
+    )
+    defer_shuffle = sum_reduce_mode != "base"
+    defer_all = sum_reduce_mode in (
+        "defer_all",
+        "defer_all_inline",
+        "defer_all_inline_late_scale",
+    )
+    inline_sum_fma = sum_reduce_mode in (
+        "defer_shuffle_inline",
+        "defer_shuffle_inline_late_scale",
+        "defer_all_inline",
+        "defer_all_inline_late_scale",
+    )
+    late_scale_inline = sum_reduce_mode in (
+        "defer_shuffle_inline_late_scale",
+        "defer_all_inline_late_scale",
+    )
     assert BN == 32
     assert BM % 32 == 0 and BN % 16 == 0 and D % 16 == 0 and N % BN == 0 and M % BM == 0
     assert (N // BN) % 2 == 0, "KV tile 数需为偶数(循环展开 2 次)"
@@ -374,22 +431,46 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
                 m_in, l_in = [m0, m1], [l0, l1]
                 m_out, l_out, corr = [None, None], [None, None], [None, None]
                 for mt in range_constexpr(2):
-                    v = frag_St[None, None, mt].load() * sm_scale_log2
+                    score = frag_St[None, None, mt].load()
+                    if const_expr(late_scale_inline):
+                        v = score
+                    else:
+                        v = score * sm_scale_log2
                     tmax = v.reduce("max")
                     for sh in (16, 32):
                         tmax = _maxnumf(tmax, tmax.shuffle_xor(sh, 64))
+                    if const_expr(late_scale_inline):
+                        tmax = _fma_f32_inline(
+                            tmax, fx.Float32(sm_scale_log2), fx.Float32(0.0)
+                        )
                     nm = m_in[mt]
                     corr_mt = fx.Float32(1.0)
                     if tmax > m_in[mt] + fx.Float32(8.0):
                         nm = tmax
                         corr_mt = _exp2_amdgcn(m_in[mt] - nm)
                     corr[mt] = corr_mt
-                    p = _exp2_vec_amdgcn(v - nm)
-                    ts = p.reduce("add")
-                    for sh in (16, 32):
-                        ts = ts + ts.shuffle_xor(sh, 64)
-                    # 用一次舍入的两条 scalar FMA 替代 packed MUL + 两条 ADD；精度由回归测试约束。
-                    l_out[mt] = fx.fma(l_in[mt], corr[mt], ts)
+                    if const_expr(late_scale_inline):
+                        centered = _scale_center_vec_f32_inline(
+                            score, fx.Float32(sm_scale_log2), nm
+                        )
+                    else:
+                        centered = v - nm
+                    p = _exp2_vec_amdgcn(centered)
+                    if const_expr(defer_all):
+                        if const_expr(inline_sum_fma):
+                            l_out[mt] = _fma_vec_f32_inline(l_in[mt], corr[mt], p)
+                        else:
+                            l_out[mt] = l_in[mt] * corr[mt] + p
+                    else:
+                        ts = p.reduce("add")
+                        if const_expr(not defer_shuffle):
+                            for sh in (16, 32):
+                                ts = ts + ts.shuffle_xor(sh, 64)
+                        # 用一次舍入的两条 scalar FMA 替代 packed MUL + 两条 ADD；精度由回归测试约束。
+                        if const_expr(inline_sum_fma):
+                            l_out[mt] = _fma_f32_inline(l_in[mt], corr[mt], ts)
+                        else:
+                            l_out[mt] = fx.fma(l_in[mt], corr[mt], ts)
                     m_out[mt] = nm
                     frag_St[None, None, mt].store(p)
                 for mt in range_constexpr(2):  # 旧 O 按 correction 缩放(GEMM2 累加前)
@@ -430,12 +511,21 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
         # flash softmax 在线统计初值(per Mq-tile,每 lane 冗余):m=-inf, l=0（仅 softmax 时携带）
         loop_init = [acc_init, kcar_init, fragK_init]
         if const_expr(softmax):
-            loop_init += [
-                fx.Float32(float("-inf")),
-                fx.Float32(float("-inf")),
-                fx.Float32(0.0),
-                fx.Float32(0.0),
-            ]
+            if const_expr(defer_all):
+                l_zero = fx.Vector.zeros_like(frag_St[None, None, 0].load())
+                loop_init += [
+                    fx.Float32(float("-inf")),
+                    fx.Float32(float("-inf")),
+                    l_zero,
+                    l_zero,
+                ]
+            else:
+                loop_init += [
+                    fx.Float32(float("-inf")),
+                    fx.Float32(float("-inf")),
+                    fx.Float32(0.0),
+                    fx.Float32(0.0),
+                ]
 
         _encode_waitcnt(vmcnt=0)
         rocdl.sched_barrier(0)
@@ -471,6 +561,11 @@ def build(M, N, D, BM, BN, H=1, softmax=True):
             # ---- epilogue:O /= l(每 Mq-tile 用最终 running sum 归一化)----
             l_final = [results[5], results[6]]
             for mt in range_constexpr(2):
+                if const_expr(defer_all):
+                    l_final[mt] = l_final[mt].reduce("add")
+                if const_expr(defer_shuffle):
+                    for sh in (16, 32):
+                        l_final[mt] = l_final[mt] + l_final[mt].shuffle_xor(sh, 64)
                 ot = frag_O[None, None, mt]
                 ot.store(ot.load() * (fx.Float32(1.0) / l_final[mt]))
 
@@ -525,20 +620,83 @@ def main():
     # 预 shuffle V 成 paged 布局 [H, N//8, D, 8];torch_ref 仍用原始 V
     V_shuf = V.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous()
 
+    # 以下命令从pyhip/tests/flydsl目录执行。复现严格Fly最终ISA组合：
+    # identity删除 + sum-pack搬移 + 绝对priority 16:0,96:2。
+    # HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_SUM_PACK=compare \
+    #   ATTN_FLY_PAIR_COUNT=12 ATTN_FLY_MAX_CONTROL_DRIFT=0.005 \
+    #   python3 test_attn_gemm.py
+    # 复现JIT ISA oracle（237T JIT归档ISA经全VGPR化和Fly ABI转换后静态加载）：
+    # HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 \
+    #   ATTN_FLY_BACKEND=jit_isa_oracle python3 test_attn_gemm.py
+    # 在同一进程中严格配对比较高层FlyDSL与JIT ISA oracle：
+    # HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=compare_oracle \
+    #   ATTN_FLY_PAIR_COUNT=8 ATTN_FLY_MAX_CONTROL_DRIFT=0.005 \
+    #   python3 test_attn_gemm.py
+    # 大块inline实验：Fly计算block/head base offset，JIT顺序覆盖prologue/pair-loop/epilogue。
+    # HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=compare_inline \
+    #   ATTN_FLY_PAIR_COUNT=8 ATTN_FLY_MAX_CONTROL_DRIFT=0.005 \
+    #   python3 test_attn_gemm.py
+    # 直接配对比较大块inline与静态JIT ISA oracle：
+    # HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 \
+    #   ATTN_FLY_BACKEND=compare_inline_oracle ATTN_FLY_PAIR_COUNT=8 \
+    #   ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+    # 对比仅后移shuffle时，inline scalar FMA消除v_pk_fma的效果：
+    # HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 \
+    #   ATTN_FLY_SUM_REDUCE=defer_shuffle_inline \
+    #   ATTN_FLY_SUM_REDUCE_CONTROL=defer_shuffle ATTN_FLY_PAIR_COUNT=12 \
+    #   ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+    # 对比完整后移sum时，inline scalar FMA消除v_pk_mul/add的效果：
+    # HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 \
+    #   ATTN_FLY_SUM_REDUCE=defer_all_inline \
+    #   ATTN_FLY_SUM_REDUCE_CONTROL=defer_all ATTN_FLY_PAIR_COUNT=24 \
+    #   ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+    # 在两种inline sum组合中延后sm_scale_log2，并用scalar inline FMA合并scale+center：
+    # HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 \
+    #   ATTN_FLY_SUM_REDUCE=defer_shuffle_inline_late_scale \
+    #   ATTN_FLY_SUM_REDUCE_CONTROL=defer_shuffle_inline ATTN_FLY_PAIR_COUNT=16 \
+    #   ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+    # HIP_VISIBLE_DEVICES=1 H=1 MULT=320 SOFTMAX=1 \
+    #   ATTN_FLY_SUM_REDUCE=defer_all_inline_late_scale \
+    #   ATTN_FLY_SUM_REDUCE_CONTROL=defer_all_inline ATTN_FLY_PAIR_COUNT=24 \
+    #   ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
     _backend = os.environ.get("ATTN_FLY_BACKEND", "fly")
-    assert _backend in ("fly", "jit_all_vgpr", "compare_jit")
-    _use_jit_backend = _backend != "fly"
-    if _use_jit_backend:
+    assert _backend in (
+        "fly",
+        "jit_isa_oracle",
+        "compare_oracle",
+        "jit_body_inline",
+        "compare_inline",
+        "compare_inline_oracle",
+    )
+    _use_jit_layout = _backend in (
+        "jit_isa_oracle",
+        "compare_oracle",
+        "jit_body_inline",
+        "compare_inline",
+        "compare_inline_oracle",
+    )
+    _use_jit_oracle = _backend in (
+        "jit_isa_oracle",
+        "compare_oracle",
+        "compare_inline_oracle",
+    )
+    _use_inline_backend = _backend in (
+        "jit_body_inline",
+        "compare_inline",
+        "compare_inline_oracle",
+    )
+    if _use_jit_layout:
         from pyhip.core.fly_isa_priority import (
-            build_all_vgpr_jit_attention_kernel,
             preshuffle_jit_key,
             preshuffle_jit_value,
         )
 
         K_jit = preshuffle_jit_key(K)
         V_jit = preshuffle_jit_value(V)
+        K_inline = K_jit.reshape(H, N, D)
+        V_inline = V_jit.reshape(H, N // 8, D, 8)
     else:
-        K_jit = V_jit = None
+        K_jit = V_jit = K_inline = V_inline = None
 
     stream = torch.cuda.current_stream()
     o_fly = torch.empty(H, M, D, dtype=torch.bfloat16)
@@ -547,20 +705,70 @@ def main():
     _softmax = (
         os.environ.get("SOFTMAX", "1") == "1"
     )  # 编译时开关:0=无 softmax 纯双 GEMM(应 ~260T)
-    if _use_jit_backend and not _softmax:
-        raise ValueError("the archived jit_all_vgpr backend requires SOFTMAX=1")
+    _sum_reduce_modes = (
+        "base",
+        "defer_shuffle",
+        "defer_shuffle_inline",
+        "defer_shuffle_inline_late_scale",
+        "defer_all",
+        "defer_all_inline",
+        "defer_all_inline_late_scale",
+    )
+    _sum_reduce_mode = os.environ.get("ATTN_FLY_SUM_REDUCE", "base")
+    _sum_reduce_control_mode = os.environ.get("ATTN_FLY_SUM_REDUCE_CONTROL")
+    assert _sum_reduce_mode in _sum_reduce_modes
+    assert (
+        _sum_reduce_control_mode is None
+        or _sum_reduce_control_mode in _sum_reduce_modes
+    )
+    if _sum_reduce_control_mode == _sum_reduce_mode:
+        raise ValueError("sum-reduce control and candidate modes must differ")
+    if _use_jit_layout and not _softmax:
+        raise ValueError("the archived JIT machine flow requires SOFTMAX=1")
     _priority_mode = os.environ.get("ATTN_FLY_PRIORITY", "off")
     _priority_mode = {"0": "off", "1": "post_isa", "on": "post_isa"}.get(
         _priority_mode, _priority_mode
     )
     assert _priority_mode in ("off", "post_isa", "compare")
-    if _backend != "fly" and _priority_mode != "off":
-        raise ValueError(
-            "ATTN_FLY_PRIORITY is only supported with ATTN_FLY_BACKEND=fly"
-        )
-    _use_post_isa = (
+    _identity_max_mode = os.environ.get("ATTN_FLY_IDENTITY_MAX", "off")
+    _identity_max_mode = {"0": "off", "1": "post_isa", "on": "post_isa"}.get(
+        _identity_max_mode, _identity_max_mode
+    )
+    assert _identity_max_mode in ("off", "post_isa", "compare")
+    _sum_pack_mode = os.environ.get("ATTN_FLY_SUM_PACK", "off")
+    _sum_pack_mode = {"0": "off", "1": "post_isa", "on": "post_isa"}.get(
+        _sum_pack_mode, _sum_pack_mode
+    )
+    assert _sum_pack_mode in ("off", "post_isa", "compare")
+    if _backend != "fly" and (
+        _priority_mode != "off"
+        or _identity_max_mode != "off"
+        or _sum_pack_mode != "off"
+    ):
+        raise ValueError("Fly post-ISA transforms require ATTN_FLY_BACKEND=fly")
+    if (_sum_reduce_mode != "base" or _sum_reduce_control_mode is not None) and (
+        _backend != "fly"
+        or not _softmax
+        or _priority_mode != "off"
+        or _identity_max_mode != "off"
+        or _sum_pack_mode != "off"
+    ):
+        raise ValueError("sum-reduce experiments require the plain softmax Fly backend")
+    _use_priority = (
         _backend == "fly" and _priority_mode != "off" and _softmax and N >= 32768
     )
+    _use_identity_max = (
+        _backend == "fly" and _identity_max_mode != "off" and _softmax and N >= 32768
+    )
+    _use_sum_pack = (
+        _backend == "fly" and _sum_pack_mode != "off" and _softmax and N >= 32768
+    )
+    if _use_sum_pack and _use_priority:
+        raise ValueError(
+            "ATTN_FLY_SUM_PACK includes its validated absolute priority window; "
+            "do not also set ATTN_FLY_PRIORITY"
+        )
+    _use_post_isa = _use_priority or _use_identity_max or _use_sum_pack
     _priority_period = None
     _priority_events = None
     _dump_dir = (
@@ -569,30 +777,73 @@ def main():
         / "fly-attn-priority"
         / f"h{H}-m{M}-n{N}"
     )
-    if _use_post_isa:
+    if _use_priority:
         from pyhip.core.fly_isa_priority import parse_priority_events
 
         _priority_period = int(os.environ.get("ATTN_FLY_PRIORITY_PERIOD", "64"))
         _priority_events = parse_priority_events(
             os.environ.get("ATTN_FLY_PRIORITY_EVENTS"), period=_priority_period
         )
+    if _use_post_isa:
         os.environ["FLYDSL_DUMP_IR"] = "1"
         os.environ["FLYDSL_DUMP_DIR"] = str(_dump_dir)
     print(
         f"[cfg] H={H} M={M} N={N} D={D} backend={_backend} softmax={_softmax} "
-        f"softmax_impl=lazy_delta8 priority={_priority_mode} active={_use_post_isa} "
+        f"softmax_impl=lazy_delta8 priority={_priority_mode} identity_max={_identity_max_mode} "
+        f"sum_pack={_sum_pack_mode} sum_reduce={_sum_reduce_mode} "
+        f"sum_reduce_control={_sum_reduce_control_mode} "
+        f"post_isa_active={_use_post_isa} "
         f"period={_priority_period} events={_priority_events}"
     )
 
     compiled = None
-    if _backend != "jit_all_vgpr":
+    sum_reduce_control = None
+    if _backend in ("fly", "compare_oracle", "compare_inline"):
+        if _sum_reduce_control_mode is not None:
+            sum_reduce_control = fly_compiled(
+                (M, N, D, BM, BN, H, _softmax, _sum_reduce_control_mode),
+                lambda: build(
+                    M,
+                    N,
+                    D,
+                    BM,
+                    BN,
+                    H=H,
+                    softmax=_softmax,
+                    sum_reduce_mode=_sum_reduce_control_mode,
+                ),
+                args,
+            )
         compiled = fly_compiled(
-            (M, N, D, BM, BN, H, _softmax),
-            lambda: build(M, N, D, BM, BN, H=H, softmax=_softmax),
+            (M, N, D, BM, BN, H, _softmax, _sum_reduce_mode),
+            lambda: build(
+                M,
+                N,
+                D,
+                BM,
+                BN,
+                H=H,
+                softmax=_softmax,
+                sum_reduce_mode=_sum_reduce_mode,
+            ),
             args,
         )
     kernel = compiled
-    if _use_jit_backend:
+    inline_compiled = None
+    if _use_inline_backend:
+        from attn_gemm_inline_kv import build as build_inline_kv
+
+        inline_args = (Q, K_inline, V_inline, o_fly, stream)
+        inline_compiled = fly_compiled(
+            ("jit_body_inline", M, N, D, BM, BN, H),
+            lambda: build_inline_kv(M, N, D, BM, BN, H=H),
+            inline_args,
+        )
+        if _backend == "jit_body_inline":
+            kernel = inline_compiled
+    if _use_jit_oracle:
+        from pyhip.core.fly_isa_priority import build_all_vgpr_jit_attention_kernel
+
         root = Path(__file__).resolve().parents[2]
         jit_kernel, artifact = build_all_vgpr_jit_attention_kernel(
             root
@@ -605,28 +856,35 @@ def main():
         print(
             f"[jit-all-vgpr] assembly={artifact.assembly_path} code_object={artifact.code_object_path}"
         )
-        if _backend == "jit_all_vgpr":
+        if _backend == "jit_isa_oracle":
             kernel = jit_kernel
     if _use_post_isa:
-        from pyhip.core.fly_isa_priority import build_attention_priority_kernel
+        from pyhip.core.fly_isa_priority import build_attention_post_isa_kernel
 
-        kernel, artifact = build_attention_priority_kernel(
+        kernel, artifact = build_attention_post_isa_kernel(
             _find_final_isa(_dump_dir),
             _dump_dir / "post-isa",
             m=M,
             h=H,
             block_m=BM,
-            period=_priority_period,
-            events=_priority_events,
+            remove_identity_max=_use_identity_max or _use_sum_pack,
+            move_sum_pack=_use_sum_pack,
+            priority_period=_priority_period,
+            priority_events=_priority_events,
+            absolute_priority_events=((16, 0), (96, 2)) if _use_sum_pack else None,
         )
         print(
             f"[post-isa] assembly={artifact.assembly_path} code_object={artifact.code_object_path}"
         )
         kernel(Q, K, V_shuf, o_fly, stream)
-    elif _backend == "jit_all_vgpr":
+    elif _backend == "jit_isa_oracle":
         kernel(Q, K_jit, V_jit, o_fly, stream)
-    elif _backend == "compare_jit":
+    elif _backend == "compare_oracle":
         jit_kernel(Q, K_jit, V_jit, o_fly, stream)
+    elif _backend == "jit_body_inline":
+        kernel(Q, K_inline, V_inline, o_fly, stream)
+    elif _backend in ("compare_inline", "compare_inline_oracle"):
+        inline_compiled(Q, K_inline, V_inline, o_fly, stream)
     torch.cuda.synchronize()
 
     # ---- 精度 ----
@@ -648,11 +906,13 @@ def main():
     Ks = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
     Vs = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
     V_shufs = [v.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous() for v in Vs]
-    if _use_jit_backend:
+    if _use_jit_layout:
         K_jits = [preshuffle_jit_key(k) for k in Ks]
         V_jits = [preshuffle_jit_value(v) for v in Vs]
+        K_inlines = [k.reshape(H, N, D) for k in K_jits]
+        V_inlines = [v.reshape(H, N // 8, D, 8) for v in V_jits]
     else:
-        K_jits = V_jits = None
+        K_jits = V_jits = K_inlines = V_inlines = None
     o_flys = [torch.empty(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
 
     run_count = 50
@@ -675,7 +935,7 @@ def main():
 
     def paired_perf(control, candidate):
         pair_count = int(os.environ.get("ATTN_FLY_PAIR_COUNT", "12"))
-        max_control_drift = float(os.environ.get("ATTN_FLY_MAX_CONTROL_DRIFT", "0.05"))
+        max_control_drift = float(os.environ.get("ATTN_FLY_MAX_CONTROL_DRIFT", "0.005"))
 
         def measure(fn, index, name):
             with cudaPerf(flops, mem_bytes, name=name, verbose=0) as measurement:
@@ -722,7 +982,20 @@ def main():
             "ratio": ratios[middle],
         }
 
-    if _backend == "compare_jit":
+    if sum_reduce_control is not None:
+        paired = paired_perf(
+            lambda i: sum_reduce_control(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
+            lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
+        )
+        tf_control = flops / paired["control_us"] / 1e6
+        tf_candidate = flops / paired["candidate_us"] / 1e6
+        print(
+            f"[paired-sum-reduce] valid={paired['valid']}/{paired['total']} "
+            f"{_sum_reduce_control_mode}={paired['control_us']:.1f}us/{tf_control:.1f}T "
+            f"{_sum_reduce_mode}={paired['candidate_us']:.1f}us/{tf_candidate:.1f}T "
+            f"time_ratio={paired['ratio']:.5f} speedup={1 / paired['ratio'] - 1:.2%}"
+        )
+    elif _backend == "compare_oracle":
         paired = paired_perf(
             lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
             lambda i: jit_kernel(Qs[i], K_jits[i], V_jits[i], o_flys[i], stream),
@@ -732,27 +1005,66 @@ def main():
         print(
             f"[paired-jit] valid={paired['valid']}/{paired['total']} "
             f"fly={paired['control_us']:.1f}us/{tf_base:.1f}T "
-            f"jit_all_vgpr={paired['candidate_us']:.1f}us/{tf_jit:.1f}T "
+            f"jit_isa_oracle={paired['candidate_us']:.1f}us/{tf_jit:.1f}T "
             f"time_ratio={paired['ratio']:.5f} speedup={1 / paired['ratio'] - 1:.2%}"
         )
-    elif _priority_mode == "compare" and _use_post_isa:
+    elif _backend == "compare_inline":
+        paired = paired_perf(
+            lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
+            lambda i: inline_compiled(
+                Qs[i], K_inlines[i], V_inlines[i], o_flys[i], stream
+            ),
+        )
+        tf_base = flops / paired["control_us"] / 1e6
+        tf_inline = flops / paired["candidate_us"] / 1e6
+        print(
+            f"[paired-inline] valid={paired['valid']}/{paired['total']} "
+            f"fly={paired['control_us']:.1f}us/{tf_base:.1f}T "
+            f"jit_body_inline={paired['candidate_us']:.1f}us/{tf_inline:.1f}T "
+            f"time_ratio={paired['ratio']:.5f} speedup={1 / paired['ratio'] - 1:.2%}"
+        )
+    elif _backend == "compare_inline_oracle":
+        paired = paired_perf(
+            lambda i: jit_kernel(Qs[i], K_jits[i], V_jits[i], o_flys[i], stream),
+            lambda i: inline_compiled(
+                Qs[i], K_inlines[i], V_inlines[i], o_flys[i], stream
+            ),
+        )
+        tf_jit = flops / paired["control_us"] / 1e6
+        tf_inline = flops / paired["candidate_us"] / 1e6
+        print(
+            f"[paired-inline-oracle] valid={paired['valid']}/{paired['total']} "
+            f"jit_isa_oracle={paired['control_us']:.1f}us/{tf_jit:.1f}T "
+            f"jit_body_inline={paired['candidate_us']:.1f}us/{tf_inline:.1f}T "
+            f"time_ratio={paired['ratio']:.5f} speedup={1 / paired['ratio'] - 1:.2%}"
+        )
+    elif (
+        _priority_mode == "compare"
+        or _identity_max_mode == "compare"
+        or _sum_pack_mode == "compare"
+    ) and _use_post_isa:
         paired = paired_perf(
             lambda i: compiled(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
             lambda i: kernel(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream),
         )
         tf_base = flops / paired["control_us"] / 1e6
-        tf_priority = flops / paired["candidate_us"] / 1e6
+        tf_post_isa = flops / paired["candidate_us"] / 1e6
         print(
             f"[paired] valid={paired['valid']}/{paired['total']} "
             f"base={paired['control_us']:.1f}us/{tf_base:.1f}T "
-            f"priority={paired['candidate_us']:.1f}us/{tf_priority:.1f}T "
+            f"post_isa={paired['candidate_us']:.1f}us/{tf_post_isa:.1f}T "
             f"time_ratio={paired['ratio']:.5f} speedup={1 / paired['ratio'] - 1:.2%}"
         )
     else:
-        if _backend == "jit_all_vgpr":
+        if _backend == "jit_isa_oracle":
 
             def launch(i):
                 kernel(Qs[i], K_jits[i], V_jits[i], o_flys[i], stream)
+
+        elif _backend == "jit_body_inline":
+
+            def launch(i):
+                kernel(Qs[i], K_inlines[i], V_inlines[i], o_flys[i], stream)
 
         else:
 
@@ -761,7 +1073,7 @@ def main():
 
         microseconds, tflops = perf(
             launch,
-            f"attn_{_backend}",
+            f"attn_{_backend}_{_sum_reduce_mode}",
         )
         print(
             f"[perf] {_backend}: {microseconds:8.1f} us  {tflops:7.1f} TFLOPS  "

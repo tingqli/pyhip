@@ -1,4 +1,8 @@
 *.s
+!archive/gemm/attn-gemm-jit-gfx942-m40960-n40960-206p5t.s
+!archive/gemm/attn-gemm-jit-gfx942-m40960-n40960-208p3t.s
+!archive/gemm/attn-gemm-jit-gfx942-m40960-n40960-208p8t.s
+!archive/gemm/attn-gemm-jit-setprio-best-gfx942-m40960-n40960-237p1t.s
 *.co
 *.pftrace
 *.egg-info/

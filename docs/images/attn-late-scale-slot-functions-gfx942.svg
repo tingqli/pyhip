@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1320" viewBox="0 0 1800 1320" style="max-width:100%;height:auto;display:block" role="img" aria-labelledby="title desc">
+<title id="title">Attention ATT slot0/slot1主要功能与指令</title>
+<desc id="desc">完整后移sum的control与late-scale版本，按ATT首批resident slot的平均cycle/tile展示GEMM2、softmax/K pipeline、GEMM1、bridge和backedge。</desc>
+<style>
+text { font-family: 'Noto Sans CJK SC', 'Microsoft YaHei', 'PingFang SC', 'DejaVu Sans', sans-serif; fill: #20262d; }
+.title { font-size: 31px; font-weight: 700; }
+.subtitle { font-size: 16px; fill: #66717d; }
+.group { font-size: 19px; font-weight: 700; }
+.row { font-size: 17px; font-weight: 700; }
+.small { font-size: 13px; fill: #66717d; }
+.axis { font-size: 13px; fill: #66717d; }
+.segment { font-size: 13px; font-weight: 700; fill: #ffffff; }
+.segment-dark { font-size: 13px; font-weight: 700; fill: #20262d; }
+.callout { font-size: 14px; font-weight: 700; }
+.flow-head { font-size: 17px; font-weight: 700; }
+.flow { font-size: 14px; }
+.note { font-size: 14px; fill: #66717d; }
+</style>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="42.0" y="52.0" text-anchor="start" class="title">ATT resident slot0 / slot1：主要功能与机器指令</text>
+<text x="42.0" y="82.0" text-anchor="start" class="subtitle">gfx942 · H=1, M=N=40960, D=128 · 完整后移sum · 首批resident slots平均时间线</text>
+<line x1="255.00" y1="135.00" x2="255.00" y2="650.00" stroke="#dfe4e8" stroke-width="1" stroke-dasharray="4 6"/>
+<text x="255.0" y="124.0" text-anchor="middle" class="axis">0</text>
+<line x1="426.76" y1="135.00" x2="426.76" y2="650.00" stroke="#dfe4e8" stroke-width="1" stroke-dasharray="4 6"/>
+<text x="426.8" y="124.0" text-anchor="middle" class="axis">400</text>
+<line x1="598.53" y1="135.00" x2="598.53" y2="650.00" stroke="#dfe4e8" stroke-width="1" stroke-dasharray="4 6"/>
+<text x="598.5" y="124.0" text-anchor="middle" class="axis">800</text>
+<line x1="770.29" y1="135.00" x2="770.29" y2="650.00" stroke="#dfe4e8" stroke-width="1" stroke-dasharray="4 6"/>
+<text x="770.3" y="124.0" text-anchor="middle" class="axis">1200</text>
+<line x1="942.06" y1="135.00" x2="942.06" y2="650.00" stroke="#dfe4e8" stroke-width="1" stroke-dasharray="4 6"/>
+<text x="942.1" y="124.0" text-anchor="middle" class="axis">1600</text>
+<line x1="1113.82" y1="135.00" x2="1113.82" y2="650.00" stroke="#dfe4e8" stroke-width="1" stroke-dasharray="4 6"/>
+<text x="1113.8" y="124.0" text-anchor="middle" class="axis">2000</text>
+<line x1="1285.59" y1="135.00" x2="1285.59" y2="650.00" stroke="#dfe4e8" stroke-width="1" stroke-dasharray="4 6"/>
+<text x="1285.6" y="124.0" text-anchor="middle" class="axis">2400</text>
+<line x1="1457.35" y1="135.00" x2="1457.35" y2="650.00" stroke="#dfe4e8" stroke-width="1" stroke-dasharray="4 6"/>
+<text x="1457.4" y="124.0" text-anchor="middle" class="axis">2800</text>
+<line x1="1629.12" y1="135.00" x2="1629.12" y2="650.00" stroke="#dfe4e8" stroke-width="1" stroke-dasharray="4 6"/>
+<text x="1629.1" y="124.0" text-anchor="middle" class="axis">3200</text>
+<line x1="255.00" y1="135.00" x2="1715.00" y2="135.00" stroke="#3d4650" stroke-width="1.4"/>
+<text x="1715.0" y="100.0" text-anchor="end" class="axis">ATT cycle / BN32 tile</text>
+<text x="42.0" y="165.0" text-anchor="start" class="group">Control · defer_all_inline</text>
+<text x="231.0" y="214.0" text-anchor="end" class="row">slot0 (fast)</text>
+<text x="231.0" y="238.0" text-anchor="end" class="small">duration 2475.1</text>
+<rect x="255.00" y="190.00" width="119.87" height="62.00" rx="3" fill="#315c9b">
+<title>control slot0 (fast) · GEMM2-A: 279.146 cycles/tile</title>
+</rect>
+<text x="314.9" y="217.0" text-anchor="middle" class="segment">GEMM2-A</text>
+<text x="314.9" y="238.0" text-anchor="middle" class="segment">279.1</text>
+<rect x="374.87" y="190.00" width="257.19" height="62.00" rx="3" fill="#a45ab5">
+<title>control slot0 (fast) · softmax/K-pipeline A: 598.938 cycles/tile</title>
+</rect>
+<text x="503.5" y="217.0" text-anchor="middle" class="segment">softmax/K A</text>
+<text x="503.5" y="238.0" text-anchor="middle" class="segment">598.9</text>
+<rect x="632.06" y="190.00" width="143.33" height="62.00" rx="3" fill="#167d75">
+<title>control slot0 (fast) · GEMM1-A: 333.781 cycles/tile</title>
+</rect>
+<text x="703.7" y="217.0" text-anchor="middle" class="segment">GEMM1-A</text>
+<text x="703.7" y="238.0" text-anchor="middle" class="segment">333.8</text>
+<rect x="775.39" y="190.00" width="8.23" height="62.00" rx="3" fill="#7f8791">
+<title>control slot0 (fast) · phase64 bridge: 19.156 cycles/tile</title>
+</rect>
+<rect x="783.61" y="190.00" width="110.13" height="62.00" rx="3" fill="#315c9b">
+<title>control slot0 (fast) · GEMM2-B: 256.460 cycles/tile</title>
+</rect>
+<text x="838.7" y="217.0" text-anchor="middle" class="segment">GEMM2-B</text>
+<text x="838.7" y="238.0" text-anchor="middle" class="segment">256.5</text>
+<rect x="893.74" y="190.00" width="264.87" height="62.00" rx="3" fill="#a45ab5">
+<title>control slot0 (fast) · softmax/K-pipeline B: 616.827 cycles/tile</title>
+</rect>
+<text x="1026.2" y="217.0" text-anchor="middle" class="segment">softmax/K B</text>
+<text x="1026.2" y="238.0" text-anchor="middle" class="segment">616.8</text>
+<rect x="1158.61" y="190.00" width="143.60" height="62.00" rx="3" fill="#167d75">
+<title>control slot0 (fast) · GEMM1-B: 334.418 cycles/tile</title>
+</rect>
+<text x="1230.4" y="217.0" text-anchor="middle" class="segment">GEMM1-B</text>
+<text x="1230.4" y="238.0" text-anchor="middle" class="segment">334.4</text>
+<rect x="1302.22" y="190.00" width="13.17" height="62.00" rx="3" fill="#4d5660">
+<title>control slot0 (fast) · backedge: 30.665 cycles/tile</title>
+</rect>
+<rect x="255.00" y="190.00" width="1060.39" height="62.00" rx="3" fill="none" stroke="#3d4650" stroke-width="1">
+</rect>
+<text x="1325.4" y="217.0" text-anchor="start" class="callout">Σ 2475.1</text>
+<text x="1325.4" y="238.0" text-anchor="start" class="small">边界/取整 +5.7</text>
+<text x="231.0" y="304.0" text-anchor="end" class="row">slot1 (slow)</text>
+<text x="231.0" y="328.0" text-anchor="end" class="small">duration 3305.1</text>
+<rect x="255.00" y="280.00" width="123.43" height="62.00" rx="3" fill="#315c9b">
+<title>control slot1 (slow) · GEMM2-A: 287.435 cycles/tile</title>
+</rect>
+<text x="316.7" y="307.0" text-anchor="middle" class="segment">GEMM2-A</text>
+<text x="316.7" y="328.0" text-anchor="middle" class="segment">287.4</text>
+<rect x="378.43" y="280.00" width="308.24" height="62.00" rx="3" fill="#a45ab5">
+<title>control slot1 (slow) · softmax/K-pipeline A: 717.818 cycles/tile</title>
+</rect>
+<text x="532.5" y="307.0" text-anchor="middle" class="segment">softmax/K A</text>
+<text x="532.5" y="328.0" text-anchor="middle" class="segment">717.8</text>
+<rect x="686.67" y="280.00" width="158.15" height="62.00" rx="3" fill="#167d75">
+<title>control slot1 (slow) · GEMM1-A: 368.296 cycles/tile</title>
+</rect>
+<text x="765.7" y="307.0" text-anchor="middle" class="segment">GEMM1-A</text>
+<text x="765.7" y="328.0" text-anchor="middle" class="segment">368.3</text>
+<rect x="844.82" y="280.00" width="9.43" height="62.00" rx="3" fill="#7f8791">
+<title>control slot1 (slow) · phase64 bridge: 21.960 cycles/tile</title>
+</rect>
+<rect x="854.25" y="280.00" width="252.23" height="62.00" rx="3" fill="#315c9b">
+<title>control slot1 (slow) · GEMM2-B: 587.380 cycles/tile</title>
+</rect>
+<text x="980.4" y="307.0" text-anchor="middle" class="segment">GEMM2-B</text>
+<text x="980.4" y="328.0" text-anchor="middle" class="segment">587.4</text>
+<rect x="1106.48" y="280.00" width="315.86" height="62.00" rx="3" fill="#a45ab5">
+<title>control slot1 (slow) · softmax/K-pipeline B: 735.562 cycles/tile</title>
+</rect>
+<text x="1264.4" y="307.0" text-anchor="middle" class="segment">softmax/K B</text>
+<text x="1264.4" y="328.0" text-anchor="middle" class="segment">735.6</text>
+<rect x="1422.33" y="280.00" width="234.26" height="62.00" rx="3" fill="#167d75">
+<title>control slot1 (slow) · GEMM1-B: 545.541 cycles/tile</title>
+</rect>
+<text x="1539.5" y="307.0" text-anchor="middle" class="segment">GEMM1-B</text>
+<text x="1539.5" y="328.0" text-anchor="middle" class="segment">545.5</text>
+<rect x="1656.60" y="280.00" width="14.10" height="62.00" rx="3" fill="#4d5660">
+<title>control slot1 (slow) · backedge: 32.833 cycles/tile</title>
+</rect>
+<rect x="255.00" y="280.00" width="1415.70" height="62.00" rx="3" fill="none" stroke="#3d4650" stroke-width="1">
+</rect>
+<text x="1680.7" y="307.0" text-anchor="start" class="callout">Σ 3305.1</text>
+<text x="1680.7" y="328.0" text-anchor="start" class="small">边界/取整 +8.3</text>
+<line x1="1317.82" y1="360.00" x2="1674.26" y2="360.00" stroke="#b9445b" stroke-width="3"/>
+<line x1="1317.82" y1="353.00" x2="1317.82" y2="367.00" stroke="#b9445b" stroke-width="3"/>
+<line x1="1674.26" y1="353.00" x2="1674.26" y2="367.00" stroke="#b9445b" stroke-width="3"/>
+<text x="1496.0" y="350.0" text-anchor="middle" class="callout" fill="#b9445b">slot完成差 830.1</text>
+<text x="42.0" y="415.0" text-anchor="start" class="group">Late-scale · defer_all_inline_late_scale</text>
+<text x="231.0" y="464.0" text-anchor="end" class="row">slot0 (fast)</text>
+<text x="231.0" y="488.0" text-anchor="end" class="small">duration 2358.4</text>
+<rect x="255.00" y="440.00" width="120.59" height="62.00" rx="3" fill="#315c9b">
+<title>late-scale slot0 (fast) · GEMM2-A: 280.827 cycles/tile</title>
+</rect>
+<text x="315.3" y="467.0" text-anchor="middle" class="segment">GEMM2-A</text>
+<text x="315.3" y="488.0" text-anchor="middle" class="segment">280.8</text>
+<rect x="375.59" y="440.00" width="230.99" height="62.00" rx="3" fill="#a45ab5">
+<title>late-scale slot0 (fast) · softmax/K-pipeline A: 537.930 cycles/tile</title>
+</rect>
+<text x="491.1" y="467.0" text-anchor="middle" class="segment">softmax/K A</text>
+<text x="491.1" y="488.0" text-anchor="middle" class="segment">537.9</text>
+<rect x="606.58" y="440.00" width="149.84" height="62.00" rx="3" fill="#167d75">
+<title>late-scale slot0 (fast) · GEMM1-A: 348.953 cycles/tile</title>
+</rect>
+<text x="681.5" y="467.0" text-anchor="middle" class="segment">GEMM1-A</text>
+<text x="681.5" y="488.0" text-anchor="middle" class="segment">349.0</text>
+<rect x="756.43" y="440.00" width="7.98" height="62.00" rx="3" fill="#7f8791">
+<title>late-scale slot0 (fast) · phase64 bridge: 18.579 cycles/tile</title>
+</rect>
+<rect x="764.41" y="440.00" width="109.03" height="62.00" rx="3" fill="#315c9b">
+<title>late-scale slot0 (fast) · GEMM2-B: 253.904 cycles/tile</title>
+</rect>
+<text x="818.9" y="467.0" text-anchor="middle" class="segment">GEMM2-B</text>
+<text x="818.9" y="488.0" text-anchor="middle" class="segment">253.9</text>
+<rect x="873.44" y="440.00" width="231.77" height="62.00" rx="3" fill="#a45ab5">
+<title>late-scale slot0 (fast) · softmax/K-pipeline B: 539.739 cycles/tile</title>
+</rect>
+<text x="989.3" y="467.0" text-anchor="middle" class="segment">softmax/K B</text>
+<text x="989.3" y="488.0" text-anchor="middle" class="segment">539.7</text>
+<rect x="1105.21" y="440.00" width="146.85" height="62.00" rx="3" fill="#167d75">
+<title>late-scale slot0 (fast) · GEMM1-B: 341.975 cycles/tile</title>
+</rect>
+<text x="1178.6" y="467.0" text-anchor="middle" class="segment">GEMM1-B</text>
+<text x="1178.6" y="488.0" text-anchor="middle" class="segment">342.0</text>
+<rect x="1252.05" y="440.00" width="13.24" height="62.00" rx="3" fill="#4d5660">
+<title>late-scale slot0 (fast) · backedge: 30.834 cycles/tile</title>
+</rect>
+<rect x="255.00" y="440.00" width="1010.29" height="62.00" rx="3" fill="none" stroke="#3d4650" stroke-width="1">
+</rect>
+<text x="1275.3" y="467.0" text-anchor="start" class="callout">Σ 2358.4</text>
+<text x="1275.3" y="488.0" text-anchor="start" class="small">边界/取整 +5.6</text>
+<text x="231.0" y="554.0" text-anchor="end" class="row">slot1 (slow)</text>
+<text x="231.0" y="578.0" text-anchor="end" class="small">duration 3333.2</text>
+<rect x="255.00" y="530.00" width="198.01" height="62.00" rx="3" fill="#315c9b">
+<title>late-scale slot1 (slow) · GEMM2-A: 461.120 cycles/tile</title>
+</rect>
+<text x="354.0" y="557.0" text-anchor="middle" class="segment">GEMM2-A</text>
+<text x="354.0" y="578.0" text-anchor="middle" class="segment">461.1</text>
+<rect x="453.01" y="530.00" width="269.09" height="62.00" rx="3" fill="#a45ab5">
+<title>late-scale slot1 (slow) · softmax/K-pipeline A: 626.649 cycles/tile</title>
+</rect>
+<text x="587.6" y="557.0" text-anchor="middle" class="segment">softmax/K A</text>
+<text x="587.6" y="578.0" text-anchor="middle" class="segment">626.6</text>
+<rect x="722.10" y="530.00" width="238.47" height="62.00" rx="3" fill="#167d75">
+<title>late-scale slot1 (slow) · GEMM1-A: 555.343 cycles/tile</title>
+</rect>
+<text x="841.3" y="557.0" text-anchor="middle" class="segment">GEMM1-A</text>
+<text x="841.3" y="578.0" text-anchor="middle" class="segment">555.3</text>
+<rect x="960.57" y="530.00" width="14.56" height="62.00" rx="3" fill="#7f8791">
+<title>late-scale slot1 (slow) · phase64 bridge: 33.898 cycles/tile</title>
+</rect>
+<rect x="975.13" y="530.00" width="173.25" height="62.00" rx="3" fill="#315c9b">
+<title>late-scale slot1 (slow) · GEMM2-B: 403.454 cycles/tile</title>
+</rect>
+<text x="1061.8" y="557.0" text-anchor="middle" class="segment">GEMM2-B</text>
+<text x="1061.8" y="578.0" text-anchor="middle" class="segment">403.5</text>
+<rect x="1148.38" y="530.00" width="277.79" height="62.00" rx="3" fill="#a45ab5">
+<title>late-scale slot1 (slow) · softmax/K-pipeline B: 646.905 cycles/tile</title>
+</rect>
+<text x="1287.3" y="557.0" text-anchor="middle" class="segment">softmax/K B</text>
+<text x="1287.3" y="578.0" text-anchor="middle" class="segment">646.9</text>
+<rect x="1426.16" y="530.00" width="238.32" height="62.00" rx="3" fill="#167d75">
+<title>late-scale slot1 (slow) · GEMM1-B: 554.984 cycles/tile</title>
+</rect>
+<text x="1545.3" y="557.0" text-anchor="middle" class="segment">GEMM1-B</text>
+<text x="1545.3" y="578.0" text-anchor="middle" class="segment">555.0</text>
+<rect x="1664.48" y="530.00" width="18.37" height="62.00" rx="3" fill="#4d5660">
+<title>late-scale slot1 (slow) · backedge: 42.791 cycles/tile</title>
+</rect>
+<rect x="255.00" y="530.00" width="1427.86" height="62.00" rx="3" fill="none" stroke="#3d4650" stroke-width="1">
+</rect>
+<text x="1692.9" y="557.0" text-anchor="start" class="callout">Σ 3333.2</text>
+<text x="1692.9" y="578.0" text-anchor="start" class="small">边界/取整 +8.1</text>
+<rect x="255.00" y="525.00" width="1427.86" height="72.00" rx="5" fill="none" stroke="#b9445b" stroke-width="1">
+</rect>
+<line x1="1267.72" y1="610.00" x2="1686.33" y2="610.00" stroke="#b9445b" stroke-width="3"/>
+<line x1="1267.72" y1="603.00" x2="1267.72" y2="617.00" stroke="#b9445b" stroke-width="3"/>
+<line x1="1686.33" y1="603.00" x2="1686.33" y2="617.00" stroke="#b9445b" stroke-width="3"/>
+<text x="1477.0" y="600.0" text-anchor="middle" class="callout" fill="#b9445b">slot完成差 974.9 (+144.8)</text>
+<rect x="255.00" y="660.00" width="20.00" height="20.00" rx="3" fill="#315c9b">
+</rect>
+<text x="284.0" y="675.0" text-anchor="start" class="flow">GEMM2: Vᵀ @ Pᵀ</text>
+<rect x="525.00" y="660.00" width="20.00" height="20.00" rx="3" fill="#a45ab5">
+</rect>
+<text x="554.0" y="675.0" text-anchor="start" class="flow">softmax + K pipeline</text>
+<rect x="795.00" y="660.00" width="20.00" height="20.00" rx="3" fill="#167d75">
+</rect>
+<text x="824.0" y="675.0" text-anchor="start" class="flow">GEMM1: K @ Qᵀ</text>
+<rect x="1065.00" y="660.00" width="20.00" height="20.00" rx="3" fill="#7f8791">
+</rect>
+<text x="1094.0" y="675.0" text-anchor="start" class="flow">bridge</text>
+<rect x="1335.00" y="660.00" width="20.00" height="20.00" rx="3" fill="#4d5660">
+</rect>
+<text x="1364.0" y="675.0" text-anchor="start" class="flow">backedge</text>
+<rect x="42.00" y="715.00" width="1716.00" height="108.00" rx="5" fill="#e8f4ef" stroke="#b8d5c9" stroke-width="1">
+</rect>
+<text x="62.0" y="748.0" text-anchor="start" class="flow-head">late-scale slot1 的关键等待放大</text>
+<text x="62.0" y="779.0" text-anchor="start" class="callout" fill="#b9445b">phase34 +86.4 · phase42 +76.2 · phase106 +124.3 · phase108 +43.8 cycles</text>
+<text x="62.0" y="805.0" text-anchor="start" class="note">softmax窗口缩短后，slow slot更早进入下一GEMM1，progressive K ds_read / lgkmcnt延迟暴露。</text>
+<rect x="42.00" y="850.00" width="330.00" height="190.00" rx="5" fill="#f6f8fa" stroke="#cfd6dc" stroke-width="1">
+</rect>
+<rect x="42.00" y="850.00" width="330.00" height="35.00" rx="5" fill="#315c9b">
+</rect>
+<text x="56.0" y="874.0" text-anchor="start" class="flow-head" fill="#ffffff">GEMM2-A / GEMM2-B</text>
+<text x="56.0" y="914.0" text-anchor="start" class="flow">• 32 x v_mfma_f32_16x16x16_bf16</text>
+<text x="56.0" y="939.0" text-anchor="start" class="flow">• v_perm_b32 probability pack</text>
+<text x="56.0" y="964.0" text-anchor="start" class="flow">• s_waitcnt vmcnt/lgkmcnt</text>
+<rect x="392.00" y="850.00" width="330.00" height="190.00" rx="5" fill="#f6f8fa" stroke="#cfd6dc" stroke-width="1">
+</rect>
+<rect x="392.00" y="850.00" width="330.00" height="35.00" rx="5" fill="#a45ab5">
+</rect>
+<text x="406.0" y="874.0" text-anchor="start" class="flow-head" fill="#ffffff">softmax + K pipeline（共有）</text>
+<text x="406.0" y="914.0" text-anchor="start" class="flow">• v_max_f32/v_max3_f32</text>
+<text x="406.0" y="939.0" text-anchor="start" class="flow">• ds_swizzle_b32/ds_bpermute_b32</text>
+<text x="406.0" y="964.0" text-anchor="start" class="flow">• s_waitcnt lgkmcnt(0)</text>
+<text x="406.0" y="989.0" text-anchor="start" class="flow">• 32 x v_exp_f32</text>
+<text x="406.0" y="1014.0" text-anchor="start" class="flow">• 32 x running-sum v_fma_f32</text>
+<rect x="742.00" y="850.00" width="330.00" height="190.00" rx="5" fill="#f6f8fa" stroke="#cfd6dc" stroke-width="1">
+</rect>
+<rect x="742.00" y="850.00" width="330.00" height="35.00" rx="5" fill="#7f4b8e">
+</rect>
+<text x="756.0" y="874.0" text-anchor="start" class="flow-head" fill="#ffffff">late-scale score路径</text>
+<text x="756.0" y="914.0" text-anchor="start" class="flow">• 4 x scalar v_fma_f32 max scale</text>
+<text x="756.0" y="939.0" text-anchor="start" class="flow">• 32 x scalar v_fma_f32 score scale+center</text>
+<rect x="1092.00" y="850.00" width="330.00" height="190.00" rx="5" fill="#f6f8fa" stroke="#cfd6dc" stroke-width="1">
+</rect>
+<rect x="1092.00" y="850.00" width="330.00" height="35.00" rx="5" fill="#167d75">
+</rect>
+<text x="1106.0" y="874.0" text-anchor="start" class="flow-head" fill="#ffffff">GEMM1-A / GEMM1-B</text>
+<text x="1106.0" y="914.0" text-anchor="start" class="flow">• 32 x v_mfma_f32_16x16x16_bf16</text>
+<text x="1106.0" y="939.0" text-anchor="start" class="flow">• progressive s_waitcnt lgkmcnt</text>
+<text x="1106.0" y="964.0" text-anchor="start" class="flow">• K ds_read_b128</text>
+<text x="1106.0" y="989.0" text-anchor="start" class="flow">• V/future-K buffer_load overlap</text>
+<rect x="1442.00" y="850.00" width="330.00" height="190.00" rx="5" fill="#f6f8fa" stroke="#cfd6dc" stroke-width="1">
+</rect>
+<rect x="1442.00" y="850.00" width="330.00" height="35.00" rx="5" fill="#7f8791">
+</rect>
+<text x="1456.0" y="874.0" text-anchor="start" class="flow-head" fill="#ffffff">bridge / backedge</text>
+<text x="1456.0" y="914.0" text-anchor="start" class="flow">• byte-offset/address VALU</text>
+<text x="1456.0" y="939.0" text-anchor="start" class="flow">• loop SALU branch</text>
+<text x="1456.0" y="964.0" text-anchor="start" class="flow">• final wait/barrier handoff</text>
+<rect x="42.00" y="1070.00" width="1716.00" height="190.00" rx="5" fill="#f6f8fa" stroke="#cfd6dc" stroke-width="1">
+</rect>
+<text x="62.0" y="1105.0" text-anchor="start" class="flow-head">如何读图</text>
+<text x="62.0" y="1136.0" text-anchor="start" class="flow">1. 每条横条是同一slot平均处理一个BN32 tile的动态时间，不是静态指令条数。</text>
+<text x="62.0" y="1164.0" text-anchor="start" class="flow">2. 紫色softmax/K段同时包含max/DS归约、EXP、running-sum FMA、BF16 pack、future-K load与K LDS write。</text>
+<text x="62.0" y="1192.0" text-anchor="start" class="flow">3. 绿色GEMM1段包含32条MFMA及progressive lgkmcnt等待；late-scale slot1的主要回退落在这些等待点。</text>
+<text x="62.0" y="1220.0" text-anchor="start" class="flow">4. late-scale让slot0快116.7 cycles/tile，却让决定吞吐的slot1慢28.1，物理wall因此回退约0.84%。</text>
+<text x="62.0" y="1248.0" text-anchor="start" class="note">数据源：四份单dispatch ATT；图中control/late-scale使用完整后移sum的16个物理SIMD。</text>
+</svg>

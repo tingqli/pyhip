@@ -29,13 +29,20 @@
 - [ ] 空闲GPU上夹心扫描softmax1 prepare预执行31/35/43 cycles（再前移DS fanout/threshold/K写）；小shape精度和资源已通过,当前未进入生产文件。
 - [x] 将JIT优化移植到FlyDSL：第二条K写中置和按m_rep半量BF16转换,40960从185.1T提升到194.4T。
 - [x] 修复FlyDSL移植对8192的shape回退：`N < 32768`恢复原scheduler+整片转换,8192从166.9--167.0T恢复到170.6--170.7T；40960保持194.0--194.1T。
-- [x] **Fly ABI机器后端达到最新JIT约237T**：将归档JIT的`156V+64A`机械重命名为`220V+0A`，12/12配对均为236.56T且输出逐元素相同；再转换为Fly 164-byte tensor ABI，实测3630.9us/236.6T、`rel_l2=0.00319`。入口为`ATTN_FLY_BACKEND=jit_all_vgpr`，严格配对Fly DSL 194.1T→机器后端236.1T（+21.59%）。机器后端目标已完成；FlyDSL codegen路径仍需对齐MFMA链、wait和resident-wave相位。
+- [x] **严格Fly最终ISA达到205.2T阶段门槛**：只处理当前`flyc.compile(build(...))`生成的ISA，删除8条identity max、把12条BF16 pack移入sum等待窗，并插入绝对priority事件`16:0,96:2`。`C-X-X-C`为12/12有效，约194.6T→205.2T（+5.42%），`rel_l2=0.00319`；ISA形态漂移会失败，不使用JIT归档机器码冒充Fly codegen。
+- [x] **系统验证Fly源码级inline asm表达**：覆盖side-effect/pure max、概率pack anchor、原生`rocdl.s_setprio`、tied累加器、选择性调度屏障，以及2条+16条MFMA整块inline。所有40960候选均逐元素一致，但最佳精确`16:0,96:2`版本仍回退5.30%，最接近最终ISA的2+16块版本回退8.76%；源码探针已全部清理，正式205.2T最终ISA路径不变。
+- [x] **扩大inline到完整JIT主流程**：Fly保留tensor ABI、block/head base offset和launch，单个asm块覆盖wave内offset、prologue、完整pair-loop、两次`kv_step`等价流程及epilogue/store。最终220V/34S/0A、零spill、128 MFMA/4 priority；与静态JIT oracle逐元素完全相同。严格配对高层Fly 194.5T→inline 236.4T（+21.61%），oracle 236.3T→inline 236.2T（-0.02%，噪声内）。该路径主要计算来自受SHA保护的JIT归档，不计为高层Fly原生codegen。
+- [x] **验证sum归约后移的`v_pk`阻塞并用inline消除**：只后移shuffle生成2条`v_pk_fma`，inline scalar FMA将254V降到232V并提升4.16%（182.0T→189.5T）；完整后移生成额外13条`v_pk_mul`、5条`v_pk_add`且268V跨occupancy阈值，逐元素inline FMA将其降到246V并提升33.02%（143.6T→191.1T）。两者相对base仍分别回退2.54%和1.96%，默认保持base。
+- [x] **测试两种inline sum组合延后`sm_scale_log2`**：逐元素inline `v_fma_f32(score,scale,-max)`删除16条`v_pk_mul`和32条SUB；只后移shuffle组合跨GPU稳定+0.29%--0.30%，完整后移sum组合稳定-0.83%--0.84%。前者相对base仍回退2.24%，不切换默认路径。
+- [x] **用ATT闭合late-scale回退**：完整后移sum的late-scale物理wall增加14.049 cycles/tile（+0.85%），与严格性能-0.83%闭合；issue减少7.730但shadow外no-issue增加24.121。slot0快116.680，决定吞吐的slot1却慢28.097；phase32/96长softmax缩短后，等待转移到下一GEMM1的K-LDS progressive wait（慢slot phase34/42/106/108分别+86.427/+76.205/+124.341/+43.776）。根因是双resident-slot失衡和K LDS延迟暴露，不是scalar FMA吞吐。
+- [x] 拆分验证raw/formal probability交织：raw完整组合相对205T回退5.18%；单步formal完整接管回退9.67%，两步对称接管收窄到6.91%，raw-domain FMA接管回退8.59%。对称接管ATT虽使shadow内no-issue减少50.340 cycles/tile，shadow外no-issue仍增加114.829，phase32双wave长团重叠从250.356升到445.208。priority第二边界80--112、M16/M17交换、回边GEMM2链旋转、max-only fanout和删6条冗余K wait均未转正，所有候选未保留。
+- [ ] **FlyDSL codegen达到最新JIT约237T**：当前高层Fly约194.6T，严格来源于Fly的最终ISA后处理约205.2T，距离JIT ISA oracle约32T。下一步必须按完整pair重排两路softmax：p0与当前GEMM1交织，p1跨循环回边与下一轮GEMM2交织；禁止继续只搬p0局部FMA/EXP，因为这会把两resident wave锁得更同相。
 - [ ] 在存在尾批的实际shape上评估persistent grid；H=1/M=40960理论示例已有320 WG整除80 CU，不需要尾批修正。
-- [ ] 拆分验证raw-domain FMA、probability寄存器复用、xor32地址复用各自的绝对性能贡献。
+- [ ] 单独验证xor32地址复用；raw-domain FMA、probability寄存器复用、max fanout和K wait压缩已完成严格消融并回退。
 
 ## 当前任务
 
 - [x] 扩展`archive/gemm/analyze-kernel-mfma-valu-coissue.py`，单次运行同时报告intra co-issue和8-wave inter co-issue，并更新实测报告。
 - [x] 新增`archive/gemm/analyze-attn-att-cycle-ledger.py`，将最终ATT的VMEM/LDS/barrier/wait和依赖空洞归入BN32 tile并闭合墙钟。
 
-> [提醒] JIT production为208.6--208.8T；最新独立`setprio_best`为236.5--237.1T，是Fly移植目标。FlyDSL长序列基线约194.0--194.4T，纯Fly最终ISA短priority窗口约197.6--198.5T；8192约170.6--170.7T。
+> [提醒] JIT production为208.6--208.8T；最新独立`setprio_best`为236.5--237.1T，是Fly移植目标。FlyDSL高层长序列约194.6T，严格来源于Fly的最终ISA组合约205.2T；8192约170.6--170.7T。

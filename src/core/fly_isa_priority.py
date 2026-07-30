@@ -16,6 +16,7 @@ ATTN_MFMA_COUNT = 128
 ATTN_PRIORITY_EVENTS = ((46, 2), (64, 0))
 ATTN_KERNARG_SIZE = 164
 ATTN_POINTER_OFFSETS = (0, 40, 80, 128)
+ATTN_IDENTITY_MAX_SPACERS = (79, 83, 79, 83, 77, 113, 77, 113)
 
 
 def preshuffle_jit_key(key, *, block_n=32):
@@ -215,6 +216,146 @@ def _instruction_opcode(line):
     return text.split(None, 1)[0]
 
 
+def _instruction_text(line):
+    text = line.split(";", 1)[0].strip()
+    if not text or text.startswith((".", "#")) or text.endswith(":"):
+        return None
+    return re.sub(r"\s+", " ", text)
+
+
+def _replace_instruction_sequence(isa, old, new, *, description):
+    lines = isa.splitlines(keepends=True)
+    instruction_indices = []
+    instructions = []
+    for index, line in enumerate(lines):
+        instruction = _instruction_text(line)
+        if instruction is not None:
+            instruction_indices.append(index)
+            instructions.append(instruction)
+
+    matches = [
+        index
+        for index in range(len(instructions) - len(old) + 1)
+        if instructions[index : index + len(old)] == list(old)
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one {description} sequence, found {len(matches)}")
+
+    match = matches[0]
+    first_line = instruction_indices[match]
+    last_line = instruction_indices[match + len(old) - 1]
+    original = lines[first_line]
+    indent = original[: len(original) - len(original.lstrip())]
+    newline = "\r\n" if original.endswith("\r\n") else "\n"
+    lines[first_line : last_line + 1] = [
+        f"{indent}{instruction}{newline}" for instruction in new
+    ]
+    return "".join(lines)
+
+
+def insert_fly_attention_max_fanout(isa):
+    """将Fly attention的两级max归约改为xor16/xor32/xor48并行fanout。"""
+    validate_attention_isa(isa)
+    isa = _replace_instruction_sequence(
+        isa,
+        ["v_xor_b32_e32 v96, 0x80, v4"],
+        ["v_xor_b32_e32 v96, 0x80, v4", "v_xor_b32_e32 v240, 0x40, v96"],
+        description="xor48 address setup",
+    )
+    isa = _replace_instruction_sequence(
+        isa,
+        [
+            "ds_swizzle_b32 v83, v81 offset:swizzle(SWAP,16)",
+            "s_waitcnt lgkmcnt(1)",
+            "v_max_f32_e32 v79, v79, v79",
+            "v_max_f32_e32 v78, v78, v79",
+            "ds_bpermute_b32 v79, v96, v78",
+            "s_waitcnt lgkmcnt(1)",
+            "v_max_f32_e32 v83, v83, v83",
+            "v_max_f32_e32 v81, v81, v83",
+            "ds_bpermute_b32 v83, v96, v81",
+            "s_waitcnt lgkmcnt(1)",
+            "v_max_f32_e32 v79, v79, v79",
+            "v_max_f32_e32 v200, v78, v79",
+            "v_pk_add_f32 v[78:79], v[76:77], s[18:19] op_sel_hi:[1,0]",
+            "s_waitcnt lgkmcnt(0)",
+            "v_max_f32_e32 v83, v83, v83",
+            "v_cmp_gt_f32_e32 vcc, v200, v79",
+            "v_max_f32_e32 v201, v81, v83",
+            "v_cmp_gt_f32_e64 s[2:3], v201, v78",
+        ],
+        [
+            "ds_swizzle_b32 v83, v81 offset:swizzle(SWAP,16)",
+            "ds_bpermute_b32 v200, v96, v78",
+            "ds_bpermute_b32 v202, v240, v78",
+            "ds_bpermute_b32 v201, v96, v81",
+            "ds_bpermute_b32 v203, v240, v81",
+            "s_waitcnt lgkmcnt(0)",
+            "v_max3_f32 v200, v78, v79, v200",
+            "v_max_f32_e32 v200, v200, v202",
+            "v_max3_f32 v201, v81, v83, v201",
+            "v_max_f32_e32 v201, v201, v203",
+            "v_pk_add_f32 v[78:79], v[76:77], s[18:19] op_sel_hi:[1,0]",
+            "v_cmp_gt_f32_e32 vcc, v200, v79",
+            "v_cmp_gt_f32_e64 s[2:3], v201, v78",
+        ],
+        description="first max fanout",
+    )
+    isa = _replace_instruction_sequence(
+        isa,
+        [
+            "ds_swizzle_b32 v113, v112 offset:swizzle(SWAP,16)",
+            "s_waitcnt lgkmcnt(1)",
+            "v_max_f32_e32 v77, v77, v77",
+            "v_max_f32_e32 v76, v76, v77",
+            "ds_bpermute_b32 v77, v96, v76",
+            "s_waitcnt lgkmcnt(1)",
+            "v_max_f32_e32 v113, v113, v113",
+            "v_max_f32_e32 v112, v112, v113",
+            "ds_bpermute_b32 v113, v96, v112",
+            "s_waitcnt lgkmcnt(1)",
+            "v_max_f32_e32 v77, v77, v77",
+            "v_max_f32_e32 v202, v76, v77",
+            "v_pk_add_f32 v[76:77], v[78:79], s[18:19] op_sel_hi:[1,0]",
+            "s_waitcnt lgkmcnt(0)",
+            "v_max_f32_e32 v113, v113, v113",
+            "v_cmp_gt_f32_e32 vcc, v202, v77",
+            "v_max_f32_e32 v203, v112, v113",
+            "v_cmp_gt_f32_e64 s[2:3], v203, v76",
+        ],
+        [
+            "ds_swizzle_b32 v113, v112 offset:swizzle(SWAP,16)",
+            "ds_bpermute_b32 v202, v96, v76",
+            "ds_bpermute_b32 v241, v240, v76",
+            "ds_bpermute_b32 v203, v96, v112",
+            "ds_bpermute_b32 v242, v240, v112",
+            "s_waitcnt lgkmcnt(0)",
+            "v_max3_f32 v202, v76, v77, v202",
+            "v_max_f32_e32 v202, v202, v241",
+            "v_max3_f32 v203, v112, v113, v203",
+            "v_max_f32_e32 v203, v203, v242",
+            "v_pk_add_f32 v[76:77], v[78:79], s[18:19] op_sel_hi:[1,0]",
+            "v_cmp_gt_f32_e32 vcc, v202, v77",
+            "v_cmp_gt_f32_e64 s[2:3], v203, v76",
+        ],
+        description="second max fanout",
+    )
+
+    replacements = {
+        r"(^\s*\.amdhsa_next_free_vgpr\s+)240(\s*$)": r"\g<1>244\g<2>",
+        r"(^\s*\.amdhsa_accum_offset\s+)240(\s*$)": r"\g<1>244\g<2>",
+        r"(^\s*\.set\s+attn_kernel_0\.num_vgpr,\s*)240(\s*$)": r"\g<1>244\g<2>",
+        r"(^\s*- \.vgpr_count:\s*)240(\s*$)": r"\g<1>244\g<2>",
+    }
+    for pattern, replacement in replacements.items():
+        isa, count = re.subn(pattern, replacement, isa, flags=re.MULTILINE)
+        if count != 1:
+            raise ValueError(
+                f"expected one max-fanout resource match for {pattern!r}, found {count}"
+            )
+    return isa
+
+
 def _validate_priority_events(period, events):
     if period <= 0:
         raise ValueError(f"MFMA period must be positive, got {period}")
@@ -265,6 +406,138 @@ def validate_attention_isa(isa, expected_mfma=ATTN_MFMA_COUNT):
         )
 
 
+def remove_fly_attention_identity_max_spacers(isa, *, expected_mfma=ATTN_MFMA_COUNT):
+    """删除max归约中已有wait覆盖的8条恒等VALU spacer。"""
+    validate_attention_isa(isa, expected_mfma=expected_mfma)
+    pattern = re.compile(r"v_max_f32_e32 v(\d+), v\1, v\1")
+    output = []
+    observed = []
+    for line in isa.splitlines(keepends=True):
+        instruction = _instruction_text(line)
+        match = None if instruction is None else pattern.fullmatch(instruction)
+        if match is None:
+            output.append(line)
+            continue
+        observed.append(int(match.group(1)))
+
+    if tuple(observed) != ATTN_IDENTITY_MAX_SPACERS:
+        raise ValueError(
+            "expected identity max spacer registers "
+            f"{ATTN_IDENTITY_MAX_SPACERS}, found {tuple(observed)}"
+        )
+
+    transformed = "".join(output)
+    validate_attention_isa(transformed, expected_mfma=expected_mfma)
+    return transformed
+
+
+def _move_instruction_subset_after(
+    isa, source_sequence, moved_offsets, anchor, *, description
+):
+    lines = isa.splitlines(keepends=True)
+    instruction_indices = []
+    instructions = []
+    for line_index, line in enumerate(lines):
+        instruction = _instruction_text(line)
+        if instruction is not None:
+            instruction_indices.append(line_index)
+            instructions.append(instruction)
+
+    source_matches = [
+        index
+        for index in range(len(instructions) - len(source_sequence) + 1)
+        if instructions[index : index + len(source_sequence)] == list(source_sequence)
+    ]
+    if len(source_matches) != 1:
+        raise ValueError(
+            f"expected one {description} source sequence, found {len(source_matches)}"
+        )
+    anchor_matches = [
+        instruction_indices[index]
+        for index, instruction in enumerate(instructions)
+        if instruction == anchor
+    ]
+    if len(anchor_matches) != 1:
+        raise ValueError(
+            f"expected one {description} destination anchor, found {len(anchor_matches)}"
+        )
+
+    source_begin = source_matches[0]
+    moved_offsets = tuple(moved_offsets)
+    if len(set(moved_offsets)) != len(moved_offsets) or any(
+        offset < 0 or offset >= len(source_sequence) for offset in moved_offsets
+    ):
+        raise ValueError(f"invalid {description} moved offsets: {moved_offsets}")
+    remove_lines = {
+        instruction_indices[source_begin + offset] for offset in moved_offsets
+    }
+    moved_instructions = [source_sequence[offset] for offset in moved_offsets]
+    anchor_line = anchor_matches[0]
+    anchor_text = lines[anchor_line]
+    indent = anchor_text[: len(anchor_text) - len(anchor_text.lstrip())]
+    newline = "\r\n" if anchor_text.endswith("\r\n") else "\n"
+
+    output = []
+    for line_index, line in enumerate(lines):
+        if line_index in remove_lines:
+            continue
+        output.append(line)
+        if line_index == anchor_line:
+            output.extend(
+                f"{indent}{instruction}{newline}" for instruction in moved_instructions
+            )
+    return "".join(output)
+
+
+def move_fly_attention_sum_pack_to_wait(isa, *, expected_mfma=ATTN_MFMA_COUNT):
+    """将每个展开步的一组BF16概率打包移入sum DS等待窗口。"""
+    validate_attention_isa(isa, expected_mfma=expected_mfma)
+    first_conversion = (
+        "v_add_u32_e32 v115, 0x8000, v115",
+        "v_add_u32_e32 v116, 0x8000, v116",
+        "v_add_u32_e32 v117, 0x8000, v117",
+        "v_add_u32_e32 v76, 0x8000, v111",
+        "v_add_u32_e32 v111, 0x8000, v112",
+        "v_add_u32_e32 v77, 0x8000, v113",
+        "v_add_u32_e32 v112, 0x8000, v114",
+        "v_add_u32_e32 v110, 0x8000, v110",
+        "v_perm_b32 v77, v112, v77, s15",
+        "v_perm_b32 v76, v111, v76, s15",
+        "v_perm_b32 v119, v110, v117, s15",
+        "v_perm_b32 v118, v116, v115, s15",
+    )
+    second_conversion = (
+        "v_add_u32_e32 v200, 0x8000, v117",
+        "v_add_u32_e32 v118, 0x8000, v118",
+        "v_add_u32_e32 v117, 0x8000, v119",
+        "v_add_u32_e32 v113, 0x8000, v113",
+        "v_add_u32_e32 v114, 0x8000, v114",
+        "v_add_u32_e32 v115, 0x8000, v115",
+        "v_add_u32_e32 v116, 0x8000, v116",
+        "v_add_u32_e32 v112, 0x8000, v112",
+        "v_perm_b32 v115, v116, v115, s15",
+        "v_perm_b32 v114, v114, v113, s15",
+        "v_perm_b32 v117, v112, v117, s15",
+        "v_perm_b32 v116, v118, v200, s15",
+    )
+    transformed = _move_instruction_subset_after(
+        isa,
+        first_conversion,
+        (0, 1, 2, 7, 10, 11),
+        "ds_swizzle_b32 v72, v70 offset:swizzle(SWAP,16)",
+        description="first sum-pack",
+    )
+    transformed = _move_instruction_subset_after(
+        transformed,
+        second_conversion,
+        (3, 4, 5, 6, 8, 9),
+        "ds_swizzle_b32 v82, v80 offset:swizzle(SWAP,16)",
+        description="second sum-pack",
+    )
+    validate_attention_isa(transformed, expected_mfma=expected_mfma)
+    return transformed
+
+
 def insert_periodic_mfma_priority(
     isa,
     *,
@@ -300,6 +573,31 @@ def insert_periodic_mfma_priority(
 
     if mfma_count != expected_mfma:
         raise AssertionError("MFMA count changed while inserting priority events")
+    return "".join(output)
+
+
+def insert_absolute_mfma_priority(isa, *, events, expected_mfma=ATTN_MFMA_COUNT):
+    """在整段机器码的绝对MFMA编号后插入priority事件。"""
+    events = tuple(events)
+    _validate_priority_events(expected_mfma, events)
+    validate_attention_isa(isa, expected_mfma=expected_mfma)
+    priority_by_position = dict(events)
+    output = []
+    mfma_count = 0
+    for line in isa.splitlines(keepends=True):
+        output.append(line)
+        if not _instruction_opcode(line).startswith("v_mfma_"):
+            continue
+        mfma_count += 1
+        if mfma_count not in priority_by_position:
+            continue
+        newline = "\r\n" if line.endswith("\r\n") else "\n"
+        indent = line[: len(line) - len(line.lstrip())]
+        output.append(f"{indent}s_setprio {priority_by_position[mfma_count]}{newline}")
+    if mfma_count != expected_mfma:
+        raise AssertionError(
+            "MFMA count changed while inserting absolute priority events"
+        )
     return "".join(output)
 
 
@@ -359,6 +657,116 @@ def build_priority_hsaco(
         ]
         subprocess.run(command, check=True, text=True, capture_output=True)
 
+    return PriorityHsaco(assembly_path=assembly_path, code_object_path=code_object_path)
+
+
+def build_attention_post_isa_hsaco(
+    source_isa_path,
+    output_dir,
+    *,
+    arch="gfx942",
+    remove_identity_max=False,
+    move_sum_pack=False,
+    priority_period=None,
+    priority_events=None,
+    absolute_priority_events=None,
+):
+    source_isa_path = Path(source_isa_path)
+    output_dir = Path(output_dir)
+    transformed = source_isa_path.read_text(encoding="utf-8")
+    transforms = []
+    if remove_identity_max:
+        transformed = remove_fly_attention_identity_max_spacers(transformed)
+        transforms.append("no-identity-max")
+    if move_sum_pack:
+        transformed = move_fly_attention_sum_pack_to_wait(transformed)
+        transforms.append("sum-pack")
+    if priority_events is not None and absolute_priority_events is not None:
+        raise ValueError("periodic and absolute priority events are mutually exclusive")
+    if priority_events is not None:
+        if priority_period is None:
+            raise ValueError("priority_period is required with priority_events")
+        transformed = insert_periodic_mfma_priority(
+            transformed, period=priority_period, events=priority_events
+        )
+        transforms.append("priority")
+    if absolute_priority_events is not None:
+        transformed = insert_absolute_mfma_priority(
+            transformed, events=absolute_priority_events
+        )
+        transforms.append("absolute-priority")
+    if not transforms:
+        raise ValueError("at least one post-ISA transform must be enabled")
+
+    digest = hashlib.sha256()
+    digest.update(transformed.encode("utf-8"))
+    digest.update(arch.encode("ascii"))
+    key = digest.hexdigest()[:16]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = "attn_kernel_0-" + "-".join(transforms) + f"-{key}"
+    assembly_path = output_dir / f"{stem}.s"
+    code_object_path = output_dir / f"{stem}.co"
+
+    if (
+        not assembly_path.exists()
+        or assembly_path.read_text(encoding="utf-8") != transformed
+    ):
+        assembly_path.write_text(transformed, encoding="utf-8")
+    if not code_object_path.exists():
+        subprocess.run(
+            [
+                _find_amdgpu_clang(),
+                "-x",
+                "assembler",
+                "-target",
+                "amdgcn-amd-amdhsa",
+                f"-mcpu={arch}",
+                str(assembly_path),
+                "-o",
+                str(code_object_path),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    return PriorityHsaco(assembly_path=assembly_path, code_object_path=code_object_path)
+
+
+def build_max_fanout_hsaco(source_isa_path, output_dir, *, arch="gfx942"):
+    source_isa_path = Path(source_isa_path)
+    output_dir = Path(output_dir)
+    transformed = insert_fly_attention_max_fanout(
+        source_isa_path.read_text(encoding="utf-8")
+    )
+    digest = hashlib.sha256()
+    digest.update(transformed.encode("utf-8"))
+    digest.update(arch.encode("ascii"))
+    key = digest.hexdigest()[:16]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    assembly_path = output_dir / f"attn_kernel_0-max-fanout-{key}.s"
+    code_object_path = output_dir / f"attn_kernel_0-max-fanout-{key}.co"
+    if (
+        not assembly_path.exists()
+        or assembly_path.read_text(encoding="utf-8") != transformed
+    ):
+        assembly_path.write_text(transformed, encoding="utf-8")
+    if not code_object_path.exists():
+        subprocess.run(
+            [
+                _find_amdgpu_clang(),
+                "-x",
+                "assembler",
+                "-target",
+                "amdgcn-amd-amdhsa",
+                f"-mcpu={arch}",
+                str(assembly_path),
+                "-o",
+                str(code_object_path),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
     return PriorityHsaco(assembly_path=assembly_path, code_object_path=code_object_path)
 
 
@@ -480,6 +888,34 @@ def build_attention_priority_kernel(
         StaticAttentionKernel(artifact.code_object_path, grid=(m // block_m, h, 1)),
         artifact,
     )
+
+
+def build_attention_post_isa_kernel(
+    source_isa_path,
+    output_dir,
+    *,
+    m,
+    h,
+    block_m=128,
+    remove_identity_max=False,
+    move_sum_pack=False,
+    priority_period=None,
+    priority_events=None,
+    absolute_priority_events=None,
+):
+    if m % block_m != 0:
+        raise ValueError(f"M={m} must be divisible by block_m={block_m}")
+    artifact = build_attention_post_isa_hsaco(
+        source_isa_path,
+        output_dir,
+        remove_identity_max=remove_identity_max,
+        move_sum_pack=move_sum_pack,
+        priority_period=priority_period,
+        priority_events=priority_events,
+        absolute_priority_events=absolute_priority_events,
+    )
+    kernel = StaticAttentionKernel(artifact.code_object_path, grid=(m // block_m, h, 1))
+    return kernel, artifact
 
 
 def build_all_vgpr_jit_attention_kernel(

@@ -3245,7 +3245,7 @@ JIT的priority边界不能脱离其精确MFMA/softmax机器顺序直接套到Fly
 是复现JIT最终ISA中连续MFMA accumulator链、24条pair-loop wait和长期resident-wave反相，同时保留Fly的
 数据布局与编译链；不是单独选择A寄存器或V寄存器。
 
-#### A/V直接同ISA消融与Fly ABI机器后端
+#### A/V直接同ISA消融与JIT ISA oracle
 
 为直接验证A/V分类是否影响性能，将237T归档中`a0:a63`机械映射到统一寄存器文件未占用的
 `v156:v219`，并同步把资源元数据从`156V+64A`改为`220V+0A`。转换严格保持所有MFMA、VALU、VMEM、LDS、
@@ -3263,28 +3263,505 @@ wait和4条`s_setprio`的顺序不变；assembler接受该code object，资源�
 “A/V寄存器选择与性能无关”已由直接实验确认。
 
 随后将该全V机器序列的四个指针槽位转换为Fly tensor ABI：kernarg从32字节改为164字节，指针offset改为
-`0/40/80/128`，workgroup上限改为256；热循环ISA不变。`tests/flydsl/test_attn_gemm.py`新增明确标注的
-`ATTN_FLY_BACKEND=jit_all_vgpr`机器后端：
+`0/40/80/128`，workgroup上限改为256；热循环ISA不变。它仍然是JIT生成并归档的机器码，只是在Fly测试
+harness中加载，运行时不重新调用Python JIT。`tests/flydsl/test_attn_gemm.py`将其明确标记为
+`ATTN_FLY_BACKEND=jit_isa_oracle`：
 
 ```text
-Fly ABI all-V backend: 3630.9 us / 236.6T, rel_l2=0.00319
-strict compare: Fly DSL 194.1T -> jit_all_vgpr 236.1T, +21.59% (8/8 valid)
+JIT ISA oracle (all-V, Fly ABI): 3630.9 us / 236.6T, rel_l2=0.00319
+strict compare: Fly DSL 194.1T -> jit_isa_oracle 236.1T, +21.59% (8/8 valid)
 ```
 
 复现命令：
 
 ```bash
-HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=jit_all_vgpr \
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=jit_isa_oracle \
   python3 tests/flydsl/test_attn_gemm.py
-HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=compare_jit \
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=compare_oracle \
   ATTN_FLY_PAIR_COUNT=8 ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 tests/flydsl/test_attn_gemm.py
 ```
 
 转换后Fly ABI汇编SHA256为`2759206039c58f8c14cac7749e3d8b591feb29485e7f0281b871d58c8d5ab2f9`，
 code object SHA256为`faf55daeb0dfe3e168d9267bc7b757b3c09dc2acb739ee75bfaf4496098232a4`。
 
-这满足“Fly调用接口下达到约237T”的性能目标，但必须区分：**机器后端已达到目标，FlyDSL codegen路径仍约
-194T（短priority后约197--198T）**。剩余约18%的差距已证明来自最终机器调度/依赖，不来自A/V寄存器类别。
+该oracle只证明目标机器序列和A/V无关结论，**不算FlyDSL codegen达到目标**。真正FlyDSL路径仍约194T
+（短priority后约197--198T）；剩余约18%的差距来自最终机器调度/依赖，不来自A/V寄存器类别。
+
+### 22.26 严格Fly最终ISA达到205.2T与p0交织反证
+
+后续优化继续只修改`pyhip/`。正式路径的输入必须是当前
+`flyc.compile(build(...))`生成的`22_final_isa.s`，并对每个待变换序列做唯一形态校验；源ISA变化时直接失败，
+不能静默套用，更不能用237T JIT归档机器码通过Fly ABI调用来冒充FlyDSL codegen。
+
+当前保留的严格Fly最终ISA组合为：
+
+1. 删除max归约等待窗中的8条identity `v_max_f32 x, x, x`；
+2. 把两个展开步共12条BF16 round/pack指令移入sum DS等待窗；
+3. 在全局MFMA编号16和96后分别插入`setprio(0)`与`setprio(2)`。
+
+`ATTN_FLY_SUM_PACK=compare`使用10套独立buffer、12轮`C-X-X-C`和0.5%首尾control漂移门限，结果为
+12/12有效：高层Fly约194.6T，post-ISA约**205.2T**，提升**5.42%**；随机40960精度
+`rel_l2=0.00319`。identity-only、pack-only和priority-only都可能回退，三者组合才为正，说明该收益来自
+双resident-wave长期相位，而不是任一局部缩码。正式产物与用于ATT的候选规范化后969条机器指令逐条一致。
+
+#### 205T与237T oracle的ATT差距
+
+按每个物理SIMD只取begin最早的两条完整resident wave，Fly 205T相对237T oracle每tile仍多约202个物理
+周期，而issue只多约3.6个周期，差距几乎全部是no-issue。Fly在动态phase32后仍有约118条指令的长团，
+单wave约1.2--1.5K cycles；两wave长团重叠约248.7 cycles/tile，而oracle接近零。故剩余约32T不是
+“少几条指令”问题，而是两个resident wave在长softmax团上的同相等待。
+
+#### raw/formal p0概率交织
+
+为验证`MFMA -> 3 ALU -> MFMA -> EXP`能否直接移植，先在最终ISA上建立了严格逐步探针：
+
+- raw-domain ordered probability在M24执行8条scalar FMA、M29/M30执行8条EXP，随机40960与raw control
+  逐元素完全相同；
+- 删除原p0 center/EXP后仍逐元素相同；进一步接管p0 local/global max、DS归约并原地复用score寄存器，
+  也保持逐元素相同；
+- 但该raw路径相对自身control仅统计中性，叠加正式identity/pack/priority后相对205T稳定回退5.18%；
+- formal log2-domain概率替代的误差仅`rel_l2=4.84e-5`，但256V和248V版本分别回退7.70%和7.53%，
+  排除额外VGPR数量是主因；
+- formal完整接管把p0 scale/max/DS/SUB/EXP整体移入M18--M30，输出与205T control逐元素完全相同，
+  三路max fanout版本仍回退9.67%；raw-domain scalar FMA接管回退8.59%，且相对205T control误差增至
+  `rel_l2=0.00204`；
+- 扫描首个priority边界16/20/24/28/32/36/40，最佳M32仍回退约8.6%；删除priority回退14.86%；
+  只交换独立的M16/M17以提前一条MFMA释放p0则为+0.023%，统计中性。
+
+这些结果共同否定“只把p0 FMA/EXP塞进当前32条MFMA”这一路线。局部静态指令更少、VGPR仍为2 waves、
+甚至逐元素完全相同，都不能保证长期物理时间线更快。
+
+#### 失败候选ATT闭环
+
+重新采集正式205T control和三路fanout完整接管候选的ATT。两份trace均有16个物理SIMD，每个SIMD 4条
+完整wave；比较时仍只取begin最早的两条，每条含81920个MFMA，即1280个tile。原始物理周期如下：
+
+| 指标（cycles/tile） | Fly 205T | p0完整接管 | 变化 |
+|---|---:|---:|---:|
+| wall | 1455.363 | 1609.205 | **+153.842** |
+| issue union | 845.001 | 872.705 | +27.704 |
+| physical no-issue | 610.362 | 736.500 | **+126.137** |
+| MFMA shadow内non-MFMA issue | 226.326 | 192.543 | **-33.783** |
+| MFMA shadow内no-issue | 447.010 | 452.982 | +5.972 |
+| shadow外no-issue | 163.352 | 283.517 | **+120.165** |
+| phase32双wave长团重叠 | 250.356 | 429.501 | **+179.145** |
+
+接管版并没有把VALU/EXP变成更多有效shadow issue，反而减少33.783 cycles/tile，并把大部分新增等待推到
+shadow外。动态phase32的平均间隔虽从1350.923降到1322.332 cycles，双wave重叠却增加179.145 cycles/tile：
+单wave局部链略短，但两wave更同相，最终总时间明显变差。
+
+CFG解释了为什么单边搬迁必然危险：全局MFMA G33--G64之后计算p0 softmax，G65--G96消费p0做GEMM2；
+G97--G128才生成p1 score，p1 softmax结束后通过`.LBB0_1 -> .LBB0_2`回边，由下一轮G1--G32消费。
+因此对称调度必须跨回边：只搬p0会改变半个pair的相位，却不处理p1到下一轮GEMM2的release链。
+
+后续可行方案必须同时满足：
+
+1. 以完整pair为单位，让p0与当前GEMM1、p1与下一轮GEMM2对称交织；
+2. 保持当前约240V、2 waves/SIMD、原K/V等待距离和已验证priority窗口的长期作用；
+3. 每次先做`C-X-X-C`，再用首批两条resident-wave ATT检查phase32双wave重叠；局部MFMA shadow指令数
+   增加但重叠恶化时立即否决。
+
+在完成跨回边对称数据流之前，不再继续扫描单独p0的FMA/EXP位置。
+
+#### 对称pair补充实验与局部结构消融
+
+单边ATT之后又用同一`v240:v247`临时区，把第二个展开步的mt0 scale/max/SUB/EXP对称搬入其GEMM1
+局部M50--M62。候选相对205T逐元素完全相同，严格配对22/24有效，但仍回退6.91%；相对单边9.67%
+确实追回约2.8个百分点，证明完整pair相位重要，但不够消除release边界。
+
+对称候选ATT仍按16个物理SIMD、每SIMD首批两条完整resident wave统计：
+
+| 指标（cycles/tile） | Fly 205T | 对称pair接管 | 变化 |
+|---|---:|---:|---:|
+| wall | 1455.363 | 1576.974 | +121.610 |
+| issue union | 845.001 | 902.122 | +57.121 |
+| physical no-issue | 610.362 | 674.852 | +64.489 |
+| MFMA shadow内non-MFMA issue | 226.326 | 226.289 | -0.037 |
+| MFMA shadow内no-issue | 447.010 | 396.670 | **-50.340** |
+| shadow外no-issue | 163.352 | 278.182 | **+114.829** |
+| phase32双wave长团重叠 | 250.356 | 445.208 | **+194.851** |
+
+对称搬迁已经减少shadow内空洞，但新增收益被shadow外TRANS（+58.241）、VALU（+30.403）和
+`lgkmcnt(0)`（+17.068 cycles/tile）吃掉。动态phase32平均间隔从1350.923缩至1213.534 cycles，
+两wave重叠却进一步增加，说明“单wave长团变短”仍不足以让两wave反相。
+
+随后完成若干只改一处机器结构的严格消融，均逐元素完全相同：
+
+| 候选 | 有效配对 | 相对205T |
+|---|---:|---:|
+| 对称接管第二priority边界80--112 | 每点4--6/8 | -6.86%--7.08% |
+| priority终点96→104 | 22/24 | -4.57% |
+| GEMM1末尾独立M16/M17交换 | 20/24 | +0.023%，中性 |
+| 回边GEMM2唯一RAW距1 accumulator链移到块尾 | 19/24 | -0.29% |
+| 严格205T上的max-only三路DS fanout，240V→244V | 22/24 | -7.73% |
+| 两套GEMM1 K wait从`7/6/5/4/3/2/1/0`压成oracle式`7/3/2/1/0` | 19/24 | -0.42% |
+
+最后一项删除了6条数值上冗余的wait，仍然变慢；max-only fanout也减少两级串行wait但大幅回退。
+因此Fly steady-state的49条wait与oracle 24条wait不能按数量直接对齐，这些wait同时塑造resident-wave相位。
+同理，oracle的MFMA链和Fly不同：Fly GEMM2有16条accumulator链、典型RAW距离16；oracle按mt为8条链、
+RAW距离8。直接照搬oracle MFMA顺序等价于历史已回退的GEMM2拆分。
+
+本轮进一步收紧了后续约束：只有能同时搬走`EXP -> local sum -> pack -> state/rescale`完整release链，并在
+ATT中降低phase32双wave重叠的跨块调度才值得保留。单独删除wait、改DS fanout、移动priority边界、旋转一条
+MFMA链或只搬概率FMA/EXP都已由严格A/B否决。
+
+### 22.27 Fly源码级inline asm系统消融
+
+为了让真正的FlyDSL源码原生生成接近205.2T最终ISA组合的机器形态，本轮系统测试了inline asm及原生
+`rocdl.s_setprio`。所有性能数据均为`H=1,M=N=40960,D=128`，先做逐元素正确性，再用10套buffer、
+12轮`C-X-X-C`和0.5%首尾control漂移门限。所有进入长测的候选均与高层Fly逐元素完全相同。
+
+局部max/pack表达均未转正：
+
+| 候选 | 静态形态 | 相对高层Fly |
+|---|---|---:|
+| 两路成组max，side-effect inline | 242V，8条VOP3 max并增加nop | -4.89% |
+| tied e32 max，side-effect inline | 240V，identity max消失 | -8.64% |
+| 概率pack零字节anchor | 242V，热循环仍553条 | -8.55% |
+| tied e32 max，`has_side_effects=False` | 240V，热循环547条、全e32 max | -4.31% |
+| pure max再删两条VCC hazard nop | 数值仍逐元素一致 | 相对pure再-2.91% |
+
+最后一项说明新增nop并非pure-inline回退的主因；删除hazard nop反而更慢。真正原因是inline操作改变LLVM可见的
+SSA依赖、寄存器分配和全局调度，从而改变两条resident wave的长期相位。
+
+随后针对正式绝对priority事件`16:0,96:2`逐步扩大inline范围：
+
+| priority表达 | 最终ISA资源/形态 | 严格配对结果 |
+|---|---|---:|
+| 全调度屏障夹零操作数inline | 224V，priority精确16/96 | -10.86%，7/12有效 |
+| 16个累加器tied输入/输出 | 232V，16条nop，priority精确16/96 | -9.38%，9/12有效 |
+| 仅锁MFMA/SALU的选择性屏障+SGPR分类 | 236V，13条nop，priority精确16/96 | -8.23%，8/12有效 |
+| 边界MFMA与priority同一asm块，AGPR分类 | 229V，16条nop，priority精确16/96 | **-5.30%**，9/12有效 |
+| 原生`rocdl.s_setprio` | 224V，19条nop，priority精确16/96 | -10.88%，7/12有效 |
+| 首窗口2条MFMA块+第二窗口16条MFMA块 | 234V，10条nop，priority精确16/96 | -8.76%，8/12有效 |
+
+其中手工按Fly默认NMK顺序展开GEMM2、但不插priority时，962条可执行ISA与`fx.gemm`基线逐条完全一致；
+因此回退不是Python展开本身，而是priority表达引入的机器调度约束。单条inline MFMA无论选择哪条独立
+accumulator链，都会自然排到块内第15条；两条MFMA合并后可精确覆盖第15/16条。第二窗口要自然到第96条，
+则必须把整个16条独立链放进同一asm块，但这仍改变全局寄存器分配和softmax长团相位。
+
+还尝试将精确inline-priority ISA叠加identity删除和sum-pack搬移。第二展开步的pack可安全搬移且逐元素一致，
+第一展开步的pack却因inline后寄存器活跃区变化而仍承载correction/EXP活值，机械前移会产生NaN。故不能把
+baseline最终ISA变换按寄存器名套到新的inline codegen上；每份源ISA都必须重新证明数据流与唯一形态。
+
+结论：inline asm能精确生成目标`setprio`机器位置，但无法保持LLVM原先的全局排程，局部静态形态更短或
+VGPR更少也没有转化为性能。正式路径继续保留“先让Fly/LLVM完成全局调度，再对最终ISA做严格最小变换”的
+205.2T组合。后续若再使用inline asm，只考虑一次覆盖完整pair、跨回边并保持两路release链对称的整段实现；
+不再重复单条max、pack anchor、hazard nop删除或局部priority锚定。
+
+### 22.28 Fly外壳加完整JIT主流程inline达到236T
+
+局部inline会让LLVM重新安排其余SSA和寄存器活跃区，因此无法保持JIT的长期resident-wave相位。为验证边界扩大后
+能否保留机器节奏，新实现将受SHA256保护的237T JIT归档主体转换成全V寄存器和Fly ABI，再作为一个完整
+`llvm.inline_asm`块嵌入Fly kernel。归档SHA256固定为
+`18e3fe8e48e9eaa2bc62ba6ac82e7f41c5019e216b6638c0bd8decb452139c3b`，漂移时直接拒绝构建。
+
+职责边界为：
+
+- Fly负责tensor ABI，计算Q/K/V/O的block/head base pointer，以及`grid=(320,H,1)`、256线程和16KB动态LDS launch；
+- inline主体负责wave内offset、buffer descriptor、Q/K/V prologue、完整pair-loop、每轮两次`kv_step`等价流程、
+  softmax/GEMM交织、epilogue transpose和O store；
+- K/V输入仍需`preshuffle_jit_key()`/`preshuffle_jit_value()`生成JIT物理字节布局；Fly侧仅reshape成rank3/rank4
+  tensor descriptor，reshape不改变物理字节顺序。
+
+最终Fly产物为164字节kernarg、220 VGPR、34 SGPR、0 AGPR、零spill、128条MFMA和4条`s_setprio`。
+从首条inline指令到末条inline指令的951条规范化指令与提取器输出逐条完全一致；输出与静态JIT ISA oracle
+逐元素完全相同，对PyTorch参考为`rel_l2=0.00319`。
+
+8轮、10套buffer、0.5% control漂移门限的严格配对结果：
+
+| 配对 | control | candidate | 时间比 | 结果 |
+|---|---:|---:|---:|---:|
+| 高层Fly → 大块inline | 4417.3 us / 194.5T | 3633.1 us / **236.4T** | 0.82230 | +21.61% |
+| JIT ISA oracle → 大块inline | 3635.8 us / 236.3T | 3636.3 us / **236.2T** | 1.00025 | -0.02% |
+
+第二组8/8配对落在测量噪声内，证明Fly侧base-offset和launch外壳没有可测GPU开销。复现：
+
+```bash
+cd tests/flydsl
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=compare_inline \
+  ATTN_FLY_PAIR_COUNT=8 ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 ATTN_FLY_BACKEND=compare_inline_oracle \
+  ATTN_FLY_PAIR_COUNT=8 ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+```
+
+该实验通过Fly tracing/lowering生成wrapper和launch，但主要计算机器序列仍来自JIT归档并对LLVM保持opaque，
+所以它证明“足够大的inline边界能无损承载JIT节奏”，**不等于高层Fly原生codegen达到237T**。原生路径仍为
+高层约194.6T、严格Fly源ISA后处理约205.2T。
+
+### 22.29 sum归约后移的v_pk归因与inline消融
+
+将`p.reduce("add")`及两次`shuffle_xor(16,32)`移到循环外有两种合法变体：只后移跨lane shuffle，或把
+running sum改为逐元素向量并把完整reduce后移。两者对40960参考精度均保持`rel_l2=0.00319`，但原始实现
+分别从194.1T降到181.7T和143.0T。最终ISA确认两种回退都包含packed FP32算术：
+
+| 版本 | VGPR | `v_pk_add` | `v_pk_mul` | `v_pk_fma` | scalar `v_fma` |
+|---|---:|---:|---:|---:|---:|
+| base | 240 | 5 | 112 | 0 | 10 |
+| 只后移shuffle | 254 | 2 | 112 | 2 | 6 |
+| 只后移shuffle + inline FMA | 232 | 0 | 112 | 0 | 10 |
+| 完整后移sum | 268 | 10 | 125 | 0 | 6 |
+| 完整后移sum + inline FMA | 246 | 0 | 112 | 0 | 38 |
+
+只后移shuffle时，两条`v_pk_fma_f32`位于MFMA之间，其中一条与下一条MFMA零条指令间隔。完整后移时新增
+13条`v_pk_mul_f32`和5条`v_pk_add_f32`，多条与前后MFMA仅隔0--2条指令；268 VGPR还跨过约256的
+2 waves/SIMD阈值。用`has_side_effects=False`的LLVM inline asm强制`v_fma_f32`后，目标packed算术全部
+消失，完整后移版本也恢复到246 VGPR、2 waves/SIMD、零spill。
+
+10套buffer、0.5% control漂移门限的严格配对结果：
+
+| 配对 | control | inline candidate | 结果 |
+|---|---:|---:|---:|
+| 只后移shuffle：packed → scalar | 4721.0 us / 182.0T | 4534.1 us / 189.5T | **+4.16%**，11/12有效 |
+| 完整后移：packed → scalar | 5983.9 us / 143.6T | 4496.0 us / 191.1T | **+33.02%**，11/24有效 |
+| base → 只后移shuffle inline | 4415.3 us / 194.6T | 4529.4 us / 189.6T | -2.54%，14/16有效 |
+| base → 完整后移inline | 6794.3 us / 126.4T | 6930.4 us / 123.9T | -1.96%，22/24有效 |
+
+前两组证明`v_pk`不能与MFMA共发是回退的重要来源，完整后移还叠加了occupancy下降；后两组说明消除
+packed算术仍不足以超过base，剩余约2%来自归约边界改变后的全局调度和活跃区。最后一组处于control与
+candidate共同的slow功耗态，严格时间比有效，但绝对TFLOPS不用于跨组比较。默认保持`base`，实验入口为：
+
+```bash
+cd tests/flydsl
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 \
+  ATTN_FLY_SUM_REDUCE=defer_shuffle_inline \
+  ATTN_FLY_SUM_REDUCE_CONTROL=defer_shuffle ATTN_FLY_PAIR_COUNT=12 \
+  ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+HIP_VISIBLE_DEVICES=0 H=1 MULT=320 SOFTMAX=1 \
+  ATTN_FLY_SUM_REDUCE=defer_all_inline \
+  ATTN_FLY_SUM_REDUCE_CONTROL=defer_all ATTN_FLY_PAIR_COUNT=24 \
+  ATTN_FLY_MAX_CONTROL_DRIFT=0.005 python3 test_attn_gemm.py
+```
+
+#### 延后`sm_scale_log2`并用inline FMA合并scale+center
+
+在上述两个inline sum组合上，进一步把score向量的`sm_scale_log2`从GEMM1后移到概率生成点。为保持running
+max仍在log2域，先归约raw score，再用一条scalar inline FMA缩放标量max；概率输入则逐元素生成
+`v_fma_f32(score, sm_scale_log2, -nm)`。这避免了历史vector FMA被LLVM重新合成`v_pk_fma_f32`的问题。
+
+两种组合的ISA变化相同：删除16条`v_pk_mul_f32`和32条`v_sub_f32`，新增36条scalar
+`v_fma_f32`及8条scalar max。只后移shuffle版本从232V升到234V，完整后移sum版本从246V升到248V；
+两者仍为2 waves/SIMD、16KB LDS、零spill，40960精度均为`rel_l2=0.00319`。
+
+严格`C-X-X-C`在两张不同GPU上的复测方向一致：
+
+| 组合 | 首次配对 | 换GPU复测 | 相对base |
+|---|---:|---:|---:|
+| 只后移shuffle inline → late-scale | +0.30%，11/16有效 | **+0.29%**，17/24有效 | 190.1T vs 194.4T，-2.24% |
+| 完整后移sum inline → late-scale | -0.84%，22/24有效 | **-0.83%**，21/24有效 | -2.80%（共同slow态） |
+
+因此late-scale scalar FMA对标量running-sum组合有约0.3%的小幅稳定收益，但对向量running-sum组合稳定
+回退约0.8%；相同局部ISA缩减并不保证相同的resident-wave相位。最佳late-scale候选仍未超过base，默认不变。
+复现模式分别为`defer_shuffle_inline_late_scale`和`defer_all_inline_late_scale`。
+
+#### late-scale回退的ATT闭环
+
+对四个模式分别采集单dispatch ATT：只后移shuffle的inline/late-scale，以及完整后移sum的inline/late-scale。
+每个物理`SE+SM+CU`取`slot0/slot1`首批两条resident wave，每条含163,840个MFMA，即1,280个BN32 tile；
+按物理SIMD合并4-cycle issue区间和MFMA后12-cycle shadow，避免两wave重复计费。完整后移两份trace均覆盖
+16个物理SIMD；只后移shuffle control因SE0未解码而使用其余12个SIMD，所有指标均按SIMD/tile归一化。
+
+![ATT resident slot0/slot1主要功能与机器指令](images/attn-late-scale-slot-functions-gfx942.svg)
+
+图中每条横条按共享cycle轴展示一个slot的主要动态功能；紫色段同时包含max/DS归约、EXP、running-sum FMA、
+BF16 pack、future-K load和K LDS write。下方卡片给出各功能段的主要ISA，红框和括号标出决定吞吐的late-scale
+slot1及其扩大后的完成时间差。图由`archive/gemm/render-attn-slot-functions.py`从结构化ATT数据生成。
+
+物理时间线与严格性能方向闭合：
+
+| 指标（cycles/tile） | shuffle inline | shuffle late | 变化 | full inline | full late | 变化 |
+|---|---:|---:|---:|---:|---:|---:|
+| physical wall | 1661.751 | 1653.983 | **-7.767** | 1652.595 | 1666.643 | **+14.049** |
+| issue union | 865.053 | 864.059 | -0.994 | 874.291 | 866.561 | -7.730 |
+| physical no-issue | 796.698 | 789.924 | **-6.774** | 778.304 | 800.082 | **+21.778** |
+| shadow内non-MFMA issue | 187.456 | 188.615 | +1.159 | 190.347 | 183.734 | **-6.613** |
+| shadow内no-issue | 469.889 | 458.122 | -11.767 | 461.945 | 459.602 | -2.343 |
+| shadow外no-issue | 326.809 | 331.802 | +4.993 | 316.359 | 340.480 | **+24.121** |
+
+完整后移候选的issue反而减少，新增wall几乎全部是shadow外no-issue。其阻塞类别增量主要为
+LDS wait `+11.449`、TRANS `+8.260`、scheduler-ready `+6.502`、barrier `+6.193`、MFMA `+3.923`
+和LDS/crosslane `+3.522 cycles/tile`；VALU阻塞反而下降`14.918`。源码归因同样沿整条release链扩散：
+softmax DS归约等待、EXP、V load、GEMM2、barrier和下一K LDS read都增加，而不是集中在inline FMA本身。
+
+最直接的闭环来自两个resident slot：
+
+| 完整后移sum | slot0 duration | slot1 duration | 两slot完成时间差 | 共同活跃区 |
+|---|---:|---:|---:|---:|
+| inline control | 2475.062 | 3305.127 | 830.127 | 2474.999 |
+| late-scale | 2358.382 | 3333.224 | 974.904 | 2358.320 |
+| 变化 | **-116.680** | **+28.097** | +144.777 | -116.679 |
+
+late-scale使单wave平均缩短44.291 cycles/tile，但只加速了原本较快的slot0；决定物理SIMD完成时间的slot1
+反而变慢28.097。两任务共享wall后正好得到`28.097/2 = 14.049 cycles/tile`，即ATT的`+0.85%`，与
+严格配对`-0.83%--0.84%`一致。只后移shuffle组合中slot0/slot1则分别缩短124.975/15.535，故整体小幅转正。
+
+phase扫描解释了slot1为何变慢。late-scale把两个主要softmax间隔phase32/96分别缩短182.339/177.315 cycles，
+但等待转移到下一组GEMM1的progressive K消费点：phase34 `+86.427`、phase42 `+76.205`、phase106
+`+124.341`、phase108 `+43.776`。phase42/106两对MFMA在静态ISA中直接相邻，没有新增FMA；其A操作数
+最近由`ds_read_b128`定义，B操作数是常驻Q。因此增长是K LDS输入未ready/机器调度相位造成的动态等待，
+不是scalar FMA占用issue槽。完整后移的phase37--45与101--109整段分别增加71.998和65.694 cycles；
+只后移shuffle对应第一段减少36.279、第二段增加38.219，基本抵消。
+
+结论：删除packed scale确实缩短单wave softmax链，但在向量running-sum版本中也移除了原本隐藏K LDS延迟的
+时间，且寄存器分配/全局排程让慢resident slot更早撞上progressive K wait。后续若继续该方向，应调整
+`barrier -> K ds_read -> next GEMM1`距离，或把有用的独立工作放入phase34/42/106/108等待窗；不能只继续
+前移/缩短scale+EXP，也不应以NOP恢复距离。默认继续保留base。
+
+## 23. 全部优化思路、决策与最终性能
+
+本节将前文所有主要路线压缩为统一决策表。早期v1--v7数据使用`M=N=8192`，v8--v13阶段数据主要使用
+`M=N=20480`；除表内特别注明外，最终attention数据均使用
+`H=1,M=N=40960,D=128,BM=128,BN=32`。不同shape的绝对TFLOPS不可直接横比。最终A/B使用10套buffer、
+`C-X-X-C`和0.5%相邻control漂移门限；650W功耗墙导致共同slow态时只采用同组时间比，不跨组比较绝对值。
+
+状态含义：**采纳**表示进入对应阶段默认路径；**阶段采纳**表示形成后续方案但已被更新版本取代；
+**仅验证**表示保留为oracle/分析入口而非高层生产codegen；**失败**表示精度或严格性能已否决。
+
+### 23.1 无softmax融合双GEMM主线
+
+| 阶段 | 优化思路与机器变化 | 资源/精度 | 性能 | 决策与关键结论 |
+|---|---|---|---:|---|
+| v1 | `S`经LDS中转，V非合并global读，2个barrier | `rel_l2≈1.3e-4` | 40.3T @8192 | **阶段基线**；窄访存、LDS往返和无流水共同限制 |
+| v2 | register-resident `S`，`K@Q^T` register trick，4-wave M-split | 326V，1 wave/SIMD | 37.6T @8192 | **阶段采纳**；避免S落全局，但VGPR悬崖和同步结构使其暂时更慢 |
+| v3 | fragment错峰复用、BN 128→64 | 202V，2 waves/SIMD | 38.9T @8192 | **阶段采纳**；证明必须先释放VGPR预算 |
+| v4 | GEMM1 K维加入`k_perm`，窄LDS读改128-bit | 196V | 72.1T @8192 | **采纳**；首次关键提速 |
+| path-b | 放弃register trick，S经LDS，让V走128-bit | 196V | 68.8T @8192 | **失败**；S的LDS写读与序列化超过V宽读收益 |
+| v5 | GEMM1 M维也加`perm_M`，S累加器物理布局直接匹配GEMM2 | 200V，`rel_l2≈1.3e-4` | 91.7T @8192 | **阶段采纳**；register trick与K/Q/V全128-bit可以共存 |
+| v6 | V改为协作global→LDS→register | 200V | 90.0T @8192 | **失败**；V直读global更优，额外LDS/barrier抵消合并收益 |
+| v7 | f32→bf16由RNE+NaN序列改为`+0x8000`截断 | 200V，`rel_l2≈1.5e-4` | 97.1T @8192 | **采纳**；热循环每tile约省96条转换VALU |
+| v8 | K/V软件预取，global load与当前计算重叠 | 184V | 163.6T @20480 | **采纳**；真正建立软件流水 |
+| 显式双套寄存器ping-pong | 手工展开并同时保留两组K/V/临时fragment | 234V | 155.3T @20480 | **失败**；live range扩张抵消流水收益 |
+| v9 | K/V LDS加入`swizzle(3,3,3)` | `rel_l2≈1.9e-4` | 168.6T @20480 | **采纳**；消除bank冲突 |
+| v10 | GEMM2转置为`O^T`，输出改64-bit store | 同占用率 | 170.5T @20480 | **采纳**；输出连续化的小幅稳定收益 |
+| v11 | V绕过LDS，paged global直接进入fragment | 去掉V LDS链 | 183.0T @20480 | **采纳**；V无需像广播K一样经LDS |
+| v12 | BN 64→32释放VGPR，再加入K LDS双缓冲 | 190V，2 waves/SIMD | 229.8T @20480 | **采纳**；“先省寄存器，再装流水”的关键范式 |
+| BN64双缓冲等VGPR扫描 | 保持大tile再增加双缓冲 | 265V，降到1 wave/SIMD | 显著回退 | **失败**；跨occupancy阈值比局部流水收益更大 |
+| v13a | `perm_M`从MMA挪到全局K物理布局 | 降低后续峰值VGPR | 197T @20480 | **单独失败、组合采纳**；本身改变读形态，但为K-prefetch腾空间 |
+| v13b | KV循环展开2次，stage变编译期常量 | 中间态 | 194T @20480 | **单独失败、组合采纳**；展开仅为地址和prefetch铺路 |
+| v13c | K LDS读跨迭代prefetch，GEMM1直接消费已就绪fragment | 204V，2 waves，`rel_l2=0.00021` | **235.8T @20480；266.0T @40960** | **最终无softmax采纳**；三步组合缺一不可 |
+
+### 23.2 在线softmax与高层FlyDSL主线
+
+| 阶段/思路 | 实现与机器变化 | 性能/精度 | 状态 | 结论或失败原因 |
+|---|---|---:|---|---|
+| 完整multi-head + flash softmax | 在线`m/l/O`，`exp2`走单`v_exp_f32` | 160--164T；`rel_l2≈0.00311` | **阶段采纳** | softmax将瓶颈从GEMM转为VALU/EXP与长期相位 |
+| LOG2E折进缩放 | `exp(x)`改为`exp2(x*LOG2E)`并合并常量乘 | +6.6%，160.4T @8192 | **采纳** | 删除逐元素额外LOG2E乘 |
+| Q预缩放 | BF16 Q提前乘scale，试图删除循环内F32 MUL | 158.5T；`rel_l2=0.00358` | **失败** | BF16量化超精度门限且原MUL已有部分隐藏 |
+| 条件correction/O-rescale | 仅rebase lane执行correction和O缩放 | +5.2%阶段收益 | **阶段采纳** | 降低常见路径工作，但分支/exec-mask仍有成本 |
+| lazy rebase `Δ=8` | 只有`tmax > m+8`时更新reference | 166.9T @8192；181.2T @40960 | **采纳** | 大幅减少常见路径O-rescale；边界输入均finite |
+| 精确two-pass | 先求全局max，再重算QK与PV | 93.0T | **失败** | 重复MFMA、K访存和流水远大于省下的状态维护 |
+| BN64/两套PV等pipeline | 更大BN或并行两套GEMM2 | 128T / 161.2T | **失败** | VGPR、重复工作和占用率抵消收益 |
+| PMC/ATT co-issue建模 | 自定义MFMA busy-window与VALU/EXP overlap | VALU覆盖MFMA busy约13.29% | **分析采纳** | 目标应是有效重叠，不是单纯减少静态指令 |
+| scheduler hint、sleep、局部priority | 强制VMEM/MFMA/VALU分组或错相 | 150.7--165.1T | **失败** | 破坏原VMEM/LDS/MFMA交错，不能跨越真实依赖 |
+| GEMM1按两个mt拆分 | 显式保留两条独立query-row accumulator链 | 166.7T @8192；183.1T @40960 | **采纳** | dependency wait小幅下降，长序列收益更明显 |
+| 直接scalarize running-sum MUL | opaque inline `v_mul_f32`替代packed MUL | 162.7T | **失败** | inline阻碍全局重排，收益小于调度损失 |
+| running-sum标准FMA | `l_out=fma(l_in,corr,ts)`，消除目标packed MUL | **170.6T @8192**；`rel_l2=0.00316` | **采纳** | scalar FMA可进入MFMA窗口，且不引入opaque屏障 |
+| Q预缩放、vector packed FMA、延后scale、BF16截断 | 局部减指令或缩短链 | 161.7T、158.9T或精度失败 | **失败** | packed指令、依赖迁移或舍入误差否决 |
+| softmax(mt0)细粒度穿插 | 在GEMM1(mt1)/GEMM2(mt0)内插max/EXP | 157.2--157.9T | **失败** | 扩live range、打断MFMA accumulator ILP |
+| 8-wave双pipeline | 两组4-wave显式错相 | 150.5T | **失败** | gfx942缺少低成本子组barrier，dependency wait上升 |
+| JIT调度移植到高层Fly | K写中置、半量BF16转换、长序列scheduler | **194.4--194.7T @40960**；240V | **最终高层Fly采纳** | 高层codegen当前稳定主路径 |
+| shape分派 | `N<32768`恢复短序列旧scheduler/整片转换 | 170.6--170.7T @8192 | **采纳** | 长序列相位优化不能机械用于短shape |
+
+### 23.3 PyHIP JIT、最终ISA与inline主线
+
+| 阶段/思路 | 机器变化 | 性能/精度 | 状态 | 决策依据 |
+|---|---|---:|---|---|
+| PyHIP JIT精确双窗口交织 | 精确控制MFMA/VMEM/DS/VALU顺序 | 171.7T早期里程碑 | **阶段采纳** | 证明机器级调度可超过高层路径 |
+| prepare/center/finish窗口重配 + K写入DS等待窗 | 保持MFMA数与资源，仅移动独立工作 | 188.1→**194.5T** | **采纳** | 减少物理no-issue而不扩live range |
+| 三路DS fanout | max/sum两级串行wait改为三路fanout一次wait | **200.3T** | **采纳** | physical no-issue显著下降 |
+| 半量BF16 pack填sum等待窗 | 只前移一半pack | **203.1--203.3T** | **采纳** | 第二半继续前移会过量填窗并回退到199T |
+| e32常量 + rolling byte offset | 缩短编码并改变循环长期相位 | **205.3--205.5T** | **采纳** | 156V+64A，仍2 waves、零spill |
+| next-K LDS读进GEMM2 shadow + max覆盖VMEM wait | `MFMA→DSRD→MFMA`，max置于`vmcnt(10/2)`间 | **206.4--206.5T** | **采纳** | 同时减少LDS与VMEM暴露 |
+| 两MFMA间3 ALU+1 EXP | 局部`MFMA→3 ALU→MFMA→EXP` | **207.9--208.3T** | **采纳** | 微基准与kernel均证明局部bundle有效 |
+| 全局复制6组bundle | 机械扩大同一排法 | 200.7--201.0T | **失败** | 改坏probability EXP与resident-wave相位 |
+| GEMM1区整体pipeline填窗 | K写地址XOR、V offset滚动等选中改动 | **208.6--208.8T** | **JIT production采纳** | 默认`production`入口与208.8T归档 |
+| 理论wavefront重排 | 按零延迟DAG追求更高静态重叠 | 最快204.1T | **失败** | 静态合法不等于物理ready；等待与双wave相位恶化 |
+| 四阶段多次`setprio` | 多窗口priority切换 | 先有收益但不稳定/回退 | **失败** | 切换成本和不连续高优先级窗口破坏流水 |
+| 单次连续priority窗口 | GEMM1 mt0第8条后升权，跨两次softmax，到GEMM2 mt0末尾降权 | **3623.5us / 237.1T**；156V+64A；`rel_l2=0.00318646` | **当前最佳JIT，独立入口采纳** | 8卡40/40冷态配对约+11.11%，长期resident-wave反相成立 |
+| A/V寄存器同ISA消融 | `156V+64A`机械重命名为`220V+0A`，顺序不变 | 236.56T vs 236.56T | **验证采纳** | 总压力与occupancy不变时，A/V类别本身无性能差异 |
+| JIT ISA oracle（all-V, Fly ABI） | 指针offset改为Fly 164-byte ABI，热循环不变 | **3630.9us / 236.6T** | **仅验证** | 目标机器序列，不是FlyDSL codegen |
+| strict Fly post-ISA | 删除8条identity max、移动12条pack、插绝对priority 16/96 | **205.2T**，相对194.6T +5.42% | **严格Fly阶段采纳** | 只变换当前Fly输出，形态漂移即失败 |
+| raw/formal p0局部交织 | 接管scale/max/DS/SUB/EXP，含对称pair版本 | 相对205T -5.18%至-9.67% | **失败** | shadow外空洞和双wave长团重叠增加 |
+| wait/fanout/priority/链旋转微消融 | 删wait、max fanout、移动priority、旋转RAW链 | 0至-7.73% | **失败** | wait数量和局部链长同时塑造长期相位，不能机械减少 |
+| Fly源码级局部inline asm | max、pack、priority、2+16 MFMA块 | 最好仍-5.30%，其余-4.31%至-10.88% | **失败** | opaque SSA边界改变LLVM寄存器分配与全局排程 |
+| 完整JIT主流程inline | Fly仅负责ABI/base offset/launch，单asm覆盖prologue/pair-loop/epilogue | **3633.1us / 236.4T**；220V/34S/0A | **仅验证** | 与oracle时间比1.00025；证明大边界可保JIT节奏，但非高层Fly |
+
+### 23.4 sum归约、packed指令与late-scale专项消融
+
+| 方案 | 最终ISA/资源 | 严格性能 | 状态 | 根因 |
+|---|---|---:|---|---|
+| 高层base | 240V；5 `v_pk_add`、112 `v_pk_mul`、10 scalar FMA | 194.1--194.6T | **默认保留** | 当前高层Fly稳定基线 |
+| 只后移跨lane shuffle | 254V；新增2 `v_pk_fma` | 181.7--182.0T，-6.43% | **失败** | packed FMA位于MFMA关键区且全局排程改变 |
+| 只后移shuffle + scalar inline FMA | 232V；目标`v_pk_fma/add`清零 | 189.5--189.7T；相对packed版+4.16% | **失败但保留实验入口** | 消除packed阻塞仍比base慢2.54% |
+| 完整后移sum | 268V；125 `v_pk_mul`、10 `v_pk_add` | 143.0--143.6T，-26.33% | **失败** | packed算术增加且跨256阈值，降为1 wave/SIMD |
+| 完整后移sum + 逐元素inline FMA | 246V；目标packed恢复到base数量，38 scalar FMA | 191.1T；相对packed版+33.02% | **失败但保留实验入口** | 恢复2 waves仍比base慢1.96% |
+| shuffle-inline late-scale | 删除16 packed scale+32 SUB，新增36 scalar FMA；234V | 189.8--190.1T；相对control **+0.29--0.30%** | **局部有效，不设默认** | 两个resident slot都缩短，但仍比base慢2.24% |
+| full-inline late-scale | 同指令替换；248V | 189.4T fast态；相对control **-0.83--0.84%** | **失败** | ATT显示slot0快116.7，但慢slot1慢28.1；shadow外no-issue +24.1 cycles/tile，K LDS延迟在phase34/42/106/108暴露 |
+
+### 23.5 专项失败、中性结果与待验证索引
+
+下表补齐没有形成独立里程碑、但已经影响后续决策的专项消融。除“待验证”外，失败探针均已从默认kernel清理。
+
+| 专项思路 | 结果/性能 | 状态 | 可复用结论 |
+|---|---:|---|---|
+| V跨tile寄存器双缓冲 | 154V+96A仍2 waves、零spill；196.9--197.0T | **失败** | occupancy不变也不代表live range和VMEM相位无成本 |
+| DPP `wave_rol:1`列归约 | 384 rotate + 392 hazard NOP；114.6T | **失败** | gfx942缺少一次rotate16/32，DS fanout更合适 |
+| 三次`wave_shr`+`readlane` | lane20得到104而期望304；广播后全wave为315 | **精度失败** | 相邻lane窗口不等于`q/q+16/q+32/q+48`列布局 |
+| lane内max/sum平衡树 | max稳定回退；sum落在噪声内 | **失败/中性** | 更短依赖树未必改善跨lane和resident-wave调度 |
+| 两个probability n-block全部提前pack | 199.1--199.2T | **失败** | 24条/tile超过DS等待窗，延迟wait后的sum/FMA |
+| 一个n-block提前pack | 203.1--203.3T | **采纳** | 12条/tile基本填满可用DS窗口 |
+| correction寄存器别名 | 152V但202.7--202.9T | **失败** | 少4条move/少VGPR不等于更短物理关键路径 |
+| pack跨MFMA拆分、提前round-add、8-byte对齐 | 202.2--202.8T | **失败** | 编码或局部邻接优化会破坏已建立的填窗相位 |
+| V load批量前压2/4条 | 201.9T / 195.7T | **失败** | 缩短VMEM成熟距离并增加队列竞争 |
+| SGPR stride/循环上界缩码 | 204.4--204.6T | **失败** | 机器码更小不是吞吐充分条件 |
+| `J.emit(center)`预算10→11 | 169.1T | **失败** | 预算11会完整取第三条5-cycle FMA并挤占下一MFMA |
+| 全局6组`MFMA→3ALU→MFMA→EXP` | 200.7--201.0T | **失败** | 微基准局部最优不能机械复制到全循环 |
+| 第二个局部ALU/EXP pair | 206.3T | **失败** | 提前p0 EXP破坏后续probability EXP相位 |
+| V load中置/lookahead | 回退约0.6--1.2T | **失败** | V到GEMM2的成熟距离变短 |
+| future-K进一步提前 | 203--204.6T | **失败** | VMEM队列压力和请求年龄顺序恶化 |
+| threshold/max预计算填GEMM1空窗 | 206.2T或中性 | **失败/中性** | 增加VGPR或读取未完成n-block，不是真正独立工作 |
+| 四个offset全部滚动 | 无稳定收益 | **中性** | 只保留与K地址XOR协同的V-offset滚动 |
+| GEMM1 split-K双accumulator | 约203T，+8V到+16V/+8到+16 ADD | **失败** | 缩短RAW链的代价超过收益 |
+| 完整/半n-block wavefront | 198.3--204.1T，最快仍-1.80% | **失败** | 真实release链包含EXP/sum/pack/rescale及live range，不是零延迟DAG |
+| 半wavefront功耗态复测 | fast +0.76%，全体-0.23%，slow -0.29% | **失败** | 650W DPM双态下必须用紧邻control，局部正样本不够采纳 |
+| 粗四阶段setprio | -15.57%；去priority后-21.16% | **失败但证明机制有效** | priority自身约+6.47%，主损失来自粗阶段切分 |
+| 15种fine priority mask | 最佳`0x7`仍-1.23%，全开-9.28% | **失败** | 多次切换与最后K-read区提权破坏互补工作 |
+| `start=3,end=15`早期+1.06% | 收紧control漂移到0.5%后-0.03% | **假阳性** | DPM切换必须用`C-X-X-C`和严格漂移门限 |
+| 单次连续priority窗口`7→15` | 237.1T | **采纳** | 减少切换并维持跨softmax的长期反相 |
+| Fly JIT式长priority窗口 | 194.2→182.3T，-6.14% | **失败** | 边界不能脱离JIT精确机器顺序移植 |
+| Fly mt分片、wait 49→41 | 226V但184.2T，-5.4% | **失败** | wait/VGPR下降未改变occupancy，且长期相位更差 |
+| raw/formal p0接管 | 相对205T -5.18%至-9.67% | **失败** | 单边搬迁增加shadow外空洞和双wave长团重叠 |
+| 对称pair p0接管 | -6.91%；shadow内no-issue下降但shadow外+114.829 cycles/tile | **失败** | 对称局部链仍未处理完整release/backedge |
+| priority终点96→104 | -4.57% | **失败** | priority窗口长度与resident-wave相位高度耦合 |
+| 独立M16/M17交换 | +0.023% | **中性** | 提前一条MFMA释放不足以改变墙钟 |
+| 回边GEMM2 RAW链旋转 | -0.29% | **失败** | 单条chain重排不能改善全局ready关系 |
+| strict Fly max-only三路fanout | 240V→244V，-7.73% | **失败** | 减wait同时改变寄存器和双wave相位 |
+| GEMM1 K wait压缩6条 | -0.42% | **失败** | 数值冗余wait仍参与塑造物理调度相位 |
+| 局部inline max/pack/priority | -4.31%至-10.88% | **失败** | opaque inline改变SSA、寄存器分配和LLVM全局调度 |
+| 完整JIT body inline | 236.4T，与oracle时间比1.00025 | **仅验证** | 足够大边界可保机器节奏，但不是高层Fly原生codegen |
+| softmax1 prepare预执行31/35/43 cycles | 小shape精度/资源通过，未完成空闲GPU严格A/B | **待验证** | 只在能保持DS fanout、threshold和K写成熟距离时继续 |
+| persistent grid（有尾批shape） | 40960的320 WG整除80 CU，无尾批收益点 | **待验证** | 只应在实际尾批shape评估 |
+| xor32地址复用 | 尚未独立严格A/B | **待验证** | 不与已回退的raw-FMA/max-fanout混合判断 |
+
+### 23.6 最终性能快照（更新至2026-07-30）
+
+| 路径/入口 | shape与口径 | 时间 | TFLOPS | 资源 | 精度 | 最终定位 |
+|---|---|---:|---:|---|---:|---|
+| Fly无softmax默认 | `SOFTMAX=0,H=1,M=N=40960` | 约3230us | **265.2--266.0T** | 204V，2 waves | `rel_l2≈0.00021--0.00023` | 无softmax最终高层基线；266.0T为当前最佳复测 |
+| Fly高层softmax默认 | `SOFTMAX=1,H=1,M=N=40960` | 约4415--4425us | **194.4--194.7T** | 240V，2 waves | `rel_l2≈0.00319` | 当前真正高层FlyDSL默认路径 |
+| Fly strict post-ISA | 当前Fly ISA的严格三变换 | 约4185us | **205.2T** | 2 waves，零spill | `rel_l2≈0.00319` | 当前严格来源于Fly的阶段终态 |
+| PyHIP JIT production | `ATTN_JIT_KERNEL=production` | 约4115us | **208.6--208.8T** | 156V+64A | `rel_l2≈0.00319` | 默认生产JIT入口 |
+| PyHIP JIT setprio_best | `ATTN_JIT_KERNEL=setprio_best` | **3623.5us** | **237.1T** | 156V+64A，2 waves | `rel_l2=0.00318646` | 当前最高性能、独立入口 |
+| all-V同ISA | setprio归档机械重命名 | 3631.1us | **236.56T** | 220V+0A | 与原ISA逐元素相同 | 证明A/V类别不是差距根因 |
+| JIT ISA oracle（Fly ABI） | `ATTN_FLY_BACKEND=jit_isa_oracle` | 3630.9us | **236.6T** | 220V/34S，164-byte ABI | `rel_l2≈0.00319` | 静态目标机器序列，仅验证 |
+| 完整JIT主流程inline | `ATTN_FLY_BACKEND=jit_body_inline` | 3633.1us | **236.4T** | 220V/34S/0A | `rel_l2≈0.00319` | Fly外壳+JIT body，仅验证 |
+| shuffle-inline late-scale | `ATTN_FLY_SUM_REDUCE=defer_shuffle_inline_late_scale` | 约4525us | **约189.8--190.1T** | 234V | `rel_l2≈0.00319` | 相对自身control小幅转正，仍不替代base |
+| full-inline late-scale | `ATTN_FLY_SUM_REDUCE=defer_all_inline_late_scale` | 约4535us（fast态） | **约189.4T** | 248V | `rel_l2≈0.00319` | ATT闭合回退，否决 |
+
+最终结论：高层FlyDSL当前稳定在约194.6T，严格Fly最终ISA后处理达到205.2T；生产JIT为208.8T，
+单窗口`setprio_best`达到237.1T。JIT oracle与完整body inline都约236T，证明差距来自高层Fly生成的机器调度，
+不是Fly ABI、A/V寄存器类别或launch外壳。后续原生Fly优化必须同时缩短单wave依赖并保持两resident slot平衡，
+以ATT中的physical wall和shadow外no-issue为验收指标；仅减少静态指令、wait数量或局部长团长度不足以判定收益。
 
 
 
