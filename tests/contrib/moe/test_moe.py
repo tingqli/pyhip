@@ -382,6 +382,18 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
             from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
+            from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
+
+            def flydsl_quant_fp8_per_tensor(x, quant_dtype):
+                amax = torch.empty(1, dtype=torch.float32, device=x.device)
+                xq = torch.empty_like(x, dtype=quant_dtype)
+                flydsl_absmax()(x, amax)
+                flydsl_quant_per_tensor(quant_dtype)(x, amax, xq)
+                fmax = torch.finfo(quant_dtype).max
+                xs = amax / fmax
+                xs = xs.reshape(1).to(torch.float32)
+                return xq, xs
+
             import flydsl.expr as fx
             import flydsl.compiler as flyc
             _TORCH_TO_FX = {
@@ -401,13 +413,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
             else:
                 weight_dtype = 'fp8'
                 compile_quant_type = quant_type
-                # activation quant type for native-fp8 prefill: env-switchable (default ptpc).
-                # weight ptpc requires act ptpc; weight per_tensor allows ptpc or per_tensor.
-                compile_act_quant_type = (
-                    'ptpc'
-                    if quant_type == 'ptpc'
-                    else os.environ.get("ACT_QUANT_TYPE", "ptpc")
-                )
+                compile_act_quant_type = quant_type
             if B == 1:
                 grid = topk_ids.numel()
                 w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
@@ -446,6 +452,16 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     None,
                     0,
                 )
+                if 0:
+                    _num_valid_tokens = num_valid_ids[0].cpu().item()
+                    _num_actual_tokens = B * TOPK
+                    print(f'num_valid_tokens={_num_valid_tokens}, num_actual_tokens={_num_actual_tokens}, num_experts={E}, K1={K1}, N1={N1}, K2={K2}, N2={N2}')
+                    g1u1_flops = _num_valid_tokens * K1 * N1 * 2
+                    down_flops = _num_valid_tokens * K2 * N2 * 2
+                    print(K1, N1, K2, N2)
+                    print(g1u1_flops)
+                    print(down_flops)
+                    assert 0
                 grid = sorted_expert_ids.shape[0]
                 w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                 # gateup: 'prefill_1x4' (4-wave tiled MMA along N, no reduce) for B>32 when the
@@ -474,11 +490,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     else:
                         gateup_in = hidden_states
                         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+
                     _fly_dispatch(
                         g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
                         (_ptr(gateup_in), _ptr(w1), _ptr(gemm1_out),
-                         _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
-                         _ptr(w1_scale_arg), _ptr(a_scale), B, grid, stream),
+                        _ptr(sorted_ids), _ptr(sorted_weights), _ptr(sorted_expert_ids), _ptr(num_valid_ids),
+                        _ptr(w1_scale_arg), _ptr(a_scale), B, grid, stream),
                     )
                 else:
                     _fly_dispatch(
@@ -867,8 +884,12 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64
         perf_prec = {}
         org_INTER_SIZE = INTER_SIZE
 
-        if (weight_type == torch.float8_e4m3fn or weight_type == torch.float8_e4m3fnuz) and INTER_SIZE // TP % 128 != 0:
-            INTER_SIZE = div_up(INTER_SIZE // TP, 128) * 128 * TP
+        if (weight_type == torch.float8_e4m3fn or weight_type == torch.float8_e4m3fnuz):
+            if (kernel_type == 'aiter'):
+                INTER_SIZE = div_up(INTER_SIZE // TP, 128) * 128 * TP # aiter asm kernel requires 128-aligned inter_dim
+            else:
+                INTER_SIZE = div_up(INTER_SIZE // TP, 64) * 64 * TP # we only requires 64-aligned
+
         if kernel_type == 'aiter' and weight_type == torch.float4_e2m1fn_x2 and INTER_SIZE // TP % 128 != 0:
             INTER_SIZE = div_up(INTER_SIZE // TP, 128) * 128 * TP
         for i in batch:
@@ -1064,8 +1085,8 @@ if __name__ == '__main__':
         "HIDDEN_SIZE":4096,
         "INTER_SIZE":192*8,
         "TP":8,
-        "E":64,
-        "TOPK":8,
+        "E":193,
+        "TOPK":9,
         "run_count":10,
         "quant_type":'per_tensor'
     }
@@ -1096,13 +1117,21 @@ if __name__ == '__main__':
         "run_count":10,
         "quant_type":'ptpc'
     }    
-    #model_args = hy3_args
-    model_args = qwen35_35B_args
-    batch = [16384]
+    model_args = hy3_args
+    #model_args = qwen35_35B_args
+    batch = [8192, 8192*2, 8192*4, 8192*8, 8192*16]
+    batch = [8192*8]
     prec = [get_fp8type()]
     #prec = [torch.bfloat16]
-    entry_common('aiter', batch, prec, **tile_mn, **model_args)
-    entry_common('fly_splitk_2s', batch, prec, **tile_mn, **model_args)
+
+    for b in [8192, 8192*2, 8192*4, 8192*8, 8192*16]:
+        batch = [b]
+        print(f"================== {b}")
+        with torchPerf(30):
+            torch.cuda.empty_cache() 
+            entry_common('aiter', batch, prec, **tile_mn, **model_args)
+            torch.cuda.empty_cache() 
+            entry_common('fly_splitk_2s', batch, prec, **tile_mn, **model_args)
 
     #batch = 131072 # accuracy issue
     #test_acc_fly_splitk_2s(batch=[batch], prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
