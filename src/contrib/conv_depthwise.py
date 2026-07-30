@@ -14,6 +14,13 @@ _DEPTHWISE_HIP_KERNELS = {
     "original": "conv_depthwise3d_hip.cpp",
 }
 
+_PACKED_DOT_FP16_ARCHS = frozenset({"gfx942", "gfx950"})
+_PACKED_DOT_BF16_ARCHS = frozenset({"gfx950"})
+
+
+def _dtype_name(dtype):
+    return str(dtype).removeprefix("torch.")
+
 
 def _packed_dot_shape_supported(KD, KH, KW, H_out, W_out, padding):
     return (
@@ -26,10 +33,11 @@ def _packed_dot_shape_supported(KD, KH, KW, H_out, W_out, padding):
 
 def _packed_dot_arch_supported(dtype):
     arch = amdgpu_arch().split(":", 1)[0]
-    if arch == "gfx950":
-        return True
-    if arch == "gfx942":
-        return str(dtype) == "torch.float16"
+    dtype_name = _dtype_name(dtype)
+    if dtype_name == "float16":
+        return arch in _PACKED_DOT_FP16_ARCHS
+    if dtype_name == "bfloat16":
+        return arch in _PACKED_DOT_BF16_ARCHS
     return False
 
 
@@ -53,8 +61,14 @@ def _resolve_hip_impl(hip_impl, KD, KH, KW, H_out, W_out, padding, dtype):
             )
         if not _packed_dot_arch_supported(dtype):
             arch = amdgpu_arch().split(":", 1)[0]
+            dtype_name = _dtype_name(dtype)
+            if dtype_name == "bfloat16":
+                raise ValueError(
+                    f"packed depthwise Conv3D BF16 is not supported on {arch}; "
+                    "use hip_impl='sgb' or 'auto'"
+                )
             raise ValueError(
-                f"packed depthwise Conv3D BF16 is not supported on {arch}; "
+                f"packed depthwise Conv3D is not supported on {arch} for dtype {dtype_name}; "
                 "use hip_impl='sgb' or 'auto'"
             )
     return hip_impl

@@ -240,7 +240,7 @@ if __name__ == "__main__":
     parser.add_argument("--depthwise-hip", type=str, default="auto",
                         choices=["auto", "packed", "sgb", "original"],
                         help="case3 HIP backend; auto selects packed on gfx950/gfx942 FP16, sgb on gfx942 BF16")
-    parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"],
+    parser.add_argument("--dtype", type=str, default="fp16", choices=["bf16", "fp16"],
                         help="input, weight, bias, and output data type")
     args = parser.parse_args()
     

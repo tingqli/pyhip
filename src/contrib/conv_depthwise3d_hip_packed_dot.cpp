@@ -1,10 +1,15 @@
 /*
- * FP16/BF16 packed-dot depthwise Conv3D for PyHIP on gfx950.
+ * FP16/BF16 packed-dot depthwise Conv3D for PyHIP.
+ *
+ * gfx950 (CDNA4): FP16 via __builtin_amdgcn_fdot2 and BF16 via
+ * __builtin_amdgcn_fdot2_f32_bf16 (dot12-insts).
+ * gfx942 (CDNA3): FP16 via __builtin_amdgcn_fdot2 only; BF16 is routed to the
+ * SGB kernel by conv_depthwise.py because dot12-insts is unavailable.
  *
  * IO_DTYPE must be __half or __hip_bfloat16. The kernel shares its packed
  * weights, LDS staging, 16-output tile, and FP32 accumulators across both data
- * types, while dot2_acc selects the matching gfx950 dot-product instruction at
- * compile time.
+ * types, while dot2_acc selects the matching dot-product builtin at compile
+ * time.
  *
  * This is intentionally a separate implementation. The previous SGB and
  * original kernels remain available for comparison and fallback.
