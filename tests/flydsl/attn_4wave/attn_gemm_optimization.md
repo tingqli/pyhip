@@ -1,5 +1,10 @@
 # 融合 Attention 双 GEMM 优化记录(FlyDSL, bf16, gfx942/MI3xx)
 
+> **ARCHIVED / 只读归档（2026-07-30）**
+>
+> 本文保留早期逐步实验细节，不再追加新结果。统一决策表、当前219T实现以及以后所有新优化和性能记录，迁移到
+> [`attn_gemm_optimization_current.md`](attn_gemm_optimization_current.md)。
+
 对应脚本:[`test_attn_gemm.py`](../test_attn_gemm.py)
 
 ## 1. 问题定义

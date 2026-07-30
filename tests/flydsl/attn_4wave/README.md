@@ -1,20 +1,18 @@
 # 4-Wave Attention Bundle
 
-本目录集中保存 `test_attn_gemm.py` 的 4-wave attention 优化闭包，主运行入口仍为上一级的 [`test_attn_gemm.py`](../test_attn_gemm.py)。
+本目录集中保存 `test_attn_gemm.py` 的 4-wave attention 优化闭包。当前唯一运行入口是上一级的 [`test_attn_gemm.py`](../test_attn_gemm.py)，只保留219T旋转反相流水。
+
+当前及以后所有优化记录统一写入 [`attn_gemm_optimization_current.md`](attn_gemm_optimization_current.md)。
 
 ## 内容
 
-- `attn_gemm_inline_kv.py`：Fly外壳与完整JIT主体inline实验。
-- `fly_isa_priority.py`：严格attention ISA变换、静态HSACO构建与加载。
-- `test_attn_gemm_jit.py`：PyHIP JIT production及`setprio_best`实现。
-- `test_*.py`：inline、ISA变换和DPP归约回归测试。
-- `isa/`：受SHA保护的gfx942归档ISA。
-- `tools/`：ATT账本、共发分析和SVG渲染工具。
-- `data/`：结构化性能、ISA和ATT分析结果。
+- `attn_gemm_optimization_current.md`：当前维护的完整决策表、219T实现和增量实验日志。
+- `attn_gemm_optimization.md`：早期逐步优化长文，已归档，只读。
+- `attn_gemm_inline_kv.py`、`fly_isa_priority.py`、`test_attn_gemm_jit.py`：历史JIT/ISA实验资料，不再由当前入口导入。
+- `test_*.py`、`isa/`、`tools/`、`data/`：历史回归、归档ISA及分析产物，用于追溯旧结论。
 - `images/`：cycle-axis和resident-slot图。
-- `attn_gemm_optimization.md`：完整优化记录、采纳/失败路线和最终性能表。
 - `mfma-valu-coissue.md`：MFMA/VALU/EXP共发微基准说明。
-- `TODO.md`：该优化主线的完成项与后续工作。
+- `TODO.md`：历史任务记录；新工作以当前优化总表为准。
 
 ## 验证
 
@@ -24,7 +22,7 @@ python3 -m pytest \
   attn_4wave/test_fly_isa_priority.py \
   attn_4wave/test_attn_gemm_inline_kv.py -q
 
-HIP_VISIBLE_DEVICES=0 H=1 MULT=16 SOFTMAX=1 \
+HIP_VISIBLE_DEVICES=0 H=1 MULT=16 \
   FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 test_attn_gemm.py
 ```
 
