@@ -1,4 +1,4 @@
-"""219T旋转反相 fused-attention kernel 的精度与性能测试。
+"""222T旋转反相 fused-attention kernel 的精度与性能测试。
 
 GEMM1计算S^T=K@Q^T，online softmax就地生成P^T，GEMM2计算O^T=V^T@P^T。K走LDS
 ping-pong，V从paged global直接进入fragment。stage0执行K global预取与softmax；stage1执行K LDS
@@ -168,7 +168,7 @@ def build(
     BN,
     H=1,
 ):
-    """构造219T旋转反相 MHA kernel(flash softmax + multi-head)。
+    """构造222T旋转反相 MHA kernel(flash softmax + multi-head)。
 
     stage0执行K global预取与softmax；stage1执行K LDS写读、GEMM2和下一次V预取/GEMM1。
     H: head 数(multi-head,grid.y=head)。
@@ -328,11 +328,25 @@ def build(
         WARP = NT // WAVES  # 64
         n_dsrd = BN * D // (WARP * VECN)  # K LDS 读(frag_K,每 wave 读 [BN,D],128-bit)
 
-        def hot_loop_scheduler(is_first_gemm):
+        def hot_loop_scheduler(is_first_gemm, stagger_v_loads=False):
             if is_first_gemm:
-                for _ in range_constexpr(8):
+                # 第二静态 substep 在第 5/6 条 V load 处有 VMEM 队列背压，保持总 MFMA 配额为 24。
+                if stagger_v_loads:
+                    for _ in range_constexpr(3):
+                        rocdl.sched_vmem(1)
+                        rocdl.sched_mfma(3)
+                    for _ in range_constexpr(2):
+                        rocdl.sched_vmem(1)
+                        rocdl.sched_mfma(4)
                     rocdl.sched_vmem(1)
                     rocdl.sched_mfma(3)
+                    for _ in range_constexpr(2):
+                        rocdl.sched_vmem(1)
+                        rocdl.sched_mfma(2)
+                else:
+                    for _ in range_constexpr(8):
+                        rocdl.sched_vmem(1)
+                        rocdl.sched_mfma(3)
 
                 rocdl.sched_vmem(100)
                 rocdl.sched_mfma(100)
@@ -365,14 +379,14 @@ def build(
 
         # 展开 2 次:偶/奇两步 LDS stage(wr)变编译期常量,消掉 kv%2;fragment 全部复用
         # K 读做成 prefetch:frag_K 在上一步 GEMM2 之后就读好,GEMM1 直接用(藏 LDS 读延迟)
-        def kv_step(kv_i, wr, ld_cur, ld_next, m0, m1, l0, l1):
+        def kv_step(kv_i, wr, ld_cur, ld_next, m0, m1, l0, l1, stagger_v_loads):
             # V 直读 paged global -> frag_V
             fx.copy(cp_vg, tcV.partition_S(v_g[None, None, kv_i]), tcV.retile(frag_V))
             # Split GEMM1 by its two independent query-row accumulator groups.
             frag_St.fill(0)
             for mt in range_constexpr(2):
                 gemm1_mt(mt)
-            hot_loop_scheduler(True)
+            hot_loop_scheduler(True, stagger_v_loads)
             # stage1 到 V(i)+GEMM1(i) 结束；stage0 从 K(i+2) global 预取开始。
             rocdl.sched_barrier(0)
             rocdl.s_setprio(0)
@@ -455,9 +469,11 @@ def build(
             frag_K.store(state[2])
             m0, m1, l0, l1 = state[3], state[4], state[5], state[6]
             kv0 = fx.Int32(kv) * 2
-            m0, m1, l0, l1 = kv_step(kv0, 1, frag_ldK, frag_ldK_next, m0, m1, l0, l1)
             m0, m1, l0, l1 = kv_step(
-                kv0 + 1, 0, frag_ldK_next, frag_ldK, m0, m1, l0, l1
+                kv0, 1, frag_ldK, frag_ldK_next, m0, m1, l0, l1, False
+            )
+            m0, m1, l0, l1 = kv_step(
+                kv0 + 1, 0, frag_ldK_next, frag_ldK, m0, m1, l0, l1, True
             )
 
             stage_results = yield [
@@ -519,7 +535,7 @@ def main():
     torch.manual_seed(0)
     torch.set_default_device("cuda")
 
-    # 219T旋转反相MHA；H/MULT仅控制问题尺寸。
+    # 222T旋转反相MHA；H/MULT仅控制问题尺寸。
     H = int(os.environ.get("H", "8"))
     BM, BN = 128, 32
     mult = int(os.environ.get("MULT", "16"))

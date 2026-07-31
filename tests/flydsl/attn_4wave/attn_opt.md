@@ -41,7 +41,7 @@ FLYDSL_RUNTIME_ENABLE_CACHE=0 \
 python3 -B tests/flydsl/test_attn_gemm.py
 ```
 
-当前gfx942空闲卡复现约`3907--3912 us / 219.7--219.9 TFLOPS`，`rel_l2≈0.00319`。
+当前gfx942空闲卡复现约`3869--3882 us / 221.3--222.1 TFLOPS`，`rel_l2≈0.00319`。
 
 ### PyHIP JIT
 
@@ -117,7 +117,7 @@ H=1, M=N=40960, D=128, BM=128, BN=32, bf16
 
 状态定义：
 
-- **当前采纳**：保留在当前219T源码路径。
+- **当前采纳**：保留在当前222T源码路径。
 - **历史采纳**：曾进入对应阶段主线，后被更优版本取代。
 - **仅验证**：作为机器码oracle或机制证据，不是当前高层实现。
 - **失败**：精度、资源或严格性能已否决。
@@ -276,13 +276,13 @@ H=1, M=N=40960, D=128, BM=128, BN=32, bf16
 | persistent grid（有尾批shape） | 40960的320 WG整除80 CU | 历史待验证，入口已删 | 只应在实际尾批shape评估 |
 | xor32地址复用 | 未独立严格A/B | 历史待验证，入口已删 | 不与已回退的raw-FMA/max-fanout混合判断 |
 
-## 6. 最新219T旋转反相流水（当前唯一实现）
+## 6. 最新222T旋转反相流水（当前唯一实现）
 
 ### 6.1 数据流与阶段边界
 
 当前源码复用原有`kv_step()`的7项loop state，不跨回边携带`frag_V`。每个静态偶/奇substep：
 
-1. **stage1续段**：读取`V(i)`，8条global load与`GEMM1(i)`的32条MFMA交织；
+1. **stage1续段**：读取`V(i)`，8条global load与`GEMM1(i)`的32条MFMA交织；第一个静态substep使用统一`3×MFMA/load`，第二个substep使用`3,3,3,4,4,3,2,2`消除第5/6条load附近的VMEM队列背压；
 2. `s_setprio(0)`，结束stage1；
 3. **stage0**：global预取`K(i+2)`，执行lazy softmax、running-sum和O correction；
 4. probability转BF16；`s_setprio(2)`结束stage0；
@@ -299,7 +299,8 @@ H=1, M=N=40960, D=128, BM=128, BN=32, bf16
 | 专用stage helper，跨回边携带V | 288V | 139.0T | 失败；V live range过长，1 wave/SIMD |
 | 旋转到原`kv_step`，原生逐元素vector FMA | 260V | 约139T | 失败；越过2-wave门槛 |
 | 同一旋转流水，priority=0 | 268V | 140.5T | 失败；无反相且寄存器更高 |
-| 旋转到原`kv_step`，inline vector FMA | 244V | 219T级 | **当前采纳** |
+| 旋转到原`kv_step`，inline vector FMA | 244V | 219T级 | 历史采纳；建立当前数据流和反相边界 |
+| 第二substep相位感知V-load配额 | 244V | 221.3--222.1T | **当前采纳；纯机器调度重排** |
 
 ### 6.3 正确性、资源与性能
 
@@ -316,7 +317,7 @@ static s_setprio = 6
 
 128条静态MFMA是完整计算：runtime loop body有两个静态substep，每个substep包含32条GEMM1和32条GEMM2。
 
-最终24组`C-X-X-C`复测：
+stage边界旋转的历史24组`C-X-X-C`复测：
 
 ```text
 valid = 22/24
@@ -327,7 +328,18 @@ speedup = 16.15%
 candidate rel_l2 = 0.00319
 ```
 
-单跑复验为3911.3us / 219.7T；ATT采集时为3908.7us / 219.8T。
+第二substep相位感知V-load配额的3轮`C-X-X-C`复测：
+
+```text
+control median = 3904.4 us / 220.0T级
+candidate median = 3874.5 us / 221.85T
+time_ratio = 0.992342
+speedup = 0.772%
+逐轮 speedup = 0.738%, 0.764%, 0.816%
+candidate rel_l2 = 0.00319
+```
+
+候选ISA仍为244V、零scratch、128 MFMA、6 setprio和17条NOP；全部opcode计数与基线一致。ATT采集时为3877.3us / 221.6T。
 
 ### 6.4 ATT阶段结果
 
@@ -348,14 +360,34 @@ completion skew = 160.881 cycles/tile
 
 旧专用stage的stage1约2469--2530 cycles/tile，新stage1降至1323--1488；stage0/stage1由约1:2.4改善到约1:1.09--1.22。剩余问题是slot1额外约165 cycles/tile，而不是stage1整体过长。
 
+### 6.5 相位感知V-load配额ATT结果
+
+基线Trace：`/tmp/attn-current-stage-antiphase/ui_output_agent_12897_dispatch_84`
+
+候选Trace：`/tmp/attn-vload-stagger-att/ui_output_agent_41880_dispatch_84`
+
+两份Trace均为H=1、M=N=40960、48条完整wave。按物理SIMD合并两个resident wave的issue区间，避免对同时发生的per-wave stall重复计数：
+
+| raw物理指标（cycles/tile） | 基线 | 候选 | 变化 |
+|---|---:|---:|---:|
+| trace task cycles | 1418.922 | 1386.716 | -32.207 (-2.27%) |
+| physical no-issue | 558.554 | 529.365 | -29.188 (-5.23%) |
+| MFMA shadow内no-issue | 342.070 | 329.891 | -12.179 |
+| shadow外no-issue | 216.484 | 199.474 | -17.010 |
+| `VMEM-load + VMEM-wait` | 66.157 | 35.526 | **-30.632 (-46.3%)** |
+| `MFMA + MFMA` | 35.589 | 26.524 | -9.064 |
+| 单独`MFMA` blocker | 17.043 | 5.874 | -11.169 |
+
+候选将第二substep的实际V-load间MFMA间隔从`3,3,3,3,3,3,3`改为`3,3,3,4,4,3,2`；第一substep保持全3不变。代价是`LDS/SMEM-wait + MFMA`增加约3.98 cycles/tile、`LDS/SMEM-wait + LDS/crosslane`增加约4.31 cycles/tile，但净物理空洞和墙钟都下降，因此采纳。
+
 ## 7. 最终性能快照
 
-“当前保留”只指当前源码中的219T旋转流水；其余行是已经迁移进本文的历史终点，不再保留对应代码分支。
+“当前保留”只指当前源码中的222T旋转流水；其余行是已经迁移进本文的历史终点，不再保留对应代码分支。
 
 | 路径 | shape与口径 | 时间 | TFLOPS | 资源 | 精度 | 定位 |
 |---|---|---:|---:|---|---:|---|
-| **当前Fly旋转反相** | softmax，40960，严格A/B | **3919.6us** | **219.2T** | 244V，2 waves，零scratch | `0.00319` | **当前唯一保留实现** |
-| 当前Fly旋转反相单跑 | softmax，40960 | 3911.3us | 219.7T | 同上 | `0.00319` | 单跑复验 |
+| **当前Fly旋转反相** | softmax，40960，3轮严格A/B | **3874.5us** | **221.85T** | 244V，2 waves，零scratch | `0.00319` | **当前唯一保留实现** |
+| 当前Fly旋转反相ATT采集 | softmax，40960 | 3877.3us | 221.6T | 同上 | `0.00319` | 48-wave ATT复验 |
 | Fly无softmax v13c | 40960 | 约3230us | 265.2--266.0T | 204V | `≈0.00021` | 历史无softmax终态 |
 | 高层Fly旧默认 | softmax，40960 | 约4415--4425us | 194.4--194.7T | 240V | `≈0.00319` | 历史基线 |
 | full-late + periodic setprio | softmax，40960 | fast约4328us | 约198.5T | 248V | `≈0.00319` | 历史实验终态 |
@@ -416,14 +448,35 @@ completion skew = 160.881 cycles/tile
 - 恢复验证：原`VMEM1 + MFMA3`回到3907.3us / 219.8T。
 - 决策：**不采纳更均匀交织**。尾部连续MFMA为V请求提供成熟距离并参与resident-wave反相；物理空洞主要是MFMA/VALU ready关系。若继续，只能围绕第5/6条load做单点、相位感知的机器调度实验，不能全局增加MFMA配额或机械lookahead。
 
+### 2026-07-31：第二substep相位感知V-load配额
+
+- 假设：物理ledger显示第二静态substep的`vmcnt(9)`与第5/6条V load形成66.157 cycles/tile的`VMEM-load + VMEM-wait`共同空洞；只调整该substep可避免破坏第一substep已经稳定的相位。
+- 改动：第一substep保持`3,3,3,3,3,3,3,3`；第二substep改为`3,3,3,4,4,3,2,2`，两者总MFMA配额均为24。
+- 正确性：256为`0.00315`，40960为`0.00319`。
+- ISA：244V、零scratch、128 MFMA、6 setprio、17 NOP；opcode计数与基线完全相同。
+- 严格A/B：3轮`C-X-X-C`的control/candidate中位数为3904.4/3874.5us，逐轮加速0.738%/0.764%/0.816%，总体+0.772%。
+- ATT：`VMEM-load + VMEM-wait` 66.157→35.526 cycles/tile（-46.3%）；总物理no-issue 558.554→529.365（-5.23%）；trace task cycles 1418.922→1386.716（-2.27%）。
+- 决策：**采纳**。
+- 产物：`/tmp/attn-vstagger-paired.log`、`/tmp/attn-vload-stagger-isa`、`/tmp/attn-vload-stagger-att/ui_output_agent_41880_dispatch_84`、`/tmp/attn-vload-stagger-physical-ledger.json`。
+
+### 2026-07-31：K LDS读写交织反证
+
+- 全部8条K读从`DSRD1+MFMA1`改成`DSRD1+MFMA2`：240V、精度不变，但220T→207.5T。
+- 只将每个substep最热的最后一条`ds_read_b128`后移跨过1条MFMA：资源/指令数不变，但220.0T→212.0T。
+- 把barrier固定到完整GEMM2后，使K写后有31条MFMA：232V、NOP减少2条，但220T→186.7T。
+- 在第12条GEMM2 MFMA设置局部栅栏，使K写后有13条MFMA：228V，但220T→196.6T。
+- 在第8条GEMM2 MFMA设置局部栅栏，使K写后有9条MFMA且barrier位置接近基线：244V，但220T→206.5T。
+- 在第二条DS写后强制4条已有VALU：机器码出现4条`v_perm_b32`和1条MFMA，VGPR 244→232、wait 55→44，但219.8T→205.1T。
+- 结论：高per-wave `ds_read_b128`/`lgkmcnt` stall是当前双wave相位的一部分，不是可独立搬动的局部根因。任何DS读写重排必须以物理SIMD共同空洞和严格墙钟为准；当前不再改变K读节奏或K写/barrier位置。
+
 ## 9. 后续方向与硬约束
 
-下一步先分析最终ATT中slot1额外约165 cycles/tile：
+当前已处理两个静态substep的VMEM不对称。后续优先分析候选ATT中剩余的物理共同空洞：
 
-1. K LDS write→barrier→K LDS read；
-2. K LDS read→GEMM1的`lgkmcnt`等待；
-3. V global load与GEMM1交织段的`vmcnt`等待；
-4. 两个静态substep是否存在不对称机器调度。
+1. `MFMA + TRANS`约127.3 cycles/tile；
+2. `LDS/SMEM-wait + MFMA`约83.5 cycles/tile；
+3. `MFMA + scheduler/ready`约57.6 cycles/tile；
+4. 剩余`VMEM-load + VMEM-wait`约35.5 cycles/tile。
 
 硬约束：
 
@@ -431,4 +484,5 @@ completion skew = 160.881 cycles/tile
 - 保持7项loop state，不跨回边携带`frag_V`。
 - 当前完整静态MFMA门槛是128，scratch必须为0，VGPR必须不超过256。
 - 不插NOP补延迟，不机械提前K read，不只压缩scale/EXP链。
+- 不再全局增加DSRD/MFMA间隔，不移动K写/barrier位置，不在DS写后强制VALU分组；这些路线已严格回退。
 - 每次顺序：候选自身精度 → ISA资源 → 40960严格A/B → 必要时ATT/PMC。
