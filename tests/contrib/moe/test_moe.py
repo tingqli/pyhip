@@ -1118,20 +1118,20 @@ if __name__ == '__main__':
         "quant_type":'ptpc'
     }    
     model_args = hy3_args
-    #model_args = qwen35_35B_args
+    model_args = qwen35_35B_args
     batch = [8192, 8192*2, 8192*4, 8192*8, 8192*16]
     batch = [8192*8]
     prec = [get_fp8type()]
     #prec = [torch.bfloat16]
 
-    for b in [8192, 8192*2, 8192*4, 8192*8, 8192*16]:
+    for b in [1, 4, 8192, 8192*2, 8192*4, 8192*8, 8192*16]:
         batch = [b]
         print(f"================== {b}")
-        with torchPerf(30):
-            torch.cuda.empty_cache() 
-            entry_common('aiter', batch, prec, **tile_mn, **model_args)
-            torch.cuda.empty_cache() 
-            entry_common('fly_splitk_2s', batch, prec, **tile_mn, **model_args)
+        #with torchPerf(30):
+        torch.cuda.empty_cache() 
+        entry_common('aiter', batch, prec, **tile_mn, **model_args)
+        torch.cuda.empty_cache() 
+        entry_common('fly_splitk_2s', batch, prec, **tile_mn, **model_args)
 
     #batch = 131072 # accuracy issue
     #test_acc_fly_splitk_2s(batch=[batch], prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)

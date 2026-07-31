@@ -1,12 +1,18 @@
-import flydsl.expr as fx
-from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl._mlir.dialects import fly, llvm, vector, gpu, scf, rocdl
-from flydsl._mlir import ir
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import types
 import inspect
+import types
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, rocdl
+from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
+from flydsl.expr import range_constexpr
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import as_ir_value
 
 
 def div_up(x, y):
@@ -18,20 +24,8 @@ def div_e(x, y):
     return x // y
 
 
-def fly_ast_rewrite(member):
-    """Apply ASTRewriter.transform to a class member callable.
-
-    Supports plain instance methods and descriptor-wrapped members
-    (staticmethod/classmethod).
-    """
-    if isinstance(member, staticmethod):
-        return staticmethod(ASTRewriter.transform(member.__func__))
-    if isinstance(member, classmethod):
-        return classmethod(ASTRewriter.transform(member.__func__))
-    return ASTRewriter.transform(member)
-
-@fly_ast_rewrite
-def split_works(num_works, num_workers, worker_id, align = 1):
+@flyc.jit
+def split_works(num_works, num_workers, worker_id, align=1):
     num_work_items = num_works // align
     num_items_per_worker = num_work_items // num_workers
     num_items_remains = num_work_items % num_workers
@@ -44,7 +38,8 @@ def split_works(num_works, num_workers, worker_id, align = 1):
     )
     work_item1 = work_item0 + num_items
 
-    return work_item0*align, work_item1*align, num_items*align
+    return work_item0 * align, work_item1 * align, num_items * align
+
 
 def load_fragment(thr_view: fx.Tensor):
     """
@@ -79,7 +74,6 @@ def load_fragment(thr_view: fx.Tensor):
         return frag_stride
 
     frag_stride = collect_nz_modes(tview_shape, tview_stride)
-    nz_cnt = fstride
     # print(" thr_view shape: ", nz_shape, " stride: ", nz_stride, " frag_stride: ", frag_stride, " nz_cnt: ", nz_cnt)
 
     if len(nz_shape) == 0:
@@ -191,7 +185,7 @@ def all_elements(*tensors, scalar=False):
             crd = [None]
             for c, s in zip(coord[1:], fshape[1:]):
                 crd.append(min(c, s - 1))
-            #print(crd, ftensor)
+            # print(crd, ftensor, fx.slice(ftensor, crd))
             ret.append(fx.slice(ftensor, crd))
         yield ret
 
@@ -292,18 +286,35 @@ def all_copy_atoms(*tensors, atom_bits, num_threads: int):
             yield atom_list[0]
         else:
             yield atom_list
-    return
 
 
 def _as_ptr(p, dtype=None):
     """Convert memref or pointer to a pointer/iterator suitable for fx.make_view.
     Handles both raw fx.Pointer values and memref values passed by flydsl runtime."""
-    try:
-        p = fx.get_iter(p)
-    finally:
-        if dtype is not None and p.dtype != dtype:
-            p = fx.recast_iter(dtype, p)
-        return p
+    ptr = p if isinstance(p, fx.Pointer) else fx.get_iter(p)
+    if dtype is not None and ptr.dtype != dtype:
+        ptr = fx.recast_iter(dtype, ptr)
+    return ptr
+
+
+def atomic_add_bf16(ptr_base, reg_vec):
+    """Pairwise global atomic-add of a bf16 vector.
+
+    UniversalAtomic(Add) does not lower to global_atomic_pk_add_bf16,
+    so emit the packed-bf16 atomic RMW by hand (2 bf16 per op).
+    """
+    for i in range_constexpr(reg_vec.numel // 2):
+        pair = Vec.from_elements([reg_vec[i * 2], reg_vec[i * 2 + 1]], fx.BFloat16)
+        addr = fx.ptrtoint(ptr_base + i * 2)
+        llvm_ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr))
+        llvm.AtomicRMWOp(
+            llvm.AtomicBinOp.fadd,
+            llvm_ptr,
+            pair,
+            llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+            alignment=4,
+        )
 
 
 def make_1d_coord_tensor(target, target_mode_index, iter0):
@@ -462,7 +473,7 @@ class FlyObjCache:
     def get_retile(self, thrcopy, frag):
         return thrcopy.retile(frag)
 
-    @fly_ast_rewrite
+    @flyc.jit
     def load_tiled_mma_frag(self, mm, src, slice_coord, dst, abc, copy_atom_bits=128):
         assert abc in ["A", "B", "C"]
         if fx.const_expr(src.address_space == TargetAddressSpace.BufferDesc):
@@ -545,7 +556,10 @@ class FlyObjCache:
         thread_m = num_threads // thread_n
         tile_mn = (thread_m, thread_n * num_vals)
         assert (num_rows % tile_mn[0]) == 0, f"expect {num_rows} % {tile_mn[0]} == 0"
-        stride = lambda m, n: m + n * tile_mn[0]
+
+        def stride(m, n):
+            return m + n * tile_mn[0]
+
         tiled_copy = fx.make_tiled_copy(
             copy_atom,
             fx.make_layout(
@@ -575,9 +589,10 @@ def asm_mark(mark: str):
 
 def dump_ir(enable_debug_info=True):
     import os
+
     import flydsl
-    from flydsl.utils.env import DebugEnvManager
     from flydsl._mlir import ir
+    from flydsl.utils.env import DebugEnvManager
 
     DebugEnvManager.enable_debug_info = enable_debug_info
     DebugEnvManager.dump_asm = True

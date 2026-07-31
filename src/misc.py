@@ -130,7 +130,7 @@ def pre_shuffle(x, mfma_MN):
 # https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/testing/numeric.py#L5
 def calc_diff(x: "torch.Tensor", y: "torch.Tensor", diff_thr=None):
     def get_diff(x, y):
-        #x, y = x.double(), y.double()
+        x, y = x.double(), y.double()
         denominator = (x * x + y * y).sum()
         if denominator == 0:    # Which means that all elements in x and y are 0
             return 0.0
