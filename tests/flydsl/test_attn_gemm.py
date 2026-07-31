@@ -348,8 +348,8 @@ def build(
                         rocdl.sched_vmem(1)
                         rocdl.sched_mfma(3)
 
-                rocdl.sched_vmem(100)
-                rocdl.sched_mfma(100)
+                # rocdl.sched_vmem(100)
+                # rocdl.sched_mfma(100)
             else:
                 rocdl.sched_vmem(1)
                 rocdl.sched_dswr(1)
@@ -415,6 +415,7 @@ def build(
                 l_out[mt] = _fma_vec_f32_inline(l_in[mt], corr[mt], probability)
                 m_out[mt] = nm
                 frag_St[None, None, mt].store(probability)
+            fx.copy(cp_cs, ld_cur, coop_s.partition_D(k_lds2[wr, None, None]))
             for mt in range_constexpr(2):  # 旧 O 按 correction 缩放(GEMM2 累加前)
                 output_tile = frag_O[None, None, mt]
 
@@ -437,7 +438,6 @@ def build(
             rocdl.sched_barrier(0)
             rocdl.s_setprio(2)
             rocdl.sched_barrier(0)
-            fx.copy(cp_cs, ld_cur, coop_s.partition_D(k_lds2[wr, None, None]))
             fx.gemm(mma, frag_O, frag_V, frag_Sb, frag_O)  # O^T = V^T @ P^T(交换 A/B)
             gpu.barrier()  # k_lds[wr] 写完可见
             # prefetch 下一步 K:读 k_lds[wr] -> frag_K(移到 GEMM2 之后,藏 LDS 读延迟)
