@@ -1,4 +1,4 @@
-"""222T旋转反相 fused-attention kernel 的精度与性能测试。
+"""旋转反相 fused-attention kernel 的精度与性能测试。
 
 GEMM1计算S^T=K@Q^T，online softmax就地生成P^T，GEMM2计算O^T=V^T@P^T。K走LDS
 ping-pong，V从paged global直接进入fragment。stage0执行K global预取与softmax；stage1执行K LDS
@@ -66,6 +66,66 @@ def _cvt_f32_to_bf16(c_frag):
 
 
 LOG2E = 1.4426950408889634  # log2(e):exp(x)=exp2(x*LOG2E),flash softmax 用 exp2 走单 v_exp_f32
+FP8_PROB_SCALE = 240.0
+FP8_V_ROW_ORDER = (
+    0,
+    1,
+    2,
+    3,
+    16,
+    17,
+    18,
+    19,
+    4,
+    5,
+    6,
+    7,
+    20,
+    21,
+    22,
+    23,
+    8,
+    9,
+    10,
+    11,
+    24,
+    25,
+    26,
+    27,
+    12,
+    13,
+    14,
+    15,
+    28,
+    29,
+    30,
+    31,
+)
+
+
+def _cvt_f32x4_to_fp8(vec):
+    """用gfx942原生v_cvt_pk_fp8_f32将4个f32打包为E4M3FNUZ。"""
+    scaled = vec * fx.Float32(FP8_PROB_SCALE)
+    packed = fx.Int32(0)
+    packed = fx.Int32(
+        rocdl.cvt_pk_fp8_f32(
+            fx.Int32.ir_type, scaled[0], scaled[1], packed, False
+        )
+    )
+    packed = fx.Int32(
+        rocdl.cvt_pk_fp8_f32(
+            fx.Int32.ir_type, scaled[2], scaled[3], packed, True
+        )
+    )
+    return fx.Vector.from_elements([packed], fx.Int32).bitcast(fx.Float8E4M3FNUZ)
+
+
+def _preshuffle_v(V, qkv_dtype):
+    """转成kernel的[D,(8,NB),N/BN]物理布局；FP8额外补偿score row置换。"""
+    H, N, D = V.shape
+    if qkv_dtype == "fp8":
+        V = V.reshape(H, N // 32, 32, D)[:, :, FP8_V_ROW_ORDER, :]
+    return V.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous()
 
 
 def _maxnumf(a, b):
@@ -137,24 +197,28 @@ def _scale_center_vec_f32_inline(score, scale, center):
     return fx.Vector.from_elements(values, fx.Float32)
 
 
-def _make_klds_view(ptr, BN, D):
-    """K LDS 视图 [2,BN,D](D 连续,stage 偏移 BN*D):SwizzleType(3,3,3) 组合行主序去 bank 冲突
-    -> K 读 ds_read2st64_b64。"""
+def _make_klds_view(ptr, BN, D, is_fp8):
+    """K LDS视图：BF16使用SwizzleType(3,3,3)，FP8保持plain row-major。"""
     base = fx.make_layout((2, BN, D), (BN * D, D, 1))
+    if is_fp8:
+        return fx.make_view(ptr, base)
     swz = fx.SwizzleType.get(3, 3, 3)
     return fx.make_view(ptr, fx.make_composed_layout(fx.static(swz), base))
 
 
-def _make_ktiles(K_, N, D, BN, koff):
-    """K coop 读源 tile [BN,D,N//BN,1](head 偏移 koff=h*N*D 元素)。perm_M 施加在全局 K cache 而非 MMA:
-    每 tile 内 Nk 按正向 k_perm (4,4,2):(D,8D,4D) 重排 -> plain 读入 LDS 后,GEMM1 不加 perm_M 也能
-    得到相同的 8-连续-Nk C 布局(N 方向已 shuffle)。假设 BN=32。"""
+def _make_ktiles(K_, N, D, BN, koff, is_fp8):
+    """K coop读源tile；BF16物理重排32行，FP8保持plain row-major。"""
+    layout = (
+        fx.make_layout((BN, D, N // BN, 1), (D, 1, BN * D, 0))
+        if is_fp8
+        else fx.make_layout(
+            ((4, 4, 2), D, N // BN, 1), ((D, 8 * D, 4 * D), 1, BN * D, 0)
+        )
+    )
     return fx.rocdl.make_buffer_tensor(
         fx.make_view(
             fx.get_iter(K_) + koff,
-            fx.make_layout(
-                ((4, 4, 2), D, N // BN, 1), ((D, 8 * D, 4 * D), 1, BN * D, 0)
-            ),
+            layout,
         ),
         max_size=False,
     )
@@ -167,24 +231,36 @@ def build(
     BM,
     BN,
     H=1,
+    qkv_dtype="bf16",
 ):
-    """构造222T旋转反相 MHA kernel(flash softmax + multi-head)。
+    """构造旋转反相 MHA kernel(flash softmax + multi-head)。
 
     stage0执行K global预取与softmax；stage1执行K LDS写读、GEMM2和下一次V预取/GEMM1。
     H: head 数(multi-head,grid.y=head)。
-    固定使用lazy rebase：局部最大值超过参考值8（log2域）时才重缩放l/O。
+    BF16使用阈值8的lazy rebase；FP8为保证probability量化有限而使用精确rebase。
     """
+    assert qkv_dtype in ("bf16", "fp8")
+    is_fp8 = qkv_dtype == "fp8"
+    element_type = fx.Float8E4M3FNUZ if is_fp8 else fx.BFloat16
+    mma_k = 32 if is_fp8 else 16
     assert BN == 32
-    assert BM % 32 == 0 and BN % 16 == 0 and D % 16 == 0 and N % BN == 0 and M % BM == 0
+    assert BM in (64, 128)
+    assert BN % 16 == 0 and D % mma_k == 0 and N % BN == 0 and M % BM == 0
     assert (N // BN) % 2 == 0, "KV tile 数需为偶数(循环展开 2 次)"
-    WAVES = BM // 32  # 每 wave 负责 32 行 query
+    WAVES = 4
+    QUERY_REPEATS = BM // (WAVES * 16)  # BM64/128 时每 wave 分别负责 1/2 个 16 行 group
     NT = WAVES * 64  # 线程数
-    VECN = 128 // fx.BFloat16.width  # 协作加载向量宽度(8 bf16 = 128b)
-    assert BM // 32 == WAVES and D % VECN == 0 and BN % 16 == 0
+    VECN = 128 // element_type.width
+    assert QUERY_REPEATS in (1, 2) and D % VECN == 0
+    bits_per_thread = BN * D * element_type.width // NT
+    assert bits_per_thread % 64 == 0, "K tile必须能由256线程按至少64-bit均分"
+    coop_copy_bits = 128 if bits_per_thread % 128 == 0 else 64
+    COOP_VEC = coop_copy_bits // element_type.width
     sm_scale = float(1.0 / (D**0.5))  # softmax 缩放 1/sqrt(D)
     sm_scale_log2 = float(
         sm_scale * LOG2E
     )  # 把 LOG2E 折进缩放:exp2(S*sm_scale*LOG2E-m) 省掉逐元素 *LOG2E
+    rebase_threshold = 0.0 if is_fp8 else 8.0
 
     @flyc.kernel
     def attn_kernel(Q_: fx.Tensor, K_: fx.Tensor, V_: fx.Tensor, O_: fx.Tensor):
@@ -198,7 +274,8 @@ def build(
         Q = fx.Tensor(
             fx.make_view(fx.get_iter(Q_) + qo_off, fx.make_layout((M, D), (D, 1)))
         )
-        NB = BN // 8
+        VECV = 8
+        NB = BN // VECV
         # O 存成转置视图 O^T[D,M]:GEMM2 转置后 C=O^T,4/lane 沿 D 连续 -> 64-bit 写
         output_view = fx.Tensor(
             fx.make_view(fx.get_iter(O_) + qo_off, fx.make_layout((D, M), (1, D)))
@@ -208,43 +285,51 @@ def build(
 
         q_tile = fx.flat_divide(Qb, fx.make_tile(BM, D))[None, None, bm, 0]  # [BM, D]
         k_tiles = _make_ktiles(
-            K_, N, D, BN, kv_off
-        )  # [BN, D, N//BN, 1](perm_M 已全局重排)
+            K_, N, D, BN, kv_off, is_fp8
+        )  # [BN,D,N//BN,1]
         o_tile = fx.flat_divide(Ob, fx.make_tile(D, BM))[
             None, None, 0, bm
         ]  # [D, BM] = O^T tile
 
-        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
-        k_perm = fx.make_layout((4, 4, 2), (1, 8, 4))
-        # perm_M 挪到全局 K(_make_ktiles) -> MMA 不加 perm_M(N 方向已 shuffle)
+        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, mma_k, element_type))
+        k_perm1 = (
+            fx.make_layout((8, 4, 2), (1, 16, 8))
+            if is_fp8
+            else fx.make_layout((4, 4, 2), (1, 8, 4))
+        )
+        k_perm2 = fx.make_layout((8, 4), (1, 8)) if is_fp8 else k_perm1
+        # BF16的row permutation在全局K view中补偿；FP8使用plain row + 连续K32 operand。
         # GEMM1 = K@Q^T: wave 沿 query-M(MFMA 的 N 维)-> (1,WAVES,1);K 维(D)加 k_perm -> K 128-bit
         tmma1 = fx.make_tiled_mma(
             mma,
             fx.make_layout((1, WAVES, 1), (1, 1, 0)),
-            fx.make_tile(None, None, k_perm),
+            fx.make_tile(None, None, k_perm1),
         )
         # GEMM2 = (S@V)^T = V^T@S^T:交换 A/B -> C=O^T[D,Mq];wave 沿 query-M(现为 N 维)-> (1,WAVES,1);
         # K 维(Nk)加 k_perm -> A(V^T)每 lane 8 Nk -> 128-bit;C 累加器 4/lane 沿 D 连续 -> O 64-bit 写出
         tmma2 = fx.make_tiled_mma(
             mma,
             fx.make_layout((1, WAVES, 1), (1, 1, 0)),
-            fx.make_tile(None, None, k_perm),
+            fx.make_tile(None, None, k_perm2),
         )
         thr1 = tmma1.thr_slice(tid)
         thr2 = tmma2.thr_slice(tid)
 
         cp_cg = fx.make_copy_atom(
-            fx.rocdl.BufferCopy128b(), fx.BFloat16
+            fx.rocdl.BufferCopy(coop_copy_bits), element_type
         )  # 协作 global -> reg(合并)
-        cp_cs = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)  # reg -> LDS
+        cp_cs = fx.make_copy_atom(
+            fx.UniversalCopy(coop_copy_bits), element_type
+        )  # reg -> LDS
         cp_kr = fx.make_copy_atom(
-            fx.UniversalCopy128b(), fx.BFloat16
+            fx.UniversalCopy128b(), element_type
         )  # k_lds -> frag_K(k_perm -> 128-bit)
         cp_vg = fx.make_copy_atom(
-            fx.rocdl.BufferCopy128b(), fx.BFloat16
+            fx.rocdl.BufferCopy64b() if is_fp8 else fx.rocdl.BufferCopy128b(),
+            element_type,
         )  # V paged global -> frag_V(直读,不经 LDS)
         cp_qg = fx.make_copy_atom(
-            fx.rocdl.BufferCopy128b(), fx.BFloat16
+            fx.rocdl.BufferCopy128b(), element_type
         )  # Q global -> frag_Q(k_perm -> 128-bit)
         cp_oc = fx.make_copy_atom(
             fx.rocdl.BufferCopy64b(), fx.BFloat16
@@ -253,16 +338,19 @@ def build(
         # LDS: K 双缓冲(ping-pong),2*[BN,D];S 不入 LDS(register trick)
         @fx.struct
         class SharedStorage:
-            k_lds: fx.Array[fx.BFloat16, 2 * BN * D, 16]
+            k_lds: fx.Array[element_type, 2 * BN * D, 16]
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        # K LDS 视图:swizzle(3,3,3) 去 bank 冲突(swz 默认 / gpermswz 共用)
-        k_lds2 = _make_klds_view(lds.k_lds.ptr, BN, D)
-        # V 直读 paged global 读源(head 偏移 kv_off):每 kv-tile [D,(8,NB)], v(8) inner -> 128-bit buffer_load
+        # BF16 swizzle去bank conflict；FP8不能复用该字节宽度相关映射。
+        k_lds2 = _make_klds_view(lds.k_lds.ptr, BN, D, is_fp8)
+        # V直读paged global：每tile [D,(8,NB)]，BF16/FP8分别使用128/64-bit load。
         v_g = fx.rocdl.make_buffer_tensor(
             fx.make_view(
                 fx.get_iter(V_) + kv_off,
-                fx.make_layout((D, (8, NB), N // BN), (8, (1, D * 8), BN * D)),
+                fx.make_layout(
+                    (D, (VECV, NB), N // BN),
+                    (VECV, (1, D * VECV), BN * D),
+                ),
             ),
             max_size=False,
         )
@@ -277,13 +365,22 @@ def build(
             fx.make_tile(D, BN),
         )[None, None, 0, 0]
 
-        # 协作加载 [BN,D] tile(线程沿 D 连续 -> 合并访问)
-        coop_thr = fx.make_layout((16, D // VECN), (D // VECN, 1))
-        coop_val = fx.make_layout((BN // 16, VECN), (VECN, 1))
+        # 固定256线程覆盖完整[BN,D]；FP8 D192使用64-bit atom均分。
+        coop_col_threads = 16 if D % (16 * COOP_VEC) == 0 else 8
+        coop_row_threads = NT // coop_col_threads
+        assert coop_row_threads <= BN and BN % coop_row_threads == 0
+        assert D % coop_col_threads == 0
+        coop_thr = fx.make_layout(
+            (coop_row_threads, coop_col_threads), (coop_col_threads, 1)
+        )
+        coop_val = fx.make_layout(
+            (BN // coop_row_threads, D // coop_col_threads),
+            (D // coop_col_threads, 1),
+        )
         coop_g = fx.make_tiled_copy_tv(cp_cg, coop_thr, coop_val).get_slice(tid)
         coop_s = fx.make_tiled_copy_tv(cp_cs, coop_thr, coop_val).get_slice(tid)
 
-        # Q(GEMM1 的 B 操作数)只载入一次,每 wave 自己的 32 行
+        # Q(GEMM1 的 B 操作数)只载入一次；BM64/128时每wave分别处理16/32行。
         frag_Q = thr1.make_fragment_B(q_tile)
         tcQ = fx.make_tiled_copy_B(cp_qg, tmma1).get_slice(tid)
         fx.copy(cp_qg, tcQ.partition_S(q_tile), tcQ.retile(frag_Q))
@@ -317,16 +414,16 @@ def build(
             fx.make_rmem_tensor(fx.make_layout((BN, BM), (BM, 1)), fx.Float32)
         )  # GEMM1 C=S^T
         frag_Sb = thr2.make_fragment_B(
-            fx.make_rmem_tensor(fx.make_layout((BM, BN), (BN, 1)), fx.BFloat16)
+            fx.make_rmem_tensor(fx.make_layout((BM, BN), (BN, 1)), element_type)
         )  # GEMM2 B=S^T
         frag_ldK_next = fx.make_fragment_like(
             coop_g.partition_S(k_tiles[None, None, 0, 0])
         )  # coop 预取 K(kv+2)
         frag_V = thr2.make_fragment_A(v_fake)  # V 直读 -> frag_V
 
-        # hot_loop_scheduler 的指令数按实际 tile 尺寸算(BN=32,D=128 -> 8 dsrd / 2 dswr / 2 vmem / 32 mfma/GEMM)
+        # K LDS读数量随D计算；VMEM/MFMA配额沿用当前旋转反相调度。
         WARP = NT // WAVES  # 64
-        n_dsrd = BN * D // (WARP * VECN)  # K LDS 读(frag_K,每 wave 读 [BN,D],128-bit)
+        n_dsrd = BN * D * element_type.width // (WARP * 128)
 
         def hot_loop_scheduler(is_first_gemm, stagger_v_loads=False):
             if is_first_gemm:
@@ -364,9 +461,9 @@ def build(
             rocdl.sched_barrier(0)
 
         def gemm1_mt(mt):
-            # GEMM1 fragments are [value, m_rep=2, n_rep=2, k_rep=8].
+            # GEMM1 fragments are [value, m_rep=2, n_rep=QUERY_REPEATS, k_rep=D/mma_k].
             # Fixing n_rep=mt gives one independent 16-row query accumulator group.
-            for k in range_constexpr(D // 16):
+            for k in range_constexpr(D // mma_k):
                 for m in range_constexpr(BN // 16):
                     acc = frag_St[None, m, mt]
                     fx.mma_atom_call(
@@ -382,9 +479,9 @@ def build(
         def kv_step(kv_i, wr, ld_cur, ld_next, m0, m1, l0, l1, stagger_v_loads):
             # V 直读 paged global -> frag_V
             fx.copy(cp_vg, tcV.partition_S(v_g[None, None, kv_i]), tcV.retile(frag_V))
-            # Split GEMM1 by its two independent query-row accumulator groups.
+            # Split GEMM1 by its independent 16-row query accumulator groups.
             frag_St.fill(0)
-            for mt in range_constexpr(2):
+            for mt in range_constexpr(QUERY_REPEATS):
                 gemm1_mt(mt)
             hot_loop_scheduler(True, stagger_v_loads)
             # stage1 到 V(i)+GEMM1(i) 结束；stage0 从 K(i+2) global 预取开始。
@@ -395,8 +492,8 @@ def build(
                 cp_cg, coop_g.partition_S(k_tiles[None, None, kv_i + 2, 0]), ld_next
             )
             m_in, l_in = [m0, m1], [l0, l1]
-            m_out, l_out, corr = [None, None], [None, None], [None, None]
-            for mt in range_constexpr(2):
+            m_out, l_out, corr = [m0, m1], [l0, l1], [None, None]
+            for mt in range_constexpr(QUERY_REPEATS):
                 score = frag_St[None, None, mt].load()
                 tmax = score.reduce("max")
                 for sh in (16, 32):
@@ -404,7 +501,7 @@ def build(
                 tmax = _fma_f32_inline(tmax, fx.Float32(sm_scale_log2), fx.Float32(0.0))
                 nm = m_in[mt]
                 corr_mt = fx.Float32(1.0)
-                if tmax > m_in[mt] + fx.Float32(8.0):
+                if tmax > m_in[mt] + fx.Float32(rebase_threshold):
                     nm = tmax
                     corr_mt = _exp2_amdgcn(m_in[mt] - nm)
                 corr[mt] = corr_mt
@@ -416,7 +513,7 @@ def build(
                 m_out[mt] = nm
                 frag_St[None, None, mt].store(probability)
             fx.copy(cp_cs, ld_cur, coop_s.partition_D(k_lds2[wr, None, None]))
-            for mt in range_constexpr(2):  # 旧 O 按 correction 缩放(GEMM2 累加前)
+            for mt in range_constexpr(QUERY_REPEATS):  # 旧 O 按 correction 缩放(GEMM2 累加前)
                 output_tile = frag_O[None, None, mt]
 
                 def rescale_output():
@@ -429,11 +526,18 @@ def build(
 
                 rescale_if_needed()
             m0, m1, l0, l1 = m_out[0], m_out[1], l_out[0], l_out[1]
-            # P^T直接作GEMM2的B；拆半转换以分散VALU。
-            frag_Stb0 = _cvt_f32_to_bf16(frag_St[None, 0, None])
-            frag_Sb[None, None, 0].store(frag_Stb0.load())
-            frag_Stb1 = _cvt_f32_to_bf16(frag_St[None, 1, None])
-            frag_Sb[None, None, 1].store(frag_Stb1.load())
+            # P^T直接作GEMM2的B。FP8的K=32 atom把两个16行half合并为8元素/lane。
+            if is_fp8:
+                for mt in range_constexpr(QUERY_REPEATS):
+                    prob_lo = _cvt_f32x4_to_fp8(frag_St[None, 0, mt].load())
+                    prob_hi = _cvt_f32x4_to_fp8(frag_St[None, 1, mt].load())
+                    frag_Sb[None, mt, 0].store(
+                        prob_lo.shuffle(prob_hi, list(range(8)))
+                    )
+            else:
+                for mn in range_constexpr(BN // 16):
+                    frag_Stb = _cvt_f32_to_bf16(frag_St[None, mn, None])
+                    frag_Sb[None, None, mn].store(frag_Stb.load())
             # stage1 从 K(i+1) LDS 写开始，跨回边延续到下一次 V load + GEMM1。
             rocdl.sched_barrier(0)
             rocdl.s_setprio(2)
@@ -493,14 +597,18 @@ def build(
         l_final = [stage_results[5], stage_results[6]]
 
         # ---- epilogue:O /= l(每 Mq-tile 用最终 running sum 归一化)----
-        for mt in range_constexpr(2):
+        for mt in range_constexpr(QUERY_REPEATS):
             l_final[mt] = l_final[mt].reduce("add")
             for sh in (16, 32):
                 l_final[mt] = l_final[mt] + l_final[mt].shuffle_xor(sh, 64)
             output_tile = frag_O[None, None, mt]
-            output_tile.store(output_tile.load() * (fx.Float32(1.0) / l_final[mt]))
+            prob_scale = FP8_PROB_SCALE if is_fp8 else 1.0
+            output_tile.store(
+                output_tile.load()
+                * (fx.Float32(1.0 / prob_scale) / l_final[mt])
+            )
 
-        # O: f32 -> bf16 -> global(每 wave 写自己的 32 行;_cvt_f32_to_bf16 省 RNE+NaN 指令)
+        # O: f32 -> bf16 -> global(每wave写16/32行；_cvt_f32_to_bf16省RNE+NaN指令)
         frag_Ob = _cvt_f32_to_bf16(frag_O)
         tcO = fx.make_tiled_copy_C(cp_oc, tmma2).get_slice(tid)
         fx.copy(cp_oc, tcO.retile(frag_Ob), tcO.partition_S(o_tile))
@@ -520,46 +628,76 @@ def build(
     return launch
 
 
-def torch_ref(Q, K, V):
+def torch_ref(Q, K, V, qkv_dtype):
     """Non-causal multi-head attention reference."""
     S = torch.einsum("hmd,hnd->hmn", Q.float(), K.float())  # [H,M,N] f32
     S = S * (1.0 / (Q.shape[-1] ** 0.5))
-    P = torch.softmax(S, dim=-1)
-    output = torch.einsum("hmn,hnd->hmd", P.to(torch.bfloat16).float(), V.float()).to(
-        torch.bfloat16
-    )
-    return output
+    if qkv_dtype == "fp8":
+        running_max = torch.full_like(S[:, :, :1], float("-inf"))
+        running_sum = torch.zeros_like(running_max)
+        output = torch.zeros(
+            Q.shape[0], Q.shape[1], V.shape[2], dtype=torch.float32, device=Q.device
+        )
+        for start in range(0, S.shape[-1], 32):
+            score = S[:, :, start : start + 32]
+            tile_max = score.amax(dim=-1, keepdim=True)
+            new_max = torch.maximum(running_max, tile_max)
+            correction = torch.exp(running_max - new_max)
+            probability = torch.exp(score - new_max)
+            probability_fp8 = (
+                probability * FP8_PROB_SCALE
+            ).to(torch.float8_e4m3fnuz).float()
+            output = output * correction + torch.einsum(
+                "hmn,hnd->hmd", probability_fp8, V[:, start : start + 32].float()
+            )
+            running_sum = running_sum * correction + probability.sum(
+                dim=-1, keepdim=True
+            )
+            running_max = new_max
+        output = output / (running_sum * FP8_PROB_SCALE)
+    else:
+        P = torch.softmax(S, dim=-1).to(torch.bfloat16).float()
+        output = torch.einsum("hmn,hnd->hmd", P, V.float())
+    return output.to(torch.bfloat16)
 
 
 def main():
     torch.manual_seed(0)
     torch.set_default_device("cuda")
 
-    # 222T旋转反相MHA；H/MULT仅控制问题尺寸。
+    # 旋转反相MHA；H/BM/MULT/D控制问题尺寸。
     H = int(os.environ.get("H", "8"))
-    BM, BN = 128, 32
+    BM = int(os.environ.get("BM", "128"))
+    BN = 32
     mult = int(os.environ.get("MULT", "16"))
-    M, N, D = BM * mult, BM * mult, 128
+    D = int(os.environ.get("D", "192"))
+    qkv_dtype = os.environ.get("QKV_DTYPE", "bf16").lower()
+    assert qkv_dtype in ("bf16", "fp8")
+    torch_dtype = torch.float8_e4m3fnuz if qkv_dtype == "fp8" else torch.bfloat16
+    M, N = BM * mult, BM * mult
 
-    Q = torch.randn(H, M, D, dtype=torch.bfloat16)
-    K = torch.randn(H, N, D, dtype=torch.bfloat16)
-    V = torch.randn(H, N, D, dtype=torch.bfloat16)
+    Q = torch.randn(H, M, D, dtype=torch.float32).to(torch_dtype)
+    K = torch.randn(H, N, D, dtype=torch.float32).to(torch_dtype)
+    V = torch.randn(H, N, D, dtype=torch.float32).to(torch_dtype)
     # 预 shuffle V 成 paged 布局 [H, N//8, D, 8];torch_ref 仍用原始 V
-    V_shuf = V.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous()
+    V_shuf = _preshuffle_v(V, qkv_dtype)
 
     stream = torch.cuda.current_stream()
     o_fly = torch.empty(H, M, D, dtype=torch.bfloat16)
     args = (Q, K, V_shuf, o_fly, stream)
-    print(f"[cfg] H={H} M={M} N={N} D={D} pipeline=stage_antiphase priority=2")
+    print(
+        f"[cfg] H={H} M={M} N={N} D={D} BM={BM} QKV={qkv_dtype} "
+        "pipeline=stage_antiphase priority=2"
+    )
     kernel = fly_compiled(
-        (M, N, D, BM, BN, H),
-        lambda: build(M, N, D, BM, BN, H=H),
+        (M, N, D, BM, BN, H, qkv_dtype),
+        lambda: build(M, N, D, BM, BN, H=H, qkv_dtype=qkv_dtype),
         args,
     )
     torch.cuda.synchronize()
 
     # ---- 精度 ----
-    o_ref = torch_ref(Q, K, V)
+    o_ref = torch_ref(Q, K, V, qkv_dtype)
     diff = (o_fly.float() - o_ref.float()).abs()
     rel = diff.norm() / o_ref.float().norm().clamp_min(1e-6)
     print(
@@ -570,13 +708,13 @@ def main():
     from pyhip import cudaPerf
 
     flops = H * 4 * M * N * D  # 每 head gemm1+gemm2 各 2*M*N*D
-    mem_bytes = (Q.numel() + K.numel() + V_shuf.numel() + o_fly.numel()) * 2
+    mem_bytes = sum(t.numel() * t.element_size() for t in (Q, K, V_shuf, o_fly))
 
     BUF_COPY = 10
-    Qs = [torch.randn(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    Ks = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    Vs = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    V_shufs = [v.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous() for v in Vs]
+    Qs = [torch.randn(H, M, D, dtype=torch.float32).to(torch_dtype) for _ in range(BUF_COPY)]
+    Ks = [torch.randn(H, N, D, dtype=torch.float32).to(torch_dtype) for _ in range(BUF_COPY)]
+    Vs = [torch.randn(H, N, D, dtype=torch.float32).to(torch_dtype) for _ in range(BUF_COPY)]
+    V_shufs = [_preshuffle_v(v, qkv_dtype) for v in Vs]
     o_flys = [torch.empty(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
 
     run_count = 50

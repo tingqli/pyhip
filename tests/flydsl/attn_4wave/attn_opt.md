@@ -25,7 +25,7 @@ co-issue说明：[`tools/mfma-valu-coissue.md`](tools/mfma-valu-coissue.md)
 
 ```bash
 HIP_VISIBLE_DEVICES=0 \
-H=1 MULT=2 \
+H=1 BM=128 MULT=2 D=128 \
 PYTHONPYCACHEPREFIX=/tmp/attn-fly-small-pyc \
 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
 python3 -B tests/flydsl/test_attn_gemm.py
@@ -35,13 +35,51 @@ python3 -B tests/flydsl/test_attn_gemm.py
 
 ```bash
 HIP_VISIBLE_DEVICES=0 \
-H=1 MULT=320 \
+H=1 BM=128 MULT=320 D=128 \
 PYTHONPYCACHEPREFIX=/tmp/attn-fly-40960-pyc \
 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
 python3 -B tests/flydsl/test_attn_gemm.py
 ```
 
-当前gfx942空闲卡复现约`3869--3882 us / 221.3--222.1 TFLOPS`，`rel_l2≈0.00319`。
+当前gfx942空闲卡复现约`3543.5 us / 242.4 TFLOPS`，`rel_l2≈0.00319`。
+
+BM64、每wave 16行、D192性能：
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+H=1 BM=64 MULT=640 D=192 \
+PYTHONPYCACHEPREFIX=/tmp/attn-fly-bm64-d192-pyc \
+FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+python3 -B tests/flydsl/test_attn_gemm.py
+```
+
+当前gfx942空闲卡两次为`11482.6--11559.7 us / 112.1--112.4 TFLOPS`，`rel_l2≈0.00315`。
+
+FP8 Q/K/V（gfx942原生E4M3FNUZ，BF16输出）：
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+H=1 BM=128 MULT=320 D=128 QKV_DTYPE=fp8 \
+PYTHONPYCACHEPREFIX=/tmp/attn-fly-fp8-pyc \
+FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+python3 -B tests/flydsl/test_attn_gemm.py
+```
+
+当前gfx942空闲卡为`3592.1 us / 239.1 TFLOPS`。40960下相对等价online-FP8 reference的
+`rel_l2=0.00027`；小shape相对标准未量化attention为`0.02204`。
+
+FP8 D192：
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+H=1 BM=128 MULT=320 D=192 QKV_DTYPE=fp8 \
+PYTHONPYCACHEPREFIX=/tmp/attn-fly-fp8-d192-pyc \
+FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+python3 -B tests/flydsl/test_attn_gemm.py
+```
+
+当前gfx942空闲卡为`4115.5 us / 313.1 TFLOPS`，相对等价online-FP8 reference的
+`rel_l2=0.00030`。
 
 ### PyHIP JIT
 
@@ -387,7 +425,13 @@ completion skew = 160.881 cycles/tile
 
 | 路径 | shape与口径 | 时间 | TFLOPS | 资源 | 精度 | 定位 |
 |---|---|---:|---:|---|---:|---|
-| **当前Fly旋转反相（K LDS写前移）** | softmax，40960，最后独立复测 | **3543.5us** | **242.4T** | ISA资源待重采 | `0.00319` | **当前源码，2次展开** |
+| **FP8 BM128 / 每wave 32行** | softmax，40960，D192 | **4115.5us** | **313.1T** | 220V，12KB LDS，零scratch | `0.00030`¹ | **当前支持配置** |
+| FP8 BM64 / 每wave 16行 | softmax，40960，D192 | 6168.0us | 208.9T | 134V，12KB LDS，零scratch | `0.00030`¹ | 当前支持配置 |
+| **FP8 BM128 / 每wave 32行** | softmax，40960，D128 | **3592.1us** | **239.1T** | 166V，8KB LDS，零scratch | `0.00027`¹ | **当前支持配置** |
+| FP8 BM64 / 每wave 16行 | softmax，40960，D128 | 4171.7us | 205.9T | 100V，8KB LDS，零scratch | `0.00027`¹ | 当前支持配置 |
+| **BM64 / 每wave 16行** | softmax，40960，D192，独立复测 | **11559.7us** | **112.1T** | 218V，24KB LDS，零scratch | `0.00315` | **当前支持配置** |
+| BM128 / 每wave 32行 | softmax，40960，D192，对照 | 12099.6us | 106.5T | 256V+73A，24KB LDS，零scratch | `0.00315` | 当前支持配置 |
+| **当前Fly旋转反相（K LDS写前移）** | softmax，40960，D128，最后独立复测 | **3543.5us** | **242.4T** | ISA资源待重采 | `0.00319` | **当前源码，2次展开** |
 | K LDS写前移前的Fly旋转反相 | softmax，40960，3轮严格A/B | 3874.5us | 221.85T | 244V，2 waves，零scratch | `0.00319` | 历史前序版本 |
 | K LDS写前移前的ATT采集 | softmax，40960 | 3877.3us | 221.6T | 同上 | `0.00319` | 48-wave ATT复验 |
 | Fly无softmax v13c | 40960 | 约3230us | 265.2--266.0T | 204V | `≈0.00021` | 历史无softmax终态 |
@@ -399,6 +443,10 @@ completion skew = 160.881 cycles/tile
 | JIT ISA oracle / body inline | softmax，40960 | 3630--3633us | 236.4--236.6T | 220V | `≈0.00319` | 仅验证机器目标 |
 
 注意：早期“189.1T→209.1T”结果是control覆盖候选输出造成的假阳性，候选实际精度错误；**209.1T绝对不能引用或采纳**。
+
+¹ FP8精度对比等价kernel语义：Q/K/V为E4M3FNUZ，online softmax每32-token tile将未归一化
+probability乘240后量化到FP8，GEMM2使用原生FP8 MFMA，输出为BF16。小shape相对标准未量化
+`softmax(QK)@V`的算法级`rel_l2=0.02204`，相对等价online-FP8 reference为`5.39e-5`。
 
 ## 8. 增量实验日志
 
@@ -487,6 +535,34 @@ completion skew = 160.881 cycles/tile
 - 两组均值：control 3539.65us，候选3628.85us；四次展开耗时增加2.520%，等价吞吐下降2.458%。
 - 恢复二次展开后的最后独立复测：3543.5us / 242.4T，`rel_l2=0.00319`；与前两次control一致。
 - 决策仍为**失败并回退**；保留K LDS写前移，只恢复二次展开。未采集该候选ATT，不进一步归因具体微观stall。
+
+### 2026-07-31：BM64与每wave 16行支持
+
+- 目标：支持`BM=64`，仍使用4 waves / 256线程，每wave只处理一个16行query group；保留`BM=128`每wave两个16行group的路径。
+- 实现：将query group数参数化为`BM/(4*16)`；softmax、O rescale和epilogue按该数展开。BF16 probability pack仍按BN方向的两个16行half执行。
+- D192修复：原K cooperative copy在D192时隐含需要384线程，但launch只有256线程。现固定256线程覆盖完整`[BN,D]`，D128/D192时每线程分别搬2/3个128-bit向量；`D`增加环境参数，默认192。
+- 小shape正确性：BM64/BM128、D128/D192四种组合均为`rel_l2=0.00315`。
+- BM64正式结果：`H=1, M=N=40960, D=192`两次为11482.6us / 112.4T、11559.7us / 112.1T，`rel_l2=0.00315`。
+- BM64 ISA：4 waves / 256线程，218V、96 SGPR、24KB LDS、零scratch，静态96 MFMA、6 setprio。
+- 同shape BM128对照：12099.6us / 106.5T，256V+73A、24KB LDS、零scratch；BM64吞吐高5.54%。
+- 用法：`HIP_VISIBLE_DEVICES=3 H=1 BM=64 MULT=640 D=192 python3 -B tests/flydsl/test_attn_gemm.py`。
+- 决策：**增加为当前支持配置**。
+
+### 2026-07-31：FP8 Q/K/V支持
+
+- 接口：`QKV_DTYPE=bf16|fp8`，gfx942的FP8映射为`torch.float8_e4m3fnuz` / `fx.Float8E4M3FNUZ`；输出保持BF16。
+- GEMM：GEMM1/GEMM2均使用原生`MFMA(16,16,32,FP8)`；BF16继续使用`MFMA(16,16,16,BF16)`。
+- probability：为避免E4M3FNUZ下溢，online softmax在FP8路径使用精确rebase；未归一化probability乘240后由`v_cvt_pk_fp8_f32`量化，epilogue除去该scale。
+- 布局：FP8 K LDS必须使用plain row-major，不能复用按BF16元素宽度设计的`SwizzleType(3,3,3)`；V host preshuffle补偿GEMM1 score的32-row物理置换。
+- 正确性：BM64/BM128与D128/D192四种小shape相对等价online-FP8 reference均为`rel_l2=3e-5--5e-5`；BF16四种组合保持`0.00315`。
+- 标准attention口径：BM64/D128小shape相对未量化`softmax(QK)@V`为`rel_l2=0.02204`，属于FP8输入和中间probability量化误差。
+- 正式BM128/D128：`H=1, M=N=40960`为3592.1us / 239.1T，`rel_l2=0.00027`；166V、19 SGPR、8KB LDS、零scratch，64条原生FP8 MFMA、16条FP8 pack。
+- 正式BM64/D128：4171.7us / 205.9T，`rel_l2=0.00027`；100V、19 SGPR、8KB LDS、零scratch，32条原生FP8 MFMA、8条FP8 pack。
+- 正式BM128/D192：4115.5us / 313.1T，`rel_l2=0.00030`；220V、96 SGPR、12KB LDS、零scratch，96条原生FP8 MFMA、16条FP8 pack。
+- 正式BM64/D192：6168.0us / 208.9T，`rel_l2=0.00030`；134V、96 SGPR、12KB LDS、零scratch，48条原生FP8 MFMA、8条FP8 pack。
+- D192中BM128相对BM64吞吐高49.88%；BM128 D192相对D128耗时只增加14.6%，计算量增加50%，TFLOPS提高30.9%。
+- BF16正式回归：BM128/D128为3537.1us / 242.9T，`rel_l2=0.00319`，与改前一致。
+- 决策：**增加为当前支持配置**。
 
 ## 9. 后续方向与硬约束
 
