@@ -382,29 +382,43 @@ class FlyObjCache:
         return func
 
     @local_cache
-    def create_thr_mma(self, dtype, wave_mnk):
-        mfma_M = 16
-        mfma_N = 16
-        mfma_K = {
-            fx.Float8E4M3FNUZ: 32,
-            fx.BFloat16: 16,
-            fx.Float16: 16,
-            fx.Float32: 4,
-        }[dtype]
+    def create_thr_mma(self, dtype, wave_mnk, mfma_MNKB = None):
+        mfma_K_lut = {
+                    fx.Float8E4M3FNUZ: 32,
+                    fx.BFloat16: 16,
+                    fx.Float16: 16,
+                    fx.Float32: 4,
+                }
+        if mfma_MNKB is not None:
+            if isinstance(mfma_MNKB, int):
+                mfma_MNKB = (mfma_MNKB,)
+            if len(mfma_MNKB) == 1:
+                mfma_B = 1
+                mfma_M = mfma_MNKB[0]
+                mfma_N = mfma_M
+                mfma_K = mfma_K_lut[dtype]
+                if mfma_M == 32: mfma_K = mfma_K//2
+            else:
+                mfma_M, mfma_N, mfma_K, mfma_B = mfma_MNKB
+        else:
+            mfma_B = 1
+            mfma_M = 16
+            mfma_N = 16
+            mfma_K = mfma_K_lut[dtype]
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(mfma_M, mfma_N, mfma_K, dtype))
 
         wave_m, wave_n, wave_k = wave_mnk
         thr_layout_mnk = fx.make_layout(
             (wave_m, wave_n, wave_k), (1, wave_m, 0 if wave_k == 1 else wave_m * wave_n)
         )
-
-        atom_frgv = mfma_K // 4  # how many elements in a fragment vector (per-thread)
+        k_lanes = 64 // (mfma_M * mfma_B)
+        atom_frgv = mfma_K // k_lanes  # how many elements in a fragment vector (per-thread)
         num_frgv_in_DW4 = 128 // (
             atom_frgv * dtype.width
         )  # to use DW4 load, how many atom_frgv needs to be packed
         num_elements_in_DW4 = 128 // dtype.width
         k_perm = fx.make_layout(
-            (atom_frgv, 4, num_frgv_in_DW4), (1, num_elements_in_DW4, atom_frgv)
+            (atom_frgv, k_lanes, num_frgv_in_DW4), (1, num_elements_in_DW4, atom_frgv)
         )
         permutation_mnk = (None, None, k_perm)
         tiled_mma = fx.make_tiled_mma(mma_atom, thr_layout_mnk, permutation_mnk)
