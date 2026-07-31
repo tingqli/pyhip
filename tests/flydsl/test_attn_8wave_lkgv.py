@@ -13,7 +13,7 @@ from flydsl._mlir.dialects import llvm
 
 import pyhip.contrib.flydsl.helpers as fxh
 
-fxh.dump_ir(True)
+#fxh.dump_ir(True)
 
 import pyhip
 pyhip.set_device()
@@ -99,7 +99,15 @@ def _eltwise_op(inst_name, *args):
     else:
         return outs[0]
 
-def s_waitcnt(vmcnt=-1, lgkmcnt=-1):
+def s_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
+    """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
+    vm_lo = vmcnt & 0xF
+    vm_hi = (vmcnt >> 4) & 0x3
+    rocdl.s_waitcnt(vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14))
+
+    """
+    # LLVM AMDGPU BACKEND cannot understand inline asm in many early stage
+    # so it will insert extra s_waitcnt, use llvm intrinsic(rocdl wrapper) instead
     asm_string = ""
     asm_string += "s_waitcnt "
     if vmcnt >= 0: asm_string += f"vmcnt({vmcnt}) "
@@ -111,14 +119,15 @@ def s_waitcnt(vmcnt=-1, lgkmcnt=-1):
         constraints="",
         has_side_effects=True,
     )
+    """
 
 @functools.cache
-def MHA(M, N, D, BM, BN, H):
+def MHA(H, D, BM, BN):
     num_threads = 512
     sm_scale_log2 = float(LOG2E / (D**0.5))
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
-    def attn_kernel(Q_: fx.Tensor, K_: fx.Tensor, V_: fx.Tensor, O_: fx.Tensor):
+    def attn_kernel(Q_: fx.Tensor, K_: fx.Tensor, V_: fx.Tensor, O_: fx.Tensor, M: fx.Int32, N: fx.Int32):
         tid = fx.thread_idx.x
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
@@ -176,7 +185,8 @@ def MHA(M, N, D, BM, BN, H):
 
         num_blocks_n = N // BN
         def is_valid_block_n(bn):
-            return (bn >= 0 and bn < num_blocks_n) if isinstance(bn, int) else True
+            #return fx.const_expr(bn >= 0 and bn < num_blocks_n) if fx.const_expr(isinstance(bn, int)) else True
+            return fx.const_expr(bn >= 0) if fx.const_expr(isinstance(bn, int)) else True
 
         flyobj = fxh.FlyObjCache()
         glk_thrcopy, glk_cp_atom = flyobj.get_tiled_copy_coalesced_mn(
@@ -361,9 +371,12 @@ def MHA(M, N, D, BM, BN, H):
             # Q@K part for block_n
             prefetch_frag_id = lds_buff_id^1
             vm_cnt = 0
-            vm_cnt += global_load_k(block_n - 1 + 4, prefetch_frag_id)
 
             if fx.const_expr(is_valid_block_n(block_n)):
+                fragS.fill(0.0)
+                s_waitcnt(lgkmcnt=0)
+                fx.gemm(tmma1, fragS, fragK, fragQ, fragS)
+
                 fx.copy(
                     v_copy_atom,
                     v_thrcopy.partition_S(v_tile[None, None, block_n]),
@@ -371,14 +384,19 @@ def MHA(M, N, D, BM, BN, H):
                 )
                 vm_cnt += num_vm_cnt_load_v
 
-                fragS.fill(0.0)
-                fx.gemm(tmma1, fragS, fragK, fragQ, fragS)
+            ds_store_k(block_n + 1, prefetch_frag_id, lds_buff_id^1) # +2, +1
+            vm_cnt += global_load_k(block_n + 3, prefetch_frag_id)   # 
 
+            if fx.const_expr(is_valid_block_n(block_n)):
                 # Issue all eight V loads within the first 24 QK MFMAs. The
                 # final eight MFMAs hide the latency of the last V load.
                 for _ in fx.range_constexpr(8):
-                    fx.rocdl.sched_vmem(1)
                     fx.rocdl.sched_mfma(3)
+                    fx.rocdl.sched_vmem(1)
+                fx.rocdl.sched_mfma(3)
+                fx.rocdl.sched_group_barrier(0x80, 1, 0)
+                fx.rocdl.sched_mfma(3)
+                fx.rocdl.sched_group_barrier(0x200, 1, 0)
                 fx.rocdl.sched_vmem(100)
                 fx.rocdl.sched_mfma(100)
 
@@ -402,25 +420,24 @@ def MHA(M, N, D, BM, BN, H):
             # MFMA-stage :
             #   1st half: P@V part for block_n
             #   2nd half: Q@K part for block_n+1
+            
             if fx.const_expr(is_valid_block_n(block_n)):
+                s_waitcnt(vmcnt=0)
                 fx.gemm(tmma2, fragO, fragV, fragS_bf16, fragO)
 
             if fx.const_expr(is_valid_block_n(block_n + 1)):
                 flyobj.load_tiled_mma_fragA(tmma1, lds_k, [None, None, lds_buff_id^1], dst=fragK)
-
-            prefetch_frag_id = lds_buff_id
-            ds_store_k(block_n + 2, prefetch_frag_id, lds_buff_id)
 
             # leave some LDS bandwidth in head of MFMA-stage
             # because head of online-softmax-stage needs LDS
             for _ in fx.range_constexpr(8):
                 fx.rocdl.sched_group_barrier(0x100, 1, 0)
                 fx.rocdl.sched_mfma(24//8)
-
-            fx.rocdl.sched_group_barrier(0x200, 1, 0)
             fx.rocdl.sched_mfma(8)
+            #fx.rocdl.sched_group_barrier(0x200, 1, 0)
             fx.rocdl.sched_barrier(0)
 
+        #==============================================================================
         ml_states = [fx.Float32(float("-inf")),
                     fx.Float32(float("-inf")),
                     fx.Float32(0.0),
@@ -431,9 +448,22 @@ def MHA(M, N, D, BM, BN, H):
         kv_step(-2, 0, ml_states)
         kv_step(-1, 1, ml_states)
 
-        for block_n, state in range(0, num_blocks_n, 2, init=ml_states):
+        num_blocks_n4 = (num_blocks_n//4)*4
+        num_blocks_n2 = (num_blocks_n//2)*2
+        for block_n, state in range(0, num_blocks_n4, 4, init=ml_states):
             kv_step(block_n, 0, state)
             kv_step(block_n + 1, 1, state)
+            kv_step(block_n + 2, 0, state)
+            kv_step(block_n + 3, 1, state)
+            results = yield state
+
+        for block_n, state in range(num_blocks_n4, num_blocks_n2, 2, init=results):
+            kv_step(block_n, 0, state)
+            kv_step(block_n + 1, 1, state)
+            results = yield state
+
+        for block_n, state in range(num_blocks_n2, num_blocks_n, 1, init=results):
+            kv_step(block_n, 0, state)
             results = yield state
 
         if wave_m == 0:
@@ -454,19 +484,24 @@ def MHA(M, N, D, BM, BN, H):
         flyobj.store_tiled_mma_fragC(tmma2, fragO_bf16, fx.select(o_tile, [1,0]), copy_atom_bits=64)
 
     @flyc.jit
-    def launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, stream: fx.Stream):
-        attn_kernel(Q, K, V, O).launch(grid=(M // BM, H, 1), block=(num_threads, 1, 1), stream=stream)
+    def launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, M: fx.Int32, N: fx.Int32, stream: fx.Stream):
+        grid_m = (M + BM - 1) // BM
+        attn_kernel(Q, K, V, O, M, N).launch(grid=(grid_m, H, 1), block=(num_threads, 1, 1), stream=stream)
 
     def callable(
         Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, O: torch.Tensor, stream = None
     ):
+        assert Q.shape[0] == H
+        assert Q.shape[2] == D
+        M = Q.shape[1]
+        N = K.shape[1]
         stream = torch.cuda.current_stream() if stream is None else stream
         cf = getattr(launch, "_cf", None)
         if cf is None:
-            cf = flyc.compile(launch, Q, K, V, O, stream)
+            cf = flyc.compile(launch, Q, K, V, O, M, N, stream)
             launch._cf = cf
         else:
-            cf(Q, K, V, O, stream)
+            cf(Q, K, V, O, M, N, stream)
 
     return callable
 
@@ -487,75 +522,80 @@ def torch_ref(Q, K, V, causal=False, softmax=True):
     O = torch.einsum("hmn,hnd->hmd", P.to(torch.bfloat16).float(), V.float()).to(torch.bfloat16)
     return S, O
 
+
+def test(H, D, seq_len_list, verbose=0):
+    BM, BN = 256, 32
+    flydsl_mha = MHA(H, D, BM, BN)
+
+    for seq_len in seq_len_list:
+        M, N = seq_len, seq_len  # 每 head M=N=BM*MULT(默认 2048)
+
+        Q = torch.randn(H, M, D, dtype=torch.bfloat16)*0.1
+        K = torch.randn(H, N, D, dtype=torch.bfloat16)*0.1
+        V = torch.randn(H, N, D, dtype=torch.bfloat16)*0.1
+
+        # 预 shuffle V 成 paged 布局 [H, N//8, D, 8];torch_ref 仍用原始 V
+        V_shuf = V.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous()
+
+        stream = torch.cuda.current_stream()
+        o_fly = torch.empty(H, M, D, dtype=torch.bfloat16)
+        #args = (Q, K, V_shuf, o_fly, S, stream)
+
+        cfg_str = f"[cfg] H={H} D={D} M/N={seq_len}"
+
+        flydsl_mha(Q, K, V_shuf, o_fly, stream)
+
+        torch.cuda.synchronize()
+
+        # ---- 精度 ----
+        s_ref, o_ref = torch_ref(Q, K, V)
+
+        # assert pyhip.allclose(o_ref, o_fly, rtol=1e-2, atol=1e-2)
+        diff = (o_fly.float() - o_ref.float()).abs()
+        rel = diff.norm() / o_ref.float().norm().clamp_min(1e-6)
+        acc_str = f"[acc] max_abs={diff.max().item():.4f} mean_abs={diff.mean().item():.5f} rel_l2={rel.item():.5f}"
+
+        # ---- 性能:多 buffer 轮换 + cudaPerf 计时 ----
+        from pyhip import cudaPerf
+
+        flops = H * 4 * M * N * D  # 每 head gemm1+gemm2 各 2*M*N*D
+        mem_bytes = (Q.numel() + K.numel() + V_shuf.numel() + o_fly.numel()) * 2
+
+        BUF_COPY = 10
+        Qs = [torch.randn(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
+        Ks = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
+        Vs = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
+        V_shufs = [v.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous() for v in Vs]
+        o_flys = [torch.empty(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
+
+        run_count = 10
+
+        def perf(fn, name):
+            for _ in range(2):  # warmup
+                fn(0)
+            torch.cuda.synchronize()
+            tfs, uss = [], []
+            i = 0
+            for _ in range(run_count):
+                with cudaPerf(flops, mem_bytes, name=name, verbose=verbose) as p:
+                    fn(i)
+                i = (i + 1) % BUF_COPY
+                tfs.append(p.tflops())
+                uss.append(p.dt() * 1e6)
+            tfs.sort()
+            uss.sort()
+            return uss[run_count // 2], tfs[run_count // 2]
+
+        us_fly, tf_fly = perf(lambda i: flydsl_mha(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream), f"attn_fly_{M}_{N}_{D}_{H}")
+        print(f"{cfg_str} : {us_fly:8.1f} us  {tf_fly:7.1f} TFLOPS  ({mem_bytes / us_fly / 1e3:.0f} GB/s) {acc_str}")
+
 def main():
     torch.manual_seed(0)
     torch.set_default_device("cuda")
 
     H = int(os.environ.get("H", "8"))
-    _mult = int(os.environ.get("MULT", "40"))
-    BM, BN = 256, 32
-    M, N, D = BM * _mult, BM * _mult, 128  # 每 head M=N=BM*MULT(默认 2048)
 
-    Q = torch.randn(H, M, D, dtype=torch.bfloat16)*0.1
-    K = torch.randn(H, N, D, dtype=torch.bfloat16)*0.1
-    V = torch.randn(H, N, D, dtype=torch.bfloat16)*0.1
-
-    # 预 shuffle V 成 paged 布局 [H, N//8, D, 8];torch_ref 仍用原始 V
-    V_shuf = V.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous()
-
-    stream = torch.cuda.current_stream()
-    o_fly = torch.empty(H, M, D, dtype=torch.bfloat16)
-    #args = (Q, K, V_shuf, o_fly, S, stream)
-
-    print(f"[cfg] H={H} M={M} N={N} D={D} softmax_impl=lazy_delta8_v_direct")
-
-    flydsl_mha = MHA(M, N, D, BM, BN, H)
-    flydsl_mha(Q, K, V_shuf, o_fly, stream)
-
-    torch.cuda.synchronize()
-
-    # ---- 精度 ----
-    s_ref, o_ref = torch_ref(Q, K, V)
-
-    assert pyhip.allclose(o_ref, o_fly, rtol=1e-2, atol=1e-2)
-    diff = (o_fly.float() - o_ref.float()).abs()
-    rel = diff.norm() / o_ref.float().norm().clamp_min(1e-6)
-    print(f"[acc] max_abs={diff.max().item():.4f} mean_abs={diff.mean().item():.5f} rel_l2={rel.item():.5f}")
-
-    # ---- 性能:多 buffer 轮换 + cudaPerf 计时 ----
-    from pyhip import cudaPerf
-
-    flops = H * 4 * M * N * D  # 每 head gemm1+gemm2 各 2*M*N*D
-    mem_bytes = (Q.numel() + K.numel() + V_shuf.numel() + o_fly.numel()) * 2
-
-    BUF_COPY = 1
-    Qs = [torch.randn(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    Ks = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    Vs = [torch.randn(H, N, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-    V_shufs = [v.reshape(H, N // 8, 8, D).permute(0, 1, 3, 2).contiguous() for v in Vs]
-    o_flys = [torch.empty(H, M, D, dtype=torch.bfloat16) for _ in range(BUF_COPY)]
-
-    run_count = 10
-
-    def perf(fn, name):
-        for _ in range(2):  # warmup
-            fn(0)
-        torch.cuda.synchronize()
-        tfs, uss = [], []
-        i = 0
-        for _ in range(run_count):
-            with cudaPerf(flops, mem_bytes, name=name, verbose=1) as p:
-                fn(i)
-            i = (i + 1) % BUF_COPY
-            tfs.append(p.tflops())
-            uss.append(p.dt() * 1e6)
-        tfs.sort()
-        uss.sort()
-        return uss[run_count // 2], tfs[run_count // 2]
-
-    us_fly, tf_fly = perf(lambda i: flydsl_mha(Qs[i], Ks[i], V_shufs[i], o_flys[i], stream), f"attn_fly_{M}_{N}_{D}_{H}")
-    print(f"[perf] fly  : {us_fly:8.1f} us  {tf_fly:7.1f} TFLOPS  ({mem_bytes / us_fly / 1e3:.0f} GB/s)")
-
+    test(H, 128, [256*4, 256*8, 256*16, 256*32, 256*40], verbose=0)
 
 if __name__ == "__main__":
     main()
