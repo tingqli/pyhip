@@ -1,7 +1,7 @@
 # 融合 Attention 双 GEMM 优化总表（当前维护）
 
 状态：**ACTIVE / 唯一持续维护入口**
-更新时间：2026-07-30
+更新时间：2026-08-01
 当前实现：[`../test_attn_gemm.py`](../test_attn_gemm.py)
 JIT实现：[`test_attn_gemm_jit.py`](test_attn_gemm_jit.py)
 co-issue工具：[`tools/test-coissue.py`](tools/test-coissue.py)
@@ -80,6 +80,24 @@ python3 -B tests/flydsl/test_attn_gemm.py
 
 当前gfx942空闲卡为`4115.5 us / 313.1 TFLOPS`，相对等价online-FP8 reference的
 `rel_l2=0.00030`。
+
+32x32 MFMA（仅`BM=128`）：
+
+```bash
+HIP_VISIBLE_DEVICES=0 \
+H=1 BM=128 MULT=2 D=128 MMA_MN=32 QKV_DTYPE=bf16 \
+FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+python3 -B tests/flydsl/test_attn_gemm.py
+```
+
+BF16使用`MFMA(32,32,8)`，FP8使用`MFMA(32,32,16)`。`BM=64 + MMA_MN=32`
+会在构建阶段直接拒绝。GPU 0计算利用率为0%时的40960测试使用`CHECK=0`跳过大矩阵reference；
+该卡仍有外部进程常驻94% VRAM，因此结果作为共享显存环境数据单独记录。
+
+MMA32 D128保持与MMA16相同的stage语义。BF16读取`HW_ID.WAVE_ID`给两个resident slot分配
+`1/3`与`0/2`四级priority；FP8保持原priority。D128专用scheduler使用GEMM1
+`VMEM:MFMA=1:1`和GEMM2 `DSRD:MFMA=1:1`，BF16/FP8分别在DSRD前放3/0条MFMA。
+BF16 D128最终为`3714.5--3723.9us / 230.7--231.3T`；D192恢复原scheduler。完整实验和ATT见第8节。
 
 ### PyHIP JIT
 
@@ -425,6 +443,10 @@ completion skew = 160.881 cycles/tile
 
 | 路径 | shape与口径 | 时间 | TFLOPS | 资源 | 精度 | 定位 |
 |---|---|---:|---:|---|---:|---|
+| MMA32 FP8 BM128 | softmax，40960，D192，GPU0共享VRAM | 3969.1us | 324.6T | 158V级，零scratch | `0.00003`² | 实验支持配置 |
+| **MMA32 FP8 BM128** | softmax，40960，D128，GPU0 | **3932.5--3934.0us** | **218.4T** | 资源待重采，8KB LDS，零scratch | `0.00005`² | **当前D128精确scheduler** |
+| MMA32 BF16 BM128 | softmax，40960，D192，GPU0共享VRAM | 7373.3us | 174.8T | 212V级，零scratch | `0.00315`² | 实验支持配置 |
+| **MMA32 BF16 BM128** | softmax，40960，D128，GPU0 | **3714.5--3723.9us** | **230.7--231.3T** | 104V+128A，112 SGPR，16KB LDS，零scratch | `0.00315`² | **当前HW-slot+精确scheduler** |
 | **FP8 BM128 / 每wave 32行** | softmax，40960，D192 | **4115.5us** | **313.1T** | 220V，12KB LDS，零scratch | `0.00030`¹ | **当前支持配置** |
 | FP8 BM64 / 每wave 16行 | softmax，40960，D192 | 6168.0us | 208.9T | 134V，12KB LDS，零scratch | `0.00030`¹ | 当前支持配置 |
 | **FP8 BM128 / 每wave 32行** | softmax，40960，D128 | **3592.1us** | **239.1T** | 166V，8KB LDS，零scratch | `0.00027`¹ | **当前支持配置** |
@@ -447,6 +469,12 @@ completion skew = 160.881 cycles/tile
 ¹ FP8精度对比等价kernel语义：Q/K/V为E4M3FNUZ，online softmax每32-token tile将未归一化
 probability乘240后量化到FP8，GEMM2使用原生FP8 MFMA，输出为BF16。小shape相对标准未量化
 `softmax(QK)@V`的算法级`rel_l2=0.02204`，相对等价online-FP8 reference为`5.39e-5`。
+
+² MMA32的40960性能使用`CHECK=0`，精度数字来自相同代码的小shape独立验证。GPU 0在测试前后
+`gfx=0%`，但外部进程曾常驻约94% VRAM；不可与独占空闲卡结果直接混用。初始性能日志为
+`/tmp/attn-mma32-gpu0-perf.log`；BF16 D128原始stage基线ATT为
+[`../ui_output_agent_27126_dispatch_82`](../ui_output_agent_27126_dispatch_82)，最终硬件wave-slot
+与精确scheduler ATT为[`../ui_output_agent_61472_dispatch_82`](../ui_output_agent_61472_dispatch_82)。
 
 ## 8. 增量实验日志
 
@@ -564,6 +592,60 @@ probability乘240后量化到FP8，GEMM2使用原生FP8 MFMA，输出为BF16。�
 - BF16正式回归：BM128/D128为3537.1us / 242.9T，`rel_l2=0.00319`，与改前一致。
 - 决策：**增加为当前支持配置**。
 
+### 2026-07-31：32x32 MFMA与128-bit grouped K读取
+
+- 接口：`MMA_MN=16|32`；`MMA_MN=32`只支持`BM=128`，`BM=64`以`MMA_MN=32 only supports BM=128`在构建前失败。
+- Atom：BF16使用`MFMA(32,32,8)`，FP8使用`MFMA(32,32,16)`；仍固定4 waves，每wave负责32行query。
+- GEMM1读取：BF16 `k_perm1=(4,2,2):(1,8,4)`，FP8为`(8,2,2):(1,16,8)`。每个128-bit K group显式按nested坐标`(ki,kg)`调用两次atom，BF16每次消费4个、FP8每次消费8个。
+- 全局K布局：BF16 MMA32使用`(4,2,2,2):(D,8D,4D,16D)`补偿32-row score置换；MMA16与FP8原布局保持不变。
+- GEMM2：MMA32使用同一grouped K permutation。BF16 V为128-bit；FP8 V的单atom operand是8 FP8，FlyDSL generic `make_tiled_copy_A`对128-bit retile会留下`ub.poison`，因此仍使用合法的64-bit V读取。Q/K保持128-bit。
+- FP8 probability：32x32 C fragment的16个score按线性顺序打包为两个8-FP8 K16 atom；MMA32使用独立的host V row inverse permutation。
+- 小shape正确性：BF16 D128/D192均为`rel_l2=0.00315`；FP8 D128/D192相对等价online-FP8 reference分别为`0.00005/0.00003`。默认MMA16 BF16/FP8回归不变。
+- ISA（D128）：BF16为64条`v_mfma_f32_32x32x8_bf16`、212V、96 SGPR、16KB LDS、零scratch，buffer load全部128-bit；FP8为32条`v_mfma_f32_32x32x16_fp8_fp8`、158V、68 SGPR、8KB LDS、零scratch，Q/K为128-bit、V为64-bit。
+- GPU0性能环境：测试触发与结束时`gfx=0%`，但外部进程常驻约94% VRAM；全尺寸reference因显存不足，使用`CHECK=0`。BF16 D128/D192为4429.2us / 194.0T、7373.3us / 174.8T；FP8 D128/D192为4297.9us / 199.9T、3969.1us / 324.6T。
+- 对比：D128 FP8相对BF16耗时低2.96%、吞吐高3.04%；D192 FP8相对BF16耗时低46.17%、吞吐高85.70%。该比例仍受共享GPU环境影响。
+- 产物：`/tmp/attn-mma32-gpu0-perf.log`。
+- 决策：**增加为实验支持配置**。
+
+### 2026-08-01：BF16 D128 MMA32移动setprio边界（已取消）
+
+- 根因ATT：[`../ui_output_agent_27126_dispatch_82`](../ui_output_agent_27126_dispatch_82)。两个resident wave只有`40.08%`时间priority相反，`46.34%`时间同时为`prio2`；首批slot完成skew中位数为`1,384,316 cycles`。原窗口的快slot约为`p2=1324 / p0=840 cycles`，慢slot的`p2`又被放大到约1796 cycles，形成priority正反馈。
+- 对照：同一套分析在历史MMA16 ATT中得到`84.55%--87.51%`物理反相，证明静态setprio次数正确不代表MMA32也能自然反相。
+- 失败反证：`prio2→prio1`为`4428us`级，与原方案等价；全部`prio0`为`4347us`级，反而快约1.9%；仅将prologue初始priority改0仍为`4432us`级；反转窗口方向为`4484us`级；在GEMM2后、barrier前升权为`4159--4161us`，仍慢于barrier后升权的`4095us`级。
+- 历史候选边界：BF16 D128 MMA32让`prio2`跨过V load、GEMM1、K prefetch、probability EXP和running-sum，在probability写回后降为`prio0`；K LDS写、O rescale、BF16 pack、GEMM2和workgroup barrier完成后恢复`prio2`，再执行K LDS read并跨回边进入下一次GEMM1。
+- 严格性能：同机器边界的`priority=0` control为`4440.3--4441.1us / 193.4--193.5T`，最终候选为`4026.3--4032.0us / 213.1--213.4T`。移除实验开关后的最终源码复测为`4020.6--4041.0us / 212.6--213.7T`；相对最初`4429.2us / 194.0T`，中位时间下降约8.99%。
+- 历史候选ATT位于`/tmp/attn-mma32-prio-scoped-final/ui_output_agent_21317_dispatch_82`。物理反相提升到`93.11%`，同时`prio2`降到`1.43%`，同时`prio0`为`5.46%`；slot完成skew中位数降到`78,682 cycles`，相对原始下降94.32%；`p2/p0`窗口中位数为`1256 / 1360 cycles`。
+- ATT stall：相对原始trace，总stall下降4.42%，MFMA stall下降3.11%，LDS指令stall下降82.74%，barrier stall下降5.37%，但LDS wait上升213.48%。动态MFMA和setprio工作量不变；资源从`84V+132A`调整为`88V+128A`，combined VGPR仍为216，另有112 SGPR、16KB LDS、零scratch，保持2 waves/SIMD。
+- 跨shape反证：直接将新边界推广到BF16 D192、FP8 D128、FP8 D192会分别回退到`163.8T / 188.2--188.5T / 291.3--291.4T`。最终用编译期条件将其限定为`MMA_MN=32 && BF16 && D=128`；其他MMA32配置恢复原边界后分别回到`175.0T / 199.8T / 324.4--324.5T`。
+- 决策：虽然墙钟和ATT均改善，但该方法改变了stage0/stage1定义，不符合“与MMA16相同完整stage反相”的目标，**取消并恢复原stage边界**。
+
+### 2026-08-01：`HW_ID.WAVE_ID`四级priority与MMA32精确scheduler
+
+- 目标：保持MMA16的完整stage边界不变。stage0为K global预取/LDS写与softmax；stage1为GEMM2并跨回边覆盖下一tile的V预取/GEMM1。用`s_getreg_b32 ..., hwreg(HW_REG_HW_ID, 0, 4)`读取每个SIMD内的物理wave slot。
+- 指定映射：slot0使用`stage0=1, stage1=3`，slot1使用`stage0=0, stage1=2`。最终ISA只有1条`s_getreg_b32`，结果常驻`s19`；ATT确认`sl0`只执行`1/3`、`sl1`只执行`0/2`。每个stage边界因`s_setprio`只有立即数形式，需要`s_cmp + s_cbranch + s_setprio + s_branch`选择路径。gfx942不支持gfx12+的`s_setprio_inc_wg`，无法用该指令消除热循环分支。
+- 正确性/资源：小shape`rel_l2=0.00315`；40960 ATT CSV为`84V+132A`、112 SGPR、16KB LDS、零scratch，combined VGPR allocation为216，仍为2 waves/SIMD。小shape ISA dump为212 VGPR、74 SGPR，两种口径不可混用。
+- 初始性能：只加指定映射时为`4519.2--4522.0us / 190.0--190.1T`，ATT运行`4523.1us / 189.9T`；比原stage control `4432.1--4433.0us / 193.8--193.9T`慢约2.0%。初始ATT位于`/tmp/attn-mma32-hwslot/ui_output_agent_25427_dispatch_82`：完整stage反相仅从原MMA32的`40.08%`升到`44.55%`，首批slot完成skew从`1,384,316`恶化到`2,034,602 cycles`。
+- 相位漂移：两个slot到达同一stage边界的差值从首tile约`3--4K cycles`近似线性增长到末尾约`2.03M cycles`。slot0的stage0/stage1中位耗时约`860/1324 cycles`，slot1约`1160/2592 cycles`；固定给slot0高一级priority放大了原有速度差，不能建立负反馈。
+- 派生反证：将固定高一级priority交换给slot1（slot0 `0/2`、slot1 `1/3`）更慢，为`4657.0--4662.9us / 184.3--184.5T`。令两个异相方向都保持2级差（slot0 `1/2`、slot1 `0/3`）也只有`4525.1--4529.3us / 189.7--189.8T`。
+- scheduler根因：MMA32每个D128 GEMM只有BF16 16条/FP8 8条MFMA，但旧`hot_loop_scheduler`仍使用MMA16配额。BF16 GEMM2的前14条MFMA配额先耗尽，8条DSRD仅前2条与MFMA配对，末6条连续聚团；越靠后的`ds_read_b128` stall越高，单条最高约0.48M cycles。
+- 第一修复：BF16 D128改为GEMM1 `VMEM1:MFMA2`，GEMM2前置4条MFMA后`(DSRD1:MFMA1)×8`。ISA中DSRD最大连续团从6降为1，DSRD stall从3.176M降为2.176M（-31.5%），总stall下降11.6%，stage反相升到65.99%；性能`4005.1--4005.8us / 214.5T`。
+- VMEM比例：同时修改GEMM1/GEMM2配额的早期`1:1`实验为213.9--214.0T，存在混淆；隔离后仅将GEMM1改为`VMEM1:MFMA1`，GEMM2保持DSRD 1:1，性能提升到`3847.1--3852.1us / 223.0--223.3T`。stage反相达到85.99%--86.92%，与MMA16的87.51%基本一致；slot skew降到10--30K cycles。
+- DSRD位置：DSRD从GEMM2调度区起点开始虽然反相最高，但DSRD/DSWR发出竞争较高。保持VMEM 1:1后，BF16在DSRD链前放3条MFMA达到最终`3714.5--3723.9us / 230.7--231.3T`。完整离散扫描为lead0≈223T、lead1≈218T、lead2≈214T、lead3≈231T、lead4≈226T、lead5≈228T、lead6≈211T、lead7≈205T、lead8≈204T；lead3是明确的长期相位峰值。
+- 其他反证：`MFMA→DSRD`顺序为217.8T，必须保持`DSRD→MFMA`请求先发；第二组DSWR插入深度0/1/2/4均为3847--3852us，墙钟不可区分，采用结构最简单的连续DSWR。`VMEM:MFMA=1:2`最终为221.3--221.7T，低于1:1。
+- 最终ATT：[`../ui_output_agent_61472_dispatch_82`](../ui_output_agent_61472_dispatch_82)，单SE1、单dispatch、16 waves、891条ISA、源码映射99.89%、无截断，snapshot与最终源码逐字一致。完整stage反相为`80.18%`，同时stage1/0为`18.37%/1.45%`，slot完成skew中位数仅`17,304 cycles`；stage中位时长为slot0 `1160/1352`、slot1 `888/1596 cycles`。相对初始HW-slot ATT，总stall约下降13%，MFMA stall约下降31%，DSRD stall`3.176M→2.773M`且单条最大`0.484M→0.312M`；总stall率`64.91%→60.9%`。LDS wait约0.505M，消费端`lgkmcnt`不在主关键路径。资源为104V+128A、112 SGPR、16KB LDS、零scratch，combined VGPR 232，保持2 waves/SIMD。
+- 无`s_getreg`消融：保持完全相同的D128 scheduler，只恢复统一`stage0=0/stage1=2`。ISA中`s_getreg_b32`从1条降为0，VGPR/occupancy不变；小shape`rel_l2=0.00315`。40960三次为`3971.7--3978.5us / 216.0--216.3T`，相对有`s_getreg`的`3718.2--3719.7us / 231.0--231.1T`耗时增加约6.92%。ATT见[`../ui_output_agent_47082_dispatch_82`](../ui_output_agent_47082_dispatch_82)：完整stage反相`80.18%→61.63%`，slot skew`17,304→754,750 cycles`，总stall增加4.84%，MFMA stall增加19.19%，VMEM-load stall增加63.79%；LDS stall虽下降38.14%，没有转化为关键路径收益。结论：当前scheduler仍需要HW-slot priority，最终代码已恢复`s_getreg`。
+- K LDS写位置消融：仅对BF16 D128 MMA32移动`fx.copy(cp_cs, ld_cur, ...)`，精度均保持`rel_l2=0.00315`、资源仍232 combined VGPR/零scratch。移到BF16 `_cvt_f32_to_bf16(frag_St)`之后时，ISA中两条`ds_write_b128`落在rounding ADD之后、pack `v_perm`之前，性能回退到`4000.7--4001.1us / 214.7T`。移到O rescale/state更新之后、BF16 pack之前时，两个静态substep被后端排成不对称写入位置，性能为`3974.5--4020.1us / 213.8--216.1T`。恢复原位置（probability完成后、O rescale之前）立即回到`3720.3--3725.3us / 230.6--230.9T`。结论：后移K写破坏lead3 scheduler的长期相位，原位置保留。
+- K LDS写拆分消融：BF16 D128的per-thread copy fragment为`((8,2),1,1)`，内层`2`恰对应两条128-bit atom。用nested slice拆成两个`(8,1,1)`子片后，ISA仍是每substep两条`ds_write_b128`，没有降成窄写；combined VGPR从232增到236，仍为2 waves、零scratch。`C-X-X-C`中control两端为`3715.9/3716.2us`（231.2T），拆分模式均明显回退：half0原位、half1在O-rescale后为`4106.1--4109.4us / 209.1--209.2T`；half1移到BF16 conversion后或pack后分别为`4088.0/4086.2us`（210.2T）；交换half身份为`4090.7us / 210.1T`。因此回退与half身份和后移距离无关，根因是把一次完整copy拆成两个独立调度边界并破坏长期相位。拆分候选ATT为[`../ui_output_agent_47059_dispatch_82`](../ui_output_agent_47059_dispatch_82)：单SE1、单dispatch、16 waves、891条ISA、源码映射99.89%、无截断，正式资源108V+132A、112 SGPR、16KB LDS、零scratch，ATT运行`4109.7us / 209.0T`。代码已恢复整片原位写，复测`3715.9--3725.3us / 230.6--231.2T`。
+- softmax EXP/DSWR交织：基线源码虽然在probability EXP后写K，后端会把整片两条`ds_write_b128`提前到16条probability `v_exp_f32`之前。使用callback并在两侧加入`sched_barrier(0)`可强制真实机器序列`EXP×8 → DSWR×2 → EXP×8`，不拆两个128-bit atom；但combined VGPR从232增到236，`C-X-X-C`从control `3718.8/3722.7us`回退到`4009.7--4012.1us / 214.1--214.2T`。去掉硬barrier后，后端把DSWR重新移出EXP块。源码切点4/8/12中，4和12生成逐字相同ISA，说明普通`sched_barrier`不能按TRANS数量建立流水。空SSA anchor、side-effect inline `v_exp_f32`和`~{memory}`也无法阻止EXP跨越LDS写；8标量struct anchor还触发LLVM限制，均已撤销。
+- `sched_group_barrier`机制验证：LLVM IGroupLP原生支持`VALU=0x002`、`DS_WRITE=0x200`和`TRANS=0x400`。独立gfx942 MIR验证从“8 VALU + 2个连续DSWR”精确重排为`VALU2 → DSWR1 → VALU2 → DSWR1 → VALU4`；attention中同一次完整`fx.copy`产生的两条`ds_write_b128`也能用两个`DS_WRITE(size=1)` group分别定位，无需拆copy。mask、独立`syncid=1`及`_sched_valu/_sched_trans/_sched_ds_write` helper均局部定义在`test_attn_gemm.py`，不修改FlyDSL目录。
+- 对称`EXP8/DSWR2/EXP8`反证：使用独立`syncid=1`发出`TRANS(size=9) → DS_WRITE(size=2) → TRANS(size=8)`可精确生成“1条running-max correction EXP + 8条probability EXP → 2条DSWR → 8条probability EXP”；首组为9是因为同一调度区更早还有1条correction EXP。资源仍232 combined VGPR/零scratch，但性能从`3715.6/3716.1us / 231.3T`回退到`4124.1--4145.8us / 207.2--208.5T`。这只否定该位置，不否定group机制。
+- resident-wave LDS冲突分析：ATT文件需按同一SIMD的`slot0/slot1`配对，`wv0/wv1`是前后两代wave，不能互配。基线K写几乎没有`DS_WRITE↔DS_WRITE`冲突（32 cycles内为0），真正冲突是`DS_WRITE↔DS_READ`：40960次K写中22583次（55.1%）距对方slot的DS read不超过32 cycles，最近距离中位数28 cycles；近冲突写stall均值64.5 cycles，远离时43.8 cycles。slot0/slot1写stall均值严重不对称，为102.2/8.2 cycles。
+- 分散两条写的位置扫描：保持一次完整copy，分别用`DS_WRITE(size=1)`把两条写插入16条probability EXP。粗扫`(0,4)/(0,8)/(0,12)/(2,6)/(2,10)/(2,14)/(4,8)/(4,12)/(6,10)/(6,14)/(8,12)/(10,14)`和局部细扫确认`(2,6)`为稳定峰值；邻域`(2,5)=248.2T`、`(2,7)=245.1T`、`(1,5)=245.4T`，而`(2,6)=249.1--249.3T`。最终机器序列为“1 correction EXP + 2 probability EXP → DSWR1 → 4 EXP → DSWR1 → 10 EXP”，资源仍104V+128A、112 SGPR、16KB LDS、零scratch、2 waves/SIMD，`rel_l2=0.00315`。
+- 最终`(2,6)` ATT：[`../ui_output_agent_22766_dispatch_82`](../ui_output_agent_22766_dispatch_82)，单SE1、单dispatch、16 waves、891条ISA、源码映射99.89%、无截断，snapshot与最终源码逐字一致，ATT运行`3451.1us / 248.9T`。相对[`../ui_output_agent_61472_dispatch_82`](../ui_output_agent_61472_dispatch_82)，总stall`29.73M→25.67M`（-13.7%）、MFMA stall`14.59M→12.62M`（-13.5%）、barrier stall`3.28M→0.92M`（-72.0%）、K写stall`2.26M→1.82M`（-19.7%）。跨slot 32-cycle `W↔R`近冲突`22583→5057`（55.1%→12.3%），最近距离中位数`28→276 cycles`，两条写间距中位数`68→220 cycles`，slot0/slot1写stall均值从`102.2/8.2→46.5/42.2 cycles`。
+- 额外物理slot错位消融：在`(2,6)`基础上将已有stage0 priority分支融合4/8/16-cycle `s_nop`，分别延迟slot0或slot1。无延迟为`249.3T`；slot0延迟4/8/16为`247.0/235.6/241.2T`，slot1延迟4/8/16为`249.1/238.0/245.4T`。因此单wave`(2,6)`已经通过现有反相调度自然错开resident waves；额外slot延迟无收益，最终不保留NOP。
+- shape/dtype分派：精确scheduler仅对`MMA_MN=32 && D=128`启用；BF16/FP8的DSRD前置MFMA分别为3/0条，EXP/DSWR `(2,6)`交织进一步仅对BF16 D128启用。BF16/FP8 D128分别达到`249.1--249.3T / 218.4T`；D192保持旧scheduler，BF16/FP8分别为`174.8T / 324.4T`。
+- 决策：**采纳D128硬件wave-slot priority、精确`VMEM 1:1 / DSRD 1:1` scheduler，以及BF16 D128的完整copy `EXP2/DSWR1/EXP4/DSWR1/EXP10`交织；D192保持原scheduler。**
+
 ## 9. 后续方向与硬约束
 
 当前已处理两个静态substep的VMEM不对称。后续优先分析候选ATT中剩余的物理共同空洞：
@@ -578,6 +660,11 @@ probability乘240后量化到FP8，GEMM2使用原生FP8 MFMA，输出为BF16。�
 - 保持两个`vector<8xf32>` running-sum，不做scalar提前归约。
 - 保持7项loop state，不跨回边携带`frag_V`。
 - 当前完整静态MFMA门槛是128，scratch必须为0，VGPR必须不超过256。
-- 不插NOP补延迟，不机械提前K read，不只压缩scale/EXP链。
+- 不插NOP补跨slot延迟，不机械提前K read，不只压缩scale/EXP链。
 - 不再全局增加DSRD/MFMA间隔，不移动K写/barrier位置，不在DS写后强制VALU分组；这些路线已严格回退。
+- MMA32 D128保持`VMEM:MFMA=1:1`与`DSRD:MFMA=1:1`；BF16/FP8分别前置3/0条MFMA。BF16相位对前置MFMA数量高度敏感。
+- MMA32 BF16 D128源码仍保持一次完整K LDS copy，位置在probability完成后、O rescale之前；机器级仅用schedule groups采用已验证的`EXP2/DSWR1/EXP4/DSWR1/EXP10`，不要后移源码copy到BF16 pack附近。
+- 不拆分MMA32 BF16 D128的两个128-bit K LDS写atom；分片会稳定回退约9--10%。
+- EXP/DSWR位置高度敏感：不要复用失败的对称`EXP8/DSWR2/EXP8`或中后段写位置；BF16 D128只保留已验证的`EXP2/DSWR1/EXP4/DSWR1/EXP10`。
+- MMA32 D192保持旧scheduler，不得机械复用D128配额。
 - 每次顺序：候选自身精度 → ISA资源 → 40960严格A/B → 必要时ATT/PMC。
