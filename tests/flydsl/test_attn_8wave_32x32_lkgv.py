@@ -29,127 +29,60 @@ V_EXP和V_MFMA可以co-issue但是似乎MFMA指令的执行周期会被延长，
 提升空间已经不大。
 """
 
-def _cvt_f32_to_bf16(c_frag):
-    """f32 -> bf16:add 0x8000 舍入 + 截断(round-half-up),比 .to(fx.BFloat16) 的 RNE + NaN 处理少指令。
-    移植自 src/contrib/flydsl/moe_gemm_splitk.py::_cvt_f32_to_bf16。"""
-    from flydsl._mlir.ir import IntegerType
-
-    c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
-    round_bit = fx.Uint32(0x8000)
-    rounded = c_frag.load().bitcast(fx.Uint32) + round_bit
-
-    """此处显式使用 has_side_effects 的 v_perm_b32 指令来实现 bf16 的转换的关键步骤：
-        (rounded >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
-       是为了防止v_perm指令物化延迟导致调度失效
-    """
-    selector = fx.Uint32(0x07060302)
-    packed = []
-    for i in range_constexpr(0, rounded.numel, 2):
-        packed.append(
-            llvm.inline_asm(
-                IntegerType.get_signless(32),
-                [arith.unwrap(rounded[i + 1]), arith.unwrap(rounded[i]), arith.unwrap(selector)],
-                "v_perm_b32 $0, $1, $2, $3",
-                "=v,v,v,s",
-                has_side_effects=True,
-            )
-        )
-    c_frag_bf16.store(fx.Vector.from_elements(packed, dtype=fx.Uint32).bitcast(fx.BFloat16))
-
-    return c_frag_bf16
-
-
-LOG2E = 1.4426950408889634
-
-
 def _maxnumf(a, b):
     """Non-NaN-propagating f32 max used by the wave softmax reduction."""
     return type(a)(arith.maxnumf(arith.unwrap(a), arith.unwrap(b)))
 
-# compiler generate v_pk_add/mul which cannot co-issue with MFMA, we have to manually call v_add/mul
-def _eltwise_op(inst_name, *args):
-    """Elementwise native v_*_f32 for an f32 FlyDSL vector."""
-    from flydsl._mlir.dialects import vector as _vd
-    from flydsl._mlir.ir import F32Type, VectorType
+@flyc.jit
+def online_softmax(fragS, fragO, ml_states, sm_scale_log2):
+    m_in, l_in = ml_states
+    scores = fxh.eltwise_op("v_mul_f32", fragS.load(), sm_scale_log2)
+    tile_max = scores.reduce("max")
+    tile_max = _maxnumf(tile_max, tile_max.shuffle_xor(32, 64))
 
-    def get_size(raw):
-        if fx.const_expr(isinstance(raw.type, VectorType)):
-            return raw.type.shape[0]
-        else:
-            return 1
+    new_max = m_in
+    corr = fx.Float32(1.0)
+    threshold = fxh.eltwise_op("v_add_f32", m_in, fx.Float32(8.0))
+    if tile_max > threshold:
+        new_max = tile_max
+        # do not use inline asm inside scf.If, use intrinsic instead
+        corr = fxh.eltwise_op("llvm.amdgcn.exp2.f32", m_in - new_max)
 
-    def get_item(raw, i):
-        if fx.const_expr(isinstance(raw.type, VectorType)):
-            return _vd.extract(raw, static_position=[i], dynamic_position=[])
-        else:
-            return raw
+    probs = fxh.eltwise_op("v_exp_f32", scores - new_max)
+    tile_sum = probs.reduce("add")
 
-    args_raw = []
-    n = 1
-    constrain_str = "=v"
-    inst_str = f"{inst_name} $0"
-    for i, src in enumerate(args):
-        raw = arith.unwrap(src)
-        args_raw.append(raw)
-        vec_width = get_size(raw)
-        assert (vec_width == 1) or (vec_width == n) or (n==1), f"{n=} {vec_width=}"
-        n = max(n, vec_width)
-        inst_str += f", ${i+1}"
-        constrain_str += ",v"
+    # this fake instruction avoids spills for some reason
+    tile_sum = fxh.eltwise_op("; fake inst", tile_sum, 0.0)
+    l_out = fxh.eltwise_op("v_fma_f32", l_in, corr, tile_sum)
+    fragS.store(probs)
 
-    f32 = F32Type.get()
-    if inst_name.startswith("llvm."):
-        outs = [
-            llvm.call_intrinsic(
-                f32,
-                inst_name,
-                [get_item(raw, i) for raw in args_raw],
-                [],
-                [],
-            )
-            for i in range(n)
-        ]
-    else:
-        outs = [
-            llvm.inline_asm(
-                f32,
-                [get_item(raw, i) for raw in args_raw],
-                inst_str,
-                constrain_str,
-                has_side_effects=False,
-            )
-            for i in range(n)
-        ]
-    if fx.const_expr(n > 1):
-        return fx.Vector(_vd.from_elements(VectorType.get([n], f32), outs))
-    else:
-        return outs[0]
+    # Rebase the accumulated numerator only when the lazy max advances.
+    def rescale_output():
+        fragO.store(fxh.eltwise_op("v_mul_f32", fragO.load(), corr))
 
-def s_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
-    """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
-    vm_lo = vmcnt & 0xF
-    vm_hi = (vmcnt >> 4) & 0x3
-    rocdl.s_waitcnt(vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14))
+    @flyc.jit
+    def rescale_if_needed():
+        if corr < fx.Float32(1.0):
+            rescale_output()
 
-    """
-    # LLVM AMDGPU BACKEND cannot understand inline asm in many early stage
-    # so it will insert extra s_waitcnt, use llvm intrinsic(rocdl wrapper) instead
-    asm_string = ""
-    asm_string += "s_waitcnt "
-    if vmcnt >= 0: asm_string += f"vmcnt({vmcnt}) "
-    if lgkmcnt >= 0: asm_string += f"lgkmcnt({lgkmcnt}) "
-    llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string=asm_string,
-        constraints="",
-        has_side_effects=True,
+    rescale_if_needed()
+
+    frag_bf16 = fxh.cvt_f32_to_bf16(fragS)
+    # A 32x32 MFMA C fragment holds 16 values per lane. Reinterpret them
+    # as four B fragments of four bf16 values for the BN=32 PV reduction.
+    frag_bf16 = fx.make_view(
+        fx.get_iter(frag_bf16),
+        fx.make_layout((4, 1, (2, 2)), (1, 0, (4, 8))),
     )
-    """
+
+    ml_states[0] = new_max
+    ml_states[1] = l_out
+    return frag_bf16
 
 @functools.cache
 def MHA(H, D, BM, BN):
     num_threads = 512
+    LOG2E = 1.4426950408889634
     sm_scale_log2 = float(LOG2E / (D**0.5))
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
@@ -332,50 +265,6 @@ def MHA(H, D, BM, BN):
         if wave_m == 1:
             gpu.barrier()
 
-        def online_softmax(frag, ml_states):
-            m_in, l_in = ml_states
-            scores = _eltwise_op("v_mul_f32", frag.load(), sm_scale_log2)
-            tile_max = scores.reduce("max")
-            tile_max = _maxnumf(tile_max, tile_max.shuffle_xor(32, 64))
-
-            new_max = m_in
-            corr = fx.Float32(1.0)
-            threshold = _eltwise_op("v_add_f32", m_in, fx.Float32(8.0))
-            if tile_max > threshold:
-                new_max = tile_max
-                # do not use inline asm inside scf.If, use intrinsic instead
-                corr = _eltwise_op("llvm.amdgcn.exp2.f32", m_in - new_max)
-
-            probs = _eltwise_op("v_exp_f32", scores - new_max)
-            tile_sum = probs.reduce("add")
-
-            # this fake instruction avoids spills for some reason
-            tile_sum = _eltwise_op("; fake inst", tile_sum, 0.0)
-            l_out = _eltwise_op("v_fma_f32", l_in, corr, tile_sum)
-            frag.store(probs)
-
-            # Rebase the accumulated numerator only when the lazy max advances.
-            def rescale_output():
-                fragO.store(_eltwise_op("v_mul_f32", fragO.load(), corr))
-
-            @flyc.jit
-            def rescale_if_needed():
-                if corr < fx.Float32(1.0):
-                    rescale_output()
-
-            rescale_if_needed()
-
-            frag_bf16 = _cvt_f32_to_bf16(frag)
-            # A 32x32 MFMA C fragment holds 16 values per lane. Reinterpret them
-            # as four B fragments of four bf16 values for the BN=32 PV reduction.
-            frag_bf16 = fx.make_view(
-                fx.get_iter(frag_bf16),
-                fx.make_layout((4, 1, (2, 2)), (1, 0, (4, 8))),
-            )
-
-            ml_states[0] = new_max
-            ml_states[1] = l_out
-            return frag_bf16
 
         def kv_step(block_n, lds_buff_id, ml_states):
 
@@ -411,7 +300,7 @@ def MHA(H, D, BM, BN):
                 fx.rocdl.sched_mfma(100)
 
             rocdl.sched_barrier(0)
-            s_waitcnt(vmcnt=vm_cnt, lgkmcnt=0)
+            fxh.s_waitcnt(vmcnt=vm_cnt, lgkmcnt=0)
             gpu.barrier() # ::::::::: wave-group barrier ::::::::: 切换调度
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
@@ -419,7 +308,7 @@ def MHA(H, D, BM, BN):
             # Online softmax. Each wave owns 32 query rows. XOR-32 combines the
             # two lanes holding different key columns for the same query row.
             if fx.const_expr(is_valid_block_n(block_n)):
-                fragS_bf16 = online_softmax(fragS, ml_states)
+                fragS_bf16 = online_softmax(fragS, fragO, ml_states, sm_scale_log2)
 
             rocdl.sched_barrier(0)
             gpu.barrier()
@@ -431,7 +320,7 @@ def MHA(H, D, BM, BN):
             #   2nd half: Q@K part for block_n+1
             
             if fx.const_expr(is_valid_block_n(block_n)):
-                s_waitcnt(vmcnt=0)
+                fxh.s_waitcnt(vmcnt=0)
                 fx.gemm(tmma2, fragO, fragV, fragS_bf16, fragO)
 
             if fx.const_expr(is_valid_block_n(block_n + 1)):
@@ -449,7 +338,7 @@ def MHA(H, D, BM, BN):
         #==============================================================================
         ml_states = [fx.Float32(float("-inf")), fx.Float32(0.0)]
 
-        kv_step(-4, 0, ml_states)
+        #kv_step(-4, 0, ml_states)
         kv_step(-3, 1, ml_states)
         kv_step(-2, 0, ml_states)
         kv_step(-1, 1, ml_states)
@@ -476,11 +365,11 @@ def MHA(H, D, BM, BN):
             gpu.barrier()
 
         l = results[1]
-        l = _eltwise_op("v_add_f32", l, l.shuffle_xor(32, 64))
+        l = fxh.eltwise_op("v_add_f32", l, l.shuffle_xor(32, 64))
         fragO.store(fragO.load() * (fx.Float32(1.0) / l))
 
         # save fragO
-        fragO_bf16 = _cvt_f32_to_bf16(fragO)
+        fragO_bf16 = fxh.cvt_f32_to_bf16(fragO)
         flyobj.store_tiled_mma_fragC(tmma2, fragO_bf16, fx.select(o_tile, [1,0]), copy_atom_bits=64)
 
     @flyc.jit

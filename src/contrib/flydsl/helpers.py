@@ -384,6 +384,7 @@ class FlyObjCache:
     @local_cache
     def create_thr_mma(self, dtype, wave_mnk, mfma_MNKB = None):
         mfma_K_lut = {
+                    fx.Float8E4M3FN: 32,
                     fx.Float8E4M3FNUZ: 32,
                     fx.BFloat16: 16,
                     fx.Float16: 16,
@@ -583,6 +584,118 @@ class FlyObjCache:
             tile_mn,
         )
         return tiled_copy.get_slice(fx.thread_idx.x), copy_atom
+
+
+def cvt_f32_to_bf16(c_frag):
+    """f32 -> bf16:add 0x8000 舍入 + 截断(round-half-up),比 .to(fx.BFloat16) 的 RNE + NaN 处理少指令。
+    移植自 src/contrib/flydsl/moe_gemm_splitk.py::_cvt_f32_to_bf16。"""
+    from flydsl._mlir.ir import IntegerType
+
+    c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
+    round_bit = fx.Uint32(0x8000)
+    rounded = c_frag.load().bitcast(fx.Uint32) + round_bit
+
+    """此处显式使用 has_side_effects 的 v_perm_b32 指令来实现 bf16 的转换的关键步骤：
+        (rounded >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+       是为了防止v_perm指令物化延迟导致调度失效
+    """
+    selector = fx.Uint32(0x07060302)
+    packed = []
+    for i in range_constexpr(0, rounded.numel, 2):
+        packed.append(
+            llvm.inline_asm(
+                IntegerType.get_signless(32),
+                [fx.arith.unwrap(rounded[i + 1]), fx.arith.unwrap(rounded[i]), fx.arith.unwrap(selector)],
+                "v_perm_b32 $0, $1, $2, $3",
+                "=v,v,v,s",
+                has_side_effects=True,
+            )
+        )
+    c_frag_bf16.store(fx.Vector.from_elements(packed, dtype=fx.Uint32).bitcast(fx.BFloat16))
+
+    return c_frag_bf16
+
+
+# compiler generate v_pk_add/mul which cannot co-issue with MFMA, we have to manually call v_add/mul
+def eltwise_op(inst_name, *args):
+    """Elementwise native v_*_f32 for an f32 FlyDSL vector."""
+    from flydsl._mlir.dialects import vector as _vd
+    from flydsl._mlir.ir import F32Type, VectorType
+
+    def get_size(raw):
+        if fx.const_expr(isinstance(raw.type, VectorType)):
+            return raw.type.shape[0]
+        else:
+            return 1
+
+    def get_item(raw, i):
+        if fx.const_expr(isinstance(raw.type, VectorType)):
+            return _vd.extract(raw, static_position=[i], dynamic_position=[])
+        else:
+            return raw
+
+    args_raw = []
+    n = 1
+    constrain_str = "=v"
+    inst_str = f"{inst_name} $0"
+    for i, src in enumerate(args):
+        raw = fx.arith.unwrap(src)
+        args_raw.append(raw)
+        vec_width = get_size(raw)
+        assert (vec_width == 1) or (vec_width == n) or (n==1), f"{n=} {vec_width=}"
+        n = max(n, vec_width)
+        inst_str += f", ${i+1}"
+        constrain_str += ",v"
+
+    f32 = F32Type.get()
+    if inst_name.startswith("llvm."):
+        outs = [
+            llvm.call_intrinsic(
+                f32,
+                inst_name,
+                [get_item(raw, i) for raw in args_raw],
+                [],
+                [],
+            )
+            for i in range(n)
+        ]
+    else:
+        outs = [
+            llvm.inline_asm(
+                f32,
+                [get_item(raw, i) for raw in args_raw],
+                inst_str,
+                constrain_str,
+                has_side_effects=False,
+            )
+            for i in range(n)
+        ]
+    if fx.const_expr(n > 1):
+        return fx.Vector(_vd.from_elements(VectorType.get([n], f32), outs))
+    else:
+        return outs[0]
+
+def s_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
+    """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
+    vm_lo = vmcnt & 0xF
+    vm_hi = (vmcnt >> 4) & 0x3
+    rocdl.s_waitcnt(vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14))
+
+    """
+    # LLVM AMDGPU BACKEND cannot understand inline asm in many early stage
+    # so it will insert extra s_waitcnt, use llvm intrinsic(rocdl wrapper) instead
+    asm_string = ""
+    asm_string += "s_waitcnt "
+    if vmcnt >= 0: asm_string += f"vmcnt({vmcnt}) "
+    if lgkmcnt >= 0: asm_string += f"lgkmcnt({lgkmcnt}) "
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string=asm_string,
+        constraints="",
+        has_side_effects=True,
+    )
+    """
 
 
 def asm_mark(mark: str):
