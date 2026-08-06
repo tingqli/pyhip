@@ -115,7 +115,26 @@ we can see extra dependencies(edges) between `ScheduleDAG`'s nodes when `llvm.am
 `ScheduleDAGMILive::schedule` calls：
   - `postProcessDAG();`  calls 
     - `IGroupLPDAGMutation::apply` scan region(BB w/o call) for sched intrinsics:
-      - SCHED_BARRIER:  `ScheduleDAGInstrs::addEdge` 从region(BB)中查找指定类型的指令，该指令到SCHED_BARRIER或者SCHED_BARRIER到该指令的额外的`dependency edge`，来防止后继schedule algo改变此类型指令相对SCHED_BARRIER的未知关系
-      - SCHED_GROUP_BARRIER: 因为 `sched.group`仅仅提供了`(指令类型,个数,次序)`信息，因此首先要在当前region(不包含call的Basic Block)中找到所有可能匹配到sched.group的指令，然后使用`PipelineSolver::solve`算法完成匹配，然后根据匹配引入新的`dependency edge`，这个过程容易出现误匹配，但是因为新引入`dependency edge`时会检查已有的依赖，如果出现环，违背了已有依赖就放弃添加，所以不会对正确性产生不良影响。比较常见的VALU指令在匹配阶段很容易出现错误匹配导致失效。
+      - SCHED_BARRIER: `ScheduleDAGInstrs::addEdge` scans region (BB) for requested
+        instruction kinds; it adds extra `dependency edge` links to or from
+        SCHED_BARRIER, so later scheduling cannot change that kind's order vs the barrier.
+        
+        (CN) SCHED_BARRIER:  `ScheduleDAGInstrs::addEdge` 从region(BB)中查找指定类型的指令，
+        该指令到SCHED_BARRIER或者SCHED_BARRIER到该指令的额外的`dependency edge`，来防止后继
+        schedule algo改变此类型指令相对SCHED_BARRIER的未知关系.
+      - 
+      SCHED_GROUP_BARRIER: `sched.group` only stores `(instruction type, count, order)`;
+        the pass gathers candidates in the call-free Basic Block and runs
+        `PipelineSolver::solve`, then adds new `dependency edge` links from the match.
+        Matching mis-fires often; edge insertion skips adds that would cycle or
+        contradict existing deps, so correctness is preserved. VALU ops are often
+        mis-matched here, so the scheduling hint may have no effect.
+        
+        (CN) SCHED_GROUP_BARRIER: 因为 `sched.group`仅仅提供了`(指令类型,个数,次序)`信息，因此
+        首先要在当前region(不包含call的Basic Block)中找到所有可能匹配到sched.group的指令，然后
+        使用`PipelineSolver::solve`算法完成匹配，然后根据匹配引入新的`dependency edge`，这个过程
+        容易出现误匹配，但是因为新引入`dependency edge`时会检查已有的依赖，如果出现环，违背了已有
+        依赖就放弃添加，所以不会对正确性产生不良影响。比较常见的VALU指令在匹配阶段很容易出现错误匹配
+        导致失效。
 
 
