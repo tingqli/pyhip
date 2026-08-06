@@ -27,11 +27,25 @@ def _maxnumf(a, b):
     return type(a)(arith.maxnumf(arith.unwrap(a), arith.unwrap(b)))
 
 @flyc.jit
-def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in):
+def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
+                   kv_block_n, kv_len,
+                   is_all_kv_valid: fx.Constexpr[bool],
+                   KV_BLOCK_SIZE: fx.Constexpr[int]):
     """
     old_max/l_in是会被更新的，使用SSA方式return更新后值，不要使用mutable container例如list来修改
     """
+    # assert 0, f"{fragS}"
+    if fx.const_expr(not is_all_kv_valid):
+        # mask out invalid kv positions
+        #  set to "-inf" if  i + (lane_id & 32) + kv_pos0 >= kv_len
+        lane_id = fx.thread_idx.x % 64
+        kv_limit = kv_len - kv_block_n * KV_BLOCK_SIZE - (lane_id < 32).select(fx.Int32(0), fx.Int32(16))
+        for i in fx.range_constexpr(16):
+            if i >= kv_limit:
+                fragS[i,0,0] = float("-inf")
+
     scores = fragS.load() * sm_scale_log2
+
     row_max = scores.reduce("max")
     row_max = _maxnumf(row_max, row_max.shuffle_xor(32, 64))
 
@@ -78,6 +92,14 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
 
     任务复杂，从极简pipeline开始构建，保证框架正确之后再开始性能调优迭代
 
+    is_causal为True时， kv_len >= qo_len, 并且attention只需要计算causal_mask合法区域即可：
+
+                rows = torch.arange(qo_len, device="cuda").unsqueeze(1)
+                cols = torch.arange(kv_len, device="cuda").unsqueeze(0)
+                causal_mask = cols <= (kv_len - qo_len + rows)
+     - num_kv_pages 只需循环到某个位置即可，后面的page都不用参考
+     - 某个kv-page之前都是non-causal的，之后才需要施加causal_mask
+     - causal_mask 施加于 32x32 的 score 矩阵上，
     """
     BM, BN = 256, 32
     num_threads = 512
@@ -89,7 +111,9 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
 
     @flyc.jit
     def attn_pipeline(q_tile, k_tile, v_tile, o_tile,
-                      ptr_kv_page_table, num_kv_pages,
+                      q_pos0, kv_len,
+                      ptr_kv_page_table,
+                      num_kv_pages, last_page_len,
                       qk_scale_log2, v_s):
         tid = fx.thread_idx.x
         lane_id = fx.thread_idx.x % 64
@@ -251,7 +275,9 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         v_tcopy = flyobj.get_tiled_mma_copy(v_copy_atom, tmma2, "A")
         v_thrcopy = v_tcopy.get_slice(tid)
 
-        def kv_step(block_n, lds_buff_id, cur_max, l_in, kv_page_id0, kv_page_id1, kv_page_id2, kv_page_id3):
+        def kv_step(block_n, lds_buff_id, cur_max, l_in,
+                    kv_page_id0, kv_page_id1, kv_page_id2, kv_page_id3,
+                    is_all_kv_valid: fx.Constexpr[bool] = True):
             # first block_n in pipeline is -3
             kv_page_id4 = ptr_kv_page_table[block_n + 4]
             # kv_page_id1, kv_page_id2, kv_page_id3, kv_page_id4
@@ -294,7 +320,11 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             rocdl.sched_barrier(0)
 
             if fx.const_expr(is_valid_block_n(block_n)):
-                cur_max, l_in = online_softmax(fragS, fragO, qk_scale_log2, cur_max, l_in)
+                # q_pos0, kv_len
+                cur_max, l_in = online_softmax(fragS, fragO, qk_scale_log2, cur_max, l_in,
+                                               block_n, kv_len,
+                                               is_all_kv_valid,
+                                               BN)
 
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
@@ -342,14 +372,26 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         cur_max, l_in, page0, page1, page2, page3 = kv_step(-2, 0, cur_max, l_in, page0, page1, page2, page3)
         cur_max, l_in, page0, page1, page2, page3 = kv_step(-1, 1, cur_max, l_in, page0, page1, page2, page3)
 
-        for page_i, state in range(0, num_kv_pages, 2, init=[cur_max, l_in, page0, page1, page2, page3]):
+        # special process for last page: last_page_len
+        num_kv_pages_valid = num_kv_pages - 2
+        if (num_kv_pages & 1) == 1:
+            num_kv_pages_valid = num_kv_pages - 1
+        for page_i, state in range(0, num_kv_pages_valid, 2, init=[cur_max, l_in, page0, page1, page2, page3]):
             cur_max, l_in, page0, page1, page2, page3 = state
             cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i, 0, cur_max, l_in, page0, page1, page2, page3)
             cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i+1, 1, cur_max, l_in, page0, page1, page2, page3)
             results = yield [cur_max, l_in, page0, page1, page2, page3]
 
-        l = results[1]
-        l = fxh.eltwise_op("v_add_f32", l, l.shuffle_xor(32, 64))
+        cur_max, l_in, page0, page1, page2, page3 = results
+
+        cur_max, l_in, page0, page1, page2, page3 = kv_step(
+            num_kv_pages_valid, 0, cur_max, l_in, page0, page1, page2, page3, is_all_kv_valid=False)
+
+        if (num_kv_pages_valid + 1) < num_kv_pages:
+            cur_max, l_in, page0, page1, page2, page3 = kv_step(
+                num_kv_pages_valid + 1, 1, cur_max, l_in, page0, page1, page2, page3, is_all_kv_valid=False)
+
+        l = fxh.eltwise_op("v_add_f32", l_in, l_in.shuffle_xor(32, 64))
         fragO.store(fragO.load() * (v_s / l))
 
         fragO_bf16 = fxh.cvt_f32_to_bf16(fragO)
@@ -451,7 +493,8 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             kv_ind_start = kv_indptr[batch_i]   # i32
             kv_ind_end = kv_indptr[batch_i + 1] # i32
             num_kv_pages = kv_ind_end - kv_ind_start # i32
-            kv_len = (num_kv_pages - 1) * page_size + kv_last_page_lens[batch_i]
+            last_page_len = kv_last_page_lens[batch_i]
+            kv_len = (num_kv_pages - 1) * page_size + last_page_len
 
 
             """
@@ -501,7 +544,8 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             v_tile = fx.group(v_tile, 1, 3)
 
             attn_pipeline(q_tile,k_tile, v_tile, o_tile,
-                          fx.get_iter(kv_page_indices) + kv_ind_start, num_kv_pages, 
+                          query_start, kv_len, fx.get_iter(kv_page_indices) + kv_ind_start,
+                          num_kv_pages,  last_page_len,
                           qk_scale_log2, v_s)
 
             # find next part of query tokens to process

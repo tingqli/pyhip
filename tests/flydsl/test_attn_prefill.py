@@ -46,7 +46,7 @@ def vectorize_kv_cache(
     return k_cache, v_cache
 
 def test_batch_prefill_mimo_fp8_vectorized_page64(
-    batch_size, qo_len, kv_len, quant_dtype, is_causal
+    batch_size, qo_len, kv_len, quant_dtype = dtypes.fp8, is_causal = False
 ):
     """Cover MiMo's direct cached-prefill contract and ragged last pages."""
     torch.manual_seed(20260730)
@@ -214,9 +214,19 @@ def test_batch_prefill_mimo_fp8_vectorized_page64(
     assert diff < 0.001, f"big diff: {diff}"
     #verify_fp8_output()
 
+
+test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=3)
+test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=13)
+test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=23)
+test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=53)
+test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=83)
+test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=256*10+23)
+
+
 multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
 
 # batch_size, qo_len, kv_len, quant_dtype, is_causal = 4, 65536, 65536, dtypes.fp8, False
 batch_size, qo_len, kv_len, quant_dtype, is_causal = 4, 256*40, 256*10, dtypes.fp8, False
 
 test_batch_prefill_mimo_fp8_vectorized_page64(batch_size, qo_len, kv_len, quant_dtype, is_causal)
+
