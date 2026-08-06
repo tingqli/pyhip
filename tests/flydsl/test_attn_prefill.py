@@ -202,8 +202,11 @@ def test_batch_prefill_mimo_fp8_vectorized_page64(
                 q_ref_batch.transpose(0, 1).unsqueeze(0),
                 k_ref.transpose(0, 1).unsqueeze(0),
                 v_ref.transpose(0, 1).unsqueeze(0),
-                #attn_mask=causal_mask,
-                is_causal = is_causal
+                # Paged-prefill uses a bottom-right-aligned causal mask when
+                # Q and KV lengths differ.  PyTorch's is_causal=True is
+                # top-left aligned, so pass the explicit mask instead.
+                attn_mask=causal_mask,
+                is_causal=False,
             )
             .squeeze(0)
             .transpose(0, 1)
@@ -214,19 +217,20 @@ def test_batch_prefill_mimo_fp8_vectorized_page64(
     assert diff < 0.001, f"big diff: {diff}"
     #verify_fp8_output()
 
+if 0:
+    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=3)
+    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=13)
+    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=23)
+    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=53)
+    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=83)
+    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=256*10+23)
 
-test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=3)
-test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=13)
-test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=23)
-test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=53)
-test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=83)
-test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=256*10+23)
 
+    multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
 
-multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
+    # batch_size, qo_len, kv_len, quant_dtype, is_causal = 4, 65536, 65536, dtypes.fp8, False
+    batch_size, qo_len, kv_len, quant_dtype, is_causal = 4, 256*40, 256*10, dtypes.fp8, False
 
-# batch_size, qo_len, kv_len, quant_dtype, is_causal = 4, 65536, 65536, dtypes.fp8, False
-batch_size, qo_len, kv_len, quant_dtype, is_causal = 4, 256*40, 256*10, dtypes.fp8, False
+    test_batch_prefill_mimo_fp8_vectorized_page64(batch_size, qo_len, kv_len, quant_dtype, is_causal)
 
-test_batch_prefill_mimo_fp8_vectorized_page64(batch_size, qo_len, kv_len, quant_dtype, is_causal)
-
+test_batch_prefill_mimo_fp8_vectorized_page64(1, 32768, 32768, dtypes.fp8, True)

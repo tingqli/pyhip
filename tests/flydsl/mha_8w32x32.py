@@ -28,21 +28,49 @@ def _maxnumf(a, b):
 
 @flyc.jit
 def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
-                   kv_block_n, kv_len,
+                   q_pos0, kv_block_n, kv_len, qo_len,
                    is_all_kv_valid: fx.Constexpr[bool],
-                   KV_BLOCK_SIZE: fx.Constexpr[int]):
+                   KV_BLOCK_SIZE: fx.Constexpr[int],
+                   is_causal: fx.Constexpr[bool]):
     """
     old_max/l_in是会被更新的，使用SSA方式return更新后值，不要使用mutable container例如list来修改
+
+    is_causal为True时， kv_len >= qo_len, 并且attention只需要计算causal_mask合法区域即可：
+
+                rows = torch.arange(qo_len, device="cuda").unsqueeze(1)
+                cols = torch.arange(kv_len, device="cuda").unsqueeze(0)
+                causal_mask = cols <= (kv_len - qo_len + rows)
+     - num_kv_pages 只需循环到某个位置即可，后面的page都不用参考
+     - 某个kv-page之前都是non-causal的，之后才需要施加causal_mask
+     - causal_mask 施加于 32x32 的 score 矩阵上，    
     """
     # assert 0, f"{fragS}"
     if fx.const_expr(not is_all_kv_valid):
         # mask out invalid kv positions
-        #  set to "-inf" if  i + (lane_id & 32) + kv_pos0 >= kv_len
-        lane_id = fx.thread_idx.x % 64
-        kv_limit = kv_len - kv_block_n * KV_BLOCK_SIZE - (lane_id < 32).select(fx.Int32(0), fx.Int32(16))
-        for i in fx.range_constexpr(16):
-            if i >= kv_limit:
-                fragS[i,0,0] = float("-inf")
+        lane_id = fx.thread_idx.x & 63
+        col_lane = (lane_id < 32).select(fx.Int32(0), fx.Int32(16))
+        col_block = fx.Int32(kv_block_n * KV_BLOCK_SIZE)
+        if fx.const_expr(not is_causal):
+            # Keep both sides explicitly i32.  A Python constexpr loop index
+            # otherwise promotes this comparison to MLIR index, whose ordered
+            # comparison is unsigned; a negative limit would then look huge
+            # and leave invalid tail columns unmasked.
+            for i in fx.range_constexpr(16):
+                kv_pos = col_block + col_lane + fx.Int32(i)
+                if kv_pos >= kv_len:
+                    fragS[i,0,0] = float("-inf")
+        else:
+            # Bottom-right causal mask:
+            #   kv_pos <= kv_len - qo_len + q_pos
+            wave_id = fx.thread_idx.x // 64
+            row_lane = fx.thread_idx.x & 31
+            q_pos = q_pos0 + wave_id * 32 + row_lane
+            causal_limit = kv_len - qo_len + q_pos
+            for i in fx.range_constexpr(16):
+                kv_pos = col_block + col_lane + fx.Int32(i)
+                if kv_pos > causal_limit:
+                    fragS[i,0,0] = float("-inf")
+
 
     scores = fragS.load() * sm_scale_log2
 
@@ -91,15 +119,6 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
     over cu_seqlens_q to find next part of query tokens to handle， until all query tokens are handled.
 
     任务复杂，从极简pipeline开始构建，保证框架正确之后再开始性能调优迭代
-
-    is_causal为True时， kv_len >= qo_len, 并且attention只需要计算causal_mask合法区域即可：
-
-                rows = torch.arange(qo_len, device="cuda").unsqueeze(1)
-                cols = torch.arange(kv_len, device="cuda").unsqueeze(0)
-                causal_mask = cols <= (kv_len - qo_len + rows)
-     - num_kv_pages 只需循环到某个位置即可，后面的page都不用参考
-     - 某个kv-page之前都是non-causal的，之后才需要施加causal_mask
-     - causal_mask 施加于 32x32 的 score 矩阵上，
     """
     BM, BN = 256, 32
     num_threads = 512
@@ -111,7 +130,7 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
 
     @flyc.jit
     def attn_pipeline(q_tile, k_tile, v_tile, o_tile,
-                      q_pos0, kv_len,
+                      q_pos0, query_len, kv_len, full_qo_len,
                       ptr_kv_page_table,
                       num_kv_pages, last_page_len,
                       qk_scale_log2, v_s):
@@ -322,9 +341,10 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             if fx.const_expr(is_valid_block_n(block_n)):
                 # q_pos0, kv_len
                 cur_max, l_in = online_softmax(fragS, fragO, qk_scale_log2, cur_max, l_in,
-                                               block_n, kv_len,
+                                               q_pos0, block_n, kv_len, full_qo_len,
                                                is_all_kv_valid,
-                                               BN)
+                                               BN,
+                                               is_causal)
 
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
@@ -372,25 +392,69 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         cur_max, l_in, page0, page1, page2, page3 = kv_step(-2, 0, cur_max, l_in, page0, page1, page2, page3)
         cur_max, l_in, page0, page1, page2, page3 = kv_step(-1, 1, cur_max, l_in, page0, page1, page2, page3)
 
-        # special process for last page: last_page_len
-        num_kv_pages_valid = num_kv_pages - 2
-        if (num_kv_pages & 1) == 1:
-            num_kv_pages_valid = num_kv_pages - 1
-        for page_i, state in range(0, num_kv_pages_valid, 2, init=[cur_max, l_in, page0, page1, page2, page3]):
+        if fx.const_expr(is_causal):
+            # Bottom-right causal diagonal for this Q tile:
+            #   kv_pos <= kv_len - full_qo_len + q_pos
+            #
+            # Pages [0, causal_full_pages) are valid for even the first query
+            # row in this tile, so they need no element mask.  Round this
+            # prefix down to an even count because the hot loop processes two
+            # pages with compile-time LDS buffer IDs 0/1.
+            causal_base = kv_len - full_qo_len + q_pos0
+            causal_full_pages = (causal_base + 1) // BN
+            num_kv_pages_valid = (causal_full_pages // 2) * 2
+
+            # Only pages intersecting at least one active query row need to be
+            # visited by the masked tail.  Later pages are fully causal-masked
+            # for the whole Q tile and must be skipped, rather than sent
+            # through online softmax as an all-minus-infinity block.
+            causal_pages = (causal_base + query_len + BN - 1) // BN
+            num_kv_pages_to_process = (causal_pages < num_kv_pages).select(
+                causal_pages, num_kv_pages
+            )
+        else:
+            # Reserve the final one or two pages for the masked tail.  The last
+            # physical page may be ragged; for an even page count its partner
+            # is handled by the same specialized pair.
+            num_kv_pages_valid = num_kv_pages - 2
+            if (num_kv_pages & 1) == 1:
+                num_kv_pages_valid = num_kv_pages - 1
+            num_kv_pages_to_process = num_kv_pages
+
+        # Seed the loop-carried result outside the loop.  For one-page inputs
+        # num_kv_pages_valid is zero, so a value assigned only by `yield`
+        # would not dominate the epilogue (and FlyDSL rejects the IR).
+        results = [cur_max, l_in, page0, page1, page2, page3]
+        for page_i, state in range(0, num_kv_pages_valid, 2, init=results):
             cur_max, l_in, page0, page1, page2, page3 = state
             cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i, 0, cur_max, l_in, page0, page1, page2, page3)
             cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i+1, 1, cur_max, l_in, page0, page1, page2, page3)
             results = yield [cur_max, l_in, page0, page1, page2, page3]
 
-        cur_max, l_in, page0, page1, page2, page3 = results
-
-        cur_max, l_in, page0, page1, page2, page3 = kv_step(
-            num_kv_pages_valid, 0, cur_max, l_in, page0, page1, page2, page3, is_all_kv_valid=False)
-
-        if (num_kv_pages_valid + 1) < num_kv_pages:
+        # Process the specialized tail in page pairs.  Non-causal has only one
+        # or two tail pages; causal may have several pages intersected by this
+        # Q tile's diagonal.
+        # Keep lds_buff_id as the compile-time constants 0/1: kv_step uses it
+        # to index Python fragment lists, so deriving it from the dynamic
+        # induction variable (page_i & 1) is not legal FlyDSL.
+        for page_i, state in range(
+            num_kv_pages_valid, num_kv_pages_to_process, 2, init=results
+        ):
+            cur_max, l_in, page0, page1, page2, page3 = state
             cur_max, l_in, page0, page1, page2, page3 = kv_step(
-                num_kv_pages_valid + 1, 1, cur_max, l_in, page0, page1, page2, page3, is_all_kv_valid=False)
+                page_i, 0,
+                cur_max, l_in, page0, page1, page2, page3,
+                is_all_kv_valid=False,
+            )
+            if fx.Int32(page_i + 1) < num_kv_pages_to_process:
+                cur_max, l_in, page0, page1, page2, page3 = kv_step(
+                    page_i + 1, 1,
+                    cur_max, l_in, page0, page1, page2, page3,
+                    is_all_kv_valid=False,
+                )
+            results = yield [cur_max, l_in, page0, page1, page2, page3]
 
+        cur_max, l_in, page0, page1, page2, page3 = results
         l = fxh.eltwise_op("v_add_f32", l_in, l_in.shuffle_xor(32, 64))
         fragO.store(fragO.load() * (v_s / l))
 
@@ -486,9 +550,11 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
 
         while batch_i < batch_size:
             # process the work
-            query_start = cu_seqlens_q[batch_i] + cur_work_idx * BM
+            query_pos0 = cur_work_idx * BM
+            query_start = cu_seqlens_q[batch_i] + query_pos0
             query_end = fx.Int32(arith.minsi(arith.unwrap(query_start + BM), arith.unwrap(cu_seqlens_q[batch_i + 1])))
             query_len = query_end - query_start
+            full_qo_len = cu_seqlens_q[batch_i + 1] - cu_seqlens_q[batch_i]
 
             kv_ind_start = kv_indptr[batch_i]   # i32
             kv_ind_end = kv_indptr[batch_i + 1] # i32
@@ -544,7 +610,8 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             v_tile = fx.group(v_tile, 1, 3)
 
             attn_pipeline(q_tile,k_tile, v_tile, o_tile,
-                          query_start, kv_len, fx.get_iter(kv_page_indices) + kv_ind_start,
+                          query_pos0, query_len, kv_len, full_qo_len,
+                          fx.get_iter(kv_page_indices) + kv_ind_start,
                           num_kv_pages,  last_page_len,
                           qk_scale_log2, v_s)
 
@@ -620,6 +687,9 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         stream = torch.cuda.current_stream() if stream is None else stream
 
         assert causal == is_causal
+        assert not causal or max_seqlen_k >= max_seqlen_q, (
+            "bottom-right causal attention requires max_seqlen_k >= max_seqlen_q"
+        )
         assert k_descale.numel() == 1
         assert v_descale.numel() == 1
         num_query_tokens, _num_qo_heads, _head_dim = Q.shape
