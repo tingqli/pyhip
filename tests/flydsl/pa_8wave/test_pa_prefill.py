@@ -4,8 +4,10 @@ import math
 import aiter
 from aiter import dtypes, pertoken_quant, per_tensor_quant
 import pyhip
+from dataclasses import dataclass
 
-from mha_8w32x32 import MHA
+from pa_prefill_8w32x32 import MHA
+
 
 def vectorize_kv_cache(
     k_cache, v_cache, num_kv_heads, head_dim_qk, head_dim_v, page_size
@@ -45,17 +47,31 @@ def vectorize_kv_cache(
     )
     return k_cache, v_cache
 
-def test_batch_prefill_mimo_fp8_vectorized_page64(
-    batch_size, qo_len, kv_len, quant_dtype = dtypes.fp8, is_causal = False
+
+@dataclass
+class ModelConfig:
+    name: str
+    num_qo_heads: int
+    num_kv_heads: int
+    head_dim_qk: int
+    head_dim_v: int
+    page_size: int = 32
+    quant_dtype = dtypes.fp8
+    is_causal: bool = True
+
+def test_pa_prefill(
+    modelcfg: ModelConfig, batch_size, qo_len, kv_len, is_causal = None
 ):
+
     """Cover MiMo's direct cached-prefill contract and ragged last pages."""
     torch.manual_seed(20260730)
-    num_qo_heads, num_kv_heads = 16, 1
-    #head_dim, page_size = 192, 64
-    #head_dim, page_size = 128, 16
-    page_size = 32
-    head_dim_qk = 192
-    head_dim_v = 128
+    num_qo_heads, num_kv_heads = modelcfg.num_qo_heads, modelcfg.num_kv_heads
+    page_size = modelcfg.page_size
+    head_dim_qk = modelcfg.head_dim_qk
+    head_dim_v = modelcfg.head_dim_v
+    quant_dtype = modelcfg.quant_dtype
+    is_causal = modelcfg.is_causal if is_causal is None else is_causal
+
     pages_per_seq = math.ceil(kv_len / page_size)
     num_pages = batch_size * pages_per_seq
 
@@ -217,20 +233,19 @@ def test_batch_prefill_mimo_fp8_vectorized_page64(
     assert diff < 0.001, f"big diff: {diff}"
     #verify_fp8_output()
 
-if 0:
-    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=3)
-    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=13)
-    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=23)
-    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=53)
-    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=83)
-    test_batch_prefill_mimo_fp8_vectorized_page64(1, qo_len=256*40, kv_len=256*10+23)
+multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
 
+modelcfg = ModelConfig("Llama3_70B_TP8", num_qo_heads=8, num_kv_heads=1, head_dim_qk=128, head_dim_v=128)
+modelcfg = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=128)
 
-    multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
+if 1:
+    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=3, is_causal = False)
+    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=13, is_causal = False)
+    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=23, is_causal = False)
+    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=53, is_causal = False)
+    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=83, is_causal = False)
+    test_pa_prefill(modelcfg, 1, qo_len=256*40, kv_len=256*10+23, is_causal = False)
 
-    # batch_size, qo_len, kv_len, quant_dtype, is_causal = 4, 65536, 65536, dtypes.fp8, False
-    batch_size, qo_len, kv_len, quant_dtype, is_causal = 4, 256*40, 256*10, dtypes.fp8, False
+    test_pa_prefill(modelcfg, 4, 256*40, 256*10, is_causal = False)
 
-    test_batch_prefill_mimo_fp8_vectorized_page64(batch_size, qo_len, kv_len, quant_dtype, is_causal)
-
-test_batch_prefill_mimo_fp8_vectorized_page64(1, 32768, 32768, dtypes.fp8, True)
+test_pa_prefill(modelcfg, 1, 32768, 32768, is_causal=True)

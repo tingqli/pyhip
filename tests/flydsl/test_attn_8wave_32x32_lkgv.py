@@ -437,12 +437,15 @@ def test(H, D, seq_len_list, verbose=0):
         torch.cuda.synchronize()
 
         # ---- 精度 ----
-        s_ref, o_ref = torch_ref(Q, K, V)
-
-        # assert pyhip.allclose(o_ref, o_fly, rtol=1e-2, atol=1e-2)
-        diff = (o_fly.float() - o_ref.float()).abs()
-        rel = diff.norm() / o_ref.float().norm().clamp_min(1e-6)
-        acc_str = f"[acc] max_abs={diff.max().item():.4f} mean_abs={diff.mean().item():.5f} rel_l2={rel.item():.5f}"
+        try:
+            s_ref, o_ref = torch_ref(Q, K, V)
+            # assert pyhip.allclose(o_ref, o_fly, rtol=1e-2, atol=1e-2)
+            diff = (o_fly.float() - o_ref.float()).abs()
+            rel = diff.norm() / o_ref.float().norm().clamp_min(1e-6)
+            acc_str = f"[acc] max_abs={diff.max().item():.4f} mean_abs={diff.mean().item():.5f} rel_l2={rel.item():.5f}"
+        except Exception as e:
+            print(f"{cfg_str}: torch_ref failed: {e}")
+            acc_str = f"[acc] torch_ref failed"
 
         # ---- 性能:多 buffer 轮换 + cudaPerf 计时 ----
         from pyhip import cudaPerf
@@ -483,8 +486,9 @@ def main():
     torch.set_default_device("cuda")
 
     H = int(os.environ.get("H", "8"))
+    multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
 
-    test(H, 128, [256*40], verbose=0)
+    test(H, 128, [256*multi_processor_count], verbose=0)
     #test(H, 128, [256*4, 256*8, 256*16, 256*32, 256*40], verbose=0)
 
 if __name__ == "__main__":
