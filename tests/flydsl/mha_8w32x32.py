@@ -7,6 +7,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl._mlir.dialects import llvm, vector
@@ -510,11 +511,8 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         v_descale: fx.Tensor,
         kv_last_page_lens: fx.Tensor,
         O_: fx.Tensor,
+        work_counter: fx.Tensor,
     ):
-        # 
-        n_wg = fx.grid_dim.x
-        i_wg = fx.block_idx.x
-
         tid = fx.thread_idx.x
 
         batch_size = fx.size(cu_seqlens_q.shape).to_py_value() - 1
@@ -524,6 +522,37 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         #if tid == 0:
         #    fx.printf("[{}.{}.{}] batch_size = {}", i_wg, i_head_qo, i_head_kv,  batch_size)
 
+        @flyc.jit
+        def fetch_work(work_counter, tid):
+            # Only lane 0 of wave 0 performs one device-scope fetch-add for
+            # the whole workgroup.  Store the result in a per-workgroup global
+            # mailbox, then use a workgroup barrier to broadcast it to all
+            # eight waves.  A wave shuffle alone cannot cross wave boundaries.
+            if tid == 0:
+                addr = fx.ptrtoint(fx.get_iter(work_counter))
+                llvm_ptr = llvm.inttoptr(
+                    ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)
+                )
+                old = llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    llvm_ptr,
+                    as_ir_value(fx.Int32(1)),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                )
+                work_counter[fx.block_idx.x + 1] = fx.Int32(old.result)
+                fxh.s_waitcnt(vmcnt=0)
+            gpu.barrier()
+            ticket = work_counter[fx.block_idx.x + 1]
+            fxh.s_waitcnt(vmcnt=0)
+            gpu.barrier()
+            return ticket
+
+        # Dynamic ticket dispenser: the host initializes the counter to the
+        # number of initially resident workgroups.  Each workgroup first owns
+        # its block id, then fetches additional work when it finishes.
+        linear_work_idx = fx.Int32(fx.block_idx.x)
         batch_i = fx.Int32(0)
         head_i = fx.Int32(0)
         cur_work_idx = fx.Int32(0)
@@ -545,7 +574,7 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             return cur_work_idx, head_i, batch_i, works_per_head
 
         cur_work_idx, head_i, batch_i, works_per_head = skip_works(
-            i_wg, cur_work_idx, head_i, batch_i, works_per_head
+            linear_work_idx, cur_work_idx, head_i, batch_i, works_per_head
         )
 
         while batch_i < batch_size:
@@ -615,9 +644,13 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
                           num_kv_pages,  last_page_len,
                           qk_scale_log2, v_s)
 
-            # find next part of query tokens to process
+            # The next ticket is global rather than grid-stride.  Faster
+            # workgroups therefore naturally process more query tiles.
+            next_linear_work_idx = fetch_work(work_counter, tid)
+            linear_work_delta = next_linear_work_idx - linear_work_idx
+            linear_work_idx = next_linear_work_idx
             cur_work_idx, head_i, batch_i, works_per_head = skip_works(
-                n_wg, cur_work_idx, head_i, batch_i, works_per_head
+                linear_work_delta, cur_work_idx, head_i, batch_i, works_per_head
             )
 
 
@@ -634,6 +667,7 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         v_descale: fx.Tensor,
         kv_last_page_lens: fx.Tensor,
         out: fx.Tensor,
+        work_counter: fx.Tensor,
         num_workgroups: fx.Int32,
         stream: fx.Stream,
     ):
@@ -664,6 +698,7 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             v_descale,
             kv_last_page_lens,
             out,
+            work_counter,
             value_attrs=value_attrs,
         ).launch(grid=(num_workgroups, 1, 1), block=(num_threads, 1, 1), stream=stream)
 
@@ -754,6 +789,12 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             return out
 
         multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
+        with torch.cuda.stream(stream):
+            # slot 0: global ticket counter; slots 1..N: per-workgroup mailbox
+            work_counter = torch.zeros(
+                multi_processor_count + 1, device="cuda", dtype=torch.int32
+            )
+            work_counter[0] = multi_processor_count
 
         cf = getattr(launch, "_cf", None)
         if cf is None:
@@ -770,6 +811,7 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
                 v_descale,
                 kv_last_page_lens,
                 out,
+                work_counter,
                 multi_processor_count,
                 stream,
             )
@@ -787,6 +829,7 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
                 v_descale,
                 kv_last_page_lens,
                 out,
+                work_counter,
                 multi_processor_count,
                 stream,
             )
