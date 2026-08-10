@@ -108,7 +108,7 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
 
 
 @functools.cache
-def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causal):
+def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causal):
     """
     cu_seqlens_q: [batch_size + 1] cu_seqlens_q[i] ~ cu_seqlens_q[i+1] is the range of query tokens in batch i
     kv_indptr   : [batch_size + 1] kv_indptr[i] ~ kv_indptr[i+1] is the range of virtual page ids in batch i
@@ -123,14 +123,18 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
     """
     BM, BN = 256, 32
     num_threads = 512
+    assert page_size in [32, 64, 128]
+    num_BN_per_page = page_size // BN
     LOG2E = 1.4426950408889634
     sm_scale_log2 = float(LOG2E / (head_dim_qk**0.5))
 
     assert (page_size % BN) == 0, f"{page_size=} must be a multiple of {BN=}"
-    assert page_size == BN
 
     @flyc.jit
-    def attn_pipeline(q_tile, k_tile, v_tile, o_tile,
+    def attn_pipeline(q_tile, # [query_start:query_end, head_qo, head_dim_qk]
+                      k_tile, # [BN, (k_vector_size, head_dim_qk // k_vector_size), num_physical_pages, num_BN_per_page]
+                      v_tile, # [head_dim_v, (k_vector_size, BN // k_vector_size), num_physical_pages, num_BN_per_page]
+                      o_tile, # [query_start:query_end, head_qo, head_dim_v]
                       q_pos0, query_len, kv_len, full_qo_len,
                       ptr_kv_page_table,
                       num_kv_pages, last_page_len,
@@ -159,7 +163,7 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         """
         k_tile = fx.composition(
             k_tile,
-            fx.make_tile(fx.make_layout((4, 2, 4), (1, 16, 4)), None, None),
+            fx.make_tile(fx.make_layout((4, 2, 4), (1, 16, 4)), None, None, None),
         )
 
         fragQ = flyobj.load_tiled_mma_fragB(tmma1, q_tile)
@@ -193,6 +197,10 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             fx.make_layout((8, 1, 2), (1, 0, 8)),
             v_tile.dtype,
         )
+
+        # let all 512 threads participate in the copy so no extra if condition involved
+        # 512*16/32 = 256, so all head_dim <= 256 can be padded to 256
+        copy_atom_bits = 64 if head_dim_qk == 128 else 128
 
         @fx.union
         class SharedStorage:
@@ -233,7 +241,6 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
 
         # k_tile layout: Tensor<f8E4M3FNUZ, global, ((4,2,4),(16,8),?):((16,256,64),(1,512),4096)>
         # assert 0, f"{k_tile}"
-        copy_atom_bits = 64 if head_dim_qk == 128 else 128
         num_copy_threads = BN * head_dim_qk * k_tile.dtype.width // copy_atom_bits
         assert BN * head_dim_qk * k_tile.dtype.width % copy_atom_bits == 0
         assert num_copy_threads <= num_threads
@@ -255,7 +262,7 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         k_tile_u32 = recast_tensor(k_tile, fx.Uint32)
 
         glk_thrcopy, _ = flyobj.get_tiled_copy_coalesced_mn(
-            k_tile_u32[None, None, 0],
+            k_tile_u32[None, None, 0, 0],
             copy_atom_bits=copy_atom_bits,
             num_threads=num_copy_threads,
         )
@@ -266,17 +273,17 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         glk_frag = fx.make_fragment_like(glk_dstk[None, None, None, 0])
         num_vm_cnt_load_k = (fx.size(glk_frag.shape).get_static_leaf_int * glk_frag.dtype.width)//copy_atom_bits
         prefetch_fragk_list = [
-            fx.make_fragment_like(glk_srck[None, None, None, 0]),
-            fx.make_fragment_like(glk_srck[None, None, None, 0]),
+            fx.make_fragment_like(glk_srck[None, None, None, 0, 0]),
+            fx.make_fragment_like(glk_srck[None, None, None, 0, 0]),
         ]
 
-        def global_load_k(block_n, page_id, frag_id):
+        def global_load_k(block_n, page_id, bn_id, frag_id):
             if fx.const_expr(is_valid_block_n(block_n)):
                 if fx.const_expr(num_copy_threads == num_threads):
-                    fx.copy(glk_cp_atom, glk_srck[None, None, None, page_id], prefetch_fragk_list[frag_id])
+                    fx.copy(glk_cp_atom, glk_srck[None, None, None, page_id, bn_id], prefetch_fragk_list[frag_id])
                 else:
                     if tid < num_copy_threads:
-                        fx.copy(glk_cp_atom, glk_srck[None, None, None, page_id], prefetch_fragk_list[frag_id])
+                        fx.copy(glk_cp_atom, glk_srck[None, None, None, page_id, bn_id], prefetch_fragk_list[frag_id])
                 return num_vm_cnt_load_k
             else:
                 return 0
@@ -295,103 +302,112 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         v_tcopy = flyobj.get_tiled_mma_copy(v_copy_atom, tmma2, "A")
         v_thrcopy = v_tcopy.get_slice(tid)
 
-        def kv_step(block_n, lds_buff_id, cur_max, l_in,
+        def kv_step(page_n, lds_buff_id, cur_max, l_in,
                     kv_page_id0, kv_page_id1, kv_page_id2, kv_page_id3,
                     is_all_kv_valid: fx.Constexpr[bool] = True):
             # first block_n in pipeline is -3
-            kv_page_id4 = ptr_kv_page_table[block_n + 4]
-            # kv_page_id1, kv_page_id2, kv_page_id3, kv_page_id4
+            kv_page_id4 = ptr_kv_page_table[page_n + 4]
 
-            # Q@K part for block_n
-            prefetch_frag_id = lds_buff_id^1
-            vm_cnt = 0
+            kv_page_0123 = [kv_page_id0, kv_page_id1, kv_page_id2, kv_page_id3]
 
-            ds_store_k(block_n + 1, prefetch_frag_id, lds_buff_id^1) # +2, +1
-            vm_cnt += global_load_k(block_n + 3, kv_page_id3, prefetch_frag_id)   # 
-            
-            if fx.const_expr(is_valid_block_n(block_n)):
-                fragS.fill(0.0)
-                #s_waitcnt(lgkmcnt=0)
-                fx.gemm(tmma1, fragS, fragK, fragQ, fragS)
+            for bn_i in fx.range_constexpr(num_BN_per_page):
+                bn0_page = kv_page_0123[(bn_i + 0)//num_BN_per_page]
+                bn0_part = (bn_i + 0) % num_BN_per_page
+                bn3_page = kv_page_0123[(bn_i + 3)//num_BN_per_page]
+                bn3_part = (bn_i + 3) % num_BN_per_page
 
-                fx.copy(
-                    v_copy_atom,
-                    v_thrcopy.partition_S(v_tile[None, None, kv_page_id0]),
-                    v_thrcopy.retile(fragV),
-                )
-                vm_cnt += num_vm_cnt_load_v
-                #assert 0, f"{vm_cnt} {num_vm_cnt_load_v}"
+                block_n = page_n * num_BN_per_page + bn_i
 
-                # Issue all eight V loads across the first eight QK MFMAs. The
-                # final eight MFMAs hide the latency of the last V load.
-                fx.rocdl.sched_group_barrier(0x200, 1, 0)
-                fx.rocdl.sched_mfma(2)
-                fx.rocdl.sched_vmem(1)
-                for _ in fx.range_constexpr(num_vm_cnt_load_v//2):
+                # Q@K part for block_n
+                prefetch_frag_id = lds_buff_id^1
+                vm_cnt = 0
+
+                ds_store_k(block_n + 1, prefetch_frag_id, lds_buff_id^1) # +2, +1
+                vm_cnt += global_load_k(block_n + 3, bn3_page, bn3_part, prefetch_frag_id)   # 
+                
+                if fx.const_expr(is_valid_block_n(block_n)):
+                    fragS.fill(0.0)
+                    #s_waitcnt(lgkmcnt=0)
+                    fx.gemm(tmma1, fragS, fragK, fragQ, fragS)
+                    fx.copy(
+                        v_copy_atom,
+                        v_thrcopy.partition_S(v_tile[None, None, bn0_page, bn0_part]),
+                        v_thrcopy.retile(fragV),
+                    )
+
+                    vm_cnt += num_vm_cnt_load_v
+                    #assert 0, f"{vm_cnt} {num_vm_cnt_load_v}"
+
+                    # Issue all eight V loads across the first eight QK MFMAs. The
+                    # final eight MFMAs hide the latency of the last V load.
+                    fx.rocdl.sched_group_barrier(0x200, 1, 0)
+                    fx.rocdl.sched_mfma(2)
+                    fx.rocdl.sched_vmem(1)
+                    for _ in fx.range_constexpr(num_vm_cnt_load_v//2):
+                        fx.rocdl.sched_mfma(3)
+                        fx.rocdl.sched_vmem(2)
+                    fx.rocdl.sched_vmem(100)
+                    fx.rocdl.sched_mfma(100)
+
+                rocdl.sched_barrier(0)
+                fxh.s_waitcnt(vmcnt=vm_cnt, lgkmcnt=0)
+                rocdl.s_barrier() # ::::::::: wave-group barrier ::::::::: 切换调度
+                rocdl.s_setprio(0)
+                rocdl.sched_barrier(0)
+
+                if fx.const_expr(is_valid_block_n(block_n)):
+                    # q_pos0, kv_len
+                    cur_max, l_in = online_softmax(fragS, fragO, qk_scale_log2, cur_max, l_in,
+                                                q_pos0, block_n, kv_len, full_qo_len,
+                                                is_all_kv_valid,
+                                                BN,
+                                                is_causal)
+
+                rocdl.sched_barrier(0)
+                rocdl.s_barrier()
+                rocdl.s_setprio(1)
+                rocdl.sched_barrier(0)
+
+                # MFMA-stage :
+                #   1st half: P@V part for block_n
+                #   2nd half: Q@K part for block_n+1
+                
+                if fx.const_expr(is_valid_block_n(block_n)):
+                    vecS = fragS.load()
+                    packed_words = []
+                    for fn in fx.range_constexpr(4):
+                        i = fn * 4
+                        lo = rocdl.cvt_pk_fp8_f32(T.i32, vecS[i], vecS[i + 1], fx.Int32(0), False)
+                        packed = rocdl.cvt_pk_fp8_f32(T.i32, vecS[i + 2], vecS[i + 3], lo, True)
+                        packed_words.append(packed)
+                    packed_fp8 = Vec.from_elements(packed_words, fx.Int32).bitcast(prob_operand.dtype)
+                    prob_operand.store(packed_fp8)
+                    fxh.s_waitcnt(vmcnt=0)
+                    fx.gemm(tmma2, fragO, fragV, prob_operand, fragO)
+
+                if fx.const_expr(is_valid_block_n(block_n + 1)):
+                    flyobj.load_tiled_mma_fragA(tmma1, lds_k, [None, None, lds_buff_id^1], dst=fragK)
+
+
+                # leave some LDS bandwidth in head of MFMA-stage
+                # because head of online-softmax-stage needs LDS
+                for _ in fx.range_constexpr(num_bits_fragK//128//2):
+                    fx.rocdl.sched_group_barrier(0x100, 2, 0)
                     fx.rocdl.sched_mfma(3)
-                    fx.rocdl.sched_vmem(2)
-                fx.rocdl.sched_vmem(100)
                 fx.rocdl.sched_mfma(100)
+                #fx.rocdl.sched_group_barrier(0x200, 1, 0)
+                fx.rocdl.sched_barrier(0)
+                lds_buff_id = lds_buff_id^1
 
-            rocdl.sched_barrier(0)
-            fxh.s_waitcnt(vmcnt=vm_cnt, lgkmcnt=0)
-            rocdl.s_barrier() # ::::::::: wave-group barrier ::::::::: 切换调度
-            rocdl.s_setprio(0)
-            rocdl.sched_barrier(0)
-
-            if fx.const_expr(is_valid_block_n(block_n)):
-                # q_pos0, kv_len
-                cur_max, l_in = online_softmax(fragS, fragO, qk_scale_log2, cur_max, l_in,
-                                               q_pos0, block_n, kv_len, full_qo_len,
-                                               is_all_kv_valid,
-                                               BN,
-                                               is_causal)
-
-            rocdl.sched_barrier(0)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            rocdl.sched_barrier(0)
-
-            # MFMA-stage :
-            #   1st half: P@V part for block_n
-            #   2nd half: Q@K part for block_n+1
-            
-            if fx.const_expr(is_valid_block_n(block_n)):
-                vecS = fragS.load()
-                packed_words = []
-                for fn in fx.range_constexpr(4):
-                    i = fn * 4
-                    lo = rocdl.cvt_pk_fp8_f32(T.i32, vecS[i], vecS[i + 1], fx.Int32(0), False)
-                    packed = rocdl.cvt_pk_fp8_f32(T.i32, vecS[i + 2], vecS[i + 3], lo, True)
-                    packed_words.append(packed)
-                packed_fp8 = Vec.from_elements(packed_words, fx.Int32).bitcast(prob_operand.dtype)
-                prob_operand.store(packed_fp8)
-                fxh.s_waitcnt(vmcnt=0)
-                fx.gemm(tmma2, fragO, fragV, prob_operand, fragO)
-
-            if fx.const_expr(is_valid_block_n(block_n + 1)):
-                flyobj.load_tiled_mma_fragA(tmma1, lds_k, [None, None, lds_buff_id^1], dst=fragK)
-
-
-            # leave some LDS bandwidth in head of MFMA-stage
-            # because head of online-softmax-stage needs LDS
-            for _ in fx.range_constexpr(num_bits_fragK//128//2):
-                fx.rocdl.sched_group_barrier(0x100, 2, 0)
-                fx.rocdl.sched_mfma(3)
-            fx.rocdl.sched_mfma(100)
-            #fx.rocdl.sched_group_barrier(0x200, 1, 0)
-            fx.rocdl.sched_barrier(0)
-
-            return cur_max, l_in, kv_page_id1, kv_page_id2, kv_page_id3, kv_page_id4
+            return lds_buff_id, cur_max, l_in, kv_page_id1, kv_page_id2, kv_page_id3, kv_page_id4
 
         if wave_m == 1:
             gpu.barrier()
-
         cur_max, l_in, page0, page1, page2, page3 = fx.Float32(float("-inf")), fx.Float32(0.0), 0,0,0,ptr_kv_page_table[0]
-
-        cur_max, l_in, page0, page1, page2, page3 = kv_step(-3, 1, cur_max, l_in, page0, page1, page2, page3)
-        cur_max, l_in, page0, page1, page2, page3 = kv_step(-2, 0, cur_max, l_in, page0, page1, page2, page3)
-        cur_max, l_in, page0, page1, page2, page3 = kv_step(-1, 1, cur_max, l_in, page0, page1, page2, page3)
+        lds_buff_id = 1
+        lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(-3, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
+        lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(-2, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
+        lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(-1, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
 
         if fx.const_expr(is_causal):
             # Bottom-right causal diagonal for this Q tile:
@@ -402,14 +418,14 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             # prefix down to an even count because the hot loop processes two
             # pages with compile-time LDS buffer IDs 0/1.
             causal_base = kv_len - full_qo_len + q_pos0
-            causal_full_pages = (causal_base + 1) // BN
+            causal_full_pages = (causal_base + 1) // page_size
             num_kv_pages_valid = (causal_full_pages // 2) * 2
 
             # Only pages intersecting at least one active query row need to be
             # visited by the masked tail.  Later pages are fully causal-masked
             # for the whole Q tile and must be skipped, rather than sent
             # through online softmax as an all-minus-infinity block.
-            causal_pages = (causal_base + query_len + BN - 1) // BN
+            causal_pages = (causal_base + query_len + page_size - 1) // page_size
             num_kv_pages_to_process = (causal_pages < num_kv_pages).select(
                 causal_pages, num_kv_pages
             )
@@ -428,8 +444,8 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         results = [cur_max, l_in, page0, page1, page2, page3]
         for page_i, state in range(0, num_kv_pages_valid, 2, init=results):
             cur_max, l_in, page0, page1, page2, page3 = state
-            cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i, 0, cur_max, l_in, page0, page1, page2, page3)
-            cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i+1, 1, cur_max, l_in, page0, page1, page2, page3)
+            lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
+            lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(page_i+1, lds_buff_id, cur_max, l_in, page0, page1, page2, page3)
             results = yield [cur_max, l_in, page0, page1, page2, page3]
 
         # Process the specialized tail in page pairs.  Non-causal has only one
@@ -442,15 +458,16 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
             num_kv_pages_valid, num_kv_pages_to_process, 2, init=results
         ):
             cur_max, l_in, page0, page1, page2, page3 = state
-            cur_max, l_in, page0, page1, page2, page3 = kv_step(
-                page_i, 0,
-                cur_max, l_in, page0, page1, page2, page3,
+            lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(
+                page_i,
+                lds_buff_id, cur_max, l_in, page0, page1, page2, page3,
                 is_all_kv_valid=False,
             )
+            
             if fx.Int32(page_i + 1) < num_kv_pages_to_process:
-                cur_max, l_in, page0, page1, page2, page3 = kv_step(
-                    page_i + 1, 1,
-                    cur_max, l_in, page0, page1, page2, page3,
+                lds_buff_id, cur_max, l_in, page0, page1, page2, page3 = kv_step(
+                    page_i+1,
+                    lds_buff_id, cur_max, l_in, page0, page1, page2, page3,
                     is_all_kv_valid=False,
                 )
             results = yield [cur_max, l_in, page0, page1, page2, page3]
@@ -625,20 +642,19 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
                                                  num_records_bytes = query_len * num_qo_heads * head_dim_v * (o_tile.dtype.width // 8))
             o_tile = o_tile[None, head_qo, None]
 
-            # K: [num_physical_pages, num_kv_heads, head_dim // k_vector_size, page_size, k_vector_size]
-            # V: [num_physical_pages, num_kv_heads, page_size // k_vector_size, head_dim, k_vector_size]
+            # K: [num_physical_pages, num_BN_per_page, num_kv_heads, head_dim // k_vector_size, BN, k_vector_size]
+            # V: [num_physical_pages, num_BN_per_page, num_kv_heads, BN // k_vector_size, head_dim, k_vector_size]
             #       =>
-            # k_tile: [page_size, (k_vector_size, head_dim // k_vector_size), num_physical_pages]
-            # v_tile: [head_dim, (k_vector_size, page_size // k_vector_size), num_physical_pages]
-            k_tile = K[None, head_kv, None, None, None]
-            v_tile = V[None, head_kv, None, None, None]
-            k_tile = fx.select(k_tile, (2, 3, 1, 0))
-            k_tile = fx.group(k_tile, 1, 3)
+            # k_tile: [BN, (k_vector_size, head_dim // k_vector_size), num_physical_pages, num_BN_per_page]
+            # v_tile: [head_dim, (k_vector_size, BN // k_vector_size), num_physical_pages, num_BN_per_page]
+            k_tile = K[None, None, head_kv, None, None, None] # [num_physical_pages, num_BN_per_page, head_dim // k_vector_size, BN, k_vector_size]
+            v_tile = V[None, None, head_kv, None, None, None] # [num_physical_pages, num_BN_per_page, BN // k_vector_size, head_dim, k_vector_size]
+            k_tile = fx.select(k_tile, (3, 4, 2, 0, 1))    # [BN, k_vector_size, head_dim // k_vector_size, num_physical_pages, num_BN_per_page]
+            k_tile = fx.group(k_tile, 1, 3)                # [BN, (k_vector_size, head_dim // k_vector_size), num_physical_pages, num_BN_per_page]
+            v_tile = fx.select(v_tile, (3, 4, 2, 0, 1))    # [head_dim, k_vector_size, BN // k_vector_size, num_physical_pages, num_BN_per_page]
+            v_tile = fx.group(v_tile, 1, 3)                # [head_dim, (k_vector_size, BN // k_vector_size), num_physical_pages, num_BN_per_page]
 
-            v_tile = fx.select(v_tile, (2, 3, 1, 0))
-            v_tile = fx.group(v_tile, 1, 3)
-
-            attn_pipeline(q_tile,k_tile, v_tile, o_tile,
+            attn_pipeline(q_tile, k_tile, v_tile, o_tile,
                           query_pos0, query_len, kv_len, full_qo_len,
                           fx.get_iter(kv_page_indices) + kv_ind_start,
                           num_kv_pages,  last_page_len,
@@ -675,8 +691,11 @@ def MHA(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causa
         num_physical_pages = K.shape[0].to_py_value()
         k_vector_size = 128 // K.dtype.width
         Q = fxh.view_as_torch_tensor(Q, (num_query_tokens, num_qo_heads, head_dim_qk))
-        K = fxh.view_as_torch_tensor(K, (num_physical_pages, num_kv_heads, head_dim_qk//k_vector_size, page_size, k_vector_size))
-        V = fxh.view_as_torch_tensor(V, (num_physical_pages, num_kv_heads, page_size//k_vector_size, head_dim_v, k_vector_size))
+        K = fxh.view_as_torch_tensor(K, (num_physical_pages, num_kv_heads, head_dim_qk//k_vector_size, num_BN_per_page, BN, k_vector_size))
+        K = fx.select(K, (0, 3, 1, 2, 4, 5))
+        V = fxh.view_as_torch_tensor(V, (num_physical_pages, num_kv_heads, num_BN_per_page, BN//k_vector_size, head_dim_v, k_vector_size))
+        V = fx.select(V, (0, 2, 1, 3, 4, 5))
+
         q_descale = fxh.view_as_torch_tensor(q_descale, (num_query_tokens, num_qo_heads, 1))
         k_descale = fxh.view_as_torch_tensor(k_descale, (1,))
         v_descale = fxh.view_as_torch_tensor(v_descale, (1,))
