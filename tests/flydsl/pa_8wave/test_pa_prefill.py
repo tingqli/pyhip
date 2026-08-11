@@ -244,8 +244,9 @@ multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
 
 model_d128 = ModelConfig("Llama3_70B_TP8", num_qo_heads=8, num_kv_heads=1, head_dim_qk=128, head_dim_v=128)
 model_mimo = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=128)
+model_mimo_padv = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=192)
 
-@pytest.mark.parametrize("modelcfg", [model_d128, model_mimo])
+@pytest.mark.parametrize("modelcfg", [model_d128, model_mimo, model_mimo_padv])
 @pytest.mark.parametrize("is_causal", [True, False])
 @pytest.mark.parametrize("page_size", [32, 64, 128])
 @pytest.mark.parametrize("quant_query_mode", ["per-token", "per-tensor"])
@@ -257,5 +258,5 @@ if __name__ == "__main__":
     quant_query_mode = "per-token"
     quant_query_mode = "per-tensor"
 
-    model = model_mimo
+    model = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=192)
     do_test_pa_prefill(model, 1, 32768, 32768, is_causal=True, page_size=page_size, quant_query_mode=quant_query_mode)

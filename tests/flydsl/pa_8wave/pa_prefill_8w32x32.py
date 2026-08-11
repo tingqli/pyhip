@@ -17,12 +17,6 @@ import pyhip.contrib.flydsl.helpers as fxh
 
 fxh.dump_ir(True)
 
-import pyhip
-
-if __name__ == "__main__":
-    pyhip.set_device()
-
-
 def _maxnumf(a, b):
     """Non-NaN-propagating f32 max used by the wave softmax reduction."""
     return type(a)(arith.maxnumf(arith.unwrap(a), arith.unwrap(b)))
@@ -123,6 +117,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
     """
     BM, BN = 256, 32
     num_threads = 512
+    num_waves = num_threads // 64
     assert page_size in [32, 64, 128]
     num_BN_per_page = page_size // BN
     LOG2E = 1.4426950408889634
@@ -133,10 +128,10 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
     assert quant_query_mode in ["per-token", "per-tensor"], f"quant_query_mode={quant_query_mode} is not supported"
 
     @flyc.jit
-    def attn_pipeline(q_tile, # [query_start:query_end, head_qo, head_dim_qk]
+    def attn_pipeline(q_tile, # [BM, head_dim_qk]
                       k_tile, # [BN, (k_vector_size, head_dim_qk // k_vector_size), num_physical_pages, num_BN_per_page]
                       v_tile, # [head_dim_v, (k_vector_size, BN // k_vector_size), num_physical_pages, num_BN_per_page]
-                      o_tile, # [query_start:query_end, head_qo, head_dim_v]
+                      o_tile, # [BM, head_dim_v]
                       q_pos0, query_len, kv_len, full_qo_len,
                       ptr_kv_page_table,
                       num_kv_pages, last_page_len,
@@ -207,7 +202,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         @fx.union
         class SharedStorage:
             k_lds: fx.Array[k_tile.dtype, 2 * BN * head_dim_qk, 16]
-            o_lds: fx.Array[o_tile.dtype, BM * head_dim_v, 16]
+            o_lds: fx.Array[o_tile.dtype, (BM//8) * head_dim_v, 16]
 
         # mask,base,shift, swizzle always in unit of 128b,
         swz_base = ((128 // k_tile.dtype.width) - 1).bit_length()
@@ -218,22 +213,6 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
             fx.make_ordered_layout((BN, head_dim_qk, 2), (1, 0, 2)),
         )
         lds_k = lds.k_lds.peek().view(layout_k_lds)
-
-        # C-shuffle aliases the same output LDS bytes through two layouts:
-        # tmma2 writes its logical C=(N, M) fragment with N contiguous, while
-        # the epilogue reads the physical tensor as row-major (M, N).  The
-        # bf16 swizzle removes the bank conflicts from the 64-bit C stores.
-        swz_o = fx.SwizzleType.get(3, 3, 3)
-        layout_o_lds_store = fx.make_composed_layout(
-            fx.static(swz_o),
-            fx.make_ordered_layout((head_dim_v, BM), order=(0, 1)),
-        )
-        layout_o_lds_read = fx.make_composed_layout(
-            fx.static(swz_o),
-            fx.make_ordered_layout((BM, head_dim_v), order=(1, 0)),
-        )
-        o_lds_store = lds.o_lds.peek().view(layout_o_lds_store)
-        o_lds_read = lds.o_lds.peek().view(layout_o_lds_read)
 
         # assert 0, f"{lds_ku32} {lds_k}"
 
@@ -492,29 +471,56 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
             # The first barrier also makes it safe to reuse the K/O union storage;
             # the last one guarantees every LDS read finishes before the next
             # persistent work item starts using the union as K storage again.
-            cshuf_atom_w = flyobj.get_universal_copy_atom(fx.BFloat16, 64)
-            cshuf_store = fx.make_tiled_copy_C(cshuf_atom_w, tmma2).get_slice(tid)
-            cshuf_read, cshuf_atom_r = flyobj.get_tiled_copy_coalesced_mn(
-                o_lds_read, copy_atom_bits=128, num_threads=num_threads
-            )
-            out_atom_w = flyobj.get_buffer_copy_atom(fx.BFloat16, 128)
-
-            gpu.barrier()
-            fx.copy(
-                cshuf_atom_w,
-                cshuf_store.retile(fragO_bf16),
-                cshuf_store.partition_D(o_lds_store),
-            )
-            gpu.barrier()
             if wave_m == 0:
                 gpu.barrier()
 
-            o_lds_thread = cshuf_read.partition_S(o_lds_read)
-            o_thread = cshuf_read.partition_D(o_tile)
-            o_coalesced = fx.make_fragment_like(o_lds_thread)
-            fx.copy(cshuf_atom_r, o_lds_thread, o_coalesced)
-            gpu.barrier()
-            fx.copy(out_atom_w, o_coalesced, o_thread)
+            # C-shuffle aliases the same output LDS bytes through two layouts:
+            # tmma2 writes its logical C=(N, M) fragment with N contiguous, while
+            # the epilogue reads the physical tensor as row-major (M, N).  The
+            # bf16 swizzle removes the bank conflicts from the 64-bit C stores.
+            swz_o = fx.SwizzleType.get(3, 3, 3)
+            layout_o_lds_store = fx.make_composed_layout(
+                fx.static(swz_o),
+                fx.make_ordered_layout((head_dim_v, BM//num_waves), order=(0, 1)),
+            )
+            assert head_dim_v % 8 == 0, f"{head_dim_v=} must be a multiple of 8"
+            num_dw4_items = (head_dim_v // 8) * (BM//num_waves)
+            layout_o_lds_read = fx.make_composed_layout(
+                fx.static(swz_o),
+                fx.make_ordered_layout((8, num_dw4_items), order=(0, 1)),
+            )
+            o_lds_store = lds.o_lds.peek().view(layout_o_lds_store)
+            o_lds_read = lds.o_lds.peek().view(layout_o_lds_read)
+            
+            lane_id = fx.thread_idx.x % 64
+            cshuf_atom_w = flyobj.get_universal_copy_atom(fx.BFloat16, 64)
+            cshuf_store = fx.make_tiled_copy_C(cshuf_atom_w, tmma2).get_slice(lane_id)
+            cshuf_atom_r = flyobj.get_universal_copy_atom(fx.BFloat16, 128)
+            out_atom_w = flyobj.get_buffer_copy_atom(fx.BFloat16, 128)
+
+            # o_lds_read [32, head_dim_v]
+            # o_tile (BM, head_dim_v):(d0, 1)
+            o_tile = fx.select(o_tile, [1,0]) # (head_dim_v, BM):(1, d0)
+            o_tile = fx.flat_divide(o_tile, [8, 32]) # (8, 32, head_dim_v//8, BM//32):(1, d0)
+            o_tile = fx.group(fx.select(o_tile, [0, 2, 1, 3]), 1, 3)
+
+            fragO_r = cshuf_store.retile(fragO_bf16)
+            thrv_o_lds_store = cshuf_store.partition_D(o_lds_store)
+
+            for src_wave in fx.range_constexpr(num_waves):
+                # due to limited LDS space for output C-shuffle, do it one wave after another
+                if wave_id == src_wave:
+                    fx.copy(cshuf_atom_w, fragO_r, thrv_o_lds_store)
+
+                gpu.barrier()
+
+                frag = fx.make_fragment_like(o_lds_read[None, 0])
+                for item in range(fx.thread_idx.x, num_dw4_items, num_threads):
+                    src = o_lds_read[None, item]
+                    dst = o_tile[None, item, src_wave]
+                    fx.copy(cshuf_atom_r, src, frag)
+                    fx.copy(out_atom_w, frag, dst)
+                gpu.barrier()
 
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
@@ -745,7 +751,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         k_descale: torch.Tensor,  # per-tensor descaling factor for K, shape [1]  (per-layer scalar, not per-head nor per-sequence)
         v_descale: torch.Tensor,  # per-tensor descaling factor for V, shape [1]  (per-layer scalar, not per-head nor per-sequence)
         kv_last_page_lens: torch.Tensor,  # [batch_size] kv_last_page_lens[i] is the number of valid tokens in the last page of batch i, used to mask out invalid tokens in the last page
-        out: torch.Tensor,  # [num_query_tokens, num_qo_heads, head_dim]
+        out: torch.Tensor = None,  # [num_query_tokens, num_qo_heads, head_dim]
         stream=None,
     ):
         stream = torch.cuda.current_stream() if stream is None else stream
@@ -775,6 +781,21 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         assert kv_last_page_lens.shape[0] == batch_size
         # some internal logic use i32 address
         assert K.numel()*K.element_size() <= 2**31 - 1, f"KV cache size ={K.numel()*K.element_size()} > 2**31 - 1"
+
+        multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
+        with torch.cuda.stream(stream):
+            # slot 0: global ticket counter; slots 1..N: per-workgroup mailbox
+            work_counter = torch.zeros(
+                multi_processor_count + 1, device="cuda", dtype=torch.int32
+            )
+            work_counter[0] = multi_processor_count
+
+            if out is None:
+                out = torch.empty(
+                    (num_query_tokens, num_qo_heads, head_dim_v),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
 
         if 0:
             # reference implementation using torch.nn.functional.scaled_dot_product_attention
@@ -817,13 +838,6 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                 )
             return out
 
-        multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
-        with torch.cuda.stream(stream):
-            # slot 0: global ticket counter; slots 1..N: per-workgroup mailbox
-            work_counter = torch.zeros(
-                multi_processor_count + 1, device="cuda", dtype=torch.int32
-            )
-            work_counter[0] = multi_processor_count
 
         cf = getattr(launch, "_cf", None)
         if cf is None:
@@ -862,5 +876,6 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                 multi_processor_count,
                 stream,
             )
+        return out
 
     return callable
