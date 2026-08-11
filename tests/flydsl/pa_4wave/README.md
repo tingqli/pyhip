@@ -94,29 +94,10 @@ python3 -B tests/flydsl/pa_4wave/test_pa_prefill.py
 
 | 实现 | shape | 中位延迟 | TFLOPS | diff | 备注 |
 |---|---|---:|---:|---:|---|
-| 4-wave历史双K基线 | non-causal, `batch=1, 10240 x 2583` | 874.162 us | 309.836 | 0.000367 | raw-max/pad16前，GPU0，50样本中位数 |
-| 8-wave control | non-causal, `batch=1, 10240 x 2583` | 821.804 us | 329.576 | 0.000367 | GPU0，同口径；4-wave 慢 6.37% |
-| 4-wave历史双K基线 | causal, `batch=1, 32768 x 32768` | 16720.924 us | 328.783 | 0.000268 | raw-max/pad16前，GPU1，50样本中位数 |
-| 8-wave control | causal, `batch=1, 32768 x 32768` | 17035.219 us | 322.717 | 0.000268 | GPU1，同口径；4-wave 快 1.84% |
-| 4-wave单K/3-wave历史版本 | non-causal / causal | 867.325 / 16422.659 us | 312.279 / 334.754 | 同上 | 吞吐略高，但首尾10% ATT显示pairwise相位接近随机 |
-| 8-wave 基线 | non-causal, `batch=4, 10240 x 2560` | 3142 us | 341.7 | 0.000344 | 额外 persistent 负载均衡回归 |
-| 4-wave persistent | non-causal, `batch=4, 10240 x 2560` | 3647 us | 294.4 | 0.000344 | 功能/调度回归，非主性能验收 |
 | **BF16 4-wave D128 max-overlap** | non-causal, `H=1, 40960 x 40960` | **3415.611 us** | **251.49** | short 0.00000246 | 50样本正式中位数；同机严格夹心加速5.69% |
-| BF16参考分支 | non-causal, `H=1, 40960 x 40960` | 4007.1 / 4124.5 us | 215.1 / 208.8 | 历史语义rel_l2约0.003 | 当前4-wave约参考102.2% |
-| **BF16 4-wave D192复用D128 raw-max** | non-causal, `Hq=16,Hkv=1,10240 x 2583` | **1321.686 us** | **204.926** | 0.00000251 | 50样本正式中位数；严格夹心加速1.35% |
-| BF16 D192原softmax control | non-causal, `Hq=16,Hkv=1,10240 x 2583` | 1338.986 us | 202.278 | 同上 | 同输入、同进程位置平衡夹心 |
-| **FP8 4-wave raw-max + split8** | non-causal, `10240 x 2583` | **752.503 us** | **359.93** | 0.000367 | 空闲GPU，50样本中位数；相对raw-max加速1.33% |
-| FP8 4-wave raw-max control | non-causal, `10240 x 2583` | 762.044 us | 355.42 | 0.000367 | 同进程、位置平衡夹心 |
-| **FP8 4-wave最终 vs 8-wave** | non-causal, `10240 x 2583` | **750.723 us** | **360.782** | 0.000367 | 同进程各50样本；吞吐为8-wave的109.50% |
-| FP8 8-wave最终control | non-causal, `10240 x 2583` | 822.044 us | 329.480 | 0.000367 | 空闲GPU6，同输入同进程 |
-| **FP8 4-wave最终 vs 8-wave** | causal, `32768 x 32768` | **15962.581 us** | **688.806** | small 0.000175 | 同进程各50样本；吞吐为8-wave的101.86% |
-| FP8 8-wave最终control | causal, `32768 x 32768` | 16259.192 us | 676.240 | 同上 | 空闲GPU6，同输入同进程 |
-| **FP8 4-wave pad16** | non-causal, `10240 x 2583` | **899.4 / 876.4 us** | **301.2 / 309.0** | 0.000367 | 两轮ABBA：8-wave的96.41% / 99.36% |
-| FP8 8-wave | non-causal, `10240 x 2583` | 867.1 / 870.8 us | 312.4 / 311.0 | 0.000367 | 同buffer、同进程ABBA |
-| **FP8 4-wave pad16** | causal, `32768 x 32768` | **15767.6 us** | **697.3** | 0.000268 | ABBA；8-wave的100.42% |
-| FP8 8-wave | causal, `32768 x 32768` | 15833.1 us | 694.4 | 0.000268 | 同buffer、同进程ABBA |
-| **BF16 4-wave** | non-causal, `batch=1, 10240 x 2583` | **1453.284 us** | **186.369** | 0.00000281 | 外部负载下的50样本中位数 |
-| **BF16 4-wave** | causal, `batch=1, 32768 x 32768` | **32966.564 us** | **166.762** | 小causal 0.00000193 | 长shape跳过64GB reference |
+| **BF16 4-wave D192 raw-max** | non-causal, `Hq=16,Hkv=1,10240 x 2583` | **1322.365 us** | **204.820** | 0.00000251 | 页状态清理后50样本正式中位数 |
+| **FP8 4-wave最终** | non-causal, `Hq=16,Hkv=1,10240 x 2583` | **750.723 us** | **360.782** | 0.000367 | raw-max + split8，50样本中位数 |
+| **FP8 4-wave最终** | causal, `Hq=16,Hkv=1,32768 x 32768` | **15962.581 us** | **688.806** | small 0.000175 | raw-max + split8，50样本中位数 |
 
 最终静态 kernel 资源：`44 VGPR + 132 AGPR / 112 SGPR / 16KB LDS / 0 scratch`，
 combined allocation 176，实际2 waves/SIMD；静态 ISA 有80条FP8 MMA。batch=1走静态
@@ -143,6 +124,14 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   `<=16528 us`。
 - 产物：`/tmp/pa-8wave-baseline-pyc`。
 
+#### 本次性能快照
+
+| 实现 | shape | 延迟 | TFLOPS | 备注 |
+|---|---|---:|---:|---|
+| 8-wave baseline | non-causal, `10240 x 2583` | 824 us | 328.7 | 主验收control |
+| 8-wave baseline | batch=4, `10240 x 2560` | 3142 us | 341.7 | persistent负载均衡control |
+| 8-wave baseline | causal, `32768 x 32768` | 15025 us | 365.9 | 主验收control |
+
 ### 2026-08-09：4-wave FP8/MMA32 功能骨架
 
 - 假设：`mha-fp8-d192` 的 `BM=128 / BN=32 / 4 waves / MMA32 FP8` 数据流可与
@@ -168,6 +157,14 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   `1008 us`。
 - 结论：采纳。
 
+#### 本次性能快照
+
+| 阶段 | non-causal延迟 | 相对初始 |
+|---|---:|---:|
+| 初始串行 | 1838 us | 1.000x |
+| stage旋转 | 1465 us | 0.797x |
+| 跨回边scheduler | 1008 us | 0.548x |
+
 ### 2026-08-09：ATT分析与C-shuffle
 
 - ATT基线：`/tmp/pa4-att/ui_output_agent_1771_dispatch_83`；2039条指令，99.95%
@@ -180,6 +177,13 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   28.52M（57.0%），VMEM store从5.9%降到0.4%。
 - 性能：完整C-shuffle约 `964 us`；半块C-shuffle约 `915 us`。
 - 结论：采纳半块C-shuffle。
+
+#### 本次性能快照
+
+| 实现 | non-causal延迟 | 备注 |
+|---|---:|---|
+| 完整C-shuffle | 964 us | 32KB LDS |
+| 半块C-shuffle | 915 us | 16KB LDS，胜出 |
 
 ### 2026-08-09：静态派发、3-wave occupancy与host开销
 
@@ -194,6 +198,14 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   `874.162 us / 309.836 TFLOPS`。
 - 结论：采纳。
 
+#### 本次性能快照
+
+| 实现 | shape | 延迟 | TFLOPS | 备注 |
+|---|---|---:|---:|---|
+| 静态4-wave双K | non-causal, `10240 x 2583` | 874.162 us | 309.836 | 50样本中位数 |
+| persistent 4-wave | batch=4, `10240 x 2560` | 3647 us | 294.4 | 非主验收路径 |
+| 8-wave control | batch=4, `10240 x 2560` | 3142 us | 341.7 | 同shape control |
+
 ### 2026-08-09：causal 80-CU仿射负载均衡
 
 - 假设：自然query-tile顺序导致静态causal尾部集中在重tile；按80 CU轮转模型均衡每CU
@@ -205,10 +217,27 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   `16720.924 us / 328.783 TFLOPS`。
 - 结论：采纳。
 
+#### 本次性能快照
+
+| causal调度 | `32768 x 32768`延迟 | TFLOPS | 备注 |
+|---|---:|---:|---|
+| 自然静态顺序 | 约17.9 ms | - | 重tile尾部集中 |
+| 轻重交错 | 约16.7 ms | - | 中间方案 |
+| 80-CU仿射映射 | 16720.924 us | 328.783 | 50样本中位数，胜出 |
+
 ### 2026-08-09：失败与中性实验
 
 - K copy改为128-bit（前128线程或四波均衡两段）：正确，但长shape回退约2.7%到
   10.7%；64-bit DS写虽在ATT中stall高，却参与resident-wave相位，回退。
+- 本轮在raw-max+split8最终主线上重新实现128-bit K copy：每页`32*192/16=384`个
+  16B atom。测试了四个wave各前32 lane执行第二轮，以及前128线程执行第二轮；两者
+  与64b control逐元素一致，但分别回退约15.5%和15.4%。候选ISA中K路径由
+  `buffer_load_dwordx2/ds_write_b64`变为`buffer_load_dwordx4/ds_write_b128`，wait
+  78降至67，VGPR从172升至176但occupancy仍为2 waves/SIMD。
+- 128b ATT显示部分线程第二轮copy触发VMEM reconvergence：两条隐式`vmcnt(0)`合计约
+  13.3M stall，最热一条约1142 cycles/次；总stall/MFMA从49.606升至81.839，首尾10%
+  pairwise反相从79.5%降至57.3%。让全部256线程执行第二轮128b load、后128线程读取
+  重复atom后，回退缩小到5.0%，但额外读取2KB/page且LDS写仍需半线程mask，仍未胜出。
 - K LDS write简单后移：单页通过但长序列错误；根因是覆盖仍被后续消费的K prefetch
   fragment。改为正确current/next角色后精度恢复，但墙钟中性。
 - probability乘240+exact rebase：精度略改善但性能回退；主线保持与8-wave一致的
@@ -219,6 +248,19 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
 - causal persistent ticket：约18.9ms；静态自然顺序约17.9ms；每head轻重相邻映射
   严重回退到24.6ms。均已回退。
 
+#### 本次性能快照
+
+| 失败/中性候选 | 延迟或回退 | 结论 |
+|---|---:|---|
+| K copy 128-bit | +2.7%--10.7% | 回退 |
+| K copy 128-bit，四wave各半wave第二轮 | 870.003 us / 311.317T，+15.5% | 回退 |
+| K copy 128-bit，前128线程第二轮 | 867.323 us / 312.279T，+15.4% | 回退 |
+| K copy 128-bit，全线程重复第二轮load | 791.004 us / 342.409T，+5.0% | 回退 |
+| K copy 64-bit control | 约752--753 us / 359--360T | 保留 |
+| direct 64-bit output store | 约1003 us | 回退 |
+| causal persistent ticket | 约18.9 ms | 回退 |
+| causal每head轻重相邻 | 约24.6 ms | 回退 |
+
 ### 2026-08-09：最终验收
 
 - 功能：全部输出finite；ragged page、反转page table、GQA、batch=4、长non-causal、
@@ -228,6 +270,15 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
 - causal同卡：`16720.924 / 17035.219 = 0.9816`，4-wave快1.84%。8-wave在该次
   正式测量中存在DPM双态，因此以用户确认的中位数口径判定。
 - 结论：两条主验收均满足4-wave不慢于8-wave超过10%的目标。
+
+#### 本次性能快照
+
+| 实现 | shape | 延迟 | TFLOPS | diff |
+|---|---|---:|---:|---:|
+| 4-wave双K | non-causal, `10240 x 2583` | 874.162 us | 309.836 | 0.000367 |
+| 8-wave control | non-causal, `10240 x 2583` | 821.804 us | 329.576 | 0.000367 |
+| 4-wave双K | causal, `32768 x 32768` | 16720.924 us | 328.783 | 0.000268 |
+| 8-wave control | causal, `32768 x 32768` | 17035.219 us | 322.717 | 0.000268 |
 
 ### 2026-08-09：双K预取流水与稳态反相复验
 
@@ -253,6 +304,14 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   `mha-fp8-d192`中的硬件slot分级方法原本只对`MMA32 && BF16 && D128`启用，直接套到
   当前FP8 D192会形成正反馈并回退，因此按ATT反证移除slot分支。
 
+#### 本次性能快照
+
+| 流水/priority | non-causal延迟 | causal延迟 | 反相结论 |
+|---|---:|---:|---|
+| 单K/3-wave历史版 | 867.325 us | 16422.659 us | pairwise约52%--54%，不稳定 |
+| 双K + hardware-slot priority | 约1030 us | - | 反相中位65.5% |
+| 双K + 统一priority | 约876--880 us | - | 反相中位83.9%，胜出 |
+
 ### 2026-08-09：BF16 D128参考验收与FP8 pad16
 
 - BF16 shape：按参考分支改用`H=1, Dq=Dv=128, qo_len=kv_len=40960`，KV page数为
@@ -271,6 +330,17 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
 - 环境：测量期间8张GPU均有外部任务，绝对时间存在DPM/负载波动；验收以同GPU、同输入、
   同进程ABBA比值和BF16 R-C-R夹心比值为准。
 - 结论：采纳BF16 D128参数化、参考scheduler和FP8 K LDS pad16。
+
+#### 本次性能快照
+
+| 实现 | shape | 延迟 | TFLOPS/吞吐比 | 备注 |
+|---|---|---:|---:|---|
+| BF16 D128 4-wave | `H=1,40960 x 40960` | 3976.8 us | 参考均值的102.24% | R3-C-R4夹心 |
+| BF16参考分支 | 同上 | 4007.1 / 4124.5 us | 215.1 / 208.8T | control |
+| FP8 pad16 4-wave | non-causal, `10240 x 2583` | 899.4 / 876.4 us | 8-wave的96.41% / 99.36% | 两轮ABBA |
+| FP8 8-wave | 同上 | 867.1 / 870.8 us | 312.4 / 311.0T | control |
+| FP8 pad16 4-wave | causal, `32768 x 32768` | 15767.6 us | 8-wave的100.42% | ABBA |
+| FP8 8-wave | 同上 | 15833.1 us | 694.4T | control |
 
 ### 2026-08-09：BF16支持与4-wave性能
 
@@ -293,14 +363,21 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   的K cooperative copy和PV probability布局，因此不在本入口提供直接BF16性能对比。
 - 结论：BF16支持完整落在4-wave kernel及其测试中，不修改8-wave实现。
 
+#### 本次性能快照
+
+| BF16路径 | shape | 延迟 | TFLOPS | diff |
+|---|---|---:|---:|---:|
+| D192 non-causal | `10240 x 2583` | 1453.284 us | 186.369 | 0.00000281 |
+| D192 causal | `32768 x 32768` | 32966.564 us | 166.762 | small 0.00000193 |
+
 ### 2026-08-09：BF16 pipeline与参考分支对照
 
-- 一致：prologue只预取K，先`K0 global->reg->LDS`并预取`K1->reg`；V到`kv_step`
+- 一致：prologue只预取K，先`K0 global->reg->LDS`并预取`K1->reg`；V到`process_kv_block`
   开头才加载。
 - 一致：stage0依次执行`K(i+2)` global预取、online softmax、`K(i+1)`写LDS和
-  probability转换；边界使用`set_stage0_priority()=0`。
+  probability转换；边界使用`enter_softmax_stage()`，D192/FP8 priority为0。
 - 一致：stage1执行PV、workgroup barrier、下一K的LDS read，并跨loop backedge覆盖
-  下一轮V load/QK；边界使用`set_stage1_priority()=2`，K LDS读在PV之后发起。
+  下一轮V load/QK；边界使用`enter_mma_stage()`，D192/FP8 priority为2，K LDS读在PV后发起。
 - 一致：循环静态展开偶/奇两个substep，current/next K fragment角色交替，尾页保持
   compile-time stage id并单独mask。
 - 差异：当前实现接入paged KV/GQA/ragged/bottom-right causal ABI，Dq=192/Dv=128
@@ -345,6 +422,15 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
 - 结论：D128和D192均采纳raw-max分支。D192复用后TFLOPS与原路径基本一致并提升约
   1.35%，精度、资源和D192 scheduler均不变。
 
+#### 本次性能快照
+
+| 路径 | shape | 延迟 | TFLOPS | 备注 |
+|---|---|---:|---:|---|
+| BF16 D128 raw-max | `H=1,40960 x 40960` | 3415.611 us | 251.49 | 50样本正式中位数 |
+| BF16 D128 control | 同上 | 3655.8 us | 235.0 | 同机稳定control |
+| BF16 D192 raw-max | `Hq=16,Hkv=1,10240 x 2583` | 1321.106 us | 205.015 | 严格夹心候选 |
+| BF16 D192 control | 同上 | 1338.986 us | 202.278 | 原softmax路径 |
+
 ### 2026-08-10：FP8 D192 raw-max与max-shuffle重叠
 
 - 假设：FP8的per-token Q descale与per-tensor K descale同样恒正，因此BF16 D128的
@@ -369,6 +455,12 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   `0.971424`。
 - 结论：采纳。两轮ATT均复现关键等待和反相改善，聚合夹心给出约3%墙钟收益，且资源、
   指令主体与精度均不变。
+
+#### 本次性能快照
+
+| FP8路径 | candidate/control时间比 | 加速 | 备注 |
+|---|---:|---:|---|
+| raw-max聚合夹心 | 0.970486 | 3.04% | 3/20严格有效组；ATT同方向复现 |
 
 ### 2026-08-10：FP8 max-shuffle split8调度
 
@@ -400,6 +492,17 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   `15962.581 vs 16259.192 us`，4-wave吞吐为8-wave的`101.86%`，均超过95%目标。
 - 结论：采纳split8。它直接压缩目标shuffle wait，ATT、正式夹心和宽度扫描结论一致。
 
+#### 本次性能快照
+
+| 实现 | shape | 延迟 | TFLOPS/吞吐比 | 备注 |
+|---|---|---:|---:|---|
+| FP8 raw-max control | non-causal, `10240 x 2583` | 762.044 us | 355.42T | 50样本 |
+| FP8 split8 | 同上 | 752.503 us | 359.93T | 较control快1.33% |
+| FP8 split8最终 | 同上 | 750.723 us | 8-wave的109.50% | 最终复验 |
+| FP8 8-wave control | 同上 | 822.044 us | 329.480T | 最终复验 |
+| FP8 split8最终 | causal, `32768 x 32768` | 15962.581 us | 8-wave的101.86% | 最终复验 |
+| FP8 8-wave control | 同上 | 16259.192 us | 676.240T | 最终复验 |
+
 ### 2026-08-10：BF16 D128 max-shuffle split8反证
 
 - 假设：BF16 raw-max路径仍有`80--93 cycles/次`的lane-shuffle wait，可能同样受益于
@@ -416,6 +519,13 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   shuffle wait从`95.2/76.9`降至`75.2/69.3 cycles/次`，但VMEM、DS-read和MFMA
   stall反弹，归一总stall仅`42.6736 -> 42.6453 cycles/MFMA`。
 - 结论：中性并回退。BF16不保留split8边界；不能由FP8的收益外推到D128 BF16。
+
+#### 本次性能快照
+
+| BF16 D128路径 | 延迟 | 时间比 | 结论 |
+|---|---:|---:|---|
+| raw-max control | 3433.435 us | 1.000000 | 保留 |
+| split8候选 | 3434.954 us | 1.000443 | 中性，回退 |
 
 ### 2026-08-10：BF16 D192理想shape与250 TFLOPS上限探索
 
@@ -439,3 +549,56 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   15.7%，或吞吐再提升18.7%。当前不能仅靠shape或直接复用D128 priority/scheduler达到。
 - 结论：当前BF16 D192 kernel的实测shape上限约`210.7 TFLOPS`，不能达到250T。若以
   250T为目标，需要针对D192的160条MFMA热循环重新做ATT驱动调度，而不是继续换shape。
+
+#### 本次性能快照
+
+| dtype/head dim | shape | 延迟 | TFLOPS | 结论 |
+|---|---|---:|---:|---|
+| BF16 D192 | `Hq=16,Hkv=1,M=5120,N=28672` | 7135.472 us | 210.671 | D192 shape扫描峰值 |
+| BF16 D128 | `Hq=16,Hkv=1,M=5120,N=32768` | 5520.903 us | 248.943 | 同设备理想shape对照 |
+| BF16 D192 | `Hq=16,Hkv=1,M=5120,N=32768` | 8161.277 us | 210.505 | 同shape仅D128的84.56% |
+
+### 2026-08-10：`kv_step`参数清理与BF16 D192 ATT
+
+- 改动：删除`kv_step()`中可由`lds_stage`推导的`current_prefetch/next_prefetch`，删除
+  仅透传的`page_id1`输入和`page_id1/page_id2`输出；helper现在只接收实际消费的
+  `page_id0/page_id2`并返回新产生的`page_id3`，调用点显式轮转页状态。
+- 正确性：BF16 D192和FP8的`kv_len=3/13/23/53/83` ragged回归全部通过；diff分别为
+  `1.63e-6--2.51e-6`和`6.87e-5--2.88e-4`。
+- 性能：BF16 D192标准shape清理后为`1322.365 us / 204.820 TFLOPS`，清理前为
+  `1321.686 us / 204.926 TFLOPS`，变化约-0.05%，判定基本一致。
+- ATT：采集`Hq=16,Hkv=1,Dq=192,Dv=128,M=10240,N=2583`的第2次static dispatch；
+  1936条指令中1935条带源码映射，资源为`124 VGPR + 132 AGPR / 112 SGPR / 25KB LDS /
+  0 scratch`。总stall 47.11M（67.4%），分类为MFMA/FMA 57.8%、LDS 16.1%、barrier
+  6.8%、LDS wait 4.7%、VMEM load 4.5%。
+- UI归档：`tests/flydsl/pa_4wave/att_bf16_d192/ui_output_agent_32152_dispatch_13/`，
+  共267个文件、约140MB；`code.json`与原始trace SHA256一致。相邻目录保留
+  `out_kernel_trace.csv`、`out_agent_info.csv`和`out_scratch_memory_trace.csv`。
+- 结论：采纳参数清理；ATT UI可直接用于后续D192 160条MFMA热循环调度分析。
+
+#### 本次性能快照
+
+| BF16 D192 | shape | 延迟 | TFLOPS | 备注 |
+|---|---|---:|---:|---|
+| 清理前 | `Hq=16,Hkv=1,10240 x 2583` | 1321.686 us | 204.926 | 50样本 |
+| `kv_step`清理后 | 同上 | 1322.365 us | 204.820 | 50样本，基本一致 |
+
+### 2026-08-10：命名与ROCDL调度封装整理
+
+- 命名：页状态由`page0/page1/page2/page3`改为
+  `current_page_id/next_page_id/prefetch_page_id/lookahead_page_id`；原`page_id0`实际为
+  当前V页，原`page_id2`实际为提前两步的K预取页。`current_work`改为
+  `query_tile_index`，persistent外层使用`work_ticket/next_ticket/ticket_delta`。
+- helper：`kv_step`改为`process_kv_block`；K搬运改为`prefetch_k/store_k_to_lds`；
+  QK/PV fragment和MMA对象按用途命名。删除未使用的`_fma_vec_f32`和
+  `_scale_center_vec_f32`。
+- 调度：将裸`rocdl.sched_*`序列封装为`enter_softmax_stage()`、`enter_mma_stage()`、
+  `schedule_qk_and_v_loads()`和`schedule_pv_and_next_k()`；主循环只保留数据流与stage
+  边界。`_schedule_fence()`统一表示full compiler scheduling fence。
+- 正确性：FP8/BF16 ragged、FP8 batch persistent及BF16/FP8 small causal全部通过，
+  diff与整理前一致。
+- 机器码：FP8最终ISA SHA256仍为
+  `e9a5f4cfff53a1da55d090a548498dc931289fb4c29cc0713e14707cba87e7c4`；BF16 D192为
+  `6414e1bff3e6d695fd74e743a8e4e51342957769009d6e74f60d0f32001542a6`。两者与整理前
+  逐字一致，opcode序列、VGPR/SGPR/LDS/scratch和调度语义均未变化。
+- 结论：采纳纯可读性整理；不改变性能主线。
