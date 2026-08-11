@@ -1,345 +1,235 @@
-# GPU workload frequency probe
+# GPU降频分析：简单Pattern与实际Kernel
 
-[`probe-gpu-frequency.py`](probe-gpu-frequency.py) 使用 PyHIP JIT 生成持续满载的 AMDGPU kernel，比较不同
-指令组合触发的 SCLK、PPT 功耗和温度变化。当前支持 gfx94x 与 gfx950。
+[`probe-gpu-frequency.py`](probe-gpu-frequency.py) 使用PyHIP JIT生成可控负载，并可离线分析rocprofv3
+ATT。本文分两部分：先用简单pattern建立经验边界，再用DPM遥测、ATT和受控code-object对照解释
+实际H3 kernel。
 
-## Workloads
+## 结论
 
-| 名称 | 热循环 | 默认参数 |
-|---|---|---|
-| `mfma` | 纯 MFMA，4 组独立 accumulator | gfx94x BF16 `16x16x16`；gfx950 FP8/F6/F4 `16x16x128` |
-| `mfma_valu` | 每条 MFMA 后放可共发的独立 scalar VALU | `3 x v_add_f32` |
-| `mfma_valu_burst` | 连续 MFMA 段后接连续 VALU 段；仅显式选择，不属于 `all` | `--mfma-burst`、`--valu-burst` |
-| `mfma_exp` | MFMA 与独立 EXP 严格交替 | 每组 `MFMA -> v_exp_f32` |
-| `exp` | 纯 EXP，4 组独立目标寄存器轮转 | `v_exp_f32` |
-| `valu` | 4 条独立依赖链轮转 | `v_fmac_f32` |
-| `mfma_mem` | MFMA 与延迟消费的 non-temporal HBM load 交错 | `load -> 64 x MFMA -> vmcnt(0)` |
-| `mfma_ds_mem` | MFMA、LDS read 与 HBM load 交错 | `load -> ds_read -> 16 x MFMA -> lgkmcnt(0) -> 48 x MFMA -> vmcnt(0)` |
-| `mem` | 纯 non-temporal HBM 流式读取 | 每组 1 条 128-bit/lane load |
+### 基于简单pattern
 
-延迟保证模式按 MFMA 最小 latency 16 cycles 计算。`mfma_mem` 和 `mfma_ds_mem` 的 64 条 MFMA
-使用同一 accumulator 依赖链，因此 HBM load 发出到 `vmcnt(0)`/消费之间至少相隔 1024 cycles；
-`mfma_ds_mem` 的 LDS read 发出到 `lgkmcnt(0)`/消费之间先执行同一链上的 16 条 MFMA，至少相隔
-256 cycles。gfx950 的 FP8 `16x16x128` MFMA latency 可能为 32 cycles，因此实际距离只会更长。
+1. 密集MFMA会触发非PPT主导的降频：纯MFMA在仅242 W时，3秒整窗SCLK已降至约1132 MHz。
+2. 纯MFMA约150 ms后离开1.8 GHz，但该状态会跨无间隙kernel边界累积；150 ms不是单kernel上限。
+3. BF16 16x16 pattern在约6.6 scalar VALU/MFMA处恢复高平均频率，但该比例不能跨opcode复用。
+4. 换成production同款32x32 MFMA后，FP8和BF16都在约60 cycles/MFMA附近跨越1800 MHz边界。
 
-默认 launch 为 `4 x CU` 个 256-thread workgroup。每个 wave 写回硬件位置，host 会要求全部 wave 均有
-记录，并报告实际覆盖的 CU/SIMD 数。HBM workload 使用 512 MiB、2 的幂大小的环形缓冲区；可通过
-`--buffer-mib` 修改。
+| MFMA opcode | 降频侧已验证至 | 高频侧已验证自 |
+|---|---:|---:|
+| `v_mfma_f32_32x32x16_fp8_fp8` | 60.356 cycles/MFMA | 60.982 cycles/MFMA |
+| `v_mfma_f32_32x32x8_bf16` | 59.718 cycles/MFMA | 60.978 cycles/MFMA |
 
-`mfma_exp` 在 gfx942 实测每 CU 超过 2 个 workgroup 时会分两批执行，使整次 launch 时长约为每 wave
-目标时长的两倍；程序因此将该模式自动限制为最多 `2 x CU`，仍要求覆盖全部 CU。其他模式继续使用
-`--blocks-per-cu`。JSON 每条结果记录实际 `grid_blocks` 与 `blocks_per_cu`，若 event 时长明显超过
-每 wave 的硬件时长，程序会拒绝该结果。
+### 基于实际kernel
 
-## Timing and frequency
+| 精度 | 实现 | DPM结果 | cycles/MFMA | 结论 |
+|---|---|---|---:|---|
+| FP8 | Triton | 不循环 | 105.879 | MFMA时间密度低，保持高频 |
+| FP8 | ASM MI308 | 不循环 | 63.450 | 位于FP8 pattern高频侧 |
+| FP8 | ASM MI300 | 约1 s循环 | 49.028 | 位于FP8 pattern降频侧 |
+| FP8 | FlyDSL 8-wave | 约1 s循环 | 53.870 | 位于FP8 pattern降频侧 |
+| FP8 | FlyDSL 4-wave | 约1 s循环 | 54.468 | 位于FP8 pattern降频侧 |
+| BF16 | Triton | 不循环 | 62.303 | 位于BF16 pattern高频侧 |
+| BF16 | ASM MI308 | 不循环 | 54.241 | 密度会误判；高stall稀释有效执行压力 |
+| BF16 | ASM MI300 | 约1 s循环 | 38.959 | stall更低、有效issue更密集 |
 
-kernel 同时读取两种硬件计数器：
+除BF16 ASM MI308外，实际kernel结果都可由同opcode的`cycles/MFMA`边界直接解释。BF16 ASM
+MI308需要结合`stall/MFMA`、issue density和MI300 `.co`受控对照，结论仅标为机制候选。
 
-- `s_memrealtime`：固定 100 MHz，与 DPM 无关；kernel 按它自行运行到目标时长；
-- `s_memtime`：按 shader clock 累加。
+## 第一部分：基于简单pattern的降频推导
 
-整段有效频率为：
+推导路径为：区分MFMA降频与PPT降频，测量持续时间，检验VALU比例，最后使用production同款
+opcode得到可与实际kernel比较的密度边界。
+
+### 1. 指标与判定
+
+kernel同时读取固定100 MHz的`s_memrealtime`和随shader clock累加的`s_memtime`：
 
 $$
 f_{\mathrm{SCLK}} = 100\,\mathrm{MHz}
 \frac{\Delta\mathrm{s\_memtime}}{\Delta\mathrm{s\_memrealtime}}.
 $$
 
-因此 1 ms 测试不依赖刷新较慢的 sysfs。程序仍用独立 CPU 线程采集以下轨迹，默认间隔 10 ms：
+含MFMA的pattern还报告aggregate SIMD `cycles/MFMA`：
 
-- `freq*_input`，标签为 `sclk`/`gfxclk`；
-- `power*_input`，标签为 `PPT`/`socket power`；
-- junction 与 HBM 温度；
-- `gpu_busy_percent`。
+$$
+\mathrm{cycles/MFMA} =
+\frac{\text{该SIMD的采样timeline span}}{\text{该SIMD上的MFMA总数}}.
+$$
 
-结果同时报告硬件目标时长误差、CUDA event 相对硬件时长的额外开销、全窗口有效 SCLK，以及后半程
-sysfs 稳态中位数。`drop` 以 `pp_dpm_sclk` 中的最高档为基准；它不是相对 idle 的频率变化。
+数值越小表示MFMA时间密度越高。正式判定使用DPM `auto`、空闲GPU、至少1秒窗口和完整SCLK/PPT
+轨迹；1 ms结果只用于观察启动瞬态。
 
-## Usage
+### 2. 区分MFMA与PPT降频
 
-从仓库根目录运行。先用 `rocm-smi --showuse --showmemuse` 选择空闲卡，并保持 DPM 为 `auto`：
+以下为MI308X上的3秒端点。`effective SCLK`是完整窗口双时钟平均，`steady SCLK`是后半段sysfs
+中位数。
 
-```bash
-cd /root/workspace/luocheng/pyhip
-HIP_VISIBLE_DEVICES=4 \
-PYHIP_CACHE_DIR=/tmp/pyhip-gpu-frequency \
-python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
-  --workloads all \
-  --duration-ms 1,10,100,1000,3000 \
-  --repeats 3 \
-  --json /tmp/gpu-frequency.json
-```
+| pattern | effective SCLK | steady SCLK | PPT | 推导 |
+|---|---:|---:|---:|---|
+| 纯MFMA | 1131.5 MHz | 1014 MHz | 242 W | 非PPT主导降频 |
+| MFMA + 3 VALU | 1131.6 MHz | 1011 MHz | 256 W | 少量可共发VALU不改变档位 |
+| MFMA + EXP | 1342.7 MHz | 1210 MHz | 265 W | MFMA仍触发降频 |
+| 纯EXP | 1834.0 MHz | 1853 MHz | 296 W | 基本不降频 |
+| 纯VALU | 1837.2 MHz | 1850 MHz | 316 W | 基本不降频 |
+| 纯HBM load | 1592.0 MHz | 1588 MHz | 650 W | PPT上限主导降频 |
 
-只检查两个端点：
+因此，密集MFMA与纯HBM load是两类不同机制：前者低功耗但低频，后者触及650 W PPT后降频。
 
-```bash
-HIP_VISIBLE_DEVICES=4 \
-python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
-  --workloads mfma,valu \
-  --duration-ms 1,3000 \
-  --cooldown-ms 2000
-```
+### 3. 约150 ms高频平台
 
-单次持续时间范围为 1--30000 ms。小于 sysfs 采样间隔的运行可能没有有效的 sysfs 稳态点，此时以
-kernel 内双时钟算出的 `effective_sclk_mhz` 为准。`--cooldown-ms` 控制不同 workload 之间的冷却时间；
-正式横向比较应保留足够冷却，并检查 JSON 中的完整频率/功耗轨迹。
+kernel内timeline以1800 MHz为阈值。两种分辨率都显示纯BF16 MFMA在约150 ms后离开高频平台：
 
-## JSON
+| timeline bin | 三次离开1.8 GHz的时间 | 中位数 |
+|---:|---:|---:|
+| 0.5 ms | 149.120 / 147.614 / 149.122 ms | 149.120 ms |
+| 0.25 ms | 150.895 / 151.135 / 152.252 ms | 151.135 ms |
 
-JSON 保留：
+但`4 x 100 ms`无间隙纯MFMA dispatch train显示该状态跨kernel边界累积：
 
-- GPU 名称、架构、BDF、CU 数、DPM 模式、传感器路径和最高 SCLK 档；
-- launch、循环、内存、采样及冷却配置；
-- MFMA latency 假设，以及 VMEM/DS wait 的最小 cycle 与 MFMA 数；
-- 每个 wave 的 realtime ticks、shader cycles、硬件 ID、XCC ID 和循环批次数；
-- CUDA event/host/hardware 时长、CU/SIMD 覆盖、有效 SCLK 分布及估算吞吐；
-- 每个 sysfs 原始采样点，以及全窗口/后半程的 SCLK、功耗和温度统计。
+| dispatch | 累计时间 | SCLK中位数 [三次范围] |
+|---:|---:|---:|
+| 0 | 100 ms | 1833.0 [1702.8, 1833.4] MHz |
+| 1 | 200 ms | 1471.5 [1468.7, 1587.7] MHz |
+| 2 | 300 ms | 1000.0 [999.8, 1000.0] MHz |
+| 3 | 400 ms | 999.9 [999.8, 1000.2] MHz |
 
-程序默认拒绝启动时 `gpu_busy_percent != 0` 或 DPM 非 `auto` 的 GPU。`--allow-busy` 只绕过前者；
-共享卡结果会混入其他进程的负载，不适合作为降频结论。
+**结论**：150 ms描述持续密集MFMA状态，不是单kernel时长规则。
 
-## MI308X 正式结果（2026-08-10）
+### 4. 约6.6 VALU/MFMA规则
 
-### 环境与协议
+简单pattern连续执行$M$条`v_mfma_f32_16x16x16_bf16`，再执行$N$条`v_fmac_f32`。三种burst
+长度的1800 MHz整窗边界为：
 
-- GPU：AMD Instinct MI308X OAM，`gfx942`，80 CU，BDF `0001:0b:00.0`，NUMA node 1；
-- SCLK DPM：`auto`，最高档 1850 MHz；PPT cap 650 W；
-- 软件：ROCm 7.2.0、PyTorch `2.9.1+rocm7.2.0.git7e1940d4`、Python 3.10.12；
-- 仓库：`luocheng/try-mha-308`，HEAD `6ad9261f7ccdd880d9d1965283e97e86d9707f5e`；
-- 脚本 SHA256：`77346b18a4f99aaa50c2b7fdd567f4d4e0079e36d2b29bf2801ad288b838c208`；
-- 启动前：GPU busy 0%，SCLK 90/91 MHz，DPM `auto`，PPT 162/163 W；
-- 参数：每档 3 次，时长 `1,10,100,1000,3000 ms`，workload 之间冷却 2000 ms，sysfs 每 10 ms
-  采样，`inner_unroll=64`，HBM buffer 512 MiB；
-- grid：默认 4 blocks/CU；`mfma_exp` 自动使用 2 blocks/CU。原矩阵 105 个样本及纯 EXP 补充的
-  6 个样本均覆盖 80 CU 和对应 grid 的全部 wave，没有分批调度。
+| MFMA burst | 最后失败点 | 首个通过点 |
+|---:|---:|---:|
+| 32 | 6.59375 VALU/MFMA | 6.625 VALU/MFMA |
+| 64 | 6.5625 VALU/MFMA | 6.578125 VALU/MFMA |
+| 128 | 6.5 VALU/MFMA | 6.5625 VALU/MFMA |
 
-短窗与稳态分别独立保存，防止长时间矩阵中断时丢失已完成结果：
+约6.6:1能恢复3秒平均频率，但更保守的后半段p10标准需要约10.5:1。
 
-| 原始数据 | 时间戳（UTC） | 样本数 | SHA256 |
-|---|---|---:|---|
-| `/tmp/gpu-frequency-short-20260810.json` | 2026-08-10 12:56:13 | 63 | `aa68647f81acf0fbae5c70a3dcd4dd5c022cf5c81d360007e6cc20ae5dca3d3c` |
-| `/tmp/gpu-frequency-steady-20260810.json` | 2026-08-10 12:59:25 | 42 | `9009972221c5f8290e4feb855550f350becc02cef7be413b70dd40a2399cf595` |
-| `/tmp/gpu-frequency-exp-steady-20260810.json` | 2026-08-10 13:48:32 | 6 | `b41615ece6cb5288bd1e55b9666f4e6a1a59d586c472c6e86d15704c23a31a5a` |
+**结论**：6.6:1只适用于该BF16 16x16 opcode、scalar-FMA filler和launch配置，不是架构常数。
 
-原 105 样本矩阵不包含后来新增的纯 EXP，复现时必须显式指定原七种 workload：
+### 5. Production同款MFMA边界
 
-```bash
-HIP_VISIBLE_DEVICES=4 PYHIP_CACHE_DIR=/tmp/pyhip-gpu-frequency-formal-20260810 \
-python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
-  --device 0 --workloads mfma,mfma_valu,mfma_exp,valu,mfma_mem,mfma_ds_mem,mem \
-  --duration-ms 1,10,100 --repeats 3 \
-  --blocks-per-cu 4 --inner-unroll 64 --valu-per-mfma 3 --loads-per-group 1 \
-  --buffer-mib 512 --sample-interval-ms 10 --cooldown-ms 2000 \
-  --json /tmp/gpu-frequency-short-20260810.json
+为得到可与实际kernel比较的边界，微探针改用production同款MFMA，固定16条MFMA后接scalar
+FMA；测试使用2 blocks/CU，即每SIMD两个resident wave，3秒、三次重复。
 
-HIP_VISIBLE_DEVICES=4 PYHIP_CACHE_DIR=/tmp/pyhip-gpu-frequency-formal-20260810 \
-python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
-  --device 0 --workloads mfma,mfma_valu,mfma_exp,valu,mfma_mem,mfma_ds_mem,mem \
-  --duration-ms 1000,3000 --repeats 3 \
-  --blocks-per-cu 4 --inner-unroll 64 --valu-per-mfma 3 --loads-per-group 1 \
-  --buffer-mib 512 --sample-interval-ms 10 --cooldown-ms 2000 \
-  --json /tmp/gpu-frequency-steady-20260810.json
-```
+| 精度 | 最后失败点 | 首个通过点 | 经验边界 |
+|---|---|---|---:|
+| FP8 | 13.25 VALU/MFMA；60.356 cycles/MFMA；1792.6 MHz | 13.50 VALU/MFMA；60.982 cycles/MFMA；1805.3 MHz | 60.356--60.982 |
+| BF16 | 13.00 VALU/MFMA；59.657 [59.620, 59.718] cycles/MFMA；1778.6 MHz | 13.50 VALU/MFMA；60.989 [60.978, 61.029] cycles/MFMA；1805.2 MHz | 59.718--60.978 |
 
-纯 EXP 补充结果使用当前脚本 SHA256
-`d64c07553275fb217261901e30010a9a5ca43feedc8bdbd8e2573ce453ba0c4b`：
+由此得到最终pattern判据：与实际kernel比较时，应使用同opcode、同resident-wave口径的
+`cycles/MFMA`，而不是固定VALU比例。FP8与BF16边界都接近60只是本机实测结果，不能视为跨opcode
+架构常数。
 
-```bash
-HIP_VISIBLE_DEVICES=4 PYHIP_CACHE_DIR=/tmp/pbexp-final \
-python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
-  --device 0 --workloads exp --duration-ms 1000,3000 --repeats 3 \
-  --blocks-per-cu 4 --sample-interval-ms 10 --cooldown-ms 2000 \
-  --json /tmp/gpu-frequency-exp-steady-20260810.json
-```
+## 第二部分：基于实际kernel的降频推导
 
-### 不同时长的整窗有效 SCLK
+实际kernel按三步分析：DPM遥测确认是否循环，ATT与同opcode的pattern边界比较；若两者矛盾，再用
+受控code-object对照检查stall和有效issue密度。
 
-每格为 3 次运行的中位数 `[最小值, 最大值]`，单位 MHz。该值来自每个 wave 的
-`s_memtime / s_memrealtime`，不是单个 sysfs 瞬时点。
+### 1. FP8实际kernel
 
-| workload | 1 ms | 10 ms | 100 ms | 1 s | 3 s |
-|---|---:|---:|---:|---:|---:|
-| `mfma` | 1748.6 [1639.1, 1836.3] | 1834.1 [1815.9, 1835.7] | 1831.7 [1829.9, 1832.9] | 1132.2 [1131.7, 1135.9] | 1131.5 [1131.4, 1132.0] |
-| `mfma_valu` | 1789.1 [1754.1, 1829.9] | 1818.1 [1815.6, 1822.5] | 1823.8 [1734.6, 1823.9] | 1131.9 [1130.4, 1133.8] | 1131.6 [1131.5, 1132.3] |
-| `mfma_exp` | 1752.6 [1735.9, 1831.3] | 1823.4 [1811.4, 1826.8] | 1828.2 [1827.9, 1829.1] | 1343.6 [1342.8, 1348.3] | 1342.7 [1342.3, 1342.8] |
-| `valu` | 1765.2 [1635.1, 1840.8] | 1832.2 [1819.4, 1836.2] | 1836.3 [1800.2, 1838.7] | 1836.9 [1826.6, 1837.9] | 1837.2 [1836.7, 1839.1] |
-| `mfma_mem` | 1735.2 [1729.7, 1781.2] | 1835.2 [1826.8, 1835.4] | 1832.4 [1729.0, 1833.0] | 1132.3 [1130.4, 1132.8] | 1132.1 [1131.2, 1132.2] |
-| `mfma_ds_mem` | 1832.6 [1304.6, 1834.2] | 1827.1 [1820.0, 1830.4] | 1832.1 [1830.3, 1833.5] | 1133.4 [1133.3, 1133.9] | 1132.1 [1131.9, 1132.7] |
-| `mem` | 1738.6 [1686.0, 1843.3] | 1734.9 [1723.3, 1753.2] | 1604.1 [1572.5, 1646.7] | 1643.3 [1636.5, 1644.2] | 1592.0 [1585.9, 1594.8] |
+#### 观察
 
-纯 EXP 是后续补充测试，仅正式采集 1/3 秒三次重复：
+| 实现 | DPM结果 | cycles/MFMA | scalar VALU/MFMA | 全VALU/MFMA | max MFMA run |
+|---|---|---:|---:|---:|---:|
+| Triton | 不循环 | 105.879 | 9.829 | 13.923 | 2 |
+| ASM MI308 | 不循环 | 63.450 | 1.674 | 4.658 | 16 |
+| ASM MI300 | 约1 s循环 | 49.028 | 3.611 | 5.612 | 16 |
+| FlyDSL 8-wave | 约1 s循环 | 53.870 | 5.393 | 6.393 | 5 |
+| FlyDSL 4-wave | 约1 s循环 | 54.468 | 5.453 | 6.516 | 5 |
 
-| workload | 1 s | 3 s |
-|---|---:|---:|
-| `exp` | 1830.1 [1818.0, 1832.5] | 1834.0 [1833.6, 1837.2] |
+#### 推导
 
-1 ms 结果依赖 workload 启动时的 DPM 相位，三次范围可达 530 MHz，不能用单个 1 ms 样本判断稳态
-降频。10 ms 开始明显收敛；3 秒时计算类 workload 的三次范围不超过 2.4 MHz，纯 HBM load 的范围为
-8.8 MHz。硬件目标时长误差在 1 ms 档最高 0.84%（纯 `mem` 的静态批次粒度），10 ms 以上最高
-0.066%，100 ms 以上最高 0.0069%。
+1. **排除150 ms**：ASM MI308单dispatch为111.292 ms，但相邻host gap仅0.095 ms；限制器状态不会
+   被kernel边界重置。
+2. **排除6.6和静态burst**：ASM MI308的scalar/full VALU比例只有1.674/4.658，却不循环；MI308与
+   MI300的最长MFMA run同为16，DPM行为仍相反。
+3. **使用FP8 exact-op边界**：MI300/FlyDSL的49.028--54.468均低于60.356，全部循环；MI308的
+   63.450和Triton的105.879均高于60.982，均不循环。
 
-### 3 秒稳态端点
+> FP8五个实际kernel被同opcode的`cycles/MFMA`边界完全分开。Triton和ASM MI308保持高频的共同原因
+> 是MFMA时间密度较低，而不是kernel边界、固定VALU比例或静态MFMA burst长度。
 
-`effective SCLK` 是完整 3 秒窗口的双时钟平均；`steady sysfs` 是后半段 sysfs 样本的中位数，因此
-计算类 workload 在前半段从高档切换到低档时，前者会高于后者。
+### 2. BF16实际kernel
 
-| workload | effective SCLK | 相对 1850 MHz 降幅 | steady sysfs | PPT | 最高 junction | 最高 HBM | 吞吐 |
-|---|---:|---:|---:|---:|---:|---:|---|
-| `mfma` | 1131.5 MHz | 38.84% | 1014 MHz | 242 W | 52 C | 47 C | 185.060 TFLOPS |
-| `mfma_valu` | 1131.6 MHz | 38.83% | 1011 MHz | 256 W | 53 C | 46 C | 184.988 TFLOPS MFMA + 4.336 TFLOPS VALU |
-| `mfma_exp` | 1342.7 MHz | 27.42% | 1210 MHz | 265 W | 53 C | 46 C | 175.792 TFLOPS + 1373.379 GOPS EXP |
-| `exp` | 1834.0 MHz | 0.87% | 1853 MHz | 296 W | 50 C | 44 C | 2344.462 GOPS EXP |
-| `valu` | 1837.2 MHz | 0.69% | 1850 MHz | 316 W | 54 C | 46 C | 18.808 TFLOPS |
-| `mfma_mem` | 1132.1 MHz | 38.80% | 1010 MHz | 304.5 W | 53 C | 49 C | 185.016 TFLOPS + 0.361 TB/s |
-| `mfma_ds_mem` | 1132.1 MHz | 38.80% | 1012 MHz | 305 W | 53 C | 49 C | 185.061 TFLOPS + 0.361 TB/s HBM + 0.361 TB/s LDS |
-| `mem` | 1592.0 MHz | 13.95% | 1588 MHz | 650 W | 56 C | 68 C | 4.296 TB/s |
+#### 观察
 
-### 结论
+| 实现 | DPM结果 | 平均耗时 | cycles/MFMA | stall/MFMA | issue density |
+|---|---|---:|---:|---:|---:|
+| Triton | 不循环 | 191.049 ms | 62.303 | 78.699 | 0.073208 |
+| ASM MI308 | 不循环 | 191.377 ms | 54.241 | 70.764 | 0.072331 |
+| ASM MI300 | 约1 s循环 | 168.773 ms | 38.959 | 34.166 | 0.118643 |
 
-1. 纯 MFMA 是最强的非 PPT 降频触发器：3 秒整窗约 1132 MHz，后半段约 1010 MHz，但 PPT 只有
-  242 W。加入三条可共发 VALU 不改变频率档位，只把 PPT 提高约 14 W。
-2. 纯 EXP 基本不降频：3 秒整窗约 1834 MHz、后半段约 1853 MHz、PPT 约 296 W。`MFMA + EXP`
-  却稳定在整窗约 1343 MHz、后半段约 1210 MHz，说明该低频档由 MFMA 段触发，不是 EXP 本身。
-3. 纯 VALU 同样几乎不降频：整窗 1837 MHz，后半段保持 1850 MHz，PPT 约 316 W。
-4. 在当前低带宽延迟隐藏配置中，给 MFMA 加 HBM load 或 LDS+HBM 不改变 MFMA 主导的降频档位；
-  `mfma_mem` 与 `mfma_ds_mem` 的 3 秒频率和 MFMA 吞吐几乎相同。
-5. 纯 HBM load 触及 650 W PPT，3 秒整窗降到约 1592 MHz，HBM 温度升至 68 C。它的降频由功耗
-  上限主导，与纯 MFMA 的低功耗/低频机制不同。
-6. 对生产 kernel 判断降频时，至少使用 1 秒窗口并同时报告整窗有效 SCLK、后半段 sysfs SCLK 和
-  PPT；1 ms 只适合观察启动瞬态，不能代表稳态档位。
+#### 推导
 
-## 纯 MFMA 连续维持 1.8 GHz 的时间（2026-08-10）
+1. **排除150 ms和6.6**：Triton/MI308单次都约191 ms，scalar/full VALU比例分别只有
+   5.265/6.282和2.555/4.539；两条局部规则都不能解释它们保持高频。
+2. **Triton直接由密度解释**：62.303高于BF16 pattern高频侧边界60.978，DPM也不循环。
+3. **MI308是密度例外**：54.241落在pattern降频侧，却不循环，因此需要检查实际issue行为。
 
-### 测量方法
+MI308与MI300的symbol、输入、launch、64 KiB LDS、SGPR/VGPR/AGPR和6912个occupancy event均
+相同，只替换`.co`：
 
-sysfs SCLK 约每 10 ms 更新且有明显滞后，不能直接用来定位降频起点。脚本新增 kernel 内 timeline
-模式：每个 bin 同时读取随 shader clock 累加的 `s_memtime` 和固定 100 MHz 的
-`s_memrealtime`，直接计算该 bin 的有效 SCLK。判定条件为：
+| 指标 | MI308 | MI300 | MI300相对变化 |
+|---|---:|---:|---:|
+| cycles/MFMA | 54.241 | 38.959 | -28.17% |
+| stall/MFMA | 70.764 | 34.166 | -51.72% |
+| issue density | 0.072331 | 0.118643 | +64.03% |
 
-- 阈值 1800 MHz；
-- 首次连续 1.5 ms 的 bin 中位频率低于 1800 MHz，视为离开 1.8 GHz 高频平台；
-- 2 blocks/CU、256 threads/block。该配置的 100 ms 纯 MFMA 吞吐中位数为 300.15 TFLOPS，与
-  4 blocks/CU 的约 299.9 TFLOPS 一致，仍是满载；4 blocks/CU 的记录型 kernel 会分两批调度，不能
-  用于绝对时间测量。
+MI308的大量周期停在MFMA、barrier和依赖stall上，持续有效issue与切换活动较低。工具将其标记为
+`stall_diluted_candidate`：这是受控对照支持的机制候选，不是硬件公布阈值。
 
-正式测试使用两种分辨率交叉验证：
+> Triton BF16因MFMA时间密度较低而保持高频；ASM MI308 BF16则由code-object调度造成的高stall
+> 稀释持续有效执行压力。两者都不能由单次时长或固定VALU比例解释。
 
-| bin | 连续低频 bin | 三次离开 1.8 GHz 的时间 | 中位数 |
-|---:|---:|---:|---:|
-| 0.5 ms | 3 | 149.120 / 147.614 / 149.122 ms | 149.120 ms |
-| 0.25 ms | 6 | 150.895 / 151.135 / 152.252 ms | 151.135 ms |
+### ATT有效性
 
-两种分辨率都观察到阶跃：阈值前约为 1824--1831 MHz，随后在约 1--2 ms 内快速落到约
-1500--1600 MHz，并在约 175--200 ms 后稳定到约 1000 MHz。分箱本身包含计数器读取和每-bin写回，
-不同分辨率及运行初态会造成约 2 ms 差异，因此最终结论取交叉验证范围而不是伪精确的单点：
+DPM遥测用于证明是否出现频率循环；ATT只用于解释执行机制。所有纳入分析的wave均满足
+`num_stitched == num_insts`，capture log没有`Stitch Incomplete`、`Wave incomplete`、cutoff或
+parser mismatch。BF16 trace使用约2 GiB buffer；首个被截断的512 MiB Triton trace已作废。
 
-> **在本机 MI308X、DPM `auto`、满载纯 BF16 MFMA 下，约可连续维持 1.8 GHz 150 ms；实测离开
-> 高频平台的范围为 147.6--152.3 ms。**
+## 附录：复现与证据
 
-复现命令：
+运行前确认目标GPU空闲且DPM为`auto`，以下命令从仓库根目录执行。
+
+### Exact-op密度扫描
 
 ```bash
-HIP_VISIBLE_DEVICES=4 PYHIP_CACHE_DIR=/tmp/pbtlfinal \
-python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
-  --device 0 --duration-ms 400 --repeats 3 --blocks-per-cu 2 --inner-unroll 64 \
-  --timeline-bin-ms 0.5 --timeline-threshold-mhz 1800 --timeline-low-bins 3 \
-  --sample-interval-ms 5 --cooldown-ms 3000 \
-  --json /tmp/gpu-frequency-mfma-timeline-20260810.json
-
-HIP_VISIBLE_DEVICES=4 PYHIP_CACHE_DIR=/tmp/pbtl025 \
-python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
-  --device 0 --duration-ms 200 --repeats 3 --blocks-per-cu 2 --inner-unroll 64 \
-  --timeline-bin-ms 0.25 --timeline-threshold-mhz 1800 --timeline-low-bins 6 \
-  --sample-interval-ms 5 --cooldown-ms 3000 \
-  --json /tmp/gpu-frequency-mfma-timeline-025ms-20260810.json
-```
-
-- timeline 脚本 SHA256：`15b5d83dedc37ce3d08015b4818bce6e29209c6bf2208f2b73a8a575d3ceb9b1`；
-- 0.5 ms JSON SHA256：`be94e7ebc6ae4f894c336901e1fac3aebadcc9f991db5a6f2706dab7f70a70c0`；
-- 0.25 ms JSON SHA256：`a44f3c0d4813197fd86c8c65cde0b3f5dd6b4342cc8d41b454c535ab2788f6b0`。
-
-## 连续 MFMA 后接连续 VALU 扫描（2026-08-10）
-
-### 定义
-
-该测试与 `mfma_valu` 的逐条交织不同。每个运行时循环固定执行：
-
-```text
-M 条连续 v_mfma_f32_16x16x16_bf16
-N 条连续 v_fmac_f32
-```
-
-MFMA 和 VALU 都轮转 4 条独立依赖链。最终 ISA 已逐点验证为完整连续段，没有被后端重排成交织序列。
-测试使用 MI308X、DPM `auto`、3 秒 kernel、3 次重复、4 blocks/CU、每次 workload 间冷却 3 秒。
-
-“避免降频”不是一个硬件公布的二元状态，本节使用两个明确口径：
-
-1. **整窗通过**：3 秒双时钟有效 SCLK 不低于 1800 MHz；
-2. **保守 p10 通过**：后半段 10 ms sysfs 样本的 p10 不低于 1800 MHz，即至少约 90% 的后半段
-  样本处于 1800 MHz 以上。
-
-### 64 条 MFMA 的精确边界
-
-每行均为 3 次独立运行；effective 列为中位数 `[最小值, 最大值]`。
-
-| 连续 MFMA | 连续 VALU | VALU/MFMA | effective SCLK | steady sysfs 中位数 | steady p10 中位数 | PPT | 三次整窗均 >=1800 |
-|---:|---:|---:|---:|---:|---:|---:|---|
-| 64 | 416 | 6.500000 | 1791.5 [1790.1, 1791.8] | 1827.0 | 1733.5 | 359 W | 否 |
-| 64 | 418 | 6.531250 | 1793.7 [1790.8, 1795.0] | 1819.0 | 1738.4 | 360 W | 否 |
-| 64 | 419 | 6.546875 | 1799.4 [1798.6, 1799.8] | 1824.0 | 1752.8 | 359 W | 否 |
-| 64 | 420 | 6.562500 | 1800.2 [1799.6, 1803.3] | 1830.0 | 1765.5 | 359 W | 否 |
-| 64 | 421 | 6.578125 | 1809.9 [1809.4, 1811.0] | 1833.5 | 1787.0 | 360 W | 是 |
-| 64 | 422 | 6.593750 | 1813.8 [1811.2, 1814.7] | 1831.0 | 1775.0 | 360 W | 是 |
-| 64 | 448 | 7.000000 | 1826.4 [1822.4, 1830.1] | 1842.0 | 1818.0 | 361 W | 是 |
-| 64 | 512 | 8.000000 | 1824.6 [1817.7, 1826.4] | 1843.0 | 1817.2 | 355 W | 是 |
-| 64 | 1024 | 16.000000 | 1834.4 [1822.1, 1836.8] | 1847.0 | 1828.4 | 333 W | 是 |
-
-因此对主测试配置 `M=64`：
-
-- 419 条 VALU 三次都未达到 1800 MHz；
-- 420 条处在边界，中位数刚过线但有一次为 1799.6 MHz；
-- **421 条是三次整窗都超过 1800 MHz 的最小实测值**，即 `421/64 = 6.578125`；
-- 工程上可取 **约 6.6 条连续 scalar FMA VALU / 1 条 BF16 MFMA** 作为恢复高平均频率的经验比例。
-
-### burst 长度验证
-
-阈值并非只由比例决定，短 burst 有轻微额外开销；32/128 条 MFMA 的相邻验证如下：
-
-| 连续 MFMA | 连续 VALU | VALU/MFMA | effective SCLK | 三次整窗均 >=1800 |
-|---:|---:|---:|---:|---|
-| 32 | 210 | 6.562500 | 1796.3 [1796.0, 1798.4] | 否 |
-| 32 | 211 | 6.593750 | 1803.7 [1796.9, 1805.0] | 否 |
-| 32 | 212 | 6.625000 | 1806.5 [1800.5, 1808.3] | 是 |
-| 128 | 832 | 6.500000 | 1792.0 [1788.3, 1792.6] | 否 |
-| 128 | 840 | 6.562500 | 1804.7 [1802.6, 1805.0] | 是 |
-
-三种 burst 长度的稳定整窗阈值落在 `6.5625--6.625 VALU/MFMA`，支持使用 6.6:1 作为近似比例，
-但不能把它当成架构保证。
-
-### 低频尾部
-
-421 条 VALU 能恢复 3 秒平均频率，但后半段 sysfs p10 仍约 1787 MHz，说明仍偶尔落入较低档位。
-按“3 次运行的后半段 p10 都 >=1800 MHz”这一更保守标准：
-
-- 656 条仍失败，其中一组 p10 为 1797 MHz；
-- 672 条通过，三组 p10 为 1820.4/1820.2/1821.2 MHz；
-- 即保守 p10 阈值在 656--672 条之间，约为 **10.5:1 VALU/MFMA**；
-- 即使 1024 条 VALU，个别 10 ms 瞬时最小值仍可低于 1800 MHz，因此不能声称所有采样点绝不降频。
-
-### 复现与原始数据
-
-显式选择 burst 模式，例如：
-
-```bash
-HIP_VISIBLE_DEVICES=4 PYHIP_CACHE_DIR=/tmp/pb421 \
-python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
-  --device 0 --workloads mfma_valu_burst --duration-ms 3000 --repeats 3 \
-  --blocks-per-cu 4 --mfma-burst 64 --valu-burst 421 \
+HIP_VISIBLE_DEVICES=4 python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
+  --workloads fp8_mfma_valu_burst --duration-ms 3000 --repeats 3 \
+  --blocks-per-cu 2 --mfma-burst 16 --fp8-valu-scan 212,216 \
   --sample-interval-ms 10 --cooldown-ms 3000 \
-  --json /tmp/gpu-frequency-valu-burst-final-20260810/valu-421.json
+  --json /tmp/gpu-frequency-fp8-density-boundary.json
+
+HIP_VISIBLE_DEVICES=4 python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
+  --workloads bf16_32 --duration-ms 3000 --repeats 3 \
+  --blocks-per-cu 2 --mfma-burst 16 --bf16-valu-scan 208,216 \
+  --sample-interval-ms 10 --cooldown-ms 3000 \
+  --json /tmp/gpu-frequency-bf16-density-boundary.json
 ```
 
-- 扫描脚本 SHA256：`2d651bdb3715a3a1988dd9671d0bf1525bdb5db5b6897b296530011a85688d70`；
-- 汇总：`/tmp/gpu-frequency-valu-burst-summary-20260810.json`；
-- 汇总 SHA256：`65ca2d923422946fa9b72793316898e327e88ebfe5ce2fc5b22178415da5cb64`；
-- 每个汇总项包含三次原始值、源 JSON 路径及其 SHA256。
+### Production ATT离线归类
+
+```bash
+python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
+  --att-traces triton=/tmp/h3-att-triton,mi308=/tmp/h3-att-mi308,\
+mi300=/tmp/h3-att-mi300,flydsl8=/tmp/h3-att-flydsl8-1simd,\
+flydsl4=/tmp/h3-att-flydsl4-1simd \
+  --json /tmp/h3-fp8-att-validation.json
+
+python3 -B tests/flydsl/attn_4wave/tools/probe-gpu-frequency.py \
+  --att-traces triton_bf16=/tmp/h3-att-bf16-triton,\
+asm_mi308_bf16=/tmp/h3-att-bf16-mi308,asm_mi300_bf16=/tmp/h3-att-bf16-mi300 \
+  --json /tmp/h3-bf16-att-validation.json
+```
+
+### 机器可读证据
+
+- [FP8分析与源数据哈希](../../../../artifacts/h3-fp8-frequency-rule/analysis.json)：dispatch train、
+  exact-op完整八点扫描和五项production ATT分类。
+- [BF16分析与源数据哈希](../../../../artifacts/h3-bf16-frequency-rule/analysis.json)：exact-op边界、
+  三项production ATT、受控资源身份和70次auto-DPM汇总。
+
+所有边界均限于当前MI308X、软件栈、温度、occupancy、filler和DPM状态，不是架构规格。

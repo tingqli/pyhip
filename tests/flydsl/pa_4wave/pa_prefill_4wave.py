@@ -93,6 +93,82 @@ def _pack_probability_fp8(probability, start):
     return fx.Vector.from_elements([_pack_f32x4_to_fp8(values)], fx.Int32).bitcast(fx.Float8E4M3FNUZ)
 
 
+@flyc.jit
+def _rescale_accumulator_if_needed(output_accumulator, correction):
+    if correction < fx.Float32(1.0):
+        output_accumulator.store(output_accumulator.load() * correction)
+
+
+def _store_fp8_probability(score_fragment, probability_operand):
+    probability = score_fragment.load()
+    for k_group in range_constexpr(2):
+        start = k_group * 8
+        probability_lo = _pack_probability_fp8(probability, start)
+        probability_hi = _pack_probability_fp8(probability, start + 4)
+        probability_operand[None, 0, k_group].store(
+            probability_lo.shuffle(probability_hi, list(range(8)))
+        )
+
+
+def _store_bf16_probability(score_fragment, probability_storage):
+    probability_storage.store(_cvt_f32_to_bf16(score_fragment).load())
+
+
+def _make_fp8_epilogue_tid(tid, running_sum):
+    return fx.Int32(
+        llvm.inline_asm(
+            fx.Int32.ir_type,
+            [arith.unwrap(tid), arith.unwrap(running_sum)],
+            "v_and_or_b32 $0, $2, 0, $1",
+            "=v,v,v",
+            has_side_effects=False,
+        )
+    )
+
+
+def _schedule_qk_bf16_d128(num_v_loads, head_dim_qk, mma_k):
+    for _ in range_constexpr(num_v_loads):
+        rocdl.sched_vmem(1)
+        rocdl.sched_mfma(1)
+    rocdl.sched_mfma(head_dim_qk // mma_k - num_v_loads)
+
+
+def _schedule_qk_bf16_d192(num_v_loads):
+    for _ in range_constexpr(num_v_loads):
+        rocdl.sched_vmem(1)
+        rocdl.sched_mfma(3)
+
+
+def _schedule_qk_fp8(num_v_loads):
+    for _ in range_constexpr(num_v_loads):
+        rocdl.sched_vmem(1)
+        rocdl.sched_mfma(2)
+
+
+def _schedule_pv_bf16(num_k_copies, num_k_reads, head_dim_v, mma_k):
+    for _ in range_constexpr(num_k_copies):
+        rocdl.sched_vmem(1)
+        rocdl.sched_dswr(1)
+    rocdl.sched_mfma(3)
+    for _ in range_constexpr(num_k_reads):
+        rocdl.sched_dsrd(1)
+        rocdl.sched_mfma(1)
+    rocdl.sched_mfma(head_dim_v // mma_k - num_k_reads - 3)
+
+
+def _schedule_pv_fp8(num_k_reads):
+    rocdl.sched_vmem(1)
+    rocdl.sched_dswr(1)
+    rocdl.sched_mfma(7)
+    rocdl.sched_vmem(1)
+    rocdl.sched_mfma(3)
+    rocdl.sched_dswr(1)
+    rocdl.sched_mfma(4)
+    for _ in range_constexpr(num_k_reads):
+        rocdl.sched_dsrd(1)
+        rocdl.sched_mfma(1)
+
+
 def _s_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
     vm_lo = vmcnt & 0xF
     vm_hi = (vmcnt >> 4) & 0x3
@@ -118,6 +194,17 @@ def _recast_tensor(tensor, dtype):
     return fx.make_view(iterator, layout)
 
 
+def _prepare_paged_v_tile(v_tile):
+    if const_expr(v_tile.dtype == fx.BFloat16):
+        token_permutation = fx.make_layout((8, (2, 2)), (1, (16, 8)))
+        v_tile = fx.composition(v_tile, fx.make_tile(None, token_permutation, None))
+    return fx.rocdl.make_buffer_tensor(v_tile, max_size=False)
+
+
+def _compile_hints_for_dtype(dtype):
+    return {"fast_fp_math": True} if dtype == torch.float8_e4m3fnuz else {}
+
+
 @flyc.jit
 def _online_softmax(
     score_fragment,
@@ -131,7 +218,6 @@ def _online_softmax(
     query_sequence_length,
     all_kv_valid: fx.Constexpr[bool],
     is_causal: fx.Constexpr[bool],
-    overlap_max_reduction: fx.Constexpr[bool],
     split_score_scaling: fx.Constexpr[bool],
     defer_output_rescale: fx.Constexpr[bool],
 ):
@@ -153,29 +239,25 @@ def _online_softmax(
                     score_fragment[index, 0, 0] = float("-inf")
 
     score = score_fragment.load()
-    if const_expr(overlap_max_reduction):
-        # Q/K scale is positive, so the cross-lane max can run before scaling.
-        row_max = score.reduce("max")
-        shuffled_row_max = row_max.shuffle_xor(32, 64)
-        if const_expr(split_score_scaling):
-            _schedule_fence()
+    # Q/K scale is positive, so the cross-lane max can run before scaling.
+    row_max = score.reduce("max")
+    shuffled_row_max = row_max.shuffle_xor(32, 64)
+    if const_expr(split_score_scaling):
+        _schedule_fence()
     if const_expr(split_score_scaling):
         scaled_values = [
-            _fma_f32(score[index], qk_scale_log2, fx.Float32(0.0))
-            for index in range_constexpr(score.numel // 2)
+            score[index] * qk_scale_log2 for index in range_constexpr(11)
         ]
         _schedule_fence()
         row_max = _maxnumf(row_max, shuffled_row_max)
         scaled_values.extend(
             [
-                _fma_f32(score[index], qk_scale_log2, fx.Float32(0.0))
-                for index in range_constexpr(score.numel // 2, score.numel)
+                score[index] * qk_scale_log2 for index in range_constexpr(11, score.numel)
             ]
         )
         scaled_score = fx.Vector.from_elements(scaled_values, fx.Float32)
     else:
-        if const_expr(overlap_max_reduction):
-            row_max = _maxnumf(row_max, shuffled_row_max)
+        row_max = _maxnumf(row_max, shuffled_row_max)
         scaled_score = fx.Vector.from_elements(
             [
                 _fma_f32(score[index], qk_scale_log2, fx.Float32(0.0))
@@ -183,11 +265,10 @@ def _online_softmax(
             ],
             fx.Float32,
         )
-    if const_expr(overlap_max_reduction):
-        row_max = _fma_f32(row_max, qk_scale_log2, fx.Float32(0.0))
+    if const_expr(split_score_scaling):
+        row_max = row_max * qk_scale_log2
     else:
-        row_max = scaled_score.reduce("max")
-        row_max = _maxnumf(row_max, row_max.shuffle_xor(32, 64))
+        row_max = _fma_f32(row_max, qk_scale_log2, fx.Float32(0.0))
 
     updated_max = running_max
     correction = fx.Float32(1.0)
@@ -200,16 +281,8 @@ def _online_softmax(
     updated_sum = _fma_f32(running_sum, correction, tile_sum)
     score_fragment.store(probability)
 
-    def rescale_output():
-        output_accumulator.store(output_accumulator.load() * correction)
-
-    @flyc.jit
-    def rescale_if_needed():
-        if correction < fx.Float32(1.0):
-            rescale_output()
-
     if const_expr(not defer_output_rescale):
-        rescale_if_needed()
+        _rescale_accumulator_if_needed(output_accumulator, correction)
     return updated_max, updated_sum, correction
 
 
@@ -248,14 +321,16 @@ def MHA(
         num_kv_pages,
         qk_scale_log2,
         v_scale,
-        single_work_item: fx.Constexpr[bool],
+        requires_epilogue_reentry_barrier: fx.Constexpr[bool],
     ):
         tid = fx.thread_idx.x
-        element_type = q_tile.dtype
-        mma_k = {fx.Float8E4M3FNUZ: 16, fx.BFloat16: 8}[element_type]
-        use_hw_slot_priority = element_type == fx.BFloat16 and head_dim_qk == 128
+        dtype = q_tile.dtype
+        is_fp8 = dtype == fx.Float8E4M3FNUZ
+        is_bf16 = dtype == fx.BFloat16
+        mma_k = 8 if is_bf16 else 16
+        use_hw_slot_priority = is_bf16 and head_dim_qk == 128
         interleave_exp_ds_write = (
-            element_type == fx.BFloat16 and head_dim_qk == 128 and num_qo_heads >= 4
+            is_bf16 and head_dim_qk == 128 and num_qo_heads >= 4
         )
         hw_wave_slot = _read_hw_wave_slot() if const_expr(use_hw_slot_priority) else None
 
@@ -275,9 +350,9 @@ def MHA(
                 rocdl.s_setprio(2)
             _schedule_fence()
 
-        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, mma_k, element_type))
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, mma_k, dtype))
         atom_values = mma_k // 2
-        vector_values = 128 // element_type.width
+        vector_values = 128 // dtype.width
         k_permutation = fx.make_layout((atom_values, 2, 2), (1, vector_values, atom_values))
         wave_layout = fx.make_layout((1, 4, 1), (1, 1, 0))
         mma_tile = fx.make_tile(None, None, k_permutation)
@@ -286,7 +361,7 @@ def MHA(
         qk_thread_mma = qk_tiled_mma.thr_slice(tid)
         pv_thread_mma = pv_tiled_mma.thr_slice(tid)
 
-        q_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), element_type)
+        q_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), dtype)
         q_thread_copy = fx.make_tiled_copy_B(q_copy_atom, qk_tiled_mma).get_slice(tid)
         q_fragment = qk_thread_mma.make_fragment_B(q_tile)
         fx.copy(q_copy_atom, q_thread_copy.partition_S(q_tile), q_thread_copy.retile(q_fragment))
@@ -306,23 +381,23 @@ def MHA(
         )
         transposed_output_tile = fx.select(o_tile, [1, 0])
         output_accumulator = pv_thread_mma.make_fragment_C(transposed_output_tile)
-        if const_expr(element_type == fx.BFloat16):
+        if const_expr(is_bf16):
             probability_storage = fx.make_fragment_like(score_fragment, dtype=fx.BFloat16)
             probability_operand = fx.make_view(
                 fx.get_iter(probability_storage), fx.make_layout((4, 1, (2, 2)), (1, 0, (4, 8)))
             )
         else:
             probability_operand = pv_thread_mma.make_fragment_B(fx.make_rmem_tensor(
-                fx.make_layout((block_m, block_n), (block_n, 1)), element_type
+                fx.make_layout((block_m, block_n), (block_n, 1)), dtype
             ))
         score_fragment.fill(0)
         probability_operand.fill(0)
 
-        k_lds_stride = head_dim_qk + (8 if element_type == fx.BFloat16 else 16)
+        k_lds_stride = head_dim_qk + (8 if is_bf16 else 16)
 
         @fx.union
         class SharedStorage:
-            k_lds: fx.Array[element_type, 2 * block_n * k_lds_stride, 16]
+            k_lds: fx.Array[dtype, 2 * block_n * k_lds_stride, 16]
             o_lds: fx.Array[fx.BFloat16, block_m * (head_dim_v // 2), 16]
 
         shared = fx.SharedAllocator().allocate(SharedStorage)
@@ -330,7 +405,7 @@ def MHA(
             (block_n, head_dim_qk, 2), (k_lds_stride, 1, block_n * k_lds_stride)
         )
         k_lds_storage = fx.make_view(shared.k_lds.peek().ptr, k_lds_layout)
-        if const_expr(element_type == fx.BFloat16):
+        if const_expr(is_bf16):
             k_row_permutation = fx.make_layout((4, 2, 4), (1, 16, 4))
             k_lds = fx.composition(k_lds_storage, fx.make_tile(k_row_permutation, None, None))
         else:
@@ -343,44 +418,42 @@ def MHA(
             fx.static(output_swizzle), fx.make_ordered_layout((block_m, head_dim_v // 2), (1, 0))
         ))
 
-        def is_compile_time_valid_block(kv_block_index):
-            return const_expr(kv_block_index >= 0) if const_expr(isinstance(kv_block_index, int)) else True
-
-        if const_expr(element_type == fx.BFloat16):
-            k_global_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), element_type)
-            k_lds_store_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
+        if const_expr(is_bf16):
+            k_global_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), dtype)
+            k_lds_store_atom = fx.make_copy_atom(fx.UniversalCopy128b(), dtype)
             num_k_copies = head_dim_qk // 64
             prefetched_k = [
-                fx.make_rmem_tensor(fx.make_layout((8, num_k_copies), (1, 8)), element_type),
-                fx.make_rmem_tensor(fx.make_layout((8, num_k_copies), (1, 8)), element_type),
+                fx.make_rmem_tensor(fx.make_layout((8, num_k_copies), (1, 8)), dtype),
+                fx.make_rmem_tensor(fx.make_layout((8, num_k_copies), (1, 8)), dtype),
             ]
 
-            def prefetch_k(kv_block_index, physical_page_id, register_slot):
-                if const_expr(is_compile_time_valid_block(kv_block_index)):
-                    for atom_index in range_constexpr(num_k_copies):
-                        linear_atom = tid + atom_index * num_threads
-                        source_row = linear_atom & (block_n - 1)
-                        d_group = linear_atom // block_n
-                        source_offset = (physical_page_id * num_kv_heads * block_n * head_dim_qk
-                                         + d_group * block_n * vector_values
-                                         + source_row * vector_values)
-                        source = fx.make_view(
-                            fx.get_iter(k_tile) + source_offset, fx.make_layout(8, 1)
-                        )
-                        fx.copy(k_global_copy_atom, source, prefetched_k[register_slot][None, atom_index])
+            def prefetch_k_bf16(physical_page_id, register_slot):
+                for atom_index in range_constexpr(num_k_copies):
+                    linear_atom = tid + atom_index * num_threads
+                    source_row = linear_atom & (block_n - 1)
+                    d_group = linear_atom // block_n
+                    source_offset = (physical_page_id * num_kv_heads * block_n * head_dim_qk
+                                     + d_group * block_n * vector_values
+                                     + source_row * vector_values)
+                    source = fx.make_view(
+                        fx.get_iter(k_tile) + source_offset, fx.make_layout(8, 1)
+                    )
+                    fx.copy(k_global_copy_atom, source, prefetched_k[register_slot][None, atom_index])
 
-            def store_k_to_lds(kv_block_index, register_slot, lds_slot):
-                if const_expr(is_compile_time_valid_block(kv_block_index)):
-                    for atom_index in range_constexpr(num_k_copies):
-                        linear_atom = tid + atom_index * num_threads
-                        source_row = linear_atom & (block_n - 1)
-                        d_group = linear_atom // block_n
-                        destination_offset = ((lds_slot & 1) * block_n * k_lds_stride
-                                              + source_row * k_lds_stride + d_group * vector_values)
-                        destination = fx.make_view(
-                            fx.get_iter(k_lds_storage) + destination_offset, fx.make_layout(8, 1)
-                        )
-                        fx.copy(k_lds_store_atom, prefetched_k[register_slot][None, atom_index], destination)
+            def store_k_to_lds_bf16(register_slot, lds_slot):
+                for atom_index in range_constexpr(num_k_copies):
+                    linear_atom = tid + atom_index * num_threads
+                    source_row = linear_atom & (block_n - 1)
+                    d_group = linear_atom // block_n
+                    destination_offset = ((lds_slot & 1) * block_n * k_lds_stride
+                                          + source_row * k_lds_stride + d_group * vector_values)
+                    destination = fx.make_view(
+                        fx.get_iter(k_lds_storage) + destination_offset, fx.make_layout(8, 1)
+                    )
+                    fx.copy(k_lds_store_atom, prefetched_k[register_slot][None, atom_index], destination)
+
+            prefetch_k = prefetch_k_bf16
+            store_k_to_lds = store_k_to_lds_bf16
         else:
             k_global_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Uint32)
             k_lds_store_atom = fx.make_copy_atom(fx.UniversalCopy64b(), fx.Uint32)
@@ -394,40 +467,41 @@ def MHA(
             k_chunk_in_group = tid & 7
             k_source_row = (k_row & 3) + ((k_row // 4) & 1) * 16 + (k_row // 8) * 4
 
-            def prefetch_k(kv_block_index, physical_page_id, register_slot):
-                if const_expr(is_compile_time_valid_block(kv_block_index)):
-                    prefetched_k[register_slot].fill(0)
-                    for atom_index in range_constexpr(num_k_copies):
-                        chunk = k_chunk_in_group + atom_index * 8
-                        d_group = chunk // 2
-                        d_half = chunk & 1
-                        source_offset = (physical_page_id * num_kv_heads * block_n * head_dim_qk
-                                         + d_group * block_n * 16
-                                         + k_source_row * 16 + d_half * 8)
-                        source = fx.make_view(
-                            fx.get_iter(k_tile_u32) + source_offset // 4, fx.make_layout(2, 1)
-                        )
-                        fx.copy(k_global_copy_atom, source, prefetched_k[register_slot][None, atom_index])
+            def prefetch_k_fp8(physical_page_id, register_slot):
+                prefetched_k[register_slot].fill(0)
+                for atom_index in range_constexpr(num_k_copies):
+                    chunk = k_chunk_in_group + atom_index * 8
+                    d_group = chunk // 2
+                    d_half = chunk & 1
+                    source_offset = (physical_page_id * num_kv_heads * block_n * head_dim_qk
+                                     + d_group * block_n * 16
+                                     + k_source_row * 16 + d_half * 8)
+                    source = fx.make_view(
+                        fx.get_iter(k_tile_u32) + source_offset // 4, fx.make_layout(2, 1)
+                    )
+                    fx.copy(k_global_copy_atom, source, prefetched_k[register_slot][None, atom_index])
 
-            def store_k_to_lds(kv_block_index, register_slot, lds_slot):
-                if const_expr(is_compile_time_valid_block(kv_block_index)):
-                    for atom_index in range_constexpr(num_k_copies):
-                        chunk = k_chunk_in_group + atom_index * 8
-                        destination_offset = ((lds_slot & 1) * block_n * k_lds_stride
-                                              + k_row * k_lds_stride + chunk * 8)
-                        destination = fx.make_view(
-                            fx.get_iter(k_lds) + destination_offset, fx.make_layout(8, 1)
-                        )
-                        fx.copy(k_lds_store_atom, prefetched_k[register_slot][None, atom_index],
-                                _recast_tensor(destination, fx.Uint32))
+            def store_k_to_lds_fp8(register_slot, lds_slot):
+                for atom_index in range_constexpr(num_k_copies):
+                    chunk = k_chunk_in_group + atom_index * 8
+                    destination_offset = ((lds_slot & 1) * block_n * k_lds_stride
+                                          + k_row * k_lds_stride + chunk * 8)
+                    destination = fx.make_view(
+                        fx.get_iter(k_lds) + destination_offset, fx.make_layout(8, 1)
+                    )
+                    fx.copy(k_lds_store_atom, prefetched_k[register_slot][None, atom_index],
+                            _recast_tensor(destination, fx.Uint32))
 
-        k_lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
+            prefetch_k = prefetch_k_fp8
+            store_k_to_lds = store_k_to_lds_fp8
+
+        k_lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), dtype)
         k_lds_copy = fx.make_tiled_copy_A(k_lds_copy_atom, qk_tiled_mma).get_slice(tid)
 
         def partition_k_lds(lds_slot):
             return k_lds_copy.partition_S(k_lds[None, None, lds_slot])
 
-        v_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), element_type)
+        v_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), dtype)
         v_copy = fx.make_tiled_copy_A(v_copy_atom, pv_tiled_mma).get_slice(tid)
         num_v_loads = fx.size(v_fragment.shape).get_static_leaf_int * v_fragment.dtype.width // 128
         num_k_fragment_bits = fx.size(k_fragment.shape).get_static_leaf_int * k_fragment.dtype.width
@@ -444,39 +518,21 @@ def MHA(
                     )
 
         def schedule_qk_and_v_loads():
-            if const_expr(element_type == fx.BFloat16 and head_dim_qk == 128):
-                for _ in range_constexpr(num_v_loads):
-                    rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(1)
-                rocdl.sched_mfma(head_dim_qk // mma_k - num_v_loads)
+            if const_expr(is_bf16 and head_dim_qk == 128):
+                _schedule_qk_bf16_d128(num_v_loads, head_dim_qk, mma_k)
+            elif const_expr(is_fp8):
+                _schedule_qk_fp8(num_v_loads)
             else:
-                for _ in range_constexpr(num_v_loads):
-                    rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(3)
+                _schedule_qk_bf16_d192(num_v_loads)
             rocdl.sched_vmem(100)
             rocdl.sched_mfma(100)
 
         def schedule_pv_and_next_k():
-            if const_expr(element_type == fx.BFloat16):
-                for _ in range_constexpr(num_k_copies):
-                    rocdl.sched_vmem(1)
-                    rocdl.sched_dswr(1)
-                rocdl.sched_mfma(3)
-                for _ in range_constexpr(num_k_fragment_bits // 128):
-                    rocdl.sched_dsrd(1)
-                    rocdl.sched_mfma(1)
-                rocdl.sched_mfma(head_dim_v // mma_k - num_k_fragment_bits // 128 - 3)
+            num_k_reads = num_k_fragment_bits // 128
+            if const_expr(is_bf16):
+                _schedule_pv_bf16(num_k_copies, num_k_reads, head_dim_v, mma_k)
             else:
-                rocdl.sched_vmem(1)
-                rocdl.sched_dswr(1)
-                rocdl.sched_mfma(7)
-                rocdl.sched_vmem(1)
-                rocdl.sched_mfma(3)
-                rocdl.sched_dswr(1)
-                rocdl.sched_mfma(4)
-                for _ in range_constexpr(num_k_fragment_bits // 128):
-                    rocdl.sched_dsrd(1)
-                    rocdl.sched_mfma(1)
+                _schedule_pv_fp8(num_k_reads)
             _schedule_fence()
 
         def process_kv_block(
@@ -489,75 +545,52 @@ def MHA(
             is_all_kv_valid: fx.Constexpr[bool] = True,
         ):
             lookahead_page_id = kv_page_table[kv_block_index + 3]
-            correction = fx.Float32(1.0)
 
-            if const_expr(is_compile_time_valid_block(kv_block_index)):
-                score_fragment.fill(0.0)
-                compute_qk()
-                fx.copy(
-                    v_copy_atom,
-                    v_copy.partition_S(v_tile[None, None, current_v_page_id]),
-                    v_copy.retile(v_fragment),
-                )
-                schedule_qk_and_v_loads()
+            score_fragment.fill(0.0)
+            compute_qk()
+            fx.copy(
+                v_copy_atom,
+                v_copy.partition_S(v_tile[None, None, current_v_page_id]),
+                v_copy.retile(v_fragment),
+            )
+            schedule_qk_and_v_loads()
 
             enter_softmax_stage()
-            prefetch_k(kv_block_index + 2, prefetch_k_page_id, k_pipeline_slot ^ 1)
+            prefetch_k(prefetch_k_page_id, k_pipeline_slot ^ 1)
 
-            if const_expr(is_compile_time_valid_block(kv_block_index)):
-                running_max, running_sum, correction = _online_softmax(
-                    score_fragment, output_accumulator, qk_scale_log2, running_max, running_sum,
-                    query_pos0, kv_block_index, kv_len, full_qo_len, is_all_kv_valid, is_causal,
-                    element_type in (fx.BFloat16, fx.Float8E4M3FNUZ),
-                    element_type == fx.Float8E4M3FNUZ,
-                    interleave_exp_ds_write,
-                )
+            running_max, running_sum, correction = _online_softmax(
+                score_fragment, output_accumulator, qk_scale_log2, running_max, running_sum,
+                query_pos0, kv_block_index, kv_len, full_qo_len, is_all_kv_valid, is_causal,
+                is_fp8,
+                interleave_exp_ds_write,
+            )
 
-            store_k_to_lds(kv_block_index + 1, k_pipeline_slot, k_pipeline_slot ^ 1)
+            store_k_to_lds(k_pipeline_slot, k_pipeline_slot ^ 1)
             if const_expr(interleave_exp_ds_write):
                 _schedule_trans(16)
                 _schedule_ds_write(1)
                 _schedule_trans(1)
                 _schedule_ds_write(1)
 
-            if const_expr(is_compile_time_valid_block(kv_block_index)):
-                if const_expr(interleave_exp_ds_write):
-
-                    def rescale_output():
-                        output_accumulator.store(output_accumulator.load() * correction)
-
-                    @flyc.jit
-                    def rescale_if_needed():
-                        if correction < fx.Float32(1.0):
-                            rescale_output()
-
-                    rescale_if_needed()
-                if const_expr(element_type == fx.Float8E4M3FNUZ):
-                    probability = score_fragment.load()
-                    for k_group in range_constexpr(2):
-                        start = k_group * 8
-                        probability_lo = _pack_probability_fp8(probability, start)
-                        probability_hi = _pack_probability_fp8(probability, start + 4)
-                        probability_operand[None, 0, k_group].store(
-                            probability_lo.shuffle(probability_hi, list(range(8)))
-                        )
-                else:
-                    probability_storage.store(_cvt_f32_to_bf16(score_fragment).load())
+            if const_expr(interleave_exp_ds_write):
+                _rescale_accumulator_if_needed(output_accumulator, correction)
+            if const_expr(is_fp8):
+                _store_fp8_probability(score_fragment, probability_operand)
+            else:
+                _store_bf16_probability(score_fragment, probability_storage)
 
             enter_mma_stage()
 
-            if const_expr(is_compile_time_valid_block(kv_block_index)):
-                fx.gemm(
-                    mma_atom, output_accumulator, v_fragment,
-                    probability_operand, output_accumulator,
-                )
+            fx.gemm(
+                mma_atom, output_accumulator, v_fragment,
+                probability_operand, output_accumulator,
+            )
 
             gpu.barrier()
-            if const_expr(is_compile_time_valid_block(kv_block_index + 1)):
-                fx.copy(
-                    k_lds_copy_atom, partition_k_lds(k_pipeline_slot ^ 1),
-                    k_lds_copy.retile(k_fragment),
-                )
+            fx.copy(
+                k_lds_copy_atom, partition_k_lds(k_pipeline_slot ^ 1),
+                k_lds_copy.retile(k_fragment),
+            )
             schedule_pv_and_next_k()
 
             return running_max, running_sum, lookahead_page_id
@@ -568,9 +601,9 @@ def MHA(
         next_page_id = kv_page_table[1]
         prefetch_page_id = kv_page_table[2]
 
-        prefetch_k(0, current_page_id, 0)
-        store_k_to_lds(0, 0, 0)
-        prefetch_k(1, next_page_id, 0)
+        prefetch_k(current_page_id, 0)
+        store_k_to_lds(0, 0)
+        prefetch_k(next_page_id, 0)
         gpu.barrier()
         fx.copy(k_lds_copy_atom, partition_k_lds(0), k_lds_copy.retile(k_fragment))
         enter_mma_stage()
@@ -578,19 +611,19 @@ def MHA(
         if const_expr(is_causal):
             causal_base = kv_len - full_qo_len + query_pos0
             num_fully_valid_pages = (causal_base + 1) // block_n
-            num_unmasked_pages = (num_fully_valid_pages // 2) * 2
+            num_fast_path_pages = (num_fully_valid_pages // 2) * 2
             num_intersecting_pages = (causal_base + query_len + block_n - 1) // block_n
             num_pages_to_process = (num_intersecting_pages < num_kv_pages).select(
                 num_intersecting_pages, num_kv_pages
             )
         else:
-            num_unmasked_pages = num_kv_pages - 2
+            num_fast_path_pages = num_kv_pages - 2
             if (num_kv_pages & 1) == 1:
-                num_unmasked_pages = num_kv_pages - 1
+                num_fast_path_pages = num_kv_pages - 1
             num_pages_to_process = num_kv_pages
 
         loop_state = [current_max, running_sum, current_page_id, next_page_id, prefetch_page_id]
-        for kv_block_index, state in range(0, num_unmasked_pages, 2, init=loop_state):
+        for kv_block_index, state in range(0, num_fast_path_pages, 2, init=loop_state):
             current_max, running_sum, current_page_id, next_page_id, prefetch_page_id = state
             current_max, running_sum, lookahead_page_id = process_kv_block(
                 kv_block_index, 0, current_max, running_sum, current_page_id, prefetch_page_id
@@ -610,7 +643,7 @@ def MHA(
             ]
 
         for kv_block_index, state in range(
-            num_unmasked_pages, num_pages_to_process, 2, init=loop_state
+            num_fast_path_pages, num_pages_to_process, 2, init=loop_state
         ):
             current_max, running_sum, current_page_id, next_page_id, prefetch_page_id = state
             current_max, running_sum, lookahead_page_id = process_kv_block(
@@ -637,12 +670,15 @@ def MHA(
         denominator = running_sum + running_sum.shuffle_xor(32, 64)
         output_accumulator.store(output_accumulator.load() * (v_scale / denominator))
         output_fragment_bf16 = _cvt_f32_to_bf16(output_accumulator)
+        epilogue_tid = tid
+        if const_expr(is_fp8):
+            epilogue_tid = _make_fp8_epilogue_tid(tid, running_sum)
         cshuffle_store_atom = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
-        cshuffle_store = fx.make_tiled_copy_C(cshuffle_store_atom, pv_tiled_mma).get_slice(tid)
+        cshuffle_store = fx.make_tiled_copy_C(cshuffle_store_atom, pv_tiled_mma).get_slice(epilogue_tid)
         cshuffle_read_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
         cshuffle_read = fx.make_tiled_copy_tv(
             cshuffle_read_atom, fx.make_layout((32, 8), (8, 1)), fx.make_layout((4, 8), (8, 1))
-        ).get_slice(tid)
+        ).get_slice(epilogue_tid)
         store_source_halves = fx.logical_divide(
             cshuffle_store.retile(output_fragment_bf16), (None, 2, None)
         )
@@ -659,7 +695,7 @@ def MHA(
             )
             gpu.barrier()
             fx.copy(cshuffle_read_atom, read_source, output_fragment)
-            if const_expr(half == 0 or not single_work_item):
+            if const_expr(half == 0 or requires_epilogue_reentry_barrier):
                 gpu.barrier()
             fx.copy(
                 output_copy_atom, output_fragment,
@@ -683,7 +719,7 @@ def MHA(
         tid,
         k_scale,
         v_scale,
-        single_work_item: fx.Constexpr[bool],
+        requires_epilogue_reentry_barrier: fx.Constexpr[bool],
     ):
         query_pos0 = query_tile_index * block_m
         query_start = cu_seqlens_q[batch_index] + query_pos0
@@ -731,14 +767,12 @@ def MHA(
         k_tile = fx.rocdl.make_buffer_tensor(k_tile, max_size=False)
         v_tile = v[None, kv_head, None, None, None]
         v_tile = fx.group(fx.select(v_tile, (2, 3, 1, 0)), 1, 3)
-        if const_expr(v_tile.dtype == fx.BFloat16):
-            token_permutation = fx.make_layout((8, (2, 2)), (1, (16, 8)))
-            v_tile = fx.composition(v_tile, fx.make_tile(None, token_permutation, None))
-        v_tile = fx.rocdl.make_buffer_tensor(v_tile, max_size=False)
+        v_tile = _prepare_paged_v_tile(v_tile)
 
         attention_pipeline(
             q_tile, k_tile, v_tile, o_tile, query_pos0, query_len, kv_len, full_qo_len,
-            fx.get_iter(kv_page_indices) + kv_start, num_kv_pages, qk_scale_log2, v_scale, single_work_item,
+            fx.get_iter(kv_page_indices) + kv_start, num_kv_pages, qk_scale_log2, v_scale,
+            requires_epilogue_reentry_barrier,
         )
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
@@ -770,7 +804,7 @@ def MHA(
             query_tile_index = work_ticket - head_index * works_per_head
         process_work_item(
             q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, kv_last_page_lens, output,
-            fx.Int32(0), head_index, query_tile_index, tid, k_descale[0], v_descale[0], True,
+            fx.Int32(0), head_index, query_tile_index, tid, k_descale[0], v_descale[0], False,
         )
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
@@ -787,8 +821,6 @@ def MHA(
         kv_last_page_lens: fx.Tensor,
         output: fx.Tensor,
         work_counter: fx.Tensor,
-        num_workgroups: fx.Int32,
-        static_schedule: fx.Constexpr[bool],
     ):
         tid = fx.thread_idx.x
         batch_size = fx.size(cu_seqlens_q.shape).to_py_value() - 1
@@ -838,12 +870,10 @@ def MHA(
         while batch_index < batch_size:
             process_work_item(
                 q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, kv_last_page_lens, output,
-                batch_index, head_index, query_tile_index, tid, k_scale, v_scale, False,
+                batch_index, head_index, query_tile_index, tid, k_scale, v_scale, True,
             )
 
-            next_ticket = work_ticket + num_workgroups
-            if not static_schedule:
-                next_ticket = fetch_work(work_counter, tid)
+            next_ticket = fetch_work(work_counter, tid)
             ticket_delta = next_ticket - work_ticket
             work_ticket = next_ticket
             query_tile_index, head_index, batch_index, works_per_head = advance_work_ticket(
@@ -906,7 +936,7 @@ def MHA(
         else:
             attention_kernel(
                 q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, k_descale, v_descale,
-                kv_last_page_lens, output, work_counter, num_workgroups, static_schedule,
+                kv_last_page_lens, output, work_counter,
                 value_attrs=value_attrs,
             ).launch(grid=(num_workgroups, 1, 1), block=(num_threads, 1, 1), stream=stream)
 
@@ -943,13 +973,13 @@ def MHA(
         assert k.numel() * k.element_size() <= 2**31 - 1
         assert "gfx942" in torch.cuda.get_device_properties().gcnArchName
 
-        multiprocessor_count = torch.cuda.get_device_properties().multi_processor_count
         batch_size = cu_seqlens_q.shape[0] - 1
         static_schedule = batch_size == 1
         if static_schedule:
             works_per_head = (q.shape[0] + block_m - 1) // block_m
             num_workgroups = num_qo_heads * works_per_head
         else:
+            multiprocessor_count = torch.cuda.get_device_properties().multi_processor_count
             num_workgroups = multiprocessor_count * 2
         if static_schedule:
             work_counter = getattr(launch, "_static_work_counter", None)
@@ -965,10 +995,15 @@ def MHA(
         cache_key = (static_schedule, q.dtype)
         compiled = compiled_cache.get(cache_key)
         if compiled is None:
-            compiled = flyc.compile(
-                launch, q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, k_descale, v_descale,
-                kv_last_page_lens, out, work_counter, num_workgroups, static_schedule, stream,
-            )
+            saved_compile_hints = launch.compile_hints
+            try:
+                launch.compile_hints = {**saved_compile_hints, **_compile_hints_for_dtype(q.dtype)}
+                compiled = flyc.compile(
+                    launch, q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, k_descale, v_descale,
+                    kv_last_page_lens, out, work_counter, num_workgroups, static_schedule, stream,
+                )
+            finally:
+                launch.compile_hints = saved_compile_hints
             compiled_cache[cache_key] = compiled
             launch._compiled = compiled_cache
         else:

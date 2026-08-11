@@ -7,6 +7,7 @@ kernel 使用固定 100 MHz 的 ``s_memrealtime`` 自行控制执行时间，并
 """
 
 import argparse
+import csv
 import json
 import math
 import re
@@ -35,6 +36,10 @@ DS_WAIT_MIN_CYCLES = 256
 MEM_WAIT_MFMAS = MEM_WAIT_MIN_CYCLES // MFMA_LATENCY_CYCLES
 DS_WAIT_MFMAS = DS_WAIT_MIN_CYCLES // MFMA_LATENCY_CYCLES
 MFMA_EXP_MAX_BLOCKS_PER_CU = 2
+FP8_DENSITY_THROTTLE_MAX_CYCLES_PER_MFMA = 60.356
+FP8_DENSITY_HIGH_FREQUENCY_MIN_CYCLES_PER_MFMA = 60.982
+BF16_DENSITY_THROTTLE_MAX_CYCLES_PER_MFMA = 59.718
+BF16_DENSITY_HIGH_FREQUENCY_MIN_CYCLES_PER_MFMA = 60.978
 assert MEM_WAIT_MFMAS * MFMA_LATENCY_CYCLES == MEM_WAIT_MIN_CYCLES
 assert DS_WAIT_MFMAS * MFMA_LATENCY_CYCLES == DS_WAIT_MIN_CYCLES
 
@@ -46,6 +51,8 @@ WORKLOADS = {
     "mfma": "纯 MFMA",
     "mfma_valu": "MFMA + 可共发 scalar VALU",
     "mfma_valu_burst": "连续 MFMA burst + 连续 VALU burst",
+    "bf16_32": "生产同款 BF16 32x32 MFMA burst + 连续 VALU burst",
+    "fp8_mfma_valu_burst": "生产同款 FP8 32x32 MFMA burst + 连续 VALU burst",
     "mfma_exp": "MFMA + EXP 交织",
     "exp": "纯 EXP",
     "valu": "纯 scalar VALU FMA",
@@ -53,7 +60,12 @@ WORKLOADS = {
     "mfma_ds_mem": "MFMA + LDS read + non-temporal HBM load 交织",
     "mem": "纯 non-temporal HBM load",
 }
-DEFAULT_WORKLOADS = tuple(name for name in WORKLOADS if name != "mfma_valu_burst")
+SPECIAL_WORKLOADS = {
+    "mfma_valu_burst",
+    "bf16_32",
+    "fp8_mfma_valu_burst",
+}
+DEFAULT_WORKLOADS = tuple(name for name in WORKLOADS if name not in SPECIAL_WORKLOADS)
 
 
 def _make_mfma_registers(jit_builder):
@@ -77,6 +89,40 @@ def _emit_mfma(jit_builder, accumulators, operand_a, operand_b, slot):
         jit_builder.v_mfma_f32_16x16x128_f8f6f4(accumulators[slot], operand_a, operand_b, 0)
     else:
         jit_builder.v_mfma_f32_16x16x16_bf16(accumulators[slot], operand_a, operand_b, 0)
+
+
+def _make_bf16_32x32_mfma_registers(jit_builder):
+    if not jit_builder.gfx < 950:
+        raise RuntimeError(
+            "bf16_32 当前只用于验证 gfx94x production MFMA"
+        )
+    operand_a = jit_builder.gpr(2, "vu32", 0x3F803F80, align=2)
+    operand_b = jit_builder.gpr(2, "vu32", 0x3F803F80, align=2)
+    accumulators = jit_builder.gpr(4, 16, "vf32", align=4)
+    accumulators[...] = 0.0
+    return accumulators, operand_a, operand_b
+
+
+def _emit_bf16_32x32_mfma(jit_builder, accumulators, operand_a, operand_b, slot):
+    jit_builder.v_mfma_f32_32x32x8_bf16(
+        accumulators[slot], operand_a, operand_b, 0
+    )
+
+
+def _make_fp8_mfma_registers(jit_builder):
+    if not jit_builder.gfx < 950:
+        raise RuntimeError("fp8_mfma_valu_burst 当前只用于验证 gfx94x 生产 FP8 MFMA")
+    operand_a = jit_builder.gpr(2, "vu32", 0x40404040, align=2)
+    operand_b = jit_builder.gpr(2, "vu32", 0x40404040, align=2)
+    accumulators = jit_builder.gpr(4, 16, "vf32", align=4)
+    accumulators[...] = 0.0
+    return accumulators, operand_a, operand_b
+
+
+def _emit_fp8_mfma(jit_builder, accumulators, operand_a, operand_b, slot):
+    jit_builder.v_mfma_f32_32x32x16_fp8_fp8(
+        accumulators[slot], operand_a, operand_b, 0
+    )
 
 
 def _read_counter(jit_builder, instruction):
@@ -157,7 +203,16 @@ def sustained_load(
     """让所有 resident waves 持续执行指定 workload，直到达到目标墙钟 tick。"""
 
     assert workload in WORKLOADS
-    has_mfma = workload in ("mfma", "mfma_valu", "mfma_valu_burst", "mfma_exp", "mfma_mem", "mfma_ds_mem")
+    has_mfma = workload in (
+        "mfma",
+        "mfma_valu",
+        "mfma_valu_burst",
+        "bf16_32",
+        "fp8_mfma_valu_burst",
+        "mfma_exp",
+        "mfma_mem",
+        "mfma_ds_mem",
+    )
     has_memory = workload in ("mfma_mem", "mfma_ds_mem", "mem")
     has_exp = workload in ("mfma_exp", "exp")
     has_ds = workload == "mfma_ds_mem"
@@ -166,7 +221,11 @@ def sustained_load(
     valu_src1 = jit_builder.gpr(4, "vf32", 0.5, align=4)
     valu_dst = jit_builder.gpr(4, "vf32", 1.0, align=4)
 
-    if has_mfma:
+    if workload == "bf16_32":
+        mfma_dst, mfma_a, mfma_b = _make_bf16_32x32_mfma_registers(jit_builder)
+    elif workload == "fp8_mfma_valu_burst":
+        mfma_dst, mfma_a, mfma_b = _make_fp8_mfma_registers(jit_builder)
+    elif has_mfma:
         mfma_dst, mfma_a, mfma_b = _make_mfma_registers(jit_builder)
 
     if has_exp:
@@ -250,9 +309,24 @@ def sustained_load(
                 last_slot = (outstanding_loads - 1) % MAX_OUTSTANDING_LOADS
                 jit_builder.v_xor_b32(load_sink, load_sink, load_values[last_slot, 0])
 
-        elif workload == "mfma_valu_burst":
+        elif workload in (
+            "mfma_valu_burst",
+            "bf16_32",
+            "fp8_mfma_valu_burst",
+        ):
             for mfma_index in range(mfma_burst):
-                _emit_mfma(jit_builder, mfma_dst, mfma_a, mfma_b, mfma_index % 4)
+                if workload == "bf16_32":
+                    _emit_bf16_32x32_mfma(
+                        jit_builder, mfma_dst, mfma_a, mfma_b, mfma_index % 4
+                    )
+                elif workload == "fp8_mfma_valu_burst":
+                    _emit_fp8_mfma(
+                        jit_builder, mfma_dst, mfma_a, mfma_b, mfma_index % 4
+                    )
+                else:
+                    _emit_mfma(
+                        jit_builder, mfma_dst, mfma_a, mfma_b, mfma_index % 4
+                    )
             for valu_index in range(valu_burst):
                 valu_slot = valu_index % 4
                 jit_builder.v_fmac_f32(valu_dst[valu_slot], valu_src0[valu_slot], valu_src1[valu_slot])
@@ -294,7 +368,13 @@ def sustained_load(
     if has_mfma:
         jit_builder.v_readfirstlane_b32(sink_component, mfma_dst[0, 0])
         jit_builder.s_xor_b32(sink_scalar, sink_scalar, sink_component)
-    if workload in ("valu", "mfma_valu", "mfma_valu_burst"):
+    if workload in (
+        "valu",
+        "mfma_valu",
+        "mfma_valu_burst",
+        "bf16_32",
+        "fp8_mfma_valu_burst",
+    ):
         jit_builder.v_readfirstlane_b32(sink_component, valu_dst[0])
         jit_builder.s_xor_b32(sink_scalar, sink_scalar, sink_component)
     if has_exp:
@@ -626,6 +706,7 @@ def _decode_records(
     frequencies = []
     unique_cus = set()
     unique_simds = set()
+    records_by_simd = {}
     total_batches = 0
     for row in host.tolist():
         realtime_ticks = int(row[0])
@@ -642,6 +723,7 @@ def _decode_records(
         simd_key = (*cu_key, (hw_id >> 4) & 0x3)
         unique_cus.add(cu_key)
         unique_simds.add(simd_key)
+        records_by_simd.setdefault(simd_key, []).append((shader_cycles, batch_count))
         frequencies.append(frequency_mhz)
         total_batches += batch_count
         records.append([realtime_ticks, shader_cycles, hw_id, xcc_id, batch_count])
@@ -660,12 +742,29 @@ def _decode_records(
         metrics["valu_tflops"] = total_groups * valu_per_group * WAVE_SIZE * flops_per_valu / (event_ms * 1e9)
     if workload in ("mfma_exp", "exp"):
         metrics["exp_gops"] = total_groups * WAVE_SIZE / (event_ms * 1e6)
-    if workload == "mfma_valu_burst":
-        matrix_flops_per_mfma = 65_536 if JIT.gfx >= 950 else 8_192
+    if workload in (
+        "mfma_valu_burst",
+        "bf16_32",
+        "fp8_mfma_valu_burst",
+    ):
+        matrix_flops_per_mfma = (
+            32_768
+            if workload == "fp8_mfma_valu_burst"
+            else 16_384
+            if workload == "bf16_32"
+            else 65_536
+            if JIT.gfx >= 950
+            else 8_192
+        )
         total_mfmas = total_batches * mfma_burst
-        total_valu = total_batches * valu_burst
         metrics["matrix_tflops"] = total_mfmas * matrix_flops_per_mfma / (event_ms * 1e9)
-        metrics["valu_tflops"] = total_valu * WAVE_SIZE * 2 / (event_ms * 1e9)
+        if workload in (
+            "mfma_valu_burst",
+            "bf16_32",
+            "fp8_mfma_valu_burst",
+        ):
+            total_valu = total_batches * valu_burst
+            metrics["valu_tflops"] = total_valu * WAVE_SIZE * 2 / (event_ms * 1e9)
     if workload == "mem":
         memory_loads = total_groups * loads_per_group
         metrics["memory_tb_per_s"] = memory_loads * WAVE_SIZE * 16 / (event_ms * 1e9)
@@ -675,6 +774,25 @@ def _decode_records(
     if workload == "mfma_ds_mem":
         ds_reads = total_groups // MEM_WAIT_MFMAS
         metrics["lds_tb_per_s"] = ds_reads * WAVE_SIZE * 16 / (event_ms * 1e9)
+
+    mfmas_per_batch = None
+    if workload in ("mfma", "mfma_valu", "mfma_exp", "mfma_mem", "mfma_ds_mem"):
+        mfmas_per_batch = inner_unroll
+    elif workload in (
+        "mfma_valu_burst",
+        "bf16_32",
+        "fp8_mfma_valu_burst",
+    ):
+        mfmas_per_batch = mfma_burst
+    simd_cycles_per_mfma = None
+    if mfmas_per_batch is not None:
+        simd_cycles_per_mfma = _summarize(
+            [
+                statistics.median(shader_cycles for shader_cycles, _ in simd_records)
+                / sum(batch_count * mfmas_per_batch for _, batch_count in simd_records)
+                for simd_records in records_by_simd.values()
+            ]
+        )
 
     target_duration_ms = target_ticks / REALTIME_TICKS_PER_MS
     hardware_duration_ms = statistics.median(record[0] for record in records) / REALTIME_TICKS_PER_MS
@@ -693,6 +811,7 @@ def _decode_records(
         "event_overhead_ms": event_ms - hardware_duration_ms,
         "event_overhead_percent": 100.0 * (event_ms - hardware_duration_ms) / hardware_duration_ms,
         "effective_sclk_mhz": _summarize(frequencies),
+        "simd_cycles_per_mfma": simd_cycles_per_mfma,
         "unique_cu_count": len(unique_cus),
         "unique_simd_count": len(unique_simds),
         "total_batches": total_batches,
@@ -709,7 +828,10 @@ def _run_once(
     grid_blocks,
     data,
     output,
+    valu_burst=None,
 ):
+    if valu_burst is None:
+        valu_burst = args.valu_burst
     target_ticks = round(duration_ms * REALTIME_TICKS_PER_MS)
     output.zero_()
     sampler = SensorSampler(sensors, args.sample_interval_ms)
@@ -726,7 +848,7 @@ def _run_once(
         args.inner_unroll,
         args.valu_per_mfma,
         args.mfma_burst,
-        args.valu_burst,
+        valu_burst,
         args.loads_per_group,
         grid_blocks,
         data.numel(),
@@ -748,7 +870,7 @@ def _run_once(
         args.inner_unroll,
         args.valu_per_mfma,
         args.mfma_burst,
-        args.valu_burst,
+        valu_burst,
         args.loads_per_group,
         torch.cuda.get_device_properties(args.device).multi_processor_count,
     )
@@ -759,8 +881,8 @@ def _run_once(
         "target_duration_ms": duration_ms,
         "grid_blocks": grid_blocks,
         "blocks_per_cu": grid_blocks // torch.cuda.get_device_properties(args.device).multi_processor_count,
-        "mfma_burst": args.mfma_burst if workload == "mfma_valu_burst" else None,
-        "valu_burst": args.valu_burst if workload == "mfma_valu_burst" else None,
+        "mfma_burst": args.mfma_burst if workload in SPECIAL_WORKLOADS else None,
+        "valu_burst": valu_burst if workload in SPECIAL_WORKLOADS else None,
         "event_duration_ms": event_ms,
         "wall_duration_ms": (host_stop_ns - host_start_ns) / 1e6,
         "effective_sclk_drop_mhz": sensors.max_sclk_mhz - effective_mhz,
@@ -770,8 +892,374 @@ def _run_once(
     }
 
 
+def _run_dispatch_train(
+    workload,
+    duration_ms,
+    args,
+    sensors,
+    grid_blocks,
+    data,
+    output,
+):
+    """连续提交多个短 kernel，检查 kernel 边界是否重置 MFMA 降频计时。"""
+
+    target_ticks = round(duration_ms * REALTIME_TICKS_PER_MS)
+    output.zero_()
+    sampler = SensorSampler(sensors, args.sample_interval_ms)
+    sampler.start()
+
+    events = []
+    host_start_ns = time.monotonic_ns()
+    for dispatch_index in range(args.dispatch_train_count):
+        event_start = torch.cuda.Event(enable_timing=True)
+        event_stop = torch.cuda.Event(enable_timing=True)
+        event_start.record()
+        sustained_load(
+            [grid_blocks],
+            [THREADS_PER_BLOCK],
+            workload,
+            args.inner_unroll,
+            args.valu_per_mfma,
+            args.mfma_burst,
+            args.valu_burst,
+            args.loads_per_group,
+            grid_blocks,
+            data.numel(),
+            target_ticks,
+            data.data_ptr(),
+            output[dispatch_index].data_ptr(),
+        )
+        event_stop.record()
+        events.append((event_start, event_stop))
+        if args.dispatch_gap_ms and dispatch_index + 1 < args.dispatch_train_count:
+            event_stop.synchronize()
+            time.sleep(args.dispatch_gap_ms / 1000.0)
+
+    events[-1][1].synchronize()
+    host_stop_ns = time.monotonic_ns()
+    sampler.stop()
+
+    expected_cus = torch.cuda.get_device_properties(args.device).multi_processor_count
+    dispatches = []
+    frequencies = []
+    for dispatch_index, (event_start, event_stop) in enumerate(events):
+        event_ms = event_start.elapsed_time(event_stop)
+        hardware = _decode_records(
+            output[dispatch_index],
+            target_ticks,
+            event_ms,
+            workload,
+            args.inner_unroll,
+            args.valu_per_mfma,
+            args.mfma_burst,
+            args.valu_burst,
+            args.loads_per_group,
+            expected_cus,
+        )
+        frequencies.extend(
+            record[1] * 100.0 / record[0] for record in hardware["records"]
+        )
+        dispatches.append(
+            {
+                "index": dispatch_index,
+                "event_duration_ms": event_ms,
+                "hardware_timer": hardware,
+            }
+        )
+
+    effective_sclk = _summarize(frequencies)
+    dispatch_densities = [
+        dispatch["hardware_timer"]["simd_cycles_per_mfma"]["median"]
+        for dispatch in dispatches
+        if dispatch["hardware_timer"]["simd_cycles_per_mfma"] is not None
+    ]
+    return {
+        "workload": workload,
+        "description": f"{WORKLOADS[workload]}，连续短 dispatch train",
+        "target_duration_ms": duration_ms * args.dispatch_train_count,
+        "per_dispatch_target_ms": duration_ms,
+        "dispatch_train_count": args.dispatch_train_count,
+        "dispatch_gap_ms": args.dispatch_gap_ms,
+        "grid_blocks": grid_blocks,
+        "blocks_per_cu": grid_blocks // expected_cus,
+        "mfma_burst": args.mfma_burst if workload.endswith("_burst") else None,
+        "valu_burst": args.valu_burst if workload.endswith("_burst") else None,
+        "event_duration_ms": sum(dispatch["event_duration_ms"] for dispatch in dispatches),
+        "wall_duration_ms": (host_stop_ns - host_start_ns) / 1e6,
+        "effective_sclk_drop_mhz": sensors.max_sclk_mhz - effective_sclk["median"],
+        "effective_sclk_drop_percent": 100.0
+        * (sensors.max_sclk_mhz - effective_sclk["median"])
+        / sensors.max_sclk_mhz,
+        "hardware_timer": {
+            "effective_sclk_mhz": effective_sclk,
+            "simd_cycles_per_mfma": _summarize(dispatch_densities),
+            "unique_cu_count": expected_cus,
+            "throughput": {},
+        },
+        "dispatches": dispatches,
+        "sysfs": _summarize_sysfs(sampler.samples, host_start_ns, host_stop_ns),
+    }
+
+
 def _parse_csv(value, converter):
     return [converter(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def _classify_mfma_density(mfma_opcodes, cycles_per_mfma, stall_per_mfma):
+    if mfma_opcodes == ["v_mfma_f32_32x32x16_fp8_fp8"]:
+        throttle_max = FP8_DENSITY_THROTTLE_MAX_CYCLES_PER_MFMA
+        high_frequency_min = FP8_DENSITY_HIGH_FREQUENCY_MIN_CYCLES_PER_MFMA
+    elif mfma_opcodes == ["v_mfma_f32_32x32x8_bf16"]:
+        throttle_max = BF16_DENSITY_THROTTLE_MAX_CYCLES_PER_MFMA
+        high_frequency_min = BF16_DENSITY_HIGH_FREQUENCY_MIN_CYCLES_PER_MFMA
+        if (
+            cycles_per_mfma <= throttle_max
+            and stall_per_mfma >= cycles_per_mfma
+        ):
+            return "stall_diluted_candidate"
+    else:
+        return "unclassified_opcode"
+    if cycles_per_mfma <= throttle_max:
+        return "throttle_side"
+    if cycles_per_mfma >= high_frequency_min:
+        return "high_frequency_side"
+    return "boundary"
+
+
+def _parse_labeled_paths(value):
+    labeled_paths = []
+    for item in _parse_csv(value, str):
+        if "=" not in item:
+            raise ValueError(f"ATT trace 必须使用 label=path 格式: {item!r}")
+        label, path = item.split("=", 1)
+        if not label or not path:
+            raise ValueError(f"ATT trace 必须使用非空 label=path 格式: {item!r}")
+        labeled_paths.append((label, Path(path)))
+    return labeled_paths
+
+
+def _selected_valu_bursts(workload, args):
+    if workload == "fp8_mfma_valu_burst" and args.fp8_valu_scan:
+        return args.fp8_valu_bursts
+    if workload == "bf16_32" and args.bf16_valu_scan:
+        return args.bf16_valu_bursts
+    return [args.valu_burst]
+
+
+def _att_instruction_class(instruction):
+    opcode = instruction.strip().split()[0]
+    if "mfma" in opcode:
+        return "mfma"
+    if opcode.startswith(("v_pk_", "v_dot", "v_wmma")):
+        return "packed_valu"
+    if opcode.startswith(("v_exp", "v_rcp")):
+        return "exp_rcp"
+    if opcode.startswith("v_"):
+        return "scalar_valu"
+    if opcode.startswith("s_waitcnt"):
+        return "waitcnt"
+    if opcode.startswith("s_barrier"):
+        return "barrier"
+    return "other"
+
+
+def _analyze_att_mfma_density(label, root):
+    ui_directories = sorted(root.glob("ui_output_agent_*"))
+    stats_paths = sorted(root.glob("stats_ui_output_agent_*.csv"))
+    if len(ui_directories) != 1 or len(stats_paths) != 1:
+        raise RuntimeError(
+            f"{root} 下应各有一个 ui_output_agent_* 和 stats_ui_output_agent_*.csv"
+        )
+    ui_directory = ui_directories[0]
+    capture_log = root.parent / f"{root.name}-capture.log"
+    trace_level_complete = None
+    if capture_log.is_file():
+        capture_text = capture_log.read_text(encoding="utf-8", errors="replace")
+        incomplete_markers = re.findall(
+            r"Stitch Incomplete|Wave incomplete|trace was cutoff|"
+            r"parser could not fully match",
+            capture_text,
+            flags=re.IGNORECASE,
+        )
+        if incomplete_markers:
+            raise RuntimeError(
+                f"{capture_log} 报告 ATT 整体不完整: {sorted(set(incomplete_markers))}"
+            )
+        trace_level_complete = True
+    code = json.loads((ui_directory / "code.json").read_text(encoding="utf-8"))["code"]
+    mfma_opcodes = sorted(
+        {
+            row[0].strip().split()[0]
+            for row in code
+            if _att_instruction_class(row[0]) == "mfma"
+        }
+    )
+    mfma_instruction_ids = {
+        instruction_id
+        for instruction_id, row in enumerate(code)
+        if _att_instruction_class(row[0]) == "mfma"
+    }
+    if not mfma_instruction_ids:
+        raise RuntimeError(f"{ui_directory / 'code.json'} 中没有 MFMA")
+
+    max_consecutive_mfma = 0
+    current_mfma_run = 0
+    for row in code:
+        if _att_instruction_class(row[0]) == "mfma":
+            current_mfma_run += 1
+            max_consecutive_mfma = max(max_consecutive_mfma, current_mfma_run)
+        else:
+            current_mfma_run = 0
+
+    simds = {}
+    wave_count = 0
+    for wave_path in sorted(ui_directory.glob("se*.json")):
+        with wave_path.open(encoding="utf-8") as handle:
+            header = handle.read(512)
+        metadata_match = re.search(
+            r'^\{"duration":(\d+),.*?"num_insts":(\d+),"num_stitched":(\d+),'
+            r'"wave":\{"begin":(\d+),"cu":\d+,"end":(\d+)',
+            header,
+        )
+        simd_match = re.search(r"_sm(\d+)_sl\d+_wv\d+\.json$", wave_path.name)
+        if metadata_match is None or simd_match is None:
+            raise RuntimeError(f"无法从 {wave_path} 的文件头或文件名解析 wave 元数据")
+        duration, num_insts, num_stitched, begin, end = map(
+            int, metadata_match.groups()
+        )
+        if num_insts != num_stitched:
+            raise RuntimeError(
+                f"{wave_path} 不完整: {num_stitched}/{num_insts}"
+            )
+        simd_id = int(simd_match.group(1))
+        simd = simds.setdefault(
+            simd_id,
+            {
+                "begin": begin,
+                "end": end,
+                "active_cycles": 0,
+                "dynamic_instructions": 0,
+            },
+        )
+        simd["begin"] = min(simd["begin"], begin)
+        simd["end"] = max(simd["end"], end)
+        simd["active_cycles"] += duration
+        simd["dynamic_instructions"] += num_insts
+        wave_count += 1
+
+    instruction_mix = {
+        name: 0
+        for name in (
+            "mfma",
+            "scalar_valu",
+            "packed_valu",
+            "exp_rcp",
+            "waitcnt",
+            "barrier",
+            "other",
+        )
+    }
+    total_latency = 0
+    total_stall = 0
+    total_idle = 0
+    with stats_paths[0].open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                hitcount = int(row["Hitcount"])
+                latency = int(row["Latency"])
+                stall = int(row["Stall"])
+                idle = int(row["Idle"])
+            except ValueError:
+                continue
+            instruction_mix[_att_instruction_class(row["Instruction"])] += hitcount
+            total_latency += latency
+            total_stall += stall
+            total_idle += idle
+    if instruction_mix["mfma"] == 0:
+        raise RuntimeError(f"{stats_paths[0]} 中没有 MFMA hit")
+    mfma_count = instruction_mix["mfma"]
+    if not simds or mfma_count % len(simds):
+        raise RuntimeError(
+            f"MFMA hit {mfma_count} 不能均分到 {len(simds)} 个采样 SIMD"
+        )
+    mfma_per_simd = mfma_count // len(simds)
+    cycles_per_mfma_by_simd = [
+        (values["end"] - values["begin"]) / mfma_per_simd
+        for _, values in sorted(simds.items())
+    ]
+    cycles_per_mfma = statistics.median(cycles_per_mfma_by_simd)
+    stall_per_mfma = total_stall / mfma_count
+    idle_per_mfma = total_idle / mfma_count
+    latency_per_mfma = total_latency / mfma_count
+    issue_density_by_simd = [
+        values["dynamic_instructions"] / values["active_cycles"]
+        for _, values in sorted(simds.items())
+    ]
+    issue_density = statistics.median(issue_density_by_simd)
+    return {
+        "label": label,
+        "root": str(root),
+        "wave_count": wave_count,
+        "all_waves_complete": True,
+        "capture_log": str(capture_log) if capture_log.is_file() else None,
+        "trace_level_complete": trace_level_complete,
+        "simds": sorted(simds),
+        "cycles_per_mfma_by_simd": cycles_per_mfma_by_simd,
+        "cycles_per_mfma_median": cycles_per_mfma,
+        "latency_per_mfma": latency_per_mfma,
+        "stall_per_mfma": stall_per_mfma,
+        "idle_per_mfma": idle_per_mfma,
+        "instruction_issue_density": issue_density,
+        "instruction_issue_density_by_simd": issue_density_by_simd,
+        "mfma_opcodes": mfma_opcodes,
+        "density_classification": _classify_mfma_density(
+            mfma_opcodes, cycles_per_mfma, stall_per_mfma
+        ),
+        "static_max_consecutive_mfma": max_consecutive_mfma,
+        "instruction_mix": instruction_mix,
+        "scalar_valu_per_mfma": instruction_mix["scalar_valu"] / mfma_count,
+        "all_valu_per_mfma": (
+            instruction_mix["scalar_valu"]
+            + instruction_mix["packed_valu"]
+            + instruction_mix["exp_rcp"]
+        )
+        / mfma_count,
+    }
+
+
+def _run_att_validation(args):
+    results = [
+        _analyze_att_mfma_density(label, root) for label, root in args.att_trace_paths
+    ]
+    print(
+        "ATT label                         cycles/MFMA stall/MFMA issue-density "
+        "class                    scalar-VALU/MFMA"
+    )
+    for result in results:
+        print(
+            f"{result['label']:32s} {result['cycles_per_mfma_median']:11.3f} "
+            f"{result['stall_per_mfma']:10.3f} "
+            f"{result['instruction_issue_density']:13.6f} "
+            f"{result['density_classification']:24s} "
+            f"{result['scalar_valu_per_mfma']:16.3f}"
+        )
+    return {
+        "schema_version": 1,
+        "mode": "att_mfma_density_validation",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "thresholds": {
+            "fp8_32x32x16": {
+                "throttle_side_max_cycles_per_mfma": FP8_DENSITY_THROTTLE_MAX_CYCLES_PER_MFMA,
+                "high_frequency_side_min_cycles_per_mfma": FP8_DENSITY_HIGH_FREQUENCY_MIN_CYCLES_PER_MFMA,
+            },
+            "bf16_32x32x8": {
+                "throttle_side_max_cycles_per_mfma": BF16_DENSITY_THROTTLE_MAX_CYCLES_PER_MFMA,
+                "high_frequency_side_min_cycles_per_mfma": BF16_DENSITY_HIGH_FREQUENCY_MIN_CYCLES_PER_MFMA,
+                "stall_diluted_candidate_requires_stall_per_mfma_ge_cycles_per_mfma": True,
+            },
+        },
+        "results": results,
+    }
 
 
 def _validate_args(parser, args):
@@ -788,6 +1276,34 @@ def _validate_args(parser, args):
     unknown = [name for name in args.selected_workloads if name not in WORKLOADS]
     if unknown:
         parser.error(f"未知 workload: {', '.join(unknown)}")
+    try:
+        args.fp8_valu_bursts = _parse_csv(args.fp8_valu_scan, int)
+    except ValueError as error:
+        parser.error(f"--fp8-valu-scan 格式错误: {error}")
+    if not args.fp8_valu_bursts:
+        args.fp8_valu_bursts = [args.valu_burst]
+    if any(value < 0 for value in args.fp8_valu_bursts):
+        parser.error("--fp8-valu-scan 中的值不能为负数")
+    if args.fp8_valu_scan and args.selected_workloads != ["fp8_mfma_valu_burst"]:
+        parser.error("--fp8-valu-scan 只支持单独选择 fp8_mfma_valu_burst")
+    try:
+        args.bf16_valu_bursts = _parse_csv(args.bf16_valu_scan, int)
+    except ValueError as error:
+        parser.error(f"--bf16-valu-scan 格式错误: {error}")
+    if not args.bf16_valu_bursts:
+        args.bf16_valu_bursts = [args.valu_burst]
+    if any(value < 0 for value in args.bf16_valu_bursts):
+        parser.error("--bf16-valu-scan 中的值不能为负数")
+    if args.bf16_valu_scan and args.selected_workloads != ["bf16_32"]:
+        parser.error("--bf16-valu-scan 只支持单独选择 bf16_32")
+    if args.fp8_valu_scan and args.bf16_valu_scan:
+        parser.error("--fp8-valu-scan 与 --bf16-valu-scan 不能同时使用")
+    try:
+        args.att_trace_paths = _parse_labeled_paths(args.att_traces)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.att_trace_paths and (args.fp8_valu_scan or args.bf16_valu_scan):
+        parser.error("--att-traces 与 VALU scan 不能同时使用")
     if args.inner_unroll <= 0:
         parser.error("--inner-unroll 必须为正数")
     if any(name in ("mfma_mem", "mfma_ds_mem") for name in args.selected_workloads):
@@ -803,6 +1319,12 @@ def _validate_args(parser, args):
         parser.error("--loads-per-group 必须在 1..4 之间")
     if args.blocks_per_cu <= 0 or args.repeats <= 0:
         parser.error("--blocks-per-cu 和 --repeats 必须为正数")
+    if args.dispatch_train_count <= 0 or args.dispatch_gap_ms < 0:
+        parser.error("--dispatch-train-count 必须为正数，--dispatch-gap-ms 不能为负数")
+    if args.dispatch_train_count == 1 and args.dispatch_gap_ms:
+        parser.error("--dispatch-gap-ms 只在 --dispatch-train-count > 1 时有效")
+    if args.dispatch_train_count > 1 and (args.fp8_valu_scan or args.bf16_valu_scan):
+        parser.error("dispatch train 与 VALU scan 不能同时使用")
     if args.sample_interval_ms <= 0 or args.cooldown_ms < 0:
         parser.error("采样间隔必须为正数，冷却时间不能为负数")
     buffer_bytes = args.buffer_mib * 1024 * 1024
@@ -815,13 +1337,24 @@ def _print_result(result, max_sclk_mhz):
     frequency = hardware["effective_sclk_mhz"]
     throughput = hardware["throughput"]
     throughput_text = " ".join(f"{name}={value:.3f}" for name, value in throughput.items())
+    density = hardware.get("simd_cycles_per_mfma")
+    density_text = "" if density is None else f" cycles/MFMA={density['median']:.3f}"
     print(
         f"{result['workload']:10s} target={result['target_duration_ms']:8.3f} ms "
         f"event={result['event_duration_ms']:8.3f} ms "
         f"SCLK={frequency['median']:7.1f} MHz "
         f"drop={result['effective_sclk_drop_percent']:6.2f}%/{max_sclk_mhz:.0f}MHz "
-        f"CU={hardware['unique_cu_count']:3d} {throughput_text}"
+        f"CU={hardware['unique_cu_count']:3d}{density_text} {throughput_text}"
     )
+    for dispatch in result.get("dispatches", []):
+        frequency = dispatch["hardware_timer"]["effective_sclk_mhz"]
+        density = dispatch["hardware_timer"]["simd_cycles_per_mfma"]
+        density_text = "" if density is None else f" cycles/MFMA={density['median']:.3f}"
+        print(
+            f"  dispatch={dispatch['index']:3d} event={dispatch['event_duration_ms']:8.3f} ms "
+            f"SCLK={frequency['median']:7.1f} MHz "
+            f"[{frequency['min']:.1f}, {frequency['max']:.1f}]{density_text}"
+        )
 
 
 def _print_comparison(results):
@@ -861,6 +1394,33 @@ def main():
     parser.add_argument("--valu-per-mfma", type=int, default=3)
     parser.add_argument("--mfma-burst", type=int, default=64)
     parser.add_argument("--valu-burst", type=int, default=0)
+    parser.add_argument(
+        "--fp8-valu-scan",
+        default="",
+        help="逗号分隔的 VALU burst；用于一次进程扫描 fp8_mfma_valu_burst 密度边界",
+    )
+    parser.add_argument(
+        "--bf16-valu-scan",
+        default="",
+        help="逗号分隔的 VALU burst；用于一次进程扫描 bf16_32 密度边界",
+    )
+    parser.add_argument(
+        "--att-traces",
+        default="",
+        help="逗号分隔的 label=trace-root；离线计算生产 kernel 的每 SIMD cycles/MFMA",
+    )
+    parser.add_argument(
+        "--dispatch-train-count",
+        type=int,
+        default=1,
+        help="每个样本连续提交的短 kernel 数；大于 1 时保留每个 dispatch 的双时钟频率",
+    )
+    parser.add_argument(
+        "--dispatch-gap-ms",
+        type=float,
+        default=0.0,
+        help="dispatch train 中同步后插入的 host idle；0 表示同一 stream 无间隙提交",
+    )
     parser.add_argument("--loads-per-group", type=int, default=1)
     parser.add_argument("--buffer-mib", type=int, default=512)
     parser.add_argument("--sample-interval-ms", type=float, default=10.0)
@@ -872,6 +1432,15 @@ def main():
     parser.add_argument("--json", help="保存完整结果 JSON")
     args = parser.parse_args()
     _validate_args(parser, args)
+
+    if args.att_trace_paths:
+        payload = _run_att_validation(args)
+        if args.json:
+            output_path = Path(args.json)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            print(f"完整结果已写入 {output_path}")
+        return
 
     torch.cuda.set_device(args.device)
     properties = torch.cuda.get_device_properties(args.device)
@@ -907,7 +1476,10 @@ def main():
     needs_memory = any(name in ("mem", "mfma_mem", "mfma_ds_mem") for name in args.selected_workloads)
     allocation_bytes = buffer_bytes if needs_memory else 4096
     data = torch.zeros(allocation_bytes, dtype=torch.uint8, device=f"cuda:{args.device}")
-    output = torch.zeros((record_count, RECORD_BYTES // 8), dtype=torch.uint64, device=f"cuda:{args.device}")
+    output_shape = (record_count, RECORD_BYTES // 8)
+    if args.dispatch_train_count > 1:
+        output_shape = (args.dispatch_train_count, *output_shape)
+    output = torch.zeros(output_shape, dtype=torch.uint64, device=f"cuda:{args.device}")
     torch.cuda.synchronize()
 
     print(
@@ -918,21 +1490,24 @@ def main():
     print("预编译并短暂预热所有 workload...")
     for workload in args.selected_workloads:
         grid_blocks = _workload_grid_blocks(workload, args.blocks_per_cu, properties.multi_processor_count)
-        sustained_load(
-            [grid_blocks],
-            [THREADS_PER_BLOCK],
-            workload,
-            args.inner_unroll,
-            args.valu_per_mfma,
-            args.mfma_burst,
-            args.valu_burst,
-            args.loads_per_group,
-            grid_blocks,
-            data.numel(),
-            1000,
-            data.data_ptr(),
-            output.data_ptr(),
-        )
+        warmup_output = output[0] if args.dispatch_train_count > 1 else output
+        valu_bursts = _selected_valu_bursts(workload, args)
+        for valu_burst in valu_bursts:
+            sustained_load(
+                [grid_blocks],
+                [THREADS_PER_BLOCK],
+                workload,
+                args.inner_unroll,
+                args.valu_per_mfma,
+                args.mfma_burst,
+                valu_burst,
+                args.loads_per_group,
+                grid_blocks,
+                data.numel(),
+                1000,
+                data.data_ptr(),
+                warmup_output.data_ptr(),
+            )
     torch.cuda.synchronize()
     if args.cooldown_ms:
         time.sleep(args.cooldown_ms / 1000.0)
@@ -942,21 +1517,36 @@ def main():
         for repeat in range(args.repeats):
             for workload in args.selected_workloads:
                 grid_blocks = _workload_grid_blocks(workload, args.blocks_per_cu, properties.multi_processor_count)
-                workload_output = output[: grid_blocks * WAVES_PER_BLOCK]
-                result = _run_once(
-                    workload,
-                    duration_ms,
-                    args,
-                    sensors,
-                    grid_blocks,
-                    data,
-                    workload_output,
-                )
-                result["repeat"] = repeat
-                results.append(result)
-                _print_result(result, sensors.max_sclk_mhz)
-                if args.cooldown_ms:
-                    time.sleep(args.cooldown_ms / 1000.0)
+                valu_bursts = _selected_valu_bursts(workload, args)
+                for valu_burst in valu_bursts:
+                    if args.dispatch_train_count > 1:
+                        workload_output = output[:, : grid_blocks * WAVES_PER_BLOCK]
+                        result = _run_dispatch_train(
+                            workload,
+                            duration_ms,
+                            args,
+                            sensors,
+                            grid_blocks,
+                            data,
+                            workload_output,
+                        )
+                    else:
+                        workload_output = output[: grid_blocks * WAVES_PER_BLOCK]
+                        result = _run_once(
+                            workload,
+                            duration_ms,
+                            args,
+                            sensors,
+                            grid_blocks,
+                            data,
+                            workload_output,
+                            valu_burst=valu_burst,
+                        )
+                    result["repeat"] = repeat
+                    results.append(result)
+                    _print_result(result, sensors.max_sclk_mhz)
+                    if args.cooldown_ms:
+                        time.sleep(args.cooldown_ms / 1000.0)
 
     _print_comparison(results)
 
@@ -991,6 +1581,10 @@ def main():
             "valu_per_mfma": args.valu_per_mfma,
             "mfma_burst": args.mfma_burst,
             "valu_burst": args.valu_burst,
+            "fp8_valu_scan": args.fp8_valu_bursts if args.fp8_valu_scan else None,
+            "bf16_valu_scan": args.bf16_valu_bursts if args.bf16_valu_scan else None,
+            "dispatch_train_count": args.dispatch_train_count,
+            "dispatch_gap_ms": args.dispatch_gap_ms,
             "loads_per_group": args.loads_per_group,
             "mfma_latency_cycles": MFMA_LATENCY_CYCLES,
             "mem_wait_min_cycles": MEM_WAIT_MIN_CYCLES,
