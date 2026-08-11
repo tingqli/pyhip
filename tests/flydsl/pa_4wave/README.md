@@ -602,3 +602,38 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
   `6414e1bff3e6d695fd74e743a8e4e51342957769009d6e74f60d0f32001542a6`。两者与整理前
   逐字一致，opcode序列、VGPR/SGPR/LDS/scratch和调度语义均未变化。
 - 结论：采纳纯可读性整理；不改变性能主线。
+
+### 2026-08-10：MiniMax-H3真实varlen pack对比
+
+- 参数：从`h3_attn_kernel_test.py`提取线上shape：segments=`(63225, 7)`、
+  `q=k=v=(63232,14,128)` BF16、`causal=False`、scale=`1/sqrt(128)`。4-wave将每段
+  独立分页，`cu_seqlens=[0,63225,63232]`，`Hq=Hkv=14`。
+- 计算口径：与H3脚本完全一致，FLOPs为两段分别求和：
+  `sum(4*S_i^2*D*H)=28,653,368,031,232`，即`28.653368 TFLOP`；TFLOPS为
+  `FLOPs/(median_ms*1e9)`。不能用`63232^2`，否则会把跨segment attention算进去，
+  多算约0.022%。
+- 计时口径：直接复用H3脚本的`bench()`：3次预热、10个CUDA event样本、
+  `statistics.median`。4-wave的`PA_CASE=h3`也使用同一协议。
+- 正确性修复：接入H3时发现手工K寻址的物理page stride漏乘`num_kv_heads`；`Hkv=1`
+  原测试无法覆盖，从`Hkv>1`的第33个token开始偏离。修正BF16/FP8两条K地址公式后，
+  `H=1/2/14,S=32/33/128`全部与Triton对齐。真实H3整包cosine=`0.9999973`、
+  max-abs=`2.44e-4`；7-token tail cosine=`1.0000001`、max-abs=`0`。
+- 同进程公平对比：物理GPU4，当前时钟读回`fclk=1300MHz,mclk=900MHz`，共享同一输入、
+  同一`Case.flops()`和`bench()`：4-wave=`181.464 ms / 157.901T`，Triton=
+  `202.460 ms / 141.526T`，ASM group RTNA=`190.815 ms / 150.163T`，ASM split RTNA=
+  `182.247 ms / 157.223T`。按吞吐计算，4-wave比Triton高11.57%、比group RTNA高
+  5.15%、比split RTNA高0.43%；按延迟计算则分别降低10.37%、4.90%和0.43%。
+- 环境说明：`H3_AITER_ATTN_UNITTEST.md`历史性能在另一镜像/二进制及更高时钟环境采集；
+  当前同机结果用于实现间公平比较，不能直接用绝对延迟跨环境下结论。仅作跨环境参考，
+  当前4-wave `157.901T`比历史Triton `149.5T`高5.6%、比历史MI308 group RTNA
+  `148.8T`高6.1%，但比替换MI300 `.co`后的历史group RTNA `165.0T`低4.3%。
+- 运行：`HIP_VISIBLE_DEVICES=4 PA_CASE=h3 python3 -B test_pa_prefill.py`。
+
+#### 本次性能快照
+
+| 实现 | median | TFLOPS | 相对4-wave |
+|---|---:|---:|---:|
+| 4-wave paged varlen | 181.464 ms | 157.901 | 1.000x |
+| AITER Triton varlen | 202.460 ms | 141.526 | 延迟高11.57% |
+| AITER ASM group RTNA | 190.815 ms | 150.163 | 延迟高5.15% |
+| AITER ASM split RTNA | 182.247 ms | 157.223 | 延迟高0.43% |

@@ -345,7 +345,7 @@ def MHA(
                         linear_atom = tid + atom_index * num_threads
                         source_row = linear_atom & (block_n - 1)
                         d_group = linear_atom // block_n
-                        source_offset = (physical_page_id * block_n * head_dim_qk
+                        source_offset = (physical_page_id * num_kv_heads * block_n * head_dim_qk
                                          + d_group * block_n * vector_values
                                          + source_row * vector_values)
                         source = fx.make_view(
@@ -385,7 +385,8 @@ def MHA(
                         chunk = k_chunk_in_group + atom_index * 8
                         d_group = chunk // 2
                         d_half = chunk & 1
-                        source_offset = (physical_page_id * block_n * head_dim_qk + d_group * block_n * 16
+                        source_offset = (physical_page_id * num_kv_heads * block_n * head_dim_qk
+                                         + d_group * block_n * 16
                                          + k_source_row * 16 + d_half * 8)
                         source = fx.make_view(
                             fx.get_iter(k_tile_u32) + source_offset // 4, fx.make_layout(2, 1)
