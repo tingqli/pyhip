@@ -70,8 +70,20 @@ def _run_aiter(hidden_states,
         quant_type=aiter_qtype
     )
 
+def _gateup_activation_ref(gate, up, activation, swiglu_limit=None):
+    if activation == 'silu':
+        return torch.nn.functional.silu(gate) * up
+    if activation == 'swiglu':
+        swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
+        output_dtype = gate.dtype
+        gate = gate.float().clamp(max=swiglu_limit)
+        up = up.float().clamp(min=-swiglu_limit, max=swiglu_limit)
+        return (gate * torch.sigmoid(1.702 * gate) * (up + 1.0)).to(output_dtype)
+    raise ValueError(f'unsupported gateup activation: {activation}')
+
+
 # https://github.com/huggingface/transformers/blob/1fed6166c00b800330fcda8494f78cbcad8e4e3b/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L235-L263
-def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids):
+def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids, activation='silu', swiglu_limit=None):
     batch_size, hidden_dim = hidden_states.shape
     E, N1, K1 = w1.shape
     INTER_SIZE = N1 // 2
@@ -89,7 +101,9 @@ def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids):
             gate_proj = w1[n, 0 : INTER_SIZE].t()
             up_proj = w1[n, INTER_SIZE :,].t()
             down_proj = w2[n].t()
-            return (torch.nn.functional.silu(x @ gate_proj) * (x @ up_proj)) @ down_proj
+            return _gateup_activation_ref(
+                x @ gate_proj, x @ up_proj, activation, swiglu_limit
+            ) @ down_proj
         idx, top_x = torch.where(expert_mask[expert_idx])
 
         # Index the correct hidden states and compute the expert hidden state for
@@ -123,7 +137,7 @@ def quant_expert_weights(w1, quant_type, dtype):
         return w1_qt, w1s, w1_ref
     assert 0, quant_type
 
-def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc'):
+def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc', activation='silu', swiglu_limit=None):
     INTER_SIZE_TP = INTER_SIZE // TP
     # acc (run_count=0): only hidden_states[0] etc. are used; smaller BUF_COPY saves VRAM.
     # perf (run_count>0): rotate buffers to reduce L2 reuse across timed iterations.
@@ -423,6 +437,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     # GPU, split-K reduce preserved via the full-fragment reduce); down stays at 64.
                     ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 32), ('stage', 'gateup'), ('alg', 'batch1'), ('E', E),
                 )
+                if activation == 'swiglu':
+                    g_kwargs += (('activation', activation), ('swiglu_limit', swiglu_limit))
                 _fly_dispatch(
                     g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
                     (_ptr(hidden_states), _ptr(w1), _ptr(gemm1_out), _ptr(topk_ids), _ptr(topk_weight), _ptr(w1_scale_arg),
@@ -476,6 +492,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('act_quant_type', compile_act_quant_type), ('TOPK', TOPK),
                     ('BLOCK_TILE_SIZE_M', TILE_M), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'gateup'), ('alg', gateup_alg), ('E', E),
                 )
+                if activation == 'swiglu':
+                    g_kwargs += (('activation', activation), ('swiglu_limit', swiglu_limit))
                 if gateup_alg == 'prefill_1x4':
                     # The prefill (native fp8 MFMA) gateup needs an fp8 input plus its
                     # dequant scale: quantize the activation per-token (ptpc) or per-tensor.
@@ -808,7 +826,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M=16, TILE_N=3
         else:
             w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
             w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
-        ref_out = get_torch_ref(hidden_states=hidden_states[0], w1=w1_ref, w2=w2_ref, topk_weight=topk_weight[0], topk_ids=topk_ids[0])
+        ref_out = get_torch_ref(hidden_states=hidden_states[0], w1=w1_ref, w2=w2_ref, topk_weight=topk_weight[0], topk_ids=topk_ids[0], activation=activation, swiglu_limit=swiglu_limit)
         # aiter_out = _run_aiter(hidden_states=hidden_states[0], w1=w1[0], w2=w2[0], topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         cur_out = run(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0], quant_type=quant_type)
         #print(f">>>>>>>>>>>>>>> {calc_diff(aiter_out, ref_out)=} ")
@@ -876,7 +894,7 @@ def entry_b1(prec=[torch.bfloat16], HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E
         perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=64, TP=8, run_count=10, quant_type='ptpc'):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=64, TP=8, run_count=10, quant_type='ptpc', activation='silu', swiglu_limit=None):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
@@ -898,7 +916,7 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M=32, TILE_N=64
             else:
                 key = f'{i}'
                 
-            perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP, quant_type=quant_type)
+            perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M=TILE_M, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP, quant_type=quant_type, activation=activation, swiglu_limit=swiglu_limit)
         quan_type=""
         if wei_is_fp8(weight_type):
             if quant_type == 'ptpc':
@@ -979,6 +997,20 @@ def test_acc_fly_splitk_2s(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE,
         entry_common('fly_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10, quant_type='ptpc')
         entry_common('fly_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10, quant_type='per_tensor')
     entry_common('fly_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
+
+@pytest.mark.parametrize("batch", [[1, 2, 64]])
+@pytest.mark.parametrize("prec", [[torch.bfloat16]])
+@pytest.mark.parametrize("TILE_M", [64])
+@pytest.mark.parametrize("TILE_N", [128])
+@pytest.mark.parametrize("HIDDEN_SIZE", [1024])
+@pytest.mark.parametrize("INTER_SIZE", [1024])
+@pytest.mark.parametrize("TP", [8])
+def test_acc_fly_splitk_2s_swiglu(batch, prec, TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE, TP):
+    entry_common(
+        'fly_splitk_2s', batch=batch, prec=prec, TILE_M=TILE_M, TILE_N=TILE_N,
+        HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=4, E=8, TP=TP,
+        run_count=0, activation='swiglu', swiglu_limit=0.02
+    )
 
 @pytest.mark.parametrize("batch", [get_batch_list('mxn_splitk_2s')])
 @pytest.mark.parametrize("prec", [[get_fp8type()]])
