@@ -108,7 +108,7 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
 
 
 @functools.cache
-def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causal):
+def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causal, quant_query_mode = "per-token"):
     """
     cu_seqlens_q: [batch_size + 1] cu_seqlens_q[i] ~ cu_seqlens_q[i+1] is the range of query tokens in batch i
     kv_indptr   : [batch_size + 1] kv_indptr[i] ~ kv_indptr[i+1] is the range of virtual page ids in batch i
@@ -129,6 +129,8 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
     sm_scale_log2 = float(LOG2E / (head_dim_qk**0.5))
 
     assert (page_size % BN) == 0, f"{page_size=} must be a multiple of {BN=}"
+
+    assert quant_query_mode in ["per-token", "per-tensor"], f"quant_query_mode={quant_query_mode} is not supported"
 
     @flyc.jit
     def attn_pipeline(q_tile, # [query_start:query_end, head_qo, head_dim_qk]
@@ -626,15 +628,20 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                                                  num_records_bytes = query_len * num_qo_heads * head_dim_qk * (q_tile.dtype.width // 8))
             q_tile = q_tile[None, head_qo, None]
 
-            qs_tile = fx.make_view(fx.get_iter(q_descale) + query_start * num_qo_heads,
-                                   fx.make_ordered_layout((BM, num_qo_heads),(1, 0)))
-            qs_tile = fx.rocdl.make_buffer_tensor(qs_tile, max_size=False,
-                                                  num_records_bytes = query_len * num_qo_heads * (qs_tile.dtype.width // 8))
-            qs_tile = qs_tile[None, head_qo]
+            if fx.const_expr(quant_query_mode == "per-token"):
+                qs_tile = fx.make_view(fx.get_iter(q_descale) + query_start * num_qo_heads,
+                                    fx.make_ordered_layout((BM, num_qo_heads),(1, 0)))
+                qs_tile = fx.rocdl.make_buffer_tensor(qs_tile, max_size=False,
+                                                    num_records_bytes = query_len * num_qo_heads * (qs_tile.dtype.width // 8))
+                qs_tile = qs_tile[None, head_qo]
+                # [TRICKY#1] this scale assumes 1 32x32 MFMA
+                query_in_tile = (fx.Int32(tid // 64) * fx.Int32(32)) + fx.Int32(tid % 32)
+                value_q_descale = qs_tile[query_in_tile]
+            else:
+                # per-tensor
+                value_q_descale = (fx.get_iter(q_descale))[0]
 
-            # [TRICKY#1] this scale assumes 1 32x32 MFMA
-            query_in_tile = (fx.Int32(tid // 64) * fx.Int32(32)) + fx.Int32(tid % 32)
-            qk_scale_log2 = qs_tile[query_in_tile] * k_s * fx.Float32(sm_scale_log2)
+            qk_scale_log2 = value_q_descale * k_s * fx.Float32(sm_scale_log2)
 
             o_tile = fx.make_view(fx.get_iter(O_) + query_start * num_qo_heads * head_dim_v,
                                   fx.make_ordered_layout((BM, num_qo_heads, head_dim_v),(2, 1, 0)))
@@ -696,7 +703,10 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         V = fxh.view_as_torch_tensor(V, (num_physical_pages, num_kv_heads, num_BN_per_page, BN//k_vector_size, head_dim_v, k_vector_size))
         V = fx.select(V, (0, 2, 1, 3, 4, 5))
 
-        q_descale = fxh.view_as_torch_tensor(q_descale, (num_query_tokens, num_qo_heads, 1))
+        if fx.const_expr(quant_query_mode == "per_tensor"):
+            q_descale = fx.make_view(fx.get_iter(q_descale), fx.make_layout((num_query_tokens, num_qo_heads, 1), (0, 0, 0)))
+        else:
+            q_descale = fxh.view_as_torch_tensor(q_descale, (num_query_tokens, num_qo_heads, 1))
         k_descale = fxh.view_as_torch_tensor(k_descale, (1,))
         v_descale = fxh.view_as_torch_tensor(v_descale, (1,))
         out = fxh.view_as_torch_tensor(out, (num_query_tokens, num_qo_heads, head_dim_v))
