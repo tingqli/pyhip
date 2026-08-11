@@ -637,3 +637,73 @@ padding；D192 padding把384B行跨度改为400B，消除行首固定落到同�
 | AITER Triton varlen | 202.460 ms | 141.526 | 延迟高11.57% |
 | AITER ASM group RTNA | 190.815 ms | 150.163 | 延迟高5.15% |
 | AITER ASM split RTNA | 182.247 ms | 157.223 | 延迟高0.43% |
+
+### 2026-08-10：BF16 D128 TRANS/DS_WRITE精确交织
+
+- 目标：在保留raw-max、完整128-bit K copy和现有双K流水的前提下，将两条K LDS写分散到
+  softmax的17条TRANS中，降低resident-wave之间的K写/K读冲突。
+- 直接移植反证：参考分支的`TRANS(3) -> W -> TRANS(4) -> W -> TRANS(10)`已在最终ISA
+  中生效且资源不变，但真实H3的1100MHz严格夹心时间比为`1.043264`，稳定回退4.33%。
+  ATT中K写stall从`0.106`升至`2.162 cycles/MFMA`，barrier从`2.297`升至`4.942`，
+  去除首尾10%后的反相率从88.09%降至86.27%。根因是当前17KB padded LDS与参考分支
+  16KB swizzle LDS的相位不同：34.36%的K写距对侧K读不超过16 cycles。
+- 最终实现：完整copy之后使用同一sync id施加
+  `TRANS(16) -> DS_WRITE(1) -> TRANS(1) -> DS_WRITE(1)`；O correction rescale延后到
+  该调度组之后，raw-max、probability和running-sum公式不变。该路径仅在
+  `BF16 && Dq=128 && num_qo_heads>=4`时启用。
+- ISA：H14的4个热路径副本均形成`16-W-1-W`；资源为
+  `88 VGPR + 128 AGPR / 112 SGPR / 17KB LDS / 0 scratch`，2 waves/SIMD。MFMA、VMEM、
+  LDS读写、barrier和waitcnt静态数量均不变。
+- 正确性：真实H3候选与提交态baseline逐元素完全一致；BF16 D128 ragged
+  `kv=3/13/23/53/83`、batch persistent和small causal的diff为
+  `1.65e-6--2.48e-6`。
+- 性能：真实H3 `(63225,7),Hq=Hkv=14,D=128`在1100MHz performance determinism下，
+  16组位置平衡夹心的baseline/candidate中位数为`188.573/183.288ms`，严格有效15组
+  时间比中位数`0.971871`，15/15获胜，提升约2.89%。
+- ATT：无丢包单SE/单SIMD baseline/final为
+  `/tmp/pa4-trans-dswr-baseline-att/ui_output_agent_37015_dispatch_15`和
+  `/tmp/pa4-trans-dswr-16-17-att/ui_output_agent_38293_dispatch_15`。总stall/MFMA
+  `38.874 -> 38.634`，MFMA `22.423 -> 21.671`，K写 `0.106 -> 0.071`；反相率
+  `88.09% -> 88.22%`。K写到对侧K读的+/-16-cycle冲突率降至0.04%，中位距离496 cycles。
+- shape门槛：1100MHz、`S=40960`扫描中，H1/H2回退1.03%/2.19%，H4/H8/H14提升
+  7.37%/5.36%/0.95%，因此H1/H2保留原raw-max路径。H1、BF16 D192、FP8 D192最终ISA
+  与提交态baseline逐字同SHA256，目标外路径无机器码漂移。
+
+#### 本次性能快照
+
+| BF16 D128路径 | shape | 1100MHz延迟 | 时间比 | 结论 |
+|---|---|---:|---:|---|
+| 提交态baseline | H3 `(63225,7)`, H14 | 188.573 ms | 1.000000 | control |
+| `16-W-1-W` | 同上 | 183.288 ms | 0.971871 | 保留，提升2.89% |
+| 直接参考`3-W-4-W-10` | 同上 | 196.700 ms | 1.043264 | 回退4.33% |
+
+### 2026-08-10：FP8 H3性能与D128 K copy修复
+
+- 测试shape：真实varlen segments=`(63225,7)`、`Hq=Hkv=14,Dq=Dv=128`；FLOPs与
+  BF16/AITER相同，为`28.653368 TFLOP`。Q使用E4M3FNUZ per-token量化，K/V使用
+  E4M3FNUZ per-tensor量化，计时为3次预热、10个CUDA event样本和median。
+- 根因修复：FP8 K预取原来固定`num_k_copies=3`，只适用于D192；D128因此读取了额外64维
+  并跨越LDS行。小D128用例的diff为`0.246`，修复前H3 whole cosine仅`0.781`，对应性能
+  数据全部作废。现改为`num_k_copies=head_dim_qk//64`，D128为2、D192仍为3。
+- 正确性：D128 ragged `kv=3/13/23/53/83`的diff为
+  `7.69e-5--2.96e-4`。真实H3 FP8相对同输入BF16输出：whole/main/tail cosine分别为
+  `0.998784/0.998558/0.999114`，whole rel-L2为`0.049304`，全部finite。
+- Auto-DPM性能：空闲GPU4两轮正式入口中位数为`86.577/86.389ms`，即
+  `330.959/331.678 TFLOPS`；样本存在约83.8ms快档和约99.9ms慢档，必须同时报告
+  min/max，不能把单个快档当稳态。
+- 定频性能：GPU0固定1100MHz的10个样本为`134.430--134.671ms`，中位
+  `134.472ms / 213.080 TFLOPS`。测试前后均无KFD进程且GPU busy为0，结束后已恢复auto。
+- 兼容性：FP8 D192最终ISA SHA256保持
+  `e9a5f4cfff53a1da55d090a548498dc931289fb4c29cc0713e14707cba87e7c4`，说明copy次数
+  参数化没有改变既有D192主线。
+- 运行：Auto-DPM使用
+  `HIP_VISIBLE_DEVICES=4 PA_CASE=h3 PA_DTYPE=fp8 FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 -B test_pa_prefill.py`；
+  定频对照需先设置performance determinism并用trap恢复`amd-smi reset -d`。
+
+#### 本次性能快照
+
+| FP8 H3模式 | median | min/max | TFLOPS | 备注 |
+|---|---:|---:|---:|---|
+| Auto-DPM复测1 | 86.577 ms | 83.792 / 99.910 ms | 330.959 | 有快慢档 |
+| Auto-DPM复测2 | 86.389 ms | 83.812 / 99.889 ms | 331.678 | 正式入口 |
+| 1100MHz determinism | 134.472 ms | 134.430 / 134.671 ms | 213.080 | 稳定档 |

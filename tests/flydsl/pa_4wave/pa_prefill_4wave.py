@@ -13,6 +13,9 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import as_ir_value
 
 LOG2E = 1.4426950408889634
+_SCHED_MASK_DS_WRITE = 0x200
+_SCHED_MASK_TRANS = 0x400
+_EXP_DSWR_SYNC_ID = 1
 
 
 def _maxnumf(lhs, rhs):
@@ -100,6 +103,14 @@ def _schedule_fence():
     rocdl.sched_barrier(0)
 
 
+def _schedule_ds_write(count, sync_id=_EXP_DSWR_SYNC_ID):
+    rocdl.sched_group_barrier(_SCHED_MASK_DS_WRITE, count, sync_id)
+
+
+def _schedule_trans(count, sync_id=_EXP_DSWR_SYNC_ID):
+    rocdl.sched_group_barrier(_SCHED_MASK_TRANS, count, sync_id)
+
+
 def _recast_tensor(tensor, dtype):
     pointer_type = fx.PointerType.get(dtype.ir_type, tensor.memspace, dtype.width // 8)
     iterator = fx.recast_iter(pointer_type, fx.get_iter(tensor))
@@ -122,6 +133,7 @@ def _online_softmax(
     is_causal: fx.Constexpr[bool],
     overlap_max_reduction: fx.Constexpr[bool],
     split_score_scaling: fx.Constexpr[bool],
+    defer_output_rescale: fx.Constexpr[bool],
 ):
     if const_expr(not all_kv_valid):
         lane_id = fx.thread_idx.x & 63
@@ -196,8 +208,9 @@ def _online_softmax(
         if correction < fx.Float32(1.0):
             rescale_output()
 
-    rescale_if_needed()
-    return updated_max, updated_sum
+    if const_expr(not defer_output_rescale):
+        rescale_if_needed()
+    return updated_max, updated_sum, correction
 
 
 @functools.cache
@@ -241,6 +254,9 @@ def MHA(
         element_type = q_tile.dtype
         mma_k = {fx.Float8E4M3FNUZ: 16, fx.BFloat16: 8}[element_type]
         use_hw_slot_priority = element_type == fx.BFloat16 and head_dim_qk == 128
+        interleave_exp_ds_write = (
+            element_type == fx.BFloat16 and head_dim_qk == 128 and num_qo_heads >= 4
+        )
         hw_wave_slot = _read_hw_wave_slot() if const_expr(use_hw_slot_priority) else None
 
         def enter_softmax_stage():
@@ -369,7 +385,7 @@ def MHA(
             k_global_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Uint32)
             k_lds_store_atom = fx.make_copy_atom(fx.UniversalCopy64b(), fx.Uint32)
             k_tile_u32 = _recast_tensor(k_tile, fx.Uint32)
-            num_k_copies = 3
+            num_k_copies = head_dim_qk // 64
             prefetched_k = [
                 fx.make_rmem_tensor(fx.make_layout((2, num_k_copies), (1, 2)), fx.Uint32),
                 fx.make_rmem_tensor(fx.make_layout((2, num_k_copies), (1, 2)), fx.Uint32),
@@ -473,6 +489,7 @@ def MHA(
             is_all_kv_valid: fx.Constexpr[bool] = True,
         ):
             lookahead_page_id = kv_page_table[kv_block_index + 3]
+            correction = fx.Float32(1.0)
 
             if const_expr(is_compile_time_valid_block(kv_block_index)):
                 score_fragment.fill(0.0)
@@ -488,16 +505,33 @@ def MHA(
             prefetch_k(kv_block_index + 2, prefetch_k_page_id, k_pipeline_slot ^ 1)
 
             if const_expr(is_compile_time_valid_block(kv_block_index)):
-                running_max, running_sum = _online_softmax(
+                running_max, running_sum, correction = _online_softmax(
                     score_fragment, output_accumulator, qk_scale_log2, running_max, running_sum,
                     query_pos0, kv_block_index, kv_len, full_qo_len, is_all_kv_valid, is_causal,
                     element_type in (fx.BFloat16, fx.Float8E4M3FNUZ),
                     element_type == fx.Float8E4M3FNUZ,
+                    interleave_exp_ds_write,
                 )
 
             store_k_to_lds(kv_block_index + 1, k_pipeline_slot, k_pipeline_slot ^ 1)
+            if const_expr(interleave_exp_ds_write):
+                _schedule_trans(16)
+                _schedule_ds_write(1)
+                _schedule_trans(1)
+                _schedule_ds_write(1)
 
             if const_expr(is_compile_time_valid_block(kv_block_index)):
+                if const_expr(interleave_exp_ds_write):
+
+                    def rescale_output():
+                        output_accumulator.store(output_accumulator.load() * correction)
+
+                    @flyc.jit
+                    def rescale_if_needed():
+                        if correction < fx.Float32(1.0):
+                            rescale_output()
+
+                    rescale_if_needed()
                 if const_expr(element_type == fx.Float8E4M3FNUZ):
                     probability = score_fragment.load()
                     for k_group in range_constexpr(2):
