@@ -258,5 +258,5 @@ if __name__ == "__main__":
     quant_query_mode = "per-token"
     quant_query_mode = "per-tensor"
 
-    model = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=192)
+    model = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=128)
     do_test_pa_prefill(model, 1, 32768, 32768, is_causal=True, page_size=page_size, quant_query_mode=quant_query_mode)

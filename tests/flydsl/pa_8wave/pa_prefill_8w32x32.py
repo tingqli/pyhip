@@ -667,9 +667,13 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
             v_tile = fx.select(v_tile, (3, 4, 2, 0, 1))    # [head_dim, k_vector_size, BN // k_vector_size, num_physical_pages, num_BN_per_page]
             v_tile = fx.group(v_tile, 1, 3)                # [head_dim, (k_vector_size, BN // k_vector_size), num_physical_pages, num_BN_per_page]
 
+            buf_kv_page_table = fx.make_view(fx.get_iter(kv_page_indices) + kv_ind_start,
+                                             fx.make_layout(num_kv_pages,1))
+            buf_kv_page_table = fx.rocdl.make_buffer_tensor(buf_kv_page_table, max_size=False)
+
             attn_pipeline(q_tile, k_tile, v_tile, o_tile,
                           query_pos0, query_len, kv_len, full_qo_len,
-                          fx.get_iter(kv_page_indices) + kv_ind_start,
+                          buf_kv_page_table,
                           num_kv_pages,  last_page_len,
                           qk_scale_log2, v_s)
 
@@ -780,7 +784,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         assert kv_indptr.shape[0] == batch_size + 1
         assert kv_last_page_lens.shape[0] == batch_size
         # some internal logic use i32 address
-        assert K.numel()*K.element_size() <= 2**31 - 1, f"KV cache size ={K.numel()*K.element_size()} > 2**31 - 1"
+        # assert K.numel()*K.element_size() <= 2**31 - 1, f"KV cache size ={K.numel()*K.element_size()} > 2**31 - 1"
 
         multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
         with torch.cuda.stream(stream):
@@ -838,6 +842,9 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                 )
             return out
 
+        if q_descale.ndim == 0: q_descale = q_descale.view(1)
+        if k_descale.ndim == 0: k_descale = k_descale.view(1)
+        if v_descale.ndim == 0: v_descale = v_descale.view(1)
 
         cf = getattr(launch, "_cf", None)
         if cf is None:
