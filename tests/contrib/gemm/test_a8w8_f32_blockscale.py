@@ -9,8 +9,10 @@ from typing_extensions import List
 
 import aiter
 from aiter import dtypes
+from aiter.ops.quant import per_1x32_mx_quant_hip
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.utility.fp4_utils import e8m0_to_f32
 try:
     from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
         gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
@@ -29,12 +31,133 @@ if FLYDSL_TEST_DIR not in sys.path:
     sys.path.insert(0, FLYDSL_TEST_DIR)
 import flydsl.compiler as flyc
 from test_gemm_fp8_8w_blockscale import compile_gemm_fp8_8wave
+from test_mxfp8_gemm_4w import compile_gemm_fp8
 
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.set_default_device('cuda')
 torch.manual_seed(0)
 
 block_shape = (128, 128)
+
+
+def _dequant_blockscale_inputs(x, weight, x_scale, w_scale):
+    m, k = x.shape
+    n = weight.shape[0]
+    scale_n = (n + block_shape[0] - 1) // block_shape[0]
+    scale_k = (k + block_shape[1] - 1) // block_shape[1]
+    x_fp32 = (
+        x.float().view(m, scale_k, block_shape[1]) * x_scale.unsqueeze(-1)
+    ).view(m, k)
+    weight_scale = rearrange(
+        w_scale.view(scale_n, scale_k, 1, 1).expand(
+            scale_n, scale_k, block_shape[0], block_shape[1]
+        ),
+        "num_blk_n num_blk_k blk_n blk_k -> (num_blk_n blk_n) (num_blk_k blk_k)",
+    )[:n, :k]
+    return x_fp32, weight.float() * weight_scale
+
+
+def _permute_mxfp8_scale(scale):
+    scale = scale.view(torch.uint8)
+    rows, groups = scale.shape
+    permuted = (
+        scale.view(rows // 128, 4, 32, groups)
+        .permute(3, 0, 2, 1)
+        .contiguous()
+        .view(-1)
+    )
+    padding = torch.full((rows * 4,), 127, dtype=torch.uint8, device=scale.device)
+    return torch.cat((permuted, padding)).view(torch.int32)
+
+
+def run_flydsl4_mxfp8_accuracy(
+    x, weight, x_scale, w_scale, output_dtype, num_repeats=0, data_clones=32
+):
+    m, k = x.shape
+    n = weight.shape[0]
+    x_source, weight_source = _dequant_blockscale_inputs(
+        x, weight, x_scale, w_scale
+    )
+    mx_x, mx_x_scale = per_1x32_mx_quant_hip(
+        x_source.to(torch.bfloat16),
+        quant_dtype=dtypes.fp8,
+        scale_type=dtypes.fp8_e8m0,
+        shuffle=False,
+    )
+    mx_weight, mx_weight_scale = per_1x32_mx_quant_hip(
+        weight_source.to(torch.bfloat16),
+        quant_dtype=dtypes.fp8,
+        scale_type=dtypes.fp8_e8m0,
+        shuffle=False,
+    )
+    ref_x = mx_x.float() * e8m0_to_f32(mx_x_scale).repeat_interleave(32, dim=1)
+    ref_weight = mx_weight.float() * e8m0_to_f32(mx_weight_scale).repeat_interleave(32, dim=1)
+    ref = (ref_x @ ref_weight.t()).to(output_dtype)
+
+    out = torch.empty((m, n), dtype=output_dtype, device=x.device)
+    stream = torch.cuda.current_stream()
+    mx_x_scale = _permute_mxfp8_scale(mx_x_scale)
+    mx_weight_scale = _permute_mxfp8_scale(mx_weight_scale)
+    args = (
+        mx_x.view(torch.int8).view(-1),
+        mx_weight.view(torch.int8).view(-1),
+        mx_x_scale,
+        mx_weight_scale,
+        out.view(-1),
+        m,
+        stream,
+    )
+    launcher = compile_gemm_fp8(256, 256, 128, n, k, with_scale=True)
+    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
+    kernel(*args)
+    torch.cuda.synchronize()
+    diff = pyhip.calc_diff(ref, out, diff_thr=1e-5)
+    print(f"flydsl4_mxfp8 accuracy: diff={diff:.6e}")
+
+    if num_repeats:
+        mx_x_clones = [mx_x.clone() for _ in range(data_clones)]
+        mx_weight_clones = [mx_weight.clone() for _ in range(data_clones)]
+        mx_x_scale_clones = [mx_x_scale.clone() for _ in range(data_clones)]
+        mx_weight_scale_clones = [mx_weight_scale.clone() for _ in range(data_clones)]
+        outputs = [torch.empty_like(out) for _ in range(data_clones)]
+        arg_sets = [
+            (
+                mx_x_clones[i].view(torch.int8).view(-1),
+                mx_weight_clones[i].view(torch.int8).view(-1),
+                mx_x_scale_clones[i],
+                mx_weight_scale_clones[i],
+                outputs[i].view(-1),
+                m,
+                stream,
+            )
+            for i in range(data_clones)
+        ]
+        for clone_args in arg_sets:
+            kernel(*clone_args)
+        torch.cuda.synchronize()
+
+        flops = 2 * m * n * k
+        rw_bytes = (
+            mx_x.numel() * mx_x.element_size()
+            + mx_weight.numel() * mx_weight.element_size()
+            + mx_x_scale.numel() * mx_x_scale.element_size()
+            + mx_weight_scale.numel() * mx_weight_scale.element_size()
+            + out.numel() * out.element_size()
+        )
+        latencies = []
+        for i in range(num_repeats):
+            clone_index = i % data_clones
+            with pyhip.cudaPerf(
+                flops, rw_bytes, name=f"flydsl4_mxfp8_kernel_{clone_index}"
+            ) as perf:
+                kernel(*arg_sets[clone_index])
+            latencies.append(perf.dt_ms)
+        best_ms = min(latencies)
+        print(
+            f"flydsl4_mxfp8 best: {best_ms * 1e3:.3f} us, "
+            f"{flops / (best_ms * 1e-3) / 1e12:.1f} TFLOPS"
+        )
+    return out, ref
 
 @perftest()
 def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
@@ -140,6 +263,18 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
     print(w_scale.shape)
 
     out_torch, _ = run_torch(x, weight, x_scale, w_scale, output_dtype)
+
+    if m % 256 == 0 and n % 256 == 0 and k >= 512 and k % 256 == 0:
+        run_flydsl4_mxfp8_accuracy(
+            x,
+            weight,
+            x_scale,
+            w_scale,
+            output_dtype,
+            num_repeats=num_repeats,
+        )
+    else:
+        print("skip flydsl4 mxfp8 accuracy: M/N must be multiples of 256; K must be a multiple of 256 and at least 512")
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     if ck_preshuffle:
