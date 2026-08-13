@@ -26,7 +26,8 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
                    q_pos0, kv_block_n, kv_len, qo_len,
                    is_all_kv_valid: fx.Constexpr[bool],
                    KV_BLOCK_SIZE: fx.Constexpr[int],
-                   is_causal: fx.Constexpr[bool]):
+                   is_causal: fx.Constexpr[bool],
+                   return_bf16_probability: fx.Constexpr[bool] = False):
     """
     old_max/l_in是会被更新的，使用SSA方式return更新后值，不要使用mutable container例如list来修改
 
@@ -98,11 +99,27 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
             rescale_output()
 
     rescale_if_needed()
+    if fx.const_expr(return_bf16_probability):
+        probability = fxh.cvt_f32_to_bf16(fragS)
+        probability = fx.make_view(
+            fx.get_iter(probability),
+            fx.make_layout((4, 1, (2, 2)), (1, 0, (4, 8))),
+        )
+        return new_max, l_out, probability
     return new_max, l_out
 
 
 @functools.cache
-def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size, is_causal, quant_query_mode = "per-token"):
+def PagedAttention(
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_v,
+    page_size,
+    is_causal,
+    quant_query_mode="per-token",
+    key_layout="vectorized",
+):
     """
     cu_seqlens_q: [batch_size + 1] cu_seqlens_q[i] ~ cu_seqlens_q[i+1] is the range of query tokens in batch i
     kv_indptr   : [batch_size + 1] kv_indptr[i] ~ kv_indptr[i+1] is the range of virtual page ids in batch i
@@ -119,6 +136,10 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
     num_threads = 512
     num_waves = num_threads // 64
     assert page_size in [32, 64, 128]
+    assert key_layout in ("vectorized", "linear")
+    if key_layout == "linear":
+        assert page_size == 32
+        assert head_dim_qk == head_dim_v == 128
     num_BN_per_page = page_size // BN
     LOG2E = 1.4426950408889634
     sm_scale_log2 = float(LOG2E / (head_dim_qk**0.5))
@@ -158,9 +179,13 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
             对K的layout中n维度进行remap, 用这个layout进行compose (4, 2, 4):(1, 16, 4) 使得P的lane[0]/[32]跟V一致
             对P的寄存器排布，按照 fx.gemm 对 A/B 输入的要求重新解释
         """
+        if fx.const_expr(k_tile.dtype == fx.BFloat16):
+            k_row_layout = fx.make_layout((4, 2, 2, 2), (1, 8, 4, 16))
+        else:
+            k_row_layout = fx.make_layout((4, 2, 4), (1, 16, 4))
         k_tile = fx.composition(
             k_tile,
-            fx.make_tile(fx.make_layout((4, 2, 4), (1, 16, 4)), None, None, None),
+            fx.make_tile(k_row_layout, None, None, None),
         )
 
         fragQ = flyobj.load_tiled_mma_fragB(tmma1, q_tile)
@@ -197,7 +222,11 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
 
         # let all 512 threads participate in the copy so no extra if condition involved
         # 512*16/32 = 256, so all head_dim <= 256 can be padded to 256
-        copy_atom_bits = 64 if head_dim_qk == 128 else 128
+        copy_atom_bits = (
+            128 if k_tile.dtype == fx.BFloat16
+            else 64 if head_dim_qk == 128
+            else 128
+        )
 
         @fx.union
         class SharedStorage:
@@ -242,7 +271,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         lds_k_u32 = recast_tensor(lds_k, fx.Uint32)
         k_tile_u32 = recast_tensor(k_tile, fx.Uint32)
 
-        glk_thrcopy, _ = flyobj.get_tiled_copy_coalesced_mn(
+        glk_thrcopy, glk_load_atom = flyobj.get_tiled_copy_coalesced_mn(
             k_tile_u32[None, None, 0, 0],
             copy_atom_bits=copy_atom_bits,
             num_threads=num_copy_threads,
@@ -250,7 +279,9 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         glk_srck = glk_thrcopy.partition_S(k_tile_u32)
         glk_dstk = glk_thrcopy.partition_D(lds_k_u32)
 
-        glk_cp_atom = flyobj.get_universal_copy_atom(fx.Uint32, copy_atom_bits)
+        glk_store_atom = flyobj.get_universal_copy_atom(
+            fx.Uint32, copy_atom_bits
+        )
         glk_frag = fx.make_fragment_like(glk_dstk[None, None, None, 0])
         num_vm_cnt_load_k = (fx.size(glk_frag.shape).get_static_leaf_int * glk_frag.dtype.width)//copy_atom_bits
         prefetch_fragk_list = [
@@ -260,11 +291,19 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
 
         def global_load_k(block_n, page_id, bn_id, frag_id):
             if fx.const_expr(is_valid_block_n(block_n)):
+                if fx.const_expr(key_layout == "linear"):
+                    last_block = num_kv_pages * num_BN_per_page - 1
+                    source_block = fx.Int32(arith.minsi(
+                        arith.unwrap(fx.Int32(block_n)), arith.unwrap(last_block)
+                    ))
+                    source = glk_srck[None, None, None, source_block, 0]
+                else:
+                    source = glk_srck[None, None, None, page_id, bn_id]
                 if fx.const_expr(num_copy_threads == num_threads):
-                    fx.copy(glk_cp_atom, glk_srck[None, None, None, page_id, bn_id], prefetch_fragk_list[frag_id])
+                    fx.copy(glk_load_atom, source, prefetch_fragk_list[frag_id])
                 else:
                     if tid < num_copy_threads:
-                        fx.copy(glk_cp_atom, glk_srck[None, None, None, page_id, bn_id], prefetch_fragk_list[frag_id])
+                        fx.copy(glk_load_atom, source, prefetch_fragk_list[frag_id])
                 return num_vm_cnt_load_k
             else:
                 return 0
@@ -272,10 +311,10 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         def ds_store_k(block_n, frag_id, lds_buff_id):
             if fx.const_expr(is_valid_block_n(block_n)):
                 if fx.const_expr(num_copy_threads == num_threads):
-                    fx.copy(glk_cp_atom, prefetch_fragk_list[frag_id], glk_dstk[None, None, None, lds_buff_id & 1])
+                    fx.copy(glk_store_atom, prefetch_fragk_list[frag_id], glk_dstk[None, None, None, lds_buff_id & 1])
                 else:
                     if tid < num_copy_threads:
-                        fx.copy(glk_cp_atom, prefetch_fragk_list[frag_id], glk_dstk[None, None, None, lds_buff_id & 1])
+                        fx.copy(glk_store_atom, prefetch_fragk_list[frag_id], glk_dstk[None, None, None, lds_buff_id & 1])
     
         fragO.fill(0.0)
 
@@ -338,11 +377,18 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
 
                 if fx.const_expr(is_valid_block_n(block_n)):
                     # q_pos0, kv_len
-                    cur_max, l_in = online_softmax(fragS, fragO, qk_scale_log2, cur_max, l_in,
-                                                q_pos0, block_n, kv_len, full_qo_len,
-                                                is_all_kv_valid,
-                                                BN,
-                                                is_causal)
+                    if fx.const_expr(k_tile.dtype == fx.BFloat16):
+                        cur_max, l_in, probability_operand = online_softmax(
+                            fragS, fragO, qk_scale_log2, cur_max, l_in,
+                            q_pos0, block_n, kv_len, full_qo_len,
+                            is_all_kv_valid, BN, is_causal, True,
+                        )
+                    else:
+                        cur_max, l_in = online_softmax(
+                            fragS, fragO, qk_scale_log2, cur_max, l_in,
+                            q_pos0, block_n, kv_len, full_qo_len,
+                            is_all_kv_valid, BN, is_causal,
+                        )
 
                 rocdl.sched_barrier(0)
                 rocdl.s_barrier()
@@ -354,17 +400,19 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                 #   2nd half: Q@K part for block_n+1
                 
                 if fx.const_expr(is_valid_block_n(block_n)):
-                    vecS = fragS.load()
-                    packed_words = []
-                    for fn in fx.range_constexpr(4):
-                        i = fn * 4
-                        lo = rocdl.cvt_pk_fp8_f32(T.i32, vecS[i], vecS[i + 1], fx.Int32(0), False)
-                        packed = rocdl.cvt_pk_fp8_f32(T.i32, vecS[i + 2], vecS[i + 3], lo, True)
-                        packed_words.append(packed)
-                    packed_fp8 = Vec.from_elements(packed_words, fx.Int32).bitcast(prob_operand.dtype)
-                    prob_operand.store(packed_fp8)
+                    if fx.const_expr(k_tile.dtype != fx.BFloat16):
+                        vecS = fragS.load()
+                        packed_words = []
+                        for fn in fx.range_constexpr(4):
+                            i = fn * 4
+                            lo = rocdl.cvt_pk_fp8_f32(T.i32, vecS[i], vecS[i + 1], fx.Int32(0), False)
+                            packed = rocdl.cvt_pk_fp8_f32(T.i32, vecS[i + 2], vecS[i + 3], lo, True)
+                            packed_words.append(packed)
+                        packed_fp8 = Vec.from_elements(packed_words, fx.Int32).bitcast(prob_operand.dtype)
+                        prob_operand.store(packed_fp8)
+                        probability_operand = prob_operand
                     fxh.s_waitcnt(vmcnt=0)
-                    fx.gemm(tmma2, fragO, fragV, prob_operand, fragO)
+                    fx.gemm(tmma2, fragO, fragV, probability_operand, fragO)
 
                 if fx.const_expr(is_valid_block_n(block_n + 1)):
                     flyobj.load_tiled_mma_fragA(tmma1, lds_k, [None, None, lds_buff_id^1], dst=fragK)
@@ -529,6 +577,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         K: fx.Tensor,
         V: fx.Tensor,
         cu_seqlens_q: fx.Tensor,
+        cu_seqlens_k: fx.Tensor,
         kv_indptr: fx.Tensor,
         kv_page_indices: fx.Tensor,
         q_descale: fx.Tensor,
@@ -614,7 +663,10 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
             kv_ind_end = kv_indptr[batch_i + 1] # i32
             num_kv_pages = kv_ind_end - kv_ind_start # i32
             last_page_len = kv_last_page_lens[batch_i]
-            kv_len = (num_kv_pages - 1) * page_size + last_page_len
+            if fx.const_expr(key_layout == "linear"):
+                kv_len = cu_seqlens_k[batch_i + 1] - cu_seqlens_k[batch_i]
+            else:
+                kv_len = (num_kv_pages - 1) * page_size + last_page_len
 
 
             """
@@ -655,15 +707,51 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                                                  num_records_bytes = query_len * num_qo_heads * head_dim_v * (o_tile.dtype.width // 8))
             o_tile = o_tile[None, head_qo, None]
 
-            # K: [num_physical_pages, num_BN_per_page, num_kv_heads, head_dim // k_vector_size, BN, k_vector_size]
-            # V: [num_physical_pages, num_BN_per_page, num_kv_heads, BN // k_vector_size, head_dim, k_vector_size]
+            # Vectorized K: [page, BN-page, kv_head, D/vector, BN, vector]
+            # Linear K: [num_kv_tokens, num_kv_heads, head_dim]
+            # Public V is [page, kv_head, page/vector, D, vector]. The launch
+            # view splits page/vector into [num_BN_per_page, BN/vector].
             #       =>
             # k_tile: [BN, (k_vector_size, head_dim // k_vector_size), num_physical_pages, num_BN_per_page]
             # v_tile: [head_dim, (k_vector_size, BN // k_vector_size), num_physical_pages, num_BN_per_page]
-            k_tile = K[None, None, head_kv, None, None, None] # [num_physical_pages, num_BN_per_page, head_dim // k_vector_size, BN, k_vector_size]
+            if fx.const_expr(key_layout == "linear"):
+                num_kv_tokens = K.shape[0].to_py_value()
+                num_linear_blocks = (num_kv_tokens + BN - 1) // BN
+                k_vector_size = 128 // K.dtype.width
+                sequence_start = cu_seqlens_k[batch_i]
+                k_tile = fx.make_view(
+                    fx.get_iter(K) + (sequence_start * num_kv_heads + head_kv) * head_dim_qk,
+                    fx.make_layout(
+                        (
+                            BN,
+                            (k_vector_size, head_dim_qk // k_vector_size),
+                            num_linear_blocks,
+                            1,
+                        ),
+                        (
+                            num_kv_heads * head_dim_qk,
+                            (1, k_vector_size),
+                            BN * num_kv_heads * head_dim_qk,
+                            0,
+                        ),
+                    ),
+                )
+                k_tile = fx.rocdl.make_buffer_tensor(
+                    k_tile,
+                    max_size=False,
+                    num_records_bytes=(
+                        ((kv_len - 1) * num_kv_heads + 1)
+                        * head_dim_qk
+                        * (K.dtype.width // 8)
+                    ),
+                )
+            else:
+                k_tile = K[None, None, head_kv, None, None, None]
+                k_tile = fx.select(k_tile, (3, 4, 2, 0, 1))
+                k_tile = fx.group(k_tile, 1, 3)
+            # V has a public [page, head, page/vector, D, vector] layout. The
+            # launch view splits page/vector into BN pages without moving data.
             v_tile = V[None, None, head_kv, None, None, None] # [num_physical_pages, num_BN_per_page, BN // k_vector_size, head_dim, k_vector_size]
-            k_tile = fx.select(k_tile, (3, 4, 2, 0, 1))    # [BN, k_vector_size, head_dim // k_vector_size, num_physical_pages, num_BN_per_page]
-            k_tile = fx.group(k_tile, 1, 3)                # [BN, (k_vector_size, head_dim // k_vector_size), num_physical_pages, num_BN_per_page]
             v_tile = fx.select(v_tile, (3, 4, 2, 0, 1))    # [head_dim, k_vector_size, BN // k_vector_size, num_physical_pages, num_BN_per_page]
             v_tile = fx.group(v_tile, 1, 3)                # [head_dim, (k_vector_size, BN // k_vector_size), num_physical_pages, num_BN_per_page]
 
@@ -677,8 +765,6 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                           num_kv_pages,  last_page_len,
                           qk_scale_log2, v_s)
 
-            # The next ticket is global rather than grid-stride.  Faster
-            # workgroups therefore naturally process more query tiles.
             next_linear_work_idx = fetch_work(work_counter, tid)
             linear_work_delta = next_linear_work_idx - linear_work_idx
             linear_work_idx = next_linear_work_idx
@@ -693,6 +779,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         K: fx.Tensor,
         V: fx.Tensor,
         cu_seqlens_q: fx.Tensor,
+        cu_seqlens_k: fx.Tensor,
         kv_indptr: fx.Tensor,
         kv_page_indices: fx.Tensor,
         q_descale: fx.Tensor,
@@ -705,11 +792,27 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         stream: fx.Stream,
     ):
         num_query_tokens = Q.shape[0].to_py_value()
-        num_physical_pages = K.shape[0].to_py_value()
+        num_physical_pages = V.shape[0].to_py_value()
         k_vector_size = 128 // K.dtype.width
         Q = fxh.view_as_torch_tensor(Q, (num_query_tokens, num_qo_heads, head_dim_qk))
-        K = fxh.view_as_torch_tensor(K, (num_physical_pages, num_kv_heads, head_dim_qk//k_vector_size, num_BN_per_page, BN, k_vector_size))
-        K = fx.select(K, (0, 3, 1, 2, 4, 5))
+        if fx.const_expr(key_layout == "linear"):
+            num_kv_tokens = K.shape[0].to_py_value()
+            K = fxh.view_as_torch_tensor(
+                K, (num_kv_tokens, num_kv_heads, head_dim_qk)
+            )
+        else:
+            K = fxh.view_as_torch_tensor(
+                K,
+                (
+                    num_physical_pages,
+                    num_kv_heads,
+                    head_dim_qk // k_vector_size,
+                    num_BN_per_page,
+                    BN,
+                    k_vector_size,
+                ),
+            )
+            K = fx.select(K, (0, 3, 1, 2, 4, 5))
         V = fxh.view_as_torch_tensor(V, (num_physical_pages, num_kv_heads, num_BN_per_page, BN//k_vector_size, head_dim_v, k_vector_size))
         V = fx.select(V, (0, 2, 1, 3, 4, 5))
 
@@ -730,6 +833,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
             K,
             V,
             cu_seqlens_q,
+            cu_seqlens_k,
             kv_indptr,
             kv_page_indices,
             q_descale,
@@ -743,9 +847,10 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
 
     def callable(
         Q: torch.Tensor,  # [num_query_tokens, num_qo_heads, head_dim]
-        K: torch.Tensor,  # [num_physical_pages, num_kv_heads, (head_dim // k_vector_size, page_size, k_vector_size)]
+        K: torch.Tensor,  # vectorized [page, kv_head, D/vector, page_size, vector] or linear [token, kv_head, D]
         V: torch.Tensor,  # [num_physical_pages, num_kv_heads, (page_size // k_vector_size, head_dim, k_vector_size)]
         cu_seqlens_q: torch.Tensor,  # [batch_size + 1] cu_seqlens_q[i] ~ cu_seqlens_q[i+1] is the range of query tokens in batch i
+        cu_seqlens_k: torch.Tensor,  # [batch_size + 1], required for linear K
         kv_indptr: torch.Tensor,  # [batch_size + 1]    kv_indptr[i] ~ kv_indptr[i+1] is the range of virtual page ids in batch i
         kv_page_indices: torch.Tensor,  # [num_pages] kv_page_indices[i] is the physical page id of virtual page i (used to index into K and V)
         max_seqlen_q: int,  # a hint for scheduler
@@ -764,23 +869,41 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         assert not causal or max_seqlen_k >= max_seqlen_q, (
             "bottom-right causal attention requires max_seqlen_k >= max_seqlen_q"
         )
+        if cu_seqlens_k is None:
+            if key_layout != "vectorized":
+                raise ValueError(
+                    "cu_seqlens_k=None requires key_layout='vectorized'"
+                )
+            cu_seqlens_k = cu_seqlens_q
         assert k_descale.numel() == 1
         assert v_descale.numel() == 1
         num_query_tokens, _num_qo_heads, _head_dim = Q.shape
         assert _num_qo_heads == num_qo_heads
         assert _head_dim == head_dim_qk
-        num_physical_pages, _num_kv_heads, _head_dim_grps, _page_size, k_vector_size = K.shape
-        assert _num_kv_heads == num_kv_heads
-        assert _head_dim_grps * k_vector_size == head_dim_qk
-        assert _page_size == page_size
+        k_vector_size = 16 // K.element_size()
+        num_physical_pages = V.shape[0]
+        if key_layout == "linear":
+            assert Q.dtype == K.dtype == V.dtype == torch.bfloat16
+            assert K.ndim == 3
+            assert K.shape[1:] == (num_kv_heads, head_dim_qk)
+            assert K.shape[0] == int(cu_seqlens_k[-1].item())
+        else:
+            assert K.shape == (
+                num_physical_pages,
+                num_kv_heads,
+                head_dim_qk // k_vector_size,
+                page_size,
+                k_vector_size,
+            )
         assert V.shape == (
             num_physical_pages,
             num_kv_heads,
-            _page_size // k_vector_size,
+            page_size // k_vector_size,
             head_dim_v,
             k_vector_size,
         )
         batch_size = cu_seqlens_q.shape[0] - 1
+        assert cu_seqlens_k.shape == cu_seqlens_q.shape
         assert kv_indptr.shape[0] == batch_size + 1
         assert kv_last_page_lens.shape[0] == batch_size
         # some internal logic use i32 address
@@ -854,6 +977,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                 K,
                 V,
                 cu_seqlens_q,
+                cu_seqlens_k,
                 kv_indptr,
                 kv_page_indices,
                 q_descale,
@@ -872,6 +996,7 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                 K,
                 V,
                 cu_seqlens_q,
+                cu_seqlens_k,
                 kv_indptr,
                 kv_page_indices,
                 q_descale,

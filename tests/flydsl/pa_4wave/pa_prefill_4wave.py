@@ -18,6 +18,16 @@ _SCHED_MASK_TRANS = 0x400
 _EXP_DSWR_SYNC_ID = 1
 
 
+def _tensor_signature(tensor):
+    return (
+        tensor.dtype,
+        tensor.device.type,
+        tensor.device.index,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+    )
+
+
 def _maxnumf(lhs, rhs):
     return type(lhs)(arith.maxnumf(arith.unwrap(lhs), arith.unwrap(rhs)))
 
@@ -194,8 +204,8 @@ def _recast_tensor(tensor, dtype):
     return fx.make_view(iterator, layout)
 
 
-def _prepare_paged_v_tile(v_tile):
-    if const_expr(v_tile.dtype == fx.BFloat16):
+def _prepare_paged_v_tile(v_tile, permute_bf16_tokens: fx.Constexpr[bool]):
+    if const_expr(v_tile.dtype == fx.BFloat16 and permute_bf16_tokens):
         token_permutation = fx.make_layout((8, (2, 2)), (1, (16, 8)))
         v_tile = fx.composition(v_tile, fx.make_tile(None, token_permutation, None))
     return fx.rocdl.make_buffer_tensor(v_tile, max_size=False)
@@ -220,10 +230,12 @@ def _online_softmax(
     is_causal: fx.Constexpr[bool],
     split_score_scaling: fx.Constexpr[bool],
     defer_output_rescale: fx.Constexpr[bool],
+    interleaved_score_columns: fx.Constexpr[bool],
 ):
     if const_expr(not all_kv_valid):
         lane_id = fx.thread_idx.x & 63
         column_base = (lane_id < 32).select(fx.Int32(0), fx.Int32(16))
+        lane_column_group = (lane_id < 32).select(fx.Int32(0), fx.Int32(8))
         block_base = fx.Int32(kv_block_index * 32)
         if const_expr(is_causal):
             wave_id = fx.thread_idx.x // 64
@@ -231,11 +243,19 @@ def _online_softmax(
             query_position = query_tile_start + wave_id * 32 + query_row
             causal_limit = kv_len - query_sequence_length + query_position
             for index in range_constexpr(16):
-                if block_base + column_base + fx.Int32(index) > causal_limit:
+                if const_expr(interleaved_score_columns):
+                    column = lane_column_group + fx.Int32((index // 8) * 16 + index % 8)
+                else:
+                    column = column_base + fx.Int32(index)
+                if block_base + column > causal_limit:
                     score_fragment[index, 0, 0] = float("-inf")
         else:
             for index in range_constexpr(16):
-                if block_base + column_base + fx.Int32(index) >= kv_len:
+                if const_expr(interleaved_score_columns):
+                    column = lane_column_group + fx.Int32((index // 8) * 16 + index % 8)
+                else:
+                    column = column_base + fx.Int32(index)
+                if block_base + column >= kv_len:
                     score_fragment[index, 0, 0] = float("-inf")
 
     score = score_fragment.load()
@@ -294,11 +314,15 @@ def MHA(
     head_dim_v,
     page_size,
     is_causal,
+    key_layout="vectorized",
 ):
     assert head_dim_qk in (128, 192)
     assert head_dim_v == 128
     assert page_size == 32
     assert num_qo_heads % num_kv_heads == 0
+    assert key_layout in ("vectorized", "linear")
+    if key_layout == "linear":
+        assert head_dim_qk == head_dim_v == 128
 
     block_m = 128
     block_n = 32
@@ -319,6 +343,8 @@ def MHA(
         full_qo_len,
         kv_page_table,
         num_kv_pages,
+        kv_sequence_start,
+        kv_head,
         qk_scale_log2,
         v_scale,
         requires_epilogue_reentry_barrier: fx.Constexpr[bool],
@@ -427,14 +453,28 @@ def MHA(
                 fx.make_rmem_tensor(fx.make_layout((8, num_k_copies), (1, 8)), dtype),
             ]
 
-            def prefetch_k_bf16(physical_page_id, register_slot):
+            def prefetch_k_bf16(logical_page_id, physical_page_id, register_slot):
+                logical_page_id = fx.Int32(arith.minsi(
+                    arith.unwrap(fx.Int32(logical_page_id)), arith.unwrap(num_kv_pages - 1)
+                ))
                 for atom_index in range_constexpr(num_k_copies):
                     linear_atom = tid + atom_index * num_threads
                     source_row = linear_atom & (block_n - 1)
                     d_group = linear_atom // block_n
-                    source_offset = (physical_page_id * num_kv_heads * block_n * head_dim_qk
-                                     + d_group * block_n * vector_values
-                                     + source_row * vector_values)
+                    if const_expr(key_layout == "linear"):
+                        source_offset = (
+                            (kv_sequence_start + logical_page_id * block_n + source_row)
+                            * num_kv_heads * head_dim_qk
+                            + kv_head * head_dim_qk
+                            + d_group * vector_values
+                        )
+                    else:
+                        source_offset = (
+                            physical_page_id * page_size * num_kv_heads * head_dim_qk
+                            + kv_head * page_size * head_dim_qk
+                            + d_group * page_size * vector_values
+                            + source_row * vector_values
+                        )
                     source = fx.make_view(
                         fx.get_iter(k_tile) + source_offset, fx.make_layout(8, 1)
                     )
@@ -467,15 +507,18 @@ def MHA(
             k_chunk_in_group = tid & 7
             k_source_row = (k_row & 3) + ((k_row // 4) & 1) * 16 + (k_row // 8) * 4
 
-            def prefetch_k_fp8(physical_page_id, register_slot):
+            def prefetch_k_fp8(logical_page_id, physical_page_id, register_slot):
                 prefetched_k[register_slot].fill(0)
                 for atom_index in range_constexpr(num_k_copies):
                     chunk = k_chunk_in_group + atom_index * 8
                     d_group = chunk // 2
                     d_half = chunk & 1
-                    source_offset = (physical_page_id * num_kv_heads * block_n * head_dim_qk
-                                     + d_group * block_n * 16
-                                     + k_source_row * 16 + d_half * 8)
+                    source_offset = (
+                        physical_page_id * page_size * num_kv_heads * head_dim_qk
+                        + kv_head * page_size * head_dim_qk
+                        + d_group * page_size * 16
+                        + k_source_row * 16 + d_half * 8
+                    )
                     source = fx.make_view(
                         fx.get_iter(k_tile_u32) + source_offset // 4, fx.make_layout(2, 1)
                     )
@@ -556,13 +599,16 @@ def MHA(
             schedule_qk_and_v_loads()
 
             enter_softmax_stage()
-            prefetch_k(prefetch_k_page_id, k_pipeline_slot ^ 1)
+            prefetch_k(
+                kv_block_index + 2, prefetch_k_page_id, k_pipeline_slot ^ 1
+            )
 
             running_max, running_sum, correction = _online_softmax(
                 score_fragment, output_accumulator, qk_scale_log2, running_max, running_sum,
                 query_pos0, kv_block_index, kv_len, full_qo_len, is_all_kv_valid, is_causal,
                 is_fp8,
                 interleave_exp_ds_write,
+                False,
             )
 
             store_k_to_lds(k_pipeline_slot, k_pipeline_slot ^ 1)
@@ -601,9 +647,9 @@ def MHA(
         next_page_id = kv_page_table[1]
         prefetch_page_id = kv_page_table[2]
 
-        prefetch_k(current_page_id, 0)
+        prefetch_k(0, current_page_id, 0)
         store_k_to_lds(0, 0)
-        prefetch_k(next_page_id, 0)
+        prefetch_k(1, next_page_id, 0)
         gpu.barrier()
         fx.copy(k_lds_copy_atom, partition_k_lds(0), k_lds_copy.retile(k_fragment))
         enter_mma_stage()
@@ -708,6 +754,7 @@ def MHA(
         k,
         v,
         cu_seqlens_q,
+        cu_seqlens_k,
         kv_indptr,
         kv_page_indices,
         q_descale,
@@ -730,7 +777,10 @@ def MHA(
         full_qo_len = cu_seqlens_q[batch_index + 1] - cu_seqlens_q[batch_index]
         kv_start = kv_indptr[batch_index]
         num_kv_pages = kv_indptr[batch_index + 1] - kv_start
-        kv_len = (num_kv_pages - 1) * page_size + kv_last_page_lens[batch_index]
+        if const_expr(key_layout == "linear"):
+            kv_len = cu_seqlens_k[batch_index + 1] - cu_seqlens_k[batch_index]
+        else:
+            kv_len = (num_kv_pages - 1) * page_size + kv_last_page_lens[batch_index]
 
         qo_head = head_index
         kv_head = (qo_head * num_kv_heads) // num_qo_heads
@@ -762,16 +812,21 @@ def MHA(
             o_tile, max_size=False, num_records_bytes=query_len * num_qo_heads * head_dim_v * 2
         )[None, qo_head, None]
 
-        k_tile = k[None, kv_head, None, None, None]
-        k_tile = fx.group(fx.select(k_tile, (2, 3, 1, 0)), 1, 3)
-        k_tile = fx.rocdl.make_buffer_tensor(k_tile, max_size=False)
+        k_tile = fx.rocdl.make_buffer_tensor(k, max_size=False)
         v_tile = v[None, kv_head, None, None, None]
         v_tile = fx.group(fx.select(v_tile, (2, 3, 1, 0)), 1, 3)
-        v_tile = _prepare_paged_v_tile(v_tile)
+        v_tile = _prepare_paged_v_tile(v_tile, True)
 
+        kv_page_table = fx.rocdl.make_buffer_ptr(
+            fx.get_iter(kv_page_indices) + kv_start,
+            num_records_bytes=(
+                fx.Int64(num_kv_pages) * (kv_page_indices.dtype.width // 8)
+            ),
+        )
         attention_pipeline(
             q_tile, k_tile, v_tile, o_tile, query_pos0, query_len, kv_len, full_qo_len,
-            fx.get_iter(kv_page_indices) + kv_start, num_kv_pages, qk_scale_log2, v_scale,
+            kv_page_table, num_kv_pages,
+            cu_seqlens_k[batch_index], kv_head, qk_scale_log2, v_scale,
             requires_epilogue_reentry_barrier,
         )
 
@@ -781,6 +836,7 @@ def MHA(
         k: fx.Tensor,
         v: fx.Tensor,
         cu_seqlens_q: fx.Tensor,
+        cu_seqlens_k: fx.Tensor,
         kv_indptr: fx.Tensor,
         kv_page_indices: fx.Tensor,
         q_descale: fx.Tensor,
@@ -803,7 +859,8 @@ def MHA(
             head_index = work_ticket // works_per_head
             query_tile_index = work_ticket - head_index * works_per_head
         process_work_item(
-            q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, kv_last_page_lens, output,
+            q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
+            q_descale, kv_last_page_lens, output,
             fx.Int32(0), head_index, query_tile_index, tid, k_descale[0], v_descale[0], False,
         )
 
@@ -813,6 +870,7 @@ def MHA(
         k: fx.Tensor,
         v: fx.Tensor,
         cu_seqlens_q: fx.Tensor,
+        cu_seqlens_k: fx.Tensor,
         kv_indptr: fx.Tensor,
         kv_page_indices: fx.Tensor,
         q_descale: fx.Tensor,
@@ -869,8 +927,10 @@ def MHA(
 
         while batch_index < batch_size:
             process_work_item(
-                q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, kv_last_page_lens, output,
-                batch_index, head_index, query_tile_index, tid, k_scale, v_scale, True,
+                q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
+                q_descale, kv_last_page_lens, output,
+                batch_index, head_index, query_tile_index, tid, k_scale, v_scale,
+                True,
             )
 
             next_ticket = fetch_work(work_counter, tid)
@@ -886,6 +946,7 @@ def MHA(
         k: fx.Tensor,
         v: fx.Tensor,
         cu_seqlens_q: fx.Tensor,
+        cu_seqlens_k: fx.Tensor,
         kv_indptr: fx.Tensor,
         kv_page_indices: fx.Tensor,
         q_descale: fx.Tensor,
@@ -899,18 +960,36 @@ def MHA(
         stream: fx.Stream,
     ):
         num_query_tokens = q.shape[0].to_py_value()
-        num_physical_pages = k.shape[0].to_py_value()
+        num_physical_pages = v.shape[0].to_py_value()
         vector_size = 128 // k.dtype.width
         q = fx.make_view(
-            fx.get_iter(q), fx.make_ordered_layout((num_query_tokens, num_qo_heads, head_dim_qk), (2, 1, 0))
-        )
-        k = fx.make_view(
-            fx.get_iter(k),
+            fx.get_iter(q),
             fx.make_ordered_layout(
-                (num_physical_pages, num_kv_heads, head_dim_qk // vector_size, page_size, vector_size),
-                (4, 3, 2, 1, 0),
+                (num_query_tokens, num_qo_heads, head_dim_qk), (2, 1, 0)
             ),
         )
+        if fx.const_expr(key_layout == "linear"):
+            num_kv_tokens = k.shape[0].to_py_value()
+            k = fx.make_view(
+                fx.get_iter(k),
+                fx.make_ordered_layout(
+                    (num_kv_tokens, num_kv_heads, head_dim_qk), (2, 1, 0)
+                ),
+            )
+        else:
+            k = fx.make_view(
+                fx.get_iter(k),
+                fx.make_ordered_layout(
+                    (
+                        num_physical_pages,
+                        num_kv_heads,
+                        head_dim_qk // vector_size,
+                        page_size,
+                        vector_size,
+                    ),
+                    (4, 3, 2, 1, 0),
+                ),
+            )
         v = fx.make_view(
             fx.get_iter(v),
             fx.make_ordered_layout(
@@ -919,23 +998,31 @@ def MHA(
             ),
         )
         q_descale = fx.make_view(
-            fx.get_iter(q_descale), fx.make_ordered_layout((num_query_tokens, num_qo_heads, 1), (2, 1, 0))
+            fx.get_iter(q_descale),
+            fx.make_ordered_layout(
+                (num_query_tokens, num_qo_heads, 1), (2, 1, 0)
+            ),
         )
         k_descale = fx.make_view(fx.get_iter(k_descale), fx.make_layout(1, 1))
         v_descale = fx.make_view(fx.get_iter(v_descale), fx.make_layout(1, 1))
         output = fx.make_view(
-            fx.get_iter(output), fx.make_ordered_layout((num_query_tokens, num_qo_heads, head_dim_v), (2, 1, 0))
+            fx.get_iter(output),
+            fx.make_ordered_layout(
+                (num_query_tokens, num_qo_heads, head_dim_v), (2, 1, 0)
+            ),
         )
         value_attrs = {"passthrough": [["target-features", "-packed-fp32-ops"]]}
         if static_schedule:
             attention_kernel_static(
-                q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, k_descale, v_descale,
+                q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
+                kv_page_indices, q_descale, k_descale, v_descale,
                 kv_last_page_lens, output,
                 value_attrs=value_attrs,
             ).launch(grid=(num_workgroups, 1, 1), block=(num_threads, 1, 1), stream=stream)
         else:
             attention_kernel(
-                q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, k_descale, v_descale,
+                q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
+                kv_page_indices, q_descale, k_descale, v_descale,
                 kv_last_page_lens, output, work_counter,
                 value_attrs=value_attrs,
             ).launch(grid=(num_workgroups, 1, 1), block=(num_threads, 1, 1), stream=stream)
@@ -945,6 +1032,7 @@ def MHA(
         k,
         v,
         cu_seqlens_q,
+        cu_seqlens_k,
         kv_indptr,
         kv_page_indices,
         max_seqlen_q,
@@ -960,23 +1048,61 @@ def MHA(
         stream = torch.cuda.current_stream() if stream is None else stream
         assert causal == is_causal
         assert not causal or max_seqlen_k >= max_seqlen_q
+        if cu_seqlens_k is None:
+            if key_layout != "vectorized":
+                raise ValueError(
+                    "cu_seqlens_k=None requires key_layout='vectorized'"
+                )
+            cu_seqlens_k = cu_seqlens_q
         assert q.dtype in (torch.float8_e4m3fnuz, torch.bfloat16)
+        if key_layout == "linear":
+            assert q.dtype == torch.bfloat16
+            assert head_dim_qk == head_dim_v == 128
         assert k.dtype == q.dtype
         assert v.dtype == q.dtype
+        tensors = (q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
+                   q_descale, k_descale, v_descale, kv_last_page_lens, out)
+        assert all(tensor.is_cuda and tensor.is_contiguous() for tensor in tensors)
+        assert cu_seqlens_q.dtype == torch.int32
+        assert cu_seqlens_k.dtype == torch.int32
+        assert kv_indptr.dtype == torch.int32
+        assert kv_page_indices.dtype == torch.int32
+        assert kv_last_page_lens.dtype == torch.int32
+        assert q_descale.dtype == k_descale.dtype == v_descale.dtype == torch.float32
         assert out.dtype == torch.bfloat16
         assert q.shape[1:] == (num_qo_heads, head_dim_qk)
+        num_query_tokens = q.shape[0]
+        assert q_descale.shape == (num_query_tokens, num_qo_heads, 1)
+        assert out.shape == (num_query_tokens, num_qo_heads, head_dim_v)
         vector_size = 16 // q.element_size()
-        assert k.shape[1:] == (num_kv_heads, head_dim_qk // vector_size, page_size, vector_size)
-        assert v.shape[1:] == (num_kv_heads, page_size // vector_size, head_dim_v, vector_size)
+        num_physical_pages = v.shape[0]
+        if key_layout == "linear":
+            assert k.shape[1:] == (num_kv_heads, head_dim_qk)
+            assert k.shape[0] == int(cu_seqlens_k[-1].item())
+        else:
+            assert k.shape == (
+                num_physical_pages,
+                num_kv_heads,
+                head_dim_qk // vector_size,
+                page_size,
+                vector_size,
+            )
+        assert v.shape == (
+            num_physical_pages, num_kv_heads,
+            page_size // vector_size, head_dim_v, vector_size,
+        )
         assert k_descale.numel() == 1
         assert v_descale.numel() == 1
+        assert cu_seqlens_q.ndim == cu_seqlens_k.ndim == kv_indptr.ndim == kv_page_indices.ndim == 1
+        assert kv_last_page_lens.ndim == 1
+        assert cu_seqlens_q.shape == cu_seqlens_k.shape == kv_indptr.shape
+        assert kv_last_page_lens.shape[0] == cu_seqlens_q.shape[0] - 1
         assert k.numel() * k.element_size() <= 2**31 - 1
         assert "gfx942" in torch.cuda.get_device_properties().gcnArchName
-
         batch_size = cu_seqlens_q.shape[0] - 1
         static_schedule = batch_size == 1
         if static_schedule:
-            works_per_head = (q.shape[0] + block_m - 1) // block_m
+            works_per_head = (num_query_tokens + block_m - 1) // block_m
             num_workgroups = num_qo_heads * works_per_head
         else:
             multiprocessor_count = torch.cuda.get_device_properties().multi_processor_count
@@ -992,15 +1118,27 @@ def MHA(
                 work_counter[0] = num_workgroups
 
         compiled_cache = getattr(launch, "_compiled", {})
-        cache_key = (static_schedule, q.dtype)
+        cache_key = (
+            static_schedule,
+            num_workgroups,
+            torch.cuda.current_device(),
+            torch.cuda.get_device_properties().gcnArchName,
+            *(_tensor_signature(tensor) for tensor in (
+                q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
+                q_descale, k_descale, v_descale, kv_last_page_lens, out,
+                work_counter,
+            )),
+        )
         compiled = compiled_cache.get(cache_key)
         if compiled is None:
             saved_compile_hints = launch.compile_hints
             try:
                 launch.compile_hints = {**saved_compile_hints, **_compile_hints_for_dtype(q.dtype)}
                 compiled = flyc.compile(
-                    launch, q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, k_descale, v_descale,
-                    kv_last_page_lens, out, work_counter, num_workgroups, static_schedule, stream,
+                    launch, q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
+                    kv_page_indices, q_descale, k_descale, v_descale,
+                    kv_last_page_lens, out, work_counter, num_workgroups,
+                    static_schedule, stream,
                 )
             finally:
                 launch.compile_hints = saved_compile_hints
@@ -1008,8 +1146,10 @@ def MHA(
             launch._compiled = compiled_cache
         else:
             compiled(
-                q, k, v, cu_seqlens_q, kv_indptr, kv_page_indices, q_descale, k_descale, v_descale,
-                kv_last_page_lens, out, work_counter, num_workgroups, static_schedule, stream,
+                q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
+                kv_page_indices, q_descale, k_descale, v_descale,
+                kv_last_page_lens, out, work_counter, num_workgroups,
+                static_schedule, stream,
             )
 
     return callable

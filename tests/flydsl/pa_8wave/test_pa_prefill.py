@@ -1,14 +1,39 @@
 import torch
 import math
 
-import aiter
-from aiter import dtypes, pertoken_quant, per_tensor_quant
 import pyhip
 from dataclasses import dataclass
 
 from pa_prefill_8w32x32 import PagedAttention
 
 import pytest
+
+
+FP8_DTYPE = torch.float8_e4m3fnuz
+
+
+def pertoken_quant(x, scale=None, quant_dtype=FP8_DTYPE):
+    x_f32 = x.float()
+    if scale is None:
+        scale = x_f32.abs().amax(dim=-1, keepdim=True) / torch.finfo(
+            quant_dtype
+        ).max
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    return (x_f32 / scale).to(quant_dtype), scale.float()
+
+
+def per_tensor_quant(x, scale=None, quant_dtype=FP8_DTYPE):
+    x_f32 = x.float()
+    if scale is None:
+        scale = x_f32.abs().max() / torch.finfo(quant_dtype).max
+    return (x_f32 / scale).to(quant_dtype), scale.reshape(1).float()
+
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx942" not in torch.cuda.get_device_properties(0).gcnArchName,
+    reason="requires gfx942",
+)
 
 
 def vectorize_kv_cache(
@@ -58,11 +83,11 @@ class ModelConfig:
     head_dim_qk: int
     head_dim_v: int
     page_size: int = 32
-    quant_dtype = dtypes.fp8
+    quant_dtype = FP8_DTYPE
     is_causal: bool = True
 
 def do_test_pa_prefill(
-    modelcfg: ModelConfig, batch_size, qo_len, kv_len, is_causal = None, page_size = None, quant_query_mode="per-token"
+    modelcfg: ModelConfig, batch_size, qo_len, kv_len, is_causal = None, page_size = None, quant_query_mode="per-token", num_iters=10
 ):
 
     """Cover MiMo's direct cached-prefill contract and ragged last pages."""
@@ -129,13 +154,18 @@ def do_test_pa_prefill(
         batch_size, pages_per_seq
     )
     page_table = page_table.flip(1).contiguous()
-    kv_page_indices = torch.nn.functional.pad(
-        page_table.flatten(), (0, 256), value=0
-    ).to("cuda")
+    kv_page_indices = page_table.flatten().to("cuda")
     cu_seqlens_q = torch.arange(
         0,
         (batch_size + 1) * qo_len,
         qo_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    cu_seqlens_k = torch.arange(
+        0,
+        (batch_size + 1) * kv_len,
+        kv_len,
         dtype=torch.int32,
         device="cuda",
     )
@@ -180,6 +210,7 @@ def do_test_pa_prefill(
         k_vec,
         v_vec,
         cu_seqlens_q,
+        cu_seqlens_k,
         kv_indptr,
         kv_page_indices,
         max_seqlen_q=qo_len,
@@ -190,7 +221,7 @@ def do_test_pa_prefill(
         v_descale=v_descale,
         kv_last_page_lens=kv_last_page_lens,
         out=out,
-        num_iters=10,
+        num_iters=num_iters,
         num_verbose=1,
         num_flops = (batch_size * num_qo_heads * (qo_len * kv_len * head_dim_qk + qo_len * kv_len * head_dim_v) * 2)//(2 if is_causal else 1)
     )
@@ -251,7 +282,7 @@ model_mimo_padv = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_
 @pytest.mark.parametrize("page_size", [32, 64, 128])
 @pytest.mark.parametrize("quant_query_mode", ["per-token", "per-tensor"])
 def test_accuracy(modelcfg, is_causal, page_size, quant_query_mode):
-    do_test_pa_prefill(modelcfg, 3, 8192+79, 8192+153, is_causal=is_causal, page_size=page_size, quant_query_mode=quant_query_mode)
+    do_test_pa_prefill(modelcfg, 3, 8192+79, 8192+153, is_causal=is_causal, page_size=page_size, quant_query_mode=quant_query_mode, num_iters=1)
 
 if __name__ == "__main__":
     page_size = 64

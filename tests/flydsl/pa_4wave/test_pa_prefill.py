@@ -3,12 +3,38 @@ import os
 import statistics
 from dataclasses import dataclass
 
+import pytest
 import torch
-
-from aiter import dtypes, per_tensor_quant, pertoken_quant
 
 import pyhip
 from pa_prefill_4wave import MHA
+
+
+FP8_DTYPE = torch.float8_e4m3fnuz
+
+
+def pertoken_quant(x, scale=None, quant_dtype=FP8_DTYPE):
+    x_f32 = x.float()
+    if scale is None:
+        scale = x_f32.abs().amax(dim=-1, keepdim=True) / torch.finfo(
+            quant_dtype
+        ).max
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    return (x_f32 / scale).to(quant_dtype), scale.float()
+
+
+def per_tensor_quant(x, scale=None, quant_dtype=FP8_DTYPE):
+    x_f32 = x.float()
+    if scale is None:
+        scale = x_f32.abs().max() / torch.finfo(quant_dtype).max
+    return (x_f32 / scale).to(quant_dtype), scale.reshape(1).float()
+
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx942" not in torch.cuda.get_device_properties(0).gcnArchName,
+    reason="requires gfx942",
+)
 
 
 def vectorize_kv_cache(k_cache, v_cache, num_kv_heads, head_dim_qk, head_dim_v, page_size):
@@ -36,7 +62,7 @@ class ModelConfig:
     head_dim_qk: int
     head_dim_v: int
     page_size: int = 32
-    quant_dtype: torch.dtype = dtypes.fp8
+    quant_dtype: torch.dtype = FP8_DTYPE
 
 
 MIMO_TP8 = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=128)
@@ -68,6 +94,7 @@ def run_formal_benchmark(
     k,
     v,
     cu_seqlens_q,
+    cu_seqlens_k,
     kv_indptr,
     kv_page_indices,
     qo_len,
@@ -93,7 +120,7 @@ def run_formal_benchmark(
     def launch(buffer_index):
         kernel(
             q_buffers[buffer_index], k_buffers[buffer_index], v_buffers[buffer_index],
-            cu_seqlens_q, kv_indptr, kv_page_indices,
+            cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
             max_seqlen_q=qo_len, max_seqlen_k=kv_len, causal=causal,
             q_descale=q_descale_buffers[buffer_index], k_descale=k_descale, v_descale=v_descale,
             kv_last_page_lens=kv_last_page_lens, out=output_buffers[buffer_index],
@@ -121,7 +148,7 @@ def run_formal_benchmark(
 
 def make_h3_inputs(quant_dtype=torch.bfloat16):
     """Build the real H3 varlen pack in the paged-KV ABI used by this kernel."""
-    assert quant_dtype in (torch.bfloat16, dtypes.fp8)
+    assert quant_dtype in (torch.bfloat16, FP8_DTYPE)
     generator = torch.Generator(device="cuda").manual_seed(1101)
     segments = H3_SEGMENTS
     num_qo_heads = H3_BF16.num_qo_heads
@@ -171,8 +198,8 @@ def make_h3_inputs(quant_dtype=torch.bfloat16):
     k_input, v_input = vectorize_kv_cache(
         k_input, v_input, num_kv_heads, head_dim, head_dim, page_size
     )
-    kv_page_indices = torch.nn.functional.pad(
-        torch.arange(num_pages, device="cuda", dtype=torch.int32), (0, 256)
+    kv_page_indices = torch.arange(
+        num_pages, device="cuda", dtype=torch.int32
     )
     kv_indptr = torch.tensor(
         [0, *torch.tensor(pages_per_sequence).cumsum(0).tolist()], device="cuda", dtype=torch.int32
@@ -185,7 +212,7 @@ def make_h3_inputs(quant_dtype=torch.bfloat16):
 
     def launch():
         kernel(
-            q_input, k_input, v_input, cu_seqlens, kv_indptr, kv_page_indices,
+            q_input, k_input, v_input, cu_seqlens, cu_seqlens, kv_indptr, kv_page_indices,
             max_seqlen_q=max(segments), max_seqlen_k=max(segments), causal=False,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             kv_last_page_lens=kv_last_page_lens, out=output,
@@ -196,7 +223,7 @@ def make_h3_inputs(quant_dtype=torch.bfloat16):
 
 def run_h3_benchmark(dtype="bf16"):
     """Run the real MiniMax-H3 varlen pack with the AITER benchmark protocol."""
-    quant_dtype = torch.bfloat16 if dtype == "bf16" else dtypes.fp8
+    quant_dtype = torch.bfloat16 if dtype == "bf16" else FP8_DTYPE
     q, _, _, _, output, launch = make_h3_inputs(quant_dtype)
     segments = H3_SEGMENTS
     num_qo_heads = H3_BF16.num_qo_heads
@@ -266,9 +293,12 @@ def run_pa_prefill(model_config, batch_size, qo_len, kv_len, causal, num_iters=1
 
     page_table = torch.arange(num_pages, dtype=torch.int32).view(batch_size, pages_per_sequence)
     page_table = page_table.flip(1).contiguous()
-    kv_page_indices = torch.nn.functional.pad(page_table.flatten(), (0, 256), value=0).to("cuda")
+    kv_page_indices = page_table.flatten().to("cuda")
     cu_seqlens_q = torch.arange(
         0, (batch_size + 1) * qo_len, qo_len, dtype=torch.int32, device="cuda"
+    )
+    cu_seqlens_k = torch.arange(
+        0, (batch_size + 1) * kv_len, kv_len, dtype=torch.int32, device="cuda"
     )
     kv_indptr = torch.arange(
         0, (batch_size + 1) * pages_per_sequence, pages_per_sequence, dtype=torch.int32, device="cuda"
@@ -293,7 +323,8 @@ def run_pa_prefill(model_config, batch_size, qo_len, kv_len, causal, num_iters=1
     dtype_name = "bf16" if quant_dtype == torch.bfloat16 else "fp8"
     print(f"[case] dtype={dtype_name} batch={batch_size} qo={qo_len} kv={kv_len} causal={causal}")
     pyhip.run_perftest(
-        kernel, q_input, k_vectorized, v_vectorized, cu_seqlens_q, kv_indptr, kv_page_indices,
+        kernel, q_input, k_vectorized, v_vectorized, cu_seqlens_q, cu_seqlens_k,
+        kv_indptr, kv_page_indices,
         max_seqlen_q=qo_len, max_seqlen_k=kv_len, causal=causal,
         q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
         kv_last_page_lens=kv_last_page_lens, out=output,
@@ -346,11 +377,32 @@ def run_pa_prefill(model_config, batch_size, qo_len, kv_len, causal, num_iters=1
 
     if os.environ.get("PA_FORMAL_BENCH") == "1":
         run_formal_benchmark(
-            kernel, q_input, k_vectorized, v_vectorized, cu_seqlens_q, kv_indptr, kv_page_indices,
+            kernel, q_input, k_vectorized, v_vectorized, cu_seqlens_q, cu_seqlens_k,
+            kv_indptr, kv_page_indices,
             qo_len, kv_len, causal, q_descale, k_descale, v_descale, kv_last_page_lens, output, flops,
             name="4wave",
         )
     return diff
+
+
+@pytest.mark.parametrize(
+    ("model_config", "batch_size", "qo_len", "kv_len", "causal"),
+    [
+        (BF16_REF, 2, 129, 83, False),
+        (BF16_REF, 1, 129, 129, True),
+        (MIMO_TP8, 2, 128, 83, False),
+    ],
+)
+def test_accuracy(model_config, batch_size, qo_len, kv_len, causal):
+    diff = run_pa_prefill(
+        model_config,
+        batch_size,
+        qo_len,
+        kv_len,
+        causal,
+        num_iters=1,
+    )
+    assert diff is not None and diff < 0.001
 
 
 def main():
