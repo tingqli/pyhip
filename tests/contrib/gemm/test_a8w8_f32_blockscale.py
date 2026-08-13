@@ -1,4 +1,6 @@
 import pytest
+import os
+import sys
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -19,6 +21,14 @@ gluon_gemm_a8w8_blockscale = None
 
 import pyhip
 from pyhip.contrib.gemm_fp8 import *
+
+FLYDSL_TEST_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "flydsl")
+)
+if FLYDSL_TEST_DIR not in sys.path:
+    sys.path.insert(0, FLYDSL_TEST_DIR)
+import flydsl.compiler as flyc
+from test_gemm_fp8_8w_blockscale import compile_gemm_fp8_8wave
 
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.set_default_device('cuda')
@@ -183,12 +193,56 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
 
         di = (di + 1) % BUF_COPY
 
+    out_flydsl = None
+    if m % 256 == 0 and n % 256 == 0 and k >= 512 and k % 256 == 0:
+        empty = torch.empty(0, dtype=dtypes.fp32, device=x.device)
+        stream = torch.cuda.current_stream()
+        flydsl_launcher = compile_gemm_fp8_8wave(
+            256, 256, 128, n, k,
+            permlane_epilogue=True,
+            preshuffle_b=False,
+            with_scale=True,
+            useTileDMA=False,
+        )
+        flydsl_outputs = [
+            torch.empty((m, n), dtype=output_dtype, device=x.device)
+            for _ in range(BUF_COPY)
+        ]
+        flydsl_args = [
+            (
+                As[i].view(torch.int8).view(-1),
+                Bs[i].view(torch.int8).view(-1),
+                flydsl_outputs[i].view(-1),
+                ATscales[i].view(-1),
+                Bscales[i].view(-1),
+                m,
+                stream,
+            )
+            for i in range(BUF_COPY)
+        ]
+        flydsl_kernel = flyc.compile[{"opt_level": 2}](
+            flydsl_launcher, *flydsl_args[0]
+        )
+        for i in range(BUF_COPY):
+            flydsl_kernel(*flydsl_args[i])
+        torch.cuda.synchronize()
+        di = 0
+        for i in range(num_repeats):
+            with pyhip.cudaPerf(flops, rw_bytes, name=f"flydsl8_kernel_{di}"):
+                flydsl_kernel(*flydsl_args[di])
+            out_flydsl = flydsl_outputs[di]
+            di = (di + 1) % BUF_COPY
+    else:
+        print("skip flydsl8: M and N must be multiples of 256; K must be a multiple of 256 and at least 512")
+
     print(f"{pyhip.calc_diff(out_torch, out_ck, diff_thr=0.01)=:.6f}")
     if ck_preshuffle:
         print(f"{pyhip.calc_diff(out_torch, out_asm, diff_thr=0.4)=:.6f}")
     if gluon_gemm_a8w8_blockscale is not None:
         print(f"{pyhip.calc_diff(out_torch, out_gluon, diff_thr=0.01)=:.2f}")
     print(f"{pyhip.calc_diff(out_torch, out_jit, diff_thr=0.04)=:.6f}")
+    if out_flydsl is not None:
+        print(f"{pyhip.calc_diff(out_torch, out_flydsl, diff_thr=0.04)=:.6f}")
     #show_diff(out_torch, out_jit)
 
 if __name__ == "__main__":

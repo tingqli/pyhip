@@ -1064,8 +1064,8 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
         ).view(N, K)
         return a_deq @ b_deq.t()
 
-    a = (torch.rand(M, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
-    b = (torch.rand(N, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
+    a = (torch.rand(M, K, device="cuda") / 1.0).to(torch.float8_e4m3fn)
+    b = (torch.rand(N, K, device="cuda") / 1.0).to(torch.float8_e4m3fn)
     sA, sB = _gen_scales()
     ref = _ref(a, b, sA, sB)
     sA_kernel = sA.transpose(0, 1).contiguous() if with_scale else sA
@@ -1130,8 +1130,8 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
     if not perf:
         return is_correct
 
-    As = [torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn) for _ in range(data_clones)]
-    Bs = [_shuffle_b(torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)) for _ in range(data_clones)]
+    As = [torch.randn((M, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn) for _ in range(data_clones)]
+    Bs = [_shuffle_b(torch.randn((N, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)) for _ in range(data_clones)]
     SAs = [(_gen_scales()[0] if with_scale else empty) for _ in range(data_clones)]
     SAs_kernel = [sa.transpose(0, 1).contiguous() if with_scale else sa for sa in SAs]
     SBs = [(_gen_scales()[1] if with_scale else empty) for _ in range(data_clones)]
@@ -1165,6 +1165,9 @@ if __name__ == "__main__":
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
     torch.manual_seed(0)
     
-    K = 6144
+    K = 8192
+    run_test(M=8192, N=8192, K=K, perf=False, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
+    run_test(M=8192, N=8192, K=K, perf=False, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
+    
+    run_test(M=8192, N=8192, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=False)
     run_test(M=8192, N=8192, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
-    run_test(M=16384, N=3584, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)

@@ -52,18 +52,16 @@ def waitvmcnt_barrier(vmcnt):
 
 
 def hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops):
-    # 对标 gemm_4wave_950：把 DSRD 与 VMEM 都按实际数量均匀铺在 16 条 MFMA 上，
-    # 而非把 DSRD 全部前置、VMEM 全部后置。均匀交织让 global load 更早发射并分散，
-    # 改善访存延迟隐藏（前置/后置写法在 8192^3 上落后参考实现约 1.8%）。
     total_mfmas = 16
     prev_dsrd = 0
     prev_vmem = 0
     for i in range_constexpr(total_mfmas):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-        cur_dsrd = ((i + 1) * dsrd_ops + total_mfmas - 1) // total_mfmas
-        cur_vmem = ((i + 1) * vmem_ops + total_mfmas - 1) // total_mfmas
+        cur_dsrd = ((i + 3) * dsrd_ops + total_mfmas - 1) // total_mfmas
+        cur_dsrd = min(cur_dsrd, dsrd_ops)
         if const_expr(cur_dsrd > prev_dsrd):
             rocdl.sched_group_barrier(rocdl.mask_dsrd, cur_dsrd - prev_dsrd, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        cur_vmem = ((i + 1) * vmem_ops + total_mfmas - 1) // total_mfmas
         if const_expr(cur_vmem > prev_vmem):
             rocdl.sched_group_barrier(rocdl.mask_vmem_rd, cur_vmem - prev_vmem, group_id)
         prev_dsrd = cur_dsrd
@@ -445,6 +443,45 @@ def compile_gemm_fp8(
         bL_s = [dma_b.partition_D(sB_l_wr[0]), dma_b.partition_D(sB_l_wr[1])]
         bR_s = [dma_b.partition_D(sB_r_wr[0]), dma_b.partition_D(sB_r_wr[1])]
 
+        if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+            a_dma_rsrc = fx.buffer_ops.create_buffer_resource(
+                argA, num_records_bytes=arith._to_raw(fx.Int32(M * K))
+            )
+            b_dma_rsrc = fx.buffer_ops.create_buffer_resource(
+                argB, num_records_bytes=arith._to_raw(fx.Int32(N * K))
+            )
+            lane_id = tid % 64
+            wave_id = tid // 64
+            wave_id_uni = fx.Int32(rocdl.readfirstlane(T.i32, arith._to_raw(wave_id)))
+            lane_voffset = fx.Int32((lane_id // 8) * 16 * K + (lane_id % 8) * 16)
+            wave_lds_base = (wave_id_uni % 2) * (8 * BLOCK_K + 16) + (wave_id_uni // 2) * A_GROUP * 2
+
+            def make_dma_ptr(ptr, copy_round):
+                view = fx.make_view(ptr, fx.make_layout(1, 1))
+                root = _fly.extract_aligned_pointer_as_index(
+                    ir.Type.parse("!llvm.ptr<3>"), arith._to_raw(view)
+                )
+                return fx.buffer_ops.get_element_ptr(
+                    root,
+                    byte_offset=wave_lds_base + copy_round * 4 * A_GROUP,
+                    elem_type=T.i8,
+                )
+
+            a_t_dma_ptrs = [[make_dma_ptr(ptr, r) for r in range_constexpr(4)] for ptr in (lds.a_t0.ptr, lds.a_t1.ptr)]
+            a_b_dma_ptrs = [[make_dma_ptr(ptr, r) for r in range_constexpr(4)] for ptr in (lds.a_b0.ptr, lds.a_b1.ptr)]
+            b_l_dma_ptrs = [[make_dma_ptr(ptr, r) for r in range_constexpr(4)] for ptr in (lds.b_l0.ptr, lds.b_l1.ptr)]
+            b_r_dma_ptrs = [[make_dma_ptr(ptr, r) for r in range_constexpr(4)] for ptr in (lds.b_r0.ptr, lds.b_r1.ptr)]
+
+            def raw_g2s(rsrc, kk, ptrs, row_tile):
+                tile_soffset = fx.Int32(kk * BLOCK_K)
+                tile_voffset = lane_voffset + fx.Int32((row_tile * BLOCK_M + wave_id_uni) * K)
+                for copy_round in range_constexpr(4):
+                    rocdl.raw_ptr_buffer_load_lds(
+                        rsrc, ptrs[copy_round], fx.Int32(16), tile_voffset + copy_round * 4 * K,
+                        tile_soffset,
+                        fx.Int32(0), fx.Int32(0),
+                    )
+
         # ---- LDS -> reg（对标 gemm_v9：A 走 B-operand，B 走 A-operand；均 padding rd）----
         # 每个 slice 只有一份寄存器 fragment（无寄存器双缓冲），双缓冲仅在 LDS 层（buf0/buf1）。
         copy_a = fx.make_tiled_copy_B(lds_copy_atom, tiled_mma).get_slice(tid)
@@ -512,25 +549,37 @@ def compile_gemm_fp8(
         # 对标 gemm_v9：8 条 async g2s（2 tile × 4 array），waitvmcnt_barrier(24)，再 s2r B_l/A_t。
         def do_g2s(kk, buf):
             ki = fx.Int32(kk)
-            fx.copy(async_copy_atom, bL_g[None, None, None, ki], bL_s[buf])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(b_dma_rsrc, ki, b_l_dma_ptrs[buf], bid_y * 2)
+            else:
+                fx.copy(async_copy_atom, bL_g[None, None, None, ki], bL_s[buf])
             rocdl.sched_barrier(0)
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_b_l_g[None, None, None, ki], scale_b_l_s[buf])
                 rocdl.sched_barrier(0)
 
-            fx.copy(async_copy_atom, aT_g[None, None, None, ki], aT_s[buf])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(a_dma_rsrc, ki, a_t_dma_ptrs[buf], bid_x * 2)
+            else:
+                fx.copy(async_copy_atom, aT_g[None, None, None, ki], aT_s[buf])
             rocdl.sched_barrier(0)
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_a_t_g[None, None, None, ki], scale_a_t_s[buf])
                 rocdl.sched_barrier(0)
 
-            fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[buf])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(a_dma_rsrc, ki, a_b_dma_ptrs[buf], bid_x * 2 + 1)
+            else:
+                fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[buf])
             rocdl.sched_barrier(0)
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_a_b_g[None, None, None, ki], scale_a_b_s[buf])
                 rocdl.sched_barrier(0)
 
-            fx.copy(async_copy_atom, bR_g[None, None, None, ki], bR_s[buf])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(b_dma_rsrc, ki, b_r_dma_ptrs[buf], bid_y * 2 + 1)
+            else:
+                fx.copy(async_copy_atom, bR_g[None, None, None, ki], bR_s[buf])
             rocdl.sched_barrier(0)
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_b_r_g[None, None, None, ki], scale_b_r_s[buf])
@@ -583,7 +632,10 @@ def compile_gemm_fp8(
             fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_b_src[0], scale_a_b_frag)
-            fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 2], bL_s[0])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(b_dma_rsrc, kiter + 2, b_l_dma_ptrs[0], bid_y * 2)
+            else:
+                fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 2], bL_s[0])
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_b_l_g[None, None, None, kiter + 2], scale_b_l_s[0])
             hot_loop_scheduler_mainloop(0, b_vmem + int(with_scale), a_dsrd + int(with_scale))
@@ -594,7 +646,10 @@ def compile_gemm_fp8(
             fx.copy(lds_copy_atom, s2r_src0_B_r, dest_frag_B_r, pred=None)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_b_r_src[0], scale_b_r_frag)
-            fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(a_dma_rsrc, kiter + 2, a_t_dma_ptrs[0], bid_x * 2)
+            else:
+                fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_a_t_g[None, None, None, kiter + 2], scale_a_t_s[0])
             hot_loop_scheduler_mainloop(1, a_vmem + int(with_scale), b_dsrd + int(with_scale))
@@ -605,7 +660,10 @@ def compile_gemm_fp8(
             fx.copy(lds_copy_atom, s2r_src1_B_l, dest_frag_B_l, pred=None)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_b_l_src[1], scale_b_l_frag)
-            fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(a_dma_rsrc, kiter + 2, a_b_dma_ptrs[0], bid_x * 2 + 1)
+            else:
+                fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_a_b_g[None, None, None, kiter + 2], scale_a_b_s[0])
             hot_loop_scheduler_mainloop(2, a_vmem + int(with_scale), b_dsrd + int(with_scale))
@@ -616,7 +674,10 @@ def compile_gemm_fp8(
             fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
-            fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 2], bR_s[0])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(b_dma_rsrc, kiter + 2, b_r_dma_ptrs[0], bid_y * 2 + 1)
+            else:
+                fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 2], bR_s[0])
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_b_r_g[None, None, None, kiter + 2], scale_b_r_s[0])
             hot_loop_scheduler_mainloop(3, b_vmem + int(with_scale), a_dsrd + int(with_scale))
@@ -628,7 +689,10 @@ def compile_gemm_fp8(
             fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
-            fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 3], bL_s[1])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(b_dma_rsrc, kiter + 3, b_l_dma_ptrs[1], bid_y * 2)
+            else:
+                fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 3], bL_s[1])
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_b_l_g[None, None, None, kiter + 3], scale_b_l_s[1])
             hot_loop_scheduler_mainloop(4, b_vmem + int(with_scale), a_dsrd + int(with_scale))
@@ -639,7 +703,10 @@ def compile_gemm_fp8(
             fx.copy(lds_copy_atom, s2r_src1_B_r, dest_frag_B_r, pred=None)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_b_r_src[1], scale_b_r_frag)
-            fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(a_dma_rsrc, kiter + 3, a_t_dma_ptrs[1], bid_x * 2)
+            else:
+                fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_a_t_g[None, None, None, kiter + 3], scale_a_t_s[1])
             hot_loop_scheduler_mainloop(5, a_vmem + int(with_scale), b_dsrd + int(with_scale))
@@ -650,7 +717,10 @@ def compile_gemm_fp8(
             fx.copy(lds_copy_atom, s2r_src0_B_l, dest_frag_B_l, pred=None)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_b_l_src[0], scale_b_l_frag)
-            fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(a_dma_rsrc, kiter + 3, a_b_dma_ptrs[1], bid_x * 2 + 1)
+            else:
+                fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_a_b_g[None, None, None, kiter + 3], scale_a_b_s[1])
             hot_loop_scheduler_mainloop(6, a_vmem + int(with_scale), b_dsrd + int(with_scale))
@@ -661,7 +731,10 @@ def compile_gemm_fp8(
             fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_t_src[0], scale_a_t_frag)
-            fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 3], bR_s[1])
+            if const_expr(not with_scale and not lds_swizzle and not preshuffle_b):
+                raw_g2s(b_dma_rsrc, kiter + 3, b_r_dma_ptrs[1], bid_y * 2 + 1)
+            else:
+                fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 3], bR_s[1])
             if const_expr(with_scale):
                 fx.copy(scale_async_copy_atom, scale_b_r_g[None, None, None, kiter + 3], scale_b_r_s[1])
             hot_loop_scheduler_mainloop(7, b_vmem + int(with_scale), a_dsrd + int(with_scale))
