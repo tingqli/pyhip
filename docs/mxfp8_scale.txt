@@ -1,0 +1,142 @@
+
+#MXFP4 current 
+           [sm, g]  g=k//32
+        scale = scale.view(sm // 32, 2SM, 16sm, g // 8, 2G, 4g)
+        scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
+       (sm//32, g//8, 4g, 16sm, 2G, 2SM)
+
+16x128//32 //64 = 1 , e8m0
+
+f per_1x32_mx_quant_hip(
+- ``dtypes.fp8_e8m0``: e8m0 byte scale ``(m, ceil(n/32))``
+(or padded ``(pad256(m), pad8(ceil(n/32)))`` when
+``shuffle=True``)
+
+scale的对齐：
+
+如果shuffle = False, 只会把k 基于group size(32)向上对其。
+如果shuffle = True, 目前会把m/n 与256 对其 ， K会256对其。
+
+shuffle等于True, E8M0 scale 会以 [sm//32, g//8, 4g, 16sm, 2G, 2SM]
+2G is specially for MXFP4, BK = 256, MFMA_16_16_128_FP4, 2 BK instruction.
+
+
+scale layout  [m, k//32]->[m, groups],
+
+[m//32, 2M, 16m, g//8, 2G, 4g] permute
+
+[m//32, g//8, 4g, 16m, 2G, 2M] 
+
+#MXFP8, 
+
+##padding:
+假设M/N已经padding到256的的倍数, permute the scale_a/scale_b
+
+##permute scale:
+from [M, K//32] to coascling access, 128 bytes contineous for coascling access.
+
+A scale [M, K//32] -> [M ,  G] -> [M//128, 4M, 32m, G]  tranpose to (G, M//128, 32m , 4M) : permute(3, 0, 2, 1)
+
+ascale natural layout : ((4M, 32m, M//128), G), ((1, 4, 128), M)
+
+## async copy to LDS
+从global memory copy到 LDS的过程，128m 内部的permute对外可以不可见，所以这里直接把permute之后的 sA tensor 看作(M, G), （1， M)
+sA view as: (M, G), （1， M）
+Partition by : (128, 4) -> 
+
+sA view as (M, G), (1, M), uint8
+bsA_t = fx.flat_divide(sA, (128, 4))[None, None, bid_x * 2 + 0, none] shape  
+bsA_t shape (128, 4, 1, G//4)
+
+
+
+###limitation: read scale from global memory related, each lane 16 bit has some limitation.
+实际需要的layout:
+bsA_t read layout ((128, 4,  G//4), (1, M, 4*M))
+tv_layout = ((64, 4), 2), ((2, 128), 1)
+
+
+每条lane 读取 128*4//256=2 bytes. 128个bytes是连续的
+问题：BUFFER_LOAD_{ubyte, sbyte, ushort, sshort, dword, dwordX3, dwordX4, format_x}. , 
+     但type ushort的时候，存入的LDS ushort 会被存成dword.
+
+### g2s copy WA
+WA: 多读数据已被数据 [128, 4] -> [128, 8], 下一个BK, 但是不使用。
+
+async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+tilemn = (128, 8), m=128, n = 8
+
+###： LDS allocation
+LDS buffer size for A/B 128*8 bytes = 1kB  ，有用的只有512 bytes.
+总共需要 8KB, 8个LDS buffer entry for A, B scale ping-pong
+
+### g2s: bsA_t read 
+tilemn = (128, 8), m=128, n = 8
+bsA_t layout view:  ((128, 4,  G//4), (1, M, 4*M)）  ,u8
+read_tv_layout = ((32, 8), 4), ((4, 128), 1) , 每条lane读4个m, 32条lane128个m, 
+
+### g2s: LDS write layout, 顺序排，理论上后一半的LDS是无用数据
+
+LDS write layout: ((128,  8), (1, 128)） u8
+tilemn = (128, 8), m=128, n = 8
+wrlds_tv_layout = ((256), 4), (4, 1)
+
+## s2r:
+
+### LDS read layout, LDS 实际的物理排布， ( 8g, 32m,4M) U8 -> (( 8g, 32m)) int32 as ， 
+我们只需要前一半的lds（4g, 32m）, LDS tensor view是原来的一半了。
+
+i32_iter = fx.recast_iter(i32, fx.get_iter(lds_wr))
+lds_rd = fx.Tensor(fx.make_view(i32_iter, fx.make_layout((32, 4), (1, 32))))
+
+bsA_t LDS read layout: ((32,  4), (1, 32)） u32
+tilemn = (32, 4), m=32, n = 4, u32
+
+tv layout和实际2x2 wave相关， A， B 不同，MMA atom里面wave0, wave1是M方向排， wave0, wave2是N方向，
+但是我们的bA用实际上用了mfma B 的tile, bB 用了 mfma A 的tile
+wave0, wave1是N方向排， wave0, wave2是M方向，
+
+scale A, tv_layout = ((16， 4， 2， 2), 1), ((1, 32, 0, 16), 1), or 
+
+scale B,tv_layout = ((16， 4， 2， 2), 1), ((1, 32, 16, 0), 1),
+
+
+#所有的scale load都要使用buffer 
+
+
+# Non-scale FP8 optimization log
+
+Protocol: 8192^3, float32 randn input, 32 rotating clones, 50 runs,
+pyhip.cudaPerf best-of-run. Gluon reference: 3132.84 TFLOPS.
+
+## 0. Tiled-copy baseline
+- Method: BufferCopyLDS128b tiled copy.
+- Correctness: pass.
+- ISA: mainloop has 36 v_add and 32 v_readfirstlane.
+- Perf: 2938.90 TFLOPS; gap to Gluon 6.19%.
+
+## 1. Raw G2S DMA
+- Method: raw_ptr_buffer_load_lds with precomputed uniform LDS m0 pointers.
+- Correctness: non-scale and scale 512^3 pass.
+- ISA: mainloop v_add 36 -> 0, v_readfirstlane 32 -> 0; 42 scalar adds remain.
+- Perf: 3001.5 TFLOPS repeatable best, +2.13%; gap to Gluon 4.19%.
+- ATT: mainloop 4706.7 -> 4461.2 cycles.
+
+## 2. Precomputed global voffsets
+- Method: move row/wave/copy-round offsets outside the mainloop.
+- Correctness: non-scale 512^3 pass.
+- ISA: mainloop 323 -> 285 instructions; scalar adds 42 -> 4.
+- Perf: 3006.73 TFLOPS, +0.17% over step 1 and +2.31% over baseline;
+     gap to Gluon 4.02%.
+
+## 3. Mainloop scheduling
+- DSRD two slots earlier: correctness pass, 3035.62 TFLOPS, +0.96%.
+- DSRD three slots earlier: correctness pass, 3024.27 TFLOPS; rejected.
+- Direct Gluon local ordering: correctness pass, 2939.53 TFLOPS; rejected.
+
+## 4. Remove precomputed global voffsets
+- Method: compute row/wave/copy-round offsets inside each raw_g2s call; keep the
+     DSRD two-slot schedule.
+- Correctness: non-scale 512^3 pass, diff 2.23e-8.
+- Perf: 3025.60 TFLOPS, -0.33% versus 3035.62 with precomputed voffsets;
+     final-window average 3002.22 TFLOPS.
