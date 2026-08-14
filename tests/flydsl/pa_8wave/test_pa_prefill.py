@@ -276,6 +276,10 @@ multi_processor_count = torch.cuda.get_device_properties().multi_processor_count
 model_d128 = ModelConfig("Llama3_70B_TP8", num_qo_heads=8, num_kv_heads=1, head_dim_qk=128, head_dim_v=128)
 model_mimo = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=128)
 model_mimo_padv = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=192)
+model_d128_bf16 = ModelConfig("Llama3_BF16", num_qo_heads=16, num_kv_heads=1, head_dim_qk=128, head_dim_v=128)
+model_d128_bf16.quant_dtype = torch.bfloat16
+model_mimo_bf16 = ModelConfig("MiMo_BF16", num_qo_heads=16, num_kv_heads=1, head_dim_qk=192, head_dim_v=128)
+model_mimo_bf16.quant_dtype = torch.bfloat16
 
 @pytest.mark.parametrize("modelcfg", [model_d128, model_mimo, model_mimo_padv])
 @pytest.mark.parametrize("is_causal", [True, False])
@@ -283,6 +287,25 @@ model_mimo_padv = ModelConfig("MiMo_TP8", num_qo_heads=16, num_kv_heads=1, head_
 @pytest.mark.parametrize("quant_query_mode", ["per-token", "per-tensor"])
 def test_accuracy(modelcfg, is_causal, page_size, quant_query_mode):
     do_test_pa_prefill(modelcfg, 3, 8192+79, 8192+153, is_causal=is_causal, page_size=page_size, quant_query_mode=quant_query_mode, num_iters=1)
+
+@pytest.mark.parametrize(
+    ("modelcfg", "qo_len", "kv_len", "is_causal", "page_size"),
+    [
+        (model_d128_bf16, 9, 9, False, 32),
+        (model_mimo_bf16, 9, 9, False, 32),
+        (model_mimo_bf16, 1024, 1024, True, 64),
+    ],
+)
+def test_bf16_accuracy(modelcfg, qo_len, kv_len, is_causal, page_size):
+    do_test_pa_prefill(
+        modelcfg,
+        1,
+        qo_len,
+        kv_len,
+        is_causal=is_causal,
+        page_size=page_size,
+        num_iters=1,
+    )
 
 if __name__ == "__main__":
     page_size = 64

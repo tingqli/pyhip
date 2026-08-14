@@ -45,6 +45,7 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
         # mask out invalid kv positions
         lane_id = fx.thread_idx.x & 63
         col_lane = (lane_id < 32).select(fx.Int32(0), fx.Int32(16))
+        bf16_col_lane = (lane_id < 32).select(fx.Int32(0), fx.Int32(8))
         col_block = fx.Int32(kv_block_n * KV_BLOCK_SIZE)
         if fx.const_expr(not is_causal):
             # Keep both sides explicitly i32.  A Python constexpr loop index
@@ -52,7 +53,11 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
             # comparison is unsigned; a negative limit would then look huge
             # and leave invalid tail columns unmasked.
             for i in fx.range_constexpr(16):
-                kv_pos = col_block + col_lane + fx.Int32(i)
+                if fx.const_expr(return_bf16_probability):
+                    column = bf16_col_lane + fx.Int32((i // 8) * 16 + i % 8)
+                else:
+                    column = col_lane + fx.Int32(i)
+                kv_pos = col_block + column
                 if kv_pos >= kv_len:
                     fragS[i,0,0] = float("-inf")
         else:
@@ -63,7 +68,11 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
             q_pos = q_pos0 + wave_id * 32 + row_lane
             causal_limit = kv_len - qo_len + q_pos
             for i in fx.range_constexpr(16):
-                kv_pos = col_block + col_lane + fx.Int32(i)
+                if fx.const_expr(return_bf16_probability):
+                    column = bf16_col_lane + fx.Int32((i // 8) * 16 + i % 8)
+                else:
+                    column = col_lane + fx.Int32(i)
+                kv_pos = col_block + column
                 if kv_pos > causal_limit:
                     fragS[i,0,0] = float("-inf")
 
@@ -253,6 +262,9 @@ def PagedAttention(
         # assert 0, f"{k_tile}"
         num_copy_threads = BN * head_dim_qk * k_tile.dtype.width // copy_atom_bits
         assert BN * head_dim_qk * k_tile.dtype.width % copy_atom_bits == 0
+        if fx.const_expr(k_tile.dtype == fx.BFloat16 and head_dim_qk == 192):
+            # Fit 768 b128 atoms into 384 threads; each thread copies two atoms.
+            num_copy_threads //= 2
         assert num_copy_threads <= num_threads
 
         # [TRICKY]
@@ -969,9 +981,21 @@ def PagedAttention(
         if k_descale.ndim == 0: k_descale = k_descale.view(1)
         if v_descale.ndim == 0: v_descale = v_descale.view(1)
 
-        cf = getattr(launch, "_cf", None)
-        if cf is None:
-            cf = flyc.compile(
+        compiled_cache = getattr(launch, "_compiled", {})
+        cache_key = (
+            torch.cuda.current_device(),
+            torch.cuda.get_device_properties().gcnArchName,
+            Q.dtype,
+            K.dtype,
+            V.dtype,
+            q_descale.dtype,
+            k_descale.dtype,
+            v_descale.dtype,
+            out.dtype,
+        )
+        compiled = compiled_cache.get(cache_key)
+        if compiled is None:
+            compiled = flyc.compile(
                 launch,
                 Q,
                 K,
@@ -989,9 +1013,10 @@ def PagedAttention(
                 multi_processor_count,
                 stream,
             )
-            launch._cf = cf
+            compiled_cache[cache_key] = compiled
+            launch._compiled = compiled_cache
         else:
-            cf(
+            compiled(
                 Q,
                 K,
                 V,

@@ -1133,7 +1133,11 @@ def MHA(
         if compiled is None:
             saved_compile_hints = launch.compile_hints
             try:
-                launch.compile_hints = {**saved_compile_hints, **_compile_hints_for_dtype(q.dtype)}
+                compile_hints = _compile_hints_for_dtype(q.dtype)
+                if not static_schedule and q.dtype == torch.bfloat16 and head_dim_qk == 192:
+                    # Keep two waves resident; unconstrained LLVM uses 256 VGPR + 9 AGPR.
+                    compile_hints = {**compile_hints, "waves_per_eu": 2}
+                launch.compile_hints = {**saved_compile_hints, **compile_hints}
                 compiled = flyc.compile(
                     launch, q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
                     kv_page_indices, q_descale, k_descale, v_descale,

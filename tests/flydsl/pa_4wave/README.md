@@ -12,6 +12,32 @@ ragged page、变长batch和bottom-right causal mask。主配置为
 
 ## 最新结果
 
+### 2026-08-14修改目标与验收
+
+目标只有两项：
+
+1. 为8-wave补齐BF16 `Dq=192,Dv=128`，修复其tail/causal mask和dtype编译缓存，
+  并增加D128/D192 BF16回归；FP8路径保持兼容。
+2. 修复4-wave batch>1 persistent BF16 D192的低occupancy分配。原
+   `vgpr_count=265`实际为`256 VGPR + 9 AGPR`，并非普通VGPR越过硬件上限；
+   设置`waves_per_eu=2`后变为`256 VGPR + 0 AGPR / 10 spill / 44B private`。
+
+验收使用MI308X/gfx942、1300MHz、`Hq=16,Hkv=1,Q=KV=32768,causal,page_size=32`，
+每组10次预热、两轮各50个event样本，顺序为`4w -> 8w -> 8w -> 4w`。
+
+| shape | batch | 4-wave | 8-wave | 关键资源 |
+|---|---:|---:|---:|---|
+| BF16 D128 | 1 | 23.983 ms / 183.381T | 30.054 ms / 146.340T | 8-wave：8 spill / 36B private |
+| BF16 D128 | 4 | 97.725 ms / 180.017T | 116.349 ms / 151.202T | 4-wave：228 VGPR / 0 spill |
+| BF16 D192 | 1 | 34.468 ms / 159.497T | 37.770 ms / 145.555T | 8-wave：23 spill / 96B private |
+| BF16 D192 | 4 | 137.813 ms / 159.566T | 146.258 ms / 150.352T | 4-wave：10 spill / 44B private |
+
+4-wave D192 batch=4修复前为`113.419T`，修复后提升`40.69%`。四组4/8-wave输出
+均finite；relative-L2为D128 batch=1/4 `3.7173e-5/3.8095e-5`，D192 batch=1/4
+`3.8662e-5/3.8175e-5`。8-wave BF16 D192短尾、causal及FP8聚焦用例通过。
+
+回归：8-wave `39 passed`、4-wave `3 passed`、公开API `11 passed`。
+
 更新时间：2026-08-11。最新8-wave参考使用per-tensor Q量化；4-wave接收同一份FP8 Q和
 等值descale。两者在同一进程使用10套buffer、各10次预热和50个CUDA event样本，采用
 位置平衡顺序；“相对8-wave”为25组配对时间比中位数的倒数。
