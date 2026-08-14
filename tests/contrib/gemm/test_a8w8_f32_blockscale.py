@@ -9,7 +9,7 @@ from typing_extensions import List
 
 import aiter
 from aiter import dtypes
-from aiter.ops.quant import per_1x32_mx_quant_hip
+from aiter.ops.quant import per_1x32_mx_quant_hip, pertoken_quant
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility.fp4_utils import e8m0_to_f32
@@ -70,14 +70,52 @@ def _permute_mxfp8_scale(scale):
     return torch.cat((permuted, padding)).view(torch.int32)
 
 
+def _quant_128x128_blockscale(x_source, weight_source):
+    m, k = x_source.shape
+    n = weight_source.shape[0]
+    assert m % 128 == 0 and n % 128 == 0 and k % 128 == 0
+    x_blocks = x_source.to(torch.bfloat16).view(-1, 128)
+    x, x_scale = pertoken_quant(x_blocks, quant_dtype=dtypes.fp8)
+    x = x.view(m, k)
+    x_scale = x_scale.view(m, k // 128)
+
+    weight_blocks = (
+        weight_source.to(torch.bfloat16)
+        .view(n // 128, 128, k // 128, 128)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(-1, 128 * 128)
+    )
+    weight, w_scale = pertoken_quant(weight_blocks, quant_dtype=dtypes.fp8)
+    weight = (
+        weight.view(n // 128, k // 128, 128, 128)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(n, k)
+    )
+    w_scale = w_scale.view(n // 128, k // 128)
+    return x, weight, x_scale, w_scale
+
+
 def run_flydsl4_mxfp8_accuracy(
-    x, weight, x_scale, w_scale, output_dtype, num_repeats=0, data_clones=32
+    x,
+    weight,
+    x_scale,
+    w_scale,
+    output_dtype,
+    num_repeats=0,
+    data_clones=32,
+    return_metrics=False,
+    source_inputs=None,
 ):
     m, k = x.shape
     n = weight.shape[0]
-    x_source, weight_source = _dequant_blockscale_inputs(
-        x, weight, x_scale, w_scale
-    )
+    if source_inputs is None:
+        x_source, weight_source = _dequant_blockscale_inputs(
+            x, weight, x_scale, w_scale
+        )
+    else:
+        x_source, weight_source = source_inputs
     mx_x, mx_x_scale = per_1x32_mx_quant_hip(
         x_source.to(torch.bfloat16),
         quant_dtype=dtypes.fp8,
@@ -114,6 +152,7 @@ def run_flydsl4_mxfp8_accuracy(
     diff = pyhip.calc_diff(ref, out, diff_thr=1e-5)
     print(f"flydsl4_mxfp8 accuracy: diff={diff:.6e}")
 
+    best_ms = None
     if num_repeats:
         mx_x_clones = [mx_x.clone() for _ in range(data_clones)]
         mx_weight_clones = [mx_weight.clone() for _ in range(data_clones)]
@@ -157,7 +196,190 @@ def run_flydsl4_mxfp8_accuracy(
             f"flydsl4_mxfp8 best: {best_ms * 1e3:.3f} us, "
             f"{flops / (best_ms * 1e-3) / 1e12:.1f} TFLOPS"
         )
+    if return_metrics:
+        return {
+            "diff": diff,
+            "best_us": best_ms * 1e3 if best_ms is not None else None,
+            "tflops": flops / (best_ms * 1e-3) / 1e12 if best_ms else None,
+        }
     return out, ref
+
+
+def _benchmark_kernel(kernel, arg_sets, flops, rw_bytes, name, num_repeats):
+    for args in arg_sets:
+        kernel(*args)
+    torch.cuda.synchronize()
+    latencies = []
+    for i in range(num_repeats):
+        clone_index = i % len(arg_sets)
+        with pyhip.cudaPerf(
+            flops, rw_bytes, name=f"{name}_{clone_index}"
+        ) as perf:
+            kernel(*arg_sets[clone_index])
+        latencies.append(perf.dt_ms)
+    best_ms = min(latencies)
+    return best_ms * 1e3, flops / (best_ms * 1e-3) / 1e12
+
+
+def benchmark_three_kernels(
+    m=8192,
+    n=8192,
+    k_values=(4096, 6144, 8192, 12288, 16384, 24576, 32768),
+    num_repeats=30,
+    data_clones=8,
+):
+    output_dtype = dtypes.bf16
+    results = []
+    torch.manual_seed(0)
+
+    for k in k_values:
+        print(f"\n{'=' * 24} M={m} N={n} K={k} {'=' * 24}")
+        torch.manual_seed(0)
+        x_source = torch.randn((m, k), dtype=dtypes.fp32) * 0.75
+        weight_source = torch.randn((n, k), dtype=dtypes.fp32) * 3.0
+        x, weight, x_scale, w_scale = _quant_128x128_blockscale(
+            x_source, weight_source
+        )
+
+        blockwise_ref, _ = run_torch(
+            x, weight, x_scale, w_scale, output_dtype
+        )
+        mxfp8 = run_flydsl4_mxfp8_accuracy(
+            x,
+            weight,
+            x_scale,
+            w_scale,
+            output_dtype,
+            num_repeats=num_repeats,
+            data_clones=data_clones,
+            return_metrics=True,
+            source_inputs=(x_source, weight_source),
+        )
+
+        x_scale_t = x_scale.transpose(0, 1).contiguous().view_as(x_scale)
+        xs = [x.clone() for _ in range(data_clones)]
+        weights = [weight.clone() for _ in range(data_clones)]
+        x_scales_t = [x_scale_t.clone() for _ in range(data_clones)]
+        w_scales = [w_scale.clone() for _ in range(data_clones)]
+        flops = 2 * m * n * k
+        rw_bytes = (
+            x.numel() * x.element_size()
+            + weight.numel() * weight.element_size()
+            + x_scale.numel() * x_scale.element_size()
+            + w_scale.numel() * w_scale.element_size()
+            + m * n * torch.empty((), dtype=output_dtype).element_size()
+        )
+        stream = torch.cuda.current_stream()
+
+        pyhip_outputs = [
+            torch.empty((m, n), dtype=output_dtype) for _ in range(data_clones)
+        ]
+
+        def run_pyhip(clone_x, clone_weight, clone_x_scale, clone_w_scale, out):
+            gemm_8wave_fp8bf16fp16(
+                [pyhip.div_up(m, 256) * pyhip.div_up(n, 256)],
+                [64 * 8],
+                "fp8",
+                False,
+                True,
+                256,
+                256,
+                n,
+                k,
+                clone_x.data_ptr(),
+                clone_weight.data_ptr(),
+                out.data_ptr(),
+                clone_x_scale.data_ptr(),
+                clone_w_scale.data_ptr(),
+                m,
+            )
+
+        pyhip_args = [
+            (xs[i], weights[i], x_scales_t[i], w_scales[i], pyhip_outputs[i])
+            for i in range(data_clones)
+        ]
+        pyhip_us, pyhip_tflops = _benchmark_kernel(
+            run_pyhip,
+            pyhip_args,
+            flops,
+            rw_bytes,
+            "pyhip8_blockscale",
+            num_repeats,
+        )
+        pyhip_diff = pyhip.calc_diff(
+            blockwise_ref, pyhip_outputs[(num_repeats - 1) % data_clones], diff_thr=0.04
+        )
+
+        flydsl_launcher = compile_gemm_fp8_8wave(
+            256,
+            256,
+            128,
+            n,
+            k,
+            permlane_epilogue=True,
+            preshuffle_b=False,
+            with_scale=True,
+            useTileDMA=False,
+        )
+        flydsl_outputs = [
+            torch.empty((m, n), dtype=output_dtype) for _ in range(data_clones)
+        ]
+        flydsl_args = [
+            (
+                xs[i].view(torch.int8).view(-1),
+                weights[i].view(torch.int8).view(-1),
+                flydsl_outputs[i].view(-1),
+                x_scales_t[i].view(-1),
+                w_scales[i].view(-1),
+                m,
+                stream,
+            )
+            for i in range(data_clones)
+        ]
+        flydsl_kernel = flyc.compile[{"opt_level": 2}](
+            flydsl_launcher, *flydsl_args[0]
+        )
+        flydsl_us, flydsl_tflops = _benchmark_kernel(
+            flydsl_kernel,
+            flydsl_args,
+            flops,
+            rw_bytes,
+            "flydsl8_blockwise",
+            num_repeats,
+        )
+        flydsl_diff = pyhip.calc_diff(
+            blockwise_ref,
+            flydsl_outputs[(num_repeats - 1) % data_clones],
+            diff_thr=0.01,
+        )
+        results.append(
+            {
+                "K": k,
+                "FlyDSL-MXFP8 TFLOPS": mxfp8["tflops"],
+                "FlyDSL-MXFP8 diff": mxfp8["diff"],
+                "pyhip-8wave TFLOPS": pyhip_tflops,
+                "pyhip-8wave diff": pyhip_diff,
+                "FlyDSL-blockwise TFLOPS": flydsl_tflops,
+                "FlyDSL-blockwise diff": flydsl_diff,
+            }
+        )
+        print(
+            f"summary K={k}: MXFP8={mxfp8['tflops']:.1f} TFLOPS "
+            f"diff={mxfp8['diff']:.3e}; pyhip8={pyhip_tflops:.1f} TFLOPS "
+            f"diff={pyhip_diff:.3e}; FlyDSL-blockwise={flydsl_tflops:.1f} "
+            f"TFLOPS diff={flydsl_diff:.3e}"
+        )
+
+    print("\n| K | FlyDSL-MXFP8 TFLOPS | diff | pyhip 8wave TFLOPS | diff | FlyDSL blockwise TFLOPS | diff |")
+    print("|---:|---:|---:|---:|---:|---:|---:|")
+    for row in results:
+        print(
+            f"| {row['K']} | {row['FlyDSL-MXFP8 TFLOPS']:.1f} | "
+            f"{row['FlyDSL-MXFP8 diff']:.3e} | {row['pyhip-8wave TFLOPS']:.1f} | "
+            f"{row['pyhip-8wave diff']:.3e} | {row['FlyDSL-blockwise TFLOPS']:.1f} | "
+            f"{row['FlyDSL-blockwise diff']:.3e} |"
+        )
+    return results
 
 @perftest()
 def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
@@ -377,7 +599,7 @@ def test_perf(m, n, k, num_repeats = 1, ck_preshuffle=True):
         print(f"{pyhip.calc_diff(out_torch, out_gluon, diff_thr=0.01)=:.2f}")
     print(f"{pyhip.calc_diff(out_torch, out_jit, diff_thr=0.04)=:.6f}")
     if out_flydsl is not None:
-        print(f"{pyhip.calc_diff(out_torch, out_flydsl, diff_thr=0.04)=:.6f}")
+        print(f"{pyhip.calc_diff(out_torch, out_flydsl, diff_thr=0.01)=:.6f}")
     #show_diff(out_torch, out_jit)
 
 if __name__ == "__main__":
@@ -414,11 +636,14 @@ if __name__ == "__main__":
     #M,N,K=8192,8192,8192
     #M,N,K=32768,9216,4096
     # pyhip_gemm_a8w8_blockscale:  torch.bfloat16 torch.float8_e4m3fn torch.Size([32, 4096]) torch.float8_e4m3fn torch.Size([1024, 4096]) [128, 128] True
-    M,N,K=32,1024,4096 
-    #M,N,K=256,256,128
-    #test_gemm(dtypes.bf16, M, N, K, True)
-    test_perf(M,N,K, num_repeats=16, ck_preshuffle=False)
-    print(M,N,K)
+    benchmark_three_kernels(
+        m=8192,
+        n=8192,
+        k_values=(8192,),
+        # k_values=(4096, 6144, 8192, 12288, 16384, 24576, 32768),
+        num_repeats=30,
+        data_clones=8,
+    )
 """
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     x = x.to(dtypes.fp32) * x_scale

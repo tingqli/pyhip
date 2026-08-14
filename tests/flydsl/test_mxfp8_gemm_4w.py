@@ -968,7 +968,7 @@ def _load_mxfp8_quant():
 
 def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
              TILEM=256, TILEN=256, TILEK=128, permlane_output=True, store_overlap=False,
-             with_scale=False, run_count=50, data_clones=32):
+             with_scale=False, run_count=50, data_clones=50):
     shuffle_weight = _load_shuffle_weight() if PRESHUFFLE_B else None
     mxfp8_quant = _load_mxfp8_quant() if with_scale else None
 
@@ -1061,19 +1061,29 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
 
     # ---- perf（多份数据轮转，排除 L2 cache 影响）----
     # 单份 A+B 只有几十 MB，反复喂同一份会常驻 L2 -> 高估 TFLOPS；轮转多份（远大于 L2）确保 cold data。
-    As = [_random_fp8((M, K)) for _ in range(data_clones)]
-    Bs = [_shuffle_b(_random_fp8((N, K))) for _ in range(data_clones)]
+    if with_scale:
+        quantized_as = [
+            _quant_mxfp8(
+                torch.randn((M, K), device="cuda", dtype=torch.float32) * 0.75
+            )
+            for _ in range(data_clones)
+        ]
+        quantized_bs = [
+            _quant_mxfp8(
+                torch.randn((N, K), device="cuda", dtype=torch.float32) * 3.0
+            )
+            for _ in range(data_clones)
+        ]
+        As = [quantized[0] for quantized in quantized_as]
+        Bs = [_shuffle_b(quantized[0]) for quantized in quantized_bs]
+        ScaleAs = [_permute_scale(quantized[1]) for quantized in quantized_as]
+        ScaleBs = [_permute_scale(quantized[1]) for quantized in quantized_bs]
+    else:
+        As = [_random_fp8((M, K)) for _ in range(data_clones)]
+        Bs = [_shuffle_b(_random_fp8((N, K))) for _ in range(data_clones)]
+        ScaleAs = [scale_a for _ in range(data_clones)]
+        ScaleBs = [scale_b for _ in range(data_clones)]
     Cs = [torch.zeros((M, N), device="cuda", dtype=torch.bfloat16) for _ in range(data_clones)]
-    ScaleAs = [
-        _permute_scale(torch.zeros((M, K // 32), device="cuda", dtype=torch.uint8))
-        if with_scale else scale_a
-        for _ in range(data_clones)
-    ]
-    ScaleBs = [
-        _permute_scale(torch.zeros((N, K // 32), device="cuda", dtype=torch.uint8))
-        if with_scale else scale_b
-        for _ in range(data_clones)
-    ]
     arg_sets = [
         (As[i].view(torch.int8).view(-1), Bs[i].view(torch.int8).view(-1), ScaleAs[i], ScaleBs[i], Cs[i].view(-1), M, stream)
         for i in range(data_clones)
@@ -1107,8 +1117,10 @@ if __name__ == "__main__":
     props = torch.cuda.get_device_properties()
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
     torch.manual_seed(0)
-    # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    M,N,K = 8192,8192,8192
+    run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=1, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=1, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=1, PRESHUFFLE_B=1, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
