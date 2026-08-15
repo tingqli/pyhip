@@ -133,7 +133,11 @@ def gpu_runtime_state(physical_gpu, bdf):
     process_result = run_json_command(
         ["amd-smi", "process", "-g", str(physical_gpu), "-G", "--json"]
     )
+    static_result = run_json_command(
+        ["amd-smi", "static", "-g", str(physical_gpu), "--json"]
+    )
     process_list = process_result["json"][0]["process_list"]
+    ptl = static_result["json"]["gpu_data"][0]["limit"]
     running_processes = [
         entry["process_info"]
         for entry in process_list
@@ -146,6 +150,8 @@ def gpu_runtime_state(physical_gpu, bdf):
         "dpm_force_performance_level": read_text(
             pci_path / "power_dpm_force_performance_level"
         ),
+        "ptl_state": ptl["ptl_state"],
+        "ptl_format": ptl["ptl_format"],
         "running_processes": running_processes,
         "process_query": process_result,
     }
@@ -153,6 +159,7 @@ def gpu_runtime_state(physical_gpu, bdf):
 
 def require_idle_gpu(physical_gpu, bdf):
     state = gpu_runtime_state(physical_gpu, bdf)
+    expected_ptl_format = os.environ.get("ATTN_PROFILE_EXPECT_PTL_FORMAT")
     max_vram_bytes = int(
         os.environ.get("ATTN_PROFILE_MAX_INITIAL_VRAM_MIB", "1024")
     ) * 1024 * 1024
@@ -177,6 +184,13 @@ def require_idle_gpu(physical_gpu, bdf):
     if state["dpm_force_performance_level"] != "auto":
         errors.append(
             f"DPM={state['dpm_force_performance_level']!r}, expected 'auto'"
+        )
+    if expected_ptl_format and state["ptl_state"] != "Enabled":
+        errors.append(f"PTL={state['ptl_state']!r}, expected 'Enabled'")
+    if expected_ptl_format and state["ptl_format"] != expected_ptl_format:
+        errors.append(
+            f"PTL format={state['ptl_format']!r}, "
+            f"expected {expected_ptl_format!r}"
         )
     if errors:
         raise RuntimeError("GPU preflight failed: " + "; ".join(errors))
