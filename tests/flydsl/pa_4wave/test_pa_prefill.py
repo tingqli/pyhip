@@ -1,7 +1,7 @@
 import math
 import os
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -391,11 +391,14 @@ def run_pa_prefill(model_config, batch_size, qo_len, kv_len, causal, num_iters=1
         (BF16_REF, 2, 129, 83, False),
         (BF16_REF, 1, 129, 129, True),
         (MIMO_TP8, 2, 128, 83, False),
+        (MIMO_TP8, 2, 128, 259, False),
+        (MIMO_BF16, 2, 128, 129, True),
     ],
 )
-def test_accuracy(model_config, batch_size, qo_len, kv_len, causal):
+@pytest.mark.parametrize("page_size", [32, 64, 128])
+def test_accuracy(model_config, batch_size, qo_len, kv_len, causal, page_size):
     diff = run_pa_prefill(
-        model_config,
+        replace(model_config, page_size=page_size),
         batch_size,
         qo_len,
         kv_len,

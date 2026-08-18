@@ -3,7 +3,7 @@
 状态：ACTIVE
 
 面向MI308X/gfx942的paged prefill attention，支持FP8/BF16 Q/K/V、BF16输出、GQA、
-ragged page、变长batch和bottom-right causal mask。主配置为
+ragged page、变长batch、bottom-right causal mask和`page_size=32/64/128`。主配置为
 `Hq=16, Hkv=1, Dq=192, Dv=128, page_size=32`；`batch=1`走static grid，
 `batch>1`走atomic-ticket persistent grid。
 
@@ -20,7 +20,15 @@ ragged page、变长batch和bottom-right causal mask。主配置为
   并增加D128/D192 BF16回归；FP8路径保持兼容。
 2. 修复4-wave batch>1 persistent BF16 D192的低occupancy分配。原
    `vgpr_count=265`实际为`256 VGPR + 9 AGPR`，并非普通VGPR越过硬件上限；
-   设置`waves_per_eu=2`后变为`256 VGPR + 0 AGPR / 10 spill / 44B private`。
+  将`rocdl.waves_per_eu=2`直接附着到persistent GPU kernel后，最终LLVM IR带有
+  `amdgpu-waves-per-eu="2"`。page32/128变为`256 VGPR + 0 AGPR / 10 spill / 44B private`，
+  page64 non-causal为`22 spill / 92B private`，causal为`16 spill / 68B private`；
+  三种page size均为`256 VGPR + 0 AGPR`、2 waves/SIMD。
+
+page64 causal的16个spill均为长寿命地址值，并非Q/K/V fragment或O accumulator：16个
+store仅在workgroup入口执行一次；每个persistent work item分别有3个初始化reload、2个
+masked-tail入口reload和11个C-shuffle epilogue reload。重复执行的KV fast/tail循环体内
+没有scratch指令。
 
 验收使用MI308X/gfx942、1300MHz、`Hq=16,Hkv=1,Q=KV=32768,causal,page_size=32`，
 每组10次预热、两轮各50个event样本，顺序为`4w -> 8w -> 8w -> 4w`。
@@ -36,7 +44,7 @@ ragged page、变长batch和bottom-right causal mask。主配置为
 均finite；relative-L2为D128 batch=1/4 `3.7173e-5/3.8095e-5`，D192 batch=1/4
 `3.8662e-5/3.8175e-5`。8-wave BF16 D192短尾、causal及FP8聚焦用例通过。
 
-回归：8-wave `39 passed`、4-wave `3 passed`、公开API `11 passed`。
+回归：8-wave `39 passed`、4-wave `15 passed`、公开API `11 passed`。
 
 更新时间：2026-08-11。最新8-wave参考使用per-tensor Q量化；4-wave接收同一份FP8 Q和
 等值descale。两者在同一进程使用10套buffer、各10次预热和50个CUDA event样本，采用
@@ -54,7 +62,7 @@ ragged page、变长batch和bottom-right causal mask。主配置为
 non-causal 25/25组获胜；causal auto 24/25组获胜；causal 1300MHz 25/25组获胜。
 causal按三角有效FLOPs计数；auto-DPM存在双态，因此同时保留1300MHz结果。
 
-4-wave当前只支持page32，因此4/8-wave表使用共同支持的page32。
+下表沿用page32性能基线；page64/page128已通过功能精度回归，尚未单独建立性能基线。
 
 主shape的4-wave static/persistent同代码对照：
 

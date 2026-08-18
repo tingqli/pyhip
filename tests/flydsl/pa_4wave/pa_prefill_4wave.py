@@ -318,14 +318,16 @@ def MHA(
 ):
     assert head_dim_qk in (128, 192)
     assert head_dim_v == 128
-    assert page_size == 32
+    assert page_size in (32, 64, 128)
     assert num_qo_heads % num_kv_heads == 0
     assert key_layout in ("vectorized", "linear")
     if key_layout == "linear":
+        assert page_size == 32
         assert head_dim_qk == head_dim_v == 128
 
     block_m = 128
     block_n = 32
+    num_blocks_per_page = page_size // block_n
     num_threads = 256
     causal_tile_step = 251
     causal_tile_offset = 251
@@ -354,6 +356,7 @@ def MHA(
         is_fp8 = dtype == fx.Float8E4M3FNUZ
         is_bf16 = dtype == fx.BFloat16
         mma_k = 8 if is_bf16 else 16
+        num_kv_blocks = (kv_len + block_n - 1) // block_n
         use_hw_slot_priority = is_bf16 and head_dim_qk == 128
         interleave_exp_ds_write = (
             is_bf16 and head_dim_qk == 128 and num_qo_heads >= 4
@@ -453,17 +456,18 @@ def MHA(
                 fx.make_rmem_tensor(fx.make_layout((8, num_k_copies), (1, 8)), dtype),
             ]
 
-            def prefetch_k_bf16(logical_page_id, physical_page_id, register_slot):
-                logical_page_id = fx.Int32(arith.minsi(
-                    arith.unwrap(fx.Int32(logical_page_id)), arith.unwrap(num_kv_pages - 1)
+            def prefetch_k_bf16(logical_block_id, physical_page_id, page_block_index, register_slot):
+                logical_block_id = fx.Int32(arith.minsi(
+                    arith.unwrap(fx.Int32(logical_block_id)), arith.unwrap(num_kv_blocks - 1)
                 ))
+                page_token_offset = fx.Int32(page_block_index) * fx.Int32(block_n)
                 for atom_index in range_constexpr(num_k_copies):
                     linear_atom = tid + atom_index * num_threads
                     source_row = linear_atom & (block_n - 1)
                     d_group = linear_atom // block_n
                     if const_expr(key_layout == "linear"):
                         source_offset = (
-                            (kv_sequence_start + logical_page_id * block_n + source_row)
+                            (kv_sequence_start + logical_block_id * block_n + source_row)
                             * num_kv_heads * head_dim_qk
                             + kv_head * head_dim_qk
                             + d_group * vector_values
@@ -473,8 +477,9 @@ def MHA(
                             physical_page_id * page_size * num_kv_heads * head_dim_qk
                             + kv_head * page_size * head_dim_qk
                             + d_group * page_size * vector_values
-                            + source_row * vector_values
+                            + (page_token_offset + source_row) * vector_values
                         )
+                    source_offset = fx.Int32(source_offset)
                     source = fx.make_view(
                         fx.get_iter(k_tile) + source_offset, fx.make_layout(8, 1)
                     )
@@ -507,8 +512,9 @@ def MHA(
             k_chunk_in_group = tid & 7
             k_source_row = (k_row & 3) + ((k_row // 4) & 1) * 16 + (k_row // 8) * 4
 
-            def prefetch_k_fp8(logical_page_id, physical_page_id, register_slot):
+            def prefetch_k_fp8(logical_block_id, physical_page_id, page_block_index, register_slot):
                 prefetched_k[register_slot].fill(0)
+                page_token_offset = fx.Int32(page_block_index) * fx.Int32(block_n)
                 for atom_index in range_constexpr(num_k_copies):
                     chunk = k_chunk_in_group + atom_index * 8
                     d_group = chunk // 2
@@ -517,8 +523,10 @@ def MHA(
                         physical_page_id * page_size * num_kv_heads * head_dim_qk
                         + kv_head * page_size * head_dim_qk
                         + d_group * page_size * 16
-                        + k_source_row * 16 + d_half * 8
+                        + (page_token_offset + k_source_row) * 16
+                        + d_half * 8
                     )
+                    source_offset = fx.Int32(source_offset)
                     source = fx.make_view(
                         fx.get_iter(k_tile_u32) + source_offset // 4, fx.make_layout(2, 1)
                     )
@@ -587,20 +595,31 @@ def MHA(
             prefetch_k_page_id,
             is_all_kv_valid: fx.Constexpr[bool] = True,
         ):
-            lookahead_page_id = kv_page_table[kv_block_index + 3]
+            current_page_block = fx.Int32(kv_block_index % num_blocks_per_page)
+            prefetch_page_block = fx.Int32(
+                (kv_block_index + 2) % num_blocks_per_page
+            )
+            lookahead_page_id = kv_page_table[
+                (kv_block_index + 3) // num_blocks_per_page
+            ]
 
             score_fragment.fill(0.0)
             compute_qk()
             fx.copy(
                 v_copy_atom,
-                v_copy.partition_S(v_tile[None, None, current_v_page_id]),
+                v_copy.partition_S(
+                    v_tile[None, None, current_v_page_id, current_page_block]
+                ),
                 v_copy.retile(v_fragment),
             )
             schedule_qk_and_v_loads()
 
             enter_softmax_stage()
             prefetch_k(
-                kv_block_index + 2, prefetch_k_page_id, k_pipeline_slot ^ 1
+                kv_block_index + 2,
+                prefetch_k_page_id,
+                prefetch_page_block,
+                k_pipeline_slot ^ 1,
             )
 
             running_max, running_sum, correction = _online_softmax(
@@ -644,32 +663,32 @@ def MHA(
         current_max = fx.Float32(float("-inf"))
         running_sum = fx.Float32(0.0)
         current_page_id = kv_page_table[0]
-        next_page_id = kv_page_table[1]
-        prefetch_page_id = kv_page_table[2]
+        next_page_id = kv_page_table[1 // num_blocks_per_page]
+        prefetch_page_id = kv_page_table[2 // num_blocks_per_page]
 
-        prefetch_k(0, current_page_id, 0)
+        prefetch_k(0, current_page_id, 0, 0)
         store_k_to_lds(0, 0)
-        prefetch_k(1, next_page_id, 0)
+        prefetch_k(1, next_page_id, 1 % num_blocks_per_page, 0)
         gpu.barrier()
         fx.copy(k_lds_copy_atom, partition_k_lds(0), k_lds_copy.retile(k_fragment))
         enter_mma_stage()
 
         if const_expr(is_causal):
             causal_base = kv_len - full_qo_len + query_pos0
-            num_fully_valid_pages = (causal_base + 1) // block_n
-            num_fast_path_pages = (num_fully_valid_pages // 2) * 2
-            num_intersecting_pages = (causal_base + query_len + block_n - 1) // block_n
-            num_pages_to_process = (num_intersecting_pages < num_kv_pages).select(
-                num_intersecting_pages, num_kv_pages
+            num_fully_valid_blocks = (causal_base + 1) // block_n
+            num_fast_path_blocks = (num_fully_valid_blocks // 2) * 2
+            num_intersecting_blocks = (causal_base + query_len + block_n - 1) // block_n
+            num_blocks_to_process = (num_intersecting_blocks < num_kv_blocks).select(
+                num_intersecting_blocks, num_kv_blocks
             )
         else:
-            num_fast_path_pages = num_kv_pages - 2
-            if (num_kv_pages & 1) == 1:
-                num_fast_path_pages = num_kv_pages - 1
-            num_pages_to_process = num_kv_pages
+            num_fast_path_blocks = num_kv_blocks - 2
+            if (num_kv_blocks & 1) == 1:
+                num_fast_path_blocks = num_kv_blocks - 1
+            num_blocks_to_process = num_kv_blocks
 
         loop_state = [current_max, running_sum, current_page_id, next_page_id, prefetch_page_id]
-        for kv_block_index, state in range(0, num_fast_path_pages, 2, init=loop_state):
+        for kv_block_index, state in range(0, num_fast_path_blocks, 2, init=loop_state):
             current_max, running_sum, current_page_id, next_page_id, prefetch_page_id = state
             current_max, running_sum, lookahead_page_id = process_kv_block(
                 kv_block_index, 0, current_max, running_sum, current_page_id, prefetch_page_id
@@ -689,7 +708,7 @@ def MHA(
             ]
 
         for kv_block_index, state in range(
-            num_fast_path_pages, num_pages_to_process, 2, init=loop_state
+            num_fast_path_blocks, num_blocks_to_process, 2, init=loop_state
         ):
             current_max, running_sum, current_page_id, next_page_id, prefetch_page_id = state
             current_max, running_sum, lookahead_page_id = process_kv_block(
@@ -699,7 +718,7 @@ def MHA(
             current_page_id, next_page_id, prefetch_page_id = (
                 next_page_id, prefetch_page_id, lookahead_page_id
             )
-            if fx.Int32(kv_block_index + 1) < num_pages_to_process:
+            if fx.Int32(kv_block_index + 1) < num_blocks_to_process:
                 current_max, running_sum, lookahead_page_id = process_kv_block(
                     kv_block_index + 1, 1, current_max, running_sum,
                     current_page_id, prefetch_page_id,
@@ -813,15 +832,16 @@ def MHA(
         )[None, qo_head, None]
 
         k_tile = fx.rocdl.make_buffer_tensor(k, max_size=False)
-        v_tile = v[None, kv_head, None, None, None]
-        v_tile = fx.group(fx.select(v_tile, (2, 3, 1, 0)), 1, 3)
+        v_tile = v[None, kv_head, None, None, None, None]
+        v_tile = fx.group(fx.select(v_tile, (3, 4, 2, 0, 1)), 1, 3)
         v_tile = _prepare_paged_v_tile(v_tile, True)
 
-        kv_page_table = fx.rocdl.make_buffer_ptr(
+        kv_page_table = fx.make_view(
             fx.get_iter(kv_page_indices) + kv_start,
-            num_records_bytes=(
-                fx.Int64(num_kv_pages) * (kv_page_indices.dtype.width // 8)
-            ),
+            fx.make_layout(num_kv_pages, 1),
+        )
+        kv_page_table = fx.rocdl.make_buffer_tensor(
+            kv_page_table, max_size=False
         )
         attention_pipeline(
             q_tile, k_tile, v_tile, o_tile, query_pos0, query_len, kv_len, full_qo_len,
@@ -993,8 +1013,15 @@ def MHA(
         v = fx.make_view(
             fx.get_iter(v),
             fx.make_ordered_layout(
-                (num_physical_pages, num_kv_heads, page_size // vector_size, head_dim_v, vector_size),
-                (4, 3, 2, 1, 0),
+                (
+                    num_physical_pages,
+                    num_kv_heads,
+                    num_blocks_per_page,
+                    block_n // vector_size,
+                    head_dim_v,
+                    vector_size,
+                ),
+                (5, 4, 3, 2, 1, 0),
             ),
         )
         q_descale = fx.make_view(
@@ -1012,6 +1039,9 @@ def MHA(
             ),
         )
         value_attrs = {"passthrough": [["target-features", "-packed-fp32-ops"]]}
+        persistent_value_attrs = dict(value_attrs)
+        if fx.const_expr(q.dtype == fx.BFloat16 and head_dim_qk == 192):
+            persistent_value_attrs["rocdl.waves_per_eu"] = 2
         if static_schedule:
             attention_kernel_static(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
@@ -1024,7 +1054,7 @@ def MHA(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
                 kv_page_indices, q_descale, k_descale, v_descale,
                 kv_last_page_lens, output, work_counter,
-                value_attrs=value_attrs,
+                value_attrs=persistent_value_attrs,
             ).launch(grid=(num_workgroups, 1, 1), block=(num_threads, 1, 1), stream=stream)
 
     def callable(
@@ -1134,9 +1164,6 @@ def MHA(
             saved_compile_hints = launch.compile_hints
             try:
                 compile_hints = _compile_hints_for_dtype(q.dtype)
-                if not static_schedule and q.dtype == torch.bfloat16 and head_dim_qk == 192:
-                    # Keep two waves resident; unconstrained LLVM uses 256 VGPR + 9 AGPR.
-                    compile_hints = {**compile_hints, "waves_per_eu": 2}
                 launch.compile_hints = {**saved_compile_hints, **compile_hints}
                 compiled = flyc.compile(
                     launch, q, k, v, cu_seqlens_q, cu_seqlens_k, kv_indptr,
