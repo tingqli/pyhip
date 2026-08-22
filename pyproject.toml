@@ -28,3 +28,6 @@ packages = [
     "pyhip.contrib.flydsl",
 ]
 package-dir = {"pyhip" = "src"}
+
+[tool.setuptools.package-data]
+"pyhip.contrib" = ["*.cpp"]
