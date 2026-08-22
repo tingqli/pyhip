@@ -2,44 +2,93 @@
  
 It seems that `machine-scheduler` has some issue, it produces sub-optimal instruction sequence in carefully written code.
 
-hip优化代码经常会把数据搬运指令连续排列，完全数据无关的计算指令也连续排列，
-但是`machine-scheduler`应该将这两者交织排列而不应该各自独立排列，这可以构造一个非常简单的测试代码验证，源码在[test-mi-sched.cpp](test-mi-sched.cpp)，programmer在书写这份代码时会有如下的自然的假定：
- - `Aregs0`/`Aregs1`/`Bregs0`/`Bregs1`都会被映射为寄存器
- - 程序会按照书写次序执行，`compute0()`/`load1()`因为完全不存在数据相互依赖，因此应该被LLVM很好的并行issue
- - 同样道理，`compute1()`/`load0()`也应该被并行issue(也就是交织issue)
+HIP-optimized code often lays out data-move instructions back-to-back and likewise lays out fully 
+data-independent compute instructions back-to-back; 
 
-但是我们观察产生的汇编，如果定义宏`MI_SCHED_BARRIER`,则能够产生预期的代码，否则`MFMA`会被大量连续issue，`DS_READ`也会被连续issue.
+(CN) hip优化代码经常会把数据搬运指令连续排列，完全数据无关的计算指令也连续排列，
+
+but the `machine-scheduler` ought to interleave the two rather than keep each kind in its own 
+contiguous run; this can be verified with very simple test code—the source is in 
+[test-mi-sched.cpp](test-mi-sched.cpp). When writing that program, one naturally assumes: 
+ - `Aregs0`/`Aregs1`/`Bregs0`/`Bregs1` will all be mapped to registers; 
+ - Execution follows source order; `compute0()` and `load1()` have no mutual data dependence 
+   and should therefore be issued in parallel by LLVM; 
+ - Likewise, `compute1()` and `load0()` should be issued in parallel (interleaved issue); 
+
+ (CN) 但是`machine-scheduler`应该将这两者交织排列而不应该各自独立排列，这可以构造一个非常简单的测试代码
+    验证，源码在[test-mi-sched.cpp](test-mi-sched.cpp)，programmer在书写这份代码时会有如下的自然的假定：
+   - `Aregs0`/`Aregs1`/`Bregs0`/`Bregs1`都会被映射为寄存器
+   - 程序会按照书写次序执行，`compute0()`/`load1()`因为完全不存在数据相互依赖，因此应该被LLVM很好的并行issue
+   - 同样道理，`compute1()`/`load0()`也应该被并行issue(也就是交织issue)
+
+But in the generated assembly: if the `MI_SCHED_BARRIER` macro is defined we get the expected code; 
+otherwise many `MFMA`s are issued consecutively and `DS_READ` is also issued consecutively. 
+
+(CN) 但是我们观察产生的汇编，如果定义宏`MI_SCHED_BARRIER`,则能够产生预期的代码，否则`MFMA`会被大量连续issue，`DS_READ`也会被连续issue.
 
 ```bash
 
-# 没有 -DMI_SCHED_BARRIER 的话，生成的代码为了减轻寄存器压力，连续的issue MFMA指令，并未跟DS_READ交织起来
+# Without `-DMI_SCHED_BARRIER`, the generated code eases register pressure by issuing MFMAs in a 
+# burst and does not interleave them with `DS_READ`. 
+# (CN) 没有 -DMI_SCHED_BARRIER 的话，生成的代码为了减轻寄存器压力，连续的issue MFMA指令，并未跟DS_READ
+#    交织起来
+
 hipcc -x hip --offload-device-only --offload-arch=gfx942 -std=c++20 -I.  -Rpass-analysis=kernel-resource-usage -DMI_SCHED_BARRIER -O2 -S -o test-mi-sched.s test-mi-sched.cpp
 
-# 生成 llvm IR
+# Emit LLVM IR. 
 hipcc -x hip --offload-device-only --offload-arch=gfx942 -std=c++20 -I.  -Rpass-analysis=kernel-resource-usage -O2 -S -emit-llvm -o test-mi-sched.ll test-mi-sched.cpp
 
-# 检查 LLVM passes
+# Inspect LLVM passes. 
 ./build/bin/llc -march=amdgcn  -mcpu=gfx942 -print-after-all < test-mi-sched.ll > test-mi-sched.s 2> test-mi-sched.irlog
 
 ```
 
-查看产生的`test-mi-sched.irlog`文件, LLVM编译的大致过程如下：
+Inspect the generated `test-mi-sched.irlog`; the LLVM compilation flow is roughly as follows: 
 
-**原始指令次序**
+(CN) 查看产生的`test-mi-sched.irlog`文件, LLVM编译的大致过程如下：
+
+**Original instruction order.**
  - V_MFMA_(virtual_vreg_group_1)
  - virtual_vreg_group_2 = DS_READ_
  - V_MFMA_(virtual_vreg_group_2)
  - virtual_vreg_group_1 = DS_READ_
  
-**Machine Instruction Scheduler (machine-scheduler)**：如果通过 __builtin_amdgcn_sched_group_barrier 约束了指令组次序，这一步将会根据约束interleaving指令次序，但是如果没有约束指令次序，则这一步没有特殊的重排指令，大致仍然是上面的原始次序。
+**Machine Instruction Scheduler (machine-scheduler)**: 
+  If instruction-group order is constrained with `__builtin_amdgcn_sched_group_barrier`, this 
+  step interleaves according to those constraints; without such a constraint it does not 
+  significantly reorder and stays close to the original order above. 
+  
+  (CN) 如果通过 __builtin_amdgcn_sched_group_barrier 约束了指令组次序，这一步将会根据约束interleaving
+  指令次序，但是如果没有约束指令次序，则这一步没有特殊的重排指令，大致仍然是上面的原始次序。
 
-**Virtual Register Rewriter (virtregrewriter)**：这一步骤之前整个程序还是基于虚拟寄存器的类似SSA的形式虚拟寄存器被映射为物理寄存器，单纯不改变指令次序，尽可能的复用失效的SSA寄存器
-因此：
+**Virtual Register Rewriter (virtregrewriter)**: 
+  Before this pass the program is still in an SSA-like form on virtual registers; here virtual 
+  registers are mapped to physical registers without changing instruction order, reusing dead 
+  SSA registers as much as possible. Therefore: 
+   - With an instruction interleaving constraint, registers are allocated in two disjoint sets;
+   - Without interleaving, the A/B registers consumed by consecutive `MFMA`s are already freed 
+     by `DS_READ_` and can be reused, so the two source register groups collapse heavily onto 
+     far fewer physical registers; 
+
+  (CN) 这一步骤之前整个程序还是基于虚拟寄存器的类似SSA的形式虚拟寄存器被映射为物理寄存器，单纯不改变指令次序，
+     尽可能的复用失效的SSA寄存器, 因此：
    - 当带有指令interleaving约束时，寄存器会被分配两份；
    - 当没有指令interleaving约束时，被连续的`MFMA`指令使用过的AB寄存器在`DS_READ_`指令处已经释放并可以复用, 最终原始代码中的两组寄存器就被大量重叠的映射到少的的多的寄存器；
 
+This compiler behavior suggests: 
+ - Unless you manually constrain `machine-scheduler` with `__builtin_amdgcn_sched_group_barrier()`, 
+   that pass almost never reorders for better issue scheduling on its own, because that could 
+   increase later physical register pressure; 
+ - Higher occupancy can help here, but at a performance cost from more redundant data movement; 
+ - Inline `asm volatile` expresses instruction order more explicitly because it bypasses LLVM 
+   backend optimizations and maps straight to assembly in source order, but it fragments the 
+   source badly; see [gemm-ilp.cpp](../tests/gemm/gemm-ilp.cpp). 
 
-编译器的这种行为习惯表明：
- - 除非手工使用`__builtin_amdgcn_sched_group_barrier()`约束`machine-scheduler`显式重排指令，  `machine-scheduler`步骤几乎完全不会为了增加issue而自动重新排列指令，因为这可能潜在导致后继物理寄存器占用量增加;
+（CN）编译器的这种行为习惯表明：
+ - 除非手工使用`__builtin_amdgcn_sched_group_barrier()`约束`machine-scheduler`显式重排指令， 
+   `machine-scheduler`步骤几乎完全不会为了增加issue而自动重新排列指令，因为这可能潜在导致后继物理寄
+   存器占用量增加;
  - 增加occupancy对这种情况有帮助，但是是以牺牲性能为代价的，因为会引入更多的冗余的数据搬运;
- - 使用 inline `asm volatile` 可以更加显式的表达指令次序，因为这种汇编会完全绕开LLVM后端的各种优化逻辑，直接按照原始顺序映射为最终的汇编，但是这会导致开发者把代码书写的非常支离破碎; 详见[gemm-ilp.cpp](../tests/gemm/gemm-ilp.cpp)
+ - 使用 inline `asm volatile` 可以更加显式的表达指令次序，因为这种汇编会完全绕开LLVM后端的各种优化
+   逻辑，直接按照原始顺序映射为最终的汇编，但是这会导致开发者把代码书写的非常支离破碎; 
+   详见[gemm-ilp.cpp](../tests/gemm/gemm-ilp.cpp)
