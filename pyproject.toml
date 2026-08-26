@@ -26,5 +26,6 @@ packages = [
     "pyhip.contrib.common",
     "pyhip.contrib.gluon",
     "pyhip.contrib.flydsl",
+    "pyhip.contrib.flydsl.moe_gemm_2stage",
 ]
 package-dir = {"pyhip" = "src"}

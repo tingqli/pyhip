@@ -26,9 +26,9 @@ USE_FP4_SHUFFLE_WEIGHT = 1
 _FLY_COMPILED_CACHE = {}
 
 
-def _select_down_config(down_path, tile_n, legacy_use_prefill):
-    if down_path == 'legacy':
-        return legacy_use_prefill, tile_n
+def _select_down_config(down_path, tile_n, default_use_prefill):
+    if down_path == 'default':
+        return default_use_prefill, tile_n
     return True, {
         '1x4_64x256': 256,
         '2x4': 256,
@@ -226,7 +226,7 @@ def quant_expert_weights(w1, quant_type, dtype):
         return w1_qt, w1s, w1_ref
     assert 0, quant_type
 
-def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='legacy', down_output_padding_bytes=None):
+def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='default', down_output_padding_bytes=None):
     INTER_SIZE_TP = INTER_SIZE // TP
     # acc (run_count=0): only hidden_states[0] etc. are used; smaller BUF_COPY saves VRAM.
     # perf (run_count>0): rotate buffers to reduce L2 reuse across timed iterations.
@@ -486,7 +486,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
             from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
-            assert down_path in ('legacy', '1x4_64x256', '2x4', '1x8')
+            assert down_path in ('default', '1x4_64x256', '2x4', '1x8')
             if down_path == '2x4':
                 assert TILE_M_DOWN == 128
             elif down_path in ('1x4_64x256', '1x8'):
@@ -523,7 +523,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                 weight_dtype = 'fp8'
                 compile_quant_type = quant_type
                 compile_act_quant_type = quant_type
-            if B == 1 and down_path == 'legacy':
+            if B == 1 and down_path == 'default':
                 assert TILE_M_GATEUP == TILE_M_DOWN, (
                     'only prefill_1x4 supports different gateup/down M tiles'
                 )
@@ -636,7 +636,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                                     w1.dtype, TOPK, K2, N2, False, TILE_M_DOWN, TILE_N,
                                     gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, quant_type == 'ptpc')
                 else:
-                    if DUMP_DOWN and down_path == 'legacy': use_down_prefill = False
+                    if DUMP_DOWN and down_path == 'default': use_down_prefill = False
                     #print(sorted_expert_ids.view(-1, 32).tolist())
 
                     if use_down_prefill:
@@ -1042,7 +1042,7 @@ def entry_b1(prec=[torch.bfloat16], HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E
         perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M_DOWN=32, TILE_M_GATEUP=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=64, TP=8, run_count=10, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='legacy', down_output_padding_bytes=None):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M_DOWN=32, TILE_M_GATEUP=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=64, TP=8, run_count=10, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='default', down_output_padding_bytes=None):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
@@ -1098,9 +1098,9 @@ def _init_env():
     ],
 )
 def test_down_device_config(device_name, expected):
-    from pyhip.contrib.flydsl.moe_gemm_splitk import _down_device_config_from_name
+    from pyhip.contrib.flydsl.moe_gemm_2stage.common import down_device_config_from_name
 
-    assert _down_device_config_from_name(device_name) == expected
+    assert down_device_config_from_name(device_name) == expected
 
 
 def init_env():
@@ -1296,7 +1296,7 @@ if __name__ == '__main__':
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
-        "down_path":'legacy',
+        "down_path":'default',
         "down_output_padding_bytes":None,
         "HIDDEN_SIZE":4096,
         "INTER_SIZE":512*8,
@@ -1324,7 +1324,7 @@ if __name__ == '__main__':
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
-        "down_path":'legacy',
+        "down_path":'default',
         "down_output_padding_bytes":None,
         "HIDDEN_SIZE":2048,
         "INTER_SIZE":512,
