@@ -367,12 +367,12 @@ scale B,tv_layout = ((16， 4， 2， 2), 1), ((1, 32, 16, 0), 1),
 TILE_M/TILE_N=256, BK=128.
 slicing之后，BM/BN=128, BK=128
 ```
-### AC A/B tile copy:
+### AC B tile copy:
 ```
-BK = 128, 16x4 thread mapping, 32 mxfp4 elements per lane
+BK = 128, 16x4 thread mapping, 32 mxfp4 elements per lane,128bit copy atom
 64 rows, 128 columns,
 ```
-### AC A/B tv layout:
+### AC B tv layout:
 ```
 ((4, 16, 4), elements_per_128b),
 ((elements_per_128b x 64, 1, 16), 64)
@@ -389,7 +389,7 @@ sub A/B natural layout: (128, 128), (K, 1),主要针对m分组，128=16x8,
 ```
 ### AC padding write LDS layout:
 ```
-LDS layout:(128, 128), (128) without padding, 每16行padding 32个元素，每32行再padding 64个元素
+LDS layout:(128, 128), (128) without padding, 每16行padding 32个元素，每32行再额外padding 64个元素
 BK=128
 LDS layout : ((16, 2，4), BK), ((BK, 16xBK+32，  （16xBK+32)x2+64), 1)
 ```
