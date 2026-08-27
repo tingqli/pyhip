@@ -103,7 +103,7 @@ def compile_gemm_fp8(
     BLOCK_K = TILE_K
     assert BLOCK_K == 128
     assert K % 256 == 0
-    assert N % 64 == 0
+    assert N % 8 == 0
     element_type = fx.Float8E4M3FN
     elements_per_128b = 16  # 128bit / fp8(8bit)
     # sched_group_barrier 精确调度（对标 bf16 hot_loop_scheduler_mainloop）：
@@ -188,7 +188,7 @@ def compile_gemm_fp8(
     ):
         tid = fx.thread_idx.x
         num_pid_n = div_up(N, TILE_N)
-        scale_m_rows = div_up(M, 256) * 256
+        scale_m_rows = (M + 255) & -256
         scale_n_rows = div_up(N, 256) * 256
         if const_expr(pid_swizzle):
             bid_x, bid_y = get_pids_950(fx.block_idx.x, M, fx.grid_dim.x, 8, 4)
@@ -798,7 +798,6 @@ def compile_gemm_fp8(
             fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
         hot_loop_scheduler_mainloop(3, 0, 8 + int(with_scale))
         rocdl.sched_barrier(0)
-        N_tail = (N % TILE_N != 0 )
         # ---- store_quadrant 定义提前（放到 buf1 尾部之前），供 store 与最后的 MFMA 交织 ----
         if const_expr(permlane_epilogue):
             # permlane：相邻两个 16x16 tile 经 permlane16_swap 重排后，每 lane 一次写 8 个连续 bf16
@@ -816,12 +815,6 @@ def compile_gemm_fp8(
             def store_quadrant(c_frag, bC, quadrant_m, quadrant_n):
                 for row_repeat in range_constexpr(fragment_mode_1_repeat):
                     for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
-                        if const_expr(N_tail):
-                            n_block_start = (
-                                bid_y * TILE_N
-                                + quadrant_n * (TILE_N // 2)
-                                + col_repeat * 32
-                            )
                         acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
                         acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
                         d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
@@ -840,30 +833,40 @@ def compile_gemm_fp8(
                             fx.Int32,
                         )
                         row = bid_x * TILE_M + quadrant_m * (TILE_M // 2) + row_repeat * 32 + wave_m * 16 + lane_id % 16
+                        N_start_blk64 = bid_y * TILE_N + quadrant_n * (TILE_N // 2) + col_repeat * 32
                         col = (
-                            bid_y * TILE_N
-                            + quadrant_n * (TILE_N // 2)
-                            + col_repeat * 32
+                            N_start_blk64
                             + lane_group % 2 * 32
                             + wave_n * 16
                             + lane_group // 2 * 8
                         )
                         byte_offset = (row * N + col) * 2
-                        if const_expr(N_tail):
+
+                        if const_expr(N % TILE_N == 0):
                             fx.buffer_ops.buffer_store(
                                 packed,
                                 c_store_rsrc,
                                 byte_offset,
                                 offset_is_bytes=True,
-                                mask=n_block_start < N,
+                            )
+                        elif const_expr((N % TILE_N) % 64 == 0):
+                            if (N_start_blk64 < N):
+                                fx.buffer_ops.buffer_store(
+                                    packed,
+                                    c_store_rsrc,
+                                    byte_offset,
+                                    offset_is_bytes=True,
+                                )
+                        elif const_expr((N % TILE_N) % 8 == 0):
+                            fx.buffer_ops.buffer_store(
+                                packed,
+                                c_store_rsrc,
+                                byte_offset,
+                                offset_is_bytes=True,
+                                mask=col < N,
                             )
                         else:
-                            fx.buffer_ops.buffer_store(
-                                packed,
-                                c_store_rsrc,
-                                byte_offset,
-                                offset_is_bytes=True,
-                            )
+                            assert False, f'unsupported N_tail {N=}'
         else:
             # 注意：fp8 op1=B 走 make_fragment_A 槽，C 的 wave 朝向相对 bf16 转置，
             # 故 c_tv 的两个 wave 维 stride 需交换为 (512, 16)。
@@ -1005,13 +1008,9 @@ import pyhip
 
 
 def _load_shuffle_weight():
-    # host 端 shuffle_weight 在 tests.utils，延迟加载避免非 preshuffle 路径依赖它。
+    # 延迟加载避免非 preshuffle 路径依赖 aiter shuffle。
     # fp8 kWidth=16、BLOCK_K=128 => shuffle_weight layout=(16, 64)（BK=IK*2=128, K=16//1B）。
-    import sys as _sys, os.path as _osp
-    _flydsl_root = _osp.abspath(_osp.join(_osp.dirname(__file__), "..", ".."))
-    if _flydsl_root not in _sys.path:
-        _sys.path.insert(0, _flydsl_root)
-    from tests.utils import shuffle_weight
+    from aiter.ops.shuffle import shuffle_weight
     return shuffle_weight
 
 
@@ -1025,7 +1024,7 @@ def _load_mxfp8_quant():
 def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
              TILEM=256, TILEN=256, TILEK=128, permlane_output=True, store_overlap=False,
              with_scale=False, run_count=50, data_clones=50):
-    assert N % 64 == 0
+    assert N % (256 if PRESHUFFLE_B else 8) == 0, f"{N=} {PRESHUFFLE_B=} N must be divisible by {'256' if PRESHUFFLE_B else '8'}"
     shuffle_weight = _load_shuffle_weight() if PRESHUFFLE_B else None
     mxfp8_quant = _load_mxfp8_quant() if with_scale else None
 
@@ -1073,7 +1072,7 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
         return x.float() * scale_f32
 
     if with_scale:
-        a, scale_a_raw = _quant_mxfp8(torch.randn((M, K), device="cuda") * 0.75)
+        a, scale_a_raw = _quant_mxfp8(torch.randn((M, K), device="cuda") * 1.5)
         b, scale_b_raw = _quant_mxfp8(torch.randn((N, K), device="cuda") * 3.0)
         ref = _dequant_mxfp8(a, scale_a_raw) @ _dequant_mxfp8(b, scale_b_raw).t()
     else:
@@ -1189,20 +1188,35 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
     print(f"gemm:  {best_ms*1e3:.1f} us  {tflops:.2f} TFLOPS  {bw_gbs:.1f} GB/s")
     return is_correct
 
+def test_acc():
+        # run_test(M=33, N=64, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    # run_test(M=62, N=384, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    # run_test(M=75, N=448, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    # run_test(M=111, N=192, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
 
+    # run_test(M=33, N=64, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    # run_test(M=62, N=384, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    # run_test(M=75, N=448, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    # run_test(M=111, N=192, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+
+    # run_test(M=33, N=72, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    # run_test(M=62, N=384+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    # run_test(M=75, N=448+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    # run_test(M=111, N=192+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+
+    # run_test(M=33, N=64+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    # run_test(M=62, N=384+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    # run_test(M=75, N=448+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    # run_test(M=111, N=192+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    
+    run_test(M=111, N=256, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    run_test(M=111, N=256, K=512, USE_SWIZZLE=1, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    run_test(M=111, N=256, K=512, USE_SWIZZLE=1, PRESHUFFLE_B=1, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    
 if __name__ == "__main__":
     props = torch.cuda.get_device_properties()
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
-    torch.manual_seed(0)
-    run_test(M=33, N=64, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    run_test(M=62, N=384, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    run_test(M=75, N=448, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    run_test(M=111, N=192, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
 
-    run_test(M=33, N=64, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    run_test(M=62, N=384, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    run_test(M=75, N=448, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    run_test(M=111, N=192, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
 
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
