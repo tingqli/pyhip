@@ -410,7 +410,7 @@ S2R与写入使用相同padding布局；packed byte地址为：
 `SQ_LDS_IDX_ACTIVE=98304`、`SQ_LDS_ADDR_CONFLICT=0`。
  ```
 
-### 2048+128 FP4 padding performance
+### 2048+128 FP4 padding performance, still have bank conflicts.
 
 Protocol: MI355X/gfx950, `M=N=8192`, `with_scale=True`, non-swizzle,
 32 rotating datasets, 50 timings, best latency. Regression is
@@ -422,6 +422,32 @@ Protocol: MI355X/gfx950, `M=N=8192`, `with_scale=True`, non-swizzle,
 | 10240 | 2755.81 TFLOPS | 2892.21 TFLOPS | 104.95% | +4.95% |
 | 12288 | 2791.75 TFLOPS | 2946.14 TFLOPS | 105.53% | +5.53% |
 | 14336 | 2834.27 TFLOPS | 2988.70 TFLOPS | 105.45% | +5.45% |
+
+### Large-shape padding performance
+
+Protocol: MI355X/gfx950, `with_scale=True`, non-swizzle A/B padding,
+`PRESHUFFLE_B=False`, 32 rotating datasets, 50 timings, best latency.
+Regression is `Hybrid/MXFP8 - 1`; a positive value means Hybrid is faster.
+
+Accuracy passed for all cases using `calc_diff <= 1e-5`:
+
+| M | N | K | MXFP8 diff | Hybrid MXFP4 diff |
+|---:|---:|---:|---:|---:|
+| 16384 | 32768 | 8192 | 2.57621e-08 | 7.45893e-09 |
+| 32768 | 32768 | 8192 | 2.57331e-08 | 1.87983e-07 |
+| 16384 | 32768 | 8448 | 2.57045e-08 | 7.48359e-09 |
+| 32768 | 32768 | 8448 | 2.56960e-08 | 7.98592e-09 |
+
+The standalone `M=N=32768, K=8192` Hybrid accuracy run had 10503 out of
+1073741824 elements outside the stricter `torch.allclose` tolerance, while
+its aggregate `calc_diff` remained well below the required threshold.
+
+| M | N | K | MXFP8 | Hybrid MXFP4 | Hybrid/MXFP8 | Regression |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16384 | 32768 | 8192 | 3173.5 us, 2771.72 TFLOPS | 3038.8 us, 2894.57 TFLOPS | 104.43% | +4.43% |
+| 32768 | 32768 | 8192 | 6324.3 us, 2781.68 TFLOPS | 6012.1 us, 2926.11 TFLOPS | 105.19% | +5.19% |
+| 16384 | 32768 | 8448 | 3289.6 us, 2757.48 TFLOPS | 3119.5 us, 2907.82 TFLOPS | 105.45% | +5.45% |
+| 32768 | 32768 | 8448 | 6551.7 us, 2769.04 TFLOPS | 6223.5 us, 2915.05 TFLOPS | 105.27% | +5.27% |
 
 ### Historical 1024+64 FP4 padding performance
 
