@@ -20,7 +20,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr.typing import BFloat16, Float4E2M1FN, Float8E4M3FN, Float32, Int8, Int32, T, Vector
+from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float32, Int8, Int32, T, Vector
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
 from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir import ir
@@ -105,11 +105,11 @@ def compile_gemm_fp8(
     assert BLOCK_K == 128
     assert K % 256 == 0
     assert N % 8 == 0
-    assert not b_mxfp4 or (lds_swizzle and not preshuffle_b)
-    a_element_type = fx.Float8E4M3FN
-    b_element_type = fx.Float4E2M1FN if b_mxfp4 else fx.Float8E4M3FN
-    a_elements_per_128b = 16
-    b_elements_per_128b = 32 if b_mxfp4 else 16
+    assert not b_mxfp4 or not preshuffle_b
+    element_type = fx.Float8E4M3FN
+    b_element_type = fx.Float4E2M1FN if b_mxfp4 else element_type
+    elements_per_128b = 16  # 128bit / fp8(8bit)
+    b_elements_per_128b = 32 if b_mxfp4 else elements_per_128b
     # sched_group_barrier 精确调度（对标 bf16 hot_loop_scheduler_mainloop）：
     # fp8 每象限一条 MFMA(16x16x128) 抵 bf16 两条(16x16x32)，故 MFMA 计数减半（32->16）；
     # ds_read/vmem 计数不变（数据量一致）。仅在完整流水迭代（同时有 s2r+g2s）时应用。
@@ -147,7 +147,11 @@ def compile_gemm_fp8(
     A_PAD = 32
     A_GROUP = 8 * BLOCK_K + A_PAD  # 1056
     a_lds_elems = (BLOCK_M // 8) * A_GROUP  # 16*1056 = 16896
-    b_lds_elems = BLOCK_N * BLOCK_K if b_mxfp4 else (BLOCK_N // 8) * A_GROUP
+    if b_mxfp4 and not lds_swizzle:
+        # 16x128 logical FP4 values followed by 128 logical FP4 values (64 B).
+        b_lds_elems = (BLOCK_N // 16) * (16 * BLOCK_K + 128)
+    else:
+        b_lds_elems = BLOCK_N * BLOCK_K if b_mxfp4 else (BLOCK_N // 8) * A_GROUP
     scale_lds_bytes = 128 * 8
 
     if with_scale:
@@ -192,7 +196,7 @@ def compile_gemm_fp8(
     ):
         tid = fx.thread_idx.x
         num_pid_n = div_up(N, TILE_N)
-        scale_m_rows = (M + 255) & -256
+        scale_m_rows = div_up(M, 256) * 256
         scale_n_rows = div_up(N, 256) * 256
         if const_expr(pid_swizzle):
             bid_x, bid_y = get_pids_950(fx.block_idx.x, M, fx.grid_dim.x, 8, 4)
@@ -200,7 +204,7 @@ def compile_gemm_fp8(
             bid_x = fx.block_idx.x // num_pid_n
             bid_y = fx.block_idx.x % num_pid_n
 
-        a_iter = fx.recast_iter(a_element_type, fx.get_iter(argA))
+        a_iter = fx.recast_iter(element_type, fx.get_iter(argA))
         b_iter = fx.recast_iter(b_element_type, fx.get_iter(argB))
         A_2d = fx.Tensor(fx.make_view(a_iter, fx.make_layout((M, K), (K, 1))))
         B_2d = fx.Tensor(fx.make_view(b_iter, fx.make_layout((N, K), (K, 1))))
@@ -286,7 +290,7 @@ def compile_gemm_fp8(
 
         # ---- tiled MMA: MFMA_Scale 16x16x128 f8f6f4 ----
         mma_atom = fx.make_mma_atom(
-            fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, b_element_type, a_element_type)
+            fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, b_element_type, element_type)
         )
         mma_atom = fx.atom_set_value(mma_atom, "scale_a", fx.Int32(0))
         mma_atom = fx.atom_set_value(mma_atom, "scale_b", fx.Int32(0))
@@ -299,7 +303,7 @@ def compile_gemm_fp8(
                         16,
                         128,
                         b_element_type,
-                        a_element_type,
+                        element_type,
                         opsel_a=n0,
                         opsel_b=m0,
                     )
@@ -324,9 +328,9 @@ def compile_gemm_fp8(
 
         # ---- copy atoms ----
         async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
-        buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), a_element_type)
+        buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), element_type)
         buffer_copy_atom_b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), b_element_type)
-        lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), a_element_type)
+        lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
         lds_copy_atom_b = fx.make_copy_atom(fx.UniversalCopy128b(), b_element_type)
 
         # ---- LDS 分配 ----
@@ -420,7 +424,7 @@ def compile_gemm_fp8(
             _rd = fx.make_composed_layout(_swl, _wr)
             _g2s_tile, _g2s_tv = fx.make_layout_tv(
                 fx.make_layout((8 * 4, 8), (8, 1)),
-                fx.make_layout((1, a_elements_per_128b), (1, 1)),
+                fx.make_layout((1, elements_per_128b), (1, 1)),
             )
             dma = fx.make_tiled_copy(buffer_copy_atom, _g2s_tv, _g2s_tile).get_slice(tid)
         else:
@@ -435,8 +439,8 @@ def compile_gemm_fp8(
                 ((8 * BLOCK_K + 16, 2 * (8 * BLOCK_K + 16) + 32, BLOCK_K), (1, 32)),
             )
             _a_dma_tv = fx.make_layout(
-                ((8, 8, 4), a_elements_per_128b),
-                ((a_elements_per_128b * 32, 1, 8), 32),
+                ((8, 8, 4), elements_per_128b),
+                ((elements_per_128b * 32, 1, 8), 32),
             )
             dma = fx.make_tiled_copy(buffer_copy_atom, _a_dma_tv, fx.make_tile(32, BLOCK_K)).get_slice(tid)
 
@@ -445,9 +449,16 @@ def compile_gemm_fp8(
         _wr_b = _wr
         _rd_b = _rd
         if const_expr(b_mxfp4):
-            _swl_b = fx.static(fx.SwizzleType.get(3, 5, BLOCK_K.bit_length() - 1 - 5))
-            _wr_b = fx.make_ordered_layout((BLOCK_N, BLOCK_K), (1, 0))
-            _rd_b = fx.make_composed_layout(_swl_b, _wr_b)
+            if const_expr(lds_swizzle):
+                _swl_b = fx.static(fx.SwizzleType.get(3, 5, BLOCK_K.bit_length() - 1 - 5))
+                _wr_b = fx.make_ordered_layout((BLOCK_N, BLOCK_K), (1, 0))
+                _rd_b = fx.make_composed_layout(_swl_b, _wr_b)
+            else:
+                _wr_b = fx.make_layout(
+                    ((16, BLOCK_N // 16), BLOCK_K),
+                    ((BLOCK_K, 16 * BLOCK_K + 128), 1),
+                )
+                _rd_b = _wr_b
         if const_expr(preshuffle_b):
             _b_lds = fx.make_layout(((16, BLOCK_N // 16), (16, BLOCK_K // 16)), ((16, 2048), (1, 256)))
             _wr_b = _b_lds
@@ -481,24 +492,31 @@ def compile_gemm_fp8(
 
         def raw_b_mxfp4_g2s(kk, ptr, row_tile):
             for copy_round in range_constexpr(2):
-                physical_slot = tid + copy_round * 256
-                logical_slot = physical_slot ^ ((physical_slot >> 3) & 7)
-                row = (logical_slot // 32) * 8 + logical_slot % 8
-                col_byte = ((logical_slot % 32) // 8) * 16
+                lane_id = tid % 64
+                wave_id = tid // 64
+                if const_expr(lds_swizzle):
+                    physical_slot = tid + copy_round * 256
+                    logical_slot = physical_slot ^ ((physical_slot >> 3) & 7)
+                    row = (logical_slot // 32) * 8 + logical_slot % 8
+                    col_byte = ((logical_slot % 32) // 8) * 16
+                    lds_byte = (wave_id * 64 + copy_round * 256) * 16
+                else:
+                    chunk = wave_id + copy_round * 4
+                    row = chunk * 16 + lane_id // 4
+                    col_byte = (lane_id % 4) * 16
+                    lds_byte = chunk * ((16 * BLOCK_K + 128) // 2)
                 global_row = row_tile * BLOCK_N + row
                 global_col_byte = kk * (BLOCK_K // 2) + col_byte
                 global_byte = global_row * (K // 2) + global_col_byte
-                wave_id = tid // 64
-                wave_id_uni = fx.Int32(
-                    rocdl.readfirstlane(T.i32, arith._to_raw(wave_id))
-                )
                 lds_root = _fly.extract_aligned_pointer_as_index(
                     ir.Type.parse("!llvm.ptr<3>"),
                     arith._to_raw(fx.make_view(ptr, fx.make_layout(1, 1))),
                 )
                 lds_ptr = fx.buffer_ops.get_element_ptr(
                     lds_root,
-                    byte_offset=(wave_id_uni * 64 + copy_round * 256) * 16,
+                    byte_offset=fx.Int32(
+                        rocdl.readfirstlane(T.i32, arith._to_raw(lds_byte))
+                    ),
                     elem_type=T.i8,
                 )
                 rocdl.raw_ptr_buffer_load_lds(
@@ -598,29 +616,26 @@ def compile_gemm_fp8(
                 for n0 in range_constexpr(4):
                     row = (n0 * 2 + wave_n) * 16 + lane_id % 16
                     col_byte = (lane_id // 16) * 16
-                    lds_byte = (row // 8) * 512 + (row % 8) * 16 + (col_byte // 16) * 128
-                    swizzled_byte = lds_byte ^ (((lds_byte >> 7) & 7) << 4)
+                    if const_expr(lds_swizzle):
+                        lds_byte = (row // 8) * 512 + (row % 8) * 16 + (col_byte // 16) * 128
+                        lds_byte = lds_byte ^ (((lds_byte >> 7) & 7) << 4)
+                    else:
+                        lds_byte = (
+                            (row // 16) * ((16 * BLOCK_K + 128) // 2)
+                            + (row % 16) * (BLOCK_K // 2)
+                            + col_byte
+                        )
                     ptr = fx.add_offset(
                         fx.recast_iter(fx.Uint8, fx.get_iter(src)),
-                        fx.make_int_tuple(swizzled_byte),
+                        fx.make_int_tuple(lds_byte),
                     )
-                    packed = fx.make_view(
-                        ptr, fx.make_layout(16, 1)
-                    ).load().bitcast(fx.Int32)
+                    packed = fx.make_view(ptr, fx.make_layout(16, 1)).load().bitcast(fx.Int32)
                     for word in range_constexpr(4):
                         values.append(packed[word])
                 dst.store(Vec.from_elements(values, fx.Int32))
             else:
                 fx.copy(lds_copy_atom, src_partition, dst_partition, pred=None)
 
-        # Derive accumulator layouts from a full transposed tile. Current FlyDSL
-        
-        # frag_C_tl = fx.select(thr_mma.make_fragment_C(bC_tl), [0, 2, 1])
-        # frag_C_tr = fx.select(thr_mma.make_fragment_C(bC_tr), [0, 2, 1])
-        # frag_C_bl = fx.select(thr_mma.make_fragment_C(bC_bl), [0, 2, 1])
-        # frag_C_br = fx.select(thr_mma.make_fragment_C(bC_br), [0, 2, 1])
-
-        # returns a leaf fragment layout, so the old post-make_fragment_C select is invalid.
         c_layout_tile = fx.make_rmem_tensor(
             fx.make_ordered_layout((BLOCK_N, BLOCK_M), (1, 0)), fx.Float32
         )
@@ -632,7 +647,9 @@ def compile_gemm_fp8(
         if const_expr(with_scale or b_mxfp4):
             def do_gemm(c_frag, b_frag, a_frag, scale_a_frag, scale_b_frag):
                 c_value = c_frag.load().ir_value()
-                b_value = vector.bitcast(T.vec(64 if b_mxfp4 else 128, T.i8), b_frag.load().ir_value())
+                b_value = vector.bitcast(
+                    T.vec(64 if b_mxfp4 else 128, T.i8), b_frag.load().ir_value()
+                )
                 a_value = vector.bitcast(T.vec(128, T.i8), a_frag.load().ir_value())
                 if const_expr(with_scale):
                     scale_a = Vec(scale_a_frag.load())[0]
@@ -654,12 +671,12 @@ def compile_gemm_fp8(
                             T.vec(32, T.i8), a_value, offsets=[m0 * 32], sizes=[32], strides=[1]
                         )
                         if const_expr(with_scale):
-                            selected_atom = fx.atom_set_value(scale_atoms[(n0, m0)], "scale_a", scale_b)
-                            selected_atom = fx.atom_set_value(selected_atom, "scale_b", scale_a)
+                            scaled_atom = fx.atom_set_value(scale_atoms[(n0, m0)], "scale_a", scale_b)
+                            scaled_atom = fx.atom_set_value(scaled_atom, "scale_b", scale_a)
                         else:
-                            selected_atom = scale_atoms[(n0, m0)]
+                            scaled_atom = scale_atoms[(n0, m0)]
                         c_sub = _fly.mma_atom_call_ssa(
-                            [T.vec(4, T.f32)], selected_atom, b_sub, a_sub, c_sub
+                            [T.vec(4, T.f32)], scaled_atom, b_sub, a_sub, c_sub
                         )
                         c_value = vector.insert_strided_slice(c_sub, c_value, [c_offset], [1])
                 c_frag.store(c_value)
@@ -737,9 +754,9 @@ def compile_gemm_fp8(
         # 的 fragment 大小不同，ds_read_b128 数量也不同；读 A 的 region 用 a_dsrd，读 B 的用
         # b_dsrd。之前对所有 region 统一传 dsrd=8，导致读 B 的 region 未被完整调度、访存交织
         # 退化并增加 wait cycles。
-        a_dsrd = frag_A_t.load().numel * a_element_type.width // 8 // 16
+        a_dsrd = frag_A_t.load().numel * element_type.width // 8 // 16
         b_dsrd = 4 if b_mxfp4 else frag_B_l.load().numel * b_element_type.width // 8 // 16
-        a_vmem = (BLOCK_M * BLOCK_K * a_element_type.width // 8) // (256 * 16)
+        a_vmem = (BLOCK_M * BLOCK_K * element_type.width // 8) // (256 * 16)
         b_vmem = (BLOCK_N * BLOCK_K * b_element_type.width // 8) // (256 * 16)
 
         # 每个 region：1 个象限 fx.gemm(C=B*A) + 下一 operand 的 s2r + 再下一块的 g2s，
@@ -916,6 +933,7 @@ def compile_gemm_fp8(
             fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
         hot_loop_scheduler_mainloop(3, 0, 8 + int(with_scale))
         rocdl.sched_barrier(0)
+        N_tail = (N % TILE_N != 0 )
         # ---- store_quadrant 定义提前（放到 buf1 尾部之前），供 store 与最后的 MFMA 交织 ----
         if const_expr(permlane_epilogue):
             # permlane：相邻两个 16x16 tile 经 permlane16_swap 重排后，每 lane 一次写 8 个连续 bf16
@@ -933,6 +951,12 @@ def compile_gemm_fp8(
             def store_quadrant(c_frag, bC, quadrant_m, quadrant_n):
                 for row_repeat in range_constexpr(fragment_mode_1_repeat):
                     for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
+                        if const_expr(N_tail):
+                            n_block_start = (
+                                bid_y * TILE_N
+                                + quadrant_n * (TILE_N // 2)
+                                + col_repeat * 32
+                            )
                         acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
                         acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
                         d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
@@ -951,40 +975,30 @@ def compile_gemm_fp8(
                             fx.Int32,
                         )
                         row = bid_x * TILE_M + quadrant_m * (TILE_M // 2) + row_repeat * 32 + wave_m * 16 + lane_id % 16
-                        N_start_blk64 = bid_y * TILE_N + quadrant_n * (TILE_N // 2) + col_repeat * 32
                         col = (
-                            N_start_blk64
+                            bid_y * TILE_N
+                            + quadrant_n * (TILE_N // 2)
+                            + col_repeat * 32
                             + lane_group % 2 * 32
                             + wave_n * 16
                             + lane_group // 2 * 8
                         )
                         byte_offset = (row * N + col) * 2
-
-                        if const_expr(N % TILE_N == 0):
+                        if const_expr(N_tail):
                             fx.buffer_ops.buffer_store(
                                 packed,
                                 c_store_rsrc,
                                 byte_offset,
                                 offset_is_bytes=True,
-                            )
-                        elif const_expr((N % TILE_N) % 64 == 0):
-                            if (N_start_blk64 < N):
-                                fx.buffer_ops.buffer_store(
-                                    packed,
-                                    c_store_rsrc,
-                                    byte_offset,
-                                    offset_is_bytes=True,
-                                )
-                        elif const_expr((N % TILE_N) % 8 == 0):
-                            fx.buffer_ops.buffer_store(
-                                packed,
-                                c_store_rsrc,
-                                byte_offset,
-                                offset_is_bytes=True,
-                                mask=col < N,
+                                mask=n_block_start < N,
                             )
                         else:
-                            assert False, f'unsupported N_tail {N=}'
+                            fx.buffer_ops.buffer_store(
+                                packed,
+                                c_store_rsrc,
+                                byte_offset,
+                                offset_is_bytes=True,
+                            )
         else:
             # 注意：fp8 op1=B 走 make_fragment_A 槽，C 的 wave 朝向相对 bf16 转置，
             # 故 c_tv 的两个 wave 维 stride 需交换为 (512, 16)。
@@ -1126,9 +1140,13 @@ import pyhip
 
 
 def _load_shuffle_weight():
-    # 延迟加载避免非 preshuffle 路径依赖 aiter shuffle。
+    # host 端 shuffle_weight 在 tests.utils，延迟加载避免非 preshuffle 路径依赖它。
     # fp8 kWidth=16、BLOCK_K=128 => shuffle_weight layout=(16, 64)（BK=IK*2=128, K=16//1B）。
-    from aiter.ops.shuffle import shuffle_weight
+    import sys as _sys, os.path as _osp
+    _flydsl_root = _osp.abspath(_osp.join(_osp.dirname(__file__), "..", ".."))
+    if _flydsl_root not in _sys.path:
+        _sys.path.insert(0, _flydsl_root)
+    from tests.utils import shuffle_weight
     return shuffle_weight
 
 
@@ -1142,8 +1160,8 @@ def _load_mxfp8_quant():
 def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
              TILEM=256, TILEN=256, TILEK=128, permlane_output=True, store_overlap=False,
              with_scale=False, B_MXFP4=False, run_count=50, data_clones=50):
-    assert N % (256 if PRESHUFFLE_B else 8) == 0, f"{N=} {PRESHUFFLE_B=} N must be divisible by {'256' if PRESHUFFLE_B else '8'}"
-    assert not B_MXFP4 or (USE_SWIZZLE and not PRESHUFFLE_B)
+    assert N % (256 if PRESHUFFLE_B else 8) == 0
+    assert not B_MXFP4 or not PRESHUFFLE_B
     shuffle_weight = _load_shuffle_weight() if PRESHUFFLE_B else None
     mxfp8_quant = _load_mxfp8_quant() if (with_scale or B_MXFP4) else None
 
@@ -1211,7 +1229,7 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
         return mxfp4_to_f32(x) * scale_f32
 
     if with_scale:
-        a, scale_a_raw = _quant_mxfp8(torch.randn((M, K), device="cuda") * 1.5)
+        a, scale_a_raw = _quant_mxfp8(torch.randn((M, K), device="cuda") * 0.75)
         b, scale_b_raw = (_quant_mxfp4 if B_MXFP4 else _quant_mxfp8)(
             torch.randn((N, K), device="cuda") * 3.0
         )
@@ -1308,9 +1326,7 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
     else:
         As = [_random_fp8((M, K)) for _ in range(data_clones)]
         Bs = [
-            _shuffle_b(
-                _random_fp4((N, K)) if B_MXFP4 else _random_fp8((N, K))
-            )
+            _shuffle_b(_random_fp4((N, K)) if B_MXFP4 else _random_fp8((N, K)))
             for _ in range(data_clones)
         ]
         ScaleAs = [scale_a for _ in range(data_clones)]
@@ -1344,35 +1360,20 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
     print(f"gemm:  {best_ms*1e3:.1f} us  {tflops:.2f} TFLOPS  {bw_gbs:.1f} GB/s")
     return is_correct
 
-def test_acc():
-        # run_test(M=33, N=64, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    # run_test(M=62, N=384, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    # run_test(M=75, N=448, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    # run_test(M=111, N=192, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
 
-    # run_test(M=33, N=64, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    # run_test(M=62, N=384, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    # run_test(M=75, N=448, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    # run_test(M=111, N=192, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-
-    # run_test(M=33, N=72, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    # run_test(M=62, N=384+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    # run_test(M=75, N=448+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    # run_test(M=111, N=192+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-
-    # run_test(M=33, N=64+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    # run_test(M=62, N=384+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    # run_test(M=75, N=448+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    # run_test(M=111, N=192+8, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    
-    run_test(M=111, N=256, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    run_test(M=111, N=256, K=512, USE_SWIZZLE=1, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    run_test(M=111, N=256, K=512, USE_SWIZZLE=1, PRESHUFFLE_B=1, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    
 if __name__ == "__main__":
     props = torch.cuda.get_device_properties()
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
+    torch.manual_seed(0)
+    run_test(M=33, N=64, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    run_test(M=62, N=384, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    run_test(M=75, N=448, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
+    run_test(M=111, N=192, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
 
+    run_test(M=33, N=64, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    run_test(M=62, N=384, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    run_test(M=75, N=448, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
+    run_test(M=111, N=192, K=512, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=0, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
 
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)

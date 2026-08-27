@@ -377,6 +377,7 @@ BK = 128, 16x4 thread mapping, 32 mxfp4 elements per lane,128bit copy atom
 ((4, 16, 4), elements_per_128b),
 ((elements_per_128b x 64, 1, 16), 64)
 ```
+
 ### AC Padding read layout:
 ```
 BK是128
@@ -387,20 +388,52 @@ sub A/B natural layout: (128, 128), (K, 1),主要针对m分组，128=16x8,
 ((8, 2, 8), BK, K//BK), ((16xK， K, 2K), 1, BK)
 
 ```
+
+### LDS for B per slice
+B LDS layout:(128, 128) mxfp4 = 128*64 bytes , without considering padding.
 ### AC padding write LDS layout:
 ```
-LDS layout:(128, 128), (128) without padding, 每16行padding 32个元素，每32行再额外padding 64个元素
-BK=128
-LDS layout : ((16, 2，4), BK), ((BK, 16xBK+32，  （16xBK+32)x2+64), 1)
+BK=128，每16行（2048个logical MXFP4）padding 128个logical MXFP4（64B）。
+LDS layout : ((16, 8), BK), ((BK, 16xBK+128), 1)
+每个16-row group占1088B：1024B packed MXFP4数据 + 64B padding。
 ```
 
 ### S2R read LDS layout padding:
 ```
-在AC 写LDSlayout 基础上做一个permute.
-LDS layout : LDS layout : ((8， 2, 2，4), BK), ((BK, 8*BK, 16xBK+32，  （16xBK+32)x2+64), 1)
-permute to:
-((2, 2，4, 8), BK), (( 8*BK, 16xBK+32，（16xBK+32)x2+64, BK), 1)
+S2R与写入使用相同padding布局；packed byte地址为：
+`(row // 16) * 1088 + (row % 16) * 64 + col_byte`。
+
+每个wave写入一个完整16-row group，因此G2S使用direct 128-bit
+`raw_ptr_buffer_load_lds`，无需register-staged LDS write。
+
+1024^3 non-scale实测整个kernel：`SQ_LDS_BANK_CONFLICT=49152`、
+`SQ_LDS_IDX_ACTIVE=98304`、`SQ_LDS_ADDR_CONFLICT=0`。
  ```
+
+### 2048+128 FP4 padding performance
+
+Protocol: MI355X/gfx950, `M=N=8192`, `with_scale=True`, non-swizzle,
+32 rotating datasets, 50 timings, best latency. Regression is
+`Hybrid/MXFP8 - 1`; a positive value means Hybrid is faster.
+
+| K | MXFP8 | Hybrid MXFP4 | Hybrid/MXFP8 | Regression |
+|---:|---:|---:|---:|---:|
+| 8192 | 2723.42 TFLOPS | 2866.87 TFLOPS | 105.27% | +5.27% |
+| 10240 | 2755.81 TFLOPS | 2892.21 TFLOPS | 104.95% | +4.95% |
+| 12288 | 2791.75 TFLOPS | 2946.14 TFLOPS | 105.53% | +5.53% |
+| 14336 | 2834.27 TFLOPS | 2988.70 TFLOPS | 105.45% | +5.45% |
+
+### Historical 1024+64 FP4 padding performance
+
+Protocol: MI355X/gfx950, `M=N=8192`, `with_scale=True`, non-swizzle,
+32 rotating datasets, 50 timings, best latency.
+
+| K | MXFP8 | Hybrid MXFP4 | Hybrid/MXFP8 |
+|---:|---:|---:|---:|
+| 8192 | 2728.02 TFLOPS | 1703.39 TFLOPS | 62.44% |
+| 10240 | 2755.36 TFLOPS | 1722.53 TFLOPS | 62.52% |
+| 12288 | 2794.20 TFLOPS | 1742.44 TFLOPS | 62.36% |
+| 14336 | 2831.60 TFLOPS | 1750.92 TFLOPS | 61.84% |
 
 
 
