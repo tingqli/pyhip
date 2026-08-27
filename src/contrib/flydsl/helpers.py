@@ -382,7 +382,7 @@ class FlyObjCache:
         return func
 
     @local_cache
-    def create_thr_mma(self, dtype, wave_mnk, mfma_MNKB = None):
+    def create_thr_mma(self, dtype, wave_mnk, mfma_MNKB = None, tid=None):
         mfma_K_lut = {
                     fx.Float8E4M3FN: 32,
                     fx.Float8E4M3FNUZ: 32,
@@ -424,7 +424,7 @@ class FlyObjCache:
         permutation_mnk = (None, None, k_perm)
         tiled_mma = fx.make_tiled_mma(mma_atom, thr_layout_mnk, permutation_mnk)
 
-        return tiled_mma.get_slice(fx.thread_idx.x)
+        return tiled_mma.get_slice(fx.thread_idx.x if tid is None else tid)
 
     @local_cache
     def get_universal_copy_atom(self, dtype, copy_bits):
@@ -439,18 +439,13 @@ class FlyObjCache:
     @local_cache
     def get_tiled_mma_copy(self, copy_atom, mm, abc, tid=None):
         assert abc in ["A", "B", "C"]
+        tid = mm.thr_idx if tid is None else tid
         if fx.const_expr(abc == "A"):
-            return fx.make_tiled_copy_A(copy_atom, mm).get_slice(
-                tid if tid is not None else fx.thread_idx.x
-            )
+            return fx.make_tiled_copy_A(copy_atom, mm).get_slice(tid)
         elif fx.const_expr(abc == "B"):
-            return fx.make_tiled_copy_B(copy_atom, mm).get_slice(
-                tid if tid is not None else fx.thread_idx.x
-            )
+            return fx.make_tiled_copy_B(copy_atom, mm).get_slice(tid)
         else:
-            return fx.make_tiled_copy_C(copy_atom, mm).get_slice(
-                tid if tid is not None else fx.thread_idx.x
-            )
+            return fx.make_tiled_copy_C(copy_atom, mm).get_slice(tid)
 
     @local_cache
     def get_partition_S(self, thrcopy, src):
