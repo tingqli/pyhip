@@ -951,12 +951,6 @@ def compile_gemm_fp8(
             def store_quadrant(c_frag, bC, quadrant_m, quadrant_n):
                 for row_repeat in range_constexpr(fragment_mode_1_repeat):
                     for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
-                        if const_expr(N_tail):
-                            n_block_start = (
-                                bid_y * TILE_N
-                                + quadrant_n * (TILE_N // 2)
-                                + col_repeat * 32
-                            )
                         acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
                         acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
                         d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
@@ -990,7 +984,7 @@ def compile_gemm_fp8(
                                 c_store_rsrc,
                                 byte_offset,
                                 offset_is_bytes=True,
-                                mask=n_block_start < N,
+                                mask=col < N,
                             )
                         else:
                             fx.buffer_ops.buffer_store(
