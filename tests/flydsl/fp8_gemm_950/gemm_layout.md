@@ -71,7 +71,7 @@ BK = 128, 8x8 thread mapping:
 ### AC Padding read layout:
 ```
 BK是128
-sub A/B natural layout: (128, 128), (K, 1),主要针对m分组，128=16x8, 
+sub A/B natural layout: (128, 128), (K, 1),主要针对m分组，128=16x8,
 ((16, 8), BK, K//BK), ((K, 16xK), 1, BK), 根据访问的thread mapping顺序permute为：
 ((8, 16), BK, K//BK), ((16xK， K), 1, BK)
 ```
@@ -362,8 +362,45 @@ scale B,tv_layout = ((16， 4， 2， 2), 1), ((1, 32, 16, 0), 1),
 ```
 
 
-# 所有的scale load都要使用buffer 
+# 4 wave mxfp4, hybrid
+```
+TILE_M/TILE_N=256, BK=128.
+slicing之后，BM/BN=128, BK=128
+```
+### AC A/B tile copy:
+```
+BK = 128, 16x4 thread mapping, 32 mxfp4 elements per lane
+64 rows, 128 columns,
+```
+### AC A/B tv layout:
+```
+((4, 16, 4), elements_per_128b),
+((elements_per_128b x 64, 1, 16), 64)
+```
+### AC Padding read layout:
+```
+BK是128
+sub A/B natural layout: (128, 128), (K, 1),主要针对m分组，128=16x8,
+((16, 8), BK, K//BK), ((K, 16xK), 1, BK), 根据访问的thread mapping顺序permute为：
+((8, 16), BK, K//BK), ((16xK， K), 1, BK)
 
+((8, 2, 8), BK, K//BK), ((16xK， K, 2K), 1, BK)
+
+```
+### AC padding write LDS layout:
+```
+LDS layout:(128, 128), (128) without padding, 每16行padding 32个元素，每32行再padding 64个元素
+BK=128
+LDS layout : ((16, 2，4), BK), ((BK, 16xBK+32，  （16xBK+32)x2+64), 1)
+```
+
+### S2R read LDS layout padding:
+```
+在AC 写LDSlayout 基础上做一个permute.
+LDS layout : LDS layout : ((8， 2, 2，4), BK), ((BK, 8*BK, 16xBK+32，  （16xBK+32)x2+64), 1)
+permute to:
+((2, 2，4, 8), BK), (( 8*BK, 16xBK+32，（16xBK+32)x2+64, BK), 1)
+ ```
 
 
 
