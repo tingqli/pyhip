@@ -1,4 +1,4 @@
-# MoE down 合并最终性能报告（2026-08-26）
+# MoE down 合并最终性能报告（2026-08-27）
 
 ## 范围与最终状态
 
@@ -139,6 +139,81 @@ K=256的Down提升率为23.5%-27.0%，Full提升率为8.5%-11.6%；Qwen3.5 35B K
 的Down提升率为20.5%-24.1%，Full提升率为5.8%-12.0%。H3 8K的`2x4` Down和
 Full提升率分别为`5.3%`和`1.5%`。
 
+## Batched GEMM core ceiling预测与实测
+
+本轮从`8c1a86965b2a65b69036291f9b95533044c2d81f`只移植
+`tests/flydsl/attn_4wave/tools/probe-batched-gemm-core-ceiling.py`到当前同名`tools`
+目录；原文件SHA256为
+`e393589fa1f49a0ede20ccd5df0f3aff2ad8fab7ed7a9fa9917dc59fba56bbcf`。正式测量版本
+SHA256为`baca74ae95a564f98b14cfadd3f7f75665a3a7d5795d3362f109c4d6b3fe22a2`。测量后执行
+Black/Ruff机械格式化，并把内聚occupancy helper的返回值对齐来源语义
+`min(requested, achievable)`；本轮七个配置的`requested == achievable`，结果不受该修正
+影响。最终版本SHA256为`80da30297540083b75eaafa22347ceb8a5379a3274c93a0c9e02065f7d952299`。
+没有移植同提交的生产profile、TODO、wave-stage工具，也没有修改`src/core/asmjit.py`。
+当前版本仅把原工具依赖的GPU状态、统计和occupancy helper内聚进单文件，并局部哈希
+JIT compile key以规避文件名长度限制。内建`self-test`的几何、padding、MFMA/VMEM
+工作量和地址多重集检查全部通过。完整CLI与复现命令见
+[`batched-gemm-core-ceiling.md`](../../flydsl/attn_4wave/tools/batched-gemm-core-ceiling.md)。
+
+这里的“预测”是该工具实测的`gemm_core_coissue_ceiling`：均衡batch skeleton保留与
+目标矩阵相同的MFMA、B read和BF16 D write工作量，但MFMA operand、VMEM结果和D payload
+彼此独立；A用`--a-in-reg`只预留完整K维寄存器，不访问A buffer；LDS只限制occupancy，
+最终ISA不得包含`ds_*`。因此它是候选tile的core co-issue上界，不是正确GEMM实现，也
+不是仅按峰值算力计算的静态理论值。
+
+### 统一协议与配置
+
+- GPU4，AMD Instinct MI308X / gfx942 / 80 CU；650W、1800MHz performance
+  determinism、PTL `Enabled / VECTOR,F8`。
+- 预测和生产实测均使用10套地址、40次round-robin warmup、50个CUDA-event样本、
+  `sample-sync=end`；报告中位数和`[P25--P75]`。
+- ceiling侧轮转B/D，生产侧轮转activation/weight/output；每个event只包含一次目标
+  down dispatch，不包含sorting、gateup、reduction或完整MoE链。
+- 生产侧使用当前`168808caeacf7e0d7cb336df25554a0bf778d6dc`源码。临时生产测量
+  harness SHA256为`f8ba0964023d2e27beb50a83250772bdd7b9055d5efdc06ec6ac316c12d8fc3e`，
+  未加入仓库。
+- `差值 = ceiling - 生产`；`达到率 = 生产 / ceiling`。两侧为独立进程，差值不是
+  配对置信区间。
+
+| Case | ceiling `B x M x N x K` | `BM x BN x BK` | `WM x WN` (`W/WG`) | `W/SIMD` | `NT/WG` | ISA；LDS | ceiling WG | 生产active/launched WG |
+| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: |
+| Hy3 K=192 | `193x1528x4096x192` | `64x512x64` | `1x8` (8) | 4 | 8 | 92V+4A；32KiB | 4,632 | 4,632/4,801 |
+| Qwen3.5 397B K=512 | `512x640x4096x512` | `64x256x128` | `1x4` (4) | 2 | 16 | 204V+4A；32KiB | 5,120 | 5,120/5,632 |
+| Qwen3.5 397B K=256 | `512x640x4096x256` | `64x256x128` | `1x4` (4) | 2 | 16 | 140V+4A；32KiB | 5,120 | 5,120/5,632 |
+| Qwen3.5 35B K=512 | `256x1024x2048x512` | `64x256x128` | `1x4` (4) | 2 | 8 | 204V+4A；32KiB | 4,096 | 4,096/4,352 |
+| Qwen3.5 35B K=256 | `256x1024x2048x256` | `64x256x128` | `1x4` (4) | 2 | 8 | 140V+4A；32KiB | 4,096 | 4,096/4,352 |
+| Xiaomi K=256 | `384x683x6144x256` | `64x256x128` | `1x4` (4) | 2 | 24 | 140V+4A；32KiB | 4,224 | 4,224/4,480 |
+| H3 K=384 | `128x1024x6144x384` | `128x256x128` | `2x4` (8) | 2 | 24 | 172V+4A；64KiB | 1,024 | 1,024/1,152 |
+
+每个ceiling WG处理完整N维，即`NT/WG=ceil(N/BN)`且N tile group数为1。均衡M取
+`B*TopK/E`的整数近似；Hy3和Xiaomi分别向BM补齐，ceiling useful/executed效率为
+99.48%和97.02%，其余五个case为100%。所有七个最终ISA的请求occupancy均与HIP
+driver返回值一致，且均为0 scratch、无`ds_*`。
+
+### 预测与实测结果
+
+| Case | 生产 ms / useful TFLOPS `[P25--P75]` | ceiling ms / useful TFLOPS `[P25--P75]` | ceiling - 生产 | 达到率 |
+| --- | ---: | ---: | ---: | ---: |
+| Hy3 K=192 | 1.3747 / 337.43 `[334.42--353.63]` | 1.2659 / 366.42 `[365.78--367.85]` | +28.99T / +8.59% | 92.09% |
+| Qwen3.5 397B K=512 | 3.4214 / 401.71 `[400.25--402.76]` | 2.7981 / 491.19 `[490.94--491.68]` | +89.49T / +22.28% | 81.78% |
+| Qwen3.5 397B K=256 | 1.8616 / 369.14 `[360.19--372.05]` | 1.6991 / 404.45 `[394.15--405.37]` | +35.31T / +9.57% | 91.27% |
+| Qwen3.5 35B K=512 | 1.4113 / 389.54 `[388.78--391.27]` | 1.1284 / 487.21 `[486.40--488.41]` | +97.66T / +25.07% | 79.95% |
+| Qwen3.5 35B K=256 | 0.7665 / 358.62 `[352.33--359.46]` | 0.6738 / 407.96 `[407.01--410.09]` | +49.34T / +13.76% | 87.91% |
+| Xiaomi K=256 | 2.2746 / 362.53 `[361.38--363.79]` | 2.1124 / 390.57 `[389.52--391.95]` | +28.03T / +7.73% | 92.82% |
+| H3 K=384 | 1.5777 / 392.01 `[390.50--395.17]` | 1.4609 / 423.34 `[422.91--424.88]` | +31.33T / +7.99% | 92.60% |
+
+七份ceiling JSON按“文件名 + SHA256”排序后的清单SHA256为
+`1c3f5cd5b5c4b4f4d9b51f5852972d12ed7c82b0e6253c84a5705507fdc59f00`；七份生产
+JSON的清单SHA256为
+`478e08d30d7f729f5c7d4a0143e1950953558afa9a3932ef03067eaef8a318c7`。
+
+生产达到ceiling的范围为79.95%--92.82%。Hy3、Xiaomi和H3均超过92%，说明当前专用
+路径已经接近这个不含正确性依赖的core co-issue上界；两个Qwen K=256路径分别达到
+91.27%和87.91%。两个K=512 `default`路径只有81.78%和79.95%，同时拥有最高的
+204V+4A资源档位，是后续优先优化对象。该差距不能直接解释为某一种cache或指令瓶颈；
+ceiling还省略了VMEM到MFMA RAW、LDS搬运、scale、metadata和真实epilogue，需结合
+PMC/ATT再做归因。
+
 ## 专用down路径运行时拓扑映射
 
 `1x4_64x256`、`2x4`和`1x8`共享`_map_down_task`，不包含Batch、E、N、K或TopK
@@ -239,6 +314,9 @@ topology存在局部收益，但不能作为`1x4_64x256`的统一策略。相同
   128 VGPR、96 SGPR、28,672B LDS和0 scratch；`2x4`两个特化资源均为256 VGPR、
   96 SGPR、65,536B LDS和0 scratch，对应1,092/1,119条指令；`1x4_64x256`为
   930条指令、250 VGPR、96 SGPR、25,600B LDS和0 scratch。
+- 七个当前生产case完成同协议batched GEMM core ceiling预测与真实down实测；生产达到率
+  为79.95%--92.82%。两个K=512 `default`路径达到率最低（81.78%和79.95%），是后续
+  优先优化对象；该差距只表示相对core co-issue上界的剩余空间，不单独用于瓶颈归因。
 - 最终生产选择见1K-32K矩阵；MI308的`2x4`和`1x8`保留topology特化与运行时门禁，
   其余设备只生成8-XCD generic；`1x4_64x256`始终使用设备相关generic swizzle。
   Qwen K=512维持`default`，K=256选
