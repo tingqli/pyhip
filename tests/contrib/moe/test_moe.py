@@ -1,5 +1,7 @@
 import math
 import os
+import statistics
+
 os.environ['PYHIP_JIT_LOG'] = '0'
 DUMP_DOWN = int(os.getenv("DUMP_DOWN", "0"))
 
@@ -226,7 +228,7 @@ def quant_expert_weights(w1, quant_type, dtype):
         return w1_qt, w1s, w1_ref
     assert 0, quant_type
 
-def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='default', down_output_padding_bytes=None):
+def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='default', down_output_padding_bytes=None, force_batch1_path=False):
     INTER_SIZE_TP = INTER_SIZE // TP
     # acc (run_count=0): only hidden_states[0] etc. are used; smaller BUF_COPY saves VRAM.
     # perf (run_count>0): rotate buffers to reduce L2 reuse across timed iterations.
@@ -523,35 +525,39 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                 weight_dtype = 'fp8'
                 compile_quant_type = quant_type
                 compile_act_quant_type = quant_type
-            if B == 1 and down_path == 'default':
+            if (B == 1 or force_batch1_path) and down_path == 'default':
                 assert TILE_M_GATEUP == TILE_M_DOWN, (
                     'only prefill_1x4 supports different gateup/down M tiles'
                 )
-                grid = topk_ids.numel()
+                batch1_alg = 'splitk' if force_batch1_path else 'batch1'
                 w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                 g_kwargs = (
                     ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
                     # gateup batch1 runs faster at BN=32 (more N-blocks/parallelism on the underutilized
                     # GPU, split-K reduce preserved via the full-fragment reduce); down stays at 64.
-                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 32), ('stage', 'gateup'), ('alg', 'batch1'), ('E', E),
+                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 32), ('stage', 'gateup'), ('alg', batch1_alg), ('E', E),
                 )
+                if force_batch1_path:
+                    g_kwargs += (('force_batch1_path', True),)
                 if activation == 'swiglu':
                     g_kwargs += (('activation', activation), ('swiglu_limit', swiglu_limit))
                 _fly_dispatch(
                     g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
                     (_ptr(hidden_states), _ptr(w1), _ptr(gemm1_out), _ptr(topk_ids), _ptr(topk_weight), _ptr(w1_scale_arg),
-                     grid, stream),
+                     B, stream),
                 )
-                cur_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+                cur_out = torch.zeros([B, N2], dtype=hidden_states.dtype, device=hidden_states.device)
                 w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                 d_kwargs = (
                     ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
-                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 64), ('stage', 'down'), ('alg', 'batch1'), ('E', E),
+                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 64), ('stage', 'down'), ('alg', batch1_alg), ('E', E),
                 )
+                if force_batch1_path:
+                    d_kwargs += (('force_batch1_path', True),)
                 _fly_dispatch(
                     d_kwargs, lambda: _moe_compile(**dict(d_kwargs)),
                     (_ptr(gemm1_out), _ptr(w2), _ptr(cur_out), _ptr(topk_ids), _ptr(topk_weight), _ptr(w2_scale_arg),
-                     grid, stream),
+                     B, stream),
                 )
             else:
                 # FlyDSL moe_gemm_splitk: gateup stage
@@ -1014,10 +1020,11 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                     quantype = " @ blockwise"
             print(f"{kernel_type}[{B=} {weight_type=}{quantype}] acc OK({diff=:.8f})")
     if run_count > 0:
-        return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
-                'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
-                'bw': sum(bw[1:]) / len(bw[1:]),
-                'diff': diff}                               # GB/s
+        aggregate = statistics.median if force_batch1_path else statistics.mean
+        return {'flops': aggregate(tflops_res[1:]),              # tflops
+            'latency': aggregate(latencies[1:]) * 1e6,        # us
+            'bw': aggregate(bw[1:]),
+            'diff': diff}                               # GB/s
 
 def is_arch_type(arch):
     props = torch.cuda.get_device_properties()
@@ -1042,7 +1049,7 @@ def entry_b1(prec=[torch.bfloat16], HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E
         perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M_DOWN=32, TILE_M_GATEUP=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=64, TP=8, run_count=10, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='default', down_output_padding_bytes=None):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M_DOWN=32, TILE_M_GATEUP=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=64, TP=8, run_count=10, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='default', down_output_padding_bytes=None, force_batch1_path=False):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
@@ -1064,7 +1071,7 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M_DOWN=32, TILE
             else:
                 key = f'{i}'
                 
-            perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP, quant_type=quant_type, activation=activation, swiglu_limit=swiglu_limit, down_path=down_path, down_output_padding_bytes=down_output_padding_bytes)
+            perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP, quant_type=quant_type, activation=activation, swiglu_limit=swiglu_limit, down_path=down_path, down_output_padding_bytes=down_output_padding_bytes, force_batch1_path=force_batch1_path)
         quan_type=""
         if wei_is_fp8(weight_type):
             if quant_type == 'ptpc':
@@ -1162,6 +1169,17 @@ def test_acc_fly_splitk_2s(batch, prec, TILE_M_DOWN, TILE_M_GATEUP, TILE_N, HIDD
         entry_common('fly_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10, quant_type='per_tensor')
     entry_common('fly_splitk_2s', batch=batch, prec=prec, TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
 
+@pytest.mark.parametrize("batch", [[1, 2, 4]])
+@pytest.mark.parametrize("prec", [[torch.bfloat16, get_fp8type()]])
+@pytest.mark.parametrize("HIDDEN_SIZE", [4096])
+@pytest.mark.parametrize("INTER_SIZE", [1024])
+@pytest.mark.parametrize("TP", [8])
+def test_acc_fly_force_batch1_path(batch, prec, HIDDEN_SIZE, INTER_SIZE, TP):
+    entry_common(
+        'fly_splitk_2s', batch=batch, prec=prec, HIDDEN_SIZE=HIDDEN_SIZE,
+        INTER_SIZE=INTER_SIZE, TP=TP, run_count=0, force_batch1_path=True
+    )
+
 @pytest.mark.parametrize("batch", [[1, 2, 64]])
 @pytest.mark.parametrize("prec", [[torch.bfloat16]])
 @pytest.mark.parametrize("TILE_M_DOWN", [64])
@@ -1209,13 +1227,24 @@ def run_acc_test(TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=64, HIDDEN_SIZE=4096, 
     test_acc_mxn_splitk_2s_fp8(batch=get_batch_list('mxn_splitk_2s'), prec=[get_fp8type()], TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, quant_type='block')
     test_acc_mxn_splitk_2s_fp4(batch=get_batch_list('mxn_splitk_2s'), prec=[get_fp4type_if_valid()], TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
 
-def show_perf(perflist):
+def show_perf(perflist, relative_to_batch=None):
     print('\nsummary:')
     for perf in perflist:
         for kernel, vals in perf.items():
             for prec, vals_ in vals.items():
                 for b, data in vals_.items():
-                    print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
+                    relative = ''
+                    if relative_to_batch is not None:
+                        baseline = vals_[str(relative_to_batch)]
+                        relative = (
+                            f', latency {data["latency"] / baseline["latency"]:.2f}x'
+                            f', throughput {data["flops"] / baseline["flops"]:.2f}x'
+                            f' vs B={relative_to_batch}'
+                        )
+                    print(
+                        f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, '
+                        f'{data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops{relative}'
+                    )
 
 @pytest.mark.parametrize("batch", [[1, 2, 4, 8, 12, 16, 32, 64]])
 def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
@@ -1228,6 +1257,21 @@ def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
     perf.append(entry_b1(prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))           # batch 1
     perf.append(entry_common('16x32_2s_b', batch=batch, prec=[get_fp8type()], TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=32, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     show_perf(perf)
+    del perf
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+@pytest.mark.parametrize("batch", [[1, 2, 4]])
+def test_force_batch1_path_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
+    perf = [
+        entry_common(
+            'fly_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp8type()],
+            HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP,
+            force_batch1_path=True,
+        )
+    ]
+    show_perf(perf, relative_to_batch=1)
     del perf
     torch.cuda.empty_cache()
     gc.collect()

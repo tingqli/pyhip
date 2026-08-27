@@ -90,7 +90,11 @@ def compile_gemm(
     down_path="default",
     down_output_padding_bytes=None,
     METADATA_TILE_SIZE_M=None,
+    force_batch1_path=False,
 ):
+    if force_batch1_path:
+        alg = "batch1"
+
     return _compile_gemm_cached(
         get_device_cache_key(),
         N,

@@ -1451,12 +1451,17 @@ def _build_moe_gemm1(
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
         e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        route_idx = batch_idx * TOPK + e_idx
 
-        arg_p_input = fx.make_view(fxh._as_ptr(p_input), fx.make_layout((1, K), (K, 1)))
+        arg_p_input = fx.make_view(
+            fxh._as_ptr(p_input) + fx.Int64(batch_idx * K),
+            fx.make_layout((1, K), (K, 1)),
+        )
         if const_expr(weight_dtype != fx.BFloat16):
             p_weight = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_weight))
         arg_p_expert_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
-        expert_id = arg_p_expert_ids[e_idx]
+        expert_id = arg_p_expert_ids[route_idx]
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         # gate/up group width. BN==32 keeps the 4-wave split-K but uses a dedicated reduce below;
         # BN>=64 uses the coalesced reduce in gemm_splitk.
@@ -1482,7 +1487,7 @@ def _build_moe_gemm1(
         )
 
         arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output),
+            fxh._as_ptr(p_output) + fx.Int64(batch_idx * TOPK * (N // 2)),
             fx.make_layout((1, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
         )
         out_tensor = fx.rocdl.make_buffer_tensor(
@@ -1749,14 +1754,14 @@ def _build_moe_gemm1(
         p_topk_ids: fx.Pointer,
         p_topk_weights: fx.Pointer,
         p_w_scale: fx.Pointer,
-        task_num: fx.Int32,
+        M: fx.Int32,
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
         moe_2stage_gateup_batch1(
             p_input, p_weight, p_output, p_topk_ids, p_w_scale
-        ).launch(grid=(num_n_blocks, task_num, 1), block=(256, 1, 1), stream=stream)
+        ).launch(grid=(num_n_blocks, TOPK, M), block=(256, 1, 1), stream=stream)
 
     @flyc.jit
     def launch_prefill_1x4(
