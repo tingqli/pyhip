@@ -29,3 +29,6 @@ packages = [
     "pyhip.contrib.flydsl.moe_gemm_2stage",
 ]
 package-dir = {"pyhip" = "src"}
+
+[tool.setuptools.package-data]
+"pyhip.contrib" = ["*.cpp"]

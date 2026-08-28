@@ -5,6 +5,73 @@ __all__ = [
 ]
 
 import os
+from pyhip.core.hiptools import amdgpu_arch
+
+
+_DEPTHWISE_HIP_KERNELS = {
+    "packed": "conv_depthwise3d_hip_packed_dot.cpp",
+    "sgb": "conv_depthwise3d_hip_sgb.cpp",
+    "original": "conv_depthwise3d_hip.cpp",
+}
+
+_PACKED_DOT_FP16_ARCHS = frozenset({"gfx942", "gfx950"})
+_PACKED_DOT_BF16_ARCHS = frozenset({"gfx950"})
+
+
+def _dtype_name(dtype):
+    return str(dtype).removeprefix("torch.")
+
+
+def _packed_dot_shape_supported(KD, KH, KW, H_out, W_out, padding):
+    return (
+        (KD, KH, KW) == (3, 5, 5)
+        and tuple(padding) == (0, 2, 2)
+        and H_out > 0
+        and W_out % 16 == 0
+    )
+
+
+def _packed_dot_arch_supported(dtype):
+    arch = amdgpu_arch().split(":", 1)[0]
+    dtype_name = _dtype_name(dtype)
+    if dtype_name == "float16":
+        return arch in _PACKED_DOT_FP16_ARCHS
+    if dtype_name == "bfloat16":
+        return arch in _PACKED_DOT_BF16_ARCHS
+    return False
+
+
+def _packed_dot_supported(KD, KH, KW, H_out, W_out, padding, dtype):
+    return _packed_dot_shape_supported(KD, KH, KW, H_out, W_out, padding) and _packed_dot_arch_supported(dtype)
+
+
+def _resolve_hip_impl(hip_impl, KD, KH, KW, H_out, W_out, padding, dtype):
+    shape_supported = _packed_dot_shape_supported(KD, KH, KW, H_out, W_out, padding)
+    packed_supported = _packed_dot_supported(KD, KH, KW, H_out, W_out, padding, dtype)
+    if hip_impl == "auto":
+        return "packed" if packed_supported else "sgb"
+    if hip_impl not in _DEPTHWISE_HIP_KERNELS:
+        choices = ", ".join(["auto", *_DEPTHWISE_HIP_KERNELS])
+        raise ValueError(f"unsupported depthwise HIP implementation {hip_impl!r}; choose from {choices}")
+    if hip_impl == "packed":
+        if not shape_supported:
+            raise ValueError(
+                "packed depthwise Conv3D requires kernel 3x5x5, "
+                "padding (0,2,2), and an output width divisible by 16"
+            )
+        if not _packed_dot_arch_supported(dtype):
+            arch = amdgpu_arch().split(":", 1)[0]
+            dtype_name = _dtype_name(dtype)
+            if dtype_name == "bfloat16":
+                raise ValueError(
+                    f"packed depthwise Conv3D BF16 is not supported on {arch}; "
+                    "use hip_impl='sgb' or 'auto'"
+                )
+            raise ValueError(
+                f"packed depthwise Conv3D is not supported on {arch} for dtype {dtype_name}; "
+                "use hip_impl='sgb' or 'auto'"
+            )
+    return hip_impl
 
 # https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.conv3d.html
 def conv_depthwise_3d(input, weight, bias,
@@ -13,7 +80,7 @@ def conv_depthwise_3d(input, weight, bias,
                     dilation,
                     groups,
                     method = None,
-                    hip_impl = "sgb"):
+                    hip_impl = "auto"):
     for s in stride: assert s == 1, s
     for d in dilation: assert d == 1, d
 
@@ -43,11 +110,10 @@ def conv_depthwise_3d(input, weight, bias,
         method = "hip"
 
     if method == "hip":
-        hip_cpp = (
-            "conv_depthwise3d_hip.cpp"
-            if hip_impl == "original"
-            else "conv_depthwise3d_hip_sgb.cpp"
+        resolved_hip_impl = _resolve_hip_impl(
+            hip_impl, KD, KH, KW, H_out, W_out, padding, input.dtype
         )
+        hip_cpp = _DEPTHWISE_HIP_KERNELS[resolved_hip_impl]
         pyhip.module(hip_cpp, "-O2").conv_depthwise3d_hip(
             [B, C_out, D_out], [256],
             input.data_ptr(),
