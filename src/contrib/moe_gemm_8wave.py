@@ -767,7 +767,7 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
 
 @jit(with_debug_log=False)
 def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
-                        NUM_EXPERTS, OC, IC,
+                        NUM_EXPERTS, OC, IC, num_oc_splits,
                         gate_up, bpreshuffle, TOPK,
                         sorted_ids:"uint*",
                         sorted_weights:"float*",
@@ -781,6 +781,9 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
     assert AB_dtype in ["fp8", "bf16"]
     assert C_dtype == "bf16"
 
+    assert (OC % num_oc_splits) == 0, f"{OC=} {num_oc_splits=}"
+    OC = OC // num_oc_splits
+
     assert gate_up == False
     num_warps = 8
     stride_k = IC * J.sizeof(AB_dtype)
@@ -790,8 +793,32 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
     # there is no share of mfma_A matrix, each warp loads directly their own part from VMEM
 
     # load expert_id
-    blk_n = J.blockIdx.x # split along OC
+    blk_oc = J.blockIdx.x # split along OC
     blk_m = J.blockIdx.y #; blk_m[0] *= 0
+
+    # num_oc_splits*num_e_blocks
+    blk_id = J.blockIdx.x
+    
+    # 
+
+    # 根据硬件scheduler的设计还原当前block分配到device上的具体CU/SE/XCD
+    # 
+    if 0:
+        NUM_XCD = 8
+        SE_PER_XCD = 4
+        CU_PER_SE = 8
+        CU_PER_XCD = (SE_PER_XCD * CU_PER_SE) # 32
+        NUM_CU = (NUM_XCD * SE_PER_XCD * CU_PER_SE)
+        xcd_id = J.gpr(blk_id % NUM_XCD)
+        se_id = J.gpr((blk_id // NUM_XCD) % SE_PER_XCD)
+        cu_id = J.gpr((blk_id // (NUM_XCD * SE_PER_XCD)) % CU_PER_SE)
+        round_id = J.gpr((blk_id // NUM_CU))
+        blk_id = J.gpr(round_id * NUM_CU + cu_id + se_id * CU_PER_SE + xcd_id * CU_PER_XCD)
+    
+    blk_oc = J.gpr(blk_id % num_oc_splits)
+    blk_m = J.gpr(blk_id // num_oc_splits)
+    
+
     expert_id = J.gpr(1, 'su32')
     J.s_load_dword(expert_id, sorted_expert_ids, blk_m[0] * J.sizeof_u32)
     max_id = J.gpr(1, 'su32')
@@ -865,9 +892,11 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
     vm_load_voff = J.gpr("vu32", J.threadIdx.x[0] * J.sizeof_DW4)
     lds_warp_off = J.gpr("su32", J.warp_id[0] * (64*J.sizeof_DW4))
 
-    weight[:] += expert_id * (OC * stride_k)
+    weight[:] += expert_id * (num_oc_splits * OC * stride_k)
+    if num_oc_splits > 1:
+        weight[:] += blk_oc * OC * stride_k
     buff_b = J.Buffer(weight, OC * stride_k)
-    
+
     def vm_load_B(lds, vm_offset):
         J.s_mov_b32("m0", lds_warp_off + lds)
         voff = J.gpr("vu32", vm_load_voff + vm_offset)
@@ -940,7 +969,10 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
 
         # since IC is small, load all B scales into LDS: 
         sizeof_scaleB = J.div(OC, scale_BN) * J.div(IC, scale_BK) * J.sizeof_f32
-        pScaleB[:] += expert_id * sizeof_scaleB
+        pScaleB[:] += expert_id * num_oc_splits * sizeof_scaleB
+        if num_oc_splits > 1:
+            pScaleB[:] += blk_oc * sizeof_scaleB
+
         lds_scaleB = J.alloc_lds(sizeof_scaleB)
         J.wg_load_lds(lds_scaleB, pScaleB, sizeof_scaleB, num_warps, wait_barrier = True)
 
@@ -1010,7 +1042,7 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
                     J.v_permlane16_swap_b32(mfma_C_bf16[m,n,1], mfma_C_bf16[m,n,3])
 
     # prepare output offsets
-    stride_c = OC * J.sizeof(C_dtype)
+    stride_c = num_oc_splits * OC * J.sizeof(C_dtype)
     buff_c = J.Buffer(output, num_token_topks * stride_c)
     vaddr_rows = J.gpr(nrM, 2, "vu32")
     for m in range(nrM):
@@ -1019,12 +1051,13 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
             J.v_lshl_add_u64(vaddr_rows[m], output, 0, vaddr_rows[m])
             col = (J.lane_id // 16)
             swap_12_col = (col & 1) * 2 + (col >> 1)
-            J.v_lshl_add_u64(vaddr_rows[m], J.gpr(2, "vu32", swap_12_col*J.sizeof_DW4, 0), 0, vaddr_rows[m])
+            J.v_lshl_add_u64(vaddr_rows[m], J.gpr(2, "vu32", swap_12_col*J.sizeof_DW4 + blk_oc * OC * J.sizeof(C_dtype), 0), 0, vaddr_rows[m])
         else:
             row_off = vrows[m] * stride_c
             col = (J.lane_id // 16)
             swap_12_col = (col & 1) * 2 + (col >> 1)
             vaddr_rows[m,0] = row_off + swap_12_col * J.sizeof_DW4
+            vaddr_rows[m,0] += J.gpr("su32", blk_oc * OC * J.sizeof(C_dtype))
 
     num_vm_stores = nrM * (nrN//2)
     def storeC(block_n):

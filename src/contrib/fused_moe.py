@@ -53,6 +53,9 @@ num_local_tokens:
 先实现bf16-8wave版本，降低复杂度，保证一些基本逻辑正确性
 """
 
+# 获取当前设备的属性
+num_CU = torch.cuda.get_device_properties().multi_processor_count
+
 def moe_sorting_ref(topk_ids,       # [num_tokens, topk]
                     topk_weights,   # [num_tokens, topk]
                     num_experts,    # number of global experts
@@ -494,10 +497,24 @@ def fused_moe(
             #sorted_expert_ids[...] = 0
             if inter_dim <= 256 and w2_is_shuffled:
                 #moe_gemm_down_tp([1, num_e_blocks], [4*64],
-                moe_gemm_8wave_down([1, num_e_blocks], [8*64],
+                """
+                为了降低wave调度的tail效应，有效num_e_blocks不够多时需要在oc方向切分增加workgroup个数
+                """
+                est_tokens_per_expert = (token_num * topk // E) 
+                est_blocks_per_expert = (est_tokens_per_expert + block_size_M - 1) // block_size_M
+                est_num_workgroups = est_blocks_per_expert * E
+                est_tail_workgroups = est_num_workgroups % num_CU
+                est_tail_wasted_ratio = (num_CU - est_tail_workgroups) / est_num_workgroups if est_tail_workgroups > 0 else 0
+
+                if est_tail_wasted_ratio > 0.3:
+                    print(f">>>>>> Estimated tail wasted ratio is high: ({est_tail_wasted_ratio}) {est_num_workgroups} {num_CU}")
+                    num_oc_splits = 4
+                else:
+                    num_oc_splits = 1
+                moe_gemm_8wave_down([num_oc_splits* num_e_blocks], [8*64],
                                 stage2_out.element_size() * stage2_out.numel() > (1<<32),
                                 AB_dtype, wg_M, 64,
-                                E, model_dim, inter_dim, 
+                                E, model_dim, inter_dim, num_oc_splits,
                                 False, w2_is_shuffled, topk,
                                 sorted_ids.data_ptr(),
                                 sorted_weights.data_ptr(),
@@ -562,15 +579,19 @@ def fused_moe(
                                     stage2_out.data_ptr(),
                                     token_num, num_oc_blocks * num_e_blocks) # num_local_tokens.data_ptr() ?
 
-        if 1:
-            moe_out = stage2_out.sum(dim=1)
-        else:
-            num_WG = 256 * 2
-            num_tokens_wg = token_num // num_WG
-            num_extra_tokens = token_num % num_WG
-            moe_gemm_final_reduce_bf16([num_WG], [64], topk, model_dim,
-                                    stage2_out.data_ptr(),
-                                    moe_out.data_ptr(),
-                                    num_tokens_wg, num_extra_tokens, token_num)
+        if do_perf:
+            rw_bytes = moe_out.numel() * moe_out.element_size() + stage2_out.numel()*stage2_out.element_size()
+            flops = 0
+        with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(flops=flops, rw_bytes=rw_bytes, name="sum             "):
+            if 1:
+                moe_out = stage2_out.sum(dim=1)
+            else:
+                num_WG = 256 * 2
+                num_tokens_wg = token_num // num_WG
+                num_extra_tokens = token_num % num_WG
+                moe_gemm_final_reduce_bf16([num_WG], [64], topk, model_dim,
+                                        stage2_out.data_ptr(),
+                                        moe_out.data_ptr(),
+                                        num_tokens_wg, num_extra_tokens, token_num)
 
     return moe_out
