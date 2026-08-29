@@ -143,13 +143,18 @@ def compile_gemm_fp8(
 
     get_pids_950 = ASTRewriter.transform(_get_pids_950)
 
-    # A padding（对标 bf16 v9 / gluon a8w8 kWidth=16 单 padding [[1024,32]]：每 8 行 pad 32 fp8=32B）
+    # A 的 16-row footprint 固定为 2112 B。A8W8 使用 [[1024,16],[2048,32]]；
+    # Hybrid 的 MFMA K permutation 改变 lane-to-K 映射，使用等容量的 [[1024,32]]。
     A_PAD = 32
     A_GROUP = 8 * BLOCK_K + A_PAD  # 1056
+    a_group8 = 8 * BLOCK_K + (A_PAD if b_mxfp4 else 16)
+    a_group16 = 2 * A_GROUP
     a_lds_elems = (BLOCK_M // 8) * A_GROUP  # 16*1056 = 16896
     if b_mxfp4 and not lds_swizzle:
-        # 16x128 logical FP4 values followed by 128 logical FP4 values (64 B).
-        b_lds_elems = (BLOCK_N // 16) * (16 * BLOCK_K + 128)
+        # Dual padding in logical FP4 elements: [[512, 128], [2048, 64]].
+        b_group4 = 4 * BLOCK_K + 128
+        b_group16 = 4 * b_group4 + 64
+        b_lds_elems = (BLOCK_N // 16) * b_group16
     else:
         b_lds_elems = BLOCK_N * BLOCK_K if b_mxfp4 else (BLOCK_N // 8) * A_GROUP
     scale_lds_bytes = 128 * 8
@@ -428,15 +433,15 @@ def compile_gemm_fp8(
             )
             dma = fx.make_tiled_copy(buffer_copy_atom, _g2s_tv, _g2s_tile).get_slice(tid)
         else:
-            # A: fp8 kWidth=32 双层 padding（对标 gemm_4wave_950：[[1024,16],[2048,32]]），
-            # 消除 MFMA_Scale A operand 读的 LDS bank conflict（单层 [[1024,32]] 无法清零）。
+            # A8W8 与 Hybrid 的 MFMA K permutation 不同，分别需要 1040 B 和
+            # 1056 B 的 8-row stride；两者的 16-row stride 均为 2112 B。
             _wr = fx.make_layout(
                 ((8, 2, BLOCK_M // 16), BLOCK_K),
-                ((BLOCK_K, 8 * BLOCK_K + 16, 2 * (8 * BLOCK_K + 16) + 32), 1),
+                ((BLOCK_K, a_group8, a_group16), 1),
             )
             _rd = fx.make_layout(
                 ((2, BLOCK_M // 16, 8), (32, BLOCK_K // 32)),
-                ((8 * BLOCK_K + 16, 2 * (8 * BLOCK_K + 16) + 32, BLOCK_K), (1, 32)),
+                ((a_group8, a_group16, BLOCK_K), (1, 32)),
             )
             _a_dma_tv = fx.make_layout(
                 ((8, 8, 4), elements_per_128b),
@@ -455,10 +460,13 @@ def compile_gemm_fp8(
                 _rd_b = fx.make_composed_layout(_swl_b, _wr_b)
             else:
                 _wr_b = fx.make_layout(
-                    ((16, BLOCK_N // 16), BLOCK_K),
-                    ((BLOCK_K, 16 * BLOCK_K + 128), 1),
+                    ((4, 4, BLOCK_N // 16), BLOCK_K),
+                    ((BLOCK_K, b_group4, b_group16), 1),
                 )
-                _rd_b = _wr_b
+                _rd_b = fx.make_layout(
+                    ((2, 8, 4, 2), BLOCK_K),
+                    ((2 * b_group4, b_group16, BLOCK_K, b_group4), 1),
+                )
         if const_expr(preshuffle_b):
             _b_lds = fx.make_layout(((16, BLOCK_N // 16), (16, BLOCK_K // 16)), ((16, 2048), (1, 256)))
             _wr_b = _b_lds
@@ -504,30 +512,48 @@ def compile_gemm_fp8(
                     chunk = wave_id + copy_round * 4
                     row = chunk * 16 + lane_id // 4
                     col_byte = (lane_id % 4) * 16
-                    lds_byte = chunk * ((16 * BLOCK_K + 128) // 2)
-                global_row = row_tile * BLOCK_N + row
+                if const_expr(lds_swizzle):
+                    global_row = row_tile * BLOCK_N + row
+                else:
+                    # Inverse of the S2R row permutation: eight consecutive LDS
+                    # rows come from global rows spaced 16 apart.
+                    global_row = row_tile * BLOCK_N + (row % 8) * 16 + row // 8
                 global_col_byte = kk * (BLOCK_K // 2) + col_byte
                 global_byte = global_row * (K // 2) + global_col_byte
                 lds_root = _fly.extract_aligned_pointer_as_index(
                     ir.Type.parse("!llvm.ptr<3>"),
                     arith._to_raw(fx.make_view(ptr, fx.make_layout(1, 1))),
                 )
-                lds_ptr = fx.buffer_ops.get_element_ptr(
-                    lds_root,
-                    byte_offset=fx.Int32(
-                        rocdl.readfirstlane(T.i32, arith._to_raw(lds_byte))
-                    ),
-                    elem_type=T.i8,
-                )
-                rocdl.raw_ptr_buffer_load_lds(
-                    b_mxfp4_rsrc,
-                    lds_ptr,
-                    fx.Int32(16),
-                    fx.Int32(global_byte),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                )
+                if const_expr(lds_swizzle):
+                    lds_ptr = fx.buffer_ops.get_element_ptr(
+                        lds_root,
+                        byte_offset=fx.Int32(
+                            rocdl.readfirstlane(T.i32, arith._to_raw(lds_byte))
+                        ),
+                        elem_type=T.i8,
+                    )
+                    rocdl.raw_ptr_buffer_load_lds(
+                        b_mxfp4_rsrc, lds_ptr, fx.Int32(16), fx.Int32(global_byte),
+                        fx.Int32(0), fx.Int32(0), fx.Int32(0),
+                    )
+                else:
+                    lane_group = lane_id // 16
+                    for group in range_constexpr(4):
+                        if lane_group == group:
+                            # The intrinsic adds lane_id * 16 to m0. Offset m0 so
+                            # each 16-lane subgroup starts after its 4-row padding.
+                            rocdl.raw_ptr_buffer_load_lds(
+                                b_mxfp4_rsrc,
+                                fx.buffer_ops.get_element_ptr(
+                                    lds_root,
+                                    byte_offset=fx.Int32(
+                                        chunk * (b_group16 // 2) + group * 64
+                                    ),
+                                    elem_type=T.i8,
+                                ),
+                                fx.Int32(16), fx.Int32(global_byte),
+                                fx.Int32(0), fx.Int32(0), fx.Int32(0),
+                            )
 
         aT_g = dma.partition_S(bA_t)
         aB_g = dma.partition_S(bA_b)
@@ -549,7 +575,7 @@ def compile_gemm_fp8(
             wave_id = tid // 64
             wave_id_uni = fx.Int32(rocdl.readfirstlane(T.i32, arith._to_raw(wave_id)))
             lane_voffset = fx.Int32((lane_id // 8) * 16 * K + (lane_id % 8) * 16)
-            wave_lds_base = (wave_id_uni % 2) * (8 * BLOCK_K + 16) + (wave_id_uni // 2) * A_GROUP * 2
+            wave_lds_base = (wave_id_uni % 2) * a_group8 + (wave_id_uni // 2) * a_group16
 
             def make_dma_ptr(ptr, copy_round):
                 view = fx.make_view(ptr, fx.make_layout(1, 1))
@@ -620,9 +646,15 @@ def compile_gemm_fp8(
                         lds_byte = (row // 8) * 512 + (row % 8) * 16 + (col_byte // 16) * 128
                         lds_byte = lds_byte ^ (((lds_byte >> 7) & 7) << 4)
                     else:
+                        row0 = row % 2
+                        row1 = (row // 2) % 8
+                        row2 = (row // 16) % 4
+                        row3 = row // 64
                         lds_byte = (
-                            (row // 16) * ((16 * BLOCK_K + 128) // 2)
-                            + (row % 16) * (BLOCK_K // 2)
+                            row0 * b_group4
+                            + row1 * (b_group16 // 2)
+                            + row2 * (BLOCK_K // 2)
+                            + row3 * (b_group4 // 2)
                             + col_byte
                         )
                     ptr = fx.add_offset(
