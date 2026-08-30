@@ -1,0 +1,10 @@
+1， 调整当前swizzle方案， 确保mxfp8, hybrid mxfp4都没有bank conflict, 先保证 non scale没有bank conflict.
+     状态：进行中。
+     - non-scale A8W8 已完成：参考 fp8_gemm_4wave，使用 FlyDSL SwizzleType S<3,4,4>，并将 S2R TiledCopy 调整为相同的 lane/value 坐标。
+     - 验证：M=N=K=512 正确性通过；SQ_LDS_BANK_CONFLICT=0，SQ_LDS_ADDR_CONFLICT=0，SQ_LDS_IDX_ACTIVE=8192。
+     - non-scale Hybrid MXFP4 待处理。
+2.  当前swizzleK必须是2的幂才可以应用，一定要有这个限制吗，比如说K=10240就无法应用当前的方A, B 读取的方案的，尝试解决这个问题。
+3.  那更改mxfp4的padding方案吧，确保2048个连续元素可以通过dma一次额写入，只能在2048的整数倍元素上做padding, 需要允许一部分mxfp4 B 的bank conflict, 尝试不同的padding 方案，找到perf 最好的，比mxfp8要高,代码
+     单独生成branch,
+4.  3完成后，由于主循环以一次unroll两次，所以可以一次读入256个K， 这个可以参考 /mywork/gfx950-gluon-tutorials/kernels/gemm/intra_wave/a4w4的读取方式，把256个K的读取在第一个128K 中读取到LDS， 这样unroll的第二个128B的pipeline
+    就不需要dma copy B into LDS,但是这个只是一种假设，可能与LDS pingpong算法冲突，重新建立一个branch,尝试把。

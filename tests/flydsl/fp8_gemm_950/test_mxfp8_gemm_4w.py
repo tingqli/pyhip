@@ -110,6 +110,12 @@ def compile_gemm_fp8(
     b_element_type = fx.Float4E2M1FN if b_mxfp4 else element_type
     elements_per_128b = 16  # 128bit / fp8(8bit)
     b_elements_per_128b = 32 if b_mxfp4 else elements_per_128b
+    if b_mxfp4:
+        swizzle_a_specs = ((3, 4, 3),)
+        swizzle_b_specs = ((3, 5, 2),)
+    else:
+        swizzle_a_specs = ((3, 4, 4),)
+        swizzle_b_specs = swizzle_a_specs
     # sched_group_barrier 精确调度（对标 bf16 hot_loop_scheduler_mainloop）：
     # fp8 每象限一条 MFMA(16x16x128) 抵 bf16 两条(16x16x32)，故 MFMA 计数减半（32->16）；
     # ds_read/vmem 计数不变（数据量一致）。仅在完整流水迭代（同时有 s2r+g2s）时应用。
@@ -147,7 +153,7 @@ def compile_gemm_fp8(
     # Hybrid 的 MFMA K permutation 改变 lane-to-K 映射，使用等容量的 [[1024,32]]。
     A_PAD = 32
     A_GROUP = 8 * BLOCK_K + A_PAD  # 1056
-    a_group8 = 8 * BLOCK_K + (A_PAD if b_mxfp4 else 16)
+    a_group8 = 8 * BLOCK_K + (A_PAD if with_scale or b_mxfp4 else 16)
     a_group16 = 2 * A_GROUP
     a_lds_elems = (BLOCK_M // 8) * A_GROUP  # 16*1056 = 16896
     if b_mxfp4 and not lds_swizzle:
@@ -252,15 +258,23 @@ def compile_gemm_fp8(
         bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 1, None]
         bB_l = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y * 2 + 0, None]
         bB_r = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y * 2 + 1, None]
+
         # A/B 全局 tile 视图：swizzle 版（全局 swizzle）或 padding 版（分组）。
         if const_expr(lds_swizzle):
-            _swg_a = fx.static(fx.SwizzleType.get(3, 4, K.bit_length() - 1 - 4))
-            _swg_b_base = 5 if b_mxfp4 else 4
-            _swg_b = fx.static(fx.SwizzleType.get(3, _swg_b_base, K.bit_length() - 1 - _swg_b_base))
-            bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), fx.make_composed_layout(_swg_a, fx.get_layout(bA_t))))
-            bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), fx.make_composed_layout(_swg_a, fx.get_layout(bA_b))))
-            bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), fx.make_composed_layout(_swg_b, fx.get_layout(bB_l))))
-            bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), fx.make_composed_layout(_swg_b, fx.get_layout(bB_r))))
+            stride_shift = K.bit_length() - BLOCK_K.bit_length()
+
+            def apply_swizzles(layout, specs, shift_adjust=0):
+                for mask, base, shift in specs:
+                    swizzle = fx.static(
+                        fx.SwizzleType.get(mask, base, shift + shift_adjust)
+                    )
+                    layout = fx.make_composed_layout(swizzle, layout)
+                return layout
+
+            bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), apply_swizzles(fx.get_layout(bA_t), swizzle_a_specs, stride_shift)))
+            bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), apply_swizzles(fx.get_layout(bA_b), swizzle_a_specs, stride_shift)))
+            bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), apply_swizzles(fx.get_layout(bB_l), swizzle_b_specs, stride_shift)))
+            bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), apply_swizzles(fx.get_layout(bB_r), swizzle_b_specs, stride_shift)))
         else:
             # A: 分组全局视图（每 8 行为一组，映射到 padding LDS 的行组），对标 bf16 v9 bA_layout。
             a_grouped = fx.make_layout(
@@ -424,9 +438,8 @@ def compile_gemm_fp8(
         # wr/rd LDS 布局 + DMA tiled copy：swizzle 版（ordered wr + swizzle rd + make_layout_tv DMA）
         # 或 padding 版（分组 wr/rd + 专用 a_dma）。A/B 共用同一 dma。
         if const_expr(lds_swizzle):
-            _swl = fx.static(fx.SwizzleType.get(3, 4, BLOCK_K.bit_length() - 1 - 4))
             _wr = fx.make_ordered_layout((BLOCK_M, BLOCK_K), (1, 0))
-            _rd = fx.make_composed_layout(_swl, _wr)
+            _rd = apply_swizzles(_wr, swizzle_a_specs)
             _g2s_tile, _g2s_tv = fx.make_layout_tv(
                 fx.make_layout((8 * 4, 8), (8, 1)),
                 fx.make_layout((1, elements_per_128b), (1, 1)),
@@ -453,12 +466,11 @@ def compile_gemm_fp8(
         # 否则沿用与 A 相同的 _wr/_rd。仅 CORRECTNESS 需 subB 正确 + LDS 为任意双射；DMA tv 只影响性能。
         _wr_b = _wr
         _rd_b = _rd
+        if const_expr(lds_swizzle):
+            _wr_b = fx.make_ordered_layout((BLOCK_N, BLOCK_K), (1, 0))
+            _rd_b = apply_swizzles(_wr_b, swizzle_b_specs)
         if const_expr(b_mxfp4):
-            if const_expr(lds_swizzle):
-                _swl_b = fx.static(fx.SwizzleType.get(3, 5, BLOCK_K.bit_length() - 1 - 5))
-                _wr_b = fx.make_ordered_layout((BLOCK_N, BLOCK_K), (1, 0))
-                _rd_b = fx.make_composed_layout(_swl_b, _wr_b)
-            else:
+            if const_expr(not lds_swizzle):
                 _wr_b = fx.make_layout(
                     ((4, 4, BLOCK_N // 16), BLOCK_K),
                     ((BLOCK_K, b_group4, b_group16), 1),
@@ -605,8 +617,34 @@ def compile_gemm_fp8(
 
         # ---- LDS -> reg（对标 gemm_v9：A 走 B-operand，B 走 A-operand；均 padding rd）----
         # 每个 slice 只有一份寄存器 fragment（无寄存器双缓冲），双缓冲仅在 LDS 层（buf0/buf1）。
-        copy_a = fx.make_tiled_copy_B(lds_copy_atom, tiled_mma).get_slice(tid)
-        copy_b = fx.make_tiled_copy_A(lds_copy_atom_b, tiled_mma).get_slice(tid)
+        if const_expr(lds_swizzle and not b_mxfp4):
+            # Match fp8_gemm_4wave's conflict-free S2R coordinates:
+            # row = lane%16 + tile*16, col = lane//16*16 + half*64.
+            s2r_value = (16, 2)
+            copy_a_tv = fx.make_layout(
+                ((16, 4, 2, 2), s2r_value),
+                (
+                    (1, 32 * 16, 0, 16),
+                    (32, 32 * 64),
+                ),
+            )
+            copy_b_tv = fx.make_layout(
+                ((16, 4, 2, 2), s2r_value),
+                (
+                    (1, 32 * 16, 16, 0),
+                    (32, 32 * 64),
+                ),
+            )
+            operand_tile = fx.make_tile(32, BLOCK_K)
+            copy_a = fx.make_tiled_copy(
+                lds_copy_atom, copy_a_tv, operand_tile
+            ).get_slice(tid)
+            copy_b = fx.make_tiled_copy(
+                lds_copy_atom_b, copy_b_tv, operand_tile
+            ).get_slice(tid)
+        else:
+            copy_a = fx.make_tiled_copy_B(lds_copy_atom, tiled_mma).get_slice(tid)
+            copy_b = fx.make_tiled_copy_A(lds_copy_atom_b, tiled_mma).get_slice(tid)
         # s2r 源：LDS buf0 / buf1（对标 gemm_v9 的 s2r_src0_* / s2r_src1_*）
         s2r_src0_A_t = copy_a.partition_S(sA_t_rd[0])
         s2r_src0_A_b = copy_a.partition_S(sA_b_rd[0])
@@ -633,6 +671,9 @@ def compile_gemm_fp8(
         if const_expr(not b_mxfp4):
             dest_frag_B_l = copy_b.retile(frag_B_l)
             dest_frag_B_r = copy_b.retile(frag_B_r)
+
+        def load_a(src_partition, dst_partition):
+            fx.copy(lds_copy_atom, src_partition, dst_partition, pred=None)
 
         def load_b(src, src_partition, dst, dst_partition):
             if const_expr(b_mxfp4):
@@ -769,7 +810,7 @@ def compile_gemm_fp8(
         do_g2s(1, 1)
         waitvmcnt_barrier(vmcnt_per_phase * 6)
         load_b(sB_l_rd[0], s2r_src0_B_l, frag_B_l, dest_frag_B_l)
-        fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
+        load_a(s2r_src0_A_t, dest_frag_A_t)
         if const_expr(with_scale):
             fx.copy(scale_lds_copy_atom, scale_b_l_src[0], scale_b_l_frag)
             fx.copy(scale_lds_copy_atom, scale_a_t_src[0], scale_a_t_frag)
@@ -797,7 +838,6 @@ def compile_gemm_fp8(
         # 运行时循环（range + init/yield 累加器透传），不做常量展开。
         
         for kidx, states in range(0, num_tiles - 2, 2, init=acc_init):
-        # for kiter in const_expr.range(0, K // BLOCK_K - 2, 2):
             frag_C_tl.store(states[0])
             frag_C_tr.store(states[1])
             frag_C_bl.store(states[2])
@@ -807,7 +847,7 @@ def compile_gemm_fp8(
             # ---- k-tile = buf0：4 象限 ----
             do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
             waitvmcnt_barrier(vmcnt_per_phase * 5)
-            fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
+            load_a(s2r_src0_A_b, dest_frag_A_b)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_b_src[0], scale_a_b_frag)
             if const_expr(b_mxfp4):
@@ -851,7 +891,7 @@ def compile_gemm_fp8(
 
             do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
             waitvmcnt_barrier(vmcnt_per_phase * 5)
-            fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
+            load_a(s2r_src1_A_t, dest_frag_A_t)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
             if const_expr(b_mxfp4):
@@ -868,7 +908,7 @@ def compile_gemm_fp8(
             # ---- k-tile = buf1：4 象限 ----
             do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
             waitvmcnt_barrier(vmcnt_per_phase * 5)
-            fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
+            load_a(s2r_src1_A_b, dest_frag_A_b)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
             if const_expr(b_mxfp4):
@@ -912,7 +952,7 @@ def compile_gemm_fp8(
 
             do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
             waitvmcnt_barrier(vmcnt_per_phase * 5)
-            fx.copy(lds_copy_atom, s2r_src0_A_t, dest_frag_A_t, pred=None)
+            load_a(s2r_src0_A_t, dest_frag_A_t)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_t_src[0], scale_a_t_frag)
             if const_expr(b_mxfp4):
@@ -936,7 +976,7 @@ def compile_gemm_fp8(
         # buf0 的 4 象限
         waitvmcnt_barrier(vmcnt_per_phase * 5)
         do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
-        fx.copy(lds_copy_atom, s2r_src0_A_b, dest_frag_A_b, pred=None)
+        load_a(s2r_src0_A_b, dest_frag_A_b)
         if const_expr(with_scale):
             fx.copy(scale_lds_copy_atom, scale_a_b_src[0], scale_a_b_frag)
         hot_loop_scheduler_mainloop(0, 0, 8 + int(with_scale))
@@ -960,7 +1000,7 @@ def compile_gemm_fp8(
 
         waitvmcnt_barrier(vmcnt_per_phase * 2)
         do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
-        fx.copy(lds_copy_atom, s2r_src1_A_t, dest_frag_A_t, pred=None)
+        load_a(s2r_src1_A_t, dest_frag_A_t)
         if const_expr(with_scale):
             fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
         hot_loop_scheduler_mainloop(3, 0, 8 + int(with_scale))
@@ -1067,7 +1107,7 @@ def compile_gemm_fp8(
         if const_expr(store_overlap):
             waitvmcnt_barrier(vmcnt_per_phase * 1)
             do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
-            fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
+            load_a(s2r_src1_A_b, dest_frag_A_b)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
             hot_loop_scheduler_mainloop(4, 0, 8 + int(with_scale))
@@ -1100,7 +1140,7 @@ def compile_gemm_fp8(
         else:
             waitvmcnt_barrier(vmcnt_per_phase)
             do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
-            fx.copy(lds_copy_atom, s2r_src1_A_b, dest_frag_A_b, pred=None)
+            load_a(s2r_src1_A_b, dest_frag_A_b)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
             hot_loop_scheduler_mainloop(4, 0, 8 + int(with_scale))
