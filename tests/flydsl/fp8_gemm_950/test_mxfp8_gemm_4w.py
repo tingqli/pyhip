@@ -112,7 +112,7 @@ def compile_gemm_fp8(
     b_elements_per_128b = 32 if b_mxfp4 else elements_per_128b
     if b_mxfp4:
         swizzle_a_specs = ((3, 4, 3),)
-        swizzle_b_specs = ((3, 5, 2),)
+        swizzle_b_specs = ((1, 5, 2),)
     else:
         swizzle_a_specs = ((3, 4, 4),)
         swizzle_b_specs = swizzle_a_specs
@@ -516,7 +516,7 @@ def compile_gemm_fp8(
                 wave_id = tid // 64
                 if const_expr(lds_swizzle):
                     physical_slot = tid + copy_round * 256
-                    logical_slot = physical_slot ^ ((physical_slot >> 3) & 7)
+                    logical_slot = physical_slot ^ ((physical_slot >> 3) & 1)
                     row = (logical_slot // 32) * 8 + logical_slot % 8
                     col_byte = ((logical_slot % 32) // 8) * 16
                     lds_byte = (wave_id * 64 + copy_round * 256) * 16
@@ -685,7 +685,7 @@ def compile_gemm_fp8(
                     col_byte = (lane_id // 16) * 16
                     if const_expr(lds_swizzle):
                         lds_byte = (row // 8) * 512 + (row % 8) * 16 + (col_byte // 16) * 128
-                        lds_byte = lds_byte ^ (((lds_byte >> 7) & 7) << 4)
+                        lds_byte = lds_byte ^ (((lds_byte >> 7) & 1) << 4)
                     else:
                         row0 = row % 2
                         row1 = (row // 2) % 8

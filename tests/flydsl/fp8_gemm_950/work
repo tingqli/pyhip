@@ -1,8 +1,9 @@
 1， 调整当前swizzle方案， 确保mxfp8, hybrid mxfp4都没有bank conflict, 先保证 non scale没有bank conflict.
-     状态：进行中。
+     状态：non-scale 已完成。
      - non-scale A8W8 已完成：参考 fp8_gemm_4wave，使用 FlyDSL SwizzleType S<3,4,4>，并将 S2R TiledCopy 调整为相同的 lane/value 坐标。
      - 验证：M=N=K=512 正确性通过；SQ_LDS_BANK_CONFLICT=0，SQ_LDS_ADDR_CONFLICT=0，SQ_LDS_IDX_ACTIVE=8192。
-     - non-scale Hybrid MXFP4 待处理。
+     - non-scale Hybrid MXFP4 已完成：B 使用 FlyDSL SwizzleType S<1,5,2>，raw G2S 和显式 S2R 使用相同的一位 16-byte slot XOR。
+     - 验证：M=N=K=512 正确性通过；SQ_LDS_BANK_CONFLICT=0，SQ_LDS_ADDR_CONFLICT=0，SQ_LDS_IDX_ACTIVE=6144。
 2.  当前swizzleK必须是2的幂才可以应用，一定要有这个限制吗，比如说K=10240就无法应用当前的方A, B 读取的方案的，尝试解决这个问题。
 3.  那更改mxfp4的padding方案吧，确保2048个连续元素可以通过dma一次额写入，只能在2048的整数倍元素上做padding, 需要允许一部分mxfp4 B 的bank conflict, 尝试不同的padding 方案，找到perf 最好的，比mxfp8要高,代码
      单独生成branch,
