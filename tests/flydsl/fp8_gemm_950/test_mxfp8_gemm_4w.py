@@ -116,6 +116,8 @@ def compile_gemm_fp8(
     else:
         swizzle_a_specs = ((3, 4, 4),)
         swizzle_b_specs = swizzle_a_specs
+    raw_global_swizzle = lds_swizzle and (K & (K - 1)) != 0
+    assert not raw_global_swizzle or not preshuffle_b
     # sched_group_barrier 精确调度（对标 bf16 hot_loop_scheduler_mainloop）：
     # fp8 每象限一条 MFMA(16x16x128) 抵 bf16 两条(16x16x32)，故 MFMA 计数减半（32->16）；
     # ds_read/vmem 计数不变（数据量一致）。仅在完整流水迭代（同时有 s2r+g2s）时应用。
@@ -229,6 +231,13 @@ def compile_gemm_fp8(
                 argB,
                 num_records_bytes=arith._to_raw(fx.Int32(N * K // 2)),
             )
+        if const_expr(raw_global_swizzle):
+            a_swizzle_rsrc = fx.buffer_ops.create_buffer_resource(
+                argA, num_records_bytes=arith._to_raw(fx.Int32(M * K))
+            )
+            b_swizzle_rsrc = fx.buffer_ops.create_buffer_resource(
+                argB, num_records_bytes=arith._to_raw(fx.Int32(N * K))
+            )
 
         if const_expr(with_scale):
             # Host: [rows, G] -> [rows/128, 4, 32, G] -> permute(3, 0, 2, 1).
@@ -261,8 +270,6 @@ def compile_gemm_fp8(
 
         # A/B 全局 tile 视图：swizzle 版（全局 swizzle）或 padding 版（分组）。
         if const_expr(lds_swizzle):
-            stride_shift = K.bit_length() - BLOCK_K.bit_length()
-
             def apply_swizzles(layout, specs, shift_adjust=0):
                 for mask, base, shift in specs:
                     swizzle = fx.static(
@@ -271,10 +278,12 @@ def compile_gemm_fp8(
                     layout = fx.make_composed_layout(swizzle, layout)
                 return layout
 
-            bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), apply_swizzles(fx.get_layout(bA_t), swizzle_a_specs, stride_shift)))
-            bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), apply_swizzles(fx.get_layout(bA_b), swizzle_a_specs, stride_shift)))
-            bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), apply_swizzles(fx.get_layout(bB_l), swizzle_b_specs, stride_shift)))
-            bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), apply_swizzles(fx.get_layout(bB_r), swizzle_b_specs, stride_shift)))
+            if const_expr(not raw_global_swizzle):
+                stride_shift = K.bit_length() - BLOCK_K.bit_length()
+                bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), apply_swizzles(fx.get_layout(bA_t), swizzle_a_specs, stride_shift)))
+                bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), apply_swizzles(fx.get_layout(bA_b), swizzle_a_specs, stride_shift)))
+                bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), apply_swizzles(fx.get_layout(bB_l), swizzle_b_specs, stride_shift)))
+                bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), apply_swizzles(fx.get_layout(bB_r), swizzle_b_specs, stride_shift)))
         else:
             # A: 分组全局视图（每 8 行为一组，映射到 padding LDS 的行组），对标 bf16 v9 bA_layout。
             a_grouped = fx.make_layout(
@@ -509,6 +518,39 @@ def compile_gemm_fp8(
         sB_r_wr = [fx.make_view(lds.b_r0.ptr, _wr_b), fx.make_view(lds.b_r1.ptr, _wr_b)]
         sB_l_rd = [fx.make_view(lds.b_l0.ptr, _rd_b), fx.make_view(lds.b_l1.ptr, _rd_b)]
         sB_r_rd = [fx.make_view(lds.b_r0.ptr, _rd_b), fx.make_view(lds.b_r1.ptr, _rd_b)]
+
+        def raw_fp8_swizzle_g2s(rsrc, kk, ptr, row_tile, specs):
+            mask, _, shift = specs[0]
+            lane_id = tid % 64
+            wave_id = tid // 64
+            lds_root = _fly.extract_aligned_pointer_as_index(
+                ir.Type.parse("!llvm.ptr<3>"),
+                arith._to_raw(fx.make_view(ptr, fx.make_layout(1, 1))),
+            )
+            for copy_round in range_constexpr(4):
+                physical_slot = tid + copy_round * 256
+                logical_slot = physical_slot ^ (
+                    (physical_slot >> shift) & ((1 << mask) - 1)
+                )
+                row = logical_slot // 8
+                col_byte = (logical_slot % 8) * 16
+                global_byte = (
+                    (row_tile * BLOCK_M + row) * K
+                    + kk * BLOCK_K
+                    + col_byte
+                )
+                lds_byte = (wave_id * 64 + copy_round * 256) * 16
+                lds_ptr = fx.buffer_ops.get_element_ptr(
+                    lds_root,
+                    byte_offset=fx.Int32(
+                        rocdl.readfirstlane(T.i32, arith._to_raw(lds_byte))
+                    ),
+                    elem_type=T.i8,
+                )
+                rocdl.raw_ptr_buffer_load_lds(
+                    rsrc, lds_ptr, fx.Int32(16), fx.Int32(global_byte),
+                    fx.Int32(0), fx.Int32(0), fx.Int32(0),
+                )
 
         def raw_b_mxfp4_g2s(kk, ptr, row_tile):
             for copy_round in range_constexpr(2):
@@ -766,6 +808,11 @@ def compile_gemm_fp8(
             ki = fx.Int32(kk)
             if const_expr(b_mxfp4):
                 raw_b_mxfp4_g2s(ki, (lds.b_l0.ptr, lds.b_l1.ptr)[buf], bid_y * 2)
+            elif const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    b_swizzle_rsrc, ki, (lds.b_l0.ptr, lds.b_l1.ptr)[buf],
+                    bid_y * 2, swizzle_b_specs,
+                )
             elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(b_dma_rsrc, ki, b_l_dma_ptrs[buf], bid_y * 2)
             else:
@@ -775,7 +822,12 @@ def compile_gemm_fp8(
                 raw_scale_g2s(scale_b_dma_rsrc, ki, scale_b_l_dma_ptrs[buf], bid_y * 2, scale_n_rows)
                 rocdl.sched_barrier(0)
 
-            if const_expr(not lds_swizzle and not preshuffle_b):
+            if const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    a_swizzle_rsrc, ki, (lds.a_t0.ptr, lds.a_t1.ptr)[buf],
+                    bid_x * 2, swizzle_a_specs,
+                )
+            elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(a_dma_rsrc, ki, a_t_dma_ptrs[buf], bid_x * 2)
             else:
                 fx.copy(async_copy_atom, aT_g[None, None, None, ki], aT_s[buf])
@@ -784,7 +836,12 @@ def compile_gemm_fp8(
                 raw_scale_g2s(scale_a_dma_rsrc, ki, scale_a_t_dma_ptrs[buf], bid_x * 2, scale_m_rows)
                 rocdl.sched_barrier(0)
 
-            if const_expr(not lds_swizzle and not preshuffle_b):
+            if const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    a_swizzle_rsrc, ki, (lds.a_b0.ptr, lds.a_b1.ptr)[buf],
+                    bid_x * 2 + 1, swizzle_a_specs,
+                )
+            elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(a_dma_rsrc, ki, a_b_dma_ptrs[buf], bid_x * 2 + 1)
             else:
                 fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[buf])
@@ -795,6 +852,11 @@ def compile_gemm_fp8(
 
             if const_expr(b_mxfp4):
                 raw_b_mxfp4_g2s(ki, (lds.b_r0.ptr, lds.b_r1.ptr)[buf], bid_y * 2 + 1)
+            elif const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    b_swizzle_rsrc, ki, (lds.b_r0.ptr, lds.b_r1.ptr)[buf],
+                    bid_y * 2 + 1, swizzle_b_specs,
+                )
             elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(b_dma_rsrc, ki, b_r_dma_ptrs[buf], bid_y * 2 + 1)
             else:
@@ -852,6 +914,11 @@ def compile_gemm_fp8(
                 fx.copy(scale_lds_copy_atom, scale_a_b_src[0], scale_a_b_frag)
             if const_expr(b_mxfp4):
                 raw_b_mxfp4_g2s(kiter + 2, lds.b_l0.ptr, bid_y * 2)
+            elif const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    b_swizzle_rsrc, kiter + 2, lds.b_l0.ptr,
+                    bid_y * 2, swizzle_b_specs,
+                )
             elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(b_dma_rsrc, kiter + 2, b_l_dma_ptrs[0], bid_y * 2)
             else:
@@ -866,7 +933,12 @@ def compile_gemm_fp8(
             load_b(sB_r_rd[0], s2r_src0_B_r, frag_B_r, dest_frag_B_r)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_b_r_src[0], scale_b_r_frag)
-            if const_expr(not lds_swizzle and not preshuffle_b):
+            if const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    a_swizzle_rsrc, kiter + 2, lds.a_t0.ptr,
+                    bid_x * 2, swizzle_a_specs,
+                )
+            elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(a_dma_rsrc, kiter + 2, a_t_dma_ptrs[0], bid_x * 2)
             else:
                 fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
@@ -880,7 +952,12 @@ def compile_gemm_fp8(
             load_b(sB_l_rd[1], s2r_src1_B_l, frag_B_l, dest_frag_B_l)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_b_l_src[1], scale_b_l_frag)
-            if const_expr(not lds_swizzle and not preshuffle_b):
+            if const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    a_swizzle_rsrc, kiter + 2, lds.a_b0.ptr,
+                    bid_x * 2 + 1, swizzle_a_specs,
+                )
+            elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(a_dma_rsrc, kiter + 2, a_b_dma_ptrs[0], bid_x * 2 + 1)
             else:
                 fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
@@ -896,6 +973,11 @@ def compile_gemm_fp8(
                 fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
             if const_expr(b_mxfp4):
                 raw_b_mxfp4_g2s(kiter + 2, lds.b_r0.ptr, bid_y * 2 + 1)
+            elif const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    b_swizzle_rsrc, kiter + 2, lds.b_r0.ptr,
+                    bid_y * 2 + 1, swizzle_b_specs,
+                )
             elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(b_dma_rsrc, kiter + 2, b_r_dma_ptrs[0], bid_y * 2 + 1)
             else:
@@ -913,6 +995,11 @@ def compile_gemm_fp8(
                 fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
             if const_expr(b_mxfp4):
                 raw_b_mxfp4_g2s(kiter + 3, lds.b_l1.ptr, bid_y * 2)
+            elif const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    b_swizzle_rsrc, kiter + 3, lds.b_l1.ptr,
+                    bid_y * 2, swizzle_b_specs,
+                )
             elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(b_dma_rsrc, kiter + 3, b_l_dma_ptrs[1], bid_y * 2)
             else:
@@ -927,7 +1014,12 @@ def compile_gemm_fp8(
             load_b(sB_r_rd[1], s2r_src1_B_r, frag_B_r, dest_frag_B_r)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_b_r_src[1], scale_b_r_frag)
-            if const_expr(not lds_swizzle and not preshuffle_b):
+            if const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    a_swizzle_rsrc, kiter + 3, lds.a_t1.ptr,
+                    bid_x * 2, swizzle_a_specs,
+                )
+            elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(a_dma_rsrc, kiter + 3, a_t_dma_ptrs[1], bid_x * 2)
             else:
                 fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
@@ -941,7 +1033,12 @@ def compile_gemm_fp8(
             load_b(sB_l_rd[0], s2r_src0_B_l, frag_B_l, dest_frag_B_l)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_b_l_src[0], scale_b_l_frag)
-            if const_expr(not lds_swizzle and not preshuffle_b):
+            if const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    a_swizzle_rsrc, kiter + 3, lds.a_b1.ptr,
+                    bid_x * 2 + 1, swizzle_a_specs,
+                )
+            elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(a_dma_rsrc, kiter + 3, a_b_dma_ptrs[1], bid_x * 2 + 1)
             else:
                 fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
@@ -957,6 +1054,11 @@ def compile_gemm_fp8(
                 fx.copy(scale_lds_copy_atom, scale_a_t_src[0], scale_a_t_frag)
             if const_expr(b_mxfp4):
                 raw_b_mxfp4_g2s(kiter + 3, lds.b_r1.ptr, bid_y * 2 + 1)
+            elif const_expr(raw_global_swizzle):
+                raw_fp8_swizzle_g2s(
+                    b_swizzle_rsrc, kiter + 3, lds.b_r1.ptr,
+                    bid_y * 2 + 1, swizzle_b_specs,
+                )
             elif const_expr(not lds_swizzle and not preshuffle_b):
                 raw_g2s(b_dma_rsrc, kiter + 3, b_r_dma_ptrs[1], bid_y * 2 + 1)
             else:

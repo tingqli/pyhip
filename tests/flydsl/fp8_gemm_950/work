@@ -5,6 +5,10 @@
      - non-scale Hybrid MXFP4 已完成：B 使用 FlyDSL SwizzleType S<1,5,2>，raw G2S 和显式 S2R 使用相同的一位 16-byte slot XOR。
      - 验证：M=N=K=512 正确性通过；SQ_LDS_BANK_CONFLICT=0，SQ_LDS_ADDR_CONFLICT=0，SQ_LDS_IDX_ACTIVE=6144。
 2.  当前swizzleK必须是2的幂才可以应用，一定要有这个限制吗，比如说K=10240就无法应用当前的方A, B 读取的方案的，尝试解决这个问题。
+     状态：已完成（PRESHUFFLE_B=False）。
+     - 2 的幂 K 保留原有全局 SwizzleType 快路径；非 2 的幂 K 使用 raw G2S，在 128-K tile 内反解 LDS swizzle，再以实际 K 作为全局 row stride。
+     - K=10240 验证：A8W8/Hybrid 的 scale 与 non-scale 正确性均通过。
+     - K=10240 non-scale profiler：A8W8 与 Hybrid 均为 SQ_LDS_BANK_CONFLICT=0、SQ_LDS_ADDR_CONFLICT=0。
 3.  那更改mxfp4的padding方案吧，确保2048个连续元素可以通过dma一次额写入，只能在2048的整数倍元素上做padding, 需要允许一部分mxfp4 B 的bank conflict, 尝试不同的padding 方案，找到perf 最好的，比mxfp8要高,代码
      单独生成branch,
 4.  3完成后，由于主循环以一次unroll两次，所以可以一次读入256个K， 这个可以参考 /mywork/gfx950-gluon-tutorials/kernels/gemm/intra_wave/a4w4的读取方式，把256个K的读取在第一个128K 中读取到LDS， 这样unroll的第二个128B的pipeline
