@@ -11,5 +11,10 @@
      - K=10240 non-scale profiler：A8W8 与 Hybrid 均为 SQ_LDS_BANK_CONFLICT=0、SQ_LDS_ADDR_CONFLICT=0。
 3.  那更改mxfp4的padding方案吧，确保2048个连续元素可以通过dma一次额写入，只能在2048的整数倍元素上做padding, 需要允许一部分mxfp4 B 的bank conflict, 尝试不同的padding 方案，找到perf 最好的，比mxfp8要高,代码
      单独生成branch,
+     状态：已选择 64-element padding，分支 mxfp8-task3-mxfp4-padding-2048。
+     - 每 2048 个连续 MXFP4 元素后 padding 64 个元素；每个块使用 full-wave raw DMA，移除 16-lane subgroup DMA。
+     - 64/128/256 均验证正确，且 M=N=K=512 时 SQ_LDS_BANK_CONFLICT=2048、SQ_LDS_ADDR_CONFLICT=0。
+     - 更新 hotloop VMEM cnt 后，M=N=K=8192 non-scale cold-data：64 padding 为 344.4 us / 3192.51 TFLOPS；MXFP8 padding 为 361.8 us / 3038.97 TFLOPS，Hybrid 高约 5.1%。
+     - M=N=K=8192 scale cold-data：64 padding 为 374.0 us / 2939.52 TFLOPS；MXFP8 padding 为 394.0 us / 2790.33 TFLOPS，Hybrid 高约 5.3%。
 4.  3完成后，由于主循环以一次unroll两次，所以可以一次读入256个K， 这个可以参考 /mywork/gfx950-gluon-tutorials/kernels/gemm/intra_wave/a4w4的读取方式，把256个K的读取在第一个128K 中读取到LDS， 这样unroll的第二个128B的pipeline
     就不需要dma copy B into LDS,但是这个只是一种假设，可能与LDS pingpong算法冲突，重新建立一个branch,尝试把。
