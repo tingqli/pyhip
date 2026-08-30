@@ -2,18 +2,21 @@
 
 ## 1. 概述
 
-`moe_gemm_8wave_down` 是面向 MoE down projection 的手写 AMDGPU JIT kernel。它针对 `IC` 较小、权重访问占主导的场景，将一个 expert block 的 `wg_M` 行分给 8 个 wave，并沿输出通道连续处理多个 `wg_N=64` tile。
+`moe_gemm_8wave_down` 是面向 MoE down projection 的手写 AMDGPU **persistent JIT kernel**。它针对 `IC` 较小、权重访问占主导的场景，将一个逻辑 expert task 的 `wg_M` 行分给 8 个 wave，并沿输出通道连续处理多个 `wg_N=64` tile。固定数量的物理 workgroup 通过全局原子计数器持续领取逻辑 task，直到任务队列耗尽。
 
 内核的核心策略是：
 
-1. 将 routing 后的 `sorted_ids` 和 `sorted_weights` 缓存在 LDS；
-2. 每个 wave 将自己负责的 activation 行完整加载到 VGPR，并跨所有输出 tile 复用；
-3. 将预 shuffle 的权重 tile 通过 `buffer_load_* lds` 协作加载到四级 LDS 环形缓冲；
-4. 在权重预取、LDS 读取、MFMA 和输出写回之间构建软件流水线；
-5. FP8 路径按 `1×128` activation scale 和 `128×128` weight scale 做分块反量化；
-6. 输出为 `[num_tokens, TOPK, OC_total]` 的 BF16 中间结果，随后由上层对 `TOPK` 求和。
+1. 启动固定的 256 个 persistent workgroup；
+2. 每个 workgroup 用 `global_atomic_add` 动态领取一个 `(blk_m, blk_oc)` 逻辑 task；
+3. 将该 task 的 `sorted_ids` 和 `sorted_weights` 缓存在 LDS；
+4. 每个 wave 将自己负责的 activation 行完整加载到 VGPR，并跨所有输出 tile 复用；
+5. 将预 shuffle 的权重 tile 通过 `buffer_load_* lds` 协作加载到四级 LDS 环形缓冲；
+6. 在权重预取、LDS 读取、MFMA 和输出写回之间构建软件流水线；
+7. 完成当前 task 后回到持久循环领取下一项；
+8. FP8 路径按 `1×128` activation scale 和 `128×128` weight scale 做分块反量化；
+9. 输出为 `[num_tokens, TOPK, OC_total]` 的 BF16 中间结果，随后由上层对 `TOPK` 求和。
 
-实现入口见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L769)，调用点见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L503)。
+实现入口见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L769)，调用点见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L550)。
 
 ---
 
@@ -26,19 +29,29 @@
 - down projection 的输出 tile 固定为 `wg_N=64`；
 - workgroup 固定为 512 threads，即 8 个 wave64。
 
-调用逻辑位于 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L494-L518)。当前调用使用一维 grid：
+调用逻辑位于 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L494-L563)。当前固定启动：
 
 $$
-G = num\_oc\_splits \times num\_e\_blocks
+G_{physical}=256
 $$
 
-每个 workgroup 计算一个 `(blk_m, blk_oc)` 组合。这里：
+物理 workgroup 数不再等于逻辑 task 数。所有 workgroup 共享一个初始化为 0 的 `blk_atomic_int`，每完成一个 task 后继续领取下一个编号。逻辑 task 总数为：
+
+$$
+G_{logical}=\left\lceil\frac{num\_valid\_ids}{wg\_M}\right\rceil
+	imes num\_oc\_splits
+$$
+
+每个逻辑 task 对应一个 `(blk_m, blk_oc)` 组合。这里：
 
 - `blk_m`：routing 后的 expert block 编号；
 - `blk_oc`：输出通道大分片编号；
-- 一个 workgroup 会在内部遍历该大分片中的所有 `wg_N` tile。
+- 一个逻辑 task 会在内部遍历该大分片中的所有 `wg_N` tile；
+- 一个物理 workgroup 在一次 kernel dispatch 中可能串行完成多个逻辑 task。
 
-上层分配的 `stage2_out` 形状为 `[num_tokens, TOPK, model_dim]`。kernel 已乘上 routing weight，但不在 kernel 内归约 TOPK；上层最终执行 `stage2_out.sum(dim=1)`，见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L573-L579)。
+上层根据估算的尾部浪费率选择 `num_oc_splits`：若 256 CU 的最后一轮预计浪费超过 30%，取 4，否则取 1，见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L507-L527)。动态 task 分配用于缓解不同 expert block 有效 token 数不均衡造成的长尾。
+
+上层分配的 `stage2_out` 形状为 `[num_tokens, TOPK, model_dim]`。kernel 已乘上 routing weight，但不在 kernel 内归约 TOPK；上层最终执行 `stage2_out.sum(dim=1)`，见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L620-L628)。
 
 ---
 
@@ -57,7 +70,7 @@ $$
 | `NUM_EXPERTS` | expert 数；当前 kernel 内未直接使用 |
 | `OC` | down projection 的总输出维度，即 `model_dim` |
 | `IC` | down projection 的归约维度，即 `inter_dim` |
-| `num_oc_splits` | 将总 `OC` 切成多少个大分片，以增加 workgroup 数 |
+| `num_oc_splits` | 将总 `OC` 切成多少个逻辑 task 分片，以增加可动态调度的任务数 |
 | `gate_up` | 必须为 `False` |
 | `bpreshuffle` | 必须为真，权重必须采用 MFMA 友好的预排布 |
 | `TOPK` | 每个 token 的路由 expert 数 |
@@ -68,16 +81,17 @@ $$
 
 | 参数 | 逻辑布局 | 用途 |
 |---|---|---|
-| `sorted_ids` | `[num_e_blocks, wg_M]`, `uint32` | routing 行到 `(token, topk)` 的映射 |
-| `sorted_weights` | `[num_e_blocks, wg_M]`, `float32` | 对应 routing weight |
-| `sorted_expert_ids` | `[num_e_blocks]`, `uint32` | 每个 expert block 对应的 expert |
+| `_sorted_ids` | `[num_e_blocks, wg_M]`, `uint32` | routing 行到 `(token, topk)` 的不可变基址 |
+| `_sorted_weights` | `[num_e_blocks, wg_M]`, `float32` | routing weight 的不可变基址 |
+| `_sorted_expert_ids` | `[num_e_blocks]`, `uint32` | 每个 expert block 对应的 expert |
 | `num_valid_ids` | 至少一个 `uint32` | 有效、含 padding 的 routing 行总数 |
-| `weight` | pre-shuffled `[E, OC, IC]` | down projection 权重 |
-| `pScaleB` | FP8 weight block scales | BF16 路径不使用 |
+| `_weight` | pre-shuffled `[E, OC, IC]` | down projection 权重的不可变基址 |
+| `_pScaleB` | FP8 weight block scales | 不可变基址；BF16 路径不使用 |
 | `input` | `[num_tokens, TOPK, IC]` | stage-1 输出/量化输出 |
 | `pScaleA` | FP8 activation scales | BF16 路径不使用 |
 | `output` | `[num_tokens, TOPK, OC_total]`, BF16 | 尚未归约 TOPK 的输出 |
 | `num_tokens` | 标量 | 用于边界和 buffer range |
+| `blk_atomic_int` | 单个 GPU 可访问的 `uint32`，初值 0 | persistent workgroup 的全局任务计数器 |
 
 ---
 
@@ -105,23 +119,41 @@ $$
 row = token\_id \times TOPK + topk\_id
 $$
 
-该变换位于 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L862-L873)。
+该变换位于 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L861-L893)。
 
 排序阶段会按 expert 将 routing 行打包到 `wg_M` 对齐的 block。padding 行通常编码为 `token_id=num_tokens, topk_id=TOPK`，并将 routing weight 设为 0。kernel 通过 `row < num_tokens*TOPK` 屏蔽 activation load；大输出路径还会显式屏蔽 store。
 
 ---
 
-## 5. Workgroup 映射
+## 5. Persistent workgroup 与动态任务映射
 
-### 5.1 一维 grid 解码
+### 5.1 全局原子任务队列
 
-当前实现先取：
+当前实现不使用 `blockIdx.x` 直接确定逻辑任务。每个 persistent workgroup 进入无条件 `While` 循环，在每轮开始时由 `threadIdx.x==0` 的 lane 执行：
 
 $$
-blk\_id = blockIdx.x
+blk\_id=atomicAdd(blk\_atomic\_int,1)
 $$
 
-然后解码：
+原子返回值先写入一个 4-byte LDS 临时槽，经 workgroup barrier 后由全部 wave 读出，再通过 `v_readfirstlane_b32` 转为 SGPR，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L817-L837)。
+
+```mermaid
+flowchart TD
+    P["256 个 persistent workgroup"] --> A["lane 0: atomicAdd(counter, 1)"]
+    A --> L["返回的 blk_id 写入 LDS"]
+    L --> B["barrier + 广播到 8 waves"]
+    B --> D["解码 blk_m / blk_oc"]
+    D --> Q{"blk_m × wg_M >= max_id ?"}
+    Q -->|是| E["s_endpgm：该物理 WG 退出"]
+    Q -->|否| T["执行一个 GEMM task"]
+    T --> A
+```
+
+这种动态队列使先完成短 task 的 CU 可以继续领取任务，而无需等待静态分配给其他 CU 的长 task，从而降低 expert token 分布不均导致的尾部。
+
+### 5.2 逻辑 task 解码
+
+领取到 `blk_id` 后解码：
 
 $$
 blk\_oc = blk\_id \bmod num\_oc\_splits
@@ -131,37 +163,40 @@ $$
 blk\_m = \left\lfloor\frac{blk\_id}{num\_oc\_splits}\right\rfloor
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L800-L827)。这要求启动 grid 为一维 `num_oc_splits * num_e_blocks`。
+见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L839-L840)。`blk_oc` 在一个 expert block 内变化最快。
 
-文件里仍保留了早期二维 grid 的 `blockIdx.x/blockIdx.y` 赋值，但随后会被上述一维解码覆盖。
+### 5.3 已禁用的静态 XCD/CU 映射实验
 
-### 5.2 可选 XCD/SE/CU 重排
-
-代码中存在一个由 `if 0` 禁用的 block-id permutation，试图按 MI350 的：
+动态队列之前保留了一段由 `if 0` 禁用的静态 block-id permutation，试图按 MI350 的：
 
 - 8 XCD；
 - 每 XCD 4 SE；
 - 每 SE 8 CU；
 - 总计 256 CU；
 
-将线性 block 顺序重排为 `(XCD, SE, CU)` 顺序，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L806-L824)。
+将初始 block 顺序重排为 XCD/CU 顺序，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L794-L815)。代码注释明确指出尚未找到 persistent 动态分配与 XCD swizzle 结合以提高 L2 命中率的方法。
 
 该映射只是对逻辑任务编号做 permutation，并不能保证某个 block 实际落在推导出的物理 CU。真正的 workgroup-to-CU 分配仍由硬件调度器决定。因此这段代码应理解为工作负载排序实验，而不是物理 CU 绑定机制。
 
-### 5.3 空 block 退出
+### 5.4 任务队列终止
 
-每个 workgroup 读取：
-
-- `expert_id = sorted_expert_ids[blk_m]`；
-- `max_id = num_valid_ids[0]`。
-
-若：
+`max_id=num_valid_ids[0]` 在 persistent 循环外只加载一次。每轮领取 task 后检查：
 
 $$
 blk\_m \times wg\_M \ge max\_id
 $$
 
-则整个 workgroup 提前 `s_endpgm`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L829-L843)。
+若成立，说明该编号及所有更大编号都已超出有效逻辑任务范围，当前物理 workgroup 执行 `s_endpgm`。由于全局计数器单调递增，不需要把编号放回队列，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L839-L843)。
+
+### 5.5 每轮重新构造 task-local 状态
+
+为了让同一个物理 workgroup 安全地处理多个 task，输入基址以 `_sorted_ids`、`_sorted_weights`、`_weight`、`_pScaleB` 保存为不可变 kernel 参数。每轮循环内重新复制到 SGPR，并加上当前 `blk_m/blk_oc/expert_id` 偏移，避免上一轮对指针的修改累积到下一轮，见：
+
+- routing 指针重建：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L846-L854)；
+- weight 指针重建：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L911-L916)；
+- scaleB 指针重建：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L985-L989)。
+
+task-local LDS 对象也在循环内分配，并由 JIT allocator 在代码生成期复用固定 LDS 地址；它们不是运行时逐轮增长的动态分配。
 
 ---
 
@@ -169,7 +204,7 @@ $$
 
 ### 6.1 把 down projection 看成标准 GEMM
 
-对一个已经按 expert 聚合好的 routing block，内核计算的是标准矩阵乘法：
+对一个 persistent workgroup 当前领取到的、已经按 expert 聚合好的 routing task，内核计算的是标准矩阵乘法：
 
 $$
 \underbrace{C_{wg}}_{wg\_M\times wg\_N}
@@ -189,7 +224,7 @@ $$
 
 ```mermaid
 flowchart LR
-    subgraph AM["A：routing 后的输入激活  256 × 256"]
+    subgraph AM["A：当前逻辑 task 的输入激活  256 × 256"]
         direction TB
         A0["wave 0：A[0:32, 0:256]"]
         A1["wave 1：A[32:64, 0:256]"]
@@ -213,7 +248,7 @@ flowchart LR
 
     EQ(("="))
 
-    subgraph CM["C：当前输出 tile  256 × 64"]
+    subgraph CM["C：当前逻辑 task 的输出 tile  256 × 64"]
         direction TB
         C0["wave 0：C[0:32, 0:64]"]
         C1["wave 1：C[32:64, 0:64]"]
@@ -256,7 +291,7 @@ $$
 nrK = \left\lceil\frac{IC\times sizeof(AB)}{64}\right\rceil
 $$
 
-相关定义见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L849-L859)。
+相关定义见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L861-L869)。
 
 典型 `wg_M=256, wg_N=64` 时：
 
@@ -344,7 +379,7 @@ flowchart LR
 
 ### 6.4 A 常驻、B 流动、C 逐 tile 输出
 
-从整个 `OC=6144` 的角度看，一个 workgroup 并非只做一次 `256×256 × 256×64`，而是让同一个 A tile 连续乘以 96 个 B tile：
+当 `num_oc_splits=1`、`OC=6144` 时，一个逻辑 task 并非只做一次 `256×256 × 256×64`，而是让同一个 A tile 连续乘以 96 个 B tile：
 
 $$
 \underbrace{A_{256\times256}}_{\text{只加载一次，常驻 VGPR}}
@@ -382,7 +417,7 @@ flowchart LR
     A --> B95 --> C95
 ```
 
-这正是该 kernel 的关键设计：**A 在 VGPR 中保持不动，B tile 经四级 LDS 环形缓冲持续流过，C tile 计算后立即写回。**
+这正是单个逻辑 task 内的关键设计：**A 在 VGPR 中保持不动，B tile 经四级 LDS 环形缓冲持续流过，C tile 计算后立即写回。** task 完成后，persistent workgroup 返回循环顶部领取下一项；静态分配的 VGPR/LDS 资源仍由该驻留 workgroup 占用，并在下一轮覆盖复用。
 
 ---
 
@@ -400,7 +435,7 @@ $$
 local\_row = warp\_id\times warp\_M + m\times16 + (lane\_id\bmod16)
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L861-L868)。
+见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L875-L882)。
 
 每 16 个 lane 对应同一 MFMA 行组，而：
 
@@ -414,7 +449,7 @@ $$
 A\_addr = input + row\times(IC\times sizeof(AB)) + col\_byte + 64k
 $$
 
-加载实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L870-L879)。
+加载实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L884-L893)。
 
 ### 7.3 A 的复用范围
 
@@ -432,7 +467,7 @@ $$
 
 ### 8.1 预排布要求
 
-kernel 强制 `bpreshuffle=True`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L882-L885)。逻辑上的 `[16, 64 bytes]` MFMA 输入 tile 在内存中已排列成可由 wave64 连续 `dwordx4` 搬运、并可由 `ds_read_b128` 直接读成 MFMA operand 的形式。
+kernel 强制 `bpreshuffle=True`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L899-L903)。逻辑上的 `[16, 64 bytes]` MFMA 输入 tile 在内存中已排列成可由 wave64 连续 `dwordx4` 搬运、并可由 `ds_read_b128` 直接读成 MFMA operand 的形式。
 
 反排布参考可见 [src/contrib/moe_gemm_ref.py](src/contrib/moe_gemm_ref.py#L1-L18)。因此报告中的 `[N/16, Kbytes/64, 16, 64 bytes]` 是逻辑 tile 视图，不等价于原始 row-major 权重布局。
 
@@ -460,7 +495,7 @@ $$
 num\_bytes\_B = T_N\times T_K\times1024
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L884-L892)。
+见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L903-L908)。
 
 ### 8.3 四级 LDS 环形缓冲
 
@@ -476,7 +511,7 @@ $$
 ldsB[block\_n\bmod4]
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L891) 和 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1081-L1091)。
+见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L908) 和 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1139-L1149)。
 
 ### 8.4 VMEM 到 LDS
 
@@ -491,7 +526,7 @@ $$
 num\_vm\_loads = \frac{T_N\times T_K}{8}
 $$
 
-当前公式使用整数除法，因此设计上要求 `T_N*T_K` 能被 8 整除，或至少该配置下没有尾块。实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L893-L915)。
+当前公式使用整数除法，因此设计上要求 `T_N*T_K` 能被 8 整除，或至少该配置下没有尾块。实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L910-L929)。
 
 `vm_offset = block_n * num_bytes_B` 是权重 Buffer 内的偏移，不是 LDS 偏移；LDS 环形位置由传入的 `ldsB[block_n % 4]` 决定。
 
@@ -503,7 +538,7 @@ $$
 offset = lds + n\times(T_K\times1024) + k\times1024
 $$
 
-读取一个 `b128` 到 `mfma_B[n,k]`。当绝对 LDS offset 超过 64 KiB 时，通过 `voff2=voff+64KiB` 将立即数 offset 拉回 16-bit 可表达范围，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L916-L929)。
+读取一个 `b128` 到 `mfma_B[n,k]`。当绝对 LDS offset 超过 64 KiB 时，通过 `voff2=voff+64KiB` 将立即数 offset 拉回 16-bit 可表达范围，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L931-L941)。
 
 ---
 
@@ -523,7 +558,7 @@ $$
 num\_tokens\times TOPK\times sizeof(float)
 $$
 
-初始地址由 routing id 构造，加载逻辑见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L943-L967)。所有 K-block scale 一次性加载到：
+初始地址由 routing id 构造，加载逻辑见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L955-L982)。所有 K-block scale 一次性加载到：
 
 $$
 mfma\_scaleA[nrM][IC/128]
@@ -537,7 +572,7 @@ $$
 scaleB[expert][OC/128][IC/128]
 $$
 
-内核先根据 `expert_id` 和 `blk_oc` 移动 scale 指针，再将当前 OC 大分片的全部 B scales 搬入 LDS，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L971-L982)。
+内核先根据 `expert_id` 和 `blk_oc` 移动 scale 指针，再将当前 OC 大分片的全部 B scales 搬入 LDS，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L991-L999)。
 
 处理第 `block_n` 个 `wg_N` tile 时，其 128-channel scale block 为：
 
@@ -545,7 +580,7 @@ $$
 bn\_wgN = \left\lfloor\frac{block\_n\times wg\_N}{128}\right\rfloor
 $$
 
-随后每个 wave 用 `ds_read_b32` 广播所需 scale，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L983-L992)。
+随后每个 wave 用 `ds_read_b32` 广播所需 scale，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1000-L1008)。
 
 当 `wg_N=64` 时，相邻两个 N tile 共用同一个 128-channel B scale。
 
@@ -559,7 +594,7 @@ BF16 路径对每个 64-byte K tile 发射：
 
 `v_mfma_f32_16x16x32_bf16`
 
-因为一个 16×32 BF16 operand 恰好每行 64 bytes。循环顺序为 K、M、N；`k=0` 时 accumulator operand 为 0，后续 K tile 累加到 `mfma_C`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L931-L942)。
+因为一个 16×32 BF16 operand 恰好每行 64 bytes。循环顺序为 K、M、N；`k=0` 时 accumulator operand 为 0，后续 K tile 累加到 `mfma_C`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L943-L953)。
 
 每个 N tile 的 MFMA 数量为：
 
@@ -591,7 +626,7 @@ $$
 C_{m,n} \mathrel{+}= temp\times scaleAB
 $$
 
-实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L994-L1041)。
+实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1010-L1050)。
 
 为隐藏 MFMA 结果相关延迟，代码维护深度约为 4 的 `dequant_queue`：发射后续 MFMA 的同时，处理较早的 `temp*scaleAB`。首次写某个 `(m,n)` 使用 `v_mul_f32` 初始化，后续 K block 使用 `v_fmac_f32` 累加。
 
@@ -604,7 +639,7 @@ FP8 的 `mfma()` 末尾会：
 3. 对相邻两个 N=16 tile 做 `v_permlane16_swap_b32`；
 4. 写入 `mfma_C_bf16[m,n,0:4]`。
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1042-L1059)。
+见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1051-L1063)。
 
 ---
 
@@ -622,7 +657,7 @@ $$
 stride_C = num\_oc\_splits\times OC\times2
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1061-L1065)。
+见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1066-L1068)。
 
 输出地址由四部分组成：
 
@@ -636,7 +671,7 @@ $$
 swap\_12\_col=(col\mathbin{\&}1)\times2+(col\gg1)
 $$
 
-对应 `0,1,2,3 -> 0,2,1,3`，与 `v_permlane16_swap_b32` 配合恢复连续 row-major BF16 输出，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1065-L1078)。
+对应 `0,1,2,3 -> 0,2,1,3`，与 `v_permlane16_swap_b32` 配合恢复连续 row-major BF16 输出，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1069-L1080)。
 
 ### 11.1 小于 4 GiB
 
@@ -650,7 +685,7 @@ Buffer range 设置为整个输出大小，可利用硬件 OOB 行为抑制 padd
 
 ### 11.2 大于 4 GiB
 
-显式构造每行 64-bit 地址，并在 store 时用 `ExecMask(row < num_token_topks)`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1064-L1095)。
+显式构造每行 64-bit 地址，并在 store 时用 `ExecMask(row < num_token_topks)`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1069-L1095)。
 
 ---
 
@@ -662,7 +697,7 @@ $$
 loop\_cnt = \frac{OC}{wg\_N}
 $$
 
-实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1097-L1099)。
+实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1098-L1100)。
 
 ### 12.1 操作定义
 
@@ -701,7 +736,7 @@ sequenceDiagram
     VGPR->>OUT: S(loop_cnt-1)
 ```
 
-实际序列位于 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1150-L1190)。
+实际序列位于 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1168-L1207)。
 
 四级 LDS ring 的目的不是允许四个 tile 同时被 MFMA 使用，而是确保：
 
@@ -735,7 +770,7 @@ wave 0–3: barrier Z
 wave 4–7:             end
 ```
 
-实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1154-L1158) 和 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1191-L1193)。
+实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1173-L1176) 和 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1210-L1210)。
 
 其意图是把同一串 barrier checkpoint 在两组 wave 之间错位一格，使两组 wave 在同一物理代码区间处于不同流水阶段，从而实现注释中描述的：
 
@@ -774,7 +809,7 @@ wave 4–7:             end
 - 更老的权重搬运已完成；
 - 仍允许最新一批预取保留在 VM queue。
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1150-L1163)。
+见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1168-L1181)。
 
 ### 14.2 稳态循环
 
@@ -790,7 +825,7 @@ wave 4–7:             end
 
 意图是：等待 LDS reads 完成，同时允许当前最新的 load/store 留在 VM counter 中；依赖指令发射顺序和 counter 的“等待至不大于 N”语义，保留可与 compute 重叠的较新 VMEM 操作。
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1165-L1174)。
+见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1183-L1192)。
 
 ### 14.3 尾部
 
@@ -808,6 +843,8 @@ wave 4–7:             end
 ## 15. 资源模型
 
 ### 15.1 LDS
+
+每轮领取任务时还会短暂使用一个 4-byte `lds_blk_id` 广播原子返回值。该对象在进入 GEMM task 前调用 `free_lds()`，因此 JIT LDS allocator 可以让后续 task-local LDS 复用其地址；通常不需要在下面的稳态峰值上额外累加 4 bytes。
 
 固定 routing LDS：
 
@@ -908,6 +945,9 @@ $$
 11. `T_N*T_K` 应与 8-wave cooperative load 划分兼容；
 12. LDS 总量不得超过目标架构的每-workgroup限制；
 13. `num_oc_splits` 后的每个 OC 大分片仍须满足 scale 和流水线边界要求。
+14. `blk_atomic_int` 必须位于当前 GPU 可访问的 device memory，并在每次 kernel launch 前清零；
+15. 物理 grid 必须非零；当前固定 256 个 workgroup 是针对 256-CU 目标设备的策略参数，而非算法正确性的逻辑任务数；
+16. persistent 循环的末尾 barrier 必须让 8 waves 在返回下一轮原子取任务之前重新汇合。
 
 这些约束目前只被部分 `assert` 表达，不能把 kernel 当成任意形状的通用 GEMM。
 
@@ -921,13 +961,13 @@ $$
 
 BF16 `mfma()` 只产生 `mfma_C`，但 `storeC()` 固定存 `mfma_C_bf16`。当前 `mfma_C_bf16` 的 routing-weight 乘法、BF16 转换和 lane 重排仅存在于 FP8 分支。因此 BF16 路径会存储未初始化寄存器。相关位置：
 
-- BF16 compute：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L931-L942)；
-- FP8-only 转换：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1042-L1059)；
-- 通用 store：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1080-L1095)。
+- BF16 compute：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L943-L953)；
+- FP8-only 转换：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1051-L1063)；
+- 通用 store：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1084-L1095)。
 
 ### 17.2 FP8 dequant queue 尾部初始化
 
-主循环弹出 queue 时会用 `mfma_C_initialized` 区分首次 `mul` 和后续 `fmac`；尾部 drain 却无条件 `fmac`。当某个 `(m,n)` 的第一次结果仍留在尾部 queue 时，会在未初始化的 `mfma_C` 上累加，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1035-L1041)。
+主循环弹出 queue 时会用 `mfma_C_initialized` 区分首次 `mul` 和后续 `fmac`；尾部 drain 却无条件 `fmac`。当某个 `(m,n)` 的第一次结果仍留在尾部 queue 时，会在未初始化的 `mfma_C` 上累加，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1044-L1050)。
 
 ### 17.3 K 尾部没有 masking/zero padding
 
@@ -948,6 +988,16 @@ BF16 `mfma()` 只产生 `mfma_C`，但 `storeC()` 固定存 `mfma_C_bf16`。当�
 ### 17.7 物理 CU 映射假设
 
 禁用的 block permutation 不能“还原当前 block 实际分配到的 CU”。如果未来启用，它只能改变逻辑任务顺序；不能以其计算结果代替 ATT/硬件计数器测得的物理调度位置。
+
+### 17.8 Persistent counter 的生命周期
+
+若 `blk_atomic_int` 未在 dispatch 前清零，首个领取到的 `blk_id` 会从旧值继续增长，可能导致部分或全部逻辑 task 被跳过。当前调用点为每次调用创建零值张量并传入其 pointer，见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L494) 和 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L550-L563)。调用方重用 counter 时必须显式清零并保证其生命周期覆盖整个异步 kernel 执行。
+
+当前 `torch.zeros(1, dtype=torch.uint32)` 没有显式指定 `device=device`。必须确认应用环境设置了正确的 PyTorch 默认 device，或者改为显式在目标 GPU 上分配；否则传入的可能是 host pointer，无法作为普通 GPU global atomic 地址安全使用。
+
+### 17.9 动态任务分配与确定性
+
+原子计数器保证每个 `blk_id` 只被领取一次，但不保证 task 到物理 workgroup/CU 的映射顺序。结果正确性不应依赖某个 expert task 固定落到某个 CU；profiling、缓存命中和执行时间也可能随运行时调度产生小幅波动。
 
 ---
 
@@ -977,13 +1027,26 @@ FP8 MFMA 之后需要额外 scale multiplication。queue 将 MFMA 结果依赖�
 
 ### 18.5 `num_oc_splits`
 
-当有效 expert blocks 太少，按 expert block 启动的 workgroup 数不足以占满 GPU 时，可沿 OC 增加大分片：
+当有效 expert blocks 太少，逻辑 task 数不足以让 256 个 persistent workgroup 都获得足够工作时，可沿 OC 增加逻辑大分片：
 
 $$
-workgroups=num\_e\_blocks\times num\_oc\_splits
+tasks=num\_valid\_e\_blocks\times num\_oc\_splits
 $$
 
-代价是每个 workgroup 的 A 会重复加载，scale/固定开销增加，并且每个 split 的 `loop_cnt` 变短。
+代价是同一个 expert block 的 A 会在不同 task 中重复加载，scale/固定开销增加，并且每个 split 的 `loop_cnt` 变短。当前上层以 256 CU 为基准估算最后一轮浪费率，大于 30% 时选择 4-way OC split，否则不切分。
+
+### 18.6 Persistent 动态负载均衡
+
+静态分配中，一个 CU 若拿到有效 token 多的 expert block，会比处理 padding 较多 block 的 CU 更晚结束。persistent workgroup 完成 task 后立即通过全局原子计数器领取下一项，使任务分配近似 work-conserving：短 task 所在 CU 会自动多处理若干 task。
+
+该策略的额外成本包括：
+
+- 每个逻辑 task 一次全局原子操作；
+- 原子结果经 LDS 广播和 workgroup barrier；
+- 每轮重新加载 `expert_id`、routing metadata 和 A；
+- 动态顺序可能削弱按 expert/XCD 组织的 L2 locality。
+
+因此它主要改善跨 expert block 的负载不均衡和 dispatch 尾部，不改变单个 GEMM task 内的四级 B pipeline。
 
 ---
 
@@ -997,6 +1060,8 @@ $$
 6. **检查 `waitcnt` 的实际 counter 顺序**：以最终 ISA 和 ATT 为准，确认编译器/JIT 发射顺序与源码生成器假设一致。
 7. **评估显式最后 `vmcnt(0)`**：它可能改变测得的 kernel 尾部时间，但能让 store drain 更容易分析；是否保留应基于端到端语义和性能测试。
 8. **不要用逻辑 block permutation 代替硬件调度测量**：XCD locality 优化应通过多次 ATT、L2 hit-rate 和稳定 benchmark 验证。
+9. **比较静态与 persistent 调度**：分别测总 kernel 时间、原子领取开销、每个物理 workgroup 完成的 task 数分布，以及 L2 hit-rate；动态均衡收益可能被权重缓存局部性下降抵消。
+10. **调物理 grid 大小**：当前固定 256 workgroups。可比较每 CU 1 个、少于 1 个和多于 1 个 persistent workgroup，但必须同时考虑 LDS/VGPR 实际 occupancy。
 
 ---
 
@@ -1004,7 +1069,7 @@ $$
 
 ### 20.1 Workgroup 生命周期
 
-ATT 的 UI JSON 原生记录 wave begin/end。一个 8-wave workgroup 的近似生命周期应聚合为：
+ATT 的 UI JSON 原生记录 wave begin/end。一个 8-wave **物理 persistent workgroup** 的生命周期应聚合为：
 
 $$
 WG_{begin}=\min_{i=0}^{7}(wave_i.begin)
@@ -1014,13 +1079,13 @@ $$
 WG_{end}=\max_{i=0}^{7}(wave_i.end)
 $$
 
-相邻 workgroup 的候选空隙为：
+相邻物理 workgroup 的候选空隙为：
 
 $$
 gap=WG_{next,begin}-WG_{prev,end}
 $$
 
-不能使用两个 workgroup 的 begin 差值作为空闲时间；该差值通常主要包含前一个 workgroup 的执行时间。
+不能使用两个 workgroup 的 begin 差值作为空闲时间；该差值通常主要包含前一个 workgroup 的执行时间。更重要的是，最新实现中一个物理 workgroup 会在单条 wave trace 内执行多个逻辑 GEMM task，因此 `occupancy.json` 的 wave begin/end **不能直接给出每个 task 的边界**。task 边界需要通过原子领取序列、源码/ISA PC 区间或额外 instrumentation 推断。
 
 ### 20.2 为什么该 kernel 容易出现“一次驻留一个 workgroup”
 
@@ -1031,9 +1096,19 @@ $$
 - 较高 VGPR 占用；
 - 大量 workgroup barrier。
 
-因此同一 CU 上多个 workgroup 并发驻留可能受到限制。ATT 中看到下一组 8 waves 在上一组接近结束时启动，通常是资源释放后的正常 workgroup replacement，而不是 profiler 在 workgroup 之间主动暂停。
+因此同一 CU 上多个 persistent workgroup 并发驻留可能受到限制。当前又只启动 256 个物理 workgroup；正常情况下它们会长时间驻留并连续处理多个 task，直到原子计数器越过任务尾部才退出。ATT 中同一组 waves 内部的长短变化可能对应不同 task，而不是新 workgroup 启动。
 
-### 20.3 推荐 ATT 范围
+### 20.3 Persistent trace 的观察重点
+
+对最新实现，更有价值的观察量是：
+
+1. kernel 开头 256 个物理 workgroup 的实际铺开速度；
+2. 每个物理 workgroup 在退出前执行了多少次原子领取循环；
+3. 最后阶段仍活跃的 persistent workgroup 数量如何下降；
+4. 原子领取点附近是否出现显著 VMEM/LDS/barrier stall；
+5. 动态 task 顺序是否降低同一 XCD 对相同 expert 权重的 L2 复用。
+
+### 20.4 推荐 ATT 范围
 
 若目标是分析完整 workgroup begin/end，建议只采一个 SE 的目标 CU，但保留四个 SIMD：
 
@@ -1052,6 +1127,7 @@ $$
 | 特性 | `moe_gemm_down_tp` | `moe_gemm_8wave_down` |
 |---|---:|---:|
 | waves/workgroup | 4 | 8 |
+| 任务调度 | grid 静态映射 | 256 个 persistent WG + 原子动态领取 |
 | A 路径 | 直接 VGPR | 直接 VGPR |
 | B LDS ring | 2 级 | 4 级 |
 | OC split | 无 | 支持 |
@@ -1064,7 +1140,7 @@ $$
 
 ## 22. 总结
 
-`moe_gemm_8wave_down` 的本质是一个针对小 K 的、A 常驻 VGPR、B 四级流式 LDS staging 的 MoE batched GEMM：
+`moe_gemm_8wave_down` 的本质是一个由全局原子任务队列驱动的 persistent MoE batched GEMM；每个逻辑 task 内采用小 K、A 常驻 VGPR、B 四级流式 LDS staging 的计算结构：
 
 $$
 C[token,topk,:]
@@ -1075,10 +1151,11 @@ $$
 
 其性能来自：
 
+- 256 个 persistent workgroup 动态领取 task，缓解 expert block 长短不均和静态调度尾部；
 - routing 后按 expert 聚合；
 - 8-wave cooperative B load；
 - A 跨 96 个典型 N tile 的高复用；
 - VMEM→LDS、LDS→VGPR、MFMA、store 的手工流水；
 - FP8 scale 乘法与 MFMA 的 queue 化交叠。
 
-同时，它是高度 shape-specialized 的实验性 kernel。当前实现包含未完全编码的形状约束以及明确的 BF16/FP8 正确性风险。后续维护应优先把 shape contract、pipeline invariant 和 barrier 代次写成断言与测试，再继续做 block permutation、ring 深度和 waitcnt 调优。
+同时，它是高度 shape-specialized 的实验性 kernel。当前实现包含未完全编码的形状约束以及明确的 BF16/FP8 正确性风险。后续维护应优先把 shape contract、persistent counter 生命周期、task 循环 invariant、pipeline invariant 和 barrier 代次写成断言与测试，再继续做 task 排序、XCD locality、ring 深度和 waitcnt 调优。

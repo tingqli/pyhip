@@ -485,8 +485,13 @@ def fused_moe(
         #print(f"{num_oc_blocks=} {valid_e_blocks=} {inter_dim=}")
         #print(w2.dtype, w2.shape, a2.dtype, a2.shape)
         if do_perf:
-            rw_bytes = w2.numel() * w2.element_size() + a2.numel() * a2.element_size() + stage2_out.numel()*stage2_out.element_size()
+            # weight is not just load once, each valid e_block loads one expert from VMEM
+            # when num-tokens are large and valid e_block is big, weight will be load from VMEM more than once
+            # and L2-cache (4MB per XCD) can hold 1.5 experts weights only, but there are 32 CU which execute 32 valid e_blocks
+            # so 
+            rw_bytes = valid_e_blocks * w2[0,:,:].numel() * w2.element_size() + a2.numel() * a2.element_size() + stage2_out.numel()*stage2_out.element_size()
             flops = num_oc_blocks*valid_e_blocks*wg_M*wg_N*inter_dim*2
+        blk_atomic_int = torch.zeros(1, dtype=torch.uint32)
         with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(flops=flops, rw_bytes=rw_bytes, name="moe_gemm_down         "):
             if a2.dtype == torch.bfloat16:
                 AB_dtype = "bf16"
@@ -499,6 +504,15 @@ def fused_moe(
                 #moe_gemm_down_tp([1, num_e_blocks], [4*64],
                 """
                 为了降低wave调度的tail效应，有效num_e_blocks不够多时需要在oc方向切分增加workgroup个数
+                需要注意的是，估算的tail是按照均匀分配的乐观值，稍微分配不均匀就会导致最后一轮任务几乎为空
+                因此这里存在两个不均衡问题：
+                 - 总任务数不够256个CU分配，最后一轮大量CU空闲（解决办法就是在OC维度切分）
+                 - 每个专家按照256大小切分得到的任务本身包含的token数不均匀，导致某些expert block快，某些慢
+                  解决办法：
+                  1.persistent kernel 
+                    尝试静态划分任务，每个CU分到的任务的token总数仍然会出现较大波动
+                    尝试动态划分任务，每个CU分到的任务的token总数会更加均衡
+                  2.或者把饱满的任务优先连续分配，长短不一的细碎任务放在尾部
                 """
                 est_tokens_per_expert = (token_num * topk // E) 
                 est_blocks_per_expert = (est_tokens_per_expert + block_size_M - 1) // block_size_M
@@ -511,7 +525,29 @@ def fused_moe(
                     num_oc_splits = 4
                 else:
                     num_oc_splits = 1
-                moe_gemm_8wave_down([num_oc_splits* num_e_blocks], [8*64],
+                # print("sorted_expert_ids", sorted_expert_ids.view(-1, 5).tolist(), num_valid_ids.tolist())
+
+                #num_oc_splits = 1
+                #print(f"valid_e_blocks:  {valid_e_blocks} ")
+
+                if 0:
+                    valid_tok_counts = []
+                    for eidx in range(valid_e_blocks):
+                        tok_ids = sorted_ids[eidx * block_size_M : (eidx + 1) * block_size_M]
+                        topk_ids = ((tok_ids >> 24) & 0xFF)
+                        valid_tok_counts.append(torch.sum(topk_ids < topk).item())
+                    
+                    for cu_idx in range(256):
+                        iii = cu_idx
+                        iii_cnt = 0
+                        while iii < len(valid_tok_counts):
+                            iii_cnt += valid_tok_counts[iii]
+                            iii += 256
+                        print(f"CU {cu_idx} valid token count: {iii_cnt}")
+
+                    print(f"Valid token counts per expert block: {valid_tok_counts}")
+
+                moe_gemm_8wave_down([256], [8*64],
                                 stage2_out.element_size() * stage2_out.numel() > (1<<32),
                                 AB_dtype, wg_M, 64,
                                 E, model_dim, inter_dim, num_oc_splits,
@@ -523,33 +559,35 @@ def fused_moe(
                                 w2.data_ptr(), None if w2_scale is None else w2_scale.data_ptr(),
                                 a2.data_ptr(), None if a2_scale is None else a2_scale.data_ptr(),
                                 stage2_out.data_ptr(),
-                                token_num)
-                import os
-                target_file = f"moe_gemm_down_{token_num}_{inter_dim}_{model_dim}_{wg_M}_{w2_is_shuffled}.pt"
-                if not os.path.exists(target_file):
-                    args_dict = {
-                        "num_e_blocks": num_e_blocks,
-                        "is_output_over_4GB": stage2_out.element_size() * stage2_out.numel() > (1<<32),
-                        "AB_dtype":AB_dtype,
-                        "wg_M": wg_M,
-                        "E": E,
-                        "model_dim": model_dim,
-                        "inter_dim": inter_dim,
-                        "w2_is_shuffled": w2_is_shuffled,
-                        "topk":topk,
-                        "sorted_ids":sorted_ids,
-                        "sorted_weights":sorted_weights,
-                        "sorted_expert_ids":sorted_expert_ids,
-                        "num_valid_ids":num_valid_ids,
-                        "w2":w2,
-                        "w2_scale":w2_scale,
-                        "a2":a2,
-                        "a2_scale":a2_scale,
-                        "stage2_out":stage2_out,
-                        "token_num":token_num
-                    }
-                    torch.save(args_dict, target_file)
-                    assert 0,f"================================= {target_file} is saved!"
+                                token_num,
+                                blk_atomic_int.data_ptr())
+                if 0:
+                    import os
+                    target_file = f"moe_gemm_down_{token_num}_{inter_dim}_{model_dim}_{wg_M}_{w2_is_shuffled}.pt"
+                    if not os.path.exists(target_file):
+                        args_dict = {
+                            "num_e_blocks": num_e_blocks,
+                            "is_output_over_4GB": stage2_out.element_size() * stage2_out.numel() > (1<<32),
+                            "AB_dtype":AB_dtype,
+                            "wg_M": wg_M,
+                            "E": E,
+                            "model_dim": model_dim,
+                            "inter_dim": inter_dim,
+                            "w2_is_shuffled": w2_is_shuffled,
+                            "topk":topk,
+                            "sorted_ids":sorted_ids,
+                            "sorted_weights":sorted_weights,
+                            "sorted_expert_ids":sorted_expert_ids,
+                            "num_valid_ids":num_valid_ids,
+                            "w2":w2,
+                            "w2_scale":w2_scale,
+                            "a2":a2,
+                            "a2_scale":a2_scale,
+                            "stage2_out":stage2_out,
+                            "token_num":token_num
+                        }
+                        torch.save(args_dict, target_file)
+                        assert 0,f"================================= {target_file} is saved!"
 
             else:
                 if USE_GLUON2:
