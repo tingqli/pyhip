@@ -1,5 +1,7 @@
 import math
 import os
+import statistics
+
 os.environ['PYHIP_JIT_LOG'] = '0'
 DUMP_DOWN = int(os.getenv("DUMP_DOWN", "0"))
 
@@ -90,7 +92,14 @@ def _run_aiter(hidden_states,
         quant_type=aiter_qtype
     )
 
-def _gateup_activation_ref(gate, up, activation, swiglu_limit=None):
+def _gateup_activation_ref(
+    gate,
+    up,
+    activation,
+    swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+):
     if activation == 'silu':
         return torch.nn.functional.silu(gate) * up
     if activation == 'swiglu':
@@ -99,6 +108,14 @@ def _gateup_activation_ref(gate, up, activation, swiglu_limit=None):
         gate = gate.float().clamp(max=swiglu_limit)
         up = up.float().clamp(min=-swiglu_limit, max=swiglu_limit)
         return (gate * torch.sigmoid(1.702 * gate) * (up + 1.0)).to(output_dtype)
+    if activation == 'situv2':
+        limit = float(swiglu_limit) if swiglu_limit else 7.0
+        output_dtype = gate.dtype
+        gate = gate.float().clamp(max=limit)
+        up = up.float().clamp(min=-limit, max=limit)
+        situ_gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+        up_scaled = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+        return (situ_gate * up_scaled).to(output_dtype)
     raise ValueError(f'unsupported gateup activation: {activation}')
 
 
@@ -121,7 +138,17 @@ def _quantize_dequantize_ref(value, quant_type, quant_dtype):
     return value
 
 
-def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids, activation='silu', swiglu_limit=None):
+def get_torch_ref(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    activation='silu',
+    swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+):
     batch_size, hidden_dim = hidden_states.shape
     E, N1, K1 = w1.shape
     INTER_SIZE = N1 // 2
@@ -140,7 +167,12 @@ def get_torch_ref(hidden_states, w1, w2, topk_weight, topk_ids, activation='silu
             up_proj = w1[n, INTER_SIZE :,].t()
             down_proj = w2[n].t()
             return _gateup_activation_ref(
-                x @ gate_proj, x @ up_proj, activation, swiglu_limit
+                x @ gate_proj,
+                x @ up_proj,
+                activation,
+                swiglu_limit,
+                situ_beta,
+                situ_linear_beta,
             ) @ down_proj
         idx, top_x = torch.where(expert_mask[expert_idx])
 
@@ -166,6 +198,8 @@ def get_quantized_torch_ref(
     quant_dtype,
     activation='silu',
     swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     batch_size, hidden_dim = hidden_states.shape
     E, N1, _ = w1.shape
@@ -186,6 +220,8 @@ def get_quantized_torch_ref(
             current_state @ w1[expert_idx, intermediate_size:].t(),
             activation,
             swiglu_limit,
+            situ_beta,
+            situ_linear_beta,
         ).to(hidden_states.dtype)
 
     intermediate_states = _quantize_dequantize_ref(
@@ -226,7 +262,7 @@ def quant_expert_weights(w1, quant_type, dtype):
         return w1_qt, w1s, w1_ref
     assert 0, quant_type
 
-def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='default', down_output_padding_bytes=None):
+def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=32, run_count=10, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E=128, TP=8, quant_type='ptpc', activation='silu', swiglu_limit=None, situ_beta=1.0, situ_linear_beta=1.0, mxfp4_gate_up_interleaved=True, down_path='default', down_output_padding_bytes=None, force_batch1_path=False, perf_aggregate=None, fly_gate_tile_n=None, fly_down_tile_n=None):
     INTER_SIZE_TP = INTER_SIZE // TP
     # acc (run_count=0): only hidden_states[0] etc. are used; smaller BUF_COPY saves VRAM.
     # perf (run_count>0): rotate buffers to reduce L2 reuse across timed iterations.
@@ -244,23 +280,66 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
     elif weight_type == torch.float4_e2m1fn_x2:
         import aiter
         from aiter.utility import fp4_utils
-        from aiter.ops.shuffle import shuffle_weight
-        # w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
-        w_ = torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
+
+        use_fly_mxfp4_layout = kernel_type == 'fly_splitk_2s'
+        if use_fly_mxfp4_layout:
+            from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+        def make_mxfp4_weight(shape):
+            experts, rows, cols = shape
+            weight = torch.randn(shape, dtype=torch.bfloat16)
+            expert_scale = torch.pow(
+                2.0, torch.arange(experts).view(experts, 1, 1) % 3 - 1
+            ).to(torch.bfloat16)
+            row_scale = torch.pow(
+                2.0, torch.arange(rows).view(1, rows, 1) % 3 - 1
+            ).to(torch.bfloat16)
+            group_scale = torch.pow(
+                2.0, torch.arange(cols // 32).view(1, 1, -1, 1) % 5 - 2
+            ).to(torch.bfloat16)
+            weight.mul_(expert_scale).mul_(row_scale)
+            weight.view(experts, rows, cols // 32, 32).mul_(group_scale)
+            return weight
+
+        w_ = (
+            make_mxfp4_weight([E, INTER_SIZE_TP * 2, HIDDEN_SIZE])
+            if use_fly_mxfp4_layout
+            else torch.randn([E, INTER_SIZE_TP * 2, HIDDEN_SIZE], dtype=torch.bfloat16)
+        )
         w1_qt, w1_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
 
         #w1_qt_scale_[...] = 1.0
         w1_f32 = fp4_utils.mxfp4_to_f32(w1_qt).to(dtype=torch.bfloat16).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE // 32, 32)
         w1_scale_f32 = fp4_utils.e8m0_to_f32(w1_qt_scale_).to(dtype=torch.bfloat16).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE // 32, 1)
         w1_ref = (w1_f32 * w1_scale_f32).reshape(E, INTER_SIZE_TP * 2, HIDDEN_SIZE)
-        w1_qt_scale = fp4_utils.e8m0_shuffle(w1_qt_scale_)
+        w1_qt_scale = (
+            shuffle_scale_a16w4(w1_qt_scale_, E, True)
+            if use_fly_mxfp4_layout and mxfp4_gate_up_interleaved
+            else fp4_utils.e8m0_shuffle(w1_qt_scale_)
+        )
         if USE_FP4_SHUFFLE_WEIGHT:
-            w1 = [shuffle_weight(w1_qt) for _ in range(BUF_COPY)]
+            if use_fly_mxfp4_layout:
+                if mxfp4_gate_up_interleaved:
+                    w1 = [
+                        shuffle_weight_a16w4(w1_qt, 16, True)
+                        for _ in range(BUF_COPY)
+                    ]
+                else:
+                    from aiter.ops.shuffle import shuffle_weight
+
+                    w1 = [shuffle_weight(w1_qt) for _ in range(BUF_COPY)]
+            else:
+                from aiter.ops.shuffle import shuffle_weight
+
+                w1 = [shuffle_weight(w1_qt) for _ in range(BUF_COPY)]
         else:
             w1 = [w1_qt.clone() for _ in range(BUF_COPY)]
         w1_scale = [w1_qt_scale.clone() for _ in range(BUF_COPY)]
-        # w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
-        w_ = torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
+        w_ = (
+            make_mxfp4_weight([E, HIDDEN_SIZE, INTER_SIZE_TP])
+            if use_fly_mxfp4_layout
+            else torch.randn([E, HIDDEN_SIZE, INTER_SIZE_TP], dtype=torch.bfloat16)
+        )
         w2_qt, w2_qt_scale_ = aiter.get_torch_quant(aiter.QuantType.per_1x32)(w_, quant_dtype=weight_type)
         #w2_qt_scale_[...] = 1.0
 
@@ -270,9 +349,21 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
         # pad scale
         w2_qt_scale_pad = torch.zeros(w2_qt_scale_.shape[0], div_up(w2_qt_scale_.shape[1], 8) * 8, dtype=w2_qt_scale_.dtype)
         w2_qt_scale_pad[:, :w2_qt_scale_.shape[1]] = w2_qt_scale_
-        w2_qt_scale = fp4_utils.e8m0_shuffle(w2_qt_scale_pad)
+        w2_qt_scale = (
+            shuffle_scale_a16w4(w2_qt_scale_, E, False)
+            if use_fly_mxfp4_layout
+            else fp4_utils.e8m0_shuffle(w2_qt_scale_pad)
+        )
         if USE_FP4_SHUFFLE_WEIGHT:
-            w2 = [shuffle_weight(w2_qt) for _ in range(BUF_COPY)]
+            if use_fly_mxfp4_layout:
+                w2 = [
+                    shuffle_weight_a16w4(w2_qt, 16, False)
+                    for _ in range(BUF_COPY)
+                ]
+            else:
+                from aiter.ops.shuffle import shuffle_weight
+
+                w2 = [shuffle_weight(w2_qt) for _ in range(BUF_COPY)]
         else:
             w2 = [w2_qt.clone() for _ in range(BUF_COPY)]
         w2_scale = [w2_qt_scale.clone() for _ in range(BUF_COPY)]
@@ -368,6 +459,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
     else:
         ele_size = 1
     mem_size = B * HIDDEN_SIZE * 2 + (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * access_expert * ele_size
+    if weight_type == torch.float4_e2m1fn_x2:
+        mem_size += (
+            HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP
+        ) * access_expert / 32
 
     import aiter
     from aiter.ops.shuffle import shuffle_weight
@@ -482,6 +577,9 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                                cur_out.data_ptr(), 
                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
         elif kernel_type == 'fly_splitk_2s':
+            if weight_type == torch.float4_e2m1fn_x2:
+                K1 *= 2
+                K2 *= 2
             from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
             from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
@@ -512,6 +610,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                 torch.float8_e4m3fnuz: fx.Uint8,
                 torch.float8_e4m3fn: fx.Uint8,
             }
+            if hasattr(torch, 'float4_e2m1fn_x2'):
+                _TORCH_TO_FX[torch.float4_e2m1fn_x2] = fx.Uint8
+            if hasattr(torch, 'float8_e8m0fnu'):
+                _TORCH_TO_FX[torch.float8_e8m0fnu] = fx.Uint8
             def _ptr(t):
                 return flyc.from_c_void_p(_TORCH_TO_FX[t.dtype], t.data_ptr())
             stream = torch.cuda.current_stream()
@@ -519,39 +621,78 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                 weight_dtype = 'bf16'
                 compile_quant_type = 'no'
                 compile_act_quant_type = 'no'
+            elif weight_type == torch.float4_e2m1fn_x2:
+                weight_dtype = 'fp4'
+                compile_quant_type = 'mxfp4'
+                compile_act_quant_type = 'no'
             else:
                 weight_dtype = 'fp8'
                 compile_quant_type = quant_type
                 compile_act_quant_type = quant_type
-            if B == 1 and down_path == 'default':
+            if (B == 1 or force_batch1_path) and down_path == 'default':
                 assert TILE_M_GATEUP == TILE_M_DOWN, (
                     'only prefill_1x4 supports different gateup/down M tiles'
                 )
-                grid = topk_ids.numel()
+                gate_tile_n = fly_gate_tile_n or (
+                    64
+                    if force_batch1_path
+                    and weight_type == torch.float4_e2m1fn_x2
+                    and B >= 4
+                    else 32
+                )
+                down_tile_n = fly_down_tile_n or (
+                    32
+                    if force_batch1_path
+                    and weight_type == torch.float4_e2m1fn_x2
+                    else 64
+                )
+                batch1_alg = (
+                    'batch1'
+                    if weight_type == torch.float4_e2m1fn_x2
+                    else ('splitk' if force_batch1_path else 'batch1')
+                )
                 w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                 g_kwargs = (
-                    ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
+                    ('N', N1), ('K', K1), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('act_quant_type', compile_act_quant_type), ('TOPK', TOPK),
                     # gateup batch1 runs faster at BN=32 (more N-blocks/parallelism on the underutilized
                     # GPU, split-K reduce preserved via the full-fragment reduce); down stays at 64.
-                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 32), ('stage', 'gateup'), ('alg', 'batch1'), ('E', E),
+                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', gate_tile_n), ('stage', 'gateup'), ('alg', batch1_alg), ('E', E),
                 )
-                if activation == 'swiglu':
+                if force_batch1_path and weight_type != torch.float4_e2m1fn_x2:
+                    g_kwargs += (('force_batch1_path', True),)
+                fused_down_clear = (
+                    force_batch1_path
+                    and weight_type == torch.float4_e2m1fn_x2
+                )
+                if fused_down_clear:
+                    g_kwargs += (('fused_down_clear', True),)
+                if activation in ('swiglu', 'situv2'):
                     g_kwargs += (('activation', activation), ('swiglu_limit', swiglu_limit))
-                _fly_dispatch(
-                    g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
-                    (_ptr(hidden_states), _ptr(w1), _ptr(gemm1_out), _ptr(topk_ids), _ptr(topk_weight), _ptr(w1_scale_arg),
-                     grid, stream),
-                )
-                cur_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+                if activation == 'situv2':
+                    g_kwargs += (('situ_beta', situ_beta), ('situ_linear_beta', situ_linear_beta))
+                if weight_type == torch.float4_e2m1fn_x2:
+                    g_kwargs += (
+                        ('mxfp4_gate_up_interleaved', mxfp4_gate_up_interleaved),
+                    )
+                cur_out = torch.empty([B, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+                if not fused_down_clear:
+                    cur_out.zero_()
                 w2_scale_arg = w2_scale if w2_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                 d_kwargs = (
-                    ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('TOPK', TOPK),
-                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', 64), ('stage', 'down'), ('alg', 'batch1'), ('E', E),
+                    ('N', N2), ('K', K2), ('weight_dtype', weight_dtype), ('weight_quant_type', compile_quant_type), ('act_quant_type', compile_act_quant_type), ('TOPK', TOPK),
+                    ('BLOCK_TILE_SIZE_M', 16), ('BLOCK_TILE_SIZE_N', down_tile_n), ('stage', 'down'), ('alg', batch1_alg), ('E', E),
+                )
+                if force_batch1_path and weight_type != torch.float4_e2m1fn_x2:
+                    d_kwargs += (('force_batch1_path', True),)
+                _fly_dispatch(
+                    g_kwargs, lambda: _moe_compile(**dict(g_kwargs)),
+                    (_ptr(hidden_states), _ptr(w1), _ptr(gemm1_out), _ptr(topk_ids), _ptr(cur_out if fused_down_clear else topk_weight), _ptr(w1_scale_arg),
+                     B, stream),
                 )
                 _fly_dispatch(
                     d_kwargs, lambda: _moe_compile(**dict(d_kwargs)),
                     (_ptr(gemm1_out), _ptr(w2), _ptr(cur_out), _ptr(topk_ids), _ptr(topk_weight), _ptr(w2_scale_arg),
-                     grid, stream),
+                     B, stream),
                 )
             else:
                 # FlyDSL moe_gemm_splitk: gateup stage
@@ -581,7 +722,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                 # Only gateup prefill supports different gateup/metadata M tiles, so 2x4
                 # forces it even for small batches. Otherwise keep the B>32 heuristic.
                 use_gateup_prefill = (
-                    B > 32 or down_path == '2x4'
+                    weight_dtype != 'fp4' and (B > 32 or down_path == '2x4')
                 ) and TILE_M_GATEUP >= 32 and TILE_M_GATEUP % 32 == 0
                 if use_gateup_prefill:
                     assert TILE_N in (128, 256) and N1 % TILE_N == 0
@@ -592,7 +733,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                 use_down_prefill, down_tile_n = _select_down_config(
                     down_path,
                     TILE_N,
-                    B > 32 and TILE_M_DOWN >= 32 and TILE_M_DOWN % 32 == 0,
+                    weight_dtype != 'fp4' and B > 32 and TILE_M_DOWN >= 32 and TILE_M_DOWN % 32 == 0,
                 )
                 w1_scale_arg = w1_scale if w1_scale is not None else torch.empty(1, dtype=torch.float32, device=hidden_states.device)
                 g_kwargs = (
@@ -600,8 +741,14 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                     ('BLOCK_TILE_SIZE_M', TILE_M_GATEUP), ('BLOCK_TILE_SIZE_N', TILE_N), ('stage', 'gateup'), ('alg', gateup_alg),
                     ('METADATA_TILE_SIZE_M', TILE_M_DOWN),
                 )
-                if activation == 'swiglu':
+                if activation in ('swiglu', 'situv2'):
                     g_kwargs += (('activation', activation), ('swiglu_limit', swiglu_limit))
+                if activation == 'situv2':
+                    g_kwargs += (('situ_beta', situ_beta), ('situ_linear_beta', situ_linear_beta))
+                if weight_type == torch.float4_e2m1fn_x2:
+                    g_kwargs += (
+                        ('mxfp4_gate_up_interleaved', mxfp4_gate_up_interleaved),
+                    )
                 if gateup_alg == 'prefill_1x4':
                     # The prefill (native fp8 MFMA) gateup needs an fp8 input plus its
                     # dequant scale: quantize the activation per-token (ptpc) or per-tensor.
@@ -963,6 +1110,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                 quant_dtype=weight_type,
                 activation=activation,
                 swiglu_limit=swiglu_limit,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
         else:
             ref_out = get_torch_ref(
@@ -973,6 +1122,8 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                 topk_ids=topk_ids[0],
                 activation=activation,
                 swiglu_limit=swiglu_limit,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
         # aiter_out = _run_aiter(hidden_states=hidden_states[0], w1=w1[0], w2=w2[0], topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         cur_out = run(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0], quant_type=quant_type)
@@ -1014,10 +1165,13 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                     quantype = " @ blockwise"
             print(f"{kernel_type}[{B=} {weight_type=}{quantype}] acc OK({diff=:.8f})")
     if run_count > 0:
-        return {'flops': sum(tflops_res[1:])/len(tflops_res[1:]),              # tflops
-                'latency': sum(latencies[1:])/len(latencies[1:]) * 1e6,        # us
-                'bw': sum(bw[1:]) / len(bw[1:]),
-                'diff': diff}                               # GB/s
+        aggregate = perf_aggregate or (
+            statistics.median if force_batch1_path else statistics.mean
+        )
+        return {'flops': aggregate(tflops_res[1:]),              # tflops
+            'latency': aggregate(latencies[1:]) * 1e6,        # us
+            'bw': aggregate(bw[1:]),
+            'diff': diff}                               # GB/s
 
 def is_arch_type(arch):
     props = torch.cuda.get_device_properties()
@@ -1042,7 +1196,7 @@ def entry_b1(prec=[torch.bfloat16], HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=8, E
         perf[kernel_type][str(weight_type)] = perf_prec
     return perf
 
-def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M_DOWN=32, TILE_M_GATEUP=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=64, TP=8, run_count=10, quant_type='ptpc', activation='silu', swiglu_limit=None, down_path='default', down_output_padding_bytes=None):
+def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M_DOWN=32, TILE_M_GATEUP=32, TILE_N=64, HIDDEN_SIZE=2048, INTER_SIZE=1024, TOPK=10, E=64, TP=8, run_count=10, quant_type='ptpc', activation='silu', swiglu_limit=None, situ_beta=1.0, situ_linear_beta=1.0, mxfp4_gate_up_interleaved=True, down_path='default', down_output_padding_bytes=None, force_batch1_path=False, perf_aggregate=None, fly_gate_tile_n=None, fly_down_tile_n=None):
     perf = {}
     perf[kernel_type] = {}
     for weight_type in prec:
@@ -1064,7 +1218,7 @@ def entry_common(kernel_type, batch, prec=[torch.bfloat16], TILE_M_DOWN=32, TILE
             else:
                 key = f'{i}'
                 
-            perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP, quant_type=quant_type, activation=activation, swiglu_limit=swiglu_limit, down_path=down_path, down_output_padding_bytes=down_output_padding_bytes)
+            perf_prec[key] = _run_batch(kernel_type, B=i, weight_type=weight_type, TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, run_count=run_count, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=TOPK, E=E, TP=TP, quant_type=quant_type, activation=activation, swiglu_limit=swiglu_limit, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta, mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved, down_path=down_path, down_output_padding_bytes=down_output_padding_bytes, force_batch1_path=force_batch1_path, perf_aggregate=perf_aggregate, fly_gate_tile_n=fly_gate_tile_n, fly_down_tile_n=fly_down_tile_n)
         quan_type=""
         if wei_is_fp8(weight_type):
             if quant_type == 'ptpc':
@@ -1162,6 +1316,77 @@ def test_acc_fly_splitk_2s(batch, prec, TILE_M_DOWN, TILE_M_GATEUP, TILE_N, HIDD
         entry_common('fly_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10, quant_type='per_tensor')
     entry_common('fly_splitk_2s', batch=batch, prec=prec, TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
 
+@pytest.mark.parametrize("batch", [[1, 2, 4, 8]])
+@pytest.mark.parametrize("prec", [[torch.bfloat16, get_fp8type()]])
+@pytest.mark.parametrize("HIDDEN_SIZE", [4096])
+@pytest.mark.parametrize("INTER_SIZE", [1024])
+@pytest.mark.parametrize("TP", [8])
+def test_acc_fly_force_batch1_path(batch, prec, HIDDEN_SIZE, INTER_SIZE, TP):
+    entry_common(
+        'fly_splitk_2s', batch=batch, prec=prec, HIDDEN_SIZE=HIDDEN_SIZE,
+        INTER_SIZE=INTER_SIZE, TP=TP, run_count=0, force_batch1_path=True
+    )
+
+@pytest.mark.parametrize("mxfp4_gate_up_interleaved", [False, True])
+@pytest.mark.parametrize("force_batch1_path", [False, True])
+def test_acc_fly_mxfp4_batch1_splitk(
+    force_batch1_path, mxfp4_gate_up_interleaved
+):
+    fp4_type = get_fp4type_if_valid()
+    if fp4_type is None:
+        pytest.skip("MXFP4 batch1/splitk requires gfx950")
+    entry_common(
+        'fly_splitk_2s', batch=[1, 2, 4, 8, 64], prec=[fp4_type],
+        TILE_M_DOWN=32, TILE_M_GATEUP=32, TILE_N=64, HIDDEN_SIZE=4096,
+        INTER_SIZE=1024, TP=8, run_count=0,
+        mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
+        force_batch1_path=force_batch1_path,
+    )
+
+@pytest.mark.parametrize("inter_size", [3072, 4096])
+@pytest.mark.parametrize("situ_beta,situ_linear_beta", [(1.0, 1.0), (0.5, 2.0)])
+@pytest.mark.parametrize("mxfp4_gate_up_interleaved", [False, True])
+def test_acc_fly_mxfp4_situv2_batch1_splitk(
+    inter_size, situ_beta, situ_linear_beta, mxfp4_gate_up_interleaved
+):
+    fp4_type = get_fp4type_if_valid()
+    if fp4_type is None:
+        pytest.skip("MXFP4 SiTUv2 batch1/splitk requires gfx950")
+    entry_common(
+        'fly_splitk_2s', batch=[1, 2], prec=[fp4_type],
+        TILE_M_DOWN=32, TILE_M_GATEUP=32, TILE_N=64, HIDDEN_SIZE=3584,
+        INTER_SIZE=inter_size, E=8, TOPK=4, TP=8, run_count=0,
+        activation='situv2', situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
+    )
+
+def test_acc_fly_situv2_batch1_splitk():
+    entry_common(
+        'fly_splitk_2s', batch=[1, 2], prec=[torch.bfloat16, get_fp8type()],
+        TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=64, HIDDEN_SIZE=1024,
+        INTER_SIZE=1024, E=8, TOPK=4, TP=8, run_count=0,
+        activation='situv2',
+    )
+
+def test_acc_fly_situv2_force_batch1():
+    entry_common(
+        'fly_splitk_2s', batch=[2],
+        prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()],
+        TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=64, HIDDEN_SIZE=3584,
+        INTER_SIZE=3072, E=8, TOPK=4, TP=8, run_count=0,
+        activation='situv2', situ_beta=0.5, situ_linear_beta=2.0,
+        force_batch1_path=True,
+    )
+
+def test_acc_fly_situv2_prefill_1x4():
+    entry_common(
+        'fly_splitk_2s', batch=[64], prec=[torch.bfloat16, get_fp8type()],
+        TILE_M_DOWN=64, TILE_M_GATEUP=64, TILE_N=128, HIDDEN_SIZE=1024,
+        INTER_SIZE=1024, E=8, TOPK=4, TP=8, run_count=0,
+        activation='situv2',
+    )
+
 @pytest.mark.parametrize("batch", [[1, 2, 64]])
 @pytest.mark.parametrize("prec", [[torch.bfloat16]])
 @pytest.mark.parametrize("TILE_M_DOWN", [64])
@@ -1209,13 +1434,24 @@ def run_acc_test(TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=64, HIDDEN_SIZE=4096, 
     test_acc_mxn_splitk_2s_fp8(batch=get_batch_list('mxn_splitk_2s'), prec=[get_fp8type()], TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, quant_type='block')
     test_acc_mxn_splitk_2s_fp4(batch=get_batch_list('mxn_splitk_2s'), prec=[get_fp4type_if_valid()], TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
 
-def show_perf(perflist):
+def show_perf(perflist, relative_to_batch=None):
     print('\nsummary:')
     for perf in perflist:
         for kernel, vals in perf.items():
             for prec, vals_ in vals.items():
                 for b, data in vals_.items():
-                    print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
+                    relative = ''
+                    if relative_to_batch is not None:
+                        baseline = vals_[str(relative_to_batch)]
+                        relative = (
+                            f', latency {data["latency"] / baseline["latency"]:.2f}x'
+                            f', throughput {data["flops"] / baseline["flops"]:.2f}x'
+                            f' vs B={relative_to_batch}'
+                        )
+                    print(
+                        f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, '
+                        f'{data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops{relative}'
+                    )
 
 @pytest.mark.parametrize("batch", [[1, 2, 4, 8, 12, 16, 32, 64]])
 def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
@@ -1228,6 +1464,63 @@ def test_small_batch_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
     perf.append(entry_b1(prec=[torch.bfloat16, get_fp8type()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))           # batch 1
     perf.append(entry_common('16x32_2s_b', batch=batch, prec=[get_fp8type()], TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=32, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     show_perf(perf)
+    del perf
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+@pytest.mark.parametrize("batch", [[1, 2, 4, 8]])
+def test_force_batch1_path_perf(batch, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
+    perf = [
+        entry_common(
+            'fly_splitk_2s', batch=batch,
+            prec=[torch.bfloat16, get_fp8type(), get_fp4type_if_valid()],
+            HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP,
+            force_batch1_path=True,
+        )
+    ]
+    show_perf(perf, relative_to_batch=1)
+    del perf
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+@pytest.mark.parametrize("batch", [[1, 2, 4, 8]])
+def test_mxfp4_fly_default_force_perf(
+    batch, HIDDEN_SIZE=7168, INTER_SIZE=3072, TP=8
+):
+    fp4_type = get_fp4type_if_valid()
+    if fp4_type is None:
+        pytest.skip("MXFP4 FlyDSL comparison requires gfx950")
+    torch.manual_seed(0)
+    default_perf = entry_common(
+        'fly_splitk_2s', batch=batch, prec=[fp4_type],
+        TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=64,
+        HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=896, TOPK=16,
+        perf_aggregate=statistics.median,
+    )
+    torch.manual_seed(0)
+    force_perf = entry_common(
+        'fly_splitk_2s', batch=batch, prec=[fp4_type],
+        TILE_M_DOWN=16, TILE_M_GATEUP=16, TILE_N=64,
+        HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, E=896, TOPK=16,
+        force_batch1_path=True, perf_aggregate=statistics.median,
+    )
+    default_perf['fly_default'] = default_perf.pop('fly_splitk_2s')
+    force_perf['fly_force_batch1'] = force_perf.pop('fly_splitk_2s')
+    perf = [default_perf, force_perf]
+    show_perf(perf)
+    default_data = default_perf['fly_default'][str(fp4_type)]
+    force_data = force_perf['fly_force_batch1'][str(fp4_type)]
+    print('\nRelative performance:')
+    for b in batch:
+        default = default_data[str(b)]
+        force = force_data[str(b)]
+        print(
+            f'B={b:<4}: force/default latency '
+            f'{force["latency"] / default["latency"]:.2f}x, bandwidth '
+            f'{force["bw"] / default["bw"]:.2f}x'
+        )
     del perf
     torch.cuda.empty_cache()
     gc.collect()

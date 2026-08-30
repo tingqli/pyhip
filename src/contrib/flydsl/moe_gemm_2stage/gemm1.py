@@ -8,7 +8,8 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
+import torch
+from flydsl._mlir.dialects import llvm, vector
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
@@ -35,11 +36,16 @@ def _build_moe_gemm1(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    mxfp4_gate_up_interleaved=True,
+    fused_down_clear=False,
     down_path="default",
     down_output_padding_bytes=None,
     METADATA_TILE_SIZE_M=None,
 ):
     assert stage == "gateup"
+    is_gfx950 = "gfx950" in torch.cuda.get_device_properties().gcnArchName
     TILE_K = 64
     # Optional TILE_K override for the prefill_1x4 alg. The env fallback lets test_moe.py /
     # profile scripts pick BK without threading a kwarg through every caller. bf16 prefill_1x4
@@ -50,19 +56,21 @@ def _build_moe_gemm1(
     # scale form (native-fp8 prefill only) and defaults to weight_quant_type (previous behavior
     # where a single quant_type drove both).
     if act_quant_type is None:
-        act_quant_type = weight_quant_type
+        act_quant_type = "no" if weight_dtype == "fp4" else weight_quant_type
     assert (
         BLOCK_TILE_SIZE_M <= 256
     ), "BLOCK_SIZE_M must be less than or equal to 256 due to LDS size limit for sorted ids."
     assert weight_dtype in [
         "bf16",
         "fp8",
-    ], "weight_dtype must be either 'bf16' or 'fp8'"
+        "fp4",
+    ], "weight_dtype must be one of 'bf16', 'fp8' or 'fp4'"
     assert weight_quant_type in [
         "no",
         "ptpc",
         "per_tensor",
-    ], "weight_quant_type must be either 'no', 'ptpc' or 'per_tensor'"
+        "mxfp4",
+    ], "weight_quant_type must be one of 'no', 'ptpc', 'per_tensor' or 'mxfp4'"
     assert act_quant_type in [
         "no",
         "ptpc",
@@ -71,9 +79,22 @@ def _build_moe_gemm1(
     assert activation in [
         "silu",
         "swiglu",
-    ], "activation must be either 'silu' or 'swiglu'"
-    if activation == "swiglu":
+        "situv2",
+    ], "activation must be 'silu', 'swiglu' or 'situv2'"
+    if activation in ("swiglu", "situv2"):
         swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
+    if activation == "situv2":
+        situ_beta = float(situ_beta)
+        situ_linear_beta = float(situ_linear_beta)
+        assert situ_beta > 0.0, "situ_beta must be positive"
+        assert situ_linear_beta > 0.0, "situ_linear_beta must be positive"
+    if weight_dtype == "fp4":
+        assert weight_quant_type == "mxfp4" and act_quant_type == "no", (
+            "fp4 requires mxfp4 weights and bf16 activations"
+        )
+        assert K % 512 == 0, f"fp4 gateup K must be a multiple of 512, got {K}"
+    else:
+        assert weight_quant_type != "mxfp4", "mxfp4 quantization requires fp4 weights"
     if METADATA_TILE_SIZE_M is None:
         METADATA_TILE_SIZE_M = BLOCK_TILE_SIZE_M
     if stage == "gateup" and alg == "prefill_1x4":
@@ -214,6 +235,10 @@ def _build_moe_gemm1(
         weight_dtype = fx.BFloat16
     elif weight_dtype == "fp8":
         weight_dtype = fx.Float8E4M3FNUZ
+    elif weight_dtype == "fp4":
+        assert alg in ("batch1", "splitk"), "fp4 is only supported by batch1/splitk"
+        assert is_gfx950, "fp4 batch1/splitk is only supported on gfx950"
+        weight_dtype = fx.Float4E2M1FN
 
     def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
         """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
@@ -273,7 +298,7 @@ def _build_moe_gemm1(
             self.offset_thread_k = offset_thread // tile_m
 
         @flyc.jit
-        def copy(self, copy_atom, k_idx, frag: fx.Tensor):
+        def copy(self, copy_atom, k_idx, frag: fx.Tensor, extra_offset=0):
             layout = fx.get_layout(self.fake_tensor_thr)
             shape = fx.get_shape(self.fake_tensor_thr)
             rep_m = fx.size(shape[1]).to_py_value()
@@ -306,7 +331,9 @@ def _build_moe_gemm1(
                         offset_k_in_tile = offset_block_k + self.offset_thread_k
                         reg = frag[None, m, k]
                         mem = fx.make_view(
-                            fx.get_iter(tensor_sub_block) + offset_k_in_tile,
+                            fx.get_iter(tensor_sub_block)
+                            + offset_k_in_tile
+                            + extra_offset,
                             fx.make_layout(value_size, stride_size),
                         )
                         if const_expr(self.is_read_from_mem):
@@ -393,6 +420,228 @@ def _build_moe_gemm1(
             crd = fx.idx2crd(i, layout)
             dst_tensor[crd] = vec[i]
 
+    def _mxfp4_scale_index(
+        expert_id,
+        blk_n,
+        local_n,
+        k_group,
+        gateup_contiguous_n,
+    ):
+        groups_padded = ((K // 32 + 7) // 8) * 8
+        if const_expr(gateup_contiguous_n is not None):
+            grouped_n = blk_n * BLOCK_TILE_SIZE_N + local_n
+            group_n = grouped_n // (2 * gateup_contiguous_n)
+            within_group = grouped_n % (2 * gateup_contiguous_n)
+            gate_up_idx = within_group // gateup_contiguous_n
+            channel = group_n * gateup_contiguous_n + within_group % gateup_contiguous_n
+            if const_expr(mxfp4_gate_up_interleaved):
+                group = fx.Int64(k_group)
+                return (
+                    fx.Int64(expert_id) * N * groups_padded
+                    + (fx.Int64(channel) // 16 * groups_padded) * 32
+                    + (group // 8) * 256
+                    + (group % 4) * 64
+                    + (fx.Int64(channel) % 16) * 4
+                    + (group % 8 // 4) * 2
+                    + gate_up_idx
+                )
+            row_in_expert = channel + gate_up_idx * (N // 2)
+            row = fx.Int64(expert_id) * N + fx.Int64(row_in_expert)
+        else:
+            row = (
+                fx.Int64(expert_id) * N
+                + fx.Int64(blk_n * BLOCK_TILE_SIZE_N + local_n)
+            )
+
+        group = fx.Int64(k_group)
+        return (
+            (row // 32 * groups_padded) * 32
+            + (group // 8) * 256
+            + (group % 4) * 64
+            + (row % 16) * 4
+            + (group % 8 // 4) * 2
+            + (row % 32 // 16)
+        )
+
+    def _mxfp4_scale_from_dword(packed_scale, byte_idx):
+        shift = fx.Uint32(byte_idx) * 8
+        scale_bits = ((packed_scale >> shift) & 0xFF) << 23
+        return scale_bits.bitcast(fx.Float32)
+
+    def _load_mxfp4_packed_scales(
+        src_tensor,
+        p_w_scale,
+        expert_id,
+        blk_n,
+        k_idx,
+        tile_k_per_wg,
+        tid,
+        gateup_contiguous_n,
+    ):
+        n_rows = fx.size(fx.get_shape(src_tensor)).to_py_value() // 4
+        if const_expr(gateup_contiguous_n is not None and tile_k_per_wg == 512):
+            wave_id = tid // 64
+            lane_group = tid % 64 // 16
+            k_group = wave_id * (K // 4 // 32) + k_idx * (128 // 32) + lane_group
+        else:
+            k_group = k_idx * (tile_k_per_wg // 32) + tid // 16
+        scale_byte_ptr = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_w_scale))
+        scale_u32_type = fx.PointerType.get(
+            fx.Uint32.ir_type, scale_byte_ptr.memspace, 4
+        )
+        scale_u32_ptr = fx.recast_iter(scale_u32_type, scale_byte_ptr)
+        packed_scale_rows = [None] * n_rows
+        if const_expr(
+            gateup_contiguous_n is not None and mxfp4_gate_up_interleaved
+        ):
+            rows_per_half = n_rows // 2
+            for channel_block in range_constexpr(rows_per_half):
+                local_n = tid % 16 + channel_block * 16
+                scale_idx = _mxfp4_scale_index(
+                    expert_id,
+                    blk_n,
+                    local_n,
+                    k_group,
+                    gateup_contiguous_n,
+                )
+                packed_scale = scale_u32_ptr[scale_idx // 4]
+                packed_scale_rows[channel_block] = packed_scale
+                packed_scale_rows[channel_block + rows_per_half] = packed_scale
+        elif const_expr(
+            n_rows >= 2
+            and (gateup_contiguous_n is None or BLOCK_TILE_SIZE_N >= 64)
+        ):
+            for row_pair in range_constexpr(n_rows // 2):
+                local_n = tid % 16 + row_pair * 32
+                scale_idx = _mxfp4_scale_index(
+                    expert_id,
+                    blk_n,
+                    local_n,
+                    k_group,
+                    gateup_contiguous_n,
+                )
+                packed_scale = scale_u32_ptr[scale_idx // 4]
+                packed_scale_rows[row_pair * 2] = packed_scale
+                packed_scale_rows[row_pair * 2 + 1] = packed_scale
+        else:
+            for row in range_constexpr(n_rows):
+                local_n = tid % 16 + row * 16
+                scale_idx = _mxfp4_scale_index(
+                    expert_id,
+                    blk_n,
+                    local_n,
+                    k_group,
+                    gateup_contiguous_n,
+                )
+                packed_scale_rows[row] = scale_u32_ptr[scale_idx // 4]
+        return packed_scale_rows
+
+    def _load_mxfp4_inputs(
+        src_tensor,
+        p_w_scale,
+        expert_id,
+        blk_n,
+        k_idx,
+        tile_k_per_wg,
+        tid,
+        gateup_contiguous_n,
+        packed_scale_rows=None,
+    ):
+        n_dwords = fx.size(fx.get_shape(src_tensor)).to_py_value()
+        src_vec = src_tensor.load()
+        if const_expr(gateup_contiguous_n is not None and tile_k_per_wg == 512):
+            wave_id = tid // 64
+            lane_group = tid % 64 // 16
+            k_group = wave_id * (K // 4 // 32) + k_idx * (128 // 32) + lane_group
+        else:
+            k_group = k_idx * (tile_k_per_wg // 32) + tid // 16
+        n_rows = n_dwords // 4
+        if const_expr(packed_scale_rows is None):
+            packed_scale_rows = _load_mxfp4_packed_scales(
+                src_tensor,
+                p_w_scale,
+                expert_id,
+                blk_n,
+                k_idx,
+                tile_k_per_wg,
+                tid,
+                gateup_contiguous_n,
+            )
+
+        scales = []
+        for row in range_constexpr(n_rows):
+            scale_idx = _mxfp4_scale_index(
+                expert_id,
+                blk_n,
+                tid % 16 + row * 16,
+                k_group,
+                gateup_contiguous_n,
+            )
+            scales.append(
+                _mxfp4_scale_from_dword(packed_scale_rows[row], scale_idx % 4)
+            )
+        return src_vec, scales, packed_scale_rows
+
+    def _decode_mxfp4_dword(packed, scale):
+        items = []
+        for byte_idx in range_constexpr(4):
+            pair = llvm.call_intrinsic(
+                T.vec(2, T.bf16),
+                "llvm.amdgcn.cvt.scalef32.pk.bf16.fp4",
+                [
+                    as_ir_value(packed),
+                    as_ir_value(scale),
+                    as_ir_value(fx.Int32(byte_idx)),
+                ],
+                [],
+                [],
+            )
+            items.append(
+                fx.BFloat16(
+                    vector.extract(pair, static_position=[0], dynamic_position=[])
+                )
+            )
+            items.append(
+                fx.BFloat16(
+                    vector.extract(pair, static_position=[1], dynamic_position=[])
+                )
+            )
+        return Vec.from_elements(items, fx.BFloat16)
+
+    def _cvt_mxfp4_bf16(
+        src_tensor,
+        dst_tensor,
+        p_w_scale,
+        expert_id,
+        blk_n,
+        k_idx,
+        tile_k_per_wg,
+        tid,
+        gateup_contiguous_n,
+        packed_scale_rows=None,
+    ):
+        src_vec, scales, _ = _load_mxfp4_inputs(
+            src_tensor,
+            p_w_scale,
+            expert_id,
+            blk_n,
+            k_idx,
+            tile_k_per_wg,
+            tid,
+            gateup_contiguous_n,
+            packed_scale_rows,
+        )
+        n_dwords = src_vec.numel
+        items = []
+        for i in range_constexpr(n_dwords):
+            decoded = _decode_mxfp4_dword(src_vec[i], scales[i // 4])
+            for value_idx in range_constexpr(8):
+                items.append(decoded[value_idx])
+        vec = Vec.from_elements(items, fx.BFloat16)
+        layout = fx.get_layout(dst_tensor)
+        for i in range_constexpr(8 * n_dwords):
+            dst_tensor[fx.idx2crd(i, layout)] = vec[i]
+
     def _clamp_gateup(gate, up):
         neg_limit = fx.Float32(-swiglu_limit)
         gate = -((-gate).maximumf(neg_limit))
@@ -404,6 +653,26 @@ def _build_moe_gemm1(
         neg_alpha_log2e = -1.702 * 1.4426950408889634
         tmp = rocdl.exp2(T.f32, _raw(gate * neg_alpha_log2e))
         return (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * (up + 1.0)
+
+    def _sigmoid(value):
+        tmp = rocdl.exp2(T.f32, _raw(value * -1.4426950408889634))
+        return rocdl.rcp(T.f32, 1.0 + tmp)
+
+    def _tanh(value):
+        abs_value = value.maximumf(-value)
+        exp_value = rocdl.exp2(T.f32, _raw(abs_value * -2.8853900817779268))
+        tanh_abs = (1.0 - exp_value) * rocdl.rcp(T.f32, 1.0 + exp_value)
+        return (value > fx.Float32(0.0)).select(tanh_abs, -tanh_abs)
+
+    def _situv2(gate, up):
+        gate, up = _clamp_gateup(gate, up)
+        beta = fx.Float32(situ_beta)
+        beta_rcp = fx.Float32(1.0 / situ_beta)
+        linear_beta = fx.Float32(situ_linear_beta)
+        linear_beta_rcp = fx.Float32(1.0 / situ_linear_beta)
+        situ_gate = beta * _tanh(gate * beta_rcp) * _sigmoid(gate)
+        up_scaled = linear_beta * _tanh(up * linear_beta_rcp)
+        return situ_gate * up_scaled
 
     def _apply_scale_gateup_bf16(
         c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale
@@ -476,6 +745,9 @@ def _build_moe_gemm1(
             if const_expr(activation == "swiglu"):
                 for j in range_constexpr(gate.numel):
                     acc.append(_swiglu_oai(gate[j], up[j]))
+            elif const_expr(activation == "situv2"):
+                for j in range_constexpr(gate.numel):
+                    acc.append(_situv2(gate[j], up[j]))
             else:
                 log2_exp1 = -1.4426950408889634
                 gate_log2 = gate * log2_exp1
@@ -528,6 +800,8 @@ def _build_moe_gemm1(
                         u = u * a_sc
                     if const_expr(activation == "swiglu"):
                         acc.append(_swiglu_oai(g, u))
+                    elif const_expr(activation == "situv2"):
+                        acc.append(_situv2(g, u))
                     else:
                         tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
                         acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
@@ -541,19 +815,37 @@ def _build_moe_gemm1(
         return out_bf16
 
     def _make_gateup_weight_view(p_weight, expert_id, contiguous_n):
-        # Preshuffle weight [16, (element_num, K//element_num)] composed with the gate/up silu
-        # grouping. Shared by the splitk / batch1 / prefill_1x4 gateup kernels.
+        # mxfp4_gate_up_interleaved selects AITER's production GUGU layout;
+        # False retains the generic GGUU preshuffle. BF16/FP8 use generic layout.
+        storage_k = K // 2 if const_expr(weight_dtype == fx.Float4E2M1FN) else K
         group_layout_silu = fx.make_layout(
-            ((contiguous_n, 2, N // (contiguous_n * 2)), K),
+            ((contiguous_n, 2, N // (contiguous_n * 2)), storage_k),
             ((1, N // 2, contiguous_n), N),
         )
+        if const_expr(
+            weight_dtype == fx.Float4E2M1FN and mxfp4_gate_up_interleaved
+        ):
+            return fx.make_view(
+                p_weight + fx.Int64(expert_id) * N * storage_k,
+                fx.composition(
+                    fx.make_layout(
+                        (((16, N // 32), 2), (16, 4, storage_k // 64)),
+                        (
+                            ((16, 32 * storage_k), 16 * storage_k),
+                            (1, 256, 1024),
+                        ),
+                    ),
+                    group_layout_silu,
+                ),
+            )
+
         element_num = 16 // (p_weight.dtype.width // 8)
         return fx.make_view(
-            p_weight + fx.Int64(expert_id * N * K),
+            p_weight + fx.Int64(expert_id) * N * storage_k,
             fx.composition(
                 fx.make_layout(
-                    ((16, N // 16), (element_num, K // element_num)),
-                    ((element_num, 16 * K), (1, 16 * element_num)),
+                    ((16, N // 16), (element_num, storage_k // element_num)),
+                    ((element_num, 16 * storage_k), (1, 16 * element_num)),
                 ),
                 group_layout_silu,
             ),
@@ -563,9 +855,9 @@ def _build_moe_gemm1(
         arg_p_weight, arg_p_input, tiled_mma, blk_n, TILE_N, tile_k_per_wg, tid
     ):
         # B (weight) operand setup for _gemm_splitk. bf16: load directly as the MFMA B-operand
-        # (b_frag and b_frag_retile are two views of the same storage). fp8: load as packed
-        # uint32 (4 fp8/dword) for cvt_fp8_bf16 in the main loop -- b_frag is the bf16 decompress
-        # target, b_frag_retile the uint32 load target (DIFFERENT storage). Returns
+        # (b_frag and b_frag_retile are two views of the same storage). fp8/mxfp4: load packed
+        # uint32 values for decompression in the main loop -- b_frag is the bf16 target and
+        # b_frag_retile is the uint32 load target (DIFFERENT storage). Returns
         # (b_cp_atom_r, b_tensor_thr, b_frag, b_frag_retile).
         if weight_dtype == fx.BFloat16:
             b_tensor = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
@@ -586,7 +878,7 @@ def _build_moe_gemm1(
             ]
             return b_cp_atom_r, b_tensor_thr, b_frag, b_frag_retile
 
-        # b_frag will be decompressed from fp8
+        # b_frag will be decompressed from fp8 or packed mxfp4.
         b_fake_tensor = fx.make_view(
             fx.get_iter(arg_p_input),
             fx.make_layout((TILE_N, tile_k_per_wg), (tile_k_per_wg, 1)),
@@ -615,10 +907,18 @@ def _build_moe_gemm1(
             fx.recast_layout(fx.get_layout(arg_p_weight), 8, 32),
         )
         b_tensor_u32 = fx.rocdl.make_buffer_tensor(arg_w_u32, max_size=False)
-        b_tile = fx.flat_divide(b_tensor_u32, fx.make_tile(TILE_N, tile_k_per_wg // 4))[
-            None, None, blk_n, None
-        ]
-        b_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Uint32)
+        packed_per_dword = 8 if const_expr(weight_dtype == fx.Float4E2M1FN) else 4
+        b_tile = fx.flat_divide(
+            b_tensor_u32, fx.make_tile(TILE_N, tile_k_per_wg // packed_per_dword)
+        )[None, None, blk_n, None]
+        b_cp_atom_r = fx.make_copy_atom(
+            (
+                fx.rocdl.BufferCopy128b(cache_modifier=3)
+                if const_expr(weight_dtype == fx.Float4E2M1FN)
+                else fx.rocdl.BufferCopy128b()
+            ),
+            fx.Uint32,
+        )
         # uint32 thread-value layout mirrors the fp8 tv_layout_B_tiled. Recasting the fp8
         # weight to uint32 keeps the thread's contiguous-inner stride (1) but divides the
         # K-group stride by 4 (4 fp8 = 1 dword), so derive the uint32 thread strides from
@@ -632,12 +932,15 @@ def _build_moe_gemm1(
         _n1 = fx.get_scalar(_tvB.shape[0][1])
         _s0 = fx.get_scalar(_tvB.stride[0][0])
         _s1 = fx.get_scalar(_tvB.stride[0][1])
-        _s0 = _s0 if _s0 < 4 else _s0 // 4
-        _s1 = _s1 if _s1 < 4 else _s1 // 4
-        tv_u32 = fx.make_layout(((_n0, _n1), 4), ((_s0, _s1), n_mma))
+        _s0 = _s0 if _s0 < packed_per_dword else _s0 // packed_per_dword
+        _s1 = _s1 if _s1 < packed_per_dword else _s1 // packed_per_dword
+        values_per_copy = 4
+        tv_u32 = fx.make_layout(
+            ((_n0, _n1), values_per_copy), ((_s0, _s1), n_mma)
+        )
         tile_mn = fx.make_tile(
             fx.make_layout(n_mma, 1),
-            fx.make_layout(tile_k_per_wg // 4, 1),
+            fx.make_layout(tile_k_per_wg // packed_per_dword, 1),
         )
         b_tiled_thr = fx.make_tiled_copy(b_cp_atom_r, tv_u32, tile_mn).get_slice(tid)
         b_tensor_thr = b_tiled_thr.partition_S(b_tile)
@@ -658,28 +961,46 @@ def _build_moe_gemm1(
         lds,
         splitk_waves=4,
         a_with_index=True,
+        p_w_scale=None,
+        expert_id=None,
+        gateup_contiguous_n=None,
     ):
         tid = gpu.thread_idx.x
 
-        tile_k_per_wg = TILE_K * splitk_waves
+        tile_k_per_wave = 128 if const_expr(weight_dtype == fx.Float4E2M1FN) else TILE_K
+        tile_k_per_wg = tile_k_per_wave * splitk_waves
+        fp4_jit_kmap = (
+            weight_dtype == fx.Float4E2M1FN
+            and splitk_waves == 4
+            and gateup_contiguous_n is not None
+        )
 
         a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
         a_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), arg_p_input.dtype)
 
         # tiled copy is created based on the tiled_mma, so the tiled_mma should be same size for tiled copy
-        rep_k_per_lane = 4 if const_expr(weight_dtype != fx.BFloat16) else 2
-        k_perm = fx.make_tile(
-            None,
-            None,
-            fx.make_layout(
-                (4, 4 * splitk_waves, rep_k_per_lane), (1, 4 * rep_k_per_lane, 4)
-            ),
-        )
-        # splitk always uses a bf16 MFMA(16,16,16): fp8 weights are decompressed to bf16 in
-        # the main loop (cvt_fp8_bf16) before the gemm, so the mma dtype is bf16 in both paths.
-        # (native-fp8 MFMA(16,16,32) is the prefill_1x4 path, not splitk.)
+        if const_expr(weight_dtype == fx.Float4E2M1FN):
+            k_perm = fx.make_tile(
+                None,
+                None,
+                fx.make_layout((8, 4 * splitk_waves, 4), (1, 32, 8)),
+            )
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
+        else:
+            rep_k_per_lane = 4 if const_expr(weight_dtype != fx.BFloat16) else 2
+            k_perm = fx.make_tile(
+                None,
+                None,
+                fx.make_layout(
+                    (4, 4 * splitk_waves, rep_k_per_lane),
+                    (1, 4 * rep_k_per_lane, 4),
+                ),
+            )
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+        # Split-k always uses bf16 MFMA operands after weight decompression. MXFP4 on gfx950
+        # uses K32 to match the JIT path; bf16/fp8 retain the existing K16 path.
         tiled_mma = fx.make_tiled_mma(
-            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+            mma_atom,
             # splitk for gateup/down
             fx.make_layout((1, 1, splitk_waves), (0, 0, 1)),
             k_perm,
@@ -740,23 +1061,128 @@ def _build_moe_gemm1(
         c_frag = tiled_mma.make_fragment_C(c_fake_tensor)
         c_frag.fill(0)
 
-        num_k_iters = K // TILE_K // splitk_waves
+        num_k_iters = K // tile_k_per_wg
+
+        def _a_k_offset(k_idx):
+            if const_expr(fp4_jit_kmap):
+                wave_id = tid // 64
+                return (
+                    wave_id * (K // splitk_waves - tile_k_per_wave)
+                    + k_idx * (tile_k_per_wave - tile_k_per_wg)
+                )
+            return 0
+
+        def _b_k_offset(k_idx):
+            if const_expr(fp4_jit_kmap):
+                wave_id = tid // 64
+                return (
+                    wave_id * (K // 2 - 2 * tile_k_per_wave)
+                    + k_idx * (2 * tile_k_per_wave - 2 * tile_k_per_wg)
+                )
+            return 0
+
+        def _gemm_stage(buf, k_idx, packed_scale_rows=None):
+            if const_expr(weight_dtype == fx.Float4E2M1FN):
+                _cvt_mxfp4_bf16(
+                    b_frag_retile[buf],
+                    b_frag[buf],
+                    p_w_scale,
+                    expert_id,
+                    blk_n,
+                    k_idx,
+                    tile_k_per_wg,
+                    tid,
+                    gateup_contiguous_n,
+                    packed_scale_rows,
+                )
+            else:
+                if const_expr(weight_dtype != fx.BFloat16):
+                    _cvt_fp8_bf16(b_frag_retile[buf], b_frag[buf])
+            fx.gemm(tiled_mma, c_frag, b_frag[buf], a_frag[buf], c_frag)
 
         def _prefetch_a(k_idx, buf):
+            extra_offset = _a_k_offset(k_idx)
             if const_expr(a_with_index):
-                a_tensor_thr.copy(a_cp_atom_r, k_idx, a_frag_retile[buf])
+                a_tensor_thr.copy(
+                    a_cp_atom_r,
+                    k_idx,
+                    a_frag_retile[buf],
+                    extra_offset=extra_offset,
+                )
             else:
+                src = a_tensor_thr[None, None, None, k_idx]
+                if const_expr(fp4_jit_kmap):
+                    src = fx.make_view(
+                        fx.add_offset(fx.get_iter(src), extra_offset),
+                        fx.get_layout(src),
+                    )
                 fx.copy(
                     a_cp_atom_r,
-                    a_tensor_thr[None, None, None, k_idx],
+                    src,
                     a_frag_retile[buf],
                 )
 
-        # Prefetch iteration 0 into buffer 0
-        _prefetch_a(fx.Int32(0), 0)
-        fx.copy(
-            b_cp_atom_r, b_tensor_thr[None, None, None, fx.Int32(0)], b_frag_retile[0]
+        def _prefetch_b(k_idx, buf):
+            src = b_tensor_thr[None, None, None, k_idx]
+            if const_expr(fp4_jit_kmap):
+                src = fx.make_view(
+                    fx.add_offset(fx.get_iter(src), _b_k_offset(k_idx)),
+                    fx.get_layout(src),
+                )
+            fx.copy(b_cp_atom_r, src, b_frag_retile[buf])
+
+        down_pair_scales = (
+            weight_dtype == fx.Float4E2M1FN and tile_k_per_wg == 128
         )
+        if const_expr(down_pair_scales):
+            _prefetch_b(fx.Int32(0), 0)
+            _prefetch_a(fx.Int32(0), 0)
+            rocdl.sched_barrier(0)
+
+        down_packed_scale_pairs = None
+        if const_expr(down_pair_scales):
+            down_packed_scale_pairs = []
+            for pair_idx in range_constexpr((num_k_iters + 1) // 2):
+                down_packed_scale_pairs.append(
+                    _load_mxfp4_packed_scales(
+                        b_frag_retile[0],
+                        p_w_scale,
+                        expert_id,
+                        blk_n,
+                        fx.Int32(pair_idx * 2),
+                        tile_k_per_wg,
+                        tid,
+                        gateup_contiguous_n,
+                    )
+                )
+
+        gate_pair_scales = (
+            fp4_jit_kmap and BLOCK_TILE_SIZE_N == 32 and K % 1024 == 0
+        )
+        if const_expr(gate_pair_scales):
+            _prefetch_b(fx.Int32(0), 0)
+            _prefetch_a(fx.Int32(0), 0)
+
+        gate_packed_scale_rows = None
+        if const_expr(gate_pair_scales):
+            gate_packed_scale_rows = _load_mxfp4_packed_scales(
+                b_frag_retile[0],
+                p_w_scale,
+                expert_id,
+                blk_n,
+                fx.Int32(0),
+                tile_k_per_wg,
+                tid,
+                gateup_contiguous_n,
+            )
+
+        if const_expr(not down_pair_scales and not gate_pair_scales):
+            if const_expr(weight_dtype == fx.Float4E2M1FN):
+                _prefetch_b(fx.Int32(0), 0)
+                _prefetch_a(fx.Int32(0), 0)
+            else:
+                _prefetch_a(fx.Int32(0), 0)
+                _prefetch_b(fx.Int32(0), 0)
 
         acc_init = c_frag.load()
 
@@ -767,53 +1193,166 @@ def _build_moe_gemm1(
         if const_expr(weight_dtype == fx.BFloat16):
             b_vmem_cnt = b_frag_retile[0].load().numel * weight_dtype.width // 8 // 16
         else:
-            b_vmem_cnt = (
-                b_frag_retile[0].load().numel * 4 // 16
-            )  # uint32 dwords -> 128b loads
+            b_vmem_cnt = b_frag_retile[0].load().numel * 4 // 16
         vmcnt_per_prefetch = a_vmem_cnt + b_vmem_cnt
+        gate_scale_vmem_cnt = b_frag_retile[0].load().numel // 4
 
-        splitk_stage_mask = 0x20 if stage == "down" and alg == "batch1" else 0
-        rocdl.sched_barrier(splitk_stage_mask)
+        rocdl.sched_barrier(0)
 
-        # Main loop: 2x unrolled ping-pong (even iter uses buf 0, odd iter uses buf 1)
-        for k2, state in range(0, num_k_iters // 2, 1, init=[acc_init]):
-            c_frag.store(state[0])
-            k_base = fx.Int32(k2 * 2)
-            # --- even iteration: compute buf[0], prefetch into buf[1] ---
-            _prefetch_a(k_base + 1, 1)
-            fx.copy(
-                b_cp_atom_r,
-                b_tensor_thr[None, None, None, k_base + 1],
-                b_frag_retile[1],
-            )
-            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
-            rocdl.sched_barrier(splitk_stage_mask)
-            if const_expr(weight_dtype != fx.BFloat16):
-                _cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
-            fx.gemm(tiled_mma, c_frag, b_frag[0], a_frag[0], c_frag)
-            rocdl.sched_barrier(splitk_stage_mask)
-            # --- odd iteration: compute buf[1], prefetch into buf[0] ---
-            _prefetch_a(k_base + 2, 0)
-            fx.copy(
-                b_cp_atom_r,
-                b_tensor_thr[None, None, None, k_base + 2],
-                b_frag_retile[0],
-            )
-            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
-            rocdl.sched_barrier(splitk_stage_mask)
-            if const_expr(weight_dtype != fx.BFloat16):
-                _cvt_fp8_bf16(b_frag_retile[1], b_frag[1])
-            fx.gemm(tiled_mma, c_frag, b_frag[1], a_frag[1], c_frag)
-            rocdl.sched_barrier(splitk_stage_mask)
-
-            results = yield [c_frag.load()]
-        c_frag.store(results)
-
-        # Tail: if num_k_iters is odd, process the last iteration with buf[0]
-        if const_expr(num_k_iters % 2 == 1):
-            if const_expr(weight_dtype != fx.BFloat16):
-                _cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
-            fx.gemm(tiled_mma, c_frag, b_frag[0], a_frag[0], c_frag)
+        if const_expr(weight_dtype == fx.Float4E2M1FN):
+            c_frag.store(acc_init)
+            if const_expr(fp4_jit_kmap and K % 1024 == 0):
+                for pair_idx in range_constexpr(num_k_iters // 2):
+                    even_idx = fx.Int32(pair_idx * 2)
+                    odd_idx = even_idx + 1
+                    if const_expr(BLOCK_TILE_SIZE_N == 32):
+                        packed_scale_rows = gate_packed_scale_rows
+                    else:
+                        packed_scale_rows = _load_mxfp4_packed_scales(
+                            b_frag_retile[0],
+                            p_w_scale,
+                            expert_id,
+                            blk_n,
+                            even_idx,
+                            tile_k_per_wg,
+                            tid,
+                            gateup_contiguous_n,
+                        )
+                    _prefetch_b(odd_idx, 1)
+                    _prefetch_a(odd_idx, 1)
+                    rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                    rocdl.sched_barrier(0)
+                    rocdl.s_setprio(1)
+                    _gemm_stage(0, even_idx, packed_scale_rows)
+                    rocdl.s_setprio(0)
+                    rocdl.sched_barrier(0)
+                    if const_expr(pair_idx + 1 < num_k_iters // 2):
+                        next_even_idx = even_idx + 2
+                        if const_expr(BLOCK_TILE_SIZE_N == 32):
+                            next_gate_packed_scale_rows = _load_mxfp4_packed_scales(
+                                b_frag_retile[0],
+                                p_w_scale,
+                                expert_id,
+                                blk_n,
+                                next_even_idx,
+                                tile_k_per_wg,
+                                tid,
+                                gateup_contiguous_n,
+                            )
+                        _prefetch_b(next_even_idx, 0)
+                        _prefetch_a(next_even_idx, 0)
+                        rocdl.s_waitcnt(
+                            _encode_waitcnt(
+                                vmcnt=(
+                                    vmcnt_per_prefetch + gate_scale_vmem_cnt
+                                    if BLOCK_TILE_SIZE_N == 32
+                                    else vmcnt_per_prefetch
+                                )
+                            )
+                        )
+                    else:
+                        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+                    rocdl.sched_barrier(0)
+                    rocdl.s_setprio(1)
+                    _gemm_stage(1, odd_idx, packed_scale_rows)
+                    rocdl.s_setprio(0)
+                    rocdl.sched_barrier(0)
+                    if const_expr(
+                        BLOCK_TILE_SIZE_N == 32
+                        and pair_idx + 1 < num_k_iters // 2
+                    ):
+                        gate_packed_scale_rows = next_gate_packed_scale_rows
+            elif const_expr(fp4_jit_kmap):
+                for k_idx in range_constexpr(num_k_iters):
+                    read_buf = k_idx & 1
+                    packed_scale_rows = _load_mxfp4_packed_scales(
+                        b_frag_retile[read_buf],
+                        p_w_scale,
+                        expert_id,
+                        blk_n,
+                        fx.Int32(k_idx),
+                        tile_k_per_wg,
+                        tid,
+                        gateup_contiguous_n,
+                    )
+                    if const_expr(k_idx + 1 < num_k_iters):
+                        write_buf = read_buf ^ 1
+                        next_idx = fx.Int32(k_idx + 1)
+                        _prefetch_b(next_idx, write_buf)
+                        _prefetch_a(next_idx, write_buf)
+                        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                    else:
+                        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+                    rocdl.sched_barrier(0)
+                    rocdl.s_setprio(1)
+                    _gemm_stage(read_buf, fx.Int32(k_idx), packed_scale_rows)
+                    rocdl.s_setprio(0)
+                    rocdl.sched_barrier(0)
+            elif const_expr(tile_k_per_wg == 128):
+                for pair_idx in range_constexpr((num_k_iters + 1) // 2):
+                    even_idx = fx.Int32(pair_idx * 2)
+                    odd_idx = even_idx + 1
+                    packed_scale_rows = down_packed_scale_pairs[pair_idx]
+                    if const_expr(pair_idx * 2 + 1 < num_k_iters):
+                        _prefetch_b(odd_idx, 1)
+                        _prefetch_a(odd_idx, 1)
+                        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                    else:
+                        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+                    rocdl.sched_barrier(0)
+                    rocdl.s_setprio(1)
+                    _gemm_stage(0, even_idx, packed_scale_rows)
+                    rocdl.s_setprio(0)
+                    rocdl.sched_barrier(0)
+                    if const_expr(pair_idx * 2 + 1 < num_k_iters):
+                        if const_expr(pair_idx * 2 + 2 < num_k_iters):
+                            next_even_idx = even_idx + 2
+                            _prefetch_b(next_even_idx, 0)
+                            _prefetch_a(next_even_idx, 0)
+                            rocdl.s_waitcnt(
+                                _encode_waitcnt(vmcnt=vmcnt_per_prefetch)
+                            )
+                        else:
+                            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+                        rocdl.sched_barrier(0)
+                        rocdl.s_setprio(1)
+                        _gemm_stage(1, odd_idx, packed_scale_rows)
+                        rocdl.s_setprio(0)
+                        rocdl.sched_barrier(0)
+            else:
+                for k_idx in range_constexpr(num_k_iters):
+                    read_buf = k_idx & 1
+                    if const_expr(k_idx + 1 < num_k_iters):
+                        write_buf = read_buf ^ 1
+                        next_idx = fx.Int32(k_idx + 1)
+                        _prefetch_a(next_idx, write_buf)
+                        _prefetch_b(next_idx, write_buf)
+                        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                    else:
+                        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+                    rocdl.sched_barrier(0)
+                    _gemm_stage(read_buf, fx.Int32(k_idx))
+                    rocdl.sched_barrier(0)
+        else:
+            for k2, state in range(0, num_k_iters // 2, 1, init=[acc_init]):
+                c_frag.store(state[0])
+                k_base = fx.Int32(k2 * 2)
+                _prefetch_a(k_base + 1, 1)
+                _prefetch_b(k_base + 1, 1)
+                rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                rocdl.sched_barrier(0)
+                _gemm_stage(0, k_base)
+                rocdl.sched_barrier(0)
+                _prefetch_a(k_base + 2, 0)
+                _prefetch_b(k_base + 2, 0)
+                rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                rocdl.sched_barrier(0)
+                _gemm_stage(1, k_base + 1)
+                rocdl.sched_barrier(0)
+                results = yield [c_frag.load()]
+            c_frag.store(results)
+            if const_expr(num_k_iters % 2 == 1):
+                _gemm_stage(0, fx.Int32(num_k_iters - 1))
 
         # [v, n, m] -> [v, m, n]
         c_frag = _select(c_frag, [0, 2, 1])
@@ -927,7 +1466,10 @@ def _build_moe_gemm1(
                     c_frag_reduce[0, m, None].store(acc)
                 else:
                     c_frag_reduce[None, m, (None, n)].store(acc)
-                gpu.barrier()
+                if const_expr(
+                    m * n_blocks + n + 1 < (TILE_M // 16) * n_blocks
+                ):
+                    gpu.barrier()
 
         return c_frag_reduce
 
@@ -1430,6 +1972,9 @@ def _build_moe_gemm1(
                 arg_p_weight,
                 lds,
                 splitk_waves=4,
+                p_w_scale=p_w_scale,
+                expert_id=expert_id,
+                gateup_contiguous_n=contiguous_n,
             )
 
             c_frag_bf16 = _apply_scale_gateup_bf16(
@@ -1446,17 +1991,23 @@ def _build_moe_gemm1(
         p_weight: fx.Pointer,  # quantized/bf16 [N/16, K/8 * 16 * 8]
         p_output: fx.Pointer,  # bf16 [M, TOPK, N//2]
         p_topk_ids: fx.Pointer,  # int32 [M, TOPK]
+        p_clear_output: fx.Pointer,
         p_w_scale: fx.Pointer,
     ):
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
         e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        route_idx = batch_idx * TOPK + e_idx
 
-        arg_p_input = fx.make_view(fxh._as_ptr(p_input), fx.make_layout((1, K), (K, 1)))
+        arg_p_input = fx.make_view(
+            fxh._as_ptr(p_input) + fx.Int64(batch_idx * K),
+            fx.make_layout((1, K), (K, 1)),
+        )
         if const_expr(weight_dtype != fx.BFloat16):
             p_weight = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_weight))
         arg_p_expert_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
-        expert_id = arg_p_expert_ids[e_idx]
+        expert_id = arg_p_expert_ids[route_idx]
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         # gate/up group width. BN==32 keeps the 4-wave split-K but uses a dedicated reduce below;
         # BN>=64 uses the coalesced reduce in gemm_splitk.
@@ -1475,6 +2026,9 @@ def _build_moe_gemm1(
             lds,
             splitk_waves=4,
             a_with_index=False,
+            p_w_scale=p_w_scale,
+            expert_id=expert_id,
+            gateup_contiguous_n=contiguous_n,
         )
 
         c_frag_bf16 = _apply_scale_gateup_bf16(
@@ -1482,7 +2036,7 @@ def _build_moe_gemm1(
         )
 
         arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output),
+            fxh._as_ptr(p_output) + fx.Int64(batch_idx * TOPK * (N // 2)),
             fx.make_layout((1, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
         )
         out_tensor = fx.rocdl.make_buffer_tensor(
@@ -1519,6 +2073,22 @@ def _build_moe_gemm1(
         c_src = c_tiled_g.get_slice(tid).retile(c_frag_bf16)
 
         fx.copy(cp_atom_w, c_src, c_dst[None, None, None, 0])
+
+        if const_expr(fused_down_clear):
+            clear_idx = blk_n * 256 + tid
+            if e_idx == 0 and clear_idx < K // 8:
+                clear_output = fx.make_view(
+                    fxh._as_ptr(p_clear_output)
+                    + fx.Int64(batch_idx * K + clear_idx * 8),
+                    fx.make_layout(8, 1),
+                )
+                clear_frag = fx.make_fragment_like(clear_output)
+                clear_frag.fill(0)
+                fx.copy(
+                    fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
+                    clear_frag,
+                    clear_output,
+                )
 
     @flyc.kernel
     def moe_2stage_gateup_prefill_1x4(
@@ -1749,14 +2319,14 @@ def _build_moe_gemm1(
         p_topk_ids: fx.Pointer,
         p_topk_weights: fx.Pointer,
         p_w_scale: fx.Pointer,
-        task_num: fx.Int32,
+        M: fx.Int32,
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
         moe_2stage_gateup_batch1(
-            p_input, p_weight, p_output, p_topk_ids, p_w_scale
-        ).launch(grid=(num_n_blocks, task_num, 1), block=(256, 1, 1), stream=stream)
+            p_input, p_weight, p_output, p_topk_ids, p_topk_weights, p_w_scale
+        ).launch(grid=(num_n_blocks, TOPK, M), block=(256, 1, 1), stream=stream)
 
     @flyc.jit
     def launch_prefill_1x4(
@@ -1815,6 +2385,10 @@ def _compile_moe_gemm1_cached(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    mxfp4_gate_up_interleaved=True,
+    fused_down_clear=False,
     METADATA_TILE_SIZE_M=None,
 ):
     del device_cache_key
@@ -1833,6 +2407,10 @@ def _compile_moe_gemm1_cached(
         tile_k=tile_k,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
+        fused_down_clear=fused_down_clear,
         down_path="default",
         down_output_padding_bytes=None,
         METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
@@ -1854,6 +2432,10 @@ def compile_moe_gemm1(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    mxfp4_gate_up_interleaved=True,
+    fused_down_clear=False,
     METADATA_TILE_SIZE_M=None,
 ):
     """Build and cache a stage1 gate-up launcher for one static configuration."""
@@ -1872,6 +2454,10 @@ def compile_moe_gemm1(
         tile_k=tile_k,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
+        fused_down_clear=fused_down_clear,
         METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
     )
 
