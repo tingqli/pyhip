@@ -142,6 +142,18 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
                    output:"void*",
                    num_tokens:"uint",
                    num_blocks:"uint"):
+    """
+    blockscale gemm的算力上限假设为2400T, 每个CU就是 2400/256=9.375 TFLOPS
+    读取带宽假定是5TB/s, 每个CU就是 5e12/256 B/s
+    M,N,K = 256,256,6144
+      按照算力bound, 6144*256*256*2/9.375e12*1e6 = 85.89us
+      按照带宽bound, 6144*256*2/(5e12/256)*1e6 = 161.06us
+    实际cache能够起到一定的减少带宽压力的作用，但是总的来说仍然是带宽bound。
+
+    按照161us估算带宽bound下算力可达到的上限几乎要减半了：
+      6144*256*256*2/161e-6*256*1e-12 = 1280 TFLOPS
+
+    """
     num_warps = 8
 
     assert AB_dtype in ["fp8", "bf16", "fp16", "f16"]
@@ -792,7 +804,12 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
     num_token_topks = J.gpr(num_tokens * TOPK)
 
     if 0:
-        """ 没有找到 persistent kernel 动态分配任务如何使用 XCD swizzle 提高L2命中率的方法 """
+        """ 没有找到 persistent kernel 动态分配任务如何使用 XCD swizzle 提高L2命中率的方法 
+        动态任务分配性能不稳定，不知道是否跟分配随机性有关，因此有一个优化思路就是预先根据
+        每个expert-block中token的数量尽量均匀分配到每个persistent kernel，这需要一个单独的
+        kernel完成分配过程，这个分配过程可以尽量把相邻的expert分给相同的XCD, 直到无法继续均匀分配为止。
+        
+        """
         blk_oc = J.blockIdx.x # split along OC
         blk_m = J.blockIdx.y #; blk_m[0] *= 0
         # num_oc_splits*num_e_blocks
@@ -855,7 +872,7 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
         # prefetch sorted ids & weights into LDS
         lds_sorted_ids = J.alloc_lds(wg_M * J.sizeof_u32)
         lds_sorted_weights = J.alloc_lds(wg_M * J.sizeof_DW)
-        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = True)
+        J.wg_load_lds(lds_sorted_ids, sorted_ids, wg_M * J.sizeof_u32, num_warps = num_warps, wait_barrier = False)
         J.wg_load_lds(lds_sorted_weights, sorted_weights, wg_M * J.sizeof_f32, num_warps = num_warps, wait_barrier = True)
 
         nrM = J.div(warp_M, 16)     # 4 @ wg_M=256
@@ -892,9 +909,7 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
                 for k in range(nrK):
                     J.global_load_dwordx4(mfma_A[m, k], vaddr, "off", mod=f"offset:{k*64}")
 
-        J.s_waitcnt(mod=f"vmcnt(0)")
-
-        # wait before first use
+        # lazy wait before first use
         #J.s_waitcnt(mod=f"vmcnt(0)")
 
         # vm_load_b, vm_load_cnt_b, vm_offset_inc_b, ds_read_b = get_mfma_loader(J, bpreshuffle, num_warps, wg_N, BLOCK_K, stride_k, 0)
@@ -984,8 +999,8 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
                     vridx[bm] += num_token_topks * J.sizeof_f32
 
             # rely on load-B-scales to do the vm_wait & sync
-            J.s_waitcnt(mod=f"vmcnt({0})")
-            J.s_barrier()
+            #J.s_waitcnt(mod=f"vmcnt({0})")
+            #J.s_barrier()
 
             # since IC is small, load all B scales into LDS: 
             sizeof_scaleB = J.div(OC, scale_BN) * J.div(IC, scale_BK) * J.sizeof_f32
@@ -995,7 +1010,7 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
                 pScaleB[:] += blk_oc * sizeof_scaleB
 
             lds_scaleB = J.alloc_lds(sizeof_scaleB)
-            J.wg_load_lds(lds_scaleB, pScaleB, sizeof_scaleB, num_warps, wait_barrier = True)
+            J.wg_load_lds(lds_scaleB, pScaleB, sizeof_scaleB, num_warps, wait_barrier = False)
 
             def ds_read_scaleB(idx_wgN):
                 # each scale is broadcasted to all lanes

@@ -403,10 +403,15 @@ def fused_moe(
     assert inter_dim*2 % wg_N == 0
     num_oc_blocks = inter_dim*2//wg_N
     num_e_blocks = sorted_expert_ids.shape[0]
-    do_perf = False
+    do_perf = True
     if do_perf:
         valid_e_blocks = num_valid_ids[0].item()//wg_M
         print(f"block_size_M:{block_size_M} valid_e_blocks = {valid_e_blocks}")
+        flops = num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2
+        # assert 0, f"{a1.shape}"
+        rw_bytes = valid_e_blocks * (w1[0, :, :].element_size() * w1[0, :, :].numel() \
+                    + a1.element_size() * a1[:block_size_M, :].numel() \
+                    + a2.element_size() * (block_size_M * block_size_N))
     if 0:
         moe_gemm_ref(activation, quant_type, topk, block_size_M, sorted_ids, sorted_expert_ids, sorted_weights, num_valid_ids,
                 a1, a1_scale,
@@ -421,7 +426,8 @@ def fused_moe(
         #print(sorted_ids)
         #print(sorted_expert_ids)
         #print(f"{num_oc_blocks=} {num_valid_ids[0].item()=} {valid_e_blocks=} / {num_e_blocks=} {inter_dim=}")
-        with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(num_oc_blocks*valid_e_blocks*wg_M*wg_N*model_dim*2, name=f"moe_gemm_8wave_gateup"):
+        # flops=flops, rw_bytes=rw_bytes
+        with contextlib.nullcontext() if not do_perf else pyhip.cudaPerf(flops = flops, rw_bytes=rw_bytes, name=f"moe_gemm_8wave_gateup"):
             if USE_GLUON2:
                 BLOCK_TILE_SIZE_M = block_size_M
                 BLOCK_TILE_SIZE_N = block_size_N
@@ -524,10 +530,10 @@ def fused_moe(
                     print(f">>>>>> Estimated tail wasted ratio is high: ({est_tail_wasted_ratio}) {est_num_workgroups} {num_CU}")
                     num_oc_splits = 4
                 else:
-                    num_oc_splits = 1
+                    num_oc_splits = 2 # 动态调度之后，切分总是能让tail更均匀
                 # print("sorted_expert_ids", sorted_expert_ids.view(-1, 5).tolist(), num_valid_ids.tolist())
 
-                #num_oc_splits = 1
+                #num_oc_splits = 2
                 #print(f"valid_e_blocks:  {valid_e_blocks} ")
 
                 if 0:
