@@ -71,7 +71,7 @@ BK = 128, 8x8 thread mapping:
 ### AC Padding read layout:
 ```
 BK是128
-sub A/B natural layout: (128, 128), (K, 1),主要针对m分组，128=16x8, 
+sub A/B natural layout: (128, 128), (K, 1),主要针对m分组，128=16x8,
 ((16, 8), BK, K//BK), ((K, 16xK), 1, BK), 根据访问的thread mapping顺序permute为：
 ((8, 16), BK, K//BK), ((16xK， K), 1, BK)
 ```
@@ -362,10 +362,54 @@ scale B,tv_layout = ((16， 4， 2， 2), 1), ((1, 32, 16, 0), 1),
 ```
 
 
-# 所有的scale load都要使用buffer 
+# 4 wave mxfp4, hybrid
+```
+TILE_M/TILE_N=256, BK=128.
+slicing之后，BM/BN=128, BK=128
+```
+### AC B tile copy:
+```
+BK = 128, 16x4 thread mapping, 32 mxfp4 elements per lane,128bit copy atom
+64 rows, 128 columns,
+```
+### AC B tv layout:
+```
+((4, 16, 4), elements_per_128b),
+((elements_per_128b x 64, 1, 16), 64)
+```
+
+### AC Padding read layout:
+```
+BK是128
+sub A/B natural layout: (128, 128), (K, 1),主要针对m分组，128=16x8,
+((16, 8), BK, K//BK), ((K, 16xK), 1, BK), 根据访问的thread mapping顺序permute为：
+((8, 16), BK, K//BK), ((16xK， K), 1, BK)
+
+((8, 2, 8), BK, K//BK), ((16xK， K, 2K), 1, BK)
+
+```
+
+### LDS for B per slice
+B LDS layout:(128, 128) mxfp4 = 128*64 bytes , without considering padding.
+
+采用双padding
+[[512,128], [2048,64]]
+
+### AC padding write LDS layout:
+```
+BK=128，每16行（2048个logical MXFP4）padding 128个logical MXFP4（64B）。
+LDS layout : (( 4 ,4, 8), BK), ((BK, 4xBK+128, (4xBK+128)x4+64, ), 1)
+每个16-row group占1088B：1024B packed MXFP4数据 + 64B padding。
+```
 
 
 
+
+
+### S2R read LDS layout padding:
+```
+ (( 2, 8, 4, 2), BK), (( (4xBK+128)x2, (4xBK+128)x4+64, BK, 4xBK+128,), 1)
+ ```
 
 # Non-scale FP8 optimization log
 
@@ -403,3 +447,4 @@ pyhip.cudaPerf best-of-run. Gluon reference: 3132.84 TFLOPS.
 - Correctness: non-scale 512^3 pass, diff 2.23e-8.
 - Perf: 3025.60 TFLOPS, -0.33% versus 3035.62 with precomputed voffsets;
      final-window average 3002.22 TFLOPS.
+
