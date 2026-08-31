@@ -331,7 +331,8 @@ def do_test_fmoe(
         expert_mask=expert_mask,
         num_iters=5,
         num_warmup=2,
-        num_copies=1
+        num_copies=1,
+        num_verbose=1
     )
     if out2_ref is not None:
         err = checkAllclose(
@@ -347,7 +348,7 @@ def do_test_fmoe(
             sim = 2 * (x * y).sum() / denominator
             return 1 - sim
         """
-        logits_diff = calc_diff(out2_ref, out2_ck, diff_thr=diff_thr)
+        logits_diff = calc_diff(out2_ref, out2_ck)
         if logits_diff > 1e-3:
             logging.warning(
                 f"logits_diff: {logits_diff} is too large, please check the implementation"
