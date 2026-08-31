@@ -58,6 +58,7 @@ def compile_gemm_fp8_8wave(
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
     BLOCK_K = TILE_K
+    assert N % 8 == 0
     element_type = fx.Float8E4M3FN
     elements_per_128b = 16  # 128bit / fp8(8bit)
     scaleA_stride = K // 128
@@ -99,14 +100,14 @@ def compile_gemm_fp8_8wave(
 
     @fx.struct
     class LDS:
-        a_t0: fx.Array[Float8E4M3FN, 16896, 16]
-        a_b0: fx.Array[Float8E4M3FN, 16896, 16]
-        a_t1: fx.Array[Float8E4M3FN, 16896, 16]
-        a_b1: fx.Array[Float8E4M3FN, 16896, 16]
-        b_l0: fx.Array[Float8E4M3FN, 16896, 16]
-        b_l1: fx.Array[Float8E4M3FN, 16896, 16]
-        b_r0: fx.Array[Float8E4M3FN, 16896, 16]
-        b_r1: fx.Array[Float8E4M3FN, 16896, 16]
+        a_t0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_b0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_t1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_b1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        b_l0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        b_l1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        b_r0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        b_r1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
         #scale a ping-pong LDS        
         scale_a0: fx.Array[Float32, 512, 4]
         scale_a1: fx.Array[Float32, 512, 4]
@@ -548,7 +549,7 @@ def compile_gemm_fp8_8wave(
                 fx.gemm(mma_atom, frag_C, frag_B, frag_A, frag_C)
 
         num_tiles = K // BLOCK_K
-        assert num_tiles >= 4 and num_tiles % 2 == 0
+        assert num_tiles % 2 == 0
         a_dsrd = frag_A_t.load().numel * element_type.width // 8 // 16
         b_dsrd = frag_B_l.load().numel * element_type.width // 8 // 16
         a_vmem = (BLOCK_M * BLOCK_K * element_type.width // 8) // (512 * 16)
@@ -941,7 +942,8 @@ def compile_gemm_fp8_8wave(
             rocdl.s_barrier()
 
         # ---- epilogue store ----
-        if const_expr(permlane_epilogue and TILE_N % 256 == 0):
+        N_tail = N % TILE_N != 0
+        if const_expr((permlane_epilogue or N_tail) and TILE_N % 256 == 0):
             pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
             lane_id = tid % 64
             wave_m = wave_id // 4
@@ -986,13 +988,28 @@ def compile_gemm_fp8_8wave(
                             + lane_group // 2 * 8
                         )
                         byte_offset = (row * N + col) * 2
-                        fx.buffer_ops.buffer_store(packed, c_store_rsrc, byte_offset, offset_is_bytes=True)
+                        if const_expr(N_tail):
+                            fx.buffer_ops.buffer_store(
+                                packed,
+                                c_store_rsrc,
+                                byte_offset,
+                                offset_is_bytes=True,
+                                mask=col < N,
+                            )
+                        else:
+                            fx.buffer_ops.buffer_store(
+                                packed,
+                                c_store_rsrc,
+                                byte_offset,
+                                offset_is_bytes=True,
+                            )
 
             store_c_quadrant(frag_C_tl, 0, 0)
             store_c_quadrant(frag_C_tr, 0, 1)
             store_c_quadrant(frag_C_bl, 1, 0)
             store_c_quadrant(frag_C_br, 1, 1)
         else:
+            assert N % TILE_N == 0, "N must be a multiple of TILE_N for permlane_epilogue=False, not supported for now"
             c_frag_bf16 = fx.make_fragment_like(frag_C_tl, dtype=fx.BFloat16)
             store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
             store_thr = fx.make_tiled_copy_C(store_atom, tiled_mma).get_slice(tid)
@@ -1051,17 +1068,15 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
         if not with_scale:
             return empty, empty
         sA = torch.rand((M, KB), device="cuda", dtype=torch.float32)
-        sB = torch.rand((N // 128, KB), device="cuda", dtype=torch.float32)
+        sB = torch.rand((div_up(N, 128), KB), device="cuda", dtype=torch.float32)
         return sA, sB
 
     def _ref(a, b, sA, sB):
         if not with_scale:
             return a.float() @ b.float().t()
         a_deq = (a.float().view(M, KB, 128) * sA.view(M, KB, 1)).view(M, K)
-        b_deq = (
-            b.float().view(N // 128, 128, KB, 128)
-            * sB.view(N // 128, 1, KB, 1)
-        ).view(N, K)
+        b_deq = b.float().view(N, KB, 128) * sB.repeat_interleave(128, dim=0)[:N, :, None]
+        b_deq = b_deq.view(N, K)
         return a_deq @ b_deq.t()
 
     a = (torch.rand(M, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
@@ -1082,42 +1097,43 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
     torch.cuda.synchronize()
 
     out_f32 = out.float()
-    abs_err = (out_f32 - ref).abs()
-    check_rtol = 1.6e-2
-    check_atol = 1e-5
-    close_mask = torch.isclose(out_f32, ref, rtol=check_rtol, atol=check_atol)
-    close_count = close_mask.count_nonzero().item()
-    total_count = close_mask.numel()
     bf16_ref = ref.to(torch.bfloat16)
-    bf16_exact_count = (out == bf16_ref).count_nonzero().item()
-    top_count = min(100, total_count)
-    top_errors, top_indices = torch.topk(abs_err.reshape(-1), top_count)
-    top_refs = ref.reshape(-1)[top_indices]
-    top_outputs = out_f32.reshape(-1)[top_indices]
-    top_rel_errors = top_errors / top_refs.abs().clamp_min(torch.finfo(torch.float32).tiny)
-    top_close = close_mask.reshape(-1)[top_indices]
 
-    print(
-        f"torch.isclose(rtol={check_rtol}, atol={check_atol}): "
-        f"{close_count}/{total_count} ({close_count / total_count:.6%}), "
-        f"not_close={total_count - close_count}"
-    )
-    print(
-        f"exact vs bf16-rounded ref: {bf16_exact_count}/{total_count} "
-        f"({bf16_exact_count / total_count:.6%}), mismatched={total_count - bf16_exact_count}"
-    )
-    print("top100: rank (row,col) ref output abs_error rel_error isclose")
-    for rank in range(top_count):
-        flat_index = top_indices[rank].item()
-        row, col = divmod(flat_index, N)
-        print(
-            f"{rank + 1:3d} ({row:5d},{col:5d}) "
-            f"ref={top_refs[rank].item(): .9e} "
-            f"output={top_outputs[rank].item(): .9e} "
-            f"abs_error={top_errors[rank].item(): .9e} "
-            f"rel_error={top_rel_errors[rank].item(): .9e} "
-            f"isclose={bool(top_close[rank].item())}"
-        )
+    # abs_err = (out_f32 - ref).abs()
+    # check_rtol = 1.6e-2
+    # check_atol = 1e-5
+    # close_mask = torch.isclose(out_f32, ref, rtol=check_rtol, atol=check_atol)
+    # close_count = close_mask.count_nonzero().item()
+    # total_count = close_mask.numel()
+    # bf16_exact_count = (out == bf16_ref).count_nonzero().item()
+    # top_count = min(100, total_count)
+    # top_errors, top_indices = torch.topk(abs_err.reshape(-1), top_count)
+    # top_refs = ref.reshape(-1)[top_indices]
+    # top_outputs = out_f32.reshape(-1)[top_indices]
+    # top_rel_errors = top_errors / top_refs.abs().clamp_min(torch.finfo(torch.float32).tiny)
+    # top_close = close_mask.reshape(-1)[top_indices]
+
+    # print(
+    #     f"torch.isclose(rtol={check_rtol}, atol={check_atol}): "
+    #     f"{close_count}/{total_count} ({close_count / total_count:.6%}), "
+    #     f"not_close={total_count - close_count}"
+    # )
+    # print(
+    #     f"exact vs bf16-rounded ref: {bf16_exact_count}/{total_count} "
+    #     f"({bf16_exact_count / total_count:.6%}), mismatched={total_count - bf16_exact_count}"
+    # )
+    # print("top100: rank (row,col) ref output abs_error rel_error isclose")
+    # for rank in range(top_count):
+    #     flat_index = top_indices[rank].item()
+    #     row, col = divmod(flat_index, N)
+    #     print(
+    #         f"{rank + 1:3d} ({row:5d},{col:5d}) "
+    #         f"ref={top_refs[rank].item(): .9e} "
+    #         f"output={top_outputs[rank].item(): .9e} "
+    #         f"abs_error={top_errors[rank].item(): .9e} "
+    #         f"rel_error={top_rel_errors[rank].item(): .9e} "
+    #         f"isclose={bool(top_close[rank].item())}"
+    #     )
     # fp8×fp8→f32 累加对整数输入是精确的：与 f32 ref 的 diff 只来自输出转 bf16 的舍入。
     # 与「bf16 舍入后的 ref」比较应 ≈0（非 scale 时用来验证计算零误差）。
     diff = pyhip.calc_diff(out_f32, ref)
@@ -1125,7 +1141,7 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
     is_correct = diff < 0.01
     print(f"####M={M} N={N} K={K} 8wave preshuffle_b={preshuffle_b} with_scale={with_scale}, useTiledDMA={useTiledDMA} "
           f"is_correct={is_correct} calc_diff(vs f32 ref)={diff:.6f} "
-          f"calc_diff(vs bf16 ref)={diff_bf16ref:.6f} max_abs={abs_err.max().item():.3f}")
+          f"calc_diff(vs bf16 ref)={diff_bf16ref:.6f}")
 
     if not perf:
         return is_correct
@@ -1166,5 +1182,8 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     
     K = 6144
+    # K = 256
     run_test(M=8192, N=8192, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
     run_test(M=16384, N=3584, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
+    run_test(M=16384, N=3392, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
+
