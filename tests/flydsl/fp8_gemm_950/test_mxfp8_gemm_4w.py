@@ -133,6 +133,9 @@ def compile_gemm_fp8(
     _USE_SCHED = _env_flag("SCHED", "1")
     scale_g2r = with_scale and _env_flag("SCALE_G2R", "1")
 
+
+    # bid_x, bid_y = get_pids_950(fx.block_idx.x, M, fx.grid_dim.x, 8, 4)
+
     def _get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
         num_pid_m = (M + TILE_M - 1) // TILE_M
         num_pid_n = div_up(N, TILE_N)
