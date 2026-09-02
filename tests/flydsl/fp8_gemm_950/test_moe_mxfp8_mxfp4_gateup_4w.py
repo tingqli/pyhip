@@ -7,6 +7,8 @@ routing contract.
 """
 
 import argparse
+import csv
+import time
 
 import torch
 
@@ -154,6 +156,22 @@ def _permute_scale(
     )
 
 
+def _convert_aiter_moe_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Convert AIter's routed MX scale swizzle to this kernel's layout."""
+    scale_u8 = scale.view(torch.uint8)
+    rows, groups = scale_u8.shape
+    if rows % 128 != 0 or groups % 8 != 0:
+        raise ValueError(
+            "AIter MoE scale requires rows divisible by 128 and groups by 8"
+        )
+    return (
+        scale_u8.view(rows // 128, 4, groups // 8, 4, 16, 2, 2)
+        .permute(2, 5, 3, 0, 6, 4, 1)
+        .contiguous()
+        .view(torch.int32)
+    )
+
+
 def prepare_moe_inputs(
     tokens: int,
     intermediate_size: int,
@@ -161,6 +179,8 @@ def prepare_moe_inputs(
     topk: int,
     num_experts: int,
 ):
+    from aiter.ops.quant import fused_dynamic_mxfp8_quant_moe_sort
+
     per_1x32_mx_quant_hip, dtypes, _, _ = _load_mx_helpers()
     (
         topk_ids,
@@ -177,14 +197,24 @@ def prepare_moe_inputs(
     a_source = torch.randn(
         (tokens, hidden_size), device="cuda", dtype=torch.bfloat16
     )
-    # a :[tokens, hidden_size]
-    # scale_a_raw: [tokens, hidden_size // 32]
-    a, scale_a_raw = per_1x32_mx_quant_hip(
+    # Keep token-order scales for the dequantized reference.
+    a_reference, scale_a_raw = per_1x32_mx_quant_hip(
         a_source,
         quant_dtype=dtypes.fp8,
         scale_type=dtypes.fp8_e8m0,
         shuffle=False,
     )
+    # Production stage1 path: quantize A and emit routed, AIter-swizzled scales.
+    a, scale_a_aiter = fused_dynamic_mxfp8_quant_moe_sort(
+        a_source,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=tokens,
+        topk=topk,
+        block_size=SORT_BLOCK_M,
+        sorted_weights=sorted_weights,
+    )
+    torch.testing.assert_close(a, a_reference, rtol=0, atol=0)
     del a_source
 
     output_size = 2 * intermediate_size
@@ -212,23 +242,10 @@ def prepare_moe_inputs(
         weight[expert].copy_(quantized)
         scale_b_raw[expert].copy_(scale.view(torch.uint8))
 
-    decoded_tokens = (sorted_ids & TOKEN_MASK).to(torch.int64)
-    decoded_slots = ((sorted_ids >> 24) & 0xFF).to(torch.int64)
-    valid = (decoded_tokens < tokens) & (decoded_slots < topk)
-    sorted_scale_a_raw = torch.full(
-        (sorted_ids.numel(), hidden_size // 32),
-        127,
-        device="cuda",
-        dtype=torch.uint8,
-    )
-    sorted_scale_a_raw[valid] = scale_a_raw.view(torch.uint8)[decoded_tokens[valid]]
-
     scale_a_padded_rows = sorted_ids.numel()
     scale_b_rows = num_experts * output_size
     scale_b_padded_rows = div_up(scale_b_rows, 256) * 256
-    scale_a = _permute_scale(
-        sorted_scale_a_raw, padded_rows=scale_a_padded_rows
-    )
+    scale_a = _convert_aiter_moe_scale(scale_a_aiter)
     scale_b = _permute_scale(
         scale_b_raw.view(scale_b_rows, hidden_size // 32),
         padded_rows=scale_b_padded_rows,
@@ -1076,7 +1093,9 @@ def run_accuracy_case(
     hidden_size: int,
     topk: int,
     num_experts: int,
-) -> bool:
+    *,
+    return_metrics: bool = False,
+) -> bool | dict[str, object]:
     validate_case_parameters(
         tokens, intermediate_size, hidden_size, topk, num_experts
     )
@@ -1130,7 +1149,95 @@ def run_accuracy_case(
         f"expert_blocks={inputs['expert_ids'].numel()} finite={finite} "
         f"allclose={allclose} max_abs={max_abs:.6g} diff={diff:.6g}"
     )
+    if return_metrics:
+        return {
+            "output_shape": str(tuple(output.shape)),
+            "expert_blocks": inputs["expert_ids"].numel(),
+            "finite": finite,
+            "allclose": allclose,
+            "max_abs": max_abs,
+            "diff": diff,
+            "correct": correct,
+        }
     return correct
+
+
+def run_accuracy_matrix(output_csv: str) -> None:
+    fieldnames = [
+        "tokens",
+        "hidden_size",
+        "topk",
+        "num_experts",
+        "intermediate_size",
+        "output_shape",
+        "expert_blocks",
+        "finite",
+        "allclose",
+        "max_abs",
+        "diff",
+        "correct",
+        "elapsed_s",
+        "error",
+    ]
+    combinations = [
+        (tokens, hidden_size, topk, num_experts, intermediate_size)
+        for tokens in range(8192, 8210)
+        for hidden_size in (6144, 4096)
+        for topk in (5, 6, 7, 8)
+        for num_experts in (384, 120)
+        for intermediate_size in (256, 128)
+    ]
+    failures = []
+    with open(output_csv, "w", newline="", encoding="ascii") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for case_index, case in enumerate(combinations, start=1):
+            tokens, hidden_size, topk, num_experts, intermediate_size = case
+            started = time.perf_counter()
+            row = {
+                "tokens": tokens,
+                "hidden_size": hidden_size,
+                "topk": topk,
+                "num_experts": num_experts,
+                "intermediate_size": intermediate_size,
+                "error": "",
+            }
+            try:
+                row.update(
+                    run_accuracy_case(
+                        tokens,
+                        intermediate_size,
+                        hidden_size,
+                        topk,
+                        num_experts,
+                        return_metrics=True,
+                    )
+                )
+            except Exception as error:
+                row.update(
+                    {
+                        "correct": False,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+            row["elapsed_s"] = time.perf_counter() - started
+            writer.writerow(row)
+            csv_file.flush()
+            if not row["correct"]:
+                failures.append(row.copy())
+            print(
+                f"matrix [{case_index}/{len(combinations)}] "
+                f"tokens={tokens} hidden={hidden_size} topk={topk} "
+                f"experts={num_experts} intermediate={intermediate_size} "
+                f"correct={row['correct']} elapsed={row['elapsed_s']:.3f}s"
+            )
+    print(
+        f"accuracy matrix: total={len(combinations)} "
+        f"passed={len(combinations) - len(failures)} failed={len(failures)} "
+        f"csv={output_csv}"
+    )
+    for failure in failures:
+        print(f"FAILED: {failure}")
 
 
 def _clone_benchmark_args(args, data_clones: int):
@@ -1458,6 +1565,11 @@ def main() -> None:
     parser.add_argument("--routing-probe", action="store_true")
     parser.add_argument("--small-accuracy", action="store_true")
     parser.add_argument("--accuracy", action="store_true")
+    parser.add_argument("--accuracy-matrix", action="store_true")
+    parser.add_argument(
+        "--accuracy-csv",
+        default="moe_mxfp8_mxfp4_gateup_4w_accuracy.csv",
+    )
     parser.add_argument("--unaligned-accuracy", action="store_true")
     parser.add_argument("--scale-padding-accuracy", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
@@ -1487,6 +1599,9 @@ def main() -> None:
         ):
             raise SystemExit("full accuracy failed")
         return
+    if args.accuracy_matrix:
+        run_accuracy_matrix(args.accuracy_csv)
+        return
     if args.unaligned_accuracy:
         if not run_accuracy_case(8193, 512, 6144, 8, 384):
             raise SystemExit("unaligned-token accuracy failed")
@@ -1508,7 +1623,8 @@ def main() -> None:
         return
     parser.error(
         "select --routing-probe, --small-accuracy, --accuracy, "
-        "--unaligned-accuracy, --scale-padding-accuracy, or --benchmark"
+        "--accuracy-matrix, --unaligned-accuracy, --scale-padding-accuracy, "
+        "or --benchmark"
     )
 
 
