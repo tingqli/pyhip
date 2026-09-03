@@ -166,9 +166,15 @@ def compile_gemm_fp8(
 
     # A 的 16-row footprint 固定为 2112 B。A8W8 使用 [[1024,16],[2048,32]]；
     # Hybrid 的 MFMA K permutation 改变 lane-to-K 映射，使用等容量的 [[1024,32]]。
+    
+    #A8w8 without scale:        1024+16, 2048+32, 双padding 所以2048个元素总共padding 16*2+32 = 64
+    #A8W8 with scale:           1024+32, 单pading, 所以2048个元素总共padding 32*2 = 64
+    #A8w4 with/without scale:   same with A8W8 with scale 
     A_PAD = 32
     A_GROUP = 8 * BLOCK_K + A_PAD  # 1056
     a_group8 = 8 * BLOCK_K + (A_PAD if with_scale or b_mxfp4 else 16)
+
+    #无论什么方案， 每2048个A padding 64. 所以a_group16是一样的。
     a_group16 = 2 * A_GROUP
     a_lds_elems = (BLOCK_M // 8) * A_GROUP  # 16*1056 = 16896
     if b_mxfp4 and not lds_swizzle:

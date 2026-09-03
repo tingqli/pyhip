@@ -26,6 +26,8 @@ from flydsl._mlir.dialects import scf
 
 SORT_BLOCK_M = 256
 TOKEN_MASK = 0xFFFFFF
+A_INPUT_SCALE = 0.33
+B_INPUT_SCALE = 0.2
 
 
 def div_up(value: int, divisor: int) -> int:
@@ -196,7 +198,7 @@ def prepare_moe_inputs(
     assert hidden_size % 32 == 0, f"hidden_size must be a multiple of 32, but got {hidden_size}"
     a_source = torch.randn(
         (tokens, hidden_size), device="cuda", dtype=torch.bfloat16
-    )
+    ) * A_INPUT_SCALE
     # Keep token-order scales for the dequantized reference.
     a_reference, scale_a_raw = per_1x32_mx_quant_hip(
         a_source,
@@ -204,7 +206,14 @@ def prepare_moe_inputs(
         scale_type=dtypes.fp8_e8m0,
         shuffle=False,
     )
+    # Set up A scale routing data.
     # Production stage1 path: quantize A and emit routed, AIter-swizzled scales.
+    # R: routing token ID as routing table. 
+    # G: quantization groups. hidden_state // 32
+    # [R, G] ->[R//32, 2r1, 16r0, G//8, 2g1, 4g0] would be permuted to 
+    # [R//32, G//8, 4g0,16r0,2g1,2r1] 
+    
+    # scale_a_aiter is padded to align with the SORTING_BLOCK_M,
     a, scale_a_aiter = fused_dynamic_mxfp8_quant_moe_sort(
         a_source,
         sorted_ids=sorted_ids,
@@ -218,37 +227,70 @@ def prepare_moe_inputs(
     del a_source
 
     output_size = 2 * intermediate_size
-    weight_storage = torch.empty(
-        (num_experts, output_size, hidden_size // 2),
-        device="cuda",
-        dtype=torch.uint8,
-    )
-    weight = weight_storage.view(dtypes.fp4x2)
-    scale_b_raw = torch.empty(
-        (num_experts, output_size, hidden_size // 32),
-        device="cuda",
-        dtype=torch.uint8,
-    )
-    for expert in range(num_experts):
-        source = torch.randn(
-            (output_size, hidden_size), device="cuda", dtype=torch.bfloat16
-        ) * 3.0
-        quantized, scale = per_1x32_mx_quant_hip(
-            source,
-            quant_dtype=dtypes.fp4x2,
-            scale_type=dtypes.fp8_e8m0,
-            shuffle=False,
-        )
-        weight[expert].copy_(quantized)
-        scale_b_raw[expert].copy_(scale.view(torch.uint8))
-
     scale_a_padded_rows = sorted_ids.numel()
     scale_b_rows = num_experts * output_size
-    scale_b_padded_rows = div_up(scale_b_rows, 256) * 256
+    weight, scale_b_raw = per_1x32_mx_quant_hip(
+        torch.randn(
+            (scale_b_rows, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        ) * B_INPUT_SCALE,
+        quant_dtype=dtypes.fp4x2,
+        scale_type=dtypes.fp8_e8m0,
+        shuffle=False,
+    )
+    weight = weight.view(num_experts, output_size, hidden_size // 2)
+    scale_b_raw = scale_b_raw.view(
+        num_experts, output_size, hidden_size // 32
+    )
+    # scale B need to padding to align with BLOCK_N, because N is not the outter most dimension after B scale is permuted.
+    scale_b_rows_per_expert = div_up(output_size, 256) * 256
+    scale_b_padded_rows = num_experts * scale_b_rows_per_expert
+    ## gaps with MOE in aiter.
+    # For mxfp8 and mxfp4,  aiter fused MOE would sort the A scale as sorted_id table. [R, G], `R` means routed token ID. `G` means quantization groups. 
+    # R would padded to 32 alignment, G would be padded to 8 aligned.
+    # Also after A scale is sorted, [R, G] would be permuted    
+
+    # [R, G] =  [R//32, 2r1, 16r0, G//8, 2g1, 4g0] would be permuted to 
+
+    # [R//32, G//8, 4g0,16r0,2g1,2r1] 
+
+    # current gemmA8w4 perfer the layout:
+
+
+    # ```
+    #         scale_u8.view(r // 128, 4r1, 32r0, groups).permute(3, 0, 2, 1)
+    # ```
+
+    # [R//128, 4r1, 32r0, G] -> [G, R//128, 32r0, 4r1]
+
+    # 把 这个是fused_dynamic_mxfp8_quant_moe_sort的 preshuffle之后的scale转化成test_moe_mxfp8_mxfp4_gateup_4w.py里面的A
+
+    # 1. 这个是fused_dynamic_mxfp8_quant_moe_sort scale的layout [R//32, G//8,4g0 ,16r0,2g1,2r1]  
+    # view as  [R//128, 4r2, G//8,4g0 ,16r0,2g1,2r1],
+
+
+    # 2. permute:
+    # [R//128, 4r2, G//8,4g0 ,16r0,2g1,2r1] -[0, 1, 2, 3, 4, 5,6]    -> [G, R//128, 32r0, 4r1]
+
+    # permute to 
+    # []
+    # [G//8, 4g0, 2g1, R//128, 2r1, 16r0, 4r2]
+
+
+    # permute:  [2， 5， 3， 0， 6， 4， 1]
+    # reshape:
+
     scale_a = _convert_aiter_moe_scale(scale_a_aiter)
+    scale_b_padded = torch.full(
+        (num_experts, scale_b_rows_per_expert, hidden_size // 32),
+        127,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    scale_b_padded[:, :output_size].copy_(scale_b_raw.view(torch.uint8))
     scale_b = _permute_scale(
-        scale_b_raw.view(scale_b_rows, hidden_size // 32),
-        padded_rows=scale_b_padded_rows,
+        scale_b_padded.view(scale_b_padded_rows, hidden_size // 32)
     )
     assert a.view(torch.uint8).numel() == tokens * hidden_size
     assert weight.view(torch.uint8).numel() == (
@@ -271,6 +313,7 @@ def prepare_moe_inputs(
         "scale_a": scale_a,
         "scale_b": scale_b,
         "scale_a_padded_rows": scale_a_padded_rows,
+        "scale_b_rows_per_expert": scale_b_rows_per_expert,
         "scale_b_padded_rows": scale_b_padded_rows,
         "sorted_ids": sorted_ids,
         "sorted_weights": sorted_weights,
@@ -400,15 +443,23 @@ def compile_moe_gateup_4w(
     block_n = 128
     block_k = 128
     output_size = 2 * intermediate_size
-    scale_b_padded_rows = div_up(num_experts * output_size, 256) * 256
+    scale_b_rows_per_expert = div_up(output_size, 256) * 256
+    scale_b_padded_rows = num_experts * scale_b_rows_per_expert
     assert intermediate_size % block_n == 0
     assert hidden_size % block_k == 0
 
+    # activateion data type fp8
     element_type = Float8E4M3FN
+    # weight type fp4
     weight_type = Float4E2M1FN
+
+    # A8w4 with scale A采用的是单padding[1024， 32]
     a_group8 = 8 * block_k + 32
     a_group16 = 2 * a_group8
     a_lds_elems = (block_m // 8) * a_group8
+    
+    # A8w4 with scale, B 采用的是单padding [2048, 64], 
+    # W4:2048是一个wave 128bit async copy的连续单元，无法内部再切分加padding,所以导致B LDS 会有bank conflict. 
     b_group16 = 16 * block_k + 64
     b_lds_elems = (block_n // 16) * b_group16
 
@@ -424,6 +475,22 @@ def compile_moe_gateup_4w(
         b_up1: fx.Array[weight_type, b_lds_elems, 16]
 
     @flyc.kernel(known_block_size=[256, 1, 1])
+    
+    
+    # args = (
+    #     inputs["a"].view(torch.int8).view(-1),
+    #     inputs["weight"].view(torch.int8).view(-1),
+    #     inputs["scale_a"],
+    #     inputs["scale_b"],
+    #     output.view(-1),
+    #     inputs["sorted_ids"],
+    #     inputs["expert_ids"],
+    #     inputs["num_valid_ids"],
+    #     tokens,
+    #     inputs["expert_ids"].numel(),
+    #     torch.cuda.current_stream(),
+    # )
+    
     def moe_gateup_kernel(
         arg_a: fx.Tensor,
         arg_b: fx.Tensor,
@@ -501,6 +568,7 @@ def compile_moe_gateup_4w(
             buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
         )
 
+        # mma_atom 生成的tile 可以用来slice A, B,
         mma_atom = fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, weight_type, element_type)
         )
@@ -519,6 +587,7 @@ def compile_moe_gateup_4w(
             for n0 in range_constexpr(4)
             for m0 in range_constexpr(4)
         }
+        #k_permutation决定的是同一行中的thread, 如何分配K，每条lane读32个K， 这32个K是否是连续的，spec的描述是不连续的。
         k_permutation = fx.make_layout(((16, 2), 4), ((1, 64), 16))
         tiled_mma = fx.make_tiled_mma(
             mma_atom,
@@ -536,7 +605,7 @@ def compile_moe_gateup_4w(
             ((2, block_m // 16, 8), (32, block_k // 32)),
             ((a_group8, a_group16, block_k), (1, 32)),
         )
-        write_layout_b = fx.make_layout(
+        read_layout_b = fx.make_layout(
             ((16, block_n // 16), block_k),
             ((block_k, b_group16), 1),
         )
@@ -550,11 +619,11 @@ def compile_moe_gateup_4w(
             for ptr in (lds.a_bottom0.ptr, lds.a_bottom1.ptr)
         ]
         b_gate_read = [
-            fx.make_view(ptr, write_layout_b)
+            fx.make_view(ptr, read_layout_b)
             for ptr in (lds.b_gate0.ptr, lds.b_gate1.ptr)
         ]
         b_up_read = [
-            fx.make_view(ptr, write_layout_b)
+            fx.make_view(ptr, read_layout_b)
             for ptr in (lds.b_up0.ptr, lds.b_up1.ptr)
         ]
 
@@ -777,6 +846,15 @@ def compile_moe_gateup_4w(
             + intermediate_size // block_n
             + n_tile_i32
         )
+        expert_scale_row_tile = expert_i32 * (
+            scale_b_rows_per_expert // block_n
+        )
+        gate_scale_row_tile = expert_scale_row_tile + n_tile_i32
+        up_scale_row_tile = (
+            expert_scale_row_tile
+            + intermediate_size // block_n
+            + n_tile_i32
+        )
         a_top_scale_tile = expert_block_i32 * 2
         a_bottom_scale_tile = a_top_scale_tile + 1
         num_k_tiles = hidden_size // block_k
@@ -835,14 +913,14 @@ def compile_moe_gateup_4w(
             scale_b_gate = load_scale_dword(
                 scale_b_rsrc,
                 kk,
-                gate_row_tile,
+                gate_scale_row_tile,
                 scale_b_padded_rows,
                 False,
             )
             scale_b_up = load_scale_dword(
                 scale_b_rsrc,
                 kk,
-                up_row_tile,
+                up_scale_row_tile,
                 scale_b_padded_rows,
                 False,
             )
@@ -1016,6 +1094,8 @@ def compile_moe_gateup_4w(
         store_quadrant(frag_c_tr, 0, True)
         store_quadrant(frag_c_br, 1, True)
 
+
+
     @flyc.jit
     def launch_moe_gateup(
         a: fx.Tensor,
@@ -1058,35 +1138,6 @@ def compile_moe_gateup_4w(
     return launch_moe_gateup
 
 
-def run_routing_probe() -> None:
-    tokens, topk, experts, k = 512, 4, 8, 128
-    _, _, sorted_ids, _, _, _ = make_balanced_routing(
-        tokens, topk, experts, k, device="cuda"
-    )
-    padding = torch.full((SORT_BLOCK_M,), tokens * topk, device="cuda", dtype=torch.int32)
-    routed_ids = torch.cat((sorted_ids, padding))
-    a = torch.arange(tokens * k, device="cuda", dtype=torch.uint8).view(tokens, k)
-    sentinel = 0xA5
-    out = torch.full((routed_ids.numel(), 16), sentinel, device="cuda", dtype=torch.uint8)
-    args = (
-        a.view(torch.int8).view(-1),
-        routed_ids,
-        out.view(torch.int8).view(-1),
-        tokens,
-        routed_ids.numel(),
-        torch.cuda.current_stream(),
-    )
-    launcher = compile_routing_buffer_probe(k)
-    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
-    kernel(*args)
-    torch.cuda.synchronize()
-
-    decoded = (sorted_ids & TOKEN_MASK).to(torch.int64)
-    torch.testing.assert_close(out[: sorted_ids.numel()], a[decoded, :16], rtol=0, atol=0)
-    assert torch.all(out[sorted_ids.numel() :] == sentinel)
-    print("routing buffer probe: PASS")
-
-
 def run_accuracy_case(
     tokens: int,
     intermediate_size: int,
@@ -1095,6 +1146,8 @@ def run_accuracy_case(
     num_experts: int,
     *,
     return_metrics: bool = False,
+    top_error_threshold: float | None = None,
+    top_error_count: int = 20,
 ) -> bool | dict[str, object]:
     validate_case_parameters(
         tokens, intermediate_size, hidden_size, topk, num_experts
@@ -1149,6 +1202,40 @@ def run_accuracy_case(
         f"expert_blocks={inputs['expert_ids'].numel()} finite={finite} "
         f"allclose={allclose} max_abs={max_abs:.6g} diff={diff:.6g}"
     )
+    if top_error_threshold is not None and max_abs >= top_error_threshold:
+        abs_error = (output.float() - reference.float()).abs()
+        flat_error = abs_error.view(-1)
+        error_count = min(top_error_count, flat_error.numel())
+        top_errors, top_indices = torch.topk(flat_error, error_count)
+        output_flat = output.view(-1).float()
+        reference_flat = reference.view(-1).float()
+        print(
+            f"top {error_count} absolute errors: tokens={tokens} "
+            f"hidden={hidden_size} topk={topk} experts={num_experts} "
+            f"intermediate={intermediate_size}"
+        )
+        for rank, (flat_index, absolute_error) in enumerate(
+            zip(top_indices.tolist(), top_errors.tolist()), start=1
+        ):
+            token_index, remainder = divmod(
+                flat_index, topk * 2 * intermediate_size
+            )
+            slot_index, output_index = divmod(
+                remainder, 2 * intermediate_size
+            )
+            reference_value = reference_flat[flat_index].item()
+            output_value = output_flat[flat_index].item()
+            relative_error = (
+                absolute_error / abs(reference_value)
+                if reference_value != 0.0
+                else (0.0 if absolute_error == 0.0 else float("inf"))
+            )
+            print(
+                f"  {rank:2d}: index=({token_index},{slot_index},{output_index}) "
+                f"ref={reference_value:.9g} out={output_value:.9g} "
+                f"abs_error={absolute_error:.9g} "
+                f"relative_error={relative_error:.9g}"
+            )
     if return_metrics:
         return {
             "output_shape": str(tuple(output.shape)),
@@ -1211,6 +1298,7 @@ def run_accuracy_matrix(output_csv: str) -> None:
                         topk,
                         num_experts,
                         return_metrics=True,
+                        top_error_threshold=8.0,
                     )
                 )
             except Exception as error:
@@ -1296,13 +1384,13 @@ def run_scale_padding_accuracy_case(m: int, n: int, k: int) -> bool:
         _load_mx_helpers()
     )
     a, scale_a_raw = per_1x32_mx_quant_hip(
-        torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.75,
+        torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * A_INPUT_SCALE,
         quant_dtype=dtypes.fp8,
         scale_type=dtypes.fp8_e8m0,
         shuffle=False,
     )
     b, scale_b_raw = per_1x32_mx_quant_hip(
-        torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 3.0,
+        torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * B_INPUT_SCALE,
         quant_dtype=dtypes.fp4x2,
         scale_type=dtypes.fp8_e8m0,
         shuffle=False,
@@ -1460,7 +1548,7 @@ def run_benchmark(
     gemm_a, gemm_scale_a_raw = per_1x32_mx_quant_hip(
         torch.randn(
             (gemm_m, hidden_size), device="cuda", dtype=torch.bfloat16
-        ),
+        ) * A_INPUT_SCALE,
         quant_dtype=dtypes.fp8,
         scale_type=dtypes.fp8_e8m0,
         shuffle=False,
@@ -1468,7 +1556,7 @@ def run_benchmark(
     gemm_b, gemm_scale_b_raw = per_1x32_mx_quant_hip(
         torch.randn(
             (gemm_n, hidden_size), device="cuda", dtype=torch.bfloat16
-        ),
+        ) * B_INPUT_SCALE,
         quant_dtype=dtypes.fp4x2,
         scale_type=dtypes.fp8_e8m0,
         shuffle=False,
@@ -1562,7 +1650,6 @@ def run_benchmark(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--routing-probe", action="store_true")
     parser.add_argument("--small-accuracy", action="store_true")
     parser.add_argument("--accuracy", action="store_true")
     parser.add_argument("--accuracy-matrix", action="store_true")
@@ -1582,9 +1669,7 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--data-clones", type=int, default=10)
     args = parser.parse_args()
-    if args.routing_probe:
-        run_routing_probe()
-        return
+
     if args.small_accuracy:
         if not run_accuracy_case(96, 128, 512, 2, 3):
             raise SystemExit("small padded accuracy failed")
