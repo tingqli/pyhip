@@ -543,16 +543,9 @@ def compile_moe_gateup_4w(
         num_tokens_i32 = fx.Int32(num_tokens)
 
         a_tensor_bytes = num_tokens_i32 * fx.Int32(hidden_size)
-        b_tensor_bytes = fx.Int32(
-            num_experts * output_size * hidden_size // 2
-        )
         a_rsrc = buffer_ops.create_buffer_resource(
             arg_a,
             num_records_bytes=arith._to_raw(a_tensor_bytes),
-        )
-        b_rsrc = buffer_ops.create_buffer_resource(
-            arg_b,
-            num_records_bytes=arith._to_raw(b_tensor_bytes),
         )
         c_rsrc = buffer_ops.create_buffer_resource(
             arg_c,
@@ -574,6 +567,23 @@ def compile_moe_gateup_4w(
             arg_num_valid_ids,
             num_records_bytes=arith._to_raw(fx.Int32(4)),
         )
+        expert_i32 = fx.Int32(
+            buffer_ops.buffer_load(
+                expert_rsrc, expert_block, vec_width=1, dtype=T.i32
+            )
+        )
+        expert_i32 = fx.Int32(
+            rocdl.readfirstlane(T.i32, arith._to_raw(expert_i32))
+        )
+        expert_byte_offset = (
+            arith.index_cast(T.index, expert_i32)
+            * arith.constant(output_size * hidden_size // 2, index=True)
+        )
+        b_rsrc = buffer_ops.create_buffer_resource(
+            arg_b,
+            num_records_bytes=output_size * hidden_size // 2,
+            base_byte_offset=expert_byte_offset,
+        )
         scale_a_padded_rows = (
             num_expert_blocks_i32 * fx.Int32(SORT_BLOCK_M)
         )
@@ -590,11 +600,6 @@ def compile_moe_gateup_4w(
             ),
         )
 
-        expert_i32 = fx.Int32(
-            buffer_ops.buffer_load(
-                expert_rsrc, expert_block, vec_width=1, dtype=T.i32
-            )
-        )
         num_valid_i32 = fx.Int32(
             buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
         )
@@ -894,12 +899,9 @@ def compile_moe_gateup_4w(
         frag_c_bl = thread_mma.make_fragment_C(c_layout_tile)
         frag_c_br = thread_mma.make_fragment_C(c_layout_tile)
 
-        expert_row_tile = expert_i32 * (output_size // block_n)
-        gate_row_tile = expert_row_tile + n_tile_i32
+        gate_row_tile = n_tile_i32
         up_row_tile = (
-            expert_row_tile
-            + intermediate_size // block_n
-            + n_tile_i32
+            intermediate_size // block_n + n_tile_i32
         )
         expert_scale_row_tile = expert_i32 * (
             scale_b_rows_per_expert // block_n
@@ -1499,7 +1501,7 @@ def run_accuracy_case(
     )
     args = (
         inputs["a"].view(torch.int8).view(-1),
-        inputs["weight"].view(torch.int8).view(-1),
+        inputs["weight"].view(torch.int8),
         inputs["scale_a"],
         inputs["scale_b"],
         output.view(-1),
@@ -1863,7 +1865,7 @@ def run_benchmark(
     )
     moe_args = (
         inputs["a"].view(torch.int8).view(-1),
-        inputs["weight"].view(torch.int8).view(-1),
+        inputs["weight"].view(torch.int8),
         inputs["scale_a"],
         inputs["scale_b"],
         output.view(-1),
