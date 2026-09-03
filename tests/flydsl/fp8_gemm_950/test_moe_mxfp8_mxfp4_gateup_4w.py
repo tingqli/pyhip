@@ -8,13 +8,15 @@ routing contract.
 
 import argparse
 import csv
+import os
 import time
 
 import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl, vector
+from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl, vector
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, Float32, Int32, T
 from flydsl.expr.typing import Vector as Vec
@@ -32,6 +34,15 @@ B_INPUT_SCALE = 0.2
 
 def div_up(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def validate_case_parameters(
@@ -355,71 +366,6 @@ def moe_reference(
     return reference
 
 
-def compile_routing_buffer_probe(k: int):
-    """Compile a 16-byte indirect gather/scatter probe for the MoE row mapping."""
-    assert k % 16 == 0
-
-    @flyc.kernel(known_block_size=[256, 1, 1])
-    def routing_buffer_probe(
-        arg_a: fx.Tensor,
-        arg_sorted_ids: fx.Tensor,
-        arg_out: fx.Tensor,
-        num_tokens: int,
-        num_sorted: int,
-    ):
-        linear = fx.block_idx.x * 256 + fx.thread_idx.x
-        sorted_rsrc = buffer_ops.create_buffer_resource(
-            arg_sorted_ids,
-            num_records_bytes=arith._to_raw(fx.Int32(num_sorted * 4)),
-        )
-        a_rsrc = buffer_ops.create_buffer_resource(
-            arg_a,
-            num_records_bytes=arith._to_raw(fx.Int32(num_tokens * k)),
-        )
-        out_rsrc = buffer_ops.create_buffer_resource(
-            arg_out,
-            num_records_bytes=arith._to_raw(fx.Int32(num_sorted * 16)),
-        )
-
-        packed_id = ArithValue(
-            buffer_ops.buffer_load(sorted_rsrc, linear, vec_width=1, dtype=T.i32)
-        )
-        token_id = packed_id & arith.constant(TOKEN_MASK, type=T.i32)
-        num_tokens_i32 = ArithValue(num_tokens)
-        token_valid = arith.cmpi(
-            CmpIPredicate.ult, token_id, num_tokens_i32
-        )
-        gathered = buffer_ops.buffer_load(
-            a_rsrc,
-            token_id * arith.constant(k // 4, type=T.i32),
-            vec_width=4,
-            dtype=T.i32,
-        )
-        buffer_ops.buffer_store(
-            gathered,
-            out_rsrc,
-            linear * arith.constant(4, type=T.i32),
-            mask=token_valid,
-        )
-
-    @flyc.jit
-    def launch_probe(
-        a: fx.Tensor,
-        sorted_ids: fx.Tensor,
-        out: fx.Tensor,
-        num_tokens: int,
-        num_sorted: int,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        routing_buffer_probe(a, sorted_ids, out, num_tokens, num_sorted).launch(
-            grid=(div_up(num_sorted, 256), 1, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
-
-    return launch_probe
-
-
 def encode_waitcnt_950(vmcnt: int = 63, expcnt: int = 7, lgkmcnt: int = 63) -> int:
     vm_lo = vmcnt & 0xF
     vm_hi = (vmcnt >> 4) & 0x3
@@ -432,11 +378,45 @@ def waitvmcnt_barrier(vmcnt: int) -> None:
     rocdl.s_barrier()
 
 
+def hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops):
+    total_mfmas = 16
+    scale_sched_late = _env_flag("SCALE_SCHED_LATE", "1")
+    scale_dsrd_pos = int(os.environ.get("SCALE_DSRD_POS", "13"))
+    scale_vmem_pos = int(os.environ.get("SCALE_VMEM_POS", "7"))
+    base_dsrd_ops = 8 if scale_sched_late and dsrd_ops == 9 else dsrd_ops
+    base_vmem_ops = 4 if scale_sched_late and vmem_ops == 5 else vmem_ops
+    prev_dsrd = 0
+    prev_vmem = 0
+    for i in range_constexpr(total_mfmas):
+        cur_dsrd = ((i + 3) * base_dsrd_ops + total_mfmas - 1) // total_mfmas
+        cur_dsrd = min(cur_dsrd, base_dsrd_ops)
+        if const_expr(scale_sched_late and dsrd_ops == 9 and i >= scale_dsrd_pos):
+            cur_dsrd += 1
+        if const_expr(cur_dsrd > prev_dsrd):
+            rocdl.sched_group_barrier(
+                rocdl.mask_dsrd, cur_dsrd - prev_dsrd, group_id
+            )
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+        cur_vmem = ((i + 1) * base_vmem_ops + total_mfmas - 1) // total_mfmas
+        if const_expr(scale_sched_late and vmem_ops == 5 and i >= scale_vmem_pos):
+            cur_vmem += 1
+        if const_expr(cur_vmem > prev_vmem):
+            rocdl.sched_group_barrier(
+                rocdl.mask_vmem_rd, cur_vmem - prev_vmem, group_id
+            )
+        prev_dsrd = cur_dsrd
+        prev_vmem = cur_vmem
+
+
 def compile_moe_gateup_4w(
     intermediate_size: int,
     hidden_size: int,
     topk: int,
     num_experts: int,
+    *,
+    b_lds_swizzle: bool = False,
+    xcd_swizzle: bool = False,
+    group_size_m: int = 1,
 ):
     """Build the padding-LDS four-wave raw gate/up projection kernel."""
     block_m = SORT_BLOCK_M // 2
@@ -445,8 +425,46 @@ def compile_moe_gateup_4w(
     output_size = 2 * intermediate_size
     scale_b_rows_per_expert = div_up(output_size, 256) * 256
     scale_b_padded_rows = num_experts * scale_b_rows_per_expert
+    num_n_tiles = intermediate_size // block_n
     assert intermediate_size % block_n == 0
     assert hidden_size % block_k == 0
+    if group_size_m <= 0:
+        raise ValueError("group_size_m must be positive")
+
+    def _get_pids_950(pid, num_pid_m, grid_mn, num_xcds, group_m):
+        num_pid_n = num_n_tiles
+        if const_expr(num_xcds != 1):
+            pids_per_xcd = (grid_mn + num_xcds - 1) // num_xcds
+            tall_xcds = grid_mn % num_xcds
+            tall_xcds = (tall_xcds == 0).select(num_xcds, tall_xcds)
+            xcd = pid % num_xcds
+            local_pid = pid // num_xcds
+            if xcd < tall_xcds:
+                pid = xcd * pids_per_xcd + local_pid
+            else:
+                pid = (
+                    tall_xcds * pids_per_xcd
+                    + (xcd - tall_xcds) * (pids_per_xcd - 1)
+                    + local_pid
+                )
+        if const_expr(group_m == 1):
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
+        else:
+            num_pid_in_group = group_m * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * group_m
+            remaining_pid_m = num_pid_m - first_pid_m
+            group_m_actual = (remaining_pid_m < group_m).select(
+                remaining_pid_m, group_m
+            )
+            pid_m = first_pid_m + (
+                (pid % num_pid_in_group) % group_m_actual
+            )
+            pid_n = (pid % num_pid_in_group) // group_m_actual
+        return pid_m, pid_n
+
+    get_pids_950 = ASTRewriter.transform(_get_pids_950)
 
     # activateion data type fp8
     element_type = Float8E4M3FN
@@ -458,10 +476,14 @@ def compile_moe_gateup_4w(
     a_group16 = 2 * a_group8
     a_lds_elems = (block_m // 8) * a_group8
     
-    # A8w4 with scale, B 采用的是单padding [2048, 64], 
-    # W4:2048是一个wave 128bit async copy的连续单元，无法内部再切分加padding,所以导致B LDS 会有bank conflict. 
+    # Padding keeps each 2048-element block contiguous; swizzle instead XORs
+    # 16-byte slots within each 8-row group to avoid B LDS bank conflicts.
     b_group16 = 16 * block_k + 64
-    b_lds_elems = (block_n // 16) * b_group16
+    b_lds_elems = (
+        block_n * block_k
+        if b_lds_swizzle
+        else (block_n // 16) * b_group16
+    )
 
     @fx.struct
     class LDS:
@@ -504,12 +526,21 @@ def compile_moe_gateup_4w(
         num_expert_blocks: int,
     ):
         tid = fx.thread_idx.x
-        n_tile = fx.block_idx.x
-        expert_block = fx.block_idx.y
+        num_expert_blocks_i32 = fx.Int32(num_expert_blocks)
+        if const_expr(xcd_swizzle):
+            expert_block, n_tile = get_pids_950(
+                fx.block_idx.x,
+                num_expert_blocks_i32,
+                fx.grid_dim.x,
+                8,
+                group_size_m,
+            )
+        else:
+            expert_block = fx.block_idx.x // num_n_tiles
+            n_tile = fx.block_idx.x % num_n_tiles
         n_tile_i32 = fx.Int32(n_tile)
         expert_block_i32 = fx.Int32(expert_block)
         num_tokens_i32 = fx.Int32(num_tokens)
-        num_expert_blocks_i32 = fx.Int32(num_expert_blocks)
 
         a_tensor_bytes = num_tokens_i32 * fx.Int32(hidden_size)
         b_tensor_bytes = fx.Int32(
@@ -605,10 +636,15 @@ def compile_moe_gateup_4w(
             ((2, block_m // 16, 8), (32, block_k // 32)),
             ((a_group8, a_group16, block_k), (1, 32)),
         )
-        read_layout_b = fx.make_layout(
-            ((16, block_n // 16), block_k),
-            ((block_k, b_group16), 1),
-        )
+        if const_expr(b_lds_swizzle):
+            read_layout_b = fx.make_ordered_layout(
+                (block_n, block_k), (1, 0)
+            )
+        else:
+            read_layout_b = fx.make_layout(
+                ((16, block_n // 16), block_k),
+                ((block_k, b_group16), 1),
+            )
 
         a_top_read = [
             fx.make_view(ptr, read_layout_a)
@@ -633,10 +669,12 @@ def compile_moe_gateup_4w(
         a_bottom_source = [copy_a.partition_S(view) for view in a_bottom_read]
         frag_a_top = thread_mma.make_fragment_B(a_top_read[0])
         frag_a_bottom = thread_mma.make_fragment_B(a_bottom_read[0])
-        frag_b_gate = fx.make_rmem_tensor(16, Int32)
-        frag_b_up = fx.make_rmem_tensor(16, Int32)
         frag_a_top_dest = copy_a.retile(frag_a_top)
         frag_a_bottom_dest = copy_a.retile(frag_a_bottom)
+
+        frag_b_gate = fx.make_rmem_tensor(16, Int32)
+        frag_b_up = fx.make_rmem_tensor(16, Int32)
+
 
         lane_id = tid % 64
         wave_id = tid // 64
@@ -712,9 +750,30 @@ def compile_moe_gateup_4w(
         def raw_b_mxfp4_g2s(kk, ptr, row_tile):
             root = lds_root(ptr)
             for copy_round in range_constexpr(2):
-                chunk = wave_id_uniform + copy_round * 4
-                row = chunk * 16 + lane_id // 4
-                col_byte = (lane_id % 4) * 16
+                if const_expr(b_lds_swizzle):
+                    physical_slot = tid + copy_round * 256
+                    logical_slot = physical_slot ^ (
+                        (physical_slot >> 3) & 1
+                    )
+                    row = (logical_slot // 32) * 8 + logical_slot % 8
+                    col_byte = ((logical_slot % 32) // 8) * 16
+                    lds_ptr = buffer_ops.get_element_ptr(
+                        root,
+                        byte_offset=(
+                            wave_id_uniform * 64 + copy_round * 256
+                        )
+                        * 16,
+                        elem_type=T.i8,
+                    )
+                else:
+                    chunk = wave_id_uniform + copy_round * 4
+                    row = chunk * 16 + lane_id // 4
+                    col_byte = (lane_id % 4) * 16
+                    lds_ptr = buffer_ops.get_element_ptr(
+                        root,
+                        byte_offset=chunk * (b_group16 // 2),
+                        elem_type=T.i8,
+                    )
                 global_row = row_tile * block_n + fx.Int32(row)
                 global_byte = (
                     global_row * (hidden_size // 2)
@@ -723,11 +782,7 @@ def compile_moe_gateup_4w(
                 )
                 rocdl.raw_ptr_buffer_load_lds(
                     b_rsrc,
-                    buffer_ops.get_element_ptr(
-                        root,
-                        byte_offset=chunk * (b_group16 // 2),
-                        elem_type=T.i8,
-                    ),
+                    lds_ptr,
                     fx.Int32(16),
                     global_byte,
                     fx.Int32(0),
@@ -760,11 +815,19 @@ def compile_moe_gateup_4w(
             for n0 in range_constexpr(4):
                 row = (n0 * 2 + wave_n) * 16 + lane_id % 16
                 col_byte = (lane_id // 16) * 16
-                lds_byte = (
-                    (row // 16) * (b_group16 // 2)
-                    + (row % 16) * (block_k // 2)
-                    + col_byte
-                )
+                if const_expr(b_lds_swizzle):
+                    lds_byte = (
+                        (row // 8) * (8 * block_k // 2)
+                        + (row % 8) * 16
+                        + (col_byte // 16) * (8 * 16)
+                    )
+                    lds_byte = lds_byte ^ (((lds_byte >> 7) & 1) << 4)
+                else:
+                    lds_byte = (
+                        (row // 16) * (b_group16 // 2)
+                        + (row % 16) * (block_k // 2)
+                        + col_byte
+                    )
                 ptr = fx.add_offset(
                     fx.recast_iter(fx.Uint8, fx.get_iter(source)),
                     fx.make_int_tuple(lds_byte),
@@ -778,10 +841,12 @@ def compile_moe_gateup_4w(
                     values.append(packed[word])
             destination.store(Vec.from_elements(values, Int32))
 
-        def do_gemm(c_frag, b_frag, a_frag, scale_a, scale_b):
+        def do_gemm(c_frag, b_frag, a_frag, scale_a_frag, scale_b_frag):
             c_value = c_frag.load().ir_value()
             b_value = vector.bitcast(T.vec(64, T.i8), b_frag.load().ir_value())
             a_value = vector.bitcast(T.vec(128, T.i8), a_frag.load().ir_value())
+            scale_a = Vec(scale_a_frag.load())[0]
+            scale_b = Vec(scale_b_frag.load())[0]
             for n0 in range_constexpr(4):
                 for m0 in range_constexpr(4):
                     c_offset = (m0 * 4 + n0) * 4
@@ -828,16 +893,6 @@ def compile_moe_gateup_4w(
         frag_c_tr = thread_mma.make_fragment_C(c_layout_tile)
         frag_c_bl = thread_mma.make_fragment_C(c_layout_tile)
         frag_c_br = thread_mma.make_fragment_C(c_layout_tile)
-        frag_c_tl.fill(0)
-        frag_c_tr.fill(0)
-        frag_c_bl.fill(0)
-        frag_c_br.fill(0)
-        accumulators = [
-            frag_c_tl.load(),
-            frag_c_tr.load(),
-            frag_c_bl.load(),
-            frag_c_br.load(),
-        ]
 
         expert_row_tile = expert_i32 * (output_size // block_n)
         gate_row_tile = expert_row_tile + n_tile_i32
@@ -859,107 +914,130 @@ def compile_moe_gateup_4w(
         a_bottom_scale_tile = a_top_scale_tile + 1
         num_k_tiles = hidden_size // block_k
         assert num_k_tiles >= 4 and num_k_tiles % 2 == 0
-        operand_vmem_per_tile = 12
 
-        def issue_g2s(kk, buffer_index: int):
+        scale_a_top_frag = fx.make_rmem_tensor(1, Int32)
+        scale_a_bottom_frag = fx.make_rmem_tensor(1, Int32)
+        scale_b_gate_frag = fx.make_rmem_tensor(1, Int32)
+        scale_b_up_frag = fx.make_rmem_tensor(1, Int32)
+        scale_a_top_g2r = [
+            fx.make_rmem_tensor(1, Int32) for _ in range_constexpr(2)
+        ]
+        scale_a_bottom_g2r = [
+            fx.make_rmem_tensor(1, Int32) for _ in range_constexpr(2)
+        ]
+        scale_b_gate_g2r = [
+            fx.make_rmem_tensor(1, Int32) for _ in range_constexpr(2)
+        ]
+        scale_b_up_g2r = [
+            fx.make_rmem_tensor(1, Int32) for _ in range_constexpr(2)
+        ]
+
+        def load_scale_g2r(destination, rsrc, kk, row_tile, rows, is_a):
+            destination.store(
+                Vec.from_elements(
+                    [load_scale_dword(rsrc, kk, row_tile, rows, is_a)],
+                    Int32,
+                )
+            )
+
+        def load_a(source, destination):
+            fx.copy(copy_a_atom, source, destination)
+
+        def load_b(source, destination):
+            load_b_fragment(source, destination)
+
+        def do_g2s(kk, buffer_index: int):
+            ki = fx.Int32(kk)
             raw_b_mxfp4_g2s(
-                kk,
+                ki,
                 (lds.b_gate0.ptr, lds.b_gate1.ptr)[buffer_index],
                 gate_row_tile,
             )
-            raw_b_mxfp4_g2s(
-                kk,
-                (lds.b_up0.ptr, lds.b_up1.ptr)[buffer_index],
-                up_row_tile,
-            )
-            raw_a_gather_g2s(
-                kk, a_top_dma_ptrs[buffer_index], a_top_token_ids
-            )
-            raw_a_gather_g2s(
-                kk, a_bottom_dma_ptrs[buffer_index], a_bottom_token_ids
-            )
-
-        def load_operands(buffer_index: int):
-            fx.copy(
-                copy_a_atom,
-                a_top_source[buffer_index],
-                frag_a_top_dest,
-            )
-            fx.copy(
-                copy_a_atom,
-                a_bottom_source[buffer_index],
-                frag_a_bottom_dest,
-            )
-            load_b_fragment(b_gate_read[buffer_index], frag_b_gate)
-            load_b_fragment(b_up_read[buffer_index], frag_b_up)
-            rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
-            rocdl.s_barrier()
-
-        def load_scales(kk):
-            scale_a_top = load_scale_dword(
-                scale_a_rsrc,
-                kk,
-                a_top_scale_tile,
-                num_expert_blocks_i32 * 256,
-                True,
-            )
-            scale_a_bottom = load_scale_dword(
-                scale_a_rsrc,
-                kk,
-                a_bottom_scale_tile,
-                num_expert_blocks_i32 * 256,
-                True,
-            )
-            scale_b_gate = load_scale_dword(
+            rocdl.sched_barrier(0)
+            load_scale_g2r(
+                scale_b_gate_g2r[buffer_index],
                 scale_b_rsrc,
-                kk,
+                ki,
                 gate_scale_row_tile,
                 scale_b_padded_rows,
                 False,
             )
-            scale_b_up = load_scale_dword(
+            rocdl.sched_barrier(0)
+            raw_a_gather_g2s(
+                ki, a_top_dma_ptrs[buffer_index], a_top_token_ids
+            )
+            rocdl.sched_barrier(0)
+            load_scale_g2r(
+                scale_a_top_g2r[buffer_index],
+                scale_a_rsrc,
+                ki,
+                a_top_scale_tile,
+                scale_a_padded_rows,
+                True,
+            )
+            rocdl.sched_barrier(0)
+            raw_a_gather_g2s(
+                ki, a_bottom_dma_ptrs[buffer_index], a_bottom_token_ids
+            )
+            rocdl.sched_barrier(0)
+            load_scale_g2r(
+                scale_a_bottom_g2r[buffer_index],
+                scale_a_rsrc,
+                ki,
+                a_bottom_scale_tile,
+                scale_a_padded_rows,
+                True,
+            )
+            rocdl.sched_barrier(0)
+            raw_b_mxfp4_g2s(
+                ki,
+                (lds.b_up0.ptr, lds.b_up1.ptr)[buffer_index],
+                up_row_tile,
+            )
+            rocdl.sched_barrier(0)
+            load_scale_g2r(
+                scale_b_up_g2r[buffer_index],
                 scale_b_rsrc,
-                kk,
+                ki,
                 up_scale_row_tile,
                 scale_b_padded_rows,
                 False,
             )
-            return scale_a_top, scale_a_bottom, scale_b_gate, scale_b_up
+            rocdl.sched_barrier(0)
 
-        def compute_tile(scales):
-            scale_a_top, scale_a_bottom, scale_b_gate, scale_b_up = scales
-            do_gemm(
-                frag_c_tl,
-                frag_b_gate,
-                frag_a_top,
-                scale_a_top,
-                scale_b_gate,
-            )
-            do_gemm(
-                frag_c_bl,
-                frag_b_gate,
-                frag_a_bottom,
-                scale_a_bottom,
-                scale_b_gate,
-            )
-            do_gemm(
-                frag_c_tr,
-                frag_b_up,
-                frag_a_top,
-                scale_a_top,
-                scale_b_up,
-            )
-            do_gemm(
-                frag_c_br,
-                frag_b_up,
-                frag_a_bottom,
-                scale_a_bottom,
-                scale_b_up,
-            )
+        a_vmem = (
+            block_m * block_k * element_type.width // 8
+        ) // (256 * 16)
+        b_vmem = (
+            block_n * block_k * weight_type.width // 8
+        ) // (256 * 16)
+        a_phase_vmem = a_vmem + 1
+        b_phase_vmem = b_vmem + 1
+        wait_ab = 2 * a_phase_vmem + 3 * b_phase_vmem
+        wait_ba = 3 * a_phase_vmem + 2 * b_phase_vmem
+        a_dsrd = frag_a_top.load().numel * element_type.width // 8 // 16
+        b_dsrd = 4
 
-        issue_g2s(fx.Int32(0), 0)
-        issue_g2s(fx.Int32(1), 1)
-        waitvmcnt_barrier(operand_vmem_per_tile)
+        do_g2s(0, 0)
+        do_g2s(1, 1)
+        waitvmcnt_barrier(3 * (a_phase_vmem + b_phase_vmem))
+        load_b(b_gate_read[0], frag_b_gate)
+        load_a(a_top_source[0], frag_a_top_dest)
+        scale_b_gate_frag.store(scale_b_gate_g2r[0].load())
+        scale_a_top_frag.store(scale_a_top_g2r[0].load())
+        rocdl.sched_barrier(0)
+
+        frag_c_tl.fill(0)
+        frag_c_tr.fill(0)
+        frag_c_bl.fill(0)
+        frag_c_br.fill(0)
+        rocdl.sched_barrier(0)
+        accumulators = [
+            frag_c_tl.load(),
+            frag_c_tr.load(),
+            frag_c_bl.load(),
+            frag_c_br.load(),
+        ]
 
         for kk_index, states in range(0, num_k_tiles - 2, 2, init=accumulators):
             frag_c_tl.store(states[0])
@@ -968,17 +1046,185 @@ def compile_moe_gateup_4w(
             frag_c_br.store(states[3])
             kk = fx.Int32(kk_index)
 
-            load_operands(0)
-            scales0 = load_scales(kk)
-            issue_g2s(kk + 2, 0)
-            waitvmcnt_barrier(operand_vmem_per_tile)
-            compute_tile(scales0)
+            do_gemm(
+                frag_c_tl,
+                frag_b_gate,
+                frag_a_top,
+                scale_a_top_frag,
+                scale_b_gate_frag,
+            )
+            waitvmcnt_barrier(wait_ab)
+            load_a(a_bottom_source[0], frag_a_bottom_dest)
+            scale_a_bottom_frag.store(scale_a_bottom_g2r[0].load())
+            raw_b_mxfp4_g2s(kk + 2, lds.b_gate0.ptr, gate_row_tile)
+            load_scale_g2r(
+                scale_b_gate_g2r[0],
+                scale_b_rsrc,
+                kk + 2,
+                gate_scale_row_tile,
+                scale_b_padded_rows,
+                False,
+            )
+            hot_loop_scheduler_mainloop(0, b_phase_vmem, a_dsrd)
+            rocdl.sched_barrier(0)
 
-            load_operands(1)
-            scales1 = load_scales(kk + 1)
-            issue_g2s(kk + 3, 1)
-            waitvmcnt_barrier(operand_vmem_per_tile)
-            compute_tile(scales1)
+            do_gemm(
+                frag_c_bl,
+                frag_b_gate,
+                frag_a_bottom,
+                scale_a_bottom_frag,
+                scale_b_gate_frag,
+            )
+            waitvmcnt_barrier(wait_ab)
+            load_b(b_up_read[0], frag_b_up)
+            scale_b_up_frag.store(scale_b_up_g2r[0].load())
+            raw_a_gather_g2s(kk + 2, a_top_dma_ptrs[0], a_top_token_ids)
+            load_scale_g2r(
+                scale_a_top_g2r[0],
+                scale_a_rsrc,
+                kk + 2,
+                a_top_scale_tile,
+                scale_a_padded_rows,
+                True,
+            )
+            hot_loop_scheduler_mainloop(1, a_phase_vmem, b_dsrd)
+            rocdl.sched_barrier(0)
+
+            do_gemm(
+                frag_c_tr,
+                frag_b_up,
+                frag_a_top,
+                scale_a_top_frag,
+                scale_b_up_frag,
+            )
+            waitvmcnt_barrier(wait_ba)
+            load_b(b_gate_read[1], frag_b_gate)
+            scale_b_gate_frag.store(scale_b_gate_g2r[1].load())
+            raw_a_gather_g2s(
+                kk + 2, a_bottom_dma_ptrs[0], a_bottom_token_ids
+            )
+            load_scale_g2r(
+                scale_a_bottom_g2r[0],
+                scale_a_rsrc,
+                kk + 2,
+                a_bottom_scale_tile,
+                scale_a_padded_rows,
+                True,
+            )
+            hot_loop_scheduler_mainloop(2, a_phase_vmem, b_dsrd)
+            rocdl.sched_barrier(0)
+
+            do_gemm(
+                frag_c_br,
+                frag_b_up,
+                frag_a_bottom,
+                scale_a_bottom_frag,
+                scale_b_up_frag,
+            )
+            waitvmcnt_barrier(wait_ba)
+            load_a(a_top_source[1], frag_a_top_dest)
+            scale_a_top_frag.store(scale_a_top_g2r[1].load())
+            raw_b_mxfp4_g2s(kk + 2, lds.b_up0.ptr, up_row_tile)
+            load_scale_g2r(
+                scale_b_up_g2r[0],
+                scale_b_rsrc,
+                kk + 2,
+                up_scale_row_tile,
+                scale_b_padded_rows,
+                False,
+            )
+            hot_loop_scheduler_mainloop(3, b_phase_vmem, a_dsrd)
+            rocdl.sched_barrier(0)
+
+            do_gemm(
+                frag_c_tl,
+                frag_b_gate,
+                frag_a_top,
+                scale_a_top_frag,
+                scale_b_gate_frag,
+            )
+            waitvmcnt_barrier(wait_ab)
+            load_a(a_bottom_source[1], frag_a_bottom_dest)
+            scale_a_bottom_frag.store(scale_a_bottom_g2r[1].load())
+            raw_b_mxfp4_g2s(kk + 3, lds.b_gate1.ptr, gate_row_tile)
+            load_scale_g2r(
+                scale_b_gate_g2r[1],
+                scale_b_rsrc,
+                kk + 3,
+                gate_scale_row_tile,
+                scale_b_padded_rows,
+                False,
+            )
+            hot_loop_scheduler_mainloop(4, b_phase_vmem, a_dsrd)
+            rocdl.sched_barrier(0)
+
+            do_gemm(
+                frag_c_bl,
+                frag_b_gate,
+                frag_a_bottom,
+                scale_a_bottom_frag,
+                scale_b_gate_frag,
+            )
+            waitvmcnt_barrier(wait_ab)
+            load_b(b_up_read[1], frag_b_up)
+            scale_b_up_frag.store(scale_b_up_g2r[1].load())
+            raw_a_gather_g2s(kk + 3, a_top_dma_ptrs[1], a_top_token_ids)
+            load_scale_g2r(
+                scale_a_top_g2r[1],
+                scale_a_rsrc,
+                kk + 3,
+                a_top_scale_tile,
+                scale_a_padded_rows,
+                True,
+            )
+            hot_loop_scheduler_mainloop(5, a_phase_vmem, b_dsrd)
+            rocdl.sched_barrier(0)
+
+            do_gemm(
+                frag_c_tr,
+                frag_b_up,
+                frag_a_top,
+                scale_a_top_frag,
+                scale_b_up_frag,
+            )
+            waitvmcnt_barrier(wait_ba)
+            load_b(b_gate_read[0], frag_b_gate)
+            scale_b_gate_frag.store(scale_b_gate_g2r[0].load())
+            raw_a_gather_g2s(
+                kk + 3, a_bottom_dma_ptrs[1], a_bottom_token_ids
+            )
+            load_scale_g2r(
+                scale_a_bottom_g2r[1],
+                scale_a_rsrc,
+                kk + 3,
+                a_bottom_scale_tile,
+                scale_a_padded_rows,
+                True,
+            )
+            hot_loop_scheduler_mainloop(6, a_phase_vmem, b_dsrd)
+            rocdl.sched_barrier(0)
+
+            do_gemm(
+                frag_c_br,
+                frag_b_up,
+                frag_a_bottom,
+                scale_a_bottom_frag,
+                scale_b_up_frag,
+            )
+            waitvmcnt_barrier(wait_ba)
+            load_a(a_top_source[0], frag_a_top_dest)
+            scale_a_top_frag.store(scale_a_top_g2r[0].load())
+            raw_b_mxfp4_g2s(kk + 3, lds.b_up1.ptr, up_row_tile)
+            load_scale_g2r(
+                scale_b_up_g2r[1],
+                scale_b_rsrc,
+                kk + 3,
+                up_scale_row_tile,
+                scale_b_padded_rows,
+                False,
+            )
+            hot_loop_scheduler_mainloop(7, b_phase_vmem, a_dsrd)
+            rocdl.sched_barrier(0)
             loop_results = yield [
                 frag_c_tl.load(),
                 frag_c_tr.load(),
@@ -991,15 +1237,102 @@ def compile_moe_gateup_4w(
         frag_c_bl.store(loop_results[2])
         frag_c_br.store(loop_results[3])
 
-        load_operands(0)
-        tail_scales0 = load_scales(fx.Int32(num_k_tiles - 2))
-        waitvmcnt_barrier(0)
-        compute_tile(tail_scales0)
+        waitvmcnt_barrier(wait_ab)
+        do_gemm(
+            frag_c_tl,
+            frag_b_gate,
+            frag_a_top,
+            scale_a_top_frag,
+            scale_b_gate_frag,
+        )
+        load_a(a_bottom_source[0], frag_a_bottom_dest)
+        scale_a_bottom_frag.store(scale_a_bottom_g2r[0].load())
+        hot_loop_scheduler_mainloop(0, 0, 8)
+        rocdl.sched_barrier(0)
 
-        load_operands(1)
-        tail_scales1 = load_scales(fx.Int32(num_k_tiles - 1))
+        waitvmcnt_barrier(2 * (a_phase_vmem + b_phase_vmem))
+        do_gemm(
+            frag_c_bl,
+            frag_b_gate,
+            frag_a_bottom,
+            scale_a_bottom_frag,
+            scale_b_gate_frag,
+        )
+        load_b(b_up_read[0], frag_b_up)
+        scale_b_up_frag.store(scale_b_up_g2r[0].load())
+        hot_loop_scheduler_mainloop(1, 0, 8)
+        rocdl.sched_barrier(0)
+
+        waitvmcnt_barrier(2 * a_phase_vmem + b_phase_vmem)
+        do_gemm(
+            frag_c_tr,
+            frag_b_up,
+            frag_a_top,
+            scale_a_top_frag,
+            scale_b_up_frag,
+        )
+        load_b(b_gate_read[1], frag_b_gate)
+        scale_b_gate_frag.store(scale_b_gate_g2r[1].load())
+        hot_loop_scheduler_mainloop(2, 0, 8)
+        rocdl.sched_barrier(0)
+
+        waitvmcnt_barrier(a_phase_vmem + b_phase_vmem)
+        do_gemm(
+            frag_c_br,
+            frag_b_up,
+            frag_a_bottom,
+            scale_a_bottom_frag,
+            scale_b_up_frag,
+        )
+        load_a(a_top_source[1], frag_a_top_dest)
+        scale_a_top_frag.store(scale_a_top_g2r[1].load())
+        hot_loop_scheduler_mainloop(3, 0, 8)
+        rocdl.sched_barrier(0)
+
+        waitvmcnt_barrier(b_phase_vmem)
+        do_gemm(
+            frag_c_tl,
+            frag_b_gate,
+            frag_a_top,
+            scale_a_top_frag,
+            scale_b_gate_frag,
+        )
+        load_a(a_bottom_source[1], frag_a_bottom_dest)
+        scale_a_bottom_frag.store(scale_a_bottom_g2r[1].load())
+        hot_loop_scheduler_mainloop(4, 0, 8)
+        rocdl.sched_barrier(0)
+
         waitvmcnt_barrier(0)
-        compute_tile(tail_scales1)
+        do_gemm(
+            frag_c_bl,
+            frag_b_gate,
+            frag_a_bottom,
+            scale_a_bottom_frag,
+            scale_b_gate_frag,
+        )
+        load_b(b_up_read[1], frag_b_up)
+        scale_b_up_frag.store(scale_b_up_g2r[1].load())
+        hot_loop_scheduler_mainloop(5, 0, 8)
+        rocdl.sched_barrier(0)
+
+        do_gemm(
+            frag_c_tr,
+            frag_b_up,
+            frag_a_top,
+            scale_a_top_frag,
+            scale_b_up_frag,
+        )
+        hot_loop_scheduler_mainloop(6, 0, 0)
+        rocdl.sched_barrier(0)
+        do_gemm(
+            frag_c_br,
+            frag_b_up,
+            frag_a_bottom,
+            scale_a_bottom_frag,
+            scale_b_up_frag,
+        )
+        hot_loop_scheduler_mainloop(7, 0, 0)
+        rocdl.sched_barrier(0)
 
         pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
         lane_group = lane_id // 16
@@ -1127,7 +1460,7 @@ def compile_moe_gateup_4w(
             num_expert_blocks,
             value_attrs=value_attrs,
         ).launch(
-            grid=(intermediate_size // block_n, num_expert_blocks, 1),
+            grid=(num_n_tiles * num_expert_blocks, 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )
@@ -1145,6 +1478,9 @@ def run_accuracy_case(
     topk: int,
     num_experts: int,
     *,
+    b_lds_swizzle: bool = False,
+    xcd_swizzle: bool = False,
+    group_size_m: int = 1,
     return_metrics: bool = False,
     top_error_threshold: float | None = None,
     top_error_count: int = 20,
@@ -1175,7 +1511,13 @@ def run_accuracy_case(
         torch.cuda.current_stream(),
     )
     launcher = compile_moe_gateup_4w(
-        intermediate_size, hidden_size, topk, num_experts
+        intermediate_size,
+        hidden_size,
+        topk,
+        num_experts,
+        b_lds_swizzle=b_lds_swizzle,
+        xcd_swizzle=xcd_swizzle,
+        group_size_m=group_size_m,
     )
     kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
     kernel(*args)
@@ -1199,6 +1541,8 @@ def run_accuracy_case(
     correct = allclose and diff <= 0.00001
     print(
         f"accuracy: shape={tuple(output.shape)} experts={num_experts} "
+        f"b_lds={'swizzle' if b_lds_swizzle else 'padding'} "
+        f"xcd_swizzle={xcd_swizzle} group_size_m={group_size_m} "
         f"expert_blocks={inputs['expert_ids'].numel()} finite={finite} "
         f"allclose={allclose} max_abs={max_abs:.6g} diff={diff:.6g}"
     )
@@ -1249,7 +1593,13 @@ def run_accuracy_case(
     return correct
 
 
-def run_accuracy_matrix(output_csv: str) -> None:
+def run_accuracy_matrix(
+    output_csv: str,
+    *,
+    b_lds_swizzle: bool = False,
+    xcd_swizzle: bool = False,
+    group_size_m: int = 1,
+) -> None:
     fieldnames = [
         "tokens",
         "hidden_size",
@@ -1272,7 +1622,7 @@ def run_accuracy_matrix(output_csv: str) -> None:
         for hidden_size in (6144, 4096)
         for topk in (5, 6, 7, 8)
         for num_experts in (384, 120)
-        for intermediate_size in (256, 128)
+        for intermediate_size in (256, 128, 64)
     ]
     failures = []
     with open(output_csv, "w", newline="", encoding="ascii") as csv_file:
@@ -1297,6 +1647,9 @@ def run_accuracy_matrix(output_csv: str) -> None:
                         hidden_size,
                         topk,
                         num_experts,
+                        b_lds_swizzle=b_lds_swizzle,
+                        xcd_swizzle=xcd_swizzle,
+                        group_size_m=group_size_m,
                         return_metrics=True,
                         top_error_threshold=8.0,
                     )
@@ -1486,6 +1839,10 @@ def run_benchmark(
     warmup: int,
     iterations: int,
     data_clones: int,
+    *,
+    b_lds_swizzle: bool = False,
+    xcd_swizzle: bool = False,
+    group_size_m: int = 1,
 ) -> None:
     validate_case_parameters(
         tokens, intermediate_size, hidden_size, topk, num_experts
@@ -1518,7 +1875,13 @@ def run_benchmark(
         torch.cuda.current_stream(),
     )
     moe_launcher = compile_moe_gateup_4w(
-        intermediate_size, hidden_size, topk, num_experts
+        intermediate_size,
+        hidden_size,
+        topk,
+        num_experts,
+        b_lds_swizzle=b_lds_swizzle,
+        xcd_swizzle=xcd_swizzle,
+        group_size_m=group_size_m,
     )
     moe_arg_sets = _clone_benchmark_args(moe_args, data_clones)
     moe_rw_bytes = sum(
@@ -1534,7 +1897,7 @@ def run_benchmark(
         moe_arg_sets,
         flops,
         moe_rw_bytes,
-        "moe_gateup",
+        f"moe_gateup_xcd{int(xcd_swizzle)}_group{group_size_m}",
         warmup,
         iterations,
     )
@@ -1630,7 +1993,9 @@ def run_benchmark(
     )
 
     print(
-        f"benchmark: clones={data_clones} warmup={warmup} runs={iterations}"
+        f"benchmark: b_lds={'swizzle' if b_lds_swizzle else 'padding'} "
+        f"xcd_swizzle={xcd_swizzle} group_size_m={group_size_m} "
+        f"clones={data_clones} warmup={warmup} runs={iterations}"
     )
     print(
         f"moe:  best={moe_best[0]:.6f} ms median={moe_median[0]:.6f} ms "
@@ -1660,6 +2025,9 @@ def main() -> None:
     parser.add_argument("--unaligned-accuracy", action="store_true")
     parser.add_argument("--scale-padding-accuracy", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--b-lds-swizzle", action="store_true")
+    parser.add_argument("--xcd-swizzle", action="store_true")
+    parser.add_argument("--group-size-m", type=int, default=1)
     parser.add_argument("--tokens", type=int, default=8192)
     parser.add_argument("--intermediate-size", type=int, default=512)
     parser.add_argument("--hidden-size", type=int, default=6144)
@@ -1671,7 +2039,16 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.small_accuracy:
-        if not run_accuracy_case(96, 128, 512, 2, 3):
+        if not run_accuracy_case(
+            96,
+            128,
+            512,
+            2,
+            3,
+            b_lds_swizzle=args.b_lds_swizzle,
+            xcd_swizzle=args.xcd_swizzle,
+            group_size_m=args.group_size_m,
+        ):
             raise SystemExit("small padded accuracy failed")
         return
     if args.accuracy:
@@ -1681,14 +2058,31 @@ def main() -> None:
             args.hidden_size,
             args.topk,
             args.num_experts,
+            b_lds_swizzle=args.b_lds_swizzle,
+            xcd_swizzle=args.xcd_swizzle,
+            group_size_m=args.group_size_m,
         ):
             raise SystemExit("full accuracy failed")
         return
     if args.accuracy_matrix:
-        run_accuracy_matrix(args.accuracy_csv)
+        run_accuracy_matrix(
+            args.accuracy_csv,
+            b_lds_swizzle=args.b_lds_swizzle,
+            xcd_swizzle=args.xcd_swizzle,
+            group_size_m=args.group_size_m,
+        )
         return
     if args.unaligned_accuracy:
-        if not run_accuracy_case(8193, 512, 6144, 8, 384):
+        if not run_accuracy_case(
+            8193,
+            512,
+            6144,
+            8,
+            384,
+            b_lds_swizzle=args.b_lds_swizzle,
+            xcd_swizzle=args.xcd_swizzle,
+            group_size_m=args.group_size_m,
+        ):
             raise SystemExit("unaligned-token accuracy failed")
         return
     if args.scale_padding_accuracy:
@@ -1704,6 +2098,9 @@ def main() -> None:
             args.warmup,
             args.iterations,
             args.data_clones,
+            b_lds_swizzle=args.b_lds_swizzle,
+            xcd_swizzle=args.xcd_swizzle,
+            group_size_m=args.group_size_m,
         )
         return
     parser.error(

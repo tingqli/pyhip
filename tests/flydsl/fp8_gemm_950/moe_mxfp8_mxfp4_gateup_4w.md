@@ -85,6 +85,61 @@ Final paired hot-data result:
 The optimized MoE is 1.483x the GEMM latency and reaches 67.4% of GEMM
 throughput.
 
+### XCD Launch-Order Sweep (Intermediate Size 256)
+
+Date: 2026-09-03
+
+Configuration: tokens 8192, topk 8, experts 256, intermediate size 256,
+hidden size 6144, MXFP8 activations, MXFP4 weights, BF16 output, padding LDS,
+20 data clones, 5 warmups, and 20 measured iterations. Balanced routing gives
+each expert exactly 256 rows.
+
+The MoE output is `[8192, 8, 512]`. The paired standalone GEMM used by the
+benchmark is `M=8192, N=4096, K=6144`, whose `[8192, 4096]` output is the MoE
+output with its topk and projection dimensions flattened. Both execute
+`2 * 8192 * 8 * 512 * 6144` useful FLOPs. This is an equal-output-shape and
+equal-FLOP comparison; it is not `M=65536, N=512, K=6144`.
+
+Commands:
+
+```bash
+python tests/flydsl/fp8_gemm_950/test_moe_mxfp8_mxfp4_gateup_4w.py \
+  --benchmark --tokens 8192 --intermediate-size 256 --hidden-size 6144 \
+  --topk 8 --num-experts 256 --data-clones 20 --warmup 5 --iterations 20
+
+for group in 4 8 16 32; do
+  python tests/flydsl/fp8_gemm_950/test_moe_mxfp8_mxfp4_gateup_4w.py \
+    --benchmark --tokens 8192 --intermediate-size 256 --hidden-size 6144 \
+    --topk 8 --num-experts 256 --data-clones 20 --warmup 5 --iterations 20 \
+    --xcd-swizzle --group-size-m "$group"
+done
+```
+
+MoE results:
+
+| Launch order | Best (ms) | Median (ms) | Best TFLOPS | Median TFLOPS |
+|---|---:|---:|---:|---:|
+| No XCD swizzle | 0.172921 | 0.176362 | 2384.42 | 2337.90 |
+| XCD, `GROUP_SIZE_M=4` | **0.171601** | 0.175361 | **2402.76** | 2351.25 |
+| XCD, `GROUP_SIZE_M=8` | 0.172202 | **0.175121** | 2394.38 | **2354.47** |
+| XCD, `GROUP_SIZE_M=16` | 0.172841 | 0.175962 | 2385.53 | 2343.22 |
+| XCD, `GROUP_SIZE_M=32` | 0.177002 | 0.179961 | 2329.45 | 2291.15 |
+
+Paired `8192 x 4096 x 6144` standalone GEMM results from the same processes:
+
+| MoE launch paired with GEMM | GEMM best (ms) | GEMM median (ms) | GEMM best TFLOPS | GEMM median TFLOPS | MoE/GEMM latency | MoE/GEMM throughput |
+|---|---:|---:|---:|---:|---:|---:|
+| No XCD swizzle | 0.157081 | 0.160202 | 2624.87 | 2573.73 | 1.101x | 90.840% |
+| XCD, `GROUP_SIZE_M=4` | 0.156282 | 0.160241 | 2638.29 | 2573.10 | 1.098x | 91.073% |
+| XCD, `GROUP_SIZE_M=8` | 0.158321 | 0.161522 | 2604.31 | 2552.70 | 1.088x | 91.939% |
+| XCD, `GROUP_SIZE_M=16` | 0.157562 | 0.162802 | 2616.85 | 2532.63 | 1.097x | 91.160% |
+| XCD, `GROUP_SIZE_M=32` | 0.157802 | 0.162522 | 2612.87 | 2536.99 | 1.122x | 89.153% |
+
+`GROUP_SIZE_M=4` has the best MoE sample and improves best throughput by
+0.77% over no XCD swizzle. `GROUP_SIZE_M=8` has the best MoE median, but the
+difference from group 4 is only 0.14%. Group 32 regresses best throughput by
+2.31%. Use group 4 as the default for this shape.
+
 ## Optimization History
 
 | Version | Best latency | Throughput | Observation |
@@ -170,3 +225,43 @@ were sufficient for the comparison.
   path instead of preparing it in this standalone test driver.
 - Add SiLU and gate-by-up only after preserving this raw gate/up accuracy
   baseline.
+
+## gaps with MOE in aiter.
+For mxfp8 and mxfp4,  aiter fused MOE would sort the A scale as sorted_id table. [R, G], `R` means routed token ID. `G` means quantization groups. 
+R would padded to 32 alignment, G would be padded to 8 aligned.
+Also after A scale is sorted, [R, G] would be permuted    
+
+[R, G] =  [R//32, 2r1, 16r0, G//8, 2g1, 4g0] would be permuted to 
+
+[R//32, G//8, 4g0,16r0,2g1,2r1] 
+
+current gemmA8w4 perfer the layout:
+
+
+```
+        scale_u8.view(rows // 128, 4, 32, groups)
+        .permute(3, 0, 2, 1)
+```
+
+[R//128, 4r1, 32r0, G] -> [G, R//128, 32r0, 4r1]
+
+把 这个是fused_dynamic_mxfp8_quant_moe_sort的 preshuffle之后的scale转化成test_moe_mxfp8_mxfp4_gateup_4w.py里面的A
+
+1. 这个是fused_dynamic_mxfp8_quant_moe_sort scale的layout [R//32, G//8,4g0 ,16r0,2g1,2r1]  
+  view as  [R//128, 4r2, G//8,4g0 ,16r0,2g1,2r1],
+
+
+2. permute:
+[R//128, 4r2, G//8,4g0 ,16r0,2g1,2r1] -[0, 1, 2, 3, 4, 5,6]    -> [G, R//128, 32r0, 4r1]
+
+permute to 
+[]
+[G//8, 4g0, 2g1, R//128, 2r1, 16r0, 4r2]
+
+
+permute:  [2， 5， 3， 0， 6， 4， 1]
+reshape:
+
+
+
+可以把moe_mxfp8_mxfp4_gatup_4w.md A scale sorted routing这部分用fused_moe.py来代替，.md文件中有关于如何通过permute以及reshape实现，
