@@ -8,7 +8,7 @@ from functools import cache
 import flydsl.compiler as flyc  # noqa: E402
 from flydsl.compiler.kernel_function import CompilationContext  # noqa: E402
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, arith
 from flydsl.expr.typing import BFloat16, Float32, T, Float8E4M3FN, Float8E4M3FNUZ
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
@@ -16,7 +16,7 @@ from flydsl.utils.env import DebugEnvManager
 from flydsl._mlir import ir
 import flydsl
 from flydsl._mlir.dialects import fly as fly_dialect
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import llvm, vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 import pyhip.contrib.flydsl as fxu
 
@@ -608,10 +608,10 @@ def compile_gemm(TILE_M, TILE_N, N, K, alg='splitk'):
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         swz = fx.SwizzleType.get(3, 3, 3)
-        at_lds = fx.make_view(lds.at_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M // 2, TILE_K), order=(1, 0))))
-        ab_lds = fx.make_view(lds.ab_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M // 2, TILE_K), order=(1, 0))))
-        bl_lds = fx.make_view(lds.bl_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))))
-        br_lds = fx.make_view(lds.br_lds, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))))
+        at_lds = fx.make_view(lds.at_lds.ptr, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M // 2, TILE_K), order=(1, 0))))
+        ab_lds = fx.make_view(lds.ab_lds.ptr, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_M // 2, TILE_K), order=(1, 0))))
+        bl_lds = fx.make_view(lds.bl_lds.ptr, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))))
+        br_lds = fx.make_view(lds.br_lds.ptr, fx.make_composed_layout(fx.static(swz), fx.make_ordered_layout((TILE_N // 2, TILE_K), order=(1, 0))))
 
         uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
         ab_lds_cp_layout_g2r = make_tiled_copy(uni_cp_atom,
@@ -3040,8 +3040,15 @@ if __name__ == '__main__':
         default=4,
         help="""select wave number 4 or 8""",
     )
+    parser.add_argument(
+        "-a",
+        "--alg",
+        choices=["splitk", "4wave", "8wave"],
+        default="4wave",
+        help="select the GEMM kernel to run",
+    )
     args = parser.parse_args()
-    print(f'selected num_warps={args.wave}')
+    print(f'selected alg={args.alg}, num_warps={args.wave}')
 
     #TILE_M = 16
     #TILE_N = 128
@@ -3085,16 +3092,18 @@ if __name__ == '__main__':
         #         TILE_M = 32
         #         TILE_N = 128
 
-        #TILE_M, TILE_N = 16, 64
-        TILE_M, TILE_N = 256, 128
+        if args.alg == 'splitk':
+            # Four waves keep separate TILE_M x TILE_N fp32 partial sums in LDS.
+            # 64 x 64 therefore consumes exactly gfx942's 64 KiB workgroup limit.
+            TILE_M, TILE_N = 64, 64
+        elif args.alg == '4wave':
+            TILE_M, TILE_N = 256, 256
+        else:
+            TILE_M, TILE_N = 256, 128
         dict_tile_mn[f'{M}'] = (TILE_M, TILE_N)
         print(f'final selected TILE_M={TILE_M}, TILE_N={TILE_N}')
         #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K)
-        # perf = merge(perf, test_perf(num_warps=args.wave, alg='splitk', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
         #perf = merge(perf, test_perf(num_warps=args.wave, alg='torch', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
         #perf = merge(perf, test_perf(num_warps=args.wave, alg='fly', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-        TILE_M, TILE_N = 128*2, 128*2
-        perf = merge(perf, test_perf(num_warps=args.wave, alg='4wave', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
-        # TILE_M, TILE_N = 256, 128
-        # perf = merge(perf, test_perf(num_warps=args.wave, alg='8wave', M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
+        perf = merge(perf, test_perf(num_warps=args.wave, alg=args.alg, M=[M], TILE_M=TILE_M, TILE_N=TILE_N, N=N, K=K))
     show_perf(perf, dict_tile_mn)
