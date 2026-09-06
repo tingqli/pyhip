@@ -633,10 +633,11 @@ def compile_moe_gateup_4w(
         thread_mma = tiled_mma.thr_slice(tid)
 
         lds = fx.SharedAllocator().allocate(LDS).peek()
-        write_layout_a = fx.make_layout(
-            ((8, 2, block_m // 16), block_k),
-            ((block_k, a_group8, a_group16), 1),
-        )
+        # write_layout_a没有使用， 使用的是raw_buffer_load_lds
+        # write_layout_a = fx.make_layout(
+        #     ((8, 2, block_m // 16), block_k),
+        #     ((block_k, a_group8, a_group16), 1),
+        # )
         read_layout_a = fx.make_layout(
             ((2, block_m // 16, 8), (32, block_k // 32)),
             ((a_group8, a_group16, block_k), (1, 32)),
@@ -668,6 +669,7 @@ def compile_moe_gateup_4w(
             for ptr in (lds.b_up0.ptr, lds.b_up1.ptr)
         ]
 
+        # lds read A: s2r A used flyDSL tiled API.
         copy_a_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
         copy_a = fx.make_tiled_copy_B(copy_a_atom, tiled_mma).get_slice(tid)
         a_top_source = [copy_a.partition_S(view) for view in a_top_read]
@@ -677,15 +679,21 @@ def compile_moe_gateup_4w(
         frag_a_top_dest = copy_a.retile(frag_a_top)
         frag_a_bottom_dest = copy_a.retile(frag_a_bottom)
 
-        frag_b_gate = fx.make_rmem_tensor(16, Int32)
-        frag_b_up = fx.make_rmem_tensor(16, Int32)
-
+        # lds read B: why s2r B can't use flyDSL tiled API copy? mxfp4 type? 
+        # n_rep = 4
+        # each thread hold 16*128/64=32 mxfp4 =  4 int 32
+        # total b reg = n_rep
+        fma_n_rep = block_n // (16*2)
+        b_reg_dwords = fma_n_rep * (16*128//64//(32//4))
+        frag_b_gate = fx.make_rmem_tensor(b_reg_dwords, Int32)
+        frag_b_up = fx.make_rmem_tensor(b_reg_dwords, Int32)
 
         lane_id = tid % 64
         wave_id = tid // 64
         wave_id_uniform = fx.Int32(
             rocdl.readfirstlane(T.i32, arith._to_raw(wave_id))
         )
+        # AC:LDS_A offset per wave. scalar reg.
         wave_a_lds_base = (
             (wave_id_uniform % 2) * a_group8
             + (wave_id_uniform // 2) * a_group16
@@ -704,6 +712,7 @@ def compile_moe_gateup_4w(
                 elem_type=T.i8,
             )
 
+        # AC: make DMA pointers for A in LDS. shape: [2, 4] for top and bottom halves.
         a_top_dma_ptrs = [
             [make_a_dma_ptr(ptr, copy_round) for copy_round in range_constexpr(4)]
             for ptr in (lds.a_top0.ptr, lds.a_top1.ptr)
@@ -714,13 +723,17 @@ def compile_moe_gateup_4w(
         ]
         mask24 = arith.constant(TOKEN_MASK, type=T.i32)
 
+        # 从sorted_id table 获取当前thread所对应的tokenID
+        # 根据这个token ID 可以load A 以及 A scale.
         def load_a_token_ids(row_half: int):
             token_ids = []
             for copy_round in range_constexpr(4):
                 row_local = (
                     row_half * block_m
                     + wave_id_uniform
+                    # 2 contineous lane row fetch data with interval of 16 rows
                     + (lane_id // 8) * 16
+                    # 4 is 4 wave
                     + copy_round * 4
                 )
                 sorted_row = (
@@ -735,25 +748,29 @@ def compile_moe_gateup_4w(
         a_top_token_ids = load_a_token_ids(0)
         a_bottom_token_ids = load_a_token_ids(1)
 
-        def raw_a_gather_g2s(kk, ptrs, token_ids):
+        # A: AC: 4 x buffer_load_dwordx4 lds
+        def raw_a_gather_g2s(k_block_idx, lds_ptrs, token_ids):
             for copy_round in range_constexpr(4):
                 global_byte = (
                     fx.Int32(token_ids[copy_round]) * hidden_size
-                    + kk * block_k
+                    + k_block_idx * block_k
                     + fx.Int32((lane_id % 8) * 16)
                 )
                 rocdl.raw_ptr_buffer_load_lds(
                     a_rsrc,
-                    ptrs[copy_round],
+                    lds_ptrs[copy_round],
                     fx.Int32(16),
                     global_byte,
                     fx.Int32(0),
                     fx.Int32(0),
                     fx.Int32(0),
                 )
-
-        def raw_b_mxfp4_g2s(kk, ptr, row_tile):
-            root = lds_root(ptr)
+        # B: AC: 2 x buffer_load_dwordx4 lds
+        # B is loaded with 'normal' 16x4 buffer load.
+        # [16x4] src: each wave copies 16 contineous rows from global memory, 4 wave copies 64 contineous rows .
+        # [16x4] dest: Also same written into LDS.
+        def raw_b_mxfp4_g2s(k_block_idx, lds_base, row_tile):
+            root = lds_root(lds_base)
             for copy_round in range_constexpr(2):
                 if const_expr(b_lds_swizzle):
                     physical_slot = tid + copy_round * 256
@@ -771,6 +788,7 @@ def compile_moe_gateup_4w(
                         elem_type=T.i8,
                     )
                 else:
+
                     chunk = wave_id_uniform + copy_round * 4
                     row = chunk * 16 + lane_id // 4
                     col_byte = (lane_id % 4) * 16
@@ -781,8 +799,11 @@ def compile_moe_gateup_4w(
                     )
                 global_row = row_tile * block_n + fx.Int32(row)
                 global_byte = (
+                    # N offset 
                     global_row * (hidden_size // 2)
-                    + kk * (block_k // 2)
+                    # K iter offset
+                    + k_block_idx * (block_k // 2)
+                    # k offset
                     + fx.Int32(col_byte)
                 )
                 rocdl.raw_ptr_buffer_load_lds(
@@ -798,10 +819,19 @@ def compile_moe_gateup_4w(
         scale_lane_id = tid % 64
         scale_wave_id = wave_id_uniform
 
+        # 1xbuffer_load_dword
         def load_scale_dword(rsrc, kk, row_tile, rows, is_a: bool):
             wave_half = scale_wave_id // 2 if is_a else scale_wave_id % 2
             scale_row = scale_lane_id % 16 + wave_half * 16
             scale_group = scale_lane_id // 16
+                    
+            # scale layout (r//128, 4, 32r0, k//32) permuted to 
+            #  (k//32, r//128, 32r0, 4r1) -> (k//128, 4g0, r //128, 32r0, 4r1)
+            
+            # rows -> r
+            # kk -> k //128
+            # row_tile -> r//128
+
             dword_offset = (
                 kk * rows
                 + fx.Int32(scale_group) * (rows // 4)
@@ -813,6 +843,8 @@ def compile_moe_gateup_4w(
                     rsrc, dword_offset, vec_width=1, dtype=T.i32
                 )
             )
+
+        # 4xds_read_128
 
         def load_b_fragment(source, destination):
             wave_n = wave_id % 2
@@ -1724,114 +1756,6 @@ def _benchmark_kernel(
     median = samples[len(samples) // 2]
     return samples[0], median
 
-
-def run_scale_padding_accuracy_case(m: int, n: int, k: int) -> bool:
-    from test_mxfp8_gemm_4w import compile_gemm_fp8
-
-    if m <= 0:
-        raise ValueError("m must be positive")
-    if n <= 0 or n % 8 != 0:
-        raise ValueError("n must be a positive multiple of 8")
-    if k < 512 or k % 256 != 0:
-        raise ValueError("k must be a multiple of 256 and at least 512")
-
-    per_1x32_mx_quant_hip, dtypes, e8m0_to_f32, mxfp4_to_f32 = (
-        _load_mx_helpers()
-    )
-    a, scale_a_raw = per_1x32_mx_quant_hip(
-        torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * A_INPUT_SCALE,
-        quant_dtype=dtypes.fp8,
-        scale_type=dtypes.fp8_e8m0,
-        shuffle=False,
-    )
-    b, scale_b_raw = per_1x32_mx_quant_hip(
-        torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * B_INPUT_SCALE,
-        quant_dtype=dtypes.fp4x2,
-        scale_type=dtypes.fp8_e8m0,
-        shuffle=False,
-    )
-
-    scale_a_padded_rows = div_up(m, 256) * 256
-    scale_b_padded_rows = div_up(n, 256) * 256
-    scale_a = _permute_scale(
-        scale_a_raw, padded_rows=scale_a_padded_rows
-    )
-    scale_b = _permute_scale(
-        scale_b_raw, padded_rows=scale_b_padded_rows
-    )
-    a_descriptor_bytes = m * k
-    b_descriptor_bytes = n * k // 2
-    scale_a_descriptor_bytes = scale_a_padded_rows * (k // 32)
-    scale_b_descriptor_bytes = scale_b_padded_rows * (k // 32)
-    assert a.view(torch.uint8).numel() == a_descriptor_bytes
-    assert b.view(torch.uint8).numel() == b_descriptor_bytes
-    assert scale_a.view(torch.uint8).numel() == scale_a_descriptor_bytes
-    assert scale_b.view(torch.uint8).numel() == scale_b_descriptor_bytes
-
-    output = torch.full(
-        (m, n), float("nan"), device="cuda", dtype=torch.bfloat16
-    )
-    args = (
-        a.view(torch.int8).view(-1),
-        b.view(torch.int8).view(-1),
-        scale_a,
-        scale_b,
-        output.view(-1),
-        m,
-        torch.cuda.current_stream(),
-    )
-    launcher = compile_gemm_fp8(
-        256,
-        256,
-        128,
-        n,
-        k,
-        lds_swizzle=False,
-        preshuffle_b=False,
-        permlane_epilogue=True,
-        store_overlap=False,
-        with_scale=True,
-        b_mxfp4=True,
-    )
-    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
-    kernel(*args)
-    torch.cuda.synchronize()
-
-    a_dequant = a.float() * e8m0_to_f32(scale_a_raw).repeat_interleave(32, dim=1)
-    b_dequant = mxfp4_to_f32(b) * e8m0_to_f32(
-        scale_b_raw
-    ).repeat_interleave(32, dim=1)
-    reference = (a_dequant @ b_dequant.t()).to(torch.bfloat16)
-    finite = bool(torch.isfinite(output).all())
-    allclose = finite and torch.allclose(
-        output, reference, rtol=0.02, atol=0.01
-    )
-    import pyhip
-
-    diff = (
-        pyhip.calc_diff(output.float(), reference.float(), diff_thr=0.00001)
-        if finite
-        else float("inf")
-    )
-    correct = allclose and diff <= 0.00001
-    print(
-        f"scale padding accuracy: M={m} N={n} K={k} "
-        f"A={m}x{k} B={n}x{k} "
-        f"scale_a_rows={m}->{scale_a_padded_rows} "
-        f"scale_b_rows={n}->{scale_b_padded_rows} "
-        f"descriptor_bytes=(A={a_descriptor_bytes}, B={b_descriptor_bytes}, "
-        f"scale_a={scale_a_descriptor_bytes}, scale_b={scale_b_descriptor_bytes}) "
-        f"allclose={allclose} diff={diff:.6g}"
-    )
-    return correct
-
-
-def run_scale_padding_accuracy() -> None:
-    for m in (33, 127, 128, 129, 255, 256, 257):
-        if not run_scale_padding_accuracy_case(m, 392, 512):
-            raise SystemExit(f"scale padding accuracy failed for M={m}")
-
-
 def run_benchmark(
     tokens: int,
     intermediate_size: int,
@@ -2025,7 +1949,6 @@ def main() -> None:
         default="moe_mxfp8_mxfp4_gateup_4w_accuracy.csv",
     )
     parser.add_argument("--unaligned-accuracy", action="store_true")
-    parser.add_argument("--scale-padding-accuracy", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--b-lds-swizzle", action="store_true")
     parser.add_argument("--xcd-swizzle", action="store_true")
@@ -2086,9 +2009,6 @@ def main() -> None:
             group_size_m=args.group_size_m,
         ):
             raise SystemExit("unaligned-token accuracy failed")
-        return
-    if args.scale_padding_accuracy:
-        run_scale_padding_accuracy()
         return
     if args.benchmark:
         run_benchmark(
