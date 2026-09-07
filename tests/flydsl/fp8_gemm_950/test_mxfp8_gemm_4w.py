@@ -102,6 +102,7 @@ def compile_gemm_fp8(
     K,
     pid_swizzle=True,
     lds_swizzle=False,
+    b_lds_swizzle=None,
     preshuffle_b=False,
     permlane_epilogue=True,
     store_overlap=False,
@@ -117,6 +118,10 @@ def compile_gemm_fp8(
     #目前不支持mxfp4 weight preshuffle.
     # preshuffle只支持mxfp8 for now.
     assert not b_mxfp4 or not preshuffle_b
+    if b_lds_swizzle is None:
+        b_lds_swizzle = lds_swizzle
+    if not b_mxfp4 and b_lds_swizzle != lds_swizzle:
+        raise ValueError("independent B LDS swizzle is only supported for MXFP4")
     element_type = fx.Float8E4M3FN
     b_element_type = fx.Float4E2M1FN if b_mxfp4 else element_type
     elements_per_128b = 16  # 128bit / fp8(8bit)
@@ -193,7 +198,7 @@ def compile_gemm_fp8(
     #无论什么方案， 每2048个A padding 64. 所以a_group16是一样的。
     a_group16 = 2 * A_GROUP
     a_lds_elems = (BLOCK_M // 8) * A_GROUP  # 16*1056 = 16896
-    if b_mxfp4 and not lds_swizzle:
+    if b_mxfp4 and not b_lds_swizzle:
         # Keep each 2048-element (16-row) block contiguous for one full-wave DMA.
         # 64/128/256-element padding have the same conflict count; 64 was fastest
         # at M=N=K=8192 and has the smallest LDS footprint.
@@ -307,16 +312,16 @@ def compile_gemm_fp8(
 
         # ---- sub, sub tensor with layout ----
         # A/B 全局 tile 视图：swizzle 版（全局 swizzle）或 padding 版（分组）。
+        def apply_swizzles(layout, specs, shift_adjust=0):
+            for mask, base, shift in specs:
+                swizzle = fx.static(
+                    fx.SwizzleType.get(mask, base, shift + shift_adjust)
+                )
+                layout = fx.make_composed_layout(swizzle, layout)
+            return layout
+
         if const_expr(lds_swizzle):
             # swizzle && !raw_global_swizzle: apply swizzle to the global tile views.
-            def apply_swizzles(layout, specs, shift_adjust=0):
-                for mask, base, shift in specs:
-                    swizzle = fx.static(
-                        fx.SwizzleType.get(mask, base, shift + shift_adjust)
-                    )
-                    layout = fx.make_composed_layout(swizzle, layout)
-                return layout
-
             if const_expr(not raw_global_swizzle):
                 # 需要把spec里面的BK shift 调整成为K的shift.
                 stride_shift = K.bit_length() - BLOCK_K.bit_length()
@@ -549,11 +554,11 @@ def compile_gemm_fp8(
         # 否则沿用与 A 相同的 _wr/_rd。仅 CORRECTNESS 需 subB 正确 + LDS 为任意双射；DMA tv 只影响性能。
         _wr_b = _wr
         _rd_b = _rd
-        if const_expr(lds_swizzle):
+        if const_expr(b_lds_swizzle):
             _wr_b = fx.make_ordered_layout((BLOCK_N, BLOCK_K), (1, 0))
             _rd_b = apply_swizzles(_wr_b, swizzle_b_specs)
         if const_expr(b_mxfp4):
-            if const_expr(not lds_swizzle):
+            if const_expr(not b_lds_swizzle):
                 _wr_b = fx.make_layout(
                     ((16, BLOCK_N // 16), BLOCK_K),
                     ((BLOCK_K, b_group16), 1),
@@ -629,7 +634,7 @@ def compile_gemm_fp8(
             for copy_round in range_constexpr(2):
                 lane_id = tid % 64
                 wave_id = tid // 64
-                if const_expr(lds_swizzle):
+                if const_expr(b_lds_swizzle):
                     physical_slot = tid + copy_round * 256
                     logical_slot = physical_slot ^ ((physical_slot >> 3) & 1)
                     row = (logical_slot // 32) * 8 + logical_slot % 8
@@ -639,7 +644,7 @@ def compile_gemm_fp8(
                     chunk = wave_id + copy_round * 4
                     row = chunk * 16 + lane_id // 4
                     col_byte = (lane_id % 4) * 16
-                if const_expr(lds_swizzle):
+                if const_expr(b_lds_swizzle):
                     global_row = row_tile * BLOCK_N + row
                 else:
                     global_row = row_tile * BLOCK_N + row
@@ -649,7 +654,7 @@ def compile_gemm_fp8(
                     ir.Type.parse("!llvm.ptr<3>"),
                     arith._to_raw(fx.make_view(ptr, fx.make_layout(1, 1))),
                 )
-                if const_expr(lds_swizzle):
+                if const_expr(b_lds_swizzle):
                     lds_ptr = fx.buffer_ops.get_element_ptr(
                         lds_root,
                         byte_offset=fx.Int32(
@@ -772,7 +777,7 @@ def compile_gemm_fp8(
                 for n0 in range_constexpr(4):
                     row = (n0 * 2 + wave_n) * 16 + lane_id % 16
                     col_byte = (lane_id // 16) * 16
-                    if const_expr(lds_swizzle):
+                    if const_expr(b_lds_swizzle):
                         lds_byte = (row // 8) * 512 + (row % 8) * 16 + (col_byte // 16) * 128
                         lds_byte = lds_byte ^ (((lds_byte >> 7) & 1) << 4)
                     else:
@@ -1458,7 +1463,7 @@ TILE_N = 256
 TILE_K = 128
 M = int(os.environ.get("GEMM_M", 8192))
 N = int(os.environ.get("GEMM_N", 8192))
-K = int(os.environ.get("GEMM_K", 8192))
+K = int(os.environ.get("GEMM_K", 16384))
 
 # permlane 存储 / store 与 MFMA 交织：可用环境变量覆盖默认值（对标 bf16 v9 run_test 结构）。
 PERMLANE_EPILOGUE = _env_flag("PERMLANE", "1")
@@ -1487,7 +1492,8 @@ def _load_mxfp8_quant():
 
 def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
              TILEM=256, TILEN=256, TILEK=128, permlane_output=True, store_overlap=False,
-             with_scale=False, B_MXFP4=False, run_count=50, data_clones=50):
+             with_scale=False, B_MXFP4=False, B_LDS_SWIZZLE=None,
+             run_count=50, data_clones=50):
     assert N % (256 if PRESHUFFLE_B else 8) == 0
     assert not B_MXFP4 or not PRESHUFFLE_B
     shuffle_weight = _load_shuffle_weight() if PRESHUFFLE_B else None
@@ -1588,6 +1594,7 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
     launcher = compile_gemm_fp8(
         TILEM, TILEN, TILEK, N, K,
         lds_swizzle=USE_SWIZZLE,
+        b_lds_swizzle=B_LDS_SWIZZLE,
         preshuffle_b=PRESHUFFLE_B,
         permlane_epilogue=permlane_output,
         store_overlap=store_overlap,
@@ -1605,7 +1612,11 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
         else float("inf")
     )
     is_correct = diff <= 0.00001
-    print(f"####M={M} N={N} K={K} {USE_SWIZZLE=} {PRESHUFFLE_B=} {B_MXFP4=} {is_correct=} {diff=}")
+    print(
+        f"####M={M} N={N} K={K} {USE_SWIZZLE=} "
+        f"{B_LDS_SWIZZLE=} {PRESHUFFLE_B=} {B_MXFP4=} "
+        f"{is_correct=} {diff=}"
+    )
     if not torch.allclose(out, ref_bf16, rtol=0.02, atol=0.01):
         abs_err = (out.float() - ref_bf16.float()).abs()
         tolerance = 0.01 + 0.02 * ref_bf16.float().abs()
@@ -1684,7 +1695,7 @@ def run_test(M, N, K, USE_SWIZZLE=False, PRESHUFFLE_B=False, perf=False,
     best_ms = latencies[0]
     tflops = flops / (best_ms * 1e-3) / 1e12
     bw_gbs = mem_bytes / (best_ms * 1e-3) / 1e9
-    print(f"\n=== perf  M={M} N={N} K={K} USE_SWIZZLE={USE_SWIZZLE} PRESHUFFLE_B={PRESHUFFLE_B} {with_scale=} ===")
+    print(f"\n=== perf  M={M} N={N} K={K} USE_SWIZZLE={USE_SWIZZLE} PRESHUFFLE_B={PRESHUFFLE_B} {with_scale=} {B_MXFP4=}===")
     print(f"gemm:  {best_ms*1e3:.1f} us  {tflops:.2f} TFLOPS  {bw_gbs:.1f} GB/s")
     return is_correct
 
@@ -1704,7 +1715,11 @@ if __name__ == "__main__":
     props = torch.cuda.get_device_properties()
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
     torch.manual_seed(0)
-    run_acc()
+    # run_acc()
+    run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False, B_MXFP4=True)
+    run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False, B_MXFP4=False)
+
+
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)

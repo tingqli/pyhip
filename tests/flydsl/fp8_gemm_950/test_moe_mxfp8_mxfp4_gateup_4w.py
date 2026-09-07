@@ -1885,6 +1885,7 @@ def run_benchmark(
         gemm_n,
         hidden_size,
         lds_swizzle=False,
+        b_lds_swizzle=b_lds_swizzle,
         preshuffle_b=False,
         permlane_epilogue=True,
         store_overlap=False,
