@@ -512,11 +512,14 @@ def printv(*args, **kwargs):
                 arg_names.append(clean_name)
     
     # Print each variable with its name
-    print(f"{filename}:{lineno}")
+    GRAY = '\033[90m'
+    YELLOW = '\033[93m'
+    RESET = '\033[0m'    
+    print(f"{GRAY}{filename}:{lineno}{RESET}")
     for i, (name, value) in enumerate(zip(arg_names, args)):
         if isinstance(value, torch.Tensor):
             value = f"{value.shape}_{value.dtype}"
-        print(f"{name:>20} = {value}")
+        print(f"{YELLOW}{name:>20}{RESET} = {value}")
 
 import types
 
@@ -979,78 +982,79 @@ def kernel(a,b,c):
 kernel((1,1,1), (64,1,1), a, b, c)
 
 """
-def fly(fun):
-    import inspect
-    from flydsl.compiler.ast_rewriter import ASTRewriter
-    sig = inspect.signature(fun)
-    params = sig.parameters
-    nargs = len(params)
-    fun = ASTRewriter.transform(fun)
-    def call(grid, block, *args):
-        # only at first invoke we got args
-        # recover args to fx.Tensor with original static shape/stride
-        def recover_static_shape_stride(fx_args):
-            new_args = []
-            for fx_a, orig_a in zip(fx_args, args):
-                if isinstance(orig_a, torch.Tensor):
-                    shape = list(orig_a.shape)
-                    stride  = list(orig_a.stride())
-                    if len(shape) == 1:
-                        shape = shape[0]
-                        stride = stride[0]
-                    #print(fx_a.shape, fx_a.stride)
-                    #print(">>>", shape, stride)
-                    fx_a = fx.Tensor(fx.make_view(fx.get_iter(fx_a), fx.make_layout(shape, stride)))
-                new_args.append(fx_a)
-            return new_args
+def fly(num_threads):
 
-        @flyc.kernel
-        def fly_kernel(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15):
-            args = [a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15][0:nargs]
-            args = recover_static_shape_stride(args)
-            fun(*args)
+    def decorator(fun):
+        import inspect
+        from flydsl.compiler.ast_rewriter import ASTRewriter
+        sig = inspect.signature(fun)
+        params = sig.parameters
+        nargs = len(params)
+        fun = ASTRewriter.transform(fun)
+        def call(grid, *args):
+            assert isinstance(grid, (list, tuple)), \
+                "Don't forget to pass grid size in tuple/list"
+            # only at first invoke we got args
+            # recover args to fx.Tensor with original static shape/stride
+            def recover_static_shape_stride(fx_args):
+                new_args = []
+                for fx_a, orig_a in zip(fx_args, args):
+                    if isinstance(orig_a, torch.Tensor):
+                        shape = list(orig_a.shape)
+                        stride  = list(orig_a.stride())
+                        if len(shape) == 1:
+                            shape = shape[0]
+                            stride = stride[0]
+                        #print(fx_a.shape, fx_a.stride)
+                        #print(">>>", shape, stride)
+                        fx_a = fx.Tensor(fx.make_view(fx.get_iter(fx_a), fx.make_layout(shape, stride)))
+                    new_args.append(fx_a)
+                return new_args
 
-        value_attrs = {"rocdl.waves_per_eu": 1,
-                        "passthrough": [["amdgpu-agpr-alloc", "256,256"],]
-                        }
-        value_attrs = None
+            @flyc.kernel(known_block_size=[num_threads, 1, 1])
+            def fly_kernel(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15):
+                args = [a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15][0:nargs]
+                args = recover_static_shape_stride(args)
+                fun(*args)
 
-        @flyc.jit
-        def launcher(
-            grid0, grid1, grid2,
-            block0, block1, block2,
-            a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
-            stream = None):
-            fly_kernel(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15).launch(grid=(grid0,grid1,grid2),block=(block0,block1,block2),stream=stream)
+            value_attrs = {"rocdl.waves_per_eu": 1,
+                            "passthrough": [["amdgpu-agpr-alloc", "256,256"],]
+                            }
+            value_attrs = None
 
-        a = list(args)
-        while(len(a) < 16):
-            a.append(0)
-        grid = list(grid)
-        while(len(grid) < 3):
-            grid.append(1)
-        block = list(block)
-        while(len(block) < 3):
-            block.append(1)
-        launcher(*grid, *block,
-                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
-                stream=torch.cuda.current_stream())
-        
-        def pre_compiled_launch(grid, block, *args):
+            @flyc.jit
+            def launcher(
+                grid0, grid1, grid2,
+                block0, # block0 is now num_threads
+                a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,
+                stream = None):
+                fly_kernel(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15).launch(grid=(grid0,grid1,grid2),block=(block0,1,1),stream=stream)
+
             a = list(args)
-            while(len(a) < 16):a.append(0)
+            while(len(a) < 16):
+                a.append(0)
             grid = list(grid)
-            while(len(grid) < 3):grid.append(1)
-            block = list(block)
-            while(len(block) < 3): block.append(1)
-            launcher(*grid, *block,
-                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
-                stream=torch.cuda.current_stream())
-            return pre_compiled_launch        
+            while(len(grid) < 3):
+                grid.append(1)
+            launcher(*grid, num_threads,
+                    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+                    stream=torch.cuda.current_stream())
+            
+            def pre_compiled_launch(grid, *args):
+                a = list(args)
+                while(len(a) < 16):a.append(0)
+                grid = list(grid)
+                while(len(grid) < 3):grid.append(1)
+                launcher(*grid, num_threads,
+                    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
+                    stream=torch.cuda.current_stream())
+                return pre_compiled_launch        
 
-        return pre_compiled_launch
+            return pre_compiled_launch
 
-    return call
+        return call
+
+    return decorator
 
 def enable_dump_ir(enable_debug_info = True):
     import os

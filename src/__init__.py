@@ -5,7 +5,7 @@ from .core.hiptools import module
 from .core.asmjit import jit, JIT
 from .misc import *
 
-from .contrib.flydsl.utils import fly
+from .contrib.flydsl.utils import fly, printv
 
 # when user call from pyhip import *
 __all__ = [

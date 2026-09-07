@@ -1,5 +1,19 @@
 # FlyDSL optimization caveat
 
+## How to copy data
+
+ - fx.Pointer can directly dereference: `ptr[index]`
+
+ - fx.Tensor can dereference as normal value or vec, given multi-dimension coordinates index:
+   - load `t[i,j]`/`t[None, j].load()`
+   - store `t[i,j] = ...`/`t[None, j] = vec`
+   - vector form load/store can be correctly lowered into high-efficiency DW4/b128 global/local_ds instructions
+
+   so **this is a better abstraction than pointer with easier usage than tiled_copy**
+
+ - tiled_copy/partition can partition tensor according to TV-layout which is not friendly to beginner in my opinion
+
+
 ## element-wise processing w/o tiled_copy
 
 for 1D element-wise processing, tiled_copy is more complex & limited.
@@ -70,3 +84,4 @@ In this case we can build a broadcast-view of the coordinate tensor, which has e
 ## coelascing within smaller memory-region
 
 MOE down kernel writes output block belong to multiple sorted tokens, and they may be located far away in global memory, which may not be friendly to cache/DRAM locality.
+
