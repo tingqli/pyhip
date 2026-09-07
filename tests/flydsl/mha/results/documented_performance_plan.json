@@ -1,0 +1,2115 @@
+{
+  "matrix": "documented",
+  "workloads": [
+    {
+      "name": "fp8_native_410t",
+      "q_lens": [
+        10240
+      ],
+      "kv_lens": [
+        2560
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "native-cast",
+      "seed": 20260906,
+      "source": "tests/flydsl/pa_8wave/tests/flydsl/pa_8wave/new_native_gfx942_results.md:S5",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 1200,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [
+        "fp8_942",
+        "fp8_942_register"
+      ],
+      "effective_flops": 268435456000,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 1200,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "workload is specific to a different backend",
+        "bf16_950": "workload is specific to a different backend",
+        "bf16_950_persistent": "workload is specific to a different backend",
+        "swa_bf16": "workload is specific to a different backend"
+      }
+    },
+    {
+      "name": "full_d128_p64",
+      "q_lens": [
+        10240
+      ],
+      "kv_lens": [
+        2583
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 216677744640,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "causal32k_d128_p64",
+      "q_lens": [
+        32768
+      ],
+      "kv_lens": [
+        32768
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 4398180728832,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "swa_kv32768_d128",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        32768
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 17314086912,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_kv65536_d128",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        65536
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 17314086912,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_kv131072_d128",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 17314086912,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window0_d128",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 0,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 134217728,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window16_d128",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 16,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 2281701376,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window64_d128",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 64,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 8724152320,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window512_d128",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 512,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 68853694464,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window1024_d128",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 1024,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 137573171200,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_query256_d128",
+      "q_lens": [
+        256
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 270532608,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_query2048_d128",
+      "q_lens": [
+        2048
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 2164260864,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_query4096_d128",
+      "q_lens": [
+        4096
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 4328521728,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_query65536_d128",
+      "q_lens": [
+        65536
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 69256347648,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "full_d192_p64",
+      "q_lens": [
+        10240
+      ],
+      "kv_lens": [
+        2583
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 270847180800,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "causal32k_d192_p64",
+      "q_lens": [
+        32768
+      ],
+      "kv_lens": [
+        32768
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 5497725911040,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "swa_kv32768_d192",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        32768
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 21642608640,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_kv65536_d192",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        65536
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 21642608640,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_kv131072_d192",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 21642608640,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window0_d192",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 0,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 167772160,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window16_d192",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 16,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 2852126720,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window64_d192",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 64,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 10905190400,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window512_d192",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 512,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 86067118080,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_window1024_d192",
+      "q_lens": [
+        16384
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 1024,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 171966464000,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_query256_d192",
+      "q_lens": [
+        256
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 338165760,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_query2048_d192",
+      "q_lens": [
+        2048
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 2705326080,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_query4096_d192",
+      "q_lens": [
+        4096
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 5410652160,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "swa_query65536_d192",
+      "q_lens": [
+        65536
+      ],
+      "kv_lens": [
+        131072
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": 128,
+      "sink": true,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_1wave/README.md",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 86570434560,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "this full-MHA backend does not support SWA/sink",
+        "fp8_942_register": "this full-MHA backend does not support SWA/sink",
+        "bf16_942": "this full-MHA backend does not support SWA/sink",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "ready; native hardware required"
+      }
+    },
+    {
+      "name": "full_d192_p32",
+      "q_lens": [
+        10240
+      ],
+      "kv_lens": [
+        2583
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 32,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 270847180800,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "backend supports page64 only (do not relabel another page size)",
+        "fp8_942_register": "backend supports page64 only (do not relabel another page size)",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "backend supports page64 only (do not relabel another page size)",
+        "bf16_950_persistent": "backend supports page64 only (do not relabel another page size)",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "causal32k_d192_p32",
+      "q_lens": [
+        32768
+      ],
+      "kv_lens": [
+        32768
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 32,
+      "causal": true,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 5497725911040,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "backend supports page64 only (do not relabel another page size)",
+        "fp8_942_register": "backend supports page64 only (do not relabel another page size)",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "backend supports page64 only (do not relabel another page size)",
+        "bf16_950_persistent": "backend supports page64 only (do not relabel another page size)",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "batch4_d192_p32",
+      "q_lens": [
+        10240,
+        10240,
+        10240,
+        10240
+      ],
+      "kv_lens": [
+        2560,
+        2560,
+        2560,
+        2560
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 32,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 1073741824000,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "backend supports page64 only (do not relabel another page size)",
+        "fp8_942_register": "backend supports page64 only (do not relabel another page size)",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "backend supports page64 only (do not relabel another page size)",
+        "bf16_950_persistent": "backend supports page64 only (do not relabel another page size)",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "batch4_d128_h1_p32",
+      "q_lens": [
+        10240,
+        10240,
+        10240,
+        10240
+      ],
+      "kv_lens": [
+        2560,
+        2560,
+        2560,
+        2560
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 1,
+      "kv_heads": 1,
+      "page": 32,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 53687091200,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "backend supports page64 only (do not relabel another page size)",
+        "fp8_942_register": "backend supports page64 only (do not relabel another page size)",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "backend supports page64 only (do not relabel another page size)",
+        "bf16_950_persistent": "backend supports page64 only (do not relabel another page size)",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "singlehead40k_p32",
+      "q_lens": [
+        40960
+      ],
+      "kv_lens": [
+        40960
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 1,
+      "kv_heads": 1,
+      "page": 32,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 858993459200,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "backend supports page64 only (do not relabel another page size)",
+        "fp8_942_register": "backend supports page64 only (do not relabel another page size)",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "backend supports page64 only (do not relabel another page size)",
+        "bf16_950_persistent": "backend supports page64 only (do not relabel another page size)",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "singlehead_causal32k_p32",
+      "q_lens": [
+        32768
+      ],
+      "kv_lens": [
+        32768
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 1,
+      "kv_heads": 1,
+      "page": 32,
+      "causal": true,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 274886295552,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "backend supports page64 only (do not relabel another page size)",
+        "fp8_942_register": "backend supports page64 only (do not relabel another page size)",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "backend supports page64 only (do not relabel another page size)",
+        "bf16_950_persistent": "backend supports page64 only (do not relabel another page size)",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "h3_p32",
+      "q_lens": [
+        63225,
+        7
+      ],
+      "kv_lens": [
+        63225,
+        7
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 14,
+      "kv_heads": 14,
+      "page": 32,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 28653368031232,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "backend supports page64 only (do not relabel another page size)",
+        "fp8_942_register": "backend supports page64 only (do not relabel another page size)",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "backend supports page64 only (do not relabel another page size)",
+        "bf16_950_persistent": "backend supports page64 only (do not relabel another page size)",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "batch4_d192_p64",
+      "q_lens": [
+        10240,
+        10240,
+        10240,
+        10240
+      ],
+      "kv_lens": [
+        2560,
+        2560,
+        2560,
+        2560
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 1073741824000,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "batch4_d128_h1_p64",
+      "q_lens": [
+        10240,
+        10240,
+        10240,
+        10240
+      ],
+      "kv_lens": [
+        2560,
+        2560,
+        2560,
+        2560
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 1,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 53687091200,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "singlehead40k_p64",
+      "q_lens": [
+        40960
+      ],
+      "kv_lens": [
+        40960
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 1,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 858993459200,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "singlehead_causal32k_p64",
+      "q_lens": [
+        32768
+      ],
+      "kv_lens": [
+        32768
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 1,
+      "kv_heads": 1,
+      "page": 64,
+      "causal": true,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 274886295552,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "h3_p64",
+      "q_lens": [
+        63225,
+        7
+      ],
+      "kv_lens": [
+        63225,
+        7
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 14,
+      "kv_heads": 14,
+      "page": 64,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/benchmark_readme.py:workloads",
+      "protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "backends": [],
+      "effective_flops": 28653368031232,
+      "measurement_protocol": {
+        "timer": "profiler",
+        "warmup": 100,
+        "rounds": 5,
+        "iterations": 100,
+        "buffers": 1,
+        "sample_warmup": 20
+      },
+      "plan": {
+        "fp8_942": "ready; native hardware required",
+        "fp8_942_register": "ready; native hardware required",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "ready; native hardware required",
+        "bf16_950_persistent": "ready; native hardware required",
+        "swa_bf16": "single-wave backend requires causal SWA"
+      }
+    },
+    {
+      "name": "historical_bf16_250t_shape",
+      "q_lens": [
+        40960
+      ],
+      "kv_lens": [
+        40960
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 1,
+      "kv_heads": 1,
+      "page": 32,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/README.md:2026-08-10",
+      "protocol": {
+        "timer": "events",
+        "warmup": 10,
+        "rounds": 1,
+        "iterations": 50,
+        "buffers": 10,
+        "sample_warmup": 0
+      },
+      "backends": [
+        "bf16_942"
+      ],
+      "effective_flops": 858993459200,
+      "measurement_protocol": {
+        "timer": "events",
+        "warmup": 10,
+        "rounds": 1,
+        "iterations": 50,
+        "buffers": 10,
+        "sample_warmup": 0
+      },
+      "plan": {
+        "fp8_942": "workload is specific to a different backend",
+        "fp8_942_register": "workload is specific to a different backend",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "workload is specific to a different backend",
+        "bf16_950_persistent": "workload is specific to a different backend",
+        "swa_bf16": "workload is specific to a different backend"
+      }
+    },
+    {
+      "name": "historical_bf16_d192_events",
+      "q_lens": [
+        10240
+      ],
+      "kv_lens": [
+        2583
+      ],
+      "dq": 192,
+      "dv": 128,
+      "heads": 16,
+      "kv_heads": 1,
+      "page": 32,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/README.md:2026-08-10",
+      "protocol": {
+        "timer": "events",
+        "warmup": 10,
+        "rounds": 1,
+        "iterations": 50,
+        "buffers": 10,
+        "sample_warmup": 0
+      },
+      "backends": [
+        "bf16_942"
+      ],
+      "effective_flops": 270847180800,
+      "measurement_protocol": {
+        "timer": "events",
+        "warmup": 10,
+        "rounds": 1,
+        "iterations": 50,
+        "buffers": 10,
+        "sample_warmup": 0
+      },
+      "plan": {
+        "fp8_942": "workload is specific to a different backend",
+        "fp8_942_register": "workload is specific to a different backend",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "workload is specific to a different backend",
+        "bf16_950_persistent": "workload is specific to a different backend",
+        "swa_bf16": "workload is specific to a different backend"
+      }
+    },
+    {
+      "name": "historical_h3_events",
+      "q_lens": [
+        63225,
+        7
+      ],
+      "kv_lens": [
+        63225,
+        7
+      ],
+      "dq": 128,
+      "dv": 128,
+      "heads": 14,
+      "kv_heads": 14,
+      "page": 32,
+      "causal": false,
+      "window": -1,
+      "sink": false,
+      "scale_mode": "per-token",
+      "input_kind": "bf16-source",
+      "seed": 20260905,
+      "source": "23cc6d1e95b1611493e21232bef5d9962b7b73c9:tests/flydsl/pa_4wave/README.md:2026-08-10",
+      "protocol": {
+        "timer": "events",
+        "warmup": 3,
+        "rounds": 1,
+        "iterations": 10,
+        "buffers": 10,
+        "sample_warmup": 0
+      },
+      "backends": [
+        "bf16_942"
+      ],
+      "effective_flops": 28653368031232,
+      "measurement_protocol": {
+        "timer": "events",
+        "warmup": 3,
+        "rounds": 1,
+        "iterations": 10,
+        "buffers": 10,
+        "sample_warmup": 0
+      },
+      "plan": {
+        "fp8_942": "workload is specific to a different backend",
+        "fp8_942_register": "workload is specific to a different backend",
+        "bf16_942": "ready; native hardware required",
+        "bf16_950": "workload is specific to a different backend",
+        "bf16_950_persistent": "workload is specific to a different backend",
+        "swa_bf16": "workload is specific to a different backend"
+      }
+    }
+  ],
+  "gpu_queried": false,
+  "executed": false,
+  "status": "planned; GPU rerun pending"
+}

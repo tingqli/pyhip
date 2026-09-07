@@ -1,0 +1,173 @@
+........................................................................ [  4%]
+........................................................................ [  8%]
+................................................ssssssssssssssssssssssss [ 13%]
+ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 17%]
+ssssssssssssssssssssssssssssssssssssssssssss......ssssssssssss........ss [ 22%]
+ssssssssss..ssss..ssss..ssssssssssssssss........................ssssssss [ 26%]
+ssssssss......ssss......ssss....ssssss...ssssssssssss............sssssss [ 31%]
+sF
+=================================== FAILURES ===================================
+_______________ test_live_page_and_cache_mutations[fp8_942-128] ________________
+tests/flydsl/mha/test_mha_pa.py:167: in test_live_page_and_cache_mutations
+    case.k_pages.mul_(2)
+E   NotImplementedError: "mul_cuda" not implemented for 'Float8_e4m3fnuz'
+------------------------------ Captured log call -------------------------------
+DEBUG    flydsl._mlir._mlir_libs:__init__.py:193 Loading all available dialects
+DEBUG    flydsl._mlir._mlir_libs:__init__.py:196 Registering translations from initializer <module 'flydsl._mlir._mlir_libs._mlirRegisterEverything' from '/tmp/pyhip-mha-py311/lib64/python3.11/site-packages/flydsl/_mlir/_mlir_libs/_mlirRegisterEverything.cpython-311-x86_64-linux-gnu.so'>
+INFO     flydsl:jit_function.py:1486 jit_args=[<flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60f6859310>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60f6888110>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60f688a4d0>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60f6889390>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60f688a510>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60f6888190>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60f6889c50>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60fe9f1890>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60f688b9d0>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60f688b190>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60da328310>, <flydsl.compiler.jit_argument.TorchTensorJitArg object at 0x7f60da32a050>, <flydsl.expr.typing.Stream object at 0x7f60ff9565d0>]
+INFO     flydsl:jit_function.py:1487 dsl_types=[<class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Tensor'>, <class 'flydsl.expr.typing.Stream'>]
+INFO     flydsl:jit_function.py:1510 dsl_args=[Tensor<Value(<block argument> of type '!fly.memref<f8E4M3FNUZ, global, ?:1>' at index: 0)>, Tensor<Value(<block argument> of type '!fly.memref<f8E4M3FNUZ, global, ?:1>' at index: 1)>, Tensor<Value(<block argument> of type '!fly.memref<f8E4M3FNUZ, global, ?:1>' at index: 2)>, Tensor<Value(<block argument> of type '!fly.memref<bf16, global, ?:1>' at index: 3)>, Tensor<Value(<block argument> of type '!fly.memref<f32, global, ?:1>' at index: 4)>, Tensor<Value(<block argument> of type '!fly.memref<i32, global, ?:1>' at index: 5)>, Tensor<Value(<block argument> of type '!fly.memref<i32, global, ?:1>' at index: 6)>, Tensor<Value(<block argument> of type '!fly.memref<i32, global, ?:1>' at index: 7)>, Tensor<Value(<block argument> of type '!fly.memref<i32, global, ?:1>' at index: 8)>, Tensor<Value(<block argument> of type '!fly.memref<f32, global, ?:1>' at index: 9)>, Tensor<Value(<block argument> of type '!fly.memref<f32, global, ?:1>' at index: 10)>, Tensor<Value(<block argument> of type '!fly.memref<f32, global, ?:1>' at index: 11)>, <flydsl.expr.typing.Stream object at 0x7f9702228cd0>]
+INFO     flydsl:ast_rewriter.py:289 [final transformed code]
+
+@flyc.jit
+def phase(previous, maximum, row_sum, o0, o1, o2, o3, prev_page, current_page, next_page, future_page, t, CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
+    previous, maximum, row_sum = (fx.Vector(previous), fx.Float32(maximum), fx.Float32(row_sum))
+    o0, o1, o2, o3 = (fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3))
+    t = fx.Int32(t)
+    if USE_LDS:
+        k = _k_fragment(gk, storage, current_page * (HK * BN * DQ), k_base, CUR, 0, DQ, dtype, True)
+        rocdl.sched_barrier(0)
+        future_request = _prefetch_page(table, _min(t + 3, last))
+        v_staging = _cooperative_load(gv, tid, current_page * (HK * BN * DV), 2)
+        k_staging = _cooperative_load(gk, tid, future_page * (HK * BN * DQ), DQ // 64)
+        rocdl.sched_barrier(0)
+        future = _page_ready(future_request)
+    else:
+        k = _k_fragment(gk, storage, current_page * (HK * BN * DQ), k_base, CUR, 0, DQ, dtype, False)
+        future = _page_ready(_prefetch_page(table, _min(t + 2, last)))
+        v_lo = _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 0, DQ, dtype, False)
+        _wait(vmcnt=4)
+    _stage_end()
+    lo = _qk(q, k, dtype)
+    previous = _pin(_exp_part(previous, 0, 24), 32)
+    _schedule(DQ // 16, scf_ifexp_dispatch(DQ == 192, lambda: 2, lambda: 3), 1, True)
+    _stage_end()
+    k = _k_fragment(gk, storage, current_page * (HK * BN * DQ), k_base, CUR, 1, DQ, dtype, USE_LDS)
+    if USE_LDS:
+        _wait(vmcnt=DQ // 64)
+        _cooperative_store(storage, tid, v_staging, 2 * (DQ // 16) * PADDED_CHUNK + CUR * V_TILE, 2)
+        _wait(lgkmcnt=0)
+    else:
+        v_hi = _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 1, DQ, dtype, False)
+        _wait(vmcnt=4)
+    _stage_end()
+    hi = _qk(q, k, dtype)
+    previous = _exp_part(previous, 24, 32)
+    row_sum = row_sum + _row_sum(previous, USE_LDS)
+    p = _pack_probability(previous, dtype)
+    _schedule(4, 2, 2, True)
+    _schedule(DQ // 16 - 4, 8, 2)
+    _stage_end()
+    v = scf_ifexp_dispatch(dsl_not_(USE_LDS), lambda: v_lo, lambda: _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 0, DQ, dtype, True))
+    if USE_LDS:
+        _wait(vmcnt=0)
+        _cooperative_store(storage, tid, k_staging, CUR * (DQ // 16) * PADDED_CHUNK, DQ // 64, True)
+    _wait(lgkmcnt=0)
+    _stage_end()
+    current = _mask(_join(lo, hi), t, row, q_len, kv_len, CAUSAL)
+    o0, o1 = _pv(p, v, o0, o1, dtype)
+    candidate = _row_max(current, USE_LDS) * scale
+    ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - maximum > 6.0).ir_value()))
+    new_max = (ballot != fx.Int64(0)).select(_maximum(maximum, candidate), maximum)
+    split = scf_ifexp_dispatch(STAGGER, lambda: 12, lambda: 6)
+    current = _center(current, scale, new_max, 0, split)
+    if USE_LDS:
+        _schedule(3, 5, 3)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 3)
+        rocdl.sched_group_barrier(2, 3, 3)
+        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, 3)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, 3)
+        rocdl.sched_group_barrier(2, 10, 3)
+        _schedule(2, 5, 3)
+    else:
+        _schedule(8, 5, 3)
+    _stage_end()
+    v = scf_ifexp_dispatch(dsl_not_(USE_LDS), lambda: v_hi, lambda: _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 1, DQ, dtype, True))
+    _wait(vmcnt=0, lgkmcnt=0)
+    _stage_end()
+    o2, o3 = _pv(p, v, o2, o3, dtype)
+    current = _center(current, scale, new_max, split, 32)
+    _schedule(8, 4, 4)
+    o0, o1, o2, o3, row_sum = _rescale(o0, o1, o2, o3, row_sum, maximum, new_max, ballot)
+    _stage_end()
+    return (current, new_max, row_sum, o0, o1, o2, o3, current_page, next_page, scf_ifexp_dispatch(USE_LDS, lambda: future_page, lambda: future), future)
+INFO     flydsl:ast_rewriter.py:289 [final transformed code]
+
+@flyc.jit
+def phase(previous, maximum, row_sum, o0, o1, o2, o3, prev_page, current_page, next_page, future_page, t, CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
+    previous, maximum, row_sum = (fx.Vector(previous), fx.Float32(maximum), fx.Float32(row_sum))
+    o0, o1, o2, o3 = (fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3))
+    t = fx.Int32(t)
+    if USE_LDS:
+        k = _k_fragment(gk, storage, current_page * (HK * BN * DQ), k_base, CUR, 0, DQ, dtype, True)
+        rocdl.sched_barrier(0)
+        future_request = _prefetch_page(table, _min(t + 3, last))
+        v_staging = _cooperative_load(gv, tid, current_page * (HK * BN * DV), 2)
+        k_staging = _cooperative_load(gk, tid, future_page * (HK * BN * DQ), DQ // 64)
+        rocdl.sched_barrier(0)
+        future = _page_ready(future_request)
+    else:
+        k = _k_fragment(gk, storage, current_page * (HK * BN * DQ), k_base, CUR, 0, DQ, dtype, False)
+        future = _page_ready(_prefetch_page(table, _min(t + 2, last)))
+        v_lo = _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 0, DQ, dtype, False)
+        _wait(vmcnt=4)
+    _stage_end()
+    lo = _qk(q, k, dtype)
+    previous = _pin(_exp_part(previous, 0, 24), 32)
+    _schedule(DQ // 16, scf_ifexp_dispatch(DQ == 192, lambda: 2, lambda: 3), 1, True)
+    _stage_end()
+    k = _k_fragment(gk, storage, current_page * (HK * BN * DQ), k_base, CUR, 1, DQ, dtype, USE_LDS)
+    if USE_LDS:
+        _wait(vmcnt=DQ // 64)
+        _cooperative_store(storage, tid, v_staging, 2 * (DQ // 16) * PADDED_CHUNK + CUR * V_TILE, 2)
+        _wait(lgkmcnt=0)
+    else:
+        v_hi = _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 1, DQ, dtype, False)
+        _wait(vmcnt=4)
+    _stage_end()
+    hi = _qk(q, k, dtype)
+    previous = _exp_part(previous, 24, 32)
+    row_sum = row_sum + _row_sum(previous, USE_LDS)
+    p = _pack_probability(previous, dtype)
+    _schedule(4, 2, 2, True)
+    _schedule(DQ // 16 - 4, 8, 2)
+    _stage_end()
+    v = scf_ifexp_dispatch(dsl_not_(USE_LDS), lambda: v_lo, lambda: _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 0, DQ, dtype, True))
+    if USE_LDS:
+        _wait(vmcnt=0)
+        _cooperative_store(storage, tid, k_staging, CUR * (DQ // 16) * PADDED_CHUNK, DQ // 64, True)
+    _wait(lgkmcnt=0)
+    _stage_end()
+    current = _mask(_join(lo, hi), t, row, q_len, kv_len, CAUSAL)
+    o0, o1 = _pv(p, v, o0, o1, dtype)
+    candidate = _row_max(current, USE_LDS) * scale
+    ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - maximum > 6.0).ir_value()))
+    new_max = (ballot != fx.Int64(0)).select(_maximum(maximum, candidate), maximum)
+    split = scf_ifexp_dispatch(STAGGER, lambda: 12, lambda: 6)
+    current = _center(current, scale, new_max, 0, split)
+    if USE_LDS:
+        _schedule(3, 5, 3)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 3)
+        rocdl.sched_group_barrier(2, 3, 3)
+        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, 3)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, 3)
+        rocdl.sched_group_barrier(2, 10, 3)
+        _schedule(2, 5, 3)
+    else:
+        _schedule(8, 5, 3)
+    _stage_end()
+    v = scf_ifexp_dispatch(dsl_not_(USE_LDS), lambda: v_hi, lambda: _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 1, DQ, dtype, True))
+    _wait(vmcnt=0, lgkmcnt=0)
+    _stage_end()
+    o2, o3 = _pv(p, v, o2, o3, dtype)
+    current = _center(current, scale, new_max, split, 32)
+    _schedule(8, 4, 4)
+    o0, o1, o2, o3, row_sum = _rescale(o0, o1, o2, o3, row_sum, maximum, new_max, ballot)
+    _stage_end()
+    return (current, new_max, row_sum, o0, o1, o2, o3, current_page, next_page, scf_ifexp_dispatch(USE_LDS, lambda: future_page, lambda: future), future)
+DEBUG    flydsl._mlir._mlir_libs:__init__.py:193 Loading all available dialects
+DEBUG    flydsl._mlir._mlir_libs:__init__.py:196 Registering translations from initializer <module 'flydsl._mlir._mlir_libs._mlirRegisterEverything' from '/tmp/pyhip-mha-py311/lib64/python3.11/site-packages/flydsl/_mlir/_mlir_libs/_mlirRegisterEverything.cpython-311-x86_64-linux-gnu.so'>
+=========================== short test summary info ============================
+FAILED tests/flydsl/mha/test_mha_pa.py::test_live_page_and_cache_mutations[fp8_942-128]
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 267 passed, 238 skipped in 967.51s (0:16:07)

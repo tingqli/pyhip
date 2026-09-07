@@ -1,0 +1,587 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /tmp/mha_aiter_py311/module_aiter_core.so
+[aiter] [pid=578970 pname=MainProcess] start build [mha_batch_prefill_fp8bf16_nlogits_nbias_nmask_nlse_ndropout_pertensor_nsink] under /tmp/mha_aiter_py311/build/mha_batch_prefill_fp8bf16_nlogits_nbias_nmask_nlse_ndropout_pertensor_nsink
+[aiter] Current hipcc not support: -mllvm -amdgpu-coerce-illegal-types=1, skip it.
+[aiter] [pid=578970 pname=MainProcess] [32mfinish build [mha_batch_prefill_fp8bf16_nlogits_nbias_nmask_nlse_ndropout_pertensor_nsink], cost 238.2s [0m
+[aiter] import [mha_batch_prefill_fp8bf16_nlogits_nbias_nmask_nlse_ndropout_pertensor_nsink] under /tmp/mha_aiter_py311/mha_batch_prefill_fp8bf16_nlogits_nbias_nmask_nlse_ndropout_pertensor_nsink.so
+[aiter] type hints mismatch, override to --> mha_batch_prefill(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens_q: torch.Tensor, kv_indptr: torch.Tensor, kv_page_indices: torch.Tensor, max_seqlen_q: int, max_seqlen_k: int, dropout_p: float, softmax_scale: float, logits_soft_cap: float, zero_tensors: bool, is_causal: bool, window_size_left: int, window_size_right: int, sink_size: int, return_softmax_lse: bool, return_dropout_randval: bool, out: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, q_descale: Optional[torch.Tensor] = None, k_descale: Optional[torch.Tensor] = None, v_descale: Optional[torch.Tensor] = None, kv_block_descale: Optional[torch.Tensor] = None, kv_last_page_lens: Optional[torch.Tensor] = None, block_table: Optional[torch.Tensor] = None, seqlen_k: Optional[torch.Tensor] = None, sink_ptr: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> List[torch.Tensor]
+/raid/users/xisun/luocheng/.env/lib64/python3.11/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-09-06 23:41:20 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:41:20 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+[W906 23:41:20.365517263 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+MHA_ROUND fp8_942 auto 128 10240 2560 False -1 flydsl 0 1103.8337448979591 us
+USDT:2026-09-06 23:41:20 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:41:20 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2560 False -1 flydsl 1 1104.5362857142852 us
+USDT:2026-09-06 23:41:20 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:41:21 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2560 False -1 flydsl 2 1103.7095154639178 us
+USDT:2026-09-06 23:41:21 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:41:21 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2560 False -1 flydsl 3 1103.7267857142856 us
+USDT:2026-09-06 23:41:21 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:41:21 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2560 False -1 flydsl 4 1103.9340631578946 us
+MHA_RESULT {"backend": "fp8_942", "config": "auto", "dq": 128, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1103.8337448979591}, "total_gpu_us": {"flydsl": 1103.8337448979591}, "tflops": {"flydsl": 194.54774398100304}, "effective_flops": 214748364800, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+[aiter] [pid=578970 pname=MainProcess] start build [mha_batch_prefill_fp8bf16_nlogits_nbias_mask_nlse_ndropout_pertensor_nsink] under /tmp/mha_aiter_py311/build/mha_batch_prefill_fp8bf16_nlogits_nbias_mask_nlse_ndropout_pertensor_nsink
+[aiter] [pid=578970 pname=MainProcess] [32mfinish build [mha_batch_prefill_fp8bf16_nlogits_nbias_mask_nlse_ndropout_pertensor_nsink], cost 237.1s [0m
+[aiter] import [mha_batch_prefill_fp8bf16_nlogits_nbias_mask_nlse_ndropout_pertensor_nsink] under /tmp/mha_aiter_py311/mha_batch_prefill_fp8bf16_nlogits_nbias_mask_nlse_ndropout_pertensor_nsink.so
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2560 True -1 flydsl 0 339.8028958333333 us
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2560 True -1 flydsl 1 339.9023333333333 us
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2560 True -1 flydsl 2 340.1228958333335 us
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2560 True -1 flydsl 3 340.00121428571424 us
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:27 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2560 True -1 flydsl 4 339.9487395833335 us
+MHA_RESULT {"backend": "fp8_942", "config": "auto", "dq": 128, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 339.9487395833335}, "total_gpu_us": {"flydsl": 339.9487395833335}, "tflops": {"flydsl": 78.99435483395027}, "effective_flops": 26854031360, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:45:38 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:38 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 False -1 flydsl 0 1144.264947916667 us
+USDT:2026-09-06 23:45:38 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:38 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 False -1 flydsl 1 1144.3162680412365 us
+USDT:2026-09-06 23:45:38 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:38 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 False -1 flydsl 2 1144.3113195876276 us
+USDT:2026-09-06 23:45:39 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:39 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 False -1 flydsl 3 1144.726142857143 us
+USDT:2026-09-06 23:45:39 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:39 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 False -1 flydsl 4 1144.618795918367 us
+MHA_RESULT {"backend": "fp8_942", "config": "auto", "dq": 128, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1144.3162680412365}, "total_gpu_us": {"flydsl": 1144.3162680412365}, "tflops": {"flydsl": 189.35127524744044}, "effective_flops": 216677744640, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 True -1 flydsl 0 349.414724489796 us
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 True -1 flydsl 1 349.4273775510203 us
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 True -1 flydsl 2 349.685336734694 us
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 True -1 flydsl 3 349.5150721649485 us
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:48 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 128 10240 2583 True -1 flydsl 4 349.49419791666674 us
+MHA_RESULT {"backend": "fp8_942", "config": "auto", "dq": 128, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 349.49419791666674}, "total_gpu_us": {"flydsl": 349.49419791666674}, "tflops": {"flydsl": 78.22343682660681}, "effective_flops": 27338637312, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:45:59 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:59 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 False -1 flydsl 0 1232.9350918367338 us
+USDT:2026-09-06 23:45:59 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:59 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 False -1 flydsl 1 1234.1567244897963 us
+USDT:2026-09-06 23:45:59 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:59 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 False -1 flydsl 2 1232.7686082474231 us
+USDT:2026-09-06 23:45:59 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:45:59 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 False -1 flydsl 3 1232.845295918367 us
+USDT:2026-09-06 23:45:59 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:00 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 False -1 flydsl 4 1232.749121212121 us
+MHA_RESULT {"backend": "fp8_942", "config": "auto", "dq": 192, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1232.845295918367}, "total_gpu_us": {"flydsl": 1232.845295918367}, "tflops": {"flydsl": 217.73652938346814}, "effective_flops": 268435456000, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 True -1 flydsl 0 377.93524489795914 us
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 True -1 flydsl 1 378.0240721649485 us
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 True -1 flydsl 2 378.11803157894724 us
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 True -1 flydsl 3 378.30667346938793 us
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2560 True -1 flydsl 4 378.1009583333334 us
+MHA_RESULT {"backend": "fp8_942", "config": "auto", "dq": 192, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 378.1009583333334}, "total_gpu_us": {"flydsl": 378.1009583333334}, "tflops": {"flydsl": 88.77930208895924}, "effective_flops": 33567539200, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:46:21 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:21 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 False -1 flydsl 0 1275.5042234042558 us
+USDT:2026-09-06 23:46:21 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:21 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 False -1 flydsl 1 1275.3798210526309 us
+USDT:2026-09-06 23:46:21 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:21 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 False -1 flydsl 2 1276.3201530612241 us
+USDT:2026-09-06 23:46:21 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:21 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 False -1 flydsl 3 1275.9176494845356 us
+USDT:2026-09-06 23:46:21 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:22 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 False -1 flydsl 4 1275.4250978260864 us
+MHA_RESULT {"backend": "fp8_942", "config": "auto", "dq": 192, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1275.5042234042558}, "total_gpu_us": {"flydsl": 1275.5042234042558}, "tflops": {"flydsl": 212.3451854021484}, "effective_flops": 270847180800, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:46:31 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:31 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 True -1 flydsl 0 387.7285104166666 us
+USDT:2026-09-06 23:46:31 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:31 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 True -1 flydsl 1 387.7238571428572 us
+USDT:2026-09-06 23:46:32 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:32 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 True -1 flydsl 2 387.5882446808513 us
+USDT:2026-09-06 23:46:32 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:32 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 True -1 flydsl 3 387.7242989690721 us
+USDT:2026-09-06 23:46:32 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:32 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942 auto 192 10240 2583 True -1 flydsl 4 387.6843789473682 us
+MHA_RESULT {"backend": "fp8_942", "config": "auto", "dq": 192, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 387.7238571428572}, "total_gpu_us": {"flydsl": 387.7238571428572}, "tflops": {"flydsl": 88.1382355262416}, "effective_flops": 34173296640, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:46:41 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:41 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 False -1 flydsl 0 1477.5544468085102 us
+USDT:2026-09-06 23:46:41 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:42 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 False -1 flydsl 1 1477.693565656565 us
+USDT:2026-09-06 23:46:42 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:42 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 False -1 flydsl 2 1477.5852727272725 us
+USDT:2026-09-06 23:46:42 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:42 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 False -1 flydsl 3 1477.4487070707073 us
+USDT:2026-09-06 23:46:42 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:42 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 False -1 flydsl 4 1478.1008958333337 us
+MHA_RESULT {"backend": "fp8_942_register", "config": "auto", "dq": 128, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1477.5852727272725}, "total_gpu_us": {"flydsl": 1477.5852727272725}, "tflops": {"flydsl": 145.33737494799564}, "effective_flops": 214748364800, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:46:50 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:50 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 True -1 flydsl 0 484.79038775510213 us
+USDT:2026-09-06 23:46:50 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:50 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 True -1 flydsl 1 485.091193877551 us
+USDT:2026-09-06 23:46:50 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:50 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 True -1 flydsl 2 485.8082340425535 us
+USDT:2026-09-06 23:46:51 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:51 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 True -1 flydsl 3 485.81161224489756 us
+USDT:2026-09-06 23:46:51 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:46:51 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2560 True -1 flydsl 4 485.81446938775537 us
+MHA_RESULT {"backend": "fp8_942_register", "config": "auto", "dq": 128, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 485.8082340425535}, "total_gpu_us": {"flydsl": 485.8082340425535}, "tflops": {"flydsl": 55.27701977494224}, "effective_flops": 26854031360, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:47:00 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:01 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 False -1 flydsl 0 1518.9753434343436 us
+USDT:2026-09-06 23:47:01 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:01 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 False -1 flydsl 1 1519.8746326530616 us
+USDT:2026-09-06 23:47:01 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:01 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 False -1 flydsl 2 1520.220645833334 us
+USDT:2026-09-06 23:47:01 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:01 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 False -1 flydsl 3 1519.5652234042557 us
+USDT:2026-09-06 23:47:01 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:01 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 False -1 flydsl 4 1519.8812020202022 us
+MHA_RESULT {"backend": "fp8_942_register", "config": "auto", "dq": 128, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1519.8746326530616}, "total_gpu_us": {"flydsl": 1519.8746326530616}, "tflops": {"flydsl": 142.56290616665655}, "effective_flops": 216677744640, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:47:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 True -1 flydsl 0 496.9540309278347 us
+USDT:2026-09-06 23:47:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 True -1 flydsl 1 496.9502083333332 us
+USDT:2026-09-06 23:47:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 True -1 flydsl 2 497.09083673469416 us
+USDT:2026-09-06 23:47:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 True -1 flydsl 3 496.8624845360825 us
+USDT:2026-09-06 23:47:10 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 128 10240 2583 True -1 flydsl 4 496.9024845360828 us
+MHA_RESULT {"backend": "fp8_942_register", "config": "auto", "dq": 128, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 496.9502083333332}, "total_gpu_us": {"flydsl": 496.9502083333332}, "tflops": {"flydsl": 55.01282996477264}, "effective_flops": 27338637312, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:47:19 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:20 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 False -1 flydsl 0 1622.6090860215068 us
+USDT:2026-09-06 23:47:20 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:20 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 False -1 flydsl 1 1622.6783225806448 us
+USDT:2026-09-06 23:47:20 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:20 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 False -1 flydsl 2 1623.3231458333337 us
+USDT:2026-09-06 23:47:20 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:20 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 False -1 flydsl 3 1623.0203684210526 us
+USDT:2026-09-06 23:47:20 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:21 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 False -1 flydsl 4 1623.7410000000004 us
+MHA_RESULT {"backend": "fp8_942_register", "config": "auto", "dq": 192, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1623.0203684210526}, "total_gpu_us": {"flydsl": 1623.0203684210526}, "tflops": {"flydsl": 165.39253679308172}, "effective_flops": 268435456000, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 True -1 flydsl 0 525.1553814432988 us
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 True -1 flydsl 1 525.030855670103 us
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 True -1 flydsl 2 524.9401237113397 us
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 True -1 flydsl 3 525.0982395833335 us
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:29 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2560 True -1 flydsl 4 525.2836962025318 us
+MHA_RESULT {"backend": "fp8_942_register", "config": "auto", "dq": 192, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 525.0982395833335}, "total_gpu_us": {"flydsl": 525.0982395833335}, "tflops": {"flydsl": 63.92620783995755}, "effective_flops": 33567539200, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:47:39 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:39 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 False -1 flydsl 0 1674.6025918367318 us
+USDT:2026-09-06 23:47:39 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:39 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 False -1 flydsl 1 1674.0250510204078 us
+USDT:2026-09-06 23:47:39 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:40 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 False -1 flydsl 2 1674.2434343434338 us
+USDT:2026-09-06 23:47:40 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:40 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 False -1 flydsl 3 1673.9557575757574 us
+USDT:2026-09-06 23:47:40 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:40 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 False -1 flydsl 4 1674.0936021505372 us
+MHA_RESULT {"backend": "fp8_942_register", "config": "auto", "dq": 192, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1674.0936021505372}, "total_gpu_us": {"flydsl": 1674.0936021505372}, "tflops": {"flydsl": 161.7873579183806}, "effective_flops": 270847180800, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:47:48 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:49 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 True -1 flydsl 0 537.5551515151512 us
+USDT:2026-09-06 23:47:49 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:49 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 True -1 flydsl 1 537.6628469387757 us
+USDT:2026-09-06 23:47:49 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:49 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 True -1 flydsl 2 537.8053854166667 us
+USDT:2026-09-06 23:47:49 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:49 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 True -1 flydsl 3 537.621214285714 us
+USDT:2026-09-06 23:47:49 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:49 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_942_register auto 192 10240 2583 True -1 flydsl 4 537.8304948453613 us
+MHA_RESULT {"backend": "fp8_942_register", "config": "auto", "dq": 192, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 537.6628469387757}, "total_gpu_us": {"flydsl": 537.6628469387757}, "tflops": {"flydsl": 63.558969779236676}, "effective_flops": 34173296640, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=fp8bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+[aiter] import [mha_batch_prefill_bf16_nlogits_nbias_nmask_nlse_ndropout_nqscale_nsink] under /tmp/mha_aiter_py311/mha_batch_prefill_bf16_nlogits_nbias_nmask_nlse_ndropout_nqscale_nsink.so
+[aiter] import [mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale] under /tmp/mha_aiter_py311/mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale.so
+USDT:2026-09-06 23:47:56 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:56 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 flydsl 0 1843.2151632653058 us
+USDT:2026-09-06 23:47:56 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:57 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 aiter_ck_linear_prepared 0 1888.078305263157 us
+USDT:2026-09-06 23:47:57 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:57 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 aiter_ck_linear_prepared 1 1888.2657113402051 us
+USDT:2026-09-06 23:47:57 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:57 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 flydsl 1 1844.239244897961 us
+USDT:2026-09-06 23:47:58 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:58 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 flydsl 2 1844.4604736842116 us
+USDT:2026-09-06 23:47:58 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:58 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 aiter_ck_linear_prepared 2 1889.6540303030288 us
+USDT:2026-09-06 23:47:58 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:58 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 aiter_ck_linear_prepared 3 1890.8140303030316 us
+USDT:2026-09-06 23:47:58 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:59 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 flydsl 3 1842.9419494949489 us
+USDT:2026-09-06 23:47:59 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:59 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 flydsl 4 1843.5851616161617 us
+USDT:2026-09-06 23:47:59 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:47:59 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2560 False -1 aiter_ck_linear_prepared 4 1890.333212121214 us
+MHA_RESULT {"backend": "bf16_942", "config": "auto", "dq": 128, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1843.5851616161617, "aiter_ck_linear_prepared": 1889.6540303030288}, "total_gpu_us": {"flydsl": 1855.7306868686892, "aiter_ck_linear_prepared": 1889.6540303030288}, "tflops": {"flydsl": 116.48410351260522, "aiter_ck_linear_prepared": 113.6442763364268}, "effective_flops": 214748364800, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+[aiter] [pid=578970 pname=MainProcess] start build [mha_batch_prefill_bf16_nlogits_nbias_mask_nlse_ndropout_nqscale_nsink] under /tmp/mha_aiter_py311/build/mha_batch_prefill_bf16_nlogits_nbias_mask_nlse_ndropout_nqscale_nsink
+[aiter] [pid=578970 pname=MainProcess] [32mfinish build [mha_batch_prefill_bf16_nlogits_nbias_mask_nlse_ndropout_nqscale_nsink], cost 317.2s [0m
+[aiter] import [mha_batch_prefill_bf16_nlogits_nbias_mask_nlse_ndropout_nqscale_nsink] under /tmp/mha_aiter_py311/mha_batch_prefill_bf16_nlogits_nbias_mask_nlse_ndropout_nqscale_nsink.so
+[aiter] [pid=578970 pname=MainProcess] start build [mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale] under /tmp/mha_aiter_py311/build/mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale
+[aiter] [pid=578970 pname=MainProcess] [32mfinish build [mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale], cost 244.0s [0m
+[aiter] import [mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale] under /tmp/mha_aiter_py311/mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale.so
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 flydsl 0 414.43870707070715 us
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 aiter_ck_linear_prepared 0 297.55706741573033 us
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 aiter_ck_linear_prepared 1 297.05454736842097 us
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 flydsl 1 413.7260204081632 us
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:24 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 flydsl 2 413.9732424242423 us
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 aiter_ck_linear_prepared 2 297.0617311827957 us
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 aiter_ck_linear_prepared 3 296.6386060606061 us
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 flydsl 3 413.6875858585858 us
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 flydsl 4 413.7102020202024 us
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:25 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2560 2560 True -1 aiter_ck_linear_prepared 4 296.5101212121212 us
+MHA_RESULT {"backend": "bf16_942", "config": "auto", "dq": 128, "q": 2560, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 413.7260204081632, "aiter_ck_linear_prepared": 297.05454736842097}, "total_gpu_us": {"flydsl": 425.980575757576, "aiter_ck_linear_prepared": 297.05454736842097}, "tflops": {"flydsl": 64.90776512801162, "aiter_ck_linear_prepared": 90.40101085102856}, "effective_flops": 26854031360, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:57:30 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:30 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 flydsl 0 1880.8791684210532 us
+USDT:2026-09-06 23:57:30 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:30 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 aiter_ck_linear_prepared 0 1978.4644432989692 us
+USDT:2026-09-06 23:57:31 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:31 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 aiter_ck_linear_prepared 1 1976.8620106382978 us
+USDT:2026-09-06 23:57:31 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:31 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 flydsl 1 1880.2977551020408 us
+USDT:2026-09-06 23:57:31 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:31 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 flydsl 2 1880.6087755102055 us
+USDT:2026-09-06 23:57:31 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:32 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 aiter_ck_linear_prepared 2 1977.913383838383 us
+USDT:2026-09-06 23:57:32 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:32 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 aiter_ck_linear_prepared 3 1977.445897959184 us
+USDT:2026-09-06 23:57:32 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:32 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 flydsl 3 1879.4108247422687 us
+USDT:2026-09-06 23:57:32 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:32 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 flydsl 4 1880.3099795918376 us
+USDT:2026-09-06 23:57:33 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:33 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 10240 2583 False -1 aiter_ck_linear_prepared 4 1977.2701616161617 us
+MHA_RESULT {"backend": "bf16_942", "config": "auto", "dq": 128, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 1880.3099795918376, "aiter_ck_linear_prepared": 1977.445897959184}, "total_gpu_us": {"flydsl": 1892.4916262626268, "aiter_ck_linear_prepared": 1977.445897959184}, "tflops": {"flydsl": 115.23511920467212, "aiter_ck_linear_prepared": 109.57455011215299}, "effective_flops": 216677744640, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 flydsl 0 457.58754545454553 us
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 aiter_ck_linear_prepared 0 313.3031829268294 us
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 aiter_ck_linear_prepared 1 314.51868686868676 us
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 flydsl 1 457.366939393939 us
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 flydsl 2 456.60210101010085 us
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:34 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 aiter_ck_linear_prepared 2 313.7310674157303 us
+USDT:2026-09-06 23:57:35 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:35 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 aiter_ck_linear_prepared 3 313.7530786516853 us
+USDT:2026-09-06 23:57:35 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:35 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 flydsl 3 456.93784848484853 us
+USDT:2026-09-06 23:57:35 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:35 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 flydsl 4 456.5988585858586 us
+USDT:2026-09-06 23:57:35 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:35 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 128 2583 2583 True -1 aiter_ck_linear_prepared 4 314.3954444444445 us
+MHA_RESULT {"backend": "bf16_942", "config": "auto", "dq": 128, "q": 2583, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 456.93784848484853, "aiter_ck_linear_prepared": 313.7530786516853}, "total_gpu_us": {"flydsl": 469.30640404040383, "aiter_ck_linear_prepared": 313.7530786516853}, "tflops": {"flydsl": 59.83010031375528, "aiter_ck_linear_prepared": 87.13424400322822}, "effective_flops": 27338637312, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:57:44 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:44 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 flydsl 0 2763.761848484848 us
+USDT:2026-09-06 23:57:45 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:45 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 aiter_ck_linear_prepared 0 2189.3581030927826 us
+USDT:2026-09-06 23:57:45 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:45 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 aiter_ck_linear_prepared 1 2189.228822916667 us
+USDT:2026-09-06 23:57:45 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:45 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 flydsl 1 2758.6898673469377 us
+USDT:2026-09-06 23:57:46 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:46 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 flydsl 2 2758.6931530612237 us
+USDT:2026-09-06 23:57:46 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:46 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 aiter_ck_linear_prepared 2 2189.7746562500006 us
+USDT:2026-09-06 23:57:46 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:46 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 aiter_ck_linear_prepared 3 2190.7492244897944 us
+USDT:2026-09-06 23:57:47 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:47 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 flydsl 3 2759.126224489796 us
+USDT:2026-09-06 23:57:47 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:47 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 flydsl 4 2759.02886868687 us
+USDT:2026-09-06 23:57:48 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:48 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2560 False -1 aiter_ck_linear_prepared 4 2189.1259489795934 us
+MHA_RESULT {"backend": "bf16_942", "config": "auto", "dq": 192, "q": 10240, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 2759.02886868687, "aiter_ck_linear_prepared": 2189.3581030927826}, "total_gpu_us": {"flydsl": 2771.184285714286, "aiter_ck_linear_prepared": 2189.3581030927826}, "tflops": {"flydsl": 97.2934567834946, "aiter_ck_linear_prepared": 122.60920478052284}, "effective_flops": 268435456000, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:57:52 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:52 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 flydsl 0 601.9638979591833 us
+USDT:2026-09-06 23:57:52 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:52 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 aiter_ck_linear_prepared 0 342.9074895833332 us
+USDT:2026-09-06 23:57:52 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:52 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 aiter_ck_linear_prepared 1 343.00857142857126 us
+USDT:2026-09-06 23:57:52 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:52 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 flydsl 1 603.2168383838381 us
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 flydsl 2 603.4236868686869 us
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 aiter_ck_linear_prepared 2 343.0873469387754 us
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 aiter_ck_linear_prepared 3 343.00665625 us
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 flydsl 3 604.8328979591834 us
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 flydsl 4 604.389767676768 us
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:57:53 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2560 2560 True -1 aiter_ck_linear_prepared 4 343.38248958333344 us
+MHA_RESULT {"backend": "bf16_942", "config": "auto", "dq": 192, "q": 2560, "kv": 2560, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 603.4236868686869, "aiter_ck_linear_prepared": 343.00857142857126}, "total_gpu_us": {"flydsl": 616.031444444444, "aiter_ck_linear_prepared": 343.00857142857126}, "tflops": {"flydsl": 55.628474537004294, "aiter_ck_linear_prepared": 97.86210023906114}, "effective_flops": 33567539200, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=40, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:58:00 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:00 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 flydsl 0 2819.5802222222223 us
+USDT:2026-09-06 23:58:00 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:00 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 aiter_ck_linear_prepared 0 2300.3482164948446 us
+USDT:2026-09-06 23:58:00 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:01 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 aiter_ck_linear_prepared 1 2300.117505050505 us
+USDT:2026-09-06 23:58:01 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:01 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 flydsl 1 2825.970131313131 us
+USDT:2026-09-06 23:58:01 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:01 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 flydsl 2 2822.955479591835 us
+USDT:2026-09-06 23:58:01 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:02 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 aiter_ck_linear_prepared 2 2300.066191919193 us
+USDT:2026-09-06 23:58:02 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:02 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 aiter_ck_linear_prepared 3 2299.3288229166674 us
+USDT:2026-09-06 23:58:02 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:03 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 flydsl 3 2825.5775204081633 us
+USDT:2026-09-06 23:58:03 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:03 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 flydsl 4 2822.0152580645167 us
+USDT:2026-09-06 23:58:03 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:03 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 10240 2583 False -1 aiter_ck_linear_prepared 4 2300.1266111111117 us
+MHA_RESULT {"backend": "bf16_942", "config": "auto", "dq": 192, "q": 10240, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "attention_us": {"flydsl": 2822.955479591835, "aiter_ck_linear_prepared": 2300.117505050505}, "total_gpu_us": {"flydsl": 2834.8656979166635, "aiter_ck_linear_prepared": 2300.117505050505}, "tflops": {"flydsl": 95.94454562179679, "aiter_ck_linear_prepared": 117.75362789304664}, "effective_flops": 270847180800, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 flydsl 0 669.2133838383842 us
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 aiter_ck_linear_prepared 0 369.1221313131312 us
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 aiter_ck_linear_prepared 1 369.51417894736835 us
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 flydsl 1 667.6407906976747 us
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:05 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 flydsl 2 669.5119795918368 us
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 aiter_ck_linear_prepared 2 369.24091836734715 us
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 aiter_ck_linear_prepared 3 369.06773195876275 us
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 flydsl 3 668.6602087912084 us
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 flydsl 4 670.0033877551018 us
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:06 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND bf16_942 auto 192 2583 2583 True -1 aiter_ck_linear_prepared 4 369.0914242424243 us
+MHA_RESULT {"backend": "bf16_942", "config": "auto", "dq": 192, "q": 2583, "kv": 2583, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": -1, "sink": false, "attention_us": {"flydsl": 669.2133838383842, "aiter_ck_linear_prepared": 369.1221313131312}, "total_gpu_us": {"flydsl": 681.4450303030303, "aiter_ck_linear_prepared": 369.1221313131312}, "tflops": {"flydsl": 51.06487327553642, "aiter_ck_linear_prepared": 92.57991797573996}, "effective_flops": 34173296640, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=41, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 flydsl 0 316.8060000000001 us
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 aiter_ck_linear_prepared 0 610.0155154639178 us
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 aiter_ck_linear_prepared 1 609.9061414141413 us
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 flydsl 1 316.9468367346939 us
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 flydsl 2 316.9137653061225 us
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 aiter_ck_linear_prepared 2 610.2552424242427 us
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:09 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 aiter_ck_linear_prepared 3 610.5093838383839 us
+USDT:2026-09-06 23:58:10 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 flydsl 3 317.0225773195876 us
+USDT:2026-09-06 23:58:10 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 flydsl 4 317.0032526315791 us
+USDT:2026-09-06 23:58:10 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:10 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 128 16384 131072 True 128 aiter_ck_linear_prepared 4 610.6709684210527 us
+MHA_RESULT {"backend": "swa_bf16", "config": "auto", "dq": 128, "q": 16384, "kv": 131072, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": 128, "sink": true, "attention_us": {"flydsl": 316.9468367346939, "aiter_ck_linear_prepared": 610.2552424242427}, "total_gpu_us": {"flydsl": 316.9468367346939, "aiter_ck_linear_prepared": 610.2552424242427}, "tflops": {"flydsl": 54.62773217860846, "aiter_ck_linear_prepared": 28.371877385632413}, "effective_flops": 17314086912, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=2048, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}
+USDT:2026-09-06 23:58:12 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:12 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 flydsl 0 364.1673636363636 us
+USDT:2026-09-06 23:58:12 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:12 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 aiter_ck_linear_prepared 0 687.3573636363632 us
+USDT:2026-09-06 23:58:12 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 aiter_ck_linear_prepared 1 687.5024226804123 us
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 flydsl 1 364.21945360824765 us
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 flydsl 2 364.1090612244896 us
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 aiter_ck_linear_prepared 2 686.7585510204079 us
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 aiter_ck_linear_prepared 3 686.4030000000001 us
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 flydsl 3 363.82298958333325 us
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 flydsl 4 363.8948210526314 us
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-06 23:58:13 578970:578970 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND swa_bf16 auto 192 16384 131072 True 128 aiter_ck_linear_prepared 4 686.6067422680412 us
+MHA_RESULT {"backend": "swa_bf16", "config": "auto", "dq": 192, "q": 16384, "kv": 131072, "batch": 1, "heads": 16, "kv_heads": 1, "page": 64, "causal": true, "window": 128, "sink": true, "attention_us": {"flydsl": 364.1090612244896, "aiter_ck_linear_prepared": 686.7585510204079}, "total_gpu_us": {"flydsl": 364.1090612244896, "aiter_ck_linear_prepared": 686.7585510204079}, "tflops": {"flydsl": 59.43990673348378, "aiter_ck_linear_prepared": 31.51414512108035}, "effective_flops": 21642608640, "reference_unavailable": {"aiter_5d": "invalid argument for batch_prefill: no matching kernel found. page_size=64, num_pages=2048, dtype=bf16. If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, CDNA3+ GPU (MI300/MI350) is required."}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "protocol": {"initial_warmup": 1200, "rounds": 5, "warmup": 20, "iterations": 100, "statistic": "drop first;1.5IQR mean;median rounds"}}

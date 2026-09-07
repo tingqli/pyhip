@@ -1,0 +1,7 @@
+{
+  "file": "mha_pa_bf16_942.py",
+  "measured_sha256": "44448e032b6796ac6b464c74108325b49c91ae36a12d8e4badff2815c22a7c61",
+  "final_sha256": "880063fa305785b537d4037d9d286b940dcc9612b0705c45c50dc796a5b6cb70",
+  "executable_ast_equal": true,
+  "changes": "whitespace/docstring indentation and empty comment only; original BF16/signature/CLI tests rerun: 8 passed, 24 skipped"
+}

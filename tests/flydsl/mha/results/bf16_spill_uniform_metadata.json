@@ -1,0 +1,71 @@
+{
+  "executed": false,
+  "gpu_queried": false,
+  "source_sha256": "2a3de1c6fc0f5273f8266860de2fe1e88739e8e83b66a81f13acdbed02b9e599",
+  "hints": {},
+  "records": [
+    {
+      "dq": 128,
+      "dv": 128,
+      "page": 64,
+      "causal": false,
+      "with_lse": false,
+      "mode": "per-token",
+      "heads": 16,
+      "kv_heads": 1,
+      "batch": 1,
+      "q": 10240,
+      "kv": 10240,
+      "executed": false,
+      "gpu_queried": false,
+      "tensor_device": "meta",
+      "resources": {
+        "group_segment_fixed_size": 16384,
+        "private_segment_fixed_size": 88,
+        "vgpr_count": 256,
+        "sgpr_count": 106,
+        "vgpr_spill_count": 21,
+        "sgpr_spill_count": 78,
+        "agpr_count": 0,
+        "vector_register_count": 256,
+        "accum_offset": 256
+      },
+      "scratch_instructions": 42,
+      "readfirstlane_instructions": 17,
+      "isa": "/tmp/mha_bf16_spill_uniform_metadata/d128_v128_p64_c0_lse0_per-token/attn_kernel_0/21_final_isa.s",
+      "isa_sha256": "f247bfc8c09855c9e9352e4189431c3690649ef13beea5ddd60176c03ee6ffe8"
+    },
+    {
+      "dq": 192,
+      "dv": 128,
+      "page": 64,
+      "causal": false,
+      "with_lse": false,
+      "mode": "per-token",
+      "heads": 16,
+      "kv_heads": 1,
+      "batch": 1,
+      "q": 10240,
+      "kv": 10240,
+      "executed": false,
+      "gpu_queried": false,
+      "tensor_device": "meta",
+      "resources": {
+        "group_segment_fixed_size": 24576,
+        "private_segment_fixed_size": 152,
+        "vgpr_count": 256,
+        "sgpr_count": 106,
+        "vgpr_spill_count": 37,
+        "sgpr_spill_count": 84,
+        "agpr_count": 0,
+        "vector_register_count": 256,
+        "accum_offset": 256
+      },
+      "scratch_instructions": 101,
+      "readfirstlane_instructions": 17,
+      "isa": "/tmp/mha_bf16_spill_uniform_metadata/d192_v128_p64_c0_lse0_per-token/attn_kernel_0/21_final_isa.s",
+      "isa_sha256": "1a3d346a369c6cbd91c85b362e7f944975e923485150722f0d4ccb2a1589efa4"
+    }
+  ],
+  "complete": true
+}

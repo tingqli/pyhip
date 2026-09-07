@@ -1,0 +1,42 @@
+{
+  "status": "complete",
+  "diagnostic_only": true,
+  "runs": [
+    {
+      "name": "bf16",
+      "command": [
+        "/tmp/pyhip-mha-py311/bin/python",
+        "/raid/users/xisun/luocheng/pyhip-moe/pyhip/tests/flydsl/mha/reproduce_baselines.py",
+        "--backend",
+        "bf16",
+        "--ptl",
+        "current",
+        "--allow-contention",
+        "--output",
+        "tests/flydsl/mha/results/low_load_spill_recheck_2/bf16_original_vs_spill_fixed.json"
+      ],
+      "returncode": 0
+    },
+    {
+      "name": "fp8",
+      "command": [
+        "/tmp/pyhip-mha-py311/bin/python",
+        "/raid/users/xisun/luocheng/pyhip-moe/pyhip/tests/flydsl/mha/test_mha_pa.py",
+        "--mode",
+        "performance",
+        "--backend",
+        "fp8_942",
+        "--case",
+        "fp8_native_410t",
+        "--ptl",
+        "current",
+        "--allow-contention",
+        "--aiter",
+        "off",
+        "--output",
+        "tests/flydsl/mha/results/low_load_spill_recheck_2/fp8_410t_gate.json"
+      ],
+      "returncode": 0
+    }
+  ]
+}

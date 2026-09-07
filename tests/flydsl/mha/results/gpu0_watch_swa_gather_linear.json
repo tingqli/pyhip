@@ -1,0 +1,27 @@
+{
+  "status": "complete",
+  "gpu": "0",
+  "pid": 2982335,
+  "command": [
+    "/tmp/pyhip-mha-py311/bin/python",
+    "tests/flydsl/mha/test_mha_pa_swa.py",
+    "--mode",
+    "performance",
+    "--gather-linear",
+    "--aiter",
+    "required",
+    "--allow-contention",
+    "--output",
+    "tests/flydsl/mha/results/swa_gather_linear_performance.json"
+  ],
+  "threshold_percent": 1.0,
+  "stable_samples": 2,
+  "allow_resident_workers": true,
+  "interval_seconds": 2,
+  "samples_seen": 85,
+  "triggered": true,
+  "time_utc": "2026-09-07T02:12:55.167087+00:00",
+  "gfx_activity_percent": 0.0,
+  "consecutive_low_samples": 2,
+  "returncode": 0
+}

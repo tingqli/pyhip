@@ -1,0 +1,40 @@
+{
+  "executed": false,
+  "gpu_queried": false,
+  "source_sha256": "6854a31b6353b3447d1ca75f6f97f2ba031f5b173d1145d9ad614904f3483eac",
+  "hints": {},
+  "records": [
+    {
+      "dq": 192,
+      "dv": 192,
+      "page": 64,
+      "causal": false,
+      "with_lse": false,
+      "mode": "per-token",
+      "heads": 16,
+      "kv_heads": 1,
+      "batch": 1,
+      "q": 10240,
+      "kv": 10240,
+      "executed": false,
+      "gpu_queried": false,
+      "tensor_device": "meta",
+      "resources": {
+        "group_segment_fixed_size": 24576,
+        "private_segment_fixed_size": 0,
+        "vgpr_count": 244,
+        "sgpr_count": 106,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "agpr_count": 0,
+        "vector_register_count": 244,
+        "accum_offset": 244
+      },
+      "scratch_instructions": 0,
+      "readfirstlane_instructions": 17,
+      "isa": "/tmp/mha_bf16_spill_stream_k/d192_v192_p64_c0_lse0_per-token/attn_kernel_0/21_final_isa.s",
+      "isa_sha256": "1953268750041c7f43c62036afe8170137f9983f561541671e09111bf8b645dd"
+    }
+  ],
+  "complete": true
+}

@@ -1,0 +1,71 @@
+{
+  "executed": false,
+  "gpu_queried": false,
+  "source_sha256": "f83411560b9e1034cd93430c9d9ff9486602aa5bdefda2c3a76c9313bfc76a45",
+  "hints": {},
+  "records": [
+    {
+      "dq": 128,
+      "dv": 128,
+      "page": 64,
+      "causal": false,
+      "with_lse": false,
+      "mode": "per-token",
+      "heads": 16,
+      "kv_heads": 1,
+      "batch": 1,
+      "q": 10240,
+      "kv": 10240,
+      "executed": false,
+      "gpu_queried": false,
+      "tensor_device": "meta",
+      "resources": {
+        "group_segment_fixed_size": 16384,
+        "private_segment_fixed_size": 0,
+        "vgpr_count": 246,
+        "sgpr_count": 102,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "agpr_count": 0,
+        "vector_register_count": 246,
+        "accum_offset": 248
+      },
+      "scratch_instructions": 0,
+      "readfirstlane_instructions": 17,
+      "isa": "/tmp/mha_bf16_spill_late_epilogue/d128_v128_p64_c0_lse0_per-token/attn_kernel_0/21_final_isa.s",
+      "isa_sha256": "e38ce84f6c8d056fc14b03869e8657517d1a21f7e59f28145cb1a54c322ce38c"
+    },
+    {
+      "dq": 192,
+      "dv": 128,
+      "page": 64,
+      "causal": false,
+      "with_lse": false,
+      "mode": "per-token",
+      "heads": 16,
+      "kv_heads": 1,
+      "batch": 1,
+      "q": 10240,
+      "kv": 10240,
+      "executed": false,
+      "gpu_queried": false,
+      "tensor_device": "meta",
+      "resources": {
+        "group_segment_fixed_size": 24576,
+        "private_segment_fixed_size": 144,
+        "vgpr_count": 256,
+        "sgpr_count": 102,
+        "vgpr_spill_count": 67,
+        "sgpr_spill_count": 0,
+        "agpr_count": 0,
+        "vector_register_count": 256,
+        "accum_offset": 256
+      },
+      "scratch_instructions": 151,
+      "readfirstlane_instructions": 17,
+      "isa": "/tmp/mha_bf16_spill_late_epilogue/d192_v128_p64_c0_lse0_per-token/attn_kernel_0/21_final_isa.s",
+      "isa_sha256": "6688b4ef7901e94ae4364c39429cd09f93519b1f9d4bc9c533377fd73a1b9452"
+    }
+  ],
+  "complete": true
+}

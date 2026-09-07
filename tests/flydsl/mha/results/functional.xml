@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="12.415" timestamp="2026-09-06T21:46:01.552838+08:00" hostname="hjbog-srdc-52.amd.com"><testcase classname="tests.flydsl.mha.test_mha_pa" name="test_live_page_and_cache_mutations[fp8_942-128]" time="12.343" /></testsuite></testsuites>

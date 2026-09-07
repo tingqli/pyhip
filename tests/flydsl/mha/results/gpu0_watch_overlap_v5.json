@@ -1,0 +1,26 @@
+{
+  "status": "complete",
+  "gpu": "0",
+  "pid": 1731145,
+  "command": [
+    "/tmp/pyhip-mha-py311/bin/python",
+    "tests/flydsl/mha/reproduce_baselines.py",
+    "--backend",
+    "bf16",
+    "--allow-contention",
+    "--ptl",
+    "current",
+    "--output",
+    "tests/flydsl/mha/results/bf16_overlap_v5_performance.json"
+  ],
+  "threshold_percent": 1.0,
+  "stable_samples": 2,
+  "allow_resident_workers": true,
+  "interval_seconds": 2,
+  "samples_seen": 71,
+  "triggered": true,
+  "time_utc": "2026-09-07T00:02:19.342581+00:00",
+  "gfx_activity_percent": 0.0,
+  "consecutive_low_samples": 2,
+  "returncode": 0
+}

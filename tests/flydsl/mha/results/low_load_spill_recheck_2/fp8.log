@@ -1,0 +1,19 @@
+/raid/users/xisun/luocheng/.env/lib64/python3.11/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-09-07 07:49:18 1628680:1628680 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-07 07:49:18 1628680:1628680 ActivityProfilerController.cpp:455] profiler_stop
+[W907 07:49:18.269741468 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+MHA_ROUND fp8_native_410t fp8_942 auto flydsl 0 1438.1053571428565 us
+USDT:2026-09-07 07:49:18 1628680:1628680 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-07 07:49:18 1628680:1628680 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_native_410t fp8_942 auto flydsl 1 1440.208960526316 us
+USDT:2026-09-07 07:49:18 1628680:1628680 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-07 07:49:18 1628680:1628680 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_native_410t fp8_942 auto flydsl 2 1433.0007738095223 us
+USDT:2026-09-07 07:49:18 1628680:1628680 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-07 07:49:19 1628680:1628680 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_native_410t fp8_942 auto flydsl 3 1436.8563294117646 us
+USDT:2026-09-07 07:49:19 1628680:1628680 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-09-07 07:49:19 1628680:1628680 ActivityProfilerController.cpp:455] profiler_stop
+MHA_ROUND fp8_native_410t fp8_942 auto flydsl 4 1439.6158051948053 us
+MHA_RESULT {"backend": "fp8_942", "config": "auto", "name": "fp8_native_410t", "q_lens": [10240], "kv_lens": [2560], "dq": 192, "dv": 128, "heads": 16, "kv_heads": 1, "page": 64, "causal": false, "window": -1, "sink": false, "scale_mode": "per-token", "input_kind": "native-cast", "seed": 20260906, "source": "tests/flydsl/pa_8wave/tests/flydsl/pa_8wave/new_native_gfx942_results.md:S5", "protocol": {"initial_warmup": 1200, "rounds": 5, "sample_warmup": 20, "iterations": 100, "buffers": 1, "timer": "profiler", "statistic": "drop first;1.5IQR mean;median rounds"}, "backends": ["fp8_942", "fp8_942_register"], "effective_flops": 268435456000, "q": 10240, "kv": 2560, "batch": 1, "attention_us": {"flydsl": 1438.1053571428565}, "event_interval_us": null, "total_gpu_us": {"flydsl": 1438.1053571428565}, "tflops": {"flydsl": 186.65910301127857}, "reference_unavailable": {}, "reference_note": "5D uses identical caches; explicit linear comparison is prepared before timing", "baseline_checks": [{"workload": "fp8_native_410t", "backend": "fp8_942", "arch": "gfx942", "gpu": "MI308X", "tflops": 413.983500680022, "microseconds": 648.420663043478, "source": "tests/flydsl/pa_8wave/tests/flydsl/pa_8wave/new_native_gfx942_results.md:S5", "ptl": "VECTOR,F8", "flydsl": "0.2.2", "minimum_tflops": 400.0, "torch_version": "2.12.1+rocm7.2", "hip_version": "7.2.53211", "status": "unmatched", "mismatch_reasons": ["GPU isolation was not enforced", "requires PTL Enabled/VECTOR,F8"], "measured_tflops": 186.65910301127857, "compiler_matches_original": false, "runtime_matches_original": true, "exact_environment_match": false, "latency_ratio_vs_documented": null}], "isolated": false}

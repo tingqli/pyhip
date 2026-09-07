@@ -1,0 +1,19 @@
+............................................................ssssssssssss [  8%]
+ssssssssssssssssssssssssssssssssssssssssssssssss........................ [ 17%]
+........................................ssssssssssssssssssssssssssssssss [ 26%]
+ssssssssssssssssssssssssssssssss....................................ssss [ 34%]
+ssssssssssssssssssssssssssssssss............ssssssssssss........ssssssss [ 43%]
+................ssssssssssssssss......ssssss....ssss....ssss..ss..ss.... [ 52%]
+ssss....ssss....ssss........ssssssss........ssssssss........ssssssss.... [ 60%]
+...............................................................sssssssss [ 69%]
+ssssssssssssssssssssssssssssssssssssssssssssssssssssssssss.s.s.......... [ 78%]
+........................................................................ [ 87%]
+............ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 95%]
+ssss.................ssssssssssssss                                      [100%]
+=============================== warnings summary ===============================
+tests/flydsl/mha/test_mha_pa_swa.py::test_empty_queries[gfx942-0-128]
+  /raid/users/xisun/luocheng/.env/lib64/python3.11/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+    _warn_once(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+430 passed, 397 skipped, 1 warning in 247.45s (0:04:07)
