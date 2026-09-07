@@ -6,7 +6,6 @@ No kernel imports or AITER initialization occur during test collection.
 from dataclasses import dataclass
 import importlib
 from itertools import accumulate
-import math
 
 import torch
 
@@ -49,7 +48,6 @@ BF16_950_PERSISTENT = Backend("bf16_950_persistent", "mha_pa_bf16_950", "gfx950"
                               persistent=True, strided=True)
 SWA = Backend("swa_bf16", "mha_pa_swa_bf16", "both", torch.bfloat16, strided=True)
 BACKENDS = (FP8, FP8_REG, BF16_942, BF16_950, BF16_950_PERSISTENT)
-PRIMARY_BACKENDS = (FP8, BF16_942, BF16_950)
 
 
 def i32(values):
@@ -274,56 +272,8 @@ def make_call(case, backend, causal, *, out=None, lse=None, **options):
     return call, out, kernel
 
 
-def assert_close(case, backend, actual, lse, causal, *, softmax_scale=None, lse_atol=None):
-    reference, ref_lse = torch_reference(case, causal, softmax_scale)
-    begin, end = case.q_offset, case.q_offset + sum(case.q_lens)
-    tolerance = 0.1 if backend.fp8 else 0.02
-    torch.testing.assert_close(actual[begin:end].float(), reference[begin:end], rtol=tolerance, atol=tolerance)
-    if lse is not None:
-        atol = lse_atol if lse_atol is not None else (8e-4 if backend.fp8 else 5e-4)
-        torch.testing.assert_close(lse[begin:end], ref_lse[begin:end], rtol=3e-4 if backend.fp8 else 2e-4, atol=atol)
-    return reference, ref_lse
-
-
-def assert_case(case, backend, causal, *, layout="contiguous", softmax_scale=None, repeats=3, with_lse=True, lse_atol=None, **options):
-    out, backing = output_buffer(case, layout)
-    lse = torch.full(case.q.shape[:2], -123.0, device="cuda", dtype=torch.float32) if with_lse else None
-    call, _, kernel = make_call(case, backend, causal, out=out, lse=lse, **options)
-    first = None
-    for _ in range(repeats):
-        result = call(return_lse=with_lse, softmax_scale=softmax_scale)
-        if with_lse:
-            assert result[0] is out and result[1] is lse
-        else:
-            assert result is out
-        if first is None:
-            first = out.clone(), None if lse is None else lse.clone()
-        else:
-            torch.testing.assert_close(out, first[0], rtol=0, atol=0)
-            if lse is not None:
-                torch.testing.assert_close(lse, first[1], rtol=0, atol=0)
-    assert_close(case, backend, out, lse, causal, softmax_scale=softmax_scale, lse_atol=lse_atol)
-    begin, end = case.q_offset, case.q_offset + sum(case.q_lens)
-    assert (out[:begin] == -123).all() and (out[end:] == -123).all()
-    if lse is not None:
-        assert (lse[:begin] == -123).all() and (lse[end:] == -123).all()
-    if layout == "padded":
-        assert (backing[:, case.heads:] == -123).all() and (backing[:, :case.heads, case.dv:] == -123).all()
-    return out, lse
-
-
 def dispatch_names(call):
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as profiler:
         call()
         torch.cuda.synchronize()
     return [e.name for e in profiler.events() if "CUDA" in str(e.device_type)]
-
-
-def effective_flops(case, causal):
-    pairs = 0
-    for q, k in zip(case.q_lens, case.kv_lens):
-        if not causal:
-            pairs += q * k
-        else:
-            pairs += sum(max(0, min(k, k - q + r + 1) - (max(0, k - q + r - case.window_left) if case.window_left >= 0 else 0)) for r in range(q))
-    return 2 * case.heads * pairs * (case.dq + case.dv)
