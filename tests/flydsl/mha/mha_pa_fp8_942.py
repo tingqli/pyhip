@@ -1,8 +1,8 @@
 """gfx942 FP8-FNUZ paged attention: BM256/BN64, eight staggered wave64s.
 
 K/V use the page64 SHUFFLE-5D ABI. ``memory_mode='lds'`` stages cooperative
-buffer loads through packed VGPRs into 41,600 bytes of LDS; ``'register'``
-loads each wave's operands directly. Neither mode uses direct-LDS DMA,
+buffer loads through packed VGPRs into 41,600 bytes of LDS for D192
+(33,280 for D128). Only LDS mode is supported; it uses no direct-LDS DMA,
 LDS-transpose instructions, or native FP32-to-BF16 conversion.
 """
 
@@ -67,12 +67,7 @@ def _max3(a, b, c):
         [a.ir_value(), b.ir_value(), c.ir_value()], "v_max3_f32 $0, $1, $2, $3", "=v,v,v,v", has_side_effects=False))
 
 
-def _row_max(values, fast=True):
-    if not fast:
-        value = fx.Float32(-1.0e30)
-        for i in range(32):
-            value = _maximum(value, values[i])
-        return _maximum(value, value.shuffle_xor(32, 64))
+def _row_max(values):
     # Independent MAX3 chains avoid the 32-deep VALU dependency chain.
     p = [_max3(values[i], values[i + 1], values[i + 2]) for i in range(0, 30, 3)]
     a = _max3(_max3(p[0], p[1], p[2]), _max3(p[3], p[4], p[5]), _max3(p[6], p[7], p[8]))
@@ -81,26 +76,11 @@ def _row_max(values, fast=True):
     return _maximum(value, value.shuffle_xor(32, 64))
 
 
-def _sum8(values):
-    # Same balanced addition tree, but only four short-lived temporaries.
-    # The register-only D192 causal path otherwise spills with all 16 pair
-    # sums live. Keeping the order identical preserves bit-exact modes.
-    result = llvm.inline_asm(ir.Type.parse("!llvm.struct<(f32, f32, f32, f32)>"),
-        [values[i].ir_value() for i in range(8)],
-        "v_add_f32 $0, $4, $5\nv_add_f32 $1, $6, $7\nv_add_f32 $2, $8, $9\nv_add_f32 $3, $10, $11\nv_add_f32 $0, $0, $1\nv_add_f32 $2, $2, $3\nv_add_f32 $0, $0, $2",
-        "=&v,=&v,=&v,=&v,v,v,v,v,v,v,v,v", has_side_effects=True)
-    return fx.Float32(llvm.extractvalue(fx.Float32.ir_type, result, [0]))
-
-
-def _row_sum(values, fast=True):
-    if fast:
-        partials = [values[i] + values[i + 1] for i in range(0, 32, 2)]
-        for width in (8, 4, 2, 1):
-            partials = [partials[2 * i] + partials[2 * i + 1] for i in range(width)]
-        value = partials[0]
-    else:
-        parts = [_sum8([values[i + j] for j in range(8)]) for i in range(0, 32, 8)]
-        value = (parts[0] + parts[1]) + (parts[2] + parts[3])
+def _row_sum(values):
+    partials = [values[i] + values[i + 1] for i in range(0, 32, 2)]
+    for width in (8, 4, 2, 1):
+        partials = [partials[2 * i] + partials[2 * i + 1] for i in range(width)]
+    value = partials[0]
     return value + value.shuffle_xor(32, 64)
 
 
@@ -235,26 +215,19 @@ def _q_fragment(resource, row_offset, lane, dq, dtype):
     return frag
 
 
-def _k_fragment(resource, storage, physical_offset, base, slot, half, dq, dtype, use_lds):
+def _k_fragment(storage, base, slot, half, dq, dtype):
     k_tile = (dq // 16) * PADDED_CHUNK
-    if use_lds:
-        parts = [_lds_words(storage, slot * k_tile + base + half * 512, d * 2080) for d in range(dq // 32)]
-    else:
-        parts = [_global_words(resource, base + half * 512 + d * 2048, physical_offset) for d in range(dq // 32)]
+    parts = [_lds_words(storage, slot * k_tile + base + half * 512, d * 2080) for d in range(dq // 32)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = _mma(dtype).make_fragment_A(fx.make_rmem_tensor(fx.make_layout((32, dq), (1, 32)), dtype))
     frag.store(words.bitcast(dtype))
     return frag
 
 
-def _v_fragment(resource, storage, physical_offset, base, slot, half, dq, dtype, use_lds):
+def _v_fragment(storage, base, slot, half, dq, dtype):
     k_tile = (dq // 16) * PADDED_CHUNK
-    if use_lds:
-        parts = [_lds_words(storage, 2 * k_tile + slot * V_TILE + base + half * PADDED_CHUNK,
-                            n * 512 + k * 4160) for n in range(2) for k in range(2)]
-    else:
-        parts = [_global_words(resource, base + half * 1024 + n * 512 + k * 4096, physical_offset)
-                 for n in range(2) for k in range(2)]
+    parts = [_lds_words(storage, 2 * k_tile + slot * V_TILE + base + half * PADDED_CHUNK,
+                        n * 512 + k * 4160) for n in range(2) for k in range(2)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = fx.make_rmem_tensor(fx.make_layout((8, 4, 2), (1, 8, 32)), dtype)
     frag.store(words.bitcast(dtype))
@@ -327,7 +300,7 @@ def _rescale(o0, o1, o2, o3, row_sum, old_max, new_max, ballot):
 def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
           H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
           CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
-          SCALE: fx.Constexpr[float], USE_LDS: fx.Constexpr[bool], STAGGER: fx.Constexpr[bool]):
+          SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool]):
     dtype = Q.dtype
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
@@ -360,31 +333,27 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     # all three issued page loads. No vector-memory wait is requested here.
     page0, page1, page2 = _page_ready(page0), _page_ready(page1), _page_ready(page2)
     k_row = (lane & 3) | ((lane & 4) << 2) | ((lane & 24) >> 1)
-    k_base = (lane >> 5) * 1024 + k_row * 16
-    v_base = (lane >> 5) * 2048 + (lane & 31) * 16
-    if fx.const_expr(USE_LDS):
-        k_base = (lane >> 5) * PADDED_CHUNK + ((k_row * 16) ^ ((k_row & 16) << 2))
-        v_base = (lane >> 5) * (2 * PADDED_CHUNK) + (lane & 31) * 16
-        k0 = _cooperative_load(gk, tid, page0 * (HK * BN * DQ), DQ // 64)
-        k1 = _cooperative_load(gk, tid, page1 * (HK * BN * DQ), DQ // 64)
-        v0 = _cooperative_load(gv, tid, page0 * (HK * BN * DV), 2)
-        # s_waitcnt vmcnt(0): K(0)/K(1)/V(0) staging registers must be ready
-        # before copying them into LDS; also drains earlier Q/scale VMEM.
-        _wait(vmcnt=0)
-        _cooperative_store(storage, tid, k0, 0, DQ // 64, True)
-        _cooperative_store(storage, tid, k1, (DQ // 16) * PADDED_CHUNK, DQ // 64, True)
-        _cooperative_store(storage, tid, v0, 2 * (DQ // 16) * PADDED_CHUNK, 2)
+    k_base = (lane >> 5) * PADDED_CHUNK + ((k_row * 16) ^ ((k_row & 16) << 2))
+    v_base = (lane >> 5) * (2 * PADDED_CHUNK) + (lane & 31) * 16
+    k0 = _cooperative_load(gk, tid, page0 * (HK * BN * DQ), DQ // 64)
+    k1 = _cooperative_load(gk, tid, page1 * (HK * BN * DQ), DQ // 64)
+    v0 = _cooperative_load(gv, tid, page0 * (HK * BN * DV), 2)
+    # s_waitcnt vmcnt(0): K(0)/K(1)/V(0) staging registers must be ready
+    # before copying them into LDS; also drains earlier Q/scale VMEM.
+    _wait(vmcnt=0)
+    _cooperative_store(storage, tid, k0, 0, DQ // 64, True)
+    _cooperative_store(storage, tid, k1, (DQ // 16) * PADDED_CHUNK, DQ // 64, True)
+    _cooperative_store(storage, tid, v0, 2 * (DQ // 16) * PADDED_CHUNK, 2)
     # s_waitcnt vmcnt(0) lgkmcnt(0): finish prologue loads and LDS writes
-    # before all waves rendezvous. Register mode has no LDS tile to publish.
+    # before all waves rendezvous.
     _wait(vmcnt=0, lgkmcnt=0)
     _stage_end()
     if fx.const_expr(STAGGER):
         # Extra entry rendezvous offsets group1 by one stage; no new s_wait.
         _stage_end()
 
-    k = _k_fragment(gk, storage, page0 * (HK * BN * DQ), k_base, 0, 0, DQ, dtype, USE_LDS)
-    # s_waitcnt vmcnt(0) lgkmcnt(0): K(0).lo ready for the first QK MFMA
-    # (LDS read in lds mode, VMEM read in register mode).
+    k = _k_fragment(storage, k_base, 0, 0, DQ, dtype)
+    # s_waitcnt vmcnt(0) lgkmcnt(0): K(0).lo LDS read ready for the first QK MFMA.
     _wait(vmcnt=0, lgkmcnt=0)
     _stage_end()
     lo = _qk(q, k, dtype)
@@ -395,28 +364,26 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     _schedule(DQ // 16, 3, 5)
     o0, o1, o2, o3 = _pin(o0), _pin(o1), _pin(o2), _pin(o3)
     _stage_end()
-    k = _k_fragment(gk, storage, page0 * (HK * BN * DQ), k_base, 0, 1, DQ, dtype, USE_LDS)
+    k = _k_fragment(storage, k_base, 0, 1, DQ, dtype)
     # s_waitcnt vmcnt(0) lgkmcnt(0): K(0).hi ready before QK consumes it.
     _wait(vmcnt=0, lgkmcnt=0)
     _stage_end()
     hi = _qk(q, k, dtype)
     scores = _mask(_join(lo, hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
-    maximum = _maximum(_row_max(scores, USE_LDS) * scale, fx.Float32(-1.0e30))
+    maximum = _maximum(_row_max(scores) * scale, fx.Float32(-1.0e30))
     scores = _center(scores, scale, maximum, 0, 32)
     row_sum = fx.Float32(0.0)
     _stage_end()
-    page3 = page2
-    if fx.const_expr(USE_LDS):
-        # Prime the extra page-ID lookahead: phase(1) will prefetch K(3).
-        # Its address must be ready before S0 so K.lo need not wait midway.
-        page3_request = _prefetch_page(table, _min(fx.Int32(3), last))
-        k2 = _cooperative_load(gk, tid, page2 * (HK * BN * DQ), DQ // 64)
-        # s_waitcnt vmcnt(0): prefetched K(2) ready for the retired K(0) slot.
-        _wait(vmcnt=0)
-        _cooperative_store(storage, tid, k2, 0, DQ // 64, True)
-        # s_waitcnt lgkmcnt(0): complete K(2) publication AND page(3) SMEM.
-        # The tied scalar result keeps the next phase's address use after it.
-        page3 = _page_ready(page3_request)
+    # Prime the extra page-ID lookahead: phase(1) will prefetch K(3).
+    # Its address must be ready before S0 so K.lo need not wait midway.
+    page3_request = _prefetch_page(table, _min(fx.Int32(3), last))
+    k2 = _cooperative_load(gk, tid, page2 * (HK * BN * DQ), DQ // 64)
+    # s_waitcnt vmcnt(0): prefetched K(2) ready for the retired K(0) slot.
+    _wait(vmcnt=0)
+    _cooperative_store(storage, tid, k2, 0, DQ // 64, True)
+    # s_waitcnt lgkmcnt(0): complete K(2) publication AND page(3) SMEM.
+    # The tied scalar result keeps the next phase's address use after it.
+    page3 = _page_ready(page3_request)
     _stage_end()
 
     @flyc.jit
@@ -428,28 +395,19 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         # S0: issue K.lo first and keep its LGKM wait at the very end.
         # future_page = page(t+2) was made ready in the previous phase (or
         # prologue); the new page(t+3) request is only used by the next phase.
-        if fx.const_expr(USE_LDS):
-            k = _k_fragment(gk, storage, current_page * (HK * BN * DQ), k_base, CUR, 0, DQ, dtype, True)
-            # Compiler-only fence: do not hoist address setup or VMEM before
-            # the six D192/four D128 LDS reads. It does not wait for the data.
-            rocdl.sched_barrier(0)
-            future_request = _prefetch_page(table, _min(t + 3, last))
-            v_staging = _cooperative_load(gv, tid, current_page * (HK * BN * DV), 2)
-            k_staging = _cooperative_load(gk, tid, future_page * (HK * BN * DQ), DQ // 64)
-            # Keep all independent work above the single final LGKM wait.
-            # V must still precede K in VMEM order for S2's rolling counter.
-            rocdl.sched_barrier(0)
-            # s_waitcnt lgkmcnt(0): K(t).lo AND next phase's page ID ready;
-            # V(t)/K(t+2) VMEM remain free to overlap this wait and S1.
-            future = _page_ready(future_request)
-        else:
-            k = _k_fragment(gk, storage, current_page * (HK * BN * DQ), k_base, CUR, 0, DQ, dtype, False)
-            # s_waitcnt lgkmcnt(0): scalar page only; does not finish K VMEM.
-            future = _page_ready(_prefetch_page(table, _min(t + 2, last)))
-            v_lo = _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 0, DQ, dtype, False)
-            # s_waitcnt vmcnt(4): retire older K(t).lo loads while allowing
-            # up to four newer V(t-1).lo b128 loads to remain outstanding.
-            _wait(vmcnt=4)
+        k = _k_fragment(storage, k_base, CUR, 0, DQ, dtype)
+        # Compiler-only fence: do not hoist address setup or VMEM before
+        # the six D192/four D128 LDS reads. It does not wait for the data.
+        rocdl.sched_barrier(0)
+        future_request = _prefetch_page(table, _min(t + 3, last))
+        v_staging = _cooperative_load(gv, tid, current_page * (HK * BN * DV), 2)
+        k_staging = _cooperative_load(gk, tid, future_page * (HK * BN * DQ), DQ // 64)
+        # Keep all independent work above the single final LGKM wait.
+        # V must still precede K in VMEM order for S2's rolling counter.
+        rocdl.sched_barrier(0)
+        # s_waitcnt lgkmcnt(0): K(t).lo AND next phase's page ID ready;
+        # V(t)/K(t+2) VMEM remain free to overlap this wait and S1.
+        future = _page_ready(future_request)
         _stage_end()
         # S1: QK low + 24 previous exps, with explicit VALU/MFMA co-issue hints.
         lo = _qk(q, k, dtype)
@@ -457,71 +415,60 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         _schedule(DQ // 16, 2 if DQ == 192 else 3, 1, True)
         _stage_end()
         # S2: current K high and publish V(t), while the other group computes.
-        k = _k_fragment(gk, storage, current_page * (HK * BN * DQ), k_base, CUR, 1, DQ, dtype, USE_LDS)
-        if fx.const_expr(USE_LDS):
-            # s_waitcnt vmcnt(3) for D192, vmcnt(2) for D128: S0 issued
-            # V's two b64 loads BEFORE K's DQ//64 loads. Wait for V only,
-            # allowing those newer K(t+2) requests to remain outstanding.
-            _wait(vmcnt=DQ // 64)
-            _cooperative_store(storage, tid, v_staging, 2 * (DQ // 16) * PADDED_CHUNK + CUR * V_TILE, 2)
-            # s_waitcnt lgkmcnt(0): K(t).hi read + V(t) LDS writes complete.
-            _wait(lgkmcnt=0)
-        else:
-            v_hi = _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 1, DQ, dtype, False)
-            # s_waitcnt vmcnt(4): older V.lo and K.hi ready; only the four
-            # newer V(t-1).hi b128 loads may remain in flight.
-            _wait(vmcnt=4)
+        k = _k_fragment(storage, k_base, CUR, 1, DQ, dtype)
+        # s_waitcnt vmcnt(3) for D192, vmcnt(2) for D128: S0 issued
+        # V's two b64 loads BEFORE K's DQ//64 loads. Wait for V only,
+        # allowing those newer K(t+2) requests to remain outstanding.
+        _wait(vmcnt=DQ // 64)
+        _cooperative_store(storage, tid, v_staging, 2 * (DQ // 16) * PADDED_CHUNK + CUR * V_TILE, 2)
+        # s_waitcnt lgkmcnt(0): K(t).hi read + V(t) LDS writes complete.
+        _wait(lgkmcnt=0)
         _stage_end()
         # S3: QK high + remaining exps, sum and native packed FP8 conversion.
         hi = _qk(q, k, dtype)
         previous = _exp_part(previous, 24, 32)
-        row_sum = row_sum + _row_sum(previous, USE_LDS)
+        row_sum = row_sum + _row_sum(previous)
         p = _pack_probability(previous, dtype)
         _schedule(4, 2, 2, True)
         _schedule(DQ // 16 - 4, 8, 2)
         _stage_end()
         # S4: V(t-1) low and K(t+2) publication after BOTH groups read K(t).
-        v = v_lo if not USE_LDS else _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 0, DQ, dtype, True)
-        if fx.const_expr(USE_LDS):
-            # s_waitcnt vmcnt(0): retire K(t+2) global prefetch before store.
-            # Safe slot reuse comes from the stage barriers, not this wait.
-            _wait(vmcnt=0)
-            _cooperative_store(storage, tid, k_staging, CUR * (DQ // 16) * PADDED_CHUNK, DQ // 64, True)
+        v = _v_fragment(storage, v_base, PREV, 0, DQ, dtype)
+        # s_waitcnt vmcnt(0): retire K(t+2) global prefetch before store.
+        # Safe slot reuse comes from the stage barriers, not this wait.
+        _wait(vmcnt=0)
+        _cooperative_store(storage, tid, k_staging, CUR * (DQ // 16) * PADDED_CHUNK, DQ // 64, True)
         # s_waitcnt lgkmcnt(0): V.lo ready + K(t+2) LDS publication complete;
-        # also covers earlier pending lane shuffles. In register mode V.lo
-        # was already made ready by S2's vmcnt(4); no VMEM wait is added here.
+        # also covers earlier pending lane shuffles.
         _wait(lgkmcnt=0)
         _stage_end()
         current = _mask(_join(lo, hi), t, row, q_len, kv_len, CAUSAL)
         # S5: PV low + current max/center. A six-bit lazy margin stays within
         # FP8-FNUZ finite range; gfx950 BF16's eight-bit margin is unsafe here.
         o0, o1 = _pv(p, v, o0, o1, dtype)
-        candidate = _row_max(current, USE_LDS) * scale
+        candidate = _row_max(current) * scale
         ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - maximum > 6.0).ir_value()))
         new_max = (ballot != fx.Int64(0)).select(_maximum(maximum, candidate), maximum)
         split = 12 if STAGGER else 6
         current = _center(current, scale, new_max, 0, split)
-        if fx.const_expr(USE_LDS):
-            # Keep the local MAX3 tree interleaved with the first four PV
-            # MFMAs. Then issue the xor32 ds_bpermute and two independent
-            # PV MFMAs before its v_max consumer. These are compiler-only
-            # hints; LLVM still inserts lgkmcnt(0) before using the result.
-            # Main-loop D192 ISA has two MFMAs in the gap; tail/causal
-            # blocks may schedule differently and must retain the wait.
-            _schedule(3, 5, 3)
-            rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 3)
-            rocdl.sched_group_barrier(0x002, 3, 3)
-            rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, 3)
-            rocdl.sched_group_barrier(rocdl.mask_mfma, 2, 3)
-            rocdl.sched_group_barrier(0x002, 10, 3)
-            _schedule(2, 5, 3)
-        else:
-            _schedule(8, 5, 3)
+        # Keep the local MAX3 tree interleaved with the first four PV
+        # MFMAs. Then issue the xor32 ds_bpermute and two independent
+        # PV MFMAs before its v_max consumer. These are compiler-only
+        # hints; LLVM still inserts lgkmcnt(0) before using the result.
+        # Main-loop D192 ISA has two MFMAs in the gap; tail/causal
+        # blocks may schedule differently and must retain the wait.
+        _schedule(3, 5, 3)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 3)
+        rocdl.sched_group_barrier(0x002, 3, 3)
+        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, 3)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, 3)
+        rocdl.sched_group_barrier(0x002, 10, 3)
+        _schedule(2, 5, 3)
         _stage_end()
         # S6: V high; V(t-1) is a full page in every forward main phase.
-        v = v_hi if not USE_LDS else _v_fragment(gv, storage, prev_page * (HK * BN * DV), v_base, PREV, 1, DQ, dtype, True)
-        # s_waitcnt vmcnt(0) lgkmcnt(0): V.hi ready for S7, whether loaded
-        # from LDS now or prefetched from VMEM in S2; drain pending LGKM too.
+        v = _v_fragment(storage, v_base, PREV, 1, DQ, dtype)
+        # s_waitcnt vmcnt(0) lgkmcnt(0): V.hi LDS read ready for S7;
+        # drain pending VMEM/LGKM too.
         _wait(vmcnt=0, lgkmcnt=0)
         _stage_end()
         # S7: PV high + remaining centered scores + lazy output rescale.
@@ -530,7 +477,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         _schedule(8, 4, 4)
         o0, o1, o2, o3, row_sum = _rescale(o0, o1, o2, o3, row_sum, maximum, new_max, ballot)
         _stage_end()
-        return current, new_max, row_sum, o0, o1, o2, o3, current_page, next_page, future_page if USE_LDS else future, future
+        return current, new_max, row_sum, o0, o1, o2, o3, current_page, next_page, future_page, future
 
     for t in range(fx.Int32(1), tiles - 1, fx.Int32(2)):
         scores, maximum, row_sum, o0, o1, o2, o3, page0, page1, page2, page3 = phase(scores, maximum, row_sum, o0, o1, o2, o3, page0, page1, page2, page3, t, 1, 0)
@@ -539,13 +486,13 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         scores, maximum, row_sum, o0, o1, o2, o3, page0, page1, page2, page3 = phase(scores, maximum, row_sum, o0, o1, o2, o3, page0, page1, page2, page3, last, 1, 0)
 
     scores = _exp_part(fx.Vector(scores), 0, 32)
-    row_sum = fx.Float32(row_sum) + _row_sum(scores, USE_LDS)
+    row_sum = fx.Float32(row_sum) + _row_sum(scores)
     p = _pack_probability(scores, dtype)
     # s_waitcnt vmcnt(0) lgkmcnt(0): drain outstanding prefetch/publication
     # and lane-shuffle work at the main-loop -> last-page boundary.
     _wait(vmcnt=0, lgkmcnt=0)
     _stage_end()
-    v = _v_fragment(gv, storage, page0 * (HK * BN * DV), v_base, last & 1, 0, DQ, dtype, USE_LDS)
+    v = _v_fragment(storage, v_base, last & 1, 0, DQ, dtype)
     # s_waitcnt vmcnt(0) lgkmcnt(0) + scheduler fence BEFORE _v_tail uses
     # asynchronous V.lo data. Zero invalid KV bytes to avoid 0 * NaN in PV.
     _wait(vmcnt=0, lgkmcnt=0)
@@ -554,7 +501,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     _stage_end()
     o0, o1 = _pv(p, v, o0, o1, dtype)
     _stage_end()
-    v = _v_fragment(gv, storage, page0 * (HK * BN * DV), v_base, last & 1, 1, DQ, dtype, USE_LDS)
+    v = _v_fragment(storage, v_base, last & 1, 1, DQ, dtype)
     # Same wait/fence for V.hi (Dv columns64:128, NOT the next KV half).
     # Both V halves reduce over the same BN64 tokens and use the same tail.
     _wait(vmcnt=0, lgkmcnt=0)
@@ -572,56 +519,44 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     out_row = (out_tid >> 6) * 32 + (out_tid & 31)
     optr = fx.get_iter(O) + ((fx.Int64(q0) + fx.Int64(q_start)) * (H * DV) + fx.Int64(head) * DV)
     obuf = rocdl.make_buffer_tensor(fx.make_view(optr, fx.make_layout(BM * H * DV, 1)), num_records_bytes=valid * H * DV * 2)
-    if fx.const_expr(USE_LDS):
-        # Both staggered groups have drained the K/V rings. Reuse the first
-        # 32 KiB for two output halves: contiguous b128 VMEM stores instead
-        # of one request per query row. XOR row[3:0] into column[5:2] makes
-        # b64 LDS writes conflict-free; odd rows swap two packed-word pairs.
-        atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16)
-        outputs = (o0, o1, o2, o3)
-        for half in fx.range_constexpr(2):
-            for n in fx.range_constexpr(2):
-                for group in fx.range_constexpr(4):
-                    val = fx.Vector.from_elements([outputs[half * 2 + n][group * 4 + i] * inv for i in range(4)], fx.Float32)
-                    words = _pack_bf16(val)
-                    col = n * 32 + group * 8 + ((out_tid >> 5) & 1) * 4
-                    element = (out_row * 64 + col) ^ ((out_row & 15) * 4)
-                    address = fx.Int32(fx.ptrtoint(fx.get_iter(storage) + element * 2))
-                    llvm.inline_asm(ir.Type.parse("!llvm.void"), [address.ir_value(), words.ir_value()],
-                        "ds_write_b64 $0, $1", "v,v,~{memory}", has_side_effects=True)
-            # s_waitcnt lgkmcnt(0): finish this wave's C-shuffle b64 writes;
-            # the following CTA barrier makes all writers ready for readers.
-            _wait(lgkmcnt=0)
-            _stage_end()
-            for i in fx.range_constexpr(4):
-                element = out_tid * 8 + i * THREADS * 8
-                read_row, read_col = element // 64, element % 64
-                element = element ^ ((read_row & 14) * 4)
-                words = _lds_words(storage, element * 2)
-                # s_waitcnt lgkmcnt(0) + fence: read result must be ready
-                # before word-pair permutation and the b128 global store.
-                _wait(lgkmcnt=0)
-                rocdl.sched_barrier(0)
-                src = fx.make_rmem_tensor(8, fx.BFloat16)
-                src.store(fx.Vector.from_elements([
-                    ((read_row & 1) == 0).select(words[j], words[j ^ 2]) for j in range(4)
-                ], fx.Int32).bitcast(fx.BFloat16))
-                offset = read_row * (H * DV) + half * 64 + read_col
-                fx.copy(atom, src, fx.make_view(fx.get_iter(obuf) + offset, fx.make_layout(8, 1)))
-            # Readers rendezvous before the next half overwrites LDS. No
-            # explicit VMEM-store drain here; this barrier is not vmcnt(0).
-            _stage_end()
-    else:
-        atom = fx.make_copy_atom(rocdl.BufferCopy64b(), fx.BFloat16)
-        outputs = (o0, o1, o2, o3)
-        for n in fx.range_constexpr(4):
+    # Both staggered groups have drained the K/V rings. Reuse the first
+    # 32 KiB for two output halves: contiguous b128 VMEM stores instead
+    # of one request per query row. XOR row[3:0] into column[5:2] makes
+    # b64 LDS writes conflict-free; odd rows swap two packed-word pairs.
+    atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16)
+    outputs = (o0, o1, o2, o3)
+    for half in fx.range_constexpr(2):
+        for n in fx.range_constexpr(2):
             for group in fx.range_constexpr(4):
-                values = fx.Vector.from_elements([outputs[n][group * 4 + i] * inv for i in range(4)], fx.Float32)
-                src = fx.make_rmem_tensor(4, fx.BFloat16)
-                src.store(_pack_bf16(values).bitcast(fx.BFloat16))
-                offset = out_row * (H * DV) + n * 32 + group * 8 + ((out_tid >> 5) & 1) * 4
-                dst = fx.make_view(fx.get_iter(obuf) + offset, fx.make_layout(4, 1))
-                fx.copy(atom, src, dst)
+                val = fx.Vector.from_elements([outputs[half * 2 + n][group * 4 + i] * inv for i in range(4)], fx.Float32)
+                words = _pack_bf16(val)
+                col = n * 32 + group * 8 + ((out_tid >> 5) & 1) * 4
+                element = (out_row * 64 + col) ^ ((out_row & 15) * 4)
+                address = fx.Int32(fx.ptrtoint(fx.get_iter(storage) + element * 2))
+                llvm.inline_asm(ir.Type.parse("!llvm.void"), [address.ir_value(), words.ir_value()],
+                    "ds_write_b64 $0, $1", "v,v,~{memory}", has_side_effects=True)
+        # s_waitcnt lgkmcnt(0): finish this wave's C-shuffle b64 writes;
+        # the following CTA barrier makes all writers ready for readers.
+        _wait(lgkmcnt=0)
+        _stage_end()
+        for i in fx.range_constexpr(4):
+            element = out_tid * 8 + i * THREADS * 8
+            read_row, read_col = element // 64, element % 64
+            element = element ^ ((read_row & 14) * 4)
+            words = _lds_words(storage, element * 2)
+            # s_waitcnt lgkmcnt(0) + fence: read result must be ready
+            # before word-pair permutation and the b128 global store.
+            _wait(lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            src = fx.make_rmem_tensor(8, fx.BFloat16)
+            src.store(fx.Vector.from_elements([
+                ((read_row & 1) == 0).select(words[j], words[j ^ 2]) for j in range(4)
+            ], fx.Int32).bitcast(fx.BFloat16))
+            offset = read_row * (H * DV) + half * 64 + read_col
+            fx.copy(atom, src, fx.make_view(fx.get_iter(obuf) + offset, fx.make_layout(8, 1)))
+        # Readers rendezvous before the next half overwrites LDS. No
+        # explicit VMEM-store drain here; this barrier is not vmcnt(0).
+        _stage_end()
     if fx.const_expr(WITH_LSE):
         if ((out_tid & 63) < 32) & (out_row < valid):
             log_l = fx.Float32(llvm.call_intrinsic(fx.Float32.ir_type, "llvm.log2.f32", [row_sum.ir_value()], [], []))
@@ -634,7 +569,7 @@ def _attention_kernel_942(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor
     CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor,
     H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
     CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float], USE_LDS: fx.Constexpr[bool]):
+    SCALE: fx.Constexpr[float]):
     head, batch, qb = fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")), fx.Int32(gpu.block_id("z"))
     q0 = _uniform(CQ[batch])
     q_len = _uniform(CQ[batch + 1]) - q0
@@ -642,19 +577,17 @@ def _attention_kernel_942(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor
     pages = _uniform(KI[batch + 1]) - start
     kv_len = (pages > 0).select((pages - 1) * BN + _uniform(LAST[batch]), fx.Int32(0))
     table = fx.make_view(fx.get_iter(PAGES) + start, fx.make_layout(pages, 1))
-    size = 2 * (DQ // 16) * PADDED_CHUNK + 2 * V_TILE if USE_LDS else 0
-    storage = Q
-    if fx.const_expr(USE_LDS):
-        storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, size, 16]).peek().view(fx.make_layout(size, 1))
+    size = 2 * (DQ // 16) * PADDED_CHUNK + 2 * V_TILE
+    storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, size, 16]).peek().view(fx.make_layout(size, 1))
     if qb * BM < q_len:
         if kv_len > 0:
             group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
             if group != 0:
                 _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
-                      H, HK, NP, DQ, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, USE_LDS, True)
+                        H, HK, NP, DQ, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, True)
             else:
                 _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
-                      H, HK, NP, DQ, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, USE_LDS, False)
+                        H, HK, NP, DQ, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, False)
         else:
             tid = fx.Int32(gpu.thread_id("x"))
             valid = _min(q_len - qb * BM, fx.Int32(BM))
@@ -678,16 +611,16 @@ def _launch_attention(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LS
     CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor,
     H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], B: fx.Constexpr[int], MAX_Q: fx.Constexpr[int],
     DQ: fx.Constexpr[int], CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float], USE_LDS: fx.Constexpr[bool], stream: fx.Stream):
+    SCALE: fx.Constexpr[float], stream: fx.Stream):
     _attention_kernel_942(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, H, HK, NP, DQ,
-        CAUSAL, PER_TOKEN, WITH_LSE, SCALE, USE_LDS, value_attrs={"rocdl.waves_per_eu": 2},
+        CAUSAL, PER_TOKEN, WITH_LSE, SCALE, value_attrs={"rocdl.waves_per_eu": 2},
     ).launch(grid=(H, B, (MAX_Q + BM - 1) // BM), block=(THREADS, 1, 1), stream=stream)
 
 
 class _PagedAttention:
-    def __init__(self, heads, kv_heads, dq, causal, memory_mode):
+    def __init__(self, heads, kv_heads, dq, causal):
         self.heads, self.kv_heads, self.dq, self.causal = heads, kv_heads, dq, causal
-        self.memory_mode = memory_mode
+        self.memory_mode = "lds"
         self._compiled = {}
 
     def __call__(self, Q, K, V, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
@@ -749,7 +682,7 @@ class _PagedAttention:
             args = (Q.view(-1), K.view(-1), V.view(-1), out.view(-1), lse.view(-1) if lse is not None else k_descale.view(-1),
                     cu_seqlens_q, kv_indptr, kv_page_indices, kv_last_page_lens, q_descale.view(-1), k_descale.view(-1), v_descale.view(-1),
                     self.heads, self.kv_heads, K.shape[0], batch, max_seqlen_q, self.dq, self.causal,
-                    q_descale.numel() != 1, lse is not None, scale, self.memory_mode == "lds", stream)
+                    q_descale.numel() != 1, lse is not None, scale, stream)
             signature = tuple((a.dtype, tuple(a.shape)) if isinstance(a, torch.Tensor) else ("stream",) if hasattr(a, "cuda_stream") else a for a in args)
             key = (Q.device, signature)
             compiled = self._compiled.get(key)
@@ -765,7 +698,9 @@ class _PagedAttention:
 def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size,
                    is_causal, quant_query_mode="per-token", key_layout="vectorized",
                    window_left=-1, has_sink=False, *, memory_mode="lds", persistent=None):
-    """Native FNUZ backend; the common factory rejects unsupported tuning modes."""
+    """Native FNUZ backend; memory_mode='lds' is retained for compatibility only."""
+    if memory_mode != "lds":
+        raise NotImplementedError("gfx942 FP8 supports memory_mode='lds' only; register mode has been removed")
     if persistent not in (None, False):
         raise NotImplementedError("gfx942 FP8 does not implement persistent scheduling")
     if head_dim_qk not in (128, 192) or (head_dim_v, page_size, key_layout) != (DV, BN, "vectorized"):
@@ -774,6 +709,6 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         raise NotImplementedError("initial gfx942 pipeline supports full causal/noncausal; SWA/sink are not implemented")
     if num_qo_heads <= 0 or num_kv_heads <= 0 or num_qo_heads % num_kv_heads:
         raise ValueError("query heads must be a positive multiple of KV heads")
-    if quant_query_mode not in ("per-token", "per-tensor") or memory_mode not in ("lds", "register"):
-        raise ValueError("unsupported scale or memory mode")
-    return _PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, is_causal, memory_mode)
+    if quant_query_mode not in ("per-token", "per-tensor"):
+        raise ValueError("unsupported scale mode")
+    return _PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, is_causal)

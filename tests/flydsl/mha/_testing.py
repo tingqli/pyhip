@@ -40,14 +40,13 @@ class Backend:
 
 
 FP8 = Backend("fp8_942", "mha_pa_fp8_942", "gfx942", torch.float8_e4m3fnuz)
-FP8_REG = Backend("fp8_942_register", "mha_pa_fp8_942", "gfx942", torch.float8_e4m3fnuz, memory_mode="register")
 BF16_942 = Backend("bf16_942", "mha_pa_bf16_942", "gfx942", torch.bfloat16,
                    empty_kv=False, causal_short_kv=False, single_dispatch=False)
 BF16_950 = Backend("bf16_950", "mha_pa_bf16_950", "gfx950", torch.bfloat16, strided=True)
 BF16_950_PERSISTENT = Backend("bf16_950_persistent", "mha_pa_bf16_950", "gfx950", torch.bfloat16,
                               persistent=True, strided=True)
 SWA = Backend("swa_bf16", "mha_pa_swa_bf16", "both", torch.bfloat16, strided=True)
-BACKENDS = (FP8, FP8_REG, BF16_942, BF16_950, BF16_950_PERSISTENT)
+BACKENDS = (FP8, BF16_942, BF16_950, BF16_950_PERSISTENT)
 
 
 def i32(values):

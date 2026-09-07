@@ -1,5 +1,9 @@
 # gfx950 Attention：运行、测试与性能
 
+> **跨机修改提示（2026-09-07）**：当前入口已改为默认10-buffer，新增SWA `aiter_gather`参考，
+> 见[changes.md](changes.md)。下文MI350原始数据保持当时单buffer口径，不是修改后重测。
+> 复现旧计时规模请显式`--buffers 1`；采用新默认需在MI350重新验证，不能沿用旧候选数/样本数。
+
 更新：2026-09-07。适用 **MI350X / gfx950，BF16，Dqk128/192，Dv128，page64**。
 Full、causal、单wave SWA都用 [test_mha_pa.py](test_mha_pa.py)，默认**先检查输出O，再测性能**。
 本文合并覆盖、性能与开发说明；性能数据来自注明时间的实测，当前入口可复测相同输入与流程。

@@ -19,12 +19,12 @@ if __package__:
     from ._testing import (BACKENDS, BF16_942, BF16_950, BF16_950_PERSISTENT, SWA,
                           dispatch_names, gpu_arch, make_call, make_case, output_buffer, torch_reference)
     from ._perf_cases import Workload
-    from ._references import ReferenceUnavailable, aiter_reference_call, probe_reference
+    from ._references import ReferenceUnavailable, aiter_reference_call, aiter_gather_call, probe_reference, requested_reference_call, requested_identity
 else:
     from _testing import (BACKENDS, BF16_942, BF16_950, BF16_950_PERSISTENT, SWA,
                          dispatch_names, gpu_arch, make_call, make_case, output_buffer, torch_reference)
     from _perf_cases import Workload
-    from _references import ReferenceUnavailable, aiter_reference_call, probe_reference
+    from _references import ReferenceUnavailable, aiter_reference_call, aiter_gather_call, probe_reference, requested_reference_call, requested_identity
 
 
 def select_backends(names, arch):
@@ -91,55 +91,80 @@ def perf_timer(flops, nbytes, name):
     return cudaPerf(flops=flops, rw_bytes=nbytes, name=name, verbose=0)
 
 
-def measure(calls, reference, *, label, flops, nbytes, run_count=5, warmup=5, repeat=1,
+def measure(calls, references, *, label, flops, nbytes, run_count=5, warmup=10, repeat=1,
             tolerance=0.02):
-    """Validate every candidate before any timing; one compact line per run."""
+    """Check every independent buffer, then run_count full rotating-buffer rounds.
+
+    One round measures every buffer. repeat>1 advances the buffer on every
+    invocation inside one event pair; all candidates see identical indices.
+    Median over all event intervals, not the fastest sample or a sum of timers.
+    """
+    buffers = len(references)
+    if not buffers or not calls or any(len(pool) != buffers for pool in calls.values()):
+        raise ValueError("every candidate requires the same nonempty buffer pool")
     rows = []
-    for name, call in calls.items():
-        actual = call()
-        torch.cuda.synchronize()  # Finish first compilation/launch before the next candidate.
-        acc = accuracy(actual, reference, f"{label}/{name}", tolerance) if reference is not None else None
-        kernels = dispatch_names(call)
+    for name, pool in calls.items():
+        accs, outputs = [], []
+        for index, (call, reference) in enumerate(zip(pool, references)):
+            actual = call()
+            torch.cuda.synchronize()
+            accs.append(accuracy(actual, reference, f"{label}/{name}/buffer{index}", tolerance) if reference is not None else None)
+            outputs.append(actual.data_ptr())
+            first = actual.clone()
+            for _ in range(2):
+                torch.testing.assert_close(call(), first, rtol=0, atol=0)
+        if len(set(outputs)) != buffers:
+            raise AssertionError(f"{name}: output buffers alias")
+        kernels = dispatch_names(pool[0])
         if not kernels and actual.numel():
             raise AssertionError(f"{name}: expected a native attention dispatch")
-        rows.append({"backend": name, "acc": acc, "checked": reference is not None,
-                     "status": "passed" if reference is not None else "unchecked",
-                     "kernels": kernels, "aiter_entry": getattr(call, "aiter_entry", None), "runs": []})
-        if name == "aiter":
-            print(f"aiter entry={getattr(call, 'aiter_entry', 'unknown')}", flush=True)
-            for kernel in kernels:
-                print(f"aiter kernel={kernel}", flush=True)
+        if name == "aiter_gather" and (len(kernels) != 2 or not any("gather" in k for k in kernels)):
+            raise AssertionError(f"expected one gather and one CK dispatch: {kernels}")
+        checked = all(ref is not None for ref in references)
+        rows.append({"backend": name, "acc": max(accs) if checked else None, "acc_per_buffer": accs,
+                     "checked": checked, "status": "passed" if checked else "unchecked",
+                     "repeated_bit_exact": True, "output_ptrs": outputs,
+                     "workspace_ptrs": [getattr(call, "workspace_ptrs", []) for call in pool],
+                     "kernels": kernels, "aiter_entry": getattr(pool[0], "aiter_entry", None),
+                     "reference_source": getattr(pool[0], "reference_source", None),
+                     "logical_io_bytes": nbytes[name], "runs": []})
+        if name.startswith("aiter"):
+            print(f"{name} entry={getattr(pool[0], 'aiter_entry', 'unknown')} kernels={kernels}", flush=True)
     if run_count:
-        for _ in range(warmup):
-            for call in calls.values():
-                call()
+        for index in range(warmup):
+            for pool in calls.values():
+                pool[index % buffers]()
         torch.cuda.synchronize()
     by_name = {row["backend"]: row for row in rows}
-    for index in range(run_count):
-        order = list(calls) if index % 2 == 0 else list(reversed(calls))
-        for name in order:
-            with perf_timer(flops * repeat, nbytes * repeat, name) as perf:
-                for _ in range(repeat):
-                    calls[name]()
-            us = perf.dt() * 1e6 / repeat
-            if not math.isfinite(us) or us <= 0:
-                raise RuntimeError("cudaPerf returned no positive timing; check CUDAPERF filtering")
-            sample = {"run": index + 1, "us": us, "tflops": perf.tflops(), "gbps": perf.bw()}
-            row = by_name[name]
-            row["runs"].append(sample)
-            acc = "unchecked" if row["acc"] is None else f"{row['acc']:.8g}"
-            print(f"{label}/{name} run={index + 1}/{run_count} acc={acc} "
-                  f"time={us:.3f} us tflops={sample['tflops']:.3f} bw={sample['gbps']:.3f} GB/s", flush=True)
+    for trial in range(run_count):
+        for buffer in range(buffers):
+            order = list(calls) if (trial + buffer) % 2 == 0 else list(reversed(calls))
+            indices = [(buffer + iteration) % buffers for iteration in range(repeat)]
+            for name in order:
+                with perf_timer(flops * repeat, nbytes[name] * repeat, name) as perf:
+                    for index in indices:
+                        calls[name][index]()
+                us = perf.dt() * 1e6 / repeat
+                if not math.isfinite(us) or us <= 0:
+                    raise RuntimeError("cudaPerf returned no positive timing; check CUDAPERF filtering")
+                sample = {"run": trial + 1, "buffer_indices": indices, "us": us,
+                          "tflops": perf.tflops(), "gbps": perf.bw()}
+                row = by_name[name]
+                row["runs"].append(sample)
+                acc = "unchecked" if row["acc"] is None else f"{row['acc']:.8g}"
+                print(f"{label}/{name} round={trial + 1}/{run_count} buffers={indices} acc={acc} "
+                      f"time={us:.3f} us tflops={sample['tflops']:.3f} bw={sample['gbps']:.3f} GB/s", flush=True)
     for row in rows:
         us = statistics.median(sample["us"] for sample in row["runs"]) if row["runs"] else None
-        row.update(us=us, tflops=flops / us / 1e6 if us else None, gbps=nbytes / us / 1e3 if us else None)
+        row.update(us=us, tflops=flops / us / 1e6 if us else None,
+                   gbps=nbytes[row["backend"]] / us / 1e3 if us else None)
     return rows
 
 
 @torch.inference_mode()
-def run_case(workload, backends, *, check=True, run_count=5, warmup=5, repeat=1,
+def run_case(workload, backends, *, check=True, run_count=5, warmup=10, repeat=1, buffers=10,
              aiter="auto", layout="contiguous", nonunit_scales=False, softmax_scale=None,
-             poison_tail=False, query_tile=None, block_n=None):
+             poison_tail=False, query_tile=None, block_n=None, requested_reference="off"):
     w = workload
     shape = w.to_dict()
     supported = [b for b in backends if w.unsupported(b) is None]
@@ -152,41 +177,65 @@ def run_case(workload, backends, *, check=True, run_count=5, warmup=5, repeat=1,
         raise ValueError("the selected backend requires contiguous Q/O")
     if poison_tail and BF16_942 in supported:
         raise ValueError("bf16_942 uses zero-padded tails; --poison-tail is supported by gfx950/SWA/FP8")
+    if buffers < 1:
+        raise ValueError("buffers must be positive")
     backend = supported[0]
-    case = make_case(w.q_lens, w.kv_lens, dtype=backend.dtype, dq=w.dq, dv=w.dv, page=w.page,
-                     heads=w.heads, kv_heads=w.kv_heads, mode=w.scale_mode, layout=layout,
-                     window_left=w.window, has_sink=w.sink, nonunit_scales=nonunit_scales,
-                     poison_tail=poison_tail, quantized=backend.fp8, source_dtype=torch.bfloat16, seed=w.seed)
-    reference = torch_reference(case, w.causal, softmax_scale)[0] if check else None
-    calls = {}
-    for candidate in supported:
-        out, _ = output_buffer(case, layout)
-        options = {"query_tile": query_tile, "block_n": block_n} if candidate == SWA else {}
-        call = make_call(case, candidate, w.causal, out=out, **options)[0]
-        calls[candidate.name] = partial(call, softmax_scale=softmax_scale)
+    cases, references, calls = [], [], {}
+    factories = {}
     if aiter != "off":
-        try:
-            call = aiter_reference_call(case, w.causal, softmax_scale=softmax_scale)
-            probe_reference(call)
-            calls["aiter"] = call
-        except ReferenceUnavailable as exc:
-            if aiter == "on":
-                raise
-            unavailable["aiter"] = str(exc)
-            print(f"{w.name}/aiter N/A: {exc}", flush=True)
+        factories["aiter"] = (aiter_reference_call, aiter)
+        if w.window >= 0:
+            factories["aiter_gather"] = (aiter_gather_call, aiter)
+    if requested_reference != "off":
+        factories["requested_reference"] = (requested_reference_call, requested_reference)
+    for index in range(buffers):
+        case = make_case(w.q_lens, w.kv_lens, dtype=backend.dtype, dq=w.dq, dv=w.dv, page=w.page,
+                         heads=w.heads, kv_heads=w.kv_heads, mode=w.scale_mode, layout=layout,
+                         window_left=w.window, has_sink=w.sink, nonunit_scales=nonunit_scales,
+                         poison_tail=poison_tail, quantized=backend.fp8, source_dtype=torch.bfloat16, seed=w.seed + index)
+        cases.append(case)
+        references.append(torch_reference(case, w.causal, softmax_scale)[0] if check else None)
+        for candidate in supported:
+            out, _ = output_buffer(case, layout)
+            options = {"query_tile": query_tile, "block_n": block_n} if candidate == SWA else {}
+            call = make_call(case, candidate, w.causal, out=out, **options)[0]
+            calls.setdefault(candidate.name, []).append(partial(call, softmax_scale=softmax_scale))
+        for name, (factory, policy) in factories.items():
+            if name in unavailable:
+                continue
+            try:
+                call = factory(case, w.causal, softmax_scale=softmax_scale)
+                probe_reference(call)
+                calls.setdefault(name, []).append(call)
+            except ReferenceUnavailable as exc:
+                if policy == "on":
+                    raise
+                unavailable[name] = str(exc)
+                calls.pop(name, None)
+                print(f"{w.name}/{name} N/A: {exc}", flush=True)
+    pointers = [{key: getattr(c, key).data_ptr() for key in ("q", "k", "v", "qs", "ks", "vs", "indices")} for c in cases]
+    for key in ("q", "k", "v"):
+        if sum(w.q_lens) and len({ptr[key] for ptr in pointers}) != buffers:
+            raise AssertionError(f"input {key} buffers alias")
     # Logical Q/K/V/O size, not a hardware traffic counter (especially for SWA).
     nbytes = (sum(w.q_lens) * w.heads * (w.dq * case.q.element_size() + w.dv * 2)
               + sum(w.kv_lens) * w.kv_heads * (w.dq + w.dv) * case.k.element_size())
+    candidate_bytes = {name: nbytes + getattr(pool[0], "extra_io_bytes", 0) for name, pool in calls.items()}
     label = f"{w.name} B{len(w.q_lens)} H{w.heads}/{w.kv_heads} Q{w.q_lens} KV{w.kv_lens} W{w.window}"
-    rows = measure(calls, reference, label=label, flops=w.flops, nbytes=nbytes, run_count=run_count,
+    rows = measure(calls, references, label=label, flops=w.flops, nbytes=candidate_bytes, run_count=run_count,
                    warmup=warmup, repeat=repeat, tolerance=0.1 if backend.fp8 else 0.02)
+    if "requested_reference" in calls:
+        if requested_identity("fp8" if backend.fp8 else "bf16") != calls["requested_reference"][0].reference_source:
+            raise ValueError("requested reference changed during measurement")
     return {"workload": shape, "results": rows, "unavailable": unavailable,
             "input": {"dtype": str(backend.dtype), "layout": layout, "poison_tail": poison_tail,
+                      "input_buffers": buffers, "buffer_seeds": [w.seed + i for i in range(buffers)],
+                      "buffer_ptrs": pointers, "with_lse": False,
                       "nonunit_scales": nonunit_scales, "softmax_scale": softmax_scale,
                       "query_tile": query_tile, "block_n": block_n,
                       "q_shape": list(case.q.shape), "q_stride": list(case.q.stride()),
                       "flydsl_kv": "SHUFFLE-5D", "aiter_kv": "prepared linear THD; conversion not timed"},
-            "flops": w.flops, "logical_io_bytes": nbytes}
+            "flops": w.flops, "logical_io_bytes": nbytes, "candidate_logical_io_bytes": candidate_bytes}
 
 
 def parse_args(argv=None):
@@ -215,15 +264,21 @@ def parse_args(argv=None):
     parser.add_argument("--query-tile", type=int, choices=(16, 32))
     parser.add_argument("--block-n", type=int, choices=(16, 32, 64))
     parser.add_argument("--check", type=int, choices=(0, 1), default=1, help="1: FP32 accuracy before timing; 0: explicitly unchecked")
-    parser.add_argument("--run-count", type=int, default=5, help="0: accuracy only; otherwise print every timed run")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--repeat", type=int, default=1, help="calls per event interval; report per-call time")
+    parser.add_argument("--buffers", type=int, default=10, help="independent input/output/workspace sets; every round measures all buffers")
+    parser.add_argument("--run-count", type=int, default=5, help="full buffer rounds; 0: accuracy only; default 5x10=50 samples per candidate")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--repeat", type=int, default=1, help="rotating-buffer calls per event interval; report per-call time")
     parser.add_argument("--aiter", choices=("auto", "on", "off"), default="auto")
+    parser.add_argument("--requested-reference", choices=("auto", "on", "off"), default="off",
+                        help="add specified dense BF16 / BN32 paged FP8 reference; never resize unsupported inputs")
     parser.add_argument("--require-idle", action="store_true", help="refuse other GPU processes; default is a quick diagnostic")
+    parser.add_argument("--wait-idle", action="store_true", help="physical GPU0: wait indefinitely for no processes and 3 quiet samples before GPU initialization")
     parser.add_argument("--output", type=Path, help="optional JSON plus summary Markdown; use a new filename")
     args = parser.parse_args(argv)
-    if args.run_count < 0 or args.warmup < 0 or args.repeat < 1 or (not args.check and not args.run_count):
-        parser.error("run-count/warmup must be nonnegative, repeat positive; enable check or timing")
+    if args.wait_idle:
+        args.require_idle = True
+    if args.run_count < 0 or args.warmup < 0 or args.repeat < 1 or args.buffers < 1 or (not args.check and not args.run_count):
+        parser.error("run-count/warmup must be nonnegative, repeat/buffers positive; enable check or timing")
     if args.batch < 1 or args.heads < 1 or args.kv_heads < 1 or args.heads % args.kv_heads:
         parser.error("batch/heads must be positive and heads divisible by kv-heads")
     if any(n < 0 for n in (*(args.q_lens or []), *(args.kv_lens or []), args.q or 0, args.kv or 0)):
@@ -256,13 +311,15 @@ def run(args, backends, selected):
               "measurement_scope": "idle-guarded diagnostic" if args.require_idle else "quick diagnostic; no exclusive reservation",
               "timer": "pyhip.cudaPerf GPU event interval; per-call time; includes launch gaps",
               "protocol": {"warmup": args.warmup, "run_count": args.run_count, "repeat": args.repeat,
-                           "input_buffers": 1, "summary": "median of all per-call event times",
+                           "input_buffers": args.buffers, "samples_per_candidate": args.run_count * args.buffers,
+                           "summary": "median of all per-call event times across all buffers and rounds",
+                           "buffer_rotation": args.buffers > 1, "repeat_reuses_same_buffer": args.buffers == 1,
                            "gpu_spin_before_event": "cudaPerf's built-in torch.cuda._sleep(1000000)"},
-              "bandwidth": "logical Q/K/V/O bytes divided by time, not measured HBM traffic",
+              "bandwidth": "logical Q/K/V/O bytes; aiter_gather adds full KV read+write; not measured HBM traffic",
               "acc_definition": "sum((ref-out)^2) / sum(ref^2+out^2), smaller is better; elementwise tolerance also required",
               "records": []}
     print(f"arch={report['environment']['arch']} check={args.check} runs={args.run_count} "
-          f"repeat={args.repeat} scope={report['measurement_scope']}", flush=True)
+          f"buffers={args.buffers} repeat={args.repeat} scope={report['measurement_scope']}", flush=True)
     try:
         for w in selected:
             if args.require_idle:
@@ -270,8 +327,11 @@ def run(args, backends, selected):
             row = run_case(w, backends, check=bool(args.check), run_count=args.run_count, warmup=args.warmup,
                            repeat=args.repeat, aiter=args.aiter, layout=args.layout, nonunit_scales=args.nonunit_scales,
                            softmax_scale=args.softmax_scale, poison_tail=args.poison_tail,
-                           query_tile=args.query_tile, block_n=args.block_n)
+                           query_tile=args.query_tile, block_n=args.block_n, requested_reference=args.requested_reference,
+                           buffers=args.buffers)
             report["records"].append(row)
+            if args.output:
+                save(args.output, report)
             if args.require_idle:
                 require_idle_device()
         if not any(row["results"] for row in report["records"]):
@@ -290,16 +350,31 @@ def run(args, backends, selected):
     print("\nMedian per-call results (all runs retained):\n" + table, flush=True)
     if args.output:
         dispatches = [f"- **{row['workload']['name']}**: `{r['aiter_entry']}`\n  - `" + "`\n  - `".join(r["kernels"]) + "`"
-                      for row in report["records"] for r in row["results"] if r["backend"] == "aiter"]
+                      for row in report["records"] for r in row["results"] if r["backend"].startswith("aiter")]
         args.output.with_suffix(".md").write_text(
             "# Quick MHA accuracy/performance\n\n"
-            "cudaPerf GPU-event intervals; acc=0 is best; bandwidth is logical Q/K/V/O GB/s, not a hardware counter.\n\n"
+            f"cudaPerf events; {args.buffers} independent buffers, {args.run_count} full rounds; acc=max across buffers. "
+            "Bandwidth is logical Q/K/V/O GB/s; gather+CK adds full KV read/write, not a hardware counter.\n\n"
             + table + "\n\n## AITER dispatch\n\n" + "\n".join(dispatches or ["AITER disabled or unavailable."]) + "\n")
     return report
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.wait_idle:
+        import os
+        if any(os.environ.get(key) != "0" for key in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")):
+            raise ValueError("--wait-idle requires explicit physical GPU0 visibility")
+        if __package__:
+            from ._hardware import wait_until_idle
+        else:
+            from _hardware import wait_until_idle
+        log = args.output.with_suffix(".idle.jsonl") if args.output else None
+        if log:
+            if args.output.exists() or args.output.with_suffix(".md").exists() or log.exists():
+                raise FileExistsError("choose new report and idle-log paths before waiting")
+            log.parent.mkdir(parents=True, exist_ok=True)
+        wait_until_idle(record_path=log)
     backends = select_backends(args.backend, gpu_arch())
     return run(args, backends, workloads(args, backends))
 
@@ -328,6 +403,39 @@ def test_swa_page_boundaries(dq):
                  dq=dq, heads=6, kv_heads=2, causal=True, window=128, sink=True)
     run_case(w, [SWA], run_count=0, aiter="off", layout="padded",
              nonunit_scales=True, poison_tail=True, softmax_scale=0.0625)
+
+
+@pytest.mark.parametrize("dq", (128, 192))
+def test_full_gather_live_cache(dq):
+    if gpu_arch() not in ("gfx942", "gfx950"):
+        pytest.skip("requires native GPU")
+    from importlib import import_module
+    gather_kv_call = import_module((__package__ + "." if __package__ else "") + "_gather").gather_kv_call
+    case = make_case((0, 7, 33), (0, 65, 193), dq=dq, heads=6, kv_heads=2,
+                     window_left=128, poison_tail=True, reverse_pages=True)
+    gather, workspace = gather_kv_call(case)
+    ptrs = [t.data_ptr() for t in workspace]
+    for index in range(2):
+        if index:
+            case.k_pages.mul_(0.5)
+            case.v_pages.neg_()
+            case.pack(copy=True)
+        actual = gather()
+        assert [t.data_ptr() for t in actual] == ptrs
+        for a, expected in zip(actual, case.logical_kv()):
+            torch.testing.assert_close(a.float(), torch.cat(expected), rtol=0, atol=0)
+    assert len(dispatch_names(gather)) == 1
+
+
+@pytest.mark.parametrize("dq", (128, 192))
+@pytest.mark.parametrize("causal", (False, True))
+@pytest.mark.parametrize("mode", ("per-token", "per-tensor"))
+def test_fp8_lds_page_boundaries(dq, causal, mode):
+    if gpu_arch() != "gfx942":
+        pytest.skip("requires native gfx942")
+    w = Workload("fp8_lds_edges", (0, 7, 33, 129), (63, 65, 193, 257), dq=dq,
+                 heads=6, kv_heads=2, causal=causal, scale_mode=mode)
+    run_case(w, select_backends(["fp8_942"], "gfx942"), run_count=0, aiter="off", poison_tail=True)
 
 
 if __name__ == "__main__":
