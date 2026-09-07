@@ -1,5 +1,9 @@
 # 测试来源与覆盖对应
 
+> **当前MI325执行证据**见[MI325_VALIDATION.md](MI325_VALIDATION.md)：初始完整979通过/1310跳过，
+> 后增stress14通过/4跳过（49,152次graph内调用）及纯离线报告回归。历史计数不与新计数相加。
+> 四个生产kernel未变；gfx950缺硬件，FP8控制实验后剩余GPU性能因设备健康阻塞未完成。
+
 最新BF16942 spill修复：96项CPU-only真实ISA编译、最终整合205通过（含24项原版逐位对照）、
 66项CPU契约回归（有11项重叠），详见 [BF16_SPILL_FIX.md](BF16_SPILL_FIX.md)。
 

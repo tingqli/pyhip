@@ -1,13 +1,31 @@
 # MHA跨机器测试与开发上下文
 
+**MI325最新完整上下文已汇总到 [README.325.md](README.325.md)**，包括环境、测试/TFLOPS、
+新性能参考、阻塞事实和不commit的完整迁移步骤；本页仍保留MI308历史来源与契约。
+
 更新：**2026-09-07**。这份文档可独立交给下一台机器/下一位开发者，不需要读取聊天记录。
 本次交付只做**本地Git提交，不推送**；用目标机的`git rev-parse HEAD`记录实际交付commit。
+
+> **最新性能参考已由用户重新指定**：BF16以dense
+> [test_attn_8wave_32x32_lkgv.py](../test_attn_8wave_32x32_lkgv.py)基本持平为目标；FP8以
+> [pa_prefill_8w32x32.py](../pa_8wave/pa_prefill_8w32x32.py)的FP8分支为参考且不得更慢。
+> 详见[REQUESTED_REFERENCES.md](REQUESTED_REFERENCES.md)。旧MI308/MI325数字不自动满足新验收。
+
+> **当前目标机补充**：MI325X / gfx942 / **304 CU**，不是下文历史源机的 MI308X / 80 CU。
+> MI325X 的 PTL 为 **N/A（不支持）**；本轮不做PTL设置，不套用MI308X的400T gate。
+> 新机环境、独立证据、原版比较和剩余阻塞统一记在
+> [MI325_VALIDATION.md](MI325_VALIDATION.md)，下文源机历史报告不覆盖、不改标签。
+> **本轮交付指令更新**：用户在本机明确选择“只保留改动，不提交”；因此本轮不commit、不push。
+> **MI325结果/阻塞**：初始完整native979通过/1310跳过，新增stress14通过/4跳过；BF16四项
+> 同机对照及96项304CTA资源完成。FP8控制实验后GPU状态读取超时，后续GPU测试暂停；未reset。
+> TFLOPS及未完成清单见MI325报告，不能将本轮宣称为全矩阵完成。
 
 ## 0. 先读这几条
 
 1. 这是4个显式kernel的统一测试目录，不是自动fallback框架：FP8/gfx942、BF16/gfx942、
    BF16/gfx950、BF16单wave SWA/gfx942+gfx950。
-2. 当前机器仅有MI308X/gfx942。**gfx950原生功能/性能仍未验收**，交叉编译不等于原生通过。
+2. 本文原始源机仅有MI308X/gfx942；当前目标机MI325X也为gfx942。
+  **gfx950原生功能/性能仍未验收**，交叉编译不等于原生通过。
 3. BF16/gfx942大量scratch spill已消除，但**D192/page32仍有约10.95%性能回退**。
    D192/page64低负载诊断改善15.44%，D128/page64基本持平。不要宣称所有shape已恢复。
 4. FP8历史413.984T依赖MI308X和PTL Enabled/VECTOR,F8；当前改版尚未完成该条件下的独占验收。

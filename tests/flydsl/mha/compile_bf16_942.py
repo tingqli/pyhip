@@ -7,11 +7,13 @@ launcher sees the same shapes/strides/dtypes as native execution.
 import argparse
 import contextlib
 import hashlib
+import importlib.metadata
 import itertools
 import json
 import os
 from pathlib import Path
 import re
+import sys
 
 import torch
 import flydsl.compiler as flyc
@@ -26,7 +28,9 @@ else:
 
 
 def compile_case(directory, *, dq, dv, page, causal, with_lse, heads=16, kv_heads=1, q=10240, kv=10240,
-                 batch=1, mode="per-token", hints=None):
+                 batch=1, mode="per-token", hints=None, workgroups=80):
+    if not isinstance(workgroups, int) or isinstance(workgroups, bool) or workgroups < 1:
+        raise ValueError("workgroups must be a positive integer")
     def tensor(shape, dtype=torch.bfloat16):
         return torch.empty(shape, dtype=dtype, device="meta")
     pages = batch * ((kv + page - 1) // page)
@@ -38,12 +42,12 @@ def compile_case(directory, *, dq, dv, page, causal, with_lse, heads=16, kv_head
     qs = tensor((q * batch * heads if mode == "per-token" else 1,), torch.float32)
     ks, vs = tensor((1,), torch.float32), tensor((1,), torch.float32)
     out, lse = tensor((q * batch, heads, dv)), tensor((q * batch, heads), torch.float32)
-    counter = tensor((81,), torch.int32)
+    counter = tensor((workgroups + 1,), torch.int32)
     launch = module._build_attention(heads, kv_heads, dq, dv, page, causal, mode, with_lse=with_lse)
     saved_hints = launch.compile_hints
     if hints:
         launch.compile_hints = {**launch.compile_hints, **hints}
-    args = (query, key, value, cq, ck, indptr, indices, qs, ks, vs, last, out, lse if with_lse else ks, counter, 80, None)
+    args = (query, key, value, cq, ck, indptr, indices, qs, ks, vs, last, out, lse if with_lse else ks, counter, workgroups, None)
     directory.mkdir(parents=True, exist_ok=True)
     saved = (env.compile.arch, env.compile.compile_only, env.debug.dump_ir, env.debug.dump_dir, env.runtime.enable_cache)
     log_path = directory / "compile.log"
@@ -69,6 +73,7 @@ def compile_case(directory, *, dq, dv, page, causal, with_lse, heads=16, kv_head
     text = files[0].read_text()
     return {"dq": dq, "dv": dv, "page": page, "causal": causal, "with_lse": with_lse,
             "mode": mode, "heads": heads, "kv_heads": kv_heads, "batch": batch, "q": q, "kv": kv,
+            "workgroups": workgroups, "counter_shape": list(counter.shape),
             "executed": False, "gpu_queried": False, "tensor_device": "meta", "resources": resource_fields(text),
             "scratch_instructions": sum("scratch_" in line for line in text.splitlines()),
             "readfirstlane_instructions": text.count("v_readfirstlane"),
@@ -89,24 +94,31 @@ def main():
     parser.add_argument("--causal", type=int, nargs="+", default=[0])
     parser.add_argument("--lse", type=int, nargs="+", default=[0])
     parser.add_argument("--mode", choices=("per-token", "per-tensor"), default="per-token")
+    parser.add_argument("--workgroups", type=int, default=80,
+                        help="explicit CTA count; 80 reproduces MI308X metadata, 304 matches MI325X (no GPU query)")
     parser.add_argument("--hints", type=json.loads, default={})
     parser.add_argument("--require-no-scratch", action="store_true")
     parser.add_argument("--retain-isa", action="store_true")
     parser.add_argument("--dump-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.workgroups < 1:
+        parser.error("--workgroups must be positive")
     # Any accidental query/allocation path through torch.cuda is a test failure.
     def forbidden(*_args, **_kwargs):
         raise RuntimeError("CPU-only compilation must not initialize or query a GPU")
     for name in ("_lazy_init", "get_device_properties", "current_stream", "synchronize", "is_available"):
         setattr(torch.cuda, name, forbidden)
-    result = {"executed": False, "gpu_queried": False, "source_sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
+    result = {"executed": False, "gpu_queried": False, "arch": "gfx942", "workgroups": args.workgroups,
+              "compiler": {"flydsl": importlib.metadata.version("flydsl"), "torch": torch.__version__,
+                           "hip": torch.version.hip, "python": sys.version, "interpreter": sys.executable},
+              "source_sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
               "hints": args.hints, "records": [], "complete": False}
     save(args.output, result)
     for dq, dv, page, causal, with_lse in itertools.product(args.dq, args.dv, args.page, args.causal, args.lse):
         directory = args.dump_root / f"d{dq}_v{dv}_p{page}_c{causal}_lse{with_lse}_{args.mode}"
         row = compile_case(directory, dq=dq, dv=dv, page=page, causal=bool(causal), with_lse=bool(with_lse),
-                           mode=args.mode, hints=args.hints)
+                           mode=args.mode, hints=args.hints, workgroups=args.workgroups)
         if args.retain_isa:
             retained = args.output.parent / (args.output.stem + "_isa") / (directory.name + ".s")
             retained.parent.mkdir(parents=True, exist_ok=True)

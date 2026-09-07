@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -36,6 +37,38 @@ def test_streamed_k_preserves_fragment_reduction_order():
         streamed = [offset + value for offset in range(0, dimension // 2, 8) for value in range(8)]
         assert streamed == original
     assert all((tid & 511) == tid for tid in range(512))
+
+
+@pytest.mark.parametrize("workgroups", (80, 304))
+def test_compile_case_uses_explicit_workgroup_metadata(monkeypatch, tmp_path, workgroups):
+    def forbidden(*args, **kwargs):
+        pytest.fail("metadata-only compilation must not query or initialize the GPU")
+    for name in ("_lazy_init", "get_device_properties", "current_stream", "synchronize", "is_available"):
+        monkeypatch.setattr(torch.cuda, name, forbidden)
+    launch = SimpleNamespace(compile_hints={})
+    monkeypatch.setattr(compile_bf16_942.module, "_build_attention", lambda *a, **k: launch)
+    resource = {"group_segment_fixed_size": 24576, "private_segment_fixed_size": 0,
+                "vgpr_count": 252, "sgpr_count": 106, "vgpr_spill_count": 0,
+                "sgpr_spill_count": 0, "agpr_count": 0}
+    def compile_meta(actual_launch, *args):
+        assert actual_launch is launch and args[-2] == workgroups
+        assert args[-3].shape == (workgroups + 1,)
+        assert all(arg.device.type == "meta" for arg in args if isinstance(arg, torch.Tensor))
+        (tmp_path / "test_final_isa.s").write_text("\n".join(f".{k}: {v}" for k, v in resource.items()))
+    monkeypatch.setattr(compile_bf16_942.flyc, "compile", compile_meta)
+    row = compile_bf16_942.compile_case(tmp_path, dq=192, dv=128, page=32, causal=False,
+                                      with_lse=False, workgroups=workgroups)
+    assert row["workgroups"] == workgroups and row["counter_shape"] == [workgroups + 1]
+    assert not row["gpu_queried"] and not row["executed"]
+    assert row["resources"]["private_segment_fixed_size"] == 0
+
+
+@pytest.mark.parametrize("workgroups", (0, -1, True, 1.5))
+def test_compile_case_rejects_invalid_workgroups(tmp_path, workgroups):
+    with pytest.raises(ValueError, match="workgroups must be a positive integer"):
+        compile_bf16_942.compile_case(tmp_path, dq=192, dv=128, page=32, causal=False,
+                                    with_lse=False, workgroups=workgroups)
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("busy,allow_resident", ((False, False), (True, False), (True, True)))

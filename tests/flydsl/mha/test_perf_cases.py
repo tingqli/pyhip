@@ -171,6 +171,32 @@ def test_default_policy_never_changes_hardware(monkeypatch, tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("state", ("N/A", None, "Unknown"))
+def test_non_ptl_device_rejects_policy_before_setter(monkeypatch, tmp_path, state):
+    for name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        monkeypatch.setenv(name, "0")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i:
+                        SimpleNamespace(gcnArchName="gfx942", name="AMD Instinct MI325X", multi_processor_count=304))
+    monkeypatch.setattr(_hardware, "ensure_idle", lambda *a: None)
+    monkeypatch.setattr(_hardware, "limits", lambda: {"gpu_data": [{"limit": {"ptl_state": state, "ptl_format": "N/A"}}]})
+    monkeypatch.setattr(_hardware.subprocess, "run", lambda *a, **k: pytest.fail("unsupported PTL must never reach a setter"))
+    with pytest.raises(RuntimeError, match="does not report supported PTL"):
+        with _hardware.ptl_experiment("VECTOR,F8", tmp_path / "unsupported.json"):
+            pytest.fail("unsupported PTL must not run the experiment")
+    assert not list(tmp_path.iterdir())
+
+
+def test_mi325_cannot_be_relabelled_as_mi308_acceptance():
+    workload, = select_workloads(("fp8_native_410t",))
+    env = measured_env(gpu="AMD Instinct MI325X", compute_units=304, flydsl="0.2.2",
+                       limits={"gpu_data": [{"limit": {"ptl_state": "N/A", "ptl_format": "N/A"}}]})
+    row, = baseline_status(workload, FP8.name, env, 1000)
+    assert row["status"] == "unmatched" and not row["exact_environment_match"]
+    assert row["latency_ratio_vs_documented"] is None
+    assert "requires MI308X/gfx942" in row["mismatch_reasons"]
+    assert "requires PTL Enabled/VECTOR,F8" in row["mismatch_reasons"]
+
+
 def test_event_timer_uses_all_rotating_buffers(monkeypatch):
     # Fully mocked events/calls: no device allocation, query or synchronization.
     order = []

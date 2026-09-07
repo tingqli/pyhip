@@ -70,6 +70,8 @@ def ptl_experiment(policy, record_path):
         raise RuntimeError("the authorized PTL experiment is restricted to gfx942 GPU0")
     before = limits()
     original = before["gpu_data"][0]["limit"]
+    if original.get("ptl_state") not in ("Enabled", "Disabled"):
+        raise RuntimeError("GPU0 does not report supported PTL controls; use --ptl current (no hardware changes)")
     if original["ptl_state"] != "Disabled":
         raise RuntimeError("PTL experiment expects the original Disabled state; refusing to overwrite another policy")
     record = {"policy": policy, "before": before, "commands": [], "restored": False}

@@ -1,5 +1,13 @@
 # 原始性能基线：口径修正与待复测计划
 
+> **本页保留历史口径**。用户2026-09-07最新指定的BF16/FP8相对参考与验收门槛以
+> [REQUESTED_REFERENCES.md](REQUESTED_REFERENCES.md)为准；不能将下表历史绝对TFLOPS当作新验收通过。
+
+> **MI325换机补充**：当前机器gfx942/304CU且无PTL，不能套用下表MI308X/80CU绝对gate。
+> 已测本机BF16原/当前的完整TFLOPS见[MI325验证报告](MI325_VALIDATION.md)与
+> [性能汇总](results/newmachine_mi325_20260907T035439Z/performance-summary.md)。
+> FP8实验后设备健康读取超时，后续性能blocked；不把未完成case填成旧数字。
+
 > 最新用户要求已恢复GPU监测及低负载测试；BF16942大量scratch spill已修复并验证。
 > 见 [BF16_SPILL_FIX.md](BF16_SPILL_FIX.md)。以下CPU-only暂停状态保留为上一阶段历史，
 > 不再是当前执行限制。绝对250T/410T门槛仍按原文匹配，不把诊断数据当复现。

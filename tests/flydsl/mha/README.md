@@ -1,7 +1,19 @@
 # Paged MHA / 单 wave SWA
 
+**MI325换机完整交接入口：[README.325.md](README.325.md)**。独立包含环境重建、已测µs/TFLOPS、
+最新BF16/FP8参考、GPU阻塞、未提交工作树迁移和下一台机器的测试顺序，无需读取聊天记录。
+
 **换机器前先读：[CONTEXT_HANDOFF.md](CONTEXT_HANDOFF.md)**。包含离线Git历史迁移、环境搭建、
 分架构测试顺序、原始计时协议、待测/待修事项和开发规则。
+
+> **最新性能验收对象**见[REQUESTED_REFERENCES.md](REQUESTED_REFERENCES.md)：BF16基本持平于
+> 用户指定dense LKG/V-global实现，FP8不得慢于指定BN32 prefill的FP8分支。
+> 新比较入口提供matched shape/µs/TFLOPS/relative gate，设备仍阻塞时只运行CPU计划，尚未宣称达标。
+
+> **当前目标机MI325X**：gfx942、304 CU、PTL N/A，不套用MI308X/80CU门槛。
+> [MI325_VALIDATION.md](MI325_VALIDATION.md) 包含979通过的初始完整native回归、14通过的新增stress、
+> 96项304CTA资源及同机BF16 µs/TFLOPS。FP8对照后GPU状态读取超时，剩余GPU计时暂停，
+> 不是全44项性能已完成；没有改生产kernel或reset GPU。本轮按用户选择不提交、不推送。
 
 > **最新：BF16/gfx942 spill修复**。96个D/V/page/CNC/LSE/scale编译组合全部零scratch/零VGPR
 > spill；默认D128/D192也零SGPR spill，VGPR为246/252。最终整合回归205通过（含24项原版逐位对照）。
@@ -33,7 +45,10 @@
 | [validate_preservation.py](validate_preservation.py) | hash验证的原Git源码，同输入ABBA / gfx950双版本交叉编译 |
 | [_perf_cases.py](_perf_cases.py)、[test_perf_cases.py](test_perf_cases.py) | 原文44项性能case、基线与CPU回归 |
 | [reproduce_baselines.py](reproduce_baselines.py)、[_hardware.py](_hardware.py) | 原版/当前版复现，显式可恢复PTL与空闲检查 |
+| [compare_requested_references.py](compare_requested_references.py)、[test_requested_references.py](test_requested_references.py) | 用户最新dense BF16 / BN32 FP8相对性能门槛、CPU计划及限时只读预检；native路径仍待恢复设备后验证 |
 | [compile_bf16_942.py](compile_bf16_942.py)、[test_bf16_spills.py](test_bf16_spills.py) | metadata-only资源编译、spill回归及原版逐位对照 |
+| [test_mha_stress.py](test_mha_stress.py) | 双stream长graph回放、live metadata/cache与实际CU counter检查 |
+| [export_performance.py](export_performance.py)、[validation_manifest.py](validation_manifest.py) | 纯离线TFLOPS表/CSV/JSON及本轮证据/ISA SHA清单，不覆盖旧报告 |
 | [watch_performance.py](watch_performance.py)、[recheck_performance.py](recheck_performance.py) | 低利用率触发的串行性能队列；驻留worker仅诊断 |
 | [summarize_results.py](summarize_results.py) | 合并资源、保留ISA与历史来源、汇总JUnit和性能 |
 

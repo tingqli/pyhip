@@ -543,6 +543,10 @@ def main(test_file, suite="pa"):
             files.append(HERE / "test_bf16_spills.py")
         if args.suite == "all":
             files.append(HERE / "test_perf_cases.py")
+            files.append(HERE / "test_mha_stress.py")
+            files.append(HERE / "test_export_performance.py")
+            files.append(HERE / "test_validation_manifest.py")
+            files.append(HERE / "test_requested_references.py")
         class Filter:
             def pytest_collection_modifyitems(self, items, config):
                 if "auto" in args.backend:

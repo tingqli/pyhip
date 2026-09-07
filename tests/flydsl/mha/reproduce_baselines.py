@@ -1,4 +1,8 @@
-"""Reproduce the documented targets before deciding whether to change kernels."""
+"""Historical documented targets with their original source/protocol provenance.
+
+For the user's newer dense-BF16 / BN32-FP8 relative gates, use
+compare_requested_references.py; do not relabel these historical comparisons.
+"""
 
 import argparse
 import contextlib
