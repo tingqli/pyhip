@@ -577,12 +577,32 @@ def _gpu_records(data):
     return {int(row["gpu"]): row for row in rows}
 
 
+def _gpu_activity(metrics):
+    values = []
+    for name in ("gfx_activity", "umc_activity"):
+        value = metrics[name]
+        value = float(value["value"] if isinstance(value, dict) else value)
+        if not math.isfinite(value) or not 0 <= value <= 100:
+            raise ValueError(f"invalid GPU utilization: {name}={value}")
+        values.append(value)
+    return tuple(values)
+
+
+def _gpu_load_ready(metrics, others, max_utilization):
+    gfx, umc = _gpu_activity(metrics)
+    if max_utilization == 0:
+        return gfx == 0 and umc == 0 and not others
+    return gfx < max_utilization and umc < max_utilization
+
+
 def select_idle_gpu(*, candidates=None, arches=("gfx942", "gfx950"), required_ptl="current",
-                    stable_samples=3, record_path=None):
-    """Scan eligible physical GPUs; never set policy or interrupt other jobs."""
+                    stable_samples=3, record_path=None, max_utilization=0.0):
+    """Select a strict-idle or explicitly allowed low-load GPU without setters."""
     global _GPU_LEASE, _GPU_SELECTION
     if stable_samples < 1:
         raise ValueError("stable_samples must be positive")
+    if not math.isfinite(max_utilization) or not 0 <= max_utilization <= 100:
+        raise ValueError("max GPU utilization must be finite and between 0 and 100")
     started = time.perf_counter()
     devices = _gpu_records(_smi("static", "--asic", "--bus", "--limit"))
     allowed = set(devices) if candidates is None else set(candidates)
@@ -621,6 +641,7 @@ def select_idle_gpu(*, candidates=None, arches=("gfx942", "gfx950"), required_pt
             log.flush()
 
     record({"event": "inventory", "eligible": eligible, "rejected": rejected,
+            "max_gpu_utilization": max_utilization, "require_no_other_processes": max_utilization == 0,
             "old_visibility": {key: os.environ.get(key) for key in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")}})
     try:
         command = [SMI, "metric", "--gpu", *(str(i) for i in eligible), "--usage", "--csv", "--watch", "5"]
@@ -656,7 +677,7 @@ def select_idle_gpu(*, candidates=None, arches=("gfx942", "gfx950"), required_pt
                 if i not in processes or not processes[i].get("process_list"):
                     raise RuntimeError(f"GPU {i}: missing process status")
                 others = other_processes(processes[i], os.getpid())
-                quiet = float(metrics["gfx_activity"]) == 0 and float(metrics["umc_activity"]) == 0 and not others
+                quiet = _gpu_load_ready(metrics, others, max_utilization)
                 stable[i] = stable[i] + 1 if quiet else 0
                 busy[i] = others
             record({"event": "sample", "metrics": batch, "other_processes": busy, "consecutive_idle": stable})
@@ -670,7 +691,7 @@ def select_idle_gpu(*, candidates=None, arches=("gfx942", "gfx950"), required_pt
                     lease.close()
                     continue
                 try:
-                    ensure_idle(eligible[i]["bdf"])
+                    selection_load = ensure_idle(eligible[i]["bdf"], max_utilization=max_utilization)
                     current = _gpu_records(_smi("static", "--gpu", eligible[i]["bdf"], "--limit"))
                     limits = next(iter(current.values()))["limit"]
                     if (limits.get("ptl_state"), limits.get("ptl_format")) != (
@@ -685,6 +706,8 @@ def select_idle_gpu(*, candidates=None, arches=("gfx942", "gfx950"), required_pt
                 _GPU_SELECTION = {**eligible[i], "logical_gpu": 0, "scan_pool": list(eligible),
                                   "selection_seconds": time.perf_counter() - started,
                                   "stable_samples": stable_samples, "required_ptl": required_ptl,
+                                  "max_gpu_utilization": max_utilization, "load_at_selection": selection_load,
+                                  "require_no_other_processes": max_utilization == 0,
                                   "local_lock_held": True, "scheduler_reserved": False}
                 record({"event": "selected", **_GPU_SELECTION})
                 return dict(_GPU_SELECTION)
@@ -714,10 +737,12 @@ def activate_selected_gpu(selection):
     actual = f"{prop.pci_domain_id:04x}:{prop.pci_bus_id:02x}:{prop.pci_device_id:02x}.0"
     if actual != selection["bdf"]:
         raise RuntimeError(f"physical GPU mapping mismatch: expected {selection['bdf']}, got {actual}")
-    require_idle_device()
+    activation_load = require_idle_device(max_utilization=selection["max_gpu_utilization"])
     selection["bdf_verified"] = True
+    selection["activation_load"] = activation_load
     if _GPU_SELECTION is not None:
         _GPU_SELECTION["bdf_verified"] = True
+        _GPU_SELECTION["activation_load"] = activation_load
 
 
 def other_processes(data, own_pid):
@@ -739,17 +764,29 @@ def other_processes(data, own_pid):
     return others
 
 
-def ensure_idle(device="0"):
+def ensure_idle(device="0", *, max_utilization=0.0, check_utilization=True):
     data = json.loads(subprocess.check_output([SMI, "process", "--gpu", device, "--json"], text=True, timeout=15))
     others = other_processes(data, os.getpid())
-    if others:
+    snapshot = {"time_utc": datetime.now(timezone.utc).isoformat(), "device": device,
+                "other_processes": others, "max_gpu_utilization": max_utilization}
+    if max_utilization > 0:
+        usage = next(iter(_gpu_records(_smi("metric", "--gpu", device, "--usage")).values()))["usage"]
+        gfx, umc = _gpu_activity(usage)
+        snapshot.update(gfx_activity=gfx, umc_activity=umc, utilization_gate_checked=check_utilization)
+        if check_utilization and not _gpu_load_ready(usage, others, max_utilization):
+            raise RuntimeError(f"GPU {device} must have gfx/UMC below {max_utilization}%: {gfx}/{umc}%")
+    elif others:
         raise RuntimeError(f"GPU {device} has another process; refusing idle-guarded benchmark: {others}")
+    return snapshot
 
 
-def require_idle_device():
+def require_idle_device(*, max_utilization=0.0):
     prop = torch.cuda.get_device_properties(0)
     bdf = f"{prop.pci_domain_id:04x}:{prop.pci_bus_id:02x}:{prop.pci_device_id:02x}.0"
-    ensure_idle(bdf)
+    # In low-load mode the threshold gates selection/start, not our own measured
+    # workload. Keep boundary telemetry without rejecting resident processes or
+    # attributing our just-finished GPU activity to somebody else.
+    return ensure_idle(bdf, max_utilization=max_utilization, check_utilization=False)
 
 
 @contextmanager
@@ -993,6 +1030,9 @@ def parse_args(argv=None):
     parser.add_argument("--required-ptl", choices=("current", "VECTOR,F8", "VECTOR,BF16"),
                         default=os.environ.get("PYHIP_MHA_REQUIRED_PTL", "current"),
                         help="select only GPUs ALREADY using this policy; never sets hardware")
+    parser.add_argument("--max-gpu-utilization", type=float,
+                        default=os.environ.get("PYHIP_MHA_MAX_GPU_UTILIZATION", "0"),
+                        help="0: strict idle/no other processes; positive: start below this gfx/UMC percent, allowing resident processes")
     parser.add_argument("--verbose-runs", action="store_true", help="print every buffer/sample; JSON always retains all samples")
     parser.add_argument("--output", type=Path, help="optional JSON plus summary Markdown; use a new filename")
     args = parser.parse_args(argv)
@@ -1002,6 +1042,10 @@ def parse_args(argv=None):
         parser.error("--gpu-pool requires auto/current and nonnegative indices")
     if args.gpu_pool is not None and args.gpu == "current":
         args.gpu = "auto"
+    if not math.isfinite(args.max_gpu_utilization) or not 0 <= args.max_gpu_utilization <= 100:
+        parser.error("max-gpu-utilization must be finite and between 0 and 100")
+    if args.max_gpu_utilization > 0 and args.gpu == "current":
+        parser.error("max-gpu-utilization requires auto or a physical GPU so the starting load is checked")
     if min(args.run_count, args.repeat, args.buffers) < 1 or args.warmup < 0:
         parser.error("run-count/repeat/buffers must be positive; warmup must be nonnegative")
     available = {spec.id for name, specs in PERF_SUITES.items() if args.suite in ("all", name) for spec in specs}
@@ -1022,7 +1066,11 @@ def run(args, selected):
     report = {"complete": False, "environment": environment(), "config": {**vars(args), "output": str(args.output) if args.output else None},
               "wall_time_s": {"idle_wait_s": getattr(args, "idle_wait_s", 0.0)},
               "git_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[3], text=True).strip(),
-              "measurement_scope": "idle-guarded diagnostic; not a scheduler reservation",
+              "measurement_scope": (f"low-load-start diagnostic (gfx/UMC < {args.max_gpu_utilization}%); other processes allowed; not exclusive"
+                                    if args.max_gpu_utilization > 0 else "idle-guarded diagnostic; not a scheduler reservation"),
+              "gpu_load_policy": {"max_gpu_utilization": args.max_gpu_utilization,
+                                  "require_no_other_processes": args.max_gpu_utilization == 0,
+                                  "threshold_scope": "selection/start only; case boundaries recorded" if args.max_gpu_utilization > 0 else "strict process guards"},
               "timer": "pyhip.cudaPerf GPU event interval; per-call time; includes launch gaps",
               "protocol": {"warmup": args.warmup, "run_count": args.run_count, "repeat": args.repeat,
                            "input_buffers": args.buffers, "samples_per_candidate": args.run_count * args.buffers,
@@ -1038,17 +1086,18 @@ def run(args, selected):
                 report["records"].append({"suite": suite, "workload": spec.workload.to_dict(), "results": [],
                                            "unavailable": {"architecture": f"requires {spec.arches}"}})
                 continue
-            require_idle_device()
+            load_before = require_idle_device(max_utilization=args.max_gpu_utilization)
             backends, references = PERF_CANDIDATES[suite](spec, report["environment"]["arch"])
             row = run_case(spec.workload, backends, reference_factories=references,
                            run_count=args.run_count, warmup=args.warmup, repeat=args.repeat,
                            buffers=args.buffers, verbose_runs=args.verbose_runs)
             row["suite"] = suite
             row["reference_names"] = [name for name, _ in references]
+            row["load_before"] = load_before
             report["records"].append(row)
+            row["load_after"] = require_idle_device(max_utilization=args.max_gpu_utilization)
             if args.output:
                 save(args.output, report)
-            require_idle_device()
         if not any(row["results"] for row in report["records"]):
             raise RuntimeError("no supported candidate ran")
         report["complete"] = True
@@ -1072,7 +1121,8 @@ def run(args, selected):
                       for row in report["records"] for r in row["results"] if r["backend"].startswith("aiter")]
         args.output.with_suffix(".md").write_text(
             "# Quick MHA accuracy/performance\n\n"
-            f"cudaPerf events; {args.buffers} independent buffers, {args.run_count} full rounds; acc=max across buffers. "
+            + report["measurement_scope"] + "\n\n"
+            + f"cudaPerf events; {args.buffers} independent buffers, {args.run_count} full rounds; acc=max across buffers. "
             "Bandwidth is logical Q/K/V/O GB/s; gather+CK adds full KV read/write, not a hardware counter.\n\n"
             + table + "\n\n## AITER dispatch\n\n" + "\n".join(dispatches or ["AITER disabled or unavailable."]) + "\n")
     return report
@@ -1096,7 +1146,8 @@ def main(argv=None):
             log.parent.mkdir(parents=True, exist_ok=True)
         arches = tuple(sorted({arch for _, spec in selected for arch in spec.arches}))
         selection = select_idle_gpu(candidates=[int(args.gpu)] if args.gpu.isdecimal() else args.gpu_pool,
-                                    arches=arches, required_ptl=args.required_ptl, record_path=log)
+                                    arches=arches, required_ptl=args.required_ptl, record_path=log,
+                                    max_utilization=args.max_gpu_utilization)
         activate_selected_gpu(selection)
     args.idle_wait_s = time.perf_counter() - wait_start if selecting else 0.0
     return run(args, selected)
@@ -1106,12 +1157,17 @@ def main(argv=None):
 def native_gpu_selection():
     # Collection remains GPU-free. Setup occurs only when native tests run.
     gpu = os.environ.get("PYHIP_MHA_GPU", "current")
+    max_utilization = float(os.environ.get("PYHIP_MHA_MAX_GPU_UTILIZATION", "0"))
+    if not math.isfinite(max_utilization) or not 0 <= max_utilization <= 100:
+        raise ValueError("PYHIP_MHA_MAX_GPU_UTILIZATION must be finite and between 0 and 100")
+    if gpu == "current" and max_utilization > 0:
+        raise ValueError("low-load pytest requires PYHIP_MHA_GPU=auto or a physical GPU index")
     if gpu != "current":
         if gpu != "auto" and not gpu.isdecimal():
             raise ValueError("PYHIP_MHA_GPU must be auto/current/physical index")
         selection = select_idle_gpu(candidates=None if gpu == "auto" else [int(gpu)],
                                     required_ptl=os.environ.get("PYHIP_MHA_REQUIRED_PTL", "current"),
-                                    record_path=os.environ.get("PYHIP_MHA_SELECTION_LOG"))
+                                    record_path=os.environ.get("PYHIP_MHA_SELECTION_LOG"), max_utilization=max_utilization)
         activate_selected_gpu(selection)
 
 

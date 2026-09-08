@@ -303,7 +303,7 @@ pytest用`PYHIP_MHA_GPU`/`PYHIP_MHA_REQUIRED_PTL`选卡；第6节已设为auto/V
 源码/依赖变化后的异常输出、加载错误或反复编译，应检查缓存兼容性和失效；首次/新shape编译正常。
 不缓存正确性结论，不加载不可信缓存，不通过减少10-buffer或跳过检查掩盖问题。
 
-MI308不能验证gfx950原生执行；MI350当前规则及待验证范围见 [README.950.md](README.950.md)，不能把skip视作pass。
+MI308不能验证gfx950原生执行；本机gfx950实测范围见 [README.355.md](README.355.md)（实际MI350X、低负载启动，非独占），不能把skip视作pass。
 10-buffer增加显存用量，OOM应如实报告，不自动缩小shape或buffer数。跨机记录见 [changes.md](changes.md)。
 
 JSON的`wall_time_s`区分选卡和执行，每case另列输入准备、FP32参考、参考设置/首调、输出校验、dispatch profiling、warmup和measurement阶段。

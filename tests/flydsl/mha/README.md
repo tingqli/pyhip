@@ -4,7 +4,8 @@
 先逐buffer检查FP32参考O与重复逐位一致性，再报告 **acc、时间、TFLOPS、逻辑GB/s**；全程不测LSE。
 正常运行不打印选卡、准备、校验、轮次或阶段耗时等流程信息；性能表及`--verbose-runs`逐样本性能输出保持不变。
 出错仍输出异常诊断；阶段耗时、设备映射、dispatch和跳过原因保存在JSON，选卡采样保存在idle JSONL。
-平台环境、当前范围及历史证据见 [README.308.md](README.308.md) 和 [README.950.md](README.950.md)。
+平台环境、当前范围及历史证据见 [README.308.md](README.308.md) 和 [README.355.md](README.355.md)。
+本机gfx950低负载重测见 [README.355.md](README.355.md)：按用户允许的gfx/UMC低于2%条件启动，CLI与性能pytest各自48候选全部通过；实际设备为MI350X，非独占。
 
 **已启用编译缓存，在排查问题时需要检查缓存是否出现问题**。沿用FlyDSL原生默认缓存，无MHA私有持久缓存层或额外缓存开关；缓存不替代正确性检查。
 
@@ -24,9 +25,9 @@
 - **BF16 dense适配已删除，三个H8/HK8、P32/P64的原MHA形状保留**，仅在gfx942运行并与AITER比较。
 - **FP8外部BN32参考及其加载/SHA适配已删除，全部7个FP8场景保留**；各类独立FP32正确性参考不受影响。
 - SWA的两个KV128K重复case已删除，独立shape覆盖不变；通用`--repeat`参数仍保留。
-- gfx950的当前规则展开为14个可运行case、48个候选；其余10个case因架构跳过。这里只核对规则，未做新gfx950原生复测。
+- gfx950已按低于2%启动条件完成14个可运行case、48个候选、2400样本；其余10个case因架构跳过，完整值见[README.355.md](README.355.md)。
 
-单文件合并后CLI与性能pytest各自完整通过：**24 case / 43候选 / 2150 event样本**；功能pytest为12通过、2跳过，性能pytest为24通过。
+MI308单文件合并后CLI与性能pytest各自完整通过：**24 case / 43候选 / 2150 event样本**；功能pytest为12通过、2跳过，性能pytest为24通过。
 完整性能数据及计时直接列于 [README.308.md](README.308.md)。
 
 ## 当前CLI
@@ -54,6 +55,7 @@ OUT=$(mktemp -d "$PWD/tests/flydsl/mha/results/mha-three-suites.XXXXXX")
 | `--gpu auto` / `current` / `N` | CLI默认`auto`（可由`PYHIP_MHA_GPU`覆盖）；自动选卡 / 保留现有可见设备 / 等待物理SMI编号N |
 | `--gpu-pool 1,2,3` | 限制自动选择的物理卡池；不能与数字`--gpu`并用，配合`current`会转为自动选择 |
 | `--required-ptl current` / `VECTOR,F8` / `VECTOR,BF16` | 默认`current`不筛策略；选卡时只筛选**已启用**指定策略的卡，绝不设置硬件 |
+| `--max-gpu-utilization 2` | 显式允许低负载启动：gfx/UMC均严格低于2%，允许驻留进程；默认0保持原严格空闲规则。pytest用`PYHIP_MHA_MAX_GPU_UTILIZATION` |
 | `--verbose-runs` | 打印每个计时样本的acc/时间/TFLOPS/带宽，不恢复流程打印；不指定也会保存全部原始样本 |
 
 例如`--suite bf16-mha --case bf16-full-d128`只运行该Full场景，而不是整个BF16集合；在MI308仍比较自有BF16与AITER。
@@ -63,9 +65,12 @@ OUT=$(mktemp -d "$PWD/tests/flydsl/mha/results/mha-three-suites.XXXXXX")
 不再通过旧的后端、preset、shape或参考开关拼接场景。只做正确性检查应运行普通pytest。
 不支持的架构记为skip/`unavailable`；若一个候选也没运行，CLI失败，不将空报告当通过。
 
-自动/指定物理卡选择均只读检查：连续3次、5秒间隔的gfx/UMC空闲且无其他进程；忙时无截止时间等待。
+自动/指定物理卡选择默认只读检查：连续3次、5秒间隔的gfx/UMC空闲且无其他进程；忙时无截止时间等待。
+显式正门槛模式则连续3次gfx/UMC均严格小于门槛即可启动，不要求进程为空；case前后仍记录利用率/进程，
+但不以自身测量产生的活动拒绝结果。阈值只约束开始时刻，结果标为非独占，不宣称整个测量期间低负载。
 选中后按ROCr UUID映射并核验BDF，整轮固定该卡。自动选择会覆盖可见设备变量，调度器分配场景须限定获分配卡池。
 `--gpu current`不进行选卡/PTL筛选或稳定空闲等待，但性能case前后仍检查其他进程。
+正利用率门槛必须配合auto或物理GPU编号，不能用current绕过起始负载检查。
 有输出时自动选卡另存同名idle JSONL日志；不覆盖已有报告或选卡日志。用户级锁不等于调度器独占预约。
 
 ## pytest：默认功能，性能显式启用
@@ -83,6 +88,7 @@ PYHIP_MHA_GPU=auto PYHIP_MHA_PERF=1 PYHIP_MHA_OUTPUT="$OUT/pytest-perf" "$PY" -m
 原pytest自定义开关及marker已移除，改用环境变量和标准pytest筛选，不再需要本目录的conftest插件。
 pytest选卡使用`PYHIP_MHA_GPU`（未设置时为`current`，与CLI默认不同）及`PYHIP_MHA_REQUIRED_PTL`，
 可用`PYHIP_MHA_SELECTION_LOG`保存选卡日志。pytest需指定物理卡时设置`PYHIP_MHA_GPU=N`；候选池选项只属于CLI。
+低负载pytest使用`PYHIP_MHA_GPU=auto PYHIP_MHA_MAX_GPU_UTILIZATION=2`；默认0仍采用原严格空闲条件。
 收集阶段和CLI列表均不初始化GPU。
 
 ## 实现与职责
