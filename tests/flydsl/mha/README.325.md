@@ -1,9 +1,10 @@
 # MI325X Attention：三个性能集与10-buffer复现
 
 更新：2026-09-08。**MI325X / gfx942 / 304 CU；PTL N/A；不测LSE。**
-按 [README.308.md](README.308.md) 的三个性能集完成本轮验证：CLI与性能pytest各自 **24 case、43候选、2150 event样本，全部正确性通过**；完整CLI数据直接列于第2节。
-BF16 dense和FP8外部BN32适配均已移除，原始shape保留；FP8仅自有LDS，BF16/SWA小shape只测自有kernel。
-功能pytest **12通过、2个gfx950 persistent跳过**。性能pytest子进程成功，外围脚本收尾错误独立记录于第8节，不改写原始证据。
+本轮仅使用 [test_mha_pa.py](test_mha_pa.py) 的既有BF16功能与性能项，验证优化提交 **`e7b4be8`**：**11通过、2个gfx950 persistent跳过、25项未选择**。
+其中BF16性能 **9 case、16候选、800 event样本全部正确性通过**，新数据见第2.1节；功能部分为2通过、2跳过。
+**FP8/SWA本轮未重测**，第2.2–2.3节保留明确标注的历史数据；不把三节合计称为本轮43候选验证。
+按用户要求不扩展范围：不新增shape、参考、LSE/ATT专项或独立测试入口，不追加CLI复测。
 
 ## 1. 环境与结果
 
@@ -18,18 +19,19 @@ BF16 dense和FP8外部BN32适配均已移除，原始shape保留；FP8仅自有L
 | 本轮设备 | 物理GPU3，BDF `0000:79:00.0`，ROCr UUID `GPU-9ff0c5f642c689c2`；映射为逻辑GPU0并核验 |
 | PTL / 功率限制 | N/A / 1000W，只读；不套用MI308的Enabled/VECTOR,F8 |
 
-**版本边界：本轮实测为 `4adaf81` 加MI325本地选卡/守卫/证据适配，源码已保存为 [实测快照](results/mi325_singlefile_20260908T031247Z/tested-source/test_mha_pa.py)。**
-测试结束后，当前分支`tmp-main`已快进到`lc/tmp-main`的 **`1f741754ab9821c935bf98f6b8190f8983a4f443`**；[当前入口](test_mha_pa.py)与远端一致，尚未按这个新提交做MI325原生复测。
-下文复现命令明确使用已测快照，不把旧数值重标为最新远端验证。
+**本轮BF16实测提交：`e7b4be8841b59435df317f6a8fa39ae12d677120`。**
+生产 [mha_pa_bf16_942.py](mha_pa_bf16_942.py) SHA256为 `84feac1fb38f834adedd48327998cf582af36803f2cb01cbba320dc0c772804f`，与该提交一致。
+仅在指定测试入口修正本机KFD/PCI UUID映射；没有改动生产kernel、输入、参考、参数集合或计时循环。
+第2.2–2.3节仍来自`4adaf81`加当时MI325适配的历史轮次，不代表FP8/SWA在`e7b4be8`上重新验证。
 
 AITER使用已有固定commit的editable安装，工作盘JIT副本见第6节；源码/依赖清理后须按固定版本恢复，不能静默省略参考。
-沿用用户授权：**只使用GPU3，gfx/UMC均低于2%，允许驻留进程；不是独占测试。**
-根盘满时按授权使用工作盘HOME/临时/缓存存储，不修改PTL、时钟、功率或NUMA，不reset、不终止其他任务，不commit/push。
+沿用用户授权：**只使用GPU3，连续3次gfx/UMC均低于2%后启动，允许驻留进程；不是独占测试。**
+继续使用已准备的工作盘HOME/临时/原生缓存，不清空缓存或重新安装依赖；不修改PTL、时钟、功率或NUMA，不reset、不终止其他任务，不commit/push。
 
 ## 2. 完整性能数据与测试耗时
 
-以下为 **2026-09-08 03:49:34–04:07:11 UTC** 同一轮CLI实测，未混入旧轮次或pytest的性能数值。
-完整列出全部43条候选：BF16 16条、FP8 7条、SWA 20条，包括全部小shape；全部正确性通过。
+**第2.1节为2026-09-08 08:21:51–08:23:06 UTC同一个pytest进程生成的9份BF16报告，共16条候选；第2.2–2.3节是保留的历史FP8/SWA数据。**
+本轮只更新BF16，不拼接新旧样本、不选择较快轮次；历史值不计入本轮测试计数。
 每行时间为10个独立buffer、5轮共50个event的每调用中位数，`acc`为10组最大值；时间/TFLOPS/逻辑GB/s保留三位小数。
 逻辑GB/s不是实测HBM带宽；AITER prepared不含gather，`aiter_gather`包含完整gather+CK。FP8仅自有LDS，无外部参考。
 
@@ -37,26 +39,30 @@ AITER使用已有固定commit的editable安装，工作盘JIT副本见第6节；
 
 | case | backend | acc | 时间µs | TFLOPS | 逻辑GB/s |
 |---|---|---:|---:|---:|---:|
-| `bf16-smoke-d128` | `bf16_942` | 2.690568e-06 | 29.265 | 2.347 | 20.452 |
-| `bf16-smoke-d192` | `bf16_942` | 2.675029e-06 | 32.529 | 2.640 | 23.000 |
-| `bf16-full-d128` | `bf16_942` | 2.868857e-06 | 549.629 | 394.225 | 155.029 |
-| `bf16-full-d128` | `aiter` | 2.654881e-06 | 411.421 | 526.657 | 207.108 |
-| `bf16-full-d192` | `bf16_942` | 2.877927e-06 | 705.124 | 384.113 | 151.052 |
-| `bf16-full-d192` | `aiter` | 2.664986e-06 | 461.296 | 587.144 | 230.895 |
-| `bf16-causal-d128` | `bf16_942` | 2.424525e-06 | 9928.882 | 442.968 | 28.726 |
-| `bf16-causal-d128` | `aiter` | 2.249573e-06 | 7859.980 | 559.566 | 36.287 |
-| `bf16-causal-d192` | `bf16_942` | 2.425113e-06 | 12386.871 | 443.835 | 28.782 |
-| `bf16-causal-d192` | `aiter` | 2.247466e-06 | 8585.956 | 640.316 | 41.523 |
-| `bf16-mha-long-p32` | `bf16_942` | 2.780988e-06 | 4475.493 | 383.865 | 37.487 |
-| `bf16-mha-long-p32` | `aiter` | 2.697695e-06 | 3369.104 | 509.924 | 49.797 |
-| `bf16-mha-short-p32` | `bf16_942` | 2.772983e-06 | 369.998 | 290.202 | 141.700 |
-| `bf16-mha-short-p32` | `aiter` | 2.571839e-06 | 256.887 | 417.981 | 204.092 |
-| `bf16-mha-short-p64` | `bf16_942` | 2.776314e-06 | 377.430 | 284.488 | 138.910 |
-| `bf16-mha-short-p64` | `aiter` | 2.572041e-06 | 255.446 | 420.340 | 205.244 |
+| `bf16-smoke-d128` | `bf16_942` | 2.690568e-06 | 26.400 | 2.602 | 22.672 |
+| `bf16-smoke-d192` | `bf16_942` | 2.675029e-06 | 31.848 | 2.696 | 23.492 |
+| `bf16-full-d128` | `bf16_942` | 2.868857e-06 | 434.135 | 499.102 | 196.272 |
+| `bf16-full-d128` | `aiter` | 2.654881e-06 | 413.884 | 523.523 | 205.876 |
+| `bf16-full-d192` | `bf16_942` | 2.877927e-06 | 756.421 | 358.064 | 140.809 |
+| `bf16-full-d192` | `aiter` | 2.664986e-06 | 481.787 | 562.173 | 221.075 |
+| `bf16-causal-d128` | `bf16_942` | 2.424525e-06 | 8343.023 | 527.169 | 34.186 |
+| `bf16-causal-d128` | `aiter` | 2.249573e-06 | 8046.235 | 546.614 | 35.447 |
+| `bf16-causal-d192` | `bf16_942` | 2.425113e-06 | 12423.357 | 442.531 | 28.697 |
+| `bf16-causal-d192` | `aiter` | 2.247466e-06 | 8800.894 | 624.678 | 40.509 |
+| `bf16-mha-long-p32` | `bf16_942` | 2.780988e-06 | 3773.531 | 455.273 | 44.460 |
+| `bf16-mha-long-p32` | `aiter` | 2.697695e-06 | 3473.359 | 494.618 | 48.303 |
+| `bf16-mha-short-p32` | `bf16_942` | 2.772983e-06 | 308.205 | 348.386 | 170.110 |
+| `bf16-mha-short-p32` | `aiter` | 2.571839e-06 | 260.834 | 411.658 | 201.005 |
+| `bf16-mha-short-p64` | `bf16_942` | 2.776314e-06 | 304.960 | 352.093 | 171.920 |
+| `bf16-mha-short-p64` | `aiter` | 2.572041e-06 | 259.991 | 412.991 | 201.656 |
 
-七个非小 shape 的自有 BF16 比本轮 AITER prepared ASM **慢 26.32%–52.86%**；没有指定 dense 参考，不能沿用旧 dense gate 的通过/失败结论。
+本轮自有BF16最高 **527.169 TFLOPS**。相对同shape AITER prepared ASM，D128 Full/Causal分别慢 **4.89% / 3.69%**，D192 Full/Causal分别慢 **57.00% / 41.16%**。
+H8/HK8的long-p32、short-p32、short-p64分别慢 **8.64% / 18.16% / 17.30%**；七个有参考的case均未快于AITER。
+正确性通过不等于达到roofline或性能门槛；本轮没有指定dense参考，也没有追加前后kernel对照测试。
 
 ### 2.2 FP8 MHA：全部7条
+
+**历史保留，未在本轮运行。** 以下为`4adaf81`轮次2026-09-08 03:49:34–04:07:11 UTC的CLI数值，来源保存在 [历史原始报告](results/mi325_bf16_e7b4be8_20260908T081608Z/history/all.json)。
 
 | case | backend | acc | 时间µs | TFLOPS | 逻辑GB/s |
 |---|---|---:|---:|---:|---:|
@@ -68,12 +74,12 @@ AITER使用已有固定commit的editable安装，工作盘JIT副本见第6节；
 | `fp8-full-tensor-d192` | `fp8_942` | 0.0003830103 | 279.362 | 960.889 | 265.676 |
 | `fp8-causal-tensor-d192` | `fp8_942` | 0.0002732739 | 6464.434 | 850.457 | 37.956 |
 
-所有 FP8 仅与独立 FP32 O 检查正确性，**没有外部性能参考**，不宣称本轮相对 BN32 加速。token/tensor 两个 D128 Full 的 H/KV 也不同，不能只归因于 scale 模式。
+历史FP8仅与独立FP32 O检查正确性，**没有外部性能参考**；本轮不宣称FP8重测或相对BN32加速。两个D128 Full的H/KV也不同，不能只归因于scale模式。
 
 ### 2.3 SWA：全部20条（已去重）
 
-两个KV128K重复参数项已删除；保留D128/D192各一个原用例，独立shape覆盖不变。
-当前SWA为8个case、20候选，整套24个case、43候选、2150样本；不从重复测量中挑较快值。
+**历史保留，未在本轮运行。** 数值与第2.2节来自同一份历史CLI，不改写原样本。
+两个KV128K重复参数项已删除，仍为8个独立case、20候选；这些不计入本轮BF16的9 case/16候选/800样本。
 
 | case | backend | acc | 时间µs | TFLOPS | 逻辑GB/s |
 |---|---|---:|---:|---:|---:|
@@ -98,7 +104,7 @@ AITER使用已有固定commit的editable安装，工作盘JIT副本见第6节；
 | `swa-kv131072-d192` | `aiter` | 1.89498e-05 | 200.603 | 107.888 | 1254.509 |
 | `swa-kv131072-d192` | `aiter_gather` | 1.89498e-05 | 359.883 | 60.138 | 1165.463 |
 
-六个长 shape 的 direct 比完整 gather+CK **延迟低 54.01%–69.86%**；prepared CK 不含 gather，仅作分解参考。
+历史六个长shape的direct比完整gather+CK **延迟低54.01%–69.86%**；不是本轮SWA性能结论。prepared CK不含gather，仅作分解参考。
 gather 逐次搬运完整 KV，不裁去窗口外前缀；实际为一个 Triton gather 加一个 CK dispatch，一对 event 覆盖两段。
 每组 20 个 K/V workspace 地址及 10 个 slot mapping 地址独立，prepared 与 gather 的 workspace 也不复用。
 
@@ -106,21 +112,15 @@ gather 逐次搬运完整 KV，不裁去窗口外前缀；实际为一个 Triton
 
 | suite | case执行数 | 候选数 | event样本数 | case总wall time之和（秒） |
 |---|---:|---:|---:|---:|
-| `bf16-mha` | 9 | 16 | 800 | 155.662 |
-| `fp8-mha` | 7 | 7 | 350 | 147.748 |
-| `swa` | 8 | 20 | 1000 | 121.747 |
-| **合计** | **24** | **43** | **2150** | **425.157** |
+| `bf16-mha` | 9 | 16 | 800 | 23.314 |
+| **本轮合计** | **9** | **16** | **800** | **23.314** |
 
-CLI进程总耗时 **1056.893秒**；其中选卡及激活 **11.149秒**、执行 **1043.253秒**。
-功能pytest **12通过、2跳过**，suite **183.127秒**、进程 **184.370秒**；性能pytest **24通过**，suite **1058.326秒**、进程 **1060.068秒**。
-进程时间包含选卡/执行，不能再次累加；分类wall time之和不含case外守卫、环境查询和保存。
-三次Python成功子进程共2301.331秒，不是含排障和文档整理的会话总耗时，也不将外围脚本收尾错误称为成功。
-
-本机已测适配比MI308多做case前后和计时前的稳定等待：CLI有72个守卫窗口、260条采样，其中44条不满足阈值后继续等待。
-守卫累计956.695秒；其中计时前守卫345.601秒，外层同步/读取计入阶段后为348.890秒，已包含在425.157秒case合计中。
-性能pytest也有72个窗口、260条采样、44条阈值拒绝；功能pytest有12个窗口、36条采样。
-近期自身计算也会影响采样，不能把拒绝样本全归因于他人任务；等待均在event外，不把wall time差异当作kernel性能变化。
-全部case阶段和pytest逐项耗时见 [验证汇总](results/mi325_singlefile_20260908T031247Z/SUMMARY.md) 及同目录CSV，正文不重复展开24行阶段表。
+本轮同一个pytest进程执行已有BF16功能+性能：**11通过、2跳过、25项未选择**，suite **73.344秒**、进程 **74.922秒**，退出码0。
+功能部分2通过/2个gfx950跳过，性能部分9项全部通过；没有独立CLI二次计时，没有执行FP8/SWA或额外专项。
+选卡 **35.718秒**已包含在进程时间内：共8条采样，5条未满足门槛，最后3条gfx/UMC均0%后启动；忙时没有总等待截止时间。
+性能case前后共18条负载记录，最大gfx12%/UMC1%；门槛只限制选卡/开始，不把自己的计算活动作为争用错误，不保证测量期间持续低于2%。
+case wall合计不含功能测试、选卡、环境查询和报告保存，不能与进程时间再次相加，也不等于event时间之和。
+完整逐case阶段、原始样本与JUnit见 [本轮BF16结果](results/mi325_bf16_e7b4be8_20260908T081608Z/bf16-audit.json) 和 [pytest日志](results/mi325_bf16_e7b4be8_20260908T081608Z/pytest.log)。
 
 ## 3. 默认10-buffer协议
 
@@ -135,7 +135,7 @@ CLI进程总耗时 **1056.893秒**；其中选卡及激活 **11.149秒**、执�
 - JIT、FP32参考、量化、预先布局转换与workspace分配在计时外；gather总路径每次转换在计时内。
 	counter初始化、辅助launch和间隙在event内，`cudaPerf` GPU spin在起始event前。10-buffer不等于强制清cache。
 
-两轮性能已分别审计：每轮430个buffer精度检查、860次额外逐位检查、2150个event，所有buffer地址、每轮0–9索引和中位数匹配。
+本轮BF16性能已离线审计：**160个buffer精度检查、320次额外逐位检查、800个event**，输入Q/K/V/scale/indices及各候选O地址独立，每轮0–9索引和所有中位数匹配。
 这不是额外GPU pytest项，不把离线审计计入功能测试通过数。
 
 ## 4. 参考与SWA路径
@@ -151,7 +151,7 @@ CLI进程总耗时 **1056.893秒**；其中选卡及激活 **11.149秒**、执�
 声明参考缺依赖或首调失败会停止，不静默省略；数值错误始终失败。BF16 dense/FP8 BN32适配已删除，独立FP32 O检查仍覆盖全部buffer。
 gather不裁SWA前缀，不用两个独立均值相加，不进入生产dispatch；运行时检查完整gather内容、独立workspace及两个dispatch。
 
-本轮BF16实际命中ASM `fmha_fwd_hd128_bf16_rtna_group` / `fmha_fwd_hd192x128_bf16_rtna_group`及对应causal变体；SWA命中CK `BlockFmhaPipelineQRKSVSAsync`。
+本轮BF16实际命中ASM `fmha_fwd_hd128_bf16_rtna_group` / `fmha_fwd_hd192x128_bf16_rtna_group`及对应causal变体；SWA的CK `BlockFmhaPipelineQRKSVSAsync`记录仅属于历史轮次。
 完整dispatch名称保存在JSON，不能仅凭AITER入口名推断具体实现。BF16完整调用中的counter初始化未从event中扣除。
 
 ## 5. 指标规则
@@ -168,72 +168,47 @@ gather不裁SWA前缀，不用两个独立均值相加，不进入生产dispatch
 ## 6. 当前CLI复现
 
 从Git根、同一个专用bash终端执行，使用已有环境，无需重装GPU依赖。环境准备后，每条测试命令均为单行；每轮新建`OUT`，不覆盖旧证据。
-**本节复现第2节已测版本，因此`MHA`明确指向实测源码快照，而不是更新后的远端入口。**
-远端`1f74175`使用`--max-gpu-utilization` / `PYHIP_MHA_MAX_GPU_UTILIZATION`，与快照的参数/等待语义不同；当前远端尚未在MI325复测，本地旧补丁没有重放到它上面。
+**本轮实际使用指定主入口的BF16功能+性能pytest，不建立另一套测试入口。**
+当前使用`--max-gpu-utilization` / `PYHIP_MHA_MAX_GPU_UTILIZATION`的低负载启动语义，不恢复旧快照的逐case稳定等待。
 
 ```bash
 PY=/root/.venvs/pyhip-mha-mi325-quanta-20260907/bin/python
-MHA=tests/flydsl/mha/results/mi325_singlefile_20260908T031247Z/tested-source/test_mha_pa.py
-OUT=$(mktemp -d "$PWD/tests/flydsl/mha/results/mi325-three-suites.XXXXXX")
+MHA=/host_lc/pyhip/tests/flydsl/mha/test_mha_pa.py
+OUT=$(mktemp -d "$PWD/tests/flydsl/mha/results/mi325-bf16.XXXXXX")
 export HOME=/host_lc/pyhip-mha-mi325-storage-20260908/home
 export XDG_CACHE_HOME="$HOME/.cache" TMPDIR=/host_lc/pyhip-mha-mi325-storage-20260908/tmp
 export TMP="$TMPDIR" TEMP="$TMPDIR"
-export PYHIP_MHA_GPU=3 PYHIP_MHA_REQUIRED_PTL=current PYHIP_MHA_IDLE_MAX_UTILIZATION=2
+export PYHIP_MHA_GPU=3 PYHIP_MHA_REQUIRED_PTL=current PYHIP_MHA_MAX_GPU_UTILIZATION=2
 export ROCR_VISIBLE_DEVICES=GPU-9ff0c5f642c689c2 HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0
 export GPU_ARCHS=gfx942 MAX_JOBS=4
 export AITER_JIT_DIR="$XDG_CACHE_HOME/pyhip-mha-mi325-quanta/aiter-jit-gpu3"
 export PATH="$(dirname "$PY"):$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-unset PYTHONPATH COMPILE_ONLY ARCH CUDAPERF PYHIP_MHA_COMPILE_CACHE
-unset FLYDSL_RUNTIME_ENABLE_CACHE FLYDSL_RUNTIME_CACHE_DIR FLYDSL_COMPILE_ONLY FLYDSL_COMPILE_ARCH FLYDSL_DUMP_IR FLYDSL_DUMP_DIR FLYDSL_RUN_ONLY
+unset PYTHONPATH COMPILE_ONLY ARCH CUDAPERF PYHIP_MHA_COMPILE_CACHE PYHIP_MHA_IDLE_MAX_UTILIZATION
+unset FLYDSL_RUNTIME_ENABLE_CACHE FLYDSL_RUNTIME_CACHE_DIR FLYDSL_COMPILE_ONLY FLYDSL_COMPILE_ARCH FLYDSL_DUMP_IR FLYDSL_DUMP_DIR FLYDSL_RUN_ONLY FLYDSL_RUNTIME_RUN_ONLY
 unset TRITON_CACHE_DIR TORCH_EXTENSIONS_DIR PYHIP_MHA_PERF PYHIP_MHA_OUTPUT PYHIP_MHA_SELECTION_LOG
 
-# GPU-free：仅列出显式case、参数和架构限制。
-"$PY" "$MHA" --list
-
-# 推荐整轮：固定授权GPU3，只选卡一次，同进程执行三套case。
-"$PY" "$MHA" --suite all --gpu 3 --required-ptl current --idle-max-utilization 2 --buffers 10 --run-count 5 --warmup 10 --repeat 1 --output "$OUT/all.json"
-```
-
-也可单独运行某类或精确ID；以下是互相独立的选择示例，完整ID见第7节：
-
-```bash
-"$PY" "$MHA" --suite bf16-mha --output "$OUT/bf16-mha.json"
-"$PY" "$MHA" --suite fp8-mha --output "$OUT/fp8-mha.json"
-"$PY" "$MHA" --suite swa --output "$OUT/swa.json"
-
-# 原dense比较shape仍在，仅自有BF16与AITER两条候选。
-"$PY" "$MHA" --suite bf16-mha --case bf16-mha-long-p32 bf16-mha-short-p32 bf16-mha-short-p64 --output "$OUT/mha-pages.json"
-
-# 四个小shape，仅自有kernel，无AITER、BN32或gather。
-"$PY" "$MHA" --case bf16-smoke-d128 bf16-smoke-d192 swa-w0-d128 swa-w0-d192 --output "$OUT/own-smoke.json"
-
-# 单个FP8案例及完整逐buffer/样本日志。
-"$PY" "$MHA" --suite fp8-mha --case fp8-full-tensor-d192 --verbose-runs --output "$OUT/fp8-tensor-d192.json"
-```
-
-**`--case`是可选场景筛选器**：`--suite`选类别，`--case`从该类别挑选已定义场景，不设置shape、不选择单个实现，也不修改参考逻辑。
-- 不传`--case`：运行所选suite全部场景；例如BF16为9个case、16条候选。
-- `--case bf16-full-d128`：只选Q10240/KV2583、Dq128、H16/HK1、page64、非causal场景，包含自有BF16与AITER。
-- 多个ID用空格分隔，必须精确、不重复且属于所选suite；执行顺序沿用参数集合。`--suite all`可跨类别选取。
-- `--list`只列参数、不初始化GPU；pytest单项选择使用节点ID或`-k`，不是CLI的`--case`。
-
-```bash
-"$PY" "$MHA" --suite bf16-mha --case bf16-full-d128 --output "$OUT/bf16-full-d128.json"
+# 可选GPU-free查询：只列出已有BF16场景。
 "$PY" "$MHA" --suite bf16-mha --list
+
+# 本轮实际方式：仅既有BF16功能与性能项，默认10buffer/5轮/warmup10/repeat1。
+PYHIP_MHA_PERF=1 PYHIP_MHA_OUTPUT="$OUT/performance" PYHIP_MHA_SELECTION_LOG="$OUT/selection.idle.jsonl" "$PY" -m pytest "$MHA" --import-mode=importlib -k 'test_bf16_mha or test_perf_bf16_mha' -q --durations=0 --junitxml="$OUT/tests.xml"
 ```
 
-自定义输入应修改显式`Workload`集合，不恢复旧backend/preset/shape猜测或参考开关。CLI始终检查正确性，buffers/run-count/repeat为正、warmup非负。
-一份根JSON的`records`包含所有选定case，成功后生成同名Markdown；选卡和守卫另存同名idle JSONL，拒绝覆盖已有输出。
+`-k`只选择主文件中的`test_bf16_mha`和`test_perf_bf16_mha`：13个参数项，未选择其他25项。
+性能pytest为每case保存一对JSON/Markdown，独立保存JUnit和选卡日志；不覆盖旧文件。
+CLI的`--suite`/`--case`仅用于选择预定义场景，不改变shape或参考；pytest使用标准`-k`或节点ID，不使用CLI的`--case`。
+本轮没有另外运行CLI；新增/修改shape、候选、参考或专项前必须先确认，不能在复测中自行扩展。
 
-已测快照的严格默认仍要求gfx/UMC为0且无其他进程；本机显式阈值2允许驻留进程，要求连续3次、5秒间隔均严格低于2%。
-除选卡外，每case前后及准备/校验/预热后的正式计时前也等待；健康但忙时无总截止时间，读数失效则失败关闭。
+默认门槛0仍要求gfx/UMC为0且无其他进程；本机显式2允许驻留进程，连续3次、5秒间隔均低于2%才启动，健康但忙时无总等待截止时间。
+正门槛只限制选卡/开始，之后case前后记录负载，不重新等待，也不因自身GPU活动拒绝结果。
 本机仅授权GPU3，不使用不限池的auto选卡；用户级锁不是独占预约，采样不能保证测量期间完全无争用。
-快照按KFD `domain/location_id`匹配BDF取得ROCr UUID，并核验实际torch BDF；PCI sysfs的ASIC serial不能直接当此机ROCr UUID。
+本机适配按KFD `domain/location_id`匹配BDF取得ROCr UUID，并核验实际torch BDF；PCI sysfs的ASIC serial不能直接当此机ROCr UUID。
 
 ## 7. 显式case与pytest范围
 
 统一B1、Dv128、contiguous Q/O、零尾页、seed20260905；除表内注明外，H16/HK1、page64、Q scale为per-token。
 BF16使用unit descales，FP8从BF16源量化；NC为full/noncausal，C为bottom-right causal，BF16/FP8 full和causal无窗口、无sink。
+**本轮只执行第7.1节及BF16功能项；第7.2–7.3节仅保留既有集合说明。**
 
 ### 7.1 BF16 MHA：9 case / 16候选
 
@@ -290,28 +265,19 @@ Full D128两种scale行的H和KV也不同，不能把性能差异仅归因于sca
 ### 7.4 普通pytest与性能pytest
 
 没有目录conftest插件；性能函数的`__test__`属性控制收集：默认仅14项功能，`PYHIP_MHA_PERF=1`时额外收集24项性能。
-标准`-k test_perf_`仅选性能项，不需自定义pytest参数或marker。本轮两类pytest子进程均已实际运行：
+不需自定义pytest参数或marker。本轮仅用`-k 'test_bf16_mha or test_perf_bf16_mha'`，在同一进程运行BF16子集：
 
 | 功能函数 | 参数项数 | MI325适用性 | 主要检查 |
 |---|---:|---|---|
 | `test_bf16_mha` | D128/192 × 8wave/persistent = 4 | 2可运行、2个gfx950 persistent跳过 | ragged、空Q、尾页、causal、GQA、非单位scale |
-| `test_fp8_mha` | D128/192 × C/NC × 两种Q scale = 8 | 8可运行 | ragged、空Q、NaN尾页、量化scale |
-| `test_swa` | D128/192 = 2 | 2可运行 | 空KV、W128+sink、padded Q/O、NaN尾页、非单位scale |
+| `test_fp8_mha` | D128/192 × C/NC × 两种Q scale = 8 | 本轮未选择 | ragged、空Q、NaN尾页、量化scale |
+| `test_swa` | D128/192 = 2 | 本轮未选择 | 空KV、W128+sink、padded Q/O、NaN尾页、非单位scale |
 
-功能 **12通过、2跳过**（183.127秒），性能 **24项全部通过**（1058.326秒）；默认及显式性能收集分别14项和24项。
-没有新增CPU测试、独立gather测试或repeat3专项；性能小shape是24项中的4项，不能另加到14项功能数里。
-
-按第6节准备环境后，选择普通功能测试或显式性能测试：
-
-```bash
-PYHIP_MHA_SELECTION_LOG="$OUT/pytest-functional-gpu.jsonl" "$PY" -m pytest "$MHA" --import-mode=importlib -q --junitxml="$OUT/tests.xml"
-
-PYHIP_MHA_PERF=1 PYHIP_MHA_OUTPUT="$OUT/pytest-perf" PYHIP_MHA_SELECTION_LOG="$OUT/pytest-perf-gpu.jsonl" "$PY" -m pytest "$MHA" --import-mode=importlib -k test_perf_ -q
-```
-
-性能pytest与CLI共用三套参数和候选规则；省略`-k`则同时执行功能测试。`PYHIP_MHA_OUTPUT`可省略，指定时每case保存一对JSON/Markdown，已有文件拒绝覆盖。
-已测快照用`PYHIP_MHA_GPU=3`、`PYHIP_MHA_REQUIRED_PTL=current`及显式低利用率变量；未设置GPU变量时pytest默认current，与CLI默认auto不同。
-列表和收集不初始化GPU，普通功能测试不做性能event计时。最新远端低负载接口不同，不能直接将快照变量用于当前入口。
+本轮 **11通过、2跳过、25项未选择**（73.344秒）：BF16功能2通过/2跳过，BF16性能9项通过。
+完整模块仍定义14个功能项及24个性能项，本轮没有执行其他功能或性能类别。
+没有新增CPU测试、独立gather测试或repeat3专项；BF16性能小shape是9项中的2项，不能另加到4个BF16功能参数项里。
+准确单行命令见第6节。性能pytest与CLI共享集合和候选规则，正利用率门槛须配合auto或物理GPU编号，不能用current绕过起始负载检查。
+列表/收集不初始化GPU，普通功能测试不做性能event计时；后续扩展测试范围须先确认。
 
 ## 8. 原生缓存、输出与跨机边界
 
@@ -321,20 +287,19 @@ PYHIP_MHA_PERF=1 PYHIP_MHA_OUTPUT="$OUT/pytest-perf" PYHIP_MHA_SELECTION_LOG="$O
 FlyDSL仍按默认HOME相对目录解析，`env.runtime.enable_cache=True`，无`FLYDSL_*`覆盖；**实际物理目录已变化，这是本机显式存储适配**。
 不修改原生key、编译锁或失效规则，不把“开启”当作全部命中，不称纯冷/全热。异常输出、加载失败或反复编译时检查版本、实际缓存目录和shell残留覆盖，不能减少buffer或跳过正确性。
 
-本轮已测源码只改选卡/守卫和证据字段；四个生产kernel、DSL、输入/FP32参考及event循环已与`4adaf81`逐字节/AST核对。
-JSON补齐metadata/scale、prepared/gather workspace及slot mapping地址并检查去别名；两轮各43候选/2150样本全部审计通过。
-本机PCI sysfs unique_id是ASIC serial，首次错误映射被实际设备核验拦截；KFD映射修复后完整测试通过，错误日志保留，不把14项fixture error当pass。
-这些本地适配在更新远端前已存入stash **`0e53a6947dedff0f44a33d459fd91d2863f3b845`**，未覆盖当前最新源码；[更新与备份记录](results/mi325_singlefile_20260908T031247Z/remote-update.txt)保存完整版本及归档摘要。
+优化提交已包含softmax标量指令、page+4页号加载/消费分离、D128无LSE的V lane偏移复用，以及显式softmax闭包依赖；V保持64-bit global加载。
+本轮没有修改这些优化或开展额外IR/ISA/LSE专项；只修正指定入口中的KFD UUID解析，输入/FP32参考/候选/测量函数与当前HEAD一致。
+BF16生产源码及测试源码SHA与生成的9份报告逐一核对；原生编译缓存保持开启，不以关闭缓存或增加私有层替代依赖修复。
+本机PCI unique_id为ASIC serial，KFD unique_id才是已核验ROCr标识；修正只影响选卡，严格默认、3次启动采样、PTL及实际BDF核验不变。
 
-JSON的wall time区分选卡/执行，每case另列输入、FP32参考、参考设置/首调、校验、dispatch profiling、warmup、计时前等待和measurement。
+JSON的wall time区分选卡/执行，每case另列输入、FP32参考、参考设置/首调、校验、dispatch profiling、warmup和measurement。
 首调可能含缓存加载/JIT，不是纯编译时间；measurement wall含spin/Python开销，不等于event样本之和。
-正常流程不打印选卡/准备/校验进度，性能表和`--verbose-runs`保留；错误诊断、dispatch及idle采样独立保存。CLI一条ROCTracer重复flow警告未隐藏。
-系统没有GNU time，使用标准库记录子进程耗时。性能pytest已经完整结束、JUnit24通过、子进程exit0，但外层bash在收尾时因运行中脚本编辑报EOF并exit2；当前脚本语法已检查，原日志不改写，也未为此重测或筛选样本。
-后续修改执行脚本须等进程退出，或用不可变脚本副本启动，避免同类收尾错误。
-
-最后重新等待GPU3三次稳定样本后完成独立tensor smoke，实际BDF/UUID正确，ECC corrected/uncorrected/deferred均0。
-smoke后的只读瞬时负载为gfx2%/UMC0%，不把它表述为持续空闲；该时刻未再启动其他GPU工作。本轮所有自有测试和监控已退出。
+正常流程不打印选卡/准备/校验进度，性能表和`--verbose-runs`保留；错误诊断、dispatch及idle采样独立保存。
+本轮用bash内建`time`记录完整pytest子进程，退出码0；测试期间没有修改执行脚本或源码。
+测试结束后的只读ECC corrected/uncorrected/deferred均0；瞬时gfx100%/UMC13%，不声称持续低负载、不推断该读数来源。
+此后未追加GPU smoke、CLI、专项或其他类别测试，也未终止其他进程；本轮自有pytest及选卡监控均已退出。
 MI325不能验证gfx950原生执行；对应平台见 [README.355.md](README.355.md)，不能把skip当pass。10-buffer OOM须如实报告，不自动缩小规模。
 
-原始结果、JUnit、逐项耗时及源码快照保存在 [本轮目录](results/mi325_singlefile_20260908T031247Z)，完整审计见 [audit.json](results/mi325_singlefile_20260908T031247Z/audit.json)。
-第2节始终只用同一轮CLI数据；旧单buffer、dense、register、ISA及失败日志保留，不能冒充当前远端或其他机器的新范围验证。
+本轮证据见 [BF16结果目录](results/mi325_bf16_e7b4be8_20260908T081608Z)、[JUnit](results/mi325_bf16_e7b4be8_20260908T081608Z/tests.xml)、[离线审计](results/mi325_bf16_e7b4be8_20260908T081608Z/bf16-audit.json)。
+原MI325正文已备份为 [更新前报告](results/mi325_bf16_e7b4be8_20260908T081608Z/README.325.before.md)；历史FP8/SWA原始报告从已有归档恢复到本轮目录的history子目录，数值未改写。
+第2.1节只用本次指定入口BF16 pytest数据，第2.2–2.3节明确为历史；不能将两种轮次合并宣称全套最新验证。
