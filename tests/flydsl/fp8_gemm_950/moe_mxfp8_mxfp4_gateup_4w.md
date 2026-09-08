@@ -140,6 +140,99 @@ Paired `8192 x 4096 x 6144` standalone GEMM results from the same processes:
 difference from group 4 is only 0.14%. Group 32 regresses best throughput by
 2.31%. Use group 4 as the default for this shape.
 
+### Exact 12288-Token MoE Versus GEMM Profile
+
+Date: 2026-09-07
+Device: gfx950 (`HIP_VISIBLE_DEVICES=5`)
+
+Configuration: tokens 12288, topk 8, experts 384, intermediate size 256,
+hidden size 6144, padding LDS, XCD swizzle, and `GROUP_SIZE_M=4`. Balanced
+routing gives each expert exactly 256 rows, so each expert has one M block and
+two N tiles. Both kernels launch 768 workgroups and execute the same 128 scaled
+MFMAs per complete loop body.
+
+The comparison GEMM is `M=12288, N=4096, K=6144`. Its B working set is 12 MiB,
+whereas the 384 expert B tensors occupy 576 MiB.
+
+Uninstrumented result:
+
+| Kernel | Latency | Throughput | Relative throughput |
+|---|---:|---:|---:|
+| MoE | 0.264123 ms | 2341.62 TFLOPS | 86.551% |
+| Equal-work GEMM | 0.228602 ms | 2705.47 TFLOPS | 100% |
+
+The MoE latency is 1.155x the GEMM latency. ATT gives the same conclusion at
+the mainloop level. A complete loop body has a 4096-cycle MFMA lower bound:
+
+| Kernel | Cycles per loop body | MFMA efficiency |
+|---|---:|---:|
+| MoE | 5827.826 | 70.28% |
+| Equal-work GEMM | 4975.449 | 82.32% |
+
+MoE therefore spends 852.38 more cycles per loop body outside the MFMA lower
+bound. The largest sampled stall deltas, MoE minus GEMM, are:
+
+| Instruction or dependency | Extra cycles per loop body |
+|---|---:|
+| `s_waitcnt` | 267.2 |
+| MFMA dependencies | 152.2 |
+| Scale `buffer_load_dword` | 124.2 |
+| `s_barrier` | 120.0 |
+| Data `buffer_load_dwordx4` | 114.9 |
+| `v_add_u32` | 92.5 |
+
+The memory counters identify the controlling difference:
+
+| Counter | MoE | Equal-work GEMM |
+|---|---:|---:|
+| L2 read requests | about 19.34M | about 19.34M |
+| L2 hit ratio | 55.13% | 85.52% |
+| DRAM read requests | 9,304,852 | 2,469,928 |
+
+MoE sends 3.767x as many reads to DRAM despite nearly identical L2 request
+counts. Each expert has only one M block, so its weights have almost no
+cross-workgroup reuse. The GEMM's 12 MiB B matrix is reused by all 48 M tiles.
+Cold expert B and B-scale reads consequently expose more VMEM wait and barrier
+latency in the MoE K loop. A gather and output scatter are secondary costs.
+
+LDS is not the relative bottleneck. Padding and B-swizzled layouts both report
+4,718,592 bank conflicts and zero `SQ_LDS_DATA_FIFO_FULL`. Reducing the current
+101,376-byte ping-pong allocation also cannot increase occupancy by itself:
+the kernel uses 512 combined VGPR/AGPR slots (`accum_offset=256`). A compile
+probe with `waves_per_eu=2` reports `desired occupancy was 2, final occupancy
+is 1`.
+
+Validated tuning outcomes:
+
+| Experiment | Result | Decision |
+|---|---:|---|
+| B non-temporal cache policy | 0.294922 ms, 2097.08 TFLOPS | Reverted |
+| B LDS swizzle | 0.267162 ms, 2314.98 TFLOPS | No benefit |
+| `SCALE_VMEM_POS=5` best sample | 0.259243 ms, 2385.70 TFLOPS | Not reproducible |
+| XCD/group-order sweep | Small run-to-run differences | Keep group 4 |
+| A gather base hoist | Already performed in generated ISA | No source change |
+| Half-size rolling LDS | Still limited to one wave/EU by registers | Not implemented |
+| B-phase VMEM-first scheduler | 0.33%-0.40% slower in repeated runs | Reverted |
+
+For the scale VMEM position, three interleaved 40-run measurements gave mean
+medians of 0.263549 ms at the default position 7 and 0.263629 ms at position 5.
+The apparent one-run gain was noise. Sweeping `SCALE_DSRD_POS` from 8 through
+15 likewise produced no stable improvement; positions 12-14 were within about
+0.15%, while position 15 regressed.
+
+A dedicated B-phase scheduler moved the two B `buffer_load_dwordx4`
+instructions from after MFMA 8 and 9 to before the first MFMA. Variants also
+staggered the second B load and B-scale load across the phase. Four interleaved
+80-iteration runs averaged 0.262002 ms for the existing scheduler, 0.263052 ms
+for the strongest `(second B, scale) = (4, 7)` candidate, and 0.262873 ms for
+the `(1, 5)` candidate. Earlier issue increased the prefetch distance but did
+not reduce end-to-end VMEM stalls in this single-wave kernel.
+
+The scale-first schedule remains the only retained kernel change. Closing the
+remaining gap requires changing expert-weight reuse or materially lowering the
+register footprint; local cache hints, LDS layout changes, and scheduler
+position changes do not remove the cold-weight cost for this routing geometry.
+
 ## Optimization History
 
 | Version | Best latency | Throughput | Observation |

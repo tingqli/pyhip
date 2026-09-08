@@ -1,9 +1,7 @@
-"""Four-wave MXFP8 x MXFP4 MoE gate/up GEMM.
+"""Four-wave MXFP8 x MXFP4 MoE gate/up GEMM with SiTUv2.
 
-The kernel writes the unfused gate and up projections to
-``[tokens, topk, 2 * intermediate_size]``.  This file starts with a focused
-buffer-resource routing probe; the GEMM implementation below reuses the same
-routing contract.
+The kernel applies SiTUv2 to the gate and up projections and writes
+``[tokens, topk, intermediate_size]``.
 """
 
 import argparse
@@ -30,6 +28,9 @@ SORT_BLOCK_M = 256
 TOKEN_MASK = 0xFFFFFF
 A_INPUT_SCALE = 0.33
 B_INPUT_SCALE = 0.2
+SITU_LIMIT = 7.0
+SITU_BETA = 2.0
+SITU_LINEAR_BETA = 1.5
 
 
 def div_up(value: int, divisor: int) -> int:
@@ -344,9 +345,8 @@ def moe_reference(
     _, _, e8m0_to_f32, mxfp4_to_f32 = _load_mx_helpers()
     scale_a = e8m0_to_f32(inputs["scale_a_raw"]).repeat_interleave(32, dim=1)
     a_dequant = inputs["a"].float() * scale_a
-    output_size = 2 * intermediate_size
     reference = torch.zeros(
-        (tokens, topk, output_size), device="cuda", dtype=torch.bfloat16
+        (tokens, topk, intermediate_size), device="cuda", dtype=torch.bfloat16
     )
     sorted_blocks = inputs["sorted_ids"].view(-1, SORT_BLOCK_M)
     for expert in range(num_experts):
@@ -362,7 +362,21 @@ def moe_reference(
         ).repeat_interleave(32, dim=1)
         weight_dequant = mxfp4_to_f32(inputs["weight"][expert]) * weight_scale
         projected = a_dequant[token_ids] @ weight_dequant.t()
-        reference[token_ids, slot_ids] = projected.to(torch.bfloat16)
+        gate = projected[:, :intermediate_size].clamp(max=SITU_LIMIT)
+        up = projected[:, intermediate_size:].clamp(
+            min=-SITU_LIMIT, max=SITU_LIMIT
+        )
+        situ_gate = (
+            SITU_BETA
+            * torch.tanh(gate / SITU_BETA)
+            * torch.sigmoid(gate)
+        )
+        up_scaled = SITU_LINEAR_BETA * torch.tanh(
+            up / SITU_LINEAR_BETA
+        )
+        reference[token_ids, slot_ids] = (situ_gate * up_scaled).to(
+            torch.bfloat16
+        )
     return reference
 
 
@@ -551,7 +565,7 @@ def compile_moe_gateup_4w(
         c_rsrc = buffer_ops.create_buffer_resource(
             arg_c,
             num_records_bytes=arith._to_raw(
-                num_tokens_i32 * fx.Int32(topk * output_size * 2)
+                num_tokens_i32 * fx.Int32(topk * intermediate_size * 2)
             ),
         )
         sorted_rsrc = buffer_ops.create_buffer_resource(
@@ -923,6 +937,38 @@ def compile_moe_gateup_4w(
                         c_sub, c_value, [c_offset], [1]
                     )
             c_frag.store(c_value)
+
+        def sigmoid(value):
+            exponent = rocdl.exp2(
+                T.f32,
+                arith._to_raw(value * -1.4426950408889634),
+            )
+            return rocdl.rcp(T.f32, 1.0 + exponent)
+
+        def tanh(value):
+            abs_value = value.maximumf(-value)
+            exponent = rocdl.exp2(
+                T.f32,
+                arith._to_raw(abs_value * -2.8853900817779268),
+            )
+            tanh_abs = (1.0 - exponent) * rocdl.rcp(
+                T.f32, 1.0 + exponent
+            )
+            return (value > fx.Float32(0.0)).select(tanh_abs, -tanh_abs)
+
+        def situlv2(gate, up):
+            neg_limit = fx.Float32(-SITU_LIMIT)
+            gate = -((-gate).maximumf(neg_limit))
+            up = (-((-up).maximumf(neg_limit))).maximumf(neg_limit)
+            situ_gate = (
+                fx.Float32(SITU_BETA)
+                * tanh(gate * fx.Float32(1.0 / SITU_BETA))
+                * sigmoid(gate)
+            )
+            up_scaled = fx.Float32(SITU_LINEAR_BETA) * tanh(
+                up * fx.Float32(1.0 / SITU_LINEAR_BETA)
+            )
+            return situ_gate * up_scaled
 
         c_layout_tile = fx.make_rmem_tensor(
             fx.make_ordered_layout((block_n, block_m), (1, 0)), Float32
@@ -1374,11 +1420,33 @@ def compile_moe_gateup_4w(
         wave_m = wave_id // 2
         wave_n = wave_id % 2
 
-        def store_quadrant(c_frag, row_quadrant: int, is_up: bool):
+        def store_gateup(gate_frag, up_frag, row_quadrant: int):
             for row_repeat in range_constexpr(4):
                 for col_repeat in range_constexpr(0, 4, 2):
-                    acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
-                    acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
+                    gate_a = Vec(
+                        gate_frag[None, col_repeat, row_repeat].load()
+                    )
+                    gate_b = Vec(
+                        gate_frag[None, col_repeat + 1, row_repeat].load()
+                    )
+                    up_a = Vec(up_frag[None, col_repeat, row_repeat].load())
+                    up_b = Vec(
+                        up_frag[None, col_repeat + 1, row_repeat].load()
+                    )
+                    acc_a = Vec.from_elements(
+                        [
+                            situlv2(gate_a[index], up_a[index])
+                            for index in range_constexpr(gate_a.numel)
+                        ],
+                        Float32,
+                    )
+                    acc_b = Vec.from_elements(
+                        [
+                            situlv2(gate_b[index], up_b[index])
+                            for index in range_constexpr(gate_b.numel)
+                        ],
+                        Float32,
+                    )
                     d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
                     d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
                     d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
@@ -1434,11 +1502,8 @@ def compile_moe_gateup_4w(
                     store_valid = arith.andi(
                         sorted_valid, arith.andi(token_valid, slot_valid)
                     )
-                    projection_base = (
-                        intermediate_size if is_up else 0
-                    ) + n_tile_i32 * block_n
                     col = (
-                        projection_base
+                        n_tile_i32 * block_n
                         + col_repeat * 32
                         + fx.Int32((lane_group % 2) * 32)
                         + fx.Int32(wave_n * 16)
@@ -1446,7 +1511,7 @@ def compile_moe_gateup_4w(
                     )
                     output_element = (
                         (fx.Int32(token_id) * topk + fx.Int32(slot_id))
-                        * output_size
+                        * intermediate_size
                         + col
                     )
                     buffer_ops.buffer_store(
@@ -1457,10 +1522,8 @@ def compile_moe_gateup_4w(
                         mask=store_valid,
                     )
 
-        store_quadrant(frag_c_tl, 0, False)
-        store_quadrant(frag_c_bl, 1, False)
-        store_quadrant(frag_c_tr, 0, True)
-        store_quadrant(frag_c_br, 1, True)
+        store_gateup(frag_c_tl, frag_c_tr, 0)
+        store_gateup(frag_c_bl, frag_c_br, 1)
 
 
 
@@ -1527,7 +1590,7 @@ def run_accuracy_case(
         tokens, intermediate_size, hidden_size, topk, num_experts
     )
     output = torch.full(
-        (tokens, topk, 2 * intermediate_size),
+        (tokens, topk, intermediate_size),
         float("nan"),
         device="cuda",
         dtype=torch.bfloat16,
@@ -1597,10 +1660,10 @@ def run_accuracy_case(
             zip(top_indices.tolist(), top_errors.tolist()), start=1
         ):
             token_index, remainder = divmod(
-                flat_index, topk * 2 * intermediate_size
+                flat_index, topk * intermediate_size
             )
             slot_index, output_index = divmod(
-                remainder, 2 * intermediate_size
+                remainder, intermediate_size
             )
             reference_value = reference_flat[flat_index].item()
             output_value = output_flat[flat_index].item()
@@ -1784,7 +1847,7 @@ def run_benchmark(
         tokens, intermediate_size, hidden_size, topk, num_experts
     )
     output = torch.empty(
-        (tokens, topk, 2 * intermediate_size),
+        (tokens, topk, intermediate_size),
         device="cuda",
         dtype=torch.bfloat16,
     )
