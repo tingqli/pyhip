@@ -69,6 +69,8 @@ class Backend:
 FP8 = Backend("fp8_942", "mha_pa_fp8_942", "gfx942", torch.float8_e4m3fnuz)
 BF16_942 = Backend("bf16_942", "mha_pa_bf16_942", "gfx942", torch.bfloat16,
                    empty_kv=False, causal_short_kv=False)
+BF16_942_GRID = Backend("bf16_942_grid", "mha_pa_bf16_942", "gfx942", torch.bfloat16,
+                       persistent=False, empty_kv=False, causal_short_kv=False)
 BF16_950 = Backend("bf16_950", "mha_pa_bf16_950", "gfx950", torch.bfloat16, strided=True)
 BF16_950_PERSISTENT = Backend("bf16_950_persistent", "mha_pa_bf16_950", "gfx950", torch.bfloat16,
                               persistent=True, strided=True)
@@ -114,14 +116,14 @@ class Workload:
         elif self.window >= 0 or self.sink:
             if backend.arch != "gfx950":
                 return "this full-MHA backend does not support SWA/sink"
-        if backend.name != "bf16_942" and self.page != 64:
+        if backend.module != "mha_pa_bf16_942" and self.page != 64:
             return "backend supports page64 only"
-        if backend.name != "bf16_942" and self.dv != 128:
+        if backend.module != "mha_pa_bf16_942" and self.dv != 128:
             return "backend supports V128 only"
         if not backend.empty_kv and any(q > 0 and k == 0 for q, k in zip(self.q_lens, self.kv_lens)):
-            return "original BF16 pipeline requires nonempty active KV"
+            return "BF16 gfx942 requires nonempty active KV"
         if self.causal and not backend.causal_short_kv and any(k < q for q, k in zip(self.q_lens, self.kv_lens)):
-            return "original BF16 causal pipeline requires KV>=Q per sequence"
+            return "BF16 gfx942 causal attention requires KV>=Q per sequence"
         return None
 
     def to_dict(self):
@@ -145,6 +147,10 @@ BF16_MHA_PERF_CASES = (
     *(PerfCase(Workload(f"bf16-full-d{d}", (10240,), (2583,), dq=d)) for d in (128, 192)),
     *(PerfCase(Workload(f"bf16-causal-d{d}", (32768,), (32768,), dq=d, causal=True)) for d in (128, 192)),
     *(PerfCase(Workload(f"bf16-mha-{name}", (q,), (kv,), dq=128, heads=8, kv_heads=8, page=page),
+               arches=("gfx942",))
+      for name, q, kv, page in (("long-p32", 20480, 20480, 32),
+                                ("short-p32", 10240, 2560, 32), ("short-p64", 10240, 2560, 64))),
+    *(PerfCase(Workload(f"bf16-mha-{name}-d192", (q,), (kv,), dq=192, heads=8, kv_heads=8, page=page),
                arches=("gfx942",))
       for name, q, kv, page in (("long-p32", 20480, 20480, 32),
                                 ("short-p32", 10240, 2560, 32), ("short-p64", 10240, 2560, 64))),
@@ -304,9 +310,10 @@ def make_case(q_lens=(256,), kv_lens=(256,), *, dtype=torch.bfloat16, dq=192, dv
                 torch.linspace(-1, 1, heads, device="cuda") if has_sink else None)
 
 
-def torch_reference(case, causal, softmax_scale=None):
-    """Independent FP32 bottom-right attention O; LSE is not tested."""
+def torch_reference(case, causal, softmax_scale=None, *, return_lse=False):
+    """Independent FP32 bottom-right attention; optional natural-log LSE."""
     output = torch.full((case.q.shape[0], case.heads, case.dv), float("nan"), device=case.q.device)
+    lse = torch.full(case.q.shape[:2], float("nan"), device=case.q.device) if return_lse else None
     scale = case.dq**-0.5 if softmax_scale is None else softmax_scale
     keys, values = case.logical_kv()
     offset = case.q_offset
@@ -317,6 +324,8 @@ def torch_reference(case, causal, softmax_scale=None):
             end = min(start + 256, q_len)
             if kv_len == 0:
                 output[offset + start:offset + end] = 0
+                if return_lse:
+                    lse[offset + start:offset + end] = -float("inf")
                 continue
             q = case.q[offset + start:offset + end].float()
             qs = case.qs if case.qs.numel() == 1 else case.qs[offset + start:offset + end]
@@ -334,12 +343,14 @@ def torch_reference(case, causal, softmax_scale=None):
                 logits.masked_fill_(mask, -float("inf"))
             if case.sinks is not None:
                 logits = torch.cat((logits, case.sinks[:, None, None].expand(-1, end - start, 1)), -1)
+            if return_lse:
+                lse[offset + start:offset + end] = logits.logsumexp(-1).transpose(0, 1)
             probabilities = logits.softmax(-1).nan_to_num(0.0)
             if case.sinks is not None:
                 probabilities = probabilities[..., :-1]
             output[offset + start:offset + end] = (probabilities @ v[:, first:last]).transpose(0, 1)
         offset += q_len
-    return output
+    return (output, lse) if return_lse else output
 
 
 def output_buffer(case, layout="contiguous"):
@@ -830,7 +841,7 @@ def save(path, data):
 
 def bf16_mha_candidates(spec, arch):
     """BF16: own kernels only for smoke, otherwise own kernels + AITER."""
-    backends = [BF16_942] if arch == "gfx942" else [BF16_950, BF16_950_PERSISTENT]
+    backends = [BF16_942, BF16_942_GRID] if arch == "gfx942" else [BF16_950, BF16_950_PERSISTENT]
     return backends, () if spec.smoke else (("aiter", aiter_reference_call),)
 
 
@@ -963,8 +974,6 @@ def run_case(workload, backends, *, run_count=5, warmup=10, repeat=1, buffers=10
         raise ValueError("a case cannot mix BF16 and FP8")
     if layout != "contiguous" and any(not b.strided for b in supported):
         raise ValueError("the selected backend requires contiguous Q/O")
-    if poison_tail and BF16_942 in supported:
-        raise ValueError("bf16_942 uses zero-padded tails; --poison-tail is supported by gfx950/SWA/FP8")
     if buffers < 1:
         raise ValueError("buffers must be positive")
     backend = supported[0]
@@ -1176,14 +1185,106 @@ def native_gpu_selection():
 def test_bf16_mha(dq, variant):
     """Only the short ragged/empty/poisoned cases not covered by perf shapes."""
     arch = gpu_arch()
-    if arch not in ("gfx942", "gfx950") or variant == "persistent" and arch != "gfx950":
+    if arch not in ("gfx942", "gfx950"):
         pytest.skip("requires a supported native GPU")
-    backends = [BF16_942 if arch == "gfx942" else BF16_950_PERSISTENT if variant == "persistent" else BF16_950]
+    backends = [BF16_942 if variant == "persistent" else BF16_942_GRID] if arch == "gfx942" else [
+        BF16_950_PERSISTENT if variant == "persistent" else BF16_950]
     kv = (63, 0, 193, 257) if arch == "gfx950" else (63, 65, 193, 257)
     w = Workload("ragged_edges", (0, 7, 33, 129), kv, dq=dq, heads=6, kv_heads=2,
                  causal=True)
     run_case(w, backends, run_count=0, layout="padded" if backends[0].strided else "contiguous", nonunit_scales=True,
-             poison_tail=backends != [BF16_942], softmax_scale=0.0625)
+             poison_tail=arch != "gfx942", softmax_scale=0.0625)
+
+
+@pytest.mark.parametrize("kv_len", (31, 64, 65, 128, 129))
+@pytest.mark.parametrize("dq", (128, 192))
+def test_bf16_stage_boundaries(kv_len, dq):
+    """One/two/three BN64 tiles exercise prologue, handoff and drain."""
+    if gpu_arch() != "gfx942":
+        pytest.skip("requires native gfx942")
+    w = Workload("bf16_stage_boundaries", (65,), (kv_len,), dq=dq)
+    run_case(w, [BF16_942], run_count=0)
+
+
+@pytest.mark.parametrize("pattern", ("uniform", "values", "keys"))
+def test_bf16_stage_operands(pattern):
+    """Distinguish V staging, softmax normalization and QK handoff bugs."""
+    if gpu_arch() != "gfx942":
+        pytest.skip("requires native gfx942")
+    case = make_case((256,), (128,), dq=128, heads=1, poison_tail=False,
+                     source_dtype=torch.bfloat16, seed=20260905)
+    if pattern in ("uniform", "values"):
+        case.q.zero_()
+    if pattern in ("uniform", "keys"):
+        case.v_pages.fill_(1)
+        case.k, case.v = vectorize_kv(case.k_pages, case.v_pages)
+    call, _, _ = make_call(case, BF16_942, False)
+    actual = call()
+    oracle = torch_reference(case, False)
+    accuracy(actual, oracle, f"bf16_stage_operands/{pattern}")
+    saved = actual.clone()
+    for _ in range(2):
+        torch.testing.assert_close(call(), saved, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("page", (32, 64, 128))
+@pytest.mark.parametrize("dq,dv", ((128, 128), (192, 128), (128, 192), (192, 192)))
+def test_bf16_layout_contract(page, dq, dv):
+    """SHUFFLE-5D, both schedulers, ragged prefixes, scales and optional LSE."""
+    if gpu_arch() != "gfx942":
+        pytest.skip("requires native gfx942")
+    case = make_case((0, 7, 33, 513), (31, 33, 97, 545), dq=dq, dv=dv, page=page,
+                     heads=12, kv_heads=3, mode="per-tensor" if page == 32 else "per-token",
+                     q_offset=5, table_offset=3, nonunit_scales=True, poison_tail=True,
+                     source_dtype=torch.bfloat16)
+    valid = slice(case.q_offset, case.q_offset + sum(case.q_lens))
+    for causal in (False, True):
+        oracle, lse_oracle = torch_reference(case, causal, 0.0625, return_lse=True)
+        for backend in (BF16_942, BF16_942_GRID):
+            call, out, kernel = make_call(case, backend, causal)
+            # D192 uses a different register/staging specialization without
+            # LSE. Validate that hot path too, not only the LSE contract path.
+            actual = call(softmax_scale=0.0625)
+            accuracy(actual[valid], oracle[valid], f"{backend.name}/no_lse/d{dq}v{dv}p{page}")
+            lse = torch.full(case.q.shape[:2], -123.0, device="cuda")
+            actual, actual_lse = call(return_lse=True, lse=lse, softmax_scale=0.0625)
+            assert actual.data_ptr() == out.data_ptr() and actual_lse.data_ptr() == lse.data_ptr()
+            assert kernel.persistent is (backend == BF16_942)
+            accuracy(actual[valid], oracle[valid], f"{backend.name}/layout/d{dq}v{dv}p{page}")
+            torch.testing.assert_close(actual_lse[valid], lse_oracle[valid], atol=0.002, rtol=0.002)
+            first, first_lse = actual.clone(), actual_lse.clone()
+            for _ in range(2):
+                assert call(lse=lse, softmax_scale=0.0625).data_ptr() == out.data_ptr()
+                torch.testing.assert_close(out, first, atol=0, rtol=0)
+                torch.testing.assert_close(lse, first_lse, atol=0, rtol=0)
+            for buffer in (out, lse):
+                assert bool((buffer[:valid.start] == -123).all())
+                assert bool((buffer[valid.stop:] == -123).all())
+
+
+@pytest.mark.parametrize("backend", (BF16_942, BF16_942_GRID), ids=lambda b: b.name)
+def test_bf16_streams_and_graph(backend):
+    """Persistent iterations must not share scheduler state across streams."""
+    if gpu_arch() != "gfx942":
+        pytest.skip("requires native gfx942")
+    case = make_case((1537,), (193,), dq=128, heads=16, poison_tail=False,
+                     source_dtype=torch.bfloat16)
+    oracle = torch_reference(case, False)
+    calls = [make_call(case, backend, False)[:2] for _ in range(2)]
+    streams = [torch.cuda.Stream() for _ in calls]
+    for stream, (call, _) in zip(streams, calls):
+        stream.wait_stream(torch.cuda.current_stream())
+        call(stream=stream)
+    for stream, (_, out) in zip(streams, calls):
+        stream.synchronize()
+        accuracy(out, oracle, f"{backend.name}/concurrent_stream")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=streams[0]):
+        calls[0][0](stream=streams[0])
+    for _ in range(2):
+        graph.replay()
+    torch.cuda.synchronize()
+    accuracy(calls[0][1], oracle, f"{backend.name}/graph_replay")
 
 
 @pytest.mark.parametrize("dq", (128, 192))
