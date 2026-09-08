@@ -384,7 +384,8 @@ def hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops):
     scale_dsrd_pos = int(os.environ.get("SCALE_DSRD_POS", "13"))
     scale_vmem_pos = int(os.environ.get("SCALE_VMEM_POS", "7"))
     base_dsrd_ops = 8 if scale_sched_late and dsrd_ops == 9 else dsrd_ops
-    base_vmem_ops = 4 if scale_sched_late and vmem_ops == 5 else vmem_ops
+    has_scale_vmem = scale_sched_late and vmem_ops in (3, 5)
+    base_vmem_ops = vmem_ops - 1 if has_scale_vmem else vmem_ops
     prev_dsrd = 0
     prev_vmem = 0
     for i in range_constexpr(total_mfmas):
@@ -398,7 +399,7 @@ def hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops):
             )
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
         cur_vmem = ((i + 1) * base_vmem_ops + total_mfmas - 1) // total_mfmas
-        if const_expr(scale_sched_late and vmem_ops == 5 and i >= scale_vmem_pos):
+        if const_expr(has_scale_vmem and i >= scale_vmem_pos):
             cur_vmem += 1
         if const_expr(cur_vmem > prev_vmem):
             rocdl.sched_group_barrier(
@@ -1090,7 +1091,6 @@ def compile_moe_gateup_4w(
             waitvmcnt_barrier(wait_ab)
             load_a(a_bottom_source[0], frag_a_bottom_dest)
             scale_a_bottom_frag.store(scale_a_bottom_g2r[0].load())
-            raw_b_mxfp4_g2s(kk + 2, lds.b_gate0.ptr, gate_row_tile)
             load_scale_g2r(
                 scale_b_gate_g2r[0],
                 scale_b_rsrc,
@@ -1099,6 +1099,7 @@ def compile_moe_gateup_4w(
                 scale_b_padded_rows,
                 False,
             )
+            raw_b_mxfp4_g2s(kk + 2, lds.b_gate0.ptr, gate_row_tile)
             hot_loop_scheduler_mainloop(0, b_phase_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
@@ -1112,7 +1113,6 @@ def compile_moe_gateup_4w(
             waitvmcnt_barrier(wait_ab)
             load_b(b_up_read[0], frag_b_up)
             scale_b_up_frag.store(scale_b_up_g2r[0].load())
-            raw_a_gather_g2s(kk + 2, a_top_dma_ptrs[0], a_top_token_ids)
             load_scale_g2r(
                 scale_a_top_g2r[0],
                 scale_a_rsrc,
@@ -1121,6 +1121,7 @@ def compile_moe_gateup_4w(
                 scale_a_padded_rows,
                 True,
             )
+            raw_a_gather_g2s(kk + 2, a_top_dma_ptrs[0], a_top_token_ids)
             hot_loop_scheduler_mainloop(1, a_phase_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
@@ -1134,9 +1135,6 @@ def compile_moe_gateup_4w(
             waitvmcnt_barrier(wait_ba)
             load_b(b_gate_read[1], frag_b_gate)
             scale_b_gate_frag.store(scale_b_gate_g2r[1].load())
-            raw_a_gather_g2s(
-                kk + 2, a_bottom_dma_ptrs[0], a_bottom_token_ids
-            )
             load_scale_g2r(
                 scale_a_bottom_g2r[0],
                 scale_a_rsrc,
@@ -1144,6 +1142,9 @@ def compile_moe_gateup_4w(
                 a_bottom_scale_tile,
                 scale_a_padded_rows,
                 True,
+            )
+            raw_a_gather_g2s(
+                kk + 2, a_bottom_dma_ptrs[0], a_bottom_token_ids
             )
             hot_loop_scheduler_mainloop(2, a_phase_vmem, b_dsrd)
             rocdl.sched_barrier(0)
@@ -1158,7 +1159,6 @@ def compile_moe_gateup_4w(
             waitvmcnt_barrier(wait_ba)
             load_a(a_top_source[1], frag_a_top_dest)
             scale_a_top_frag.store(scale_a_top_g2r[1].load())
-            raw_b_mxfp4_g2s(kk + 2, lds.b_up0.ptr, up_row_tile)
             load_scale_g2r(
                 scale_b_up_g2r[0],
                 scale_b_rsrc,
@@ -1167,6 +1167,7 @@ def compile_moe_gateup_4w(
                 scale_b_padded_rows,
                 False,
             )
+            raw_b_mxfp4_g2s(kk + 2, lds.b_up0.ptr, up_row_tile)
             hot_loop_scheduler_mainloop(3, b_phase_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
@@ -1180,7 +1181,6 @@ def compile_moe_gateup_4w(
             waitvmcnt_barrier(wait_ab)
             load_a(a_bottom_source[1], frag_a_bottom_dest)
             scale_a_bottom_frag.store(scale_a_bottom_g2r[1].load())
-            raw_b_mxfp4_g2s(kk + 3, lds.b_gate1.ptr, gate_row_tile)
             load_scale_g2r(
                 scale_b_gate_g2r[1],
                 scale_b_rsrc,
@@ -1189,6 +1189,7 @@ def compile_moe_gateup_4w(
                 scale_b_padded_rows,
                 False,
             )
+            raw_b_mxfp4_g2s(kk + 3, lds.b_gate1.ptr, gate_row_tile)
             hot_loop_scheduler_mainloop(4, b_phase_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
@@ -1202,7 +1203,6 @@ def compile_moe_gateup_4w(
             waitvmcnt_barrier(wait_ab)
             load_b(b_up_read[1], frag_b_up)
             scale_b_up_frag.store(scale_b_up_g2r[1].load())
-            raw_a_gather_g2s(kk + 3, a_top_dma_ptrs[1], a_top_token_ids)
             load_scale_g2r(
                 scale_a_top_g2r[1],
                 scale_a_rsrc,
@@ -1211,6 +1211,7 @@ def compile_moe_gateup_4w(
                 scale_a_padded_rows,
                 True,
             )
+            raw_a_gather_g2s(kk + 3, a_top_dma_ptrs[1], a_top_token_ids)
             hot_loop_scheduler_mainloop(5, a_phase_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
@@ -1224,9 +1225,6 @@ def compile_moe_gateup_4w(
             waitvmcnt_barrier(wait_ba)
             load_b(b_gate_read[0], frag_b_gate)
             scale_b_gate_frag.store(scale_b_gate_g2r[0].load())
-            raw_a_gather_g2s(
-                kk + 3, a_bottom_dma_ptrs[1], a_bottom_token_ids
-            )
             load_scale_g2r(
                 scale_a_bottom_g2r[1],
                 scale_a_rsrc,
@@ -1234,6 +1232,9 @@ def compile_moe_gateup_4w(
                 a_bottom_scale_tile,
                 scale_a_padded_rows,
                 True,
+            )
+            raw_a_gather_g2s(
+                kk + 3, a_bottom_dma_ptrs[1], a_bottom_token_ids
             )
             hot_loop_scheduler_mainloop(6, a_phase_vmem, b_dsrd)
             rocdl.sched_barrier(0)
@@ -1248,7 +1249,6 @@ def compile_moe_gateup_4w(
             waitvmcnt_barrier(wait_ba)
             load_a(a_top_source[0], frag_a_top_dest)
             scale_a_top_frag.store(scale_a_top_g2r[0].load())
-            raw_b_mxfp4_g2s(kk + 3, lds.b_up1.ptr, up_row_tile)
             load_scale_g2r(
                 scale_b_up_g2r[1],
                 scale_b_rsrc,
@@ -1257,6 +1257,7 @@ def compile_moe_gateup_4w(
                 scale_b_padded_rows,
                 False,
             )
+            raw_b_mxfp4_g2s(kk + 3, lds.b_up1.ptr, up_row_tile)
             hot_loop_scheduler_mainloop(7, b_phase_vmem, a_dsrd)
             rocdl.sched_barrier(0)
             loop_results = yield [
