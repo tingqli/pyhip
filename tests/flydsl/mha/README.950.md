@@ -1,104 +1,102 @@
 # gfx950 Attention：运行、测试与性能
 
-> **跨机修改提示（2026-09-07）**：当前入口已改为默认10-buffer，新增SWA `aiter_gather`参考，
-> 见[changes.md](changes.md)。下文MI350原始数据保持当时单buffer口径，不是修改后重测。
-> 复现旧计时规模请显式`--buffers 1`；采用新默认需在MI350重新验证，不能沿用旧候选数/样本数。
+更新：2026-09-08。适用 **MI350X / gfx950，BF16，Dqk128/192，Dv128，page64**。
+唯一入口 [test_mha_pa.py](test_mha_pa.py) 已改为三套显式性能集；当前gfx950展开规则仅完成契约核对，
+**没有新gfx950原生测试或性能结果**。第4节保留的是2026-09-07旧单buffer记录，不是当前范围验收。
+新CLI的MI308结果单独见 [README.308.md](README.308.md)，不可代替gfx950验证。
 
-更新：2026-09-07。适用 **MI350X / gfx950，BF16，Dqk128/192，Dv128，page64**。
-Full、causal、单wave SWA都用 [test_mha_pa.py](test_mha_pa.py)，默认**先检查输出O，再测性能**。
-本文合并覆盖、性能与开发说明；性能数据来自注明时间的实测，当前入口可复测相同输入与流程。
+**已启用编译缓存，在排查问题时需要检查缓存是否出现问题**。使用FlyDSL原生默认缓存，无MHA私有持久缓存层、
+自定义目录管理或额外缓存开关；所有buffer仍检查FP32 O和重复逐位一致性，不测LSE。
 
 ## 1. 快速开始
 
-以下命令均从Git仓库根目录执行。使用已有ROCm环境，不要为运行测试重装GPU依赖。
-本机已验证的环境：Python3.10.12、PyTorch2.9.1+rocm7.2.0.git7e1940d4、
-HIP7.2.26015-fc0010cf6a、FlyDSL0.3.1；AITER提交`4529fa9c72f06aa7144b2ebed3eb5ff01e3499d1`。
+在gfx950机器上从Git根执行，使用已有ROCm/AITER环境，不为测试重装GPU依赖，也不沿用MI308的临时JIT目录。
+旧MI350记录的环境为Python3.10.12、PyTorch2.9.1+rocm7.2.0.git7e1940d4、
+HIP7.2.26015-fc0010cf6a、FlyDSL0.3.1、AITER `4529fa9c72f06aa7144b2ebed3eb5ff01e3499d1`；这不是新环境验证。
 
 ```bash
 PY=/opt/venv/bin/python
-export HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0
-export FLYDSL_RUNTIME_ENABLE_CACHE=0
+MHA=tests/flydsl/mha/test_mha_pa.py
+OUT=$(mktemp -d "$PWD/tests/flydsl/mha/results/gfx950-three-suites.XXXXXX")
+export PATH="$(dirname "$PY"):$PATH"
+export GPU_ARCHS=gfx950 PYHIP_MHA_GPU=auto PYHIP_MHA_REQUIRED_PTL=current
+unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 unset FLYDSL_COMPILE_ONLY FLYDSL_COMPILE_ARCH CUDAPERF
 
-# 默认：8-wave + AITER，D192，Q10240/KV2583，noncausal。
-"$PY" tests/flydsl/mha/test_mha_pa.py
+# GPU-free：列出三套显式case，包含各自架构限制。
+"$PY" "$MHA" --list
 
-# 单wave SWA + AITER；默认Q16K/KV128K，W128，开启sink。
-"$PY" tests/flydsl/mha/test_mha_pa.py --backend swa --window 128 --sink
+# 当前整轮；all是默认suite，不再只运行一个D192 full形状。
+"$PY" "$MHA" --suite all --gpu auto --required-ptl current --buffers 10 --run-count 5 --warmup 10 --repeat 1 --output "$OUT/all.json"
 
-# 自定义causal，比较8-wave static/persistent与AITER。
-"$PY" tests/flydsl/mha/test_mha_pa.py \
-  --q 32768 --kv 32768 --dq 128 --causal --backend 8wave persistent
+# 可选：单独运行BF16或精确选择一对长SWA形状。
+"$PY" "$MHA" --suite bf16-mha --output "$OUT/bf16-mha.json"
+"$PY" "$MHA" --suite swa --case swa-kv32768-d128 swa-kv32768-d192 --output "$OUT/swa-32k.json"
 ```
 
-每次运行显示`acc=... time=... us tflops=... bw=... GB/s`，最后输出中位数表。
-`--output`保存全部样本、环境、源码hash及AITER kernel；使用新文件，不能覆盖旧结果。
+上述为当前CLI命令，未在gfx950执行。多架构混合机器须用`--gpu-pool`限定已分配的gfx950物理SMI编号，
+或用`--gpu N`选择指定卡；`GPU_ARCHS`只是编译环境变量，不是运行时选卡过滤器。
+自动选择只读检查连续3次、5秒间隔的gfx/UMC空闲与无其他进程，随后按ROCr UUID映射、核验BDF；不设置PTL/时钟/功耗，不抢占任务。
+`--required-ptl current`不筛策略；其他PTL值只筛选已经启用该策略的卡，不能强加MI308的F8策略。
+`--gpu current`保留现有可见设备、不做自动选卡/PTL筛选，性能case前后仍检查其他进程。
 
-## 2. 常用参数
+## 2. 当前参数与gfx950候选规则
 
-| 参数 | 含义 |
-|---|---|
-| `--check 1` / `--check 0` | 默认1：计时前检查FP32参考。0：只测性能，显示`acc=unchecked`，不算精度通过 |
-| `--run-count 0` | 只检查正确性，不计时 |
-| `--run-count 5 --warmup 10 --repeat 1` | 计时次数、预热次数、每个event区间的调用数；repeat>1仍报告每次调用时间 |
-| `--backend 8wave persistent swa` | 选一个或多个实现；默认8-wave，单wave需显式选`swa` |
-| `--q 128 --kv 256 --batch 3` | 三条等长序列，每条Q128/KV256 |
-| `--q-lens 33,129 --kv-lens 65,193` | 两条不等长序列；列表优先于对应的`--q/--kv`，两侧列表项数须一致 |
-| `--dq 128 192 --heads 16 --kv-heads 1` | Q/K head维度、Q head数、KV head数；Q head数须为KV head数的整数倍 |
-| `--causal` | 只允许当前位置及之前的key，Q/KV不等长时按右下角对齐 |
-| `--window 128 --sink` | 非负窗口自动开启causal；W128最多129个key，W0仅当前位置。sink只加一次分母 |
-| `--aiter auto/on/off` | auto允许缺依赖/不支持时显示N/A；on要求参考可用；off只测自有实现。数值错误始终失败 |
-| `--layout padded --poison-tail` | 同一case兼测非连续Q/O和NaN尾页；另可选`head-major` |
-| `--query-tile 16 --block-n 32` | 单wave调优参数；默认不展开全tile扫描 |
+- `--suite all|bf16-mha|fp8-mha|swa`选择显式集合；可选`--case ID ...`只筛选其中的场景，不修改输入或参考候选。不传时运行所选集合全部场景；ID必须精确且不能重复。
+  `--list`仅列参数、不初始化GPU，不加载kernel/AITER。完整CLI表见 [README.md](README.md)。
+- `--output`可选，一份根JSON保存全部所选case的`records`，成功后生成一份同名Markdown；无嵌套manifest。
+  用新文件避免覆盖；自动选卡另有同名idle JSONL日志。`--verbose-runs`显示每个样本，JSON无论如何保留全部样本。
+- 正常运行不打印选卡/准备/校验/轮次/阶段流程；性能表和逐样本性能输出不变。异常诊断仍可见，详情保留于JSON/idle JSONL；静默等待仍执行原空闲检查。
+- CLI始终检查正确性，`buffers/run-count/repeat`必须为正数，`warmup`非负；只做功能检查用pytest。
+  自定义输入请编辑主测试文件三个参数集合中的显式`Workload`行，不再使用旧的后端、preset、shape或参考开关。
 
-- `W-1`表示不限制滑动窗口，是否causal由`--causal`决定；`custom_d192`只是“自定义D192 case”的名字。
-- 单case选择`swa`或显式非负`--window`时，未指定的Q/KV默认16384/131072；其余默认10240/2583。
-- 更多配置可看`--help`，包括scale与输出路径。非单位descales的AITER比较不支持时明确N/A，
-  可用`--aiter off`检查自有kernel；不为参考偷偷改变输入值。
+三个性能函数是`test_perf_bf16_mha`（`BF16_MHA_PERF_CASES`，9项）、
+`test_perf_fp8_mha`（`FP8_MHA_PERF_CASES`，7项）及`test_perf_swa`（`SWA_PERF_CASES`，8项）。
+全部精确ID/参数见 [README.308.md](README.308.md)，下面仅列gfx950按当前架构规则展开的候选数：
 
-## 3. 一条命令复测本文性能表
+| suite / 场景 | case执行数 | gfx950每case候选 | 候选合计 |
+|---|---:|---|---:|
+| BF16 smoke，Q65/KV129，D128/192 | 2 | `bf16_950`、`bf16_950_persistent`，仅自有 | 4 |
+| BF16 full/causal，D128/192 | 4 | static、persistent、AITER | 12 |
+| BF16原dense比较的H8/HK8 MHA形状 | 3 | gfx942限定，全部skip（含P64形状） | 0 |
+| FP8全套 | 7 | gfx942限定，全部skip，无fallback | 0 |
+| SWA W0+sink小shape，D128/192 | 2 | `swa_bf16`，仅自有 | 2 |
+| SWA长shape，KV32K/64K/128K，D128/192 | 6 | static、persistent、`swa_bf16`、prepared AITER、gather+CK | 30 |
 
-沿用§1环境。下面是**生成§4全部数据的实际命令**，输出目录名随机，因此可重复执行：
+因此BF16为6个可运行case/16候选，SWA为8个case/32候选；`all`合计**14个可运行case、48候选，10个架构skip**。
+默认协议若全部成功将有**2400个event样本**；这些是规则计数，不是本机新实测。单选FP8时gfx950没有可运行候选，CLI失败，不能视为通过。
+SWA的两个KV128K重复标签已删除，独立shape覆盖不变；通用`--repeat 1`默认不变。
+
+BF16 dense及FP8外部BN32适配均已删除；FP8在gfx942也仅测自有LDS。三个原BF16形状仅在gfx942保留为自有+AITER；其余非smoke BF16和长SWA的声明参考是**必需项**。
+缺依赖、JIT失败或数值错误必须失败，不能自动去掉AITER/gather或缩小输入来凑通过。
+
+## 3. 当前计时与比较口径
+
+默认10个独立Q/K/V、scale/metadata和O/workspace，seed依次为20260905+i；warmup10、run-count5、repeat1。
+每轮遍历全部buffer，每候选50个event，不是只测5个buffer。`repeat`增大时逐调用轮转并归一化为每调用时间。
+所有buffer都先检查FP32 O、有限值及两次逐位重复；BF16逐元素`rtol=atol=0.02`，acc为逐buffer归一化平方误差的最大值。
+
+- 采用`pyhip.cudaPerf` GPU event的全部样本中位数，不删慢样本或挑最快值；辅助launch与间隙在event内，GPU spin在起始event前。
+  JIT、FP32参考、量化、workspace分配和prepared布局转换在计时外；不测LSE。
+- 有效FLOPs为 $2H_q\sum_b N_{visible,b}(D_{qk}+D_v)$，只计可见QK/PV，不计mask/padding和sink。
+  带宽按逻辑Q/K/V/O计字节，SWA仍含完整逻辑KV；**不是实测HBM流量**。
+- AITER full使用公开varlen路由，不强制OPUS；窗口/sink显式用CK。prepared AITER的线性KV提前准备，不能称作分页端到端性能。
+- `aiter_gather`每次完整读取分页KV并写出线性workspace，再执行CK；一对event覆盖两个dispatch，不缓存gather、不裁前缀。
+  其逻辑字节在Q/K/V/O之上另加完整KV读+写，因此不能用不同分子的GB/s大小代替同shape延迟比较。
+
+若只选择旧表中的6个逻辑形状，可使用当前ID，但现在会额外包含2条gather+CK，按默认协议为22候选/1100样本，**不是旧20候选/100 run复现**：
 
 ```bash
-OUT=$(mktemp -d "$PWD/tests/flydsl/mha/results/readme-repro.XXXXXX")
-"$PY" tests/flydsl/mha/test_mha_pa.py \
-  --preset basic --dq 128 192 --backend 8wave persistent swa \
-  --aiter on --check 1 --run-count 5 --warmup 10 --repeat 1 \
-  --output "$OUT/performance.json"
+"$PY" "$MHA" --suite all --case bf16-full-d128 bf16-full-d192 bf16-causal-d128 bf16-causal-d192 swa-kv131072-d128 swa-kv131072-d192 --output "$OUT/historical-shapes-current-protocol.json"
 ```
 
-统一B1/H16/HK1、BF16/V128/page64、预分配O、unit descales、per-token Q scale、零尾页；
-固定随机种子20260905。`basic`只包含以下三类，每类测D128与D192：
+## 4. 历史MI350性能记录（旧6形状 / 20候选 / 100 run）
 
-| 场景 | 每序列Q / KV | 模式 | 实际候选 |
-|---|---|---|---|
-| Full | 10240 / 2583 | noncausal | 8-wave static、persistent、AITER |
-| Causal | 32768 / 32768 | causal | 8-wave static、persistent、AITER |
-| SWA | 16384 / 131072 | W128 + sink | 8-wave static、persistent、单wave、AITER |
-
-共**6个shape、20个候选结果、100个计时run**。只选`--backend swa --preset basic --dq 128 192`
-则只跑两个SWA shape。其它batch、窗口、长序列用§2参数直接配置，不再增加另一套功能测试。
-
-### 数据口径
-
-- `acc`是`pyhip.calc_diff`的归一化平方误差，约为 $\sum(ref-out)^2/\sum(ref^2+out^2)$，
-  **越小越好，0表示一致**，不是准确率百分比。同时逐元素检查`rtol=atol=0.02`及有限值。
-  每个shape的所有候选检查通过后才计时；失败打印`acc`并停止，不能把坏结果当快结果。
-- 时间使用`pyhip.cudaPerf` GPU event，每个run单独记录，最终取所有run的中位数。
-  区间内包含launch间隙，计时器自带的GPU spin在起始event之前；不包含JIT、FP32参考和布局准备。
-- 有效FLOPs为 $2H_q\sum_b N_{visible,b}(D_{qk}+D_v)$，只计真实可见QK/PV，不计mask/padding和sink。
-  $\mathrm{TFLOPS}=F/(t_{\mu s}10^6)$；带宽为逻辑Q/K/V/O字节除时间，单位GB/s。
-  **带宽不是实测HBM流量**，尤其SWA的逻辑KV字节包含未访问前缀。
-- AITER输入是提前准备的linear KV，自有kernel直接读取5D分页KV；转换不计时，不能称为
-  完整分页端到端对照。full走公开varlen路由，窗口/sink显式走CK，避免W0/sink被错误路由。
-
-## 4. 性能实测记录
-
-2026-09-07 11:53 UTC，MI350X/gfx950、256 CU；代码起点`2bdffaa`，实际工作树源码hash记录在JSON。
-**全部20个候选精度通过**。这是一轮非独占快速诊断，保留原auto-DPM/功耗策略、PTL=N/A。
-命令可以复现输入和流程，**不保证共享GPU上的微秒数完全一致**；部分SWA轮次波动明显，
-请查看全部样本，不挑最快一轮，也不与旧profiler计时拼接比较。
+以下数值原样保留自旧文档：2026-09-07 11:53 UTC，MI350X/gfx950、256 CU，代码起点`2bdffaa`。
+当时单buffer、warmup10/run-count5/repeat1；B1/H16/HK1/V128/page64/unit descales/per-token、seed20260905。
+Full Q10240/KV2583、causal Q32768/KV32768各有static/persistent/AITER；SWA Q16384/KV131072/W128+sink另加单wave，**没有gather+CK**。
+旧记录记载20候选精度通过，是非独占快速诊断，保留auto-DPM/功耗策略、PTL=N/A。
+**当前工作树未附带该轮原始文件，本文未重新核验这些历史数值，更未将其记作新gfx950结果。**
 
 后端：`bf16_950`=8-wave static，`bf16_950_persistent`=8-wave persistent，`swa_bf16`=单wave。
 
@@ -125,12 +123,11 @@ OUT=$(mktemp -d "$PWD/tests/flydsl/mha/results/readme-repro.XXXXXX")
 | swa_d192 | swa_bf16 | 2.74844e-6 | 79.523 | 272.155 | 3164.597 |
 | swa_d192 | aiter | 2.74844e-6 | 123.964 | 174.588 | 2030.091 |
 
-来源：[本次JSON](results/readme-repro.BqIaWy/performance.json)、
-[逐run日志](results/readme-repro.BqIaWy/performance.log)。自动生成的结果表与本文来自同一轮，
-JSON的`config`、`protocol`、`environment`包含复测所需参数、环境和源码身份。
-后续删除旧脚本、精简helper未改内核、输入或计时方式；本表及JSON保留原测量值和源码hash。
+原文历史链接保留（当前工作树缺失，无法本地复核）：[历史JSON](results/readme-repro.BqIaWy/performance.json)、
+[历史逐run日志](results/readme-repro.BqIaWy/performance.log)。旧JSON的`config`、`protocol`、`environment`记录当时参数、环境和源码身份。
+仅设为单buffer也不能把新候选集合还原为旧集合。
 
-| AITER场景 | 本轮实际命中的kernel |
+| AITER场景 | 旧文档记录的kernel（非当前命中验证） |
 |---|---|
 | D128 full / causal | `aiter::fmha_fwd_hd128_bf16_group` / `aiter::fmha_fwd_hd128_bf16_causal_group`（ASM） |
 | D192 full / causal | `gqa_d192_v128_kernel<...>`（OPUS） |
@@ -138,33 +135,41 @@ JSON的`config`、`protocol`、`environment`包含复测所需参数、环境和
 | D192 SWA | CK `BlockFmhaPipelineQRKSVSAsync` |
 
 不要求AITER必须命中OPUS，也不要求自有实现所有case都快于AITER；以实际输出的kernel与样本为准。
-更换AITER/编译器后应重新跑相同命令，不能沿用旧列名认定同一实现。
+更换AITER/编译器后应按当前ID重新测试，不能沿用旧列名认定同一实现，也不能跨计时协议拼接性能结论。
 
 ## 5. 基本功能测试与通过标准
 
-性能命令本身已经检查主shape正确性。日常只运行[test_mha_pa.py](test_mha_pa.py)，
-独立的测试工具回归文件已移除，主文件仅保留以下6项边界检查：
+全部测试辅助代码已合入主文件，原6个辅助模块和本目录conftest已删除；生产kernel和共用DSL适配保持独立。
+性能case本身检查主shape正确性；普通pytest默认仅收集14个边界功能项，`PYHIP_MHA_PERF=1`才额外收集24个性能项。
+当前gfx950架构适用性如下，**不是本次通过结果**：
 
-| 测试 | 范围 | 本次结果 |
-|---|---|---:|
-| `test_page_boundaries` | D128/192×8-wave static/persistent；短ragged、空KV、NaN尾页、padded布局、非单位scale | 4通过 |
-| `test_swa_page_boundaries` | D128/192单wave；同类边界加W128/sink | 2通过 |
+| 测试 | 范围 | gfx950架构适用性 |
+|---|---|---|
+| `test_bf16_mha` | D128/192×static/persistent；ragged、空Q/KV、NaN尾页、padded布局、非单位scale | 4项可运行 |
+| `test_swa` | D128/192单wave；同类边界加W128/sink | 2项可运行 |
+| `test_fp8_mha` | D128/192×C/NC×两种Q scale，仅gfx942 | 8项skip |
 
-复现当前**6通过、0失败、0跳过**：
+按第1节环境运行普通功能测试，或显式启用性能集：
 
 ```bash
-"$PY" -m pytest tests/flydsl/mha/test_mha_pa.py --import-mode=importlib -q --junitxml="$OUT/tests.xml"
+PYHIP_MHA_SELECTION_LOG="$OUT/pytest-functional-gpu.jsonl" "$PY" -m pytest "$MHA" --import-mode=importlib -q --junitxml="$OUT/tests.xml"
+PYHIP_MHA_PERF=1 PYHIP_MHA_OUTPUT="$OUT/pytest-perf" PYHIP_MHA_SELECTION_LOG="$OUT/pytest-perf-gpu.jsonl" "$PY" -m pytest "$MHA" --import-mode=importlib -k test_perf_ -q
 ```
 
-清理后证据：[JUnit](results/cleanup.jML3Sd/tests.xml)、[日志](results/cleanup.jML3Sd/tests.log)。
-目录级pytest也仅收集这6项；旧专项脚本及其测试已删除，不再需要收集排除配置。
-另以Q65/KV129、D128/192验证了[full](results/cleanup.jML3Sd/full.json)和
-[W0+sink SWA](results/cleanup.jML3Sd/swa.json)：含AITER的14个候选均通过精度检查并输出逐run指标。
-这些小形状只验证入口与指标，不作为性能对比；§4数据仍是原始完整性能轮次。
+性能pytest共24参数项，在gfx950按规则14项可运行、10项架构skip；每项可含多个候选，不等于48个pytest项。
+`PYHIP_MHA_PERF=1`在收集前启用性能函数，`-k test_perf_`只选性能；省略`-k`则同时执行功能与性能。
+`PYHIP_MHA_OUTPUT`可省略，指定时使用新目录，每case一对JSON/Markdown，已有同名文件拒绝覆盖；不再使用原pytest自定义参数/marker。
+pytest选卡使用`PYHIP_MHA_GPU`/`PYHIP_MHA_REQUIRED_PTL`，未设置时GPU默认为current，收集阶段不初始化GPU。
+混合架构机器的pytest应设置`PYHIP_MHA_GPU=N`限定已分配的gfx950物理卡；pytest不接受CLI的候选池选项。
+没有新增CPU测试或独立gather测试；gather的运行时检查仍在SWA性能对照内。
 
-**日常OK**：主shape精度检查通过，以上6项通过，计时有效且报告完整。`--check 0`不是精度通过，
-缺依赖的N/A不是已验证。不以单次快测判断小比例性能变化；若要确认优化/回退，在同机同配置下
-保留修改前后样本逐case比较。正式性能结论另需独占/负载证据。
+**历史功能证据链接保留，当前工作树缺失**：[JUnit](results/cleanup.jML3Sd/tests.xml)、[日志](results/cleanup.jML3Sd/tests.log)。
+旧文档记载6项通过；当时尚无当前8项gfx942 FP8功能项，不能再写成当前“6通过/0跳过”。
+旧Q65/KV129检查的[full](results/cleanup.jML3Sd/full.json)及
+[W0+sink SWA](results/cleanup.jML3Sd/swa.json)曾包含AITER，共14候选；它们不是现在仅自有的smoke范围。
+
+**新gfx950验收仍待原生运行**：6个适用功能项需实际通过，8个FP8项应明确skip；
+性能报告需完整、所有已声明候选正确且计时有效。缺参考不是通过，不以共享设备单次快测判断小比例优化；正式结论另需负载/独占证据。
 
 ## 6. 开发参考与保留事项
 
@@ -173,15 +178,12 @@ JSON的`config`、`protocol`、`environment`包含复测所需参数、环境和
 - **单wave**：W≤16默认QT16/BN16，其余QT32/BN32；两个16行子tile共享K/V，先QK再PV，
   控制寄存器生命周期；lazy-max和lane-local sum不能改变sink只加一次的语义。
 - **边界安全**：只mask概率不足以消除V尾部NaN，0×NaN仍为NaN；保持offset/stride正确。
-  单wave并非所有宽窗都最优，新增优化用相应`--window`复测，不据窄窗推断全部窗口。
-- **环境**：逻辑GPU0不一定是SMI索引0，本机对应PCI `0000:75:00.0` / SMI索引3。
-  不自动设置时钟/功耗/PTL，不终止其它任务；需要空闲检查加`--require-idle`。
-- **历史资料**：旧A/B、ISA、OPUS与其它机器的原始结果保留，但不再把多轮表格混入本文。
-  原文件hash与当时协议仍以各自JSON为准，旧数量不代表当前小套件已重新运行。
-- **gfx942 / MI325**：不属于上面的本机验收；BF16 page32历史差距仍需在对应机器确认，
-  FP8与指定参考的验收曾受设备健康问题阻塞，不能视为通过。相关内核仍由主入口选择，
-  本次未重新做gfx942原生验证；不要套用gfx950数据或修改共享机器策略来凑门槛。
+  单wave并非所有宽窗都最优；新形状应作为显式`Workload`记录，不据窄窗推断全部窗口。
+- **选卡**：自动模式会覆盖可见设备变量，调度器环境须限定已分配的物理卡池；逻辑GPU0不是固定SMI编号。
+  用户级锁不是系统预约，整个流程不改硬件策略或终止他人任务。
+- **缓存**：核对FlyDSL版本、`env.runtime.enable_cache`、`env.runtime.cache_dir`和残留环境覆盖；
+  沿用原生默认，不叠加私有缓存，也不通过减少10-buffer或跳过精度检查掩盖问题。
+- **历史资料**：旧A/B、ISA、OPUS与跨机器数据保持原值及原协议；缺失的历史附件不新建或伪造，不把旧数量当新验收。
 
-目录只保留主入口、4个内核、必要helper和两份README，职责见[目录说明](README.md)。
-换机需携带当前工作树与依赖；只复制commit会遗漏未提交修改。每次结果另存新目录，
-不覆盖历史JSON/JUnit/ISA。
+目录职责见 [README.md](README.md)，跨机记录见 [changes.md](changes.md)。换机需携带实际工作树和依赖，
+只复制commit可能遗漏未提交修改；所有新结果另存，不覆盖历史JSON/JUnit/ISA。

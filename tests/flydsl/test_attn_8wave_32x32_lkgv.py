@@ -2,8 +2,6 @@
 import functools
 import os
 
-os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
-
 import torch
 
 import flydsl.compiler as flyc

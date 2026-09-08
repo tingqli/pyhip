@@ -7,9 +7,6 @@ dispatched. Empty KV sequences are outside this backend's current contract.
 
 import functools
 import math
-import os
-
-os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
 import torch
 
