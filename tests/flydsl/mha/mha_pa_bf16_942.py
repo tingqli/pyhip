@@ -95,8 +95,9 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
                 if kv_pos > causal_limit:
                     fragS[i,0,0] = float("-inf")
 
-
-    scores = fragS.load() * sm_scale_log2
+    # Keep the scalar row scale scalar in the generated ISA. Generic vector
+    # arithmetic duplicates it for packed-FP32 operations across the hot loop.
+    scores = fxh.eltwise_op("v_mul_f32", fragS.load(), sm_scale_log2)
 
     row_max = scores.reduce("max")
     row_max = _maxnumf(row_max, row_max.shuffle_xor(32, 64))
@@ -109,7 +110,7 @@ def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
         # do not use inline asm inside scf.If, use intrinsic instead
         corr = fxh.eltwise_op("llvm.amdgcn.exp2.f32", old_max - new_max)
 
-    probs = fxh.eltwise_op("v_exp_f32", scores - new_max)
+    probs = fxh.eltwise_op("v_exp_f32", fxh.eltwise_op("v_sub_f32", scores, new_max))
     row_sum = probs.reduce("add")
 
     # this fake instruction avoids spills for some reason, but seems to be not required anymore
@@ -184,7 +185,12 @@ def _build_attention(
     # retain the original QK/V overlap for the default V128/no-LSE path.
     defer_v = head_dim_v == 192 or (head_dim_qk == 192 and with_lse)
     stream_k = head_dim_v == 192
-    bounded_k = head_dim_qk == 192 or head_dim_v == 192 or page_size == 128
+    # Scalar softmax leaves room for the normal LDS/PV overlap at D128/page128.
+    # Keep use-site address recomputation for wider operands or extra LSE state.
+    bounded_k = head_dim_qk == 192 or head_dim_v == 192 or (page_size == 128 and with_lse)
+    # Explicit closure dependency: the helper is invoked by the nested kv_step.
+    # Native JIT cache discovery must see it without scanning nested code objects.
+    softmax = online_softmax
 
     @flyc.jit
     def attn_pipeline(q_tile, # [BM, head_dim_qk]
@@ -335,9 +341,13 @@ def _build_attention(
         v_copy_atom = flyobj.get_universal_copy_atom(v_tile.dtype, 128)
 
         def load_v(page, part):
-            v_thrcopy = fx.make_tiled_copy_A(v_copy_atom, tmma2).get_slice(_late_thread_id())
+            # D128/no-LSE has room to retain page-local lane offsets; do not
+            # rebuild them between QK MFMAs. Wider paths retain bounded live
+            # addresses. Both paths still use full-width GLOBAL addressing.
+            v_tid = tid if head_dim_qk == 128 and head_dim_v == 128 and not with_lse else _late_thread_id()
+            v_thrcopy = fx.make_tiled_copy_A(v_copy_atom, tmma2).get_slice(v_tid)
             fx.copy(v_copy_atom, v_thrcopy.partition_S(v_tile[None, None, page, part]),
-                v_thrcopy.retile(fragV))
+                    v_thrcopy.retile(fragV))
 
         def kv_step(page_n, lds_buff_id, cur_max, l_in,
                     kv_page_id0, kv_page_id1, kv_page_id2, kv_page_id3,
@@ -346,9 +356,8 @@ def _build_attention(
             # The explicit-loop induction variable is MLIR index. Convert
             # before indexing a buffer descriptor (whose offset is i32),
             # otherwise older layout lowering emits invalid extsi i64->i32.
-            kv_page_id4 = _uniform(ptr_kv_page_table[fx.Int32(page_n + 4)])
-
             kv_page_0123 = [kv_page_id0, kv_page_id1, kv_page_id2, kv_page_id3]
+            kv_page_id4 = fx.Int32(0)
 
             for bn_i in fx.range_constexpr(num_BN_per_page):
                 bn0_page = kv_page_0123[(bn_i + 0)//num_BN_per_page]
@@ -407,9 +416,15 @@ def _build_attention(
                 rocdl.s_setprio(0)
                 rocdl.sched_barrier(0)
 
+                if fx.const_expr(bn_i == 0):
+                    # Prefetch metadata in the non-MFMA phase. Leave the
+                    # loaded value in a VGPR until this step has completed;
+                    # it must not consume a QK/V VMEM scheduling slot.
+                    kv_page_id4 = ptr_kv_page_table[fx.Int32(page_n + 4)]
+
                 if fx.const_expr(is_valid_block_n(block_n)):
                     # q_pos0, kv_len
-                    cur_max, l_in, probability_operand = online_softmax(
+                    cur_max, l_in, probability_operand = softmax(
                         fragS, fragO, qk_scale_log2, cur_max, l_in,
                         q_pos0, block_n, kv_len, full_qo_len,
                         is_all_kv_valid, BN, is_causal, head_dim_qk == 192 and page_size == 128,
@@ -459,7 +474,7 @@ def _build_attention(
                 fx.rocdl.sched_barrier(0)
                 lds_buff_id = lds_buff_id^1
 
-            return lds_buff_id, cur_max, l_in, kv_page_id1, kv_page_id2, kv_page_id3, kv_page_id4
+            return lds_buff_id, cur_max, l_in, kv_page_id1, kv_page_id2, kv_page_id3, _uniform(kv_page_id4)
 
         if (_late_thread_id() // 256) == 1:
             gpu.barrier()
