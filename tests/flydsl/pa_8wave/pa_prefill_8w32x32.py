@@ -1,7 +1,4 @@
 import functools
-import os
-
-os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
 import torch
 
@@ -14,8 +11,6 @@ from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr.typing import Vector as Vec
 
 import pyhip.contrib.flydsl.helpers as fxh
-
-fxh.dump_ir(True)
 
 def _maxnumf(a, b):
     """Non-NaN-propagating f32 max used by the wave softmax reduction."""

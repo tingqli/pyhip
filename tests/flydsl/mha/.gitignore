@@ -1,0 +1,8 @@
+# These are intentionally retained ISA evidence, not transient JIT dumps.
+# Override the repository-wide *.s exclusion only inside this test directory.
+!results/**/*.s
+
+# Runtime caches are not part of the cross-machine handoff.
+__pycache__/
+*.py[cod]
+.pytest_cache/
