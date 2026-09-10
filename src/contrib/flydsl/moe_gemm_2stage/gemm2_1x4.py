@@ -41,6 +41,8 @@ def _build_moe_gemm2_1x4(
     down_path="default",
     down_output_padding_bytes=None,
     METADATA_TILE_SIZE_M=None,
+    _task_table=False,
+    _store_cache=_DOWN_STORE_CACHE_MODIFIER,
 ):
     assert stage == "down"
     assert down_path == "1x4_64x256"
@@ -309,11 +311,13 @@ def _build_moe_gemm2_1x4(
         e_idx = _map_down_task(max_valid_id, False, block_m_per_4wave_group)
         e_offset = fx.Int64(e_idx)
         if e_idx * block_m_per_4wave_group < max_valid_id:
+            if const_expr(_task_table):
+                row_begin = fx.Int64(p_sorted_expert_ids[2 * e_idx])
             # 1. 建立当前expert任务的输入、输出、sorted metadata和weight视图。
             arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
             arg_p_output = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_output, fx.BFloat16)
-                + e_offset * (block_m_per_4wave_group * output_row_stride),
+                + (row_begin * output_row_stride if const_expr(_task_table) else e_offset * (block_m_per_4wave_group * output_row_stride)),
                 (block_m_per_4wave_group, output_row_stride),
             )
             output_store_rsrc = fx.buffer_ops.create_buffer_resource(
@@ -322,23 +326,22 @@ def _build_moe_gemm2_1x4(
                 num_records_bytes=block_m_per_4wave_group * output_row_stride * 2,
             )
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_ids) + e_offset * block_m_per_4wave_group,
+                fxh._as_ptr(p_sorted_ids) + (row_begin if const_expr(_task_table) else e_offset * block_m_per_4wave_group),
                 (block_m_per_4wave_group,),
                 fx.Int32,
             )
             arg_p_sorted_weights = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_weights) + e_offset * block_m_per_4wave_group,
+                fxh._as_ptr(p_sorted_weights) + (row_begin if const_expr(_task_table) else e_offset * block_m_per_4wave_group),
                 (block_m_per_4wave_group,),
                 fx.Float32,
             )
-            expert_id = fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[
-                e_idx
-            ]
+            expert_id = p_sorted_expert_ids[2 * e_idx + 1] if const_expr(_task_table) else fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[e_idx]
 
             # 16bytes/DW4
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
-                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id * N * K),
+                fxh._as_ptr(p_weight, weight_dtype)
+                + (fx.Int64(expert_id) * N * K if const_expr(_task_table) else fx.Int64(expert_id * N * K)),
                 fx.make_layout(
                     (
                         ((4, 2, 2, 4, 4, N // 256)),
@@ -643,7 +646,7 @@ def _build_moe_gemm2_1x4(
                         Vec(out_frags[0].load()).bitcast(fx.Int32),
                         output_store_rsrc,
                         byte_offsets[0],
-                        cache_modifier=_DOWN_STORE_CACHE_MODIFIER,
+                        cache_modifier=_store_cache,
                         offset_is_bytes=True,
                     )
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
@@ -651,7 +654,7 @@ def _build_moe_gemm2_1x4(
                         Vec(out_frags[1].load()).bitcast(fx.Int32),
                         output_store_rsrc,
                         byte_offsets[1],
-                        cache_modifier=_DOWN_STORE_CACHE_MODIFIER,
+                        cache_modifier=_store_cache,
                         offset_is_bytes=True,
                     )
 
@@ -752,7 +755,7 @@ def _build_moe_gemm2_1x4(
                             Vec(out_frags[0].load()).bitcast(fx.Int32),
                             output_store_rsrc,
                             byte_offsets[0],
-                            cache_modifier=_DOWN_STORE_CACHE_MODIFIER,
+                            cache_modifier=_store_cache,
                             offset_is_bytes=True,
                         )
                         fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
@@ -760,7 +763,7 @@ def _build_moe_gemm2_1x4(
                             Vec(out_frags[1].load()).bitcast(fx.Int32),
                             output_store_rsrc,
                             byte_offsets[1],
-                            cache_modifier=_DOWN_STORE_CACHE_MODIFIER,
+                            cache_modifier=_store_cache,
                             offset_is_bytes=True,
                         )
 
@@ -946,4 +949,5 @@ def _build_moe_gemm2_1x4(
         )
         kernel.launch(grid=(1, task_num, 1), block=(256, 1, 1), stream=stream)
 
+    launch_prefill_1x4.compile_hints["target_features"] = "-packed-fp32-ops"
     return launch_prefill_1x4

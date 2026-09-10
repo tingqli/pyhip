@@ -442,6 +442,7 @@ def _derive(args):
         "waves_per_simd",
         "n_tiles_per_wg",
         "accumulator_destinations",
+        "b_load_cooperation",
     ):
         if getattr(args, name) < 1:
             raise RuntimeError(f"{name.replace('_', '-')} must be positive")
@@ -451,6 +452,8 @@ def _derive(args):
         raise RuntimeError("waves-m * waves-n must be 4, 8, or 16")
     if args.bm % args.waves_m or args.bn % args.waves_n:
         raise RuntimeError("BM/BN must be divisible by waves-m/waves-n")
+    if args.waves_m % args.b_load_cooperation:
+        raise RuntimeError("b-load-cooperation must divide waves-m")
     wave_m = args.bm // args.waves_m
     wave_n = args.bn // args.waves_n
     if wave_m % 16 or wave_n % 16:
@@ -481,7 +484,7 @@ def _derive(args):
     c_tiles_per_wave = (wave_m // 16) * (wave_n // 16)
     mfma_per_wave_per_k = c_tiles_per_wave * (args.bk // 32)
     a_bytes_per_wave_per_k = wave_m * args.bk
-    b_bytes_per_wave_per_k = wave_n * args.bk
+    b_bytes_per_wave_per_k = wave_n * args.bk // args.b_load_cooperation
     d_bytes_per_wave = wave_m * wave_n * 2
 
     if args.a_in_reg:
@@ -567,6 +570,7 @@ def _logical_access_multiset(args):
             n_tile = n_tile_begin + n_tile_in_wg
             for wave in range(derived.waves_per_workgroup):
                 wave_m, wave_n = divmod(wave, args.waves_n)
+                b_cooperation_rank = wave_m % args.b_load_cooperation
                 a_stream = (batch_id * derived.m_tiles + m_tile) * args.waves_m + wave_m
                 b_stream = (batch_id * derived.n_padded // args.bn + n_tile) * args.waves_n + wave_n
                 d_stream = (
@@ -576,7 +580,8 @@ def _logical_access_multiset(args):
                     for read in range(derived.a_reads_per_wave_per_k):
                         accesses["a"][(a_stream, k_tile, read)] += 1
                     for read in range(derived.b_reads_per_wave_per_k):
-                        accesses["b"][(b_stream, k_tile, read)] += 1
+                        cooperative_read = b_cooperation_rank * derived.b_reads_per_wave_per_k + read
+                        accesses["b"][(b_stream, k_tile, cooperative_read)] += 1
                 for write in range(derived.d_writes_per_wave):
                     accesses["d"][(d_stream, write)] += 1
     return accesses
@@ -597,6 +602,7 @@ def batched_gemm_core_ceiling(
     n_tiles_per_wg,
     waves_per_simd,
     accumulator_destinations,
+    b_load_cooperation,
     cross_n_prefetch,
     cross_n_spread_stores,
     a_in_reg,
@@ -619,7 +625,7 @@ def batched_gemm_core_ceiling(
     c_tiles = (wave_m_size // 16) * (wave_n_size // 16)
     mfma_per_k = c_tiles * (bk // 32)
     a_bytes_per_k = wave_m_size * bk
-    b_bytes_per_k = wave_n_size * bk
+    b_bytes_per_k = wave_n_size * bk // b_load_cooperation
     d_bytes_per_wave = wave_m_size * wave_n_size * 2
     a_reads = 0 if a_in_reg else a_bytes_per_k // BYTES_PER_WAVE_OP
     b_reads = b_bytes_per_k // BYTES_PER_WAVE_OP
@@ -656,6 +662,7 @@ def batched_gemm_core_ceiling(
     wave = builder.warp_id[0]
     wave_m = wave // waves_n
     wave_n = wave % waves_n
+    b_cooperation_rank = wave_m % b_load_cooperation
 
     a_stream_bytes = wave_m_size * k_padded
     b_stream_bytes = wave_n_size * k_padded
@@ -720,7 +727,10 @@ def batched_gemm_core_ceiling(
                 operation += 1
         for read_index in range(b_reads):
             operation_offsets[operation] = (
-                n_tile_in_wg * waves_n * b_stream_bytes + k_tile * b_bytes_per_k + read_index * BYTES_PER_WAVE_OP
+                n_tile_in_wg * waves_n * b_stream_bytes
+                + k_tile * (b_bytes_per_k * b_load_cooperation)
+                + b_cooperation_rank * b_bytes_per_k
+                + read_index * BYTES_PER_WAVE_OP
             )
             operation += 1
 
@@ -916,6 +926,7 @@ def _launch(args, derived, a, b, d):
         args.n_tiles_per_wg,
         args.waves_per_simd,
         args.accumulator_destinations,
+        args.b_load_cooperation,
         args.cross_n_prefetch,
         args.cross_n_spread_stores,
         args.a_in_reg,
@@ -982,6 +993,7 @@ def _config_dict(args, derived):
             "waves_per_workgroup": derived.waves_per_workgroup,
             "requested_waves_per_simd": args.waves_per_simd,
             "accumulator_destinations": args.accumulator_destinations,
+            "b_load_cooperation": args.b_load_cooperation,
             "cross_n_prefetch": args.cross_n_prefetch,
             "cross_n_spread_stores": args.cross_n_spread_stores,
             "a_in_reg": args.a_in_reg,
@@ -1247,6 +1259,12 @@ def _candidate_arguments(parser):
         choices=(1, 2, 3, 4),
         default=1,
     )
+    parser.add_argument(
+        "--b-load-cooperation",
+        type=int,
+        default=1,
+        help="number of wave-m peers that cooperatively cover one B tile",
+    )
     parser.add_argument("--cross-n-prefetch", action="store_true")
     parser.add_argument("--cross-n-spread-stores", action="store_true")
     parser.add_argument("--a-in-reg", action="store_true")
@@ -1402,6 +1420,52 @@ def _self_test():
         assert "requires at least 8" in str(error)
     else:
         raise AssertionError("W4 2stage_barrier unexpectedly accepted")
+
+    cooperative_args = _parser().parse_args(
+        [
+            "bench",
+            "--batch",
+            "512",
+            "--m",
+            "2560",
+            "--n",
+            "4096",
+            "--k",
+            "256",
+            "--bm",
+            "256",
+            "--bn",
+            "64",
+            "--bk",
+            "128",
+            "--waves-m",
+            "4",
+            "--waves-n",
+            "1",
+            "--n-tiles-per-wg",
+            "8",
+            "--waves-per-simd",
+            "2",
+            "--b-load-cooperation",
+            "4",
+            "--a-in-reg",
+        ]
+    )
+    cooperative = _derive(cooperative_args)
+    assert cooperative.wave_m == 64 and cooperative.wave_n == 64
+    assert cooperative.m_tiles == 10 and cooperative.n_tile_groups == 8
+    assert cooperative.k_tiles == 2 and cooperative.workgroups == 40_960
+    assert cooperative.mfma_per_wave_per_k == 64
+    assert cooperative.b_reads_per_wave_per_k == 2
+    assert cooperative.d_writes_per_wave == 8
+    cooperative_accesses = _logical_access_multiset(cooperative_args)
+    cooperative_args.b_load_cooperation = 1
+    baseline_accesses = _logical_access_multiset(cooperative_args)
+    assert cooperative_accesses["b"].keys() == baseline_accesses["b"].keys()
+    assert all(
+        count * 4 == baseline_accesses["b"][key]
+        for key, count in cooperative_accesses["b"].items()
+    )
     print("self-test passed: geometry, work, VMEM, and padding")
 
 

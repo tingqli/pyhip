@@ -205,7 +205,13 @@ def _build_moe_gemm2_2x4(
             )
         return packed
 
-    down_ops = fxh.FlyObjCache()
+    generic_down_ops = fxh.FlyObjCache()
+    topology_down_ops = fxh.FlyObjCache()
+
+    def get_down_ops(topology_map):
+        if topology_map:
+            return topology_down_ops
+        return generic_down_ops
 
     @flyc.jit
     def _map_down_task(
@@ -414,7 +420,7 @@ def _build_moe_gemm2_2x4(
                 * (TOPK * K)
                 * (arg_p_input.dtype.width // 8),
             )
-            cp_atom = down_ops.get_buffer_copy_atom(arg_p_input.dtype, 128)
+            cp_atom = get_down_ops(topology_map).get_buffer_copy_atom(arg_p_input.dtype, 128)
 
             def flatten_A(x):
                 # second mode is innermost, so swap before flattening
@@ -464,7 +470,7 @@ def _build_moe_gemm2_2x4(
             # 当前N块scale固定延迟到MFMA后读取，避免拉长live range。
             if use_direct_ptpc_scale:
                 assert BLOCK_K == 128 and nBK == 3
-            mm = down_ops.create_thr_mma(weight_dtype, (4, 1, 1), tid=local_tid)
+            mm = get_down_ops(topology_map).create_thr_mma(weight_dtype, (4, 1, 1), tid=local_tid)
 
             c_fake_tensor = fx.make_view(
                 fx.get_iter(arg_p_input),
@@ -509,7 +515,7 @@ def _build_moe_gemm2_2x4(
                         fx.get_iter(scale_lds),
                         fx.make_layout(((4, 2, 2, 4, 4), 1), ((1, 16, 32, 64, 4), 0)),
                     )
-            scale_lds_copy_atom = down_ops.get_universal_copy_atom(fx.Float32, 128)
+            scale_lds_copy_atom = get_down_ops(topology_map).get_universal_copy_atom(fx.Float32, 128)
 
             def issue_scale_block_global(block_n):
                 lane_id = local_tid % 64
@@ -539,7 +545,7 @@ def _build_moe_gemm2_2x4(
                     scale_frag = fx.make_fragment_like(scale_dst)
                     scale_frag.store(scale_vec)
                     fx.copy(scale_lds_copy_atom, scale_frag, scale_dst)
-                return down_ops.load_tiled_mma_fragC(
+                return get_down_ops(topology_map).load_tiled_mma_fragC(
                     mm, scale_lds_logical, dst=dst, copy_atom_bits=128
                 )
 
@@ -579,7 +585,7 @@ def _build_moe_gemm2_2x4(
                 fx.make_layout((BLOCK_N, BLOCK_M), (0, 1)),
             )
             # load rows/token weights using C layout
-            frag_sorted_weight = down_ops.load_tiled_mma_fragC(
+            frag_sorted_weight = get_down_ops(topology_map).load_tiled_mma_fragC(
                 mm, sorted_weights, copy_atom_bits=32
             )
 
@@ -588,16 +594,16 @@ def _build_moe_gemm2_2x4(
                 frag_sorted_weight.store(frag_sorted_weight.load() * combined_scale)
             elif fx.const_expr(arg_a_scale is not None):
                 """Load per-token scales and combine them with routing weights."""
-                cp_atom = down_ops.get_buffer_copy_atom(p_a_scale.dtype, 32)
+                cp_atom = get_down_ops(topology_map).get_buffer_copy_atom(p_a_scale.dtype, 32)
                 coord_tensor = fx.make_view(
                     fx.get_iter(arg_p_sorted_ids),
                     fx.make_layout((BLOCK_N, BLOCK_M), (0, 1)),
                 )
-                frag_coord = down_ops.load_tiled_mma_fragC(
+                frag_coord = get_down_ops(topology_map).load_tiled_mma_fragC(
                     mm, coord_tensor, copy_atom_bits=32
                 )
                 frag_pt_scales = mm.make_fragment_C(coord_tensor)
-                frag_pt_scalesr = down_ops.get_tiled_mma_retile(
+                frag_pt_scalesr = get_down_ops(topology_map).get_tiled_mma_retile(
                     mm, frag_pt_scales, "C", copy_atom=cp_atom
                 )
 
@@ -617,7 +623,7 @@ def _build_moe_gemm2_2x4(
                         combined_scale = combined_scale * per_tensor_w_scale
                     frag_pt.store(combined_scale)
                 frag_sorted_weight = frag_pt_scales
-            cshuffle_copy_atom = down_ops.get_universal_copy_atom(fx.BFloat16, 128)
+            cshuffle_copy_atom = get_down_ops(topology_map).get_universal_copy_atom(fx.BFloat16, 128)
 
             def store_packed_vector_cshuffle_2x4(packed_store, block_n, vector_index):
                 lane_id = fx.Int32(fx.thread_idx.x % 64)
@@ -727,7 +733,7 @@ def _build_moe_gemm2_2x4(
             # Prologue: stage0 prepares N block 0 / K core 0.
             if wave_group == 1:
                 fx.gpu.barrier()
-            frag_weight = down_ops.load_tiled_mma_fragA(
+            frag_weight = get_down_ops(topology_map).load_tiled_mma_fragA(
                 mm, weight, [None, None, fx.Int32(0), 0]
             )
             frag_pc_scale = None
@@ -810,11 +816,11 @@ def _build_moe_gemm2_2x4(
                 next_slot = (k_core + 1) % 2
                 next_scale_vec = None
                 overlap_previous_output_store(block_n, k_core, previous_fragC)
-                down_ops.load_tiled_mma_fragB(
+                get_down_ops(topology_map).load_tiled_mma_fragB(
                     mm, ldsA, [None, None, 0, k_core], frag_act
                 )
                 if const_expr(k_core + 1 < nBK):
-                    down_ops.load_tiled_mma_fragA(
+                    get_down_ops(topology_map).load_tiled_mma_fragA(
                         mm,
                         weight,
                         [None, None, block_n, k_core + 1],
@@ -827,7 +833,7 @@ def _build_moe_gemm2_2x4(
                     ):
                         next_scale_vec = issue_scale_block_global(next_block_n)
                         fx.rocdl.sched_barrier(0)
-                    down_ops.load_tiled_mma_fragA(
+                    get_down_ops(topology_map).load_tiled_mma_fragA(
                         mm,
                         weight,
                         [None, None, next_block_n, 0],
@@ -880,7 +886,7 @@ def _build_moe_gemm2_2x4(
                 # Apply channel scale; routing weight and BF16 conversion happen
                 # while the next N tile retires this delayed output.
                 if const_expr(use_direct_ptpc_scale):
-                    down_ops.load_tiled_mma_fragC(
+                    get_down_ops(topology_map).load_tiled_mma_fragC(
                         mm,
                         arg_w_scale,
                         [None, None, block_n, 0],
@@ -929,7 +935,7 @@ def _build_moe_gemm2_2x4(
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
-        down_ops.clear_all()
+        generic_down_ops.clear_all()
         generic_kernel = moe_2stage_down_prefill_2x4(
             p_input,
             p_weight,
@@ -945,7 +951,7 @@ def _build_moe_gemm2_2x4(
             value_attrs={"passthrough": [["target-features", "-packed-fp32-ops"]]},
         )
         if const_expr(topology_enabled):
-            down_ops.clear_all()
+            topology_down_ops.clear_all()
             topology_kernel = moe_2stage_down_prefill_2x4(
                 p_input,
                 p_weight,
@@ -973,4 +979,5 @@ def _build_moe_gemm2_2x4(
                 grid=(1, task_num, 1), block=(512, 1, 1), stream=stream
             )
 
+    launch_prefill_1x4.compile_hints["target_features"] = "-packed-fp32-ops"
     return launch_prefill_1x4

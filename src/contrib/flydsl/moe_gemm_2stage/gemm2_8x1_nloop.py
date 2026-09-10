@@ -1,0 +1,160 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""K128 pure及K256/320/384/512/640的1N循环；K192使用独立BK192 helper。"""
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr.typing import Vector as Vec
+
+from .gemm2_8x1_schedule import output_quarter, packing_events, vmem_wait_schedule
+
+
+@flyc.jit
+def emit_nloop(
+    k, n_tiles, unroll_n, ptpc, rolling, relax_vmcnt, c, prefetched,
+    first_scales, ops, issue_b, commit_b, read_b, load_scale, pack,
+    issue_output, store_output, mma, clear, schedule_pack,
+    enter_memory, enter_compute, stage_end, wait,
+    k_widths=None,
+):
+    assert k != 192, "K192 uses emit_bk192_nloop"
+    assert k != 320 or k_widths == (128, 192)
+    widths = k_widths or tuple(min(128, k - 128 * index) for index in range((k + 127) // 128))
+    ks = len(widths)
+    budgets = vmem_wait_schedule(k, n_tiles, ptpc, rolling, relax_vmcnt, k_widths)
+    first_unpacked = 2 if k == 320 else 3
+    merged_tail = k == 320
+
+    def position(n, stage, delta=0):
+        source = (stage + delta) % (2 * ks)
+        target_k = (source % ks + 1) % ks
+        target_n = n + (stage + delta) // (2 * ks) + (source % ks + 1) // ks
+        return target_n, target_k, source // ks, (target_n * ks + target_k) & 1
+
+    def valid(stage, delta, last):
+        source = stage + delta
+        return not last or (source < 2 * ks and source % ks + 1 < ks)
+
+    def run_tile(n, carries, previous_packed, previous_scales, scales, first, last, penultimate=False):
+        packed = []
+        for stage in range_constexpr(1 if first else 0, 2 * ks):
+            k_stage, half, entry = stage % ks, stage // ks, stage & 1
+            slot = (n * ks + k_stage) & 1
+            output = output_quarter(k, stage, k_widths)
+            has_output = rolling and not first and output is not None
+            enter_memory()
+            if const_expr(rolling and stage < 4):
+                scales.append(load_scale(n, stage))
+            if const_expr(has_output):
+                fragments, destinations = issue_output(n - 1, previous_packed, output % 2, output // 2)
+            elif const_expr(not rolling and not first and stage == 0):
+                for quarter in range_constexpr(4):
+                    fragments, destinations = issue_output(n - 1, previous_packed, quarter % 2, quarter // 2)
+                    store_output(fragments, destinations)
+            bf = [read_b(slot, half, k_stage, 0)]
+            if const_expr(has_output):
+                store_output(fragments, destinations, lgkmcnt=widths[k_stage] // 32)
+                fx.rocdl.sched_barrier(0)
+            bf.append(read_b(slot, half, k_stage, 1))
+            budget_n = 0 if first else n_tiles - 1 if last else n_tiles - 2 if penultimate else 1
+            if const_expr(valid(stage, 0, last) or (rolling and ptpc and packing_events(k, stage, first, k_widths))):
+                wait(vmcnt=budgets[budget_n * 2 * ks + stage])
+            if const_expr(valid(stage, 0, last)):
+                target_n, target_k, target_half, target_slot = position(n, stage)
+                commit_b(target_slot, target_k, target_half, entry, carries[entry])
+            if const_expr(valid(stage, 2, last) and (not penultimate or stage < 2 * ks - 1)):
+                future_n, future_k, future_half, _ = position(n, stage, 2)
+                fx.rocdl.sched_barrier(0)
+                carries[entry] = issue_b(future_n, future_k, future_half, entry)
+            stage_end()
+            enter_compute()
+            for packet in range_constexpr(2):
+                pair = 2 * half + packet
+                if const_expr(k_stage == 0):
+                    clear(pair)
+                fx.rocdl.sched_barrier(0)
+                mma(bf[packet], k_stage, pair)
+                if const_expr(rolling):
+                    for packed_packet, previous, record in packing_events(k, stage, first, k_widths):
+                        if const_expr(packet == packed_packet):
+                            if const_expr(previous):
+                                previous_packed.append(pack(record, previous_scales[record - first_unpacked]))
+                            else:
+                                packed.append(pack(record, scales[record]))
+                            schedule_pack()
+            wait(lgkmcnt=0)
+            enter_memory()
+            stage_end()
+            if const_expr(not rolling and stage == 2 * ks - 1):
+                # 与原pure路径一致，先完成compute阶段再退休；inline-asm FMA
+                # 不受后端MFMA hazard识别，不能紧贴最后MFMA消费其结果。
+                scales = [load_scale(n, pair) for pair in range_constexpr(4)]
+                wait(vmcnt=0)
+                packed = [pack(pair, scales[pair]) for pair in range_constexpr(4)]
+        return carries, packed, scales
+
+    carries, pending_packed, pending_scales = run_tile(0, prefetched, [], [], first_scales, True, False)
+    b_carriers = [fx.make_fragment_like(carries[index]) for index in range_constexpr(2)]
+    if const_expr(rolling and ptpc):
+        scale_carriers = [fx.make_fragment_like(pending_scales[pair])
+                          for pair in range_constexpr(first_unpacked, 4)]
+
+    def save_state(carries, packed, scales):
+        state = [carries[index].load() for index in range_constexpr(2)]
+        if const_expr(rolling):
+            for row in range_constexpr(2):
+                for group in range_constexpr(2 * first_unpacked, 8):
+                    state.append(c[None, group, row].load())
+            if const_expr(ptpc):
+                for pair in range_constexpr(first_unpacked, 4):
+                    state.append(scales[pair].load())
+        for pair in range_constexpr(first_unpacked if rolling else 4):
+            for row in range_constexpr(2):
+                state.append(packed[pair][row])
+        return state
+
+    def restore_state(state):
+        for index in range_constexpr(2):
+            b_carriers[index].store(state[index])
+        offset = 2
+        scales = []
+        if const_expr(rolling):
+            for row in range_constexpr(2):
+                for group in range_constexpr(2 * first_unpacked, 8):
+                    c[None, group, row].store(state[offset])
+                    offset += 1
+            for pair in range_constexpr(first_unpacked, 4):
+                if const_expr(ptpc):
+                    scale_carriers[pair - first_unpacked].store(state[offset])
+                    offset += 1
+                    scales.append(scale_carriers[pair - first_unpacked])
+                else:
+                    scales.append(fx.Float32(1.0))
+        packed = []
+        for pair in range_constexpr(first_unpacked if rolling else 4):
+            packed.append([Vec(state[offset]), Vec(state[offset + 1])])
+            offset += 2
+        return list(b_carriers), packed, scales
+
+    initial = save_state(carries, pending_packed, pending_scales)
+    # K320末块192单独剥离倒数第二N，避免其最后一拍请求未消费的N==NT。
+    stop = 1 + ((n_tiles - (3 if merged_tail else 2)) // unroll_n) * unroll_n
+    ops.clear_all()
+    for block_start, state in range(1, stop, unroll_n, init=initial):
+        carries, previous_packed, previous_scales = restore_state(state)
+        for offset in range_constexpr(unroll_n):
+            carries, packed, scales = run_tile(fx.Int64(block_start) + offset, carries, previous_packed, previous_scales, [], False, False)
+            previous_packed, previous_scales = packed, scales[first_unpacked:]
+        results = yield save_state(carries, packed, scales)
+    ops.clear_all()
+    carries, pending_packed, previous_scales = restore_state(results)
+    for n in range_constexpr(stop, n_tiles - 1):
+        carries, pending_packed, pending_scales = run_tile(
+            n, carries, pending_packed, previous_scales, [], False, False,
+            penultimate=merged_tail and n == n_tiles - 2,
+        )
+        previous_scales = pending_scales[first_unpacked:]
+    _, pending_packed, pending_scales = run_tile(n_tiles - 1, carries, pending_packed, previous_scales, [], False, True)
+    return pending_packed, pending_scales

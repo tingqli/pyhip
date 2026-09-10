@@ -44,6 +44,7 @@ def _build_moe_gemm2_default(
     down_path="default",
     down_output_padding_bytes=None,
     METADATA_TILE_SIZE_M=None,
+    _task_table=False,
 ):
     assert stage == "down"
     assert down_path == "default"
@@ -128,8 +129,9 @@ def _build_moe_gemm2_default(
         assert weight_quant_type == "per_tensor"
         assert act_quant_type == "per_tensor"
     else:
-        assert down_output_padding_bytes is None
+        assert down_output_padding_bytes is None or _task_table
 
+    output_row_stride = N + (down_output_padding_bytes or 0) // 2
     cshuffle_2x4_bytes = 8 * 16 * 64 * 2
 
     # MI308X有4个XCC，每个XCC包含4个SE，每个SE包含5个CU。
@@ -1357,30 +1359,31 @@ def _build_moe_gemm2_default(
         max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
 
         if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
+            if const_expr(_task_table):
+                row_begin = fx.Int64(p_sorted_expert_ids[2 * e_idx])
             arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
             arg_p_output = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_output, fx.BFloat16)
-                + fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * N),
-                (BLOCK_TILE_SIZE_M, N),
+                + (row_begin * output_row_stride if const_expr(_task_table) else fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * N)),
+                (BLOCK_TILE_SIZE_M, output_row_stride),
             )
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M,
+                fxh._as_ptr(p_sorted_ids) + (row_begin if const_expr(_task_table) else e_idx * BLOCK_TILE_SIZE_M),
                 (BLOCK_TILE_SIZE_M,),
                 fx.Int32,
             )
             arg_p_sorted_weights = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_weights) + e_idx * BLOCK_TILE_SIZE_M,
+                fxh._as_ptr(p_sorted_weights) + (row_begin if const_expr(_task_table) else e_idx * BLOCK_TILE_SIZE_M),
                 (BLOCK_TILE_SIZE_M,),
                 fx.Float32,
             )
-            expert_id = fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[
-                e_idx
-            ]
+            expert_id = p_sorted_expert_ids[2 * e_idx + 1] if const_expr(_task_table) else fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[e_idx]
 
             # 16bytes/DW4
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
-                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id * N * K),
+                fxh._as_ptr(p_weight, weight_dtype)
+                + (fx.Int64(expert_id) * N * K if const_expr(_task_table) else fx.Int64(expert_id * N * K)),
                 fx.make_layout(
                     ((16, N // 16), (element_num, K // element_num)),
                     ((element_num, 16 * K), (1, 16 * element_num)),

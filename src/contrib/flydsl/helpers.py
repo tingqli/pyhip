@@ -698,7 +698,7 @@ def asm_mark(mark: str):
     filename = caller_frame.f_code.co_filename
     lineno = caller_frame.f_lineno
 
-    rocdl.sched_barrier(0)
+    fx.rocdl.sched_barrier(0)
     llvm.inline_asm(
         ir.Type.parse("!llvm.void"),
         [],
@@ -706,7 +706,7 @@ def asm_mark(mark: str):
         "",
         has_side_effects=True,
     )
-    rocdl.sched_barrier(0)
+    fx.rocdl.sched_barrier(0)
 
 
 def dump_ir(enable_debug_info=True):
