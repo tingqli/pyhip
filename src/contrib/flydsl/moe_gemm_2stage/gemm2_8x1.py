@@ -108,9 +108,8 @@ def _build_moe_gemm2_8x1(
     SPECIALIZED_ROLLING = K == 384
     N_TILES = N // BLOCK_N
     TOTAL_CORES = N_TILES * K_STAGES
-    WEIGHT_HALF_ATOMS = BLOCK_N * BLOCK_K // (16 * 2)
-    WEIGHT_QUARTER_ATOMS = WEIGHT_HALF_ATOMS // 2
-    WEIGHT_COPY_ROUNDS_PER_GROUP = WEIGHT_HALF_ATOMS // 256
+    WEIGHT_QUARTER_ATOMS = BLOCK_N * BLOCK_K // (16 * 4)
+    WEIGHT_PREFETCH_SLOTS = 2
     OUTPUT_STORES_PER_WAVE = WAVE_M * BLOCK_N * 2 // (64 * 16)
     CSHUFFLE_N_PAIRS = BLOCK_N // 32
     output_row_stride = N + down_output_padding_bytes // 2
@@ -125,7 +124,6 @@ def _build_moe_gemm2_8x1(
     cu_per_se = 5
     se_count = xcc_count * se_per_xcc
 
-    assert WEIGHT_COPY_ROUNDS_PER_GROUP == 2
     assert WEIGHT_QUARTER_ATOMS == 256
     assert OUTPUT_STORES_PER_WAVE == 8
 
@@ -366,7 +364,7 @@ def _build_moe_gemm2_8x1(
                     fx.make_layout(16, 1), fx.Float8E4M3FNUZ
                 )
                 for _ in range_constexpr(
-                    WEIGHT_COPY_ROUNDS_PER_GROUP
+                    WEIGHT_PREFETCH_SLOTS
                 )
             ]
             weight_store_atom = fx.make_copy_atom(
@@ -408,28 +406,6 @@ def _build_moe_gemm2_8x1(
                 for storage in weight_storage_ptrs
             ]
 
-            def weight_atom_index(copy_round):
-                return (
-                    wave_group * WEIGHT_HALF_ATOMS
-                    + group_tid
-                    + copy_round * 256
-                )
-
-            weight_lane_offsets_bytes = []
-            for copy_round in range_constexpr(
-                WEIGHT_COPY_ROUNDS_PER_GROUP
-            ):
-                atom_index = weight_atom_index(copy_round)
-                n_group = atom_index // BLOCK_K
-                within_group = atom_index % BLOCK_K
-                k_group = within_group // 16
-                n_inner = within_group % 16
-                weight_lane_offsets_bytes.append(
-                    n_group * (16 * K)
-                    + k_group * 256
-                    + n_inner * 16
-                )
-
             quarter_atom_index = (
                 wave_group * WEIGHT_QUARTER_ATOMS
                 + group_tid
@@ -443,59 +419,6 @@ def _build_moe_gemm2_8x1(
                 + quarter_k_group * 256
                 + quarter_n_inner * 16
             )
-
-            def issue_weight_full_load(block_n, k_stage):
-                core_base_bytes = (
-                    block_n * (BLOCK_N * K)
-                    + k_stage * (BLOCK_K // 16) * 256
-                )
-                for copy_round in range_constexpr(
-                    WEIGHT_COPY_ROUNDS_PER_GROUP
-                ):
-                    loaded = Vec(
-                        rocdl_dialect.RawPtrBufferLoadOp(
-                            ir.VectorType.get(
-                                [4], ir.IntegerType.get_signless(32)
-                            ),
-                            weight_rsrc,
-                            _raw(
-                                fx.Int32(
-                                    weight_lane_offsets_bytes[copy_round]
-                                )
-                            ),
-                            _raw(fx.Int32(core_base_bytes)),
-                            aux=ir.IntegerAttr.get(
-                                ir.IntegerType.get_signless(32), 0
-                            ),
-                        ).result
-                    ).bitcast(fx.Float8E4M3FNUZ)
-                    weight_staging[copy_round].store(
-                        loaded
-                    )
-
-            def commit_weight_full(slot):
-                for copy_round in range_constexpr(
-                    WEIGHT_COPY_ROUNDS_PER_GROUP
-                ):
-                    atom_index = weight_atom_index(copy_round)
-                    n_group = atom_index // BLOCK_K
-                    within_group = atom_index % BLOCK_K
-                    k_group = within_group // 16
-                    n_inner = within_group % 16
-                    lds_offset = (
-                        n_group * (16 * BLOCK_K)
-                        + k_group * 256
-                        + n_inner * 16
-                    )
-                    destination = fx.make_view(
-                        weight_storage_ptrs[slot] + lds_offset,
-                        fx.make_layout(16, 1),
-                    )
-                    fx.copy(
-                        weight_store_atom,
-                        weight_staging[copy_round],
-                        destination,
-                    )
 
             def issue_weight_quarter_load(
                 block_n, k_stage, n_half, staging_index=0
@@ -548,8 +471,9 @@ def _build_moe_gemm2_8x1(
                     destination,
                 )
 
-            # P0 starts before A gather so younger A/scale VMEM can hide B0 latency.
-            issue_weight_full_load(0, 0)
+            # 只预填Q0=L/K0；其余请求统一按消费者顺序推进。
+            # 仍在A gather前发出，以年轻的A/scale请求覆盖启动延迟。
+            issue_weight_quarter_load(0, 0, 0, 0)
             fx.rocdl.sched_barrier(0)
 
             input_copy = fx.make_copy_atom(
@@ -1161,26 +1085,18 @@ def _build_moe_gemm2_8x1(
                     constrain_mfma_valu_packet()
 
             def pending_weight_position(half_core):
-                source_block_n = half_core // (K_STAGES * 2)
-                source_stage = half_core % (K_STAGES * 2)
-                source_k_stage = source_stage % K_STAGES
-                source_n_half = source_stage // K_STAGES
-                pending_core = (
-                    source_block_n * K_STAGES
-                    + source_k_stage
-                    + 1
-                )
+                # Q[q]是当前消费者；提交Q[q+1]，两拍前发起其VMEM。
+                target = half_core + 1
+                target_n = target // (2 * K_STAGES)
+                target_k = target % K_STAGES
                 return (
-                    pending_core // K_STAGES,
-                    pending_core % K_STAGES,
-                    source_n_half,
-                    pending_core < TOTAL_CORES,
-                    pending_core & 1,
+                    target_n, target_k, (target % (2 * K_STAGES)) // K_STAGES,
+                    target < 2 * TOTAL_CORES, (target_n * K_STAGES + target_k) & 1,
                 )
 
-            # P0: fill B(0, 0), then seed two future half-B requests.
+            # LDS=Q0，P0=Q1，P1=Q2；不重复加载后半区的K0。
             fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=4))
-            commit_weight_full(0)
+            commit_weight_quarter(0, 0, 0)
             fx.rocdl.sched_barrier(0)
             prefetch0 = pending_weight_position(0)
             prefetch1 = pending_weight_position(1)
@@ -1201,7 +1117,7 @@ def _build_moe_gemm2_8x1(
             pending_packed_super_records = None
             pending_scale_quarters = None
 
-            # S0/S1 of q=0 are peeled into the prologue. Their future operand is q=2.
+            # 首memory/compute对剥离；新请求始终供两拍后的commit使用。
             _enter_memory_stage()
             scale_quarters = []
             if const_expr(ROLLING_EPILOGUE):

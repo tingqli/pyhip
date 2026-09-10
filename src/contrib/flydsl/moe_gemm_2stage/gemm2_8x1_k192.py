@@ -158,10 +158,12 @@ def _build_moe_gemm2_8x1_k192(
                 fragment.store(values)
                 return fragment
 
-            full_b = []
-            # 整块K使全局preshuffle与LDS槽字节序相同，512线程各拷3×16B。
-            for copy_round in range_constexpr(3):
-                full_b.append(raw_b_load(tid * 16, copy_round * 512 * 16, 4))
+            def issue_bk192(n, half):
+                base = n * BN * K + half * (BN // 2) * K
+                return [raw_b_load(tid * 16, base, 4), raw_b_load(8192 + tid * 8, base, 2)]
+
+            # Q0仅包含L/BK192；每线程16B+8B，H半区由Q1单独提交。
+            first_b = issue_bk192(0, 0)
             rocdl.sched_barrier(0)
 
             # A严格gather完整192，不加载或计算不存在的第四个K64。
@@ -182,10 +184,6 @@ def _build_moe_gemm2_8x1_k192(
                             af[None, row, (k8, k64)].store(part)
                 afragments.append(af)
 
-            def issue_bk192(n, half):
-                base = n * BN * K + half * (BN // 2) * K
-                return [raw_b_load(tid * 16, base, 4), raw_b_load(8192 + tid * 8, base, 2)]
-
             # partition只建立一次；完整lane地址在上一compute尾部准备，跨N携带。
             b_template = fx.make_view(bptrs[0],
                 fx.make_layout(((16, BN // 64), (16, K // 16)), ((16, 16 * K), (1, 256))))
@@ -197,8 +195,12 @@ def _build_moe_gemm2_8x1_k192(
 
             def prepare_b_addresses(n):
                 read_address = fx.Int32(fx.ptrtoint(fx.get_iter(b_partition))) + fx.Int32((n & 1) * BN * K)
-                write_base = fx.Int32(fx.ptrtoint(bptrs[0])) + fx.Int32(((n + 1) & 1) * BN * K)
-                values = [read_address, write_base + tid * 16, write_base + 8192 + tid * 8]
+                # 读L时写同N的H；读H时写下一N的L。两份完整lane指针在此准备。
+                write_base = fx.Int32(fx.ptrtoint(bptrs[0]))
+                write_h = write_base + fx.Int32((n & 1) * BN * K + (BN // 2) * K)
+                write_l = write_base + fx.Int32(((n + 1) & 1) * BN * K)
+                values = [read_address, write_h + tid * 16, write_h + 8192 + tid * 8,
+                          write_l + tid * 16, write_l + 8192 + tid * 8]
                 # 空tied asm不增加ISA指令，但强制地址在compute尾部sched屏障前就绪。
                 return [fx.Int32(llvm.inline_asm(ir.IntegerType.get_signless(32), [_raw(value)],
                     "", "=v,0", has_side_effects=True)) for value in values]
@@ -206,8 +208,8 @@ def _build_moe_gemm2_8x1_k192(
             def commit_bk192(n, half, fragments, addresses):
                 for part in range_constexpr(2):
                     words = 4 if part == 0 else 2
-                    base = fx.inttoptr(b_write_types[part], addresses[part + 1])
-                    destination = fx.make_view(base + half * (BN // 2) * (K // 4), fx.make_layout(words, 1))
+                    base = fx.inttoptr(b_write_types[part], addresses[1 + (1 - half) * 2 + part])
+                    destination = fx.make_view(base, fx.make_layout(words, 1))
                     fx.copy(ops.get_universal_copy_atom(fx.Uint32, words * 32), fragments[part], destination)
 
             def read_b(slot, half, ks, quarter, addresses):
@@ -334,17 +336,19 @@ def _build_moe_gemm2_8x1_k192(
                                 fx.mma_atom_call(atom, c[None, pair * 2 + ng, row], weight_piece, activation, c[None, pair * 2 + ng, row])
 
             wait(vmcnt=0)
-            for copy_round in range_constexpr(3):
+            for part in range_constexpr(2):
+                words = 4 if part == 0 else 2
+                offset = tid * 16 if part == 0 else 8192 + tid * 8
                 destination = fx.make_view(
-                    fx.recast_iter(fx.Uint32, bptrs[0]) + tid * 4 + copy_round * 2048, fx.make_layout(4, 1),
+                    fx.recast_iter(fx.Uint32, bptrs[0]) + offset // 4, fx.make_layout(words, 1),
                 )
-                fx.copy(ops.get_universal_copy_atom(fx.Uint32, 128), full_b[copy_round], destination)
+                fx.copy(ops.get_universal_copy_atom(fx.Uint32, words * 32), first_b[part], destination)
             wait(lgkmcnt=0)
             stage_end()
             c.fill(0)
-            prefetched = [None, None]
+            prefetched = [issue_bk192(0, 1), None]  # P0=Q1=当前H。
             if const_expr(NT > 1):
-                prefetched = [issue_bk192(1, half) for half in range_constexpr(2)]
+                prefetched[1] = issue_bk192(1, 0)  # P1=Q2=下一N的L。
 
             def first_stagger():
                 if group == 1:
@@ -387,33 +391,34 @@ def _build_moe_gemm2_8x1_k192(
 
 @cache
 def bk192_wait_schedule(n_tiles, ptpc, rolling):
-    """每half-B是16B+8B两条VMEM，同时保护B提交和跨半区pack的scale。"""
+    """消费FIFO的每half-B为16B+8B两条VMEM；同时保护B及跨半区pack的scale。"""
     sequence, requests, scales, budgets = 0, {}, {}, []
 
-    def issue(n, half):
+    def issue(q):
         nonlocal sequence
-        if n < n_tiles:
+        if q < 2 * n_tiles:
             sequence += 2
-            requests[n, half] = sequence
+            requests[q] = sequence
 
-    issue(1, 0)
-    issue(1, 1)
+    issue(1)
+    issue(2)
     for n in range(n_tiles):
         for half in range(2):
+            q = 2 * n + half
             if ptpc:
                 for pair in range(2 * half, 2 * half + 2):
                     sequence += 2
                     scales[n, pair] = sequence
             if n > 0:
                 sequence += 4
-            required = [requests[n + 1, half]] if n + 1 < n_tiles else []
+            required = [requests[q + 1]] if q + 1 < 2 * n_tiles else []
             if rolling and ptpc:
                 if half == 0 and n > 0:
                     required.extend(scales[n - 1, pair] for pair in (2, 3))
                 elif half == 1:
                     required.extend(scales[n, pair] for pair in (0, 1))
             budgets.append(min((sequence - event for event in required), default=63))
-            issue(n + 2, half)
+            issue(q + 3)
     return tuple(budgets)
 
 
@@ -445,11 +450,11 @@ def emit_bk192_nloop(
             budget = budgets[2 * n + half] if isinstance(n, int) else body_budgets[half]
             if const_expr(budget != 63 or not relax_vmcnt):
                 wait(vmcnt=budget if relax_vmcnt else 0)
-            if const_expr(has_next):
-                commit_b(n + 1, half, carries[half], addresses)
-            if const_expr(has_future):
+            if const_expr(half == 0 or has_next):
+                commit_b(n + half, 1 - half, carries[half], addresses)
+            if const_expr((half == 0 and has_next) or (half == 1 and has_future)):
                 fx.rocdl.sched_barrier(0)
-                carries[half] = issue_b(n + 2, half)
+                carries[half] = issue_b(n + 1 + half, 1 - half)
             stage_end()
             priority(3)
             for packet in range_constexpr(2):
@@ -529,7 +534,7 @@ def emit_bk192_nloop(
             for pair in range_constexpr(2 if rolling else 4):
                 packed.append([Vec(state[offset]), Vec(state[offset + 1])])
                 offset += 2
-            return [list(carry) for carry in b_carriers], packed, scales, [fx.Int32(value) for value in state[-3:]]
+            return [list(carry) for carry in b_carriers], packed, scales, [fx.Int32(value) for value in state[-5:]]
 
         initial = save_state(carries, pending_packed, pending_scales, addresses)
         # 剥离最后两N，所有动态迭代的n+2均有效，不发出未消费的越界B请求。

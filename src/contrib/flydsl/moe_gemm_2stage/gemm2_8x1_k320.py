@@ -169,11 +169,11 @@ def _build_moe_gemm2_8x1_k320(
                 fragment.store(values)
                 return fragment
 
-            full_b = []
-            for copy_round in range_constexpr(2):
-                index = group * 512 + group_tid + copy_round * 256
-                offset = (index // K_WIDTHS[0]) * (16 * K) + ((index % K_WIDTHS[0]) // 16) * 256 + (index % 16) * 16
-                full_b.append(raw_b_load(offset, 0, 4))
+            # 仅预填Q0=L/K128；每线程16B，后续用同一消费FIFO。
+            first_index = group * 256 + group_tid
+            first_offset = ((first_index // K_WIDTHS[0]) * (16 * K)
+                            + ((first_index % K_WIDTHS[0]) // 16) * 256 + (first_index % 16) * 16)
+            first_b = raw_b_load(first_offset, 0, 4)
             rocdl.sched_barrier(0)
 
             # A严格按K_WIDTHS gather，128/192的总量为320。
@@ -195,9 +195,9 @@ def _build_moe_gemm2_8x1_k320(
                 afragments.append(af)
 
             def b_position(q):
-                n, stage = q // (2 * KS), q % (2 * KS)
-                target = n * KS + stage % KS + 1
-                return target // KS, target % KS, stage // KS, target < NT * KS, target & 1
+                target = q + 1
+                n, ks = target // (2 * KS), target % KS
+                return n, ks, (target % (2 * KS)) // KS, target < NT * KS * 2, (n * KS + ks) & 1
 
             def b_offsets(ks):
                 width = K_WIDTHS[ks]
@@ -370,10 +370,7 @@ def _build_moe_gemm2_8x1_k320(
                                 fx.mma_atom_call(atom, c[None, pair * 2 + ng, row], weight_piece, activation, c[None, pair * 2 + ng, row])
 
             wait(vmcnt=4)
-            for copy_round in range_constexpr(2):
-                index = group * 512 + group_tid + copy_round * 256
-                destination = fx.make_view(fx.recast_iter(fx.Uint32, bptrs[0]) + index * 4, fx.make_layout(4, 1))
-                fx.copy(ops.get_universal_copy_atom(fx.Uint32, 128), full_b[copy_round], destination)
+            commit_b((0, 0, 0, True, 0), first_b)
             rocdl.sched_barrier(0)
             prefetched = [issue_b(b_position(0)), None]
             if const_expr(b_position(1)[3]):
@@ -456,6 +453,9 @@ def _build_moe_gemm2_8x1_k320(
                 if const_expr(has_future):
                     rocdl.sched_barrier(0)
                     prefetched[entry] = issue_b(future)
+                if const_expr(q == 1):
+                    # 与共享循环相同：首次H/K128提交后再放行领先wave组。
+                    wait(lgkmcnt=0)
                 stage_end()
 
                 priority(3)

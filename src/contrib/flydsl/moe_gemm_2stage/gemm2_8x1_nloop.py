@@ -27,19 +27,17 @@ def emit_nloop(
     ks = len(widths)
     budgets = vmem_wait_schedule(k, n_tiles, ptpc, rolling, relax_vmcnt, k_widths)
     first_unpacked = 2 if k == 320 else 3
-    merged_tail = k == 320
 
     def position(n, stage, delta=0):
-        source = (stage + delta) % (2 * ks)
-        target_k = (source % ks + 1) % ks
-        target_n = n + (stage + delta) // (2 * ks) + (source % ks + 1) // ks
-        return target_n, target_k, source // ks, (target_n * ks + target_k) & 1
+        # 所有K按消费者顺序提交Q[q+1]；delta=2预取Q[q+3]。
+        target = stage + delta + 1
+        target_n, target_k = n + target // (2 * ks), target % ks
+        return target_n, target_k, (target % (2 * ks)) // ks, (target_n * ks + target_k) & 1
 
     def valid(stage, delta, last):
-        source = stage + delta
-        return not last or (source < 2 * ks and source % ks + 1 < ks)
+        return not last or stage + delta + 1 < 2 * ks
 
-    def run_tile(n, carries, previous_packed, previous_scales, scales, first, last, addresses, penultimate=False):
+    def run_tile(n, carries, previous_packed, previous_scales, scales, first, last, addresses):
         packed = []
         for stage in range_constexpr(1 if first else 0, 2 * ks):
             k_stage, half, entry = stage % ks, stage // ks, stage & 1
@@ -67,20 +65,25 @@ def emit_nloop(
             else:
                 bf.append(read_b(slot, half, k_stage, 1))
             # n=1已剥离，回边使用n>=2预算。
-            budget_n = (0 if first else n_tiles - 1 if last else n_tiles - 2 if penultimate
-                        else n if isinstance(n, int) else 2)
+            budget_n = 0 if first else n_tiles - 1 if last else n if isinstance(n, int) else 2
             if const_expr(valid(stage, 0, last) or (rolling and ptpc and packing_events(k, stage, first, k_widths))):
                 wait(vmcnt=budgets[budget_n * 2 * ks + stage])
             if const_expr(valid(stage, 0, last)):
                 target_n, target_k, target_half, target_slot = position(n, stage)
                 if const_expr(prepare_b_addresses is not None):
-                    commit_b(target_slot, target_k, target_half, entry, carries[entry], addresses[2 + ((k_stage + 1) & 1)])
+                    # L末K切换到同N的H/K0；奇数KS不能沿用“当前slot+1”。
+                    relative_slot = (target_k + ((stage + 1) // (2 * ks)) * ks) & 1
+                    commit_b(target_slot, target_k, target_half, entry, carries[entry], addresses[2 + relative_slot])
                 else:
                     commit_b(target_slot, target_k, target_half, entry, carries[entry])
-            if const_expr(valid(stage, 2, last) and (not penultimate or stage < 2 * ks - 1)):
+            if const_expr(valid(stage, 2, last)):
                 future_n, future_k, future_half, _ = position(n, stage, 2)
                 fx.rocdl.sched_barrier(0)
                 carries[entry] = issue_b(future_n, future_k, future_half, entry)
+            if const_expr(k == 320 and first and stage == 1):
+                # 首次H/K128不再由整块预填；领先组下一memory会立即读取。
+                # 在交接barrier前完成本组LDS写，不能依赖稍后的compute尾等待。
+                wait(lgkmcnt=0)
             stage_end()
             enter_compute()
             for packet in range_constexpr(2):
@@ -115,7 +118,6 @@ def emit_nloop(
     # 首个输出过渡整块留在prologue。
     carries, pending_packed, pending_scales, addresses = run_tile(
         1, carries, pending_packed, pending_scales[first_unpacked:], [], False, False, addresses,
-        penultimate=merged_tail and n_tiles == 3,
     )
     b_carriers = [fx.make_fragment_like(carries[index]) for index in range_constexpr(2)]
     if const_expr(rolling and ptpc):
@@ -163,9 +165,9 @@ def emit_nloop(
         return list(b_carriers), packed, scales, addresses
 
     initial = save_state(carries, pending_packed, pending_scales, addresses)
-    # K320继续单独处理倒数第二N。
+    # Q[q+3]最多进入下一N，所有共享K都只需独立处理最后N。
     loop_start = 2
-    stop = loop_start + (max(0, n_tiles - loop_start - (2 if merged_tail else 1)) // unroll_n) * unroll_n
+    stop = loop_start + (max(0, n_tiles - loop_start - 1) // unroll_n) * unroll_n
     ops.clear_all()
     for block_start, state in range(loop_start, stop, unroll_n, init=initial):
         carries, previous_packed, previous_scales, addresses = restore_state(state)
@@ -178,7 +180,6 @@ def emit_nloop(
     for n in range_constexpr(stop, n_tiles - 1):
         carries, pending_packed, pending_scales, addresses = run_tile(
             n, carries, pending_packed, previous_scales, [], False, False, addresses,
-            penultimate=merged_tail and n == n_tiles - 2,
         )
         previous_scales = pending_scales[first_unpacked:]
     _, pending_packed, pending_scales, _ = run_tile(n_tiles - 1, carries, pending_packed, previous_scales, [], False, True, addresses)

@@ -51,8 +51,8 @@ def vmem_wait_schedule(k, n_tiles, ptpc=True, rolling=True, relax=True, k_widths
     ks, events, requests, scales = len(widths), [], {}, {}
 
     def valid(q):
-        n, stage = divmod(q, 2 * ks)
-        return 0 <= q < n_tiles * 2 * ks and n * ks + stage % ks + 1 < n_tiles * ks
+        # 请求编号q代表提交Q[q+1]；只裁掉最终消费者之后的请求。
+        return 0 <= q < n_tiles * 2 * ks - 1
 
     def request(q):
         if valid(q):
