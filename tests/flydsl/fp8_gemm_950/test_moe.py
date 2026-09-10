@@ -307,8 +307,7 @@ def benchmark(
         ) as perf:
             run(arg_sets[clone_index])
         samples.append((perf.dt() * 1.0e6, perf.tflops(), perf.bw()))
-    samples.sort(key=lambda sample: sample[0])
-    return samples[0], samples[len(samples) // 2]
+    return min(samples, key=lambda sample: sample[0])
 
 
 def run_case(
@@ -361,27 +360,44 @@ def run_case(
     if not (aiter_finite and pyhip_finite):
         raise AssertionError("stage1 produced a non-finite output")
 
+    # Padded rows still run through the MFMA pipe, they are just never stored, so
+    # hw counts them; eff counts only routed work and is comparable across block_m.
+    routed_tokens = tokens * topk
     pyhip_sorted_tokens = int(data["pyhip_valid_ids"][0].item())
     aiter_sorted_tokens = int(data["aiter_valid_ids"][0].item())
-    pyhip_flops = 2 * pyhip_sorted_tokens * gate_up_size * hidden_size
-    aiter_flops = 2 * aiter_sorted_tokens * gate_up_size * hidden_size
+    eff_flops = 2 * routed_tokens * gate_up_size * hidden_size
+    aiter_hw_flops = 2 * aiter_sorted_tokens * gate_up_size * hidden_size
+    pyhip_hw_flops = 2 * pyhip_sorted_tokens * gate_up_size * hidden_size
+    print(
+        f"padding: routed={routed_tokens} "
+        f"aiter_rows={aiter_sorted_tokens} "
+        f"({aiter_sorted_tokens / routed_tokens:.3f}x) "
+        f"pyhip_rows={pyhip_sorted_tokens} "
+        f"({pyhip_sorted_tokens / routed_tokens:.3f}x)"
+    )
 
-    def nominal_rw_bytes(sorted_tokens: int) -> int:
-        input_bytes = sorted_tokens * hidden_size
+    def eff_tflops(latency_us: float) -> float:
+        return eff_flops / (latency_us * 1.0e-6) / 1.0e12
+
+    # Padded rows read an out-of-range token id, so they generate no real traffic.
+    def nominal_rw_bytes() -> int:
+        input_bytes = routed_tokens * hidden_size
         weight_bytes = experts * gate_up_size * hidden_size // 2
         scale_bytes = (
-            sorted_tokens * hidden_size + experts * gate_up_size * hidden_size
+            routed_tokens * hidden_size + experts * gate_up_size * hidden_size
         ) // 32
         output_bytes = tokens * topk * gate_up_size
         return input_bytes + weight_bytes + scale_bytes + output_bytes
 
+    rw_bytes = nominal_rw_bytes()
+
     aiter_arg_sets = [make_aiter_args(data, clone=True) for _ in range(data_clones)]
-    aiter_best, aiter_median = benchmark(
+    aiter_best = benchmark(
         "aiter_stage1",
         lambda args: run_aiter_stage1(args, data, aiter_xcd_swizzle),
         aiter_arg_sets,
-        aiter_flops,
-        nominal_rw_bytes(aiter_sorted_tokens),
+        aiter_hw_flops,
+        rw_bytes,
         warmup,
         iterations,
     )
@@ -389,39 +405,31 @@ def run_case(
     torch.cuda.empty_cache()
 
     pyhip_arg_sets = [make_pyhip_args(data, clone=True) for _ in range(data_clones)]
-    pyhip_best, pyhip_median = benchmark(
+    pyhip_best = benchmark(
         "pyhip_a8w4_stage1",
         lambda args: pyhip_kernel(*args),
         pyhip_arg_sets,
-        pyhip_flops,
-        nominal_rw_bytes(pyhip_sorted_tokens),
+        pyhip_hw_flops,
+        rw_bytes,
         warmup,
         iterations,
     )
     del pyhip_arg_sets
     torch.cuda.empty_cache()
 
+    for name, best in (("aiter", aiter_best), ("pyhip", pyhip_best)):
+        print(
+            f"{name}: {best[0]:.3f} us "
+            f"hw={best[1]:.2f} TFLOPS "
+            f"eff={eff_tflops(best[0]):.2f} TFLOPS "
+            f"bw={best[2]:.2f} GB/s"
+        )
     print(
-        f"aiter: best={aiter_best[0]:.3f} us "
-        f"median={aiter_median[0]:.3f} us "
-        f"best={aiter_best[1]:.2f} TFLOPS "
-        f"median={aiter_median[1]:.2f} TFLOPS "
-        f"best_bw={aiter_best[2]:.2f} GB/s "
-        f"median_bw={aiter_median[2]:.2f} GB/s"
+        f"ratio: latency={pyhip_best[0] / aiter_best[0]:.3f}x "
+        f"eff_throughput={aiter_best[0] / pyhip_best[0]:.3%} "
+        f"hw_tflops={pyhip_best[1] / aiter_best[1]:.3%}"
     )
-    print(
-        f"pyhip: best={pyhip_best[0]:.3f} us "
-        f"median={pyhip_median[0]:.3f} us "
-        f"best={pyhip_best[1]:.2f} TFLOPS "
-        f"median={pyhip_median[1]:.2f} TFLOPS "
-        f"best_bw={pyhip_best[2]:.2f} GB/s "
-        f"median_bw={pyhip_median[2]:.2f} GB/s"
-    )
-    print(
-        f"ratio: latency={pyhip_median[0] / aiter_median[0]:.3f}x "
-        f"throughput={pyhip_median[1] / aiter_median[1]:.3%}"
-    )
-    return aiter_median, pyhip_median, aiter_best, pyhip_best
+    return aiter_best, pyhip_best
 
 
 def main() -> None:
@@ -473,7 +481,7 @@ def main() -> None:
             f"clones={args.data_clones} warmup={args.warmup} "
             f"iterations={args.iterations}"
         )
-        aiter_median, pyhip_median, aiter_best, pyhip_best = run_case(
+        aiter_best, pyhip_best = run_case(
             tokens,
             args.gate_up_size,
             args.hidden_size,
@@ -486,19 +494,17 @@ def main() -> None:
             args.pyhip_xcd_swizzle,
             args.pyhip_group_size_m,
         )
-        results.append((tokens, aiter_median, pyhip_median, aiter_best, pyhip_best))
+        results.append((tokens, aiter_best, pyhip_best))
         torch.cuda.empty_cache()
 
-    print("\nmedian summary")
-    for tokens, aiter_median, pyhip_median, aiter_best, pyhip_best in results:
+    print("\nsummary")
+    for tokens, aiter_best, pyhip_best in results:
         print(
             f"M={tokens:5d} N={args.gate_up_size} K={args.hidden_size:5d} "
-            f"aiter={aiter_median[0]:8.3f} us "
-            f"pyhip={pyhip_median[0]:8.3f} us "
-            f"pyhip/aiter={pyhip_median[0] / aiter_median[0]:.3f}x "
-            f"aiter_best={aiter_best[0]:8.3f} us "
-            f"pyhip_best={pyhip_best[0]:8.3f} us "
-            f"pyhip_best/aiter_best={pyhip_best[0] / aiter_best[0]:.3f}x"
+            f"aiter={aiter_best[0]:8.3f} us "
+            f"pyhip={pyhip_best[0]:8.3f} us "
+            f"tput={aiter_best[0] / pyhip_best[0]:.3f}x "
+            f"hw_tflops={pyhip_best[1] / aiter_best[1]:.3f}x"
         )
 
 

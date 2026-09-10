@@ -829,20 +829,53 @@ def compile_moe_gateup_4w(
         a_top_token_ids = load_a_token_ids(0)
         a_bottom_token_ids = load_a_token_ids(1)
 
+        # Epilogue routing IDs are loop-invariant; fetching them here keeps the
+        # store path free of dependent VMEM round trips.
+        def load_store_row_ids():
+            rows = []
+            for row_quadrant in range_constexpr(2):
+                for row_repeat in range_constexpr(4):
+                    row_local = (
+                        row_quadrant * block_m
+                        + row_repeat * 32
+                        + (wave_id_uniform // 2) * 16
+                        + lane_id % 16
+                    )
+                    sorted_row = expert_block_i32 * SORT_BLOCK_M + fx.Int32(row_local)
+                    rows.append(
+                        (
+                            sorted_row,
+                            buffer_ops.buffer_load(
+                                sorted_rsrc, sorted_row, vec_width=1, dtype=T.i32
+                            ),
+                        )
+                    )
+            return rows
+
+        store_row_ids = load_store_row_ids()
+
+        # Row/lane part of the gather address is K-invariant, so it is hoisted
+        # and the K step rides in soffset instead of a per-load VALU add.
+        def make_a_voffsets(token_ids):
+            return [
+                fx.Int32(token_ids[copy_round]) * hidden_size
+                + fx.Int32((lane_id % 8) * 16)
+                for copy_round in range_constexpr(4)
+            ]
+
+        a_top_voffsets = make_a_voffsets(a_top_token_ids)
+        a_bottom_voffsets = make_a_voffsets(a_bottom_token_ids)
+
         # A: AC: 4 x buffer_load_dwordx4 lds
-        def raw_a_gather_g2s(k_block_idx, lds_ptrs, token_ids):
+        def raw_a_gather_g2s(k_block_idx, lds_ptrs, voffsets):
+            tile_soffset = fx.Int32(k_block_idx * block_k)
             for copy_round in range_constexpr(4):
-                global_byte = (
-                    fx.Int32(token_ids[copy_round]) * hidden_size
-                    + k_block_idx * block_k
-                    + fx.Int32((lane_id % 8) * 16)
-                )
                 rocdl.raw_ptr_buffer_load_lds(
                     a_rsrc,
                     lds_ptrs[copy_round],
                     fx.Int32(16),
-                    global_byte,
-                    fx.Int32(0),
+                    voffsets[copy_round],
+                    tile_soffset,
                     fx.Int32(0),
                     fx.Int32(0),
                 )
@@ -851,44 +884,54 @@ def compile_moe_gateup_4w(
         # B is loaded with 'normal' 16x4 buffer load.
         # [16x4] src: each wave copies 16 contineous rows from global memory, 4 wave copies 64 contineous rows .
         # [16x4] dest: Also same written into LDS.
-        def raw_b_mxfp4_g2s(k_block_idx, lds_base, row_tile):
-            root = lds_root(lds_base)
-            for copy_round in range_constexpr(2):
-                if const_expr(b_lds_swizzle):
-                    physical_slot = tid + copy_round * 256
-                    logical_slot = physical_slot ^ ((physical_slot >> 3) & 1)
-                    row = (logical_slot // 32) * 8 + logical_slot % 8
-                    col_byte = ((logical_slot % 32) // 8) * 16
-                    lds_ptr = buffer_ops.get_element_ptr(
-                        root,
-                        byte_offset=(wave_id_uniform * 64 + copy_round * 256) * 16,
-                        elem_type=T.i8,
-                    )
-                else:
+        def b_copy_round_slots(copy_round: int):
+            if const_expr(b_lds_swizzle):
+                physical_slot = tid + copy_round * 256
+                logical_slot = physical_slot ^ ((physical_slot >> 3) & 1)
+                row = (logical_slot // 32) * 8 + logical_slot % 8
+                col_byte = ((logical_slot % 32) // 8) * 16
+                lds_byte = (wave_id_uniform * 64 + copy_round * 256) * 16
+            else:
+                chunk = wave_id_uniform + copy_round * 4
+                row = chunk * 16 + lane_id // 4
+                col_byte = (lane_id % 4) * 16
+                lds_byte = chunk * (b_group16 // 2)
+            return row, col_byte, lds_byte
 
-                    chunk = wave_id_uniform + copy_round * 4
-                    row = chunk * 16 + lane_id // 4
-                    col_byte = (lane_id % 4) * 16
-                    lds_ptr = buffer_ops.get_element_ptr(
-                        root,
-                        byte_offset=chunk * (b_group16 // 2),
-                        elem_type=T.i8,
-                    )
-                global_row = row_tile * block_n + fx.Int32(row)
-                global_byte = (
-                    # N offset
-                    global_row * (hidden_size // 2)
-                    # K iter offset
-                    + k_block_idx * (block_k // 2)
-                    # k offset
-                    + fx.Int32(col_byte)
+        def make_b_dma_ptrs(lds_base):
+            root = lds_root(lds_base)
+            return [
+                buffer_ops.get_element_ptr(
+                    root,
+                    byte_offset=b_copy_round_slots(copy_round)[2],
+                    elem_type=T.i8,
                 )
+                for copy_round in range_constexpr(2)
+            ]
+
+        # N offset and intra-row byte offset are K-invariant.
+        def make_b_voffsets(row_tile):
+            voffsets = []
+            for copy_round in range_constexpr(2):
+                row, col_byte, _ = b_copy_round_slots(copy_round)
+                global_row = row_tile * block_n + fx.Int32(row)
+                voffsets.append(global_row * (hidden_size // 2) + fx.Int32(col_byte))
+            return voffsets
+
+        b_gate_dma_ptrs = [
+            make_b_dma_ptrs(ptr) for ptr in (lds.b_gate0.ptr, lds.b_gate1.ptr)
+        ]
+        b_up_dma_ptrs = [make_b_dma_ptrs(ptr) for ptr in (lds.b_up0.ptr, lds.b_up1.ptr)]
+
+        def raw_b_mxfp4_g2s(k_block_idx, lds_ptrs, voffsets):
+            tile_soffset = fx.Int32(k_block_idx * (block_k // 2))
+            for copy_round in range_constexpr(2):
                 rocdl.raw_ptr_buffer_load_lds(
                     b_rsrc,
-                    lds_ptr,
+                    lds_ptrs[copy_round],
                     fx.Int32(16),
-                    global_byte,
-                    fx.Int32(0),
+                    voffsets[copy_round],
+                    tile_soffset,
                     fx.Int32(0),
                     fx.Int32(0),
                 )
@@ -896,32 +939,32 @@ def compile_moe_gateup_4w(
         scale_lane_id = tid % 64
         scale_wave_id = wave_id_uniform
 
-        # One buffer_load_dword ... lds per wave; no scale value lives in a
-        # prefetch VGPR. Global packed-scale layout is unchanged.
-        def raw_scale_g2s(rsrc, kk, ptr, row_tile, rows, is_a: bool):
+        # scale layout (r//128, 4r1, 32r0, k//32) permuted to
+        #  (k//32, r//128, 32r0, 4r1) -> ( k//128, 4g0,r //128, 32r0, 4r1)
+
+        # ( k//128, 4g0, r //128, 32r0, 4r1) , (r*4, r, 128, 4, 1 )
+
+        # rows -> r
+        # kk -> k //128
+        # row_tile -> r//128
+        def make_scale_voffset(row_tile, rows, is_a: bool):
             wave_half = scale_wave_id // 2 if is_a else scale_wave_id % 2
             scale_row = scale_lane_id % 16 + wave_half * 16
             scale_group = scale_lane_id // 16
-
-            # scale layout (r//128, 4r1, 32r0, k//32) permuted to
-            #  (k//32, r//128, 32r0, 4r1) -> ( k//128, 4g0,r //128, 32r0, 4r1)
-
-            # ( k//128, 4g0, r //128, 32r0, 4r1) , (r*4, r, 128, 4, 1 )
-
-            # rows -> r
-            # kk -> k //128
-            # row_tile -> r//128
-
-            tile_voffset = (
+            return (
                 fx.Int32(scale_row) * 4
                 + fx.Int32(scale_group) * rows
                 + row_tile * 32 * 4
             )
+
+        # One buffer_load_dword ... lds per wave; no scale value lives in a
+        # prefetch VGPR. Global packed-scale layout is unchanged.
+        def raw_scale_g2s(rsrc, kk, ptr, voffset, rows):
             rocdl.raw_ptr_buffer_load_lds(
                 rsrc,
                 ptr,
                 fx.Int32(4),
-                tile_voffset,
+                voffset,
                 fx.Int32(kk * rows * 4),
                 fx.Int32(0),
                 fx.Int32(0),
@@ -1050,6 +1093,21 @@ def compile_moe_gateup_4w(
         num_k_tiles = hidden_size // block_k
         assert num_k_tiles >= 4 and num_k_tiles % 2 == 0
 
+        b_gate_voffsets = make_b_voffsets(gate_row_tile)
+        b_up_voffsets = make_b_voffsets(up_row_tile)
+        scale_b_gate_voffset = make_scale_voffset(
+            gate_scale_row_tile, scale_b_padded_rows, False
+        )
+        scale_b_up_voffset = make_scale_voffset(
+            up_scale_row_tile, scale_b_padded_rows, False
+        )
+        scale_a_top_voffset = make_scale_voffset(
+            a_top_scale_tile, scale_a_padded_rows, True
+        )
+        scale_a_bottom_voffset = make_scale_voffset(
+            a_bottom_scale_tile, scale_a_padded_rows, True
+        )
+
         # Only the scales consumed by MFMA are kept in registers. Future tiles
         # reside in the corresponding scale LDS ping-pong buffers.
         scale_a_top_frag = fx.make_fragment_like(scale_a_top_source[0])
@@ -1079,63 +1137,51 @@ def compile_moe_gateup_4w(
         def do_g2s(kk, buffer_index: int):
             ki = fx.Int32(kk)
             # AC B left;
-            raw_b_mxfp4_g2s(
-                ki,
-                (lds.b_gate0.ptr, lds.b_gate1.ptr)[buffer_index],
-                gate_row_tile,
-            )
+            raw_b_mxfp4_g2s(ki, b_gate_dma_ptrs[buffer_index], b_gate_voffsets)
             rocdl.sched_barrier(0)
             # load B left scale
             raw_scale_g2s(
                 scale_b_rsrc,
                 ki,
                 scale_b_gate_dma_ptrs[buffer_index],
-                gate_scale_row_tile,
+                scale_b_gate_voffset,
                 scale_b_padded_rows,
-                False,
             )
             rocdl.sched_barrier(0)
             # AC A top
-            raw_a_gather_g2s(ki, a_top_dma_ptrs[buffer_index], a_top_token_ids)
+            raw_a_gather_g2s(ki, a_top_dma_ptrs[buffer_index], a_top_voffsets)
             rocdl.sched_barrier(0)
             # load top scale
             raw_scale_g2s(
                 scale_a_rsrc,
                 ki,
                 scale_a_top_dma_ptrs[buffer_index],
-                a_top_scale_tile,
+                scale_a_top_voffset,
                 scale_a_padded_rows,
-                True,
             )
             rocdl.sched_barrier(0)
             # AC A bottom.
-            raw_a_gather_g2s(ki, a_bottom_dma_ptrs[buffer_index], a_bottom_token_ids)
+            raw_a_gather_g2s(ki, a_bottom_dma_ptrs[buffer_index], a_bottom_voffsets)
             rocdl.sched_barrier(0)
             # load A bottom scale;
             raw_scale_g2s(
                 scale_a_rsrc,
                 ki,
                 scale_a_bottom_dma_ptrs[buffer_index],
-                a_bottom_scale_tile,
+                scale_a_bottom_voffset,
                 scale_a_padded_rows,
-                True,
             )
             rocdl.sched_barrier(0)
             # AC B right
-            raw_b_mxfp4_g2s(
-                ki,
-                (lds.b_up0.ptr, lds.b_up1.ptr)[buffer_index],
-                up_row_tile,
-            )
+            raw_b_mxfp4_g2s(ki, b_up_dma_ptrs[buffer_index], b_up_voffsets)
             rocdl.sched_barrier(0)
             # load B right scale.
             raw_scale_g2s(
                 scale_b_rsrc,
                 ki,
                 scale_b_up_dma_ptrs[buffer_index],
-                up_scale_row_tile,
+                scale_b_up_voffset,
                 scale_b_padded_rows,
-                False,
             )
             rocdl.sched_barrier(0)
 
@@ -1202,12 +1248,11 @@ def compile_moe_gateup_4w(
                 scale_b_rsrc,
                 kk + 2,
                 scale_b_gate_dma_ptrs[0],
-                gate_scale_row_tile,
+                scale_b_gate_voffset,
                 scale_b_padded_rows,
-                False,
             )
             order_scale_before_g2s()
-            raw_b_mxfp4_g2s(kk + 2, lds.b_gate0.ptr, gate_row_tile)
+            raw_b_mxfp4_g2s(kk + 2, b_gate_dma_ptrs[0], b_gate_voffsets)
             hot_loop_scheduler_read_a_prefetch_b(0, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
@@ -1228,12 +1273,11 @@ def compile_moe_gateup_4w(
                 scale_a_rsrc,
                 kk + 2,
                 scale_a_top_dma_ptrs[0],
-                a_top_scale_tile,
+                scale_a_top_voffset,
                 scale_a_padded_rows,
-                True,
             )
             order_scale_before_g2s()
-            raw_a_gather_g2s(kk + 2, a_top_dma_ptrs[0], a_top_token_ids)
+            raw_a_gather_g2s(kk + 2, a_top_dma_ptrs[0], a_top_voffsets)
             hot_loop_scheduler_read_b_prefetch_a(1, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
 
@@ -1252,12 +1296,11 @@ def compile_moe_gateup_4w(
                 scale_a_rsrc,
                 kk + 2,
                 scale_a_bottom_dma_ptrs[0],
-                a_bottom_scale_tile,
+                scale_a_bottom_voffset,
                 scale_a_padded_rows,
-                True,
             )
             order_scale_before_g2s()
-            raw_a_gather_g2s(kk + 2, a_bottom_dma_ptrs[0], a_bottom_token_ids)
+            raw_a_gather_g2s(kk + 2, a_bottom_dma_ptrs[0], a_bottom_voffsets)
             hot_loop_scheduler_read_b_prefetch_a(2, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
             # phase 3:
@@ -1275,12 +1318,11 @@ def compile_moe_gateup_4w(
                 scale_b_rsrc,
                 kk + 2,
                 scale_b_up_dma_ptrs[0],
-                up_scale_row_tile,
+                scale_b_up_voffset,
                 scale_b_padded_rows,
-                False,
             )
             order_scale_before_g2s()
-            raw_b_mxfp4_g2s(kk + 2, lds.b_up0.ptr, up_row_tile)
+            raw_b_mxfp4_g2s(kk + 2, b_up_dma_ptrs[0], b_up_voffsets)
             hot_loop_scheduler_read_a_prefetch_b(3, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
 
@@ -1300,12 +1342,11 @@ def compile_moe_gateup_4w(
                 scale_b_rsrc,
                 kk + 3,
                 scale_b_gate_dma_ptrs[1],
-                gate_scale_row_tile,
+                scale_b_gate_voffset,
                 scale_b_padded_rows,
-                False,
             )
             order_scale_before_g2s()
-            raw_b_mxfp4_g2s(kk + 3, lds.b_gate1.ptr, gate_row_tile)
+            raw_b_mxfp4_g2s(kk + 3, b_gate_dma_ptrs[1], b_gate_voffsets)
             hot_loop_scheduler_read_a_prefetch_b(4, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
             # phase1:
@@ -1324,12 +1365,11 @@ def compile_moe_gateup_4w(
                 scale_a_rsrc,
                 kk + 3,
                 scale_a_top_dma_ptrs[1],
-                a_top_scale_tile,
+                scale_a_top_voffset,
                 scale_a_padded_rows,
-                True,
             )
             order_scale_before_g2s()
-            raw_a_gather_g2s(kk + 3, a_top_dma_ptrs[1], a_top_token_ids)
+            raw_a_gather_g2s(kk + 3, a_top_dma_ptrs[1], a_top_voffsets)
             hot_loop_scheduler_read_b_prefetch_a(5, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
             # phase2:
@@ -1348,12 +1388,11 @@ def compile_moe_gateup_4w(
                 scale_a_rsrc,
                 kk + 3,
                 scale_a_bottom_dma_ptrs[1],
-                a_bottom_scale_tile,
+                scale_a_bottom_voffset,
                 scale_a_padded_rows,
-                True,
             )
             order_scale_before_g2s()
-            raw_a_gather_g2s(kk + 3, a_bottom_dma_ptrs[1], a_bottom_token_ids)
+            raw_a_gather_g2s(kk + 3, a_bottom_dma_ptrs[1], a_bottom_voffsets)
             hot_loop_scheduler_read_b_prefetch_a(6, a_vmem, b_dsrd)
             rocdl.sched_barrier(0)
             # phase3:
@@ -1372,12 +1411,11 @@ def compile_moe_gateup_4w(
                 scale_b_rsrc,
                 kk + 3,
                 scale_b_up_dma_ptrs[1],
-                up_scale_row_tile,
+                scale_b_up_voffset,
                 scale_b_padded_rows,
-                False,
             )
             order_scale_before_g2s()
-            raw_b_mxfp4_g2s(kk + 3, lds.b_up1.ptr, up_row_tile)
+            raw_b_mxfp4_g2s(kk + 3, b_up_dma_ptrs[1], b_up_voffsets)
             hot_loop_scheduler_read_a_prefetch_b(7, b_vmem, a_dsrd)
             rocdl.sched_barrier(0)
             loop_results = yield [
@@ -1491,11 +1529,26 @@ def compile_moe_gateup_4w(
 
         pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
         lane_group = lane_id // 16
-        wave_m = wave_id // 2
         wave_n = wave_id % 2
 
         def store_gateup(gate_frag, up_frag, row_quadrant: int):
             for row_repeat in range_constexpr(4):
+                sorted_row, fused_id = store_row_ids[row_quadrant * 4 + row_repeat]
+                token_id = arith.andi(fused_id, mask24)
+                slot_id = arith.shrui(fused_id, arith.constant(24, type=T.i32))
+                token_valid = arith.cmpi(CmpIPredicate.ult, token_id, num_tokens_i32)
+                slot_valid = arith.cmpi(
+                    CmpIPredicate.ult,
+                    slot_id,
+                    arith.constant(topk, type=T.i32),
+                )
+                sorted_valid = arith.cmpi(CmpIPredicate.ult, sorted_row, num_valid_i32)
+                store_valid = arith.andi(
+                    sorted_valid, arith.andi(token_valid, slot_valid)
+                )
+                row_base = (
+                    fx.Int32(token_id) * topk + fx.Int32(slot_id)
+                ) * intermediate_size
                 for col_repeat in range_constexpr(0, 4, 2):
                     gate_a = Vec(gate_frag[None, col_repeat, row_repeat].load())
                     gate_b = Vec(gate_frag[None, col_repeat + 1, row_repeat].load())
@@ -1542,32 +1595,6 @@ def compile_moe_gateup_4w(
                         ],
                         Int32,
                     )
-                    row_local = (
-                        row_quadrant * block_m
-                        + row_repeat * 32
-                        + wave_m * 16
-                        + lane_id % 16
-                    )
-                    sorted_row = expert_block_i32 * SORT_BLOCK_M + fx.Int32(row_local)
-                    fused_id = buffer_ops.buffer_load(
-                        sorted_rsrc, sorted_row, vec_width=1, dtype=T.i32
-                    )
-                    token_id = arith.andi(fused_id, mask24)
-                    slot_id = arith.shrui(fused_id, arith.constant(24, type=T.i32))
-                    token_valid = arith.cmpi(
-                        CmpIPredicate.ult, token_id, num_tokens_i32
-                    )
-                    slot_valid = arith.cmpi(
-                        CmpIPredicate.ult,
-                        slot_id,
-                        arith.constant(topk, type=T.i32),
-                    )
-                    sorted_valid = arith.cmpi(
-                        CmpIPredicate.ult, sorted_row, num_valid_i32
-                    )
-                    store_valid = arith.andi(
-                        sorted_valid, arith.andi(token_valid, slot_valid)
-                    )
                     col = (
                         n_tile_i32 * block_n
                         + col_repeat * 32
@@ -1575,9 +1602,7 @@ def compile_moe_gateup_4w(
                         + fx.Int32(wave_n * 16)
                         + fx.Int32((lane_group // 2) * 8)
                     )
-                    output_element = (
-                        fx.Int32(token_id) * topk + fx.Int32(slot_id)
-                    ) * intermediate_size + col
+                    output_element = row_base + col
                     buffer_ops.buffer_store(
                         packed,
                         c_rsrc,
