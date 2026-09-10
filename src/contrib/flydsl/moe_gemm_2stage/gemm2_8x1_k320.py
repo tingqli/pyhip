@@ -3,8 +3,6 @@
 
 """K320：128+192四阶段；不padding或增加MFMA。"""
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -21,10 +19,8 @@ from .common import get_down_device_config
 def _build_moe_gemm2_8x1_k320(
     N, TOPK, padding, *, weight_quant_type="ptpc", act_quant_type=None,
     _task_table=False,
-    _n_loop=1, _store_cache=2, _relax_vmcnt=True,
-    _block_k=192,
+    _n_loop=1, _store_cache=2,
 ):
-    assert _block_k == 192
     K, BM, BN = 320, 256, 128
     K_WIDTHS = (128, 192)
     K_OFFSETS = (0, 128)
@@ -38,10 +34,9 @@ def _build_moe_gemm2_8x1_k320(
     KS, NT = len(K_WIDTHS), N // BN
     use_n_loop = bool(_n_loop and NT >= 3)
     STRIDE = N + padding // 2
-    ROLLING = os.environ.get("MOE_8X1_ROLLING_EPILOGUE", "1") != "0"
     from .gemm2_8x1_schedule import vmem_wait_schedule
     vmem_budgets = vmem_wait_schedule(
-        K, NT, weight_quant_type == "ptpc", ROLLING, _relax_vmcnt,
+        K, NT, weight_quant_type == "ptpc",
         K_WIDTHS,
     )
     ops = fxh.FlyObjCache()
@@ -202,9 +197,8 @@ def _build_moe_gemm2_8x1_k320(
             def b_offsets(ks):
                 width = K_WIDTHS[ks]
                 index = group * (BN * width // 64) + group_tid
-                extra = 0
-                global_offset = (index // width) * (16 * K) + ((index % width) // 16) * 256 + (index % 16) * 16 + extra
-                local_offset = (index // width) * (16 * width) + ((index % width) // 16) * 256 + (index % 16) * 16 + extra
+                global_offset = (index // width) * (16 * K) + ((index % width) // 16) * 256 + (index % 16) * 16
+                local_offset = (index // width) * (16 * width) + ((index % width) // 16) * 256 + (index % 16) * 16
                 return global_offset, local_offset
 
             def tail192_b_offsets(part):
@@ -230,7 +224,7 @@ def _build_moe_gemm2_8x1_k320(
                 return raw_b_load(b_offsets(ks)[0], n * BN * K + K_OFFSETS[ks] * 16 + half * (BN // 2) * K, K_WIDTHS[ks] // 32)
 
             def commit_b(position, fragment):
-                ks, half, slot = position[1], position[2], position[4]
+                ks, half = position[1], position[2]
                 width = K_WIDTHS[ks]
                 base = fx.recast_iter(fx.Uint32, bptrs[ks]) + half * (BN // 2) * (width // 4)
                 if const_expr(width == 192):
@@ -263,7 +257,7 @@ def _build_moe_gemm2_8x1_k320(
             scratch_write = ops.get_universal_copy_atom(fx.BFloat16, 128)
             scratch_read = ops.get_universal_copy_atom(fx.BFloat16, 64)
             scratch_base = (wave % 4) * 16 * BN
-            lane_group, row8, row_half = lane // 16, (lane % 16) % 8, (lane % 16) // 8
+            lane_group = lane // 16
 
             if const_expr(weight_quant_type == "ptpc"):
                 scale_buffer = fx.rocdl.make_buffer_tensor(
@@ -381,7 +375,7 @@ def _build_moe_gemm2_8x1_k320(
 
             # q0剥离，额外一拍barrier令两组4-wave交错memory/compute。
             priority(0)
-            scales = [load_scale(0, 0)] if ROLLING else []
+            scales = [load_scale(0, 0)]
             first_b = [read_b(0, 0, 0, quarter) for quarter in range_constexpr(2)]
             wait(vmcnt=vmem_budgets[0])
             commit_b(b_position(0), prefetched[0])
@@ -416,9 +410,12 @@ def _build_moe_gemm2_8x1_k320(
                     priority(3)
 
                 packed_previous, scales_previous = emit_nloop(
-                    K, NT, _n_loop, weight_quant_type == "ptpc", ROLLING, _relax_vmcnt,
-                    c, prefetched, scales, ops, loop_issue, loop_commit, read_b, load_scale, pack,
-                    issue_output, store_output, mma, clear, schedule_pack, memory, compute, stage_end, wait,
+                    k=K, n_tiles=NT, unroll_n=_n_loop, ptpc=weight_quant_type == "ptpc",
+                    c=c, prefetched=prefetched, first_scales=scales, ops=ops,
+                    issue_b=loop_issue, commit_b=loop_commit, read_b=read_b,
+                    load_scale=load_scale, pack=pack, issue_output=issue_output, store_output=store_output,
+                    mma=mma, clear=clear, schedule_pack=schedule_pack,
+                    enter_memory=memory, enter_compute=compute, stage_end=stage_end, wait=wait,
                     k_widths=K_WIDTHS,
                 )
             for q in range_constexpr(1, 1 if use_n_loop else NT * KS * 2):
@@ -430,15 +427,11 @@ def _build_moe_gemm2_8x1_k320(
                 if const_expr(stage == 0):
                     scales, packed_current = [], []
                 priority(0)
-                if const_expr(ROLLING):
-                    scales.append(load_scale(n, stage))
-                has_output = ROLLING and n > 0
+                scales.append(load_scale(n, stage))
+                has_output = n > 0
                 if const_expr(has_output):
                     output_quarter = stage
                     output_fragments, output_destinations = issue_output(n - 1, packed_previous, output_quarter % 2, output_quarter // 2)
-                elif const_expr(not ROLLING and n > 0 and stage == 0):
-                    retire(n - 1, packed_previous)
-
                 bf = [read_b(slot, half, ks, 0)]
                 if const_expr(has_output):
                     store_output(output_fragments, output_destinations, lgkmcnt=K_WIDTHS[ks] // 32)
@@ -447,7 +440,7 @@ def _build_moe_gemm2_8x1_k320(
                 if const_expr(pending[3]):
                     wait(vmcnt=vmem_budgets[q])
                     commit_b(pending, prefetched[entry])
-                elif const_expr(ROLLING and weight_quant_type == "ptpc" and ks == 0):
+                elif const_expr(weight_quant_type == "ptpc" and ks == 0):
                     # 末N即便没有下一B提交，跨SR打包仍必须保护scale消费者。
                     wait(vmcnt=vmem_budgets[q])
                 if const_expr(has_future):
@@ -465,7 +458,7 @@ def _build_moe_gemm2_8x1_k320(
                         clear(pair)
                     rocdl.sched_barrier(0)
                     mma(bf[local_pair], ks, pair)
-                    if const_expr(ROLLING and ks == 0):
+                    if const_expr(ks == 0):
                         if const_expr(n > 0 and half == 0):
                             retired_pair = local_pair + 2
                             packed_previous.append(pack(retired_pair, scales_previous[retired_pair]))
@@ -478,17 +471,9 @@ def _build_moe_gemm2_8x1_k320(
                 wait(lgkmcnt=0)
                 priority(0)
                 stage_end()
-                if const_expr(not ROLLING and stage == 2 * KS - 1):
-                    # pure分支在阶段边界之后打包，避免inline-asm紧邻末MFMA。
-                    scales = [load_scale(n, pair) for pair in range_constexpr(4)]
-                    wait(vmcnt=0)
-                    packed_previous = [pack(pair, scales[pair]) for pair in range_constexpr(4)]
-                    scales_previous = scales
-
-            if const_expr(ROLLING):
-                wait(vmcnt=0)
-                for pair in range_constexpr(2, 4):
-                    packed_previous.append(pack(pair, scales_previous[pair]))
+            wait(vmcnt=0)
+            for pair in range_constexpr(2, 4):
+                packed_previous.append(pack(pair, scales_previous[pair]))
             retire(NT - 1, packed_previous)
             stage_end()
             if group == 0:

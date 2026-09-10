@@ -37,12 +37,11 @@ def output_quarter(k, stage, k_widths=None):
 
 
 @cache
-def vmem_wait_schedule(k, n_tiles, ptpc=True, rolling=True, relax=True, k_widths=None):
+def vmem_wait_schedule(k, n_tiles, ptpc=True, k_widths=None):
     """普通buffer/global每条指令一个事件；wait后才issue下一条B。
 
     预算取所有即将消费的B/scale的年龄最小值。不能只计算B的年龄：
     K256某些packet用的是上一拍scale，会把9收紧到7。
-    pure保留原保守阈值；其scale在退休点显式wait(0)，不按rolling推断。
     K192使用独立BK192账本；K320必须显式传入唯一分块(128, 192)。
     """
     assert k in (256, 320, 384, 512, 640) and n_tiles >= 1, "shared 8x1 schedule不支持该K或N块数"
@@ -66,25 +65,17 @@ def vmem_wait_schedule(k, n_tiles, ptpc=True, rolling=True, relax=True, k_widths
     result = []
     for q in range(n_tiles * 2 * ks):
         n, stage = divmod(q, 2 * ks)
-        scale_count = 2 if rolling and ptpc and stage < 4 else 0
+        scale_count = 2 if ptpc and stage < 4 else 0
         events.extend([("scale", n, stage)] * scale_count)
         if scale_count:
             scales[n, stage] = len(events) - 1
-        store_count = (2 if rolling and n > 0 and output_quarter(k, stage, k_widths) is not None
-                       else 8 if not rolling and n > 0 and stage == 0 else 0)
+        store_count = 2 if n > 0 and output_quarter(k, stage, k_widths) is not None else 0
         events.extend([("store", n, stage)] * store_count)
         required = [requests[q]] if valid(q) else []
-        if rolling and ptpc:
+        if ptpc:
             for _, previous, record in packing_events(k, stage, n == 0, k_widths):
                 required.append(scales[n - int(previous), record])
-        old = scale_count + store_count + int(valid(q + 1))
-        if k == 512 and ptpc and rolling and n > 0 and 0 < stage <= 4 and valid(q + 1):
-            old += 4
         budget = min((len(events) - 1 - index for index in required), default=63)
-        if k_widths is not None:
-            # 新末块路径pure也按native B保护，scale在pure pack点另行wait(0)。
-            result.append(budget if relax else 0)
-        else:
-            result.append(budget if relax and rolling else old)
+        result.append(budget)
         request(q + 2)
     return tuple(result)

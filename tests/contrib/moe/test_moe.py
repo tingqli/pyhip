@@ -33,12 +33,22 @@ def _select_down_config(down_path, tile_n, default_use_prefill):
         return default_use_prefill, tile_n
     return True, {
         '1x4_64x256': 256,
-        '2x4': 256,
-        '1x8': 512,
-        '4x1': 64,
         '8x1': 128,
         '8x1_compact': 128,
     }[down_path]
+
+
+def _model_down_config(case, batch):
+    """交互测试的已测Hy3/H3预设；不作为生产selector，也不外推未测Batch。"""
+    paths = {
+        'hy3': {1024: '8x1_compact', 2048: '8x1_compact', 4096: '1x4_64x256',
+                8192: '8x1_compact', 16384: '8x1', 32768: '8x1'},
+        'h3': {1024: '1x4_64x256', 2048: '1x4_64x256', 4096: '1x4_64x256',
+               8192: '8x1', 16384: '8x1_compact', 32768: '8x1_compact'},
+    }
+    path = paths[case].get(batch, 'default')
+    return dict(down_path=path, TILE_M_DOWN=256 if path == '8x1' else 64,
+                down_output_padding_bytes=None if path == 'default' else 128)
 
 
 def _fly_dispatch(cache_key, build_jit, args):
@@ -587,16 +597,12 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
             from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
             from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
             from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
-            assert down_path in ('default', '1x4_64x256', '2x4', '1x8', '4x1', '8x1', '8x1_compact')
-            if down_path == '2x4':
-                assert TILE_M_DOWN == 128
-            elif down_path == '4x1':
-                assert TILE_M_DOWN in (128, 256)
-            elif down_path == '8x1':
+            assert down_path in ('default', '1x4_64x256', '8x1', '8x1_compact')
+            if down_path == '8x1':
                 assert TILE_M_DOWN == 256
             elif down_path == '8x1_compact':
                 assert TILE_M_DOWN == 64 and TILE_M_GATEUP == 64
-            elif down_path in ('1x4_64x256', '1x8'):
+            elif down_path == '1x4_64x256':
                 assert TILE_M_DOWN == 64
             assert down_output_padding_bytes in (None, 0, 32, 64, 128)
 
@@ -728,10 +734,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                     print(down_flops)
                     assert 0
                 grid = sorted_expert_ids.shape[0]
-                # Only gateup prefill supports different gateup/metadata M tiles, so 2x4
-                # forces it even for small batches. Otherwise keep the B>32 heuristic.
+                # 专用M分块路径要求gateup prefill支持不同kernel/metadata M。
+                # 其余路径保持B>32启发式。
                 use_gateup_prefill = (
-                    weight_dtype != 'fp4' and (B > 32 or down_path in ('2x4', '4x1', '8x1', '8x1_compact'))
+                    weight_dtype != 'fp4' and (B > 32 or down_path in ('8x1', '8x1_compact'))
                 ) and TILE_M_GATEUP >= 32 and TILE_M_GATEUP % 32 == 0
                 if use_gateup_prefill:
                     assert TILE_N in (128, 256) and N1 % TILE_N == 0
@@ -839,7 +845,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                         #print(idx.view(-1,16))
                         compact_args = ()
                         if down_path == '8x1_compact':
-                            from pyhip.contrib.flydsl.moe_gemm_2stage.compact_tasks import allocate_task_buffers
+                            from pyhip.contrib.flydsl.moe_gemm_2stage.gemm2_8x1_compact import allocate_task_buffers
                             full_tasks, tail_tasks, task_counts = allocate_task_buffers(sorted_expert_ids, E)
                             compact_args = (
                                 _ptr(full_tasks), _ptr(tail_tasks), _ptr(task_counts),
@@ -1334,44 +1340,10 @@ def test_acc_fly_splitk_2s(batch, prec, TILE_M_DOWN, TILE_M_GATEUP, TILE_N, HIDD
     entry_common('fly_splitk_2s', batch=batch, prec=prec, TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=10)
 
 
-@pytest.mark.parametrize(
-    "tile_m_down,hidden_size,inter_size,quant_type",
-    [
-        (128, 512, 128, "ptpc"),
-        (128, 512, 192, "per_tensor"),
-        (256, 512, 128, "per_tensor"),
-        (256, 512, 192, "ptpc"),
-        (128, 2048, 512, "ptpc"),
-    ],
-)
-def test_acc_fly_splitk_2s_down_4x1(
-    monkeypatch, tile_m_down, hidden_size, inter_size, quant_type
-):
-    monkeypatch.delenv("MOE_PREFILL_TILE_K", raising=False)
-    entry_common(
-        "fly_splitk_2s",
-        batch=[33],
-        prec=[get_fp8type()],
-        TILE_M_DOWN=tile_m_down,
-        TILE_M_GATEUP=64,
-        TILE_N=128,
-        HIDDEN_SIZE=hidden_size,
-        INTER_SIZE=inter_size,
-        TOPK=4,
-        E=8,
-        TP=1,
-        run_count=0,
-        quant_type=quant_type,
-        down_path="4x1",
-        down_output_padding_bytes=128,
-    )
-
-
 @pytest.mark.parametrize("inter_size", [192, 256, 320, 384, 512, 640])
 @pytest.mark.parametrize("quant_type", ["ptpc", "per_tensor"])
 def test_acc_fly_splitk_2s_down_8x1(monkeypatch, inter_size, quant_type):
     monkeypatch.delenv("MOE_PREFILL_TILE_K", raising=False)
-    monkeypatch.setenv("MOE_8X1_ROLLING_EPILOGUE", "1")
     entry_common(
         "fly_splitk_2s",
         batch=[33],
@@ -1393,9 +1365,8 @@ def test_acc_fly_splitk_2s_down_8x1(monkeypatch, inter_size, quant_type):
 
 @pytest.mark.parametrize("inter_size", [192, 320])
 @pytest.mark.parametrize("tile_k", [None, 128, 192])
-@pytest.mark.parametrize("rolling", ["0", "1"])
 @pytest.mark.parametrize("weight_quant, act_quant", [("ptpc", None), ("per_tensor", None), ("per_tensor", "ptpc")])
-def test_fly_down_8x1_mixed_dispatch(monkeypatch, inter_size, tile_k, rolling, weight_quant, act_quant):
+def test_fly_down_8x1_mixed_dispatch(monkeypatch, inter_size, tile_k, weight_quant, act_quant):
     import importlib
     from pyhip.contrib.flydsl.moe_gemm_2stage.gemm2_8x1 import _build_moe_gemm2_8x1
 
@@ -1404,14 +1375,13 @@ def test_fly_down_8x1_mixed_dispatch(monkeypatch, inter_size, tile_k, rolling, w
     calls = []
 
     def build_mixed(n, topk, padding, *, weight_quant_type, act_quant_type, _task_table=False,
-                    _n_loop=1, _store_cache=2, _relax_vmcnt=True, _block_k=192):
+                    _n_loop=1, _store_cache=2):
         assert not _task_table
-        assert (_n_loop, _store_cache, _relax_vmcnt, _block_k) == (1, 2, True, 192)
+        assert (_n_loop, _store_cache) == (1, 2)
         calls.append((n, topk, padding, weight_quant_type, act_quant_type))
         return sentinel
 
     monkeypatch.setattr(module, f"_build_moe_gemm2_8x1_k{inter_size}", build_mixed)
-    monkeypatch.setenv("MOE_8X1_ROLLING_EPILOGUE", rolling)
     result = _build_moe_gemm2_8x1(
         N=512, K=inter_size, weight_dtype="fp8", weight_quant_type=weight_quant,
         TOPK=4, BLOCK_TILE_SIZE_M=256, BLOCK_TILE_SIZE_N=128,
@@ -1423,11 +1393,9 @@ def test_fly_down_8x1_mixed_dispatch(monkeypatch, inter_size, tile_k, rolling, w
 
 
 @pytest.mark.parametrize("inter_size", [192, 320])
-@pytest.mark.parametrize("rolling", ["0", "1"])
-def test_fly_down_8x1_rejects_removed_bk64(monkeypatch, inter_size, rolling):
+def test_fly_down_8x1_rejects_removed_bk64(inter_size):
     from pyhip.contrib.flydsl.moe_gemm_2stage.gemm2_8x1 import _build_moe_gemm2_8x1
 
-    monkeypatch.setenv("MOE_8X1_ROLLING_EPILOGUE", rolling)
     with pytest.raises(AssertionError, match="仅保留K192整块192"):
         _build_moe_gemm2_8x1(
             N=512, K=inter_size, weight_dtype="fp8", weight_quant_type="ptpc",
@@ -1696,8 +1664,8 @@ if __name__ == '__main__':
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":128,
-        "down_path":'1x8',
-        "down_output_padding_bytes":0,
+        "down_path":'1x4_64x256',
+        "down_output_padding_bytes":128,
         "HIDDEN_SIZE":4096,
         "INTER_SIZE":192*8,
         "TP":8,
@@ -1748,11 +1716,11 @@ if __name__ == '__main__':
         "run_count":10,
         "quant_type":'ptpc'
     }
-    qwen35_35B_k256_b32768_args = {
-        "TILE_M_DOWN":256,
+    qwen35_35B_k256_args = {
+        "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
-        "down_path":'4x1',
+        "down_path":'1x4_64x256',
         "down_output_padding_bytes":128,
         "HIDDEN_SIZE":2048,
         "INTER_SIZE":256,
@@ -1777,11 +1745,11 @@ if __name__ == '__main__':
         "quant_type":'ptpc'
     }
     h3_args = {
-        "TILE_M_DOWN":128,
+        "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
-        "down_path":'2x4',
-        "down_output_padding_bytes":0,
+        "down_path":'1x4_64x256',
+        "down_output_padding_bytes":128,
         "HIDDEN_SIZE":6144,
         "INTER_SIZE":384*8,
         "TP":8,
@@ -1804,7 +1772,12 @@ if __name__ == '__main__':
         torch.cuda.empty_cache() 
         entry_common('aiter', batch, prec, **model_args)
         torch.cuda.empty_cache() 
-        entry_common('fly_splitk_2s', batch, prec, **model_args)
+        fly_args = dict(model_args)
+        if model_args is hy3_args:
+            fly_args.update(_model_down_config('hy3', b))
+        elif model_args is h3_args:
+            fly_args.update(_model_down_config('h3', b))
+        entry_common('fly_splitk_2s', batch, prec, **fly_args)
 
     #batch = 131072 # accuracy issue
     #test_acc_fly_splitk_2s(batch=[batch], prec=[torch.bfloat16], TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)

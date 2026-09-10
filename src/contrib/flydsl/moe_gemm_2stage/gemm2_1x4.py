@@ -84,35 +84,10 @@ def _build_moe_gemm2_1x4(
     assert (
         BLOCK_TILE_SIZE_M == METADATA_TILE_SIZE_M
     ), "only gateup prefill_1x4 supports different kernel/metadata M tiles"
-    assert down_path in ("default", "1x4_64x256", "2x4", "1x8")
-    use_1x4_64x256 = down_path == "1x4_64x256"
-    use_2x4 = down_path == "2x4"
-    use_1x8 = down_path == "1x8"
-    topology_enabled, generic_xcd_count = (
-        _get_down_device_config()
-        if use_1x4_64x256 or use_2x4 or use_1x8
-        else (False, 8)
-    )
+    _, generic_xcd_count = _get_down_device_config()
     block_m_per_4wave_group = 64
-
-    # Down path selection. 1x4_64x256 uses a 1x4-wave M64xN256 workgroup;
-    # 2x4 combines two independent 4-wave subgroups into one M128xN256
-    # workgroup; 1x8 uses a 1x8-wave M64xN512 workgroup.
-    if use_1x4_64x256:
-        assert BLOCK_TILE_SIZE_M == 64
-        assert BLOCK_TILE_SIZE_N == 256
-    elif use_2x4:
-        assert BLOCK_TILE_SIZE_M == 128
-        assert BLOCK_TILE_SIZE_N == 256
-    elif use_1x8:
-        assert BLOCK_TILE_SIZE_M == 64
-        assert BLOCK_TILE_SIZE_N == 512
-        assert weight_quant_type == "per_tensor"
-        assert act_quant_type == "per_tensor"
-    else:
-        assert down_output_padding_bytes is None
-
-    cshuffle_2x4_bytes = 8 * 16 * 64 * 2
+    assert BLOCK_TILE_SIZE_M == 64
+    assert BLOCK_TILE_SIZE_N == 256
 
     # MI308X有4个XCC，每个XCC包含4个SE，每个SE包含5个CU。
     # topology map仅在MI308X上启用；每个分区的任务数由运行时有效任务数推导。
@@ -120,37 +95,20 @@ def _build_moe_gemm2_1x4(
     gfx942_se_per_xcc = 4
     gfx942_cu_per_se = 5
     gfx942_se_count = gfx942_xcc_count * gfx942_se_per_xcc
-    if use_1x4_64x256 or use_2x4 or use_1x8:
-        assert stage == "down" and alg == "prefill_1x4"
-        assert N % BLOCK_TILE_SIZE_N == 0
-        assert K % 64 == 0
-        assert weight_dtype == "fp8"
-        assert weight_quant_type in ("ptpc", "per_tensor")
-        assert down_output_padding_bytes in (0, 32, 64, 128)
-        if use_1x4_64x256:
-            activation_bytes = block_m_per_4wave_group * K
-            scale_bytes = BLOCK_TILE_SIZE_N * 4 if weight_quant_type == "ptpc" else 0
-            cshuffle_bytes = 4 * 16 * 64 * (fx.BFloat16.width // 8)
-            assert activation_bytes + scale_bytes + cshuffle_bytes <= 64 * 1024, (
-                "1x4_64x256 exceeds gfx942 LDS capacity; "
-                f"activation={activation_bytes}B, scale={scale_bytes}B, "
-                f"cshuffle={cshuffle_bytes}B"
-            )
-        if use_2x4:
-            activation_bytes = 2 * block_m_per_4wave_group * K
-            assert activation_bytes + cshuffle_2x4_bytes <= 64 * 1024, (
-                "2x4 requires activation and row-major CShuffle "
-                "to fit gfx942 LDS; "
-                f"activation={activation_bytes}B, "
-                f"cshuffle={cshuffle_2x4_bytes}B"
-            )
-        if use_1x8:
-            activation_bytes = block_m_per_4wave_group * K
-            cshuffle_bytes = 8 * 16 * 64 * (fx.BFloat16.width // 8)
-            assert activation_bytes + cshuffle_bytes <= 64 * 1024, (
-                "1x8 exceeds gfx942 LDS capacity; "
-                f"activation={activation_bytes}B, cshuffle={cshuffle_bytes}B"
-            )
+    assert alg == "prefill_1x4"
+    assert N % BLOCK_TILE_SIZE_N == 0
+    assert K % 64 == 0
+    assert weight_dtype == "fp8"
+    assert weight_quant_type in ("ptpc", "per_tensor")
+    assert down_output_padding_bytes in (0, 32, 64, 128)
+    activation_bytes = block_m_per_4wave_group * K
+    scale_bytes = BLOCK_TILE_SIZE_N * 4 if weight_quant_type == "ptpc" else 0
+    cshuffle_bytes = 4 * 16 * 64 * (fx.BFloat16.width // 8)
+    assert activation_bytes + scale_bytes + cshuffle_bytes <= 64 * 1024, (
+        "1x4_64x256 exceeds gfx942 LDS capacity; "
+        f"activation={activation_bytes}B, scale={scale_bytes}B, "
+        f"cshuffle={cshuffle_bytes}B"
+    )
     output_row_stride = N + (
         down_output_padding_bytes // (fx.BFloat16.width // 8)
         if down_output_padding_bytes is not None

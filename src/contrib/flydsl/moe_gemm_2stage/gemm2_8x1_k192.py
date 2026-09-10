@@ -4,7 +4,6 @@
 """K192：双槽整块BK192，两拍48-MFMA/wave。"""
 
 from functools import cache
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -22,11 +21,9 @@ from .common import get_down_device_config
 def _build_moe_gemm2_8x1_k192(
     N, TOPK, padding, *, weight_quant_type="ptpc", act_quant_type=None,
     _task_table=False,
-    _n_loop=1, _store_cache=2, _relax_vmcnt=True,
-    _block_k=192,
+    _n_loop=1, _store_cache=2,
 ):
-    assert _block_k == 192
-    K, BM, BN, MAX_BK = 192, 256, 128, _block_k
+    K, BM, BN = 192, 256, 128
     K_WIDTHS = (192,)
     K_OFFSETS = (0,)
     if act_quant_type is None:
@@ -38,7 +35,6 @@ def _build_moe_gemm2_8x1_k192(
     assert padding in (0, 32, 64, 128)
     KS, NT = len(K_WIDTHS), N // BN
     STRIDE = N + padding // 2
-    ROLLING = os.environ.get("MOE_8X1_ROLLING_EPILOGUE", "1") != "0"
     ops = fxh.FlyObjCache()
     topology, xcc_count = get_down_device_config()
     se_count = xcc_count * 4
@@ -71,8 +67,7 @@ def _build_moe_gemm2_8x1_k192(
         p_w_scale: fx.Pointer, p_a_scale: fx.Pointer, M: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_idx.x)
-        # 保留原线程索引表达式的生成顺序，避免清理时引入SSA漂移。
-        lane, wave, group_tid = tid % 64, tid // 64, tid % 256
+        lane, wave = tid % 64, tid // 64
         group = fx.Int32(rocdl.readfirstlane(ir.IntegerType.get_signless(32), _raw(tid // 256)))
         valid = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
         wg = fx.Int32(gpu.block_idx.y)
@@ -94,8 +89,8 @@ def _build_moe_gemm2_8x1_k192(
             if const_expr(_task_table):
                 row_begin = p_sorted_expert_ids[2 * e_idx]
             allocator = fx.SharedAllocator()
-            bslots = allocator.allocate(fx.Array[fx.Float8E4M3FNUZ, 2 * BN * MAX_BK, 16])
-            bptrs = [bslots.peek().ptr, bslots.peek().ptr + BN * MAX_BK]
+            bslots = allocator.allocate(fx.Array[fx.Float8E4M3FNUZ, 2 * BN * K, 16])
+            bptrs = [bslots.peek().ptr, bslots.peek().ptr + BN * K]
             scratch = allocator.allocate(fx.Array[fx.BFloat16, 4 * 16 * BN, 16])
             scratch_view = scratch.peek().view(fx.make_layout(4 * 16 * BN, 1))
             ids_lds = fx.make_view(fx.recast_iter(fx.Int32, scratch.peek().ptr), fx.make_layout(BM, 1))
@@ -228,7 +223,7 @@ def _build_moe_gemm2_8x1_k192(
             scratch_write = ops.get_universal_copy_atom(fx.BFloat16, 128)
             scratch_read = ops.get_universal_copy_atom(fx.BFloat16, 64)
             scratch_base = (wave % 4) * 16 * BN
-            lane_group, row8, row_half = lane // 16, (lane % 16) % 8, (lane % 16) // 8
+            lane_group = lane // 16
 
             if const_expr(weight_quant_type == "ptpc"):
                 scale_buffer = fx.rocdl.make_buffer_tensor(
@@ -355,15 +350,18 @@ def _build_moe_gemm2_8x1_k192(
                     stage_end()
 
             packed_previous, scales_previous = emit_bk192_nloop(
-                NT, _n_loop, weight_quant_type == "ptpc", ROLLING, _relax_vmcnt, c, prefetched, ops,
-                issue_bk192, commit_bk192, read_b, load_scale, pack, issue_output, store_output,
-                mma, clear, schedule_pack, priority, stage_end, wait, first_stagger, prepare_b_addresses,
+                n_tiles=NT, unroll_n=_n_loop, ptpc=weight_quant_type == "ptpc",
+                c=c, prefetched=prefetched, ops=ops,
+                issue_b=issue_bk192, commit_b=commit_bk192, read_b=read_b,
+                load_scale=load_scale, pack=pack, issue_output=issue_output, store_output=store_output,
+                mma=mma, clear=clear, schedule_pack=schedule_pack,
+                priority=priority, stage_end=stage_end, wait=wait,
+                first_stagger=first_stagger, prepare_b_addresses=prepare_b_addresses,
             )
 
-            if const_expr(ROLLING):
-                wait(vmcnt=0)
-                for pair in range_constexpr(2, 4):
-                    packed_previous.append(pack(pair, scales_previous[pair]))
+            wait(vmcnt=0)
+            for pair in range_constexpr(2, 4):
+                packed_previous.append(pack(pair, scales_previous[pair]))
             retire(NT - 1, packed_previous)
             stage_end()
             if group == 0:
@@ -390,7 +388,7 @@ def _build_moe_gemm2_8x1_k192(
 
 
 @cache
-def bk192_wait_schedule(n_tiles, ptpc, rolling):
+def bk192_wait_schedule(n_tiles, ptpc):
     """消费FIFO的每half-B为16B+8B两条VMEM；同时保护B及跨半区pack的scale。"""
     sequence, requests, scales, budgets = 0, {}, {}, []
 
@@ -412,7 +410,7 @@ def bk192_wait_schedule(n_tiles, ptpc, rolling):
             if n > 0:
                 sequence += 4
             required = [requests[q + 1]] if q + 1 < 2 * n_tiles else []
-            if rolling and ptpc:
+            if ptpc:
                 if half == 0 and n > 0:
                     required.extend(scales[n - 1, pair] for pair in (2, 3))
                 elif half == 1:
@@ -424,64 +422,70 @@ def bk192_wait_schedule(n_tiles, ptpc, rolling):
 
 @flyc.jit
 def emit_bk192_nloop(
-    n_tiles, unroll_n, ptpc, rolling, relax_vmcnt, c, prefetched, ops,
+    n_tiles, unroll_n, ptpc, c, prefetched, ops,
     issue_b, commit_b, read_b, load_scale, pack, issue_output, store_output,
     mma, clear, schedule_pack, priority, stage_end, wait, first_stagger, prepare_b_addresses,
 ):
-    budgets = bk192_wait_schedule(n_tiles, ptpc, rolling)
+    # 1. K192独立计划：每N两拍，最后两N剥离，不能套共享BK128尾部。
+    budgets = bk192_wait_schedule(n_tiles, ptpc)
     body_budgets = tuple(min((budgets[2 * n + half] for n in range(2, n_tiles - 2)), default=63)
                          for half in range(2))
+
+    # 2. 单拍流程。原语保持16B+8B搬运以及CShuffle/B-read交织。
+    def memory_stage(n, half, carries, previous_packed, scales, first, has_next, has_future, addresses):
+        priority(0)
+        for pair in range_constexpr(2 * half, 2 * half + 2):
+            scales.append(load_scale(n, pair))
+        bf = []
+        for quarter in range_constexpr(2):
+            if const_expr(not first):
+                fragments, destinations = issue_output(n - 1, previous_packed, quarter, half)
+            bf.append(read_b(n & 1, half, 0, quarter, addresses))
+            if const_expr(not first):
+                # 本次C读比随后6条B ds_read更早；不等待整个B片段再发store。
+                store_output(fragments, destinations, lgkmcnt=6)
+                fx.rocdl.sched_barrier(0)
+        budget = budgets[2 * n + half] if isinstance(n, int) else body_budgets[half]
+        if const_expr(budget != 63):
+            wait(vmcnt=budget)
+        if const_expr(half == 0 or has_next):
+            commit_b(n + half, 1 - half, carries[half], addresses)
+        if const_expr((half == 0 and has_next) or (half == 1 and has_future)):
+            fx.rocdl.sched_barrier(0)
+            carries[half] = issue_b(n + 1 + half, 1 - half)
+        stage_end()
+        return bf
+
+    def compute_stage(n, half, bf, previous_packed, previous_scales, packed, scales, first, has_next, addresses):
+        priority(3)
+        for packet in range_constexpr(2):
+            pair = half * 2 + packet
+            clear(pair)
+            fx.rocdl.sched_barrier(0)
+            mma(bf[packet], 0, pair)
+            if const_expr(half == 0 and not first):
+                previous_packed.append(pack(2 + packet, previous_scales[packet]))
+                schedule_pack()
+            elif const_expr(half == 1):
+                packed.append(pack(packet, scales[packet]))
+                schedule_pack()
+        if const_expr(half == 1 and has_next):
+            addresses = prepare_b_addresses(n + 1)
+        wait(lgkmcnt=0)
+        priority(0)
+        stage_end()
+        return addresses
 
     def run_tile(n, carries, previous_packed, previous_scales, first, has_next, has_future, addresses):
         packed, scales = [], []
         for half in range_constexpr(2):
-            priority(0)
-            for pair in range_constexpr(2 * half, 2 * half + 2):
-                scales.append(load_scale(n, pair))
-            bf = []
-            for quarter in range_constexpr(2):
-                if const_expr(not first):
-                    fragments, destinations = issue_output(n - 1, previous_packed, quarter, half)
-                bf.append(read_b(n & 1, half, 0, quarter, addresses))
-                if const_expr(not first):
-                    # 本次C读比随后6条B ds_read更早；不等待整个B片段再发store。
-                    store_output(fragments, destinations, lgkmcnt=6)
-                    fx.rocdl.sched_barrier(0)
-            budget = budgets[2 * n + half] if isinstance(n, int) else body_budgets[half]
-            if const_expr(budget != 63 or not relax_vmcnt):
-                wait(vmcnt=budget if relax_vmcnt else 0)
-            if const_expr(half == 0 or has_next):
-                commit_b(n + half, 1 - half, carries[half], addresses)
-            if const_expr((half == 0 and has_next) or (half == 1 and has_future)):
-                fx.rocdl.sched_barrier(0)
-                carries[half] = issue_b(n + 1 + half, 1 - half)
-            stage_end()
-            priority(3)
-            for packet in range_constexpr(2):
-                pair = half * 2 + packet
-                clear(pair)
-                fx.rocdl.sched_barrier(0)
-                mma(bf[packet], 0, pair)
-                if const_expr(rolling):
-                    if const_expr(half == 0 and not first):
-                        previous_packed.append(pack(2 + packet, previous_scales[packet]))
-                        schedule_pack()
-                    elif const_expr(half == 1):
-                        packed.append(pack(packet, scales[packet]))
-                        schedule_pack()
-            if const_expr(half == 1 and has_next):
-                addresses = prepare_b_addresses(n + 1)
-            wait(lgkmcnt=0)
-            priority(0)
-            stage_end()
+            bf = memory_stage(n, half, carries, previous_packed, scales, first, has_next, has_future, addresses)
+            addresses = compute_stage(n, half, bf, previous_packed, previous_scales, packed, scales, first, has_next, addresses)
             if const_expr(first and half == 0):
                 first_stagger()
-        if const_expr(not rolling):
-            # pure在compute阶段边界之后打包，避免inline-asm FMA过早读取MFMA结果。
-            wait(vmcnt=0)
-            packed = [pack(pair, scales[pair]) for pair in range_constexpr(4)]
         return carries, packed, scales, addresses
 
+    # 3. N0/N1及短N编排。has_future只控制预取，不取消当前pack依赖。
     carries, pending_packed, pending_scales, addresses = run_tile(
         0, prefetched, [], [], True, n_tiles > 1, n_tiles > 2, prepare_b_addresses(0),
     )
@@ -496,19 +500,20 @@ def emit_bk192_nloop(
                 n, carries, pending_packed, pending_scales[2:], False, n + 1 < n_tiles, n + 2 < n_tiles, addresses,
             )
     else:
+        # 4. 回边状态：两段B carries、C2/C3、scale、BF16 C0/C1、5个地址。
+        # 保留精确SSA顺序和carrier创建时机，不引入携带全部fragment的Context。
         b_carriers = [[fx.make_fragment_like(part) for part in carry] for carry in carries]
-        if const_expr(rolling and ptpc):
+        if const_expr(ptpc):
             scale_carriers = [fx.make_fragment_like(pending_scales[pair]) for pair in range_constexpr(2, 4)]
 
         def save_state(carries, packed, scales, addresses):
             state = [part.load() for carry in carries for part in carry]
-            if const_expr(rolling):
-                for row in range_constexpr(2):
-                    for group in range_constexpr(4, 8):
-                        state.append(c[None, group, row].load())
-                if const_expr(ptpc):
-                    state.extend(scales[pair].load() for pair in range_constexpr(2, 4))
-            for pair in range_constexpr(2 if rolling else 4):
+            for row in range_constexpr(2):
+                for group in range_constexpr(4, 8):
+                    state.append(c[None, group, row].load())
+            if const_expr(ptpc):
+                state.extend(scales[pair].load() for pair in range_constexpr(2, 4))
+            for pair in range_constexpr(2):
                 state.extend(packed[pair][row] for row in range_constexpr(2))
             state.extend(addresses)
             return state
@@ -518,26 +523,25 @@ def emit_bk192_nloop(
                 for part in range_constexpr(2):
                     b_carriers[half][part].store(state[half * 2 + part])
             offset, scales = 4, []
-            if const_expr(rolling):
-                for row in range_constexpr(2):
-                    for group in range_constexpr(4, 8):
-                        c[None, group, row].store(state[offset])
-                        offset += 1
-                for pair in range_constexpr(2):
-                    if const_expr(ptpc):
-                        scale_carriers[pair].store(state[offset])
-                        scales.append(scale_carriers[pair])
-                        offset += 1
-                    else:
-                        scales.append(fx.Float32(1.0))
+            for row in range_constexpr(2):
+                for group in range_constexpr(4, 8):
+                    c[None, group, row].store(state[offset])
+                    offset += 1
+            for pair in range_constexpr(2):
+                if const_expr(ptpc):
+                    scale_carriers[pair].store(state[offset])
+                    scales.append(scale_carriers[pair])
+                    offset += 1
+                else:
+                    scales.append(fx.Float32(1.0))
             packed = []
-            for pair in range_constexpr(2 if rolling else 4):
+            for pair in range_constexpr(2):
                 packed.append([Vec(state[offset]), Vec(state[offset + 1])])
                 offset += 2
             return [list(carry) for carry in b_carriers], packed, scales, [fx.Int32(value) for value in state[-5:]]
 
         initial = save_state(carries, pending_packed, pending_scales, addresses)
-        # 剥离最后两N，所有动态迭代的n+2均有效，不发出未消费的越界B请求。
+        # 5. 稳态回边 → 展开余数及最后两N，所有动态迭代的n+2均有效。
         stop = 2 + ((n_tiles - 4) // unroll_n) * unroll_n
         ops.clear_all()
         for block_start, state in range(2, stop, unroll_n, init=initial):

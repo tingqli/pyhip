@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Experimental MoE stage2 8x1 down-projection kernel builder."""
-
-import os
+"""8x1入口与BK128原语绑定；N级流程由独立emitter编排，K192/K320各自特化。"""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -41,8 +39,8 @@ def _build_moe_gemm2_8x1(
     _task_table=False,
     _n_loop=1,
     _store_cache=2,
-    _relax_vmcnt=True,
 ):
+    # 1. Host配置与分支选择；不在此重新设计流水事件。
     del E, activation, swiglu_limit
     assert stage == "down"
     assert alg == "prefill_1x4"
@@ -79,8 +77,7 @@ def _build_moe_gemm2_8x1(
             N, TOPK, down_output_padding_bytes,
             weight_quant_type=weight_quant_type, act_quant_type=act_quant_type,
             _task_table=_task_table, _n_loop=_n_loop,
-            _store_cache=_store_cache, _relax_vmcnt=_relax_vmcnt,
-            _block_k=tile_k,
+            _store_cache=_store_cache,
         )
 
     if K == 320:
@@ -90,8 +87,7 @@ def _build_moe_gemm2_8x1(
             N, TOPK, down_output_padding_bytes,
             weight_quant_type=weight_quant_type, act_quant_type=act_quant_type,
             _task_table=_task_table, _n_loop=_n_loop,
-            _store_cache=_store_cache, _relax_vmcnt=_relax_vmcnt,
-            _block_k=tile_k,
+            _store_cache=_store_cache,
         )
 
     assert K % tile_k == 0
@@ -102,10 +98,6 @@ def _build_moe_gemm2_8x1(
     NUM_WAVES = 8
     WAVE_M = BLOCK_M // NUM_WAVES
     K_STAGES = K // BLOCK_K
-    DEDICATED_K256 = K == 256
-    DEDICATED_K512 = K == 512
-    DEDICATED_K640 = K == 640
-    SPECIALIZED_ROLLING = K == 384
     N_TILES = N // BLOCK_N
     TOTAL_CORES = N_TILES * K_STAGES
     WEIGHT_QUARTER_ATOMS = BLOCK_N * BLOCK_K // (16 * 4)
@@ -113,10 +105,9 @@ def _build_moe_gemm2_8x1(
     OUTPUT_STORES_PER_WAVE = WAVE_M * BLOCK_N * 2 // (64 * 16)
     CSHUFFLE_N_PAIRS = BLOCK_N // 32
     output_row_stride = N + down_output_padding_bytes // 2
-    ROLLING_EPILOGUE = os.environ.get("MOE_8X1_ROLLING_EPILOGUE", "1") != "0"
     use_n_loop = bool(_n_loop and N_TILES >= 3)
-    from .gemm2_8x1_schedule import vmem_wait_schedule
-    vmem_budgets = vmem_wait_schedule(K, N_TILES, weight_quant_type == "ptpc", ROLLING_EPILOGUE, _relax_vmcnt)
+    from .gemm2_8x1_schedule import packing_events, vmem_wait_schedule
+    vmem_budgets = vmem_wait_schedule(K, N_TILES, weight_quant_type == "ptpc")
     CSHUFFLE_WAVES = 4
     down_ops = fxh.FlyObjCache()
     topology_enabled, xcc_count = get_down_device_config()
@@ -131,27 +122,6 @@ def _build_moe_gemm2_8x1(
         vm_lo = vmcnt & 0xF
         vm_hi = (vmcnt >> 4) & 0x3
         return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
-
-    def _pack_scaled_bf16_pairs(values, scales):
-        fma_bias = as_ir_value(fx.Uint32(0x8000)).bitcast(fx.Float32.ir_type)
-        scaled = fxh.eltwise_op("llvm.fma.f32", values, scales, fma_bias)
-        selector = fx.Uint32(0x07060302)
-        packed = []
-        for index in range_constexpr(0, scaled.numel, 2):
-            packed.append(
-                llvm.inline_asm(
-                    ir.IntegerType.get_signless(32),
-                    [
-                        _raw(scaled[index + 1]),
-                        _raw(scaled[index]),
-                        _raw(selector),
-                    ],
-                    "v_perm_b32 $0, $1, $2, $3",
-                    "=v,v,v,s",
-                    has_side_effects=True,
-                )
-            )
-        return packed
 
     def _stage_end():
         rocdl.sched_barrier(0)
@@ -181,6 +151,7 @@ def _build_moe_gemm2_8x1(
         p_a_scale: fx.Pointer,
         M: fx.Int32,
     ):
+        # 2. 任务/布局与驻留状态：所有早退均在两组错相开始之前。
         tid = fx.Int32(gpu.thread_idx.x)
         lane_id = tid % 64
         wave_id = tid // 64
@@ -471,6 +442,7 @@ def _build_moe_gemm2_8x1(
                     destination,
                 )
 
+            # 3. Prologue第一段：首B必须早于A gather发出，不能合并到后面的初始化。
             # 只预填Q0=L/K0；其余请求统一按消费者顺序推进。
             # 仍在A gather前发出，以年轻的A/scale请求覆盖启动延迟。
             issue_weight_quarter_load(0, 0, 0, 0)
@@ -571,56 +543,6 @@ def _build_moe_gemm2_8x1(
                         )
                 output_destination_offsets.append(row_pair_offsets)
 
-            def pack_cshuffle_record(
-                output,
-                row_scales,
-                weight_scales,
-                row_pair,
-                n_pair,
-            ):
-                packed_chunks = []
-                for n_group in range_constexpr(
-                    2 * n_pair, 2 * n_pair + 2
-                ):
-                    values = Vec(
-                        output[None, n_group, row_pair].load()
-                    )
-                    if const_expr(weight_quant_type == "ptpc"):
-                        weight_scale_values = Vec(
-                            weight_scales[None, n_group, row_pair].load()
-                        )
-                    row_scale_values = Vec(
-                        row_scales[None, n_group, row_pair].load()
-                    )
-                    if const_expr(weight_quant_type == "ptpc"):
-                        weighted_values = fxh.eltwise_op(
-                            "v_fma_f32", values, weight_scale_values, fx.Float32(0.0),
-                        )
-                    else:
-                        weighted_values = values
-                    packed_chunks.extend(
-                        _pack_scaled_bf16_pairs(
-                            weighted_values, row_scale_values
-                        )
-                    )
-                return Vec.from_elements(
-                    packed_chunks, fx.Uint32
-                ).bitcast(fx.BFloat16)
-
-            def pack_cshuffle_row_pair(
-                output, row_scales, weight_scales, row_pair
-            ):
-                return [
-                    pack_cshuffle_record(
-                        output,
-                        row_scales,
-                        weight_scales,
-                        row_pair,
-                        n_pair,
-                    )
-                    for n_pair in range_constexpr(CSHUFFLE_N_PAIRS)
-                ]
-
             def pack_cshuffle_super_record(
                 output, row_scales, weight_scales, n_pair
             ):
@@ -717,19 +639,6 @@ def _build_moe_gemm2_8x1(
                         [_raw(fx.Int32(fx.ptrtoint(pointer)))], "", "=v,0", has_side_effects=True))
                     cshuffle_read_pointers.append(fx.inttoptr(pointer.type, address))
 
-            def write_cshuffle_row_pair(packed_records):
-                for n_pair in range_constexpr(CSHUFFLE_N_PAIRS):
-                    lds_offset = wave_lds_base + cshuffle_plane_offset(lane_row, lane_group, n_pair)
-                    destination = fx.make_view(
-                        fx.get_iter(cshuffle_lds) + lds_offset,
-                        fx.make_layout(8, 1),
-                    )
-                    fragment = fx.make_fragment_like(destination)
-                    fragment.store(packed_records[n_pair])
-                    fx.copy(
-                        cshuffle_write_atom, fragment, destination
-                    )
-
             def write_cshuffle_quarter(packed_records, n_half):
                 for local_n_pair in range_constexpr(
                     CSHUFFLE_N_PAIRS // 2
@@ -748,28 +657,6 @@ def _build_moe_gemm2_8x1(
                     fx.copy(
                         cshuffle_write_atom, fragment, destination
                     )
-
-            def issue_read_cshuffle_row_pair(block_n, row_pair):
-                output_fragments = []
-                destinations = []
-                for n_half in range_constexpr(2):
-                    for output_row_half in range_constexpr(2):
-                        fragment_pair = []
-                        for source_group in range_constexpr(2):
-                            source = fx.make_view(cshuffle_read_pointers[2 * n_half + output_row_half] + source_group * 1024,
-                                                  fx.make_layout(4, 1))
-                            fragment = fx.make_fragment_like(source)
-                            fx.copy(cshuffle_read_atom, source, fragment)
-                            fragment_pair.append(fragment)
-                        fx.rocdl.sched_barrier(0)
-                        output_fragments.append(fragment_pair)
-                        destination_index = (
-                            n_half * 2 + output_row_half
-                        )
-                        destinations.append((block_n, fx.make_view(
-                            fx.get_iter(output_tensor) + output_destination_offsets[row_pair][destination_index],
-                            fx.make_layout(8, 1))))
-                return output_fragments, destinations
 
             def issue_read_cshuffle_quarter(block_n, row_pair, n_half):
                 output_fragments = []
@@ -833,28 +720,6 @@ def _build_moe_gemm2_8x1(
                         down_ops.get_tiled_mma_retile(mm, fragment, "C", copy_atom=copy_atom),
                         soffset=fx.Int32(block_n * BLOCK_N))
                 return fragment
-
-            def retire_output(block_n):
-                if const_expr(weight_quant_type == "ptpc"):
-                    frag_weight_scale = load_weight_scale(block_n, 0, BLOCK_N)
-                else:
-                    frag_weight_scale = fx.Float32(1.0)
-                for row_pair in range_constexpr(WAVE_M // 16):
-                    packed_records = pack_cshuffle_row_pair(
-                        frag_c,
-                        frag_row_scale,
-                        frag_weight_scale,
-                        row_pair,
-                    )
-                    write_cshuffle_row_pair(packed_records)
-                    output_fragments, destinations = (
-                        issue_read_cshuffle_row_pair(
-                            block_n, row_pair
-                        )
-                    )
-                    store_cshuffle_read_results(
-                        output_fragments, destinations
-                    )
 
             def issue_packed_output_quarter(
                 block_n,
@@ -970,120 +835,6 @@ def _build_moe_gemm2_8x1(
                         load_weight_scale_quarter(block_n, stage_in_tile)
                     )
 
-            def pack_specialized_rolling(
-                block_n, stage_in_tile, local_n_pair,
-                packed_super_records, pending_packed_super_records,
-                scale_quarters, pending_scale_quarters,
-            ):
-                # 每个16-MFMA packet最多交织一份40-VALU super-record。
-                if const_expr(K == 384):
-                    if const_expr(
-                        stage_in_tile == 0 and local_n_pair == 0 and block_n > 0
-                    ):
-                        pending_packed_super_records.append(
-                            pack_cshuffle_super_record(
-                                frag_c, frag_row_scale, pending_scale_quarters[3], 3,
-                            )
-                        )
-                        constrain_mfma_valu_packet()
-                    elif const_expr(stage_in_tile == 2 and local_n_pair == 1):
-                        packed_super_records.append(
-                            pack_cshuffle_super_record(
-                                frag_c, frag_row_scale, scale_quarters[0], 0,
-                            )
-                        )
-                        constrain_mfma_valu_packet()
-                    elif const_expr(stage_in_tile == 3 and local_n_pair == 0):
-                        packed_super_records.append(
-                            pack_cshuffle_super_record(
-                                frag_c, frag_row_scale, scale_quarters[1], 1,
-                            )
-                        )
-                        constrain_mfma_valu_packet()
-                    elif const_expr(stage_in_tile == 5 and local_n_pair == 1):
-                        packed_super_records.append(
-                            pack_cshuffle_super_record(
-                                frag_c, frag_row_scale, scale_quarters[2], 2,
-                            )
-                        )
-                        constrain_mfma_valu_packet()
-
-            def pack_k512_rolling(
-                block_n, stage_in_tile, local_n_pair,
-                packed_super_records, pending_packed_super_records,
-                scale_quarters, pending_scale_quarters,
-            ):
-                # 八core顺序：K0L/K1L/K2L/K3L/K0H/K1H/K2H/K3H。
-                # 只退休已完成全部K贡献的分片；上一N的SR3留到下一K0L覆盖打包延迟。
-                if const_expr(
-                    stage_in_tile == 0 and local_n_pair == 0 and block_n > 0
-                ):
-                    pending_packed_super_records.append(
-                        pack_cshuffle_super_record(
-                            frag_c, frag_row_scale, pending_scale_quarters[3], 3,
-                        )
-                    )
-                    constrain_mfma_valu_packet()
-                elif const_expr(stage_in_tile == 3 and local_n_pair == 1):
-                    packed_super_records.append(
-                        pack_cshuffle_super_record(
-                            frag_c, frag_row_scale, scale_quarters[0], 0,
-                        )
-                    )
-                    constrain_mfma_valu_packet()
-                elif const_expr(stage_in_tile == 4 and local_n_pair == 0):
-                    packed_super_records.append(
-                        pack_cshuffle_super_record(
-                            frag_c, frag_row_scale, scale_quarters[1], 1,
-                        )
-                    )
-                    constrain_mfma_valu_packet()
-                elif const_expr(stage_in_tile == 7 and local_n_pair == 1):
-                    packed_super_records.append(
-                        pack_cshuffle_super_record(
-                            frag_c, frag_row_scale, scale_quarters[2], 2,
-                        )
-                    )
-                    constrain_mfma_valu_packet()
-
-            def pack_k640_rolling(
-                block_n, stage_in_tile, local_n_pair,
-                packed_super_records, pending_packed_super_records,
-                scale_quarters, pending_scale_quarters,
-            ):
-                # 十core：K0L..K4L/K0H..K4H；最后一个K贡献完成后才允许打包。
-                # 40条VALU与独立分片的16-MFMA packet交织，不覆盖仍在累加的C。
-                if const_expr(
-                    stage_in_tile == 0 and local_n_pair == 0 and block_n > 0
-                ):
-                    pending_packed_super_records.append(
-                        pack_cshuffle_super_record(
-                            frag_c, frag_row_scale, pending_scale_quarters[3], 3,
-                        )
-                    )
-                    constrain_mfma_valu_packet()
-                elif const_expr(stage_in_tile == 4 and local_n_pair == 1):
-                    packed_super_records.append(
-                        pack_cshuffle_super_record(
-                            frag_c, frag_row_scale, scale_quarters[0], 0,
-                        )
-                    )
-                    constrain_mfma_valu_packet()
-                elif const_expr(stage_in_tile == 5 and local_n_pair == 0):
-                    packed_super_records.append(
-                        pack_cshuffle_super_record(
-                            frag_c, frag_row_scale, scale_quarters[1], 1,
-                        )
-                    )
-                    constrain_mfma_valu_packet()
-                elif const_expr(stage_in_tile == 9 and local_n_pair == 1):
-                    packed_super_records.append(
-                        pack_cshuffle_super_record(
-                            frag_c, frag_row_scale, scale_quarters[2], 2,
-                        )
-                    )
-                    constrain_mfma_valu_packet()
-
             def pending_weight_position(half_core):
                 # Q[q]是当前消费者；提交Q[q+1]，两拍前发起其VMEM。
                 target = half_core + 1
@@ -1094,66 +845,81 @@ def _build_moe_gemm2_8x1(
                     target < 2 * TOTAL_CORES, (target_n * K_STAGES + target_k) & 1,
                 )
 
-            # LDS=Q0，P0=Q1，P1=Q2；不重复加载后半区的K0。
-            fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=4))
-            commit_weight_quarter(0, 0, 0)
-            fx.rocdl.sched_barrier(0)
-            prefetch0 = pending_weight_position(0)
-            prefetch1 = pending_weight_position(1)
-            if const_expr(prefetch0[3]):
-                issue_weight_quarter_load(
-                    prefetch0[0], prefetch0[1], prefetch0[2], 0
+            def seed_weight_pipeline():
+                # 首B此前已发出；这里只落LDS并建立Q1/Q2种子，不重排A gather。
+                fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=4))
+                commit_weight_quarter(0, 0, 0)
+                fx.rocdl.sched_barrier(0)
+                prefetch0 = pending_weight_position(0)
+                prefetch1 = pending_weight_position(1)
+                if const_expr(prefetch0[3]):
+                    issue_weight_quarter_load(
+                        prefetch0[0], prefetch0[1], prefetch0[2], 0
+                    )
+                if const_expr(prefetch1[3]):
+                    issue_weight_quarter_load(
+                        prefetch1[0], prefetch1[1], prefetch1[2], 1
+                    )
+                fx.rocdl.s_waitcnt(
+                    _encode_waitcnt(vmcnt=1 if prefetch1[3] else 0)
                 )
-            if const_expr(prefetch1[3]):
-                issue_weight_quarter_load(
-                    prefetch1[0], prefetch1[1], prefetch1[2], 1
-                )
-            fx.rocdl.s_waitcnt(
-                _encode_waitcnt(vmcnt=1 if prefetch1[3] else 0)
-            )
-            _stage_end()
+                _stage_end()
+                return prefetch0
 
+            def emit_first_stage(prefetch0):
+                # 首M0/C0有独立wait；结束后group1多一次barrier建立错相。
+                _enter_memory_stage()
+                scale_quarters = []
+                load_rolling_scales(0, 0, scale_quarters)
+                frag_weight = down_ops.load_tiled_mma_fragA(
+                    mm,
+                    lds_weight_halves[0][0],
+                    copy_atom_bits=128,
+                )
+                fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=2 if weight_quant_type == "ptpc" else 0))
+                if const_expr(prefetch0[3]):
+                    commit_weight_quarter(prefetch0[4], prefetch0[2], 0)
+                prefetch2 = pending_weight_position(2)
+                if const_expr(prefetch2[3]):
+                    fx.rocdl.sched_barrier(0)
+                    issue_weight_quarter_load(prefetch2[0], prefetch2[1], prefetch2[2], 0)
+                fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                _stage_end()
+                _enter_compute_stage()
+                for n_pair in range_constexpr(2):
+                    run_super_record_mfma(frag_weight, 0, n_pair, 2 * n_pair)
+                _enter_memory_stage()
+                _stage_end()
+                if wave_group == 1:
+                    _stage_end()
+                return scale_quarters, frag_weight
+
+            def drain_output(pending_packed_super_records, pending_scale_quarters):
+                # 最后N只补未pack的C3；旧BF16不可提前覆盖。
+                fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+                pending_packed_super_records.append(
+                    pack_cshuffle_super_record(
+                        frag_c, frag_row_scale, pending_scale_quarters[-1], CSHUFFLE_N_PAIRS - 1,
+                    )
+                )
+                for output_n_half in range_constexpr(2):
+                    for row_pair in range_constexpr(WAVE_M // 16):
+                        store_packed_output_quarter(
+                            N_TILES - 1, pending_packed_super_records, row_pair, output_n_half,
+                        )
+                _stage_end()
+                if wave_group == 0:
+                    _stage_end()
+
+            # 4–5. 执行目录：建立种子 → 首拍/错相 → N循环 → 末N排空。
+            prefetch0 = seed_weight_pipeline()
             frag_c.fill(0)
             pending_packed_super_records = None
             pending_scale_quarters = None
-
-            # 首memory/compute对剥离；新请求始终供两拍后的commit使用。
-            _enter_memory_stage()
-            scale_quarters = []
-            if const_expr(ROLLING_EPILOGUE):
-                load_rolling_scales(0, 0, scale_quarters)
-            frag_weight = down_ops.load_tiled_mma_fragA(
-                mm,
-                lds_weight_halves[0][0],
-                copy_atom_bits=128,
-            )
-            fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=2 if weight_quant_type == "ptpc" else 0))
-            if const_expr(prefetch0[3]):
-                commit_weight_quarter(
-                    prefetch0[4], prefetch0[2], 0
-                )
-            prefetch2 = pending_weight_position(2)
-            if const_expr(prefetch2[3]):
-                fx.rocdl.sched_barrier(0)
-                issue_weight_quarter_load(
-                    prefetch2[0], prefetch2[1], prefetch2[2], 0
-                )
-            fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-            _stage_end()
-
-            _enter_compute_stage()
-            for n_pair in range_constexpr(2):
-                run_super_record_mfma(
-                    frag_weight, 0, n_pair, 2 * n_pair
-                )
-            _enter_memory_stage()
-            _stage_end()
-
-            if wave_group == 1:
-                _stage_end()
-
+            scale_quarters, frag_weight = emit_first_stage(prefetch0)
             packed_super_records = []
             if const_expr(use_n_loop):
+                # 6a. 原语适配：地址生成与fragment布局不进入N级调度器。
                 from .gemm2_8x1_nloop import emit_nloop
 
                 if const_expr(K in (384, 640)):
@@ -1213,14 +979,17 @@ def _build_moe_gemm2_8x1(
                     fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt))
 
                 pending_packed_super_records, pending_scale_quarters = emit_nloop(
-                    K, N_TILES, _n_loop, weight_quant_type == "ptpc", ROLLING_EPILOGUE,
-                    _relax_vmcnt, frag_c, weight_staging, scale_quarters, down_ops,
-                    loop_issue, loop_commit, loop_read, load_weight_scale_quarter, loop_pack,
-                    issue_packed_output_quarter, store_cshuffle_read_results, loop_mma,
-                    clear_super_record, constrain_mfma_valu_packet, _enter_memory_stage,
-                    _enter_compute_stage, _stage_end, loop_wait,
+                    k=K, n_tiles=N_TILES, unroll_n=_n_loop, ptpc=weight_quant_type == "ptpc",
+                    c=frag_c, prefetched=weight_staging, first_scales=scale_quarters, ops=down_ops,
+                    issue_b=loop_issue, commit_b=loop_commit, read_b=loop_read,
+                    load_scale=load_weight_scale_quarter, pack=loop_pack,
+                    issue_output=issue_packed_output_quarter, store_output=store_cshuffle_read_results,
+                    mma=loop_mma, clear=clear_super_record, schedule_pack=constrain_mfma_valu_packet,
+                    enter_memory=_enter_memory_stage, enter_compute=_enter_compute_stage,
+                    stage_end=_stage_end, wait=loop_wait,
                     prepare_b_addresses=prepare_b_addresses if const_expr(K in (384, 640)) else None,
                 )
+            # 6b. 短N/_n_loop=0的实际展开实现，不是可删除的参考路径。
             total_half_cores = 1 if use_n_loop else TOTAL_CORES * 2
             for half_core in range_constexpr(1, total_half_cores):
                 block_n = half_core // (K_STAGES * 2)
@@ -1234,12 +1003,6 @@ def _build_moe_gemm2_8x1(
                 pending_n_half = pending[2]
                 has_pending = pending[3]
 
-                next_pending = pending_weight_position(half_core + 1)
-                has_next_pending = (
-                    half_core + 1 < total_half_cores
-                    and next_pending[3]
-                )
-
                 future_pending = pending_weight_position(half_core + 2)
                 has_future_pending = (
                     half_core + 2 < total_half_cores
@@ -1252,30 +1015,25 @@ def _build_moe_gemm2_8x1(
                     packed_super_records = []
 
                 _enter_memory_stage()
-                if const_expr(ROLLING_EPILOGUE):
-                    load_rolling_scales(block_n, stage_in_tile, scale_quarters)
+                load_rolling_scales(block_n, stage_in_tile, scale_quarters)
 
                 output_fragments = None
                 output_destinations = None
                 has_rolling_output = (
-                    ROLLING_EPILOGUE and block_n > 0
-                    and stage_in_tile < CSHUFFLE_N_PAIRS
+                    block_n > 0 and stage_in_tile < CSHUFFLE_N_PAIRS
                 )
-                if const_expr(block_n > 0):
-                    if const_expr(has_rolling_output):
-                        output_n_half = stage_in_tile // 2
-                        output_row_pair = stage_in_tile % 2
-                        (
-                            output_fragments,
-                            output_destinations,
-                        ) = issue_packed_output_quarter(
-                            block_n - 1,
-                            pending_packed_super_records,
-                            output_row_pair,
-                            output_n_half,
-                        )
-                    elif const_expr(not ROLLING_EPILOGUE and stage_in_tile == 0):
-                        retire_output(block_n - 1)
+                if const_expr(has_rolling_output):
+                    output_n_half = stage_in_tile // 2
+                    output_row_pair = stage_in_tile % 2
+                    (
+                        output_fragments,
+                        output_destinations,
+                    ) = issue_packed_output_quarter(
+                        block_n - 1,
+                        pending_packed_super_records,
+                        output_row_pair,
+                        output_n_half,
+                    )
 
                 frag_weight_quarters = []
                 frag_weight_quarters.append(
@@ -1302,7 +1060,7 @@ def _build_moe_gemm2_8x1(
                     )
                 )
 
-                if const_expr(not ROLLING_EPILOGUE or block_n == 0):
+                if const_expr(block_n == 0):
                     frag_weight = down_ops.load_tiled_mma_fragA(
                         mm,
                         lds_weight_halves[slot][n_half],
@@ -1310,36 +1068,8 @@ def _build_moe_gemm2_8x1(
                     )
 
                 if const_expr(has_pending):
-                    current_vmem = (
-                        2
-                        if weight_quant_type == "ptpc"
-                        and ROLLING_EPILOGUE and stage_in_tile < CSHUFFLE_N_PAIRS
-                        else 0
-                    ) + (
-                        2 if has_rolling_output
-                        else (
-                            OUTPUT_STORES_PER_WAVE
-                            if not ROLLING_EPILOGUE
-                            and block_n > 0
-                            and stage_in_tile == 0
-                            else 0
-                        )
-                    ) + (
-                        1 if has_next_pending else 0
-                    )
-                    if const_expr(
-                        DEDICATED_K512 and weight_quant_type == "ptpc"
-                        and ROLLING_EPILOGUE and block_n > 0
-                        and 0 < stage_in_tile <= CSHUFFLE_N_PAIRS
-                        and has_next_pending
-                    ):
-                        # B在q-2拍发出：前一拍4条scale/store也比它年轻。
-                        # stage1–3额度5→9，stage4额度1→5；首N/stage0/drain及其它K/量化不变。
-                        current_vmem += 4
-                    if const_expr(_relax_vmcnt and ROLLING_EPILOGUE):
-                        current_vmem = vmem_budgets[half_core]
                     fx.rocdl.s_waitcnt(
-                        _encode_waitcnt(vmcnt=current_vmem)
+                        _encode_waitcnt(vmcnt=vmem_budgets[half_core])
                     )
                     commit_weight_quarter(
                         pending[4],
@@ -1366,7 +1096,7 @@ def _build_moe_gemm2_8x1(
                     if const_expr(k_stage == 0):
                         clear_super_record(n_pair)
                     fx.rocdl.sched_barrier(0)
-                    if const_expr(ROLLING_EPILOGUE and block_n > 0):
+                    if const_expr(block_n > 0):
                         run_super_record_mfma(
                             frag_weight_quarters[local_n_pair],
                             k_stage,
@@ -1380,85 +1110,22 @@ def _build_moe_gemm2_8x1(
                             n_pair,
                             2 * local_n_pair,
                         )
-                    if const_expr(ROLLING_EPILOGUE and SPECIALIZED_ROLLING):
-                        pack_specialized_rolling(
-                            block_n, stage_in_tile, local_n_pair,
-                            packed_super_records, pending_packed_super_records,
-                            scale_quarters, pending_scale_quarters,
-                        )
-                    if const_expr(ROLLING_EPILOGUE and DEDICATED_K512):
-                        pack_k512_rolling(
-                            block_n, stage_in_tile, local_n_pair,
-                            packed_super_records, pending_packed_super_records,
-                            scale_quarters, pending_scale_quarters,
-                        )
-                    if const_expr(ROLLING_EPILOGUE and DEDICATED_K640):
-                        pack_k640_rolling(
-                            block_n, stage_in_tile, local_n_pair,
-                            packed_super_records, pending_packed_super_records,
-                            scale_quarters, pending_scale_quarters,
-                        )
-                    if const_expr(
-                        ROLLING_EPILOGUE
-                        and DEDICATED_K256
-                        and stage_in_tile == 0
-                        and local_n_pair == 0
-                        and block_n > 0
-                    ):
-                        pending_packed_super_records.append(
-                            pack_cshuffle_super_record(
-                                frag_c,
-                                frag_row_scale,
-                                pending_scale_quarters[-1],
-                                CSHUFFLE_N_PAIRS - 1,
-                            )
-                        )
-                        constrain_mfma_valu_packet()
-                    if const_expr(
-                        ROLLING_EPILOGUE
-                        and DEDICATED_K256
-                        and stage_in_tile == 1
-                        and local_n_pair == 1
-                    ):
-                        packed_super_records.append(
-                            pack_cshuffle_super_record(
-                                frag_c,
-                                frag_row_scale,
-                                scale_quarters[0],
-                                0,
-                            )
-                        )
-                        constrain_mfma_valu_packet()
-                    if const_expr(
-                        ROLLING_EPILOGUE
-                        and DEDICATED_K256
-                        and stage_in_tile == 2
-                        and local_n_pair == 0
-                    ):
-                        packed_super_records.append(
-                            pack_cshuffle_super_record(
-                                frag_c,
-                                frag_row_scale,
-                                scale_quarters[1],
-                                1,
-                            )
-                        )
-                        constrain_mfma_valu_packet()
-                    if const_expr(
-                        ROLLING_EPILOGUE
-                        and DEDICATED_K256
-                        and stage_in_tile == 3
-                        and local_n_pair == 1
-                    ):
-                        packed_super_records.append(
-                            pack_cshuffle_super_record(
-                                frag_c,
-                                frag_row_scale,
-                                scale_quarters[2],
-                                2,
-                            )
-                        )
-                        constrain_mfma_valu_packet()
+                    # 复用原事件表：跨N仍为3份BF16＋1份FP32，不推迟pack。
+                    for packet, previous, record in packing_events(K, stage_in_tile, block_n == 0):
+                        if const_expr(local_n_pair == packet):
+                            if const_expr(previous):
+                                pending_packed_super_records.append(
+                                    pack_cshuffle_super_record(
+                                        frag_c, frag_row_scale, pending_scale_quarters[record], record,
+                                    )
+                                )
+                            else:
+                                packed_super_records.append(
+                                    pack_cshuffle_super_record(
+                                        frag_c, frag_row_scale, scale_quarters[record], record,
+                                    )
+                                )
+                            constrain_mfma_valu_packet()
 
                 if const_expr(
                     stage_in_tile + 1 == K_STAGES * 2
@@ -1472,33 +1139,8 @@ def _build_moe_gemm2_8x1(
                 _enter_memory_stage()
                 _stage_end()
 
-            if const_expr(ROLLING_EPILOGUE):
-                fx.rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
-                pending_packed_super_records.append(
-                    pack_cshuffle_super_record(
-                        frag_c,
-                        frag_row_scale,
-                        pending_scale_quarters[-1],
-                        CSHUFFLE_N_PAIRS - 1,
-                    )
-                )
-                for output_n_half in range_constexpr(2):
-                    for row_pair in range_constexpr(WAVE_M // 16):
-                        store_packed_output_quarter(
-                            N_TILES - 1,
-                            pending_packed_super_records,
-                            row_pair,
-                            output_n_half,
-                        )
-            elif const_expr(use_n_loop):
-                for output_n_half in range_constexpr(2):
-                    for row_pair in range_constexpr(WAVE_M // 16):
-                        store_packed_output_quarter(N_TILES - 1, pending_packed_super_records, row_pair, output_n_half)
-            else:
-                retire_output(N_TILES - 1)
-            _stage_end()
-            if wave_group == 0:
-                _stage_end()
+            # 7. 最后N排空与退出barrier补偿。
+            drain_output(pending_packed_super_records, pending_scale_quarters)
 
     @flyc.jit
     def launch_prefill_8x1(

@@ -1,1485 +1,831 @@
-# FlyDSL MoE down `8x1` 设计
+# FlyDSL MoE 两阶段：性能、测试与 8x1 流水线
 
-## 当前支持范围（2026-09-08）
+本文是MoE当前唯一维护的说明文档，独立说明支持范围、路径选择、测试方法、六K完整流水及重要优化。默认目标为 **MI308X / gfx942、FP8 E4M3FNUZ A/W、BF16输出**，不将8x1结果外推其它dtype或硬件。
 
-- `down_path="8x1"`和`"8x1_compact"`仅支持 **K=192、256、320、384、512、640**。
-- K=128及其rolling/pure实现、独立Nloop和专用VMEM账本已移除；请求该K会明确报错，不静默切换算法。
-- **BK128分块仍保留**：K256/384/512/640使用BK128，K320使用128+192，K192使用整192。
-- 其他down算法的K128支持、历史源码快照、测试数据和ATT UI不受此删除影响。
+**版本边界：**2026-09-10仅保留Down四path：`default`、`1x4_64x256`、`8x1`、`8x1_compact`；`1x8/2x4/4x1`已删除，旧path明确报错、不静默回退。当前推荐是测试预设，不是生产自动selector。性能来自9/9矩阵及9/10两点独立确认，设计／资源来自9/9原pack消费FIFO版本；本次完成保持执行顺序的可读性重构，未新增GPU性能数据。
 
-下文是历史设计与实验记录；其中旧K128支持和BK64方案不代表当前接口。
+原始文档字节已冻结在[迁移准备清单](../../../../tests/contrib/moe/results/readability_docs_20260910/prepared.json)，SHA256：`cff0e61c660d25dac2f62215d2ab9dce75f0f7011c1f2d68b50d561f23d6454a`。历史日期、JSON、ISA、ELF和source身份不重标；链接只供复核，正文无需借助其它文档理解。
 
-本 README 摘录自[根设计文档](../../../../../../../../../../../design_moe_gemm_8wave_down.md)第0节；第1–22节旧 JIT 设计仍在原文。
-原章节号、日期和实验数据保留，下文“后文第1–22节”指原文。
-这是设计/实现演进记录，不自动等于本目录 `matrix_smoke` 源码快照或工作区后续 K192/K320 候选的当前状态。
+## 目录
 
-## 0. FlyDSL `8x1` / BN128 双阶段实验设计（2026-09-04）
+- [一、性能与测试](#performance)：[支持与shape](#scope) · [测试方法](#testing) · [42点主表](#matrix42) · [66行历史落选](#historical-nonselection) · [删除与独立确认](#migration-confirmation) · [验证边界](#validation-boundaries)
+- [二、流水线设计](#pipeline)：[符号](#notation) · [K256](#pipeline-k256) · [K192](#pipeline-k192) · [K320](#pipeline-k320) · [K384](#pipeline-k384) · [K512](#pipeline-k512) · [K640](#pipeline-k640) · [非PTPC与尾部](#pipeline-boundaries) · [资源](#resources)
+- [三、重要优化](#optimizations)
 
-本节定义下一版 FlyDSL down kernel 的实验规范。后文第1--22节记录旧 JIT
-`moe_gemm_8wave_down` 的 BN64、四级 LDS ring 设计，只作为历史参考，不是新实现的
-资源或流水约束。新实现计划独立为 `moe_gemm_2stage/gemm2_8x1.py`，先支持 FP8 PTPC
-和K256，不修改当前生产`4x1`。
+<a id="performance"></a>
 
-参考实现：
+## 一、性能与测试
 
-- `src/contrib/flydsl/moe_gemm_2stage/gemm2_2x4.py`：gfx942上的512-thread启动、
-  conditional-displacement barrier、`s_setprio`和raw buffer store；
-- `/opt/aiter/csrc/include/fmha_fwd_hd192_v128_bf16_opus_kernel.hpp`：两个4-wave组
-  相差一个barrier代次的严格错相；只借鉴barrier代次，不移植gfx942不支持的
-  `sched_group_barrier`调度提示；
-- `tests/flydsl/attn_4wave/tools/batched-gemm-core-ceiling.md`：co-issue上界和4-wave
-  cooperative-B-load结果。该探针不含真实LDS、依赖、scale和epilogue，只能作为上界。
+<a id="scope"></a>
 
-### 0.1 固定几何与首版范围
+### 1.1 支持范围与七组shape
 
-```text
-WG threads       = 512 = 8 waves
-WG tile          = BM256 x N
-inner N tile     = BN128
-inner K tile     = BK64 or BK128
-wave topology    = 8x1
-wave output      = M32 x N128
-dtype            = A/B FP8 E4M3FNUZ, C BF16
-quantization     = PTPC
-first case       = K256
+| 当前path | 本文的布局／约束 |
+|---|---|
+| `default` | 矩阵BM64，BN沿用case原配置，默认padding；该builder的其它算法／格式不在8x1性能结论内。 |
+| `1x4_64x256` | 简称1x4，BM64/BN256；非Hy3为padding128B。Hy3测过padding0和128B；4K当前选后者，称1x4-P128／direct_m64。 |
+| `8x1` | BM256/BN128，512线程、8 waves，M256 sorting metadata，非atomic输出，`alg="prefill_1x4"`。 |
+| `8x1_compact` | M64 metadata/BN128接口，构表→M256 full→M64 tail三个kernel，同stream、无host count读回；阈值0.6，Down计时包含全部三个kernel。 |
+
+8x1/compact只支持 **K=192/256/320/384/512/640**，正N为128倍数；weight/activation支持 `ptpc/ptpc`、`per_tensor/per_tensor`、`per_tensor/ptpc`，activation未指定则随weight。padding为0/32/64/128B，BF16行stride=`N+padding/2`，sum须匹配；compact要求`0<E≤2048`。
+
+**K192整192，K320为128+192，其余BK128。** K192/K320兼容`tile_k=None/128/192`但都转入真实192实现，不是三种算法。8x1的K128、BK64、pure/rolling环境开关、legacy wait及固定`_block_k`实验参数已删；其它Down算法的K128支持不受影响。builder默认`_n_loop=1`、`_store_cache=2`，0/2 N展开是显式选项，不是自动selector。源码：[四path分发](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2.py)、[8x1](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py)、[compact](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_compact.py)。
+
+每case的Batch为1024/2048/4096/8192/16384/32768（1K–32K），七组共42点。
+
+| Case | Hidden N | Inter/TP K | E | TopK | weight/activation量化 | gateup BN |
+|---|---:|---:|---:|---:|---|---:|
+| Hy3 K192 | 4096 | 192 | 193 | 9 | per_tensor/per_tensor | 128 |
+| Qwen397 K512 | 4096 | 512 | 512 | 10 | ptpc/ptpc | 256 |
+| Qwen397 K256 | 4096 | 256 | 512 | 10 | ptpc/ptpc | 256 |
+| Qwen35 K512 | 2048 | 512 | 256 | 8 | ptpc/ptpc | 256 |
+| Qwen35 K256 | 2048 | 256 | 256 | 8 | ptpc/ptpc | 256 |
+| Xiaomi K256 | 6144 | 256 | 384 | 8 | ptpc/ptpc | 256 |
+| H3 K384 | 6144 | 384 | 128 | 4 | ptpc/ptpc | 256 |
+
+9/9历史候选还含1x8（BM64/BN512，仅Hy3双per-tensor）、2x4（BM128/BN256，五个非K512 case）、4x1-M128/M256（BN64，另有Qwen35 K256 M256-P128）。这些只解释历史，不能传给当前dispatcher。2x4的K512当时activation+CShuffle=80KiB超过64KiB guard，是当时实现限制，不是跨硬件的算法不支持结论。
+
+<a id="testing"></a>
+
+### 1.2 功能与性能测试方法
+
+按 **CPU契约→fresh offline→GPU random→performance** 推进；CPU不证明GPU数值，离线编译不是运行，性能全1权重检查不替代随机W。
+
+随机Down参考使用实际量化后的A/W转FP32做矩阵乘，再乘对应expert/channel weight scale、activation行scale和routing weight。`rel_l2`为 $\lVert actual-reference\rVert_2/\lVert reference\rVert_2$，专项Down要求小于0.005，并检查有效输出finite、padding及inactive区域的NaN哨兵未被覆盖；graph重放还须污染并重建任务workspace。公共整链另与其参考输出比较，不将Down单算子阈值冒称所有整链的统一契约。
+
+| 层次 | 入口及检查 |
+|---|---|
+| CPU契约 | [共享schedule](../../../../tests/contrib/moe/test_all_8x1_schedule.py)、[K192](../../../../tests/contrib/moe/test_k192_bk192.py)、[首过渡/尾部/状态](../../../../tests/contrib/moe/test_nloop_transition.py)、[删path](../../../../tests/contrib/moe/test_remove_down_paths.py)：实际AST、B/scale消费者、wait、pack和状态；冻结指纹不是新运行。 |
+| fresh offline | [本轮重构编译入口](../../../../tests/contrib/moe/check_moe_readability.py)：绑定本轮完整before/after源，COMPILE_ONLY/gfx942、4XCC/80CU显式输入，GPU/ExecutionEngine入口拒绝；保存source/IR/实际ISA/ELF/SHA，查零private/spill/scratch。不是读取GPU属性，不能仅据编译通过宣称功能正确。该入口限定本轮四源改动，后续新实验须重新建立匹配身份。 |
+| ordinary随机 | [Nloop驱动](../../../../tests/contrib/moe/check_all_8x1_nloop.py)：随机FP8 A/W、routing、非恒定scale、FP32参考、rel_l2<0.005、finite及padding/inactive哨兵；六K、三量化、unroll0/1/2、task-table。**会编译并运行GPU**；旧CLI硬锁HIP_VISIBLE_DEVICES=7，不能直接当GPU4命令或伪造编号绕过。 |
+| compact随机/边界 | [Down测试](../../../../tests/contrib/moe/test_compact_m64_down.py)：六K、mixed、N128/多tile、四padding、graph重放污染workspace、>2GiB真实权重偏移、FP32参考。必须核对均衡后的有效full/tail，而非仅有full launch：新增`test_compact_post_balance_full_coverage`以CU与expert数的公倍数构造full及full+tail，并断言准确counts；本次未运行这个GPU节点。[任务表exact cover](../../../../tests/contrib/moe/test_compact_m64_tasks.py)的GPU node不是CPU测试，即使文件含CPU reference。 |
+| 公共整链 | [公共测试](../../../../tests/contrib/moe/test_moe.py)的test_acc_fly_splitk_2s_down_8x1：Batch33/N512/E8/TopK4/TP1、六K×两量化、run_count=0；compact整链也调用公共入口。小N Down不等于整链支持，整链沿用N为512倍数。 |
+
+**以下命令从仓库根执行，本次未运行。** 每次新目录，不覆盖历史或失败记录。[pytest配置](../../../../pytest.ini)为`python_files=*.py`，必须显式file/node，不对目录盲跑。重构后契约若拒绝，应查真实改变，不能删断言或修改旧SHA。
+
+```bash
+set -euo pipefail
+REPO="$PWD"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$REPO/src:$REPO/tests/contrib/moe:/opt/aiter:/usr/local/lib/python3.10/dist-packages"
+RUN="$REPO/tests/contrib/moe/results/manual_$(date +%Y%m%d_%H%M%S)_$$"
+[[ ! -e "$RUN" ]] && mkdir -p "$RUN"
+unset MOE_PREFILL_TILE_K MOE_8X1_ROLLING_EPILOGUE
+HIP_VISIBLE_DEVICES=-1 ROCR_VISIBLE_DEVICES=-1 \
+	.venv/bin/python -m pytest -q -p no:cacheprovider \
+	tests/contrib/moe/test_all_8x1_schedule.py \
+	tests/contrib/moe/test_k192_bk192.py \
+	tests/contrib/moe/test_nloop_transition.py --junitxml="$RUN/cpu.xml"
+HIP_VISIBLE_DEVICES=-1 ROCR_VISIBLE_DEVICES=-1 COMPILE_ONLY=1 \
+ARCH=gfx942 FLYDSL_GPU_ARCH=gfx942 \
+	.venv/bin/python tests/contrib/moe/check_moe_readability.py \
+	--version after \
+	--k 256 --n 2048 --topk 8 --quant ptpc --n-loop 1 --padding 128 \
+	--output "$RUN/offline_k256_ptpc"
+unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES GPU_DEVICE_ORDINAL
+HIP_VISIBLE_DEVICES=4 \
+	.venv/bin/python -m pytest -q -p no:cacheprovider \
+	tests/contrib/moe/test_moe.py::test_acc_fly_splitk_2s_down_8x1 \
+	tests/contrib/moe/test_compact_m64_down.py::test_compact_down_reference \
+	tests/contrib/moe/test_compact_m64_down.py::test_compact_mixed_quant_all_full \
+	tests/contrib/moe/test_compact_m64_down.py::test_compact_post_balance_full_coverage \
+	tests/contrib/moe/test_compact_m64_down.py::test_compact_padding_multitile_and_graph \
+	tests/contrib/moe/test_compact_m64_down.py::test_compact_end_to_end \
+	--junitxml="$RUN/gpu.xml"
 ```
 
-8个wave只沿M分工；每个wave持有`A[32, K]`，遍历完整N。一个WG沿N每次处理128列，
-在K内每次处理128点：
+GPU测试先确认所选卡可用；仅设置一层HIP设备过滤，进程内物理GPU4重编号为cuda:0，不叠加ROCR筛选。上例单配置offline+公共pytest**不自动产生两版30配置随机/graph门禁**。旧小Batch的“all_full”测试名指均衡前几何，80CU/阈值0.6下可能全拆为tail；新增节点使full数为`lcm(CU,8)`，余数为0，MI308X/80CU的Batch5120/5121分别保留80个full及80full+4tail。完整ordinary Nloop随机应使用与目标卡/当前源码匹配的驱动，旧GPU7 guard不可绕过。[冻结版本runtime](../../../../tests/contrib/moe/k192_cshuffle_runtime.py)说明source/launcher绑定，但旧候选SHA/参数不是现行接口。
 
-```text
-for n0 in range(0, N, 128):
-    for k0 in range(0, K, 128):
-        C[0:256, n0:n0+128] +=
-            A[0:256, k0:k0+128] @ B[n0:n0+128, k0:k0+128].T
-```
+#### 计时与统计
 
-K128/256/384/512使用BK128，分别有1/2/3/4个K core；K192使用3个BK64 core，避免
-补零执行。Qwen35的N2048在K256时对应16个N tile、32个K core；Qwen397的N4096
-对应32个N tile、64个K core。A只在prologue gather一次，随后跨完整N循环常驻寄存器。
-
-当时范围（历史）：
-
-- K128、K192、K256、K384和K512均已支持；
-- K192固定使用BK64，其余K固定使用BK128；
-- K256保留rolling epilogue优化快路径；其他K使用同一反相B流水和pure epilogue；
-- BF16：见LDS分析，它不能直接复用首版双BK128 ping-pong；
-- 自动selector、非MI308X映射和低Batch边界均等K256原型通过后再处理。
-
-### 0.2 每wave工作量
-
-对`BM256 x BN128 x BK128`：
-
-```text
-wave_M x wave_N                  = 32 x 128
-MFMA / wave / BK128              = (32/16)*(128/16)*(128/32) = 64
-A bytes / wave / full K256       = 32*256 = 8192B = 32 VGPR
-B bytes / WG / BK128             = 128*128 = 16384B
-B global bytes / wave / BK128    = 16384/8 = 2048B
-B buffer_load_dwordx4 / wave     = 2
-B ds_read_b128 / wave / BK128    = 16
-B operand / wave / full N128     = 64 VGPR
-C FP32 accumulator / wave        = 32*128/64 = 64 VGPR
-C ds_write_b128 / wave / N tile  = 8
-C ds_read_b128 / wave / N tile   = 8
-C buffer_store_dwordx4 / wave    = 8
-```
-
-每wave输出仍为4096点，与当前BM256/BN64 `4x1`的`M64 x N64`相同；每个BK128也仍为
-64条MFMA。BN翻倍后B operand从32增至64 VGPR，但A的M条带减半，A从64降至32 VGPR。
-因此主要数据寄存器总量近似守恒，这是8x1有机会保持在256 VGPR以内的原因。
-
-完整N上，8x1的N tile数和K core数相对BN64 4x1减半，因而barrier代次数也近似减半；
-代价是同一个B元素需广播给8个M-wave而不是4个，单wave每BK128的B LDS读取由8条增至
-16条，WG总B-LDS读流量约为4x1的两倍。反相主要是在用更高LDS读压力换更少barrier和
-更稳定的MFMA/non-MFMA互补，不能只按全局B读取量判断收益。
-
-### 0.3 LDS账本
-
-B ping/pong必须是两个独立声明，不能从一个`2*BN*BK`数组切片：
-
-```text
-b_ping : FP8[128*128], align 16 = 16384B
-b_pong : FP8[128*128], align 16 = 16384B
-```
-
-CShuffle按一个正在执行memory stage的4-wave半组分配。每wave一次只处理一个16-row
-row-pair，需要`16*128*2 = 4096B`；4个memory wave共用：
-
-```text
-cshuffle_scratch = 4*16*128*2 = 16384B
-```
-
-两个半组严格反相，不会同时进入CShuffle。前一半组必须在stage barrier前完成全部
-LDS read，后一半组才能复用同一16KB scratch。`sorted_ids[256]`和
-`sorted_weights[256]`共2KB，只在prologue存活；建议把它们作为
-`cshuffle_scratch`的临时视图，A和row scale进入寄存器并经过WG barrier后再将该区域
-改作CShuffle。weight scale直接从global读入寄存器，不占LDS。
-
-| LDS对象 | 字节 |
-| --- | ---: |
-| `b_ping` | 16,384 |
-| `b_pong` | 16,384 |
-| metadata/CShuffle复用scratch | 16,384 |
-| **峰值** | **49,152 (48KiB)** |
-
-即使metadata暂时独立分配，总量也只有51,200B；但首版仍应显式复用，以保留调试余量。
-48KiB在gfx942的64KiB/WG上限内，只允许每CU驻留一个8-wave WG，即每个
-SIMD约2 waves（Q2）。
-
-无错相/普通pipeline对照不能复用上述16KB半组scratch，因为8个wave可能同时进入
-CShuffle；该对照应为两个4-wave group各声明16KB，共32KB。它与两个B槽合计正好
-64KB，metadata仍须在prologue后与CShuffle别名，且allocator不能再产生额外padding。
-
-BF16的一个B tile为32KB，两个独立ping/pong已经占满64KB，无法再容纳CShuffle。
-因此BF16不是简单替换dtype：后续必须改为BK64、单B槽、BN64或不经LDS的输出重排之一。
-
-### 0.4 VGPR上界
-
-gfx942按combined VGPR计算occupancy。8-wave WG需要约2 waves/SIMD，单wave硬上限为
-256 combined VGPR；实现目标应为`<=240`，`241--248`只能进入性能试验，`>256`直接
-判失败。
-
-K256稳态的显式活跃值预算：
-
-| 对象 | 32-bit VGPR/wave | 约束 |
-| --- | ---: | --- |
-| 完整A `32x256` | 32 | 跨完整N循环存活 |
-| 当前C `32x128` FP32 | 64 | 不允许双C tile |
-| 当前BK128的B operand | 64 | 16条`ds_read_b128`完整读取N128 |
-| 下一B半片global staging | 8 | 两条dwordx4；只保留一套staging |
-| row id、routing/A scale | 4--8 | 每次只保留两个M atom所需值 |
-| weight scale | 2--4 | 8个N atom逐个消费，禁止C-shape fragment |
-| C pack、vector offset、临时值 | 12--20 | row-pair流式复用 |
-| **显式小计** | **186--200** | 不含LLVM分配碎片和循环状态 |
-
-以已编译的N4096/BM128 `4x1`（164 VGPR）为锚点，BN64扩到BN128会分别增加约32个C
-和32个B operand寄存器，得到约228 VGPR；以当前BM256 `4x1`的240 VGPR为另一锚点，
-8x1的A减32而B增32，仍约240。故首版合理预测为`228--248 VGPR`，必须以fresh ISA和
-driver occupancy为准。
-
-以下任一情况都会大概率越过256：
-
-- 保留上一N tile的完整C以跨tile延迟epilogue：`+64`；
-- 同时保留两套完整B LDS fragment：`+64`；
-- 用`make_fragment_C`构造完整PTPC weight-scale fragment：最坏`+64`；
-- 一次物化完整BF16 packed-C而不是按row-pair流式复用：约`+24`以上。
-
-因此首版禁止双C、双B-reg fragment和完整scale fragment。若2-stage需要这些对象才能
-平衡时序，应改成更多细粒度stage，而不是接受spill。最终门禁为0 private/scratch。
-
-SGPR预计接近现有kernel的96--112，不是Q2限制项，但N/K/wave级基址应全部保持标量，
-避免为了地址计算把它们重新物化为VGPR。
-
-### 0.5 B的8-wave协作与两槽依赖
-
-严格反相后，同一物理时刻只有4个wave处于memory stage，所以一个`B[128,128]`不能在
-单个物理memory phase内由8个wave完整产生。首版必须把每个B tile拆成两个8KB半片：
-
-```text
-wave 0..3 在自己的 memory(t) 阶段写 B[t+1].half0
-wave 4..7 在下一物理阶段的 memory(t) 写 B[t+1].half1
-```
-
-两半跨相邻两个物理阶段完成。B至少提前一个逻辑K core开始预取；`B[t+1]`完成后，
-group0和group1分别在各自的`memory(t+1)`读取它。ping/pong足够，因为写
-`B[t+1]`时，两组都已把同奇偶的`B[t-1]`读入寄存器。
-
-为避免混淆，后文使用四个不同动作：
-
-```text
-P(t, g): global B[t].half[g] -> 该wave的8个staging VGPR（真正的预取，不等待）
-W(t, g): 等待P(t,g)后，把staging VGPR以2条ds_write_b128提交到Bslot(t)
-R(t):    从已完整的Bslot(t)发出16条ds_read_b128 -> 64个B operand VGPR
-C(t):    只执行使用Areg和Breg的64条MFMA
-```
-
-后文`M(t)`与`S0(t)`同义，表示memory stage；`C(t)`与`S1(t)`同义，表示纯MFMA
-compute stage。
-
-K/N边界统一使用扁平core编号；因此“最后一个K预取下一N的K0”不是特殊分支：
-
-```text
-core(n, k) = n * K_TILES + k
-next_core(n, k):
-    if k + 1 < K_TILES: return (n,     k + 1)
-    else:               return (n + 1, 0)
-```
-
-prologue由全部8个wave共同执行`P(0, all) -> W(0, all)`，完整填好B0。进入错相区后，
-每个memory stage一开始先发`P(t+1, group)`，再执行`R(t)`、前一N的epilogue等独立工作，
-最后才等待并执行`W(t+1, group)`。因此global-load latency位于整个memory stage背后，
-不是“读完当前B以后才同步加载下一B”。
-
-前四个barrier代次如下，其中`M(t)`包含`P(t+1,g) + R(t) + W(t+1,g)`：
-
-| barrier代次前的物理阶段 | group0（wave0--3） | group1（wave4--7） | 下一B状态 |
-| --- | --- | --- | --- |
-| prologue | `P(0,all), W(0,all)` | `P(0,all), W(0,all)` | B0完整 |
-| 0 | `M(0): P(1,0), R(0), W(1,0)` | 额外stagger barrier，阻塞 | B1 half0完成 |
-| 1 | `C(0)` | `M(0): P(1,1), R(0), W(1,1)` | B1完整 |
-| 2 | `M(1): P(2,0), R(1), W(2,0)` | `C(0)` | B2 half0完成 |
-| 3 | `C(1)` | `M(1): P(2,1), R(1), W(2,1)` | B2完整 |
-
-所以group0进入`M(1)`并执行`R(1)`前，group1已经完成`W(1,1)`；同理后续每个slot在
-消费前都已由两个group写完整。这个代次关系必须用最终ISA和正确性压力测试验证，不能
-仅由源码中的barrier数量推断。
-
-如果要求每个B tile在一个memory phase内完成，则只能让当前4-wave半组重复加载完整
-16KB；这会把每waveB读取从2KB增至4KB，已不再是“8-wave协作加载”，不作为首选。
-
-### 0.6 gfx942地址生成
-
-核心循环使用`fx.buffer_ops.create_buffer_resource`和raw buffer load/store。FlyDSL当前
-API支持：
-
-```text
-fx.rocdl.readfirstlane(i32, value)
-fx.buffer_ops.buffer_load(..., soffset_bytes=scalar_offset)
-fx.buffer_ops.buffer_store(..., soffset_bytes=scalar_offset,
-                           offset_is_bytes=True)
-```
-
-建议把`expert/N/K/wave/load-round`共同决定的字节基址通过`readfirstlane`固定到SGPR，
-每lane只保留一个由`lane_id`决定的32-bit vector offset。B的两个load round复用同一组
-8个payload VGPR。output按row-pair现算一个row vector offset，N tile基址走
-`soffset_bytes`；不要让所有行地址跨核心循环存活。
-
-旧JIT使用`buffer_load_dwordx4 ... lds`直接写LDS；当前FlyDSL首版应保守按
-`buffer_load_dwordx4 -> 8 VGPR payload -> UniversalCopy128b -> LDS`建模。只有实际
-lowering和ISA证明支持安全的direct-to-LDS，才能把这8个staging VGPR从预算中删除。
-
-fresh ISA门禁：
-
-- N/K主循环内不应重复出现大整数乘法或64-bit vector地址构造；
-- B路径目标是每wave每BK128两条`buffer_load_dwordx4`，随后两条
-    `ds_write_b128`；
-- output为每wave每N tile八条`buffer_store_dwordx4 nt`；
-- 只允许prologue中的A gather保留必要的per-row vector地址；
-- 若raw buffer路径没有减少VGPR或反而增加SALU/wait，应保留`fx.copy`版本作对照，
-  不能只凭源码形式判断。
-
-### 0.7 严格反相流水
-
-定义扁平core编号：
-
-```text
-t = n_tile * K_TILES + k_tile
-Bslot(t) = b_ping if t is even else b_pong
-group = wave_id // 4        # group0: wave0..3, group1: wave4..7
-```
-
-每个group执行相同的`memory(t) -> compute(t)`代码。group1在prologue多执行一个
-`stage_end()`，group0在epilogue补一个，令两个group始终相差一个barrier代次：
-
-```text
-stage_end():
-    sched_barrier(0)
-    s_barrier()
-    sched_barrier(0)
-```
-
-`wave_id/group`必须先经过`readfirstlane`，确保条件分支是scalar branch。进入错相区后
-禁止只有部分wave提前退出；两组执行的barrier总数必须完全相同。
-
-#### Stage目录
-
-与Opus参考的写法一致，这里把prologue、稳态stage和drain逐项列出。`setprio`和
-`stage_end()`视为stage边界控制，不计入payload；`S1`两次边界之间只允许MFMA。
-
-**P0：metadata与首块weight prologue（8 waves同步）**
-
-```text
-1. 映射task并读取expert id；所有WG-uniform退出都在错相前完成。
-2. sorted_ids/sorted_weights -> scratch；WG barrier。
-3. P_full_B(0)：全部8个wave先发B(n0,k0)的两条buffer_load_dwordx4。
-4. gather每wave的A[32,K]、routing weight和activation scale到VGPR。
-5. partial vmcnt：只等待较老的B0，允许较新的A/scale继续在飞。
-6. W_full_B(0)：两条ds_write_b128/wave -> b_ping。
-7. 等待A/scale；WG barrier。此时B0完整可见，scratch可改作CShuffle。
-```
-
-**P1：错相启动**
-
-```text
-group0: 直接进入S0(n0,k0)
-group1: 额外执行一次stage_end()，阻塞一个barrier代次
-```
-
-**S0：memory stage，禁止MFMA**
-
-共同顺序如下，必须把下一块weight预取放在stage最前面：
-
-```text
-1. P(next,g)：预取B[next].half[g] -> 8 staging VGPR，不等待。
-2. 若当前是K0且n>0，发出上一N tile的PTPC weight-scale load。
-3. R(cur)：16条ds_read_b128，从完整Bslot(cur)读取当前B -> 64 Breg。
-4. 若当前是K0且n>0，写回本group上一N tile的128行：
-      Creg * weight_scale * row_scale
-      -> BF16 pack
-      -> 8条ds_write_b128
-      -> 8条ds_read_b128
-      -> 8条buffer_store_dwordx4 nt
-5. 等待步骤1的两个较老B load，保留更年轻的output store在飞。
-6. W(next,g)：两条ds_write_b128，把B[next].half[g]提交到下一ping/pong槽。
-7. 等待R(cur)和W(next,g)所需的lgkmcnt；stage_end()。
-```
-
-K256下，S0在两个K位置的具体职责不同：
-
-| S0位置 | 下一weight预取 | output epilogue | 当前B读取 |
-| --- | --- | --- | --- |
-| `S0(n,k0,g)` | `P(B[n,k1].half[g])` | 写回`D[n-1]`，`n=0`时跳过 | `R(B[n,k0])` |
-| `S0(n,k1,g)` | `P(B[n+1,k0].half[g])` | 无；当前N尚未完成 | `R(B[n,k1])` |
-
-因此K1末尾显式预取的是下一N的K0，而不是等到下一轮N循环才开始读取weight。
-
-**S1：compute stage，payload只包含MFMA**
-
-```text
-S1(n,k0): 64条MFMA，C输入使用0，开始新的C[n]
-S1(n,k1): 64条MFMA，C输入使用Creg，完成C[n]
-```
-
-这里定义的是基线`S1P`。基线S1内禁止B/A/scale load、LDS读写、global store、地址计算、BF16转换和显式清零。
-K0通过MFMA的`c=0`覆盖旧Creg。实现时可在进入S1后的边界处设置`setprio(3)`，在离开
-S1的边界处恢复`setprio(0)`；两者不能漂入64条MFMA序列中间。后文可选`S1E`只放宽为
-MFMA加独立scalar FMA/permute，仍禁止DS/VMEM和global store。
-
-K256稳态stage的每wave静态主体为：
-
-| Stage | B VMEM | B LDS | Epilogue | MFMA |
-| --- | ---: | ---: | ---: | ---: |
-| 首个`S0(n0,k0)` | 2 load | 16 read + 2 write | 无 | 0 |
-| 轻`S0(n,k1)` | 2 load | 16 read + 2 write | 无 | 0 |
-| 重`S0(n>0,k0)` | 2 load | 16 B-read + 2 B-write + 8 C-write + 8 C-read | scale/pack + 8 store | 0 |
-| `S1(n,k0/k1)` | 0 | 0 | 0 | 64 |
-
-表中B VMEM和B LDS write属于下一core，B LDS read属于当前core；这正是预取与消费的
-跨stage关系。
-
-#### VALU集中位置
-
-现有Qwen35 K256/BM256 `4x1` final ATT的13,417条指令中，排除MFMA后共有6,244条
-`v_*` VALU。按opcode语义分类如下；内联helper的debug location大量归到同一行，因此
-这里不使用源码行号分类：
-
-| VALU类别 | 静态指令数 | 占非MFMA VALU | 主要opcode |
-| --- | ---: | ---: | --- |
-| output scale与BF16 pack | 5,124 | 82.06% | 2,048 `v_fma_f32`、2,047 `v_fmaak_f32`、1,024 `v_perm_b32`及少量mul/fmac |
-| 地址、索引与lane变换 | 593 | 9.50% | `v_add_lshl`、`v_lshl_or`、`v_and/or`、`v_mad` |
-| move/materialization | 519 | 8.31% | `v_mov_b32` |
-| 其他 | 8 | 0.13% | 少量杂项 |
-
-当前4x1的N2048按BN64展开32个N tile，所以上述主epilogue平均每tile、每wave约为：
-
-```text
-64  x weight-scale FMA
-64  x row-scale + BF16-bias FMA
-32  x v_perm_b32
-----------------------------
-约160条主要VALU / N tile / wave
-```
-
-8x1每wave输出`M32 x N128 = 4096`点，与4x1的`M64 x N64 = 4096`点相同，因此每个
-完成N128 tile的每wave epilogue仍预计约160条主要VALU，不会因BN翻倍而翻倍。它们的
-stage归属为：
-
-| Stage | VALU密度 | 主要VALU |
-| --- | --- | --- |
-| `P0` | 低，一次性 | sorted-id解码、A gather地址、routing与activation scale合并 |
-| 首个`S0(n0,k0)` | 很低 | 少量lane/vector offset；主要是VMEM/LDS |
-| 轻`S0(n,k1)` | 很低 | 下一N/K0的weight地址；目标是由SGPR `soffset`承担 |
-| 重`S0(n>0,k0)` | **最高** | 上一N的约128条scale/FMA、32条BF16 pack/permute，以及少量output/CShuffle地址 |
-| `S1(n,k0/k1)` | **0条普通VALU** | 只允许64条MFMA；MFMA按独立issue类别统计 |
-| `D0` | **最高** | 最后N tile的同一套约160条epilogue VALU |
-| `D1` | 0 | 只有barrier代次补偿 |
-
-weight预取本体是两条`buffer_load_dwordx4`和两条`ds_write_b128`，不是VALU。若核心循环
-仍出现大量地址VALU，说明`readfirstlane + raw-buffer soffset`没有成功把N/K/wave基址
-标量化。允许保留少量`v_readfirstlane_b32`完成VGPR到SGPR的转换，但不应在每个N atom
-或每个store重复执行。
-
-在物理时序中，主要VALU出现在：
-
-```text
-T4: group0 heavy S0 = epilogue VALU + CShuffle/store
-    || group1 S1 = 64 MFMA
-T5: group0 S1 = 64 MFMA
-    || group1 heavy S0 = epilogue VALU + CShuffle/store
-
-T8/T9、T12/T13……重复相同模式；D0只在尾部出现一次。
-```
-
-因此反相设计真正要遮盖的是重`S0`中的epilogue VALU，而不是两条weight load。ATT验收
-时应分别统计`VALU issue`、`VALU dependency stall`及其与peer MFMA的重叠；只看到
-MFMA union提高不足以证明约160条epilogue VALU已经被隐藏。
-
-#### 可选实验：把epilogue滚入后续MFMA
-
-可以把epilogue VALU延迟到后续MFMA序列中尝试同wave co-issue，但不能保留“上一N的
-完整C + 下一N的完整C”两个fragment；这会额外增加64 VGPR，使预计`228--248 VGPR`
-直接越过256。正确做法是按C fragment小单元滚动退休和复用。
-
-一个wave的`M32 x N128` C包含`2 M atom x 8 N atom`，共16个4-FP32 fragment。
-把“同一M atom、相邻两个N atom”定义为一个retire record：
-
-```text
-records / N tile / wave       = 2 * (8/2) = 8
-C VGPR / record               = 2 fragments * 4 = 8
-MFMA / record / BK128         = 2 N atoms * 4 K atoms = 8
-epilogue VALU / record        = 8 weight-scale FMA
-                              + 8 row-scale/BF16-bias FMA
-                              + 4 v_perm
-                              = 20
-CShuffle/memory / record      = 1 ds_write_b128
-                              + 1 ds_read_b128
-                              + 1 buffer_store_dwordx4 nt
-```
-
-把同一N-pair在两个M atom上的record组成一个super-record：
-
-```text
-super-record / N tile / wave  = 4
-C VGPR / super-record         = 16
-MFMA / super-record / BK128   = 16
-epilogue VALU / super-record  = 40
-40 / 16                       = 2.5 VALU/MFMA
-```
-
-super-record包含4个独立C accumulator，每个accumulator在BK128内更新4次。MFMA按
-`K atom -> 4个C fragment`排列，同一accumulator两次写之间相隔4条MFMA，与正式
-co-issue微基准的四条独立accumulator链接近。
-
-因此“每条MFMA后最多3条scalar VALU”在静态数量上可以容纳40条epilogue VALU；但
-3条是容量上限，不是要求每次填满。CShuffle的DS读写、global store、wait和scale读取
-不属于这3条scalar VALU，必须放在packet边界或S0，不能冒充免费co-issue。
-
-gfx942正式微基准为该比例提供了机制证据：以16-cycle BF16 MFMA为anchor，独立的
-scalar `v_fma_f32`和`v_perm_b32`在同wave及peer-wave两种模式下均可fully hide 3条；
-第4条会增加约4 cycles。普通scalar VALU约4 cycles，MFMA开始约4 cycles后可进入VALU
-pipeline，剩余shadow约12 cycles，恰好容纳3条。packed `v_pk_mul_f32/v_pk_add_f32`
-容量为0，因此本方案必须继续使用scalar FMA和`v_perm_b32`，不能为减少指令数改回packed
-FP32。
-
-该正式微基准的anchor是`v_mfma_f32_16x16x16_bf16`，8x1使用
-`v_mfma_f32_16x16x32_fp8_fp8`。两者在当前设计中均按16-cycle执行窗建模，但FP8组合仍
-应先用同一微基准补测`N=0..4`；在FP8实测完成前，“3条可完全隐藏”是强假设而非生产
-保证。
-
-##### 推荐V1：同N K1内滚动，隐藏75% scalar VALU
-
-当前N的C在最终K stage中按super-record逐步完成。V1在计算`SR(r+1)`时退休`SR(r)`：
-
-```text
-S0(n,k1):
-    prefetch/commit B(n+1,k0)
-    read B(n,k1)
-    fill scale_lds[group][N128]            # 512B/group
-    preload scale for SR0
-
-S1E(n,k1):
-    16 final-K MFMA -> SR0                 # 无旧SR可退休
-    16 final-K MFMA -> SR1 || scalar_epilogue(SR0) -> packed SR0
-    16 final-K MFMA -> SR2 || scalar_epilogue(SR1) -> packed SR1
-    16 final-K MFMA -> SR3 || scalar_epilogue(SR2) -> packed SR2
-    # packed SR0..2占24 VGPR；SR3仍为16个FP32，总C-family从64降到40
-
-S0(n+1,k0):
-    scalar_epilogue(SR3) -> packed SR3     # 最先执行，遮盖peer K1开头的纯MFMA
-    P(B[n+1,k1], group)
-    R(B[n+1,k0]) -> Breg
-    for packed SR0..3:
-        ds_write -> ds_read -> 2 x dwordx4 NT store
-    # 旧C全部死亡，64个C槽可由下一N的K0 MFMA以c=0覆盖
-    wait/commit B[n+1,k1].half[group]
-
-S1P(n+1,k0):
-    64 pure K0 MFMA
-```
-
-V1每个N tile将`3 * 40 = 120`条scalar epilogue VALU滚入K1的48条carrier MFMA，
-平均2.5条/MFMA；剩余SR3的40条VALU和全部CShuffle/store仍在下一S0，由peer group的
-MFMA做inter-wave遮盖。这样不会把global store插入MFMA train，也不需要双C。
-
-之所以首版只隐藏75%而不是把160条全部塞进K1，是因为SR0的最终结果必须先由前16条
-K1 MFMA产生；只有后48条MFMA可安全作为完整super-record carrier。其scalar容量为
-`48 * 3 = 144`，覆盖120条后尚余24 slot，但不足以再容纳完整SR3的40条。更细的
-fragment级滚动可能利用SR0内部后段MFMA，但RAW和寄存器复用更难，留作V2。
-
-packed SR必须就地占用已经死亡的FP32 C槽；三个packed SR共24 VGPR，加仍为FP32的SR3
-16 VGPR，低于原64 C VGPR。若LLVM另分配24个VGPR而不复用死槽，候选可能超过256，
-应先通过缩短live range/inline asm约束修复，不能接受spill。
-
-##### 每16条MFMA的40-VALU模板
-
-旧SR包含4个C fragment。设其最终MFMA按fragment 0..3结束；新carrier SR的MFMA记为
-`F0..F15`。假设FP8 MFMA accumulator到scalar FMA需要至少约16 cycles，frag0..3可
-分别在`F0..F3`之后达到四条MFMA的依赖距离。一个依赖感知模板为：
-
-| carrier MFMA | 随后的最多3条scalar VALU |
-| ---: | --- |
-| `F0` | `W(f0,0..2)` |
-| `F1` | `W(f0,3), W(f1,0..1)` |
-| `F2` | `W(f1,2..3), W(f2,0)` |
-| `F3` | `W(f2,1..3)` |
-| `F4` | `W(f3,0..2)` |
-| `F5` | `W(f3,3), R(f0,0..1)` |
-| `F6` | `R(f0,2..3), R(f1,0)` |
-| `F7` | `R(f1,1..3)` |
-| `F8` | `R(f2,0..2)` |
-| `F9` | `R(f2,3), R(f3,0..1)` |
-| `F10` | `R(f3,2..3), P0` |
-| `F11` | `P1, P2, P3` |
-| `F12` | `P4, P5, P6` |
-| `F13` | `P7, spare, spare` |
-| `F14` | `spare, spare, spare` |
-| `F15` | `spare, spare, spare` |
-
-`W`是weight-scale FMA，`R`是row-scale/BF16-bias FMA，`P`是`v_perm_b32`。元素顺序
-必须保证W/R/P不是同一值上的连续RAW链。该表有40条真实epilogue VALU和8个空slot；
-空slot留给少量move/地址或scheduler，不能填packed FP32。
-
-FP8 accumulator RAW距离尚未由当前微基准验证。若ISA/功能测试显示`F0..F3`开始W过早，
-先实现保守V0：`SR0/SR1`只计算，`SR2`退休SR0，`SR3`退休SR1，仅隐藏80/160=50%的
-scalar VALU；SR2/SR3在下一S0退休。V0提供完整16-MFMA super-record间隔。
-
-##### scale与调度约束
-
-当前实现不为PTPC weight scale增加LDS。K1对应的S0直接发出8条
-`global_load_dwordx4`，在进入S1E前保留scale fragment；S1E通过逐级`vmcnt(7..2)`让
-每个super-record仅在对应scale就绪后执行。scale VMEM不计入每个MFMA后的3条scalar
-VALU容量。这个选择使rolling版本比原先在S1E内发scale load多占8个VGPR，但保证所有
-compute段都没有VMEM/DS/store。总LDS为：
-
-```text
-32KB B ping/pong + 16KB shared CShuffle = 48KB
-```
-
-S1E只允许MFMA、scalar FMA/permute及必要move。CShuffle DS和global store全部留在下一
-S0；strict stagger保证同一物理时刻只有一个group使用共享16KB CShuffle。
-
-三条VALU不能是同一个值上的`W -> R -> P`连续依赖链。gfx942/ROCDL支持
-`sched_group_barrier`，可在自然basic block内用`MFMA 1 -> VALU 3`约束machine
-scheduler；但它可能误匹配普通VALU并延长live range。首版先显式生成顺序并检查ISA，
-只有LLVM重新聚团时才加局部group barrier。
-
-FlyDSL调度提示的伪代码为：
-
-```text
-# 先在同一个natural basic block生成16条MFMA和40条独立scalar VALU。
-emit_super_record_mfma_and_epilogue()
-
-# 然后给machine scheduler描述目标节奏；0x8=MFMA，0x2=VALU。
-for slot in 0..15:
-    sched_group_barrier(mask=0x8, count=1, group=0)
-    sched_group_barrier(mask=0x2, count=3, group=0)
-sched_barrier(0)
-```
-
-最后两个slot实际只有8个空位中的一部分真实VALU，`count=3`可能误匹配packet外地址指令；
-更稳妥的实现是按上表真实数量生成`3,...,3,1,0,0`，或把16-MFMA packet拆成两个自然
-basic block。每个block内统计必须精确，不能用`count=100`通配。
-
-`v_fma_f32`和`v_perm_b32`是对PC对齐敏感的8-byte指令；微基准中跨8-byte边界会把
-约4 cycles抬到约5 cycles。fresh ISA必须检查rolling区域的实际PC对齐，且避免无意插入
-4-byte指令令后续整段VOP3错位。若对齐无法稳定控制，应把实际5-cycle成本纳入容量，
-此时每MFMA稳定隐藏3条的结论可能不再成立。
-
-##### 与双group反相的组合
-
-```text
-T3: group0 S1E(n0,k1) || group1 S0(n0,k1)
-T4: group0 S0(n1,k0)  || group1 S1E(n0,k1)
-T5: group0 S1P(n1,k0) || group1 S0(n1,k0)
-T6: group0 S0(n1,k1)  || group1 S1P(n1,k0)
-T7: group0 S1E(n1,k1) || group1 S0(n1,k1)
-```
-
-因此V1同时利用两种重叠：S1E内是同wave MFMA/scalar-VALU co-issue；另一group的S0
-提供VMEM/LDS/CShuffle/store。下一K0 S0先完成scalar SR3的40条VALU，目标是与peer K1
-开头尚未插入epilogue VALU的16条MFMA重叠；随后才发B VMEM并执行LDS read、CShuffle和
-store。这是最终ISA顺序保证，实际跨wave重叠程度仍由ATT确认。
-
-注意同一SIMD只有共享的VALU发射资源；intra与inter容量不能相加。以`T4`为例，group1
-的S1E携带120条scalar VALU，group0的S0携带剩余40条，合计仍是原tile的160条，面对
-64条peer MFMA即`2.5 VALU/MFMA`，低于微基准的3条容量。V1的潜在收益来自让VALU更早
-ready、缩短重S0及避免大段VALU聚团，不是把总容量从3变成6；若ATT显示VALU issue
-contention或MFMA密度下降，应保留纯S1P基线。
-
-##### 风险与晋级门禁
-
-现有ceiling的“每16条MFMA插1条global store”实验回退5.93%，说明打断MFMA train和
-让读写VMEM长期并存可能得不偿失。它没有测试独立标量VALU，不能直接否证本方案，但
-要求先保留“纯MFMA S1 + peer-wave重S0”作为control。
-
-候选只有同时满足以下条件才继续：
-
-- fresh ISA `<=256 VGPR`、目标`<=240`，0 scratch；不能出现双C fragment；
-- 每个carrier 16条MFMA对应40条scale/pack VALU，整tile总数不增加；
-- MFMA之间是2--3条独立scalar VALU，而不是依赖链、packed FP32、DS/VMEM或成片VALU；
-- ATT中MFMA issue密度不低于纯S1 control，VALU与MFMA重叠增加；
-- shared CShuffle无跨group覆盖，总LDS为48KB，physical/reduced output逐bit一致；
-- 先用同进程10-buffer ABBA4比较pure-S1与rolling-S1E，再决定是否采ATT。
-
-**D0：最终N tile drain**
-
-```text
-1. 最后一个S1(n_last,k1)完成后，不再执行P/W。
-2. load最后N tile的weight scale。
-3. 对本group的Creg执行scale、BF16 pack、CShuffle和8条dwordx4 NT store。
-4. 等待CShuffle LDS读取完成；output store仅按kernel完成语义所需程度drain。
-5. stage_end()。
-```
-
-**D1：barrier代次补偿**
-
-```text
-group0: 额外执行一次stage_end()，补偿group1在P1执行的额外barrier
-group1: 无额外stage
-```
-
-#### K256稳态并行时序
-
-记号：
-
-```text
-M_g(n,k) = group g执行S0(n,k,g)
-C_g(n,k) = group g执行S1(n,k)
-E_g(n)   = group g写回N tile n中自己负责的128行
-H_g(n,k) = group g预取/提交B[n,k].half[g]
-```
-
-下表列出prologue后连续十个物理时刻。每一行的group0和group1同时运行；表尾给出该
-时刻结束后新weight tile的完成状态。
-
-| 物理时刻 | group0：wave0--3 | group1：wave4--7 | weight流水状态 | output状态 |
-| ---: | --- | --- | --- | --- |
-| `T-1` | P0：`P/W B(0,0)`并gather A | P0：`P/W B(0,0)`并gather A | `B(0,0)`完整于ping | 无 |
-| `T0` | `M_0(0,0)`：`H_0(0,1)`、`R(0,0)` | P1：额外barrier，阻塞 | `B(0,1).half0`于pong | 无 |
-| `T1` | `C_0(0,0)`：64 MFMA | `M_1(0,0)`：`H_1(0,1)`、`R(0,0)` | `B(0,1)`完整于pong | 无 |
-| `T2` | `M_0(0,1)`：`H_0(1,0)`、`R(0,1)` | `C_1(0,0)`：64 MFMA | `B(1,0).half0`于ping | 无 |
-| `T3` | `C_0(0,1)`：64 MFMA，完成`C_0(0)` | `M_1(0,1)`：`H_1(1,0)`、`R(0,1)` | `B(1,0)`完整于ping | group0的`C(0)`就绪 |
-| `T4` | `M_0(1,0)`：`H_0(1,1)`、`R(1,0)`、`E_0(0)` | `C_1(0,1)`：64 MFMA，完成`C_1(0)` | `B(1,1).half0`于pong | group0写`D(0)` |
-| `T5` | `C_0(1,0)`：64 MFMA | `M_1(1,0)`：`H_1(1,1)`、`R(1,0)`、`E_1(0)` | `B(1,1)`完整于pong | group1写`D(0)` |
-| `T6` | `M_0(1,1)`：`H_0(2,0)`、`R(1,1)` | `C_1(1,0)`：64 MFMA | `B(2,0).half0`于ping | 无 |
-| `T7` | `C_0(1,1)`：64 MFMA，完成`C_0(1)` | `M_1(1,1)`：`H_1(2,0)`、`R(1,1)` | `B(2,0)`完整于ping | group0的`C(1)`就绪 |
-| `T8` | `M_0(2,0)`：`H_0(2,1)`、`R(2,0)`、`E_0(1)` | `C_1(1,1)`：64 MFMA，完成`C_1(1)` | `B(2,1).half0`于pong | group0写`D(1)` |
-| `T9` | `C_0(2,0)`：64 MFMA | `M_1(2,0)`：`H_1(2,1)`、`R(2,0)`、`E_1(1)` | `B(2,1)`完整于pong | group1写`D(1)` |
-
-从`T1`开始，每个稳态时刻都是一组纯MFMA与另一组纯非MFMA并行：
-
-```text
-T1: group0 MFMA(n0,k0) || group1 prefetch B(n0,k1) + LDS read/write
-T2: group0 prefetch B(n1,k0) + LDS read/write || group1 MFMA(n0,k0)
-T3: group0 MFMA(n0,k1) || group1 prefetch下一N的B(n1,k0) + LDS read/write
-T4: group0 prefetch B(n1,k1) + write D(n0) || group1 MFMA(n0,k1)
-T5: group0 MFMA(n1,k0) || group1 prefetch B(n1,k1) + write D(n0)
-```
-
-`T2/T3`明确展示K1阶段预取下一N的K0；`T4/T5`展示最重的output epilogue分别与另一个
-group的K1/K0 MFMA重叠。每个SIMD期望形成`wave g`与`wave g+4`的一对，但最终物理配对
-必须由ATT确认。
-
-#### 尾部并行时序
-
-令`L=(n_last,k1)`为最后一个core：
-
-| 物理时刻 | group0 | group1 |
-| ---: | --- | --- |
-| `TL-1` | `C_0(L)`，完成最后C | `M_1(L)`，无下一B预取 |
-| `TL` | `D0_0`：写回最后D | `C_1(L)`，完成最后C |
-| `TL+1` | `D1_0`：补偿barrier并阻塞 | `D0_1`：写回最后D |
-
-两组完成相同的逻辑stage数和barrier代数后才能退出；不得让某组在最后一次store后直接
-return，否则另一组可能永久等待。
-
-#### 伪代码
-
-```text
-kernel_8x1(...):
-    tid       = threadIdx.x                 # 0..511
-    lane      = tid % 64
-    wave      = readfirstlane(tid / 64)     # 0..7, SGPR
-    group     = readfirstlane(wave / 4)     # 0 or 1
-    local_w   = wave % 4
-
-    task = map_task(blockIdx.y)
-    if task * 256 >= valid_rows:            # WG-uniform exit, before stagger
-        return
-
-    # Three independent LDS objects. Do not slice one 32KB B allocation.
-    shared b_ping[128 * 128] : fp8 align(16)
-    shared b_pong[128 * 128] : fp8 align(16)
-    shared scratch[16 KiB]   : byte align(16)
-
-    # Prologue metadata uses scratch[0:2KiB].
-    cooperative_load(sorted_ids[task, 0:256], scratch.ids)
-    cooperative_load(sorted_weights[task, 0:256], scratch.route)
-    barrier()
-
-    # Weight prologue: issue B0 BEFORE A gather, so A loads/address work hide B0 latency.
-    b_stage = P_full_B(0):
-        issue_two_raw_buffer_load_dwordx4(
-            B[core=0].stripe[wave],
-            vector_offset = lane_B_offset,
-            scalar_offset = readfirstlane(B_wave_base(core=0, wave)),
-        )
-
-    # Each wave owns 32 rows and keeps all K in registers. These VMEM loads are
-    # younger than P_full_B(0), which permits a partial vmcnt wait for B0.
-    for m_atom in 0..1:
-        encoded_row[m_atom] = scratch.ids[wave*32 + m_atom*16 + lane%16]
-        row_scale[m_atom] = scratch.route[...] * activation_scale[...]
-        for a_chunk in full K:
-            Areg[m_atom, a_chunk] = raw_buffer_load_A(encoded_row, a_chunk)
-
-    # Wait only the two older B0 loads; keep younger A/scale loads in flight.
-    wait P_full_B(0), keeping A/scale VMEM outstanding
-    W_full_B(0):
-        commit_two_ds_write_b128(Bslot(0), b_stage)
-    wait A and row scale
-    barrier()                              # B0 visible; scratch may become CShuffle
-
-    K_TILES   = K / 128                    # first version: 2
-    N_TILES   = N / 128
-    TOTAL     = N_TILES * K_TILES
-    Creg.fill(0)
-
-    if group == 1:
-        stage_end()                        # one-generation displacement
-
-    for t in 0 .. TOTAL-1:
-        n_tile = t / K_TILES
-        k_tile = t % K_TILES
-
-        # -------- memory stage M(t): no MFMA --------
-        # 1. Issue the NEXT weight global prefetch first. K1 naturally points
-        #    to the next N tile's K0 through flattened core numbering.
-        if t + 1 < TOTAL:
-            b_stage = P(t + 1, group):
-                issue_two_raw_buffer_load_dwordx4(
-                B[t+1].half[group],
-                vector_offset = lane_B_offset,
-                scalar_offset = readfirstlane(B_tile_wave_base(t+1, wave)),
-            )
-
-        # 2. Read the CURRENT complete weight tile from ping/pong to Breg.
-        Breg = R(t):
-            issue_16_ds_read_b128(Bslot(t))
-
-        # 3. Retire a completed output while P(t+1,g) remains in flight.
-        if k_tile == 0 and t > 0:
-            wscale = raw_load_128_channel_scales(n_tile - 1)
-            for row_pair in 0..1:
-                # Stream one row-pair: scale -> BF16 pack -> 128-bit LDS.
-                scaled = Creg[row_pair] * row_scale * wscale
-                ds_write_b128(scratch.wave_local[local_w], pack_bf16(scaled))
-                wait required LDS writes
-                row_major = ds_read_b128(scratch.wave_local[local_w])
-                wait required LDS reads
-                buffer_store_dwordx4_nt(
-                    row_major,
-                    vector_offset = current_row_offset,
-                    scalar_offset = readfirstlane(output_n_base(n_tile - 1)),
-                )
-            Creg.fill(0)
-
-        # 4. Only now wait for the prefetched NEXT half and commit it to LDS.
-        if t + 1 < TOTAL:
-            wait P(t + 1, group), keeping newer output stores in flight
-            W(t + 1, group):
-                commit_two_ds_write_b128(
-                    Bslot(t + 1).half[group], b_stage
-                )
-
-        wait until R(t) and W(t+1,group) LDS operations are done
-        setprio(0)
-        stage_end()
-
-        # -------- compute stage C(t): MFMA only --------
-        setprio(3)
-        repeat 64 MFMA in dependency-spread order:
-            Creg = mfma_fp8(Areg[k_tile], Breg, Creg)
-        setprio(0)
-        stage_end()
-
-    # Retire the final N tile. At runtime group0 drains while group1 computes,
-    # then group1 drains while group0 waits at the compensating barrier.
-    wscale = raw_load_128_channel_scales(N_TILES - 1)
-    cshuffle_and_store_final_C(Creg, row_scale, wscale, scratch)
-    wait final LDS reads and required output stores
-    stage_end()
-
-    if group == 0:
-        stage_end()                        # balance group1 prologue displacement
-```
-
-首版不保留previous-C；K1完成后的完整epilogue放在下一N的K0 memory stage。这样不会
-增加64个C寄存器，但memory stage呈现轻/重交替。若重stage无法被64条MFMA遮盖，先把
-epilogue按两个row-pair细分为更多stage；不要直接双缓冲C。
-
-### 0.8 反相是否能遮盖非MFMA工作
-
-每个compute stage固定64条MFMA。当前Qwen35 K256 `4x1` fresh ATT中同量K0段的中位
-跨度约1024 cycles，可作为第一版阴影预算。8x1的重memory stage每wave约包含：
-
-```text
-下一B半片:       2 buffer load + 2 ds_write
-当前B fragment: 16 ds_read
-PTPC scale:      8个N atom的scale load（标量/向量化以ISA为准，2--4个live）
-输出缩放:       约128个FP32 mul/FMA
-BF16 pack:       约32个VALU/permute
-CShuffle/store:  8 ds_write + 8 ds_read + 8 buffer store
-```
-
-总量约200条非MFMA指令。B预取应最先发出，VMEM等待与输出缩放、CShuffle和当前B的
-LDS读取重叠；输出store保持异步。按纯发射槽和约1024-cycle计算窗，容量上可以遮盖，
-且每个SIMD预期同时驻留一个compute wave和一个memory wave。
-
-但这不是性能保证。48KiB LDS把实际形态限制在Q2；ceiling扫描中，W8 synthetic
-`2stage_barrier`相对`2stage_0`明显回退：Qwen397 K256/Q2约
-`268.19 -> 185.09T`，Qwen35 K256/Q2约`265.44 -> 186.96T`。该探针没有真实memory
-工作可供遮盖，不能直接否证本设计，却证明hard barrier本身代价很高。原型必须同时
-保留无错相或普通pipeline对照；只有ATT证明
-每个SIMD上的一对resident wave长期呈现“一个MFMA、一个非MFMA”，且阶段总时长接近
-`max(compute, memory)`而非两者之和，才算反相成功。
-
-推荐ATT门禁：
-
-- 8个wave按`0/4、1/5、2/6、3/7`形成每SIMD一对；若实际物理映射不同，分组必须调整；
-- steady区MFMA/non-MFMA反相，不在同一时段一起等待barrier；
-- barrier stall、`lgkmcnt`和`vmcnt`分别统计，不能只看MFMA union；
-- 核心循环无scratch、无大整数vector地址链；
-- B ping/pong覆盖前必须证明两个group都已读取旧slot。
-
-### 0.9 两个Qwen K256 case的胜率
-
-#### Qwen3.5 35B K256
-
-32K时每expert平均1024行，BM256无额外expert padding；实际valid rows为262,144。
-Down有效工作量为：
-
-```text
-2 * 32768 * 8 * 2048 * 256 = 274,877,906,944 FLOP
-```
-
-当前1x4为`0.819303ms / 335.50T`，当前生产4x1为
-`0.766544ms / 358.59T`。4-wave cooperative-B-load ceiling为`473.10T`；8x1每wave的
-MFMA、B-load和D-store工作量与该形态相同，可先作为乐观代理。8x1超过1x4只需达到
-该代理上界的70.9%，超过当前4x1需75.8%，因此该case有现实胜率，应作为首个实现和
-ABBA目标。
-
-#### Qwen3.5 397B K256
-
-32K时每expert平均640行，BM256按expert补到768行；实际4x1 BM256 valid rows为
-393,216，而useful rows只有327,680，useful/executed效率为`5/6 = 83.33%`：
-
-```text
-useful FLOP   = 2 * 327680 * 4096 * 256 = 687,194,767,360
-executed FLOP = 2 * 393216 * 4096 * 256 = 824,633,720,832
-```
-
-当前1x4最终验收为`1.866767ms / 368.12 useful TFLOPS`。沿用`452.90 executed T`的
-cooperative ceiling作乐观代理，先乘padding效率后只有`377.42 useful T`，仅比1x4高
-2.53%。8x1必须达到`441.74 executed T`，即代理上界的97.54%，才能刚好追平1x4；
-真实kernel还必须支付LDS、barrier、scale、metadata和CShuffle成本。因此在固定BM256
-约束下，Qwen397超越1x4的概率很低。它适合作为第二个正确性/性能对照，不应作为首个
-晋级目标。
-
-上述`452.90/473.10T`来自BN64、4-wave协作加载的无依赖ceiling，不是8x1实测。
-正式实现前应先扩展/运行精确的`WMxWN=8x1、BM256、BN128、BK128、B cooperation=8、
-LDS=48KiB、full-N/WG` skeleton，分别测普通pipeline和strict stagger；这里的折算只做
-go/no-go排序。
-
-### 0.10 实施顺序与门禁
-
-1. 先做K256 compile-only skeleton：A/C/B fragment、两个独立B LDS变量和16KB scratch；
-   不做正确性前先验证`<=240 VGPR`目标、`<=256`硬门禁、48KiB LDS、0 scratch。
-2. 验证B地址多重集：每个BK128恰好覆盖`128*128`个FP8元素，两个group各覆盖不相交
-   的8KB；ping/pong覆盖前无未完成reader。
-3. 加入metadata/A gather和PTPC scale，禁止完整scale fragment；再次检查VGPR。
-4. 加入row-pair CShuffle，逐bit/column-code验证128-bit LDS到dwordx4输出映射。
-5. 先跑无错相参考，再开conditional-displacement stagger；功能门禁通过后使用空闲GPU、
-    PTL `Enabled / VECTOR,F8`、1800MHz、NUMA off和10 buffers执行ABBA4。无错相参考使用
-    32KB CShuffle和总计64KB LDS，strict stagger使用16KB CShuffle和总计48KB LDS。
-6. Qwen35若稳定超过当前4x1，升ABBA12/24并采fresh ATT；Qwen397只在Qwen35流水成立后
-   补测。所有结果同时报告ms和有效TFLOPS，并区分useful/executed工作量。
-
-#### 当前实现状态
-
-实现位于`src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py`，源码SHA256为
-`2a8dac91c072d074ed5b4cc8e8e713c2392bbbdb5e975f30613d6126ef4d1788`。固定约束为
-BM256、BN128、BK128、K256、512 threads和PTPC FP8；dispatcher使用
-`down_path="8x1"`。
-
-compile-only的gfx942最终ISA验证如下：
-
-| 版本 | ISA SHA256 | VGPR | SGPR | LDS | scratch |
-| --- | --- | ---: | ---: | ---: | ---: |
-| pure-S1 | `40fe50ada9010b9f3b97e5a78016e495bce07ebf5b56a1c109ceb7487a87e439` | 230 | 96 | 49152 B | 0 |
-| rolling-S1E | `8aed9d0a89b4496bc629391c83af44731dbfb53e7120fedafdfd6534684c4d1c` | 232 | 96 | 49152 B | 0 |
-
-rolling最终ISA共有2048条MFMA和128条`buffer_store_dwordx4`，无packed FP32；32个
-compute段均为64条MFMA，K0段无普通VALU，K1段约120条scalar VALU且无VMEM、DS或
-store。每个MFMA后的普通VALU不超过3条。P0中两条B0 load位于全部8条A gather load
-之前，`vmcnt(4)`后提交B0到LDS，再以`vmcnt(0)`收完A。
-
-2026-09-04的最终ISA审计还确认：16个K0 compute段都只有64条MFMA；16个K1 compute
-段各有64条MFMA、48条weight-scale FMA、48条row-scale/BF16-bias FMA、24条
-`v_perm_b32`和6条递减scale `vmcnt` wait，无地址VALU或内存指令。将4个独立fragment
-改为统一按`W -> R -> P`阶段生成后，后端NOP由76条降至32条；再将SR3的40条VALU
-提前到下一K0 memory stage头部后，最终NOP为20条且资源不变。
-
-K1先发2条next-B和8条较新的weight-scale load，随后以`vmcnt(8)`只等待next-B；带8条
-output store的K0也以`vmcnt(8)`等待next-B。SR3前移后，每个稳态K0先发两条当前B，
-此时VMEM队列按“2笔旧scale + 2笔新B”排列；随后以`vmcnt(3) -> 4 W -> vmcnt(2)`只消费
-旧scale，两条B保持在途，再执行剩余36条`W/R/P`。因此scale等待不会drain当前B预取；
-完整kernel仍只有4处边界`vmcnt(0)`，steady K0没有`vmcnt(0)`。
-
-B LDS的`ds_write_b128`和`ds_read_b128`、CShuffle的`ds_write_b128`和
-`ds_read2st64_b64`按CDNA3 lane-group静态模拟均为0冲突，每组访问恰好覆盖32个bank。
-GPU7上的目标dispatch（grid 4608、workgroup 512、LDS 49152 B、scratch 0）进一步测得
-`SQ_LDS_BANK_CONFLICT=0`。
-
-后续地址审计发现旧rolling ISA仍有316条整数VALU。它们不在compute段，但输出地址在
-每个N tile的K0 memory stage重复生成，B tile地址也在每个core重复做VGPR加法。当前
-版本将8个lane相关输出destination offset提前到循环前，后续N tile增量折叠为
-`buffer_store_dwordx4 offset:*`；B的两个lane offset只计算一次并固定在两个VGPR中，
-`n*32768 + k*2048`通过MUBUF的SGPR `soffset`传入。32个B core offset已逐项与理论序列
-核对一致。最终整数VALU由316降为136；新增31条SALU用于
-物化展开后的scalar offset，rolling VGPR从230升到232，仍低于240目标。32个compute
-段中的整数VALU保持为0。剩余136条集中在metadata/A gather、CShuffle首次地址初始化
-和一次64-bit scale地址进位，不在稳态重复计算。
-
-当前最终ISA共有6774条指令。15个稳态K0 memory stage都严格以
-`16 v_fma_f32 + 16 v_fmaak_f32 + 8 v_perm_b32`开头，随后才发两条B
-`buffer_load_dwordx4`。第一组CShuffle的4写/4读先入LDS队列，再发16条B
-`ds_read_b128`；`lgkmcnt(14)`只等待较老CShuffle结果并保留大部分B读在途，进入MFMA前
-仍以`lgkmcnt(0)`保证B fragment完整。总数学、VMEM和DS指令数不变。
-
-当前版本重新采集`SQ_LDS_BANK_CONFLICT=0`；静态CDNA3 lane-group模拟也确认全部B
-`ds_read_b128` offset每组恰好覆盖32个bank。旧ATT中单条B读的successful issue成本
-p50/p95均为4 cycles，相邻读issue delta的p50/p90为20/32 cycles；该约32-cycle现象来自
-同CU四SIMD、双resident wave共享LDS发射/队列，而不是bank replay。原始紧邻B burst的
-`lgkmcnt(0)`实测stall p50为152 cycles，因此立即full wait并非必要。
-
-Qwen35 K256 B32768、PTL `Enabled / VECTOR,F8`、1800MHz、10-buffer短ABBA4中，原始
-full-wait与partial-wait版本分别为0.900644ms / 305.20有效TFLOPS和
-0.879963ms / 312.37有效TFLOPS。候选中位ratio为0.9690，但IQR为
-`[0.8646, 1.0805]`且仅2/4轮获胜，因此只视为方向性信号，不作为稳定性能结论。
-
-fresh rolling端到端测试无死锁和非法访问，结果为
-`test_acc_fly_splitk_2s_down_8x1: 1 passed`、`diff=0.00018656`。测试在auto DPM且NUMA
-balancing开启的环境进行，只用于正确性和bank counter，不作为正式性能结果；正式
-多buffer性能仍待验证。地址前移版
-已在GPU7直接复跑同一正确性测试，仍为`1 passed`、`diff=0.00018656`；正确性测试无需
-等待GPU空闲，只有正式性能测试使用空闲GPU门禁。bank-counter结果来自地址前移前版本，
-但B/CShuffle LDS地址公式和DS指令未变化。
-
-#### 2026-09-04 fresh ATT：K0-head SR3反相
-
-> 以下至“当前K256 ATT入口”是实现演进记录，使用过旧geometry或旧owner口径，仅用于
-> 解释候选取舍。当前统计定义、数值和复现命令只认
-> [stall_analysis.md](../../../../../../../../../../flydsl/attn_4wave/tools/stall_analysis.md)。
-
-最终B-first源码（SHA256 `fb296aeb...b65167`）在GPU7以1800MHz determinism、PTL
-`Enabled / VECTOR,F8`、650W和NUMA off抓取dispatch 16。Qwen35 K256 B32768单次
-dispatch为0.819003ms；有效工作量为274,877,906,944 FLOP，对应335.625有效TFLOPS。
-该数值来自ATT采集运行，不替代多buffer ABBA性能结论。
-
-四个SE共得到536条完整wave trace，其中408条active wave均恰好执行2048条MFMA，128条
-为uniform early-exit。16个物理SIMD都同时驻留两个wave slot；分析204个重叠wave pair
-和6120个稳态K0-head窗口后得到：
-
-- B第二条load到首条SR3 VALU的p50距离为12 cycles；
-- scale `vmcnt(3)`和`vmcnt(2)`在全部6120个窗口中都仅为4 cycles，无观测到data stall；
-- 40条SR3 VALU的p50跨度为216 cycles，p95为332 cycles；
-- 99.395%的SR3 VALU issue落在peer MFMA执行窗内，96.285%落在peer纯MFMA区域；
-- group1纯MFMA命中为100%，group0为92.569%（任意MFMA命中98.791%）；
-- B在`vmcnt(8)`前的p50 lead time为1752 cycles，`vmcnt(8)`的p50/p95均为4 cycles；
-- 仅89/6120（1.454%）个`vmcnt(8)`超过4 cycles，7/6120（0.114%）超过1024 cycles。
-
-因此scale partial wait没有破坏B预取，K0-head SR3与peer MFMA的反相重叠已被ATT直接验证。
-剩余问题是group0相位不如group1完整，以及少量B VMEM长尾。MFMA-lifecycle steady union为
-65.941%；trim掉每slot一个replacement wave后的central two-slot envelope MFMA union为
-58.927%，双slot active比例为99.313%，说明仍有明显非MFMA/tail暴露。
-
-完整解码UI和专项分析位于`ui_output_moe_8x1_k0head_dispatch_16/`，入口报告为
-`ATT_ANALYSIS.md`。采集结束后GPU7已恢复为auto、PTL Disabled和NUMA balancing on。
-
-#### 2026-09-04：32-MFMA stage、跨stage B预取与`lgkmcnt`实验
-
-当前8x1已将每个BK128的64条MFMA拆成两个32-MFMA compute stage；K256每个N tile
-形成8个memory/compute stage。B quarter使用单套staging跨过一个完整32-MFMA窗口后，
-再由下一memory stage等待并提交到LDS。生产shape最终ISA为178 VGPR、96 SGPR、48KiB
-LDS、0 scratch，保持2048条MFMA、72条B buffer load、128条scale load、512条B
-`ds_read_b128`和128条output store不变。N2048专项正确性为`diff=0.00017510`。
-
-carry版本fresh ATT位于`ui_output_moe_8x1_vmcnt_carry_dispatch_16/`。B load到
-`vmcnt(4)`尝试的p50提前量由472增至1176 cycles；wait stall由p50/p95
-`48/276`降至`4/4` cycles，98.94%的稳态wait仅4 cycles。dispatch 16为
-`0.694283ms / 395.92 useful TFLOPS`，但该值是单次ATT，不替代多buffer正式结论。
-
-在carry基础上隔离测试两种`lgkmcnt`调整。以下均为`n>0`且存在下一B预取的稳态
-memory stage；每段之后都是`barrier -> 32 MFMA + 40 VALU`。
-
-##### Carry：两次full LDS wait（历史基线）
-
-```text
-2 global_load_dwordx4                 # 当前scale quarter
-
-2 ds_write_b128                       # CShuffle写
-2 ds_read2st64_b64                    # CShuffle读
-s_waitcnt lgkmcnt(0)                  # 等CShuffle结果
-整理CShuffle结果
-2 buffer_store_dwordx4 nt             # 上一N的一个output quarter
-
-8 ds_read_b128                        # 当前B half -> MFMA operand
-s_waitcnt vmcnt(4)                    # 等跨stage pending-B；保留2 scale + 2 store
-1 ds_write_b128                       # pending-B提交到下一LDS slot
-1 buffer_load_dwordx4                 # 发下一个B quarter，跨32 MFMA
-s_waitcnt lgkmcnt(0)                  # 等8 B-read + 1 pending-B write
-s_barrier
-```
-
-第一次full wait保证CShuffle结果可由VALU整理并送入output store；第二次full wait保证
-当前B fragment和下一LDS slot在barrier前完成。生产ISA为178 VGPR、205条
-`s_waitcnt`，其中133条`lgkmcnt(0)`。
-
-##### Partial：B读越过CShuffle partial wait
-
-```text
-2 global_load_dwordx4                 # 当前scale quarter
-
-2 ds_write_b128                       # CShuffle写
-2 ds_read2st64_b64                    # CShuffle读
-8 ds_read_b128                        # 当前B half先入队
-s_waitcnt lgkmcnt(8)                  # 源码意图：只收较老CShuffle，保留B读
-整理CShuffle结果
-2 buffer_store_dwordx4 nt
-
-s_waitcnt vmcnt(4)                    # 等pending-B；保留2 scale + 2 store
-1 ds_write_b128                       # pending-B提交到下一LDS slot
-1 buffer_load_dwordx4                 # 下一个B quarter
-s_waitcnt lgkmcnt(0)                  # 等B读和pending-B write
-s_barrier
-```
-
-最终ISA没有简单保留“一条`lgkmcnt(8)`”；LLVM按两个CShuffle结果的实际寄存器依赖生成
-`lgkmcnt(9)`和`lgkmcnt(8)`。完整N2048 ISA共有91条`lgkmcnt(8)`、60条
-`lgkmcnt(9)`和73条`lgkmcnt(0)`，总`s_waitcnt`反而增至296条，VGPR增至182。
-
-##### Merged：源码合并为一次full LDS wait
-
-```text
-2 global_load_dwordx4                 # 当前scale quarter
-
-2 ds_write_b128                       # CShuffle写
-2 ds_read2st64_b64                    # CShuffle读，结果暂不消费
-8 ds_read_b128                        # 当前B half
-s_waitcnt vmcnt(2)                    # 等pending-B；只保留当前2条scale load
-1 ds_write_b128                       # pending-B提交到下一LDS slot
-s_waitcnt lgkmcnt(0)                  # 源码唯一full wait：CShuffle + B读 + B写
-整理CShuffle结果
-2 buffer_store_dwordx4 nt
-1 buffer_load_dwordx4                 # 下一个B quarter，放在stage最后
-s_barrier
-```
-
-源码只有一次显式`lgkmcnt(0)`，但机器调度器仍需分别等待两个CShuffle结果寄存器；代表性
-最终ISA为`lgkmcnt(10) -> lgkmcnt(9) -> lgkmcnt(0)`。完整ISA共有1条
-`lgkmcnt(10)`、32条`lgkmcnt(8)`、60条`lgkmcnt(9)`和73条`lgkmcnt(0)`；因此
-“源码合并”并不等于机器码只剩一个wait。总`s_waitcnt`为238条，VGPR为182。
-
-##### 三版本对比
-
-| 项目 | carry | partial | merged |
-| --- | --- | --- | --- |
-| CShuffle结果等待 | 立即`lgkmcnt(0)` | B读后源码`lgkmcnt(8)` | 延迟到stage尾统一等待 |
-| stage尾等待 | `lgkmcnt(0)` | `lgkmcnt(0)` | 同一个源码`lgkmcnt(0)` |
-| pending-B VMEM wait | `vmcnt(4)` | `vmcnt(4)` | `vmcnt(2)` |
-| 下一个B load位置 | stage尾、full LDS wait前 | stage尾、full LDS wait前 | output store后、barrier前 |
-| 最终ISA partial LDS wait | 无 | 91×`lgkmcnt(8)` + 60×`lgkmcnt(9)` | 32×`lgkmcnt(8)` + 60×`lgkmcnt(9)` + 1×`lgkmcnt(10)` |
-| 最终ISA `lgkmcnt(0)` | 133 | 73 | 73 |
-| 总`s_waitcnt` | 205 | 296 | 238 |
-| VGPR / SGPR / LDS / scratch | 178 / 96 / 48KiB / 0 | 182 / 96 / 48KiB / 0 | 182 / 96 / 48KiB / 0 |
-| 数学、VMEM、DS、store总量 | 基准 | 与基准相同 | 与基准相同 |
-| N2048物理输出 | 基准 | 逐bit相同，relative-L2=0 | 逐bit相同，relative-L2=0 |
-| 独立ABBA12中位 | 0.765723ms / 358.98T | 0.765463ms / 359.10T | 0.801003ms / 343.17T |
-| 候选/carry配对ratio中位 | 1.00000 | 1.00073，6/12胜 | 1.04704，6/12胜 |
-| 结论 | **保留** | 与carry持平，不合入 | 回退约4.29%，不合入 |
-
-三版本N2048物理输出逐bit一致、relative-L2为0。partial绝对中位只比同轮carry快
-0.034%，配对IQR大幅跨1，视为持平；merged相对carry回退约4.29%。因此当前工作区
-当时保留carry版本，不合入基础partial或merged。
-
-merged隔离源码`5709ca09...`另行抓取fresh ATT。GPU7 dispatch 16为
-`0.731723ms / 375.66 useful TFLOPS`，trace资源为56 regular + 128 accum VGPR、
-112 SGPR、48KiB LDS、0 scratch。四个SE共生成536个完整wave JSON，UI位于
-`ui_output_moe_8x1_lgkm_merged_dispatch_16/`；UI内嵌`source_2_gemm2_8x1.py`的
-SHA256与merged隔离源码完全一致。该单次ATT数值不改变ABBA12中merged回退4.29%的
-正式判断。
-
-Partial还测试了late-wait变体：删除memory stage中`s_barrier`前的源码
-`s_waitcnt lgkmcnt(0)`，并将其移动到随后32-MFMA compute stage末尾。隔离源码SHA256
-为`17f2e541...`，N2048输出与carry逐bit一致、relative-L2为0。最终ISA没有把一条
-full wait原样放到第32条MFMA后；LLVM按各组B operand首次消费自动拆成
-`lgkmcnt(8/6/5/4/2/1/0)`并穿插在MFMA序列中。生产ISA为182 VGPR、96 SGPR、48KiB
-LDS、0 scratch，数学、VMEM、DS和store总量不变，但`s_waitcnt`增至612条。
-
-late-wait fresh ATT dispatch 16为`0.695163ms / 395.42 useful TFLOPS`。400个active
-wave中，compute内自动wait的p50/p90/p95均为4 cycles；`lgkmcnt(8)`全部为4 cycles，
-`lgkmcnt(0)`有97.91%为4 cycles。四个SE共生成656个完整wave JSON，UI位于
-`ui_output_moe_8x1_partial_latewait_dispatch_16/`。该结果说明LDS完成延迟已被分摊到
-MFMA消费点，但仍需独立多buffer ABBA才能判断大量自动wait是否改善稳定性能。该
-late-wait源码当时已合入工作区，源码SHA256为`17f2e541...`；工作区fresh N2048 ISA
-与ATT前隔离候选逐字节一致，ISA SHA256为`7a564947...`。
-
-##### Memory-stage `v_mov`的两种实验
-
-late-wait生产ISA的每个稳态memory stage有4条`v_mov_b32`，来自CShuffle两条
-`ds_read2st64_b64`结果向两个连续`buffer_store_dwordx4`源的重排，不是B staging或
-地址生成。N2048稳态memory区共有约240条、完整kernel共有262条`v_mov_b32`。late-wait
-ATT中全部动态`v_mov` stall为p50 4、p95 44 cycles，部分CShuffle拼装site的p90达到
-88--96 cycles。
-
-**实验1：删除move。** 每个output row先分配连续8-BF16 rmem fragment，将两个64-bit
-LDS copy直接写入前后half；在copy间加入`sched_barrier(0)`阻止LLVM跨row融合
-`ds_read2st64_b64`。最终ISA把128条`ds_read2st64_b64`改成256条`ds_read_b64`，完整
-`v_mov_b32`由262降到6，VGPR由182降到172，总指令由7449降到7203；代价是总DS issue
-从832增至960。N2048输出与late-wait逐bit一致、relative-L2=0。独立10-buffer ABBA12：
-
-```text
-late-wait: 0.765223ms / 359.21T
-novmov:    0.759783ms / 361.78T
-ratio median 0.99822，IQR [0.87408, 1.12670]，6/12胜
-```
-
-绝对中位快约0.71%，但配对结果完全不稳定；增加的128条DS issue基本抵消move/VGPR
-减少，因此不合入。
-
-**实验2：让四个compute stage都从头部交织VALU。** 原late-wait中phase0/2的40条
-epilogue VALU位于MFMA 1--14，phase1/3位于MFMA 17--30。实验版改为phase0/1分别退休
-上一N的SR2/SR3，phase2/3退休当前N已完成的SR0/SR1，最终四个phase均把40条VALU放在
-MFMA 1--14；最后N的SR2/SR3在tail补齐。N2048逐bit一致、relative-L2=0，但跨tile
-延长packed-record生命周期使VGPR由182升到200。独立10-buffer ABBA12：
-
-```text
-late-wait: 0.768604ms / 357.63T
-headvalu:  0.769923ms / 357.02T
-ratio median 1.00505，IQR [0.87889, 1.13443]，6/12胜
-```
-
-该版本略慢且配对不稳定，也不合入。当时工作区继续保留late-wait源码`17f2e541...`。
-
-##### Corrected physical-SIMD ATT与4+4 B-read调度
-
-旧K0-head ATT按每core 64 MFMA、每N tile 2 core分析，得到的65.941%/58.927% union
-不能代表当前32-MFMA half-stage实现。将分析器改为每core 32 MFMA、每N tile 4 core，
-并排除0-MFMA uniform early-exit wave后，严格按`stall_analysis.md`执行：动态事件使用
-`code[pc_index]`映射，successful issue取`first_attempt + stall`，每条MFMA标记16-cycle
-执行窗，再按`(shader_engine, cu, simd)`合并两个resident wave。N2--N13的late-wait
-physical MFMA-union账本为：
-
-```text
-physical total:                        11,715,980 cycles
-MFMA-union busy:                        9,728,000 cycles = 83.0319%
-MFMA-union idle:                        1,987,980 cycles = 16.9681%
-```
-
-每个4-cycle union-idle tick按两个active wave等权归入互斥owner，owner之和严格等于idle。
-late-wait owner构成为：
-
-| exclusive owner | cycles | idle占比 | union总周期占比 |
-| --- | ---: | ---: | ---: |
-| normal issue exposure | 604,826 | 30.424% | 5.162% |
-| other dependency stall | 488,546 | 24.575% | 4.170% |
-| structural tail | 289,804 | 14.578% | 2.474% |
-| DS issue stall | 232,464 | 11.693% | 1.984% |
-| LDS completion wait | 123,340 | 6.204% | 1.053% |
-| VMEM issue stall | 102,974 | 5.180% | 0.879% |
-| VMEM completion wait | 94,638 | 4.761% | 0.808% |
-| scheduler ready | 51,032 | 2.567% | 0.436% |
-| MFMA issue unavailable | 356 | 0.018% | 0.003% |
-
-这里`normal issue exposure`表示union空洞内仍在成功发射普通VALU/DS/VMEM/SALU的服务
-成本，不是stall；`other dependency stall`主要包含barrier、VALU和SALU/control依赖。
-单wave的MFMA unavailable不能直接相加到physical账本，本trace中它在physical union里
-近似为0。
-
-进一步按静态PC分类133条`s_barrier`，`barrier + barrier`的397,104 cycles全部闭合：
-381,644 cycles（96.1%）来自`compute_end + memory_end`，15,460 cycles来自
-`memory_end + prologue phase compensation`。主循环不存在可直接删除的同类重复barrier；
-这些barrier同时维持两个4-wave组反相、B quarter可见性和16KiB CShuffle复用。gfx942
-也不支持gfx12的`s_barrier_signal/s_barrier_wait`拆分，因此不采用提前signal方案。
-
-隔离测试将memory-stage优先级从0提高到1或2。两版N2048均逐bit一致，最终ISA除128处
-`s_setprio`立即数外与late-wait相同。`setprio=1`独立10-buffer ABBA12结果为：
-
-```text
-late-wait: 0.768383ms / 357.74 useful TFLOPS
-setprio=1: 0.770503ms / 356.75 useful TFLOPS
-ratio median 1.00761，IQR [0.87935, 1.13381]，6/12胜
-```
-
-结果不稳定且略慢；`setprio=2`在ABBA4中也无优势，二者均不合入。
-
-随后直接针对`VALU issue + DS-read stall`做4+4 B-read调度。每个N32 quarter使用独立
-LDS视图和fragment，最终ISA的稳态memory stage为：
-
-```text
-2 ds_read2st64_b64                    # CShuffle读
-4 ds_read_b128                        # 当前B quarter 0
-s_waitcnt lgkmcnt(5/4)
-4 v_mov_b32 + 2 buffer_store_dwordx4  # 消费CShuffle结果
-4 ds_read_b128                        # 当前B quarter 1
-```
-
-调度屏障只约束LLVM不能把第二组B读重新上提，不生成额外机器指令。与late-wait相比，
-完整N2048 ISA仍为2048 MFMA、512条B `ds_read_b128`、128条CShuffle
-`ds_read2st64_b64`、192条`ds_write_b128`、612条`s_waitcnt`和133条`s_barrier`；
-资源仍为182 VGPR、96 SGPR、48KiB LDS、0 scratch，也未增加`vmcnt(0)`。
-
-10-buffer、GPU7、1800MHz determinism、PTL `Enabled / VECTOR,F8`、650W、NUMA off，
-每轮先对两个版本各做一次不计时prime以消除同步后首dispatch固定长尾。有效工作量为
-`2*32768*8*2048*256 = 274,877,906,944 FLOP`：
-
-| 测试 | late-wait | 4+4 B-read | 配对ratio | 胜场 |
-| --- | ---: | ---: | ---: | ---: |
-| primed ABBA4 | 0.772723ms / 355.73T | 0.768924ms / 357.48T | 0.99232，IQR [0.98886, 0.99602] | 4/4 |
-| primed ABBA12 #1 | 0.764463ms / 359.57T | 0.760224ms / 361.58T | 0.99200，IQR [0.98690, 1.00023] | 9/12 |
-| primed ABBA12 #2 | 0.773843ms / 355.21T | 0.768003ms / 357.91T | 0.98931，IQR [0.98512, 0.99344] | 12/12 |
-| clean primed ABBA24 | 0.778023ms / 353.30T | 0.768463ms / 357.70T | 0.98752，IQR [0.98581, 0.99231] | 24/24 |
-
-clean ABBA24的配对中位改善为1.25%，24/24轮胜；每版本48个绝对样本。测试初始全机
-0% busy，GPU7为auto、PTL Disabled、NUMA on；测试中为1800MHz determinism、PTL
-`Enabled / VECTOR,F8`、NUMA off；结束后恢复auto、PTL Disabled、NUMA on。fresh ATT
-dispatch 16为`0.695283ms / 395.35 useful TFLOPS`，该单次ATT时延不替代ABBA结论。
-
-bread44的N2--N13 physical MFMA-union为：
-
-```text
-physical total:                        11,748,900 cycles
-MFMA-union busy:                        9,922,560 cycles = 84.4552%
-MFMA-union idle:                        1,826,340 cycles = 15.5448%
-lifecycle MFMA-union busy:                                  70.20%
-single-wave cycles/N:                  4930.63 -> 4849.51 (-1.65%)
-```
-
-其exclusive owner账本为：
-
-| exclusive owner | cycles | idle占比 | union总周期占比 |
-| --- | ---: | ---: | ---: |
-| normal issue exposure | 620,918 | 33.998% | 5.285% |
-| other dependency stall | 506,370 | 27.726% | 4.310% |
-| structural tail | 230,952 | 12.646% | 1.966% |
-| DS issue stall | 172,444 | 9.442% | 1.468% |
-| LDS completion wait | 132,498 | 7.255% | 1.128% |
-| VMEM completion wait | 69,962 | 3.831% | 0.595% |
-| VMEM issue stall | 51,114 | 2.799% | 0.435% |
-| scheduler ready | 42,082 | 2.304% | 0.358% |
-| MFMA issue unavailable | 0 | 0% | 0% |
-
-按各trace自己的physical total归一，late-wait到bread44的owner转移为：
-
-| owner | late-wait | bread44 | 变化 |
-| --- | ---: | ---: | ---: |
-| normal issue exposure | 5.1624% | 5.2849% | +0.1225 pp |
-| other dependency stall | 4.1699% | 4.3099% | +0.1400 pp |
-| structural tail | 2.4736% | 1.9657% | -0.5078 pp |
-| DS issue stall | 1.9842% | 1.4677% | -0.5164 pp |
-| LDS completion wait | 1.0528% | 1.1277% | +0.0750 pp |
-| VMEM completion wait | 0.8078% | 0.5955% | -0.2123 pp |
-| VMEM issue stall | 0.8789% | 0.4351% | -0.4439 pp |
-| scheduler ready | 0.4356% | 0.3582% | -0.0774 pp |
-| MFMA issue unavailable | 0.0030% | 0% | -0.0030 pp |
-
-下降项合计1.7608个百分点，转移到normal issue、other dependency和LDS wait共
-0.3375个百分点，净减少idle 1.4233个百分点，恰好等于MFMA union busy增量，账本闭合。
-
-bread44热点进一步拆分如下，百分比均为union总周期占比：
-
-- normal issue 5.285%：普通VALU 3.843%，DS write 0.687%，DS read 0.416%，
-    VMEM load 0.226%，VMEM store 0.063%，SALU 0.048%。其中`v_fmaak_f32`为
-    1.700%，`v_fma_f32`为1.633%，`v_perm_b32`为0.348%。
-- other dependency 4.310%：`s_barrier` 2.878%，SALU/control 0.929%，VALU依赖
-    0.503%；其中`s_setprio` 0.497%、`s_nop` 0.433%。
-- DS issue 1.468%：`ds_read_b128` 0.857%、`ds_read2st64_b64` 0.311%、
-    `ds_write_b128` 0.300%。
-- LDS completion wait 1.128%：全部为`lgkmcnt`；主要是compute消费B fragment时的
-    `lgkmcnt(8/6/5/2/1)`，memory中的`lgkmcnt(5/4)`只占较小部分。
-- VMEM issue 0.435%：scale `global_load_dwordx4` 0.304%、output store 0.118%、
-    B `buffer_load_dwordx4` 0.013%。VMEM completion wait 0.595%全部来自
-    `vmcnt(4)`。
-
-joint reason×phase只作为定位见证，不能与owner重复相加。最大组合为
-`normal issue@core3 + structural tail@tail`，占idle 3.934%（总周期0.611%）；其次是
-`DS issue@boundary23 + normal issue@core2` 3.530%和
-`DS issue@boundary12 + normal issue@core2` 3.509%。`all_waves_same_reason`也只是
-witness：other dependency占总周期2.119%，normal issue占1.836%，双tail占0.498%；
-不存在all-waves VMEM issue或VMEM wait见证，strict VMEM-wait floor为0。
-
-ATT共536条完整wave：408条active wave均执行2048 MFMA，128条uniform early-exit；
-四SE active分布为104/96/104/104。16个采样physical SIMD中12个捕获26条active wave、
-4个捕获24条。dispatch grid为`(512, 1280, 1)`、每WG 512 threads，资源为56 regular
-VGPR + 128 AGPR、112 trace SGPR、48KiB LDS、0 scratch。该采样只解释目标CU内部，
-不覆盖80 CU间dispatch-tail；整卡结论由上述clean ABBA24给出。
-
-因此4+4的主收益是降低B `ds_read_b128` issue、B/output VMEM issue/wait和structural
-tail；部分时间转移成普通FMA发射、VALU依赖与`lgkmcnt`，但physical union和墙钟同时
-改善，不是单纯的stall转移。rolling和
-pure N2048物理输出均逐bit一致、relative-L2=0；仓库专项pytest为`1 passed`。该4+4
-基线源码SHA256为`c0626336...`，fresh N2048 ISA SHA256为`edf9d2f9...`。ATT UI保存在
-`ui_output_moe_8x1_bread44_dispatch_16/`。ATT隔离源码SHA256为`0f00d257...`；它与
-工作区只存在缩进格式差异，二者fresh ISA逐字节一致。
-
-##### Prologue额外half-B预取：两级VMEM carry
-
-4+4 B-read版本的稳态`vmcnt(4)`前方有2条scale load和2条output store，等待更老的
-pending-B quarter完成。ATT中24,072次动态`vmcnt(4)`的p50/p90/p95均为4 cycles，
-730次（3.03%）超过4 cycles；strict physical owner中VMEM completion wait占union
-总周期0.5955%。
-
-本实验不是把同一条load在memory stage内前移，而是在prologue额外发出下一份half-B
-对应的quarter request，并把单级carry扩成两级FIFO。每个4-wave group的序列为：
-
-```text
-prologue: issue L0 -> staging0; issue L1 -> staging1; vmcnt(1)
-peeled M0: commit L0; issue L2 -> staging0
-steady Mh: commit Lh from staging[h&1]; issue L(h+2) into freed staging
-```
-
-每个`Lh`是每wave一条`buffer_load_dwordx4`；两个4-wave group分别贡献一个quarter，
-合起来形成一个N64 half-B。稳态等待点同时保留一个更年轻的B request，因此rolling
-主路径由56处`vmcnt(4)`变成`vmcnt(5)`。静态producer/consumer审计确认62/62个B
-load到`ds_write_b128` commit边均有counter-valid wait覆盖；ATT中load successful issue
-到commit successful issue的p50由1156增至2340 cycles，主要跨越的MFMA数由32增至64。
-
-资源预算与fresh ISA结果：
-
-| 资源/工作量 | 4+4基线 | 两级carry | 变化 |
-| --- | ---: | ---: | ---: |
-| 编译器next-free VGPR | 182 | 186 | +4 |
-| ATT regular + accum allocation | 56 + 128 | 60 + 132 | +8 combined allocation |
-| SGPR | 96 | 96 | 0 |
-| LDS | 48KiB | 48KiB | 0 |
-| scratch | 0 | 0 | 0 |
-| B buffer load / B DS read / MFMA | 72 / 512 / 2048 | 72 / 512 / 2048 | 0 |
-
-48KiB LDS已经把kernel限制为1 WG/CU，即2 waves/SIMD；192 combined allocation仍低于
-256硬门槛，occupancy不变，并保留64个combined register余量。rolling/pure的N2048
-以及单tile N128 rolling/pure均逐bit一致、relative-L2=0；专项pytest为`1 passed`。
-
-10-buffer clean primed ABBA结果：
-
-| 测试 | 4+4基线 | 两级carry | 配对ratio | 胜场 |
-| --- | ---: | ---: | ---: | ---: |
-| ABBA4 | 0.774323ms / 354.99T | 0.754624ms / 364.26T | 0.97334，IQR [0.96365, 0.97519] | 4/4 |
-| ABBA12 | 0.779004ms / 352.86T | 0.752303ms / 365.38T | 0.96697，IQR [0.96552, 0.97089] | 12/12 |
-| ABBA24 | 0.774583ms / 354.87T | 0.751384ms / 365.83T | 0.96702，IQR [0.96372, 0.96969] | 24/24 |
-
-fresh ATT dispatch 16为`0.677603ms / 405.66 useful TFLOPS`。N2--N13 strict
-physical MFMA-union由84.4552%升至85.2412%，single-wave cycles/N由4849.51降至
-4807.02。exclusive owner按union总周期归一的转移为：
-
-| owner | 4+4基线 | 两级carry | 变化 |
-| --- | ---: | ---: | ---: |
-| normal issue exposure | 5.2849% | 5.3555% | +0.0706 pp |
-| other dependency stall | 4.3099% | 3.8368% | -0.4732 pp |
-| structural tail | 1.9657% | 1.6409% | -0.3248 pp |
-| DS issue stall | 1.4677% | 1.5085% | +0.0407 pp |
-| LDS completion wait | 1.1277% | 1.1486% | +0.0208 pp |
-| VMEM completion wait | 0.5955% | 0.5225% | -0.0730 pp |
-| VMEM issue stall | 0.4351% | 0.4492% | +0.0141 pp |
-| scheduler ready | 0.3582% | 0.2969% | -0.0613 pp |
-
-因此增加预取没有造成显著VMEM issue反弹；但约3.3%的墙钟改善也不只来自减少
-`vmcnt`等待。更深carry改变了memory/compute到达相位，主要减少barrier依赖0.4830
-个百分点和structural tail 0.3248个百分点。该深预取基线源码SHA256为
-`3a4936d9...`，fresh ISA SHA256为`73961767...`；ATT UI位于
-`ui_output_moe_8x1_bprefetch2_dispatch_16/`。
-
-##### K128/K192/K384/K512泛化
-
-多K支持没有复制新的builder。K256专用rolling路径保持原样；其余K通过编译期常量
-选择BK、fragment rank和pure epilogue。B流水由原先隐含的两K-stage关系改为全局core
-坐标：
-
-```text
-core(n, k)        = n * K_STAGES + k
-Bslot(core)       = core & 1
-pending(q)        = core(source(q)) + 1
-future_pending(q) = pending(q + 2)
-```
-
-这使奇数K-stage的N边界也保持正确ping/pong parity。K192的BK64 fragment会折叠
-`k_iter`维，因此A/B operand使用`k_atom`索引；每个4-wave group只让前128线程参与
-quarter load和LDS commit。K256/BK128的编译期分支被完全裁掉，fresh ISA与多K改动前
-逐字节一致，SHA256仍为`73961767...`。
-
-N2048 fresh ISA资源和算法工作量：
-
-| K | BK / K stages | VGPR / SGPR | LDS / scratch | MFMA | B load / B LDS read / B LDS write |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 128 / 1 | 169 / 96 | 48KiB / 0 | 1,024 | 36 / 256 / 160 |
-| 192 | 64 / 3 | 171 / 96 | 32KiB / 0 | 1,536 | 101 / 384 / 223 |
-| 256 | 128 / 2 | 186 / 96 | 48KiB / 0 | 2,048 | 72 / 512 / 192 |
-| 384 | 128 / 3 | 192 / 96 | 48KiB / 0 | 3,072 | 108 / 768 / 224 |
-| 512 | 128 / 4 | 210 / 96 | 48KiB / 0 | 4,096 | 144 / 1,024 / 256 |
-
-K128/192/384/512在N128和N2048隔离运行中均finite；正式torch-reference
-`test_acc_fly_splitk_2s_down_8x1`以N512参数化覆盖五种K并得到`5 passed`。K512最高为
-210 VGPR，仍低于256硬门槛且0 scratch。当前多K工作区源码SHA256为`85a13a74...`。
-各shape的fresh ISA SHA256分别为：
-
-```text
-K128  039590ebfce1f5723e18aee765e3ee134d270dd2a4681511177aeb031336ac8e
-K192  f1c64a5ac95fc54b03c3e233cd9e7848d568db27e60ad2460bf4c8792e23800a
-K256  739617672892eb8035e997d493298e5617c0e1ddfa5f4350011f7aee2777c7df
-K384  a540995a14875f1441b98014b1de622e5f7e921dbf038db8ace6d7396d56e5bc
-K512  331231503ee1b4f02be1d52e445a1596b77b026bd78044d3745638df99e11fff
-```
-
-##### 当前K256 ATT入口
-
-当前K256 ATT的方法、唯一复算命令、七层账本、98540记录交集和N2/core1具体stage均已
-收敛到[stall_analysis.md](../../../../../../../../../../flydsl/attn_4wave/tools/stall_analysis.md)。统一分析器为
-[analyze_mfma_stall.py](../../../../../../../../../../flydsl/attn_4wave/tools/analyze_mfma_stall.py)，raw trace和
-生成报告位于`ui_output_moe_8x1_k256_current_dispatch_16/`。本设计文档不再复制ATT
-数字，避免方法或trace更新后出现两个权威版本。
-
-统一性能测试使用B32768、N2048、TOPK8、E256、BM256、BN128、10个轮换buffer；
-正序和反序各12轮，每种K共48个样本。GPU7固定1800MHz determinism、PTL
-`Enabled / VECTOR,F8`、650W、NUMA off，测试结束后恢复原状态。有效工作量和吞吐为：
+- Down：ordinary一个kernel，compact构表/full/tail全计；矩阵event外先公共default gateup刷新上下文。
+- Combined：同event内Down+sorted_sum，gateup仍在外。Full：sorting、两次量化、gateup、down、invert、sum，中间张量在调用内创建，不是全地址固定/graph计时。
+- 三phase不能相减为独立sum/gateup耗时，也不能各选最优拼一个实现。编译/审计/父墙钟不当kernel时延。
 
 $$
-F_{useful}=2\times32768\times8\times2048\times K,
-\qquad
-T_{effective}=F_{useful}/t.
+F_D=F_{Combined}=2\times B\times TopK\times N\times K,\quad
+F_{Full}=3F_D,\quad T_{effective}=F/(t_{ms}\times10^9).
 $$
 
-| K | BK | useful FLOP | 中位时延 | P25--P75 | 有效TFLOPS |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 128 | 137,438,953,472 | 0.840743ms | 0.838783--0.842133ms | 163.47 |
-| 192 | 64 | 206,158,430,208 | 1.402705ms | 1.399016--1.409205ms | 146.97 |
-| 256 | 128 | 274,877,906,944 | 0.738483ms | 0.729823--0.745843ms | 372.22 |
-| 384 | 128 | 412,316,860,416 | 1.344445ms | 1.340965--1.346465ms | 306.68 |
-| 512 | 128 | 549,755,813,888 | 1.611647ms | 1.610086--1.613047ms | 341.11 |
+所有格为 **ms / wall-time有效TFLOPS**，按useful而非padding执行行计F；Full的3倍仅计三路GEMM，其它算子耗时仍在event内。ATT union×roof只能称“模型TFLOPS”，不混用。
 
-这些均为wall-time有效TFLOPS，不是ATT union乘roof得到的模型TFLOPS。K192使用BK64，
-stage/barrier数与K384相同但每stage只有一半MFMA，因此有效TFLOPS最低；K256仍使用
-专用rolling epilogue，不能直接用它与其他K的pure epilogue效率做线性比较。
+性能参考：只选**GPU4–7空闲目标卡**，9/9与9/10用GPU4/MI308X/gfx942/80CU；核验PCI/ID，busy≤5%、VRAM≤20%。其它卡只观察，非全机空闲，进出快照非连续监控。**NUMA保持1，不改主机设置；PTL实核Enabled / VECTOR,F8，请求1800MHz determinism/650W**，不把请求当持续实测频率。10-buffer、warmup、同半轮同输入/权重，两版ABBA/BAAB、矩阵轮转正序+反序，每轮两个sample先均值再配对；保留raw/IQR，不删长尾。微改动先两版单shape Down-only，复用SHA已验ELF；不自动扩大compact/Full/42点。快测无矩阵gateup priming，两协议绝对ms不混池。结束先drain stream、后检、卸载kernel，再恢复原auto/PTL并核验NUMA/设备。实现：[目标卡托管](../../../../tests/contrib/moe/k192_cshuffle_workflow.py)、[两版快测](../../../../tests/contrib/moe/benchmark_8x1_optimizations_quick.py)。不要复用旧全机NUMA关闭协议。
 
-同一carry源码`2e08d1fd...`随后在GPU7、PTL `Enabled / VECTOR,F8`、1800MHz、
-650W、NUMA off下重新执行10-buffer A/A ABBA12。两个独立标签共48个样本，合并中位为
-`0.772963ms / 355.62 useful TFLOPS`，P25/P75为`0.768243/0.951284ms`；两标签
-ratio中位为1.00639且各6/12胜，说明没有代码差异，但运行中仍存在周期性慢样本。
-physical输出逐bit一致、relative-L2为0。
+复现上述参考环境前还须只读确认NUMA初态为1；否则停止，不改主机设置。目标卡托管只保证保持初态，并不会强制把它设为1。
 
-同版本fresh ATT dispatch 16为`0.739683ms / 371.62 useful TFLOPS`，资源为
-52 regular + 132 accum VGPR、112 trace SGPR、48KiB LDS、0 scratch。四个SE共生成
-480个完整wave JSON，UI位于`ui_output_moe_8x1_carry_fresh_dispatch_16/`。该ATT时延
-低于ABBA12中位，但仍是单次采集结果，不能替代多buffer性能结论。测试结束后GPU7已
-恢复auto、PTL Disabled，NUMA balancing恢复开启。
+以下模板**仅在已有当前源码完整30配置随机/graph验证及兼容schema两版产物后**使用；三收据变量须真实存在。驱动严格核验，不能以旧JSON改SHA满足。
+
+```bash
+unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES GPU_DEVICE_ORDINAL
+HIP_VISIBLE_DEVICES=4 \
+PYTHONPATH="$REPO/src:$REPO/tests/contrib/moe:/opt/aiter:/usr/local/lib/python3.10/dist-packages" \
+	.venv/bin/python tests/contrib/moe/benchmark_8x1_optimizations_quick.py \
+	--k 256 --quant ptpc --batch 32768 --rounds 24 --buffers 10 \
+	--gpu 4 --hardware-scope target \
+	--baseline "${BASELINE_RECEIPT:?需已核验基线}" \
+	--candidate "${CANDIDATE_RECEIPT:?需已核验候选}" \
+	--validation "${VALIDATION_RECEIPT:?需当前源码30配置随机及graph审计}" \
+	--output "$RUN/down_k256_pair.json"
+```
+
+9/9矩阵：旧9/8只给42个incumbent标签，不复用绝对ms。三phase配对改善**Q1均>0**才支配旧推荐，竞争候选互比，否则保守保留，推荐不必是各phase绝对median最小。全候选24轮后一次冻结5点独立48轮，涉及1x8/2x4的原推荐/初选也确认；48整点替代24，不混池/追加方向性抽样。**IQR是样本分位，不是置信区间；跨0不证明等价。** 同轮$r=mean(t_{candidate,2})/mean(t_{control,2})$：改善$1-r$，时延增幅$r-1$，吞吐损失$1-1/r$；配对median不等于绝对median之比。[旧矩阵门禁](../../../../tests/contrib/moe/matrix_retest_support.py)拒绝新源码/模块集合是保护，不得绕过；后续须先有匹配当前源码的新验证。
+
+<a id="matrix42"></a>
+
+### 1.3 42点当前推荐与当时测量：混合日期展示
+
+[迁移标签](../../../../tests/contrib/moe/results/remove_down_paths_20260910/migrated_choices.json)：compact14点、1x4 18点、ordinary8x1 5点、default5点。40点沿用9/9选择和当时ms/T；仅Hy3 4K为direct_m64/1x4-P128、8K为compact，采用9/10确认的replacement_ms/T。Qwen35 K256/32K当前是8x1/padding128B，不再旧手工4x1。
+
+**这是两个日期独立runs的并列展示，不是9/10新统一42点测量，不算跨日期加速、不把40个旧值重标为删除后性能。** 9/9共9份run、55,584个event（全候选24轮+5点独立48轮）；两点9/10确认另计。[旧矩阵汇总](../../../../tests/contrib/moe/results/final_matrix_20260909/matrix_summary.json)和[两点确认](../../../../tests/contrib/moe/results/hy3_path_removal_confirm_20260910/audited.json)各保留原身份。
+
+| Case / Batch | 当前推荐 | Down ms / T | Combined ms / T | Full ms / T | 9/9来源／轮数 | 9/10来源／轮数 |
+|---|---|---|---|---|---|---|
+| Hy3 K192 / 1K | 8x1_compact | 0.106360 / 136.29 | 0.135881 / 106.68 | 0.385041 / 112.94 | [48](../../../../tests/contrib/moe/results/final_matrix_20260909/hy3_abba48.json) | — |
+| Hy3 K192 / 2K | 8x1_compact | 0.164841 / 175.87 | 0.224160 / 129.33 | 0.561322 / 154.94 | [48](../../../../tests/contrib/moe/results/final_matrix_20260909/hy3_abba48.json) | — |
+| Hy3 K192 / 4K | 1x4-P128 | 0.232161 / 249.75 | 0.340062 / 170.50 | 0.824363 / 211.01 | — | [独立48](../../../../tests/contrib/moe/results/hy3_path_removal_confirm_20260910/audited.json) |
+| Hy3 K192 / 8K | 8x1_compact | 0.363761 / 318.79 | 0.579722 / 200.03 | 1.428066 / 243.61 | — | [独立48](../../../../tests/contrib/moe/results/hy3_path_removal_confirm_20260910/audited.json) |
+| Hy3 K192 / 16K | 8x1 | 0.607302 / 381.90 | 1.022984 / 226.72 | 2.574450 / 270.27 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/hy3_abba24.json) | — |
+| Hy3 K192 / 32K | 8x1 | 1.097104 / 422.80 | 1.933428 / 239.91 | 5.125241 / 271.51 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/hy3_abba24.json) | — |
+| Qwen397 K512 / 1K | 1x4 | 0.488781 / 87.87 | 0.521222 / 82.40 | 1.222564 / 105.39 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_abba24.json) | — |
+| Qwen397 K512 / 2K | 1x4 | 0.489762 / 175.39 | 0.549662 / 156.28 | 1.321525 / 195.00 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_abba24.json) | — |
+| Qwen397 K512 / 4K | default | 0.813683 / 211.14 | 0.924584 / 185.81 | 2.311949 / 222.93 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_abba24.json) | — |
+| Qwen397 K512 / 8K | default | 1.154524 / 297.61 | 1.357945 / 253.03 | 3.361913 / 306.61 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_abba24.json) | — |
+| Qwen397 K512 / 16K | 8x1_compact | 1.569807 / 437.76 | 2.010748 / 341.76 | 5.517061 / 373.67 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_abba24.json) | — |
+| Qwen397 K512 / 32K | 8x1_compact | 3.097813 / 443.66 | 4.034175 / 340.69 | 10.886242 / 378.75 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_abba24.json) | — |
+| Qwen397 K256 / 1K | 1x4 | 0.281141 / 76.38 | 0.315721 / 68.02 | 0.694423 / 92.77 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_k256_abba24.json) | — |
+| Qwen397 K256 / 2K | 1x4 | 0.281941 / 152.34 | 0.339981 / 126.33 | 0.778163 / 165.58 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_k256_abba24.json) | — |
+| Qwen397 K256 / 4K | 1x4 | 0.480922 / 178.61 | 0.603542 / 142.33 | 1.354925 / 190.19 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_k256_abba24.json) | — |
+| Qwen397 K256 / 8K | 1x4 | 0.670983 / 256.04 | 0.899683 / 190.95 | 2.045528 / 251.96 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_k256_abba24.json) | — |
+| Qwen397 K256 / 16K | 8x1_compact | 0.967524 / 355.13 | 1.439686 / 238.66 | 3.398293 / 303.33 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_k256_abba24.json) | — |
+| Qwen397 K256 / 32K | 8x1_compact | 1.816547 / 378.30 | 2.742090 / 250.61 | 6.670746 / 309.05 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen397_k256_abba24.json) | — |
+| Qwen35 K512 / 1K | default | 0.147881 / 116.17 | 0.160400 / 107.11 | 0.379221 / 135.91 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_abba24.json) | — |
+| Qwen35 K512 / 2K | default | 0.151261 / 227.16 | 0.171660 / 200.16 | 0.436382 / 236.21 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_abba24.json) | — |
+| Qwen35 K512 / 4K | default | 0.234341 / 293.25 | 0.274501 / 250.34 | 0.720803 / 286.01 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_abba24.json) | — |
+| Qwen35 K512 / 8K | 8x1_compact | 0.323941 / 424.27 | 0.415321 / 330.92 | 1.239924 / 332.53 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_abba24.json) | — |
+| Qwen35 K512 / 16K | 8x1_compact | 0.636443 / 431.90 | 0.807683 / 340.33 | 2.378649 / 346.68 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_abba24.json) | — |
+| Qwen35 K512 / 32K | 8x1 | 1.198304 / 458.78 | 1.517466 / 362.29 | 4.639077 / 355.52 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_abba24.json) | — |
+| Qwen35 K256 / 1K | 1x4 | 0.082181 / 104.53 | 0.097640 / 87.98 | 0.231481 / 111.33 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_k256_abba24.json) | — |
+| Qwen35 K256 / 2K | 1x4 | 0.085141 / 201.78 | 0.110900 / 154.91 | 0.277381 / 185.81 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_k256_abba24.json) | — |
+| Qwen35 K256 / 4K | 1x4 | 0.137441 / 250.00 | 0.185761 / 184.97 | 0.459261 / 224.45 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_k256_abba24.json) | — |
+| Qwen35 K256 / 8K | 8x1_compact | 0.202081 / 340.06 | 0.293261 / 234.33 | 0.789243 / 261.21 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_k256_abba24.json) | — |
+| Qwen35 K256 / 16K | 8x1_compact | 0.373301 / 368.17 | 0.544542 / 252.39 | 1.499326 / 275.00 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_k256_abba24.json) | — |
+| Qwen35 K256 / 32K | 8x1 | 0.711962 / 386.08 | 1.030364 / 266.78 | 2.906831 / 283.69 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/qwen35_k256_abba24.json) | — |
+| Xiaomi K256 / 1K | 1x4 | 0.295601 / 87.18 | 0.337341 / 76.39 | 0.743303 / 104.01 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/xiaomi_abba24.json) | — |
+| Xiaomi K256 / 2K | 1x4 | 0.294841 / 174.80 | 0.363582 / 141.76 | 0.850843 / 181.72 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/xiaomi_abba24.json) | — |
+| Xiaomi K256 / 4K | 1x4 | 0.528742 / 194.95 | 0.661822 / 155.75 | 1.492765 / 207.16 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/xiaomi_abba24.json) | — |
+| Xiaomi K256 / 8K | 1x4 | 0.748223 / 275.53 | 1.005484 / 205.03 | 2.255988 / 274.15 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/xiaomi_abba24.json) | — |
+| Xiaomi K256 / 16K | 8x1_compact | 1.288145 / 320.09 | 1.799987 / 229.07 | 4.192895 / 295.01 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/xiaomi_abba24.json) | — |
+| Xiaomi K256 / 32K | 1x4 | 2.306848 / 357.47 | 3.297132 / 250.11 | 7.853290 / 315.01 | [48](../../../../tests/contrib/moe/results/final_matrix_20260909/xiaomi_abba48.json) | — |
+| H3 K384 / 1K | 1x4 | 0.157641 / 122.60 | 0.178621 / 108.20 | 0.415881 / 139.42 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/h3_abba24.json) | — |
+| H3 K384 / 2K | 1x4 | 0.159800 / 241.89 | 0.198661 / 194.58 | 0.480002 / 241.59 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/h3_abba24.json) | — |
+| H3 K384 / 4K | 1x4 | 0.302721 / 255.38 | 0.375281 / 206.00 | 0.844144 / 274.75 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/h3_abba24.json) | — |
+| H3 K384 / 8K | 8x1 | 0.392921 / 393.51 | 0.534342 / 289.36 | 1.431425 / 324.05 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/h3_abba24.json) | — |
+| H3 K384 / 16K | 8x1_compact | 0.672242 / 460.01 | 0.950464 / 325.35 | 2.615649 / 354.68 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/h3_abba24.json) | — |
+| H3 K384 / 32K | 8x1_compact | 1.327125 / 466.03 | 1.878647 / 329.21 | 5.184999 / 357.84 | [24](../../../../tests/contrib/moe/results/final_matrix_20260909/h3_abba24.json) | — |
+
+Hy3 1K/2K虽选compact，**full数为0，数学由M64 tail完成**，不是8x1满块吞吐获胜。
+
+<a id="historical-nonselection"></a>
+
+### 1.4 2026-09-09完整历史落选账本（66行）
+
+> **66行保留9/9原值。Hy3 4K/8K当时对照1x8，现在已不存在；两点当前迁移看独立确认。这里不是删除后或重构后的全矩阵重评。** “现选/旧推荐”均为9/9当时标签。D/C/F=Down/Combined/Full，ms/T为有效吞吐；改善正值更快，IQR为配对Q1/Q3。行比是执行填充行/当时所选执行行，F/T是compact full/tail任务数（均衡routing几何，不是实测驻留）。24点两者均落选。padding与慢Down相关但无单因素归因；full=0仍三个launch。未采PMC/ATT，不猜bank/cache/occupancy。证据：[66行原始JSON](../../../../tests/contrib/moe/results/final_matrix_20260909/nonselection.json)。
+
+| 点 | 未选候选 vs 所选 | 候选D/C/F ms / T | 相对所选改善 [IQR]% | 工作量 | 未选原因 |
+| --- | --- | --- | --- | --- | --- |
+| Hy3 K192 / 1K | 8x1 vs 8x1_compact | Down 0.237680 / 60.99<br>Combined 0.270541 / 53.58<br>Full 0.694143 / 62.65 | Down -123.854% [-125.117, -121.763]<br>Combined -99.492% [-100.507, -98.194]<br>Full -80.928% [-85.434, -76.843] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Hy3 K192 / 2K | 8x1 vs 8x1_compact | Down 0.237721 / 121.95<br>Combined 0.297541 / 97.44<br>Full 0.751403 / 115.75 | Down -44.460% [-45.041, -43.582]<br>Combined -32.639% [-33.521, -32.226]<br>Full -34.058% [-36.056, -31.003] | 行比2.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Hy3 K192 / 4K | 8x1 vs 1x8 | Down 0.238281 / 243.33<br>Combined 0.349842 / 165.74<br>Full 0.886363 / 196.25 | Down -0.651% [-1.648, -0.064]<br>Combined -3.916% [-4.608, -3.444]<br>Full -6.317% [-8.138, -4.762] | 行比1.333 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Hy3 K192 / 4K | 8x1_compact vs 1x8 | Down 0.239841 / 241.75<br>Combined 0.348082 / 166.58<br>Full 0.838423 / 207.47 | Down -0.790% [-1.112, -0.236]<br>Combined -3.297% [-3.644, -2.857]<br>Full -0.634% [-2.500, +0.774] | 行比1.000；F/T=0/579 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Hy3 K192 / 8K | 8x1 vs 1x8 | Down 0.423022 / 274.13<br>Combined 0.641023 / 180.90<br>Full 1.559246 / 223.12 | Down -4.378% [-4.678, -4.003]<br>Combined -7.907% [-8.383, -7.604]<br>Full -8.884% [-9.932, -8.219] | 行比1.333 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Hy3 K192 / 8K | 8x1_compact vs 1x8 | Down 0.374462 / 309.68<br>Combined 0.592202 / 195.82<br>Full 1.439025 / 241.76 | Down +7.222% [+6.589, +7.708]<br>Combined +0.005% [-0.482, +0.374]<br>Full -0.217% [-1.324, +0.473] | 行比1.000；F/T=160/518 | 未达三phase共同改善门槛；对现选路径Q1≤0：Combined/Full；对旧推荐未过：Combined/Full |
+| Hy3 K192 / 16K | 8x1_compact vs 8x1 | Down 0.655583 / 353.77<br>Combined 1.076024 / 215.54<br>Full 2.635690 / 263.99 | Down -8.540% [-8.913, -8.110]<br>Combined -5.077% [-5.301, -4.894]<br>Full -2.437% [-3.183, -1.930] | 行比1.000；F/T=560/76 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Hy3 K192 / 32K | 8x1_compact vs 8x1 | Down 1.155505 / 401.43<br>Combined 1.995348 / 232.47<br>Full 5.190741 / 268.09 | Down -5.678% [-6.140, -5.428]<br>Combined -3.225% [-3.482, -2.895]<br>Full -1.322% [-1.604, -0.983] | 行比1.000；F/T=1120/152 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 1K | 8x1 vs 1x4 | Down 1.164325 / 36.89<br>Combined 1.204105 / 35.67<br>Full 3.413273 / 37.75 | Down -151.226% [-155.063, -148.379]<br>Combined -142.406% [-146.331, -137.615]<br>Full -181.918% [-188.237, -176.145] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 1K | 8x1_compact vs 1x4 | Down 0.496522 / 86.50<br>Combined 0.529762 / 81.07<br>Full 1.229064 / 104.84 | Down -1.356% [-2.068, -0.181]<br>Combined -1.015% [-2.342, -0.081]<br>Full -0.543% [-1.311, +0.354] | 行比1.000；F/T=0/512 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 2K | 8x1 vs 1x4 | Down 1.175384 / 73.08<br>Combined 1.243485 / 69.08<br>Full 3.517614 / 73.26 | Down -150.686% [-153.738, -148.302]<br>Combined -136.456% [-141.666, -131.599]<br>Full -172.528% [-176.042, -165.517] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 2K | 8x1_compact vs 1x4 | Down 0.498502 / 172.32<br>Combined 0.561742 / 152.92<br>Full 1.328866 / 193.92 | Down -1.526% [-2.221, -0.948]<br>Combined -1.596% [-2.724, +0.209]<br>Full -0.404% [-1.484, +0.621] | 行比1.000；F/T=0/512 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 4K | 8x1 vs default | Down 1.188665 / 144.53<br>Combined 1.310905 / 131.05<br>Full 3.727535 / 138.27 | Down -48.814% [-49.814, -47.645]<br>Combined -44.631% [-45.645, -43.850]<br>Full -61.546% [-62.693, -60.209] | 行比2.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 4K | 8x1_compact vs default | Down 0.852463 / 201.53<br>Combined 0.981484 / 175.04<br>Full 2.375409 / 216.97 | Down -5.253% [-6.015, -4.520]<br>Combined -5.848% [-6.363, -5.389]<br>Full -1.855% [-2.342, -1.450] | 行比1.000；F/T=0/1024 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 8K | 8x1 vs default | Down 1.182025 / 290.69<br>Combined 1.413866 / 243.02<br>Full 3.951435 / 260.87 | Down -3.225% [-3.565, -2.594]<br>Combined -4.667% [-4.926, -4.326]<br>Full -16.959% [-17.630, -16.364] | 行比1.333 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 8K | 8x1_compact vs default | Down 1.231064 / 279.11<br>Combined 1.455046 / 236.14<br>Full 3.496974 / 294.77 | Down -6.845% [-7.605, -6.263]<br>Combined -7.981% [-8.259, -7.214]<br>Full -3.568% [-4.238, -2.779] | 行比1.000；F/T=0/1536 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 16K | 8x1 vs 8x1_compact | Down 2.204528 / 311.72<br>Combined 2.662730 / 258.08<br>Full 7.684910 / 268.26 | Down -40.647% [-40.764, -40.282]<br>Combined -31.887% [-32.212, -31.526]<br>Full -38.882% [-39.394, -38.490] | 行比1.600 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K512 / 32K | 8x1 vs 8x1_compact | Down 3.454893 / 397.81<br>Combined 4.385457 / 313.40<br>Full 12.203328 / 337.87 | Down -11.420% [-11.835, -11.267]<br>Combined -8.717% [-8.981, -8.195]<br>Full -11.890% [-12.109, -11.619] | 行比1.200 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 1K | 8x1 vs 1x4 | Down 0.717763 / 29.92<br>Combined 0.757523 / 28.35<br>Full 1.853927 / 34.75 | Down -154.549% [-156.110, -153.667]<br>Combined -139.632% [-140.897, -138.075]<br>Full -170.449% [-174.840, -167.442] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 1K | 8x1_compact vs 1x4 | Down 0.289841 / 74.09<br>Combined 0.324421 / 66.19<br>Full 0.700282 / 92.00 | Down -2.801% [-3.281, -2.443]<br>Combined -2.835% [-3.117, -2.352]<br>Full -1.009% [-1.787, -0.662] | 行比1.000；F/T=0/512 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 2K | 8x1 vs 1x4 | Down 0.722023 / 59.49<br>Combined 0.789643 / 54.39<br>Full 1.947187 / 66.17 | Down -155.309% [-157.538, -154.143]<br>Combined -132.009% [-134.285, -131.055]<br>Full -153.001% [-154.160, -148.546] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 2K | 8x1_compact vs 1x4 | Down 0.290561 / 147.82<br>Combined 0.349142 / 123.01<br>Full 0.784063 / 164.34 | Down -3.221% [-3.562, -2.727]<br>Combined -2.423% [-2.810, -1.969]<br>Full -1.132% [-1.324, -0.801] | 行比1.000；F/T=0/512 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 4K | 8x1 vs 1x4 | Down 0.724143 / 118.62<br>Combined 0.855323 / 100.43<br>Full 2.149428 / 119.89 | Down -51.320% [-52.161, -49.673]<br>Combined -42.246% [-43.761, -40.037]<br>Full -58.592% [-61.267, -57.259] | 行比2.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 4K | 8x1_compact vs 1x4 | Down 0.491682 / 174.71<br>Combined 0.614363 / 139.82<br>Full 1.360185 / 189.46 | Down -1.938% [-2.914, -1.483]<br>Combined -1.898% [-3.154, -0.973]<br>Full -0.592% [-1.162, +0.296] | 行比1.000；F/T=0/1024 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 8K | 8x1 vs 1x4 | Down 0.722503 / 237.78<br>Combined 0.965744 / 177.89<br>Full 2.403909 / 214.40 | Down -7.630% [-8.593, -7.071]<br>Combined -7.207% [-7.998, -6.484]<br>Full -17.157% [-18.995, -15.554] | 行比1.333 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 8K | 8x1_compact vs 1x4 | Down 0.684502 / 250.98<br>Combined 0.913564 / 188.05<br>Full 2.069568 / 249.04 | Down -1.748% [-2.074, -1.275]<br>Combined -1.482% [-2.606, -1.120]<br>Full -0.303% [-2.353, +0.350] | 行比1.000；F/T=0/1536 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 16K | 8x1 vs 8x1_compact | Down 1.347185 / 255.05<br>Combined 1.829927 / 187.77<br>Full 4.558038 / 226.15 | Down -38.890% [-39.401, -38.455]<br>Combined -26.862% [-27.278, -26.305]<br>Full -34.169% [-34.892, -33.347] | 行比1.600 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen397 K256 / 32K | 8x1 vs 8x1_compact | Down 2.003628 / 342.98<br>Combined 2.928071 / 234.69<br>Full 7.338089 / 280.94 | Down -9.714% [-10.069, -9.499]<br>Combined -6.562% [-6.944, -6.322]<br>Full -10.112% [-10.410, -9.797] | 行比1.200 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K512 / 1K | 8x1 vs default | Down 0.344961 / 49.80<br>Combined 0.360261 / 47.69<br>Full 0.997203 / 51.68 | Down -135.759% [-136.958, -132.727]<br>Combined -126.191% [-127.369, -124.378]<br>Full -163.698% [-165.674, -162.026] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K512 / 1K | 8x1_compact vs default | Down 0.157761 / 108.90<br>Combined 0.172580 / 99.55<br>Full 0.390421 / 132.01 | Down -7.620% [-8.200, -6.255]<br>Combined -8.001% [-8.714, -6.920]<br>Full -3.281% [-3.801, -2.588] | 行比1.000；F/T=0/256 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K512 / 2K | 8x1 vs default | Down 0.350601 / 98.00<br>Combined 0.376301 / 91.31<br>Full 1.050524 / 98.12 | Down -132.032% [-133.987, -131.115]<br>Combined -119.234% [-121.169, -118.440]<br>Full -141.150% [-141.729, -140.369] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K512 / 2K | 8x1_compact vs default | Down 0.159400 / 215.56<br>Combined 0.184720 / 186.01<br>Full 0.448061 / 230.06 | Down -5.533% [-6.212, -4.347]<br>Combined -7.746% [-8.648, -6.946]<br>Full -2.879% [-3.429, -2.448] | 行比1.000；F/T=0/256 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K512 / 4K | 8x1 vs default | Down 0.357261 / 192.35<br>Combined 0.404601 / 169.84<br>Full 1.117544 / 184.47 | Down -52.673% [-54.354, -51.771]<br>Combined -47.714% [-49.311, -46.714]<br>Full -55.157% [-56.137, -54.674] | 行比2.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K512 / 4K | 8x1_compact vs default | Down 0.252821 / 271.81<br>Combined 0.300141 / 228.96<br>Full 0.742682 / 277.59 | Down -7.920% [-8.366, -7.362]<br>Combined -9.244% [-9.825, -8.800]<br>Full -3.257% [-3.618, -2.635] | 行比1.000；F/T=0/512 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K512 / 8K | 8x1 vs 8x1_compact | Down 0.371681 / 369.78<br>Combined 0.462782 / 296.98<br>Full 1.287825 / 320.17 | Down -14.688% [-14.830, -14.592]<br>Combined -11.339% [-11.450, -11.245]<br>Full -3.900% [-4.014, -3.746] | 行比1.000 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K512 / 16K | 8x1 vs 8x1_compact | Down 0.647283 / 424.66<br>Combined 0.818163 / 335.97<br>Full 2.384229 / 345.87 | Down -1.675% [-1.741, -1.614]<br>Combined -1.313% [-1.405, -1.220]<br>Full -0.272% [-0.347, -0.178] | 行比1.000 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K512 / 32K | 8x1_compact vs 8x1 | Down 1.221484 / 450.07<br>Combined 1.541366 / 356.67<br>Full 4.660798 / 353.86 | Down -1.929% [-1.960, -1.906]<br>Combined -1.558% [-1.612, -1.510]<br>Full -0.483% [-0.557, -0.427] | 行比1.000；F/T=1024/0 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K256 / 1K | 8x1 vs 1x4 | Down 0.209561 / 40.99<br>Combined 0.224861 / 38.20<br>Full 0.556402 / 46.32 | Down -155.299% [-156.259, -154.635]<br>Combined -130.972% [-132.296, -129.474]<br>Full -141.205% [-142.453, -110.202] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K256 / 1K | 8x1_compact vs 1x4 | Down 0.089021 / 96.49<br>Combined 0.104621 / 82.11<br>Full 0.237321 / 108.59 | Down -8.406% [-8.836, -7.925]<br>Combined -7.673% [-8.182, -6.582]<br>Full -2.654% [-3.561, +7.060] | 行比1.000；F/T=0/256 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K256 / 2K | 8x1 vs 1x4 | Down 0.214641 / 80.04<br>Combined 0.240161 / 71.53<br>Full 0.604562 / 85.25 | Down -152.375% [-153.056, -151.736]<br>Combined -116.457% [-117.343, -115.611]<br>Full -117.776% [-118.729, -111.402] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K256 / 2K | 8x1_compact vs 1x4 | Down 0.092120 / 186.49<br>Combined 0.117860 / 145.76<br>Full 0.284101 / 181.41 | Down -8.240% [-8.720, -7.570]<br>Combined -6.292% [-6.687, -5.884]<br>Full -2.457% [-2.627, -0.783] | 行比1.000；F/T=0/256 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K256 / 4K | 8x1 vs 1x4 | Down 0.216761 / 158.51<br>Combined 0.264881 / 129.72<br>Full 0.665902 / 154.80 | Down -58.280% [-59.112, -57.244]<br>Combined -42.929% [-44.135, -41.900]<br>Full -44.900% [-45.548, -44.665] | 行比2.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K256 / 4K | 8x1_compact vs 1x4 | Down 0.144920 / 237.09<br>Combined 0.193040 / 177.99<br>Full 0.467041 / 220.71 | Down -5.295% [-5.805, -4.957]<br>Combined -4.175% [-4.612, -3.546]<br>Full -1.673% [-2.034, -1.389] | 行比1.000；F/T=0/512 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K256 / 8K | 8x1 vs 8x1_compact | Down 0.223880 / 306.95<br>Combined 0.314342 / 218.61<br>Full 0.811483 / 254.05 | Down -9.829% [-10.293, -9.524]<br>Combined -7.070% [-7.287, -6.582]<br>Full -2.751% [-2.896, -2.504] | 行比1.000 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K256 / 16K | 8x1 vs 8x1_compact | Down 0.386142 / 355.93<br>Combined 0.557702 / 246.44<br>Full 1.513326 / 272.46 | Down -3.585% [-3.913, -3.438]<br>Combined -2.538% [-2.747, -2.407]<br>Full -0.903% [-1.130, -0.733] | 行比1.000 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Qwen35 K256 / 32K | 8x1_compact vs 8x1 | Down 0.732343 / 375.34<br>Combined 1.051824 / 261.33<br>Full 2.921811 / 282.23 | Down -2.745% [-3.043, -2.452]<br>Combined -1.873% [-2.117, -1.608]<br>Full -0.671% [-0.886, -0.392] | 行比1.000；F/T=1024/0 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 1K | 8x1 vs 1x4 | Down 0.765603 / 33.66<br>Combined 0.807883 / 31.90<br>Full 2.023068 / 38.21 | Down -159.925% [-161.318, -158.129]<br>Combined -140.847% [-141.915, -139.688]<br>Full -175.506% [-179.222, -168.960] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 1K | 8x1_compact vs 1x4 | Down 0.303021 / 85.04<br>Combined 0.344902 / 74.72<br>Full 0.749923 / 103.09 | Down -2.612% [-2.906, -2.258]<br>Combined -2.588% [-3.252, -2.198]<br>Full -0.944% [-2.087, +0.005] | 行比1.000；F/T=0/384 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 2K | 8x1 vs 1x4 | Down 0.760523 / 67.77<br>Combined 0.837723 / 61.52<br>Full 2.145188 / 72.08 | Down -159.256% [-161.003, -156.658]<br>Combined -131.096% [-133.262, -128.267]<br>Full -152.804% [-155.656, -149.366] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 2K | 8x1_compact vs 1x4 | Down 0.303262 / 169.95<br>Combined 0.374381 / 137.67<br>Full 0.858443 / 180.12 | Down -2.526% [-2.881, -2.228]<br>Combined -2.503% [-2.842, -1.849]<br>Full -0.993% [-1.277, -0.536] | 行比1.000；F/T=0/384 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 4K | 8x1 vs 1x4 | Down 0.769423 / 133.97<br>Combined 0.908964 / 113.40<br>Full 2.345249 / 131.86 | Down -46.367% [-47.647, -44.537]<br>Combined -37.726% [-39.498, -36.423]<br>Full -56.448% [-58.552, -54.601] | 行比2.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 4K | 8x1_compact vs 1x4 | Down 0.538602 / 191.38<br>Combined 0.670543 / 153.72<br>Full 1.500906 / 206.03 | Down -1.773% [-2.149, -1.177]<br>Combined -1.402% [-2.295, -0.884]<br>Full +0.260% [-1.140, +1.303] | 行比1.000；F/T=0/768 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 8K | 8x1 vs 1x4 | Down 0.765323 / 269.37<br>Combined 1.027884 / 200.57<br>Full 2.587950 / 238.98 | Down -2.491% [-3.564, -1.766]<br>Combined -2.101% [-2.507, -1.486]<br>Full -15.251% [-16.167, -14.355] | 行比1.333 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 8K | 8x1_compact vs 1x4 | Down 0.760603 / 271.05<br>Combined 1.019624 / 202.19<br>Full 2.274948 / 271.86 | Down -1.308% [-2.183, -0.935]<br>Combined -1.246% [-2.316, -0.910]<br>Full -1.004% [-1.309, -0.327] | 行比1.000；F/T=0/1152 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 16K | 8x1 vs 8x1_compact | Down 1.465505 / 281.35<br>Combined 1.986607 / 207.55<br>Full 4.976279 / 248.57 | Down -13.994% [-14.264, -13.698]<br>Combined -10.390% [-10.606, -10.075]<br>Full -18.518% [-18.832, -18.021] | 行比1.333 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| Xiaomi K256 / 32K | 8x1 vs 1x4 | Down 2.212468 / 372.72<br>Combined 3.209952 / 256.90<br>Full 7.934249 / 311.80 | Down +3.519% [+3.201, +3.692]<br>Combined +2.221% [+2.064, +2.486]<br>Full -1.221% [-1.658, -0.830] | 行比1.091 | Down有收益，但Full配对回退；对现选路径Q1≤0：Full；对旧推荐未过：Full |
+| Xiaomi K256 / 32K | 8x1_compact vs 1x4 | Down 2.249128 / 366.65<br>Combined 3.242412 / 254.33<br>Full 7.840829 / 315.52 | Down +2.258% [+2.078, +2.538]<br>Combined +1.517% [+1.378, +1.641]<br>Full +0.156% [-0.398, +0.698] | 行比1.000；F/T=768/1152 | 未达三phase共同改善门槛；对现选路径Q1≤0：Full；对旧推荐未过：Full |
+| H3 K384 / 1K | 8x1 vs 1x4 | Down 0.382241 / 50.56<br>Combined 0.403102 / 47.95<br>Full 1.046144 / 55.42 | Down -142.880% [-144.527, -141.826]<br>Combined -125.819% [-128.231, -125.092]<br>Full -153.803% [-158.802, -150.735] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| H3 K384 / 1K | 8x1_compact vs 1x4 | Down 0.165601 / 116.71<br>Combined 0.186641 / 103.55<br>Full 0.423581 / 136.89 | Down -4.949% [-5.430, -4.697]<br>Combined -4.453% [-4.870, -4.105]<br>Full -2.311% [-2.874, -1.299] | 行比1.000；F/T=0/128 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| H3 K384 / 2K | 8x1 vs 1x4 | Down 0.384822 / 100.45<br>Combined 0.424281 / 91.11<br>Full 1.099944 / 105.43 | Down -141.498% [-143.151, -140.180]<br>Combined -114.612% [-116.928, -113.545]<br>Full -129.886% [-133.699, -127.520] | 行比4.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| H3 K384 / 2K | 8x1_compact vs 1x4 | Down 0.168201 / 229.81<br>Combined 0.206981 / 186.75<br>Full 0.488182 / 237.54 | Down -5.147% [-5.385, -4.870]<br>Combined -4.063% [-4.489, -3.813]<br>Full -1.677% [-2.486, -0.944] | 行比1.000；F/T=0/128 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| H3 K384 / 4K | 8x1 vs 1x4 | Down 0.387241 / 199.64<br>Combined 0.459622 / 168.20<br>Full 1.194744 / 194.12 | Down -28.485% [-28.865, -27.762]<br>Combined -22.996% [-23.672, -22.665]<br>Full -41.545% [-42.372, -40.235] | 行比2.000 | Down配对较慢；执行填充行更多；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| H3 K384 / 4K | 8x1_compact vs 1x4 | Down 0.313421 / 246.66<br>Combined 0.385861 / 200.36<br>Full 0.855024 / 271.25 | Down -3.630% [-3.880, -3.425]<br>Combined -3.020% [-3.149, -2.801]<br>Full -1.209% [-1.916, -0.929] | 行比1.000；F/T=0/256 | Down配对较慢；满块为0，仍走构表/空full/tail；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| H3 K384 / 8K | 8x1_compact vs 8x1 | Down 0.400122 / 386.43<br>Combined 0.541862 / 285.35<br>Full 1.431445 / 324.05 | Down -1.886% [-1.997, -1.671]<br>Combined -0.978% [-1.352, -0.767]<br>Full -0.292% [-0.585, +0.084] | 行比1.000；F/T=128/0 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| H3 K384 / 16K | 8x1 vs 8x1_compact | Down 0.780203 / 396.36<br>Combined 1.058244 / 292.22<br>Full 2.739850 / 338.60 | Down -15.967% [-16.031, -15.890]<br>Combined -11.783% [-12.129, -11.283]<br>Full -4.131% [-4.834, -3.512] | 行比1.000 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+| H3 K384 / 32K | 8x1 vs 8x1_compact | Down 1.362625 / 453.89<br>Combined 1.912447 / 323.39<br>Full 5.235179 / 354.41 | Down -2.633% [-2.704, -2.587]<br>Combined -1.863% [-1.984, -1.772]<br>Full -0.205% [-0.774, +0.201] | 行比1.000 | Down配对较慢；对现选路径Q1≤0：Down/Combined/Full；对旧推荐未过：Down/Combined/Full |
+
+<a id="migration-confirmation"></a>
+
+### 1.5 删除损失与两点独立确认
+
+9/9[删除反事实](../../../../tests/contrib/moe/results/final_matrix_20260909/path_removal.json)按真实path过滤：原选存活则保持，策略损失严格0；被删则从剩余三phase非支配集中选Full绝对median最小者，同值按label。仅删1x8/同时删1x8+2x4都只影响Hy3 4K和8K，其余40点保留（仅删1x8时36点无该候选，同时删时12点无两者）；仅删2x4无改选，42点标签保留，其中12个K512点原本不含2x4。随后删4x1也无改选，因为当前42点没有选中它。标签策略损失0不是测得wall time零差异，也不是这些路径所有shape永远无益。
+
+当时强制重选存在同样本挑最优偏差，**不等于删除后重测**。4K非支配1x4-P128与compact的Full分别0.832323 / 208.99、0.838423 / 207.47，按规则选前者；ordinary为0.886363 / 196.25。8K选compact，1x4-P128 Full为1.468506 / 236.90，ordinary为1.559246 / 223.12。保留两受影响点全部原值，不重复40行零策略损失：
+
+| 9/9替代 | Phase | 原1x8 ms / T → 替代 ms / T | 时延增幅 [IQR]% | 吞吐损失 [IQR]% |
+|---|---|---|---|---|
+| Hy3 4K → 1x4-P128 | Down | 0.237281 / 244.36 → 0.231561 / 250.40 | -2.691 [-3.180, -2.346] | -2.765 [-3.285, -2.403] |
+| Hy3 4K → 1x4-P128 | Combined | 0.335621 / 172.76 → 0.339221 / 170.93 | +0.882 [+0.451, +1.159] | +0.875 [+0.449, +1.145] |
+| Hy3 4K → 1x4-P128 | Full | 0.833103 / 208.79 → 0.832323 / 208.99 | -0.211 [-1.637, +0.917] | -0.211 [-1.665, +0.909] |
+| Hy3 8K → compact | Down | 0.406102 / 285.55 → 0.374462 / 309.68 | -7.222 [-7.708, -6.589] | -7.784 [-8.352, -7.054] |
+| Hy3 8K → compact | Combined | 0.594262 / 195.14 → 0.592202 / 195.82 | -0.005 [-0.374, +0.482] | -0.005 [-0.376, +0.480] |
+| Hy3 8K → compact | Full | 1.433525 / 242.68 → 1.439025 / 241.76 | +0.217 [-0.473, +1.324] | +0.217 [-0.475, +1.307] |
+
+单phase包络另外两项非零：Hy3 4K Combined从1x8→1x4-P128，绝对median增幅+1.073%，配对+0.882% [+0.451,+1.159]；8K Full从1x8→compact，绝对median+0.384%，配对+0.217% [-0.473,+1.324]。仅删1x8与同时删两支分别重复这两项，其余最优label仍在、包络损失0；不能把独立phase包络拼成最终推荐。
+
+#### 2026-09-10：预先固定替代的独立48轮
+
+4K→direct_m64/1x4-P128，8K→compact，保持**删除前冻结源码和原9候选顺序**，仅分析两个预先固定的替代。不是删除后或可读性重构后计时，不是新42点，没有重新选路、没有与9/9拼96轮、没有删样本或按方向追加。证据：[计划](../../../../tests/contrib/moe/results/hy3_path_removal_confirm_20260910/plan.json)、[raw](../../../../tests/contrib/moe/results/hy3_path_removal_confirm_20260910/hy3_abba48.json)、[审计](../../../../tests/contrib/moe/results/hy3_path_removal_confirm_20260910/audited.json)。
+
+| 9/10替代 | Phase | 同run原1x8 ms / T → 替代 ms / T | 时延增幅 [IQR]% | 吞吐损失 [IQR]% | 替代快/慢轮 |
+|---|---|---|---|---|---|
+| Hy3 4K → 1x4-P128 | Down | 0.238521 / 243.09 → 0.232161 / 249.75 | -2.771 [-3.197, -2.283] | -2.850 [-3.303, -2.336] | 48 / 0 |
+| Hy3 4K → 1x4-P128 | Combined | 0.339081 / 171.00 → 0.340062 / 170.50 | +0.289 [-0.022, +0.856] | +0.289 [-0.022, +0.849] | 12 / 36 |
+| Hy3 4K → 1x4-P128 | Full | 0.826463 / 210.47 → 0.824363 / 211.01 | -0.402 [-2.131, +1.273] | -0.404 [-2.177, +1.257] | 28 / 20 |
+| Hy3 8K → compact | Down | 0.396321 / 292.60 → 0.363761 / 318.79 | -8.194 [-8.574, -7.756] | -8.926 [-9.378, -8.408] | 48 / 0 |
+| Hy3 8K → compact | Combined | 0.584522 / 198.39 → 0.579722 / 200.03 | -0.696 [-1.037, -0.171] | -0.701 [-1.048, -0.171] | 41 / 7 |
+| Hy3 8K → compact | Full | 1.428106 / 243.60 → 1.428066 / 243.61 | +0.126 [-0.781, +0.757] | +0.126 [-0.787, +0.751] | 23 / 25 |
+
+Down两点均稳定收益，8K Combined也收益；4K Combined及两点Full IQR跨零，**只表示本轮未观察稳定损失，不是等价证明**。8K Full绝对median略低、配对增幅为正是不同统计量，不矛盾；9/9的4K Combined稳定小损失仍保留。
+
+确认共5,184全候选event/1,152目标pair event、2,592逐轮检查+36初始检查，最大相对default rel_l2=0；12artifact/16kernel与前run ISA/ELF/资源精确一致。全1性能W不等于新随机W验证。GPU4 PCI `0001:0B:00.0`、ID `0xbe022834ccc51849`，PTL Enabled/VECTOR,F8、请求1800MHz/650W、NUMA1；退出auto、PTL Disabled/N/A、busy0/VRAM0、NUMA1。其它卡有负载非全机空闲，105.369885秒父墙钟不是kernel时延。
+
+<a id="validation-boundaries"></a>
+
+### 1.6 验证边界
+
+- 9/9矩阵71artifact/93kernel零private/spill/scratch；fresh逐轮检查27,792次，最大相对default rel_l2=2.06569639e-05，初始另计；仅K192/256/384/512，**不外推K320/K640**。全1W、单seed均衡routing不能替代生产trace或随机压力。
+- 既有原FIFO随机180配置/3,600检查；[cleanup审计](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/final_audited.json)28组ELF/ISA/host严格比较、40paired kernel、CPU1,625通过，new_gpu_checks=0，不是新跑180配置或任意shape证明。
+- [删1x8/2x4交付](../../../../tests/contrib/moe/results/remove_down_paths_20260910/delivery.json)：CPU990通过，6离线compact对/18paired kernel，无新GPU/性能；误收GPU的31项不可用记录未当通过。[删4x1交付](../../../../tests/contrib/moe/results/remove_4x1_20260910/delivery.json)：CPU994、0改选，无新编译/GPU/性能。
+- 历史20模块/22源是各run身份，不是当前计数；任务表并入compact后，现行源码集合为18项。未新增ATT/PMC或occupancy/cache/bank计数；零spill、功能通过及IQR跨零都不是性能保证。
+
+<a id="pipeline"></a>
+
+## 二、流水线设计
+
+记录 **2026-09-09原pack消费FIFO、PTPC、默认1N循环**。这组合启动、B周转、C打包/回写和两组wave错相，不是几十级独立流水。**逐stage表左Memory、右紧接的Compute；每行是单wave一次逻辑配对，不是一个cycle或全WG同步同行。** 可读性重构保留这些事件/依赖；新的代码身份与旧数值证据分开核验。
+
+<a id="notation"></a>
+
+### 2.1 符号与读表方法
+
+| 符号 | 含义 |
+|---|---|
+| N/n/T | N输出总列数，n为N128块编号，T=N/128；标题N=0/1指n=0/1，不是总列数。首轮/过渡表假设有足够后续块。 |
+| L/H | 当前块前/后N64，列0–63/64–127。 |
+| K0/K1 | K256的两个K128，坐标0–127/128–255；其它K按实际分块。 |
+| s/q | K256 s=0..3、q=4n+s；一般s=0..2KS−1、q=2KS·n+s，前KS拍L后KS拍H。 |
+| A | prologue gather到VGPR的activation，沿完整N复用。 |
+| B[n,L/H,Kk] | N64×真实归约块的权重，各wave协作搬运后按MFMA布局读。 |
+| Q[q] | 当前Compute消费B。K256 Q[4n..4n+3]为L/K0、L/K1、H/K0、H/K1。 |
+| P0/P1 | 每wave负责搬运的B片段VGPR槽，load可在途，提交须wait；用P[q&1]，提交后同槽发新预取。不是Compute packet或LDS槽号。 |
+| j=0..3 | N128内四N32，列0–31/32–63/64–95/96–127。 |
+| C[n,j] | FP32累加结果，当前半区全部K完成才数学完成。 |
+| C_bf16[n,j] | 同编号C缩放/pack后的BF16，留VGPR待CShuffle，不再是FP32累加器。 |
+| r0/r1 | 每wave两个实际不相邻的M16条带；M维，不是packet或新旧C双缓冲。 |
+| packet0/1 | 当前N64的两个N32，每个都含r0/r1；BK128每packet16 MFMA/wave、整192为24，每Compute两个packet，不是两wave组。 |
+| S[n,j] | weight scale；PTPC每份2条VMEM，activation scale×routing weight已融合行scale。 |
+| pack | 完成C结合weight/行scale生成BF16；**pack≠global store**。 |
+| C_bf16[n,0/1].r0 | C0/C1各自r0合成M16×N64；2/3和r1同理，斜杠非除法。 |
+| CShuffle | VGPR→LDS→VGPR→Global，计算布局重排为合并store布局。 |
+| load/store×2 | 每wave两条VMEM，不是两个元素；LDS不计vmcnt。 |
+| vmcnt(x)/lgkmcnt(x) | 等计数≤x，不是等x条完成；前者普通VMEM load/store依赖，后者此处LDS等，越小越严格。 |
+| KS | K192/256/320/384/512/640分别1/2/2/3/4/5；K320不是ceil(320/128)=3。 |
+
+沿三条数据路径读表：
+
+1. **B供数：Global → P → LDS → Breg。** 正常读`Q[q]`、提交`Q[q+1]`、预取`Q[q+3]`，`Q[q+2]`在另一P槽；启动建立LDS中的Q0及P0/P1中的Q1/Q2种子。
+2. **C计算与打包：FP32 → pack → BF16。** K256当前Compute使用上一Memory的scale；同一表行新load供后续Compute。`C[n,3]`到下一N的**Compute 0**才pack，不是更新下一N的`C[n+1,0]`。
+3. **C回写：上一N的BF16在当前Memory回写，当前FP32继续计算。** 旧FP32被pack消费后才clear；旧BF16被CShuffle写消费后才复用，不能整轮开始就覆盖全部C。不同列处理不同代数据，不是一份数据一拍走完全程。
+
+group0为wave0–3，group1为wave4–7；两组以scalar条件和barrier错相，一组memory时另一组可compute，不保证每cycle完美重叠。所有WG-uniform退出在错相前，尾部平衡barrier。K256的“上一拍scale”不套其它K：K512/K640保留多拍，K192/K320同Compute可pack两份。B的P槽和LDS槽不同；K192 P=16B+8B，K320 P0/P1=24B/16B每lane。K192深稳态另需`n+2<T`；短N裁剪，不能套表。wait按真实指令事件，不算wait后才issue的B，编译器可合并冗余wait。
+
+| K | 归约块坐标 | 每N M/C对 | 每packet MFMA | 每N MFMA/wave | 跨N FP32 | 跨N BF16 | LDS |
+|---|---|---:|---|---:|---|---|---|
+| 192 | K0=0–191 | 2 | 24 | 96 | C2/C3 | C0/C1 | 64KiB |
+| 256 | K0=0–127；K1=128–255 | 4 | 16 | 128 | C3 | C0/C1/C2 | 48KiB |
+| 320 | K0=0–127；K1=128–319 | 4 | K0=16；K1=24 | 160 | C2/C3 | C0/C1 | 56KiB |
+| 384 | K0=0–127；K1=128–255；K2=256–383 | 6 | 16 | 192 | C3 | C0/C1/C2 | 48KiB |
+| 512 | K0=0–127；K1=128–255；K2=256–383；K3=384–511 | 8 | 16 | 256 | C3 | C0/C1/C2 | 48KiB |
+| 640 | K0=0–127；K1=128–255；K2=256–383；K3=384–511；K4=512–639 | 10 | 16 | 320 | C3 | C0/C1/C2 | 48KiB |
+
+共同WG=M256×N128/8 waves，A跨N驻留。固定原pack，不恢复Memory-pack/delayed/formal：后移曾延长FP32/scale活跃期，K256/PTPC VGPR176→202、K320 214→232且无稳定收益证据。K192/K320原本两FP32+两BF16，不是后移新加。
+
+<a id="pipeline-k256"></a>
+
+### 2.2 K256：Prologue、N=0、N=1、稳态与尾部
+
+K256/PTPC/default1N，每N四M/C对，Compute两个16-MFMA packet；不是旧整N128/64-MFMA大stage账本。
+
+#### Prologue（尚无正常MFMA packet）
+
+| 启动部分 | Memory侧：加载／准备 | Memory侧：等待与提交 | Compute侧／C状态 |
+|---|---|---|---|
+| 元数据与行scale | 准备sorted IDs、expert ID；加载并融合routing weight与activation scale | 必要的元数据／LDS同步 | 尚未计算C |
+| 首B与A | 先发出`B[0,L,K0] → P0`，再gather两个K128块的A到VGPR | A跨后续N块复用 | 尚未计算C |
+| 首B落LDS | 使用刚加载的`P0` | `vmcnt(4)` → `P0 → LDS B[0,L,K0]` | 尚未计算C |
+| 两个预取种子 | `B[0,L,K1] → P0`；`B[0,H,K0] → P1` | `vmcnt(1)` → barrier | 初始FP32累加区清零；**没有旧`C_bf16`** |
+
+进入N0时LDS只有首B，P0/P1承载后两B预取。
+
+#### N=0：无旧C回写
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[0,0]` | **无** | `B[0,L,K0]` | **`vmcnt(2)`** | `P0 → B[0,L,K1]` | `B[0,H,K1] → P0` | **Compute 0** | Packet 0：`C[0,0]`从0计算K0贡献<br>Packet 1：`C[0,1]`从0计算K0贡献 | **无** | — |
+| **Memory 1** | `S[0,1]` | **无** | `B[0,L,K1]` | `vmcnt(3)` | `P1 → B[0,H,K0]` | `B[1,L,K0] → P1` | **Compute 1** | Packet 0：`C[0,0]`累加K1，完成<br>Packet 1：`C[0,1]`累加K1，完成 | `C_bf16[0,0]`<br>与packet 1交织 | `S[0,0]` |
+| **Memory 2** | `S[0,2]` | **无** | `B[0,H,K0]` | `vmcnt(3)` | `P0 → B[0,H,K1]` | `B[1,L,K1] → P0` | **Compute 2** | Packet 0：`C[0,2]`清零＋K0贡献<br>Packet 1：`C[0,3]`清零＋K0贡献 | `C_bf16[0,1]`<br>与packet 0交织 | `S[0,1]` |
+| **Memory 3** | `S[0,3]` | **无** | `B[0,H,K1]` | `vmcnt(3)` | `P1 → B[1,L,K0]` | `B[1,H,K0] → P1` | **Compute 3** | Packet 0：`C[0,2]`累加K1，完成<br>Packet 1：`C[0,3]`累加K1，完成 | `C_bf16[0,2]`<br>与packet 1交织 | `S[0,2]` |
+
+N0结束保留BF16 C0/C1/C2，FP32 C3与S3。**首Memory0独立剥离实际vmcnt(2)，不可用通用账本3覆盖。**
+
+#### N=1：首次回写过渡
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[1,0]` | `C_bf16[0,0/1].r0` | `B[1,L,K0]` | **`vmcnt(5)`** | `P0 → B[1,L,K1]` | `B[1,H,K1] → P0` | **Compute 0** | Packet 0：`C[1,0]`清零＋K0贡献<br>Packet 1：`C[1,1]`清零＋K0贡献 | **`C_bf16[0,3]`**<br>与packet 0交织 | **`S[0,3]`** |
+| **Memory 1** | `S[1,1]` | `C_bf16[0,0/1].r1` | `B[1,L,K1]` | `vmcnt(7)` | `P1 → B[1,H,K0]` | `B[2,L,K0] → P1` | **Compute 1** | Packet 0：`C[1,0]`累加K1，完成<br>Packet 1：`C[1,1]`累加K1，完成 | `C_bf16[1,0]`<br>与packet 1交织 | `S[1,0]` |
+| **Memory 2** | `S[1,2]` | `C_bf16[0,2/3].r0` | `B[1,H,K0]` | `vmcnt(7)` | `P0 → B[1,H,K1]` | `B[2,L,K1] → P0` | **Compute 2** | Packet 0：`C[1,2]`清零＋K0贡献<br>Packet 1：`C[1,3]`清零＋K0贡献 | `C_bf16[1,1]`<br>与packet 0交织 | `S[1,1]` |
+| **Memory 3** | `S[1,3]` | `C_bf16[0,2/3].r1` | `B[1,H,K1]` | `vmcnt(7)` | `P1 → B[2,L,K0]` | `B[2,H,K0] → P1` | **Compute 3** | Packet 0：`C[1,2]`累加K1，完成<br>Packet 1：`C[1,3]`累加K1，完成 | `C_bf16[1,2]`<br>与packet 1交织 | `S[1,2]` |
+
+首5保护旧S[0,3]，N0 Memory3无2条输出store，比深稳态少2个年轻请求。
+
+#### N≥2：完整稳态，未排空
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[n,0]` | `C_bf16[n−1,0/1].r0` | `B[n,L,K0]` | `vmcnt(7)` | `P0 → B[n,L,K1]` | `B[n,H,K1] → P0` | **Compute 0** | Packet 0：`C[n,0]`清零＋K0贡献<br>Packet 1：`C[n,1]`清零＋K0贡献 | **`C_bf16[n−1,3]`**<br>与packet 0交织 | **`S[n−1,3]`** |
+| **Memory 1** | `S[n,1]` | `C_bf16[n−1,0/1].r1` | `B[n,L,K1]` | `vmcnt(7)` | `P1 → B[n,H,K0]` | `B[n+1,L,K0] → P1` | **Compute 1** | Packet 0：`C[n,0]`累加K1，完成<br>Packet 1：`C[n,1]`累加K1，完成 | `C_bf16[n,0]`<br>与packet 1交织 | `S[n,0]` |
+| **Memory 2** | `S[n,2]` | `C_bf16[n−1,2/3].r0` | `B[n,H,K0]` | `vmcnt(7)` | `P0 → B[n,H,K1]` | `B[n+1,L,K1] → P0` | **Compute 2** | Packet 0：`C[n,2]`清零＋K0贡献<br>Packet 1：`C[n,3]`清零＋K0贡献 | `C_bf16[n,1]`<br>与packet 0交织 | `S[n,1]` |
+| **Memory 3** | `S[n,3]` | `C_bf16[n−1,2/3].r1` | `B[n,H,K1]` | `vmcnt(7)` | `P1 → B[n+1,L,K0]` | `B[n+1,H,K0] → P1` | **Compute 3** | Packet 0：`C[n,2]`累加K1，完成<br>Packet 1：`C[n,3]`累加K1，完成 | `C_bf16[n,2]`<br>与packet 1交织 | `S[n,2]` |
+
+#### 顺序与尾部
+
+Pack列是同编号C→缩放/pack→BF16，不是store。Memory按功能列，非严格左到右：**scale→CShuffle写/读→B packet0读→lgkmcnt(4)→BF16 store×2→B packet1读→vmcnt→B提交→B预取**。首N无CShuffle/store，首M0另lgkmcnt(0)再交接。两4-wave组错相，非WG同步逐行。
+
+足够长PTPC最后N wait=**7/7/6/6**，末拍无下一B仍保护当前C2 pack；其后vmcnt(0)补C3，按L/H、r0/r1回写末N全部BF16、drain依赖、平衡barrier。短N按实际请求裁剪，不当所有ISA逐条模板。源码：[主builder](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py)、[循环](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_nloop.py)、[账本](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_schedule.py)。
+
+<a id="pipeline-k192"></a>
+
+### 2.3 K192：Prologue、N=0、N=1、稳态与尾部
+
+**整BK192、每N两拍**，Q[2n]=L/K0，Q[2n+1]=H/K0。每份N64×K192 B每lane16B+8B两VMEM，不补K256；每Compute两个24-MFMA packet，共48 MFMA/wave。
+
+#### Prologue
+
+| 启动部分 | Memory侧：加载／准备 | Memory侧：等待与提交 | Compute侧／C状态 |
+|---|---|---|---|
+| 元数据与行scale | 准备sorted IDs、expert与行scale | 元数据／LDS同步 | 尚未计算C |
+| 首B与A | 发出`B[0,L,K0]`的16B＋8B加载；gather完整K192的A | 只加载三个K64范围，不加载不存在的第四段 | A留在VGPR跨N复用 |
+| 首B落LDS | 使用启动临时B片段 | **`vmcnt(0)`** → 两段写入LDS槽0的L → **`lgkmcnt(0)`** → barrier | FP32累加区清零 |
+| 两个预取种子 | `B[0,H,K0] → P0`；`B[1,L,K0] → P1`，各load ×2 | **此处不额外套用K256的`vmcnt(1)`种子等待**；由首Memory保护提交 | 无旧C或旧BF16 |
+
+两个完整N128×K192 LDS槽48KiB+CShuffle16KiB=64KiB；当前N槽n&1，L/H同槽两个半区，下N另一槽。
+
+#### N=0
+
+| **Memory Stage** | **Scale load ×4** | **CShuffle → C_bf16 store ×4** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[0,0]`、`S[0,1]`，各load ×2 | **无** | `B[0,L,K0]` | **`vmcnt(6)`** | `P0 → B[0,H,K0]` | `B[1,H,K0] → P0`，load ×2 | **Compute 0** | Packet 0：`C[0,0]`清零＋K0，完成<br>Packet 1：`C[0,1]`清零＋K0，完成 | **无** | — |
+| **Memory 1** | `S[0,2]`、`S[0,3]`，各load ×2 | **无** | `B[0,H,K0]` | **`vmcnt(6)`** | `P1 → B[1,L,K0]` | `B[2,L,K0] → P1`，load ×2 | **Compute 1** | Packet 0：`C[0,2]`清零＋K0，完成<br>Packet 1：`C[0,3]`清零＋K0，完成 | `C_bf16[0,0]`与packet 0交织<br>`C_bf16[0,1]`与packet 1交织 | `S[0,0]`、`S[0,1]` |
+
+N0结束：BF16 C0/C1，FP32 C2/C3及S2/S3。
+
+#### N=1
+
+| **Memory Stage** | **Scale load ×4** | **CShuffle → C_bf16 store ×4** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[1,0]`、`S[1,1]` | `C_bf16[0,0/1].r0`与`.r1`，各store ×2 | `B[1,L,K0]` | **`vmcnt(10)`** | `P0 → B[1,H,K0]` | `B[2,H,K0] → P0`，load ×2 | **Compute 0** | Packet 0：`C[1,0]`清零＋K0，完成<br>Packet 1：`C[1,1]`清零＋K0，完成 | **`C_bf16[0,2]`**与packet 0交织<br>**`C_bf16[0,3]`**与packet 1交织 | **`S[0,2]`、`S[0,3]`** |
+| **Memory 1** | `S[1,2]`、`S[1,3]` | `C_bf16[0,2/3].r0`与`.r1`，各store ×2 | `B[1,H,K0]` | **`vmcnt(14)`** | `P1 → B[2,L,K0]` | `B[3,L,K0] → P1`，load ×2 | **Compute 1** | Packet 0：`C[1,2]`清零＋K0，完成<br>Packet 1：`C[1,3]`清零＋K0，完成 | `C_bf16[1,0]`与packet 0交织<br>`C_bf16[1,1]`与packet 1交织 | `S[1,0]`、`S[1,1]` |
+
+首Memory0的10保护旧S2/S3，N0 Memory1没有4store；Memory1已有完整14。
+
+#### N≥2，且n+2<T：完整稳态
+
+| **Memory Stage** | **Scale load ×4** | **CShuffle → C_bf16 store ×4** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[n,0]`、`S[n,1]` | `C_bf16[n−1,0/1].r0`与`.r1`，各store ×2 | `B[n,L,K0]` | **`vmcnt(14)`** | `P0 → B[n,H,K0]` | `B[n+1,H,K0] → P0`，load ×2 | **Compute 0** | Packet 0：`C[n,0]`清零＋K0，完成<br>Packet 1：`C[n,1]`清零＋K0，完成 | **`C_bf16[n−1,2]`**与packet 0交织<br>**`C_bf16[n−1,3]`**与packet 1交织 | **`S[n−1,2]`、`S[n−1,3]`** |
+| **Memory 1** | `S[n,2]`、`S[n,3]` | `C_bf16[n−1,2/3].r0`与`.r1`，各store ×2 | `B[n,H,K0]` | **`vmcnt(14)`** | `P1 → B[n+1,L,K0]` | `B[n+2,L,K0] → P1`，load ×2 | **Compute 1** | Packet 0：`C[n,2]`清零＋K0，完成<br>Packet 1：`C[n,3]`清零＋K0，完成 | `C_bf16[n,0]`与packet 0交织<br>`C_bf16[n,1]`与packet 1交织 | `S[n,0]`、`S[n,1]` |
+
+#### 回写／地址／尾部
+
+1. r0/r1两小步骤各CShuffle写/读→对应B packet读→**lgkmcnt(6)**→store×2，再VM wait/提交/预取。每B packet6条128-bit LDS读，不套4。
+2. 上N Compute1尾prepare_b_addresses预备下N**5个完整lane地址**：当前读、H写16B/8B、下L写16B/8B，跨回边携带；两组在首Compute0后额外barrier错相。
+3. 始终跨N两BF16 C0/C1+两FP32 C2/C3及scale，下N Compute0 pack旧C2/C3，Memory1写完才清零高半累加器。
+4. 最后两N独立裁剪：倒数第二N不发不存在的n+2/L；最后N不提交/预取越界。足够长PTPC末N**12/12**，后vmcnt(0)补C2/C3、L/H与r0/r1全部回写。
+5. T=1无P1下N种子；T<4无动态回边，6/6、10/14、14/14表不机械套单N。源码：[K192原语/流程/账本](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_k192.py)。
+
+<a id="pipeline-k320"></a>
+
+### 2.4 K320：Prologue、N=0、N=1、稳态与尾部
+
+每N四拍**L/K128、L/K192、H/K128、H/K192**，Compute为32/48/32/48 MFMA/wave。K0每lane16B/load×1，K1每lane24B/load×2。槽0 N128×128=16KiB，槽1 N128×192=24KiB，CShuffle16KiB，共56KiB；L/H间距8192/12288B，槽不随N交换。P0=K192、P1=K128，不是LDS编号。
+
+#### Prologue
+
+| 启动部分 | Memory侧：加载／准备 | Memory侧：等待与提交 | Compute侧／C状态 |
+|---|---|---|---|
+| 元数据与行scale | sorted IDs、expert及行scale准备 | 元数据／LDS同步 | 尚未计算C |
+| 首B与A | 首B只发`B[0,L,K0]`，load ×1；A按128＋192 gather到VGPR | 不重复预填H/K0，不padding归约维 | 尚未计算C |
+| 首B落LDS | 使用启动首B片段 | `vmcnt(4)` → LDS槽0的L/K0 | 尚未计算C |
+| 两个预取种子 | `B[0,L,K1] → P0`，load ×2；`B[0,H,K0] → P1`，load ×1 | `vmcnt(1)` → barrier | FP32累加区清零；无旧BF16 |
+
+#### N=0
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[0,0]` | **无** | `B[0,L,K0]` | **`vmcnt(3)`** | `P0 → B[0,L,K1]` | `B[0,H,K1] → P0`，load ×2 | **Compute 0** | Packet 0：`C[0,0]`从0计算K0贡献<br>Packet 1：`C[0,1]`从0计算K0贡献 | **无** | — |
+| **Memory 1** | `S[0,1]` | **无** | `B[0,L,K1]` | **`vmcnt(6)`** | `P1 → B[0,H,K0]` | `B[1,L,K0] → P1`，load ×1 | **Compute 1** | Packet 0：`C[0,0]`累加K1，完成<br>Packet 1：`C[0,1]`累加K1，完成 | **无** | — |
+| **Memory 2** | `S[0,2]` | **无** | `B[0,H,K0]` | **`vmcnt(3)`** | `P0 → B[0,H,K1]` | `B[1,L,K1] → P0`，load ×2 | **Compute 2** | Packet 0：`C[0,2]`清零＋K0贡献<br>Packet 1：`C[0,3]`清零＋K0贡献 | `C_bf16[0,0]`与packet 0交织<br>`C_bf16[0,1]`与packet 1交织 | `S[0,0]`、`S[0,1]` |
+| **Memory 3** | `S[0,3]` | **无** | `B[0,H,K1]` | **`vmcnt(6)`** | `P1 → B[1,L,K0]` | `B[1,H,K0] → P1`，load ×1 | **Compute 3** | Packet 0：`C[0,2]`累加K1，完成<br>Packet 1：`C[0,3]`累加K1，完成 | **无** | — |
+
+N0结束BF16 C0/C1、FP32 C2/C3及S2/S3。首M0实际3非BK128的2，首M1提交H/K128后**交接barrier前lgkmcnt(0)**。
+
+#### N=1
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[1,0]` | `C_bf16[0,0/1].r0` | `B[1,L,K0]` | **`vmcnt(5)`** | `P0 → B[1,L,K1]` | `B[1,H,K1] → P0`，load ×2 | **Compute 0** | Packet 0：`C[1,0]`清零＋K0贡献<br>Packet 1：`C[1,1]`清零＋K0贡献 | **`C_bf16[0,2]`**与packet 0交织<br>**`C_bf16[0,3]`**与packet 1交织 | **`S[0,2]`、`S[0,3]`** |
+| **Memory 1** | `S[1,1]` | `C_bf16[0,0/1].r1` | `B[1,L,K1]` | **`vmcnt(10)`** | `P1 → B[1,H,K0]` | `B[2,L,K0] → P1`，load ×1 | **Compute 1** | Packet 0：`C[1,0]`累加K1，完成<br>Packet 1：`C[1,1]`累加K1，完成 | **无** | — |
+| **Memory 2** | `S[1,2]` | `C_bf16[0,2/3].r0` | `B[1,H,K0]` | **`vmcnt(7)`** | `P0 → B[1,H,K1]` | `B[2,L,K1] → P0`，load ×2 | **Compute 2** | Packet 0：`C[1,2]`清零＋K0贡献<br>Packet 1：`C[1,3]`清零＋K0贡献 | `C_bf16[1,0]`与packet 0交织<br>`C_bf16[1,1]`与packet 1交织 | `S[1,0]`、`S[1,1]` |
+| **Memory 3** | `S[1,3]` | `C_bf16[0,2/3].r1` | `B[1,H,K1]` | **`vmcnt(10)`** | `P1 → B[2,L,K0]` | `B[2,H,K0] → P1`，load ×1 | **Compute 3** | Packet 0：`C[1,2]`累加K1，完成<br>Packet 1：`C[1,3]`累加K1，完成 | **无** | — |
+
+M0保护上一N S2/S3，首N末拍无store所以5而深稳态7；BK192双VMEM改变年龄，不能写7/7/7/7。
+
+#### N≥2：完整稳态
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[n,0]` | `C_bf16[n−1,0/1].r0` | `B[n,L,K0]` | **`vmcnt(7)`** | `P0 → B[n,L,K1]` | `B[n,H,K1] → P0`，load ×2 | **Compute 0** | Packet 0：`C[n,0]`清零＋K0贡献<br>Packet 1：`C[n,1]`清零＋K0贡献 | **`C_bf16[n−1,2]`**与packet 0交织<br>**`C_bf16[n−1,3]`**与packet 1交织 | **`S[n−1,2]`、`S[n−1,3]`** |
+| **Memory 1** | `S[n,1]` | `C_bf16[n−1,0/1].r1` | `B[n,L,K1]` | **`vmcnt(10)`** | `P1 → B[n,H,K0]` | `B[n+1,L,K0] → P1`，load ×1 | **Compute 1** | Packet 0：`C[n,0]`累加K1，完成<br>Packet 1：`C[n,1]`累加K1，完成 | **无** | — |
+| **Memory 2** | `S[n,2]` | `C_bf16[n−1,2/3].r0` | `B[n,H,K0]` | **`vmcnt(7)`** | `P0 → B[n,H,K1]` | `B[n+1,L,K1] → P0`，load ×2 | **Compute 2** | Packet 0：`C[n,2]`清零＋K0贡献<br>Packet 1：`C[n,3]`清零＋K0贡献 | `C_bf16[n,0]`与packet 0交织<br>`C_bf16[n,1]`与packet 1交织 | `S[n,0]`、`S[n,1]` |
+| **Memory 3** | `S[n,3]` | `C_bf16[n−1,2/3].r1` | `B[n,H,K1]` | **`vmcnt(10)`** | `P1 → B[n+1,L,K0]` | `B[n+1,H,K0] → P1`，load ×1 | **Compute 3** | Packet 0：`C[n,2]`累加K1，完成<br>Packet 1：`C[n,3]`累加K1，完成 | **无** | — |
+
+#### 交接与尾部
+
+只有Compute0/2各pack两份，与packet0/1交织，模板仍是BK128 16-MFMA，不移到BK192拍。正常Memory同K256，B packet0后store前**K0 lgkmcnt4、K1 lgkmcnt6**；首M0和首M1交接前另lgkmcnt0，不能依赖晚Compute尾wait。足够长末N前3拍**7/10/6**，末M3无B提交/pack消费者，账本63且不发VM wait；后vmcnt0补C2/C3全部回写。共享循环独立N0/N1/末N，短N裁去越界。源码：[K320](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_k320.py)。
+
+<a id="pipeline-k384"></a>
+
+### 2.5 K384：Prologue、N=0、N=1、稳态与尾部
+
+3个K128，每N六拍Q[6n..6n+5]=L/K0、L/K1、L/K2、H/K0、H/K1、H/K2。每Compute两个16-MFMA packet，共32MFMA/wave，B预取每份load×1。
+
+#### Prologue
+
+| 启动部分 | Memory侧：加载／准备 | Memory侧：等待与提交 | Compute侧／C状态 |
+|---|---|---|---|
+| 元数据与行scale | sorted IDs、expert、routing与activation scale | 元数据／LDS同步 | 尚未计算C |
+| 首B与A | `B[0,L,K0] → P0`；gather K0/K1/K2的A到VGPR | A跨N复用 | 尚未计算C |
+| 首B落LDS | 使用刚加载的P0 | `vmcnt(4)` → LDS槽0的`B[0,L,K0]` | 尚未计算C |
+| 两个预取种子 | `B[0,L,K1] → P0`；**`B[0,L,K2] → P1`** | `vmcnt(1)` → barrier | FP32累加区清零；无旧BF16 |
+
+首M0读Q0、提交Q1、发Q3=H/K0；**Q2是L/K2**。
+
+#### N=0
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[0,0]` | **无** | `B[0,L,K0]` | **`vmcnt(2)`** | `P0 → B[0,L,K1]` | `B[0,H,K0] → P0` | **Compute 0** | Packet 0：`C[0,0]`从0计算K0贡献<br>Packet 1：`C[0,1]`从0计算K0贡献 | **无** | — |
+| **Memory 1** | `S[0,1]` | **无** | `B[0,L,K1]` | `vmcnt(5)` | `P1 → B[0,L,K2]` | `B[0,H,K1] → P1` | **Compute 1** | Packet 0：`C[0,0]`累加K1<br>Packet 1：`C[0,1]`累加K1 | **无** | — |
+| **Memory 2** | `S[0,2]` | **无** | `B[0,L,K2]` | `vmcnt(5)` | `P0 → B[0,H,K0]` | `B[0,H,K2] → P0` | **Compute 2** | Packet 0：`C[0,0]`累加K2，完成<br>Packet 1：`C[0,1]`累加K2，完成 | `C_bf16[0,0]`<br>与packet 1交织 | `S[0,0]` |
+| **Memory 3** | `S[0,3]` | **无** | `B[0,H,K0]` | `vmcnt(5)` | `P1 → B[0,H,K1]` | `B[1,L,K0] → P1` | **Compute 3** | Packet 0：`C[0,2]`清零＋K0贡献<br>Packet 1：`C[0,3]`清零＋K0贡献 | `C_bf16[0,1]`<br>与packet 0交织 | `S[0,1]` |
+| **Memory 4** | **无** | **无** | `B[0,H,K1]` | `vmcnt(3)` | `P0 → B[0,H,K2]` | `B[1,L,K1] → P0` | **Compute 4** | Packet 0：`C[0,2]`累加K1<br>Packet 1：`C[0,3]`累加K1 | **无** | — |
+| **Memory 5** | **无** | **无** | `B[0,H,K2]` | `vmcnt(1)` | `P1 → B[1,L,K0]` | `B[1,L,K2] → P1` | **Compute 5** | Packet 0：`C[0,2]`累加K2，完成<br>Packet 1：`C[0,3]`累加K2，完成 | `C_bf16[0,2]`<br>与packet 1交织 | `S[0,2]` |
+
+N0结束BF16 C0/C1/C2，FP32 C3及S3。
+
+#### N=1
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[1,0]` | `C_bf16[0,0/1].r0` | `B[1,L,K0]` | **`vmcnt(5)`** | `P0 → B[1,L,K1]` | `B[1,H,K0] → P0` | **Compute 0** | Packet 0：`C[1,0]`清零＋K0贡献<br>Packet 1：`C[1,1]`清零＋K0贡献 | **`C_bf16[0,3]`**<br>与packet 0交织 | **`S[0,3]`** |
+| **Memory 1** | `S[1,1]` | `C_bf16[0,0/1].r1` | `B[1,L,K1]` | `vmcnt(9)` | `P1 → B[1,L,K2]` | `B[1,H,K1] → P1` | **Compute 1** | Packet 0：`C[1,0]`累加K1<br>Packet 1：`C[1,1]`累加K1 | **无** | — |
+| **Memory 2** | `S[1,2]` | `C_bf16[0,2/3].r0` | `B[1,L,K2]` | `vmcnt(9)` | `P0 → B[1,H,K0]` | `B[1,H,K2] → P0` | **Compute 2** | Packet 0：`C[1,0]`累加K2，完成<br>Packet 1：`C[1,1]`累加K2，完成 | `C_bf16[1,0]`<br>与packet 1交织 | `S[1,0]` |
+| **Memory 3** | `S[1,3]` | `C_bf16[0,2/3].r1` | `B[1,H,K0]` | `vmcnt(9)` | `P1 → B[1,H,K1]` | `B[2,L,K0] → P1` | **Compute 3** | Packet 0：`C[1,2]`清零＋K0贡献<br>Packet 1：`C[1,3]`清零＋K0贡献 | `C_bf16[1,1]`<br>与packet 0交织 | `S[1,1]` |
+| **Memory 4** | **无** | **无** | `B[1,H,K1]` | `vmcnt(5)` | `P0 → B[1,H,K2]` | `B[2,L,K1] → P0` | **Compute 4** | Packet 0：`C[1,2]`累加K1<br>Packet 1：`C[1,3]`累加K1 | **无** | — |
+| **Memory 5** | **无** | **无** | `B[1,H,K2]` | `vmcnt(1)` | `P1 → B[2,L,K0]` | `B[2,L,K2] → P1` | **Compute 5** | Packet 0：`C[1,2]`累加K2，完成<br>Packet 1：`C[1,3]`累加K2，完成 | `C_bf16[1,2]`<br>与packet 1交织 | `S[1,2]` |
+
+N1等待已同深稳态，不照搬K256首拍5/深7。
+
+#### N≥2：完整稳态
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[n,0]` | `C_bf16[n−1,0/1].r0` | `B[n,L,K0]` | **`vmcnt(5)`** | `P0 → B[n,L,K1]` | `B[n,H,K0] → P0` | **Compute 0** | Packet 0：`C[n,0]`清零＋K0贡献<br>Packet 1：`C[n,1]`清零＋K0贡献 | **`C_bf16[n−1,3]`**<br>与packet 0交织 | **`S[n−1,3]`** |
+| **Memory 1** | `S[n,1]` | `C_bf16[n−1,0/1].r1` | `B[n,L,K1]` | `vmcnt(9)` | `P1 → B[n,L,K2]` | `B[n,H,K1] → P1` | **Compute 1** | Packet 0：`C[n,0]`累加K1<br>Packet 1：`C[n,1]`累加K1 | **无** | — |
+| **Memory 2** | `S[n,2]` | `C_bf16[n−1,2/3].r0` | `B[n,L,K2]` | `vmcnt(9)` | `P0 → B[n,H,K0]` | `B[n,H,K2] → P0` | **Compute 2** | Packet 0：`C[n,0]`累加K2，完成<br>Packet 1：`C[n,1]`累加K2，完成 | `C_bf16[n,0]`<br>与packet 1交织 | `S[n,0]` |
+| **Memory 3** | `S[n,3]` | `C_bf16[n−1,2/3].r1` | `B[n,H,K0]` | `vmcnt(9)` | `P1 → B[n,H,K1]` | `B[n+1,L,K0] → P1` | **Compute 3** | Packet 0：`C[n,2]`清零＋K0贡献<br>Packet 1：`C[n,3]`清零＋K0贡献 | `C_bf16[n,1]`<br>与packet 0交织 | `S[n,1]` |
+| **Memory 4** | **无** | **无** | `B[n,H,K1]` | `vmcnt(5)` | `P0 → B[n,H,K2]` | `B[n+1,L,K1] → P0` | **Compute 4** | Packet 0：`C[n,2]`累加K1<br>Packet 1：`C[n,3]`累加K1 | **无** | — |
+| **Memory 5** | **无** | **无** | `B[n,H,K2]` | `vmcnt(1)` | `P1 → B[n+1,L,K0]` | `B[n+1,L,K2] → P1` | **Compute 5** | Packet 0：`C[n,2]`累加K2，完成<br>Packet 1：`C[n,3]`累加K2，完成 | `C_bf16[n,2]`<br>与packet 1交织 | `S[n,2]` |
+
+#### 奇数KS、scale与尾部
+
+LDS槽`(3n+k_stage)&1`随N翻转，P仍按`s&1`选择；L/K2和H/K0可在同槽不同N64区域。上一N的Compute 5准备2读+2写共**4个完整lane地址**，包含实际partition，跨回边携带。Scale只在Memory 0–3加载；Compute 0/2/3/5分别pack旧C3、当前C0/C1/C2。S0用于Compute 2，S2用于Compute 5，S3留到下一N，不能逐拍替换。Memory 4/5无scale/store；回写在B packet0读后用`lgkmcnt(4)`，VM等待同时保护B提交和本拍scale。足够长PTPC末N为**5/9/9/9/4/7**，末拍无下一B仍有pack；后`vmcnt(0)`只补C3并回写末N，短N可合并冗余等待，不能当统一ISA模板。
+
+<a id="pipeline-k512"></a>
+
+### 2.6 K512：Prologue、N=0、N=1、稳态与尾部
+
+4个K128，每N八拍，先L/K0..K3再H/K0..K3；每Compute两个16-MFMA packet，非一次完整K512，每N256MFMA/wave，B每份load×1。
+
+#### Prologue
+
+| 启动部分 | Memory侧：加载／准备 | Memory侧：等待与提交 | Compute侧／C状态 |
+|---|---|---|---|
+| 元数据与行scale | sorted IDs、expert、routing与activation scale | 元数据／LDS同步 | 尚未计算C |
+| 首B与A | `B[0,L,K0] → P0`；gather K0/K1/K2/K3的A到VGPR | A跨N复用 | 尚未计算C |
+| 首B落LDS | 使用刚加载的P0 | `vmcnt(4)` → LDS槽0的`B[0,L,K0]` | 尚未计算C |
+| 两个预取种子 | `B[0,L,K1] → P0`；`B[0,L,K2] → P1` | `vmcnt(1)` → barrier | FP32累加区清零；无旧BF16 |
+
+首M0预取Q3=L/K3，H/K0到M1才预取。
+
+#### N=0
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[0,0]` | **无** | `B[0,L,K0]` | **`vmcnt(2)`** | `P0 → B[0,L,K1]` | `B[0,L,K3] → P0` | **Compute 0** | Packet 0：`C[0,0]`从0计算K0贡献<br>Packet 1：`C[0,1]`从0计算K0贡献 | **无** | — |
+| **Memory 1** | `S[0,1]` | **无** | `B[0,L,K1]` | `vmcnt(5)` | `P1 → B[0,L,K2]` | `B[0,H,K0] → P1` | **Compute 1** | Packet 0：`C[0,0]`累加K1<br>Packet 1：`C[0,1]`累加K1 | **无** | — |
+| **Memory 2** | `S[0,2]` | **无** | `B[0,L,K2]` | `vmcnt(5)` | `P0 → B[0,L,K3]` | `B[0,H,K1] → P0` | **Compute 2** | Packet 0：`C[0,0]`累加K2<br>Packet 1：`C[0,1]`累加K2 | **无** | — |
+| **Memory 3** | `S[0,3]` | **无** | `B[0,L,K3]` | `vmcnt(5)` | `P1 → B[0,H,K0]` | `B[0,H,K2] → P1` | **Compute 3** | Packet 0：`C[0,0]`累加K3，完成<br>Packet 1：`C[0,1]`累加K3，完成 | `C_bf16[0,0]`<br>与packet 1交织 | `S[0,0]` |
+| **Memory 4** | **无** | **无** | `B[0,H,K0]` | `vmcnt(3)` | `P0 → B[0,H,K1]` | `B[0,H,K3] → P0` | **Compute 4** | Packet 0：`C[0,2]`清零＋K0贡献<br>Packet 1：`C[0,3]`清零＋K0贡献 | `C_bf16[0,1]`<br>与packet 0交织 | `S[0,1]` |
+| **Memory 5** | **无** | **无** | `B[0,H,K1]` | `vmcnt(1)` | `P1 → B[0,H,K2]` | `B[1,L,K0] → P1` | **Compute 5** | Packet 0：`C[0,2]`累加K1<br>Packet 1：`C[0,3]`累加K1 | **无** | — |
+| **Memory 6** | **无** | **无** | `B[0,H,K2]` | `vmcnt(1)` | `P0 → B[0,H,K3]` | `B[1,L,K1] → P0` | **Compute 6** | Packet 0：`C[0,2]`累加K2<br>Packet 1：`C[0,3]`累加K2 | **无** | — |
+| **Memory 7** | **无** | **无** | `B[0,H,K3]` | `vmcnt(1)` | `P1 → B[1,L,K0]` | `B[1,L,K2] → P1` | **Compute 7** | Packet 0：`C[0,2]`累加K3，完成<br>Packet 1：`C[0,3]`累加K3，完成 | `C_bf16[0,2]`<br>与packet 1交织 | `S[0,2]` |
+
+N0结束BF16 C0/C1/C2，FP32 C3及S3。
+
+#### N=1
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[1,0]` | `C_bf16[0,0/1].r0` | `B[1,L,K0]` | **`vmcnt(5)`** | `P0 → B[1,L,K1]` | `B[1,L,K3] → P0` | **Compute 0** | Packet 0：`C[1,0]`清零＋K0贡献<br>Packet 1：`C[1,1]`清零＋K0贡献 | **`C_bf16[0,3]`**<br>与packet 0交织 | **`S[0,3]`** |
+| **Memory 1** | `S[1,1]` | `C_bf16[0,0/1].r1` | `B[1,L,K1]` | `vmcnt(9)` | `P1 → B[1,L,K2]` | `B[1,H,K0] → P1` | **Compute 1** | Packet 0：`C[1,0]`累加K1<br>Packet 1：`C[1,1]`累加K1 | **无** | — |
+| **Memory 2** | `S[1,2]` | `C_bf16[0,2/3].r0` | `B[1,L,K2]` | `vmcnt(9)` | `P0 → B[1,L,K3]` | `B[1,H,K1] → P0` | **Compute 2** | Packet 0：`C[1,0]`累加K2<br>Packet 1：`C[1,1]`累加K2 | **无** | — |
+| **Memory 3** | `S[1,3]` | `C_bf16[0,2/3].r1` | `B[1,L,K3]` | `vmcnt(9)` | `P1 → B[1,H,K0]` | `B[1,H,K2] → P1` | **Compute 3** | Packet 0：`C[1,0]`累加K3，完成<br>Packet 1：`C[1,1]`累加K3，完成 | `C_bf16[1,0]`<br>与packet 1交织 | `S[1,0]` |
+| **Memory 4** | **无** | **无** | `B[1,H,K0]` | `vmcnt(5)` | `P0 → B[1,H,K1]` | `B[1,H,K3] → P0` | **Compute 4** | Packet 0：`C[1,2]`清零＋K0贡献<br>Packet 1：`C[1,3]`清零＋K0贡献 | `C_bf16[1,1]`<br>与packet 0交织 | `S[1,1]` |
+| **Memory 5** | **无** | **无** | `B[1,H,K1]` | `vmcnt(1)` | `P1 → B[1,H,K2]` | `B[2,L,K0] → P1` | **Compute 5** | Packet 0：`C[1,2]`累加K1<br>Packet 1：`C[1,3]`累加K1 | **无** | — |
+| **Memory 6** | **无** | **无** | `B[1,H,K2]` | `vmcnt(1)` | `P0 → B[1,H,K3]` | `B[2,L,K1] → P0` | **Compute 6** | Packet 0：`C[1,2]`累加K2<br>Packet 1：`C[1,3]`累加K2 | **无** | — |
+| **Memory 7** | **无** | **无** | `B[1,H,K3]` | `vmcnt(1)` | `P1 → B[2,L,K0]` | `B[2,L,K2] → P1` | **Compute 7** | Packet 0：`C[1,2]`累加K3，完成<br>Packet 1：`C[1,3]`累加K3，完成 | `C_bf16[1,2]`<br>与packet 1交织 | `S[1,2]` |
+
+#### N≥2：完整稳态
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[n,0]` | `C_bf16[n−1,0/1].r0` | `B[n,L,K0]` | **`vmcnt(5)`** | `P0 → B[n,L,K1]` | `B[n,L,K3] → P0` | **Compute 0** | Packet 0：`C[n,0]`清零＋K0贡献<br>Packet 1：`C[n,1]`清零＋K0贡献 | **`C_bf16[n−1,3]`**<br>与packet 0交织 | **`S[n−1,3]`** |
+| **Memory 1** | `S[n,1]` | `C_bf16[n−1,0/1].r1` | `B[n,L,K1]` | `vmcnt(9)` | `P1 → B[n,L,K2]` | `B[n,H,K0] → P1` | **Compute 1** | Packet 0：`C[n,0]`累加K1<br>Packet 1：`C[n,1]`累加K1 | **无** | — |
+| **Memory 2** | `S[n,2]` | `C_bf16[n−1,2/3].r0` | `B[n,L,K2]` | `vmcnt(9)` | `P0 → B[n,L,K3]` | `B[n,H,K1] → P0` | **Compute 2** | Packet 0：`C[n,0]`累加K2<br>Packet 1：`C[n,1]`累加K2 | **无** | — |
+| **Memory 3** | `S[n,3]` | `C_bf16[n−1,2/3].r1` | `B[n,L,K3]` | `vmcnt(9)` | `P1 → B[n,H,K0]` | `B[n,H,K2] → P1` | **Compute 3** | Packet 0：`C[n,0]`累加K3，完成<br>Packet 1：`C[n,1]`累加K3，完成 | `C_bf16[n,0]`<br>与packet 1交织 | `S[n,0]` |
+| **Memory 4** | **无** | **无** | `B[n,H,K0]` | `vmcnt(5)` | `P0 → B[n,H,K1]` | `B[n,H,K3] → P0` | **Compute 4** | Packet 0：`C[n,2]`清零＋K0贡献<br>Packet 1：`C[n,3]`清零＋K0贡献 | `C_bf16[n,1]`<br>与packet 0交织 | `S[n,1]` |
+| **Memory 5** | **无** | **无** | `B[n,H,K1]` | `vmcnt(1)` | `P1 → B[n,H,K2]` | `B[n+1,L,K0] → P1` | **Compute 5** | Packet 0：`C[n,2]`累加K1<br>Packet 1：`C[n,3]`累加K1 | **无** | — |
+| **Memory 6** | **无** | **无** | `B[n,H,K2]` | `vmcnt(1)` | `P0 → B[n,H,K3]` | `B[n+1,L,K1] → P0` | **Compute 6** | Packet 0：`C[n,2]`累加K2<br>Packet 1：`C[n,3]`累加K2 | **无** | — |
+| **Memory 7** | **无** | **无** | `B[n,H,K3]` | `vmcnt(1)` | `P1 → B[n+1,L,K0]` | `B[n+1,L,K2] → P1` | **Compute 7** | Packet 0：`C[n,2]`累加K3，完成<br>Packet 1：`C[n,3]`累加K3，完成 | `C_bf16[n,2]`<br>与packet 1交织 | `S[n,2]` |
+
+#### 八拍与尾部
+
+LDS槽`(4n+k_stage)&1=k_stage&1`不随N翻转；两个16KiB B槽+CShuffle16KiB=48KiB，P每拍轮换，不是四个B常驻。N0 wait为**2/5/5/5/3/1/1/1**，N1/steady为**5/9/9/9/5/1/1/1**；只有前4个Memory有scale/store，不恢复legacy +4。Compute 0 pack旧C3，Compute 3/4/7分别pack当前C0/C1/C2；C0到K3归约完成后才在独立packet1间隙pack，没有减少贡献。足够长PTPC末N为**5/9/9/9/5/1/0/9**，末拍仍保护C2的scale消费者；最后三个Memory无越界Q[q+3]，后`vmcnt(0)`补C3并完整回写。
+
+<a id="pipeline-k640"></a>
+
+### 2.7 K640：Prologue、N=0、N=1、稳态与尾部
+
+5个K128、每N十拍，先L/K0..K4再H/K0..K4。Compute32MFMA/wave，每N320；**stage4仍L、stage5才H**，scale/旧回写已在前4拍安排。
+
+#### Prologue
+
+| 启动部分 | Memory侧：加载／准备 | Memory侧：等待与提交 | Compute侧／C状态 |
+|---|---|---|---|
+| 元数据与行scale | sorted IDs、expert、routing与activation scale | 元数据／LDS同步 | 尚未计算C |
+| 首B与A | `B[0,L,K0] → P0`；gather K0..K4的A到VGPR | 五段A跨N复用 | 尚未计算C |
+| 首B落LDS | 使用刚加载的P0 | `vmcnt(4)` → LDS槽0的`B[0,L,K0]` | 尚未计算C |
+| 两个预取种子 | `B[0,L,K1] → P0`；`B[0,L,K2] → P1` | `vmcnt(1)` → barrier | FP32累加区清零；无旧BF16 |
+
+M0发Q3=L/K3，M1发Q4=L/K4，M2才H/K0。
+
+#### N=0
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[0,0]` | **无** | `B[0,L,K0]` | **`vmcnt(2)`** | `P0 → B[0,L,K1]` | `B[0,L,K3] → P0` | **Compute 0** | Packet 0：`C[0,0]`从0计算K0贡献<br>Packet 1：`C[0,1]`从0计算K0贡献 | **无** | — |
+| **Memory 1** | `S[0,1]` | **无** | `B[0,L,K1]` | `vmcnt(5)` | `P1 → B[0,L,K2]` | `B[0,L,K4] → P1` | **Compute 1** | Packet 0：`C[0,0]`累加K1<br>Packet 1：`C[0,1]`累加K1 | **无** | — |
+| **Memory 2** | `S[0,2]` | **无** | `B[0,L,K2]` | `vmcnt(5)` | `P0 → B[0,L,K3]` | `B[0,H,K0] → P0` | **Compute 2** | Packet 0：`C[0,0]`累加K2<br>Packet 1：`C[0,1]`累加K2 | **无** | — |
+| **Memory 3** | `S[0,3]` | **无** | `B[0,L,K3]` | `vmcnt(5)` | `P1 → B[0,L,K4]` | `B[0,H,K1] → P1` | **Compute 3** | Packet 0：`C[0,0]`累加K3<br>Packet 1：`C[0,1]`累加K3 | **无** | — |
+| **Memory 4** | **无** | **无** | `B[0,L,K4]` | `vmcnt(3)` | `P0 → B[0,H,K0]` | `B[0,H,K2] → P0` | **Compute 4** | Packet 0：`C[0,0]`累加K4，完成<br>Packet 1：`C[0,1]`累加K4，完成 | `C_bf16[0,0]`<br>与packet 1交织 | `S[0,0]` |
+| **Memory 5** | **无** | **无** | `B[0,H,K0]` | `vmcnt(1)` | `P1 → B[0,H,K1]` | `B[0,H,K3] → P1` | **Compute 5** | Packet 0：`C[0,2]`清零＋K0贡献<br>Packet 1：`C[0,3]`清零＋K0贡献 | `C_bf16[0,1]`<br>与packet 0交织 | `S[0,1]` |
+| **Memory 6** | **无** | **无** | `B[0,H,K1]` | `vmcnt(1)` | `P0 → B[0,H,K2]` | `B[0,H,K4] → P0` | **Compute 6** | Packet 0：`C[0,2]`累加K1<br>Packet 1：`C[0,3]`累加K1 | **无** | — |
+| **Memory 7** | **无** | **无** | `B[0,H,K2]` | `vmcnt(1)` | `P1 → B[0,H,K3]` | `B[1,L,K0] → P1` | **Compute 7** | Packet 0：`C[0,2]`累加K2<br>Packet 1：`C[0,3]`累加K2 | **无** | — |
+| **Memory 8** | **无** | **无** | `B[0,H,K3]` | `vmcnt(1)` | `P0 → B[0,H,K4]` | `B[1,L,K1] → P0` | **Compute 8** | Packet 0：`C[0,2]`累加K3<br>Packet 1：`C[0,3]`累加K3 | **无** | — |
+| **Memory 9** | **无** | **无** | `B[0,H,K4]` | `vmcnt(1)` | `P1 → B[1,L,K0]` | `B[1,L,K2] → P1` | **Compute 9** | Packet 0：`C[0,2]`累加K4，完成<br>Packet 1：`C[0,3]`累加K4，完成 | `C_bf16[0,2]`<br>与packet 1交织 | `S[0,2]` |
+
+N0结束BF16 C0/C1/C2、FP32 C3与S3。
+
+#### N=1
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[1,0]` | `C_bf16[0,0/1].r0` | `B[1,L,K0]` | **`vmcnt(5)`** | `P0 → B[1,L,K1]` | `B[1,L,K3] → P0` | **Compute 0** | Packet 0：`C[1,0]`清零＋K0贡献<br>Packet 1：`C[1,1]`清零＋K0贡献 | **`C_bf16[0,3]`**<br>与packet 0交织 | **`S[0,3]`** |
+| **Memory 1** | `S[1,1]` | `C_bf16[0,0/1].r1` | `B[1,L,K1]` | `vmcnt(9)` | `P1 → B[1,L,K2]` | `B[1,L,K4] → P1` | **Compute 1** | Packet 0：`C[1,0]`累加K1<br>Packet 1：`C[1,1]`累加K1 | **无** | — |
+| **Memory 2** | `S[1,2]` | `C_bf16[0,2/3].r0` | `B[1,L,K2]` | `vmcnt(9)` | `P0 → B[1,L,K3]` | `B[1,H,K0] → P0` | **Compute 2** | Packet 0：`C[1,0]`累加K2<br>Packet 1：`C[1,1]`累加K2 | **无** | — |
+| **Memory 3** | `S[1,3]` | `C_bf16[0,2/3].r1` | `B[1,L,K3]` | `vmcnt(9)` | `P1 → B[1,L,K4]` | `B[1,H,K1] → P1` | **Compute 3** | Packet 0：`C[1,0]`累加K3<br>Packet 1：`C[1,1]`累加K3 | **无** | — |
+| **Memory 4** | **无** | **无** | `B[1,L,K4]` | `vmcnt(5)` | `P0 → B[1,H,K0]` | `B[1,H,K2] → P0` | **Compute 4** | Packet 0：`C[1,0]`累加K4，完成<br>Packet 1：`C[1,1]`累加K4，完成 | `C_bf16[1,0]`<br>与packet 1交织 | `S[1,0]` |
+| **Memory 5** | **无** | **无** | `B[1,H,K0]` | `vmcnt(1)` | `P1 → B[1,H,K1]` | `B[1,H,K3] → P1` | **Compute 5** | Packet 0：`C[1,2]`清零＋K0贡献<br>Packet 1：`C[1,3]`清零＋K0贡献 | `C_bf16[1,1]`<br>与packet 0交织 | `S[1,1]` |
+| **Memory 6** | **无** | **无** | `B[1,H,K1]` | `vmcnt(1)` | `P0 → B[1,H,K2]` | `B[1,H,K4] → P0` | **Compute 6** | Packet 0：`C[1,2]`累加K1<br>Packet 1：`C[1,3]`累加K1 | **无** | — |
+| **Memory 7** | **无** | **无** | `B[1,H,K2]` | `vmcnt(1)` | `P1 → B[1,H,K3]` | `B[2,L,K0] → P1` | **Compute 7** | Packet 0：`C[1,2]`累加K2<br>Packet 1：`C[1,3]`累加K2 | **无** | — |
+| **Memory 8** | **无** | **无** | `B[1,H,K3]` | `vmcnt(1)` | `P0 → B[1,H,K4]` | `B[2,L,K1] → P0` | **Compute 8** | Packet 0：`C[1,2]`累加K3<br>Packet 1：`C[1,3]`累加K3 | **无** | — |
+| **Memory 9** | **无** | **无** | `B[1,H,K4]` | `vmcnt(1)` | `P1 → B[2,L,K0]` | `B[2,L,K2] → P1` | **Compute 9** | Packet 0：`C[1,2]`累加K4，完成<br>Packet 1：`C[1,3]`累加K4，完成 | `C_bf16[1,2]`<br>与packet 1交织 | `S[1,2]` |
+
+#### N≥2：完整稳态
+
+| **Memory Stage** | **Scale load ×2** | **CShuffle → C_bf16 store ×2** | **B：LDS→VGPR** | **VM等待** | **B：VGPR→LDS提交** | **B：Global→VGPR预取** | **Compute Stage** | **FP32累加** | **Pack生成的BF16结果** | **Pack使用的scale** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Memory 0** | `S[n,0]` | `C_bf16[n−1,0/1].r0` | `B[n,L,K0]` | **`vmcnt(5)`** | `P0 → B[n,L,K1]` | `B[n,L,K3] → P0` | **Compute 0** | Packet 0：`C[n,0]`清零＋K0贡献<br>Packet 1：`C[n,1]`清零＋K0贡献 | **`C_bf16[n−1,3]`**<br>与packet 0交织 | **`S[n−1,3]`** |
+| **Memory 1** | `S[n,1]` | `C_bf16[n−1,0/1].r1` | `B[n,L,K1]` | `vmcnt(9)` | `P1 → B[n,L,K2]` | `B[n,L,K4] → P1` | **Compute 1** | Packet 0：`C[n,0]`累加K1<br>Packet 1：`C[n,1]`累加K1 | **无** | — |
+| **Memory 2** | `S[n,2]` | `C_bf16[n−1,2/3].r0` | `B[n,L,K2]` | `vmcnt(9)` | `P0 → B[n,L,K3]` | `B[n,H,K0] → P0` | **Compute 2** | Packet 0：`C[n,0]`累加K2<br>Packet 1：`C[n,1]`累加K2 | **无** | — |
+| **Memory 3** | `S[n,3]` | `C_bf16[n−1,2/3].r1` | `B[n,L,K3]` | `vmcnt(9)` | `P1 → B[n,L,K4]` | `B[n,H,K1] → P1` | **Compute 3** | Packet 0：`C[n,0]`累加K3<br>Packet 1：`C[n,1]`累加K3 | **无** | — |
+| **Memory 4** | **无** | **无** | `B[n,L,K4]` | `vmcnt(5)` | `P0 → B[n,H,K0]` | `B[n,H,K2] → P0` | **Compute 4** | Packet 0：`C[n,0]`累加K4，完成<br>Packet 1：`C[n,1]`累加K4，完成 | `C_bf16[n,0]`<br>与packet 1交织 | `S[n,0]` |
+| **Memory 5** | **无** | **无** | `B[n,H,K0]` | `vmcnt(1)` | `P1 → B[n,H,K1]` | `B[n,H,K3] → P1` | **Compute 5** | Packet 0：`C[n,2]`清零＋K0贡献<br>Packet 1：`C[n,3]`清零＋K0贡献 | `C_bf16[n,1]`<br>与packet 0交织 | `S[n,1]` |
+| **Memory 6** | **无** | **无** | `B[n,H,K1]` | `vmcnt(1)` | `P0 → B[n,H,K2]` | `B[n,H,K4] → P0` | **Compute 6** | Packet 0：`C[n,2]`累加K1<br>Packet 1：`C[n,3]`累加K1 | **无** | — |
+| **Memory 7** | **无** | **无** | `B[n,H,K2]` | `vmcnt(1)` | `P1 → B[n,H,K3]` | `B[n+1,L,K0] → P1` | **Compute 7** | Packet 0：`C[n,2]`累加K2<br>Packet 1：`C[n,3]`累加K2 | **无** | — |
+| **Memory 8** | **无** | **无** | `B[n,H,K3]` | `vmcnt(1)` | `P0 → B[n,H,K4]` | `B[n+1,L,K1] → P0` | **Compute 8** | Packet 0：`C[n,2]`累加K3<br>Packet 1：`C[n,3]`累加K3 | **无** | — |
+| **Memory 9** | **无** | **无** | `B[n,H,K4]` | `vmcnt(1)` | `P1 → B[n+1,L,K0]` | `B[n+1,L,K2] → P1` | **Compute 9** | Packet 0：`C[n,2]`累加K4，完成<br>Packet 1：`C[n,3]`累加K4，完成 | `C_bf16[n,2]`<br>与packet 1交织 | `S[n,2]` |
+
+#### 十拍与尾部
+
+LDS槽`(5n+k_stage)&1`随N翻转，上一N的Compute 9准备4个读/写lane地址跨回边；L/K4与H/K0可在同槽不同半区，不按`s&1`猜LDS。Scale/旧store仅在Memory 0–3；Compute 0 pack旧C3，Compute 4/5/9分别pack当前C0/C1/C2；**Compute 4没有新scale却使用保留的S0**。N0 wait为**2/5/5/5/3/1/1/1/1/1**，N1/steady为**5/9/9/9/5/1/1/1/1/1**；后六拍仍有B/MFMA。足够长PTPC末N为**5/9/9/9/5/1/1/1/0/11**，末拍C2仍有scale消费者，后`vmcnt(0)`补C3完整回写；11不推广到稳态或其它K。
+
+K384/512/640共用[主原语](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py)、[流程](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_nloop.py)、[事件账本](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_schedule.py)。
+
+<a id="pipeline-boundaries"></a>
+
+### 2.8 非PTPC、短N及compact边界
+
+非PTPC权重（per_tensor/per_tensor或per_tensor/ptpc）**pack事件、B FIFO、C回写结构不变**，只是weight scalar在prologue融合行scale，不发逐N S[n,j] VMEM。每份pack由40降24 VALU，不少MFMA。
+
+| K分支 | per-tensor权重：N=0实际逻辑wait | N=1过渡wait | 深稳态wait | 最后N账本（足够长循环） |
+|---|---|---|---|---|
+| K192 | `2/2` | `6/10` | `10/10` | `8/63` |
+| K256 | `0/1/1/1` | `3/5/5/5` | `5/5/5/5` | `5/5/4/63` |
+| K320 | `1/2/1/2` | `3/6/5/6` | `5/6/5/6` | `5/6/4/63` |
+| K384 | `0/1/1/1/1/1` | `3/5/5/5/3/1` | `3/5/5/5/3/1` | `3/5/5/5/2/63` |
+| K512 | `0/1/1/1/1/1/1/1` | `3/5/5/5/3/1/1/1` | `3/5/5/5/3/1/1/1` | `3/5/5/5/3/1/0/63` |
+| K640 | `0/1/1/1/1/1/1/1/1/1` | `3/5/5/5/3/1/1/1/1/1` | `3/5/5/5/3/1/1/1/1/1` | `3/5/5/5/3/1/1/1/0/63` |
+
+63是无当前VM消费者的哨兵，不是等63条、不能省LDS；是否发VM wait看实际guard，最后仍vmcnt0。单/双N按真实T生成，不能截深循环末N阈值。
+
+| 路径 | 动态循环前 | 短N／尾部 | 最终补pack |
+|---|---|---|---|
+| K192独立 | N0/N1独立，按下N/下下N裁剪 | 最后两N独立；T<4展开；n_loop0全展开，1/2为每回边N数 | C2/C3 |
+| K256/320/384/512/640共享 | 独立首M0/C0，再N0和完整N1 | 最后N独立；普通builder T<3不用共享回边；n_loop0实际展开，1/2保持pack/FIFO | K320 C2/C3，其余C3 |
+
+只有q+1<2KS·T才提交、q+3<2KS·T才预取；取消越界B不取消当前pack消费者。展开路径可能已被更早严格wait保护，不能强塞共享尾拍冗余wait，错相/退出barrier仍须平衡。
+
+compact M256 full沿用上述同K流水，从M64 metadata任务表读取`[physical_row_begin, expert_id]`及count，保持physical行编号，不改pack/K宽度。**构表→full→M64 tail**同stream，无host count读回；N%256=0时tail1x4，否则default，K192/K320 full的192归约不改变tail既有BK128。见[组合launcher与任务表](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_compact.py)。
+
+<a id="resources"></a>
+
+### 2.9 2026-09-09原pack资源记录
+
+**实际归档产物，非delayed/formal、非活跃槽模型、非本次重构fresh编译。** 源码/ISA/ELF身份见各证据，保留不同descriptor字段原值。
+
+| 项目 | 统计口径 |
+|---|---|
+| 环境 | gfx942/MI308X、FlyDSL0.3.2，离线拓扑输入4XCC/80CU；不由理论峰值推资源。 |
+| ordinary | M256×N128、512 threads/8 waves、n_loop1、store_cache2、padding128B、非task-table，K192/K320真实归约。 |
+| PTPC | weight/activation均PTPC，N2048/TopK8；不是块编号N0/N1。 |
+| per-tensor | 双per_tensor，N4096/TopK9；与PTPC的N/TopK不同，不仅量化影响资源。 |
+| VGPR/SGPR | ELF metadata vgpr_count/sgpr_count；每lane32-bit VGPR槽、wave共享SGPR，非WG合计或stage瞬时live值。 |
+| next_free | ISA descriptor字段，与metadata分列；ordinary next_free_sgpr全部96，不是metadata全96。 |
+| LDS | group_segment_fixed_size，每WG字节，1KiB=1024B。 |
+| 静态ISA | 完整kernel机器指令，含prologue/回边/drain，非源码行或动态计数。 |
+| 回边ISA | end−begin+1含回跳，默认一次一个N128，非完整kernel条数。 |
+| spill/scratch | ordinary及compact均VGPR/SGPR spill=0、private=0、scratch指令0、metadata AGPR=0。 |
+
+#### ordinary PTPC／N2048／TopK8
+
+| K分支 | VGPR（metadata） | SGPR（metadata） | `next_free_vgpr` | LDS KiB | 静态ISA条数 | 回边ISA条数 | 资源证据 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| K192 | 214 | 36 | 214 | 64 | 2062 | 365 | [K192 PTPC](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k192_ptpc/result.json) |
+| K256 | 176 | 38 | 176 | 48 | 1989 | 433 | [K256 PTPC](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k256_ptpc/result.json) |
+| K320 | 214 | 37 | 214 | 56 | 2191 | 473 | [K320 PTPC](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k320_ptpc/result.json) |
+| K384 | 202 | 38 | 202 | 48 | 2447 | 545 | [K384 PTPC](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k384_ptpc/result.json) |
+| K512 | 220 | 38 | 220 | 48 | 2866 | 646 | [K512 PTPC](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k512_ptpc/result.json) |
+| K640 | 244 | 38 | 244 | 48 | 3331 | 762 | [K640 PTPC](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k640_ptpc/result.json) |
+
+#### ordinary per-tensor／N4096／TopK9
+
+| K分支 | VGPR（metadata） | SGPR（metadata） | `next_free_vgpr` | LDS KiB | 静态ISA条数 | 回边ISA条数 | 资源证据 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| K192 | 176 | 34 | 176 | 64 | 1675 | 293 | [K192 per-tensor](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k192_per_tensor/result.json) |
+| K256 | **160** | 34 | **169** | 48 | 1657 | 354 | [K256 per-tensor](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k256_per_tensor/result.json) |
+| K320 | 192 | 38 | 192 | 56 | 1854 | 396 | [K320 per-tensor](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k320_per_tensor/result.json) |
+| K384 | 176 | 34 | 176 | 48 | 2128 | 472 | [K384 per-tensor](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k384_per_tensor/result.json) |
+| K512 | 188 | 34 | 188 | 48 | 2546 | 571 | [K512 per-tensor](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k512_per_tensor/result.json) |
+| K640 | 212 | 34 | 212 | 48 | 3021 | 688 | [K640 per-tensor](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/initial_k640_per_tensor/result.json) |
+
+K256标量metadata VGPR160/next_free169两者保留，不凭差值猜spill/驻留。mixed的activation gather/行scale仍可不同，不套per-tensor资源。
+
+| K | B LDS | CShuffle LDS | 合计 |
+|---|---|---:|---:|
+| K192 | 2×128×192=49152B | 16384B | 65536B/64KiB |
+| K320 | 16384+24576=40960B | 16384B | 57344B/56KiB |
+| K256/K384/K512/K640 | 2×128×128=32768B | 16384B | 49152B/48KiB |
+
+sorted IDs启动复用既有LDS，不另驻buffer；增K不把全部B放LDS，仍两槽，完整A常驻VGPR。跨N C份数之外还有A/B/scale/地址等，不能据此线性推VGPR。12ordinary归档默认steady Memory均无VALU，不是无寄存器live或无wait；[原FIFO等价审计](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/final_audited.json)绑定版本。
+
+#### compact full/tail分列（12个kernel），构表另计
+
+顺序三个launch，不能将资源相加当一WG。共同gfx942、TopK4/E256、padding32B、阈值0.6；mixed=per_tensor weight+PTPC activation，u=n_loop、cache=store_cache，配置不同不是单因素比较。
+
+| K/配置 | u/cache | kernel | metadata VGPR | metadata SGPR | LDS KiB | 静态ISA | 证据 |
+|---|---|---|---:|---:|---:|---:|---|
+| K192/N768/PTPC | 1/2 | M256 full | 214 | 34 | 64 | 2061 | [K192](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k192_n768_ptpc_u1_after/result.json) |
+| K192/N768/PTPC | 1/2 | M64 tail 1x4 | 190 | 31 | 21 | 648 | [K192](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k192_n768_ptpc_u1_after/result.json) |
+| K256/N640/mixed | 2/0 | M256 full | 154 | 34 | 48 | 2016 | [K256](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k256_n640_mixed_u2_after/result.json) |
+| K256/N640/mixed | 2/0 | M64 tail default | 128 | 36 | 16 | 632 | [K256](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k256_n640_mixed_u2_after/result.json) |
+| K320/N768/mixed | 2/0 | M256 full | 188 | 35 | 56 | 2637 | [K320](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k320_n768_mixed_u2_after/result.json) |
+| K320/N768/mixed | 2/0 | M64 tail 1x4 | 158 | 31 | 28 | 719 | [K320](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k320_n768_mixed_u2_after/result.json) |
+| K384/N640/per-tensor | 0/2 | M256 full | 174 | 34 | 48 | 2554 | [K384](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k384_n640_per_tensor_u0_after/result.json) |
+| K384/N640/per-tensor | 0/2 | M64 tail default | 176 | 36 | 24 | 781 | [K384](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k384_n640_per_tensor_u0_after/result.json) |
+| K512/N768/per-tensor | 1/2 | M256 full | 188 | 34 | 48 | 2547 | [K512](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k512_n768_per_tensor_u1_after/result.json) |
+| K512/N768/per-tensor | 1/2 | M64 tail 1x4 | 204 | 31 | 40 | 852 | [K512](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k512_n768_per_tensor_u1_after/result.json) |
+| K640/N768/mixed | 2/2 | M256 full | 216 | 31 | 48 | 4378 | [K640](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k640_n768_mixed_u2_after/result.json) |
+| K640/N768/mixed | 2/2 | M64 tail 1x4 | 212 | 31 | 48 | 1077 | [K640](../../../../tests/contrib/moe/results/cleanup_8x1_20260909/compact/k640_n768_mixed_u2_after/result.json) |
+
+六组构表相同：**20VGPR/28SGPR/4KiB LDS/544静态ISA**、256threads，next_free_sgpr22非metadata28。full512threads、tail256threads，full/tail next_free_sgpr96，全零private/spill/scratch。compact VGPR字段：K256 full metadata/next_free=154/169；K320 tail158/169；K512/640 tail204/257、212/257。next_free257不直接等于每lane可分配257或spill，须看完整descriptor/架构。
+
+这些24行ordinary/full/tail+构表是特定源码/编译器/shape/选项事实，不是任意N/mixed/n_loop0/2/compact统一上限，不能只据表推occupancy/MFMA busy/性能；本次无新测量。
+
+<a id="optimizations"></a>
+
+## 三、重要优化
+
+### 3.1 确实现有的机制
+
+| 优化 | 当前机制和限制 |
+|---|---|
+| 8-wave反相 | 512线程/两4-wave组，scalar条件及barrier一代位移，memory优先级0/compute3；一组VMEM/LDS/CShuffle、另一组MFMA+原pack。16KiB scratch错相复用，不能半组提前退出或宣称每cycle完全重叠。 |
+| 两P槽消费FIFO | 启动LDS Q0、P中Q1/Q2；正常读Q[q]、提交Q[q+1]、发Q[q+3]，Q[q+2]在另P，提前跨计算窗。wait含已发store，同时约束B/scale消费者，非统一放宽9。 |
+| A驻留/真实K | 每wave两M16完整A只gather一次跨N；行scale提前融合。K192整192、K320 128+192避免补零和小stage，BK128多块仍两B LDS槽，不按K线性推寄存器。 |
+| 原pack/scalar FMA/perm | 每N四N32 super-record各含r0/r1，在独立MFMA packet交织pack，不保留两套完整FP32 C。PTPC每份16weight FMA+16行scale/bias FMA+8perm=40VALU，scalar权重先融合后16FMA+8perm=24；用v_fma_f32/v_perm_b32，禁packed-fp32-ops。pack不是store，VMEM/DS/store不混入MFMA train；模板的最多3条独立VALU不是FP8实测时序保证。 |
+| CShuffle plane xor/read2 | 128bit写，source-group低位移到相隔2KiB plane，row/pair xor分bank；仅配同一输出行两8B读，让后端read2st64_b64避免跨行v_mov。B packet0先读→partial LDS wait→store→packet1读，BK128用4、192用6。模型payload、ISA、PMC不同，源码不保证所有shape零bank。 |
+| Nloop1 | 默认每回边一个N128，剥离N0/N1/尾部，回边只steady；保存B carry、未pack C/scale、BF16和必要地址。0为全展开、2两N；少展开体积不自动等于快。 |
+| 地址提前准备 | 均匀N/K/wave偏移走scalar buffer offset，lane和C读指针提前，K192跨N5完整地址、K384/640四地址；12归档ordinary steady Memory无VALU，不意味Compute无地址或任意配置相同。copy offset须区分元素/字节。 |
+| compact平衡 | 每expert单连续run，顺序不必排序；保留physical行。原full F、实际CU U、r=F mod U，仅0<5r<3U把全局full后缀r个M256拆4r个M64，r0不拆；counts为full×256、tail×64，容量包含拆分，device guard、无host读回。launch开销可能抵消padding收益，逐shape选。 |
+| cache/64-thread sum | builder缓存包含设备/静态参数，task缓存也含CU/阈值。store_cache2为aux（源码SLC），ISA修饰以产物为准不猜命中。sorted_sum每token64线程，先TopK位置、128bit BF16读、FP32按TopK累加转BF16，stride含padding；inverse仅valid前缀并查token/topk边界，避免未写区域。 |
+
+不把旧pure/K128/BK64、Memory-pack/delayed/formal或direct-to-LDS实验当当前实现，早期实验原字节仍归档；收益仅认对应run，不以指令数变少代替wall-time证据。
+
+
+
+
+
+
+
+
 
