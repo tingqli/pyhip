@@ -7,7 +7,7 @@ from pyhip.contrib.gluon.fused_mlp import mlp_fused_gate_up
 
 #####################################################################
 from pyhip import cudaPerf, calc_diff
-from common.utils import gen_timing
+from pyhip.contrib.gluon.utils import gen_timing
 from torch import Tensor
 import pytest
 
