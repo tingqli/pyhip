@@ -183,7 +183,7 @@ def flydsl_moe_gemm_8wave_down(
             input_q,
             (16, k // 16, num_tokens * topk),
             fx.Int32,
-            as_buffer=True,
+            as_buffer=False,
         )
         output_data = ptr_to_tensor(
             output,
@@ -294,13 +294,14 @@ def flydsl_moe_gemm_8wave_down(
                     output_rows[mi] = output_row
 
                 for mi in range_constexpr(num_mma_m):
-                    for kb in range_constexpr(num_mma_k):
-                        for step in range_constexpr(2):
-                            a_mma_frag_w[None, step, mi, kb] = input_data[
-                                None,
-                                lane_div16 + (kb * 128 + step * 64) // 16,
-                                output_rows[mi],
-                            ].load()
+                    if valid_rows[mi]:
+                        for kb in range_constexpr(num_mma_k):
+                            for step in range_constexpr(2):
+                                a_mma_frag_w[None, step, mi, kb] = input_data[
+                                    None,
+                                    lane_div16 + (kb * 128 + step * 64) // 16,
+                                    output_rows[mi],
+                                ].load()
 
                 for mi in range_constexpr(num_mma_m):
                     for kb in range_constexpr(num_mma_k):
