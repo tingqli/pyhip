@@ -20,7 +20,6 @@ from test_moe_mxfp8_mxfp4_gateup_4w import (
     compile_moe_gateup_4w,
 )
 
-
 A_INPUT_SCALE = 0.33
 B_INPUT_SCALE = 0.2
 AITER_TILE_M = 128
@@ -28,7 +27,8 @@ AITER_TILE_N = 256
 AITER_TILE_K = 256
 
 
-#python ./test_moe.py --tokens 49152  --gate-up-size 2048  --hidden-size 6144 --topk 8 --experts 384  --warmup 5 --iterations 30 --data-clones 15 --pyhip-group-size-m 8
+# python ./test_moe.py --tokens 49152  --gate-up-size 2048  --hidden-size 6144 --topk 8 --experts 384  --warmup 5 --iterations 30 --data-clones 15 --pyhip-group-size-m 8
+
 
 def div_up(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
@@ -42,21 +42,13 @@ def make_balanced_topk(
     if not 0 < topk <= experts:
         raise ValueError("topk must be in [1, experts]")
     num_routes = tokens * topk
-    expert_permutation = torch.randperm(
-        experts, device="cuda", dtype=torch.int64
+    expert_permutation = torch.randperm(experts, device="cuda", dtype=torch.int64)
+    route_indices = torch.arange(num_routes, device="cuda", dtype=torch.int64)
+    topk_ids = (
+        expert_permutation[route_indices % experts].to(torch.int32).view(tokens, topk)
     )
-    route_indices = torch.arange(
-        num_routes, device="cuda", dtype=torch.int64
-    )
-    topk_ids = expert_permutation[route_indices % experts].to(
-        torch.int32
-    ).view(tokens, topk)
-    topk_weights = torch.ones(
-        (tokens, topk), device="cuda", dtype=torch.float32
-    )
-    counts = torch.bincount(
-        topk_ids.view(-1).to(torch.int64), minlength=experts
-    )
+    topk_weights = torch.ones((tokens, topk), device="cuda", dtype=torch.float32)
+    counts = torch.bincount(topk_ids.view(-1).to(torch.int64), minlength=experts)
     if int(counts.max() - counts.min()) > 1:
         raise AssertionError("routing is not balanced")
     if topk > 1:
@@ -106,9 +98,7 @@ def prepare_case(
     if hidden_size < 512 or hidden_size % 256 != 0:
         raise ValueError("hidden_size must be a multiple of 256 and at least 512")
 
-    topk_ids, topk_weights, route_counts = make_balanced_topk(
-        tokens, topk, experts
-    )
+    topk_ids, topk_weights, route_counts = make_balanced_topk(tokens, topk, experts)
     aiter_routing = sort_routes(
         topk_ids,
         topk_weights,
@@ -124,10 +114,10 @@ def prepare_case(
         SORT_BLOCK_M,
     )
 
-
-    a_source = torch.randn(
-        (tokens, hidden_size), device="cuda", dtype=torch.bfloat16
-    ) * A_INPUT_SCALE
+    a_source = (
+        torch.randn((tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
+        * A_INPUT_SCALE
+    )
     a_aiter, aiter_scale_a = fused_dynamic_mxfp8_quant_moe_sort(
         a_source,
         sorted_ids=aiter_routing[0],
@@ -149,11 +139,14 @@ def prepare_case(
     torch.testing.assert_close(a_aiter, a_pyhip, rtol=0, atol=0)
     del a_source, a_pyhip
 
-    weight_source = torch.randn(
-        (experts * gate_up_size, hidden_size),
-        device="cuda",
-        dtype=torch.bfloat16,
-    ) * B_INPUT_SCALE
+    weight_source = (
+        torch.randn(
+            (experts * gate_up_size, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * B_INPUT_SCALE
+    )
     weight, scale_b_raw = per_1x32_mx_quant_hip(
         weight_source,
         quant_dtype=dtypes.fp4x2,
@@ -162,9 +155,7 @@ def prepare_case(
     )
     del weight_source
     weight = weight.view(experts, gate_up_size, hidden_size // 2)
-    scale_b_raw = scale_b_raw.view(
-        experts, gate_up_size, hidden_size // 32
-    )
+    scale_b_raw = scale_b_raw.view(experts, gate_up_size, hidden_size // 32)
 
     aiter_weight = shuffle_weight_a16w4(weight, 16, True)
     aiter_scale_b = shuffle_scale_a16w4(
@@ -182,9 +173,7 @@ def prepare_case(
     )
     scale_b_padded[:, :gate_up_size].copy_(scale_b_raw.view(torch.uint8))
     pyhip_scale_b = _permute_scale(
-        scale_b_padded.view(
-            experts * scale_b_rows_per_expert, hidden_size // 32
-        )
+        scale_b_padded.view(experts * scale_b_rows_per_expert, hidden_size // 32)
     )
 
     return {
@@ -317,9 +306,7 @@ def benchmark(
             verbose=0,
         ) as perf:
             run(arg_sets[clone_index])
-        samples.append(
-            (perf.dt() * 1.0e6, perf.tflops(), perf.bw())
-        )
+        samples.append((perf.dt() * 1.0e6, perf.tflops(), perf.bw()))
     samples.sort(key=lambda sample: sample[0])
     return samples[0], samples[len(samples) // 2]
 
@@ -337,9 +324,7 @@ def run_case(
     pyhip_xcd_swizzle: bool,
     pyhip_group_size_m: int,
 ):
-    data = prepare_case(
-        tokens, gate_up_size, hidden_size, topk, experts
-    )
+    data = prepare_case(tokens, gate_up_size, hidden_size, topk, experts)
     route_counts = data["route_counts"]
     print(
         f"routing: routes={tokens * topk} experts={experts} "
@@ -358,9 +343,7 @@ def run_case(
     )
     aiter_check_args = make_aiter_args(data, clone=False)
     pyhip_check_args = make_pyhip_args(data, clone=False)
-    pyhip_kernel = flyc.compile[{"opt_level": 2}](
-        pyhip_launcher, *pyhip_check_args
-    )
+    pyhip_kernel = flyc.compile[{"opt_level": 2}](pyhip_launcher, *pyhip_check_args)
     run_aiter_stage1(aiter_check_args, data, aiter_xcd_swizzle)
     pyhip_kernel(*pyhip_check_args)
     torch.cuda.synchronize()
@@ -387,15 +370,12 @@ def run_case(
         input_bytes = sorted_tokens * hidden_size
         weight_bytes = experts * gate_up_size * hidden_size // 2
         scale_bytes = (
-            sorted_tokens * hidden_size
-            + experts * gate_up_size * hidden_size
+            sorted_tokens * hidden_size + experts * gate_up_size * hidden_size
         ) // 32
         output_bytes = tokens * topk * gate_up_size
         return input_bytes + weight_bytes + scale_bytes + output_bytes
 
-    aiter_arg_sets = [
-        make_aiter_args(data, clone=True) for _ in range(data_clones)
-    ]
+    aiter_arg_sets = [make_aiter_args(data, clone=True) for _ in range(data_clones)]
     aiter_best, aiter_median = benchmark(
         "aiter_stage1",
         lambda args: run_aiter_stage1(args, data, aiter_xcd_swizzle),
@@ -408,9 +388,7 @@ def run_case(
     del aiter_arg_sets
     torch.cuda.empty_cache()
 
-    pyhip_arg_sets = [
-        make_pyhip_args(data, clone=True) for _ in range(data_clones)
-    ]
+    pyhip_arg_sets = [make_pyhip_args(data, clone=True) for _ in range(data_clones)]
     pyhip_best, pyhip_median = benchmark(
         "pyhip_a8w4_stage1",
         lambda args: pyhip_kernel(*args),
@@ -443,22 +421,26 @@ def run_case(
         f"ratio: latency={pyhip_median[0] / aiter_median[0]:.3f}x "
         f"throughput={pyhip_median[1] / aiter_median[1]:.3%}"
     )
-    return aiter_median, pyhip_median
+    return aiter_median, pyhip_median, aiter_best, pyhip_best
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare AIter and PyHIP A8W4 MoE stage1 kernels"
     )
     parser.add_argument(
-        "--tokens", type=int, nargs="+", default=(12288, 24576)
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=(8192, 16384, 24576, 12288, 24576, 49152),
     )
-    parser.add_argument("--gate-up-size", type=int, default=256)
+    parser.add_argument("--gate-up-size", type=int, default=512)
     parser.add_argument("--hidden-size", type=int, default=6144)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=31)
-    parser.add_argument("--data-clones", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--data-clones", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--aiter-xcd-swizzle", type=int, default=8)
     parser.add_argument("--pyhip-group-size-m", type=int, default=4)
@@ -491,7 +473,7 @@ def main() -> None:
             f"clones={args.data_clones} warmup={args.warmup} "
             f"iterations={args.iterations}"
         )
-        aiter_median, pyhip_median = run_case(
+        aiter_median, pyhip_median, aiter_best, pyhip_best = run_case(
             tokens,
             args.gate_up_size,
             args.hidden_size,
@@ -504,16 +486,19 @@ def main() -> None:
             args.pyhip_xcd_swizzle,
             args.pyhip_group_size_m,
         )
-        results.append((tokens, aiter_median, pyhip_median))
+        results.append((tokens, aiter_median, pyhip_median, aiter_best, pyhip_best))
         torch.cuda.empty_cache()
 
     print("\nmedian summary")
-    for tokens, aiter_median, pyhip_median in results:
+    for tokens, aiter_median, pyhip_median, aiter_best, pyhip_best in results:
         print(
             f"M={tokens:5d} N={args.gate_up_size} K={args.hidden_size:5d} "
             f"aiter={aiter_median[0]:8.3f} us "
             f"pyhip={pyhip_median[0]:8.3f} us "
-            f"pyhip/aiter={pyhip_median[0] / aiter_median[0]:.3f}x"
+            f"pyhip/aiter={pyhip_median[0] / aiter_median[0]:.3f}x "
+            f"aiter_best={aiter_best[0]:8.3f} us "
+            f"pyhip_best={pyhip_best[0]:8.3f} us "
+            f"pyhip_best/aiter_best={pyhip_best[0] / aiter_best[0]:.3f}x"
         )
 
 
