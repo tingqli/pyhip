@@ -25,6 +25,7 @@ def _build_moe_gemm2_8x1_compact(
     assert BLOCK_TILE_SIZE_M == 64 and BLOCK_TILE_SIZE_N == 128
     assert METADATA_TILE_SIZE_M in (None, 64)
     assert E is not None and 0 < E <= 2048
+    assert K in (192, 256, 320, 384, 512, 640), "8x1_compact仅支持K=192/256/320/384/512/640"
     assert N > 0 and N % 128 == 0
     assert down_output_padding_bytes in (0, 32, 64, 128)
     common = dict(

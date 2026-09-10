@@ -9,6 +9,7 @@ from functools import cache
 def packing_events(k, stage, first=False, k_widths=None):
     """返回(packet, previous-N, super-record)，不是当前MFMA的输出分片。"""
     assert k != 192, "K192 uses the independent BK192 helper"
+    assert k in (256, 320, 384, 512, 640), "shared 8x1 schedule不支持该K"
     assert k_widths == (128, 192) if k == 320 else k_widths is None
     ks = (k + 127) // 128
     if k == 320:
@@ -30,6 +31,7 @@ def packing_events(k, stage, first=False, k_widths=None):
 
 def output_quarter(k, stage, k_widths=None):
     assert k != 192, "K192 uses the independent BK192 helper"
+    assert k in (256, 320, 384, 512, 640), "shared 8x1 schedule不支持该K"
     assert k_widths == (128, 192) if k == 320 else k_widths is None
     return stage if stage < 4 else None
 
@@ -43,8 +45,7 @@ def vmem_wait_schedule(k, n_tiles, ptpc=True, rolling=True, relax=True, k_widths
     pure保留原保守阈值；其scale在退休点显式wait(0)，不按rolling推断。
     K192使用独立BK192账本；K320必须显式传入唯一分块(128, 192)。
     """
-    assert k in (128, 256, 320, 384, 512, 640) and n_tiles >= 1
-    assert k != 128 or not rolling
+    assert k in (256, 320, 384, 512, 640) and n_tiles >= 1, "shared 8x1 schedule不支持该K或N块数"
     assert k_widths == (128, 192) if k == 320 else k_widths is None
     widths = k_widths or tuple(min(128, k - 128 * i) for i in range((k + 127) // 128))
     ks, events, requests, scales = len(widths), [], {}, {}
@@ -86,33 +87,4 @@ def vmem_wait_schedule(k, n_tiles, ptpc=True, rolling=True, relax=True, k_widths
         else:
             result.append(budget if relax and rolling else old)
         request(q + 2)
-    return tuple(result)
-
-
-@cache
-def k128_vmem_wait_schedule(n_tiles, ptpc=True, relax=True):
-    events, requests, scales, result = [], {}, {0: -1}, []
-
-    def issue(n, micro):
-        if n < n_tiles:
-            events.append(("B", n, micro))
-            requests[n, micro] = len(events) - 1
-
-    issue(1, 0)
-    issue(1, 1)
-    for q in range(2 * n_tiles):
-        n, micro = divmod(q, 2)
-        required = [requests[n + 1, micro]] if n + 1 < n_tiles else []
-        if ptpc and q > 0:
-            scale = scales[n - 1 if micro == 0 else n]
-            if scale >= 0:
-                required.append(scale)
-        budget = min((len(events) - 1 - index for index in required), default=63)
-        result.append(budget if relax else int(micro == 0 or n + 2 < n_tiles))
-        issue(n + 2, micro)
-        if ptpc and q > 0 and micro == 0:
-            events.extend([("scale", n)] * 4)
-            scales[n] = len(events) - 1
-        if q >= 3:
-            events.extend([("store", n, micro)] * 4)
     return tuple(result)

@@ -60,7 +60,7 @@ def _build_moe_gemm2_8x1(
     if METADATA_TILE_SIZE_M is None:
         METADATA_TILE_SIZE_M = BLOCK_TILE_SIZE_M
     assert METADATA_TILE_SIZE_M == BLOCK_TILE_SIZE_M
-    assert K in (128, 192, 256, 320, 384, 512, 640)
+    assert K in (192, 256, 320, 384, 512, 640), "8x1仅支持K=192/256/320/384/512/640"
     if tile_k is None:
         tile_k = 192 if K in (192, 320) else 128
     assert tile_k == 128 or (K in (192, 320) and tile_k == 192), "8x1仅保留K192整块192、K320的128+192，其余K使用BK128"
@@ -95,15 +95,6 @@ def _build_moe_gemm2_8x1(
         )
 
     assert K % tile_k == 0
-    if K == 128 and os.environ.get("MOE_8X1_ROLLING_EPILOGUE", "1") != "0":
-        from .gemm2_8x1_k128 import _build_moe_gemm2_8x1_k128
-
-        return _build_moe_gemm2_8x1_k128(
-            N, TOPK, down_output_padding_bytes,
-            weight_quant_type=weight_quant_type, act_quant_type=act_quant_type,
-            _task_table=_task_table, _n_loop=_n_loop,
-            _store_cache=_store_cache, _relax_vmcnt=_relax_vmcnt,
-        )
 
     BLOCK_M = BLOCK_TILE_SIZE_M
     BLOCK_N = BLOCK_TILE_SIZE_N
@@ -121,17 +112,12 @@ def _build_moe_gemm2_8x1(
     WEIGHT_QUARTER_ATOMS = WEIGHT_HALF_ATOMS // 2
     WEIGHT_COPY_ROUNDS_PER_GROUP = WEIGHT_HALF_ATOMS // 256
     OUTPUT_STORES_PER_WAVE = WAVE_M * BLOCK_N * 2 // (64 * 16)
-    CSHUFFLE_RECORDS_PER_ROW = BLOCK_N // 8
     CSHUFFLE_N_PAIRS = BLOCK_N // 32
     output_row_stride = N + down_output_padding_bytes // 2
-    ROLLING_EPILOGUE = (
-        (DEDICATED_K256 or DEDICATED_K512 or DEDICATED_K640 or SPECIALIZED_ROLLING)
-        and os.environ.get("MOE_8X1_ROLLING_EPILOGUE", "1") != "0"
-    )
+    ROLLING_EPILOGUE = os.environ.get("MOE_8X1_ROLLING_EPILOGUE", "1") != "0"
     use_n_loop = bool(_n_loop and N_TILES >= 3)
-    if K != 128:
-        from .gemm2_8x1_schedule import vmem_wait_schedule
-        vmem_budgets = vmem_wait_schedule(K, N_TILES, weight_quant_type == "ptpc", ROLLING_EPILOGUE, _relax_vmcnt)
+    from .gemm2_8x1_schedule import vmem_wait_schedule
+    vmem_budgets = vmem_wait_schedule(K, N_TILES, weight_quant_type == "ptpc", ROLLING_EPILOGUE, _relax_vmcnt)
     CSHUFFLE_WAVES = 4
     down_ops = fxh.FlyObjCache()
     topology_enabled, xcc_count = get_down_device_config()
@@ -640,8 +626,6 @@ def _build_moe_gemm2_8x1(
             )
             lane_group = lane_id // 16
             lane_row = lane_id % 16
-            row_in_8 = lane_row % 8
-            row_half = lane_row // 8
             local_wave = wave_id % CSHUFFLE_WAVES
             wave_lds_base = local_wave * (16 * BLOCK_N)
             output_destination_offsets = []
@@ -789,19 +773,29 @@ def _build_moe_gemm2_8x1(
                     for chunks in packed_records
                 ]
 
+            def cshuffle_plane_offset(row, group, pair):
+                # BF16元素偏移；source-group低位移到2KiB plane，保持128bit写。
+                return ((row & 1) * 8 + ((group & 2) ^ (row & 2)) * 8
+                        + ((pair & 1) ^ ((row >> 2) & 1)) * 32 + (pair >> 1) * 64
+                        + (row >> 3) * 128 + (row & 6) * 128 + (group & 1) * 1024)
+
+            # C读地址不随N/row_pair改变；完整地址固定，防止常量行偏移沉入memory。
+            cshuffle_read_pointers = []
+            for n_half in range_constexpr(2):
+                for output_row_half in range_constexpr(2):
+                    output_atom = n_half * 8 + lane_id % 8
+                    n_group = output_atom // 2
+                    offset = (wave_lds_base + cshuffle_plane_offset(
+                        output_row_half * 8 + lane_id // 8, (output_atom % 2) * 2, n_group // 2)
+                        + (n_group % 2) * 4)
+                    pointer = fx.get_iter(cshuffle_lds) + offset
+                    address = fx.Int32(llvm.inline_asm(ir.IntegerType.get_signless(32),
+                        [_raw(fx.Int32(fx.ptrtoint(pointer)))], "", "=v,0", has_side_effects=True))
+                    cshuffle_read_pointers.append(fx.inttoptr(pointer.type, address))
+
             def write_cshuffle_row_pair(packed_records):
                 for n_pair in range_constexpr(CSHUFFLE_N_PAIRS):
-                    logical_record = n_pair * 4 + lane_group
-                    physical_record = logical_record ^ row_in_8
-                    lds_offset = (
-                        wave_lds_base
-                        + (
-                            (row_half * 8 + row_in_8)
-                            * CSHUFFLE_RECORDS_PER_ROW
-                            + physical_record
-                        )
-                        * 8
-                    )
+                    lds_offset = wave_lds_base + cshuffle_plane_offset(lane_row, lane_group, n_pair)
                     destination = fx.make_view(
                         fx.get_iter(cshuffle_lds) + lds_offset,
                         fx.make_layout(8, 1),
@@ -820,17 +814,7 @@ def _build_moe_gemm2_8x1(
                         n_half * (CSHUFFLE_N_PAIRS // 2)
                         + local_n_pair
                     )
-                    logical_record = n_pair * 4 + lane_group
-                    physical_record = logical_record ^ row_in_8
-                    lds_offset = (
-                        wave_lds_base
-                        + (
-                            (row_half * 8 + row_in_8)
-                            * CSHUFFLE_RECORDS_PER_ROW
-                            + physical_record
-                        )
-                        * 8
-                    )
+                    lds_offset = wave_lds_base + cshuffle_plane_offset(lane_row, lane_group, n_pair)
                     destination = fx.make_view(
                         fx.get_iter(cshuffle_lds) + lds_offset,
                         fx.make_layout(8, 1),
@@ -846,110 +830,43 @@ def _build_moe_gemm2_8x1(
                 destinations = []
                 for n_half in range_constexpr(2):
                     for output_row_half in range_constexpr(2):
-                        output_atom = n_half * 8 + lane_id % 8
-                        n_group = output_atom // 2
-                        n_pair = n_group // 2
-                        chunk_half = n_group % 2
-                        lane_group_begin = (output_atom % 2) * 2
                         fragment_pair = []
                         for source_group in range_constexpr(2):
-                            logical_record = (
-                                n_pair * 4
-                                + lane_group_begin
-                                + source_group
-                            )
-                            physical_record = (
-                                logical_record ^ (lane_id // 8)
-                            )
-                            lds_offset = (
-                                wave_lds_base
-                                + (
-                                    (
-                                        output_row_half * 8
-                                        + lane_id // 8
-                                    )
-                                    * CSHUFFLE_RECORDS_PER_ROW
-                                    + physical_record
-                                )
-                                * 8
-                                + chunk_half * 4
-                            )
-                            source = fx.make_view(
-                                fx.get_iter(cshuffle_lds) + lds_offset,
-                                fx.make_layout(4, 1),
-                            )
+                            source = fx.make_view(cshuffle_read_pointers[2 * n_half + output_row_half] + source_group * 1024,
+                                                  fx.make_layout(4, 1))
                             fragment = fx.make_fragment_like(source)
                             fx.copy(cshuffle_read_atom, source, fragment)
                             fragment_pair.append(fragment)
+                        fx.rocdl.sched_barrier(0)
                         output_fragments.append(fragment_pair)
                         destination_index = (
                             n_half * 2 + output_row_half
                         )
-                        destinations.append(
-                            fx.make_view(
-                                fx.get_iter(output_tensor)
-                                + output_destination_offsets[row_pair][
-                                    destination_index
-                                ]
-                                + block_n * BLOCK_N,
-                                fx.make_layout(8, 1),
-                            )
-                        )
+                        destinations.append((block_n, fx.make_view(
+                            fx.get_iter(output_tensor) + output_destination_offsets[row_pair][destination_index],
+                            fx.make_layout(8, 1))))
                 return output_fragments, destinations
 
             def issue_read_cshuffle_quarter(block_n, row_pair, n_half):
                 output_fragments = []
                 destinations = []
                 for output_row_half in range_constexpr(2):
-                    output_atom = n_half * 8 + lane_id % 8
-                    n_group = output_atom // 2
-                    n_pair = n_group // 2
-                    chunk_half = n_group % 2
-                    lane_group_begin = (output_atom % 2) * 2
                     fragment_pair = []
                     for source_group in range_constexpr(2):
-                        logical_record = (
-                            n_pair * 4
-                            + lane_group_begin
-                            + source_group
-                        )
-                        physical_record = (
-                            logical_record ^ (lane_id // 8)
-                        )
-                        lds_offset = (
-                            wave_lds_base
-                            + (
-                                (
-                                    output_row_half * 8
-                                    + lane_id // 8
-                                )
-                                * CSHUFFLE_RECORDS_PER_ROW
-                                + physical_record
-                            )
-                            * 8
-                            + chunk_half * 4
-                        )
-                        source = fx.make_view(
-                            fx.get_iter(cshuffle_lds) + lds_offset,
-                            fx.make_layout(4, 1),
-                        )
+                        source = fx.make_view(cshuffle_read_pointers[2 * n_half + output_row_half] + source_group * 1024,
+                                              fx.make_layout(4, 1))
                         fragment = fx.make_fragment_like(source)
                         fx.copy(cshuffle_read_atom, source, fragment)
                         fragment_pair.append(fragment)
+                    # 只合并同一输出行的两段8B，避免跨行配对产生额外搬运。
+                    fx.rocdl.sched_barrier(0)
                     output_fragments.append(fragment_pair)
                     destination_index = (
                         n_half * 2 + output_row_half
                     )
-                    destinations.append(
-                        fx.make_view(
-                            fx.get_iter(output_tensor)
-                            + output_destination_offsets[row_pair][
-                                destination_index
-                            ]
-                            + block_n * BLOCK_N,
-                            fx.make_layout(8, 1),
-                        )
-                    )
+                    destinations.append((block_n, fx.make_view(
+                        fx.get_iter(output_tensor) + output_destination_offsets[row_pair][destination_index],
+                        fx.make_layout(8, 1))))
                 return output_fragments, destinations
 
             def store_cshuffle_read_results(
@@ -973,20 +890,29 @@ def _build_moe_gemm2_8x1(
                     output_fragment.store(
                         first.shuffle(second, list(range(8)))
                     )
-                    fx.copy(
-                        output_store_atom,
-                        output_fragment,
-                        destinations[output_index],
-                    )
+                    output_n, destination = destinations[output_index]
+                    fx.copy(output_store_atom, output_fragment, destination, soffset=fx.Int32(output_n * BLOCK_N))
+
+            if const_expr(weight_quant_type == "ptpc"):
+                weight_scale_buffer = fx.rocdl.make_buffer_tensor(
+                    fxh.view_as_torch_tensor(fxh._as_ptr(p_w_scale, fx.Float32) + fx.Int64(expert_id) * N, (N,), fx.Float32),
+                    max_size=False, num_records_bytes=N * 4,
+                )
+
+            def load_weight_scale(block_n, first_column, columns):
+                weight_scale = fx.make_view(fx.get_iter(weight_scale_buffer) + first_column,
+                                            fx.make_layout((columns, BLOCK_M), (1, 0)))
+                # BufferCopy的soffset为元素；128bit保持每quarter的两条dwordx4。
+                copy_atom = down_ops.get_buffer_copy_atom(fx.Float32, 128)
+                fragment = mm.make_fragment_C(weight_scale)
+                fx.copy(copy_atom, down_ops.get_tiled_mma_partition_S(mm, weight_scale, "C", copy_atom_bits=128),
+                        down_ops.get_tiled_mma_retile(mm, fragment, "C", copy_atom=copy_atom),
+                        soffset=fx.Int32(block_n * BLOCK_N))
+                return fragment
 
             def retire_output(block_n):
                 if const_expr(weight_quant_type == "ptpc"):
-                    weight_scale = fx.make_view(
-                        fxh._as_ptr(p_w_scale, fx.Float32)
-                        + fx.Int64(expert_id) * N + block_n * BLOCK_N,
-                        fx.make_layout((BLOCK_N, BLOCK_M), (1, 0)),
-                    )
-                    frag_weight_scale = down_ops.load_tiled_mma_fragC(mm, weight_scale, copy_atom_bits=32)
+                    frag_weight_scale = load_weight_scale(block_n, 0, BLOCK_N)
                 else:
                     frag_weight_scale = fx.Float32(1.0)
                 for row_pair in range_constexpr(WAVE_M // 16):
@@ -1095,13 +1021,7 @@ def _build_moe_gemm2_8x1(
 
             def load_weight_scale_quarter(block_n, n_pair):
                 if const_expr(weight_quant_type == "ptpc"):
-                    weight_scale = fx.make_view(
-                        fxh._as_ptr(p_w_scale, fx.Float32)
-                        + fx.Int64(expert_id) * N + block_n * BLOCK_N
-                        + n_pair * (BLOCK_N // CSHUFFLE_N_PAIRS),
-                        fx.make_layout((BLOCK_N // CSHUFFLE_N_PAIRS, BLOCK_M), (1, 0)),
-                    )
-                    return down_ops.load_tiled_mma_fragC(mm, weight_scale, copy_atom_bits=32)
+                    return load_weight_scale(block_n, n_pair * (BLOCK_N // CSHUFFLE_N_PAIRS), BLOCK_N // CSHUFFLE_N_PAIRS)
                 else:
                     # 保留编译期退休列表形状，不发送逐N的scale VMEM。
                     return fx.Float32(1.0)
@@ -1120,7 +1040,7 @@ def _build_moe_gemm2_8x1(
                 fx.rocdl.sched_barrier(0)
 
             def load_rolling_scales(block_n, stage_in_tile, scale_quarters):
-                # 通用rolling路径在前四stage加载scale；K128使用独立builder。
+                # 通用rolling路径在前四stage加载scale。
                 if const_expr(stage_in_tile < CSHUFFLE_N_PAIRS):
                     scale_quarters.append(
                         load_weight_scale_quarter(block_n, stage_in_tile)
@@ -1320,19 +1240,52 @@ def _build_moe_gemm2_8x1(
             if const_expr(use_n_loop):
                 from .gemm2_8x1_nloop import emit_nloop
 
+                if const_expr(K in (384, 640)):
+                    # 奇数K段使B槽随N翻转；先建立真实lane partition，不能只前置裸槽指针。
+                    b_template = weight_lds_quarter_view(weight_storage_ptrs[0], 0)
+                    b_copy = down_ops.get_universal_copy_atom(fx.Float8E4M3FNUZ, 128)
+                    b_partition = down_ops.get_tiled_mma_partition_S(mm, b_template, "A", copy_atom_bits=128)
+                    b_read_pointer = fx.get_iter(b_partition)
+                    b_write_pointer = (weight_storage_ptrs[0]
+                        + (quarter_atom_index // BLOCK_K) * (16 * BLOCK_K)
+                        + ((quarter_atom_index % BLOCK_K) // 16) * 256
+                        + (quarter_atom_index % 16) * 16)
+
+                def prepare_b_addresses(n):
+                    # 两种相对槽的读/写地址在上一N的compute尾部准备，并跨回边携带。
+                    parity = (n * K_STAGES) & 1
+                    read_base = fx.Int32(fx.ptrtoint(b_read_pointer))
+                    write_base = fx.Int32(fx.ptrtoint(b_write_pointer))
+                    values = [base + fx.Int32(((parity + relative_slot) & 1) * BLOCK_N * BLOCK_K)
+                              for base in (read_base, write_base) for relative_slot in range_constexpr(2)]
+                    return [fx.Int32(llvm.inline_asm(ir.IntegerType.get_signless(32), [_raw(value)],
+                                "", "=v,0", has_side_effects=True)) for value in values]
+
                 def loop_issue(n, ks, half, entry):
                     issue_weight_quarter_load(n, ks, half, entry)
                     return weight_staging[entry]
 
-                def loop_commit(slot, ks, half, entry, fragment):
+                def loop_commit(slot, ks, half, entry, fragment, address=None):
                     weight_staging[entry].store(fragment.load())
-                    commit_weight_quarter(slot, half, entry)
+                    if const_expr(address is not None):
+                        base = fx.inttoptr(b_write_pointer.type, address)
+                        destination = fx.make_view(base + half * (BLOCK_N // 2) * BLOCK_K, fx.make_layout(16, 1))
+                        fx.copy(weight_store_atom, weight_staging[entry], destination)
+                    else:
+                        commit_weight_quarter(slot, half, entry)
 
-                def loop_read(slot, half, ks, quarter):
-                    view = weight_lds_quarter_view(
-                        weight_storage_ptrs[0] + slot * BLOCK_N * BLOCK_K, 2 * half + quarter,
-                    )
-                    return down_ops.load_tiled_mma_fragA(mm, view, copy_atom_bits=128)
+                def loop_read(slot, half, ks, quarter, address=None):
+                    if const_expr(address is not None):
+                        base = fx.inttoptr(b_read_pointer.type, address)
+                        source = fx.make_view(base + (2 * half + quarter) * (BLOCK_N // 4) * BLOCK_K, b_partition.layout)
+                        fragment = mm.make_fragment_A(b_template)
+                        fx.copy(b_copy, source, down_ops.get_tiled_mma_retile(mm, fragment, "A", copy_atom=b_copy))
+                        return fragment
+                    else:
+                        view = weight_lds_quarter_view(
+                            weight_storage_ptrs[0] + slot * BLOCK_N * BLOCK_K, 2 * half + quarter,
+                        )
+                        return down_ops.load_tiled_mma_fragA(mm, view, copy_atom_bits=128)
 
                 def loop_pack(pair, scale):
                     return pack_cshuffle_super_record(frag_c, frag_row_scale, scale, pair)
@@ -1350,6 +1303,7 @@ def _build_moe_gemm2_8x1(
                     issue_packed_output_quarter, store_cshuffle_read_results, loop_mma,
                     clear_super_record, constrain_mfma_valu_packet, _enter_memory_stage,
                     _enter_compute_stage, _stage_end, loop_wait,
+                    prepare_b_addresses=prepare_b_addresses if const_expr(K in (384, 640)) else None,
                 )
             total_half_cores = 1 if use_n_loop else TOTAL_CORES * 2
             for half_core in range_constexpr(1, total_half_cores):

@@ -1367,7 +1367,7 @@ def test_acc_fly_splitk_2s_down_4x1(
     )
 
 
-@pytest.mark.parametrize("inter_size", [128, 192, 256, 320, 384, 512, 640])
+@pytest.mark.parametrize("inter_size", [192, 256, 320, 384, 512, 640])
 @pytest.mark.parametrize("quant_type", ["ptpc", "per_tensor"])
 def test_acc_fly_splitk_2s_down_8x1(monkeypatch, inter_size, quant_type):
     monkeypatch.delenv("MOE_PREFILL_TILE_K", raising=False)

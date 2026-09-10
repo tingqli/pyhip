@@ -424,7 +424,7 @@ def emit_bk192_nloop(
     mma, clear, schedule_pack, priority, stage_end, wait, first_stagger, prepare_b_addresses,
 ):
     budgets = bk192_wait_schedule(n_tiles, ptpc, rolling)
-    body_budgets = tuple(min((budgets[2 * n + half] for n in range(1, n_tiles - 2)), default=63)
+    body_budgets = tuple(min((budgets[2 * n + half] for n in range(2, n_tiles - 2)), default=63)
                          for half in range(2))
 
     def run_tile(n, carries, previous_packed, previous_scales, first, has_next, has_future, addresses):
@@ -480,8 +480,13 @@ def emit_bk192_nloop(
     carries, pending_packed, pending_scales, addresses = run_tile(
         0, prefetched, [], [], True, n_tiles > 1, n_tiles > 2, prepare_b_addresses(0),
     )
+    if const_expr(n_tiles > 1):
+        # n=1的首个输出过渡只执行一次；其后回边统一使用真正稳态的预算。
+        carries, pending_packed, pending_scales, addresses = run_tile(
+            1, carries, pending_packed, pending_scales[2:], False, n_tiles > 2, n_tiles > 3, addresses,
+        )
     if const_expr(unroll_n == 0 or n_tiles < 4):
-        for n in range_constexpr(1, n_tiles):
+        for n in range_constexpr(2, n_tiles):
             carries, pending_packed, pending_scales, addresses = run_tile(
                 n, carries, pending_packed, pending_scales[2:], False, n + 1 < n_tiles, n + 2 < n_tiles, addresses,
             )
@@ -528,9 +533,9 @@ def emit_bk192_nloop(
 
         initial = save_state(carries, pending_packed, pending_scales, addresses)
         # 剥离最后两N，所有动态迭代的n+2均有效，不发出未消费的越界B请求。
-        stop = 1 + ((n_tiles - 3) // unroll_n) * unroll_n
+        stop = 2 + ((n_tiles - 4) // unroll_n) * unroll_n
         ops.clear_all()
-        for block_start, state in range(1, stop, unroll_n, init=initial):
+        for block_start, state in range(2, stop, unroll_n, init=initial):
             carries, previous_packed, previous_scales, addresses = restore_state(state)
             for offset in range_constexpr(unroll_n):
                 carries, packed, scales, addresses = run_tile(
