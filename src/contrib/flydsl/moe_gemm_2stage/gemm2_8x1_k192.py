@@ -186,24 +186,36 @@ def _build_moe_gemm2_8x1_k192(
                 base = n * BN * K + half * (BN // 2) * K
                 return [raw_b_load(tid * 16, base, 4), raw_b_load(8192 + tid * 8, base, 2)]
 
-            def commit_bk192(n, half, fragments):
-                # 先recast对齐的LDS基址，再按Uint32偏移，保留动态槽地址的对齐信息。
-                base = fx.recast_iter(fx.Uint32, bptrs[0]) + (n & 1) * (BN * K // 4) + half * (BN // 2) * (K // 4)
+            # partition只建立一次；完整lane地址在上一compute尾部准备，跨N携带。
+            b_template = fx.make_view(bptrs[0],
+                fx.make_layout(((16, BN // 64), (16, K // 16)), ((16, 16 * K), (1, 256))))
+            b_copy = ops.get_universal_copy_atom(fx.Float8E4M3FNUZ, 128)
+            b_partition = ops.get_tiled_mma_partition_S(mm, b_template, "A", copy_atom_bits=128)
+            b_read_type = fx.get_iter(b_partition).type
+            b_write_ptr = fx.recast_iter(fx.Uint32, bptrs[0])
+            b_write_types = [b_write_ptr.type, (b_write_ptr + 2).type]
+
+            def prepare_b_addresses(n):
+                read_address = fx.Int32(fx.ptrtoint(fx.get_iter(b_partition))) + fx.Int32((n & 1) * BN * K)
+                write_base = fx.Int32(fx.ptrtoint(bptrs[0])) + fx.Int32(((n + 1) & 1) * BN * K)
+                values = [read_address, write_base + tid * 16, write_base + 8192 + tid * 8]
+                # 空tied asm不增加ISA指令，但强制地址在compute尾部sched屏障前就绪。
+                return [fx.Int32(llvm.inline_asm(ir.IntegerType.get_signless(32), [_raw(value)],
+                    "", "=v,0", has_side_effects=True)) for value in values]
+
+            def commit_bk192(n, half, fragments, addresses):
                 for part in range_constexpr(2):
                     words = 4 if part == 0 else 2
-                    offset = tid * 4 if part == 0 else 2048 + tid * 2
-                    destination = fx.make_view(base + offset, fx.make_layout(words, 1))
+                    base = fx.inttoptr(b_write_types[part], addresses[part + 1])
+                    destination = fx.make_view(base + half * (BN // 2) * (K // 4), fx.make_layout(words, 1))
                     fx.copy(ops.get_universal_copy_atom(fx.Uint32, words * 32), fragments[part], destination)
 
-            def read_b(slot, half, ks, quarter):
-                width = K_WIDTHS[ks]
-                # 整块BK192半区相距12288B。
-                view = fx.make_view(
-                    (bptrs[0] + slot * BN * MAX_BK)
-                    + half * (BN // 2) * MAX_BK + quarter * (BN // 4) * width,
-                    fx.make_layout(((16, BN // 64), (16, width // 16)), ((16, 16 * width), (1, 256))),
-                )
-                return ops.load_tiled_mma_fragA(mm, view, copy_atom_bits=128)
+            def read_b(slot, half, ks, quarter, addresses):
+                base = fx.inttoptr(b_read_type, addresses[0])
+                source = fx.make_view(base + half * (BN // 2) * K + quarter * (BN // 4) * K, b_partition.layout)
+                fragment = mm.make_fragment_A(b_template)
+                fx.copy(b_copy, source, ops.get_tiled_mma_retile(mm, fragment, "A", copy_atom=b_copy))
+                return fragment
 
             out = fx.rocdl.make_buffer_tensor(
                 fx.make_view(fxh._as_ptr(p_output, fx.BFloat16) + (fx.Int64(row_begin) * STRIDE if const_expr(_task_table) else fx.Int64(e_idx) * BM * STRIDE),
@@ -216,11 +228,23 @@ def _build_moe_gemm2_8x1_k192(
             scratch_base = (wave % 4) * 16 * BN
             lane_group, row8, row_half = lane // 16, (lane % 16) % 8, (lane % 16) // 8
 
+            if const_expr(weight_quant_type == "ptpc"):
+                scale_buffer = fx.rocdl.make_buffer_tensor(
+                    fxh.view_as_torch_tensor(fxh._as_ptr(p_w_scale, fx.Float32) + fx.Int64(expert) * N, (N,), fx.Float32),
+                    max_size=False, num_records_bytes=N * 4,
+                )
+
             def load_scale(n, pair):
                 if const_expr(weight_quant_type == "ptpc"):
-                    tensor = fx.make_view(fxh._as_ptr(p_w_scale, fx.Float32) + fx.Int64(expert) * N + n * BN + pair * 32,
-                                          fx.make_layout((32, BM), (1, 0)))
-                    return ops.load_tiled_mma_fragC(mm, tensor, copy_atom_bits=32)
+                    # fx.copy的soffset单位为元素，lowering再乘4转为原生字节偏移。
+                    tensor = fx.make_view(fx.get_iter(scale_buffer) + pair * 32, fx.make_layout((32, BM), (1, 0)))
+                    # 保持每pair两条dwordx4；copy32不会自动合并，会破坏VMEM等待账本。
+                    copy_atom = ops.get_buffer_copy_atom(fx.Float32, 128)
+                    fragment = mm.make_fragment_C(tensor)
+                    fx.copy(copy_atom, ops.get_tiled_mma_partition_S(mm, tensor, "C", copy_atom_bits=128),
+                            ops.get_tiled_mma_retile(mm, fragment, "C", copy_atom=copy_atom),
+                            soffset=fx.Int32(n * BN))
+                    return fragment
                 else:
                     return fx.Float32(1.0)
 
@@ -248,10 +272,14 @@ def _build_moe_gemm2_8x1_k192(
                 return [Vec.from_elements(record, fx.Uint32).bitcast(fx.BFloat16) for record in records]
 
             def issue_output(n, packed, row, half):
+                def plane_offset(r, g, p):
+                    # BF16元素偏移：source-group低位移到2KiB plane，保留128bit写。
+                    return ((r & 1) * 8 + ((g & 2) ^ (r & 2)) * 8
+                            + ((p & 1) ^ ((r >> 2) & 1)) * 32 + (p >> 1) * 64
+                            + (r >> 3) * 128 + (r & 6) * 128 + (g & 1) * 1024)
                 for local_pair in range_constexpr(2):
                     pair = half * 2 + local_pair
-                    record = (pair * 4 + lane_group) ^ row8
-                    offset = scratch_base + ((row_half * 8 + row8) * 16 + record) * 8
+                    offset = scratch_base + plane_offset(lane % 16, lane_group, pair)
                     destination = fx.make_view(fx.get_iter(scratch_view) + offset, fx.make_layout(8, 1))
                     fragment = fx.make_fragment_like(destination)
                     fragment.store(packed[pair][row])
@@ -260,19 +288,19 @@ def _build_moe_gemm2_8x1_k192(
                 for oh in range_constexpr(2):
                     atom_index = half * 8 + lane % 8
                     ng = atom_index // 2
+                    offset = scratch_base + plane_offset(oh * 8 + lane // 8, 2 * (atom_index % 2), ng // 2) + (ng % 2) * 4
                     pieces = []
                     for source_group in range_constexpr(2):
-                        logical_record = (ng // 2) * 4 + (atom_index % 2) * 2 + source_group
-                        record = logical_record ^ (lane // 8)
-                        offset = scratch_base + ((oh * 8 + lane // 8) * 16 + record) * 8 + (ng % 2) * 4
-                        source = fx.make_view(fx.get_iter(scratch_view) + offset, fx.make_layout(4, 1))
+                        source = fx.make_view(fx.get_iter(scratch_view) + offset + source_group * 1024, fx.make_layout(4, 1))
                         fragment = fx.make_fragment_like(source)
                         fx.copy(scratch_read, source, fragment)
                         pieces.append(fragment)
+                    # 让同一输出的两段8B合并为read2st64(offset1:4)，禁止跨oh配对。
+                    fx.rocdl.sched_barrier(0)
                     fragments.append(pieces)
                     out_row = wave * 16 + row * 128 + oh * 8 + lane // 8
-                    destinations.append(fx.make_view(fx.get_iter(out) + out.layout(atom_index * 8, out_row) + n * BN,
-                                                     fx.make_layout(8, 1)))
+                    destinations.append((n, fx.make_view(fx.get_iter(out) + out.layout(atom_index * 8, out_row),
+                                                        fx.make_layout(8, 1))))
                 return fragments, destinations
 
             def store_output(fragments, destinations, lgkmcnt=0):
@@ -281,7 +309,9 @@ def _build_moe_gemm2_8x1_k192(
                     first, second = Vec(fragments[index][0].load()), Vec(fragments[index][1].load())
                     result = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
                     result.store(first.shuffle(second, list(range(8))))
-                    fx.copy(store_atom, result, destinations[index])
+                    output_n, destination = destinations[index]
+                    # 线程内输出地址不含N循环变量；统一N偏移由SGPR soffset提供。
+                    fx.copy(store_atom, result, destination, soffset=fx.Int32(output_n * BN))
 
             def retire(n, packed):
                 for half in range_constexpr(2):
@@ -323,7 +353,7 @@ def _build_moe_gemm2_8x1_k192(
             packed_previous, scales_previous = emit_bk192_nloop(
                 NT, _n_loop, weight_quant_type == "ptpc", ROLLING, _relax_vmcnt, c, prefetched, ops,
                 issue_bk192, commit_bk192, read_b, load_scale, pack, issue_output, store_output,
-                mma, clear, schedule_pack, priority, stage_end, wait, first_stagger,
+                mma, clear, schedule_pack, priority, stage_end, wait, first_stagger, prepare_b_addresses,
             )
 
             if const_expr(ROLLING):
@@ -391,13 +421,13 @@ def bk192_wait_schedule(n_tiles, ptpc, rolling):
 def emit_bk192_nloop(
     n_tiles, unroll_n, ptpc, rolling, relax_vmcnt, c, prefetched, ops,
     issue_b, commit_b, read_b, load_scale, pack, issue_output, store_output,
-    mma, clear, schedule_pack, priority, stage_end, wait, first_stagger,
+    mma, clear, schedule_pack, priority, stage_end, wait, first_stagger, prepare_b_addresses,
 ):
     budgets = bk192_wait_schedule(n_tiles, ptpc, rolling)
     body_budgets = tuple(min((budgets[2 * n + half] for n in range(1, n_tiles - 2)), default=63)
                          for half in range(2))
 
-    def run_tile(n, carries, previous_packed, previous_scales, first, has_next, has_future):
+    def run_tile(n, carries, previous_packed, previous_scales, first, has_next, has_future, addresses):
         packed, scales = [], []
         for half in range_constexpr(2):
             priority(0)
@@ -407,7 +437,7 @@ def emit_bk192_nloop(
             for quarter in range_constexpr(2):
                 if const_expr(not first):
                     fragments, destinations = issue_output(n - 1, previous_packed, quarter, half)
-                bf.append(read_b(n & 1, half, 0, quarter))
+                bf.append(read_b(n & 1, half, 0, quarter, addresses))
                 if const_expr(not first):
                     # 本次C读比随后6条B ds_read更早；不等待整个B片段再发store。
                     store_output(fragments, destinations, lgkmcnt=6)
@@ -416,7 +446,7 @@ def emit_bk192_nloop(
             if const_expr(budget != 63 or not relax_vmcnt):
                 wait(vmcnt=budget if relax_vmcnt else 0)
             if const_expr(has_next):
-                commit_b(n + 1, half, carries[half])
+                commit_b(n + 1, half, carries[half], addresses)
             if const_expr(has_future):
                 fx.rocdl.sched_barrier(0)
                 carries[half] = issue_b(n + 2, half)
@@ -434,6 +464,8 @@ def emit_bk192_nloop(
                     elif const_expr(half == 1):
                         packed.append(pack(packet, scales[packet]))
                         schedule_pack()
+            if const_expr(half == 1 and has_next):
+                addresses = prepare_b_addresses(n + 1)
             wait(lgkmcnt=0)
             priority(0)
             stage_end()
@@ -443,22 +475,22 @@ def emit_bk192_nloop(
             # pure在compute阶段边界之后打包，避免inline-asm FMA过早读取MFMA结果。
             wait(vmcnt=0)
             packed = [pack(pair, scales[pair]) for pair in range_constexpr(4)]
-        return carries, packed, scales
+        return carries, packed, scales, addresses
 
-    carries, pending_packed, pending_scales = run_tile(
-        0, prefetched, [], [], True, n_tiles > 1, n_tiles > 2,
+    carries, pending_packed, pending_scales, addresses = run_tile(
+        0, prefetched, [], [], True, n_tiles > 1, n_tiles > 2, prepare_b_addresses(0),
     )
     if const_expr(unroll_n == 0 or n_tiles < 4):
         for n in range_constexpr(1, n_tiles):
-            carries, pending_packed, pending_scales = run_tile(
-                n, carries, pending_packed, pending_scales[2:], False, n + 1 < n_tiles, n + 2 < n_tiles,
+            carries, pending_packed, pending_scales, addresses = run_tile(
+                n, carries, pending_packed, pending_scales[2:], False, n + 1 < n_tiles, n + 2 < n_tiles, addresses,
             )
     else:
         b_carriers = [[fx.make_fragment_like(part) for part in carry] for carry in carries]
         if const_expr(rolling and ptpc):
             scale_carriers = [fx.make_fragment_like(pending_scales[pair]) for pair in range_constexpr(2, 4)]
 
-        def save_state(carries, packed, scales):
+        def save_state(carries, packed, scales, addresses):
             state = [part.load() for carry in carries for part in carry]
             if const_expr(rolling):
                 for row in range_constexpr(2):
@@ -468,6 +500,7 @@ def emit_bk192_nloop(
                     state.extend(scales[pair].load() for pair in range_constexpr(2, 4))
             for pair in range_constexpr(2 if rolling else 4):
                 state.extend(packed[pair][row] for row in range_constexpr(2))
+            state.extend(addresses)
             return state
 
         def restore_state(state):
@@ -491,25 +524,25 @@ def emit_bk192_nloop(
             for pair in range_constexpr(2 if rolling else 4):
                 packed.append([Vec(state[offset]), Vec(state[offset + 1])])
                 offset += 2
-            return [list(carry) for carry in b_carriers], packed, scales
+            return [list(carry) for carry in b_carriers], packed, scales, [fx.Int32(value) for value in state[-3:]]
 
-        initial = save_state(carries, pending_packed, pending_scales)
+        initial = save_state(carries, pending_packed, pending_scales, addresses)
         # 剥离最后两N，所有动态迭代的n+2均有效，不发出未消费的越界B请求。
         stop = 1 + ((n_tiles - 3) // unroll_n) * unroll_n
         ops.clear_all()
         for block_start, state in range(1, stop, unroll_n, init=initial):
-            carries, previous_packed, previous_scales = restore_state(state)
+            carries, previous_packed, previous_scales, addresses = restore_state(state)
             for offset in range_constexpr(unroll_n):
-                carries, packed, scales = run_tile(
-                    fx.Int64(block_start) + offset, carries, previous_packed, previous_scales, False, True, True,
+                carries, packed, scales, addresses = run_tile(
+                    fx.Int64(block_start) + offset, carries, previous_packed, previous_scales, False, True, True, addresses,
                 )
                 previous_packed, previous_scales = packed, scales[2:]
-            results = yield save_state(carries, packed, scales)
+            results = yield save_state(carries, packed, scales, addresses)
         ops.clear_all()
-        carries, pending_packed, previous_scales = restore_state(results)
+        carries, pending_packed, previous_scales, addresses = restore_state(results)
         for n in range_constexpr(stop, n_tiles):
-            carries, pending_packed, pending_scales = run_tile(
-                n, carries, pending_packed, previous_scales, False, n + 1 < n_tiles, n + 2 < n_tiles,
+            carries, pending_packed, pending_scales, addresses = run_tile(
+                n, carries, pending_packed, previous_scales, False, n + 1 < n_tiles, n + 2 < n_tiles, addresses,
             )
             previous_scales = pending_scales[2:]
     return pending_packed, pending_scales
