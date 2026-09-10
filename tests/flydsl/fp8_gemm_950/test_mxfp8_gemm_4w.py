@@ -3,7 +3,7 @@
 #
 # fp8 GEMM (C = B * A, 输出 bf16)，按 test_gemm_v9.py 的方式用 tile + layout 抽象编写
 # （flat_divide / make_tiled_copy / make_tiled_mma / make_fragment / fx.copy / fx.gemm），
-# 不做手动 byte-offset 计算。
+# LDS 读取保留 layout 抽象；G2S 使用预计算 byte offset 的 raw DMA。
 #   - BLOCK_M=BLOCK_N=BLOCK_K=128, TILE_M=TILE_N=256, 4-wave, 2x2 quadrant
 #   - MFMA 指令 V_MFMA_SCALE_F32_16X16X128_F8F6F4（scale=0 => 不含 scale）
 #   - A/B 均普通输入 + LDS bank-conflict 消解：padding（默认，[[1024,32]] 单 padding，对标 bf16 v9）
@@ -51,57 +51,37 @@ def waitvmcnt_barrier(vmcnt):
     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
     rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
     rocdl.s_barrier()
+    # Compiler fence only: keep the compute prefix after this phase's waits.
+    rocdl.sched_barrier(0)
 
 
-def hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops):
-    total_mfmas = 16
-    scale_sched_late = _env_flag("SCALE_SCHED_LATE", "1")
-    scale_dsrd_pos = int(os.environ.get("SCALE_DSRD_POS", "13"))
-    scale_vmem_pos = int(os.environ.get("SCALE_VMEM_POS", "7"))
-    base_dsrd_ops = 8 if scale_sched_late and dsrd_ops == 9 else dsrd_ops
-    has_scale_vmem = scale_sched_late and vmem_ops in (3, 5)
-    base_vmem_ops = vmem_ops - 1 if has_scale_vmem else vmem_ops
-    prev_dsrd = 0
-    prev_vmem = 0
-    for i in range_constexpr(total_mfmas):
-        cur_dsrd = ((i + 3) * base_dsrd_ops + total_mfmas - 1) // total_mfmas
-        cur_dsrd = min(cur_dsrd, base_dsrd_ops)
-        if const_expr(scale_sched_late and dsrd_ops == 9 and i >= scale_dsrd_pos):
-            cur_dsrd += 1
-        if const_expr(cur_dsrd > prev_dsrd):
-            rocdl.sched_group_barrier(rocdl.mask_dsrd, cur_dsrd - prev_dsrd, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-        cur_vmem = ((i + 1) * base_vmem_ops + total_mfmas - 1) // total_mfmas
-        if const_expr(has_scale_vmem and i >= scale_vmem_pos):
-            cur_vmem += 1
-        if const_expr(cur_vmem > prev_vmem):
+def _schedule_compute(group_id, dsrd_ops, vmem_ops):
+    """Compute prefix, sequential V1/M2/D2/M1 bundles and a compute tail.
+
+    Counts already include scales. Skip exhausted memory groups; never emit
+    zero-count hints or pad the actual 16 MFMAs. Scaled FP8 x FP8 (V5, D9)
+    uses an M1 prefix so the final D1 also has an M1 followup:
+    1 + 5 * 2 + 5 * 1 = 16. All other modes, including V0 drain, keep M2.
+    """
+    assert vmem_ops >= 0 and dsrd_ops >= 0
+    mfma_prefix = 1 if dsrd_ops == 9 and vmem_ops == 5 else 2
+    dsrd_groups = (dsrd_ops + 1) // 2
+    dsrd_mfmas = min(dsrd_groups, 16 - mfma_prefix - 2 * vmem_ops)
+    assert dsrd_mfmas >= 0
+    mfma_tail = 16 - mfma_prefix - 2 * vmem_ops - dsrd_mfmas
+    rocdl.sched_group_barrier(rocdl.mask_mfma, mfma_prefix, group_id)
+    for i in range_constexpr(max(vmem_ops, dsrd_groups)):
+        if const_expr(i < vmem_ops):
+            rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
+            rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+        if const_expr(i < dsrd_groups):
             rocdl.sched_group_barrier(
-                rocdl.mask_vmem_rd, cur_vmem - prev_vmem, group_id
+                rocdl.mask_dsrd, min(2, dsrd_ops - 2 * i), group_id
             )
-        prev_dsrd = cur_dsrd
-        prev_vmem = cur_vmem
-
-
-def hot_loop_a8w8_noscale(group_id, vmem_ops, dsrd_ops):
-    total_mfmas = 16
-    dsrd_lead = int(os.environ.get("A8W8_NOSCALE_DSRD_LEAD", "3"))
-    vmem_lead = int(os.environ.get("A8W8_NOSCALE_VMEM_LEAD", "1"))
-    prev_dsrd = 0
-    prev_vmem = 0
-    for i in range_constexpr(total_mfmas):
-        cur_dsrd = ((i + dsrd_lead) * dsrd_ops + total_mfmas - 1) // total_mfmas
-        cur_dsrd = max(0, min(cur_dsrd, dsrd_ops))
-        if const_expr(cur_dsrd > prev_dsrd):
-            rocdl.sched_group_barrier(rocdl.mask_dsrd, cur_dsrd - prev_dsrd, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-        cur_vmem = ((i + vmem_lead) * vmem_ops + total_mfmas - 1) // total_mfmas
-        cur_vmem = max(0, min(cur_vmem, vmem_ops))
-        if const_expr(cur_vmem > prev_vmem):
-            rocdl.sched_group_barrier(
-                rocdl.mask_vmem_rd, cur_vmem - prev_vmem, group_id
-            )
-        prev_dsrd = cur_dsrd
-        prev_vmem = cur_vmem
+            if const_expr(i < dsrd_mfmas):
+                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+    if const_expr(mfma_tail > 0):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, mfma_tail, group_id)
 
 
 # VMEM_WRITE / VALU 掩码（flydsl 未导出 vmem_wr 常量，直接用 bit 值）。
@@ -109,12 +89,18 @@ _MASK_VALU = 0x002
 _MASK_VMEM_WR = 0x040
 
 
-def scheduler_store_overlap(group_id):
+def scheduler_store_overlap(group_id, dsrd_ops=0):
     # MFMA 领先：每 2 条 MFMA 穿插 store 的 VALU(cvt/permlane) 与 buffer_store(vmem_wr)，
     # 用 MFMA 计算掩盖 store 的写延迟（fp8 每象限 16 条 MFMA、8 次 buffer_store）。
     # MFMA 必须领先，否则 store 会挡住计算流水。
-    for _ in range_constexpr(8):
+    # Phase 5 also reads the last B operand/scale. Pair those reads with the
+    # existing M2 groups, without adding MFMAs or changing the eight stores.
+    for i in range_constexpr(8):
         rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+        if const_expr(2 * i < dsrd_ops):
+            rocdl.sched_group_barrier(
+                rocdl.mask_dsrd, min(2, dsrd_ops - 2 * i), group_id
+            )
         rocdl.sched_group_barrier(_MASK_VALU, 6, group_id)
         rocdl.sched_group_barrier(_MASK_VMEM_WR, 1, group_id)
 
@@ -149,10 +135,8 @@ def compile_gemm_fp8(
         raise ValueError("independent B LDS swizzle is only supported for MXFP4")
     element_type = fx.Float8E4M3FN
     b_element_type = fx.Float4E2M1FN if b_mxfp4 else element_type
-    elements_per_128b = 16  # 128bit / fp8(8bit)
-    b_elements_per_128b = 32 if b_mxfp4 else elements_per_128b
-    # 这些swizzle spec是基于LDS的swizzle, SShift 与K/BK有关，目前的设置时BK的，apply
-    # 到global memory时需要根据K调整，后面的代码可以看到。
+    # These specs describe LDS BK128 tiles. Raw DMA inverts the tile-local
+    # swizzle before applying the global row stride K; no K-dependent swizzle.
     #     // A generic Swizzle functor
     # /* 0bxxxxxxxxxxxxxxxYYYxxxxxxxZZZxxxx
     #  *                               ^--^ MBase is the number of least-sig bits to keep constant
@@ -171,16 +155,9 @@ def compile_gemm_fp8(
     else:
         swizzle_a_specs = ((3, 4, 4),)
         swizzle_b_specs = swizzle_a_specs
-    # raw_global_swizzle用于处理swizzle被enabled 并且K不是2的幂的情况。
-    raw_global_swizzle = lds_swizzle and (K & (K - 1)) != 0
-
-    # raw_global_swizzle 不支持preshuffle b,
-    assert not raw_global_swizzle or not preshuffle_b
-    # sched_group_barrier 精确调度（对标 bf16 hot_loop_scheduler_mainloop）：
-    # fp8 每象限一条 MFMA(16x16x128) 抵 bf16 两条(16x16x32)，故 MFMA 计数减半（32->16）；
-    # ds_read/vmem 计数不变（数据量一致）。仅在完整流水迭代（同时有 s2r+g2s）时应用。
-    _USE_SCHED = _env_flag("SCHED", "1")
-    scale_g2r = with_scale and _env_flag("SCALE_G2R", "1")
+    # Retain the existing preshuffle/swizzle mode restriction. Raw DMA below
+    # uses the same tile-local swizzle map for power-of-two and other K sizes.
+    assert not (lds_swizzle and (K & (K - 1)) != 0) or not preshuffle_b
 
     def _get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
         num_pid_m = (M + TILE_M - 1) // TILE_M
@@ -284,7 +261,12 @@ def compile_gemm_fp8(
     ):
         tid = fx.thread_idx.x
         num_pid_n = div_up(N, TILE_N)
-        scale_m_rows = div_up(M, 256) * 256
+        # M is launch-uniform, but its dynamic ABI value may be classified as
+        # divergent. Scalarize once: a divergent scale soffset would introduce
+        # an EXEC waterfall around every A-scale DMA and split the pipeline.
+        scale_m_rows = fx.Int32(
+            rocdl.readfirstlane(T.i32, arith._to_raw(fx.Int32(div_up(M, 256) * 256)))
+        )
         scale_n_rows = div_up(N, 256) * 256
         if const_expr(pid_swizzle):
             bid_x, bid_y = get_pids_950(fx.block_idx.x, M, fx.grid_dim.x, 8, 4)
@@ -292,135 +274,28 @@ def compile_gemm_fp8(
             bid_x = fx.block_idx.x // num_pid_n
             bid_y = fx.block_idx.x % num_pid_n
 
-        a_iter = fx.recast_iter(element_type, fx.get_iter(argA))
-        b_iter = fx.recast_iter(b_element_type, fx.get_iter(argB))
-        A_2d = fx.Tensor(fx.make_view(a_iter, fx.make_layout((M, K), (K, 1))))
-        B_2d = fx.Tensor(fx.make_view(b_iter, fx.make_layout((N, K), (K, 1))))
         C_2d = fx.Tensor(
             fx.make_view(fx.get_iter(argC), fx.make_layout((M, N), (N, 1)))
         )
-        # ---- buffer descirptor resource----
-        A = fx.rocdl.make_buffer_tensor(A_2d, max_size=False)
-        B = fx.rocdl.make_buffer_tensor(B_2d, max_size=False)
+        # All operand DMA resources use byte bounds, including packed FP4.
+        a_dma_rsrc = fx.buffer_ops.create_buffer_resource(
+            argA, num_records_bytes=arith._to_raw(fx.Int32(M * K))
+        )
+        b_dma_rsrc = fx.buffer_ops.create_buffer_resource(
+            argB,
+            num_records_bytes=arith._to_raw(fx.Int32(N * K // (2 if b_mxfp4 else 1))),
+        )
         C = fx.rocdl.make_buffer_tensor(C_2d, max_size=False)
-        if const_expr(b_mxfp4):
-            b_mxfp4_rsrc = fx.buffer_ops.create_buffer_resource(
-                argB,
-                num_records_bytes=arith._to_raw(fx.Int32(N * K // 2)),
-            )
-        if const_expr(raw_global_swizzle):
-            a_swizzle_rsrc = fx.buffer_ops.create_buffer_resource(
-                argA, num_records_bytes=arith._to_raw(fx.Int32(M * K))
-            )
-            b_swizzle_rsrc = fx.buffer_ops.create_buffer_resource(
-                argB, num_records_bytes=arith._to_raw(fx.Int32(N * K))
-            )
-
-        if const_expr(with_scale):
-            # Host: [rows, G] -> [rows/128, 4, 32, G] -> permute(3, 0, 2, 1).
-            # View as i32 words (4 packed E8M0 = one uint32) so the LDS DMA copies one
-            # dword/lane (value=1); an i8 value=4 copy misplaces the source by +3 bytes.
-            scale_a_iter = fx.recast_iter(Int32, fx.get_iter(argScaleA))
-            scale_b_iter = fx.recast_iter(Int32, fx.get_iter(argScaleB))
-            scale_a_layout_int32 = fx.make_layout(
-                ((32, 8), (scale_m_rows // 128, K // 128)),
-                ((1, scale_m_rows // 4), (32, scale_m_rows)),
-            )
-            scale_b_layout_int32 = fx.make_layout(
-                ((32, 8), (scale_n_rows // 128, K // 128)),
-                ((1, scale_n_rows // 4), (32, scale_n_rows)),
-            )
-            ScaleA = fx.rocdl.make_buffer_tensor(
-                fx.Tensor(fx.make_view(scale_a_iter, scale_a_layout_int32)),
-                max_size=False,
-            )
-            ScaleB = fx.rocdl.make_buffer_tensor(
-                fx.Tensor(fx.make_view(scale_b_iter, scale_b_layout_int32)),
-                max_size=False,
-            )
         c_store_rsrc = fx.buffer_ops.create_buffer_resource(
             argC, num_records_bytes=arith._to_raw(fx.Int32(M * N * 2))
         )
 
-        # ---- divide A, B into blocks ----
-        bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 0, None]
-        bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 1, None]
-        bB_l = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y * 2 + 0, None]
-        bB_r = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y * 2 + 1, None]
-
-        # ---- sub, sub tensor with layout ----
-        # A/B 全局 tile 视图：swizzle 版（全局 swizzle）或 padding 版（分组）。
-        def apply_swizzles(layout, specs, shift_adjust=0):
+        # Swizzle only the LDS read layout; global DMA maps are tile-local.
+        def apply_swizzles(layout, specs):
             for mask, base, shift in specs:
-                swizzle = fx.static(
-                    fx.SwizzleType.get(mask, base, shift + shift_adjust)
-                )
+                swizzle = fx.static(fx.SwizzleType.get(mask, base, shift))
                 layout = fx.make_composed_layout(swizzle, layout)
             return layout
-
-        if const_expr(lds_swizzle):
-            # swizzle && !raw_global_swizzle: apply swizzle to the global tile views.
-            if const_expr(not raw_global_swizzle):
-                # 需要把spec里面的BK shift 调整成为K的shift.
-                stride_shift = K.bit_length() - BLOCK_K.bit_length()
-                bA_t = fx.Tensor(
-                    fx.make_view(
-                        fx.get_iter(bA_t),
-                        apply_swizzles(
-                            fx.get_layout(bA_t), swizzle_a_specs, stride_shift
-                        ),
-                    )
-                )
-                bA_b = fx.Tensor(
-                    fx.make_view(
-                        fx.get_iter(bA_b),
-                        apply_swizzles(
-                            fx.get_layout(bA_b), swizzle_a_specs, stride_shift
-                        ),
-                    )
-                )
-                bB_l = fx.Tensor(
-                    fx.make_view(
-                        fx.get_iter(bB_l),
-                        apply_swizzles(
-                            fx.get_layout(bB_l), swizzle_b_specs, stride_shift
-                        ),
-                    )
-                )
-                bB_r = fx.Tensor(
-                    fx.make_view(
-                        fx.get_iter(bB_r),
-                        apply_swizzles(
-                            fx.get_layout(bB_r), swizzle_b_specs, stride_shift
-                        ),
-                    )
-                )
-        else:
-            # A: 分组全局视图（每 8 行为一组，映射到 padding LDS 的行组)
-            a_grouped = fx.make_layout(
-                ((8, BLOCK_M // 8), BLOCK_K, K // BLOCK_K),
-                ((BLOCK_M // 8 * K, K), 1, BLOCK_K),
-            )
-            bA_t = fx.Tensor(fx.make_view(fx.get_iter(bA_t), a_grouped))
-            bA_b = fx.Tensor(fx.make_view(fx.get_iter(bA_b), a_grouped))
-            b_grouped = fx.make_layout(
-                ((8, BLOCK_N // 8), BLOCK_K, K // BLOCK_K),
-                ((BLOCK_N // 8 * K, K), 1, BLOCK_K),
-            )
-            bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), b_grouped))
-            bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), b_grouped))
-
-        # preshuffle B：host 端已 shuffle_weight(B, layout=(16,64))，kernel 用 subB 再视图
-        # 从 flat_divide 的 tile base 恢复 logical (n,k) -> shuffled 物理偏移（与 swizzle/padding 无关）。
-        # subB 形状 ((ni16, nb=BLOCK_N//16), (k0=16, k1=BLOCK_K//16), k_tile)，
-        # 步长 ((16, 16*K), (1, 256), 2048) 对应 shuffle 存储顺序 (nb,kb,k1,ni,k0)。
-        if const_expr(preshuffle_b):
-            _subB = fx.make_layout(
-                ((16, BLOCK_N // 16), (16, BLOCK_K // 16), K // BLOCK_K),
-                ((16, 16 * K), (1, 256), 2048),
-            )
-            bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), _subB))
-            bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), _subB))
 
         bC_tl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[
             None, None, bid_x * 2 + 0, bid_y * 2 + 0
@@ -482,16 +357,20 @@ def compile_gemm_fp8(
         thr_mma = tiled_mma.thr_slice(tid)
 
         # ---- copy atoms ----
-        async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
-        buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), element_type)
-        buffer_copy_atom_b = fx.make_copy_atom(
-            fx.rocdl.BufferCopy128b(), b_element_type
-        )
         lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
         lds_copy_atom_b = fx.make_copy_atom(fx.UniversalCopy128b(), b_element_type)
 
         # ---- LDS 分配 ----
         lds = fx.SharedAllocator().allocate(LDS).peek()
+        lane_id = tid % 64
+        wave_id = tid // 64
+        wave_id_uniform = fx.Int32(rocdl.readfirstlane(T.i32, arith._to_raw(wave_id)))
+
+        def lds_root(ptr):
+            return _fly.extract_aligned_pointer_as_index(
+                ir.Type.parse("!llvm.ptr<3>"),
+                arith._to_raw(fx.make_view(ptr, fx.make_layout(1, 1))),
+            )
 
         scale_a_t_frag = None
         scale_a_b_frag = None
@@ -535,19 +414,6 @@ def compile_gemm_fp8(
             scale_a_b_frag = fx.make_fragment_like(scale_a_b_src[0])
             scale_b_l_frag = fx.make_fragment_like(scale_b_l_src[0])
             scale_b_r_frag = fx.make_fragment_like(scale_b_r_src[0])
-            if const_expr(scale_g2r):
-                scale_a_t_g2r = [
-                    fx.make_fragment_like(scale_a_t_src[0]) for _ in range_constexpr(2)
-                ]
-                scale_a_b_g2r = [
-                    fx.make_fragment_like(scale_a_b_src[0]) for _ in range_constexpr(2)
-                ]
-                scale_b_l_g2r = [
-                    fx.make_fragment_like(scale_b_l_src[0]) for _ in range_constexpr(2)
-                ]
-                scale_b_r_g2r = [
-                    fx.make_fragment_like(scale_b_r_src[0]) for _ in range_constexpr(2)
-                ]
 
             scale_a_dma_rsrc = fx.buffer_ops.create_buffer_resource(
                 argScaleA,
@@ -557,19 +423,10 @@ def compile_gemm_fp8(
                 argScaleB,
                 num_records_bytes=arith._to_raw(fx.Int32(scale_n_rows * K // 32)),
             )
-            scale_lane_id = tid % 64
-            scale_wave_id = tid // 64
-            scale_wave_id_uni = fx.Int32(
-                rocdl.readfirstlane(T.i32, arith._to_raw(scale_wave_id))
-            )
 
             def make_scale_dma_ptr(ptr):
-                view = fx.make_view(ptr, fx.make_layout(1, 1))
-                root = _fly.extract_aligned_pointer_as_index(
-                    ir.Type.parse("!llvm.ptr<3>"), arith._to_raw(view)
-                )
                 return fx.buffer_ops.get_element_ptr(
-                    root, byte_offset=scale_wave_id_uni * 64 * 4, elem_type=T.i8
+                    lds_root(ptr), byte_offset=wave_id_uniform * 64 * 4, elem_type=T.i8
                 )
 
             scale_a_t_dma_ptrs = [
@@ -589,54 +446,38 @@ def compile_gemm_fp8(
                 for ptr in (lds.scale_b_r0.ptr, lds.scale_b_r1.ptr)
             ]
 
-            def raw_scale_g2s(rsrc, kk, ptr, row_tile, rows, is_a):
-                wave_half = scale_wave_id_uni // 2 if is_a else scale_wave_id_uni % 2
-                scale_row = scale_lane_id % 16 + wave_half * 16
-                scale_group = scale_lane_id // 16
-                tile_voffset = scale_row * 4 + scale_group * rows + row_tile * 32 * 4
+            def make_scale_voffset(row_tile, rows, is_a):
+                wave_half = wave_id_uniform // 2 if is_a else wave_id_uniform % 2
+                scale_row = lane_id % 16 + wave_half * 16
+                scale_group = lane_id // 16
+                return (
+                    fx.Int32(scale_row) * 4
+                    + fx.Int32(scale_group) * rows
+                    + fx.Int32(row_tile) * 32 * 4
+                )
+
+            scale_a_t_voffset = make_scale_voffset(bid_x * 2, scale_m_rows, True)
+            scale_a_b_voffset = make_scale_voffset(bid_x * 2 + 1, scale_m_rows, True)
+            scale_b_l_voffset = make_scale_voffset(bid_y * 2, scale_n_rows, False)
+            scale_b_r_voffset = make_scale_voffset(bid_y * 2 + 1, scale_n_rows, False)
+
+            # Host layout packs four E8M0 groups per BK128. Only the K step
+            # changes in the loop, in soffset; every lane copies one dword.
+            def raw_scale_g2s(rsrc, kk, ptr, voffset, rows):
                 rocdl.raw_ptr_buffer_load_lds(
                     rsrc,
                     ptr,
                     fx.Int32(4),
-                    fx.Int32(tile_voffset),
+                    voffset,
                     fx.Int32(kk * rows * 4),
                     fx.Int32(0),
                     fx.Int32(0),
                 )
 
-            def scale_g2r_load(rsrc, kk, row_tile, rows, is_a):
-                wave_half = scale_wave_id_uni // 2 if is_a else scale_wave_id_uni % 2
-                scale_row = scale_lane_id % 16 + wave_half * 16
-                scale_group = scale_lane_id // 16
-                dword_offset = (
-                    kk * rows + scale_group * (rows // 4) + row_tile * 32 + scale_row
-                )
-                return fx.Int32(
-                    fx.buffer_ops.buffer_load(
-                        rsrc, fx.Int32(dword_offset), vec_width=1, dtype=T.i32
-                    )
-                )
-
-            def load_scale_g2r(frag, rsrc, kk, row_tile, rows, is_a):
-                frag.store(
-                    Vec.from_elements(
-                        [scale_g2r_load(rsrc, kk, row_tile, rows, is_a)], fx.Int32
-                    )
-                )
-
-        # ---- AC: tiled copy ----
-        # wr/rd LDS 布局 + DMA tiled copy：swizzle 版（ordered wr + swizzle rd + make_layout_tv DMA）
-        # 或 padding 版（分组 wr/rd + 专用 a_dma）。A/B 共用同一 dma。
+        # ---- LDS read layouts (unchanged by the raw G2S address factories) ----
         if const_expr(lds_swizzle):
             _wr = fx.make_ordered_layout((BLOCK_M, BLOCK_K), (1, 0))
             _rd = apply_swizzles(_wr, swizzle_a_specs)
-            _g2s_tile, _g2s_tv = fx.make_layout_tv(
-                fx.make_layout((8 * 4, 8), (8, 1)),
-                fx.make_layout((1, elements_per_128b), (1, 1)),
-            )
-            dma = fx.make_tiled_copy(buffer_copy_atom, _g2s_tv, _g2s_tile).get_slice(
-                tid
-            )
         else:
             # A8W8 与 Hybrid 的 MFMA K permutation 不同，分别需要 1040 B 和
             # 1056 B 的 8-row stride；两者的 16-row stride 均为 2112 B。
@@ -648,17 +489,9 @@ def compile_gemm_fp8(
                 ((2, BLOCK_M // 16, 8), (32, BLOCK_K // 32)),
                 ((a_group8, a_group16, BLOCK_K), (1, 32)),
             )
-            _a_dma_tv = fx.make_layout(
-                ((8, 8, 4), elements_per_128b),
-                ((elements_per_128b * 32, 1, 8), 32),
-            )
-            dma = fx.make_tiled_copy(
-                buffer_copy_atom, _a_dma_tv, fx.make_tile(32, BLOCK_K)
-            ).get_slice(tid)
 
-        # ---- LSD  read write layout----
-        # B 的 LDS wr/rd：preshuffle 时用与 shuffle 一致的无 bank-conflict 布局（wr==rd），
-        # 否则沿用与 A 相同的 _wr/_rd。仅 CORRECTNESS 需 subB 正确 + LDS 为任意双射；DMA tv 只影响性能。
+        # B's LDS read layout: preshuffle uses the host shuffle's physical
+        # ordering; otherwise retain the original padding/swizzle layout.
         _wr_b = _wr
         _rd_b = _rd
         if const_expr(b_lds_swizzle):
@@ -678,203 +511,136 @@ def compile_gemm_fp8(
             _wr_b = _b_lds
             _rd_b = _b_lds
 
-        # B 专属 DMA：preshuffle 时 subB 的嵌套形状与 padding dma 不匹配，需独立 tiled_copy。
-        # 手工 tv：每线程沿 k0(=16 连续 fp8=128b) 合并 load，n=ni(16)+16*half(2)，k=16*kblk(8)+kv(16)。
-        # 对标 bf16 的 ((16,8,2),8),((1,256,16),32) tile(32,64)；fp8 value 16、kblk 步 512、tile(32,128)。
-        if const_expr(preshuffle_b):
-            _b_g2s_tv = fx.make_layout(
-                ((16, 8, 2), b_elements_per_128b), ((1, 512, 16), 32)
-            )
-            dma_b = fx.make_tiled_copy(
-                buffer_copy_atom, _b_g2s_tv, fx.make_tile(32, BLOCK_K)
-            ).get_slice(tid)
-        elif const_expr(b_mxfp4):
-            _b_g2s_tile, _b_g2s_tv = fx.make_layout_tv(
-                fx.make_layout((32, 8), (8, 1)),
-                fx.make_layout((4, 16), (16, 1)),
-            )
-            dma_b = fx.make_tiled_copy(
-                buffer_copy_atom_b, _b_g2s_tv, _b_g2s_tile
-            ).get_slice(tid)
-        else:
-            dma_b = dma
-
-        sA_t_wr = [fx.make_view(lds.a_t0.ptr, _wr), fx.make_view(lds.a_t1.ptr, _wr)]
-        sA_b_wr = [fx.make_view(lds.a_b0.ptr, _wr), fx.make_view(lds.a_b1.ptr, _wr)]
         sA_t_rd = [fx.make_view(lds.a_t0.ptr, _rd), fx.make_view(lds.a_t1.ptr, _rd)]
         sA_b_rd = [fx.make_view(lds.a_b0.ptr, _rd), fx.make_view(lds.a_b1.ptr, _rd)]
-        sB_l_wr = [fx.make_view(lds.b_l0.ptr, _wr_b), fx.make_view(lds.b_l1.ptr, _wr_b)]
-        sB_r_wr = [fx.make_view(lds.b_r0.ptr, _wr_b), fx.make_view(lds.b_r1.ptr, _wr_b)]
         sB_l_rd = [fx.make_view(lds.b_l0.ptr, _rd_b), fx.make_view(lds.b_l1.ptr, _rd_b)]
         sB_r_rd = [fx.make_view(lds.b_r0.ptr, _rd_b), fx.make_view(lds.b_r1.ptr, _rd_b)]
 
-        ## g2s for mxfp8 A/B with raw_global_swizzle.
-        def raw_fp8_swizzle_g2s(rsrc, kk, ptr, row_tile, specs):
-            mask, _, shift = specs[0]
-            lane_id = tid % 64
-            wave_id = tid // 64
-            lds_root = _fly.extract_aligned_pointer_as_index(
-                ir.Type.parse("!llvm.ptr<3>"),
-                arith._to_raw(fx.make_view(ptr, fx.make_layout(1, 1))),
-            )
-            for copy_round in range_constexpr(4):
+        # The instruction adds lane_id * 16 to each wave-uniform LDS base.
+        # Factories run once per kernel, never inside the K loop or raw_g2s.
+        def fp8_copy_slots(copy_round, swizzled, specs):
+            if const_expr(swizzled):
+                mask, _, shift = specs[0]
                 physical_slot = tid + copy_round * 256
                 logical_slot = physical_slot ^ (
                     (physical_slot >> shift) & ((1 << mask) - 1)
                 )
                 row = logical_slot // 8
                 col_byte = (logical_slot % 8) * 16
-                global_byte = (row_tile * BLOCK_M + row) * K + kk * BLOCK_K + col_byte
-                lds_byte = (wave_id * 64 + copy_round * 256) * 16
-                lds_ptr = fx.buffer_ops.get_element_ptr(
-                    lds_root,
-                    byte_offset=fx.Int32(
-                        rocdl.readfirstlane(T.i32, arith._to_raw(lds_byte))
-                    ),
+                lds_byte = (wave_id_uniform * 64 + copy_round * 256) * 16
+            else:
+                row = wave_id_uniform + (lane_id // 8) * 16 + copy_round * 4
+                col_byte = (lane_id % 8) * 16
+                lds_byte = (
+                    (wave_id_uniform % 2) * a_group8
+                    + (wave_id_uniform // 2) * a_group16
+                    + copy_round * 4 * A_GROUP
+                )
+            return row, col_byte, lds_byte
+
+        def make_fp8_voffsets(row_tile, block_rows, swizzled, specs):
+            voffsets = []
+            for copy_round in range_constexpr(4):
+                row, col_byte, _ = fp8_copy_slots(copy_round, swizzled, specs)
+                voffsets.append(
+                    (fx.Int32(row_tile) * block_rows + fx.Int32(row)) * K
+                    + fx.Int32(col_byte)
+                )
+            return voffsets
+
+        def make_fp8_dma_ptrs(ptr, swizzled, specs):
+            root = lds_root(ptr)
+            return [
+                fx.buffer_ops.get_element_ptr(
+                    root,
+                    byte_offset=fp8_copy_slots(r, swizzled, specs)[2],
                     elem_type=T.i8,
                 )
-                rocdl.raw_ptr_buffer_load_lds(
-                    rsrc,
-                    lds_ptr,
-                    fx.Int32(16),
-                    fx.Int32(global_byte),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                )
+                for r in range_constexpr(4)
+            ]
 
-        ## g2s for mxfp4 B with raw_global_swizzle.
-        def raw_b_mxfp4_g2s(kk, ptr, row_tile):
-            for copy_round in range_constexpr(2):
-                lane_id = tid % 64
-                wave_id = tid // 64
+        def b_copy_slots(copy_round):
+            if const_expr(preshuffle_b):
+                physical_slot = tid + copy_round * 256
+                nb = physical_slot // 128
+                in_nb = physical_slot % 128
+                # Existing _subB: ((16, BLOCK_N//16), (16, BLOCK_K//16), K//128)
+                # strides ((16, 16*K), (1, 256), 2048). A contiguous LDS slot
+                # has ni=in_nb%16, k1=in_nb//16, so ni*16+k1*256=in_nb*16.
+                # Only nb's stride changes from LDS 2048 to global 16*K.
+                src_byte = nb * 16 * K + in_nb * 16
+                lds_byte = (wave_id_uniform * 64 + copy_round * 256) * 16
+            elif const_expr(b_mxfp4):
                 if const_expr(b_lds_swizzle):
                     physical_slot = tid + copy_round * 256
                     logical_slot = physical_slot ^ ((physical_slot >> 3) & 1)
                     row = (logical_slot // 32) * 8 + logical_slot % 8
                     col_byte = ((logical_slot % 32) // 8) * 16
-                    lds_byte = (wave_id * 64 + copy_round * 256) * 16
+                    lds_byte = (wave_id_uniform * 64 + copy_round * 256) * 16
                 else:
-                    chunk = wave_id + copy_round * 4
+                    chunk = wave_id_uniform + copy_round * 4
                     row = chunk * 16 + lane_id // 4
                     col_byte = (lane_id % 4) * 16
-                if const_expr(b_lds_swizzle):
-                    global_row = row_tile * BLOCK_N + row
-                else:
-                    global_row = row_tile * BLOCK_N + row
-                global_col_byte = kk * (BLOCK_K // 2) + col_byte
-                global_byte = global_row * (K // 2) + global_col_byte
-                lds_root = _fly.extract_aligned_pointer_as_index(
-                    ir.Type.parse("!llvm.ptr<3>"),
-                    arith._to_raw(fx.make_view(ptr, fx.make_layout(1, 1))),
+                    lds_byte = chunk * (b_group16 // 2)
+                src_byte = fx.Int32(row) * (K // 2) + fx.Int32(col_byte)
+            else:
+                row, col_byte, lds_byte = fp8_copy_slots(
+                    copy_round, b_lds_swizzle, swizzle_b_specs
                 )
-                if const_expr(b_lds_swizzle):
-                    lds_ptr = fx.buffer_ops.get_element_ptr(
-                        lds_root,
-                        byte_offset=fx.Int32(
-                            rocdl.readfirstlane(T.i32, arith._to_raw(lds_byte))
-                        ),
-                        elem_type=T.i8,
-                    )
-                    rocdl.raw_ptr_buffer_load_lds(
-                        b_mxfp4_rsrc,
-                        lds_ptr,
-                        fx.Int32(16),
-                        fx.Int32(global_byte),
-                        fx.Int32(0),
-                        fx.Int32(0),
-                        fx.Int32(0),
-                    )
-                else:
-                    rocdl.raw_ptr_buffer_load_lds(
-                        b_mxfp4_rsrc,
-                        fx.buffer_ops.get_element_ptr(
-                            lds_root,
-                            byte_offset=fx.Int32(chunk * (b_group16 // 2)),
-                            elem_type=T.i8,
-                        ),
-                        fx.Int32(16),
-                        fx.Int32(global_byte),
-                        fx.Int32(0),
-                        fx.Int32(0),
-                        fx.Int32(0),
-                    )
+                src_byte = fx.Int32(row) * K + fx.Int32(col_byte)
+            return fx.Int32(src_byte), lds_byte
 
-        aT_g = dma.partition_S(bA_t)
-        aB_g = dma.partition_S(bA_b)
-        bL_g = dma_b.partition_S(bB_l)
-        bR_g = dma_b.partition_S(bB_r)
-        aT_s = [dma.partition_D(sA_t_wr[0]), dma.partition_D(sA_t_wr[1])]
-        aB_s = [dma.partition_D(sA_b_wr[0]), dma.partition_D(sA_b_wr[1])]
-        bL_s = [dma_b.partition_D(sB_l_wr[0]), dma_b.partition_D(sB_l_wr[1])]
-        bR_s = [dma_b.partition_D(sB_r_wr[0]), dma_b.partition_D(sB_r_wr[1])]
+        b_copy_rounds = 2 if b_mxfp4 else 4
+        b_k_stride = 16 * BLOCK_K if preshuffle_b else BLOCK_K // (2 if b_mxfp4 else 1)
 
-        ## g2s for mxfp8 A/B padding case use raw_g2s APIs.
-        if const_expr(not lds_swizzle and not preshuffle_b):
-            a_dma_rsrc = fx.buffer_ops.create_buffer_resource(
-                argA, num_records_bytes=arith._to_raw(fx.Int32(M * K))
-            )
-            b_dma_rsrc = fx.buffer_ops.create_buffer_resource(
-                argB, num_records_bytes=arith._to_raw(fx.Int32(N * K))
-            )
-            lane_id = tid % 64
-            wave_id = tid // 64
-            wave_id_uni = fx.Int32(rocdl.readfirstlane(T.i32, arith._to_raw(wave_id)))
-            lane_voffset = fx.Int32((lane_id // 8) * 16 * K + (lane_id % 8) * 16)
-            wave_lds_base = (wave_id_uni % 2) * a_group8 + (
-                wave_id_uni // 2
-            ) * a_group16
+        def make_b_voffsets(row_tile):
+            tile_byte = fx.Int32(row_tile) * BLOCK_N * (K // (2 if b_mxfp4 else 1))
+            return [
+                tile_byte + b_copy_slots(r)[0] for r in range_constexpr(b_copy_rounds)
+            ]
 
-            # make_dma_ptr就是m0寄存器需要的address.
-            def make_dma_ptr(ptr, copy_round):
-                view = fx.make_view(ptr, fx.make_layout(1, 1))
-                root = _fly.extract_aligned_pointer_as_index(
-                    ir.Type.parse("!llvm.ptr<3>"), arith._to_raw(view)
-                )
-                return fx.buffer_ops.get_element_ptr(
+        def make_b_dma_ptrs(ptr):
+            root = lds_root(ptr)
+            return [
+                fx.buffer_ops.get_element_ptr(
                     root,
-                    # A group 里面已经包含了单padding已经shuang padding,case.双padding是吧所有padding 平均了之后。
-                    byte_offset=wave_lds_base + copy_round * 4 * A_GROUP,
+                    byte_offset=b_copy_slots(r)[1],
                     elem_type=T.i8,
                 )
-
-            a_t_dma_ptrs = [
-                [make_dma_ptr(ptr, r) for r in range_constexpr(4)]
-                for ptr in (lds.a_t0.ptr, lds.a_t1.ptr)
-            ]
-            a_b_dma_ptrs = [
-                [make_dma_ptr(ptr, r) for r in range_constexpr(4)]
-                for ptr in (lds.a_b0.ptr, lds.a_b1.ptr)
-            ]
-            b_l_dma_ptrs = [
-                [make_dma_ptr(ptr, r) for r in range_constexpr(4)]
-                for ptr in (lds.b_l0.ptr, lds.b_l1.ptr)
-            ]
-            b_r_dma_ptrs = [
-                [make_dma_ptr(ptr, r) for r in range_constexpr(4)]
-                for ptr in (lds.b_r0.ptr, lds.b_r1.ptr)
+                for r in range_constexpr(b_copy_rounds)
             ]
 
-            # g2s: fx.copy() API 会重复read_firstlane 来填充m0的地址，performance 会drop.
-            def raw_g2s(rsrc, kk, ptrs, row_tile):
-                tile_soffset = fx.Int32(kk * BLOCK_K)
-                tile_voffset = lane_voffset + fx.Int32(
-                    (row_tile * BLOCK_M + wave_id_uni) * K
+        a_t_voffsets = make_fp8_voffsets(
+            bid_x * 2, BLOCK_M, lds_swizzle, swizzle_a_specs
+        )
+        a_b_voffsets = make_fp8_voffsets(
+            bid_x * 2 + 1, BLOCK_M, lds_swizzle, swizzle_a_specs
+        )
+        b_l_voffsets = make_b_voffsets(bid_y * 2)
+        b_r_voffsets = make_b_voffsets(bid_y * 2 + 1)
+        a_t_dma_ptrs = [
+            make_fp8_dma_ptrs(ptr, lds_swizzle, swizzle_a_specs)
+            for ptr in (lds.a_t0.ptr, lds.a_t1.ptr)
+        ]
+        a_b_dma_ptrs = [
+            make_fp8_dma_ptrs(ptr, lds_swizzle, swizzle_a_specs)
+            for ptr in (lds.a_b0.ptr, lds.a_b1.ptr)
+        ]
+        b_l_dma_ptrs = [make_b_dma_ptrs(ptr) for ptr in (lds.b_l0.ptr, lds.b_l1.ptr)]
+        b_r_dma_ptrs = [make_b_dma_ptrs(ptr) for ptr in (lds.b_r0.ptr, lds.b_r1.ptr)]
+
+        def raw_g2s(rsrc, kk, ptrs, voffsets, k_stride):
+            tile_soffset = fx.Int32(kk * k_stride)
+            for copy_round in range_constexpr(len(voffsets)):
+                rocdl.raw_ptr_buffer_load_lds(
+                    rsrc,
+                    ptrs[copy_round],
+                    fx.Int32(16),
+                    voffsets[copy_round],
+                    tile_soffset,
+                    fx.Int32(0),
+                    fx.Int32(0),
                 )
-                # ptrs 是 m0需要的地址。
-                # rsrc 时global memory base
-                # tile_voffset + copy_round * 4 * K: kiter=0时lane的 vecotr offset
-                # tile_soffset: BK 步进时的scalar offset.
-                for copy_round in range_constexpr(4):
-                    rocdl.raw_ptr_buffer_load_lds(
-                        rsrc,
-                        ptrs[copy_round],
-                        fx.Int32(16),
-                        tile_voffset + copy_round * 4 * K,
-                        tile_soffset,
-                        fx.Int32(0),
-                        fx.Int32(0),
-                    )
 
         # ---- LDS -> reg（对标 gemm_v9：A 走 B-operand，B 走 A-operand；均 padding rd）----
         # 每个 slice 只有一份寄存器 fragment（无寄存器双缓冲），双缓冲仅在 LDS 层（buf0/buf1）。
@@ -1062,165 +828,63 @@ def compile_gemm_fp8(
         num_tiles = K // BLOCK_K
         assert num_tiles >= 4
 
-        # ---- prologue：预取 tile0/tile1 到 LDS buf0/buf1，再把 buf0 的 B_l/A_t s2r 到寄存器 ----
-        # 对标 gemm_v9：预取两个 tile 的四个 operand，再按尚未完成的 VMEM 数等待后做 s2r。
+        # Small prefetch helpers share the same hoisted addresses in prologue
+        # and all eight phases. Future scales precede their data, as in MoE.
+        def prefetch_b_l(kk, buf):
+            if const_expr(with_scale):
+                raw_scale_g2s(
+                    scale_b_dma_rsrc,
+                    kk,
+                    scale_b_l_dma_ptrs[buf],
+                    scale_b_l_voffset,
+                    scale_n_rows,
+                )
+            raw_g2s(b_dma_rsrc, kk, b_l_dma_ptrs[buf], b_l_voffsets, b_k_stride)
+
+        def prefetch_a_t(kk, buf):
+            if const_expr(with_scale):
+                raw_scale_g2s(
+                    scale_a_dma_rsrc,
+                    kk,
+                    scale_a_t_dma_ptrs[buf],
+                    scale_a_t_voffset,
+                    scale_m_rows,
+                )
+            raw_g2s(a_dma_rsrc, kk, a_t_dma_ptrs[buf], a_t_voffsets, BLOCK_K)
+
+        def prefetch_a_b(kk, buf):
+            if const_expr(with_scale):
+                raw_scale_g2s(
+                    scale_a_dma_rsrc,
+                    kk,
+                    scale_a_b_dma_ptrs[buf],
+                    scale_a_b_voffset,
+                    scale_m_rows,
+                )
+            raw_g2s(a_dma_rsrc, kk, a_b_dma_ptrs[buf], a_b_voffsets, BLOCK_K)
+
+        def prefetch_b_r(kk, buf):
+            if const_expr(with_scale):
+                raw_scale_g2s(
+                    scale_b_dma_rsrc,
+                    kk,
+                    scale_b_r_dma_ptrs[buf],
+                    scale_b_r_voffset,
+                    scale_n_rows,
+                )
+            raw_g2s(b_dma_rsrc, kk, b_r_dma_ptrs[buf], b_r_voffsets, b_k_stride)
+
+        # Preserve the two-tile prologue's B_l, A_t, A_b, B_r batch order.
         def do_g2s(kk, buf):
             ki = fx.Int32(kk)
-            # --------------  AC  BLeft ------------------
-            # --------------------------------------------
-            ## B is mxfp4 case, padding or swizzle
-            if const_expr(b_mxfp4):
-                raw_b_mxfp4_g2s(ki, (lds.b_l0.ptr, lds.b_l1.ptr)[buf], bid_y * 2)
-            ## mxfp8 A/B use swizzle and K不是2的整数幂，无法使用apply swizzle on global memory
-            elif const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    b_swizzle_rsrc,
-                    ki,
-                    (lds.b_l0.ptr, lds.b_l1.ptr)[buf],
-                    bid_y * 2,
-                    swizzle_b_specs,
-                )
-            ## mxfp8 A/B padding.
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(b_dma_rsrc, ki, b_l_dma_ptrs[buf], bid_y * 2)
-            #### preshuffle B fp8 或者 swizzle && not raw_global_swizzle
-            else:
-                fx.copy(async_copy_atom, bL_g[None, None, None, ki], bL_s[buf])
+            prefetch_b_l(ki, buf)
             rocdl.sched_barrier(0)
-            if const_expr(with_scale):
-
-                if const_expr(scale_g2r):
-                    ### load scale from global memory to register.
-                    load_scale_g2r(
-                        scale_b_l_g2r[buf],
-                        scale_b_dma_rsrc,
-                        ki,
-                        bid_y * 2,
-                        scale_n_rows,
-                        False,
-                    )
-                else:
-                    ### scale into LDS
-                    raw_scale_g2s(
-                        scale_b_dma_rsrc,
-                        ki,
-                        scale_b_l_dma_ptrs[buf],
-                        bid_y * 2,
-                        scale_n_rows,
-                        False,
-                    )
-                rocdl.sched_barrier(0)
-
-            # --------------  AC  ATop ---------------------
-            # ----------------------------------------------
-            if const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    a_swizzle_rsrc,
-                    ki,
-                    (lds.a_t0.ptr, lds.a_t1.ptr)[buf],
-                    bid_x * 2,
-                    swizzle_a_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(a_dma_rsrc, ki, a_t_dma_ptrs[buf], bid_x * 2)
-            else:
-                fx.copy(async_copy_atom, aT_g[None, None, None, ki], aT_s[buf])
+            prefetch_a_t(ki, buf)
             rocdl.sched_barrier(0)
-
-            if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    load_scale_g2r(
-                        scale_a_t_g2r[buf],
-                        scale_a_dma_rsrc,
-                        ki,
-                        bid_x * 2,
-                        scale_m_rows,
-                        True,
-                    )
-                else:
-                    raw_scale_g2s(
-                        scale_a_dma_rsrc,
-                        ki,
-                        scale_a_t_dma_ptrs[buf],
-                        bid_x * 2,
-                        scale_m_rows,
-                        True,
-                    )
-                rocdl.sched_barrier(0)
-
-            # --------------  AC  A bottom ------------------
-            # -----------------------------------------------
-            if const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    a_swizzle_rsrc,
-                    ki,
-                    (lds.a_b0.ptr, lds.a_b1.ptr)[buf],
-                    bid_x * 2 + 1,
-                    swizzle_a_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(a_dma_rsrc, ki, a_b_dma_ptrs[buf], bid_x * 2 + 1)
-            else:
-                fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[buf])
+            prefetch_a_b(ki, buf)
             rocdl.sched_barrier(0)
-            if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    load_scale_g2r(
-                        scale_a_b_g2r[buf],
-                        scale_a_dma_rsrc,
-                        ki,
-                        bid_x * 2 + 1,
-                        scale_m_rows,
-                        True,
-                    )
-                else:
-                    raw_scale_g2s(
-                        scale_a_dma_rsrc,
-                        ki,
-                        scale_a_b_dma_ptrs[buf],
-                        bid_x * 2 + 1,
-                        scale_m_rows,
-                        True,
-                    )
-                rocdl.sched_barrier(0)
-
-            # --------------  AC  B right -------------------
-            # ----------------------------------------------
-            if const_expr(b_mxfp4):
-                raw_b_mxfp4_g2s(ki, (lds.b_r0.ptr, lds.b_r1.ptr)[buf], bid_y * 2 + 1)
-            elif const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    b_swizzle_rsrc,
-                    ki,
-                    (lds.b_r0.ptr, lds.b_r1.ptr)[buf],
-                    bid_y * 2 + 1,
-                    swizzle_b_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(b_dma_rsrc, ki, b_r_dma_ptrs[buf], bid_y * 2 + 1)
-            else:
-                fx.copy(async_copy_atom, bR_g[None, None, None, ki], bR_s[buf])
+            prefetch_b_r(ki, buf)
             rocdl.sched_barrier(0)
-            if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    load_scale_g2r(
-                        scale_b_r_g2r[buf],
-                        scale_b_dma_rsrc,
-                        ki,
-                        bid_y * 2 + 1,
-                        scale_n_rows,
-                        False,
-                    )
-                else:
-                    raw_scale_g2s(
-                        scale_b_dma_rsrc,
-                        ki,
-                        scale_b_r_dma_ptrs[buf],
-                        bid_y * 2 + 1,
-                        scale_n_rows,
-                        False,
-                    )
-                rocdl.sched_barrier(0)
 
         # A uses four full-wave VMEM instructions per operand. MXFP4 B now uses
         # two after replacing four subgroup loads with one full-wave load per
@@ -1229,6 +893,8 @@ def compile_gemm_fp8(
         b_vmem = (BLOCK_N * BLOCK_K * b_element_type.width // 8) // (256 * 16)
         a_phase_vmem = a_vmem + int(with_scale)
         b_phase_vmem = b_vmem + int(with_scale)
+        # (wait_ab, wait_ba): scaled FP4 (19,21), scaled FP8 (25,25),
+        # unscaled FP8 (20,20), unscaled FP4 (14,16). Scales are counted once.
         wait_ab = 2 * a_phase_vmem + 3 * b_phase_vmem
         wait_ba = 3 * a_phase_vmem + 2 * b_phase_vmem
 
@@ -1238,12 +904,8 @@ def compile_gemm_fp8(
         load_b(sB_l_rd[0], s2r_src0_B_l, frag_B_l, dest_frag_B_l)
         load_a(s2r_src0_A_t, dest_frag_A_t)
         if const_expr(with_scale):
-            if const_expr(scale_g2r):
-                scale_b_l_frag.store(scale_b_l_g2r[0].load())
-                scale_a_t_frag.store(scale_a_t_g2r[0].load())
-            else:
-                fx.copy(scale_lds_copy_atom, scale_b_l_src[0], scale_b_l_frag)
-                fx.copy(scale_lds_copy_atom, scale_a_t_src[0], scale_a_t_frag)
+            fx.copy(scale_lds_copy_atom, scale_b_l_src[0], scale_b_l_frag)
+            fx.copy(scale_lds_copy_atom, scale_a_t_src[0], scale_a_t_frag)
         rocdl.sched_barrier(0)
 
         frag_C_tl.fill(0)
@@ -1267,13 +929,10 @@ def compile_gemm_fp8(
             4 if b_mxfp4 else frag_B_l.load().numel * b_element_type.width // 8 // 16
         )
 
-        def schedule_mainloop(group_id, vmem_ops, dsrd_ops):
-            if const_expr(not with_scale and not b_mxfp4):
-                hot_loop_a8w8_noscale(group_id, vmem_ops, dsrd_ops)
-            else:
-                hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops)
+        a_phase_dsrd = a_dsrd + int(with_scale)
+        b_phase_dsrd = b_dsrd + int(with_scale)
 
-        # 每个 region：1 个象限 fx.gemm(C=B*A) + 下一 operand 的 s2r + 再下一块的 g2s，
+        # 每个 region：wait/fence -> independent next s2r -> GEMM -> future G2S -> schedule，
         # 用 s2r_src0_*/s2r_src1_* 在 LDS buf0/buf1 之间 ping-pong；每个 slice 顺序与 gemm_v9 一致。
         # k-tile 内 4 个象限的顺序固定为：tl(A_t·B_l) -> bl(A_b·B_l) -> tr(A_t·B_r) -> br(A_b·B_r)。
         # 运行时循环（range + init/yield 累加器透传），不做常量展开。
@@ -1287,367 +946,87 @@ def compile_gemm_fp8(
 
             # ---- k-tile = buf0 ----
             # ----------------------buf0:part0----------------------
+            waitvmcnt_barrier(wait_ab)
+            load_a(s2r_src0_A_b, dest_frag_A_b)
+            if const_expr(with_scale):
+                fx.copy(scale_lds_copy_atom, scale_a_b_src[0], scale_a_b_frag)
             if const_expr(not with_scale and not b_mxfp4):
                 do_gemm_mainloop(frag_C_tl, frag_B_l, frag_A_t)
             else:
                 do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
-            waitvmcnt_barrier(wait_ab)
-            load_a(s2r_src0_A_b, dest_frag_A_b)
-            if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_a_b_frag.store(scale_a_b_g2r[0].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_a_b_src[0], scale_a_b_frag)
-            if const_expr(with_scale and scale_g2r):
-                load_scale_g2r(
-                    scale_b_l_g2r[0],
-                    scale_b_dma_rsrc,
-                    kiter + 2,
-                    bid_y * 2,
-                    scale_n_rows,
-                    False,
-                )
-            if const_expr(b_mxfp4):
-                raw_b_mxfp4_g2s(kiter + 2, lds.b_l0.ptr, bid_y * 2)
-            elif const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    b_swizzle_rsrc,
-                    kiter + 2,
-                    lds.b_l0.ptr,
-                    bid_y * 2,
-                    swizzle_b_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(b_dma_rsrc, kiter + 2, b_l_dma_ptrs[0], bid_y * 2)
-            else:
-                fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 2], bL_s[0])
-            if const_expr(with_scale and not scale_g2r):
-                raw_scale_g2s(
-                    scale_b_dma_rsrc,
-                    kiter + 2,
-                    scale_b_l_dma_ptrs[0],
-                    bid_y * 2,
-                    scale_n_rows,
-                    False,
-                )
-            schedule_mainloop(
-                0, b_phase_vmem, a_dsrd + int(with_scale and not scale_g2r)
-            )
+            prefetch_b_l(kiter + 2, 0)
+            _schedule_compute(0, a_phase_dsrd, b_phase_vmem)
             rocdl.sched_barrier(0)
 
             # ----------------------buf0:part1----------------------
-            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale_a_b_frag, scale_b_l_frag)
             waitvmcnt_barrier(wait_ab)
             load_b(sB_r_rd[0], s2r_src0_B_r, frag_B_r, dest_frag_B_r)
             if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_b_r_frag.store(scale_b_r_g2r[0].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_b_r_src[0], scale_b_r_frag)
-            if const_expr(with_scale and scale_g2r):
-                load_scale_g2r(
-                    scale_a_t_g2r[0],
-                    scale_a_dma_rsrc,
-                    kiter + 2,
-                    bid_x * 2,
-                    scale_m_rows,
-                    True,
-                )
-            if const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    a_swizzle_rsrc,
-                    kiter + 2,
-                    lds.a_t0.ptr,
-                    bid_x * 2,
-                    swizzle_a_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(a_dma_rsrc, kiter + 2, a_t_dma_ptrs[0], bid_x * 2)
-            else:
-                fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 2], aT_s[0])
-            if const_expr(with_scale and not scale_g2r):
-                raw_scale_g2s(
-                    scale_a_dma_rsrc,
-                    kiter + 2,
-                    scale_a_t_dma_ptrs[0],
-                    bid_x * 2,
-                    scale_m_rows,
-                    True,
-                )
-            schedule_mainloop(
-                1, a_phase_vmem, b_dsrd + int(with_scale and not scale_g2r)
-            )
+                fx.copy(scale_lds_copy_atom, scale_b_r_src[0], scale_b_r_frag)
+            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale_a_b_frag, scale_b_l_frag)
+            prefetch_a_t(kiter + 2, 0)
+            _schedule_compute(1, b_phase_dsrd, a_phase_vmem)
             rocdl.sched_barrier(0)
 
             # ----------------------buf0:part2----------------------
-            do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale_a_t_frag, scale_b_r_frag)
             waitvmcnt_barrier(wait_ba)
             load_b(sB_l_rd[1], s2r_src1_B_l, frag_B_l, dest_frag_B_l)
             if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_b_l_frag.store(scale_b_l_g2r[1].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_b_l_src[1], scale_b_l_frag)
-            if const_expr(with_scale and scale_g2r):
-                load_scale_g2r(
-                    scale_a_b_g2r[0],
-                    scale_a_dma_rsrc,
-                    kiter + 2,
-                    bid_x * 2 + 1,
-                    scale_m_rows,
-                    True,
-                )
-            if const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    a_swizzle_rsrc,
-                    kiter + 2,
-                    lds.a_b0.ptr,
-                    bid_x * 2 + 1,
-                    swizzle_a_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(a_dma_rsrc, kiter + 2, a_b_dma_ptrs[0], bid_x * 2 + 1)
-            else:
-                fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 2], aB_s[0])
-            if const_expr(with_scale and not scale_g2r):
-                raw_scale_g2s(
-                    scale_a_dma_rsrc,
-                    kiter + 2,
-                    scale_a_b_dma_ptrs[0],
-                    bid_x * 2 + 1,
-                    scale_m_rows,
-                    True,
-                )
-            schedule_mainloop(
-                2, a_phase_vmem, b_dsrd + int(with_scale and not scale_g2r)
-            )
+                fx.copy(scale_lds_copy_atom, scale_b_l_src[1], scale_b_l_frag)
+            do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale_a_t_frag, scale_b_r_frag)
+            prefetch_a_b(kiter + 2, 0)
+            _schedule_compute(2, b_phase_dsrd, a_phase_vmem)
             rocdl.sched_barrier(0)
 
             # ----------------------buf0:part3----------------------
-            do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
             waitvmcnt_barrier(wait_ba)
             load_a(s2r_src1_A_t, dest_frag_A_t)
             if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_a_t_frag.store(scale_a_t_g2r[1].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
-            if const_expr(with_scale and scale_g2r):
-                load_scale_g2r(
-                    scale_b_r_g2r[0],
-                    scale_b_dma_rsrc,
-                    kiter + 2,
-                    bid_y * 2 + 1,
-                    scale_n_rows,
-                    False,
-                )
-            if const_expr(b_mxfp4):
-                raw_b_mxfp4_g2s(kiter + 2, lds.b_r0.ptr, bid_y * 2 + 1)
-            elif const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    b_swizzle_rsrc,
-                    kiter + 2,
-                    lds.b_r0.ptr,
-                    bid_y * 2 + 1,
-                    swizzle_b_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(b_dma_rsrc, kiter + 2, b_r_dma_ptrs[0], bid_y * 2 + 1)
-            else:
-                fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 2], bR_s[0])
-            if const_expr(with_scale and not scale_g2r):
-                raw_scale_g2s(
-                    scale_b_dma_rsrc,
-                    kiter + 2,
-                    scale_b_r_dma_ptrs[0],
-                    bid_y * 2 + 1,
-                    scale_n_rows,
-                    False,
-                )
-            schedule_mainloop(
-                3, b_phase_vmem, a_dsrd + int(with_scale and not scale_g2r)
-            )
+                fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
+            do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
+            prefetch_b_r(kiter + 2, 0)
+            _schedule_compute(3, a_phase_dsrd, b_phase_vmem)
             rocdl.sched_barrier(0)
 
             # ---- k-tile = buf1：4 象限 ----
             # ----------------------buf1:part0----------------------
-            do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
             waitvmcnt_barrier(wait_ab)
             load_a(s2r_src1_A_b, dest_frag_A_b)
             if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_a_b_frag.store(scale_a_b_g2r[1].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
-            if const_expr(with_scale and scale_g2r):
-                load_scale_g2r(
-                    scale_b_l_g2r[1],
-                    scale_b_dma_rsrc,
-                    kiter + 3,
-                    bid_y * 2,
-                    scale_n_rows,
-                    False,
-                )
-            if const_expr(b_mxfp4):
-                raw_b_mxfp4_g2s(kiter + 3, lds.b_l1.ptr, bid_y * 2)
-            elif const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    b_swizzle_rsrc,
-                    kiter + 3,
-                    lds.b_l1.ptr,
-                    bid_y * 2,
-                    swizzle_b_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(b_dma_rsrc, kiter + 3, b_l_dma_ptrs[1], bid_y * 2)
-            else:
-                fx.copy(async_copy_atom, bL_g[None, None, None, kiter + 3], bL_s[1])
-            if const_expr(with_scale and not scale_g2r):
-                raw_scale_g2s(
-                    scale_b_dma_rsrc,
-                    kiter + 3,
-                    scale_b_l_dma_ptrs[1],
-                    bid_y * 2,
-                    scale_n_rows,
-                    False,
-                )
-            schedule_mainloop(
-                4, b_phase_vmem, a_dsrd + int(with_scale and not scale_g2r)
-            )
+                fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
+            do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
+            prefetch_b_l(kiter + 3, 1)
+            _schedule_compute(4, a_phase_dsrd, b_phase_vmem)
             rocdl.sched_barrier(0)
 
             # ----------------------buf1:part1----------------------
-            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale_a_b_frag, scale_b_l_frag)
             waitvmcnt_barrier(wait_ab)
             load_b(sB_r_rd[1], s2r_src1_B_r, frag_B_r, dest_frag_B_r)
             if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_b_r_frag.store(scale_b_r_g2r[1].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_b_r_src[1], scale_b_r_frag)
-            if const_expr(with_scale and scale_g2r):
-                load_scale_g2r(
-                    scale_a_t_g2r[1],
-                    scale_a_dma_rsrc,
-                    kiter + 3,
-                    bid_x * 2,
-                    scale_m_rows,
-                    True,
-                )
-            if const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    a_swizzle_rsrc,
-                    kiter + 3,
-                    lds.a_t1.ptr,
-                    bid_x * 2,
-                    swizzle_a_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(a_dma_rsrc, kiter + 3, a_t_dma_ptrs[1], bid_x * 2)
-            else:
-                fx.copy(async_copy_atom, aT_g[None, None, None, kiter + 3], aT_s[1])
-            if const_expr(with_scale and not scale_g2r):
-                raw_scale_g2s(
-                    scale_a_dma_rsrc,
-                    kiter + 3,
-                    scale_a_t_dma_ptrs[1],
-                    bid_x * 2,
-                    scale_m_rows,
-                    True,
-                )
-            schedule_mainloop(
-                5, a_phase_vmem, b_dsrd + int(with_scale and not scale_g2r)
-            )
+                fx.copy(scale_lds_copy_atom, scale_b_r_src[1], scale_b_r_frag)
+            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale_a_b_frag, scale_b_l_frag)
+            prefetch_a_t(kiter + 3, 1)
+            _schedule_compute(5, b_phase_dsrd, a_phase_vmem)
             rocdl.sched_barrier(0)
 
             # ----------------------buf1:part2----------------------
-            do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale_a_t_frag, scale_b_r_frag)
             waitvmcnt_barrier(wait_ba)
             load_b(sB_l_rd[0], s2r_src0_B_l, frag_B_l, dest_frag_B_l)
             if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_b_l_frag.store(scale_b_l_g2r[0].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_b_l_src[0], scale_b_l_frag)
-            if const_expr(with_scale and scale_g2r):
-                load_scale_g2r(
-                    scale_a_b_g2r[1],
-                    scale_a_dma_rsrc,
-                    kiter + 3,
-                    bid_x * 2 + 1,
-                    scale_m_rows,
-                    True,
-                )
-            if const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    a_swizzle_rsrc,
-                    kiter + 3,
-                    lds.a_b1.ptr,
-                    bid_x * 2 + 1,
-                    swizzle_a_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(a_dma_rsrc, kiter + 3, a_b_dma_ptrs[1], bid_x * 2 + 1)
-            else:
-                fx.copy(async_copy_atom, aB_g[None, None, None, kiter + 3], aB_s[1])
-            if const_expr(with_scale and not scale_g2r):
-                raw_scale_g2s(
-                    scale_a_dma_rsrc,
-                    kiter + 3,
-                    scale_a_b_dma_ptrs[1],
-                    bid_x * 2 + 1,
-                    scale_m_rows,
-                    True,
-                )
-            schedule_mainloop(
-                6, a_phase_vmem, b_dsrd + int(with_scale and not scale_g2r)
-            )
+                fx.copy(scale_lds_copy_atom, scale_b_l_src[0], scale_b_l_frag)
+            do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale_a_t_frag, scale_b_r_frag)
+            prefetch_a_b(kiter + 3, 1)
+            _schedule_compute(6, b_phase_dsrd, a_phase_vmem)
             rocdl.sched_barrier(0)
 
             # ----------------------buf1:part3----------------------
-            do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
             waitvmcnt_barrier(wait_ba)
             load_a(s2r_src0_A_t, dest_frag_A_t)
             if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_a_t_frag.store(scale_a_t_g2r[0].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_a_t_src[0], scale_a_t_frag)
-            if const_expr(with_scale and scale_g2r):
-                load_scale_g2r(
-                    scale_b_r_g2r[1],
-                    scale_b_dma_rsrc,
-                    kiter + 3,
-                    bid_y * 2 + 1,
-                    scale_n_rows,
-                    False,
-                )
-            if const_expr(b_mxfp4):
-                raw_b_mxfp4_g2s(kiter + 3, lds.b_r1.ptr, bid_y * 2 + 1)
-            elif const_expr(raw_global_swizzle):
-                raw_fp8_swizzle_g2s(
-                    b_swizzle_rsrc,
-                    kiter + 3,
-                    lds.b_r1.ptr,
-                    bid_y * 2 + 1,
-                    swizzle_b_specs,
-                )
-            elif const_expr(not lds_swizzle and not preshuffle_b):
-                raw_g2s(b_dma_rsrc, kiter + 3, b_r_dma_ptrs[1], bid_y * 2 + 1)
-            else:
-                fx.copy(async_copy_atom, bR_g[None, None, None, kiter + 3], bR_s[1])
-            if const_expr(with_scale and not scale_g2r):
-                raw_scale_g2s(
-                    scale_b_dma_rsrc,
-                    kiter + 3,
-                    scale_b_r_dma_ptrs[1],
-                    bid_y * 2 + 1,
-                    scale_n_rows,
-                    False,
-                )
-            schedule_mainloop(
-                7, b_phase_vmem, a_dsrd + int(with_scale and not scale_g2r)
-            )
+                fx.copy(scale_lds_copy_atom, scale_a_t_src[0], scale_a_t_frag)
+            do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
+            prefetch_b_r(kiter + 3, 1)
+            _schedule_compute(7, a_phase_dsrd, b_phase_vmem)
             rocdl.sched_barrier(0)
 
             results = yield [
@@ -1662,49 +1041,39 @@ def compile_gemm_fp8(
         frag_C_br.store(results[3])
 
         # ---- epilogue：最后 2 个 k-tile（buf0 / buf1），无 g2s，只做 s2r + gemm ----
+        # Six hardware barriers total; phases 6/7 have no next LDS operand.
+        # As in the mainloop, next reads are disjoint from the current GEMM.
         # buf0 的 4 象限
         waitvmcnt_barrier(wait_ab)
-        do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
         load_a(s2r_src0_A_b, dest_frag_A_b)
         if const_expr(with_scale):
-            if const_expr(scale_g2r):
-                scale_a_b_frag.store(scale_a_b_g2r[0].load())
-            else:
-                fx.copy(scale_lds_copy_atom, scale_a_b_src[0], scale_a_b_frag)
-        hot_loop_scheduler_mainloop(0, 0, 8 + int(with_scale and not scale_g2r))
+            fx.copy(scale_lds_copy_atom, scale_a_b_src[0], scale_a_b_frag)
+        do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
+        _schedule_compute(0, a_phase_dsrd, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(2 * (a_phase_vmem + b_phase_vmem))
-        do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale_a_b_frag, scale_b_l_frag)
         load_b(sB_r_rd[0], s2r_src0_B_r, frag_B_r, dest_frag_B_r)
         if const_expr(with_scale):
-            if const_expr(scale_g2r):
-                scale_b_r_frag.store(scale_b_r_g2r[0].load())
-            else:
-                fx.copy(scale_lds_copy_atom, scale_b_r_src[0], scale_b_r_frag)
-        hot_loop_scheduler_mainloop(1, 0, 8 + int(with_scale and not scale_g2r))
+            fx.copy(scale_lds_copy_atom, scale_b_r_src[0], scale_b_r_frag)
+        do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale_a_b_frag, scale_b_l_frag)
+        _schedule_compute(1, b_phase_dsrd, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(2 * a_phase_vmem + b_phase_vmem)
-        do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale_a_t_frag, scale_b_r_frag)
         load_b(sB_l_rd[1], s2r_src1_B_l, frag_B_l, dest_frag_B_l)
         if const_expr(with_scale):
-            if const_expr(scale_g2r):
-                scale_b_l_frag.store(scale_b_l_g2r[1].load())
-            else:
-                fx.copy(scale_lds_copy_atom, scale_b_l_src[1], scale_b_l_frag)
-        hot_loop_scheduler_mainloop(2, 0, 8 + int(with_scale and not scale_g2r))
+            fx.copy(scale_lds_copy_atom, scale_b_l_src[1], scale_b_l_frag)
+        do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale_a_t_frag, scale_b_r_frag)
+        _schedule_compute(2, b_phase_dsrd, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(a_phase_vmem + b_phase_vmem)
-        do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
         load_a(s2r_src1_A_t, dest_frag_A_t)
         if const_expr(with_scale):
-            if const_expr(scale_g2r):
-                scale_a_t_frag.store(scale_a_t_g2r[1].load())
-            else:
-                fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
-        hot_loop_scheduler_mainloop(3, 0, 8 + int(with_scale and not scale_g2r))
+            fx.copy(scale_lds_copy_atom, scale_a_t_src[1], scale_a_t_frag)
+        do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
+        _schedule_compute(3, a_phase_dsrd, 0)
         rocdl.sched_barrier(0)
         N_tail = N % TILE_N != 0
         # ---- store_quadrant 定义提前（放到 buf1 尾部之前），供 store 与最后的 MFMA 交织 ----
@@ -1824,29 +1193,23 @@ def compile_gemm_fp8(
         # buf1 的 4 象限。store_overlap 时把每象限的 store 与后一象限的 MFMA 交织，
         # 用 MFMA 计算掩盖 buffer_store 的写延迟（对标 bf16 v9 scheduler_store_overlap）；
         # 否则先算完 4 象限，再统一 store（不交织，用于对照）。
-        if const_expr(store_overlap):
-            waitvmcnt_barrier(b_phase_vmem)
-            do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
-            load_a(s2r_src1_A_b, dest_frag_A_b)
-            if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_a_b_frag.store(scale_a_b_g2r[1].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
-            hot_loop_scheduler_mainloop(4, 0, 8 + int(with_scale and not scale_g2r))
-            rocdl.sched_barrier(0)
+        waitvmcnt_barrier(b_phase_vmem)
+        load_a(s2r_src1_A_b, dest_frag_A_b)
+        if const_expr(with_scale):
+            fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
+        do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
+        _schedule_compute(4, a_phase_dsrd, 0)
+        rocdl.sched_barrier(0)
 
-            waitvmcnt_barrier(0)
+        waitvmcnt_barrier(0)
+        load_b(sB_r_rd[1], s2r_src1_B_r, frag_B_r, dest_frag_B_r)
+        if const_expr(with_scale):
+            fx.copy(scale_lds_copy_atom, scale_b_r_src[1], scale_b_r_frag)
+        do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale_a_b_frag, scale_b_l_frag)
+        if const_expr(store_overlap):
             # bl 的 MFMA 与 tl 的 store 互相掩盖
-            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale_a_b_frag, scale_b_l_frag)
-            load_b(sB_r_rd[1], s2r_src1_B_r, frag_B_r, dest_frag_B_r)
-            if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_b_r_frag.store(scale_b_r_g2r[1].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_b_r_src[1], scale_b_r_frag)
             store_quadrant(frag_C_tl, bC_tl, 0, 0)
-            scheduler_store_overlap(5)
+            scheduler_store_overlap(5, b_phase_dsrd)
             rocdl.sched_barrier(0)
 
             # tr 的 MFMA 掩盖 bl 的 store
@@ -1864,33 +1227,14 @@ def compile_gemm_fp8(
             # 最后 br 单独 store
             store_quadrant(frag_C_br, bC_br, 1, 1)
         else:
-            waitvmcnt_barrier(b_phase_vmem)
-            do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
-            load_a(s2r_src1_A_b, dest_frag_A_b)
-            if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_a_b_frag.store(scale_a_b_g2r[1].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_a_b_src[1], scale_a_b_frag)
-            hot_loop_scheduler_mainloop(4, 0, 8 + int(with_scale and not scale_g2r))
-            rocdl.sched_barrier(0)
-
-            waitvmcnt_barrier(0)
-            do_gemm(frag_C_bl, frag_B_l, frag_A_b, scale_a_b_frag, scale_b_l_frag)
-            load_b(sB_r_rd[1], s2r_src1_B_r, frag_B_r, dest_frag_B_r)
-            if const_expr(with_scale):
-                if const_expr(scale_g2r):
-                    scale_b_r_frag.store(scale_b_r_g2r[1].load())
-                else:
-                    fx.copy(scale_lds_copy_atom, scale_b_r_src[1], scale_b_r_frag)
-            hot_loop_scheduler_mainloop(5, 0, 8 + int(with_scale and not scale_g2r))
+            _schedule_compute(5, b_phase_dsrd, 0)
             rocdl.sched_barrier(0)
 
             do_gemm(frag_C_tr, frag_B_r, frag_A_t, scale_a_t_frag, scale_b_r_frag)
-            hot_loop_scheduler_mainloop(6, 0, 0)
+            _schedule_compute(6, 0, 0)
             rocdl.sched_barrier(0)
             do_gemm(frag_C_br, frag_B_r, frag_A_b, scale_a_b_frag, scale_b_r_frag)
-            hot_loop_scheduler_mainloop(7, 0, 0)
+            _schedule_compute(7, 0, 0)
             rocdl.sched_barrier(0)
 
             store_quadrant(frag_C_tl, bC_tl, 0, 0)
@@ -2011,8 +1355,8 @@ def run_test(
             .contiguous()
             .view(-1)
         )
-        # BufferCopyLDS32b reads an 8-group window although each BK128 consumes 4.
-        # Keep the final workaround overread inside the allocation.
+        # Retain the legacy host allocation padding for run_test compatibility;
+        # raw scale DMA consumes only four groups per BK128, without overread.
         padding = torch.full((rows * 4,), 127, device=scale.device, dtype=torch.uint8)
         return torch.cat((permuted, padding)).view(torch.int32)
 
@@ -2335,8 +1679,8 @@ if __name__ == "__main__":
         permlane_output=PERMLANE_EPILOGUE,
         store_overlap=STORE_OVERLAP,
         with_scale=False,
-        B_MXFP4=True,
-        B_LDS_SWIZZLE=True,
+        B_MXFP4=False,
+        B_LDS_SWIZZLE=False,
     )
     # run_test(
     #     M=M,
