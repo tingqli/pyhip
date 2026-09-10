@@ -265,11 +265,23 @@ def _build_moe_gemm2_8x1_k320(
             scratch_base = (wave % 4) * 16 * BN
             lane_group, row8, row_half = lane // 16, (lane % 16) % 8, (lane % 16) // 8
 
+            if const_expr(weight_quant_type == "ptpc"):
+                scale_buffer = fx.rocdl.make_buffer_tensor(
+                    fxh.view_as_torch_tensor(fxh._as_ptr(p_w_scale, fx.Float32) + fx.Int64(expert) * N, (N,), fx.Float32),
+                    max_size=False, num_records_bytes=N * 4,
+                )
+
             def load_scale(n, pair):
                 if const_expr(weight_quant_type == "ptpc"):
-                    tensor = fx.make_view(fxh._as_ptr(p_w_scale, fx.Float32) + fx.Int64(expert) * N + n * BN + pair * 32,
-                                          fx.make_layout((32, BM), (1, 0)))
-                    return ops.load_tiled_mma_fragC(mm, tensor, copy_atom_bits=32)
+                    # fx.copy的soffset按元素计量；uniform N偏移由SGPR提供。
+                    tensor = fx.make_view(fx.get_iter(scale_buffer) + pair * 32, fx.make_layout((32, BM), (1, 0)))
+                    # 每pair仍两条dwordx4，保持原VMEM请求数和等待账本。
+                    copy_atom = ops.get_buffer_copy_atom(fx.Float32, 128)
+                    fragment = mm.make_fragment_C(tensor)
+                    fx.copy(copy_atom, ops.get_tiled_mma_partition_S(mm, tensor, "C", copy_atom_bits=128),
+                            ops.get_tiled_mma_retile(mm, fragment, "C", copy_atom=copy_atom),
+                            soffset=fx.Int32(n * BN))
+                    return fragment
                 else:
                     return fx.Float32(1.0)
 
@@ -297,10 +309,14 @@ def _build_moe_gemm2_8x1_k320(
                 return [Vec.from_elements(record, fx.Uint32).bitcast(fx.BFloat16) for record in records]
 
             def issue_output(n, packed, row, half):
+                def plane_offset(r, g, p):
+                    # BF16元素偏移：两段8B分到相距2KiB的plane，producer仍128bit写。
+                    return ((r & 1) * 8 + ((g & 2) ^ (r & 2)) * 8
+                            + ((p & 1) ^ ((r >> 2) & 1)) * 32 + (p >> 1) * 64
+                            + (r >> 3) * 128 + (r & 6) * 128 + (g & 1) * 1024)
                 for local_pair in range_constexpr(2):
                     pair = half * 2 + local_pair
-                    record = (pair * 4 + lane_group) ^ row8
-                    offset = scratch_base + ((row_half * 8 + row8) * 16 + record) * 8
+                    offset = scratch_base + plane_offset(lane % 16, lane_group, pair)
                     destination = fx.make_view(fx.get_iter(scratch_view) + offset, fx.make_layout(8, 1))
                     fragment = fx.make_fragment_like(destination)
                     fragment.store(packed[pair][row])
@@ -309,19 +325,19 @@ def _build_moe_gemm2_8x1_k320(
                 for oh in range_constexpr(2):
                     atom_index = half * 8 + lane % 8
                     ng = atom_index // 2
+                    offset = scratch_base + plane_offset(oh * 8 + lane // 8, 2 * (atom_index % 2), ng // 2) + (ng % 2) * 4
                     pieces = []
                     for source_group in range_constexpr(2):
-                        logical_record = (ng // 2) * 4 + (atom_index % 2) * 2 + source_group
-                        record = logical_record ^ (lane // 8)
-                        offset = scratch_base + ((oh * 8 + lane // 8) * 16 + record) * 8 + (ng % 2) * 4
-                        source = fx.make_view(fx.get_iter(scratch_view) + offset, fx.make_layout(4, 1))
+                        source = fx.make_view(fx.get_iter(scratch_view) + offset + source_group * 1024, fx.make_layout(4, 1))
                         fragment = fx.make_fragment_like(source)
                         fx.copy(scratch_read, source, fragment)
                         pieces.append(fragment)
+                    # 合并同一输出的两次64bit读，禁止跨oh配对产生额外搬运。
+                    fx.rocdl.sched_barrier(0)
                     fragments.append(pieces)
                     out_row = wave * 16 + row * 128 + oh * 8 + lane // 8
-                    destinations.append(fx.make_view(fx.get_iter(out) + out.layout(atom_index * 8, out_row) + n * BN,
-                                                     fx.make_layout(8, 1)))
+                    destinations.append((n, fx.make_view(fx.get_iter(out) + out.layout(atom_index * 8, out_row),
+                                                        fx.make_layout(8, 1))))
                 return fragments, destinations
 
             def store_output(fragments, destinations, lgkmcnt=0):
@@ -330,7 +346,8 @@ def _build_moe_gemm2_8x1_k320(
                     first, second = Vec(fragments[index][0].load()), Vec(fragments[index][1].load())
                     result = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
                     result.store(first.shuffle(second, list(range(8))))
-                    fx.copy(store_atom, result, destinations[index])
+                    output_n, destination = destinations[index]
+                    fx.copy(store_atom, result, destination, soffset=fx.Int32(output_n * BN))
 
             def retire(n, packed):
                 for half in range_constexpr(2):
