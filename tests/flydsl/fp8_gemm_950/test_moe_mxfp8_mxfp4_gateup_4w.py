@@ -6,7 +6,6 @@ The kernel applies SiTUv2 to the gate and up projections and writes
 
 import argparse
 import csv
-import os
 import time
 
 import torch
@@ -34,15 +33,6 @@ SITU_LINEAR_BETA = 1.5
 
 def div_up(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
-
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
 def validate_case_parameters(
@@ -370,79 +360,54 @@ def waitvmcnt_barrier(vmcnt: int) -> None:
     rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
     rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
     rocdl.s_barrier()
+    # Keep the compute prefix inside this phase, after its waits/barrier.
+    # This is only a compiler scheduling fence, not another hardware barrier.
+    rocdl.sched_barrier(0)
 
 
-def hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops):
-    total_mfmas = 16
-    scale_sched_late = _env_flag("SCALE_SCHED_LATE", "1")
-    scale_dsrd_pos = int(os.environ.get("SCALE_DSRD_POS", "13"))
-    scale_vmem_pos = int(os.environ.get("SCALE_VMEM_POS", "7"))
-    base_dsrd_ops = 8 if scale_sched_late and dsrd_ops == 9 else dsrd_ops
-    has_scale_vmem = scale_sched_late and vmem_ops in (3, 5)
-    base_vmem_ops = vmem_ops - 1 if has_scale_vmem else vmem_ops
-    prev_dsrd = 0
-    prev_vmem = 0
-    for i in range_constexpr(total_mfmas):
-        cur_dsrd = ((i + 3) * base_dsrd_ops + total_mfmas - 1) // total_mfmas
-        cur_dsrd = min(cur_dsrd, base_dsrd_ops)
-        if const_expr(scale_sched_late and dsrd_ops == 9 and i >= scale_dsrd_pos):
-            cur_dsrd += 1
-        if const_expr(cur_dsrd > prev_dsrd):
-            rocdl.sched_group_barrier(rocdl.mask_dsrd, cur_dsrd - prev_dsrd, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-        cur_vmem = ((i + 1) * base_vmem_ops + total_mfmas - 1) // total_mfmas
-        if const_expr(has_scale_vmem and i >= scale_vmem_pos):
-            cur_vmem += 1
-        if const_expr(cur_vmem > prev_vmem):
-            rocdl.sched_group_barrier(
-                rocdl.mask_vmem_rd, cur_vmem - prev_vmem, group_id
-            )
-        prev_dsrd = cur_dsrd
-        prev_vmem = cur_vmem
+def _schedule_compute(group_id, dsrd_ops, vmem_ops):
+    """Lead with MFMA2, then repeat VMEM1 -> MFMA2 -> LDS2 -> MFMA1.
 
-
-def _schedule_mainloop_loads(group_id, dsrd_ops, vmem_ops):
-    """VMEM first, then pairs of DS reads followed by MFMA work.
-
-    Data and scale both use G2S; the scale adds one DS_READ_B32.
-    Reserve one final MFMA for the odd DS read. The DS mask matches both
-    widths, so the singleton group does not specifically select the scale.
-    Hardware waits/barriers stay at the call site's original pipeline boundary.
-    Check final ISA: dependencies can prevent the requested scheduling edges.
+    Counts include scales: the VMEM mask matches DWORD and DWORDx4 alike;
+    the odd LDS read gets a singleton group. The two compute groups are
+    sequential, NOT shared MFMA slots: a complete bundle uses three MFMAs.
+    The two leading MFMAs come from the tail, keeping 16 MFMAs per phase.
+    The epilogue drain shares this schedule with vmem_ops=0; skip exhausted
+    memory pairings and finish the remaining MFMAs without zero-count groups.
+    These are scheduling hints for independent work, not hardware waits.
     """
-    assert dsrd_ops in (5, 9)
-    if const_expr(_env_flag("MOE_BASELINE_SCHED", "0")):
-        hot_loop_scheduler_mainloop(group_id, vmem_ops, dsrd_ops)
-    else:
-        rocdl.sched_group_barrier(rocdl.mask_vmem_rd, vmem_ops, group_id)
-        paired_dsrd_ops = dsrd_ops - 1
-        pair_count = paired_dsrd_ops // 2
-        for pair_index in range_constexpr(pair_count):
-            rocdl.sched_group_barrier(rocdl.mask_dsrd, 2, group_id)
-            mfma_ops = 32 // paired_dsrd_ops - int(pair_index == pair_count - 1)
-            rocdl.sched_group_barrier(rocdl.mask_mfma, mfma_ops, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+    assert vmem_ops >= 0 and dsrd_ops >= 0
+    mfma_prefix = 2
+    dsrd_groups = (dsrd_ops + 1) // 2
+    mfma_tail = 16 - mfma_prefix - 2 * vmem_ops - dsrd_groups
+    assert mfma_tail >= 0
+    rocdl.sched_group_barrier(rocdl.mask_mfma, mfma_prefix, group_id)
+    for i in range_constexpr(max(vmem_ops, dsrd_groups)):
+        if const_expr(i < vmem_ops):
+            rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
+            rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
+        if const_expr(i < dsrd_groups):
+            rocdl.sched_group_barrier(
+                rocdl.mask_dsrd, min(2, dsrd_ops - 2 * i), group_id
+            )
+            rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+    if const_expr(mfma_tail > 0):
+        rocdl.sched_group_barrier(rocdl.mask_mfma, mfma_tail, group_id)
 
 
 def hot_loop_scheduler_read_a_prefetch_b(group_id, g2s_ops, dsrd_ops):
     """Phases 0/3: 16 MFMA, 8 data DS + 1 scale DS, 2 data G2S + 1 scale G2S.
 
-    Request VMEM3, (DS2/MFMA4)x3, DS2/MFMA3, DS1/MFMA1.
     The two phases share this template, NOT their vmcnt thresholds.
     """
     assert g2s_ops == 2 and dsrd_ops == 8
-    _schedule_mainloop_loads(group_id, dsrd_ops + 1, g2s_ops + 1)
+    _schedule_compute(group_id, dsrd_ops + 1, g2s_ops + 1)
 
 
 def hot_loop_scheduler_read_b_prefetch_a(group_id, g2s_ops, dsrd_ops):
-    """Phases 1/2: 16 MFMA, 4 data DS + 1 scale DS, 4 data G2S + 1 scale G2S.
-
-    Request VMEM5, DS2/MFMA8, DS2/MFMA7, DS1/MFMA1.
-    Scheduling requests cannot override operand or memory dependencies.
-    """
+    """Phases 1/2: 16 MFMA, 4 data DS + 1 scale DS, 4 data G2S + 1 scale G2S."""
     assert g2s_ops == 4 and dsrd_ops == 4
-    _schedule_mainloop_loads(group_id, dsrd_ops + 1, g2s_ops + 1)
+    _schedule_compute(group_id, dsrd_ops + 1, g2s_ops + 1)
 
 
 def compile_moe_gateup_4w(
@@ -1430,7 +1395,12 @@ def compile_moe_gateup_4w(
         frag_c_bl.store(loop_results[2])
         frag_c_br.store(loop_results[3])
 
+        # Drain the last two K tiles with the same compute scheduler, no VMEM.
+        # As in the mainloop, seed each region with independent next-operand
+        # reads before GEMM so LLVM can interleave them without scale anti-deps.
         waitvmcnt_barrier(wait_ab)
+        load_a(a_bottom_source[0], frag_a_bottom_dest)
+        load_scale(scale_a_bottom_source[0], scale_a_bottom_frag)
         do_gemm(
             frag_c_tl,
             frag_b_gate,
@@ -1438,12 +1408,12 @@ def compile_moe_gateup_4w(
             scale_a_top_frag,
             scale_b_gate_frag,
         )
-        load_a(a_bottom_source[0], frag_a_bottom_dest)
-        load_scale(scale_a_bottom_source[0], scale_a_bottom_frag)
-        hot_loop_scheduler_mainloop(0, 0, a_dsrd + 1)
+        _schedule_compute(0, a_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(2 * (a_phase_vmem + b_phase_vmem))
+        load_b(b_up_read[0], frag_b_up)
+        load_scale(scale_b_up_source[0], scale_b_up_frag)
         do_gemm(
             frag_c_bl,
             frag_b_gate,
@@ -1451,12 +1421,12 @@ def compile_moe_gateup_4w(
             scale_a_bottom_frag,
             scale_b_gate_frag,
         )
-        load_b(b_up_read[0], frag_b_up)
-        load_scale(scale_b_up_source[0], scale_b_up_frag)
-        hot_loop_scheduler_mainloop(1, 0, b_dsrd + 1)
+        _schedule_compute(1, b_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(2 * a_phase_vmem + b_phase_vmem)
+        load_b(b_gate_read[1], frag_b_gate)
+        load_scale(scale_b_gate_source[1], scale_b_gate_frag)
         do_gemm(
             frag_c_tr,
             frag_b_up,
@@ -1464,12 +1434,12 @@ def compile_moe_gateup_4w(
             scale_a_top_frag,
             scale_b_up_frag,
         )
-        load_b(b_gate_read[1], frag_b_gate)
-        load_scale(scale_b_gate_source[1], scale_b_gate_frag)
-        hot_loop_scheduler_mainloop(2, 0, b_dsrd + 1)
+        _schedule_compute(2, b_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(a_phase_vmem + b_phase_vmem)
+        load_a(a_top_source[1], frag_a_top_dest)
+        load_scale(scale_a_top_source[1], scale_a_top_frag)
         do_gemm(
             frag_c_br,
             frag_b_up,
@@ -1477,12 +1447,12 @@ def compile_moe_gateup_4w(
             scale_a_bottom_frag,
             scale_b_up_frag,
         )
-        load_a(a_top_source[1], frag_a_top_dest)
-        load_scale(scale_a_top_source[1], scale_a_top_frag)
-        hot_loop_scheduler_mainloop(3, 0, a_dsrd + 1)
+        _schedule_compute(3, a_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(b_phase_vmem)
+        load_a(a_bottom_source[1], frag_a_bottom_dest)
+        load_scale(scale_a_bottom_source[1], scale_a_bottom_frag)
         do_gemm(
             frag_c_tl,
             frag_b_gate,
@@ -1490,12 +1460,12 @@ def compile_moe_gateup_4w(
             scale_a_top_frag,
             scale_b_gate_frag,
         )
-        load_a(a_bottom_source[1], frag_a_bottom_dest)
-        load_scale(scale_a_bottom_source[1], scale_a_bottom_frag)
-        hot_loop_scheduler_mainloop(4, 0, a_dsrd + 1)
+        _schedule_compute(4, a_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(0)
+        load_b(b_up_read[1], frag_b_up)
+        load_scale(scale_b_up_source[1], scale_b_up_frag)
         do_gemm(
             frag_c_bl,
             frag_b_gate,
@@ -1503,9 +1473,7 @@ def compile_moe_gateup_4w(
             scale_a_bottom_frag,
             scale_b_gate_frag,
         )
-        load_b(b_up_read[1], frag_b_up)
-        load_scale(scale_b_up_source[1], scale_b_up_frag)
-        hot_loop_scheduler_mainloop(5, 0, b_dsrd + 1)
+        _schedule_compute(5, b_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         do_gemm(
@@ -1515,7 +1483,7 @@ def compile_moe_gateup_4w(
             scale_a_top_frag,
             scale_b_up_frag,
         )
-        hot_loop_scheduler_mainloop(6, 0, 0)
+        _schedule_compute(6, 0, 0)
         rocdl.sched_barrier(0)
         do_gemm(
             frag_c_br,
@@ -1524,7 +1492,7 @@ def compile_moe_gateup_4w(
             scale_a_bottom_frag,
             scale_b_up_frag,
         )
-        hot_loop_scheduler_mainloop(7, 0, 0)
+        _schedule_compute(7, 0, 0)
         rocdl.sched_barrier(0)
 
         pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")

@@ -440,7 +440,7 @@ def main() -> None:
         "--tokens",
         type=int,
         nargs="+",
-        default=(8192, 16384, 24576, 12288, 24576, 49152),
+        default=(8192, 16384, 32768, 65536, 12288, 24576, 49152),
     )
     parser.add_argument("--gate-up-size", type=int, default=512)
     parser.add_argument("--hidden-size", type=int, default=6144)
