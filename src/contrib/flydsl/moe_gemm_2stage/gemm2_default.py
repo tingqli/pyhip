@@ -14,8 +14,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 
-from . import layout_helpers as fxh
-from .common import get_down_device_config as _get_down_device_config
+from . import common as fxh
 
 # gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
 _DOWN_STORE_CACHE_MODIFIER = 2
@@ -44,6 +43,7 @@ def _build_moe_gemm2_default(
     down_path="default",
     down_output_padding_bytes=None,
     METADATA_TILE_SIZE_M=None,
+    _task_table=False,
 ):
     assert stage == "down"
     assert down_path == "default"
@@ -102,69 +102,8 @@ def _build_moe_gemm2_default(
     assert (
         BLOCK_TILE_SIZE_M == METADATA_TILE_SIZE_M
     ), "only gateup prefill_1x4 supports different kernel/metadata M tiles"
-    assert down_path in ("default", "1x4_64x256", "2x4", "1x8")
-    use_1x4_64x256 = down_path == "1x4_64x256"
-    use_2x4 = down_path == "2x4"
-    use_1x8 = down_path == "1x8"
-    topology_enabled, generic_xcd_count = (
-        _get_down_device_config()
-        if use_1x4_64x256 or use_2x4 or use_1x8
-        else (False, 8)
-    )
-    block_m_per_4wave_group = 64
-
-    # Down path selection. 1x4_64x256 uses a 1x4-wave M64xN256 workgroup;
-    # 2x4 combines two independent 4-wave subgroups into one M128xN256
-    # workgroup; 1x8 uses a 1x8-wave M64xN512 workgroup.
-    if use_1x4_64x256:
-        assert BLOCK_TILE_SIZE_M == 64
-        assert BLOCK_TILE_SIZE_N == 256
-    elif use_2x4:
-        assert BLOCK_TILE_SIZE_M == 128
-        assert BLOCK_TILE_SIZE_N == 256
-    elif use_1x8:
-        assert BLOCK_TILE_SIZE_M == 64
-        assert BLOCK_TILE_SIZE_N == 512
-        assert weight_quant_type == "per_tensor"
-        assert act_quant_type == "per_tensor"
-    else:
-        assert down_output_padding_bytes is None
-
-    cshuffle_2x4_bytes = 8 * 16 * 64 * 2
-
-    # MI308X有4个XCC，每个XCC包含4个SE，每个SE包含5个CU。
-    # topology map仅在MI308X上启用；每个分区的任务数由运行时有效任务数推导。
-    if use_1x4_64x256 or use_2x4 or use_1x8:
-        assert stage == "down" and alg == "prefill_1x4"
-        assert N % BLOCK_TILE_SIZE_N == 0
-        assert K % 64 == 0
-        assert weight_dtype == "fp8"
-        assert weight_quant_type in ("ptpc", "per_tensor")
-        assert down_output_padding_bytes in (0, 32, 64, 128)
-        if use_1x4_64x256:
-            activation_bytes = block_m_per_4wave_group * K
-            scale_bytes = BLOCK_TILE_SIZE_N * 4 if weight_quant_type == "ptpc" else 0
-            cshuffle_bytes = 4 * 16 * 64 * (fx.BFloat16.width // 8)
-            assert activation_bytes + scale_bytes + cshuffle_bytes <= 64 * 1024, (
-                "1x4_64x256 exceeds gfx942 LDS capacity; "
-                f"activation={activation_bytes}B, scale={scale_bytes}B, "
-                f"cshuffle={cshuffle_bytes}B"
-            )
-        if use_2x4:
-            activation_bytes = 2 * block_m_per_4wave_group * K
-            assert activation_bytes + cshuffle_2x4_bytes <= 64 * 1024, (
-                "2x4 requires activation and row-major CShuffle "
-                "to fit gfx942 LDS; "
-                f"activation={activation_bytes}B, "
-                f"cshuffle={cshuffle_2x4_bytes}B"
-            )
-        if use_1x8:
-            activation_bytes = block_m_per_4wave_group * K
-            cshuffle_bytes = 8 * 16 * 64 * (fx.BFloat16.width // 8)
-            assert activation_bytes + cshuffle_bytes <= 64 * 1024, (
-                "1x8 exceeds gfx942 LDS capacity; "
-                f"activation={activation_bytes}B, cshuffle={cshuffle_bytes}B"
-            )
+    assert down_output_padding_bytes is None or _task_table
+    output_row_stride = N + (down_output_padding_bytes or 0) // 2
     # Supported native-fp8 prefill (weight, act) combos: weight ptpc requires act ptpc;
     # weight per_tensor allows act ptpc or per_tensor.
     if weight_dtype == "fp8" and alg == "prefill_1x4":
@@ -1357,30 +1296,31 @@ def _build_moe_gemm2_default(
         max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
 
         if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
+            if const_expr(_task_table):
+                row_begin = fx.Int64(p_sorted_expert_ids[2 * e_idx])
             arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
             arg_p_output = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_output, fx.BFloat16)
-                + fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * N),
-                (BLOCK_TILE_SIZE_M, N),
+                + (row_begin * output_row_stride if const_expr(_task_table) else fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * N)),
+                (BLOCK_TILE_SIZE_M, output_row_stride),
             )
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M,
+                fxh._as_ptr(p_sorted_ids) + (row_begin if const_expr(_task_table) else e_idx * BLOCK_TILE_SIZE_M),
                 (BLOCK_TILE_SIZE_M,),
                 fx.Int32,
             )
             arg_p_sorted_weights = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_weights) + e_idx * BLOCK_TILE_SIZE_M,
+                fxh._as_ptr(p_sorted_weights) + (row_begin if const_expr(_task_table) else e_idx * BLOCK_TILE_SIZE_M),
                 (BLOCK_TILE_SIZE_M,),
                 fx.Float32,
             )
-            expert_id = fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[
-                e_idx
-            ]
+            expert_id = p_sorted_expert_ids[2 * e_idx + 1] if const_expr(_task_table) else fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[e_idx]
 
             # 16bytes/DW4
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
-                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id * N * K),
+                fxh._as_ptr(p_weight, weight_dtype)
+                + (fx.Int64(expert_id) * N * K if const_expr(_task_table) else fx.Int64(expert_id * N * K)),
                 fx.make_layout(
                     ((16, N // 16), (element_num, K // element_num)),
                     ((element_num, 16 * K), (1, 16 * element_num)),

@@ -16,7 +16,7 @@ from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from . import layout_helpers as fxh
+from . import common as fxh
 from .common import get_device_cache_key
 
 

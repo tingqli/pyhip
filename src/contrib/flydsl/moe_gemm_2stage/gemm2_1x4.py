@@ -15,7 +15,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from . import layout_helpers as fxh
+from . import common as fxh
 from .common import get_down_device_config as _get_down_device_config
 
 # gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
@@ -41,6 +41,8 @@ def _build_moe_gemm2_1x4(
     down_path="default",
     down_output_padding_bytes=None,
     METADATA_TILE_SIZE_M=None,
+    _task_table=False,
+    _store_cache=_DOWN_STORE_CACHE_MODIFIER,
 ):
     assert stage == "down"
     assert down_path == "1x4_64x256"
@@ -82,35 +84,10 @@ def _build_moe_gemm2_1x4(
     assert (
         BLOCK_TILE_SIZE_M == METADATA_TILE_SIZE_M
     ), "only gateup prefill_1x4 supports different kernel/metadata M tiles"
-    assert down_path in ("default", "1x4_64x256", "2x4", "1x8")
-    use_1x4_64x256 = down_path == "1x4_64x256"
-    use_2x4 = down_path == "2x4"
-    use_1x8 = down_path == "1x8"
-    topology_enabled, generic_xcd_count = (
-        _get_down_device_config()
-        if use_1x4_64x256 or use_2x4 or use_1x8
-        else (False, 8)
-    )
+    _, generic_xcd_count = _get_down_device_config()
     block_m_per_4wave_group = 64
-
-    # Down path selection. 1x4_64x256 uses a 1x4-wave M64xN256 workgroup;
-    # 2x4 combines two independent 4-wave subgroups into one M128xN256
-    # workgroup; 1x8 uses a 1x8-wave M64xN512 workgroup.
-    if use_1x4_64x256:
-        assert BLOCK_TILE_SIZE_M == 64
-        assert BLOCK_TILE_SIZE_N == 256
-    elif use_2x4:
-        assert BLOCK_TILE_SIZE_M == 128
-        assert BLOCK_TILE_SIZE_N == 256
-    elif use_1x8:
-        assert BLOCK_TILE_SIZE_M == 64
-        assert BLOCK_TILE_SIZE_N == 512
-        assert weight_quant_type == "per_tensor"
-        assert act_quant_type == "per_tensor"
-    else:
-        assert down_output_padding_bytes is None
-
-    cshuffle_2x4_bytes = 8 * 16 * 64 * 2
+    assert BLOCK_TILE_SIZE_M == 64
+    assert BLOCK_TILE_SIZE_N == 256
 
     # MI308X有4个XCC，每个XCC包含4个SE，每个SE包含5个CU。
     # topology map仅在MI308X上启用；每个分区的任务数由运行时有效任务数推导。
@@ -118,37 +95,20 @@ def _build_moe_gemm2_1x4(
     gfx942_se_per_xcc = 4
     gfx942_cu_per_se = 5
     gfx942_se_count = gfx942_xcc_count * gfx942_se_per_xcc
-    if use_1x4_64x256 or use_2x4 or use_1x8:
-        assert stage == "down" and alg == "prefill_1x4"
-        assert N % BLOCK_TILE_SIZE_N == 0
-        assert K % 64 == 0
-        assert weight_dtype == "fp8"
-        assert weight_quant_type in ("ptpc", "per_tensor")
-        assert down_output_padding_bytes in (0, 32, 64, 128)
-        if use_1x4_64x256:
-            activation_bytes = block_m_per_4wave_group * K
-            scale_bytes = BLOCK_TILE_SIZE_N * 4 if weight_quant_type == "ptpc" else 0
-            cshuffle_bytes = 4 * 16 * 64 * (fx.BFloat16.width // 8)
-            assert activation_bytes + scale_bytes + cshuffle_bytes <= 64 * 1024, (
-                "1x4_64x256 exceeds gfx942 LDS capacity; "
-                f"activation={activation_bytes}B, scale={scale_bytes}B, "
-                f"cshuffle={cshuffle_bytes}B"
-            )
-        if use_2x4:
-            activation_bytes = 2 * block_m_per_4wave_group * K
-            assert activation_bytes + cshuffle_2x4_bytes <= 64 * 1024, (
-                "2x4 requires activation and row-major CShuffle "
-                "to fit gfx942 LDS; "
-                f"activation={activation_bytes}B, "
-                f"cshuffle={cshuffle_2x4_bytes}B"
-            )
-        if use_1x8:
-            activation_bytes = block_m_per_4wave_group * K
-            cshuffle_bytes = 8 * 16 * 64 * (fx.BFloat16.width // 8)
-            assert activation_bytes + cshuffle_bytes <= 64 * 1024, (
-                "1x8 exceeds gfx942 LDS capacity; "
-                f"activation={activation_bytes}B, cshuffle={cshuffle_bytes}B"
-            )
+    assert alg == "prefill_1x4"
+    assert N % BLOCK_TILE_SIZE_N == 0
+    assert K % 64 == 0
+    assert weight_dtype == "fp8"
+    assert weight_quant_type in ("ptpc", "per_tensor")
+    assert down_output_padding_bytes in (0, 32, 64, 128)
+    activation_bytes = block_m_per_4wave_group * K
+    scale_bytes = BLOCK_TILE_SIZE_N * 4 if weight_quant_type == "ptpc" else 0
+    cshuffle_bytes = 4 * 16 * 64 * (fx.BFloat16.width // 8)
+    assert activation_bytes + scale_bytes + cshuffle_bytes <= 64 * 1024, (
+        "1x4_64x256 exceeds gfx942 LDS capacity; "
+        f"activation={activation_bytes}B, scale={scale_bytes}B, "
+        f"cshuffle={cshuffle_bytes}B"
+    )
     output_row_stride = N + (
         down_output_padding_bytes // (fx.BFloat16.width // 8)
         if down_output_padding_bytes is not None
@@ -309,36 +269,36 @@ def _build_moe_gemm2_1x4(
         e_idx = _map_down_task(max_valid_id, False, block_m_per_4wave_group)
         e_offset = fx.Int64(e_idx)
         if e_idx * block_m_per_4wave_group < max_valid_id:
+            if const_expr(_task_table):
+                row_begin = fx.Int64(p_sorted_expert_ids[2 * e_idx])
             # 1. 建立当前expert任务的输入、输出、sorted metadata和weight视图。
             arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
             arg_p_output = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_output, fx.BFloat16)
-                + e_offset * (block_m_per_4wave_group * output_row_stride),
+                + (row_begin * output_row_stride if const_expr(_task_table) else e_offset * (block_m_per_4wave_group * output_row_stride)),
                 (block_m_per_4wave_group, output_row_stride),
             )
-            output_store_rsrc = fx.buffer_ops.create_buffer_resource(
-                arg_p_output,
-                max_size=False,
+            output_store_rsrc = fx.rocdl.get_buffer_rsrc(fx.rocdl.make_buffer_ptr(
+                fx.get_iter(arg_p_output),
                 num_records_bytes=block_m_per_4wave_group * output_row_stride * 2,
-            )
+            ))
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_ids) + e_offset * block_m_per_4wave_group,
+                fxh._as_ptr(p_sorted_ids) + (row_begin if const_expr(_task_table) else e_offset * block_m_per_4wave_group),
                 (block_m_per_4wave_group,),
                 fx.Int32,
             )
             arg_p_sorted_weights = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_weights) + e_offset * block_m_per_4wave_group,
+                fxh._as_ptr(p_sorted_weights) + (row_begin if const_expr(_task_table) else e_offset * block_m_per_4wave_group),
                 (block_m_per_4wave_group,),
                 fx.Float32,
             )
-            expert_id = fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[
-                e_idx
-            ]
+            expert_id = p_sorted_expert_ids[2 * e_idx + 1] if const_expr(_task_table) else fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[e_idx]
 
             # 16bytes/DW4
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
-                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id * N * K),
+                fxh._as_ptr(p_weight, weight_dtype)
+                + (fx.Int64(expert_id) * N * K if const_expr(_task_table) else fx.Int64(expert_id * N * K)),
                 fx.make_layout(
                     (
                         ((4, 2, 2, 4, 4, N // 256)),
@@ -446,11 +406,10 @@ def _build_moe_gemm2_1x4(
                     fxh._as_ptr(p_w_scale) + expert_id * N,
                     fx.make_layout(N, 1),
                 )
-                scale_global_rsrc = fx.buffer_ops.create_buffer_resource(
-                    scale_global,
-                    max_size=False,
+                scale_global_rsrc = fx.rocdl.get_buffer_rsrc(fx.rocdl.make_buffer_ptr(
+                    fx.get_iter(scale_global),
                     num_records_bytes=N * (fx.Float32.width // 8),
-                )
+                ))
                 scale_lds_logical = fx.make_view(
                     fx.get_iter(scale_lds),
                     fx.make_layout(
@@ -465,14 +424,18 @@ def _build_moe_gemm2_1x4(
                 wave_id = fx.Int32(fx.thread_idx.x // 64)
                 scale_local_offset = wave_id * WAVE_N + lane_id * 4
                 scale_offset = fx.Int32(block_n) * BLOCK_N + scale_local_offset
-                scale_vec = fx.Vector(
-                    fx.buffer_ops.buffer_load(
+                # 原buffer_load接收元素偏移；原生ROCDL使用字节，失效lane仍走OOB零填充。
+                scale_byte_offset = (lane_id < WAVE_N // 4).select(
+                    scale_offset * (fx.Float32.width // 8), fx.Int32(0x7FFFFFFF)
+                )
+                scale_vec = Vec(
+                    fx.rocdl.RawPtrBufferLoadOp(
+                        ir.VectorType.get([4], fx.Float32.ir_type),
                         scale_global_rsrc,
-                        scale_offset,
-                        vec_width=4,
-                        dtype=fx.Float32,
-                        mask=lane_id < WAVE_N // 4,
-                    )
+                        scale_byte_offset.ir_value(),
+                        fx.Int32(0).ir_value(),
+                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0),
+                    ).result
                 )
                 return scale_vec
 
@@ -639,20 +602,20 @@ def _build_moe_gemm2_1x4(
 
                     # Consume the older read first without forcing the newer read complete.
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
-                    fx.buffer_ops.buffer_store(
-                        Vec(out_frags[0].load()).bitcast(fx.Int32),
+                    fx.rocdl.RawPtrBufferStoreOp(
+                        Vec(out_frags[0].load()).bitcast(fx.Int32).ir_value(),
                         output_store_rsrc,
-                        byte_offsets[0],
-                        cache_modifier=_DOWN_STORE_CACHE_MODIFIER,
-                        offset_is_bytes=True,
+                        byte_offsets[0].ir_value(),
+                        fx.Int32(0).ir_value(),
+                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                     )
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                    fx.buffer_ops.buffer_store(
-                        Vec(out_frags[1].load()).bitcast(fx.Int32),
+                    fx.rocdl.RawPtrBufferStoreOp(
+                        Vec(out_frags[1].load()).bitcast(fx.Int32).ir_value(),
                         output_store_rsrc,
-                        byte_offsets[1],
-                        cache_modifier=_DOWN_STORE_CACHE_MODIFIER,
-                        offset_is_bytes=True,
+                        byte_offsets[1].ir_value(),
+                        fx.Int32(0).ir_value(),
+                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                     )
 
                 for row_pair in range_constexpr(4):
@@ -748,20 +711,20 @@ def _build_moe_gemm2_1x4(
                                 ).to(fx.Int32)
                             )
                         fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
-                        fx.buffer_ops.buffer_store(
-                            Vec(out_frags[0].load()).bitcast(fx.Int32),
+                        fx.rocdl.RawPtrBufferStoreOp(
+                            Vec(out_frags[0].load()).bitcast(fx.Int32).ir_value(),
                             output_store_rsrc,
-                            byte_offsets[0],
-                            cache_modifier=_DOWN_STORE_CACHE_MODIFIER,
-                            offset_is_bytes=True,
+                            byte_offsets[0].ir_value(),
+                            fx.Int32(0).ir_value(),
+                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                         )
                         fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                        fx.buffer_ops.buffer_store(
-                            Vec(out_frags[1].load()).bitcast(fx.Int32),
+                        fx.rocdl.RawPtrBufferStoreOp(
+                            Vec(out_frags[1].load()).bitcast(fx.Int32).ir_value(),
                             output_store_rsrc,
-                            byte_offsets[1],
-                            cache_modifier=_DOWN_STORE_CACHE_MODIFIER,
-                            offset_is_bytes=True,
+                            byte_offsets[1].ir_value(),
+                            fx.Int32(0).ir_value(),
+                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                         )
 
             use_delayed_4wave_store = BLOCK_K == 128 and nBK == 2
@@ -946,4 +909,5 @@ def _build_moe_gemm2_1x4(
         )
         kernel.launch(grid=(1, task_num, 1), block=(256, 1, 1), stream=stream)
 
+    launch_prefill_1x4.compile_hints["target_features"] = "-packed-fp32-ops"
     return launch_prefill_1x4

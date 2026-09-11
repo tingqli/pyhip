@@ -7,15 +7,15 @@ import functools
 
 from .common import get_device_cache_key
 from .gemm2_1x4 import _build_moe_gemm2_1x4
-from .gemm2_1x8 import _build_moe_gemm2_1x8
-from .gemm2_2x4 import _build_moe_gemm2_2x4
+from .gemm2_8x1 import _build_moe_gemm2_8x1
+from .gemm2_8x1_compact import _build_moe_gemm2_8x1_compact
 from .gemm2_default import _build_moe_gemm2_default
 
 _BUILDERS = {
     "default": _build_moe_gemm2_default,
     "1x4_64x256": _build_moe_gemm2_1x4,
-    "1x8": _build_moe_gemm2_1x8,
-    "2x4": _build_moe_gemm2_2x4,
+    "8x1": _build_moe_gemm2_8x1,
+    "8x1_compact": _build_moe_gemm2_8x1_compact,
 }
 
 
@@ -46,7 +46,9 @@ def _compile_moe_gemm2_cached(
     METADATA_TILE_SIZE_M=None,
 ):
     del device_cache_key
-    assert down_path in _BUILDERS
+    assert down_path in _BUILDERS, (
+        f"unsupported down_path={down_path!r}; supported: {', '.join(_BUILDERS)}"
+    )
     builder = _BUILDERS[down_path]
     default_kwargs = {}
     if down_path == "default":

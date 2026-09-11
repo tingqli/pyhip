@@ -11,8 +11,9 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import range_constexpr
+from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.typing import as_ir_value
+from flydsl.expr.typing import as_ir_value, is_generic_address_space, is_target_address_space
 
 
 def div_up(x, y):
@@ -353,6 +354,102 @@ def torch_layout(*shape):
 def view_as_torch_tensor(ptr, shape, dtype=None):
     ptr = _as_ptr(ptr, dtype)
     return fx.make_view(ptr, torch_layout(*shape))
+
+
+# ==================== Tensor访存 ====================
+# 数据载体与访存地址分离；不在load内准备动态地址或插入等待。
+# 显式buffer偏移是descriptor根相对的完整字节偏移，替代而非累加slice偏移。
+# LDS使用已物化的完整字节地址，另允许可在编译期计算的固定字节偏移。
+# 调用者负责对齐、buffer范围、soffset的wave一致性，以及原wait/barrier合同。
+
+
+def _offset_i32(value):
+    """只提取已经准备好的i32 SSA；动态trunc/单位换算必须在调用之前完成。"""
+    if isinstance(value, (fx.Int32, fx.Uint32)):
+        return value.ir_value()
+    if isinstance(value, ir.Value) and isinstance(value.type, ir.IntegerType) and value.type.width == 32:
+        return value
+    if isinstance(value, int) and not isinstance(value, bool) and -(1 << 31) <= value < (1 << 32):
+        return fx.Uint32(value & 0xFFFFFFFF).ir_value()
+    raise TypeError("offset需要预计算的32位SSA或32位编译期整数")
+
+
+class BufferTensor(fx.Tensor):
+    """buffer Tensor的单条原生访存；不缓存额外动态Python字段。"""
+
+    @dsl_loc_tracing
+    def __getitem__(self, coord):
+        result = super().__getitem__(coord)
+        return type(self)(result) if isinstance(result, fx.Tensor) else result
+
+    def _packet_bits(self):
+        if not is_target_address_space(self.address_space, TargetAddressSpace.BufferDesc):
+            raise TypeError("显式buffer访存需要BufferDesc Tensor")
+        if not self.layout.is_static or fx.rank(self.layout) != 1 or self.stride.to_py_value() not in (1, (1,)):
+            raise ValueError("显式buffer访存只接受静态连续一维packet")
+        bits = fx.size(self).to_py_value() * self.dtype.width
+        if bits not in (32, 64, 128):
+            raise ValueError("packet只支持32/64/128bit；16B+8B必须显式发出两条请求")
+        return bits
+
+    @dsl_loc_tracing
+    def load(self, *, voffset_bytes=None, soffset_bytes=0, aux=0):
+        if voffset_bytes is None:
+            if not isinstance(soffset_bytes, int) or soffset_bytes != 0 or aux != 0:
+                raise ValueError("显式soffset/aux需要同时提供完整voffset_bytes")
+            return super().load()
+        bits = self._packet_bits()
+        if not isinstance(aux, int):
+            raise TypeError("aux必须是编译期整数")
+        resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(self))
+        result = rocdl.RawPtrBufferLoadOp(
+            ir.VectorType.get([bits // 32], fx.Uint32.ir_type), resource,
+            _offset_i32(voffset_bytes), _offset_i32(soffset_bytes),
+            aux=ir.IntegerAttr.get(fx.Int32.ir_type, aux),
+        ).result
+        return Vec(result).bitcast(self.dtype)
+
+
+class LdsTensor(fx.Tensor):
+    """LDS Tensor使用完整预计算地址；复杂partition可指定原copy atom和目标retile。"""
+
+    @dsl_loc_tracing
+    def __getitem__(self, coord):
+        result = super().__getitem__(coord)
+        return type(self)(result) if isinstance(result, fx.Tensor) else result
+
+    def _addressed(self, address_bytes, offset_bytes):
+        if not is_generic_address_space(self.address_space, fx.AddressSpace.Shared):
+            raise TypeError("显式LDS访存需要Shared Tensor")
+        element_bytes = self.dtype.width // 8
+        if not element_bytes or not isinstance(offset_bytes, int) or offset_bytes % element_bytes:
+            raise ValueError("LDS固定偏移必须是按元素对齐的编译期字节数")
+        pointer = fx.get_iter(self)
+        if address_bytes is not None:
+            pointer = fx.inttoptr(pointer.type, fx.Int32(_offset_i32(address_bytes)))
+        if offset_bytes:
+            pointer = pointer + offset_bytes // element_bytes
+        return fx.make_view(pointer, self.layout)
+
+    @dsl_loc_tracing
+    def load(self, *, address_bytes=None, offset_bytes=0, into=None, copy_atom=None):
+        """无into时返回Vector；指定into时按原atom写目标fragment，并返回None。"""
+        source = self._addressed(address_bytes, offset_bytes)
+        if into is None:
+            if copy_atom is not None:
+                raise ValueError("指定copy_atom时必须提供into目标fragment")
+            return source.load()
+        if copy_atom is None:
+            raise ValueError("指定into时必须明确copy_atom，不能改变访存位宽")
+        fx.copy(copy_atom, source, into)
+
+    @dsl_loc_tracing
+    def store(self, vector, *, address_bytes=None, offset_bytes=0, copy_atom=None):
+        destination = self._addressed(address_bytes, offset_bytes)
+        if copy_atom is None:
+            return destination.store(vector)
+        # copy模式的vector是已有rmem Tensor，保留其fragment/retile，不复制寄存器。
+        fx.copy(copy_atom, vector, destination)
 
 
 # MLIR values are all SSA which is naturally different from each other
@@ -698,7 +795,7 @@ def asm_mark(mark: str):
     filename = caller_frame.f_code.co_filename
     lineno = caller_frame.f_lineno
 
-    rocdl.sched_barrier(0)
+    fx.rocdl.sched_barrier(0)
     llvm.inline_asm(
         ir.Type.parse("!llvm.void"),
         [],
@@ -706,7 +803,7 @@ def asm_mark(mark: str):
         "",
         has_side_effects=True,
     )
-    rocdl.sched_barrier(0)
+    fx.rocdl.sched_barrier(0)
 
 
 def dump_ir(enable_debug_info=True):
