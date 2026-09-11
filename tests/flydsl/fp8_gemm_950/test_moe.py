@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import torch
 
@@ -322,6 +323,8 @@ def run_case(
     aiter_xcd_swizzle: int,
     pyhip_xcd_swizzle: bool,
     pyhip_group_size_m: int,
+    profile_kernel: str | None = None,
+    profile_launches: int = 1,
 ):
     data = prepare_case(tokens, gate_up_size, hidden_size, topk, experts)
     route_counts = data["route_counts"]
@@ -332,6 +335,22 @@ def run_case(
         f"pyhip_blocks={data['pyhip_expert_ids'].numel()}"
     )
 
+    # Padded rows still run through the MFMA pipe, they are just never stored, so
+    # hw counts them; eff counts only routed work and is comparable across block_m.
+    routed_tokens = tokens * topk
+    pyhip_sorted_tokens = int(data["pyhip_valid_ids"][0].item())
+    aiter_sorted_tokens = int(data["aiter_valid_ids"][0].item())
+    eff_flops = 2 * routed_tokens * gate_up_size * hidden_size
+    aiter_hw_flops = 2 * aiter_sorted_tokens * gate_up_size * hidden_size
+    pyhip_hw_flops = 2 * pyhip_sorted_tokens * gate_up_size * hidden_size
+    print(
+        f"padding: routed={routed_tokens} "
+        f"aiter_rows={aiter_sorted_tokens} "
+        f"({aiter_sorted_tokens / routed_tokens:.3f}x) "
+        f"pyhip_rows={pyhip_sorted_tokens} "
+        f"({pyhip_sorted_tokens / routed_tokens:.3f}x)"
+    )
+
     pyhip_launcher = compile_moe_gateup_4w(
         gate_up_size // 2,
         hidden_size,
@@ -340,6 +359,68 @@ def run_case(
         xcd_swizzle=pyhip_xcd_swizzle,
         group_size_m=pyhip_group_size_m,
     )
+
+    if profile_kernel is not None:
+        if profile_kernel == "aiter":
+            profile_arg_sets = [
+                make_aiter_args(data, clone=True) for _ in range(data_clones)
+            ]
+
+            def profile_run(iteration):
+                run_aiter_stage1(
+                    profile_arg_sets[iteration % len(profile_arg_sets)],
+                    data,
+                    aiter_xcd_swizzle,
+                )
+
+            padded_tokens = aiter_sorted_tokens
+            hw_flops = aiter_hw_flops
+            setup_launches = 0
+        else:
+            profile_arg_sets = [
+                make_pyhip_args(data, clone=True) for _ in range(data_clones)
+            ]
+            pyhip_kernel = flyc.compile[{"opt_level": 2}](
+                pyhip_launcher, *profile_arg_sets[0]
+            )
+
+            def profile_run(iteration):
+                pyhip_kernel(*profile_arg_sets[iteration % len(profile_arg_sets)])
+
+            padded_tokens = pyhip_sorted_tokens
+            hw_flops = pyhip_hw_flops
+            setup_launches = 1
+
+        for iteration in range(warmup):
+            profile_run(iteration)
+        torch.cuda.synchronize()
+        print(
+            "PROFILE_META "
+            + json.dumps(
+                {
+                    "kernel": profile_kernel,
+                    "tokens": tokens,
+                    "gate_up_size": gate_up_size,
+                    "hidden_size": hidden_size,
+                    "topk": topk,
+                    "experts": experts,
+                    "routed_tokens": routed_tokens,
+                    "padded_tokens": padded_tokens,
+                    "padded_flops": hw_flops,
+                    "setup_launches": setup_launches,
+                    "warmup": warmup,
+                    "data_clones": data_clones,
+                    "profile_launches": profile_launches,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        for iteration in range(profile_launches):
+            profile_run(warmup + iteration)
+        torch.cuda.synchronize()
+        return None
+
     aiter_check_args = make_aiter_args(data, clone=False)
     pyhip_check_args = make_pyhip_args(data, clone=False)
     pyhip_kernel = flyc.compile[{"opt_level": 2}](pyhip_launcher, *pyhip_check_args)
@@ -359,22 +440,6 @@ def run_case(
     )
     if not (aiter_finite and pyhip_finite):
         raise AssertionError("stage1 produced a non-finite output")
-
-    # Padded rows still run through the MFMA pipe, they are just never stored, so
-    # hw counts them; eff counts only routed work and is comparable across block_m.
-    routed_tokens = tokens * topk
-    pyhip_sorted_tokens = int(data["pyhip_valid_ids"][0].item())
-    aiter_sorted_tokens = int(data["aiter_valid_ids"][0].item())
-    eff_flops = 2 * routed_tokens * gate_up_size * hidden_size
-    aiter_hw_flops = 2 * aiter_sorted_tokens * gate_up_size * hidden_size
-    pyhip_hw_flops = 2 * pyhip_sorted_tokens * gate_up_size * hidden_size
-    print(
-        f"padding: routed={routed_tokens} "
-        f"aiter_rows={aiter_sorted_tokens} "
-        f"({aiter_sorted_tokens / routed_tokens:.3f}x) "
-        f"pyhip_rows={pyhip_sorted_tokens} "
-        f"({pyhip_sorted_tokens / routed_tokens:.3f}x)"
-    )
 
     def eff_tflops(latency_us: float) -> float:
         return eff_flops / (latency_us * 1.0e-6) / 1.0e12
@@ -422,12 +487,40 @@ def run_case(
             f"{name}: {best[0]:.3f} us "
             f"hw={best[1]:.2f} TFLOPS "
             f"eff={eff_tflops(best[0]):.2f} TFLOPS "
-            f"bw={best[2]:.2f} GB/s"
+            f"nominal_rw_bw={best[2]:.2f} GB/s"
         )
     print(
         f"ratio: latency={pyhip_best[0] / aiter_best[0]:.3f}x "
         f"eff_throughput={aiter_best[0] / pyhip_best[0]:.3%} "
         f"hw_tflops={pyhip_best[1] / aiter_best[1]:.3%}"
+    )
+    print(
+        "BENCH_RESULT "
+        + json.dumps(
+            {
+                "tokens": tokens,
+                "gate_up_size": gate_up_size,
+                "hidden_size": hidden_size,
+                "topk": topk,
+                "experts": experts,
+                "routed_tokens": routed_tokens,
+                "latency_stat": "minimum",
+                "aiter": {
+                    "padded_tokens": aiter_sorted_tokens,
+                    "latency_us": aiter_best[0],
+                    "padded_tflops": aiter_best[1],
+                    "effective_tflops": eff_tflops(aiter_best[0]),
+                },
+                "pyhip": {
+                    "padded_tokens": pyhip_sorted_tokens,
+                    "latency_us": pyhip_best[0],
+                    "padded_tflops": pyhip_best[1],
+                    "effective_tflops": eff_tflops(pyhip_best[0]),
+                },
+            },
+            sort_keys=True,
+        ),
+        flush=True,
     )
     return aiter_best, pyhip_best
 
@@ -453,6 +546,12 @@ def main() -> None:
     parser.add_argument("--aiter-xcd-swizzle", type=int, default=8)
     parser.add_argument("--pyhip-group-size-m", type=int, default=4)
     parser.add_argument(
+        "--profile-kernel",
+        choices=("aiter", "pyhip"),
+        help="run only one implementation for hardware-counter collection",
+    )
+    parser.add_argument("--profile-launches", type=int, default=1)
+    parser.add_argument(
         "--no-pyhip-xcd-swizzle",
         action="store_false",
         dest="pyhip_xcd_swizzle",
@@ -467,6 +566,10 @@ def main() -> None:
         parser.error("--data-clones must be positive")
     if args.pyhip_group_size_m <= 0:
         parser.error("--pyhip-group-size-m must be positive")
+    if args.profile_launches <= 0:
+        parser.error("--profile-launches must be positive")
+    if args.profile_kernel and len(args.tokens) != 1:
+        parser.error("--profile-kernel requires exactly one --tokens value")
 
     props = torch.cuda.get_device_properties()
     if "950" not in props.gcnArchName:
@@ -481,7 +584,7 @@ def main() -> None:
             f"clones={args.data_clones} warmup={args.warmup} "
             f"iterations={args.iterations}"
         )
-        aiter_best, pyhip_best = run_case(
+        case_result = run_case(
             tokens,
             args.gate_up_size,
             args.hidden_size,
@@ -493,7 +596,12 @@ def main() -> None:
             args.aiter_xcd_swizzle,
             args.pyhip_xcd_swizzle,
             args.pyhip_group_size_m,
+            args.profile_kernel,
+            args.profile_launches,
         )
+        if case_result is None:
+            return
+        aiter_best, pyhip_best = case_result
         results.append((tokens, aiter_best, pyhip_best))
         torch.cuda.empty_cache()
 

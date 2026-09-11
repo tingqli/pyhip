@@ -4,6 +4,210 @@ Date: 2026-09-07
 
 Shape: `M=4096, N=4096, K=16384`
 
+## 2026-09-10 update: LDS scales, hoisted DMA offsets and compute scheduling
+
+This section is an incremental update. All September7 measurements below are
+retained as historical snapshots; their use of "current" refers to that date.
+Today's tests use the unchanged `run_test()` API in
+[test_mxfp8_gemm_4w.py](test_mxfp8_gemm_4w.py), called by the isolated
+[daily driver](agent_workspace/daily_results_20260910/run_case.py).
+The kernel source was not edited for this report, and the user's Git index was
+not changed.
+
+Tested source SHA256:
+`89fd627e1b8d24f28c97fc7061359e4a31712ab1fe69066702dcf44a2c0e5d32`
+(commit `b78e6a563575570bcbc308fad78aaeb7e83c5005`).
+The performance comparison below was rerun on September11 against the exact
+user-selected base commit `122e34dbfe5b287652495d90ea9f7cbedf31780e`.
+September10 accuracy/ISA/PMC evidence remains separately dated below.
+
+### Main changes today
+
+1. **LDS-only scale path.** Removed A/B scale G2R branches and `SCALE_G2R`
+	scheduling alternatives. E8M0 scales now go global → LDS → registers.
+2. **Hoisted DMA address calculations.** Precompute K-invariant source byte
+	offsets and wave-uniform LDS destination pointers. K advances through scalar
+	`soffset`, including FP8/FP4 padding and swizzle paths. Explicitly scalarize
+	the dynamic A-scale row stride outside the loop, avoiding A-scale EXEC
+	waterfalls and repeated `readfirstlane` in the mainloop.
+3. **Read-first pipeline and shared compute scheduler.** Read the independent
+	next LDS operand before current compute, then prefetch future data/scales.
+	Mainloop and compute-only drain share `_schedule_compute`; existing hardware
+	synchronization is retained. Compiler fences keep the prefix within a phase.
+4. **Scaled A8W8 M1 prefix.** Its V5/D9 phase uses
+	`M1 → (V1 M2 D2 M1) ×4 → V1 M2 D1 M1`, still exactly16MFMAs. The final DS32
+	is followed by an independent MFMA instead of immediately reaching the
+	wait. Other modes and V0 drain retain prefix2. The final scaled-A8W8 compile
+	is spill-free; the earlier M2 intermediate snapshot had4 spill words/20B
+	scratch. No drain-hint disabling experiment was merged.
+
+### Exact test configuration
+
+All four modes: M=N4096/K16384, tile256×256×128, four waves/256 threads,
+BF16 permlane output, seed0, no preshuffle, no store overlap.
+**A always uses padding. B uses swizzle only for W4.**
+
+| Mode | `with_scale` | `B_MXFP4` | `USE_SWIZZLE` (A) | `B_LDS_SWIZZLE` |
+|---|---|---|---|---|
+| A8W8 | False | False | False | False |
+| A8W8 with scale | True | False | False | False |
+| A8W4 | False | True | False | True |
+| A8W4 with scale | True | True | False | True |
+
+Perf uses `run_test(perf=True, run_count=50, data_clones=50)` with the above
+arguments. All50 clones are warmed once before50 Event measurements, using
+`pyhip.cudaPerf`, **not CUDA graphs**. Physical MI355X GPU6, runtime JIT cache
+disabled, profiler and IR dump disabled for timing. Separate invocations with
+`perf=False` collect accuracy/dumps and PMC; profiler timestamps are not used
+for throughput. No clocks, power limits or system settings were changed.
+
+### 2026-09-11: highest throughput, exact commit-to-commit comparison
+
+**Base:** `122e34dbfe5b287652495d90ea9f7cbedf31780e`
+
+**New:** `b78e6a563575570bcbc308fad78aaeb7e83c5005`
+
+Both immutable source snapshots call their own original `run_test()` with the
+four configurations above. Only invocation parameters select the configuration;
+neither kernel implementation nor `run_test()` was rewritten. The two versions'
+`run_test()` ASTs are identical. Seed0 is reset per invocation; actual A/B data,
+all50 rotating input sets, and all used scale tensors were SHA256-checked after
+timing. **All corresponding input bytes and BF16 reference bytes match across
+base/new and both rounds.** This is stronger than merely using the same shape
+or assuming that the same seed produces identical input.
+
+Both versions use the same installed compiler/dependencies and physical GPU6.
+Two complete rounds reverse execution order (base→new, then new→base), each
+with50clones and50timed launches. For each configuration and version, select
+the **highest TFLOPS across its100measurements**, not an average or median.
+Throughput ratio = new maximum TFLOPS / base maximum TFLOPS; >1 means improvement.
+
+| Mode | Base max TFLOPS (`122e34d`) | New max TFLOPS (`b78e6a5`) | Throughput ratio | Improvement |
+|---|---:|---:|---:|---:|
+| A8W8 | **2908.11** | **2944.25** | **1.0124×** | **+1.24%** |
+| A8W8 with scale | **2768.14** | **2803.70** | **1.0128×** | **+1.28%** |
+| A8W4 | **3055.54** | **3133.55** | **1.0255×** | **+2.55%** |
+| A8W4 with scale | **2850.81** | **2999.51** | **1.0522×** | **+5.22%** |
+
+The corresponding best latencies (base→new) are189.042→186.722us,
+198.601→196.082us,179.921→175.442us and192.842→183.282us. These aligned dimensions
+have no tile-padding FLOP overhead, so effective and hardware throughput ratios
+coincide. All16completed API invocations pass the existing diff criterion;
+base/new diff values match for each configuration. Both scaled-A8W8 versions
+retain the same47strict-allclose outliers described below.
+
+Source SHA256:
+- Base: `e7b8abe0736bc95b77d0592a05d5ebd7791a67cf25d1df46c66091b964e30589`
+- New: `89fd627e1b8d24f28c97fc7061359e4a31712ab1fe69066702dcf44a2c0e5d32`
+
+GPU utilization/allocation is checked before each subprocess and process
+ownership is recorded after it. Low sampled activity immediately after our
+own subprocess exits is accepted only with no KFD process using any GPU;
+high utilization, another client or unknown ownership stops the run. These
+checks do not constitute continuous hardware isolation. The table describes
+observed best throughput, not a statistical confidence interval.
+
+Only the two complete balanced rounds (artifact IDs5/6) enter this summary.
+Incomplete attempts and September10's competing-workload runs remain excluded.
+No September7 historical throughput or other-commit result is used in these
+ratios. Earlier historical-comparison ratios in this update are superseded.
+Original September7 sections below remain untouched.
+
+Reproduction and raw evidence:
+[comparison notes](agent_workspace/commit_compare_20260911/README.md),
+[run script](agent_workspace/commit_compare_20260911/run.sh),
+[input verification driver](agent_workspace/commit_compare_20260911/compare.py),
+[commit manifest](agent_workspace/commit_compare_20260911/manifest.json),
+[verified summary](agent_workspace/commit_compare_20260911/summary.json).
+
+### Registers, scratch and emitted pipeline
+
+All four fresh ISA dumps have **zero SGPR/VGPR spills, zero private segment,
+and no `scratch_load`/`scratch_store` instructions**. Architectural VGPR count
+is shown separately: gfx950 metadata's combined VGPR count includes the AGPR
+allocation and alignment; it must not be interpreted as ordinary VGPRs alone.
+
+| Mode | Architectural VGPRs | AGPRs | Combined metadata VGPRs | Metadata SGPRs | LDS bytes | VGPR / SGPR spill count | Private segment |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| A8W8 | 244 | 256 | 500 | 59 | 135168 | 0 / 0 | 0 B |
+| A8W8 with scale | 242 | 256 | 500 | 85 | 143360 | 0 / 0 | 0 B |
+| A8W4 | 212 | 256 | 468 | 51 | 100352 | 0 / 0 | 0 B |
+| A8W4 with scale | 220 | 256 | 476 | 78 | 108544 | 0 / 0 | 0 B |
+
+Independent instruction-stream audits pass all8mainloop phases and the drain
+in all4modes. Each loop iteration has128MFMA; data/scale DMA counts are32/0,
+32/8,24/0,24/8 respectively. All buffer loads are LDS DMA, with no ordinary
+scale G2R loads. No `v_add*`, `v_lshl*`, `v_mul*`, `v_readfirstlane*` address
+operations or `s_nop` remain in the audited mainloops.
+
+Audits:
+[A8W8](agent_workspace/daily_results_20260910/a8w8_audit.log),
+[A8W8 scaled](agent_workspace/daily_results_20260910/a8w8_scale_audit.log),
+[A8W4](agent_workspace/daily_results_20260910/a8w4_audit.log),
+[A8W4 scaled](agent_workspace/daily_results_20260910/a8w4_scale_audit.log).
+ISA dumps:
+[A8W8](agent_workspace/daily_results_20260910/a8w8_dump/gemm_kernel_0/21_final_isa.s),
+[A8W8 scaled](agent_workspace/daily_results_20260910/a8w8_scale_dump/gemm_kernel_0/21_final_isa.s),
+[A8W4](agent_workspace/daily_results_20260910/a8w4_dump/gemm_kernel_0/21_final_isa.s),
+[A8W4 scaled](agent_workspace/daily_results_20260910/a8w4_scale_dump/gemm_kernel_0/21_final_isa.s).
+FlyDSL's ISA dump is an assembly-mode recompile, not an HSACO disassembly.
+
+### LDS bank-conflict hardware counters
+
+Fresh `rocprofv3 --pmc` collects `SQ_LDS_BANK_CONFLICT` and
+`SQ_LDS_DATA_FIFO_FULL`, filtered to `gemm_kernel`, using the exact layouts
+above. Each mode's CSV contains2dispatch records per counter; these are
+aggregate counter values, **not the64per-instance samples in the older report**.
+
+| Mode | Records per counter | Bank conflict min / max / sum | Bank conflict nonzero | LDS FIFO full min / max / sum | FIFO nonzero |
+|---|---:|---:|---:|---:|---:|
+| A8W8 | 2 | 0 / 0 / 0 | 0 | 0 / 0 / 0 | 0 |
+| A8W8 with scale | 2 | 0 / 0 / 0 | 0 | 0 / 0 / 0 | 0 |
+| A8W4 | 2 | 0 / 0 / 0 | 0 | 0 / 0 / 0 | 0 |
+| A8W4 with scale | 2 | 0 / 0 / 0 | 0 | 0 / 0 / 0 | 0 |
+
+This confirms zero reported conflicts for the selected layouts, not zero LDS
+latency or stalls of every kind. In particular, this is not a W4 B-padding run.
+Raw counter CSVs:
+[A8W8](agent_workspace/daily_results_20260910/a8w8_pmc/smci355-ccs-aus-m09-09/464499_counter_collection.csv),
+[A8W8 scaled](agent_workspace/daily_results_20260910/a8w8_scale_pmc/smci355-ccs-aus-m09-09/464655_counter_collection.csv),
+[A8W4](agent_workspace/daily_results_20260910/a8w4_pmc/smci355-ccs-aus-m09-09/464891_counter_collection.csv),
+[A8W4 scaled](agent_workspace/daily_results_20260910/a8w4_scale_pmc/smci355-ccs-aus-m09-09/465112_counter_collection.csv).
+
+### Accuracy
+
+`run_test()` validates finite BF16 output with its existing `calc_diff <= 1e-5`
+criterion. The independent `torch.allclose(rtol=0.02, atol=0.01)` check is
+reported separately; no tolerances were loosened.
+
+| Mode | Existing diff criterion | Reported diff | Strict allclose |
+|---|---|---:|---|
+| A8W8 | PASS | 2.3599037946020474e-08 | True |
+| A8W8 with scale | PASS | 2.5712566409374915e-08 | **False, pre-existing** |
+| A8W4 | PASS | 6.391154272478161e-11 | True |
+| A8W4 with scale | PASS | 7.416759206790857e-09 | True |
+
+All four separate accuracy runs and all four PMC-instrumented correctness runs
+pass the diff criterion. Scaled A8W8 retains exactly47/16777216elements outside
+strict tolerance, max absolute error8, identical to the pre-port diagnostic;
+it must not be described as an allclose pass. The earlier same-source
+[24-case regression](agent_workspace/a8w8_scale_prefix1_20260910/current_accuracy_matrix.log)
+also passed, covering tails, K512/768/1024, padding/swizzle, FP8 preshuffle and
+store overlap. The legacy non-permlane compiler-asserting path remains excluded
+from that supported matrix and was not fixed by these changes.
+
+Accuracy logs:
+[A8W8](agent_workspace/daily_results_20260910/a8w8_accuracy.log),
+[A8W8 scaled](agent_workspace/daily_results_20260910/a8w8_scale_accuracy.log),
+[A8W4](agent_workspace/daily_results_20260910/a8w4_accuracy.log),
+[A8W4 scaled](agent_workspace/daily_results_20260910/a8w4_scale_accuracy.log).
+Reproduction scripts:
+[perf + ISA](agent_workspace/daily_results_20260910/perf_and_isa.sh),
+[PMC](agent_workspace/daily_results_20260910/pmc.sh).
+All agent-only scripts, tests, logs and dumps are isolated under
+[agent workspace](agent_workspace/README.md); original user dumps are preserved.
+No new ATT mainloop-cycle/efficiency measurement was made in this update.
+
 ## Current `test_mxfp8_gemm_4w.py` snapshot: with scale vs without scale
 
 This section profiles the current kernel directly through
