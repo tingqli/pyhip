@@ -1839,7 +1839,8 @@ def _clone_benchmark_args(args, data_clones: int):
 def _benchmark_kernel(
     kernel,
     arg_sets,
-    flops: int,
+    effective_flops: int,
+    padded_flops: int,
     rw_bytes: int,
     name: str,
     warmup: int,
@@ -1854,13 +1855,16 @@ def _benchmark_kernel(
     for iteration in range(iterations):
         clone_index = (warmup + iteration) % len(arg_sets)
         with cudaPerf(
-            flops,
+            effective_flops,
             rw_bytes,
             name=f"{name}_{clone_index}",
             verbose=0,
         ) as perf:
             kernel(*arg_sets[clone_index])
-        samples.append((perf.dt() * 1.0e3, perf.tflops(), perf.bw()))
+        latency_ms = perf.dt() * 1.0e3
+        effective_tput = perf.tflops()
+        padded_tput = padded_flops / (latency_ms * 1.0e-3) / 1.0e12
+        samples.append((latency_ms, effective_tput, padded_tput, perf.bw()))
     samples.sort(key=lambda sample: sample[0])
     median = samples[len(samples) // 2]
     return samples[0], median
@@ -1924,13 +1928,17 @@ def run_benchmark(
         for value in moe_args
         if isinstance(value, torch.Tensor)
     )
+    routed_rows = tokens * topk
+    padded_rows = inputs["sorted_ids"].numel()
     del inputs, moe_args, output
     moe_kernel = flyc.compile[{"opt_level": 2}](moe_launcher, *moe_arg_sets[0])
-    flops = 2 * tokens * topk * (2 * intermediate_size) * hidden_size
+    effective_flops = 2 * routed_rows * (2 * intermediate_size) * hidden_size
+    padded_flops = 2 * padded_rows * (2 * intermediate_size) * hidden_size
     moe_best, moe_median = _benchmark_kernel(
         moe_kernel,
         moe_arg_sets,
-        flops,
+        effective_flops,
+        padded_flops,
         moe_rw_bytes,
         f"moe_gateup_xcd{int(xcd_swizzle)}_group{group_size_m}",
         warmup,
@@ -1938,110 +1946,19 @@ def run_benchmark(
     )
     del moe_arg_sets, moe_kernel
 
-    from test_mxfp8_gemm_4w import compile_gemm_fp8
-
-    per_1x32_mx_quant_hip, dtypes, _, _ = _load_mx_helpers()
-    gemm_m = tokens
-    gemm_n = topk * 2 * intermediate_size
-    gemm_a, gemm_scale_a_raw = per_1x32_mx_quant_hip(
-        torch.randn((gemm_m, hidden_size), device="cuda", dtype=torch.bfloat16)
-        * A_INPUT_SCALE,
-        quant_dtype=dtypes.fp8,
-        scale_type=dtypes.fp8_e8m0,
-        shuffle=False,
-    )
-    gemm_b, gemm_scale_b_raw = per_1x32_mx_quant_hip(
-        torch.randn((gemm_n, hidden_size), device="cuda", dtype=torch.bfloat16)
-        * B_INPUT_SCALE,
-        quant_dtype=dtypes.fp4x2,
-        scale_type=dtypes.fp8_e8m0,
-        shuffle=False,
-    )
-    gemm_output = torch.empty((gemm_m, gemm_n), device="cuda", dtype=torch.bfloat16)
-    gemm_scale_a_padded_rows = div_up(gemm_m, 256) * 256
-    gemm_scale_b_padded_rows = div_up(gemm_n, 256) * 256
-    gemm_scale_a = _permute_scale(
-        gemm_scale_a_raw, padded_rows=gemm_scale_a_padded_rows
-    )
-    gemm_scale_b = _permute_scale(
-        gemm_scale_b_raw, padded_rows=gemm_scale_b_padded_rows
-    )
-    assert gemm_a.view(torch.uint8).numel() == gemm_m * hidden_size
-    assert gemm_b.view(torch.uint8).numel() == gemm_n * hidden_size // 2
-    assert gemm_scale_a.view(torch.uint8).numel() == (
-        gemm_scale_a_padded_rows * (hidden_size // 32)
-    )
-    assert gemm_scale_b.view(torch.uint8).numel() == (
-        gemm_scale_b_padded_rows * (hidden_size // 32)
-    )
-    gemm_args = (
-        gemm_a.view(torch.int8).view(-1),
-        gemm_b.view(torch.int8).view(-1),
-        gemm_scale_a,
-        gemm_scale_b,
-        gemm_output.view(-1),
-        gemm_m,
-        torch.cuda.current_stream(),
-    )
-    gemm_launcher = compile_gemm_fp8(
-        256,
-        256,
-        128,
-        gemm_n,
-        hidden_size,
-        lds_swizzle=False,
-        b_lds_swizzle=b_lds_swizzle,
-        preshuffle_b=False,
-        permlane_epilogue=True,
-        store_overlap=False,
-        with_scale=True,
-        b_mxfp4=True,
-    )
-    gemm_arg_sets = _clone_benchmark_args(gemm_args, data_clones)
-    gemm_rw_bytes = sum(
-        value.numel() * value.element_size()
-        for value in gemm_args
-        if isinstance(value, torch.Tensor)
-    )
-    del (
-        gemm_args,
-        gemm_a,
-        gemm_b,
-        gemm_scale_a_raw,
-        gemm_scale_b_raw,
-        gemm_scale_a,
-        gemm_scale_b,
-        gemm_output,
-    )
-    gemm_kernel = flyc.compile[{"opt_level": 2}](gemm_launcher, *gemm_arg_sets[0])
-    gemm_best, gemm_median = _benchmark_kernel(
-        gemm_kernel,
-        gemm_arg_sets,
-        flops,
-        gemm_rw_bytes,
-        "gemm",
-        warmup,
-        iterations,
-    )
-
     print(
         f"benchmark: b_lds={'swizzle' if b_lds_swizzle else 'padding'} "
         f"xcd_swizzle={xcd_swizzle} group_size_m={group_size_m} "
+        f"routed_rows={routed_rows} padded_rows={padded_rows} "
         f"clones={data_clones} warmup={warmup} runs={iterations}"
     )
     print(
         f"moe:  best={moe_best[0]:.6f} ms median={moe_median[0]:.6f} ms "
-        f"best={moe_best[1]:.2f} TFLOPS median={moe_median[1]:.2f} TFLOPS "
-        f"best_bw={moe_best[2]:.2f} GB/s median_bw={moe_median[2]:.2f} GB/s"
-    )
-    print(
-        f"gemm: best={gemm_best[0]:.6f} ms median={gemm_median[0]:.6f} ms "
-        f"best={gemm_best[1]:.2f} TFLOPS median={gemm_median[1]:.2f} TFLOPS "
-        f"best_bw={gemm_best[2]:.2f} GB/s median_bw={gemm_median[2]:.2f} GB/s"
-    )
-    print(
-        f"gap: latency={moe_best[0] / gemm_best[0]:.3f}x "
-        f"throughput={moe_best[1] / gemm_best[1]:.3%}"
+        f"best_effective_tput={moe_best[1]:.2f} TFLOPS "
+        f"median_effective_tput={moe_median[1]:.2f} TFLOPS "
+        f"best_padded_tput={moe_best[2]:.2f} TFLOPS "
+        f"median_padded_tput={moe_median[2]:.2f} TFLOPS "
+        f"best_bw={moe_best[3]:.2f} GB/s median_bw={moe_median[3]:.2f} GB/s"
     )
 
 

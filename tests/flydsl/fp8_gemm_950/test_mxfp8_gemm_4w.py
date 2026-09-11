@@ -1668,55 +1668,11 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     # run_acc()
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False, B_MXFP4=False)
-    run_test(
-        M=M,
-        N=N,
-        K=K,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=1,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=False,
-        B_MXFP4=False,
-        B_LDS_SWIZZLE=False,
-    )
 
     run_test(
-        M=M,
-        N=N,
-        K=K,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=1,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=True,
-        B_MXFP4=False,
-        B_LDS_SWIZZLE=False,
-    )
-
-    run_test(
-        M=M,
-        N=N,
-        K=K,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=1,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=False,
-        B_MXFP4=True,
-        B_LDS_SWIZZLE=True,
-    )
-
-    run_test(
-        M=M,
-        N=N,
-        K=K,
+        M=196608,
+        N=512,
+        K=6144,
         USE_SWIZZLE=0,
         PRESHUFFLE_B=0,
         perf=1,

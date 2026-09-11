@@ -260,7 +260,7 @@ def make_pyhip_args(data, *, clone: bool):
         dtype=dtypes.bf16,
     )
     return (
-        tensor(data["a"]).view(torch.int8).view(-1),
+        tensor(data["a"]).view(torch.int8),
         tensor(data["weight"]).view(torch.int8),
         tensor(data["pyhip_scale_a"]),
         tensor(data["pyhip_scale_b"]),
@@ -341,8 +341,8 @@ def run_case(
     pyhip_sorted_tokens = int(data["pyhip_valid_ids"][0].item())
     aiter_sorted_tokens = int(data["aiter_valid_ids"][0].item())
     eff_flops = 2 * routed_tokens * gate_up_size * hidden_size
-    aiter_hw_flops = 2 * aiter_sorted_tokens * gate_up_size * hidden_size
-    pyhip_hw_flops = 2 * pyhip_sorted_tokens * gate_up_size * hidden_size
+    aiter_padded_flops = 2 * aiter_sorted_tokens * gate_up_size * hidden_size
+    pyhip_padded_flops = 2 * pyhip_sorted_tokens * gate_up_size * hidden_size
     print(
         f"padding: routed={routed_tokens} "
         f"aiter_rows={aiter_sorted_tokens} "
@@ -374,7 +374,7 @@ def run_case(
                 )
 
             padded_tokens = aiter_sorted_tokens
-            hw_flops = aiter_hw_flops
+            padded_flops = aiter_padded_flops
             setup_launches = 0
         else:
             profile_arg_sets = [
@@ -388,7 +388,7 @@ def run_case(
                 pyhip_kernel(*profile_arg_sets[iteration % len(profile_arg_sets)])
 
             padded_tokens = pyhip_sorted_tokens
-            hw_flops = pyhip_hw_flops
+            padded_flops = pyhip_padded_flops
             setup_launches = 1
 
         for iteration in range(warmup):
@@ -406,7 +406,7 @@ def run_case(
                     "experts": experts,
                     "routed_tokens": routed_tokens,
                     "padded_tokens": padded_tokens,
-                    "padded_flops": hw_flops,
+                    "padded_flops": padded_flops,
                     "setup_launches": setup_launches,
                     "warmup": warmup,
                     "data_clones": data_clones,
@@ -461,7 +461,7 @@ def run_case(
         "aiter_stage1",
         lambda args: run_aiter_stage1(args, data, aiter_xcd_swizzle),
         aiter_arg_sets,
-        aiter_hw_flops,
+        aiter_padded_flops,
         rw_bytes,
         warmup,
         iterations,
@@ -474,7 +474,7 @@ def run_case(
         "pyhip_a8w4_stage1",
         lambda args: pyhip_kernel(*args),
         pyhip_arg_sets,
-        pyhip_hw_flops,
+        pyhip_padded_flops,
         rw_bytes,
         warmup,
         iterations,
@@ -485,14 +485,14 @@ def run_case(
     for name, best in (("aiter", aiter_best), ("pyhip", pyhip_best)):
         print(
             f"{name}: {best[0]:.3f} us "
-            f"hw={best[1]:.2f} TFLOPS "
+            f"padded={best[1]:.2f} TFLOPS "
             f"eff={eff_tflops(best[0]):.2f} TFLOPS "
             f"nominal_rw_bw={best[2]:.2f} GB/s"
         )
     print(
         f"ratio: latency={pyhip_best[0] / aiter_best[0]:.3f}x "
         f"eff_throughput={aiter_best[0] / pyhip_best[0]:.3%} "
-        f"hw_tflops={pyhip_best[1] / aiter_best[1]:.3%}"
+        f"padded_tflops={pyhip_best[1] / aiter_best[1]:.3%}"
     )
     print(
         "BENCH_RESULT "
@@ -612,7 +612,7 @@ def main() -> None:
             f"aiter={aiter_best[0]:8.3f} us "
             f"pyhip={pyhip_best[0]:8.3f} us "
             f"tput={aiter_best[0] / pyhip_best[0]:.3f}x "
-            f"hw_tflops={pyhip_best[1] / aiter_best[1]:.3f}x"
+            f"padded_tflops={pyhip_best[1] / aiter_best[1]:.3f}x"
         )
 
 
