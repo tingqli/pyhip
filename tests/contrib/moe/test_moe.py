@@ -1692,7 +1692,7 @@ if __name__ == '__main__':
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
-        "down_path":'1x4_64x256',
+        "down_path":'8x1_compact',
         "down_output_padding_bytes":128,
         "HIDDEN_SIZE":4096,
         "INTER_SIZE":256*8,
@@ -1717,10 +1717,10 @@ if __name__ == '__main__':
         "quant_type":'ptpc'
     }
     qwen35_35B_k256_args = {
-        "TILE_M_DOWN":64,
+        "TILE_M_DOWN":256,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
-        "down_path":'1x4_64x256',
+        "down_path":'8x1',
         "down_output_padding_bytes":128,
         "HIDDEN_SIZE":2048,
         "INTER_SIZE":256,
@@ -1759,7 +1759,7 @@ if __name__ == '__main__':
         "quant_type":'ptpc'
     }
     model_args = hy3_args
-    model_args = qwen35_35B_args
+    model_args = qwen35_397B_k256_args
     batch = [8192, 8192*2, 8192*4, 8192*8, 8192*16]
     batch = [8192*8]
     prec = [get_fp8type()]

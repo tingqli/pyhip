@@ -15,7 +15,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from . import layout_helpers as fxh
+from . import common as fxh
 from .common import get_down_device_config as _get_down_device_config
 
 # gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
@@ -278,11 +278,10 @@ def _build_moe_gemm2_1x4(
                 + (row_begin * output_row_stride if const_expr(_task_table) else e_offset * (block_m_per_4wave_group * output_row_stride)),
                 (block_m_per_4wave_group, output_row_stride),
             )
-            output_store_rsrc = fx.buffer_ops.create_buffer_resource(
-                arg_p_output,
-                max_size=False,
+            output_store_rsrc = fx.rocdl.get_buffer_rsrc(fx.rocdl.make_buffer_ptr(
+                fx.get_iter(arg_p_output),
                 num_records_bytes=block_m_per_4wave_group * output_row_stride * 2,
-            )
+            ))
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_sorted_ids) + (row_begin if const_expr(_task_table) else e_offset * block_m_per_4wave_group),
                 (block_m_per_4wave_group,),
@@ -407,11 +406,10 @@ def _build_moe_gemm2_1x4(
                     fxh._as_ptr(p_w_scale) + expert_id * N,
                     fx.make_layout(N, 1),
                 )
-                scale_global_rsrc = fx.buffer_ops.create_buffer_resource(
-                    scale_global,
-                    max_size=False,
+                scale_global_rsrc = fx.rocdl.get_buffer_rsrc(fx.rocdl.make_buffer_ptr(
+                    fx.get_iter(scale_global),
                     num_records_bytes=N * (fx.Float32.width // 8),
-                )
+                ))
                 scale_lds_logical = fx.make_view(
                     fx.get_iter(scale_lds),
                     fx.make_layout(
@@ -426,14 +424,18 @@ def _build_moe_gemm2_1x4(
                 wave_id = fx.Int32(fx.thread_idx.x // 64)
                 scale_local_offset = wave_id * WAVE_N + lane_id * 4
                 scale_offset = fx.Int32(block_n) * BLOCK_N + scale_local_offset
-                scale_vec = fx.Vector(
-                    fx.buffer_ops.buffer_load(
+                # 原buffer_load接收元素偏移；原生ROCDL使用字节，失效lane仍走OOB零填充。
+                scale_byte_offset = (lane_id < WAVE_N // 4).select(
+                    scale_offset * (fx.Float32.width // 8), fx.Int32(0x7FFFFFFF)
+                )
+                scale_vec = Vec(
+                    fx.rocdl.RawPtrBufferLoadOp(
+                        ir.VectorType.get([4], fx.Float32.ir_type),
                         scale_global_rsrc,
-                        scale_offset,
-                        vec_width=4,
-                        dtype=fx.Float32,
-                        mask=lane_id < WAVE_N // 4,
-                    )
+                        scale_byte_offset.ir_value(),
+                        fx.Int32(0).ir_value(),
+                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0),
+                    ).result
                 )
                 return scale_vec
 
@@ -600,20 +602,20 @@ def _build_moe_gemm2_1x4(
 
                     # Consume the older read first without forcing the newer read complete.
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
-                    fx.buffer_ops.buffer_store(
-                        Vec(out_frags[0].load()).bitcast(fx.Int32),
+                    fx.rocdl.RawPtrBufferStoreOp(
+                        Vec(out_frags[0].load()).bitcast(fx.Int32).ir_value(),
                         output_store_rsrc,
-                        byte_offsets[0],
-                        cache_modifier=_store_cache,
-                        offset_is_bytes=True,
+                        byte_offsets[0].ir_value(),
+                        fx.Int32(0).ir_value(),
+                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                     )
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                    fx.buffer_ops.buffer_store(
-                        Vec(out_frags[1].load()).bitcast(fx.Int32),
+                    fx.rocdl.RawPtrBufferStoreOp(
+                        Vec(out_frags[1].load()).bitcast(fx.Int32).ir_value(),
                         output_store_rsrc,
-                        byte_offsets[1],
-                        cache_modifier=_store_cache,
-                        offset_is_bytes=True,
+                        byte_offsets[1].ir_value(),
+                        fx.Int32(0).ir_value(),
+                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                     )
 
                 for row_pair in range_constexpr(4):
@@ -709,20 +711,20 @@ def _build_moe_gemm2_1x4(
                                 ).to(fx.Int32)
                             )
                         fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
-                        fx.buffer_ops.buffer_store(
-                            Vec(out_frags[0].load()).bitcast(fx.Int32),
+                        fx.rocdl.RawPtrBufferStoreOp(
+                            Vec(out_frags[0].load()).bitcast(fx.Int32).ir_value(),
                             output_store_rsrc,
-                            byte_offsets[0],
-                            cache_modifier=_store_cache,
-                            offset_is_bytes=True,
+                            byte_offsets[0].ir_value(),
+                            fx.Int32(0).ir_value(),
+                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                         )
                         fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                        fx.buffer_ops.buffer_store(
-                            Vec(out_frags[1].load()).bitcast(fx.Int32),
+                        fx.rocdl.RawPtrBufferStoreOp(
+                            Vec(out_frags[1].load()).bitcast(fx.Int32).ir_value(),
                             output_store_rsrc,
-                            byte_offsets[1],
-                            cache_modifier=_store_cache,
-                            offset_is_bytes=True,
+                            byte_offsets[1].ir_value(),
+                            fx.Int32(0).ir_value(),
+                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                         )
 
             use_delayed_4wave_store = BLOCK_K == 128 and nBK == 2

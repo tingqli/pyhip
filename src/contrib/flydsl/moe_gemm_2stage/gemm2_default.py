@@ -14,7 +14,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 
-from . import layout_helpers as fxh
+from . import common as fxh
 
 # gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
 _DOWN_STORE_CACHE_MODIFIER = 2

@@ -29,7 +29,7 @@ def _build_moe_gemm2_8x1_compact(
     USE_ATOMIC_WRITE=True, act_quant_type=None, tile_k=None,
     activation="silu", swiglu_limit=None, down_path="default",
     down_output_padding_bytes=None, METADATA_TILE_SIZE_M=None,
-    _n_loop=1, _store_cache=2,
+    _store_cache=2,
     _min_tail_utilization=0.6,
 ):
     assert stage == "down" and alg == "prefill_1x4" and down_path == "8x1_compact"
@@ -48,7 +48,7 @@ def _build_moe_gemm2_8x1_compact(
     )
     full = _build_moe_gemm2_8x1(
         **common, BLOCK_TILE_SIZE_M=256, BLOCK_TILE_SIZE_N=128, down_path="8x1",
-        _n_loop=_n_loop, _store_cache=_store_cache,
+        _store_cache=_store_cache,
     )
     # K192/K320的末块BK192只改变8x1满块；M64尾kernel保持其既有BK128算法。
     tail_common = {**common, "tile_k": 128 if K in (192, 320) and tile_k == 192 else tile_k}
