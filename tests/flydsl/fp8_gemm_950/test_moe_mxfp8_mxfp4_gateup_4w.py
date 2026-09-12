@@ -153,22 +153,6 @@ def _permute_scale(
     )
 
 
-def _convert_aiter_moe_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Convert AIter's routed MX scale swizzle to this kernel's layout."""
-    scale_u8 = scale.view(torch.uint8)
-    rows, groups = scale_u8.shape
-    if rows % 128 != 0 or groups % 8 != 0:
-        raise ValueError(
-            "AIter MoE scale requires rows divisible by 128 and groups by 8"
-        )
-    return (
-        scale_u8.view(rows // 128, 4, groups // 8, 4, 16, 2, 2)
-        .permute(2, 5, 3, 0, 6, 4, 1)
-        .contiguous()
-        .view(torch.int32)
-    )
-
-
 def prepare_moe_inputs(
     tokens: int,
     intermediate_size: int,
@@ -250,30 +234,7 @@ def prepare_moe_inputs(
 
     # [R//32, G//8, 4g0,16r0,2g1,2r1]
 
-    # current gemmA8w4 perfer the layout:
-
-    # ```
-    #         scale_u8.view(r // 128, 4r1, 32r0, groups).permute(3, 0, 2, 1)
-    # ```
-
-    # [R//128, 4r1, 32r0, G] -> [G, R//128, 32r0, 4r1]
-
-    # 把 这个是fused_dynamic_mxfp8_quant_moe_sort的 preshuffle之后的scale转化成test_moe_mxfp8_mxfp4_gateup_4w.py里面的A
-
-    # 1. 这个是fused_dynamic_mxfp8_quant_moe_sort scale的layout [R//32, G//8,4g0 ,16r0,2g1,2r1]
-    # view as  [R//128, 4r2, G//8,4g0 ,16r0,2g1,2r1],
-
-    # 2. permute:
-    # [R//128, 4r2, G//8,4g0 ,16r0,2g1,2r1] -[0, 1, 2, 3, 4, 5,6]    -> [G, R//128, 32r0, 4r1]
-
-    # permute to
-    # []
-    # [G//8, 2g1, 4g0, R//128, 2r1, 16r0, 4r2]
-
-    # permute:  [2， 5， 3， 0， 6， 4， 1]
-    # reshape:
-    # @todo: try using permute
-    scale_a = _convert_aiter_moe_scale(scale_a_aiter)
+    scale_a = scale_a_aiter.view(torch.int32)
     scale_b_padded = torch.full(
         (num_experts, scale_b_rows_per_expert, hidden_size // 32),
         127,
@@ -482,10 +443,13 @@ def compile_moe_gateup_4w(
     b_group16 = 16 * block_k + 64
     b_lds_elems = block_n * block_k if b_lds_swizzle else (block_n // 16) * b_group16
 
-    # One dword per thread, as in gemm_4w. There are 128 unique scale dwords:
-    # A is replicated for wave pairs 0/1 and 2/3; B for pairs 0/2 and 1/3.
-    # All 256 slots are consumed, with a contiguous 64-dword region per wave.
+    # One contiguous DWORD G2S per thread. Pair adjacent native r0 DWORDs
+    # and both r1 bytes across the four row repeats, using one aligned
+    # DS64. Pad producer planes by 32 DWORDs to spread bank addresses.
+    # B retains the original replicated packed-scale layout.
     scale_lds_dwords = 256
+    scale_a_wave_stride = 96
+    scale_a_lds_dwords = 3 * scale_a_wave_stride + 64
 
     @fx.struct
     class LDS:
@@ -497,10 +461,10 @@ def compile_moe_gateup_4w(
         b_gate1: fx.Array[weight_type, b_lds_elems, 16]
         b_up0: fx.Array[weight_type, b_lds_elems, 16]
         b_up1: fx.Array[weight_type, b_lds_elems, 16]
-        scale_a_top0: fx.Array[Int32, scale_lds_dwords, 16]
-        scale_a_top1: fx.Array[Int32, scale_lds_dwords, 16]
-        scale_a_bottom0: fx.Array[Int32, scale_lds_dwords, 16]
-        scale_a_bottom1: fx.Array[Int32, scale_lds_dwords, 16]
+        scale_a_top0: fx.Array[Int32, scale_a_lds_dwords, 16]
+        scale_a_top1: fx.Array[Int32, scale_a_lds_dwords, 16]
+        scale_a_bottom0: fx.Array[Int32, scale_a_lds_dwords, 16]
+        scale_a_bottom1: fx.Array[Int32, scale_a_lds_dwords, 16]
         scale_b_gate0: fx.Array[Int32, scale_lds_dwords, 16]
         scale_b_gate1: fx.Array[Int32, scale_lds_dwords, 16]
         scale_b_up0: fx.Array[Int32, scale_lds_dwords, 16]
@@ -611,7 +575,7 @@ def compile_moe_gateup_4w(
             fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, weight_type, element_type)
         )
         scale_atoms = {
-            (n0, m0): fx.make_mma_atom(
+            (g1, n0, m0): fx.make_mma_atom(
                 fx.rocdl.cdna4.MFMA_Scale(
                     16,
                     16,
@@ -619,9 +583,10 @@ def compile_moe_gateup_4w(
                     weight_type,
                     element_type,
                     opsel_a=n0,
-                    opsel_b=m0,
+                    opsel_b=2 * g1 + m0 % 2,
                 )
             )
+            for g1 in range_constexpr(2)
             for n0 in range_constexpr(4)
             for m0 in range_constexpr(4)
         }
@@ -679,14 +644,6 @@ def compile_moe_gateup_4w(
         def make_scale_source(ptr):
             return scale_copy.partition_S(fx.make_view(ptr, scale_read_layout))
 
-        scale_a_top_source = [
-            make_scale_source(ptr)
-            for ptr in (lds.scale_a_top0.ptr, lds.scale_a_top1.ptr)
-        ]
-        scale_a_bottom_source = [
-            make_scale_source(ptr)
-            for ptr in (lds.scale_a_bottom0.ptr, lds.scale_a_bottom1.ptr)
-        ]
         scale_b_gate_source = [
             make_scale_source(ptr)
             for ptr in (lds.scale_b_gate0.ptr, lds.scale_b_gate1.ptr)
@@ -745,20 +702,20 @@ def compile_moe_gateup_4w(
             for ptr in (lds.a_bottom0.ptr, lds.a_bottom1.ptr)
         ]
 
-        def make_scale_dma_ptr(ptr):
+        def make_scale_dma_ptr(ptr, wave_stride: int = 64):
             # The instruction adds lane_id * 4; the supplied base is wave-uniform.
             return buffer_ops.get_element_ptr(
                 lds_root(ptr),
-                byte_offset=wave_id_uniform * 64 * 4,
+                byte_offset=wave_id_uniform * wave_stride * 4,
                 elem_type=T.i8,
             )
 
         scale_a_top_dma_ptrs = [
-            make_scale_dma_ptr(ptr)
+            make_scale_dma_ptr(ptr, scale_a_wave_stride)
             for ptr in (lds.scale_a_top0.ptr, lds.scale_a_top1.ptr)
         ]
         scale_a_bottom_dma_ptrs = [
-            make_scale_dma_ptr(ptr)
+            make_scale_dma_ptr(ptr, scale_a_wave_stride)
             for ptr in (lds.scale_a_bottom0.ptr, lds.scale_a_bottom1.ptr)
         ]
         scale_b_gate_dma_ptrs = [
@@ -778,11 +735,13 @@ def compile_moe_gateup_4w(
             for copy_round in range_constexpr(4):
                 row_local = (
                     row_half * block_m
-                    + wave_id_uniform
-                    # 2 contineous lane row fetch data with interval of 16 rows
-                    + (lane_id // 8) * 16
-                    # 4 is 4 wave
-                    + copy_round * 4
+                    # Bijective row assignment; data LDS layout is unchanged.
+                    + wave_id_uniform * 2
+                    + (copy_round % 2) * 8
+                    + (copy_round // 2) * 32
+                    + lane_id // 32
+                    + ((lane_id // 16) % 2) * 16
+                    + ((lane_id // 8) % 2) * 64
                 )
                 sorted_row = expert_block_i32 * SORT_BLOCK_M + fx.Int32(row_local)
                 fused_id = buffer_ops.buffer_load(
@@ -802,9 +761,11 @@ def compile_moe_gateup_4w(
                 for row_repeat in range_constexpr(4):
                     row_local = (
                         row_quadrant * block_m
-                        + row_repeat * 32
-                        + (wave_id_uniform // 2) * 16
-                        + lane_id % 16
+                        + (wave_id_uniform // 2) * 64
+                        + ((lane_id % 16) // 8) * 32
+                        + (row_repeat % 2) * 16
+                        + (lane_id % 8) * 2
+                        + row_repeat // 2
                     )
                     sorted_row = expert_block_i32 * SORT_BLOCK_M + fx.Int32(row_local)
                     rows.append(
@@ -904,6 +865,29 @@ def compile_moe_gateup_4w(
         scale_lane_id = tid % 64
         scale_wave_id = wave_id_uniform
 
+        def make_a_scale_source(ptr):
+            # LDS [r2, g0, r0] with padding between r2 planes. Row
+            # repeats consume adjacent r0 DWORDs and both r1 bytes.
+            r2 = (scale_wave_id // 2) * 2 + (scale_lane_id % 16) // 8
+            dword_offset = (
+                r2 * scale_a_wave_stride
+                + (scale_lane_id // 16) * 16
+                + (scale_lane_id % 8) * 2
+            )
+            source_ptr = fx.add_offset(
+                ptr, fx.make_int_tuple(dword_offset)
+            )
+            return fx.make_view(source_ptr, fx.make_layout(2, 1))
+
+        scale_a_top_source = [
+            make_a_scale_source(ptr)
+            for ptr in (lds.scale_a_top0.ptr, lds.scale_a_top1.ptr)
+        ]
+        scale_a_bottom_source = [
+            make_a_scale_source(ptr)
+            for ptr in (lds.scale_a_bottom0.ptr, lds.scale_a_bottom1.ptr)
+        ]
+
         # scale layout (r//128, 4r1, 32r0, k//32) permuted to
         #  (k//32, r//128, 32r0, 4r1) -> ( k//128, 4g0,r //128, 32r0, 4r1)
 
@@ -922,6 +906,16 @@ def compile_moe_gateup_4w(
                 + row_tile * 32 * 4
             )
 
+        def make_a_scale_voffset(row_tile):
+            # Native [R//32, G//8, g0, r0, g1, r1]; g1/r1 are the
+            # four bytes of each DWORD. All lane-dependent addresses
+            # are constructed before the runtime loop.
+            g0 = scale_lane_id // 16
+            r0 = scale_lane_id % 16
+            r2 = scale_wave_id
+            groups = hidden_size // 32
+            return row_tile * (128 * groups) + r2 * (32 * groups) + g0 * 64 + r0 * 4
+
         # One buffer_load_dword ... lds per wave; no scale value lives in a
         # prefetch VGPR. Global packed-scale layout is unchanged.
         def raw_scale_g2s(rsrc, kk, ptr, voffset, rows):
@@ -931,6 +925,17 @@ def compile_moe_gateup_4w(
                 fx.Int32(4),
                 voffset,
                 fx.Int32(kk * rows * 4),
+                fx.Int32(0),
+                fx.Int32(0),
+            )
+
+        def raw_a_scale_g2s(kk, ptr, voffset):
+            rocdl.raw_ptr_buffer_load_lds(
+                scale_a_rsrc,
+                ptr,
+                fx.Int32(4),
+                voffset,
+                fx.Int32((kk // 2) * 256),
                 fx.Int32(0),
                 fx.Int32(0),
             )
@@ -965,11 +970,18 @@ def compile_moe_gateup_4w(
                     values.append(packed[word])
             destination.store(Vec.from_elements(values, Int32))
 
-        def do_gemm(c_frag, b_frag, a_frag, scale_a_frag, scale_b_frag):
+        def do_gemm(
+            c_frag,
+            b_frag,
+            a_frag,
+            scale_a_frag,
+            scale_b_frag,
+            scale_g1: int,
+        ):
             c_value = c_frag.load().ir_value()
             b_value = vector.bitcast(T.vec(64, T.i8), b_frag.load().ir_value())
             a_value = vector.bitcast(T.vec(128, T.i8), a_frag.load().ir_value())
-            scale_a = Vec(scale_a_frag.load())[0]
+            scale_a = Vec(scale_a_frag.load())
             scale_b = Vec(scale_b_frag.load())[0]
             for n0 in range_constexpr(4):
                 for m0 in range_constexpr(4):
@@ -997,9 +1009,11 @@ def compile_moe_gateup_4w(
                         strides=[1],
                     )
                     scaled_atom = fx.atom_set_value(
-                        scale_atoms[(n0, m0)], "scale_a", scale_b
+                        scale_atoms[(scale_g1, n0, m0)], "scale_a", scale_b
                     )
-                    scaled_atom = fx.atom_set_value(scaled_atom, "scale_b", scale_a)
+                    scaled_atom = fx.atom_set_value(
+                        scaled_atom, "scale_b", scale_a[m0 // 2]
+                    )
                     c_sub = _fly.mma_atom_call_ssa(
                         [T.vec(4, T.f32)], scaled_atom, b_sub, a_sub, c_sub
                     )
@@ -1066,22 +1080,21 @@ def compile_moe_gateup_4w(
         scale_b_up_voffset = make_scale_voffset(
             up_scale_row_tile, scale_b_padded_rows, False
         )
-        scale_a_top_voffset = make_scale_voffset(
-            a_top_scale_tile, scale_a_padded_rows, True
-        )
-        scale_a_bottom_voffset = make_scale_voffset(
-            a_bottom_scale_tile, scale_a_padded_rows, True
-        )
+        scale_a_top_voffset = make_a_scale_voffset(a_top_scale_tile)
+        scale_a_bottom_voffset = make_a_scale_voffset(a_bottom_scale_tile)
 
         # Only the scales consumed by MFMA are kept in registers. Future tiles
         # reside in the corresponding scale LDS ping-pong buffers.
-        scale_a_top_frag = fx.make_fragment_like(scale_a_top_source[0])
-        scale_a_bottom_frag = fx.make_fragment_like(scale_a_bottom_source[0])
+        scale_a_top_frag = fx.make_rmem_tensor(2, Int32)
+        scale_a_bottom_frag = fx.make_rmem_tensor(2, Int32)
         scale_b_gate_frag = fx.make_fragment_like(scale_b_gate_source[0])
         scale_b_up_frag = fx.make_fragment_like(scale_b_up_source[0])
 
         def load_scale(source, destination):
             fx.copy(scale_lds_copy_atom, source, destination)
+
+        def load_a_scale(source, destination):
+            destination.store(source.load())
 
         def load_a(source, destination):
             fx.copy(copy_a_atom, source, destination)
@@ -1117,24 +1130,16 @@ def compile_moe_gateup_4w(
             raw_a_gather_g2s(ki, a_top_dma_ptrs[buffer_index], a_top_voffsets)
             rocdl.sched_barrier(0)
             # load top scale
-            raw_scale_g2s(
-                scale_a_rsrc,
-                ki,
-                scale_a_top_dma_ptrs[buffer_index],
-                scale_a_top_voffset,
-                scale_a_padded_rows,
+            raw_a_scale_g2s(
+                ki, scale_a_top_dma_ptrs[buffer_index], scale_a_top_voffset
             )
             rocdl.sched_barrier(0)
             # AC A bottom.
             raw_a_gather_g2s(ki, a_bottom_dma_ptrs[buffer_index], a_bottom_voffsets)
             rocdl.sched_barrier(0)
             # load A bottom scale;
-            raw_scale_g2s(
-                scale_a_rsrc,
-                ki,
-                scale_a_bottom_dma_ptrs[buffer_index],
-                scale_a_bottom_voffset,
-                scale_a_padded_rows,
+            raw_a_scale_g2s(
+                ki, scale_a_bottom_dma_ptrs[buffer_index], scale_a_bottom_voffset
             )
             rocdl.sched_barrier(0)
             # AC B right
@@ -1175,7 +1180,7 @@ def compile_moe_gateup_4w(
         # load A top
         load_a(a_top_source[0], frag_a_top_dest)
         load_scale(scale_b_gate_source[0], scale_b_gate_frag)
-        load_scale(scale_a_top_source[0], scale_a_top_frag)
+        load_a_scale(scale_a_top_source[0], scale_a_top_frag)
         rocdl.sched_barrier(0)
 
         frag_c_tl.fill(0)
@@ -1200,13 +1205,14 @@ def compile_moe_gateup_4w(
             waitvmcnt_barrier(wait_ab)
             # load A bottom
             load_a(a_bottom_source[0], frag_a_bottom_dest)
-            load_scale(scale_a_bottom_source[0], scale_a_bottom_frag)
+            load_a_scale(scale_a_bottom_source[0], scale_a_bottom_frag)
             do_gemm(
                 frag_c_tl,
                 frag_b_gate,
                 frag_a_top,
                 scale_a_top_frag,
                 scale_b_gate_frag,
+                0,
             )
 
             raw_scale_g2s(
@@ -1233,14 +1239,9 @@ def compile_moe_gateup_4w(
                 frag_a_bottom,
                 scale_a_bottom_frag,
                 scale_b_gate_frag,
+                0,
             )
-            raw_scale_g2s(
-                scale_a_rsrc,
-                kk + 2,
-                scale_a_top_dma_ptrs[0],
-                scale_a_top_voffset,
-                scale_a_padded_rows,
-            )
+            raw_a_scale_g2s(kk + 2, scale_a_top_dma_ptrs[0], scale_a_top_voffset)
             order_scale_before_g2s()
             raw_a_gather_g2s(kk + 2, a_top_dma_ptrs[0], a_top_voffsets)
             hot_loop_scheduler_read_b_prefetch_a(1, a_vmem, b_dsrd)
@@ -1256,13 +1257,10 @@ def compile_moe_gateup_4w(
                 frag_a_top,
                 scale_a_top_frag,
                 scale_b_up_frag,
+                0,
             )
-            raw_scale_g2s(
-                scale_a_rsrc,
-                kk + 2,
-                scale_a_bottom_dma_ptrs[0],
-                scale_a_bottom_voffset,
-                scale_a_padded_rows,
+            raw_a_scale_g2s(
+                kk + 2, scale_a_bottom_dma_ptrs[0], scale_a_bottom_voffset
             )
             order_scale_before_g2s()
             raw_a_gather_g2s(kk + 2, a_bottom_dma_ptrs[0], a_bottom_voffsets)
@@ -1271,13 +1269,14 @@ def compile_moe_gateup_4w(
             # phase 3:
             waitvmcnt_barrier(wait_ba)
             load_a(a_top_source[1], frag_a_top_dest)
-            load_scale(scale_a_top_source[1], scale_a_top_frag)
+            load_a_scale(scale_a_top_source[1], scale_a_top_frag)
             do_gemm(
                 frag_c_br,
                 frag_b_up,
                 frag_a_bottom,
                 scale_a_bottom_frag,
                 scale_b_up_frag,
+                0,
             )
             raw_scale_g2s(
                 scale_b_rsrc,
@@ -1294,13 +1293,14 @@ def compile_moe_gateup_4w(
             # phase 0:
             waitvmcnt_barrier(wait_ab)
             load_a(a_bottom_source[1], frag_a_bottom_dest)
-            load_scale(scale_a_bottom_source[1], scale_a_bottom_frag)
+            load_a_scale(scale_a_bottom_source[1], scale_a_bottom_frag)
             do_gemm(
                 frag_c_tl,
                 frag_b_gate,
                 frag_a_top,
                 scale_a_top_frag,
                 scale_b_gate_frag,
+                1,
             )
 
             raw_scale_g2s(
@@ -1324,15 +1324,10 @@ def compile_moe_gateup_4w(
                 frag_a_bottom,
                 scale_a_bottom_frag,
                 scale_b_gate_frag,
+                1,
             )
 
-            raw_scale_g2s(
-                scale_a_rsrc,
-                kk + 3,
-                scale_a_top_dma_ptrs[1],
-                scale_a_top_voffset,
-                scale_a_padded_rows,
-            )
+            raw_a_scale_g2s(kk + 3, scale_a_top_dma_ptrs[1], scale_a_top_voffset)
             order_scale_before_g2s()
             raw_a_gather_g2s(kk + 3, a_top_dma_ptrs[1], a_top_voffsets)
             hot_loop_scheduler_read_b_prefetch_a(5, a_vmem, b_dsrd)
@@ -1347,14 +1342,11 @@ def compile_moe_gateup_4w(
                 frag_a_top,
                 scale_a_top_frag,
                 scale_b_up_frag,
+                1,
             )
 
-            raw_scale_g2s(
-                scale_a_rsrc,
-                kk + 3,
-                scale_a_bottom_dma_ptrs[1],
-                scale_a_bottom_voffset,
-                scale_a_padded_rows,
+            raw_a_scale_g2s(
+                kk + 3, scale_a_bottom_dma_ptrs[1], scale_a_bottom_voffset
             )
             order_scale_before_g2s()
             raw_a_gather_g2s(kk + 3, a_bottom_dma_ptrs[1], a_bottom_voffsets)
@@ -1363,13 +1355,14 @@ def compile_moe_gateup_4w(
             # phase3:
             waitvmcnt_barrier(wait_ba)
             load_a(a_top_source[0], frag_a_top_dest)
-            load_scale(scale_a_top_source[0], scale_a_top_frag)
+            load_a_scale(scale_a_top_source[0], scale_a_top_frag)
             do_gemm(
                 frag_c_br,
                 frag_b_up,
                 frag_a_bottom,
                 scale_a_bottom_frag,
                 scale_b_up_frag,
+                1,
             )
 
             raw_scale_g2s(
@@ -1400,13 +1393,14 @@ def compile_moe_gateup_4w(
         # reads before GEMM so LLVM can interleave them without scale anti-deps.
         waitvmcnt_barrier(wait_ab)
         load_a(a_bottom_source[0], frag_a_bottom_dest)
-        load_scale(scale_a_bottom_source[0], scale_a_bottom_frag)
+        load_a_scale(scale_a_bottom_source[0], scale_a_bottom_frag)
         do_gemm(
             frag_c_tl,
             frag_b_gate,
             frag_a_top,
             scale_a_top_frag,
             scale_b_gate_frag,
+            0,
         )
         _schedule_compute(0, a_dsrd + 1, 0)
         rocdl.sched_barrier(0)
@@ -1420,6 +1414,7 @@ def compile_moe_gateup_4w(
             frag_a_bottom,
             scale_a_bottom_frag,
             scale_b_gate_frag,
+            0,
         )
         _schedule_compute(1, b_dsrd + 1, 0)
         rocdl.sched_barrier(0)
@@ -1433,32 +1428,35 @@ def compile_moe_gateup_4w(
             frag_a_top,
             scale_a_top_frag,
             scale_b_up_frag,
+            0,
         )
         _schedule_compute(2, b_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(a_phase_vmem + b_phase_vmem)
         load_a(a_top_source[1], frag_a_top_dest)
-        load_scale(scale_a_top_source[1], scale_a_top_frag)
+        load_a_scale(scale_a_top_source[1], scale_a_top_frag)
         do_gemm(
             frag_c_br,
             frag_b_up,
             frag_a_bottom,
             scale_a_bottom_frag,
             scale_b_up_frag,
+            0,
         )
         _schedule_compute(3, a_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(b_phase_vmem)
         load_a(a_bottom_source[1], frag_a_bottom_dest)
-        load_scale(scale_a_bottom_source[1], scale_a_bottom_frag)
+        load_a_scale(scale_a_bottom_source[1], scale_a_bottom_frag)
         do_gemm(
             frag_c_tl,
             frag_b_gate,
             frag_a_top,
             scale_a_top_frag,
             scale_b_gate_frag,
+            1,
         )
         _schedule_compute(4, a_dsrd + 1, 0)
         rocdl.sched_barrier(0)
@@ -1472,6 +1470,7 @@ def compile_moe_gateup_4w(
             frag_a_bottom,
             scale_a_bottom_frag,
             scale_b_gate_frag,
+            1,
         )
         _schedule_compute(5, b_dsrd + 1, 0)
         rocdl.sched_barrier(0)
@@ -1482,6 +1481,7 @@ def compile_moe_gateup_4w(
             frag_a_top,
             scale_a_top_frag,
             scale_b_up_frag,
+            1,
         )
         _schedule_compute(6, 0, 0)
         rocdl.sched_barrier(0)
@@ -1491,6 +1491,7 @@ def compile_moe_gateup_4w(
             frag_a_bottom,
             scale_a_bottom_frag,
             scale_b_up_frag,
+            1,
         )
         _schedule_compute(7, 0, 0)
         rocdl.sched_barrier(0)
