@@ -1,5 +1,16 @@
 # PyHIP A8W4 MoE Roofline Results
 
+## 2026-09-12 Native A-scale follow-up
+
+The [paired-row DS64 expanded regression report](../../native_scale_perf_20260912/expanded_paired_rows/README.md)
+covers 25 configurations, two complete six-round paired batches, and 25/25
+independent reference-accuracy passes. Pooled kernel latency changes have a
+median of +0.55%, with 24/25 configurations <=1%; worst pooled +1.14%, worst
+single-batch median +1.39%. These are **kernel-only paired comparisons**, not an
+end-to-end speedup or an all-shape <=1% guarantee. The exact tested snapshot is
+identified in the linked report; the later live experimental kernel is different.
+The historical roofline/PMC/ATT results below have not been replaced or reprofiled.
+
 All event timings are minimums from the unprofiled rotating-clone run. PMC columns are medians of isolated profiled dispatches.
 
 - Shape: gate_up=512, K=6144, topk=8, experts=384

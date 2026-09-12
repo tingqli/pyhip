@@ -16,8 +16,6 @@ from pyhip import cudaPerf
 
 from test_moe_mxfp8_mxfp4_gateup_4w import (
     SORT_BLOCK_M,
-    _convert_aiter_moe_scale,
-    _permute_scale,
     compile_moe_gateup_4w,
 )
 
@@ -164,18 +162,9 @@ def prepare_case(
         experts,
         True,
     )
-    pyhip_scale_a = _convert_aiter_moe_scale(pyhip_scale_a_aiter)
-    scale_b_rows_per_expert = div_up(gate_up_size, 256) * 256
-    scale_b_padded = torch.full(
-        (experts, scale_b_rows_per_expert, hidden_size // 32),
-        127,
-        device="cuda",
-        dtype=torch.uint8,
-    )
-    scale_b_padded[:, :gate_up_size].copy_(scale_b_raw.view(torch.uint8))
-    pyhip_scale_b = _permute_scale(
-        scale_b_padded.view(experts * scale_b_rows_per_expert, hidden_size // 32)
-    )
+    pyhip_scale_a = pyhip_scale_a_aiter.view(torch.int32)
+    # Both kernels consume the exact same native W1 scale bytes.
+    pyhip_scale_b = aiter_scale_b.view(torch.int32)
 
     return {
         "tokens": tokens,
