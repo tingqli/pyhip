@@ -9,6 +9,8 @@ if __name__ == "__main__":
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -23,12 +25,9 @@ class ROCDLBuffer:
     """Buffer-resource view for direct global-to-LDS copies of dwords."""
 
     def __init__(self, base_tensor):
-        num_elements = fx.size(base_tensor).to_py_value()
         self.base_offset = fx.ptrtoint(fx.get_iter(base_tensor))
-        self.rsrc = fx.buffer_ops.create_buffer_resource_from_addr(
-            self.base_offset,
-            num_records_bytes=num_elements * base_tensor.dtype.width // 8,
-        )
+        buffer = fx.rocdl.make_buffer_tensor(base_tensor, False)
+        self.rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(buffer))
 
     @flyc.jit
     def load_async(
@@ -63,21 +62,13 @@ class ROCDLBuffer:
 
         tid = fx.thread_idx.x
         wave = tid // fx.Int32(64)
-        dst_base_ptr = fx.buffer_ops.create_llvm_ptr(
-            fx.ptrtoint(ptr_dst),
-            address_space=3,
-        )
         zero_i32 = arith._to_raw(fx.Int32(0))
-        wave_byte_offset = fx.rocdl.readfirstlane(
+        wave_byte_offset = fx.Int32(fx.rocdl.readfirstlane(
             T.i32,
             arith._to_raw(wave * fx.Int32(64 * atom_bytes)),
-        )
-        lds_ptr = fx.buffer_ops.get_element_ptr(
-            dst_base_ptr,
-            wave_byte_offset,
-            0,
-            T.i8,
-        )
+        ))
+        lds_address = fx.Int32(fx.ptrtoint(ptr_dst)) + wave_byte_offset
+        lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
         src_base_byte_offset = fx.Int32(
             fx.ptrtoint(ptr_src) - self.base_offset
         )
@@ -89,19 +80,13 @@ class ROCDLBuffer:
         for copy_round in range_constexpr(num_rounds):
             rocdl.raw_ptr_buffer_load_async_lds(
                 self.rsrc,
-                lds_ptr,
+                llvm.inttoptr(lds_ptr_type, arith._to_raw(lds_address)),
                 arith._to_raw(fx.Int32(atom_bytes)),
                 arith._to_raw(source_byte_offset),
                 zero_i32,
                 zero_i32,
-                zero_i32,
             )
-            lds_ptr = fx.buffer_ops.get_element_ptr(
-                lds_ptr,
-                None,
-                num_threads * atom_bytes,
-                T.i8,
-            )
+            lds_address += num_threads * atom_bytes
             source_byte_offset += num_threads * atom_bytes
 
         # Partial 16-byte round.
@@ -109,10 +94,9 @@ class ROCDLBuffer:
             if tid < fx.Int32(tail_atoms):
                 rocdl.raw_ptr_buffer_load_async_lds(
                     self.rsrc,
-                    lds_ptr,
+                    llvm.inttoptr(lds_ptr_type, arith._to_raw(lds_address)),
                     arith._to_raw(fx.Int32(atom_bytes)),
                     arith._to_raw(source_byte_offset),
-                    zero_i32,
                     zero_i32,
                     zero_i32,
                 )
@@ -123,21 +107,15 @@ class ROCDLBuffer:
                 src_base_byte_offset
                 + fx.Int32((num_bytes // atom_bytes) * atom_bytes)
             )
-            dword_lds_ptr = fx.buffer_ops.get_element_ptr(
-                lds_ptr,
-                None,
-                tail_atoms * atom_bytes,
-                T.i8,
-            )
+            dword_lds_address = lds_address + tail_atoms * atom_bytes
             if tid < fx.Int32(tail_dwords):
                 rocdl.raw_ptr_buffer_load_async_lds(
                     self.rsrc,
-                    dword_lds_ptr,
+                    llvm.inttoptr(lds_ptr_type, arith._to_raw(dword_lds_address)),
                     arith._to_raw(fx.Int32(dword_bytes)),
                     arith._to_raw(
                         dword_source_base + tid * fx.Int32(dword_bytes)
                     ),
-                    zero_i32,
                     zero_i32,
                     zero_i32,
                 )

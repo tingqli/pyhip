@@ -26,7 +26,7 @@ from moe_8wave_down_utils import ROCDLBuffer
 
 
 def _atomic_add_i32(addr, value):
-    ptr = fx.buffer_ops.create_llvm_ptr(addr, address_space=1)
+    ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), arith._to_raw(addr))
     return llvm.AtomicRMWOp(
         llvm.AtomicBinOp.add,
         ptr,
@@ -406,7 +406,12 @@ def flydsl_moe_gemm_8wave_down(
                                 if len(dequant_queue) > 3:
                                     c_mma_frag, mfma_scaleAB, (mi0, ni0) = dequant_queue.pop(0)
                                     if const_expr((mi0, ni0) in acc_init):
-                                        acc[None, mi0, ni0].store(acc[None, mi0, ni0].load() + c_mma_frag.load() * mfma_scaleAB)
+                                        # Match PyHIP/tuned cross-K rounding. Separate mul/add
+                                        # can flip a BF16 tie and lose a TOPK-sum residual.
+                                        acc[None, mi0, ni0].store(fxh.eltwise_op(
+                                            "llvm.fma.f32", c_mma_frag.load(), mfma_scaleAB,
+                                            acc[None, mi0, ni0].load(),
+                                        ))
                                     else:
                                         acc[None, mi0, ni0].store(c_mma_frag.load() * mfma_scaleAB)
                                         acc_init[mi0, ni0] = True
@@ -415,7 +420,10 @@ def flydsl_moe_gemm_8wave_down(
                     while const_expr(len(dequant_queue) > 0):
                         c_mma_frag, mfma_scaleAB, (mi0, ni0) = dequant_queue.pop(0)
                         if const_expr((mi0, ni0) in acc_init):
-                            acc[None, mi0, ni0].store(acc[None, mi0, ni0].load() + c_mma_frag.load() * mfma_scaleAB)
+                            acc[None, mi0, ni0].store(fxh.eltwise_op(
+                                "llvm.fma.f32", c_mma_frag.load(), mfma_scaleAB,
+                                acc[None, mi0, ni0].load(),
+                            ))
                         else:
                             acc[None, mi0, ni0].store(c_mma_frag.load() * mfma_scaleAB)
                             acc_init[mi0, ni0] = True
