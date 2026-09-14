@@ -128,6 +128,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts, persistent=True):
     assert k == 256 and n > 0 and n % 512 == 0
     assert 0 < topk <= min(num_experts, 255)
     n_split, ks, nt = n // 4, 2, n // 512
+    assert 256 * (n + n_split) * 2 < (1 << 32), "tile offsets include the invalid-row sentinel"
     slot_bytes, ring_slots = 16384, 4
     scale_count = n_split // 128 * ks
     scale_words = (scale_count + 63 + 255) // 256 * 256
@@ -177,8 +178,6 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts, persistent=True):
         a_packet = fxh.BufferTensor(fx.make_view(fx.get_iter(a_buffer), fx.make_layout(4, 1)))
         as_buffer = fx.rocdl.make_buffer_tensor(fx.make_view(input_scales, fx.make_layout(rows * ks, 1)), False)
         as_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(as_buffer))
-        out_buffer = fx.rocdl.make_buffer_tensor(fx.make_view(output, fx.make_layout(output_capacity_rows * n, 1)), False)
-        out_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(out_buffer))
         max_id = _scalar(num_valid_ids[0])
         atom = fx.make_mma_atom(rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
         zero, dma_size = fx.Int32(0).ir_value(), fx.Int32(16).ir_value()
@@ -237,6 +236,12 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts, persistent=True):
                 )
                 weight_buffer = fx.rocdl.make_buffer_tensor(weight_view, False)
                 weight_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(weight_buffer))
+                # Rebase each sorted M block in 64-bit element arithmetic.
+                # Buffer bounds and store offsets then cover only this block,
+                # even when the caller's packed allocation exceeds 4 GiB.
+                out_view = fx.make_view(output + fx.Int64(blk_m) * (256 * n), fx.make_layout(256 * n, 1))
+                out_buffer = fx.rocdl.make_buffer_tensor(out_view, False)
+                out_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(out_buffer))
                 a = fx.make_rmem_tensor([8, 2, ks], fx.Int32)
                 a_words = fx.make_view(fx.get_iter(a), fx.make_ordered_layout([4, 2, 2, ks], 0))
                 stage_a_scales = fx.make_rmem_tensor([2, ks], fx.Float32)
@@ -261,9 +266,9 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts, persistent=True):
                         encoded = ids_lds[row].bitcast(fx.Uint32)
                         token, slot = encoded & 0xFFFFFF, encoded >> 24
                         valid = (token < fx.Uint32(num_tokens)) & (slot < topk)
-                        offset = blk_m * (256 * n * 2) + blk_oc * (256 * n_split * 2) + row * 128
+                        offset = blk_oc * (256 * n_split * 2) + row * 128
                         offset += swap_col * 16 + (task_lane_row % 2) * 64
-                        addresses.append(_pin_address(valid.select(offset, output_capacity_rows * (n * 2))))
+                        addresses.append(_pin_address(valid.select(offset, fx.Int32(256 * n * 2))))
                     coalesced_addresses.append(addresses)
 
                 # All VGPR addresses are pinned before the first Memory stage.
@@ -543,7 +548,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts, persistent=True):
                    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, task_counter)
         assert all(t.is_cuda and t.device == output.device and t.is_contiguous() for t in tensors)
         assert input_q.numel() < (1 << 32) and input_scales.numel() * 4 < (1 << 32) and n_split * k < (1 << 32)
-        assert (output.numel() + n) * 2 < (1 << 32), "32-bit offsets include the invalid-row sentinel"
+        assert output.shape[0] < (1 << 31), "row count is passed as int32"
         assert torch.cuda.get_device_properties(output.device).gcnArchName.startswith("gfx950")
         if persistent:
             task_counter.zero_()

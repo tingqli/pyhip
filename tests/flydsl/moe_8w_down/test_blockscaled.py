@@ -792,6 +792,153 @@ def test_cli_rejects_unsupported_m128(monkeypatch, capsys, candidate):
     assert error.value.code == 2 and "OC8" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("candidate", ["256x128 persist", "256x128"])
+def test_m256_packed_crosses_4gib(candidate):
+    """Exercise live stores below/above 4 GiB, not just an oversized tail."""
+    require_gpu()
+    tokens, topk, n, experts, block_m = 2, 2, 6144, 4, 256
+    block_bytes = block_m * n * 2
+    crossing = (1 << 32) // block_bytes
+    blocks, valid_rows = crossing + 3, (crossing + 2) * block_m
+    rows = blocks * block_m
+    assert crossing * block_bytes < (1 << 32) < (crossing + 1) * block_bytes
+    locations = [[0, (crossing + 1) * block_m + 255],
+                 [crossing * block_m + 127, (crossing + 1) * block_m + 128]]
+    a = torch.zeros((tokens, topk, 256), dtype=torch.bfloat16, device="cuda")
+    a[..., 0], a[..., 128] = 1, 2
+    pattern = (torch.arange(n, device="cuda", dtype=torch.float32) % 16 + 1) / 8
+    w = torch.zeros((experts, n, 256), dtype=torch.bfloat16, device="cuda")
+    w[..., 0], w[..., 128] = pattern, -pattern
+    sa = torch.ones((2, tokens * topk), device="cuda")
+    sb = torch.ones((experts, n // 128, 2), device="cuda")
+    sb[:, :, 0] = torch.arange(1, experts + 1, device="cuda")[:, None]
+    sb[:, :, 1] = sb[:, :, 0] * 0.25
+    routing = torch.tensor([[0.25, 0.75], [0.5, 0.5]], device="cuda")
+    expected_routes = (pattern[None, None, :] * 0.5
+                       * torch.tensor([1, 2], device="cuda")[None, :, None]
+                       * routing[:, :, None]).to(torch.bfloat16)
+    expected = expected_routes.sum(dim=1)
+    sentinel = (topk << 24) | tokens
+    ids = torch.full((rows,), sentinel, dtype=torch.int32, device="cuda")
+    routes = torch.zeros(rows, device="cuda")
+    eids = torch.zeros(blocks, dtype=torch.int32, device="cuda")
+    eids[crossing + 1:] = 1
+    for token in range(tokens):
+        for slot in range(topk):
+            ids[locations[token][slot]] = (slot << 24) | token
+            routes[locations[token][slot]] = routing[token, slot]
+    # Native metadata is tested separately. This sparse synthetic prefix places
+    # real rows at the addressing boundary; its capacity tail is hostile.
+    ids[valid_rows:], routes[valid_rows:] = 0, 123
+    valid = torch.tensor([valid_rows], dtype=torch.int32, device="cuda")
+    counter = torch.full((1,), 0x123456, dtype=torch.int32, device="cuda")
+    source_guard = torch.full((rows + 2, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    output_guard = torch.full((tokens + 2, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    output, packed = output_guard[1:-1], source_guard[1:-1]
+    workspace = DownReduceWorkspace()
+    workspace.data = packed
+    pipeline = make_packed_pipeline(candidate, n=n, topk=topk, num_experts=experts, workspace=workspace)
+    args = (output, a.to(torch.float8_e4m3fn), shuffle_weight(w.to(torch.float8_e4m3fn), layout=(16, 16)),
+            sa, sb, ids, routes, eids, valid, counter)
+    physical = packed.view(blocks, n // 64, block_m, 64)
+    expected_inverse = torch.tensor(locations, dtype=torch.int32, device="cuda")
+
+    def check(live):
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected if live else torch.zeros_like(expected), rtol=0, atol=0)
+        assert torch.isnan(source_guard[[0, -1]]).all() and torch.isnan(output_guard[[0, -1]]).all()
+        assert torch.isnan(packed[valid_rows:]).all()
+        assert workspace.data.data_ptr() == packed.data_ptr()
+        expected_counter = int(valid[0].item()) // block_m * 4 + 256 if candidate == "256x128 persist" else 0x123456
+        assert counter.item() == expected_counter
+        if live:
+            torch.testing.assert_close(workspace.inverse, expected_inverse, rtol=0, atol=0)
+            for token in range(tokens):
+                for slot in range(topk):
+                    bm, row = divmod(locations[token][slot], block_m)
+                    torch.testing.assert_close(physical[bm, :, row, :].reshape(n),
+                                               expected_routes[token, slot], rtol=0, atol=0)
+        else:
+            assert (workspace.inverse == -1).all()
+        for bm in (0, crossing, crossing + 1):
+            keep = torch.ones(block_m, dtype=torch.bool, device="cuda")
+            if live:
+                for row in (location % block_m for route in locations for location in route
+                            if location // block_m == bm):
+                    keep[row] = False
+            assert torch.isnan(physical[bm, :, keep, :]).all()
+
+    pipeline(*args)
+    check(True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pipeline(*args)
+    old_ids = ids.clone()
+    for state in ("valid", "invalid", "empty", "restore"):
+        if state == "invalid":
+            ids[:valid_rows].fill_(sentinel)
+        elif state == "empty":
+            valid.zero_()
+        elif state == "restore":
+            ids.copy_(old_ids)
+            valid.fill_(valid_rows)
+        packed.fill_(torch.nan)
+        output.fill_(torch.nan)
+        counter.fill_(0x123456)
+        graph.replay()
+        check(state in ("valid", "restore"))
+
+
+@pytest.mark.parametrize("sort_block_m", [128, 256])
+def test_packed_reducer_crosses_4gib(sort_block_m):
+    """Wide source gathers, partial column CTA, invalid indices and replay."""
+    require_gpu()
+    tokens, n, topk = 2, 2560, 8
+    block_bytes = sort_block_m * n * 2
+    crossing = (1 << 32) // block_bytes
+    rows = (crossing + 2) * sort_block_m
+    assert crossing * block_bytes < (1 << 32) < (crossing + 1) * block_bytes
+    locations = [[0, crossing * sort_block_m + sort_block_m // 2, rows - 1,
+                  -1, -2, rows, (1 << 31) - 1, -(1 << 31)],
+                 [1, crossing * sort_block_m + 1, (crossing + 1) * sort_block_m,
+                  -1, -2, rows + 1, (1 << 31) - 1, -(1 << 31)]]
+    generator = torch.Generator(device="cuda").manual_seed(2091)
+    values = torch.randn((tokens, topk, n), generator=generator, device="cuda").to(torch.bfloat16)
+    values[:, 3:] = 0
+    source_guard = torch.full((rows + 2, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    source = source_guard[1:-1]
+    physical = source.view(-1, n // 64, sort_block_m, 64)
+    for token in range(tokens):
+        for slot in range(3):
+            bm, row = divmod(locations[token][slot], sort_block_m)
+            physical[bm, :, row, :].copy_(values[token, slot].view(n // 64, 64))
+    expected = torch.zeros((tokens, n), device="cuda")
+    for slot in range(topk):
+        expected += values[:, slot].float()
+    expected = expected.to(torch.bfloat16)
+    inverse = torch.tensor(locations, dtype=torch.int32, device="cuda")
+    output_guard = torch.full((tokens + 2, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    output = output_guard[1:-1]
+    reduce = make_moe_sum(n=n, topk=topk, sort_block_m=sort_block_m)
+
+    def check(live):
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected if live else torch.zeros_like(expected), rtol=0, atol=0)
+        assert torch.isnan(source_guard[[0, -1]]).all() and torch.isnan(output_guard[[0, -1]]).all()
+
+    reduce(output, source, inverse)
+    check(True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        reduce(output, source, inverse)
+    original = inverse.clone()
+    for live in (True, False, True):
+        inverse.copy_(original) if live else inverse.fill_(-1)
+        output.fill_(torch.nan)
+        graph.replay()
+        check(live)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=16384)

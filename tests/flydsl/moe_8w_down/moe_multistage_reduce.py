@@ -21,6 +21,7 @@ def make_moe_sum(*, n, topk, sort_block_m=256):
     """Gather packed down routes through inverse; missing entries contribute0."""
     assert n > 0 and n % 512 == 0 and 0 < topk <= 255
     assert sort_block_m in (128, 256)
+    assert sort_block_m * n * 2 < (1 << 32), "one packed M block must fit a buffer descriptor"
     column_blocks = (n + 2047) // 2048
 
     @flyc.kernel(known_block_size=[256, 1, 1])
@@ -29,9 +30,7 @@ def make_moe_sum(*, n, topk, sort_block_m=256):
         tid = fx.Int32(fx.thread_idx.x)
         token = fx.Int32(fx.block_idx.x) // column_blocks
         block_col = fx.Int32(fx.block_idx.x) % column_blocks
-        source_buffer = fx.rocdl.make_buffer_tensor(fx.make_view(source, fx.make_layout(source_rows * n, 1)), False)
         target_buffer = fx.rocdl.make_buffer_tensor(fx.make_view(output, fx.make_layout(tokens * n, 1)), False)
-        srsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(source_buffer))
         drsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(target_buffer))
         zero = ir.IntegerAttr.get(fx.Int32.ir_type, 0)
         zero_offset = fx.Int32(0).ir_value()
@@ -40,10 +39,18 @@ def make_moe_sum(*, n, topk, sort_block_m=256):
         locations = [_scalar(inverse[token * topk + route]) for route in range_constexpr(topk)]
 
         def read_route(location, column):
-            bm, row = location // sort_block_m, location % sort_block_m
+            valid_row = (location >= 0) & (location < source_rows)
+            safe_location = valid_row.select(location, fx.Int32(0))
+            bm, row = safe_location // sort_block_m, safe_location % sort_block_m
+            # A route's M block may start above 4 GiB; only the block-local
+            # byte offset is 32-bit. Invalid inverse entries use a safe base.
+            block = fx.make_view(source + fx.Int64(bm) * (sort_block_m * n),
+                                 fx.make_layout(sort_block_m * n, 1))
+            source_buffer = fx.rocdl.make_buffer_tensor(block, False)
+            srsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(source_buffer))
             # OC partitions columns; it does not change the global N64 layout.
-            element = bm * (sort_block_m * n) + column // 64 * (sort_block_m * 64) + row * 64 + column % 64
-            valid = (location >= 0) & (location < source_rows) & (column < n)
+            element = column // 64 * (sort_block_m * 64) + row * 64 + column % 64
+            valid = valid_row & (column < n)
             offset = valid.select(element * 2, fx.Int32(-1))
             return fx.Vector(rocdl.raw_ptr_buffer_load(
                 vector_type, srsrc, offset.ir_value(), zero_offset, aux=read_aux,
@@ -72,7 +79,7 @@ def make_moe_sum(*, n, topk, sort_block_m=256):
         assert inverse.shape == (tokens, topk)
         assert source.dtype == output.dtype == torch.bfloat16 and inverse.dtype == torch.int32
         assert all(t.is_cuda and t.is_contiguous() and t.device == output.device for t in (output, source, inverse))
-        assert source.numel() * 2 < (1 << 32) and output.numel() * 2 < (1 << 32)
+        assert source.shape[0] < (1 << 31) and output.numel() * 2 < (1 << 32)
         stream = torch.cuda.current_stream(output.device)
         compiled = getattr(launch, "_cf", None)
         if compiled is None:

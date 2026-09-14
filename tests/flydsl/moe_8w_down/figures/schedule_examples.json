@@ -1,0 +1,224 @@
+{
+  "model": {
+    "tasks": 9256,
+    "n": 6144,
+    "example_batch": 16384,
+    "claims": [
+      {
+        "worker": 0,
+        "h": 0,
+        "r": 0,
+        "v": 0,
+        "t": 0,
+        "m": 0,
+        "oc": 0,
+        "phi": 0
+      },
+      {
+        "worker": 8,
+        "h": 0,
+        "r": 1,
+        "v": 8,
+        "t": 2,
+        "m": 0,
+        "oc": 2,
+        "phi": 1
+      },
+      {
+        "worker": 0,
+        "h": 0,
+        "r": 2,
+        "v": 16,
+        "t": 4,
+        "m": 0,
+        "oc": 4,
+        "phi": 0
+      },
+      {
+        "worker": 16,
+        "h": 0,
+        "r": 3,
+        "v": 24,
+        "t": 6,
+        "m": 0,
+        "oc": 6,
+        "phi": 2
+      }
+    ],
+    "worker8_packets": [
+      {
+        "q": 0,
+        "p": 2,
+        "slot": 0,
+        "global_n64": 26,
+        "column_begin": 1664,
+        "column_end": 1728,
+        "global_n128_scale": 13
+      },
+      {
+        "q": 1,
+        "p": 3,
+        "slot": 1,
+        "global_n64": 27,
+        "column_begin": 1728,
+        "column_end": 1792,
+        "global_n128_scale": 13
+      },
+      {
+        "q": 2,
+        "p": 4,
+        "slot": 2,
+        "global_n64": 28,
+        "column_begin": 1792,
+        "column_end": 1856,
+        "global_n128_scale": 14
+      },
+      {
+        "q": 3,
+        "p": 5,
+        "slot": 3,
+        "global_n64": 29,
+        "column_begin": 1856,
+        "column_end": 1920,
+        "global_n128_scale": 14
+      },
+      {
+        "q": 4,
+        "p": 6,
+        "slot": 0,
+        "global_n64": 30,
+        "column_begin": 1920,
+        "column_end": 1984,
+        "global_n128_scale": 15
+      },
+      {
+        "q": 5,
+        "p": 7,
+        "slot": 1,
+        "global_n64": 31,
+        "column_begin": 1984,
+        "column_end": 2048,
+        "global_n128_scale": 15
+      },
+      {
+        "q": 6,
+        "p": 8,
+        "slot": 2,
+        "global_n64": 32,
+        "column_begin": 2048,
+        "column_end": 2112,
+        "global_n128_scale": 16
+      },
+      {
+        "q": 7,
+        "p": 9,
+        "slot": 3,
+        "global_n64": 33,
+        "column_begin": 2112,
+        "column_end": 2176,
+        "global_n128_scale": 16
+      },
+      {
+        "q": 8,
+        "p": 10,
+        "slot": 0,
+        "global_n64": 34,
+        "column_begin": 2176,
+        "column_end": 2240,
+        "global_n128_scale": 17
+      },
+      {
+        "q": 9,
+        "p": 11,
+        "slot": 1,
+        "global_n64": 35,
+        "column_begin": 2240,
+        "column_end": 2304,
+        "global_n128_scale": 17
+      },
+      {
+        "q": 10,
+        "p": 0,
+        "slot": 2,
+        "global_n64": 24,
+        "column_begin": 1536,
+        "column_end": 1600,
+        "global_n128_scale": 12
+      },
+      {
+        "q": 11,
+        "p": 1,
+        "slot": 3,
+        "global_n64": 25,
+        "column_begin": 1600,
+        "column_end": 1664,
+        "global_n128_scale": 12
+      }
+    ],
+    "verified_packet_orders": 3072,
+    "semantics": "Logical examples only; neither placement nor concurrent execution is measured."
+  },
+  "assets": {
+    "queue_steps.png": {
+      "sha256": "5c683e9e23e084a6ceae34d9cc5f752d39d3348c3f17a2d4a91e45c7b570894b",
+      "size": [
+        1600,
+        1210
+      ],
+      "frames": 1,
+      "bytes": 233015
+    },
+    "n_phase_steps.png": {
+      "sha256": "97cd779dc3c6c5652604269b632d3e30e7ec6f1c3e81e18e050484a38ca337aa",
+      "size": [
+        1600,
+        1240
+      ],
+      "frames": 1,
+      "bytes": 286688
+    },
+    "queue_n_phase.gif": {
+      "sha256": "9244efcfc1824c3c413ea7efd8cdf5f14ac817f50642483f98981ac9fd768d1e",
+      "size": [
+        1600,
+        1060
+      ],
+      "frames": 18,
+      "bytes": 1861963,
+      "durations_ms": [
+        2200,
+        2200,
+        2200,
+        2600,
+        2400,
+        1600,
+        800,
+        800,
+        800,
+        800,
+        800,
+        800,
+        800,
+        800,
+        800,
+        1600,
+        1600,
+        3800
+      ]
+    }
+  },
+  "source_sha256": {
+    "moe_multistage_down.py": "e77124968db6923ffcb25036957d679d2730ba5ff3ad01576d354ad67a012c87",
+    "moe_multistage_down_m128.py": "f75ba5aa231a5e913f5f358d5dba22a9e63fcb2b556bb6a606039e240a9c36d7",
+    "moe_multistage_reduce.py": "4b27d800678a73bb2f908fa37d2195241b800facf50721ac9ad5bcb9cd58a4a5",
+    "moe_multistage_pipeline.py": "c6f485048e153cf01657f510a5e18aee2802b28b7d8f4ebbc67ef67f6b8e4819",
+    "test_blockscaled.py": "39e50e8d13e55ef87b5d1b2ba1a0f34f3ea5bf4252ee8b7cd65357385d231dd1",
+    "moe_8wave_down.py": "955ce3b08e787eac1d803789f9303f7f64b1ab9e8bdef6f8a84562bbc0a5cb1f",
+    "moe_8wave_down_utils.py": "9ea1ac03c893a7053b31c3add4ebd49f17b271dc10752449876b473a1f31b418"
+  },
+  "font": [
+    "Noto Sans CJK SC",
+    "Regular"
+  ],
+  "generator_sha256": "9986af98f50efec82516e41c12d068db44a13258729386105f061309011d9c97"
+}
