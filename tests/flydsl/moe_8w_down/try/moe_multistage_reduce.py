@@ -25,13 +25,14 @@ from moe_multistage_down import _scalar
 @cache
 def make_moe_sum(*, n, topk, num_oc_splits=4, output_layout="sorted",
                  num_threads=64, block_cols=1024, preload=True,
-                 read_policy=0, write_policy=0, tree_sum=False):
+                 read_policy=0, write_policy=0, tree_sum=False, packed_rows=256):
     assert n > 0 and num_oc_splits > 0 and n % (128 * num_oc_splits) == 0
     assert 0 < topk <= 255
-    assert output_layout in ("routed", "sorted", "packed", "linear", "linear_raw")
+    assert output_layout in ("routed", "sorted", "packed", "linear", "linear_raw", "linear16", "packed_nmajor", "packed128")
     assert num_threads in (64, 128, 256)
     assert block_cols > 0 and block_cols % (num_threads * 8) == 0
     assert read_policy in (0, 2, 16, 18) and write_policy in (0, 2)
+    assert packed_rows >= 256 and (packed_rows == 256 or output_layout == "packed")
     n_split = n // num_oc_splits
     column_blocks = (n + block_cols - 1) // block_cols
 
@@ -66,14 +67,23 @@ def make_moe_sum(*, n, topk, num_oc_splits=4, output_layout="sorted",
             row_lane = local_row % 16 // 2 * 2 + local_column // 32 + local_column % 32 // 16 * 16
             lane = row_lane + local_column % 16 // 8 * 32
             element = (location * n + column if output_layout in ("routed", "sorted") else
-                       bm * (256 * n) + oc * (256 * n_split) + q * (256 * 64) + row * 64 + local_column if output_layout == "packed" else
+                       bm * (packed_rows * n) + oc * (packed_rows * n_split) + q * (packed_rows * 64) + row * 64 + local_column if output_layout == "packed" else
                        bm * (256 * n) + oc * (256 * n_split) + q * (256 * 64) + wave * 2048 + (local_column // 16) * 512 + local_row * 8 + (local_column % 16 // 8) * 4 if output_layout == "linear_raw" else
                        bm * (256 * n) + oc * (256 * n_split) + q * (256 * 64) + wave * 2048 + record * 512 + lane * 8)
-            valid = (location >= 0) & (location < source_rows) & (column < n)
+            if const_expr(output_layout == "linear16"):
+                packet = local_row // 16 * 2 + local_column // 32
+                raw_lane = (local_column % 16 // 4) * 16 + local_row % 16
+                element = bm * (256 * n) + oc * (256 * n_split) + q * (256 * 64) + wave * 2048 + packet * 512 + raw_lane * 8 + local_column % 32 // 16 * 4
+            if const_expr(output_layout == "packed_nmajor"):
+                element = (column // 64 * source_rows + location) * 64 + local_column
+            if const_expr(output_layout == "packed128"):
+                element = bm * (256 * n) + column // 128 * (256 * 128) + row * 128 + column % 128
+            logical_rows = source_rows if packed_rows == 256 else source_rows // packed_rows * 256
+            valid = (location >= 0) & (location < logical_rows) & (column < n)
             offset = valid.select(element * 2, fx.Int32(-1))
-            if const_expr(output_layout == "linear_raw"):
+            if const_expr(output_layout in ("linear_raw", "linear16")):
                 left = fx.Vector(rocdl.raw_ptr_buffer_load(pair_type, srsrc, offset.ir_value(), zero, aux=read_aux))
-                right_offset = valid.select((element + 256) * 2, fx.Int32(-1))
+                right_offset = valid.select((element + (128 if output_layout == "linear16" else 256)) * 2, fx.Int32(-1))
                 right = fx.Vector(rocdl.raw_ptr_buffer_load(pair_type, srsrc, right_offset.ir_value(), zero, aux=read_aux))
                 result = fx.Vector.from_elements([left[0], left[1], right[0], right[1]], fx.Int32)
             else:
@@ -116,7 +126,7 @@ def make_moe_sum(*, n, topk, num_oc_splits=4, output_layout="sorted",
         if output_layout == "routed":
             assert source.shape == (tokens, topk, n)
         else:
-            assert source.ndim == 2 and source.shape[1] == n and source.shape[0] % 256 == 0
+            assert source.ndim == 2 and source.shape[1] == n and source.shape[0] % packed_rows == 0
         assert source.dtype == output.dtype == torch.bfloat16 and inverse.dtype == torch.int32
         assert all(t.is_cuda and t.is_contiguous() and t.device == output.device for t in (output, source, inverse))
         assert source.numel() * 2 < (1 << 32) and output.numel() * 2 < (1 << 32)

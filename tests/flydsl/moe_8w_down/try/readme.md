@@ -273,7 +273,7 @@ GPU构表直接扫描AITER M256 sorted前缀；4个占用M64 chunk组成一个M2
 
 验证结果：
 
-- 主目录统一测试 **25 passed**，包含旧BN32/BN64的跨K FMA相消及graph回归；[日志](cleanup_20260912/tests.log)。
+- 主目录统一测试 **25 passed**，包含旧BN32/BN64的跨K FMA相消及graph回归；[日志](cleanup_20260912/tests.log)。补回旧比较的平均绝对误差/`calc_diff`列后再次25项通过，`calc_diff`按原定义分块统计以控制内存；[最终日志](cleanup_20260912/final_tests.log)。
 - 归档compact/pipeline/ATT账本 **58 passed**；[日志](cleanup_20260912/archive_tests.log)。
 - 同址ABBA、同一个归档benchmark比较归档winner与精简winner：down **509.256443 vs509.406599 μs**（约0.03%差异），完整 **908.283001 vs905.132800 μs**；四次大形状均正确，没有显示down退化，不把小幅整体差异当作新的优化收益。[独立复核入口](compare_winner_cleanup.py)、[原始日志](cleanup_20260912/paired_cleanup.log)。
 - 新鲜精简版ISA：**185 VGPR、96 SGPR、70660B LDS、零private/VGPR spill/SGPR spill，无AGPR**，12个Memory均无VALU、12个整段Compute均无地址，165个稳态MFMA间隔各7条VALU，输出NT。reduce为41 VGPR/31 SGPR、零LDS/private/spill。[实际down ISA](cleanup_20260912/isa/moe_winner_cleanup_isa_20260912/moe_down_8stage_kernel_0/21_final_isa.s)、[reduce ISA](cleanup_20260912/isa/moe_winner_cleanup_isa_20260912/moe_down_sum_kernel_0/21_final_isa.s)。采集日志里的辅助资源提取曾误报SGPR8，以真实 `.sgpr_count:96` 为准，原日志不篡改。
@@ -319,3 +319,187 @@ GPU构表直接扫描AITER M256 sorted前缀；4个占用M64 chunk组成一个M2
 | 15 | [OC/XCD/ATT/compact/混合OC](ck_test/oc_compact_20260912/README.md) |
 
 当前优先改进方向来自已有证据：Memory发射停顿和两组wave覆盖，而非单纯继续增加stage、减少OC或只追求更少padded FLOPs。所有未采用方案均保留供后续复验，不把正确但更慢的实验删除出历史。
+
+## 19. 2026-09-12：4-stage真实HBM带宽PMC
+
+按用户要求，对当前主目录精简winner用gfx950 DRAM专用计数器，而不是tensor逻辑模型：read/write/atomic 32B counters同pass，23次直接launch的第14–23次，按同dispatchGPU时间戳复算。平均 **550.028 μs**，每次HBM读取 **1.238594GB**、写入 **1.610663GB**，加权读写带宽 **5.180203TB/s**（读2.251874、写2.928328）。原子请求104KiB单列，不假定一次请求等于读写各一次。
+
+全卡 `_sum` 已包含16个TCC实例×8XCD，不能再乘8；计数单位32B，时间单位ns，不除以猜测时钟。写入量与1.5GiB有效BF16输出差0.00309%，读写总量与原B每M块模型差−0.10063%，但PMC是真实请求计数，模型仍不能替代测量。所有10个样本保留，不借用无PMC509 μs作为分母；不包含reduce、inverse和counter fill。数值0/805306368不匹配。
+
+首次精确kernel过滤漏掉FlyDSL `_0` 后缀，仅生成trace而无PMC；保留失败记录，修正匹配后才成功采集30行PMC。无kernel/配置/时钟/容差修改。[完整报告、原始数据、计数器定义与复算](pmc_20260912/README.md)。
+
+## 20. 2026-09-12：XCD swizzle对L2与HBM的单独影响
+
+针对“HBM读量接近B每M块一次，nonpersistent＋XCD能否改善复用”的追问，先核对旧消融：同场nonpersistent无/有swizzle为682.061/510.907 μs，已经显示时间影响；此前persistent与XCD的配对结果接近，并不能否定swizzle的缓存收益。
+
+新增归档内独立driver，三种调度都使用同一完整工厂、OC4/PF3/SC1/NT/packed和同数学路径；主目录固定winner不改。正常计时在同一数据/地址上做P/N/X、X/N/P；PMC各调度独立进程，23次直接down中采第14–23次，DRAM read/write32B与TCC_HIT/MISS四项同pass，核对40条记录/10dispatch和精确GPU时间戳。
+
+| 模式 | 正常down均值 μs | PMC GPU μs | HBM读 MiB | HBM写 MiB | 聚合TCC命中 |
+|---|---:|---:|---:|---:|---:|
+| persistent | 518.889 | 546.972 | 1170.114 | 1536.049 | 39.689% |
+| nonpersistent无swizzle | 675.322 | 681.160 | 1336.589 | 1536.673 | 35.982% |
+| nonpersistent＋8 XCD | 514.357 | 539.980 | 637.333 | 1536.037 | 51.566% |
+
+swizzle相对无swizzle的HBM读−52.32%，正常时延−23.84%；相对persistent读−45.53%、读写总流量−19.69%，但正常时延只−0.87%。XCD读637.333MiB接近A＋B各读一次的608MiB，改善量532.781MiB远大于A一次/四次的96MiB差距，强烈支持B跨M块复用改善；仍不能将聚合hit率当成B的精确hit率。输出写入仍1.5GiB，约占XCD读写70.68%；同步、计算和WG准备成本也不会随读流量等比例下降，不能只看更低HBM字节推导稳定时间收益。
+
+六次普通计时和三次PMC应用数值均通过，0/805306368不匹配；没有重采ATT或改变主默认配置。结论更新为：**缓存收益明确，是否替代persistent还需端到端时长验收**，不是“XCD没有用”。[完整消融、理论边界、原始CSV与复算](xcd_pmc_20260912/README.md)。
+
+## 21. 2026-09-12：swizzle fresh ATT采集
+
+按后续请求，对同一nonpersistent＋8 XCD、OC4/PF3/packed配置抓取23次直接down launch中的第21次，dispatch263104。保留raw ATT、UI、29个code objects、kernel/driver源码快照和采集日志；未覆盖此前任何ATT。数值0/805306368不匹配。
+
+解码输出128个wave全部完整，其中96个有效wave各384条MFMA、32个early exit。请求CU0/SE0x3/SIMD0xf，实际wave只覆盖SE0/CU0的SIMD0–3及两个slots；SE1虽有27080B原始trace但没有解码wave，不能报告为双SE有效覆盖。本次只做完整性验证，未重算stall账本，后续MFMA执行窗仍应为32 cycles。[采集说明与UI入口](xcd_pmc_20260912/att/README.md)。
+
+## 22. 2026-09-12：HBM降流量后的剩余开销
+
+后续只用上述已有trace做CPU分析，不重采GPU：successful issue＋32cycles、同SIMD并集、N2–N9交集窗口。主账本与独立连续区间复核一致，1448460窗口cycles中737280为MFMA，即50.901%。剩余VMEM issue12.110%（store7.169%、load4.941%）、completion wait0.106%、LDS issue9.750%、VALU14.923%（DPP子项5.789%）、barrier9.549%、other2.660%，互斥主表闭合。
+
+Compute core覆盖72.197%、core内conditional busy70.503%；23040个内部相邻MFMA issue间隔min/p50为40 cycles、均值46.324、p9584，16MFMA core平均726.854cycles而执行工作512。有效task头尾分别18.377%/3.109%，与steady分类不同分母；early-exit执行只占局部全wave horizon约0.308%，interbatch空档约0.359%，不把512个empty WG直接解释成14%时间损失。
+
+结论：swizzle对无swizzle已有23.84%时延改善；相对persistent读取−45.53%只等于总读写−19.69%，固定写出、片上供数、VALU打包和同步仍在。PF3/错相下部分访存等待可能被重叠，但没有独立测出其可兑换的微秒；不能断言写带宽饱和或把全部小差异归于任务启动。旧persistent ATT与本次单SE/down-only非严格配对，局部busy不能证明整卡加速。主路径不变，具体证据和下一步验证见 [分析报告](xcd_pmc_20260912/att/analysis.md)。
+
+## 23. 2026-09-12：MFMA32＋XCD8，保持原浮点顺序再试
+
+在try内给MFMA32增加nonpersistent／XCD8，并让K1延迟独立于routing folding：仍先显式FMA累加，再单独routing乘法和BF16转换。与MFMA16同OC4/PF3/packed及同一reduce，真实A/B/scales/routing／中间／inverse／最终地址共享；B两种prepack计时外复制到同一分配。
+
+两轮正反筛选，MFMA16 down515.005 μs，直接MFMA32 518.602、精确defer14 516.141、defer16 520.461 μs。再试row-scale驻留无明显收益；加全padding wave跳算后小幅领先，但真实ISA发现一组尾部MFMA下沉出Compute，未满足调度约束。通过pin住延迟结果／scale修复，旧失败ISA和所有筛选日志保留。
+
+最终修复后两轮ABBA/BAAB：**MFMA16 XCD down514.401524／完整902.171522 μs；MFMA32精确defer14＋cache＋skip down511.390500／完整901.317425 μs**。Down时延−0.5853%，完整−0.0947%，完整两轮一胜一负；不晋级默认，不把组合的小差异全归于MFMA32。
+
+最终ISA218VGPR/40SGPR/70660B LDS、零spill/private/AGPR/atomic；12Compute各8MFMA，77个稳态间隔各14VALU，**每段仍有46VALU尾部**。同次MFMA16 XCD为181VGPR/37SGPR。实际padded行从196608降至137088（全padding wave跳算），B DMA/LDS/barrier不因此删除；最终padded TF/s分母按执行行修正，不使用早期完整padding模型。
+
+15项定向测试和默认大形状全部正确，原容差不变；FMA相消用例最终0.015625逐位通过。主目录胜出代码、计时器、GPU配置和Git提交均未改变；无新ATT/PMC。[完整实验报告、配对数据、ISA及复现入口](mfma32_xcd_20260912/README.md)。
+
+## 24. 2026-09-12：MFMA16 XCD prologue缩短
+
+仅在try参数工厂增加默认关闭的启动优化：A与B首次DMA重叠（保留B0消费者wait）、ID生产线程直接gather A scales以合并metadata barrier、批量LDS读取routing ID供A／输出地址复用。另测更早发B但未胜。主目录winner和steady计算不变，原BF16／FMA／routing数学顺序不变。
+
+两轮ABBA/BAAB，对冻结原XCD源：**down514.985527→510.639299 μs（时延−0.844%）**，完整down＋inverse＋reduce903.018254→901.603150 μs（−0.157%）。不将这点完整流程差异晋级为稳定赢家。
+
+同驱动／同设置新抓前后SE0/CU0 ATT，都是96个完整有效wave／48个physical batch：平均prologue **11337.667→10149.167 cycles（−10.483%）**，p50 11382→9736；但p95 12979.6→13350.4未改善。生命周期prologue占比17.990%→16.657%，局部steady MFMA49.698%→50.612%；不是整卡利用率。每wave首次MFMA前wait计数15/19/20→9/12/13，barrier4/5→3/4。raw wait累加只用于定位，不冒充物理节省。
+
+15项新方向定向检查＋3项原路径兼容回归通过，默认shape逐路／最终结果全正确。ISA181VGPR/46SGPR/70660LDS、零spill/private/AGPR、165个7-VALU间隔、Memory无VALU／Compute无地址，保留全部必要wait。无新PMC或硬件／Git操作。[完整报告、前后UI、ISA、筛选及配对结果](prologue_xcd_20260912/README.md)。
+
+## 25. 2026-09-12：M128／4-wave独立CTA，10%目标未达
+
+实现独立CTA滚动供数：M128每wave32行，N64×K256 B包由4轮×256线程×16B合作加载；wait放在消费者入口，ring复用仍有正确的LDS读完／发布约束。基线固定为上一轮prologue优化后的M256／8-wave XCD8 OC4，不更换慢基线。
+
+扩展保留29组screen／163个候选名称（含基线）：M／wave／OC／ring粒度、DMA与store交织、packed FP32、K128和N32包、直接B读取、metadata准备、MFMA32、Triton、不同输出布局／pitch、原子归约、任务映射、N错相、wave优先级与静态CTA复用。多数结构失败或持平，所有慢／失败日志保留。
+
+最终选中显式 `M128_CONTINUOUS_VMEM_CONFIG`：M128／4-wave、OC8、PF3／4-slot、store分散到Compute、transpose宽度4（硬件仍8 XCD）、N按task//4轮转、Memory priority3／Compute0。保留原FP8／K128 scale／显式FMA／routing／BF16顺序及原packed ABI；Compute为接续VMEM而允许store／SALU，不再宣称旧严格address-free Compute规范。
+
+最终四轮同址ABBA/BAAB：**当前M256 down512.209212→M128 485.550212 μs，速度+5.4905%，时延−5.2047%**；完整900.469849→876.870023 μs，时延−2.6208%。10%速度要求≤465.644738 μs，仍差19.905474 μs，`target_met=False`，不把结果报成达标、不自动改主目录winner。
+
+最终84项回归通过，四轮16次大形状逐路／TOPK结果全正确，严格相消用例通过。选中ISA181VGPR/46SGPR/68616B LDS、零spill/private/AGPR、12Compute各16MFMA，非启动Compute4条NT store，Memory无VALU。实际计算148096行／1157个M128任务，对照196608行／768M256；B重复装载增加，逻辑带宽不是HBM PMC。
+
+保留一次中间 `m128_xcd4` ATT（非最终priority/rotation）：SE0CU0，248wave含148有效／100early，slot有效数量19/18，不能套用等batch旧分析。连续MFMA并集909312／活动并集2767544cycles；局部比例不冒充整卡性能。详见 [完整实验与最终验收](m128_20260912/README.md)。
+
+## 26. 2026-09-13：当前4-wave配置fresh ATT
+
+通过主测试 `m128_priority3 --profile --mode down` 抓取包含N错相／Memory priority3的当前M128／4-wave配置，OC8/PF3/ring4/transpose宽度4。23次直接down中的第21次，dispatch265489，SE0/CU0/SIMD0–3；不包含inverse／reduce，没有PMC或性能计时。
+
+252个wave全部完整，其中148个有效wave各192 MFMA、104个无MFMA，slot0／slot1有效数量19／18，不强制配对。数值0/805306368超容差。原始ATT3720424B、30个code objects、同次ISA181VGPR/46SGPR/68616B LDS零spill/private/AGPR，以及七个源码的快照归档／SHA256全部保留。主kernel/test未修改；旧中间ATT不覆盖、不重标。[UI、ISA与完整性证据](m128_att_20260913/README.md)。
+
+## 27. 2026-09-13：四wave down的实际HBM PMC带宽
+
+当前 `m128_priority3` 与上述ATT相同源码，单pass同时采集DRAM专用read/write/atomic 32B-sum计数器；23次直接down中的第14–23次，严格与对应GPU起止时间戳匹配，不含inverse/reduce或ATT。
+
+十次平均 **516.8865μs**，读 **756.610MiB**、写 **1536.053MiB**；加权读 **1.534889TB/s**、写 **3.116096TB/s**、合计 **4.650985TB/s**，原子请求0。首个较慢616.302μs样本保留，不选最快值；有效BF16写理论1.5GiB，实际仅多0.003426%。数值0/805306368超容差。`_sum`已聚合所有XCD，不再乘拓扑数，也不将此前普通计时／逻辑流量混作PMC分母／分子。
+
+原始30行PMC、全kernel trace、Agent信息、十次样本、源码快照／哈希、同dispatch CPU复算均保留，主kernel/test和硬件配置未改。[完整测量与复算](m128_pmc_20260913/README.md)。
+
+## 28. 2026-09-13：按VMEM均匀发射修复启动供数链
+
+原2264-cycle gap逐wave定位为两个独立CTA的启动依赖重合：一组Compute0后等待B1 DMA并barrier会合，另一组sorted ID读取／metadata publication仍未完成，不是纯计算或跨CTA同步。
+
+实现并选择 `active_b_prefetch=3, spread_refill=True`：确认任务非空后先发B0–2，与A／输出地址准备重叠；后续4次B补充DMA分散到16次LDS读取之间。总B包数、48store／有效wave、数学顺序、packed ABI及必要wait/barrier不变。原配置基准已固定，不随preset变更。
+
+新鲜ATT前后同CU四SIMD的VMEM间隔p95/p99为184/516→164/436cycles，最大2320→1572，最长无发射stall覆盖部分1804→1100；≥128cycle间隔占采样包络59.681%→53.838%，其中无发射stall覆盖部分41.213%→37.458%。这些不是HBM空闲率。前后有效wave144/148，全部解码完整；ISA181VGPR、46→54SGPR、68616LDS、零spill/private/AGPR。
+
+四轮同址ABBA/BAAB：down485.308675→482.826988μs，速度+0.5140%，四轮down均领先；完整877.033777→876.318827μs，基本持平。所有逐路和TOPK检查通过，原10%目标不因此宣称完成。新preset已接入主测试M128候选；主M256/legacy不改，无新PMC／硬件或Git操作。[根因、全部失败尝试、前后UI及验收](m128_vmem_20260913/README.md)。
+
+## 29. 2026-09-13：XCD直接对应OC，映射成立但性能回退
+
+固定当前M128／4-wave的提前B＋分散DMA，仅关闭4路转置，使 `task=bid, M128=bid//8, OC=bid%8`。两轮同址ABBA／BAAB：当前down483.787776／完整878.070229μs，OC-direct553.184250／938.753451μs，时延分别增加14.3444%／6.9110%；全部8次逐路与最终结果均正确。
+
+新增默认关闭的 `record_placement` 诊断开关，在真实GEMM中读取 `HW_REG_XCC_ID`。每配置3次诊断、每次14336个CTA全部满足 `physical_xcc == bid%8`；OC-direct的9256个有效任务矩阵为对角线1157，确实一XCD一OC。回读未进入计时，4项graph／empty／strict FMA测试通过。没有本方案新PMC／ATT，不推断回退的唯一原因。
+
+不更换默认preset。保留源码快照、全部配对样本、每CTA硬件记录及独立验证：[完整实验](m128_oc_xcd_20260913/README.md)。无数学、计时、硬件或Git操作变化。
+
+## 30. 2026-09-13：M64／4-wave新path，每SIMD四wave驻留
+
+新增M64／4-wave入口：每wave16行，N64×K256 Compute为8 MFMA，PF1／2×16KiB B-ring，34820B LDS，118VGPR／46SGPR、零spill/private/AGPR。沿用准确K128-scale／显式FMA／routing后BF16、M256 parent packed ABI及当前XCD4／N错相，保留同步。共用工厂扩展M64交织门控及根据MFMA数分配DMA轮数，原M128 preset不变。
+
+新鲜默认shape ATT第21次down：SE0/CU0四SIMD，456个完整wave文件（288有效各96MFMA、168无MFMA）。生命周期重叠扫描确认每SIMD最大4个有效wave，四wave时间占有效wave生命周期69.65%／70.15%／69.62%／70.40%，加权69.953%；不是整卡occupancy或同时发射率。
+
+两轮同址ABBA／BAAB：M128 down483.232576／完整877.179676μs；M64为527.239020／913.132150μs，时延+9.1067%／4.0986%。任务块1157→2267，padded行仅148096→145088，B任务重复／同步工作增加可能抵消驻留收益；无新PMC，不把逻辑9.881TB/s说成HBM。
+
+7项graph／空routing／strict FMA检查、8次大形状配对及ATT正确性均通过；两个B片段读取／DMA批发变体初筛也未胜。保留新path及全部原始证据，默认仍M128。[实现、驻留UI与性能报告](m64_4wave_20260913/README.md)。
+
+## 31. M64 ATT／VMEM接续及超过M128 5%目标：未达到
+
+2026-09-13。原M64的1392-cycle无发射空档由多个CTA的B等待与metadata准备重叠造成。实现PF2／双槽，保留全部LDS读完及publication barrier，提前两包有效B；同时探索metadata、不同XCD/OC、cache、N错相、8KiB包、wave-N私有LDS、2×2及双N64包、分散DMA和静态CTA。
+
+13组screen、65个候选名称（含基线）、178次大形状检查均保留。最佳M64为PF2／XCD8／Compute调度放开，独立十tensor入口 [moe_m64_tuned.py](m64_vmem_20260913/moe_m64_tuned.py)。相对原M64两轮配对525.485→513.086μs，速度+2.42%；对当前M128四轮同址验收 **482.877 vs512.241μs**，M64慢6.08%。达标需≤459.883μs，还差52.359μs；**不宣布5%目标完成**，不替换主测试默认。
+
+最终ATT376个完整wave，292有效×96MFMA，四SIMD仍均观察到4wave共驻留。内部vmcnt0消失；any-VMEM p95 116→108、p99 352→424、最大2996→2336cycles，最长无发射stall覆盖部分1392→952。统计有好有坏，不能称完全均匀或HBM空闲百分比。独立同dispatch DRAM PMC约4.407TB/s，不是逻辑10.17TB/s。
+
+主37tests通过；最终定向16通过、2个已证实不支持的32B DMA跳过，含2项拒绝已知失败single-slot双N配置的门控检查；CPU5项通过。single-slot双N虽大形状曾通过，小形状失败，因此禁用，所有失败证据保留。测量后收紧门控不改变最佳kernel，重编ISA逐字节一致。主内核、reference、timer、precision、GPU设置和Git索引保持不动。[完整报告／最终UI／配对与PMC](m64_vmem_20260913/README.md)、[全实验账本](m64_vmem_20260913/experiments.md)。
+
+## 32. 论文启发的XCD分派解释：padding相位＋A跨XCD复制
+
+2026-09-13。参考Otterness/Anderson 2022《Exploring AMD GPU scheduling details by experimenting with “worst practices”》，不直接移植其Radeon VII／ROCm4.2的四SE／CU-mask规则。新增自仪器化HIP probes、真实MoE物理放置、无张量routing重放、A/B-only消融及DRAM/L2 PMC；未改kernel或GPU设置。
+
+主要发现：
+
+- 16次真MoE回读全部满足XCC=bid%8；每XCD另有四相位SE分派，但SE编号排列不同。identity下M128四SE有效CTA是`{384,384,384,5}`，M64是`{768,726,389,384}`，XCD总数均衡掩盖SE偏斜。width4/8使SE负载max/mean接近1。
+- 无A/B/C、仅重放真实非空模式，M128 identity508.173→width4 402.890μs；M64 508.140→393.580μs。真实MoE仅在专家内部打乱完整M128块，identity552.392→488.876μs，width4几乎不变484.956→484.536μs，支持周期性padding是重要原因。
+- B(expert,OC)在0/4/8/16路都只落一个XCD，不能用这一点独自解释当前收益。A每M块消费域8→2→1；A-only PMC260.013→65.013→31.820MiB，验证激活域复制成本。
+- 真MoE正常同址M1280/4/8/16路549.372/483.837/496.454/504.270μs，DRAM读1067.427/836.508/811.288/945.791MiB；M64 identity592.431，4路515.390、8路511.468。后续4/8路配对M128484.662/493.947，M64512.424/512.563基本持平；不声称8路永远最好。
+- 反例保留：B-only shared identity/width8都约192MiB、约112μs，unique约768MiB/230μs。纯swizzle不是普适加速。一个慢XCD也未挡住其他XCD结束；SE内部却能观察到慢域导致快域结束推迟，不能混淆层级。
+
+[完整解释／论文分节对应](xcd_schedule_20260913/README.md)、[实际负载与消融图](xcd_schedule_20260913/explanation.png)、[真实时间线](xcd_schedule_20260913/dispatch_timeline.svg)、[独立复算数据](xcd_schedule_20260913/report_verified.json)。CPU23项与probe非均匀整数GPU16项通过，所有counter字节与同dispatch时间匹配、十个样本保留，无新ATT／precision／timer／CU mask／Git变更。
+
+## 33. 多Batch验证：收益可扩展，但非单调且受4GiB寻址约束
+
+2026-09-13，Batch按token数定义，固定TOPK8/E384/N6144/K256、seed1234。用Batch28672的同一A/B/scales/routing/reference池前缀扫描1、16、64、128、512、1024、2048、4096、6144、8192、12288、16384、24576、28672，M128/M64各identity／4路／8路；每Batch六候选同址、原warmup2/iters10、正反两轮。原始full/small两进程均保留，重复28672不替换主结果。
+
+- 当前M128 4路的Down相对identity速度比1.010～1.489；Batch12288为398.910vs406.363μs、16384为482.735vs550.154μs、28672为801.595vs886.114μs，收益非单调。
+- Batch1的完整流程略回退21.501vs21.373μs，12288完整收益仅0.29%；8路在12288有约0.3%完整流程回退，不删除。小Batch1～128 M64较快，Batch≥512最快M128优于最快M64。大Batch完整吞吐约19.4Mtoken/s／有效约900TF/s，不等于理论极限。
+- 8个Batch×6候选物理回读48次，均满足本轮XCC=bid%8及SE四相位模型；4路改善SE有效CTA均衡。不同Batch的专家run长度分布和padding阶梯与速度起伏相符，不把负载计数当成busy百分比或全部时延归因。
+- 14不同Batch、180计时后逐路/sum检查（含重复点）及48放置检查全通过；22项CPU回归独立复核均值、吞吐、raw放置、边界与不挑快样本。普通容差不变，无新PMC/ATT。
+- 32768/65536标准packed分配4.125/7.125GiB，超过原32-bit地址guard，未launch。CPU公式边界31393/31394，不冒充已GPU验证；最大实测仍28672。kernel、reference、timer、GPU设置和Git索引未改。
+
+[完整报告](xcd_batch_20260913/README.md)、[Down/完整/吞吐表格](xcd_batch_20260913/summary_verified.log)、[CSV](xcd_batch_20260913/results_verified.csv)、[趋势图](xcd_batch_20260913/scaling.png)、[原始full](xcd_batch_20260913/full/results.json)／[small](xcd_batch_20260913/small/results.json)。
+
+## 34. 2026-09-13：修正原生M128/M64的sorting粒度
+
+用户指出M128应使用sort128，不能复用sort256来评估。此前两节及更早M128/M64数字保留为**sort256历史条件**，其padding/SE解释不代表原生布局。
+
+主测试M128已改为AITER sort128，并同步expert索引、task边界、packed stride、workspace及reducer/解码；旧M256与BN32/BN64候选保留。原生M64/sort64作对照，默认流水与数学不改。新增非256对齐专家边界、容量尾部及严格相消/graph回归；首轮17项GPU相关测试与9项CPU分析检查通过。
+
+最终CPU扩展为15项通过；默认与5个代表Batch共76次计时后检查、8次实际放置通过，主入口五候选通过。默认sort128 M128非空块余数变为290/289/289/289，identity SE max/mean1.002593；旧sort256仍为384/384/384/5与1.327571。两轮native identity504.997／width4479.890／width8488.238μs；width4相对identity优势从旧14.1%缩小到5.23%。Batch32768原生sort128/64均通过，旧sort256容量限制仍保留。无新ATT/PMC，不把剩余差异全部归因于缓存。
+
+[修正说明与复测](sort_alignment_20260913/README.md)、[新实验驱动](sort_alignment_20260913/run.py)、[回归日志](sort_alignment_20260913/tests_native.log)、[修改前9份源码](sort_alignment_20260913/before_sources.tar.gz)。
+
+## 35. 2026-09-13：XCD分片persistent M128
+
+按请求实现XCD亲和的常驻队列：每XCD独立计数器、同XCD四SE共享领取、小bundle、本地耗尽后有限扫描其他分片。保留当前native sort128、PF3/ring4、activeB3/spread和exact block-scale math，默认width4独立CTA不变。
+
+十tensor封装保留调用者counter；内部workspace每次清零队列，包含在Down及graph replay中。单CTA也能扫完8分片，无全局barrier，不依赖block_id%8或worker在每XCD的覆盖假设。诊断逐虚拟任务记录访问次数、实际XCC/HW_ID、源分片、worker序号和是否非空。
+
+首轮[13项针对性检查](xcd_persistent_20260913/tests_third.log)通过；后续[7项CPU检查](xcd_persistent_20260913/tests_cpu_final.log)含随机交错领取模型。首两次FlyDSL作用域错误保留，修正未改变数学或容差。[实现与测量说明](xcd_persistent_20260913/README.md)、[入口](xcd_persistent_20260913/moe_xcd_persistent.py)、[同址对比](xcd_persistent_20260913/run.py)。
+
+默认shape两轮普通Down为：原width4 **478.587μs**，256-worker/bundle4 **570.742μs**，256-worker/bundle8 **644.479μs**，512-worker/bundle4 **546.051μs**；全部逐路/最终检查通过但均回退，保持实验状态，不宣称解决了现有kernel的性能瓶颈。队列reset计入Down，没有新ATT/PMC；不得把回退单独归为某一stall。
+
+三配置诊断各9256任务不漏不重，容量尾部零访问；home/steal分别8231/1025、9079/177、9237/19。512-worker/bundle4大部分任务保持XCD亲和但仍回退，L2命中率未测。原主M128相关8项回归通过；[原始计时/归属独立复查](xcd_persistent_20260913/verified_final.log)8样本＋3诊断通过，[最终7份运行时源码](xcd_persistent_20260913/after_sources.tar.gz)及清单保留，默认主路径不变。
+
+## 36. 2026-09-13：移植主M256的单计数器persistent调度
+
+用户指出 `4-stage BN128 tuned` 本来就是persistent。新增M128/sort128全局atomicAdd(1)＋1word LDS广播路径，取消分片/bundle/swizzle；OC8与OC4分开，并与原M256、独立width4/identity和XCD512/bundle4同址对照。保持原PF3/activeB3/spread、输出布局、数学与计时器，主五候选不改。
+
+更大的M256、8-wave两组错相、OC4使其任务数与B/A摊销不同，不能把速度差全算在“persistent”或atomic数量上。默认任务3072 vs M128/OC8的9256；完整工作模型与边界见[实验报告](global_persistent_20260913/README.md)。
+
+首版两处领任务经LLVM合并产生异常lane控制流，先表现为GPU同步卡住，后来诊断正确而普通版NaN。保留全部失败源码、IR和日志，以普通/图重放复现定位，不靠诊断写入或放宽容差绕过。改为单一循环头领取后，[9项检查通过](global_persistent_20260913/tests_single_claim.log)，含普通graph投毒/恢复、准确计数和严格0.015625相消。[十tensor入口](global_persistent_20260913/moe_global_persistent.py)、[七项同址对照驱动](global_persistent_20260913/run.py)。
+
+最终同址两轮Down/Full μs：M256 tuned515.714/900.976，width4477.549/871.851，identity506.868/888.906，XCD512/bundle4542.515/936.198；新global256/OC8575.644/960.728，global512/OC8519.468/904.416，global256/OC4534.789/924.041。最佳新路径较同轮XCD时延低4.25%，较width4仍高8.78%，不提升为默认；与M256相差0.73%，两轮不能认定稳定胜负。所有14样本逐路/最终检查、counter、同址和8源码SHA核验通过。[最终复查](global_persistent_20260913/verified_final.log)与[运行时快照](global_persistent_20260913/after_sources.tar.gz)保留；无新ATT/PMC或性能口径更改。

@@ -17,10 +17,10 @@ from moe_multistage_down import _scalar
 
 
 @cache
-def make_moe_sum(*, n, topk):
+def make_moe_sum(*, n, topk, sort_block_m=256):
     """Gather packed down routes through inverse; missing entries contribute0."""
     assert n > 0 and n % 512 == 0 and 0 < topk <= 255
-    n_split = n // 4
+    assert sort_block_m in (128, 256)
     column_blocks = (n + 2047) // 2048
 
     @flyc.kernel(known_block_size=[256, 1, 1])
@@ -40,9 +40,9 @@ def make_moe_sum(*, n, topk):
         locations = [_scalar(inverse[token * topk + route]) for route in range_constexpr(topk)]
 
         def read_route(location, column):
-            bm, row = location // 256, location % 256
-            oc, q = column // n_split, column % n_split // 64
-            element = bm * (256 * n) + oc * (256 * n_split) + q * (256 * 64) + row * 64 + column % 64
+            bm, row = location // sort_block_m, location % sort_block_m
+            # OC partitions columns; it does not change the global N64 layout.
+            element = bm * (sort_block_m * n) + column // 64 * (sort_block_m * 64) + row * 64 + column % 64
             valid = (location >= 0) & (location < source_rows) & (column < n)
             offset = valid.select(element * 2, fx.Int32(-1))
             return fx.Vector(rocdl.raw_ptr_buffer_load(
@@ -68,7 +68,7 @@ def make_moe_sum(*, n, topk):
     def reduce(output, source, inverse):
         assert output.ndim == 2 and output.shape[1] == n
         tokens = output.shape[0]
-        assert source.ndim == 2 and source.shape[1] == n and source.shape[0] % 256 == 0
+        assert source.ndim == 2 and source.shape[1] == n and source.shape[0] % sort_block_m == 0
         assert inverse.shape == (tokens, topk)
         assert source.dtype == output.dtype == torch.bfloat16 and inverse.dtype == torch.int32
         assert all(t.is_cuda and t.is_contiguous() and t.device == output.device for t in (output, source, inverse))
@@ -82,6 +82,6 @@ def make_moe_sum(*, n, topk):
             compiled(output.data_ptr(), source.data_ptr(), inverse.data_ptr(), tokens, source.shape[0], stream.cuda_stream)
         return output
 
-    reduce.config = {"output_layout": "packed", "num_threads": 256, "block_cols": 2048,
-                     "preload": True, "read_policy": 2, "write_policy": 0, "tree_sum": False}
+    reduce.config = {"output_layout": "packed", "sort_block_m": sort_block_m, "num_threads": 256, "block_cols": 2048,
+                     "read_policy": 2, "write_policy": 0}
     return reduce

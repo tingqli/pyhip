@@ -162,6 +162,8 @@ def flydsl_moe_gemm_8wave_down(
     lds_read_first=False, coalesced_output=False, stage_priority=True,
     output_layout="routed",
     persistent=True, xcd_swizzle=False, task_table=False,
+    overlap_prologue=False, fused_metadata=False, batch_routing_ids=False,
+    early_b_prefetch=False,
 ):
     """Return the same ten-tensor callable as moe_8wave_down's factory.
 
@@ -183,6 +185,10 @@ def flydsl_moe_gemm_8wave_down(
     """
     assert block_m == 256
     assert not xcd_swizzle or not persistent, "XCD swizzle maps nonpersistent workgroup IDs"
+    assert not (overlap_prologue or fused_metadata or batch_routing_ids or early_b_prefetch) or (
+        block_n == 128 and k == 256 and coalesced_output and not persistent and not task_table
+    ), "prologue experiments require the nonpersistent coalesced BN128/K256 path"
+    assert not early_b_prefetch or not overlap_prologue, "select one A/B startup ordering"
     assert output_layout in ("routed", "sorted", "packed")
     assert output_layout == "routed" or (block_n == 128 and k == 256 and coalesced_output)
     assert output_cache_policy in (0, 1, 2, 3, 16, 17, 18, 19)
@@ -344,21 +350,8 @@ def flydsl_moe_gemm_8wave_down(
                                           else task_lane_row * 16 + task_lane_k * 256)
                 row_begin = _scalar(sorted_expert_ids[2 * blk_m]) if const_expr(task_table) else blk_m * 256
                 expert = _scalar(sorted_expert_ids[2 * blk_m + 1]) if const_expr(task_table) else _scalar(sorted_expert_ids[blk_m])
-                if task_tid < 256:
-                    ids_lds[task_tid] = sorted_ids[row_begin + task_tid]
-                    routes_lds[task_tid] = sorted_weights[row_begin + task_tid]
-                for copy_round in range_constexpr((scale_count + 511) // 512):
-                    index = task_tid + copy_round * 512
-                    if index < scale_count:
-                        scales_lds[index] = weight_scales[
-                            expert * (((n + 127) // 128) * ks) + (blk_oc * n_split // 128) * ks + index
-                        ]
-                fx.barrier()
 
-                # A scales are gathered once per routed row, not duplicated
-                # across the four K lane groups or kept live across all N.
-                if task_tid < 256:
-                    encoded = ids_lds[task_tid].bitcast(fx.Uint32)
+                def gather_row_scales(encoded, row_index):
                     token = encoded & 0xFFFFFF
                     slot = encoded >> 24
                     valid = (token < fx.Uint32(num_tokens)) & (slot < topk)
@@ -368,7 +361,26 @@ def flydsl_moe_gemm_8wave_down(
                         row_scale = fx.Float32(rocdl.raw_ptr_buffer_load(
                             fx.Float32.ir_type, as_rsrc, arith._to_raw(scale_offset), zero,
                         ))
-                        a_scales_lds[kb * 256 + task_tid] = row_scale
+                        a_scales_lds[kb * 256 + row_index] = row_scale
+
+                if task_tid < 256:
+                    encoded = sorted_ids[row_begin + task_tid].bitcast(fx.Uint32)
+                    ids_lds[task_tid] = encoded.bitcast(fx.Int32)
+                    routes_lds[task_tid] = sorted_weights[row_begin + task_tid]
+                    if const_expr(fused_metadata):
+                        # The ID producer can gather its own A scales directly;
+                        # all shared metadata is published by one barrier below.
+                        gather_row_scales(encoded, task_tid)
+                for copy_round in range_constexpr((scale_count + 511) // 512):
+                    index = task_tid + copy_round * 512
+                    if index < scale_count:
+                        scales_lds[index] = weight_scales[
+                            expert * (((n + 127) // 128) * ks) + (blk_oc * n_split // 128) * ks + index
+                        ]
+                if const_expr(not fused_metadata):
+                    fx.barrier()
+                    if task_tid < 256:
+                        gather_row_scales(ids_lds[task_tid].bitcast(fx.Uint32), task_tid)
                 fx.barrier()
 
                 weight_view = fx.make_view(
@@ -377,6 +389,33 @@ def flydsl_moe_gemm_8wave_down(
                 )
                 weight_buffer = fx.rocdl.make_buffer_tensor(weight_view, False)
                 weight_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(weight_buffer))
+
+                def dma_b(n_tile, step, voffset):
+                    # step is constexpr even for the dynamic N loop.  Only
+                    # scalar tile/slot arithmetic is emitted here.
+                    target_n = n_tile + step // steps
+                    target_step = step % steps
+                    kb = (target_step // 2) % ks if const_expr(split_memory) else 0 if const_expr(full_k_narrow) else target_step % ks
+                    half = (target_step // 4) * 2 + target_step % 2 if const_expr(split_memory) else target_step if const_expr(full_k_narrow) else target_step // ks
+                    slot = (target_n * steps + target_step) % ring_slots
+                    soffset = fx.Int32(target_n * (block_n * k) + half * (packet_n * k) + kb * 2048)
+                    for copy_round in range_constexpr(dma_rounds):
+                        address = dma_base + slot * slot_bytes + copy_round * (512 * 16)
+                        dst = llvm.inttoptr(lds_ptr_type, arith._to_raw(address))
+                        rocdl.raw_ptr_buffer_load_async_lds(
+                            weight_rsrc, dst, dma_size, arith._to_raw(voffset),
+                            arith._to_raw(soffset + copy_round * 8192 if const_expr(full_k_narrow)
+                                          else soffset + dma_wave_offset + copy_round * (64 * k)), zero,
+                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, weight_cache_policy),
+                        )
+                    rocdl.asyncmark()
+
+                if const_expr(early_b_prefetch):
+                    # Metadata is published; overlap B with the independent A
+                    # gather/address work. The final full wait also retires A.
+                    for step in range_constexpr(min(prefetch, steps * nt)):
+                        dma_b(0, step, dma_offset)
+                    rocdl.sched_barrier(0)
                 a = fx.make_rmem_tensor([8, 2, ks], fx.Int32)
                 a_words = fx.make_view(fx.get_iter(a), fx.make_ordered_layout([4, 2, 2, ks], 0))
                 stage_a_scales = fx.make_rmem_tensor([2, ks] if full_k_narrow else 2, fx.Float32)
@@ -384,9 +423,26 @@ def flydsl_moe_gemm_8wave_down(
                 c = fx.make_rmem_tensor([4, 2, block_n // 16], fx.Float32)
                 out_addresses = []
                 swap_col = (task_lane_k & 1) * 2 + (task_lane_k >> 1)
+                cached_ids = fx.make_rmem_tensor([2, 2], fx.Int32)
+                if const_expr(batch_routing_ids):
+                    id_pairs = fxh.LdsTensor(fx.make_view(fx.get_iter(ids_lds), fx.make_layout(2, 1)))
+                    for mi in range_constexpr(2):
+                        row_pair = task_wave * 32 + mi * 16 + (task_lane_row // 2) * 2
+                        address = fx.Int32(fx.ptrtoint(fx.get_iter(ids_lds))) + row_pair * 4
+                        cached_ids[None, mi].store(id_pairs.load(address_bytes=address))
+                    rocdl.sched_barrier(0)
+                    rocdl.s_waitcnt(lgkmcnt=0)
+                    for mi in range_constexpr(2):
+                        cached_ids[None, mi].store(_pin_packet(cached_ids[None, mi].load()))
+
+                def input_id(mi):
+                    if const_expr(batch_routing_ids):
+                        return (task_lane_row % 2 == 0).select(cached_ids[0, mi], cached_ids[1, mi]).bitcast(fx.Uint32)
+                    return ids_lds[task_wave * 32 + mi * 16 + task_lane_row].bitcast(fx.Uint32)
+
                 for mi in range_constexpr(2):
                     row = task_wave * 32 + mi * 16 + task_lane_row
-                    encoded = ids_lds[row].bitcast(fx.Uint32)
+                    encoded = input_id(mi)
                     token = encoded & 0xFFFFFF
                     slot = encoded >> 24
                     valid = (token < fx.Uint32(num_tokens)) & (slot < topk)
@@ -411,7 +467,8 @@ def flydsl_moe_gemm_8wave_down(
                         addresses = []
                         for parity in range_constexpr(2):
                             row = task_wave * 32 + mi * 16 + (task_lane_row // 2) * 2 + parity
-                            encoded = ids_lds[row].bitcast(fx.Uint32)
+                            encoded = (cached_ids[parity, mi].bitcast(fx.Uint32) if const_expr(batch_routing_ids)
+                                       else ids_lds[row].bitcast(fx.Uint32))
                             token, slot = encoded & 0xFFFFFF, encoded >> 24
                             valid = (token < fx.Uint32(num_tokens)) & (slot < topk)
                             output_row = row_begin + row if const_expr(output_layout != "routed") else fx.Int32(token) * topk + fx.Int32(slot)
@@ -458,26 +515,6 @@ def flydsl_moe_gemm_8wave_down(
                 def broadcast_scale(value):
                     # A coefficient broadcast, not an address calculation.
                     return _scalar(value).bitcast(fx.Float32)
-
-                def dma_b(n_tile, step, voffset):
-                    # step is constexpr even for the dynamic N loop.  Only
-                    # scalar tile/slot arithmetic is emitted here.
-                    target_n = n_tile + step // steps
-                    target_step = step % steps
-                    kb = (target_step // 2) % ks if const_expr(split_memory) else 0 if const_expr(full_k_narrow) else target_step % ks
-                    half = (target_step // 4) * 2 + target_step % 2 if const_expr(split_memory) else target_step if const_expr(full_k_narrow) else target_step // ks
-                    slot = (target_n * steps + target_step) % ring_slots
-                    soffset = fx.Int32(target_n * (block_n * k) + half * (packet_n * k) + kb * 2048)
-                    for copy_round in range_constexpr(dma_rounds):
-                        address = dma_base + slot * slot_bytes + copy_round * (512 * 16)
-                        dst = llvm.inttoptr(lds_ptr_type, arith._to_raw(address))
-                        rocdl.raw_ptr_buffer_load_async_lds(
-                            weight_rsrc, dst, dma_size, arith._to_raw(voffset),
-                            arith._to_raw(soffset + copy_round * 8192 if const_expr(full_k_narrow)
-                                          else soffset + dma_wave_offset + copy_round * (64 * k)), zero,
-                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, weight_cache_policy),
-                        )
-                    rocdl.asyncmark()
 
                 def read_b(n_tile, step, ring_phase):
                     b = fx.make_rmem_tensor([8, packet_n // 16, ks] if full_k_narrow else [8, packet_n // 16], fx.Int32)
@@ -849,9 +886,16 @@ def flydsl_moe_gemm_8wave_down(
                     return packed
 
                 # Preparation -> prologue -> stagger -> N0/N1 -> 1N loop -> tail.
-                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-                for step in range_constexpr(min(prefetch, steps * nt)):
-                    dma_b(0, step, dma_offset)
+                if const_expr(overlap_prologue):
+                    # A loads precede B0's marker. Waiting for B0 below also
+                    # retires A, without serializing A completion before B issue.
+                    rocdl.sched_barrier(0)
+                    rocdl.s_waitcnt(lgkmcnt=0)
+                else:
+                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                if const_expr(not early_b_prefetch):
+                    for step in range_constexpr(min(prefetch, steps * nt)):
+                        dma_b(0, step, dma_offset)
                 rocdl.wait_asyncmark(min(prefetch, steps * nt) - 1)
                 _stage_end()
                 if group == 1:
@@ -984,5 +1028,8 @@ def flydsl_moe_gemm_8wave_down(
         "output_layout": output_layout,
         "persistent": persistent, "xcd_swizzle": xcd_swizzle, "xcd_count": 8,
         "task_table": task_table,
+        "overlap_prologue": overlap_prologue, "fused_metadata": fused_metadata,
+        "batch_routing_ids": batch_routing_ids,
+        "early_b_prefetch": early_b_prefetch,
     }
     return callable

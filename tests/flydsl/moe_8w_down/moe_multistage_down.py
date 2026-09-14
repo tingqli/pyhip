@@ -9,9 +9,9 @@ sixteen MFMA16x16x128 instructions per Compute, and register-only packing
 of the completed other half. The next tile's Memory stages retire the
 previous output equally. A, scales and routing are cached per task.
 
-Only the selected persistent256/SC1-weight/NT-output configuration lives
-here. Packed output is [expert_block256, global_N64, row256, col64], stored
-in a caller-owned 2-D allocation; consume it with the packed reducer.
+Only persistent256 or independent width8 scheduling is supported, with
+SC1 weights/NT output. Layout is [expert_block256, global_N64, row256, col64],
+stored in a caller-owned 2-D allocation; consume it with the packed reducer.
 """
 
 from functools import cache
@@ -22,28 +22,27 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 
 from pyhip.contrib.flydsl import helpers as fxh
 from pyhip.contrib.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as _ptr
 
 
 ATT_TUNED_BN128_CONFIG = {
-    "block_m": 256, "block_n": 128, "num_oc_splits": 4,
+    "block_m": 256, "block_n": 128, "sort_block_m": 256, "num_waves": 8, "num_oc_splits": 4,
     "prefetch_distance": 3, "persistent_workgroups": 256,
     "output_cache_policy": 2, "weight_cache_policy": 16,
-    "lds_read_first": True, "coalesced_output": True, "stage_priority": False,
-    "output_layout": "packed", "persistent": True, "xcd_swizzle": False,
+    "output_layout": "packed", "persistent": True,
 }
 
 
 def _scalar(value):
-    return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, arith._to_raw(value)))
+    return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, value.ir_value()))
 
 
 def _pin_address(value):
     return fx.Int32(llvm.inline_asm(
-        fx.Int32.ir_type, [arith._to_raw(value)], "", "=v,0", has_side_effects=True,
+        fx.Int32.ir_type, [value.ir_value()], "", "=v,0", has_side_effects=True,
     ))
 
 
@@ -58,7 +57,7 @@ def _task_thread_id(wave):
 
 
 def _pin_packet(value):
-    raw = arith._to_raw(value)
+    raw = value.ir_value()
     return fx.Vector(llvm.inline_asm(raw.type, [raw], "", "=v,0", has_side_effects=True))
 
 
@@ -116,14 +115,15 @@ def _pack_pair(c0, c1, route):
 
 
 @cache
-def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
+def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts, persistent=True):
     """Build the fixed winning packed down; return the ten-tensor callable.
 
     A: OCP E4M3FN [tokens,topk,256], A scales: physical K-major FP32.
     B: OCP E4M3FN [experts,N,256], shuffle_weight(layout=(16,16)).
     B scales: [experts,N/128,2]. Sorting uses M256 padded expert runs.
     Output: BF16 [expert_capacity*256,N], physically packed, NOT row-major.
-    The caller's int32 counter is reset on the current stream each call.
+    Persistent calls reset the counter; independent calls preserve it.
+    Independent width8 swizzle changes task order, not the eight-wave pipeline.
     """
     assert k == 256 and n > 0 and n % 512 == 0
     assert 0 < topk <= min(num_experts, 255)
@@ -181,21 +181,30 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
         out_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(out_buffer))
         max_id = _scalar(num_valid_ids[0])
         atom = fx.make_mma_atom(rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
-        zero, dma_size = arith._to_raw(fx.Int32(0)), arith._to_raw(fx.Int32(16))
+        zero, dma_size = fx.Int32(0).ir_value(), fx.Int32(16).ir_value()
         lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
 
+        linear_task = fx.Int32(fx.block_idx.x)
+        task = fx.Int32(0)
         running = fx.Boolean(True)
         while running:
             task_tid = fx.Uint32(_task_thread_id(scalar_wave))
-            if task_tid == 0:
-                counter_ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), arith._to_raw(fx.ptrtoint(task_counter)))
-                next_task = fx.Int32(llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add, counter_ptr, arith._to_raw(fx.Int32(1)),
-                    llvm.AtomicOrdering.monotonic, syncscope="agent",
-                ).res)
-                task_lds[0] = next_task
-            fx.barrier()
-            task = _scalar(task_lds[0])
+            if const_expr(persistent):
+                if task_tid == 0:
+                    counter_ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), fx.ptrtoint(task_counter).ir_value())
+                    next_task = fx.Int32(llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add, counter_ptr, fx.Int32(1).ir_value(),
+                        llvm.AtomicOrdering.monotonic, syncscope="agent",
+                    ).res)
+                    task_lds[0] = next_task
+                fx.barrier()
+                task = _scalar(task_lds[0])
+            else:
+                task = linear_task
+                # Transpose only the valid prefix; preserve a bijective tail.
+                chunk = (max_id // 256 * 4) // 8
+                mapped = (task % 8) * chunk + task // 8
+                task = (task < chunk * 8).select(mapped, task)
             blk_m, blk_oc = task // 4, task % 4
             running = blk_m * 256 < max_id
             if running:
@@ -217,9 +226,9 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                     valid = (token < fx.Uint32(num_tokens)) & (slot < topk)
                     input_row = fx.Int32(token) * topk + fx.Int32(slot)
                     for kb in range_constexpr(ks):
-                        scale_offset = arith.select(valid, (kb * rows + input_row) * 4, fx.Int32(-1))
+                        scale_offset = valid.select((kb * rows + input_row) * 4, fx.Int32(-1))
                         a_scales_lds[kb * 256 + task_tid] = fx.Float32(rocdl.raw_ptr_buffer_load(
-                            fx.Float32.ir_type, as_rsrc, arith._to_raw(scale_offset), zero,
+                            fx.Float32.ir_type, as_rsrc, scale_offset.ir_value(), zero,
                         ))
                 fx.barrier()
                 weight_view = fx.make_view(
@@ -242,7 +251,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                     input_row = fx.Int32(token) * topk + fx.Int32(slot)
                     for kb in range_constexpr(ks):
                         for part in range_constexpr(2):
-                            offset = arith.select(valid, input_row * k + task_lane_k * 16 + kb * 128 + part * 64, fx.Int32(-1))
+                            offset = valid.select(input_row * k + task_lane_k * 16 + kb * 128 + part * 64, fx.Int32(-1))
                             a_words[None, part, mi, kb].store(a_packet.load(voffset_bytes=offset))
                 coalesced_addresses = []
                 for mi in range_constexpr(2):
@@ -254,7 +263,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                         valid = (token < fx.Uint32(num_tokens)) & (slot < topk)
                         offset = blk_m * (256 * n * 2) + blk_oc * (256 * n_split * 2) + row * 128
                         offset += swap_col * 16 + (task_lane_row % 2) * 64
-                        addresses.append(_pin_address(arith.select(valid, offset, output_capacity_rows * (n * 2))))
+                        addresses.append(_pin_address(valid.select(offset, output_capacity_rows * (n * 2))))
                     coalesced_addresses.append(addresses)
 
                 # All VGPR addresses are pinned before the first Memory stage.
@@ -282,10 +291,10 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                     soffset = fx.Int32(target_n * (128 * k) + half * (64 * k))
                     for copy_round in range_constexpr(2):
                         address = dma_base + slot * slot_bytes + copy_round * 8192
-                        dst = llvm.inttoptr(lds_ptr_type, arith._to_raw(address))
+                        dst = llvm.inttoptr(lds_ptr_type, address.ir_value())
                         rocdl.raw_ptr_buffer_load_async_lds(
-                            weight_rsrc, dst, dma_size, arith._to_raw(dma_offset),
-                            arith._to_raw(soffset + copy_round * 8192), zero,
+                            weight_rsrc, dst, dma_size, dma_offset.ir_value(),
+                            (soffset + copy_round * 8192).ir_value(), zero,
                             aux=ir.IntegerAttr.get(fx.Int32.ir_type, 16),
                         )
                     rocdl.asyncmark()
@@ -314,7 +323,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                         words[None, packet].store(_pin_packet(words[None, packet].load()))
 
                 def pack_record(record):
-                    return [[_pack_pair(c[None, mi, record * 2].load(), c[None, mi, record * 2 + 1].load(), stage_routes[mi])]
+                    return [_pack_pair(c[None, mi, record * 2].load(), c[None, mi, record * 2 + 1].load(), stage_routes[mi])
                             for mi in range_constexpr(2)]
 
                 def store_quarter(n_tile, packed, quarter):
@@ -322,9 +331,9 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                     for local_record in range_constexpr(2):
                         record = half * 2 + local_record
                         rocdl.raw_ptr_buffer_store(
-                            arith._to_raw(packed[record][mi][0]), out_rsrc,
-                            arith._to_raw(coalesced_addresses[mi][local_record]),
-                            arith._to_raw(fx.Int32((n_tile * 2 + half) * 32768)),
+                            packed[record][mi].ir_value(), out_rsrc,
+                            coalesced_addresses[mi][local_record].ir_value(),
+                            fx.Int32((n_tile * 2 + half) * 32768).ir_value(),
                             aux=ir.IntegerAttr.get(fx.Int32.ir_type, 2),
                         )
 
@@ -432,7 +441,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                         _mark(f"MOE8_COMPUTE_BEGIN_{step}")
                         record = compute_stage(b, scale, step, not first or step == 1)
                         if const_expr(not first or step == 1):
-                            parts = [[[record[mi][pair]] for mi in range_constexpr(2)] for pair in range_constexpr(2)]
+                            parts = [[record[mi][pair] for mi in range_constexpr(2)] for pair in range_constexpr(2)]
                             if const_expr(step == 1):
                                 packed.extend(parts)
                             else:
@@ -443,7 +452,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
 
                 def save_state(packed):
                     state = [c[None, mi, ni].load() for mi in range_constexpr(2) for ni in range_constexpr(4, 8)]
-                    state.extend([packed[record][mi][0] for record in range_constexpr(2) for mi in range_constexpr(2)])
+                    state.extend([packed[record][mi] for record in range_constexpr(2) for mi in range_constexpr(2)])
                     return state
 
                 def restore_state(state):
@@ -453,10 +462,10 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                             c[None, mi, ni].store(state[index])
                             index += 1
                     packed = []
-                    for record in range_constexpr(2):
+                    for _ in range_constexpr(2):
                         record_data = []
                         for mi in range_constexpr(2):
-                            record_data.append([fx.Vector(state[index])])
+                            record_data.append(fx.Vector(state[index]))
                             index += 1
                         packed.append(record_data)
                     return packed
@@ -486,9 +495,9 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                 _priority(3)
                 for record in range_constexpr(2, 4):
                     packed.append(pack_record(record))
-                coalesced = [_coalesce_output_pairs(packed[2][mi][0], packed[3][mi][0]) for mi in range_constexpr(2)]
-                packed[2] = [[coalesced[mi][0]] for mi in range_constexpr(2)]
-                packed[3] = [[coalesced[mi][1]] for mi in range_constexpr(2)]
+                coalesced = [_coalesce_output_pairs(packed[2][mi], packed[3][mi]) for mi in range_constexpr(2)]
+                packed[2] = [coalesced[mi][0] for mi in range_constexpr(2)]
+                packed[3] = [coalesced[mi][1] for mi in range_constexpr(2)]
                 _priority(0)
                 for quarter in range_constexpr(4):
                     store_quarter(nt - 1, packed, quarter)
@@ -498,6 +507,8 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
                 if group == 0:
                     _stage_end()
             fx.barrier()
+            if const_expr(not persistent):
+                running = fx.Boolean(False)
 
     @flyc.jit
     def launch(output: fx.Pointer, input_q: fx.Pointer, weight_shuffled: fx.Pointer,
@@ -509,7 +520,8 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
             output, input_q, weight_shuffled, input_scales, weight_scales,
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, task_counter,
             num_tokens, output_capacity_rows, value_attrs=kernel_attrs,
-        ).launch(grid=(256, 1, 1), block=(512, 1, 1), stream=stream)
+        ).launch(grid=(256 if const_expr(persistent) else output_capacity_rows // 256 * 4, 1, 1),
+             block=(512, 1, 1), stream=stream)
 
     def down(output, input_q, weight_shuffled, input_scales, weight_scales,
              sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, task_counter):
@@ -533,7 +545,8 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
         assert input_q.numel() < (1 << 32) and input_scales.numel() * 4 < (1 << 32) and n_split * k < (1 << 32)
         assert (output.numel() + n) * 2 < (1 << 32), "32-bit offsets include the invalid-row sentinel"
         assert torch.cuda.get_device_properties(output.device).gcnArchName.startswith("gfx950")
-        task_counter.zero_()
+        if persistent:
+            task_counter.zero_()
         stream = torch.cuda.current_stream(output.device)
         compiled = getattr(launch, "_cf", None)
         if compiled is None:
@@ -543,5 +556,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts):
             compiled(*(t.data_ptr() for t in tensors), tokens, output.shape[0], stream.cuda_stream)
         return output
 
-    down.config = {**ATT_TUNED_BN128_CONFIG, "stages": 4}
+    down.config = {**ATT_TUNED_BN128_CONFIG, "stages": 4,
+                   "persistent": persistent, "persistent_workgroups": 256 if persistent else 0,
+                   "xcd_count": 0 if persistent else 8}
     return down
