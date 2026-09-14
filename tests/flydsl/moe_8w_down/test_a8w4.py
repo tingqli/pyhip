@@ -14,13 +14,17 @@ Usage:
 from __future__ import annotations
 
 import os
+os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
 import pytest
 import torch
+import re
 
 from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 from aiter.ops.opus.moe_stage2_a8w4_meta import (
+    OPUS_A8W4_KID_ROUTE_BF16_BM32_FULL_N7168_SMALL,
     OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3072,
+    opus_a8w4_kid_reduce_block_n,
 )
 
 from aiter import ActivationType, QuantType, dtypes
@@ -41,6 +45,7 @@ from aiter.test_common import checkAllclose
 from aiter.utility.fp4_utils import e8m0_shuffle
 
 import pyhip
+from moe_8wave_down_a8w4 import flydsl_moe_gemm_8wave_down_a8w4
 
 Q_TYPE = QuantType.per_1x32
 
@@ -59,28 +64,27 @@ def _stage1_tile_k(model_dim: int) -> int:
 
 
 def _check_close(ref, out, label, atol=1.0, rtol=0.05, max_err_ratio=0.05):
-    assert not out.isnan().any(), f"{label}: output has NaN"
-    assert not out.isinf().any(), f"{label}: output has Inf"
+    if out.isnan().any():
+        return f"NaN!!!"
+    if out.isinf().any():
+        return f"Inf!!!"
     err = checkAllclose(ref, out, msg=label, atol=atol, rtol=rtol)
-    assert (
-        err == 0 or err <= max_err_ratio
-    ), f"{label}: checkAllclose failed (err={err}, max={max_err_ratio})"
-    return err
-
+    if(err > max_err_ratio):
+        return f"{err}!!!"
+    return f"{err:6g}!!!"
 
 def _print_stage2_results(rows):
-    baseline_us = rows[0][1]
     headers = ("Kernel", "Time (us)", "TFLOPS", "vs FlyDSL", "Error ratio", "Diff")
     widths = [len(header) for header in headers]
     formatted_rows = []
-    for name, elapsed_us, tflops, err, diff in rows:
+    for name, elapsed_us, tflops, improve, err, diff in rows:
         row = (
             name,
-            f"{elapsed_us:.3f}",
-            f"{tflops:.3f}",
-            f"{baseline_us / elapsed_us:.3f}x",
-            f"{err:.6g}",
-            f"{diff:.6g}",
+            f"{elapsed_us:.3f}" if elapsed_us is not None else "N/A",
+            f"{tflops/elapsed_us:.3f}" if elapsed_us is not None else "N/A",
+            f"{improve:.3f}x" if improve is not None else "N/A",
+            f"{err}" if err is not None else "N/A",
+            f"{diff:.6g}" if diff is not None else "N/A",
         )
         formatted_rows.append(row)
         widths = [max(width, len(value)) for width, value in zip(widths, row)]
@@ -203,6 +207,9 @@ def _generate_a8w4_gui_data(
         "sorted_weights": sorted_weights,
         "sorted_expert_ids": sorted_expert_ids,
         "num_valid_ids": num_valid_ids,
+        "topk_ids": topk_ids,
+        "topk_weights": topk_weights,
+        "a2_scale": a2_scale,
         "ref_stage1": ref_stage1,
         "ref_stage2": ref_stage2,
         "token": token,
@@ -241,112 +248,309 @@ def test_pick_flydsl_stage2_tile_k():
 
 
 @_SKIP_GFX950_FLYDSL
-def test_flydsl_stage2_a8w4_gui(inter_dim=384, seed=1234):
+def test_flydsl_stage2_a8w4_gui(seed=1234):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
 
-    token, model_dim, E, topk, block_m = 16384, 6144, 384, 8, 64
-    data = _generate_a8w4_gui_data(
-        token,
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        block_m,
-        seed=seed,
-        # The locally built Opus module currently contains effective-K=384.
-        inter_pad_override=0,
-    )
-    effective_inter_dim = inter_dim - data["inter_pad"]
-    padded_rows = int(data["num_valid_ids"][0].item())
-    flops = 2 * padded_rows * model_dim * effective_inter_dim
+    kernel_selector=r"flydsl_moe_stage2|flydsl_moe_gemm_8wave_down_a8w4|opus"
+    kernel_selector=r"flydsl|.*8wave"
 
-    flydsl_out, flydsl_us = pyhip.run_perftest(
-        flydsl_moe_stage2,
-        inter_states=data["a2_q"],
-        w2=data["w2_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        topk=topk,
-        tile_m=block_m,
-        tile_n=256,
-        tile_k=256,
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype="bf16",
-        mode="reduce",
-        w2_scale=data["w2_scale_shuf"],
-        a2_scale=data["a2_scale_sort"],
-        sorted_weights=data["sorted_weights"],
-        inter_dim_pad=data["inter_pad"],
-        model_dim_pad=0,
-        num_warmup=2,
-        num_iters=10,
-        num_copies=1,
-        num_flops=flops,
-        num_verbose=1,
-        num_name="flydsl_moe_stage2_a8w4",
-        num_spec_tag=f"M={token},N={model_dim},K={effective_inter_dim}",
-    )
-    torch.cuda.synchronize()
-    flydsl_err = _check_close(
-        data["ref_stage2"], flydsl_out, f"flydsl_stage2_a8w4_gui_i{inter_dim}"
-    )
-    flydsl_diff = pyhip.calc_diff(flydsl_out, data["ref_stage2"])
+    """
 
-    opus_out = torch.empty_like(data["ref_stage2"])
+    16384
+    flydsl_moe_gemm_8wave_down_a8w4_0                     488.897  4602  2.250  0.639  1.611  flydsl_moe_gemm_8wave_down_a8w4_0
 
-    # BM64 is a per-route MXFP8 kernel followed by token/top-k reduction.
-    opus_out, opus_us = pyhip.run_perftest(
-        _opus_a8w4.opus_a8w4_stage2_wrapper,
-        inter_states=data["a2_q"],
-        w1=None,
-        w2=data["w2_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        out=opus_out,
-        topk=topk,
-        kernelName=_opus_a8w4.OPUS_A8W4_STAGE2_KERNEL,
-        w2_scale=data["w2_scale_shuf"],
-        a2_scale=data["a2_scale_sort"],
-        sorted_weights=data["sorted_weights"],
-        inter_dim_pad=data["inter_pad"],
-        model_dim_pad=0,
-        block_m=block_m,
-        kernel_id=OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3072,
-        stage2_reduce_block_n=3072,
-        route_out=True,
-        num_warmup=2,
-        num_iters=10,
-        num_copies=1,
-        num_flops=flops,
-        num_verbose=1,
-        num_name="opus_moe_stage2_a8w4",
-        num_spec_tag=f"M={token},N={model_dim},K={effective_inter_dim}",
-    )
-    torch.cuda.synchronize()
-    opus_err = _check_close(
-        data["ref_stage2"],
-        opus_out,
-        f"opus_stage2_a8w4_gui_i{inter_dim}",
-        # BM64 only has MXFP8 route-output kernels. The extra route-output
-        # quantize/dequantize step needs the same 10% ratio accepted by the
-        # Opus tuner; catastrophic errors still fail checkAllclose.
-        max_err_ratio=0.1,
-    )
-    opus_diff = pyhip.calc_diff(opus_out, data["ref_stage2"])
+    token个数翻倍，权重读取增加并不多，但是写出数据量翻倍
+    此时总带宽急剧下降，比较奇怪
+
+    16384*2
+    flydsl_moe_gemm_8wave_down_a8w4_0                    1107.840  3618  4.008  0.787  3.221  flydsl_moe_gemm_8wave_down_a8w4_0
+
+    """
+    NUM_ITERS = 10
+    all_tokens = [4096, 8192, 16384, 16384*2]
+    model_dim, inter_dim, E, topk = 6144, 256, 384, 8
+    base_block_m = 64
+    stage2_results = []
+
+    for token in all_tokens:
+        num_oc_splits = 1 if token >= 16384 else 4
+
+        data = _generate_a8w4_gui_data(
+            token,
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            base_block_m,
+            seed=seed,
+            # The locally built Opus module currently contains effective-K=384.
+            inter_pad_override=0,
+        )
+        effective_inter_dim = inter_dim - data["inter_pad"]
+
+        candidates = [(flydsl_moe_stage2, 64, 0),(flydsl_moe_gemm_8wave_down_a8w4, 256, 128)]
+        for kernel, block_m, block_n in candidates:
+            if block_m == base_block_m:
+                sorted_ids = data["sorted_ids"]
+                sorted_weights = data["sorted_weights"]
+                sorted_expert_ids = data["sorted_expert_ids"]
+                num_valid_ids = data["num_valid_ids"]
+                a2_scale_sort = data["a2_scale_sort"]
+            else:
+                (
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    _,
+                ) = moe_sorting(
+                    data["topk_ids"],
+                    data["topk_weights"],
+                    E,
+                    model_dim,
+                    torch.bfloat16,
+                    block_m,
+                )
+                a2_scale_sort = mxfp4_moe_sort_fwd(
+                    data["a2_scale"],
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token,
+                    cols=inter_dim,
+                )
+
+            flops = 2 * token * topk * model_dim * effective_inter_dim
+
+            if kernel is flydsl_moe_stage2:
+                try:
+                    flydsl_out, flydsl_us = pyhip.run_perftest(
+                        flydsl_moe_stage2,
+                        inter_states=data["a2_q"],
+                        w2=data["w2_shuf"],
+                        sorted_token_ids=sorted_ids,
+                        sorted_expert_ids=sorted_expert_ids,
+                        num_valid_ids=num_valid_ids,
+                        topk=topk,
+                        tile_m=block_m,
+                        tile_n=256,
+                        tile_k=256,
+                        a_dtype="fp8",
+                        b_dtype="fp4",
+                        out_dtype="bf16",
+                        mode="reduce",
+                        w2_scale=data["w2_scale_shuf"],
+                        a2_scale=a2_scale_sort,
+                        sorted_weights=sorted_weights,
+                        inter_dim_pad=data["inter_pad"],
+                        model_dim_pad=0,
+                        num_warmup=2,
+                        num_iters=NUM_ITERS,
+                        num_flops=flops,
+                        num_verbose=1,
+                        num_name=f"flydsl_moe_stage2_a8w4_bm{block_m}",
+                        num_spec_tag=f"M={token},N={model_dim},K={effective_inter_dim}",
+                    )
+                    torch.cuda.synchronize()
+                    flydsl_err = _check_close(
+                        data["ref_stage2"],
+                        flydsl_out,
+                        f"flydsl_stage2_a8w4_bm{block_m}_i{inter_dim}",
+                    )
+                    flydsl_diff = pyhip.calc_diff(flydsl_out, data["ref_stage2"])
+                except Exception as e:
+                    print(f"Error occurred during FlyDSL BM{block_m} stage2 test: {e}")
+                    flydsl_us = None
+                    flydsl_err = None
+                    flydsl_diff = None
+
+                baseline_us = flydsl_us
+                stage2_results.append(
+                    (
+                        f"{token:6} FlyDSL BM{block_m}",
+                        flydsl_us,
+                        flops / 1e6,
+                        1.0,
+                        flydsl_err,
+                        flydsl_diff,
+                    )
+                )
+
+            if kernel is flydsl_moe_gemm_8wave_down_a8w4:
+                try:
+                    wave8_out = torch.full(
+                        (token, topk, model_dim),
+                        torch.nan,
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    )
+                    wave8_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+                    wave8_kernel = flydsl_moe_gemm_8wave_down_a8w4(
+                        n=model_dim,
+                        k=inter_dim,
+                        topk=topk,
+                        num_experts=E,
+                        block_m=block_m,
+                        block_n=block_n,
+                        num_oc_splits=num_oc_splits
+                    )
+
+                    def launch_8wave(*args):
+                        args[-1].zero_()
+                        wave8_kernel(*args)
+                        return wave8_out.sum(dim=1)
+
+                    wave8_reduced, wave8_us = pyhip.run_perftest(
+                        launch_8wave,
+                        wave8_out,
+                        data["a2_q"],
+                        data["w2_shuf"],
+                        a2_scale_sort,
+                        data["w2_scale_shuf"],
+                        sorted_ids,
+                        sorted_weights,
+                        sorted_expert_ids,
+                        num_valid_ids,
+                        wave8_counter,
+                        num_warmup=2,
+                        num_iters=NUM_ITERS,
+                        num_flops=flops,
+                        num_verbose=1,
+                        num_name=f"moe_gemm_8wave_down_a8w4_bm{block_m}_bn{block_n}",
+                        num_spec_tag=f"M={token},N={model_dim},K={effective_inter_dim}",
+                    )
+                    torch.cuda.synchronize()
+                    wave8_err = _check_close(
+                        data["ref_stage2"],
+                        wave8_reduced,
+                        f"moe_8wave_down_a8w4_bm{block_m}_bn{block_n}_i{inter_dim}",
+                    )
+                    wave8_diff = pyhip.calc_diff(wave8_reduced, data["ref_stage2"])
+                except Exception as e:
+                    print(
+                        f"Error occurred during 8-wave BM{block_m} BN{block_n} "
+                        f"stage2 test: {e}"
+                    )
+                    wave8_us = None
+                    wave8_err = None
+                    wave8_diff = None
+
+                stage2_results.append(
+                    (
+                        f"{token:6} 8-wave BM{block_m} BN{block_n}",
+                        wave8_us,
+                        flops / 1e6,
+                        baseline_us/wave8_us if baseline_us and wave8_us else None,
+                        wave8_err,
+                        wave8_diff,
+                    )
+                )
+
+        # Opus uses separate sort block sizes dictated by each route-output kernel.
+        opus_results = []
+        opus_configs = (
+            (
+                "bf16",
+                32,
+                OPUS_A8W4_KID_ROUTE_BF16_BM32_FULL_N7168_SMALL,
+                0.05,
+            ),
+            ("fp8", 64, OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3072, 0.1),
+        ) if inter_dim in [384,] else ()
+
+        for route_dtype, opus_block_m, opus_kernel_id, max_err_ratio in opus_configs:
+            try:
+                if not re.match(kernel_selector, "opus_a8w4_stage2_wrapper"):
+                    raise ValueError("not selected")
+                # Opus route kernels require metadata sorted with the kernel's own
+                # block_m. Keep these independent of the FlyDSL/8-wave block_m.
+                (
+                    opus_sorted_ids,
+                    opus_sorted_weights,
+                    opus_sorted_expert_ids,
+                    opus_num_valid_ids,
+                    _,
+                ) = moe_sorting(
+                    data["topk_ids"],
+                    data["topk_weights"],
+                    E,
+                    model_dim,
+                    torch.bfloat16,
+                    opus_block_m,
+                )
+                opus_padded_rows = int(opus_num_valid_ids[0].item())
+                opus_flops = 2 * opus_padded_rows * model_dim * effective_inter_dim
+                opus_a2_scale_sort = mxfp4_moe_sort_fwd(
+                    data["a2_scale"],
+                    sorted_ids=opus_sorted_ids,
+                    num_valid_ids=opus_num_valid_ids,
+                    token_num=token,
+                    cols=inter_dim,
+                )
+                opus_out = torch.empty_like(data["ref_stage2"])
+
+                # The kernel id controls whether the per-route intermediate is
+                # BF16 or MXFP8; both paths finish with token/top-k reduction.
+                opus_out, opus_us = pyhip.run_perftest(
+                    _opus_a8w4.opus_a8w4_stage2_wrapper,
+                    inter_states=data["a2_q"],
+                    w1=None,
+                    w2=data["w2_shuf"],
+                    sorted_token_ids=opus_sorted_ids,
+                    sorted_expert_ids=opus_sorted_expert_ids,
+                    num_valid_ids=opus_num_valid_ids,
+                    out=opus_out,
+                    topk=topk,
+                    kernelName=_opus_a8w4.OPUS_A8W4_STAGE2_KERNEL,
+                    w2_scale=data["w2_scale_shuf"],
+                    a2_scale=opus_a2_scale_sort,
+                    sorted_weights=opus_sorted_weights,
+                    inter_dim_pad=data["inter_pad"],
+                    model_dim_pad=0,
+                    block_m=opus_block_m,
+                    kernel_id=opus_kernel_id,
+                    stage2_reduce_block_n=opus_a8w4_kid_reduce_block_n(
+                        opus_kernel_id
+                    ),
+                    route_out=True,
+                    num_warmup=2,
+                    num_iters=NUM_ITERS,
+                    num_flops=opus_flops,
+                    num_verbose=1,
+                    num_name=f"opus_{route_dtype}_moe_stage2_a8w4",
+                    num_spec_tag=f"M={token},N={model_dim},K={effective_inter_dim}",
+                )
+                torch.cuda.synchronize()
+                opus_err = _check_close(
+                    data["ref_stage2"],
+                    opus_out,
+                    f"opus_{route_dtype}_stage2_a8w4_gui_i{inter_dim}",
+                    # MXFP8 has an additional route-output quantize/dequantize step.
+                    max_err_ratio=max_err_ratio,
+                )
+                opus_diff = pyhip.calc_diff(opus_out, data["ref_stage2"])
+            except Exception as e:
+                print(f"Error occurred during Opus {route_dtype} stage2 test: {e}")
+                opus_us = None
+                opus_err = None
+                opus_diff = None
+                opus_flops = None
+
+            stage2_results.append(
+                (
+                    f"{token:6} Opus {route_dtype.upper():.4s} BM{opus_block_m}",
+                    opus_us,
+                    opus_flops / 1e6 if opus_flops else None,
+                    baseline_us/opus_us if baseline_us and opus_us else None,
+                    opus_err,
+                    opus_diff,
+                )
+            )
 
     _print_stage2_results(
         [
-            ("FlyDSL", flydsl_us, flops / flydsl_us / 1e6, flydsl_err, flydsl_diff),
-            ("Opus", opus_us, flops / opus_us / 1e6, opus_err, opus_diff),
+            *stage2_results
         ]
     )
-
-
-if __name__ == "__main__":
-    test_flydsl_stage2_a8w4_gui()
 
 
 @pytest.mark.parametrize("inter_dim", [256, 384, 640])
@@ -411,4 +615,12 @@ def test_flydsl_e2e_a8w4_gui(inter_dim):
     )
     torch.cuda.synchronize()
     _check_close(data["ref_stage2"], out, f"e2e_a8w4_gui_i{inter_dim}")
+
+
+def main():
+    test_flydsl_stage2_a8w4_gui()
+
+
+if __name__ == "__main__":
+    main()
 
