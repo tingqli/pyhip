@@ -1,90 +1,259 @@
 # PyHIP A8W4 MoE Roofline Results
 
-## 2026-09-12 Native A-scale follow-up
+## 2026-09-14 Current SwiGLU ATT and Performance
 
-The [paired-row DS64 expanded regression report](../../native_scale_perf_20260912/expanded_paired_rows/README.md)
-covers 25 configurations, two complete six-round paired batches, and 25/25
-independent reference-accuracy passes. Pooled kernel latency changes have a
-median of +0.55%, with 24/25 configurations <=1%; worst pooled +1.14%, worst
-single-batch median +1.39%. These are **kernel-only paired comparisons**, not an
-end-to-end speedup or an all-shape <=1% guarantee. The exact tested snapshot is
-identified in the linked report; the later live experimental kernel is different.
-The historical roofline/PMC/ATT results below have not been replaced or reprofiled.
+**Activation: SiLU(gate) × up, without clamping.** All new tables in this section use the same frozen source, including the user-added epilogue wait/barrier before consuming the final up operands.
+Kernel SHA256: `477a7ce297519d6a3ebaa4b25eb45d9f0f205732280c6b1b78caf30a62bf9f2e`.
+Driver SHA256: `fa4e2de725d94e718f8e2d8ca40d8b34c3e831f71acadd7c9726312255898c97`.
 
-All event timings are minimums from the unprofiled rotating-clone run. PMC columns are medians of isolated profiled dispatches.
+- Common shape: intermediate=256 (gate_up=512), K=6144, topk=8, experts=384; GPU6.
+- AIter: tile M128/N256/K256, act=silu, swiglu_limit=None, XCD8. PyHIP: four waves, sort block M256, XCD enabled/groupM4. Native A/B scale layouts retained.
+- Kernel source differs from the earlier 695be7... snapshot below. T24576 was recaptured alongside T12288 and T49152; previous ATT and performance results are not relabeled as current.
 
-- Shape: gate_up=512, K=6144, topk=8, experts=384
-- Practical ceilings used: 5000 GB/s HBM, 3500 TFLOP/s A8W4 matrix
-- Ridge point: 700.0 FLOP/byte
-- Saturation threshold: 70%
-- HBM % = profiled HBM GB/s / practical HBM ceiling
-- Compute % = profiled padded TFLOP/s / practical A8W4 ceiling
-- HBM bytes = 32 * (DRAM read 32B equivalents + normal-write 32B equivalents + atomic-write 32B equivalents)
-- Padded FLOPs = 2 * padded_tokens * gate_up_size * hidden_size
+### ATT Phase Breakdown: T12288 / T24576 / T49152
 
-## PyHIP Roofline Summary
+Scope: target CU1 on SE0–SE3 (four physical CUs), all four SIMDs, two dispatches per shape, warmup3/clones20. Six dispatches and24 raw SE traces contain **672 complete waves**:96/192/384 for T12288/T24576/T49152. No trace-loss warning was reported; all three capture output checks have max_abs=0 against AIter.
+Phase boundaries: wave.begin → first mainloop entry → first epilogue entry → wave.end. Every wave passed23-iteration validation, all128 static mainloop MFMA indices exactly once per iteration, dynamic MFMA counts0/2944/128, and num_insts==num_stitched==instruction-list length. Phase cycles sum exactly to each wave lifetime.
+Time share = summed phase cycles / summed whole-wave cycles. Mean cycles use equal wave weights within each shape; shapes are not pooled. The epilogue includes two-K-tile drain, SwiGLU, packing and stores.
 
-| M | Padded rows | Pad | Event us | Padded TF/s | HBM GB/s | HBM % | Compute % | AI F/B | MFMA % | Wait % | Roof | Observed |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|
-| 8192 | 98304 | 1.500 | 227.482 | 2718.79 | 4016.05 | 80.3 | 67.9 | 592.0 | 66.1 | 12.4 | memory | memory-bandwidth |
-| 12288 | 98304 | 1.000 | 249.762 | 2476.26 | 4779.99 | 95.6 | 68.2 | 499.0 | 61.0 | 13.2 | memory | memory-bandwidth |
-| 16384 | 196608 | 1.500 | 423.924 | 2917.86 | 2681.33 | 53.6 | 63.0 | 823.0 | 68.5 | 12.1 | compute | issue/sync/occupancy |
-| 24576 | 196608 | 1.000 | 468.605 | 2639.64 | 3272.17 | 65.4 | 60.3 | 645.4 | 65.8 | 12.1 | memory | memory-side-unsaturated |
-| 32768 | 294912 | 1.125 | 670.247 | 2768.27 | 3454.42 | 69.1 | 74.2 | 750.7 | 68.2 | 12.1 | compute | compute |
-| 49152 | 393216 | 1.000 | 925.329 | 2673.54 | 3195.08 | 63.9 | 68.4 | 749.4 | 68.8 | 12.2 | compute | issue/sync/occupancy |
-| 65536 | 589824 | 1.125 | 1320.013 | 2811.22 | 2969.78 | 59.4 | 71.9 | 847.8 | 69.8 | 12.0 | compute | compute |
+| Tokens | Valid waves | Phase | MFMA/wave | Theoretical MFMA cycles | Mean cycles/wave | Time share | Theoretical MFMA efficiency |
+|---:|---:|:---|---:|---:|---:|---:|---:|
+| 12288 | 96 | Prologue | 0 | 0 | 10122.917 | 7.085% | N/A |
+| 12288 | 96 | Mainloop | 2944 | 94208 | 121625.750 | 85.124% | 77.457282% |
+| 12288 | 96 | Epilogue | 128 | 4096 | 11132.583 | 7.791% | 36.792898% |
+| 12288 | 96 | Whole wave | 3072 | 98304 | 142881.250 | 100.000% | 68.801190% |
+| 24576 | 192 | Prologue | 0 | 0 | 9272.896 | 7.358% | N/A |
+| 24576 | 192 | Mainloop | 2944 | 94208 | 105623.542 | 83.807% | 89.192237% |
+| 24576 | 192 | Epilogue | 128 | 4096 | 11135.375 | 8.835% | 36.783674% |
+| 24576 | 192 | Whole wave | 3072 | 98304 | 126031.812 | 100.000% | 77.999354% |
+| 49152 | 384 | Prologue | 0 | 0 | 8586.396 | 6.568% | N/A |
+| 49152 | 384 | Mainloop | 2944 | 94208 | 110975.031 | 84.889% | 84.891168% |
+| 49152 | 384 | Epilogue | 128 | 4096 | 11168.312 | 8.543% | 36.675192% |
+| 49152 | 384 | Whole wave | 3072 | 98304 | 130729.740 | 100.000% | 75.196356% |
 
-## AIter Roofline Summary
+Theoretical MFMA efficiency = theoretical MFMA cycles / phase elapsed cycles; it is **not** the dispatch-level PMC MfmaUtil counter or additive instruction issue/stall share. Full-device occupancy and HBM bandwidth cannot be inferred from these sampled waves.
 
-| Tokens | Padded rows | AI F/B | HBM GB/s | Event padded TF/s | Profile padded TF/s | Compute % | Bound |
-|---:|---:|---:|---:|---:|---:|---:|:---|
-| 8192 | 98304 | 576.5 | 3671.16 | 2445.70 | 2116.59 | 60.5 | memory-bandwidth |
-| 12288 | 98304 | 483.9 | 4038.40 | 2251.93 | 1953.72 | 55.8 | memory-bandwidth |
-| 16384 | 147456 | 581.9 | 3130.45 | 2358.89 | 1821.60 | 52.0 | memory-side-unsaturated |
-| 24576 | 196608 | 629.2 | 3229.61 | 2359.85 | 2032.17 | 58.1 | memory-side-unsaturated |
-| 32768 | 294912 | 717.3 | 2930.08 | 2432.75 | 2101.73 | 60.0 | issue/sync/occupancy |
-| 49152 | 393216 | 740.9 | 2811.16 | 2386.07 | 2077.35 | 59.4 | issue/sync/occupancy |
-| 65536 | 540672 | 731.2 | 2862.90 | 2418.37 | 2094.57 | 59.8 | issue/sync/occupancy |
+#### ATT Per-dispatch Variability
 
-## PyHIP vs AIter MoE Throughput
+| Tokens | Dispatch | Waves | Prologue share | Mainloop share | Epilogue share | Whole-wave cycles |
+|---:|:---|---:|---:|---:|---:|---:|
+| 12288 | 434 | 48 | 7.207% | 84.963% | 7.831% | 142103.000 |
+| 12288 | 440 | 48 | 6.964% | 85.283% | 7.753% | 143659.500 |
+| 24576 | 437 | 96 | 7.393% | 83.899% | 8.708% | 127869.458 |
+| 24576 | 443 | 96 | 7.321% | 83.713% | 8.966% | 124194.167 |
+| 49152 | 437 | 192 | 6.385% | 85.240% | 8.375% | 133548.792 |
+| 49152 | 443 | 192 | 6.759% | 84.522% | 8.719% | 127910.688 |
 
-Both ratios are PyHIP / AIter. Effective throughput uses routed tokens; padded throughput includes rows executed by the MFMA pipe.
-Effective compute % = routed rows / padded rows; it measures padding efficiency, not hardware compute utilization.
+### SwiGLU Performance Method
 
-### Throughput
+Unprofiled Event benchmark after ATT completed: three full seven-shape runs of the frozen test_moe driver, seed0,5warmups,20samples,20rotating clones; original token order8192,16384,32768,65536,12288,24576,49152. Each shape runs AIter then PyHIP, not alternating paired order. GPU6 idle was checked before the sequence; exclusive access is not guaranteed.
+Each reported latency is the **median of three per-run minima**, not the global minimum or the median of all60 samples. Throughputs are recomputed from that latency. All21/21 checks passed with max_abs=0 and finite outputs; source hashes matched before/after.
+Routed rows=tokens×topk. Effective FLOPs=2×routed_rows×gate_up×K; padded FLOPs replace routed_rows with the implementation’s executed padded rows. Throughput counts GEMM FLOPs, not activation operations. Both throughput ratios below are **PyHIP/AIter**.
+
+###  Throughput data PYHIIP and AITER
 
 | Tokens | AIter effective TF/s | PyHIP effective TF/s | AIter padded TF/s | PyHIP padded TF/s |
 |---:|---:|---:|---:|---:|
-| 8192 | 1630.47 | 1812.53 | 2445.70 | 2718.79 |
-| 12288 | 2251.93 | 2476.26 | 2251.93 | 2476.26 |
-| 16384 | 2096.79 | 1945.24 | 2358.89 | 2917.86 |
-| 24576 | 2359.85 | 2639.64 | 2359.85 | 2639.64 |
-| 32768 | 2162.44 | 2460.69 | 2432.75 | 2768.27 |
-| 49152 | 2386.07 | 2673.54 | 2386.07 | 2673.54 |
-| 65536 | 2345.08 | 2498.87 | 2418.37 | 2811.22 |
+| 8192 | 1614.38 | 1963.77 | 2421.57 | 2945.65 |
+| 12288 | 2256.20 | 2671.81 | 2256.20 | 2671.81 |
+| 16384 | 2096.15 | 2119.43 | 2358.17 | 3179.14 |
+| 24576 | 2353.74 | 2822.77 | 2353.74 | 2822.77 |
+| 32768 | 2174.19 | 2652.38 | 2445.96 | 2983.93 |
+| 49152 | 2394.20 | 2911.95 | 2394.20 | 2911.95 |
+| 65536 | 2305.87 | 2676.75 | 2377.93 | 3011.34 |
 
-### Ratios And Padding Efficiency
+### Throughput Ratios(pyhip/aiter) And Padding Efficiency
+
+Effective compute % below means routed_rows/padded_rows, i.e. **padding efficiency**, not hardware utilization.
 
 | Tokens | AIter padded rows | PyHIP padded rows | AIter effective compute % | PyHIP effective compute % | Effective tput ratio | Padded tput ratio |
 |---:|---:|---:|---:|---:|---:|---:|
-| 8192 | 98304 | 98304 | 66.7 | 66.7 | 1.112 | 1.112 |
-| 12288 | 98304 | 98304 | 100.0 | 100.0 | 1.100 | 1.100 |
-| 16384 | 147456 | 196608 | 88.9 | 66.7 | 0.928 | 1.237 |
-| 24576 | 196608 | 196608 | 100.0 | 100.0 | 1.119 | 1.119 |
-| 32768 | 294912 | 294912 | 88.9 | 88.9 | 1.138 | 1.138 |
-| 49152 | 393216 | 393216 | 100.0 | 100.0 | 1.120 | 1.120 |
-| 65536 | 540672 | 589824 | 97.0 | 88.9 | 1.066 | 1.162 |
+| 8192 | 98304 | 98304 | 66.7 | 66.7 | 1.216 | 1.216 |
+| 12288 | 98304 | 98304 | 100.0 | 100.0 | 1.184 | 1.184 |
+| 16384 | 147456 | 196608 | 88.9 | 66.7 | 1.011 | 1.348 |
+| 24576 | 196608 | 196608 | 100.0 | 100.0 | 1.199 | 1.199 |
+| 32768 | 294912 | 294912 | 88.9 | 88.9 | 1.220 | 1.220 |
+| 49152 | 393216 | 393216 | 100.0 | 100.0 | 1.216 | 1.216 |
+| 65536 | 540672 | 589824 | 97.0 | 88.9 | 1.161 | 1.266 |
 
-### Token-Weighted Summary
 
-Weighted mean = sum(tokens * metric) / sum(tokens). Ratios are PyHIP / AIter; for latency, values below 1 are better.
+### SwiGLU PyHIP MoE vs Equal-padded Single-expert GEMM (2026-09-14)
 
-| Metric | AIter weighted mean | PyHIP weighted mean | PyHIP/AIter |
-|:---|---:|---:|---:|
-| Event latency (us) | 923.456 | 848.975 | 0.919 |
-| Effective TF/s | 2274.84 | 2478.87 | 1.090 |
-| Padded TF/s | 2392.76 | 2736.94 | 1.144 |
-| HBM GB/s | 3026.23 | 3259.28 | 1.077 |
+Both workloads use the same unmodified, source-frozen **test_moe.py** driver and the PyHIP result from that driver. MoE: topk=8, experts=384; GEMM: topk=1, experts=1, tokens set to the MoE **actual PyHIP padded rows**. This is the single-expert fused gate/up SwiGLU path, not a different standalone dense-GEMM implementation.
+Common settings: GPU6, gate_up=512 (intermediate=256), K=6144, XCD enabled/groupM4, seed0,5 warmups,20 rotating clones,20 Event samples. **No profiler or PMC counters.** Input preparation, quantization and routing are outside the timed kernel.
+Three rounds per pair, alternating MoE/GEMM order by pair and round. Each invocation retains the driver’s AIter check and AIter-then-PyHIP measurement order; only **PyHIP padded TF/s** is compared below. Each reported latency is the median of three per-run minima. Repeated matched GEMM sizes are rerun for each pair, not reused from another row.
+Kernel SHA256: `477a7ce297519d6a3ebaa4b25eb45d9f0f205732280c6b1b78caf30a62bf9f2e`. Driver SHA256: `fa4e2de725d94e718f8e2d8ca40d8b34c3e831f71acadd7c9726312255898c97`.
+Validation: **42/42 invocations passed**, with matched actual padded rows and unchanged live/source snapshots. Every workload passed the driver’s AIter/PyHIP finite-output and closeness checks; all max_abs values zero: **True**. MoE and single-expert GEMM outputs are not compared to each other, since their inputs/weights differ.
+
+Padded FLOPs = 2 × padded_M × 512 × 6144. Padded TF/s = padded_FLOPs / (latency_us × 10^6). Ratio below is **MoE padded TF/s / GEMM padded TF/s**; >1 means higher measured MoE throughput.
+
+| MoE tokens | Matched GEMM tokens / padded M | MoE padded TF/s | GEMM padded TF/s | MoE/GEMM tput ratio |
+|---:|---:|---:|---:|---:|
+| 8192 | 98304 | 2926.14 | 2766.46 | 1.058 |
+| 12288 | 98304 | 2650.75 | 2779.39 | 0.954 |
+| 16384 | 196608 | 3143.59 | 2832.34 | 1.110 |
+| 24576 | 196608 | 2815.32 | 2837.01 | 0.992 |
+| 32768 | 294912 | 2998.20 | 2869.48 | 1.045 |
+| 49152 | 393216 | 2875.53 | 2875.53 | 1.000 |
+| 65536 | 589824 | 3043.95 | 2877.85 | 1.058 |
+
+gemm的tput 使用 expert = 1, topk=1 moe kernel 模拟的。
+12288低于gemm的原因是每个expert只能分到256 tokens, B 完全没有办法复用。 24576每个expert可以分到512个tokens就已经基本相同。
+8192, 16384, 32768, 65536， MOE 反而比 gemm高的原因是对于sortte table里面的padding token, MOE 输入buffer load是不会又Vmem load,而且MFMA是A的寄存器输入时0， 所以MFMA 效率反而比padded等效token要高。
+
+#### Repeat evidence for the equal-padded comparison
+
+| MoE tokens | MoE median-min µs | GEMM median-min µs | MoE run-min range µs | GEMM run-min range µs |
+|---:|---:|---:|:---|:---|
+| 8192 | 211.362 | 223.562 | 209.202–212.482 | 222.362–224.082 |
+| 12288 | 233.321 | 222.522 | 232.962–237.562 | 222.282–222.722 |
+| 16384 | 393.483 | 436.724 | 393.123–393.604 | 433.804–437.405 |
+| 24576 | 439.364 | 436.005 | 437.364–440.564 | 435.964–436.404 |
+| 32768 | 618.846 | 646.606 | 618.325–618.966 | 643.366–648.446 |
+| 49152 | 860.328 | 860.328 | 860.048–865.688 | 856.528–862.648 |
+| 65536 | 1219.090 | 1289.451 | 1215.411–1221.651 | 1280.572–1292.251 |
+
+The ranges are three observed per-run minima, not confidence intervals. GPU6 was checked idle before the sequence; exclusive device access is not guaranteed. Historical PMC/dense-GEMM tables are unchanged and are not combined with these Event timings.
+[Summary](../../swiglu_moe_equal_gemm_20260914/summary.json) · [All42 run results and exact commands](../../swiglu_moe_equal_gemm_20260914/results.json) · [Run log](../../swiglu_moe_equal_gemm_20260914/run.log)
+
+### Single-expert Simulated GEMM vs Standalone Scaled A8W4 GEMM (2026-09-14)
+
+Both sides were freshly measured on **GPU0**, not mixed with the GPU6 results above. GPU6 was occupied at preflight and no benchmark ran there for this comparison. No PMC counters or hardware profiler were used.
+- Simulated GEMM: test_moe.py, experts=1, topk=1, tokens=M; use its PyHIP result, not AIter throughput.
+- Standalone GEMM: unmodified test_mxfp8_gemm_4w.py run_test API, with_scale=True, B_MXFP4=True, A LDS padding/B LDS swizzle, preshuffle=False, permlane=True, store_overlap=False. Calling the API selects all M sizes without editing the hardcoded single-shape __main__.
+- Both: N/gate_up=512, K=6144, tile256×256×128 matrix work per block, four waves, XCD8/groupM4; 20 clones,20 warmups,20 Event samples, seed0. Three alternating workload rounds per unique M; report median of three per-run minima.
+- Five unique M sizes cover the seven MoE-token rows. Rows mapping to the same M intentionally share that freshly measured result.
+- Host-only adapter: standalone A is passed as a zero-copy [M,K] view at compilation/launch rather than a flattened shape. Its original flat tensor shape exceeds signed int32 at M393216 and M589824, causing FlyDSL argument packing to fail. The adapter is applied to every M; pointer, bytes, scale tensors and original kernel source are unchanged. No source change to the standalone or simulated kernel.
+
+**Scale contract:** both use one E8M0 scale per32 K elements, but different physical layouts. Simulated uses native AIter routed A and gate/up-interleaved B scales; standalone uses its legacy K-group-major scale permutation. Each uses its own preparation outside timing; neither scale preparation nor format conversion is timed.
+**Other differences:** simulated includes SwiGLU and writes M×256 BF16, whereas standalone is linear and writes M×512 BF16. The original test APIs also generate different input distributions/clone contents. Matrix work2×M×512×6144 matches, but this is not identical-output or scale-layout-only A/B.
+
+| Original MoE tokens | GEMM M | Simulated GEMM padded TF/s | Standalone A8W4 TF/s | Simulated/standalone tput |
+|---:|---:|---:|---:|---:|
+| 8192 | 98304 | 2851.14 | 2707.36 | 1.053 |
+| 12288 | 98304 | 2851.14 | 2707.36 | 1.053 |
+| 16384 | 196608 | 2935.04 | 2772.66 | 1.059 |
+| 24576 | 196608 | 2935.04 | 2772.66 | 1.059 |
+| 32768 | 294912 | 2968.46 | 2790.93 | 1.064 |
+| 49152 | 393216 | 2980.58 | 2835.33 | 1.051 |
+| 65536 | 589824 | 2991.54 | 2838.32 | 1.054 |
+
+Ratio is simulated/standalone; >1 means greater measured simulated-GEMM throughput. Both throughput numerators count matrix FLOPs only, not activation operations.
+
+#### Repeat evidence: simulated versus standalone
+
+| M | Simulated median-min µs | Standalone median-min µs | Simulated run-min range µs | Standalone run-min range µs |
+|---:|---:|---:|:---|:---|
+| 98304 | 216.922 | 228.442 | 215.362–217.522 | 227.722–228.722 |
+| 196608 | 421.443 | 446.124 | 421.163–422.484 | 445.964–447.284 |
+| 294912 | 625.046 | 664.805 | 624.405–627.006 | 664.566–665.166 |
+| 393216 | 830.007 | 872.527 | 828.007–830.647 | 870.608–880.768 |
+| 589824 | 1240.450 | 1307.410 | 1240.131–1240.851 | 1305.091–1327.172 |
+
+Validation: 30/30 runs completed. Simulated runs passed the original AIter/PyHIP output check. All15 standalone runs passed the original calc_diff≤1e-5 check; strict elementwise allclose failed in 0/15 standalone runs (reported separately, not hidden). No cross-implementation output equality is asserted because epilogues differ.
+All three source snapshots matched live hashes before/after measurement. Standalone timing samples are captured at host run_test return using sys.setprofile; GPU timing remains its existing cudaPerf Events. This is not rocprofiler/ATT/PMC. Ranges are observed per-run minima, not confidence intervals; idle preflight is not exclusive GPU ownership.
+
+Source SHA256:
+- [test_moe.py](../../simulated_vs_dense_a8w4_20260914/matrix_a_view/data/test_moe.py): `fa4e2de725d94e718f8e2d8ca40d8b34c3e831f71acadd7c9726312255898c97`
+- [test_moe_mxfp8_mxfp4_gateup_4w.py](../../simulated_vs_dense_a8w4_20260914/matrix_a_view/data/test_moe_mxfp8_mxfp4_gateup_4w.py): `477a7ce297519d6a3ebaa4b25eb45d9f0f205732280c6b1b78caf30a62bf9f2e`
+- [test_mxfp8_gemm_4w.py](../../simulated_vs_dense_a8w4_20260914/matrix_a_view/data/test_mxfp8_gemm_4w.py): `61502281047dff30a9a744a1d2bb19751e4d36cb92e95b6a7171964f3aa94a56`
+
+[Summary](../../simulated_vs_dense_a8w4_20260914/matrix_a_view/summary.json) · [Raw results and commands](../../simulated_vs_dense_a8w4_20260914/matrix_a_view/results.json)
+
+### Current SwiGLU Artifacts
+
+- [ATT capture/phase summary](../../swiglu_phase_sweep_20260914/summary.json)
+- [Performance summary and all per-run results](../../swiglu_phase_sweep_20260914/performance/summary.json)
+- [Unprofiled run0](../../swiglu_phase_sweep_20260914/performance/run_0.log), [run1](../../swiglu_phase_sweep_20260914/performance/run_1.log), [run2](../../swiglu_phase_sweep_20260914/performance/run_2.log)
+- Per-wave phase data: [T12288](../../swiglu_phase_sweep_20260914/tokens12288/phases.json), [T24576](../../swiglu_phase_sweep_20260914/tokens24576/phases.json), [T49152](../../swiglu_phase_sweep_20260914/tokens49152/phases.json)
+- [Frozen current kernel](../../swiglu_phase_sweep_20260914/snapshot/test_moe_mxfp8_mxfp4_gateup_4w.py)
+
+## User-supplied MoE and GEMM ATT
+
+These statistics use the user-provided captures, **not** the GPU6/CU1 sweep
+above. No kernels were rerun. The GEMM command uses tokens=24576, topk=1,
+experts=1, gate_up=512, K=6144: it is the single-expert fused gate/up path,
+with 24576 routed rows, not a matched-workload 196608-row dense run.
+
+### User GEMM Phase Breakdown
+
+Dispatches 418 and 420 each contain four complete decoded waves, all on
+SE0/CU0: **8 waves total**. Raw trace files exist for SE0–3, but no wave
+JSON was present for SE1–3; the statistics do not fabricate missing samples.
+
+| Phase | MFMA/wave | Theoretical MFMA cycles | Mean cycles/wave | Time share | Theoretical MFMA efficiency |
+|:---|---:|---:|---:|---:|---:|
+| Prologue | 0 | 0 | 9653.000 | 6.853% | N/A |
+| Mainloop | 2944 | 94208 | 119973.500 | 85.174% | 78.524007% |
+| Epilogue | 128 | 4096 | 11231.000 | 7.973% | 36.470483% |
+| Whole wave | 3072 | 98304 | 140857.500 | 100.000% | 69.789681% |
+
+Mainloop cycles/iteration = 119973.5 / 23 = **5216.239130**;
+efficiency = 4096 / 5216.239130 = **78.524007%**. Individual dispatch
+efficiencies are **81.065639% / 76.136905%**. This is a small sample with
+visible variation, not a whole-device MFMA busy measurement.
+
+### Why this differs from the preceding captures
+
+The supplied MoE has 432 complete waves on CU0 across 18 decoded SEs:
+mainloop efficiency **85.095088%**, or **84.007713%** when restricted to
+its SE0–3 samples. The earlier agent result **89.192237%** uses CU1 on
+SE0–3 and two other dispatches. The physical GPU ordinal and capture-time
+source hash are not established from the user-provided wave files.
+
+**The user MoE, user GEMM and preceding agent captures have exactly the same
+mainloop disassembly, including operands.** The mainloop efficiency formula
+is also the same. These observations do not establish a SwiGLU-caused
+mainloop regression: CU/SE selection, dispatches and workload are not
+controlled A/B samples. The exact cause of the measured cycle differences
+has not been isolated.
+
+All provided waves passed stitching, 23-iteration/backedge/MFMA-index and
+phase-duration-sum validation. A capture log was not supplied, so this is not
+a claim of independently verified absence of raw packet loss.
+Details: [user capture analysis and per-SE tables](../../user_att_20260914/REPORT.md),
+[per-wave results and input hashes](../../user_att_20260914/summary.json).
+
+## 2026-09-14 Earlier SwiGLU Snapshot ATT Phase Breakdown
+
+The following 695be7... capture predates the user-added epilogue wait/barrier;
+it is retained as earlier-snapshot data, not the current three-shape sweep.
+
+Current activation is **SiLU(gate) × up, without clamping**. This update uses
+the source-frozen SwiGLU capture for tokens=24576, intermediate=256
+(gate_up=512), K=6144, topk=8, experts=384: GPU6, target CU1 on SE0–SE3,
+all four SIMDs, two dispatches (437/443), **192 complete waves**.
+Kernel SHA256: `695be7a39a2a34bfdc8024fdfa2d8c63109e94c07343d615f9bc4fc001484c89`.
+
+Boundaries are `wave.begin -> first mainloop entry -> first epilogue entry -> wave.end`.
+Every wave passed 23-iteration/MFMA-count validation and the three elapsed
+durations sum exactly to its lifetime. Time share is summed phase cycles divided
+by summed whole-wave cycles; mean cycles give equal weight to each wave.
+The epilogue includes the final two K tiles, activation, packing and stores.
+
+| Phase | MFMA/wave | Theoretical MFMA cycles | Mean cycles/wave | Time share | Theoretical MFMA efficiency |
+|:---|---:|---:|---:|---:|---:|
+| Prologue | 0 | 0 | 9287.292 | 7.388% | N/A |
+| Mainloop | 2944 | 94208 | 105428.708 | 83.867% | 89.357066% |
+| Epilogue | 128 | 4096 | 10993.208 | 8.745% | 37.259368% |
+| Whole wave | 3072 | 98304 | 125709.208 | 100.000% | 78.199522% |
+
+Compared with the preceding same-scope SiTUv2 capture (not the older MoE/GEMM
+tables below), phase shares changed from **6.748% / 75.339% / 17.913%** to
+**7.388% / 83.867% / 8.745%**. Mainloop absolute cycles changed only +0.027%;
+its higher share primarily reflects the epilogue shrinking by 56.133%.
+These are separate captures, not interleaved ATT A/B samples.
+
+Theoretical MFMA efficiency is theoretical MFMA cycles / phase elapsed cycles,
+not the PMC `MfmaUtil` counter or an additive instruction issue/stall share.
+No new matched dense-GEMM capture or PMC roofline run was performed; **all
+older roofline, MoE/GEMM and per-CU tables below remain historical**.
+
+Details: [current phase comparison and per-dispatch shares](../../swiglu_20260914/REPORT.md#att-prologue--mainloop--epilogue-breakdown),
+[SwiGLU ATT report](../../swiglu_att_20260914/REPORT.md), and
+[per-wave phase validation](../../swiglu_att_20260914/phases.json).
+
+## 2026-09-12 Native A-scale follow-up
 
 ## PyHIP MoE vs PyHIP Dense A8W4 GEMM
 
@@ -104,7 +273,12 @@ Dense coverage: 7/7 unique padded-row shapes (complete).
 | 49152 | 393216 | 2673.54 | 2804.59 | 0.953 | 2393.73 | 2680.37 | 0.893 | 1.080 | issue/sync/occupancy | compute |
 | 65536 | 589824 | 2811.22 | 2751.36 | 1.022 | 2517.79 | 2663.06 | 0.945 | 0.955 | compute | compute |
 
-## ATT Mainloop MFMA Efficiency
+## Historical ATT Mainloop MFMA Efficiency
+
+**Historical MoE/GEMM comparison, not the 2026-09-14 SwiGLU sweep or the
+user-supplied captures above.** The cycles and efficiencies below are retained
+from their original captures. The formula is the same; the underlying samples
+are different. No current matched dense-GEMM comparison has replaced this table.
 
 These results are calculated from decoded ATT wave clocks and are distinct from
 the dispatch-level PMC `MFMA %` column above. The measured interval starts at the
@@ -119,10 +293,10 @@ equal weight to every valid decoded wave across the two captured dispatches.
 | MoE tokens | Matched GEMM M | MoE valid waves | MoE cycles/iter | MoE MFMA efficiency | GEMM valid waves | GEMM cycles/iter | GEMM MFMA efficiency | MoE - GEMM |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 12288 | 98304 | 48/48 | 4787.456522 | 85.556913% | 48/48 | 4503.793478 | 90.945556% | -5.388643 pp |
-| 16384 | 196608 | 96/96 | 4292.257246 | 95.427645% | 96/96 | 4517.317029 | 90.673291% | +4.754354 pp |
 | 24576 | 196608 | 96/96 | 4447.780797 | 92.090869% | 96/96 | 4475.617754 | 91.518093% | +0.572777 pp |
-| 32768 | 294912 | 144/144 | 4312.907005 | 94.970747% | 144/144 | 4558.710145 | 89.849977% | +5.120770 pp |
 | 49152 | 393216 | 192/192 | 4375.557065 | 93.610938% | 192/192 | 4421.855072 | 92.630806% | +0.980132 pp |
+| 16384 | 196608 | 96/96 | 4292.257246 | 95.427645% | 96/96 | 4517.317029 | 90.673291% | +4.754354 pp |
+| 32768 | 294912 | 144/144 | 4312.907005 | 94.970747% | 144/144 | 4558.710145 | 89.849977% | +5.120770 pp |
 | 65536 | 589824 | 288/288 | 4337.845411 | 94.424757% | 288/288 | 4448.084541 | 92.084581% | +2.340177 pp |
 
 All 1728 decoded waves passed loop validation: every wave contained all 23
@@ -238,19 +412,4 @@ Across target indices 1-7, the unweighted mean mainloop MFMA efficiency is
 the 23-iteration mainloop, phase-boundary, dynamic-MFMA-count, and duration-sum
 checks; no ATT data-loss warning was reported.
 
-## Quantitative Conclusions
 
-- PyHIP wins effective throughput on 6/7 shapes and padded throughput on 7/7 shapes.
-- Tokens-weighted PyHIP/AIter ratios are 0.919x latency, 1.090x effective TF/s, 1.144x padded TF/s, and 1.077x measured HBM GB/s.
-- The weakest effective result is tokens=16384: 0.928x effective versus 1.237x padded throughput.
-- The largest PyHIP padding-efficiency deficit is tokens=16384: 66.7% versus AIter 88.9%.
-- Observed PyHIP bounds: compute=2, issue/sync/occupancy=2, memory-bandwidth=2, memory-side-unsaturated=1. Observed AIter bounds: issue/sync/occupancy=3, memory-bandwidth=2, memory-side-unsaturated=2.
-- Against same-padded-FLOP dense GEMM, PyHIP MoE wins unprofiled event TF/s on 3/7 shapes; event ratios span 0.916x to 1.047x.
-- Profiled MoE/dense TF/s ratios span 0.775x to 0.965x; these isolated PMC durations are used for roofline classification, while event timings are the primary performance comparison.
-- In the six-shape ATT sweep, MoE mainloop MFMA efficiency is 85.56% to 95.43%, while matched dense-shaped gate/up efficiency is 89.85% to 92.63%. MoE is higher in 5/6 comparisons by 0.57 to 5.12 percentage points and lower for tokens=12288 by 5.39 percentage points.
-
-## Interpretation
-
-`Roof` is the arithmetic-intensity prediction. `Observed` uses HBM and padded-TFLOPS utilization relative to the practical ceilings. The PMC `MFMA %` value is a dispatch-level hardware pipeline diagnostic; ATT mainloop MFMA efficiency measures theoretical MFMA cycles divided by elapsed cycles only inside the decoded mainloop. A low-bandwidth, high-wait result is labeled memory-latency/cache rather than HBM-bandwidth bound. If neither subsystem is saturated, the report does not force a false memory-versus-compute binary classification.
-
-Nominal tensor bytes are intentionally excluded from measured HBM traffic.

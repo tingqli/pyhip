@@ -71,7 +71,7 @@ base/new efficiency comparison.
 GPU6 was idle at each preflight; postflight recorded no GPU-using KFD client.
 No decoder/overflow/incomplete-trace warning was found in the four profile logs.
 All four `run_test` invocations passed their existing diff criterion; scaled
-A8W8 retained the known strict-allclose diagnostic (47outliers in this
+A8W8 retained the known strict-allclose diagnostic (47outliers in thisq
 seed0-per-process run). Runtime JIT cache was disabled and fresh auxiliary
 assembly dumps were captured alongside the traces. The runtime trace's
 decoded `code.json`, not merely scheduling hints, supplies the instruction

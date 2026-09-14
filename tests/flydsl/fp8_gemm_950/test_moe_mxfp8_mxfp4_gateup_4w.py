@@ -1,6 +1,6 @@
-"""Four-wave MXFP8 x MXFP4 MoE gate/up GEMM with SiTUv2.
+"""Four-wave MXFP8 x MXFP4 MoE gate/up GEMM with SwiGLU.
 
-The kernel applies SiTUv2 to the gate and up projections and writes
+The kernel applies SiLU(gate) * up without clamping and writes
 ``[tokens, topk, intermediate_size]``.
 """
 
@@ -26,9 +26,6 @@ SORT_BLOCK_M = 256
 TOKEN_MASK = 0xFFFFFF
 A_INPUT_SCALE = 0.33
 B_INPUT_SCALE = 0.2
-SITU_LIMIT = 7.0
-SITU_BETA = 2.0
-SITU_LINEAR_BETA = 1.5
 
 
 def div_up(value: int, divisor: int) -> int:
@@ -301,11 +298,11 @@ def moe_reference(
         )
         weight_dequant = mxfp4_to_f32(inputs["weight"][expert]) * weight_scale
         projected = a_dequant[token_ids] @ weight_dequant.t()
-        gate = projected[:, :intermediate_size].clamp(max=SITU_LIMIT)
-        up = projected[:, intermediate_size:].clamp(min=-SITU_LIMIT, max=SITU_LIMIT)
-        situ_gate = SITU_BETA * torch.tanh(gate / SITU_BETA) * torch.sigmoid(gate)
-        up_scaled = SITU_LINEAR_BETA * torch.tanh(up / SITU_LINEAR_BETA)
-        reference[token_ids, slot_ids] = (situ_gate * up_scaled).to(torch.bfloat16)
+        gate = projected[:, :intermediate_size]
+        up = projected[:, intermediate_size:]
+        reference[token_ids, slot_ids] = (torch.nn.functional.silu(gate) * up).to(
+            torch.bfloat16
+        )
     return reference
 
 
@@ -379,6 +376,7 @@ def compile_moe_gateup_4w(
     xcd_swizzle: bool = False,
     group_size_m: int = 1,
     scale_first: bool = False,
+    epilogue_overlap: bool = True,
 ):
     """Build four-wave gate/up with data and scale prefetched through ping-pong LDS."""
     block_m = SORT_BLOCK_M // 2
@@ -981,13 +979,15 @@ def compile_moe_gateup_4w(
             scale_b_frag,
             scale_g1: int,
             is_up: bool = False,
+            row_begin: int = 0,
+            row_end: int = 4,
         ):
             c_value = c_frag.load().ir_value()
             b_value = vector.bitcast(T.vec(64, T.i8), b_frag.load().ir_value())
             a_value = vector.bitcast(T.vec(128, T.i8), a_frag.load().ir_value())
             scale_a = Vec(scale_a_frag.load())
             scale_b = Vec(scale_b_frag.load())
-            for m0 in range_constexpr(4):
+            for m0 in range_constexpr(row_begin, row_end):
                 for n0 in range_constexpr(4):
                     c_offset = (m0 * 4 + n0) * 4
                     c_sub = vector.extract_strided_slice(
@@ -1033,28 +1033,9 @@ def compile_moe_gateup_4w(
             )
             return rocdl.rcp(T.f32, 1.0 + exponent)
 
-        def tanh(value):
-            abs_value = value.maximumf(-value)
-            exponent = rocdl.exp2(
-                T.f32,
-                arith._to_raw(abs_value * -2.8853900817779268),
-            )
-            tanh_abs = (1.0 - exponent) * rocdl.rcp(T.f32, 1.0 + exponent)
-            return (value > fx.Float32(0.0)).select(tanh_abs, -tanh_abs)
-
-        def situlv2(gate, up):
-            neg_limit = fx.Float32(-SITU_LIMIT)
-            gate = -((-gate).maximumf(neg_limit))
-            up = (-((-up).maximumf(neg_limit))).maximumf(neg_limit)
-            situ_gate = (
-                fx.Float32(SITU_BETA)
-                * tanh(gate * fx.Float32(1.0 / SITU_BETA))
-                * sigmoid(gate)
-            )
-            up_scaled = fx.Float32(SITU_LINEAR_BETA) * tanh(
-                up * fx.Float32(1.0 / SITU_LINEAR_BETA)
-            )
-            return situ_gate * up_scaled
+        def silu_mul(gate, up):
+            # MiMo-V2.5 expert SwiGLU: no SiTUv2 transforms or clamp.
+            return (gate * sigmoid(gate)) * up
 
         c_layout_tile = fx.make_rmem_tensor(
             fx.make_ordered_layout((block_n, block_m), (1, 0)), Float32
@@ -1389,6 +1370,7 @@ def compile_moe_gateup_4w(
         # Drain the last two K tiles with the same compute scheduler, no VMEM.
         # As in the mainloop, seed each region with independent next-operand
         # reads before GEMM so LLVM can interleave them without scale anti-deps.
+        ######### epilogue 0:
         waitvmcnt_barrier(wait_ab)
         load_a(a_bottom_source[0], frag_a_bottom_dest)
         load_a_scale(scale_a_bottom_source[0], scale_a_bottom_frag)
@@ -1446,63 +1428,48 @@ def compile_moe_gateup_4w(
         )
         _schedule_compute(3, a_dsrd + 1, 0)
         rocdl.sched_barrier(0)
-
+        ######### epilogue 1:
         waitvmcnt_barrier(b_phase_vmem)
         load_a(a_bottom_source[1], frag_a_bottom_dest)
         load_a_scale(scale_a_bottom_source[1], scale_a_bottom_frag)
-        do_gemm(
-            frag_c_tl,
-            frag_b_gate,
-            frag_a_top,
-            scale_a_top_frag,
-            scale_b_gate_frag,
-            1,
-        )
-        _schedule_compute(4, a_dsrd + 1, 0)
+        if const_expr(not epilogue_overlap):
+            do_gemm(
+                frag_c_tl,
+                frag_b_gate,
+                frag_a_top,
+                scale_a_top_frag,
+                scale_b_gate_frag,
+                1,
+            )
+            _schedule_compute(4, a_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         waitvmcnt_barrier(0)
         load_b(b_up_read[1], frag_b_up)
         load_scale(scale_b_up_source[1], scale_b_up_frag)
-        do_gemm(
-            frag_c_bl,
-            frag_b_gate,
-            frag_a_bottom,
-            scale_a_bottom_frag,
-            scale_b_gate_frag,
-            1,
-        )
-        _schedule_compute(5, b_dsrd + 1, 0)
-        rocdl.sched_barrier(0)
-
-        do_gemm(
-            frag_c_tr,
-            frag_b_up,
-            frag_a_top,
-            scale_a_top_frag,
-            scale_b_up_frag,
-            1,
-            True,
-        )
-        _schedule_compute(6, 0, 0)
-        rocdl.sched_barrier(0)
-        do_gemm(
-            frag_c_br,
-            frag_b_up,
-            frag_a_bottom,
-            scale_a_bottom_frag,
-            scale_b_up_frag,
-            1,
-            True,
-        )
-        _schedule_compute(7, 0, 0)
+        if const_expr(not epilogue_overlap):
+            do_gemm(
+                frag_c_bl,
+                frag_b_gate,
+                frag_a_bottom,
+                scale_a_bottom_frag,
+                scale_b_gate_frag,
+                1,
+            )
+            _schedule_compute(5, b_dsrd + 1, 0)
         rocdl.sched_barrier(0)
 
         lane_group = lane_id // 16
         wave_n = wave_id % 2
 
-        def store_gateup(gate_frag, up_frag, row_quadrant: int):
-            for row_repeat in range_constexpr(4):
+        def store_gateup(
+            gate_frag,
+            up_frag,
+            row_quadrant: int,
+            row_begin: int = 0,
+            row_end: int = 4,
+        ):
+            for row_repeat in range_constexpr(row_begin, row_end):
                 sorted_row, fused_id = store_row_ids[row_quadrant * 4 + row_repeat]
                 token_id = arith.andi(fused_id, mask24)
                 slot_id = arith.shrui(fused_id, arith.constant(24, type=T.i32))
@@ -1528,7 +1495,7 @@ def compile_moe_gateup_4w(
                 ]
                 for repeat_pair in range_constexpr(2):
                     acc = [
-                        situlv2(
+                        silu_mul(
                             gates[repeat_pair * 2 + j][index],
                             ups[repeat_pair * 2 + j][index],
                         )
@@ -1559,8 +1526,114 @@ def compile_moe_gateup_4w(
                         mask=store_valid,
                     )
 
-        store_gateup(frag_c_tl, frag_c_tr, 0)
-        store_gateup(frag_c_bl, frag_c_br, 1)
+        if const_expr(epilogue_overlap):
+            # All G2S are finished. Complete one row repeat's final gate/up
+            # projections, then release its accumulators through
+            # activation/packing/stores while later repeats still have MFMA.
+            do_gemm(
+                frag_c_tl,
+                frag_b_gate,
+                frag_a_top,
+                scale_a_top_frag,
+                scale_b_gate_frag,
+                1,
+                False,
+                0,
+                1,
+            )
+            # wait for b_up lds read complete
+            waitvmcnt_barrier(0)
+            do_gemm(
+                frag_c_tr,
+                frag_b_up,
+                frag_a_top,
+                scale_a_top_frag,
+                scale_b_up_frag,
+                1,
+                True,
+                0,
+                1,
+            )
+            rocdl.sched_barrier(0)
+            for row_repeat in range_constexpr(4):
+                do_gemm(
+                    frag_c_bl,
+                    frag_b_gate,
+                    frag_a_bottom,
+                    scale_a_bottom_frag,
+                    scale_b_gate_frag,
+                    1,
+                    False,
+                    row_repeat,
+                    row_repeat + 1,
+                )
+                do_gemm(
+                    frag_c_br,
+                    frag_b_up,
+                    frag_a_bottom,
+                    scale_a_bottom_frag,
+                    scale_b_up_frag,
+                    1,
+                    True,
+                    row_repeat,
+                    row_repeat + 1,
+                )
+                store_gateup(frag_c_tl, frag_c_tr, 0, row_repeat, row_repeat + 1)
+                rocdl.sched_barrier(0)
+                if const_expr(row_repeat < 3):
+                    do_gemm(
+                        frag_c_tl,
+                        frag_b_gate,
+                        frag_a_top,
+                        scale_a_top_frag,
+                        scale_b_gate_frag,
+                        1,
+                        False,
+                        row_repeat + 1,
+                        row_repeat + 2,
+                    )
+                    do_gemm(
+                        frag_c_tr,
+                        frag_b_up,
+                        frag_a_top,
+                        scale_a_top_frag,
+                        scale_b_up_frag,
+                        1,
+                        True,
+                        row_repeat + 1,
+                        row_repeat + 2,
+                    )
+                store_gateup(frag_c_bl, frag_c_br, 1, row_repeat, row_repeat + 1)
+                # Compiler boundary only: do not hoist every remaining MFMA
+                # above the first stores. Hardware stores remain asynchronous.
+                rocdl.sched_barrier(0)
+        else:
+            # wait for b_up lds read complete
+            waitvmcnt_barrier(0)
+            do_gemm(
+                frag_c_tr,
+                frag_b_up,
+                frag_a_top,
+                scale_a_top_frag,
+                scale_b_up_frag,
+                1,
+                True,
+            )
+            _schedule_compute(6, 0, 0)
+            rocdl.sched_barrier(0)
+            do_gemm(
+                frag_c_br,
+                frag_b_up,
+                frag_a_bottom,
+                scale_a_bottom_frag,
+                scale_b_up_frag,
+                1,
+                True,
+            )
+            _schedule_compute(7, 0, 0)
+            rocdl.sched_barrier(0)
+            store_gateup(frag_c_tl, frag_c_tr, 0)
+            store_gateup(frag_c_bl, frag_c_br, 1)
 
     @flyc.jit
     def launch_moe_gateup(

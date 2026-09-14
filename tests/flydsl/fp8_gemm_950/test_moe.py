@@ -225,13 +225,13 @@ def run_aiter_stage1(args, data, xcd_swizzle: int) -> None:
         a_dtype="fp8",
         b_dtype="fp4",
         out_dtype="bf16",
-        act="situv2",
+        act="silu",
         gate_mode="interleave",
         use_async_copy=True,
         waves_per_eu=1,
         b_nt=0,
         xcd_swizzle=xcd_swizzle,
-        swiglu_limit=7.0,
+        swiglu_limit=None,
     )
 
 
@@ -388,6 +388,7 @@ def run_case(
             + json.dumps(
                 {
                     "kernel": profile_kernel,
+                    "activation": "swiglu_unclamped",
                     "tokens": tokens,
                     "gate_up_size": gate_up_size,
                     "hidden_size": hidden_size,
@@ -425,10 +426,11 @@ def run_case(
     print(
         f"output: aiter_finite={aiter_finite} pyhip_finite={pyhip_finite} "
         f"max_abs={max_abs:.6g} "
-        "semantics=aiter_silu_mul_vs_pyhip_situv2"
+        "semantics=swiglu_unclamped"
     )
     if not (aiter_finite and pyhip_finite):
         raise AssertionError("stage1 produced a non-finite output")
+    torch.testing.assert_close(pyhip_output, aiter_output, rtol=0.02, atol=0.01)
 
     def eff_tflops(latency_us: float) -> float:
         return eff_flops / (latency_us * 1.0e-6) / 1.0e12
@@ -487,6 +489,7 @@ def run_case(
         "BENCH_RESULT "
         + json.dumps(
             {
+                "activation": "swiglu_unclamped",
                 "tokens": tokens,
                 "gate_up_size": gate_up_size,
                 "hidden_size": hidden_size,
