@@ -1,5 +1,29 @@
 # PyHIP A8W4 MoE Roofline Results
 
+## 2026-09-14 B-scale Commit Double-check: ATT vs Actual Throughput
+
+**T24576: `866d403` lowers sampled ATT mainloop efficiency, but no unprofiled MoE throughput regression was reproduced.** Direct parent is `16f3101`; both revisions use SiTUv2. Current's SwiGLU is listed separately, not used to explain the scale-commit before/after result.
+
+GPU6, gate_up512/K6144/topk8/E384, seed0, XCD8/groupM4. Unprofiled original-driver test:7 alternating rounds, warmup3/clones20/Event samples20, median of seven per-run minima. All21 runs completed; common inputs match, and the14 parent/commit outputs match byte-for-byte. Scale preparation/conversion is outside kernel timing.
+
+| Revision | Activation | Unprofiled latency µs | Padded TF/s | Initial paired ATT mainloop efficiency |
+|:---|:---|---:|---:|---:|
+| 16f3101, before B-scale commit | SiTUv2 | 473.684 | 2611.34 | 90.749526% |
+| 866d403, B-scale commit | SiTUv2 | 471.845 | 2621.52 | 86.972244% |
+| Current 477a7ce kernel snapshot | SwiGLU | 439.324 | 2815.58 | 86.869116% |
+
+The B-scale commit changes median latency by **−0.388%** and throughput by **+0.390%**, a small effect within observed variation. Paired latency changes span−1.179% to+0.261%; this does not support an actual tput regression at this shape.
+
+ATT is a separate measurement: CU1 on SE0–3/allSIMDs, matching iteration8,4counterordered rounds/version. Initial parent→B-commit mainloop cycles increase **+4.343%** (all four pairs positive), efficiency−3.777pp. Follow-up control comparisons reproduce positive aggregate increases of+1.967% to+3.621%, with individual reversals. Extra initial cycles localize mostly to G2S issue+stall (**+3782.531 of+4508.604 cycles/wave**), especially A-data G2S; explicit waitcnt time and MFMA work barely change.
+
+**Cause boundary:** MFMA nesting, B-data row mapping and B-scale global-contiguity ablations did not recover the gap. Widening the parent's B-scale transport plus its LDS slots produces a smaller+1.031% mainloop increase, implicating the transport path but not proving a unique cache/queue/LDS/occupancy mechanism. Actual MFMA work and G2S request counts are unchanged; B-scale transfers widen from DWORD to DWORDx4. No PMC counters were collected.
+
+Sampled mean mainloop cycles are not whole-device unprofiled dispatch time: fixed eighth launch versus best-of20 Event launches, sampled CUs versus dispatch makespan, and cycles versus time without locked/logged clocks. ATT perturbation and cache/scheduling effects are not isolated. **SwiGLU's shorter epilogue is relevant only to current, not the two SiTUv2 scale revisions.**
+
+No production fix merged. A native-layout producer-balancing candidate preserves DWORDx4 and the pipeline, but its first GPU test was blocked by119.6GB VRAM already in use on GPU6; only syntax/integer mapping checks passed. It must pass GPU correctness, ATT and unprofiled throughput before adoption. Historical tables below are unchanged.
+
+[Detailed conclusions, failed attempts and candidate status](../../scale_commit_att_20260914/CONCLUSIONS.md) · [Unprofiled results](../../scale_commit_att_20260914/unprofiled_perf/REPORT.md) · [Initial commit ATT comparison](../../scale_commit_att_20260914/REPORT.md)
+
 ## 2026-09-14 Current SwiGLU ATT and Performance
 
 **Activation: SiLU(gate) × up, without clamping.** All new tables in this section use the same frozen source, including the user-added epilogue wait/barrier before consuming the final up operands.

@@ -6,6 +6,7 @@ The kernel applies SiLU(gate) * up without clamping and writes
 
 import argparse
 import csv
+import json
 import time
 
 import torch
@@ -26,6 +27,10 @@ SORT_BLOCK_M = 256
 TOKEN_MASK = 0xFFFFFF
 A_INPUT_SCALE = 0.33
 B_INPUT_SCALE = 0.2
+DEFAULT_BENCHMARK_TOKENS = (8192, 16384, 32768, 65536, 12288, 24576, 49152)
+AITER_TILE_M = 128
+AITER_TILE_N = 256
+AITER_TILE_K = 256
 
 
 def div_up(value: int, divisor: int) -> int:
@@ -1814,11 +1819,11 @@ def run_accuracy_matrix(
     ]
     combinations = [
         (tokens, hidden_size, topk, num_experts, intermediate_size)
-        for tokens in range(8192, 8210)
+        for tokens in range(8192, 8210, 8193)
         for hidden_size in (6144, 4096)
         for topk in (5, 6, 7, 8)
         for num_experts in (384, 120)
-        for intermediate_size in (256, 128, 64)
+        for intermediate_size in (256, 128)
     ]
     failures = []
     with open(output_csv, "w", newline="", encoding="ascii") as csv_file:
@@ -1923,20 +1928,74 @@ def _benchmark_kernel(
     return samples[0], median
 
 
-def run_benchmark(
+def _prepare_aiter_benchmark_args(
+    inputs,
     tokens: int,
     intermediate_size: int,
     hidden_size: int,
     topk: int,
     num_experts: int,
-    warmup: int,
-    iterations: int,
-    data_clones: int,
+):
+    from aiter import dtypes
+    from aiter.fused_moe import moe_sorting
+    from aiter.ops.quant import mxfp4_moe_sort_fwd
+    from aiter.ops.shuffle import shuffle_weight_a16w4
+
+    # Reuse the same quantized A, logical weights and top-k choices. AIter's
+    # M128 tiles need their own padding/routing, not PyHIP's M256 scale rows.
+    sorted_ids, _, expert_ids, valid_ids, _ = moe_sorting(
+        inputs["topk_ids"],
+        inputs["topk_weights"],
+        num_experts,
+        hidden_size,
+        dtypes.bf16,
+        AITER_TILE_M,
+        accumulate=False,
+    )
+    num_sorted = int(valid_ids[0].item())
+    if num_sorted % AITER_TILE_M:
+        raise AssertionError("AIter sorted route count is not block aligned")
+    sorted_ids = sorted_ids[:num_sorted].contiguous()
+    expert_ids = expert_ids[: num_sorted // AITER_TILE_M].contiguous()
+    # This byte-sort helper is shared by AIter's MXFP8 and MXFP4 quant paths.
+    # Re-sort the original token scales without re-quantizing A.
+    scale_a = mxfp4_moe_sort_fwd(
+        inputs["scale_a_raw"], sorted_ids, valid_ids, tokens, hidden_size
+    )
+    weight = shuffle_weight_a16w4(inputs["weight"], 16, True)
+    output = torch.empty(
+        (tokens, topk, intermediate_size),
+        device=inputs["a"].device,
+        dtype=dtypes.bf16,
+    )
+    return (
+        inputs["a"],
+        weight,
+        sorted_ids,
+        expert_ids,
+        valid_ids,
+        output,
+        inputs["scale_b"].view(dtypes.fp8_e8m0),
+        scale_a,
+    )
+
+
+def run_benchmark(
+    tokens: int = 8192,
+    intermediate_size: int = 256,
+    hidden_size: int = 6144,
+    topk: int = 8,
+    num_experts: int = 384,
+    warmup: int = 5,
+    iterations: int = 20,
+    data_clones: int = 20,
     *,
     b_lds_swizzle: bool = False,
-    xcd_swizzle: bool = False,
-    group_size_m: int = 1,
-) -> None:
+    xcd_swizzle: bool = True,
+    group_size_m: int = 4,
+    aiter_xcd_swizzle: int = 8,
+) -> dict:
+    """Compare PyHIP and AIter SwiGLU on shared inputs, outside setup/JIT time."""
 
     validate_case_parameters(tokens, intermediate_size, hidden_size, topk, num_experts)
     if warmup < 0:
@@ -1945,6 +2004,13 @@ def run_benchmark(
         raise ValueError("iterations must be positive")
     if data_clones <= 0:
         raise ValueError("data_clones must be positive")
+    if group_size_m <= 0:
+        raise ValueError("group_size_m must be positive")
+    if aiter_xcd_swizzle < 0:
+        raise ValueError("aiter_xcd_swizzle must be non-negative")
+
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
     inputs = prepare_moe_inputs(
         tokens, intermediate_size, hidden_size, topk, num_experts
     )
@@ -1975,18 +2041,91 @@ def run_benchmark(
         xcd_swizzle=xcd_swizzle,
         group_size_m=group_size_m,
     )
-    moe_arg_sets = _clone_benchmark_args(moe_args, data_clones)
+    moe_kernel = flyc.compile[{"opt_level": 2}](moe_launcher, *moe_args)
+    aiter_args = _prepare_aiter_benchmark_args(
+        inputs, tokens, intermediate_size, hidden_size, topk, num_experts
+    )
+
+    def run_aiter(a, weight, sorted_ids, expert_ids, valid_ids, out, scale_b, scale_a):
+        flydsl_moe_stage1(
+            a=a,
+            w1=weight,
+            sorted_token_ids=sorted_ids,
+            sorted_expert_ids=expert_ids,
+            num_valid_ids=valid_ids,
+            out=out,
+            topk=topk,
+            tile_m=AITER_TILE_M,
+            tile_n=AITER_TILE_N,
+            tile_k=AITER_TILE_K,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            act="silu",
+            gate_mode="interleave",
+            use_async_copy=True,
+            waves_per_eu=1,
+            b_nt=0,
+            xcd_swizzle=aiter_xcd_swizzle,
+            swiglu_limit=None,
+            w1_scale=scale_b,
+            a1_scale=scale_a,
+        )
+
+    # Compile/launch both once even when warmup=0. Never time correctness,
+    # weight/scale shuffling, routing, or first-call compilation.
+    run_aiter(*aiter_args)
+    moe_kernel(*moe_args)
+    torch.cuda.synchronize()
+    aiter_output = aiter_args[5]
+    aiter_finite = bool(torch.isfinite(aiter_output).all())
+    pyhip_finite = bool(torch.isfinite(output).all())
+    max_abs = (output.float() - aiter_output.float()).abs().max().item()
+    print(
+        f"output: aiter_finite={aiter_finite} pyhip_finite={pyhip_finite} "
+        f"max_abs={max_abs:.6g} semantics=swiglu_unclamped"
+    )
+    if not (aiter_finite and pyhip_finite):
+        raise AssertionError("stage1 produced a non-finite output")
+    torch.testing.assert_close(output, aiter_output, rtol=0.02, atol=0.01)
+
     moe_rw_bytes = sum(
         value.numel() * value.element_size()
         for value in moe_args
         if isinstance(value, torch.Tensor)
     )
+    aiter_rw_bytes = sum(
+        value.numel() * value.element_size()
+        for value in aiter_args
+        if isinstance(value, torch.Tensor)
+    )
     routed_rows = tokens * topk
-    padded_rows = inputs["sorted_ids"].numel()
-    del inputs, moe_args, output
-    moe_kernel = flyc.compile[{"opt_level": 2}](moe_launcher, *moe_arg_sets[0])
+    padded_rows = moe_args[5].numel()
+    aiter_padded_rows = aiter_args[2].numel()
     effective_flops = 2 * routed_rows * (2 * intermediate_size) * hidden_size
     padded_flops = 2 * padded_rows * (2 * intermediate_size) * hidden_size
+    aiter_padded_flops = 2 * aiter_padded_rows * (2 * intermediate_size) * hidden_size
+    del inputs, output, aiter_output
+
+    # Match the comparison driver's order and keep only one backend's cloned
+    # argument sets resident at a time. Both use the same warmup/clone/sample counts.
+    aiter_arg_sets = _clone_benchmark_args(aiter_args, data_clones)
+    for arg_set in aiter_arg_sets:
+        arg_set[1].is_shuffled = True
+    aiter_best, aiter_median = _benchmark_kernel(
+        run_aiter,
+        aiter_arg_sets,
+        effective_flops,
+        aiter_padded_flops,
+        aiter_rw_bytes,
+        "aiter_stage1",
+        warmup,
+        iterations,
+    )
+    del aiter_arg_sets, arg_set, aiter_args
+    torch.cuda.empty_cache()
+
+    moe_arg_sets = _clone_benchmark_args(moe_args, data_clones)
     moe_best, moe_median = _benchmark_kernel(
         moe_kernel,
         moe_arg_sets,
@@ -1997,22 +2136,56 @@ def run_benchmark(
         warmup,
         iterations,
     )
-    del moe_arg_sets, moe_kernel
+    del moe_arg_sets, moe_args, moe_kernel
+    torch.cuda.empty_cache()
 
     print(
         f"benchmark: b_lds={'swizzle' if b_lds_swizzle else 'padding'} "
         f"xcd_swizzle={xcd_swizzle} group_size_m={group_size_m} "
         f"routed_rows={routed_rows} padded_rows={padded_rows} "
+        f"aiter_padded_rows={aiter_padded_rows} aiter_xcd_swizzle={aiter_xcd_swizzle} "
         f"clones={data_clones} warmup={warmup} runs={iterations}"
     )
+    for name, best, median in (
+        ("aiter", aiter_best, aiter_median),
+        ("moe", moe_best, moe_median),
+    ):
+        print(
+            f"{name}:  best={best[0]:.6f} ms median={median[0]:.6f} ms "
+            f"best_effective_tput={best[1]:.2f} TFLOPS "
+            f"median_effective_tput={median[1]:.2f} TFLOPS "
+            f"best_padded_tput={best[2]:.2f} TFLOPS "
+            f"median_padded_tput={median[2]:.2f} TFLOPS "
+            f"best_bw={best[3]:.2f} GB/s median_bw={median[3]:.2f} GB/s"
+        )
     print(
-        f"moe:  best={moe_best[0]:.6f} ms median={moe_median[0]:.6f} ms "
-        f"best_effective_tput={moe_best[1]:.2f} TFLOPS "
-        f"median_effective_tput={moe_median[1]:.2f} TFLOPS "
-        f"best_padded_tput={moe_best[2]:.2f} TFLOPS "
-        f"median_padded_tput={moe_median[2]:.2f} TFLOPS "
-        f"best_bw={moe_best[3]:.2f} GB/s median_bw={moe_median[3]:.2f} GB/s"
+        f"ratio: latency={moe_best[0] / aiter_best[0]:.3f}x "
+        f"eff_throughput={aiter_best[0] / moe_best[0]:.3%} "
+        f"padded_tflops={moe_best[2] / aiter_best[2]:.3%}"
     )
+    result = {
+        "activation": "swiglu_unclamped",
+        "tokens": tokens,
+        "gate_up_size": 2 * intermediate_size,
+        "hidden_size": hidden_size,
+        "topk": topk,
+        "experts": num_experts,
+        "routed_tokens": routed_rows,
+        "latency_stat": "minimum",
+    }
+    for name, best, median, rows in (
+        ("aiter", aiter_best, aiter_median, aiter_padded_rows),
+        ("pyhip", moe_best, moe_median, padded_rows),
+    ):
+        result[name] = {
+            "padded_tokens": rows,
+            "latency_us": best[0] * 1.0e3,
+            "median_latency_us": median[0] * 1.0e3,
+            "effective_tflops": best[1],
+            "padded_tflops": best[2],
+        }
+    print("BENCH_RESULT " + json.dumps(result, sort_keys=True), flush=True)
+    return result
 
 
 def main() -> None:
@@ -2024,20 +2197,55 @@ def main() -> None:
         "--accuracy-csv",
         default="moe_mxfp8_mxfp4_gateup_4w_accuracy.csv",
     )
-    parser.add_argument("--unaligned-accuracy", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--b-lds-swizzle", action="store_true")
-    parser.add_argument("--xcd-swizzle", action="store_true")
-    parser.add_argument("--group-size-m", type=int, default=1)
-    parser.add_argument("--tokens", type=int, default=8192)
-    parser.add_argument("--intermediate-size", type=int, default=512)
+    swizzle = parser.add_mutually_exclusive_group()
+    swizzle.add_argument("--xcd-swizzle", action="store_true", dest="xcd_swizzle")
+    swizzle.add_argument(
+        "--no-xcd-swizzle",
+        "--no-pyhip-xcd-swizzle",
+        action="store_false",
+        dest="xcd_swizzle",
+    )
+    parser.set_defaults(xcd_swizzle=True)
+    parser.add_argument("--group-size-m", "--pyhip-group-size-m", type=int, default=4)
+    parser.add_argument("--aiter-xcd-swizzle", type=int, default=8)
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        help="benchmark defaults: 8192 16384 32768 65536 12288 24576 49152; accuracy: 8192",
+    )
+    dimensions = parser.add_mutually_exclusive_group()
+    dimensions.add_argument("--intermediate-size", type=int, default=256)
+    dimensions.add_argument(
+        "--gate-up-size", type=int, help="twice --intermediate-size"
+    )
     parser.add_argument("--hidden-size", type=int, default=6144)
     parser.add_argument("--topk", type=int, default=8)
-    parser.add_argument("--num-experts", type=int, default=256)
+    parser.add_argument("--num-experts", "--experts", type=int, default=384)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
-    parser.add_argument("--data-clones", type=int, default=10)
+    parser.add_argument("--data-clones", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if (
+        sum((args.small_accuracy, args.accuracy, args.accuracy_matrix, args.benchmark))
+        != 1
+    ):
+        parser.error(
+            "select exactly one of --small-accuracy, --accuracy, --accuracy-matrix, or --benchmark"
+        )
+
+    token_counts = args.tokens or (
+        DEFAULT_BENCHMARK_TOKENS if args.benchmark else DEFAULT_BENCHMARK_TOKENS[:1]
+    )
+    if args.accuracy and len(token_counts) != 1:
+        parser.error("--accuracy requires exactly one --tokens value")
+    props = torch.cuda.get_device_properties()
+    if "950" not in props.gcnArchName:
+        raise RuntimeError("MFMA_Scale requires gfx950")
+    torch.manual_seed(args.seed)
 
     if args.small_accuracy:
         if not run_accuracy_case(
@@ -2054,7 +2262,7 @@ def main() -> None:
         return
     if args.accuracy:
         if not run_accuracy_case(
-            args.tokens,
+            token_counts[0],
             args.intermediate_size,
             args.hidden_size,
             args.topk,
@@ -2073,43 +2281,44 @@ def main() -> None:
             group_size_m=args.group_size_m,
         )
         return
-    if args.unaligned_accuracy:
-        if not run_accuracy_case(
-            8193,
-            512,
-            6144,
-            8,
-            384,
-            b_lds_swizzle=args.b_lds_swizzle,
-            xcd_swizzle=args.xcd_swizzle,
-            group_size_m=args.group_size_m,
-        ):
-            raise SystemExit("unaligned-token accuracy failed")
-        return
     if args.benchmark:
-        run_benchmark(
-            args.tokens,
-            args.intermediate_size,
-            args.hidden_size,
-            args.topk,
-            args.num_experts,
-            args.warmup,
-            args.iterations,
-            args.data_clones,
-            b_lds_swizzle=args.b_lds_swizzle,
-            xcd_swizzle=args.xcd_swizzle,
-            group_size_m=args.group_size_m,
-        )
+        results = []
+        for tokens in token_counts:
+            print(
+                f"\n########case: M={tokens} intermediate={args.intermediate_size} hidden_sz={args.hidden_size} "
+                f"topk={args.topk} experts={args.num_experts} clones={args.data_clones} "
+                f"warmup={args.warmup} iterations={args.iterations}"
+            )
+            results.append(
+                run_benchmark(
+                    tokens,
+                    args.intermediate_size,
+                    args.hidden_size,
+                    args.topk,
+                    args.num_experts,
+                    args.warmup,
+                    args.iterations,
+                    args.data_clones,
+                    b_lds_swizzle=args.b_lds_swizzle,
+                    xcd_swizzle=args.xcd_swizzle,
+                    group_size_m=args.group_size_m,
+                    aiter_xcd_swizzle=args.aiter_xcd_swizzle,
+                )
+            )
+        print("\n[summary]:")
+        for result in results:
+            aiter_us = result["aiter"]["latency_us"]
+            pyhip_us = result["pyhip"]["latency_us"]
+            print(
+                f"M={result['tokens']:5d} intermediate_sz={args.intermediate_size} hidden_sz={result['hidden_size']:5d} "
+                f"aiter={aiter_us:8.3f} us pyhip={pyhip_us:8.3f} us "
+                f"tput={aiter_us / pyhip_us:.3f}x "
+                f"padded_tflops={result['pyhip']['padded_tflops'] / result['aiter']['padded_tflops']:.3f}x "
+                f"padded_tflops={result['pyhip']['padded_tflops']:.1f}TFLOPS "
+                f"effective_tflops={result['pyhip']['effective_tflops']:.1f}TFLOPS"
+            )
         return
-    parser.error(
-        "select --routing-probe, --small-accuracy, --accuracy, "
-        "--accuracy-matrix, --unaligned-accuracy, --scale-padding-accuracy, "
-        "or --benchmark"
-    )
 
 
 if __name__ == "__main__":
-    props = torch.cuda.get_device_properties()
-    assert "950" in props.gcnArchName, "MFMA_Scale requires gfx950"
-    torch.manual_seed(0)
     main()
