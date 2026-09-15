@@ -21,11 +21,14 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float32, Int8, Int32, T, Vector
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, arith
 from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as _fly
 from flydsl._mlir.dialects import llvm as _llvm
+
+# Raw vector SSA is retained at the existing SSA-returning MFMA boundary.
+from flydsl._mlir.dialects import vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
 __all__ = ["compile_gemm_fp8"]
@@ -37,6 +40,17 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 def div_up(x, y):
     return (x + y - 1) // y
+
+
+def _buffer_resource(tensor, num_records_bytes):
+    buffer = rocdl.make_buffer_tensor(tensor, num_records_bytes=num_records_bytes)
+    return rocdl.get_buffer_rsrc(fx.get_iter(buffer))
+
+
+def _lds_byte_ptr(ptr, byte_offset):
+    return fx.to_llvm_ptr(
+        fx.add_offset(fx.recast_iter(fx.Uint8, ptr), fx.make_int_tuple(byte_offset))
+    )
 
 
 def encode_waitcnt_950(vmcnt=63, expcnt=7, lgkmcnt=63):
@@ -257,7 +271,7 @@ def compile_gemm_fp8(
         argScaleA: fx.Tensor,
         argScaleB: fx.Tensor,
         argC: fx.Tensor,
-        M: int,
+        M: fx.Int32,
     ):
         tid = fx.thread_idx.x
         num_pid_n = div_up(N, TILE_N)
@@ -278,17 +292,13 @@ def compile_gemm_fp8(
             fx.make_view(fx.get_iter(argC), fx.make_layout((M, N), (N, 1)))
         )
         # All operand DMA resources use byte bounds, including packed FP4.
-        a_dma_rsrc = fx.buffer_ops.create_buffer_resource(
-            argA, num_records_bytes=arith._to_raw(fx.Int32(M * K))
-        )
-        b_dma_rsrc = fx.buffer_ops.create_buffer_resource(
+        a_dma_rsrc = _buffer_resource(argA, num_records_bytes=fx.Int64(M) * K)
+        b_dma_rsrc = _buffer_resource(
             argB,
-            num_records_bytes=arith._to_raw(fx.Int32(N * K // (2 if b_mxfp4 else 1))),
+            num_records_bytes=N * K // (2 if b_mxfp4 else 1),
         )
         C = fx.rocdl.make_buffer_tensor(C_2d, max_size=False)
-        c_store_rsrc = fx.buffer_ops.create_buffer_resource(
-            argC, num_records_bytes=arith._to_raw(fx.Int32(M * N * 2))
-        )
+        c_store_rsrc = _buffer_resource(argC, num_records_bytes=fx.Int64(M) * N * 2)
 
         # Swizzle only the LDS read layout; global DMA maps are tile-local.
         def apply_swizzles(layout, specs):
@@ -366,12 +376,6 @@ def compile_gemm_fp8(
         wave_id = tid // 64
         wave_id_uniform = fx.Int32(rocdl.readfirstlane(T.i32, arith._to_raw(wave_id)))
 
-        def lds_root(ptr):
-            return _fly.extract_aligned_pointer_as_index(
-                ir.Type.parse("!llvm.ptr<3>"),
-                arith._to_raw(fx.make_view(ptr, fx.make_layout(1, 1))),
-            )
-
         scale_a_t_frag = None
         scale_a_b_frag = None
         scale_b_l_frag = None
@@ -415,19 +419,17 @@ def compile_gemm_fp8(
             scale_b_l_frag = fx.make_fragment_like(scale_b_l_src[0])
             scale_b_r_frag = fx.make_fragment_like(scale_b_r_src[0])
 
-            scale_a_dma_rsrc = fx.buffer_ops.create_buffer_resource(
+            scale_a_dma_rsrc = _buffer_resource(
                 argScaleA,
-                num_records_bytes=arith._to_raw(fx.Int32(scale_m_rows * K // 32)),
+                num_records_bytes=fx.Int64(scale_m_rows) * (K // 32),
             )
-            scale_b_dma_rsrc = fx.buffer_ops.create_buffer_resource(
+            scale_b_dma_rsrc = _buffer_resource(
                 argScaleB,
-                num_records_bytes=arith._to_raw(fx.Int32(scale_n_rows * K // 32)),
+                num_records_bytes=scale_n_rows * K // 32,
             )
 
             def make_scale_dma_ptr(ptr):
-                return fx.buffer_ops.get_element_ptr(
-                    lds_root(ptr), byte_offset=wave_id_uniform * 64 * 4, elem_type=T.i8
-                )
+                return _lds_byte_ptr(ptr, wave_id_uniform * 64 * 4)
 
             scale_a_t_dma_ptrs = [
                 make_scale_dma_ptr(ptr)
@@ -549,13 +551,8 @@ def compile_gemm_fp8(
             return voffsets
 
         def make_fp8_dma_ptrs(ptr, swizzled, specs):
-            root = lds_root(ptr)
             return [
-                fx.buffer_ops.get_element_ptr(
-                    root,
-                    byte_offset=fp8_copy_slots(r, swizzled, specs)[2],
-                    elem_type=T.i8,
-                )
+                _lds_byte_ptr(ptr, fp8_copy_slots(r, swizzled, specs)[2])
                 for r in range_constexpr(4)
             ]
 
@@ -600,13 +597,8 @@ def compile_gemm_fp8(
             ]
 
         def make_b_dma_ptrs(ptr):
-            root = lds_root(ptr)
             return [
-                fx.buffer_ops.get_element_ptr(
-                    root,
-                    byte_offset=b_copy_slots(r)[1],
-                    elem_type=T.i8,
-                )
+                _lds_byte_ptr(ptr, b_copy_slots(r)[1])
                 for r in range_constexpr(b_copy_rounds)
             ]
 
@@ -1137,21 +1129,25 @@ def compile_gemm_fp8(
                             + wave_n * 16
                             + lane_group // 2 * 8
                         )
-                        byte_offset = (row * N + col) * 2
+                        byte_offset = fx.Int32((row * N + col) * 2)
                         if const_expr(N_tail):
-                            fx.buffer_ops.buffer_store(
-                                packed,
+                            masked_offset = (col < N).select(
+                                byte_offset, fx.Int32(0x7FFFFFFF)
+                            )
+                            rocdl.raw_ptr_buffer_store(
+                                packed.ir_value(),
                                 c_store_rsrc,
-                                byte_offset,
-                                offset_is_bytes=True,
-                                mask=col < N,
+                                masked_offset.ir_value(),
+                                fx.Int32(0).ir_value(),
+                                aux=ir.IntegerAttr.get(T.i32, 0),
                             )
                         else:
-                            fx.buffer_ops.buffer_store(
-                                packed,
+                            rocdl.raw_ptr_buffer_store(
+                                packed.ir_value(),
                                 c_store_rsrc,
-                                byte_offset,
-                                offset_is_bytes=True,
+                                byte_offset.ir_value(),
+                                fx.Int32(0).ir_value(),
+                                aux=ir.IntegerAttr.get(T.i32, 0),
                             )
 
         else:
@@ -1249,7 +1245,7 @@ def compile_gemm_fp8(
         ScaleA: fx.Tensor,
         ScaleB: fx.Tensor,
         C: fx.Tensor,
-        M: int,
+        M: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         # 累加器钉到 AGPR（force-agpr）+ mfma-vgpr-form=False：避免 C 累加器 VGPR/AGPR 混放导致的
@@ -1284,14 +1280,9 @@ import pyhip
 
 
 def _load_shuffle_weight():
-    # host 端 shuffle_weight 在 tests.utils，延迟加载避免非 preshuffle 路径依赖它。
-    # fp8 kWidth=16、BLOCK_K=128 => shuffle_weight layout=(16, 64)（BK=IK*2=128, K=16//1B）。
-    import sys as _sys, os.path as _osp
-
-    _flydsl_root = _osp.abspath(_osp.join(_osp.dirname(__file__), "..", ".."))
-    if _flydsl_root not in _sys.path:
-        _sys.path.insert(0, _flydsl_root)
-    from tests.utils import shuffle_weight
+    # The FlyDSL wheel does not ship tests.utils. AIter's public helper uses
+    # the same (16, 64) FP8 block permutation (BK=128, kWidth=16 bytes).
+    from aiter.ops.shuffle import shuffle_weight
 
     return shuffle_weight
 
@@ -1429,8 +1420,10 @@ def run_test(
     )
     stream = torch.cuda.current_stream()
     args = (
-        a.view(torch.int8).view(-1),
-        weight.view(torch.int8).view(-1),
+        # Keep dimensions below the signed int32 shape ABI limit at large M.
+        # The kernel uses the same base pointers and explicit M/N/K bounds.
+        a.view(torch.int8),
+        weight.view(torch.int8),
         scale_a,
         scale_b,
         out.view(-1),
@@ -1525,8 +1518,8 @@ def run_test(
     ]
     arg_sets = [
         (
-            As[i].view(torch.int8).view(-1),
-            Bs[i].view(torch.int8).view(-1),
+            As[i].view(torch.int8),
+            Bs[i].view(torch.int8),
             ScaleAs[i],
             ScaleBs[i],
             Cs[i].view(-1),
