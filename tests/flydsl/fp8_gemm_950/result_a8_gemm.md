@@ -4,6 +4,293 @@ Date: 2026-09-07
 
 Shape: `M=4096, N=4096, K=16384`
 
+## 2026-09-11: current four-case ATT mainloop efficiency
+
+Fresh ROCm Advanced Thread Trace (`rocprofv3 --att`) was collected separately
+for each current `run_test()` configuration. **A uses padding; B uses swizzle
+only for W4.** M=N4096/K16384, tile256×256×128, BF16 permlane output, no
+preshuffle/store overlap, seed0 per process,50clones/50Event launches. The
+profiler selects the15th matching `gemm_kernel` invocation on physicalGPU6,
+CU0, SE mask0xF, SIMD mask0xF, with a0x60000000-byte ATT buffer.
+
+Current source SHA256:
+`4645cac2bd0cfc44e4b071d7355473143bdad3030ea732c7695d378a7d3d7de6`.
+The source hash remained unchanged across all four profiles. The ASTs of
+`compile_gemm_fp8`, `_schedule_compute` and `run_test` match commit `b78e6a5`;
+the current file's standalone invocations include all four configurations.
+No kernel source or user-managed dump was modified for this profiling task.
+
+### Results and accounting
+
+For each trace, average the mainloop duration of the decoded
+`se0_sm0_sl0_wv0` and `se2_sm0_sl0_wv0` waves, then divide by63complete K-loop
+iterations. Every iteration contains128MFMA instructions, each accounting for
+32cycles (4096theoretical MFMA cycles/iteration). FP4 B's `cbsz:4` does not make
+this mixed FP8×FP4 instruction a16cycle operation: its other input remains FP8.
+
+$$
+	ext{Mainloop MFMA efficiency} =
+\frac{128 \times 32}{\text{mean traced mainloop cycles}/63}\times100\%.
+$$
+
+| Mode | Iterations | MFMA / iteration | Theoretical cycles / iteration | Observed cycles / iteration | Non-MFMA accounting overhead / iteration | MFMA efficiency |
+|---|---:|---:|---:|---:|---:|---:|
+| A8W8 | 63 | 128 | 4096 | **4290.159** | 194.159 | **95.47%** |
+| A8W8 with scale | 63 | 128 | 4096 | **4411.238** | 315.238 | **92.85%** |
+| A8W4 | 63 | 128 | 4096 | **4204.127** | 108.127 | **97.43%** |
+| A8W4 with scale | 63 | 128 | 4096 | **4252.063** | 156.063 | **96.33%** |
+
+The scaled path adds121.079cycles/iteration for A8W8 and47.937cycles/iteration
+for A8W4 in these sampled waves. "Non-MFMA overhead" is the accounting remainder,
+not an additive causal decomposition of wait, LDS or VMEM stall counters.
+
+| Mode | Loop index range | First drain index | SE0/SM0 mainloop cycles | SE2/SM0 mainloop cycles | Mean mainloop cycles |
+|---|---|---:|---:|---:|---:|
+| A8W8 | 602–879 | 880 | 270240 | 270320 | 270280 |
+| A8W8 with scale | 672–978 | 979 | 278504 | 277312 | 277908 |
+| A8W4 | 598–845 | 846 | 264892 | 264828 | 264860 |
+| A8W4 with scale | 671–947 | 948 | 268352 | 267408 | 267880 |
+
+The indices above are decoded `code.json` instruction indices, not source/ISA
+line numbers. In every case, aggregate loop/epilogue hitcounts are504/8=63.
+The verifier also resolves the actual signed back-edge displacement to the
+loop-entry PC and checks each of the two selected waves:63loop entries,
+one branch and exactly128MFMAs in every iteration, then one drain entry.
+Thus prologue and the final two K tiles in the drain are excluded.
+
+### Scope and evidence
+
+These are **sampled-wave steady-state efficiencies**, not whole-kernel GPU
+utilization or end-to-end speedups. Only one dispatch per configuration was
+traced; no statistical repeatability claim is made. ATT-instrumented Event
+times are retained in raw logs but are **not** used as normal performance
+values and do not replace the user-supplied throughput table below.
+No new base-commit ATT trace was collected, so this section is not a matched
+base/new efficiency comparison.
+
+GPU6 was idle at each preflight; postflight recorded no GPU-using KFD client.
+No decoder/overflow/incomplete-trace warning was found in the four profile logs.
+All four `run_test` invocations passed their existing diff criterion; scaled
+A8W8 retained the known strict-allclose diagnostic (47outliers in thisq
+seed0-per-process run). Runtime JIT cache was disabled and fresh auxiliary
+assembly dumps were captured alongside the traces. The runtime trace's
+decoded `code.json`, not merely scheduling hints, supplies the instruction
+counts and measured cycles.
+
+Reproduction: [ATT configuration](agent_workspace/att_efficiency_20260911/att.json),
+[per-case profile script](agent_workspace/att_efficiency_20260911/profile.sh),
+[independent verifier](agent_workspace/att_efficiency_20260911/analyze.py),
+[verified summary](agent_workspace/att_efficiency_20260911/summary.json).
+The existing `process_json.py` analyzer was used unchanged, with its output
+retained for each case. All new scripts, traces, logs and temporary files are
+under [ATT task notes](agent_workspace/att_efficiency_20260911/README.md).
+
+Decoded trace code:
+[A8W8](agent_workspace/att_efficiency_20260911/a8w8_trace/ui_output_agent_46553_dispatch_315/code.json),
+[A8W8 scaled](agent_workspace/att_efficiency_20260911/a8w8_scale_trace/ui_output_agent_63289_dispatch_864/code.json),
+[A8W4](agent_workspace/att_efficiency_20260911/a8w4_trace/ui_output_agent_5984_dispatch_271/code.json),
+[A8W4 scaled](agent_workspace/att_efficiency_20260911/a8w4_scale_trace/ui_output_agent_60528_dispatch_848/code.json).
+
+## 2026-09-10 update: LDS scales, hoisted DMA offsets and compute scheduling
+
+This section is an incremental update. All September7 measurements below are
+retained as historical snapshots; their use of "current" refers to that date.
+Today's tests use the unchanged `run_test()` API in
+[test_mxfp8_gemm_4w.py](test_mxfp8_gemm_4w.py), called by the isolated
+[daily driver](agent_workspace/daily_results_20260910/run_case.py).
+The kernel source was not edited for this report, and the user's Git index was
+not changed.
+
+Tested source SHA256:
+`89fd627e1b8d24f28c97fc7061359e4a31712ab1fe69066702dcf44a2c0e5d32`
+(commit `b78e6a563575570bcbc308fad78aaeb7e83c5005`).
+The performance comparison below uses the user's September11 direct-run output
+for base commit `122e34dbfe5b287652495d90ea9f7cbedf31780e` and the new commit.
+It replaces the earlier, lower-throughput agent-run comparison.
+September10 accuracy/ISA/PMC evidence remains separately dated below.
+
+### Main changes today
+
+1. **LDS-only scale path.** Removed A/B scale G2R branches and `SCALE_G2R`
+	scheduling alternatives. E8M0 scales now go global → LDS → registers.
+2. **Hoisted DMA address calculations.** Precompute K-invariant source byte
+	offsets and wave-uniform LDS destination pointers. K advances through scalar
+	`soffset`, including FP8/FP4 padding and swizzle paths. Explicitly scalarize
+	the dynamic A-scale row stride outside the loop, avoiding A-scale EXEC
+	waterfalls and repeated `readfirstlane` in the mainloop.
+3. **Read-first pipeline and shared compute scheduler.** Read the independent
+	next LDS operand before current compute, then prefetch future data/scales.
+	Mainloop and compute-only drain share `_schedule_compute`; existing hardware
+	synchronization is retained. Compiler fences keep the prefix within a phase.
+4. **Scaled A8W8 M1 prefix.** Its V5/D9 phase uses
+	`M1 → (V1 M2 D2 M1) ×4 → V1 M2 D1 M1`, still exactly16MFMAs. The final DS32
+	is followed by an independent MFMA instead of immediately reaching the
+	wait. Other modes and V0 drain retain prefix2. The final scaled-A8W8 compile
+	is spill-free; the earlier M2 intermediate snapshot had4 spill words/20B
+	scratch. No drain-hint disabling experiment was merged.
+
+### Exact test configuration
+
+All four modes: M=N4096/K16384, tile256×256×128, four waves/256 threads,
+BF16 permlane output, seed0, no preshuffle, no store overlap.
+**A always uses padding. B uses swizzle only for W4.**
+
+| Mode | `with_scale` | `B_MXFP4` | `USE_SWIZZLE` (A) | `B_LDS_SWIZZLE` |
+|---|---|---|---|---|
+| A8W8 | False | False | False | False |
+| A8W8 with scale | True | False | False | False |
+| A8W4 | False | True | False | True |
+| A8W4 with scale | True | True | False | True |
+
+Perf uses `run_test(perf=True, run_count=50, data_clones=50)` with the above
+arguments. All50 clones are warmed once before50 Event measurements, using
+`pyhip.cudaPerf`, **not CUDA graphs**. The earlier agent measurements used physical
+MI355X GPU6 with runtime JIT cache, profiler and IR dump disabled for timing;
+these environment details are not inferred for the user-supplied logs below.
+Separate agent invocations with
+`perf=False` collect accuracy/dumps and PMC; profiler timestamps are not used
+for throughput. No clocks, power limits or system settings were changed.
+
+### 2026-09-11: highest throughput, exact commit-to-commit comparison
+
+**Base:** `122e34dbfe5b287652495d90ea9f7cbedf31780e`
+
+**New:** `b78e6a563575570bcbc308fad78aaeb7e83c5005`
+
+**Data source: the two terminal outputs supplied by the user**, running the
+script directly with the four `run_test()` configurations above. The user
+identified the first output (A8W8 best3080.87TFLOPS) as `122e34d` and the second
+(A8W8 best3120.03TFLOPS) as `b78e6a5`. Each configuration's reported `gemm:`
+summary is its **highest throughput over50measurements**, not an average or
+median. No new benchmark was run when applying this correction.
+
+Throughput ratio = new maximum TFLOPS / base maximum TFLOPS; >1 means improvement.
+The table uses only the user-supplied values, without mixing in agent-run maxima.
+
+| Mode | Base max TFLOPS (`122e34d`) | New max TFLOPS (`b78e6a5`) | Throughput ratio | Improvement |
+|---|---:|---:|---:|---:|
+| A8W8 | **3080.87** | **3120.03** | **1.0127×** | **+1.27%** |
+| A8W8 with scale | **2951.20** | **2970.98** | **1.0067×** | **+0.67%** |
+| A8W4 | **3244.53** | **3318.96** | **1.0229×** | **+2.29%** |
+| A8W4 with scale | **3023.28** | **3163.12** | **1.0463×** | **+4.63%** |
+
+The corresponding best displayed samples (base→new) are178.442→176.202us,
+186.282→185.042us,169.441→165.641us and181.841→173.802us. Ratios are calculated
+from the reported TFLOPS, rather than the rounded one-decimal latency summary.
+These aligned dimensions
+have no tile-padding FLOP overhead, so effective and hardware throughput ratios
+coincide. All8API calls in the supplied logs report `is_correct=True`;
+base/new diff values match for each configuration. Scaled A8W8 reports56strict
+allclose outliers/max absolute error8 in both logs, not the47outliers from the
+separate agent accuracy batch below. The supplied logs do not contain input-byte
+hashes, a physical GPU index, or complete environment/occupancy metadata; the
+earlier agent-run identity checks must not be attributed to these measurements.
+
+Source SHA256 of the Git snapshots (not hashes recorded by the supplied logs):
+- Base: `e7b8abe0736bc95b77d0592a05d5ebd7791a67cf25d1df46c66091b964e30589`
+- New: `89fd627e1b8d24f28c97fc7061359e4a31712ab1fe69066702dcf44a2c0e5d32`
+
+The earlier agent-run table and its historical-reference predecessor are
+superseded for the reported throughput comparison. Their raw artifacts are
+retained without alteration, and are not evidence for the replacement numbers.
+The cause of the absolute throughput discrepancy has not been established.
+No September7 throughput or other-commit value enters the ratios above.
+
+[User-provided result extract](agent_workspace/commit_compare_20260911/user_provided_results.md)
+records the replacement values and accuracy diagnostics. The
+[comparison notes](agent_workspace/commit_compare_20260911/README.md) and
+[original agent summary](agent_workspace/commit_compare_20260911/summary.json)
+remain available as explicitly superseded measurements.
+
+### Registers, scratch and emitted pipeline
+
+All four fresh ISA dumps have **zero SGPR/VGPR spills, zero private segment,
+and no `scratch_load`/`scratch_store` instructions**. Architectural VGPR count
+is shown separately: gfx950 metadata's combined VGPR count includes the AGPR
+allocation and alignment; it must not be interpreted as ordinary VGPRs alone.
+
+| Mode | Architectural VGPRs | AGPRs | Combined metadata VGPRs | Metadata SGPRs | LDS bytes | VGPR / SGPR spill count | Private segment |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| A8W8 | 244 | 256 | 500 | 59 | 135168 | 0 / 0 | 0 B |
+| A8W8 with scale | 242 | 256 | 500 | 85 | 143360 | 0 / 0 | 0 B |
+| A8W4 | 212 | 256 | 468 | 51 | 100352 | 0 / 0 | 0 B |
+| A8W4 with scale | 220 | 256 | 476 | 78 | 108544 | 0 / 0 | 0 B |
+
+Independent instruction-stream audits pass all8mainloop phases and the drain
+in all4modes. Each loop iteration has128MFMA; data/scale DMA counts are32/0,
+32/8,24/0,24/8 respectively. All buffer loads are LDS DMA, with no ordinary
+scale G2R loads. No `v_add*`, `v_lshl*`, `v_mul*`, `v_readfirstlane*` address
+operations or `s_nop` remain in the audited mainloops.
+
+Audits:
+[A8W8](agent_workspace/daily_results_20260910/a8w8_audit.log),
+[A8W8 scaled](agent_workspace/daily_results_20260910/a8w8_scale_audit.log),
+[A8W4](agent_workspace/daily_results_20260910/a8w4_audit.log),
+[A8W4 scaled](agent_workspace/daily_results_20260910/a8w4_scale_audit.log).
+ISA dumps:
+[A8W8](agent_workspace/daily_results_20260910/a8w8_dump/gemm_kernel_0/21_final_isa.s),
+[A8W8 scaled](agent_workspace/daily_results_20260910/a8w8_scale_dump/gemm_kernel_0/21_final_isa.s),
+[A8W4](agent_workspace/daily_results_20260910/a8w4_dump/gemm_kernel_0/21_final_isa.s),
+[A8W4 scaled](agent_workspace/daily_results_20260910/a8w4_scale_dump/gemm_kernel_0/21_final_isa.s).
+FlyDSL's ISA dump is an assembly-mode recompile, not an HSACO disassembly.
+
+### LDS bank-conflict hardware counters
+
+Fresh `rocprofv3 --pmc` collects `SQ_LDS_BANK_CONFLICT` and
+`SQ_LDS_DATA_FIFO_FULL`, filtered to `gemm_kernel`, using the exact layouts
+above. Each mode's CSV contains2dispatch records per counter; these are
+aggregate counter values, **not the64per-instance samples in the older report**.
+
+| Mode | Records per counter | Bank conflict min / max / sum | Bank conflict nonzero | LDS FIFO full min / max / sum | FIFO nonzero |
+|---|---:|---:|---:|---:|---:|
+| A8W8 | 2 | 0 / 0 / 0 | 0 | 0 / 0 / 0 | 0 |
+| A8W8 with scale | 2 | 0 / 0 / 0 | 0 | 0 / 0 / 0 | 0 |
+| A8W4 | 2 | 0 / 0 / 0 | 0 | 0 / 0 / 0 | 0 |
+| A8W4 with scale | 2 | 0 / 0 / 0 | 0 | 0 / 0 / 0 | 0 |
+
+This confirms zero reported conflicts for the selected layouts, not zero LDS
+latency or stalls of every kind. In particular, this is not a W4 B-padding run.
+Raw counter CSVs:
+[A8W8](agent_workspace/daily_results_20260910/a8w8_pmc/smci355-ccs-aus-m09-09/464499_counter_collection.csv),
+[A8W8 scaled](agent_workspace/daily_results_20260910/a8w8_scale_pmc/smci355-ccs-aus-m09-09/464655_counter_collection.csv),
+[A8W4](agent_workspace/daily_results_20260910/a8w4_pmc/smci355-ccs-aus-m09-09/464891_counter_collection.csv),
+[A8W4 scaled](agent_workspace/daily_results_20260910/a8w4_scale_pmc/smci355-ccs-aus-m09-09/465112_counter_collection.csv).
+
+### Accuracy (separate September10 agent validation)
+
+`run_test()` validates finite BF16 output with its existing `calc_diff <= 1e-5`
+criterion. The independent `torch.allclose(rtol=0.02, atol=0.01)` check is
+reported separately; no tolerances were loosened.
+
+| Mode | Existing diff criterion | Reported diff | Strict allclose |
+|---|---|---:|---|
+| A8W8 | PASS | 2.3599037946020474e-08 | True |
+| A8W8 with scale | PASS | 2.5712566409374915e-08 | **False, pre-existing** |
+| A8W4 | PASS | 6.391154272478161e-11 | True |
+| A8W4 with scale | PASS | 7.416759206790857e-09 | True |
+
+All four separate accuracy runs and all four PMC-instrumented correctness runs
+pass the diff criterion. Scaled A8W8 retains exactly47/16777216elements outside
+strict tolerance, max absolute error8, identical to the pre-port diagnostic;
+it must not be described as an allclose pass. The earlier same-source
+[24-case regression](agent_workspace/a8w8_scale_prefix1_20260910/current_accuracy_matrix.log)
+also passed, covering tails, K512/768/1024, padding/swizzle, FP8 preshuffle and
+store overlap. The legacy non-permlane compiler-asserting path remains excluded
+from that supported matrix and was not fixed by these changes.
+
+Accuracy logs:
+[A8W8](agent_workspace/daily_results_20260910/a8w8_accuracy.log),
+[A8W8 scaled](agent_workspace/daily_results_20260910/a8w8_scale_accuracy.log),
+[A8W4](agent_workspace/daily_results_20260910/a8w4_accuracy.log),
+[A8W4 scaled](agent_workspace/daily_results_20260910/a8w4_scale_accuracy.log).
+Reproduction scripts:
+[perf + ISA](agent_workspace/daily_results_20260910/perf_and_isa.sh),
+[PMC](agent_workspace/daily_results_20260910/pmc.sh).
+All agent-only scripts, tests, logs and dumps are isolated under
+[agent workspace](agent_workspace/README.md); original user dumps are preserved.
+No ATT mainloop-cycle/efficiency measurement was made in the September10
+update; the separate September11 ATT results are recorded at the top.
+
 ## Current `test_mxfp8_gemm_4w.py` snapshot: with scale vs without scale
 
 This section profiles the current kernel directly through
