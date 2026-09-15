@@ -2,6 +2,9 @@
 
 The kernel applies SiLU(gate) * up without clamping and writes
 ``[tokens, topk, intermediate_size]``.
+
+The benchmark compares BF16 PyHIP/FlyDSL outputs with Opus stage1, which also
+fuses MXFP8 output quantization. Opus timings are not a BF16-output speedup.
 """
 
 import argparse
@@ -14,14 +17,15 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl, vector
-from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, Float32, Int32, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as _fly
-from flydsl._mlir.dialects import llvm as _llvm
-from flydsl._mlir.dialects import scf
+
+# These vector operations feed the SSA-returning MFMA atom boundary directly.
+from flydsl._mlir.dialects import vector
 
 SORT_BLOCK_M = 256
 TOKEN_MASK = 0xFFFFFF
@@ -31,10 +35,33 @@ DEFAULT_BENCHMARK_TOKENS = (8192, 16384, 32768, 65536, 12288, 24576, 49152)
 AITER_TILE_M = 128
 AITER_TILE_N = 256
 AITER_TILE_K = 256
+# This shape-safe group-split variant shares FlyDSL's M128 routing. It supports
+# I % 128 == 0 and K % 256 == 0; this is not production config auto-tuning.
+OPUS_TILE_M = 128
+OPUS_KERNEL_NAME = "opus_moe1_afp8_wfp4_bf16_t128x256_gs_qgb2"
 
 
 def div_up(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _buffer_resource(tensor, num_records_bytes, base_byte_offset=0):
+    """Bounded byte descriptor for the explicitly scheduled raw G2S path."""
+    ptr = fx.add_offset(
+        fx.recast_iter(fx.Uint8, fx.get_iter(tensor)),
+        fx.make_int_tuple(base_byte_offset),
+    )
+    buffer = rocdl.make_buffer_tensor(
+        fx.make_view(ptr, fx.make_layout(1, 1)),
+        num_records_bytes=num_records_bytes,
+    )
+    return rocdl.get_buffer_rsrc(fx.get_iter(buffer))
+
+
+def _lds_byte_ptr(ptr, byte_offset):
+    return fx.to_llvm_ptr(
+        fx.add_offset(fx.recast_iter(fx.Uint8, ptr), fx.make_int_tuple(byte_offset))
+    )
 
 
 def validate_case_parameters(
@@ -377,13 +404,20 @@ def compile_moe_gateup_4w(
     topk: int,
     num_experts: int,
     *,
+    preshuffleB: bool = False,
     b_lds_swizzle: bool = False,
     xcd_swizzle: bool = False,
     group_size_m: int = 1,
     scale_first: bool = False,
     epilogue_overlap: bool = True,
 ):
-    """Build four-wave gate/up with data and scale prefetched through ping-pong LDS."""
+    """Build four-wave gate/up with data/scales prefetched through ping-pong LDS.
+
+    preshuffleB=False: raw packed FP4 [E, 2*I, K/2], gate rows then up rows.
+    preshuffleB=True: the same shape with AIter's
+    shuffle_weight_a16w4(raw, 16, True) bytes. Use dense preshuffled B LDS,
+    without XOR swizzle; A/B scales and the MFMA/pipeline contract are unchanged.
+    """
     block_m = SORT_BLOCK_M // 2
     block_n = 128
     block_k = 128
@@ -395,6 +429,8 @@ def compile_moe_gateup_4w(
     assert hidden_size % block_k == 0
     if group_size_m <= 0:
         raise ValueError("group_size_m must be positive")
+    if preshuffleB and b_lds_swizzle:
+        raise ValueError("preshuffleB uses dense B LDS; b_lds_swizzle is raw-B only")
 
     def _get_pids_950(pid, num_pid_m, grid_mn, num_xcds, group_m):
         num_pid_n = num_n_tiles
@@ -441,8 +477,14 @@ def compile_moe_gateup_4w(
 
     # Padding keeps each 2048-element block contiguous; swizzle instead XORs
     # 16-byte slots within each 8-row group to avoid B LDS bank conflicts.
+    # Native preshuffle uses dense [N/16, K/32, 16n, 16byte] storage instead.
     b_group16 = 16 * block_k + 64
-    b_lds_elems = block_n * block_k if b_lds_swizzle else (block_n // 16) * b_group16
+    b_lds_elems = (
+        block_n * block_k
+        if preshuffleB or b_lds_swizzle
+        else (block_n // 16) * b_group16
+    )
+    b_k_tile_bytes = 16 * block_k // 2 if preshuffleB else block_k // 2
 
     # One contiguous DWORD G2S per thread. Pair adjacent native r0 DWORDs
     # and both r1 bytes across the four row repeats, using one aligned
@@ -498,8 +540,8 @@ def compile_moe_gateup_4w(
         arg_sorted_ids: fx.Tensor,
         arg_expert_ids: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
-        num_tokens: int,
-        num_expert_blocks: int,
+        num_tokens: fx.Int32,
+        num_expert_blocks: fx.Int32,
     ):
         tid = fx.thread_idx.x
         num_expert_blocks_i32 = fx.Int32(num_expert_blocks)
@@ -519,50 +561,52 @@ def compile_moe_gateup_4w(
         num_tokens_i32 = fx.Int32(num_tokens)
 
         a_tensor_bytes = num_tokens_i32 * fx.Int32(hidden_size)
-        a_rsrc = buffer_ops.create_buffer_resource(
+        a_rsrc = _buffer_resource(
             arg_a,
             num_records_bytes=arith._to_raw(a_tensor_bytes),
         )
-        c_rsrc = buffer_ops.create_buffer_resource(
+        c_rsrc = _buffer_resource(
             arg_c,
             num_records_bytes=arith._to_raw(
                 num_tokens_i32 * fx.Int32(topk * intermediate_size * 2)
             ),
         )
-        sorted_rsrc = buffer_ops.create_buffer_resource(
+        sorted_rsrc = _buffer_resource(
             arg_sorted_ids,
             num_records_bytes=arith._to_raw(
                 num_expert_blocks_i32 * fx.Int32(SORT_BLOCK_M * 4)
             ),
         )
-        expert_rsrc = buffer_ops.create_buffer_resource(
+        expert_rsrc = _buffer_resource(
             arg_expert_ids,
             num_records_bytes=arith._to_raw(num_expert_blocks_i32 * fx.Int32(4)),
         )
-        valid_rsrc = buffer_ops.create_buffer_resource(
+        valid_rsrc = _buffer_resource(
             arg_num_valid_ids,
             num_records_bytes=arith._to_raw(fx.Int32(4)),
         )
         expert_i32 = fx.Int32(
-            buffer_ops.buffer_load(expert_rsrc, expert_block, vec_width=1, dtype=T.i32)
+            rocdl.raw_ptr_buffer_load(
+                T.i32, expert_rsrc, expert_block_i32 * 4, fx.Int32(0)
+            )
         )
         expert_i32 = fx.Int32(rocdl.readfirstlane(T.i32, arith._to_raw(expert_i32)))
         expert_byte_offset = arith.index_cast(T.index, expert_i32) * arith.constant(
             output_size * hidden_size // 2, index=True
         )
-        b_rsrc = buffer_ops.create_buffer_resource(
+        b_rsrc = _buffer_resource(
             arg_b,
             num_records_bytes=output_size * hidden_size // 2,
             base_byte_offset=expert_byte_offset,
         )
         scale_a_padded_rows = num_expert_blocks_i32 * fx.Int32(SORT_BLOCK_M)
-        scale_a_rsrc = buffer_ops.create_buffer_resource(
+        scale_a_rsrc = _buffer_resource(
             arg_scale_a,
             num_records_bytes=arith._to_raw(
                 scale_a_padded_rows * fx.Int32(hidden_size // 32)
             ),
         )
-        scale_b_rsrc = buffer_ops.create_buffer_resource(
+        scale_b_rsrc = _buffer_resource(
             arg_scale_b,
             num_records_bytes=2 * block_n * (hidden_size // 32),
             base_byte_offset=arith.index_cast(T.index, expert_i32)
@@ -572,7 +616,7 @@ def compile_moe_gateup_4w(
         )
 
         num_valid_i32 = fx.Int32(
-            buffer_ops.buffer_load(valid_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            rocdl.raw_ptr_buffer_load(T.i32, valid_rsrc, fx.Int32(0), fx.Int32(0))
         )
 
         # mma_atom 生成的tile 可以用来slice A, B,
@@ -614,7 +658,12 @@ def compile_moe_gateup_4w(
             ((2, block_m // 16, 8), (32, block_k // 32)),
             ((a_group8, a_group16, block_k), (1, 32)),
         )
-        if const_expr(b_lds_swizzle):
+        if const_expr(preshuffleB):
+            read_layout_b = fx.make_layout(
+                ((16, block_n // 16), (32, block_k // 32)),
+                ((32, 16 * block_k), (1, 16 * 32)),
+            )
+        elif const_expr(b_lds_swizzle):
             read_layout_b = fx.make_ordered_layout((block_n, block_k), (1, 0))
         else:
             read_layout_b = fx.make_layout(
@@ -685,18 +734,8 @@ def compile_moe_gateup_4w(
             wave_id_uniform // 2
         ) * a_group16
 
-        def lds_root(ptr):
-            return _fly.extract_aligned_pointer_as_index(
-                ir.Type.parse("!llvm.ptr<3>"),
-                arith._to_raw(fx.make_view(ptr, fx.make_layout(1, 1))),
-            )
-
         def make_a_dma_ptr(ptr, copy_round: int):
-            return buffer_ops.get_element_ptr(
-                lds_root(ptr),
-                byte_offset=wave_a_lds_base + copy_round * 4 * a_group8,
-                elem_type=T.i8,
-            )
+            return _lds_byte_ptr(ptr, wave_a_lds_base + copy_round * 4 * a_group8)
 
         # AC: make DMA pointers for A in LDS. shape: [2, 4] for top and bottom halves.
         a_top_dma_ptrs = [
@@ -710,11 +749,7 @@ def compile_moe_gateup_4w(
 
         def make_scale_dma_ptr(ptr, wave_stride: int = 64):
             # The instruction adds lane_id * 4; the supplied base is wave-uniform.
-            return buffer_ops.get_element_ptr(
-                lds_root(ptr),
-                byte_offset=wave_id_uniform * wave_stride * 4,
-                elem_type=T.i8,
-            )
+            return _lds_byte_ptr(ptr, wave_id_uniform * wave_stride * 4)
 
         scale_a_top_dma_ptrs = [
             make_scale_dma_ptr(ptr, scale_a_wave_stride)
@@ -750,8 +785,8 @@ def compile_moe_gateup_4w(
                     + ((lane_id // 8) % 2) * 64
                 )
                 sorted_row = expert_block_i32 * SORT_BLOCK_M + fx.Int32(row_local)
-                fused_id = buffer_ops.buffer_load(
-                    sorted_rsrc, sorted_row, vec_width=1, dtype=T.i32
+                fused_id = rocdl.raw_ptr_buffer_load(
+                    T.i32, sorted_rsrc, sorted_row * 4, fx.Int32(0)
                 )
                 token_ids.append(arith.andi(fused_id, mask24))
             return token_ids
@@ -777,8 +812,8 @@ def compile_moe_gateup_4w(
                     rows.append(
                         (
                             sorted_row,
-                            buffer_ops.buffer_load(
-                                sorted_rsrc, sorted_row, vec_width=1, dtype=T.i32
+                            rocdl.raw_ptr_buffer_load(
+                                T.i32, sorted_rsrc, sorted_row * 4, fx.Int32(0)
                             ),
                         )
                     )
@@ -813,11 +848,18 @@ def compile_moe_gateup_4w(
                 )
 
         # B: AC: 2 x buffer_load_dwordx4 lds
-        # B is loaded with 'normal' 16x4 buffer load.
+        # Raw B is loaded with 'normal' 16x4 buffer load.
         # [16x4] src: each wave copies 16 contineous rows from global memory, 4 wave copies 64 contineous rows .
         # [16x4] dest: Also same written into LDS.
         def b_copy_round_slots(copy_round: int):
-            if const_expr(b_lds_swizzle):
+            if const_expr(preshuffleB):
+                # Each wave copies one native N16/K128 tile (1024 bytes).
+                # DMA adds lane_id*16 to this wave-uniform LDS base.
+                chunk = wave_id_uniform + copy_round * 4
+                row = chunk * 16 + lane_id % 16
+                col_byte = (lane_id // 16) * 16
+                lds_byte = chunk * (16 * block_k // 2)
+            elif const_expr(b_lds_swizzle):
                 physical_slot = tid + copy_round * 256
                 logical_slot = physical_slot ^ ((physical_slot >> 3) & 1)
                 row = (logical_slot // 32) * 8 + logical_slot % 8
@@ -831,29 +873,35 @@ def compile_moe_gateup_4w(
             return row, col_byte, lds_byte
 
         def make_b_dma_ptrs(lds_base):
-            root = lds_root(lds_base)
             return [
-                buffer_ops.get_element_ptr(
-                    root,
-                    byte_offset=b_copy_round_slots(copy_round)[2],
-                    elem_type=T.i8,
-                )
+                _lds_byte_ptr(lds_base, b_copy_round_slots(copy_round)[2])
                 for copy_round in range_constexpr(2)
             ]
 
         # N offset and intra-row byte offset are K-invariant.
-        def make_b_voffsets(row_tile):
+        def make_b_voffsets(row_tile, is_up: bool = False):
             voffsets = []
             for copy_round in range_constexpr(2):
                 row, col_byte, _ = b_copy_round_slots(copy_round)
-                row = (
-                    ((row // 16) % 2) * 32
-                    + (row % 16) * 2
-                    + (row // 32) % 2
-                    + (row // 64) * 64
-                )
-                global_row = row_tile * block_n + fx.Int32(row)
-                voffsets.append(global_row * (hidden_size // 2) + fx.Int32(col_byte))
+                if const_expr(preshuffleB):
+                    # [I/16, 2gu, K/128, 4klane, 16nlane, 16byte].
+                    # A gate/up plane spans 8*K bytes; the K128 step is 1024B.
+                    n16 = n_tile_i32 * (block_n // 16) + fx.Int32(row // 16)
+                    voffsets.append(
+                        (n16 * 2 + int(is_up)) * (8 * hidden_size)
+                        + fx.Int32(col_byte * 16 + (row % 16) * 16)
+                    )
+                else:
+                    row = (
+                        ((row // 16) % 2) * 32
+                        + (row % 16) * 2
+                        + (row // 32) % 2
+                        + (row // 64) * 64
+                    )
+                    global_row = row_tile * block_n + fx.Int32(row)
+                    voffsets.append(
+                        global_row * (hidden_size // 2) + fx.Int32(col_byte)
+                    )
             return voffsets
 
         b_gate_dma_ptrs = [
@@ -862,7 +910,7 @@ def compile_moe_gateup_4w(
         b_up_dma_ptrs = [make_b_dma_ptrs(ptr) for ptr in (lds.b_up0.ptr, lds.b_up1.ptr)]
 
         def raw_b_mxfp4_g2s(k_block_idx, lds_ptrs, voffsets):
-            tile_soffset = fx.Int32(k_block_idx * (block_k // 2))
+            tile_soffset = fx.Int32(k_block_idx * b_k_tile_bytes)
             for copy_round in range_constexpr(2):
                 rocdl.raw_ptr_buffer_load_lds(
                     b_rsrc,
@@ -954,7 +1002,19 @@ def compile_moe_gateup_4w(
             for n0 in range_constexpr(4):
                 row = (n0 * 2 + wave_n) * 16 + lane_id % 16
                 col_byte = (lane_id // 16) * 16
-                if const_expr(b_lds_swizzle):
+                if const_expr(preshuffleB):
+                    # Preserve the original register/scale/epilogue row mapping.
+                    # The row permutation is now on the LDS consumer, while
+                    # producers copy consecutive 16-byte native lane slots.
+                    logical_n = (
+                        wave_n * 32 + (lane_id % 16) * 2 + n0 % 2 + (n0 // 2) * 64
+                    )
+                    lds_byte = (
+                        (logical_n // 16) * (16 * block_k // 2)
+                        + col_byte * 16
+                        + (logical_n % 16) * 16
+                    )
+                elif const_expr(b_lds_swizzle):
                     lds_byte = (
                         (row // 8) * (8 * block_k // 2)
                         + (row % 8) * 16
@@ -1063,7 +1123,7 @@ def compile_moe_gateup_4w(
         assert num_k_tiles >= 4 and num_k_tiles % 2 == 0
 
         b_gate_voffsets = make_b_voffsets(gate_row_tile)
-        b_up_voffsets = make_b_voffsets(up_row_tile)
+        b_up_voffsets = make_b_voffsets(up_row_tile, True)
         scale_b_gate_voffset = make_b_scale_voffset()
         scale_b_up_voffset = scale_b_gate_voffset
         scale_a_top_voffset = make_a_scale_voffset(a_top_scale_tile)
@@ -1523,12 +1583,16 @@ def compile_moe_gateup_4w(
                         + repeat_pair * 64
                     )
                     output_element = row_base + col
-                    buffer_ops.buffer_store(
-                        packed,
+                    # Preserve masked OOB stores without adding an EXEC branch.
+                    byte_offset = fx.Boolean(store_valid).select(
+                        fx.Int32(output_element * 2), fx.Int32(0x7FFFFFFF)
+                    )
+                    rocdl.raw_ptr_buffer_store(
+                        packed.ir_value(),
                         c_rsrc,
-                        output_element * 2,
-                        offset_is_bytes=True,
-                        mask=store_valid,
+                        byte_offset.ir_value(),
+                        fx.Int32(0).ir_value(),
+                        aux=ir.IntegerAttr.get(T.i32, 0),
                     )
 
         if const_expr(epilogue_overlap):
@@ -1650,8 +1714,8 @@ def compile_moe_gateup_4w(
         sorted_ids: fx.Tensor,
         expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
-        num_tokens: int,
-        num_expert_blocks: int,
+        num_tokens: fx.Int32,
+        num_expert_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         value_attrs = {
@@ -1687,6 +1751,7 @@ def run_accuracy_case(
     topk: int,
     num_experts: int,
     *,
+    preshuffleB: bool = False,
     b_lds_swizzle: bool = False,
     xcd_swizzle: bool = False,
     group_size_m: int = 1,
@@ -1695,9 +1760,17 @@ def run_accuracy_case(
     top_error_count: int = 20,
 ) -> bool | dict[str, object]:
     validate_case_parameters(tokens, intermediate_size, hidden_size, topk, num_experts)
+    if preshuffleB and b_lds_swizzle:
+        raise ValueError("preshuffleB uses dense B LDS; b_lds_swizzle is raw-B only")
     inputs = prepare_moe_inputs(
         tokens, intermediate_size, hidden_size, topk, num_experts
     )
+    weight = inputs["weight"]
+    if preshuffleB:
+        from aiter.ops.shuffle import shuffle_weight_a16w4
+
+        # Keep inputs["weight"] raw for the independent dequantized reference.
+        weight = shuffle_weight_a16w4(weight, 16, True)
     output = torch.full(
         (tokens, topk, intermediate_size),
         float("nan"),
@@ -1706,7 +1779,7 @@ def run_accuracy_case(
     )
     args = (
         inputs["a"].view(torch.int8).view(-1),
-        inputs["weight"].view(torch.int8),
+        weight.view(torch.int8),
         inputs["scale_a"],
         inputs["scale_b"],
         output.view(-1),
@@ -1722,6 +1795,7 @@ def run_accuracy_case(
         hidden_size,
         topk,
         num_experts,
+        preshuffleB=preshuffleB,
         b_lds_swizzle=b_lds_swizzle,
         xcd_swizzle=xcd_swizzle,
         group_size_m=group_size_m,
@@ -1746,7 +1820,8 @@ def run_accuracy_case(
     correct = allclose and diff <= 0.00001
     print(
         f"accuracy: shape={tuple(output.shape)} experts={num_experts} "
-        f"b_lds={'swizzle' if b_lds_swizzle else 'padding'} "
+        f"preshuffleB={preshuffleB} "
+        f"b_lds={'preshuffled_dense' if preshuffleB else 'swizzle' if b_lds_swizzle else 'padding'} "
         f"xcd_swizzle={xcd_swizzle} group_size_m={group_size_m} "
         f"expert_blocks={inputs['expert_ids'].numel()} finite={finite} "
         f"allclose={allclose} max_abs={max_abs:.6g} diff={diff:.6g}"
@@ -1783,6 +1858,7 @@ def run_accuracy_case(
             )
     if return_metrics:
         return {
+            "preshuffleB": preshuffleB,
             "output_shape": str(tuple(output.shape)),
             "expert_blocks": inputs["expert_ids"].numel(),
             "finite": finite,
@@ -1797,6 +1873,7 @@ def run_accuracy_case(
 def run_accuracy_matrix(
     output_csv: str,
     *,
+    preshuffleB: bool = False,
     b_lds_swizzle: bool = False,
     xcd_swizzle: bool = False,
     group_size_m: int = 1,
@@ -1807,6 +1884,7 @@ def run_accuracy_matrix(
         "topk",
         "num_experts",
         "intermediate_size",
+        "preshuffleB",
         "output_shape",
         "expert_blocks",
         "finite",
@@ -1838,6 +1916,7 @@ def run_accuracy_matrix(
                 "topk": topk,
                 "num_experts": num_experts,
                 "intermediate_size": intermediate_size,
+                "preshuffleB": preshuffleB,
                 "error": "",
             }
             try:
@@ -1848,6 +1927,7 @@ def run_accuracy_matrix(
                         hidden_size,
                         topk,
                         num_experts,
+                        preshuffleB=preshuffleB,
                         b_lds_swizzle=b_lds_swizzle,
                         xcd_swizzle=xcd_swizzle,
                         group_size_m=group_size_m,
@@ -1980,6 +2060,134 @@ def _prepare_aiter_benchmark_args(
     )
 
 
+def _prepare_opus_benchmark_args(aiter_args):
+    """Reuse FlyDSL's native A/B/scales and routing; preallocate FP8 outputs."""
+    a, weight, sorted_ids, expert_ids, valid_ids, out, scale_b, scale_a = aiter_args
+    if AITER_TILE_M != OPUS_TILE_M:
+        raise ValueError("Opus needs routing and A scales sorted for its block_m")
+    if out.shape[1] > 128:
+        raise ValueError("Opus stage1 requires topk <= 128 (signed packed route IDs)")
+    for tensor in (a, weight, scale_a, scale_b):
+        if tensor.numel() * tensor.element_size() > 0xFFFFFFFF:
+            raise ValueError(
+                "Opus input exceeds its 32-bit buffer extent; use --no-opus"
+            )
+    scale_rows = (
+        div_up(max(sorted_ids.numel(), expert_ids.numel() * OPUS_TILE_M), 256) * 256
+    )
+    scale_cols = div_up(out.shape[-1] // 32, 8) * 8
+    if max(out.numel(), scale_rows * scale_cols) > 0xFFFFFFFF:
+        raise ValueError("Opus output exceeds its 32-bit buffer extent; use --no-opus")
+
+    # Poison outputs before the untimed validation to detect unwritten routes.
+    # Scale padding is deliberately left NaN and excluded from validation.
+    opus_out = torch.full(out.shape, 0x7F, device=a.device, dtype=torch.uint8).view(
+        torch.float8_e4m3fn
+    )
+    out_scale = torch.full(
+        (scale_rows, scale_cols), 0xFF, device=a.device, dtype=torch.uint8
+    ).view(torch.float8_e8m0fnu)
+    return (
+        a,
+        weight,
+        sorted_ids,
+        expert_ids,
+        valid_ids,
+        opus_out,
+        scale_b,
+        scale_a,
+        out_scale,
+    )
+
+
+def _check_opus_benchmark_output(opus_args, reference):
+    """Check dequantized FP8 values and native scales on valid routes only.
+
+    Opus quantizes FP32 SiLU(gate)*up, whereas the existing reference is BF16.
+    Retain the BF16 check's 2%/0.01 allowance and add the E4M3 rounding bound:
+    1/16 relative for normals, half a subnormal step (scale/1024) near zero.
+    """
+    _, _, sorted_ids, _, valid_ids, out, _, _, out_scale = opus_args
+    tokens, topk, intermediate = reference.shape
+    rows, cols = out_scale.shape
+    if out.dtype != torch.float8_e4m3fn or out_scale.dtype != torch.float8_e8m0fnu:
+        raise AssertionError("Opus must return FP8 E4M3FN and E8M0 scales")
+    if out.shape != reference.shape or rows % 32 or cols % 8:
+        raise AssertionError("Opus output/scale shape mismatch")
+    # Invert [R/32, G/8, 4g0, 16r0, 2g1, 2r1], not a row-major scale view.
+    raw_scale = (
+        out_scale.view(torch.uint8)
+        .view(rows // 32, cols // 8, 4, 16, 2, 2)
+        .permute(0, 5, 3, 1, 4, 2)
+        .contiguous()
+        .view(rows, cols)
+    )
+    num_sorted = int(valid_ids[0].item())
+    packed = sorted_ids[:num_sorted]
+    token_ids = (packed & TOKEN_MASK).long()
+    slot_ids = ((packed >> 24) & 0xFF).long()
+    valid = (token_ids < tokens) & (slot_ids < topk)
+    valid_routes = int(valid.sum().item())
+    if valid_routes != tokens * topk:
+        raise AssertionError(
+            "Opus validation routing does not cover all token/topk rows"
+        )
+    token_ids, slot_ids = token_ids[valid], slot_ids[valid]
+    scales = (
+        raw_scale[:num_sorted][valid, : intermediate // 32]
+        .contiguous()
+        .view(torch.float8_e8m0fnu)
+        .float()
+    )
+    # Gather bytes: advanced indexing is not supported for every FP8 dtype.
+    quantized = (
+        out.view(torch.uint8)[token_ids, slot_ids]
+        .view(torch.float8_e4m3fn)
+        .float()
+        .view(-1, intermediate // 32, 32)
+    )
+    actual = quantized * scales.unsqueeze(-1)
+    expected = reference[token_ids, slot_ids].float().view_as(actual)
+    if not bool(torch.isfinite(actual).all() & torch.isfinite(scales).all()):
+        raise AssertionError("Opus produced non-finite values or valid-route scales")
+
+    # RCEIL scale = ceil_pow2(amax/448): a nonzero group's amax lies in
+    # (224*scale, 448*scale]. Allow only the existing BF16 reference tolerance
+    # at scale boundaries; do not require exact bytes after BF16 rounding.
+    amax = expected.abs().amax(dim=-1)
+    scale_ok = (amax <= 448 * scales * 1.02 + 0.01) & (
+        amax + 0.01 >= 224 * scales * 0.98
+    )
+    error = (actual - expected).abs()
+    bound = expected.abs() * (0.02 + 1 / 16) + 0.01 + scales.unsqueeze(-1) / 1024
+    max_abs = error.max().item()
+    if not bool(scale_ok.all() & (error <= bound).all()):
+        raise AssertionError(
+            f"Opus FP8 validation failed: max_abs={max_abs:.6g}, "
+            f"bad_scales={int((~scale_ok).sum().item())}, "
+            f"bad_values={int((error > bound).sum().item())}"
+        )
+    relative_l2 = (
+        torch.linalg.vector_norm(error)
+        / torch.linalg.vector_norm(expected).clamp_min(1e-30)
+    ).item()
+    print(
+        f"output: opus_finite=True opus_scale_check=True "
+        f"dequant_max_abs={max_abs:.6g} relative_l2={relative_l2:.6g} "
+        "semantics=swiglu_unclamped+fp8_quant"
+    )
+    return {
+        "finite": True,
+        "scale_check": True,
+        "valid_routes": valid_routes,
+        "dequant_max_abs": max_abs,
+        "relative_l2": relative_l2,
+        "elementwise_rtol": 0.02 + 1 / 16,
+        "elementwise_atol": 0.01,
+        "subnormal_atol_per_scale": 1 / 1024,
+    }
+
+
 def run_benchmark(
     tokens: int = 8192,
     intermediate_size: int = 256,
@@ -1990,12 +2198,14 @@ def run_benchmark(
     iterations: int = 20,
     data_clones: int = 20,
     *,
+    preshuffleB: bool = False,
     b_lds_swizzle: bool = False,
     xcd_swizzle: bool = True,
     group_size_m: int = 4,
     aiter_xcd_swizzle: int = 8,
+    include_opus: bool = True,
 ) -> dict:
-    """Compare PyHIP and AIter SwiGLU on shared inputs, outside setup/JIT time."""
+    """Compare stage1 backends outside setup/JIT; Opus additionally quantizes."""
 
     validate_case_parameters(tokens, intermediate_size, hidden_size, topk, num_experts)
     if warmup < 0:
@@ -2008,6 +2218,8 @@ def run_benchmark(
         raise ValueError("group_size_m must be positive")
     if aiter_xcd_swizzle < 0:
         raise ValueError("aiter_xcd_swizzle must be non-negative")
+    if preshuffleB and b_lds_swizzle:
+        raise ValueError("preshuffleB uses dense B LDS; b_lds_swizzle is raw-B only")
 
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
 
@@ -2019,9 +2231,15 @@ def run_benchmark(
         device="cuda",
         dtype=torch.bfloat16,
     )
+    aiter_args = _prepare_aiter_benchmark_args(
+        inputs, tokens, intermediate_size, hidden_size, topk, num_experts
+    )
+    # Shuffle once outside timing. In native mode all three implementations
+    # consume exactly the same W1 bytes; each still uses its own M routing.
+    weight = aiter_args[1] if preshuffleB else inputs["weight"]
     moe_args = (
         inputs["a"].view(torch.int8).view(-1),
-        inputs["weight"].view(torch.int8),
+        weight.view(torch.int8),
         inputs["scale_a"],
         inputs["scale_b"],
         output.view(-1),
@@ -2037,14 +2255,47 @@ def run_benchmark(
         hidden_size,
         topk,
         num_experts,
+        preshuffleB=preshuffleB,
         b_lds_swizzle=b_lds_swizzle,
         xcd_swizzle=xcd_swizzle,
         group_size_m=group_size_m,
     )
     moe_kernel = flyc.compile[{"opt_level": 2}](moe_launcher, *moe_args)
-    aiter_args = _prepare_aiter_benchmark_args(
-        inputs, tokens, intermediate_size, hidden_size, topk, num_experts
-    )
+    if include_opus:
+        from aiter import ActivationType
+        from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
+
+        opus_args = _prepare_opus_benchmark_args(aiter_args)
+
+        def run_opus(
+            a,
+            weight,
+            sorted_ids,
+            expert_ids,
+            valid_ids,
+            out,
+            scale_b,
+            scale_a,
+            out_scale,
+        ):
+            return opus_moe_stage1_a8w4_fwd(
+                hidden_states=a,
+                w1=weight,
+                hidden_scale=scale_a,
+                w1_scale=scale_b,
+                sorted_token_ids=sorted_ids,
+                sorted_expert_ids=expert_ids,
+                num_valid_ids=valid_ids,
+                topk=topk,
+                inter_dim_pad=0,
+                block_m=OPUS_TILE_M,
+                kernelName=OPUS_KERNEL_NAME,
+                activation=ActivationType.Silu.value,
+                out=out,
+                out_scale=out_scale,
+                output_sorted=False,
+                swiglu_limit=None,
+            )
 
     def run_aiter(a, weight, sorted_ids, expert_ids, valid_ids, out, scale_b, scale_a):
         flydsl_moe_stage1(
@@ -2068,11 +2319,14 @@ def run_benchmark(
             b_nt=0,
             xcd_swizzle=aiter_xcd_swizzle,
             swiglu_limit=None,
+            # Newer AIter can return sorted quantized rows; retain the public
+            # per-token BF16 output contract used by this comparison.
+            v2_output_layout=False,
             w1_scale=scale_b,
             a1_scale=scale_a,
         )
 
-    # Compile/launch both once even when warmup=0. Never time correctness,
+    # Compile/launch each once even when warmup=0. Never time correctness,
     # weight/scale shuffling, routing, or first-call compilation.
     run_aiter(*aiter_args)
     moe_kernel(*moe_args)
@@ -2088,6 +2342,20 @@ def run_benchmark(
     if not (aiter_finite and pyhip_finite):
         raise AssertionError("stage1 produced a non-finite output")
     torch.testing.assert_close(output, aiter_output, rtol=0.02, atol=0.01)
+    if include_opus:
+        print(
+            f"opus: kernel={OPUS_KERNEL_NAME} block_m={OPUS_TILE_M} "
+            "output=fp8_e4m3fn+e8m0 (fused quantization; not BF16-equivalent)",
+            flush=True,
+        )
+        run_opus(*opus_args)
+        torch.cuda.synchronize()
+        opus_validation = _check_opus_benchmark_output(opus_args, output)
+        opus_rw_bytes = sum(
+            value.numel() * value.element_size()
+            for value in opus_args
+            if isinstance(value, torch.Tensor)
+        )
 
     moe_rw_bytes = sum(
         value.numel() * value.element_size()
@@ -2105,10 +2373,10 @@ def run_benchmark(
     effective_flops = 2 * routed_rows * (2 * intermediate_size) * hidden_size
     padded_flops = 2 * padded_rows * (2 * intermediate_size) * hidden_size
     aiter_padded_flops = 2 * aiter_padded_rows * (2 * intermediate_size) * hidden_size
-    del inputs, output, aiter_output
+    del inputs, weight, output, aiter_output
 
     # Match the comparison driver's order and keep only one backend's cloned
-    # argument sets resident at a time. Both use the same warmup/clone/sample counts.
+    # argument sets resident at a time. All use the same warmup/clone/sample counts.
     aiter_arg_sets = _clone_benchmark_args(aiter_args, data_clones)
     for arg_set in aiter_arg_sets:
         arg_set[1].is_shuffled = True
@@ -2132,24 +2400,43 @@ def run_benchmark(
         effective_flops,
         padded_flops,
         moe_rw_bytes,
-        f"moe_gateup_xcd{int(xcd_swizzle)}_group{group_size_m}",
+        f"moe_gateup_preB{int(preshuffleB)}_xcd{int(xcd_swizzle)}_group{group_size_m}",
         warmup,
         iterations,
     )
     del moe_arg_sets, moe_args, moe_kernel
     torch.cuda.empty_cache()
 
+    if include_opus:
+        opus_arg_sets = _clone_benchmark_args(opus_args, data_clones)
+        opus_best, opus_median = _benchmark_kernel(
+            run_opus,
+            opus_arg_sets,
+            effective_flops,
+            aiter_padded_flops,
+            opus_rw_bytes,
+            "opus_stage1_fp8_fused_quant",
+            warmup,
+            iterations,
+        )
+        del opus_arg_sets, opus_args
+        torch.cuda.empty_cache()
+
     print(
-        f"benchmark: b_lds={'swizzle' if b_lds_swizzle else 'padding'} "
+        f"benchmark: preshuffleB={preshuffleB} "
+        f"b_lds={'preshuffled_dense' if preshuffleB else 'swizzle' if b_lds_swizzle else 'padding'} "
         f"xcd_swizzle={xcd_swizzle} group_size_m={group_size_m} "
         f"routed_rows={routed_rows} padded_rows={padded_rows} "
         f"aiter_padded_rows={aiter_padded_rows} aiter_xcd_swizzle={aiter_xcd_swizzle} "
         f"clones={data_clones} warmup={warmup} runs={iterations}"
     )
-    for name, best, median in (
+    timings = [
         ("aiter", aiter_best, aiter_median),
         ("moe", moe_best, moe_median),
-    ):
+    ]
+    if include_opus:
+        timings.append(("opus_fp8_fused_quant", opus_best, opus_median))
+    for name, best, median in timings:
         print(
             f"{name}:  best={best[0]:.6f} ms median={median[0]:.6f} ms "
             f"best_effective_tput={best[1]:.2f} TFLOPS "
@@ -2165,6 +2452,7 @@ def run_benchmark(
     )
     result = {
         "activation": "swiglu_unclamped",
+        "preshuffleB": preshuffleB,
         "tokens": tokens,
         "gate_up_size": 2 * intermediate_size,
         "hidden_size": hidden_size,
@@ -2183,6 +2471,24 @@ def run_benchmark(
             "median_latency_us": median[0] * 1.0e3,
             "effective_tflops": best[1],
             "padded_tflops": best[2],
+            "output_dtype": "bf16",
+            "fused_quant": False,
+        }
+    if include_opus:
+        result["opus"] = {
+            "kernel_name": OPUS_KERNEL_NAME,
+            "block_m": OPUS_TILE_M,
+            "padded_tokens": aiter_padded_rows,
+            "latency_us": opus_best[0] * 1.0e3,
+            "median_latency_us": opus_median[0] * 1.0e3,
+            "effective_tflops": opus_best[1],
+            "padded_tflops": opus_best[2],
+            "output_dtype": "fp8_e4m3fn",
+            "output_scale_dtype": "fp8_e8m0fnu",
+            "output_layout": "token_topk",
+            "fused_quant": True,
+            "bf16_equivalent": False,
+            "validation": opus_validation,
         }
     print("BENCH_RESULT " + json.dumps(result, sort_keys=True), flush=True)
     return result
@@ -2198,7 +2504,15 @@ def main() -> None:
         default="moe_mxfp8_mxfp4_gateup_4w_accuracy.csv",
     )
     parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("--b-lds-swizzle", action="store_true")
+    b_layout = parser.add_mutually_exclusive_group()
+    b_layout.add_argument("--b-lds-swizzle", action="store_true")
+    b_layout.add_argument(
+        "--preshuffleB",
+        "--preshuffle-b",
+        dest="preshuffleB",
+        action="store_true",
+        help="use AIter G1U1 preshuffled MXFP4 weights and dense B LDS",
+    )
     swizzle = parser.add_mutually_exclusive_group()
     swizzle.add_argument("--xcd-swizzle", action="store_true", dest="xcd_swizzle")
     swizzle.add_argument(
@@ -2210,6 +2524,11 @@ def main() -> None:
     parser.set_defaults(xcd_swizzle=True)
     parser.add_argument("--group-size-m", "--pyhip-group-size-m", type=int, default=4)
     parser.add_argument("--aiter-xcd-swizzle", type=int, default=8)
+    parser.add_argument(
+        "--no-opus",
+        action="store_true",
+        help="keep the two BF16 backends only (default also benchmarks Opus FP8+quant)",
+    )
     parser.add_argument(
         "--tokens",
         type=int,
@@ -2254,6 +2573,7 @@ def main() -> None:
             512,
             2,
             3,
+            preshuffleB=args.preshuffleB,
             b_lds_swizzle=args.b_lds_swizzle,
             xcd_swizzle=args.xcd_swizzle,
             group_size_m=args.group_size_m,
@@ -2267,6 +2587,7 @@ def main() -> None:
             args.hidden_size,
             args.topk,
             args.num_experts,
+            preshuffleB=args.preshuffleB,
             b_lds_swizzle=args.b_lds_swizzle,
             xcd_swizzle=args.xcd_swizzle,
             group_size_m=args.group_size_m,
@@ -2276,6 +2597,7 @@ def main() -> None:
     if args.accuracy_matrix:
         run_accuracy_matrix(
             args.accuracy_csv,
+            preshuffleB=args.preshuffleB,
             b_lds_swizzle=args.b_lds_swizzle,
             xcd_swizzle=args.xcd_swizzle,
             group_size_m=args.group_size_m,
@@ -2287,7 +2609,7 @@ def main() -> None:
             print(
                 f"\n########case: M={tokens} intermediate={args.intermediate_size} hidden_sz={args.hidden_size} "
                 f"topk={args.topk} experts={args.num_experts} clones={args.data_clones} "
-                f"warmup={args.warmup} iterations={args.iterations}"
+                f"warmup={args.warmup} iterations={args.iterations} preshuffleB={args.preshuffleB}"
             )
             results.append(
                 run_benchmark(
@@ -2299,19 +2621,28 @@ def main() -> None:
                     args.warmup,
                     args.iterations,
                     args.data_clones,
+                    preshuffleB=args.preshuffleB,
                     b_lds_swizzle=args.b_lds_swizzle,
                     xcd_swizzle=args.xcd_swizzle,
                     group_size_m=args.group_size_m,
                     aiter_xcd_swizzle=args.aiter_xcd_swizzle,
+                    include_opus=not args.no_opus,
                 )
             )
         print("\n[summary]:")
         for result in results:
             aiter_us = result["aiter"]["latency_us"]
             pyhip_us = result["pyhip"]["latency_us"]
+            opus_text = (
+                f"opus_fp8+quant={result['opus']['latency_us']:8.3f} us "
+                if "opus" in result
+                else ""
+            )
             print(
                 f"M={result['tokens']:5d} intermediate_sz={args.intermediate_size} hidden_sz={result['hidden_size']:5d} "
+                f"preshuffleB={result['preshuffleB']} "
                 f"aiter={aiter_us:8.3f} us pyhip={pyhip_us:8.3f} us "
+                f"{opus_text}"
                 f"tput={aiter_us / pyhip_us:.3f}x "
                 f"padded_tflops={result['pyhip']['padded_tflops'] / result['aiter']['padded_tflops']:.3f}x "
                 f"padded_tflops={result['pyhip']['padded_tflops']:.1f}TFLOPS "
