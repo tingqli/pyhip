@@ -512,10 +512,15 @@ def compile_fp8_stage1_giu1(
                 value = Vec(value).bitcast(fx.Int32)
                 # Keep the DWORD boundary opaque to byte-vector legalization.
                 # Tied operands make this an identity with no machine instruction.
-                value = Vec(_llvm.inline_asm(
-                    T.vec(16, T.i32), [value.ir_value()], "", "=v,0",
-                    has_side_effects=True,
-                ))
+                value = Vec(
+                    _llvm.inline_asm(
+                        T.vec(16, T.i32),
+                        [value.ir_value()],
+                        "",
+                        "=v,0",
+                        has_side_effects=True,
+                    )
+                )
             return value
 
         # Drain routing VMEM before the pipeline's counted DMA batches start.
@@ -796,7 +801,8 @@ def check_native_weight_layout(b_lds_padding=0):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     lds_address = (
                         (tid // 64) * (16 * 128 + b_lds_padding)
-                        + (tid % 64) * 16 + chunk * 1024
+                        + (tid % 64) * 16
+                        + chunk * 1024
                     )
                     local_row, local_col = row % 128, col % 128
                     consumer_address = (
