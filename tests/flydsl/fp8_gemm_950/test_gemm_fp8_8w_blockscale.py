@@ -199,6 +199,14 @@ def compile_gemm_fp8_8wave(
 
         lds = fx.SharedAllocator().allocate(LDS).peek()
 
+        # B采用得128x128 scale, BM*BK=256x256, 一次loop MFMA得Bscale是 2个Dword被不同的lane复用。
+        # 把所有的Bscale copy 进LDS. 一次dword copy就可以满足 32*1024*1024 的weight 元素个数，32*1024*1024
+        # 理论上大部分weight都可以通过一次buffer_load满足。所以放到LDS
+        #  copy type           一次copy需要LDS bytes       weight元素个数
+        # DWORDX4 copy          512*16 = 8KB              512*4*128*128=33554432 = 32*1024*1024
+        # DWORD copy             512*4 = 2KB              512*128*128=8388608 = 8*1024*1024
+        # todo: 加入LDS assert
+
         # Stage the complete ScaleB tile before constructing any tiled-MMA or
         # accumulator fragments. The wait/barrier closes this register lifetime,
         # allowing the loader's address VGPRs to be reused by the MFMA pipeline.
@@ -221,6 +229,8 @@ def compile_gemm_fp8_8wave(
             tail_elems = remaining_elems - loaded_32b
             scale_b_global_base = fx.Int32(bid_y * scaleB_elems * 4)
 
+            # DWORDX4 copy B scale into LDS
+            # N * K >=32*1024*1024
             if const_expr(rounds_128b > 0):
                 lane_byte_offset_128b = fx.Int32(tid * 16)
                 wave_offset_128b = rocdl.readfirstlane(
@@ -241,12 +251,12 @@ def compile_gemm_fp8_8wave(
                         fx.Int32(0),
                         fx.Int32(0),
                     )
-
             if const_expr(remaining_elems > 0):
                 lane_byte_offset_32b = fx.Int32(tid * 4)
                 wave_offset_32b = rocdl.readfirstlane(
                     T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 4))
                 )
+                # 剩下的数据     8*1024*1024  <= remaining < 32*1024*1024
                 for copy_round in range_constexpr(rounds_32b):
                     round_elem_offset = loaded_128b + copy_round * total_lanes
                     scale_b_dst = _lds_byte_ptr(
@@ -262,7 +272,7 @@ def compile_gemm_fp8_8wave(
                         fx.Int32(0),
                         fx.Int32(0),
                     )
-
+                # remaining < 8*1024*1024
                 if const_expr(tail_elems > 0):
                     if tid < tail_elems:
                         tail_elem_offset = loaded_128b + loaded_32b
@@ -1335,15 +1345,27 @@ def run_test(
     bf16_ref = ref.to(torch.bfloat16)
 
     # Report both the FP32 reference error and the BF16-rounded comparison.
-    diff = pyhip.calc_diff(out_f32, ref)
-    diff_bf16ref = pyhip.calc_diff(out_f32, bf16_ref.float())
-    is_correct = diff < 0.01
+    finite = bool(torch.isfinite(out_f32).all() & torch.isfinite(ref).all())
+    diff_threshold = 0.00001
+    diff = pyhip.calc_diff(out_f32, ref) if finite else float("inf")
+    diff_bf16ref = (
+        pyhip.calc_diff(out_f32, bf16_ref.float()) if finite else float("inf")
+    )
+    allclose = finite and torch.allclose(out_f32, ref, rtol=0.02, atol=0.01)
+    diff_ok = finite and diff <= diff_threshold
+    is_correct = diff_ok and allclose
     print(
         f"####M={M} N={N} K={K} 8wave preshuffle_b={preshuffle_b} with_scale={with_scale}, useTiledDMA={useTiledDMA} "
         f"split_m={split_m} "
-        f"is_correct={is_correct} calc_diff(vs f32 ref)={diff:.6f} "
-        f"calc_diff(vs bf16 ref)={diff_bf16ref:.6f}"
+        f"is_correct={is_correct} finite={finite} allclose={allclose} "
+        f"calc_diff(vs f32 ref)={diff:.9g} diff_thr={diff_threshold:.9g} "
+        f"diff_ok={diff_ok} calc_diff(vs bf16 ref)={diff_bf16ref:.9g}",
+        flush=True,
     )
+    if not finite:
+        raise AssertionError("non-finite GEMM output or reference")
+    pyhip.calc_diff(out_f32, ref, diff_thr=0.00001)
+    torch.testing.assert_close(out_f32, ref, rtol=0.02, atol=0.01)
 
     if not perf:
         return is_correct
