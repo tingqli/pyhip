@@ -15,6 +15,7 @@ Output is [tokens, topk, I]; routing weights are NOT applied in stage1.
 The compute pipeline is the 8-wave, 256x256, half-M single-FIFO GEMM:
 TL0/TR0/BL0/BR0, then TL1/TR1/BL1/BR1. Left/right mean gate/up here.
 Each phase interleaves old-partial FP32 FMA with independent new MFMA.
+Workgroups use 256-WG XCD batches, with no M grouping by default.
 I must be a multiple of 128 and K a multiple of 256 (at least 256).
 The module is importable; CLI modes include --small-accuracy, --accuracy,
 --accuracy-matrix, --layout-check and --benchmark.
@@ -90,44 +91,36 @@ def compile_fp8_stage1_giu1(
     num_experts,
     *,
     xcd_swizzle=True,
-    group_size_m=4,
-    prefetch_store_ids=True,
-    b_lds_padding=0,
-    packed_b_carry=True,
+    group_size_m=1,
 ):
     """Build a half-M, single-FIFO kernel for AIter-native FP8 weight bytes.
 
     Routing must contain complete 256-row expert blocks, each assigned to a
     valid local expert. Padding uses an invalid token/slot; each real
     (token, slot) must appear exactly once. No EP expert masking or bias.
-    Native B slabs are read coalesced into LDS without padding by default.
-    B's loop carry uses packed DWORDs, not individual FP8 bytes. Output routing IDs
-    are prefetched by default; disable prefetch_store_ids for lower VGPR use.
+    Native B slabs are read coalesced into unpadded LDS. B's loop carry uses
+    packed DWORDs and output routing IDs are prefetched before the K loop.
+    The retained pipeline is half-M, one FIFO, B lookahead and scalar B scales;
+    no full-M, K-unroll, priority-switch or alternative loader experiments.
     """
     validate_parameters(1, intermediate_size, hidden_size, topk, num_experts)
     if group_size_m <= 0:
         raise ValueError("group_size_m must be positive")
-    if b_lds_padding not in (0, 64):
-        raise ValueError("b_lds_padding must be 0 or 64 bytes per N16 group")
     kb_count = hidden_size // BLOCK_K
     n_tiles = intermediate_size // BLOCK_N
     a_group8 = 8 * BLOCK_K + 16
     a_group16 = 2 * a_group8 + 32
     lds_operand_elems = (BLOCK_M // 16) * a_group16
-    b_group16 = 16 * BLOCK_K + b_lds_padding
+    b_group16 = 16 * BLOCK_K
     b_lds_elems = (BLOCK_N // 16) * b_group16
 
     def _get_pids(pid, m_tiles, grid_size):
         if const_expr(xcd_swizzle):
-            per_xcd = (grid_size + 7) // 8
-            tall = grid_size % 8
-            tall = (tall == 0).select(8, tall)
-            xcd = pid % 8
-            local = pid // 8
-            if xcd < tall:
-                pid = xcd * per_xcd + local
-            else:
-                pid = tall * per_xcd + (xcd - tall) * (per_xcd - 1) + local
+            # Match bounded XCD batches without scattering adjacent experts
+            # over the full grid. Leave the incomplete final batch linear.
+            full_batches = grid_size - grid_size % 256
+            if pid < full_batches:
+                pid = (pid // 256) * 256 + (pid % 8) * 32 + (pid % 256) // 8
         group_id = pid // (group_size_m * n_tiles)
         first_m = group_id * group_size_m
         remaining = m_tiles - first_m
@@ -260,12 +253,11 @@ def compile_fp8_stage1_giu1(
                 )
             )
 
-        if const_expr(prefetch_store_ids):
-            store_ids = [
-                sorted_id(bottom * 128 + repeat * 32 + wave_m * 16 + lane_id % 16)
-                for bottom in range_constexpr(2)
-                for repeat in range_constexpr(4)
-            ]
+        store_ids = [
+            sorted_id(bottom * 128 + repeat * 32 + wave_m * 16 + lane_id % 16)
+            for bottom in range_constexpr(2)
+            for repeat in range_constexpr(4)
+        ]
 
         # Exactly the GEMM producer's row permutation. Two DWORDx4 copies
         # cover one A128xK128 operand; replace its row index with token ID.
@@ -507,21 +499,18 @@ def compile_fp8_stage1_giu1(
             rocdl.sched_barrier(0)
 
         def load_b_carry():
-            value = frag_bl.load()
-            if const_expr(packed_b_carry):
-                value = Vec(value).bitcast(fx.Int32)
-                # Keep the DWORD boundary opaque to byte-vector legalization.
-                # Tied operands make this an identity with no machine instruction.
-                value = Vec(
-                    _llvm.inline_asm(
-                        T.vec(16, T.i32),
-                        [value.ir_value()],
-                        "",
-                        "=v,0",
-                        has_side_effects=True,
-                    )
+            value = Vec(frag_bl.load()).bitcast(fx.Int32)
+            # Keep the DWORD boundary opaque to byte-vector legalization.
+            # Tied operands make this an identity with no machine instruction.
+            return Vec(
+                _llvm.inline_asm(
+                    T.vec(16, T.i32),
+                    [value.ir_value()],
+                    "",
+                    "=v,0",
+                    has_side_effects=True,
                 )
-            return value
+            )
 
         # Drain routing VMEM before the pipeline's counted DMA batches start.
         rocdl.sched_barrier(0)
@@ -578,10 +567,7 @@ def compile_fp8_stage1_giu1(
             frag_p.store(states[4])
             old_a = Vec(states[5])
             old_b = fx.Float32(states[6])
-            if const_expr(packed_b_carry):
-                frag_bl.store(Vec(states[7]).bitcast(Float8E4M3FN))
-            else:
-                frag_bl.store(states[7])
+            frag_bl.store(Vec(states[7]).bitcast(Float8E4M3FN))
             kiter = fx.Int32(k_index)
             for tile in range_constexpr(2):
                 ki = kiter + tile
@@ -668,11 +654,7 @@ def compile_fp8_stage1_giu1(
         def store_gate_up(gates, ups, bottom):
             for row_repeat in range_constexpr(4):
                 row = bottom * 128 + row_repeat * 32 + wave_m * 16 + lane_id % 16
-                fused = (
-                    store_ids[bottom * 4 + row_repeat]
-                    if const_expr(prefetch_store_ids)
-                    else sorted_id(row)
-                )
+                fused = store_ids[bottom * 4 + row_repeat]
                 token, slot = fused & TOKEN_MASK, (fused >> 24) & 255
                 valid = (
                     (token < num_tokens)
@@ -760,7 +742,7 @@ def compile_fp8_stage1_giu1(
     return launch_stage1
 
 
-def check_native_weight_layout(b_lds_padding=0):
+def check_native_weight_layout():
     """CPU byte-level check against the actual AIter shuffle, not its flag."""
     from aiter.ops.shuffle import shuffle_weight
 
@@ -800,13 +782,13 @@ def check_native_weight_layout(b_lds_padding=0):
                     )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     lds_address = (
-                        (tid // 64) * (16 * 128 + b_lds_padding)
+                        (tid // 64) * (16 * 128)
                         + (tid % 64) * 16
                         + chunk * 1024
                     )
                     local_row, local_col = row % 128, col % 128
                     consumer_address = (
-                        (local_row // 16) * (16 * 128 + b_lds_padding)
+                        (local_row // 16) * (16 * 128)
                         + (local_col // 16) * 256
                         + (local_row % 16) * 16
                     )
@@ -1023,7 +1005,7 @@ def run_case(
     routing="balanced",
     data_case="random",
     xcd_swizzle=True,
-    group_size_m=4,
+    group_size_m=1,
     benchmark=False,
     warmup=5,
     iterations=20,
@@ -1182,7 +1164,7 @@ def main():
         default="random",
     )
     parser.add_argument("--no-xcd-swizzle", action="store_true")
-    parser.add_argument("--group-size-m", type=int, default=4)
+    parser.add_argument("--group-size-m", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--data-clones", type=int, default=4)
