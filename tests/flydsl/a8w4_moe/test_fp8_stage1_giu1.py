@@ -13,8 +13,10 @@ A and scale_a are gathered through expert-major packed sorted token IDs.
 Output is [tokens, topk, I]; routing weights are NOT applied in stage1.
 
 The compute pipeline is the 8-wave, 256x256, half-M single-FIFO GEMM:
-TL0/TR0/BL0/BR0, then TL1/TR1/BL1/BR1. Left/right mean gate/up here.
+TL[s0]/TR[s0]/BL[s0]/BR[s0], then TL[s1]/TR[s1]/BL[s1]/BR[s1].
+Here s0/s1 denote slice0/slice1; left/right mean gate/up.
 Each phase interleaves old-partial FP32 FMA with independent new MFMA.
+Each A64xK128 M slice has an independent LDS entry and a single DMA instruction.
 Workgroups use 256-WG XCD batches, with no M grouping by default.
 I must be a multiple of 128 and K a multiple of 256 (at least 256).
 The module is importable; CLI modes include --small-accuracy, --accuracy,
@@ -35,6 +37,12 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm, vector
 
+# 每个 WG 处理同一 expert 的 256 条排序路由行（含 padding）。
+# N 方向分别计算 128 个 gate 和对应的 128 个 up：合计 256 列中间结果，
+# 在寄存器中做 SiLU(gate) * up 后仅输出 128 列，而不是输出 256 列。
+# BLOCK_M=128 是 top/bottom 各自的行数；BLOCK_N=128 是 gate/up 各自的列数。
+# 权重仍是 GGUU（所有 gate 行在前、所有 up 行在后）；融合计算不等于
+# gate/up interleave，shuffle_weight(16,16) 只做矩阵内部的分块重排。
 SORT_BLOCK_M = 256
 BLOCK_M = 128
 BLOCK_N = 128
@@ -108,9 +116,13 @@ def compile_fp8_stage1_giu1(
         raise ValueError("group_size_m must be positive")
     kb_count = hidden_size // BLOCK_K
     n_tiles = intermediate_size // BLOCK_N
+    # Keep A64 padding: tested row-major XOR layouts were slower on the main
+    # gfx950 targets, even with precomputed offsets and zero register spills.
+    # Saving 2KiB of LDS did not improve measured end-to-end kernel latency.
     a_group8 = 8 * BLOCK_K + 16
     a_group16 = 2 * a_group8 + 32
-    lds_operand_elems = (BLOCK_M // 16) * a_group16
+    a_slice_rows = BLOCK_M // 2
+    a_lds_elems = (a_slice_rows // 16) * a_group16
     b_group16 = 16 * BLOCK_K
     b_lds_elems = (BLOCK_N // 16) * b_group16
 
@@ -134,14 +146,27 @@ def compile_fp8_stage1_giu1(
 
     @fx.struct
     class LDS:
-        a_t0: fx.Array[Float8E4M3FN, lds_operand_elems, 16]
-        a_b0: fx.Array[Float8E4M3FN, lds_operand_elems, 16]
-        a_t1: fx.Array[Float8E4M3FN, lds_operand_elems, 16]
-        a_b1: fx.Array[Float8E4M3FN, lds_operand_elems, 16]
+        ##LDS A ping buffer
+        a_t0_slice0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_t0_slice1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_b0_slice0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_b0_slice1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+
+        ##LDS A pong buffer
+        a_t1_slice0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_t1_slice1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_b1_slice0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_b1_slice1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+
+        ##LDS B ping buffer
         b_l0: fx.Array[Float8E4M3FN, b_lds_elems, 16]
-        b_l1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
         b_r0: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+
+        ##LDS B pong buffer
+        b_l1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
         b_r1: fx.Array[Float8E4M3FN, b_lds_elems, 16]
+        # One DMA per K128 tile: 256 row scales duplicated across 512 lanes.
+        # Both compute M slices share these entries; do not split the scales.
         scale_a0: fx.Array[Float32, 512, 4]
         scale_a1: fx.Array[Float32, 512, 4]
 
@@ -195,12 +220,26 @@ def compile_fp8_stage1_giu1(
             fx.Int64(expert) * (2 * n_tiles * kb_count * 4),
         )
         lds = fx.SharedAllocator().allocate(LDS).peek()
+        # Map the low two logical row bits to the padded 16-row groups.
+        # The matching producer below preserves a single 8KiB DMA per M slice.
         read_layout = fx.make_layout(
-            ((2, BLOCK_M // 16, 8), (32, BLOCK_K // 32)),
-            ((a_group8, a_group16, BLOCK_K), (1, 32)),
+            ((a_slice_rows // 16, 2, 8), (32, BLOCK_K // 32)),
+            ((a_group16, a_group8, BLOCK_K), (1, 32)),
         )
-        a_top = [fx.make_view(p, read_layout) for p in (lds.a_t0.ptr, lds.a_t1.ptr)]
-        a_bottom = [fx.make_view(p, read_layout) for p in (lds.a_b0.ptr, lds.a_b1.ptr)]
+        a_top = [
+            [fx.make_view(p, read_layout) for p in pair]
+            for pair in (
+                (lds.a_t0_slice0.ptr, lds.a_t0_slice1.ptr),
+                (lds.a_t1_slice0.ptr, lds.a_t1_slice1.ptr),
+            )
+        ]
+        a_bottom = [
+            [fx.make_view(p, read_layout) for p in pair]
+            for pair in (
+                (lds.a_b0_slice0.ptr, lds.a_b0_slice1.ptr),
+                (lds.a_b1_slice0.ptr, lds.a_b1_slice1.ptr),
+            )
+        ]
         # Keep native N16/K16 bytes in LDS. Move the existing logical-row
         # permutation to the consumer so each producer wave reads 1024B
         # contiguously instead of eight scattered rows from eight N16 groups.
@@ -227,10 +266,7 @@ def compile_fp8_stage1_giu1(
         copy_a = fx.make_tiled_copy_B(copy_atom, tiled_mma).get_slice(tid)
         copy_b = fx.make_tiled_copy_A(copy_atom, tiled_mma).get_slice(tid)
 
-        def a_part(view, part):
-            return fx.flat_divide(view, (64, BLOCK_K))[None, None, part, 0]
-
-        frag_a = thread_mma.make_fragment_B(a_part(a_top[0], 0))
+        frag_a = thread_mma.make_fragment_B(a_top[0][0])
         frag_bl = thread_mma.make_fragment_A(b_gate[0])
         frag_br = thread_mma.make_fragment_A(b_up[0])
         dest_a = copy_a.retile(frag_a)
@@ -259,13 +295,15 @@ def compile_fp8_stage1_giu1(
             for repeat in range_constexpr(4)
         ]
 
-        # Exactly the GEMM producer's row permutation. Two DWORDx4 copies
-        # cover one A128xK128 operand; replace its row index with token ID.
+        # One cooperative DWORDx4 DMA covers one complete A64xK128 entry.
+        # Within an entry r = wave_id//2 + 4*(wave_id%2) + 8*(lane_id//8).
+        # This is the inverse of the (4,2,8) consumer's padded row mapping.
         a_voffsets = []
         for bottom in range_constexpr(2):
             offsets = []
-            for chunk in range_constexpr(2):
-                row = bottom * 128 + (tid // 8 % 8) * 16 + tid // 64 + chunk * 8
+            for m_slice in range_constexpr(2):
+                local_row = wave_id // 2 + (wave_id % 2) * 4 + (lane_id // 8) * 8
+                row = bottom * 128 + m_slice * a_slice_rows + local_row
                 fused = sorted_id(row)
                 token = fused & TOKEN_MASK
                 slot = (fused >> 24) & 255
@@ -288,13 +326,8 @@ def compile_fp8_stage1_giu1(
 
         def operand_dma_ptrs(views):
             return [
-                [
-                    _lds_byte_ptr(
-                        fx.get_iter(view), wave_dma_base + chunk * 4 * a_group16
-                    )
-                    for chunk in range_constexpr(2)
-                ]
-                for view in views
+                [_lds_byte_ptr(fx.get_iter(view), wave_dma_base) for view in pair]
+                for pair in views
             ]
 
         at_dma = operand_dma_ptrs(a_top)
@@ -326,17 +359,16 @@ def compile_fp8_stage1_giu1(
         b_gate_base = n_tile * (BLOCK_N * hidden_size)
         b_up_base = b_gate_base + intermediate_size * hidden_size
 
-        def ac_a(buf, ki, bottom=0):
-            for chunk in range_constexpr(2):
-                rocdl.raw_ptr_buffer_load_lds(
-                    a_rsrc,
-                    ab_dma[buf][chunk] if const_expr(bottom) else at_dma[buf][chunk],
-                    fx.Int32(16),
-                    a_voffsets[bottom][chunk],
-                    fx.Int32(ki * BLOCK_K),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                )
+        def ac_a(buf, ki, m_slice, bottom=0):
+            rocdl.raw_ptr_buffer_load_lds(
+                a_rsrc,
+                ab_dma[buf][m_slice] if const_expr(bottom) else at_dma[buf][m_slice],
+                fx.Int32(16),
+                a_voffsets[bottom][m_slice],
+                fx.Int32(ki * BLOCK_K),
+                fx.Int32(0),
+                fx.Int32(0),
+            )
 
         def ac_b(buf, ki, is_up=0):
             for chunk in range_constexpr(2):
@@ -365,9 +397,9 @@ def compile_fp8_stage1_giu1(
                 fx.Int32(0),
             )
 
-        def rd_a(buf, part, bottom=0):
-            view = a_bottom[buf] if const_expr(bottom) else a_top[buf]
-            fx.copy(copy_atom, copy_a.partition_S(a_part(view, part)), dest_a)
+        def rd_a(buf, m_slice, bottom=0):
+            view = a_bottom[buf][m_slice] if const_expr(bottom) else a_top[buf][m_slice]
+            fx.copy(copy_atom, copy_a.partition_S(view), dest_a)
 
         def rd_bl(buf):
             fx.copy(copy_atom, copy_b.partition_S(b_gate[buf]), dest_bl)
@@ -377,11 +409,11 @@ def compile_fp8_stage1_giu1(
 
         scale_copy = fx.make_copy_atom(fx.UniversalCopy32b(), Float32)
 
-        def rd_scale_a(buf, bottom, part):
+        def rd_scale_a(buf, bottom, m_slice):
             values = []
             for m0 in range_constexpr(2):
                 index = wave_m * 256 + bottom * 128 + wave_m * 16 + lane_id % 16
-                index = index + (part * 2 + m0) * 32
+                index = index + (m_slice * 2 + m0) * 32
                 ptr = lds.scale_a0.ptr if const_expr(buf == 0) else lds.scale_a1.ptr
                 src = fx.make_view(
                     fx.add_offset(ptr, fx.make_int_tuple(index)), fx.make_layout(1, 1)
@@ -412,7 +444,7 @@ def compile_fp8_stage1_giu1(
                 Float32,
             )
 
-        def compute(c_frag, b_frag, old_scale_a, old_scale_b, old_part):
+        def compute(c_frag, b_frag, old_scale_a, old_scale_b, prev_m_slice):
             # Old partial and new MFMA results are independent. Preserve the
             # GEMM's early-clobber boundary and scalar (not packed) FP32 FMA.
             result_type = ir.Type.parse(
@@ -433,8 +465,8 @@ def compile_fp8_stage1_giu1(
             )
             for m0 in range_constexpr(2):
                 scale = Vec(old_scale_a)[m0] * old_scale_b
-                cs0 = c_frag[None, 0, old_part * 2 + m0]
-                cs1 = c_frag[None, 1, old_part * 2 + m0]
+                cs0 = c_frag[None, 0, prev_m_slice * 2 + m0]
+                cs1 = c_frag[None, 1, prev_m_slice * 2 + m0]
                 p0 = Vec(frag_p[None, 0, m0].load())
                 p1 = Vec(frag_p[None, 1, m0].load())
                 c0, c1 = Vec(cs0.load()), Vec(cs1.load())
@@ -486,14 +518,14 @@ def compile_fp8_stage1_giu1(
                     _llvm.extractvalue(T.vec(4, T.f32), result, [9])
                 )
 
-        def begin_phase():
+        def begin_compute_phase():
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
             rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
             rocdl.sched_barrier(0)
 
-        def end_phase():
+        def end_compute_phase():
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -520,11 +552,13 @@ def compile_fp8_stage1_giu1(
         rocdl.sched_barrier(0)
         ac_b(0, 0)
         rocdl.sched_barrier(0)
-        ac_a(0, 0)
+        ac_a(0, 0, 0)
+        ac_a(0, 0, 1)
         rocdl.sched_barrier(0)
         ac_b(0, 0, 1)
         rocdl.sched_barrier(0)
-        ac_a(0, 0, 1)
+        ac_a(0, 0, 0, 1)
+        ac_a(0, 0, 1, 1)
         rocdl.sched_barrier(0)
         # The complementary barrier follows the final FIFO drain.
         if wave_id >= 4:
@@ -538,7 +572,8 @@ def compile_fp8_stage1_giu1(
         rocdl.sched_barrier(0)
         ac_scale_a(1, fx.Int32(1))
         rocdl.sched_barrier(0)
-        ac_a(1, 1)
+        ac_a(1, 1, 0)
+        ac_a(1, 1, 1)
         rocdl.sched_barrier(0)
         ac_b(1, 1)
         rocdl.sched_barrier(0)
@@ -569,43 +604,50 @@ def compile_fp8_stage1_giu1(
             old_b = fx.Float32(states[6])
             frag_bl.store(Vec(states[7]).bitcast(Float8E4M3FN))
             kiter = fx.Int32(k_index)
-            for tile in range_constexpr(2):
-                ki = kiter + tile
-                for part in range_constexpr(2):
-                    rd_a(tile, part)
-                    top_scale = rd_scale_a(tile, 0, part)
-                    if const_expr(part == 0):
+            for k_tile in range_constexpr(2):
+                ki = kiter + k_tile
+                for m_slice in range_constexpr(2):
+                    rd_a(k_tile, m_slice)
+                    top_scale = rd_scale_a(k_tile, 0, m_slice)
+                    if const_expr(m_slice == 0):
                         b_scale = rd_scale_b(ki)
-                        ac_a(1 - tile, ki + 1, 1)
-                    begin_phase()
-                    # New TL; consume BR from the preceding part/K tile.
-                    compute(c_br, frag_bl, old_a, old_b, 1 - part)
-                    end_phase()
-                    if const_expr(part == 0):
-                        rd_br(tile)
+                    # One bottom M-slice DMA per M slice instead of two in slice0.
+                    ac_a(1 - k_tile, ki + 1, m_slice, 1)
+                    begin_compute_phase()
+                    # New TL; consume BR from the preceding M slice/K k_tile.
+                    compute(c_br, frag_bl, old_a, old_b, 1 - m_slice)
+                    end_compute_phase()
+                    if const_expr(m_slice == 0):
+                        rd_br(k_tile)
+                    begin_compute_phase()
+                    compute(c_tl, frag_br, top_scale, b_scale[0], m_slice)
+                    end_compute_phase()
+                    # At this TR end barrier both staggered groups have finished
+                    # TL's LDS reads. Refill only this independent top entry.
+                    ac_a(k_tile, ki + 2, m_slice)
+                    rd_a(k_tile, m_slice, 1)
+                    bottom_scale = rd_scale_a(k_tile, 1, m_slice)
+                    if const_expr(m_slice == 0):
+                        # B registers persist through slice1; LDS can be reused.
+                        ac_b(k_tile, ki + 2)
+                    begin_compute_phase()
+                    compute(c_tr, frag_bl, top_scale, b_scale[1], m_slice)
+                    end_compute_phase()
+                    if const_expr(m_slice == 0):
+                        ac_b(k_tile, ki + 2, 1)
+                        # A_b(ki,slice1) has eight younger VMEM operations here:
+                        # prior top[s1]+scale, then bottom[s0]+top[s0]+Bgate*2+Bup*2.
+                        # Complete it before slice1 can read that entry.
+                        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=8))
                     else:
-                        # Both parts have read A_t in both staggered groups.
-                        ac_a(tile, ki + 2)
-                    begin_phase()
-                    compute(c_tl, frag_br, top_scale, b_scale[0], part)
-                    end_phase()
-                    rd_a(tile, part, 1)
-                    bottom_scale = rd_scale_a(tile, 1, part)
-                    if const_expr(part == 0):
-                        # B registers persist through part1; LDS can be reused.
-                        ac_b(tile, ki + 2)
-                    begin_phase()
-                    compute(c_tr, frag_bl, top_scale, b_scale[1], part)
-                    end_phase()
-                    if const_expr(part == 0):
-                        ac_b(tile, ki + 2, 1)
-                    else:
-                        ac_scale_a(tile, ki + 2)
+                        ac_scale_a(k_tile, ki + 2)
+                        # Seven younger ops follow top(ki+2,slice0): Bgate*2,
+                        # Bup*2,bottom[s1],top[s1],scale. Earlier B(ki+1) is ready too.
                         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=7))
-                        rd_bl(1 - tile)
-                    begin_phase()
-                    compute(c_bl, frag_br, bottom_scale, b_scale[0], part)
-                    end_phase()
+                        rd_bl(1 - k_tile)
+                    begin_compute_phase()
+                    compute(c_bl, frag_br, bottom_scale, b_scale[0], m_slice)
+                    end_compute_phase()
                     old_a, old_b = bottom_scale, b_scale[1]
             result = yield [
                 c_tl.load(),
@@ -782,9 +824,7 @@ def check_native_weight_layout():
                     )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     lds_address = (
-                        (tid // 64) * (16 * 128)
-                        + (tid % 64) * 16
-                        + chunk * 1024
+                        (tid // 64) * (16 * 128) + (tid % 64) * 16 + chunk * 1024
                     )
                     local_row, local_col = row % 128, col % 128
                     consumer_address = (
@@ -796,6 +836,59 @@ def check_native_weight_layout():
                         lds_address, consumer_address, rtol=0, atol=0
                     )
     print("layout: AIter shuffle_weight(16,16) native byte mapping PASS")
+    return True
+
+
+def check_a_slice_layout():
+    """Exhaustive CPU check of all bytes written/read in each A64 entry."""
+    group8 = 8 * BLOCK_K + 16
+    group16 = 2 * group8 + 32
+    tid = torch.arange(512, device="cpu")[:, None]
+    byte = torch.arange(16, device="cpu")[None, :]
+    wave = tid // 64
+    local_row = wave // 2 + (wave % 2) * 4 + (tid % 64 // 8) * 8
+    col = (tid % 8) * 16 + byte
+    producer = (
+        (tid // 64 % 2) * group8 + (tid // 128) * group16 + (tid % 64) * 16 + byte
+    )
+    consumer = (
+        (local_row % 4) * group16
+        + (local_row // 4 % 2) * group8
+        + (local_row // 8) * BLOCK_K
+        + col
+    )
+    entry_bytes = 4 * group16
+    # Every adjacent group of eight lanes reads exactly one complete row.
+    torch.testing.assert_close(
+        col.reshape(64, 128).sort(dim=1).values,
+        torch.arange(128).expand(64, 128),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(producer, consumer, rtol=0, atol=0)
+    assert producer.unique().numel() == 64 * BLOCK_K
+    assert int(producer.max()) < entry_bytes
+    logical = local_row * BLOCK_K + col
+    torch.testing.assert_close(
+        logical.flatten().sort().values, torch.arange(64 * BLOCK_K), rtol=0, atol=0
+    )
+    # Check all four M slices and both ping/pong generations, including boundaries.
+    for ping in range(2):
+        physical, routed = [], []
+        for bottom in range(2):
+            for m_slice in range(2):
+                entry = ping * 4 + bottom * 2 + m_slice
+                physical.append((entry * entry_bytes + producer).flatten())
+                routed.append(
+                    (
+                        (bottom * 128 + m_slice * 64 + local_row) * BLOCK_K + col
+                    ).flatten()
+                )
+        assert torch.cat(physical).unique().numel() == 256 * BLOCK_K
+        torch.testing.assert_close(
+            torch.cat(routed).sort().values, torch.arange(256 * BLOCK_K), rtol=0, atol=0
+        )
+    print("layout: padded A64 byte mapping/coalescing PASS")
     return True
 
 
@@ -1147,19 +1240,29 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=6144)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--num-experts", "--experts", type=int, default=384)
+    # routing 控制 token 选择哪些专家；每个 token 的 topk 个专家互不重复。
+    # balanced：循环分配后打乱 token 顺序/专家编号，各专家路由数最多差 1。
+    # random：每个 token 独立生成随机专家分数再取 topk，负载仅在期望上均衡。
+    # skewed：随机选定同一组 topk 专家，全部 token 都路由到这组，负载极端集中。
+    # 这些是合成测试路由，不代表真实模型的 gate 分布。各专家按 256 行补齐，
+    # 因此 routing 会影响 padding、WG 数量与权重复用，而不改变计算公式。
     parser.add_argument(
         "--routing", choices=("balanced", "random", "skewed"), default="balanced"
     )
+    # data_case 控制 A/权重/scale 的数值，可与 routing 独立组合。
+    # 除 random/last_k 外，下列场景在有限输入、无 bias 时均应输出全零。
+    # last_k 仍执行完整 K-loop，仅最后一个 K128 分块有贡献，检查尾部/FIFO drain。
+    # zero_gate/zero_up 清零的是投影权重，不是路由分数；性能测试通常用 random。
     parser.add_argument(
         "--data-case",
         choices=(
-            "random",
-            "zero_a",
-            "zero_a_scale",
-            "zero_b_scale",
-            "last_k",
-            "zero_gate",
-            "zero_up",
+            "random",  # 随机 A/权重及非零 FP32 scale：常规精度/性能测试。
+            "zero_a",  # FP8 A 数据清零，保留 scale。
+            "zero_a_scale",  # 仅 A-scale 清零，A 数据保留。
+            "zero_b_scale",  # 仅 B-scale 清零，权重数据保留。
+            "last_k",  # A-scale 除最后一个 K128 分块外全部置零。
+            "zero_gate",  # 所有专家前 I 行 gate 权重清零；SiLU(0)=0。
+            "zero_up",  # 所有专家后 I 行 up 权重清零。
         ),
         default="random",
     )
@@ -1171,6 +1274,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     check_native_weight_layout()
+    check_a_slice_layout()
     if args.layout_check:
         return
     if "gfx950" not in torch.cuda.get_device_properties().gcnArchName:

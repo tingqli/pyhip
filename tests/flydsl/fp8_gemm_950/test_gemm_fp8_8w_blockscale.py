@@ -5,7 +5,7 @@
 The blockscale contract is ScaleA[KB, M] and ScaleB[ceil(N/128), KB], KB=K/128.
 Both pipelines use a 256x256 WG tile, eight waves, and ping-pong padded LDS.
 split_m=True selects the half-M single-FIFO pipeline: each wave's 64x32
-quadrant is computed as two 32x32 parts sharing A and partial registers.
+quadrant is computed as two 32x32 M slices sharing A and partial registers.
 split_m=False retains the four-phase baseline, including the unscaled path.
 """
 
@@ -78,8 +78,8 @@ def compile_gemm_fp8_8wave(
     if split_m:
         assert with_scale, "split_m is a blockscale pipeline"
         assert (TILE_M, TILE_N, TILE_K) == (256, 256, 128)
-    M_PARTS = 2 if split_m else 1
-    PHASE_M_REP = BLOCK_M // 32 // M_PARTS
+    M_SLICES = 2 if split_m else 1
+    PHASE_M_REP = BLOCK_M // 32 // M_SLICES
     assert N % 8 == 0
     element_type = fx.Float8E4M3FN
     elements_per_128b = 16  # 128bit / fp8(8bit)
@@ -367,14 +367,15 @@ def compile_gemm_fp8_8wave(
 
         thr_mma = tiled_mma.thr_slice(tid)
 
-        def _a_part_view(src, part):
-            return fx.flat_divide(src, (BLOCK_M // M_PARTS, BLOCK_K))[
-                None, None, part, 0
+        def _a_m_slice_view(src, m_slice):
+            return fx.flat_divide(src, (BLOCK_M // M_SLICES, BLOCK_K))[
+                None, None, m_slice, 0
             ]
 
-        # Both M parts reuse this allocation: 16, rather than 32, A dwords
+        # 根据情况 A会被分成2个M slice（slice0/slice1）
+        # Both M slices reuse this allocation: 16, rather than 32, A dwords
         # per lane on the split path. The WG and full C fragments stay 256x256.
-        frag_A_t = thr_mma.make_fragment_B(_a_part_view(sA_t_rd[0], 0))
+        frag_A_t = thr_mma.make_fragment_B(_a_m_slice_view(sA_t_rd[0], 0))
         frag_B_l = thr_mma.make_fragment_A(sB_l_rd[0])
         frag_B_r = thr_mma.make_fragment_A(sB_r_rd[0])
 
@@ -382,7 +383,7 @@ def compile_gemm_fp8_8wave(
         dest_frag_B_l = copy_b.retile(frag_B_l)
         dest_frag_B_r = copy_b.retile(frag_B_r)
 
-        # Four full accumulators survive both M parts; only the partial FIFO shrinks.
+        # Four full accumulators survive both M slices; only the partial FIFO shrinks.
         bC_tl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[
             None, None, bid_x * 2 + 0, bid_y * 2 + 0
         ]
@@ -394,8 +395,10 @@ def compile_gemm_fp8_8wave(
         frag_C_tr = thr_mma.make_fragment_C(bC_tl)
         frag_C_bl = thr_mma.make_fragment_C(bC_tl)
         frag_C_br = thr_mma.make_fragment_C(bC_tl)
-        c_part = fx.flat_divide(bC_tl, (BLOCK_N, BLOCK_M // M_PARTS))[None, None, 0, 0]
-        frag_P = thr_mma.make_fragment_C(c_part)  # One 16-f32 FIFO when split.
+        c_slice = fx.flat_divide(bC_tl, (BLOCK_N, BLOCK_M // M_SLICES))[
+            None, None, 0, 0
+        ]
+        frag_P = thr_mma.make_fragment_C(c_slice)  # One 16-f32 FIFO when split.
 
         # ==== A/B block-scale 设置：A per-token group-128，B per-128 rows/group-128 ====
         # C[m,n] = sum_kb scaleA[m,kb] * scaleB[n//128,kb] * partial[kb]。
@@ -404,6 +407,9 @@ def compile_gemm_fp8_8wave(
         #   + wave_m*16 + lane%16（wave_m=wave_id//4）=> scaleA 随 m0/lane 变化，广播 val/n0。
         N_REP = BLOCK_N // 64
         if const_expr(with_scale):
+            ### Ascale layout: groups = K //128, [groups, M//256, 256m]
+            ### 是一次kiter 256 rows 只需要256个scale(atop+abottom)就够了。
+            ### 每个lane读一个dword, 512个lane读取512个元素， 512个元素前后得256指向相同得A scale, 所以只有256个A scale.
             sA_rsrc = _buffer_resource(
                 argScaleA,
                 num_records_bytes=arith._to_raw(fx.Int32(M * scaleA_stride * 4)),
@@ -494,7 +500,7 @@ def compile_gemm_fp8_8wave(
                     fx.Float32,
                 )
 
-            def _rd_scale_a(buf, bottom, part=0):
+            def _rd_scale_a(buf, bottom, m_slice=0):
                 half_offset = bottom * BLOCK_M
                 wave_copy_offset = wave_m * TILE_M
                 scales = []
@@ -504,7 +510,7 @@ def compile_gemm_fp8_8wave(
                         + half_offset
                         + wave_m * 16
                         + lane_id % 16
-                        + (part * PHASE_M_REP + m0) * 32
+                        + (m_slice * PHASE_M_REP + m0) * 32
                     )
                     scale_src = fx.make_view(
                         fx.add_offset(
@@ -524,9 +530,28 @@ def compile_gemm_fp8_8wave(
             frag_A,
             prev_scale_a=None,
             prev_scale_b=None,
-            prev_part=0,
+            prev_m_slice=0,
         ):
+            # 256x256x128 WG: per-lane logical shapes; counts are 32-bit
+            # register equivalents, not additive physical VGPR allocations.
+            # M_SLICES                1 (full-M)       2 (half-M)
+            # PHASE_M_REP             4                2
+            # frag_A [Kval, Mrep, Krep]: (32,4,1) fp8  (32,2,1) fp8 -> 32/16 VGPR
+            # frag_B [Kval, Nrep, Krep]: (32,2,1) fp8 in both       -> 16 VGPR
+            # frag_C [Cval, Nrep, Mrep]: (4,2,4) f32 in both       -> 32 VGPR
+            # frag_P (outer FIFO)       (4,2,4) f32    (4,2,2) f32 -> 32/16 VGPR
+            # prev_scale_a: 4/2 f32; prev_scale_b: one scalar (SGPR after load/
+            # scalarization). prev_m_slice selects old C rows, not another FIFO.
             if const_expr(with_scale):
+                #     for mm in (Mrep):
+                #         dq_scale = prev_scale_a[mm] *prev_scale_b
+                #         for nn in (Nrep):
+                #             frag_C[0, nn, mm] += dq_scale * frag_P[0, nn, mm]
+                #             frag_C[1, nn, mm] += dq_scale * frag_P[1, nn, mm]
+                #             frag_C[2, nn, mm] += dq_scale * frag_P[1, nn, mm]
+                #             frag_C[3, nn, mm] += dq_scale * frag_P[1, nn, mm]
+                #             frag_P[0：3, nn, mm] = mfma_16x16x128(frag_A[:, mm], frag_B[:, nn], 0)
+
                 # Consume the preceding phase's FIFO while issuing independent
                 # new MFMAs. Inline asm fixes 4 scalar FMAs -> 1 MFMA and avoids
                 # packed FP32 VALU; early-clobber keeps old/new partials disjoint.
@@ -550,13 +575,16 @@ def compile_gemm_fp8_8wave(
                 asm_mfma1 = "v_mfma_f32_16x16x128_f8f6f4 $9, $28, $29, 0\n"
                 compute_asm = asm_fma0 + asm_mfma0 + asm_fma1 + asm_mfma1
                 for m0 in range_constexpr(PHASE_M_REP):
+                    # Per m0 (either M_SLICES): scale=f32; each partial/accum=4xf32.
                     scale = Vec(prev_scale_a)[m0] * prev_scale_b
-                    cs0 = frag_C[None, 0, prev_part * PHASE_M_REP + m0]
-                    cs1 = frag_C[None, 1, prev_part * PHASE_M_REP + m0]
+                    cs0 = frag_C[None, 0, prev_m_slice * PHASE_M_REP + m0]
+                    cs1 = frag_C[None, 1, prev_m_slice * PHASE_M_REP + m0]
                     partial0 = Vec(frag_P[None, 0, m0].load())
                     partial1 = Vec(frag_P[None, 1, m0].load())
                     accum0 = Vec(cs0.load())
                     accum1 = Vec(cs1.load())
+                    # Each MFMA operand below is 8xi32 (32 packed fp8 values).
+                    # A is reused by both N outputs; bitcast does not convert data.
                     operand_a0 = vector.bitcast(
                         T.vec(8, T.i32), frag_B[None, 0, 0].load().ir_value()
                     )
@@ -651,16 +679,16 @@ def compile_gemm_fp8_8wave(
         _s2r_Bl = [s2r_src0_B_l, s2r_src1_B_l]
         _s2r_Br = [s2r_src0_B_r, s2r_src1_B_r]
 
-        def _rd_At(b, part=0):
+        def _rd_At(b, m_slice=0):
             if const_expr(split_m):
-                src = copy_a.partition_S(_a_part_view(sA_t_rd[b], part))
+                src = copy_a.partition_S(_a_m_slice_view(sA_t_rd[b], m_slice))
                 fx.copy(lds_copy_atom, src, dest_frag_A_t)
             else:
                 fx.copy(lds_copy_atom, _s2r_At[b], dest_frag_A_t, pred=None)
 
-        def _rd_Ab(b, part=0):
+        def _rd_Ab(b, m_slice=0):
             if const_expr(split_m):
-                src = copy_a.partition_S(_a_part_view(sA_b_rd[b], part))
+                src = copy_a.partition_S(_a_m_slice_view(sA_b_rd[b], m_slice))
                 fx.copy(lds_copy_atom, src, dest_frag_A_t)
             else:
                 fx.copy(lds_copy_atom, _s2r_Ab[b], dest_frag_A_t, pred=None)
@@ -807,6 +835,7 @@ def compile_gemm_fp8_8wave(
         vm_load_cnt_scale_a = 1 if const_expr(with_scale) else 0
 
         rocdl.sched_barrier(0)
+        ### todo: this part useless??? barrier needed?
         vmcnt = vm_load_cnt_a + vm_load_cnt_b
         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
         rocdl.s_barrier()
@@ -871,19 +900,19 @@ def compile_gemm_fp8_8wave(
                 scale_b_addr_1 = _scale_b_addr(kiter + 1)
 
             if const_expr(split_m):
-                # For each K tile: TL0/TR0/BL0/BR0, then TL1/TR1/BL1/BR1.
-                # A and P are half-sized and reused, B_l/B_r survive both parts.
+                # Each K tile: TL[s0]/TR[s0]/BL[s0]/BR[s0], then TL[s1]/TR[s1]/BL[s1]/BR[s1].
+                # A and P are half-sized and reused, B_l/B_r survive both M slices.
                 # P always holds the immediately preceding compute phase:
-                # TL0 consumes BR1(k-1); TL1 consumes BR0(k). Other phases
-                # consume the preceding quadrant of their current M part.
+                # TL[s0] consumes BR[s1](k-1); TL[s1] consumes BR[s0](k). Other phases
+                # consume the preceding quadrant of their current M slice.
                 for tile in range_constexpr(2):
                     tick = tile
                     tock = 1 - tile
                     ki = kiter + tile
-                    for part in range_constexpr(2):
-                        _rd_At(tick, part)
-                        mfma_scaleA = _rd_scale_a(tick, 0, part)
-                        if const_expr(part == 0):
+                    for m_slice in range_constexpr(2):
+                        _rd_At(tick, m_slice)
+                        mfma_scaleA = _rd_scale_a(tick, 0, m_slice)
+                        if const_expr(m_slice == 0):
                             mfma_scaleB = _rd_scale_b(_scale_b_addr(ki))
                             _ac_Ab(tock, ki + 1)
                         rocdl.sched_barrier(0)
@@ -896,14 +925,14 @@ def compile_gemm_fp8_8wave(
                             frag_A_t,
                             fifo_scale_a_1,
                             fifo_scale_b_1,
-                            1 - part,
+                            1 - m_slice,
                         )
                         end_compute_phase()
 
-                        if const_expr(part == 0):
+                        if const_expr(m_slice == 0):
                             _rd_Br(tick)
                         else:
-                            # A_t must survive part0; only part1's read closes
+                            # A_t must survive slice0; only slice1's read closes
                             # its lifetime in both staggered wave groups.
                             _ac_At(tick, ki + 2)
 
@@ -915,15 +944,15 @@ def compile_gemm_fp8_8wave(
                             frag_A_t,
                             fifo_scale_a_0,
                             fifo_scale_b_0,
-                            part,
+                            m_slice,
                         )
                         end_compute_phase()
 
-                        _rd_Ab(tick, part)
-                        mfma_scaleA = _rd_scale_a(tick, 1, part)
-                        if const_expr(part == 0):
-                            # B survives in registers through part1; its LDS
-                            # slot is already free after part0's reads.
+                        _rd_Ab(tick, m_slice)
+                        mfma_scaleA = _rd_scale_a(tick, 1, m_slice)
+                        if const_expr(m_slice == 0):
+                            # B survives in registers through slice1; its LDS
+                            # slot is already free after slice0's reads.
                             _ac_Bl(tick, ki + 2)
 
                         fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
@@ -934,14 +963,14 @@ def compile_gemm_fp8_8wave(
                             frag_A_t,
                             fifo_scale_a_1,
                             fifo_scale_b_1,
-                            part,
+                            m_slice,
                         )
                         end_compute_phase()
 
-                        if const_expr(part == 0):
+                        if const_expr(m_slice == 0):
                             _ac_Br(tick, ki + 2)
                         else:
-                            # BL1's end barrier closes all current ScaleA reads.
+                            # BL[s1]'s end barrier closes all current ScaleA reads.
                             _ac_scale_a(tick, ki + 2)
                             rocdl.s_waitcnt(
                                 encode_waitcnt_950(
@@ -950,7 +979,7 @@ def compile_gemm_fp8_8wave(
                                     + vm_load_cnt_scale_a
                                 )
                             )
-                            # BL1 has consumed the current B_l registers.
+                            # BL[s1] has consumed the current B_l registers.
                             # The next LDS slot predates A_b(k+1), which
                             # the rolling vmcnt wait above completes.
                             _rd_Bl(tock)
@@ -963,7 +992,7 @@ def compile_gemm_fp8_8wave(
                             frag_A_t,
                             fifo_scale_a_0,
                             fifo_scale_b_0,
-                            part,
+                            m_slice,
                         )
                         end_compute_phase()
             else:
@@ -1158,7 +1187,7 @@ def compile_gemm_fp8_8wave(
             fifo_scale_b_1 = fx.Float32(results[6])
             for m0 in range_constexpr(PHASE_M_REP):
                 for n0 in range_constexpr(N_REP):
-                    cs = frag_C_br[None, n0, (M_PARTS - 1) * PHASE_M_REP + m0]
+                    cs = frag_C_br[None, n0, (M_SLICES - 1) * PHASE_M_REP + m0]
                     scale = Vec(fifo_scale_a_1)[m0] * fifo_scale_b_1
                     scale_vec = Vec.filled(4, scale, fx.Float32)
                     cs.store(fx.fma(frag_P[None, n0, m0].load(), scale_vec, cs.load()))
