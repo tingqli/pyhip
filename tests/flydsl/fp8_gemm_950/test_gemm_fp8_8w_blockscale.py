@@ -125,6 +125,9 @@ def compile_gemm_fp8_8wave(
     A_GROUP = 8 * BLOCK_K + 16
     a_lds_elems = (BLOCK_M // 16) * (2 * A_GROUP + 32)
 
+    ### CDNA4 LDS 160KB.
+    ### A+B = 132KB, A scale=2KB, B scale depending on K, when K=32768, B scale=2KB
+    ### so LDS resource 很富裕。
     @fx.struct
     class LDS:
         a_t0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
@@ -158,6 +161,7 @@ def compile_gemm_fp8_8wave(
             bid_x = fx.block_idx.x // num_pid_n
             bid_y = fx.block_idx.x % num_pid_n
 
+        ### A, B, C buffer resource
         a_iter = fx.recast_iter(element_type, fx.get_iter(argA))
         b_iter = fx.recast_iter(element_type, fx.get_iter(argB))
         A_2d = fx.Tensor(fx.make_view(a_iter, fx.make_layout((M, K), (K, 1))))
@@ -174,13 +178,14 @@ def compile_gemm_fp8_8wave(
         )
         b_dma_rsrc = _buffer_resource(argB, num_records_bytes=N * K)
 
-        # The WG's four quadrants share top/bottom A and left/right B.
+        ### The WG's four quadrants share top/bottom A and left/right B.
         bA_t = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 0, None]
         bA_b = fx.flat_divide(A, (BLOCK_M, BLOCK_K))[None, None, bid_x * 2 + 1, None]
         bB_l = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y * 2 + 0, None]
         bB_r = fx.flat_divide(B, (BLOCK_N, BLOCK_K))[None, None, bid_y * 2 + 1, None]
 
-        # Interleave rows within each 128-row quadrant to match padded LDS.
+        ### The A,B vemem grouped layout for efficient LDS padding
+        ### Interleave rows within each 128-row quadrant to match padded LDS.
         a_grouped = fx.make_layout(
             ((8, BLOCK_M // 8), BLOCK_K, K // BLOCK_K),
             ((BLOCK_M // 8 * K, K), 1, BLOCK_K),
@@ -193,23 +198,24 @@ def compile_gemm_fp8_8wave(
         )
         bB_l = fx.Tensor(fx.make_view(fx.get_iter(bB_l), b_grouped))
         bB_r = fx.Tensor(fx.make_view(fx.get_iter(bB_r), b_grouped))
+        ### all needed copy atom
         async_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), element_type)
         lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
 
+        ### 分配LDS
         lds = fx.SharedAllocator().allocate(LDS).peek()
 
+        ### copied
         # B采用得128x128 scale, BM*BK=256x256, 一次loop MFMA得Bscale是 2个Dword被不同的lane复用。
         # 把所有的Bscale copy 进LDS. 一次dword copy就可以满足 32*1024*1024 的weight 元素个数，32*1024*1024
         # 理论上大部分weight都可以通过一次buffer_load满足。所以放到LDS
         #  copy type           一次copy需要LDS bytes       weight元素个数
-        # DWORDX4 copy          512*16 = 8KB              512*4*128*128=33554432 = 32*1024*1024
-        # DWORD copy             512*4 = 2KB              512*128*128=8388608 = 8*1024*1024
-        # todo: 加入LDS assert
-
+        # DWORDX4 copy          512*16 = 8KB              512*4*128*128=33554432 = BN* 131072
+        # DWORD copy             512*4 = 2KB              512*128*128=8388608 = BN*32768
+        # 131072 should be larger than most gemm K. 8KB is also
         # Stage the complete ScaleB tile before constructing any tiled-MMA or
-        # accumulator fragments. The wait/barrier closes this register lifetime,
-        # allowing the loader's address VGPRs to be reused by the MFMA pipeline.
+        # accumulator fragments.
         if const_expr(with_scale):
             sB_rsrc = _buffer_resource(
                 argScaleB,
@@ -290,10 +296,13 @@ def compile_gemm_fp8_8wave(
                             fx.Int32(0),
                         )
 
+            ### The wait/barrier closes this register lifetime,
+            ### allowing the loader's address VGPRs to be reused by the MFMA pipeline.
             rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0))
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
+        ### read LDS layout and write LDS layout. AC copy tile
         # Write groups (8,2,8) become read groups (2,8,8) without moving data.
         _wr = fx.make_layout(
             ((8, 2, BLOCK_M // 16), BLOCK_K),
@@ -320,10 +329,12 @@ def compile_gemm_fp8_8wave(
         sB_l_rd = [fx.make_view(lds.b_l0.ptr, _rd), fx.make_view(lds.b_l1.ptr, _rd)]
         sB_r_rd = [fx.make_view(lds.b_r0.ptr, _rd), fx.make_view(lds.b_r1.ptr, _rd)]
 
+        ### AC copytile partition vmem
         aT_g = dma.partition_S(bA_t)
         aB_g = dma.partition_S(bA_b)
         bL_g = dma.partition_S(bB_l)
         bR_g = dma.partition_S(bB_r)
+        ## AC copy tile partition LDS.
         aT_s = [dma.partition_D(sA_t_wr[0]), dma.partition_D(sA_t_wr[1])]
         aB_s = [dma.partition_D(sA_b_wr[0]), dma.partition_D(sA_b_wr[1])]
         bL_s = [dma.partition_D(sB_l_wr[0]), dma.partition_D(sB_l_wr[1])]
@@ -336,6 +347,8 @@ def compile_gemm_fp8_8wave(
         )
         mma_atom = fx.atom_set_value(mma_atom, "scale_a", fx.Int32(0))
         mma_atom = fx.atom_set_value(mma_atom, "scale_b", fx.Int32(0))
+        ### MFMA instruction spec:k_perm is fx.make_layout(((16, 2), 4), ((1, 64), 16)), spec里面每条lane 处理32个K，32个K 分两段连续。每段16个K连续。
+        ### 这里每条lane处理连续得32个K，
         k_perm = fx.make_layout((32, 4), (1, 32))
         tiled_mma = fx.make_tiled_mma(
             mma_atom, fx.make_layout((4, 2, 1), (1, 4, 0)), (None, None, k_perm)
