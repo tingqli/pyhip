@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>N4稳态 · 全8-step时间轴与主要工作</title>
+  <style>
+    :root { color-scheme: light; font-family: "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif; color: #17263b; background: #eef2f7; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { position: sticky; top: 0; z-index: 2; background: #ffffffed; backdrop-filter: blur(12px); border-bottom: 1px solid #d8e0ec; padding: 16px 24px 12px; }
+    h1 { margin: 0 0 6px; font-size: 23px; }
+    p { margin: 5px 0; line-height: 1.6; color: #526278; font-size: 14px; }
+    .toolbar, .steps { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+    button, select, .link { border: 1px solid #c6d3e4; border-radius: 7px; padding: 7px 11px; font: inherit; font-size: 14px; background: white; color: #243c5d; text-decoration: none; cursor: pointer; }
+    button:hover, .link:hover { border-color: #548ae0; background: #edf4ff; }
+    button[aria-pressed="true"] { color: white; background: #2459a8; border-color: #2459a8; }
+    button:focus-visible, select:focus-visible, a:focus-visible, .viewport:focus-visible { outline: 3px solid #60a5fa; outline-offset: 2px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-left: 8px; font-size: 14px; }
+    .dot { display: inline-block; width: 13px; height: 13px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+    .blue { background: #bad5ff; } .green { background: #b9e5c8; } .orange { background: #d97706; } .purple { background: #7c3aed; }
+    main { padding: 16px 24px 28px; }
+    .viewport { overflow: auto; border: 1px solid #d6dfeb; border-radius: 12px; background: white; box-shadow: 0 3px 18px #20314b0a; }
+    #panorama { max-height: calc(100vh - 234px); min-height: 260px; }
+    .viewport img { display: block; max-width: none; }
+    .fold-panel { margin-bottom: 20px; scroll-margin-top: 222px; }
+    .fold-panel h2 { font-size: 18px; margin: 0 0 8px; }
+    .fold-panel .viewport { max-height: none; }
+    .fold-panel svg { display: block; min-width: 1050px; width: 100%; height: auto; }
+    .muted { color: #62758d; font-size: 13px; }
+    .help { padding: 12px 16px; margin-top: 12px; border: 1px solid #dbe4f1; border-radius: 10px; background: white; }
+    #error { color: #b91c1c; }
+    [hidden] { display: none !important; }
+    @media (max-width: 750px) { header, main { padding-left: 12px; padding-right: 12px; } h1 { font-size: 19px; } #panorama { max-height: 65vh; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>同一个CU · 4＋4 wave · 全8-step稳态时间轴</h1>
+    <p>每个step含两个h16子stage。蓝／绿框内写出真实主要工作；后4 wave始终比前4 wave错开一个Memory／Compute区间。</p>
+    <div class="toolbar" role="group" aria-label="显示方式">
+      <button id="long-mode" type="button" aria-pressed="true">连续横轴</button>
+      <button id="fold-mode" type="button" aria-pressed="false">折行读全图（每行2步）</button>
+      <label for="zoom">缩放</label>
+      <select id="zoom"><option value="0.65">65%</option><option value="0.85" selected>85%</option><option value="1">100%</option><option value="1.25">125%</option><option value="fit">全8步总览</option></select>
+      <a class="link" href="all_steps.svg" target="_blank" rel="noopener">打开完整SVG</a>
+      <div class="legend"><span><i class="dot blue"></i>Memory</span><span><i class="dot green"></i>Compute</span><span><i class="dot orange"></i>A同步</span><span><i class="dot purple"></i>B同步</span></div>
+    </div>
+    <nav class="steps" aria-label="跳转到step"></nav>
+  </header>
+  <main>
+    <div id="panorama" class="viewport" tabindex="0" aria-label="连续时间轴，可横向和纵向滚动">
+      <img id="picture" src="all_steps.svg" alt="8个step、16个子stage的完整双泳道时间轴，每框内含W、X、Y、MFMA及归约工作，下面是2拍和3拍CU在途上界。" width="7378" height="1037">
+    </div>
+    <div id="folded" hidden></div>
+    <p id="error" role="alert" hidden></p>
+    <div class="help">
+      <p><strong>读法：</strong>横向滚动或点击step跳转；折行模式从上到下接续同一时间轴，不是四个CU。所有图宽只示意程序顺序，不是实测时间。</p>
+      <p><strong>搬运命名：</strong>g2r＝global→寄存器；r2s＝寄存器→LDS；s2r＝LDS→寄存器；r2g＝寄存器→global。q＝g×8＋step，pf＝2或3。</p>
+      <p><strong>容易混淆：</strong>每个Compute对当前q执行40 MFMA，同时后处理q−1的相同h16；Y在step0..3的h16=1写回上一组整份M16×H32，不只写后H16。</p>
+      <p><strong>在途数：</strong>框内末上界按单wave，图下数字按全CU。A＝4(b当前＋b上一子stage)，B＝8b当前；不扣自然完成，不能当实测队列占用。</p>
+      <p class="muted">本图复用已核对的源码和第92节逐stage估算；没有改kernel或新增GPU采样。全SVG可离线打开。</p>
+    </div>
+  </main>
+  <script>
+    const picture = document.querySelector('#picture');
+    const panorama = document.querySelector('#panorama');
+    const folded = document.querySelector('#folded');
+    const zoom = document.querySelector('#zoom');
+    const longButton = document.querySelector('#long-mode');
+    const foldButton = document.querySelector('#fold-mode');
+    const steps = document.querySelector('.steps');
+    const error = document.querySelector('#error');
+    let scale = 0.85;
+    let mode = 'long';
+    let fullSvg = null;
+
+    // 只缩放静态SVG，不查询硬件或触发任何kernel。
+    function setScale() {
+      const center = (panorama.scrollLeft + panorama.clientWidth / 2) / scale;
+      scale = zoom.value === 'fit' ? panorama.clientWidth / 8680 : Number(zoom.value);
+      picture.style.width = `${8680 * scale}px`;
+      picture.style.height = `${1220 * scale}px`;
+      panorama.scrollLeft = Math.max(0, center * scale - panorama.clientWidth / 2);
+    }
+
+    function makeFolded() {
+      if (!fullSvg || folded.childElementCount) return;
+      // 每行截取同一长图的两个step，第二行起仍从上一行的末B时刻接续。
+      for (let pair = 0; pair < 4; pair++) {
+        const section = document.createElement('section');
+        section.className = 'fold-panel';
+        section.id = `pair-${pair}`;
+        const title = document.createElement('h2');
+        title.textContent = `时间轴第${pair + 1}行 · step ${pair * 2} → ${pair * 2 + 1}${pair === 3 ? ' → 下一组衔接' : ' → 下行接续'}`;
+        const guide = document.createElement('p');
+        guide.textContent = '上泳道＝前4 wave（0–3）；下泳道＝后4 wave（4–7）。底部数字上排＝3拍、下排＝2拍的CU在途VMEM上界。行首接上一行末尾，不重新启动。';
+        const viewport = document.createElement('div');
+        viewport.className = 'viewport';
+        viewport.tabIndex = 0;
+        const svg = fullSvg.cloneNode(true);
+        // 每一份定义使用独立id，防止多张SVG相互引用错误。
+        const prefix = `fold${pair}-`;
+        for (const node of svg.querySelectorAll('[id]')) node.id = prefix + node.id;
+        for (const node of svg.querySelectorAll('use')) {
+          const href = node.getAttributeNS('http://www.w3.org/1999/xlink', 'href');
+          node.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', '#' + prefix + href.slice(1));
+        }
+        for (const node of svg.querySelectorAll('[marker-end]')) node.setAttribute('marker-end', `url(#${prefix}arrow)`);
+        svg.setAttribute('aria-labelledby', `${prefix}title ${prefix}description`);
+        const start = 180 + pair * 2048;
+        const width = pair === 3 ? 2344 : 2088;
+        svg.setAttribute('viewBox', `${start - 20} 120 ${width} 980`);
+        svg.removeAttribute('width');
+        svg.removeAttribute('height');
+        viewport.append(svg);
+        section.append(title, guide, viewport);
+        folded.append(section);
+      }
+    }
+
+    function setMode(next) {
+      mode = next;
+      const isLong = next === 'long';
+      panorama.hidden = !isLong;
+      folded.hidden = isLong;
+      zoom.disabled = !isLong;
+      longButton.setAttribute('aria-pressed', String(isLong));
+      foldButton.setAttribute('aria-pressed', String(!isLong));
+      if (isLong) setScale(); else makeFolded();
+    }
+
+    for (let step = 0; step < 8; step++) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = `step ${step} · S${Math.floor(step / 2)}${step % 2 ? '高' : '低'}32`;
+      button.addEventListener('click', () => {
+        if (mode === 'long') {
+          panorama.scrollLeft = Math.max(0, (180 + step * 1024 - 24) * scale);
+          panorama.scrollTop = 105 * scale;
+        } else {
+          document.querySelector(`#pair-${Math.floor(step / 2)}`)?.scrollIntoView({ block: 'start' });
+        }
+      });
+      steps.append(button);
+    }
+
+    zoom.addEventListener('change', setScale);
+    longButton.addEventListener('click', () => setMode('long'));
+    foldButton.addEventListener('click', () => setMode('fold'));
+    window.addEventListener('resize', () => { if (mode === 'long' && zoom.value === 'fit') setScale(); });
+    setScale();
+    fetch('all_steps.svg').then(response => {
+      if (!response.ok) throw new Error(`SVG读取失败：${response.status}`);
+      return response.text();
+    }).then(text => {
+      const xml = new DOMParser().parseFromString(text, 'image/svg+xml');
+      if (xml.querySelector('parsererror')) throw new Error('SVG解析失败');
+      fullSvg = xml.documentElement;
+      if (mode === 'fold') makeFolded();
+    }).catch(reason => {
+      error.textContent = `${reason.message}。连续横轴仍可用；本地file协议可能禁止折行所需的fetch，请打开完整SVG。`;
+      error.hidden = false;
+      foldButton.disabled = true;
+      if (mode === 'fold') setMode('long');
+    });
+  </script>
+</body>
+</html>

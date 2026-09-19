@@ -1,4 +1,2 @@
 # SPDX-License-Identifier: MIT
-from .combined_host import CombinedPaddedGRRead
-
-__all__ = ["CombinedPaddedGRRead"]
+"""GRRead回归测试；正式API位于pyhip.contrib.flydsl.gr_read。"""

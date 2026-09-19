@@ -7771,3 +7771,266 @@ M映射保持时，W3→W2的正常service **84.450→77.821（−7.849%）**，
 [最终机器摘要](results/n4_prefetch_mapping_20260919/summary.json) SHA **6355fb315ad45713addc3015ea525f9aaad9b1f1e16ec0dd410ccb21acc35845**；[纯CPU收尾脚本](results/n4_prefetch_mapping_20260919/finalize.py)复核八份真实ELF／全部UI、**3072完整wave／13701120条稳态MFMA**、四版实际任务归属、原分析法闭合及所有正反差分。T8主ISA精确不变，kernel descriptor除代码入口相对位移外的56B资源／ABI位完全一致。冻结本轮3327个产物，再次核上一轮3719个产物和896项保护；本轮没有编译／正确性／采集失败，也没有重复采集取优。
 
 仅追加第90节，旧 **768576B／SHA 6fde9c3571d067433da5548bda4e4b946a5fb927b3448f1b83f89a1b57d25cb0** 前缀保持；Git index **976d2867636be82f7ea9bb41830ad39968383b8abad1636389457db03d9ec6b9**保持，不stage／reset／commit／push，不改硬件设置。当前正式N4仍W2＋M-major，不发生版本晋级或回退。
+
+## 91. GRRead正式化：按batch自动选择N2/N4/N8、删除实验路径并逐档回归（2026-09-19）
+
+用户本轮明确要求整理为正式代码，并确认原话“删除胜出的路径”实际指**删除未胜出的实验路径，保留按batch选中的实现**。本节是对前述历史入口的替代说明；旧记录和性能证据不改，不再要求使用旧的`implementation`／`up_block_m`参数。
+
+### 91.1 正式入口、目录与清理范围
+
+正式可安装包为`pyhip.contrib.flydsl.gr_read`，唯一公开入口为 **`CombinedPaddedGRRead(rows, w_down, w_up)`**。构造时完成权重shuffle、workspace分配、batch选型和JIT；`reader(x)`执行Down＋Up两个kernel并返回复用的内部输出。`run_down(x)`、`run_up(x)`保留为分阶段调用接口，不再带kernel选择参数。
+
+| 职责 | 正式文件 |
+|---|---|
+| 包导出 | [GRRead包入口](../../../src/contrib/flydsl/gr_read/__init__.py) |
+| 验证输入、准备权重／workspace、两次launch | [runtime](../../../src/contrib/flydsl/gr_read/runtime.py) |
+| 固定维度、batch选型、权重布局 | [common](../../../src/contrib/flydsl/gr_read/common.py) |
+| 搬运、同步、MFMA与数值helper | [helpers](../../../src/contrib/flydsl/gr_read/helpers.py) |
+| 胜出M64/N320/K64 Down | [down](../../../src/contrib/flydsl/gr_read/down.py) |
+| M256 N2、X64、W3、default cache、四相位 | [up_n2](../../../src/contrib/flydsl/gr_read/up_n2.py) |
+| M256 N4/N8、X128、W2、XPY NT、phase0 | [up_n4_n8](../../../src/contrib/flydsl/gr_read/up_n4_n8.py) |
+
+包已加入[安装配置](../../../pyproject.toml)。不从测试目录或历史结果动态加载正式kernel，不依赖实验收据／hsaco的路径硬编码；Python包内仅保留胜出算法。
+
+- 删除旧decode／FP32 workspace、M128 Up与测试用`tuned`别名，删除`implementation`、`hidden_pad`、`up_block_m`等公开手动开关。下游需改用上述三参数正式构造方式；不保留会隐藏旧行为的兼容分支。
+- 删除原测试根目录内的旧Host、旧kernel、四个`prefil_*`入口、cache微测量／W预读／三版手动矩阵／多代ISA检查入口，共10个被替代或实验文件。所需helper已抽取，不通过保留整套落选核来提供少量函数。
+- 去掉Up的`GR_*`调试文本和`_mark`参数，但**保留两侧compiler scheduling barrier与empty side-effect inline asm**，作为正式调度边界；不是随意删除保护已验收交错的编译约束。所有wait、priority、barrier、数值表达式与搬运顺序保持。
+- N4/N8共用源的`n_splits`只保留为内部必需编译期参数，公开Host自动给出4或8；没有环境变量、CLI强制路径、运行时autotune或旧实现回退。
+- 保留必要回归测试：[自动dispatch／数值／padding／Graph](test_gr_read.py)、[N2尾块Graph与公开参数验证](test_runtime.py)、[原BF16数值参考](reference.py)。[测试收集配置](conftest.py)排除历史results，防止全目录pytest误执行旧实验。
+- 整理前14个源码／配置文件已经逐字节快照，见[冻结收据](results/production_cleanup_20260919/prepare.json)；历史results全保留。旧实验入口不再作为现行API，需复现实验时使用该轮保存的源码快照，不能把已清理入口缺失当作历史测量失效。
+
+### 91.2 Batch调度规则与已测16档
+
+1k＝1024。按正常Y原生起点的历史完整矩阵选型，不使用第78节的Y+128B矩阵，也不把第81节60k出口门禁失败的一行当合格新基线。80CU参考设备的选择固定如下：
+
+| Up路径 | 已测batch |
+|---|---|
+| **N8** | **1k、2k、12k、16k、32k** |
+| **N4** | **4k、24k、64k** |
+| **N2** | **8k、10k、20k、28k、30k、36k、48k、60k** |
+
+32k的N4/N8历史差仅0.18%，按原全样本中位保留N8，不宣称稳定显著胜出；60k继续采用正式N2保守基线。
+
+为支持非表格行数，构造时使用确定性的CTA尾轮模型，而不是一长串只匹配精确batch的测试开关：
+
+$$
+m=\left\lceil T/256\right\rceil,\qquad
+N_{split}=\underset{s\in\{2,4,8\}}{\arg\min}\left\lceil\frac{ms}{CU}\right\rceil c_s,
+\quad(c_2,c_4,c_8)=(280,144,77).
+$$
+
+校准常数来自80CU历史正常起点矩阵的每CTA轮相对代价；设备CU数取实际属性。三个路径仍均1CTA/CU，模型只表示整轮及尾轮容量，**不是某CTA真实物理落点的保证，也不宣称0…65536每个行数都实测最优**。未测行数／其他gfx942 CU数量属于该规则的确定性推广；此次完整性能回归限定以上16档。空batch为no-op，不JIT、不launch。
+
+### 91.3 数值、机器码与功能回归
+
+[源码审计](results/production_cleanup_20260919/source_audit.json)确认：归一化kernel符号与删除的debug文本后，三个GPU函数AST与整理前快照完全相同；参考计算与`check_close`函数AST不变，原P／Y容差不放宽；0…65536全部行数的dispatch返回合法N2/N4/N8。
+
+全部16档分别编译正式入口，并与该batch整理前**选中的旧Up ELF**及旧Down源重新生成的ELF比较：
+
+- **Down和Up的ELF `.text`逐byte完全相同，kernel descriptor的资源／ABI字段完全相同。** 文件名、symbol和整ELF哈希可以不同；判断依据是实际指令段，而非把源码注释变化误叫性能变化。
+- 新公共两kernel路径通过原BF16参考的全行逐元素检查；新旧结果逐位相同。原生Y和独立+128B guard输出各3次，guard完整；guard不进入性能测试。
+- [首档检查](results/production_cleanup_20260919/check_1024.json)与[剩余15档检查批次](results/production_cleanup_20260919/check_batch.json)全部通过，没有更换候选、放宽容差或重编译调优。
+- 正式pytest **31 passed、0 failed、0 skipped**，包含16档选型、非法行数、空batch、1／129／257／2561／5121／7681等边界的数值与padding、单Graph双调用及3次changed-input replay、N2尾块、公开签名与非法权重。结果见[JUnit收据](results/production_cleanup_20260919/pytest.xml)。
+
+性能回归另外测试新公共Python入口，避免仅凭机器码相同便假设没有Host开销回归；同场整理前选中ELF是reference，不直接拿不同时间／频率的历史绝对数值硬比。
+
+### 91.4 全16档整理前后性能：Up与Total全部通过，36k Down单独核查
+
+[预设协议](results/production_cleanup_20260919/prepared.json)固定：GPU2／PCI A4、PTL Enabled／VECTOR,F8、auto650W；每shape **10个独立X/W/P/Y buffer、2warm、24轮ABBA/BAAB**，Down／Up／Total三个scope分别计时，旧版／新版各48样本。新版使用真实公开`run_down`／`run_up`／`__call__`，旧版使用冻结选中的ELF，同一配对完全同地址。JIT、准备／shuffle、校验与轮间遥测都在timer外。
+
+**性能基本不变的验收阈值在测量前固定为3%**：全48样本中位之比与24轮配对ratio中位都不得超过1.03，不删首样本、慢段或长尾。全矩阵 **4608条raw／768份轮间遥测**均保留。Total是完整两launch直接计时，不是Down与Up中位数相加。
+
+以下为新版全矩阵原始中位数，单元格均 **us／有效TFLOPS**。差值与同场旧版选中路径相比；36k Down的首次未通过如实列出，不用随后独立确认的数据替换本表。
+
+| Batch | 自动Up | 新Down us／T | 新Up us／T | 新Total us／T | Up相对旧版 | Total相对旧版 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1k | N8 | 141.161／47.541 | 77.181／86.951 | 222.301／60.377 | +0.027% | −0.009% |
+| 2k | N8 | 142.481／94.201 | 79.580／168.658 | 225.961／118.797 | +0.151% | +0.018% |
+| 4k | N4 | 145.100／185.000 | 145.721／184.212 | 294.482／182.311 | +0.152% | +0.150% |
+| 8k | N2 | 262.361／204.631 | 272.761／196.828 | 533.183／201.384 | −0.073% | +0.019% |
+| 10k | N2 | 266.561／251.758 | 277.002／242.269 | 544.642／246.433 | −0.309% | +0.210% |
+| 12k | N8 | 398.182／202.246 | 385.182／209.072 | 793.424／202.995 | +0.062% | +0.035% |
+| 16k | N8 | 549.862／195.275 | 534.983／200.706 | 1077.645／199.276 | +0.067% | +0.067% |
+| 20k | N2 | 559.042／240.085 | 567.843／236.364 | 1129.045／237.755 | −0.056% | +0.926% |
+| 24k | N4 | 691.103／233.050 | 716.003／224.945 | 1405.086／229.255 | +0.053% | −0.297% |
+| 28k | N2 | 825.843／227.531 | 850.104／221.037 | 1670.367／224.986 | +0.739% | −0.104% |
+| 30k | N2 | 832.263／241.903 | 859.943／234.116 | 1691.447／238.053 | +0.061% | +0.279% |
+| 32k | N8 | 965.744／222.366 | 1005.224／213.632 | 1967.168／218.333 | −0.521% | +0.284% |
+| 36k | N2 | **1321.365／182.835†** | 1265.985／190.833 | 2532.230／190.814 | +0.054% | −0.262% |
+| 48k | N2 | 1823.827／176.619 | 1927.308／167.136 | 3857.276／167.021 | −0.877% | +1.483% |
+| 60k | N2 | 2175.549／185.081 | 2366.170／170.171 | 4618.379／174.370 | +0.378% | +1.363% |
+| 64k | N4 | 2382.770／180.251 | 2647.190／162.246 | 5074.400／169.280 | −0.029% | +0.022% |
+
+$$
+F_{Down}(T)=F_{Up}(T)=2T\times10240\times320,\qquad
+F_{Total}(T)=4T\times10240\times320,\qquad
+TFLOPS_{effective}=\frac{F(T)}{t_{us}\times10^6}.
+$$
+
+†36k Down首次矩阵：旧 **1209.965us／199.669T**，新 **1321.365us／182.835T**，全中位差 **+9.207%**，超过门槛；这项原判定不改。其配对ratio中位 **0.997750**，却没有显示同方向回归，需下节独立核查。
+
+完整结果：[48行性能CSV](results/production_cleanup_20260919/performance.csv)、[初始矩阵摘要](results/production_cleanup_20260919/summary.json)。该摘要明确保留 `performance_regression_passed=false`，因为 **47/48个batch×scope通过，而非48/48首轮全部通过**。
+
+- **Up全16档通过**，全中位变化范围 **−0.877%…+0.739%**；配对ratio中位范围 **0.994607…1.004282**。
+- **Total全16档通过**，全中位变化范围 **−0.297%…+1.483%**；配对ratio中位范围 **0.998274…1.012690**。
+- Down除36k全中位这一项外通过；全部16档Down配对中位范围 **0.982263…1.007020**。
+
+本轮36k及更大规模出现新旧两版共同变慢，SCLK读数全批范围1201…1812MHz；60k／64k绝对TFLOPS因此不能代替旧正常时钟条件下的基线。本次目标是证明**整理前后同场基本不变**，不是重新宣称这些绝对值最优。所有性能门禁仍通过，不按时钟快慢筛数据，也不通过调频恢复某个数字。
+
+### 91.5 36k Down唯一异常：保留首次失败，一次三路确认不复现回归
+
+对[原36k矩阵](results/production_cleanup_20260919/timing_36864.json)逐轮只读复核：第12轮后SCLK读数 **1767MHz**，末轮 **1256MHz**，新旧两版都从约1.09ms进入约1.46ms。全48样本的中位数恰好落在快慢两簇之间：
+
+- 旧版中间两值 **1189.365／1230.565us**，中位1209.965us。
+- 新版中间两值 **1310.925／1331.805us**，中位1321.365us。
+- 相同轮次的pair中位 **0.997750［P25=0.993159，P75=1.021752］**，与全中位比1.092069不同。不能择优删除其中一个统计口径，也不把轮间读数当每kernel的精确实际频率。
+
+为区分代码对象／加载、公共Host开销和时钟变化，只追加**一次固定协议Down-only三路确认**，未重新跑全矩阵。GPU调用前另行冻结[确认协议](results/production_cleanup_20260919/confirm_36k/protocol.json)：旧native、新native、新public三个入口，10buffers、24轮旋转回文、每版48样本，仍用原3%门槛，首个长样本全部保留。
+
+| 36k Down独立确认 | 全样本中位us | 有效TFLOPS | 相对旧native | 配对ratio中位［P25,P75］ |
+|---|---:|---:|---:|---|
+| 旧ELF＋native | 1091.724 | 221.294 | — | — |
+| 新ELF＋native | 1091.784 | 221.282 | +0.005% | 1.001364［0.997392,1.005265］ |
+| **新公共入口** | **1092.004** | **221.237** | **+0.026%** | **0.999863［0.997360,1.001846］** |
+
+新public对新native为 **+0.020%**，三对比较均通过原门槛。工作量 $F=241591910400$，仍为真实Down GEMM有效TFLOPS。确认期间轮间SCLK范围1422…1779MHz；这次未复现原矩阵后半的1256MHz慢段，但**不是人为改频率，也不是反复测到通过**。
+
+证据：[独立确认完整样本](results/production_cleanup_20260919/confirm_36k.json)、[独立CPU补充摘要](results/production_cleanup_20260919/confirmation_summary.json)。原矩阵／原false／4608条raw不改，确认144条raw不与原样本合池。可接受的结论是：**所选16档Up／Total完整矩阵性能基本不变，Down36的首轮统计异常保留，一次隔离确认没有复现代码或公共接口回归**；不是“首轮所有scope均通过”，也不是对自动时钟机制触发原因的证明。
+
+### 91.6 最终交付与剩余边界
+
+- 初始摘要SHA **5d84db90a99c63b1422dd3c224e68221313c6e272d2a82da6ff26a82a43783ac** 保留false；独立确认SHA **c82da3823d0bec6597b0f1e03ce401dbd05c4ea9668b3f19d37474e506806a9f**；最终接受说明SHA **27ee94ad4a8397de228ca7b76565e0ad38e4bf7d9b1338bdeee794e907064d23**。
+- 共16档、31项pytest、**4608＋144＝4752条性能raw、816份轮间遥测**；51份前／采样前／出口门禁，最大GPU use5%、VRAM8%，全部Enabled／VECTOR,F8／auto650W；未放宽门禁、未设置时钟／功率／PTL。没有ATT／PMC或新的GPU调优。
+- 正式7个模块无测试CLI、环境开关或落选kernel；旧源保留在本轮before快照，测试根目录只保留必要回归。N4/N8的内部编译期共用参数与正式调度栅栏属于算法，不因“清理开关”而删除。
+- 16档所选Down／Up `.text`及资源字段全部与旧版相同，数值／guard／Graph通过；运行和31项测试可正常解析新包。额外Pylance MCP在当前解释器／editable映射下仍报告`reportMissingImports`及FlyDSL动态类型诊断，旧快照有同类诊断，未通过全局压低诊断级别或改GPU表达式掩盖。此静态分析限制与已执行的导入／JIT／功能验收分开，不声称全仓库类型检查零诊断。
+- 当前调用者需从正式包导入，并去掉旧测试入口参数；同一实例复用partial/output，保留多次输出需自行复制；并发stream使用独立实例。当前针对gfx942，其他架构不隐式回退。
+- 只追加第91节，旧 **780986B／SHA 2ba8dc58f8e453f938c2ef287f07ae47aa5c8668826902a7791b67bcecbc7eb3** 前缀保持。进入本轮时Git工作区已干净，index由外部变为 **212bbc2384cc9b9b5aeba6c430694f5f92b4eb7dd707f2b98a382491c10f2f51**，已冻结并全程不写；无stage／reset／commit／push。
+
+## 92. N4预取2／3拍：按CU估计每个stage的在途VMEM指令数（2026-09-19，CPU-only）
+
+沿用第90节N4的W2／W3实际ISA，保持X128、XPY NT、phase0和4＋4 wave错相；W2的指令段已再次核为与第91节正式N4完全相同。**不新运行GPU，不用启动段，只给LOOP稳态的保守在途上界。** [估算程序](results/n4_cu_vmem_20260919/estimate.py)、[机器结果](results/n4_cu_vmem_20260919/estimate.json)、[完整stage CSV](results/n4_cu_vmem_20260919/stages.csv)。
+
+### 92.1 计量单位与推算规则
+
+- 一个CU驻留 **1CTA＝8wave**，分为领先／随后两组各4wave，不把8wave当同时执行同一Memory段。
+- 这里的“一条VMEM”是**一条wave级、由vmcnt跟踪的buffer load/store指令**。`dwordx4`、`dwordx2`各算1条；不是64个lane请求，也不是cacheline／HBM transaction，不能乘64或直接换算硬件队列entry数。
+- 一个H32 packet（`step=0…7`）有`h16=0/1`两个Memory＋Compute子stage，编号 $j=2\,step+h16$。16个子stage在每个H64四stream组内重复。
+- `h16=0`每wave新发 **2W＋1X＝3条**；`h16=1`新发 **1W＋1X**，其中step0…3还各有 **1Y store**，所以分别是3条或2条。P在启动加载后常驻VGPR，不在稳态逐stage增加；LDS／SMEM不计入本表VMEM。
+
+设上一个子stage末的单wave上界为 $B_{j-1}$，本段实际`vmcnt`阈值为 $w_j$、之后的新发VMEM条数为 $I_j$：
+
+$$
+A_j=\min(B_{j-1},w_j),\qquad B_j=A_j+I_j.
+$$
+
+这里 $A_j$ 是**wait完成后**上界，$B_j$是**本Memory新发指令结束后**上界；Compute不发VMEM，也没有额外vmcnt，保守模型不扣除自然返回。实际请求通常会在Compute中提前完成，故这些值**不是实测平均占用**。
+
+尤其不能直接令 $A_j=w_j$：W3的step1/h16=0虽为`vmcnt(9)`，此前上界只有6，所以是 $6\rightarrow6\rightarrow9$，不是 $6\rightarrow9\rightarrow12$；step3/h16=1的`vmcnt(11)`也只能把此前上界10保持为10，新发3条后为13而非14。
+
+### 92.2 4＋4错相的两个CU边界
+
+每个子stage存在两种有不同wave进度的barrier边界，必须分开：
+
+- **边界A**：领先4wave已完成Memory $j$，随后4wave完成Compute $j-1$，CU上界为 $4(B_j+B_{j-1})$。
+- **边界B**：领先4wave完成Compute $j$，随后4wave已完成Memory $j$，CU上界为 $8B_j$。这不代表8wave同时发射，而是两组都已经完成该段Memory、尚未通过下一段wait约束。
+
+下表全部数值是条数上界，“wait→末”是单wave的 $A_j\rightarrow B_j$；CU列是真正合成8wave后的上界。组内wave可以存在短时错位，因此完整阶段内还可能继承上一边界的上界；**不能把段末较小值反推为本段wait尚未完成时也已经减少**。
+
+| 子stage（step,h16） | 新发／wave | 2拍：wave wait后→Memory末 | 3拍：wave wait后→Memory末 | 2拍CU边界A | 3拍CU边界A | 2拍CU边界B | 3拍CU边界B |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0,0 | 3 | 2→5 | 2→5 | 44 | 60 | 40 | 40 |
+| 0,1 | 3 | 3→6 | 3→6 | 44 | 44 | 48 | 48 |
+| 1,0 | 3 | 4→7 | 6→9 | 52 | 60 | 56 | 72 |
+| 1,1 | 3 | 5→8 | 9→12 | 60 | 84 | 64 | 96 |
+| 2,0 | 3 | 3→6 | 3→6 | 56 | 72 | 48 | 48 |
+| 2,1 | 3 | 4→7 | 4→7 | 52 | 52 | 56 | 56 |
+| 3,0 | 3 | 4→7 | 7→10 | 56 | 68 | 56 | 80 |
+| **3,1** | **3** | **5→8** | **10→13** | **60** | **92** | **64** | **104** |
+| 4,0 | 3 | 3→6 | 3→6 | 56 | 76 | 48 | 48 |
+| 4,1 | 2 | 4→6 | 4→6 | 48 | 48 | 48 | 48 |
+| 5,0 | 3 | 3→6 | 6→9 | 48 | 60 | 48 | 72 |
+| 5,1 | 2 | 4→6 | 9→11 | 48 | 80 | 48 | 88 |
+| 6,0 | 3 | 2→5 | 2→5 | 44 | 64 | 40 | 40 |
+| 6,1 | 2 | 3→5 | 3→5 | 40 | 40 | 40 | 40 |
+| 7,0 | 3 | 3→6 | 5→8 | 44 | 52 | 48 | 64 |
+| 7,1 | 2 | 4→6 | 8→10 | 48 | 72 | 48 | 80 |
+
+表中step0,0的 $B_{j-1}$ 来自上一H64组的step7,1：W2为6、W3为10；所以即使该段本wave末尾均5，两版CU边界A仍是44和60。这是稳态跨组衔接，不是启动段计数。
+
+**稳态单wave峰值上界：W2＝8，W3＝13；对应CU峰值上界：64与104。** W3→W2使该保守峰值下降40条，即 **38.46%**。这只是未显式排空指令窗口的上界变化，**不等于硬件实测平均在途数下降38.46%，也不能把它与第90节issue-stall下降38.66%的数值相近当作唯一因果证明**。每个stage的新发条数／总流量并没有因此减少。
+
+为什么W3不是简单每wave恒多3条？X128 pair在偶packet转置前也需要等X完成；这些较严wait会同时约束更早的W/Y请求，因此不少偶拍两版的 $B_j$ 完全一样。差异主要在随后的奇packet，W3允许连续多个Memory子stage多积累请求，形成9／12、10／13、9／11、8／10等较高窗口。
+
+### 92.3 已有ATT程序序的独立复核与边界
+
+[独立复核](results/n4_cu_vmem_20260919/crosscheck.json)读取第90节W2_M／W3_M正反四份旧ATT，不调用已清理的历史实验入口：共 **1536wave、172032次稳态子stage检查**，每次wait前／后和Memory末的上界都与表格完全一致；全任务最终vmcnt0闭合，单wave峰值分别8／13。该复核只验证真实指令序允许的计数窗口，ATT没有逐条VMEM实际完成时刻，不能升级成“测到了在途数”。
+
+估算摘要SHA **2274006335f602b0ffe7f4ccb4715e529d73089e69345bfeef88944925cbbff4**。正式源、旧ISA／ELF／ATT／结果、Git index不改；只新增CPU估算／核验产物及追加本节。旧文档 **795561B／SHA 8f5021d09f8a20fba63388e35d7951b24d56d5930dd0c92c3aed3a974addb9b1** 前缀保持，无新GPU、性能、ATT、PMC或硬件设置写入。
+
+## 93. 测试入口恢复默认一站式直接执行：全部正确性→全部性能（2026-09-19）
+
+按用户要求，参考整理前测试的准备／参考／计时行为，为[test_gr_read.py](test_gr_read.py)恢复直接执行功能。[一站式实现](benchmark.py)与pytest用例分开：无参数执行测试入口时先解析环境和选卡，随后才导入Torch／PyHIP；通过pytest导入时仍只收集功能回归，**不会自动跑完整性能矩阵**。
+
+### 93.1 默认行为与可选参数
+
+无参数执行即完成以下两个严格分离的阶段，无需传`--sweep`：
+
+1. **全部16档正确性**：1／2／4／8／10／12／16／20／24／28／30／32／36／48／60／64k，1k＝1024。逐档执行原BF16参考、NaN投毒后两kernel路径、原P／Y逐元素容差、真实rel_l2和padding检查。任一档失败，不进入性能阶段。
+2. **全部16档性能**：只有上一步全部成功才开始；正式入口仍自动选择N2／N4／N8。每档默认10个独立X／shuffle权重／P／Y buffers、每scope2次预热、10次测量，完整样本取中位；依次报告Down、Up、直接Total的us与有效TFLOPS，并打印全部batch汇总表。
+
+保留的参数均控制测试范围／环境／采样，不重新引入kernel开关：`--rows 4K`单档，`--batches 1K 4K 60K`自定义列表，`--check-only`只检查，`--gpu`指定物理卡（默认2），`--seed`、`--warmup`、`--iters`、`--buffers`、`--amd-smi`与`--output`。`--rows`／`--batches`互斥，重复batch或无效计数拒绝；不接受旧`--implementation`或`--up-block-m`。
+
+性能沿用原`cudaPerf`。JIT、构造、shuffle、分配、参考和输出校验都在timer外；每个性能Y必须为原生对齐allocation起点，不使用guard切片。所有计时buffer预检且计时后的输出逐位校验，不通过重跑Total覆盖某scope的坏输出。
+
+每档性能前／采样前／出口只读检查GPU util≤5%、VRAM≤20%、PTL **Enabled／VECTOR,F8**；状态先落盘，门禁失败立即停止，不循环等空闲、不换卡、不放宽阈值、不写任何硬件设置。`--check-only`不执行性能门禁。batch之间释放已完成的张量，避免全矩阵同时常驻显存。
+
+输出默认新建`results/one_stop_*`目录，也可用`--output`指定**尚不存在**的目录；保存逐batch检查、完整样本JSONL、地址与硬件快照、总summary。失败时已有数据和`complete=false`／失败阶段／batch／异常全部保留，返回非零退出码；不会覆盖历史或只打印一个误导性PASS。
+
+### 93.2 本次实际执行验收
+
+- [新增CPU流程回归](test_benchmark.py)共24项，核默认16档与2warm／10samples／10buffers、参数拒绝、**全部check严格先于任何timing**、check失败不启动性能、性能失败只调用一次并立即停止、check-only不查门禁、门禁边界、exclusive结果文件。
+- 原31项功能／Graph回归保持；本次完整 **55 passed、0 failed、0 skipped**，见[JUnit报告](results/one_stop_entry_20260919/pytest.xml)。CLI help也已直接执行通过，不触发Torch／GPU初始化。
+- 随后真正**无参数执行一次test_gr_read.py**，不是只mock流程：[调用收据](results/one_stop_entry_20260919/run.json)确认命令没有范围或采样覆盖参数，全部16档正确性通过后才开始全部16档性能。
+- 共 **480条性能原始样本、48份硬件门禁**，全样本保留；最大GPU use4%、VRAM9%，全部PTL Enabled／VECTOR,F8。自动N2/N4/N8与正式选型一致，正式src七模块、原参考和timer哈希保持不变。
+- [完整控制台输出](results/one_stop_entry_20260919/default_run.log)、[这次默认运行summary](results/one_stop_20260919_081607_049227_537517/summary.json)、[独立CPU核验摘要](results/one_stop_entry_20260919/summary.json)保存全部16档时延／有效TFLOPS及功能误差。此次是新增测试入口的单版运行确认，不与第91节样本合池，也不据跨时段绝对值宣布新的性能回归或优化。
+
+输出中工作量明确为
+
+$$
+F_{Down}=F_{Up}=2T\times10240\times320,\qquad
+F_{Total}=4T\times10240\times320,\qquad
+TFLOPS=F/(t_{us}\times10^6).
+$$
+
+Total直接计时，不相加三个不同测量窗口的中位数；不把busy×roof模型值当有效TFLOPS。
+
+本轮仅新增测试功能及追加本节。旧 **801177B／SHA 5894a345fc6e4aaee37e930d82f1786018f8f28eaa29965c9043c7502b3a47a7** 文档前缀保持，Git index **212bbc2384cc9b9b5aeba6c430694f5f92b4eb7dd707f2b98a382491c10f2f51**未写；没有stage／reset／commit／push、新kernel调优、ATT或PMC。
+
+## 94. 4＋4 wave错相：同一CU的稳态横向时间轴（2026-09-19）
+
+**这是稳态，不是启动段。** 稳态表示Memory／Compute错相协议周期性重复，不表示每个时刻的在途VMEM数恒定。以下截取循环中间三个相邻子stage：`j−1=(step3,h16=0)`、`j=(step3,h16=1)`、`j＋1=(step4,h16=0)`；左右都仍有流水，不从空队列开始。
+
+![同一个CU内两组wave的稳态时间轴](results/n4_steady_timeline_20260919/steady_timeline.svg)
+
+第92节的“两个CU边界”更准确地说是**同一个CU上的两个交替同步时刻A／B**。沿图中时间轴从左向右：
+
+- **A当前段**：前4 wave完成Memory j，后4 wave完成Compute j−1；只有前组发过当前Memory。3拍上界为`4×13＋4×10=92`，2拍为`4×8＋4×7=60`。
+- **B当前段**：前4 wave完成Compute j，后4 wave完成Memory j；两组都发过当前Memory。3拍上界为`4×13＋4×13=104`，2拍为`4×8＋4×8=64`。**这不等于8 wave同时发Memory**，而是已经发出的请求可以跨过Compute仍在途。
+- 下一段较严`vmcnt(3)`使上界下降，图中3拍继续为76／48，仍然是稳态。这里沿用第92节的保守模型，只扣显式wait约束，不扣自然完成；数字是wave级VMEM指令条数上界，不是实测队列占用。
+
+方块宽度只表达程序序，不代表实测周期；两组各4 wave的组内错位和较早到barrier后的等待宽度未展开。`s_barrier`不是`vmcnt(0)`，不会自动排空VMEM。只新增SVG并追加本节，数据复用第92节[逐stage估算](results/n4_cu_vmem_20260919/stages.csv)，没有修改kernel或重跑GPU／ATT／性能测试。
+
+## 95. 全8个step展开，并在Memory／Compute框内标明主要工作（2026-09-19）
+
+在第94节三段局部图之外，新增[完整8-step长图](results/n4_steady_timeline_20260919/all_steps.svg)与[可缩放查看页](results/n4_steady_timeline_20260919/index.html)。原图不覆盖。长图包含step0…7各自的h16=0／1、前／后4 wave的64个主体框，以及左侧上一组Compute7.1、右侧下一组Memory0.0的稳态衔接。查看页支持连续横轴、按step跳转、缩放和“每行2步”折行；折行只是同一条时间轴的换行，不是四个CU或四次启动。
+
+![全部8个step的主要工作与两组wave时间轴](results/n4_steady_timeline_20260919/all_steps.svg)
+
+框内统一`g2r=global→寄存器`、`r2s=寄存器→LDS`、`s2r=LDS→寄存器`、`r2g=寄存器→global`。`q=g×8+step`是H32 packet，`j=2×step+h16`是子stage；**Compute对q做MFMA，同时后处理q−1的相同h16，不是后处理j−1**。
+
+- **Memory**：每h16读取W[q]的10条LDS指令；h16=0／1分别将W[q+1]的2／1片r2s，再发2／1条未来W g2r以及1条未来X g2r。2／3拍的W目的包分别为q+2／q+3，不改变r2s目的包q+1。框内列出两版vmcnt阈值与单wave末上界。
+- **偶step的X搬运**：h16=0先取旧X pair的高H32，再分h16=0／1把新pair两批经LDS转置；奇step不重复转置。P启动后常驻VGPR，稳态无P g2r。
+- **Compute**：每wave／h16为40条MFMA，穿插旧logits的sigmoid和FP32 FMA。step1／2处理stream0并先清对应累加；step3／4加stream1；step5／6加stream2；step7完成本组低H32的stream3、×0.25并BF16打包；step0完成上一组高H32的同样收尾。
+- **Y写回**：只在step0／1／2／3的h16=1分别写上一组低H32的M0／M1、高H32的M0／M1，每次为一份M16×H32。h16=1是执行时机，**不是只写后H16**；打包发生在寄存器，不能与r2g写回混称。
+
+全部16个子stage的等待值、wave末上界及64个CU A／B数字逐项对照第92节CSV，前后泳道同名框相差一个Memory／Compute区间；峰值仍是2拍64／3拍104条保守上界。图中的等宽只用于表达顺序，组内错位、barrier等待长度及自然完成未按真实时间绘制。此次仅绘图和查看页，正式kernel／测试入口／原图／历史结果不改，无新增GPU、JIT、ATT或性能采样。

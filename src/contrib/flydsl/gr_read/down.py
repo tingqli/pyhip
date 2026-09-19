@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""GR read prefill Down：M64/N320/K64，FP32累加，BF16 GEMM边界与SiLU输出。"""
+"""GR read Down：M64/N320/K64，FP32累加，BF16 GEMM边界与SiLU输出。"""
 
 from functools import cache
 
@@ -7,10 +7,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 
-if __package__:
-    from .kernel import K, R, _sigmoid, _weight_view
-else:
-    from kernel import K, R, _sigmoid, _weight_view
+from .common import K, R
+from .helpers import _sigmoid_down as _sigmoid, _weight_view
 
 BM, BN, BK = 64, 320, 64
 GROUP_STEPS = 8
@@ -18,8 +16,8 @@ GROUPS = K // BK // GROUP_STEPS
 
 
 @cache
-def make_down_1x4(rows, padded_rows):
-    """只构造胜出配置；每个CTA计算64行和全部320个隐藏通道。"""
+def make_down(rows, padded_rows):
+    """构造正式Down；每个CTA计算64行和全部320个隐藏通道。"""
     assert 0 < rows <= padded_rows and padded_rows % BM == 0
 
     @fx.struct
@@ -28,7 +26,7 @@ def make_down_1x4(rows, padded_rows):
         a1: fx.Array[fx.BFloat16, BM * BK, 16]
 
     @flyc.kernel(known_block_size=[256, 1, 1])
-    def gr_read_down_1x4(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor):
+    def gr_read_down(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor):
         tid = fx.Int32(fx.thread_idx.x)
         im, jn, _ = fx.block_idx
         # 逻辑M域必须覆盖padding CTA，防止单tile布局把其block偏移折叠回首tile。
@@ -88,7 +86,7 @@ def make_down_1x4(rows, padded_rows):
             if const_expr(read_next):
                 fx.copy(copy_s, a_transfer_s, a_destinations[slot ^ 1])
                 # A2+B10个VMEM请求，每次间隔6条MFMA；8次DS读，2次A写。
-                # 每拍共12*6 + 4 + 2*2 = 80条MFMA，保持胜出版本的交错顺序。
+                # 每拍共12*6 + 4 + 2*2 = 80条MFMA，保持既定的交错顺序。
                 for request in range_constexpr(12):
                     if const_expr(request < 8):
                         rocdl.sched_dsrd(1)
@@ -129,6 +127,6 @@ def make_down_1x4(rows, padded_rows):
 
     @flyc.jit
     def launch_down(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, stream: fx.Stream):
-        gr_read_down_1x4(X, W, P).launch(grid=(padded_rows // BM, R // BN, 1), block=(256, 1, 1), stream=stream)
+        gr_read_down(X, W, P).launch(grid=(padded_rows // BM, R // BN, 1), block=(256, 1, 1), stream=stream)
 
     return launch_down
