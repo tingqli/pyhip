@@ -43,6 +43,13 @@ description: 'Use when tuning FlyDSL AMD FP8 GEMM or MoE Memory/Compute scheduli
 - `remaining=7`是源码调度预算，不等于所有实际MFMA间都有7条机器VALU；startup、drain、copy和DPP均需看ISA。
 - 使用编译器识别的DPP intrinsic暴露跨lane读hazard；opaque inline asm不一定得到正确间隔调度。
 
+## gfx942 MoE 8x1的两条可复用教训
+
+- **延后pack不一定降低成本。** 已完成的FP32结果和weight scale要一直活到pack，而提前打包后通常只需保留较小的BF16片段。若跨入下一拍B暂存峰，寄存器需求可能上升；把pack移到Memory还可能缩短Compute却拉长Memory，破坏4＋4错相重叠。应先画live-range/consumer表，不能仅凭指令数下降或`vmcnt`变宽判断收益。[历史反例](../../../tests/contrib/moe/results/k256_memory_pack_20260909/att_comparison.json)
+- **等待取全部即将消费的数据中最严格者。** B和scale都有自己的producer；不要只数B之后的年轻VMEM。首N缺旧输出store、过渡N与末N裁剪，会让相同stage的预算不同；wait之后才发出的请求不属于该次预算。请求宽度变化（例如BK192的16B＋8B）也必须进入实际指令事件账本。gfx942的VM/LGKM规则不无条件推广到其他架构。[现行schedule](../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py)
+
+更多专项方法：[MoE分块/compact](../moe-fp8-tiling/SKILL.md)、[LDS CShuffle](../flydsl-cshuffle-layout/SKILL.md)、[接口与编译等价](../flydsl-codegen-validation/SKILL.md)。本节的gfx942原生buffer流水与前述gfx950 direct-global-to-LDS实例不是同一实现。
+
 ## 验收
 
 - 精度/graph：短N、padding、跨expert边界、valid0、invalid→恢复、原始严格相消测试。

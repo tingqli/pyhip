@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """GRRead basic correctness and performance tests with an inline reference and CLI.
 
-Direct execution checks all 16 batch sizes before timing Down/Up/Total.
+Direct execution checks all 17 batch sizes, including 512, before timing Down/Up/Total.
 Use --check-only for correctness without timing. Pytest checks basic numerical
 results, empty inputs, and tails without running performance tests.
 Retain every timing sample. Stop on a failed gate without waiting or changing hardware.
@@ -25,7 +25,7 @@ C, H, R = 4, 2560, 320
 CHECK_ROWS = 1024
 DOWN_TOLERANCE = dict(rtol=0.015625, atol=2e-5)
 OUTPUT_TOLERANCE = dict(rtol=1e-2, atol=5e-3)
-DEFAULT_BATCHES = tuple(k * 1024 for k in (1, 2, 4, 8, 10, 12, 16, 20, 24, 28, 30, 32, 36, 48, 60, 64))
+DEFAULT_BATCHES = (512,) + tuple(k * 1024 for k in (1, 2, 4, 8, 10, 12, 16, 20, 24, 28, 30, 32, 36, 48, 60, 64))
 SCOPES = ("down", "up", "total")
 
 
@@ -44,7 +44,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     batches = parser.add_mutually_exclusive_group()
     batches.add_argument("--rows", type=parse_batch, help="run one batch size, e.g. 4K")
-    batches.add_argument("--batches", nargs="+", type=parse_batch, help="batch sizes to test; defaults to all 16 sizes")
+    batches.add_argument("--batches", nargs="+", type=parse_batch,
+                         help=f"batch sizes to test; defaults to all {len(DEFAULT_BATCHES)} sizes, including 512")
     parser.add_argument("--gpu", type=int, default=3, help="physical ROCm GPU index (default: 3)")
     parser.add_argument("--check-only", action="store_true", help="check all selected batches without hardware gates or timing")
     parser.add_argument("--seed", type=int, default=131)
@@ -111,7 +112,7 @@ def prepare_gr_read(x, w_down, w_up):
     """Prepare shuffled weights, buffers, and compiled launches for this input."""
     torch, flyc, _, _ = dependencies()
     from pyhip.contrib.flydsl.gr_read.common import (
-        K, preshuffle_weight, select_down_n_splits, select_n_splits, validate_rows,
+        K, preshuffle_weight, select_down_config, select_n_splits, validate_rows,
     )
     from pyhip.contrib.flydsl.gr_read.prefill_down import make_down
     from pyhip.contrib.flydsl.gr_read.prefill_up import make_up
@@ -131,7 +132,8 @@ def prepare_gr_read(x, w_down, w_up):
     props = torch.cuda.get_device_properties(x.device)
     if props.gcnArchName.split(":", 1)[0] != "gfx942":
         raise ValueError("GRRead currently targets gfx942")
-    down_n_splits = select_down_n_splits(rows, props.multi_processor_count)
+    down_config = select_down_config(rows, props.multi_processor_count)
+    down_block_m, down_num_waves, down_n_splits = down_config
     n_splits = select_n_splits(rows, props.multi_processor_count)
     with torch.cuda.device(x.device):
         # 保留H64内stream优先的布局；这里只搬迁准备逻辑，不改变权重排列。
@@ -144,9 +146,10 @@ def prepare_gr_read(x, w_down, w_up):
         if rows:
             # compile会执行launcher；直接使用本次足量二维X，不再额外分配占位输入。
             stream = torch.cuda.current_stream(x.device)
-            down = flyc.compile(make_down(n_splits=down_n_splits), x, w_down, partial, rows, stream)
+            down = flyc.compile(make_down(n_splits=down_n_splits, block_m=down_block_m, num_waves=down_num_waves),
+                                x, w_down, partial, rows, stream)
             up = flyc.compile(make_up(n_splits=n_splits), x, w_up, partial, output, rows, stream)
-    return w_down, w_up, partial, output, down, up, down_n_splits, n_splits
+    return w_down, w_up, partial, output, down, up, down_config, n_splits
 
 
 def run_down(x, w_down, partial, down):
@@ -215,7 +218,8 @@ def check_batch(rows, args):
     torch, _, _, _ = dependencies()
     with torch.no_grad():
         x, wd, wu = make_inputs(torch, rows, args.seed)
-        w_down, w_up, partial, output, down, up, down_n_splits, n_splits = prepare_gr_read(x, wd, wu)
+        w_down, w_up, partial, output, down, up, down_config, n_splits = prepare_gr_read(x, wd, wu)
+        down_block_m, down_num_waves, down_n_splits = down_config
         p_expected, y_expected = reference_bf16(x, wd, wu)
         assert partial.dtype == output.dtype == torch.bfloat16
         assert partial.shape == (rows, R)
@@ -231,10 +235,11 @@ def check_batch(rows, args):
         check_close(partial, p_expected, DOWN_TOLERANCE)
         check_close(output, y_expected, OUTPUT_TOLERANCE)
         result = {"complete": True, "rows": rows, "down_n_splits": down_n_splits,
+                  "down_block_m": down_block_m, "down_num_waves": down_num_waves,
                   "n_splits": n_splits, "P_rel_l2": p_error, "Y_rel_l2": y_error,
                   "P_tolerance": DOWN_TOLERANCE, "Y_tolerance": OUTPUT_TOLERANCE,
-              "partial_shape": list(partial.shape), "checked_scopes": list(SCOPES)}
-        print(f"  T={rows:5d}  Down N{down_n_splits} / Up N{n_splits}  "
+                  "partial_shape": list(partial.shape), "checked_scopes": list(SCOPES)}
+        print(f"  T={rows:5d}  Down M{down_block_m}/W{down_num_waves}/N{down_n_splits} / Up N{n_splits}  "
               f"Down rel_l2={p_error:.6g}  Output rel_l2={y_error:.6g}  PASS", flush=True)
         return result
 
@@ -303,7 +308,8 @@ def benchmark_batch(rows, args, folder):
         expected_p = expected_y = None
         addresses = []
         calls = {scope: [] for scope in SCOPES}
-        for input_x, w_down, w_up, partial, output, down, up, down_n_splits, n_splits in buffers:
+        for input_x, w_down, w_up, partial, output, down, up, down_config, n_splits in buffers:
+            down_block_m, down_num_waves, down_n_splits = down_config
             addresses.append({name: tensor_address(tensor, output=name == "Y") for name, tensor in zip(
                 ("X", "W_down", "W_up", "P", "Y"), (input_x, w_down, w_up, partial, output))})
             calls["down"].append((input_x, w_down, partial, down))
@@ -347,10 +353,12 @@ def benchmark_batch(rows, args, folder):
                 elapsed = median(samples)
                 timings[scope] = {"elapsed_us": elapsed, "samples_us": samples, "gemm_FLOPs": flops,
                                   "effective_TFLOPS": flops / elapsed / 1e6}
-                print(f"  T={rows:5d} Down N{down_n_splits} / Up N{n_splits} {scope:5s}: {elapsed:.3f} us, "
+                print(f"  T={rows:5d} Down M{down_block_m}/W{down_num_waves}/N{down_n_splits} "
+                      f"/ Up N{n_splits} {scope:5s}: {elapsed:.3f} us, "
                       f"{timings[scope]['effective_TFLOPS']:.3f} effective TFLOPS", flush=True)
         after = hardware_gate(args, folder, "after")
         return {"complete": True, "rows": rows, "down_n_splits": down_n_splits,
+                "down_block_m": down_block_m, "down_num_waves": down_num_waves,
                 "n_splits": n_splits, "timings": timings,
                 "hardware_before": before, "hardware_before_samples": ready, "hardware_after": after,
                 "buffers": args.buffers, "warmup_each": args.warmup, "samples_each": args.iters,
@@ -370,7 +378,8 @@ def print_summary(results):
     print("|---:|---:|---:|---:|---:|---:|", flush=True)
     for result in results:
         cells = [f"{result['timings'][scope]['elapsed_us']:.3f} / {result['timings'][scope]['effective_TFLOPS']:.3f}" for scope in SCOPES]
-        print(f"| {result['rows']} | N{result['down_n_splits']} | N{result['n_splits']} | {' | '.join(cells)} |", flush=True)
+        down = f"M{result['down_block_m']}/W{result['down_num_waves']}/N{result['down_n_splits']}"
+        print(f"| {result['rows']} | {down} | N{result['n_splits']} | {' | '.join(cells)} |", flush=True)
 
 
 def run_suite(args, output):
@@ -439,7 +448,9 @@ if __name__ == "__main__":
 import pytest
 
 
-@pytest.mark.parametrize("rows", (0, 1, 63, 64, 65, 129, 255, 256, 257, 2561, 65537, *DEFAULT_BATCHES))
+@pytest.mark.parametrize("rows", (0, 1, 31, 32, 33, 63, 64, 65, 129, 255, 256, 257,
+                                  1023, 1025, 2047, 2049, 2560, 2561, 3072, 3073,
+                                  4095, 4097, 65537, *DEFAULT_BATCHES))
 def test_gr_read(rows):
     torch = pytest.importorskip("torch")
     if torch.version.hip is None or not torch.cuda.is_available():

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""GRRead Up N2/N4/N8: independent CTAs with cooperative X128 loads and two-stage W prefetch.
+"""GRRead Up N2/N4/N8/N10/N20 with cooperative X128 loads and two-stage W prefetch.
 
 X/P loads and Y stores use NT; W uses the default policy. P is BF16 with full K320 and FP32 logits.
 The four streams for each H64 use the original FMA order and the integer BF16 output helper.
@@ -63,13 +63,13 @@ def _pack_y_from_mean(v0, v1):
 def make_up(*, n_splits):
     """Build the unified Up launcher without queue state, fallbacks, or alternate cache policies.
 
-    N2/N4/N8 CTAs process 160/80/40 H32 packets; each eight-packet group completes an H64 four-stream reduction.
+    Each CTA processes 40/n_splits whole H64 groups, with eight H32 packets per group.
     Runtime rows share one artifact across full tiles and tails; the grid covers actual rows only.
     Callers must provide positive rows and X/P/Y storage covering all actual rows.
-    n_splits is a required internal compile-time parameter supporting only 2/4/8.
+    Automatic dispatch includes N10/N20 for calibrated small batches and retains N2/N4/N8 elsewhere.
     """
-    if n_splits not in (2, 4, 8):
-        raise ValueError('n_splits must be 2, 4 or 8')
+    if n_splits not in (2, 4, 8, 10, 20):
+        raise ValueError('n_splits must be 2, 4, 8, 10 or 20')
     N_SPLITS = n_splits
     PACKETS = K // 32 // N_SPLITS
     GROUPS = PACKETS // GROUP_STEPS
@@ -325,9 +325,13 @@ def make_up(*, n_splits):
                     [fx.Float32(values[i]) for i in range_constexpr(13, 45)],
                     [fx.Int32(values[i]) for i in range_constexpr(45, 53)])
 
-        for g, values in range(fx.Index(1), fx.Index(GROUPS - 1), fx.Index(1), init=save(state)):
-            state = run_group(fx.Int32(g), *restore(values))
-            result = yield save(state)
+        if const_expr(GROUPS > 2):
+            for g, values in range(fx.Index(1), fx.Index(GROUPS - 1), fx.Index(1), init=save(state)):
+                state = run_group(fx.Int32(g), *restore(values))
+                result = yield save(state)
+        else:
+            # N20仅有FIRST和LAST两组；直接传递FIRST状态，不生成空稳态循环。
+            result = save(state)
         _, c_previous, x_previous, _, totals, y = run_group(fx.Int32(GROUPS - 1), *restore(result), last=True)
         if group == 0:
             _barrier()
