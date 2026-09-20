@@ -12,7 +12,7 @@ BLOCK_M = 256
 _ROUND_COST = ((2, 280), (4, 144), (8, 77))
 
 # Down M64：8档同址Down-only校准得到单CTA轮相对成本，N2减少工作但翻倍CTA。
-# 当前两版VGPR均限制为1CTA/CU；按实际M256 padding后的M64 CTA数估算尾轮。
+# 当前两版VGPR均限制为1CTA/CU；
 # gfx942/80CU时1..2560行选N2，其余选N1；其他CU数量仍用同一确定性模型。
 _DOWN_ROUND_COST = ((1, 140), (2, 105))
 
@@ -40,7 +40,7 @@ def select_down_n_splits(rows, compute_units):
         raise ValueError("compute_units must be a positive integer")
     if rows == 0:
         return 1
-    m_tiles = (rows + BLOCK_M - 1) // BLOCK_M * (BLOCK_M // 64)
+    m_tiles = (rows + 63) // 64
     return min(_DOWN_ROUND_COST,
                key=lambda item: ((m_tiles * item[0] + compute_units - 1) // compute_units) * item[1])[0]
 

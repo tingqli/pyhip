@@ -89,7 +89,7 @@ def dependencies():
     # 延迟导入：CLI先选GPU；--help和参数解析不初始化Torch，也不依赖pytest。
     import torch
     import torch.nn.functional as F
-    from pyhip.contrib.flydsl.gr_read import CombinedPaddedGRRead
+    import flydsl.compiler as flyc
     from pyhip.misc import cudaPerf
     if torch.version.hip is None or not torch.cuda.is_available():
         raise RuntimeError("ROCm GPU required")
@@ -104,7 +104,78 @@ def dependencies():
         gates = torch.sigmoid(logits).unflatten(-1, (C, H))
         return p, (gates * x.unflatten(-1, (C, H))).mean(dim=-2)
 
-    return torch, CombinedPaddedGRRead, _mix_reference, cudaPerf
+    return torch, flyc, _mix_reference, cudaPerf
+
+
+def prepare_gr_read(x, w_down, w_up):
+    """Prepare shuffled weights, buffers, and compiled launches for this input."""
+    torch, flyc, _, _ = dependencies()
+    from pyhip.contrib.flydsl.gr_read.common import (
+        K, preshuffle_weight, select_down_n_splits, select_n_splits, validate_rows,
+    )
+    from pyhip.contrib.flydsl.gr_read.prefill_down import make_down
+    from pyhip.contrib.flydsl.gr_read.prefill_up import make_up
+
+    rows = x.shape[0]
+    validate_rows(rows)
+    if w_down.shape != (R, K) or w_up.shape != (K, R):
+        raise ValueError("expected W_down[320,10240] and W_up[10240,320]")
+    if w_down.dtype != torch.bfloat16 or w_up.dtype != torch.bfloat16:
+        raise ValueError("GRRead weights must be BF16")
+    if w_down.device != w_up.device or not w_down.is_cuda or torch.version.hip is None:
+        raise ValueError("weights must be on the same ROCm device")
+    if x.shape != (rows, K) or x.dtype != w_down.dtype or x.device != w_down.device:
+        raise ValueError("input must match the weights' dtype and device and have shape [rows,10240]")
+    if not x.is_contiguous():
+        raise ValueError("input must be contiguous")
+    props = torch.cuda.get_device_properties(x.device)
+    if props.gcnArchName.split(":", 1)[0] != "gfx942":
+        raise ValueError("GRRead currently targets gfx942")
+    down_n_splits = select_down_n_splits(rows, props.multi_processor_count)
+    n_splits = select_n_splits(rows, props.multi_processor_count)
+    with torch.cuda.device(x.device):
+        # 保留H64内stream优先的布局；这里只搬迁准备逻辑，不改变权重排列。
+        up_interleaved = w_up.detach().reshape(C, H // 64, 2, 4, 2, 4, R).permute(1, 0, 2, 4, 3, 5, 6).contiguous().reshape(K, R)
+        w_down = preshuffle_weight(w_down)
+        w_up = preshuffle_weight(up_interleaved)
+        partial = torch.empty((rows, R), dtype=x.dtype, device=x.device)
+        output = torch.empty((rows, H), dtype=x.dtype, device=x.device)
+        down = up = None
+        if rows:
+            # compile会执行launcher；直接使用本次足量二维X，不再额外分配占位输入。
+            stream = torch.cuda.current_stream(x.device)
+            down = flyc.compile(make_down(n_splits=down_n_splits), x, w_down, partial, rows, stream)
+            up = flyc.compile(make_up(n_splits=n_splits), x, w_up, partial, output, rows, stream)
+    return w_down, w_up, partial, output, down, up, down_n_splits, n_splits
+
+
+def run_down(x, w_down, partial, down):
+    """Launch Down with prepared buffers and return the BF16 intermediate."""
+    torch, _, _, _ = dependencies()
+    if x.shape[0]:
+        with torch.cuda.device(x.device):
+            down(x, w_down, partial, x.shape[0], torch.cuda.current_stream(x.device))
+    return partial
+
+
+def run_up(x, w_up, partial, output, up):
+    """Launch Up with prepared buffers and return the BF16 output."""
+    torch, _, _, _ = dependencies()
+    if x.shape[0]:
+        with torch.cuda.device(x.device):
+            up(x, w_up, partial, output, x.shape[0], torch.cuda.current_stream(x.device))
+    return output
+
+
+def run_gr_read(x, w_down, w_up, partial, output, down, up):
+    """Launch Down then Up on the current stream, without host row splitting."""
+    torch, _, _, _ = dependencies()
+    if x.shape[0]:
+        with torch.cuda.device(x.device):
+            stream = torch.cuda.current_stream(x.device)
+            down(x, w_down, partial, x.shape[0], stream)
+            up(x, w_up, partial, output, x.shape[0], stream)
+    return output
 
 
 def reference_bf16(x, w_down, w_up):
@@ -141,31 +212,29 @@ def make_inputs(torch, rows, seed):
 
 
 def check_batch(rows, args):
-    torch, reader_type, _, _ = dependencies()
+    torch, _, _, _ = dependencies()
     with torch.no_grad():
         x, wd, wu = make_inputs(torch, rows, args.seed)
-        reader = reader_type(rows, wd, wu)
+        w_down, w_up, partial, output, down, up, down_n_splits, n_splits = prepare_gr_read(x, wd, wu)
         p_expected, y_expected = reference_bf16(x, wd, wu)
-        partial = reader.partial.view(-1, R)
-        assert reader.partial.dtype == reader.output.dtype == torch.bfloat16
+        assert partial.dtype == output.dtype == torch.bfloat16
+        assert partial.shape == (rows, R)
         # 单独检查两基础函数，再检查完整调用；共用同一参考，不做结构/内部选型测试。
-        reader.partial.fill_(torch.nan)
-        assert reader.run_down(x) is reader.partial
-        p_error = check_close(partial[:rows], p_expected, DOWN_TOLERANCE)
-        assert (partial[rows:] == 0).all().item(), "Down padding must be zero"
-        reader.output.fill_(torch.nan)
-        assert reader.run_up(x) is reader.output
-        y_error = check_close(reader.output, y_expected, OUTPUT_TOLERANCE)
-        reader.partial.fill_(torch.nan); reader.output.fill_(torch.nan)
-        assert reader(x) is reader.output
-        check_close(partial[:rows], p_expected, DOWN_TOLERANCE)
-        check_close(reader.output, y_expected, OUTPUT_TOLERANCE)
-        assert (partial[rows:] == 0).all().item(), "Down padding must be zero"
-        result = {"complete": True, "rows": rows, "down_n_splits": reader.down_n_splits,
-                  "n_splits": reader.n_splits, "P_rel_l2": p_error, "Y_rel_l2": y_error,
+        partial.fill_(torch.nan)
+        assert run_down(x, w_down, partial, down) is partial
+        p_error = check_close(partial, p_expected, DOWN_TOLERANCE)
+        output.fill_(torch.nan)
+        assert run_up(x, w_up, partial, output, up) is output
+        y_error = check_close(output, y_expected, OUTPUT_TOLERANCE)
+        partial.fill_(torch.nan); output.fill_(torch.nan)
+        assert run_gr_read(x, w_down, w_up, partial, output, down, up) is output
+        check_close(partial, p_expected, DOWN_TOLERANCE)
+        check_close(output, y_expected, OUTPUT_TOLERANCE)
+        result = {"complete": True, "rows": rows, "down_n_splits": down_n_splits,
+                  "n_splits": n_splits, "P_rel_l2": p_error, "Y_rel_l2": y_error,
                   "P_tolerance": DOWN_TOLERANCE, "Y_tolerance": OUTPUT_TOLERANCE,
-                  "padding_zero": True, "checked_scopes": list(SCOPES)}
-        print(f"  T={rows:5d}  Down N{reader.down_n_splits} / Up N{reader.n_splits}  "
+              "partial_shape": list(partial.shape), "checked_scopes": list(SCOPES)}
+        print(f"  T={rows:5d}  Down N{down_n_splits} / Up N{n_splits}  "
               f"Down rel_l2={p_error:.6g}  Output rel_l2={y_error:.6g}  PASS", flush=True)
         return result
 
@@ -226,43 +295,44 @@ def tensor_address(tensor, *, output=False):
 
 def benchmark_batch(rows, args, folder):
     before = hardware_gate(args, folder, "before")
-    torch, reader_type, _, cuda_perf = dependencies()
+    torch, _, _, cuda_perf = dependencies()
     with torch.no_grad():
         x, wd, wu = make_inputs(torch, rows, args.seed)
-        buffers = [(x, reader_type(rows, wd, wu))]
-        buffers += [(x.clone(), reader_type(rows, wd, wu)) for _ in range(args.buffers - 1)]
+        inputs = [x] + [x.clone() for _ in range(args.buffers - 1)]
+        buffers = [(input_x, *prepare_gr_read(input_x, wd, wu)) for input_x in inputs]
         expected_p = expected_y = None
         addresses = []
-        for input_x, reader in buffers:
+        calls = {scope: [] for scope in SCOPES}
+        for input_x, w_down, w_up, partial, output, down, up, down_n_splits, n_splits in buffers:
             addresses.append({name: tensor_address(tensor, output=name == "Y") for name, tensor in zip(
-                ("X", "W_down", "W_up", "P", "Y"), (input_x, reader.w_down, reader.w_up, reader.partial, reader.output))})
-            reader.partial.fill_(torch.nan); reader.output.fill_(torch.nan)
-            reader(input_x)
+                ("X", "W_down", "W_up", "P", "Y"), (input_x, w_down, w_up, partial, output))})
+            calls["down"].append((input_x, w_down, partial, down))
+            calls["up"].append((input_x, w_up, partial, output, up))
+            calls["total"].append((input_x, w_down, w_up, partial, output, down, up))
+            partial.fill_(torch.nan); output.fill_(torch.nan)
+            run_gr_read(*calls["total"][-1])
             if expected_p is None:
-                expected_p, expected_y = reader.partial.clone(), reader.output.clone()
-            torch.testing.assert_close(reader.partial, expected_p, rtol=0, atol=0)
-            torch.testing.assert_close(reader.output, expected_y, rtol=0, atol=0)
+                expected_p, expected_y = partial.clone(), output.clone()
+            torch.testing.assert_close(partial, expected_p, rtol=0, atol=0)
+            torch.testing.assert_close(output, expected_y, rtol=0, atol=0)
         assert all(len({row[name]["pointer"] for row in addresses}) == args.buffers for name in addresses[0])
         write_json(folder / "addresses.json", addresses)
-        for scope in SCOPES:
+        for scope, launch in zip(SCOPES, (run_down, run_up, run_gr_read)):
             for index in range(args.warmup):
-                input_x, reader = buffers[index % args.buffers]
-                launch = reader.run_down if scope == "down" else reader.run_up if scope == "up" else reader
-                launch(input_x)
+                launch(*calls[scope][index % args.buffers])
         torch.cuda.synchronize()
         ready = hardware_gate(args, folder, "before_samples")
         timings = {}
         with (folder / "samples.jsonl").open("x") as raw:
-            for scope in SCOPES:
+            for scope, launch in zip(SCOPES, (run_down, run_up, run_gr_read)):
                 perf = cuda_perf(name=f"gr_read_{scope}", verbose=0)
                 if not perf.enable:
                     raise RuntimeError("CUDAPERF disables GRRead timing")
                 for index in range(args.iters):
                     bi = index % args.buffers
-                    input_x, reader = buffers[bi]
-                    launch = reader.run_down if scope == "down" else reader.run_up if scope == "up" else reader
+                    launch_args = calls[scope][bi]
                     with perf:
-                        launch(input_x)
+                        launch(*launch_args)
                     us = perf.latencies[-1] * 1e6
                     assert math.isfinite(us) and us > 0
                     raw.write(json.dumps({"scope": scope, "sample": index, "buffer": bi, "us": us}) + "\n")
@@ -270,18 +340,18 @@ def benchmark_batch(rows, args, folder):
                 samples = [value * 1e6 for value in perf.latencies]
                 assert len(samples) == args.iters
                 for bi in sorted({index % args.buffers for index in range(args.iters)}):
-                    reader = buffers[bi][1]
-                    torch.testing.assert_close(reader.partial if scope == "down" else reader.output,
+                    _, _, _, partial, output, _, _, _, _ = buffers[bi]
+                    torch.testing.assert_close(partial if scope == "down" else output,
                                                expected_p if scope == "down" else expected_y, rtol=0, atol=0)
                 flops = (4 if scope == "total" else 2) * rows * 10240 * 320
                 elapsed = median(samples)
                 timings[scope] = {"elapsed_us": elapsed, "samples_us": samples, "gemm_FLOPs": flops,
                                   "effective_TFLOPS": flops / elapsed / 1e6}
-                print(f"  T={rows:5d} Down N{reader.down_n_splits} / Up N{reader.n_splits} {scope:5s}: {elapsed:.3f} us, "
+                print(f"  T={rows:5d} Down N{down_n_splits} / Up N{n_splits} {scope:5s}: {elapsed:.3f} us, "
                       f"{timings[scope]['effective_TFLOPS']:.3f} effective TFLOPS", flush=True)
         after = hardware_gate(args, folder, "after")
-        return {"complete": True, "rows": rows, "down_n_splits": buffers[0][1].down_n_splits,
-                "n_splits": buffers[0][1].n_splits, "timings": timings,
+        return {"complete": True, "rows": rows, "down_n_splits": down_n_splits,
+                "n_splits": n_splits, "timings": timings,
                 "hardware_before": before, "hardware_before_samples": ready, "hardware_after": after,
                 "buffers": args.buffers, "warmup_each": args.warmup, "samples_each": args.iters,
                 "timed_outputs_bitexact": True, "all_samples_retained": True, "Total_measured_directly": True,
@@ -369,7 +439,7 @@ if __name__ == "__main__":
 import pytest
 
 
-@pytest.mark.parametrize("rows", (0, 1, 129, 257, 65537, *DEFAULT_BATCHES))
+@pytest.mark.parametrize("rows", (0, 1, 63, 64, 65, 129, 255, 256, 257, 2561, 65537, *DEFAULT_BATCHES))
 def test_gr_read(rows):
     torch = pytest.importorskip("torch")
     if torch.version.hip is None or not torch.cuda.is_available():

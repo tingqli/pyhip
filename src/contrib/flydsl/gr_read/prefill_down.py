@@ -7,7 +7,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 
-from .common import BLOCK_M, K, R
+from .common import K, R
 from .helpers import _sigmoid_down as _sigmoid, _weight_view
 
 BM, BK = 64, 64
@@ -20,7 +20,7 @@ def make_down(*, n_splits=1):
     """Specialize only by N splits; the launcher receives the actual rows at runtime.
 
     N1 covers 320 channels; N2 CTAs cover disjoint 160-channel slices without split-K or reduction launches.
-    Callers must provide positive rows and at least ceil(rows/256)*256*R elements in P.
+    Callers must provide positive rows and P[rows, R]; tail stores are bounded by the actual row count.
     """
     if n_splits not in (1, 2):
         raise ValueError("n_splits must be 1 or 2")
@@ -41,7 +41,7 @@ def make_down(*, n_splits=1):
         remaining = rows - row_begin
         valid_rows = (remaining > 0).select(remaining, fx.Int64(0))
         valid_rows = (valid_rows < BM).select(valid_rows, fx.Int64(BM))
-        # 全padding CTA的X范围为0，所有buffer读返回0；P仍写完整64行零。
+        # 尾块X只读取有效行；越界buffer读返回0，P的尾行store由descriptor屏蔽。
         x_row_begin = (row_begin < rows).select(row_begin, rows)
         x = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(X) + x_row_begin * K,
                     fx.make_layout((BM, K), (K, 1))), max_size=False, num_records_bytes=valid_rows * K * 2)
@@ -49,7 +49,7 @@ def make_down(*, n_splits=1):
         if const_expr(n_splits == 1):
             weights = fx.rocdl.make_buffer_tensor(_weight_view(fx.get_iter(W), R, K), max_size=False)
             output = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(P) + row_begin * R,
-                        fx.make_layout((R, BM), (1, R))), max_size=False, num_records_bytes=BM * R * 2)
+                        fx.make_layout((R, BM), (1, R))), max_size=False, num_records_bytes=valid_rows * R * 2)
             b_tiles = fx.flat_divide(weights, fx.make_tile(BN, BK))[None, None, jn, None]
             c_tile = fx.flat_divide(output, fx.make_tile(BN, BM))[None, None, jn, 0]
         else:
@@ -57,9 +57,10 @@ def make_down(*, n_splits=1):
             n_begin = fx.Int64(jn) * BN
             weights = fx.rocdl.make_buffer_tensor(
                 _weight_view(fx.get_iter(W) + n_begin * K, BN, K), max_size=False)
+            p_bytes = (valid_rows > 0).select(((valid_rows - 1) * R + BN) * 2, fx.Int64(0))
             output = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(P) + row_begin * R + n_begin,
                         fx.make_layout((BN, BM), (1, R))), max_size=False,
-                        num_records_bytes=((BM - 1) * R + BN) * 2)
+                        num_records_bytes=p_bytes)
             b_tiles = fx.flat_divide(weights, fx.make_tile(BN, BK))[None, None, 0, None]
             c_tile = fx.flat_divide(output, fx.make_tile(BN, BM))[None, None, 0, 0]
         atom = fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16))
@@ -156,7 +157,7 @@ def make_down(*, n_splits=1):
     @flyc.jit
     def launch_down(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor,
                     rows: fx.Int64, stream: fx.Stream):
-        m_tiles = (rows + BLOCK_M - 1) // BLOCK_M * (BLOCK_M // BM)
+        m_tiles = (rows + BM - 1) // BM
         gr_read_down(X, W, P, rows).launch(grid=(m_tiles, R // BN, 1), block=(256, 1, 1), stream=stream)
 
     return launch_down
