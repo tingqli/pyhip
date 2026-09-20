@@ -8290,3 +8290,223 @@ $$
 独立汇总SHA **29bf9b55d3a86f8e8d33f8b7dc43a6ec54c61f2f772e90f6f2736ef4cdc7c9e9**，265份产物manifest已逐SHA核对；`fixed_two_launches=true`、`host_window_workaround_removed=true`。正式源SHA：Down **b6d910e53620bd47d6b56160c269918fb06768bab55b6830bebb0b3fb5b92bbc**，Up **9e461d3a54b98c151da28a58d3bb70853575e77a7b759042996bee7326faf6a9**，runtime **95756c5ca2543e93ec85bfa33d91d0d229c9e04afd569cf1dca0041e468e7577**。
 
 本轮按要求验证固定launch数与正确性，**没有性能采样、ATT或PMC，也未改PTL／频率／功率／NUMA**。实测最大262145行不是新的软件batch上限，实际还受设备grid、张量shape表示和可用内存限制。只追加本节，旧 **834796B／SHA e60ed4427c2ba70917f187f68521268184b2c9a999aa085c6755e2669e48ac57** 文档前缀原样保留。无stage／reset／commit／push，Git index与用户配置未写；历史实验和失败证据不删除。
+
+## 100. Down新增N2并按batch／CU自动选择：小batch收益，较大batch保留N1（2026-09-19）
+
+按用户“给down kernel加上N2，像up一样动态选择”的要求，在[正式Down](../../../src/contrib/flydsl/gr_read/down.py)增加内部编译期`n_splits=1/2`，由[独立Down选型函数](../../../src/contrib/flydsl/gr_read/common.py)和[runtime](../../../src/contrib/flydsl/gr_read/runtime.py)构造时自动选择。**N2是320个输出通道拆为两个160列CTA，不是split-K**；没有原子归约、额外拼接kernel或Host分块。非空完整调用仍固定Down＋Up两次launch，Up的实现和N2/N4/N8选型完全不变。
+
+### 100.1 Down N1／N2实现与数值合同
+
+- N1保持M64/N320/K64、4个N方向wave；N2为M64/N160/K64、2个N方向×2个M方向wave，仍256线程、双8KiB A LDS，共16KiB。每wave每K64拍的MFMA由80条变为40条，完整K10240累加顺序与BF16 GEMM边界／FP32缩放SiLU／BF16 P输出保持。
+- N2每CTA的W基址增加`jn×160×K`个BF16元素，因preshuffle的N16块连续，160列恰好是10个块；使用局部N160权重view，避免把N160按N64截断。P基址加`jn×160`，每行仍stride320，两CTA分别写[0,160)和[160,320)，不重不漏。X/P的64位行tile基址与局部buffer边界继续使用第99节方案。
+- N2减少单wave计算量，但其B数据在两组M wave中独立读取，不能误称每wave只剩5次B load。当前流水保持每拍A2＋B10条VMEM请求；N2安排12×3＋2×2＝40条MFMA、4次DS读和2次A写。N1仍12×6＋4＋2×2＝80条，原调度不变。
+- [129尾块收据](results/down_n2_20260919/check_129.json)与8个校准shape逐项确认：old／N1／N2的P均bitexact、原容差通过、padding0、P guard正常，且N1 `.text`与第99节原Down精确相同。N1整块210VGPR／24SGPR、尾块214／24；N2为160VGPR／26SGPR，均16KiB LDS、0spill／scratch，kernarg保持64B。静态MFMA分别1280／640。
+
+### 100.2 只测Down的同场校准
+
+[计划](results/down_n2_20260919/prepare.json)在GPU性能前固定8档：1024、2048、2560、4096、5120、8192、20480、61440。全部功能先通过，再运行原`cudaPerf`，每档10个独立X/W/P buffers、每版2次预热、24轮ABBA／BAAB、每版48sample；同一轮两版使用完全相同X/W/P地址，P在原生allocation起点，无guard偏移。每次被计时调用后直接检查其P输出，不重跑覆盖。**全部768条raw保留，包括首样本和长尾。** 本轮不自动扩大到Up／Total性能矩阵。
+
+每格为 **中位us／有效TFLOPS**；N2变化是相对同场N1的完整样本中位时延变化。
+
+| rows | N1 us／TFLOPS | N2 us／TFLOPS | N2时延变化 | 配对ratio中位 | 自动Down |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 140.620／47.723 | **103.601／64.777** | **−26.326%** | 0.740431 | N2 |
+| 2048 | 141.580／94.800 | **104.500／128.437** | **−26.190%** | 0.779065 | N2 |
+| 2560 | 142.021／118.132 | **105.020／159.752** | **−26.053%** | 0.779682 | N2 |
+| 4096 | **144.721／185.485** | 208.241／128.906 | +43.891% | 1.408030 | N1 |
+| 5120 | **145.021／231.376** | 209.941／159.828 | +44.766% | 1.388588 | N1 |
+| 8192 | **263.221／203.962** | 401.801／133.616 | +52.648% | 1.493592 | N1 |
+| 20480 | **561.862／238.880** | 933.524／143.775 | +66.148% | 1.660920 | N1 |
+| 61440 | **1645.086／244.761** | 2768.131／145.460 | +68.267% | 1.682398 | N1 |
+
+工作量 $F_{Down}=2T\times10240\times320$，有效TFLOPS为 $F_{Down}/(t_{us}\times10^6)$；不能把Down单阶段改善直接说成Total同幅度改善，也不能把配对中位与全样本中位比混为同一统计量。表格与完整高精度数据：[performance.csv](results/down_n2_20260919/performance.csv)、[原始汇总](results/down_n2_20260919/summarize.json)。
+
+24份入口／采样前／出口门禁全部GPU2、PCI0000:A4:00.0、PTL **Enabled／VECTOR,F8**、auto650W，最大GPU use3%、VRAM6%。门禁未放宽，没有等待空闲重试、换卡或写PTL／频率／功率／NUMA。本轮没有ATT／PMC，因而不把性能差值唯一归因某一级缓存、带宽或调度机制。
+
+### 100.3 动态选择规则
+
+令总行数为T、设备CU数为U，公开workspace仍对齐M256：
+
+$$
+T_p=256\left\lceil T/256\right\rceil,\quad
+B_D=T_p/64,\quad
+D^*=\arg\min_{D\in\{1,2\}}\left\lceil B_DD/U\right\rceil c_D,
+\qquad(c_1,c_2)=(140,105).
+$$
+
+这两个系数是本轮校准的相对每CTA轮成本，不是逐kernel精确预测；当前VGPR分配下两版均按1CTA/CU建模。**本机80CU时1～2560行选择N2，超过2560行选择N1；0行保持无launch。** 2561行虽然只比边界多1行，却会padding到2816行，Down CTA数由40变44，N2由80变88个CTA，出现第二轮，所以切回N1。无需在16档列表中查找，任意合法batch按相同公式计算。
+
+`reader.down_n_splits`记录Down选择，原`reader.n_splits`继续表示Up；没有在公开构造参数里添加强制kernel选项。[一站式入口](benchmark.py)现在分别打印Down与Up的N分片，并在JSON结果保存两者。对于其他CU数量会代入实际U，但未在其他硬件上重新校准；未测batch只作模型选择，不声称已经逐batch测出最优。
+
+### 100.4 功能、Graph与正式入口验证
+
+- [Down分片回归](test_down.py)覆盖1／65／129／257／65537／262145行，两分片P逐位一致、原BF16参考、guard、padding、changed-input Graph，以及N2输出直接供原Up消费，无额外拼接。单次Down Graph实际只有1个kernel节点。
+- [选型回归](test_down_dispatch.py)覆盖80CU边界、40／80／120／304CU模型代入、非法参数、runtime真实工厂调用、两个选择分支的实际HIP Graph均固定Down＋Up两个kernel节点，以及CLI表格两种N选择。
+- [完整回归日志](results/down_n2_20260919/pytest.log)／[JUnit](results/down_n2_20260919/pytest.xml)：**152 passed，0 failed／error／skipped**，包括第99节全部大batch两launch／guard／Graph用例。另有前置Down专用10项通过，不把它们重复计入152项。
+- [CLI真实check-only](results/down_n2_20260919/cli/summary.json)验证1024／2048／2560选Down N2，2561／4096选Down N1；Up分别仍8／8／8／4／4。公开接口没有改变，实际两launch和原数值合同均通过。
+- 增加CLI双选择打印时曾出现一处缩进错误，导致第一次CPU `final-audit`在导入CLI时失败、尚未产生收据；仅修正缩进后重新审计通过，没有GPU测试或性能结果因此被覆盖。编辑器对Down仍有FlyDSL动态IR／装饰器类型类静态诊断，不以修改已验GPU表达式或降低全局规则来掩盖；实际JIT、ISA和上述运行回归通过。
+
+### 100.5 交付记录
+
+[独立CPU复核](results/down_n2_20260919/review.json)逐条重算768raw、ABBA／BAAB顺序、buffer轮换、工作量／TFLOPS、配对ratio、24份门禁，并穷举0…262145行核对80CU模型边界；模型在8个已测点均选择同场更快的一版。汇总SHA **55ae1e1b16095f9d5ae8b7840a28bedebda722be4f8007b36860a58bda93b676**。
+
+正式源SHA：Down **fb529903cd5badab3c19bb24cfdbafd2e201cc9b6d4460905c14fa307ff3cdd6**，common **3482598dda8a9424fdcd6e1b9335a1b3d85dc4bea49f612071b1fd0742837ce7**，runtime **12a617627bf54cf87e3e5c8c694e7b7431eae6985f33a9303a6316d0b0108392**；Up／参考／timer哈希保持。用户Git index在本轮前后有外部变化，逐收据只读记录，最终为 **b42c45e1257c59085f89c540a27cd156d8c734d1f590cd63024ae626684f0bbf**；没有stage／reset／commit／push或恢复用户暂存内容。只追加本节，旧 **842077B／SHA a5db37838db416c5c56977b0b63e24f709a3dfb9b420688e7365d2747251178f** 文档前缀原样保留。
+
+## 101. rows改为运行时参数，并删除padded_rows：五种分片跨batch复用（2026-09-19）
+
+按用户先“rows, padded_rows作为运行时参数”、随后“删除padded_rows”的最新要求，最终接口**只传真实运行时rows**。已删除正式代码中的`padded_rows`形参、实例字段、冗余`validate_launch_rows`及CLI结果中的对应字段；不是把它改名后继续传入，也不是删除P所需的内部对齐空间。原始基线、中间版本和空Graph失败证据原样保留，不批量修改历史实验。
+
+### 101.1 最终接口和工作范围
+
+- [Down工厂与launcher](../../../src/contrib/flydsl/gr_read/down.py)：`make_down(*, n_splits=1)`仅按N1/N2缓存，`launch_down(X,W,P,rows,stream)`中的`rows: fx.Int64`为运行时标量，不是闭包或`Constexpr`。
+- [Up工厂与launcher](../../../src/contrib/flydsl/gr_read/up.py)：`make_up(*, n_splits)`仅按N2/N4/N8缓存，`launch_up(X,W,P,Y,rows,stream)`同样只传运行时rows。删除按`rows % BM`选择的编译期分支；X行偏移统一放入vector address，局部buffer extent屏蔽尾行，不在稳态流水中增加行数分支。
+- [runtime](../../../src/contrib/flydsl/gr_read/runtime.py)的公开构造签名仍为`CombinedPaddedGRRead(rows,w_down,w_up)`；每个实例仍持有固定形状workspace，不做自动扩容。不同batch、相同N分片共享同一编译产物，X/P/Y保持二维参数避免大tensor扁平numel超i32。公开`partial`仍是一维BF16空间。
+- P容量直接由rows算出：$320\times256\lceil T/256\rceil$个元素；Down的M64 grid为$4\lceil T/256\rceil$，不是一般情况下的$\lceil T/64\rceil$。多出的全padding CTA使用零extent读取并把P padding写零，因此原M256对齐合同与Down选型成本模型均保持。
+- Up grid仍为$N\lceil T/256\rceil$，只读写真实T行。CTA入口继续64位tile基址＋局部buffer读写，**没有Host行窗口或额外kernel**；非空完整调用固定Down＋Up两launch，0行仍0launch。
+- 原BF16 P边界、完整K10240／R320归约、FP32 logits、stream顺序FMA和整数BF16输出舍入不变。[AST与源哈希审计](results/runtime_rows_20260919/rows_only_audit.json)确认主要稳态数学／调度函数与第100节基线相同；80CU的0…262145行两种分片选择也经逐项核对保持一致。
+
+### 101.2 功能、同产物复用和Graph验证
+
+[完整日志](results/runtime_rows_20260919/rows_only_pytest.log)／[JUnit](results/runtime_rows_20260919/rows_only_pytest.xml)：**161 passed，0 failed／error／skipped，32.77s**。全部沿用原逐元素容差，P为`rtol=0.015625, atol=2e-5`，Y为`rtol=0.01, atol=0.005`；rel_l2仅报告，不替代断言。
+
+- [新增跨行数回归](test_runtime_rows.py)覆盖Down1/2×Up2/4/8全部6组合。每组合先取得一对compiled对象，然后禁止再次调用`flyc.compile`，按**129→1024→257→65→256→129→1→1024**顺序运行；交替传真实shape与1536行容量tensor，证明访问范围来自rows标量而非tensor shape。8次均保持同artifact、每launcher仅1个cache项；真实行之外X为NaN，P padding必须0、对齐末端之后P和真实末端之后Y保持42，外侧guards完整。
+- 每个组合还验证真实HIP Graph单call为**2个kernel节点**、双call为**4个kernel节点**，并更换两次输入replay后验证原参考；不同129／1024行reader共享Down/Up编译产物的测试也通过。
+- 原8个大shape **65537／98304／104704／104705／131072／131073／209409／262145**全部通过，最大X仍为**5368729600B**。各shape单call2／双call4节点、P/Y guard、padding0、分阶段调用逐位一致和两次changed-input replay全部通过。24次大shape参考检查P rel_l2范围**5.61494045e-5～6.21789667e-5**，Y为**0.000533086635～0.000534214638**。
+- [正式CLI check-only](results/runtime_rows_20260919/rows_only_cli/summary.json)验证129／4096／8192行，Down分别N2/N1/N1、Up分别N8/N4/N2；三个结果均通过，`performance=[]`。
+- 最初新增复用测试在[保留的失败日志](results/runtime_rows_20260919/smoke.log)中8组数值/边界检查已过，但Graph为0节点：测试闭包复用了捕获前保存的stream，而`torch.cuda.graph()`切换到了内部capture stream。仅将测试调用改为实时取得`torch.cuda.current_stream()`，不修改kernel或降低节点断言。[修正后单项日志](results/runtime_rows_20260919/rows_only_smoke.log)和上述全套均通过；全套0行用例产生空Graph警告是预期行为。
+
+### 101.3 编译产物和交付边界
+
+[五种分片ISA／缓存收据](results/runtime_rows_20260919/rows_only_isa.json)分别用129行尾块和4096行整块、不同二维shape调用，确认各分片**共用同一artifact，cache数量均1**：
+
+| 分片 | VGPR | SGPR | LDS | kernarg |
+|---|---:|---:|---:|---:|
+| Down N1 | 214 | 24 | 16KiB | 72B |
+| Down N2 | 160 | 26 | 16KiB | 72B |
+| Up N2／N4／N8 | 230 | 34 | 64KiB | 96B |
+
+全部AGPR、scratch、VGPR/SGPR spill为0，仍使用buffer load/store。新增64位运行时rows使GPU ABI由旧Down64B／Up88B变为**72B／96B**，旧native打包不能直接复用。现在整块也使用通用尾块安全路径，不能由“稳态AST相同”声称旧整块ISA逐byte相同或性能不变；本轮**未做性能采样、ATT、PMC或硬件设置修改**。
+
+[最终汇总](results/runtime_rows_20260919/rows_only_summarize.json)SHA **fd680de160a75fdfb29ad779f08868f0eb54496c97bd1e909078bf4c052dfd1d**，164份证据manifest已逐SHA复核。正式源SHA：common **0f44599c4f32a05f992b759a2f53cf46ebb279157085cb72c51b68ed409a1632**，Down **950f3b0ddd438d1935f00ae957f80097113a9fb7bc7ec3cb842c3bcf39dc11e5**，Up **047e08ecc0ddee3a15bff54369544c5d97e2b67460b426c9fd2bb8d28949dfe6**，runtime **ee9104cd03a26125f2ae2114ff847c585c987a561f28b4a55bc3a5f063c9a4a0**。参考和timer未改，Host／测试诊断为空；Up仍有已知FlyDSL动态类型／editable import类静态诊断，不通过全局降级规则掩盖，实际JIT与运行回归通过。
+
+只追加本节，旧**849749B／SHA a20e5809a2cfb37f476c1950223e4ce6f819dd04a5c1b7a9761a632aa6e2365d**前缀保持。Git index只读记录保持**b42c45e1257c59085f89c540a27cd156d8c734d1f590cd63024ae626684f0bbf**，无stage／reset／commit／push；用户配置、历史证据及用户导出的my-favs副本未覆盖。
+
+## 102. 测试精简为单文件：保留基础正确性和性能，使用空闲GPU3验证（2026-09-20）
+
+用户最新明确要求“保留一个测试文件test_gr_read.py，保留基础正确性测试和性能测试即可；基础函数的性能测试正确性测试能够覆盖即可”，并允许切换空闲GPU、无空闲卡时先继续其他工作。本轮将原CLI与BF16参考合入[唯一测试文件](test_gr_read.py)，删除9个拆分入口／参考／专项测试模块，不再保留结构、自动选型、Graph节点或跨batch缓存等独立回归。历史结果及[原文件快照](results/entry_merge_20260919/prepare.json)保留；[收集配置](conftest.py)仍排除历史results目录，包初始化保留，它们不包含测试用例。
+
+### 102.1 保留的功能和覆盖范围
+
+- [基础检查](test_gr_read.py#L142)按原BF16参考依次检查`run_down`的P、`run_up`的Y，再检查完整`__call__`的P/Y；每阶段输出先填NaN，P尾行仍要求为0。参考的1024行分块、BF16边界及原逐元素容差不变，rel_l2仅报告，不代替逐元素断言。
+- [pytest入口](test_gr_read.py#L373)只保留一个参数化测试：0／1／129／257／65537行加默认16档，共**21项**。没有独立的源码AST、强制N分片、API开关、Graph节点或缓存结构测试。
+- [直接执行入口](test_gr_read.py#L350)仍默认先检查16档正确性，再输出Down／Up／直接Total性能；支持`--rows`、`--batches`、`--gpu`、`--check-only`及原采样参数。保留用户设置的默认物理GPU3，Torch延迟导入，直接运行与`--help`不依赖pytest。
+- 原`cudaPerf`、10独立buffers、每阶段2warmup／10sample、全样本中位数、Y原生allocation起点、PTL／空闲门禁和失败停止协议不变。不是把不同阶段的中位数相加作为Total。
+- [迁移审计](results/entry_merge_20260919/single_file_audit.json)确认11个CLI／性能函数与旧入口AST一致，BF16参考核心AST完全相同，六个正式GRRead模块及timer逐SHA未变。活跃Python代码由**1174行降至389行**，仅保留一个测试文件。
+
+### 102.2 选卡与实测结果
+
+前次仅完成准备，[旧快照](results/entry_merge_20260919/prepare.json)记录GPU2利用率58%、显存5%，性能门禁不通过；这不应阻止代码整理，旧失败状态未覆盖。本轮用户授权选空闲卡后，[新准备检查](results/entry_merge_20260919/single_file_prepare.json)确认GPU3、PCI **0000:C8:00.0**、GPU／显存均0%，PTL **Enabled／VECTOR,F8**，保持auto650W，未更改任何设备设置。
+
+[完整基础回归日志](results/entry_merge_20260919/single_file_pytest.log)／[JUnit](results/entry_merge_20260919/single_file_pytest.xml)：**21 passed，0 failed／error／skipped，13.46s**。每个batch同时覆盖两个基础函数及完整调用，不把删除的旧专项测试计入本轮通过数量。
+
+仅用1024行做性能入口验证，没有重跑16档性能矩阵。[原始结果](results/entry_merge_20260919/single_file_timing/summary.json)与[30条完整样本](results/entry_merge_20260919/single_file_timing/timing_1024/samples.jsonl)如下：
+
+| 阶段 | N分片 | 中位时延(us) | 有效TFLOPS |
+|---|---|---:|---:|
+| Down | N2 | 121.220499 | 55.360986 |
+| Up | N8 | 76.700501 | 87.494688 |
+| Total | N2＋N8 | 196.361005 | 68.352537 |
+
+工作量 $F_D=F_U=2T\times10240\times320$，$F_{Total}=4T\times10240\times320$，有效TFLOPS为 $F/(t_{us}\times10^6)$，T＝1024。三次入口／采样前／出口门禁均GPU3、利用率0%、显存0%、PTL Enabled／VECTOR,F8；10组独立地址、buffer轮换和全部30sample已逐项复核，长尾未过滤，计时输出逐位校验通过。**这是单文件入口可运行性的验证，不是与历史GPU2的同场性能对比，不据此宣称提速或回退。** 无ATT／PMC／PTL／频率／功率／NUMA写入。
+
+### 102.3 交付记录
+
+[最终汇总](results/entry_merge_20260919/single_file_summarize.json)SHA **08b9265aabe7ec9c3380209558db8ffebfcdb10435df746965cb285fcbc5a1ea**，28份manifest全部逐SHA核对；唯一测试源SHA **38a006786d79217bc06d0e4a24a0ded8400ebc146356b892248a916403206625**。旧GPU2门禁失败和before快照保留，未重复运行旧成功验收。编辑器该测试文件无诊断，实际pytest与CLI均通过。
+
+只追加本节，旧**856124B／SHA ca95cc7f526180f15a1cf668bd9a1d369d70a55d6c72aeb3a77d2896d5d69171**文档前缀不变。Git index保持**b42c45e1257c59085f89c540a27cd156d8c734d1f590cd63024ae626684f0bbf**，无stage／reset／commit／push；正式kernel、timer、用户配置和my-favs副本未修改。
+
+## 103. 代码字符串与提示统一英文，完整16档修改前后重测（2026-09-20）
+
+按用户“代码中注释可以是中文，但代码本身/提示都改为英文；修改后数据全部重测，和改之前进行对比”的要求，本轮仅翻译现行GRRead六个生产模块及三个测试／配置模块中的docstring、CLI help和运行提示；普通`#`注释可保留中文。[词法与AST审计](results/english_output_20260920/audit.json)确认所有非COMMENT token均为ASCII，剔除docstring、help和print的文字后AST完全相同；变量名、计算表达式、参考、容差、分片模型、默认GPU3及原`cudaPerf`协议不变。仍只保留[一个基础测试文件](test_gr_read.py)，不恢复已删除的专项测试。
+
+### 103.1 重测协议和正确性
+
+先冻结[修改前源码及计划](results/english_output_20260920/prepare.json)，在修改前真实跑完一轮，再翻译和审计，最后用同一物理**GPU3／PCI0000:C8:00.0**跑修改后完整一轮。用户刚运行的历史one-stop结果未覆盖，也不拿第102节仅1k的结果冒充本次全矩阵基线。
+
+- 前后各默认16档，均先完成全部正确性，再测Down／Up／直接Total：10组独立buffer、2warmup、每阶段10sample，全样本中位数。总计**960条raw／96份性能门禁**，全部保留；96门禁均PTL **Enabled／VECTOR,F8**，最大GPU use4%、VRAM9%，未改频率／功率／PTL／NUMA。
+- [修改前收据](results/english_output_20260920/suite-before.json)和[修改后收据](results/english_output_20260920/suite-after.json)均为**16项正确性＋16档三阶段性能完成**。每项正确性覆盖`run_down`、`run_up`及完整调用，原逐元素容差保持；前后16份正确性报告的P/Y rel_l2及其他字段**完全一致**，这不是额外的跨进程输出逐位证明。
+- [修改后基础pytest](results/english_output_20260920/pytest_after.xml)为**21 passed，0 failed／error／skipped，13.16s**，包括0／1／129／257／65537及默认16档。实际CLI [帮助](results/english_output_20260920/help.txt)、[非法参数提示](results/english_output_20260920/invalid_args.txt)和[完整运行日志](results/english_output_20260920/after.log)均已核对英文；非法参数返回2是预期行为。
+- 下表每格为**中位us／有效TFLOPS**，变化按$(t_{after}/t_{before}-1)\times100\%$，正数表示更慢。$F_D=F_U=2T\times10240\times320$，$F_{Total}=4T\times10240\times320$，有效TFLOPS为$F/(t_{us}\times10^6)$，1k＝1024行。Total直接测量，不相加独立阶段的中位数。
+
+### 103.2 Down对比
+
+| Batch | N | 修改前 us／TFLOPS | 修改后 us／TFLOPS | 时延变化 |
+|---:|---:|---:|---:|---:|
+| 1k | 2 | 135.701／49.453 | 131.660／50.971 | −2.978% |
+| 2k | 2 | 137.521／97.598 | 137.381／97.697 | −0.102% |
+| 4k | 1 | 163.261／164.421 | 169.700／158.182 | +3.944% |
+| 8k | 1 | 286.341／187.494 | 297.381／180.533 | +3.856% |
+| 10k | 1 | 293.701／228.493 | 302.501／221.846 | +2.996% |
+| 12k | 1 | 418.162／192.582 | 418.382／192.481 | +0.053% |
+| 16k | 1 | 578.322／185.665 | 548.722／195.680 | −5.118% |
+| 20k | 1 | 558.122／240.481 | 558.562／240.292 | +0.079% |
+| 24k | 1 | 692.823／232.471 | 691.063／233.063 | −0.254% |
+| 28k | 1 | 823.883／228.072 | 822.263／228.521 | −0.197% |
+| 30k | 1 | 829.683／242.655 | 829.324／242.760 | −0.043% |
+| 32k | 1 | 956.444／224.528 | 957.324／224.322 | +0.092% |
+| 36k | 1 | 1093.945／220.845 | 1093.845／220.865 | −0.009% |
+| 48k | 1 | 1365.185／235.955 | 1372.606／234.680 | +0.544% |
+| 60k | 1 | 1646.867／244.496 | 1643.347／245.020 | −0.214% |
+| 64k | 1 | 1780.548／241.216 | 1784.388／240.697 | +0.216% |
+
+### 103.3 Up对比
+
+| Batch | N | 修改前 us／TFLOPS | 修改后 us／TFLOPS | 时延变化 |
+|---:|---:|---:|---:|---:|
+| 1k | 8 | 76.681／87.518 | 76.621／87.586 | −0.078% |
+| 2k | 8 | 78.380／171.239 | 78.380／171.240 | −0.001% |
+| 4k | 4 | 144.301／186.025 | 144.621／185.613 | +0.222% |
+| 8k | 2 | 275.381／194.955 | 275.301／195.012 | −0.029% |
+| 10k | 2 | 280.321／239.400 | 280.222／239.485 | −0.035% |
+| 12k | 8 | 384.782／209.289 | 384.182／209.616 | −0.156% |
+| 16k | 8 | 531.062／202.188 | 530.982／202.218 | −0.015% |
+| 20k | 2 | 558.242／240.429 | 557.243／240.861 | −0.179% |
+| 24k | 4 | 713.603／225.702 | 713.103／225.860 | −0.070% |
+| 28k | 2 | 826.343／227.393 | 825.943／227.503 | −0.048% |
+| 30k | 2 | 831.664／242.077 | 830.683／242.363 | −0.118% |
+| 32k | 8 | 991.504／216.588 | 991.364／216.619 | −0.014% |
+| 36k | 2 | 1097.484／220.132 | 1097.224／220.185 | −0.024% |
+| 48k | 2 | 1374.986／234.273 | 1375.286／234.222 | +0.022% |
+| 60k | 2 | 1676.307／240.203 | 1677.627／240.014 | +0.079% |
+| 64k | 4 | 1886.988／227.610 | 1868.668／229.841 | −0.971% |
+
+### 103.4 直接Total对比与结论边界
+
+| Batch | 修改前 us／TFLOPS | 修改后 us／TFLOPS | 时延变化 |
+|---:|---:|---:|---:|
+| 1k | 196.241／68.394 | 196.301／68.373 | +0.031% |
+| 2k | 199.281／134.702 | 199.241／134.729 | −0.020% |
+| 4k | 294.421／182.348 | 294.222／182.472 | −0.068% |
+| 8k | 551.202／194.800 | 552.302／194.412 | +0.200% |
+| 10k | 561.522／239.025 | 562.122／238.770 | +0.107% |
+| 12k | 797.424／201.977 | 796.764／202.144 | −0.083% |
+| 16k | 1076.905／199.413 | 1076.744／199.442 | −0.015% |
+| 20k | 1108.884／242.077 | 1110.485／241.728 | +0.144% |
+| 24k | 1408.366／228.721 | 1404.946／229.278 | −0.243% |
+| 28k | 1655.107／227.061 | 1652.987／227.352 | −0.128% |
+| 30k | 1665.707／241.731 | 1669.007／241.253 | +0.198% |
+| 32k | 1960.028／219.128 | 1952.528／219.970 | −0.383% |
+| 36k | 2204.410／219.190 | 2201.929／219.437 | −0.113% |
+| 48k | 2792.071／230.741 | 2766.191／232.900 | −0.927% |
+| 60k | 3382.334／238.092 | 3372.095／238.815 | −0.303% |
+| 64k | 3716.315／231.141 | 3707.475／231.692 | −0.238% |
+
+Total变化范围**−0.927%～+0.200%**，16档变化百分比的中位为−0.075%；Up为**−0.971%～+0.222%**。Down范围**−5.118%～+3.944%**，4k／8k变慢超过3%，16k变快约5.1%，均按实测保留，未重采筛选或过滤长尾。**本次是先后两次独立完整运行，不是交错同址ABBA；没有频率遥测或ISA逐字节对比，因此不能把差异直接归因于英文文字替换，也不宣称所有单阶段性能完全不变。** 未新增性能合格阈值来掩盖较大的Down差异。
+
+### 103.5 证据与交付
+
+[48项完整精度CSV](results/english_output_20260920/comparison.csv)、[修改前结果](results/english_output_20260920/before_run/summary.json)、[修改后结果](results/english_output_20260920/after_run/summary.json)和[最终对比](results/english_output_20260920/compare.json)均保留。汇总SHA **a941f7b524065b7d15f6dc1d7e516bc7f259e705947dc25d498107466114c492**，247份manifest已逐SHA复核，同时核对每档10组独立X/W/P/Y地址、Y allocation起点、sample序号／buffer轮换／中位数／FLOPs和96份门禁。
+
+修改后测试源SHA **792ea5c89f8be2c0389aa270832f7320281bfd67d41ae9300be0548674ced63f**；生产文件的文本哈希因docstring翻译变化，但计算AST保持，不能继续声称生产源哈希未变。timer和用户配置未改，未增加活跃测试文件。测试／Host文件诊断为空；Down／Up保留既有FlyDSL动态IR类型类静态诊断，不用全局降级设置掩盖，实际JIT与运行测试已通过。
+
+仅追加本节，旧**860759B／SHA bf186b8429c8163bd84c7fd302c65aba85bdcbb53a8d52f7c1cba5b6e6739ec7**文档前缀不变；历史数据和用户my-favs副本未改。Git index保持**b42c45e1257c59085f89c540a27cd156d8c734d1f590cd63024ae626684f0bbf**，无stage／reset／commit／push；无ATT／PMC或硬件设置修改。

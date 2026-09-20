@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""GR read Up N2/N4/N8：统一X128协作读取、W两拍预取的独立CTA流水。
+"""GRRead Up N2/N4/N8: independent CTAs with cooperative X128 loads and two-stage W prefetch.
 
-X/P读取和Y写出使用NT，W默认；P为BF16、完整K320、FP32 logits。
-相同H64的四stream始终按原顺序FMA，Y调用真实整数BF16 helper。
-两个20KiB B LDS槽＋每wave3KiB X LDS，总64KiB；512线程。
-每子阶段一条未来X读取，P读取与启动X/B LDS搬运重叠。
-N分片数为内部编译期参数，公开入口按batch选择，不提供实验开关。
+X/P loads and Y stores use NT; W uses the default policy. P is BF16 with full K320 and FP32 logits.
+The four streams for each H64 use the original FMA order and the integer BF16 output helper.
+Two 20 KiB B LDS slots plus 3 KiB of X LDS per wave use 64 KiB total with 512 threads.
+Each substage loads future X while P loads overlap startup X/B LDS transfers.
+N splits are an internal compile-time parameter selected by batch, with no experimental switches.
 """
 from functools import cache
 
@@ -16,7 +16,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from pyhip.contrib.flydsl.helpers import cvt_f32_to_bf16
 
-from .common import H, K, R, validate_launch_rows
+from .common import H, K, R
 from .helpers import (
     _barrier,
     _ds_read,
@@ -60,16 +60,16 @@ def _pack_y_from_mean(v0, v1):
 
 
 @cache
-def make_up(rows, padded_rows, *, n_splits):
-    """构造统一Up launcher，无queue状态、回退路径或不同cache策略。
+def make_up(*, n_splits):
+    """Build the unified Up launcher without queue state, fallbacks, or alternate cache policies.
 
-    N2/N4/N8每CTA分别处理160/80/40个H32包；每8包是完整H64四路归约。
-    rows非256整数倍时保留尾行掩码；整块形状使用精确grid。
-    n_splits是内部必需编译期参数，仅支持2/4/8。
+    N2/N4/N8 CTAs process 160/80/40 H32 packets; each eight-packet group completes an H64 four-stream reduction.
+    Runtime rows share one artifact across full tiles and tails; the grid covers actual rows only.
+    Callers must provide positive rows and X/P/Y storage covering all actual rows.
+    n_splits is a required internal compile-time parameter supporting only 2/4/8.
     """
     if n_splits not in (2, 4, 8):
         raise ValueError('n_splits must be 2, 4 or 8')
-    validate_launch_rows(rows, padded_rows, BM)
     N_SPLITS = n_splits
     PACKETS = K // 32 // N_SPLITS
     GROUPS = PACKETS // GROUP_STEPS
@@ -79,7 +79,7 @@ def make_up(rows, padded_rows, *, n_splits):
         b: fx.Array[fx.Int32, (2 * B_SLOT_BYTES + 24576) // 4, 16]
 
     @flyc.kernel(known_block_size=[512, 1, 1])
-    def gr_read_up(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor):
+    def gr_read_up(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor, rows: fx.Int64):
         tid = fx.Int32(fx.thread_idx.x)
         lane, wave = tid % 64, tid // 64
         group = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, (tid // 256).ir_value()))
@@ -96,11 +96,9 @@ def make_up(rows, padded_rows, *, n_splits):
         n_base, n_phase = n_task * PACKETS, fx.Int32(0)
         # X/P/Y在CTA入口用64位元素偏移重设基址；循环内地址只相对本M256 tile。
         row_begin = block_m.to(fx.Int64) * BM
-        if const_expr(rows % BM == 0):
-            valid_rows = fx.Int64(BM)
-        else:
-            remaining = fx.Int64(rows) - row_begin
-            valid_rows = (remaining < BM).select(remaining, fx.Int64(BM))
+        remaining = rows - row_begin
+        valid_rows = (remaining > 0).select(remaining, fx.Int64(0))
+        valid_rows = (valid_rows < BM).select(valid_rows, fx.Int64(BM))
         tile_x = fx.make_view(fx.get_iter(X) + row_begin * K, fx.make_layout(BM * K, 1))
         tile_p = fx.make_view(fx.get_iter(P) + row_begin * R, fx.make_layout(BM * R, 1))
         tile_y = fx.make_view(fx.get_iter(Y) + row_begin * H, fx.make_layout(BM * H, 1))
@@ -120,15 +118,12 @@ def make_up(rows, padded_rows, *, n_splits):
         b_write16, b_write8 = _pin_v(b_base + tid * 16), _pin_v(b_base + tid * 8)
 
         # 每row八个lane，各16B；四条load覆盖本wave的M32/H64。
+        # 行偏移统一放入vector address，让同一buffer extent正确屏蔽任意尾行。
         x_pair_address = []
         x_row8 = wave * 32 + lane % 8
-        if const_expr(rows % BM == 0):
-            x_a = _pin_v(x_row8 * K * 2 + lane // 8 * 16)
-            x_pair_address = [x_a, x_a, x_a, x_a]
-        else:
-            for part in range_constexpr(4):
-                mr = x_row8 + part * 8
-                x_pair_address.append(_pin_v(mr * K * 2 + lane // 8 * 16))
+        for part in range_constexpr(4):
+            mr = x_row8 + part * 8
+            x_pair_address.append(_pin_v(mr * K * 2 + lane // 8 * 16))
         # 每wave3KiB：低半M16的1KiB分时复用，高半M32保留2KiB。
         x_lds_base = b_base + 2 * B_SLOT_BYTES + wave * 3072
         x_write = [_pin_v(x_lds_base + lane % 8 * 16 + lane // 8 % 4 * 256 + lane // 32 * (1024 + mi * 1024))
@@ -151,8 +146,7 @@ def make_up(rows, padded_rows, *, n_splits):
                 _ds_write(b_write16, value, slot * B_SLOT_BYTES + part * 8192)
 
         def load_x_pair_g2r(q, step, part):
-            row_offset = part * 8 * K * 2 if const_expr(rows % BM == 0) else 0
-            return _load_nt(xr, x_pair_address[part], packet(q) // 8 * 128 + step // 2 * H * 2 + row_offset)
+            return _load_nt(xr, x_pair_address[part], packet(q) // 8 * 128 + step // 2 * H * 2)
 
         def x_pair_r2s_s2r(first8, second8, mi, defer_low=False):
             _ds_write(x_write[mi], first8, 0)
@@ -361,8 +355,9 @@ def make_up(rows, padded_rows, *, n_splits):
         _schedule_boundary()
 
     @flyc.jit
-    def launch_up(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor, stream: fx.Stream):
-        gr_read_up(X, W, P, Y).launch(grid=(((rows + BM - 1) // BM) * N_SPLITS, 1, 1), block=(512, 1, 1), stream=stream)
+    def launch_up(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor,
+                  rows: fx.Int64, stream: fx.Stream):
+        gr_read_up(X, W, P, Y, rows).launch(grid=(((rows + BM - 1) // BM) * N_SPLITS, 1, 1), block=(512, 1, 1), stream=stream)
 
     launch_up.compile_hints['llvm_options'] = {'vectorize-slp': False}
     return launch_up

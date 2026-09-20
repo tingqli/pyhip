@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""gfx942 BF16 GRRead；公开入口按batch自动选择N2/N4/N8。"""
+"""gfx942 BF16 GRRead with automatic batch-dependent N-split selection."""
 
 from typing import TYPE_CHECKING
 

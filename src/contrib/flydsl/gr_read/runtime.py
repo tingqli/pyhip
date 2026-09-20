@@ -1,24 +1,28 @@
 # SPDX-License-Identifier: MIT
-"""GRRead正式入口：构造时按batch选择Up；非空输入固定Down＋Up两次launch。"""
+"""Public GRRead API with batch-dependent Down/Up splits and two launches for nonempty inputs."""
 
 import flydsl.compiler as flyc
 import torch
 
-from .common import BLOCK_M, C, H, K, R, preshuffle_weight, select_n_splits, validate_rows
-from .down import make_down
-from .up import make_up
+from .common import (
+    BLOCK_M, C, H, K, R, preshuffle_weight, select_down_n_splits,
+    select_n_splits, validate_rows,
+)
+from .prefill_down import make_down
+from .prefill_up import make_up
 
 
 class CombinedPaddedGRRead:
-    """BF16 X[T,10240] -> Y[T,2560]，gfx942上支持任意可分配的非负整数T。
+    """BF16 X[T,10240] -> Y[T,2560] for any allocatable nonnegative integer T on gfx942.
 
-    构造时准备权重、workspace和JIT；统一X128 Up的N2/N4/N8由batch及设备CU数选择。
-    X/P/Y在kernel内偏移到当前CTA tile，再使用局部buffer读写；Host不分块。
-    任何非空batch都只发Down＋Up两次launch，完整P/Y布局不变。
-    不保留decode/prefill、tile、预取或cache的实验开关。
-    Down保留BF16 GEMM/SiLU边界；Up用完整K320 FP32 logits和整数BF16输出舍入。
-    返回内部可复用output；需保留多次结果时由调用者复制。
-    同一实例只能在同一stream顺序调用；并发stream须使用独立实例。
+    Prepare weights, workspace, and JIT at construction; select Down N1/N2 and Up N2/N4/N8 by batch and CU count.
+    Rows are runtime arguments; batches with the same N splits share artifacts while each instance has fixed workspace shapes.
+    Kernels rebase X/P/Y to the current CTA tile for local buffer access; the host does not split rows.
+    Every nonempty batch launches Down and Up exactly once each, preserving full P/Y layouts.
+    No experimental decode/prefill, tile, prefetch, or cache switches are exposed.
+    Down preserves the BF16 GEMM/SiLU boundary; Up uses full K320 FP32 logits and integer BF16 output rounding.
+    Return reusable internal output; callers must copy results that need to outlive subsequent calls.
+    Call an instance sequentially on one stream; concurrent streams require separate instances.
     """
 
     def __init__(self, rows, w_down, w_up):
@@ -34,26 +38,27 @@ class CombinedPaddedGRRead:
             raise ValueError("GRRead currently targets gfx942")
         self.rows = rows
         self.dtype, self.device = w_down.dtype, w_down.device
+        self.down_n_splits = select_down_n_splits(rows, props.multi_processor_count)
         self.n_splits = select_n_splits(rows, props.multi_processor_count)
-        self.padded_rows = (rows + BLOCK_M - 1) // BLOCK_M * BLOCK_M
         with torch.cuda.device(self.device):
             # H64内按stream遍历两个H32；三个N分片共用同一权重物理布局。
             up_interleaved = w_up.detach().reshape(C, H // 64, 2, 4, 2, 4, R).permute(1, 0, 2, 4, 3, 5, 6).contiguous().reshape(K, R)
             self.w_down = preshuffle_weight(w_down)
             self.w_up = preshuffle_weight(up_interleaved)
-            self.partial = torch.empty(self.padded_rows * R, dtype=self.dtype, device=self.device)
+            self.partial = torch.empty((rows + BLOCK_M - 1) // BLOCK_M * BLOCK_M * R,
+                                       dtype=self.dtype, device=self.device)
             self.output = torch.empty((rows, H), dtype=self.dtype, device=self.device)
             self.down = self.up = None
             if rows:
                 # flyc.compile会执行一次launcher，必须提供足量X；二维shape避免扁平numel超i32。
                 x = torch.empty((rows, K), dtype=self.dtype, device=self.device)
-                partial = self.partial.view(self.padded_rows, R)
+                partial = self.partial.view(-1, R)
                 stream = torch.cuda.current_stream(self.device)
                 # Up禁用SLP的编译选项不传播到Down；维持分别编译的既有合同。
-                ld = make_down(rows, self.padded_rows)
-                lu = make_up(rows, self.padded_rows, n_splits=self.n_splits)
-                self.down = flyc.compile(ld, x, self.w_down, partial, stream)
-                self.up = flyc.compile(lu, x, self.w_up, partial, self.output, stream)
+                ld = make_down(n_splits=self.down_n_splits)
+                lu = make_up(n_splits=self.n_splits)
+                self.down = flyc.compile(ld, x, self.w_down, partial, rows, stream)
+                self.up = flyc.compile(lu, x, self.w_up, partial, self.output, rows, stream)
 
     def _check_input(self, x):
         if x.shape != (self.rows, K) or x.dtype != self.dtype or x.device != self.device:
@@ -66,7 +71,7 @@ class CombinedPaddedGRRead:
         if self.rows:
             assert self.down is not None
             with torch.cuda.device(self.device):
-                self.down(x, self.w_down, self.partial.view(self.padded_rows, R), torch.cuda.current_stream(self.device))
+                self.down(x, self.w_down, self.partial.view(-1, R), self.rows, torch.cuda.current_stream(self.device))
         return self.partial
 
     def run_up(self, x):
@@ -74,7 +79,7 @@ class CombinedPaddedGRRead:
         if self.rows:
             assert self.up is not None
             with torch.cuda.device(self.device):
-                self.up(x, self.w_up, self.partial.view(self.padded_rows, R), self.output, torch.cuda.current_stream(self.device))
+                self.up(x, self.w_up, self.partial.view(-1, R), self.output, self.rows, torch.cuda.current_stream(self.device))
         return self.output
 
     def __call__(self, x):
@@ -83,7 +88,7 @@ class CombinedPaddedGRRead:
             assert self.down is not None and self.up is not None
             with torch.cuda.device(self.device):
                 stream = torch.cuda.current_stream(self.device)
-                partial = self.partial.view(self.padded_rows, R)
-                self.down(x, self.w_down, partial, stream)
-                self.up(x, self.w_up, partial, self.output, stream)
+                partial = self.partial.view(-1, R)
+                self.down(x, self.w_down, partial, self.rows, stream)
+                self.up(x, self.w_up, partial, self.output, self.rows, stream)
         return self.output

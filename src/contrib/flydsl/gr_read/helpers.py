@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""胜出GRRead核共用的搬运、同步与数值操作；无实验分支或profiling标记。"""
+"""Shared GRRead data movement, synchronization, and numerical helpers without experimental branches."""
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -78,7 +78,7 @@ def _sigmoid(value):
 
 
 def _pack_y_mean(v0, v1):
-    """四路均值后用整数helper舍入；两个BF16打包到一个DWORD。"""
+    """Round the four-stream mean with the integer helper and pack two BF16 values into one DWORD."""
     values = fx.Vector.from_elements([v0 * 0.25, v1 * 0.25], fx.Float32)
     fragment = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Float32)
     fragment.store(values)

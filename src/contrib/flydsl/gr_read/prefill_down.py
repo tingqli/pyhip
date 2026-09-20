@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""GR read Down：M64/N320/K64，FP32累加，BF16 GEMM边界与SiLU输出。"""
+"""GRRead Down: M64/N320 or N160/K64, FP32 accumulation, a BF16 GEMM boundary, and SiLU output."""
 
 from functools import cache
 
@@ -7,18 +7,25 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 
-from .common import K, R, validate_launch_rows
+from .common import BLOCK_M, K, R
 from .helpers import _sigmoid_down as _sigmoid, _weight_view
 
-BM, BN, BK = 64, 320, 64
+BM, BK = 64, 64
 GROUP_STEPS = 8
 GROUPS = K // BK // GROUP_STEPS
 
 
 @cache
-def make_down(rows, padded_rows):
-    """构造正式Down；每个CTA计算64行和全部320个隐藏通道。"""
-    validate_launch_rows(rows, padded_rows, BM)
+def make_down(*, n_splits=1):
+    """Specialize only by N splits; the launcher receives the actual rows at runtime.
+
+    N1 covers 320 channels; N2 CTAs cover disjoint 160-channel slices without split-K or reduction launches.
+    Callers must provide positive rows and at least ceil(rows/256)*256*R elements in P.
+    """
+    if n_splits not in (1, 2):
+        raise ValueError("n_splits must be 1 or 2")
+    BN = R // n_splits
+    N_WAVES, M_WAVES = 4 // n_splits, n_splits
 
     @fx.struct
     class Shared:
@@ -26,30 +33,42 @@ def make_down(rows, padded_rows):
         a1: fx.Array[fx.BFloat16, BM * BK, 16]
 
     @flyc.kernel(known_block_size=[256, 1, 1])
-    def gr_read_down(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor):
+    def gr_read_down(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, rows: fx.Int64):
         tid = fx.Int32(fx.thread_idx.x)
         im, jn, _ = fx.block_idx
         # 先以64位把全局指针移到本M64 tile；buffer内仅保留局部32位偏移。
         row_begin = fx.Int64(im) * BM
-        if const_expr(rows % BM == 0):
-            valid_rows = (row_begin < rows).select(fx.Int64(BM), fx.Int64(0))
-        else:
-            remaining = fx.Int64(rows) - row_begin
-            valid_rows = (remaining > 0).select(remaining, fx.Int64(0))
-            valid_rows = (valid_rows < BM).select(valid_rows, fx.Int64(BM))
+        remaining = rows - row_begin
+        valid_rows = (remaining > 0).select(remaining, fx.Int64(0))
+        valid_rows = (valid_rows < BM).select(valid_rows, fx.Int64(BM))
         # 全padding CTA的X范围为0，所有buffer读返回0；P仍写完整64行零。
-        x_row_begin = (row_begin < rows).select(row_begin, fx.Int64(rows))
+        x_row_begin = (row_begin < rows).select(row_begin, rows)
         x = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(X) + x_row_begin * K,
                     fx.make_layout((BM, K), (K, 1))), max_size=False, num_records_bytes=valid_rows * K * 2)
-        weights = fx.rocdl.make_buffer_tensor(_weight_view(fx.get_iter(W), R, K), max_size=False)
-        output = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(P) + row_begin * R,
-                    fx.make_layout((R, BM), (1, R))), max_size=False, num_records_bytes=BM * R * 2)
         a_tiles = fx.flat_divide(x, fx.make_tile(BM, BK))[None, None, 0, None]
-        b_tiles = fx.flat_divide(weights, fx.make_tile(BN, BK))[None, None, jn, None]
-        c_tile = fx.flat_divide(output, fx.make_tile(BN, BM))[None, None, jn, 0]
+        if const_expr(n_splits == 1):
+            weights = fx.rocdl.make_buffer_tensor(_weight_view(fx.get_iter(W), R, K), max_size=False)
+            output = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(P) + row_begin * R,
+                        fx.make_layout((R, BM), (1, R))), max_size=False, num_records_bytes=BM * R * 2)
+            b_tiles = fx.flat_divide(weights, fx.make_tile(BN, BK))[None, None, jn, None]
+            c_tile = fx.flat_divide(output, fx.make_tile(BN, BM))[None, None, jn, 0]
+        else:
+            # preshuffle的每N16块连续；N160正好10块，从局部N0开始避免N64取整。
+            n_begin = fx.Int64(jn) * BN
+            weights = fx.rocdl.make_buffer_tensor(
+                _weight_view(fx.get_iter(W) + n_begin * K, BN, K), max_size=False)
+            output = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(P) + row_begin * R + n_begin,
+                        fx.make_layout((BN, BM), (1, R))), max_size=False,
+                        num_records_bytes=((BM - 1) * R + BN) * 2)
+            b_tiles = fx.flat_divide(weights, fx.make_tile(BN, BK))[None, None, 0, None]
+            c_tile = fx.flat_divide(output, fx.make_tile(BN, BM))[None, None, 0, 0]
         atom = fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16))
-        tiled = fx.make_tiled_mma(atom, fx.make_layout((4, 1, 1), (1, 0, 0)),
-                                 (None, None, fx.make_layout((4, 4, 2), (1, 8, 4))))
+        if const_expr(n_splits == 1):
+            tiled = fx.make_tiled_mma(atom, fx.make_layout((4, 1, 1), (1, 0, 0)),
+                                     (None, None, fx.make_layout((4, 4, 2), (1, 8, 4))))
+        else:
+            tiled = fx.make_tiled_mma(atom, fx.make_layout((2, 2, 1), (1, 2, 0)),
+                                     (None, None, fx.make_layout((4, 4, 2), (1, 8, 4))))
         mma_thread = tiled.thr_slice(tid)
         copy_g = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16)
         copy_s = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
@@ -85,22 +104,23 @@ def make_down(rows, padded_rows):
                 read_g2r(next_k, slot ^ 1)
             for ki in range_constexpr(BK // 32):
                 fx.copy(copy_s, a_reads[slot][None, None, ki], a_registers[None, None, ki])
-                for token_tile in range_constexpr(BM // 16):
-                    for channel_tile in range_constexpr(BN // 64):
+                for token_tile in range_constexpr(BM // (16 * M_WAVES)):
+                    for channel_tile in range_constexpr(BN // (16 * N_WAVES)):
                         for k16 in range_constexpr(2):
                             fx.mma_atom_call(atom, c_fragment[None, channel_tile, token_tile],
                                 b_fragments[slot][None, channel_tile, (k16, ki)], a_fragment[None, token_tile, (k16, ki)],
                                 c_fragment[None, channel_tile, token_tile])
             if const_expr(read_next):
                 fx.copy(copy_s, a_transfer_s, a_destinations[slot ^ 1])
-                # A2+B10个VMEM请求，每次间隔6条MFMA；8次DS读，2次A写。
-                # 每拍共12*6 + 4 + 2*2 = 80条MFMA，保持既定的交错顺序。
+                # A2+B10条VMEM；N2的B跨M wave复用地址，但仍由各wave独立读取。
+                # N1: 12*6+4+2*2=80 MFMA；N2: 12*3+2*2=40 MFMA。
                 for request in range_constexpr(12):
-                    if const_expr(request < 8):
+                    if const_expr(request < 8 // M_WAVES):
                         rocdl.sched_dsrd(1)
                     rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(6)
-                rocdl.sched_mfma(4)
+                    rocdl.sched_mfma(6 // M_WAVES)
+                if const_expr(n_splits == 1):
+                    rocdl.sched_mfma(4)
                 for _ in range_constexpr(2):
                     rocdl.sched_dswr(1)
                     rocdl.sched_mfma(2)
@@ -134,7 +154,9 @@ def make_down(rows, padded_rows):
         fx.copy(copy_c, c_copy.retile(p_bf16), c_copy.partition_D(c_tile))
 
     @flyc.jit
-    def launch_down(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, stream: fx.Stream):
-        gr_read_down(X, W, P).launch(grid=(padded_rows // BM, R // BN, 1), block=(256, 1, 1), stream=stream)
+    def launch_down(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor,
+                    rows: fx.Int64, stream: fx.Stream):
+        m_tiles = (rows + BLOCK_M - 1) // BLOCK_M * (BLOCK_M // BM)
+        gr_read_down(X, W, P, rows).launch(grid=(m_tiles, R // BN, 1), block=(256, 1, 1), stream=stream)
 
     return launch_down
