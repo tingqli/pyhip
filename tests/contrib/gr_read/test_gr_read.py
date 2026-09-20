@@ -23,7 +23,7 @@ def test_batch_dispatch(k, splits):
     assert select_n_splits(k * 1024, 80) == splits
 
 
-@pytest.mark.parametrize("rows", (-1, 65537, True, 1.5, "1024"))
+@pytest.mark.parametrize("rows", (-1, None, True, 1.5, "1024"))
 def test_invalid_rows(rows):
     with pytest.raises(ValueError):
         select_n_splits(rows, 80)

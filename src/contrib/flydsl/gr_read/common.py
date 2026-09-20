@@ -3,7 +3,6 @@
 
 C, H, R = 4, 2560, 320
 K = C * H
-MAX_ROWS = 65536
 BLOCK_M = 256
 
 # gfx942/80CU正常输出起点的历史矩阵校准值，单位为每CTA轮的相对时间。
@@ -14,8 +13,16 @@ _ROUND_COST = ((2, 280), (4, 144), (8, 77))
 
 
 def validate_rows(rows):
-    if not isinstance(rows, int) or isinstance(rows, bool) or not 0 <= rows <= MAX_ROWS:
-        raise ValueError(f"GRRead supports 0..{MAX_ROWS} rows")
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 0:
+        raise ValueError("expected GRRead rows to be a nonnegative integer")
+
+
+def validate_launch_rows(rows, padded_rows, block_m):
+    """内部工厂只验证有效行与padding；X/P/Y基址在CTA内用64位重设。"""
+    validate_rows(rows)
+    validate_rows(padded_rows)
+    if not (0 < rows <= padded_rows and padded_rows % block_m == 0):
+        raise ValueError(f"expected 0 < rows <= padded_rows, aligned to {block_m}")
 
 
 def select_n_splits(rows, compute_units):

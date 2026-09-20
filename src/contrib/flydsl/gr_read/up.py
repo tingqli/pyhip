@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""GR read Up N4/N8：X每行128B协作读取，支持N4/N8独立CTA。
+"""GR read Up N2/N4/N8：统一X128协作读取、W两拍预取的独立CTA流水。
 
 X/P读取和Y写出使用NT，W默认；P为BF16、完整K320、FP32 logits。
 相同H64的四stream始终按原顺序FMA，Y调用真实整数BF16 helper。
 两个20KiB B LDS槽＋每wave3KiB X LDS，总64KiB；512线程。
-每子阶段一条未来X读取，W预取两拍，P读取与启动X/B搬运重叠。
-N4/N8共享GPU实现，通过内部必需编译期参数选择分片数。
+每子阶段一条未来X读取，P读取与启动X/B LDS搬运重叠。
+N分片数为内部编译期参数，公开入口按batch选择，不提供实验开关。
 """
 from functools import cache
 
@@ -16,7 +16,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from pyhip.contrib.flydsl.helpers import cvt_f32_to_bf16
 
-from .common import H, K, R
+from .common import H, K, R, validate_launch_rows
 from .helpers import (
     _barrier,
     _ds_read,
@@ -60,17 +60,16 @@ def _pack_y_from_mean(v0, v1):
 
 
 @cache
-def make_up_n4_n8(rows, padded_rows, *, n_splits):
-    """构造正式Up N4/N8 launcher；输入/输出ABI与Up N2相同，无额外queue状态。
+def make_up(rows, padded_rows, *, n_splits):
+    """构造统一Up launcher，无queue状态、回退路径或不同cache策略。
 
-    N4每CTA处理80个H32包，N8处理40包；每8包包含完整H64四路归约。
-    rows非256整数倍时保留尾行掩码；整块形状使用精确grid避免多余CTA。
-    n_splits是内部必需编译期参数，仅支持4/8；不做跨分片数的隐式回退。
+    N2/N4/N8每CTA分别处理160/80/40个H32包；每8包是完整H64四路归约。
+    rows非256整数倍时保留尾行掩码；整块形状使用精确grid。
+    n_splits是内部必需编译期参数，仅支持2/4/8。
     """
-    if n_splits not in (4, 8):
-        raise ValueError('n_splits must be 4 or 8')
-    if not (0 < rows <= padded_rows and padded_rows % BM == 0):
-        raise ValueError('expected 0 < rows <= padded_rows with padded_rows divisible by 256')
+    if n_splits not in (2, 4, 8):
+        raise ValueError('n_splits must be 2, 4 or 8')
+    validate_launch_rows(rows, padded_rows, BM)
     N_SPLITS = n_splits
     PACKETS = K // 32 // N_SPLITS
     GROUPS = PACKETS // GROUP_STEPS
@@ -80,7 +79,7 @@ def make_up_n4_n8(rows, padded_rows, *, n_splits):
         b: fx.Array[fx.Int32, (2 * B_SLOT_BYTES + 24576) // 4, 16]
 
     @flyc.kernel(known_block_size=[512, 1, 1])
-    def gr_read_up_n4_n8(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor):
+    def gr_read_up(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor):
         tid = fx.Int32(fx.thread_idx.x)
         lane, wave = tid % 64, tid // 64
         group = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, (tid // 256).ir_value()))
@@ -95,28 +94,41 @@ def make_up_n4_n8(rows, padded_rows, *, n_splits):
         task_tid = fx.Uint32(llvm.inline_asm(fx.Uint32.ir_type, [tid.ir_value()], '', '=v,0', has_side_effects=True))
         lane, wave = fx.Int32(task_tid & 63), fx.Int32(task_tid >> 6)
         n_base, n_phase = n_task * PACKETS, fx.Int32(0)
-        row = block_m * BM + wave * 32 + lane % 16
-        buffers = [fx.rocdl.make_buffer_tensor(t, max_size=False) for t in (W, P, X, Y)]
+        # X/P/Y在CTA入口用64位元素偏移重设基址；循环内地址只相对本M256 tile。
+        row_begin = block_m.to(fx.Int64) * BM
+        if const_expr(rows % BM == 0):
+            valid_rows = fx.Int64(BM)
+        else:
+            remaining = fx.Int64(rows) - row_begin
+            valid_rows = (remaining < BM).select(remaining, fx.Int64(BM))
+        tile_x = fx.make_view(fx.get_iter(X) + row_begin * K, fx.make_layout(BM * K, 1))
+        tile_p = fx.make_view(fx.get_iter(P) + row_begin * R, fx.make_layout(BM * R, 1))
+        tile_y = fx.make_view(fx.get_iter(Y) + row_begin * H, fx.make_layout(BM * H, 1))
+        buffers = [fx.rocdl.make_buffer_tensor(W, max_size=False),
+                   fx.rocdl.make_buffer_tensor(tile_p, max_size=False, num_records_bytes=valid_rows * R * 2),
+                   fx.rocdl.make_buffer_tensor(tile_x, max_size=False, num_records_bytes=valid_rows * K * 2),
+                   fx.rocdl.make_buffer_tensor(tile_y, max_size=False, num_records_bytes=valid_rows * H * 2)]
         wr, pr, xr, yr = [fx.rocdl.get_buffer_rsrc(fx.get_iter(t)) for t in buffers]
+        row = wave * 32 + lane % 16
         p_address, x_address, y_address = [], [], []
         for mi in range_constexpr(2):
             mr = row + mi * 16
-            p_address.append(_pin_v(mr * R * 2 + lane // 16 * 16 if const_expr(rows % BM == 0) else (mr < rows).select(mr * R * 2 + lane // 16 * 16, fx.Int32(0x7fffffff))))
-            y_address.append(_pin_v(mr * H * 2 + lane // 16 * 16 if const_expr(rows % BM == 0) else (mr < rows).select(mr * H * 2 + lane // 16 * 16, fx.Int32(0x7fffffff))))
+            p_address.append(_pin_v(mr * R * 2 + lane // 16 * 16))
+            y_address.append(_pin_v(mr * H * 2 + lane // 16 * 16))
         w16, w8 = _pin_v(tid * 16), _pin_v(tid * 8)
         b_read = _pin_v(b_base + lane % 16 * 16 + lane // 16 * 256)
         b_write16, b_write8 = _pin_v(b_base + tid * 16), _pin_v(b_base + tid * 8)
 
         # 每row八个lane，各16B；四条load覆盖本wave的M32/H64。
         x_pair_address = []
-        x_row8 = block_m * BM + wave * 32 + lane % 8
+        x_row8 = wave * 32 + lane % 8
         if const_expr(rows % BM == 0):
             x_a = _pin_v(x_row8 * K * 2 + lane // 8 * 16)
             x_pair_address = [x_a, x_a, x_a, x_a]
         else:
             for part in range_constexpr(4):
                 mr = x_row8 + part * 8
-                x_pair_address.append(_pin_v((mr < rows).select(mr * K * 2 + lane // 8 * 16, fx.Int32(0x7fffffff))))
+                x_pair_address.append(_pin_v(mr * K * 2 + lane // 8 * 16))
         # 每wave3KiB：低半M16的1KiB分时复用，高半M32保留2KiB。
         x_lds_base = b_base + 2 * B_SLOT_BYTES + wave * 3072
         x_write = [_pin_v(x_lds_base + lane % 8 * 16 + lane // 8 % 4 * 256 + lane // 32 * (1024 + mi * 1024))
@@ -350,7 +362,7 @@ def make_up_n4_n8(rows, padded_rows, *, n_splits):
 
     @flyc.jit
     def launch_up(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor, stream: fx.Stream):
-        gr_read_up_n4_n8(X, W, P, Y).launch(grid=(((rows + BM - 1) // BM) * N_SPLITS, 1, 1), block=(512, 1, 1), stream=stream)
+        gr_read_up(X, W, P, Y).launch(grid=(((rows + BM - 1) // BM) * N_SPLITS, 1, 1), block=(512, 1, 1), stream=stream)
 
     launch_up.compile_hints['llvm_options'] = {'vectorize-slp': False}
     return launch_up

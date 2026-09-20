@@ -7,7 +7,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 
-from .common import K, R
+from .common import K, R, validate_launch_rows
 from .helpers import _sigmoid_down as _sigmoid, _weight_view
 
 BM, BN, BK = 64, 320, 64
@@ -18,7 +18,7 @@ GROUPS = K // BK // GROUP_STEPS
 @cache
 def make_down(rows, padded_rows):
     """构造正式Down；每个CTA计算64行和全部320个隐藏通道。"""
-    assert 0 < rows <= padded_rows and padded_rows % BM == 0
+    validate_launch_rows(rows, padded_rows, BM)
 
     @fx.struct
     class Shared:
@@ -29,16 +29,24 @@ def make_down(rows, padded_rows):
     def gr_read_down(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor):
         tid = fx.Int32(fx.thread_idx.x)
         im, jn, _ = fx.block_idx
-        # 逻辑M域必须覆盖padding CTA，防止单tile布局把其block偏移折叠回首tile。
-        # 物理buffer边界仍是有效rows；无效行由buffer OOB读取为零。
-        x = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(X), fx.make_layout((padded_rows, K), (K, 1))),
-                                        max_size=False, num_records_bytes=rows * K * 2)
+        # 先以64位把全局指针移到本M64 tile；buffer内仅保留局部32位偏移。
+        row_begin = fx.Int64(im) * BM
+        if const_expr(rows % BM == 0):
+            valid_rows = (row_begin < rows).select(fx.Int64(BM), fx.Int64(0))
+        else:
+            remaining = fx.Int64(rows) - row_begin
+            valid_rows = (remaining > 0).select(remaining, fx.Int64(0))
+            valid_rows = (valid_rows < BM).select(valid_rows, fx.Int64(BM))
+        # 全padding CTA的X范围为0，所有buffer读返回0；P仍写完整64行零。
+        x_row_begin = (row_begin < rows).select(row_begin, fx.Int64(rows))
+        x = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(X) + x_row_begin * K,
+                    fx.make_layout((BM, K), (K, 1))), max_size=False, num_records_bytes=valid_rows * K * 2)
         weights = fx.rocdl.make_buffer_tensor(_weight_view(fx.get_iter(W), R, K), max_size=False)
-        output = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(P),
-                    fx.make_layout((R, padded_rows), (1, R))), max_size=False)
-        a_tiles = fx.flat_divide(x, fx.make_tile(BM, BK))[None, None, im, None]
+        output = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(P) + row_begin * R,
+                    fx.make_layout((R, BM), (1, R))), max_size=False, num_records_bytes=BM * R * 2)
+        a_tiles = fx.flat_divide(x, fx.make_tile(BM, BK))[None, None, 0, None]
         b_tiles = fx.flat_divide(weights, fx.make_tile(BN, BK))[None, None, jn, None]
-        c_tile = fx.flat_divide(output, fx.make_tile(BN, BM))[None, None, jn, im]
+        c_tile = fx.flat_divide(output, fx.make_tile(BN, BM))[None, None, jn, 0]
         atom = fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16))
         tiled = fx.make_tiled_mma(atom, fx.make_layout((4, 1, 1), (1, 0, 0)),
                                  (None, None, fx.make_layout((4, 4, 2), (1, 8, 4))))
