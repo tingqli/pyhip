@@ -4,17 +4,6 @@
 
 支持 ROCm gfx942。固定维度为 C=4、H=2560、R=320、K=10240；本轮性能配置在 MI308X / 80CU 上验证。此入口负责 prefill，独立 decode 实现及上层 prefill/decode 分派另行接入。
 
-## 1. 安装与最小接入
-
-验证环境：PyTorch `2.12.0+rocm7.2.4.gitcf5ea6e.post2`，FlyDSL **`0.3.2`**，gfx942 / 80CU。FlyDSL 版本仅记录在本文档中，由使用环境提供。
-
-以下命令在已应用本补丁、已具备上述依赖的 PyHIP 仓库根目录运行：
-
-```bash
-python3 -m pip install -e .
-```
-
-本补丁按源码 / editable 方式接入，保持仓库原有 `pyproject.toml`，不新增依赖清单或 wheel 打包声明。
 
 ```python
 from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
