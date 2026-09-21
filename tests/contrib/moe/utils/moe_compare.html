@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoE · Kernel comparison</title>
+<style>
+  :root { color-scheme:dark; --bg:#0b1120; --panel:#141e31; --line:#2b3850; --text:#e8effb; --muted:#a3b3cb; --accent:#69e0bd; }
+  * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px/1.6 system-ui,sans-serif; }
+  main { max-width:1450px; margin:auto; padding:32px; } h1 { margin:0; font-size:30px; letter-spacing:-.8px; } h2 { font-size:17px; margin:0 0 12px; }
+  .eyebrow { color:var(--accent); font-size:11px; letter-spacing:2px; font-weight:700; } .muted { color:var(--muted); } header { display:flex; justify-content:space-between; gap:20px; align-items:center; margin-bottom:24px; }
+  .pill,.status { border:1px solid var(--line); border-radius:20px; padding:3px 10px; font-size:11px; white-space:nowrap; }
+  .controls { display:flex; flex-wrap:wrap; gap:16px; align-items:end; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; }
+  label { display:grid; gap:5px; color:var(--muted); font-size:12px; } .check { display:flex; align-items:center; padding:8px 0; }
+  input,select,button { font:inherit; color:var(--text); background:#0d1628; border:1px solid var(--line); border-radius:7px; padding:8px 11px; } input[type=checkbox] { accent-color:var(--accent); }
+  button { cursor:pointer; } button:hover,select:hover { border-color:var(--accent); } :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  #model { min-width:215px; } #search { min-width:220px; } #context { margin:15px 0; overflow-wrap:anywhere; }
+  .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin:18px 0; } .card,.panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:20px; }
+  .card small { display:block; color:var(--muted); } .card strong { display:block; font-size:22px; overflow-wrap:anywhere; margin-top:5px; } .card:first-child strong { color:var(--accent); font-size:17px; }
+  .panel { margin:16px 0; } .panel-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+  #chart { width:100%; height:auto; display:block; } svg text { fill:var(--muted); font:11px system-ui; } .series { opacity:.75; } .series:hover { opacity:1; stroke-width:4; }
+  #legend { display:flex; flex-wrap:wrap; gap:6px 15px; padding-top:12px; max-height:150px; overflow:auto; } #legend label { display:flex; align-items:center; gap:5px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; flex:none; } .notice { color:#f9ce87; white-space:pre-wrap; } #empty { text-align:center; padding:30px; color:var(--muted); }
+  .rank { display:grid; grid-template-columns:minmax(180px,320px) 1fr 95px; gap:12px; align-items:center; margin:9px 0; } .rank-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .track { background:#0d1628; border-radius:4px; height:10px; } .bar { height:100%; border-radius:4px; } .number { font-variant-numeric:tabular-nums; text-align:right; white-space:nowrap; }
+  .table-wrap { overflow:auto; } table { width:100%; border-collapse:collapse; white-space:nowrap; } th,td { padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-size:12px; } th button { padding:0; border:0; background:transparent; } tr.best { background:#14362f; } .OK { color:#69e0bd; } .FAIL,.ERROR,.NOT_RUN { color:#ffabb1; }
+  .UNSUPPORTED { color:var(--muted); } details { white-space:normal; min-width:220px; max-width:500px; } summary { cursor:pointer; color:var(--muted); } pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:11px; }
+  footer { margin:24px 0 5px; color:var(--muted); font-size:12px; } @media(max-width:800px) { main { padding:18px; } .cards { grid-template-columns:1fr 1fr; } header { align-items:start; } .rank { grid-template-columns:150px 1fr 80px; } }
+</style>
+</head>
+<body>
+<main>
+  <header><div><div class="eyebrow">PYHIP / KERNEL LAB</div><h1>MoE performance explorer</h1><div class="muted">Complete calls. Shared inputs. Accuracy-checked winners.</div></div><span class="pill">OFFLINE · SINGLE FILE</span></header>
+  <div class="controls">
+    <label>Model<select id="model"></select></label>
+    <label>Tokens<select id="tokens"></select></label>
+    <label>Chart metric<select id="metric"><option value="latency">E2E latency · μs</option><option value="speedup">Speedup vs tuned Aiter</option></select></label>
+    <label>Filter drivers<input id="search" type="search" placeholder="Name or driver family"></label>
+    <label class="check"><input id="log" type="checkbox" checked>Logarithmic Y</label>
+    <label class="check"><input id="unsupported" type="checkbox">Show unsupported</label>
+  </div>
+  <div id="context" class="muted"></div><div id="notice" class="notice" role="status"></div>
+  <div class="cards"><div class="card"><small>FASTEST VALID DRIVER</small><strong id="winner">—</strong></div><div class="card"><small>BEST E2E LATENCY</small><strong id="latency">—</strong></div><div class="card"><small>VS TUNED AITER</small><strong id="speedup">—</strong></div><div class="card"><small>VALID / MEASURED ROWS</small><strong id="coverage">—</strong></div></div>
+  <section class="panel"><div class="panel-heading"><h2>Across batch sizes</h2><button id="show-all">Show all drivers</button></div><div class="muted">Click a point to inspect its token count. Toggle drivers below; hover points for values.</div><svg id="chart" viewBox="0 0 1040 290" role="img" aria-label="Driver latency or speedup across token counts"></svg><div id="empty" hidden>No valid measurements for this selection.</div><div id="legend"></div></section>
+  <section class="panel"><h2 id="ranking-title">Selected batch · latency ranking</h2><div id="ranking"></div></section>
+  <section class="panel"><div class="panel-heading"><h2>All results</h2><span class="muted">Tuned Aiter pinned first · click a heading to sort</span></div><div class="table-wrap"><table><thead><tr><th><button data-sort="candidate">Driver ↕</button></th><th><button data-sort="status">Status ↕</button></th><th><button data-sort="diff">calc_diff ↕</button></th><th><button data-sort="e2e_latency_s">E2E μs ↕</button></th><th><button data-sort="speedup">Speedup ↕</button></th><th>Kernel / parameters / reason</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+  <footer id="footer"></footer>
+</main>
+<script type="application/json" id="data">__MOE_DATA__</script>
+<script>
+'use strict';
+const data = JSON.parse(document.getElementById('data').textContent);
+const $ = id => document.getElementById(id);
+const hidden = new Set();
+let sortKey = 'e2e_latency_s', sortDirection = 1;
+const reports = data.reports || [];
+const valid = row => row.status === 'OK' && Number.isFinite(row.e2e_latency_s) && row.e2e_latency_s > 0;
+const fmt = (value, digits=3) => Number.isFinite(value) ? value.toFixed(digits) : '—';
+const best = batch => (batch?.rows || []).filter(valid).sort((a,b) => a.e2e_latency_s-b.e2e_latency_s)[0];
+const color = name => {
+  if (name === 'aiter') return '#ffca75';
+  let hash = 0; for (const char of name) hash = (hash*31 + char.charCodeAt(0)) | 0;
+  return `hsl(${Math.abs(hash)%360} 70% 68%)`;
+};
+function element(tag, text, parent, className) {
+  const node = document.createElement(tag); if (text != null) node.textContent = text;
+  if (className) node.className = className; if (parent) parent.appendChild(node); return node;
+}
+function option(select, value, text) { const node = element('option', text, select); node.value = value; }
+function svg(tag, attrs, text) {
+  const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [key,value] of Object.entries(attrs)) node.setAttribute(key, value);
+  if (text != null) node.textContent = text; return node;
+}
+const report = () => reports[Number($('model').value)];
+const visible = row => !hidden.has(row.candidate) && `${row.candidate} ${row.driver}`.toLowerCase().includes($('search').value.toLowerCase());
+const metric = row => !valid(row) ? null : $('metric').value === 'latency' ? row.e2e_latency_s*1e6 : row.speedup;
+function selectModel() {
+  hidden.clear(); $('tokens').replaceChildren();
+  for (const batch of report()?.batches || []) option($('tokens'), batch.spec.tokens, batch.spec.tokens);
+  render();
+}
+function chart(current) {
+  const batches = [...(current?.batches || [])].sort((a,b) => a.spec.tokens-b.spec.tokens), root = $('chart'); root.replaceChildren(); $('legend').replaceChildren();
+  const names = [...new Set(batches.flatMap(batch => batch.rows.filter(row => $('unsupported').checked || row.status !== 'UNSUPPORTED').map(row => row.candidate)))];
+  const matching = names.filter(name => batches.some(batch => batch.rows.some(row => row.candidate === name && `${name} ${row.driver}`.toLowerCase().includes($('search').value.toLowerCase()))));
+  for (const name of matching) {
+    const label = element('label', null, $('legend'));
+    const box = element('input', null, label); box.type = 'checkbox'; box.checked = !hidden.has(name);
+    const dot = element('span', null, label, 'dot'); dot.style.background = color(name); element('span', name, label);
+    box.onchange = () => { box.checked ? hidden.delete(name) : hidden.add(name); render(); };
+  }
+  const points = batches.flatMap(batch => batch.rows.filter(visible).map(row => ({row, m:batch.spec.tokens, v:metric(row)}))).filter(point => Number.isFinite(point.v) && point.v > 0);
+  $('empty').hidden = points.length > 0;
+  if (!points.length) return;
+  const log = $('log').checked, convert = value => log ? Math.log10(value) : value;
+  const xmin = Math.log2(Math.min(...batches.map(batch => batch.spec.tokens))), xmax = Math.log2(Math.max(...batches.map(batch => batch.spec.tokens)));
+  let ymin = log ? Math.min(...points.map(point => convert(point.v))) : 0, ymax = Math.max(...points.map(point => convert(point.v)));
+  if (ymin === ymax) { ymin -= .5; ymax += .5; } else { ymax += (ymax-ymin)*.08; }
+  const x = m => xmin === xmax ? 542 : 75 + (Math.log2(m)-xmin)/(xmax-xmin)*935;
+  const y = v => 245 - (convert(v)-ymin)/(ymax-ymin)*215;
+  for (let i=0;i<=4;i++) {
+    const value = ymin+(ymax-ymin)*i/4, ypos = 245-215*i/4;
+    root.appendChild(svg('line', {x1:75,y1:ypos,x2:1010,y2:ypos,stroke:'#2b3850'}));
+    root.appendChild(svg('text', {x:65,y:ypos+4,'text-anchor':'end'}, fmt(log ? 10**value : value, 2)));
+  }
+  for (const batch of batches) root.appendChild(svg('text', {x:x(batch.spec.tokens),y:267,'text-anchor':'middle'}, batch.spec.tokens));
+  root.appendChild(svg('text', {x:1010,y:285,'text-anchor':'end'}, 'tokens · log₂'));
+  for (const name of matching.filter(name => !hidden.has(name))) {
+    let segment = [];
+    const flush = () => { if (segment.length) root.appendChild(svg('polyline', {points:segment.join(' '),fill:'none',stroke:color(name),'stroke-width':name==='aiter'?3:1.8,class:'series'})); segment = []; };
+    for (const batch of batches) {
+      const row = batch.rows.find(row => row.candidate === name), value = row ? metric(row) : null;
+      if (!Number.isFinite(value) || value <= 0) { flush(); continue; }
+      segment.push(`${x(batch.spec.tokens)},${y(value)}`);
+    }
+    flush();
+  }
+  for (const point of points) {
+    const circle = svg('circle', {cx:x(point.m),cy:y(point.v),r:point.m===Number($('tokens').value)?4:2.6,fill:color(point.row.candidate),tabindex:0,role:'button','aria-label':`${point.row.candidate}, tokens ${point.m}`});
+    circle.appendChild(svg('title', {}, `${point.row.candidate}\ntokens=${point.m}\n${fmt(point.v)} ${$('metric').value==='latency'?'μs':'×'}`));
+    const choose = () => { $('tokens').value = point.m; render(); }; circle.onclick = choose; circle.onkeydown = event => { if (event.key==='Enter') choose(); };
+    root.appendChild(circle);
+  }
+}
+function render() {
+  const current = report(), batches = current?.batches || [], batch = batches.find(batch => batch.spec.tokens === Number($('tokens').value));
+  const winner = best(batch), baseline = batch?.rows[0], spec = batch?.spec, device = current?.device;
+  $('context').textContent = spec ? `${device?.name || ''} · ${device?.gfx || ''} / ${device?.cu_num || '?'} CU · TP=${spec.TP}, H=${spec.model_dim}, global I=${spec.inter_dim}, E=${spec.experts}, topk=${spec.topk} · ${spec.quant_scheme_str} / ${spec.activation}` : current?.model || 'No results';
+  $('notice').textContent = current?.error || batch?.error || (baseline && baseline.status !== 'OK' ? `No valid tuned Aiter baseline (${baseline.status}). Absolute latency remains available; speedups are unavailable. ${baseline.reason || ''}` : '');
+  $('winner').textContent = winner?.candidate || 'No valid winner'; $('latency').textContent = winner ? `${fmt(winner.e2e_latency_s*1e6)} μs` : '—';
+  $('speedup').textContent = Number.isFinite(winner?.speedup) ? `${fmt(winner.speedup)}×` : '—';
+  $('coverage').textContent = `${(batch?.rows || []).filter(valid).length} / ${(batch?.rows || []).filter(row => row.status !== 'UNSUPPORTED').length}`;
+  chart(current);
+  $('ranking').replaceChildren();
+  const ranked = (batch?.rows || []).filter(row => valid(row) && visible(row)).sort((a,b) => a.e2e_latency_s-b.e2e_latency_s);
+  const largest = Math.max(...ranked.map(row => row.e2e_latency_s));
+  for (const row of ranked) {
+    const item = element('div', null, $('ranking'), 'rank');
+    const name = element('span', row.candidate === winner?.candidate ? `★ ${row.candidate}` : row.candidate, item, 'rank-name'); name.title = row.candidate;
+    const track = element('div', null, item, 'track'), bar = element('div', null, track, 'bar'); bar.style.width = `${100*row.e2e_latency_s/largest}%`; bar.style.background = color(row.candidate);
+    element('span', `${fmt(row.e2e_latency_s*1e6)} μs`, item, 'number');
+  }
+  if (!ranked.length) element('div', 'No valid matching driver for this batch.', $('ranking'), 'muted');
+  $('rows').replaceChildren();
+  const rows = (batch?.rows || []).filter(row => visible(row) && (row.candidate === 'aiter' || $('unsupported').checked || row.status !== 'UNSUPPORTED'));
+  rows.sort((a,b) => {
+    if (a.candidate==='aiter') return -1; if (b.candidate==='aiter') return 1;
+    const av=a[sortKey], bv=b[sortKey]; if (av==null) return 1; if (bv==null) return -1;
+    return sortDirection*(typeof av==='number' ? av-bv : String(av).localeCompare(String(bv)));
+  });
+  for (const row of rows) {
+    const tr=element('tr', null, $('rows'), row.candidate===winner?.candidate?'best':'');
+    element('td', row.candidate, tr); const status=element('td', null, tr); element('span', row.status, status, `status ${row.status}`);
+    element('td', Number.isFinite(row.diff)?row.diff.toExponential(3):'—', tr, 'number');
+    element('td', valid(row)?fmt(row.e2e_latency_s*1e6):'—', tr, 'number'); element('td', Number.isFinite(row.speedup)?`${fmt(row.speedup)}×`:'—', tr, 'number');
+    const detail=element('details', null, element('td', null, tr)); element('summary', row.reason?'Details / reason':'Kernel / configuration', detail);
+    element('pre', `${row.kernel_name || ''}\n${JSON.stringify(row.params,null,2)}${row.reason?'\n'+row.reason:''}${row.log?'\nLog: '+row.log:''}`, detail);
+  }
+  const options=current?.options || {};
+  $('footer').textContent = `${data.benchmark_protocol} · seed=${options.seed ?? '—'}, buffers=${options.buffer_count ?? '—'}, warmup=${options.warmup ?? '—'}, iters=${options.iters ?? '—'}, rounds=${options.rounds ?? '—'} · Best means fastest accuracy-passing measured candidate, not a universal hardware optimum. No clock locking or external-load exclusion. Model artifacts: ${current?.artifact_dir || '—'}`;
+}
+reports.forEach((item,index) => option($('model'), index, item.model + (item.success === false ? ' · partial/errors' : '')));
+$('model').onchange=selectModel;
+for (const id of ['tokens','metric','log','unsupported']) $(id).onchange=render;
+$('search').oninput=render; $('show-all').onclick=()=>{hidden.clear();$('search').value='';render();};
+for (const button of document.querySelectorAll('[data-sort]')) button.onclick=()=>{sortDirection=sortKey===button.dataset.sort?-sortDirection:1;sortKey=button.dataset.sort;render();};
+selectModel();
+</script>
+</body>
+</html>

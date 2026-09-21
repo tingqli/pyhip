@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "pyhip"
 dynamic = ["version"]
 requires-python = ">=3.8"
-dependencies = ["filelock", "numpy"]
+dependencies = ["filelock", "numpy", "tqdm"]
 description = "Python AMDGPU kernel developing tool"
 readme = "README.md"
 license = "MIT"

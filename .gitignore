@@ -10,3 +10,5 @@ ck_test/
 .compile.lock
 my_ir_dumps/
 .rocprofv3/
+aiter-moe*/
+**/tuned_aiter/

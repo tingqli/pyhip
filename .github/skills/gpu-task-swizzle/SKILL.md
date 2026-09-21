@@ -48,6 +48,8 @@ description: 'Use when optimizing GPU GEMM or MoE task order, OC splitting, grid
 
 当前M256、S=4、T=3072的width8满足$F_8(8j+x)=384x+j$；每4个j覆盖同一M的四个OC。当前独立M128用width2，persistent M128用width4，不用旧README中的width4替代现状。
 
+**写出布局变化后，重新选宽度。** A8W4的32K实验中，64B/行写出时分片width8较快，改成128B/行后反而无转置的分片队列较快。不要把旧swizzle当固定最优，更不能将各轮加速比相乘；先固定布局/cache，再单独比较任务映射。见[对照记录](../../../tests/flydsl/moe_8w_down/A8W4_OPTIMIZATION.md#coalescing)。
+
 ## 禁止的推论
 
 - 不能从task编号直接认定SE/CU编号或同时驻留；SE相位可能是每XCD的排列。

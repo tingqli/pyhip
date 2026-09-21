@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Selected packed BF16 TOPK sum: 256 threads, 2048 columns, NT reads."""
+"""BF16 TOPK sum: packed gather or direct routed reads, 256 threads, NT loads."""
 
 from functools import cache
 
@@ -17,9 +17,17 @@ from moe_multistage_down import _scalar
 
 
 @cache
-def make_moe_sum(*, n, topk, sort_block_m=256):
-    """Gather packed down routes through inverse; missing entries contribute0."""
+def make_moe_sum(*, n, topk, sort_block_m=256, source_layout="packed"):
+    """Packed gather (default) or routed [tokens,topk,N] without inverse.
+
+    Packed mode preserves sequential slot addition. Routed mode uses four
+    FP32 accumulators, matching Torch's non-contiguous-dimension sum order
+    for the supported TOPK<=16, N%512==0 BF16 layout (Reduce.cuh vt0=4).
+    """
     assert n > 0 and n % 512 == 0 and 0 < topk <= 255
+    assert source_layout in ("packed", "routed")
+    if source_layout == "routed":
+        return _make_routed_sum(n=n, topk=topk)
     assert sort_block_m in (128, 256)
     assert sort_block_m * n * 2 < (1 << 32), "one packed M block must fit a buffer descriptor"
     column_blocks = (n + 2047) // 2048
@@ -91,4 +99,67 @@ def make_moe_sum(*, n, topk, sort_block_m=256):
 
     reduce.config = {"output_layout": "packed", "sort_block_m": sort_block_m, "num_threads": 256, "block_cols": 2048,
                      "read_policy": 2, "write_policy": 0}
+    return reduce
+
+
+@cache
+def _make_routed_sum(*, n, topk):
+    assert topk <= 16, "Torch-compatible routed summation is validated for TOPK<=16"
+    assert topk * n * 2 < (1 << 32), "one token must fit a buffer descriptor"
+    column_blocks = (n + 2047) // 2048
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def moe_routed_sum_kernel(output: fx.Pointer, source: fx.Pointer, tokens: fx.Int32):
+        tid = fx.thread_idx.x
+        token = fx.Int32(fx.block_idx.x) // column_blocks
+        column = fx.Int32(fx.block_idx.x) % column_blocks * 2048 + tid * 8
+        # Rebase per token so the source may cross 4GiB without a wrapped offset.
+        src = rocdl.make_buffer_tensor(fx.make_view(source + fx.Int64(token) * (topk * n),
+                                                   fx.make_layout(topk * n, 1)), False)
+        dst = rocdl.make_buffer_tensor(fx.make_view(output + fx.Int64(token) * n,
+                                                   fx.make_layout(n, 1)), False)
+        load = fx.make_copy_atom(rocdl.BufferCopy128b(cache_modifier=2), fx.BFloat16)
+        store = fx.make_copy_atom(rocdl.BufferCopy128b(cache_modifier=0), fx.BFloat16)
+        fragments = []
+        for route in range_constexpr(topk):
+            # An invalid column must be outside the whole token, not alias the next slot.
+            offset = (column < n).select(route * n + column, topk * n)
+            view = fx.make_view(fx.get_iter(src) + offset, fx.make_layout(8, 1))
+            fragment = fx.make_rmem_tensor(8, fx.BFloat16)
+            fx.copy(load, view, fragment)
+            fragments.append(fragment.load().to(fx.Float32))
+        accumulators = [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range_constexpr(4)]
+        for route in range_constexpr(topk):
+            accumulators[route % 4] = accumulators[route % 4] + fragments[route]
+        accum = accumulators[0]
+        for group in range_constexpr(1, 4):
+            accum = accum + accumulators[group]
+        fragment = fx.make_rmem_tensor(8, fx.BFloat16)
+        fragment.store(accum.to(fx.BFloat16))
+        offset = (column < n).select(column, n)
+        fx.copy(store, fragment, fx.make_view(fx.get_iter(dst) + offset, fx.make_layout(8, 1)))
+
+    @flyc.jit
+    def launch(output: fx.Pointer, source: fx.Pointer, tokens: fx.Int32, stream: fx.Stream):
+        moe_routed_sum_kernel(output, source, tokens).launch(
+            grid=(tokens * column_blocks, 1, 1), block=(256, 1, 1), stream=stream)
+
+    def reduce(output, source, inverse=None):
+        assert inverse is None, "routed source has no inverse map"
+        assert output.ndim == 2 and output.shape[1] == n
+        tokens = output.shape[0]
+        assert tokens * column_blocks < (1 << 31)
+        assert source.shape == (tokens, topk, n)
+        assert source.dtype == output.dtype == torch.bfloat16
+        assert all(t.is_cuda and t.is_contiguous() and t.device == output.device for t in (output, source))
+        stream = torch.cuda.current_stream(output.device)
+        if tokens:
+            start, end = source.data_ptr(), source.data_ptr() + source.numel() * 2
+            assert output.data_ptr() + output.numel() * 2 <= start or output.data_ptr() >= end
+            _run_compiled(launch, _ptr(output), _ptr(source), fx.Int32(tokens), fx.Stream(stream.cuda_stream))
+        return output
+
+    reduce.launch = launch
+    reduce.config = {"output_layout": "routed", "num_threads": 256, "block_cols": 2048,
+                     "read_policy": 2, "write_policy": 0, "sum_order": "torch_vt4"}
     return reduce

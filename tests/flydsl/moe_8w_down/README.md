@@ -1,5 +1,15 @@
 # MoE down：相对PyHIP的优化与四个固定case
 
+本文记录FP8 blockscale路径；A8W4的完整实验、当前实现、roofline及归约结果统一见 [A8W4_OPTIMIZATION.md](A8W4_OPTIMIZATION.md)。
+
+**A8W4性能可视化：**[离线交互报表](visualization/results/a8w4_default_k256.html) · [静态预览](visualization/results/a8w4_default_k256.png) · [采集与绘图说明](visualization/README.md)。
+支持Down/Full切换、tokens曲线、相对基线热力图及最快配置摘要；报表读取结果，不修改内核或计时流程。
+
+**当前入口分层：**主回归保留 [test_a8w4.py](test_a8w4.py)、[test_a8w4_8wave_optimized.py](test_a8w4_8wave_optimized.py)、
+[test_async_copy_lds.py](test_async_copy_lds.py)、[test_routed_moe_sum.py](test_routed_moe_sum.py) 和 [test_blockscaled.py](test_blockscaled.py)。
+历史探索统一到 [experiments/bench.py](experiments/bench.py)：一次精确检查后专注Down/Full性能，不再自动跑完整鲁棒性矩阵。
+旧源码完整保留在 [归档快照](experiments/archive/pre_cleanup_20260915.tar.gz)；运行方式和验证口径见 [A8W4入口说明](A8W4_OPTIMIZATION.md#12-代码与重现入口)。
+
 本文对应2026-09-14清理后的主代码，包含B32k的packed大buffer寻址修复。以测试中的 **PyHIP FP8 down＋Torch TOPK sum** 为基线，先列公共增量，再分别说明 **256x128 persist、256x128、128x128、128x128 persist**。历史筛选数字不作为每项优化的独立收益证明。
 
 ## 1. 名称、任务粒度与基线

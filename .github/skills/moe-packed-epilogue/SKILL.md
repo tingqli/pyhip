@@ -1,19 +1,33 @@
 ---
 name: moe-packed-epilogue
-description: 'Use when optimizing MoE GEMM output stores and TOPK reduction with packed sorted-row output, register BF16/permlane/DPP reordering, inverse route indices, native sorting alignment, or cache hints without changing FP32/FMA/BF16 numerical semantics.'
+description: 'Use when optimizing MoE GEMM routed or packed output, 64B/128B per-row store coalescing, BF16/permlane/DPP reordering, NT/SC1 cache-policy experiments, inverse route indices, or TOPK reduction without changing numerical semantics.'
 ---
 
-# MoE packed输出与专用reduce
+# MoE写出合并、packed布局与归约
 
 ## 目标与前提
 
-将不规则routed写回从大GEMM的epilogue移到更小的inverse＋gather reduce，必要时用寄存器bit交换让相邻lane合并写事务。**只在消费者能直接读packed格式时成立**；如果还需要单独restore到routed再sum，应把restore成本纳入比较。
+先区分两个独立选择：**跨线程重排，让同一行写得更连续**；**改成packed布局，改变后续归约的读取方式**。DPP重排不依赖packed，routed输出也可以做到128B/行，并继续使用原来的`torch.sum`。
+
+只有选择packed时，才将不规则routed写回改为排序行写出，再交给inverse＋gather reduce。消费者必须能直接读packed；如果还需restore到routed，应把转换成本纳入比较。
 
 原PyHIP已经有寄存器BF16/permlane且无C LDS。因此新增点是packed地址、额外DPP合并和消费者设计，不是笼统的“去掉PyHIP的C LDS”。
 
-## 实施步骤
+## routed 64B→128B：先试不改输出格式的方案
 
-1. **固定数值顺序。** 每route：K128 partial→FP32 factor乘法→下一K128 partial显式FMA→routing乘法→BF16 RNE；然后TOPK的BF16值扩到FP32顺序相加→最终BF16。不能提前跨route合并FP32、重结合scale或放宽容差。
+1. **按一条wave store、同一有效行计算连续宽度。** 原A8W4每lane写16B，四lane写同一行，共64B。BN128每行最终写256B，是多条store的总量，不是单次合并宽度；4/8wave也不决定这个宽度。
+2. **交换行和列的一位。** 令`lr=lane%16`。先完成原route乘法、BF16舍入和permlane，再用DPP交换`lr`低位与BF16列的bit5，使八lane各写16B，共同覆盖一行128B。输出仍为`[tokens, topk, N]`。
+3. **数据和目标有效性一起重排。** 广播对应偶/奇目标route，不能沿用源lane的mask。无效目标必须落到buffer真正OOB；靠buffer边界抑制写入，不需要额外可写的sentinel行。测试相邻行一真一假、全无效、空任务和恢复。
+4. **把布局和cache拆成四组。** 固定调度，测64/128B × aux0/aux18。当前gfx950的NT=2、SC1=16、两者=18；检查实际计时ELF，去掉store标志后，同宽度的完整指令文本应相同。原Tensor赋值与显式copy可能生成不同代码，先保留aux0作桥接控制。
+5. **以Full决定是否采用。** 两seed复测中，常用M128路径在8K/16K/32K受益，128B下NT+SC1通常还有额外Full收益；但4K不宜统一开启，8K无width转置的分片路径在aux0下DPP还会使Down变慢。改布局后要重新测任务顺序。
+
+128B只是逻辑连续地址覆盖，**不等于证明一个128B硬件事务或HBM流量减半**。DPP也有指令和寄存器成本；记录scratch和驻留是否变化，不能只看地址更整齐。
+
+实现及反例：[A8W4写出实验](../../../tests/flydsl/moe_8w_down/A8W4_OPTIMIZATION.md#coalescing)、[轻量四组性能对照](../../../tests/flydsl/moe_8w_down/experiments/bench.py)、[主四wave边界回归](../../../tests/flydsl/moe_8w_down/test_a8w4.py)。
+
+## 选择packed布局时的步骤
+
+1. **固定数值顺序。** blockscale实例每route：K128 partial→FP32 factor乘法→下一K128 partial显式FMA→routing乘法→BF16 RNE；A8W4保留原生scaled-MFMA的K累积顺序。然后TOPK的BF16值扩到FP32顺序相加→最终BF16。不能提前跨route合并FP32、重结合scale或放宽容差。
 2. **写出物理ABI。** 设Block M=B、排序位置l、完整输出列n、完整N。布局为`[m_block, global_N64, row_in_block, col64]`，元素索引：
 
    $$
@@ -31,10 +45,12 @@ description: 'Use when optimizing MoE GEMM output stores and TOPK reduction with
 ## 测量与边界
 
 - 分别报告Down、inverse fill/build、reduce以及直接计时的Full；Full不能由组件数相加替代。
+- warm reduce单独计时不能代表刚完成Down后的cache状态；Full的收益不能未经测量就全归给reduce。
 - 与routed＋`torch.sum`比较时，共享A/B/scales和输出地址，原始routing语义一致；解码/参考/投毒放在计时外。
 - 流量模型注明“实际有效输出”与“分配的padding容量”。默认有效BF16 route写出是1.5GiB，不是全部capacity行。
 - 使用PMC解释HBM时，DRAM32B计数乘32，用**同dispatch**时间作分母；`_sum`不再乘XCD。NT不等于写流量减少或一定更快。
 - 全零routing、valid0、专家尾块、恶意有效-looking capacity tail、连续graph replay都要测试。包含接近BF16中点的跨K相消，不只用随机allclose。
+- 上述完整边界用于维护中的主实现；历史性能探索先做一次普通精确检查，再专注同址配对计时，不重复主实现的鲁棒性矩阵。
 - 一个独立reduce workspace不能隔离缓存down callable的内部persistent queue；遵守[队列并发契约](../gpu-persistent-work-queues/SKILL.md)。
 
 ## 本仓库代码与回归

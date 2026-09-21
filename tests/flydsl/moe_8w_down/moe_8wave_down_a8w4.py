@@ -14,7 +14,6 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
@@ -37,15 +36,17 @@ if os.environ.get("PYHIP_FLYDSL_NOP_MFMA") == "1":
 
 #fxh.dump_ir(True)
 
-def _atomic_add_i32(addr, value):
-    ptr = fx.buffer_ops.create_llvm_ptr(addr, address_space=1)
-    return llvm.AtomicRMWOp(
+def _atomic_add_i32(tensor, value):
+    ptr = fx.to_llvm_ptr(fx.get_iter(tensor))
+    old = llvm.AtomicRMWOp(
         llvm.AtomicBinOp.add,
         ptr,
         arith._to_raw(value),
         llvm.AtomicOrdering.monotonic,
         syncscope="agent",
-    ).res
+        alignment=4,
+    ).result
+    return fx.Int32(old)
 
 
 def _recast_tensor(tensor, dtype):
@@ -187,17 +188,24 @@ def flydsl_moe_gemm_8wave_down_a8w4(
             (num_experts * n * scale_k_cols,),
             fx.Int32,
         )
-
-        def make_rsrc(ptr, num_bytes):
-            return buffer_ops.create_buffer_resource_from_addr(
-                arith.index_cast(T.i64, fx.ptrtoint(ptr)),
-                num_records_bytes=num_bytes,
-            )
-
-        input_scale_rsrc = make_rsrc(
+        input_scale_storage = _ptr_to_tensor(
             input_scales,
-            num_expert_blocks * fx.Int32(block_m * scale_k_cols),
+            (num_expert_blocks * fx.Int32(block_m * scale_k_cols),),
+            fx.Int32,
         )
+        input_scale_words = fx.make_view(
+            fx.get_iter(input_scale_storage),
+            fx.make_layout(
+                (64, scale_k_packs, block_m // 32, num_expert_blocks),
+                (
+                    1,
+                    scale_stride_k,
+                    scale_stride_m,
+                    (block_m // 32) * scale_stride_m,
+                ),
+            ),
+        )
+        task_counter_data = _ptr_to_tensor(task_counter, (4,), fx.Int32)
         a_mma_frag = fx.make_rmem_tensor(
             [8, num_mma_m, k_blocks], fx.Int32
         )
@@ -222,9 +230,7 @@ def flydsl_moe_gemm_8wave_down_a8w4(
         running = fx.Boolean(True)
         while running:
             if tid == fx.Int32(0):
-                lds_task_id[0] = fx.Int32(
-                    _atomic_add_i32(fx.ptrtoint(task_counter), fx.Int32(1))
-                )
+                lds_task_id[0] = _atomic_add_i32(task_counter_data, fx.Int32(1))
             fx.barrier()
             task = lds_task_id[0]
             blk_m = task // fx.Int32(num_oc_splits)
@@ -287,22 +293,17 @@ def flydsl_moe_gemm_8wave_down_a8w4(
                 # Packed E8M0 layout: (M/32, ceil((K/32)/8), 4, 16).
                 for mi in range_constexpr(num_mma_m):
                     m16 = m_wave_base // fx.Int32(16) + fx.Int32(mi)
-                    a_scale_m = blk_m * fx.Int32(block_m // 32) + m16 // fx.Int32(2)
                     a_scale_shift = (m16 % fx.Int32(2)) * fx.Int32(8)
                     for kp in range_constexpr(scale_k_packs):
-                        scale_idx = (
-                            a_scale_m * fx.Int32(scale_stride_m)
-                            + fx.Int32(kp * scale_stride_k)
-                            + lane
+                        a_scale_words[mi, kp] = (
+                            input_scale_words[
+                                lane,
+                                kp,
+                                m16 // fx.Int32(2),
+                                blk_m,
+                            ]
+                            >> a_scale_shift
                         )
-                        a_scale_words[mi, kp] = fx.Int32(
-                            buffer_ops.buffer_load(
-                                input_scale_rsrc,
-                                scale_idx,
-                                vec_width=1,
-                                dtype=T.i32,
-                            )
-                        ) >> a_scale_shift
 
                 weight_expert_byte = expert * fx.Int32(n * k // 2)
                 weight_split_byte = blk_oc * fx.Int32(n_split * k // 2)
