@@ -11,6 +11,10 @@ from aiter.jit.utils.chip_info import get_gfx
 import argparse
 import pandas as pd
 import logging
+import os
+import functools
+import importlib.util
+from pathlib import Path
 
 from aiter.fused_moe import (
     fused_topk,
@@ -26,13 +30,67 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
 )
 
+# Only time the outer fused MoE by default; nested cudaPerf adds synchronization.
+os.environ.setdefault("CUDAPERF", "0")
 import pyhip
 from pyhip import calc_diff
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 pyhip.set_device()
 
-def generate_data(total_token, num_global_expert, num_local_expert, model_dim, topk, dtype):
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_stage1_module():
+    path = (
+        Path(__file__).resolve().parents[2] / "flydsl/a8w4_moe/test_fp8_stage1_giu1.py"
+    )
+    spec = importlib.util.spec_from_file_location("fp8_blockscale_stage1", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_flydsl_stage1_kernels = {}
+
+
+def flydsl_moe_stage1(
+    a1, w1, a1_scale, w1_scale, sorted_ids, sorted_expert_ids, num_valid_ids, a2
+):
+    token_num, model_dim = a1.shape
+    _, topk, inter_dim = a2.shape
+    E = w1.shape[0]
+    # Only launch valid expert blocks, not the sort buffer's unused capacity.
+    num_e_blocks = int(num_valid_ids[0].item()) // 256
+    module = _flydsl_stage1_module()
+    module.validate_parameters(token_num, inter_dim, model_dim, topk, E)
+    args = (
+        a1.view(torch.int8),
+        w1.view(torch.int8),
+        a1_scale.view(model_dim // 128, token_num),
+        w1_scale,
+        sorted_ids[: num_e_blocks * 256],
+        sorted_expert_ids[:num_e_blocks],
+        num_valid_ids,
+        a2.view(-1),
+        token_num,
+        num_e_blocks,
+        torch.cuda.current_stream(),
+    )
+    key = (a1.device, token_num, model_dim, inter_dim, E, topk, num_e_blocks)
+    if key not in _flydsl_stage1_kernels:
+        launcher = module.compile_fp8_stage1_giu1(inter_dim, model_dim, topk, E)
+        _flydsl_stage1_kernels[key] = module.flyc.compile[{"opt_level": 2}](
+            launcher, *args
+        )
+        print(f"FlyDSL FP8 blockscale stage1: {key}", flush=True)
+    _flydsl_stage1_kernels[key](*args)
+    return a2
+
+
+def generate_data(
+    total_token, num_global_expert, num_local_expert, model_dim, topk, dtype
+):
     total_x = torch.randn((total_token, model_dim), dtype=dtype)
     score = torch.randn((total_token, num_global_expert), dtype=dtype)
     total_topk_weights, total_topk_ids = fused_topk(total_x, score, topk, True)
@@ -42,6 +100,7 @@ def generate_data(total_token, num_global_expert, num_local_expert, model_dim, t
     input_x = total_x[selected_indices]
     topk_weights = total_topk_weights[selected_indices]
     return input_x, topk_ids, topk_weights
+
 
 @benchmark()
 def do_test_fmoe(
@@ -75,10 +134,12 @@ def do_test_fmoe(
         E = num_local_expert
         # ensure each EP rank get roughly same number of tokens
         total_token = token * ep_size
-        input, topk_ids, topk_weights = generate_data(total_token, num_global_expert, num_local_expert, model_dim, topk, dtype)
+        input, topk_ids, topk_weights = generate_data(
+            total_token, num_global_expert, num_local_expert, model_dim, topk, dtype
+        )
         token = input.shape[0]
         expert_mask = torch.zeros(size=(num_global_expert,), dtype=torch.int32)
-        expert_mask[:num_local_expert] = 1        
+        expert_mask[:num_local_expert] = 1
     else:
         num_global_expert = E
         num_local_expert = E
@@ -220,19 +281,19 @@ def do_test_fmoe(
         #   each 4 e8m0 scales are interleaved & packed into a u32
         #       2x2 16x128 => 2x2 16x4 => (2*16)x(2*4) e8m0-scales
         """
-            m, n = scale.shape
-            scale_padded = torch.empty(
-                (m + 255) // 256 * 256,
-                (n + 7) // 8 * 8,
-                dtype=scale.dtype,
-                device=scale.device,
-            )
-            scale_padded[:m, :n] = scale
-            scale = scale_padded
-            sm, sn = scale.shape
-            scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
-            scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()   # sm//32, sn//8, [(4n,16m), (2n,2m)]
-            scale = scale.view(sm, sn)
+        m, n = scale.shape
+        scale_padded = torch.empty(
+            (m + 255) // 256 * 256,
+            (n + 7) // 8 * 8,
+            dtype=scale.dtype,
+            device=scale.device,
+        )
+        scale_padded[:m, :n] = scale
+        scale = scale_padded
+        sm, sn = scale.shape
+        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
+        scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()   # sm//32, sn//8, [(4n,16m), (2n,2m)]
+        scale = scale.view(sm, sn)
         """
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
@@ -243,9 +304,27 @@ def do_test_fmoe(
         if qType == aiter.QuantType.per_128x128:
             # use dequantized weights to get more accurate reference results
             NUM_EXPERTS, OC, IC = w1_qt.shape
-            w1_ref = (w1_qt.view(NUM_EXPERTS, OC//128, 128, IC//128, 128).to(w1_scale.dtype) * w1_scale.view(NUM_EXPERTS, OC//128, 1, IC//128, 1)).view(NUM_EXPERTS, OC, IC).to(input.dtype)
+            w1_ref = (
+                (
+                    w1_qt.view(NUM_EXPERTS, OC // 128, 128, IC // 128, 128).to(
+                        w1_scale.dtype
+                    )
+                    * w1_scale.view(NUM_EXPERTS, OC // 128, 1, IC // 128, 1)
+                )
+                .view(NUM_EXPERTS, OC, IC)
+                .to(input.dtype)
+            )
             NUM_EXPERTS, OC, IC = w2_qt.shape
-            w2_ref = (w2_qt.view(NUM_EXPERTS, OC//128, 128, IC//128, 128).to(w2_scale.dtype) * w2_scale.view(NUM_EXPERTS, OC//128, 1, IC//128, 1)).view(NUM_EXPERTS, OC, IC).to(input.dtype)
+            w2_ref = (
+                (
+                    w2_qt.view(NUM_EXPERTS, OC // 128, 128, IC // 128, 128).to(
+                        w2_scale.dtype
+                    )
+                    * w2_scale.view(NUM_EXPERTS, OC // 128, 1, IC // 128, 1)
+                )
+                .view(NUM_EXPERTS, OC, IC)
+                .to(input.dtype)
+            )
         else:
             w1_ref = w1
             w2_ref = w2
@@ -332,7 +411,7 @@ def do_test_fmoe(
         num_iters=5,
         num_warmup=2,
         num_copies=1,
-        num_verbose=1
+        num_verbose=1,
     )
     if out2_ref is not None:
         err = checkAllclose(
@@ -349,29 +428,52 @@ def do_test_fmoe(
             return 1 - sim
         """
         logits_diff = calc_diff(out2_ref, out2_ck)
-        if logits_diff > 1e-3:
-            logging.warning(
-                f"logits_diff: {logits_diff} is too large, please check the implementation"
-            )
+        if diff_thr is not None and diff_thr > 0:
+            assert logits_diff < diff_thr, f"{logits_diff=} must be < {diff_thr}"
     else:
         logits_diff = -1
 
     return {"us": us2, "logits_diff": logits_diff}
 
+
 import pytest
-@pytest.mark.parametrize("dtype",[dtypes.bf16])
-@pytest.mark.parametrize("num_tokens",[1, 32, 64, 128, 256, 512, 1024, 2048, 16000, 32000, 64000, 128000])
-@pytest.mark.parametrize("model_dim, inter_dim, expert, topk,", [(4096, 128, 400, 20), (4096, 1536, 400, 20)])
+
+
+@pytest.mark.parametrize("dtype", [dtypes.bf16])
+@pytest.mark.parametrize(
+    "num_tokens", [1, 32, 64, 128, 256, 512, 1024, 2048, 16000, 32000, 64000, 128000]
+)
+@pytest.mark.parametrize(
+    "model_dim, inter_dim, expert, topk,", [(4096, 128, 400, 20), (4096, 1536, 400, 20)]
+)
 @pytest.mark.parametrize("act_type", [aiter.ActivationType.Silu])
-@pytest.mark.parametrize("quant_type, aq_dtype, wq_dtype", [
-    (aiter.QuantType.No, None, None),
-    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8)
-])
+@pytest.mark.parametrize(
+    "quant_type, aq_dtype, wq_dtype",
+    [
+        (aiter.QuantType.No, None, None),
+        (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),
+    ],
+)
 @pytest.mark.parametrize("preshuffle", [True, False])
 @pytest.mark.parametrize("ep_size", [1])
 @pytest.mark.parametrize("diff_thr", [0.001])
 @pytest.mark.parametrize("method", ["auto"])
-def test_fmoe(dtype, num_tokens, model_dim, inter_dim, expert, topk, act_type, quant_type, aq_dtype, wq_dtype, preshuffle, ep_size, diff_thr, method):
+def test_fmoe(
+    dtype,
+    num_tokens,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    act_type,
+    quant_type,
+    aq_dtype,
+    wq_dtype,
+    preshuffle,
+    ep_size,
+    diff_thr,
+    method,
+):
     if get_gfx() == "gfx942":
         pytest.skip(f"Skipping test_fmoe on gfx942")
 
@@ -379,28 +481,30 @@ def test_fmoe(dtype, num_tokens, model_dim, inter_dim, expert, topk, act_type, q
     global fused_moe_impl
     from pyhip.contrib.fused_moe import fused_moe as fused_moe_asmjit
     import functools
+
     fused_moe_impl = functools.partial(fused_moe_asmjit, method="jit")
     ret = do_test_fmoe(
-                dtype,
-                num_tokens,
-                model_dim,
-                inter_dim,
-                expert,
-                topk,
-                act_type,
-                quant_type,
-                aq_dtype,
-                wq_dtype,
-                use_g1u1=True,
-                doweight_stage1=doweight_stage1,
-                preshuffle=preshuffle,
-                diff_thr=diff_thr,
-                ep_size=ep_size,
-            )
+        dtype,
+        num_tokens,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        act_type,
+        quant_type,
+        aq_dtype,
+        wq_dtype,
+        use_g1u1=True,
+        doweight_stage1=doweight_stage1,
+        preshuffle=preshuffle,
+        diff_thr=diff_thr,
+        ep_size=ep_size,
+    )
     del ret
     import gc
+
     gc.collect()
-    torch.cuda.empty_cache() 
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
@@ -436,7 +540,6 @@ if __name__ == "__main__":
     # l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
     l_hidden_intermediate_pad = [(0, 0), (192, 128), (129, 191)][1:2]
     l_preshuffle = [False, True]
-
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -570,22 +673,25 @@ if __name__ == "__main__":
         def __call__(self, parser, namespace, values, option_string=None):
             global fused_moe_impl
             from pyhip.contrib.fused_moe import fused_moe as fused_moe_asmjit
-            fused_moe_impl = fused_moe_asmjit
+
+            fused_moe_impl = functools.partial(
+                fused_moe_asmjit, method="jit", stage1_impl=flydsl_moe_stage1
+            )
             setattr(namespace, self.dest, True)
 
     parser.add_argument(
         "-j",
         "--jit",
-        nargs = 0,
+        nargs=0,
         action=UseJitAction,
-        help="use jit."
+        help="use FlyDSL FP8 blockscale stage1 + PyHIP; unsupported paths keep the original implementation.",
     )
 
     parser.add_argument(
         "-diff",
         type=float,
-        default=0.001,
-        help="diff threshold."
+        default=0.01,
+        help="calc_diff threshold (strictly less); <=0 disables this assertion.",
     )
 
     #########################################################################################################################
@@ -714,7 +820,7 @@ if __name__ == "__main__":
                             doweight_stage1=doweight_stage1,
                             preshuffle=preshuffle,
                             diff_thr=None if args.diff < 0 else args.diff,
-                            ep_size=args.ep
+                            ep_size=args.ep,
                         )
                         df.append(ret)
     time_us = float(df[-1]["us"])
