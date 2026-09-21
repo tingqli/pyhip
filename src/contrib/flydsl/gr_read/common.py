@@ -25,12 +25,15 @@ def validate_rows(rows):
 
 
 def select_n_splits(rows, compute_units):
-    """Select Up N splits using calibrated CTA rounds, including N10/N20 for small batches."""
+    """Select N40 for calibrated tiny batches, otherwise use the existing CTA-round model."""
     validate_rows(rows)
     if not isinstance(compute_units, int) or isinstance(compute_units, bool) or compute_units <= 0:
         raise ValueError("compute_units must be a positive integer")
     if rows == 0:
         return 8
+    # 80CU的32..512行同址对照支持单H64组；1024开始回退，不推广到更大batch。
+    if compute_units == 80 and rows <= 512:
+        return 40
     m_tiles = (rows + BLOCK_M - 1) // BLOCK_M
     costs = _SMALL_UP_ROUND_COST if compute_units == 80 and rows <= 4096 else _ROUND_COST
     return min(costs, key=lambda item: ((m_tiles * item[0] + compute_units - 1) // compute_units) * item[1])[0]
@@ -49,13 +52,13 @@ def select_down_n_splits(rows, compute_units):
 
 
 def select_down_config(rows, compute_units):
-    """Return (block_m, num_waves, n_splits) without runtime autotuning."""
+    """Return (block_m, num_waves, n_splits, block_k) without runtime autotuning."""
     n_splits = select_down_n_splits(rows, compute_units)
-    # 80CU同址实测512/1024支持M32/W4/N5；区间内插值不代表每个行数都实测最优。
-    # 2048无稳定收益，其余batch和未校准CU配置沿用M64，不推广两wave候选。
-    if compute_units == 80 and 0 < rows <= 1024:
-        return 32, 4, 5
-    return 64, 4, n_splits
+    # 80CU同址32..2048的BK128优于正式基线；中间行数是插值，非逐shape最优保证。
+    # 4096/8192保留M64的数据复用；其它CU仍用原M64/BK64模型。
+    if compute_units == 80 and 0 < rows <= 2048:
+        return 32, 4, 5, 128
+    return 64, 4, n_splits, 64
 
 
 def preshuffle_weight(weight):

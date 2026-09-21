@@ -16,12 +16,13 @@ GROUPS = K // BK // GROUP_STEPS
 
 
 @cache
-def make_down(*, n_splits=1, block_m=64, num_waves=4):
+def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64):
     """Specialize by tile shape; the launcher receives the actual rows at runtime.
 
     N1/N2/N4/N5 cover disjoint 320/160/80/64-channel slices without split-K or reduction launches.
     N5 also supports M32 with two/four waves and M16 with two waves.
-    Automatic dispatch selects M32/W4/N5 for calibrated small batches, otherwise M64/W4/N1 or N2.
+    Automatic dispatch selects M32/W4/N5/BK128 for calibrated small batches.
+    Other batches retain M64/W4/N1 or N2 with BK64 and full K10240 reduction.
     Two-wave tiles remain explicit experimental candidates, not automatic choices.
     Callers must provide positive rows and P[rows, R]; tail stores are bounded by the actual row count.
     """
@@ -31,14 +32,20 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4):
         raise ValueError("expected M64/W4, M32/W4, M32/W2 or M16/W2")
     if block_m != 64 and n_splits != 5:
         raise ValueError("small-M tiles currently require n_splits=5")
+    if block_k not in (64, 128):
+        raise ValueError("block_k must be 64 or 128")
+    if block_k != 64 and (block_m, num_waves, n_splits) != (32, 4, 5):
+        raise ValueError("BK128 currently requires M32/W4/N5")
     BM = block_m
+    BK = block_k
+    GROUPS = K // BK // GROUP_STEPS
     THREADS = num_waves * 64
     BN = R // n_splits
     N_WAVES, M_WAVES = ({1: (4, 1), 2: (2, 2), 4: (1, 4), 5: (4, 1)}[n_splits]
                         if BM == 64 else (num_waves, 1))
     A_REQUESTS = BM * BK // (THREADS * 8)
-    A_LDS_READS = BM // M_WAVES // 8
-    VMEM_REQUESTS = A_REQUESTS + BN // N_WAVES // 8
+    A_LDS_READS = BM // M_WAVES // 8 * (BK // 64)
+    VMEM_REQUESTS = A_REQUESTS + BN // N_WAVES // 8 * (BK // 64)
     STAGE_MFMA = BM // (16 * M_WAVES) * (BN // (16 * N_WAVES)) * (BK // 16)
 
     @fx.struct

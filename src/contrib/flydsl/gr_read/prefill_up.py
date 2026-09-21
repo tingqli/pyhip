@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""GRRead Up N2/N4/N8/N10/N20 with cooperative X128 loads and two-stage W prefetch.
+"""GRRead Up N2/N4/N8/N10/N20/N40 with cooperative X128 loads and two-stage W prefetch.
 
 X/P loads and Y stores use NT; W uses the default policy. P is BF16 with full K320 and FP32 logits.
 The four streams for each H64 use the original FMA order and the integer BF16 output helper.
@@ -37,6 +37,8 @@ SUB_WAITS = (
     ((1, 3), (3, 4), (2, 3), (3, 4), (2, 3), (3, 4), (2, 3), (3, 4)),
     ((2, 3), (4, 5), (3, 4), (4, 5), (3, 4), (3, 4), (2, 3), (3, 4)),
     ((2, 3), (4, 5), (3, 4), (4, 5), (3, 4), (3, 4), (2, 0), (0, 0)),
+    # N40单组：没有旧Y写出，前六拍沿用FIRST；末两拍停止W/X预取并排空。
+    ((1, 3), (3, 4), (2, 3), (3, 4), (2, 3), (3, 4), (2, 0), (0, 0)),
 )
 
 
@@ -67,9 +69,10 @@ def make_up(*, n_splits):
     Runtime rows share one artifact across full tiles and tails; the grid covers actual rows only.
     Callers must provide positive rows and X/P/Y storage covering all actual rows.
     Automatic dispatch includes N10/N20 for calibrated small batches and retains N2/N4/N8 elsewhere.
+    N40 is selected for calibrated batches up to 512 rows on 80-CU devices.
     """
-    if n_splits not in (2, 4, 8, 10, 20):
-        raise ValueError('n_splits must be 2, 4, 8, 10 or 20')
+    if n_splits not in (2, 4, 8, 10, 20, 40):
+        raise ValueError('n_splits must be 2, 4, 8, 10, 20 or 40')
     N_SPLITS = n_splits
     PACKETS = K // 32 // N_SPLITS
     GROUPS = PACKETS // GROUP_STEPS
@@ -190,7 +193,7 @@ def make_up(*, n_splits):
                     if const_expr(first and step == 0 and h16 == 0):
                         _priority(0)
                     _schedule_boundary()
-                    rocdl.s_waitcnt(vmcnt=SUB_WAITS[0 if first else 2 if last else 1][step][h16])
+                    rocdl.s_waitcnt(vmcnt=SUB_WAITS[3 if first and last else 0 if first else 2 if last else 1][step][h16])
                     if const_expr(step % 2 == 0 and (not first or step > 0)):
                         if const_expr(h16 == 0):
                             x_previous = [_ds_read(x_read, 1024 + mi * 1024) for mi in range_constexpr(2)]
@@ -311,7 +314,7 @@ def make_up(*, n_splits):
             [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range_constexpr(4)],
             [fx.Vector.filled(4, 0, fx.Int32) for _ in range_constexpr(2)], x_pair_g2r,
             [fx.Float32(0.0) for _ in range_constexpr(32)],
-            [fx.Int32(0) for _ in range_constexpr(8)], first=True, x_initial=x_initial)
+            [fx.Int32(0) for _ in range_constexpr(8)], first=True, last=GROUPS == 1, x_initial=x_initial)
 
         def save(state):
             b, c, x, xn, totals, y = state
@@ -325,14 +328,18 @@ def make_up(*, n_splits):
                     [fx.Float32(values[i]) for i in range_constexpr(13, 45)],
                     [fx.Int32(values[i]) for i in range_constexpr(45, 53)])
 
-        if const_expr(GROUPS > 2):
-            for g, values in range(fx.Index(1), fx.Index(GROUPS - 1), fx.Index(1), init=save(state)):
-                state = run_group(fx.Int32(g), *restore(values))
-                result = yield save(state)
+        if const_expr(GROUPS == 1):
+            # N40的同一组只执行一次，直接将最后packet的状态交给公共drain。
+            _, c_previous, x_previous, _, totals, y = state
         else:
-            # N20仅有FIRST和LAST两组；直接传递FIRST状态，不生成空稳态循环。
-            result = save(state)
-        _, c_previous, x_previous, _, totals, y = run_group(fx.Int32(GROUPS - 1), *restore(result), last=True)
+            if const_expr(GROUPS > 2):
+                for g, values in range(fx.Index(1), fx.Index(GROUPS - 1), fx.Index(1), init=save(state)):
+                    state = run_group(fx.Int32(g), *restore(values))
+                    result = yield save(state)
+            else:
+                # N20仅有FIRST和LAST两组；直接传递FIRST状态，不生成空稳态循环。
+                result = save(state)
+            _, c_previous, x_previous, _, totals, y = run_group(fx.Int32(GROUPS - 1), *restore(result), last=True)
         if group == 0:
             _barrier()
         _priority(0)
