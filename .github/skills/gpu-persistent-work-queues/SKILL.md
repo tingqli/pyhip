@@ -48,7 +48,7 @@ $$T_h=\max(0,\lceil(T-h)/X\rceil).$$
 
 ## 本仓库实现
 
-- [PyHIP全局claim](../../../src/contrib/moe_gemm_8wave.py#L833-L864)、[M256全局claim与独立width8](../../../tests/flydsl/moe_8w_down/moe_multistage_down.py#L188-L211)。
+- [PyHIP全局claim](../../../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L833-L864)、[M256全局claim与独立width8](../../../tests/flydsl/moe_8w_down/moe_multistage_down.py#L188-L211)。
 - [M128逻辑分片/单header claim](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L72-L98)。
 - [任务结束同步与末terminal自复位](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L369-L387)、[首次分配与私有状态](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L400-L436)。
 - [graph/shape生命周期与CPU交错回归](../../../tests/flydsl/moe_8w_down/test_blockscaled.py#L602-L681)。

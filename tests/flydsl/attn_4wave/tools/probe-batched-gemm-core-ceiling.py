@@ -29,8 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
-from pyhip.core.asmjit import JIT, jit
-from pyhip.core.hiptools import get_lib, hip_check_error
+from pyhip.codegen.asm.asmjit import JIT, jit
+from pyhip.runtime.hiptools import get_lib, hip_check_error
 
 VOID_POINTER = "void*"
 WAVE_SIZE = 64

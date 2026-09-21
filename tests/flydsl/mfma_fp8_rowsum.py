@@ -22,7 +22,7 @@ import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl._mlir.dialects import llvm
 
-import pyhip.contrib.flydsl.helpers as fxh
+import pyhip.codegen.flydsl.helpers as fxh
 
 fxh.dump_ir(True)
 

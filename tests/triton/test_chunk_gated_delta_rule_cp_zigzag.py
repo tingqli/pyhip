@@ -40,7 +40,7 @@ from sglang.srt.layers.attention.fla.chunk_o import chunk_fwd_o
 # from sglang.srt.layers.attention.fla.cp.chunk_cp_zigzag import (
 #     chunk_gated_delta_rule_fwd_cp_zigzag,
 # )
-from pyhip.contrib.triton.chunk_gated_delta_rule_cp_zigzag import (
+from pyhip.ops.attention.triton.chunk_gated_delta_rule_cp_zigzag import (
     chunk_gated_delta_rule_fwd_cp_zigzag,
 )
 

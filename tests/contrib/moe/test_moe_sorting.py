@@ -2,7 +2,7 @@ import pyhip
 import torch
 import aiter
 import pytest
-from pyhip.contrib.moe_sorting import moe_sorting
+from pyhip.ops.moe.asm.moe_sorting import moe_sorting
 
 def div_up(x, y):
     return (x + y - 1) // y

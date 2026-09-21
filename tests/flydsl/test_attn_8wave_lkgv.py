@@ -11,7 +11,7 @@ import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl._mlir.dialects import llvm
 
-import pyhip.contrib.flydsl.helpers as fxh
+import pyhip.codegen.flydsl.helpers as fxh
 
 #fxh.dump_ir(True)
 
@@ -24,7 +24,7 @@ pyhip.set_device()
 
 def _cvt_f32_to_bf16(c_frag):
     """f32 -> bf16:add 0x8000 舍入 + 截断(round-half-up),比 .to(fx.BFloat16) 的 RNE + NaN 处理少指令。
-    移植自 src/contrib/flydsl/moe_gemm_splitk.py::_cvt_f32_to_bf16。"""
+    移植自 src/pyhip/ops/moe/flydsl/moe_gemm_splitk.py::_cvt_f32_to_bf16。"""
     c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
     round_bit = fx.Uint32(0x8000)
     c_frag_bf16.store(

@@ -377,7 +377,7 @@ def test_fmoe(dtype, num_tokens, model_dim, inter_dim, expert, topk, act_type, q
 
     doweight_stage1 = False
     global fused_moe_impl
-    from pyhip.contrib.fused_moe import fused_moe as fused_moe_asmjit
+    from pyhip.ops.moe.fused_moe import fused_moe as fused_moe_asmjit
     import functools
     fused_moe_impl = functools.partial(fused_moe_asmjit, method="jit")
     ret = do_test_fmoe(
@@ -569,7 +569,7 @@ if __name__ == "__main__":
     class UseJitAction(argparse.Action):
         def __call__(self, parser, namespace, values, option_string=None):
             global fused_moe_impl
-            from pyhip.contrib.fused_moe import fused_moe as fused_moe_asmjit
+            from pyhip.ops.moe.fused_moe import fused_moe as fused_moe_asmjit
             fused_moe_impl = fused_moe_asmjit
             setattr(namespace, self.dest, True)
 

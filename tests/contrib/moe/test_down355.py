@@ -1,6 +1,6 @@
 import pyhip
 from pyhip import calc_diff
-from pyhip.contrib.moe_gemm_down_tp import moe_gemm_down_tp
+from pyhip.ops.moe.asm.moe_gemm_down_tp import moe_gemm_down_tp
 import torch
 
 import contextlib

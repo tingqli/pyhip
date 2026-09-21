@@ -15,8 +15,8 @@ from typing import Any, cast
 
 import torch
 
-from pyhip.core.asmjit import JIT, jit
-from pyhip.misc import cudaPerf
+from pyhip.codegen.asm.asmjit import JIT, jit
+from pyhip.testing.misc import cudaPerf
 
 BM = 128
 BN = 32

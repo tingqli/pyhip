@@ -20,7 +20,7 @@ from pathlib import Path
 
 import torch
 
-from pyhip.core.asmjit import JIT, jit
+from pyhip.codegen.asm.asmjit import JIT, jit
 
 REALTIME_HZ = 100_000_000
 REALTIME_TICKS_PER_MS = REALTIME_HZ // 1000

@@ -2,7 +2,7 @@ import pyhip
 import torch
 
 from pyhip import calc_diff
-from pyhip.contrib.moe_gemm_mxfp4 import *
+from pyhip.ops.moe.asm.moe_gemm_mxfp4 import *
 
 import aiter
 from aiter.utility import fp4_utils

@@ -6,7 +6,7 @@
 import torch
 
 from moe_multistage_reduce import make_moe_sum
-from pyhip.contrib.flydsl.moe_gemm_2stage.moe_reduce import invert_sorted_ids
+from pyhip.ops.moe.flydsl.moe_gemm_2stage.moe_reduce import invert_sorted_ids
 
 
 class DownReduceWorkspace:

@@ -1,5 +1,5 @@
 import pyhip
-from pyhip.contrib.gemm_cdna4 import *
+from pyhip.ops.gemm.asm.gemm_cdna4 import *
 import pytest
 import functools
 import torch

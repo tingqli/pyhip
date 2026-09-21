@@ -12,7 +12,7 @@ from aiter.ops.shuffle import shuffle_weight
 
 import pyhip
 
-import pyhip.contrib.flydsl as fxu
+import pyhip.codegen.flydsl as fxu
 
 # fxu.enable_dump_ir(True)
 

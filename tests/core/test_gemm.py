@@ -4,7 +4,7 @@ import functools
 import warnings
 import torch
 
-from pyhip.contrib.common.loaders import tb_swizzle
+from pyhip.codegen.asm.common.loaders import tb_swizzle
 
 """
 work-group协作，每次预取 wg_M * row_bytes 大小的内容到预取寄存器，写入LDS

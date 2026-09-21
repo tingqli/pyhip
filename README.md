@@ -1,6 +1,11 @@
 # pyhip
 
-PyHIP provides a one-stop toolkit for Python-based CDNA Assembly kernel development.
+PyHIP provides AMDGPU kernels implemented with assembly, HIP, FlyDSL, Triton,
+and Gluon, alongside the tools used to develop them. Kernels are installed as
+normal Python modules under `pyhip.ops`; assembly JIT is one backend, not a
+requirement for the other implementations.
+
+The assembly authoring tools retain the existing features:
 
  - Following Triton's design philosophy, kernels are described in Python with jit decorators triggering the compilation pipeline. The resulting kernels can be called directly and interact seamlessly with PyTorch.
  - No automatic spilling; any variable allocated with J.gpr is guaranteed to be mapped to physical registers.
@@ -17,6 +22,63 @@ Create [prebuilt Docker image with PyTorch pre-installed](https://rocm.docs.amd.
 pip install git+https://github.com/tingqli/pyhip.git
 # or clone the repo and run editable install with "pip install -e ."
 ```
+
+Install the compiler/runtime dependencies required by the selected implementation
+in the same environment (ROCm PyTorch, FlyDSL, Triton/Gluon, and Aiter where used).
+`import pyhip` does not import these optional backends or initialize a GPU.
+First calls may compile kernels; installing the package does not precompile every
+architecture or remove the corresponding compiler requirements.
+
+After updating from the old layout, reinstall an existing editable installation
+so that it points to `src/pyhip`, rather than the former `src` package root.
+
+# Package layout
+
+```text
+src/pyhip/
+    ops/                    # Installable kernels and their existing wrappers
+        gemm/                 # asm/, gluon/, multi-backend linear wrapper
+        moe/                  # asm/, flydsl/, gluon/, fused wrappers/reference
+        attention/            # asm/, triton/
+        conv/                 # Existing wrappers; hip/ contains packaged C++ sources
+        gr_read/flydsl/        # GRRead down/up projections
+        mlp/gluon/            # Fused MLP
+    codegen/                # Shared, language-specific authoring tools
+        asm/                  # Assembly JIT, IR/passes, allocator, common generators
+        flydsl/               # Layout, tiled-copy/MMA, and tensor helpers
+        gluon/                # Shared Gluon helpers
+    runtime/                # HIP source compilation, code-object loading/launch
+    testing/                # Timing and correctness helpers
+    tools/                  # Standalone code inspection and hardware probes
+tests/                    # Existing test locations and entry points are unchanged
+docs/                     # Usage and optimization notes
+```
+
+Import the implementation you need directly after either a wheel or editable
+installation; no test-directory `PYTHONPATH` is needed to use packaged kernels:
+
+```python
+from pyhip.ops.moe.fused_moe import fused_moe
+from pyhip.ops.moe.asm.moe import moe_2stage_splitk
+from pyhip.ops.moe.flydsl.moe_gemm_2stage import compile_moe_gemm1
+from pyhip.ops.conv.conv_depthwise import conv_depthwise_3d
+from pyhip.testing import run_perftest
+```
+
+Call signatures, kernel bodies, and tuning parameters are unchanged. Modules
+that already combine multiple backends stay together at the operation level;
+they are not split into a new dispatch framework. New implementations belong
+under the operation's backend package. Tests and benchmarks import those modules,
+never the reverse. Native sources live with the package and are included in both
+wheels and source distributions; compiled artifacts remain in the existing user
+caches, not the installation directory.
+
+The old `pyhip.contrib.*` and `pyhip.core.*` module paths have moved. Repository
+tests, examples, and source links use the new paths. The small root API remains:
+`pyhip.jit`, `pyhip.JIT`, `pyhip.module`, timing helpers, and lazy `pyhip.fly` /
+`pyhip.printv`. Shared FlyDSL authoring helpers are now `pyhip.codegen.flydsl`.
+The embedded-HIP entry point `python -m pyhip` is unchanged; standalone tools
+are available as `python -m pyhip.tools.exts` and `python -m pyhip.tools.probe`.
 
 # Usage - Assembly kernels
 

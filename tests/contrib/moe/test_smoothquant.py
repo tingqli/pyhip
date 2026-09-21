@@ -13,8 +13,8 @@ import os
 os.environ["PYHIP_SIMPLE_GEN_FILENAME"] = "1"
 
 import pyhip
-from pyhip.core.asmjit import JIT
-from pyhip.contrib.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
+from pyhip.codegen.asm.asmjit import JIT
+from pyhip.ops.moe.asm.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
 import pytest
 import gc
 

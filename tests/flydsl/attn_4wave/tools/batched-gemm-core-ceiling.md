@@ -16,7 +16,7 @@ Black/Ruff机械格式化，并把内聚occupancy helper的返回值对齐来源
 `f277294969e170a47b81ecb331ed3eca6f2f8e7cbd3f21b2e3d151f6b7664721`。
 
 本次只移植该探针：未移植原提交中的生产profile、TODO或wave-stage工具，也未修改
-`src/core/asmjit.py`。当前文件内聚了原探针依赖的GPU状态、统计和occupancy helper，
+`src/pyhip/codegen/asm/asmjit.py`。当前文件内聚了原探针依赖的GPU状态、统计和occupancy helper，
 并只对自身JIT compile key做哈希缩短。
 
 ## 模型边界

@@ -1,7 +1,7 @@
 
 import torch
 import pyhip
-from pyhip.contrib.w8a8_block_fp8_linear import *
+from pyhip.ops.gemm.w8a8_block_fp8_linear import *
 import aiter
 from aiter import dtypes, get_hip_quant
 from aiter.ops.shuffle import shuffle_weight

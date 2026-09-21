@@ -18,7 +18,7 @@ import flydsl
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm, vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
-import pyhip.contrib.flydsl as fxu
+import pyhip.codegen.flydsl as fxu
 
 if 0:
     make_tiled_copy = fxu.make_tiled_copy

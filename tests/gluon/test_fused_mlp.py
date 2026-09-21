@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from functools import cache
 
-from pyhip.contrib.gluon.fused_mlp import mlp_fused_gate_up
+from pyhip.ops.mlp.gluon.fused_mlp import mlp_fused_gate_up
 
 #####################################################################
 from pyhip import cudaPerf, calc_diff

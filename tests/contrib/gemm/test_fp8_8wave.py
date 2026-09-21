@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import pyhip
 import pytest
-from pyhip.contrib.gemm_fp8 import *
+from pyhip.ops.gemm.asm.gemm_fp8 import *
 
 
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )

@@ -7,8 +7,8 @@ import argparse
 
 import pyhip
 
-from pyhip.contrib.conv_depthwise import *
-from pyhip.contrib.conv_pointwise import *
+from pyhip.ops.conv.conv_depthwise import *
+from pyhip.ops.conv.conv_pointwise import *
 
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.manual_seed(0)

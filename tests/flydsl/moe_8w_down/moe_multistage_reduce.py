@@ -12,7 +12,7 @@ from flydsl._mlir import ir
 from flydsl.expr import range_constexpr, rocdl
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from pyhip.contrib.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as _ptr
+from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as _ptr
 from moe_multistage_down import _scalar
 
 

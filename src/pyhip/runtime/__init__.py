@@ -1,0 +1,1 @@
+"""HIP compilation, module loading, and kernel launch helpers."""

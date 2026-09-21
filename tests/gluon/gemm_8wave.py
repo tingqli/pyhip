@@ -16,7 +16,7 @@ from triton.experimental.gluon.language.amd.cdna3 import (
     sched_group_barrier as _amd_iglp_sched_group_barrier, s_set_prio as _amd_iglp_sched_set_prio
 )
 
-from pyhip.contrib.gluon.utils import read_cycle, read_realtime, get_cu_id
+from pyhip.codegen.gluon.utils import read_cycle, read_realtime, get_cu_id
 from common.utils import gen_timing
 
 SHUFFLE = 1

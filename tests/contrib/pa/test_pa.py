@@ -1,6 +1,6 @@
 import pyhip
 from pyhip import div_up
-from pyhip.contrib.pa import *
+from pyhip.ops.attention.asm.pa import *
 import torch
 
 def test():

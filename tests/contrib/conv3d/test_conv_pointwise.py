@@ -1,5 +1,5 @@
 import torch
-from pyhip.contrib.conv_pointwise import *
+from pyhip.ops.conv.conv_pointwise import *
 import pyhip
 
 torch.set_default_device("cuda")

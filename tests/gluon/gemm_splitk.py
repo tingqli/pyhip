@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from functools import cache
 
-from pyhip.contrib.gluon.gemm_splitk import gemm_splitk_kernel
+from pyhip.ops.gemm.gluon.gemm_splitk import gemm_splitk_kernel
 
 #####################################################################
 from pyhip import cudaPerf

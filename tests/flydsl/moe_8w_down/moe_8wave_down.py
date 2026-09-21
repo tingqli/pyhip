@@ -15,8 +15,8 @@ from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from pyhip.contrib.flydsl import helpers as fxh
-from pyhip.contrib.flydsl.moe_gemm_2stage.common import (
+from pyhip.codegen.flydsl import helpers as fxh
+from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import (
     torch_tensor_to_pointer as _ptr,
 )
 

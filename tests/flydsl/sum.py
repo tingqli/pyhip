@@ -10,7 +10,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 
 import pyhip
 
-import pyhip.contrib.flydsl as fxu
+import pyhip.codegen.flydsl as fxu
 
 _, stream = pyhip.set_device()
 
@@ -83,7 +83,7 @@ def test_sum_dim(L, M, N, dtype):
     assert torch.allclose(ref, ret, atol=1e-3), f"A.sum(1)={ref}  B = {ret}"
 
     # compare with pyhip-jit
-    from pyhip.contrib.moe_gemm_mxfp4 import moe_gemm_final_reduce_bf16
+    from pyhip.ops.moe.asm.moe_gemm_mxfp4 import moe_gemm_final_reduce_bf16
 
     num_tokens_total = L
     num_CU = 80

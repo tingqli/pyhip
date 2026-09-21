@@ -91,7 +91,7 @@ def dependencies():
     import torch
     import torch.nn.functional as F
     import flydsl.compiler as flyc
-    from pyhip.misc import cudaPerf
+    from pyhip.testing.misc import cudaPerf
     if torch.version.hip is None or not torch.cuda.is_available():
         raise RuntimeError("ROCm GPU required")
     props = torch.cuda.get_device_properties(0)
@@ -111,11 +111,11 @@ def dependencies():
 def prepare_gr_read(x, w_down, w_up):
     """Prepare shuffled weights, buffers, and compiled launches for this input."""
     torch, flyc, _, _ = dependencies()
-    from pyhip.contrib.flydsl.gr_read.common import (
+    from pyhip.ops.gr_read.flydsl.common import (
         K, preshuffle_weight, select_down_config, select_n_splits, validate_rows,
     )
-    from pyhip.contrib.flydsl.gr_read.prefill_down import make_down
-    from pyhip.contrib.flydsl.gr_read.prefill_up import make_up
+    from pyhip.ops.gr_read.flydsl.prefill_down import make_down
+    from pyhip.ops.gr_read.flydsl.prefill_up import make_up
 
     rows = x.shape[0]
     validate_rows(rows)

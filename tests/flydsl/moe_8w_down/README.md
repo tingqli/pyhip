@@ -20,14 +20,14 @@
 
 ### PyHIP已经有的机制——不能算成新增
 
-以[真正的基线调用](test_blockscaled.py#L71-L86)为准，进入的是[PyHIP down](../../../src/contrib/moe_gemm_8wave.py#L781-L864)，不是同文件的gate/up函数。
+以[真正的基线调用](test_blockscaled.py#L71-L86)为准，进入的是[PyHIP down](../../../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L781-L864)，不是同文件的gate/up函数。
 
 - 全局`atomicAdd(1)`领任务，LDS向整个CTA广播，任务内复用A寄存器片段。
 - FP8原生MFMA16×16×128，K128独立scale，FP32乘法/FMA后routing乘法。
 - B权重pre-shuffle、直接global→LDS、四个B槽，以及8 waves分成4＋4错相执行Memory/Compute。
 - BF16 conversion和`permlane16_swap`在寄存器中完成；**原基线也没有C LDS shuffle**。
 
-代码：[A加载与四槽B DMA](../../../src/contrib/moe_gemm_8wave.py#L869-L947)、[FP8 MFMA/反量化/打包](../../../src/contrib/moe_gemm_8wave.py#L969-L1077)、[错相流水](../../../src/contrib/moe_gemm_8wave.py#L1121-L1225)。默认`M256/8 waves`每wave是32行，`nrM=2`；不能照搬源码中遗留的`nrM=4`注释。
+代码：[A加载与四槽B DMA](../../../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L869-L947)、[FP8 MFMA/反量化/打包](../../../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L969-L1077)、[错相流水](../../../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1121-L1225)。默认`M256/8 waves`每wave是32行，`nrM=2`；不能照搬源码中遗留的`nrM=4`注释。
 
 本测试的PyHIP输出为`[tokens, TOPK, N]` routed BF16，最终使用[预分配Torch sum](test_blockscaled.py#L89-L112)。源码里另有手写reduce函数，但**本基线没有调用它**。
 
@@ -71,7 +71,7 @@ PyHIP沿原token/slot写routed行；同wave的相邻排序行可能落在不相�
 2. 256线程、2048列/CTA，提前读TOPK位置和片段，FP32顺序累加后转BF16。
 3. 没有额外的“先restore成routed再sum”中间步骤；但inverse和gather本身有成本，必须计入Full。
 
-代码：[inverse有效前缀](../../../src/contrib/flydsl/moe_gemm_2stage/moe_reduce.py#L110-L136)、[packed reducer](moe_multistage_reduce.py#L20-L59)、[共享pipeline](moe_multistage_pipeline.py#L34-L82)。
+代码：[inverse有效前缀](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/moe_reduce.py#L110-L136)、[packed reducer](moe_multistage_reduce.py#L20-L59)、[共享pipeline](moe_multistage_pipeline.py#L34-L82)。
 
 若排序位置为l、输出列为j、Block M为B，则packed元素索引为：
 
@@ -85,7 +85,7 @@ M256的[输出descriptor](moe_multistage_down.py#L239-L244)现在按M块重建�
 
 ### 2.4 明确B/C的cache policy，保持原数值顺序
 
-四个新case的B DMA均为aux16／SC1；M256输出aux2／NT，M128输出aux18／SC1+NT。专用reduce中间读取aux2／NT，最终输出aux0。PyHIP基线的[Buffer load默认未加SC1](../../../src/core/asmjit.py#L672-L684)，[store调用没有NT扩展标志](../../../src/contrib/moe_gemm_8wave.py#L1099-L1110)。这些是当前实测选择，不是通用“开NT就快”的规则。
+四个新case的B DMA均为aux16／SC1；M256输出aux2／NT，M128输出aux18／SC1+NT。专用reduce中间读取aux2／NT，最终输出aux0。PyHIP基线的[Buffer load默认未加SC1](../../../src/pyhip/codegen/asm/asmjit.py#L672-L684)，[store调用没有NT扩展标志](../../../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1099-L1110)。这些是当前实测选择，不是通用“开NT就快”的规则。
 
 四个case仍保持：K128 partial分别缩放→第二项FP32 FMA→routing乘法→每route BF16 RNE→TOPK FP32 sum→最终BF16。没有把scale/routing重结合，也没有在BF16舍入前跨route求和。代码：[M256显式FMA](moe_multistage_down.py#L377-L383)、[M128显式FMA](moe_multistage_down_m128.py#L295-L302)、[严格相消回归](test_blockscaled.py#L515-L555)。
 

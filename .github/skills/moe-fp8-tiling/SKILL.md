@@ -5,11 +5,11 @@ description: 'Use when optimizing gfx942 FlyDSL MoE 8x1 K192/K320 or BK128 tilin
 
 # MoE FP8分块与compact尾块
 
-目标：按实际有效工作量、专家分布和完整调用成本选择分块，而不是把单CTA吞吐当作全链性能。这里针对[FlyDSL两阶段MoE](../../../src/contrib/flydsl/moe_gemm_2stage/README.md)；不要直接套用gfx950块量化或GRRead的数值规则。
+目标：按实际有效工作量、专家分布和完整调用成本选择分块，而不是把单CTA吞吐当作全链性能。这里针对[FlyDSL两阶段MoE](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md)；不要直接套用gfx950块量化或GRRead的数值规则。
 
 ## 1. 先核实现行支持范围
 
-从[dispatcher](../../../src/contrib/flydsl/moe_gemm_2stage/gemm2.py)与[8x1 builder](../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py)读取真实约束：
+从[dispatcher](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2.py)与[8x1 builder](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py)读取真实约束：
 
 - 当前Down路径为`default`、`1x4_64x256`、`8x1`、`8x1_compact`。旧分支名称和历史调参开关不是现行API。
 - 此8x1是M256/N128、512线程，FP8 E4M3FNUZ输入/权重、BF16输出；支持K192/256/320/384/512/640，N为正的128倍数。
@@ -42,7 +42,7 @@ $$
 
 ## 4. compact任务表的正确性条件
 
-参考[compact实现](../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_compact.py)：
+参考[compact实现](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1_compact.py)：
 
 1. 保留M64 sorting metadata；每任务为`[physical_row_begin, expert_id]`，不重写原始route物理行号。每个expert必须是唯一连续run，run排列可不按expert编号。
 2. 对一个含$b_e$个M64块的run，分为$\lfloor b_e/4\rfloor$个M256 full和$b_e\bmod4$个M64 tail。证明每个有效物理块恰好被处理一次。
@@ -63,7 +63,7 @@ $$
 
 ## 6. 证据入口
 
-- [现行分发、支持范围与历史测量身份](../../../src/contrib/flydsl/moe_gemm_2stage/README.md)。
+- [现行分发、支持范围与历史测量身份](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md)。
 - [任务表覆盖回归](../../../tests/contrib/moe/test_compact_m64_tasks.py)、[compact历史验收](../../../tests/contrib/moe/results/compact_m64/summary.json)。
 - [六K流水与资源历史审计](../../../tests/contrib/moe/results/readme_latest_20260911/audited.json)。
 - [打包后移的Memory/Compute反例](../../../tests/contrib/moe/results/k256_memory_pack_20260909/att_comparison.json)。

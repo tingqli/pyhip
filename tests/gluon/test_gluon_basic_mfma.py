@@ -14,7 +14,7 @@ from triton.experimental.gluon.language.amd.cdna3 import (
     sched_group_barrier as _amd_iglp_sched_group_barrier,
 )
 from pyhip import div_up
-from pyhip.contrib.gluon.utils import read_cycle, read_realtime, get_cu_id
+from pyhip.codegen.gluon.utils import read_cycle, read_realtime, get_cu_id
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
 
 def init_env():

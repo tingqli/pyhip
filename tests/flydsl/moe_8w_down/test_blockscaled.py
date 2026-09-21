@@ -13,13 +13,13 @@ from aiter.fused_moe import moe_sorting
 from aiter.ops.shuffle import shuffle_weight
 
 import pyhip
-from pyhip.contrib.moe_gemm_8wave import moe_gemm_8wave_down
+from pyhip.ops.moe.asm.moe_gemm_8wave import moe_gemm_8wave_down
 from moe_8wave_down import flydsl_moe_gemm_8wave_down as legacy_flydsl_down
 from moe_multistage_down import flydsl_moe_gemm_8wave_down
 import moe_multistage_down_m128 as m128_kernel
 from moe_multistage_pipeline import DownReduceWorkspace, compile_packed_down_reduce
 from moe_multistage_reduce import make_moe_sum
-from pyhip.contrib.flydsl.moe_gemm_2stage.moe_reduce import invert_sorted_ids
+from pyhip.ops.moe.flydsl.moe_gemm_2stage.moe_reduce import invert_sorted_ids
 
 
 def make_m128_priority3_down(*, n, k=256, topk, num_experts):

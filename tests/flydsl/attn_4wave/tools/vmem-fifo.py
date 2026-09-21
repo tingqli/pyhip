@@ -25,7 +25,7 @@ os.environ.setdefault("PYHIP_DEBUG_LOG", "")
 
 import torch  # pyright: ignore[reportMissingImports]
 
-from pyhip.core.asmjit import JIT, jit  # pyright: ignore[reportMissingImports]
+from pyhip.codegen.asm.asmjit import JIT, jit  # pyright: ignore[reportMissingImports]
 
 UINT32 = "unsigned int"
 VOID_POINTER = "void*"

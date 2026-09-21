@@ -8,7 +8,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import pyhip
 
-import pyhip.contrib.flydsl as fxu
+import pyhip.codegen.flydsl as fxu
 
 # fxu.enable_dump_ir(True)
 

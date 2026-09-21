@@ -7,7 +7,7 @@ import pytest
 os.environ['PYHIP_JIT_LOG'] = '0'
 import torch
 from pyhip import cudaPerf, torchPerf, calc_diff, div_up
-from pyhip.contrib.jit_gemm_splitk import *
+from pyhip.ops.gemm.asm.jit_gemm_splitk import *
 
 import aiter
 from aiter.utility import fp4_utils

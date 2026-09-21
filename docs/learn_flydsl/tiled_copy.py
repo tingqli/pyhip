@@ -9,7 +9,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly
 
 import pyhip
-import pyhip.contrib.flydsl as fxu
+import pyhip.codegen.flydsl as fxu
 
 if 1:
     make_tiled_copy = fxu.make_tiled_copy

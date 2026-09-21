@@ -5,7 +5,7 @@ import torch
 #from fly_moe_down import compile_gemm
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm
+from pyhip.ops.moe.flydsl.moe_gemm_splitk import compile_gemm
 
 def xcd_swizzle(J, blk1d, num_blocks, num_oc_blocks, NUM_XCD, NUM_CU_PER_XCD):
     NUM_CU = NUM_XCD * NUM_CU_PER_XCD

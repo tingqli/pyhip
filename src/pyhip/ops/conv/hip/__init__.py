@@ -1,0 +1,1 @@
+"""HIP convolution sources shipped alongside the Python wrappers."""

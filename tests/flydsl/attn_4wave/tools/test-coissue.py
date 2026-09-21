@@ -23,7 +23,7 @@ import statistics
 
 import torch
 
-from pyhip.core.asmjit import JIT, jit
+from pyhip.codegen.asm.asmjit import JIT, jit
 
 DEFAULT_INNER_UNROLL = 1000
 DEFAULT_OUTER_LOOPS = 1000

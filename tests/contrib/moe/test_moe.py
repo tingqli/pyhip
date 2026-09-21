@@ -11,8 +11,8 @@ from typing import Optional
 
 import pyhip
 from pyhip import cudaPerf, torchPerf, calc_diff, div_up
-from pyhip.contrib.moe_gemm_mxfp4 import *
-from pyhip.contrib.moe import *
+from pyhip.ops.moe.asm.moe_gemm_mxfp4 import *
+from pyhip.ops.moe.asm.moe import *
 
 import aiter
 from aiter.utility import fp4_utils
@@ -593,10 +593,10 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
             if weight_type == torch.float4_e2m1fn_x2:
                 K1 *= 2
                 K2 *= 2
-            from pyhip.contrib.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
-            from pyhip.contrib.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
-            from pyhip.contrib.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
-            from pyhip.contrib.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
+            from pyhip.ops.moe.flydsl.moe_gemm_splitk import compile_gemm as _moe_compile
+            from pyhip.ops.moe.flydsl.moe_gemm_splitk import sorted_sum as _moe_sorted_sum
+            from pyhip.ops.moe.flydsl.moe_gemm_splitk import invert_sorted_ids as _moe_invert_sorted_ids
+            from pyhip.ops.moe.flydsl.moe_gemm_splitk import flydsl_absmax, flydsl_quant_per_tensor
             assert down_path in ('default', '1x4_64x256', '8x1', '8x1_compact')
             if down_path == '8x1':
                 assert TILE_M_DOWN == 256
@@ -845,7 +845,7 @@ def _run_batch(kernel_type, B=1, weight_type=torch.bfloat16, TILE_M_DOWN=16, TIL
                         #print(idx.view(-1,16))
                         compact_args = ()
                         if down_path == '8x1_compact':
-                            from pyhip.contrib.flydsl.moe_gemm_2stage.gemm2_8x1_compact import allocate_task_buffers
+                            from pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm2_8x1_compact import allocate_task_buffers
                             full_tasks, tail_tasks, task_counts = allocate_task_buffers(sorted_expert_ids, E)
                             compact_args = (
                                 _ptr(full_tasks), _ptr(tail_tasks), _ptr(task_counts),
@@ -1275,7 +1275,7 @@ def _init_env():
     ],
 )
 def test_down_device_config(device_name, expected):
-    from pyhip.contrib.flydsl.moe_gemm_2stage.common import down_device_config_from_name
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import down_device_config_from_name
 
     assert down_device_config_from_name(device_name) == expected
 
@@ -1368,9 +1368,9 @@ def test_acc_fly_splitk_2s_down_8x1(monkeypatch, inter_size, quant_type):
 @pytest.mark.parametrize("weight_quant, act_quant", [("ptpc", None), ("per_tensor", None), ("per_tensor", "ptpc")])
 def test_fly_down_8x1_mixed_dispatch(monkeypatch, inter_size, tile_k, weight_quant, act_quant):
     import importlib
-    from pyhip.contrib.flydsl.moe_gemm_2stage.gemm2_8x1 import _build_moe_gemm2_8x1
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm2_8x1 import _build_moe_gemm2_8x1
 
-    module = importlib.import_module(f"pyhip.contrib.flydsl.moe_gemm_2stage.gemm2_8x1_k{inter_size}")
+    module = importlib.import_module(f"pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm2_8x1_k{inter_size}")
     sentinel = object()
     calls = []
 
@@ -1394,7 +1394,7 @@ def test_fly_down_8x1_mixed_dispatch(monkeypatch, inter_size, tile_k, weight_qua
 
 @pytest.mark.parametrize("inter_size", [192, 320])
 def test_fly_down_8x1_rejects_removed_bk64(inter_size):
-    from pyhip.contrib.flydsl.moe_gemm_2stage.gemm2_8x1 import _build_moe_gemm2_8x1
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm2_8x1 import _build_moe_gemm2_8x1
 
     with pytest.raises(AssertionError, match="仅保留K192整块192"):
         _build_moe_gemm2_8x1(

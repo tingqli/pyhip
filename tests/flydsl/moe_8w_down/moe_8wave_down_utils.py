@@ -15,7 +15,7 @@ from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 import pyhip
-from pyhip.contrib.flydsl import helpers as fxh
+from pyhip.codegen.flydsl import helpers as fxh
 
 if __name__ == "__main__":
     fxh.dump_ir(False)

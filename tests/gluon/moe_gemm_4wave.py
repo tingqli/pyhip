@@ -1,5 +1,5 @@
 import torch
-from pyhip.contrib.gluon.moe_gemm_4wave import moe_2stage_gateup, moe_2stage_down
+from pyhip.ops.moe.gluon.moe_gemm_4wave import moe_2stage_gateup, moe_2stage_down
 
 #####################################################################
 import pytest

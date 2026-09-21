@@ -18,7 +18,7 @@ except:
 gluon_gemm_a8w8_blockscale = None
 
 import pyhip
-from pyhip.contrib.gemm_fp8 import *
+from pyhip.ops.gemm.asm.gemm_fp8 import *
 
 torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
 torch.set_default_device('cuda')

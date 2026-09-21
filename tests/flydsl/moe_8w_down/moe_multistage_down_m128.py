@@ -15,8 +15,8 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-from pyhip.contrib.flydsl import helpers as fxh
-from pyhip.contrib.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as _ptr
+from pyhip.codegen.flydsl import helpers as fxh
+from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as _ptr
 from moe_multistage_down import _coalesce_output_pairs, _mark, _pack_pair, _pin_address, _pin_packet, _scalar, _stage_end
 
 

@@ -1,5 +1,5 @@
 import torch
-from pyhip.contrib.gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_down
+from pyhip.ops.moe.gluon.moe_gemm_splitk import moe_2stage_splitk_gateup, moe_2stage_splitk_down
 
 #####################################################################
 import pytest

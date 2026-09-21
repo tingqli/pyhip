@@ -1,5 +1,5 @@
 import pyhip
-from pyhip.contrib.gemm_a4w4 import *
+from pyhip.ops.gemm.asm.gemm_a4w4 import *
 from pyhip import calc_diff
 
 import pytest

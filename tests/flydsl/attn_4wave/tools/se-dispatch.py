@@ -344,7 +344,7 @@ def draw_svg(path, blocks, sample, ticks_per_us):
 
 
 def device_info(torch):
-    from pyhip.core.hiptools import get_lib, hip_check_error
+    from pyhip.runtime.hiptools import get_lib, hip_check_error
     device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)
     if not props.gcnArchName.startswith("gfx950"):

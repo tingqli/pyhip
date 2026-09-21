@@ -531,7 +531,7 @@ Oracle recoverable假设目标blocker可立即替换为ready MFMA，只是上界
 
 这里指8x1 **PTPC＋rolling**跨N内存stage中的`vmcnt(5)`，不是LDS的`lgkmcnt(5)`，
 也不是K=512时所有等待都固定为5。compact的满块复用同一逻辑。
-计算位置见[VMEM额度与B提交](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1386-L1424)。
+计算位置见[VMEM额度与B提交](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1386-L1424)。
 
 **5 = 2条本stage weight-scale load + 2条上一N输出store + 1条已发出的next-pending B load。**
 两个scale在当前ISA为`global_load_dwordx4`，两个输出为`buffer_store_dwordx4 ... nt`，
@@ -622,7 +622,7 @@ P(q)之后、当前wait之前：
 P(q)及其9条后继会使计数至少为10，因此`vmcnt(9)`足以保证P(q)完成。
 旧`vmcnt(5)`则还会要求完成其中最早的4条——即上一拍的scale×2/store×2。
 
-物理上[weight_staging](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L354-L365)
+物理上[weight_staging](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L354-L365)
 是两份VGPR staging，`q&1`轮换；“q−2发出、q提交”的三拍跨度，不应误写成三个独立的
 在途B global-load槽。当前计算使用的B已经从LDS读入寄存器，和这两份carry不是同一层。
 9的依据是**目标producer之后的VMEM序列**，不是仅凭FIFO槽数推算。
@@ -660,7 +660,7 @@ P(q)及其9条后继会使计数至少为10，因此`vmcnt(9)`足以保证P(q)�
 ### 生产源码选择性5→9：正确性通过，性能没有一致获益（2026-09-06）
 
 本节是上一节实验之后、用户要求“修改kernel，测试性能”的独立验收。
-当前[生产等待分支](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1405-L1416)
+当前[生产等待分支](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1405-L1416)
 只在K512、PTPC、rolling、`block_n>0`、stage1–3且`has_next_pending`时增加4条年龄额度。
 stage0仍5；最后N stage2仍4、stage3无该commit；pure、其它K和per-tensor不改。
 普通8x1及compact满块复用该分支；构表、tail、cache policy、padding、sorted_sum和selector均不改。
@@ -941,7 +941,7 @@ VMEM-wait的`core3→4` phase由141.73→**1056.96 cycles/batch**，占新版该
 
 ### K512继续放宽stage4：1→5（2026-09-06）
 
-用户随后要求“放宽stage4”。本轮只扩展[前一拍请求年龄额度](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1405-L1416)
+用户随后要求“放宽stage4”。本轮只扩展[前一拍请求年龄额度](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1405-L1416)
 到K512/PTPC、rolling、`block_n>0`、stage4且`has_next_pending`；stage1–3仍9，stage0仍5，
 首N、pure、per-tensor、其它K及stage5–7的等待不变。普通8x1和compact满块共同生效。
 
@@ -1098,7 +1098,7 @@ ABI大小76B，grid与原launcher相同；真实随机正确性仍由前述160�
 5. 单独测冷编译时间、IR/.text体积、资源与两版Down-only；只有这些通过才扩展compact/Full，
   不把N循环与stage4、padding/cache policy等多个改动混为一个实验。
 
-已有[1x4的运行时N循环](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_1x4.py#L859-L920)
+已有[1x4的运行时N循环](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_1x4.py#L859-L920)
 使用`range(..., init=loop_state)`和`yield next_state`，可参考其状态传递方式，不能照搬不同B/输出时序。
 上述原型及验收项已记入[TODO](../../../contrib/moe/TODO.md)；后续实现与实测如下，默认仍保留全展开。
 
@@ -1106,7 +1106,7 @@ ABI大小76B，grid与原launcher相同；真实随机正确性仍由前述160�
 
 ### K512 N循环原型：保留stage4正式改动，冷编译显著缩短（2026-09-06）
 
-本节是K512-only原型的历史记录。生产现已使用[通用N循环](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_nloop.py)，
+本节是K512-only原型的历史记录。生产现已使用[通用N循环](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1_nloop.py)，
 旧专用实现已从生产目录清理；下面源码链接指向原实验快照，不以通用版本替代旧ISA身份。
 
 用户要求“1合并入正式代码，尝试2，改善测试时间”。**stage4选择性1→5已作为正式默认保留**，
@@ -1474,8 +1474,8 @@ env -u PYTHONPATH "$PY" "$TOOLS/analyze_mfma_stall.py" \
 ## K320：128+128+64混合分块（2026-09-05）
 
 **结论：混合分块保留，K320默认采用128+128+64；旧5×64已从当前入口删除，只保留历史源码快照作对照。**
-独立实现位于[gemm2_8x1_k320.py](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_k320.py)，
-[通用入口](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L70)只做编译期分流，
+独立实现位于[gemm2_8x1_k320.py](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1_k320.py)，
+[通用入口](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L70)只做编译期分流，
 不再把混合宽度条件堆进已验证的K512调度。
 
 固定shape仍为B32768、TOPK8、E256、N2048、BM256、BN128、padding128B、8 waves/WG。
@@ -1922,9 +1922,9 @@ LDS issue包含693,268 cycles issue-stall和1,188,848 cycles正常服务。
 ## K192测试：128+64，时延下降52.2%，busy未到80%（2026-09-05）
 
 **128+64数值与性能测试通过，但physical MFMA busy为69.280%，尚未达到80%。**
-保留独立的[gemm2_8x1_k192.py](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_k192.py)，
+保留独立的[gemm2_8x1_k192.py](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1_k192.py)，
 测试当时仅显式`tile_k=128`选择它，默认仍是3×64 pure。随后按要求删除旧分支，
-[当前K192默认与显式128都分流到混合实现](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L60-L72)。
+[当前K192默认与显式128都分流到混合实现](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L60-L72)。
 以下保留该轮历史数据；默认切换不把“比基线快”改写成“busy达标”。
 K320/K512/K640已验证实现保持不变，清理后的回归见[分支清理审计](#bk64-cleanup)。
 
@@ -2107,7 +2107,7 @@ PYTHONPATH=/usr/local/lib/python3.10/dist-packages "$PY" "$TOOLS/analyze_mfma_st
 - 删除K192的3×64和K320的5×64通用实现，包括`DEDICATED_K320`、BK64条件加载/提交、
   专属Uint32/64-bit staging、BK64 A/B索引、`pack_k320_rolling()`及单store流水状态。
   通用内核的`BLOCK_K`现在恒为128；**混合实现中真实64尾段的搬运与MFMA保留**，没有K-padding。
-- [入口](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L60-L81)只接受`tile_k=None/128`，
+- [入口](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L60-L81)只接受`tile_k=None/128`，
   K192默认128+64、K320默认128+128+64；显式64抛出说明旧路径已移除的`AssertionError`，不静默换算法。
 - [运行器](run_moe_8x1.py#L197-L217)默认也统一为128；CLI的64选项继续服务于历史`--source/--control`快照，
   不是保留当前kernel的旧分支。历史JSON、raw ATT和源码快照均未删除。
@@ -2149,16 +2149,16 @@ accum offset五个资源字段。K192/K320的rolling关闭路径用上面的随�
 
 ### 第二轮：已清理K128遗留与恒真条件
 
-根因是[入口提前分流](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L82-L115)：
+根因是[入口提前分流](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L82-L115)：
 K128且rolling开启时已返回独立builder；关闭时通用`ROLLING_EPILOGUE=False`。
 在一次构建期间环境配置固定的正常调用契约下，旧通用内核里的`K == 128 && ROLLING_EPILOGUE`永不成立。
 
 | 已完成清理 | 保留行为 |
 | --- | --- |
 | 删除K128专属scale/pack、rolling输出、drain，以及`write_packed_super_record_k128()`和`read_packed_half_k128()` | K384/K256/K512/K640退休时序不变 |
-| 移除8-wave CShuffle、joined-fragment、非空`scratch_half`、K128输出映射与4-request特例 | [当前CShuffle读回/存储](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L870-L950)只保留可达实现 |
-| 简化各标志的恒真`BLOCK_K == 128`，`SPECIALIZED_ROLLING`只保留K384 | [当前专用标志](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L93-L114)不删除实际K特化 |
-| 删除K192 q2预取恒真保护（target=1、NT≥1，所以`1 < 2*NT`） | [实际预取](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1_k192.py#L338-L344)保留；K320的单N边界仍有意义，未删 |
+| 移除8-wave CShuffle、joined-fragment、非空`scratch_half`、K128输出映射与4-request特例 | [当前CShuffle读回/存储](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L870-L950)只保留可达实现 |
+| 简化各标志的恒真`BLOCK_K == 128`，`SPECIALIZED_ROLLING`只保留K384 | [当前专用标志](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L93-L114)不删除实际K特化 |
+| 删除K192 q2预取恒真保护（target=1、NT≥1，所以`1 < 2*NT`） | [实际预取](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1_k192.py#L338-L344)保留；K320的单N边界仍有意义，未删 |
 
 清理步骤单独重新编译12条生产路径，指令与资源全部不变；随后新增量化，再对这12条PTPC路径
 重复验证，仍完全一致。通用K128 pure与独立K128继续保留；没有删除有效实现来凑代码简化。
@@ -2178,8 +2178,8 @@ K128且rolling开启时已返回独立builder；关闭时通用`ROLLING_EPILOGUE
 
 ### 未消费结果与不能误删的路径
 
-- [两个quarter-load结果](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1346-L1376)只在
-  [`ROLLING_EPILOGUE and block_n > 0`](../../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1424-L1436)消费；
+- [两个quarter-load结果](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1346-L1376)只在
+  [`ROLLING_EPILOGUE and block_n > 0`](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py#L1424-L1436)消费；
   pure/首N改用full-half fragment。已证明这些场景下结果未消费，**尚未证明会残留额外ISA访存**，
   不能跳过DCE/JIT核验就宣称性能收益，也不能整段删除rolling稳态需要的quarter load。
 - pure开关、单N/跨N预取边界、K256/K384/K512/K640有效时序，以及混合64尾段都保留。

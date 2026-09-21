@@ -16,7 +16,7 @@ from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 import torch
 
 import pyhip
-import pyhip.contrib.flydsl.helpers as fxh
+import pyhip.codegen.flydsl.helpers as fxh
 
 # fxh.dump_ir(False)
 

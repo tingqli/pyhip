@@ -9,7 +9,7 @@ description: 'Use when optimizing FlyDSL gfx942 LDS CShuffle, ds_read_b64 versus
 
 ## 1. 从真实producer/consumer表达式建立模型
 
-1. 从[现行8x1代码](../../../src/contrib/flydsl/moe_gemm_2stage/gemm2_8x1.py)找`cshuffle_plane_offset`、`shuffle_8x1_c_r2s2r`、`store_8x1_c_r2g`与B读取原语。
+1. 从[现行8x1代码](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/gemm2_8x1.py)找`cshuffle_plane_offset`、`shuffle_8x1_c_r2s2r`、`store_8x1_c_r2g`与B读取原语。
 2. 给每个BF16元素附上`(wave,lane,record,row,half,element)`标签；按真实写地址放入模拟LDS，再按真实读地址收集输出。
 3. 覆盖所有wave/lane/half/输出行和N偏移，验证：无非法重叠、无漏读、每次输出payload与原布局逐元素相同。
 4. 尽量执行源码中提取的地址表达式，而非另写一个“看起来相同”的模型。全局输出地址和mask也属于证明范围。

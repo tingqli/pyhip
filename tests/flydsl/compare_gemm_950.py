@@ -152,7 +152,7 @@ def make_flydsl_case(module, waves: int, tile_m: int, tile_n: int, dtype: str, m
 def make_jit_case(a, b, preshuffle: bool):
     import pyhip
     import torch
-    from pyhip.contrib.gemm_fp8 import gemm_8wave_fp8bf16fp16
+    from pyhip.ops.gemm.asm.gemm_fp8 import gemm_8wave_fp8bf16fp16
 
     m, k = a.shape
     n = b.shape[0]

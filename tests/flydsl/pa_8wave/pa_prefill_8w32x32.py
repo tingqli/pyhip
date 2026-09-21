@@ -10,7 +10,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr.typing import Vector as Vec
 
-import pyhip.contrib.flydsl.helpers as fxh
+import pyhip.codegen.flydsl.helpers as fxh
 
 def _maxnumf(a, b):
     """Non-NaN-propagating f32 max used by the wave softmax reduction."""
