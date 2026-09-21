@@ -9,7 +9,7 @@ description: 'Use when optimizing or reviewing gfx942 FlyDSL GRRead BF16 prefill
 
 ## 1. 固定数值和调用合同
 
-从[唯一测试入口](../../../tests/contrib/gr_read/test_gr_read.py)和[Down](../../../src/pyhip/ops/gr_read/flydsl/prefill_down.py)、[Up](../../../src/pyhip/ops/gr_read/flydsl/prefill_up.py)核对：
+从[唯一测试入口](../../../tests/ops/gr_read/test_gr_read.py)和[Down](../../../src/pyhip/ops/gr_read/flydsl/prefill_down.py)、[Up](../../../src/pyhip/ops/gr_read/flydsl/prefill_up.py)核对：
 
 - 固定`C=4, H=2560, R=320, K=C*H=10240`；X为BF16 `[T,K]`，P为BF16 `[T,R]`，Y为BF16 `[T,H]`，P无行padding。
 - Down完整K10240 FP32累加，GEMM结果先舍入BF16，再以FP32乘0.25、SiLU，最后写BF16 P。不要将这次中间舍入移到激活之后。

@@ -1,6 +1,6 @@
 # GFX950 FlyDSL GEMM 优化与测试
 
-本文只记录当前`tests/flydsl/test_gemm.py::compile_gemm_950`仍在使用的优化、可复现测试
+本文只记录当前`experiments/gemm/flydsl/test_gemm.py::compile_gemm_950`仍在使用的优化、可复现测试
 方法和最终数据。历史失败方案、外部实现对照和已淘汰阶段数据不属于本文。
 
 ## 1. 测试范围
@@ -45,7 +45,7 @@ rocm-smi -d 0 \
 运行pytest、完整长循环矩阵和两K-tile prologue/tail矩阵：
 
 ```bash
-python3 tests/flydsl/compare_gemm_950.py validate \
+python3 experiments/gemm/flydsl/compare_gemm_950.py validate \
   --full-size 4096 --full-k 4096 \
   --full-launches 10 --two-tile-launches 20 \
   --csv /tmp/gemm950_functional.csv
@@ -53,7 +53,7 @@ python3 tests/flydsl/compare_gemm_950.py validate \
 
 该命令执行：
 
-1. `pytest tests/flydsl/test_gemm.py -k gemm_950 -q`；
+1. `pytest experiments/gemm/flydsl/test_gemm.py -k gemm_950 -q`；
 2. 16个`wave x tile x dtype`配置的`4096^3`长循环，每项10次；
 3. 相同16个配置的两K-tile版本，BF16 K=128、FP8 K=256，每项20次。
 
@@ -64,7 +64,7 @@ python3 tests/flydsl/compare_gemm_950.py validate \
 
 ```bash
 python3 tests/flydsl/verify_gemm_950_pipeline.py
-python3 tests/flydsl/compare_gemm_950.py verify-8wave
+python3 experiments/gemm/flydsl/compare_gemm_950.py verify-8wave
 sha256sum -c tests/flydsl/asm/gfx950_current/SHA256SUMS
 sha256sum -c tests/flydsl/asm/gfx950_8wave_tiles/SHA256SUMS
 ```
@@ -89,7 +89,7 @@ sha256sum -c tests/flydsl/asm/gfx950_8wave_tiles/SHA256SUMS
 完整tile sweep：
 
 ```bash
-python3 tests/flydsl/compare_gemm_950.py benchmark \
+python3 experiments/gemm/flydsl/compare_gemm_950.py benchmark \
   --m 4096 --n 4096 --k-values 4096 \
   --waves all --dtype all \
   --tiles 128x128,128x256,256x128,256x256 \
@@ -100,7 +100,7 @@ python3 tests/flydsl/compare_gemm_950.py benchmark \
 默认FlyDSL/JIT对照：
 
 ```bash
-python3 tests/flydsl/compare_gemm_950.py benchmark \
+python3 experiments/gemm/flydsl/compare_gemm_950.py benchmark \
   --m 4096 --n 4096 --k-values 4096 \
   --waves 8 --dtype fp8 --tiles 256x256 \
   --jit-layout both --warmup 20 --rounds 24 --iterations 100 \
@@ -110,7 +110,7 @@ python3 tests/flydsl/compare_gemm_950.py benchmark \
 K sweep：
 
 ```bash
-python3 tests/flydsl/compare_gemm_950.py benchmark \
+python3 experiments/gemm/flydsl/compare_gemm_950.py benchmark \
   --m 4096 --n 4096 \
   --k-values 1024,2048,4096,8192,16384 \
   --waves all --dtype all --tiles 256x256 \

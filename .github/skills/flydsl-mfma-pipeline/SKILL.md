@@ -60,6 +60,6 @@ description: 'Use when tuning FlyDSL AMD FP8 GEMM or MoE Memory/Compute scheduli
 ## 本仓库代码
 
 - [PyHIP已有的wave错相与Memory/Compute序列](../../../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1121-L1225)。
-- [M256 DMA/scale](../../../tests/flydsl/moe_8w_down/moe_multistage_down.py#L278-L327)、[延迟退休与包装交错](../../../tests/flydsl/moe_8w_down/moe_multistage_down.py#L340-L448)、[错相首尾闭合](../../../tests/flydsl/moe_8w_down/moe_multistage_down.py#L474-L511)。
-- [M128 pair/PF3 publication与refill](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L221-L261)、[延迟store/包装/退休](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L263-L339)。
-- [worker N相位rematerialization](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L139-L150)。
+- [M256 DMA/scale](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down.py#L278-L327)、[延迟退休与包装交错](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down.py#L340-L448)、[错相首尾闭合](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down.py#L474-L511)。
+- [M128 pair/PF3 publication与refill](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down_m128.py#L221-L261)、[延迟store/包装/退休](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down_m128.py#L263-L339)。
+- [worker N相位rematerialization](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down_m128.py#L139-L150)。

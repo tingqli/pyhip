@@ -24,7 +24,7 @@ description: 'Use when benchmarking or diagnosing PyHIP GPU kernels, GRRead late
 
 ## 3. 固定实际地址与执行路径
 
-1. 采用[现有测试入口](../../../tests/contrib/gr_read/test_gr_read.py)中的原`cudaPerf`，默认10个独立X/权重/P/Y buffers、每阶段2warmup、10sample，全样本中位数。不要为了“更稳定”偷偷换timer。
+1. 采用[现有测试入口](../../../tests/ops/gr_read/test_gr_read.py)中的原`cudaPerf`，默认10个独立X/权重/P/Y buffers、每阶段2warmup、10sample，全样本中位数。不要为了“更稳定”偷偷换timer。
 2. 记录各tensor实际data pointer、storage base、storage offset、mod256及mod4096。性能Y用原生allocation起点；guard view用于正确性时不要直接替代性能buffer。
 3. 对照尽量使用同一批输入和地址，交错AB/BA或预先固定的ABBA/BAAB，并保持buffer轮换。先后两个整轮数据可以报告，但必须标明非交错、非同址配对的限制。
 4. 相同ELF也会因X/Y相对地址变化而变慢。Y加128B仍然满足16B自然对齐，不能据此声称硬件要求256B对齐；256B对齐也不保证任意相对地址都快。

@@ -40,8 +40,8 @@ description: 'Use when optimizing MoE GEMM output stores and TOPK reduction with
 ## 本仓库代码与回归
 
 - [PyHIP routed地址和store](../../../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1080-L1110)。
-- [BF16/permlane与row/column DPP交换](../../../tests/flydsl/moe_8w_down/moe_multistage_down.py#L64-L115)。
-- [M128 packed输出地址及DPP mask](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L177-L214)。
-- [packed reducer索引、load与顺序sum](../../../tests/flydsl/moe_8w_down/moe_multistage_reduce.py#L40-L59)。
-- [workspace与完整pipeline](../../../tests/flydsl/moe_8w_down/moe_multistage_pipeline.py#L12-L82)、[inverse valid-prefix保护](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/moe_reduce.py#L110-L136)。
-- [严格相消](../../../tests/flydsl/moe_8w_down/test_blockscaled.py#L515-L555)、[专家边界/容量尾部](../../../tests/flydsl/moe_8w_down/test_blockscaled.py#L558-L599)。
+- [BF16/permlane与row/column DPP交换](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down.py#L64-L115)。
+- [M128 packed输出地址及DPP mask](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down_m128.py#L177-L214)。
+- [packed reducer索引、load与顺序sum](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_reduce.py#L40-L59)。
+- [workspace与完整pipeline](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_pipeline.py#L12-L82)、[inverse valid-prefix保护](../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/moe_reduce.py#L110-L136)。
+- [严格相消](../../../experiments/moe/flydsl/moe_8w_down/test_blockscaled.py#L515-L555)、[专家边界/容量尾部](../../../experiments/moe/flydsl/moe_8w_down/test_blockscaled.py#L558-L599)。

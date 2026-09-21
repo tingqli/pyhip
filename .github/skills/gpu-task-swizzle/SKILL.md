@@ -57,7 +57,7 @@ description: 'Use when optimizing GPU GEMM or MoE task order, OC splitting, grid
 
 ## 本仓库代码与证据
 
-- [M256 width8前缀转置](../../../tests/flydsl/moe_8w_down/moe_multistage_down.py#L188-L211)。
-- [M128 width2/4及queue到virtual task](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L45-L98)。
-- [N相位同时进入B地址](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L139-L160)、[输出地址](../../../tests/flydsl/moe_8w_down/moe_multistage_down_m128.py#L211-L214)。
-- [旧sort256与原生sort128的区别](../../../tests/flydsl/attn_4wave/tools/se-dispatch.md#L186-L292)；其中历史width4实测不可重标为当前width2实测。
+- [M256 width8前缀转置](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down.py#L188-L211)。
+- [M128 width2/4及queue到virtual task](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down_m128.py#L45-L98)。
+- [N相位同时进入B地址](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down_m128.py#L139-L160)、[输出地址](../../../experiments/moe/flydsl/moe_8w_down/moe_multistage_down_m128.py#L211-L214)。
+- [旧sort256与原生sort128的区别](../../../experiments/attention/flydsl/attn_4wave/tools/se-dispatch.md#L186-L292)；其中历史width4实测不可重标为当前width2实测。

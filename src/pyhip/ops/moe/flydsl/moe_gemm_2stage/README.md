@@ -62,7 +62,7 @@
 | CPU契约 | [共享schedule](../../../../../../tests/contrib/moe/test_all_8x1_schedule.py)、[首拍与准备移位](../../../../../../tests/contrib/moe/test_startup_8x1.py)、[方向命名](../../../../../../tests/contrib/moe/test_8x1_direction_names.py)的[169项检查](../../../../../../tests/contrib/moe/results/startup_8x1_20260911/cpu_views.xml)通过：实际AST、全部K贡献、FP32/BF16生命周期、四scale与输出、短N/地址策略；不是全仓测试计数。 |
 | fresh offline | [单配置编译入口](../../../../../../tests/contrib/moe/check_startup_8x1.py)与[最终资源编排](../../../../../../tests/contrib/moe/run_readme_latest.py)使用COMPILE_ONLY/gfx942、4XCC/80CU显式输入，拒绝GPU/runtime/ExecutionEngine。12ordinary＋6compact配置共30个kernel，18次编译与自重汇编全部通过，102个实际steady Memory段零VALU，见[资源收据](../../../../../../tests/contrib/moe/results/readme_latest_20260911/resources/result.json)。这是最终after资源验收，不是旧/新ISA相同证明。 |
 | ordinary/compact随机 | [GPU入口](../../../../../../tests/contrib/moe/check_startup_8x1.py)完成六K、短N/长N、三量化与compact，共48配置。每配置2个seed×2版本×（2次direct＋3次graph）=20检查，总960；[完整收据](../../../../../../tests/contrib/moe/results/readme_latest_20260911/gpu/result.json)为`complete=true`，最大rel_l2=0.003345513716340065，新旧输出bit-identical。正确性不调整PTL、频率、功耗或NUMA设置；随机W验收独立于性能全1W。 |
-| 公共整链/额外边界 | [公共测试](../../../../../../tests/contrib/moe/test_moe.py)、[compact专项](../../../../../../tests/contrib/moe/test_compact_m64_down.py)及[任务表exact cover](../../../../../../tests/contrib/moe/test_compact_m64_tasks.py)通过[本轮入口](../../../../../../tests/contrib/moe/run_readme_latest.py)完成147项、0失败/错误/跳过，见[收据](../../../../../../tests/contrib/moe/results/readme_latest_20260911/public/result.json)。含ordinary/compact整链、超过2GiB真实权重偏移、`test_compact_post_balance_full_coverage`的实际full/full+tail及graph。含任务表CPU节点，147不是147个GPU配置，不与960次检查相加；整链仍使用N为512倍数。 |
+| 公共整链/额外边界 | [公共测试](../../../../../../tests/ops/moe/test_moe.py)、[compact专项](../../../../../../tests/contrib/moe/test_compact_m64_down.py)及[任务表exact cover](../../../../../../tests/contrib/moe/test_compact_m64_tasks.py)通过[本轮入口](../../../../../../tests/contrib/moe/run_readme_latest.py)完成147项、0失败/错误/跳过，见[收据](../../../../../../tests/contrib/moe/results/readme_latest_20260911/public/result.json)。含ordinary/compact整链、超过2GiB真实权重偏移、`test_compact_post_balance_full_coverage`的实际full/full+tail及graph。含任务表CPU节点，147不是147个GPU配置，不与960次检查相加；整链仍使用N为512倍数。 |
 
 **以下为仓库根目录下的独立复现模板。** 本次实际结果以链接收据为准，不覆盖成功、失败或历史记录，不重新运行准备步骤或修改冻结SHA绕过门禁。[文档合同](../../../../../../tests/contrib/moe/test_moe_readme.py)逐格重算数字、IQR和几何。[pytest配置](../../../../../../pytest.ini)为`python_files=*.py`，必须显式file/node，不对目录盲跑；若源码、驱动或依赖身份变化，应建立新的配套验证。
 
@@ -71,7 +71,7 @@ set -euo pipefail
 REPO="$PWD"
 PY="$REPO/.venv/bin/python"
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="$REPO/src:$REPO/tests/contrib/moe:$REPO/tests/flydsl/attn_4wave/tools:/opt/aiter:/usr/local/lib/python3.10/dist-packages"
+export PYTHONPATH="$REPO/src:$REPO/tests/contrib/moe:$REPO/experiments/attention/flydsl/attn_4wave/tools:/opt/aiter:/usr/local/lib/python3.10/dist-packages"
 RUN="$REPO/tests/contrib/moe/results/manual_latest_$(date +%Y%m%d_%H%M%S)_$$"
 [[ ! -e "$RUN" ]] && mkdir -p "$RUN"
 unset MOE_PREFILL_TILE_K MOE_8X1_ROLLING_EPILOGUE

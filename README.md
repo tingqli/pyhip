@@ -50,7 +50,9 @@ src/pyhip/
     runtime/                # HIP source compilation, code-object loading/launch
     testing/                # Timing and correctness helpers
     tools/                  # Standalone code inspection and hardware probes
-tests/                    # Existing test locations and entry points are unchanged
+tests/                    # Default regression suite: codegen/asm and ops/<operation>
+benchmarks/               # Explicit operator timing/model-matrix entry points
+experiments/              # Kernel prototypes, their local tests, and analysis tools
 docs/                     # Usage and optimization notes
 ```
 
@@ -169,18 +171,34 @@ test_kernel([gridDim_x, gridDim_y, gridDim_z],    # grid dimensions
 
 # Tests
 
+Run from the repository root after installing PyHIP. Default collection is
+limited to `tests/**/test_*.py`, with importlib mode and performance-only tests
+excluded. Existing correctness checks, shapes, tolerances, and kernel bodies
+are unchanged; many tests still require a supported ROCm GPU.
+
 ```bash
-# ensure core functionality correctness
-./tests/core/run_unittests.sh
-
-# tests for contrib
-./tests/contrib/run_test.sh
-# run individual test for contrib
-python tests/contrib/pa/test_pa.py
-python tests/contrib/moe/test_moe.py
-python tests/contrib/moe/test_mxfp4.py
-
+# inspect the default regression suite without executing tests
+python -m pytest --collect-only -q
+# assembly JIT regression tests (GPU required)
+python -m pytest tests/codegen/asm -q
+# operator regression tests
+python -m pytest tests/ops/gemm/test_cdna4.py -q
+# opt in to marked performance tests
+python -m pytest tests/ops/moe/test_moe.py -m perf -s
+# GRRead retains its combined correctness/benchmark CLI (gfx942)
+python tests/ops/gr_read/test_gr_read.py --gpu 3 --check-only
+# standalone benchmark entry points
+python benchmarks/moe/test_fused_moe.py --help
+python benchmarks/attention/test_pa.py
+# experimental validation must be selected explicitly
+python -m pytest experiments/elementwise/gluon/test_fused_sigmoid_mul_add.py -q
 ```
+
+See [tests/README.md](tests/README.md) for the relocation map and collection
+rules, [benchmarks/README.md](benchmarks/README.md) for timing entry points,
+and [experiments/README.md](experiments/README.md) for opt-in experimental work.
+Default collection is not a promise that every historical test passes on every
+GPU or dependency version; known upstream/test incompatibilities remain visible.
 
 
 
