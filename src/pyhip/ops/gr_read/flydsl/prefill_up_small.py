@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""GRRead Up N2/N4/N8/N10/N20/N40 with cooperative X128 loads and two-stage W prefetch.
+"""M64/M128 GR read Up with fixed N40 and the existing H64 packed weights.
 
-X/P loads and Y stores use NT; W uses the default policy. P is BF16 with full K320 and FP32 logits.
-The four streams for each H64 use the original FMA order and the integer BF16 output helper.
-Two 20 KiB B LDS slots plus 3 KiB of X LDS per wave use 64 KiB total with 512 threads.
-Each substage loads future X while P loads overlap startup X/B LDS transfers.
-N splits are an internal compile-time parameter selected by batch, with no experimental switches.
+Two or four waves cooperatively load each original W packet in four or two
+chunks. LDS sizes and VMEM wait counts follow that compile-time choice.
+P remains a single BF16 activation; FP32 logits/FMA and output rounding match M256.
 """
 from functools import cache
 
@@ -14,7 +12,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from pyhip.codegen.flydsl.helpers import cvt_f32_to_bf16
+from pyhip.contrib.flydsl.helpers import cvt_f32_to_bf16
 
 from .common import H, K, R
 from .helpers import (
@@ -30,16 +28,9 @@ from .helpers import (
     _sigmoid,
 )
 
-BM = 256
 B_SLOT_BYTES = 32 * R * 2
 GROUP_STEPS = 8
-SUB_WAITS = (
-    ((1, 3), (3, 4), (2, 3), (3, 4), (2, 3), (3, 4), (2, 3), (3, 4)),
-    ((2, 3), (4, 5), (3, 4), (4, 5), (3, 4), (3, 4), (2, 3), (3, 4)),
-    ((2, 3), (4, 5), (3, 4), (4, 5), (3, 4), (3, 4), (2, 0), (0, 0)),
-    # N40单组：没有旧Y写出，前六拍沿用FIRST；末两拍停止W/X预取并排空。
-    ((1, 3), (3, 4), (2, 3), (3, 4), (2, 3), (3, 4), (2, 0), (0, 0)),
-)
+
 
 
 def _load_nt(resource, address, scalar_offset=0, words=4):
@@ -62,32 +53,37 @@ def _pack_y_from_mean(v0, v1):
 
 
 @cache
-def make_up(*, n_splits, block_m=256):
-    """Build the unified Up launcher without queue state, fallbacks, or alternate cache policies.
-
-    Each CTA processes 40/n_splits whole H64 groups, with eight H32 packets per group.
-    Runtime rows share one artifact across full tiles and tails; the grid covers actual rows only.
-    Callers must provide positive rows and X/P/Y storage covering all actual rows.
-    Automatic dispatch includes N10/N20 for calibrated small batches and retains N2/N4/N8 elsewhere.
-    N40 is selected for calibrated batches up to 512 rows on 80-CU devices.
-    """
-    if block_m in (64, 128):
-        from .prefill_up_small import make_up as make_small_up
-        return make_small_up(block_m=block_m, n_splits=n_splits)
-    if block_m != 256:
-        raise ValueError('Up block_m must be 64, 128 or 256')
-    if n_splits not in (2, 4, 8, 10, 20, 40):
-        raise ValueError('n_splits must be 2, 4, 8, 10, 20 or 40')
+def make_up(*, block_m, n_splits=40):
+    """Build the selected M64/W2 or M128/W4 Up; rows stay runtime arguments."""
+    if block_m not in (64, 128):
+        raise ValueError('small Up requires block_m=64 or 128')
+    BM = block_m
+    THREADS = BM * 2
+    WAVES = THREADS // 64
+    W_CHUNKS = 512 // THREADS
+    SUB_WAITS = (
+        ((1, 3), (3, 4), (2, 3), (3, 4), (2, 3), (3, 4), (2, 3), (3, 4)),
+        ((2, 3), (4, 5), (3, 4), (4, 5), (3, 4), (3, 4), (2, 3), (3, 4)),
+        ((2, 3), (4, 5), (3, 4), (4, 5), (3, 4), (3, 4), (2, 0), (0, 0)),
+        ((W_CHUNKS, 2 * W_CHUNKS + 1),
+         (W_CHUNKS + 2, 2 * W_CHUNKS + 2),
+         (W_CHUNKS + 1, 2 * W_CHUNKS + 1),
+         (W_CHUNKS + 2, 2 * W_CHUNKS + 2),
+         (W_CHUNKS + 1, 2 * W_CHUNKS + 1),
+         (W_CHUNKS + 2, 2 * W_CHUNKS + 2), (W_CHUNKS + 1, 0), (0, 0)),
+    )
+    if n_splits != 40:
+        raise ValueError('this specialization requires n_splits=40')
     N_SPLITS = n_splits
     PACKETS = K // 32 // N_SPLITS
     GROUPS = PACKETS // GROUP_STEPS
 
     @fx.struct
     class Shared:
-        b: fx.Array[fx.Int32, (2 * B_SLOT_BYTES + 24576) // 4, 16]
+        b: fx.Array[fx.Int32, (2 * B_SLOT_BYTES + WAVES * 3072) // 4, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
-    def gr_read_up(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor, rows: fx.Int64):
+    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    def gr_read_up_small(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor, rows: fx.Int64):
         tid = fx.Int32(fx.thread_idx.x)
         lane, wave = tid % 64, tid // 64
         group = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, (tid // 256).ir_value()))
@@ -142,16 +138,31 @@ def make_up(*, n_splits, block_m=256):
             shifted = q + n_phase
             return (n_base + (shifted >= PACKETS).select(shifted - PACKETS, shifted)).to(fx.Uint32)
 
+        def load_b_packet(w_packet, part):
+            words = 2 if part == 2 else 4
+            addr = w8 if part == 2 else w16
+            offset = w_packet * B_SLOT_BYTES + part * 8192
+            stride = THREADS * words * 4
+            chunks = [_load(wr, addr, offset + i * stride, words=words)
+                      for i in range_constexpr(W_CHUNKS)]
+            first = chunks[0].shuffle(chunks[1], list(range(words * 2)))
+            if const_expr(W_CHUNKS == 4):
+                second = chunks[2].shuffle(chunks[3], list(range(words * 2)))
+                return first.shuffle(second, list(range(words * 4)))
+            return first
+
         def read_b_g2r(q, part):
-            return _load(wr, w8 if part == 2 else w16, packet(q) * B_SLOT_BYTES + part * 8192,
-                         words=2 if part == 2 else 4)
+            return load_b_packet(packet(q), part)
 
         def store_b_r2s(slot, part, value):
-            if const_expr(part == 2):
-                llvm.inline_asm(ir.Type.parse('!llvm.void'), [b_write8.ir_value(), value.ir_value()],
-                    f'ds_write_b64 $0,$1 offset:{slot * B_SLOT_BYTES + 16384}', 'v,v,~{memory}', has_side_effects=True)
-            else:
-                _ds_write(b_write16, value, slot * B_SLOT_BYTES + part * 8192)
+            for half in range_constexpr(W_CHUNKS):
+                if const_expr(part == 2):
+                    fragment = value.shuffle(value, [half * 2, half * 2 + 1])
+                    llvm.inline_asm(ir.Type.parse('!llvm.void'), [b_write8.ir_value(), fragment.ir_value()],
+                        f'ds_write_b64 $0,$1 offset:{slot * B_SLOT_BYTES + 16384 + half * THREADS * 8}', 'v,v,~{memory}', has_side_effects=True)
+                else:
+                    fragment = value.shuffle(value, list(range(half * 4, half * 4 + 4)))
+                    _ds_write(b_write16, fragment, slot * B_SLOT_BYTES + part * 8192 + half * THREADS * 16)
 
         def load_x_pair_g2r(q, step, part):
             return _load_nt(xr, x_pair_address[part], packet(q) // 8 * 128 + step // 2 * H * 2)
@@ -212,8 +223,7 @@ def make_up(*, n_splits, block_m=256):
                                 store_b_r2s((step + 1) % 2, part, b_g2r[part])
                             if const_expr(not last or step < 6):
                                 w_packet = (next_packet if const_expr(step >= 6) else first_packet) + (step + 2) % 8
-                                b_g2r[part] = _load(wr, w8 if part == 2 else w16,
-                                    w_packet * B_SLOT_BYTES + part * 8192, words=2 if part == 2 else 4)
+                                b_g2r[part] = load_b_packet(w_packet, part)
                     if const_expr(not last or step < 6):
                         part = h16 * 2 + step % 2
                         x_pair_q = q + (2 if const_expr(step % 2 == 0) else 1)
@@ -294,9 +304,9 @@ def make_up(*, n_splits, block_m=256):
                         fragments.append(both.shuffle(both, [k4 * 2, k4 * 2 + 1]).bitcast(fx.BFloat16))
             p_bf16.append(fragments)
 
-        # P到FIRST0的MFMA才消费，允许它与X/B LDS启动重叠。
-        # 源序预算vmcnt20之外，LLVM可能为重排后的真实消费者补更严等待。
-        rocdl.s_waitcnt(vmcnt=20)
+        # 单份BF16 P在FIRST0前就绪，保持后续W/X等待账本明确。
+        # 初始P读取全部完成后，再启动各packet的W/X流水。
+        rocdl.s_waitcnt(vmcnt=0)  # Both activation planes must be ready before MFMA.
         x_initial = [fx.Vector.filled(4, 0, fx.Int32) for _ in range_constexpr(2)]
         _ds_write(x_write[0], x_pair_g2r[0], 0)
         _ds_write(x_write[0], x_pair_g2r[1], 128)
@@ -373,7 +383,7 @@ def make_up(*, n_splits, block_m=256):
     @flyc.jit
     def launch_up(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor,
                   rows: fx.Int64, stream: fx.Stream):
-        gr_read_up(X, W, P, Y, rows).launch(grid=(((rows + BM - 1) // BM) * N_SPLITS, 1, 1), block=(512, 1, 1), stream=stream)
+        gr_read_up_small(X, W, P, Y, rows).launch(grid=(((rows + BM - 1) // BM) * N_SPLITS, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
     launch_up.compile_hints['llvm_options'] = {'vectorize-slp': False}
     return launch_up

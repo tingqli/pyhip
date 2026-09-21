@@ -85,13 +85,30 @@ def write_json(path, value):
         json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
 
 
+def use_checkout_package():
+    import importlib.util
+    repo = Path(__file__).resolve().parents[3]
+    expected = repo / "src/__init__.py"
+    module = sys.modules.get("pyhip")
+    if module is not None:
+        if Path(module.__file__).resolve() != expected:
+            raise RuntimeError(f"wrong PyHIP checkout: {module.__file__}")
+        return
+    spec = importlib.util.spec_from_file_location("pyhip", expected,
+                                                  submodule_search_locations=[str(repo / "src")])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pyhip"] = module
+    spec.loader.exec_module(module)
+
+
 @cache
 def dependencies():
     # 延迟导入：CLI先选GPU；--help和参数解析不初始化Torch，也不依赖pytest。
+    use_checkout_package()
     import torch
     import torch.nn.functional as F
     import flydsl.compiler as flyc
-    from pyhip.testing.misc import cudaPerf
+    from pyhip.misc import cudaPerf
     if torch.version.hip is None or not torch.cuda.is_available():
         raise RuntimeError("ROCm GPU required")
     props = torch.cuda.get_device_properties(0)
@@ -108,50 +125,20 @@ def dependencies():
     return torch, flyc, _mix_reference, cudaPerf
 
 
-def prepare_gr_read(x, w_down, w_up):
-    """Prepare shuffled weights, buffers, and compiled launches for this input."""
-    torch, flyc, _, _ = dependencies()
-    from pyhip.ops.gr_read.flydsl.common import (
-        K, preshuffle_weight, select_down_config, select_n_splits, validate_rows,
-    )
-    from pyhip.ops.gr_read.flydsl.prefill_down import make_down
-    from pyhip.ops.gr_read.flydsl.prefill_up import make_up
+def prepare_reader(x, w_down, w_up):
+    dependencies()
+    from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
+    packed_down, packed_up = prepare_weights(w_down, w_up)
+    reader = GRReadPrefill(x.shape[0], packed_down, packed_up)
+    reader._check_input(x)
+    return reader
 
-    rows = x.shape[0]
-    validate_rows(rows)
-    if w_down.shape != (R, K) or w_up.shape != (K, R):
-        raise ValueError("expected W_down[320,10240] and W_up[10240,320]")
-    if w_down.dtype != torch.bfloat16 or w_up.dtype != torch.bfloat16:
-        raise ValueError("GRRead weights must be BF16")
-    if w_down.device != w_up.device or not w_down.is_cuda or torch.version.hip is None:
-        raise ValueError("weights must be on the same ROCm device")
-    if x.shape != (rows, K) or x.dtype != w_down.dtype or x.device != w_down.device:
-        raise ValueError("input must match the weights' dtype and device and have shape [rows,10240]")
-    if not x.is_contiguous():
-        raise ValueError("input must be contiguous")
-    props = torch.cuda.get_device_properties(x.device)
-    if props.gcnArchName.split(":", 1)[0] != "gfx942":
-        raise ValueError("GRRead currently targets gfx942")
-    down_config = select_down_config(rows, props.multi_processor_count)
-    down_block_m, down_num_waves, down_n_splits, down_block_k = down_config
-    n_splits = select_n_splits(rows, props.multi_processor_count)
-    with torch.cuda.device(x.device):
-        # 保留H64内stream优先的布局；这里只搬迁准备逻辑，不改变权重排列。
-        up_interleaved = w_up.detach().reshape(C, H // 64, 2, 4, 2, 4, R).permute(1, 0, 2, 4, 3, 5, 6).contiguous().reshape(K, R)
-        w_down = preshuffle_weight(w_down)
-        w_up = preshuffle_weight(up_interleaved)
-        partial = torch.empty((rows, R), dtype=x.dtype, device=x.device)
-        output = torch.empty((rows, H), dtype=x.dtype, device=x.device)
-        down = up = None
-        if rows:
-            # compile会执行launcher；直接使用本次足量二维X，不再额外分配占位输入。
-            stream = torch.cuda.current_stream(x.device)
-            down = flyc.compile(
-                make_down(n_splits=down_n_splits, block_m=down_block_m,
-                          num_waves=down_num_waves, block_k=down_block_k),
-                x, w_down, partial, rows, stream)
-            up = flyc.compile(make_up(n_splits=n_splits), x, w_up, partial, output, rows, stream)
-    return w_down, w_up, partial, output, down, up, down_config, n_splits
+
+def prepare_gr_read(x, w_down, w_up):
+    """Compatibility tuple for historical scripts; current tests use the public object."""
+    reader = prepare_reader(x, w_down, w_up)
+    return (reader.w_down, reader.w_up, reader.partial, reader.output,
+            reader.down, reader.up, reader.down_config, reader.up_config[1])
 
 
 def run_down(x, w_down, partial, down):
@@ -220,30 +207,30 @@ def check_batch(rows, args):
     torch, _, _, _ = dependencies()
     with torch.no_grad():
         x, wd, wu = make_inputs(torch, rows, args.seed)
-        w_down, w_up, partial, output, down, up, down_config, n_splits = prepare_gr_read(x, wd, wu)
-        down_block_m, down_num_waves, down_n_splits, down_block_k = down_config
+        reader = prepare_reader(x, wd, wu)
+        partial, output = reader.partial, reader.output
+        dm, dw, dn, dk = reader.down_config
+        um, un = reader.up_config
         p_expected, y_expected = reference_bf16(x, wd, wu)
         assert partial.dtype == output.dtype == torch.bfloat16
         assert partial.shape == (rows, R)
-        # 单独检查两基础函数，再检查完整调用；共用同一参考，不做结构/内部选型测试。
         partial.fill_(torch.nan)
-        assert run_down(x, w_down, partial, down) is partial
+        assert reader.run_down(x) is partial
         p_error = check_close(partial, p_expected, DOWN_TOLERANCE)
         output.fill_(torch.nan)
-        assert run_up(x, w_up, partial, output, up) is output
+        assert reader.run_up(x) is output
         y_error = check_close(output, y_expected, OUTPUT_TOLERANCE)
         partial.fill_(torch.nan); output.fill_(torch.nan)
-        assert run_gr_read(x, w_down, w_up, partial, output, down, up) is output
+        assert reader(x) is output
         check_close(partial, p_expected, DOWN_TOLERANCE)
         check_close(output, y_expected, OUTPUT_TOLERANCE)
-        result = {"complete": True, "rows": rows, "down_n_splits": down_n_splits,
-              "down_block_m": down_block_m, "down_num_waves": down_num_waves, "down_block_k": down_block_k,
-                  "n_splits": n_splits, "P_rel_l2": p_error, "Y_rel_l2": y_error,
+        result = {"complete": True, "rows": rows, "down_n_splits": dn,
+                  "down_block_m": dm, "down_num_waves": dw, "down_block_k": dk,
+                  "up_block_m": um, "n_splits": un, "P_rel_l2": p_error, "Y_rel_l2": y_error,
                   "P_tolerance": DOWN_TOLERANCE, "Y_tolerance": OUTPUT_TOLERANCE,
                   "partial_shape": list(partial.shape), "checked_scopes": list(SCOPES)}
-        print(f"  T={rows:5d}  Down M{down_block_m}/W{down_num_waves}/N{down_n_splits}/BK{down_block_k} "
-              f"/ Up N{n_splits}  "
-              f"Down rel_l2={p_error:.6g}  Output rel_l2={y_error:.6g}  PASS", flush=True)
+        print(f"  T={rows:5d} Down M{dm}/W{dw}/N{dn}/BK{dk} / Up M{um}/N{un} "
+              f"Down rel_l2={p_error:.6g} Output rel_l2={y_error:.6g} PASS", flush=True)
         return result
 
 
@@ -283,6 +270,8 @@ def validate_hardware(snapshot):
 
 
 def hardware_gate(args, folder, phase):
+    import time
+    time.sleep(2)
     snapshot = read_hardware(args.gpu, args.amd_smi)
     # 门禁未通过也先保留实际状态；不重新查询直到通过。
     write_json(folder / f"hardware_{phase}.json", snapshot)
@@ -307,41 +296,41 @@ def benchmark_batch(rows, args, folder):
     with torch.no_grad():
         x, wd, wu = make_inputs(torch, rows, args.seed)
         inputs = [x] + [x.clone() for _ in range(args.buffers - 1)]
-        buffers = [(input_x, *prepare_gr_read(input_x, wd, wu)) for input_x in inputs]
+        readers = [prepare_reader(input_x, wd, wu) for input_x in inputs]
         expected_p = expected_y = None
         addresses = []
         calls = {scope: [] for scope in SCOPES}
-        for input_x, w_down, w_up, partial, output, down, up, down_config, n_splits in buffers:
-            down_block_m, down_num_waves, down_n_splits, down_block_k = down_config
+        for input_x, reader in zip(inputs, readers):
+            dm, dw, dn, dk = reader.down_config
+            um, un = reader.up_config
+            partial, output = reader.partial, reader.output
             addresses.append({name: tensor_address(tensor, output=name == "Y") for name, tensor in zip(
-                ("X", "W_down", "W_up", "P", "Y"), (input_x, w_down, w_up, partial, output))})
-            calls["down"].append((input_x, w_down, partial, down))
-            calls["up"].append((input_x, w_up, partial, output, up))
-            calls["total"].append((input_x, w_down, w_up, partial, output, down, up))
+                ("X", "W_down", "W_up", "P", "Y"),
+                (input_x, reader.w_down, reader.w_up, partial, output))})
+            calls["down"].append(lambda x=input_x, r=reader: r.run_down(x))
+            calls["up"].append(lambda x=input_x, r=reader: r.run_up(x))
+            calls["total"].append(lambda x=input_x, r=reader: r(x))
             partial.fill_(torch.nan); output.fill_(torch.nan)
-            run_gr_read(*calls["total"][-1])
+            reader(input_x)
             if expected_p is None:
                 expected_p, expected_y = partial.clone(), output.clone()
             torch.testing.assert_close(partial, expected_p, rtol=0, atol=0)
             torch.testing.assert_close(output, expected_y, rtol=0, atol=0)
         assert all(len({row[name]["pointer"] for row in addresses}) == args.buffers for name in addresses[0])
         write_json(folder / "addresses.json", addresses)
-        for scope, launch in zip(SCOPES, (run_down, run_up, run_gr_read)):
-            for index in range(args.warmup):
-                launch(*calls[scope][index % args.buffers])
+        for scope in SCOPES:
+            for index in range(args.warmup): calls[scope][index % args.buffers]()
         torch.cuda.synchronize()
         ready = hardware_gate(args, folder, "before_samples")
         timings = {}
         with (folder / "samples.jsonl").open("x") as raw:
-            for scope, launch in zip(SCOPES, (run_down, run_up, run_gr_read)):
+            for scope in SCOPES:
                 perf = cuda_perf(name=f"gr_read_{scope}", verbose=0)
                 if not perf.enable:
                     raise RuntimeError("CUDAPERF disables GRRead timing")
                 for index in range(args.iters):
                     bi = index % args.buffers
-                    launch_args = calls[scope][bi]
-                    with perf:
-                        launch(*launch_args)
+                    with perf: calls[scope][bi]()
                     us = perf.latencies[-1] * 1e6
                     assert math.isfinite(us) and us > 0
                     raw.write(json.dumps({"scope": scope, "sample": index, "buffer": bi, "us": us}) + "\n")
@@ -349,24 +338,23 @@ def benchmark_batch(rows, args, folder):
                 samples = [value * 1e6 for value in perf.latencies]
                 assert len(samples) == args.iters
                 for bi in sorted({index % args.buffers for index in range(args.iters)}):
-                    _, _, _, partial, output, _, _, _, _ = buffers[bi]
-                    torch.testing.assert_close(partial if scope == "down" else output,
+                    reader = readers[bi]
+                    torch.testing.assert_close(reader.partial if scope == "down" else reader.output,
                                                expected_p if scope == "down" else expected_y, rtol=0, atol=0)
                 flops = (4 if scope == "total" else 2) * rows * 10240 * 320
                 elapsed = median(samples)
                 timings[scope] = {"elapsed_us": elapsed, "samples_us": samples, "gemm_FLOPs": flops,
                                   "effective_TFLOPS": flops / elapsed / 1e6}
-                print(f"  T={rows:5d} Down M{down_block_m}/W{down_num_waves}/N{down_n_splits}/BK{down_block_k} "
-                      f"/ Up N{n_splits} {scope:5s}: {elapsed:.3f} us, "
-                      f"{timings[scope]['effective_TFLOPS']:.3f} effective TFLOPS", flush=True)
+                print(f"  T={rows:5d} Down M{dm}/W{dw}/N{dn}/BK{dk} / Up M{um}/N{un} "
+                      f"{scope}: {elapsed:.3f} us", flush=True)
         after = hardware_gate(args, folder, "after")
-        return {"complete": True, "rows": rows, "down_n_splits": down_n_splits,
-                "down_block_m": down_block_m, "down_num_waves": down_num_waves, "down_block_k": down_block_k,
-                "n_splits": n_splits, "timings": timings,
+        return {"complete": True, "rows": rows, "down_n_splits": dn,
+                "down_block_m": dm, "down_num_waves": dw, "down_block_k": dk,
+                "up_block_m": um, "n_splits": un, "timings": timings,
                 "hardware_before": before, "hardware_before_samples": ready, "hardware_after": after,
                 "buffers": args.buffers, "warmup_each": args.warmup, "samples_each": args.iters,
-                "timed_outputs_bitexact": True, "all_samples_retained": True, "Total_measured_directly": True,
-                "settings_written": False}
+                "timed_outputs_bitexact": True, "all_samples_retained": True,
+                "Total_measured_directly": True, "settings_written": False}
 
 
 def release_buffers():
@@ -452,7 +440,7 @@ if __name__ == "__main__":
 import pytest
 
 
-@pytest.mark.parametrize("rows", (0, 1, 31, 33, 63, 65, 127, 129, 255, 257, 511, 513,
+@pytest.mark.parametrize("rows", (0, 1, 31, 33, 47, 48, 49, 63, 65, 127, 129, 255, 257, 511, 513,
                                   1023, 1025, 2047, 2049, 2560, 2561, 3072, 3073,
                                   4095, 4097, 65537, *DEFAULT_BATCHES))
 def test_gr_read(rows):
@@ -465,3 +453,90 @@ def test_gr_read(rows):
         check_batch(rows, argparse.Namespace(seed=131))
     finally:
         release_buffers()
+
+
+def require_rocm():
+    torch = pytest.importorskip("torch")
+    if torch.version.hip is None or not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx942"):
+        pytest.skip("gfx942 required")
+    use_checkout_package()
+    return torch
+
+
+def test_prepared_weights_shared_and_current_stream():
+    torch = require_rocm()
+    from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
+
+    with torch.inference_mode():
+        x, wd, wu = make_inputs(torch, 64, 917)
+        packed = prepare_weights(wd, wu)
+        before_weights = tuple(w.clone() for w in packed)
+        first = GRReadPrefill(64, *packed)
+        second = GRReadPrefill(129, *packed)
+        assert first.w_down.data_ptr() == second.w_down.data_ptr() == packed[0].data_ptr()
+        assert first.w_up.data_ptr() == second.w_up.data_ptr() == packed[1].data_ptr()
+        assert first.partial.data_ptr() != second.partial.data_ptr()
+        assert first.output.data_ptr() != second.output.data_ptr()
+        before_x = x.clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            assert first(x) is first.output
+        torch.cuda.current_stream().wait_stream(stream)
+        expected = reference_bf16(x, wd, wu)[1]
+        torch.testing.assert_close(first.output, expected, **OUTPUT_TOLERANCE)
+        saved = first.output.clone()
+        x2 = make_inputs(torch, 129, 918)[0]
+        second(x2)
+        torch.testing.assert_close(first.output, saved, rtol=0, atol=0)
+        x.mul_(0.99).add_(0.015625)
+        first(x)
+        torch.testing.assert_close(first.output, reference_bf16(x, wd, wu)[1], **OUTPUT_TOLERANCE)
+        assert torch.equal(before_x.mul(0.99).add(0.015625), x)
+        assert all(torch.equal(w, original) for w, original in zip(packed, before_weights))
+
+
+def test_prepared_input_contract():
+    torch = require_rocm()
+    from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
+
+    x, wd, wu = make_inputs(torch, 64, 919)
+    packed = prepare_weights(wd, wu)
+    reader = GRReadPrefill(64, *packed)
+    with pytest.raises(ValueError):
+        reader(x[:63])
+    with pytest.raises(ValueError):
+        reader(x.float())
+    noncontiguous = torch.empty((64, 20480), device=x.device, dtype=x.dtype)[:, ::2]
+    with pytest.raises(ValueError):
+        reader(noncontiguous)
+    with pytest.raises(ValueError):
+        GRReadPrefill(True, *packed)
+    with pytest.raises(ValueError):
+        GRReadPrefill(64, *packed, output=torch.empty_like(x))
+
+
+def test_prepared_multiple_devices():
+    torch = require_rocm()
+    if torch.cuda.device_count() < 2 or not torch.cuda.get_device_properties(1).gcnArchName.startswith("gfx942"):
+        pytest.skip("two gfx942 devices required")
+    from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
+
+    with torch.inference_mode(), torch.cuda.device(0):
+        x, wd, wu = make_inputs(torch, 64, 920)
+        pd, pu = prepare_weights(wd, wu)
+        first = GRReadPrefill(64, pd, pu)
+        pd1, pu1 = pd.to("cuda:1"), pu.to("cuda:1")
+        second = GRReadPrefill(64, pd1, pu1)
+        x1 = x.to("cuda:1")
+        expected = first(x).clone()
+        actual = second(x1).to("cuda:0")
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.cuda.current_device() == 0
+        with torch.cuda.device(1):
+            first.run_down(x)
+            first.run_up(x)
+            assert torch.cuda.current_device() == 1
+        torch.testing.assert_close(first.output, expected, rtol=0, atol=0)

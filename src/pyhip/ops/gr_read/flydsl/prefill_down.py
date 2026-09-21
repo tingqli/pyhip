@@ -16,33 +16,39 @@ GROUPS = K // BK // GROUP_STEPS
 
 
 @cache
-def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64):
-    """Specialize by tile shape; the launcher receives the actual rows at runtime.
+def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64, swizzle_shift=3):
+    """Build a complete-K Down with tunable M/N tiles, waves, BK and LDS swizzle.
 
-    N1/N2/N4/N5 cover disjoint 320/160/80/64-channel slices without split-K or reduction launches.
-    N5 also supports M32 with two/four waves and M16 with two waves.
-    Automatic dispatch selects M32/W4/N5/BK128 for calibrated small batches.
-    Other batches retain M64/W4/N1 or N2 with BK64 and full K10240 reduction.
-    Two-wave tiles remain explicit experimental candidates, not automatic choices.
-    Callers must provide positive rows and P[rows, R]; tail stores are bounded by the actual row count.
+    N1/N2/N4 retain their original M64/W4/BK64 configurations.
+    N5/N10/N20 allow smaller M tiles and one, two or four waves.
+    BK64..1024 choices are bounded by thread-copy coverage and 64 KiB LDS.
+    K groups and scheduling budgets follow the actual tile/request counts.
+    The original FP32 accumulation -> BF16 -> FP32 SiLU -> BF16 order is preserved.
+    Runtime rows bound all tail loads/stores; weight packing is unchanged.
     """
-    if n_splits not in (1, 2, 4, 5):
-        raise ValueError("n_splits must be 1, 2, 4 or 5")
-    if (block_m, num_waves) not in ((64, 4), (32, 4), (32, 2), (16, 2)):
-        raise ValueError("expected M64/W4, M32/W4, M32/W2 or M16/W2")
-    if block_m != 64 and n_splits != 5:
-        raise ValueError("small-M tiles currently require n_splits=5")
-    if block_k not in (64, 128):
-        raise ValueError("block_k must be 64 or 128")
-    if block_k != 64 and (block_m, num_waves, n_splits) != (32, 4, 5):
-        raise ValueError("BK128 currently requires M32/W4/N5")
-    BM = block_m
-    BK = block_k
+    if n_splits not in (1, 2, 4, 5, 10, 20):
+        raise ValueError('unsupported N split')
+    if block_m not in (16, 32, 64) or num_waves not in (1, 2, 4):
+        raise ValueError('unsupported M/waves')
+    if block_k not in (64, 128, 256, 512, 1024):
+        raise ValueError('unsupported BK')
+    BM, BK = block_m, block_k
+    assert BM * BK * 4 <= 65536 and BK // 8 <= num_waves * 64
+    GROUP_STEPS = 8
+    while (K // BK) % GROUP_STEPS:
+        GROUP_STEPS //= 2
     GROUPS = K // BK // GROUP_STEPS
+    SWIZZLE_SHIFT = (BK.bit_length() - 4) if swizzle_shift is None else swizzle_shift
     THREADS = num_waves * 64
     BN = R // n_splits
-    N_WAVES, M_WAVES = ({1: (4, 1), 2: (2, 2), 4: (1, 4), 5: (4, 1)}[n_splits]
-                        if BM == 64 else (num_waves, 1))
+    if n_splits in (1, 2, 4):
+        assert (BM, num_waves, BK) == (64, 4, 64)
+        N_WAVES, M_WAVES = {1: (4, 1), 2: (2, 2), 4: (1, 4)}[n_splits]
+    else:
+        N_WAVES = min(num_waves, BN // 16)
+        M_WAVES = num_waves // N_WAVES
+    assert BM % (16 * M_WAVES) == 0 and BN % (16 * N_WAVES) == 0
+    STORE_MFMA = 2 if n_splits <= 5 else 1
     A_REQUESTS = BM * BK // (THREADS * 8)
     A_LDS_READS = BM // M_WAVES // 8 * (BK // 64)
     VMEM_REQUESTS = A_REQUESTS + BN // N_WAVES // 8 * (BK // 64)
@@ -103,7 +109,7 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64):
         a_source = a_gcopy.partition_S(a_tiles)
         a_transfer = fx.make_fragment_like(a_source[None, None, None, 0])
         shared = fx.SharedAllocator().allocate(Shared).peek()
-        swizzle = fx.make_composed_layout(fx.static(fx.SwizzleType.get(3, 3, 3)),
+        swizzle = fx.make_composed_layout(fx.static(fx.SwizzleType.get(3, 3, SWIZZLE_SHIFT)),
                                            fx.make_ordered_layout((BM, BK), (1, 0)))
         a_lds = [fx.make_view(pointer, swizzle) for pointer in (shared.a0.ptr, shared.a1.ptr)]
         a_scopy = fx.make_tiled_copy(copy_s, tv, fx.make_tile(threads_m, BK)).get_slice(tid)
@@ -148,18 +154,19 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64):
                         rocdl.sched_mfma(4)
                 else:
                     # M64的N4/N5保持原配额；小M按实际A搬运条数调整，K顺序不变。
-                    # 每条A LDS store留两条MFMA，其余按真实VMEM请求数分配。
+                    # 按N分片为每条A LDS store留1或2条MFMA，其余按真实VMEM请求数分配。
                     for request in range_constexpr(VMEM_REQUESTS):
                         ds_reads = A_LDS_READS // VMEM_REQUESTS + (request < A_LDS_READS % VMEM_REQUESTS)
                         if const_expr(ds_reads):
                             rocdl.sched_dsrd(ds_reads)
                         rocdl.sched_vmem(1)
-                        count = ((request + 1) * (STAGE_MFMA - 2 * A_REQUESTS) // VMEM_REQUESTS
-                                 - request * (STAGE_MFMA - 2 * A_REQUESTS) // VMEM_REQUESTS)
-                        rocdl.sched_mfma(count)
+                        count = ((request + 1) * (STAGE_MFMA - STORE_MFMA * A_REQUESTS) // VMEM_REQUESTS
+                                 - request * (STAGE_MFMA - STORE_MFMA * A_REQUESTS) // VMEM_REQUESTS)
+                        if const_expr(count > 0):
+                            rocdl.sched_mfma(count)
                 for _ in range_constexpr(A_REQUESTS):
                     rocdl.sched_dswr(1)
-                    rocdl.sched_mfma(2)
+                    rocdl.sched_mfma(STORE_MFMA)
             rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.sched_barrier(0)
             fx.gpu.barrier()
