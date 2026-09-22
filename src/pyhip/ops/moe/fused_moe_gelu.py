@@ -67,7 +67,7 @@ def fused_moe_gelu(
     bias1=None,
     bias2=None,
     splitk=0,
-    method="auto", # jit, gluon, auto
+    method="auto", # jit, auto
 ):
     device = hidden_states.device
     def get_inter_dim(w1_shape, w2_shape):
