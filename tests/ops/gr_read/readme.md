@@ -66,36 +66,38 @@ Down 保持完整 K 的 FP32 累加 → BF16 舍入 → 转回 FP32 除 4、SiLU
 ## 4. 正确性与性能入口
 
 ```bash
-# 全部基础正确性，包括大 T 与边界；单 GPU 时双 GPU 项跳过。
-HIP_VISIBLE_DEVICES=0,1 python3 -m pytest -q tests/contrib/gr_read/test_gr_read.py
-
-# 原入口默认 21 档：32/64/128/256/512 及 1K–64K。
-python3 tests/contrib/gr_read/test_gr_read.py --gpu 3 --check-only
-# 性能表同时输出 Down、Up、Total、Torch compile Total 和加速比。
+# 正确性统一入口：默认检查 decode 和 prefill 的 Down/Up/Total。
 python3 tests/contrib/gr_read/test_gr_read.py --gpu 3
 
-# 重点检查新的配置边界。
-python3 tests/contrib/gr_read/test_gr_read.py --gpu 3 --check-only \
-  --batches 47 48 49 128 129 256 257 512 513
+# Pytest 保留原数值、边界、共享权重和 device 回归检查。
+HIP_VISIBLE_DEVICES=0,1 python3 -m pytest -q tests/contrib/gr_read/test_gr_read.py
 
-# 与当前 SGLang checkout 的 prefill 对照，普通调用，无 CUDA Graph。
-python3 tests/contrib/gr_read/bench_gr_read_compare.py \
-  --phase prefill --sglang-root /opt/sglang --gpu 3 \
-  --rows 48 64 128 192 256 384 512 1024 \
-  --output /tmp/gr_read_prefill_compare.jsonl
+# Benchmark 默认显示进度，最后输出 Decode 和 Prefill 两张表，不需要 --output。
+python3 tests/contrib/gr_read/bench_gr_read_compare.py --gpu 3 --sglang-root /opt/sglang
+
+# 只测 prefill：33/64/128/256/512 及 1K–64K 共 21 档，无需 SGLang 安装。
+python3 tests/contrib/gr_read/bench_gr_read_compare.py --phase prefill --gpu 3
+
+# 检查 prefill Up：先运行并校验 Down 的 P，再检查 Up；不做 Total 验证或性能计时。
+python3 tests/contrib/gr_read/test_gr_read.py --phase prefill --scope up --gpu 3 \
+  --batches 33 48 64 128 129 256 257 512 513
+
+# 仅在需要保留原始样本时显式指定输出文件。
+python3 tests/contrib/gr_read/bench_gr_read_compare.py --gpu 3 --sglang-root /opt/sglang \
+  --output /tmp/gr_read_compare.jsonl
 ```
 
-原性能入口分别测 Down、Up、Total，并新增 Torch compile 完整调用。使用原 `cudaPerf`，默认 10 组独立 buffer、各阶段 2 次预热、10 个样本取中位数；保留逐阶段采样顺序，Torch compile 接在 Total 后面。这张表使用各阶段整组样本的中位数，不是交错 A/B 测量。Total 直接测量。权重打包、对象构造、首次编译、参考与校验不计时。门禁前固定静置 2 秒，单次查询要求 GPU use≤5%、VRAM≤20%、PTL Enabled/VECTOR,F8；失败停止并保留数据。没有修改设备设置或剔除长尾。
+Benchmark 的 prefill 表分别测 Down、Up、Total 和 Torch compile 完整调用。使用原 `cudaPerf`，默认 10 组独立 buffer、各阶段 2 次预热、10 个样本取中位数；保留逐阶段采样顺序，Torch compile 接在 Total 后面。这张表使用各阶段整组样本的中位数，不是交错 A/B 测量。Total 直接测量。权重打包、对象构造、首次编译、参考与校验不计时。门禁前固定静置 2 秒，单次查询要求 GPU use≤5%、VRAM≤20%、PTL Enabled/VECTOR,F8；失败停止并保留数据。没有修改设备设置或剔除长尾。
 
-表格新增 `Torch compile us / TFLOPS` 和 `Speedup`，其中 **Speedup = Torch compile Total / PyHIP Total**，大于 1 表示 PyHIP 更快；结果及全部样本也写入原 JSON/JSONL 输出。TFLOPS 两边都按 `4*T*10240*320` 的有效 GEMM 工作量计算。
+表格新增 `Torch compile us / TFLOPS` 和 `Speedup`，其中 **Speedup = Torch compile Total / PyHIP Total**，大于 1 表示 PyHIP 更快；显式传入 `--output` 时，结果及全部样本写入 JSONL。默认显示阶段初始化、逐 batch 准备/检查/时延进度，最后打印两张完整表，不自动创建结果文件或目录。进度实时刷新，均在计时区间外；`--verbose` 可额外显示硬件和详细正确性信息。TFLOPS 两边都按 `4*T*10240*320` 的有效 GEMM 工作量计算。
 
-这里的 Torch compile 对照在脚本内保留 SGLang `2843214f6ed923e992a74ee4d7a0cda5d7deddbf` 的 `_mix_compute` 公式，使用默认 `torch.compile`，只返回 Y，无需安装 SGLang。每次对完整 T 调用一次；原来按 1024 行分块、返回 P/Y 的正确性参考仍单独保留，不用于计时。两边使用同一个 X；Torch 轮换 10 对原始 BF16 权重，PyHIP 使用对应的 packed 权重，均在准备阶段生成。Torch 保留原生中间张量和输出分配，地址单独记录，内部工作区不强制与 PyHIP 相同。所有实际被计时的 Torch 输出都会检查；prefill 全程普通调用，无 CUDA Graph。`--check-only` 仍只运行原正确性检查。
+这里的 Torch compile 对照在脚本内保留 SGLang `2843214f6ed923e992a74ee4d7a0cda5d7deddbf` 的 `_mix_compute` 公式，使用默认 `torch.compile`，只返回 Y，无需安装 SGLang。每次对完整 T 调用一次；原来按 1024 行分块、返回 P/Y 的正确性参考仍单独保留，不用于计时。两边使用同一个 X；Torch 轮换 10 对原始 BF16 权重，PyHIP 使用对应的 packed 权重，均在准备阶段生成。Torch 保留原生中间张量和输出分配，地址单独记录，内部工作区不强制与 PyHIP 相同。所有实际被计时的 Torch 输出都会检查；prefill 全程普通调用，无 CUDA Graph。`test_gr_read.py` 现在只运行正确性检查，保留 `--check-only` 兼容写法；性能测试统一在 `bench_gr_read_compare.py`。
 
-[SGLang 对照脚本](bench_gr_read_compare.py)读取指定 checkout 的原 `_mix_compute` AST 并按原方式 `torch.compile`，同时加载 `hc_mix_triton.py` 的实现及支持判断。两边共用原始权重值和 X；PyHIP 的 packed 权重每对只准备一次、跨所有 T 复用。JSONL 记录版本、源码 hash、地址、原始样本、初始/改变输入 FP64 检查；`--output` 必须是新文件。
+[SGLang 对照脚本](bench_gr_read_compare.py)读取指定 checkout 的原 `_mix_compute` AST 并按原方式 `torch.compile`，同时加载 `hc_mix_triton.py` 的实现及支持判断。两边共用原始权重值和 X；PyHIP 的 packed 权重每对只准备一次、跨所有 T 复用。可选 JSONL 记录版本、源码 hash、地址、原始样本、初始/改变输入 FP64 检查；只有显式提供 `--output` 才写文件，文件名须为新路径。
 
 当前核对的 SGLang `2843214f6ed923e992a74ee4d7a0cda5d7deddbf` 在 gfx942 非确定性推理下，T1–16 为 Triton persistent，T≥17 为 torch.compile。对照脚本按实际支持函数选择后端。测量从已经归一化的 X 开始，不含 RMSNorm、TP 通信和整个模型。
 
-本 prefill 补丁可独立运行上述对照；若仓库同时有 `tests/contrib/gr_read_decode/kernel.py`，同一脚本的 `--phase decode` 默认覆盖 T1–32，Down/Up/Total 分别捕获 CUDA Graph。独立 decode 源码未包含在本 prefill 补丁中。
+两个入口都支持 `--phase all/decode/prefill`，默认 all。指定一个 phase 时可用 `--rows` / `--batches`；同时运行两阶段时用 `--decode-rows` 和 `--prefill-rows`。Decode 默认覆盖全部 T1–32，benchmark 的 Down/Up/Total/SGLang 分别捕获 Graph；prefill 的 Graph 开关与采样方式保持原样。
 
 T48–512 的正式优化前后对照已在 30 档、普通调用下验证：选中的两段实现全部快于该版 SGLang torch.compile，范围为 1.06–4.19×。这是特定硬件和固定协议的测量，不能将少量样本 smoke 的时延替代完整数据。迁入公共接口后的同址配对复测中，30 档时延变化中位数为 −0.095%，最大增加 0.451%；完整报告和原始数据记录在本机 `qwen3.8-flash-next-doc` 的 45/46 号文档。
 
@@ -131,22 +133,38 @@ Decode 默认覆盖全部 T1–32，独立测量、独立出表。Prefill 继续
 在仓库根目录运行：
 
 ```bash
-# 原 decode 正确性：默认 2 对权重、全部 T1–32、6528 次 Graph replay。
-HIP_VISIBLE_DEVICES=2 python3 tests/contrib/gr_read_decode/test_gr_read.py
+# Decode 正确性：原 2 对权重、全部 T1–32、6528 次完整调用 Graph replay，加分阶段检查。
+python3 tests/contrib/gr_read/test_gr_read.py --phase decode --gpu 2
 
-# 原 decode 带宽型负载基准：100 对独立权重，全部 T1–32。
-HIP_VISIBLE_DEVICES=2 python3 tests/contrib/gr_read_decode/bench_gr_read.py \
-  --weights 100 --rounds 3 --samples 7 --seed 707 \
-  --output /tmp/gr_read_decode_graph.jsonl
+# 只排查 decode Down 或 Up。
+python3 tests/contrib/gr_read/test_gr_read.py --phase decode --scope down --rows 1 16 17 32 --gpu 2
+python3 tests/contrib/gr_read/test_gr_read.py --phase decode --scope up --rows 1 16 17 32 --gpu 2
 
-# Decode 与当前 SGLang 单独对照，Down/Up/Total 分别捕获 Graph。
+# Decode 的独立 Graph 对照表：原 100 权重 / 3 rounds / 7 samples，默认不写文件。
 python3 tests/contrib/gr_read/bench_gr_read_compare.py \
-  --phase decode --sglang-root /opt/sglang --gpu 2 \
-  --output /tmp/gr_read_decode_sglang.jsonl
+  --phase decode --sglang-root /opt/sglang --gpu 2
 ```
 
-`--output` 使用新文件名。原 decode 基准的 100 组独立权重工作集、buffer 准备、capture、计时器和检查流程保持：图内依次执行所有实例两轮，每个样本 replay 三次，Event 时间除以 600；3 轮 × 7 个样本全部保留并取中位数。Packing、编译和参考不计时。输出仍使用原微秒时延与有效 TFLOPS 指标，未把逻辑字节数当成实测 HBM 流量。
+Decode 对照保持原 PR 中的 100 组独立权重工作集、buffer 准备、capture、计时器和检查流程：图内依次执行所有实例两轮，每个样本 replay 三次，Event 时间除以 600；3 轮 × 7 个样本全部保留并取中位数。Packing、编译和参考不计时。原独立 Total 基准的计时核心保留在 benchmark 文件的 `benchmark_decode_total()` 中供回归使用，默认不额外输出第三张表。
 
 SGLang 对照读取指定 checkout 的原实现和支持判断。在本机 gfx942、默认非确定性推理下，T1–16 为 Triton persistent，T17–32 为 Torch compile；两边均使用 decode 的 Graph 协议。对照表包含 T1–32 每一行和实际后端，独立于 prefill 表。两边使用相同 X 与逻辑权重，PyHIP packing 在准备阶段完成。
 
 原 FP64 容差 `rtol=1e-2, atol=5e-3`、live rows 缩小/恢复、zero/stale/NaN 尾行、P/Y 预污染、内部 padding、guard、输入及权重不变检查全部保留。
+
+### Decode 与 prefill 的测法不同
+
+Decode 使用 CUDA Graph 测量，prefill 使用原 `cudaPerf` 普通调用，两者分别出表。以下为默认参数；每次 GR read 调用的 batch 都是该行的 T。
+
+| 项目 | Decode | Prefill |
+| --- | --- | --- |
+| 执行方式 | CUDA Graph | 普通调用，无 CUDA Graph |
+| 工作集 | 100 组独立权重和对应输入实例 | 10 组独立 buffer |
+| 一个图的内容 | `calls + calls`：100 个实例执行两遍，共 200 次调用 | 没有图 |
+| 一个计时样本 | Event 包住 3 次 graph replay，共 600 次调用 | 一个 `with cudaPerf` 包住一次调用 |
+| 换算为每次调用的 µs | `elapsed_ms * 1000 / (100 * 2 * 3)` | `perf.latencies[-1] * 1e6`，由秒转换为 µs |
+| 显式采样前预热 | 每轮先 replay 图 3 次，预热不计时 | 每个 scope 普通调用 2 次，预热不计时 |
+| 最终统计 | 3 轮 × 7＝21 个均摊时延样本，取中位数 | 10 个单次调用时延样本，取中位数 |
+
+Decode 公式中的 `1000` 是毫秒转微秒，`100` 是独立测试实例数，`2` 来自图中的 `calls + calls`，`3` 来自计时区间的三次 replay。实际代码使用实例数 `N * 2 * 3` 作分母，100 是默认的 N。对于 Total，一次调用已经包含 Down＋Up；外层 3×7 只负责收集 21 个样本，再取中位数。
+
+图构造前的预执行、packing、首次编译和正确性检查均在计时区外。以上差异沿用各自原有基准；同一张表里的 PyHIP 与 SGLang/Torch compile 使用该表对应的计时方式。
