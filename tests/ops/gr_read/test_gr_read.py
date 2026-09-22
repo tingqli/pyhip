@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Decode and prefill correctness, with separate numerical contracts.
+"""Check decode/prefill accuracy, then print separate performance tables.
 
-Benchmarking lives in bench_gr_read_compare.py. Direct execution defaults to
-both phases; no result file is created unless --output is supplied.
+Direct execution checks all selected batches before running the existing
+samplers in bench_gr_read_compare.py. --check-only skips performance.
+No result file is created unless --output is supplied; pytest checks accuracy only.
 """
 import argparse
 from contextlib import nullcontext
@@ -392,17 +393,22 @@ def selected_rows(parser, args):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("all", "decode", "prefill"), default="all")
-    parser.add_argument("--scope", choices=(*SCOPES, "all"), default="all")
-    parser.add_argument("--gpu", type=int, default=3)
+    parser.add_argument("--scope", choices=(*SCOPES, "all"), default="all",
+                        help="accuracy scope; a single scope implies --check-only")
+    parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--rows", "--batches", nargs="+", type=parse_batch)
     parser.add_argument("--decode-rows", nargs="+", type=parse_batch)
     parser.add_argument("--prefill-rows", nargs="+", type=parse_batch)
-    parser.add_argument("--decode-weights", type=int, default=2)
-    parser.add_argument("--decode-seed", type=int, default=303)
+    parser.add_argument("--decode-weights", type=int, default=2, help="accuracy weight pairs; performance retains 100")
+    parser.add_argument("--decode-seed", type=int, default=303, help="accuracy seed; performance retains seed 707")
     parser.add_argument("--prefill-seed", type=int, default=131)
     parser.add_argument("--seed", type=int, help="override the selected single phase")
     parser.add_argument("--weights", type=int, help="alias for --decode-weights in decode-only mode")
-    parser.add_argument("--check-only", action="store_true", help="compatibility alias; this script only checks correctness")
+    parser.add_argument("--check-only", action="store_true", help="check accuracy only; skip hardware gates and timing")
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument("--sglang-root", type=Path, help="optional SGLang checkout for decode performance comparison")
+    comparison.add_argument("--no-sglang", action="store_true", help="skip SGLang comparison; still measure PyHIP and prefill Torch compile")
+    parser.add_argument("--amd-smi", type=Path, help="compatible amd-smi CLI for performance hardware gates")
     parser.add_argument("--output", type=Path, help="optional new JSONL file; default: console only")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -415,47 +421,100 @@ def parse_args(argv=None):
         args.decode_weights = args.weights
     if args.gpu < 0 or args.decode_weights < 1 or not __debug__:
         parser.error("nonnegative GPU and positive weight count required; do not use python -O")
+    args.check_only = args.check_only or args.scope != "all"
     return args
 
 
-def main(argv=None):
-    args = parse_args(argv)
-    prepare_cli_environment(args)
+def run_correctness(args, emit):
+    """Keep the original accuracy workloads, completing both phases before timing."""
     use_checkout_package()
     import torch
     from pyhip.ops.gr_read.flydsl import prepare_weights
     if torch.version.hip is None or not torch.cuda.is_available():
         raise RuntimeError("ROCm GPU required")
-    if args.output: args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.phase in ("all", "decode"):
+        print(f"Accuracy: decode {len(args.decode_rows)} batches, {args.decode_weights} weight pairs, scope={args.scope}", flush=True)
+        total = 0
+        with torch.inference_mode():
+            for i in range(args.decode_weights):
+                _, wd, wu = make_decode_inputs(1, args.decode_seed + i)
+                pd, pu = prepare_weights(wd, wu)
+                before_down, before_up = pd.clone(), pu.clone()
+                for index, rows in enumerate(args.decode_rows, 1):
+                    print(f"[Decode accuracy {i + 1}/{args.decode_weights}, {index}/{len(args.decode_rows)}] T={rows}", flush=True)
+                    seed = args.decode_seed + i * 10000 + rows
+                    if args.scope in ("down", "up", "all"):
+                        result = check_decode_stages(rows, wd, wu, pd, pu, seed, args.scope)
+                        emit({"type": "stage_check", "phase": "decode", "weight": i, **result})
+                    if args.scope in ("total", "all"):
+                        result = check_decode_rows(rows, wd, wu, pd, pu, seed)
+                        total += result["replays"]
+                        emit({"type": "check", "phase": "decode", "weight": i, **result})
+                    assert torch.equal(pd, before_down) and torch.equal(pu, before_up), "packed weights mutated"
+        emit({"type": "summary", "phase": "decode", "complete": True, "rows": args.decode_rows, "replays": total})
+        print(f"Decode: {len(args.decode_rows)} shapes, {args.decode_weights} weight pairs, {total} full-path Graph replays PASS", flush=True)
+    if args.phase in ("all", "prefill"):
+        for index, rows in enumerate(args.prefill_rows, 1):
+            print(f"[Prefill accuracy {index}/{len(args.prefill_rows)}] T={rows}, scope={args.scope}", flush=True)
+            result = check_batch(rows, argparse.Namespace(seed=args.prefill_seed, scope=args.scope, verbose=args.verbose))
+            emit({"type": "check", "phase": "prefill", **result})
+        emit({"type": "summary", "phase": "prefill", "complete": True, "rows": args.prefill_rows})
+        print(f"Prefill: {len(args.prefill_rows)} shapes, {args.scope} PASS", flush=True)
+
+
+@cache
+def benchmarking():
+    import importlib.util
+    path = Path(__file__).with_name("bench_gr_read_compare.py")
+    spec = importlib.util.spec_from_file_location("gr_read_benchmark", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def benchmark_options(args):
+    # Preserve the independent decode accuracy (2/303) and performance (100/707)
+    # workloads. Other sampling options remain on the standalone benchmark CLI.
+    options = ["--phase", args.phase, "--gpu", str(args.gpu),
+               "--decode-rows", *map(str, args.decode_rows),
+               "--prefill-rows", *map(str, args.prefill_rows),
+               "--prefill-seed", str(args.prefill_seed)]
+    for name in ("sglang_root", "amd_smi"):
+        value = getattr(args, name)
+        if value is not None:
+            options.extend(("--" + name.replace("_", "-"), str(value)))
+    if args.no_sglang:
+        options.append("--no-sglang")
+    if args.verbose:
+        options.append("--verbose")
+    return benchmarking().parse_args(options)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    performance = None if args.check_only else benchmark_options(args)
+    prepare_cli_environment(args)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
     with (args.output.open("x") if args.output else nullcontext()) as out:
         def emit(record):
             if out:
-                out.write(json.dumps(record, allow_nan=False) + "\n"); out.flush()
-        if args.phase in ("all", "decode"):
-            total = 0
-            with torch.inference_mode():
-                for i in range(args.decode_weights):
-                    _, wd, wu = make_decode_inputs(1, args.decode_seed + i)
-                    pd, pu = prepare_weights(wd, wu)
-                    before_down, before_up = pd.clone(), pu.clone()
-                    for rows in args.decode_rows:
-                        seed = args.decode_seed + i * 10000 + rows
-                        if args.scope in ("down", "up", "all"):
-                            result = check_decode_stages(rows, wd, wu, pd, pu, seed, args.scope)
-                            emit({"type": "stage_check", "phase": "decode", "weight": i, **result})
-                        if args.scope in ("total", "all"):
-                            result = check_decode_rows(rows, wd, wu, pd, pu, seed)
-                            total += result["replays"]
-                            emit({"type": "check", "phase": "decode", "weight": i, **result})
-                        assert torch.equal(pd, before_down) and torch.equal(pu, before_up), "packed weights mutated"
-            emit({"type": "summary", "phase": "decode", "complete": True, "rows": args.decode_rows, "replays": total})
-            print(f"Decode: {len(args.decode_rows)} shapes, {args.decode_weights} weight pairs, {total} full-path Graph replays PASS")
-        if args.phase in ("all", "prefill"):
-            for rows in args.prefill_rows:
-                result = check_batch(rows, argparse.Namespace(seed=args.prefill_seed, scope=args.scope, verbose=args.verbose))
-                emit({"type": "check", "phase": "prefill", **result})
-            emit({"type": "summary", "phase": "prefill", "complete": True, "rows": args.prefill_rows})
-            print(f"Prefill: {len(args.prefill_rows)} shapes, {args.scope} PASS")
+                out.write(json.dumps({"stage": "accuracy", **record}, allow_nan=False) + "\n")
+                out.flush()
+        print(f"[1/{1 if args.check_only else 2}] Accuracy checks for all selected batches", flush=True)
+        run_correctness(args, emit)
+        release_buffers()
+        if performance is not None:
+            print("\n[2/2] All selected batches passed accuracy; starting performance.", flush=True)
+            bench = benchmarking()
+            bench.run_benchmarks(
+                performance,
+                lambda phase, record: bench.emit_record(out, phase, {"stage": "performance", **record}),
+                prefill_checked=True,
+            )
+        else:
+            print("Accuracy complete; performance skipped (--check-only or single --scope).", flush=True)
     return 0
 
 

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Print separate decode Graph and prefill eager benchmark tables.
 
-Defaults preserve the two PR #36 protocols. Progress is printed during setup
+Defaults preserve the two PR #36 protocols. SGLang comparison is optional.
+Progress is printed during setup
 and between measurements, followed by the final tables. No result files are
 created unless --output is supplied.
 """
@@ -55,6 +56,8 @@ def dependencies(sglang_root):
     decode = SimpleNamespace(GRReadDecode=GRReadDecode, prepare_weights=prepare_weights,
                              down_launcher=make_decode_down, up_launcher=make_decode_up)
     check = SimpleNamespace(reference=reference, assert_close=assert_close, make_inputs=make_inputs, capture=capture)
+    if sglang_root is None:
+        return torch, flyc, cudaPerf, decode, check, prefill, None, None
     source = sglang_root / 'python/sglang/srt/layers/hyperconnection.py'
     tree = ast.parse(source.read_text())
     functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_mix_compute']
@@ -193,8 +196,10 @@ class Case:
         (self.pd, self.pu, self.p, self.y) = (pd, pu, reader.partial, reader.output)
         self.down = flyc.compile(decode.down_launcher(rows), x.view(-1), pd, self.p, torch.cuda.current_stream(x.device))
         self.up = flyc.compile(decode.up_launcher(rows), x.view(-1), pu, self.p, self.y.view(-1), torch.cuda.current_stream(x.device))
-        self.sg_backend = 'triton' if triton_mix.fused_hc_mix_supported(x, wd, wu) else 'torch.compile'
-        self.sg_call = triton_mix.fused_hc_mix if self.sg_backend == 'triton' else compiled_mix
+        self.sg_backend = self.sg_call = None
+        if triton_mix is not None:
+            self.sg_backend = 'triton' if triton_mix.fused_hc_mix_supported(x, wd, wu) else 'torch.compile'
+            self.sg_call = triton_mix.fused_hc_mix if self.sg_backend == 'triton' else compiled_mix
         self.sg_y = None
 
     def run(self, scope):
@@ -223,7 +228,8 @@ def fp64_check(case, reference):
         end = min(begin + 1024, case.rows)
         expected = reference(case.x[begin:end], case.wd, case.wu)
         output_check(case.torch, case.y[begin:end], expected, 'PyHIP vs FP64')
-        output_check(case.torch, case.sg_y[begin:end], expected, 'SGLang vs FP64')
+        if case.sg_call is not None:
+            output_check(case.torch, case.sg_y[begin:end], expected, 'SGLang vs FP64')
 
 
 def decode_stage_check(case):
@@ -261,29 +267,31 @@ def check_timed(cases, scope):
 
 def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
     (torch, _, cudaPerf, _, check, prefill, _, _) = dep
+    scopes = SCOPES if dep[-1] is not None else SCOPES[:-1]
     gen = torch.Generator(device='cuda').manual_seed(args.seed + rows)
     cases = [Case(rows, torch.randn(rows, 10240, device='cuda', dtype=torch.bfloat16, generator=gen), wd, wu, args, dep, packed_pairs[i] if packed_pairs is not None else None) for (i, (wd, wu)) in enumerate(pairs)]
     stage_errors = []
     for (index, c) in enumerate(cases):
         c.run('total')
-        c.run('sglang')
+        if c.sg_call is not None:
+            c.run('sglang')
         fp64_check(c, check.reference)
         if args.phase == 'decode' and index < 2:
             stage_errors.append(decode_stage_check(c))
-        (c.saved_p, c.saved_y, c.saved_sg) = (c.p.clone(), c.y.clone(), c.sg_y.clone())
+        (c.saved_p, c.saved_y, c.saved_sg) = (c.p.clone(), c.y.clone(), c.sg_y.clone() if c.sg_y is not None else None)
     graphs = {}
-    for scope in SCOPES:
+    for scope in scopes:
         calls = [lambda c=c, scope=scope: c.run(scope) for c in cases]
         graphs[scope] = check.capture(calls + calls)
         graphs[scope].replay()
         check_timed(cases, scope)
     emit({'type': 'correctness', 'phase': 'initial', 'rows': rows, 'pairs': len(pairs), 'fp64_passed': True, 'isolated_down_max_abs': stage_errors, 'isolated_up_fp64_passed': bool(stage_errors)})
-    emit({'type': 'addresses', 'rows': rows, 'buffers': [{k: address(v) for (k, v) in (('X', c.x), ('WD_raw', c.wd), ('WU_raw', c.wu), ('WD_packed', c.pd), ('WU_packed', c.pu), ('P', c.p), ('Y', c.y), ('SGLang_Y', c.sg_y))} for c in cases]})
+    emit({'type': 'addresses', 'rows': rows, 'buffers': [{k: address(v) for (k, v) in (('X', c.x), ('WD_raw', c.wd), ('WU_raw', c.wu), ('WD_packed', c.pd), ('WU_packed', c.pu), ('P', c.p), ('Y', c.y), ('SGLang_Y', c.sg_y)) if v is not None} for c in cases]})
     torch.cuda.synchronize()
     gate(prefill, args, 'before_samples', emit, rows)
-    values = {scope: [] for scope in SCOPES}
+    values = {scope: [] for scope in scopes}
     for round_index in range(args.rounds):
-        order = SCOPES if round_index % 2 == 0 else SCOPES[::-1]
+        order = scopes if round_index % 2 == 0 else scopes[::-1]
         for scope in order:
             samples = graph_samples(torch, graphs[scope], len(cases) * 2, args.samples)
             values[scope].extend(samples)
@@ -293,19 +301,23 @@ def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
         c.x.mul_(0.99).add_(0.015625)
     if graphs:
         graphs['total'].replay()
-        graphs['sglang'].replay()
+        if 'sglang' in graphs:
+            graphs['sglang'].replay()
     else:
         for c in cases:
             c.run('total')
-            c.run('sglang')
+            if c.sg_call is not None:
+                c.run('sglang')
     for c in cases:
         fp64_check(c, check.reference)
     torch.cuda.synchronize()
     gate(prefill, args, 'after_samples', emit, rows)
     timings = {scope: median(samples) for (scope, samples) in values.items()}
-    result = {'type': 'result', 'rows': rows, 'phase': args.phase, 'mode': 'cuda_graph' if graphs else 'eager', 'sglang_backend': cases[0].sg_backend, 'median_us': timings, 'speedup_total': timings['sglang'] / timings['total'], 'changed_input_fp64_passed': True, 'effective_tflops': {s: (2 if s in ('down', 'up') else 4) * rows * 10240 * 320 / (v * 1000000.0) for (s, v) in timings.items()}}
+    result = {'type': 'result', 'rows': rows, 'phase': args.phase, 'mode': 'cuda_graph' if graphs else 'eager', 'sglang_backend': cases[0].sg_backend, 'median_us': timings, 'speedup_total': timings['sglang'] / timings['total'] if 'sglang' in timings else None, 'changed_input_fp64_passed': True, 'effective_tflops': {s: (2 if s in ('down', 'up') else 4) * rows * 10240 * 320 / (v * 1000000.0) for (s, v) in timings.items()}}
     emit(result)
-    print(f"T={rows:5d} {result['mode']:10s} Down={timings['down']:.3f} Up={timings['up']:.3f} Total={timings['total']:.3f} SGLang({cases[0].sg_backend})={timings['sglang']:.3f} us speedup={result['speedup_total']:.3f}x", flush=True)
+    comparison = (f" SGLang({cases[0].sg_backend})={timings['sglang']:.3f} us speedup={result['speedup_total']:.3f}x"
+                  if 'sglang' in timings else " SGLang: not run")
+    print(f"T={rows:5d} {result['mode']:10s} Down={timings['down']:.3f} Up={timings['up']:.3f} Total={timings['total']:.3f}" + comparison, flush=True)
     return result
 
 
@@ -520,8 +532,10 @@ def parse_args(argv=None):
     checks = testing()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--phase', choices=('all', 'decode', 'prefill'), default='all')
-    parser.add_argument('--gpu', type=int, default=3)
-    parser.add_argument('--sglang-root', type=Path, help='SGLang checkout; otherwise infer the installed checkout')
+    parser.add_argument('--gpu', type=int, default=0)
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument('--sglang-root', type=Path, help='SGLang checkout; otherwise use an installed checkout if available')
+    comparison.add_argument('--no-sglang', action='store_true', help='measure PyHIP decode only; prefill still includes Torch compile')
     parser.add_argument('--rows', '--batches', nargs='+', type=checks.parse_batch)
     parser.add_argument('--decode-rows', nargs='+', type=checks.parse_batch)
     parser.add_argument('--prefill-rows', nargs='+', type=checks.parse_batch)
@@ -553,18 +567,21 @@ def parse_args(argv=None):
     counts = (args.decode_weights, args.decode_rounds, args.decode_samples, args.prefill_buffers, args.prefill_iters)
     if min(counts) < 1 or args.gpu < 0 or args.prefill_warmup < 0 or args.settle_seconds < 0 or not __debug__:
         parser.error('positive counts, nonnegative GPU/warmup/settling required; do not use python -O')
-    if args.phase != 'prefill':
+    if args.phase != 'prefill' and not args.no_sglang:
         if args.sglang_root is None:
-            spec = importlib.util.find_spec('sglang')
+            try:
+                spec = importlib.util.find_spec('sglang')
+            except ModuleNotFoundError:
+                spec = None
             if spec is not None and spec.origin:
                 candidate = Path(spec.origin).resolve().parents[2]
                 if (candidate / 'python/sglang/srt/layers/hyperconnection.py').is_file():
                     args.sglang_root = candidate
-        if args.sglang_root is None:
-            parser.error('decode comparison requires --sglang-root pointing to the SGLang checkout')
-        args.sglang_root = args.sglang_root.resolve()
-        if not (args.sglang_root / 'python/sglang/srt/layers/hyperconnection.py').is_file():
-            parser.error('SGLang hyperconnection.py was not found under --sglang-root')
+        if args.sglang_root is not None:
+            args.sglang_root = args.sglang_root.resolve()
+            for name in ('hyperconnection.py', 'hc_mix_triton.py'):
+                if not (args.sglang_root / 'python/sglang/srt/layers' / name).is_file():
+                    parser.error(f'SGLang {name} was not found under --sglang-root')
     return args
 
 
@@ -584,23 +601,29 @@ def run_decode(args, emit):
                             weights=args.decode_weights, rounds=args.decode_rounds,
                             samples=args.decode_samples, warmup=2, settle_seconds=args.settle_seconds,
                             amd_smi=args.amd_smi, verbose=args.verbose)
+    runtime = 'runtime and SGLang' if args.sglang_root is not None else 'PyHIP runtime'
     print(f"\nDecode: {len(args.decode_rows)} batches, {local.weights} weight pairs, "
-          f"{local.rounds}x{local.samples} Graph samples/scope. Loading runtime and SGLang...", flush=True)
+          f"{local.rounds}x{local.samples} Graph samples/scope. Loading {runtime}...", flush=True)
+    if args.sglang_root is None:
+        print("SGLang comparison not run; measuring PyHIP Down/Up/Total. "
+              "Use --sglang-root to add the SGLang comparison.", flush=True)
     dep = dependencies(args.sglang_root)
     torch, _, _, _, check, prefill, _, _ = dep
     props = torch.cuda.get_device_properties(0)
     if torch.version.hip is None or props.gcnArchName.split(':')[0] != 'gfx942':
         raise RuntimeError('decode comparison targets ROCm gfx942')
     source_paths = [Path(__file__), Path(__file__).with_name('test_gr_read.py'),
-                    args.sglang_root / 'python/sglang/srt/layers/hyperconnection.py',
-                    args.sglang_root / 'python/sglang/srt/layers/hc_mix_triton.py',
                     *(REPO / 'src/pyhip/ops/gr_read/flydsl').glob('*.py')]
+    if args.sglang_root is not None:
+        source_paths.extend(args.sglang_root / 'python/sglang/srt/layers' / name
+                            for name in ('hyperconnection.py', 'hc_mix_triton.py'))
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
           'gpu': props.name, 'arch': props.gcnArchName, 'compute_units': props.multi_processor_count,
           'protocol': {'weights': local.weights, 'rounds': local.rounds, 'samples': local.samples,
                        'seed': local.seed, 'graph_passes': 2, 'replays_per_sample': 3, 'mode': 'cuda_graph'},
           'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
-          'sglang_head': subprocess.check_output(['git', '-C', str(args.sglang_root), 'rev-parse', 'HEAD'], text=True).strip(),
+          'sglang_head': (subprocess.check_output(['git', '-C', str(args.sglang_root), 'rev-parse', 'HEAD'], text=True).strip()
+                          if args.sglang_root is not None else None),
           'settings_written': False})
     gate(prefill, local, 'entry', emit)
     results = []
@@ -621,7 +644,7 @@ def run_decode(args, emit):
     return results
 
 
-def run_prefill(args, emit):
+def run_prefill(args, emit, *, check=True):
     prefill = testing()
     local = SimpleNamespace(gpu=args.gpu, seed=args.prefill_seed, buffers=args.prefill_buffers,
                             warmup=args.prefill_warmup, iters=args.prefill_iters,
@@ -634,7 +657,7 @@ def run_prefill(args, emit):
                        'seed': local.seed, 'scope_order': list(TIMING_SCOPES), 'mode': 'eager'},
           'settings_written': False})
     # Keep the original prefill flow: all selected correctness checks before timing.
-    for index, rows in enumerate(args.prefill_rows, 1):
+    for index, rows in enumerate(args.prefill_rows if check else (), 1):
         try:
             print(f"[Prefill check {index}/{len(args.prefill_rows)}] T={rows}: checking correctness (JIT may compile)...", flush=True)
             result = prefill.check_batch(rows, local)
@@ -663,23 +686,21 @@ def print_decode_table(results):
     print('|---:|---:|---:|---:|---|---:|---:|')
     for r in results:
         t = r['median_us']
+        sg_time = f"{t['sglang']:.3f}" if 'sglang' in t else '—'
+        speedup = f"{r['speedup_total']:.3f}x" if r['speedup_total'] is not None else '—'
         print(f"| {r['rows']} | {t['down']:.3f} | {t['up']:.3f} | {t['total']:.3f} | "
-              f"{r['sglang_backend']} | {t['sglang']:.3f} | {r['speedup_total']:.3f}x |")
+              f"{r['sglang_backend'] or 'not run'} | {sg_time} | {speedup} |")
 
 
-def main(argv=None):
-    args = parse_args(argv)
+def run_benchmarks(args, emit, *, prefill_checked=False):
+    """Run the existing samplers and print both final tables after all phases."""
     checks = testing()
-    checks.prepare_cli_environment(args)
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
     results_by_phase = {}
-    with (args.output.open('x') if args.output else nullcontext()) as stream:
-        if args.phase in ('all', 'decode'):
-            results_by_phase['decode'] = run_decode(args, lambda r: emit_record(stream, 'decode', r))
-            checks.release_buffers()
-        if args.phase in ('all', 'prefill'):
-            results_by_phase['prefill'] = run_prefill(args, lambda r: emit_record(stream, 'prefill', r))
+    if args.phase in ('all', 'decode'):
+        results_by_phase['decode'] = run_decode(args, lambda r: emit('decode', r))
+        checks.release_buffers()
+    if args.phase in ('all', 'prefill'):
+        results_by_phase['prefill'] = run_prefill(args, lambda r: emit('prefill', r), check=not prefill_checked)
     print('\nBenchmark complete. Final results:', flush=True)
     if 'decode' in results_by_phase:
         print_decode_table(results_by_phase['decode'])
@@ -687,6 +708,16 @@ def main(argv=None):
         print('\nPrefill (eager cudaPerf)')
         print_prefill_table(results_by_phase['prefill'])
     sys.stdout.flush()
+    return results_by_phase
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    testing().prepare_cli_environment(args)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+    with (args.output.open('x') if args.output else nullcontext()) as stream:
+        run_benchmarks(args, lambda phase, record: emit_record(stream, phase, record))
     return 0
 
 
