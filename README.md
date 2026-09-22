@@ -1,204 +1,227 @@
-# pyhip
+# PyHIP
 
-PyHIP provides AMDGPU kernels implemented with assembly, HIP, FlyDSL, Triton,
-and Gluon, alongside the tools used to develop them. Kernels are installed as
-normal Python modules under `pyhip.ops`; assembly JIT is one backend, not a
-requirement for the other implementations.
+**AMDGPU kernels, development tools, and evaluation in one repository.**
 
-The assembly authoring tools retain the existing features:
+PyHIP is a workspace for developing, integrating, and comparing GPU kernels
+written in **HIP, FlyDSL, Triton, Gluon, or Python-generated assembly**. Reusable
+implementations are shipped as Python modules under `pyhip.ops` and can be
+imported directly after installation.
 
- - Following Triton's design philosophy, kernels are described in Python with jit decorators triggering the compilation pipeline. The resulting kernels can be called directly and interact seamlessly with PyTorch.
- - No automatic spilling; any variable allocated with J.gpr is guaranteed to be mapped to physical registers.
- - SGPR/VGPR register lifetimes are automatically managed and allocated.
- - SGPR/VGPR expressions support basic arithmetic (add, subtract, multiply, divide, modulo), bitwise shifts, AND, OR, NOT — clean, intuitive, and maintainable.
- - Python context managers enable control flow code generation for While/If constructs, significantly improving code readability.
- - Direct invocation of arbitrary instructions with explicit s_waitcnt, enabling fine-grained instruction pipelining.
+The repository separates three responsibilities:
 
-# Install
+- **Use kernels:** import an implementation or an existing operator wrapper.
+- **Develop kernels:** use the language and compiler suited to the problem;
+    assembly JIT is an optional tool, not the center of every implementation.
+- **Evaluate kernels:** keep correctness regressions, explicit benchmarks, and
+    experimental implementations separate, with reusable measurement helpers.
 
-Create [prebuilt Docker image with PyTorch pre-installed](https://rocm.docs.amd.com/projects/install-on-linux/en/develop/install/3rd-party/pytorch-install.html), then run a container and install this package inside container.
+There is no mandatory backend class hierarchy, common compiler, or universal
+"fastest kernel" dispatcher. Each implementation retains its own interface and
+supported shapes, layouts, dtypes, and GPU architectures.
+
+## Installation
+
+Use a Linux environment with an AMD GPU, ROCm, and a matching ROCm PyTorch build.
+A [ROCm PyTorch container](https://rocm.docs.amd.com/projects/install-on-linux/en/develop/install/3rd-party/pytorch-install.html)
+is a convenient starting point.
 
 ```bash
-pip install git+https://github.com/tingqli/pyhip.git
-# or clone the repo and run editable install with "pip install -e ."
+# Install from GitHub
+python -m pip install git+https://github.com/tingqli/pyhip.git
+
+# Or, from a checkout, install the current branch for development
+python -m pip install -e .
 ```
 
-Install the compiler/runtime dependencies required by the selected implementation
-in the same environment (ROCm PyTorch, FlyDSL, Triton/Gluon, and Aiter where used).
-`import pyhip` does not import these optional backends or initialize a GPU.
-First calls may compile kernels; installing the package does not precompile every
-architecture or remove the corresponding compiler requirements.
+Install the dependencies required by the selected implementation in the same
+environment: ROCm toolchain for HIP/assembly, FlyDSL for FlyDSL kernels,
+Triton with Gluon support for Gluon kernels, and Aiter or other integration
+dependencies where used. The base package does not install all GPU backends.
 
-After updating from the old layout, reinstall an existing editable installation
-so that it points to `src/pyhip`, rather than the former `src` package root.
+`import pyhip` does not import the optional GPU backends or initialize a GPU.
+Importing a specific implementation may load its dependencies. First calls can
+compile kernels; installation does not precompile all architectures or remove
+the corresponding compiler requirements.
 
-# Package layout
+For an existing editable installation from the old layout, reinstall it so it
+points to the package under [src/pyhip](src/pyhip).
+
+## Using installed kernels
+
+Choose the implementation explicitly. Packaged kernels do not require imports
+from repository tests or a test-directory `PYTHONPATH`.
+
+| Operator family | Implementations currently present |
+|---|---|
+| [GEMM / Linear](src/pyhip/ops/gemm) | Assembly, Gluon, and a multi-backend quantized Linear wrapper |
+| [MoE](src/pyhip/ops/moe) | Assembly, FlyDSL, Gluon, fused wrappers, and a reference implementation |
+| [Attention](src/pyhip/ops/attention) | Assembly paged attention and Triton linear attention |
+| [Convolution](src/pyhip/ops/conv) | HIP depthwise and assembly/Gluon pointwise implementations |
+| [GRRead](src/pyhip/ops/gr_read) | FlyDSL down/up projections |
+| [MLP](src/pyhip/ops/mlp) | Gluon fused gate/up |
+
+Availability in this table does not imply support for every GPU or input shape.
+Check the implementation and its associated tests for the required contract.
+
+For example, this BF16 grouped pointwise convolution uses the Gluon path:
+
+```python
+import torch
+from pyhip.ops.conv.conv_pointwise import conv_pointwise
+
+x = torch.randn((1, 16, 3, 4, 64), device="cuda", dtype=torch.bfloat16)
+weight = torch.randn((4, 4, 4), device="cuda", dtype=torch.bfloat16)
+bias = torch.randn((16,), device="cuda", dtype=torch.bfloat16)
+
+y = conv_pointwise(x, weight, bias, groups=4, use_gluon=True)
+assert y.shape == x.shape
+```
+
+Other entry points include `pyhip.ops.moe.fused_moe.fused_moe`,
+`pyhip.ops.moe.asm.moe.moe_2stage_splitk`, and
+`pyhip.ops.moe.flydsl.moe_gemm_2stage.compile_moe_gemm1`. Some are complete
+Tensor operators; others are low-level kernels or launcher factories. Refer to
+their signatures rather than assuming identical call conventions.
+
+## Repository layout
 
 ```text
-src/pyhip/
-    ops/                    # Installable kernels and their existing wrappers
-        gemm/                 # asm/, gluon/, multi-backend linear wrapper
-        moe/                  # asm/, flydsl/, gluon/, fused wrappers/reference
-        attention/            # asm/, triton/
-        conv/                 # Existing wrappers; hip/ contains packaged C++ sources
-        gr_read/flydsl/        # GRRead down/up projections
-        mlp/gluon/            # Fused MLP
-    codegen/                # Shared, language-specific authoring tools
-        asm/                  # Assembly JIT, IR/passes, allocator, common generators
-        flydsl/               # Layout, tiled-copy/MMA, and tensor helpers
-        gluon/                # Shared Gluon helpers
-    runtime/                # HIP source compilation, code-object loading/launch
-    testing/                # Timing and correctness helpers
-    tools/                  # Standalone code inspection and hardware probes
-tests/                    # Default regression suite: codegen/asm and ops/<operation>
-benchmarks/               # Explicit operator timing/model-matrix entry points
-experiments/              # Kernel prototypes, their local tests, and analysis tools
-docs/                     # Usage and optimization notes
+src/pyhip/                  # Installed Python package
+├── ops/                    # Operators, grouped by operation and backend
+│   ├── gemm/               # asm/, gluon/, and existing wrappers
+│   ├── moe/                # asm/, flydsl/, gluon/, wrappers/reference
+│   ├── attention/          # asm/, triton/
+│   ├── conv/               # Wrappers and packaged hip/ sources
+│   ├── gr_read/flydsl/     # Down/up projections
+│   └── mlp/gluon/          # Fused MLP
+├── codegen/                # Shared asm/, flydsl/, and gluon/ authoring tools
+├── runtime/                # HIP compilation, code-object loading, and launch
+├── testing/                # Timing, accuracy comparison, and trace helpers
+└── tools/                  # Explicit code-inspection and hardware-probing tools
+
+tests/                      # Default correctness/regression suite
+├── codegen/asm/            # Assembly JIT and instruction tests (includes GPU work)
+└── ops/                    # Tests of installed operators
+benchmarks/                 # Explicit operator timing and model-matrix scripts
+experiments/                # Prototypes with their own tests, benchmarks, and notes
+docs/                       # Usage, debugging, and optimization documentation
+archive/                    # Historical code and reference material
+.github/skills/             # Reusable development and validation guidance
 ```
 
-Import the implementation you need directly after either a wheel or editable
-installation; no test-directory `PYTHONPATH` is needed to use packaged kernels:
+**Dependency direction:** tests and benchmarks consume the installed package;
+the installed package must not depend on them. Experimental groups can contain
+their own kernels without becoming part of the published API.
 
-```python
-from pyhip.ops.moe.fused_moe import fused_moe
-from pyhip.ops.moe.asm.moe import moe_2stage_splitk
-from pyhip.ops.moe.flydsl.moe_gemm_2stage import compile_moe_gemm1
-from pyhip.ops.conv.conv_depthwise import conv_depthwise_3d
-from pyhip.testing import run_perftest
-```
+Existing multi-backend wrappers remain at the operation level. Native sources
+are packaged with their wrappers; compilation outputs belong in user caches,
+not the installation directory. Package discovery and resource inclusion are
+defined in [pyproject.toml](pyproject.toml).
 
-Call signatures, kernel bodies, and tuning parameters are unchanged. Modules
-that already combine multiple backends stay together at the operation level;
-they are not split into a new dispatch framework. New implementations belong
-under the operation's backend package. Tests and benchmarks import those modules,
-never the reverse. Native sources live with the package and are included in both
-wheels and source distributions; compiled artifacts remain in the existing user
-caches, not the installation directory.
+## Testing and benchmarking
 
-The old `pyhip.contrib.*` and `pyhip.core.*` module paths have moved. Repository
-tests, examples, and source links use the new paths. The small root API remains:
-`pyhip.jit`, `pyhip.JIT`, `pyhip.module`, timing helpers, and lazy `pyhip.fly` /
-`pyhip.printv`. Shared FlyDSL authoring helpers are now `pyhip.codegen.flydsl`.
-The embedded-HIP entry point `python -m pyhip` is unchanged; standalone tools
-are available as `python -m pyhip.tools.exts` and `python -m pyhip.tools.probe`.
-
-# Usage - Assembly kernels
-
- - use `pyhip.jit` decorator to declare a jit asm kernel
- - the first arg J of type `pyhip.JIT` provides key methods to:
-   - allocate SGPR/VGPR/AccVGPRs explictly : `J.gpr(*shape, type, [initializers])`
-   - call **any** assembly instructions directly : `J.s_store_dword/J.s_waitcnt ...`
-   - build runtime control flow : `J.While/J.If/...`
- - kernel args with string-type annotations are runtime-args, the annotation is it's HIP type; all other args w/o string-type annotations are compile-time args.
- - directly invoke the kernel with args of torch tensors, int, float ...
-
-```python
-@pyhip.jit()
-def kernel(J, N, s_pout:"int*"):
-    s_i = J.gpr('si32')
-    s_cnt = J.gpr('si32')
-    s_i[0] = 0
-    s_cnt[0] = 0
-    with J.While(s_i[0] < N) as loop:
-        with J.If((s_i[0] & 1)==0):
-            s_cnt[0] = s_cnt + s_i
-        s_i[0] = s_i[0] + 1
-
-    J.s_store_dword(s_cnt, s_pout, 0, mod="glc")
-    J.s_waitcnt(mod=f"lgkmcnt({0})")
-
-OUT = torch.arange(0,32, dtype=torch.int)
-kernel([1],[64], 32, OUT.data_ptr())
-assert OUT[0] == sum([i if (i & 1) == 0 else 0 for i in range(32)]), f"{OUT=}"
-```
-
-Internally, `pyhip.jit` wraps the jit kernel, on invokation, it checks kernel binary file-cache under `~/.pyhip` using compile-time args as the key, and only do re-build on cache miss.
-
-The build process will call jit kernel to generate IR (which is just a structured assembly), and apply following passes and then convert it into inline-asm into a HIP kernel and invokes ROCM to compile it into `.co` binary.
-
- - pass_remove_dead_bb: remove unreachable BB
- - pass_a2v: convert AccVGPRs to VGPRs for unsuitable instruction
- - pass_insert_nop: insert s_nop according to CDNA ISA
- - pass_hide_dependency: reorder nearby instructions to hide inst-to-inst dependency stall
- - pass_hide_karg_loads: reorder prelog instructions to hide kernel-arg load latency
- - pass_cse: common sub-expression elimination
- - pass_dse: dead store elimination
- - pass_dce: deac code elimination
- - pass_break_down_gprs: break logical VGPR array into smaller blocks according to instructions actually accessing needs
- - register_allocation_linear_scan: allocate physical register to logic registers
-
-# Usage - HIP kernels
-
-It can also invoke ROCM tools to compile HIP source into co file and then using `ctypes` to call HIP runtime API (from libamdhip64) to load & launch kernels from .co file.
-
-specifically, following tools from ROCm is used:
-
- - `/opt/rocm/llvm/bin/amdgpu-arch` : detect GPU arch
- - `hipcc -x hip --offload-device-only -S` : compile HIP source into .s
- - `/opt/rocm/llvm/bin/clang++ -x assembler -target amdgcn-amd-amdhsa` : assemble .s into .co
-
-First implement your device kernel using HIP language in a .cpp or .s file, and then writting following code on python side to compile & launch them.
-
-```python
-# import torch before pyhip to load correct version of runtime (libamdhip64.so)
-import torch
-import pyhip
-
-# this decorator will do recompilation if source file is modified after .co file
-#   - compile mla.cpp file into mla.s using hipcc -x hip
-#   - compile mla.s file into mla.co using clang++ -x assembler
-# and then it loads mla.co and kernel function test_kernel, wrap it as a normal python callable
-# you can call it with gridDim & blockDim & torch cuda tensors like this:
-#     test_kernel([gridx,gridy,gridz],[blkx,blky,blkz], q.data_ptr(), ....)
-@pyhip.module("mla.cpp")
-def test_kernel(q, k, v, n, sm): ...
-
-# when we meet performance issue, we can make a copy of mla.s and hack it by hand, this allows us
-# to root-cause performance issue much easier since we can avoid involving complex HIP compiler.
-@pyhip.module("mla-copy.s")
-def test_kernel(q, k, v, n, sm): ...
-
-# launch kernel on torch cuda tensor
-test_kernel([gridDim_x, gridDim_y, gridDim_z],    # grid dimensions
-            [blockDim_x, blockDim_y, blockDim_z], # block dimensions
-            q.data_ptr(), # q is a torch cuda tensor, data_ptr() get it's device side pointer
-            k.data_ptr(), # k is a torch cuda tensor, data_ptr() get it's device side pointer
-            v.data_ptr(), # v is a torch cuda tensor, data_ptr() get it's device side pointer
-            n             # normal argument
-            )
-
-```
-
-# Tests
-
-Run from the repository root after installing PyHIP. Default collection is
-limited to `tests/**/test_*.py`, with importlib mode and performance-only tests
-excluded. Existing correctness checks, shapes, tolerances, and kernel bodies
-are unchanged; many tests still require a supported ROCm GPU.
+Run from the repository root using the environment in which PyHIP is installed.
 
 ```bash
-# inspect the default regression suite without executing tests
+# Inspect the default test collection
 python -m pytest --collect-only -q
-# assembly JIT regression tests (GPU required)
-python -m pytest tests/codegen/asm -q
-# operator regression tests
+
+# Run a selected operator regression suite
 python -m pytest tests/ops/gemm/test_cdna4.py -q
-# opt in to marked performance tests
+
+# Opt in to performance-only tests
 python -m pytest tests/ops/moe/test_moe.py -m perf -s
-# GRRead retains its combined correctness/benchmark CLI (gfx942)
-python tests/ops/gr_read/test_gr_read.py --gpu 3 --check-only
-# standalone benchmark entry points
+
+# Inspect a standalone benchmark's options
 python benchmarks/moe/test_fused_moe.py --help
-python benchmarks/attention/test_pa.py
-# experimental validation must be selected explicitly
+
+# Run an experimental check explicitly
 python -m pytest experiments/elementwise/gluon/test_fused_sigmoid_mul_add.py -q
 ```
 
-See [tests/README.md](tests/README.md) for the relocation map and collection
-rules, [benchmarks/README.md](benchmarks/README.md) for timing entry points,
-and [experiments/README.md](experiments/README.md) for opt-in experimental work.
-Default collection is not a promise that every historical test passes on every
-GPU or dependency version; known upstream/test incompatibilities remain visible.
+[pytest.ini](pytest.ini) limits default collection to test-named Python modules
+under [tests](tests), uses importlib mode, and excludes the `perf` marker.
+Many tests require a GPU, including some during collection. Architecture and
+dependency constraints still apply; the directory layout is not a guarantee
+that all historical tests pass in every environment.
+
+- [tests/README.md](tests/README.md): regression entry points and collection rules.
+- [benchmarks/README.md](benchmarks/README.md): standalone timing scripts.
+- [experiments/README.md](experiments/README.md): opt-in experimental validation.
+
+Do not collect the entire experimental tree: some scripts perform GPU work or
+load saved input data at import time. GRRead deliberately keeps its combined
+test/benchmark CLI in [test_gr_read.py](tests/ops/gr_read/test_gr_read.py).
+
+Shared helpers are available from `pyhip.testing`, including `calc_diff`,
+`cudaPerf`, and `run_perftest`. The latter returns `(output, latency_us)` and
+handles warmup and tensor-buffer rotation; correctness checks and the choice of
+what is inside the timed call remain the caller's responsibility.
+
+## Developing and integrating kernels
+
+1. Keep a new prototype with its local checks and profiling scripts in the
+     appropriate experimental operation/backend group.
+2. When integrating it for direct use, put the kernel and wrapper under the
+     corresponding `pyhip.ops` module. Document shape, dtype, layout, architecture,
+     output-buffer, and weight-preparation requirements.
+3. Use backend-specific helpers from `pyhip.codegen` or the backend's own
+     compiler/runtime. Do not route FlyDSL or Triton through the assembly JIT.
+4. Add correctness coverage under the matching operator test group and an
+     explicit benchmark where useful. Keep reference calculations and compilation
+     outside the intended timing region, and state whether preparation is timed.
+
+Preserve existing operator interfaces when reorganizing code. Shared helpers
+should have a concrete use across implementations; no plugin registry or new
+framework is required just to add a kernel.
+
+Useful starting points: [FlyDSL examples](docs/learn_flydsl),
+[FlyDSL debugging](docs/debug-flydsl.md),
+[GPU profiling](docs/profile-gpu.md), and
+[development/validation guidance](.github/skills/README.md).
+
+### Migrating older imports
+
+The old `pyhip.contrib.*` and `pyhip.core.*` paths have moved to operator,
+codegen, and runtime modules. Existing `pyhip.jit`, `pyhip.JIT`, `pyhip.module`,
+timing helpers, and lazy `pyhip.fly` / `pyhip.printv` remain available.
+Use `pyhip.codegen.flydsl` for shared FlyDSL authoring helpers.
+
+## Appendix: low-level kernel authoring
+
+### Assembly JIT
+
+The original assembly toolkit is retained in
+[src/pyhip/codegen/asm](src/pyhip/codegen/asm):
+
+- `@pyhip.jit()` defines a kernel; its first argument, `J`, generates instructions.
+- `J.gpr` allocates logical SGPR/VGPR/AccVGPR values with automatic lifetime and
+    physical-register allocation, without automatic spilling.
+- `J.If` / `J.While` describe control flow; instruction methods expose explicit
+    loads, stores, MFMA, and wait counts.
+- String-annotated parameters describe runtime HIP arguments; unannotated
+    parameters specialize the kernel at compile time.
+
+The pipeline generates assembly IR, applies optimization/register-allocation
+passes, and uses ROCm to build and load a code object. Existing compiled-artifact
+caching is retained (`PYHIP_CACHE_DIR`, default `~/.pyhip`).
+
+See [basic examples](tests/codegen/asm/test_basic.py),
+[control flow](tests/codegen/asm/test_jump.py), and
+[MFMA tests](tests/codegen/asm/test_mfma_minimal.py) for executable examples.
+
+### HIP sources and code objects
+
+`pyhip.module` compiles HIP C++ or assembly sources and wraps kernel launches
+through the HIP runtime. Relative source paths are resolved against the calling
+Python module. See the [depthwise wrapper](src/pyhip/ops/conv/conv_depthwise.py),
+its [packaged HIP sources](src/pyhip/ops/conv/hip), and the
+[runtime implementation](src/pyhip/runtime/hiptools.py).
+
+`python -m pyhip` retains the embedded-Python HIP/Markdown runner.
+`python -m pyhip.tools.exts` extracts assembly from trace output;
+`python -m pyhip.tools.probe` runs hardware probes and is not part of the default
+test suite.
 
 
 
