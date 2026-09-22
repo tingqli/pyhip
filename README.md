@@ -3,7 +3,7 @@
 **AMDGPU kernels, development tools, and evaluation in one repository.**
 
 PyHIP is a workspace for developing, integrating, and comparing GPU kernels
-written in **HIP, FlyDSL, Triton, Gluon, or Python-generated assembly**. Reusable
+written in **HIP, FlyDSL, Gluon, or Python-generated assembly**. Reusable
 implementations are shipped as Python modules under `pyhip.ops` and can be
 imported directly after installation.
 
@@ -35,8 +35,9 @@ python -m pip install -e .
 
 Install the dependencies required by the selected implementation in the same
 environment: ROCm toolchain for HIP/assembly, FlyDSL for FlyDSL kernels,
-Triton with Gluon support for Gluon kernels, and Aiter or other integration
-dependencies where used. The base package does not install all GPU backends.
+Triton with Gluon support for optional convolution kernels, and Aiter or other
+integration dependencies where used. The base package does not install all GPU
+backends.
 
 `import pyhip` does not import the optional GPU backends or initialize a GPU.
 Importing a specific implementation may load its dependencies. First calls can
@@ -53,15 +54,20 @@ from repository tests or a test-directory `PYTHONPATH`.
 
 | Operator family | Implementations currently present |
 |---|---|
-| [GEMM / Linear](src/pyhip/ops/gemm) | Assembly, Gluon, and a multi-backend quantized Linear wrapper |
-| [MoE](src/pyhip/ops/moe) | Assembly, FlyDSL, Gluon, fused wrappers, and a reference implementation |
-| [Attention](src/pyhip/ops/attention) | Assembly paged attention and Triton linear attention |
+| [GEMM / Linear](src/pyhip/ops/gemm) | Assembly and an ASM/Aiter quantized Linear wrapper |
+| [MoE](src/pyhip/ops/moe) | Assembly, FlyDSL, fused wrappers, and a reference implementation |
+| [Attention](src/pyhip/ops/attention) | Assembly paged attention |
 | [Convolution](src/pyhip/ops/conv) | HIP depthwise and assembly/Gluon pointwise implementations |
 | [GRRead](src/pyhip/ops/gr_read) | FlyDSL down/up projections |
-| [MLP](src/pyhip/ops/mlp) | Gluon fused gate/up |
 
 Availability in this table does not imply support for every GPU or input shape.
 Check the implementation and its associated tests for the required contract.
+
+Quantized Linear accepts `method="auto"` or `"jit"` for ASM, and `"aiter"` for
+Aiter. Fused MoE accepts `"auto"` or `"jit"`; automatic SiLU dispatch uses ASM
+split-K for supported small-token cases and the existing eight-wave path
+otherwise. The former `method="gluon"` option is no longer supported by these
+wrappers. Optional Gluon convolution implementations remain available.
 
 For example, this BF16 grouped pointwise convolution uses the Gluon path:
 
@@ -88,13 +94,12 @@ their signatures rather than assuming identical call conventions.
 ```text
 src/pyhip/                  # Installed Python package
 ├── ops/                    # Operators, grouped by operation and backend
-│   ├── gemm/               # asm/, gluon/, and existing wrappers
-│   ├── moe/                # asm/, flydsl/, gluon/, wrappers/reference
-│   ├── attention/          # asm/, triton/
+│   ├── gemm/               # asm/ and existing wrappers
+│   ├── moe/                # asm/, flydsl/, wrappers/reference
+│   ├── attention/          # asm/
 │   ├── conv/               # Wrappers and packaged hip/ sources
-│   ├── gr_read/flydsl/     # Down/up projections
-│   └── mlp/gluon/          # Fused MLP
-├── codegen/                # Shared asm/, flydsl/, and gluon/ authoring tools
+│   └── gr_read/flydsl/      # Down/up projections
+├── codegen/                # Shared asm/ and flydsl/ authoring tools
 ├── runtime/                # HIP compilation, code-object loading, and launch
 ├── testing/                # Timing, accuracy comparison, and trace helpers
 └── tools/                  # Explicit code-inspection and hardware-probing tools
@@ -136,7 +141,7 @@ python -m pytest tests/ops/moe/test_moe.py -m perf -s
 python benchmarks/moe/test_fused_moe.py --help
 
 # Run an experimental check explicitly
-python -m pytest experiments/elementwise/gluon/test_fused_sigmoid_mul_add.py -q
+python -m pytest experiments/gemm/flydsl/test_gemm.py -k gemm_950 -q
 ```
 
 [pytest.ini](pytest.ini) limits default collection to test-named Python modules

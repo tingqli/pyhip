@@ -10,7 +10,6 @@ from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale as aiter_
 aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
 from .asm.gemm_fp8 import gemm_8wave_fp8bf16fp16
-from .gluon.gemm_splitk import gemm_splitk
 from pyhip import div_up
 
 __all__ = ["w8a8_block_fp8_linear"]
@@ -26,6 +25,9 @@ def w8a8_block_fp8_linear(
     b_preshuffle = True,
     method = "auto"
 ) -> torch.Tensor:
+    if method not in ("auto", "jit", "aiter"):
+        raise ValueError(f"Unsupported method {method!r}; expected 'auto', 'jit', or 'aiter'.")
+
     if method == "aiter":
         assert input_scale is None
         # assert input_scale is None
@@ -62,18 +64,6 @@ def w8a8_block_fp8_linear(
     M = input.numel() // K
     N = weight.shape[0]
     output = torch.empty([*input.shape[:-1], N], dtype = input.dtype, device = input.device)
-
-    if (M <= 512 and method != "jit") or method == "gluon":
-        #if input.device.index == 0:
-        #    print("=========================input ", input.shape, input.dtype, input.device)
-        #    print("=========================weight ", weight.shape, weight.dtype, weight.device)
-        #    print("=========================output ", output.shape, output.dtype, output.device)
-        #    print("=========================weight_scale ", weight_scale.shape, weight_scale.dtype, weight_scale.device, b_preshuffle)
-
-        if gemm_splitk(input, weight, output, weight_scale, b_preshuffle):
-            if bias is not None:
-                output += bias
-            return output
 
     q_input, x_scale = aiter_per1x128_quant(input.view(M, K), quant_dtype=aiter.dtypes.fp8, transpose_scale=True)
 

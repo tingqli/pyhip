@@ -9,7 +9,6 @@ tests/
     conv/           Installed pointwise convolution
     gemm/           Installed ASM GEMM variants and split-K
     gr_read/        GRRead correctness tests and its existing benchmark CLI
-    mlp/            Installed Gluon MLP
     moe/            Installed MoE implementations and cross-backend tests
 ```
 
@@ -30,7 +29,7 @@ python -m pytest tests/ops/gemm/test_cdna4.py -q
 python -m pytest tests/ops/moe/test_moe.py -m perf -s
 ```
 
-Six explicitly performance-only test functions in the GEMM, MLP, and MoE suites
+Explicitly performance-only test functions in the GEMM and MoE suites
 are marked `perf` and excluded by default. `-m perf` opts in; `-m ""` removes the
 default marker filter. Correctness tests that also record timing remain intact;
 the marker does not split or rewrite existing test bodies.
@@ -47,7 +46,6 @@ existing PyHIP JIT cache; use direct pytest commands above when that is unwanted
 | Pointwise convolution | [test_conv_pointwise.py](ops/conv/test_conv_pointwise.py) |
 | GRRead, README, and local collection config | [ops/gr_read](ops/gr_read/) |
 | Cross-backend MoE regression suite | [test_moe.py](ops/moe/test_moe.py) |
-| Gluon MLP regression suite | [test_fused_mlp.py](ops/mlp/test_fused_mlp.py) |
 | CLI-only operator timing/model matrices | [benchmarks](../benchmarks/README.md) |
 | Kernel prototypes, local checks, and profiler groups | [experiments](../experiments/README.md) |
 | Gluon debug-buffer timing helper | [pyhip.testing.timing](../src/pyhip/testing/timing.py) |
@@ -55,15 +53,14 @@ existing PyHIP JIT cache; use direct pytest commands above when that is unwanted
 The benchmark scripts that take ordinary function arguments without pytest
 fixtures remain executable scripts, not newly fabricated parametrized tests.
 GRRead keeps its single-file CLI/test design; there is no new shared runner.
-No regression or experimental test body was deleted to narrow collection.
 
 ## Existing limitations
 
 This organization does not repair historical kernels or relax their numerical
 checks. For example, the MoE mixed-dispatch test still refers to the already
 removed `gemm2_8x1_k192` / `gemm2_8x1_k320` modules. Those failures remain visible
-when selected. Some experimental Gluon scripts require an older compiler API;
-Triton linear-attention experiments need the SGLang FLA modules.
+when selected. Optional Gluon convolution tests require a compatible Triton
+installation with Gluon support.
 
 New reusable kernels belong under `src/pyhip/ops`; tests should consume the
 installed package. Small instruction/layout probes can live in a regression

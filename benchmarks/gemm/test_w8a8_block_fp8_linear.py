@@ -65,18 +65,6 @@ def test(m, n, k, b_preshuffle = False):
             b_preshuffle = b_preshuffle,
             num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"  jit {m},{n},{k}")
 
-    ret_gluon, dt = pyhip.run_perftest(
-            w8a8_block_fp8_linear,
-            input,
-            weight,
-            block_size,
-            weight_scale,
-            input_scale = None,
-            bias = None,
-            method = "gluon",
-            b_preshuffle = b_preshuffle,
-            num_flops=m*n*k*2, num_bytes=rw_bytes, num_spec_tag=f"gluon {m},{n},{k}")
-
     ret_auto, dt = pyhip.run_perftest(
             w8a8_block_fp8_linear,
             input,
@@ -91,7 +79,6 @@ def test(m, n, k, b_preshuffle = False):
 
     print(f"{pyhip.calc_diff(ref, ret_aiter)=:.6f}")
     print(f"{pyhip.calc_diff(ref, ret_jit, diff_thr=0.01)=:.6f}")
-    print(f"{pyhip.calc_diff(ref, ret_gluon, diff_thr=0.01)=:.6f}")
     print(f"{pyhip.calc_diff(ref, ret_auto, diff_thr=0.01)=:.6f}")
 
 if __name__ == "__main__":

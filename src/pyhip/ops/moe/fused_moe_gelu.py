@@ -67,8 +67,10 @@ def fused_moe_gelu(
     bias1=None,
     bias2=None,
     splitk=0,
-    method="auto", # jit, gluon, auto
+    method="auto", # jit, auto
 ):
+    if method not in ("auto", "jit"):
+        raise ValueError(f"Unsupported method {method!r}; expected 'auto' or 'jit'.")
     device = hidden_states.device
     def get_inter_dim(w1_shape, w2_shape):
         E, _, model_dim = w1_shape
