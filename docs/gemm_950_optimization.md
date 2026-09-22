@@ -166,8 +166,8 @@ Q1/Q3跨度，没有观察到显式wait和compute高优先级导致的稳定性�
 
 tile sweep延迟变化范围为-0.43%到+0.26%，默认JIT对比为
 -0.02%到+0.06%，K sweep为-0.62%到+0.31%。三组最大绝对变化分别为0.43%、0.06%和
-0.62%，均小于对应运行内Q1/Q3跨度，未观察到rebase性能回退。49行原始对比保存在
-`tests/flydsl/results/gfx950_current/rebase_comparison.csv`。
+0.62%，均小于对应运行内Q1/Q3跨度，未观察到rebase性能回退。49行原始对比可通过
+第2.4节的benchmark命令配合`--csv`重新生成。
 
 ## 4. 最终测试数据
 
@@ -194,8 +194,8 @@ tile sweep延迟变化范围为-0.43%到+0.26%，默认JIT对比为
 | 8w `256x256` | **0.097042 / 1416.3** | **0.045704 / 3007.1** |
 
 `256x256`中，4-wave与8-wave BF16延迟相差0.01%，8-wave FP8比4-wave快3.08%。全部
-16个case在计时前通过正确性检查，Q1/Q3跨度最大为2.25%。原始数据：
-`tests/flydsl/results/gfx950_current/tile_sweep.csv`。
+16个case在计时前通过正确性检查，Q1/Q3跨度最大为2.25%。原始数据可通过上文tile
+sweep命令生成到`/tmp/gemm950_tile_sweep.csv`。
 
 ### 4.3 默认8-wave FP8与JIT，`4096^3`
 
@@ -205,8 +205,8 @@ tile sweep延迟变化范围为-0.43%到+0.26%，默认JIT对比为
 | JIT preshuffle | 0.044920 ms | 0.044884/0.044972 ms | 3059.7 | -2.03% |
 | JIT row-major | 0.044984 ms | 0.044927/0.045061 ms | 3055.3 | -1.89% |
 
-三条路径均先通过同输入正确性检查，Q1/Q3跨度最大为0.34%。原始数据：
-`tests/flydsl/results/gfx950_current/default_vs_jit.csv`。
+三条路径均先通过同输入正确性检查，Q1/Q3跨度最大为0.34%。原始数据可通过上文默认
+FlyDSL/JIT对照命令生成到`/tmp/gemm950_default_vs_jit.csv`。
 
 ### 4.4 K sweep
 
@@ -235,5 +235,5 @@ FP8与JIT：
 | 16384 | 0.159456 / 3447.7 | 0.156791 / 3506.3 | 0.158525 / 3467.9 | 0.158384 / 3471.0 |
 
 在短K下JIT领先；随着K增加，差距持续缩小。K=16384时FlyDSL 8-wave FP8达到
-3506.3 TFLOPS，分别比JIT preshuffle和row-major快1.09%与1.01%。原始30行数据保存在
-`tests/flydsl/results/gfx950_current/k_sweep.csv`。
+3506.3 TFLOPS，分别比JIT preshuffle和row-major快1.09%与1.01%。原始30行数据可通过
+上文K sweep命令生成到`/tmp/gemm950_k_sweep.csv`。
