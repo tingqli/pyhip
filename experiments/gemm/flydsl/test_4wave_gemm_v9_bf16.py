@@ -784,10 +784,7 @@ import pyhip
 def _load_shuffle_weight():
     # host 端 shuffle_weight 在 tests.utils，延迟加载避免非 preshuffle 路径依赖它。
     import sys as _sys, os.path as _osp
-    _flydsl_root = _osp.abspath(_osp.join(_osp.dirname(__file__), "..", "..", ".."))
-    if _flydsl_root not in _sys.path:
-        _sys.path.insert(0, _flydsl_root)
-    from tests.utils import shuffle_weight
+    from aiter.ops.shuffle import shuffle_weight
     return shuffle_weight
 
 
