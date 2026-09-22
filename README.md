@@ -155,8 +155,9 @@ that all historical tests pass in every environment.
 - [experiments/README.md](experiments/README.md): opt-in experimental validation.
 
 Do not collect the entire experimental tree: some scripts perform GPU work or
-load saved input data at import time. GRRead deliberately keeps its combined
-test/benchmark CLI in [test_gr_read.py](tests/ops/gr_read/test_gr_read.py).
+load saved input data at import time. GRRead keeps its correctness CLI in
+[test_gr_read.py](tests/ops/gr_read/test_gr_read.py) and its benchmark CLI in
+[bench_gr_read_compare.py](tests/ops/gr_read/bench_gr_read_compare.py).
 
 Shared helpers are available from `pyhip.testing`, including `calc_diff`,
 `cudaPerf`, and `run_perftest`. The latter returns `(output, latency_us)` and
@@ -227,6 +228,5 @@ its [packaged HIP sources](src/pyhip/ops/conv/hip), and the
 `python -m pyhip.tools.exts` extracts assembly from trace output;
 `python -m pyhip.tools.probe` runs hardware probes and is not part of the default
 test suite.
-
 
 

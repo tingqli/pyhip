@@ -64,7 +64,9 @@ existing PyHIP JIT cache; use direct pytest commands above when that is unwanted
 
 The benchmark scripts that take ordinary function arguments without pytest
 fixtures remain executable scripts, not newly fabricated parametrized tests.
-GRRead keeps its single-file CLI/test design; there is no new shared runner.
+GRRead uses [test_gr_read.py](ops/gr_read/test_gr_read.py) for correctness and
+[bench_gr_read_compare.py](ops/gr_read/bench_gr_read_compare.py) for timing.
+Both cover decode and prefill; the benchmark prints a separate table for each.
 
 ## Existing limitations
 

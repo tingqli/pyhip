@@ -1,12 +1,15 @@
-# GR read prefill：正式接口与接入说明
+# GR read prefill / decode：正式接口与接入说明
 
 当前实现是两阶段 BF16 prefill：Down GEMM + SiLU 写入 P，Up GEMM + sigmoid + 四路加权归约写入 Y。T48–512 的调优已进入正式源码；调用方无需导入实验目录，也无需手动选择 kernel。
 
-支持 ROCm gfx942。固定维度为 C=4、H=2560、R=320、K=10240；本轮性能配置在 MI308X / 80CU 上验证。此入口负责 prefill，独立 decode 实现及上层 prefill/decode 分派另行接入。
+支持 ROCm gfx942。固定维度为 C=4、H=2560、R=320、K=10240；本轮性能配置在 MI308X / 80CU 上验证。`GRReadPrefill` 与 `GRReadDecode` 共用权重预处理，调用方按阶段选择对象；decode 的独立测试方法见第 6 节。
 
+## 1. 安装与最小接入
+
+FlyDSL 验证版本为 **0.3.2**。
 
 ```python
-from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
+from pyhip.ops.gr_read.flydsl import GRReadPrefill, prepare_weights
 
 # 模型加载 / 准备阶段，每对原始 BF16 权重只做一次。
 # w_down: [320, 10240]，w_up: [10240, 320]，同一张 ROCm GPU。
@@ -35,23 +38,22 @@ y64 = read64.run_up(x64)
 
 | 文件 | 职责 |
 | --- | --- |
-| [host.py](../../../src/contrib/flydsl/gr_read/host.py) | `GRReadPrefill` 准备、工作区、当前 stream/device、完整或分阶段调用 |
-| [common.py](../../../src/contrib/flydsl/gr_read/common.py) | 公共权重预处理入口、维度、固定配置选择 |
-| [prefill_down.py](../../../src/contrib/flydsl/gr_read/down.py) | 原 Down 与调优后的 tile/BK/swizzle 参数 |
-| [prefill_up.py](../../../src/contrib/flydsl/gr_read/up.py) | 原 M256 Up，按参数分派小 M 版本 |
-| [prefill_up_small.py](../../../src/contrib/flydsl/gr_read/up.py) | 合并后的 M64/M128 Up 编译期特化 |
-| [helpers.py](../../../src/contrib/flydsl/gr_read/helpers.py) | 原数值与底层辅助函数 |
+| [host.py](../../../src/pyhip/ops/gr_read/flydsl/host.py) | `GRReadPrefill` / `GRReadDecode` 准备、工作区、当前 stream/device、完整或分阶段调用 |
+| [common.py](../../../src/pyhip/ops/gr_read/flydsl/common.py) | 公共权重预处理入口、维度、固定配置选择 |
+| [down.py](../../../src/pyhip/ops/gr_read/flydsl/down.py) | Prefill Down 与调优后的 tile/BK/swizzle 参数，以及 decode split-K Down |
+| [up.py](../../../src/pyhip/ops/gr_read/flydsl/up.py) | Prefill M256/M64/M128 Up 编译期特化，以及 decode Up |
+| [helpers.py](../../../src/pyhip/ops/gr_read/flydsl/helpers.py) | 原数值与底层辅助函数 |
 
 80CU 上的配置如下，选择发生在准备阶段，无运行时 autotune：
 
 | T | Down M / waves / N splits / BK | Up M / N splits | Down swizzle shift |
 | --- | --- | --- | --- |
-| 48–128 | 16 / 2 / 10 / 1024 | 64 / 40 | 7 |
+| 33–128 | 16 / 2 / 10 / 1024 | 64 / 40 | 7 |
 | 129–256 | 16 / 2 / 10 / 512 | 128 / 40 | 6 |
 | 257–512 | 32 / 4 / 5 / 512 | 256 / 40 | 6 |
 | 其余 T，或其它 CU 数 | 原 prefill 配置选择 | 原 M256 Up | 3 |
 
-T48–512 将两个 GPU launch 收在一个已编译 host 调用中，仍然是两个 GPU kernel。此处未捕获 CUDA Graph。范围外保留原两个 launcher；其它 CU 数的回退没有在本机做性能验收。
+T33–512 将两个 GPU launch 收在一个已编译 host 调用中，仍然是两个 GPU kernel。此处未捕获 CUDA Graph。范围外保留原两个 launcher；其它 CU 数的回退没有在本机做性能验收。
 
 旧测试脚本的 `prepare_gr_read` / `run_gr_read` tuple 接口仍保留兼容；业务接入使用上面的公共对象，才能直接使用最终的配置与 host 调用路径。
 
@@ -67,23 +69,23 @@ Down 保持完整 K 的 FP32 累加 → BF16 舍入 → 转回 FP32 除 4、SiLU
 
 ```bash
 # 正确性统一入口：默认检查 decode 和 prefill 的 Down/Up/Total。
-python3 tests/contrib/gr_read/test_gr_read.py --gpu 3
+python3 tests/ops/gr_read/test_gr_read.py --gpu 3
 
 # Pytest 保留原数值、边界、共享权重和 device 回归检查。
-HIP_VISIBLE_DEVICES=0,1 python3 -m pytest -q tests/contrib/gr_read/test_gr_read.py
+HIP_VISIBLE_DEVICES=0,1 python3 -m pytest -q tests/ops/gr_read/test_gr_read.py
 
 # Benchmark 默认显示进度，最后输出 Decode 和 Prefill 两张表，不需要 --output。
-python3 tests/contrib/gr_read/bench_gr_read_compare.py --gpu 3 --sglang-root /opt/sglang
+python3 tests/ops/gr_read/bench_gr_read_compare.py --gpu 3 --sglang-root /opt/sglang
 
 # 只测 prefill：33/64/128/256/512 及 1K–64K 共 21 档，无需 SGLang 安装。
-python3 tests/contrib/gr_read/bench_gr_read_compare.py --phase prefill --gpu 3
+python3 tests/ops/gr_read/bench_gr_read_compare.py --phase prefill --gpu 3
 
 # 检查 prefill Up：先运行并校验 Down 的 P，再检查 Up；不做 Total 验证或性能计时。
-python3 tests/contrib/gr_read/test_gr_read.py --phase prefill --scope up --gpu 3 \
+python3 tests/ops/gr_read/test_gr_read.py --phase prefill --scope up --gpu 3 \
   --batches 33 48 64 128 129 256 257 512 513
 
 # 仅在需要保留原始样本时显式指定输出文件。
-python3 tests/contrib/gr_read/bench_gr_read_compare.py --gpu 3 --sglang-root /opt/sglang \
+python3 tests/ops/gr_read/bench_gr_read_compare.py --gpu 3 --sglang-root /opt/sglang \
   --output /tmp/gr_read_compare.jsonl
 ```
 
@@ -95,7 +97,7 @@ Benchmark 的 prefill 表分别测 Down、Up、Total 和 Torch compile 完整调
 
 [SGLang 对照脚本](bench_gr_read_compare.py)读取指定 checkout 的原 `_mix_compute` AST 并按原方式 `torch.compile`，同时加载 `hc_mix_triton.py` 的实现及支持判断。两边共用原始权重值和 X；PyHIP 的 packed 权重每对只准备一次、跨所有 T 复用。可选 JSONL 记录版本、源码 hash、地址、原始样本、初始/改变输入 FP64 检查；只有显式提供 `--output` 才写文件，文件名须为新路径。
 
-当前核对的 SGLang `2843214f6ed923e992a74ee4d7a0cda5d7deddbf` 在 gfx942 非确定性推理下，T1–16 为 Triton persistent，T≥17 为 torch.compile。对照脚本按实际支持函数选择后端。测量从已经归一化的 X 开始，不含 RMSNorm、TP 通信和整个模型。
+2026-09-22 重构后复测的 SGLang `a8dba4230820b4b5928dbf94f16c4487b171c086` 在 gfx942 非确定性推理下，T1–16 为 Triton persistent，T≥17 为 torch.compile；其 `_mix_compute` 与上述脚本内公式的 AST 一致。对照脚本按实际支持函数选择后端。测量从已经归一化的 X 开始，不含 RMSNorm、TP 通信和整个模型。
 
 两个入口都支持 `--phase all/decode/prefill`，默认 all。指定一个 phase 时可用 `--rows` / `--batches`；同时运行两阶段时用 `--decode-rows` 和 `--prefill-rows`。Decode 默认覆盖全部 T1–32，benchmark 的 Down/Up/Total/SGLang 分别捕获 Graph；prefill 的 Graph 开关与采样方式保持原样。
 
@@ -103,19 +105,19 @@ T48–512 的正式优化前后对照已在 30 档、普通调用下验证：选
 
 ## 5. 有效优化方法
 
-1. **先固定数值边界，再减少算术。** Down完整K10240 FP32累加后先舍入BF16，再做FP32缩放和SiLU，写BF16 P。Up完整R320归约、直接FP32 logits、stream0→1→2→3顺序FMA，最后乘0.25并使用既有整数BF16 helper。浮点FMA加偏置不能替代整数位模式舍入；“容差通过”与“逐位等价”分开验收。[数值helpers](../../../src/contrib/flydsl/gr_read/helpers.py)
+1. **先固定数值边界，再减少算术。** Down完整K10240 FP32累加后先舍入BF16，再做FP32缩放和SiLU，写BF16 P。Up完整R320归约、直接FP32 logits、stream0→1→2→3顺序FMA，最后乘0.25并使用既有整数BF16 helper。浮点FMA加偏置不能替代整数位模式舍入；“容差通过”与“逐位等价”分开验收。[数值helpers](../../../src/pyhip/ops/gr_read/flydsl/helpers.py)
 
-2. **按实际CTA轮数独立选择Down／Up的N分片。** Down N1/N2对应320／160列，Up选择N2/N4/N8；比较$\lceil B_MN/U\rceil c_N$而不是只看单CTA工作量。Down用$B_D=\lceil T/64\rceil$，Up用$B_U=\lceil T/256\rceil$；更多分片有利于小batch填满CU，却可能增加大batch轮数和重复读取。成本是历史校准模型，不是跨设备最优保证。[选择规则](../../../src/contrib/flydsl/gr_read/common.py)
+2. **按实际CTA轮数独立选择Down／Up的N分片。** Down N1/N2对应320／160列，Up选择N2/N4/N8；比较$\lceil B_MN/U\rceil c_N$而不是只看单CTA工作量。Down用$B_D=\lceil T/64\rceil$，Up用$B_U=\lceil T/256\rceil$；更多分片有利于小batch填满CU，却可能增加大batch轮数和重复读取。成本是历史校准模型，不是跨设备最优保证。[选择规则](../../../src/pyhip/ops/gr_read/flydsl/common.py)
 
 3. **让权重顺序匹配归约顺序和输出lane。** Up先将权重排列为`[H64 tile, stream, H32 half, ...]`，相邻8个H32 packet完成同一H64的四路归约；内层重排使同一lane取得连续8个BF16，适配X和16B Y store。随后N16/K32 preshuffle负责MFMA输入打包，不能混淆两层排列。变更前先用CPU标签证明索引双射，再同步修改消费地址。[准备函数](test_gr_read.py#L110)
 
-4. **交错当前MFMA与上一packet的后处理。** 在Compute(q)计算当前logits，同时推进q−1的scale／exp／rcp／FMA／BF16打包，拆开后处理自身依赖链。当前每10条MFMA推进两个旧元素，SFU独占间隔，普通间隔控制VALU数量；实际收益取决于机器调度和生存期，不是让指令间隔形式上均匀。保留FIRST／LOOP／LAST和drain的完整覆盖。[Up流水](../../../src/contrib/flydsl/gr_read/up.py)
+4. **交错当前MFMA与上一packet的后处理。** 在Compute(q)计算当前logits，同时推进q−1的scale／exp／rcp／FMA／BF16打包，拆开后处理自身依赖链。当前每10条MFMA推进两个旧元素，SFU独占间隔，普通间隔控制VALU数量；实际收益取决于机器调度和生存期，不是让指令间隔形式上均匀。保留FIRST／LOOP／LAST和drain的完整覆盖。[Up流水](../../../src/pyhip/ops/gr_read/flydsl/up.py)
 
 5. **联合调整预取深度、寄存器占用与等待。** 当前W2在Memory(q)发布W(q+1)、预读W(q+2)，少保留一个W搬运包；没有减少总W字节。任何预取或发射顺序改动都要重算W/X/Y的VMEM完成账本，检查LDS覆写和实际ISA。4＋4wave错相必须首尾闭合，barrier不能替代完成等待，VGPR下降也不自动提高占用率。
 
 6. **按缓存行组织X协作读取，再恢复计算布局。** 同行8个lane各读16B形成X128，覆盖H64并供相邻两个H32消费；通过每wave3KiB LDS恢复MFMA布局。两个20KiB W槽＋24KiB X区共64KiB。X/P读和Y写当前使用NT、W保持default；合并请求能减少重复取读，但增加LDS工作，不能只凭HBM字节下降宣称加速。
 
-7. **64位tile基址＋局部buffer边界，避免Host分块和P padding。** CTA入口先以64位元素偏移重设X/P/Y，descriptor只覆盖当前tile有效行。Down N1输出范围为`valid_rows*R*2`；N2保留stride R，范围为`((valid_rows-1)*R+BN)*2`，valid0为0。二维tensor避免展平动态shape超i32；rows运行时传入，工厂仅按N分片缓存。正常`flyc.compile`会执行一次，必须提供足量张量。[Down尾块处理](../../../src/contrib/flydsl/gr_read/down.py)
+7. **64位tile基址＋局部buffer边界，避免Host分块和P padding。** CTA入口先以64位元素偏移重设X/P/Y，descriptor只覆盖当前tile有效行。Down N1输出范围为`valid_rows*R*2`；N2保留stride R，范围为`((valid_rows-1)*R+BN)*2`，valid0为0。二维tensor避免展平动态shape超i32；rows运行时传入，工厂仅按N分片缓存。正常`flyc.compile`会执行一次，必须提供足量张量。[Down尾块处理](../../../src/pyhip/ops/gr_read/flydsl/down.py)
 
 8. **把性能条件和归因口径固定下来。** 正确性guard view与性能原生allocation分开，记录X/P/Y相对地址；同一ELF也会对地址偏移敏感。保留长尾，用同址交错对照确认小收益。ATT只分析共同稳态窗口，区分issue-stall和completion-wait，不把跨wave stall求和当墙钟，也不把MFMA union×roof模型TFLOPS当实测。逻辑M-major或swizzle不保证物理XCD归属，需单独验证。
 
@@ -126,22 +128,22 @@ T48–512 的正式优化前后对照已在 30 档、普通调用下验证：选
 
 ## 6. Decode T1–32：独立正确性、原 Graph 基准和 SGLang 对照
 
-实现已按方向收拢：[down.py](../../../src/contrib/flydsl/gr_read/down.py) 包含 prefill Down 和 decode split-K Down，[up.py](../../../src/contrib/flydsl/gr_read/up.py) 包含所有 prefill Up 和 decode Up。上文旧文件名对应的实现均迁入这两个文件。两后端共用 `common.prepare_weights()`；模型加载时 prepare 一次，同一份 packed Down/Up 权重可传给 `GRReadDecode` 和 `GRReadPrefill`。FlyDSL 验证版本为 **0.3.2**。
+实现已按方向收拢：[down.py](../../../src/pyhip/ops/gr_read/flydsl/down.py) 包含 prefill Down 和 decode split-K Down，[up.py](../../../src/pyhip/ops/gr_read/flydsl/up.py) 包含所有 prefill Up 和 decode Up。两后端共用 `common.prepare_weights()`；模型加载时 prepare 一次，同一份 packed Down/Up 权重可传给 `GRReadDecode` 和 `GRReadPrefill`。FlyDSL 验证版本为 **0.3.2**。
 
-Decode 默认覆盖全部 T1–32，独立测量、独立出表。Prefill 继续普通调用，默认性能矩阵首档现为 T33；T33–64 全部使用之前验证的小 M 配置（同上文 T48–128 的配置，包括 T48），其余 prefill 配置保持。
+Decode 默认覆盖全部 T1–32，独立测量、独立出表。Prefill 继续普通调用，默认性能矩阵首档现为 T33；T33–64 全部使用之前验证的小 M 配置（同上文 T33–128 的配置，包括 T48），其余 prefill 配置保持。
 
 在仓库根目录运行：
 
 ```bash
 # Decode 正确性：原 2 对权重、全部 T1–32、6528 次完整调用 Graph replay，加分阶段检查。
-python3 tests/contrib/gr_read/test_gr_read.py --phase decode --gpu 2
+python3 tests/ops/gr_read/test_gr_read.py --phase decode --gpu 2
 
 # 只排查 decode Down 或 Up。
-python3 tests/contrib/gr_read/test_gr_read.py --phase decode --scope down --rows 1 16 17 32 --gpu 2
-python3 tests/contrib/gr_read/test_gr_read.py --phase decode --scope up --rows 1 16 17 32 --gpu 2
+python3 tests/ops/gr_read/test_gr_read.py --phase decode --scope down --rows 1 16 17 32 --gpu 2
+python3 tests/ops/gr_read/test_gr_read.py --phase decode --scope up --rows 1 16 17 32 --gpu 2
 
 # Decode 的独立 Graph 对照表：原 100 权重 / 3 rounds / 7 samples，默认不写文件。
-python3 tests/contrib/gr_read/bench_gr_read_compare.py \
+python3 tests/ops/gr_read/bench_gr_read_compare.py \
   --phase decode --sglang-root /opt/sglang --gpu 2
 ```
 

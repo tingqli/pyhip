@@ -48,10 +48,10 @@ def dependencies(sglang_root):
     prefill.use_checkout_package()
     import torch
     import flydsl.compiler as flyc
-    from pyhip.misc import cudaPerf
-    from pyhip.contrib.flydsl.gr_read import GRReadDecode, prepare_weights
-    from pyhip.contrib.flydsl.gr_read.down import make_decode_down
-    from pyhip.contrib.flydsl.gr_read.up import make_decode_up
+    from pyhip.testing import cudaPerf
+    from pyhip.ops.gr_read.flydsl import GRReadDecode, prepare_weights
+    from pyhip.ops.gr_read.flydsl.down import make_decode_down
+    from pyhip.ops.gr_read.flydsl.up import make_decode_up
     decode = SimpleNamespace(GRReadDecode=GRReadDecode, prepare_weights=prepare_weights,
                              down_launcher=make_decode_down, up_launcher=make_decode_up)
     check = SimpleNamespace(reference=reference, assert_close=assert_close, make_inputs=make_inputs, capture=capture)
@@ -479,7 +479,7 @@ def time_graph(graph, calls, samples):
 def benchmark_decode_total(rows, pairs, args, emit):
     import torch
     testing().use_checkout_package()
-    from pyhip.contrib.flydsl.gr_read import GRReadDecode, prepare_weights
+    from pyhip.ops.gr_read.flydsl import GRReadDecode, prepare_weights
     gen = torch.Generator(device="cuda").manual_seed(args.seed + rows)
     xs = [torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16, generator=gen) for _ in pairs]
     readers = [GRReadDecode(rows, *prepare_weights(wd, wu)) for wd, wu in pairs]
@@ -594,7 +594,7 @@ def run_decode(args, emit):
     source_paths = [Path(__file__), Path(__file__).with_name('test_gr_read.py'),
                     args.sglang_root / 'python/sglang/srt/layers/hyperconnection.py',
                     args.sglang_root / 'python/sglang/srt/layers/hc_mix_triton.py',
-                    *(REPO / 'src/contrib/flydsl/gr_read').glob('*.py')]
+                    *(REPO / 'src/pyhip/ops/gr_read/flydsl').glob('*.py')]
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
           'gpu': props.name, 'arch': props.gcnArchName, 'compute_units': props.multi_processor_count,
           'protocol': {'weights': local.weights, 'rounds': local.rounds, 'samples': local.samples,
@@ -607,7 +607,7 @@ def run_decode(args, emit):
     with torch.inference_mode():
         print(f"Decode: preparing {local.weights} shared weight pairs...", flush=True)
         pairs = [check.make_inputs(1, local.seed + i)[1:] for i in range(local.weights)]
-        from pyhip.contrib.flydsl.gr_read import prepare_weights
+        from pyhip.ops.gr_read.flydsl import prepare_weights
         packed_pairs = [prepare_weights(wd, wu) for wd, wu in pairs]
         emit({'type': 'weight_preparation', 'pairs': len(pairs), 'packing_calls': len(pairs), 'shared_across_rows': True})
         for index, rows in enumerate(args.decode_rows, 1):

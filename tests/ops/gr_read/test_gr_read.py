@@ -53,14 +53,14 @@ def prepare_cli_environment(args):
 def use_checkout_package():
     import importlib.util
     repo = Path(__file__).resolve().parents[3]
-    expected = repo / "src/__init__.py"
+    expected = repo / "src/pyhip/__init__.py"
     module = sys.modules.get("pyhip")
     if module is not None:
         if Path(module.__file__).resolve() != expected:
             raise RuntimeError(f"wrong PyHIP checkout: {module.__file__}")
         return
     spec = importlib.util.spec_from_file_location("pyhip", expected,
-                                                  submodule_search_locations=[str(repo / "src")])
+                                                  submodule_search_locations=[str(repo / "src/pyhip")])
     module = importlib.util.module_from_spec(spec)
     sys.modules["pyhip"] = module
     spec.loader.exec_module(module)
@@ -73,7 +73,7 @@ def dependencies():
     import torch
     import torch.nn.functional as F
     import flydsl.compiler as flyc
-    from pyhip.misc import cudaPerf
+    from pyhip.testing import cudaPerf
     if torch.version.hip is None or not torch.cuda.is_available():
         raise RuntimeError("ROCm GPU required")
     props = torch.cuda.get_device_properties(0)
@@ -122,7 +122,7 @@ def torch_compile_mix():
 
 def prepare_reader(x, w_down, w_up):
     dependencies()
-    from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
+    from pyhip.ops.gr_read.flydsl import GRReadPrefill, prepare_weights
     packed_down, packed_up = prepare_weights(w_down, w_up)
     reader = GRReadPrefill(x.shape[0], packed_down, packed_up)
     reader._check_input(x)
@@ -284,8 +284,8 @@ def assert_decode_close(actual, expected, label):
 def check_decode_rows(rows, wd, wu, pd, pu, seed):
     import torch
     use_checkout_package()
-    from pyhip.contrib.flydsl.gr_read import GRReadDecode
-    from pyhip.contrib.flydsl.gr_read.common import K, R, H as HS
+    from pyhip.ops.gr_read.flydsl import GRReadDecode
+    from pyhip.ops.gr_read.flydsl.common import K, R, H as HS
     reader = GRReadDecode(rows, pd, pu)
     assert reader.w_down.data_ptr() == pd.data_ptr()
     assert reader.w_up.data_ptr() == pu.data_ptr()
@@ -335,9 +335,9 @@ def check_decode_rows(rows, wd, wu, pd, pu, seed):
 def check_decode_stages(rows, wd, wu, pd, pu, seed, scope="all"):
     import torch
     import flydsl.compiler as flyc
-    from pyhip.contrib.flydsl.gr_read import GRReadDecode
-    from pyhip.contrib.flydsl.gr_read.down import make_decode_down
-    from pyhip.contrib.flydsl.gr_read.up import make_decode_up
+    from pyhip.ops.gr_read.flydsl import GRReadDecode
+    from pyhip.ops.gr_read.flydsl.down import make_decode_down
+    from pyhip.ops.gr_read.flydsl.up import make_decode_up
 
     x = make_decode_inputs(rows, seed)[0]
     reader = GRReadDecode(rows, pd, pu)
@@ -423,7 +423,7 @@ def main(argv=None):
     prepare_cli_environment(args)
     use_checkout_package()
     import torch
-    from pyhip.contrib.flydsl.gr_read import prepare_weights
+    from pyhip.ops.gr_read.flydsl import prepare_weights
     if torch.version.hip is None or not torch.cuda.is_available():
         raise RuntimeError("ROCm GPU required")
     if args.output: args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -490,7 +490,7 @@ if "pytest" in sys.modules:
 
     def test_prepared_weights_shared_and_current_stream():
         torch = require_rocm()
-        from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
+        from pyhip.ops.gr_read.flydsl import GRReadPrefill, prepare_weights
 
         with torch.inference_mode():
             x, wd, wu = make_inputs(torch, 64, 917)
@@ -523,7 +523,7 @@ if "pytest" in sys.modules:
 
     def test_prepared_input_contract():
         torch = require_rocm()
-        from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
+        from pyhip.ops.gr_read.flydsl import GRReadPrefill, prepare_weights
 
         x, wd, wu = make_inputs(torch, 64, 919)
         packed = prepare_weights(wd, wu)
@@ -545,7 +545,7 @@ if "pytest" in sys.modules:
         torch = require_rocm()
         if torch.cuda.device_count() < 2 or not torch.cuda.get_device_properties(1).gcnArchName.startswith("gfx942"):
             pytest.skip("two gfx942 devices required")
-        from pyhip.contrib.flydsl.gr_read import GRReadPrefill, prepare_weights
+        from pyhip.ops.gr_read.flydsl import GRReadPrefill, prepare_weights
 
         with torch.inference_mode(), torch.cuda.device(0):
             x, wd, wu = make_inputs(torch, 64, 920)
@@ -574,8 +574,8 @@ if "pytest" in sys.modules:
         if not torch.cuda.get_device_properties(0).gcnArchName.startswith('gfx942'):
             pytest.skip('gfx942 required')
         use_checkout_package()
-        from pyhip.contrib.flydsl.gr_read import GRReadDecode, GRReadPrefill, prepare_weights
-        from pyhip.contrib.flydsl.gr_read.common import prepare_weights as shared_prepare
+        from pyhip.ops.gr_read.flydsl import GRReadDecode, GRReadPrefill, prepare_weights
+        from pyhip.ops.gr_read.flydsl.common import prepare_weights as shared_prepare
         assert prepare_weights is shared_prepare
         with torch.no_grad(), torch.cuda.device(0):
             (x, wd, wu) = make_decode_inputs(64, 4917)

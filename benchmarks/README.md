@@ -22,7 +22,9 @@ The MoE comparison script locates its sibling CLI relative to itself and uses
 the current Python interpreter. The GEMM trace script points to the relocated
 GEMM regression file; its external profiler/decoder requirements are unchanged.
 
-GRRead deliberately keeps its combined CLI and pytest checks in
+GRRead keeps its benchmark CLI in
+[bench_gr_read_compare.py](../tests/ops/gr_read/bench_gr_read_compare.py), beside
+the correctness CLI and pytest checks in
 [test_gr_read.py](../tests/ops/gr_read/test_gr_read.py). Comparisons that depend on
 relocated GEMM kernels now live in the opt-in tests under
 [tests/ops/gemm](../tests/ops/gemm/).
