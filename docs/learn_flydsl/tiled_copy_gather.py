@@ -9,7 +9,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly
 
 import pyhip
-import pyhip.contrib.flydsl.utils as fxu
+import pyhip.codegen.flydsl.utils as fxu
 
 # fxu.enable_dump_ir()
 

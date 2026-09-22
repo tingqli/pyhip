@@ -7,25 +7,23 @@ name = "pyhip"
 dynamic = ["version"]
 requires-python = ">=3.8"
 dependencies = ["filelock", "numpy"]
-description = "Python AMDGPU kernel developing tool"
+description = "AMDGPU kernels and language-specific development tools"
 readme = "README.md"
 license = "MIT"
-license-files = ["LICEN[CS]E.*"]
+license-files = ["LICEN[CS]E*"]
 
 [tool.setuptools_scm]
 # Used when building from an sdist or tree without VCS metadata.
 fallback_version = "1.0.0"
 
 [tool.setuptools]
-# `package-dir` maps the `pyhip` package root to `src/`. Declaring only `pyhip`
-# installs flat modules there and skips subdirs; `core`/`contrib` must be listed.
-packages = [
-    "pyhip",
-    "pyhip.core",
-    "pyhip.contrib",
-    "pyhip.contrib.common",
-    "pyhip.contrib.gluon",
-    "pyhip.contrib.flydsl",
-    "pyhip.contrib.flydsl.moe_gemm_2stage",
-]
-package-dir = {"pyhip" = "src"}
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pyhip*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"*" = ["*.cpp", "*.h", "*.hpp", "*.s", "*.md"]

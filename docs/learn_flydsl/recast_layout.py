@@ -2,7 +2,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
-import pyhip.contrib.flydsl.utils as fxu
+import pyhip.codegen.flydsl.utils as fxu
 # fxu.enable_dump_ir(True)
 
 @flyc.jit

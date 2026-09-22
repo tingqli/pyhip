@@ -16,7 +16,7 @@
 8. FP8 路径按 `1×128` activation scale 和 `128×128` weight scale 做分块反量化；
 9. 输出为 `[num_tokens, TOPK, OC_total]` 的 BF16 中间结果，随后由上层对 `TOPK` 求和。
 
-实现入口见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L769)，调用点见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L550)。
+实现入口见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L769)，调用点见 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L550)。
 
 ---
 
@@ -29,7 +29,7 @@
 - down projection 的输出 tile 固定为 `wg_N=64`；
 - workgroup 固定为 512 threads，即 8 个 wave64。
 
-调用逻辑位于 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L494-L563)。当前固定启动：
+调用逻辑位于 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L494-L563)。当前固定启动：
 
 $$
 G_{physical}=256
@@ -49,15 +49,15 @@ $$
 - 一个逻辑 task 会在内部遍历该大分片中的所有 `wg_N` tile；
 - 一个物理 workgroup 在一次 kernel dispatch 中可能串行完成多个逻辑 task。
 
-上层根据估算的尾部浪费率选择 `num_oc_splits`：若 256 CU 的最后一轮预计浪费超过 30%，取 4，否则取 1，见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L507-L527)。动态 task 分配用于缓解不同 expert block 有效 token 数不均衡造成的长尾。
+上层根据估算的尾部浪费率选择 `num_oc_splits`：若 256 CU 的最后一轮预计浪费超过 30%，取 4，否则取 1，见 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L507-L527)。动态 task 分配用于缓解不同 expert block 有效 token 数不均衡造成的长尾。
 
-上层分配的 `stage2_out` 形状为 `[num_tokens, TOPK, model_dim]`。kernel 已乘上 routing weight，但不在 kernel 内归约 TOPK；上层最终执行 `stage2_out.sum(dim=1)`，见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L620-L628)。
+上层分配的 `stage2_out` 形状为 `[num_tokens, TOPK, model_dim]`。kernel 已乘上 routing weight，但不在 kernel 内归约 TOPK；上层最终执行 `stage2_out.sum(dim=1)`，见 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L620-L628)。
 
 ---
 
 ## 3. 接口
 
-函数签名见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L769-L780)。
+函数签名见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L769-L780)。
 
 ### 3.1 JIT 特化参数
 
@@ -119,7 +119,7 @@ $$
 row = token\_id \times TOPK + topk\_id
 $$
 
-该变换位于 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L861-L893)。
+该变换位于 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L861-L893)。
 
 排序阶段会按 expert 将 routing 行打包到 `wg_M` 对齐的 block。padding 行通常编码为 `token_id=num_tokens, topk_id=TOPK`，并将 routing weight 设为 0。kernel 通过 `row < num_tokens*TOPK` 屏蔽 activation load；大输出路径还会显式屏蔽 store。
 
@@ -135,7 +135,7 @@ $$
 blk\_id=atomicAdd(blk\_atomic\_int,1)
 $$
 
-原子返回值先写入一个 4-byte LDS 临时槽，经 workgroup barrier 后由全部 wave 读出，再通过 `v_readfirstlane_b32` 转为 SGPR，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L817-L837)。
+原子返回值先写入一个 4-byte LDS 临时槽，经 workgroup barrier 后由全部 wave 读出，再通过 `v_readfirstlane_b32` 转为 SGPR，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L817-L837)。
 
 ```mermaid
 flowchart TD
@@ -163,7 +163,7 @@ $$
 blk\_m = \left\lfloor\frac{blk\_id}{num\_oc\_splits}\right\rfloor
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L839-L840)。`blk_oc` 在一个 expert block 内变化最快。
+见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L839-L840)。`blk_oc` 在一个 expert block 内变化最快。
 
 ### 5.3 已禁用的静态 XCD/CU 映射实验
 
@@ -174,7 +174,7 @@ $$
 - 每 SE 8 CU；
 - 总计 256 CU；
 
-将初始 block 顺序重排为 XCD/CU 顺序，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L794-L815)。代码注释明确指出尚未找到 persistent 动态分配与 XCD swizzle 结合以提高 L2 命中率的方法。
+将初始 block 顺序重排为 XCD/CU 顺序，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L794-L815)。代码注释明确指出尚未找到 persistent 动态分配与 XCD swizzle 结合以提高 L2 命中率的方法。
 
 该映射只是对逻辑任务编号做 permutation，并不能保证某个 block 实际落在推导出的物理 CU。真正的 workgroup-to-CU 分配仍由硬件调度器决定。因此这段代码应理解为工作负载排序实验，而不是物理 CU 绑定机制。
 
@@ -186,15 +186,15 @@ $$
 blk\_m \times wg\_M \ge max\_id
 $$
 
-若成立，说明该编号及所有更大编号都已超出有效逻辑任务范围，当前物理 workgroup 执行 `s_endpgm`。由于全局计数器单调递增，不需要把编号放回队列，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L839-L843)。
+若成立，说明该编号及所有更大编号都已超出有效逻辑任务范围，当前物理 workgroup 执行 `s_endpgm`。由于全局计数器单调递增，不需要把编号放回队列，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L839-L843)。
 
 ### 5.5 每轮重新构造 task-local 状态
 
 为了让同一个物理 workgroup 安全地处理多个 task，输入基址以 `_sorted_ids`、`_sorted_weights`、`_weight`、`_pScaleB` 保存为不可变 kernel 参数。每轮循环内重新复制到 SGPR，并加上当前 `blk_m/blk_oc/expert_id` 偏移，避免上一轮对指针的修改累积到下一轮，见：
 
-- routing 指针重建：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L846-L854)；
-- weight 指针重建：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L911-L916)；
-- scaleB 指针重建：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L985-L989)。
+- routing 指针重建：[src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L846-L854)；
+- weight 指针重建：[src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L911-L916)；
+- scaleB 指针重建：[src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L985-L989)。
 
 task-local LDS 对象也在循环内分配，并由 JIT allocator 在代码生成期复用固定 LDS 地址；它们不是运行时逐轮增长的动态分配。
 
@@ -291,7 +291,7 @@ $$
 nrK = \left\lceil\frac{IC\times sizeof(AB)}{64}\right\rceil
 $$
 
-相关定义见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L861-L869)。
+相关定义见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L861-L869)。
 
 典型 `wg_M=256, wg_N=64` 时：
 
@@ -435,7 +435,7 @@ $$
 local\_row = warp\_id\times warp\_M + m\times16 + (lane\_id\bmod16)
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L875-L882)。
+见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L875-L882)。
 
 每 16 个 lane 对应同一 MFMA 行组，而：
 
@@ -449,7 +449,7 @@ $$
 A\_addr = input + row\times(IC\times sizeof(AB)) + col\_byte + 64k
 $$
 
-加载实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L884-L893)。
+加载实现见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L884-L893)。
 
 ### 7.3 A 的复用范围
 
@@ -467,9 +467,9 @@ $$
 
 ### 8.1 预排布要求
 
-kernel 强制 `bpreshuffle=True`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L899-L903)。逻辑上的 `[16, 64 bytes]` MFMA 输入 tile 在内存中已排列成可由 wave64 连续 `dwordx4` 搬运、并可由 `ds_read_b128` 直接读成 MFMA operand 的形式。
+kernel 强制 `bpreshuffle=True`，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L899-L903)。逻辑上的 `[16, 64 bytes]` MFMA 输入 tile 在内存中已排列成可由 wave64 连续 `dwordx4` 搬运、并可由 `ds_read_b128` 直接读成 MFMA operand 的形式。
 
-反排布参考可见 [src/contrib/moe_gemm_ref.py](src/contrib/moe_gemm_ref.py#L1-L18)。因此报告中的 `[N/16, Kbytes/64, 16, 64 bytes]` 是逻辑 tile 视图，不等价于原始 row-major 权重布局。
+反排布参考可见 [src/pyhip/ops/moe/moe_gemm_ref.py](../src/pyhip/ops/moe/moe_gemm_ref.py#L1-L18)。因此报告中的 `[N/16, Kbytes/64, 16, 64 bytes]` 是逻辑 tile 视图，不等价于原始 row-major 权重布局。
 
 ### 8.2 一个 B tile 的大小
 
@@ -495,7 +495,7 @@ $$
 num\_bytes\_B = T_N\times T_K\times1024
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L903-L908)。
+见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L903-L908)。
 
 ### 8.3 四级 LDS 环形缓冲
 
@@ -511,7 +511,7 @@ $$
 ldsB[block\_n\bmod4]
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L908) 和 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1139-L1149)。
+见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L908) 和 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1139-L1149)。
 
 ### 8.4 VMEM 到 LDS
 
@@ -526,7 +526,7 @@ $$
 num\_vm\_loads = \frac{T_N\times T_K}{8}
 $$
 
-当前公式使用整数除法，因此设计上要求 `T_N*T_K` 能被 8 整除，或至少该配置下没有尾块。实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L910-L929)。
+当前公式使用整数除法，因此设计上要求 `T_N*T_K` 能被 8 整除，或至少该配置下没有尾块。实现见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L910-L929)。
 
 `vm_offset = block_n * num_bytes_B` 是权重 Buffer 内的偏移，不是 LDS 偏移；LDS 环形位置由传入的 `ldsB[block_n % 4]` 决定。
 
@@ -538,7 +538,7 @@ $$
 offset = lds + n\times(T_K\times1024) + k\times1024
 $$
 
-读取一个 `b128` 到 `mfma_B[n,k]`。当绝对 LDS offset 超过 64 KiB 时，通过 `voff2=voff+64KiB` 将立即数 offset 拉回 16-bit 可表达范围，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L931-L941)。
+读取一个 `b128` 到 `mfma_B[n,k]`。当绝对 LDS offset 超过 64 KiB 时，通过 `voff2=voff+64KiB` 将立即数 offset 拉回 16-bit 可表达范围，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L931-L941)。
 
 ---
 
@@ -558,7 +558,7 @@ $$
 num\_tokens\times TOPK\times sizeof(float)
 $$
 
-初始地址由 routing id 构造，加载逻辑见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L955-L982)。所有 K-block scale 一次性加载到：
+初始地址由 routing id 构造，加载逻辑见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L955-L982)。所有 K-block scale 一次性加载到：
 
 $$
 mfma\_scaleA[nrM][IC/128]
@@ -572,7 +572,7 @@ $$
 scaleB[expert][OC/128][IC/128]
 $$
 
-内核先根据 `expert_id` 和 `blk_oc` 移动 scale 指针，再将当前 OC 大分片的全部 B scales 搬入 LDS，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L991-L999)。
+内核先根据 `expert_id` 和 `blk_oc` 移动 scale 指针，再将当前 OC 大分片的全部 B scales 搬入 LDS，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L991-L999)。
 
 处理第 `block_n` 个 `wg_N` tile 时，其 128-channel scale block 为：
 
@@ -580,7 +580,7 @@ $$
 bn\_wgN = \left\lfloor\frac{block\_n\times wg\_N}{128}\right\rfloor
 $$
 
-随后每个 wave 用 `ds_read_b32` 广播所需 scale，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1000-L1008)。
+随后每个 wave 用 `ds_read_b32` 广播所需 scale，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1000-L1008)。
 
 当 `wg_N=64` 时，相邻两个 N tile 共用同一个 128-channel B scale。
 
@@ -594,7 +594,7 @@ BF16 路径对每个 64-byte K tile 发射：
 
 `v_mfma_f32_16x16x32_bf16`
 
-因为一个 16×32 BF16 operand 恰好每行 64 bytes。循环顺序为 K、M、N；`k=0` 时 accumulator operand 为 0，后续 K tile 累加到 `mfma_C`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L943-L953)。
+因为一个 16×32 BF16 operand 恰好每行 64 bytes。循环顺序为 K、M、N；`k=0` 时 accumulator operand 为 0，后续 K tile 累加到 `mfma_C`，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L943-L953)。
 
 每个 N tile 的 MFMA 数量为：
 
@@ -626,7 +626,7 @@ $$
 C_{m,n} \mathrel{+}= temp\times scaleAB
 $$
 
-实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1010-L1050)。
+实现见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1010-L1050)。
 
 为隐藏 MFMA 结果相关延迟，代码维护深度约为 4 的 `dequant_queue`：发射后续 MFMA 的同时，处理较早的 `temp*scaleAB`。首次写某个 `(m,n)` 使用 `v_mul_f32` 初始化，后续 K block 使用 `v_fmac_f32` 累加。
 
@@ -639,7 +639,7 @@ FP8 的 `mfma()` 末尾会：
 3. 对相邻两个 N=16 tile 做 `v_permlane16_swap_b32`；
 4. 写入 `mfma_C_bf16[m,n,0:4]`。
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1051-L1063)。
+见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1051-L1063)。
 
 ---
 
@@ -657,7 +657,7 @@ $$
 stride_C = num\_oc\_splits\times OC\times2
 $$
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1066-L1068)。
+见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1066-L1068)。
 
 输出地址由四部分组成：
 
@@ -671,7 +671,7 @@ $$
 swap\_12\_col=(col\mathbin{\&}1)\times2+(col\gg1)
 $$
 
-对应 `0,1,2,3 -> 0,2,1,3`，与 `v_permlane16_swap_b32` 配合恢复连续 row-major BF16 输出，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1069-L1080)。
+对应 `0,1,2,3 -> 0,2,1,3`，与 `v_permlane16_swap_b32` 配合恢复连续 row-major BF16 输出，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1069-L1080)。
 
 ### 11.1 小于 4 GiB
 
@@ -685,7 +685,7 @@ Buffer range 设置为整个输出大小，可利用硬件 OOB 行为抑制 padd
 
 ### 11.2 大于 4 GiB
 
-显式构造每行 64-bit 地址，并在 store 时用 `ExecMask(row < num_token_topks)`，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1069-L1095)。
+显式构造每行 64-bit 地址，并在 store 时用 `ExecMask(row < num_token_topks)`，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1069-L1095)。
 
 ---
 
@@ -697,7 +697,7 @@ $$
 loop\_cnt = \frac{OC}{wg\_N}
 $$
 
-实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1098-L1100)。
+实现见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1098-L1100)。
 
 ### 12.1 操作定义
 
@@ -736,7 +736,7 @@ sequenceDiagram
     VGPR->>OUT: S(loop_cnt-1)
 ```
 
-实际序列位于 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1168-L1207)。
+实际序列位于 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1168-L1207)。
 
 四级 LDS ring 的目的不是允许四个 tile 同时被 MFMA 使用，而是确保：
 
@@ -770,7 +770,7 @@ wave 0–3: barrier Z
 wave 4–7:             end
 ```
 
-实现见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1173-L1176) 和 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1210-L1210)。
+实现见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1173-L1176) 和 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1210-L1210)。
 
 其意图是把同一串 barrier checkpoint 在两组 wave 之间错位一格，使两组 wave 在同一物理代码区间处于不同流水阶段，从而实现注释中描述的：
 
@@ -809,7 +809,7 @@ wave 4–7:             end
 - 更老的权重搬运已完成；
 - 仍允许最新一批预取保留在 VM queue。
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1168-L1181)。
+见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1168-L1181)。
 
 ### 14.2 稳态循环
 
@@ -825,7 +825,7 @@ wave 4–7:             end
 
 意图是：等待 LDS reads 完成，同时允许当前最新的 load/store 留在 VM counter 中；依赖指令发射顺序和 counter 的“等待至不大于 N”语义，保留可与 compute 重叠的较新 VMEM 操作。
 
-见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1183-L1192)。
+见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1183-L1192)。
 
 ### 14.3 尾部
 
@@ -961,13 +961,13 @@ $$
 
 BF16 `mfma()` 只产生 `mfma_C`，但 `storeC()` 固定存 `mfma_C_bf16`。当前 `mfma_C_bf16` 的 routing-weight 乘法、BF16 转换和 lane 重排仅存在于 FP8 分支。因此 BF16 路径会存储未初始化寄存器。相关位置：
 
-- BF16 compute：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L943-L953)；
-- FP8-only 转换：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1051-L1063)；
-- 通用 store：[src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1084-L1095)。
+- BF16 compute：[src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L943-L953)；
+- FP8-only 转换：[src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1051-L1063)；
+- 通用 store：[src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1084-L1095)。
 
 ### 17.2 FP8 dequant queue 尾部初始化
 
-主循环弹出 queue 时会用 `mfma_C_initialized` 区分首次 `mul` 和后续 `fmac`；尾部 drain 却无条件 `fmac`。当某个 `(m,n)` 的第一次结果仍留在尾部 queue 时，会在未初始化的 `mfma_C` 上累加，见 [src/contrib/moe_gemm_8wave.py](src/contrib/moe_gemm_8wave.py#L1044-L1050)。
+主循环弹出 queue 时会用 `mfma_C_initialized` 区分首次 `mul` 和后续 `fmac`；尾部 drain 却无条件 `fmac`。当某个 `(m,n)` 的第一次结果仍留在尾部 queue 时，会在未初始化的 `mfma_C` 上累加，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1044-L1050)。
 
 ### 17.3 K 尾部没有 masking/zero padding
 
@@ -991,7 +991,7 @@ BF16 `mfma()` 只产生 `mfma_C`，但 `storeC()` 固定存 `mfma_C_bf16`。当�
 
 ### 17.8 Persistent counter 的生命周期
 
-若 `blk_atomic_int` 未在 dispatch 前清零，首个领取到的 `blk_id` 会从旧值继续增长，可能导致部分或全部逻辑 task 被跳过。当前调用点为每次调用创建零值张量并传入其 pointer，见 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L494) 和 [src/contrib/fused_moe.py](src/contrib/fused_moe.py#L550-L563)。调用方重用 counter 时必须显式清零并保证其生命周期覆盖整个异步 kernel 执行。
+若 `blk_atomic_int` 未在 dispatch 前清零，首个领取到的 `blk_id` 会从旧值继续增长，可能导致部分或全部逻辑 task 被跳过。当前调用点为每次调用创建零值张量并传入其 pointer，见 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L494) 和 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L550-L563)。调用方重用 counter 时必须显式清零并保证其生命周期覆盖整个异步 kernel 执行。
 
 当前 `torch.zeros(1, dtype=torch.uint32)` 没有显式指定 `device=device`。必须确认应用环境设置了正确的 PyTorch 默认 device，或者改为显式在目标 GPU 上分配；否则传入的可能是 host pointer，无法作为普通 GPU global atomic 地址安全使用。
 
@@ -1122,7 +1122,7 @@ $$
 
 ## 21. 与 `moe_gemm_down_tp` 的关系
 
-[src/contrib/moe_gemm_down_tp.py](src/contrib/moe_gemm_down_tp.py) 是该设计的较早/较简单版本：
+[src/pyhip/ops/moe/asm/moe_gemm_down_tp.py](../src/pyhip/ops/moe/asm/moe_gemm_down_tp.py) 是该设计的较早/较简单版本：
 
 | 特性 | `moe_gemm_down_tp` | `moe_gemm_8wave_down` |
 |---|---:|---:|

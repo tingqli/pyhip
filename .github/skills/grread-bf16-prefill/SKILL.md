@@ -9,7 +9,7 @@ description: 'Use when optimizing or reviewing gfx942 FlyDSL GRRead BF16 prefill
 
 ## 1. 固定数值和调用合同
 
-从[唯一测试入口](../../../tests/contrib/gr_read/test_gr_read.py)和[Down](../../../src/contrib/flydsl/gr_read/prefill_down.py)、[Up](../../../src/contrib/flydsl/gr_read/prefill_up.py)核对：
+从[唯一测试入口](../../../tests/ops/gr_read/test_gr_read.py)和[Down](../../../src/pyhip/ops/gr_read/flydsl/prefill_down.py)、[Up](../../../src/pyhip/ops/gr_read/flydsl/prefill_up.py)核对：
 
 - 固定`C=4, H=2560, R=320, K=C*H=10240`；X为BF16 `[T,K]`，P为BF16 `[T,R]`，Y为BF16 `[T,H]`，P无行padding。
 - Down完整K10240 FP32累加，GEMM结果先舍入BF16，再以FP32乘0.25、SiLU，最后写BF16 P。不要将这次中间舍入移到激活之后。
@@ -31,13 +31,13 @@ $$
 
 1. 同一H64的四stream聚在一起，8个H32 packet按`(s0,a0),(s0,a1),...,(s3,a1)`消费。
 2. 物理H32位置`16b+4g+m`对应逻辑通道`8g+4b+m`；`g=lane//16`的lane组在两个H16片段中取得连续8个BF16，适配X恢复与Y的16B store。
-3. 再调用[权重preshuffle](../../../src/contrib/flydsl/gr_read/common.py)，将N16/K32块变为连续的MFMA输入存储布局。这与上面的逻辑通道重排是两个不同步骤。
+3. 再调用[权重preshuffle](../../../src/pyhip/ops/gr_read/flydsl/common.py)，将N16/K32块变为连续的MFMA输入存储布局。这与上面的逻辑通道重排是两个不同步骤。
 
 修改时先用CPU行标签覆盖全部10240个输出通道，证明排列不重不漏、R不改变；再验证实际X/输出寄存器对应。不能只改permute而沿用旧packet地址、totals索引和Y写出。
 
 ## 3. 按CTA轮数选择N分片
 
-使用[当前选择模型](../../../src/contrib/flydsl/gr_read/common.py)，分别评估Down与Up：
+使用[当前选择模型](../../../src/pyhip/ops/gr_read/flydsl/common.py)，分别评估Down与Up：
 
 $$
 N^*=\arg\min_N\left\lceil B_MN/U\right\rceil c_N,

@@ -287,7 +287,7 @@ def compile_mlir_to_binary(mlir_module_str: str, chip_type="gfx942"):
 compile_mlir_to_binary(input_mlir, chip_type="gfx942")
 
 
-from pyhip.hsaco_tools import get_lib
+from pyhip.runtime.hsaco_tools import get_lib
 import torch
 torch.set_default_device("cuda")
 a = torch.randn(1024, device="cuda")

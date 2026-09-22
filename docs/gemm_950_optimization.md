@@ -1,6 +1,6 @@
 # GFX950 FlyDSL GEMM 优化与测试
 
-本文只记录当前`tests/flydsl/test_gemm.py::compile_gemm_950`仍在使用的优化、可复现测试
+本文只记录当前`experiments/gemm/flydsl/test_gemm.py::compile_gemm_950`仍在使用的优化、可复现测试
 方法和最终数据。历史失败方案、外部实现对照和已淘汰阶段数据不属于本文。
 
 ## 1. 测试范围
@@ -45,7 +45,7 @@ rocm-smi -d 0 \
 运行pytest、完整长循环矩阵和两K-tile prologue/tail矩阵：
 
 ```bash
-python3 tests/flydsl/compare_gemm_950.py validate \
+python3 experiments/gemm/flydsl/compare_gemm_950.py validate \
   --full-size 4096 --full-k 4096 \
   --full-launches 10 --two-tile-launches 20 \
   --csv /tmp/gemm950_functional.csv
@@ -53,7 +53,7 @@ python3 tests/flydsl/compare_gemm_950.py validate \
 
 该命令执行：
 
-1. `pytest tests/flydsl/test_gemm.py -k gemm_950 -q`；
+1. `pytest experiments/gemm/flydsl/test_gemm.py -k gemm_950 -q`；
 2. 16个`wave x tile x dtype`配置的`4096^3`长循环，每项10次；
 3. 相同16个配置的两K-tile版本，BF16 K=128、FP8 K=256，每项20次。
 
@@ -63,10 +63,8 @@ python3 tests/flydsl/compare_gemm_950.py validate \
 ### 2.3 汇编与同步验证
 
 ```bash
-python3 tests/flydsl/verify_gemm_950_pipeline.py
-python3 tests/flydsl/compare_gemm_950.py verify-8wave
-sha256sum -c tests/flydsl/asm/gfx950_current/SHA256SUMS
-sha256sum -c tests/flydsl/asm/gfx950_8wave_tiles/SHA256SUMS
+python3 experiments/gemm/flydsl/compare_gemm_950.py verify-8wave \
+  --asm /tmp/gemm_kernel_0/21_final_isa.s
 ```
 
 默认`256x256`汇编合同：
@@ -77,8 +75,7 @@ sha256sum -c tests/flydsl/asm/gfx950_8wave_tiles/SHA256SUMS
   `10,8,6,4,2,0`；相邻wait之间2条DMA；每区相位为
   `wait -> setprio(1) -> barrier -> MFMA -> setprio(0) -> barrier -> LDS read/DMA`。
 
-完整8-wave tile汇编、抽取值和SHA256保存在
-`tests/flydsl/asm/gfx950_8wave_tiles/`。
+该验证需要提供本地生成的8-wave final ISA dump，例如`/tmp/gemm_kernel_0/21_final_isa.s`。
 
 ### 2.4 性能测试
 
@@ -89,7 +86,7 @@ sha256sum -c tests/flydsl/asm/gfx950_8wave_tiles/SHA256SUMS
 完整tile sweep：
 
 ```bash
-python3 tests/flydsl/compare_gemm_950.py benchmark \
+python3 experiments/gemm/flydsl/compare_gemm_950.py benchmark \
   --m 4096 --n 4096 --k-values 4096 \
   --waves all --dtype all \
   --tiles 128x128,128x256,256x128,256x256 \
@@ -100,7 +97,7 @@ python3 tests/flydsl/compare_gemm_950.py benchmark \
 默认FlyDSL/JIT对照：
 
 ```bash
-python3 tests/flydsl/compare_gemm_950.py benchmark \
+python3 experiments/gemm/flydsl/compare_gemm_950.py benchmark \
   --m 4096 --n 4096 --k-values 4096 \
   --waves 8 --dtype fp8 --tiles 256x256 \
   --jit-layout both --warmup 20 --rounds 24 --iterations 100 \
@@ -110,7 +107,7 @@ python3 tests/flydsl/compare_gemm_950.py benchmark \
 K sweep：
 
 ```bash
-python3 tests/flydsl/compare_gemm_950.py benchmark \
+python3 experiments/gemm/flydsl/compare_gemm_950.py benchmark \
   --m 4096 --n 4096 \
   --k-values 1024,2048,4096,8192,16384 \
   --waves all --dtype all --tiles 256x256 \
@@ -169,8 +166,8 @@ Q1/Q3跨度，没有观察到显式wait和compute高优先级导致的稳定性�
 
 tile sweep延迟变化范围为-0.43%到+0.26%，默认JIT对比为
 -0.02%到+0.06%，K sweep为-0.62%到+0.31%。三组最大绝对变化分别为0.43%、0.06%和
-0.62%，均小于对应运行内Q1/Q3跨度，未观察到rebase性能回退。49行原始对比保存在
-`tests/flydsl/results/gfx950_current/rebase_comparison.csv`。
+0.62%，均小于对应运行内Q1/Q3跨度，未观察到rebase性能回退。49行原始对比可通过
+第2.4节的benchmark命令配合`--csv`重新生成。
 
 ## 4. 最终测试数据
 
@@ -197,8 +194,8 @@ tile sweep延迟变化范围为-0.43%到+0.26%，默认JIT对比为
 | 8w `256x256` | **0.097042 / 1416.3** | **0.045704 / 3007.1** |
 
 `256x256`中，4-wave与8-wave BF16延迟相差0.01%，8-wave FP8比4-wave快3.08%。全部
-16个case在计时前通过正确性检查，Q1/Q3跨度最大为2.25%。原始数据：
-`tests/flydsl/results/gfx950_current/tile_sweep.csv`。
+16个case在计时前通过正确性检查，Q1/Q3跨度最大为2.25%。原始数据可通过上文tile
+sweep命令生成到`/tmp/gemm950_tile_sweep.csv`。
 
 ### 4.3 默认8-wave FP8与JIT，`4096^3`
 
@@ -208,8 +205,8 @@ tile sweep延迟变化范围为-0.43%到+0.26%，默认JIT对比为
 | JIT preshuffle | 0.044920 ms | 0.044884/0.044972 ms | 3059.7 | -2.03% |
 | JIT row-major | 0.044984 ms | 0.044927/0.045061 ms | 3055.3 | -1.89% |
 
-三条路径均先通过同输入正确性检查，Q1/Q3跨度最大为0.34%。原始数据：
-`tests/flydsl/results/gfx950_current/default_vs_jit.csv`。
+三条路径均先通过同输入正确性检查，Q1/Q3跨度最大为0.34%。原始数据可通过上文默认
+FlyDSL/JIT对照命令生成到`/tmp/gemm950_default_vs_jit.csv`。
 
 ### 4.4 K sweep
 
@@ -238,5 +235,5 @@ FP8与JIT：
 | 16384 | 0.159456 / 3447.7 | 0.156791 / 3506.3 | 0.158525 / 3467.9 | 0.158384 / 3471.0 |
 
 在短K下JIT领先；随着K增加，差距持续缩小。K=16384时FlyDSL 8-wave FP8达到
-3506.3 TFLOPS，分别比JIT preshuffle和row-major快1.09%与1.01%。原始30行数据保存在
-`tests/flydsl/results/gfx950_current/k_sweep.csv`。
+3506.3 TFLOPS，分别比JIT preshuffle和row-major快1.09%与1.01%。原始30行数据可通过
+上文K sweep命令生成到`/tmp/gemm950_k_sweep.csv`。

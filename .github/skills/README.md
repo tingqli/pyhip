@@ -2,7 +2,7 @@
 
 本目录使用仓库级Agent Skills布局：每个子目录包含带`name`／`description`的SKILL文件，由支持该布局的工具按需发现；不需要额外的全局指令或GPU环境改动。
 
-这些skills记录**可复用的推导、实施和验证方法**，不是无条件套用的最佳参数。gfx950 MoE down的实例入口见 [四个case及PyHIP基线对照](../../tests/flydsl/moe_8w_down/README.md)。
+这些skills记录**可复用的推导、实施和验证方法**，不是无条件套用的最佳参数。gfx950 MoE down的实例入口见 [四个case及PyHIP基线对照](../../experiments/moe/flydsl/moe_8w_down/README.md)。
 
 | Skill | 适用场景 |
 |---|---|

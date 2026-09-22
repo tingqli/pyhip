@@ -9,7 +9,7 @@ description: 'Use when benchmarking or diagnosing PyHIP GPU kernels, GRRead late
 
 ## 1. 冻结对象和测试范围
 
-1. 读取当前kernel、调用方和原[计时器](../../../src/misc.py)，记录shape、dtype、归约长度、grid/block、分片、源码哈希。存在编译产物时记录ISA/ELF身份，不能给旧产物换标签冒充新版本。
+1. 读取当前kernel、调用方和原[计时器](../../../src/pyhip/testing/misc.py)，记录shape、dtype、归约长度、grid/block、分片、源码哈希。存在编译产物时记录ISA/ELF身份，不能给旧产物换标签冒充新版本。
 2. 明确是在测基础阶段、完整调用还是构造准备。GRRead默认不计shuffle、分配、JIT、参考和校验；Full是直接计Down＋Up，不相加两个独立中位数。
 3. 正确性必须先于性能：逐元素容差、shape和边界检查不变，rel_l2是附加指标。不能通过放宽容差换取性能。
 4. 预先确定shape、buffer数量、预热、样本数和候选顺序。小改动先最小目标阶段验证；只有用户要求或预先规定条件满足后，才扩大矩阵。
@@ -24,7 +24,7 @@ description: 'Use when benchmarking or diagnosing PyHIP GPU kernels, GRRead late
 
 ## 3. 固定实际地址与执行路径
 
-1. 采用[现有测试入口](../../../tests/contrib/gr_read/test_gr_read.py)中的原`cudaPerf`，默认10个独立X/权重/P/Y buffers、每阶段2warmup、10sample，全样本中位数。不要为了“更稳定”偷偷换timer。
+1. 采用[现有测试入口](../../../tests/ops/gr_read/test_gr_read.py)中的原`cudaPerf`，默认10个独立X/权重/P/Y buffers、每阶段2warmup、10sample，全样本中位数。不要为了“更稳定”偷偷换timer。
 2. 记录各tensor实际data pointer、storage base、storage offset、mod256及mod4096。性能Y用原生allocation起点；guard view用于正确性时不要直接替代性能buffer。
 3. 对照尽量使用同一批输入和地址，交错AB/BA或预先固定的ABBA/BAAB，并保持buffer轮换。先后两个整轮数据可以报告，但必须标明非交错、非同址配对的限制。
 4. 相同ELF也会因X/Y相对地址变化而变慢。Y加128B仍然满足16B自然对齐，不能据此声称硬件要求256B对齐；256B对齐也不保证任意相对地址都快。

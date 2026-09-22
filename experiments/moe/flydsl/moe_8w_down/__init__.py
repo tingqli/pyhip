@@ -1,0 +1,1 @@
+"""Eight-wave down-projection variants and local tests."""
