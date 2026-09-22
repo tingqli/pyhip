@@ -22,7 +22,6 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_TILES = ((128, 128), (128, 256), (256, 128), (256, 256))
 DEFAULT_SOURCE = ROOT / "experiments/gemm/flydsl/test_gemm.py"
-DEFAULT_ASM = ROOT / "tests/flydsl/asm/gfx950_current/gemm_8wave_bf16_m4096_n4096_k4096.s"
 
 
 @dataclass
@@ -112,7 +111,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="verify the 8-wave source and final-ISA VMEM pipeline",
     )
     verify_parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
-    verify_parser.add_argument("--asm", type=Path, default=DEFAULT_ASM)
+    verify_parser.add_argument("--asm", type=Path, required=True)
 
     return parser.parse_args(raw_args)
 
