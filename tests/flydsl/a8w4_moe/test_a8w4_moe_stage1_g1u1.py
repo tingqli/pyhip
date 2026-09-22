@@ -1720,7 +1720,7 @@ def compile_moe_gateup_4w(
     ):
         value_attrs = {
             "rocdl.waves_per_eu": 1,
-            "passthrough": [["amdgpu-agpr-alloc", "256,256"]],
+            "llvm.passthrough": [["amdgpu-agpr-alloc", "256,256"]],
         }
         moe_gateup_kernel(
             a,

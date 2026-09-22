@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-#
-# fp8 GEMM (C = B * A, 输出 bf16)，按 test_gemm_v9.py 的方式用 tile + layout 抽象编写
-# （flat_divide / make_tiled_copy / make_tiled_mma / make_fragment / fx.copy / fx.gemm），
+
 # LDS 读取保留 layout 抽象；G2S 使用预计算 byte offset 的 raw DMA。
 #   - BLOCK_M=BLOCK_N=BLOCK_K=128, TILE_M=TILE_N=256, 4-wave, 2x2 quadrant
 #   - MFMA 指令 V_MFMA_SCALE_F32_16X16X128_F8F6F4（scale=0 => 不含 scale）
@@ -70,15 +68,17 @@ def waitvmcnt_barrier(vmcnt):
 
 
 def _schedule_compute(group_id, dsrd_ops, vmem_ops):
-    """Compute prefix, sequential V1/M2/D2/M1 bundles and a compute tail.
-
-    Counts already include scales. Skip exhausted memory groups; never emit
-    zero-count hints or pad the actual 16 MFMAs. Scaled FP8 x FP8 (V5, D9)
-    uses an M1 prefix so the final D1 also has an M1 followup:
-    1 + 5 * 2 + 5 * 1 = 16. All other modes, including V0 drain, keep M2.
-    """
     assert vmem_ops >= 0 and dsrd_ops >= 0
+    """
+    按照下面的pattern进行排布:
+    MFMA_prefix+ VMEMx1/MFMAx2 + DS_READx2/MFMAx1 + MFMA_tail
+
+    MXFP8 with scale gemm (dsrd_ops == 9 and vmem_ops == 5)
+    MFMA_prefix = 1 if MXFP8 with scale gemm else 2
+    1 + 5 * 2 + 5 * 1 = 16.
+    """
     mfma_prefix = 1 if dsrd_ops == 9 and vmem_ops == 5 else 2
+    # ds_read_128B 16 cycles. MFMA_FP8_16x16x128_FP8
     dsrd_groups = (dsrd_ops + 1) // 2
     dsrd_mfmas = min(dsrd_groups, 16 - mfma_prefix - 2 * vmem_ops)
     assert dsrd_mfmas >= 0
@@ -221,6 +221,7 @@ def compile_gemm_fp8(
     a_group16 = 2 * A_GROUP
     a_lds_elems = (BLOCK_M // 8) * A_GROUP  # 16*1056 = 16896
     if b_mxfp4 and not b_lds_swizzle:
+        # 没有找到b是mxfp4情况下没有bank conflict的方案：
         # Keep each 2048-element (16-row) block contiguous for one full-wave DMA.
         # 64/128/256-element padding have the same conflict count; 64 was fastest
         # at M=N=K=8192 and has the smallest LDS footprint.
@@ -228,7 +229,10 @@ def compile_gemm_fp8(
         b_lds_elems = (BLOCK_N // 16) * b_group16
     else:
         b_lds_elems = BLOCK_N * BLOCK_K if b_mxfp4 else (BLOCK_N // 8) * A_GROUP
-    scale_lds_bytes = 128 * 8
+    # 真是需要的scale = 128*128 /32= 512 bytes.
+    # buffer load into lds, LDS 每条lane的数据要求至少DWORD对其。 256条lane就是256*4 = 1024bytes.
+    # 所以这里会重复copy, 512Bytes 真正需要的scale被clone两份，放入LDS。 这样只浪费了LDS。
+    scale_lds_bytes = 512 * 2
 
     if with_scale:
 
@@ -278,6 +282,7 @@ def compile_gemm_fp8(
         # M is launch-uniform, but its dynamic ABI value may be classified as
         # divergent. Scalarize once: a divergent scale soffset would introduce
         # an EXEC waterfall around every A-scale DMA and split the pipeline.
+        # A, B scale: m,n is padding to 256 multiple.
         scale_m_rows = fx.Int32(
             rocdl.readfirstlane(T.i32, arith._to_raw(fx.Int32(div_up(M, 256) * 256)))
         )
@@ -321,15 +326,15 @@ def compile_gemm_fp8(
         ]
 
         # ---- tiled MMA: MFMA_Scale 16x16x128 f8f6f4 ----
-        # 这个MMA atom更多用于获得 A， B相关的寄存器。
-        # scale 相关的寄存器无法通过这个方式获得。
+        # 这个MMA atom 用与non-scale fx.mma()，以及A, B, C fragment 寄存器。
+        # scale的寄存器无法通过这个方式获得。
         mma_atom = fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, b_element_type, element_type)
         )
         mma_atom = fx.atom_set_value(mma_atom, "scale_a", fx.Int32(0))
         mma_atom = fx.atom_set_value(mma_atom, "scale_b", fx.Int32(0))
-        # 真正用于做gemm的 mma atom
         if const_expr(with_scale or b_mxfp4):
+            # 真正用于做gemm的 mma atom
             # Logical B occupies MFMA operand A and logical A occupies operand B.
             scale_atoms = {
                 (n0, m0): fx.make_mma_atom(
@@ -346,6 +351,7 @@ def compile_gemm_fp8(
                 for n0 in range_constexpr(4)
                 for m0 in range_constexpr(4)
             }
+            # b_mxfp4 and not with_scale. b_element_type is mxfp4 , which is just set.
             if const_expr(not with_scale):
                 scale_atoms = {
                     key: fx.atom_set_value(
@@ -381,9 +387,27 @@ def compile_gemm_fp8(
         scale_b_l_frag = None
         scale_b_r_frag = None
         if const_expr(with_scale):
-            # Each wave owns 64 consecutive scale dwords. Replicating the 32x4
-            # logical scale tile per consuming wave uses the existing 1 KB entry
-            # while giving every lane a distinct 64-bank LDS address.
+            """
+            wave layout for C
+
+            2x2:
+            | wave 0 | wave1 |
+            | wave 2 | wave3 |
+
+            scale A in LDS:
+            [scaleA_1st, scaleA_1st, scaleA_2nd, scaleA_2nd]
+            scale B in LDS:
+            [scaleB_1st, scaleB_2nd, scaleB_1st, scaleB_2nd]
+
+
+            scale_rd_layout = fx.make_layout(256, 1)
+            scale_tv = fx.make_layout((256, 1), (1, 1))
+            基于这种LDS里面的重复模式，刚好用下面的layout可以保证：
+            Ascale: wave0/1share 一份， wave 2/3share 一份.
+            Bscale: wave0/2share 一份， wave 1/3share 一份，
+            """
+
+            # ---- scale LDS read. Still use flydsl tiled API ----
             scale_lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
             scale_rd_layout = fx.make_layout(256, 1)
             scale_tv = fx.make_layout((256, 1), (1, 1))
@@ -428,6 +452,8 @@ def compile_gemm_fp8(
                 num_records_bytes=scale_n_rows * K // 32,
             )
 
+            ##### scale DMA copy LDS ofset.####
+            # 预计算A, B scale DMA copy LDS  offset.
             def make_scale_dma_ptr(ptr):
                 return _lds_byte_ptr(ptr, wave_id_uniform * 64 * 4)
 
@@ -448,21 +474,32 @@ def compile_gemm_fp8(
                 for ptr in (lds.scale_b_r0.ptr, lds.scale_b_r1.ptr)
             ]
 
+            # ---- scale DMA copy vmem offset. ----
+            # [m // 128, 4m1, 32m0, groups] -> [groups//4, 4g0, m // 128,  32m0, 4m1]
+            # [4g0, 32m0, 4m1], 128 DWORD(512B)被4wave，每个wave是[4,16]方式 DWORD copy,
+            # 4g0对应4行lane, 16 column per wave对于32m0里面的 16列。 4wave会把 32 m0重复成64列放入到LDS.
             def make_scale_voffset(row_tile, rows, is_a):
+                # 对于scale A, wave0/1负责前半部分，wave2/3负责后半部分, [scaleA_1st, scaleA_1st, scaleA_2nd, scaleA_2nd]
+                # 对于scale B, wave0/2负责前半部分，wave1/3负责后半部分, [scaleB_1st, scaleB_2nd, scaleB_1st, scaleB_2nd]
                 wave_half = wave_id_uniform // 2 if is_a else wave_id_uniform % 2
                 scale_row = lane_id % 16 + wave_half * 16
                 scale_group = lane_id // 16
                 return (
+                    # [32m0] dim, stride is 4
                     fx.Int32(scale_row) * 4
+                    # [groups] dim, stride is div_up(m,256)*256
                     + fx.Int32(scale_group) * rows
+                    # [m //128] dim , stride is 32*4
                     + fx.Int32(row_tile) * 32 * 4
                 )
 
+            # 预计算A, B scale DMA copy VMEM offset.
             scale_a_t_voffset = make_scale_voffset(bid_x * 2, scale_m_rows, True)
             scale_a_b_voffset = make_scale_voffset(bid_x * 2 + 1, scale_m_rows, True)
             scale_b_l_voffset = make_scale_voffset(bid_y * 2, scale_n_rows, False)
             scale_b_r_voffset = make_scale_voffset(bid_y * 2 + 1, scale_n_rows, False)
 
+            # scale DMA copy raw API. 没有VAL计算vector offset.
             # Host layout packs four E8M0 groups per BK128. Only the K step
             # changes in the loop, in soffset; every lane copies one dword.
             def raw_scale_g2s(rsrc, kk, ptr, voffset, rows):
@@ -518,8 +555,8 @@ def compile_gemm_fp8(
         sB_l_rd = [fx.make_view(lds.b_l0.ptr, _rd_b), fx.make_view(lds.b_l1.ptr, _rd_b)]
         sB_r_rd = [fx.make_view(lds.b_r0.ptr, _rd_b), fx.make_view(lds.b_r1.ptr, _rd_b)]
 
-        # The instruction adds lane_id * 16 to each wave-uniform LDS base.
-        # Factories run once per kernel, never inside the K loop or raw_g2s.
+        # ----g2s raw API: A DMA copy vmem offset and lds offset. ----
+        # A :计算vmem 的 行，列 以及 LDS的offset.
         def fp8_copy_slots(copy_round, swizzled, specs):
             if const_expr(swizzled):
                 mask, _, shift = specs[0]
@@ -556,6 +593,8 @@ def compile_gemm_fp8(
                 for r in range_constexpr(4)
             ]
 
+        # ----g2s raw API: B DMA copy vmem offset and lds offset. ----
+        # B :计算vmem 的 行，列 以及 LDS的offset.
         def b_copy_slots(copy_round):
             if const_expr(preshuffle_b):
                 physical_slot = tid + copy_round * 256
@@ -602,6 +641,7 @@ def compile_gemm_fp8(
                 for r in range_constexpr(b_copy_rounds)
             ]
 
+        # ----g2s raw offset: A/B DMA copy vmem offset and lds offset. ----
         a_t_voffsets = make_fp8_voffsets(
             bid_x * 2, BLOCK_M, lds_swizzle, swizzle_a_specs
         )
@@ -666,11 +706,25 @@ def compile_gemm_fp8(
             dest_frag_B_r = copy_b.retile(frag_B_r)
 
         # copy A from LDS to reg. tiled API. very simple.
+        """v10 is only calculated once outside of mainloop
+        will update const offset. so no calculation effort for loading A from LDS
+        ds_read_b128 v[108:111], v10 offset:50688
+        ds_read_b128 v[112:115], v10 offset:50752"""
+
         def load_a(src_partition, dst_partition):
             fx.copy(lds_copy_atom, src_partition, dst_partition, pred=None)
 
         # copy A from LDS to reg. tiled API only used for non-mxfp4 case. mxfp4 case is handled by raw API function.
         # todo: mxfp4 padding方案存在bank conflict, swizzle可以work,是不是可以考虑使用 标准的 tiled copy API.
+
+        """编译器优化会提前计算偏移量，xor两个都是runtime的变量，如何提取的？？
+        v_or_b32_e32 v37, 0x14800, v13
+        ....
+        v_or_b32_e32 v41, 0x12800, v13
+        .....
+        v_or_b32_e32 v45, 0x16800, v13
+        v_or_b32_e32 v49, 0x10800, v13"""
+
         def load_b(src, src_partition, dst, dst_partition):
             if const_expr(b_mxfp4):
                 lane_id = tid % 64
@@ -773,52 +827,33 @@ def compile_gemm_fp8(
             def do_gemm(c_frag, b_frag, a_frag, scale_a_frag=None, scale_b_frag=None):
                 fx.gemm(mma_atom, c_frag, b_frag, a_frag, c_frag)
 
-            def do_gemm_mainloop(
-                c_frag, b_frag, a_frag, scale_a_frag=None, scale_b_frag=None
-            ):
-                c_value = c_frag.load().ir_value()
-                b_value = vector.bitcast(T.vec(128, T.i8), b_frag.load().ir_value())
-                a_value = vector.bitcast(T.vec(128, T.i8), a_frag.load().ir_value())
-                c_results = []
-                for n0 in range_constexpr(4):
-                    for m0 in range_constexpr(4):
-                        c_offset = (m0 * 4 + n0) * 4
-                        c_sub = vector.extract_strided_slice(
-                            T.vec(4, T.f32),
-                            c_value,
-                            offsets=[c_offset],
-                            sizes=[4],
-                            strides=[1],
-                        )
-                        b_sub = vector.extract_strided_slice(
-                            T.vec(32, T.i8),
-                            b_value,
-                            offsets=[n0 * 32],
-                            sizes=[32],
-                            strides=[1],
-                        )
-                        a_sub = vector.extract_strided_slice(
-                            T.vec(32, T.i8),
-                            a_value,
-                            offsets=[m0 * 32],
-                            sizes=[32],
-                            strides=[1],
-                        )
-                        c_results.append(
-                            _fly.mma_atom_call_ssa(
-                                [T.vec(4, T.f32)], mma_atom, b_sub, a_sub, c_sub
-                            )
-                        )
-                c_elements = []
-                for m0 in range_constexpr(4):
-                    for n0 in range_constexpr(4):
-                        c_result = Vec(c_results[n0 * 4 + m0])
-                        for elem in range_constexpr(4):
-                            c_elements.append(c_result[elem])
-                c_frag.store(Vec.from_elements(c_elements, fx.Float32))
-
         num_tiles = K // BLOCK_K
         assert num_tiles >= 4
+        # prefetch fx.copy() 影响性能，使用raw_ptr_buffer_load_lds
+        """ DMA copy 没有使用fx.copy(): 以bf16为例， v_readfirstlane_b32, v_add_u32_e32, s_mov_b32 m0
+        s_mov_b32 m0, s16
+        v_mfma_f32_16x16x32_bf16 a[248:251], v[30:33], v[132:135], a[248:251]
+        ds_read_b128 v[156:159], v74 offset:16864
+        v_readfirstlane_b32 s16, v88
+        v_add_u32_e32 v35, 0x10000, v34
+        v_mfma_f32_16x16x32_bf16 a[236:239], v[26:29], v[120:123], a[236:239]
+        ds_read_b128 v[152:155], v74 offset:17120
+        v_readfirstlane_b32 s17, v27
+        v_readfirstlane_b32 s18, v28
+        
+        
+        使用 raw_ptr_buffer_load_lds(): just s_mov_b32
+        
+        ds_read_b128 v[102:105], v8 offset:33792
+        ds_read_b128 v[106:109], v8 offset:33856
+        v_mfma_scale_f32_16x16x128_f8f6f4 a[88:91], v[94:97], v[62:69], a[88:91], v52, v51 op_sel:[1,0,0] op_sel_hi:[0,0,0] cbsz:4
+        buffer_load_dwordx4 v18, s[8:11], s26 offen lds
+        s_mov_b32 m0, s45
+        v_mfma_scale_f32_16x16x128_f8f6f4 a[96:99], v[94:97], v[70:77], a[96:99], v52, v51 op_sel:[1,1,0] op_sel_hi:[0,0,0] cbsz:4
+        v_mfma_scale_f32_16x16x128_f8f6f4 a[116:119], v[94:97], v[78:85], a[116:119], v52, v51 op_sel:[1,0,0] op_sel_hi:[0,1,0] cbsz:4
+        ds_read_b128 v[110:113], v8 offset:34048
+        ds_read_b128 v[114:117], v8 offset:34112
+        v_mfma_scale_f32_16x16x128_f8f6f4 a[156:159], v[94:97], v[54:61], a[156:159], v52, v51 op_sel:[1,1,0] op_sel_hi:[0,1,0] cbsz:4 """
 
         # Small prefetch helpers share the same hoisted addresses in prologue
         # and all eight phases. Future scales precede their data, as in MoE.
@@ -942,10 +977,7 @@ def compile_gemm_fp8(
             load_a(s2r_src0_A_b, dest_frag_A_b)
             if const_expr(with_scale):
                 fx.copy(scale_lds_copy_atom, scale_a_b_src[0], scale_a_b_frag)
-            if const_expr(not with_scale and not b_mxfp4):
-                do_gemm_mainloop(frag_C_tl, frag_B_l, frag_A_t)
-            else:
-                do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
+            do_gemm(frag_C_tl, frag_B_l, frag_A_t, scale_a_t_frag, scale_b_l_frag)
             prefetch_b_l(kiter + 2, 0)
             _schedule_compute(0, a_phase_dsrd, b_phase_vmem)
             rocdl.sched_barrier(0)
@@ -1252,7 +1284,7 @@ def compile_gemm_fp8(
         # v_accvgpr 拷贝与 VGPR 压力（对标 test_gemm_v9.py）。
         value_attrs = {
             "rocdl.waves_per_eu": 1,
-            "passthrough": [["amdgpu-agpr-alloc", "256,256"]],
+            "llvm.passthrough": [["amdgpu-agpr-alloc", "256,256"]],
         }
         gemm_kernel(A, B, ScaleA, ScaleB, C, M, value_attrs=value_attrs).launch(
             grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1),
@@ -1340,6 +1372,8 @@ def run_test(
                 dim=0,
             )
         rows = padded_rows
+        # [m // 128, 4m1, 32m0, groups] -> [groups, m // 128, 32m0, 4m1] , 4m1 packe 4 repeated E8m0 scale into one Dword.
+        # 一次DWORD读取对于每条lane就可以得到4次rep的scale.
         permuted = (
             scale.view(rows // 128, 4, 32, groups)
             .permute(3, 0, 2, 1)
@@ -1660,26 +1694,12 @@ if __name__ == "__main__":
     assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
     torch.manual_seed(0)
     # run_acc()
-    # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False, B_MXFP4=False)
-    run_test(
-        M=98304,
-        N=512,
-        K=6144,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=1,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=True,
-        B_MXFP4=True,
-        B_LDS_SWIZZLE=True,
-    )
+    # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False, B_MXFP4=False)\
 
     run_test(
-        M=196608,
-        N=512,
-        K=6144,
+        M=4096,
+        N=4096,
+        K=16384,
         USE_SWIZZLE=0,
         PRESHUFFLE_B=0,
         perf=1,
@@ -1687,23 +1707,53 @@ if __name__ == "__main__":
         permlane_output=PERMLANE_EPILOGUE,
         store_overlap=STORE_OVERLAP,
         with_scale=True,
-        B_MXFP4=True,
-        B_LDS_SWIZZLE=True,
+        B_MXFP4=False,
+        B_LDS_SWIZZLE=False,
     )
-    run_test(
-        M=393216,
-        N=512,
-        K=6144,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=1,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=True,
-        B_MXFP4=True,
-        B_LDS_SWIZZLE=True,
-    )
+
+    # run_test(
+    #     M=98304,
+    #     N=512,
+    #     K=6144,
+    #     USE_SWIZZLE=0,
+    #     PRESHUFFLE_B=0,
+    #     perf=1,
+    #     TILEK=TILE_K,
+    #     permlane_output=PERMLANE_EPILOGUE,
+    #     store_overlap=STORE_OVERLAP,
+    #     with_scale=True,
+    #     B_MXFP4=True,
+    #     B_LDS_SWIZZLE=True,
+    # )
+
+    # run_test(
+    #     M=196608,
+    #     N=512,
+    #     K=6144,
+    #     USE_SWIZZLE=0,
+    #     PRESHUFFLE_B=0,
+    #     perf=1,
+    #     TILEK=TILE_K,
+    #     permlane_output=PERMLANE_EPILOGUE,
+    #     store_overlap=STORE_OVERLAP,
+    #     with_scale=True,
+    #     B_MXFP4=True,
+    #     B_LDS_SWIZZLE=True,
+    # )
+    # run_test(
+    #     M=393216,
+    #     N=512,
+    #     K=6144,
+    #     USE_SWIZZLE=0,
+    #     PRESHUFFLE_B=0,
+    #     perf=1,
+    #     TILEK=TILE_K,
+    #     permlane_output=PERMLANE_EPILOGUE,
+    #     store_overlap=STORE_OVERLAP,
+    #     with_scale=True,
+    #     B_MXFP4=True,
+    #     B_LDS_SWIZZLE=True,
+    # )
     # run_test(
     #     M=M,
     #     N=N,

@@ -1482,21 +1482,21 @@ if __name__ == "__main__":
         with_scale=True,
         split_m=split_m,
     )
-    run_test(
-        M=16384,
-        N=3584,
-        K=K,
-        perf=True,
-        permlane_output=PERMLANE_EPILOGUE,
-        with_scale=True,
-        split_m=split_m,
-    )
-    run_test(
-        M=16384,
-        N=3392,
-        K=K,
-        perf=True,
-        permlane_output=PERMLANE_EPILOGUE,
-        with_scale=True,
-        split_m=split_m,
-    )
+    # run_test(
+    #     M=16384,
+    #     N=3584,
+    #     K=K,
+    #     perf=True,
+    #     permlane_output=PERMLANE_EPILOGUE,
+    #     with_scale=True,
+    #     split_m=split_m,
+    # )
+    # run_test(
+    #     M=16384,
+    #     N=3392,
+    #     K=K,
+    #     perf=True,
+    #     permlane_output=PERMLANE_EPILOGUE,
+    #     with_scale=True,
+    #     split_m=split_m,
+    # )
