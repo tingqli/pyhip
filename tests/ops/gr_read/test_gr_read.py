@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """GRRead basic correctness and performance tests with an inline reference and CLI.
 
-Direct execution checks all 21 batch sizes, including 32/64/128/256/512, before timing Down/Up/Total.
+Direct execution checks all 21 batch sizes, including 32/64/128/256/512,
+before timing Down/Up/Total and a full-row torch.compile comparison.
 Use --check-only for correctness without timing. Pytest checks basic numerical
 results, empty inputs, and tails without running performance tests.
 Retain every timing sample. Stop on a failed gate without waiting or changing hardware.
@@ -27,6 +28,7 @@ DOWN_TOLERANCE = dict(rtol=0.015625, atol=2e-5)
 OUTPUT_TOLERANCE = dict(rtol=1e-2, atol=5e-3)
 DEFAULT_BATCHES = (32, 64, 128, 256, 512) + tuple(k * 1024 for k in (1, 2, 4, 8, 10, 12, 16, 20, 24, 28, 30, 32, 36, 48, 60, 64))
 SCOPES = ("down", "up", "total")
+TIMING_SCOPES = (*SCOPES, "torch_compile")
 
 
 def parse_batch(value):
@@ -123,6 +125,36 @@ def dependencies():
         return p, (gates * x.unflatten(-1, (C, H))).mean(dim=-2)
 
     return torch, flyc, _mix_reference, cudaPerf
+
+
+@cache
+def torch_compile_mix():
+    """Standalone copy of SGLang's output-only _mix_compute, with default compile options."""
+    torch, _, _, _ = dependencies()
+    import torch.nn.functional as F
+
+    # Mirrors hyperconnection.py at SGLang 2843214f6ed923e992a74ee4d7a0cda5d7deddbf.
+    # Keep this separate from the chunked P/Y correctness reference: benchmark
+    # the full T in one call, returning only Y as the actual model does.
+    def _mix_compute(
+        hyper_input_normed: torch.Tensor,
+        input_mix_weight_down: torch.Tensor,
+        input_mix_weight_up: torch.Tensor,
+        hc: int,
+        hs: int,
+    ) -> torch.Tensor:
+        input_mix_weight = F.silu(
+            F.linear(hyper_input_normed, input_mix_weight_down) / hc
+        )
+        input_mix_weight = F.linear(input_mix_weight, input_mix_weight_up)
+        input_mix_weight = torch.sigmoid(input_mix_weight)
+        input_mix_weight = input_mix_weight.unflatten(-1, (hc, hs))
+        output = (
+            input_mix_weight * hyper_input_normed.unflatten(-1, (hc, hs))
+        ).mean(dim=-2)
+        return output
+
+    return torch.compile(_mix_compute)
 
 
 def prepare_reader(x, w_down, w_up):
@@ -293,14 +325,20 @@ def tensor_address(tensor, *, output=False):
 def benchmark_batch(rows, args, folder):
     before = hardware_gate(args, folder, "before")
     torch, _, _, cuda_perf = dependencies()
+    compiled_mix = torch_compile_mix()
     with torch.no_grad():
         x, wd, wu = make_inputs(torch, rows, args.seed)
         inputs = [x] + [x.clone() for _ in range(args.buffers - 1)]
-        readers = [prepare_reader(input_x, wd, wu) for input_x in inputs]
+        # Both implementations rotate over independent weight allocations.
+        # Each pair has identical logical values; packing happens only here.
+        weights = [(wd, wu)] + [(wd.clone(), wu.clone()) for _ in range(args.buffers - 1)]
+        readers = [prepare_reader(input_x, *pair) for input_x, pair in zip(inputs, weights)]
         expected_p = expected_y = None
+        expected_torch = None
+        torch_outputs = [None] * args.buffers
         addresses = []
-        calls = {scope: [] for scope in SCOPES}
-        for input_x, reader in zip(inputs, readers):
+        calls = {scope: [] for scope in TIMING_SCOPES}
+        for bi, (input_x, reader, (raw_down, raw_up)) in enumerate(zip(inputs, readers, weights)):
             dm, dw, dn, dk = reader.down_config
             um, un = reader.up_config
             partial, output = reader.partial, reader.output
@@ -310,38 +348,62 @@ def benchmark_batch(rows, args, folder):
             calls["down"].append(lambda x=input_x, r=reader: r.run_down(x))
             calls["up"].append(lambda x=input_x, r=reader: r.run_up(x))
             calls["total"].append(lambda x=input_x, r=reader: r(x))
+            calls["torch_compile"].append(
+                lambda x=input_x, wd=raw_down, wu=raw_up: compiled_mix(x, wd, wu, C, H))
             partial.fill_(torch.nan); output.fill_(torch.nan)
             reader(input_x)
             if expected_p is None:
                 expected_p, expected_y = partial.clone(), output.clone()
             torch.testing.assert_close(partial, expected_p, rtol=0, atol=0)
             torch.testing.assert_close(output, expected_y, rtol=0, atol=0)
+            # Compile the actual full shape and check every buffer before timing.
+            torch_outputs[bi] = calls["torch_compile"][bi]()
+            if expected_torch is None:
+                expected_torch = torch_outputs[bi].clone()
+            torch.testing.assert_close(torch_outputs[bi], expected_torch, rtol=0, atol=0)
+            check_close(output, torch_outputs[bi], OUTPUT_TOLERANCE)
+            addresses[-1].update({name: tensor_address(tensor) for name, tensor in (
+                ("Torch_X", input_x), ("Torch_W_down", raw_down), ("Torch_W_up", raw_up),
+                ("Torch_Y_prepared", torch_outputs[bi]))})
         assert all(len({row[name]["pointer"] for row in addresses}) == args.buffers for name in addresses[0])
         write_json(folder / "addresses.json", addresses)
-        for scope in SCOPES:
+        for scope in TIMING_SCOPES:
             for index in range(args.warmup): calls[scope][index % args.buffers]()
         torch.cuda.synchronize()
         ready = hardware_gate(args, folder, "before_samples")
         timings = {}
         with (folder / "samples.jsonl").open("x") as raw:
-            for scope in SCOPES:
+            # Retain the original stage-by-stage sampling order; append Torch.
+            # These are whole-scope medians, not an interleaved A/B experiment.
+            for scope in TIMING_SCOPES:
                 perf = cuda_perf(name=f"gr_read_{scope}", verbose=0)
                 if not perf.enable:
                     raise RuntimeError("CUDAPERF disables GRRead timing")
                 for index in range(args.iters):
                     bi = index % args.buffers
-                    with perf: calls[scope][bi]()
+                    with perf: actual = calls[scope][bi]()
                     us = perf.latencies[-1] * 1e6
                     assert math.isfinite(us) and us > 0
-                    raw.write(json.dumps({"scope": scope, "sample": index, "buffer": bi, "us": us}) + "\n")
+                    record = {"scope": scope, "sample": index, "buffer": bi, "us": us}
+                    if scope == "torch_compile":
+                        torch_outputs[bi] = actual
+                        record["output_address"] = tensor_address(actual)
+                    raw.write(json.dumps(record) + "\n")
                     raw.flush()
+                    # Validate each timed Torch output before a later call can
+                    # release/reuse it. No validation is inside the timer.
+                    if scope == "torch_compile":
+                        torch.testing.assert_close(actual, expected_torch, rtol=0, atol=0)
                 samples = [value * 1e6 for value in perf.latencies]
                 assert len(samples) == args.iters
                 for bi in sorted({index % args.buffers for index in range(args.iters)}):
                     reader = readers[bi]
-                    torch.testing.assert_close(reader.partial if scope == "down" else reader.output,
-                                               expected_p if scope == "down" else expected_y, rtol=0, atol=0)
-                flops = (4 if scope == "total" else 2) * rows * 10240 * 320
+                    actual = (torch_outputs[bi] if scope == "torch_compile" else
+                              reader.partial if scope == "down" else reader.output)
+                    expected = (expected_torch if scope == "torch_compile" else
+                                expected_p if scope == "down" else expected_y)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                flops = (2 if scope in ("down", "up") else 4) * rows * 10240 * 320
                 elapsed = median(samples)
                 timings[scope] = {"elapsed_us": elapsed, "samples_us": samples, "gemm_FLOPs": flops,
                                   "effective_TFLOPS": flops / elapsed / 1e6}
@@ -354,7 +416,12 @@ def benchmark_batch(rows, args, folder):
                 "hardware_before": before, "hardware_before_samples": ready, "hardware_after": after,
                 "buffers": args.buffers, "warmup_each": args.warmup, "samples_each": args.iters,
                 "timed_outputs_bitexact": True, "all_samples_retained": True,
-                "Total_measured_directly": True, "settings_written": False}
+                "Total_measured_directly": True, "settings_written": False,
+                "speedup_vs_torch_compile": timings["torch_compile"]["elapsed_us"] / timings["total"]["elapsed_us"],
+                "torch_compile": {"full_rows": rows, "returns": "Y", "options": "default", "cuda_graph": False,
+                                  "shared_X": True, "independent_raw_weight_buffers": args.buffers,
+                                  "output_allocation": "native", "Y_tolerance": OUTPUT_TOLERANCE},
+                "sampling_order": list(TIMING_SCOPES)}
 
 
 def release_buffers():
@@ -365,22 +432,28 @@ def release_buffers():
 
 
 def print_summary(results):
-    print("\n| Batch | Down | Up | Down us / TFLOPS | Up us / TFLOPS | Total us / TFLOPS |", flush=True)
-    print("|---:|---:|---:|---:|---:|---:|", flush=True)
+    print("\n| Batch | Down | Up | Down us / TFLOPS | Up us / TFLOPS | Total us / TFLOPS | Torch compile us / TFLOPS | Speedup |", flush=True)
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|", flush=True)
     for result in results:
-        cells = [f"{result['timings'][scope]['elapsed_us']:.3f} / {result['timings'][scope]['effective_TFLOPS']:.3f}" for scope in SCOPES]
+        cells = [f"{result['timings'][scope]['elapsed_us']:.3f} / {result['timings'][scope]['effective_TFLOPS']:.3f}" for scope in TIMING_SCOPES]
         down = (f"M{result['down_block_m']}/W{result['down_num_waves']}"
                 f"/N{result['down_n_splits']}/BK{result['down_block_k']}")
-        print(f"| {result['rows']} | {down} | N{result['n_splits']} | {' | '.join(cells)} |", flush=True)
+        print(f"| {result['rows']} | {down} | M{result['up_block_m']}/N{result['n_splits']} | "
+              f"{' | '.join(cells)} | {result['speedup_vs_torch_compile']:.3f}x |", flush=True)
+    print("Speedup = Torch compile Total / PyHIP Total; eager cudaPerf, full-row calls, no CUDA Graph.", flush=True)
 
 
 def run_suite(args, output):
     result = {"complete": False, "phase": "correctness", "batches": args.batches, "gpu": args.gpu,
               "seed": args.seed, "checks": [], "performance": [], "check_only": args.check_only,
-              "protocol": {"buffers": args.buffers, "warmup": args.warmup, "iters": args.iters},
+              "protocol": {"buffers": args.buffers, "warmup": args.warmup, "iters": args.iters,
+                           "timing_scopes": list(TIMING_SCOPES), "scope_order": "sequential", "cuda_graph": False},
               "settings_written": False}
     active_rows = None
     try:
+        torch, _, _, _ = dependencies()
+        result["environment"] = {"torch": torch.__version__, "hip": torch.version.hip,
+                                 "torch_compile_source": "inline SGLang _mix_compute at 2843214f6ed923e992a74ee4d7a0cda5d7deddbf"}
         print(f"[1/2] Correctness checks for all {len(args.batches)} batch sizes (no idle-GPU requirement)", flush=True)
         for rows in args.batches:
             active_rows = rows

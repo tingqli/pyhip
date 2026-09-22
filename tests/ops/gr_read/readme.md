@@ -71,6 +71,7 @@ HIP_VISIBLE_DEVICES=0,1 python3 -m pytest -q tests/contrib/gr_read/test_gr_read.
 
 # 原入口默认 21 档：32/64/128/256/512 及 1K–64K。
 python3 tests/contrib/gr_read/test_gr_read.py --gpu 3 --check-only
+# 性能表同时输出 Down、Up、Total、Torch compile Total 和加速比。
 python3 tests/contrib/gr_read/test_gr_read.py --gpu 3
 
 # 重点检查新的配置边界。
@@ -84,7 +85,11 @@ python3 tests/contrib/gr_read/bench_gr_read_compare.py \
   --output /tmp/gr_read_prefill_compare.jsonl
 ```
 
-原性能入口分别测 Down、Up、Total；Total 直接测量。使用原 `cudaPerf`，默认 10 组独立 buffer、各阶段 2 次预热、10 个样本取中位数。权重打包、对象构造、JIT、参考与校验不计时。门禁前固定静置 2 秒，单次查询要求 GPU use≤5%、VRAM≤20%、PTL Enabled/VECTOR,F8；失败停止并保留数据。没有修改设备设置或剔除长尾。
+原性能入口分别测 Down、Up、Total，并新增 Torch compile 完整调用。使用原 `cudaPerf`，默认 10 组独立 buffer、各阶段 2 次预热、10 个样本取中位数；保留逐阶段采样顺序，Torch compile 接在 Total 后面。这张表使用各阶段整组样本的中位数，不是交错 A/B 测量。Total 直接测量。权重打包、对象构造、首次编译、参考与校验不计时。门禁前固定静置 2 秒，单次查询要求 GPU use≤5%、VRAM≤20%、PTL Enabled/VECTOR,F8；失败停止并保留数据。没有修改设备设置或剔除长尾。
+
+表格新增 `Torch compile us / TFLOPS` 和 `Speedup`，其中 **Speedup = Torch compile Total / PyHIP Total**，大于 1 表示 PyHIP 更快；结果及全部样本也写入原 JSON/JSONL 输出。TFLOPS 两边都按 `4*T*10240*320` 的有效 GEMM 工作量计算。
+
+这里的 Torch compile 对照在脚本内保留 SGLang `2843214f6ed923e992a74ee4d7a0cda5d7deddbf` 的 `_mix_compute` 公式，使用默认 `torch.compile`，只返回 Y，无需安装 SGLang。每次对完整 T 调用一次；原来按 1024 行分块、返回 P/Y 的正确性参考仍单独保留，不用于计时。两边使用同一个 X；Torch 轮换 10 对原始 BF16 权重，PyHIP 使用对应的 packed 权重，均在准备阶段生成。Torch 保留原生中间张量和输出分配，地址单独记录，内部工作区不强制与 PyHIP 相同。所有实际被计时的 Torch 输出都会检查；prefill 全程普通调用，无 CUDA Graph。`--check-only` 仍只运行原正确性检查。
 
 [SGLang 对照脚本](bench_gr_read_compare.py)读取指定 checkout 的原 `_mix_compute` AST 并按原方式 `torch.compile`，同时加载 `hc_mix_triton.py` 的实现及支持判断。两边共用原始权重值和 X；PyHIP 的 packed 权重每对只准备一次、跨所有 T 复用。JSONL 记录版本、源码 hash、地址、原始样本、初始/改变输入 FP64 检查；`--output` 必须是新文件。
 
