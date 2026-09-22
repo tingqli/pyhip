@@ -32,7 +32,7 @@ description: 'Use when refactoring or debugging FlyDSL kernels, buffer/LDS byte 
 - 24B搬运明确分16B+8B，不能扩读32B或声称是一条VM请求。copy32不保证自动合并为copy128，请求数变化会影响wait账本。
 - 全局行/expert大偏移必须在乘法前升64位；局部buffer extent与实际stride、尾行共同决定边界。
 
-现行定义及CPU/MLIR合同：[helpers](../../../src/pyhip/codegen/flydsl/helpers.py)、[Tensor接口回归](../../../tests/contrib/moe/test_tensor_memory.py)。
+现行定义及CPU/MLIR合同：[helpers](../../../src/pyhip/codegen/flydsl/helpers.py)、[Tensor接口回归](../../../tests/codegen/asm/test_tensor.py)。
 
 ## 3. 区分正常编译、纯离线与缓存复用
 
