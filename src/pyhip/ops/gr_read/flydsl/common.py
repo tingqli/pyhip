@@ -54,7 +54,7 @@ def select_down_n_splits(rows, compute_units):
 def select_down_config(rows, compute_units):
     """Return (block_m, num_waves, n_splits, block_k) without runtime autotuning."""
     n_splits = select_down_n_splits(rows, compute_units)
-    if compute_units == 80 and 48 <= rows <= 512:
+    if compute_units == 80 and 33 <= rows <= 512:
         if rows <= 128:
             return 16, 2, 10, 1024
         if rows <= 256:
@@ -68,9 +68,9 @@ def select_down_config(rows, compute_units):
 
 
 def select_up_config(rows, compute_units):
-    """Return (M tile, N splits), retaining the original M256 path outside 48..512."""
+    """Return (M tile, N splits), retaining the original M256 path outside 33..512."""
     n_splits = select_n_splits(rows, compute_units)
-    if compute_units == 80 and 48 <= rows <= 256:
+    if compute_units == 80 and 33 <= rows <= 256:
         return (64 if rows <= 128 else 128), n_splits
     return 256, n_splits
 
@@ -79,7 +79,7 @@ def select_prefill_config(rows, compute_units):
     """Return the complete, fixed prefill configuration used during preparation."""
     dm, dw, dn, dk = select_down_config(rows, compute_units)
     um, un = select_up_config(rows, compute_units)
-    swizzle = (7 if rows <= 128 else 6) if compute_units == 80 and 48 <= rows <= 512 else 3
+    swizzle = (7 if rows <= 128 else 6) if compute_units == 80 and 33 <= rows <= 512 else 3
     return dm, dw, dn, dk, um, un, swizzle
 
 

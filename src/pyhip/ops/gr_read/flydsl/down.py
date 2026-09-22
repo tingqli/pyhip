@@ -203,3 +203,88 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64, swizzle_shift=
         gr_read_down(X, W, P, rows).launch(grid=(m_tiles, R // BN, 1), block=(THREADS, 1, 1), stream=stream)
 
     return launch_down
+
+
+# Decode T1..32: original global split-K=4 pipeline.
+@cache
+def make_decode_down(rows):
+    (bm, bk, waves) = (16 if rows <= 16 else 32, 128, 4)
+    (split, dn) = (4, 16)
+    prefetch_unroll = 2 if rows <= 25 else 1
+    iterations = K // waves // bk // split
+    padded_rows = (rows + bm - 1) // bm * bm
+
+    @fx.struct
+    class DownShared:
+        partials: fx.Array[fx.Float32, bm * dn * waves, 16]
+
+    @flyc.kernel
+    def down_wave_splitk_pipeline(X: fx.Tensor, W: fx.Tensor, A: fx.Tensor):
+        tid = fx.thread_idx.x
+        (lane, wave) = (tid % 64, tid // 64)
+        (im, jn, sk) = fx.block_idx
+        x = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(X), fx.make_layout((rows, K), (K, 1))), max_size=False)
+        w_layout = fx.make_layout(((16, R // 16), (8, 4, K // 32)), ((8, 16 * K), (1, 128, 512)))
+        w = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(W), w_layout), max_size=False)
+        shared = fx.SharedAllocator().allocate(DownShared).peek()
+        partials = shared.partials.view(fx.make_layout((bm, dn, waves), (dn, 1, bm * dn)))
+        a_tile = fx.flat_divide(w, fx.make_tile(dn, bk))[None, None, jn, None]
+        b_tile = fx.flat_divide(x, fx.make_tile(bm, bk))[None, None, im, None]
+        c_tile = fx.select(partials[None, None, wave], [1, 0])
+        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+        tiled = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (0, 0, 0)), (None, None, fx.make_layout((4, 4, 2), (1, 8, 4))))
+        thr = tiled.thr_slice(lane)
+        copy_ab = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        copy_c = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+        ca = fx.make_tiled_copy_A(copy_ab, tiled).get_slice(lane)
+        cb = fx.make_tiled_copy_B(copy_ab, tiled).get_slice(lane)
+        cc = fx.make_tiled_copy_C(copy_c, tiled).get_slice(lane)
+        fa = thr.make_fragment_A(a_tile[None, None, 0])
+        fb = thr.make_fragment_B(b_tile[None, None, 0])
+        fc = thr.make_fragment_C(c_tile)
+        (ga, gb) = (ca.partition_S(a_tile), cb.partition_S(b_tile))
+        (ra, rb) = (ca.retile(fa), cb.retile(fb))
+        fc.fill(0)
+        next_a = thr.make_fragment_A(a_tile[None, None, 0])
+        next_b = thr.make_fragment_B(b_tile[None, None, 0])
+        (next_ra, next_rb) = (ca.retile(next_a), cb.retile(next_b))
+        first = sk * (K // split // bk) + wave
+        fx.copy(copy_ab, ga[None, None, None, first], ra)
+        fx.copy(copy_ab, gb[None, None, None, first], rb)
+        for (ki, state) in range(fx.Index(1), fx.Index(iterations), fx.Index(prefetch_unroll), init=[fa.load(), fb.load(), fc.load()]):
+            fa.store(state[0])
+            fb.store(state[1])
+            fc.store(state[2])
+            kt = sk * (K // split // bk) + fx.Int32(ki) * waves + wave
+            fx.copy(copy_ab, ga[None, None, None, kt], next_ra)
+            fx.copy(copy_ab, gb[None, None, None, kt], next_rb)
+            fx.gemm(mma, fc, fa, fb, fc)
+            if fx.const_expr(prefetch_unroll == 2):
+                second = kt + waves
+                fx.copy(copy_ab, ga[None, None, None, second], ra)
+                fx.copy(copy_ab, gb[None, None, None, second], rb)
+                fx.gemm(mma, fc, next_a, next_b, fc)
+                (carried_a, carried_b) = (fa.load(), fb.load())
+            else:
+                (carried_a, carried_b) = (next_a.load(), next_b.load())
+            result = (yield [carried_a, carried_b, fc.load()])
+        fa.store(result[0])
+        fb.store(result[1])
+        fc.store(result[2])
+        fx.gemm(mma, fc, fa, fb, fc)
+        fx.copy(copy_c, cc.retile(fc), cc.partition_D(c_tile))
+        fx.gpu.barrier()
+        out = fx.make_view(fx.get_iter(A), fx.make_layout((padded_rows, R, split), (R, 1, padded_rows * R)))
+        for i in range_constexpr((bm * dn + waves * 64 - 1) // (waves * 64)):
+            index = tid + i * waves * 64
+            if index < bm * dn:
+                (row, col) = (index // dn, index % dn)
+                total = fx.Float32(0.0)
+                for s in range_constexpr(waves):
+                    total = total + fx.memref_load(partials, (row, col, s))
+                fx.memref_store(total, out, (im * bm + row, jn * dn + col, sk))
+
+    @flyc.jit
+    def launch(X: fx.Tensor, W: fx.Tensor, A: fx.Tensor, stream: fx.Stream):
+        down_wave_splitk_pipeline(X, W, A).launch(grid=(padded_rows // bm, R // dn, split), block=(waves * 64, 1, 1), stream=stream)
+    return launch

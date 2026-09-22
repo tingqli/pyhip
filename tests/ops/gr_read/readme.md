@@ -37,9 +37,9 @@ y64 = read64.run_up(x64)
 | --- | --- |
 | [host.py](../../../src/contrib/flydsl/gr_read/host.py) | `GRReadPrefill` 准备、工作区、当前 stream/device、完整或分阶段调用 |
 | [common.py](../../../src/contrib/flydsl/gr_read/common.py) | 公共权重预处理入口、维度、固定配置选择 |
-| [prefill_down.py](../../../src/contrib/flydsl/gr_read/prefill_down.py) | 原 Down 与调优后的 tile/BK/swizzle 参数 |
-| [prefill_up.py](../../../src/contrib/flydsl/gr_read/prefill_up.py) | 原 M256 Up，按参数分派小 M 版本 |
-| [prefill_up_small.py](../../../src/contrib/flydsl/gr_read/prefill_up_small.py) | 合并后的 M64/M128 Up 编译期特化 |
+| [prefill_down.py](../../../src/contrib/flydsl/gr_read/down.py) | 原 Down 与调优后的 tile/BK/swizzle 参数 |
+| [prefill_up.py](../../../src/contrib/flydsl/gr_read/up.py) | 原 M256 Up，按参数分派小 M 版本 |
+| [prefill_up_small.py](../../../src/contrib/flydsl/gr_read/up.py) | 合并后的 M64/M128 Up 编译期特化 |
 | [helpers.py](../../../src/contrib/flydsl/gr_read/helpers.py) | 原数值与底层辅助函数 |
 
 80CU 上的配置如下，选择发生在准备阶段，无运行时 autotune：
@@ -107,16 +107,46 @@ T48–512 的正式优化前后对照已在 30 档、普通调用下验证：选
 
 3. **让权重顺序匹配归约顺序和输出lane。** Up先将权重排列为`[H64 tile, stream, H32 half, ...]`，相邻8个H32 packet完成同一H64的四路归约；内层重排使同一lane取得连续8个BF16，适配X和16B Y store。随后N16/K32 preshuffle负责MFMA输入打包，不能混淆两层排列。变更前先用CPU标签证明索引双射，再同步修改消费地址。[准备函数](test_gr_read.py#L110)
 
-4. **交错当前MFMA与上一packet的后处理。** 在Compute(q)计算当前logits，同时推进q−1的scale／exp／rcp／FMA／BF16打包，拆开后处理自身依赖链。当前每10条MFMA推进两个旧元素，SFU独占间隔，普通间隔控制VALU数量；实际收益取决于机器调度和生存期，不是让指令间隔形式上均匀。保留FIRST／LOOP／LAST和drain的完整覆盖。[Up流水](../../../src/contrib/flydsl/gr_read/prefill_up.py)
+4. **交错当前MFMA与上一packet的后处理。** 在Compute(q)计算当前logits，同时推进q−1的scale／exp／rcp／FMA／BF16打包，拆开后处理自身依赖链。当前每10条MFMA推进两个旧元素，SFU独占间隔，普通间隔控制VALU数量；实际收益取决于机器调度和生存期，不是让指令间隔形式上均匀。保留FIRST／LOOP／LAST和drain的完整覆盖。[Up流水](../../../src/contrib/flydsl/gr_read/up.py)
 
 5. **联合调整预取深度、寄存器占用与等待。** 当前W2在Memory(q)发布W(q+1)、预读W(q+2)，少保留一个W搬运包；没有减少总W字节。任何预取或发射顺序改动都要重算W/X/Y的VMEM完成账本，检查LDS覆写和实际ISA。4＋4wave错相必须首尾闭合，barrier不能替代完成等待，VGPR下降也不自动提高占用率。
 
 6. **按缓存行组织X协作读取，再恢复计算布局。** 同行8个lane各读16B形成X128，覆盖H64并供相邻两个H32消费；通过每wave3KiB LDS恢复MFMA布局。两个20KiB W槽＋24KiB X区共64KiB。X/P读和Y写当前使用NT、W保持default；合并请求能减少重复取读，但增加LDS工作，不能只凭HBM字节下降宣称加速。
 
-7. **64位tile基址＋局部buffer边界，避免Host分块和P padding。** CTA入口先以64位元素偏移重设X/P/Y，descriptor只覆盖当前tile有效行。Down N1输出范围为`valid_rows*R*2`；N2保留stride R，范围为`((valid_rows-1)*R+BN)*2`，valid0为0。二维tensor避免展平动态shape超i32；rows运行时传入，工厂仅按N分片缓存。正常`flyc.compile`会执行一次，必须提供足量张量。[Down尾块处理](../../../src/contrib/flydsl/gr_read/prefill_down.py)
+7. **64位tile基址＋局部buffer边界，避免Host分块和P padding。** CTA入口先以64位元素偏移重设X/P/Y，descriptor只覆盖当前tile有效行。Down N1输出范围为`valid_rows*R*2`；N2保留stride R，范围为`((valid_rows-1)*R+BN)*2`，valid0为0。二维tensor避免展平动态shape超i32；rows运行时传入，工厂仅按N分片缓存。正常`flyc.compile`会执行一次，必须提供足量张量。[Down尾块处理](../../../src/contrib/flydsl/gr_read/down.py)
 
 8. **把性能条件和归因口径固定下来。** 正确性guard view与性能原生allocation分开，记录X/P/Y相对地址；同一ELF也会对地址偏移敏感。保留长尾，用同址交错对照确认小收益。ATT只分析共同稳态窗口，区分issue-stall和completion-wait，不把跨wave stall求和当墙钟，也不把MFMA union×roof模型TFLOPS当实测。逻辑M-major或swizzle不保证物理XCD归属，需单独验证。
 
 可复用流程已整理为项目skills：
 - [grread-bf16-prefill](../../../.github/skills/grread-bf16-prefill/SKILL.md)：数值边界、权重／lane布局、N分片、X128/W2流水、精确尾块。
 - [gpu-benchmark-validation](../../../.github/skills/gpu-benchmark-validation/SKILL.md)：空闲GPU与PTL、原计时器和地址条件、原始样本、ATT/PMC归因边界。
+
+
+## 6. Decode T1–32：独立正确性、原 Graph 基准和 SGLang 对照
+
+实现已按方向收拢：[down.py](../../../src/contrib/flydsl/gr_read/down.py) 包含 prefill Down 和 decode split-K Down，[up.py](../../../src/contrib/flydsl/gr_read/up.py) 包含所有 prefill Up 和 decode Up。上文旧文件名对应的实现均迁入这两个文件。两后端共用 `common.prepare_weights()`；模型加载时 prepare 一次，同一份 packed Down/Up 权重可传给 `GRReadDecode` 和 `GRReadPrefill`。FlyDSL 验证版本为 **0.3.2**。
+
+Decode 默认覆盖全部 T1–32，独立测量、独立出表。Prefill 继续普通调用，默认性能矩阵首档现为 T33；T33–64 全部使用之前验证的小 M 配置（同上文 T48–128 的配置，包括 T48），其余 prefill 配置保持。
+
+在仓库根目录运行：
+
+```bash
+# 原 decode 正确性：默认 2 对权重、全部 T1–32、6528 次 Graph replay。
+HIP_VISIBLE_DEVICES=2 python3 tests/contrib/gr_read_decode/test_gr_read.py
+
+# 原 decode 带宽型负载基准：100 对独立权重，全部 T1–32。
+HIP_VISIBLE_DEVICES=2 python3 tests/contrib/gr_read_decode/bench_gr_read.py \
+  --weights 100 --rounds 3 --samples 7 --seed 707 \
+  --output /tmp/gr_read_decode_graph.jsonl
+
+# Decode 与当前 SGLang 单独对照，Down/Up/Total 分别捕获 Graph。
+python3 tests/contrib/gr_read/bench_gr_read_compare.py \
+  --phase decode --sglang-root /opt/sglang --gpu 2 \
+  --output /tmp/gr_read_decode_sglang.jsonl
+```
+
+`--output` 使用新文件名。原 decode 基准的 100 组独立权重工作集、buffer 准备、capture、计时器和检查流程保持：图内依次执行所有实例两轮，每个样本 replay 三次，Event 时间除以 600；3 轮 × 7 个样本全部保留并取中位数。Packing、编译和参考不计时。输出仍使用原微秒时延与有效 TFLOPS 指标，未把逻辑字节数当成实测 HBM 流量。
+
+SGLang 对照读取指定 checkout 的原实现和支持判断。在本机 gfx942、默认非确定性推理下，T1–16 为 Triton persistent，T17–32 为 Torch compile；两边均使用 decode 的 Graph 协议。对照表包含 T1–32 每一行和实际后端，独立于 prefill 表。两边使用相同 X 与逻辑权重，PyHIP packing 在准备阶段完成。
+
+原 FP64 容差 `rtol=1e-2, atol=5e-3`、live rows 缩小/恢复、zero/stale/NaN 尾行、P/Y 预污染、内部 padding、guard、输入及权重不变检查全部保留。

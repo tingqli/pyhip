@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""gfx942 BF16 GR read: prepare shared weights once and precompile prefill calls."""
+"""gfx942 BF16 GR read: shared packed weights for decode and prefill."""
 
 from .common import prepare_weights
-from .host import GRReadPrefill
+from .host import GRReadDecode, GRReadPrefill
 
-__all__ = ['GRReadPrefill', 'prepare_weights']
+__all__ = ['GRReadDecode', 'GRReadPrefill', 'prepare_weights']

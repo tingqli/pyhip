@@ -22,7 +22,7 @@ import time
 import warnings
 
 REPO = Path(__file__).resolve().parents[3]
-PREFILL_ROWS = (32, 64, 128, 256, 512) + tuple(
+PREFILL_ROWS = (33, 64, 128, 256, 512) + tuple(
     k * 1024 for k in (1, 2, 4, 8, 10, 12, 16, 20, 24, 28, 30, 32, 36, 48, 60, 64)
 )
 SCOPES = ('down', 'up', 'total', 'sglang')
@@ -87,10 +87,11 @@ def dependencies(sglang_root, *, with_decode=True):
 
     decode = None
     if with_decode:
-        path = REPO / 'tests/contrib/gr_read_decode/kernel.py'
-        if not path.is_file():
-            raise RuntimeError('decode example is not installed; use --phase prefill')
-        decode = load_file('gr_compare_decode', path)
+        from pyhip.contrib.flydsl.gr_read import GRReadDecode, prepare_weights
+        from pyhip.contrib.flydsl.gr_read.down import make_decode_down
+        from pyhip.contrib.flydsl.gr_read.up import make_decode_up
+        decode = SimpleNamespace(GRReadDecode=GRReadDecode, prepare_weights=prepare_weights,
+                                 down_launcher=make_decode_down, up_launcher=make_decode_up)
     check = SimpleNamespace(reference=reference, assert_close=assert_close, make_inputs=make_inputs, capture=capture)
     prefill = load_file('gr_compare_prefill', Path(__file__).with_name('test_gr_read.py'))
     source = sglang_root / 'python/sglang/srt/layers/hyperconnection.py'
@@ -321,6 +322,7 @@ def benchmark_rows(rows, pairs, args, dep, emit, packed_pairs=None):
     print(f"T={rows:5d} {result['mode']:10s} Down={timings['down']:.3f} Up={timings['up']:.3f} "
           f"Total={timings['total']:.3f} SGLang({cases[0].sg_backend})={timings['sglang']:.3f} us "
           f"speedup={result['speedup_total']:.3f}x", flush=True)
+    return result
 
 
 def main():
@@ -367,8 +369,6 @@ def main():
                  args.sglang_root / 'python/sglang/srt/layers/hyperconnection.py',
                  args.sglang_root / 'python/sglang/srt/layers/hc_mix_triton.py']
         paths.extend((REPO / 'src/contrib/flydsl/gr_read').glob('*.py'))
-        if args.phase == 'decode':
-            paths.append(REPO / 'tests/contrib/gr_read_decode/kernel.py')
         emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
               'gpu': props.name, 'arch': props.gcnArchName, 'compute_units': props.multi_processor_count,
               'args': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
@@ -383,12 +383,20 @@ def main():
             packed_pairs = [prepare_weights(wd, wu) for wd, wu in pairs]
             emit({'type': 'weight_preparation', 'pairs': len(pairs), 'packing_calls': len(pairs),
                   'shared_across_rows': True})
+            results = []
             for rows in args.rows:
-                benchmark_rows(rows, pairs, args, dep, emit, packed_pairs)
+                results.append(benchmark_rows(rows, pairs, args, dep, emit, packed_pairs))
                 gc.collect()
                 torch.cuda.empty_cache()
         gate(prefill, args, 'exit', emit)
         emit({'type': 'summary', 'complete': True, 'rows': args.rows})
+        if args.phase == 'decode':
+            print('\n| T | Decode Down us | Decode Up us | Decode Total us | SGLang backend | SGLang Total us | Speedup |')
+            print('|---:|---:|---:|---:|---|---:|---:|')
+            for r in results:
+                t = r['median_us']
+                print(f"| {r['rows']} | {t['down']:.3f} | {t['up']:.3f} | {t['total']:.3f} | "
+                      f"{r['sglang_backend']} | {t['sglang']:.3f} | {r['speedup_total']:.3f}x |")
 
 
 if __name__ == '__main__':

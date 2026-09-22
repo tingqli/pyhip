@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """GRRead basic correctness and performance tests with an inline reference and CLI.
 
-Direct execution checks all 21 batch sizes, including 32/64/128/256/512,
+Direct execution checks all 21 batch sizes, including 33/64/128/256/512,
 before timing Down/Up/Total and a full-row torch.compile comparison.
 Use --check-only for correctness without timing. Pytest checks basic numerical
 results, empty inputs, and tails without running performance tests.
@@ -26,7 +26,7 @@ C, H, R = 4, 2560, 320
 CHECK_ROWS = 1024
 DOWN_TOLERANCE = dict(rtol=0.015625, atol=2e-5)
 OUTPUT_TOLERANCE = dict(rtol=1e-2, atol=5e-3)
-DEFAULT_BATCHES = (32, 64, 128, 256, 512) + tuple(k * 1024 for k in (1, 2, 4, 8, 10, 12, 16, 20, 24, 28, 30, 32, 36, 48, 60, 64))
+DEFAULT_BATCHES = (33, 64, 128, 256, 512) + tuple(k * 1024 for k in (1, 2, 4, 8, 10, 12, 16, 20, 24, 28, 30, 32, 36, 48, 60, 64))
 SCOPES = ("down", "up", "total")
 TIMING_SCOPES = (*SCOPES, "torch_compile")
 
@@ -47,7 +47,7 @@ def parse_args(argv=None):
     batches = parser.add_mutually_exclusive_group()
     batches.add_argument("--rows", type=parse_batch, help="run one batch size, e.g. 4K")
     batches.add_argument("--batches", nargs="+", type=parse_batch,
-                         help=f"batch sizes to test; defaults to all {len(DEFAULT_BATCHES)} sizes, including 32/64/128/256/512")
+                         help=f"batch sizes to test; defaults to all {len(DEFAULT_BATCHES)} sizes, including 33/64/128/256/512")
     parser.add_argument("--gpu", type=int, default=3, help="physical ROCm GPU index (default: 3)")
     parser.add_argument("--check-only", action="store_true", help="check all selected batches without hardware gates or timing")
     parser.add_argument("--seed", type=int, default=131)
@@ -513,7 +513,7 @@ if __name__ == "__main__":
 import pytest
 
 
-@pytest.mark.parametrize("rows", (0, 1, 31, 33, 47, 48, 49, 63, 65, 127, 129, 255, 257, 511, 513,
+@pytest.mark.parametrize("rows", (0, 1, 31, 32, 47, 48, 49, 63, 65, 127, 129, 255, 257, 511, 513,
                                   1023, 1025, 2047, 2049, 2560, 2561, 3072, 3073,
                                   4095, 4097, 65537, *DEFAULT_BATCHES))
 def test_gr_read(rows):
