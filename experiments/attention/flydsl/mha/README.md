@@ -41,7 +41,7 @@ MI308阶段分离后的单文件合并pytest：**68通过、0跳过**；41项功
 PY="${PY:-python}"
 MHA=experiments/attention/flydsl/mha/test_mha_pa.py
 "$PY" "$MHA" --list
-OUT=$(mktemp -d "$PWD/tests/flydsl/mha/results/mha-three-suites.XXXXXX")
+OUT=$(mktemp -d "$PWD/mha-results.XXXXXX")
 "$PY" "$MHA" --suite all --output "$OUT/all.json"
 
 # 可选：精确选择同一suite中的两个case，不改变它们的输入或参考。
