@@ -63,10 +63,8 @@ python3 experiments/gemm/flydsl/compare_gemm_950.py validate \
 ### 2.3 汇编与同步验证
 
 ```bash
-python3 tests/flydsl/verify_gemm_950_pipeline.py
-python3 experiments/gemm/flydsl/compare_gemm_950.py verify-8wave
-sha256sum -c tests/flydsl/asm/gfx950_current/SHA256SUMS
-sha256sum -c tests/flydsl/asm/gfx950_8wave_tiles/SHA256SUMS
+python3 experiments/gemm/flydsl/compare_gemm_950.py verify-8wave \
+  --asm /tmp/gemm_kernel_0/21_final_isa.s
 ```
 
 默认`256x256`汇编合同：
@@ -77,8 +75,7 @@ sha256sum -c tests/flydsl/asm/gfx950_8wave_tiles/SHA256SUMS
   `10,8,6,4,2,0`；相邻wait之间2条DMA；每区相位为
   `wait -> setprio(1) -> barrier -> MFMA -> setprio(0) -> barrier -> LDS read/DMA`。
 
-完整8-wave tile汇编、抽取值和SHA256保存在
-`tests/flydsl/asm/gfx950_8wave_tiles/`。
+该验证需要提供本地生成的8-wave final ISA dump，例如`/tmp/gemm_kernel_0/21_final_isa.s`。
 
 ### 2.4 性能测试
 
