@@ -542,6 +542,11 @@ def compile_gemm_fp8_8wave(
             # frag_P (outer FIFO)       (4,2,4) f32    (4,2,2) f32 -> 32/16 VGPR
             # prev_scale_a: 4/2 f32; prev_scale_b: one scalar (SGPR after load/
             # scalarization). prev_m_slice selects old C rows, not another FIFO.
+            
+        
+            # v_pk_fma can't be used because of mfma can't coissue with v_pk_fma, which would cause stall between MFMAs ISAs
+            # not find a good way to use v_fma and prevent v_pk_fma. perf drop when "passthrough": [["target-features", "-packed-fp32-ops"]],
+            # keep the inline assembly for now.
             if const_expr(with_scale):
                 #     for mm in (Mrep):
                 #         dq_scale = prev_scale_a[mm] *prev_scale_b
