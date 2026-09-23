@@ -38,6 +38,36 @@ ASM split-K 保留原脚本的实际 batch 集合：2–63、128–255、256/512
 因此默认用例数量比旧脚本的单 node 内循环多。可用 node id 或 `-k` 做定向验证。
 没有新增 pytest 命令行配置框架；新增 tile 时直接增加普通参数化用例。
 
+### jit_blockscale：小 shape 回归与大 shape 优化
+
+两个测试函数复用普通 helper `_run_jit_blockscale`，不混合 shape 参数或使用参数级标记：
+
+- `test_jit_blockscale`：小 shape 回归，不加 `perf` 标记。
+- `test_jit_blockscale_perf`：大 shape 优化，函数上加 `@pytest.mark.perf`。
+
+仓库默认的 `-m "not perf"` 会排除大 shape，不准备其输入，也不运行 kernel。
+
+| 选择 | H / I_tp / E / topk | M |
+|---|---|---|
+| 默认小 shape | 1024 / 256 / 8 / 4 | 1、17、257 |
+| `-m perf` 大 shape | 4096 / 256 / 512 / 10 | 64、1024、8192 |
+
+大 shape 复用 `qwen35_397B_k256` 的维度，但本测试始终使用 FP8 block-scale
+量化，不使用模型预设的 PTPC。两组都固定执行所选 tile / Down 路径，检查
+正确性并打印耗时、TFLOPS 和 diff；没有 autotune 或 fallback。
+
+```bash
+# 普通回归：只运行小 shape
+python3 -m pytest tests/ops/moe/test_moe.py::test_jit_blockscale -s
+
+# 优化阶段：显式选择大 shape，不运行小 shape
+python3 -m pytest tests/ops/moe/test_moe.py::test_jit_blockscale_perf -m perf -s
+
+# 缩小到大 shape 的一个 batch 和 persistent 配置
+python3 -m pytest tests/ops/moe/test_moe.py::test_jit_blockscale_perf -m perf \
+  -k 'm1024 and dppersistent and bm256 and dn64' -s
+```
+
 ## 共享工具与测试边界
 
 [pyhip.testing.moe](../../../src/pyhip/testing/moe.py) 提供：

@@ -1,7 +1,8 @@
 """固定配置的 MoE kernel pytest；不运行 autotune，也不依赖其候选列表。
 
 每个 batch/dtype/layout 是独立 node，可用 -k 或 node id 选择。
-普通用例只验正确性；-m perf 显式运行完整固定路径的多 buffer 计时。
+普通用例只验正确性，jit_blockscale 同时打印耗时和 diff；
+-m perf 显式运行大 shape 和其余固定路径的多 buffer 计时。
 """
 
 import inspect
@@ -111,9 +112,43 @@ def test_asm_splitk(tokens, precision):
     _check(_prepare(DECODE_MODEL, tokens, precision), SPLITK_CONFIG)
 
 
+def _run_jit_blockscale(model, tokens, tile_m, tile_n_down, down_path, record_property):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("native FP8 block-scale kernels require gfx950")
+    if not ((down_path == "default" and tile_n_down > 64)
+            or (down_path == "persistent" and tile_m == 256 and tile_n_down == 64)):
+        pytest.skip("unsupported block-scale Down tile combination")
+    call = _prepare(model, tokens, "block")
+    call["hidden_states"].mul_(50)  # 覆盖 SiLU 非线性区间及两阶段激活量化。
+    _measure(call, dict(_impl="jit_blockscale", tile_m_gate=tile_m, tile_m_down=tile_m,
+                        tile_n_gate=256, tile_n_down=tile_n_down, down_path=down_path),
+             record_property)
+
+
+@pytest.mark.parametrize("tokens", [1, 17, 257], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("tile_m", [128, 256], ids=lambda m: f"bm{m}")
+@pytest.mark.parametrize("tile_n_down", [64, 128, 256], ids=lambda n: f"dn{n}")
+@pytest.mark.parametrize("down_path", ["default", "persistent"], ids=lambda p: f"dp{p}")
+def test_jit_blockscale(tokens, tile_m, tile_n_down, down_path, record_property):
+    model = dict(HIDDEN_SIZE=1024, INTER_SIZE=256, TP=1, E=8, TOPK=4)
+    _run_jit_blockscale(model, tokens, tile_m, tile_n_down, down_path, record_property)
+
+
 @pytest.mark.parametrize("tokens", [1, 17, 64, 257], ids=lambda m: f"m{m}")
 def test_asm_one_stage(tokens):
     _check(_prepare(SMALL_MODEL, tokens, "bf16"), dict(_impl="jit_1stage"))
+
+
+@pytest.mark.parametrize("tokens", [1, 17, 513], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("preshuffle", ["off", "on"], ids=["raw", "shuffled"])
+def test_jit_gelu(tokens, preshuffle):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("GELU 8-wave kernels require gfx950")
+    model = dict(HIDDEN_SIZE=512, INTER_SIZE=256, TP=1, E=8, TOPK=4)
+    call = _prepare(model, tokens, "bf16", activation="gelu", preshuffle=preshuffle)
+    call["hidden_states"].mul_(100)  # 覆盖 GELU 非线性区间。
+    _check(call, dict(_impl="jit_gelu", tile_m_gate=256, tile_m_down=256,
+                      tile_n_gate=256, tile_n_down=256))
 
 
 @pytest.mark.parametrize("tokens", [2, 4, 16], ids=lambda m: f"m{m}")
@@ -244,6 +279,14 @@ def test_fly_down_8x1_rejects_removed_bk64(inter_size):
             BLOCK_TILE_SIZE_M=256, BLOCK_TILE_SIZE_N=128, stage="down", alg="prefill_1x4",
             USE_ATOMIC_WRITE=False, act_quant_type="ptpc", tile_k=64,
             down_path="8x1", down_output_padding_bytes=128)
+
+
+@pytest.mark.perf
+@pytest.mark.parametrize("tokens", [8192, 16384], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("model_name", ["qwen35_397B_k256"])
+def test_jit_blockscale_perf(model_name, tokens,  record_property):
+    _run_jit_blockscale(MOE_MODELS[model_name], tokens, 256, 64, "persistent",
+                       record_property)
 
 
 @pytest.mark.perf
