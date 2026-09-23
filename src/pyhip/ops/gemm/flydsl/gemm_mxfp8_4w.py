@@ -13,6 +13,8 @@
 #
 # CDNA4 (gfx950) only: FP8/MXFP8 GEMM with optional MXFP4 weights.
 
+from functools import cache
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float32, Int8, Int32, T, Vector
@@ -127,7 +129,43 @@ def compile_gemm_fp8(
     with_scale=False,
     b_mxfp4=False,
 ):
-    require_cdna4()
+    """Return the cached launcher for this CDNA4 target and static configuration."""
+    return _compile_gemm_fp8_cached(
+        require_cdna4(),
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        N,
+        K,
+        pid_swizzle,
+        lds_swizzle,
+        b_lds_swizzle,
+        preshuffle_b,
+        permlane_epilogue,
+        store_overlap,
+        with_scale,
+        b_mxfp4,
+    )
+
+
+@cache
+def _compile_gemm_fp8_cached(
+    target,
+    TILE_M,
+    TILE_N,
+    TILE_K,
+    N,
+    K,
+    pid_swizzle,
+    lds_swizzle,
+    b_lds_swizzle,
+    preshuffle_b,
+    permlane_epilogue,
+    store_overlap,
+    with_scale,
+    b_mxfp4,
+):
+    del target  # JIT launchers capture their target; keep it in the cache key.
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
     BLOCK_K = TILE_K
@@ -1256,3 +1294,7 @@ def compile_gemm_fp8(
 
     launch_gemm.compile_hints["llvm_options"] = {"amdgpu-mfma-vgpr-form": False}
     return launch_gemm
+
+
+compile_gemm_fp8.cache_clear = _compile_gemm_fp8_cached.cache_clear
+compile_gemm_fp8.cache_info = _compile_gemm_fp8_cached.cache_info

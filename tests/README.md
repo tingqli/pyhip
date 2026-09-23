@@ -34,12 +34,14 @@ are marked `perf` and excluded by default. `-m perf` opts in; `-m ""` removes th
 default marker filter. Correctness tests that also record timing remain intact;
 the marker does not split or rewrite existing test bodies.
 
-The FlyDSL [8-wave block-scale FP8](ops/gemm/test_gemm_fp8_8w_blockscale.py)
-and [4-wave MXFP8/MXFP4](ops/gemm/test_mxfp8_gemm_4w.py) suites import kernels
+The FlyDSL [8-wave block-scale FP8](ops/gemm/test_gemm_fp8_blockscale_8w.py)
+and [4-wave MXFP8/MXFP4](ops/gemm/test_gemm_mxfp8_4w.py) suites import kernels
 from [pyhip.ops.gemm.flydsl](../src/pyhip/ops/gemm/flydsl/). Their GPU tests
 require ROCm CDNA4 (`gfx950`) and skip on other devices. The kernel factories
 also reject non-CDNA4 compilation targets; explicit offline `gfx950` targets
-remain supported. MX quantization and weight-preshuffle cases additionally
+remain supported. Factories cache launchers by compilation target and static
+configuration, expose `cache_info()` / `cache_clear()`, and validate the target
+even on cache hits. MX quantization and weight-preshuffle cases additionally
 require AIter. Select either file directly for correctness, or add `-m perf -s`
 to run its rotating-buffer benchmarks.
 

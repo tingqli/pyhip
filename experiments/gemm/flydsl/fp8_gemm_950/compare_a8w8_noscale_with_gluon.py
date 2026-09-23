@@ -174,7 +174,7 @@ def make_flydsl_launcher(
     m, n, k, inputs_a, inputs_b, outputs, scales_a=None, scales_b=None
 ):
     import flydsl.compiler as flyc
-    from pyhip.ops.gemm.flydsl.mxfp8_gemm_4w import compile_gemm_fp8
+    from pyhip.ops.gemm.flydsl.gemm_mxfp8_4w import compile_gemm_fp8
 
     with_scale = scales_a is not None and scales_b is not None
     if with_scale:

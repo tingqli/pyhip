@@ -35,7 +35,7 @@ def _load_shuffle_weight():
 
 def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with_scale=False,
              run_count=50, data_clones=32, useTiledDMA=False):
-    from pyhip.ops.gemm.flydsl.gemm_fp8_8w_blockscale import compile_gemm_fp8_8wave
+    from pyhip.ops.gemm.flydsl.gemm_fp8_blockscale_8w import compile_gemm_fp8_8wave
 
     shuffle_weight = _load_shuffle_weight() if preshuffle_b else None
 
@@ -152,29 +152,64 @@ def test_perf(M, N, K):
     assert run_test(M, N, K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
 
 
+@pytest.fixture
+def gemm_factory(monkeypatch):
+    from pyhip.ops.gemm.flydsl.gemm_fp8_blockscale_8w import compile_gemm_fp8_8wave
+
+    monkeypatch.setenv("FLYDSL_COMPILE_BACKEND", "rocm")
+    monkeypatch.setenv("ARCH", "gfx950")
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    compile_gemm_fp8_8wave.cache_clear()
+    yield compile_gemm_fp8_8wave
+    compile_gemm_fp8_8wave.cache_clear()
+
+
 @pytest.mark.parametrize(
     "backend,arch", [("rocm", "gfx942"), ("rocm", "gfx1100"), ("cuda", "sm_90")],
 )
-def test_requires_cdna4(monkeypatch, backend, arch):
+def test_requires_cdna4(monkeypatch, gemm_factory, backend, arch):
     from pyhip.ops.gemm.flydsl import common
-    from pyhip.ops.gemm.flydsl.gemm_fp8_8w_blockscale import compile_gemm_fp8_8wave
 
+    # A warmed cache must not bypass validation after switching targets.
+    gemm_factory(TILE_M, TILE_N, TILE_K, 256, 512)
+    cache_info = gemm_factory.cache_info()
     monkeypatch.setattr(
         common.flyc,
         "get_backend",
         lambda: SimpleNamespace(target=SimpleNamespace(backend=backend, arch=arch)),
     )
     with pytest.raises(RuntimeError, match="CDNA4"):
-        compile_gemm_fp8_8wave(TILE_M, TILE_N, TILE_K, 256, 512)
+        gemm_factory(TILE_M, TILE_N, TILE_K, 256, 512)
+    assert gemm_factory.cache_info() == cache_info
 
 
 @pytest.mark.parametrize("arch", ["gfx950", "gfx950:sramecc+:xnack-"])
-def test_accepts_cdna4_compile_target(monkeypatch, arch):
-    from pyhip.ops.gemm.flydsl.gemm_fp8_8w_blockscale import compile_gemm_fp8_8wave
-
+def test_accepts_cdna4_compile_target(monkeypatch, gemm_factory, arch):
     monkeypatch.setenv("ARCH", arch)
-    monkeypatch.setenv("COMPILE_ONLY", "1")
-    assert callable(compile_gemm_fp8_8wave(TILE_M, TILE_N, TILE_K, 256, 512))
+    assert callable(gemm_factory(TILE_M, TILE_N, TILE_K, 256, 512))
+
+
+def test_launcher_cache(monkeypatch, gemm_factory):
+    args = (TILE_M, TILE_N, TILE_K, 256, 512)
+    launcher = gemm_factory(*args)
+    assert gemm_factory(
+        TILE_M=TILE_M, TILE_N=TILE_N, TILE_K=TILE_K, N=256, K=512,
+        with_scale=False,
+    ) is launcher
+    assert gemm_factory(*args, with_scale=True) is not launcher
+    assert gemm_factory(TILE_M, TILE_N, TILE_K, 384, 512) is not launcher
+    assert gemm_factory.cache_info().hits == 1
+    assert gemm_factory.cache_info().misses == 3
+
+    monkeypatch.setenv("ARCH", "gfx950:sramecc+:xnack-")
+    assert gemm_factory(*args) is not launcher
+    monkeypatch.setenv("ARCH", "gfx950")
+    assert gemm_factory(*args) is launcher
+    assert gemm_factory.cache_info().currsize == 4
+
+    gemm_factory.cache_clear()
+    assert gemm_factory.cache_info().currsize == 0
+    assert gemm_factory(*args) is not launcher
 
 
 if __name__ == "__main__":

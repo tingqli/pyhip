@@ -12,6 +12,8 @@
 #   - 约定：A 走 make_fragment_B，B 走 make_fragment_A；fx.gemm(mma, C, frag_B, frag_A)。
 #   - CDNA4/gfx950 only.
 
+from functools import cache
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float32, Int32, T, Vector
@@ -60,7 +62,37 @@ def compile_gemm_fp8_8wave(
     with_scale=False,
     useTileDMA=False,
 ):
-    require_cdna4()
+    """Return the cached launcher for this CDNA4 target and static configuration."""
+    return _compile_gemm_fp8_8wave_cached(
+        require_cdna4(),
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        N,
+        K,
+        pid_swizzle,
+        permlane_epilogue,
+        preshuffle_b,
+        with_scale,
+        useTileDMA,
+    )
+
+
+@cache
+def _compile_gemm_fp8_8wave_cached(
+    target,
+    TILE_M,
+    TILE_N,
+    TILE_K,
+    N,
+    K,
+    pid_swizzle,
+    permlane_epilogue,
+    preshuffle_b,
+    with_scale,
+    useTileDMA,
+):
+    del target  # JIT launchers capture their target; keep it in the cache key.
     assert preshuffle_b == False, f'preshuffle B not verified on non-scale path, scale not supported'
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
@@ -1011,3 +1043,7 @@ def compile_gemm_fp8_8wave(
         )
 
     return launch_gemm
+
+
+compile_gemm_fp8_8wave.cache_clear = _compile_gemm_fp8_8wave_cached.cache_clear
+compile_gemm_fp8_8wave.cache_info = _compile_gemm_fp8_8wave_cached.cache_info
