@@ -96,7 +96,7 @@ Decoded trace code:
 This section is an incremental update. All September7 measurements below are
 retained as historical snapshots; their use of "current" refers to that date.
 Today's tests use the unchanged `run_test()` API in
-[test_mxfp8_gemm_4w.py](test_mxfp8_gemm_4w.py), called by the isolated
+[test_gemm_mxfp8_4w.py](test_gemm_mxfp8_4w.py), called by the isolated
 [daily driver](../../../../tests/flydsl/fp8_gemm_950/agent_workspace/daily_results_20260910/run_case.py).
 The kernel source was not edited for this report, and the user's Git index was
 not changed.
@@ -291,10 +291,10 @@ All agent-only scripts, tests, logs and dumps are isolated under
 No ATT mainloop-cycle/efficiency measurement was made in the September10
 update; the separate September11 ATT results are recorded at the top.
 
-## Current `test_mxfp8_gemm_4w.py` snapshot: with scale vs without scale
+## Current `test_gemm_mxfp8_4w.py` snapshot: with scale vs without scale
 
 This section profiles the current kernel directly through
-`test_mxfp8_gemm_4w.py`. It is newer than the historical FlyDSL/Gluon
+`test_gemm_mxfp8_4w.py`. It is newer than the historical FlyDSL/Gluon
 comparison below, so its no-scale result must not be compared as though it were
 the same kernel snapshot as the historical 96.34% result.
 
@@ -347,7 +347,7 @@ PYTHONPATH=/mywork/pyhip \
 /opt/rocm/bin/rocprofv3 --att \
 	-i /mywork/pyhip/tests/flydsl/att_matmul.json \
 	-d /tmp/a8w8-noscale-test-file-att-20260907 \
-	-- python ./test_mxfp8_gemm_4w.py
+	-- python ./test_gemm_mxfp8_4w.py
 ```
 
 With scale, freshly rerun for this comparison:
@@ -363,7 +363,7 @@ PYTHONPATH=/mywork/pyhip \
 /opt/rocm/bin/rocprofv3 --att \
 	-i /mywork/pyhip/tests/flydsl/att_matmul.json \
 	-d /tmp/a8w8-scaled-test-file-att-20260907-rerun \
-	-- python ./test_mxfp8_gemm_4w.py
+	-- python ./test_gemm_mxfp8_4w.py
 ```
 
 Decode the steady-state mainloops:
@@ -518,7 +518,7 @@ PYTHONPATH=/mywork/pyhip \
 /opt/rocm/bin/rocprofv3 --att \
 	-i /mywork/pyhip/tests/flydsl/att_matmul.json \
 	-d /tmp/a8w4-noscale-a-pad-b-swizzle-att-20260907 \
-	-- python ./test_mxfp8_gemm_4w.py
+	-- python ./test_gemm_mxfp8_4w.py
 
 python /mywork/gfx950-gluon-tutorials/scripts/process_json.py \
 	/tmp/a8w4-noscale-a-pad-b-swizzle-att-20260907/ui_output_agent_34773_dispatch_271
@@ -531,7 +531,7 @@ No-scale comparison traces:
 
 ### A8W4 B padding vs B swizzle
 
-An alternating no-profiler test used `test_mxfp8_gemm_4w.py` with the same 50
+An alternating no-profiler test used `test_gemm_mxfp8_4w.py` with the same 50
 clones and 50 Event measurements per round. Only `B_LDS_SWIZZLE` changed.
 
 | Best-of-50 result | A padding + B padding | A padding + B swizzle |
@@ -553,7 +553,7 @@ MXFP4 now defaults to B LDS swizzle when `B_LDS_SWIZZLE` is omitted. Passing
 `B_LDS_SWIZZLE=False` remains available for explicit B-padding comparisons;
 non-MXFP4 paths continue to inherit the A LDS layout.
 
-Matched hardware-counter runs used the current `test_mxfp8_gemm_4w.py` source
+Matched hardware-counter runs used the current `test_gemm_mxfp8_4w.py` source
 and changed only `B_LDS_SWIZZLE`. B padding reports conflicts in every sampled
 counter instance, whereas B swizzle reports none:
 
