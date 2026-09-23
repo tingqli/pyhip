@@ -40,9 +40,14 @@ fixtures. Run those directly, for example:
 python experiments/gemm/flydsl/gemm4.py
 ```
 
-Experiments retain their own performance selection rules; the regression-suite
-`perf` marker does not control all experimental timing. MHA still uses
+Experiments retain their own performance selection rules; formal
+regression-suite performance-only functions are marked `perf`. MHA still uses
 `PYHIP_MHA_PERF` as before. Do not assume a broad experimental invocation is cheap.
+
+The gfx950 8-wave block-scale FP8 and 4-wave MXFP8/MXFP4 implementations now
+live in [pyhip.ops.gemm.flydsl](../src/pyhip/ops/gemm/flydsl/), with correctness
+and opt-in performance tests in [tests/ops/gemm](../tests/ops/gemm/). Their
+remaining comparison script imports the library kernel, not a sibling test.
 
 Sibling imports support both explicit pytest/importlib execution and existing
 direct script entry points. Flash Attention and the PA 4/8-wave groups remain

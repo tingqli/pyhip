@@ -8,7 +8,6 @@ import pyhip
 
 # PYTHONPATH=/tmp/triton-gfx950-v11-site:/mywork/pyhip LLVM_PASS_PLUGIN_PATH=/mywork/gfx950-gluon-tutorials/plugins/llir_scheduler/libLlirSched.so LLVM_PASS_PLUGIN_KEEP_TARGET_MACHINE=1 TRITON_FORCE_MFMA_AGPR=1 TRITON_AMDGCNAS_PLUGIN=1 TRITON_CACHE_DIR=/tmp/a8w8_compare_cache python compare_a8w8_noscale_cold.py
 
-PYHIP_ROOT = "/mywork/pyhip"
 GLUON_ROOT = "/mywork/gfx950-gluon-tutorials"
 BLOCK_M = 256
 BLOCK_N = 256
@@ -174,12 +173,8 @@ def make_shared_inputs(m, n, k, clones, seed, include_gluon):
 def make_flydsl_launcher(
     m, n, k, inputs_a, inputs_b, outputs, scales_a=None, scales_b=None
 ):
-    sys.path.insert(0, f"{PYHIP_ROOT}/experiments/gemm/flydsl/fp8_gemm_950")
     import flydsl.compiler as flyc
-    if __package__:
-        from .test_mxfp8_gemm_4w import compile_gemm_fp8
-    else:
-        from test_mxfp8_gemm_4w import compile_gemm_fp8
+    from pyhip.ops.gemm.flydsl.mxfp8_gemm_4w import compile_gemm_fp8
 
     with_scale = scales_a is not None and scales_b is not None
     if with_scale:

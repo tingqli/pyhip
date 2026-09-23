@@ -3,37 +3,43 @@
 #
 # fp8 GEMM (C = B * A, 输出 bf16) —— 8-wave 版本，按 test_gemm_v9_fp8.py 的 tile + layout
 # 抽象风格编写（flat_divide / make_tiled_copy / make_tiled_mma / make_fragment / fx.copy /
-# fx.gemm），不做手动 byte-offset DMA。算法对标 test_gemm.py::compile_gemm_950 的
+# fx.gemm），G2S 默认使用 raw DMA，也支持 tiled copy。算法对标 compile_gemm_950 的
 # gemm_8wave_950（fp8）：2x2 quadrant、8 wave（tiled_mma wave grid 4x2）、双缓冲 LDS、
 # 每 region compute-phase(s_setprio + s_barrier) 调度。
 #   - BLOCK_M=BLOCK_N=BLOCK_K=128, TILE_M=TILE_N=256, block=512(8 wave)
 #   - MFMA V_MFMA_SCALE_F32_16X16X128_F8F6F4（scale=0）
 #   - A/B LDS dual-padding（[[1024,16],[2048,32]]）消 bank conflict；tile-based fx.copy g2s。
 #   - 约定：A 走 make_fragment_B，B 走 make_fragment_A；fx.gemm(mma, C, frag_B, frag_A)。
-#
-# 运行：cd /mywork/FlyDSL/tests/kernels && HIP_VISIBLE_DEVICES=4 python ./test_gemm_v9_fp8_8wave.py
-
-import os
-
-import torch
+#   - CDNA4/gfx950 only.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float32, Int32, T, Vector
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, vector, arith
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, arith
 from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import vector
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl._mlir.dialects import fly as _fly_dialect
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
+from .common import require_cdna4
 
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+__all__ = ["compile_gemm_fp8_8wave"]
 
 
 def div_up(x, y):
     return (x + y - 1) // y
+
+
+def _buffer_resource(tensor, num_records_bytes):
+    buffer = rocdl.make_buffer_tensor(tensor, num_records_bytes=num_records_bytes)
+    return rocdl.get_buffer_rsrc(fx.get_iter(buffer))
+
+
+def _lds_byte_ptr(ptr, byte_offset):
+    return fx.to_llvm_ptr(
+        fx.add_offset(fx.recast_iter(fx.Uint8, ptr), fx.make_int_tuple(byte_offset))
+    )
 
 
 def encode_waitcnt_950(vmcnt=63, expcnt=7, lgkmcnt=63):
@@ -54,6 +60,7 @@ def compile_gemm_fp8_8wave(
     with_scale=False,
     useTileDMA=False,
 ):
+    require_cdna4()
     assert preshuffle_b == False, f'preshuffle B not verified on non-scale path, scale not supported'
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
@@ -134,10 +141,10 @@ def compile_gemm_fp8_8wave(
         A = fx.rocdl.make_buffer_tensor(A_2d, max_size=False)
         B = fx.rocdl.make_buffer_tensor(B_2d, max_size=False)
         C = fx.rocdl.make_buffer_tensor(C_2d, max_size=False)
-        a_dma_rsrc = fx.buffer_ops.create_buffer_resource(
-            argA, num_records_bytes=arith._to_raw(fx.Int32(M * K))
+        a_dma_rsrc = _buffer_resource(
+            argA, num_records_bytes=fx.Int32(M * K)
         )
-        b_dma_rsrc = fx.buffer_ops.create_buffer_resource(argB, num_records_bytes=N * K)
+        b_dma_rsrc = _buffer_resource(argB, num_records_bytes=N * K)
 
         #subA/subB,  一个WG 被分成两个slice
         #bA flat_divide output :[BM, BK, REP_BM, REP_BK]
@@ -184,17 +191,9 @@ def compile_gemm_fp8_8wave(
         # accumulator fragments. The wait/barrier closes this register lifetime,
         # allowing the loader's address VGPRs to be reused by the MFMA pipeline.
         if const_expr(with_scale):
-            sB_rsrc = fx.buffer_ops.create_buffer_resource(
+            sB_rsrc = _buffer_resource(
                 argScaleB,
-                num_records_bytes=arith._to_raw(
-                    fx.Int32(div_up(N, 128) * scaleA_stride * 4)
-                ),
-            )
-            scale_b_lds = fx.make_view(
-                lds.scale_b.ptr, fx.make_layout(scaleB_elems, 1)
-            )
-            scale_b_root_ptr = _fly_dialect.extract_aligned_pointer_as_index(
-                ir.Type.parse("!llvm.ptr<3>"), arith._to_raw(scale_b_lds)
+                num_records_bytes=div_up(N, 128) * scaleA_stride * 4,
             )
             total_lanes = 512
             elems_per_128b_scale = 4
@@ -214,10 +213,8 @@ def compile_gemm_fp8_8wave(
                 )
                 for copy_round in range_constexpr(rounds_128b):
                     round_elem_offset = copy_round * elems_per_round_128b
-                    scale_b_dst = fx.buffer_ops.get_element_ptr(
-                        scale_b_root_ptr,
-                        byte_offset=wave_offset_128b + round_elem_offset * 4,
-                        elem_type=T.i8,
+                    scale_b_dst = _lds_byte_ptr(
+                        lds.scale_b.ptr, wave_offset_128b + round_elem_offset * 4,
                     )
                     rocdl.raw_ptr_buffer_load_lds(
                         sB_rsrc, scale_b_dst, fx.Int32(16), lane_byte_offset_128b,
@@ -232,10 +229,8 @@ def compile_gemm_fp8_8wave(
                 )
                 for copy_round in range_constexpr(rounds_32b):
                     round_elem_offset = loaded_128b + copy_round * total_lanes
-                    scale_b_dst = fx.buffer_ops.get_element_ptr(
-                        scale_b_root_ptr,
-                        byte_offset=wave_offset_32b + round_elem_offset * 4,
-                        elem_type=T.i8,
+                    scale_b_dst = _lds_byte_ptr(
+                        lds.scale_b.ptr, wave_offset_32b + round_elem_offset * 4,
                     )
                     rocdl.raw_ptr_buffer_load_lds(
                         sB_rsrc, scale_b_dst, fx.Int32(4), lane_byte_offset_32b,
@@ -246,10 +241,8 @@ def compile_gemm_fp8_8wave(
                 if const_expr(tail_elems > 0):
                     if tid < tail_elems:
                         tail_elem_offset = loaded_128b + loaded_32b
-                        scale_b_dst = fx.buffer_ops.get_element_ptr(
-                            scale_b_root_ptr,
-                            byte_offset=wave_offset_32b + tail_elem_offset * 4,
-                            elem_type=T.i8,
+                        scale_b_dst = _lds_byte_ptr(
+                            lds.scale_b.ptr, wave_offset_32b + tail_elem_offset * 4,
                         )
                         rocdl.raw_ptr_buffer_load_lds(
                             sB_rsrc, scale_b_dst, fx.Int32(4), lane_byte_offset_32b,
@@ -379,8 +372,8 @@ def compile_gemm_fp8_8wave(
         M_REP = TILE_M // 64
         N_REP = TILE_N // 128
         if const_expr(with_scale):
-            sA_rsrc = fx.buffer_ops.create_buffer_resource(
-                argScaleA, num_records_bytes=arith._to_raw(fx.Int32(M * scaleA_stride * 4))
+            sA_rsrc = _buffer_resource(
+                argScaleA, num_records_bytes=fx.Int32(M * scaleA_stride * 4)
             )
             lane_id = tid % 64
             wave_m = wave_id // 4
@@ -394,13 +387,7 @@ def compile_gemm_fp8_8wave(
             )
             
             def _scale_dst_ptr(root_view, byte_offset):
-                ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                root_ptr = _fly_dialect.extract_aligned_pointer_as_index(
-                    ptr_type, arith._to_raw(root_view)
-                )
-                return fx.buffer_ops.get_element_ptr(
-                    root_ptr, byte_offset=byte_offset, elem_type=T.i8
-                )
+                return _lds_byte_ptr(fx.get_iter(root_view), byte_offset)
 
             scale_row = tid % TILE_M
             scale_lane_src_offset = fx.Int32(scale_row * 4)
@@ -482,13 +469,13 @@ def compile_gemm_fp8_8wave(
                     accum0 = Vec(cs0.load())
                     accum1 = Vec(cs1.load())
                     operand_a0 = vector.bitcast(
-                        T.vec(8, T.i32), frag_B[None, 0, 0].load()
+                        T.vec(8, T.i32), frag_B[None, 0, 0].load().ir_value()
                     )
                     operand_a1 = vector.bitcast(
-                        T.vec(8, T.i32), frag_B[None, 1, 0].load()
+                        T.vec(8, T.i32), frag_B[None, 1, 0].load().ir_value()
                     )
                     operand_b = vector.bitcast(
-                        T.vec(8, T.i32), frag_A[None, m0, 0].load()
+                        T.vec(8, T.i32), frag_A[None, m0, 0].load().ir_value()
                     )
                     result = _llvm.inline_asm(
                         result_type,
@@ -623,9 +610,10 @@ def compile_gemm_fp8_8wave(
             _elem_bytes = element_type.width // 8  # fp8 = 1
 
             def _dma_dst_ptr(root_view, byte_offset):
-                _pt = ir.Type.parse("!llvm.ptr<3>")
-                _rp = _fly_dialect.extract_aligned_pointer_as_index(_pt, arith._to_raw(root_view))
-                return fx.buffer_ops.get_element_ptr(_rp, byte_offset=byte_offset, elem_type=T.i8)
+                return fx.add_offset(
+                    fx.recast_iter(fx.Uint8, fx.get_iter(root_view)),
+                    fx.make_int_tuple(byte_offset),
+                )
 
             # pyhip 的 g2s tv（512 线程 = 64 行 × 8 k-组，每线程 1×16 fp8）
             _g2s_tile, _g2s_tv = fx.make_layout_tv(
@@ -660,11 +648,7 @@ def compile_gemm_fp8_8wave(
 
             def _raw_g2s(rsrc, dst_base, src_wave_base, ki):
                 for chunk in range_constexpr(BLOCK_M // 64):
-                    _dp = fx.buffer_ops.get_element_ptr(
-                        dst_base,
-                        static_byte_offset=chunk * _dst_stride * _elem_bytes,
-                        elem_type=T.i8,
-                    )
+                    _dp = _lds_byte_ptr(dst_base, chunk * _dst_stride * _elem_bytes)
                     _so = src_wave_base + fx.Int32(
                         ki * BLOCK_K * _elem_bytes + chunk * 8 * K * _elem_bytes
                     )
@@ -915,7 +899,7 @@ def compile_gemm_fp8_8wave(
         frag_C_bl.store(results[2])
         frag_C_br.store(results[3])
         
-        c_store_rsrc = fx.buffer_ops.create_buffer_resource(argC, num_records_bytes=arith._to_raw(fx.Int32(M * N * 2)))
+        c_store_rsrc = _buffer_resource(argC, num_records_bytes=fx.Int32(M * N * 2))
         bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x * 2 + 0, bid_y * 2 + 1]
         bC_bl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x * 2 + 1, bid_y * 2 + 0]
         bC_br = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_x * 2 + 1, bid_y * 2 + 1]
@@ -987,22 +971,18 @@ def compile_gemm_fp8_8wave(
                             + wave_n * 16
                             + lane_group // 2 * 8
                         )
-                        byte_offset = (row * N + col) * 2
+                        byte_offset = fx.Int32((row * N + col) * 2)
                         if const_expr(N_tail):
-                            fx.buffer_ops.buffer_store(
-                                packed,
-                                c_store_rsrc,
-                                byte_offset,
-                                offset_is_bytes=True,
-                                mask=col < N,
+                            byte_offset = (col < N).select(
+                                byte_offset, fx.Int32(0x7FFFFFFF)
                             )
-                        else:
-                            fx.buffer_ops.buffer_store(
-                                packed,
-                                c_store_rsrc,
-                                byte_offset,
-                                offset_is_bytes=True,
-                            )
+                        rocdl.raw_ptr_buffer_store(
+                            packed.ir_value(),
+                            c_store_rsrc,
+                            byte_offset.ir_value(),
+                            fx.Int32(0).ir_value(),
+                            aux=ir.IntegerAttr.get(T.i32, 0),
+                        )
 
             store_c_quadrant(frag_C_tl, 0, 0)
             store_c_quadrant(frag_C_tr, 0, 1)
@@ -1031,159 +1011,3 @@ def compile_gemm_fp8_8wave(
         )
 
     return launch_gemm
-
-
-# =========================== test / perf ===========================
-TILE_M = 256
-TILE_N = 256
-TILE_K = 128
-M = int(os.environ.get("GEMM_M", 8192))
-N = int(os.environ.get("GEMM_N", 8192))
-K = int(os.environ.get("GEMM_K", 8192))
-PERMLANE_EPILOGUE = _env_flag("PERMLANE", "1")
-
-import pyhip
-
-
-def _load_shuffle_weight():
-    import sys as _sys, os.path as _osp
-    _root = _osp.abspath(_osp.join(_osp.dirname(__file__), "..", ".."))
-    if _root not in _sys.path:
-        _sys.path.insert(0, _root)
-    from tests.utils import shuffle_weight
-    return shuffle_weight
-
-
-def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with_scale=False,
-             run_count=50, data_clones=32, useTiledDMA=False):
-    shuffle_weight = _load_shuffle_weight() if preshuffle_b else None
-
-    def _shuffle_b(x):
-        return shuffle_weight(x, layout=(16, 64)) if preshuffle_b else x
-
-    KB = K // 128
-    empty = torch.empty(0, device="cuda", dtype=torch.float32)
-
-    def _gen_scales():
-        if not with_scale:
-            return empty, empty
-        sA = torch.rand((M, KB), device="cuda", dtype=torch.float32)
-        sB = torch.rand((div_up(N, 128), KB), device="cuda", dtype=torch.float32)
-        return sA, sB
-
-    def _ref(a, b, sA, sB):
-        if not with_scale:
-            return a.float() @ b.float().t()
-        a_deq = (a.float().view(M, KB, 128) * sA.view(M, KB, 1)).view(M, K)
-        b_deq = b.float().view(N, KB, 128) * sB.repeat_interleave(128, dim=0)[:N, :, None]
-        b_deq = b_deq.view(N, K)
-        return a_deq @ b_deq.t()
-
-    a = (torch.rand(M, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
-    b = (torch.rand(N, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
-    sA, sB = _gen_scales()
-    ref = _ref(a, b, sA, sB)
-    sA_kernel = sA.transpose(0, 1).contiguous() if with_scale else sA
-    out = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
-    weight = _shuffle_b(b)
-    stream = torch.cuda.current_stream()
-    args = (a.view(torch.int8).view(-1), weight.view(torch.int8).view(-1), out.view(-1),
-            sA_kernel.view(-1), sB.view(-1), M, stream)
-
-    launcher = compile_gemm_fp8_8wave(TILE_M, TILE_N, TILE_K, N, K, permlane_epilogue=permlane_output,
-                                      preshuffle_b=preshuffle_b, with_scale=with_scale, useTileDMA=useTiledDMA)
-    kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
-    kernel(*args)
-    torch.cuda.synchronize()
-
-    out_f32 = out.float()
-    bf16_ref = ref.to(torch.bfloat16)
-
-    # abs_err = (out_f32 - ref).abs()
-    # check_rtol = 1.6e-2
-    # check_atol = 1e-5
-    # close_mask = torch.isclose(out_f32, ref, rtol=check_rtol, atol=check_atol)
-    # close_count = close_mask.count_nonzero().item()
-    # total_count = close_mask.numel()
-    # bf16_exact_count = (out == bf16_ref).count_nonzero().item()
-    # top_count = min(100, total_count)
-    # top_errors, top_indices = torch.topk(abs_err.reshape(-1), top_count)
-    # top_refs = ref.reshape(-1)[top_indices]
-    # top_outputs = out_f32.reshape(-1)[top_indices]
-    # top_rel_errors = top_errors / top_refs.abs().clamp_min(torch.finfo(torch.float32).tiny)
-    # top_close = close_mask.reshape(-1)[top_indices]
-
-    # print(
-    #     f"torch.isclose(rtol={check_rtol}, atol={check_atol}): "
-    #     f"{close_count}/{total_count} ({close_count / total_count:.6%}), "
-    #     f"not_close={total_count - close_count}"
-    # )
-    # print(
-    #     f"exact vs bf16-rounded ref: {bf16_exact_count}/{total_count} "
-    #     f"({bf16_exact_count / total_count:.6%}), mismatched={total_count - bf16_exact_count}"
-    # )
-    # print("top100: rank (row,col) ref output abs_error rel_error isclose")
-    # for rank in range(top_count):
-    #     flat_index = top_indices[rank].item()
-    #     row, col = divmod(flat_index, N)
-    #     print(
-    #         f"{rank + 1:3d} ({row:5d},{col:5d}) "
-    #         f"ref={top_refs[rank].item(): .9e} "
-    #         f"output={top_outputs[rank].item(): .9e} "
-    #         f"abs_error={top_errors[rank].item(): .9e} "
-    #         f"rel_error={top_rel_errors[rank].item(): .9e} "
-    #         f"isclose={bool(top_close[rank].item())}"
-    #     )
-    # fp8×fp8→f32 累加对整数输入是精确的：与 f32 ref 的 diff 只来自输出转 bf16 的舍入。
-    # 与「bf16 舍入后的 ref」比较应 ≈0（非 scale 时用来验证计算零误差）。
-    diff = pyhip.calc_diff(out_f32, ref)
-    diff_bf16ref = pyhip.calc_diff(out_f32, bf16_ref.float())
-    is_correct = diff < 0.01
-    print(f"####M={M} N={N} K={K} 8wave preshuffle_b={preshuffle_b} with_scale={with_scale}, useTiledDMA={useTiledDMA} "
-          f"is_correct={is_correct} calc_diff(vs f32 ref)={diff:.6f} "
-          f"calc_diff(vs bf16 ref)={diff_bf16ref:.6f}")
-
-    if not perf:
-        return is_correct
-
-    As = [torch.randint(-2, 3, (M, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn) for _ in range(data_clones)]
-    Bs = [_shuffle_b(torch.randint(-2, 3, (N, K), device="cuda", dtype=torch.int8).to(torch.float8_e4m3fn)) for _ in range(data_clones)]
-    SAs = [(_gen_scales()[0] if with_scale else empty) for _ in range(data_clones)]
-    SAs_kernel = [sa.transpose(0, 1).contiguous() if with_scale else sa for sa in SAs]
-    SBs = [(_gen_scales()[1] if with_scale else empty) for _ in range(data_clones)]
-    Cs = [torch.zeros((M, N), device="cuda", dtype=torch.bfloat16) for _ in range(data_clones)]
-    arg_sets = [
-        (As[i].view(torch.int8).view(-1), Bs[i].view(torch.int8).view(-1), Cs[i].view(-1),
-         SAs_kernel[i].view(-1), SBs[i].view(-1), M, stream)
-        for i in range(data_clones)
-    ]
-    flops = 2 * M * N * K
-    mem_bytes = (M * K + N * K) * 1 + M * N * 2
-    for i in range(data_clones):
-        kernel(*arg_sets[i])
-    torch.cuda.synchronize()
-    di = 0
-    latencies = []
-    for _ in range(run_count):
-        di = (di + 1) % data_clones
-        with pyhip.cudaPerf(flops, mem_bytes, name=f"gemm_{di}") as p:
-            kernel(*arg_sets[di])
-        latencies.append(p.dt_ms)
-    latencies.sort()
-    best_ms = latencies[0]
-    print(f"\n=== perf 8wave M={M} N={N} K={K} with_scale={with_scale} ===")
-    print(f"gemm:  {best_ms*1e3:.1f} us  {flops/(best_ms*1e-3)/1e12:.2f} TFLOPS  {mem_bytes/(best_ms*1e-3)/1e9:.1f} GB/s")
-    return is_correct
-
-
-if __name__ == "__main__":
-    props = torch.cuda.get_device_properties()
-    assert "950" in props.gcnArchName, "fp8 MFMA_Scale 需要 gfx950"
-    torch.manual_seed(0)
-    
-    K = 6144
-    # K = 256
-    run_test(M=8192, N=8192, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
-    run_test(M=16384, N=3584, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
-    run_test(M=16384, N=3392, K=K, perf=True, permlane_output=PERMLANE_EPILOGUE, with_scale=True)
-
