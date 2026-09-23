@@ -105,6 +105,8 @@ def run_test(M, N, K, perf=False, permlane_output=True, preshuffle_b=False, with
     ]
     flops = 2 * M * N * K
     mem_bytes = (M * K + N * K) * 1 + M * N * 2
+    if with_scale:
+        mem_bytes += (M + div_up(N, 128)) * KB * 4
     for i in range(data_clones):
         kernel(*arg_sets[i])
     torch.cuda.synchronize()

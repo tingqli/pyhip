@@ -285,6 +285,9 @@ def run_test(
 
     flops = 2 * M * N * K
     mem_bytes = M * K + N * K * (0.5 if B_MXFP4 else 1) + M * N * 2
+    if with_scale:
+        mem_bytes += scale_a.numel() * scale_a.element_size()
+        mem_bytes += scale_b.numel() * scale_b.element_size()
 
     # warmup（轮转，把所有 clone 都碰一遍）
     for i in range(data_clones):
