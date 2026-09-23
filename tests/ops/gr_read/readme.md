@@ -115,7 +115,7 @@ T48–512 的正式优化前后对照已在 30 档、普通调用下验证：选
 
 ### 算法速查入口
 
-[test_gr_read_algorithms.py](test_gr_read_algorithms.py) 集中展示按 rows 选择 decode / prefill 的入口，打印各档 Down/Up 配置和 P 布局，用 `torch.allclose` 检查 P/Y。默认选取 22 个代表性 rows；所有 case 共用一次 preshuffle 后的权重。两条路径均为普通调用，只检查精度，不捕获 CUDA Graph、不测性能，也不依赖 SGLang。
+[test_gr_read_algorithms.py](test_gr_read_algorithms.py) 集中展示按 rows 选择 decode / prefill 的入口，打印各档 Down/Up 配置和 P 布局，用 `torch.allclose` 检查 P/Y。默认选取 12 个代表性 rows；所有 case 共用一次 preshuffle 后的权重。两条路径均为普通调用，只检查精度，不捕获 CUDA Graph、不测性能，也不依赖 SGLang。
 
 ```bash
 python3 tests/ops/gr_read/test_gr_read_algorithms.py
@@ -151,6 +151,10 @@ python3 tests/ops/gr_read/test_gr_read_algorithms.py --gpu 2 --rows 1 24 32 33 6
 
 Decode 默认覆盖全部 T1–32，独立测量、独立出表。Prefill 继续普通调用，默认性能矩阵首档现为 T33；T33–64 全部使用之前验证的小 M 配置（同上文 T33–128 的配置，包括 T48），其余 prefill 配置保持。
 
+Decode 的 P 现在紧凑存储为 FP32 `[4,T,320]`（对象内为 flat tensor），不再补齐到 16/32 行；`reader.padded_rows` 已移除，查看 P 用 `reader.partial.view(4, reader.rows, 320)`。Down 只写 `row < T`；Up 使用一个有界 buffer，将无效行的读取地址映射到整个 P 末尾之外，由硬件返回零，避免读进下一份 partial，也不需要额外的 EXEC 行掩码。M tile 和向上取整的 grid 保留，没有旧 padded-P 回退或 `skip_padding` 分段。
+
+CUDA Graph 中 T 是图的固定输入行数。例如图档位 T24、实际 live=17 时，X/Y 仍是 24 行，P 固定为 `[4,24,320]`，地址和 split 间距不随 replay 改变；图内补齐的 `[17,24)` 行照常计算，框架只消费有效输出。普通调用 X17 时才准备 `[4,17,320]`。
+
 在仓库根目录运行：
 
 ```bash
@@ -170,7 +174,7 @@ Decode 对照保持原 PR 中的 100 组独立权重工作集、buffer 准备、
 
 SGLang 对照读取指定 checkout 的原实现和支持判断。在本机 gfx942、默认非确定性推理下，T1–16 为 Triton persistent，T17–32 为 Torch compile；两边均使用 decode 的 Graph 协议。对照表包含 T1–32 每一行和实际后端，独立于 prefill 表。两边使用相同 X 与逻辑权重，PyHIP packing 在准备阶段完成。
 
-原 FP64 容差 `rtol=1e-2, atol=5e-3`、live rows 缩小/恢复、zero/stale/NaN 尾行、P/Y 预污染、内部 padding、guard、输入及权重不变检查全部保留。
+原 FP64 容差 `rtol=1e-2, atol=5e-3`、live rows 缩小/恢复、zero/stale/NaN 尾行、P/Y 预污染、输入及权重不变检查保留。P 不再有内部 padding，改为检查准确的紧凑 shape、P 两端 guard 及各 split 的数值；完整 Graph replay 继续检查 X/P/Y 两端 guard。
 
 ### Decode 与 prefill 的测法不同
 

@@ -144,7 +144,7 @@ def _decode_pair_launcher(rows):
 
 
 class GRReadDecode:
-    """Prepared T1..32 decode; packed weights are shared with prefill."""
+    """Prepared T1..32 decode with compact FP32 P[4,T,320]; weights are shared with prefill."""
 
     def __init__(self, rows, packed_down, packed_up):
         if not isinstance(rows, int) or isinstance(rows, bool) or not 1 <= rows <= 32:
@@ -162,8 +162,8 @@ class GRReadDecode:
             warnings.warn(f"GR read decode was tuned on gfx942; running on {props.gcnArchName}",
                           RuntimeWarning, stacklevel=2)
         self.w_down, self.w_up = packed_down, packed_up
-        self.padded_rows = (rows + 15) // 16 * 16
-        self.partial = torch.empty(4 * self.padded_rows * R, dtype=torch.float32, device=self.device)
+        # rows 是输入 tensor / 捕获图的固定行数，不是 replay 时变化的 live token 数。
+        self.partial = torch.empty(4 * rows * R, dtype=torch.float32, device=self.device)
         self.output = torch.empty((rows, HS), dtype=torch.bfloat16, device=self.device)
         # HIP module handles in FlyDSL 0.3.2 are device-specific.
         device_hints = {'gr_read_device': self.device.index, 'gr_read_arch': props.gcnArchName}

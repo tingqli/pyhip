@@ -295,6 +295,7 @@ def check_decode_rows(rows, wd, wu, pd, pu, seed):
     reader = GRReadDecode(rows, pd, pu)
     assert reader.w_down.data_ptr() == pd.data_ptr()
     assert reader.w_up.data_ptr() == pu.data_ptr()
+    assert reader.partial.shape == (4 * rows * R,), "decode P must be compact"
     (x, sx) = guarded((rows, K), torch.bfloat16, pd.device)
     (reader.partial, sp) = guarded(reader.partial.shape, torch.float32, pd.device)
     (reader.output, sy) = guarded((rows, HS), torch.bfloat16, pd.device)
@@ -322,9 +323,8 @@ def check_decode_rows(rows, wd, wu, pd, pu, seed):
             if live:
                 error = ((actual - expected).abs() / (0.005 + 0.01 * expected.abs())).max().item()
                 maximum = max(maximum, error)
-            partial = reader.partial.view(4, reader.padded_rows, R)
+            partial = reader.partial.view(4, rows, R)
             assert torch.isfinite(partial[:, :live]).all(), label + ': live scratch'
-            assert torch.count_nonzero(partial[:, rows:]) == 0, label + ': internal padding'
             if tail == 'zero':
                 assert torch.count_nonzero(partial[:, live:]) == 0, label + ': zero scratch tail'
                 assert torch.count_nonzero(reader.output[live:]) == 0, label + ': zero output tail'
@@ -335,7 +335,8 @@ def check_decode_rows(rows, wd, wu, pd, pu, seed):
             for storage in (sx, sp, sy):
                 assert torch.all(storage[:16] == 97) and torch.all(storage[-16:] == 97), label + ': guard overwritten'
             count += 1
-    return {'rows': rows, 'replays': count, 'max_scaled_error': maximum, 'passed': True}
+    return {'rows': rows, 'replays': count, 'max_scaled_error': maximum,
+            'partial_shape': [4, rows, R], 'compact_partial_guards_passed': True, 'passed': True}
 
 
 def check_decode_stages(rows, wd, wu, pd, pu, seed, scope="all"):
@@ -347,6 +348,8 @@ def check_decode_stages(rows, wd, wu, pd, pu, seed, scope="all"):
 
     x = make_decode_inputs(rows, seed)[0]
     reader = GRReadDecode(rows, pd, pu)
+    assert reader.partial.shape == (4 * rows * 320,), "decode P must be compact"
+    reader.partial, partial_storage = guarded(reader.partial.shape, torch.float32, pd.device)
     stream = torch.cuda.current_stream()
     down = flyc.compile(make_decode_down(rows), x.view(-1), pd, reader.partial, stream)
     up = flyc.compile(make_decode_up(rows), x.view(-1), pu, reader.partial, reader.output.view(-1), stream)
@@ -355,13 +358,13 @@ def check_decode_stages(rows, wd, wu, pd, pu, seed, scope="all"):
         before = x.clone()
         reader.partial.fill_(float("nan"))
         down(x.view(-1), pd, reader.partial, stream)
-        partial = reader.partial.view(4, reader.padded_rows, 320)
+        partial = reader.partial.view(4, rows, 320)
         if scope in ("down", "all"):
             for split in range(4):
                 begin, end = split * 2560, (split + 1) * 2560
                 expected = x[:, begin:end].double() @ wd[:, begin:end].double().T
                 torch.testing.assert_close(partial[split, :rows].double(), expected, rtol=2e-5, atol=1e-5)
-            assert torch.count_nonzero(partial[:, rows:]) == 0
+        assert torch.all(partial_storage[:16] == 97) and torch.all(partial_storage[-16:] == 97), "Down overwrote compact P guard"
         if scope in ("up", "all"):
             hidden = torch.nn.functional.silu(partial[:, :rows].double().sum(0) * .25)
             expected = (torch.sigmoid(hidden @ wu.double().T).reshape(rows, 4, 2560)
@@ -369,6 +372,7 @@ def check_decode_stages(rows, wd, wu, pd, pu, seed, scope="all"):
             reader.output.fill_(float("nan"))
             up(x.view(-1), pu, reader.partial, reader.output.view(-1), stream)
             assert_decode_close(reader.output, expected, "isolated decode Up from actual P")
+        assert torch.all(partial_storage[:16] == 97) and torch.all(partial_storage[-16:] == 97), "Up overwrote compact P guard"
         assert torch.equal(before, x)
     return {"rows": rows, "scope": scope, "input_states": 2, "passed": True}
 

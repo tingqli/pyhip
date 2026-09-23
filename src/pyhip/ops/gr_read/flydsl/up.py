@@ -420,19 +420,12 @@ LOG2E = 1.4426950408889634
 def make_decode_up(rows):
     (bm, un, split, waves) = (16, 128, 4, 4)
     bk = 32 if 9 <= rows <= 16 or 29 <= rows <= 31 else 160
-    # Decode T1..32：编译期选择是否跳过 P 的内部 tile padding 读取，不改变 P 布局。
-    # T1..8、T17..31：只读取 row < rows 的四份 partial，内部尾行的 acc 保持零。
-    # T9..15：读取完整 M16 tile（Down 已将内部尾行写零），省去读取时的线程掩码。
-    # T16、T32：没有内部尾行，下面 rows % bm == 0，开关取值不影响读取。
-    # 这是原 H64 decode 调优保留的分段：在减少 P 读取与减少掩码开销之间取舍，
-    # 配合 BK、权重预加载等配置选择；9 不是硬件/数学要求，也不保证跨设备最优。
-    # 每个 split 的间距始终为 padded_rows * R；此开关不会缩小 P 的分配。
-    # CUDA Graph 中 rows 固定为图的输入行数：图 T24、live=17 时，只跳过内部行
-    # [24,32)，仍计算图内的补齐行 [17,24)；replay 时不会根据 live 重选此开关。
-    skip_padding = not 9 <= rows <= 16
+    # P 紧凑存储为 [4,rows,R]，split 间距为 rows*R；无效行的地址指向整个 P 之外。
+    # 图 T24、live=17 时 rows 仍为24：图内 [17,24) 行照常计算，不读取不存在的
+    # P 行 [24,32)。四份 partial 的有效行读取顺序和 SiLU high/low 保持不变。
     preload_weights = rows <= 16
     (hn, hidden_stride) = (un // HC, R + 4)
-    padded_rows = (rows + bm - 1) // bm * bm
+    m_tiles = (rows + bm - 1) // bm
     (threads, elem) = (waves * 64, fx.BFloat16)
 
     @fx.struct
@@ -489,17 +482,14 @@ def make_decode_up(rows):
         for i in range_constexpr(bm * R // (threads * 4)):
             ix = tid + i * threads
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
-            if fx.const_expr(skip_padding and rows % bm != 0):
-                if im * bm + ix // (R // 4) < rows:
-                    for s in range_constexpr(split):
-                        offset = (s * padded_rows + im * bm) * (R // 4) + ix
-                        fx.copy(copy_p, p4[None, offset], fp)
-                        acc = acc + fp.load()
-            else:
-                for s in range_constexpr(split):
-                    offset = (s * padded_rows + im * bm) * (R // 4) + ix
-                    fx.copy(copy_p, p4[None, offset], fp)
-                    acc = acc + fp.load()
+            offset = (im * bm * (R // 4) + ix).to(fx.Int32)
+            if fx.const_expr(rows % bm != 0):
+                # offset 以4个FP32为单位。无效行映射到P总长度，后续加split偏移
+                # 仍然越界并读零；地址选择不改变EXEC，避免阻断跨组load的重叠。
+                offset = (offset < rows * (R // 4)).select(offset, fx.Int32(rows * R))
+            for s in range_constexpr(split):
+                fx.copy(copy_p, p4[None, offset + s * rows * (R // 4)], fp)
+                acc = acc + fp.load()
             z = acc * 0.25
             values = []
             for j in range_constexpr(4):
@@ -547,5 +537,5 @@ def make_decode_up(rows):
 
     @flyc.jit
     def launch_up(X: fx.Tensor, W: fx.Tensor, P: fx.Tensor, Y: fx.Tensor, stream: fx.Stream):
-        up_gate_h64(X, W, P, Y).launch(grid=(padded_rows // bm, K // un, 1), block=(threads, 1, 1), stream=stream)
+        up_gate_h64(X, W, P, Y).launch(grid=(m_tiles, K // un, 1), block=(threads, 1, 1), stream=stream)
     return launch_up

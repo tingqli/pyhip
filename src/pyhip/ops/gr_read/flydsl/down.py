@@ -205,14 +205,14 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64, swizzle_shift=
     return launch_down
 
 
-# Decode T1..32: original global split-K=4 pipeline.
+# Decode T1..32: global split-K=4, compact FP32 P[4,rows,R].
 @cache
 def make_decode_down(rows):
     (bm, bk, waves) = (16 if rows <= 16 else 32, 128, 4)
     (split, dn) = (4, 16)
     prefetch_unroll = 2 if rows <= 25 else 1
     iterations = K // waves // bk // split
-    padded_rows = (rows + bm - 1) // bm * bm
+    m_tiles = (rows + bm - 1) // bm
 
     @fx.struct
     class DownShared:
@@ -274,17 +274,19 @@ def make_decode_down(rows):
         fx.gemm(mma, fc, fa, fb, fc)
         fx.copy(copy_c, cc.retile(fc), cc.partition_D(c_tile))
         fx.gpu.barrier()
-        out = fx.make_view(fx.get_iter(A), fx.make_layout((padded_rows, R, split), (R, 1, padded_rows * R)))
+        out = fx.make_view(fx.get_iter(A), fx.make_layout((rows, R, split), (R, 1, rows * R)))
         for i in range_constexpr((bm * dn + waves * 64 - 1) // (waves * 64)):
             index = tid + i * waves * 64
             if index < bm * dn:
                 (row, col) = (index // dn, index % dn)
-                total = fx.Float32(0.0)
-                for s in range_constexpr(waves):
-                    total = total + fx.memref_load(partials, (row, col, s))
-                fx.memref_store(total, out, (im * bm + row, jn * dn + col, sk))
+                # 计算仍覆盖完整 M tile，但紧凑 P 只存实际 rows，不能写进下一份 split。
+                if im * bm + row < rows:
+                    total = fx.Float32(0.0)
+                    for s in range_constexpr(waves):
+                        total = total + fx.memref_load(partials, (row, col, s))
+                    fx.memref_store(total, out, (im * bm + row, jn * dn + col, sk))
 
     @flyc.jit
     def launch(X: fx.Tensor, W: fx.Tensor, A: fx.Tensor, stream: fx.Stream):
-        down_wave_splitk_pipeline(X, W, A).launch(grid=(padded_rows // bm, R // dn, split), block=(waves * 64, 1, 1), stream=stream)
+        down_wave_splitk_pipeline(X, W, A).launch(grid=(m_tiles, R // dn, split), block=(waves * 64, 1, 1), stream=stream)
     return launch
