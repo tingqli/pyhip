@@ -83,6 +83,17 @@ python benchmarks/moe/bench_tuned_moe.py \
   persistent Down，激活在两次 GEMM 前分别量化，scale 使用转置存储。
   普通 8-wave 路径支持 raw/shuffled 权重；persistent Down 只用于 shuffled w2。
   gfx942 不加入这些 gfx950 专用 kernel，仍使用已有 split-K/Aiter 候选。
+- FlyDSL direct decode 将输出清零融合进 Gate/Up，BF16/FP8/MXFP4 都支持，
+  大 H、小 I_tp 时用多轮清零覆盖全部输出。MXFP4 的 B1 同时搜索 Down DN32/64。
+  prefill 的 Gate/Up BN 搜索128/256，BK 为 BF16 的64/128或 FP8 的128/256；
+  三条专用 Down 路径也覆盖这两组 BN，输出 padding 搜索0/128B。
+  默认 FP8 Down 不再排除 I192/I320。候选层只枚举配置并尊重 caller 的 M 设置，
+  不重复维护 FlyDSL 的 K/E 白名单、对齐和 LDS 公式；kernel 编译失败的配置由
+  prune 排除，其余配置仍须通过原精度检查。winner 的 `tile_k_gate` 保存在 JSON。
+  Gate/Up 和 Down 的 FP32→BF16 沿用公共转换函数的 RTA/RTE 选项，当前默认 RTA；
+  如需 RTE，在进程启动前设置 `AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=0`。
+  舍入选项应在导入 kernel 前设置；改变选项后重新调优，不在运行中切换。
+  inverse/sorted reduce 的编译缓存按 tensor 所在设备隔离，每次使用该设备当前 stream。
 - `--activation gelu --dtype bf16` 使用 G1U0：W1 为 `[E, I_tp, H]`，不含 gate；
   W2 为 `[E, H, I_tp]`。`jit_gelu` 复用现有 8-wave kernel，固定 M/N tile=256，
   要求 gfx950、H/I_tp 按256对齐、`--gate-mode separated`，并满足32-bit buffer
@@ -101,7 +112,7 @@ python benchmarks/moe/bench_tuned_moe.py \
   可能共用已有 winner，不能把 bucket 复用称为“每个 M 都单独调优”。
   缓存目录沿用 `FLYDSL_AUTOTUNE_CACHE_DIR`；
   `FLYDSL_AUTOTUNE_CONFIG_DIR` 可启用强制调优时的离线配置导出。
-  本次 block-scale 更新使用 v3 缓存，不复用旧候选和参考检查生成的 v2 配置。
+  本次候选补齐使用 v5 缓存，不复用 v4 及更早配置；首次调用会重新调优。
 - `--tune-aiter [DIR]` 默认目录为 `./tuned_aiter`。先把整个模型/token 矩阵
   按 Aiter 的 lookup key 去重写入 `untuned.csv`，再调用已安装 Aiter 的
   `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py`，最佳 kernel 保存到

@@ -9,15 +9,18 @@ import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from . import common as fxh
+from .common import get_device_cache_key
 from .common import torch_tensor_to_pointer as _ptr
 
 
 @functools.cache
-def sorted_sum(
+def _sorted_sum_cached(
+    device_cache_key,
     TOPK,
     N,
     row_padding_bytes=None,
 ):
+    del device_cache_key
     if row_padding_bytes is not None:
         assert row_padding_bytes in (0, 32, 64, 128)
     num_threads = 64
@@ -84,18 +87,22 @@ def sorted_sum(
             grid=(batch_size, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
 
+    return launch
+
+
+@functools.cache
+def sorted_sum(TOPK, N, row_padding_bytes=None):
+    # 这里只缓存不持有编译产物的入口；launcher 按本次 tensor 的设备选择。
     def callable(
         loc_ids: torch.Tensor, A: torch.Tensor, B: torch.Tensor, batch_size: int
     ):
-        stream = torch.cuda.current_stream()
-        _run_compiled(
-            launch,
-            _ptr(loc_ids),
-            _ptr(A),
-            _ptr(B),
-            batch_size,
-            stream,
-        )
+        assert loc_ids.device == A.device == B.device
+        with torch.cuda.device(B.device):
+            launch = _sorted_sum_cached(get_device_cache_key(), TOPK, N, row_padding_bytes)
+            _run_compiled(
+                launch, _ptr(loc_ids), _ptr(A), _ptr(B), batch_size,
+                torch.cuda.current_stream(B.device),
+            )
 
     return callable
 
@@ -107,7 +114,8 @@ def compile_moe_reduction(*, topk, model_dim, row_padding_bytes=None):
 
 
 @functools.cache
-def invert_sorted_ids(TOPK):
+def _invert_sorted_ids_cached(device_cache_key, TOPK):
+    del device_cache_key
     num_threads = 64
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
@@ -147,6 +155,11 @@ def invert_sorted_ids(TOPK):
             sorted_ids, invert, p_num_valid, num_ids, batch_size
         ).launch(grid=(grid_size, 1, 1), block=(num_threads, 1, 1), stream=stream)
 
+    return launch
+
+
+@functools.cache
+def invert_sorted_ids(TOPK):
     def callable(
         sorted_ids: torch.Tensor,
         invert: torch.Tensor,
@@ -154,15 +167,13 @@ def invert_sorted_ids(TOPK):
         num_ids: int,
         batch_size: int,
     ):
-        stream = torch.cuda.current_stream()
-        _run_compiled(
-            launch,
-            _ptr(sorted_ids),
-            _ptr(invert),
-            _ptr(num_valid),
-            fx.Uint32(num_ids),
-            fx.Uint32(batch_size),
-            stream,
-        )
+        assert sorted_ids.device == invert.device == num_valid.device
+        with torch.cuda.device(sorted_ids.device):
+            launch = _invert_sorted_ids_cached(get_device_cache_key(), TOPK)
+            _run_compiled(
+                launch, _ptr(sorted_ids), _ptr(invert), _ptr(num_valid),
+                fx.Uint32(num_ids), fx.Uint32(batch_size),
+                torch.cuda.current_stream(sorted_ids.device),
+            )
 
     return callable

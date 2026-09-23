@@ -171,11 +171,19 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
     block_m = options["block_size_M"]
 
     def add(impl, gm=16, dm=16, gn=64, dn=64, **kwargs):
-        """只加入符合 M tile 设置、且两个 GEMM 的 N 都能被对应 tile 整除的配置。"""
-        if block_m not in (None, 0, -1, dm) or (2 * i) % gn or h % dn:
+        """保留 caller 的 M 设置；FlyDSL 的 tile/资源限制交给编译检查。"""
+        if block_m not in (None, 0, -1, dm):
             return
-        configs.append(Config(_impl=impl, tile_m_gate=gm, tile_m_down=dm,
-                              tile_n_gate=gn, tile_n_down=dn, **kwargs))
+        # ASM wrapper 用整除计算 launch grid，不能丢掉最后一个 N tile。
+        if impl.startswith("jit_") and ((2 * i) % gn or h % dn):
+            return
+        params = dict(_impl=impl, tile_m_gate=gm, tile_m_down=dm,
+                      tile_n_gate=gn, tile_n_down=dn, **kwargs)
+        if impl == "fly_prefill":
+            for k in ((64, 128) if kind == "bf16" else (128, 256)):
+                configs.append(Config(**params, tile_k_gate=k))
+        else:
+            configs.append(Config(**params))
 
     if kind == "block" and silu and separated:
         arch = torch.cuda.get_device_properties(hidden_states.device).gcnArchName.split(":")[0]
@@ -215,33 +223,26 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
 
     if kind == "block":
         return configs  # 当前 FlyDSL kernel 不支持 128×128 block scale。
-    if kind == "fp4" and (h % 512 or i % 128):
-        return configs
     if batch_bucket <= 32:
+        down_ns = (32,) if kind == "fp4" else (64,)
+        if kind == "fp4" and batch_bucket == 1:
+            down_ns += (64,)
         for gn in (32, 64):
-            add("fly_decode", gn=gn, dn=32 if kind == "fp4" else 64, decode_alg="batch1")
+            for dn in down_ns:
+                add("fly_decode", gn=gn, dn=dn, decode_alg="batch1")
     for m in (16, 32, 64):
         for n in (64, 128):
             add("fly_decode", m, m, n, n)
     if kind == "fp4" or batch_bucket < 64:
         return configs
-    if kind != "bf16" and h % 256:
-        return configs  # FP8 gateup 的 BK128 双缓冲流程要求 K tile 的数量为偶数。
     for m in (32, 64, 128):
-        if max(m * i * (2 if kind == "bf16" else 1), m * 256) <= 65536:
-            if kind == "bf16" or i % 128 == 0:
-                for n in (128, 256):
-                    add("fly_prefill", m, m, n, 128)
+        for n in (128, 256):
+            add("fly_prefill", m, m, n, 128)
     if kind != "bf16":
-        for padding in (0, 128):
-            if 64 * i + 1024 + 8192 <= 65536:
-                add("fly_prefill", 64, 64, 128, 256,
-                    down_path="1x4_64x256", padding=padding)
-            if i in (192, 256, 320, 384, 512, 640):
-                add("fly_prefill", 64, 256, 128, 128, down_path="8x1", padding=padding)
-                if w1.shape[0] <= 2048:
-                    add("fly_prefill", 64, 64, 128, 128,
-                        down_path="8x1_compact", padding=padding)
+        for path, dm, dn in (("1x4_64x256", 64, 256), ("8x1", 256, 128), ("8x1_compact", 64, 128)):
+            for gn in (128, 256):
+                for padding in (0, 128):
+                    add("fly_prefill", 64, dm, gn, dn, down_path=path, padding=padding)
     return configs
 
 
@@ -388,7 +389,7 @@ def _run_blockscale(x, w1, w2, ids, weights, options, out, m, gn, dn,
 
 
 def _run_fly(x, w1, w2, ids, weights, options, out, impl, gm, dm, gn, dn,
-             decode_alg, down_path, padding):
+             decode_alg, down_path, padding, tile_k_gate=0):
     """执行 FlyDSL 的两阶段 MoE，每次调用都重新获取当前 stream。"""
     import flydsl.compiler as flyc
     import flydsl.expr as fx
@@ -435,12 +436,9 @@ def _run_fly(x, w1, w2, ids, weights, options, out, impl, gm, dm, gn, dn,
              mxfp4_gate_up_interleaved=options["gate_mode"] == GateMode.INTERLEAVE)
     d = dict(common, N=h, K=i, stage="down", BLOCK_TILE_SIZE_M=dm, BLOCK_TILE_SIZE_N=dn)
     if impl == "fly_decode" and decode_alg == "batch1":
-        # 每个 gateup N tile 最多清零 256×8 个 BF16 元素；覆盖不完整时改用 out.zero_()。
-        fused_clear = kind == "fp4" and (n1 // gn) * 256 * 8 >= h
-        if not fused_clear:
-            out.zero_()
-        launch(dict(g, alg="batch1", fused_down_clear=fused_clear),
-               (x, w1, mid, ids, out if fused_clear else weights, s1), b)
+        # Gate/Up 清零整个输出，后续同 stream 的 Down 再 atomic add。
+        launch(dict(g, alg="batch1", fused_down_clear=True),
+               (x, w1, mid, ids, out, s1), b)
         launch(dict(d, alg="batch1"), (mid, w2, out, ids, weights, s2), b)
         return out
 
@@ -454,7 +452,7 @@ def _run_fly(x, w1, w2, ids, weights, options, out, impl, gm, dm, gn, dn,
 
     gate_in, a_scale = quantize(x) if kind == "fp8" else (x, dummy)
     launch(dict(g, alg="prefill_1x4", METADATA_TILE_SIZE_M=dm,
-                tile_k=128 if kind == "fp8" else 64),
+                 tile_k=tile_k_gate or (128 if kind == "fp8" else 64)),
            (gate_in, w1, mid, *routing, s1, a_scale), b, grid)
     down_in, a_scale = quantize(mid) if kind == "fp8" else (mid, dummy)
     routes = torch.empty((grid * dm, h + (padding or 0) // 2), device=x.device, dtype=x.dtype)
@@ -479,7 +477,8 @@ def _run_fly(x, w1, w2, ids, weights, options, out, impl, gm, dm, gn, dn,
 def _fmoe_wrapper(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
                   batch_bucket, model_key, _impl="aiter", tile_m_gate=16,
                   tile_m_down=16, tile_n_gate=64, tile_n_down=64, block_n=0,
-                  decode_alg="splitk", down_path="default", padding=None, num_oc_splits=1):
+                  decode_alg="splitk", down_path="default", padding=None, num_oc_splits=1,
+                  tile_k_gate=0):
     """供 autotune 调用的 Python 入口；Config 提供实现名称和 tile 参数。"""
     global last_dispatch
     if record_dispatch:
@@ -489,6 +488,8 @@ def _fmoe_wrapper(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
                                  tile_n_gate=tile_n_gate, tile_n_down=tile_n_down, block_n=block_n,
                                  decode_alg=decode_alg, down_path=down_path, padding=padding,
                                  num_oc_splits=num_oc_splits)
+            if _impl == "fly_prefill":
+                last_dispatch["tile_k_gate"] = tile_k_gate
     if _impl == "aiter":
         return _aiter_fused_moe(hidden_states, w1, w2, topk_weight, topk_ids, **options)
     out = options["output"]
@@ -503,7 +504,7 @@ def _fmoe_wrapper(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
     if _impl in ("fly_decode", "fly_prefill"):
         return _run_fly(hidden_states, w1, w2, topk_ids, topk_weight, options, out,
                         _impl, tile_m_gate, tile_m_down, tile_n_gate, tile_n_down,
-                        decode_alg, down_path, padding)
+                        decode_alg, down_path, padding, tile_k_gate)
     raise ValueError(f"unknown MoE implementation: {_impl}")
 
 
@@ -666,14 +667,14 @@ _autotuned_fmoe = autotune(
     configs=_configs,
     key=["batch_bucket", "model_key"],
     prune_configs_by=_prune_invalid_configs,
-    artifact_name="pyhip_fused_moe_v3",
+    artifact_name="pyhip_fused_moe_v5",
 )(_fmoe_wrapper)
 
 
 def _model_key(call):
     """把影响配置选择的信息加入 cache key；缓存只保存配置，不保存张量数据。"""
     # FlyDSL 不会读取 tensor 的自定义属性或展开 options 中的张量，需要手动补充。
-    values = {"version": 3}
+    values = {"version": 5}
     for name, value in call.items():
         if isinstance(value, torch.Tensor):
             shape = tuple(value.shape)

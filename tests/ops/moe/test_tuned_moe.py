@@ -59,6 +59,17 @@ def _check(result, call, reference):
     assert calc_diff(reference, result) <= .02
 
 
+def _round_bf16_reference(value):
+    """定点测试遵循当前舍入模式；不改变完整 MoE 的独立参考和容差。"""
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage import common
+
+    if not (common._SIMPLIFIED_BF16_RTA or common._SIMPLIFIED_BF16_RTE):
+        return value.bfloat16()
+    bits = value.float().contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    bias = 0x8000 if common._SIMPLIFIED_BF16_RTA else 0x7FFF + ((bits >> 16) & 1)
+    return ((bits + bias) >> 16).to(torch.int16).view(torch.bfloat16)
+
+
 def _tune_arguments(call):
     bound = inspect.signature(tm.fused_moe).bind(**call)
     bound.apply_defaults()
@@ -70,8 +81,355 @@ def _native_configs(call):
             if config.all_kwargs()["_impl"] == "jit_blockscale"]
 
 
+def _fly_call(tokens=4, hidden=512, inter=128, kind="bf16", activation="silu", gate_mode="separated"):
+    args = SimpleNamespace(
+        dtype="mxfp4" if kind == "fp4" else "bf16" if kind == "bf16" else "fp8",
+        quant=kind if kind in ("ptpc", "per_tensor") else "model", seed=8,
+        gate_mode=gate_mode, preshuffle="on", routing="balanced", activation=activation,
+        beta=.5 if activation == "situv2" else None,
+        linear_beta=2.0 if activation == "situv2" else None, swiglu_limit=None,
+    )
+    model = dict(HIDDEN_SIZE=hidden, INTER_SIZE=inter, TP=1, E=4, TOPK=2)
+    call, _ = prepare(model, tokens, args)
+    call["hidden_states"].mul_(50)
+    return call
+
+
+@pytest.mark.parametrize("hidden", [128, 256, 384, 512, 768])
+@pytest.mark.parametrize("kind", ["bf16", "ptpc"])
+def test_fly_candidates_defer_shape_checks(hidden, kind):
+    call = _fly_call(tokens=65, hidden=hidden, kind=kind)
+    configs = [c.all_kwargs() for c in tm._configs(**_tune_arguments(call))]
+    assert any(c["_impl"].startswith("jit_") for c in configs)  # 不限制其它后端。
+    assert any(c["_impl"] == "fly_decode" for c in configs)
+    assert any(c["_impl"] == "fly_prefill" for c in configs)
+    # 即使当前 kernel 不支持该 shape，也不在候选层复制 K/LDS/N 限制。
+    prefill = [c for c in configs if c["_impl"] == "fly_prefill" and "down_path" not in c]
+    assert {(c["tile_m_gate"], c["tile_n_gate"], c["tile_k_gate"]) for c in prefill} == {
+        (m, n, k) for m in (32, 64, 128) for n in (128, 256)
+        for k in ((64, 128) if kind == "bf16" else (128, 256))
+    }
+    limited = tm._configs(**_tune_arguments(call | {"block_size_M": 64}))
+    assert all(c.all_kwargs()["tile_m_down"] == 64 for c in limited if c.all_kwargs()["_impl"] != "aiter")
+
+
+@pytest.mark.parametrize("alg", ["batch1", "splitk"])
+@pytest.mark.parametrize("kind", ["bf16", "fp8"])
+def test_fly_gateup_rejects_incomplete_k(alg, kind):
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm1 import _build_moe_gemm1
+
+    with pytest.raises(AssertionError, match="multiple of 256"):
+        _build_moe_gemm1(N=256, K=384, weight_dtype=kind,
+                         weight_quant_type="no" if kind == "bf16" else "ptpc",
+                         TOPK=2, BLOCK_TILE_SIZE_M=16, BLOCK_TILE_SIZE_N=64, alg=alg, E=4)
+
+
+@pytest.mark.parametrize("kind, path, inter, gate_n", [
+    ("bf16", "default", 128, 128),
+    ("ptpc", "default", 256, 128),
+    ("ptpc", "default", 192, 128),
+    ("ptpc", "default", 320, 128),
+    ("per_tensor", "default", 192, 128),
+    ("per_tensor", "default", 320, 128),
+    ("ptpc", "1x4_64x256", 192, 128),
+    ("ptpc", "8x1", 320, 128),
+    ("ptpc", "8x1_compact", 192, 128),
+    ("per_tensor", "1x4_64x256", 256, 128),
+    ("per_tensor", "8x1", 192, 128),
+    ("per_tensor", "8x1_compact", 320, 128),
+    ("ptpc", "1x4_64x256", 256, 256),
+    ("ptpc", "8x1", 256, 256),
+    ("ptpc", "8x1_compact", 256, 256),
+    ("per_tensor", "1x4_64x256", 384, 256),
+    ("per_tensor", "8x1", 384, 256),
+    ("per_tensor", "8x1_compact", 384, 256),
+])
+def test_fly_prefill_k_tiles(monkeypatch, kind, path, inter, gate_n):
+    from pyhip.ops.moe.flydsl import moe_gemm_splitk as fly
+
+    call = _fly_call(tokens=257, inter=inter, kind=kind)
+    tuning = _tune_arguments(call)
+    configs = [c.all_kwargs() for c in tm._configs(**tuning)
+               if c.all_kwargs()["_impl"] == "fly_prefill"
+               and c.all_kwargs().get("down_path", "default") == path
+               and c.all_kwargs()["tile_m_gate"] == 64
+               and c.all_kwargs()["tile_m_down"] == (256 if path == "8x1" else 64)
+               and c.all_kwargs()["tile_n_gate"] == gate_n
+               and c.all_kwargs().get("padding") == (None if path == "default" else 128)]
+    expected_ks = {64, 128} if kind == "bf16" else {128, 256}
+    assert {c["tile_k_gate"] for c in configs} == expected_ks and len(configs) == 2
+    reference = tm._torch_reference(call)
+    compiled = []
+    original_compile = fly.compile_gemm
+
+    def compile_gemm(**params):
+        compiled.append(params)
+        return original_compile(**params)
+
+    monkeypatch.setattr(fly, "compile_gemm", compile_gemm)
+    monkeypatch.setattr(tm, "record_dispatch", True)
+    monkeypatch.setattr(tm, "last_dispatch", None)
+    for config in configs:
+        call["output"].fill_(float("nan"))
+        _check(tm._fmoe_wrapper(**tuning, **config), call, reference)
+        assert tm.last_dispatch["tile_k_gate"] == config["tile_k_gate"]
+        assert compiled[-2]["tile_k"] == config["tile_k_gate"]
+        assert "tile_k" not in compiled[-1]  # Gate/Up 的 BK 不改变 Down 的 K 分块。
+
+
+@pytest.mark.parametrize("kind, inter, bad_options, reason", [
+    ("ptpc", 192, dict(tile_m_gate=32, tile_m_down=32), "num_atoms"),
+    ("ptpc", 192, dict(tile_n_gate=256), "complete N tile"),
+    ("ptpc", 768, dict(down_path="8x1", tile_m_down=256, padding=128), "8x1仅支持K"),
+])
+def test_fly_compile_failure_pruning(capsys, kind, inter, bad_options, reason):
+    call = _fly_call(tokens=65, inter=inter, kind=kind)
+    tuning = _tune_arguments(call)
+    configs = tm._configs(**tuning)
+    bad_params = dict(_impl="fly_prefill", tile_m_gate=64, tile_m_down=64, tile_n_gate=128,
+                      tile_n_down=128, tile_k_gate=64 if kind == "bf16" else 128) | bad_options
+    bad = next(c for c in configs if c.all_kwargs() == bad_params)
+    good = next(c for c in configs if c.all_kwargs() == dict(
+        _impl="fly_decode", tile_m_gate=16, tile_m_down=16, tile_n_gate=64, tile_n_down=64))
+    assert tm._prune_invalid_configs([bad, good], tuning) == [good]
+    assert reason in capsys.readouterr().out
+
+
+def test_fly_default_down_large_lds():
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("96 KiB LDS requires gfx950")
+    call = _fly_call(tokens=65, inter=384, kind="bf16")
+    tuning = _tune_arguments(call)
+    config = next(c for c in tm._configs(**tuning) if c.all_kwargs() == dict(
+        _impl="fly_prefill", tile_m_gate=128, tile_m_down=128,
+        tile_n_gate=128, tile_n_down=128, tile_k_gate=64))
+    # Down 的 BF16 A tile 占 128×384×2 = 96 KiB，不应被通用 64 KiB 限制排除。
+    reference = tm._torch_reference(call)
+    call["output"].fill_(float("nan"))
+    _check(tm._fmoe_wrapper(**tuning, **config.all_kwargs()), call, reference)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 4, 32, 33])
+def test_fly_mxfp4_direct_candidates(tokens):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("MXFP4 requires gfx950")
+    configs = tm._configs(**_tune_arguments(_fly_call(tokens=tokens, kind="fp4")))
+    tiles = {(c.all_kwargs()["tile_n_gate"], c.all_kwargs()["tile_n_down"]) for c in configs
+             if c.all_kwargs()["_impl"] == "fly_decode" and c.all_kwargs().get("decode_alg") == "batch1"}
+    assert tiles == ({(gn, dn) for gn in (32, 64) for dn in ((32, 64) if tokens == 1 else (32,))}
+                     if tokens <= 32 else set())
+
+
+@pytest.mark.parametrize("tokens, hidden, inter, kind, activation, gate_mode, gate_n, down_n", [
+    (1, 512, 128, "bf16", "silu", "separated", 32, 64),
+    (3, 512, 128, "ptpc", "silu", "separated", 32, 64),
+    (8, 512, 128, "per_tensor", "swiglu", "separated", 64, 64),
+    (7, 32768, 64, "bf16", "silu", "separated", 64, 64),
+    (5, 32768, 64, "ptpc", "silu", "separated", 32, 64),
+    (4, 512, 128, "fp4", "silu", "separated", 32, 32),
+    (3, 512, 128, "fp4", "situv2", "interleave", 64, 32),
+    (1, 512, 128, "fp4", "silu", "separated", 32, 64),
+    (1, 512, 128, "fp4", "situv2", "interleave", 64, 64),
+])
+def test_fly_direct_clear_graph(monkeypatch, tokens, hidden, inter, kind, activation, gate_mode, gate_n, down_n):
+    if kind == "fp4" and not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("MXFP4 requires gfx950")
+    from pyhip.ops.moe.flydsl import moe_gemm_splitk as fly
+
+    call = _fly_call(tokens, hidden, inter, kind, activation, gate_mode)
+    # 输出两侧保留红区；多轮清零不能漏写 token，也不能越过输出末尾。
+    storage = torch.full((tokens * hidden + 64,), -123.0, dtype=torch.bfloat16)
+    call["output"] = storage[32:-32].view(tokens, hidden)
+    tuning = _tune_arguments(call)
+    config = next(c.all_kwargs() for c in tm._configs(**tuning)
+                  if c.all_kwargs()["_impl"] == "fly_decode" and c.all_kwargs().get("decode_alg") == "batch1"
+                  and c.all_kwargs()["tile_n_gate"] == gate_n and c.all_kwargs()["tile_n_down"] == down_n)
+    compiled = []
+    original_compile = fly.compile_gemm
+
+    def compile_gemm(**params):
+        compiled.append(params)
+        return original_compile(**params)
+
+    monkeypatch.setattr(fly, "compile_gemm", compile_gemm)
+    reference = tm._torch_reference(call)
+    call["output"].fill_(float("nan"))
+    _check(tm._fmoe_wrapper(**tuning, **config), call, reference)
+    assert compiled[0]["fused_down_clear"] is True
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        tm._fmoe_wrapper(**tuning, **config)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            tm._fmoe_wrapper(**tuning, **config)
+            result = tm._fmoe_wrapper(**tuning, **config)
+    stream.synchronize()
+    original_x = call["hidden_states"].clone()
+    for zero in (False, True, False):
+        call["hidden_states"].copy_(original_x * (0.0 if zero else -.75))
+        call["topk_ids"].copy_((call["topk_ids"] + 1) % 4)
+        call["topk_weight"].mul_(-.5)
+        reference = tm._torch_reference(call)
+        call["output"].fill_(float("nan"))
+        graph.replay()
+        _check(result, call, reference)
+        assert (storage[:32] == -123).all() and (storage[-32:] == -123).all()
+
+
 def test_aiter_signature():
     assert inspect.signature(tm.fused_moe) == inspect.signature(tm._aiter_fused_moe)
+
+
+def test_fly_bf16_rounding_bits():
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import _f32_to_bf16, torch_tensor_to_pointer as ptr
+
+    # ±halfway 两侧、奇偶 LSB、subnormal、overflow、signed zero 和不同 NaN payload。
+    upper = [0, 1, 0x7f, 0x80, 0x3f80, 0x3f81, 0x3fff, 0x4000, 0x7f7f,
+             0x8000, 0x8001, 0x807f, 0x8080, 0xbf80, 0xbf81, 0xff7f]
+    bits = [(hi << 16) | lo for hi in upper for lo in (0, 1, 0x7fff, 0x8000, 0x8001, 0xffff)]
+    bits += [0x7f800000, 0xff800000, 0x7f800001, 0xff800001, 0x7fffffff, 0xffffffff]
+    bits += [0] * (512 - len(bits))
+    x_cpu = torch.tensor(bits, dtype=torch.int64, device="cpu").to(torch.int32).view(torch.float32)
+    expected = _round_bf16_reference(x_cpu)
+    x = x_cpu.cuda()
+    vector_out = torch.empty(x.shape, dtype=torch.bfloat16)
+    scalar_out = torch.empty_like(vector_out)
+
+    @flyc.kernel
+    def convert(A: fx.Pointer, B: fx.Pointer, C: fx.Pointer):
+        base = fx.thread_idx.x * 8
+        values = fx.make_view(A + base, fx.make_layout(8, 1)).load()
+        fx.make_view(B + base, fx.make_layout(8, 1)).store(_f32_to_bf16(values))
+        for i in fx.range_constexpr(8):
+            C[base + i] = _f32_to_bf16(A[base + i])
+
+    @flyc.jit
+    def launch(A: fx.Pointer, B: fx.Pointer, C: fx.Pointer, stream: fx.Stream):
+        convert(A, B, C).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+
+    _run_compiled(launch, ptr(x), ptr(vector_out), ptr(scalar_out), torch.cuda.current_stream())
+    nan = expected.isnan()
+    for result in (vector_out.cpu(), scalar_out.cpu()):
+        assert torch.equal(result.isnan(), nan)
+        assert torch.equal(result[~nan].view(torch.int16), expected[~nan].view(torch.int16))
+
+
+@pytest.mark.parametrize("path", ["default", "1x4_64x256", "8x1", "8x1_compact"])
+def test_fly_down_rounds_before_packing(path):
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+    from aiter.ops.shuffle import shuffle_weight
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as ptr
+    from pyhip.ops.moe.flydsl.moe_gemm_splitk import compile_gemm, invert_sorted_ids, sorted_sum
+
+    b, h, k = 257, 512, 192
+    qdtype = aiter.dtypes.fp8
+    # dot 恰好为 1，结果由 FP32 scale/routing 决定，能逐 bit 检查 halfway 舍入。
+    x = torch.zeros((b, 1, k), dtype=torch.bfloat16)
+    w = torch.zeros((1, h, k), dtype=torch.bfloat16)
+    x[..., 0] = 1
+    w[..., 0] = 1
+    x, w = x.to(qdtype), shuffle_weight(w.to(qdtype))
+    scales = torch.tensor([1 + 1 / 256, 1 + 3 / 256, -(1 + 3 / 256),
+                           1 + 3 / 256 - 2**-20, 1 + 3 / 256 + 2**-20, -0.0, .5, 2.0],
+                          dtype=torch.float32).repeat(h // 8)
+    a_scale = torch.ones((b, 1), dtype=torch.float32)
+    ids = torch.zeros((b, 1), dtype=torch.int32)
+    weights = torch.tensor([1.0, -.5, 2.0], dtype=torch.float32).repeat((b + 2) // 3)[:b, None].contiguous()
+    bm, bn = (256 if path == "8x1" else 64), (256 if path == "1x4_64x256" else 128)
+    padding = None if path == "default" else 128
+    si, sw, se, valid, out = tm.moe_sorting(ids, weights, 1, h, torch.bfloat16, bm)
+    routes = torch.full((se.numel() * bm, h + (padding or 0) // 2), float("nan"), dtype=torch.bfloat16)
+    params = dict(N=h, K=k, weight_dtype="fp8", weight_quant_type="ptpc", act_quant_type="ptpc",
+                  TOPK=1, E=1, BLOCK_TILE_SIZE_M=bm, BLOCK_TILE_SIZE_N=bn,
+                  stage="down", alg="prefill_1x4", USE_ATOMIC_WRITE=False,
+                  down_path=path, down_output_padding_bytes=padding)
+    extra = ()
+    if path == "8x1_compact":
+        from pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm2_8x1_compact import (
+            _build_moe_gemm2_8x1_compact, allocate_task_buffers,
+        )
+        # 小测试显式保留 full，覆盖 M256 full 和 M64 tail 两种 epilogue。
+        launcher = _build_moe_gemm2_8x1_compact(**params, _min_tail_utilization=0)
+        full, tail, counts = allocate_task_buffers(se, 1)
+        extra = (ptr(full), ptr(tail), ptr(counts), full.shape[0], tail.shape[0])
+    else:
+        launcher = compile_gemm(**params)
+    _run_compiled(launcher, *(ptr(t) for t in (x, w, routes, si, sw, se, valid, scales, a_scale)),
+                  b, se.numel(), *extra, torch.cuda.current_stream())
+    loc = torch.empty((b, 1), dtype=torch.int32)
+    invert_sorted_ids(1)(si, loc, valid, si.numel(), b)
+    sorted_sum(1, h, padding)(loc, routes, out, b)
+    torch.testing.assert_close(out, _round_bf16_reference(weights * scales), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("padding", [0, 128])
+def test_fly_reduce_device_cache_stream_graph(monkeypatch, padding):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two GPUs for launcher cache isolation")
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage import moe_reduce as reduce
+
+    # 同一个入口在 0→1→0 上复用，不能把第一次的 compiled function 带到另一张卡。
+    invert = reduce.invert_sorted_ids(2)
+    add = reduce.compile_moe_reduction(topk=2, model_dim=512, row_padding_bytes=padding)
+    original_run = reduce._run_compiled
+    launched = []
+
+    def run(launcher, *args):
+        launched.append((torch.cuda.current_device(), launcher))
+        assert args[-1] == torch.cuda.current_stream()
+        return original_run(launcher, *args)
+
+    monkeypatch.setattr(reduce, "_run_compiled", run)
+    per_device = {}
+    for device in (0, 1, 0):
+        with torch.cuda.device(device):
+            ids = torch.zeros(256, dtype=torch.int32, device=device)
+            ids[:8] = torch.tensor([(1 << 24) | 2, 0, (1 << 24), 2, 1, (1 << 24) | 1, 3, 3],
+                                   dtype=torch.int32, device=device)
+            valid = torch.tensor([8], dtype=torch.int32, device=device)
+            loc = torch.full((3, 2), -1, dtype=torch.int32, device=device)
+            expected_loc = torch.tensor([[1, 2], [4, 5], [3, 0]], dtype=torch.int32, device=device)
+            # valid 之后故意保留看似有效的路由，数据区则填 NaN。
+            routes = torch.full((256, 512 + padding // 2), float("nan"), dtype=torch.bfloat16, device=device)
+            routes[:6, :512] = ((torch.arange(6, device=device)[:, None]
+                                 + torch.arange(512, device=device)[None, :] % 17) * .125).bfloat16()
+            out = torch.empty((3, 512), dtype=torch.bfloat16, device=device)
+            previous_stream = torch.cuda.current_stream(device)
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(previous_stream)
+            torch.cuda.set_stream(stream)
+        try:
+            with torch.cuda.device(1 - device):
+                invert(ids, loc, valid, ids.numel(), 3)
+                add(loc, routes, out, 3)
+                assert torch.cuda.current_device() == 1 - device
+            current = launched[-2:]
+            assert all(item[0] == device for item in current)
+            if device in per_device:
+                assert all(a[1] is b[1] for a, b in zip(current, per_device[device]))
+            else:
+                per_device[device] = current
+            with torch.cuda.device(device), torch.cuda.stream(stream):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    invert(ids, loc, valid, ids.numel(), 3)
+                    add(loc, routes, out, 3)
+                for factor in (0.0, 1.0, -2.0):
+                    routes[:6, :512].fill_(factor)
+                    out.fill_(float("nan"))
+                    graph.replay()
+                    torch.testing.assert_close(loc, expected_loc, atol=0, rtol=0)
+                    torch.testing.assert_close(out, torch.full_like(out, 2 * factor), atol=0, rtol=0)
+            stream.synchronize()
+        finally:
+            with torch.cuda.device(device):
+                torch.cuda.set_stream(previous_stream)
+    assert all(a[1] is not b[1] for a, b in zip(per_device[0], per_device[1]))
 
 
 @pytest.mark.parametrize("tokens, hidden, inter, shuffled", [
@@ -237,7 +595,7 @@ def test_dispatch_winner_cache_and_artifact(monkeypatch, tmp_path):
 
     def do_bench(fn, **kwargs):
         fn()
-        return 1.0 if tm.last_dispatch["_impl"] == "jit_batch" else 2.0
+        return 1.0 if tm.last_dispatch["_impl"] == "fly_prefill" else 2.0
 
     def tuner(configs):
         return tm.autotune(configs=configs, key=["batch_bucket", "model_key"], do_bench=do_bench,
@@ -247,13 +605,15 @@ def test_dispatch_winner_cache_and_artifact(monkeypatch, tmp_path):
         pytest.fail("cache/artifact hit must not search candidates")
 
     monkeypatch.setattr(tm, "_run_jit", run)
+    monkeypatch.setattr(tm, "_run_fly", run)
     monkeypatch.setattr(tm, "_autotuned_fmoe", tuner([
-        tm.Config(_impl="jit_batch", block_n=1024), tm.Config(_impl="jit_splitk")]))
+        tm.Config(_impl="fly_prefill", tile_k_gate=256), tm.Config(_impl="jit_splitk")]))
     assert tm.fused_moe(**call) is call["output"]
     # 最后一个被计时的候选不是 winner；正式调用必须覆盖它。
-    assert dispatches == ["jit_batch", "jit_splitk", "jit_batch"]
+    assert dispatches == ["fly_prefill", "jit_splitk", "fly_prefill"]
     winner = tm.last_dispatch.copy()
-    assert winner["_impl"] == "jit_batch" and winner["block_n"] == 1024
+    assert winner["_impl"] == "fly_prefill" and winner["tile_k_gate"] == 256
+    assert bench.json.loads(_tune_arguments(call)["model_key"])["version"] == 5
     assert len(list((tmp_path / "configs").glob("pyhip_dispatch_test-*.json"))) == 1
 
     monkeypatch.setenv("FLYDSL_AUTOTUNE", "0")
@@ -261,7 +621,7 @@ def test_dispatch_winner_cache_and_artifact(monkeypatch, tmp_path):
     dispatches.clear()
     tm.last_dispatch = None
     tm.fused_moe(**call)
-    assert dispatches == ["jit_batch"] and tm.last_dispatch == winner
+    assert dispatches == ["fly_prefill"] and tm.last_dispatch == winner
 
     # 新 autotuner + 空普通缓存目录，只能从离线 artifact 命中。
     monkeypatch.setenv("FLYDSL_AUTOTUNE_CACHE_DIR", str(tmp_path / "empty-cache"))
@@ -269,7 +629,7 @@ def test_dispatch_winner_cache_and_artifact(monkeypatch, tmp_path):
     dispatches.clear()
     tm.last_dispatch = None
     tm.fused_moe(**call)
-    assert dispatches == ["jit_batch"] and tm.last_dispatch == winner
+    assert dispatches == ["fly_prefill"] and tm.last_dispatch == winner
 
 
 @pytest.mark.parametrize("failed, previous_record", [(False, False), (False, True), (True, False), (True, True)])

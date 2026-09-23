@@ -298,7 +298,8 @@ def run_case(name, model, tokens, args):
                 if tm.record_dispatch:
                     tm.last_dispatch = None
                 call["output"].fill_(float("nan"))
-                with environment("FLYDSL_AUTOTUNE", "1" if backend == "tuned" and (args.retune or args.tune_aiter) else "0"):
+                # disable kernel cache: tunning always compile new kernel
+                with environment("FLYDSL_RUNTIME_ENABLE_CACHE", "0"), environment("FLYDSL_AUTOTUNE", "1" if backend == "tuned" and (args.retune or args.tune_aiter) else "0"):
                     result = op(**call)
                 row["correctness"][backend] = check_output(result, call["output"], reference)
                 if backend == "tuned":
