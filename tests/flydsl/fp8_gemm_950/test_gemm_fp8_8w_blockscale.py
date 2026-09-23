@@ -4,6 +4,8 @@
 
 The blockscale contract is ScaleA[KB, M] and ScaleB[ceil(N/128), KB], KB=K/128.
 Both pipelines use a 256x256 WG tile, eight waves, and ping-pong padded LDS.
+Optional preshuffle_b consumes aiter.shuffle_weight(B, layout=(16, 16)) directly;
+B uses packed LDS tiles in that mode, while both scale layouts stay unchanged.
 split_m=True selects the half-M single-FIFO pipeline: each wave's 64x32
 quadrant is computed as two 32x32 M slices sharing A and partial registers.
 split_m=False retains the four-phase baseline, including the unscaled path.
@@ -69,9 +71,12 @@ def compile_gemm_fp8_8wave(
 
     The split path fixes scalar B scales, one-phase-ahead B_l reads, and no
     s_setprio changes. Both paths interleave four scalar FMAs per new MFMA.
-    preshuffle_b is retained only to reject unsupported calls explicitly.
+    preshuffle_b uses the FP8 (16, 16) weight shuffle, without gate/up interleave.
+    Its coalesced raw B DMA is also used when useTileDMA selects tiled A DMA.
     """
-    assert not preshuffle_b, "preshuffled B is not supported"
+    if preshuffle_b:
+        assert (TILE_M, TILE_N, TILE_K) == (256, 256, 128)
+        assert N % 16 == 0 and K % 256 == 0
     BLOCK_M = TILE_M // 2
     BLOCK_N = TILE_N // 2
     BLOCK_K = TILE_K
@@ -156,7 +161,12 @@ def compile_gemm_fp8_8wave(
         wave_id = tid // 64
         num_pid_n = div_up(N, TILE_N)
         if const_expr(pid_swizzle):
-            bid_x, bid_y = get_pids_950(fx.block_idx.x, M, fx.grid_dim.x, 8, 4)
+            if const_expr(split_m):
+                # Match launch grid; the restricted target prevents OCKL inlining.
+                grid_mn = div_up(M, TILE_M) * num_pid_n
+            else:
+                grid_mn = fx.grid_dim.x
+            bid_x, bid_y = get_pids_950(fx.block_idx.x, M, grid_mn, 8, 4)
         else:
             bid_x = fx.block_idx.x // num_pid_n
             bid_y = fx.block_idx.x % num_pid_n
@@ -324,10 +334,19 @@ def compile_gemm_fp8_8wave(
         sA_b_wr = [fx.make_view(lds.a_b0.ptr, _wr), fx.make_view(lds.a_b1.ptr, _wr)]
         sA_t_rd = [fx.make_view(lds.a_t0.ptr, _rd), fx.make_view(lds.a_t1.ptr, _rd)]
         sA_b_rd = [fx.make_view(lds.a_b0.ptr, _rd), fx.make_view(lds.a_b1.ptr, _rd)]
+        if const_expr(preshuffle_b):
+            # Logical B[n,k] -> [n//16, k//16, n%16, k%16] in packed LDS.
+            # k_perm still assigns each MFMA lane the same contiguous 32 K values.
+            _b_rd = fx.make_layout(
+                ((16, BLOCK_N // 16), (16, BLOCK_K // 16)),
+                ((16, BLOCK_K * 16), (1, 256)),
+            )
+        else:
+            _b_rd = _rd
         sB_l_wr = [fx.make_view(lds.b_l0.ptr, _wr), fx.make_view(lds.b_l1.ptr, _wr)]
         sB_r_wr = [fx.make_view(lds.b_r0.ptr, _wr), fx.make_view(lds.b_r1.ptr, _wr)]
-        sB_l_rd = [fx.make_view(lds.b_l0.ptr, _rd), fx.make_view(lds.b_l1.ptr, _rd)]
-        sB_r_rd = [fx.make_view(lds.b_r0.ptr, _rd), fx.make_view(lds.b_r1.ptr, _rd)]
+        sB_l_rd = [fx.make_view(lds.b_l0.ptr, _b_rd), fx.make_view(lds.b_l1.ptr, _b_rd)]
+        sB_r_rd = [fx.make_view(lds.b_r0.ptr, _b_rd), fx.make_view(lds.b_r1.ptr, _b_rd)]
 
         ### AC copytile partition vmem
         aT_g = dma.partition_S(bA_t)
@@ -542,12 +561,41 @@ def compile_gemm_fp8_8wave(
             # frag_P (outer FIFO)       (4,2,4) f32    (4,2,2) f32 -> 32/16 VGPR
             # prev_scale_a: 4/2 f32; prev_scale_b: one scalar (SGPR after load/
             # scalarization). prev_m_slice selects old C rows, not another FIFO.
-            
-        
-            # v_pk_fma can't be used because of mfma can't coissue with v_pk_fma, which would cause stall between MFMAs ISAs
-            # not find a good way to use v_fma and prevent v_pk_fma. perf drop when "passthrough": [["target-features", "-packed-fp32-ops"]],
-            # keep the inline assembly for now.
-            if const_expr(with_scale):
+            if const_expr(split_m):
+                # Compiler-only fences preserve 4 scalar FMAs -> 1 MFMA.
+                # Consume old P before replacing it with the next phase's result.
+                for m0 in range_constexpr(PHASE_M_REP):
+                    scale = Vec(prev_scale_a)[m0] * prev_scale_b
+                    rocdl.sched_barrier(0)
+                    for n0 in range_constexpr(N_REP):
+                        cs = frag_C[None, n0, prev_m_slice * PHASE_M_REP + m0]
+                        ps = frag_P[None, n0, m0]
+                        partial = Vec(ps.load())
+                        accum = Vec(cs.load())
+                        values = []
+                        for elem in range_constexpr(4):
+                            values.append(fx.fma(partial[elem], scale, accum[elem]))
+                        cs.store(Vec.from_elements(values, fx.Float32))
+                        rocdl.sched_barrier(0)
+                        ps.store(
+                            rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                                T.vec(4, T.f32),
+                                [
+                                    Vec(frag_B[None, n0, 0].load()).bitcast(fx.Int32),
+                                    Vec(frag_A[None, m0, 0].load()).bitcast(fx.Int32),
+                                    Vec.filled(4, 0.0, fx.Float32),
+                                    0,
+                                    0,
+                                    0,
+                                    fx.Int32(0),
+                                    0,
+                                    fx.Int32(0),
+                                ],
+                            )
+                        )
+                        rocdl.sched_barrier(0)
+            elif const_expr(with_scale):
+                # M_PART=0 would have spill if not using in-line assebly.
                 #     for mm in (Mrep):
                 #         dq_scale = prev_scale_a[mm] *prev_scale_b
                 #         for nn in (Nrep):
@@ -780,6 +828,37 @@ def compile_gemm_fp8_8wave(
                         fx.Int32(0),
                     )
 
+        if const_expr(preshuffle_b):
+            # Each wave copies a contiguous 16x64-byte block; two instructions
+            # per quadrant retain the existing pipeline's vmcnt accounting.
+            # Global offset(n,k) = (n//16)*16*K + (k//16)*256
+            #                       + (n%16)*16 + k%16.
+            _b_ps_lane_offset = fx.Int32(
+                (wave_id // 2) * 16 * K + (wave_id % 2) * 1024 + (tid % 64) * 16
+            )
+            _b_ps_wave_offset = rocdl.readfirstlane(
+                T.i32, arith._to_raw(fx.Int32(wave_id * 1024))
+            )
+
+            def _preshuffle_g2s(root_view, quadrant, ki):
+                for chunk in range_constexpr(2):
+                    dst = _lds_byte_ptr(
+                        fx.get_iter(root_view), _b_ps_wave_offset + chunk * 8192
+                    )
+                    src_base = fx.Int32(
+                        (bid_y * TILE_N + quadrant * BLOCK_N + chunk * 64) * K
+                        + ki * BLOCK_K * 16
+                    )
+                    rocdl.raw_ptr_buffer_load_lds(
+                        b_dma_rsrc,
+                        dst,
+                        fx.Int32(16),
+                        _b_ps_lane_offset,
+                        src_base,
+                        fx.Int32(0),
+                        fx.Int32(0),
+                    )
+
         def _ac_At(b, ki):
             if const_expr(not useTileDMA):
                 _raw_g2s(a_dma_rsrc, _aT_dst[b], _aT_src_wave_base, ki)
@@ -798,13 +877,17 @@ def compile_gemm_fp8_8wave(
                 fx.copy(async_copy_atom, aB_g[None, None, None, ki], aB_s[b])
 
         def _ac_Bl(b, ki):
-            if const_expr(not useTileDMA):
+            if const_expr(preshuffle_b):
+                _preshuffle_g2s(sB_l_rd[b], 0, ki)
+            elif const_expr(not useTileDMA):
                 _raw_g2s(b_dma_rsrc, _bL_dst[b], _bL_src_wave_base, ki)
             else:
                 fx.copy(async_copy_atom, bL_g[None, None, None, ki], bL_s[b])
 
         def _ac_Br(b, ki):
-            if const_expr(not useTileDMA):
+            if const_expr(preshuffle_b):
+                _preshuffle_g2s(sB_r_rd[b], 1, ki)
+            elif const_expr(not useTileDMA):
                 _raw_g2s(
                     b_dma_rsrc,
                     _bR_dst[b],
@@ -1303,12 +1386,18 @@ def compile_gemm_fp8_8wave(
         M: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        gemm_kernel(A, B, C, scaleA, scaleB, M).launch(
+        value_attrs = {}
+        if const_expr(split_m):
+            value_attrs["llvm.passthrough"] = [["target-features", "-packed-fp32-ops"]]
+        gemm_kernel(A, B, C, scaleA, scaleB, M, value_attrs=value_attrs).launch(
             grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1),
             block=(512, 1, 1),
             stream=stream,
         )
 
+    # if split_m:
+    #     # Preserve scalar FMAC in the split pipeline instead of SLP-packed FMA.
+    #     launch_gemm.compile_hints["llvm_options"] = {"vectorize-slp": False}
     return launch_gemm
 
 
@@ -1333,7 +1422,8 @@ def run_test(
     split_m=False,
 ):
     """Check a Torch reference and optionally time rotating input/output clones."""
-    assert not preshuffle_b, "preshuffled B is not supported"
+    if preshuffle_b:
+        from aiter.ops.shuffle import shuffle_weight
 
     KB = K // 128
     empty = torch.empty(0, device="cuda", dtype=torch.float32)
@@ -1359,12 +1449,13 @@ def run_test(
     b = (torch.rand(N, K, device="cuda") / 10.0).to(torch.float8_e4m3fn)
     sA, sB = _gen_scales()
     ref = _ref(a, b, sA, sB)
+    b_kernel = shuffle_weight(b, layout=(16, 16)) if preshuffle_b else b
     sA_kernel = sA.transpose(0, 1).contiguous() if with_scale else sA
     out = torch.zeros((M, N), device="cuda", dtype=torch.bfloat16)
     stream = torch.cuda.current_stream()
     args = (
         a.view(torch.int8),
-        b.view(torch.int8),
+        b_kernel.view(torch.int8),
         out.view(-1),
         sA_kernel.view(-1),
         sB.view(-1),
@@ -1429,6 +1520,8 @@ def run_test(
         )
         for _ in range(data_clones)
     ]
+    if preshuffle_b:
+        Bs = [shuffle_weight(b, layout=(16, 16)) for b in Bs]
     SAs = [(_gen_scales()[0] if with_scale else empty) for _ in range(data_clones)]
     SAs_kernel = [sa.transpose(0, 1).contiguous() if with_scale else sa for sa in SAs]
     SBs = [(_gen_scales()[1] if with_scale else empty) for _ in range(data_clones)]
@@ -1462,7 +1555,9 @@ def run_test(
         latencies.append(p.dt_ms)
     latencies.sort()
     best_ms = latencies[0]
-    print(f"\n=== perf 8wave M={M} N={N} K={K} with_scale={with_scale} ===")
+    print(
+        f"\n=== perf 8wave M={M} N={N} K={K} {with_scale=} {preshuffle_b=} {split_m=} ==="
+    )
     print(
         f"gemm:  {best_ms*1e3:.1f} us  {flops/(best_ms*1e-3)/1e12:.2f} TFLOPS  {mem_bytes/(best_ms*1e-3)/1e9:.1f} GB/s"
     )
@@ -1477,6 +1572,7 @@ if __name__ == "__main__":
     K = 6144
     # The script exercises the cleaned half-M path; SPLIT_M=0 selects baseline.
     split_m = _env_flag("SPLIT_M", "1")
+    preshuffle_b = _env_flag("PRESHUFFLE_B", "0")
     # K = 256
     run_test(
         M=4096,
@@ -1484,6 +1580,7 @@ if __name__ == "__main__":
         K=16384,
         perf=True,
         permlane_output=PERMLANE_EPILOGUE,
+        preshuffle_b=preshuffle_b,
         with_scale=True,
         split_m=split_m,
     )

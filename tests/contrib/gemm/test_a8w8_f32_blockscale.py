@@ -19,6 +19,7 @@ from aiter.test_common import benchmark, checkAllclose, perftest
 # Gluon is disabled for now.
 gluon_gemm_a8w8_blockscale = None
 
+PERF_VERBOSE = 0
 import pyhip
 from pyhip.contrib.gemm_fp8 import gemm_8wave_fp8bf16fp16
 
@@ -88,7 +89,7 @@ def _flydsl_module():
     return module
 
 
-def prepare_flydsl(x, weight, out, x_scale_t, w_scale, split_m):
+def prepare_flydsl(x, weight, out, x_scale_t, w_scale, split_m, preshuffle_b=False):
     m, k = x.shape
     n = weight.shape[0]
     fly = _flydsl_module()
@@ -102,7 +103,14 @@ def prepare_flydsl(x, weight, out, x_scale_t, w_scale, split_m):
         torch.cuda.current_stream(),
     )
     launcher = fly.compile_gemm_fp8_8wave(
-        256, 256, 128, n, k, with_scale=True, split_m=split_m
+        256,
+        256,
+        128,
+        n,
+        k,
+        with_scale=True,
+        split_m=split_m,
+        preshuffle_b=preshuffle_b,
     )
     return fly.flyc.compile[{"opt_level": 2}](launcher, *args), args
 
@@ -188,18 +196,23 @@ def txest_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["asmjit err"] = err_jit
     ret["asmjit diff"] = pyhip.calc_diff(a, out_jit, diff_thr=1e-5)
 
-    if not ck_preshuffle:
-        for split_m in (False, True):
-            tag = f"flydsl_split_m_{split_m}"
-            out_fly = torch.empty((m, n), dtype=dtype, device=x.device)
-            fly_kernel, args = prepare_flydsl(
-                x, weight, out_fly, x_scale_t, w_scale, split_m
-            )
-            fly_kernel(*args)
-            err_fly = checkAllclose(a, out_fly, msg=tag, tol_err_ratio=0)
-            assert err_fly == 0
-            ret[f"{tag} err"] = err_fly
-            ret[f"{tag} diff"] = pyhip.calc_diff(a, out_fly, diff_thr=1e-5)
+    for split_m in (False, True):
+        tag = f"flydsl_split_m_{split_m}"
+        out_fly = torch.empty((m, n), dtype=dtype, device=x.device)
+        fly_kernel, args = prepare_flydsl(
+            x,
+            gemm_weight,
+            out_fly,
+            x_scale_t,
+            w_scale,
+            split_m,
+            preshuffle_b=ck_preshuffle,
+        )
+        fly_kernel(*args)
+        err_fly = checkAllclose(a, out_fly, msg=tag, tol_err_ratio=0)
+        assert err_fly == 0
+        ret[f"{tag} err"] = err_fly
+        ret[f"{tag} diff"] = pyhip.calc_diff(a, out_fly, diff_thr=1e-5)
 
     for k, v in ret.items():
         print(f"\t{k}:{v}")
@@ -213,6 +226,15 @@ def txest_gemm(dtype, m, n, k, ck_preshuffle=True):
 def test_perf(m, n, k, num_repeats=1, ck_preshuffle=True, require_tuned=True):
     config = _aiter_config(m, n, k, ck_preshuffle, require_tuned)
     assert num_repeats > 0
+    max_tflops = {}
+    diffs = {}
+
+    def record_perf(kernel_type, perf):
+        max_tflops.setdefault(kernel_type, None)
+        if perf.latencies:
+            max_tflops[kernel_type] = max(max_tflops[kernel_type] or 0.0, perf.tflops())
+
+    aiter_type = f"aiter_{config['libtype']}" if config else "aiter_untuned"
     output_dtype = dtypes.bf16
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
@@ -271,8 +293,11 @@ def test_perf(m, n, k, num_repeats=1, ck_preshuffle=True, require_tuned=True):
     torch.cuda.synchronize()
     di = 0
     for i in range(num_repeats):
-        with pyhip.cudaPerf(flops, rw_bytes, name=f"ck_kernel_{di}") as p0:
+        with pyhip.cudaPerf(
+            flops, rw_bytes, name=f"ck_kernel_{di}", verbose=PERF_VERBOSE
+        ) as p0:
             ck_kernel(As[di], Bs[di], Ascales[di], Bscales[di])
+        record_perf(aiter_type, p0)
         di = (di + 1) % BUF_COPY
 
     if ck_preshuffle:
@@ -284,10 +309,13 @@ def test_perf(m, n, k, num_repeats=1, ck_preshuffle=True, require_tuned=True):
         torch.cuda.synchronize()
         di = 0
         for i in range(num_repeats):
-            with pyhip.cudaPerf(flops, rw_bytes, name=f"asm_kernel_{di}") as p0:
+            with pyhip.cudaPerf(
+                flops, rw_bytes, name=f"asm_kernel_{di}", verbose=PERF_VERBOSE
+            ) as p0:
                 aiter.gemm_a8w8_blockscale_bpreshuffle_asm(
                     As[di], Bs[di], out_asm, Ascales[di], Bscales[di]
                 )
+            record_perf("asm", p0)
             di = (di + 1) % BUF_COPY
 
     if gluon_gemm_a8w8_blockscale is not None:
@@ -299,10 +327,13 @@ def test_perf(m, n, k, num_repeats=1, ck_preshuffle=True, require_tuned=True):
         torch.cuda.synchronize()
         di = 0
         for i in range(num_repeats):
-            with pyhip.cudaPerf(flops, rw_bytes, name=f"gluon_kernel_{di}") as p0:
+            with pyhip.cudaPerf(
+                flops, rw_bytes, name=f"gluon_kernel_{di}", verbose=PERF_VERBOSE
+            ) as p0:
                 gluon_gemm_a8w8_blockscale(
                     As[di], Bs[di], Ascales[di], Bscales[di], output_dtype, out_gluon
                 )
+            record_perf("gluon", p0)
             di = (di + 1) % BUF_COPY
 
     # gemm_8wave_fp8bf16fp16 requires  x_scale_t
@@ -331,7 +362,9 @@ def test_perf(m, n, k, num_repeats=1, ck_preshuffle=True, require_tuned=True):
     torch.cuda.synchronize()
     di = 0
     for i in range(num_repeats):
-        with pyhip.cudaPerf(m * n * k * 2, rw_bytes, name=f"asmjit_kernel_{di}") as p0:
+        with pyhip.cudaPerf(
+            m * n * k * 2, rw_bytes, name=f"asmjit_kernel_{di}", verbose=PERF_VERBOSE
+        ) as p0:
             gemm_8wave_fp8bf16fp16(
                 [num_block_N * num_block_M],
                 [64 * 8],
@@ -350,47 +383,74 @@ def test_perf(m, n, k, num_repeats=1, ck_preshuffle=True, require_tuned=True):
                 m,
             )
 
+        record_perf("pyhip", p0)
         di = (di + 1) % BUF_COPY
 
-    if not ck_preshuffle:
-        for split_m in (False, True):
-            out_fly = torch.empty((m, n), dtype=output_dtype, device=x.device)
-            fly_kernel, args = prepare_flydsl(
-                As[0], Bs[0], out_fly, ATscales[0], Bscales[0], split_m
+    for split_m in (False, True):
+        kernel_type = f"flydsl_split_m_{split_m}"
+        out_fly = torch.empty((m, n), dtype=output_dtype, device=x.device)
+        fly_kernel, args = prepare_flydsl(
+            As[0],
+            Bs[0],
+            out_fly,
+            ATscales[0],
+            Bscales[0],
+            split_m,
+            preshuffle_b=ck_preshuffle,
+        )
+        fly_args = [
+            (
+                As[di].view(torch.int8),
+                Bs[di].view(torch.int8),
+                out_fly.view(-1),
+                ATscales[di].view(-1),
+                Bscales[di].view(-1),
+                m,
+                args[-1],
             )
-            fly_args = [
-                (
-                    As[di].view(torch.int8),
-                    Bs[di].view(torch.int8),
-                    out_fly.view(-1),
-                    ATscales[di].view(-1),
-                    Bscales[di].view(-1),
-                    m,
-                    args[-1],
-                )
-                for di in range(BUF_COPY)
-            ]
-            for di in range(BUF_COPY):
+            for di in range(BUF_COPY)
+        ]
+        for di in range(BUF_COPY):
+            fly_kernel(*fly_args[di])
+        torch.cuda.synchronize()
+        di = 0
+        for i in range(num_repeats):
+            with pyhip.cudaPerf(
+                flops,
+                rw_bytes,
+                name=f"flydsl_split_m_{split_m}_{di}",
+                verbose=PERF_VERBOSE,
+            ) as p0:
                 fly_kernel(*fly_args[di])
-            torch.cuda.synchronize()
-            di = 0
-            for i in range(num_repeats):
-                with pyhip.cudaPerf(
-                    flops, rw_bytes, name=f"flydsl_split_m_{split_m}_{di}"
-                ) as p0:
-                    fly_kernel(*fly_args[di])
-                di = (di + 1) % BUF_COPY
-            print(
-                f"{split_m=}, {pyhip.calc_diff(out_torch, out_fly, diff_thr=1e-5)=:.6f}"
-            )
+            record_perf(kernel_type, p0)
+            di = (di + 1) % BUF_COPY
+        diffs[kernel_type] = pyhip.calc_diff(out_torch, out_fly, diff_thr=1e-5)
 
-    print(f"{pyhip.calc_diff(out_torch, out_ck, diff_thr=1e-5)=:.6f}")
+    diffs[aiter_type] = pyhip.calc_diff(out_torch, out_ck, diff_thr=1e-5)
     if ck_preshuffle:
-        print(f"{pyhip.calc_diff(out_torch, out_asm, diff_thr=1e-5)=:.6f}")
+        diffs["asm"] = pyhip.calc_diff(out_torch, out_asm, diff_thr=1e-5)
     if gluon_gemm_a8w8_blockscale is not None:
-        print(f"{pyhip.calc_diff(out_torch, out_gluon, diff_thr=1e-5)=:.2f}")
-    print(f"{pyhip.calc_diff(out_torch, out_jit, diff_thr=1e-5)=:.6f}")
-    # show_diff(out_torch, out_jit)
+        diffs["gluon"] = pyhip.calc_diff(out_torch, out_gluon, diff_thr=1e-5)
+    diffs["pyhip"] = pyhip.calc_diff(out_torch, out_jit, diff_thr=1e-5)
+
+    print(f"\nSummary: M={m}, N={n}, K={k}, {ck_preshuffle=}, {num_repeats=}")
+    rows = [
+        (
+            kernel_type,
+            f"{diffs[kernel_type]:.6e}",
+            f"{peak:.1f}" if peak is not None else "N/A (timing disabled)",
+        )
+        for kernel_type, peak in max_tflops.items()
+    ]
+    headers = ("Kernel type", "Diff", "Max TFLOPS")
+    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(3)]
+    row_format = f"| {{:<{widths[0]}}} | {{:>{widths[1]}}} | {{:>{widths[2]}}} |"
+    print(row_format.format(*headers))
+    print(
+        f"| {'-' * widths[0]} | {'-' * (widths[1] - 1)}: | {'-' * (widths[2] - 1)}: |"
+    )
+    for row in rows:
+        print(row_format.format(*row))
 
 
 if __name__ == "__main__":
@@ -429,8 +489,21 @@ if __name__ == "__main__":
     # pyhip_gemm_a8w8_blockscale:  torch.bfloat16 torch.float8_e4m3fn torch.Size([32, 4096]) torch.float8_e4m3fn torch.Size([1024, 4096]) [128, 128] True
     M, N, K = 4096, 4096, 16384
     # M,N,K=256,256,128
-    txest_gemm(dtypes.bf16, M, N, K, False)
+    # txest_gemm(dtypes.bf16, M, N, K, False)
     test_perf(M, N, K, num_repeats=32, ck_preshuffle=False)
+    test_perf(M, N, K, num_repeats=32, ck_preshuffle=True)
+
+    M, N, K = 16384, 3584, 6144
+    # txest_gemm(dtypes.bf16, M, N, K, False)
+    test_perf(M, N, K, num_repeats=32, ck_preshuffle=False)
+    test_perf(M, N, K, num_repeats=32, ck_preshuffle=True)
+
+    M, N, K = 16384, 3392, 6144
+    # M,N,K=256,256,128
+    # txest_gemm(dtypes.bf16, M, N, K, False)
+    test_perf(M, N, K, num_repeats=32, ck_preshuffle=False)
+    test_perf(M, N, K, num_repeats=32, ck_preshuffle=True)
+
     print(M, N, K)
 """
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
