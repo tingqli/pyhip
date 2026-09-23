@@ -309,106 +309,6 @@ def run_test(
     return is_correct
 
 
-def run_acc():
-    run_test(
-        M=33,
-        N=64,
-        K=512,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=0,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=False,
-    )
-    run_test(
-        M=62,
-        N=384,
-        K=512,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=0,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=False,
-    )
-    run_test(
-        M=75,
-        N=448,
-        K=512,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=0,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=False,
-    )
-    run_test(
-        M=111,
-        N=192,
-        K=512,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=0,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=False,
-    )
-
-    run_test(
-        M=33,
-        N=64,
-        K=512,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=0,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=True,
-    )
-    run_test(
-        M=62,
-        N=384,
-        K=512,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=0,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=True,
-    )
-    run_test(
-        M=75,
-        N=448,
-        K=512,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=0,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=True,
-    )
-    run_test(
-        M=111,
-        N=192,
-        K=512,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=0,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=True,
-    )
-
-
 @pytest.mark.usefixtures("cdna4_device")
 @pytest.mark.parametrize(
     "M,N,K",
@@ -426,7 +326,19 @@ def run_acc():
 def test_accuracy(M, N, K, with_scale, B_MXFP4):
     if with_scale or B_MXFP4:
         pytest.importorskip("aiter")
-    assert run_test(M, N, K, with_scale=with_scale, B_MXFP4=B_MXFP4, perf=False)
+    assert run_test(
+        M=M,
+        N=N,
+        K=K,
+        USE_SWIZZLE=False,
+        PRESHUFFLE_B=False,
+        perf=False,
+        TILEK=TILE_K,
+        permlane_output=PERMLANE_EPILOGUE,
+        store_overlap=STORE_OVERLAP,
+        with_scale=with_scale,
+        B_MXFP4=B_MXFP4,
+    )
 
 
 @pytest.mark.usefixtures("cdna4_device")
@@ -540,7 +452,6 @@ if __name__ == "__main__":
             f"MXFP8 GEMM requires CDNA4 (gfx950); got {props.gcnArchName}"
         )
     torch.manual_seed(0)
-    # run_acc()
     # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False, B_MXFP4=False)
     run_test(
         M=98304,
