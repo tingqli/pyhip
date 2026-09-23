@@ -9,28 +9,25 @@ import torch
 import aiter
 
 from benchmarks.moe import bench_tuned_moe as bench
-from benchmarks.moe.bench_tuned_moe import prepare
 from pyhip import calc_diff
 from pyhip.ops.moe import tuned_moe as tm
+from pyhip.testing.moe import make_moe_runner, measure_moe, prepare_moe, torch_reference
 
 
 @pytest.fixture(autouse=True)
-def _cuda_default():
+def _cuda_default(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("requires ROCm GPU")
     previous = torch.get_default_device()
     torch.set_default_device("cuda")
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")  # 不影响 autotune 配置缓存测试。
     yield
     torch.set_default_device(previous)
 
 
 def _block_call(tokens=17, hidden=512, inter=256, shuffled=(True, True)):
-    args = SimpleNamespace(
-        dtype="fp8", quant="block", seed=8, gate_mode="separated", preshuffle="off",
-        routing="balanced", activation="silu", beta=None, linear_beta=None, swiglu_limit=None,
-    )
     model = dict(HIDDEN_SIZE=hidden, INTER_SIZE=inter, TP=1, E=4, TOPK=2)
-    call, _ = prepare(model, tokens, args)
+    call, _ = prepare_moe(model, tokens, dtype="fp8", quant="block", seed=8, preshuffle="off")
     # 不只覆盖 benchmark 的小输入；扩大幅度以检验 SiLU 和中间激活量化。
     call["hidden_states"].mul_(50)
     from aiter.ops.shuffle import shuffle_weight
@@ -42,12 +39,8 @@ def _block_call(tokens=17, hidden=512, inter=256, shuffled=(True, True)):
 
 
 def _gelu_call(tokens=17, hidden=512, inter=256):
-    args = SimpleNamespace(
-        dtype="bf16", quant="model", seed=8, gate_mode="separated", preshuffle="off",
-        routing="balanced", activation="gelu", beta=None, linear_beta=None, swiglu_limit=None,
-    )
     model = dict(HIDDEN_SIZE=hidden, INTER_SIZE=inter, TP=1, E=4, TOPK=2)
-    call, _ = prepare(model, tokens, args)
+    call, _ = prepare_moe(model, tokens, dtype="bf16", activation="gelu", seed=8, preshuffle="off")
     call["hidden_states"].mul_(100)  # 覆盖 GELU 的非线性区间，而不只测接近零的输入。
     return call
 
@@ -82,15 +75,14 @@ def _native_configs(call):
 
 
 def _fly_call(tokens=4, hidden=512, inter=128, kind="bf16", activation="silu", gate_mode="separated"):
-    args = SimpleNamespace(
+    model = dict(HIDDEN_SIZE=hidden, INTER_SIZE=inter, TP=1, E=4, TOPK=2)
+    call, _ = prepare_moe(model, tokens,
         dtype="mxfp4" if kind == "fp4" else "bf16" if kind == "bf16" else "fp8",
         quant=kind if kind in ("ptpc", "per_tensor") else "model", seed=8,
         gate_mode=gate_mode, preshuffle="on", routing="balanced", activation=activation,
         beta=.5 if activation == "situv2" else None,
         linear_beta=2.0 if activation == "situv2" else None, swiglu_limit=None,
     )
-    model = dict(HIDDEN_SIZE=hidden, INTER_SIZE=inter, TP=1, E=4, TOPK=2)
-    call, _ = prepare(model, tokens, args)
     call["hidden_states"].mul_(50)
     return call
 
@@ -280,6 +272,59 @@ def test_fly_direct_clear_graph(monkeypatch, tokens, hidden, inter, kind, activa
 
 def test_aiter_signature():
     assert inspect.signature(tm.fused_moe) == inspect.signature(tm._aiter_fused_moe)
+
+
+def test_fixed_runner_without_autotune(monkeypatch):
+    call = _fly_call(tokens=1)
+    reference = torch_reference(call)
+    config = dict(_impl="fly_prefill", tile_m_gate=64, tile_m_down=64,
+                  tile_n_gate=128, tile_n_down=128, tile_k_gate=64)
+    runner = make_moe_runner(config)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("fixed kernel tests must not tune, enumerate candidates or fall back to Aiter")
+
+    monkeypatch.setattr(tm, "_configs", unexpected)
+    monkeypatch.setattr(tm, "_autotuned_fmoe", unexpected)
+    monkeypatch.setattr(tm, "_aiter_fused_moe", unexpected)
+    monkeypatch.setattr(tm, "record_dispatch", True)
+    monkeypatch.setattr(tm, "last_dispatch", None)
+    config["_impl"] = "aiter"  # runner 保存静态配置副本，不受调用方后续修改影响。
+    _check(runner(**call), call, reference)
+    assert tm.last_dispatch["_impl"] == "fly_prefill"
+    seen = set()
+
+    def measured(**buffers):
+        seen.add((buffers["w1"].data_ptr(), buffers["output"].data_ptr()))
+        assert buffers["w1"].is_shuffled and buffers["w2"].is_shuffled
+        return runner(**buffers)
+
+    stats = measure_moe(measured, call, reference, copies=2, warmup=1, iters=3)
+    assert stats["correctness"]["status"] == "PASS"
+    assert len(stats["samples_us"]) == 3 and len(seen) == 3
+    assert stats["num_copies"] == 2
+
+
+@pytest.mark.parametrize("dtype, quant, activation, gate_mode", [
+    ("bf16", "model", "silu", "separated"), ("bf16", "model", "gelu", "separated"),
+    ("fp8", "ptpc", "silu", "separated"), ("fp8", "per_tensor", "silu", "separated"),
+    ("fp8", "block", "silu", "separated"), ("mxfp4", "model", "silu", "separated"),
+    ("mxfp4", "model", "situv2", "interleave"),
+])
+def test_shared_preparation(dtype, quant, activation, gate_mode):
+    if dtype == "mxfp4" and not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("MXFP4 requires gfx950")
+    model = dict(HIDDEN_SIZE=256, INTER_SIZE=256, TP=1, E=4, TOPK=2)
+    options = dict(dtype=dtype, quant=quant, activation=activation, gate_mode=gate_mode,
+                   seed=8, preshuffle="on", routing="balanced", beta=None, linear_beta=None,
+                   swiglu_limit=None)
+    call, kind = prepare_moe(model, 3, **options)
+    benchmark_call, benchmark_kind = bench.prepare(model, 3, SimpleNamespace(**options))
+    assert kind == benchmark_kind and tm._torch_reference is torch_reference
+    for name, value in call.items():
+        if isinstance(value, torch.Tensor) and name != "output":
+            assert torch.equal(value.view(torch.uint8), benchmark_call[name].view(torch.uint8)), name
+    assert call["w1"].is_shuffled and call["w2"].is_shuffled
 
 
 def test_fly_bf16_rounding_bits():
@@ -643,7 +688,7 @@ def test_benchmark_dispatch_recording(monkeypatch, failed, previous_record):
     monkeypatch.setattr(tm, "last_dispatch", {"_impl": "stale"})
     monkeypatch.setattr(tm, "_autotuned_fmoe", object())  # benchmark 不能查询 autotuner 内部状态。
     monkeypatch.setattr(bench, "prepare", lambda *args: (call, "block"))
-    monkeypatch.setattr(tm, "_torch_reference", lambda call: torch.zeros_like(call["hidden_states"]))
+    monkeypatch.setattr(bench, "torch_reference", lambda call: torch.zeros_like(call["hidden_states"]))
 
     def aiter_call(**call):
         assert not tm.record_dispatch
@@ -693,7 +738,7 @@ def test_benchmark_accuracy_and_speedup(monkeypatch, capsys, case, check_only, e
                            retune=False, tune_aiter=None, check_only=check_only, rounds=2,
                            copies=2, warmup=0, iters=2)
     monkeypatch.setattr(bench, "prepare", lambda *args: (call, "bf16"))
-    monkeypatch.setattr(tm, "_torch_reference", lambda call: x)
+    monkeypatch.setattr(bench, "torch_reference", lambda call: x)
     monkeypatch.setattr(tm, "record_dispatch", False)
     monkeypatch.setattr(tm, "last_dispatch", None)
     calls = {"aiter": 0, "winner": 0}

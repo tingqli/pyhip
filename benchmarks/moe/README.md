@@ -8,8 +8,8 @@ benchmark worker 或 Ray。默认使用 Aiter 已有配置；`--tune-aiter` 可�
 ## 共享模型配置
 
 [moe_shapes.py](../../src/pyhip/testing/moe_shapes.py) 保存从
-[test_moe.py](../../tests/ops/moe/test_moe.py) 抽出的七个模型配置；原交互测试
-也读取该表，避免两个入口的 shape 漂移。这里是原测试预设，不是模型所有
+[旧 MoE 测试](../../tests/ops/moe/test_moe.py) 抽出的七个模型配置；固定 kernel
+pytest 和 benchmark 都读取该表，避免 shape 漂移。这里是原测试预设，不是模型所有
 checkpoint/TP 的通用定义。只运行单个 TP shard 的 MoE，不包含通信。
 
 | 名称 | model_dim | inter_dim（全局） | TP | inter_dim_tp（实际 kernel） | experts | topk | 默认 FP8 量化 |
@@ -22,10 +22,15 @@ checkpoint/TP 的通用定义。只运行单个 TP shard 的 MoE，不包含通�
 | xiaomi | 6144 | 2048 | 8 | 256 | 384 | 8 | ptpc |
 | h3 | 6144 | 3072 | 8 | 384 | 128 | 4 | ptpc |
 
-**双方始终使用相同的实际维度，不做后端专属 padding。** 原交互测试的
-`entry_common()` 会将 FP8 Aiter 的 I_tp 按 128 对齐、其他后端按 64 对齐；
+**双方始终使用相同的实际维度，不做后端专属 padding。** 已移除的旧交互测试
+`entry_common()` 曾将 FP8 Aiter 的 I_tp 按 128 对齐、其他后端按 64 对齐；
 因此 Hy3 可能变成 Aiter I_tp=256 对 PyHIP I_tp=192。这种数据不能直接当作
 同配置 speedup。新入口保留 I_tp=192；若某后端不支持，记录失败而不是改 shape。
+
+输入生成、独立 Torch 参考、输出检查和多 buffer 测量统一放在
+[pyhip.testing.moe](../../src/pyhip/testing/moe.py)，由 benchmark 和 pytest 共用。
+固定 FlyDSL/ASM kernel 的正确性和性能测试见
+[MoE pytest 说明](../../tests/ops/moe/README.md)，不在本脚本新增后端选择功能。
 
 ## 使用
 

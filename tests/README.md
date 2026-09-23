@@ -31,8 +31,8 @@ python -m pytest tests/ops/moe/test_moe.py -m perf -s
 
 Explicitly performance-only test functions in the GEMM and MoE suites
 are marked `perf` and excluded by default. `-m perf` opts in; `-m ""` removes the
-default marker filter. Correctness tests that also record timing remain intact;
-the marker does not split or rewrite existing test bodies.
+default marker filter. MoE now separates fixed-kernel correctness from timing;
+see [MoE pytest usage](ops/moe/README.md) for individual configurations and node IDs.
 
 The inherited shell runners remain beside their suites. They still clear the
 existing PyHIP JIT cache; use direct pytest commands above when that is unwanted.
@@ -52,15 +52,15 @@ existing PyHIP JIT cache; use direct pytest commands above when that is unwanted
 
 The benchmark scripts that take ordinary function arguments without pytest
 fixtures remain executable scripts, not newly fabricated parametrized tests.
-GRRead keeps its single-file CLI/test design; there is no new shared runner.
+GRRead keeps its existing single-file CLI/test design.
 
 ## Existing limitations
 
 This organization does not repair historical kernels or relax their numerical
-checks. For example, the MoE mixed-dispatch test still refers to the already
-removed `gemm2_8x1_k192` / `gemm2_8x1_k320` modules. Those failures remain visible
-when selected. Optional Gluon convolution tests require a compatible Triton
-installation with Gluon support.
+checks. MoE fixed-kernel tests consume the installed launchers and shared
+[input/reference helpers](../src/pyhip/testing/moe.py); they do not depend on
+autotune candidate selection. Some other suites still require GPU initialization
+during collection. Optional experiments retain their own dependencies.
 
 New reusable kernels belong under `src/pyhip/ops`; tests should consume the
 installed package. Small instruction/layout probes can live in a regression

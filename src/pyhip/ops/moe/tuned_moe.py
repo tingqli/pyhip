@@ -11,7 +11,6 @@ FLYDSL_AUTOTUNE_CONFIG_DIR 用于指定离线配置的导出目录。
 精度阈值沿用 test_moe 的 ``calc_diff <= 0.02``，并非逐元素 2% 相对误差。
 """
 
-import inspect
 import json
 import math
 import os
@@ -25,6 +24,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 from flydsl.autotune import Config, autotune
 
 from pyhip import calc_diff
+from pyhip.testing.moe import torch_reference as _torch_reference
 
 __all__ = ["fused_moe", "record_dispatch", "last_dispatch"]
 
@@ -506,123 +506,6 @@ def _fmoe_wrapper(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
                         _impl, tile_m_gate, tile_m_down, tile_n_gate, tile_n_down,
                         decode_alg, down_path, padding, tile_k_gate)
     raise ValueError(f"unknown MoE implementation: {_impl}")
-
-
-def _reference_weight(weight, scale, expert, kind, interleave, gate):
-    """校验用：还原单个 expert 的权重布局，并用 scale 做反量化。"""
-    value = weight[expert]
-    n, k = value.shape
-    shuffled = bool(getattr(weight, "is_shuffled", False))
-    if kind == "fp4":
-        value = value.view(torch.uint8)
-    if shuffled and interleave and gate:
-        # GUGU 的 gate/up 交错存放，unshuffle 方式与 GGUU 不同。
-        value = value.view(n // 32, 2, k // 64, 4, 16, 16)
-        value = value.permute(1, 0, 4, 2, 3, 5).reshape(n, k)
-    elif shuffled:
-        pack = 16 // value.element_size()
-        value = value.view(n // 16, k // pack, 16, pack)
-        value = value.permute(0, 2, 1, 3).reshape(n, k)
-    if kind == "bf16":
-        return value
-    if kind == "fp4":
-        from aiter.utility import fp4_utils
-
-        cols = k * 2 // 32
-        if shuffled:
-            # 按补齐后的列数定位当前 expert；unshuffle 后再去掉多余的 scale 列。
-            padded = (cols + 7) // 8 * 8
-            scales = scale.view(torch.uint8).reshape(-1)[expert * n * padded:(expert + 1) * n * padded]
-            scales = scales.view(n // 32, padded // 8, 4, 16, 2, 2)
-            order = (5, 0, 3, 1, 4, 2) if interleave and gate else (0, 5, 3, 1, 4, 2)
-            scales = scales.permute(order).reshape(n, padded)[:, :cols]
-        else:
-            scales = scale.view(torch.uint8).reshape(weight.shape[0], n, cols)[expert]
-        value = fp4_utils.mxfp4_to_f32(value.view(torch.float4_e2m1fn_x2)).view(n, cols, 32)
-        return (value * fp4_utils.e8m0_to_f32(scales).unsqueeze(-1)).reshape(n, k * 2).to(torch.bfloat16)
-    value = value.float()
-    if kind == "ptpc":
-        value = value * scale.reshape(weight.shape[0], n, 1)[expert]
-    elif kind == "per_tensor":
-        value = value * scale.reshape(-1)[expert]
-    else:
-        value = (value.view(n // 128, 128, k // 128, 128)
-                 * scale.reshape(weight.shape[0], n // 128, k // 128)[expert, :, None, :, None])
-    # block-scale MFMA 的 scale 乘法在 FP32 中完成，不提前舍入到 BF16。
-    value = value.reshape(n, k)
-    return value if kind == "block" else value.to(torch.bfloat16)
-
-
-def _reference_activation(value, kind, quant_dtype):
-    """模拟 FP8 激活的量化与反量化，避免用未量化的结果做比较。"""
-    if kind not in ("ptpc", "per_tensor", "block"):
-        return value
-    shape = value.shape
-    data = value.float().reshape(-1, 128 if kind == "block" else shape[-1])
-    amax = data.abs().amax() if kind == "per_tensor" else data.abs().amax(dim=-1, keepdim=True)
-    scale = amax / torch.finfo(quant_dtype).max
-    scale = torch.where(scale == 0, 1.0, scale)  # scale 为 0 时用 1 代替，避免全零输入出现 0/0。
-    result = ((data / scale).to(quant_dtype).float() * scale).reshape(shape)
-    return result if kind == "block" else result.to(value.dtype)
-
-
-def _torch_reference(call):
-    """用独立的 Torch 实现校验 MoE，而不是把某个候选的输出作为参考。
-
-    每次只还原一个 expert 的权重，减少显存占用。FP8 对输入和中间结果量化；
-    MXFP4 使用 BF16 激活。A4W4 候选也必须通过相同的参考检查和 calc_diff 阈值。
-    """
-    # 参考计算只接收公共 API 参数；补默认值不进入算子的正常执行路径。
-    bound = inspect.signature(fused_moe).bind(**call)
-    bound.apply_defaults()
-    call = bound.arguments
-    x, w1, w2, ids, weights = (call[name] for name in
-                              ("hidden_states", "w1", "w2", "topk_ids", "topk_weight"))
-    kind = _native_kind(call)
-    if kind is None:
-        raise ValueError("independent MoE validation is unavailable for these inputs")
-    if not ((ids >= 0) & (ids < w1.shape[0])).all().item():
-        raise ValueError("topk_ids contains an out-of-range expert")
-    b, h = x.shape
-    gelu = call["activation"] == aiter.ActivationType.Gelu
-    i, topk = w1.shape[1] // (1 if gelu else 2), ids.shape[1]
-    interleave = call["gate_mode"] == GateMode.INTERLEAVE
-    dtype = x.dtype
-    x = _reference_activation(x, kind, w1.dtype)
-    mid = torch.empty((b, topk, i), dtype=dtype, device=x.device)
-    for expert in range(w1.shape[0]):
-        row, slot = torch.where(ids == expert)
-        if row.numel() == 0:
-            continue
-        weight = _reference_weight(w1, call["w1_scale"], expert, kind, interleave, True)
-        projection = x[row].float() @ weight.float().T
-        act = call["activation"]
-        if gelu:
-            value = torch.nn.functional.gelu(projection)
-        else:
-            gate, up = projection.chunk(2, dim=-1)
-            if act == aiter.ActivationType.Swiglu:
-                limit = 7.0 if call["swiglu_limit"] is None else float(call["swiglu_limit"])
-                gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
-                value = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
-            elif act == aiter.ActivationType.Situv2:
-                beta = 1.0 if call["beta"] is None else float(call["beta"])
-                linear_beta = 1.0 if call["linear_beta"] is None else float(call["linear_beta"])
-                value = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-                value = value * (linear_beta * torch.tanh(up / linear_beta))
-            else:
-                value = torch.nn.functional.silu(gate) * up
-        mid[row, slot] = value.to(dtype)
-    mid = _reference_activation(mid, kind, w1.dtype)
-    result = torch.zeros((b, h), dtype=torch.float32, device=x.device)
-    for expert in range(w2.shape[0]):
-        row, slot = torch.where(ids == expert)
-        if row.numel() == 0:
-            continue
-        weight = _reference_weight(w2, call["w2_scale"], expert, kind, interleave, False)
-        value = (mid[row, slot].float() @ weight.float().T) * weights[row, slot, None]
-        result.index_add_(0, row, value)
-    return result.to(dtype)
 
 
 def _prune_invalid_configs(configs, sig_args):

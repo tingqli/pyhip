@@ -17,6 +17,7 @@ import subprocess
 import sys
 
 from pyhip.testing.moe_shapes import MOE_MODELS
+from pyhip.testing.moe import check_output, measure_moe, moe_types, prepare_moe, torch_reference
 
 
 @contextmanager
@@ -34,22 +35,8 @@ def environment(name, value):
 
 
 def _moe_types(model, args):
-    import aiter
-    import torch
-
-    kind = (model["quant_type"] if args.quant == "model" else args.quant) if args.dtype == "fp8" else args.dtype
-    arch = torch.cuda.get_device_properties().gcnArchName
-    fp8 = torch.float8_e4m3fn if "gfx950" in arch else torch.float8_e4m3fnuz
-    dtype = {"bf16": torch.bfloat16, "fp8": fp8, "mxfp4": torch.float4_e2m1fn_x2}[args.dtype]
-    quant = {"bf16": aiter.QuantType.No, "ptpc": aiter.QuantType.per_Token,
-             "per_tensor": aiter.QuantType.per_Tensor, "block": aiter.QuantType.per_128x128,
-             "mxfp4": aiter.QuantType.per_1x32}[kind]
-    if args.activation == "gelu" and (kind != "bf16" or args.gate_mode != "separated"):
-        raise ValueError("GELU benchmark uses non-gated BF16 weights with --gate-mode separated")
-    activation = {"silu": aiter.ActivationType.Silu, "gelu": aiter.ActivationType.Gelu,
-                  "swiglu": aiter.ActivationType.Swiglu,
-                  "situv2": aiter.ActivationType.Situv2}[args.activation]
-    return kind, dtype, quant, activation
+    return moe_types(model, dtype=args.dtype, quant=args.quant,
+                     activation=args.activation, gate_mode=args.gate_mode)
 
 
 def _aiter_shape(model, tokens, args):
@@ -143,132 +130,16 @@ def tune_aiter(models, args):
         clear_configs()
 
 
-def _make_weight(experts, rows, cols, kind, quant_dtype, generator, shuffled, interleave, gate):
-    """逐个 expert 生成量化权重和 scale，再根据参数决定是否 shuffle。"""
-    import aiter
-    import torch
-    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
-
-    packed = kind == "mxfp4"
-    weight = torch.empty((experts, rows, cols // 2 if packed else cols), dtype=quant_dtype)
-    scale_shape = {"bf16": None, "ptpc": (experts, rows, 1), "per_tensor": (experts,),
-                   "block": (experts, rows // 128, cols // 128),
-                   "mxfp4": (experts * rows, cols // 32)}[kind]
-    scales = (None if scale_shape is None else torch.empty(
-        scale_shape, dtype=torch.uint8 if packed else torch.float32))
-    # 每次只量化一个 expert，避免整套权重的 FP32 临时副本占用太多显存。
-    for expert in range(experts):
-        value = torch.randn((rows, cols), dtype=torch.bfloat16, generator=generator)
-        if kind == "bf16":
-            q, scale = value, None
-        elif kind == "block":
-            # 将权重拆成 128×128 block 分别量化，再恢复 N/K 维度的排列。
-            blocks = value.view(rows // 128, 128, cols // 128, 128).permute(0, 2, 1, 3)
-            q, scale = aiter.get_torch_quant(aiter.QuantType.per_Token)(
-                blocks.reshape(-1, 128 * 128), quant_dtype=quant_dtype)
-            q = q.view(rows // 128, cols // 128, 128, 128).permute(0, 2, 1, 3).reshape(rows, cols)
-            scale = scale.reshape(rows // 128, cols // 128)
-        else:
-            qtype = {"ptpc": aiter.QuantType.per_Token, "per_tensor": aiter.QuantType.per_Tensor,
-                     "mxfp4": aiter.QuantType.per_1x32}[kind]
-            q, scale = aiter.get_torch_quant(qtype)(value, quant_dtype=quant_dtype)
-        if packed:
-            # FP4/E8M0 按字节复制；view 只改变数据的解释方式，不转换数值。
-            weight[expert].view(torch.uint8).copy_(q.view(torch.uint8))
-            scales[expert * rows:(expert + 1) * rows].copy_(scale.view(torch.uint8))
-        else:
-            weight[expert].copy_(q)
-            if scales is not None:
-                scales[expert].copy_(scale.reshape(scales[expert].shape))
-    if packed:
-        scales = scales.view(torch.float8_e8m0fnu)
-    if shuffled:
-        weight = shuffle_weight(weight, is_guinterleave=interleave, gate_up=gate)
-        if packed:
-            scales = shuffle_scale(scales, experts, is_guinterleave=interleave, gate_up=gate)
-    else:
-        weight.is_shuffled = False
-    return weight, scales
-
-
 def prepare(model, tokens, args):
-    """为两个实现准备相同的输入，张量默认分配到 main 设置的 CUDA 设备。"""
-    import torch
-
-    # I 使用 TP 切分后的实际维度，不能只给某个后端做 padding。
-    h, i, e, k = model["HIDDEN_SIZE"], model["INTER_SIZE"] // model["TP"], model["E"], model["TOPK"]
-    arch = torch.cuda.get_device_properties().gcnArchName
-    kind, dtype, quant, activation = _moe_types(model, args)
-    if kind == "block" and (h % 128 or i % 128):
-        raise ValueError("block scales require H and I_tp divisible by 128; no implicit padding is allowed")
-    if kind == "mxfp4" and "gfx950" not in arch:
-        raise ValueError("these MXFP4 candidates require gfx950")
-    # set_default_device 不影响 Generator，仍需显式创建 CUDA generator。
-    generator = torch.Generator(device="cuda").manual_seed(args.seed)
-    x = (torch.randn((tokens, h), dtype=torch.bfloat16, generator=generator) + 1) * .001
-    interleave = args.gate_mode == "interleave"
-    gated = args.activation != "gelu"
-    w1, s1 = _make_weight(e, (2 if gated else 1) * i, h, kind, dtype, generator,
-                          args.preshuffle == "on", interleave, gated)
-    w2, s2 = _make_weight(e, h, i, kind, dtype, generator, args.preshuffle == "on", interleave, False)
-    if args.routing == "balanced":
-        # 重复使用同一组随机 expert 排列，让各 expert 分到的 token 数量尽量均衡。
-        permutation = torch.randperm(e, dtype=torch.int32, generator=generator)
-        ids = permutation.repeat((tokens * k + e - 1) // e)[:tokens * k].reshape(tokens, k).contiguous()
-    else:
-        scores = torch.randn((tokens, e), generator=generator)
-        ids = scores.topk(k, dim=-1).indices.to(torch.int32).contiguous()
-    weights = torch.randn((tokens, k), generator=generator)
-    # 张量必须作为顶层参数传入，run_perftest 才能一起复制权重、scale 和 output。
-    call = dict(hidden_states=x, w1=w1, w2=w2, topk_weight=weights, topk_ids=ids,
-                w1_scale=s1, w2_scale=s2, quant_type=quant, activation=activation,
-                gate_mode=args.gate_mode, beta=args.beta, linear_beta=args.linear_beta,
-                swiglu_limit=args.swiglu_limit, output=torch.empty_like(x))
-    return call, kind
-
-
-def check_output(result, output, reference):
-    """检查返回的 output、shape、dtype 和精度；0.02 不是逐元素 2% 误差。"""
-    import torch
-    from pyhip import calc_diff
-
-    if result is not output or result.shape != reference.shape or result.dtype != reference.dtype:
-        return dict(status="ERROR", reason="output identity/shape/dtype mismatch")
-    if not torch.isfinite(result).all().item():
-        return dict(status="INCORRECT", reason="output contains NaN/Inf")
-    diff = calc_diff(reference, result)
-    if not math.isfinite(diff):
-        return dict(status="INCORRECT", reason="non-finite calc_diff")
-    return dict(status="PASS" if diff <= .02 else "INCORRECT", diff=diff)
+    return prepare_moe(model, tokens, dtype=args.dtype, quant=args.quant, activation=args.activation,
+                       gate_mode=args.gate_mode, preshuffle=args.preshuffle, routing=args.routing,
+                       seed=args.seed, beta=args.beta, linear_beta=args.linear_beta,
+                       swiglu_limit=args.swiglu_limit)
 
 
 def measure(op, call, reference, args, *, allow_incorrect=False):
-    """逐一校验计时输出；Aiter 可允许数值失败，但保留最差检查结果。"""
-    from pyhip import run_perftest
-
-    outputs = {}
-
-    def invoke(**buffers):
-        result = op(**buffers)
-        # 只保留输出供计时后校验，不保留整套权重，也不在计时区间内计算参考结果。
-        output = buffers["output"]
-        outputs[output.data_ptr()] = (result, output)
-        return result
-
-    call["output"].fill_(float("nan"))  # 副本会继承 NaN，用于发现未写入的输出元素。
-    stats = {}
-    _, mean_us = run_perftest(invoke, **call, num_iters=args.iters, num_warmup=args.warmup,
-                             num_copies=args.copies, num_stats=stats)
-    worst = dict(status="PASS", diff=0.0)
-    for result, output in outputs.values():
-        check = check_output(result, output, reference)
-        if check["status"] != "PASS" and not (allow_incorrect and check["status"] == "INCORRECT"):
-            raise RuntimeError(f"timed output failed validation: {check}")
-        if check.get("diff", math.inf) >= worst.get("diff", math.inf):
-            worst = check
-    stats["correctness"] = worst
-    stats["mean_us"] = mean_us
-    return stats
+    return measure_moe(op, call, reference, iters=args.iters, warmup=args.warmup,
+                       copies=args.copies, allow_incorrect=allow_incorrect)
 
 
 def run_case(name, model, tokens, args):
@@ -288,7 +159,7 @@ def run_case(name, model, tokens, args):
         tm.record_dispatch = False
         call, kind = prepare(model, tokens, args)
         row["quant"] = kind
-        reference = tm._torch_reference(call)
+        reference = torch_reference(call)
         if not torch.isfinite(reference).all().item():
             raise ValueError("non-finite reference")
         ops = {"aiter": tm._aiter_fused_moe, "tuned": tm.fused_moe}
