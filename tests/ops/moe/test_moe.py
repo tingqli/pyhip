@@ -1366,30 +1366,26 @@ def test_acc_fly_splitk_2s_down_8x1(monkeypatch, inter_size, quant_type):
 @pytest.mark.parametrize("inter_size", [192, 320])
 @pytest.mark.parametrize("tile_k", [None, 128, 192])
 @pytest.mark.parametrize("weight_quant, act_quant", [("ptpc", None), ("per_tensor", None), ("per_tensor", "ptpc")])
-def test_fly_down_8x1_mixed_dispatch(monkeypatch, inter_size, tile_k, weight_quant, act_quant):
-    import importlib
+def test_fly_down_8x1_mixed_dispatch(inter_size, tile_k, weight_quant, act_quant):
+    import inspect
     from pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm2_8x1 import _build_moe_gemm2_8x1
 
-    module = importlib.import_module(f"pyhip.ops.moe.flydsl.moe_gemm_2stage.gemm2_8x1_k{inter_size}")
-    sentinel = object()
-    calls = []
-
-    def build_mixed(n, topk, padding, *, weight_quant_type, act_quant_type, _task_table=False,
-                    _n_loop=1, _store_cache=2):
-        assert not _task_table
-        assert (_n_loop, _store_cache) == (1, 2)
-        calls.append((n, topk, padding, weight_quant_type, act_quant_type))
-        return sentinel
-
-    monkeypatch.setattr(module, f"_build_moe_gemm2_8x1_k{inter_size}", build_mixed)
     result = _build_moe_gemm2_8x1(
         N=512, K=inter_size, weight_dtype="fp8", weight_quant_type=weight_quant,
         TOPK=4, BLOCK_TILE_SIZE_M=256, BLOCK_TILE_SIZE_N=128,
         stage="down", alg="prefill_1x4", USE_ATOMIC_WRITE=False,
         act_quant_type=act_quant, tile_k=tile_k, down_path="8x1", down_output_padding_bytes=128,
     )
-    assert result is sentinel
-    assert calls == [(512, 4, 128, weight_quant, act_quant or weight_quant)]
+    # K192/K320 已合入同一个 kernel，检查其实际捕获的静态参数，不再 mock 已删模块。
+    kernel = inspect.getclosurevars(result.func).nonlocals["moe_2stage_down_prefill_8x1"]
+    params = inspect.getclosurevars(kernel._func).nonlocals
+    assert callable(result)
+    assert {key: params[key] for key in (
+        "N", "K", "TOPK", "tile_k", "weight_quant_type", "act_quant_type",
+        "down_output_padding_bytes", "_task_table", "_store_cache",
+    )} == dict(N=512, K=inter_size, TOPK=4, tile_k=192, weight_quant_type=weight_quant,
+              act_quant_type=act_quant or weight_quant, down_output_padding_bytes=128,
+              _task_table=False, _store_cache=2)
 
 
 @pytest.mark.parametrize("inter_size", [192, 320])
@@ -1664,103 +1660,70 @@ if __name__ == '__main__':
     prec = [torch.bfloat16, get_fp8type()]
     #test_acc_fly_splitk_2s(batch=[1, 4, 17, 8192], prec=prec, TILE_M_DOWN=TILE_M_DOWN, TILE_M_GATEUP=TILE_M_GATEUP, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
 
+    from pyhip.testing.moe_shapes import MOE_MODELS
+
     hy3_args = {
+        **MOE_MODELS["hy3"],
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":128,
         "down_path":'1x4_64x256',
         "down_output_padding_bytes":128,
-        "HIDDEN_SIZE":4096,
-        "INTER_SIZE":192*8,
-        "TP":8,
-        "E":193,
-        "TOPK":9,
         "run_count":10,
-        "quant_type":'per_tensor'
     }
     qwen35_397B_args = {
+        **MOE_MODELS["qwen35_397B"],
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
         "down_path":'default',
         "down_output_padding_bytes":None,
-        "HIDDEN_SIZE":4096,
-        "INTER_SIZE":512*8,
-        "TP":8,
-        "E":512,
-        "TOPK":10,
         "run_count":10,
-        "quant_type":'ptpc'
     }
     qwen35_397B_k256_args = {
+        **MOE_MODELS["qwen35_397B_k256"],
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
         "down_path":'8x1_compact',
         "down_output_padding_bytes":128,
-        "HIDDEN_SIZE":4096,
-        "INTER_SIZE":256*8,
-        "TP":8,
-        "E":512,
-        "TOPK":10,
         "run_count":10,
-        "quant_type":'ptpc'
     }
     qwen35_35B_args = {
+        **MOE_MODELS["qwen35_35B"],
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
         "down_path":'default',
         "down_output_padding_bytes":None,
-        "HIDDEN_SIZE":2048,
-        "INTER_SIZE":512,
-        "TP":1,
-        "E":256,
-        "TOPK":8,
         "run_count":10,
-        "quant_type":'ptpc'
     }
     qwen35_35B_k256_args = {
+        **MOE_MODELS["qwen35_35B_k256"],
         "TILE_M_DOWN":256,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
         "down_path":'8x1',
         "down_output_padding_bytes":128,
-        "HIDDEN_SIZE":2048,
-        "INTER_SIZE":256,
-        "TP":1,
-        "E":256,
-        "TOPK":8,
         "run_count":10,
-        "quant_type":'ptpc'
     }
     xiaomi_args = {
+        **MOE_MODELS["xiaomi"],
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
         "down_path":'1x4_64x256',
         "down_output_padding_bytes":128,
-        "HIDDEN_SIZE":6144,
-        "INTER_SIZE":256*8,
-        "TP":8,
-        "E":384,
-        "TOPK":8,
         "run_count":10,
-        "quant_type":'ptpc'
     }
     h3_args = {
+        **MOE_MODELS["h3"],
         "TILE_M_DOWN":64,
         "TILE_M_GATEUP":64,
         "TILE_N":256,
         "down_path":'1x4_64x256',
         "down_output_padding_bytes":128,
-        "HIDDEN_SIZE":6144,
-        "INTER_SIZE":384*8,
-        "TP":8,
-        "E":128,
-        "TOPK":4,
         "run_count":10,
-        "quant_type":'ptpc'
     }
     model_args = hy3_args
     model_args = qwen35_397B_k256_args

@@ -404,7 +404,9 @@ def moe_gemm_8wave_g1u1(J, is_input_over_4GB,
             for m in range(nrM):
                 for n in range(nrN):
                     if n == 0:
-                        mfma_fifo_scale[c_index%2, m] = mfma_scaleA[m] * mfma_scaleB[b_index]
+                        # Down N128 的两个 N64 半块共用同一个 128×128 weight scale。
+                        scale_index = b_index * HALF_BLOCK_SIZE_COL // scale_BN
+                        mfma_fifo_scale[c_index%2, m] = mfma_scaleA[m] * mfma_scaleB[scale_index]
                     J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 0], mfma_fifo[fifo_read_id, 0], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
                     J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 1], mfma_fifo[fifo_read_id, 1], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
                     J.v_fmac_f32(mfma_C[mfma_fifo_c_index, m, n, 2], mfma_fifo[fifo_read_id, 2], mfma_fifo_scale[mfma_fifo_c_index % 2,m])
@@ -1058,10 +1060,14 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
 
                 while len(dequant_queue):
                     tc, ts, (tm,tn) = dequant_queue.pop(0)
-                    J.v_fmac_f32(mfma_C[tm, tn, 0], tc[0], ts)
-                    J.v_fmac_f32(mfma_C[tm, tn, 1], tc[1], ts)
-                    J.v_fmac_f32(mfma_C[tm, tn, 2], tc[2], ts)
-                    J.v_fmac_f32(mfma_C[tm, tn, 3], tc[3], ts)
+                    # K128 只有一组 MFMA，尾部几个 C 尚未初始化，不能直接 fmac。
+                    if mfma_C_initialized[tm, tn] == 0:
+                        mfma_C_initialized[tm, tn] = 1
+                        for lane in range(4):
+                            J.v_mul_f32(mfma_C[tm, tn, lane], tc[lane], ts)
+                    else:
+                        for lane in range(4):
+                            J.v_fmac_f32(mfma_C[tm, tn, lane], tc[lane], ts)
 
                 for m in range(nrM):
                     for n in range(0, nrN, 2):

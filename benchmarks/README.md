@@ -14,6 +14,7 @@ Run with the same Python environment used to install PyHIP:
 ```bash
 python benchmarks/moe/test_fused_moe.py --help
 python benchmarks/moe/cmp_perf_fused_moe.py --help
+python benchmarks/moe/bench_tuned_moe.py --list-models
 python benchmarks/conv/test_conv_depthwise.py --help
 python benchmarks/gemm/test_w8a8_block_fp8_linear.py
 ```
@@ -21,6 +22,12 @@ python benchmarks/gemm/test_w8a8_block_fp8_linear.py
 The MoE comparison script locates its sibling CLI relative to itself and uses
 the current Python interpreter. The GEMM trace script points to the relocated
 GEMM regression file; its external profiler/decoder requirements are unchanged.
+
+For same-shape Aiter vs autotuned PyHIP MoE comparisons, use
+[bench_tuned_moe.py](moe/bench_tuned_moe.py). It shares the seven model presets
+with the interactive regression, validates both backends independently, and
+exports raw timings without backend-specific shape padding. See the
+[MoE benchmark guide](moe/README.md) for the protocol and result statuses.
 
 GRRead deliberately keeps its combined CLI and pytest checks in
 [test_gr_read.py](../tests/ops/gr_read/test_gr_read.py). Comparisons that depend on
