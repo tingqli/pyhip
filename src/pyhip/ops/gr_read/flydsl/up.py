@@ -420,6 +420,15 @@ LOG2E = 1.4426950408889634
 def make_decode_up(rows):
     (bm, un, split, waves) = (16, 128, 4, 4)
     bk = 32 if 9 <= rows <= 16 or 29 <= rows <= 31 else 160
+    # Decode T1..32：编译期选择是否跳过 P 的内部 tile padding 读取，不改变 P 布局。
+    # T1..8、T17..31：只读取 row < rows 的四份 partial，内部尾行的 acc 保持零。
+    # T9..15：读取完整 M16 tile（Down 已将内部尾行写零），省去读取时的线程掩码。
+    # T16、T32：没有内部尾行，下面 rows % bm == 0，开关取值不影响读取。
+    # 这是原 H64 decode 调优保留的分段：在减少 P 读取与减少掩码开销之间取舍，
+    # 配合 BK、权重预加载等配置选择；9 不是硬件/数学要求，也不保证跨设备最优。
+    # 每个 split 的间距始终为 padded_rows * R；此开关不会缩小 P 的分配。
+    # CUDA Graph 中 rows 固定为图的输入行数：图 T24、live=17 时，只跳过内部行
+    # [24,32)，仍计算图内的补齐行 [17,24)；replay 时不会根据 live 重选此开关。
     skip_padding = not 9 <= rows <= 16
     preload_weights = rows <= 16
     (hn, hidden_stride) = (un // HC, R + 4)
