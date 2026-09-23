@@ -64,6 +64,7 @@ def _native_kind(call):
         return None
     if call["activation"] not in (
         aiter.ActivationType.Silu, aiter.ActivationType.Swiglu, aiter.ActivationType.Situv2,
+        aiter.ActivationType.Gelu,
     ):
         return None
     if call["activation"] == aiter.ActivationType.Silu and call["swiglu_limit"]:
@@ -99,6 +100,10 @@ def _native_kind(call):
         return None
     if kind is None:
         return None
+    gelu = call["activation"] == aiter.ActivationType.Gelu
+    if gelu and (kind != "bf16" or any(call[name] is not None for name in
+                                      ("swiglu_limit", "beta", "linear_beta"))):
+        return None  # 这里只接入非 gated、无量化的 GELU kernel。
     mode = call["gate_mode"]
     if mode != GateMode.SEPARATED and not (kind == "fp4" and mode == GateMode.INTERLEAVE):
         return None
@@ -110,7 +115,7 @@ def _native_kind(call):
     i *= 2 if kind == "fp4" else 1
     if e <= 0 or h <= 0 or i <= 0 or x.shape[1] != h:
         return None
-    if tuple(w1.shape) != (e, 2 * i, h // (2 if kind == "fp4" else 1)):
+    if tuple(w1.shape) != (e, i if gelu else 2 * i, h // (2 if kind == "fp4" else 1)):
         return None
     if h % 128 or i % 64:
         return None
@@ -149,6 +154,17 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
     configs = [Config(_impl="aiter")]
     if kind is None:
         return configs
+    if options["activation"] == aiter.ActivationType.Gelu:
+        h = hidden_states.shape[1]
+        i, topk = w1.shape[1], topk_ids.shape[1]
+        # 固定 M/N=256，LDS 130 KiB；按整个 bucket 检查 32-bit offset，含 padding/prefetch。
+        if (torch.cuda.get_device_properties(hidden_states.device).gcnArchName.startswith("gfx950")
+                and h % 256 == 0 and i % 256 == 0
+                and options["block_size_M"] in (None, 0, -1, 256)
+                and max((batch_bucket + 2) * topk, 256) * max(h, i) * 2 < 2**32):
+            configs.append(Config(_impl="jit_gelu", tile_m_gate=256, tile_m_down=256,
+                                  tile_n_gate=256, tile_n_down=256))
+        return configs  # 其它 ASM/FlyDSL 候选实现的是 gated 激活，不能混用。
     h, i = hidden_states.shape[1], w1.shape[1] // 2
     separated = options["gate_mode"] == GateMode.SEPARATED
     silu = options["activation"] == aiter.ActivationType.Silu
@@ -298,6 +314,30 @@ def _run_jit(x, w1, w2, ids, weights, options, out, impl, m, gn, dn, block_n):
     else:
         moe_2stage_splitk([h // dn, grid], [64], w2.dtype, topk, i, h, False, m, dn,
                          mid.data_ptr(), w2.data_ptr(), out.data_ptr(), *routing, p2, b, ptpc)
+    return out
+
+
+def _run_gelu(x, w1, w2, ids, weights, out):
+    """复用非 gated GELU 8-wave kernel，直接写入 caller output，不走 Torch fallback。"""
+    from .asm.moe_gemm_8wave_gelu import moe_gemm_8wave_gelu
+
+    b, h = x.shape
+    e, i, _ = w1.shape
+    topk = ids.shape[1]
+    si, sw, se, valid, _ = moe_sorting(ids, weights, e, h, x.dtype, 256, output=out)
+    routing = [t.data_ptr() for t in (si, sw, se, valid)]
+    grid = min(se.numel(), b * topk)
+    mid = torch.empty((b, topk, i), dtype=x.dtype, device=x.device)
+    routes = torch.empty((b, topk, h), dtype=x.dtype, device=x.device)
+    for source, weight, target, up in ((x, w1, mid, True), (mid, w2, routes, False)):
+        n, k = weight.shape[1:]
+        tasks = n // 256 * grid
+        moe_gemm_8wave_gelu(
+            [tasks], [512], not up, False, False, "bf16", 256, 256, n, k,
+            up, bool(getattr(weight, "is_shuffled", False)), topk, *routing,
+            weight.data_ptr(), 0, source.data_ptr(), 0, target.data_ptr(), 0, b, tasks,
+        )
+    torch.sum(routes, dim=1, out=out)
     return out
 
 
@@ -452,6 +492,8 @@ def _fmoe_wrapper(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
     if _impl == "aiter":
         return _aiter_fused_moe(hidden_states, w1, w2, topk_weight, topk_ids, **options)
     out = options["output"]
+    if _impl == "jit_gelu":
+        return _run_gelu(hidden_states, w1, w2, topk_ids, topk_weight, out)
     if _impl in ("jit_batch1", "jit_batch", "jit_splitk", "jit_1stage", "jit_mxfp4"):
         return _run_jit(hidden_states, w1, w2, topk_ids, topk_weight, options, out,
                         _impl, tile_m_down, tile_n_gate, tile_n_down, block_n)
@@ -541,7 +583,8 @@ def _torch_reference(call):
     if not ((ids >= 0) & (ids < w1.shape[0])).all().item():
         raise ValueError("topk_ids contains an out-of-range expert")
     b, h = x.shape
-    i, topk = w1.shape[1] // 2, ids.shape[1]
+    gelu = call["activation"] == aiter.ActivationType.Gelu
+    i, topk = w1.shape[1] // (1 if gelu else 2), ids.shape[1]
     interleave = call["gate_mode"] == GateMode.INTERLEAVE
     dtype = x.dtype
     x = _reference_activation(x, kind, w1.dtype)
@@ -551,19 +594,23 @@ def _torch_reference(call):
         if row.numel() == 0:
             continue
         weight = _reference_weight(w1, call["w1_scale"], expert, kind, interleave, True)
-        gate, up = (x[row].float() @ weight.float().T).chunk(2, dim=-1)
+        projection = x[row].float() @ weight.float().T
         act = call["activation"]
-        if act == aiter.ActivationType.Swiglu:
-            limit = 7.0 if call["swiglu_limit"] is None else float(call["swiglu_limit"])
-            gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
-            value = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
-        elif act == aiter.ActivationType.Situv2:
-            beta = 1.0 if call["beta"] is None else float(call["beta"])
-            linear_beta = 1.0 if call["linear_beta"] is None else float(call["linear_beta"])
-            value = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-            value = value * (linear_beta * torch.tanh(up / linear_beta))
+        if gelu:
+            value = torch.nn.functional.gelu(projection)
         else:
-            value = torch.nn.functional.silu(gate) * up
+            gate, up = projection.chunk(2, dim=-1)
+            if act == aiter.ActivationType.Swiglu:
+                limit = 7.0 if call["swiglu_limit"] is None else float(call["swiglu_limit"])
+                gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+                value = gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+            elif act == aiter.ActivationType.Situv2:
+                beta = 1.0 if call["beta"] is None else float(call["beta"])
+                linear_beta = 1.0 if call["linear_beta"] is None else float(call["linear_beta"])
+                value = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+                value = value * (linear_beta * torch.tanh(up / linear_beta))
+            else:
+                value = torch.nn.functional.silu(gate) * up
         mid[row, slot] = value.to(dtype)
     mid = _reference_activation(mid, kind, w1.dtype)
     result = torch.zeros((b, h), dtype=torch.float32, device=x.device)
@@ -697,8 +744,9 @@ def fused_moe(
 ):
     """兼容 Aiter 的 MoE 推理接口；传入 output 时，会写入并返回该 tensor。
 
-    目前只对 BF16 输入、带 gate、无 bias/EP 的组合调优。gfx950 的 FP8
-    block-scale SiLU 路径支持两份权重各自的 raw/shuffled 布局；其他组合的
+    对 BF16 输入、无 bias/EP 的组合调优：SiLU/SwiGLU/SiTUv2 使用 gated
+    结构，GELU 使用非 gated BF16 权重。gfx950 的 FP8 block-scale SiLU
+    和 BF16 GELU 路径支持两份权重各自的 raw/shuffled 布局；其它组合的
     原始布局或混合布局只能尝试 Aiter。候选都需通过 Torch 参考检查。
     其他 API 功能直接转交 Aiter，不在这里额外校验。若 is_shuffled 属性丢失
     （例如重新包装成 Parameter），就按原始布局处理，不猜测实际存储方式。

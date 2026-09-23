@@ -44,7 +44,10 @@ def _moe_types(model, args):
     quant = {"bf16": aiter.QuantType.No, "ptpc": aiter.QuantType.per_Token,
              "per_tensor": aiter.QuantType.per_Tensor, "block": aiter.QuantType.per_128x128,
              "mxfp4": aiter.QuantType.per_1x32}[kind]
-    activation = {"silu": aiter.ActivationType.Silu, "swiglu": aiter.ActivationType.Swiglu,
+    if args.activation == "gelu" and (kind != "bf16" or args.gate_mode != "separated"):
+        raise ValueError("GELU benchmark uses non-gated BF16 weights with --gate-mode separated")
+    activation = {"silu": aiter.ActivationType.Silu, "gelu": aiter.ActivationType.Gelu,
+                  "swiglu": aiter.ActivationType.Swiglu,
                   "situv2": aiter.ActivationType.Situv2}[args.activation]
     return kind, dtype, quant, activation
 
@@ -72,7 +75,7 @@ def _aiter_shape(model, tokens, args):
     return dict(token=fm.get_padded_M(tokens), model_dim=h, inter_dim=i,
                 expert=model["E"], topk=model["TOPK"], act_type=activation, dtype=dtypes.bf16,
                 q_dtype_a=q_dtype_a, q_dtype_w=dtype, q_type=fm.quant_remap.get(quant, quant),
-                use_g1u1=True, doweight_stage1=False)
+                use_g1u1=args.activation != "gelu", doweight_stage1=False)
 
 
 @contextmanager
@@ -83,6 +86,8 @@ def tune_aiter(models, args):
 
     shapes = [_aiter_shape(MOE_MODELS[name], tokens, args) for name in models for tokens in args.tokens]
     shapes = list({tuple(shape.values()): shape for shape in shapes}.values())
+    if any(not shape["use_g1u1"] for shape in shapes):
+        raise ValueError("the official Aiter tuner currently supports G1U1 only, not non-gated GELU (G1U0)")
     directory = args.tune_aiter.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     untuned, tuned = directory / "untuned.csv", directory / "tuned.csv"
@@ -202,7 +207,9 @@ def prepare(model, tokens, args):
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     x = (torch.randn((tokens, h), dtype=torch.bfloat16, generator=generator) + 1) * .001
     interleave = args.gate_mode == "interleave"
-    w1, s1 = _make_weight(e, 2 * i, h, kind, dtype, generator, args.preshuffle == "on", interleave, True)
+    gated = args.activation != "gelu"
+    w1, s1 = _make_weight(e, (2 if gated else 1) * i, h, kind, dtype, generator,
+                          args.preshuffle == "on", interleave, gated)
     w2, s2 = _make_weight(e, h, i, kind, dtype, generator, args.preshuffle == "on", interleave, False)
     if args.routing == "balanced":
         # 重复使用同一组随机 expert 排列，让各 expert 分到的 token 数量尽量均衡。
@@ -226,7 +233,7 @@ def check_output(result, output, reference):
     from pyhip import calc_diff
 
     if result is not output or result.shape != reference.shape or result.dtype != reference.dtype:
-        return dict(status="INCORRECT", reason="output identity/shape/dtype mismatch")
+        return dict(status="ERROR", reason="output identity/shape/dtype mismatch")
     if not torch.isfinite(result).all().item():
         return dict(status="INCORRECT", reason="output contains NaN/Inf")
     diff = calc_diff(reference, result)
@@ -235,8 +242,8 @@ def check_output(result, output, reference):
     return dict(status="PASS" if diff <= .02 else "INCORRECT", diff=diff)
 
 
-def measure(op, call, reference, args):
-    """使用 run_perftest 计时，结束后逐一校验实际使用的输出 buffer。"""
+def measure(op, call, reference, args, *, allow_incorrect=False):
+    """逐一校验计时输出；Aiter 可允许数值失败，但保留最差检查结果。"""
     from pyhip import run_perftest
 
     outputs = {}
@@ -252,10 +259,14 @@ def measure(op, call, reference, args):
     stats = {}
     _, mean_us = run_perftest(invoke, **call, num_iters=args.iters, num_warmup=args.warmup,
                              num_copies=args.copies, num_stats=stats)
+    worst = dict(status="PASS", diff=0.0)
     for result, output in outputs.values():
         check = check_output(result, output, reference)
-        if check["status"] != "PASS":
+        if check["status"] != "PASS" and not (allow_incorrect and check["status"] == "INCORRECT"):
             raise RuntimeError(f"timed output failed validation: {check}")
+        if check.get("diff", math.inf) >= worst.get("diff", math.inf):
+            worst = check
+    stats["correctness"] = worst
     stats["mean_us"] = mean_us
     return stats
 
@@ -268,6 +279,7 @@ def run_case(name, model, tokens, args):
     row = dict(model=name, tokens=tokens, model_dim=model["HIDDEN_SIZE"],
                inter_dim=model["INTER_SIZE"], tp=model["TP"], inter_dim_tp=model["INTER_SIZE"] // model["TP"],
                experts=model["E"], topk=model["TOPK"], dtype=args.dtype, gate_mode=args.gate_mode,
+               use_g1u1=args.activation != "gelu",
                preshuffle=args.preshuffle, routing=args.routing, seed=args.seed,
                activation=args.activation, swiglu_limit=args.swiglu_limit, beta=args.beta,
                linear_beta=args.linear_beta, correctness={}, rounds={"aiter": [], "tuned": []}, winner=None)
@@ -296,12 +308,12 @@ def run_case(name, model, tokens, args):
                 row["correctness"][backend] = dict(status="ERROR", reason=str(error))
             finally:
                 tm.record_dispatch = False  # 正式计时不记录 dispatch。
-        if any(check["status"] != "PASS" for check in row["correctness"].values()):
+        if row["correctness"]["aiter"]["status"] == "ERROR" or row["correctness"]["tuned"]["status"] != "PASS":
             row["status"] = "NOT_COMPARABLE"
-            row["reason"] = "Performance comparison skipped: both backends must pass accuracy validation."
+            row["reason"] = "Performance comparison skipped: Aiter must execute with valid output metadata and winner must pass accuracy validation."
             return row
         if args.check_only:
-            row["status"] = "CHECK_PASS"
+            row["status"] = "CHECK_PASS" if row["correctness"]["aiter"]["status"] == "PASS" else "AITER_INCORRECT"
             return row
 
         # 相同参数已经完成调优；关闭强制搜索，计时只运行已选中的配置。
@@ -310,9 +322,12 @@ def run_case(name, model, tokens, args):
                 # 轮流采用 A→T 和 T→A 的顺序，减小固定先后顺序对结果的影响。
                 order = ("aiter", "tuned") if round_id % 2 == 0 else ("tuned", "aiter")
                 for backend in order:
-                    stats = measure(ops[backend], call, reference, args)
+                    stats = measure(ops[backend], call, reference, args, allow_incorrect=backend == "aiter")
                     row["rounds"][backend].append(stats)
-        flops = 6 * tokens * model["TOPK"] * model["HIDDEN_SIZE"] * row["inter_dim_tp"]
+                    check = stats["correctness"]
+                    if check.get("diff", math.inf) >= row["correctness"][backend].get("diff", math.inf):
+                        row["correctness"][backend] = check
+        flops = (6 if row["use_g1u1"] else 4) * tokens * model["TOPK"] * model["HIDDEN_SIZE"] * row["inter_dim_tp"]
         for backend in ops:
             # 汇总所有轮次的样本后再取中位数，不单独挑最快的一轮。
             samples = [t for run in row["rounds"][backend] for t in run["samples_us"]]
@@ -321,7 +336,9 @@ def run_case(name, model, tokens, args):
                                 min_us=min(samples), max_us=max(samples),
                                 effective_tflops=flops / (median * 1e6))
         row["speedup"] = row["aiter"]["median_us"] / row["tuned"]["median_us"]
-        row["status"] = "PASS"
+        row["status"] = "PASS" if row["correctness"]["aiter"]["status"] == "PASS" else "AITER_INCORRECT"
+        if row["status"] == "AITER_INCORRECT":
+            row["reason"] = "Aiter accuracy failed; speedup compares timings only, not equivalent correct results."
     except Exception as error:
         row.update(status="ERROR", reason=f"{type(error).__name__}: {error}")
         torch.cuda.synchronize()
@@ -331,16 +348,21 @@ def run_case(name, model, tokens, args):
 
 
 def print_table(rows):
-    """打印性能对比表；失败时说明原因，不计算加速比。"""
-    print("\n| model | M | H / I_tp / E / topk | check A/T | Aiter us | tuned us | speedup | winner | status |")
-    print("|---|---:|---|---|---:|---:|---:|---|---|")
+    """并列展示精度与时延；Aiter 数值失败的比较明确标注。"""
+    print("\n| model | M | H / I_tp / E / topk | check A/T | Aiter diff | winner diff | Aiter us | tuned us | speedup | winner | status |")
+    print("|---|---:|---|---|---:|---:|---:|---:|---:|---|---|")
     for row in rows:
         times = [f"{row[b]['median_us']:.2f}" if b in row else "—" for b in ("aiter", "tuned")]
         checks = "/".join(row["correctness"].get(b, {}).get("status", "—") for b in ("aiter", "tuned"))
+        diffs = []
+        for backend in ("aiter", "tuned"):
+            check = row["correctness"].get(backend, {})
+            diffs.append(f"{check['diff']:.6g}" if "diff" in check else
+                         "NaN/Inf" if check.get("status") == "INCORRECT" else "—")
         speed = f"{row['speedup']:.3f}x" if row.get("speedup") is not None else "—"
         winner = (row.get("winner") or {}).get("_impl", "—")
         dims = " / ".join(str(row[k]) for k in ("model_dim", "inter_dim_tp", "experts", "topk"))
-        print(f"| {row['model']} | {row['tokens']} | {dims} | {checks} | {times[0]} | {times[1]} | {speed} | {winner} | {row['status']} |")
+        print(f"| {row['model']} | {row['tokens']} | {dims} | {checks} | {diffs[0]} | {diffs[1]} | {times[0]} | {times[1]} | {speed} | {winner} | {row['status']} |")
     for row in rows:
         label = f"{row['model']} M={row['tokens']}"
         if row.get("reason"):
@@ -359,7 +381,8 @@ def main(argv=None):
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 4, 64])
     parser.add_argument("--dtype", choices=("bf16", "fp8", "mxfp4"), default="fp8")
     parser.add_argument("--quant", choices=("model", "ptpc", "per_tensor", "block"), default="model")
-    parser.add_argument("--activation", choices=("silu", "swiglu", "situv2"), default="silu")
+    parser.add_argument("--activation", choices=("silu", "swiglu", "situv2", "gelu"), default="silu",
+                        help="gelu selects non-gated (G1U0) BF16 MoE; other activations use G1U1")
     parser.add_argument("--swiglu-limit", type=float)
     parser.add_argument("--beta", type=float)
     parser.add_argument("--linear-beta", type=float)
@@ -389,6 +412,13 @@ def main(argv=None):
         parser.error("interleave requires preshuffled MXFP4 weights")
     if args.dtype != "fp8" and args.quant != "model":
         parser.error("--quant only overrides FP8 quantization")
+    if args.activation == "gelu":
+        if args.dtype != "bf16" or args.gate_mode != "separated":
+            parser.error("--activation gelu requires --dtype bf16 --gate-mode separated (non-gated MoE)")
+        if any(value is not None for value in (args.swiglu_limit, args.beta, args.linear_beta)):
+            parser.error("GELU does not use swiglu-limit/beta/linear-beta")
+        if args.tune_aiter:
+            parser.error("--tune-aiter does not support GELU G1U0; the official tuner only tunes G1U1")
     if args.tune_aiter and args.preshuffle != "on":
         parser.error("--tune-aiter requires --preshuffle on; the official tuner benchmarks shuffled weights")
     if args.output is not None and args.output.exists():

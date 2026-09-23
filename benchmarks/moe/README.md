@@ -59,6 +59,11 @@ python3 benchmarks/moe/bench_tuned_moe.py \
   --models qwen35_35B_k256 --tokens 1 64 1024 --dtype fp8 --quant block \
   --retune --output /tmp/moe-block.json
 
+# BF16 非 gated GELU（G1U0）：沿用模型维度，不代表原模型使用 GELU
+python3 benchmarks/moe/bench_tuned_moe.py \
+  --models qwen35_35B_k256 --tokens 1 64 1024 --dtype bf16 --activation gelu \
+  --retune --check-only --output /tmp/moe-gelu.json
+
 # 独立检查 BF16，或 MXFP4 的 caller 布局与激活参数
 python benchmarks/moe/bench_tuned_moe.py \
   --models qwen35_35B_k256 --tokens 4 --dtype bf16 --check-only
@@ -78,6 +83,16 @@ python benchmarks/moe/bench_tuned_moe.py \
   persistent Down，激活在两次 GEMM 前分别量化，scale 使用转置存储。
   普通 8-wave 路径支持 raw/shuffled 权重；persistent Down 只用于 shuffled w2。
   gfx942 不加入这些 gfx950 专用 kernel，仍使用已有 split-K/Aiter 候选。
+- `--activation gelu --dtype bf16` 使用 G1U0：W1 为 `[E, I_tp, H]`，不含 gate；
+  W2 为 `[E, H, I_tp]`。`jit_gelu` 复用现有 8-wave kernel，固定 M/N tile=256，
+  要求 gfx950、H/I_tp 按256对齐、`--gate-mode separated`，并满足32-bit buffer
+  地址范围；两份权重分别支持 raw/shuffled。实际 token 数不必是256的倍数。
+  GELU kernel 使用 tanh 近似，仍对独立的默认 Torch GELU 参考检查，不放宽阈值。
+  不加入旧 wrapper 中的 MXFP4 Torch fallback，也不把 gated kernel 当作 G1U0。
+  **当前官方 Aiter tuner 只支持 G1U1，所以 GELU 不可与 `--tune-aiter` 同用。**
+  当前 Aiter 的 BF16 G1U0 路径在已测 shape 上不通过精度；benchmark 仍会搜索和
+  验证 `jit_gelu`，并显示双方 diff、时延和加速比，状态标记 `AITER_INCORRECT`。
+  此时加速比仅比较执行时间，不代表两条实现都给出了正确结果。
 - `--routing balanced` 沿用旧测试的随机 expert permutation 循环分配；
   `random` 对每个 token 使用随机 top-k。双方共用相同路由和 routing weights。
 - `--copies 0` 使用 `pyhip.run_perftest` 内部约4GB复制预算；可显式指定份数。
@@ -122,20 +137,25 @@ python benchmarks/moe/bench_tuned_moe.py \
    保留 clone 后的 `is_shuffled`。默认按 Aiter→tuned、tuned→Aiter 两个 block
    交错；每个实现各自使用内部复制池，**不是同地址逐样本配对测量**。
 6. 每轮检查所有实际使用的输出副本，输出在 clone 前填 NaN，不重跑另一个
-  结果代替校验。`run_perftest` 返回均值，摘要从全部原始样本算中位数。
+  结果代替校验。Aiter 数值失败（包括 NaN/Inf）不阻止计时，仍记录检查结果；
+  winner 数值失败或任何一方执行/输出元数据错误时不生成加速比。
+  `run_perftest` 返回均值，摘要从全部原始样本算中位数。
 7. `speedup = Aiter_median_us / tuned_median_us`；大于1表示本次 tuned API 更快。
-   有效计算量为 `6*M*topk*model_dim*inter_dim_tp`，不含 gate/quant/通信 FLOPs。
+  gated 模式有效计算量为 `6*M*topk*model_dim*inter_dim_tp`；非 gated GELU 为
+  `4*M*topk*model_dim*inter_dim_tp`，均不含激活/quant/通信 FLOPs。
    表内 winner 可能是 Aiter；这种情况仍测整个 tuned API 的调度开销。
 
 FlyDSL 调优器自己的计时与最终多buffer测量不完全相同。因此 winner 是“调优器
-选中的配置”，不保证最终所有地址/路由分布中都最快。不通过精度的路径不报告
-性能倍数；未支持形状不擅自 padding、换 dtype 或放宽阈值。
+选中的配置”，不保证最终所有地址/路由分布中都最快。Aiter 精度失败时仍比较
+时延，但保留失败标记；winner 仍须通过原精度阈值。未支持形状不擅自 padding、换 dtype。
 同样，Aiter 的最佳行来自官方 tuner 的输入生成、精度门槛和计时方式；即使开启
-`--tune-aiter`，仍必须通过这里独立的 Torch 参考和实际计时输出检查。
+`--tune-aiter`，仍执行这里独立的 Torch 参考和实际计时输出检查。
 
 ## 输出
 
-运行结束打印一张汇总表，包括 `Aiter us`、`tuned us`、`speedup`、winner 和状态。
+运行结束打印一张汇总表，包括 `Aiter diff`、`winner diff`、`Aiter us`、`tuned us`、
+`speedup`、winner 和状态。diff 取计时前检查及各轮输出副本中的最大值；非有限输出
+显示 `NaN/Inf`，无法检查显示 `—`，JSON 不写入非标准的 NaN/Infinity 数值。
 可选 JSON 只保存运行参数、模型维度、精度结果、配置和计时样本。
 
 winner 来自 tuned MoE 的实际 dispatch，不读取 FlyDSL 私有缓存。模块的
@@ -150,5 +170,6 @@ winner 来自 tuned MoE 的实际 dispatch，不读取 FlyDSL 私有缓存。模
 |---|---|
 | CHECK_PASS | 两条实现精度通过，只做正确性，不做性能对照 |
 | PASS | 两条实现和实际计时输出校验通过，显示延迟和加速比 |
-| NOT_COMPARABLE | 至少一条实现精度/执行失败，不生成 speedup |
+| AITER_INCORRECT | Aiter 数值检查失败，winner 通过；除 check-only 外仍显示延迟和 speedup，退出码保持非零 |
+| NOT_COMPARABLE | 执行/输出元数据检查失败，或 winner 精度失败，不生成 speedup |
 | ERROR | 数据准备、参考或调用错误；reason 中保留异常 |
