@@ -62,7 +62,8 @@ class GRReadPrefill:
             _check_buffer(weight, (K * R,), torch.bfloat16, self.device, name)
         props = torch.cuda.get_device_properties(self.device)
         if props.gcnArchName.split(':', 1)[0] != 'gfx942':
-            raise ValueError('GRReadPrefill currently targets gfx942')
+            warnings.warn(f"GR read prefill was tuned on gfx942; running on {props.gcnArchName}",
+                          RuntimeWarning, stacklevel=2)
         self.w_down, self.w_up = packed_down, packed_up
         self.config = select_prefill_config(rows, props.multi_processor_count)
         self.down_config = self.config[:4]
@@ -158,7 +159,8 @@ class GRReadDecode:
         self.rows, self.device = rows, packed_down.device
         props = torch.cuda.get_device_properties(self.device)
         if props.gcnArchName.split(":")[0] != "gfx942":
-            warnings.warn(f"GR read decode was tuned on gfx942; running on {props.gcnArchName}", RuntimeWarning)
+            warnings.warn(f"GR read decode was tuned on gfx942; running on {props.gcnArchName}",
+                          RuntimeWarning, stacklevel=2)
         self.w_down, self.w_up = packed_down, packed_up
         self.padded_rows = (rows + 15) // 16 * 16
         self.partial = torch.empty(4 * self.padded_rows * R, dtype=torch.float32, device=self.device)

@@ -2,7 +2,7 @@
 
 当前实现是两阶段 BF16 prefill：Down GEMM + SiLU 写入 P，Up GEMM + sigmoid + 四路加权归约写入 Y。T48–512 的调优已进入正式源码；调用方无需导入实验目录，也无需手动选择 kernel。
 
-支持 ROCm gfx942。固定维度为 C=4、H=2560、R=320、K=10240；本轮性能配置在 MI308X / 80CU 上验证。`GRReadPrefill` 与 `GRReadDecode` 共用权重预处理，调用方按阶段选择对象；decode 的独立测试方法见第 6 节。
+固定维度为 C=4、H=2560、R=320、K=10240；当前实现与性能配置在 ROCm gfx942、MI308X / 80CU 上验证。其他 ROCm 架构只发出 warning 后继续尝试执行，测试不会仅因架构不同而跳过；实际编译、执行或精度错误仍会正常报错。`GRReadPrefill` 与 `GRReadDecode` 共用权重预处理，调用方按阶段选择对象；decode 的独立测试方法见第 6 节。
 
 ## 1. 安装与最小接入
 
@@ -99,7 +99,7 @@ python3 tests/ops/gr_read/bench_gr_read_compare.py --gpu 3 --sglang-root /opt/sg
 
 `--check-only` 或单独指定 `--scope down/up/total` 时只做精度检查；pytest 也只检查正确性。精度失败会在进入性能阶段前停止。性能采样继续复用 `bench_gr_read_compare.py`：decode 精度默认为 2 对权重 / seed303，性能仍为 100 对权重 / seed707；`test_gr_read.py` 的 `--decode-weights` / `--decode-seed` 只作用于精度。需要调整性能采样参数时使用单独的 benchmark 入口。显式提供 `--output` 时，同一 JSONL 用 `stage=accuracy/performance` 区分默认流程的两部分记录。
 
-Benchmark 的 prefill 表分别测 Down、Up、Total 和 Torch compile 完整调用。使用原 `cudaPerf`，默认 10 组独立 buffer、各阶段 2 次预热、10 个样本取中位数；保留逐阶段采样顺序，Torch compile 接在 Total 后面。这张表使用各阶段整组样本的中位数，不是交错 A/B 测量。Total 直接测量。权重打包、对象构造、首次编译、参考与校验不计时。门禁前固定静置 2 秒，单次查询要求 GPU use≤5%、VRAM≤20%、PTL Enabled/VECTOR,F8；失败停止并保留数据。没有修改设备设置或剔除长尾。
+Benchmark 的 prefill 表分别测 Down、Up、Total 和 Torch compile 完整调用。使用原 `cudaPerf`，默认 10 组独立 buffer、各阶段 2 次预热、10 个样本取中位数；保留逐阶段采样顺序，Torch compile 接在 Total 后面。这张表使用各阶段整组样本的中位数，不是交错 A/B 测量。Total 直接测量。权重打包、对象构造、首次编译、参考与校验不计时。门禁前固定静置 2 秒，GPU use≤5%、VRAM≤20% 仍为硬性条件，失败停止并保留数据。PTL Enabled/VECTOR,F8 作为已验证环境的提示：查询结果中的状态或格式不同，只发 warning 后继续；PTL 查询逻辑和查询失败时的报错方式沿用原版。没有修改设备设置或剔除长尾。
 
 表格新增 `Torch compile us / TFLOPS` 和 `Speedup`，其中 **Speedup = Torch compile Total / PyHIP Total**，大于 1 表示 PyHIP 更快；显式传入 `--output` 时，结果及全部样本写入 JSONL。默认显示阶段初始化、逐 batch 准备/检查/时延进度，最后打印两张完整表，不自动创建结果文件或目录。进度实时刷新，均在计时区间外；`--verbose` 可额外显示硬件和详细正确性信息。TFLOPS 两边都按 `4*T*10240*320` 的有效 GEMM 工作量计算。
 
@@ -112,6 +112,15 @@ Benchmark 的 prefill 表分别测 Down、Up、Total 和 Torch compile 完整调
 两个入口都支持 `--phase all/decode/prefill`，默认 all。指定一个 phase 时可用 `--rows` / `--batches`；同时运行两阶段时用 `--decode-rows` 和 `--prefill-rows`。Decode 默认覆盖全部 T1–32，benchmark 的 Down/Up/Total/SGLang 分别捕获 Graph；prefill 的 Graph 开关与采样方式保持原样。
 
 T48–512 的正式优化前后对照已在 30 档、普通调用下验证：选中的两段实现全部快于该版 SGLang torch.compile，范围为 1.06–4.19×。这是特定硬件和固定协议的测量，不能将少量样本 smoke 的时延替代完整数据。迁入公共接口后的同址配对复测中，30 档时延变化中位数为 −0.095%，最大增加 0.451%；完整报告和原始数据记录在本机 `qwen3.8-flash-next-doc` 的 45/46 号文档。
+
+### 算法速查入口
+
+[test_gr_read_algorithms.py](test_gr_read_algorithms.py) 集中展示按 rows 选择 decode / prefill 的入口，打印各档 Down/Up 配置和 P 布局，用 `torch.allclose` 检查 P/Y。默认选取 22 个代表性 rows；所有 case 共用一次 preshuffle 后的权重。两条路径均为普通调用，只检查精度，不捕获 CUDA Graph、不测性能，也不依赖 SGLang。
+
+```bash
+python3 tests/ops/gr_read/test_gr_read_algorithms.py
+python3 tests/ops/gr_read/test_gr_read_algorithms.py --gpu 2 --rows 1 24 32 33 64 512 4k
+```
 
 ## 5. 有效优化方法
 

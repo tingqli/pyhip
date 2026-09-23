@@ -163,7 +163,9 @@ def validate_hardware(snapshot):
         raise RuntimeError(f"GPU{snapshot['gpu']} busy: use={use}%, VRAM={vram}%; stop without retry")
     formats = {part.strip().upper() for part in str(limit.get("ptl_format")).split(",")}
     if str(limit.get("ptl_state")).lower() != "enabled" or formats != {"VECTOR", "F8"}:
-        raise RuntimeError("Timing requires PTL Enabled/VECTOR,F8; no hardware settings were changed")
+        warnings.warn(f"Expected PTL Enabled/VECTOR,F8; continuing with "
+                      f"{limit.get('ptl_state')}/{limit.get('ptl_format')}",
+                      RuntimeWarning, stacklevel=2)
 
 
 def tensor_address(tensor, *, output=False):
@@ -468,7 +470,9 @@ def check_hardware(snapshot, *, entry=False):
     if (entry and (use != 0 or memory != 0)) or use > 5 or memory > 20:
         raise RuntimeError(f"GPU occupied: {snapshot}; benchmark stopped")
     if limit.get("ptl_state") != "Enabled" or limit.get("ptl_format") != "VECTOR,F8":
-        raise RuntimeError(f"expected PTL Enabled/VECTOR,F8: {snapshot}")
+        warnings.warn(f"Expected PTL Enabled/VECTOR,F8; continuing with "
+                      f"{limit.get('ptl_state')}/{limit.get('ptl_format')}",
+                      RuntimeWarning, stacklevel=2)
 
 
 def time_graph(graph, calls, samples):
@@ -609,9 +613,10 @@ def run_decode(args, emit):
               "Use --sglang-root to add the SGLang comparison.", flush=True)
     dep = dependencies(args.sglang_root)
     torch, _, _, _, check, prefill, _, _ = dep
+    if torch.version.hip is None or not torch.cuda.is_available():
+        raise RuntimeError('decode comparison requires a ROCm GPU')
+    prefill.warn_architecture(torch, 0)
     props = torch.cuda.get_device_properties(0)
-    if torch.version.hip is None or props.gcnArchName.split(':')[0] != 'gfx942':
-        raise RuntimeError('decode comparison targets ROCm gfx942')
     source_paths = [Path(__file__), Path(__file__).with_name('test_gr_read.py'),
                     *(REPO / 'src/pyhip/ops/gr_read/flydsl').glob('*.py')]
     if args.sglang_root is not None:

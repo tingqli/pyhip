@@ -67,6 +67,13 @@ def use_checkout_package():
     spec.loader.exec_module(module)
 
 
+def warn_architecture(torch, device=None):
+    arch = torch.cuda.get_device_properties(device).gcnArchName
+    if arch.split(":", 1)[0] != "gfx942":
+        warnings.warn(f"GR read was validated on gfx942; running on {arch}",
+                      RuntimeWarning, stacklevel=2)
+
+
 @cache
 def dependencies():
     # 延迟导入：CLI先选GPU；--help和参数解析不初始化Torch，也不依赖pytest。
@@ -77,9 +84,7 @@ def dependencies():
     from pyhip.testing import cudaPerf
     if torch.version.hip is None or not torch.cuda.is_available():
         raise RuntimeError("ROCm GPU required")
-    props = torch.cuda.get_device_properties(0)
-    if not props.gcnArchName.startswith("gfx942"):
-        raise RuntimeError("GRRead currently requires gfx942")
+    warn_architecture(torch, 0)
 
     @torch.compile(fullgraph=True)
     def _mix_reference(x, w_down, w_up):
@@ -529,8 +534,7 @@ if "pytest" in sys.modules:
         torch = pytest.importorskip("torch")
         if torch.version.hip is None or not torch.cuda.is_available():
             pytest.skip("ROCm GPU required")
-        if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx942"):
-            pytest.skip("gfx942 required")
+        warn_architecture(torch)
         try:
             check_batch(rows, argparse.Namespace(seed=131))
         finally:
@@ -541,8 +545,7 @@ if "pytest" in sys.modules:
         torch = pytest.importorskip("torch")
         if torch.version.hip is None or not torch.cuda.is_available():
             pytest.skip("ROCm GPU required")
-        if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx942"):
-            pytest.skip("gfx942 required")
+        warn_architecture(torch)
         use_checkout_package()
         return torch
 
@@ -602,8 +605,9 @@ if "pytest" in sys.modules:
 
     def test_prepared_multiple_devices():
         torch = require_rocm()
-        if torch.cuda.device_count() < 2 or not torch.cuda.get_device_properties(1).gcnArchName.startswith("gfx942"):
-            pytest.skip("two gfx942 devices required")
+        if torch.cuda.device_count() < 2:
+            pytest.skip("two ROCm devices required")
+        warn_architecture(torch, 1)
         from pyhip.ops.gr_read.flydsl import GRReadPrefill, prepare_weights
 
         with torch.inference_mode(), torch.cuda.device(0):
@@ -630,8 +634,7 @@ if "pytest" in sys.modules:
         torch = pytest.importorskip('torch')
         if torch.version.hip is None or not torch.cuda.is_available():
             pytest.skip('ROCm required')
-        if not torch.cuda.get_device_properties(0).gcnArchName.startswith('gfx942'):
-            pytest.skip('gfx942 required')
+        warn_architecture(torch, 0)
         use_checkout_package()
         from pyhip.ops.gr_read.flydsl import GRReadDecode, GRReadPrefill, prepare_weights
         from pyhip.ops.gr_read.flydsl.common import prepare_weights as shared_prepare
@@ -651,7 +654,8 @@ if "pytest" in sys.modules:
                 graph.replay()
                 assert_decode_close(decode.output, decode_reference(x[:16], wd, wu), 'decode shared packing')
                 assert_decode_close(prefill(x), decode_reference(x, wd, wu), 'prefill shared packing')
-            if torch.cuda.device_count() >= 2 and torch.cuda.get_device_properties(1).gcnArchName.startswith('gfx942'):
+            if torch.cuda.device_count() >= 2:
+                warn_architecture(torch, 1)
                 second = GRReadDecode(16, pd.to('cuda:1'), pu.to('cuda:1'))
                 actual = second(x[:16].to('cuda:1')).to('cuda:0')
                 torch.testing.assert_close(actual, decode.output, rtol=0, atol=0)

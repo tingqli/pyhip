@@ -13,7 +13,7 @@ tests/
 ```
 
 Do not infer CPU-only behavior from `codegen`: these tests launch GPU kernels.
-GRRead requires gfx942; other cases have their existing architecture gates.
+GRRead warns outside gfx942 and continues; other cases have their existing architecture gates.
 
 ## Running
 
