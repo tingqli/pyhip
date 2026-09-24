@@ -1,7 +1,8 @@
 # GFX950 FlyDSL GEMM 优化与测试
 
-本文只记录当前`experiments/gemm/flydsl/test_gemm.py::compile_gemm_950`仍在使用的优化、可复现测试
-方法和最终数据。历史失败方案、外部实现对照和已淘汰阶段数据不属于本文。
+本文只记录当前gfx950 GEMM路径仍在使用的优化、可复现测试方法和最终数据。当前代码入口位于
+`src/pyhip/ops/gemm/flydsl/`，对应的correctness / opt-in perf测试位于
+`tests/ops/gemm/`。历史失败方案、外部实现对照和已淘汰阶段数据不属于本文。
 
 ## 1. 测试范围
 
@@ -42,30 +43,25 @@ rocm-smi -d 0 \
 
 ### 2.2 功能测试
 
-运行pytest、完整长循环矩阵和两K-tile prologue/tail矩阵：
+运行当前保留的pytest入口：
 
 ```bash
-python3 experiments/gemm/flydsl/compare_gemm_950.py validate \
-  --full-size 4096 --full-k 4096 \
-  --full-launches 10 --two-tile-launches 20 \
-  --csv /tmp/gemm950_functional.csv
+python -m pytest tests/ops/gemm/test_cdna4.py -q
+python -m pytest tests/ops/gemm/test_4wave_cdna4_slicing.py -q
+python -m pytest tests/ops/gemm/test_gemm_fp8_blockscale_8w.py -q
+python -m pytest tests/ops/gemm/test_gemm_mxfp8_4w.py -q
 ```
 
-该命令执行：
-
-1. `pytest experiments/gemm/flydsl/test_gemm.py -k gemm_950 -q`；
-2. 16个`wave x tile x dtype`配置的`4096^3`长循环，每项10次；
-3. 相同16个配置的两K-tile版本，BF16 K=128、FP8 K=256，每项20次。
+当前树中不再保留`compare_gemm_950.py`这样的统一驱动；功能覆盖现在分别落在上述测试文件中。
 
 每次launch前用NaN填充C，并对整个输出与Torch reference做比较：BF16使用
 `rtol=0.1, atol=0.03`，FP8使用`rtol=0.05, atol=0.5`。
 
 ### 2.3 汇编与同步验证
 
-```bash
-python3 experiments/gemm/flydsl/compare_gemm_950.py verify-8wave \
-  --asm /tmp/gemm_kernel_0/21_final_isa.s
-```
+当前树中不再保留`verify-8wave` CLI。需要汇编与同步验证时，直接在本地编译
+`pyhip.ops.gemm.flydsl.gemm_fp8_blockscale_8w.compile_gemm_fp8_8wave`生成ISA
+dump，并按下述合同检查。
 
 默认`256x256`汇编合同：
 
@@ -83,37 +79,17 @@ python3 experiments/gemm/flydsl/compare_gemm_950.py verify-8wave \
 所有case先通过完整输出检查，再预热20轮，执行24组、每组100次的位置平衡计时；case
 每轮循环移位，完成一轮位置集合后反向。
 
-完整tile sweep：
+当前保留的性能入口为opt-in pytest / 直接脚本执行：
 
 ```bash
-python3 experiments/gemm/flydsl/compare_gemm_950.py benchmark \
-  --m 4096 --n 4096 --k-values 4096 \
-  --waves all --dtype all \
-  --tiles 128x128,128x256,256x128,256x256 \
-  --jit-layout none --warmup 20 --rounds 24 --iterations 100 \
-  --csv /tmp/gemm950_tile_sweep.csv
+python -m pytest tests/ops/gemm/test_gemm_fp8_blockscale_8w.py -m perf -q
+python -m pytest tests/ops/gemm/test_gemm_mxfp8_4w.py -m perf -q
+python tests/ops/gemm/test_gemm_fp8_blockscale_8w.py
+python tests/ops/gemm/test_gemm_mxfp8_4w.py
 ```
 
-默认FlyDSL/JIT对照：
-
-```bash
-python3 experiments/gemm/flydsl/compare_gemm_950.py benchmark \
-  --m 4096 --n 4096 --k-values 4096 \
-  --waves 8 --dtype fp8 --tiles 256x256 \
-  --jit-layout both --warmup 20 --rounds 24 --iterations 100 \
-  --csv /tmp/gemm950_default_vs_jit.csv
-```
-
-K sweep：
-
-```bash
-python3 experiments/gemm/flydsl/compare_gemm_950.py benchmark \
-  --m 4096 --n 4096 \
-  --k-values 1024,2048,4096,8192,16384 \
-  --waves all --dtype all --tiles 256x256 \
-  --jit-layout both --warmup 20 --rounds 24 --iterations 100 \
-  --csv /tmp/gemm950_k_sweep.csv
-```
+历史tile sweep、FlyDSL/JIT对照和K sweep结果来自已删除的`compare_gemm_950.py`
+驱动；当前代码树保留的是上述可执行测试入口和本文记录的数据。
 
 ## 3. 当前采用的优化方法
 

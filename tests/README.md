@@ -7,7 +7,7 @@ tests/
   codegen/asm/       Assembly JIT, IR, instruction, and layout regression tests
   ops/
     conv/           Installed pointwise convolution
-    gemm/           Installed ASM GEMM variants and split-K
+    gemm/           Installed ASM/FlyDSL GEMM variants and split-K
     gr_read/        GRRead correctness tests and its existing benchmark CLI
     moe/            Installed MoE implementations and cross-backend tests
 ```
@@ -29,10 +29,21 @@ python -m pytest tests/ops/gemm/test_cdna4.py -q
 python -m pytest tests/ops/moe/test_moe.py -m perf -s
 ```
 
-Explicitly performance-only test functions in the GEMM and MoE suites
+Explicitly performance-only test functions in the GEMM, MLP, and MoE suites
 are marked `perf` and excluded by default. `-m perf` opts in; `-m ""` removes the
 default marker filter. Correctness tests that also record timing remain intact;
 the marker does not split or rewrite existing test bodies.
+
+The FlyDSL [8-wave block-scale FP8](ops/gemm/test_gemm_fp8_blockscale_8w.py)
+and [4-wave MXFP8/MXFP4](ops/gemm/test_gemm_mxfp8_4w.py) suites import kernels
+from [pyhip.ops.gemm.flydsl](../src/pyhip/ops/gemm/flydsl/). Their GPU tests
+require ROCm CDNA4 (`gfx950`) and skip on other devices. The kernel factories
+also reject non-CDNA4 compilation targets; explicit offline `gfx950` targets
+remain supported. Factories cache launchers by compilation target and static
+configuration, expose `cache_info()` / `cache_clear()`, and validate the target
+even on cache hits. MX quantization and weight-preshuffle cases additionally
+require AIter. Select either file directly for correctness, or add `-m perf -s`
+to run its rotating-buffer benchmarks.
 
 The inherited shell runners remain beside their suites. They still clear the
 existing PyHIP JIT cache; use direct pytest commands above when that is unwanted.
@@ -43,6 +54,7 @@ existing PyHIP JIT cache; use direct pytest commands above when that is unwanted
 |---|---|
 | Core tests | [codegen/asm](codegen/asm/) |
 | Parameterized GEMM regressions | [ops/gemm](ops/gemm/) |
+| Experimental gfx950 8-wave block-scale / 4-wave MXFP8 GEMM | [kernels](../src/pyhip/ops/gemm/flydsl/) and [tests](ops/gemm/) |
 | Pointwise convolution | [test_conv_pointwise.py](ops/conv/test_conv_pointwise.py) |
 | GRRead, README, and local collection config | [ops/gr_read](ops/gr_read/) |
 | Cross-backend MoE regression suite | [test_moe.py](ops/moe/test_moe.py) |

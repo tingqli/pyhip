@@ -24,8 +24,8 @@ GEMM regression file; its external profiler/decoder requirements are unchanged.
 
 GRRead deliberately keeps its combined CLI and pytest checks in
 [test_gr_read.py](../tests/ops/gr_read/test_gr_read.py). Comparisons that depend on
-experimental kernels remain with those kernels, for example
-[compare_gemm_950.py](../experiments/gemm/flydsl/compare_gemm_950.py).
+relocated GEMM kernels now live in the opt-in tests under
+[tests/ops/gemm](../tests/ops/gemm/).
 
 Benchmarks may allocate large buffers, compile kernels, or require external
 tools. There is no new scheduling, process isolation, hardware management, or
