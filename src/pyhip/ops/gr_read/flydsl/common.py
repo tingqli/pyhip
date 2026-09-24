@@ -54,6 +54,12 @@ def select_down_n_splits(rows, compute_units):
 def select_down_config(rows, compute_units):
     """Return (block_m, num_waves, n_splits, block_k) without runtime autotuning."""
     n_splits = select_down_n_splits(rows, compute_units)
+    if compute_units == 80 and 33 <= rows <= 512:
+        if rows <= 128:
+            return 16, 2, 10, 1024
+        if rows <= 256:
+            return 16, 2, 10, 512
+        return 32, 4, 5, 512
     # 80CU同址32..2048的BK128优于正式基线；中间行数是插值，非逐shape最优保证。
     # 4096/8192保留M64的数据复用；其它CU仍用原M64/BK64模型。
     if compute_units == 80 and 0 < rows <= 2048:
@@ -61,7 +67,39 @@ def select_down_config(rows, compute_units):
     return 64, 4, n_splits, 64
 
 
+def select_up_config(rows, compute_units):
+    """Return (M tile, N splits), retaining the original M256 path outside 33..512."""
+    n_splits = select_n_splits(rows, compute_units)
+    if compute_units == 80 and 33 <= rows <= 256:
+        return (64 if rows <= 128 else 128), n_splits
+    return 256, n_splits
+
+
+def select_prefill_config(rows, compute_units):
+    """Return the complete, fixed prefill configuration used during preparation."""
+    dm, dw, dn, dk = select_down_config(rows, compute_units)
+    um, un = select_up_config(rows, compute_units)
+    swizzle = (7 if rows <= 128 else 6) if compute_units == 80 and 33 <= rows <= 512 else 3
+    return dm, dw, dn, dk, um, un, swizzle
+
+
 def preshuffle_weight(weight):
     """Convert BF16 [N,K] to [N/16,K/32,4,16,8] during weight preparation only."""
     n, k = weight.shape
     return weight.detach().reshape(n // 16, 16, k // 32, 4, 8).permute(0, 2, 3, 1, 4).contiguous().view(-1)
+
+
+def prepare_weights(w_down, w_up):
+    """Pack original BF16 matrices once; the result is shared by all T and both GR read backends."""
+    import torch
+
+    if w_down.shape != (R, K) or w_up.shape != (K, R):
+        raise ValueError("expected W_down[320,10240] and W_up[10240,320]")
+    if w_down.dtype != torch.bfloat16 or w_up.dtype != torch.bfloat16:
+        raise ValueError("GR read weights must be BF16")
+    if w_down.device != w_up.device:
+        raise ValueError("weights must share a device")
+    interleaved = w_up.detach().reshape(C, H // 64, 2, 4, 2, 4, R).permute(
+        1, 0, 2, 4, 3, 5, 6
+    ).contiguous().reshape(K, R)
+    return preshuffle_weight(w_down), preshuffle_weight(interleaved)

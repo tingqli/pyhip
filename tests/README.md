@@ -13,7 +13,7 @@ tests/
 ```
 
 Do not infer CPU-only behavior from `codegen`: these tests launch GPU kernels.
-GRRead requires gfx942; other cases have their existing architecture gates.
+GRRead warns outside gfx942 and continues; other cases have their existing architecture gates.
 
 ## Running
 
@@ -64,7 +64,10 @@ existing PyHIP JIT cache; use direct pytest commands above when that is unwanted
 
 The benchmark scripts that take ordinary function arguments without pytest
 fixtures remain executable scripts, not newly fabricated parametrized tests.
-GRRead keeps its single-file CLI/test design; there is no new shared runner.
+GRRead's [test_gr_read.py](ops/gr_read/test_gr_read.py) CLI defaults to all accuracy
+checks followed by separate decode and prefill performance tables. Use
+`--check-only` for accuracy alone; pytest never starts timing. The samplers and
+standalone benchmark CLI remain in [bench_gr_read_compare.py](ops/gr_read/bench_gr_read_compare.py).
 
 ## Existing limitations
 

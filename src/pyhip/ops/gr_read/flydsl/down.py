@@ -16,33 +16,39 @@ GROUPS = K // BK // GROUP_STEPS
 
 
 @cache
-def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64):
-    """Specialize by tile shape; the launcher receives the actual rows at runtime.
+def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64, swizzle_shift=3):
+    """Build a complete-K Down with tunable M/N tiles, waves, BK and LDS swizzle.
 
-    N1/N2/N4/N5 cover disjoint 320/160/80/64-channel slices without split-K or reduction launches.
-    N5 also supports M32 with two/four waves and M16 with two waves.
-    Automatic dispatch selects M32/W4/N5/BK128 for calibrated small batches.
-    Other batches retain M64/W4/N1 or N2 with BK64 and full K10240 reduction.
-    Two-wave tiles remain explicit experimental candidates, not automatic choices.
-    Callers must provide positive rows and P[rows, R]; tail stores are bounded by the actual row count.
+    N1/N2/N4 retain their original M64/W4/BK64 configurations.
+    N5/N10/N20 allow smaller M tiles and one, two or four waves.
+    BK64..1024 choices are bounded by thread-copy coverage and 64 KiB LDS.
+    K groups and scheduling budgets follow the actual tile/request counts.
+    The original FP32 accumulation -> BF16 -> FP32 SiLU -> BF16 order is preserved.
+    Runtime rows bound all tail loads/stores; weight packing is unchanged.
     """
-    if n_splits not in (1, 2, 4, 5):
-        raise ValueError("n_splits must be 1, 2, 4 or 5")
-    if (block_m, num_waves) not in ((64, 4), (32, 4), (32, 2), (16, 2)):
-        raise ValueError("expected M64/W4, M32/W4, M32/W2 or M16/W2")
-    if block_m != 64 and n_splits != 5:
-        raise ValueError("small-M tiles currently require n_splits=5")
-    if block_k not in (64, 128):
-        raise ValueError("block_k must be 64 or 128")
-    if block_k != 64 and (block_m, num_waves, n_splits) != (32, 4, 5):
-        raise ValueError("BK128 currently requires M32/W4/N5")
-    BM = block_m
-    BK = block_k
+    if n_splits not in (1, 2, 4, 5, 10, 20):
+        raise ValueError('unsupported N split')
+    if block_m not in (16, 32, 64) or num_waves not in (1, 2, 4):
+        raise ValueError('unsupported M/waves')
+    if block_k not in (64, 128, 256, 512, 1024):
+        raise ValueError('unsupported BK')
+    BM, BK = block_m, block_k
+    assert BM * BK * 4 <= 65536 and BK // 8 <= num_waves * 64
+    GROUP_STEPS = 8
+    while (K // BK) % GROUP_STEPS:
+        GROUP_STEPS //= 2
     GROUPS = K // BK // GROUP_STEPS
+    SWIZZLE_SHIFT = (BK.bit_length() - 4) if swizzle_shift is None else swizzle_shift
     THREADS = num_waves * 64
     BN = R // n_splits
-    N_WAVES, M_WAVES = ({1: (4, 1), 2: (2, 2), 4: (1, 4), 5: (4, 1)}[n_splits]
-                        if BM == 64 else (num_waves, 1))
+    if n_splits in (1, 2, 4):
+        assert (BM, num_waves, BK) == (64, 4, 64)
+        N_WAVES, M_WAVES = {1: (4, 1), 2: (2, 2), 4: (1, 4)}[n_splits]
+    else:
+        N_WAVES = min(num_waves, BN // 16)
+        M_WAVES = num_waves // N_WAVES
+    assert BM % (16 * M_WAVES) == 0 and BN % (16 * N_WAVES) == 0
+    STORE_MFMA = 2 if n_splits <= 5 else 1
     A_REQUESTS = BM * BK // (THREADS * 8)
     A_LDS_READS = BM // M_WAVES // 8 * (BK // 64)
     VMEM_REQUESTS = A_REQUESTS + BN // N_WAVES // 8 * (BK // 64)
@@ -103,7 +109,7 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64):
         a_source = a_gcopy.partition_S(a_tiles)
         a_transfer = fx.make_fragment_like(a_source[None, None, None, 0])
         shared = fx.SharedAllocator().allocate(Shared).peek()
-        swizzle = fx.make_composed_layout(fx.static(fx.SwizzleType.get(3, 3, 3)),
+        swizzle = fx.make_composed_layout(fx.static(fx.SwizzleType.get(3, 3, SWIZZLE_SHIFT)),
                                            fx.make_ordered_layout((BM, BK), (1, 0)))
         a_lds = [fx.make_view(pointer, swizzle) for pointer in (shared.a0.ptr, shared.a1.ptr)]
         a_scopy = fx.make_tiled_copy(copy_s, tv, fx.make_tile(threads_m, BK)).get_slice(tid)
@@ -148,18 +154,19 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64):
                         rocdl.sched_mfma(4)
                 else:
                     # M64的N4/N5保持原配额；小M按实际A搬运条数调整，K顺序不变。
-                    # 每条A LDS store留两条MFMA，其余按真实VMEM请求数分配。
+                    # 按N分片为每条A LDS store留1或2条MFMA，其余按真实VMEM请求数分配。
                     for request in range_constexpr(VMEM_REQUESTS):
                         ds_reads = A_LDS_READS // VMEM_REQUESTS + (request < A_LDS_READS % VMEM_REQUESTS)
                         if const_expr(ds_reads):
                             rocdl.sched_dsrd(ds_reads)
                         rocdl.sched_vmem(1)
-                        count = ((request + 1) * (STAGE_MFMA - 2 * A_REQUESTS) // VMEM_REQUESTS
-                                 - request * (STAGE_MFMA - 2 * A_REQUESTS) // VMEM_REQUESTS)
-                        rocdl.sched_mfma(count)
+                        count = ((request + 1) * (STAGE_MFMA - STORE_MFMA * A_REQUESTS) // VMEM_REQUESTS
+                                 - request * (STAGE_MFMA - STORE_MFMA * A_REQUESTS) // VMEM_REQUESTS)
+                        if const_expr(count > 0):
+                            rocdl.sched_mfma(count)
                 for _ in range_constexpr(A_REQUESTS):
                     rocdl.sched_dswr(1)
-                    rocdl.sched_mfma(2)
+                    rocdl.sched_mfma(STORE_MFMA)
             rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.sched_barrier(0)
             fx.gpu.barrier()
@@ -196,3 +203,90 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64):
         gr_read_down(X, W, P, rows).launch(grid=(m_tiles, R // BN, 1), block=(THREADS, 1, 1), stream=stream)
 
     return launch_down
+
+
+# Decode T1..32: global split-K=4, compact FP32 P[4,rows,R].
+@cache
+def make_decode_down(rows):
+    (bm, bk, waves) = (16 if rows <= 16 else 32, 128, 4)
+    (split, dn) = (4, 16)
+    prefetch_unroll = 2 if rows <= 25 else 1
+    iterations = K // waves // bk // split
+    m_tiles = (rows + bm - 1) // bm
+
+    @fx.struct
+    class DownShared:
+        partials: fx.Array[fx.Float32, bm * dn * waves, 16]
+
+    @flyc.kernel
+    def down_wave_splitk_pipeline(X: fx.Tensor, W: fx.Tensor, A: fx.Tensor):
+        tid = fx.thread_idx.x
+        (lane, wave) = (tid % 64, tid // 64)
+        (im, jn, sk) = fx.block_idx
+        x = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(X), fx.make_layout((rows, K), (K, 1))), max_size=False)
+        w_layout = fx.make_layout(((16, R // 16), (8, 4, K // 32)), ((8, 16 * K), (1, 128, 512)))
+        w = fx.rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(W), w_layout), max_size=False)
+        shared = fx.SharedAllocator().allocate(DownShared).peek()
+        partials = shared.partials.view(fx.make_layout((bm, dn, waves), (dn, 1, bm * dn)))
+        a_tile = fx.flat_divide(w, fx.make_tile(dn, bk))[None, None, jn, None]
+        b_tile = fx.flat_divide(x, fx.make_tile(bm, bk))[None, None, im, None]
+        c_tile = fx.select(partials[None, None, wave], [1, 0])
+        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+        tiled = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (0, 0, 0)), (None, None, fx.make_layout((4, 4, 2), (1, 8, 4))))
+        thr = tiled.thr_slice(lane)
+        copy_ab = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        copy_c = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+        ca = fx.make_tiled_copy_A(copy_ab, tiled).get_slice(lane)
+        cb = fx.make_tiled_copy_B(copy_ab, tiled).get_slice(lane)
+        cc = fx.make_tiled_copy_C(copy_c, tiled).get_slice(lane)
+        fa = thr.make_fragment_A(a_tile[None, None, 0])
+        fb = thr.make_fragment_B(b_tile[None, None, 0])
+        fc = thr.make_fragment_C(c_tile)
+        (ga, gb) = (ca.partition_S(a_tile), cb.partition_S(b_tile))
+        (ra, rb) = (ca.retile(fa), cb.retile(fb))
+        fc.fill(0)
+        next_a = thr.make_fragment_A(a_tile[None, None, 0])
+        next_b = thr.make_fragment_B(b_tile[None, None, 0])
+        (next_ra, next_rb) = (ca.retile(next_a), cb.retile(next_b))
+        first = sk * (K // split // bk) + wave
+        fx.copy(copy_ab, ga[None, None, None, first], ra)
+        fx.copy(copy_ab, gb[None, None, None, first], rb)
+        for (ki, state) in range(fx.Index(1), fx.Index(iterations), fx.Index(prefetch_unroll), init=[fa.load(), fb.load(), fc.load()]):
+            fa.store(state[0])
+            fb.store(state[1])
+            fc.store(state[2])
+            kt = sk * (K // split // bk) + fx.Int32(ki) * waves + wave
+            fx.copy(copy_ab, ga[None, None, None, kt], next_ra)
+            fx.copy(copy_ab, gb[None, None, None, kt], next_rb)
+            fx.gemm(mma, fc, fa, fb, fc)
+            if fx.const_expr(prefetch_unroll == 2):
+                second = kt + waves
+                fx.copy(copy_ab, ga[None, None, None, second], ra)
+                fx.copy(copy_ab, gb[None, None, None, second], rb)
+                fx.gemm(mma, fc, next_a, next_b, fc)
+                (carried_a, carried_b) = (fa.load(), fb.load())
+            else:
+                (carried_a, carried_b) = (next_a.load(), next_b.load())
+            result = (yield [carried_a, carried_b, fc.load()])
+        fa.store(result[0])
+        fb.store(result[1])
+        fc.store(result[2])
+        fx.gemm(mma, fc, fa, fb, fc)
+        fx.copy(copy_c, cc.retile(fc), cc.partition_D(c_tile))
+        fx.gpu.barrier()
+        out = fx.make_view(fx.get_iter(A), fx.make_layout((rows, R, split), (R, 1, rows * R)))
+        for i in range_constexpr((bm * dn + waves * 64 - 1) // (waves * 64)):
+            index = tid + i * waves * 64
+            if index < bm * dn:
+                (row, col) = (index // dn, index % dn)
+                # 计算仍覆盖完整 M tile，但紧凑 P 只存实际 rows，不能写进下一份 split。
+                if im * bm + row < rows:
+                    total = fx.Float32(0.0)
+                    for s in range_constexpr(waves):
+                        total = total + fx.memref_load(partials, (row, col, s))
+                    fx.memref_store(total, out, (im * bm + row, jn * dn + col, sk))
+
+    @flyc.jit
+    def launch(X: fx.Tensor, W: fx.Tensor, A: fx.Tensor, stream: fx.Stream):
+        down_wave_splitk_pipeline(X, W, A).launch(grid=(m_tiles, R // dn, split), block=(waves * 64, 1, 1), stream=stream)
+    return launch
