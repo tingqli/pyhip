@@ -195,6 +195,9 @@ def run_case(name, model, tokens, args):
                 order = ("aiter", "tuned") if round_id % 2 == 0 else ("tuned", "aiter")
                 for backend in order:
                     stats = measure(ops[backend], call, reference, args, allow_incorrect=backend == "aiter")
+                    samples = stats["samples_us"]
+                    if not samples or any(not math.isfinite(t) or t <= 0 for t in samples):
+                        raise RuntimeError(f"{backend}: timing samples must be finite and positive")
                     row["rounds"][backend].append(stats)
                     check = stats["correctness"]
                     if check.get("diff", math.inf) >= row["correctness"][backend].get("diff", math.inf):

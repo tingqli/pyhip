@@ -5,10 +5,12 @@
 benchmark worker 或 Ray。默认使用 Aiter 已有配置；`--tune-aiter` 可在对照前
 统一运行官方 Aiter tuner。
 
+已有一次运行的[性能快照](perf-snapshot-350.md)，包含失败状态和完整 winner 配置；
+只作该次运行的参考，不代表所有设备和输入的性能保证。
+
 ## 共享模型配置
 
-[moe_shapes.py](../../src/pyhip/testing/moe_shapes.py) 保存从
-[旧 MoE 测试](../../tests/ops/moe/test_moe.py) 抽出的七个模型配置；固定 kernel
+[moe_shapes.py](../../src/pyhip/testing/moe_shapes.py) 保存八个模型/量化配置；固定 kernel
 pytest 和 benchmark 都读取该表，避免 shape 漂移。这里是原测试预设，不是模型所有
 checkpoint/TP 的通用定义。只运行单个 TP shard 的 MoE，不包含通信。
 
@@ -19,7 +21,8 @@ checkpoint/TP 的通用定义。只运行单个 TP shard 的 MoE，不包含通�
 | qwen35_397B_k256 | 4096 | 2048 | 8 | 256 | 512 | 10 | ptpc |
 | qwen35_35B | 2048 | 512 | 1 | 512 | 256 | 8 | ptpc |
 | qwen35_35B_k256 | 2048 | 256 | 1 | 256 | 256 | 8 | ptpc |
-| xiaomi | 6144 | 2048 | 8 | 256 | 384 | 8 | ptpc |
+| mimo_ptpc | 6144 | 2048 | 8 | 256 | 384 | 8 | ptpc |
+| mimo_block | 6144 | 2048 | 8 | 256 | 384 | 8 | block |
 | h3 | 6144 | 3072 | 8 | 384 | 128 | 4 | ptpc |
 
 **双方始终使用相同的实际维度，不做后端专属 padding。** 已移除的旧交互测试
@@ -88,9 +91,10 @@ python benchmarks/moe/bench_tuned_moe.py \
   gfx950 的 block-scale SiLU 候选包括原生 FP8 8-wave 两阶段路径及小 K
   persistent Down，激活在两次 GEMM 前分别量化，scale 使用转置存储。
   普通 8-wave 路径支持 raw/shuffled 权重；persistent Down 只用于 shuffled w2。
-  权重量化的 `jit_splitk` 不执行 A1×128 激活量化，因此不参与 block 调优；
-  底层 kernel 和固定路径测试仍保留。gfx942 不加入 gfx950 专用 kernel，
-  block 模式只保留 Aiter 候选，仍须通过独立参考检查。
+  `jit_splitk` 也可作为 A16W8 block 候选：两份权重已 shuffle、SiLU/separated、
+  H 按512对齐时，kernel 反量化权重并直接消费 BF16 输入及中间激活，不执行
+  A1×128 激活量化。gfx942 可搜索该路径和 Aiter，但不加入 gfx950 专用 8-wave。
+  两种路径都须通过相同的独立参考和原误差门槛。
 - gfx950 的 BF16 SiLU 也加入 `jit_8wave`，共用普通/persistent 8-wave 流程，
   不量化激活；两份权重分别遵循 `is_shuffled`。persistent Down 支持小 K 和
   OC split1/2/4，counter 每次调用及 graph replay 都在输入设备清零。
@@ -104,6 +108,10 @@ python benchmarks/moe/bench_tuned_moe.py \
   就保证它在每个 shape 上成为有效候选。固定 kernel pytest 单独检查 A4W4 数值语义。
 - FlyDSL direct decode 将输出清零融合进 Gate/Up，BF16/FP8/MXFP4 都支持，
   大 H、小 I_tp 时用多轮清零覆盖全部输出。MXFP4 的 B1 同时搜索 Down DN32/64。
+  `fly_decode` 的 direct/sorted 路径均保留 BF16 激活，支持 PTPC、per-tensor 和
+  MXFP4 权重反量化，不支持 block scale；`jit_splitk` 支持 PTPC、block、MXFP4，
+  不直接支持 per-tensor scales。省去激活量化可能降低小 batch 开销，但不保证
+  所有输入都更快或更接近量化参考；加入候选不等于一定通过 prune 或成为 winner。
   prefill 的 Gate/Up BN 搜索128/256，BK 为 BF16 的64/128或 FP8 的128/256；
   三条专用 Down 路径也覆盖这两组 BN，输出 padding 搜索0/128B。
   默认 FP8 Down 不再排除 I192/I320。候选层只枚举配置并尊重 caller 的 M 设置，
@@ -132,9 +140,9 @@ python benchmarks/moe/bench_tuned_moe.py \
   缓存目录沿用 `FLYDSL_AUTOTUNE_CACHE_DIR`；
   `FLYDSL_AUTOTUNE_CONFIG_DIR` 可启用强制调优时的离线配置导出。
   本次迁移使用 v6 缓存，不复用 v5 及更早配置；首次调用会重新调优。
-  block 模式的 key 额外记录 A1×128 激活语义，旧的 block winner/cache/artifact
-  不再命中，避免继续执行已移出候选集的权重量化 split-K；其它模式不受影响。
-- `--tune-aiter [DIR]` 默认目录为 `./tuned_aiter`。先把整个模型/token 矩阵
+  block 模式的 key 记录同时允许 A1×128/BF16 激活的候选策略，之前仅搜索
+  A1×128 的 winner/cache/artifact 不再命中；其它模式不受影响。
+- `--tune-aiter [DIR]` 默认目录为 `./tuned_aiter_moe`。先把整个模型/token 矩阵
   按 Aiter 的 lookup key 去重写入 `untuned.csv`，再调用已安装 Aiter 的
   `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py`，最佳 kernel 保存到
   `tuned.csv`。使用 `--all --mp 1` 重新调优本次 shape，不覆盖 Aiter 自带配置；
@@ -192,6 +200,7 @@ FlyDSL 调优器自己的计时与最终多buffer测量不完全相同。因此 
 即使 winner 是 Aiter，也使用 tuned API 的实测时延；未计时则显示 `—`。
 diff 取计时前检查及各轮输出副本中的最大值；非有限输出
 显示 `NaN/Inf`，无法检查显示 `—`，JSON 不写入非标准的 NaN/Infinity 数值。
+空、非有限或非正的计时样本记为 `ERROR`，不计算 speedup/TFLOPS，也不写入报告样本。
 可选 JSON 只保存运行参数、模型维度、精度结果、配置和计时样本。
 
 `--md FILE` 将相同的最终表格写入 Markdown，不重跑计时，也不收录调优日志。

@@ -7,7 +7,8 @@
 首次未命中缓存时执行校验和计时，后续直接复用选中的配置。
 FLYDSL_AUTOTUNE=1 可强制重新调优，graph capture 前需关闭该开关。
 FLYDSL_AUTOTUNE_CONFIG_DIR 用于指定离线配置的导出目录。
-计时包含排序、激活量化、两次 GEMM 和 reduce，不包含参考计算和精度检查。
+压缩权重既可走低精度激活路径，也可在 kernel 内反量化并直接消费 BF16 激活。
+计时包含排序、所选路径的激活量化、两次 GEMM 和 reduce，不包含参考和精度检查。
 精度阈值沿用 test_moe 的 ``calc_diff <= 0.02``，并非逐元素 2% 相对误差。
 """
 
@@ -211,9 +212,9 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
             add("jit_batch", gn=32)
             if kind == "ptpc" and h % 1024 == 0:
                 add("jit_batch", gn=32, block_n=1024)
-        # split-K 的 block 路径只量化权重，不满足公共 API 的 A1x128 激活语义。
-        if kind in ("bf16", "ptpc", "fp4"):
-            if kind != "fp4" or h % 1024 == 0:
+        # 允许权重反量化、BF16 激活的路径参与调优；与量化参考的差异仍由 prune 检查。
+        if kind in ("bf16", "ptpc", "block", "fp4"):
+            if (kind != "block" or h % 512 == 0) and (kind != "fp4" or h % 1024 == 0):
                 for m in (16, 32, 64):
                     for n in (64, 128):
                         add("jit_splitk", m, m, n, n)
@@ -581,8 +582,8 @@ def _model_key(call):
     # FlyDSL 不会读取 tensor 的自定义属性或展开 options 中的张量，需要手动补充。
     values = {"version": 6}
     if call["quant_type"] in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128):
-        # 失效曾允许 A16W8 split-K 的 block 缓存和离线配置，不影响其它量化模式。
-        values["block_activation_quant"] = "per_1x128"
+        # 新策略同时搜索 A8W8/A16W8，不复用只允许 A1x128 激活的旧 winner。
+        values["block_activation_quant"] = "per_1x128_or_bf16"
     for name, value in call.items():
         if isinstance(value, torch.Tensor):
             shape = tuple(value.shape)
@@ -657,6 +658,8 @@ def fused_moe(
     结构，GELU 使用非 gated BF16 权重。gfx950 的 BF16 / FP8 block-scale
     SiLU 8-wave 和 BF16 GELU 路径支持两份权重各自的 raw/shuffled 布局；其它组合的
     原始布局或混合布局只能尝试 Aiter。候选都需通过 Torch 参考检查。
+    压缩权重允许反量化后使用 BF16 激活，不保证与标准激活量化流程逐值等价；
+    jit_splitk / fly_decode 按支持范围参与搜索，仍使用统一参考和原误差门槛。
     其他 API 功能直接转交 Aiter，不在这里额外校验。若 is_shuffled 属性丢失
     （例如重新包装成 Parameter），就按原始布局处理，不猜测实际存储方式。
     本地路径要求 caller 在每次调用及 graph replay 时保证 0 <= topk_ids < E。

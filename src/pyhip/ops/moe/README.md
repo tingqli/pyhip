@@ -5,6 +5,9 @@ It selects among Aiter, PyHIP ASM, and FlyDSL implementations for supported
 BF16-input inference workloads on gfx942/gfx950. Other API features are forwarded
 to Aiter; that path is not validated by the local tuner.
 
+See the [performance snapshot](../../../../benchmarks/moe/perf-snapshot-350.md)
+for recorded results, including failed cases. These are run-specific measurements.
+
 ## Standard workflow
 
 ### 1. Collect the workload
@@ -47,6 +50,24 @@ reference, then times valid candidates. Cache hits reuse the config with the
 current tensors and stream. Set `FLYDSL_AUTOTUNE=1` to force a fresh search;
 turn it off after tuning and warm up before graph capture.
 
+Compressed weights do not require quantized activations in every candidate.
+The following paths dequantize weights in the kernel and keep BF16 inputs and
+intermediates; both weights must be shuffled, and activation/shape limits apply:
+
+| Weight format | `jit_splitk` | `fly_decode` (direct / sorted) |
+|---|---|---|
+| FP8 PTPC | Yes | Yes |
+| FP8 per-tensor | No | Yes |
+| FP8 block (W128×128) | Yes, H divisible by 512 | No |
+| MXFP4 | Yes, H divisible by 1024 | Yes |
+
+These A16W8/A16W4 candidates compete with activation-quantized paths. They still
+must pass the same Torch reference and `calc_diff <= 0.02` check; no per-candidate
+reference or relaxed tolerance is used. Skipping activation quantization can help
+small batches, but does not guarantee higher accuracy, lower latency, or exact
+equivalence to the quantized computation. Cache hits do not repeat this check.
+Block-mode caches from the previous, activation-quantized-only policy are retuned.
+
 ### 3. Validate, tune, and compare
 
 [bench_tuned_moe.py](../../../../benchmarks/moe/bench_tuned_moe.py) uses shared
@@ -73,10 +94,11 @@ python3 benchmarks/moe/bench_tuned_moe.py \
 - `--check-only` skips comparison timing, not tuning on a cache miss.
 	The benchmark controls `FLYDSL_AUTOTUNE`; use `--retune` or `--tune-aiter`
 	rather than setting that variable externally to force a search.
-- Rows show diff, median latency, speedup, and the recorded winner config.
+- Rows show diff, median latency, speedup, winner TFLOPS, and the recorded config.
 	Timing covers the full eager MoE call, not isolated GEMMs or graph replay.
 	`AITER_INCORRECT` keeps timing results but is not a valid correctness pass.
-- Use a new `--output` path for each report. Test deployment-specific precision
+- Use `--md FILE` for a Markdown report grouped by model, or `--output FILE`
+	for JSON. Both require new file paths. Test deployment-specific precision
 	and layout options separately; see the [benchmark guide](../../../../benchmarks/moe/README.md).
 
 ### 4. Reuse offline configs

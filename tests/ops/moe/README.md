@@ -36,6 +36,9 @@ python3 -m pytest tests/ops/moe/test_moe.py -q
 ASM split-K 保留原脚本的实际 batch 集合：2–63、128–255、256/512/768、
 2048/4096/6144/8192、6144–6399，去掉重复的6144。它们现在分别显示结果，
 因此默认用例数量比旧脚本的单 node 内循环多。可用 node id 或 `-k` 做定向验证。
+当前精度矩阵是 BF16、PTPC、MXFP4；block-scale 的 A1×128 激活语义由
+`test_jit_blockscale` 验证。公共调优同时允许仅量化权重的 block `jit_splitk`，
+但这不改变本文件固定 split-K 测试的精度矩阵，也不把两种数值流程视为等价。
 没有新增 pytest 命令行配置框架；新增 tile 时直接增加普通参数化用例。
 
 ### jit_blockscale：小 shape 回归与大 shape 优化
@@ -138,6 +141,7 @@ E8M0 scale；这不改变 benchmark 的默认输入。RTA/RTE 保持 kernel 的�
 | 手动模型性能循环 | `test_model_prefill_perf`；Aiter 对照仍使用原 benchmark |
 
 旧 FP8 split-K 的 `block` 参数曾遗漏传给执行函数，实际重复测试 PTPC；
-新用例明确生成 block-scale 权重。旧性能阶段还可能使用未 shuffle 的副本；
+当前 block-scale 测试明确生成对应权重，并执行两次激活量化的 8-wave 路径。
+旧性能阶段还可能使用未 shuffle 的副本；
 新测量复制同一组准备好的 tensor 并校验各副本，不保留这些错误行为。
 历史运行记录保持不变；不把新计时与旧脚本的不同边界直接比较。
