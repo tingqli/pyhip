@@ -29,8 +29,8 @@ Select a known test file or node, for example:
 
 ```bash
 python -m pytest experiments/moe/flydsl/moe_8w_down/test_blockscaled.py -k test_cli_scope -q
-python -m pytest experiments/gemm/flydsl/test_gemm.py -k gemm_950 -q
-python experiments/gemm/flydsl/compare_gemm_950.py --help
+python -m pytest tests/ops/gemm/test_gemm_fp8_blockscale_8w.py -q
+python tests/ops/gemm/test_gemm_mxfp8_4w.py
 ```
 
 Some plain modules provide their own script entry points rather than pytest
@@ -40,9 +40,15 @@ fixtures. Run those directly, for example:
 python experiments/gemm/flydsl/gemm4.py
 ```
 
-Experiments retain their own performance selection rules; the regression-suite
-`perf` marker does not control all experimental timing. MHA still uses
+Experiments retain their own performance selection rules; formal
+regression-suite performance-only functions are marked `perf`. MHA still uses
 `PYHIP_MHA_PERF` as before. Do not assume a broad experimental invocation is cheap.
+
+The gfx950 8-wave block-scale FP8 and 4-wave MXFP8/MXFP4 implementations now
+live in [pyhip.ops.gemm.flydsl](../src/pyhip/ops/gemm/flydsl/), with correctness
+and opt-in performance tests in [tests/ops/gemm](../tests/ops/gemm/). The
+historical `compare_gemm_950.py` driver was removed during relocation, so run
+the surviving test entry points directly.
 
 Sibling imports support both explicit pytest/importlib execution and existing
 direct script entry points. Flash Attention and the PA 4/8-wave groups remain

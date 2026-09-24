@@ -29,10 +29,12 @@ with the fixed-kernel pytest suite, validates both backends independently, and
 exports raw timings without backend-specific shape padding. See the
 [MoE benchmark guide](moe/README.md) for the protocol and result statuses.
 
-GRRead deliberately keeps its combined CLI and pytest checks in
-[test_gr_read.py](../tests/ops/gr_read/test_gr_read.py). Comparisons that depend on
-experimental kernels remain with those kernels, for example
-[compare_gemm_950.py](../experiments/gemm/flydsl/compare_gemm_950.py).
+GRRead keeps its benchmark CLI in
+[bench_gr_read_compare.py](../tests/ops/gr_read/bench_gr_read_compare.py), beside
+the pytest checks and default accuracy-then-performance CLI in
+[test_gr_read.py](../tests/ops/gr_read/test_gr_read.py) (`--check-only` skips timing).
+Comparisons that depend on relocated GEMM kernels now live in the opt-in tests
+under [tests/ops/gemm](../tests/ops/gemm/).
 
 Benchmarks may allocate large buffers, compile kernels, or require external
 tools. There is no new scheduling, process isolation, hardware management, or
