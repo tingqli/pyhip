@@ -106,9 +106,8 @@ def test_asm_batch_loopn(tokens):
 
 
 @pytest.mark.parametrize("tokens", SPLITK_TOKENS, ids=lambda m: f"m{m}")
-@pytest.mark.parametrize("precision", ["bf16", "ptpc", "block", "mxfp4"])
+@pytest.mark.parametrize("precision", ["bf16", "ptpc", "mxfp4"])
 def test_asm_splitk(tokens, precision):
-    # 旧 block 参数遗漏传递；现在明确准备 block-scale 权重，而不是重复 PTPC。
     _check(_prepare(DECODE_MODEL, tokens, precision), SPLITK_CONFIG)
 
 

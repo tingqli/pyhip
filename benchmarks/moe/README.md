@@ -52,7 +52,8 @@ python benchmarks/moe/bench_tuned_moe.py \
 
 # 全模型同 batch 矩阵；默认沿用各模型的 FP8 量化模式
 python benchmarks/moe/bench_tuned_moe.py \
-  --models all --tokens 1 4 64 1024 --dtype fp8 --output /tmp/moe-all.json
+  --models all --tokens 1 4 64 1024 --dtype fp8 \
+  --output /tmp/moe-all.json --md /tmp/moe-all.md
 
 # 先批量调优 Aiter，再重新搜索 PyHIP 候选并比较；目录参数可省略
 python3 benchmarks/moe/bench_tuned_moe.py \
@@ -185,9 +186,19 @@ FlyDSL 调优器自己的计时与最终多buffer测量不完全相同。因此 
 ## 输出
 
 运行结束打印一张汇总表，包括 `Aiter diff`、`winner diff`、`Aiter us`、`tuned us`、
-`speedup`、winner 和状态。diff 取计时前检查及各轮输出副本中的最大值；非有限输出
+`speedup`、`winner`、`winner TFLOPS`、状态和完整 winner config。
+`winner TFLOPS` 紧跟 `winner` 列，使用实测 tuned API 的中位时延：
+`effective_FLOPs / (tuned_median_us * 1e6)`，gated/非 gated 的有效计算量见上文。
+即使 winner 是 Aiter，也使用 tuned API 的实测时延；未计时则显示 `—`。
+diff 取计时前检查及各轮输出副本中的最大值；非有限输出
 显示 `NaN/Inf`，无法检查显示 `—`，JSON 不写入非标准的 NaN/Infinity 数值。
 可选 JSON 只保存运行参数、模型维度、精度结果、配置和计时样本。
+
+`--md FILE` 将相同的最终表格写入 Markdown，不重跑计时，也不收录调优日志。
+每个模型使用三级标题，包含模型名、dtype/quant、activation 和 TP；标题下记录
+H/I/I_tp、experts/topk、gate mode、shuffle、routing、seed 和激活参数，随后列出各个 M。
+失败状态及原因也保留。可与 `--output` 同用；两者必须使用不同的新文件，
+不会覆盖已有报告，缺失的父目录自动创建。
 
 winner 来自 tuned MoE 的实际 dispatch，不读取 FlyDSL 私有缓存。模块的
 `record_dispatch` 默认关闭；开启后，`last_dispatch` 只覆盖保存最后一次配置，

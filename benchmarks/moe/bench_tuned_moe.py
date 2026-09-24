@@ -87,7 +87,7 @@ def tune_aiter(models, args):
     # 当前 tuner 默认只搜 flydslv2；显式打开全部候选，并限制为同一张 GPU。
     env = dict(os.environ, TUNE_ONLY="", OPUS_ONLY="0", OPUS_SKIP_CKTILE="0", TUNE_MOE_KERNEL_REGEX="",
                TUNE_MOE_EXPERT_BALANCE=str(args.routing == "balanced"), TUNE_MOE_ROUTING_SEED=str(args.seed))
-    subprocess.run([sys.executable, str(script), "-i", str(untuned), "-o", str(tuned), "--all", "--mp", "1", "--timeout", "60"],
+    subprocess.run([sys.executable, str(script), "-i", str(untuned), "-o", str(tuned), "--all", "--mp", "1", "--timeout", "300"],
                    cwd=script.parents[2], env=env, check=True)
 
     def clear_configs():
@@ -219,10 +219,10 @@ def run_case(name, model, tokens, args):
     return row
 
 
-def print_table(rows):
+def print_table(rows, *, file=None):
     """并列展示精度与时延；Aiter 数值失败的比较明确标注。"""
-    print("\n| model | M | H / I_tp / E / topk | check A/T | Aiter diff | winner diff | Aiter us | tuned us | speedup | winner | status | winner config |")
-    print("|---|---:|---|---|---:|---:|---:|---:|---:|---|---|---|")
+    print("\n| model | M | H / I_tp / E / topk | check A/T | Aiter diff | winner diff | Aiter us | tuned us | speedup | winner | winner TFLOPS | status | winner config |", file=file)
+    print("|---|---:|---|---|---:|---:|---:|---:|---:|---|---:|---|---|", file=file)
     for row in rows:
         times = [f"{row[b]['median_us']:.2f}" if b in row else "—" for b in ("aiter", "tuned")]
         checks = "/".join(row["correctness"].get(b, {}).get("status", "—") for b in ("aiter", "tuned"))
@@ -233,23 +233,45 @@ def print_table(rows):
                          "NaN/Inf" if check.get("status") == "INCORRECT" else "—")
         speed = f"{row['speedup']:.3f}x" if row.get("speedup") is not None else "—"
         winner = (row.get("winner") or {}).get("_impl", "—")
+        tflops = row.get("tuned", {}).get("effective_tflops")
+        throughput = f"{tflops:.3f}" if tflops is not None else "—"
         config = json.dumps(row["winner"], sort_keys=True) if row.get("winner") else "—"
         dims = " / ".join(str(row[k]) for k in ("model_dim", "inter_dim_tp", "experts", "topk"))
-        print(f"| {row['model']} | {row['tokens']} | {dims} | {checks} | {diffs[0]} | {diffs[1]} | {times[0]} | {times[1]} | {speed} | {winner} | {row['status']} | {config} |")
+        print(f"| {row['model']} | {row['tokens']} | {dims} | {checks} | {diffs[0]} | {diffs[1]} | {times[0]} | {times[1]} | {speed} | {winner} | {throughput} | {row['status']} | {config} |", file=file)
+    print(file=file)
     for row in rows:
         label = f"{row['model']} M={row['tokens']}"
         if row.get("reason"):
-            print(f"[{label}] {row['reason'].splitlines()[0]}")
+            print(f"[{label}] {row['reason'].splitlines()[0]}", file=file)
         for backend, check in row["correctness"].items():
             if check["status"] != "PASS":
                 detail = check.get("reason", f"calc_diff={check.get('diff')}")
-                print(f"[{label}] {backend}: {check['status']}: {detail.splitlines()[0]}")
+                print(f"[{label}] {backend}: {check['status']}: {detail.splitlines()[0]}", file=file)
+
+
+def print_markdown(rows, file):
+    """按模型分组，复用屏幕表格，不重新计算或测量性能。"""
+    print("# MoE performance", file=file)
+    print("\nWinner TFLOPS uses the measured full tuned-call median latency.", file=file)
+    groups = {}
+    for row in rows:
+        groups.setdefault(row["model"], []).append(row)
+    if not groups:
+        print("\nNo completed cases.", file=file)
+    for group in groups.values():
+        row = group[0]
+        print(f"\n### {row['model']} ({row['dtype']}/{row.get('quant', '—')}, "
+              f"{row['activation']}, TP={row['tp']})", file=file)
+        fields = ("model_dim", "inter_dim", "inter_dim_tp", "experts", "topk", "gate_mode",
+                  "preshuffle", "routing", "seed", "swiglu_limit", "beta", "linear_beta")
+        print("\n" + ", ".join(f"{name}={row[name]}" for name in fields if row.get(name) is not None), file=file)
+        print_table(group, file=file)
 
 
 def main(argv=None):
     """解析命令行参数，只在运行测试时设置默认 CUDA 设备。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--models", nargs="+", choices=[*MOE_MODELS, "all"], default=["qwen35_35B_k256"])
+    parser.add_argument("--models", nargs="+", choices=[*MOE_MODELS, "all"], default=["all"])
     parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 4, 16, 64, 256, 1024, 4096, 8192, 16384, 32768])
     parser.add_argument("--dtype", choices=("bf16", "fp8", "mxfp4"), default="fp8")
@@ -272,6 +294,8 @@ def main(argv=None):
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--rounds", type=int, default=2, help="alternate A/T then T/A blocks")
     parser.add_argument("--output", type=Path, help="new JSON file; refuses to overwrite an existing report")
+    parser.add_argument("--md", type=Path, metavar="FILE",
+                        help="new Markdown performance report grouped by model; refuses to overwrite")
     args = parser.parse_args(argv)
     if args.list_models:
         print("model                     model_dim  inter_dim  TP  inter_dim_tp  experts  topk  fp8_quant")
@@ -296,6 +320,10 @@ def main(argv=None):
         parser.error("--tune-aiter requires --preshuffle on; the official tuner benchmarks shuffled weights")
     if args.output is not None and args.output.exists():
         parser.error("report already exists; use a new --output path")
+    if args.md is not None and args.md.exists():
+        parser.error("report already exists; use a new --md path")
+    if args.output is not None and args.md is not None and args.output.resolve() == args.md.resolve():
+        parser.error("--output and --md must use different paths")
 
     import aiter
     import torch
@@ -325,6 +353,11 @@ def main(argv=None):
                     rows.append(row)
     finally:
         print_table(rows)
+        if args.md is not None:
+            args.md.parent.mkdir(parents=True, exist_ok=True)
+            with args.md.open("x", encoding="utf-8") as stream:
+                print_markdown(rows, stream)
+            print(f"Markdown report: {args.md}")
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             with args.output.open("x") as stream:
