@@ -130,8 +130,11 @@ defined in [pyproject.toml](pyproject.toml).
 Run from the repository root using the environment in which PyHIP is installed.
 
 ```bash
+# Run the curated default regression set after broad code changes
+python3 -m pytest -q
+
 # Inspect the default test collection
-python -m pytest --collect-only -q
+python3 -m pytest --collect-only -q
 
 # Run a selected operator regression suite
 python -m pytest tests/ops/gemm/test_cdna4.py -q
@@ -146,11 +149,12 @@ python benchmarks/moe/bench_tuned_moe.py --help
 python -m pytest experiments/gemm/flydsl/test_gemm.py -k gemm_950 -q
 ```
 
-[pytest.ini](pytest.ini) limits default collection to test-named Python modules
-under [tests](tests), uses importlib mode, and excludes the `perf` marker.
-Many tests require a GPU, including some during collection. Architecture and
-dependency constraints still apply; the directory layout is not a guarantee
-that all historical tests pass in every environment.
+[pytest.ini](pytest.ini) lists the existing modules in the default regression
+set, uses importlib mode, and excludes the `perf` marker. Passing `tests`
+explicitly overrides that list and includes historical diagnostics/failures.
+No existing test code is changed for selection. The default set was validated
+on gfx950; many tests require a GPU, including some during collection.
+See [tests/README.md](tests/README.md) for coverage, exclusions, and hardware limits.
 
 - [tests/README.md](tests/README.md): regression entry points and collection rules.
 - [benchmarks/README.md](benchmarks/README.md): standalone timing scripts.
