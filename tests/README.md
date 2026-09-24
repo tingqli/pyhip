@@ -124,6 +124,17 @@ require AIter. Their non-performance cases are included by default. Select eithe
 file directly for focused correctness, or add `-m perf -s` for rotating-buffer
 benchmarks.
 
+The 8-wave suite covers both the four-phase baseline and `split_m=True`
+half-M single-FIFO pipeline (block scales required), with raw/tiled A DMA
+and optional `(16, 16)` B preshuffle. Its checks use finite outputs,
+`calc_diff <= 1e-5`, and `rtol=0.02, atol=0.01` against the FP32 reference.
+Its performance tests select both pipelines; the standalone entry defaults
+to `SPLIT_M=1`, and `PRESHUFFLE_B=1` enables shuffled weights for performance.
+The 4-wave suite retains its `(16, 64)` shuffle and MXFP8/MXFP4 checks,
+including scaled layout variants and padded MXFP4 LDS. Both standalone
+entries use the updated `4096 x 4096 x 16384` case; the older performance
+shapes remain selectable through pytest.
+
 The inherited shell runners remain beside their suites. They still clear the
 existing PyHIP JIT cache; use direct pytest commands above when that is unwanted.
 

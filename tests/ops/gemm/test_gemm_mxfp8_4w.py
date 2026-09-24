@@ -94,6 +94,8 @@ def run_test(
                 dim=0,
             )
         rows = padded_rows
+        # [m // 128, 4m1, 32m0, groups] -> [groups, m // 128, 32m0, 4m1] , 4m1 packe 4 repeated E8m0 scale into one Dword.
+        # 一次DWORD读取对于每条lane就可以得到4次rep的scale.
         permuted = (
             scale.view(rows // 128, 4, 32, groups)
             .permute(3, 0, 2, 1)
@@ -354,21 +356,38 @@ def test_accuracy(M, N, K, with_scale, B_MXFP4):
         pytest.param({"store_overlap": True}, id="store-overlap"),
     ],
 )
-def test_layout_accuracy(options):
-    if options.get("PRESHUFFLE_B", False):
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_layout_accuracy(options, with_scale):
+    if with_scale or options.get("PRESHUFFLE_B", False):
         pytest.importorskip("aiter")
     assert run_test(
-        M=256, N=256, K=512, with_scale=False, B_MXFP4=False, perf=False, **options
+        M=256, N=256, K=512, with_scale=with_scale, B_MXFP4=False, perf=False, **options
+    )
+
+
+@pytest.mark.usefixtures("cdna4_device")
+@pytest.mark.parametrize("M,N,K", [(33, 64, 512), (257, 264, 768)])
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_mxfp4_padding_accuracy(M, N, K, with_scale):
+    pytest.importorskip("aiter")
+    assert run_test(
+        M, N, K, with_scale=with_scale, B_MXFP4=True,
+        B_LDS_SWIZZLE=False, perf=False,
     )
 
 
 @pytest.mark.perf
 @pytest.mark.usefixtures("cdna4_device")
 @pytest.mark.parametrize(
-    "M,N,K",
-    [(98304, 512, 6144), (196608, 512, 6144), (393216, 512, 6144)],
+    "M,N,K,B_MXFP4",
+    [
+        (4096, 4096, 16384, False),
+        (98304, 512, 6144, True),
+        (196608, 512, 6144, True),
+        (393216, 512, 6144, True),
+    ],
 )
-def test_perf(M, N, K):
+def test_perf(M, N, K, B_MXFP4):
     pytest.importorskip("aiter")
     assert run_test(
         M=M,
@@ -381,8 +400,8 @@ def test_perf(M, N, K):
         permlane_output=PERMLANE_EPILOGUE,
         store_overlap=STORE_OVERLAP,
         with_scale=True,
-        B_MXFP4=True,
-        B_LDS_SWIZZLE=True,
+        B_MXFP4=B_MXFP4,
+        B_LDS_SWIZZLE=B_MXFP4,
     )
 
 
@@ -455,11 +474,10 @@ if __name__ == "__main__":
             f"MXFP8 GEMM requires CDNA4 (gfx950); got {props.gcnArchName}"
         )
     torch.manual_seed(0)
-    # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False, B_MXFP4=False)
     run_test(
-        M=98304,
-        N=512,
-        K=6144,
+        M=4096,
+        N=4096,
+        K=16384,
         USE_SWIZZLE=0,
         PRESHUFFLE_B=0,
         perf=1,
@@ -467,56 +485,6 @@ if __name__ == "__main__":
         permlane_output=PERMLANE_EPILOGUE,
         store_overlap=STORE_OVERLAP,
         with_scale=True,
-        B_MXFP4=True,
-        B_LDS_SWIZZLE=True,
+        B_MXFP4=False,
+        B_LDS_SWIZZLE=False,
     )
-
-    run_test(
-        M=196608,
-        N=512,
-        K=6144,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=1,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=True,
-        B_MXFP4=True,
-        B_LDS_SWIZZLE=True,
-    )
-    run_test(
-        M=393216,
-        N=512,
-        K=6144,
-        USE_SWIZZLE=0,
-        PRESHUFFLE_B=0,
-        perf=1,
-        TILEK=TILE_K,
-        permlane_output=PERMLANE_EPILOGUE,
-        store_overlap=STORE_OVERLAP,
-        with_scale=True,
-        B_MXFP4=True,
-        B_LDS_SWIZZLE=True,
-    )
-    # run_test(
-    #     M=M,
-    #     N=N,
-    #     K=K,
-    #     USE_SWIZZLE=0,
-    #     PRESHUFFLE_B=0,
-    #     perf=1,
-    #     TILEK=TILE_K,
-    #     permlane_output=PERMLANE_EPILOGUE,
-    #     store_overlap=STORE_OVERLAP,
-    #     with_scale=True,
-    #     B_MXFP4=True,
-    #     B_LDS_SWIZZLE=True,
-    # )
-
-    # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = True)
-    # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP, with_scale = False)
-    # run_test(M=M, N=N, K=K, USE_SWIZZLE=1, PRESHUFFLE_B=0, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
-    # run_test(M=M, N=N, K=K, USE_SWIZZLE=0, PRESHUFFLE_B=1, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
-    # run_test(M=M, N=N, K=K, USE_SWIZZLE=1, PRESHUFFLE_B=1, perf=1, TILEK=TILE_K, permlane_output=PERMLANE_EPILOGUE, store_overlap=STORE_OVERLAP)
