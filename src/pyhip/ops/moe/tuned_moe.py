@@ -211,8 +211,9 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
             add("jit_batch", gn=32)
             if kind == "ptpc" and h % 1024 == 0:
                 add("jit_batch", gn=32, block_n=1024)
-        if kind in ("bf16", "ptpc", "block", "fp4"):
-            if (kind != "block" or h % 512 == 0) and (kind != "fp4" or h % 1024 == 0):
+        # split-K 的 block 路径只量化权重，不满足公共 API 的 A1x128 激活语义。
+        if kind in ("bf16", "ptpc", "fp4"):
+            if kind != "fp4" or h % 1024 == 0:
                 for m in (16, 32, 64):
                     for n in (64, 128):
                         add("jit_splitk", m, m, n, n)
@@ -579,6 +580,9 @@ def _model_key(call):
     """把影响配置选择的信息加入 cache key；缓存只保存配置，不保存张量数据。"""
     # FlyDSL 不会读取 tensor 的自定义属性或展开 options 中的张量，需要手动补充。
     values = {"version": 6}
+    if call["quant_type"] in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128):
+        # 失效曾允许 A16W8 split-K 的 block 缓存和离线配置，不影响其它量化模式。
+        values["block_activation_quant"] = "per_1x128"
     for name, value in call.items():
         if isinstance(value, torch.Tensor):
             shape = tuple(value.shape)
@@ -655,6 +659,8 @@ def fused_moe(
     原始布局或混合布局只能尝试 Aiter。候选都需通过 Torch 参考检查。
     其他 API 功能直接转交 Aiter，不在这里额外校验。若 is_shuffled 属性丢失
     （例如重新包装成 Parameter），就按原始布局处理，不猜测实际存储方式。
+    本地路径要求 caller 在每次调用及 graph replay 时保证 0 <= topk_ids < E。
+    调优参考中的范围检查仅用于诊断；缓存路径不扫描 ID，也不做主机同步。
     缓存命中后仍使用当前输入和 stream；graph capture 前应完成调优和预热。
     """
     global last_dispatch

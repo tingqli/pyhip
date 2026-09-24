@@ -87,7 +87,7 @@ def tune_aiter(models, args):
     # 当前 tuner 默认只搜 flydslv2；显式打开全部候选，并限制为同一张 GPU。
     env = dict(os.environ, TUNE_ONLY="", OPUS_ONLY="0", OPUS_SKIP_CKTILE="0", TUNE_MOE_KERNEL_REGEX="",
                TUNE_MOE_EXPERT_BALANCE=str(args.routing == "balanced"), TUNE_MOE_ROUTING_SEED=str(args.seed))
-    subprocess.run([sys.executable, str(script), "-i", str(untuned), "-o", str(tuned), "--all", "--mp", "1", "--timeout", "120"],
+    subprocess.run([sys.executable, str(script), "-i", str(untuned), "-o", str(tuned), "--all", "--mp", "1", "--timeout", "60"],
                    cwd=script.parents[2], env=env, check=True)
 
     def clear_configs():
@@ -169,7 +169,7 @@ def run_case(name, model, tokens, args):
                 if tm.record_dispatch:
                     tm.last_dispatch = None
                 call["output"].fill_(float("nan"))
-                # disable kernel cache: tunning always compile new kernel
+                # Validate current FlyDSL source without reusing disk-compiled kernels.
                 with environment("FLYDSL_RUNTIME_ENABLE_CACHE", "0"), environment("FLYDSL_AUTOTUNE", "1" if backend == "tuned" and (args.retune or args.tune_aiter) else "0"):
                     result = op(**call)
                 row["correctness"][backend] = check_output(result, call["output"], reference)
@@ -221,8 +221,8 @@ def run_case(name, model, tokens, args):
 
 def print_table(rows):
     """并列展示精度与时延；Aiter 数值失败的比较明确标注。"""
-    print("\n| model | M | H / I_tp / E / topk | check A/T | Aiter diff | winner diff | Aiter us | tuned us | speedup | winner | status |")
-    print("|---|---:|---|---|---:|---:|---:|---:|---:|---|---|")
+    print("\n| model | M | H / I_tp / E / topk | check A/T | Aiter diff | winner diff | Aiter us | tuned us | speedup | winner | status | winner config |")
+    print("|---|---:|---|---|---:|---:|---:|---:|---:|---|---|---|")
     for row in rows:
         times = [f"{row[b]['median_us']:.2f}" if b in row else "—" for b in ("aiter", "tuned")]
         checks = "/".join(row["correctness"].get(b, {}).get("status", "—") for b in ("aiter", "tuned"))
@@ -233,8 +233,9 @@ def print_table(rows):
                          "NaN/Inf" if check.get("status") == "INCORRECT" else "—")
         speed = f"{row['speedup']:.3f}x" if row.get("speedup") is not None else "—"
         winner = (row.get("winner") or {}).get("_impl", "—")
+        config = json.dumps(row["winner"], sort_keys=True) if row.get("winner") else "—"
         dims = " / ".join(str(row[k]) for k in ("model_dim", "inter_dim_tp", "experts", "topk"))
-        print(f"| {row['model']} | {row['tokens']} | {dims} | {checks} | {diffs[0]} | {diffs[1]} | {times[0]} | {times[1]} | {speed} | {winner} | {row['status']} |")
+        print(f"| {row['model']} | {row['tokens']} | {dims} | {checks} | {diffs[0]} | {diffs[1]} | {times[0]} | {times[1]} | {speed} | {winner} | {row['status']} | {config} |")
     for row in rows:
         label = f"{row['model']} M={row['tokens']}"
         if row.get("reason"):
@@ -250,7 +251,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models", nargs="+", choices=[*MOE_MODELS, "all"], default=["qwen35_35B_k256"])
     parser.add_argument("--list-models", action="store_true")
-    parser.add_argument("--tokens", type=int, nargs="+", default=[1, 4, 64])
+    parser.add_argument("--tokens", type=int, nargs="+", default=[1, 4, 16, 64, 256, 1024, 4096, 8192, 16384, 32768])
     parser.add_argument("--dtype", choices=("bf16", "fp8", "mxfp4"), default="fp8")
     parser.add_argument("--quant", choices=("model", "ptpc", "per_tensor", "block"), default="model")
     parser.add_argument("--activation", choices=("silu", "swiglu", "situv2", "gelu"), default="silu",
@@ -264,8 +265,8 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--retune", action="store_true", help="force a search before timing each exact M")
-    parser.add_argument("--tune-aiter", nargs="?", type=Path, const=Path("tuned_aiter"), metavar="DIR",
-                        help="run the official Aiter tuner first; save untuned.csv/tuned.csv in DIR (default: tuned_aiter)")
+    parser.add_argument("--tune-aiter", nargs="?", type=Path, const=Path("tuned_aiter_moe"), metavar="DIR",
+                        help="run the official Aiter tuner first; save untuned.csv/tuned.csv in DIR (default: tuned_aiter_moe)")
     parser.add_argument("--copies", type=int, default=0, help="run_perftest copies; 0 keeps its automatic ~4GB cap")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)

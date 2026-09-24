@@ -18,8 +18,10 @@ MOE_MODELS = {
                        quant_type="ptpc"),
     "qwen35_35B_k256": dict(HIDDEN_SIZE=2048, INTER_SIZE=256, TP=1, E=256, TOPK=8,
                             quant_type="ptpc"),
-    "xiaomi": dict(HIDDEN_SIZE=6144, INTER_SIZE=256 * 8, TP=8, E=384, TOPK=8,
+    "mimo_ptpc": dict(HIDDEN_SIZE=6144, INTER_SIZE=256 * 8, TP=8, E=384, TOPK=8,
                    quant_type="ptpc"),
+    "mimo_block": dict(HIDDEN_SIZE=6144, INTER_SIZE=256 * 8, TP=8, E=384, TOPK=8,
+                   quant_type="block"),
     "h3": dict(HIDDEN_SIZE=6144, INTER_SIZE=384 * 8, TP=8, E=128, TOPK=4,
                quant_type="ptpc"),
 }

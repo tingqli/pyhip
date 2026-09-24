@@ -87,7 +87,9 @@ python benchmarks/moe/bench_tuned_moe.py \
   gfx950 的 block-scale SiLU 候选包括原生 FP8 8-wave 两阶段路径及小 K
   persistent Down，激活在两次 GEMM 前分别量化，scale 使用转置存储。
   普通 8-wave 路径支持 raw/shuffled 权重；persistent Down 只用于 shuffled w2。
-  gfx942 不加入这些 gfx950 专用 kernel，仍使用已有 split-K/Aiter 候选。
+  权重量化的 `jit_splitk` 不执行 A1×128 激活量化，因此不参与 block 调优；
+  底层 kernel 和固定路径测试仍保留。gfx942 不加入 gfx950 专用 kernel，
+  block 模式只保留 Aiter 候选，仍须通过独立参考检查。
 - gfx950 的 BF16 SiLU 也加入 `jit_8wave`，共用普通/persistent 8-wave 流程，
   不量化激活；两份权重分别遵循 `is_shuffled`。persistent Down 支持小 K 和
   OC split1/2/4，counter 每次调用及 graph replay 都在输入设备清零。
@@ -129,6 +131,8 @@ python benchmarks/moe/bench_tuned_moe.py \
   缓存目录沿用 `FLYDSL_AUTOTUNE_CACHE_DIR`；
   `FLYDSL_AUTOTUNE_CONFIG_DIR` 可启用强制调优时的离线配置导出。
   本次迁移使用 v6 缓存，不复用 v5 及更早配置；首次调用会重新调优。
+  block 模式的 key 额外记录 A1×128 激活语义，旧的 block winner/cache/artifact
+  不再命中，避免继续执行已移出候选集的权重量化 split-K；其它模式不受影响。
 - `--tune-aiter [DIR]` 默认目录为 `./tuned_aiter`。先把整个模型/token 矩阵
   按 Aiter 的 lookup key 去重写入 `untuned.csv`，再调用已安装 Aiter 的
   `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py`，最佳 kernel 保存到
