@@ -70,7 +70,7 @@ def moe_gemm_8wave_gelu(J,
                    AB_dtype, wg_M, wg_N,
                    OC, IC, 
                    gate_up, bpreshuffle,
-                   TOPK:"int",
+                   TOPK,
                    sorted_ids:"uint*",
                    sorted_weights:"float*",
                    sorted_expert_ids:"uint*",
@@ -135,7 +135,8 @@ def moe_gemm_8wave_gelu(J,
         # vm_load_b(k, m=0) loads from gate-weight
         # vm_load_b(k, m=1) loads from up-weight
         # AB_dtype == "s8" means smooth-quant, input is also of shape [num_tokens, TOPK, dims]
-        LOADER_TOPK = J.gpr("su32",0)
+        # loader 在代码生成时选择二维/三维索引，不能传入运行时 GPR 作 Python 条件。
+        LOADER_TOPK = 0
         buff_a = J.Buffer(input, num_tokens * stride_k)
     else:
         LOADER_TOPK = TOPK
@@ -487,7 +488,7 @@ def moe_gemm_8wave_gelu(J,
                     # to support (num_tokens * TOPK * stride_n) > 4GB, we can only use global_store_dword
                     vaddr = J.gpr(2, "vu32", output[0], output[1])
                     J.v_lshl_add_u64(vaddr, J.gpr(2, "vu32", vaddr0 + vrows_topk * (stride_n), 0), 0, vaddr)
-                    J.v_mad_u64_u32(vaddr, "vcc", (vrows[cm, m] & 0xFFFFFF), J.gpr("vu32", J.gpr(TOPK * stride_n)), vaddr)
+                    J.v_mad_u64_u32(vaddr, "vcc", (vrows[cm, m] & 0xFFFFFF), J.gpr("vu32", TOPK * stride_n), vaddr)
                     for cn in range(2):
                         cindex = cn + cm*2
                         for n in range(0, nrN, 2):
