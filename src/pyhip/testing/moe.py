@@ -158,6 +158,14 @@ def _reference_weight(weight, scale, expert, kind, interleave, gate):
 def _reference_activation(value, kind, quant_dtype):
     import torch
 
+    if kind == "a4w4":
+        import aiter
+        from aiter.utility import fp4_utils
+
+        quant, scales = aiter.get_torch_quant(aiter.QuantType.per_1x32)(value, quant_dtype=quant_dtype)
+        dequant = (fp4_utils.mxfp4_to_f32(quant).view(-1, 32)
+                   * fp4_utils.e8m0_to_f32(scales).view(-1, 1))
+        return dequant.reshape(value.shape).to(value.dtype)
     if kind not in ("ptpc", "per_tensor", "block"):
         return value
     shape = value.shape
@@ -169,11 +177,12 @@ def _reference_activation(value, kind, quant_dtype):
     return result if kind == "block" else result.to(value.dtype)
 
 
-def torch_reference(call):
+def torch_reference(call, *, mxfp4_activations=False):
     """独立 Torch MoE 参考；沿用公共 API 默认值、原量化语义和数值顺序。
 
     只在调用时导入算子以补参数和验证输入，不执行任何被测 kernel。
     FP8 对输入和中间结果量化；MXFP4 使用 BF16 激活；GELU 为非 gated。
+    固定 A4W4 kernel 测试可显式模拟两次 MXFP4 激活量化；API 调优仍用默认参考。
     """
     import aiter
     import torch
@@ -188,6 +197,9 @@ def torch_reference(call):
     kind = _native_kind(call)
     if kind is None:
         raise ValueError("independent MoE validation is unavailable for these inputs")
+    if mxfp4_activations and kind != "fp4":
+        raise ValueError("MXFP4 activation reference requires MXFP4 weights")
+    act_kind = "a4w4" if mxfp4_activations else kind
     if not ((ids >= 0) & (ids < w1.shape[0])).all().item():
         raise ValueError("topk_ids contains an out-of-range expert")
     b, h = x.shape
@@ -195,7 +207,7 @@ def torch_reference(call):
     i, topk = w1.shape[1] // (1 if gelu else 2), ids.shape[1]
     interleave = call["gate_mode"] == GateMode.INTERLEAVE
     dtype = x.dtype
-    x = _reference_activation(x, kind, w1.dtype)
+    x = _reference_activation(x, act_kind, w1.dtype)
     mid = torch.empty((b, topk, i), dtype=dtype, device=x.device)
     for expert in range(w1.shape[0]):
         row, slot = torch.where(ids == expert)
@@ -220,7 +232,7 @@ def torch_reference(call):
             else:
                 value = torch.nn.functional.silu(gate) * up
         mid[row, slot] = value.to(dtype)
-    mid = _reference_activation(mid, kind, w1.dtype)
+    mid = _reference_activation(mid, act_kind, w1.dtype)
     result = torch.zeros((b, h), dtype=torch.float32, device=x.device)
     for expert in range(w2.shape[0]):
         row, slot = torch.where(ids == expert)

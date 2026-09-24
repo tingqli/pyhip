@@ -88,6 +88,17 @@ python benchmarks/moe/bench_tuned_moe.py \
   persistent Down，激活在两次 GEMM 前分别量化，scale 使用转置存储。
   普通 8-wave 路径支持 raw/shuffled 权重；persistent Down 只用于 shuffled w2。
   gfx942 不加入这些 gfx950 专用 kernel，仍使用已有 split-K/Aiter 候选。
+- gfx950 的 BF16 SiLU 也加入 `jit_8wave`，共用普通/persistent 8-wave 流程，
+  不量化激活；两份权重分别遵循 `is_shuffled`。persistent Down 支持小 K 和
+  OC split1/2/4，counter 每次调用及 graph replay 都在输入设备清零。
+- MXFP4 SiLU 增加 `jit_mxfp4_4wave`：专用 4-wave Gate/Up 搭配通用 MXFP4 Down；
+  `jit_mxfp4` 保留通用 Gate/Up，两条路径均采用 A4W4、sorted activation scales
+  和运行时选择的 final reduce：H 按1024对齐时用 JIT `moe_gemm_final_reduce_bf16`，
+  否则用 `torch.sum` 写入同一 output，不因此排除 GEMM 候选。GEMM 要求 separated、
+  两份权重已 shuffle、H/I_tp 按256对齐、相关 tensor 小于4 GiB；
+  专用 Gate/Up 搜索 M/N128/256，Down N128。
+  **A4W4 候选仍需通过公共 A16W4 Torch 参考的原精度门槛**，不能因为支持该 kernel
+  就保证它在每个 shape 上成为有效候选。固定 kernel pytest 单独检查 A4W4 数值语义。
 - FlyDSL direct decode 将输出清零融合进 Gate/Up，BF16/FP8/MXFP4 都支持，
   大 H、小 I_tp 时用多轮清零覆盖全部输出。MXFP4 的 B1 同时搜索 Down DN32/64。
   prefill 的 Gate/Up BN 搜索128/256，BK 为 BF16 的64/128或 FP8 的128/256；
@@ -117,7 +128,7 @@ python benchmarks/moe/bench_tuned_moe.py \
   可能共用已有 winner，不能把 bucket 复用称为“每个 M 都单独调优”。
   缓存目录沿用 `FLYDSL_AUTOTUNE_CACHE_DIR`；
   `FLYDSL_AUTOTUNE_CONFIG_DIR` 可启用强制调优时的离线配置导出。
-  本次候选补齐使用 v5 缓存，不复用 v4 及更早配置；首次调用会重新调优。
+  本次迁移使用 v6 缓存，不复用 v5 及更早配置；首次调用会重新调优。
 - `--tune-aiter [DIR]` 默认目录为 `./tuned_aiter`。先把整个模型/token 矩阵
   按 Aiter 的 lookup key 去重写入 `untuned.csv`，再调用已安装 Aiter 的
   `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py`，最佳 kernel 保存到
@@ -181,6 +192,11 @@ winner 来自 tuned MoE 的实际 dispatch，不读取 FlyDSL 私有缓存。模
 
 不采集 GPU 状态，不检查利用率/显存门槛，不扫描源码或记录 tensor 地址。
 请自行选择合适的设备；延迟和加速比只是本次运行的实测结果。
+
+旧 MoE wrappers、逐阶段调试脚本、subprocess 比较入口和清缓存启动脚本已删除。
+不提供旧 `method` 参数的兼容转发，也不保留 MXFP4 GELU 的 Torch 执行 fallback；
+GELU 本地候选仍只支持 BF16。EP 等公共 API 功能继续转交 Aiter，不承诺旧本地路径行为。
+自定义 shape 可在固定 pytest 中添加模型字典；benchmark CLI 仍使用共享模型表。
 
 | 状态 | 含义 |
 |---|---|

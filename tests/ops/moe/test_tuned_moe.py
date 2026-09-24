@@ -509,11 +509,6 @@ def test_gelu_candidate(tokens, hidden, inter, shuffled):
     for name, value in before.items():
         assert torch.equal(call[name], value)
     assert tuple(bool(getattr(call[name], "is_shuffled", False)) for name in ("w1", "w2")) == shuffled
-    if tokens == 17:
-        from pyhip.ops.moe.fused_moe_gelu import fused_moe_gelu
-
-        legacy = fused_moe_gelu(x, call["w1"], call["w2"], weights, ids, activation=aiter.ActivationType.Gelu)
-        torch.testing.assert_close(legacy, call["output"], atol=0, rtol=0)
 
 
 def test_gelu_config_constraints(monkeypatch):
@@ -658,7 +653,7 @@ def test_dispatch_winner_cache_and_artifact(monkeypatch, tmp_path):
     assert dispatches == ["fly_prefill", "jit_splitk", "fly_prefill"]
     winner = tm.last_dispatch.copy()
     assert winner["_impl"] == "fly_prefill" and winner["tile_k_gate"] == 256
-    assert bench.json.loads(_tune_arguments(call)["model_key"])["version"] == 5
+    assert bench.json.loads(_tune_arguments(call)["model_key"])["version"] == 6
     assert len(list((tmp_path / "configs").glob("pyhip_dispatch_test-*.json"))) == 1
 
     monkeypatch.setenv("FLYDSL_AUTOTUNE", "0")
@@ -883,6 +878,187 @@ def test_blockscale_reference(quant_type):
                                 a2_scale=d_scale, w2_scale=call["w2_scale"])
     actual = tm._torch_reference(call)
     torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shuffled", [(False, False), (True, False), (False, True), (True, True)])
+def test_8wave_candidates(shuffled):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("these 8-wave tiles require gfx950")
+    from aiter.ops.shuffle import shuffle_weight
+
+    call, _ = prepare_moe(dict(HIDDEN_SIZE=1024, INTER_SIZE=256, TP=1, E=4, TOPK=2),
+                           17, dtype="bf16", seed=8, preshuffle="off")
+    call["hidden_states"].mul_(50)
+    for name, enabled in zip(("w1", "w2"), shuffled):
+        if enabled:
+            call[name] = shuffle_weight(call[name])
+    tuning = _tune_arguments(call)
+    configs = [c for c in tm._configs(**tuning) if c.all_kwargs()["_impl"] == "jit_8wave"]
+    assert len(configs) == (7 if shuffled[1] else 4)
+    reference = torch_reference(call)
+    before = {name: call[name].clone() for name in ("w1", "w2")}
+    for config in configs:
+        call["output"].fill_(float("nan"))
+        _check(tm._fmoe_wrapper(**tuning, **config.all_kwargs()), call, reference)
+    for name, value in before.items():
+        assert torch.equal(value, call[name])
+    assert tuple(bool(getattr(call[name], "is_shuffled", False)) for name in ("w1", "w2")) == shuffled
+
+
+def test_migrated_config_constraints(monkeypatch):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+
+    def native(call, impl):
+        return [c.all_kwargs() for c in tm._configs(**_tune_arguments(call))
+                if c.all_kwargs()["_impl"].startswith(impl)]
+
+    bf16 = _fly_call(tokens=33, hidden=1024, inter=256)
+    limited = native(bf16 | {"block_size_M": 128}, "jit_8wave")
+    assert len(limited) == 2 and all(c["tile_m_down"] == 128 for c in limited)
+    fp4 = _fly_call(tokens=33, hidden=1024, inter=256, kind="fp4")
+    configs = native(fp4, "jit_mxfp4")
+    assert len(configs) == 5
+    assert {(c["tile_m_down"], c["tile_n_gate"]) for c in configs
+            if c["_impl"] == "jit_mxfp4_4wave"} == {(m, n) for m in (128, 256) for n in (128, 256)}
+    assert all(c["tile_m_down"] == 128 for c in native(fp4 | {"block_size_M": 128}, "jit_mxfp4"))
+    # final_reduce 的限制不影响 GEMM 候选；运行时可改用 torch.sum。
+    for hidden in (256, 512, 1536):
+        assert native(_fly_call(hidden=hidden, inter=256, kind="fp4"), "jit_mxfp4") == configs
+    assert not native(_fly_call(kind="fp4", gate_mode="interleave"), "jit_mxfp4")
+    fp4["w1"].is_shuffled = False
+    assert not native(fp4, "jit_mxfp4")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *a: SimpleNamespace(
+        name="AMD Instinct MI300X", gcnArchName="gfx942", multi_processor_count=304,
+    ))
+    assert not native(bf16, "jit_8wave")
+
+
+@pytest.mark.parametrize("hidden", [256, 512, 1024, 1536, 2048], ids=lambda h: f"h{h}")
+@pytest.mark.parametrize("impl", ["jit_mxfp4", "jit_mxfp4_4wave"])
+def test_mxfp4_final_reduce_dispatch(hidden, impl, monkeypatch):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+    from pyhip.ops.moe.asm import moe_gemm_mxfp4 as asm
+
+    call = _fly_call(tokens=17, hidden=hidden, inter=256, kind="fp4")
+    reference = torch_reference(call, mxfp4_activations=True)
+    runner = make_moe_runner(dict(_impl=impl, tile_m_gate=128, tile_m_down=128,
+                                  tile_n_gate=128, tile_n_down=128))
+    original_reduce = asm.moe_gemm_final_reduce_bf16
+    seen = []
+
+    def reduce(*args):
+        assert hidden % 1024 == 0, "unsupported H must use torch.sum"
+        seen.append(args[3])
+        return original_reduce(*args)
+
+    monkeypatch.setattr(asm, "moe_gemm_final_reduce_bf16", reduce)
+    call["output"].fill_(float("nan"))
+    _check(runner(**call), call, reference)
+    assert seen == ([hidden] if hidden % 1024 == 0 else [])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = runner(**call)
+    call["output"].fill_(float("nan"))
+    graph.replay()
+    _check(result, call, reference)
+
+
+def test_mxfp4_pruning_keeps_public_reference():
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+    call, _ = prepare_moe(dict(HIDDEN_SIZE=1024, INTER_SIZE=256, TP=1, E=4, TOPK=2),
+                           17, dtype="mxfp4", seed=8, structured_scales=True)
+    tuning = _tune_arguments(call)
+    configs = tm._configs(**tuning)
+    a4w4 = [c for c in configs if c.all_kwargs()["_impl"] in ("jit_mxfp4", "jit_mxfp4_4wave")]
+    good = next(c for c in configs if c.all_kwargs() == dict(
+        _impl="jit_splitk", tile_m_gate=16, tile_m_down=16, tile_n_gate=64, tile_n_down=64))
+    reference = torch_reference(call)
+    a4w4_reference = torch_reference(call, mxfp4_activations=True)
+    # A4W4 自身正确不等于满足公共 A16W4 精度要求；调优不能换参考来放行。
+    assert calc_diff(reference, a4w4_reference) > .02
+    for config in a4w4:
+        _check(tm._fmoe_wrapper(**tuning, **config.all_kwargs()), call, a4w4_reference)
+    assert tm._prune_invalid_configs([*a4w4, good], tuning) == [good]
+    with pytest.raises(ValueError, match="requires MXFP4 weights"):
+        torch_reference(_fly_call(), mxfp4_activations=True)
+
+
+@pytest.mark.parametrize("kind, config", [
+    ("bf16", dict(_impl="jit_8wave", tile_m_gate=128, tile_m_down=128, tile_n_gate=256, tile_n_down=128)),
+    ("bf16", dict(_impl="jit_8wave", tile_m_gate=256, tile_m_down=256, tile_n_gate=256,
+                  tile_n_down=64, down_path="persistent", num_oc_splits=4)),
+    ("mxfp4", dict(_impl="jit_mxfp4", tile_m_gate=128, tile_m_down=128, tile_n_gate=128, tile_n_down=128)),
+    ("mxfp4", dict(_impl="jit_mxfp4_4wave", tile_m_gate=256, tile_m_down=256, tile_n_gate=256, tile_n_down=128)),
+], ids=["bf16-default", "bf16-persistent", "mxfp4-generic", "mxfp4-4wave"])
+def test_migrated_stream_graph(kind, config):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+    call, _ = prepare_moe(dict(HIDDEN_SIZE=1024, INTER_SIZE=256, TP=1, E=4, TOPK=2),
+                           33, dtype=kind, seed=8, structured_scales=kind == "mxfp4")
+    call["hidden_states"].mul_(50)
+    runner = make_moe_runner(config)
+    reference = torch_reference(call, mxfp4_activations=kind == "mxfp4")
+    stats = measure_moe(runner, call, reference, copies=2, warmup=1, iters=3)
+    assert stats["correctness"]["status"] == "PASS" and len(stats["samples_us"]) == 3
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            runner(**call)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            runner(**call)
+            result = runner(**call)
+    stream.synchronize()
+    original = call["hidden_states"].clone()
+    for factor in (0.0, -.75, 1.0):
+        call["hidden_states"].copy_(original * factor)
+        call["topk_ids"].copy_((call["topk_ids"] + 1) % 4)
+        call["topk_weight"].mul_(-.5)
+        reference = torch_reference(call, mxfp4_activations=kind == "mxfp4")
+        call["output"].fill_(float("nan"))
+        graph.replay()
+        _check(result, call, reference)
+
+
+@pytest.mark.parametrize("kind, impl", [("bf16", "jit_8wave"), ("mxfp4", "jit_mxfp4_4wave")])
+def test_migrated_tuning_cache(kind, impl, monkeypatch, tmp_path):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+    call, _ = prepare_moe(dict(HIDDEN_SIZE=1024, INTER_SIZE=256, TP=1, E=4, TOPK=2),
+                           17, dtype=kind, seed=8)
+    call["hidden_states"].fill_(.0625)
+    if kind == "mxfp4":
+        # 精确可表示的输入/权重，使 A4W4 也通过原公共参考门槛。
+        for name in ("w1", "w2"):
+            call[name].view(torch.uint8).fill_(0x22)
+            call[f"{name}_scale"].view(torch.uint8).fill_(119)
+    configs = [c for c in tm._configs(**_tune_arguments(call)) if c.all_kwargs()["_impl"] == impl]
+    assert configs
+    tuner = tm.autotune(configs=configs, key=["batch_bucket", "model_key"],
+                        prune_configs_by=tm._prune_invalid_configs,
+                        artifact_name=f"migration_{impl}")(tm._fmoe_wrapper)
+    monkeypatch.setattr(tm, "_autotuned_fmoe", tuner)
+    monkeypatch.setattr(tm, "record_dispatch", True)
+    monkeypatch.setenv("FLYDSL_AUTOTUNE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("FLYDSL_AUTOTUNE", "1")
+    _check(tm.fused_moe(**call), call, torch_reference(call))
+    winner = tm.last_dispatch.copy()
+    assert winner["_impl"] == impl
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("cache hit must not retune")
+
+    monkeypatch.setenv("FLYDSL_AUTOTUNE", "0")
+    monkeypatch.setattr(tuner, "configs", unexpected)
+    call["hidden_states"].mul_(-.5)
+    call["topk_ids"].copy_((call["topk_ids"] + 1) % 4)
+    call["output"].fill_(float("nan"))
+    _check(tm.fused_moe(**call), call, torch_reference(call))
+    assert tm.last_dispatch == winner
 
 
 @pytest.mark.parametrize("tokens, hidden, inter, shuffled", [

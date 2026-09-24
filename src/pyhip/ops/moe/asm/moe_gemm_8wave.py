@@ -944,17 +944,15 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
                 voff[0] += num_warps*64*J.sizeof_DW4
 
         voff = J.gpr(J.lane_id[0] * J.sizeof_DW4)
-        voff2 = J.gpr("vu32", voff[0] + 64*1024)
+        # ds_read_b128 的立即数只有 16 位；BF16 K256 的 LDS 会跨过 128 KiB。
+        read_bases = [voff] + [J.gpr("vu32", voff[0] + base)
+                              for base in range(64*1024, ldsB[-1] + num_bytes_B, 64*1024)]
         def ds_read_B(lds, n, k):
             assert k >=0 and k < num_16x64b_K
             assert n >=0 and n < num_16x64b_wg_N
             offset = lds + n*(num_16x64b_K * 1024) + k*1024
-            if offset >= 64*1024:
-                voffset = voff2
-                offset -= 64*1024
-            else:
-                voffset = voff
-            J.ds_read_b128(mfma_B[n, k], voffset, mod=f"offset:{offset}")
+            J.ds_read_b128(mfma_B[n, k], read_bases[offset // (64*1024)],
+                          mod=f"offset:{offset % (64*1024)}")
 
         if AB_dtype == "bf16":
             def mfma():
@@ -1069,19 +1067,21 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
                         for lane in range(4):
                             J.v_fmac_f32(mfma_C[tm, tn, lane], tc[lane], ts)
 
-                for m in range(nrM):
-                    for n in range(0, nrN, 2):
-                        for i in range(4):
-                            J.v_mul_f32(mfma_C[m,n,i], mfma_C[m,n,i], vweights[m])
-                        for i in range(4):
-                            J.v_mul_f32(mfma_C[m,n+1,i], mfma_C[m,n+1,i], vweights[m])
+        def packC():
+            # BF16 和 FP8 都要乘 routing weight，再打包为 store 使用的 BF16。
+            for m in range(nrM):
+                for n in range(0, nrN, 2):
+                    for i in range(4):
+                        J.v_mul_f32(mfma_C[m,n,i], mfma_C[m,n,i], vweights[m])
+                    for i in range(4):
+                        J.v_mul_f32(mfma_C[m,n+1,i], mfma_C[m,n+1,i], vweights[m])
 
-                        J.uni_cvt_pk_bf16_f32(mfma_C_bf16[m,n,0], mfma_C[ m,n,0], mfma_C[ m,n,1])
-                        J.uni_cvt_pk_bf16_f32(mfma_C_bf16[m,n,1], mfma_C[ m,n,2], mfma_C[ m,n,3])
-                        J.uni_cvt_pk_bf16_f32(mfma_C_bf16[m,n,2], mfma_C[ m,n+1,0], mfma_C[ m,n+1,1])
-                        J.uni_cvt_pk_bf16_f32(mfma_C_bf16[m,n,3], mfma_C[ m,n+1,2], mfma_C[ m,n+1,3])
-                        J.v_permlane16_swap_b32(mfma_C_bf16[m,n,0], mfma_C_bf16[m,n,2])
-                        J.v_permlane16_swap_b32(mfma_C_bf16[m,n,1], mfma_C_bf16[m,n,3])
+                    J.uni_cvt_pk_bf16_f32(mfma_C_bf16[m,n,0], mfma_C[ m,n,0], mfma_C[ m,n,1])
+                    J.uni_cvt_pk_bf16_f32(mfma_C_bf16[m,n,1], mfma_C[ m,n,2], mfma_C[ m,n,3])
+                    J.uni_cvt_pk_bf16_f32(mfma_C_bf16[m,n,2], mfma_C[ m,n+1,0], mfma_C[ m,n+1,1])
+                    J.uni_cvt_pk_bf16_f32(mfma_C_bf16[m,n,3], mfma_C[ m,n+1,2], mfma_C[ m,n+1,3])
+                    J.v_permlane16_swap_b32(mfma_C_bf16[m,n,0], mfma_C_bf16[m,n,2])
+                    J.v_permlane16_swap_b32(mfma_C_bf16[m,n,1], mfma_C_bf16[m,n,3])
 
         # prepare output offsets
         stride_c = num_oc_splits * OC * J.sizeof(C_dtype)
@@ -1166,6 +1166,7 @@ def moe_gemm_8wave_down(J, is_output_over_4GB, AB_dtype, wg_M, wg_N,
 
         def compute(block_n):
             J.emit(mfma())
+            packC()
 
         def global_store(block_n):
             J.emit(storeC(block_n))

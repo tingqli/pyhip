@@ -50,7 +50,7 @@ ASM split-K 保留原脚本的实际 batch 集合：2–63、128–255、256/512
 | 选择 | H / I_tp / E / topk | M |
 |---|---|---|
 | 默认小 shape | 1024 / 256 / 8 / 4 | 1、17、257 |
-| `-m perf` 大 shape | 4096 / 256 / 512 / 10 | 64、1024、8192 |
+| `-m perf` 大 shape | 4096 / 256 / 512 / 10 | 8192、16384 |
 
 大 shape 复用 `qwen35_397B_k256` 的维度，但本测试始终使用 FP8 block-scale
 量化，不使用模型预设的 PTPC。两组都固定执行所选 tile / Down 路径，检查
@@ -63,10 +63,34 @@ python3 -m pytest tests/ops/moe/test_moe.py::test_jit_blockscale -s
 # 优化阶段：显式选择大 shape，不运行小 shape
 python3 -m pytest tests/ops/moe/test_moe.py::test_jit_blockscale_perf -m perf -s
 
-# 缩小到大 shape 的一个 batch 和 persistent 配置
+# 大 shape 固定为 M256/N64 persistent Down；选择其中一个 batch
 python3 -m pytest tests/ops/moe/test_moe.py::test_jit_blockscale_perf -m perf \
-  -k 'm1024 and dppersistent and bm256 and dn64' -s
+  -k m8192 -s
 ```
+
+### BF16 8-wave 与 A4W4 完整路径
+
+- `test_jit_8wave` / `test_jit_8wave_persistent` 固定运行 BF16 SiLU，覆盖 raw/shuffled、
+  M128/256、Down N128/256，以及 persistent K128/256、OC split1/2/4。
+- `test_jit_mxfp4` 覆盖通用 `moe_gemm_mxfp4` Gate/Up 和专用
+  `moe_gemm_mxfp4_gateup_4wave`，共用通用 Down；H 按1024对齐时使用 JIT
+  `moe_gemm_final_reduce_bf16`，否则仅最后一步改用 `torch.sum`，不更换 GEMM。
+  覆盖 H256/512/1536 的 fallback 与 H1024/2048 的 JIT reduce，
+  M1/17/513 同时覆盖空 worker 和不均匀 token 分配；两种路径都检查 graph replay。
+  测试的是完整 A4W4 MoE，不再保留逐阶段调试脚本或单独的 final-reduce 调试入口。
+- `test_jit_8wave_perf` / `test_jit_mxfp4_perf` 分别是显式 `perf` 大 shape 入口；
+  不通过参数级标记混合正确性组和性能组。
+
+```bash
+python3 -m pytest tests/ops/moe/test_moe.py -k 'test_jit_8wave or test_jit_mxfp4' -q
+python3 -m pytest tests/ops/moe/test_moe.py::test_jit_8wave_perf -m perf -s
+python3 -m pytest tests/ops/moe/test_moe.py::test_jit_mxfp4_perf -m perf -s
+```
+
+固定 A4W4 测试显式使用 `torch_reference(..., mxfp4_activations=True)`，
+用 Torch 量化/反量化模拟两次激活量化，并保持 `calc_diff <= 0.02`。
+这只是独立校验，不是运行候选或 fallback；公共 API 调优及 Aiter 对照仍使用默认
+A16W4 参考，量化误差超过原门槛的 A4W4 候选仍被排除。
 
 ## 共享工具与测试边界
 
@@ -104,6 +128,10 @@ E8M0 scale；这不改变 benchmark 的默认输入。RTA/RTE 保持 kernel 的�
 | `16x32_2s_b` | `jit_batch` / `test_asm_batch`；loop-N 单独测试 |
 | `mxn_splitk_2s` | `jit_splitk` / `test_asm_splitk` |
 | `mxn_splitk_1s` | `jit_1stage` / `test_asm_one_stage` |
+| BF16 SiLU 8-wave | `jit_8wave` / `test_jit_8wave`、`test_jit_8wave_persistent` |
+| FP8 block-scale 8-wave | `jit_blockscale` / `test_jit_blockscale` |
+| MXFP4 通用/专用 Gate/Up | `jit_mxfp4` / `jit_mxfp4_4wave` / `test_jit_mxfp4` |
+| BF16 GELU | `jit_gelu` / `test_jit_gelu`；不保留 MXFP4 GELU Torch fallback |
 | `fly_splitk_2s` 的 batch/启发式分支 | `fly_decode` / `fly_prefill`，按 direct、sorted、prefill 明确拆开 |
 | SiTUv2 / SwiGLU / MXFP4 布局 | 保留专门的参数化用例，不在一个 test 中改写 dtype 列表 |
 | 8x1 六种 K 和两种量化 | `test_fly_down_paths`，扩展为四条 Down 路径 |

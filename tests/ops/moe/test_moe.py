@@ -55,9 +55,9 @@ def _prepare(model, tokens, precision, **options):
     return call
 
 
-def _check(call, config):
+def _check(call, config, *, mxfp4_activations=False):
     runner = make_moe_runner(config)
-    reference = torch_reference(call)
+    reference = torch_reference(call, mxfp4_activations=mxfp4_activations)
     assert torch.isfinite(reference).all()
     call["output"].fill_(float("nan"))
     check = check_output(runner(**call), call["output"], reference)
@@ -65,11 +65,11 @@ def _check(call, config):
     return runner, reference
 
 
-def _measure(call, config, record_property):
+def _measure(call, config, record_property, *, mxfp4_activations=False):
     from pyhip.testing import misc
 
     assert misc.CUDAPERF is None, "unset CUDAPERF when running perf tests"
-    runner, reference = _check(call, config)
+    runner, reference = _check(call, config, mxfp4_activations=mxfp4_activations)
     stats = measure_moe(runner, call, reference, copies=2, warmup=2, iters=10)
     samples = stats["samples_us"]
     assert len(samples) == 10 and all(math.isfinite(t) and t > 0 for t in samples)
@@ -110,6 +110,50 @@ def test_asm_batch_loopn(tokens):
 def test_asm_splitk(tokens, precision):
     # 旧 block 参数遗漏传递；现在明确准备 block-scale 权重，而不是重复 PTPC。
     _check(_prepare(DECODE_MODEL, tokens, precision), SPLITK_CONFIG)
+
+
+@pytest.mark.parametrize("tokens", [1, 17, 513], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("tile_m", [128, 256], ids=lambda m: f"bm{m}")
+@pytest.mark.parametrize("tile_n_down", [128, 256], ids=lambda n: f"dn{n}")
+@pytest.mark.parametrize("preshuffle", ["off", "on"], ids=["raw", "shuffled"])
+def test_jit_8wave(tokens, tile_m, tile_n_down, preshuffle):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("these 8-wave tiles require gfx950")
+    model = dict(HIDDEN_SIZE=1024, INTER_SIZE=256, TP=1, E=8, TOPK=4)
+    call = _prepare(model, tokens, "bf16", preshuffle=preshuffle)
+    call["hidden_states"].mul_(50)
+    _check(call, dict(_impl="jit_8wave", tile_m_gate=tile_m, tile_m_down=tile_m,
+                      tile_n_gate=256, tile_n_down=tile_n_down))
+
+
+@pytest.mark.parametrize("tokens", [1, 17, 513], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("inter", [128, 256], ids=lambda i: f"i{i}")
+@pytest.mark.parametrize("splits", [1, 2, 4], ids=lambda s: f"split{s}")
+def test_jit_8wave_persistent(tokens, inter, splits):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("these 8-wave tiles require gfx950")
+    model = dict(HIDDEN_SIZE=1024, INTER_SIZE=inter, TP=1, E=8, TOPK=4)
+    call = _prepare(model, tokens, "bf16")
+    call["hidden_states"].mul_(50)
+    _check(call, dict(_impl="jit_8wave", tile_m_gate=256, tile_m_down=256,
+                      tile_n_gate=256, tile_n_down=64, down_path="persistent", num_oc_splits=splits))
+
+
+@pytest.mark.parametrize("tokens", [1, 17, 513], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("hidden, inter", [
+    (256, 256), (512, 256), (1536, 256), (2048, 256), (1024, 256), (1024, 512), (1024, 768),
+], ids=["h256-i256", "h512-i256", "h1536-i256", "h2048-i256", "h1024-i256", "h1024-i512", "h1024-i768"])
+@pytest.mark.parametrize("impl, tile_m, tile_n_gate", [
+    ("jit_mxfp4", 128, 128), ("jit_mxfp4_4wave", 128, 128),
+    ("jit_mxfp4_4wave", 128, 256), ("jit_mxfp4_4wave", 256, 128),
+    ("jit_mxfp4_4wave", 256, 256),
+], ids=["generic", "4wave-m128-n128", "4wave-m128-n256", "4wave-m256-n128", "4wave-m256-n256"])
+def test_jit_mxfp4(tokens, hidden, inter, impl, tile_m, tile_n_gate):
+    model = dict(HIDDEN_SIZE=hidden, INTER_SIZE=inter, TP=1, E=8, TOPK=4)
+    call = _prepare(model, tokens, "mxfp4")
+    call["hidden_states"].mul_(50)
+    _check(call, dict(_impl=impl, tile_m_gate=tile_m, tile_m_down=tile_m,
+                      tile_n_gate=tile_n_gate, tile_n_down=128), mxfp4_activations=True)
 
 
 def _run_jit_blockscale(model, tokens, tile_m, tile_n_down, down_path, record_property):
@@ -279,6 +323,32 @@ def test_fly_down_8x1_rejects_removed_bk64(inter_size):
             BLOCK_TILE_SIZE_M=256, BLOCK_TILE_SIZE_N=128, stage="down", alg="prefill_1x4",
             USE_ATOMIC_WRITE=False, act_quant_type="ptpc", tile_k=64,
             down_path="8x1", down_output_padding_bytes=128)
+
+
+@pytest.mark.perf
+@pytest.mark.parametrize("tokens", [8192, 16384], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("model_name", ["qwen35_397B_k256"])
+@pytest.mark.parametrize("down_path", ["default", "persistent"])
+def test_jit_8wave_perf(model_name, tokens, down_path, record_property):
+    call = _prepare(MOE_MODELS[model_name], tokens, "bf16")
+    call["hidden_states"].mul_(50)
+    _measure(call, dict(_impl="jit_8wave", tile_m_gate=256, tile_m_down=256,
+                        tile_n_gate=256, tile_n_down=64 if down_path == "persistent" else 256,
+                        down_path=down_path), record_property)
+
+
+@pytest.mark.perf
+@pytest.mark.parametrize("tokens", [1024, 8192], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("model_name", ["qwen35_397B_k256"])
+@pytest.mark.parametrize("impl, tile_m, tile_n_gate", [
+    ("jit_mxfp4", 128, 128), ("jit_mxfp4_4wave", 256, 256),
+], ids=["generic", "4wave"])
+def test_jit_mxfp4_perf(model_name, tokens, impl, tile_m, tile_n_gate, record_property):
+    call = _prepare(MOE_MODELS[model_name], tokens, "mxfp4")
+    call["hidden_states"].mul_(50)
+    _measure(call, dict(_impl=impl, tile_m_gate=tile_m, tile_m_down=tile_m,
+                        tile_n_gate=tile_n_gate, tile_n_down=128), record_property,
+             mxfp4_activations=True)
 
 
 @pytest.mark.perf

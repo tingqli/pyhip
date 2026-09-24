@@ -1,1 +1,1 @@
-"""MoE implementations, reference, and existing multi-backend wrappers."""
+"""MoE ASM/FlyDSL kernels and the Aiter-compatible tuned_moe entry point."""

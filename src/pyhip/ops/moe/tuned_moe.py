@@ -185,19 +185,20 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
         else:
             configs.append(Config(**params))
 
-    if kind == "block" and silu and separated:
+    if kind in ("bf16", "block") and silu and separated:
         arch = torch.cuda.get_device_properties(hidden_states.device).gcnArchName.split(":")[0]
-        # 原生 FP8 MFMA 和这些 8-wave tile 的 LDS 用量要求 gfx950。
+        # 这些 8-wave tile 的 LDS 用量要求 gfx950，BF16 不做激活量化。
         # 普通路径分别支持 raw/shuffled 权重，不替调用方转换布局。
         if arch == "gfx950":
+            impl = "jit_8wave" if kind == "bf16" else "jit_blockscale"
             for m in (128, 256):
                 for n in (128, 256):
-                    add("jit_blockscale", m, m, 256, n)
+                    add(impl, m, m, 256, n)
             # 沿用已有 persistent Down 的 M256 / 小 K 范围，counter 每次调用清零。
             if i <= 256 and getattr(w2, "is_shuffled", False):
                 for splits in (1, 2, 4):
                     if h % (splits * 128) == 0 and h // splits >= 256:
-                        add("jit_blockscale", 256, 256, 256, 64,
+                        add(impl, 256, 256, 256, 64,
                             down_path="persistent", num_oc_splits=splits)
 
     # 其余本地 kernel 要求两份权重都已 shuffle。
@@ -218,8 +219,11 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
         # 一阶段融合 kernel 的 Down 只支持 BF16 权重，不能传入 FP8/FP4。
         if kind == "bf16" and i <= 512:
             add("jit_1stage")
-        if kind == "fp4" and h % 1024 == 0 and i % 256 == 0:
+        if kind == "fp4" and h % 256 == 0 and i % 256 == 0:
             add("jit_mxfp4", 128, 128, 128, 128)
+            for m in (128, 256):
+                for n in (128, 256):
+                    add("jit_mxfp4_4wave", m, m, n, 128)
 
     if kind == "block":
         return configs  # 当前 FlyDSL kernel 不支持 128×128 block scale。
@@ -277,24 +281,36 @@ def _run_jit(x, w1, w2, ids, weights, options, out, impl, m, gn, dn, block_n):
                          x.data_ptr(), w1.data_ptr(), p1, w2.data_ptr(), p2,
                          out.data_ptr(), *routing, b)
         return out
-    if impl == "jit_mxfp4":
-        from .asm.moe_gemm_mxfp4 import moe_gemm_final_reduce_bf16, moe_gemm_mxfp4
+    if impl in ("jit_mxfp4", "jit_mxfp4_4wave"):
+        from .asm.moe_gemm_mxfp4 import (
+            moe_gemm_final_reduce_bf16, moe_gemm_mxfp4, moe_gemm_mxfp4_gateup_4wave,
+        )
         from aiter.utility.fp4_utils import moe_mxfp4_sort
 
+        if max(x.nbytes, w1.nbytes, w2.nbytes, mid.nbytes, b * topk * h * x.element_size()) >= 2**32:
+            raise ValueError("MXFP4 ASM kernels require tensors smaller than 4 GiB")
         # A4W4 还需要量化激活，并按排序后的 token 顺序重排激活 scale。
         quant = aiter.get_hip_quant(aiter.QuantType.per_1x32)
         xq, xs = quant(x, quant_dtype=w1.dtype)
         xs = moe_mxfp4_sort(xs, sorted_ids=si, num_valid_ids=valid, token_num=b, block_size=m)
-        moe_gemm_mxfp4([n1 // gn, grid], [256], m, gn, e, n1, h // 2, True, topk,
-                      *routing, w1.data_ptr(), p1, xq.data_ptr(), xs.data_ptr(), mid.data_ptr(), b)
+        if impl == "jit_mxfp4_4wave":
+            moe_gemm_mxfp4_gateup_4wave([n1 // gn * grid], [256], m, gn, e, n1, h // 2, True, topk,
+                                      *routing, w1.data_ptr(), p1, xq.data_ptr(), xs.data_ptr(), mid.data_ptr(), b)
+        else:
+            moe_gemm_mxfp4([n1 // gn, grid], [256], m, gn, e, n1, h // 2, True, topk,
+                          *routing, w1.data_ptr(), p1, xq.data_ptr(), xs.data_ptr(), mid.data_ptr(), b)
         aq, scales = quant(mid.view(b * topk, i), quant_dtype=w1.dtype)
         scales = moe_mxfp4_sort(scales[:b * topk].view(b, topk, -1), sorted_ids=si,
                                num_valid_ids=valid, token_num=b, block_size=m)
         routes = torch.empty((b, topk, h), dtype=x.dtype, device=x.device)
         moe_gemm_mxfp4([h // dn, grid], [256], m, dn, e, h, i // 2, False, topk,
                       *routing, w2.data_ptr(), p2, aq.data_ptr(), scales.data_ptr(), routes.data_ptr(), b)
-        moe_gemm_final_reduce_bf16([512], [64], topk, h, routes.data_ptr(), out.data_ptr(),
-                                  b // 512, b % 512, b)
+        # JIT reduce 双缓冲每轮处理两个 512 元素分片；不满足时仅替换最后的 sum。
+        if h % 1024 == 0:
+            moe_gemm_final_reduce_bf16([512], [64], topk, h, routes.data_ptr(), out.data_ptr(),
+                                      b // 512, b % 512, b)
+        else:
+            torch.sum(routes, dim=1, out=out)
         return out
     ptpc = w1.dtype == torch.bfloat16 or options["quant_type"] == aiter.QuantType.per_Token
     if impl == "jit_batch":
@@ -342,10 +358,13 @@ def _run_gelu(x, w1, w2, ids, weights, out):
     return out
 
 
-def _run_blockscale(x, w1, w2, ids, weights, options, out, m, gn, dn,
-                    down_path, num_oc_splits):
-    """W128×128 / A1×128 FP8 两阶段路径，复用 fused_moe 的 8-wave kernel。"""
+def _run_8wave(x, w1, w2, ids, weights, options, out, m, gn, dn,
+               down_path, num_oc_splits):
+    """BF16 或 W128×128 / A1×128 FP8 SiLU，共用 8-wave 两阶段流程。"""
     from .asm.moe_gemm_8wave import moe_gemm_8wave_down, moe_gemm_8wave_g1u1
+
+    def ptr(t):
+        return t.data_ptr() if t is not None else 0
 
     b, h = x.shape
     e, n1, _ = w1.shape
@@ -353,15 +372,17 @@ def _run_blockscale(x, w1, w2, ids, weights, options, out, m, gn, dn,
     si, sw, se, valid, _ = moe_sorting(ids, weights, e, h, x.dtype, m, output=out)
     routing = [t.data_ptr() for t in (si, sw, se, valid)]
     grid = min(se.numel(), b * topk)
-    quantize = aiter.get_hip_quant(aiter.QuantType.per_1x128)
+    bf16 = w1.dtype == torch.bfloat16
+    ab_dtype = "bf16" if bf16 else "fp8"
+    quantize = aiter.get_hip_quant(aiter.QuantType.No if bf16 else aiter.QuantType.per_1x128)
     # kernel 按 [K/128, M] 读取激活 scale；不要再将它转为 row-major。
     aq, a_scale = quantize(x, quant_dtype=w1.dtype, transpose_scale=True)
     mid = torch.empty((b, topk, i), dtype=x.dtype, device=x.device)
     tasks = n1 // gn * grid
     moe_gemm_8wave_g1u1(
-        [tasks], [512], aq.nbytes > (1 << 32), "fp8", m, gn, e, n1, h,
+        [tasks], [512], aq.nbytes > (1 << 32), ab_dtype, m, gn, e, n1, h,
         True, bool(getattr(w1, "is_shuffled", False)), topk, *routing,
-        w1.data_ptr(), options["w1_scale"].data_ptr(), aq.data_ptr(), a_scale.data_ptr(),
+        w1.data_ptr(), ptr(options["w1_scale"]), aq.data_ptr(), ptr(a_scale),
         mid.data_ptr(), b, tasks,
     )
     dq, d_scale = quantize(mid, quant_dtype=w2.dtype, num_rows_factor=topk, transpose_scale=True)
@@ -371,17 +392,17 @@ def _run_blockscale(x, w1, w2, ids, weights, options, out, m, gn, dn,
         counter = torch.zeros(1, dtype=torch.int32, device=x.device)
         workers = torch.cuda.get_device_properties(x.device).multi_processor_count
         moe_gemm_8wave_down(
-            [workers], [512], routes.nbytes > (1 << 32), "fp8", m, dn,
+            [workers], [512], routes.nbytes > (1 << 32), ab_dtype, m, dn,
             e, h, i, num_oc_splits, False, True, topk, *routing,
-            w2.data_ptr(), options["w2_scale"].data_ptr(), dq.data_ptr(), d_scale.data_ptr(),
+            w2.data_ptr(), ptr(options["w2_scale"]), dq.data_ptr(), ptr(d_scale),
             routes.data_ptr(), b, counter.data_ptr(),
         )
     else:
         tasks = h // dn * grid
         moe_gemm_8wave_g1u1(
-            [tasks], [512], dq.nbytes > (1 << 32), "fp8", m, dn, e, h, i,
+            [tasks], [512], dq.nbytes > (1 << 32), ab_dtype, m, dn, e, h, i,
             False, bool(getattr(w2, "is_shuffled", False)), topk, *routing,
-            w2.data_ptr(), options["w2_scale"].data_ptr(), dq.data_ptr(), d_scale.data_ptr(),
+            w2.data_ptr(), ptr(options["w2_scale"]), dq.data_ptr(), ptr(d_scale),
             routes.data_ptr(), b, tasks,
         )
     torch.sum(routes, dim=1, out=out)
@@ -495,12 +516,12 @@ def _fmoe_wrapper(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
     out = options["output"]
     if _impl == "jit_gelu":
         return _run_gelu(hidden_states, w1, w2, topk_ids, topk_weight, out)
-    if _impl in ("jit_batch1", "jit_batch", "jit_splitk", "jit_1stage", "jit_mxfp4"):
+    if _impl in ("jit_batch1", "jit_batch", "jit_splitk", "jit_1stage", "jit_mxfp4", "jit_mxfp4_4wave"):
         return _run_jit(hidden_states, w1, w2, topk_ids, topk_weight, options, out,
                         _impl, tile_m_down, tile_n_gate, tile_n_down, block_n)
-    if _impl == "jit_blockscale":
-        return _run_blockscale(hidden_states, w1, w2, topk_ids, topk_weight, options, out,
-                               tile_m_down, tile_n_gate, tile_n_down, down_path, num_oc_splits)
+    if _impl in ("jit_8wave", "jit_blockscale"):
+        return _run_8wave(hidden_states, w1, w2, topk_ids, topk_weight, options, out,
+                          tile_m_down, tile_n_gate, tile_n_down, down_path, num_oc_splits)
     if _impl in ("fly_decode", "fly_prefill"):
         return _run_fly(hidden_states, w1, w2, topk_ids, topk_weight, options, out,
                         _impl, tile_m_gate, tile_m_down, tile_n_gate, tile_n_down,
@@ -550,14 +571,14 @@ _autotuned_fmoe = autotune(
     configs=_configs,
     key=["batch_bucket", "model_key"],
     prune_configs_by=_prune_invalid_configs,
-    artifact_name="pyhip_fused_moe_v5",
+    artifact_name="pyhip_fused_moe_v6",
 )(_fmoe_wrapper)
 
 
 def _model_key(call):
     """把影响配置选择的信息加入 cache key；缓存只保存配置，不保存张量数据。"""
     # FlyDSL 不会读取 tensor 的自定义属性或展开 options 中的张量，需要手动补充。
-    values = {"version": 5}
+    values = {"version": 6}
     for name, value in call.items():
         if isinstance(value, torch.Tensor):
             shape = tuple(value.shape)
@@ -629,8 +650,8 @@ def fused_moe(
     """兼容 Aiter 的 MoE 推理接口；传入 output 时，会写入并返回该 tensor。
 
     对 BF16 输入、无 bias/EP 的组合调优：SiLU/SwiGLU/SiTUv2 使用 gated
-    结构，GELU 使用非 gated BF16 权重。gfx950 的 FP8 block-scale SiLU
-    和 BF16 GELU 路径支持两份权重各自的 raw/shuffled 布局；其它组合的
+    结构，GELU 使用非 gated BF16 权重。gfx950 的 BF16 / FP8 block-scale
+    SiLU 8-wave 和 BF16 GELU 路径支持两份权重各自的 raw/shuffled 布局；其它组合的
     原始布局或混合布局只能尝试 Aiter。候选都需通过 Torch 参考检查。
     其他 API 功能直接转交 Aiter，不在这里额外校验。若 is_shuffled 属性丢失
     （例如重新包装成 Parameter），就按原始布局处理，不猜测实际存储方式。

@@ -10,7 +10,7 @@ from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 
-# 默认使用保留 NaN 的 RTE；RTA 必须显式开启，简化位运算不保留所有 NaN。
+# 默认使用简化 RTA；关闭 RTA 后使用保留 NaN 的 RTE。
 _SIMPLIFIED_BF16_RTA = os.environ.get(
     "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED", "1"
 ).lower() in ("1", "true")

@@ -16,7 +16,7 @@
 8. FP8 路径按 `1×128` activation scale 和 `128×128` weight scale 做分块反量化；
 9. 输出为 `[num_tokens, TOPK, OC_total]` 的 BF16 中间结果，随后由上层对 `TOPK` 求和。
 
-实现入口见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L769)，调用点见 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L550)。
+实现入口见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py)，当前调用点为 [src/pyhip/ops/moe/tuned_moe.py](../src/pyhip/ops/moe/tuned_moe.py) 中的 `_run_8wave`。
 
 ---
 
@@ -29,7 +29,7 @@
 - down projection 的输出 tile 固定为 `wg_N=64`；
 - workgroup 固定为 512 threads，即 8 个 wave64。
 
-调用逻辑位于 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L494-L563)。当前固定启动：
+调用逻辑位于 [src/pyhip/ops/moe/tuned_moe.py](../src/pyhip/ops/moe/tuned_moe.py)。当前按输入设备的 CU 数启动 worker；本文以 256 CU 为例：
 
 $$
 G_{physical}=256
@@ -49,9 +49,9 @@ $$
 - 一个逻辑 task 会在内部遍历该大分片中的所有 `wg_N` tile；
 - 一个物理 workgroup 在一次 kernel dispatch 中可能串行完成多个逻辑 task。
 
-上层根据估算的尾部浪费率选择 `num_oc_splits`：若 256 CU 的最后一轮预计浪费超过 30%，取 4，否则取 1，见 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L507-L527)。动态 task 分配用于缓解不同 expert block 有效 token 数不均衡造成的长尾。
+上层在 `num_oc_splits=1/2/4` 中调优，并保证每个 split 的 OC 按 128 对齐且至少为 256，见 [src/pyhip/ops/moe/tuned_moe.py](../src/pyhip/ops/moe/tuned_moe.py)。动态 task 分配用于缓解不同 expert block 有效 token 数不均衡造成的长尾。
 
-上层分配的 `stage2_out` 形状为 `[num_tokens, TOPK, model_dim]`。kernel 已乘上 routing weight，但不在 kernel 内归约 TOPK；上层最终执行 `stage2_out.sum(dim=1)`，见 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L620-L628)。
+上层分配的 `routes` 形状为 `[num_tokens, TOPK, model_dim]`。kernel 已乘上 routing weight，但不在 kernel 内 reduce TOPK；上层用 `torch.sum(routes, dim=1, out=out)` 写入 caller output，见 [src/pyhip/ops/moe/tuned_moe.py](../src/pyhip/ops/moe/tuned_moe.py)。
 
 ---
 
@@ -469,7 +469,7 @@ $$
 
 kernel 强制 `bpreshuffle=True`，见 [src/pyhip/ops/moe/asm/moe_gemm_8wave.py](../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L899-L903)。逻辑上的 `[16, 64 bytes]` MFMA 输入 tile 在内存中已排列成可由 wave64 连续 `dwordx4` 搬运、并可由 `ds_read_b128` 直接读成 MFMA operand 的形式。
 
-反排布参考可见 [src/pyhip/ops/moe/moe_gemm_ref.py](../src/pyhip/ops/moe/moe_gemm_ref.py#L1-L18)。因此报告中的 `[N/16, Kbytes/64, 16, 64 bytes]` 是逻辑 tile 视图，不等价于原始 row-major 权重布局。
+反排布参考可见 [src/pyhip/testing/moe.py](../src/pyhip/testing/moe.py) 的 `_reference_weight`。因此报告中的 `[N/16, Kbytes/64, 16, 64 bytes]` 是逻辑 tile 视图，不等价于原始 row-major 权重布局。
 
 ### 8.2 一个 B tile 的大小
 
@@ -991,9 +991,9 @@ BF16 `mfma()` 只产生 `mfma_C`，但 `storeC()` 固定存 `mfma_C_bf16`。当�
 
 ### 17.8 Persistent counter 的生命周期
 
-若 `blk_atomic_int` 未在 dispatch 前清零，首个领取到的 `blk_id` 会从旧值继续增长，可能导致部分或全部逻辑 task 被跳过。当前调用点为每次调用创建零值张量并传入其 pointer，见 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L494) 和 [src/pyhip/ops/moe/fused_moe.py](../src/pyhip/ops/moe/fused_moe.py#L550-L563)。调用方重用 counter 时必须显式清零并保证其生命周期覆盖整个异步 kernel 执行。
+若 `blk_atomic_int` 未在 dispatch 前清零，首个领取到的 `blk_id` 会从旧值继续增长，可能导致部分或全部逻辑 task 被跳过。当前每次调用创建私有零值 counter 并传入其 pointer，见 [src/pyhip/ops/moe/tuned_moe.py](../src/pyhip/ops/moe/tuned_moe.py) 的 `_run_8wave`；graph replay 也执行清零。
 
-当前 `torch.zeros(1, dtype=torch.uint32)` 没有显式指定 `device=device`。必须确认应用环境设置了正确的 PyTorch 默认 device，或者改为显式在目标 GPU 上分配；否则传入的可能是 host pointer，无法作为普通 GPU global atomic 地址安全使用。
+counter 使用 `torch.zeros(1, dtype=torch.int32, device=x.device)`，明确在输入设备上分配，不依赖 PyTorch 默认设备。
 
 ### 17.9 动态任务分配与确定性
 

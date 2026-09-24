@@ -5,27 +5,27 @@ part of default pytest collection. Some filenames retain `test_` to minimize
 churn; their function arguments are CLI inputs, not pytest fixtures.
 
 - [gemm](gemm/): FP8/blockscale comparisons, standalone linear checks, and trace inputs.
-- [moe](moe/): fused MoE CLI, comparison script, MXFP4/sorting checks, and trace config.
+- [moe](moe/): Aiter vs tuned MoE comparison, sorting checks, and trace config.
 - [conv](conv/): depthwise convolution correctness and timing CLI.
 - [attention](attention/): paged-attention correctness/timing script.
 
 Run with the same Python environment used to install PyHIP:
 
 ```bash
-python benchmarks/moe/test_fused_moe.py --help
-python benchmarks/moe/cmp_perf_fused_moe.py --help
+python benchmarks/moe/bench_tuned_moe.py --help
 python benchmarks/moe/bench_tuned_moe.py --list-models
 python benchmarks/conv/test_conv_depthwise.py --help
 python benchmarks/gemm/test_w8a8_block_fp8_linear.py
 ```
 
-The MoE comparison script locates its sibling CLI relative to itself and uses
-the current Python interpreter. The GEMM trace script points to the relocated
-GEMM regression file; its external profiler/decoder requirements are unchanged.
+The MoE comparison runs both APIs in one process. Fixed BF16 8-wave and MXFP4
+kernel checks live in the [MoE pytest suite](../tests/ops/moe/README.md), with
+explicit `perf` groups for large shapes. The GEMM trace script's external
+profiler/decoder requirements are unchanged.
 
 For same-shape Aiter vs autotuned PyHIP MoE comparisons, use
 [bench_tuned_moe.py](moe/bench_tuned_moe.py). It shares the seven model presets
-with the interactive regression, validates both backends independently, and
+with the fixed-kernel pytest suite, validates both backends independently, and
 exports raw timings without backend-specific shape padding. See the
 [MoE benchmark guide](moe/README.md) for the protocol and result statuses.
 
