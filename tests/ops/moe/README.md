@@ -8,6 +8,13 @@
 [test_tuned_moe.py](test_tuned_moe.py) 保留调优策略、缓存、benchmark、
 特殊数值和 graph/多设备边界回归。固定 kernel 的覆盖不随候选策略变化。
 
+## 依赖接口
+
+当前基准为 FlyDSL 0.3.0 和 Aiter `cdfd46fcd`，直接使用 SiTUv2、原生 buffer
+描述符、命名 waitcnt 和 autotune artifact，不再提供旧版接口回退。
+Aiter 的 `moe_sorting` / `fused_moe` 仍无 `output` 参数，因此保留输出清零/复制适配；
+非空 `stage2_scatter` 仍明确拒绝。硬件架构限制与软件版本无关，继续保留对应跳过规则。
+
 ## 运行与选择
 
 在仓库根目录使用默认 ROCm Python：

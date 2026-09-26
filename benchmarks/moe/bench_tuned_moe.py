@@ -101,11 +101,9 @@ def tune_aiter(models, args):
                 environment("AITER_KSPLIT", "0"):
             for shape in shapes:
                 lookup = {"activation" if name == "act_type" else name: value for name, value in shape.items()}
-                beta, linear_beta, _ = fm._normalize_mxfp4_activation_params(
-                    shape["act_type"], args.beta, args.linear_beta, args.swiglu_limit)
+                # 当前 Aiter 的 beta/linear_beta/clamp 在执行时传入，不参与配置查表。
                 metadata = fm.get_2stage_cfgs(**lookup, hidden_pad=0, intermediate_pad=0,
-                                             gate_mode=args.gate_mode, situ_beta=beta,
-                                             situ_linear_beta=linear_beta, swiglu_limit=args.swiglu_limit)
+                                             gate_mode=args.gate_mode)
                 key = (fm.get_gfx_runtime(), fm.get_cu_num(), *(value if isinstance(value, (int, bool)) else str(value)
                                                              for value in shape.values()))
                 config = fm.cfg_2stages[0].get(key)

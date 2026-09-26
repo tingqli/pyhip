@@ -271,7 +271,12 @@ def test_fly_direct_clear_graph(monkeypatch, tokens, hidden, inter, kind, activa
 
 
 def test_aiter_signature():
-    assert inspect.signature(tm.fused_moe) == inspect.signature(tm._aiter_fused_moe)
+    # output/stage2_scatter 由 PyHIP 补齐，其余参数与当前 Aiter 一致。
+    parameters = inspect.signature(tm.fused_moe).parameters
+    native = inspect.signature(tm._aiter_fused_moe).parameters
+    assert set(parameters) - set(native) == {"output", "stage2_scatter"}
+    for name, parameter in native.items():
+        assert parameters[name] == parameter
 
 
 def test_fixed_runner_without_autotune(monkeypatch):
@@ -325,6 +330,41 @@ def test_shared_preparation(dtype, quant, activation, gate_mode):
         if isinstance(value, torch.Tensor) and name != "output":
             assert torch.equal(value.view(torch.uint8), benchmark_call[name].view(torch.uint8)), name
     assert call["w1"].is_shuffled and call["w2"].is_shuffled
+
+
+def test_fly_buffer_byte_offsets():
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+    from pyhip.codegen.flydsl.helpers import BufferTensor
+
+    # 32-bit load 曾因 v1i32 lowering 导致 LLVM 崩溃；BF16 同时覆盖字节/元素偏移。
+    dtype, elem = torch.bfloat16, fx.BFloat16
+    elements, packet_bytes = 2, 4
+    x = (torch.arange(64 * elements) % 29 + 1).to(dtype)
+    storage = torch.full((66 * elements,), 113, dtype=dtype)
+    out = storage[elements:-elements]
+
+    @flyc.kernel
+    def copy_packet(X: fx.Pointer, Y: fx.Pointer):
+        root = fx.rocdl.make_buffer_tensor(
+            fx.make_view(X, fx.make_layout(64 * elements, 1)), num_records_bytes=62 * packet_bytes)
+        # 非零 slice 偏移不能再加到显式、根 descriptor 相对的完整字节偏移上。
+        packet = BufferTensor(fx.make_view(fx.get_iter(root) + 2 * elements, fx.make_layout(elements, 1)))
+        values = packet.load(voffset_bytes=fx.Int32(fx.thread_idx.x * packet_bytes),
+                             soffset_bytes=fx.Int32(packet_bytes), aux=2)
+        fx.make_view(Y + fx.thread_idx.x * elements, fx.make_layout(elements, 1)).store(values)
+
+    @flyc.jit
+    def launch(X: fx.Pointer, Y: fx.Pointer, stream: fx.Stream):
+        copy_packet(X, Y).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+
+    _run_compiled(launch, flyc.from_c_void_p(elem, x.data_ptr()),
+                  flyc.from_c_void_p(elem, out.data_ptr()), torch.cuda.current_stream())
+    expected = torch.zeros_like(out)
+    expected[:61 * elements] = x[elements:62 * elements]
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    assert (storage[:elements] == 113).all() and (storage[-elements:] == 113).all()
 
 
 def test_fly_bf16_rounding_bits():

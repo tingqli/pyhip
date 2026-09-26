@@ -18,14 +18,12 @@ import os
 
 import aiter
 import torch
-from aiter.fused_moe import fused_moe as _aiter_fused_moe
-from aiter.fused_moe import moe_sorting
-from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import GateMode
 from flydsl.autotune import Config, autotune
 
 from pyhip import calc_diff
 from pyhip.testing.moe import torch_reference as _torch_reference
+from ._aiter_compat import fused_moe as _aiter_fused_moe, moe_sorting
 
 __all__ = ["fused_moe", "record_dispatch", "last_dispatch"]
 
@@ -567,15 +565,19 @@ def _prune_invalid_configs(configs, sig_args):
         )
     return valid
 
-
-# 不设 default：首次未命中缓存时必须先调优，不能直接使用未经校验的配置。
+"""
+  - 不设 default：首次未命中缓存时必须先调优，不能直接使用未经校验的配置。
+  - artifact(artifact_name, json文件保存tune过各种模型 winner configs 映射表) 是为了跨机器复用；
+  - artifact 只有设置了 FLYDSL_AUTOTUNE_CONFIG_DIR 目录才会生成
+  - 如果本地 scratch cache(FLYDSL_AUTOTUNE_CACHE_DIR)已经有命中的 winner (本地tune过的配置)，
+    它会优先于 artifact 被匹配上
+"""
 _autotuned_fmoe = autotune(
     configs=_configs,
     key=["batch_bucket", "model_key"],
     prune_configs_by=_prune_invalid_configs,
     artifact_name="pyhip_fused_moe_v6",
 )(_fmoe_wrapper)
-
 
 def _model_key(call):
     """把影响配置选择的信息加入 cache key；缓存只保存配置，不保存张量数据。"""
@@ -649,7 +651,7 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
-    stage2_scatter: Stage2ScatterContext | None = None,
+    stage2_scatter=None,
     output: torch.Tensor | None = None,
 ):
     """兼容 Aiter 的 MoE 推理接口；传入 output 时，会写入并返回该 tensor。
