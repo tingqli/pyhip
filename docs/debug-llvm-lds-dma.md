@@ -1,13 +1,15 @@
 
 # Dump all IRs
 
-Passing `-mllvm -print-after-all` to clang (or just `-print-after-all` to llc), all IRs after every pass will be dumpped to console during compilation.
+Passing `-mllvm -print-after-all` to clang (or just `-print-after-all` to llc), all IRs
+after every pass will be dumpped to console during compilation.
 
 ```bash
 /opt/rocm/llvm/bin/llc -march=amdgcn  -mcpu=gfx942 -print-after-all < xxx.ll > xxx.s 2> xxx.ir
 ```
 
-# LDS异步写入指令编译产生多余vmcnt的问题
+# LDS async-write instructions compile to redundant `vmcnt` waits
+# (CN) LDS异步写入指令编译产生多余vmcnt的问题
 
 
 ```c++
@@ -35,7 +37,11 @@ __global__ void test(int * src, int * dst, int offset) {
     dst[threadIdx.x] = sum;
 }
 /*
-产生如下汇编，看起来，LDS的读写入口是有序的，因此不需要加任何等待，
+The assembly below is produced. It appears that LDS read/write entry points are ordered,
+so no waits are needed: a `ds_read` issued first is not affected by a later `buffer_load`
+such that it would read modified data.
+
+(CN) 产生如下汇编，看起来，LDS的读写入口是有序的，因此不需要加任何等待，
 先发起的ds_read不会受到后发起的 buffer_load的影响返回被修改过的结果
 */
 	ds_read2st64_b32 v[2:3], v4 offset1:1
@@ -51,7 +57,8 @@ __global__ void test(int * src, int * dst, int offset) {
 	global_store_dword v1, v0, s[6:7]
 
 /*
-修改次序，先写入LDS,再从LDS读取数据:
+Reorder operations: write to LDS first, then read from LDS:
+(CN) 修改次序，先写入LDS,再从LDS读取数据:
 
 __device__ int devfunc(int32x4_t rsrc, int * ptr0, int * ptr1) {
     raw_buffer_load_lds(rsrc, (as3_uint32_ptr )ptr0, 4, threadIdx.x, 0,64*sizeof(int)*0,0);
@@ -66,8 +73,11 @@ __device__ int devfunc(int32x4_t rsrc, int * ptr0, int * ptr1) {
     return ret0 + ret1 + ret2 + ret3;
 }
 
-因为无法确定写入和读出是否针对相同地址或者重叠内存区域
-所以必须加入 s_waitcnt vmcnt(0) 保证异步写入LDS已经完成，再发起 LDS读取
+Because we cannot tell whether writes and reads target the same addresses or overlapping memory,
+we must insert `s_waitcnt vmcnt(0)` so async LDS writes complete before issuing LDS reads.
+
+(CN) 因为无法确定写入和读出是否针对相同地址或者重叠内存区域所以必须加入 s_waitcnt vmcnt(0) 保证异步
+写入LDS已经完成，再发起 LDS读取
 */
 	buffer_load_dword v0, s[0:3], 0 offen lds
 	buffer_load_dword v0, s[0:3], 0 offen offset:256 lds
@@ -86,11 +96,19 @@ __device__ int devfunc(int32x4_t rsrc, int * ptr0, int * ptr1) {
 
 
 /*
-仅仅把 ptr1 加上 restrict 修饰 (ptr0的 restrict 修饰加不加不影响结果汇编)
+Adding `restrict` only to `ptr1` (whether `ptr0` is `restrict` or not does not change the 
+resulting assembly). The generated assembly issues memory-to-LDS writes first, then reads 
+from LDS; `restrict` guarantees the two sides do not access the same addresses, so issuing 
+writes first can overlap better with `ds_read`.
+
+However, the `s_waitcnt vmcnt(0)` here feels redundant: `restrict` already implies LDS
+reads need not wait on those writes. This touches the core logic of using async LDS loads 
+for high performance, so we need a way to eliminate this extra `s_waitcnt vmcnt(0)`.
+
+(CN) 仅仅把 ptr1 加上 restrict 修饰 (ptr0的 restrict 修饰加不加不影响结果汇编)
 __device__ int devfunc(int32x4_t rsrc, int * ptr0, int * __restrict__ ptr1) {
 产生的汇编开始先从内存写入LDS，然后再从LDS读出，因为 restrict 语义已经保证 二者不会
 访问相同地址的内容，因此先发起写入，可以利用 ds_read 更好的并行。
-
 但是这里的 s_waitcnt vmcnt(0) 感觉是多余的。因为 restrict 语义已经保证了，从LDS读取无需等待
 这涉及到使用该异步LDS读入进行高性能计算的核心逻辑，因此必须找到优化掉这个多余 s_waitcnt vmcnt(0) 的方法。
 
@@ -113,8 +131,8 @@ __device__ int devfunc(int32x4_t rsrc, int * ptr0, int * __restrict__ ptr1) {
 
 
 /*
-该错误似乎在clang-22中被修复了， s_waitcnt vmcnt(0) 只有不存在 restrict 修饰符的情况下才会被
-插入。 
+This bug appears fixed in clang-22: `s_waitcnt vmcnt(0)` is inserted only when `restrict` is absent.
+(CN) 该错误似乎在clang-22中被修复了， s_waitcnt vmcnt(0) 只有不存在 restrict 修饰符的情况下才会被插入。
 */
 
 	buffer_load_dword v1, s[0:3], 0 offen lds
@@ -134,22 +152,39 @@ __device__ int devfunc(int32x4_t rsrc, int * ptr0, int * __restrict__ ptr1) {
 
 ```
 
+# How to optimize away redundant `vmcnt` waits
+# (CN) 如何优化多余的vmcnt等待
 
-# 如何优化多余的vmcnt等待
-
-
-llvm的执行选项可以通过clang传入:`-mllvm -print-after-all`，这会打印全部的IR，即使发布版也有，非常利于调试。
+LLVM execution options can be passed through clang as `-mllvm -print-after-all`; this dumps all IR
+(even in release builds) and is very helpful for debugging.
+(CN) llvm的执行选项可以通过clang传入:`-mllvm -print-after-all`，这会打印全部的IR，即使发布版也有，非常利于调试。
 
 
 ```python
-# 在最终的log里面搜索第一次出现 isel （instruction selection）关键字可以发现，llvm IR在restrict存在和不存在就存在区别：没有 restrict 时，按照原始代码次序，先触发 LDS DMA，再从LDS加载数据到寄存器，因为二者可能引用重叠内存地址, 并且两个指令都没有 alias 相关的属性
+# In the final log, search for the first occurrence of `isel` (instruction selection): LLVM IR differs
+# with and without `restrict`. Without `restrict`, program order triggers LDS DMA first, then loads from
+# LDS into registers, because the two may reference overlapping memory and neither instruction carries
+# alias-related metadata.
+
+# (CN) 在最终的log里面搜索第一次出现 isel （instruction selection）关键字可以发现，llvm IR在restrict存在和不存在
+# 就存在区别：没有 restrict 时，按照原始代码次序，先触发 LDS DMA，再从LDS加载数据到寄存器，因为二者可能引用重叠内存地址, 
+# 并且两个指令都没有 alias 相关的属性
 '''
   %12 = getelementptr inbounds i32, ptr addrspace(3) %9, i32 %11
   tail call void @llvm.amdgcn.raw.buffer.load.lds(<4 x i32> noundef %8, ptr addrspace(3) noundef @_ZZ4testPiS_iE3lds, i32 noundef 4, i32 noundef %11, i32 noundef 0, i32 noundef 0, i32 noundef 0) #3
   %13 = load i32, ptr addrspace(3) %12, align 4, !tbaa !6
 '''
 
-# 带有 restrict 时，先从LDS读取再触发LDS DMA加载数据，因为二者数据无关，并且先出现的指令 带有 alias.scope, 后出现的带有 noalias, 这一点跟 lds-dma-waits.ll 中的测试用例不同，但是我们通过构造类似 lds-dma-waits.ll 中的用例，就是声明多个 __shared__ 数组的方式，发现虽然isel之前的llvm IR中没有alias信息，但是在(amdgpu-lower-module-lds)步骤之后却出现了正确的 alias.scope 和 noalias 属性，每个lds数组被生成了一个独立的 alias.scope, 以供后继分析使用
+# With `restrict`, IR order is LDS read first, then LDS DMA load, because the data are independent; 
+# the earlier instruction has `alias.scope` and the later has `noalias`—unlike `lds-dma-waits.ll`.
+# By building a case like that file (multiple `__shared__` arrays), we see that before isel there 
+# is no alias metadata, but after `amdgpu-lower-module-lds` correct `alias.scope` / `noalias` appear, 
+# with one `alias.scope` per LDS array for later analyses.
+
+# (CN) 带有 restrict 时，先从LDS读取再触发LDS DMA加载数据，因为二者数据无关，并且先出现的指令 带有 alias.scope, 
+# 后出现的带有 noalias, 这一点跟 lds-dma-waits.ll 中的测试用例不同，但是我们通过构造类似 lds-dma-waits.ll 中的用例，
+# 就是声明多个 __shared__ 数组的方式，发现虽然isel之前的llvm IR中没有alias信息，但是在(amdgpu-lower-module-lds)步骤
+# 之后却出现了正确的 alias.scope 和 noalias 属性，每个lds数组被生成了一个独立的 alias.scope, 以供后继分析使用
 
 '''
   %21 = getelementptr inbounds i32, ptr addrspace(3) %18, i32 %20
@@ -158,7 +193,14 @@ llvm的执行选项可以通过clang传入:`-mllvm -print-after-all`，这会打
   tail call void @llvm.amdgcn.raw.buffer.load.lds(<4 x i32> noundef %17, ptr addrspace(3) noundef @llvm.amdgcn.kernel._Z4testPiS_i.lds, i32 noundef 4, i32 noundef %20, i32 noundef 0, i32 noundef 0, i32 noundef 0) #7, !noalias !12
 '''
 
-  # 但是这个次序在 Machine Instruction Scheduler (machine-scheduler) 之后反转，又变回了先触发LDS DMA，再读LDS,这也没问题，越早触发越早完成，反正restrict语义保证了二者引用的内存地址不重叠，谁先谁后无所谓, 但是这里出现一点问题就是按理说应该先出现的指令先声明alias.scope，但是此处指令调度之后，后出现的指令才有scope!!!
+  # After the machine instruction scheduler, this order flips back to LDS DMA first, then LDS read—which 
+  # is fine: earlier issue finishes sooner, and `restrict` means non-overlapping addresses so
+  # order does not matter. One wrinkle: you would expect the first instruction in program order to 
+  # declare `alias.scope`, but after scheduling the *later* instruction carries the scope.
+  
+  # (CN) 但是这个次序在 Machine Instruction Scheduler (machine-scheduler) 之后反转，又变回了先触发LDS DMA，
+  # 再读LDS, 这也没问题，越早触发越早完成，反正restrict语义保证了二者引用的内存地址不重叠，谁先谁后无所谓, 
+  # 但是这里出现一点问题 就是按理说应该先出现的指令先声明alias.scope，但是此处指令调度之后，后出现的指令才有scope!!!
 
 '''
   320B	  BUFFER_LOAD_DWORD_LDS_OFFEN %14:vgpr_32, %12:sgpr_128, 0, 0, 0, 0, implicit $exec, implicit $m0 :: (dereferenceable load (s32) from `ptr addrspace(1) poison`, align 1, !noalias !12, addrspace 1), (dereferenceable store (s32) into @llvm.amdgcn.kernel._Z4testPiS_i.lds, align 1, !noalias !12, addrspace 3)
@@ -166,7 +208,11 @@ llvm的执行选项可以通过clang传入:`-mllvm -print-after-all`，这会打
   336B	  %17:vgpr_32 = V_LSHL_ADD_U32_e64 %4:sreg_32_xm0_xexec, 2, %16:vgpr_32, implicit $exec
   344B	  %19:vgpr_32 = DS_READ_B32_gfx9 %17:vgpr_32, 0, 0, implicit $exec :: (load (s32) from %ir.21, !tbaa !8, !alias.scope !12, addrspace 3)
 '''
-  # 对比第一次出现 S_WAITCNT 3952 （也就是s_waitcnt vmcnt(0)的编码）的pass，可知是`SIInsertWaitcnts.cpp`生成的wait:
+  # Comparing the pass where `S_WAITCNT 3952` first appears (encoding of `s_waitcnt vmcnt(0)`), 
+  # the wait is inserted by `SIInsertWaitcnts.cpp`.
+  
+  # (CN) 对比第一次出现 S_WAITCNT 3952 （也就是s_waitcnt vmcnt(0)的编码）的pass 可知是`SIInsertWaitcnts.cpp`
+  # 生成的wait:
 '''
   BUFFER_LOAD_DWORD_LDS_OFFEN $vgpr1, killed $sgpr0_sgpr1_sgpr2_sgpr3, 0, 0, 0, 0, implicit $exec, implicit $m0 :: (dereferenceable load (s32) from `ptr addrspace(1) poison`, align 1, !noalias !12, addrspace 1), (dereferenceable store (s32) into @llvm.amdgcn.kernel._Z4testPiS_i.lds, align 1, !noalias !12, addrspace 3)
   renamable $vgpr1 = V_LSHLREV_B32_e32 2, killed $vgpr1, implicit $exec
@@ -174,12 +220,21 @@ llvm的执行选项可以通过clang传入:`-mllvm -print-after-all`，这会打
   S_WAITCNT 3952
   renamable $vgpr1 = DS_READ_B32_gfx9 killed renamable $vgpr1, 0, 0, implicit $exec :: (load (s32) from %ir.21, !tbaa !8, !alias.scope !12, addrspace 3)
 '''
-#  这一步中，根据 ds_read 中的 !alias.scope !12 以及 BUFFER_LOAD_DWORD_LDS_OFFEN 中的 !noalias !12 应该可以肯定二者无关。
-#  从而不必插入s_waitcnt vmcnt(0)进行等待。
+# At this step, `!alias.scope !12` on `ds_read` and `!noalias !12` on `BUFFER_LOAD_DWORD_LDS_OFFEN` 
+# should prove the operations are unrelated, so inserting `s_waitcnt vmcnt(0)` should not be
+# necessary.
+
+# (CN) 这一步中，根据 ds_read 中的 !alias.scope !12 以及 BUFFER_LOAD_DWORD_LDS_OFFEN 中的 !noalias
+# !12 应该可以肯定二者无关。从而不必插入s_waitcnt vmcnt(0)进行等待。
 
 ```
 
-通过跟踪插入waitcnt的代码在`restrict`修饰符存在和不存在两种情况下的不同执行路径发现，在restrict存在时，`ds_read`指令会跳过一些逻辑不会产生vmcnt0的wait，而关键代码是下面的commit添加的：
+Tracing the waitcnt-insertion code for paths with and without `restrict` shows that with `restrict`, 
+`ds_read` skips some logic so no `vmcnt(0)` wait is produced; the key behavior was introduced by the
+commit below.
+
+(CN) 通过跟踪插入waitcnt的代码在`restrict`修饰符存在和不存在两种情况下的不同执行路径发现，在restrict存在时，
+`ds_read`指令会 跳过一些逻辑不会产生vmcnt0的wait，而关键代码是下面的commit添加的：
 
 ```txt
 
@@ -198,15 +253,32 @@ locations if we can prove they are disjoint using alias analysis.
 
 Fixes: SWDEV-433427
 
-这里提到了一些关键点和scoreboard概念：
- - 修改前只有track register dependencies, 例如load指令读入数据到vgpr寄存器，后面又对该寄存器进行ALU计算，此时该vgpr在被ALU指令使用之前应该插入s_waitcnt指令保证数据就位，但是应该wait多少个cnt，则取决指令调度/排布阶段，在使用该寄存器和读取该寄存器之间插入了多少条其他vm指令。这些信息就是编译器内部维护的所谓scoreboard完成的。
- - 修改增加了memory dependencies的tracking逻辑，因为buffer_load_to_lds指令写入的是LDS内存而非寄存器，后继读取LDS内存到寄存器的指令潜在会需要等待buffer_load_to_lds的目的LDS内存区域ready，这个等待也是通过插入合适的wait vmcnt指令完成，但是跟寄存器不同，此时写入的是LDS，而且地址还可能未知（alias）
+The commit highlights scoreboard ideas:
+ - Before the change, only register dependencies were tracked: e.g. a load writes a VGPR and a later
+   ALU uses it—`s_waitcnt` must ensure data is ready before use; how many counts to wait depends
+   on scheduling (how many other VM instructions sit between producer and consumer). The compiler’s 
+   internal “scoreboard” tracks that.
+ - The change adds memory-dependency tracking: `buffer_load_to_lds` writes LDS, not a register; a 
+   later LDS read may need the destination LDS region to be ready, again via `wait vmcnt`, but unlike
+   registers the target is LDS and addresses may be unknown (aliasing).
 
-但是该commit出问题的clang中也包含，因此不是该commit解决的问题
-对比了无问题的最新代码和有问题的分支发现下面的commit才是fix，
-该commit基本上就是说，只需要ds_read中存在 alias.scope 修饰符
-哪怕在`LDSDMAStores`中找不到匹配项，仍然不插入vmcnt(0).
-这里提到一个 `inter-thread dependences` 有点无法理解。
+(CN) 这里提到了一些关键点和scoreboard概念：
+ - 修改前只有track register dependencies, 例如load指令读入数据到vgpr寄存器，后面又对该寄存器进行ALU
+   计算，此时该vgpr在被ALU指令使用之前应该插入s_waitcnt指令保证数据就位，但是应该wait多少个cnt，则
+   取决指令调度/排布阶段，在使用该寄存器和读取该寄存器之间插入了多少条其他vm指令。这些信息就是编译器
+   内部维护的所谓scoreboard完成的。
+ - 修改增加了memory dependencies的tracking逻辑，因为buffer_load_to_lds指令写入的是LDS内存而非寄存器，
+   后继读取LDS内存到寄存器的指令潜在会需要等待buffer_load_to_lds的目的LDS内存区域ready，这个等待也是
+   通过插入合适的wait vmcnt指令完成，但是跟寄存器不同，此时写入的是LDS，而且地址还可能未知（alias）
+
+The buggy clang build also contains this commit, so it is not what fixed the issue. Comparing latest 
+good code to the bad branch shows the fix is the commit below: essentially, if `ds_read` has
+`alias.scope` metadata, do not insert `vmcnt(0)` even when no matching entry is found in `LDSDMAStores`. 
+The commit message’s “inter-thread dependences” is a bit opaque.
+
+(CN) 但是该commit出问题的clang中也包含，因此不是该commit解决的问题对比了无问题的最新代码和有问题的分支发现
+下面的commit才是fix，该commit基本上就是说，只需要ds_read中存在 alias.scope 修饰符哪怕在`LDSDMAStores`
+中找不到匹配项，仍然不插入vmcnt(0). 这里提到一个 `inter-thread dependences` 有点无法理解。
 
 e75f586b813a081cffcafb8b5d34b5547e52e548
 
@@ -218,8 +290,11 @@ handling inter-thread dependences is normally managed by the memory
 model instead of the waitcnt pass, so this change updates the behavior
 to be more inline with how other types of memory events are handled.
 
-这个commit也修改了下面的测试用例，从测试用例可以更清楚的了解该修改的主要逻辑
-应该可以用debug模式跟踪测试用例的编译器的表现来更深入的理解这些改动。
+This commit also updates the test below; the test clarifies the main logic. You can run
+the compiler in debug mode on that test to see behavior in more detail.
+
+(CN) 这个commit也修改了下面的测试用例，从测试用例可以更清楚的了解该修改的主要逻辑应该可以用debug模式跟踪测试
+用例的编译器的表现来更深入的理解这些改动。
 
 llvm\test\CodeGen\AMDGPU\lds-dma-waits.ll (e75f586)
 
@@ -310,7 +385,11 @@ main_body:
 }
 
 
-下面是新引入的测试用例，LDS DMA写入的区域(scope)和load的区域完全无关, generateWaitcntInstBefore因此就会比对之前的检查
+Below is a newly added test: the LDS DMA write scope and the load region are completely disjoint, so
+`generateWaitcntInstBefore` applies the stricter checks described earlier.
+
+(CN) 下面是新引入的测试用例，LDS DMA写入的区域(scope)和load的区域完全无关, generateWaitcntInstBefore因此
+就会比对之前的检查
 
 define amdgpu_kernel void @global_load_lds_no_alias_ds_read(ptr addrspace(1) nocapture %gptr, i32 %i1, i32 %i2, ptr addrspace(1) %out) {
 ; GFX9-LABEL: global_load_lds_no_alias_ds_read:
@@ -353,20 +432,53 @@ renamable $vgpr2_vgpr3 = DS_READ2ST64_B32_gfx9 renamable $vgpr1, 0, 1, 0, implic
 
 
 WaitcntBrackets
-现在我们对问题的大致情况有所了解，但是还是缺乏一个全局概念，理解函数`SIInsertWaitcnts::run`的行为就是最后一步。一个比读代码更为非常有效的，直接获得函数行为的感性认识的方式，就是观察代码的行为，而作者非常清楚这一点，下面的参数可以产生我们感兴趣的pass的行为debug-log `-debug-only=si-insert-waitcnts -print-after-all`, 这个log还需要配合一个非常简单的测试用例，我们直接从作者构造的用例`lds-dma-waits.ll`中摘取一个函数即可。
+We now have a rough picture of the issue but still lack a global mental model; understanding 
+`SIInsertWaitcnts::run` is the last step. A very effective way to build intuition for what the 
+function does—often more so than reading code line by line—is to observe its behavior; the LLVM 
+authors know this. The flags `-debug-only=si-insert-waitcnts -print-after-all` produce a debug log 
+for the pass we care about. Pair that log with a tiny test case; you can lift one function from the
+author’s `lds-dma-waits.ll`.
 
-跟llvm IR有异曲同工之妙，log也是高度抽象的，简洁的表达，因此需要观察产生log的地方的代码才能理解其含义，我们发现打印的是核心数据结构`WaitcntBrackets`的内容，以及发生重大修改，也就是插入新s_waitcnt指令的地方。
+(CN) 现在我们对问题的大致情况有所了解，但是还是缺乏一个全局概念，理解函数`SIInsertWaitcnts::run`的行为
+就是最后一步。一个比读代码更为非常有效的，直接获得函数行为的感性认识的方式，就是观察代码的行为，而作者非常
+清楚这一点，下面的参数可以产生我们感兴趣的pass的行为debug-log `-debug-only=si-insert-waitcnts -print-after-all`,
+这个log还需要配合一个非常简单的测试用例，我们直接从作者构造的用例`lds-dma-waits.ll`中摘取一个函数即可。
 
-每遇到一条会引起 vmcnt/lgkmcnt/... 等计数器增加的指令类型时，编译器就会模拟硬件执行期行为，对`WaitcntBrackets`中的计数器进行增加，同时记录是哪些目标寄存器（对加载到LDS的指令，引入了8个伪寄存器）会被修改，例如`s[8:15]=S_LOAD_DWORDX8`就会引起`LGKM_CNT`增加1并由编译器记录`s[8:15]`会被更新。后面遇到需要访问`s[8:15]`寄存器的指令时，就知道需要插入合适的s_waitcnt了。
+Like LLVM IR, the log is highly abstract and terse, so you need to read the code that
+emits it. We see dumps of the core structure `WaitcntBrackets`, and places where behavior 
+changes materially—namely where new `s_waitcnt` instructions are inserted.
 
-每个寄存器维护了一个score，代表的是其是被第几个issue（且未完成）的指令所写入的，每次插入s_waitcnt指令要求count降低时，低score的寄存器（也就是较早发起读入的寄存器）就优先被完成。
+(CN) 跟llvm IR有异曲同工之妙，log也是高度抽象的，简洁的表达，因此需要观察产生log的地方的代码才能理解其含义，
+我们发现打印的是核心数据结构`WaitcntBrackets`的内容，以及发生重大修改，也就是插入新s_waitcnt指令的地方。
+
+For each instruction kind that bumps `vmcnt` / `lgkmcnt` / …, the compiler mimics hardware behavior: 
+it increments the counters in `WaitcntBrackets` and records which destination registers will be 
+written (for loads into LDS, eight pseudo-registers are used). For example `s[8:15] = S_LOAD_DWORDX8` 
+bumps `LGKM_CNT` by one and the compiler notes that `s[8:15]` will be updated. When a later instruction 
+reads `s[8:15]`, it knows to insert an appropriate `s_waitcnt`.
+
+(CN) 每遇到一条会引起 vmcnt/lgkmcnt/... 等计数器增加的指令类型时，编译器就会模拟硬件执行期行为，对
+`WaitcntBrackets`中的计数器进行增加，同时记录是哪些目标寄存器（对加载到LDS的指令，引入了8个伪寄存器）会被
+修改，例如`s[8:15]=S_LOAD_DWORDX8`就会引起`LGKM_CNT`增加1并由编译器记录`s[8:15]`会被更新。后面遇到需要
+访问`s[8:15]`寄存器的指令时，就知道需要插入合适的s_waitcnt了。
+
+Each register keeps a *score*: which issued-but-not-yet-completed instruction last wrote it. When 
+an `s_waitcnt` lowers the count, lower-score registers (those from earlier in-flight ops) are 
+considered completed first.
+
+(CN) 每个寄存器维护了一个score，代表的是其是被第几个issue（且未完成）的指令所写入的，每次插入s_waitcnt指令
+要求count降低时，低score的寄存器（也就是较早发起读入的寄存器）就优先被完成。
 
 s0 = s_load_dword : lgkm_cnt(1) 0:s0
 s1 = s_load_dword : lgkm_cnt(2) 0:s0 1:s1
 s2 = s_load_dword : lgkm_cnt(3) 0:s0 1:s1 2:s2
 
-s_waitcnt lgkm_cnt(1)  等待lgkm_cnt小于等于1，因此score小于等于1的寄存器就完成了
-                    lgkm_cnt <=1 1:s2  
+`s_waitcnt lgkmcnt(1)` waits until `lgkmcnt <= 1`, so registers with score ≤ 1 are
+treated as complete;
+        lgkmcnt <= 1 1:s2
+
+(CN) s_waitcnt lgkm_cnt(1)  等待lgkm_cnt小于等于1，因此score小于等于1的寄存器就完成了
+        lgkm_cnt <=1 1:s2
 
 
 Summary:
@@ -381,59 +493,109 @@ to clear any pending event type (and will then clear all pending event
 types for that count type).
 
 
-阅读代码的方法，收集简单事实，理解变量含义：
+How to read the code: collect small facts and map names to meaning.
+ - Each counter type has its own LB/UB: `getScoreUB(T)` / `setScoreUB(T, CurrScore)`.
+ - Each register has a per-counter score: `getRegScore(RegNo, T)` /
+ `setScoreByInterval(Interval, T, CurrScore)`.
+ - UB is bumped by one in `updateEventWaitcntAfter` per instruction kind—modeling the
+ hardware counter increment at issue. UB never decreases in the code searched, so **UB
+ is effectively the total number of instructions of that type that have been issued**.
+ - LB is updated in `generateWaitcnt` / `applyWaitcnt` from the emitted `s_waitcnt` type
+ and count `Count`, to `(UB - Count)`; given the meaning of `s_waitcnt type(Count)`,
+ **LB can be read as how many instructions of that type have completed**.
+ - Comments say the “bracket” in `WaitcntBrackets` is the interval `[LB, UB]`.
+
+ - **`[LB, UB]` and register scores mainly decide when and how much to insert
+ `s_waitcnt`.** Concretely:
+  - In `updateByEvent()`:
+   1. UB for the current instruction’s counter type increments by one (UB never
+   shrinks).
+   2. For defs (`Inst.defs()`), UB sets each def’s score; scores are immutable once
+   set—**so a register’s score is the issue index / “time” of the instruction that will
+   write it**.
+   3. For memoperands (`Inst.memoperands()`), if the insn may write LDS (from registers
+   or external DMA), a pseudo def represents the LDS region by alias scope, its score is
+   set, and alias info is stored in a `LDSDMAStores` slot; regardless of alias metadata,
+   `FIRST_LDS_VGPR` records the latest LDS-write “time” (score).
+
+  - In `generateWaitcntInstBefore()` / `determineWait()`:
+   1. For source registers: if a score lies in `(LB, UB]`, the value may still be
+   overwritten by an in-flight instruction—then plan a wait for `UB - Score` so the
+   producer at that score completes.
+   2. For memoperands: if a read might come from LDS (addr space LDS or FLAT when
+   unknown at compile time), check `alias.scope`; if it overlaps a region in
+   `LDSDMAStores`, use that region’s score to choose the wait count; if no overlap, no
+   wait; without `alias.scope`, fall back to the conservative `FIRST_LDS_VGPR` rule.
+
+ - In `WaitcntBrackets::print()`, printed register scores are relative: `RegScore - (LB
+ + 1)`; scores ≤ LB are omitted, so log values sit in `[0, UB - LB)`—relative issue
+ order among still-incomplete instructions.
+
+(CN) 阅读代码的方法，收集简单事实，理解变量含义：
  - 每种counter有自己的LB/UB: getScoreUB(T)/setScoreUB(T, CurrScore);
  - 每个寄存器，每种counter有自己的score: getRegScore(RegNo, T)/setScoreByInterval(Interval, T, CurrScore);
- - counter的UB在 updateEventWaitcntAfter 函数中，根据指令类型增长1，这就是在追踪硬件counter对相应指令issue阶段加1的行为，并且搜索代码发现UB永远不减少，所以**UB的含义就是该类型指令的总的issue的数量**。
- - counter的LB在 generateWaitcnt/applyWaitcnt 函数中，根据生成的s_waitcnt的类型和等待数量Count, 修改为`(UB-Count)`, 根据`s_waitcnt type(Count)`指令的含义，**LB可以理解为已经完成的此类型的指令的数量**。
+ - counter的UB在 updateEventWaitcntAfter 函数中，根据指令类型增长1，这就是在追踪硬件counter对相应指令issue
+   阶段加1的行为，并且搜索代码发现UB永远不减少，所以**UB的含义就是该类型指令的总的issue的数量**。
+ - counter的LB在 generateWaitcnt/applyWaitcnt 函数中，根据生成的s_waitcnt的类型和等待数量Count, 修改
+   为`(UB-Count)`, 根据`s_waitcnt type(Count)`指令的含义，**LB可以理解为已经完成的此类型的指令的数量**。
  - 从注释中得知，WaitcntBrackets中的bracket指的就是`[LB, UB]`之间的范围
 
  - `[LB,UB]`以及寄存器Score的最主要作用就是**判断何时需要插入s_waitcnt，插入多少**，为此：
-  - updateByEvent()中：
-   1. (对应当前指令类型的)UB自加1 (UB永不减少)
-   2. 检查指令目标寄存器(Inst.defs())，利用UB决定目标寄存器的score, 一旦score生成就不再修改，因此**寄存器的Score也就是代表了，会修改其值的指令的issue的序号或者时间点**
-   3. 检查指令的内存操作数(Inst.memoperands())，如果指令可能会写入LDS--不论是从寄存器还是直接从外存DMA搬运，则根据alias的scope分配一个伪目标寄存器表达LDS目标区域并设置其score，并且记录alias信息到LDSDMAStores的一个slot中，另外不论alias信息是否存在，都用FIRST_LDS_VGPR记录最新的写入LDS的时间点---也即是score.
+   - updateByEvent()中：
+     1. (对应当前指令类型的)UB自加1 (UB永不减少)
+     2. 检查指令目标寄存器(Inst.defs())，利用UB决定目标寄存器的score, 一旦score生成就不再修改，因此**寄存器的
+        Score也就是代表了，会修改其值的指令的issue的序号或者时间点**
+     3. 检查指令的内存操作数(Inst.memoperands())，如果指令可能会写入LDS--不论是从寄存器还是直接从外存DMA搬运，
+        则根据alias的scope分配一个伪目标寄存器表达LDS目标区域并设置其score，并且记录alias信息到LDSDMAStores的一
+        个slot中，另外不论alias信息是否存在，都用FIRST_LDS_VGPR记录最新的写入LDS的时间点---也即是score.
 
-  - generateWaitcntInstBefore()/determineWait()中：
-   1. 指令需要读取的src寄存器：检查其score是否在`(LB,UB]`之间，也就是会被已issue但是尚未完成的指令所修改，是的话，就预备插入s_waitcnt，而等待的cnt是 `UB-Score`，也就是保证score对应的时间点的指令执行完成。
-   2. 指令的内存操作数(Inst.memoperands())：如果是有可能从LDS读取--也就是内存操作数目的AddrSpace属于LDS或者FLAT(编译期无法确定地址空间)，则检查其alias.scope，如果跟LDSDMAStores中某个LDS区域重叠，就使用该区域的score确定需要插入等待的cnt，如果没有重叠就不插入任何cnt，如果没有alias.scope则根据FIRST_LDS_VGPR进行最保守的等待。
-    
- - WaitcntBrackets::print()中打印出来的寄存器的score其实是相对时间`RegScore - (LB + 1)`，小于等于LB的不会打印，因此看到的debug log中的值都是`[0,UB-LB)`范围内的，代表目前尚未完成的指令中issue的相对序号。
+ - generateWaitcntInstBefore()/determineWait()中：
+     1. 指令需要读取的src寄存器：检查其score是否在`(LB,UB]`之间，也就是会被已issue但是尚未完成的指令所修改，
+        是的话，就预备插入s_waitcnt，而等待的cnt是 `UB-Score`，也就是保证score对应的时间点的指令执行完成。
+     2. 指令的内存操作数(Inst.memoperands())：
+        如果是有可能从LDS读取--也就是内存操作数目的AddrSpace属于LDS或者FLAT(编译期无法确定地址空间)，则检查
+        其alias.scope，如果跟LDSDMAStores中某个LDS区域重叠，就使用该区域的score确定需要插入等待的cnt，如果
+        没有重叠就不插入任何cnt，如果没有alias.scope则根据FIRST_LDS_VGPR进行最保守的等待。
 
-
-
-
-
-
-
-
-
-
+ - WaitcntBrackets::print()中打印出来的寄存器的score其实是相对时间`RegScore - (LB + 1)`，小于等于LB的不会打印，
+   因此看到的debug log中的值都是`[0,UB-LB)`范围内的，代表目前尚未完成的指令中issue的相对序号。
 
 
+Takeaway: structure complex work—simplify, modularize, visualize behavior. Grasping the
+core concepts matters most; the same ideas reappear in different shapes. The basic
+`BasicBlock` idea shows up many times in LLVM, e.g. as `MachineBasicBlock` in CodeGen:
+ - *Predecessor*: any basic block that can branch to this one.
+ - *Successor* (note spelling): any basic block this one can branch to.
 
-
-
-
-
-
-
-
-
-感叹：复杂事务结构化，简单化，模块化，代码行为可视化
-理解基本概念才是最核心的，因为相同的基本概念会以不同的形式实现出来。例如基本的`BasicBlock`概念在llvm就实现了多次，例如CodeGen中的`MachineBasicBlock`:
- - `Predecessor`: 任何会跳转到该BB的BB
- - `Sucessor`：任何会从该BB跳转到的BB
+(CN) 感叹：复杂事务结构化，简单化，模块化，代码行为可视化理解基本概念才是最核心的，因为相同的基本概念会以不同
+     的形式实现出来。例如基本的`BasicBlock`概念在llvm就实现了多次，例如CodeGen中的`MachineBasicBlock`:
+     - `Predecessor`: 任何会跳转到该BB的BB
+     - `Sucessor`：任何会从该BB跳转到的BB
 
 llvm/include/llvm/Support/GenericLoopInfo.h：
 
-高级语言使用`for/while/do-while`构造的结构化的loop或者嵌套loop，在汇编级别有着特定的结构：由一个入口组成，这个入口负责初始化循环变量，因为最内层循环体仍然可能包含`if/continue/break`，因此通常的最内层循环体可能是多个BB组成，除了循环体最末尾的BB,组成循环体的其他的BB，也可能跳转回入口形成循环。
+Structured loops from `for` / `while` / `do-while` (including nested loops) map to a
+particular CFG shape at assembly level: a header that initializes induction variables.
+The innermost body may still contain `if` / `continue` / `break`, so the inner “body” is
+often several BBs; besides the latch-like tail BB, other body BBs may also branch back
+to the header to close the loop.
 
-
+(CN) 高级语言使用`for/while/do-while`构造的结构化的loop或者嵌套loop，在汇编级别有着特定的结构：由一个入口组成，
+     这个入口负责初始化循环变量，因为最内层循环体仍然可能包含`if/continue/break`，因此通常的最内层循环体可能是
+     多个BB组成，除了循环体最末尾的BB, 组成循环体的其他的BB, 也可能跳转回入口形成循环。
 
 llvm/include/llvm/PassSupport.h
 
-编译pass需要以一种有机方式组织，例如passX依赖passA, 而passY也依赖passA, 而passZ依赖passX和passY, 则最终passA先运行，然后是X,Y,最后是Z，也就是pass之间的依赖链跟函数调用依赖链不同，passA不会运行多次。所有的pass也不是无关的或者依赖人为决定运行次序的。当passX运行时(`runOnMachineFunction`)，passA的运行保证已经结束，其分析结果数据可以使用`getAnalysis`获取。
+Passes must be organized by dependencies: if pass X needs A, pass Y needs A, and pass Z
+needs X and Y, the pipeline runs A, then X and Y, then Z—unlike a call graph, A is not
+invoked repeatedly for each consumer. Pass order is not arbitrary. When X runs
+(`runOnMachineFunction`), A has already finished and its analyses are available via
+`getAnalysis`.
+
+(CN) 编译pass需要以一种有机方式组织，例如passX依赖passA, 而passY也依赖passA, 而passZ依赖passX和passY, 则
+     最终passA先运行，然后是X,Y,最后是Z，也就是pass之间的依赖链跟函数调用依赖链不同，
+     passA不会运行多次。所有的pass也不是无关的或者依赖人为决定运行次序的。当passX运行时(`runOnMachineFunction`)，
+     passA的运行保证已经结束，其分析结果数据可以使用`getAnalysis`获取。
 
 
 MachineLoopInfo *MLI
@@ -442,7 +604,15 @@ AliasAnalysis *AA
 
 SIInsertWaitcnts::run
 
-因为需要逐条处理指令，这些pass都是高度状态化的，很多成员变量用以维护大量生命周期不明的信息。而且很多if判断用来应对各种可能出现的情况，不相关的逻辑会交织在一起。因此通过逐行阅读代码理解这些逻辑是不现实的，而应该针对一个测试用例使用debug手段跟踪命中的逻辑，理解这些命中的逻辑。
+Because instructions are handled one by one, these passes are heavily stateful: many
+members hold data whose lifetimes are hard to see at a glance, and many `if`s handle
+corner cases so unrelated concerns interleave. Line-by-line reading is unrealistic; use
+a small test and debug logging to see which branches actually fire and build
+understanding from that.
+
+(CN) 因为需要逐条处理指令，这些pass都是高度状态化的，很多成员变量用以维护大量生命周期不明的信息。而且很多if判断
+     用来应对各种可能出现的情况，不相关的逻辑会交织在一起。因此通过逐行阅读代码理解这些逻辑是不现实的，而应该针
+     对一个测试用例使用debug手段跟踪命中的逻辑，理解这些命中的逻辑。
 
 
 
