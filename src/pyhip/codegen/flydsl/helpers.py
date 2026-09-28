@@ -375,14 +375,14 @@ _GFX94X_BITS = {
 
 @functools.cache
 def _raw_ptr_buffer_load_op_aux_type_is_ir_value():
-    # gfx942_cache_policy 
     try:
+        # introduced by https://github.com/llvm/llvm-project/pull/198875
         policy = ir.Attribute.parse("#rocdl<gfx942_cache_policy sc0|nt>")
     except Exception as e:
         return True
     return False
 
-def rocdl_aux(spec: str|int = ""):
+def rocdl_aux(spec = ""):
     """将 gfx942/gfx950 缓存策略名称转换为 i32 value 或 MLIR I32Attr"""
     if isinstance(spec, int):
         value = spec
