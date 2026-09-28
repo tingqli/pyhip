@@ -12,7 +12,7 @@ from flydsl._mlir import ir
 from flydsl.expr import range_constexpr, rocdl
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as _ptr
+from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import torch_tensor_to_pointer as _ptr, rocdl_aux
 if __package__:
     from .moe_multistage_down import _scalar
 else:
@@ -35,10 +35,10 @@ def make_moe_sum(*, n, topk, sort_block_m=256):
         block_col = fx.Int32(fx.block_idx.x) % column_blocks
         target_buffer = fx.rocdl.make_buffer_tensor(fx.make_view(output, fx.make_layout(tokens * n, 1)), False)
         drsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(target_buffer))
-        zero = ir.IntegerAttr.get(fx.Int32.ir_type, 0)
+        zero_aux = rocdl_aux(0)
         zero_offset = fx.Int32(0).ir_value()
         vector_type = ir.VectorType.get([4], fx.Int32.ir_type)
-        read_aux = ir.IntegerAttr.get(fx.Int32.ir_type, 2)
+        read_aux = rocdl_aux(2)
         locations = [_scalar(inverse[token * topk + route]) for route in range_constexpr(topk)]
 
         def read_route(location, column):
@@ -66,7 +66,7 @@ def make_moe_sum(*, n, topk, sort_block_m=256):
             accum = accum + fragments[route].to(fx.Float32)
         offset = (column < n).select((token * n + column) * 2, fx.Int32(-1))
         rocdl.raw_ptr_buffer_store(accum.to(fx.BFloat16).bitcast(fx.Int32).ir_value(),
-                                  drsrc, offset.ir_value(), zero_offset, aux=zero)
+                                  drsrc, offset.ir_value(), zero_offset, aux=zero_aux)
 
     @flyc.jit
     def launch(output: fx.Pointer, source: fx.Pointer, inverse: fx.Pointer,

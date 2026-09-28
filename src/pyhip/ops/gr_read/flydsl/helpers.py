@@ -5,7 +5,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
-from pyhip.codegen.flydsl.helpers import cvt_f32_to_bf16
+from pyhip.codegen.flydsl.helpers import cvt_f32_to_bf16, rocdl_aux
 
 
 def _weight_view(pointer, n, k):
@@ -45,13 +45,13 @@ def _load(resource, address, scalar_offset=0, words=4):
     value = rocdl.RawPtrBufferLoadOp(
         fx.Int32.ir_type if words == 1 else ir.VectorType.get([words], fx.Int32.ir_type), resource,
         address.ir_value(), fx.Int32(scalar_offset).ir_value(),
-        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0)).result
+        aux=rocdl_aux(0)).result
     return fx.Int32(value) if words == 1 else fx.Vector(value)
 
 
 def _store(resource, address, values, scalar_offset=0):
     rocdl.RawPtrBufferStoreOp(values.ir_value(), resource, address.ir_value(),
-        fx.Int32(scalar_offset).ir_value(), aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0))
+    fx.Int32(scalar_offset).ir_value(), aux=rocdl_aux(0))
 
 
 def _ds_read(address, offset):

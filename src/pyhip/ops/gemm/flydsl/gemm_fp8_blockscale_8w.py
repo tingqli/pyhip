@@ -24,6 +24,7 @@ from flydsl._mlir.dialects import vector
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 from .common import require_cdna4
 
 __all__ = ["compile_gemm_fp8_8wave"]
@@ -1013,7 +1014,7 @@ def _compile_gemm_fp8_8wave_cached(
                             c_store_rsrc,
                             byte_offset.ir_value(),
                             fx.Int32(0).ir_value(),
-                            aux=ir.IntegerAttr.get(T.i32, 0),
+                            aux=rocdl_aux(0),
                         )
 
             store_c_quadrant(frag_C_tl, 0, 0)

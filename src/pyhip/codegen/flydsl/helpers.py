@@ -355,6 +355,49 @@ def view_as_torch_tensor(ptr, shape, dtype=None):
     ptr = _as_ptr(ptr, dtype)
     return fx.make_view(ptr, torch_layout(*shape))
 
+# gfx942 与 gfx950 在此封装中使用同一组缓存策略位。
+_GFX94X_BITS = {
+    # bit 0：缓存/一致性策略的一部分；对原子指令，还表示返回操作前的内存值。
+    #       不要简单理解为“总是绕过某级缓存”。
+    "sc0": 0,
+    # bit 1：non-temporal（非时间局部性）提示，表示数据预计不会很快再次使用。
+    "nt": 1,
+    # bit 3：buffer 寻址的 swizzle（交错）标志；影响地址组织，
+    #       不是对寄存器中的数据执行 ds_swizzle。
+    "swz": 3,
+    # bit 4：与 sc0 一起指定缓存/一致性策略。
+    #       两个位的实际作用还取决于指令和同步范围。
+    "sc1": 4,
+    # bit 31：向 LLVM 后端标记此 buffer 操作为 volatile；
+    #         在最终机器指令选择前会被移除，不是硬件缓存策略位。
+    "volatile_op": 31,
+}
+
+@functools.cache
+def _raw_ptr_buffer_load_op_aux_type_is_ir_value():
+    # gfx942_cache_policy 
+    try:
+        policy = ir.Attribute.parse("#rocdl<gfx942_cache_policy sc0|nt>")
+    except Exception as e:
+        return True
+    return False
+
+def rocdl_aux(spec: str|int = ""):
+    """将 gfx942/gfx950 缓存策略名称转换为 i32 value 或 MLIR I32Attr"""
+    if isinstance(spec, int):
+        value = spec
+    else:
+        names = spec.strip().lower().split()
+        bits = 0
+        for name in names:
+            if name not in _GFX94X_BITS:
+                raise ValueError(f"unknown cache policy flag: {name!r}")
+            bits |= 1 << _GFX94X_BITS[name]
+        value = bits
+    if _raw_ptr_buffer_load_op_aux_type_is_ir_value():
+        return fx.Int32(value).ir_value()
+
+    return ir.IntegerAttr.get(fx.Int32.ir_type, value)
 
 # ==================== Tensor访存 ====================
 # 数据载体与访存地址分离；不在load内准备动态地址或插入等待。
@@ -404,10 +447,12 @@ class BufferTensor(fx.Tensor):
         resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(self))
         # LLVM 的 raw buffer intrinsic 支持 i32/v2i32/v4i32，不支持 v1i32。
         result_type = fx.Uint32.ir_type if bits == 32 else ir.VectorType.get([bits // 32], fx.Uint32.ir_type)
+
+        # the type of parameter `aux` is changed from ir_value to int_attr, try both
         result = rocdl.RawPtrBufferLoadOp(
             result_type, resource,
             _offset_i32(voffset_bytes), _offset_i32(soffset_bytes),
-            aux=fx.Int32(aux).ir_value(),
+            aux = rocdl_aux(aux)
         ).result
         values = Vec.from_elements([fx.Uint32(result)], fx.Uint32) if bits == 32 else Vec(result)
         return values.bitcast(self.dtype)
@@ -791,7 +836,6 @@ def s_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
         has_side_effects=True,
     )
     """
-
 
 def asm_mark(mark: str):
     caller_frame = inspect.currentframe().f_back

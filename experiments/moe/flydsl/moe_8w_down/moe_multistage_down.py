@@ -300,7 +300,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts, persistent=True):
                         rocdl.raw_ptr_buffer_load_async_lds(
                             weight_rsrc, dst, dma_size, dma_offset.ir_value(),
                             (soffset + copy_round * 8192).ir_value(), zero,
-                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, 16),
+                            aux=fxh.rocdl_aux(16),
                         )
                     rocdl.asyncmark()
 
@@ -339,7 +339,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts, persistent=True):
                             packed[record][mi].ir_value(), out_rsrc,
                             coalesced_addresses[mi][local_record].ir_value(),
                             fx.Int32((n_tile * 2 + half) * 32768).ir_value(),
-                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, 2),
+                            aux=fxh.rocdl_aux(2),
                         )
 
                 def compute_stage(b, scale, step, has_pack):

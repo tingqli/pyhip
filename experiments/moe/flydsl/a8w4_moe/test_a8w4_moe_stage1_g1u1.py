@@ -27,6 +27,8 @@ from flydsl._mlir.dialects import fly as _fly
 # These vector operations feed the SSA-returning MFMA atom boundary directly.
 from flydsl._mlir.dialects import vector
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
+
 SORT_BLOCK_M = 256
 TOKEN_MASK = 0xFFFFFF
 A_INPUT_SCALE = 0.33
@@ -1592,7 +1594,7 @@ def compile_moe_gateup_4w(
                         c_rsrc,
                         byte_offset.ir_value(),
                         fx.Int32(0).ir_value(),
-                        aux=ir.IntegerAttr.get(T.i32, 0),
+                        aux=rocdl_aux(0),
                     )
 
         if const_expr(epilogue_overlap):

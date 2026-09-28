@@ -121,6 +121,7 @@ from pyhip.codegen.flydsl.helpers import (
     split_works,
     torch_layout,
     view_as_torch_tensor,
+    rocdl_aux,
 )
 
 __all__ = [
@@ -139,4 +140,5 @@ __all__ = [
     "split_works",
     "torch_layout",
     "view_as_torch_tensor",
+    "rocdl_aux",
 ]

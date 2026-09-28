@@ -28,6 +28,7 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 from .common import require_cdna4
 
 __all__ = ["compile_gemm_fp8"]
@@ -1171,7 +1172,7 @@ def _compile_gemm_fp8_cached(
                                 c_store_rsrc,
                                 masked_offset.ir_value(),
                                 fx.Int32(0).ir_value(),
-                                aux=ir.IntegerAttr.get(T.i32, 0),
+                                aux=rocdl_aux(0),
                             )
                         else:
                             rocdl.raw_ptr_buffer_store(
@@ -1179,7 +1180,7 @@ def _compile_gemm_fp8_cached(
                                 c_store_rsrc,
                                 byte_offset.ir_value(),
                                 fx.Int32(0).ir_value(),
-                                aux=ir.IntegerAttr.get(T.i32, 0),
+                                aux=rocdl_aux(0),
                             )
 
         else:
