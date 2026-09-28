@@ -1,50 +1,53 @@
 # GR read prefill / decode：正式接口与接入说明
 
-当前实现是两阶段 BF16 prefill：Down GEMM + SiLU 写入 P，Up GEMM + sigmoid + 四路加权归约写入 Y。T48–512 的调优已进入正式源码；调用方无需导入实验目录，也无需手动选择 kernel。
+公共入口为 `gr_read(x, packed_down, packed_up, output=None)`。它按输入实际行数选择 T1–32 decode 或 T33 起的 prefill，内部申请中间工作区并缓存编译产物。输入不额外补行，非空计算保持 Down＋Up 两个 GPU kernel。
 
-固定维度为 C=4、H=2560、R=320、K=10240；当前实现与性能配置在 ROCm gfx942、MI308X / 80CU 上验证。其他 ROCm 架构只发出 warning 后继续尝试执行，测试不会仅因架构不同而跳过；实际编译、执行或精度错误仍会正常报错。`GRReadPrefill` 与 `GRReadDecode` 共用权重预处理，调用方按阶段选择对象；decode 的独立测试方法见第 6 节。
+固定维度为 C=4、H=2560、R=320、K=10240；当前实现与性能配置在 ROCm gfx942、MI308X / 80CU 上验证。其他 ROCm 架构发出 warning 后继续尝试执行；实际编译、执行或精度错误正常报错。`GRReadPrefill` 与 `GRReadDecode` 保留供分阶段检查及已有调用兼容；业务调用使用统一函数。
 
 ## 1. 安装与最小接入
 
-FlyDSL 验证版本为 **0.3.2**。
+本轮函数接口验证使用 **FlyDSL 0.3.1、ROCm PyTorch 2.12.0**。原 kernel 的历史验证使用过 FlyDSL 0.3.2。先在已安装 ROCm PyTorch/FlyDSL 的环境中，从仓库根目录运行 `python3 -m pip install -e .`。
 
 ```python
-from pyhip.ops.gr_read.flydsl import GRReadPrefill, prepare_weights
+from pyhip.ops.gr_read import gr_read, prepare_weights
 
 # 模型加载 / 准备阶段，每对原始 BF16 权重只做一次。
 # w_down: [320, 10240]，w_up: [10240, 320]，同一张 ROCm GPU。
 packed_down, packed_up = prepare_weights(w_down, w_up)
 
-# 按实际 T 提前准备并缓存对象：分配 P/Y、编译均发生在构造时。
-read64 = GRReadPrefill(64, packed_down, packed_up)
-read512 = GRReadPrefill(512, packed_down, packed_up)
+# x 是已归一化、连续且 16B 对齐的 BF16 [T,10240]。
+# 首次调用编译当前 T/配置；后续相同配置复用编译结果。
+y = gr_read(x, packed_down, packed_up)
 
-# 运行阶段：x64 为已经归一化的 contiguous BF16 [64, 10240]。
-# 在当前 stream 上启动 Down、Up；返回对象持有的 BF16 [64, 2560]。
-y64 = read64(x64)
-
-# 分阶段检查 / 测量；Up 消费本次 Down 生成的 P。
-p64 = read64.run_down(x64)
-y64 = read64.run_up(x64)
+# 调用方已有 BF16 [T,2560] 输出时可直接写入，返回值就是 out。
+y = gr_read(x, packed_down, packed_up, output=out)
+assert y is out
 ```
 
 每层每个 device 保留一份 packed 权重，所有 T 共用其指针。Down 为 N16/K32 preshuffle；Up 先按 H64 做 `reshape(4,40,2,4,2,4,320).permute(1,0,2,4,3,5,6)`，再做同一 N16/K32 preshuffle。这与现有 decode 的权重布局一致。将来接入 SGLang 时仍在加载阶段做一次，不能放进每次 forward。
 
-每个对象固定 T/device，独占 P `[T,320]` 和 Y `[T,2560]`；下一次调用覆盖返回值。需要保留结果时由调用方复制。并发 stream 各用独立对象，可共享只读 packed 权重；准备阶段与执行 stream 的依赖由调用方按正常 Torch stream 规则管理。
+函数默认每次申请独立输出，仍持有的旧输出不会被下一次调用覆盖。中间 P 由 PyHIP 管理：decode 为紧凑 FP32 `[4,T,320]`，prefill 为 BF16 `[T,320]`。缓存只保留编译产物，不持有调用方输入、权重或工作区。并发 stream 可共享只读权重和代码，工作区由 Torch 分配器隔离；调用方遵循正常的 Torch stream 依赖规则。
 
-已有工作区时可使用 `GRReadPrefill(T, packed_down, packed_up, partial=p, output=y)`。P/Y 必须与 X、权重及彼此独立，shape/dtype/device 正确、连续、起始地址 16B 对齐。构造会执行编译样例并写入工作区，不要在已有数据仍被消费时重新构造。T=0 返回空工作区，不 launch。
+Graph capture 前，用同一函数预热需要的 shape/配置和 device；缓存未命中时在 capture 内调用会明确报错。Graph replay 复用捕获时的地址，输出随 replay 更新。框架传入 X24、实际只有 17 行有效时，编译/执行仍是 T24，P 始终为 `[4,24,320]`；有效前缀由框架消费。普通 X17 则只编译并执行 T17，不自动编译 1..17。
+
+外部 output 必须与输入 T/device 匹配、连续且 16B 对齐，不能与 X 或 packed 权重重叠。T=0 返回空输出且不编译、不 launch。接口用于推理，梯度输入需在 `torch.no_grad()` / `inference_mode()` 中使用。
+
+诊断时仍可构造 `GRReadPrefill(T, packed_down, packed_up, partial=p, output=y)`，通过 `run_down(x)` / `run_up(x)` 查看 P 或分阶段计时。准备对象持有的 Y 会被下一次对象调用覆盖；这一旧对象语义与函数的默认输出生命周期不同。
 
 ## 2. 正式源码与分派
 
 | 文件 | 职责 |
 | --- | --- |
-| [host.py](../../../src/pyhip/ops/gr_read/flydsl/host.py) | `GRReadPrefill` / `GRReadDecode` 准备、工作区、当前 stream/device、完整或分阶段调用 |
+| [host.py](../../../src/pyhip/ops/gr_read/flydsl/host.py) | `gr_read` 分派、编译缓存、内部工作区与当前 stream/device；保留旧准备对象和分阶段调用 |
 | [common.py](../../../src/pyhip/ops/gr_read/flydsl/common.py) | 公共权重预处理入口、维度、固定配置选择 |
 | [down.py](../../../src/pyhip/ops/gr_read/flydsl/down.py) | Prefill Down 与调优后的 tile/BK/swizzle 参数，以及 decode split-K Down |
 | [up.py](../../../src/pyhip/ops/gr_read/flydsl/up.py) | Prefill M256/M64/M128 Up 编译期特化，以及 decode Up |
 | [helpers.py](../../../src/pyhip/ops/gr_read/flydsl/helpers.py) | 原数值与底层辅助函数 |
 
-80CU 上的配置如下，选择发生在准备阶段，无运行时 autotune：
+Decode 对全部 T1–32 按真实 T 编译和缓存，不采用固定七档表。Prefill 保留按真实 T 的现有配置选择，相同配置跨 T 复用编译产物；没有运行时 autotune。
+本轮曾对 prefill 的 pow2 配置选型做同址测试，T2049 回退 34.67%，部分大 batch 回退约 5.2%，因此保留原选型。配置缓存无需以牺牲真实行数的选型为代价。
+
+80CU 上的小 prefill 配置如下：
 
 | T | Down M / waves / N splits / BK | Up M / N splits | Down swizzle shift |
 | --- | --- | --- | --- |
@@ -55,7 +58,7 @@ y64 = read64.run_up(x64)
 
 T33–512 将两个 GPU launch 收在一个已编译 host 调用中，仍然是两个 GPU kernel。此处未捕获 CUDA Graph。范围外保留原两个 launcher；其它 CU 数的回退没有在本机做性能验收。
 
-旧测试脚本的 `prepare_gr_read` / `run_gr_read` tuple 接口仍保留兼容；业务接入使用上面的公共对象，才能直接使用最终的配置与 host 调用路径。
+旧测试脚本的 `prepare_gr_read` / `run_gr_read` tuple 接口仍保留兼容；业务接入使用公共 `gr_read` 函数。
 
 ## 3. 数值边界与验收范围
 
@@ -77,11 +80,14 @@ python3 tests/ops/gr_read/test_gr_read.py
 python3 tests/ops/gr_read/test_gr_read.py --gpu 2
 python3 tests/ops/gr_read/test_gr_read.py --gpu 2 --check-only
 
+# 只测 PyHIP 性能；两阶段的固定性能对照均跳过，精度检查仍保留。
+python3 tests/ops/gr_read/test_gr_read.py --gpu 2 --no-baselines
+
 # Pytest 保留原数值、边界、共享权重和 device 回归检查。
 HIP_VISIBLE_DEVICES=0,1 python3 -m pytest -q tests/ops/gr_read/test_gr_read.py
 
 # 也可单独运行原 benchmark 入口，保留其内部输出校验。
-python3 tests/ops/gr_read/bench_gr_read_compare.py --gpu 3 --sglang-root /opt/sglang
+python3 tests/ops/gr_read/bench_gr_read_compare.py --gpu 3
 
 # 只测 prefill：33/64/128/256/512 及 1K–64K 共 21 档，无需 SGLang 安装。
 python3 tests/ops/gr_read/bench_gr_read_compare.py --phase prefill --gpu 3
@@ -91,35 +97,41 @@ python3 tests/ops/gr_read/test_gr_read.py --phase prefill --scope up --gpu 3 \
   --batches 33 48 64 128 129 256 257 512 513
 
 # 仅在需要保留原始样本时显式指定输出文件。
-python3 tests/ops/gr_read/bench_gr_read_compare.py --gpu 3 --sglang-root /opt/sglang \
+python3 tests/ops/gr_read/bench_gr_read_compare.py --gpu 3 \
   --output /tmp/gr_read_compare.jsonl
 ```
 
-没有 SGLang 也可以跑默认完整流程：decode 测 PyHIP Down/Up/Total，SGLang backend 显示 `not run`，对应时延和 Speedup 显示 `—`；prefill 仍保留独立的 Torch compile 对照。能找到已安装的 SGLang checkout 时自动加入 decode 对照，也可用 `--sglang-root /path/to/sglang` 指定源码；不要求安装完整 SGLang。`--no-sglang` 可显式关闭该对照，与 `--sglang-root` 互斥。显式指定的无效源码路径会报错。
+默认使用 [baselines.py](baselines.py) 中固定的 Torch compile / Triton 对照，环境不需要安装 SGLang，也不会探测或读取外部 checkout。`--sglang-root` 和 `--no-sglang` 已移除；`--no-baselines` 跳过 decode 和 prefill 两阶段的性能对照，相关表格显示 `—`，独立精度参考仍运行。对照所需的 PyTorch/Triton 依赖缺失会正常报错，不静默更换实现。
 
 `--check-only` 或单独指定 `--scope down/up/total` 时只做精度检查；pytest 也只检查正确性。精度失败会在进入性能阶段前停止。性能采样继续复用 `bench_gr_read_compare.py`：decode 精度默认为 2 对权重 / seed303，性能仍为 100 对权重 / seed707；`test_gr_read.py` 的 `--decode-weights` / `--decode-seed` 只作用于精度。需要调整性能采样参数时使用单独的 benchmark 入口。显式提供 `--output` 时，同一 JSONL 用 `stage=accuracy/performance` 区分默认流程的两部分记录。
 
-Benchmark 的 prefill 表分别测 Down、Up、Total 和 Torch compile 完整调用。使用原 `cudaPerf`，默认 10 组独立 buffer、各阶段 2 次预热、10 个样本取中位数；保留逐阶段采样顺序，Torch compile 接在 Total 后面。这张表使用各阶段整组样本的中位数，不是交错 A/B 测量。Total 直接测量。权重打包、对象构造、首次编译、参考与校验不计时。门禁前固定静置 2 秒，GPU use≤5%、VRAM≤20% 仍为硬性条件，失败停止并保留数据。PTL Enabled/VECTOR,F8 作为已验证环境的提示：查询结果中的状态或格式不同，只发 warning 后继续；PTL 查询逻辑和查询失败时的报错方式沿用原版。没有修改设备设置或剔除长尾。
+包含性能测量的运行只在**整次启动时检查一次硬件**，位于正确性测试、GPU buffer 准备与预热之前；decode/prefill 切换、各 batch 和结束时不再查询或判断空闲，避免 `rocm-smi` 滞后的利用率包含本次测试自身的活动。入口默认静置 2 秒，独立 benchmark 的 `--settle-seconds` 只调整这一次等待。GPU use≤5%、VRAM≤20% 仍为入口条件，失败立即停止，不重试；纯精度运行不做硬件检查。PTL Enabled/VECTOR,F8 作为已验证环境的提示，状态或格式不同只发 warning；查询失败仍正常报错。显式提供 `--output` 时保存一条 `phase=setup`、`event_phase=entry`、`hardware_policy=entry_only` 的原始快照，prefill result 不再包含逐 batch 的 `hardware_before*` / `hardware_after` 字段。入口快照只描述启动状态，不能证明整个测量期间独占 GPU。
+
+Benchmark 的 prefill 表分别测 Down、Up、Total 和 Torch compile 完整调用。使用原 `cudaPerf`，默认 10 组独立 buffer、各阶段 2 次预热、10 个样本取中位数；保留逐阶段采样顺序，Torch compile 接在 Total 后面。这张表使用各阶段整组样本的中位数，不是交错 A/B 测量。Total 直接调用 `gr_read(..., output=预分配的Y)`，P 由函数内部申请；Down/Up 单阶段仍使用准备对象的 P。两者工作区地址可能不同，不能用阶段中位数之和代替 Total。权重打包、对象构造、首次编译、参考与校验不计时。没有修改设备设置或剔除长尾。
 
 表格新增 `Torch compile us / TFLOPS` 和 `Speedup`，其中 **Speedup = Torch compile Total / PyHIP Total**，大于 1 表示 PyHIP 更快；显式传入 `--output` 时，结果及全部样本写入 JSONL。默认显示阶段初始化、逐 batch 准备/检查/时延进度，最后打印两张完整表，不自动创建结果文件或目录。进度实时刷新，均在计时区间外；`--verbose` 可额外显示硬件和详细正确性信息。TFLOPS 两边都按 `4*T*10240*320` 的有效 GEMM 工作量计算。
 
-这里的 Torch compile 对照在脚本内保留 SGLang `2843214f6ed923e992a74ee4d7a0cda5d7deddbf` 的 `_mix_compute` 公式，使用默认 `torch.compile`，只返回 Y，无需安装 SGLang。每次对完整 T 调用一次；原来按 1024 行分块、返回 P/Y 的正确性参考仍单独保留，不用于计时。两边使用同一个 X；Torch 轮换 10 对原始 BF16 权重，PyHIP 使用对应的 packed 权重，均在准备阶段生成。Torch 保留原生中间张量和输出分配，地址单独记录，内部工作区不强制与 PyHIP 相同。所有实际被计时的 Torch 输出都会检查；prefill 全程普通调用，无 CUDA Graph。`test_gr_read.py` 默认在全部精度检查通过后调用这些采样函数，不重复运行已完成的 prefill 基础精度检查；计时所用 buffer 的准备和输出校验仍完整保留。
+两套性能对照集中在一个 `baselines.py` 文件中：Torch 部分保留原输出 Y 的公式和默认 `torch.compile` 选项，对完整 T 一次调用；decode/prefill 使用独立根包装函数保持编译缓存隔离。原按 1024 行分块、返回 P/Y 的正确性参考仍单独保留，不用于计时。
 
-[SGLang 对照脚本](bench_gr_read_compare.py)读取指定 checkout 的原 `_mix_compute` AST 并按原方式 `torch.compile`，同时加载 `hc_mix_triton.py` 的实现及支持判断。两边共用原始权重值和 X；PyHIP 的 packed 权重每对只准备一次、跨所有 T 复用。可选 JSONL 记录版本、源码 hash、地址、原始样本、初始/改变输入 FP64 检查；只有显式提供 `--output` 才写文件，文件名须为新路径。
+Triton 部分固定本轮已测的 SGLang checkout `1b5e190695300821eff9c393af5cc07a6df949a7`，包含 `8cf5501b6913f57a2e7c8dcee52b625fc8ab23c3` 的 MI308X/80CU 调优，不能称为当前 upstream main。Kernel、launcher、支持范围和 counter 重置逻辑保留，确定性模式改为显式参数，默认 False，不再导入框架配置。来源、原始 SHA256、修改说明放在文件头注释，Apache-2.0 许可证全文放在文件尾注释；本地辅助函数沿用仓库 MIT 许可证。`metadata()` 记录来源版本、当前单文件 SHA256 和 Torch/Triton 版本，无需额外 JSON 或目录。Triton counter 由同设备串行调用共享，基准不并发执行它；atomic 累加按原容差检查，不要求逐位确定性。
 
-2026-09-22 重构后复测的 SGLang `a8dba4230820b4b5928dbf94f16c4487b171c086` 在 gfx942 非确定性推理下，T1–16 为 Triton persistent，T≥17 为 torch.compile；其 `_mix_compute` 与上述脚本内公式的 AST 一致。对照脚本按实际支持函数选择后端。测量从已经归一化的 X 开始，不含 RMSNorm、TP 通信和整个模型。
+权重从同一组原始逻辑值出发：PyHIP 使用自己的 packed Down/Up；每个活动对照实例使用独立的原始连续 BF16 矩阵 `[320,10240]`、`[10240,320]`。两套对照均不接受 PyHIP 的 packed 布局。复制和 packing 均在计时外，X 保持共享；记录各自权重/P/Y 地址，检查所有实际计时输出。移入固定源码和权重副本后的数据作为新一轮基线，原始历史结果不改写。
 
-两个入口都支持 `--phase all/decode/prefill`，默认 all。指定一个 phase 时可用 `--rows` / `--batches`；同时运行两阶段时用 `--decode-rows` 和 `--prefill-rows`。Decode 默认覆盖全部 T1–32，benchmark 的 Down/Up/Total/SGLang 分别捕获 Graph；prefill 的 Graph 开关与采样方式保持原样。
+默认 BF16 固定形状下，decode T1–16 使用 Triton persistent，T17–32 使用 Torch compile；prefill 使用 Torch compile。结果标为 Frozen baseline，并记录源码及 Torch/Triton 版本。测量从已归一化的 X 开始，不包含 RMSNorm、TP 通信或整个模型。
+
+两个入口都支持 `--phase all/decode/prefill`，默认 all。指定一个 phase 时可用 `--rows` / `--batches`；同时运行两阶段时用 `--decode-rows` 和 `--prefill-rows`。Decode 默认覆盖全部 T1–32，benchmark 的 Down/Up/Total/Frozen baseline 分别捕获 Graph；prefill 的 Graph 开关与采样方式保持原样。
 
 T48–512 的正式优化前后对照已在 30 档、普通调用下验证：选中的两段实现全部快于该版 SGLang torch.compile，范围为 1.06–4.19×。这是特定硬件和固定协议的测量，不能将少量样本 smoke 的时延替代完整数据。迁入公共接口后的同址配对复测中，30 档时延变化中位数为 −0.095%，最大增加 0.451%；完整报告和原始数据记录在本机 `qwen3.8-flash-next-doc` 的 45/46 号文档。
 
-### 算法速查入口
+### 公共函数回归
 
-[test_gr_read_algorithms.py](test_gr_read_algorithms.py) 集中展示按 rows 选择 decode / prefill 的入口，打印各档 Down/Up 配置和 P 布局，用 `torch.allclose` 检查 P/Y。默认选取 12 个代表性 rows；所有 case 共用一次 preshuffle 后的权重。两条路径均为普通调用，只检查精度，不捕获 CUDA Graph、不测性能，也不依赖 SGLang。
+`test_gr_read.py` 同时检查准备对象和 `gr_read()`。Decode 的 6528 次 Graph replay 每次包含两种完整调用，比较相同 T 的输出逐位一致；另有按需编译、跨权重缓存、默认输出生命周期、Graph 工作区污染/guard、空输入、契约检查及 stream/device 回归。
+固定对照独立化后，全量 pytest 为 67 项，其中新增 11 项检查原始权重副本、框架独立性、Torch/Triton 精度和 counter 的 Graph replay 行为。
 
 ```bash
-python3 tests/ops/gr_read/test_gr_read_algorithms.py
-python3 tests/ops/gr_read/test_gr_read_algorithms.py --gpu 2 --rows 1 24 32 33 64 512 4k
+HIP_VISIBLE_DEVICES=2,3 python3 -m pytest -q tests/ops/gr_read/test_gr_read.py -k test_api
+HIP_VISIBLE_DEVICES=2 python3 -m pytest -q tests/ops/gr_read/test_gr_read.py -k baseline
+python3 tests/ops/gr_read/test_gr_read.py --gpu 2 --phase decode --rows 1 12 17 24 28 32 --check-only
 ```
 
 ## 5. 有效优化方法
@@ -145,9 +157,9 @@ python3 tests/ops/gr_read/test_gr_read_algorithms.py --gpu 2 --rows 1 24 32 33 6
 - [gpu-benchmark-validation](../../../.github/skills/gpu-benchmark-validation/SKILL.md)：空闲GPU与PTL、原计时器和地址条件、原始样本、ATT/PMC归因边界。
 
 
-## 6. Decode T1–32：独立正确性、原 Graph 基准和 SGLang 对照
+## 6. Decode T1–32：独立正确性、原 Graph 基准和固定对照
 
-实现已按方向收拢：[down.py](../../../src/pyhip/ops/gr_read/flydsl/down.py) 包含 prefill Down 和 decode split-K Down，[up.py](../../../src/pyhip/ops/gr_read/flydsl/up.py) 包含所有 prefill Up 和 decode Up。两后端共用 `common.prepare_weights()`；模型加载时 prepare 一次，同一份 packed Down/Up 权重可传给 `GRReadDecode` 和 `GRReadPrefill`。FlyDSL 验证版本为 **0.3.2**。
+实现已按方向收拢：[down.py](../../../src/pyhip/ops/gr_read/flydsl/down.py) 包含 prefill Down 和 decode split-K Down，[up.py](../../../src/pyhip/ops/gr_read/flydsl/up.py) 包含所有 prefill Up 和 decode Up。两后端共用 `common.prepare_weights()`；模型加载时 prepare 一次，同一份 packed Down/Up 权重传给统一 `gr_read()`，也可用于准备对象的分阶段检查。本轮函数接口验证使用 **FlyDSL 0.3.1**。
 
 Decode 默认覆盖全部 T1–32，独立测量、独立出表。Prefill 继续普通调用，默认性能矩阵首档现为 T33；T33–64 全部使用之前验证的小 M 配置（同上文 T33–128 的配置，包括 T48），其余 prefill 配置保持。
 
@@ -165,14 +177,14 @@ python3 tests/ops/gr_read/test_gr_read.py --phase decode --gpu 2 --check-only
 python3 tests/ops/gr_read/test_gr_read.py --phase decode --scope down --rows 1 16 17 32 --gpu 2
 python3 tests/ops/gr_read/test_gr_read.py --phase decode --scope up --rows 1 16 17 32 --gpu 2
 
-# Decode 的独立 Graph 对照表：原 100 权重 / 3 rounds / 7 samples，默认不写文件。
+# Decode 的固定基线 Graph 对照表：原 100 权重 / 3 rounds / 7 samples，默认不写文件。
 python3 tests/ops/gr_read/bench_gr_read_compare.py \
-  --phase decode --sglang-root /opt/sglang --gpu 2
+  --phase decode --gpu 2
 ```
 
 Decode 对照保持原 PR 中的 100 组独立权重工作集、buffer 准备、capture、计时器和检查流程：图内依次执行所有实例两轮，每个样本 replay 三次，Event 时间除以 600；3 轮 × 7 个样本全部保留并取中位数。Packing、编译和参考不计时。原独立 Total 基准的计时核心保留在 benchmark 文件的 `benchmark_decode_total()` 中供回归使用，默认不额外输出第三张表。
 
-SGLang 对照读取指定 checkout 的原实现和支持判断。在本机 gfx942、默认非确定性推理下，T1–16 为 Triton persistent，T17–32 为 Torch compile；两边均使用 decode 的 Graph 协议。对照表包含 T1–32 每一行和实际后端，独立于 prefill 表。两边使用相同 X 与逻辑权重，PyHIP packing 在准备阶段完成。
+固定对照在本机 gfx942、显式非确定性模式下，T1–16 为 Triton persistent，T17–32 为 Torch compile；两边均使用原 decode Graph 协议。表中列出实际后端，独立于 prefill 表。X 和逻辑权重值相同，物理权重 buffer 按各自布局独立准备。Triton counter 在同一设备的串行调用间共享，测试不并发执行这些基线。
 
 原 FP64 容差 `rtol=1e-2, atol=5e-3`、live rows 缩小/恢复、zero/stale/NaN 尾行、P/Y 预污染、输入及权重不变检查保留。P 不再有内部 padding，改为检查准确的紧凑 shape、P 两端 guard 及各 split 的数值；完整 Graph replay 继续检查 X/P/Y 两端 guard。
 
@@ -192,73 +204,75 @@ Decode 使用 CUDA Graph 测量，prefill 使用原 `cudaPerf` 普通调用，�
 
 Decode 公式中的 `1000` 是毫秒转微秒，`100` 是独立测试实例数，`2` 来自图中的 `calls + calls`，`3` 来自计时区间的三次 replay。实际代码使用实例数 `N * 2 * 3` 作分母，100 是默认的 N。对于 Total，一次调用已经包含 Down＋Up；外层 3×7 只负责收集 21 个样本，再取中位数。
 
-图构造前的预执行、packing、首次编译和正确性检查均在计时区外。以上差异沿用各自原有基准；同一张表里的 PyHIP 与 SGLang/Torch compile 使用该表对应的计时方式。
+图构造前的预执行、packing、首次编译和正确性检查均在计时区外。以上差异沿用各自原有基准；同一张表里的 PyHIP 与固定基线 使用该表对应的计时方式。
 
 
 ## 性能数据
 
-Tested on MI308X PTL ( VECTOR,F8)
+2026-09-28，GPU 2 / MI308X / 80CU / PTL Enabled,VECTOR,F8，FlyDSL 0.3.1、ROCm PyTorch 2.12.0。下表来自屏蔽 SGLang 探测/导入后的完整精度与性能流程，使用 tests 内固定对照及独立的原始权重副本。Total 使用函数式入口并传入预分配 Y。
+
+额外的同场对照区分了工作区布局影响：32 档 decode 编译产物均与原实现逐字节相同；相同 X/WD/WU/P/Y 地址下，新函数与准备对象的差异在约 0.13% 内。真实内部工作区分配时，T≤16 的中位增量约 0.17 µs，外部 output 模式最大 +2.27%，默认分配输出模式最大 +2.22%；T17–32 的增量较小。该差异与工作区地址/复用方式相关，不能把同址结果当成所有分配布局都无回退。
+
 ### Decode (CUDA Graph)
 
-| T | Decode Down us | Decode Up us | Decode Total us | SGLang backend | SGLang Total us | Speedup |
+| T | Decode Down us | Decode Up us | Decode Total us | Frozen baseline backend | Frozen baseline Total us | Speedup |
 |---:|---:|---:|---:|---|---:|---:|
-| 1 | 4.874 | 6.339 | 10.983 | triton | 30.666 | 2.792x |
-| 2 | 4.911 | 6.414 | 11.107 | triton | 31.006 | 2.792x |
-| 3 | 4.956 | 6.484 | 11.215 | triton | 31.683 | 2.825x |
-| 4 | 4.995 | 6.856 | 11.470 | triton | 31.560 | 2.752x |
-| 5 | 5.009 | 6.938 | 11.608 | triton | 32.472 | 2.797x |
-| 6 | 5.054 | 6.989 | 11.730 | triton | 32.405 | 2.763x |
-| 7 | 5.127 | 7.394 | 11.946 | triton | 32.637 | 2.732x |
-| 8 | 5.172 | 7.435 | 12.055 | triton | 32.442 | 2.691x |
-| 9 | 5.176 | 7.832 | 12.207 | triton | 34.339 | 2.813x |
-| 10 | 5.246 | 7.831 | 12.299 | triton | 34.507 | 2.806x |
-| 11 | 5.383 | 7.831 | 12.417 | triton | 34.575 | 2.784x |
-| 12 | 5.494 | 7.836 | 12.527 | triton | 34.526 | 2.756x |
-| 13 | 5.489 | 7.839 | 12.574 | triton | 34.532 | 2.746x |
-| 14 | 5.604 | 7.837 | 12.711 | triton | 34.581 | 2.721x |
-| 15 | 5.725 | 7.838 | 12.851 | triton | 34.829 | 2.710x |
-| 16 | 5.883 | 7.838 | 13.018 | triton | 34.893 | 2.680x |
-| 17 | 6.852 | 10.070 | 15.983 | torch.compile | 33.361 | 2.087x |
-| 18 | 7.021 | 10.071 | 16.150 | torch.compile | 32.690 | 2.024x |
-| 19 | 7.177 | 10.067 | 16.369 | torch.compile | 32.765 | 2.002x |
-| 20 | 7.331 | 10.037 | 16.539 | torch.compile | 32.809 | 1.984x |
-| 21 | 7.339 | 10.014 | 16.633 | torch.compile | 32.782 | 1.971x |
-| 22 | 7.506 | 10.012 | 16.812 | torch.compile | 32.863 | 1.955x |
-| 23 | 7.740 | 10.045 | 16.966 | torch.compile | 32.900 | 1.939x |
-| 24 | 8.057 | 10.088 | 17.332 | torch.compile | 32.918 | 1.899x |
-| 25 | 8.266 | 10.121 | 17.589 | torch.compile | 26.430 | 1.503x |
-| 26 | 8.812 | 10.082 | 18.175 | torch.compile | 26.403 | 1.453x |
-| 27 | 8.966 | 10.160 | 18.407 | torch.compile | 26.431 | 1.436x |
-| 28 | 9.205 | 10.186 | 18.648 | torch.compile | 26.536 | 1.423x |
-| 29 | 9.219 | 10.335 | 18.791 | torch.compile | 26.580 | 1.415x |
-| 30 | 9.371 | 10.328 | 18.886 | torch.compile | 26.638 | 1.410x |
-| 31 | 9.501 | 10.364 | 19.045 | torch.compile | 26.674 | 1.401x |
-| 32 | 9.693 | 9.889 | 19.408 | torch.compile | 26.061 | 1.343x |
+| 1 | 4.804 | 6.530 | 11.340 | triton | 31.601 | 2.787x |
+| 2 | 4.883 | 6.581 | 11.381 | triton | 31.851 | 2.799x |
+| 3 | 4.930 | 6.664 | 11.660 | triton | 32.927 | 2.824x |
+| 4 | 4.972 | 6.662 | 11.686 | triton | 32.968 | 2.821x |
+| 5 | 4.987 | 6.687 | 11.730 | triton | 34.142 | 2.911x |
+| 6 | 5.049 | 6.695 | 11.729 | triton | 34.159 | 2.912x |
+| 7 | 5.111 | 6.843 | 11.733 | triton | 34.232 | 2.917x |
+| 8 | 5.164 | 6.866 | 11.805 | triton | 34.302 | 2.906x |
+| 9 | 5.184 | 7.621 | 12.348 | triton | 35.681 | 2.890x |
+| 10 | 5.264 | 7.830 | 12.482 | triton | 35.746 | 2.864x |
+| 11 | 5.389 | 7.830 | 12.604 | triton | 35.755 | 2.837x |
+| 12 | 5.498 | 7.830 | 12.737 | triton | 36.012 | 2.827x |
+| 13 | 5.512 | 7.831 | 12.795 | triton | 35.905 | 2.806x |
+| 14 | 5.625 | 7.848 | 12.922 | triton | 35.921 | 2.780x |
+| 15 | 5.747 | 7.912 | 13.141 | triton | 36.010 | 2.740x |
+| 16 | 5.908 | 7.836 | 13.262 | triton | 36.082 | 2.721x |
+| 17 | 6.876 | 9.780 | 16.246 | torch.compile | 36.677 | 2.258x |
+| 18 | 7.048 | 9.781 | 16.488 | torch.compile | 32.633 | 1.979x |
+| 19 | 7.196 | 9.784 | 16.613 | torch.compile | 32.793 | 1.974x |
+| 20 | 7.367 | 9.784 | 16.775 | torch.compile | 32.753 | 1.952x |
+| 21 | 7.394 | 9.782 | 16.835 | torch.compile | 32.737 | 1.945x |
+| 22 | 7.561 | 9.787 | 16.937 | torch.compile | 32.714 | 1.932x |
+| 23 | 7.802 | 9.787 | 17.241 | torch.compile | 32.861 | 1.906x |
+| 24 | 8.114 | 9.789 | 17.591 | torch.compile | 32.858 | 1.868x |
+| 25 | 8.324 | 9.789 | 17.891 | torch.compile | 27.304 | 1.526x |
+| 26 | 8.856 | 9.815 | 18.364 | torch.compile | 27.371 | 1.490x |
+| 27 | 8.992 | 9.844 | 18.610 | torch.compile | 27.373 | 1.471x |
+| 28 | 9.254 | 9.853 | 18.863 | torch.compile | 27.337 | 1.449x |
+| 29 | 9.274 | 9.784 | 18.864 | torch.compile | 27.385 | 1.452x |
+| 30 | 9.431 | 9.780 | 19.002 | torch.compile | 27.473 | 1.446x |
+| 31 | 9.565 | 9.781 | 19.122 | torch.compile | 27.360 | 1.431x |
+| 32 | 9.778 | 9.781 | 19.309 | torch.compile | 27.097 | 1.403x |
 
 ### Prefill (eager cudaPerf)
 
-| Batch | Down | Up | Down us / TFLOPS | Up us / TFLOPS | Total us / TFLOPS | Torch compile us / TFLOPS | Speedup |
+| Batch | Down | Up | Down us / TFLOPS | Up us / TFLOPS | Total us / TFLOPS | Frozen Torch compile us / TFLOPS | Speedup |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 33 | M16/W2/N10/BK1024 | M64/N40 | 16.540 / 13.076 | 16.520 / 13.091 | 31.101 / 13.908 | 42.740 / 10.120 | 1.374x |
-| 64 | M16/W2/N10/BK1024 | M64/N40 | 17.060 / 24.586 | 17.280 / 24.273 | 32.080 / 26.149 | 36.081 / 23.250 | 1.125x |
-| 128 | M16/W2/N10/BK1024 | M64/N40 | 17.381 / 48.264 | 17.460 / 48.045 | 32.640 / 51.401 | 44.180 / 37.975 | 1.354x |
-| 256 | M16/W2/N10/BK512 | M128/N40 | 26.660 / 62.930 | 20.680 / 81.128 | 42.520 / 78.914 | 55.621 / 60.327 | 1.308x |
-| 512 | M32/W4/N5/BK512 | M256/N40 | 31.900 / 105.186 | 26.160 / 128.266 | 53.940 / 124.414 | 84.980 / 78.970 | 1.575x |
-| 1024 | M32/W4/N5/BK128 | M256/N20 | 60.260 / 111.366 | 39.460 / 170.068 | 93.100 / 144.164 | 161.921 / 82.891 | 1.739x |
-| 2048 | M32/W4/N5/BK128 | M256/N10 | 115.661 / 116.044 | 65.940 / 203.545 | 168.201 / 159.592 | 280.922 / 95.555 | 1.670x |
-| 4096 | M64/W4/N1/BK64 | M256/N10 | 169.581 / 158.293 | 128.781 / 208.444 | 280.681 / 191.274 | 493.703 / 108.744 | 1.759x |
-| 8192 | M64/W4/N1/BK64 | M256/N2 | 301.562 / 178.030 | 274.981 / 195.239 | 550.903 / 194.906 | 944.025 / 113.741 | 1.714x |
-| 10240 | M64/W4/N1/BK64 | M256/N2 | 309.721 / 216.675 | 278.902 / 240.618 | 559.603 / 239.845 | 1749.210 / 76.731 | 3.126x |
-| 12288 | M64/W4/N1/BK64 | M256/N8 | 444.442 / 181.195 | 381.582 / 211.044 | 794.764 / 202.653 | 1893.630 / 85.054 | 2.383x |
-| 16384 | M64/W4/N1/BK64 | M256/N8 | 547.783 / 196.016 | 530.563 / 202.378 | 1078.586 / 199.102 | 3061.917 / 70.135 | 2.839x |
-| 20480 | M64/W4/N1/BK64 | M256/N2 | 558.023 / 240.524 | 553.323 / 242.567 | 1105.565 / 242.804 | 3377.758 / 79.471 | 3.055x |
-| 24576 | M64/W4/N1/BK64 | M256/N4 | 690.964 / 233.097 | 710.504 / 226.686 | 1405.467 / 229.193 | 3699.440 / 87.073 | 2.632x |
-| 28672 | M64/W4/N1/BK64 | M256/N2 | 824.084 / 228.017 | 824.765 / 227.828 | 1647.149 / 228.158 | 4847.626 / 77.524 | 2.943x |
-| 30720 | M64/W4/N1/BK64 | M256/N2 | 827.024 / 243.435 | 827.624 / 243.259 | 1663.069 / 242.115 | 5012.207 / 80.335 | 3.014x |
-| 32768 | M64/W4/N1/BK64 | M256/N8 | 959.565 / 223.798 | 990.745 / 216.754 | 1947.990 / 220.482 | 5181.387 / 82.892 | 2.660x |
-| 36864 | M64/W4/N1/BK64 | M256/N2 | 1093.766 / 220.881 | 1095.706 / 220.490 | 2192.192 / 220.411 | 6313.594 / 76.531 | 2.880x |
-| 49152 | M64/W4/N1/BK64 | M256/N2 | 1367.767 / 235.510 | 1390.988 / 231.578 | 2769.695 / 232.605 | 7313.379 / 88.091 | 2.641x |
-| 61440 | M64/W4/N1/BK64 | M256/N2 | 1640.889 / 245.387 | 1671.849 / 240.843 | 3354.678 / 240.055 | 6584.955 / 122.295 | 1.963x |
-| 65536 | M64/W4/N1/BK64 | M256/N4 | 1778.790 / 241.454 | 1865.930 / 230.178 | 3684.279 / 233.151 | 7188.679 / 119.493 | 1.951x |
-
+| 33 | M16/W2/N10/BK1024 | M64/N40 | 16.580 / 13.044 | 16.560 / 13.060 | 31.060 / 13.926 | 46.340 / 9.334 | 1.492x |
+| 64 | M16/W2/N10/BK1024 | M64/N40 | 16.980 / 24.701 | 17.340 / 24.189 | 31.880 / 26.313 | 32.360 / 25.922 | 1.015x |
+| 128 | M16/W2/N10/BK1024 | M64/N40 | 16.880 / 49.696 | 17.360 / 48.321 | 32.580 / 51.495 | 41.920 / 40.022 | 1.287x |
+| 256 | M16/W2/N10/BK512 | M128/N40 | 26.080 / 64.329 | 20.580 / 81.522 | 42.620 / 78.729 | 53.380 / 62.860 | 1.252x |
+| 512 | M32/W4/N5/BK512 | M256/N40 | 29.920 / 112.147 | 26.181 / 128.166 | 54.020 / 124.229 | 82.860 / 80.991 | 1.534x |
+| 1024 | M32/W4/N5/BK128 | M256/N20 | 58.860 / 114.014 | 39.560 / 169.638 | 93.661 / 143.302 | 160.040 / 83.865 | 1.709x |
+| 2048 | M32/W4/N5/BK128 | M256/N10 | 111.681 / 120.180 | 66.121 / 202.990 | 169.101 / 158.743 | 279.401 / 96.075 | 1.652x |
+| 4096 | M64/W4/N1/BK64 | M256/N10 | 158.741 / 169.103 | 130.061 / 206.392 | 280.382 / 191.479 | 495.422 / 108.366 | 1.767x |
+| 8192 | M64/W4/N1/BK64 | M256/N2 | 286.501 / 187.389 | 276.042 / 194.489 | 550.983 / 194.877 | 946.725 / 113.416 | 1.718x |
+| 10240 | M64/W4/N1/BK64 | M256/N2 | 293.442 / 228.696 | 281.001 / 238.820 | 559.963 / 239.690 | 1751.429 / 76.633 | 3.128x |
+| 12288 | M64/W4/N1/BK64 | M256/N8 | 416.843 / 193.192 | 382.422 / 210.581 | 795.544 / 202.454 | 1900.530 / 84.745 | 2.389x |
+| 16384 | M64/W4/N1/BK64 | M256/N8 | 549.903 / 195.260 | 530.943 / 202.233 | 1078.425 / 199.131 | 3065.656 / 70.050 | 2.843x |
+| 20480 | M64/W4/N1/BK64 | M256/N2 | 558.003 / 240.532 | 557.663 / 240.679 | 1107.026 / 242.483 | 3392.918 / 79.116 | 3.065x |
+| 24576 | M64/W4/N1/BK64 | M256/N4 | 691.043 / 233.070 | 714.824 / 225.316 | 1407.767 / 228.818 | 3716.799 / 86.667 | 2.640x |
+| 28672 | M64/W4/N1/BK64 | M256/N2 | 823.245 / 228.249 | 825.345 / 227.668 | 1651.349 / 227.577 | 4876.746 / 77.062 | 2.953x |
+| 30720 | M64/W4/N1/BK64 | M256/N2 | 827.845 / 243.194 | 826.165 / 243.688 | 1664.568 / 241.896 | 5046.306 / 79.792 | 3.032x |
+| 32768 | M64/W4/N1/BK64 | M256/N8 | 958.065 / 224.148 | 988.245 / 217.303 | 1953.850 / 219.821 | 5202.287 / 82.559 | 2.663x |
+| 36864 | M64/W4/N1/BK64 | M256/N2 | 1089.306 / 221.785 | 1091.646 / 221.310 | 2187.132 / 220.921 | 6348.953 / 76.104 | 2.903x |
+| 49152 | M64/W4/N1/BK64 | M256/N2 | 1364.727 / 236.034 | 1373.207 / 234.577 | 2761.334 / 233.309 | 7366.139 / 87.460 | 2.668x |
+| 61440 | M64/W4/N1/BK64 | M256/N2 | 1647.088 / 244.464 | 1667.729 / 241.438 | 3358.297 / 239.796 | 6656.535 / 120.980 | 1.982x |
+| 65536 | M64/W4/N1/BK64 | M256/N4 | 1775.450 / 241.909 | 1867.910 / 229.934 | 3690.140 / 232.781 | 7254.199 / 118.413 | 1.966x |
 Speedup = Torch compile Total / PyHIP Total; eager cudaPerf, full-row calls, no CUDA Graph.

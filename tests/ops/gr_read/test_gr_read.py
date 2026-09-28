@@ -97,33 +97,28 @@ def dependencies():
 
 
 @cache
+def baseline_modules():
+    """Load this checkout's test-only module in script and pytest import modes."""
+    import importlib.util
+    name = '_pyhip_gr_read_baselines'
+    path = Path(__file__).with_name('baselines.py')
+    if name in sys.modules:
+        module = sys.modules[name]
+        if Path(module.__file__).resolve() != path.resolve():
+            raise RuntimeError('baseline module belongs to a different checkout')
+        return module
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@cache
 def torch_compile_mix():
-    """Standalone copy of SGLang's output-only _mix_compute, with default compile options."""
-    torch, _, _, _ = dependencies()
-    import torch.nn.functional as F
-
-    # Mirrors hyperconnection.py at SGLang 2843214f6ed923e992a74ee4d7a0cda5d7deddbf.
-    # Keep this separate from the chunked P/Y correctness reference: benchmark
-    # the full T in one call, returning only Y as the actual model does.
-    def _mix_compute(
-        hyper_input_normed: torch.Tensor,
-        input_mix_weight_down: torch.Tensor,
-        input_mix_weight_up: torch.Tensor,
-        hc: int,
-        hs: int,
-    ) -> torch.Tensor:
-        input_mix_weight = F.silu(
-            F.linear(hyper_input_normed, input_mix_weight_down) / hc
-        )
-        input_mix_weight = F.linear(input_mix_weight, input_mix_weight_up)
-        input_mix_weight = torch.sigmoid(input_mix_weight)
-        input_mix_weight = input_mix_weight.unflatten(-1, (hc, hs))
-        output = (
-            input_mix_weight * hyper_input_normed.unflatten(-1, (hc, hs))
-        ).mean(dim=-2)
-        return output
-
-    return torch.compile(_mix_compute)
+    """Full-row performance baseline; independent from the P/Y accuracy reference."""
+    dependencies()
+    return baseline_modules().torch_compiled('prefill')
 
 
 def prepare_reader(x, w_down, w_up):
@@ -229,6 +224,15 @@ def check_batch(rows, args):
             assert reader(x) is output
             check_close(partial, p_expected, DOWN_TOLERANCE)
             y_error = check_close(output, y_expected, OUTPUT_TOLERANCE)
+        if scope in ("total", "all"):
+            from pyhip.ops.gr_read import gr_read
+            actual = gr_read(x, reader.w_down, reader.w_up)
+            if 0 < rows <= 32:
+                assert_decode_close(actual, decode_reference(x, wd, wu), 'public exact-row decode')
+            else:
+                check_close(actual, y_expected, OUTPUT_TOLERANCE)
+            assert gr_read(x, reader.w_down, reader.w_up, output=output) is output
+            torch.testing.assert_close(output, actual, rtol=0, atol=0)
         result = {"complete": True, "rows": rows, "down_n_splits": dn,
                   "down_block_m": dm, "down_num_waves": dw, "down_block_k": dk,
                   "up_block_m": um, "n_splits": un, "P_rel_l2": p_error, "Y_rel_l2": y_error,
@@ -291,6 +295,7 @@ def check_decode_rows(rows, wd, wu, pd, pu, seed):
     import torch
     use_checkout_package()
     from pyhip.ops.gr_read.flydsl import GRReadDecode
+    from pyhip.ops.gr_read import gr_read
     from pyhip.ops.gr_read.flydsl.common import K, R, H as HS
     reader = GRReadDecode(rows, pd, pu)
     assert reader.w_down.data_ptr() == pd.data_ptr()
@@ -299,10 +304,13 @@ def check_decode_rows(rows, wd, wu, pd, pu, seed):
     (x, sx) = guarded((rows, K), torch.bfloat16, pd.device)
     (reader.partial, sp) = guarded(reader.partial.shape, torch.float32, pd.device)
     (reader.output, sy) = guarded((rows, HS), torch.bfloat16, pd.device)
+    (api_output, api_storage) = guarded((rows, HS), torch.bfloat16, pd.device)
     gen = torch.Generator(device=pd.device).manual_seed(seed)
     x.normal_(generator=gen)
     assert_decode_close(reader(x), decode_reference(x, wd, wu), f'T={rows}: eager FP64 mismatch')
-    graph = capture_decode([lambda : reader(x)])
+    assert gr_read(x, pd, pu, output=api_output) is api_output
+    torch.testing.assert_close(api_output, reader.output, rtol=0, atol=0)
+    graph = capture_decode([lambda : reader(x), lambda : gr_read(x, pd, pu, output=api_output)])
     (count, maximum) = (0, 0.0)
     for tail in ('zero', 'stale', 'nan'):
         x.normal_(generator=gen)
@@ -315,11 +323,14 @@ def check_decode_rows(rows, wd, wu, pd, pu, seed):
             before = x.clone()
             reader.partial.fill_(float('nan'))
             reader.output.fill_(float('nan'))
+            api_output.fill_(float('nan'))
             graph.replay()
             expected = decode_reference(x[:live], wd, wu)
             actual = reader.output[:live].double()
             label = f'T={rows}, live={live}, tail={tail}'
             assert_decode_close(actual, expected, label)
+            assert_decode_close(api_output[:live], expected, label + ': public API')
+            torch.testing.assert_close(api_output[:live], reader.output[:live], rtol=0, atol=0)
             if live:
                 error = ((actual - expected).abs() / (0.005 + 0.01 * expected.abs())).max().item()
                 maximum = max(maximum, error)
@@ -332,10 +343,10 @@ def check_decode_rows(rows, wd, wu, pd, pu, seed):
                 assert torch.isfinite(partial).all(), label + ': stale scratch'
                 assert torch.isfinite(reader.output).all(), label + ': stale output'
             assert torch.allclose(x, before, rtol=0, atol=0, equal_nan=True), label + ': input mutated'
-            for storage in (sx, sp, sy):
+            for storage in (sx, sp, sy, api_storage):
                 assert torch.all(storage[:16] == 97) and torch.all(storage[-16:] == 97), label + ': guard overwritten'
             count += 1
-    return {'rows': rows, 'replays': count, 'max_scaled_error': maximum,
+    return {'rows': rows, 'replays': count, 'public_api_replays': count, 'max_scaled_error': maximum,
             'partial_shape': [4, rows, R], 'compact_partial_guards_passed': True, 'passed': True}
 
 
@@ -414,9 +425,7 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, help="override the selected single phase")
     parser.add_argument("--weights", type=int, help="alias for --decode-weights in decode-only mode")
     parser.add_argument("--check-only", action="store_true", help="check accuracy only; skip hardware gates and timing")
-    comparison = parser.add_mutually_exclusive_group()
-    comparison.add_argument("--sglang-root", type=Path, help="optional SGLang checkout for decode performance comparison")
-    comparison.add_argument("--no-sglang", action="store_true", help="skip SGLang comparison; still measure PyHIP and prefill Torch compile")
+    parser.add_argument("--no-baselines", action="store_true", help="skip frozen performance baselines in both phases; accuracy references still run")
     parser.add_argument("--amd-smi", type=Path, help="compatible amd-smi CLI for performance hardware gates")
     parser.add_argument("--output", type=Path, help="optional new JSONL file; default: console only")
     parser.add_argument("--verbose", action="store_true")
@@ -461,7 +470,8 @@ def run_correctness(args, emit):
                         emit({"type": "check", "phase": "decode", "weight": i, **result})
                     assert torch.equal(pd, before_down) and torch.equal(pu, before_up), "packed weights mutated"
         emit({"type": "summary", "phase": "decode", "complete": True, "rows": args.decode_rows, "replays": total})
-        print(f"Decode: {len(args.decode_rows)} shapes, {args.decode_weights} weight pairs, {total} full-path Graph replays PASS", flush=True)
+        print(f"Decode: {len(args.decode_rows)} shapes, {args.decode_weights} weight pairs, "
+              f"{total} Graph replays with prepared + functional calls PASS", flush=True)
     if args.phase in ("all", "prefill"):
         for index, rows in enumerate(args.prefill_rows, 1):
             print(f"[Prefill accuracy {index}/{len(args.prefill_rows)}] T={rows}, scope={args.scope}", flush=True)
@@ -489,12 +499,12 @@ def benchmark_options(args):
                "--decode-rows", *map(str, args.decode_rows),
                "--prefill-rows", *map(str, args.prefill_rows),
                "--prefill-seed", str(args.prefill_seed)]
-    for name in ("sglang_root", "amd_smi"):
+    for name in ("amd_smi",):
         value = getattr(args, name)
         if value is not None:
             options.extend(("--" + name.replace("_", "-"), str(value)))
-    if args.no_sglang:
-        options.append("--no-sglang")
+    if args.no_baselines:
+        options.append("--no-baselines")
     if args.verbose:
         options.append("--verbose")
     return benchmarking().parse_args(options)
@@ -511,16 +521,21 @@ def main(argv=None):
             if out:
                 out.write(json.dumps({"stage": "accuracy", **record}, allow_nan=False) + "\n")
                 out.flush()
+        if performance is not None:
+            bench = benchmarking()
+            def emit_performance(phase, record):
+                bench.emit_record(out, phase, {"stage": "performance", **record})
+            bench.benchmark_entry_gate(performance, emit_performance)
         print(f"[1/{1 if args.check_only else 2}] Accuracy checks for all selected batches", flush=True)
         run_correctness(args, emit)
         release_buffers()
         if performance is not None:
             print("\n[2/2] All selected batches passed accuracy; starting performance.", flush=True)
-            bench = benchmarking()
             bench.run_benchmarks(
                 performance,
-                lambda phase, record: bench.emit_record(out, phase, {"stage": "performance", **record}),
+                emit_performance,
                 prefill_checked=True,
+                hardware_checked=True,
             )
         else:
             print("Accuracy complete; performance skipped (--check-only or single --scope).", flush=True)
@@ -581,6 +596,261 @@ if "pytest" in sys.modules:
                     decode(x[:16])
                     assert torch.cuda.current_device() == 1
             assert torch.equal(pd, saved_weights[0]) and torch.equal(pu, saved_weights[1])
+
+
+    def api_inputs(rows=17, seed=1729):
+        torch = pytest.importorskip('torch')
+        pytest.importorskip('flydsl')
+        if torch.version.hip is None or not torch.cuda.is_available():
+            pytest.skip('ROCm required')
+        use_checkout_package()
+        from pyhip.ops.gr_read import prepare_weights
+        x, wd, wu = make_decode_inputs(rows, seed)
+        return x, wd, wu, *prepare_weights(wd, wu)
+
+
+    def test_api_cache_and_output_lifetime(monkeypatch):
+        import weakref
+        import torch
+        x, wd, wu, pd, pu = api_inputs()
+        from pyhip.ops.gr_read.flydsl import host
+        monkeypatch.setattr(host, '_compiled_calls', {})
+        calls = []
+        compile_call = host._compile_call
+
+        def observed(rows, *args):
+            calls.append(rows)
+            return compile_call(rows, *args)
+
+        monkeypatch.setattr(host, '_compile_call', observed)
+        y = host.gr_read(x, pd, pu)
+        assert_decode_close(y, decode_reference(x, wd, wu), 'cold call')
+        before = y.clone()
+        out = torch.empty_like(y)
+        x.mul_(.75)
+        assert host.gr_read(x, pd, pu, output=out) is out
+        assert_decode_close(out, decode_reference(x, wd, wu), 'changed input')
+        assert torch.equal(y, before) and y.data_ptr() != out.data_ptr()
+        assert calls == [17]
+        host.gr_read(x[:12], pd, pu)
+        assert calls == [17, 12], 'do not compile all T below the first input'
+        x2, wd2, wu2, pd2, pu2 = api_inputs(seed=77)
+        assert_decode_close(host.gr_read(x2, pd2, pu2), decode_reference(x2, wd2, wu2), 'current weights')
+        assert calls == [17, 12], 'compiled code must be shared across weight pairs'
+        refs = [weakref.ref(t) for t in (x2, pd2, pu2)]
+        del x2, pd2, pu2
+        gc.collect()
+        assert all(ref() is None for ref in refs), 'compiled cache must not retain caller tensors'
+
+
+    def test_api_prefill_runtime_rows(monkeypatch):
+        import torch
+        x, wd, wu, pd, pu = api_inputs(128)
+        from pyhip.ops.gr_read.flydsl import host
+        monkeypatch.setattr(host, '_compiled_calls', {})
+        expected = host.GRReadPrefill(33, pd, pu)(x[:33]).clone()
+        torch.testing.assert_close(host.gr_read(x[:33], pd, pu), expected, rtol=0, atol=0)
+        assert len(host._compiled_calls) == 1
+
+        def unexpected_compile(*args, **kwargs):
+            pytest.fail('same prefill config must reuse code for different runtime rows')
+
+        monkeypatch.setattr(host, '_compile_call', unexpected_compile)
+        for rows in (64, 65, 127, 128):
+            reference = host.GRReadPrefill(rows, pd, pu)(x[:rows]).clone()
+            out = torch.empty_like(reference)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = host.gr_read(x[:rows], pd, pu, output=out)
+            graph.replay()
+            assert result is out
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+            assert len(host._compiled_calls) == 1
+
+
+    @pytest.mark.parametrize('rows', (17, 24, 33, 513))
+    def test_api_graph_workspaces(monkeypatch, rows):
+        import torch
+        x, wd, wu, pd, pu = api_inputs(rows)
+        from pyhip.ops.gr_read.flydsl import host
+        x2 = x.clone().mul_(.5)
+        host.gr_read(x, pd, pu)
+        allocations = []
+        native_empty = torch.empty
+
+        def guarded_empty(shape, *args, **kwargs):
+            if torch.cuda.is_current_stream_capturing():
+                tensor, storage = guarded(shape, kwargs['dtype'], kwargs['device'])
+                allocations.append((tensor, storage))
+                return tensor
+            return native_empty(shape, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, 'empty', guarded_empty)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                y = host.gr_read(x, pd, pu)
+                y2 = host.gr_read(x2, pd, pu)
+        assert len(allocations) == 4
+        assert len({t.data_ptr() for t, _ in allocations}) == 4
+        p_shape = (4 * rows * R,) if rows <= 32 else (rows, R)
+        partials = [t for t, _ in allocations if tuple(t.shape) == p_shape]
+        assert len(partials) == 2
+        assert all(p.dtype == (torch.float32 if rows <= 32 else torch.bfloat16) for p in partials)
+        for live in (rows, min(rows, 17), 0, rows):
+            x[:live].mul_(.9).add_(.015625)
+            x[live:].fill_(float('nan'))
+            if live == rows:
+                x.nan_to_num_(.125)
+            before = x.clone()
+            for t, _ in allocations:
+                t.fill_(float('nan'))
+            graph.replay()
+            reference = (decode_reference(x[:live], wd, wu) if rows <= 32
+                         else reference_bf16(x[:live], wd, wu)[1].double())
+            assert_decode_close(y[:live], reference, 'fixed T and valid prefix')
+            reference2 = (decode_reference(x2, wd, wu) if rows <= 32
+                          else reference_bf16(x2, wd, wu)[1].double())
+            assert_decode_close(y2, reference2, 'independent P/Y for second call')
+            torch.testing.assert_close(x, before, rtol=0, atol=0, equal_nan=True)
+            for _, storage in allocations:
+                assert torch.all(storage[:16] == 97) and torch.all(storage[-16:] == 97)
+
+
+    def test_api_empty_and_contracts(monkeypatch):
+        import torch
+        x, wd, wu, pd, pu = api_inputs()
+        from pyhip.ops.gr_read.flydsl import host
+        monkeypatch.setattr(host, '_compiled_calls', {})
+        empty = x[:0]
+        out = torch.empty((0, H), dtype=x.dtype, device=x.device)
+        assert host.gr_read(empty, pd, pu, output=out) is out
+        assert host.gr_read(empty, pd, pu).shape == (0, H)
+        assert not host._compiled_calls
+        output = torch.full((17, H), 13, dtype=x.dtype, device=x.device)
+        bad_calls = [
+            (x.float(), pd, pu, output), (x[:, ::2], pd, pu, output),
+            (x, wd, pu, output), (x, pd, pu.float(), output),
+            (x, pd, pu, output[:16]), (x, pd, pu, output.float()),
+            (x, pd, pu, x.view(-1)[:17 * H].view(17, H)),
+            (x, pd, pu, pd[:17 * H].view(17, H)),
+        ]
+        misaligned = torch.empty(x.numel() + 1, dtype=x.dtype, device=x.device)[1:].view_as(x)
+        bad_calls.append((misaligned, pd, pu, output))
+        for xi, pdi, pui, yi in bad_calls:
+            with pytest.raises(ValueError):
+                host.gr_read(xi, pdi, pui, output=yi)
+        assert torch.all(output == 13) and not host._compiled_calls
+        with pytest.raises(ValueError, match='inference-only'):
+            host.gr_read(x.detach().requires_grad_(True), pd, pu)
+        graph = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match='warmed'), torch.cuda.graph(graph):
+            host.gr_read(x, pd, pu)
+        assert not host._compiled_calls
+
+
+    def test_api_streams_and_devices():
+        import torch
+        x, wd, wu, pd, pu = api_inputs()
+        from pyhip.ops.gr_read import gr_read
+        gr_read(x, pd, pu)
+        producer = torch.cuda.current_stream()
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        outputs = []
+        for stream in streams:
+            stream.wait_stream(producer)
+            with torch.cuda.stream(stream):
+                outputs.append(gr_read(x, pd, pu))
+        for stream in streams:
+            producer.wait_stream(stream)
+        assert outputs[0].data_ptr() != outputs[1].data_ptr()
+        torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+        if torch.cuda.device_count() > 1:
+            x1, pd1, pu1 = [t.to('cuda:1') for t in (x, pd, pu)]
+            assert torch.cuda.current_device() == 0
+            result = gr_read(x1, pd1, pu1)
+            assert torch.cuda.current_device() == 0
+            torch.testing.assert_close(result.to(x.device), outputs[0], rtol=0, atol=0)
+
+
+    def test_baseline_raw_weights():
+        torch = pytest.importorskip('torch')
+        baselines = baseline_modules()
+        wd = torch.arange(32, dtype=torch.float32).view(4, 8).to(torch.bfloat16)
+        wu = wd.T.contiguous()
+        a, b = baselines.prepare_weights(wd, wu)
+        c, d = baselines.prepare_weights(wd, wu)
+        assert all(t.is_contiguous() for t in (a, b, c, d))
+        assert len({t.data_ptr() for t in (wd, wu, a, b, c, d)}) == 6
+        assert torch.equal(a, wd) and torch.equal(c, wd)
+        assert torch.equal(b, wu) and torch.equal(d, wu)
+        with pytest.raises(ValueError, match='original 2D'):
+            baselines.prepare_weights(wd.flatten(), wu.flatten())
+
+
+    def test_baseline_cli_without_framework(monkeypatch):
+        import importlib.util
+        original = importlib.util.find_spec
+
+        def no_framework(name, *args, **kwargs):
+            if name == 'sglang' or name.startswith('sglang.'):
+                pytest.fail('CLI must not discover a framework installation')
+            return original(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, 'find_spec', no_framework)
+        for parser in (parse_args, benchmarking().parse_args):
+            assert not parser([]).no_baselines
+            assert parser(['--no-baselines']).no_baselines
+            assert not hasattr(parser([]), 'sglang_root')
+            with pytest.raises(SystemExit):
+                parser(['--sglang-root', '/does/not/exist'])
+            with pytest.raises(SystemExit):
+                parser(['--no-sglang'])
+        assert benchmark_options(parse_args(['--no-baselines'])).no_baselines
+
+
+    @pytest.mark.parametrize('rows', (1, 3, 8, 12, 16, 17, 24, 33, 65))
+    def test_frozen_baselines_graph(monkeypatch, rows):
+        import builtins
+        import torch
+        x, wd, wu, pd, pu = api_inputs(rows, seed=907)
+        original_import = builtins.__import__
+
+        def without_framework(name, *args, **kwargs):
+            if name == 'sglang' or name.startswith('sglang.'):
+                pytest.fail('frozen baselines must not import SGLang')
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, '__import__', without_framework)
+        baselines = baseline_modules()
+        triton = baselines
+        twd, twu = baselines.prepare_weights(wd, wu)
+        rwd, rwu = baselines.prepare_weights(wd, wu)
+        assert all(a.data_ptr() != b.data_ptr() for a, b in ((pd, twd), (pu, twu), (twd, rwd), (twu, rwu)))
+        supported = triton.fused_hc_mix_supported(x, rwd, rwu)
+        assert supported == (rows <= 16)
+        assert not triton.fused_hc_mix_supported(x, rwd, rwu, deterministic=True)
+        compiled = baselines.torch_compiled('decode' if rows <= 32 else 'prefill')
+        calls = [('torch.compile', lambda: compiled(x, twd, twu, C, H))]
+        if supported:
+            calls.append(('triton', lambda: triton.fused_hc_mix(x, rwd, rwu, C, H)))
+        with torch.inference_mode():
+            for label, call in calls:
+                expected = decode_reference(x, wd, wu)
+                assert_decode_close(call(), expected, label + ' initial')
+                call()  # all first-use setup must complete before capture
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = call()
+                for _ in range(2):
+                    x.mul_(.99).add_(.015625)
+                    output.fill_(float('nan'))
+                    graph.replay()
+                    assert_decode_close(output, decode_reference(x, wd, wu), label + ' replay')
+                    if label == 'triton':
+                        assert torch.count_nonzero(triton._get_counters(x.device)) == 0
+        assert torch.equal(twd, wd) and torch.equal(rwd, wd)
+        assert torch.equal(twu, wu) and torch.equal(rwu, wu)
 
 
 if __name__ == "__main__":

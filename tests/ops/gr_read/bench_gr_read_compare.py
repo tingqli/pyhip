@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: MIT
 """Print separate decode Graph and prefill eager benchmark tables.
 
-Defaults preserve the two PR #36 protocols. SGLang comparison is optional.
+Defaults preserve the two PR #36 protocols. Frozen test baselines are optional.
 Progress is printed during setup
 and between measurements, followed by the final tables. No result files are
 created unless --output is supplied.
 """
 import argparse
-import ast
 from contextlib import nullcontext
 from functools import cache
 import gc
@@ -27,7 +26,7 @@ import warnings
 
 REPO = Path(__file__).resolve().parents[3]
 C, H, R = 4, 2560, 320
-SCOPES = ('down', 'up', 'total', 'sglang')
+SCOPES = ('down', 'up', 'total', 'baseline')
 TIMING_SCOPES = ('down', 'up', 'total', 'torch_compile')
 
 
@@ -44,7 +43,7 @@ def testing():
     return load_file('gr_read_checks', Path(__file__).with_name('test_gr_read.py'))
 
 
-def dependencies(sglang_root):
+def dependencies(no_baselines=False):
     prefill = testing()
     prefill.use_checkout_package()
     import torch
@@ -56,18 +55,11 @@ def dependencies(sglang_root):
     decode = SimpleNamespace(GRReadDecode=GRReadDecode, prepare_weights=prepare_weights,
                              down_launcher=make_decode_down, up_launcher=make_decode_up)
     check = SimpleNamespace(reference=reference, assert_close=assert_close, make_inputs=make_inputs, capture=capture)
-    if sglang_root is None:
+    if no_baselines:
         return torch, flyc, cudaPerf, decode, check, prefill, None, None
-    source = sglang_root / 'python/sglang/srt/layers/hyperconnection.py'
-    tree = ast.parse(source.read_text())
-    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_mix_compute']
-    if len(functions) != 1: raise RuntimeError('expected one SGLang _mix_compute function')
-    namespace = {'torch': torch, 'F': torch.nn.functional}
-    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), namespace)
-    compiled_mix = torch.compile(namespace['_mix_compute'])
-    sys.path.insert(0, str(sglang_root / 'python'))
-    triton_mix = load_file('gr_compare_sglang_triton', sglang_root / 'python/sglang/srt/layers/hc_mix_triton.py')
-    return torch, flyc, cudaPerf, decode, check, prefill, compiled_mix, triton_mix
+    baselines = prefill.baseline_modules()
+    return (torch, flyc, cudaPerf, decode, check, prefill,
+            baselines.torch_compiled('decode'), baselines)
 
 
 def reference(x, w_down, w_up):
@@ -177,12 +169,19 @@ def tensor_address(tensor, *, output=False):
             "mod256": pointer % 256, "mod4096": pointer % 4096}
 
 
-def gate(prefill, args, phase, emit, rows=None):
-    # Fixed before any run: allow this process's own work to leave the SMI window.
-    # One query per gate; failed gates are retained and never retried in this run.
+def benchmark_entry_gate(args, emit):
+    # Check once, before correctness, allocations or warmup. SMI utilization can
+    # lag behind our own GPU work, so it is not an idle gate between batches.
     time.sleep(args.settle_seconds)
     snapshot = read_hardware(args.gpu, args.amd_smi)
-    emit({'type': 'hardware', 'phase': phase, 'rows': rows, **snapshot})
+    emit('setup', {'type': 'hardware', 'event_phase': 'entry',
+                   'hardware_policy': 'entry_only', 'settle_seconds': args.settle_seconds,
+                   **snapshot})
+    print(f"GPU{args.gpu} startup check: use={snapshot['card']['GPU use (%)']}%, "
+          f"VRAM={snapshot['card']['GPU Memory Allocated (VRAM%)']}%; "
+          "hardware checked once before GPU work.", flush=True)
+    if args.verbose:
+        print(snapshot, flush=True)
     validate_hardware(snapshot)
 
 
@@ -194,28 +193,32 @@ class Case:
         (self.phase, self.rows, self.prefill) = (args.phase, rows, prefill)
         (pd, pu) = packed if packed is not None else decode.prepare_weights(wd, wu)
         reader = decode.GRReadDecode(rows, pd, pu)
+        from pyhip.ops.gr_read import gr_read
+        self.gr_read = gr_read
         self.reader = reader
         (self.pd, self.pu, self.p, self.y) = (pd, pu, reader.partial, reader.output)
         self.down = flyc.compile(decode.down_launcher(rows), x.view(-1), pd, self.p, torch.cuda.current_stream(x.device))
         self.up = flyc.compile(decode.up_launcher(rows), x.view(-1), pu, self.p, self.y.view(-1), torch.cuda.current_stream(x.device))
-        self.sg_backend = self.sg_call = None
+        self.baseline_backend = self.baseline_call = None
+        self.baseline_wd = self.baseline_wu = None
         if triton_mix is not None:
-            self.sg_backend = 'triton' if triton_mix.fused_hc_mix_supported(x, wd, wu) else 'torch.compile'
-            self.sg_call = triton_mix.fused_hc_mix if self.sg_backend == 'triton' else compiled_mix
-        self.sg_y = None
+            self.baseline_wd, self.baseline_wu = prefill.baseline_modules().prepare_weights(wd, wu)
+            self.baseline_backend = 'triton' if triton_mix.fused_hc_mix_supported(x, self.baseline_wd, self.baseline_wu) else 'torch.compile'
+            self.baseline_call = triton_mix.fused_hc_mix if self.baseline_backend == 'triton' else compiled_mix
+        self.baseline_y = None
 
     def run(self, scope):
         torch = self.torch
-        if scope == 'sglang':
-            self.sg_y = self.sg_call(self.x, self.wd, self.wu, 4, 2560)
-            return self.sg_y
+        if scope == 'baseline':
+            self.baseline_y = self.baseline_call(self.x, self.baseline_wd, self.baseline_wu, 4, 2560)
+            return self.baseline_y
         stream = torch.cuda.current_stream(self.x.device)
         if scope == 'down':
             self.down(self.x.view(-1), self.pd, self.p, stream)
         elif scope == 'up':
             self.up(self.x.view(-1), self.pu, self.p, self.y.view(-1), stream)
         else:
-            self.reader(self.x)
+            self.gr_read(self.x, self.pd, self.pu, output=self.y)
         return self.p if scope == 'down' else self.y
 
 
@@ -230,8 +233,8 @@ def fp64_check(case, reference):
         end = min(begin + 1024, case.rows)
         expected = reference(case.x[begin:end], case.wd, case.wu)
         output_check(case.torch, case.y[begin:end], expected, 'PyHIP vs FP64')
-        if case.sg_call is not None:
-            output_check(case.torch, case.sg_y[begin:end], expected, 'SGLang vs FP64')
+        if case.baseline_call is not None:
+            output_check(case.torch, case.baseline_y[begin:end], expected, 'frozen baseline vs FP64')
 
 
 def decode_stage_check(case):
@@ -263,7 +266,7 @@ def check_timed(cases, scope):
             c.torch.testing.assert_close(c.y, c.saved_y, rtol=0, atol=0)
         else:
             # SGLang's persistent atomic reduction is not required to be bitexact.
-            output_check(c.torch, c.sg_y, c.saved_sg, 'timed SGLang output')
+            output_check(c.torch, c.baseline_y, c.saved_baseline, 'timed frozen baseline output')
 
 
 def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
@@ -274,12 +277,12 @@ def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
     stage_errors = []
     for (index, c) in enumerate(cases):
         c.run('total')
-        if c.sg_call is not None:
-            c.run('sglang')
+        if c.baseline_call is not None:
+            c.run('baseline')
         fp64_check(c, check.reference)
         if args.phase == 'decode' and index < 2:
             stage_errors.append(decode_stage_check(c))
-        (c.saved_p, c.saved_y, c.saved_sg) = (c.p.clone(), c.y.clone(), c.sg_y.clone() if c.sg_y is not None else None)
+        (c.saved_p, c.saved_y, c.saved_baseline) = (c.p.clone(), c.y.clone(), c.baseline_y.clone() if c.baseline_y is not None else None)
     graphs = {}
     for scope in scopes:
         calls = [lambda c=c, scope=scope: c.run(scope) for c in cases]
@@ -287,9 +290,10 @@ def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
         graphs[scope].replay()
         check_timed(cases, scope)
     emit({'type': 'correctness', 'phase': 'initial', 'rows': rows, 'pairs': len(pairs), 'fp64_passed': True, 'isolated_down_max_abs': stage_errors, 'isolated_up_fp64_passed': bool(stage_errors)})
-    emit({'type': 'addresses', 'rows': rows, 'buffers': [{k: address(v) for (k, v) in (('X', c.x), ('WD_raw', c.wd), ('WU_raw', c.wu), ('WD_packed', c.pd), ('WU_packed', c.pu), ('P', c.p), ('Y', c.y), ('SGLang_Y', c.sg_y)) if v is not None} for c in cases]})
+    emit({'type': 'addresses', 'rows': rows, 'total_entry': 'gr_read',
+          'total_partial': 'allocated internally for each call; P_stages is only used by stage measurements',
+          'buffers': [{k: address(v) for (k, v) in (('X', c.x), ('WD_raw', c.wd), ('WU_raw', c.wu), ('WD_packed', c.pd), ('WU_packed', c.pu), ('P_stages', c.p), ('Y', c.y), ('Baseline_WD', c.baseline_wd), ('Baseline_WU', c.baseline_wu), ('Baseline_Y', c.baseline_y)) if v is not None} for c in cases]})
     torch.cuda.synchronize()
-    gate(prefill, args, 'before_samples', emit, rows)
     values = {scope: [] for scope in scopes}
     for round_index in range(args.rounds):
         order = scopes if round_index % 2 == 0 else scopes[::-1]
@@ -302,53 +306,45 @@ def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
         c.x.mul_(0.99).add_(0.015625)
     if graphs:
         graphs['total'].replay()
-        if 'sglang' in graphs:
-            graphs['sglang'].replay()
+        if 'baseline' in graphs:
+            graphs['baseline'].replay()
     else:
         for c in cases:
             c.run('total')
-            if c.sg_call is not None:
-                c.run('sglang')
+            if c.baseline_call is not None:
+                c.run('baseline')
     for c in cases:
         fp64_check(c, check.reference)
     torch.cuda.synchronize()
-    gate(prefill, args, 'after_samples', emit, rows)
     timings = {scope: median(samples) for (scope, samples) in values.items()}
-    result = {'type': 'result', 'rows': rows, 'phase': args.phase, 'mode': 'cuda_graph' if graphs else 'eager', 'sglang_backend': cases[0].sg_backend, 'median_us': timings, 'speedup_total': timings['sglang'] / timings['total'] if 'sglang' in timings else None, 'changed_input_fp64_passed': True, 'effective_tflops': {s: (2 if s in ('down', 'up') else 4) * rows * 10240 * 320 / (v * 1000000.0) for (s, v) in timings.items()}}
+    result = {'type': 'result', 'rows': rows, 'phase': args.phase, 'mode': 'cuda_graph' if graphs else 'eager', 'baseline_backend': cases[0].baseline_backend, 'median_us': timings, 'speedup_total': timings['baseline'] / timings['total'] if 'baseline' in timings else None, 'changed_input_fp64_passed': True, 'effective_tflops': {s: (2 if s in ('down', 'up') else 4) * rows * 10240 * 320 / (v * 1000000.0) for (s, v) in timings.items()}}
     emit(result)
-    comparison = (f" SGLang({cases[0].sg_backend})={timings['sglang']:.3f} us speedup={result['speedup_total']:.3f}x"
-                  if 'sglang' in timings else " SGLang: not run")
+    comparison = (f" Frozen({cases[0].baseline_backend})={timings['baseline']:.3f} us speedup={result['speedup_total']:.3f}x"
+                  if 'baseline' in timings else " Baseline: not run")
     print(f"T={rows:5d} {result['mode']:10s} Down={timings['down']:.3f} Up={timings['up']:.3f} Total={timings['total']:.3f}" + comparison, flush=True)
     return result
 
 
-def prefill_hardware_gate(args, emit, point, rows):
-    time.sleep(2)
-    snapshot = read_hardware(args.gpu, args.amd_smi)
-    emit({"type": "hardware", "event_phase": point, "rows": rows, **snapshot})
-    validate_hardware(snapshot)
-    if args.verbose:
-        print(f"GPU{args.gpu} prefill {point}: {snapshot['card']}", flush=True)
-    return snapshot
-
-
 def benchmark_prefill_batch(rows, args, emit):
-    before = prefill_hardware_gate(args, emit, "before", rows)
     prefill = testing()
     torch, _, _, cuda_perf = prefill.dependencies()
-    compiled_mix = prefill.torch_compile_mix()
+    compiled_mix = None if args.no_baselines else prefill.torch_compile_mix()
+    scopes = TIMING_SCOPES[:-1] if args.no_baselines else TIMING_SCOPES
+    from pyhip.ops.gr_read import gr_read
     with torch.no_grad():
         x, wd, wu = prefill.make_inputs(torch, rows, args.seed)
         inputs = [x] + [x.clone() for _ in range(args.buffers - 1)]
         # Both implementations rotate over independent weight allocations.
         # Each pair has identical logical values; packing happens only here.
         weights = [(wd, wu)] + [(wd.clone(), wu.clone()) for _ in range(args.buffers - 1)]
+        baseline_weights = ([prefill.baseline_modules().prepare_weights(*pair) for pair in weights]
+                            if compiled_mix is not None else [])
         readers = [prefill.prepare_reader(input_x, *pair) for input_x, pair in zip(inputs, weights)]
         expected_p = expected_y = None
         expected_torch = None
         torch_outputs = [None] * args.buffers
         addresses = []
-        calls = {scope: [] for scope in TIMING_SCOPES}
+        calls = {scope: [] for scope in scopes}
         for bi, (input_x, reader, (raw_down, raw_up)) in enumerate(zip(inputs, readers, weights)):
             dm, dw, dn, dk = reader.down_config
             um, un = reader.up_config
@@ -358,34 +354,37 @@ def benchmark_prefill_batch(rows, args, emit):
                 (input_x, reader.w_down, reader.w_up, partial, output))})
             calls["down"].append(lambda x=input_x, r=reader: r.run_down(x))
             calls["up"].append(lambda x=input_x, r=reader: r.run_up(x))
-            calls["total"].append(lambda x=input_x, r=reader: r(x))
-            calls["torch_compile"].append(
-                lambda x=input_x, wd=raw_down, wu=raw_up: compiled_mix(x, wd, wu, C, H))
+            calls["total"].append(lambda x=input_x, r=reader: gr_read(x, r.w_down, r.w_up, output=r.output))
+            if compiled_mix is not None:
+                baseline_down, baseline_up = baseline_weights[bi]
+                calls["torch_compile"].append(
+                    lambda x=input_x, wd=baseline_down, wu=baseline_up: compiled_mix(x, wd, wu, C, H))
             partial.fill_(torch.nan); output.fill_(torch.nan)
             reader(input_x)
             if expected_p is None:
                 expected_p, expected_y = partial.clone(), output.clone()
             torch.testing.assert_close(partial, expected_p, rtol=0, atol=0)
             torch.testing.assert_close(output, expected_y, rtol=0, atol=0)
-            # Compile the actual full shape and check every buffer before timing.
-            torch_outputs[bi] = calls["torch_compile"][bi]()
-            if expected_torch is None:
-                expected_torch = torch_outputs[bi].clone()
-            torch.testing.assert_close(torch_outputs[bi], expected_torch, rtol=0, atol=0)
-            prefill.check_close(output, torch_outputs[bi], prefill.OUTPUT_TOLERANCE)
-            addresses[-1].update({name: tensor_address(tensor) for name, tensor in (
-                ("Torch_X", input_x), ("Torch_W_down", raw_down), ("Torch_W_up", raw_up),
-                ("Torch_Y_prepared", torch_outputs[bi]))})
+            if compiled_mix is not None:
+                # Compile/check every raw-layout baseline buffer before timing.
+                torch_outputs[bi] = calls["torch_compile"][bi]()
+                if expected_torch is None:
+                    expected_torch = torch_outputs[bi].clone()
+                torch.testing.assert_close(torch_outputs[bi], expected_torch, rtol=0, atol=0)
+                prefill.check_close(output, torch_outputs[bi], prefill.OUTPUT_TOLERANCE)
+                addresses[-1].update({name: tensor_address(tensor) for name, tensor in (
+                    ("Torch_X", input_x), ("Torch_W_down", baseline_down), ("Torch_W_up", baseline_up),
+                    ("Torch_Y_prepared", torch_outputs[bi]))})
         assert all(len({row[name]["pointer"] for row in addresses}) == args.buffers for name in addresses[0])
-        emit({"type": "addresses", "rows": rows, "buffers": addresses})
-        for scope in TIMING_SCOPES:
+        emit({"type": "addresses", "rows": rows, "buffers": addresses,
+              "total_entry": "gr_read", "total_partial": "internal allocation; P refers to the stage workspace"})
+        for scope in scopes:
             for index in range(args.warmup): calls[scope][index % args.buffers]()
         torch.cuda.synchronize()
-        ready = prefill_hardware_gate(args, emit, "before_samples", rows)
         timings = {}
         # Retain the original stage-by-stage sampling order; append Torch.
         # These are whole-scope medians, not an interleaved A/B experiment.
-        for scope in TIMING_SCOPES:
+        for scope in scopes:
             perf = cuda_perf(name=f"gr_read_{scope}", verbose=0)
             if not perf.enable:
                 raise RuntimeError("CUDAPERF disables GRRead timing")
@@ -418,30 +417,32 @@ def benchmark_prefill_batch(rows, args, emit):
                               "effective_TFLOPS": flops / elapsed / 1e6}
             print(f"  T={rows:5d} Down M{dm}/W{dw}/N{dn}/BK{dk} / Up M{um}/N{un} "
                   f"{scope}: {elapsed:.3f} us", flush=True)
-        after = prefill_hardware_gate(args, emit, "after", rows)
         return {"complete": True, "rows": rows, "down_n_splits": dn,
                 "down_block_m": dm, "down_num_waves": dw, "down_block_k": dk,
                 "up_block_m": um, "n_splits": un, "timings": timings,
-                "hardware_before": before, "hardware_before_samples": ready, "hardware_after": after,
                 "buffers": args.buffers, "warmup_each": args.warmup, "samples_each": args.iters,
                 "timed_outputs_bitexact": True, "all_samples_retained": True,
                 "Total_measured_directly": True, "settings_written": False,
-                "speedup_vs_torch_compile": timings["torch_compile"]["elapsed_us"] / timings["total"]["elapsed_us"],
+                "speedup_vs_torch_compile": (timings["torch_compile"]["elapsed_us"] / timings["total"]["elapsed_us"]
+                                             if compiled_mix is not None else None),
                 "torch_compile": {"full_rows": rows, "returns": "Y", "options": "default", "cuda_graph": False,
                                   "shared_X": True, "independent_raw_weight_buffers": args.buffers,
-                                  "output_allocation": "native", "Y_tolerance": prefill.OUTPUT_TOLERANCE},
-                "sampling_order": list(TIMING_SCOPES)}
+                                  "output_allocation": "native", "Y_tolerance": prefill.OUTPUT_TOLERANCE}
+                                  if compiled_mix is not None else None,
+                "sampling_order": list(scopes)}
 
 
 def print_prefill_table(results):
-    print("\n| Batch | Down | Up | Down us / TFLOPS | Up us / TFLOPS | Total us / TFLOPS | Torch compile us / TFLOPS | Speedup |", flush=True)
+    print("\n| Batch | Down | Up | Down us / TFLOPS | Up us / TFLOPS | Total us / TFLOPS | Frozen Torch compile us / TFLOPS | Speedup |", flush=True)
     print("|---:|---:|---:|---:|---:|---:|---:|---:|", flush=True)
     for result in results:
-        cells = [f"{result['timings'][scope]['elapsed_us']:.3f} / {result['timings'][scope]['effective_TFLOPS']:.3f}" for scope in TIMING_SCOPES]
+        cells = [(f"{result['timings'][scope]['elapsed_us']:.3f} / {result['timings'][scope]['effective_TFLOPS']:.3f}"
+                  if scope in result['timings'] else '—') for scope in TIMING_SCOPES]
+        speedup = f"{result['speedup_vs_torch_compile']:.3f}x" if result['speedup_vs_torch_compile'] is not None else '—'
         down = (f"M{result['down_block_m']}/W{result['down_num_waves']}"
                 f"/N{result['down_n_splits']}/BK{result['down_block_k']}")
         print(f"| {result['rows']} | {down} | M{result['up_block_m']}/N{result['n_splits']} | "
-              f"{' | '.join(cells)} | {result['speedup_vs_torch_compile']:.3f}x |", flush=True)
+              f"{' | '.join(cells)} | {speedup} |", flush=True)
     print("Speedup = Torch compile Total / PyHIP Total; eager cudaPerf, full-row calls, no CUDA Graph.", flush=True)
 
 
@@ -508,11 +509,7 @@ def benchmark_decode_total(rows, pairs, args, emit):
     for x, r, (wd, wu) in zip(xs, readers, pairs):
         assert_close(r.output, reference(x, wd, wu), f"T={rows}: initial FP64")
     torch.cuda.synchronize()
-    # Clear our own initialization/check work from the utilization window.
-    time.sleep(2)
-    snap = hardware_snapshot()
-    emit({"type": "hardware", "phase": "before_samples", "rows": rows, **snap})
-    check_hardware(snap)
+    # The caller checks hardware once before preparing the benchmark inputs.
     timings = []
     for round_index in range(args.rounds):
         values = time_graph(graph, len(pairs) * 2, args.samples)
@@ -536,9 +533,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--phase', choices=('all', 'decode', 'prefill'), default='all')
     parser.add_argument('--gpu', type=int, default=0)
-    comparison = parser.add_mutually_exclusive_group()
-    comparison.add_argument('--sglang-root', type=Path, help='SGLang checkout; otherwise use an installed checkout if available')
-    comparison.add_argument('--no-sglang', action='store_true', help='measure PyHIP decode only; prefill still includes Torch compile')
+    parser.add_argument('--no-baselines', action='store_true', help='skip frozen performance baselines in both phases; accuracy references still run')
     parser.add_argument('--rows', '--batches', nargs='+', type=checks.parse_batch)
     parser.add_argument('--decode-rows', nargs='+', type=checks.parse_batch)
     parser.add_argument('--prefill-rows', nargs='+', type=checks.parse_batch)
@@ -550,7 +545,7 @@ def parse_args(argv=None):
     parser.add_argument('--prefill-warmup', type=int, default=2)
     parser.add_argument('--prefill-iters', type=int, default=10)
     parser.add_argument('--prefill-seed', type=int, default=131)
-    parser.add_argument('--settle-seconds', type=float, default=2.0, help='decode gate settling; prefill retains its fixed 2 seconds')
+    parser.add_argument('--settle-seconds', type=float, default=2.0, help='wait once before the startup hardware check')
     parser.add_argument('--amd-smi', type=Path)
     parser.add_argument('--output', type=Path, help='optional new JSONL file; default: progress and tables on console')
     parser.add_argument('--verbose', action='store_true', help='also print hardware and detailed correctness diagnostics')
@@ -570,21 +565,6 @@ def parse_args(argv=None):
     counts = (args.decode_weights, args.decode_rounds, args.decode_samples, args.prefill_buffers, args.prefill_iters)
     if min(counts) < 1 or args.gpu < 0 or args.prefill_warmup < 0 or args.settle_seconds < 0 or not __debug__:
         parser.error('positive counts, nonnegative GPU/warmup/settling required; do not use python -O')
-    if args.phase != 'prefill' and not args.no_sglang:
-        if args.sglang_root is None:
-            try:
-                spec = importlib.util.find_spec('sglang')
-            except ModuleNotFoundError:
-                spec = None
-            if spec is not None and spec.origin:
-                candidate = Path(spec.origin).resolve().parents[2]
-                if (candidate / 'python/sglang/srt/layers/hyperconnection.py').is_file():
-                    args.sglang_root = candidate
-        if args.sglang_root is not None:
-            args.sglang_root = args.sglang_root.resolve()
-            for name in ('hyperconnection.py', 'hc_mix_triton.py'):
-                if not (args.sglang_root / 'python/sglang/srt/layers' / name).is_file():
-                    parser.error(f'SGLang {name} was not found under --sglang-root')
     return args
 
 
@@ -602,15 +582,14 @@ def emit_record(stream, phase, record):
 def run_decode(args, emit):
     local = SimpleNamespace(phase='decode', gpu=args.gpu, seed=args.decode_seed,
                             weights=args.decode_weights, rounds=args.decode_rounds,
-                            samples=args.decode_samples, warmup=2, settle_seconds=args.settle_seconds,
+                            samples=args.decode_samples, warmup=2,
                             amd_smi=args.amd_smi, verbose=args.verbose)
-    runtime = 'runtime and SGLang' if args.sglang_root is not None else 'PyHIP runtime'
+    runtime = 'PyHIP runtime' if args.no_baselines else 'PyHIP and frozen baselines'
     print(f"\nDecode: {len(args.decode_rows)} batches, {local.weights} weight pairs, "
           f"{local.rounds}x{local.samples} Graph samples/scope. Loading {runtime}...", flush=True)
-    if args.sglang_root is None:
-        print("SGLang comparison not run; measuring PyHIP Down/Up/Total. "
-              "Use --sglang-root to add the SGLang comparison.", flush=True)
-    dep = dependencies(args.sglang_root)
+    if args.no_baselines:
+        print("Frozen performance baselines disabled (--no-baselines).", flush=True)
+    dep = dependencies(args.no_baselines)
     torch, _, _, _, check, prefill, _, _ = dep
     if torch.version.hip is None or not torch.cuda.is_available():
         raise RuntimeError('decode comparison requires a ROCm GPU')
@@ -618,32 +597,29 @@ def run_decode(args, emit):
     props = torch.cuda.get_device_properties(0)
     source_paths = [Path(__file__), Path(__file__).with_name('test_gr_read.py'),
                     *(REPO / 'src/pyhip/ops/gr_read/flydsl').glob('*.py')]
-    if args.sglang_root is not None:
-        source_paths.extend(args.sglang_root / 'python/sglang/srt/layers' / name
-                            for name in ('hyperconnection.py', 'hc_mix_triton.py'))
+    if not args.no_baselines:
+        source_paths.append(Path(__file__).with_name('baselines.py'))
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
           'gpu': props.name, 'arch': props.gcnArchName, 'compute_units': props.multi_processor_count,
           'protocol': {'weights': local.weights, 'rounds': local.rounds, 'samples': local.samples,
                        'seed': local.seed, 'graph_passes': 2, 'replays_per_sample': 3, 'mode': 'cuda_graph'},
           'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
-          'sglang_head': (subprocess.check_output(['git', '-C', str(args.sglang_root), 'rev-parse', 'HEAD'], text=True).strip()
-                          if args.sglang_root is not None else None),
+          'baseline': None if args.no_baselines else prefill.baseline_modules().metadata(),
           'settings_written': False})
-    gate(prefill, local, 'entry', emit)
     results = []
     with torch.inference_mode():
         print(f"Decode: preparing {local.weights} shared weight pairs...", flush=True)
         pairs = [check.make_inputs(1, local.seed + i)[1:] for i in range(local.weights)]
         from pyhip.ops.gr_read.flydsl import prepare_weights
         packed_pairs = [prepare_weights(wd, wu) for wd, wu in pairs]
-        emit({'type': 'weight_preparation', 'pairs': len(pairs), 'packing_calls': len(pairs), 'shared_across_rows': True})
+        emit({'type': 'weight_preparation', 'pairs': len(pairs), 'packing_calls': len(pairs),
+              'shared_across_rows': True, 'baseline_layout': 'independent contiguous raw matrices' if not args.no_baselines else None})
         for index, rows in enumerate(args.decode_rows, 1):
             print(f"[Decode {index}/{len(args.decode_rows)}] T={rows}: "
                   "preparing kernels, checking outputs and capturing graphs...", flush=True)
             results.append(benchmark_decode_rows(rows, pairs, local, dep, emit, packed_pairs))
             gc.collect()
             torch.cuda.empty_cache()
-    gate(prefill, local, 'exit', emit)
     emit({'type': 'summary', 'complete': True, 'rows': args.decode_rows})
     return results
 
@@ -652,13 +628,14 @@ def run_prefill(args, emit, *, check=True):
     prefill = testing()
     local = SimpleNamespace(gpu=args.gpu, seed=args.prefill_seed, buffers=args.prefill_buffers,
                             warmup=args.prefill_warmup, iters=args.prefill_iters,
-                            amd_smi=args.amd_smi, verbose=args.verbose)
+                            amd_smi=args.amd_smi, verbose=args.verbose, no_baselines=args.no_baselines)
     print(f"\nPrefill: {len(args.prefill_rows)} batches, {local.buffers} buffers, "
           f"{local.warmup} warmup calls, {local.iters} eager samples/scope. Loading runtime...", flush=True)
     torch, _, _, _ = prefill.dependencies()
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
           'protocol': {'buffers': local.buffers, 'warmup': local.warmup, 'iters': local.iters,
-                       'seed': local.seed, 'scope_order': list(TIMING_SCOPES), 'mode': 'eager'},
+                       'seed': local.seed, 'scope_order': list(TIMING_SCOPES[:-1] if args.no_baselines else TIMING_SCOPES), 'mode': 'eager'},
+          'baseline': None if args.no_baselines else prefill.baseline_modules().metadata(),
           'settings_written': False})
     # Keep the original prefill flow: all selected correctness checks before timing.
     for index, rows in enumerate(args.prefill_rows if check else (), 1):
@@ -686,18 +663,20 @@ def run_prefill(args, emit, *, check=True):
 
 def print_decode_table(results):
     print('\nDecode (CUDA Graph)')
-    print('\n| T | Decode Down us | Decode Up us | Decode Total us | SGLang backend | SGLang Total us | Speedup |')
+    print('\n| T | Decode Down us | Decode Up us | Decode Total us | Frozen baseline backend | Frozen baseline Total us | Speedup |')
     print('|---:|---:|---:|---:|---|---:|---:|')
     for r in results:
         t = r['median_us']
-        sg_time = f"{t['sglang']:.3f}" if 'sglang' in t else '—'
+        baseline_time = f"{t['baseline']:.3f}" if 'baseline' in t else '—'
         speedup = f"{r['speedup_total']:.3f}x" if r['speedup_total'] is not None else '—'
         print(f"| {r['rows']} | {t['down']:.3f} | {t['up']:.3f} | {t['total']:.3f} | "
-              f"{r['sglang_backend'] or 'not run'} | {sg_time} | {speedup} |")
+              f"{r['baseline_backend'] or 'not run'} | {baseline_time} | {speedup} |")
 
 
-def run_benchmarks(args, emit, *, prefill_checked=False):
+def run_benchmarks(args, emit, *, prefill_checked=False, hardware_checked=False):
     """Run the existing samplers and print both final tables after all phases."""
+    if not hardware_checked:
+        benchmark_entry_gate(args, emit)
     checks = testing()
     results_by_phase = {}
     if args.phase in ('all', 'decode'):
