@@ -1,78 +1,165 @@
+"""Depthwise Conv3D wrapper and the historical assembly JIT experiment."""
+
 import pyhip
 
-__all__ = [
-    "conv_depthwise_3d", "conv_depthwise_3d_jit"
-]
+__all__ = ["conv_depthwise_3d", "conv_depthwise_3d_jit"]
 
-import os
+_PACKED_HIP_SOURCE = "hip/conv_depthwise3d_hip_packed_dot.cpp"
+_PACKED_FP16_ARCHS = frozenset({"gfx942", "gfx950"})
+_PACKED_BF16_ARCHS = frozenset({"gfx950"})
 
-# https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.conv3d.html
-def conv_depthwise_3d(input, weight, bias,
-                    stride,
-                    padding, 
-                    dilation,
-                    groups,
-                    method = None,
-                    hip_impl = "sgb"):
-    for s in stride: assert s == 1, s
-    for d in dilation: assert d == 1, d
 
-    assert str(input.dtype) == 'torch.bfloat16' or str(input.dtype) == 'torch.float16'
+def _triple(value):
+    if isinstance(value, int):
+        return (value, value, value)
+    result = tuple(value)
+    if len(result) != 3:
+        raise ValueError("Conv3D stride, padding, and dilation must have three values")
+    return result
 
-    global torch
+
+def _device_arch(input):
     import torch
-    output = torch.empty(input.shape, dtype=input.dtype, device=input.device)
-    B, C_in, D, H, W = input.shape
-    C_out, C_g, KD, KH, KW = weight.shape
 
-    assert padding[0] == 0
-    assert padding[1] == KH//2
-    assert padding[2] == KW//2
+    properties = torch.cuda.get_device_properties(input.device)
+    arch = getattr(properties, "gcnArchName", "")
+    if not arch:
+        from pyhip.runtime.hiptools import amdgpu_arch
 
-    assert C_out == C_in
-    assert C_g * groups == C_in
-    assert C_g == 1, f"depthwise assumes C_g == 1 but got {C_g}"
+        arch = amdgpu_arch()
+    return arch.split(":", 1)[0]
 
-    D_out = (D + 2 * padding[0] - dilation[0] * (KD - 1) - 1) // stride[0] + 1  # case3: (61+0-2-1)//1+1 = 59
-    H_out = (H + 2 * padding[1] - dilation[1] * (KH - 1) - 1) // stride[1] + 1  # case3: (45+4-4-1)//1+1 = 45
-    W_out = (W + 2 * padding[2] - dilation[2] * (KW - 1) - 1) // stride[2] + 1  # case3: (80+4-4-1)//1+1 = 80
 
-    output = torch.zeros(B, C_out, D_out, H_out, W_out, dtype=input.dtype, device=input.device)
+def _packed_unavailable_reason(input, weight, bias, stride, padding, dilation, groups):
+    """Return why the packed 3x5x5 kernel cannot safely handle this call."""
+    import torch
 
-    if method is None:
-        method = "hip"
+    if input.ndim != 5 or weight.ndim != 5:
+        return "input and weight must be 5D"
+    if input.device.type != "cuda" or torch.version.hip is None:
+        return "a ROCm GPU tensor is required"
+    if input.dtype not in (torch.float16, torch.bfloat16):
+        return "only FP16 and BF16 are supported"
+    if weight.device != input.device or weight.dtype != input.dtype:
+        return "weight must have the same device and dtype as input"
+    if bias is not None and (bias.device != input.device or bias.dtype != input.dtype):
+        return "bias must have the same device and dtype as input"
+    if not input.is_contiguous() or not weight.is_contiguous() or (
+        bias is not None and not bias.is_contiguous()
+    ):
+        return "input, weight, and bias must be contiguous NCDHW tensors"
 
-    if method == "hip":
-        hip_cpp = (
-            "hip/conv_depthwise3d_hip.cpp"
-            if hip_impl == "original"
-            else "hip/conv_depthwise3d_hip_sgb.cpp"
+    batch, in_channels, depth, height, width = input.shape
+    out_channels, channels_per_group, kd, kh, kw = weight.shape
+    if batch < 1 or in_channels < 1:
+        return "batch and channel counts must be positive"
+    if groups != in_channels or out_channels != in_channels or channels_per_group != 1:
+        return "groups, input channels, and output channels must match"
+    if bias is not None and (bias.ndim != 1 or bias.numel() != out_channels):
+        return "bias must have one value per output channel"
+    if (kd, kh, kw) != (3, 5, 5):
+        return "the filter must be 3x5x5"
+    if stride != (1, 1, 1) or dilation != (1, 1, 1) or padding != (0, 2, 2):
+        return "stride=(1,1,1), dilation=(1,1,1), padding=(0,2,2) are required"
+    if depth < 3 or height < 1 or width < 16 or width % 16:
+        return "depth >= 3, height >= 1, and width divisible by 16 are required"
+    # The HIP kernel stages a padded spatial tile plus a small dword-read tail.
+    lds_bytes = (3 * (height + 4) * (width + 4) + 2 * kw) * input.element_size()
+    if lds_bytes > 64 * 1024:
+        return "the padded spatial tile exceeds 64 KiB of LDS"
+
+    arch = _device_arch(input)
+    if input.dtype == torch.float16 and arch not in _PACKED_FP16_ARCHS:
+        return f"FP16 packed dot is unavailable on {arch}"
+    if input.dtype == torch.bfloat16 and arch not in _PACKED_BF16_ARCHS:
+        return f"BF16 packed dot is unavailable on {arch}"
+    return None
+
+
+def conv_depthwise_3d(
+    input, weight, bias, stride, padding, dilation, groups, method=None, hip_impl="auto"
+):
+    """Compute depthwise Conv3D, selecting packed HIP for its supported shape.
+
+    ``hip_impl='packed'`` requires the optimized kernel. ``'auto'`` uses
+    PyTorch Conv3D when that kernel cannot handle the call. ``method='jit'``
+    retains the historical assembly experiment.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    stride, padding, dilation = map(_triple, (stride, padding, dilation))
+    if method == "torch":
+        return F.conv3d(input, weight, bias, stride, padding, dilation, groups)
+    if method not in (None, "hip", "jit"):
+        raise ValueError(f"unsupported depthwise Conv3D method {method!r}")
+
+    if method in (None, "hip"):
+        if hip_impl not in ("auto", "packed"):
+            raise ValueError("hip_impl must be 'auto' or 'packed'; old HIP kernels were removed")
+        reason = _packed_unavailable_reason(input, weight, bias, stride, padding, dilation, groups)
+        if reason:
+            if hip_impl == "packed":
+                raise ValueError(f"packed depthwise Conv3D: {reason}")
+            return F.conv3d(input, weight, bias, stride, padding, dilation, groups)
+
+        batch, channels, depth, height, width = input.shape
+        out_depth = depth - 2
+        output = torch.empty(
+            (batch, channels, out_depth, height, width), dtype=input.dtype, device=input.device
         )
-        pyhip.module(hip_cpp, "-O2").conv_depthwise3d_hip(
-            [B, C_out, D_out], [256],
+        pyhip.module(_PACKED_HIP_SOURCE, "-O2").conv_depthwise3d_hip(
+            [batch, channels, out_depth],
+            [256],
             input.data_ptr(),
             output.data_ptr(),
             weight.data_ptr(),
-            bias.data_ptr(),
-            C_in, D, H, W,
-            C_out, D_out, H_out, W_out,
+            bias.data_ptr() if bias is not None else 0,
+            channels, depth, height, width,
+            channels, out_depth, height, width,
             IO_DTYPE="__half" if input.dtype == torch.float16 else "__hip_bfloat16",
-            BLOCK_H=H_out,
-            BLOCK_W=W_out,
-            PaddingD=padding[0],PaddingH=padding[1],PaddingW=padding[2],
-            KD=KD, KH=KH, KW=KW)
+            BLOCK_H=height, BLOCK_W=width,
+            PaddingD=0, PaddingH=2, PaddingW=2,
+            KD=3, KH=5, KW=5,
+        )
+        return output
 
-    elif method == "jit":
-        conv_depthwise_3d_jit([B, C_out,D_out], [256],
-                        KD, KH, KW, H_out, W_out,
-                        input.data_ptr(),
-                        weight.data_ptr(),
-                        output.data_ptr(),
-                        bias.data_ptr(),
-                        B, C_out, D, D_out)
-    else:
-        assert False, f"unsupported method : {method}"
-
+    # Keep the existing assembly JIT entry point for explicit experiments.
+    if input.ndim != 5 or weight.ndim != 5:
+        raise ValueError("assembly depthwise Conv3D requires 5D input and weight")
+    batch, channels, depth, height, width = input.shape
+    out_channels, channels_per_group, kd, kh, kw = weight.shape
+    if (
+        input.dtype != torch.bfloat16
+        or weight.dtype != input.dtype
+        or bias is None
+        or bias.dtype != input.dtype
+        or input.device.type != "cuda"
+        or weight.device != input.device
+        or bias.device != input.device
+        or not input.is_contiguous()
+        or not weight.is_contiguous()
+        or not bias.is_contiguous()
+        or groups != channels
+        or out_channels != channels
+        or channels_per_group != 1
+        or stride != (1, 1, 1)
+        or dilation != (1, 1, 1)
+        or padding != (0, kh // 2, kw // 2)
+    ):
+        raise ValueError("assembly depthwise Conv3D requires its BF16 depthwise layout")
+    out_depth = (depth + 2 * padding[0] - dilation[0] * (kd - 1) - 1) // stride[0] + 1
+    out_height = (height + 2 * padding[1] - dilation[1] * (kh - 1) - 1) // stride[1] + 1
+    out_width = (width + 2 * padding[2] - dilation[2] * (kw - 1) - 1) // stride[2] + 1
+    output = torch.zeros(
+        (batch, out_channels, out_depth, out_height, out_width),
+        dtype=input.dtype, device=input.device,
+    )
+    conv_depthwise_3d_jit(
+        [batch, out_channels, out_depth], [256], kd, kh, kw, out_height, out_width,
+        input.data_ptr(), weight.data_ptr(), output.data_ptr(), bias.data_ptr(),
+        batch, out_channels, depth, out_depth,
+    )
     return output
 
 @pyhip.jit(with_debug_log=False)

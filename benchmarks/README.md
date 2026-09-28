@@ -16,6 +16,7 @@ Run with the same Python environment used to install PyHIP:
 python benchmarks/moe/bench_tuned_moe.py --help
 python benchmarks/moe/bench_tuned_moe.py --list-models
 python benchmarks/conv/test_conv_depthwise.py --help
+python benchmarks/conv/test_conv_depthwise.py --shape case3 --depthwise-hip packed --dtype bf16 --iters 100
 python benchmarks/gemm/test_w8a8_block_fp8_linear.py
 ```
 
