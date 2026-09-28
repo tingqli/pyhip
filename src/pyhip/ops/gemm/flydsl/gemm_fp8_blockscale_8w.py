@@ -252,7 +252,7 @@ def _compile_gemm_fp8_8wave_cached(
                     rocdl.raw_ptr_buffer_load_lds(
                         sB_rsrc, scale_b_dst, fx.Int32(16), lane_byte_offset_128b,
                         fx.Int32(scale_b_global_base + round_elem_offset * 4),
-                        fx.Int32(0), fx.Int32(0),
+                        fx.Int32(0), aux=rocdl_aux(0),
                     )
 
             if const_expr(remaining_elems > 0):
@@ -268,7 +268,7 @@ def _compile_gemm_fp8_8wave_cached(
                     rocdl.raw_ptr_buffer_load_lds(
                         sB_rsrc, scale_b_dst, fx.Int32(4), lane_byte_offset_32b,
                         fx.Int32(scale_b_global_base + round_elem_offset * 4),
-                        fx.Int32(0), fx.Int32(0),
+                        fx.Int32(0), aux=rocdl_aux(0),
                     )
 
                 if const_expr(tail_elems > 0):
@@ -280,7 +280,7 @@ def _compile_gemm_fp8_8wave_cached(
                         rocdl.raw_ptr_buffer_load_lds(
                             sB_rsrc, scale_b_dst, fx.Int32(4), lane_byte_offset_32b,
                             fx.Int32(scale_b_global_base + tail_elem_offset * 4),
-                            fx.Int32(0), fx.Int32(0),
+                            fx.Int32(0), aux=rocdl_aux(0),
                         )
 
             rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0))
@@ -431,7 +431,7 @@ def _compile_gemm_fp8_8wave_cached(
                 rocdl.raw_ptr_buffer_load_lds(
                     sA_rsrc, scale_dst, fx.Int32(4),
                     scale_lane_src_offset,
-                    fx.Int32(scale_src_tile_base + kb * M * 4), fx.Int32(0), fx.Int32(0),
+                    fx.Int32(scale_src_tile_base + kb * M * 4), fx.Int32(0), aux=rocdl_aux(0),
                 )
 
             def _scale_b_addr(kb):
@@ -686,7 +686,7 @@ def _compile_gemm_fp8_8wave_cached(
                         ki * BLOCK_K * _elem_bytes + chunk * 8 * K * _elem_bytes
                     )
                     rocdl.raw_ptr_buffer_load_lds(
-                        rsrc, _dp, fx.Int32(16), _lane_src_offset, _so, fx.Int32(0), fx.Int32(0)
+                        rsrc, _dp, fx.Int32(16), _lane_src_offset, _so, fx.Int32(0), aux=rocdl_aux(0)
                     )
 
         def _ac_At(b, ki):

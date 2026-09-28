@@ -506,7 +506,7 @@ def _compile_gemm_fp8_cached(
                     voffset,
                     fx.Int32(kk * rows * 4),
                     fx.Int32(0),
-                    fx.Int32(0),
+                    aux=rocdl_aux(0),
                 )
 
         # ---- LDS read layouts (unchanged by the raw G2S address factories) ----
@@ -664,7 +664,7 @@ def _compile_gemm_fp8_cached(
                     voffsets[copy_round],
                     tile_soffset,
                     fx.Int32(0),
-                    fx.Int32(0),
+                    aux=rocdl_aux(0),
                 )
 
         # ---- LDS -> reg（对标 gemm_v9：A 走 B-operand，B 走 A-operand；均 padding rd）----

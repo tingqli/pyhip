@@ -121,7 +121,7 @@ def make_m128_down(*, n, k=256, topk, num_experts, persistent=False):
                 for kb in range_constexpr(2):
                     offset = valid.select((kb * rows + source) * 4, fx.Int32(-1))
                     row_scales[kb * 128 + tid] = fx.Float32(rocdl.raw_ptr_buffer_load(
-                        fx.Float32.ir_type, asrsrc, offset.ir_value(), zero))
+                        fx.Float32.ir_type, asrsrc, offset.ir_value(), zero, aux=fxh.rocdl_aux(0)))
                 if const_expr(not persistent):
                     mask = fx.Uint64(rocdl.ballot(fx.Uint64.ir_type, valid.ir_value()))
                     if lane == 0:

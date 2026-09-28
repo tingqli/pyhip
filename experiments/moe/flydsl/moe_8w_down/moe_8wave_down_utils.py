@@ -85,6 +85,7 @@ class ROCDLBuffer:
                 arith._to_raw(source_byte_offset),
                 zero_i32,
                 zero_i32,
+                aux=fxh.rocdl_aux(0),
             )
             lds_address += num_threads * atom_bytes
             source_byte_offset += num_threads * atom_bytes
@@ -99,6 +100,7 @@ class ROCDLBuffer:
                     arith._to_raw(source_byte_offset),
                     zero_i32,
                     zero_i32,
+                    aux=fxh.rocdl_aux(0),
                 )
 
         # Up to three residual dwords after the final 16-byte atom.
@@ -118,6 +120,7 @@ class ROCDLBuffer:
                     ),
                     zero_i32,
                     zero_i32,
+                    aux=fxh.rocdl_aux(0),
                 )
 
 

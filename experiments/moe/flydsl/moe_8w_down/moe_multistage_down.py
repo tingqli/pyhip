@@ -227,7 +227,7 @@ def flydsl_moe_gemm_8wave_down(*, n, k=256, topk, num_experts, persistent=True):
                     for kb in range_constexpr(ks):
                         scale_offset = valid.select((kb * rows + input_row) * 4, fx.Int32(-1))
                         a_scales_lds[kb * 256 + task_tid] = fx.Float32(rocdl.raw_ptr_buffer_load(
-                            fx.Float32.ir_type, as_rsrc, scale_offset.ir_value(), zero,
+                            fx.Float32.ir_type, as_rsrc, scale_offset.ir_value(), zero, aux=fxh.rocdl_aux(0),
                         ))
                 fx.barrier()
                 weight_view = fx.make_view(
