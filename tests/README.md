@@ -58,8 +58,8 @@ collection hooks:
 - **ASM codegen/runtime:** basic memory operations, scalar/vector expressions,
   integer division, control flow, SIMT, CSE/DCE/DSE, debug logging, LDS tensors,
   workgroup loads, swizzle, reduction, softmax, and the score/value MFMA check.
-- **Depthwise Conv3D:** packed FP16/BF16 HIP correctness, unsupported-shape and
-  gfx942 BF16 fallback, and removed-backend rejection in
+- **Depthwise Conv3D:** packed FP16/BF16 and SGB BF16 HIP correctness,
+  unsupported-shape and gfx942 BF16 dispatch, and removed-backend rejection in
   [test_conv_depthwise.py](ops/conv/test_conv_depthwise.py).
 - **Installed GEMM:** all existing correctness cases in
   [test_cdna4.py](ops/gemm/test_cdna4.py) and

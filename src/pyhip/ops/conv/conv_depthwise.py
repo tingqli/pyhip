@@ -5,8 +5,10 @@ import pyhip
 __all__ = ["conv_depthwise_3d", "conv_depthwise_3d_jit"]
 
 _PACKED_HIP_SOURCE = "hip/conv_depthwise3d_hip_packed_dot.cpp"
+_SGB_HIP_SOURCE = "hip/conv_depthwise3d_hip_bf16_sgb.cpp"
 _PACKED_FP16_ARCHS = frozenset({"gfx942", "gfx950"})
 _PACKED_BF16_ARCHS = frozenset({"gfx950"})
+_SGB_BF16_ARCHS = frozenset({"gfx942", "gfx950"})
 
 
 def _triple(value):
@@ -30,8 +32,8 @@ def _device_arch(input):
     return arch.split(":", 1)[0]
 
 
-def _packed_unavailable_reason(input, weight, bias, stride, padding, dilation, groups):
-    """Return why the packed 3x5x5 kernel cannot safely handle this call."""
+def _hip_shape_unavailable_reason(input, weight, bias, stride, padding, dilation, groups):
+    """Return why the depthwise HIP kernels cannot safely handle this call."""
     import torch
 
     if input.ndim != 5 or weight.ndim != 5:
@@ -68,6 +70,17 @@ def _packed_unavailable_reason(input, weight, bias, stride, padding, dilation, g
     if lds_bytes > 64 * 1024:
         return "the padded spatial tile exceeds 64 KiB of LDS"
 
+    return None
+
+
+def _packed_unavailable_reason(input, weight, bias, stride, padding, dilation, groups):
+    reason = _hip_shape_unavailable_reason(
+        input, weight, bias, stride, padding, dilation, groups
+    )
+    if reason:
+        return reason
+    import torch
+
     arch = _device_arch(input)
     if input.dtype == torch.float16 and arch not in _PACKED_FP16_ARCHS:
         return f"FP16 packed dot is unavailable on {arch}"
@@ -76,14 +89,38 @@ def _packed_unavailable_reason(input, weight, bias, stride, padding, dilation, g
     return None
 
 
+def _sgb_unavailable_reason(input, weight, bias, stride, padding, dilation, groups):
+    reason = _hip_shape_unavailable_reason(
+        input, weight, bias, stride, padding, dilation, groups
+    )
+    if reason:
+        return reason
+    import torch
+
+    if input.dtype != torch.bfloat16:
+        return "SGB fallback is only selected for BF16"
+    arch = _device_arch(input)
+    if arch not in _SGB_BF16_ARCHS:
+        return f"BF16 SGB fallback is unavailable on {arch}"
+    # The SGB source reserves a fixed 32 KiB LDS slab and stages the whole halo.
+    _, _, _, height, width = input.shape
+    halo_elements = 3 * (height + 4) * (width + 4)
+    filter_elements = 3 * 5 * 5
+    reserved_elements = ((filter_elements + 31) // 32) * 32
+    max_elements = (32 * 1024 // input.element_size()) - reserved_elements
+    if halo_elements > max_elements:
+        return "the padded spatial tile exceeds SGB's 32 KiB LDS allocation"
+    return None
+
+
 def conv_depthwise_3d(
     input, weight, bias, stride, padding, dilation, groups, method=None, hip_impl="auto"
 ):
     """Compute depthwise Conv3D, selecting packed HIP for its supported shape.
 
-    ``hip_impl='packed'`` requires the optimized kernel. ``'auto'`` uses
-    PyTorch Conv3D when that kernel cannot handle the call. ``method='jit'``
-    retains the historical assembly experiment.
+    ``hip_impl='packed'`` requires the optimized kernel. ``'auto'`` uses SGB
+    for gfx942 BF16 and PyTorch Conv3D for other unsupported cases.
+    ``method='jit'`` retains the historical assembly experiment.
     """
     import torch
     import torch.nn.functional as F
@@ -95,20 +132,43 @@ def conv_depthwise_3d(
         raise ValueError(f"unsupported depthwise Conv3D method {method!r}")
 
     if method in (None, "hip"):
-        if hip_impl not in ("auto", "packed"):
-            raise ValueError("hip_impl must be 'auto' or 'packed'; old HIP kernels were removed")
-        reason = _packed_unavailable_reason(input, weight, bias, stride, padding, dilation, groups)
-        if reason:
-            if hip_impl == "packed":
+        if hip_impl not in ("auto", "packed", "sgb"):
+            raise ValueError("hip_impl must be 'auto', 'packed', or 'sgb'; original HIP was removed")
+        if hip_impl == "packed":
+            reason = _packed_unavailable_reason(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+            if reason:
                 raise ValueError(f"packed depthwise Conv3D: {reason}")
-            return F.conv3d(input, weight, bias, stride, padding, dilation, groups)
+            source = _PACKED_HIP_SOURCE
+        elif hip_impl == "sgb":
+            reason = _sgb_unavailable_reason(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+            if reason:
+                raise ValueError(f"SGB depthwise Conv3D: {reason}")
+            source = _SGB_HIP_SOURCE
+        else:
+            packed_reason = _packed_unavailable_reason(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+            if packed_reason is None:
+                source = _PACKED_HIP_SOURCE
+            else:
+                sgb_reason = _sgb_unavailable_reason(
+                    input, weight, bias, stride, padding, dilation, groups
+                )
+                if sgb_reason is None and _device_arch(input) == "gfx942":
+                    source = _SGB_HIP_SOURCE
+                else:
+                    return F.conv3d(input, weight, bias, stride, padding, dilation, groups)
 
         batch, channels, depth, height, width = input.shape
         out_depth = depth - 2
         output = torch.empty(
             (batch, channels, out_depth, height, width), dtype=input.dtype, device=input.device
         )
-        pyhip.module(_PACKED_HIP_SOURCE, "-O2").conv_depthwise3d_hip(
+        pyhip.module(source, "-O2").conv_depthwise3d_hip(
             [batch, channels, out_depth],
             [256],
             input.data_ptr(),

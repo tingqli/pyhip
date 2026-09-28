@@ -1,5 +1,7 @@
 """Correctness and dispatch checks for the packaged depthwise Conv3D kernel."""
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -80,10 +82,42 @@ def test_auto_uses_torch_for_depthwise_multiplier(monkeypatch):
     torch.testing.assert_close(_run(x, w, b), expected)
 
 
-def test_auto_uses_torch_for_bf16_on_gfx942(monkeypatch):
+def test_sgb_matches_torch_bf16():
+    x, w, b = _case(torch.bfloat16)
+    if depthwise._sgb_unavailable_reason(
+        x, w, b, (1, 1, 1), (0, 2, 2), (1, 1, 1), 2
+    ):
+        pytest.skip("BF16 SGB is unavailable on this GPU")
+    expected = F.conv3d(x, w, b, padding=(0, 2, 2), groups=2)
+    actual = _run(x, w, b, hip_impl="sgb")
+    assert pyhip.calc_diff(expected, actual) < 1e-4
+    assert (expected - actual).abs().max().item() < 0.02
+
+
+def test_auto_selects_sgb_for_bf16_on_gfx942(monkeypatch):
     x, w, b = _case(torch.bfloat16)
     monkeypatch.setattr(depthwise, "_device_arch", lambda _x: "gfx942")
-    monkeypatch.setattr(pyhip, "module", lambda *_args: pytest.fail("packed kernel was selected"))
+    selected = []
+    real_module = pyhip.module
+
+    def record_source(source, *args):
+        selected.append(source)
+        # pyhip.module resolves relative paths from its immediate caller.
+        return real_module(str(Path(depthwise.__file__).parent / source), *args)
+
+    monkeypatch.setattr(pyhip, "module", record_source)
+    expected = F.conv3d(x, w, b, padding=(0, 2, 2), groups=2)
+    actual = _run(x, w, b)
+    assert pyhip.calc_diff(expected, actual) < 1e-4
+    assert (expected - actual).abs().max().item() < 0.02
+    assert selected == [depthwise._SGB_HIP_SOURCE]
+
+
+def test_auto_uses_torch_when_gfx942_bf16_exceeds_sgb_lds(monkeypatch):
+    _, w, b = _case(torch.bfloat16, width=80)
+    x = torch.randn((1, 2, 5, 80, 80), device="cuda", dtype=torch.bfloat16) / 8
+    monkeypatch.setattr(depthwise, "_device_arch", lambda _x: "gfx942")
+    monkeypatch.setattr(pyhip, "module", lambda *_args: pytest.fail("HIP kernel was selected"))
     expected = F.conv3d(x, w, b, padding=(0, 2, 2), groups=2)
     torch.testing.assert_close(_run(x, w, b), expected)
 
@@ -108,8 +142,13 @@ def test_assembly_jit_rejects_unsupported_layout():
         )
 
 
-@pytest.mark.parametrize("removed_impl", ["original", "sgb"])
-def test_removed_hip_implementations_are_rejected(removed_impl):
+def test_sgb_requires_bf16():
     x, w, b = _case(torch.float16)
-    with pytest.raises(ValueError, match="old HIP kernels were removed"):
-        _run(x, w, b, hip_impl=removed_impl)
+    with pytest.raises(ValueError, match="SGB fallback is only selected for BF16"):
+        _run(x, w, b, hip_impl="sgb")
+
+
+def test_removed_original_hip_implementation_is_rejected():
+    x, w, b = _case(torch.float16)
+    with pytest.raises(ValueError, match="original HIP was removed"):
+        _run(x, w, b, hip_impl="original")

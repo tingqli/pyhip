@@ -233,8 +233,8 @@ if __name__ == "__main__":
     parser.add_argument("--profile", action="store_true", help="是否启用 profile")
     parser.add_argument("--shape", type=str, default="case3", choices=["case1", "case2", "case3", "case4"], 
                         help="选择测试的 shape 选项: case1 ([1, 64, 63, 45, 80]), case2 ([1, 512, 61, 45, 80]), case3 ([1, 512, 61, 45, 80], groups=512), case4 ([1, 2048, 61, 45, 80], groups=4)")
-    parser.add_argument("--depthwise-hip", type=str, default="auto", choices=["auto", "packed"],
-                        help="case3 HIP backend; auto uses PyTorch for unsupported shapes or GPUs")
+    parser.add_argument("--depthwise-hip", type=str, default="auto", choices=["auto", "packed", "sgb"],
+                        help="case3 HIP backend; auto uses SGB for gfx942 BF16 and PyTorch for other unsupported cases")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"],
                         help="input, weight, bias, and output dtype")
     args = parser.parse_args()
