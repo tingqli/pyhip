@@ -597,8 +597,14 @@ def _model_key(call):
         elif isinstance(value, torch.dtype):
             value = str(value)
         values[name] = value
+
+    # 当前的key的构成逻辑上比较完备，但是对于轻量级kernel来说带来的额外CPU开销可能占比会高一些
+    # 考虑到轻量级kernel一般会使能cuda graph降低CPU侧开销，因此不做简化
+
+    # 系统上存在不同型号的多张显卡时，可能需要考虑每张显卡的具体属性来选择最优配置。
     props = torch.cuda.get_device_properties(call["hidden_states"].device)
     values["device"] = (props.name, props.gcnArchName, props.multi_processor_count)
+    # 环境变量变化会引起aiter/pyhip后端选择不同实现
     values["environment"] = sorted((name, value) for name, value in os.environ.items()
                                     if name.startswith(("AITER_", "MOE_", "PYHIP_")))
     if call["w1"].dtype == torch.float4_e2m1fn_x2:

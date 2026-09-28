@@ -276,7 +276,9 @@ def test_aiter_signature():
     native = inspect.signature(tm._aiter_fused_moe).parameters
     diff = set(parameters) - set(native)
     assert diff == {"output", "stage2_scatter"} or diff == set()
-
+    if len(diff):
+        for name, parameter in native.items():
+            assert parameters[name] == parameter
 
 def test_fixed_runner_without_autotune(monkeypatch):
     call = _fly_call(tokens=1)
