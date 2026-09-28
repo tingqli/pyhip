@@ -76,6 +76,8 @@ def generate_mxfp4_weight(N,K,BUF_COPY=None):
 @pytest.mark.parametrize("N", [256, 256*6])
 @pytest.mark.parametrize("K", [256])
 def test_accuracy(M, N, K):
+    if "gfx950" not in torch.cuda.get_device_properties().gcnArchName:
+        pytest.skip("unsupported GPU")    
     w, w_scale, w_ref = generate_mxfp4_weight(N, K)
     A = torch.randn([M, K], dtype=torch.bfloat16)
     ref_out = A @ w_ref.t()

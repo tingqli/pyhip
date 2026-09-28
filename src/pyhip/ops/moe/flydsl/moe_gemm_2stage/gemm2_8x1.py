@@ -15,7 +15,7 @@ from flydsl.expr.typing import Vector as Vec, as_ir_value
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import common as fxh
-from .common import BufferTensor, LdsTensor, get_down_device_config
+from .common import BufferTensor, LdsTensor, _f32_to_bf16, get_down_device_config
 
 
 # ==================== 公共入口与8x1共享实现 ====================
@@ -237,17 +237,11 @@ def pack_8x1_record(pair, scale, *, c, row_scale, weight_quant_type):
             else:
                 weighted.append(Vec(c[None, ng, row].load()))
             rows.append(Vec(row_scale[None, ng, row].load()))
-    bias = as_ir_value(fx.Uint32(0x8000)).bitcast(fx.Float32.ir_type)
-    scaled = [fxh.eltwise_op("llvm.fma.f32", weighted[index], rows[index], bias) for index in range_constexpr(4)]
-    selector = fx.Uint32(0x07060302)
     records = [[], []]
     for index in range_constexpr(4):
-        for element in range_constexpr(0, scaled[index].numel, 2):
-            records[index // 2].append(llvm.inline_asm(
-                ir.IntegerType.get_signless(32),
-                [_raw(scaled[index][element + 1]), _raw(scaled[index][element]), _raw(selector)],
-                "v_perm_b32 $0, $1, $2, $3", "=v,v,v,s", has_side_effects=True,
-            ))
+        packed = _f32_to_bf16(weighted[index] * rows[index]).bitcast(fx.Uint32)
+        for element in range_constexpr(packed.numel):
+            records[index // 2].append(packed[element])
     return [Vec.from_elements(record, fx.Uint32).bitcast(fx.BFloat16) for record in records]
 
 

@@ -15,6 +15,7 @@ from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 
 from . import common as fxh
+from .common import _f32_to_bf16
 
 # gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
 _DOWN_STORE_CACHE_MODIFIER = 2
@@ -569,15 +570,7 @@ def _build_moe_gemm2_default(
 
     def _cvt_f32_to_bf16(c_frag):
         c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
-        if const_expr(is_gfx950):
-            c_frag_bf16.store(c_frag.load().to(fx.BFloat16))
-        else:
-            round_bit = fx.Uint32(0x8000)
-            c_frag_bf16.store(
-                ((c_frag.load().bitcast(fx.Uint32) + round_bit) >> 16)
-                .to(fx.Uint16)
-                .bitcast(fx.BFloat16)
-            )
+        c_frag_bf16.store(_f32_to_bf16(c_frag.load()))
         return c_frag_bf16
 
     def _make_down_weight_view(p_weight, expert_id):
@@ -1492,14 +1485,6 @@ def _build_moe_gemm2_default(
 
                 frag_sorted_weight = frag_pt_scales
 
-            def f32_to_bf16(x):
-                round_bit = as_ir_value(fx.Uint32(0x8000)).bitcast(fx.Float32.ir_type)
-                return (
-                    ((x + round_bit).bitcast(fx.Uint32) >> 16)
-                    .to(fx.Uint16)
-                    .bitcast(fx.BFloat16)
-                )
-
             def gemm_compute(fragW, fragPCS, fragC):
                 fragC.fill(0)
                 for k in fx.range_constexpr(nBK):
@@ -1535,7 +1520,7 @@ def _build_moe_gemm2_default(
                 for fc, fsw in fxh.all_elements(fragC, frag_sorted_weight):
                     fc.store(fc.load() * fsw.load())
                 vec_f32 = fragC.load()
-                fragC_bf16.store(f32_to_bf16(vec_f32))
+                fragC_bf16.store(_f32_to_bf16(vec_f32))
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 
             arg_p_output = fx.flat_divide(arg_p_output, (BLOCK_M, BLOCK_N))

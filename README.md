@@ -55,7 +55,7 @@ from repository tests or a test-directory `PYTHONPATH`.
 | Operator family | Implementations currently present |
 |---|---|
 | [GEMM / Linear](src/pyhip/ops/gemm) | Assembly and an ASM/Aiter quantized Linear wrapper |
-| [MoE](src/pyhip/ops/moe) | Assembly, FlyDSL, fused wrappers, and a reference implementation |
+| [MoE](src/pyhip/ops/moe) | Assembly, FlyDSL, and an Aiter-compatible autotuned API |
 | [Attention](src/pyhip/ops/attention) | Assembly paged attention |
 | [Convolution](src/pyhip/ops/conv) | HIP depthwise and assembly/Gluon pointwise implementations |
 | [GRRead](src/pyhip/ops/gr_read) | FlyDSL down/up projections |
@@ -64,10 +64,12 @@ Availability in this table does not imply support for every GPU or input shape.
 Check the implementation and its associated tests for the required contract.
 
 Quantized Linear accepts `method="auto"` or `"jit"` for ASM, and `"aiter"` for
-Aiter. Fused MoE accepts `"auto"` or `"jit"`; automatic SiLU dispatch uses ASM
-split-K for supported small-token cases and the existing eight-wave path
-otherwise. The former `method="gluon"` option is no longer supported by these
-wrappers. Optional Gluon convolution implementations remain available.
+Aiter. MoE uses `pyhip.ops.moe.tuned_moe.fused_moe`, with Aiter's signature;
+supported inputs are autotuned across validated Aiter, ASM and FlyDSL candidates.
+Other API features are forwarded to Aiter. Fixed kernel tests use
+`pyhip.testing.moe.make_moe_runner`, without autotuning or fallback. The old
+MoE wrappers and their `method="auto"/"jit"` interface have been removed.
+Optional Gluon convolution implementations remain available.
 
 For example, this BF16 grouped pointwise convolution uses the Gluon path:
 
@@ -83,7 +85,7 @@ y = conv_pointwise(x, weight, bias, groups=4, use_gluon=True)
 assert y.shape == x.shape
 ```
 
-Other entry points include `pyhip.ops.moe.fused_moe.fused_moe`,
+Other entry points include `pyhip.ops.moe.tuned_moe.fused_moe`,
 `pyhip.ops.moe.asm.moe.moe_2stage_splitk`, and
 `pyhip.ops.moe.flydsl.moe_gemm_2stage.compile_moe_gemm1`. Some are complete
 Tensor operators; others are low-level kernels or launcher factories. Refer to
@@ -95,13 +97,13 @@ their signatures rather than assuming identical call conventions.
 src/pyhip/                  # Installed Python package
 ├── ops/                    # Operators, grouped by operation and backend
 │   ├── gemm/               # asm/ and existing wrappers
-│   ├── moe/                # asm/, flydsl/, wrappers/reference
+│   ├── moe/                # asm/, flydsl/, autotuned MoE API
 │   ├── attention/          # asm/
 │   ├── conv/               # Wrappers and packaged hip/ sources
 │   └── gr_read/flydsl/      # Down/up projections
 ├── codegen/                # Shared asm/ and flydsl/ authoring tools
 ├── runtime/                # HIP compilation, code-object loading, and launch
-├── testing/                # Timing, accuracy comparison, and trace helpers
+├── testing/                # Timing, independent references, and trace helpers
 └── tools/                  # Explicit code-inspection and hardware-probing tools
 
 tests/                      # Default correctness/regression suite
@@ -128,8 +130,11 @@ defined in [pyproject.toml](pyproject.toml).
 Run from the repository root using the environment in which PyHIP is installed.
 
 ```bash
+# Run the curated default regression set after broad code changes
+python3 -m pytest -q
+
 # Inspect the default test collection
-python -m pytest --collect-only -q
+python3 -m pytest --collect-only -q
 
 # Run a selected operator regression suite
 python -m pytest tests/ops/gemm/test_cdna4.py -q
@@ -138,17 +143,18 @@ python -m pytest tests/ops/gemm/test_cdna4.py -q
 python -m pytest tests/ops/moe/test_moe.py -m perf -s
 
 # Inspect a standalone benchmark's options
-python benchmarks/moe/test_fused_moe.py --help
+python benchmarks/moe/bench_tuned_moe.py --help
 
 # Run an experimental check explicitly
 python -m pytest experiments/gemm/flydsl/test_gemm.py -k gemm_950 -q
 ```
 
-[pytest.ini](pytest.ini) limits default collection to test-named Python modules
-under [tests](tests), uses importlib mode, and excludes the `perf` marker.
-Many tests require a GPU, including some during collection. Architecture and
-dependency constraints still apply; the directory layout is not a guarantee
-that all historical tests pass in every environment.
+[pytest.ini](pytest.ini) lists the existing modules in the default regression
+set, uses importlib mode, and excludes the `perf` marker. Passing `tests`
+explicitly overrides that list and includes historical diagnostics/failures.
+No existing test code is changed for selection. The default set was validated
+on gfx950; many tests require a GPU, including some during collection.
+See [tests/README.md](tests/README.md) for coverage, exclusions, and hardware limits.
 
 - [tests/README.md](tests/README.md): regression entry points and collection rules.
 - [benchmarks/README.md](benchmarks/README.md): standalone timing scripts.

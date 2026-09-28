@@ -17,7 +17,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import common as fxh
-from .common import get_device_cache_key
+from .common import _f32_to_bf16, get_device_cache_key
 
 
 def _build_moe_gemm1(
@@ -95,6 +95,8 @@ def _build_moe_gemm1(
         assert K % 512 == 0, f"fp4 gateup K must be a multiple of 512, got {K}"
     else:
         assert weight_quant_type != "mxfp4", "mxfp4 quantization requires fp4 weights"
+        if alg in ("splitk", "batch1"):
+            assert K % (4 * TILE_K) == 0, "gateup K must be a multiple of 256 for four-wave split-K"
     if METADATA_TILE_SIZE_M is None:
         METADATA_TILE_SIZE_M = BLOCK_TILE_SIZE_M
     if stage == "gateup" and alg == "prefill_1x4":
@@ -123,7 +125,6 @@ def _build_moe_gemm1(
         assert (
             BLOCK_TILE_SIZE_N % 64 == 0
         ), "For split-k, BLOCK_TILE_SIZE_N needs to be multiple of 64 due to reduce layout."
-        assert K % (32 * 4) == 0, "K must be a multiple of 128 for split-k algorithm."
         c_reduce_lds_size = (
             16 * 64 * 4
         )  # save LDS size instead of BLOCK_TILE_SIZE_M * BLOCK_TILE_SIZE_N * 4
@@ -755,13 +756,7 @@ def _build_moe_gemm1(
                     tmp = rocdl.exp2(T.f32, _raw(gate_log2[j]))
                     acc.append((gate[j] * rocdl.rcp(T.f32, 1.0 + tmp)) * up[j])
             acc = Vec.from_elements(acc, fx.Float32)
-            round_bit = fx.Uint32(0x8000)
-            acc = (
-                ((acc.bitcast(fx.Uint32) + round_bit) >> 16)
-                .to(fx.Uint16)
-                .bitcast(fx.BFloat16)
-            )
-            c_frag_bf16[None, None, i].store(acc)
+            c_frag_bf16[None, None, i].store(_f32_to_bf16(acc))
 
         return c_frag_bf16
 
@@ -775,7 +770,6 @@ def _build_moe_gemm1(
         # per-N-channel fp8 weight scales (shape [value, rep_n]) and an optional per-row
         # fp8 activation scale (a_scale[m], one per C M-row) are folded into the read so
         log2_exp1 = -1.4426950408889634
-        round_bit = fx.Uint32(0x8000)
         out_bf16 = fx.make_fragment_like(gate_frag, dtype=fx.BFloat16)
         m_reps = fx.size(fx.get_shape(gate_frag)[1]).to_py_value()
         n_reps = fx.size(fx.get_shape(gate_frag)[2]).to_py_value()
@@ -806,12 +800,7 @@ def _build_moe_gemm1(
                         tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
                         acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
                 acc = Vec.from_elements(acc, fx.Float32)
-                acc = (
-                    ((acc.bitcast(fx.Uint32) + round_bit) >> 16)
-                    .to(fx.Uint16)
-                    .bitcast(fx.BFloat16)
-                )
-                out_bf16[None, m, n].store(acc)
+                out_bf16[None, m, n].store(_f32_to_bf16(acc))
         return out_bf16
 
     def _make_gateup_weight_view(p_weight, expert_id, contiguous_n):
@@ -2075,20 +2064,23 @@ def _build_moe_gemm1(
         fx.copy(cp_atom_w, c_src, c_dst[None, None, None, 0])
 
         if const_expr(fused_down_clear):
-            clear_idx = blk_n * 256 + tid
-            if e_idx == 0 and clear_idx < K // 8:
-                clear_output = fx.make_view(
-                    fxh._as_ptr(p_clear_output)
-                    + fx.Int64(batch_idx * K + clear_idx * 8),
-                    fx.make_layout(8, 1),
-                )
-                clear_frag = fx.make_fragment_like(clear_output)
-                clear_frag.fill(0)
-                fx.copy(
-                    fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
-                    clear_frag,
-                    clear_output,
-                )
+            clear_threads = ((N + BLOCK_TILE_SIZE_N - 1) // BLOCK_TILE_SIZE_N) * 256
+            clear_rounds = (K // 8 + clear_threads - 1) // clear_threads
+            for clear_round in range_constexpr(clear_rounds):
+                clear_idx = blk_n * 256 + tid + clear_round * clear_threads
+                if e_idx == 0 and clear_idx < K // 8:
+                    clear_output = fx.make_view(
+                        fxh._as_ptr(p_clear_output)
+                        + fx.Int64(batch_idx) * K + fx.Int64(clear_idx) * 8,
+                        fx.make_layout(8, 1),
+                    )
+                    clear_frag = fx.make_fragment_like(clear_output)
+                    clear_frag.fill(0)
+                    fx.copy(
+                        fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
+                        clear_frag,
+                        clear_output,
+                    )
 
     @flyc.kernel
     def moe_2stage_gateup_prefill_1x4(

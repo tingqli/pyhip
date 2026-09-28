@@ -402,12 +402,15 @@ class BufferTensor(fx.Tensor):
         if not isinstance(aux, int):
             raise TypeError("aux必须是编译期整数")
         resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(self))
+        # LLVM 的 raw buffer intrinsic 支持 i32/v2i32/v4i32，不支持 v1i32。
+        result_type = fx.Uint32.ir_type if bits == 32 else ir.VectorType.get([bits // 32], fx.Uint32.ir_type)
         result = rocdl.RawPtrBufferLoadOp(
-            ir.VectorType.get([bits // 32], fx.Uint32.ir_type), resource,
+            result_type, resource,
             _offset_i32(voffset_bytes), _offset_i32(soffset_bytes),
-            aux=ir.IntegerAttr.get(fx.Int32.ir_type, aux),
+            aux=fx.Int32(aux).ir_value(),
         ).result
-        return Vec(result).bitcast(self.dtype)
+        values = Vec.from_elements([fx.Uint32(result)], fx.Uint32) if bits == 32 else Vec(result)
+        return values.bitcast(self.dtype)
 
 
 class LdsTensor(fx.Tensor):

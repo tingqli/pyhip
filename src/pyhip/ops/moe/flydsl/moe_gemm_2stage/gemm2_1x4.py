@@ -16,6 +16,7 @@ from flydsl.expr.typing import as_ir_value
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import common as fxh
+from .common import _f32_to_bf16
 from .common import get_down_device_config as _get_down_device_config
 
 # gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
@@ -143,26 +144,8 @@ def _build_moe_gemm2_1x4(
         return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
 
     def _pack_scaled_bf16_pairs(values, scales):
-        # 0x8000在这里按f32位型参与FMA；v_perm只取高16位，因此不是BF16 RNE。
-        fma_bias = as_ir_value(fx.Uint32(0x8000)).bitcast(fx.Float32.ir_type)
-        scaled = fxh.eltwise_op("llvm.fma.f32", values, scales, fma_bias)
-        selector = fx.Uint32(0x07060302)
-        packed = []
-        for index in range_constexpr(0, scaled.numel, 2):
-            packed.append(
-                llvm.inline_asm(
-                    ir.IntegerType.get_signless(32),
-                    [
-                        _raw(scaled[index + 1]),
-                        _raw(scaled[index]),
-                        _raw(selector),
-                    ],
-                    "v_perm_b32 $0, $1, $2, $3",
-                    "=v,v,v,s",
-                    has_side_effects=True,
-                )
-            )
-        return packed
+        packed = _f32_to_bf16(values * scales).bitcast(fx.Uint32)
+        return [packed[index] for index in range_constexpr(packed.numel)]
 
     def _store_scaled_bf16(source, scales, destination):
         for src, scale, dst in fxh.all_elements(source, scales, destination):
@@ -434,7 +417,7 @@ def _build_moe_gemm2_1x4(
                         scale_global_rsrc,
                         scale_byte_offset.ir_value(),
                         fx.Int32(0).ir_value(),
-                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0),
+                        aux=fx.Int32(0).ir_value(),
                     ).result
                 )
                 return scale_vec
@@ -607,7 +590,7 @@ def _build_moe_gemm2_1x4(
                         output_store_rsrc,
                         byte_offsets[0].ir_value(),
                         fx.Int32(0).ir_value(),
-                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
+                        aux=fx.Int32(_store_cache).ir_value(),
                     )
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
                     fx.rocdl.RawPtrBufferStoreOp(
@@ -615,7 +598,7 @@ def _build_moe_gemm2_1x4(
                         output_store_rsrc,
                         byte_offsets[1].ir_value(),
                         fx.Int32(0).ir_value(),
-                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
+                        aux=fx.Int32(_store_cache).ir_value(),
                     )
 
                 for row_pair in range_constexpr(4):
@@ -716,7 +699,7 @@ def _build_moe_gemm2_1x4(
                             output_store_rsrc,
                             byte_offsets[0].ir_value(),
                             fx.Int32(0).ir_value(),
-                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
+                            aux=fx.Int32(_store_cache).ir_value(),
                         )
                         fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
                         fx.rocdl.RawPtrBufferStoreOp(
@@ -724,7 +707,7 @@ def _build_moe_gemm2_1x4(
                             output_store_rsrc,
                             byte_offsets[1].ir_value(),
                             fx.Int32(0).ir_value(),
-                            aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
+                            aux=fx.Int32(_store_cache).ir_value(),
                         )
 
             use_delayed_4wave_store = BLOCK_K == 128 and nBK == 2

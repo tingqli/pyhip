@@ -13,6 +13,8 @@ torch.manual_seed(0)
 @pytest.mark.parametrize("N", [256, 256*6])
 @pytest.mark.parametrize("K", [256])
 def test_accuracy(M, N, K, use_pre_shuffle = 1):
+    if "gfx950" not in torch.cuda.get_device_properties().gcnArchName:
+        pytest.skip("unsupported GPU")
     wg_M = 256
     wg_N = 256
     blk_cnt = pyhip.div_up(M, wg_M) * pyhip.div_up(N, wg_N)

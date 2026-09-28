@@ -174,6 +174,7 @@ def div_up(x, y):
     return (x + y - 1) // y
 
 def run_perftest(kernel, *args, **kwargs):
+    """返回最后一次调用的输出和平均耗时（微秒）；num_stats 可记录每次耗时。"""
     global torch
     import torch
     import copy
@@ -193,6 +194,7 @@ def run_perftest(kernel, *args, **kwargs):
     num_iters = extract_attr(kwargs, 'num_iters', 10)
     num_warmup = extract_attr(kwargs, 'num_warmup', 2)
     num_copies = extract_attr(kwargs, 'num_copies', 0)
+    num_stats = kwargs.pop('num_stats', None)
     num_flops = extract_attr(kwargs, 'num_flops', 0)
     num_bytes = extract_attr(kwargs, 'num_bytes', 0)
     num_spec_tag = extract_attr(kwargs, 'num_spec_tag', '')
@@ -249,12 +251,21 @@ def run_perftest(kernel, *args, **kwargs):
                 new_kwargs[k] = v
         kwarg_copies.append(new_kwargs)
 
-    # first run on original inputs to return the output, then run on copies for perf
-    out = kernel(*args, **kwargs)
-
-    for i in range(num_warmup + num_iters):
-        with perf:
-            out = kernel(*args_copies[i%num_copies], **kwarg_copies[i%num_copies])
+    try:
+        # 先用原始张量运行一次（不计时），再轮换内部副本进行预热和计时，无需外部复制。
+        out = kernel(*args, **kwargs)
+        for i in range(num_warmup + num_iters):
+            with perf:
+                out = kernel(*args_copies[i%num_copies], **kwarg_copies[i%num_copies])
+    finally:
+        # 异常时也保留已记录的样本，便于调用方检查失败前的结果。
+        if num_stats is not None:
+            num_stats.update(
+                num_copies=num_copies,
+                copy_bytes=copy_bytes,
+                warmup_us=[t * 1e6 for t in perf.latencies[:num_warmup]],
+                samples_us=[t * 1e6 for t in perf.latencies[num_warmup:]],
+            )
 
     dt = perf.dt(excludes=num_warmup)
 
