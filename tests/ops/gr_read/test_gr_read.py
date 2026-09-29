@@ -1,413 +1,66 @@
 # SPDX-License-Identifier: MIT
-"""Check decode/prefill accuracy, then print separate performance tables.
+"""GR read regression tests and the compatible accuracy-then-performance CLI.
 
-Direct execution checks all selected batches before running the existing
-samplers in bench_gr_read_compare.py. --check-only skips performance.
-No result file is created unless --output is supplied; pytest checks accuracy only.
+Performance implementation and end-user documentation live in benchmarks/gr_read.
+--check-only skips timing; pytest runs correctness checks only.
 """
 import argparse
 from contextlib import nullcontext
 from functools import cache
 import gc
 import json
-import os
 from pathlib import Path
 import sys
-import warnings
 
-C, H, R = 4, 2560, 320
-CHECK_ROWS = 1024
-DOWN_TOLERANCE = dict(rtol=0.015625, atol=2e-5)
-OUTPUT_TOLERANCE = dict(rtol=1e-2, atol=5e-3)
-DEFAULT_BATCHES = (33, 64, 128, 256, 512) + tuple(k * 1024 for k in (1, 2, 4, 8, 10, 12, 16, 20, 24, 28, 30, 32, 36, 48, 60, 64))
-SCOPES = ("down", "up", "total")
-
-
-def parse_batch(value):
-    text = value.strip().lower()
-    try:
-        rows = int(text[:-1]) * 1024 if text.endswith("k") else int(text)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("batch must be an integer or an integer followed by K") from error
-    if rows < 1:
-        raise argparse.ArgumentTypeError("batch must be a positive integer")
-    return rows
-
-
-def prepare_cli_environment(args):
-    """Select the GPU before importing Torch without installing dependencies or changing hardware."""
-    repo = Path(__file__).resolve().parents[3]
-    paths = (repo, repo / "src", Path("/opt/aiter"),
-             Path(f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages"))
-    for path in paths:
-        if path.is_dir() and str(path) not in sys.path:
-            sys.path.append(str(path))
-    if os.environ.get("HSA_CU_MASK") or os.environ.get("ROC_GLOBAL_CU_MASK"):
-        raise RuntimeError("GRRead reference tests require an unmasked GPU")
-    for key in ("ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL", "CUDAPERF", "COMPILE_ONLY",
-                "FLYDSL_DUMP_IR", "FLYDSL_DEBUG_DUMP_ASM", "FLYDSL_DUMP_DIR", "FLYDSL_RUNTIME_RUN_ONLY"):
-        os.environ.pop(key, None)
-    os.environ["HIP_VISIBLE_DEVICES"] = str(args.gpu)
-    os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "1"
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO / 'src'))
+from pyhip.testing import gr_read as checks
+from pyhip.testing.gr_read import (
+    C,
+    H,
+    R,
+    CHECK_ROWS,
+    DOWN_TOLERANCE,
+    OUTPUT_TOLERANCE,
+    DEFAULT_BATCHES,
+    SCOPES,
+    parse_batch,
+    prepare_cli_environment,
+    warn_architecture,
+    dependencies,
+    prepare_reader,
+    prepare_gr_read,
+    run_down,
+    run_up,
+    run_gr_read,
+    reference_bf16,
+    check_close,
+    make_inputs,
+    check_batch,
+    decode_reference,
+    make_decode_inputs,
+    capture_decode,
+    guarded,
+    assert_decode_close,
+    check_decode_rows,
+    check_decode_stages,
+    release_buffers,
+    selected_rows,
+    run_correctness
+)
 
 
 def use_checkout_package():
-    import importlib.util
-    repo = Path(__file__).resolve().parents[3]
-    expected = repo / "src/pyhip/__init__.py"
-    module = sys.modules.get("pyhip")
-    if module is not None:
-        if Path(module.__file__).resolve() != expected:
-            raise RuntimeError(f"wrong PyHIP checkout: {module.__file__}")
-        return
-    spec = importlib.util.spec_from_file_location("pyhip", expected,
-                                                  submodule_search_locations=[str(repo / "src/pyhip")])
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["pyhip"] = module
-    spec.loader.exec_module(module)
+    if Path(checks.__file__).resolve() != REPO / 'src/pyhip/testing/gr_read.py':
+        raise RuntimeError(f'wrong PyHIP checkout: {checks.__file__}')
 
 
-def warn_architecture(torch, device=None):
-    arch = torch.cuda.get_device_properties(device).gcnArchName
-    if arch.split(":", 1)[0] != "gfx942":
-        warnings.warn(f"GR read was validated on gfx942; running on {arch}",
-                      RuntimeWarning, stacklevel=2)
-
-
-@cache
-def dependencies():
-    # 延迟导入：CLI先选GPU；--help和参数解析不初始化Torch，也不依赖pytest。
-    use_checkout_package()
-    import torch
-    import torch.nn.functional as F
-    import flydsl.compiler as flyc
-    from pyhip.testing import cudaPerf
-    if torch.version.hip is None or not torch.cuda.is_available():
-        raise RuntimeError("ROCm GPU required")
-    warn_architecture(torch, 0)
-
-    @torch.compile(fullgraph=True)
-    def _mix_reference(x, w_down, w_up):
-        p = F.silu(F.linear(x, w_down) / C)
-        logits = F.linear(p, w_up)
-        gates = torch.sigmoid(logits).unflatten(-1, (C, H))
-        return p, (gates * x.unflatten(-1, (C, H))).mean(dim=-2)
-
-    return torch, flyc, _mix_reference, cudaPerf
-
-
-@cache
 def baseline_modules():
-    """Load this checkout's test-only module in script and pytest import modes."""
-    import importlib.util
-    name = '_pyhip_gr_read_baselines'
-    path = Path(__file__).with_name('baselines.py')
-    if name in sys.modules:
-        module = sys.modules[name]
-        if Path(module.__file__).resolve() != path.resolve():
-            raise RuntimeError('baseline module belongs to a different checkout')
-        return module
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+    return benchmarking().baseline_modules()
 
 
-@cache
 def torch_compile_mix():
-    """Full-row performance baseline; independent from the P/Y accuracy reference."""
-    dependencies()
-    return baseline_modules().torch_compiled('prefill')
-
-
-def prepare_reader(x, w_down, w_up):
-    dependencies()
-    from pyhip.ops.gr_read.flydsl import GRReadPrefill, prepare_weights
-    packed_down, packed_up = prepare_weights(w_down, w_up)
-    reader = GRReadPrefill(x.shape[0], packed_down, packed_up)
-    reader._check_input(x)
-    return reader
-
-
-def prepare_gr_read(x, w_down, w_up):
-    """Compatibility tuple for historical scripts; current tests use the public object."""
-    reader = prepare_reader(x, w_down, w_up)
-    return (reader.w_down, reader.w_up, reader.partial, reader.output,
-            reader.down, reader.up, reader.down_config, reader.up_config[1])
-
-
-def run_down(x, w_down, partial, down):
-    """Launch Down with prepared buffers and return the BF16 intermediate."""
-    torch, _, _, _ = dependencies()
-    if x.shape[0]:
-        with torch.cuda.device(x.device):
-            down(x, w_down, partial, x.shape[0], torch.cuda.current_stream(x.device))
-    return partial
-
-
-def run_up(x, w_up, partial, output, up):
-    """Launch Up with prepared buffers and return the BF16 output."""
-    torch, _, _, _ = dependencies()
-    if x.shape[0]:
-        with torch.cuda.device(x.device):
-            up(x, w_up, partial, output, x.shape[0], torch.cuda.current_stream(x.device))
-    return output
-
-
-def run_gr_read(x, w_down, w_up, partial, output, down, up):
-    """Launch Down then Up on the current stream, without host row splitting."""
-    torch, _, _, _ = dependencies()
-    if x.shape[0]:
-        with torch.cuda.device(x.device):
-            stream = torch.cuda.current_stream(x.device)
-            down(x, w_down, partial, x.shape[0], stream)
-            up(x, w_up, partial, output, x.shape[0], stream)
-    return output
-
-
-def reference_bf16(x, w_down, w_up):
-    torch, _, mix, _ = dependencies()
-    activation = torch.empty((x.shape[0], R), device=x.device, dtype=torch.bfloat16)
-    output = torch.empty((x.shape[0], H), device=x.device, dtype=torch.bfloat16)
-    with torch.autocast("cuda", enabled=False):
-        for begin in range(0, x.shape[0], CHECK_ROWS):
-            end = min(begin + CHECK_ROWS, x.shape[0])
-            p, y = mix(x[begin:end], w_down, w_up)
-            assert p.dtype == y.dtype == torch.bfloat16
-            activation[begin:end], output[begin:end] = p, y
-    return activation, output
-
-
-def check_close(actual, expected, tolerance):
-    torch, _, _, _ = dependencies()
-    assert actual.shape == expected.shape
-    error_squared = expected_squared = 0.0
-    for begin in range(0, actual.shape[0], CHECK_ROWS):
-        a, e = actual[begin:begin + CHECK_ROWS].double(), expected[begin:begin + CHECK_ROWS].double()
-        torch.testing.assert_close(a, e, **tolerance)
-        error_squared += (a - e).square().sum().item()
-        expected_squared += e.square().sum().item()
-    return (error_squared / expected_squared if expected_squared else error_squared) ** 0.5
-
-
-def make_inputs(torch, rows, seed):
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    x = torch.randn((rows, 10240), device="cuda", dtype=torch.bfloat16, generator=generator)
-    wd = torch.randn((320, 10240), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.02
-    wu = torch.randn((10240, 320), device="cuda", dtype=torch.bfloat16, generator=generator) * 0.02
-    return x, wd, wu
-
-
-def check_batch(rows, args):
-    torch, _, _, _ = dependencies()
-    with torch.no_grad():
-        x, wd, wu = make_inputs(torch, rows, args.seed)
-        reader = prepare_reader(x, wd, wu)
-        partial, output = reader.partial, reader.output
-        dm, dw, dn, dk = reader.down_config
-        um, un = reader.up_config
-        p_expected, y_expected = reference_bf16(x, wd, wu)
-        assert partial.dtype == output.dtype == torch.bfloat16
-        assert partial.shape == (rows, R)
-        scope = getattr(args, "scope", "all")
-        partial.fill_(torch.nan)
-        assert reader.run_down(x) is partial
-        p_error = check_close(partial, p_expected, DOWN_TOLERANCE)
-        y_error = None
-        if scope in ("up", "all"):
-            output.fill_(torch.nan)
-            assert reader.run_up(x) is output
-            y_error = check_close(output, y_expected, OUTPUT_TOLERANCE)
-        if scope in ("total", "all"):
-            partial.fill_(torch.nan); output.fill_(torch.nan)
-            assert reader(x) is output
-            check_close(partial, p_expected, DOWN_TOLERANCE)
-            y_error = check_close(output, y_expected, OUTPUT_TOLERANCE)
-        if scope in ("total", "all"):
-            from pyhip.ops.gr_read import gr_read
-            actual = gr_read(x, reader.w_down, reader.w_up)
-            if 0 < rows <= 32:
-                assert_decode_close(actual, decode_reference(x, wd, wu), 'public exact-row decode')
-            else:
-                check_close(actual, y_expected, OUTPUT_TOLERANCE)
-            assert gr_read(x, reader.w_down, reader.w_up, output=output) is output
-            torch.testing.assert_close(output, actual, rtol=0, atol=0)
-        result = {"complete": True, "rows": rows, "down_n_splits": dn,
-                  "down_block_m": dm, "down_num_waves": dw, "down_block_k": dk,
-                  "up_block_m": um, "n_splits": un, "P_rel_l2": p_error, "Y_rel_l2": y_error,
-                  "P_tolerance": DOWN_TOLERANCE, "Y_tolerance": OUTPUT_TOLERANCE,
-                  "partial_shape": list(partial.shape), "checked_scopes": list(SCOPES) if scope == "all" else [scope]}
-        if getattr(args, "verbose", False):
-            print(f"T={rows} prefill {scope}: P rel_l2={p_error:.6g}, Y rel_l2={y_error} PASS", flush=True)
-        return result
-
-
-def decode_reference(x, w_down, w_up):
-    import torch
-    (x, wd, wu) = (x.double(), w_down.double(), w_up.double())
-    hidden = torch.nn.functional.silu(x @ wd.T * 0.25)
-    gates = torch.sigmoid(hidden @ wu.T).reshape(-1, 4, 2560)
-    return (gates * x.reshape(-1, 4, 2560)).mean(dim=1)
-
-
-def make_decode_inputs(rows, seed):
-    import torch
-    gen = torch.Generator(device='cuda').manual_seed(seed)
-
-    def randn(*shape):
-        return torch.randn(*shape, dtype=torch.bfloat16, device='cuda', generator=gen)
-    return (randn(rows, 10240), randn(320, 10240) * 0.02, randn(10240, 320) * 0.02)
-
-
-def capture_decode(calls):
-    import torch
-    for _ in range(2):
-        for call in calls:
-            call()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with warnings.catch_warnings(record=True) as messages:
-        warnings.simplefilter('always')
-        with torch.cuda.graph(graph):
-            for call in calls:
-                call()
-    for message in messages:
-        if 'graph is empty' in str(message.message).lower():
-            raise RuntimeError('empty graph: launch did not use the capture stream')
-        warnings.warn(str(message.message), message.category)
-    return graph
-
-
-def guarded(shape, dtype, device):
-    import math
-    import torch
-    storage = torch.full((math.prod(shape) + 32,), 97, dtype=dtype, device=device)
-    return (storage[16:-16].view(shape), storage)
-
-
-def assert_decode_close(actual, expected, label):
-    import torch
-    assert torch.allclose(actual.double(), expected, rtol=0.01, atol=0.005), label
-
-
-def check_decode_rows(rows, wd, wu, pd, pu, seed):
-    import torch
-    use_checkout_package()
-    from pyhip.ops.gr_read.flydsl import GRReadDecode
-    from pyhip.ops.gr_read import gr_read
-    from pyhip.ops.gr_read.flydsl.common import K, R, H as HS
-    reader = GRReadDecode(rows, pd, pu)
-    assert reader.w_down.data_ptr() == pd.data_ptr()
-    assert reader.w_up.data_ptr() == pu.data_ptr()
-    assert reader.partial.shape == (4 * rows * R,), "decode P must be compact"
-    (x, sx) = guarded((rows, K), torch.bfloat16, pd.device)
-    (reader.partial, sp) = guarded(reader.partial.shape, torch.float32, pd.device)
-    (reader.output, sy) = guarded((rows, HS), torch.bfloat16, pd.device)
-    (api_output, api_storage) = guarded((rows, HS), torch.bfloat16, pd.device)
-    gen = torch.Generator(device=pd.device).manual_seed(seed)
-    x.normal_(generator=gen)
-    assert_decode_close(reader(x), decode_reference(x, wd, wu), f'T={rows}: eager FP64 mismatch')
-    assert gr_read(x, pd, pu, output=api_output) is api_output
-    torch.testing.assert_close(api_output, reader.output, rtol=0, atol=0)
-    graph = capture_decode([lambda : reader(x), lambda : gr_read(x, pd, pu, output=api_output)])
-    (count, maximum) = (0, 0.0)
-    for tail in ('zero', 'stale', 'nan'):
-        x.normal_(generator=gen)
-        for live in list(range(rows, -1, -1)) + list(range(1, rows + 1)):
-            x[:live].normal_(generator=gen)
-            if tail == 'zero':
-                x[live:].zero_()
-            elif tail == 'nan':
-                x[live:].fill_(float('nan'))
-            before = x.clone()
-            reader.partial.fill_(float('nan'))
-            reader.output.fill_(float('nan'))
-            api_output.fill_(float('nan'))
-            graph.replay()
-            expected = decode_reference(x[:live], wd, wu)
-            actual = reader.output[:live].double()
-            label = f'T={rows}, live={live}, tail={tail}'
-            assert_decode_close(actual, expected, label)
-            assert_decode_close(api_output[:live], expected, label + ': public API')
-            torch.testing.assert_close(api_output[:live], reader.output[:live], rtol=0, atol=0)
-            if live:
-                error = ((actual - expected).abs() / (0.005 + 0.01 * expected.abs())).max().item()
-                maximum = max(maximum, error)
-            partial = reader.partial.view(4, rows, R)
-            assert torch.isfinite(partial[:, :live]).all(), label + ': live scratch'
-            if tail == 'zero':
-                assert torch.count_nonzero(partial[:, live:]) == 0, label + ': zero scratch tail'
-                assert torch.count_nonzero(reader.output[live:]) == 0, label + ': zero output tail'
-            elif tail == 'stale':
-                assert torch.isfinite(partial).all(), label + ': stale scratch'
-                assert torch.isfinite(reader.output).all(), label + ': stale output'
-            assert torch.allclose(x, before, rtol=0, atol=0, equal_nan=True), label + ': input mutated'
-            for storage in (sx, sp, sy, api_storage):
-                assert torch.all(storage[:16] == 97) and torch.all(storage[-16:] == 97), label + ': guard overwritten'
-            count += 1
-    return {'rows': rows, 'replays': count, 'public_api_replays': count, 'max_scaled_error': maximum,
-            'partial_shape': [4, rows, R], 'compact_partial_guards_passed': True, 'passed': True}
-
-
-def check_decode_stages(rows, wd, wu, pd, pu, seed, scope="all"):
-    import torch
-    import flydsl.compiler as flyc
-    from pyhip.ops.gr_read.flydsl import GRReadDecode
-    from pyhip.ops.gr_read.flydsl.down import make_decode_down
-    from pyhip.ops.gr_read.flydsl.up import make_decode_up
-
-    x = make_decode_inputs(rows, seed)[0]
-    reader = GRReadDecode(rows, pd, pu)
-    assert reader.partial.shape == (4 * rows * 320,), "decode P must be compact"
-    reader.partial, partial_storage = guarded(reader.partial.shape, torch.float32, pd.device)
-    stream = torch.cuda.current_stream()
-    down = flyc.compile(make_decode_down(rows), x.view(-1), pd, reader.partial, stream)
-    up = flyc.compile(make_decode_up(rows), x.view(-1), pu, reader.partial, reader.output.view(-1), stream)
-    for state in range(2):
-        if state: x.mul_(0.99).add_(0.015625)
-        before = x.clone()
-        reader.partial.fill_(float("nan"))
-        down(x.view(-1), pd, reader.partial, stream)
-        partial = reader.partial.view(4, rows, 320)
-        if scope in ("down", "all"):
-            for split in range(4):
-                begin, end = split * 2560, (split + 1) * 2560
-                expected = x[:, begin:end].double() @ wd[:, begin:end].double().T
-                torch.testing.assert_close(partial[split, :rows].double(), expected, rtol=2e-5, atol=1e-5)
-        assert torch.all(partial_storage[:16] == 97) and torch.all(partial_storage[-16:] == 97), "Down overwrote compact P guard"
-        if scope in ("up", "all"):
-            hidden = torch.nn.functional.silu(partial[:, :rows].double().sum(0) * .25)
-            expected = (torch.sigmoid(hidden @ wu.double().T).reshape(rows, 4, 2560)
-                        * x.double().reshape(rows, 4, 2560)).mean(1)
-            reader.output.fill_(float("nan"))
-            up(x.view(-1), pu, reader.partial, reader.output.view(-1), stream)
-            assert_decode_close(reader.output, expected, "isolated decode Up from actual P")
-        assert torch.all(partial_storage[:16] == 97) and torch.all(partial_storage[-16:] == 97), "Up overwrote compact P guard"
-        assert torch.equal(before, x)
-    return {"rows": rows, "scope": scope, "input_states": 2, "passed": True}
-
-
-def release_buffers():
-    gc.collect()
-    torch = sys.modules.get("torch")
-    if torch is not None and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-def selected_rows(parser, args):
-    if args.rows is not None:
-        if args.phase == "all": parser.error("use --decode-rows / --prefill-rows with --phase all")
-        if args.decode_rows is not None or args.prefill_rows is not None:
-            parser.error("--rows cannot be combined with phase-specific rows")
-        if args.phase == "decode": args.decode_rows = args.rows
-        else: args.prefill_rows = args.rows
-    args.decode_rows = args.decode_rows or list(range(1, 33))
-    args.prefill_rows = args.prefill_rows or list(DEFAULT_BATCHES)
-    if any(not 1 <= r <= 32 for r in args.decode_rows): parser.error("decode rows must be in 1..32")
-    if any(r < 33 for r in args.prefill_rows): parser.error("prefill benchmark rows start at 33")
-    if any(len(set(rs)) != len(rs) for rs in (args.decode_rows, args.prefill_rows)):
-        parser.error("rows must be distinct")
+    return benchmarking().torch_compile_mix()
 
 
 def parse_args(argv=None):
@@ -428,6 +81,7 @@ def parse_args(argv=None):
     parser.add_argument("--no-baselines", action="store_true", help="skip frozen performance baselines in both phases; accuracy references still run")
     parser.add_argument("--amd-smi", type=Path, help="compatible amd-smi CLI for performance hardware gates")
     parser.add_argument("--output", type=Path, help="optional new JSONL file; default: console only")
+    parser.add_argument("--md", type=Path, help="optional new Markdown performance report")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
     selected_rows(parser, args)
@@ -440,51 +94,18 @@ def parse_args(argv=None):
     if args.gpu < 0 or args.decode_weights < 1 or not __debug__:
         parser.error("nonnegative GPU and positive weight count required; do not use python -O")
     args.check_only = args.check_only or args.scope != "all"
+    if args.check_only and args.md is not None:
+        parser.error('--md requires performance measurement; remove --check-only / single --scope')
+    checks.validate_report_paths(parser, args.output, args.md)
     return args
 
 
-def run_correctness(args, emit):
-    """Keep the original accuracy workloads, completing both phases before timing."""
-    use_checkout_package()
-    import torch
-    from pyhip.ops.gr_read.flydsl import prepare_weights
-    if torch.version.hip is None or not torch.cuda.is_available():
-        raise RuntimeError("ROCm GPU required")
-    if args.phase in ("all", "decode"):
-        print(f"Accuracy: decode {len(args.decode_rows)} batches, {args.decode_weights} weight pairs, scope={args.scope}", flush=True)
-        total = 0
-        with torch.inference_mode():
-            for i in range(args.decode_weights):
-                _, wd, wu = make_decode_inputs(1, args.decode_seed + i)
-                pd, pu = prepare_weights(wd, wu)
-                before_down, before_up = pd.clone(), pu.clone()
-                for index, rows in enumerate(args.decode_rows, 1):
-                    print(f"[Decode accuracy {i + 1}/{args.decode_weights}, {index}/{len(args.decode_rows)}] T={rows}", flush=True)
-                    seed = args.decode_seed + i * 10000 + rows
-                    if args.scope in ("down", "up", "all"):
-                        result = check_decode_stages(rows, wd, wu, pd, pu, seed, args.scope)
-                        emit({"type": "stage_check", "phase": "decode", "weight": i, **result})
-                    if args.scope in ("total", "all"):
-                        result = check_decode_rows(rows, wd, wu, pd, pu, seed)
-                        total += result["replays"]
-                        emit({"type": "check", "phase": "decode", "weight": i, **result})
-                    assert torch.equal(pd, before_down) and torch.equal(pu, before_up), "packed weights mutated"
-        emit({"type": "summary", "phase": "decode", "complete": True, "rows": args.decode_rows, "replays": total})
-        print(f"Decode: {len(args.decode_rows)} shapes, {args.decode_weights} weight pairs, "
-              f"{total} Graph replays with prepared + functional calls PASS", flush=True)
-    if args.phase in ("all", "prefill"):
-        for index, rows in enumerate(args.prefill_rows, 1):
-            print(f"[Prefill accuracy {index}/{len(args.prefill_rows)}] T={rows}, scope={args.scope}", flush=True)
-            result = check_batch(rows, argparse.Namespace(seed=args.prefill_seed, scope=args.scope, verbose=args.verbose))
-            emit({"type": "check", "phase": "prefill", **result})
-        emit({"type": "summary", "phase": "prefill", "complete": True, "rows": args.prefill_rows})
-        print(f"Prefill: {len(args.prefill_rows)} shapes, {args.scope} PASS", flush=True)
 
 
 @cache
 def benchmarking():
     import importlib.util
-    path = Path(__file__).with_name("bench_gr_read_compare.py")
+    path = REPO / "benchmarks/gr_read/bench_gr_read_compare.py"
     spec = importlib.util.spec_from_file_location("gr_read_benchmark", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -499,7 +120,7 @@ def benchmark_options(args):
                "--decode-rows", *map(str, args.decode_rows),
                "--prefill-rows", *map(str, args.prefill_rows),
                "--prefill-seed", str(args.prefill_seed)]
-    for name in ("amd_smi", "output"):
+    for name in ("amd_smi", "output", "md"):
         value = getattr(args, name)
         if value is not None:
             options.extend(("--" + name.replace("_", "-"), str(value)))
@@ -525,7 +146,7 @@ def main(argv=None):
             bench = benchmarking()
             def emit_performance(phase, record):
                 bench.emit_record(out, phase, {"stage": "performance", **record})
-            bench.benchmark_entry_gate(performance, emit_performance)
+            startup_hardware = bench.benchmark_entry_gate(performance, emit_performance)
         print(f"[1/{1 if args.check_only else 2}] Accuracy checks for all selected batches", flush=True)
         run_correctness(args, emit)
         release_buffers()
@@ -536,6 +157,7 @@ def main(argv=None):
                 emit_performance,
                 prefill_checked=True,
                 hardware_checked=True,
+                startup_hardware=startup_hardware,
             )
         else:
             print("Accuracy complete; performance skipped (--check-only or single --scope).", flush=True)
@@ -782,6 +404,66 @@ if "pytest" in sys.modules:
         assert benchmark_options(parse_args([])).output is None
         assert benchmark_options(parse_args(['--output', str(output)])).output == output
         assert benchmarking().parse_args(['--output', str(output)]).output == output
+
+
+    def test_benchmark_report_paths(tmp_path):
+        output, markdown = tmp_path / 'samples.jsonl', tmp_path / 'report.md'
+        assert benchmark_options(parse_args(['--md', str(markdown)])).md == markdown
+        for parser in (parse_args, benchmarking().parse_args):
+            with pytest.raises(SystemExit):
+                parser(['--output', str(output), '--md', str(output)])
+            markdown.write_text('keep this report')
+            with pytest.raises(SystemExit):
+                parser(['--md', str(markdown)])
+            assert markdown.read_text() == 'keep this report'
+            markdown.unlink()
+        with pytest.raises(SystemExit):
+            parse_args(['--check-only', '--md', str(markdown)])
+
+
+    @pytest.mark.parametrize('with_baselines', (False, True))
+    def test_benchmark_markdown_report(tmp_path, with_baselines):
+        bench = benchmarking()
+        path = tmp_path / 'report.md'
+        baseline = ({'source_checkout_commit': 'source-version',
+                     'triton_last_change_commit': 'tuning-version',
+                     'runtime_versions': {'torch': 'torch-version', 'triton': 'triton-version'}}
+                    if with_baselines else None)
+        env = {'gpu': 'MI308X', 'arch': 'gfx942', 'compute_units': 80,
+               'torch': 'torch-version', 'hip': 'hip-version',
+               'protocol': {'record_total_partials': with_baselines}, 'baseline': baseline,
+               'sources': {str(bench.REPO / 'src/pyhip/testing/gr_read.py'): 'source-hash'}}
+        timings = {'down': 4., 'up': 6., 'total': 10.}
+        prefill_timings = {scope: {'elapsed_us': value, 'effective_TFLOPS': 1.}
+                           for scope, value in timings.items()}
+        if with_baselines:
+            timings['baseline'] = 20.
+            prefill_timings['torch_compile'] = {'elapsed_us': 20., 'effective_TFLOPS': .5}
+        results = {'decode': [{'rows': 1, 'median_us': timings,
+                              'baseline_backend': 'triton' if with_baselines else None,
+                              'speedup_total': 2. if with_baselines else None}],
+                   'prefill': [{'rows': 33, 'timings': prefill_timings, 'down_block_m': 16,
+                                'down_num_waves': 2, 'down_n_splits': 10, 'down_block_k': 1024,
+                                'up_block_m': 64, 'n_splits': 40,
+                                'speedup_vs_torch_compile': 2. if with_baselines else None}]}
+        hardware = {'gpu': 2, 'card': {'PCI Bus': '0000:A4:00.0', 'GPU use (%)': '0',
+                                     'GPU Memory Allocated (VRAM%)': '0'},
+                    'limit': {'ptl_state': 'Enabled', 'ptl_format': 'VECTOR,F8'}}
+        args = argparse.Namespace(output=tmp_path / 'raw.jsonl' if with_baselines else None)
+        bench.write_markdown_report(path, args, results, {'decode': env, 'prefill': env},
+                                    hardware, '2026-09-29T00:00:00+00:00')
+        report = path.read_text()
+        for expected in ('## Decode', '## Prefill', 'MI308X', '80 CUs', '0000:A4:00.0',
+                         'M16/W2/N10/BK1024', 'src/pyhip/testing/gr_read.py', '10.000'):
+            assert expected in report
+        if with_baselines:
+            assert 'source-version' in report and '2.000x' in report and '<raw.jsonl>' in report
+        else:
+            assert 'Frozen performance baselines disabled' in report and 'not exported' in report
+        with pytest.raises(FileExistsError):
+            bench.write_markdown_report(path, args, results, {'decode': env, 'prefill': env},
+                                        hardware, 'later')
+        assert path.read_text() == report
 
 
     @pytest.mark.parametrize('rows,record_partials', ((33, True), (513, True), (33, False)))

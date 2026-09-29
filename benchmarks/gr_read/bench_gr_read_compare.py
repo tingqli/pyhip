@@ -4,14 +4,18 @@
 Defaults preserve the two PR #36 protocols. Frozen test baselines are optional.
 Progress is printed during setup
 and between measurements, followed by the final tables. No result files are
-created unless --output is supplied.
+created unless --output or --md is supplied. See readme.md for integration and
+the measured MI308X performance snapshot.
 """
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stdout
+from datetime import datetime, timezone
 from functools import cache
 import gc
 import hashlib
 import importlib.util
+from importlib import metadata as package_metadata
+import io
 import json
 import math
 import os
@@ -25,7 +29,8 @@ import time
 import warnings
 from unittest.mock import patch
 
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / 'src'))
 C, H, R = 4, 2560, 320
 SCOPES = ('down', 'up', 'total', 'baseline')
 TIMING_SCOPES = ('down', 'up', 'total', 'torch_compile')
@@ -41,12 +46,49 @@ def load_file(name, path):
 
 @cache
 def testing():
-    return load_file('gr_read_checks', Path(__file__).with_name('test_gr_read.py'))
+    from pyhip.testing import gr_read
+    if Path(gr_read.__file__).resolve() != REPO / 'src/pyhip/testing/gr_read.py':
+        raise RuntimeError(f'wrong PyHIP checkout: {gr_read.__file__}')
+    return gr_read
+
+
+@cache
+def baseline_modules():
+    """Load this checkout's benchmark baseline module in script and pytest import modes."""
+    import importlib.util
+    name = '_pyhip_gr_read_baselines'
+    path = Path(__file__).with_name('baselines.py')
+    if name in sys.modules:
+        module = sys.modules[name]
+        if Path(module.__file__).resolve() != path.resolve():
+            raise RuntimeError('baseline module belongs to a different checkout')
+        return module
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+
+@cache
+def torch_compile_mix():
+    """Full-row performance baseline; independent from the P/Y accuracy reference."""
+    testing().dependencies()
+    return baseline_modules().torch_compiled('prefill')
+
+
+def source_hashes(no_baselines):
+    paths = [Path(__file__), Path(testing().__file__),
+             REPO / 'src/pyhip/ops/gr_read/__init__.py',
+             *(REPO / 'src/pyhip/ops/gr_read/flydsl').glob('*.py')]
+    if not no_baselines:
+        paths.append(Path(__file__).with_name('baselines.py'))
+    return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
 
 
 def dependencies(no_baselines=False):
     prefill = testing()
-    prefill.use_checkout_package()
     import torch
     import flydsl.compiler as flyc
     from pyhip.testing import cudaPerf
@@ -58,7 +100,7 @@ def dependencies(no_baselines=False):
     check = SimpleNamespace(reference=reference, assert_close=assert_close, make_inputs=make_inputs, capture=capture)
     if no_baselines:
         return torch, flyc, cudaPerf, decode, check, prefill, None, None
-    baselines = prefill.baseline_modules()
+    baselines = baseline_modules()
     return (torch, flyc, cudaPerf, decode, check, prefill,
             baselines.torch_compiled('decode'), baselines)
 
@@ -185,6 +227,7 @@ def benchmark_entry_gate(args, emit):
     if args.verbose:
         print(snapshot, flush=True)
     validate_hardware(snapshot)
+    return snapshot
 
 
 class Case:
@@ -204,7 +247,7 @@ class Case:
         self.baseline_backend = self.baseline_call = None
         self.baseline_wd = self.baseline_wu = None
         if triton_mix is not None:
-            self.baseline_wd, self.baseline_wu = prefill.baseline_modules().prepare_weights(wd, wu)
+            self.baseline_wd, self.baseline_wu = baseline_modules().prepare_weights(wd, wu)
             self.baseline_backend = 'triton' if triton_mix.fused_hc_mix_supported(x, self.baseline_wd, self.baseline_wu) else 'torch.compile'
             self.baseline_call = triton_mix.fused_hc_mix if self.baseline_backend == 'triton' else compiled_mix
         self.baseline_y = None
@@ -388,7 +431,7 @@ def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
 def benchmark_prefill_batch(rows, args, emit):
     prefill = testing()
     torch, _, _, cuda_perf = prefill.dependencies()
-    compiled_mix = None if args.no_baselines else prefill.torch_compile_mix()
+    compiled_mix = None if args.no_baselines else torch_compile_mix()
     scopes = TIMING_SCOPES[:-1] if args.no_baselines else TIMING_SCOPES
     from pyhip.ops.gr_read import gr_read
     with torch.no_grad():
@@ -397,7 +440,7 @@ def benchmark_prefill_batch(rows, args, emit):
         # Both implementations rotate over independent weight allocations.
         # Each pair has identical logical values; packing happens only here.
         weights = [(wd, wu)] + [(wd.clone(), wu.clone()) for _ in range(args.buffers - 1)]
-        baseline_weights = ([prefill.baseline_modules().prepare_weights(*pair) for pair in weights]
+        baseline_weights = ([baseline_modules().prepare_weights(*pair) for pair in weights]
                             if compiled_mix is not None else [])
         readers = [prefill.prepare_reader(input_x, *pair) for input_x, pair in zip(inputs, weights)]
         expected_p = expected_y = None
@@ -565,7 +608,6 @@ def time_graph(graph, calls, samples):
 
 def benchmark_decode_total(rows, pairs, args, emit):
     import torch
-    testing().use_checkout_package()
     from pyhip.ops.gr_read.flydsl import GRReadDecode, prepare_weights
     gen = torch.Generator(device="cuda").manual_seed(args.seed + rows)
     xs = [torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16, generator=gen) for _ in pairs]
@@ -619,6 +661,7 @@ def parse_args(argv=None):
     parser.add_argument('--settle-seconds', type=float, default=2.0, help='wait once before the startup hardware check')
     parser.add_argument('--amd-smi', type=Path)
     parser.add_argument('--output', type=Path, help='optional new JSONL file; default: progress and tables on console')
+    parser.add_argument('--md', type=Path, help='optional new Markdown performance report')
     parser.add_argument('--verbose', action='store_true', help='also print hardware and detailed correctness diagnostics')
     for name in ('weights', 'rounds', 'samples', 'buffers', 'warmup', 'iters', 'seed'):
         parser.add_argument('--' + name, type=int, help='single-phase compatibility option')
@@ -636,6 +679,7 @@ def parse_args(argv=None):
     counts = (args.decode_weights, args.decode_rounds, args.decode_samples, args.prefill_buffers, args.prefill_iters)
     if min(counts) < 1 or args.gpu < 0 or args.prefill_warmup < 0 or args.settle_seconds < 0 or not __debug__:
         parser.error('positive counts, nonnegative GPU/warmup/settling required; do not use python -O')
+    checks.validate_report_paths(parser, args.output, args.md)
     return args
 
 
@@ -667,17 +711,13 @@ def run_decode(args, emit):
         raise RuntimeError('decode comparison requires a ROCm GPU')
     prefill.warn_architecture(torch, 0)
     props = torch.cuda.get_device_properties(0)
-    source_paths = [Path(__file__), Path(__file__).with_name('test_gr_read.py'),
-                    *(REPO / 'src/pyhip/ops/gr_read/flydsl').glob('*.py')]
-    if not args.no_baselines:
-        source_paths.append(Path(__file__).with_name('baselines.py'))
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
           'gpu': props.name, 'arch': props.gcnArchName, 'compute_units': props.multi_processor_count,
           'protocol': {'weights': local.weights, 'rounds': local.rounds, 'samples': local.samples,
                        'seed': local.seed, 'graph_passes': 2, 'replays_per_sample': 3, 'mode': 'cuda_graph',
                        'record_total_partials': local.record_partials},
-          'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
-          'baseline': None if args.no_baselines else prefill.baseline_modules().metadata(),
+          'sources': source_hashes(args.no_baselines),
+          'baseline': None if args.no_baselines else baseline_modules().metadata(),
           'settings_written': False})
     results = []
     with torch.inference_mode():
@@ -706,11 +746,14 @@ def run_prefill(args, emit, *, check=True):
     print(f"\nPrefill: {len(args.prefill_rows)} batches, {local.buffers} buffers, "
           f"{local.warmup} warmup calls, {local.iters} eager samples/scope. Loading runtime...", flush=True)
     torch, _, _, _ = prefill.dependencies()
+    props = torch.cuda.get_device_properties(0)
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
+          'gpu': props.name, 'arch': props.gcnArchName, 'compute_units': props.multi_processor_count,
           'protocol': {'buffers': local.buffers, 'warmup': local.warmup, 'iters': local.iters,
                        'seed': local.seed, 'scope_order': list(TIMING_SCOPES[:-1] if args.no_baselines else TIMING_SCOPES), 'mode': 'eager',
                        'record_total_partials': local.record_partials},
-          'baseline': None if args.no_baselines else prefill.baseline_modules().metadata(),
+          'sources': source_hashes(args.no_baselines),
+          'baseline': None if args.no_baselines else baseline_modules().metadata(),
           'settings_written': False})
     # Keep the original prefill flow: all selected correctness checks before timing.
     for index, rows in enumerate(args.prefill_rows if check else (), 1):
@@ -748,17 +791,76 @@ def print_decode_table(results):
               f"{r['baseline_backend'] or 'not run'} | {baseline_time} | {speedup} |")
 
 
-def run_benchmarks(args, emit, *, prefill_checked=False, hardware_checked=False):
+def write_markdown_report(path, args, results, environments, hardware, started_at):
+    """Render completed results with the same tables printed by the benchmark."""
+    stream = io.StringIO()
+    with redirect_stdout(stream):
+        print('# GR read performance report\n')
+        print(f'Run started: {started_at}. Dimensions: BF16 X[T,10240], C=4, H=2560, R=320.\n')
+        print('Total calls `gr_read(..., output=out)` with an internally allocated P. '
+              'Packing, compilation and correctness checks are outside timing.\n')
+        if hardware is not None:
+            card, limit = hardware['card'], hardware['limit']
+            print(f"Physical GPU {hardware['gpu']}, PCI {card.get('PCI Bus', 'unknown')}; "
+                  f"startup use={card['GPU use (%)']}%, VRAM={card['GPU Memory Allocated (VRAM%)']}%; "
+                  f"PTL={limit.get('ptl_state')}/{limit.get('ptl_format')}.\n")
+        print('Hardware checked once at startup; device settings were not changed.\n')
+        try:
+            print(f"FlyDSL: {package_metadata.version('flydsl')}.\n")
+        except package_metadata.PackageNotFoundError:
+            print('FlyDSL package version unavailable.\n')
+        for phase, rows in results.items():
+            env = environments[phase]
+            print(f'## {phase.capitalize()}\n')
+            print(f"GPU: {env['gpu']}; {env['arch']}; {env['compute_units']} CUs. "
+                  f"Torch: {env['torch']}; HIP: {env['hip']}.\n")
+            print('Sampling protocol:\n```json\n' + json.dumps(env['protocol'], indent=2) + '\n```\n')
+            if env['baseline'] is None:
+                print('Frozen performance baselines disabled.\n')
+            else:
+                baseline = env['baseline']
+                print(f"Frozen SGLang baseline checkout: `{baseline['source_checkout_commit']}`; "
+                      f"Triton tuning commit: `{baseline['triton_last_change_commit']}`.\n")
+                print('Baseline compiler versions: `' + json.dumps(baseline['runtime_versions']) + '`.\n')
+            print(f'{len(rows)} selected shapes completed with output checks.\n')
+            if phase == 'decode':
+                print_decode_table(rows)
+            else:
+                print_prefill_table(rows)
+            print('\nSource SHA256:\n```json\n' + json.dumps(
+                {str(Path(p).relative_to(REPO)): digest for p, digest in env['sources'].items()},
+                indent=2) + '\n```\n')
+        if args.output is not None:
+            raw = os.path.relpath(args.output.resolve(), path.resolve().parent)
+            print(f'[Raw samples and actual P addresses](<{raw}>)\n')
+        else:
+            print('Raw samples and internal P addresses were not exported; use `--output` to retain them.\n')
+        print('Decode uses CUDA Graph replay; prefill uses eager cudaPerf. '
+              'The two timing modes are reported separately. Effective TFLOPS count GEMM work only.')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('x') as out:
+        out.write(stream.getvalue())
+
+
+def run_benchmarks(args, emit, *, prefill_checked=False, hardware_checked=False, startup_hardware=None):
     """Run the existing samplers and print both final tables after all phases."""
+    started_at = datetime.now(timezone.utc).isoformat(timespec='seconds')
     if not hardware_checked:
-        benchmark_entry_gate(args, emit)
+        startup_hardware = benchmark_entry_gate(args, emit)
     checks = testing()
+    environments = {}
+
+    def phase_emit(phase, record):
+        if args.md is not None and record['type'] == 'environment':
+            environments[phase] = record
+        emit(phase, record)
+
     results_by_phase = {}
     if args.phase in ('all', 'decode'):
-        results_by_phase['decode'] = run_decode(args, lambda r: emit('decode', r))
+        results_by_phase['decode'] = run_decode(args, lambda r: phase_emit('decode', r))
         checks.release_buffers()
     if args.phase in ('all', 'prefill'):
-        results_by_phase['prefill'] = run_prefill(args, lambda r: emit('prefill', r), check=not prefill_checked)
+        results_by_phase['prefill'] = run_prefill(args, lambda r: phase_emit('prefill', r), check=not prefill_checked)
     print('\nBenchmark complete. Final results:', flush=True)
     if 'decode' in results_by_phase:
         print_decode_table(results_by_phase['decode'])
@@ -766,6 +868,9 @@ def run_benchmarks(args, emit, *, prefill_checked=False, hardware_checked=False)
         print('\nPrefill (eager cudaPerf)')
         print_prefill_table(results_by_phase['prefill'])
     sys.stdout.flush()
+    if args.md is not None:
+        write_markdown_report(args.md, args, results_by_phase, environments, startup_hardware, started_at)
+        print(f'Markdown report: {args.md}', flush=True)
     return results_by_phase
 
 

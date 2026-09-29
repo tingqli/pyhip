@@ -163,8 +163,10 @@ See [tests/README.md](tests/README.md) for coverage, exclusions, and hardware li
 Do not collect the entire experimental tree: some scripts perform GPU work or
 load saved input data at import time. GRRead checks accuracy before printing
 decode and prefill performance tables via [test_gr_read.py](tests/ops/gr_read/test_gr_read.py)
-(`--check-only` skips timing). Its standalone benchmark CLI remains in
-[bench_gr_read_compare.py](tests/ops/gr_read/bench_gr_read_compare.py).
+(`--check-only` skips timing). Its standalone benchmark CLI is
+[bench_gr_read_compare.py](benchmarks/gr_read/bench_gr_read_compare.py); performance
+data, integration examples and report commands are in the
+[GR read benchmark guide](benchmarks/gr_read/readme.md).
 
 Shared helpers are available from `pyhip.testing`, including `calc_diff`,
 `cudaPerf`, and `run_perftest`. The latter returns `(output, latency_us)` and
@@ -235,4 +237,3 @@ its [packaged HIP sources](src/pyhip/ops/conv/hip), and the
 `python -m pyhip.tools.exts` extracts assembly from trace output;
 `python -m pyhip.tools.probe` runs hardware probes and is not part of the default
 test suite.
-
