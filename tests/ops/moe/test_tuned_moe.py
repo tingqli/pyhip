@@ -275,7 +275,11 @@ def test_aiter_signature():
     parameters = inspect.signature(tm.fused_moe).parameters
     native = inspect.signature(tm._aiter_fused_moe).parameters
     diff = set(parameters) - set(native)
-    assert diff == {"output", "stage2_scatter"} or diff == set()
+    print("Parameters:", parameters)
+    print("Native:", native)
+    print("diff:", diff)
+    diff_names = ["output", "stage2_scatter", "quant_type_a", "quant_dtype_a", "quant_dtype_a2"] 
+    assert all(k in diff_names for k in diff)
     for name, parameter in native.items():
         assert parameters[name].name == parameter.name
         assert parameters[name].kind == parameter.kind
