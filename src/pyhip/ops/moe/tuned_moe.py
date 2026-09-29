@@ -55,6 +55,7 @@ def _native_kind(call):
     if any(call[name] is not None for name in (
         "expert_mask", "num_local_tokens", "a1_scale", "a2_scale", "bias1", "bias2",
         "shared_w1", "shared_w2", "shared_w1_scale", "shared_w2_scale", "stage2_scatter",
+        "quant_type_a", "quant_dtype_a", "quant_dtype_a2",
     )):
         return None
     if (call["doweight_stage1"] or call["hidden_pad"] or call["intermediate_pad"]
@@ -659,6 +660,9 @@ def fused_moe(
     shared_expert_id: int = -1,
     stage2_scatter=None,
     output: torch.Tensor | None = None,
+    quant_type_a: int | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,    
 ):
     """兼容 Aiter 的 MoE 推理接口；传入 output 时，会写入并返回该 tensor。
 
