@@ -275,11 +275,10 @@ def test_aiter_signature():
     parameters = inspect.signature(tm.fused_moe).parameters
     native = inspect.signature(tm._aiter_fused_moe).parameters
     diff = set(parameters) - set(native)
-    print("Parameters:", parameters)
-    print("Native:", native)
-    print("diff:", diff)
-    diff_names = ["output", "stage2_scatter", "quant_type_a", "quant_dtype_a", "quant_dtype_a2"] 
-    assert all(k in diff_names for k in diff)
+    compatibility_names = {
+         "output", "stage2_scatter", "quant_type_a", "quant_dtype_a", "quant_dtype_a2",
+    }
+    assert diff == compatibility_names - set(native)
     # 共有参数必须保持原生顺序，避免位置调用绑错参数。
     assert [name for name in parameters if name in native] == list(native)
     for name, parameter in native.items():
