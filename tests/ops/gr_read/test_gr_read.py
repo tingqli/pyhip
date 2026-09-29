@@ -499,7 +499,7 @@ def benchmark_options(args):
                "--decode-rows", *map(str, args.decode_rows),
                "--prefill-rows", *map(str, args.prefill_rows),
                "--prefill-seed", str(args.prefill_seed)]
-    for name in ("amd_smi",):
+    for name in ("amd_smi", "output"):
         value = getattr(args, name)
         if value is not None:
             options.extend(("--" + name.replace("_", "-"), str(value)))
@@ -715,6 +715,154 @@ if "pytest" in sys.modules:
             torch.testing.assert_close(x, before, rtol=0, atol=0, equal_nan=True)
             for _, storage in allocations:
                 assert torch.all(storage[:16] == 97) and torch.all(storage[-16:] == 97)
+
+
+    @pytest.mark.parametrize('rows', (1, 17))
+    def test_decode_total_graph_addresses(monkeypatch, rows):
+        import weakref
+        import torch
+
+        bench = benchmarking()
+        dep = bench.dependencies(no_baselines=True)
+        from pyhip.ops.gr_read.flydsl import host
+        cases = []
+        with torch.inference_mode():
+            for seed in (901, 902):
+                x, wd, wu, pd, pu = api_inputs(rows, seed=seed)
+                case = bench.Case(rows, x, wd, wu, argparse.Namespace(phase='decode'),
+                                  dep, packed=(pd, pu))
+                case.run('total')
+                cases.append(case)
+            key = next(k for k in host._compiled_calls if k[0] == x.device.index and k[2] == rows)
+            native_pair, = host._compiled_calls[key]
+            launch_partials, partial_refs, records = [], [], []
+
+            def observed_pair(*args):
+                if torch.cuda.is_current_stream_capturing():
+                    # Independent check at the launch boundary: P is argument 3.
+                    launch_partials.append(bench.address(args[3]))
+                    partial_refs.append(weakref.ref(args[3]))
+                return native_pair(*args)
+
+            native_empty = torch.empty
+            with monkeypatch.context() as patch:
+                patch.setitem(host._compiled_calls, key, (observed_pair,))
+                calls = [lambda c=c, bi=bi: bench.capture_total_call(c, bi, len(cases), records)
+                         for bi, c in enumerate(cases)]
+                graph = bench.capture(calls + calls)
+            assert torch.empty is native_empty
+            assert len(records) == len(launch_partials) == 4  # Excludes eager warmups.
+            assert [r['P_total'] for r in records] == launch_partials
+            assert [(r['call_index'], r['pass_index'], r['buffer']) for r in records] == [
+                (0, 0, 0), (1, 0, 1), (2, 1, 0), (3, 1, 1)]
+            assert all(ref() is None for ref in partial_refs), 'logging must not retain P tensors'
+            assert json.loads(json.dumps(records)) == records
+            for record in records:
+                case = cases[record['buffer']]
+                partial = record['P_total']
+                assert partial['pointer'] != case.p.data_ptr()
+                assert partial['shape'] == [4 * rows * R]
+                assert record['logical_shape'] == [4, rows, R]
+                for name, tensor in (('X', case.x), ('WD_packed', case.pd),
+                                     ('WU_packed', case.pu), ('Y', case.y)):
+                    assert record['relative_bytes']['P_minus_' + name] == partial['pointer'] - tensor.data_ptr()
+            for _ in range(2):
+                for case in cases:
+                    case.x.mul_(.9).add_(.015625)
+                    case.y.fill_(torch.nan)
+                graph.replay()
+                for case in cases:
+                    assert_decode_close(case.y, decode_reference(case.x, case.wd, case.wu),
+                                        'Total graph with recorded native workspace')
+                assert len(records) == 4  # Replay does not run the observer or allocate P.
+
+
+    def test_partial_logging_output_option(tmp_path):
+        output = tmp_path / 'samples.jsonl'
+        assert benchmark_options(parse_args([])).output is None
+        assert benchmark_options(parse_args(['--output', str(output)])).output == output
+        assert benchmarking().parse_args(['--output', str(output)]).output == output
+
+
+    @pytest.mark.parametrize('rows,record_partials', ((33, True), (513, True), (33, False)))
+    def test_prefill_total_sample_addresses(monkeypatch, rows, record_partials):
+        import weakref
+        import torch
+
+        bench = benchmarking()
+        prefill = bench.testing()
+        dep = prefill.dependencies()
+        from pyhip.ops.gr_read.flydsl import host
+        x, wd, wu, pd, pu = api_inputs(rows)
+        host.gr_read(x, pd, pu)
+        config = host._prefill_config(rows, torch.cuda.get_device_properties(x.device).multi_processor_count)
+        key = next(k for k in host._compiled_calls if k[0] == x.device.index and k[2] == config)
+        kernels = host._compiled_calls[key]
+        launches, partial_refs, records = [], [], []
+        active_scope = None
+
+        # Exercise sample boundaries without doing performance measurement in pytest.
+        class AccuracyTimer:
+            enable = True
+
+            def __init__(self, name, verbose):
+                self.name, self.latencies = name, []
+
+            def __enter__(self):
+                nonlocal active_scope
+                active_scope = self.name
+
+            def __exit__(self, *args):
+                nonlocal active_scope
+                active_scope = None
+                self.latencies.append(1e-6)
+
+        def observed_kernel(kernel):
+            def launch(*args):
+                if active_scope == 'gr_read_total':
+                    partial = args[3] if len(kernels) == 1 else args[2]
+                    launches.append(bench.address(partial))
+                    partial_refs.append(weakref.ref(partial))
+                return kernel(*args)
+            return launch
+
+        make_record = bench.partial_address_record
+
+        def checked_record(*args):
+            assert active_scope is None, 'build address metadata only after timing'
+            return make_record(*args)
+
+        def unexpected_observer(*args, **kwargs):
+            pytest.fail('console-only prefill must not install a P observer')
+
+        native_empty = torch.empty
+        monkeypatch.setitem(host._compiled_calls, key, tuple(observed_kernel(k) for k in kernels))
+        monkeypatch.setattr(prefill, 'dependencies', lambda: (*dep[:3], AccuracyTimer))
+        monkeypatch.setattr(bench, 'partial_address_record', checked_record)
+        if not record_partials:
+            monkeypatch.setattr(bench, 'observe_partial_allocations', unexpected_observer)
+        args = argparse.Namespace(seed=131, buffers=2, warmup=2, iters=3,
+                                  no_baselines=True, record_partials=record_partials)
+        result = bench.benchmark_prefill_batch(rows, args, records.append)
+        assert result['timed_outputs_bitexact'] and torch.empty is native_empty
+        assert all(ref() is None for ref in partial_refs)
+        buffers = next(r['buffers'] for r in records if r['type'] == 'addresses')
+        samples = [r for r in records if r['type'] == 'sample' and r['scope'] == 'total']
+        assert [r['buffer'] for r in samples] == [0, 1, 0]
+        assert len(launches) == len(samples) * len(kernels)
+        for index, sample in enumerate(samples):
+            assert ('P_total' in sample) == record_partials
+            if not record_partials:
+                continue
+            partial = sample['P_total']
+            assert all(p == partial for p in launches[index * len(kernels):(index + 1) * len(kernels)])
+            assert partial['shape'] == [rows, R] and partial['dtype'] == 'torch.bfloat16'
+            buffer = buffers[sample['buffer']]
+            assert partial['pointer'] != buffer['P_stages']['pointer']
+            for name, field in (('X', 'X'), ('WD_packed', 'W_down'), ('WU_packed', 'W_up'), ('Y', 'Y')):
+                assert sample['relative_bytes']['P_minus_' + name] == partial['pointer'] - buffer[field]['pointer']
+        assert not any('P_total' in r for r in records if r.get('scope') in ('down', 'up'))
+        json.dumps(records)
 
 
     def test_api_empty_and_contracts(monkeypatch):

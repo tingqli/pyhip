@@ -7,7 +7,7 @@ and between measurements, followed by the final tables. No result files are
 created unless --output is supplied.
 """
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import cache
 import gc
 import hashlib
@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import warnings
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[3]
 C, H, R = 4, 2560, 320
@@ -119,6 +120,7 @@ def graph_samples(torch, graph, calls, count):
 
 def address(tensor):
     return {'pointer': tensor.data_ptr(), 'storage_offset': tensor.storage_offset(),
+            'storage_base': tensor.untyped_storage().data_ptr(),
             'mod256': tensor.data_ptr() % 256, 'mod4096': tensor.data_ptr() % 4096,
             'shape': list(tensor.shape), 'dtype': str(tensor.dtype)}
 
@@ -222,6 +224,55 @@ class Case:
         return self.p if scope == 'down' else self.y
 
 
+@contextmanager
+def observe_partial_allocations(shape, dtype, device):
+    """Temporarily observe native allocations, retaining only address integers."""
+    import torch
+    native_empty = torch.empty
+    partials = []
+
+    def observed_empty(*args, **kwargs):
+        tensor = native_empty(*args, **kwargs)
+        if tensor.device == device and tensor.dtype == dtype and tuple(tensor.shape) == shape:
+            # No tensor/storage references, metadata dictionaries or GPU work.
+            partials.append((tensor.data_ptr(), tensor.untyped_storage().data_ptr(),
+                             tensor.storage_offset()))
+        return tensor
+
+    with patch.object(torch, 'empty', observed_empty):
+        yield partials
+
+
+def partial_address_record(partials, shape, dtype, x, packed_down, packed_up, output):
+    """Build JSON metadata after the call; eager callers must finish timing first."""
+    if len(partials) != 1:
+        raise RuntimeError(f'expected one Total P allocation, observed {len(partials)}')
+    pointer, storage_base, storage_offset = partials[0]
+    return {'P_total': {'pointer': pointer, 'storage_base': storage_base,
+                        'storage_offset': storage_offset, 'mod256': pointer % 256,
+                        'mod4096': pointer % 4096, 'shape': list(shape), 'dtype': str(dtype)},
+            'relative_bytes': {'P_minus_' + name: pointer - tensor.data_ptr()
+                               for name, tensor in (('X', x), ('WD_packed', packed_down),
+                                                    ('WU_packed', packed_up), ('Y', output))}}
+
+
+def capture_total_call(case, buffer_index, buffer_count, records):
+    """Observe the native P allocation only during this Total graph call."""
+    torch = case.torch
+    if not torch.cuda.is_current_stream_capturing():
+        return case.run('total')
+    shape = (4 * case.rows * R,)
+    with observe_partial_allocations(shape, torch.float32, case.x.device) as partials:
+        output = case.run('total')
+    call_index = len(records)
+    records.append({'call_index': call_index, 'pass_index': call_index // buffer_count,
+                    'buffer': buffer_index,
+                    'logical_shape': [4, case.rows, R],
+                    **partial_address_record(partials, shape, torch.float32,
+                                             case.x, case.pd, case.pu, case.y)})
+    return output
+
+
 def output_check(torch, actual, expected, label):
     torch.testing.assert_close(actual.double(), expected.double(), rtol=1e-2, atol=5e-3,
                                msg=label)
@@ -284,15 +335,24 @@ def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
             stage_errors.append(decode_stage_check(c))
         (c.saved_p, c.saved_y, c.saved_baseline) = (c.p.clone(), c.y.clone(), c.baseline_y.clone() if c.baseline_y is not None else None)
     graphs = {}
+    total_calls = []
     for scope in scopes:
-        calls = [lambda c=c, scope=scope: c.run(scope) for c in cases]
+        if scope == 'total' and args.record_partials:
+            calls = [lambda c=c, bi=bi: capture_total_call(c, bi, len(cases), total_calls)
+                     for bi, c in enumerate(cases)]
+        else:
+            calls = [lambda c=c, scope=scope: c.run(scope) for c in cases]
         graphs[scope] = check.capture(calls + calls)
         graphs[scope].replay()
         check_timed(cases, scope)
+    if args.record_partials:
+        assert len(total_calls) == 2 * len(cases), 'record every Total call in both graph passes'
     emit({'type': 'correctness', 'phase': 'initial', 'rows': rows, 'pairs': len(pairs), 'fp64_passed': True, 'isolated_down_max_abs': stage_errors, 'isolated_up_fp64_passed': bool(stage_errors)})
-    emit({'type': 'addresses', 'rows': rows, 'total_entry': 'gr_read',
-          'total_partial': 'allocated internally for each call; P_stages is only used by stage measurements',
-          'buffers': [{k: address(v) for (k, v) in (('X', c.x), ('WD_raw', c.wd), ('WU_raw', c.wu), ('WD_packed', c.pd), ('WU_packed', c.pu), ('P_stages', c.p), ('Y', c.y), ('Baseline_WD', c.baseline_wd), ('Baseline_WU', c.baseline_wu), ('Baseline_Y', c.baseline_y)) if v is not None} for c in cases]})
+    if args.record_partials:
+        emit({'type': 'addresses', 'rows': rows, 'total_entry': 'gr_read',
+              'total_partial': 'actual capture allocations in total_calls; P_stages belongs to Down/Up stage graphs',
+              'total_calls': total_calls,
+              'buffers': [{k: address(v) for (k, v) in (('X', c.x), ('WD_raw', c.wd), ('WU_raw', c.wu), ('WD_packed', c.pd), ('WU_packed', c.pu), ('P_stages', c.p), ('Y', c.y), ('Baseline_WD', c.baseline_wd), ('Baseline_WU', c.baseline_wu), ('Baseline_Y', c.baseline_y)) if v is not None} for c in cases]})
     torch.cuda.synchronize()
     values = {scope: [] for scope in scopes}
     for round_index in range(args.rounds):
@@ -350,7 +410,7 @@ def benchmark_prefill_batch(rows, args, emit):
             um, un = reader.up_config
             partial, output = reader.partial, reader.output
             addresses.append({name: tensor_address(tensor, output=name == "Y") for name, tensor in zip(
-                ("X", "W_down", "W_up", "P", "Y"),
+                ("X", "W_down", "W_up", "P_stages", "Y"),
                 (input_x, reader.w_down, reader.w_up, partial, output))})
             calls["down"].append(lambda x=input_x, r=reader: r.run_down(x))
             calls["up"].append(lambda x=input_x, r=reader: r.run_up(x))
@@ -377,7 +437,7 @@ def benchmark_prefill_batch(rows, args, emit):
                     ("Torch_Y_prepared", torch_outputs[bi]))})
         assert all(len({row[name]["pointer"] for row in addresses}) == args.buffers for name in addresses[0])
         emit({"type": "addresses", "rows": rows, "buffers": addresses,
-              "total_entry": "gr_read", "total_partial": "internal allocation; P refers to the stage workspace"})
+              "total_entry": "gr_read", "total_partial": "actual allocations recorded as P_total on each Total sample; P_stages belongs to stage measurements"})
         for scope in scopes:
             for index in range(args.warmup): calls[scope][index % args.buffers]()
         torch.cuda.synchronize()
@@ -390,10 +450,21 @@ def benchmark_prefill_batch(rows, args, emit):
                 raise RuntimeError("CUDAPERF disables GRRead timing")
             for index in range(args.iters):
                 bi = index % args.buffers
-                with perf: actual = calls[scope][bi]()
+                partials = None
+                if scope == 'total' and args.record_partials:
+                    # Install/remove the observer outside the original timer.
+                    # Only raw address integers are collected inside the call.
+                    with observe_partial_allocations((rows, R), torch.bfloat16, inputs[bi].device) as partials:
+                        with perf: actual = calls[scope][bi]()
+                else:
+                    with perf: actual = calls[scope][bi]()
                 us = perf.latencies[-1] * 1e6
                 assert math.isfinite(us) and us > 0
                 record = {"scope": scope, "sample": index, "buffer": bi, "us": us}
+                if partials is not None:
+                    reader = readers[bi]
+                    record.update(partial_address_record(partials, (rows, R), torch.bfloat16,
+                                                         inputs[bi], reader.w_down, reader.w_up, actual))
                 if scope == "torch_compile":
                     torch_outputs[bi] = actual
                     record["output_address"] = tensor_address(actual)
@@ -583,7 +654,8 @@ def run_decode(args, emit):
     local = SimpleNamespace(phase='decode', gpu=args.gpu, seed=args.decode_seed,
                             weights=args.decode_weights, rounds=args.decode_rounds,
                             samples=args.decode_samples, warmup=2,
-                            amd_smi=args.amd_smi, verbose=args.verbose)
+                            amd_smi=args.amd_smi, verbose=args.verbose,
+                            record_partials=args.output is not None)
     runtime = 'PyHIP runtime' if args.no_baselines else 'PyHIP and frozen baselines'
     print(f"\nDecode: {len(args.decode_rows)} batches, {local.weights} weight pairs, "
           f"{local.rounds}x{local.samples} Graph samples/scope. Loading {runtime}...", flush=True)
@@ -602,7 +674,8 @@ def run_decode(args, emit):
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
           'gpu': props.name, 'arch': props.gcnArchName, 'compute_units': props.multi_processor_count,
           'protocol': {'weights': local.weights, 'rounds': local.rounds, 'samples': local.samples,
-                       'seed': local.seed, 'graph_passes': 2, 'replays_per_sample': 3, 'mode': 'cuda_graph'},
+                       'seed': local.seed, 'graph_passes': 2, 'replays_per_sample': 3, 'mode': 'cuda_graph',
+                       'record_total_partials': local.record_partials},
           'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
           'baseline': None if args.no_baselines else prefill.baseline_modules().metadata(),
           'settings_written': False})
@@ -628,13 +701,15 @@ def run_prefill(args, emit, *, check=True):
     prefill = testing()
     local = SimpleNamespace(gpu=args.gpu, seed=args.prefill_seed, buffers=args.prefill_buffers,
                             warmup=args.prefill_warmup, iters=args.prefill_iters,
-                            amd_smi=args.amd_smi, verbose=args.verbose, no_baselines=args.no_baselines)
+                            amd_smi=args.amd_smi, verbose=args.verbose, no_baselines=args.no_baselines,
+                            record_partials=args.output is not None)
     print(f"\nPrefill: {len(args.prefill_rows)} batches, {local.buffers} buffers, "
           f"{local.warmup} warmup calls, {local.iters} eager samples/scope. Loading runtime...", flush=True)
     torch, _, _, _ = prefill.dependencies()
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
           'protocol': {'buffers': local.buffers, 'warmup': local.warmup, 'iters': local.iters,
-                       'seed': local.seed, 'scope_order': list(TIMING_SCOPES[:-1] if args.no_baselines else TIMING_SCOPES), 'mode': 'eager'},
+                       'seed': local.seed, 'scope_order': list(TIMING_SCOPES[:-1] if args.no_baselines else TIMING_SCOPES), 'mode': 'eager',
+                       'record_total_partials': local.record_partials},
           'baseline': None if args.no_baselines else prefill.baseline_modules().metadata(),
           'settings_written': False})
     # Keep the original prefill flow: all selected correctness checks before timing.

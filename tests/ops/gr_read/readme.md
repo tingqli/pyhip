@@ -150,11 +150,13 @@ python3 tests/ops/gr_read/bench_gr_read_compare.py --gpu 3 \
 
 默认使用 [baselines.py](baselines.py) 中固定的 Torch compile / Triton 对照，环境不需要安装 SGLang，也不会探测或读取外部 checkout。`--sglang-root` 和 `--no-sglang` 已移除；`--no-baselines` 跳过 decode 和 prefill 两阶段的性能对照，相关表格显示 `—`，独立精度参考仍运行。对照所需的 PyTorch/Triton 依赖缺失会正常报错，不静默更换实现。
 
-`--check-only` 或单独指定 `--scope down/up/total` 时只做精度检查；pytest 也只检查正确性。精度失败会在进入性能阶段前停止。性能采样继续复用 `bench_gr_read_compare.py`：decode 精度默认为 2 对权重 / seed303，性能仍为 100 对权重 / seed707；`test_gr_read.py` 的 `--decode-weights` / `--decode-seed` 只作用于精度。需要调整性能采样参数时使用单独的 benchmark 入口。显式提供 `--output` 时，同一 JSONL 用 `stage=accuracy/performance` 区分默认流程的两部分记录。
+`--check-only` 或单独指定 `--scope down/up/total` 时只做精度检查；pytest 也只检查正确性。精度失败会在进入性能阶段前停止。性能采样继续复用 `bench_gr_read_compare.py`：decode 精度默认为 2 对权重 / seed303，性能仍为 100 对权重 / seed707；`test_gr_read.py` 的 `--decode-weights` / `--decode-seed` 只作用于精度。需要调整性能采样参数时使用单独的 benchmark 入口。显式提供 `--output` 时，同一 JSONL 用 `stage=accuracy/performance` 区分默认流程的两部分记录。两个入口都仅在提供 `--output` 时采集 Total 内部 P 的地址；普通 `python3 tests/ops/gr_read/test_gr_read.py --gpu 2` 不安装这些观察器，继续原来的纯打印测量流程。
 
 包含性能测量的运行只在**整次启动时检查一次硬件**，位于正确性测试、GPU buffer 准备与预热之前；decode/prefill 切换、各 batch 和结束时不再查询或判断空闲，避免 `rocm-smi` 滞后的利用率包含本次测试自身的活动。入口默认静置 2 秒，独立 benchmark 的 `--settle-seconds` 只调整这一次等待。GPU use≤5%、VRAM≤20% 仍为入口条件，失败立即停止，不重试；纯精度运行不做硬件检查。PTL Enabled/VECTOR,F8 作为已验证环境的提示，状态或格式不同只发 warning；查询失败仍正常报错。显式提供 `--output` 时保存一条 `phase=setup`、`event_phase=entry`、`hardware_policy=entry_only` 的原始快照，prefill result 不再包含逐 batch 的 `hardware_before*` / `hardware_after` 字段。入口快照只描述启动状态，不能证明整个测量期间独占 GPU。
 
 Benchmark 的 prefill 表分别测 Down、Up、Total 和 Torch compile 完整调用。使用原 `cudaPerf`，默认 10 组独立 buffer、各阶段 2 次预热、10 个样本取中位数；保留逐阶段采样顺序，Torch compile 接在 Total 后面。这张表使用各阶段整组样本的中位数，不是交错 A/B 测量。Total 直接调用 `gr_read(..., output=预分配的Y)`，P 由函数内部申请；Down/Up 单阶段仍使用准备对象的 P。两者工作区地址可能不同，不能用阶段中位数之和代替 Total。权重打包、对象构造、首次编译、参考与校验不计时。没有修改设备设置或剔除长尾。
+
+Prefill 的地址表用 `P_stages` 标识 `reader.partial`。启用 `--output` 后，每条 `scope=total` 的 `sample` 另存当次原生申请的 BF16 `[T,320]` `P_total`，包含 pointer、storage base/offset、mod256/mod4096、shape、dtype，以及相对 X、packed Down/Up 权重、Y 的 `relative_bytes`；通过 `sample` 和 `buffer` 下标关联到这次真实计时调用，不以预热地址代替。观察器在原 `cudaPerf` 上下文外安装/卸载，调用内只收集地址整数，完整元数据和 JSON 在计时结束后生成，不保留 tensor/storage 引用。Eager 采样中的地址读取仍有少量 CPU 工作，导出模式不承诺零观察开销；环境记录的 `protocol.record_total_partials` 标明是否开启。纯打印模式不执行这部分采集。
 
 表格新增 `Torch compile us / TFLOPS` 和 `Speedup`，其中 **Speedup = Torch compile Total / PyHIP Total**，大于 1 表示 PyHIP 更快；显式传入 `--output` 时，结果及全部样本写入 JSONL。默认显示阶段初始化、逐 batch 准备/检查/时延进度，最后打印两张完整表，不自动创建结果文件或目录。进度实时刷新，均在计时区间外；`--verbose` 可额外显示硬件和详细正确性信息。TFLOPS 两边都按 `4*T*10240*320` 的有效 GEMM 工作量计算。
 
@@ -174,10 +176,14 @@ T48–512 的正式优化前后对照已在 30 档、普通调用下验证：选
 
 `test_gr_read.py` 同时检查准备对象和 `gr_read()`。Decode 的 6528 次 Graph replay 每次包含两种完整调用，比较相同 T 的输出逐位一致；另有按需编译、跨权重缓存、默认输出生命周期、Graph 工作区污染/guard、空输入、契约检查及 stream/device 回归。
 固定对照独立化后，全量 pytest 为 67 项，其中新增 11 项检查原始权重副本、框架独立性、Torch/Triton 精度和 counter 的 Graph replay 行为。
+Total Graph 地址记录另有 2 项定向回归（T1、T17）：核对捕获时记录的 P 与实际 kernel 参数一致、两轮调用对应正确、记录不持有 P tensor 引用，以及改变输入后的 replay 精度。
+Prefill 地址记录另检查 T33、T513 的实际 launcher 参数、每个 Total 样本的对应关系及计时外元数据组装；同时检查纯打印不安装观察器，以及统一 CLI 正确传递 `--output`。相关测试只验证正确性和记录流程，不在 pytest 中进行性能测量。
 
 ```bash
 HIP_VISIBLE_DEVICES=2,3 python3 -m pytest -q tests/ops/gr_read/test_gr_read.py -k test_api
 HIP_VISIBLE_DEVICES=2 python3 -m pytest -q tests/ops/gr_read/test_gr_read.py -k baseline
+HIP_VISIBLE_DEVICES=2 python3 -m pytest -q tests/ops/gr_read/test_gr_read.py -k test_decode_total_graph_addresses
+HIP_VISIBLE_DEVICES=2 python3 -m pytest -q tests/ops/gr_read/test_gr_read.py -k 'test_prefill_total_sample_addresses or test_partial_logging_output_option'
 python3 tests/ops/gr_read/test_gr_read.py --gpu 2 --phase decode --rows 1 12 17 24 28 32 --check-only
 ```
 
@@ -230,6 +236,14 @@ python3 tests/ops/gr_read/bench_gr_read_compare.py \
 ```
 
 Decode 对照保持原 PR 中的 100 组独立权重工作集、buffer 准备、capture、计时器和检查流程：图内依次执行所有实例两轮，每个样本 replay 三次，Event 时间除以 600；3 轮 × 7 个样本全部保留并取中位数。Packing、编译和参考不计时。原独立 Total 基准的计时核心保留在 benchmark 文件的 `benchmark_decode_total()` 中供回归使用，默认不额外输出第三张表。
+
+Decode 的 `addresses` JSON 记录同时保留分阶段和 Total Graph 的真实工作区地址：`buffers[i].P_stages` 是 Down/Up 单独测量使用的准备对象 P；`total_calls` 则逐次记录 Total Graph 捕获期间 `gr_read()` 原生申请的内部 P。默认 100 组 buffer、图内两轮，共 200 条 Total 调用记录：
+
+- `call_index` 为图内调用顺序（从 0 开始），`pass_index` 为图内第 0/1 轮，`buffer` 对应 `buffers` 数组下标。
+- `P_total` 包含实际指针、storage base/offset、地址模 256/4096、物理 shape 和 dtype；`logical_shape` 为 decode 的 `[4,T,320]`。
+- `relative_bytes` 记录有符号字节差 `P_minus_X`、`P_minus_WD_packed`、`P_minus_WU_packed`、`P_minus_Y`，便于比较实际工作区布局。
+
+每次捕获调用分别记录，允许原生分配器复用地址，不要求 200 个不同指针。仅在启用 `--output` 时，采集在 Total capture 的该次调用内观察原生分配，只保存数值，不保存 tensor/storage 引用，不改变 P 分配或增加 GPU 操作；预热与计时 replay 不采集。Replay 使用捕获时的地址。纯打印模式直接捕获原调用，不启用地址观察器。旧 JSON 未记录的 Total P 地址无法通过 `P_stages` 推导，不事后补写历史记录。
 
 固定对照在本机 gfx942、显式非确定性模式下，T1–16 为 Triton persistent，T17–32 为 Torch compile；两边均使用原 decode Graph 协议。表中列出实际后端，独立于 prefill 表。X 和逻辑权重值相同，物理权重 buffer 按各自布局独立准备。Triton counter 在同一设备的串行调用间共享，测试不并发执行这些基线。
 
