@@ -47,6 +47,60 @@ the corresponding compiler requirements.
 For an existing editable installation from the old layout, reinstall it so it
 points to the package under [src/pyhip](src/pyhip).
 
+### Validate against an Aiter ref
+
+[scripts/validate_aiter.sh](scripts/validate_aiter.sh) accepts an Aiter branch,
+tag, or commit and tests it against the current PyHIP working tree:
+
+```bash
+# Default suite, then an activated debug shell
+bash scripts/validate_aiter.sh main
+
+# A tag and a focused test; pytest arguments follow --
+bash scripts/validate_aiter.sh v0.1.12.post1 -- -q -k test_aiter_signature
+
+# Use refs from an existing clone without changing that checkout
+bash scripts/validate_aiter.sh --repo /path/to/aiter COMMIT_SHA
+
+# Noninteractive run; optionally choose the outer Python and a new work directory
+bash scripts/validate_aiter.sh --python /path/to/python3 \
+        --work-dir /path/to/new-run --no-shell main -- -q
+
+# remove test environment
+rm -rf -- /root/.cache/pyhip/aiter-envs/run.zDkPok
+```
+
+- **Torch is reused**, not downloaded or reinstalled, from `python3` on the
+    calling shell's `PATH` (or `--python`). That interpreter must already have
+    ROCm Torch; ROCm, its compiler, Git, and Python venv support must also be
+    available. Incompatible Torch requirements fail instead of replacing Torch.
+- The new venv shares outer site packages as fallbacks, including when the
+    outer Python is itself in a venv. This is not a fully isolated dependency
+    environment. Compatible installed dependencies may be reused; new installs
+    stay in the new venv.
+- Aiter is cloned separately, checked out at the resolved commit, and its
+    submodules and declared build/runtime dependencies are installed. **FlyDSL's
+    version comes only from that Aiter ref**; the runner adds no independent
+    FlyDSL version. The ref's Triton installer runs when present. Aiter and the
+    current PyHIP checkout are installed editable, including local PyHIP edits.
+- Pytest runs from this repository root and honors [pytest.ini](pytest.ini).
+    The venv, Aiter checkout, separate compilation caches, activation script,
+    and exit-status summary are retained in the printed run directory. By
+    default this is a unique directory under `~/.cache/pyhip/aiter-envs`;
+    `--work-dir` must name a directory that does not yet exist.
+- Success or failure opens an activated **child Bash** when a terminal is
+    available. It starts in PyHIP without reading the user's Bash startup file.
+    `exit` returns to the original shell without activating the parent. Use the
+    printed `source` command to reopen the same environment and caches later.
+    `--no-shell` or noninteractive input skips the child shell. After it exits,
+    the runner returns the installation/pytest status, not the debug shell's
+    status.
+
+Environments are not automatically deleted. Allow disk space for dependency
+wheels, submodules, and cold compilation. An old Aiter ref may genuinely be
+incompatible with the current Python, Torch, ROCm, GPU, or PyHIP; the script
+retains failures for debugging rather than changing tests to pass.
+
 ## Using installed kernels
 
 Choose the implementation explicitly. Packaged kernels do not require imports

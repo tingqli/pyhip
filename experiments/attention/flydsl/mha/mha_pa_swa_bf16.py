@@ -15,6 +15,7 @@ import flydsl.expr as fx
 from flydsl.expr import as_ir_value, gpu, rocdl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 try:
     from ._dsl import select, rmem, resource, wait
@@ -101,7 +102,7 @@ def _mma(k, arch):
 
 def _load(resource, voffset, soffset, words=4):
     return fx.Vector(rocdl.raw_ptr_buffer_load(ir.VectorType.get([words], fx.Int32.ir_type), as_ir_value(resource),
-                                              fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(), fx.Int32(0).ir_value()))
+                                              fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(), aux=rocdl_aux(0)))
 
 
 def _resource(tensor, size):

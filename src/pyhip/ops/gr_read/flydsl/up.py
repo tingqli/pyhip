@@ -14,7 +14,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from pyhip.codegen.flydsl.helpers import cvt_f32_to_bf16
+from pyhip.codegen.flydsl.helpers import cvt_f32_to_bf16, rocdl_aux
 
 from .common import C as HC, H, H as HS, K, R
 from .helpers import (
@@ -46,13 +46,13 @@ def _load_nt(resource, address, scalar_offset=0, words=4):
     value = rocdl.RawPtrBufferLoadOp(
         fx.Int32.ir_type if words == 1 else ir.VectorType.get([words], fx.Int32.ir_type), resource,
         address.ir_value(), fx.Int32(scalar_offset).ir_value(),
-        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 2)).result
+        aux=rocdl_aux(2)).result
     return fx.Int32(value) if words == 1 else fx.Vector(value)
 
 
 def _store_nt(resource, address, values, scalar_offset=0):
     rocdl.RawPtrBufferStoreOp(values.ir_value(), resource, address.ir_value(),
-        fx.Int32(scalar_offset).ir_value(), aux=ir.IntegerAttr.get(fx.Int32.ir_type, 2))
+    fx.Int32(scalar_offset).ir_value(), aux=rocdl_aux(2))
 
 
 def _pack_y_from_mean(v0, v1):

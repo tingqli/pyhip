@@ -417,7 +417,7 @@ def _build_moe_gemm2_1x4(
                         scale_global_rsrc,
                         scale_byte_offset.ir_value(),
                         fx.Int32(0).ir_value(),
-                        aux=fx.Int32(0).ir_value(),
+                        aux=fxh.rocdl_aux(0),
                     ).result
                 )
                 return scale_vec
@@ -590,7 +590,7 @@ def _build_moe_gemm2_1x4(
                         output_store_rsrc,
                         byte_offsets[0].ir_value(),
                         fx.Int32(0).ir_value(),
-                        aux=fx.Int32(_store_cache).ir_value(),
+                        aux=fxh.rocdl_aux(_store_cache),
                     )
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
                     fx.rocdl.RawPtrBufferStoreOp(
@@ -598,7 +598,7 @@ def _build_moe_gemm2_1x4(
                         output_store_rsrc,
                         byte_offsets[1].ir_value(),
                         fx.Int32(0).ir_value(),
-                        aux=fx.Int32(_store_cache).ir_value(),
+                        aux=fxh.rocdl_aux(_store_cache),
                     )
 
                 for row_pair in range_constexpr(4):
@@ -699,7 +699,7 @@ def _build_moe_gemm2_1x4(
                             output_store_rsrc,
                             byte_offsets[0].ir_value(),
                             fx.Int32(0).ir_value(),
-                            aux=fx.Int32(_store_cache).ir_value(),
+                            aux=fxh.rocdl_aux(_store_cache),
                         )
                         fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
                         fx.rocdl.RawPtrBufferStoreOp(
@@ -707,7 +707,7 @@ def _build_moe_gemm2_1x4(
                             output_store_rsrc,
                             byte_offsets[1].ir_value(),
                             fx.Int32(0).ir_value(),
-                            aux=fx.Int32(_store_cache).ir_value(),
+                            aux=fxh.rocdl_aux(_store_cache),
                         )
 
             use_delayed_4wave_store = BLOCK_K == 128 and nBK == 2
@@ -800,10 +800,11 @@ def _build_moe_gemm2_1x4(
                 previous_fragC.fill(0)
 
             delayed_output_state_index = 2 if weight_quant_type == "ptpc" else 1
+            # Keep FP8 out of SCF loop state for FlyDSL 0.3.4.1 legalization.
             if const_expr(weight_quant_type == "ptpc"):
-                loop_state = [frag_weight.load(), frag_pc_scale.load()]
+                loop_state = [frag_weight.load().bitcast(fx.Int8), frag_pc_scale.load()]
             else:
-                loop_state = [frag_weight.load()]
+                loop_state = [frag_weight.load().bitcast(fx.Int8)]
             if const_expr(use_delayed_4wave_store):
                 loop_state.append(previous_fragC.load())
             for block_n, state in range(
@@ -813,7 +814,7 @@ def _build_moe_gemm2_1x4(
                 init=loop_state,
             ):
                 # Restore the next weight/scale and any delayed output tile.
-                frag_weight_slots[0].store(state[0])
+                frag_weight_slots[0].store(state[0].bitcast(weight_dtype))
                 if const_expr(weight_quant_type == "ptpc"):
                     frag_pc_scale.store(state[1])
                 if const_expr(use_delayed_4wave_store):
@@ -839,11 +840,11 @@ def _build_moe_gemm2_1x4(
 
                 if const_expr(weight_quant_type == "ptpc"):
                     next_state = [
-                        frag_weight_slots[nBK % 2].load(),
+                        frag_weight_slots[nBK % 2].load().bitcast(fx.Int8),
                         next_frag_pc_scale.load(),
                     ]
                 else:
-                    next_state = [frag_weight_slots[nBK % 2].load()]
+                    next_state = [frag_weight_slots[nBK % 2].load().bitcast(fx.Int8)]
                 if const_expr(use_delayed_4wave_store):
                     next_state.append(fragC.load())
                 results = yield next_state

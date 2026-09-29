@@ -15,6 +15,7 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, rocdl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 
 BM, BN, DV, THREADS = 256, 64, 128, 512
@@ -169,7 +170,7 @@ def _buffer(tensor, elements):
 def _global_words(resource, voffset, soffset, count=4):
     return fx.Vector(rocdl.raw_ptr_buffer_load(ir.VectorType.get([count], fx.Int32.ir_type),
                                               resource, fx.Int32(voffset).ir_value(),
-                                              fx.Int32(soffset).ir_value(), fx.Int32(0).ir_value()))
+                                              fx.Int32(soffset).ir_value(), aux=rocdl_aux(0)))
 
 
 def _lds_words(storage, base, immediate=0):

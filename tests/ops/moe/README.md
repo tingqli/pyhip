@@ -12,8 +12,10 @@
 
 当前基准为 FlyDSL 0.3.0 和 Aiter `cdfd46fcd`，直接使用 SiTUv2、原生 buffer
 描述符、命名 waitcnt 和 autotune artifact，不再提供旧版接口回退。
-Aiter 的 `moe_sorting` / `fused_moe` 仍无 `output` 参数，因此保留输出清零/复制适配；
-非空 `stage2_scatter` 仍明确拒绝。硬件架构限制与软件版本无关，继续保留对应跳过规则。
+为兼容尚无 `output` 参数的 Aiter，保留 `moe_sorting` / `fused_moe` 的输出清零/复制适配。
+`stage2_scatter` 和三项激活量化参数按原生签名转发；旧版不支持的 `None` 默认值会被移除，
+显式非 `None` 值仍由原生 Aiter 报错，不会被静默忽略。
+硬件架构限制与软件版本无关，继续保留对应跳过规则。
 
 ## 运行与选择
 

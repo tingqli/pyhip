@@ -27,6 +27,8 @@ from flydsl._mlir.dialects import fly as _fly
 # These vector operations feed the SSA-returning MFMA atom boundary directly.
 from flydsl._mlir.dialects import vector
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
+
 SORT_BLOCK_M = 256
 TOKEN_MASK = 0xFFFFFF
 A_INPUT_SCALE = 0.33
@@ -587,7 +589,7 @@ def compile_moe_gateup_4w(
         )
         expert_i32 = fx.Int32(
             rocdl.raw_ptr_buffer_load(
-                T.i32, expert_rsrc, expert_block_i32 * 4, fx.Int32(0)
+                T.i32, expert_rsrc, expert_block_i32 * 4, fx.Int32(0), aux=rocdl_aux(0)
             )
         )
         expert_i32 = fx.Int32(rocdl.readfirstlane(T.i32, arith._to_raw(expert_i32)))
@@ -616,7 +618,7 @@ def compile_moe_gateup_4w(
         )
 
         num_valid_i32 = fx.Int32(
-            rocdl.raw_ptr_buffer_load(T.i32, valid_rsrc, fx.Int32(0), fx.Int32(0))
+            rocdl.raw_ptr_buffer_load(T.i32, valid_rsrc, fx.Int32(0), fx.Int32(0), aux=rocdl_aux(0))
         )
 
         # mma_atom 生成的tile 可以用来slice A, B,
@@ -786,7 +788,7 @@ def compile_moe_gateup_4w(
                 )
                 sorted_row = expert_block_i32 * SORT_BLOCK_M + fx.Int32(row_local)
                 fused_id = rocdl.raw_ptr_buffer_load(
-                    T.i32, sorted_rsrc, sorted_row * 4, fx.Int32(0)
+                    T.i32, sorted_rsrc, sorted_row * 4, fx.Int32(0), aux=rocdl_aux(0)
                 )
                 token_ids.append(arith.andi(fused_id, mask24))
             return token_ids
@@ -813,7 +815,7 @@ def compile_moe_gateup_4w(
                         (
                             sorted_row,
                             rocdl.raw_ptr_buffer_load(
-                                T.i32, sorted_rsrc, sorted_row * 4, fx.Int32(0)
+                                T.i32, sorted_rsrc, sorted_row * 4, fx.Int32(0), aux=rocdl_aux(0)
                             ),
                         )
                     )
@@ -844,7 +846,7 @@ def compile_moe_gateup_4w(
                     voffsets[copy_round],
                     tile_soffset,
                     fx.Int32(0),
-                    fx.Int32(0),
+                    aux=rocdl_aux(0),
                 )
 
         # B: AC: 2 x buffer_load_dwordx4 lds
@@ -919,7 +921,7 @@ def compile_moe_gateup_4w(
                     voffsets[copy_round],
                     tile_soffset,
                     fx.Int32(0),
-                    fx.Int32(0),
+                    aux=rocdl_aux(0),
                 )
 
         scale_lane_id = tid % 64
@@ -980,7 +982,7 @@ def compile_moe_gateup_4w(
                 voffset,
                 fx.Int32((kk // 2) * 256),
                 fx.Int32(0),
-                fx.Int32(0),
+                aux=rocdl_aux(0),
             )
 
         def raw_a_scale_g2s(kk, ptr, voffset):
@@ -991,7 +993,7 @@ def compile_moe_gateup_4w(
                 voffset,
                 fx.Int32((kk // 2) * 256),
                 fx.Int32(0),
-                fx.Int32(0),
+                aux=rocdl_aux(0),
             )
 
         # 4xds_read_128
@@ -1592,7 +1594,7 @@ def compile_moe_gateup_4w(
                         c_rsrc,
                         byte_offset.ir_value(),
                         fx.Int32(0).ir_value(),
-                        aux=ir.IntegerAttr.get(T.i32, 0),
+                        aux=rocdl_aux(0),
                     )
 
         if const_expr(epilogue_overlap):

@@ -1,8 +1,16 @@
-"""补齐当前 Aiter 尚未提供的 caller-owned output 接口。"""
+"""兼容不同 Aiter 版本的 MoE 参数和 caller-owned output。"""
 
 from functools import wraps
+from inspect import signature
 
 from aiter.fused_moe import fused_moe as _fused_moe, moe_sorting as _moe_sorting
+
+
+_fused_moe_parameters = signature(_fused_moe).parameters
+_unsupported_kwargs = tuple(
+    name for name in ("stage2_scatter", "quant_type_a", "quant_dtype_a", "quant_dtype_a2")
+    if name not in _fused_moe_parameters
+)
 
 
 @wraps(_moe_sorting)
@@ -17,9 +25,11 @@ def moe_sorting(*args, output=None, **kwargs):
 
 
 @wraps(_fused_moe)
-def fused_moe(*args, output=None, stage2_scatter=None, **kwargs):
-    if stage2_scatter is not None:
-        raise NotImplementedError("installed Aiter fused_moe does not support stage2_scatter")
+def fused_moe(*args, output=None, **kwargs):
+    # Only omit unsupported defaults; explicit values still reach Aiter and fail.
+    for name in _unsupported_kwargs:
+        if kwargs.get(name) is None:
+            kwargs.pop(name, None)
     result = _fused_moe(*args, **kwargs)
     if output is not None:
         if (output.shape != result.shape or output.dtype != result.dtype

@@ -121,7 +121,7 @@ def make_m128_down(*, n, k=256, topk, num_experts, persistent=False):
                 for kb in range_constexpr(2):
                     offset = valid.select((kb * rows + source) * 4, fx.Int32(-1))
                     row_scales[kb * 128 + tid] = fx.Float32(rocdl.raw_ptr_buffer_load(
-                        fx.Float32.ir_type, asrsrc, offset.ir_value(), zero))
+                        fx.Float32.ir_type, asrsrc, offset.ir_value(), zero, aux=fxh.rocdl_aux(0)))
                 if const_expr(not persistent):
                     mask = fx.Uint64(rocdl.ballot(fx.Uint64.ir_type, valid.ir_value()))
                     if lane == 0:
@@ -157,7 +157,7 @@ def make_m128_down(*, n, k=256, topk, num_experts, persistent=False):
                         (dma_base + phase * 16384 + turn * 4096).ir_value())
                     rocdl.raw_ptr_buffer_load_async_lds(wrsrc, dst, fx.Int32(16).ir_value(),
                         dma_offset.ir_value(), (packet_index(q) * 16384 + turn * 4096).ir_value(), zero,
-                        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 16))
+                        aux=fxh.rocdl_aux(16))
 
                 for q in range_constexpr(min(4 if persistent else 3, packets)):
                     for turn in range_constexpr(4):
@@ -214,7 +214,7 @@ def make_m128_down(*, n, k=256, topk, num_experts, persistent=False):
 
                 def store_one(packed, q, record):
                     rocdl.raw_ptr_buffer_store(packed[record].ir_value(), orsrc, out_addresses[record].ir_value(),
-                        (packet_index(q) * 16384).ir_value(), aux=ir.IntegerAttr.get(fx.Int32.ir_type, 18))
+                        (packet_index(q) * 16384).ir_value(), aux=fxh.rocdl_aux(18))
 
                 def store(packed, q):
                     for record in range_constexpr(4):

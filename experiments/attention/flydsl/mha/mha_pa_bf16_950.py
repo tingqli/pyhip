@@ -16,6 +16,7 @@ import flydsl.expr as fx
 from flydsl.expr import as_ir_value, gpu, rocdl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 try:
     from ._dsl import select, rmem, resource, wait
@@ -171,7 +172,7 @@ def _dma(resource, storage, destination, voffset, soffset):
     rocdl.raw_ptr_buffer_load_lds(
         as_ir_value(resource), as_ir_value(fx.to_llvm_ptr(fx.get_iter(storage) + destination)),
         as_ir_value(fx.Int32(16)), as_ir_value(fx.Int32(voffset)), as_ir_value(fx.Int32(soffset)),
-        as_ir_value(fx.Int32(0)), as_ir_value(fx.Int32(0))
+        as_ir_value(fx.Int32(0)), aux=rocdl_aux(0)
     )
 
 
