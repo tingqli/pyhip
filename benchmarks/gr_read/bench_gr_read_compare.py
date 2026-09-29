@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: MIT
 """Print separate decode Graph and prefill eager benchmark tables.
 
-Defaults preserve the two PR #36 protocols. SGLang comparison is optional.
+Defaults preserve the two PR #36 protocols. Frozen test baselines are optional.
 Progress is printed during setup
 and between measurements, followed by the final tables. No result files are
-created unless --output is supplied.
+created unless --output or --md is supplied. See readme.md for integration and
+the measured MI308X performance snapshot.
 """
 import argparse
-import ast
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stdout
+from datetime import datetime, timezone
 from functools import cache
 import gc
 import hashlib
 import importlib.util
+from importlib import metadata as package_metadata
+import io
 import json
 import math
 import os
@@ -24,10 +27,12 @@ import subprocess
 import sys
 import time
 import warnings
+from unittest.mock import patch
 
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / 'src'))
 C, H, R = 4, 2560, 320
-SCOPES = ('down', 'up', 'total', 'sglang')
+SCOPES = ('down', 'up', 'total', 'baseline')
 TIMING_SCOPES = ('down', 'up', 'total', 'torch_compile')
 
 
@@ -41,12 +46,49 @@ def load_file(name, path):
 
 @cache
 def testing():
-    return load_file('gr_read_checks', Path(__file__).with_name('test_gr_read.py'))
+    from pyhip.testing import gr_read
+    if Path(gr_read.__file__).resolve() != REPO / 'src/pyhip/testing/gr_read.py':
+        raise RuntimeError(f'wrong PyHIP checkout: {gr_read.__file__}')
+    return gr_read
 
 
-def dependencies(sglang_root):
+@cache
+def baseline_modules():
+    """Load this checkout's benchmark baseline module in script and pytest import modes."""
+    import importlib.util
+    name = '_pyhip_gr_read_baselines'
+    path = Path(__file__).with_name('baselines.py')
+    if name in sys.modules:
+        module = sys.modules[name]
+        if Path(module.__file__).resolve() != path.resolve():
+            raise RuntimeError('baseline module belongs to a different checkout')
+        return module
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+
+@cache
+def torch_compile_mix():
+    """Full-row performance baseline; independent from the P/Y accuracy reference."""
+    testing().dependencies()
+    return baseline_modules().torch_compiled('prefill')
+
+
+def source_hashes(no_baselines):
+    paths = [Path(__file__), Path(testing().__file__),
+             REPO / 'src/pyhip/ops/gr_read/__init__.py',
+             *(REPO / 'src/pyhip/ops/gr_read/flydsl').glob('*.py')]
+    if not no_baselines:
+        paths.append(Path(__file__).with_name('baselines.py'))
+    return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+
+
+def dependencies(no_baselines=False):
     prefill = testing()
-    prefill.use_checkout_package()
     import torch
     import flydsl.compiler as flyc
     from pyhip.testing import cudaPerf
@@ -56,18 +98,11 @@ def dependencies(sglang_root):
     decode = SimpleNamespace(GRReadDecode=GRReadDecode, prepare_weights=prepare_weights,
                              down_launcher=make_decode_down, up_launcher=make_decode_up)
     check = SimpleNamespace(reference=reference, assert_close=assert_close, make_inputs=make_inputs, capture=capture)
-    if sglang_root is None:
+    if no_baselines:
         return torch, flyc, cudaPerf, decode, check, prefill, None, None
-    source = sglang_root / 'python/sglang/srt/layers/hyperconnection.py'
-    tree = ast.parse(source.read_text())
-    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_mix_compute']
-    if len(functions) != 1: raise RuntimeError('expected one SGLang _mix_compute function')
-    namespace = {'torch': torch, 'F': torch.nn.functional}
-    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), namespace)
-    compiled_mix = torch.compile(namespace['_mix_compute'])
-    sys.path.insert(0, str(sglang_root / 'python'))
-    triton_mix = load_file('gr_compare_sglang_triton', sglang_root / 'python/sglang/srt/layers/hc_mix_triton.py')
-    return torch, flyc, cudaPerf, decode, check, prefill, compiled_mix, triton_mix
+    baselines = baseline_modules()
+    return (torch, flyc, cudaPerf, decode, check, prefill,
+            baselines.torch_compiled('decode'), baselines)
 
 
 def reference(x, w_down, w_up):
@@ -127,6 +162,7 @@ def graph_samples(torch, graph, calls, count):
 
 def address(tensor):
     return {'pointer': tensor.data_ptr(), 'storage_offset': tensor.storage_offset(),
+            'storage_base': tensor.untyped_storage().data_ptr(),
             'mod256': tensor.data_ptr() % 256, 'mod4096': tensor.data_ptr() % 4096,
             'shape': list(tensor.shape), 'dtype': str(tensor.dtype)}
 
@@ -177,13 +213,21 @@ def tensor_address(tensor, *, output=False):
             "mod256": pointer % 256, "mod4096": pointer % 4096}
 
 
-def gate(prefill, args, phase, emit, rows=None):
-    # Fixed before any run: allow this process's own work to leave the SMI window.
-    # One query per gate; failed gates are retained and never retried in this run.
+def benchmark_entry_gate(args, emit):
+    # Check once, before correctness, allocations or warmup. SMI utilization can
+    # lag behind our own GPU work, so it is not an idle gate between batches.
     time.sleep(args.settle_seconds)
     snapshot = read_hardware(args.gpu, args.amd_smi)
-    emit({'type': 'hardware', 'phase': phase, 'rows': rows, **snapshot})
+    emit('setup', {'type': 'hardware', 'event_phase': 'entry',
+                   'hardware_policy': 'entry_only', 'settle_seconds': args.settle_seconds,
+                   **snapshot})
+    print(f"GPU{args.gpu} startup check: use={snapshot['card']['GPU use (%)']}%, "
+          f"VRAM={snapshot['card']['GPU Memory Allocated (VRAM%)']}%; "
+          "hardware checked once before GPU work.", flush=True)
+    if args.verbose:
+        print(snapshot, flush=True)
     validate_hardware(snapshot)
+    return snapshot
 
 
 class Case:
@@ -194,29 +238,82 @@ class Case:
         (self.phase, self.rows, self.prefill) = (args.phase, rows, prefill)
         (pd, pu) = packed if packed is not None else decode.prepare_weights(wd, wu)
         reader = decode.GRReadDecode(rows, pd, pu)
+        from pyhip.ops.gr_read import gr_read
+        self.gr_read = gr_read
         self.reader = reader
         (self.pd, self.pu, self.p, self.y) = (pd, pu, reader.partial, reader.output)
         self.down = flyc.compile(decode.down_launcher(rows), x.view(-1), pd, self.p, torch.cuda.current_stream(x.device))
         self.up = flyc.compile(decode.up_launcher(rows), x.view(-1), pu, self.p, self.y.view(-1), torch.cuda.current_stream(x.device))
-        self.sg_backend = self.sg_call = None
+        self.baseline_backend = self.baseline_call = None
+        self.baseline_wd = self.baseline_wu = None
         if triton_mix is not None:
-            self.sg_backend = 'triton' if triton_mix.fused_hc_mix_supported(x, wd, wu) else 'torch.compile'
-            self.sg_call = triton_mix.fused_hc_mix if self.sg_backend == 'triton' else compiled_mix
-        self.sg_y = None
+            self.baseline_wd, self.baseline_wu = baseline_modules().prepare_weights(wd, wu)
+            self.baseline_backend = 'triton' if triton_mix.fused_hc_mix_supported(x, self.baseline_wd, self.baseline_wu) else 'torch.compile'
+            self.baseline_call = triton_mix.fused_hc_mix if self.baseline_backend == 'triton' else compiled_mix
+        self.baseline_y = None
 
     def run(self, scope):
         torch = self.torch
-        if scope == 'sglang':
-            self.sg_y = self.sg_call(self.x, self.wd, self.wu, 4, 2560)
-            return self.sg_y
+        if scope == 'baseline':
+            self.baseline_y = self.baseline_call(self.x, self.baseline_wd, self.baseline_wu, 4, 2560)
+            return self.baseline_y
         stream = torch.cuda.current_stream(self.x.device)
         if scope == 'down':
             self.down(self.x.view(-1), self.pd, self.p, stream)
         elif scope == 'up':
             self.up(self.x.view(-1), self.pu, self.p, self.y.view(-1), stream)
         else:
-            self.reader(self.x)
+            self.gr_read(self.x, self.pd, self.pu, output=self.y)
         return self.p if scope == 'down' else self.y
+
+
+@contextmanager
+def observe_partial_allocations(shape, dtype, device):
+    """Temporarily observe native allocations, retaining only address integers."""
+    import torch
+    native_empty = torch.empty
+    partials = []
+
+    def observed_empty(*args, **kwargs):
+        tensor = native_empty(*args, **kwargs)
+        if tensor.device == device and tensor.dtype == dtype and tuple(tensor.shape) == shape:
+            # No tensor/storage references, metadata dictionaries or GPU work.
+            partials.append((tensor.data_ptr(), tensor.untyped_storage().data_ptr(),
+                             tensor.storage_offset()))
+        return tensor
+
+    with patch.object(torch, 'empty', observed_empty):
+        yield partials
+
+
+def partial_address_record(partials, shape, dtype, x, packed_down, packed_up, output):
+    """Build JSON metadata after the call; eager callers must finish timing first."""
+    if len(partials) != 1:
+        raise RuntimeError(f'expected one Total P allocation, observed {len(partials)}')
+    pointer, storage_base, storage_offset = partials[0]
+    return {'P_total': {'pointer': pointer, 'storage_base': storage_base,
+                        'storage_offset': storage_offset, 'mod256': pointer % 256,
+                        'mod4096': pointer % 4096, 'shape': list(shape), 'dtype': str(dtype)},
+            'relative_bytes': {'P_minus_' + name: pointer - tensor.data_ptr()
+                               for name, tensor in (('X', x), ('WD_packed', packed_down),
+                                                    ('WU_packed', packed_up), ('Y', output))}}
+
+
+def capture_total_call(case, buffer_index, buffer_count, records):
+    """Observe the native P allocation only during this Total graph call."""
+    torch = case.torch
+    if not torch.cuda.is_current_stream_capturing():
+        return case.run('total')
+    shape = (4 * case.rows * R,)
+    with observe_partial_allocations(shape, torch.float32, case.x.device) as partials:
+        output = case.run('total')
+    call_index = len(records)
+    records.append({'call_index': call_index, 'pass_index': call_index // buffer_count,
+                    'buffer': buffer_index,
+                    'logical_shape': [4, case.rows, R],
+                    **partial_address_record(partials, shape, torch.float32,
+                                             case.x, case.pd, case.pu, case.y)})
+    return output
 
 
 def output_check(torch, actual, expected, label):
@@ -230,8 +327,8 @@ def fp64_check(case, reference):
         end = min(begin + 1024, case.rows)
         expected = reference(case.x[begin:end], case.wd, case.wu)
         output_check(case.torch, case.y[begin:end], expected, 'PyHIP vs FP64')
-        if case.sg_call is not None:
-            output_check(case.torch, case.sg_y[begin:end], expected, 'SGLang vs FP64')
+        if case.baseline_call is not None:
+            output_check(case.torch, case.baseline_y[begin:end], expected, 'frozen baseline vs FP64')
 
 
 def decode_stage_check(case):
@@ -263,7 +360,7 @@ def check_timed(cases, scope):
             c.torch.testing.assert_close(c.y, c.saved_y, rtol=0, atol=0)
         else:
             # SGLang's persistent atomic reduction is not required to be bitexact.
-            output_check(c.torch, c.sg_y, c.saved_sg, 'timed SGLang output')
+            output_check(c.torch, c.baseline_y, c.saved_baseline, 'timed frozen baseline output')
 
 
 def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
@@ -274,22 +371,32 @@ def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
     stage_errors = []
     for (index, c) in enumerate(cases):
         c.run('total')
-        if c.sg_call is not None:
-            c.run('sglang')
+        if c.baseline_call is not None:
+            c.run('baseline')
         fp64_check(c, check.reference)
         if args.phase == 'decode' and index < 2:
             stage_errors.append(decode_stage_check(c))
-        (c.saved_p, c.saved_y, c.saved_sg) = (c.p.clone(), c.y.clone(), c.sg_y.clone() if c.sg_y is not None else None)
+        (c.saved_p, c.saved_y, c.saved_baseline) = (c.p.clone(), c.y.clone(), c.baseline_y.clone() if c.baseline_y is not None else None)
     graphs = {}
+    total_calls = []
     for scope in scopes:
-        calls = [lambda c=c, scope=scope: c.run(scope) for c in cases]
+        if scope == 'total' and args.record_partials:
+            calls = [lambda c=c, bi=bi: capture_total_call(c, bi, len(cases), total_calls)
+                     for bi, c in enumerate(cases)]
+        else:
+            calls = [lambda c=c, scope=scope: c.run(scope) for c in cases]
         graphs[scope] = check.capture(calls + calls)
         graphs[scope].replay()
         check_timed(cases, scope)
+    if args.record_partials:
+        assert len(total_calls) == 2 * len(cases), 'record every Total call in both graph passes'
     emit({'type': 'correctness', 'phase': 'initial', 'rows': rows, 'pairs': len(pairs), 'fp64_passed': True, 'isolated_down_max_abs': stage_errors, 'isolated_up_fp64_passed': bool(stage_errors)})
-    emit({'type': 'addresses', 'rows': rows, 'buffers': [{k: address(v) for (k, v) in (('X', c.x), ('WD_raw', c.wd), ('WU_raw', c.wu), ('WD_packed', c.pd), ('WU_packed', c.pu), ('P', c.p), ('Y', c.y), ('SGLang_Y', c.sg_y)) if v is not None} for c in cases]})
+    if args.record_partials:
+        emit({'type': 'addresses', 'rows': rows, 'total_entry': 'gr_read',
+              'total_partial': 'actual capture allocations in total_calls; P_stages belongs to Down/Up stage graphs',
+              'total_calls': total_calls,
+              'buffers': [{k: address(v) for (k, v) in (('X', c.x), ('WD_raw', c.wd), ('WU_raw', c.wu), ('WD_packed', c.pd), ('WU_packed', c.pu), ('P_stages', c.p), ('Y', c.y), ('Baseline_WD', c.baseline_wd), ('Baseline_WU', c.baseline_wu), ('Baseline_Y', c.baseline_y)) if v is not None} for c in cases]})
     torch.cuda.synchronize()
-    gate(prefill, args, 'before_samples', emit, rows)
     values = {scope: [] for scope in scopes}
     for round_index in range(args.rounds):
         order = scopes if round_index % 2 == 0 else scopes[::-1]
@@ -302,99 +409,105 @@ def benchmark_decode_rows(rows, pairs, args, dep, emit, packed_pairs=None):
         c.x.mul_(0.99).add_(0.015625)
     if graphs:
         graphs['total'].replay()
-        if 'sglang' in graphs:
-            graphs['sglang'].replay()
+        if 'baseline' in graphs:
+            graphs['baseline'].replay()
     else:
         for c in cases:
             c.run('total')
-            if c.sg_call is not None:
-                c.run('sglang')
+            if c.baseline_call is not None:
+                c.run('baseline')
     for c in cases:
         fp64_check(c, check.reference)
     torch.cuda.synchronize()
-    gate(prefill, args, 'after_samples', emit, rows)
     timings = {scope: median(samples) for (scope, samples) in values.items()}
-    result = {'type': 'result', 'rows': rows, 'phase': args.phase, 'mode': 'cuda_graph' if graphs else 'eager', 'sglang_backend': cases[0].sg_backend, 'median_us': timings, 'speedup_total': timings['sglang'] / timings['total'] if 'sglang' in timings else None, 'changed_input_fp64_passed': True, 'effective_tflops': {s: (2 if s in ('down', 'up') else 4) * rows * 10240 * 320 / (v * 1000000.0) for (s, v) in timings.items()}}
+    result = {'type': 'result', 'rows': rows, 'phase': args.phase, 'mode': 'cuda_graph' if graphs else 'eager', 'baseline_backend': cases[0].baseline_backend, 'median_us': timings, 'speedup_total': timings['baseline'] / timings['total'] if 'baseline' in timings else None, 'changed_input_fp64_passed': True, 'effective_tflops': {s: (2 if s in ('down', 'up') else 4) * rows * 10240 * 320 / (v * 1000000.0) for (s, v) in timings.items()}}
     emit(result)
-    comparison = (f" SGLang({cases[0].sg_backend})={timings['sglang']:.3f} us speedup={result['speedup_total']:.3f}x"
-                  if 'sglang' in timings else " SGLang: not run")
+    comparison = (f" Frozen({cases[0].baseline_backend})={timings['baseline']:.3f} us speedup={result['speedup_total']:.3f}x"
+                  if 'baseline' in timings else " Baseline: not run")
     print(f"T={rows:5d} {result['mode']:10s} Down={timings['down']:.3f} Up={timings['up']:.3f} Total={timings['total']:.3f}" + comparison, flush=True)
     return result
 
 
-def prefill_hardware_gate(args, emit, point, rows):
-    time.sleep(2)
-    snapshot = read_hardware(args.gpu, args.amd_smi)
-    emit({"type": "hardware", "event_phase": point, "rows": rows, **snapshot})
-    validate_hardware(snapshot)
-    if args.verbose:
-        print(f"GPU{args.gpu} prefill {point}: {snapshot['card']}", flush=True)
-    return snapshot
-
-
 def benchmark_prefill_batch(rows, args, emit):
-    before = prefill_hardware_gate(args, emit, "before", rows)
     prefill = testing()
     torch, _, _, cuda_perf = prefill.dependencies()
-    compiled_mix = prefill.torch_compile_mix()
+    compiled_mix = None if args.no_baselines else torch_compile_mix()
+    scopes = TIMING_SCOPES[:-1] if args.no_baselines else TIMING_SCOPES
+    from pyhip.ops.gr_read import gr_read
     with torch.no_grad():
         x, wd, wu = prefill.make_inputs(torch, rows, args.seed)
         inputs = [x] + [x.clone() for _ in range(args.buffers - 1)]
         # Both implementations rotate over independent weight allocations.
         # Each pair has identical logical values; packing happens only here.
         weights = [(wd, wu)] + [(wd.clone(), wu.clone()) for _ in range(args.buffers - 1)]
+        baseline_weights = ([baseline_modules().prepare_weights(*pair) for pair in weights]
+                            if compiled_mix is not None else [])
         readers = [prefill.prepare_reader(input_x, *pair) for input_x, pair in zip(inputs, weights)]
         expected_p = expected_y = None
         expected_torch = None
         torch_outputs = [None] * args.buffers
         addresses = []
-        calls = {scope: [] for scope in TIMING_SCOPES}
+        calls = {scope: [] for scope in scopes}
         for bi, (input_x, reader, (raw_down, raw_up)) in enumerate(zip(inputs, readers, weights)):
             dm, dw, dn, dk = reader.down_config
             um, un = reader.up_config
             partial, output = reader.partial, reader.output
             addresses.append({name: tensor_address(tensor, output=name == "Y") for name, tensor in zip(
-                ("X", "W_down", "W_up", "P", "Y"),
+                ("X", "W_down", "W_up", "P_stages", "Y"),
                 (input_x, reader.w_down, reader.w_up, partial, output))})
             calls["down"].append(lambda x=input_x, r=reader: r.run_down(x))
             calls["up"].append(lambda x=input_x, r=reader: r.run_up(x))
-            calls["total"].append(lambda x=input_x, r=reader: r(x))
-            calls["torch_compile"].append(
-                lambda x=input_x, wd=raw_down, wu=raw_up: compiled_mix(x, wd, wu, C, H))
+            calls["total"].append(lambda x=input_x, r=reader: gr_read(x, r.w_down, r.w_up, output=r.output))
+            if compiled_mix is not None:
+                baseline_down, baseline_up = baseline_weights[bi]
+                calls["torch_compile"].append(
+                    lambda x=input_x, wd=baseline_down, wu=baseline_up: compiled_mix(x, wd, wu, C, H))
             partial.fill_(torch.nan); output.fill_(torch.nan)
             reader(input_x)
             if expected_p is None:
                 expected_p, expected_y = partial.clone(), output.clone()
             torch.testing.assert_close(partial, expected_p, rtol=0, atol=0)
             torch.testing.assert_close(output, expected_y, rtol=0, atol=0)
-            # Compile the actual full shape and check every buffer before timing.
-            torch_outputs[bi] = calls["torch_compile"][bi]()
-            if expected_torch is None:
-                expected_torch = torch_outputs[bi].clone()
-            torch.testing.assert_close(torch_outputs[bi], expected_torch, rtol=0, atol=0)
-            prefill.check_close(output, torch_outputs[bi], prefill.OUTPUT_TOLERANCE)
-            addresses[-1].update({name: tensor_address(tensor) for name, tensor in (
-                ("Torch_X", input_x), ("Torch_W_down", raw_down), ("Torch_W_up", raw_up),
-                ("Torch_Y_prepared", torch_outputs[bi]))})
+            if compiled_mix is not None:
+                # Compile/check every raw-layout baseline buffer before timing.
+                torch_outputs[bi] = calls["torch_compile"][bi]()
+                if expected_torch is None:
+                    expected_torch = torch_outputs[bi].clone()
+                torch.testing.assert_close(torch_outputs[bi], expected_torch, rtol=0, atol=0)
+                prefill.check_close(output, torch_outputs[bi], prefill.OUTPUT_TOLERANCE)
+                addresses[-1].update({name: tensor_address(tensor) for name, tensor in (
+                    ("Torch_X", input_x), ("Torch_W_down", baseline_down), ("Torch_W_up", baseline_up),
+                    ("Torch_Y_prepared", torch_outputs[bi]))})
         assert all(len({row[name]["pointer"] for row in addresses}) == args.buffers for name in addresses[0])
-        emit({"type": "addresses", "rows": rows, "buffers": addresses})
-        for scope in TIMING_SCOPES:
+        emit({"type": "addresses", "rows": rows, "buffers": addresses,
+              "total_entry": "gr_read", "total_partial": "actual allocations recorded as P_total on each Total sample; P_stages belongs to stage measurements"})
+        for scope in scopes:
             for index in range(args.warmup): calls[scope][index % args.buffers]()
         torch.cuda.synchronize()
-        ready = prefill_hardware_gate(args, emit, "before_samples", rows)
         timings = {}
         # Retain the original stage-by-stage sampling order; append Torch.
         # These are whole-scope medians, not an interleaved A/B experiment.
-        for scope in TIMING_SCOPES:
+        for scope in scopes:
             perf = cuda_perf(name=f"gr_read_{scope}", verbose=0)
             if not perf.enable:
                 raise RuntimeError("CUDAPERF disables GRRead timing")
             for index in range(args.iters):
                 bi = index % args.buffers
-                with perf: actual = calls[scope][bi]()
+                partials = None
+                if scope == 'total' and args.record_partials:
+                    # Install/remove the observer outside the original timer.
+                    # Only raw address integers are collected inside the call.
+                    with observe_partial_allocations((rows, R), torch.bfloat16, inputs[bi].device) as partials:
+                        with perf: actual = calls[scope][bi]()
+                else:
+                    with perf: actual = calls[scope][bi]()
                 us = perf.latencies[-1] * 1e6
                 assert math.isfinite(us) and us > 0
                 record = {"scope": scope, "sample": index, "buffer": bi, "us": us}
+                if partials is not None:
+                    reader = readers[bi]
+                    record.update(partial_address_record(partials, (rows, R), torch.bfloat16,
+                                                         inputs[bi], reader.w_down, reader.w_up, actual))
                 if scope == "torch_compile":
                     torch_outputs[bi] = actual
                     record["output_address"] = tensor_address(actual)
@@ -418,30 +531,32 @@ def benchmark_prefill_batch(rows, args, emit):
                               "effective_TFLOPS": flops / elapsed / 1e6}
             print(f"  T={rows:5d} Down M{dm}/W{dw}/N{dn}/BK{dk} / Up M{um}/N{un} "
                   f"{scope}: {elapsed:.3f} us", flush=True)
-        after = prefill_hardware_gate(args, emit, "after", rows)
         return {"complete": True, "rows": rows, "down_n_splits": dn,
                 "down_block_m": dm, "down_num_waves": dw, "down_block_k": dk,
                 "up_block_m": um, "n_splits": un, "timings": timings,
-                "hardware_before": before, "hardware_before_samples": ready, "hardware_after": after,
                 "buffers": args.buffers, "warmup_each": args.warmup, "samples_each": args.iters,
                 "timed_outputs_bitexact": True, "all_samples_retained": True,
                 "Total_measured_directly": True, "settings_written": False,
-                "speedup_vs_torch_compile": timings["torch_compile"]["elapsed_us"] / timings["total"]["elapsed_us"],
+                "speedup_vs_torch_compile": (timings["torch_compile"]["elapsed_us"] / timings["total"]["elapsed_us"]
+                                             if compiled_mix is not None else None),
                 "torch_compile": {"full_rows": rows, "returns": "Y", "options": "default", "cuda_graph": False,
                                   "shared_X": True, "independent_raw_weight_buffers": args.buffers,
-                                  "output_allocation": "native", "Y_tolerance": prefill.OUTPUT_TOLERANCE},
-                "sampling_order": list(TIMING_SCOPES)}
+                                  "output_allocation": "native", "Y_tolerance": prefill.OUTPUT_TOLERANCE}
+                                  if compiled_mix is not None else None,
+                "sampling_order": list(scopes)}
 
 
 def print_prefill_table(results):
-    print("\n| Batch | Down | Up | Down us / TFLOPS | Up us / TFLOPS | Total us / TFLOPS | Torch compile us / TFLOPS | Speedup |", flush=True)
+    print("\n| Batch | Down | Up | Down us / TFLOPS | Up us / TFLOPS | Total us / TFLOPS | Frozen Torch compile us / TFLOPS | Speedup |", flush=True)
     print("|---:|---:|---:|---:|---:|---:|---:|---:|", flush=True)
     for result in results:
-        cells = [f"{result['timings'][scope]['elapsed_us']:.3f} / {result['timings'][scope]['effective_TFLOPS']:.3f}" for scope in TIMING_SCOPES]
+        cells = [(f"{result['timings'][scope]['elapsed_us']:.3f} / {result['timings'][scope]['effective_TFLOPS']:.3f}"
+                  if scope in result['timings'] else '—') for scope in TIMING_SCOPES]
+        speedup = f"{result['speedup_vs_torch_compile']:.3f}x" if result['speedup_vs_torch_compile'] is not None else '—'
         down = (f"M{result['down_block_m']}/W{result['down_num_waves']}"
                 f"/N{result['down_n_splits']}/BK{result['down_block_k']}")
         print(f"| {result['rows']} | {down} | M{result['up_block_m']}/N{result['n_splits']} | "
-              f"{' | '.join(cells)} | {result['speedup_vs_torch_compile']:.3f}x |", flush=True)
+              f"{' | '.join(cells)} | {speedup} |", flush=True)
     print("Speedup = Torch compile Total / PyHIP Total; eager cudaPerf, full-row calls, no CUDA Graph.", flush=True)
 
 
@@ -493,7 +608,6 @@ def time_graph(graph, calls, samples):
 
 def benchmark_decode_total(rows, pairs, args, emit):
     import torch
-    testing().use_checkout_package()
     from pyhip.ops.gr_read.flydsl import GRReadDecode, prepare_weights
     gen = torch.Generator(device="cuda").manual_seed(args.seed + rows)
     xs = [torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16, generator=gen) for _ in pairs]
@@ -508,11 +622,7 @@ def benchmark_decode_total(rows, pairs, args, emit):
     for x, r, (wd, wu) in zip(xs, readers, pairs):
         assert_close(r.output, reference(x, wd, wu), f"T={rows}: initial FP64")
     torch.cuda.synchronize()
-    # Clear our own initialization/check work from the utilization window.
-    time.sleep(2)
-    snap = hardware_snapshot()
-    emit({"type": "hardware", "phase": "before_samples", "rows": rows, **snap})
-    check_hardware(snap)
+    # The caller checks hardware once before preparing the benchmark inputs.
     timings = []
     for round_index in range(args.rounds):
         values = time_graph(graph, len(pairs) * 2, args.samples)
@@ -536,9 +646,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--phase', choices=('all', 'decode', 'prefill'), default='all')
     parser.add_argument('--gpu', type=int, default=0)
-    comparison = parser.add_mutually_exclusive_group()
-    comparison.add_argument('--sglang-root', type=Path, help='SGLang checkout; otherwise use an installed checkout if available')
-    comparison.add_argument('--no-sglang', action='store_true', help='measure PyHIP decode only; prefill still includes Torch compile')
+    parser.add_argument('--no-baselines', action='store_true', help='skip frozen performance baselines in both phases; accuracy references still run')
     parser.add_argument('--rows', '--batches', nargs='+', type=checks.parse_batch)
     parser.add_argument('--decode-rows', nargs='+', type=checks.parse_batch)
     parser.add_argument('--prefill-rows', nargs='+', type=checks.parse_batch)
@@ -550,9 +658,10 @@ def parse_args(argv=None):
     parser.add_argument('--prefill-warmup', type=int, default=2)
     parser.add_argument('--prefill-iters', type=int, default=10)
     parser.add_argument('--prefill-seed', type=int, default=131)
-    parser.add_argument('--settle-seconds', type=float, default=2.0, help='decode gate settling; prefill retains its fixed 2 seconds')
+    parser.add_argument('--settle-seconds', type=float, default=2.0, help='wait once before the startup hardware check')
     parser.add_argument('--amd-smi', type=Path)
     parser.add_argument('--output', type=Path, help='optional new JSONL file; default: progress and tables on console')
+    parser.add_argument('--md', type=Path, help='optional new Markdown performance report')
     parser.add_argument('--verbose', action='store_true', help='also print hardware and detailed correctness diagnostics')
     for name in ('weights', 'rounds', 'samples', 'buffers', 'warmup', 'iters', 'seed'):
         parser.add_argument('--' + name, type=int, help='single-phase compatibility option')
@@ -570,21 +679,7 @@ def parse_args(argv=None):
     counts = (args.decode_weights, args.decode_rounds, args.decode_samples, args.prefill_buffers, args.prefill_iters)
     if min(counts) < 1 or args.gpu < 0 or args.prefill_warmup < 0 or args.settle_seconds < 0 or not __debug__:
         parser.error('positive counts, nonnegative GPU/warmup/settling required; do not use python -O')
-    if args.phase != 'prefill' and not args.no_sglang:
-        if args.sglang_root is None:
-            try:
-                spec = importlib.util.find_spec('sglang')
-            except ModuleNotFoundError:
-                spec = None
-            if spec is not None and spec.origin:
-                candidate = Path(spec.origin).resolve().parents[2]
-                if (candidate / 'python/sglang/srt/layers/hyperconnection.py').is_file():
-                    args.sglang_root = candidate
-        if args.sglang_root is not None:
-            args.sglang_root = args.sglang_root.resolve()
-            for name in ('hyperconnection.py', 'hc_mix_triton.py'):
-                if not (args.sglang_root / 'python/sglang/srt/layers' / name).is_file():
-                    parser.error(f'SGLang {name} was not found under --sglang-root')
+    checks.validate_report_paths(parser, args.output, args.md)
     return args
 
 
@@ -602,48 +697,42 @@ def emit_record(stream, phase, record):
 def run_decode(args, emit):
     local = SimpleNamespace(phase='decode', gpu=args.gpu, seed=args.decode_seed,
                             weights=args.decode_weights, rounds=args.decode_rounds,
-                            samples=args.decode_samples, warmup=2, settle_seconds=args.settle_seconds,
-                            amd_smi=args.amd_smi, verbose=args.verbose)
-    runtime = 'runtime and SGLang' if args.sglang_root is not None else 'PyHIP runtime'
+                            samples=args.decode_samples, warmup=2,
+                            amd_smi=args.amd_smi, verbose=args.verbose,
+                            record_partials=args.output is not None)
+    runtime = 'PyHIP runtime' if args.no_baselines else 'PyHIP and frozen baselines'
     print(f"\nDecode: {len(args.decode_rows)} batches, {local.weights} weight pairs, "
           f"{local.rounds}x{local.samples} Graph samples/scope. Loading {runtime}...", flush=True)
-    if args.sglang_root is None:
-        print("SGLang comparison not run; measuring PyHIP Down/Up/Total. "
-              "Use --sglang-root to add the SGLang comparison.", flush=True)
-    dep = dependencies(args.sglang_root)
+    if args.no_baselines:
+        print("Frozen performance baselines disabled (--no-baselines).", flush=True)
+    dep = dependencies(args.no_baselines)
     torch, _, _, _, check, prefill, _, _ = dep
     if torch.version.hip is None or not torch.cuda.is_available():
         raise RuntimeError('decode comparison requires a ROCm GPU')
     prefill.warn_architecture(torch, 0)
     props = torch.cuda.get_device_properties(0)
-    source_paths = [Path(__file__), Path(__file__).with_name('test_gr_read.py'),
-                    *(REPO / 'src/pyhip/ops/gr_read/flydsl').glob('*.py')]
-    if args.sglang_root is not None:
-        source_paths.extend(args.sglang_root / 'python/sglang/srt/layers' / name
-                            for name in ('hyperconnection.py', 'hc_mix_triton.py'))
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
           'gpu': props.name, 'arch': props.gcnArchName, 'compute_units': props.multi_processor_count,
           'protocol': {'weights': local.weights, 'rounds': local.rounds, 'samples': local.samples,
-                       'seed': local.seed, 'graph_passes': 2, 'replays_per_sample': 3, 'mode': 'cuda_graph'},
-          'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
-          'sglang_head': (subprocess.check_output(['git', '-C', str(args.sglang_root), 'rev-parse', 'HEAD'], text=True).strip()
-                          if args.sglang_root is not None else None),
+                       'seed': local.seed, 'graph_passes': 2, 'replays_per_sample': 3, 'mode': 'cuda_graph',
+                       'record_total_partials': local.record_partials},
+          'sources': source_hashes(args.no_baselines),
+          'baseline': None if args.no_baselines else baseline_modules().metadata(),
           'settings_written': False})
-    gate(prefill, local, 'entry', emit)
     results = []
     with torch.inference_mode():
         print(f"Decode: preparing {local.weights} shared weight pairs...", flush=True)
         pairs = [check.make_inputs(1, local.seed + i)[1:] for i in range(local.weights)]
         from pyhip.ops.gr_read.flydsl import prepare_weights
         packed_pairs = [prepare_weights(wd, wu) for wd, wu in pairs]
-        emit({'type': 'weight_preparation', 'pairs': len(pairs), 'packing_calls': len(pairs), 'shared_across_rows': True})
+        emit({'type': 'weight_preparation', 'pairs': len(pairs), 'packing_calls': len(pairs),
+              'shared_across_rows': True, 'baseline_layout': 'independent contiguous raw matrices' if not args.no_baselines else None})
         for index, rows in enumerate(args.decode_rows, 1):
             print(f"[Decode {index}/{len(args.decode_rows)}] T={rows}: "
                   "preparing kernels, checking outputs and capturing graphs...", flush=True)
             results.append(benchmark_decode_rows(rows, pairs, local, dep, emit, packed_pairs))
             gc.collect()
             torch.cuda.empty_cache()
-    gate(prefill, local, 'exit', emit)
     emit({'type': 'summary', 'complete': True, 'rows': args.decode_rows})
     return results
 
@@ -652,13 +741,19 @@ def run_prefill(args, emit, *, check=True):
     prefill = testing()
     local = SimpleNamespace(gpu=args.gpu, seed=args.prefill_seed, buffers=args.prefill_buffers,
                             warmup=args.prefill_warmup, iters=args.prefill_iters,
-                            amd_smi=args.amd_smi, verbose=args.verbose)
+                            amd_smi=args.amd_smi, verbose=args.verbose, no_baselines=args.no_baselines,
+                            record_partials=args.output is not None)
     print(f"\nPrefill: {len(args.prefill_rows)} batches, {local.buffers} buffers, "
           f"{local.warmup} warmup calls, {local.iters} eager samples/scope. Loading runtime...", flush=True)
     torch, _, _, _ = prefill.dependencies()
+    props = torch.cuda.get_device_properties(0)
     emit({'type': 'environment', 'torch': torch.__version__, 'hip': torch.version.hip,
+          'gpu': props.name, 'arch': props.gcnArchName, 'compute_units': props.multi_processor_count,
           'protocol': {'buffers': local.buffers, 'warmup': local.warmup, 'iters': local.iters,
-                       'seed': local.seed, 'scope_order': list(TIMING_SCOPES), 'mode': 'eager'},
+                       'seed': local.seed, 'scope_order': list(TIMING_SCOPES[:-1] if args.no_baselines else TIMING_SCOPES), 'mode': 'eager',
+                       'record_total_partials': local.record_partials},
+          'sources': source_hashes(args.no_baselines),
+          'baseline': None if args.no_baselines else baseline_modules().metadata(),
           'settings_written': False})
     # Keep the original prefill flow: all selected correctness checks before timing.
     for index, rows in enumerate(args.prefill_rows if check else (), 1):
@@ -686,25 +781,86 @@ def run_prefill(args, emit, *, check=True):
 
 def print_decode_table(results):
     print('\nDecode (CUDA Graph)')
-    print('\n| T | Decode Down us | Decode Up us | Decode Total us | SGLang backend | SGLang Total us | Speedup |')
+    print('\n| T | Decode Down us | Decode Up us | Decode Total us | Frozen baseline backend | Frozen baseline Total us | Speedup |')
     print('|---:|---:|---:|---:|---|---:|---:|')
     for r in results:
         t = r['median_us']
-        sg_time = f"{t['sglang']:.3f}" if 'sglang' in t else '—'
+        baseline_time = f"{t['baseline']:.3f}" if 'baseline' in t else '—'
         speedup = f"{r['speedup_total']:.3f}x" if r['speedup_total'] is not None else '—'
         print(f"| {r['rows']} | {t['down']:.3f} | {t['up']:.3f} | {t['total']:.3f} | "
-              f"{r['sglang_backend'] or 'not run'} | {sg_time} | {speedup} |")
+              f"{r['baseline_backend'] or 'not run'} | {baseline_time} | {speedup} |")
 
 
-def run_benchmarks(args, emit, *, prefill_checked=False):
+def write_markdown_report(path, args, results, environments, hardware, started_at):
+    """Render completed results with the same tables printed by the benchmark."""
+    stream = io.StringIO()
+    with redirect_stdout(stream):
+        print('# GR read performance report\n')
+        print(f'Run started: {started_at}. Dimensions: BF16 X[T,10240], C=4, H=2560, R=320.\n')
+        print('Total calls `gr_read(..., output=out)` with an internally allocated P. '
+              'Packing, compilation and correctness checks are outside timing.\n')
+        if hardware is not None:
+            card, limit = hardware['card'], hardware['limit']
+            print(f"Physical GPU {hardware['gpu']}, PCI {card.get('PCI Bus', 'unknown')}; "
+                  f"startup use={card['GPU use (%)']}%, VRAM={card['GPU Memory Allocated (VRAM%)']}%; "
+                  f"PTL={limit.get('ptl_state')}/{limit.get('ptl_format')}.\n")
+        print('Hardware checked once at startup; device settings were not changed.\n')
+        try:
+            print(f"FlyDSL: {package_metadata.version('flydsl')}.\n")
+        except package_metadata.PackageNotFoundError:
+            print('FlyDSL package version unavailable.\n')
+        for phase, rows in results.items():
+            env = environments[phase]
+            print(f'## {phase.capitalize()}\n')
+            print(f"GPU: {env['gpu']}; {env['arch']}; {env['compute_units']} CUs. "
+                  f"Torch: {env['torch']}; HIP: {env['hip']}.\n")
+            print('Sampling protocol:\n```json\n' + json.dumps(env['protocol'], indent=2) + '\n```\n')
+            if env['baseline'] is None:
+                print('Frozen performance baselines disabled.\n')
+            else:
+                baseline = env['baseline']
+                print(f"Frozen SGLang baseline checkout: `{baseline['source_checkout_commit']}`; "
+                      f"Triton tuning commit: `{baseline['triton_last_change_commit']}`.\n")
+                print('Baseline compiler versions: `' + json.dumps(baseline['runtime_versions']) + '`.\n')
+            print(f'{len(rows)} selected shapes completed with output checks.\n')
+            if phase == 'decode':
+                print_decode_table(rows)
+            else:
+                print_prefill_table(rows)
+            print('\nSource SHA256:\n```json\n' + json.dumps(
+                {str(Path(p).relative_to(REPO)): digest for p, digest in env['sources'].items()},
+                indent=2) + '\n```\n')
+        if args.output is not None:
+            raw = os.path.relpath(args.output.resolve(), path.resolve().parent)
+            print(f'[Raw samples and actual P addresses](<{raw}>)\n')
+        else:
+            print('Raw samples and internal P addresses were not exported; use `--output` to retain them.\n')
+        print('Decode uses CUDA Graph replay; prefill uses eager cudaPerf. '
+              'The two timing modes are reported separately. Effective TFLOPS count GEMM work only.')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('x') as out:
+        out.write(stream.getvalue())
+
+
+def run_benchmarks(args, emit, *, prefill_checked=False, hardware_checked=False, startup_hardware=None):
     """Run the existing samplers and print both final tables after all phases."""
+    started_at = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    if not hardware_checked:
+        startup_hardware = benchmark_entry_gate(args, emit)
     checks = testing()
+    environments = {}
+
+    def phase_emit(phase, record):
+        if args.md is not None and record['type'] == 'environment':
+            environments[phase] = record
+        emit(phase, record)
+
     results_by_phase = {}
     if args.phase in ('all', 'decode'):
-        results_by_phase['decode'] = run_decode(args, lambda r: emit('decode', r))
+        results_by_phase['decode'] = run_decode(args, lambda r: phase_emit('decode', r))
         checks.release_buffers()
     if args.phase in ('all', 'prefill'):
-        results_by_phase['prefill'] = run_prefill(args, lambda r: emit('prefill', r), check=not prefill_checked)
+        results_by_phase['prefill'] = run_prefill(args, lambda r: phase_emit('prefill', r), check=not prefill_checked)
     print('\nBenchmark complete. Final results:', flush=True)
     if 'decode' in results_by_phase:
         print_decode_table(results_by_phase['decode'])
@@ -712,6 +868,9 @@ def run_benchmarks(args, emit, *, prefill_checked=False):
         print('\nPrefill (eager cudaPerf)')
         print_prefill_table(results_by_phase['prefill'])
     sys.stdout.flush()
+    if args.md is not None:
+        write_markdown_report(args.md, args, results_by_phase, environments, startup_hardware, started_at)
+        print(f'Markdown report: {args.md}', flush=True)
     return results_by_phase
 
 

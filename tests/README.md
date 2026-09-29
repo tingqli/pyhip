@@ -8,7 +8,7 @@ tests/
   ops/
     conv/           Installed pointwise convolution
     gemm/           Installed ASM/FlyDSL GEMM variants and split-K
-    gr_read/        GRRead correctness tests and its existing benchmark CLI
+    gr_read/        GRRead correctness tests
     moe/            Installed MoE implementations and cross-backend tests
 ```
 
@@ -147,7 +147,9 @@ fixtures remain executable scripts, not newly fabricated parametrized tests.
 GRRead's [test_gr_read.py](ops/gr_read/test_gr_read.py) CLI defaults to all accuracy
 checks followed by separate decode and prefill performance tables. Use
 `--check-only` for accuracy alone; pytest never starts timing. The samplers and
-standalone benchmark CLI remain in [bench_gr_read_compare.py](ops/gr_read/bench_gr_read_compare.py).
+standalone benchmark CLI live in [benchmarks/gr_read](../benchmarks/gr_read/readme.md).
+Shared inputs and correctness references live in `pyhip.testing.gr_read`.
+
 Its local [conftest.py](ops/gr_read/conftest.py) temporarily removes the default
 device context installed by other suites, then restores it. This avoids a
 Torch 2.9 `unflatten` compile failure in combined runs; it does not change the

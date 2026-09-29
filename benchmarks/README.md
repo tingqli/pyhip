@@ -8,6 +8,7 @@ churn; their function arguments are CLI inputs, not pytest fixtures.
 - [moe](moe/): Aiter vs tuned MoE comparison, sorting checks, and trace config.
 - [conv](conv/): depthwise convolution correctness and timing CLI.
 - [attention](attention/): paged-attention correctness/timing script.
+- [gr_read](gr_read/readme.md): decode/prefill performance, frozen baselines, integration examples and Markdown reports.
 
 Run with the same Python environment used to install PyHIP:
 
@@ -29,9 +30,12 @@ with the fixed-kernel pytest suite, validates both backends independently, and
 exports raw timings without backend-specific shape padding. See the
 [MoE benchmark guide](moe/README.md) for the protocol and result statuses.
 
-GRRead keeps its benchmark CLI in
-[bench_gr_read_compare.py](../tests/ops/gr_read/bench_gr_read_compare.py), beside
-the pytest checks and default accuracy-then-performance CLI in
+GRRead's benchmark CLI is [bench_gr_read_compare.py](gr_read/bench_gr_read_compare.py).
+The [GR read guide](gr_read/readme.md) includes measured performance, integration
+and warmup examples, and `--output` / `--md` report options. Inputs and accuracy
+references are shared through `pyhip.testing.gr_read`; the benchmark does not
+load repository test scripts. Pytest checks and the compatible
+accuracy-then-performance CLI remain in
 [test_gr_read.py](../tests/ops/gr_read/test_gr_read.py) (`--check-only` skips timing).
 Comparisons that depend on relocated GEMM kernels now live in the opt-in tests
 under [tests/ops/gemm](../tests/ops/gemm/).
