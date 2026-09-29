@@ -159,7 +159,7 @@ Decode 对全部 T1–32 按真实 T 编译和缓存，不采用固定七档表�
 | 257–512 | 32 / 4 / 5 / 512 | 256 / 40 | 6 |
 | 其余 T，或其它 CU 数 | 原 prefill 配置选择 | 原 M256 Up | 3 |
 
-T33–512 将两个 GPU launch 收在一个已编译 host 调用中，仍然是两个 GPU kernel。此处未捕获 CUDA Graph。范围外保留原两个 launcher；其它 CU 数的回退没有在本机做性能验收。
+所有非空 decode/prefill 调用都通过一个已编译 host 入口，依次提交 Down、Up 两个 GPU kernel。Host 提交方式不再按 T512 或 CU 数分支；上表中的算法配置选择保持独立。单独的 Down/Up 入口用于分阶段检查和计时，其它 CU 数的配置没有在本机做性能验收。
 
 测试辅助函数集中在 `pyhip.testing.gr_read`；业务接入使用公共 `gr_read` 函数。
 

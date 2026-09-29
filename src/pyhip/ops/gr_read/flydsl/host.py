@@ -24,7 +24,7 @@ def _launchers(config):
 
 
 @cache
-def _pair_launcher(config):
+def _prefill_pair_launcher(config):
     down, up = _launchers(config)
 
     @flyc.jit
@@ -50,9 +50,10 @@ class GRReadPrefill:
 
     Pass weights from prepare_weights(), once per original weight pair. Instances
     for different T share those tensors and own separate P/Y workspaces. Prepare
-    before hot execution; each nonempty call launches Down and Up on the current
-    stream. The next call overwrites output. Concurrent streams need separate
-    instances. Optional P/Y buffers must be independent of X and the weights.
+    before hot execution; each nonempty call submits Down and Up through one
+    compiled host entry on the current stream. The next call overwrites output.
+    Concurrent streams need separate instances. Optional P/Y buffers must be
+    independent of X and the weights.
     """
 
     def __init__(self, rows, packed_down, packed_up, *, partial=None, output=None):
@@ -88,9 +89,8 @@ class GRReadPrefill:
                 down, up = _launchers(self.config)
                 self.down = flyc.compile(down, x, self.w_down, self.partial, rows, stream)
                 self.up = flyc.compile(up, x, self.w_up, self.partial, self.output, rows, stream)
-                if props.multi_processor_count == 80 and 33 <= rows <= 512:
-                    self.dispatch = flyc.compile(_pair_launcher(self.config), x, self.w_down, self.w_up,
-                                                 self.partial, self.output, rows, stream)
+                self.dispatch = flyc.compile(_prefill_pair_launcher(self.config), x, self.w_down, self.w_up,
+                                             self.partial, self.output, rows, stream)
 
     def _check_input(self, x):
         if (x.shape != (self.rows, K) or x.dtype != torch.bfloat16 or x.device != self.device
@@ -124,11 +124,7 @@ class GRReadPrefill:
                 return self(x)
         if self.rows:
             stream = torch.cuda.current_stream(self.device)
-            if self.dispatch is not None:
-                self.dispatch(x, self.w_down, self.w_up, self.partial, self.output, self.rows, stream)
-            else:
-                self.down(x, self.w_down, self.partial, self.rows, stream)
-                self.up(x, self.w_up, self.partial, self.output, self.rows, stream)
+            self.dispatch(x, self.w_down, self.w_up, self.partial, self.output, self.rows, stream)
         return self.output
 
 
@@ -210,18 +206,15 @@ def _prefill_config(rows, compute_units):
     return select_prefill_config(rows, compute_units)
 
 
-def _compile_call(rows, config, paired, x, packed_down, packed_up, partial, output, stream):
+def _compile_call(rows, config, x, packed_down, packed_up, partial, output, stream):
     # compile() executes the call once. Use the full, initialized caller inputs
     # and return that first result without launching a second time.
+    # Down 和 Up 始终通过一个编译后的 host 入口提交，GPU 仍执行两个 kernel。
     if rows <= 32:
-        return (flyc.compile(_decode_pair_launcher(rows), x.view(-1), packed_down,
-                             packed_up, partial, output.view(-1), stream),)
-    if paired:
-        return (flyc.compile(_pair_launcher(config), x, packed_down, packed_up,
-                             partial, output, rows, stream),)
-    down, up = _launchers(config)
-    return (flyc.compile(down, x, packed_down, partial, rows, stream),
-            flyc.compile(up, x, packed_up, partial, output, rows, stream))
+        return flyc.compile(_decode_pair_launcher(rows), x.view(-1), packed_down,
+                            packed_up, partial, output.view(-1), stream)
+    return flyc.compile(_prefill_pair_launcher(config), x, packed_down, packed_up,
+                        partial, output, rows, stream)
 
 
 def gr_read(x, packed_down, packed_up, *, output=None):
@@ -231,6 +224,7 @@ def gr_read(x, packed_down, packed_up, *, output=None):
     prepare_weights(). T1..32 uses exact-row decode. Prefill starts at T33, with
     actual-row configuration selection and runtime rows. Configurations share
     compiled code across T. No input rows are padded or copied.
+    Every nonempty call uses one compiled host entry to launch Down then Up.
     The result is [T,2560]; if output is supplied, it is written and returned.
 
     Warm the needed shapes/configurations on each device before Graph capture.
@@ -268,10 +262,9 @@ def gr_read(x, packed_down, packed_up, *, output=None):
 
     props = _device_properties(device)
     config = rows if rows <= 32 else _prefill_config(rows, props.multi_processor_count)
-    paired = rows <= 32 or (props.multi_processor_count == 80 and rows <= 512)
-    key = (device.index, props.gcnArchName, config, paired)
-    kernels = _compiled_calls.get(key)
-    if kernels is None and torch.cuda.is_current_stream_capturing():
+    key = (device.index, props.gcnArchName, config)
+    dispatch = _compiled_calls.get(key)
+    if dispatch is None and torch.cuda.is_current_stream_capturing():
         raise RuntimeError('gr_read must be warmed on this device before Graph capture')
 
     if output is None:
@@ -279,22 +272,18 @@ def gr_read(x, packed_down, packed_up, *, output=None):
     partial = torch.empty((4 * rows * R,) if rows <= 32 else (rows, R),
                           dtype=torch.float32 if rows <= 32 else torch.bfloat16, device=device)
     stream = torch.cuda.current_stream(device)
-    if kernels is None:
+    if dispatch is None:
         with _compile_lock:
-            kernels = _compiled_calls.get(key)
-            if kernels is None:
+            dispatch = _compiled_calls.get(key)
+            if dispatch is None:
                 hints = {'gr_read_device': device.index, 'gr_read_arch': props.gcnArchName}
                 with CompilationContext.compile_hints(hints):
-                    kernels = _compile_call(rows, config, paired, x, packed_down, packed_up,
-                                            partial, output, stream)
-                _compiled_calls[key] = kernels
+                    dispatch = _compile_call(rows, config, x, packed_down, packed_up,
+                                             partial, output, stream)
+                _compiled_calls[key] = dispatch
                 return output
     if rows <= 32:
-        kernels[0](x.view(-1), packed_down, packed_up, partial, output.view(-1), stream)
-    elif paired:
-        kernels[0](x, packed_down, packed_up, partial, output, rows, stream)
+        dispatch(x.view(-1), packed_down, packed_up, partial, output.view(-1), stream)
     else:
-        down, up = kernels
-        down(x, packed_down, partial, rows, stream)
-        up(x, packed_up, partial, output, rows, stream)
+        dispatch(x, packed_down, packed_up, partial, output, rows, stream)
     return output

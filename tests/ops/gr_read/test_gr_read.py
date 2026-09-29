@@ -265,21 +265,33 @@ if "pytest" in sys.modules:
         assert all(ref() is None for ref in refs), 'compiled cache must not retain caller tensors'
 
 
-    def test_api_prefill_runtime_rows(monkeypatch):
+    @pytest.mark.parametrize('row_sizes', ((33, 64, 65, 127, 128),
+                                         (513, 768, 1023, 1024),
+                                         (2049, 2304, 2559, 2560)))
+    def test_api_prefill_runtime_rows(monkeypatch, row_sizes):
         import torch
-        x, wd, wu, pd, pu = api_inputs(128)
+        x, wd, wu, pd, pu = api_inputs(max(row_sizes))
         from pyhip.ops.gr_read.flydsl import host
         monkeypatch.setattr(host, '_compiled_calls', {})
-        expected = host.GRReadPrefill(33, pd, pu)(x[:33]).clone()
-        torch.testing.assert_close(host.gr_read(x[:33], pd, pu), expected, rtol=0, atol=0)
+
+        def stage_reference(rows):
+            reader = host.GRReadPrefill(rows, pd, pu)
+            reader.run_down(x[:rows])
+            expected = reader.run_up(x[:rows]).clone()
+            torch.testing.assert_close(reader(x[:rows]), expected, rtol=0, atol=0)
+            return expected
+
+        first = row_sizes[0]
+        expected = stage_reference(first)
+        torch.testing.assert_close(host.gr_read(x[:first], pd, pu), expected, rtol=0, atol=0)
         assert len(host._compiled_calls) == 1
 
         def unexpected_compile(*args, **kwargs):
             pytest.fail('same prefill config must reuse code for different runtime rows')
 
         monkeypatch.setattr(host, '_compile_call', unexpected_compile)
-        for rows in (64, 65, 127, 128):
-            reference = host.GRReadPrefill(rows, pd, pu)(x[:rows]).clone()
+        for rows in row_sizes[1:]:
+            reference = stage_reference(rows)
             out = torch.empty_like(reference)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -356,7 +368,7 @@ if "pytest" in sys.modules:
                 case.run('total')
                 cases.append(case)
             key = next(k for k in host._compiled_calls if k[0] == x.device.index and k[2] == rows)
-            native_pair, = host._compiled_calls[key]
+            native_pair = host._compiled_calls[key]
             launch_partials, partial_refs, records = [], [], []
 
             def observed_pair(*args):
@@ -368,7 +380,7 @@ if "pytest" in sys.modules:
 
             native_empty = torch.empty
             with monkeypatch.context() as patch:
-                patch.setitem(host._compiled_calls, key, (observed_pair,))
+                patch.setitem(host._compiled_calls, key, observed_pair)
                 calls = [lambda c=c, bi=bi: bench.capture_total_call(c, bi, len(cases), records)
                          for bi, c in enumerate(cases)]
                 graph = bench.capture(calls + calls)
@@ -479,7 +491,7 @@ if "pytest" in sys.modules:
         host.gr_read(x, pd, pu)
         config = host._prefill_config(rows, torch.cuda.get_device_properties(x.device).multi_processor_count)
         key = next(k for k in host._compiled_calls if k[0] == x.device.index and k[2] == config)
-        kernels = host._compiled_calls[key]
+        native_dispatch = host._compiled_calls[key]
         launches, partial_refs, records = [], [], []
         active_scope = None
 
@@ -499,14 +511,12 @@ if "pytest" in sys.modules:
                 active_scope = None
                 self.latencies.append(1e-6)
 
-        def observed_kernel(kernel):
-            def launch(*args):
-                if active_scope == 'gr_read_total':
-                    partial = args[3] if len(kernels) == 1 else args[2]
-                    launches.append(bench.address(partial))
-                    partial_refs.append(weakref.ref(partial))
-                return kernel(*args)
-            return launch
+        def observed_dispatch(*args):
+            if active_scope == 'gr_read_total':
+                partial = args[3]
+                launches.append(bench.address(partial))
+                partial_refs.append(weakref.ref(partial))
+            return native_dispatch(*args)
 
         make_record = bench.partial_address_record
 
@@ -518,7 +528,7 @@ if "pytest" in sys.modules:
             pytest.fail('console-only prefill must not install a P observer')
 
         native_empty = torch.empty
-        monkeypatch.setitem(host._compiled_calls, key, tuple(observed_kernel(k) for k in kernels))
+        monkeypatch.setitem(host._compiled_calls, key, observed_dispatch)
         monkeypatch.setattr(prefill, 'dependencies', lambda: (*dep[:3], AccuracyTimer))
         monkeypatch.setattr(bench, 'partial_address_record', checked_record)
         if not record_partials:
@@ -531,13 +541,13 @@ if "pytest" in sys.modules:
         buffers = next(r['buffers'] for r in records if r['type'] == 'addresses')
         samples = [r for r in records if r['type'] == 'sample' and r['scope'] == 'total']
         assert [r['buffer'] for r in samples] == [0, 1, 0]
-        assert len(launches) == len(samples) * len(kernels)
+        assert len(launches) == len(samples)
         for index, sample in enumerate(samples):
             assert ('P_total' in sample) == record_partials
             if not record_partials:
                 continue
             partial = sample['P_total']
-            assert all(p == partial for p in launches[index * len(kernels):(index + 1) * len(kernels)])
+            assert launches[index] == partial
             assert partial['shape'] == [rows, R] and partial['dtype'] == 'torch.bfloat16'
             buffer = buffers[sample['buffer']]
             assert partial['pointer'] != buffer['P_stages']['pointer']

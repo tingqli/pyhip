@@ -1,4 +1,4 @@
-# GR read 正确性回归
+# GR read 正确性回归测试
 
 性能入口、完整性能数据、公共接口接入示例和 MI308X/80CU 预热档位见 [benchmark README](../../../benchmarks/gr_read/readme.md)。正式性能脚本为 [bench_gr_read_compare.py](../../../benchmarks/gr_read/bench_gr_read_compare.py)，固定 Torch/Triton 对照集中在同目录的单文件 `baselines.py`。
 
@@ -32,6 +32,12 @@ python3 tests/ops/gr_read/test_gr_read.py --gpu 2 --phase prefill --check-only
 # 单阶段核验；Up 检查会先生成并校验 Down 的 P。
 python3 tests/ops/gr_read/test_gr_read.py --gpu 2 --phase decode --scope down --rows 1 16 17 32
 python3 tests/ops/gr_read/test_gr_read.py --gpu 2 --phase prefill --scope up --rows 33 128 129 512 513
+
+# 只测 T=16 的 decode 正确性 --check-only 表示只检查正确性，不跑性能采样。
+python3 tests/ops/gr_read/test_gr_read.py --phase decode --rows 16 --check-only
+
+# 只测 T=128 的 prefill 正确性 --rows 64 128 256 可以指定多个 batch。
+python3 tests/ops/gr_read/test_gr_read.py --phase prefill --rows 128 --check-only
 ```
 
 兼容 CLI 的 `--decode-weights` / `--decode-seed` 仅控制精度工作集，默认 2 对权重 / seed303；性能仍使用原 100 对权重 / seed707。调整性能采样参数应使用独立 benchmark。兼容 CLI 也支持 `--no-baselines`、`--output` 和 `--md`；单独 `--scope` 或 `--check-only` 不做性能测量。
