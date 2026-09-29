@@ -280,6 +280,8 @@ def test_aiter_signature():
     print("diff:", diff)
     diff_names = ["output", "stage2_scatter", "quant_type_a", "quant_dtype_a", "quant_dtype_a2"] 
     assert all(k in diff_names for k in diff)
+    # 共有参数必须保持原生顺序，避免位置调用绑错参数。
+    assert [name for name in parameters if name in native] == list(native)
     for name, parameter in native.items():
         assert parameters[name].name == parameter.name
         assert parameters[name].kind == parameter.kind
