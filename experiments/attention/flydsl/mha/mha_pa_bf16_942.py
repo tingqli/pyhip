@@ -3,11 +3,13 @@
 BM256/BN64, eight wave64s staggered by one stage. The V128/no-LSE hot path
 keeps VMEM/DS in S0/2/4/6 and MFMA/VALU in S1/3/5/7, following gfx950's
 stage organization. Lane addresses are prepared before memory stages;
-V uses a full 64-bit GLOBAL scalar base, never a buffer descriptor.
+D128/D192 V uses a full 64-bit GLOBAL scalar base, not a buffer descriptor.
 One K slot and two V slots use 49,920/58,240 bytes for D128/D192. Softmax
 lags QK by one tile; cross32 reductions issue in memory stages and retire
 with the operand reads. Optional LSE/V192 retain the checked wide path.
 Ordinary and persistent grids share this body and public tensor layouts.
+DQ=DV=256 defaults to the BM128/BN64 M16 K+V DMA specialization with
+early page lookahead, merged page-ready waits and late S4 LGKM completion.
 """
 
 import functools
@@ -887,6 +889,17 @@ class _PagedAttention:
         self.heads, self.kv_heads, self.dq, self.dv = heads, kv_heads, dq, dv
         self.page_size, self.causal, self.quant_query_mode = page, causal, mode
         self.memory_mode, self.persistent = "lds", persistent
+        self._launch = _launch_attention
+        if dq == dv == 256:
+            if __package__:
+                from .mha_pa_bf16_256_dma_942 import _launcher
+            else:
+                from mha_pa_bf16_256_dma_942 import _launcher
+            # Select the validated v73 combination without calling its public
+            # factory, which itself reuses this module's argument validation.
+            # Match the explicit factory's positional cache key as well.
+            self._launch = _launcher(False, 1, True, 1, True, True, True)
+            self.bf16_backend = "native-m16-dma4-q0-kearly-vearly-interleave1-1-pages1-lateS41"
         self._compiled = {}
 
     def __call__(self, Q, K, V, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
@@ -988,7 +1001,7 @@ class _PagedAttention:
                 key = (device, signature)
                 compiled = self._compiled.get(key)
                 if compiled is None:
-                    self._compiled[key] = flyc.compile(_launch_attention, *args)
+                    self._compiled[key] = flyc.compile(self._launch, *args)
                 else:
                     compiled(*args)
         return (out, lse) if return_lse else out
@@ -1002,6 +1015,8 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
 
     persistent=False selects FP8's ordinary head/batch/query-tile grid. Both
     paths use the same eight-stage kernel and require no scheduler workspace.
+    Dq/Dv128/192 use BM256. Dq=Dv256 defaults to BM128 M16 K+V DMA,
+    early page lookahead and the S4 completion wait after its barrier.
     """
     if memory_mode != "lds" or key_layout != "vectorized":
         raise NotImplementedError("gfx942 BF16 supports LDS and vectorized K only")
@@ -1016,8 +1031,9 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         raise ValueError("head counts, dimensions and page_size must be integers")
     if num_qo_heads <= 0 or num_kv_heads <= 0 or num_qo_heads % num_kv_heads:
         raise ValueError("query heads must be a positive multiple of KV heads")
-    if head_dim_qk not in (128, 192) or head_dim_v not in (128, 192) or page_size not in (32, 64, 128):
-        raise NotImplementedError("gfx942 BF16 supports D128/D192, V128/V192 and pages32/64/128")
+    supported_dims = (head_dim_qk in (128, 192) and head_dim_v in (128, 192)) or head_dim_qk == head_dim_v == 256
+    if not supported_dims or page_size not in (32, 64, 128):
+        raise NotImplementedError("gfx942 BF16 supports Dq/Dv128/192 or Dq=Dv256 and pages32/64/128")
     if quant_query_mode not in ("per-token", "per-tensor"):
         raise ValueError("query scale mode must be per-token or per-tensor")
     return _PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size,

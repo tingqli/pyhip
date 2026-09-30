@@ -141,7 +141,8 @@ class PerfCase:
         return self.workload.name
 
 
-# B1, V128, contiguous, unit BF16 descales, zero tail padding, seed20260905.
+# B1, contiguous, unit BF16 descales, zero tail padding, seed20260905.
+# Original cases use V128; explicit D256 GQA cases use Dq=Dv256, H24/HK2.
 BF16_MHA_PERF_CASES = (
     *(PerfCase(Workload(f"bf16-smoke-d{d}", (65,), (129,), dq=d), smoke=True) for d in (128, 192)),
     *(PerfCase(Workload(f"bf16-full-d{d}", (10240,), (2583,), dq=d)) for d in (128, 192)),
@@ -154,6 +155,15 @@ BF16_MHA_PERF_CASES = (
                arches=("gfx942",))
       for name, q, kv, page in (("long-p32", 20480, 20480, 32),
                                 ("short-p32", 10240, 2560, 32), ("short-p64", 10240, 2560, 64))),
+    PerfCase(Workload("bf16-gqa-smoke-d256", (65,), (129,), dq=256, dv=256, heads=24, kv_heads=2),
+             smoke=True, arches=("gfx942",)),
+    *(PerfCase(Workload(f"bf16-gqa-{name}-d256", (q,), (kv,), dq=256, dv=256, heads=24, kv_heads=2,
+                        page=page, causal=causal), arches=("gfx942",))
+      for name, q, kv, page, causal in (("full", 10240, 2583, 64, False),
+                                       ("causal", 32768, 32768, 64, True),
+                                       ("long-p32", 20480, 20480, 32, False),
+                                       ("short-p32", 10240, 2560, 32, False),
+                                       ("short-p64", 10240, 2560, 64, False))),
 )
 
 FP8_MHA_PERF_CASES = (
@@ -1180,6 +1190,28 @@ def native_gpu_selection():
         activate_selected_gpu(selection)
 
 
+def test_bf16_256_default_factory():
+    """Public D256 selects v73; explicit experiments keep isolated factories."""
+    native = BF16_942.load()
+    dma = importlib.import_module(native.__package__ + ".mha_pa_bf16_256_dma_942"
+                                  if native.__package__ else "mha_pa_bf16_256_dma_942")
+    expected = dma._launcher(False, 1, True, 1, True, True, True)
+    for page in (32, 64, 128):
+        for persistent in (None, True, False):
+            default = native.PagedAttention(24, 2, 256, 256, page, False, persistent=persistent)
+            assert default._launch is expected
+            assert default.persistent is (persistent is not False)
+            assert default.bf16_backend.endswith("-pages1-lateS41")
+            alternate = dma.PagedAttention(24, 2, 256, 256, page, False, persistent=persistent,
+                dma_query=False, dma_key="early", dma_value="early", early_pages=False, late_s4_wait=False)
+            assert alternate is not default and alternate._compiled is not default._compiled
+            assert alternate._launch is dma._launcher(False, 1, True, 1, True, False, False)
+            assert default._launch is expected
+    for dq in (128, 192):
+        for dv in (128, 192):
+            assert native.PagedAttention(24, 2, dq, dv, 64, False)._launch is native._launch_attention
+
+
 @pytest.mark.parametrize("variant", ("8wave", "persistent"))
 @pytest.mark.parametrize("dq", (128, 192))
 def test_bf16_mha(dq, variant):
@@ -1197,12 +1229,13 @@ def test_bf16_mha(dq, variant):
 
 
 @pytest.mark.parametrize("kv_len", (31, 64, 65, 128, 129))
-@pytest.mark.parametrize("dq", (128, 192))
+@pytest.mark.parametrize("dq", (128, 192, 256))
 def test_bf16_stage_boundaries(kv_len, dq):
     """One/two/three BN64 tiles exercise prologue, handoff and drain."""
     if gpu_arch() != "gfx942":
         pytest.skip("requires native gfx942")
-    w = Workload("bf16_stage_boundaries", (65,), (kv_len,), dq=dq)
+    w = Workload("bf16_stage_boundaries", (65,), (kv_len,), dq=dq, dv=256 if dq == 256 else 128,
+                 heads=24 if dq == 256 else 16, kv_heads=2 if dq == 256 else 1)
     run_case(w, [BF16_942], run_count=0)
 
 
@@ -1228,13 +1261,14 @@ def test_bf16_stage_operands(pattern):
 
 
 @pytest.mark.parametrize("page", (32, 64, 128))
-@pytest.mark.parametrize("dq,dv", ((128, 128), (192, 128), (128, 192), (192, 192)))
+@pytest.mark.parametrize("dq,dv", ((128, 128), (192, 128), (128, 192), (192, 192), (256, 256)))
 def test_bf16_layout_contract(page, dq, dv):
     """SHUFFLE-5D, both schedulers, ragged prefixes, scales and optional LSE."""
     if gpu_arch() != "gfx942":
         pytest.skip("requires native gfx942")
     case = make_case((0, 7, 33, 513), (31, 33, 97, 545), dq=dq, dv=dv, page=page,
-                     heads=12, kv_heads=3, mode="per-tensor" if page == 32 else "per-token",
+                     heads=24 if dq == 256 else 12, kv_heads=2 if dq == 256 else 3,
+                     mode="per-tensor" if page == 32 else "per-token",
                      q_offset=5, table_offset=3, nonunit_scales=True, poison_tail=True,
                      source_dtype=torch.bfloat16)
     valid = slice(case.q_offset, case.q_offset + sum(case.q_lens))
@@ -1263,11 +1297,13 @@ def test_bf16_layout_contract(page, dq, dv):
 
 
 @pytest.mark.parametrize("backend", (BF16_942, BF16_942_GRID), ids=lambda b: b.name)
-def test_bf16_streams_and_graph(backend):
+@pytest.mark.parametrize("dim", (128, 256))
+def test_bf16_streams_and_graph(backend, dim):
     """Persistent iterations must not share scheduler state across streams."""
     if gpu_arch() != "gfx942":
         pytest.skip("requires native gfx942")
-    case = make_case((1537,), (193,), dq=128, heads=16, poison_tail=False,
+    case = make_case((1537,), (193,), dq=dim, dv=dim, heads=24 if dim == 256 else 16,
+                     kv_heads=2 if dim == 256 else 1, poison_tail=False,
                      source_dtype=torch.bfloat16)
     oracle = torch_reference(case, False)
     calls = [make_call(case, backend, False)[:2] for _ in range(2)]
