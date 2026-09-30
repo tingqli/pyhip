@@ -1,0 +1,21 @@
+{
+  "model_id": "Qwen/Qwen3.8-Flash-Next",
+  "revision": "34567a4712bc9766c4449e2e98e4468bfa24d915",
+  "source_url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/34567a4712bc9766c4449e2e98e4468bfa24d915/config.json",
+  "snapshot_kind": "Relevant text_config fields only; no weights are required",
+  "text_config": {
+    "dtype": "bfloat16",
+    "hidden_size": 2560,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "indexer_n_heads": 4,
+    "indexer_kv_heads": 1,
+    "indexer_head_dim": 128,
+    "indexer_budget": 2048,
+    "indexer_compress_ratio": 4,
+    "num_hidden_layers": 48,
+    "full_attention_interval": 4,
+    "max_position_embeddings": 262144
+  }
+}
