@@ -1,12 +1,13 @@
 # Linear Flash Attention 接口
 
 - [flash_attn_varlen_8wave.py](flash_attn_varlen_8wave.py)：原 D128 adapter，行为未修改。
-- [flash_attn_varlen_d256.py](flash_attn_varlen_d256.py)：新增 gfx942 BF16 D256 原生 linear adapter，独立导入，不替换原接口。
+- [../mha/mha_pa_bf16_942.py](../mha/mha_pa_bf16_942.py)：gfx942 BF16 D256 linear公共入口为`flash_attn_varlen_func`，不替换原D128接口。
+    同模块的`PagedAttention`仍要求SHUFFLE-5D K/V与page32/64/128；不会把5D分页输入当作linear/page1/page4。
 
 ## D256 使用方式
 
 ```python
-from experiments.attention.flydsl.flash_attn_api.flash_attn_varlen_d256 import (
+from experiments.attention.flydsl.mha.mha_pa_bf16_942 import (
     flash_attn_varlen_func,
 )
 
@@ -60,7 +61,11 @@ Q/K/V/O指针要求16-byte对齐，所有输入/输出字节跨度小于2GiB；`
 K/V直接DMA到LDS，V在 `ds_read_b128` 后用编译器可见 `v_perm_b32` 做BF16 2×2转置，再进入M16 MFMA。
 **每次热调用只有一个attention kernel，没有KV转换/gather kernel，也没有调用外预转换要求。**
 
-[test_flash_attn_varlen_d256.py](test_flash_attn_varlen_d256.py) **98项通过**，含causal/LSE、实际随机/逆序页表、GQA、尾部NaN、guard、stream/graph、metadata修改、拒绝条件；所有本次测试编译特化检查private及VGPR/SGPR spill为0。
+[../mha/test_mha_pa.py](../mha/test_mha_pa.py) 的`test_bf16_linear_d256_`前缀保留**10项**：独立FP32 oracle覆盖linear/page1/page4、
+逆序真实页表、GQA、causal/LSE、NaN尾部、guard、stream/graph、metadata失效与错误输入。
+测试与helpers已并入统一MHA测试入口；private及VGPR/SGPR spill检查保留，未改原有MHA测试。
+用标准`-k test_bf16_linear_d256_`筛选；四个`test_bf16_linear_d256_unsupported_options`参数用例不需要GPU，
+pytest选卡仍默认`PYHIP_MHA_GPU=current`。历史98项是旧测试矩阵，不冒充当前数量；本次迁移后的10项均已通过，未重测linear性能。
 
 2026-09-24正式Full验收：B1/Q10240/KV2583/H24/HK2/D256、noncausal/noLSE/persistent，10独立buffer×5轮、每候选50样本，原 `cudaPerf`。
 对同场v98，随机page1/page4 **TFLOPS分别低8.90%/9.37%**；时延分别高 **9.77%/10.33%**。

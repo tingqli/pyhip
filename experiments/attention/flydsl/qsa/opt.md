@@ -1,5 +1,9 @@
 # QSA 优化日志
 
+> 当前API以[README](README.md)为准。2026-09-25整理后默认auto/rho4、dense2051、sorted BN32，
+> BQ/grid固定为已验证值；仅保留auto与forced union。旧章节中的调参命令和模块名是历史记录。
+> [本次代码/测试/机器码验证](../../../../mytest/mydata/qsa_cleanup_20260925_01/README.md)；未改写旧profile或旧性能结果。
+
 ## 2026-09-25：TP2 / TP4 三路精确分流
 
 ### 范围与预先声明的验收
@@ -578,3 +582,125 @@ block sidecar跨custom-op传递、稳定地址与生命周期、每次replay重�
 推荐合入顺序：**可选包与eligibility → 保持token接口的eager adapter → 真实请求/缓存验证 →
 原block sidecar和scratch复用 → 服务端性能验收 → 最后考虑graph、paged直读和indexer短前缀跳算**。
 每阶段默认关闭并能恢复旧路径；任何尚未完成的阶段在日志明确标记，不用实验图/合成测试代替生产验收。
+
+## 2026-09-25：TP2 第一阶段插件接入与真实模型 profile
+
+本节是上述方案的**本机可回滚实验接入**，不是修改SGLang生产源码或全量上线认证。
+按用户约束，新增代码、测试和报告均在PyHIP的mytest；SGLang和原启动/测试脚本只读。
+当前SGLang为c9ef753，不是方案链接中的540d564；已重新核对并固定backend/indexer/expand的源码SHA。
+
+- 使用当前SGLang原生general-plugin entry point＋HookRegistry，而非修改模型/ServerArgs或把experiments目录加入服务器sys.path。
+	[插件说明](../../../../mytest/sglang_flydsl_qsa_plugin/README.md)；默认关闭，`PYHIP_QSA_PREFILL=1`启用。
+- 6个QSA runtime文件＋3个MHA helper在wheel构建时逐字打包，许可证/哈希随包保存；不导入合成输入、benchmark、pytest或AMD SMI。
+- 原`forward_extend`继续处理KV写入、prefix gather、裁剪和padding；只在主runner ordinary eager EXTEND的compressed BF16/gfx942合同内替换sparse prefill调用。decode/spec/graph/tokenwise/CP/DCP保持旧路。
+- 第一阶段GPU恢复原block，按真实完整块数检查四项连续、对齐、tail、padding、因果和重复块，错误显式暴露；无异常后baseline重算。
+- 独占scratch按backend/device/stream/完整length+prefix布局/heads/scale缓存，逐layer重建gate与sort；首次布局仍有实验prepare的小metadata回读，不称零同步。输出独立分配。
+
+### 验证
+
+- 目标机原完整矩阵：[238 passed](../../../../mytest/qsa_original_full_tests.xml)，无skip。
+- 最终插件：[27 passed](../../../../mytest/qsa_plugin_final_tests.xml)，含生产选择恢复、非法token、TP2/4/8、prefix gather/空请求、padding/save=false、动态选择、预热隔离和单卡双stream。
+- TP2实际模型各rank校验48个layer/layout案例，逐元素检查共289284行，另做FP32边界/采样oracle；保持rtol=atol=0.02。并非模型准确率或超长上下文验收。
+- 补充同进程跨GPU测试的夹具ambient-device错误与修正后的FlyDSL特化跨卡限制均保留失败记录。最终0.1.1显式限制每进程单GPU；SGLang本次TP2为每rank独立进程，服务采集没有此错误。
+
+### Profile结果（不重采/覆盖旧base）
+
+完整材料：[TP2 QSA profile报告](../../../../mytest/sglang_tp2_qsa_20260925_01/README.md)。
+负载仍为nominal12000→5、4请求、并发1，4/4成功；真实3×12000＋1×11888 prefill、20 decode graph，与旧base一致。
+每rank新QSA命中48次；真实query行分流dense17.13%、direct70.66%、union12.20%，不能用synthetic shared吞吐替代。
+
+| 单rank累计GPU kernel时间，48次调用 | TP0 | TP1 |
+| --- | ---: | ---: |
+| 原sparse attention | 467.187ms | 466.883ms |
+| 新attention本体 | 315.330ms | 315.345ms |
+| 恢复＋校验 | 10.253ms | 10.242ms |
+| plan＋sort | 8.732ms | 8.746ms |
+| 新三段合计 | 334.316ms | 334.332ms |
+| 三段GPU工作比值 | 1.397x | 1.396x |
+
+TP0本体dense11.381ms、union25.123ms、direct278.826ms，按source scope＋correlation区分同名kernel。
+indexer相关GPU工作209.734→210.084ms，未跳过；本负载无prefix gather。
+上述不包含host调度、输出分配、未改上游操作或indexer，不是完整TTFT加速。
+Median TTFT1083.10→1074.18ms；两场未交错、地址/server seed不同，candidate额外预热11888特化，mean改善不能全部归因于QSA。
+profiler导出等待计入benchmark duration；不将其吞吐当无profiler基准。
+
+采集用0.1.0固定包；之后0.1.1仅加单GPU进程防误用检查，9个runtime文件逐字相同并已机械核对，未重贴旧trace版本。
+两ranktrace完整，PTL均Enabled/VECTOR,F8，服务/GPU资源已清理。保留ROCtracer重复flow警告与未完成的长上下文/模型指标/sidecar/graph等边界。
+
+## 2026-09-25：GPU kernel 角色命名（0.1.2）
+
+- 按用户要求，为FlyDSL添加显式profiler符号：`direct_qsa_bf16_d256`、`union_qsa_bf16_d256`、
+	`dense_qsa_bf16_d256_bounded`；dense复用的共享MHA实现命名为`dense_mha_bf16_d256`。
+	MHA只有这一装饰器名称变化，计算与调用接口不变。
+- Triton准备kernel改为`direct_qsa_sort_blocks`与`union_qsa_scatter_membership`、
+	`union_qsa_compact_membership`、`union_qsa_score_masks`，避免混淆排序与建表成本。
+- [33项定向GPU测试](../../../../mytest/qsa_kernel_names_tests.xml)通过，覆盖TP2/4/8、direct两种BN、
+	union局部分组、dense对齐/尾部、graph gate；fixture从实际编译IR断言四类FlyDSL符号与零spill。
+- [源码重现证明](../../../../mytest/qsa_kernel_names_proof.json)逐字核对9个runtime文件：
+	只有4个FlyDSL显示名和4个Triton函数名/调用变化，adapter未变。
+- 新[0.1.2包](../../../../mytest/qsa_plugin_dist/pyhip_sglang_qsa_plugin-0.1.2-py3-none-any.whl)与target_v3已生成，原生插件加载预检通过。
+	target_v1/v2、旧wheel及两轮trace不改写；没有重跑模型profile或性能计时，不能将命名后的产物称为旧场次实测。
+
+## 2026-09-25：两层真实输入重放，调整分流达到半base
+
+按用户新要求，新增数据/profile/日志统一在mytest/mydata大容量卷；不移动旧数据，不改SGLang。
+[完整报告](../../../../mytest/mydata/qsa_real_study_20260925/README.md)、
+[预声明协议](../../../../mytest/mydata/qsa_real_study_20260925/PROTOCOL.md)、
+[实际命令](../../../../mytest/mydata/qsa_real_study_20260925/COMMANDS.md)。
+
+- 用原TP2 profile负载捕获layer3/47、rank0/1、真实M12000/11888，8份BF16 Q/K/V及全部选择/长度/位置/scale/输出。
+	只捕获profile窗口原始调用，同stream独立GPU克隆；导出trace后CPU序列化。克隆扰动该trace，性能用离线重放，不称dump零开销。
+- 逐张量/文件SHA验证；原baseline两条GPU函数AST与当前SGLang一致。真实数据正确性8passed，容差仍rtol=atol=.02。
+- 有效探索比较15种配置，再细化union grid1/2/4和dense2048；forcedunion或auto rho4最好。
+	direct-only、BN64、BQ4、nosort等不解决目标；union_only/dense2048也未同时改善两层。
+- 原rho1.5仅13.3%–21.9%非dense行走union。去重后唯一block/逐query选择block总和为21.44%–25.81%，
+	聚合复用3.87–4.66×；rho中位1.74–2.14、最大3.021。rho4使本批全部非dense行走union，逐query选择和causality不变。
+- 保留dense2051、effectiveBQ8、grid_multiplier2、BN32、sort=true；无计算内核修改。
+
+### 正式10buffer/10sample验收（非探索样本）
+
+全部8份数据在物理GPU0/PCI0000:0a:00.0重放，原cudaPerf、每buffer/scope2warmup、相邻sample逆序，
+每case7scope×10sample，合计560raw。base输出预分配；full为recover+async assert+rebuild+dispatch，
+不含indexer、KV gather、分配、JIT或服务调度。
+
+| 8case范围 | full ms | 原base耗时比例 | full有效TFLOPS |
+| --- | ---: | ---: | ---: |
+| 原base | 9.7085–9.8237 | 100% | 28.04–28.18 |
+| 原auto/rho1.5 | 6.9168–7.0800 | 70.46%–72.91% | 38.64–39.96 |
+| dense+union | 3.7906–4.5679 | 39.04%–46.51% | 60.51–72.18 |
+| auto/rho4 | 3.8223–4.6012 | 39.37%–46.85% | 60.07–71.58 |
+
+两个候选在**每一份**输入上都显式断言full<=0.5base，
+[性能单测8passed](../../../../mytest/mydata/qsa_real_study_20260925/formal_performance.xml)。
+[最终审计/CSV](../../../../mytest/mydata/qsa_real_study_20260925/audit_final/timings.csv)从raw重算；
+24份门禁均PTL Enabled/VECTOR,F8、利用率0%、VRAM<=5%，源码/实际ELF零scratch/spill核对通过。
+原sweep_v1结束利用率20%失败，186raw保留但不作为性能结论；后续按原harness校验/源码冻结/end gate顺序执行，无sleep或轮询。
+
+### 可用插件0.1.4与限制
+
+新增`PYHIP_QSA_MODE`和`PYHIP_QSA_UNION_INFLATION`，默认仍auto/1.5；推荐本批显式auto/4以保留direct fallback。
+[配置收据](../../../../mytest/mydata/qsa_real_study_20260925/selected_config.json)、
+[0.1.4包](../../../../mytest/mydata/qsa_real_study_20260925/packages/pyhip_sglang_qsa_plugin-0.1.4-py3-none-any.whl)。
+31项插件回归+8份真实输入经打包Registry首次prepare/后续rebuild，共
+[39passed](../../../../mytest/mydata/qsa_real_study_20260925/plugin_tuned_tests.xml)；原生5hook/lazy import预检通过。
+9个runtime文件与bridge均与0.1.3采集包逐字相同，历史包/trace不换标签。
+
+不宣称无profiler端到端2×，也不宣称相对auto1.5再减半（实际下降33.7%–46.0%）。
+调优后全模型服务profile、其他层/真实长prefix/并发shape及TP4/TP8性能尚未验证。
+
+## 2026-09-25：最新源码 auto4 TP2 全模型 profile
+
+按用户要求，从当前源码重新构建0.1.4到新的独立target，再运行原模型TP2 launcher、warmup与profile负载；
+[报告/双rank trace入口](../../../../mytest/mydata/sglang_tp2_qsa_latest_20260925_01/README.md)。
+没有输入克隆、没有改SGLang、没有覆盖旧profile；当前9个runtime及插件源哈希与包一致。
+
+- 4/4请求成功，实际3×M12000+1×M11888，20decode steps；每rank48次新QSA。
+- 每rank48个真实layer/layout通过原rtol=atol=.02全行对照和FP32采样；profile外验证，不作为模型准确率评测。
+- 最新GPU恢复+plan+attention累计TP0/1=216.738/216.491ms，原base=467.187/466.883ms，
+	新/旧46.39%/46.37%，约2.16×；旧auto1.5三段334.316/334.332ms。
+- 最新attention本体198.870/198.638ms；TP0 dense11.391ms、union186.609ms、direct gate0.870ms。
+- 全部12个QSA层：dense17.13%、union82.87%、direct工作行0；auto仍有direct gate/skip成本。
+- Median TTFT1083.10→1013.54ms为分场profile观测，server seed/地址及预热不同，不称端到端2.16×；duration含导出等待。
+- 双trace完整，QSA相关ROCm correlation无缺失/歧义；原始duplicate-flow警告保留。服务已结束，GPU0/1均回到空闲。
+- [TP0单trace三表](../../../../mytest/mydata/sglang_tp2_qsa_latest_20260925_01/triage_tp0.md)显示通信/GEMM/MoE仍是主要工作；
+	单trace不据此证明overlap/fusion收益。真实长prefix、其他并发shape、TP4/TP8调优性能仍未验证。

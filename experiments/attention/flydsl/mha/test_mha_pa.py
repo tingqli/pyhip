@@ -1191,57 +1191,19 @@ def native_gpu_selection():
 
 
 def test_bf16_256_default_factory():
-    """Public D256 selects v73; explicit experiments keep isolated factories."""
+    """Public D256 keeps the validated paged path; smaller dimensions stay unchanged."""
     native = BF16_942.load()
-    dma = importlib.import_module(native.__package__ + ".mha_pa_bf16_256_dma_942"
-                                  if native.__package__ else "mha_pa_bf16_256_dma_942")
-    expected = dma._launcher(False, 1, True, 1, True, True, True)
+    paged = importlib.import_module(native.__package__ + ".mha_pa_bf16_256_paged_942"
+                                    if native.__package__ else "mha_pa_bf16_256_paged_942")
     for page in (32, 64, 128):
         for persistent in (None, True, False):
             default = native.PagedAttention(24, 2, 256, 256, page, False, persistent=persistent)
-            assert default._launch is expected
+            assert default._launch is paged._launch
             assert default.persistent is (persistent is not False)
             assert default.bf16_backend.endswith("-pages1-lateS41")
-            alternate = dma.PagedAttention(24, 2, 256, 256, page, False, persistent=persistent,
-                dma_query=False, dma_key="early", dma_value="early", early_pages=False, late_s4_wait=False)
-            assert alternate is not default and alternate._compiled is not default._compiled
-            assert alternate._launch is dma._launcher(False, 1, True, 1, True, False, False)
-            assert default._launch is expected
     for dq in (128, 192):
         for dv in (128, 192):
             assert native.PagedAttention(24, 2, dq, dv, 64, False)._launch is native._launch_attention
-
-
-def test_bf16_256_pipeline_factory():
-    """Selected pipeline options are validated and do not mutate defaults."""
-    native = BF16_942.load()
-    dma = importlib.import_module(native.__package__ + ".mha_pa_bf16_256_dma_942"
-                                  if native.__package__ else "mha_pa_bf16_256_dma_942")
-    options = dict(dma_query=False, dma_key="early", dma_value="early", early_pages=True,
-                   late_s4_wait=True, lead_wait=3, late_s0_wait=True, pv_columns=2,
-                   m0_offset=True, partial_k_wait=True, pv_s7_overlap=True)
-    for page in (32, 64, 128):
-        for persistent in (True, False):
-            order = 2 if persistent else 0
-            default = native.PagedAttention(24, 2, 256, 256, page, False, persistent=persistent)
-            original_launch = default._launch
-            selected = dma.PagedAttention(24, 2, 256, 256, page, False, persistent=persistent,
-                                           task_order=order, **options)
-            assert selected._launch is dma._launcher(False, 1, True, 1, True, True, True,
-                                                       3, True, 2, True, order, True, True)
-            assert selected is not default and selected._compiled is not default._compiled
-            assert default._launch is original_launch
-    invalid = (dict(lead_wait=True), dict(lead_wait=4), dict(pv_columns=3), dict(m0_offset=1),
-               dict(task_order=3), dict(partial_k_wait=1), dict(pv_s7_overlap=1))
-    for change in invalid:
-        with pytest.raises(ValueError):
-            dma.PagedAttention(24, 2, 256, 256, 64, False, **(options | change))
-    with pytest.raises(NotImplementedError):
-        dma.PagedAttention(24, 2, 256, 256, 64, False, persistent=False, task_order=2, **options)
-    for change in (dict(dma_query=True), dict(dma_key="off"), dict(dma_value="off"),
-                   dict(early_pages=False), dict(late_s4_wait=False), dict(pv_columns=0)):
-        with pytest.raises(NotImplementedError):
-            dma.PagedAttention(24, 2, 256, 256, 64, False, **(options | change))
 
 
 @pytest.mark.parametrize("variant", ("8wave", "persistent"))
@@ -1375,6 +1337,184 @@ def test_fp8_mha(dq, causal, mode):
     w = Workload("fp8_lds_edges", (0, 7, 33, 129), (63, 65, 193, 257), dq=dq,
                  heads=6, kv_heads=2, causal=causal, scale_mode=mode)
     run_case(w, [FP8], run_count=0, poison_tail=True)
+
+
+# ---- D256-only linear/page1/page4 contracts ----
+
+@cache
+def _linear_d256_api():
+    # Keep CLI --list and pytest collection free of native kernel imports.
+    if __package__:
+        from . import mha_pa_bf16_942 as api
+    else:
+        import mha_pa_bf16_942 as api
+    return api
+
+
+@pytest.fixture(scope="module")
+def linear_d256_gfx942():
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip("requires ROCm gfx942")
+    if not torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.startswith("gfx942"):
+        pytest.skip("requires gfx942")
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _linear_d256_inputs(device, *, qlens=(0, 7, 33, 65), klens=(3, 33, 65, 129), page=None,
+           heads=12, kv_heads=1, causal=True, persistent=True, scale=0.0625):
+    generator = torch.Generator(device=device).manual_seed(20260924)
+    q = torch.randn((sum(qlens), heads, 256), generator=generator, device=device, dtype=torch.bfloat16)
+    keys = [torch.randn((n, kv_heads, 256), generator=generator, device=device, dtype=q.dtype) for n in klens]
+    values = [torch.randn(k.shape, generator=generator, device=device, dtype=q.dtype) for k in keys]
+    cq, ck = [0], [0]
+    for n, k in zip(qlens, klens):
+        cq.append(cq[-1] + n)
+        ck.append(ck[-1] + k)
+    table = None
+    if page is None:
+        k, v = torch.cat(keys), torch.cat(values)
+    else:
+        counts = [math.ceil(n / page) for n in klens]
+        count = sum(counts)
+        k = torch.full((count * page, kv_heads, 256), float("nan"), device=device, dtype=q.dtype)
+        v = torch.full_like(k, float("nan"))
+        table = torch.full((len(klens), max(counts) + 1), -1, device=device, dtype=torch.int32)
+        cursor = 0
+        for sequence, n in enumerate(klens):
+            pages = torch.arange(count - cursor - 1, count - cursor - counts[sequence] - 1, -1, device=device)
+            table[sequence, :counts[sequence]] = pages.to(torch.int32)
+            rows = torch.arange(n, device=device)
+            physical = pages[rows // page] * page + rows % page
+            k[physical], v[physical] = keys[sequence], values[sequence]
+            cursor += counts[sequence]
+    output = torch.empty(q.shape, device=device, dtype=torch.float32)
+    lse = torch.empty(q.shape[:2], device=device, dtype=torch.float32)
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for sequence, (n, length) in enumerate(zip(qlens, klens)):
+            if n == 0:
+                continue
+            g = heads // kv_heads
+            key = keys[sequence].float().repeat_interleave(g, dim=1)
+            value = values[sequence].float().repeat_interleave(g, dim=1)
+            scores = torch.einsum("mhd,nhd->hmn", q[cq[sequence]:cq[sequence + 1]].float(), key) * scale
+            if causal:
+                mask = torch.arange(length, device=device)[None] > torch.arange(n, device=device)[:, None] + length - n
+                scores.masked_fill_(mask[None], -float("inf"))
+            lse[cq[sequence]:cq[sequence + 1]] = scores.logsumexp(-1).T
+            output[cq[sequence]:cq[sequence + 1]] = torch.einsum("hmn,nhd->mhd", scores.softmax(-1), value)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+    arguments = dict(q=q, k=k, v=v,
+                     cu_seqlens_q=torch.tensor(cq, dtype=torch.int32, device=device),
+                     cu_seqlens_k=torch.tensor(ck, dtype=torch.int32, device=device),
+                     max_seqlen_q=max(qlens), max_seqlen_k=max(klens),
+                     block_table=table, page_size=page or 1, causal=causal,
+                     persistent=persistent, softmax_scale=scale, return_lse=True)
+    return arguments, (output, lse)
+
+
+def _linear_d256_check(arguments, expected):
+    actual = _linear_d256_api().flash_attn_varlen_func(**arguments)
+    assert actual[0].dtype == torch.bfloat16 and actual[0].is_contiguous()
+    torch.testing.assert_close(actual[0].float(), expected[0], rtol=0.02, atol=0.02)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0.002, atol=0.002)
+    return actual
+
+
+@pytest.mark.parametrize("page,persistent,heads,hk,causal", [
+    (None, True, 12, 1, True), (1, False, 6, 2, False), (4, True, 24, 2, True),
+])
+def test_bf16_linear_d256_layout_tail_and_lse(linear_d256_gfx942, page, persistent, heads, hk, causal):
+    args, reference = _linear_d256_inputs(linear_d256_gfx942, page=page, persistent=persistent, heads=heads,
+                             kv_heads=hk, causal=causal, scale=0.5 if page == 1 else 0.0625)
+    first = _linear_d256_check(args, reference)
+    repeated = _linear_d256_check(args, reference)
+    torch.testing.assert_close(first, repeated, rtol=0, atol=0)
+    no_lse = _linear_d256_api().flash_attn_varlen_func(**(args | {"return_lse": False}))
+    torch.testing.assert_close(no_lse.float(), reference[0], rtol=0.02, atol=0.02)
+
+
+def test_bf16_linear_d256_empty_self_attention_and_guards(linear_d256_gfx942):
+    args, reference = _linear_d256_inputs(linear_d256_gfx942, qlens=(0, 0), klens=(3, 65))
+    _linear_d256_check(args, reference)
+    args, reference = _linear_d256_inputs(linear_d256_gfx942, qlens=(0, 17, 33), klens=(0, 17, 33), heads=3)
+    args["cu_seqlens_k"] = None
+    q = args["q"]
+    storage = torch.full((q.numel() + 16,), 123.0, dtype=q.dtype, device=q.device)
+    args["out"] = storage[8:-8].view_as(q)
+    first = _linear_d256_check(args, reference)
+    assert first[0] is args["out"] and bool((storage[:8] == 123).all()) and bool((storage[-8:] == 123).all())
+
+
+def test_bf16_linear_d256_streams_graph_and_metadata_invalidation(linear_d256_gfx942):
+    args, reference = _linear_d256_inputs(linear_d256_gfx942, page=4)
+    current = torch.cuda.current_stream()
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    outputs = [torch.empty_like(args["q"]) for _ in streams]
+    for stream, out in zip(streams, outputs):
+        stream.wait_stream(current)
+        result = _linear_d256_api().flash_attn_varlen_func(**args, out=out, stream=stream)
+        current.wait_stream(stream)
+        torch.testing.assert_close(result[0].float(), reference[0], rtol=0.02, atol=0.02)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=streams[0]):
+        result = _linear_d256_api().flash_attn_varlen_func(**args, out=outputs[0])
+    for _ in range(2):
+        graph.replay()
+        current.synchronize()
+        torch.testing.assert_close(result[0].float(), reference[0], rtol=0.02, atol=0.02)
+    original = args["block_table"].clone()
+    args["block_table"][0, 0] = -1
+    with pytest.raises(ValueError, match="invalid active"):
+        _linear_d256_api().flash_attn_varlen_func(**args)
+    args["block_table"].copy_(original)
+    _linear_d256_check(args, reference)
+    args["cu_seqlens_q"].add_(0)
+    with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=streams[1]):
+        with pytest.raises(RuntimeError, match="Unwarmed or changed"):
+            _linear_d256_api().flash_attn_varlen_func(**args)
+
+
+@pytest.mark.parametrize("option", ({"dropout_p": 0.1}, {"num_waves": 4}, {"page_size": 2}, {"bias": 0}))
+def test_bf16_linear_d256_unsupported_options(option):
+    args = dict(q=None, k=None, v=None, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0)
+    with pytest.raises(NotImplementedError):
+        _linear_d256_api().flash_attn_varlen_func(**(args | option))
+
+
+def test_bf16_linear_d256_invalid_scale_metadata_and_alias(linear_d256_gfx942):
+    args, _ = _linear_d256_inputs(linear_d256_gfx942, page=4)
+    for scale in (0, -1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="softmax_scale"):
+            _linear_d256_api().flash_attn_varlen_func(**(args | {"softmax_scale": scale}))
+    with pytest.raises(ValueError, match="overlap"):
+        _linear_d256_api().flash_attn_varlen_func(**(args | {"out": args["q"]}))
+    backing = torch.empty(args["q"].numel() + args["k"].numel(), device=linear_d256_gfx942, dtype=torch.bfloat16)
+    key_alias = backing[:args["k"].numel()].view_as(args["k"]).copy_(args["k"])
+    out_alias = backing[8:8 + args["q"].numel()].view_as(args["q"])
+    with pytest.raises(ValueError, match="overlap"):
+        _linear_d256_api().flash_attn_varlen_func(**(args | {"k": key_alias, "out": out_alias}))
+    with pytest.raises(ValueError, match="maxima"):
+        _linear_d256_api().flash_attn_varlen_func(**(args | {"max_seqlen_q": 1}))
+    with pytest.raises(ValueError, match="contiguous"):
+        _linear_d256_api().flash_attn_varlen_func(**(args | {"q": args["q"].float()}))
+    with pytest.raises(NotImplementedError, match="autograd"):
+        _linear_d256_api().flash_attn_varlen_func(**(args | {"q": args["q"].detach().requires_grad_()}))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def linear_d256_native_resources():
+    yield
+    if not torch.cuda.is_initialized():
+        return
+    from . import mha_pa_bf16_256_linear_942 as core
+
+    for compiled in core._COMPILED.values():
+        for field in ("private_segment_fixed_size", "vgpr_spill_count", "sgpr_spill_count"):
+            values = re.findall(rf"\b{field}\s*=\s*(\d+)", compiled._keepalive.ir)
+            assert values and not any(map(int, values)), field
 
 
 def _pytest_perf(suite, spec):

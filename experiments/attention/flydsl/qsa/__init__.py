@@ -1,17 +1,5 @@
-"""Packed sparse GQA inputs, reference, and frozen SGLang baseline.
+"""gfx942 sparse attention; the only public callable is qsa()."""
 
-GPU implementations are imported explicitly so input-contract tests stay CPU-only.
-"""
+from .qsa import qsa
 
-from .contract import AttentionInputs, CaseSpec, ModelShape, load_model_shape
-from .inputs import default_spec, make_inputs, validate_inputs
-
-__all__ = [
-    "AttentionInputs",
-    "CaseSpec",
-    "ModelShape",
-    "default_spec",
-    "load_model_shape",
-    "make_inputs",
-    "validate_inputs",
-]
+__all__ = ["qsa"]

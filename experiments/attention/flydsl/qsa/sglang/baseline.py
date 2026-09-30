@@ -1,15 +1,45 @@
 # Copyright 2023-2024 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
 
-"""SGLang prefill snapshot; provenance is recorded in source_manifest.json.
+"""Frozen SGLang kernels and a tensor-only adapter for temporary test use."""
 
-The two decorated definitions are unchanged from the Apache-2.0 SGLang QSA
-bundle. This module's header is adapted for its new package location; host
-launch adapters live in baseline.py.
-"""
-
+import torch
 import triton
 import triton.language as tl
+
+SOURCE_MANIFEST = {
+    "repository": "https://github.com/sgl-project/sglang",
+    "workspace_head": "540d564c19436f28f2644e2247350da56c124452",
+    "source_path": "python/sglang/srt/layers/attention/qsa/sparse_attn.py",
+    "source_file_sha256": "8e378de61927524a4d3c725bc910a310d31306504bbfa57fc5e27aaee0665d91",
+    "snapshot_path": "baseline.py",
+    "hash_scope": "UTF-8 source of each decorated function, including final newline",
+    "functions": {
+        "_sparse_gqa_prefill": "215b956fac4755f39de59b04c60b3e867f15aa44b27cd55055423b6f29f2f7f3",
+        "_sparse_gqa_chunk_prefill": "050a46369a586a4310b988acd3b6fa7b80369ad813874a00c8fe272c152694d6",
+    },
+    "scope": "Copied function definitions, not a relocation of production code",
+    "host_adapter_changes": [
+        "Caller preallocates output, instead of torch.empty_like inside the wrapper",
+        "max_seqlen_q comes from host case lengths; no GPU .max().item() synchronization",
+        "The original H20/non-H20 launch tables are retained; no ROCm tuning is claimed",
+        "Only 2-D shared-across-heads indices and contiguous BF16 inputs are exposed",
+    ],
+}
+
+_H20_CONFIGS = (
+    (32, (32, 8, 2)),
+    (64, (64, 8, 2)),
+    (1024, (32, 4, 2)),
+    (float("inf"), (16, 1, 2)),
+)
+_L20_CONFIGS = (
+    (32, (32, 8, 2)),
+    (64, (64, 8, 2)),
+    (128, (64, 4, 2)),
+    (512, (32, 4, 2)),
+    (float("inf"), (16, 1, 2)),
+)
 
 
 @triton.jit
@@ -205,3 +235,63 @@ def _sparse_gqa_chunk_prefill(
         output,
         mask=(offs_h < GROUP_SIZE)[:, None],
     )
+
+
+def baseline(
+    q,
+    k,
+    v,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    *,
+    max_seqlen_q,
+    has_prefix=False,
+    softmax_scale=0.0625,
+    out=None,
+):
+    """Launch the frozen baseline with caller-preallocated sequence metadata."""
+    if out is None:
+        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    if q.numel() == 0:
+        return out
+
+    with torch.cuda.device(q.device):
+        group_size = q.shape[1] // k.shape[1]
+        table = (
+            _H20_CONFIGS
+            if "H20" in torch.cuda.get_device_name(q.device)
+            else _L20_CONFIGS
+        )
+        block_n, warps, stages = next(
+            cfg for limit, cfg in table if q.shape[0] <= limit
+        )
+        grid = (max_seqlen_q, (cu_q.numel() - 1) * k.shape[1])
+        strides = (
+            *q.stride(),
+            *k.stride(),
+            *v.stride(),
+            *out.stride(),
+            indices.stride(0),
+            0,
+            indices.stride(1),
+        )
+        options = {
+            "NUM_KV_HEADS": k.shape[1],
+            "GROUP_SIZE": group_size,
+            "BLOCK_M": max(16, triton.next_power_of_2(group_size)),
+            "BLOCK_N": block_n,
+            "HEAD_DIM": q.shape[2],
+            "num_warps": warps,
+            "num_stages": stages,
+        }
+        args = (q, k, v, out, indices)
+        tail = (softmax_scale, indices.shape[1], *strides)
+        if not has_prefix:
+            _sparse_gqa_prefill[grid](*args, cu_q, *tail, **options)
+        else:
+            _sparse_gqa_chunk_prefill[grid](
+                *args, cu_q, cu_k, kv_lens, *tail, **options
+            )
+    return out

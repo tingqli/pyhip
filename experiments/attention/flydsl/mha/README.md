@@ -1,5 +1,27 @@
 # Paged Attention / SWA
 
+## 2026-09-25：D256胜出路径整理
+
+当前D256仅保留两套**不同输入ABI**的已验证实现：
+
+- [mha_pa_bf16_256_paged_942.py](mha_pa_bf16_256_paged_942.py)：原SHUFFLE-5D公共`PagedAttention`默认v73，
+	register Q、early K/V DMA、page lookahead、late S4 wait。保留page32/64/128、两种调度与LSE。
+- [mha_pa_bf16_256_linear_942.py](mha_pa_bf16_256_linear_942.py)：普通线性/page1/page4 D256，供varlen接口和QSA dense/union复用。
+- [_common.py](_common.py)：19个通用helper后接明确标注的D256专用常量与15个helper；两套D256内核统一从这里导入，函数体不变。
+- [mha_pa_bf16_942.py](mha_pa_bf16_942.py)：统一公开`PagedAttention`与`flash_attn_varlen_func`，但**不混用输入ABI**。
+
+`PagedAttention`继续检查5D K/V：K为`[P,HK,Dq/8,S,8]`，V为`[P,HK,S/8,Dv,8]`，page32/64/128。
+`flash_attn_varlen_func`接受连续BF16 `[T,H,256]` Q和`[T,HK,256]` K/V，支持linear/page1/page4；
+完整参数顺序、metadata weakref/版本检查、graph预热约束、alias/跨度检查和LSE返回均保留。
+线性接口的导入和调用示例见[接口说明](../flash_attn_api/README.md)。本次52项BF16回归通过，包含全部10项linear测试；未重测MHA性能。
+
+删除旧v48设备流水、P-exchange及其测试，DMA模块收敛为上述固定v73路径；Q-DMA、K/V off/split/late、
+write_mix和未采纳v98开关不再作为当前候选。**不是删除公共D256分页支持**。
+D128/192、FP8、gfx950和SWA仍有独立调用者，不在本次裁剪范围内。
+
+下文是此前试验记录，旧模块名/命令仅表示当时状态；当前接口以上述文件为准。
+全部历史JSON/ELF/profile保持不变，详细过程继续留在[opt.md](opt.md)。
+
 更新：2026-09-09。默认统一入口为 [test_mha_pa.py](test_mha_pa.py)：CLI运行性能集，普通pytest运行边界正确性测试。
 MI308计算/访存分离pipeline已完成68项回归。用户确认250T目标为D128/D192 MHA long、含两种调度；persistent分别266.633/266.633T，普通grid分别264.072/267.176T，四项达标。平台文档第2节更新为同一完整进程的61条结果，full/short仍为237.897–248.660T，不扩大达标结论。结果为低负载启动、非独占，不宣称全程无干扰。
 先逐buffer检查FP32参考O与重复逐位一致性，再报告 **acc、时间、TFLOPS、逻辑GB/s**；性能集不测LSE，BF16功能契约另校验自然对数LSE。
@@ -23,10 +45,9 @@ MI308计算/访存分离pipeline已完成68项回归。用户确认250T目标为
 上面的v48六shape成绩及下面的实验数字是各自历史轮次，不改写为新默认成绩，220T目标状态不变。
 实验模块保留原参数默认值以支持显式对照；公共入口显式选择全部组合选项。
 
-**可选 M32 P-exchange 实验（2026-09-23）：**新增独立
-[mha_pa_bf16_256_pexchange_942.py](mha_pa_bf16_256_pexchange_942.py)，显式导入其中的`PagedAttention`选择，
+**历史 M32 P-exchange 实验（2026-09-23，当前已移除）：**当时通过独立实验factory选择，
 不替换公共默认后端。QK按key列分半、LDS交换P/行统计、两wave各累加DV128；64KiB LDS，已测Full零scratch/spill。
-独立[回归](test_mha_pa_pexchange.py)21项通过。2buffer/4样本Full为133.437/132.598T，
+当时独立回归21项通过。2buffer/4样本Full为133.437/132.598T，
 同轮v48为190.322/189.862T；**新版本当前更慢**，不加入默认CLI候选。
 详情与资源/原始证据见[P-exchange记录](results/d256_pexchange_20260923/README.md)。
 
@@ -34,7 +55,7 @@ MI308计算/访存分离pipeline已完成68项回归。用户确认250T目标为
 两个显式实例29.391/36.267T，同轮自有P-exchange133.430T、v48 190.241T。
 这些shuffle配置不是gfx942默认生成实例，且交换FP32 S而非BF16 P；不作为CK最优性能结论。
 
-**可选4B/lane direct-to-LDS实验：**[独立DMA4模块](mha_pa_bf16_256_dma_942.py)保留Q-only/K-only/Q+K，
+**历史4B/lane direct-to-LDS实验：**当时独立DMA4模块比较Q-only/K-only/Q+K，
 Q/K阶段最好方案为`dma_query=False, dma_key="early", interleave=True`，K写LDS的VMEM与S4 V读取逐条交织。
 Q/K/QK的78项及补测DS写/DMA写混排的26项功能检查通过；后者未优于S4读写交织。
 10buffer/50样本同轮相对v48约+4%；绝对吞吐存在运行中频率波动，两个完整50样本轮均保留，
@@ -62,7 +83,7 @@ K部分WAR退休、S7 PV/center重叠和任务转置）。26项功能、12项稀
 [Viewer manifest](ui_output_agent_18599_dispatch_393/filenames.json)、[统计CSV](stats_ui_output_agent_18599_dispatch_393.csv)、
 [采集身份与审计](results/d256_v98_att_20260924/README.md)；实际ELF与正式计时版本一致，8/8波完整，无新性能达标声明。
 
-**新增D256 linear（2026-09-24）：**独立 [flash_attn_varlen_func](../flash_attn_api/flash_attn_varlen_d256.py)
+**新增D256 linear（2026-09-24，现并入统一MHA入口）：**[flash_attn_varlen_func](mha_pa_bf16_942.py)
 支持BF16 Q/K/V/O `[T,H,D]`、GQA、KV page1/4与任意物理页表；K/V直接DMA到LDS，V通过LDS读取＋`v_perm`转置，热调用仅一个attention kernel，无KV转换。
 [98项功能及资源回归](results/d256_linear_20260924/l30-resource-functional.xml)通过。
 正式Full/persistent每候选50样本，对v98随机page1/page4吞吐低8.90%/9.37%，时延高9.77%/**10.33%**；
@@ -139,8 +160,11 @@ OUT=$(mktemp -d "$PWD/mha-results.XXXXXX")
 
 ## pytest：默认功能，性能显式启用
 
-默认统一入口单文件pytest收集53项功能测试（含D256默认及可选流水线factory回归）；只有`PYHIP_MHA_PERF=1`时才收集额外33项性能测试。没有独立gather测试。
-新M32实验的21项回归在[test_mha_pa_pexchange.py](test_mha_pa_pexchange.py)，需显式选择该文件；不改变上述默认suite。
+当前统一入口单文件pytest包含62项功能用例（静态参数计数：既有52项，加迁入的10项D256 linear契约）；只有`PYHIP_MHA_PERF=1`时才收集额外33项性能测试。没有独立gather测试。
+迁入用例采用`test_bf16_linear_d256_`前缀，可用标准`-k test_bf16_linear_d256_`筛选。
+独立FP32 oracle、linear/page1/page4逆序页表、GQA、causal/LSE、NaN尾部、guard、stream/graph、metadata失效、错误输入和private/spill检查均保留。
+这10项为已有测试迁移，已随本次52项BF16回归通过；四个`test_bf16_linear_d256_unsupported_options`参数用例不需要GPU。
+新M32实验的21项历史回归已随失败实验移除，不作为当前suite。
 MI308本次数值检查41项功能及27项性能全部通过。BF16覆盖块数边界、所有Dq/Dv128/192和page32/64/128组合、两种调度、无LSE热路径/LSE、NaN尾页、前缀guard及并发stream/graph。
 
 ```bash
@@ -162,12 +186,11 @@ pytest选卡使用`PYHIP_MHA_GPU`（未设置时为`current`，与CLI默认不�
 |---|---|---|
 | [mha_pa_bf16_950.py](mha_pa_bf16_950.py) | `bf16_950` / `bf16_950_persistent` | gfx950 BF16，static/persistent；D128/192、V128、page64，full/causal/SWA/sink |
 | [mha_pa_swa_bf16.py](mha_pa_swa_bf16.py) | `swa_bf16` | gfx950/gfx942 BF16，单wave causal SWA；D128/192、V128、page64 |
-| [mha_pa_bf16_942.py](mha_pa_bf16_942.py) | `bf16_942` / `bf16_942_grid` | gfx942 BF16，Dq/Dv128/192 使用 BM256/BN64；Dq=Dv256 默认分派到 [mha_pa_bf16_256_dma_942.py](mha_pa_bf16_256_dma_942.py) 的v73组合（BM128/BN64）；两调度、page32/64/128、LSE/NaN尾页 |
-| [mha_pa_bf16_256_pexchange_942.py](mha_pa_bf16_256_pexchange_942.py) | 独立驱动 `pexchange` / `pexchange_grid` | 可选实验，M32 key-split/P交换/DV128；仅D256，两调度、page32/64/128、LSE；未加入默认CLI候选 |
+| [mha_pa_bf16_942.py](mha_pa_bf16_942.py) | `bf16_942` / `bf16_942_grid` | gfx942 BF16，Dq/Dv128/192 使用 BM256/BN64；Dq=Dv256 分派到 [固定v73分页路径](mha_pa_bf16_256_paged_942.py)（BM128/BN64）；两调度、page32/64/128、LSE/NaN尾页 |
+| [mha_pa_bf16_942.py](mha_pa_bf16_942.py) 的 `flash_attn_varlen_func` | D256 linear API | 连续BF16 THD、page1/page4，分派到[线性内核](mha_pa_bf16_256_linear_942.py)；与上行SHUFFLE-5D接口分开校验 |
 | [mha_pa_fp8_942.py](mha_pa_fp8_942.py) | `fp8_942` | gfx942 FNUZ FP8，仅LDS；register实现已移除 |
 
 - [test_mha_pa.py](test_mha_pa.py)：默认三类suite与共用测试辅助实现，按参数/输入与oracle/参考/gather/硬件与报告/计时/pytest分区；原6个测试辅助模块及conftest已合并删除。
-- [test_mha_pa_pexchange.py](test_mha_pa_pexchange.py)：独立M32实验的factory隔离、LDS/P布局及GPU功能回归，复用统一入口的输入/参考工具。
 - [_dsl.py](_dsl.py)：生产kernel共用FlyDSL适配，仍由kernel直接导入，不属于测试框架，独立保留。
 - [__init__.py](__init__.py)：保留kernel包结构。
 

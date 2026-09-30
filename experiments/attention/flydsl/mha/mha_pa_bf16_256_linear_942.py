@@ -17,15 +17,15 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 
 if __package__:
-    from . import mha_pa_bf16_256_942 as base
-    from .mha_pa_bf16_942 import (
+    from . import _common as base
+    from ._common import (
         _uniform, _min, _pin_i32, _pin, _join, _maximum, _pack_bf16,
         _stage_end, _wait, _schedule, _buffer,
         _read_address, _rescale, _advance_max,
     )
 else:
-    import mha_pa_bf16_256_942 as base
-    from mha_pa_bf16_942 import (
+    import _common as base
+    from _common import (
         _uniform, _min, _pin_i32, _pin, _join, _maximum, _pack_bf16,
         _stage_end, _wait, _schedule, _buffer,
         _read_address, _rescale, _advance_max,
@@ -443,7 +443,7 @@ def _work(Q, K, V, O, LSE, CQ, CK, TABLE, storage, work,
                  H, HK, NK, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, False)
 
 
-@flyc.kernel(known_block_size=[THREADS, 1, 1])
+@flyc.kernel(name="dense_mha_bf16_d256", known_block_size=[THREADS, 1, 1])
 def _linear_256_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
     CQ: fx.Tensor, CK: fx.Tensor, TABLE: fx.Tensor,
     H: fx.Constexpr[int], HK: fx.Constexpr[int], NK: fx.Constexpr[int], B: fx.Constexpr[int],

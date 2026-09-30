@@ -1,882 +1,517 @@
 # Copyright 2023-2024 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
+"""QSA normal correctness, real-data replay and performance in one entry point.
 
-"""QSA bundle correctness checks adapted for the package implementation API.
-
-Only the TP2/TP4 M=12000 cases carry the perf marker; no test performs timing.
-TP8 is correctness-only, and small TP1 cases retain baseline compatibility.
+Pytest runs numerical/normal-use checks; -m perf enables timing explicitly.
+CLI --check-only skips timing. All new results live under mytest/mydata.
 """
 
-from __future__ import annotations
-
-import ast
+import argparse
+import gc
 import hashlib
+import importlib
+import importlib.metadata
+from itertools import accumulate
 import json
-import re
+import math
+import os
 from pathlib import Path
-from typing import Literal
+import re
+import shutil
+import statistics
+import sys
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
-from .contract import AttentionInputs, CaseSpec, load_model_shape
-from .inputs import default_spec, make_inputs, validate_inputs
-from .reference import check_output, sparse_reference
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    __package__ = "experiments.attention.flydsl.qsa"
 
+from . import qsa
+from .sglang.baseline import baseline
 
-def _case_spec(
-    *, name: str, layout: str, selection: str, attention_tp: int
-) -> CaseSpec:
-    if layout == "ragged":
-        return CaseSpec(
-            name=name,
-            query_lens=(7, 0, 9, 4),
-            # A prefix-only request must still advance the packed KV offset.
-            prefix_lens=(0, 0, 0, 0) if name == "no_prefix" else (3000, 5, 12000, 3),
-            attention_tp=attention_tp,
-            selection=selection,
-            selection_group=4,
-        )
-    if layout == "257":
-        return default_spec(
-            name=name,
-            query_tokens=257,
-            prefix_tokens=3000,
-            attention_tp=attention_tp,
-            selection=selection,
-        )
-    if layout == "12000":
-        return default_spec(name=name, attention_tp=attention_tp, selection=selection)
-    raise ValueError(f"Unknown test layout: {layout}")
-
-
-def _assert_local_shapes(*, inputs: AttentionInputs) -> None:
-    query_heads, kv_heads = {1: (24, 2), 2: (12, 1), 4: (6, 1), 8: (3, 1)}[
-        inputs.spec.attention_tp
-    ]
-    query_tokens = sum(inputs.spec.query_lens)
-    kv_tokens = query_tokens + sum(inputs.spec.prefix_lens)
-    assert inputs.q.shape == (query_tokens, query_heads, 256)
-    assert inputs.k.shape == inputs.v.shape == (kv_tokens, kv_heads, 256)
-
-
-def _assert_causal_masks_cpu(*, inputs: AttentionInputs) -> None:
-    validate_inputs(inputs=inputs)
-    _assert_local_shapes(inputs=inputs)
-    assert inputs.q.device.type == "cpu"
-    ratio = inputs.model.indexer_compress_ratio
-    visible = inputs.query_positions + 1
-    counts = (visible // ratio).clamp_max(inputs.model.block_topk) * ratio
-    counts += visible % ratio
-    valid = inputs.indices >= 0
-    expected_valid = torch.arange(inputs.model.final_topk)[None, :] < counts[:, None]
-    torch.testing.assert_close(valid, expected_valid)
-    assert bool(torch.all(~valid | (inputs.indices < visible[:, None])))
-    kv_lens = inputs.kv_lens[inputs.query_sequence_ids.long()]
-    assert bool(torch.all(~valid | (inputs.indices < kv_lens[:, None])))
-    assert bool(torch.all(counts > 0))
-    for tensor in (inputs.q, inputs.k, inputs.v):
-        assert tensor.is_contiguous() and tensor.device.type == "cpu"
-    assert inputs.scale == 0.0625
-
-
-def _with_nan_kv_guards(
-    *, inputs: AttentionInputs
-) -> tuple[AttentionInputs, list[torch.Tensor]]:
-    fields = {name: getattr(inputs, name) for name in inputs.__struct_fields__}
-    guards = []
-    for name in ("k", "v"):
-        original = fields[name]
-        storage = torch.full(
-            (original.shape[0] + 8, *original.shape[1:]),
-            float("nan"),
-            dtype=original.dtype,
-            device=original.device,
-        )
-        storage[: original.shape[0]].copy_(original)
-        fields[name] = storage[: original.shape[0]]
-        guards.append(storage[original.shape[0] :])
-    return AttentionInputs(**fields), guards
-
-
-def _guarded_output(*, inputs: AttentionInputs) -> tuple[torch.Tensor, torch.Tensor]:
-    storage = torch.full(
-        (inputs.q.shape[0] + 2, *inputs.q.shape[1:]),
-        123.0,
-        dtype=inputs.q.dtype,
-        device=inputs.q.device,
-    )
-    return storage, storage[1:-1]
-
-
-def test_frozen_baseline_snapshot_cpu():
-    root = Path(__file__).parent
-    manifest = json.loads((root / "source_manifest.json").read_text(encoding="utf-8"))
-    source = (root / manifest["snapshot_path"]).read_text(encoding="utf-8")
-    lines = source.splitlines(keepends=True)
-    actual = {}
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.FunctionDef) and node.name in manifest["functions"]:
-            first = min([node.lineno] + [item.lineno for item in node.decorator_list])
-            body = "".join(lines[first - 1 : node.end_lineno])
-            actual[node.name] = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    assert actual == manifest["functions"], "Frozen SGLang baseline kernels changed"
-
-
-@pytest.mark.parametrize("name", ("no_prefix", "chunk_prefill"))
-@pytest.mark.parametrize("attention_tp", (1, 2, 4, 8))
-def test_default_model_contract_cpu(name, attention_tp):
-    model = load_model_shape()
-    spec = default_spec(name=name, attention_tp=attention_tp)
-    assert spec.query_lens == (12000,)
-    assert spec.prefix_lens == ((0,) if name == "no_prefix" else (12000,))
-    assert spec.attention_tp == attention_tp
-    assert spec.selection == "independent" and spec.selection_group == 8
-    assert spec.seed == 17
-    assert (model.num_attention_heads, model.num_key_value_heads, model.head_dim) == (
-        24,
-        2,
-        256,
-    )
-    assert model.indexer_budget == 2048 and model.indexer_compress_ratio == 4
-    assert model.block_topk == 512 and model.final_topk == 2051
-
-
-@pytest.mark.parametrize("name", ("no_prefix", "chunk_prefill"))
-@pytest.mark.parametrize("selection", ("independent", "shared", "recent"))
-@pytest.mark.parametrize("attention_tp", (1, 2, 4, 8))
-def test_causal_block_and_tail_contract_cpu(name, selection, attention_tp):
-    spec = default_spec(
-        name=name,
-        query_tokens=2057 if name == "no_prefix" else 17,
-        prefix_tokens=2040,
-        attention_tp=attention_tp,
-        selection=selection,
-    )
-    inputs = make_inputs(spec=spec, device="cpu")
-    _assert_causal_masks_cpu(inputs=inputs)
-    counts = (inputs.indices >= 0).sum(dim=1)
-    prefix = spec.prefix_lens[0]
-    for visible, count in (
-        (1, 1),
-        (4, 4),
-        (2048, 2048),
-        (2051, 2051),
-        (2052, 2048),
-        (2053, 2049),
-    ):
-        row = visible - prefix - 1
-        if 0 <= row < counts.numel():
-            assert counts[row].item() == count
-
-
-@pytest.mark.parametrize("name", ("no_prefix", "chunk_prefill"))
-@pytest.mark.parametrize("selection", ("independent", "shared", "recent"))
-@pytest.mark.parametrize("attention_tp", (1, 2, 4, 8))
-def test_ragged_prefix_contract_cpu(name, selection, attention_tp):
-    spec = _case_spec(
-        name=name, layout="ragged", selection=selection, attention_tp=attention_tp
-    )
-    inputs = make_inputs(spec=spec, device="cpu")
-    _assert_causal_masks_cpu(inputs=inputs)
-    assert inputs.cu_q.tolist() == [0, 7, 7, 16, 20]
-    assert inputs.query_sequence_ids.tolist() == [0] * 7 + [2] * 9 + [3] * 4
-    assert inputs.cu_k.tolist() == (
-        [0, 7, 7, 16, 20] if name == "no_prefix" else [0, 3007, 3012, 15021, 15028]
-    )
-    if name == "chunk_prefill":
-        assert inputs.query_positions[[0, 7, 16]].tolist() == [3000, 12000, 3]
-
-
-@pytest.mark.parametrize(
-    "corruption",
-    ("future_token", "padding", "block", "sequence", "position", "kv_offset"),
+_runtime = importlib.import_module(".qsa", __package__)
+ROOT = Path(__file__).resolve().parents[4]
+DATA = ROOT / "mytest/mydata"
+REAL_INPUTS = DATA / "qsa_real_study_20260925/capture/inputs"
+CASES = (
+    ((0,), (0,), 12), ((1,), (0,), 12), ((64,), (0,), 12),
+    ((7, 0, 9, 9, 9, 7), (0, 5, 55, 56, 2050, 3000), 12),
+    ((33,), (2047,), 12), ((33,), (2051,), 6),
+    ((65,), (30000,), 12), ((65,), (30000,), 6), ((65,), (30000,), 3),
+    ((2057,), (0,), 12), ((33,), (12000,), 12),
 )
-def test_invalid_causal_contract_rejected_cpu(corruption):
-    spec = CaseSpec(
-        name="chunk_prefill",
-        query_lens=(3, 0, 2),
-        prefix_lens=(5, 7, 1),
-        attention_tp=8,
-    )
-    inputs = make_inputs(spec=spec, device="cpu")
-    if corruption == "future_token":
-        inputs.indices[0, 0] = inputs.query_positions[0] + 1
-    elif corruption == "padding":
-        inputs.indices[0, -1] = 0
-    elif corruption == "block":
-        inputs.block_indices[2, 1] = inputs.block_indices[2, 0]
-    elif corruption == "sequence":
-        inputs.query_sequence_ids[0] = 2
-    elif corruption == "position":
-        inputs.query_positions[0] += 1
-    else:
-        inputs.cu_k[1] += 1
-    with pytest.raises(AssertionError):
-        validate_inputs(inputs=inputs)
 
 
-def test_reference_masks_padding_and_ragged_prefix_cpu():
-    spec = CaseSpec(
-        name="chunk_prefill",
-        query_lens=(2, 0, 1),
-        prefix_lens=(2, 3, 1),
-        attention_tp=8,
-    )
-    inputs = make_inputs(spec=spec, device="cpu")
-    inputs.q.zero_()
-    inputs.k.zero_()
-    for sequence, (start, end) in enumerate(zip(inputs.cu_k[:-1], inputs.cu_k[1:])):
-        values = 10 * (sequence + 1) + torch.arange(int(end - start))
-        inputs.v[int(start) : int(end)] = values[:, None, None]
-    validate_inputs(inputs=inputs)
-    actual = sparse_reference(inputs=inputs, rows=[0, 1, 2])
-    expected = torch.tensor([11.0, 11.5, 30.5])[:, None, None].expand_as(actual)
-    assert actual.dtype == torch.float32
-    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
+def _hash(tensor):
+    raw = tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes() if tensor.numel() else b""
+    return hashlib.sha256(raw).hexdigest()
 
 
-@pytest.fixture
-def gpu_device():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA/ROCm GPU unavailable; GPU correctness was not checked")
-    pytest.importorskip("triton")
-    pytest.importorskip("flydsl")
-    if torch.version.hip is None:
-        pytest.skip("The implemented FlyDSL kernel targets gfx942")
-    if (
-        torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(
-            ":"
-        )[0]
-        != "gfx942"
-    ):
-        pytest.skip("The implemented FlyDSL kernel targets gfx942")
+def _metadata(q, k, v, indices, query_lens, prefix_lens, scale=0.0625, captured=None):
+    lengths = tuple(qn + pn for qn, pn in zip(query_lens, prefix_lens))
+    kw = {"dtype": torch.int32, "device": q.device}
+    return SimpleNamespace(q=q, k=k, v=v, indices=indices, query_lens=tuple(query_lens),
+                           prefix_lens=tuple(prefix_lens), scale=scale, captured=captured,
+                           cu_q=torch.tensor(tuple(accumulate(query_lens, initial=0)), **kw),
+                           cu_k=torch.tensor(tuple(accumulate(lengths, initial=0)), **kw),
+                           kv_lens=torch.tensor(lengths, **kw),
+                           positions=torch.tensor([p + i for n, p in zip(query_lens, prefix_lens) for i in range(n)], **kw),
+                           sequence_ids=torch.tensor([s for s, n in enumerate(query_lens) for _ in range(n)], **kw))
+
+
+def _make_case(queries, prefixes, heads, device, seed=17, shared=False):
+    rows, total = sum(queries), sum(queries) + sum(prefixes)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    q = torch.randn((rows, heads, 256), generator=generator, device=device, dtype=torch.bfloat16)
+    k = torch.randn((total, 1, 256), generator=generator, device=device, dtype=q.dtype)
+    v = torch.randn(k.shape, generator=generator, device=device, dtype=q.dtype)
+    indices = np.full((rows, 2051), -1, dtype=np.int32)
+    rng, row = np.random.default_rng(seed), 0
+    for count, prefix in zip(queries, prefixes):
+        priority = None
+        for local in range(count):
+            visible = prefix + local + 1
+            blocks = visible // 4
+            if blocks <= 512:
+                chosen = np.arange(blocks)
+            elif shared:
+                if local % 32 == 0:
+                    priority = rng.permutation((prefix + count) // 4)
+                chosen = priority[priority < blocks][:512]
+            else:
+                chosen = rng.choice(blocks, 512, replace=False)
+            tokens = np.concatenate(((chosen[:, None] * 4 + np.arange(4)).reshape(-1), np.arange(blocks * 4, visible)))
+            indices[row, :len(tokens)] = tokens
+            row += 1
+    return _metadata(q, k, v, torch.from_numpy(indices).to(device), queries, prefixes)
+
+
+def _load(path, device):
+    value = torch.load(path, map_location="cpu", weights_only=True)
+    meta, tensors = value["metadata"], value["tensors"]
+    for name, tensor in tensors.items():
+        assert _hash(tensor) == meta["tensor_metadata"][name]["sha256"], (path, name)
+    result = _metadata(*(tensors[name].to(device) for name in ("q", "k", "v", "indices")),
+                       meta["query_lens"], meta["prefix_lens"], meta["scale"], tensors["output"].to(device))
+    result.capture = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return result
+
+
+def _call(inputs, out=None):
+    return qsa(inputs.q, inputs.k, inputs.v, inputs.indices, query_lens=inputs.query_lens,
+               prefix_lens=inputs.prefix_lens, softmax_scale=inputs.scale, out=out)
+
+
+def _base(inputs, out=None):
+    return baseline(inputs.q, inputs.k, inputs.v, inputs.indices, inputs.cu_q, inputs.cu_k, inputs.kv_lens,
+                    max_seqlen_q=max(inputs.query_lens, default=0), has_prefix=any(inputs.prefix_lens),
+                    softmax_scale=inputs.scale, out=out)
+
+
+def _rows(inputs, count=32):
+    result, start = set(), 0
+    for length, prefix in zip(inputs.query_lens, inputs.prefix_lens):
+        result.update(start + n for n in (0, 1, 2, 3, 4, 7, 8, 31, 32, 2047 - prefix,
+                      2048 - prefix, 2050 - prefix, 2051 - prefix, 2052 - prefix, length - 1) if 0 <= n < length)
+        start += length
+    if start:
+        result.update(np.linspace(0, start - 1, min(start, count), dtype=int).tolist())
+    return sorted(result)
+
+
+@torch.no_grad()
+def reference(inputs, rows):
+    """FP32 per-query selected-token oracle; never uses union scratch."""
+    outputs = []
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for start in range(0, len(rows), 4):
+            ids = torch.tensor(rows[start:start + 4], device=inputs.q.device)
+            tokens = inputs.indices[ids].long()
+            slots = inputs.cu_k[inputs.sequence_ids[ids].long(), None].long() + tokens.clamp_min(0)
+            keys, values = inputs.k[slots].float(), inputs.v[slots].float()
+            queries = inputs.q[ids].float().reshape(-1, inputs.k.shape[1], inputs.q.shape[1] // inputs.k.shape[1], 256)
+            scores = torch.einsum("bghd,bkgd->bghk", queries, keys) * inputs.scale
+            scores.masked_fill_(tokens[:, None, None, :] < 0, -float("inf"))
+            outputs.append(torch.einsum("bghk,bkgd->bghd", scores.softmax(-1), values).reshape(-1, inputs.q.shape[1], 256))
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+    return torch.cat(outputs) if outputs else inputs.q.float()
+
+
+def _audit(inputs):
+    if not inputs.q.shape[0]:
+        return {"rows": 0, "dense_rows": 0, "union_rows": 0, "direct_rows": 0}
+    key = (inputs.q.device, torch.cuda.current_stream(inputs.q.device).cuda_stream,
+           inputs.query_lens, inputs.prefix_lens, inputs.q.shape[1], inputs.k.shape[1], inputs.scale)
+    workspace = _runtime._workspaces[key]
+    blocks = workspace.metadata["block_indices"].cpu().numpy()
+    indices, positions = inputs.indices.cpu().numpy(), inputs.positions.cpu().tolist()
+    for row, position in enumerate(positions):
+        count = min((position + 1) // 4, 512)
+        chosen = blocks[row, :count]
+        assert len(set(chosen.tolist())) == count and np.all(chosen >= 0) and np.all(chosen < (position + 1) // 4)
+        tokens = np.concatenate(((chosen[:, None] * 4 + np.arange(4)).reshape(-1), np.arange((position + 1) // 4 * 4, position + 1)))
+        np.testing.assert_array_equal(indices[row, :len(tokens)], tokens)
+        assert np.all(indices[row, len(tokens):] == -1)
+    dense_rows = sum(workspace.dense.query_counts)
+    assert workspace.dense.query_counts == tuple(min(n, max(0, 2051 - p)) for n, p in zip(inputs.query_lens, inputs.prefix_lens))
+    result = {"rows": inputs.q.shape[0], "dense_rows": dense_rows, "union_rows": 0, "direct_rows": 0}
+    if workspace.union is not None:
+        plan = workspace.union
+        metadata, counts, active = plan.metadata.cpu().tolist(), plan.counts.cpu().tolist(), plan.active.cpu().tolist()
+        members = plan.dense_membership.cpu().numpy().view(np.uint32)
+        compact, bits = plan.blocks.cpu().numpy(), plan.membership.cpu().numpy().view(np.uint32)
+        assert sum(item[1] for item in metadata) == inputs.q.shape[0] - dense_rows
+        union_rows = 0
+        for tile, (first, rows, _, _, position) in enumerate(metadata):
+            expected = {}
+            for local in range(rows):
+                for b in blocks[first + local]:
+                    if b >= 0:
+                        expected[int(b)] = expected.get(int(b), 0) | (1 << local)
+                visible = position + local + 1
+                if visible % 4:
+                    b = visible // 4
+                    expected[b] = expected.get(b, 0) | (1 << local)
+            assert {int(b): int(members[tile, b]) for b in members[tile].nonzero()[0]} == expected
+            assert counts[tile][0] == len(expected)
+            if active[tile]:
+                count = counts[tile][0]
+                assert {int(b): int(m) for b, m in zip(compact[tile, :count], bits[tile, :count])} == expected
+            total = sum(min((position + i + 1) // 4, 512) + bool((position + i + 1) % 4) for i in range(rows))
+            assert active[tile] == (len(expected) * rows <= 4 * total)
+            union_rows += rows * active[tile]
+        result.update(union_rows=union_rows, direct_rows=inputs.q.shape[0] - dense_rows - union_rows)
+    return result
+
+
+@torch.no_grad()
+def check(inputs, *, compare_baseline=True):
+    """Normal calls jointly cover numerical output, guards, reuse and current selection."""
+    original_hashes = {n: _hash(getattr(inputs, n)) for n in ("q", "k", "v", "indices")}
+    storage = torch.full((inputs.q.shape[0] + 2, *inputs.q.shape[1:]), 123.0, device=inputs.q.device, dtype=inputs.q.dtype)
+    output = storage[1:-1]
+    output.fill_(float("nan"))
+    assert _call(inputs, output) is output
+    assert bool(torch.isfinite(output).all()) and bool((storage[[0, -1]] == 123).all())
+    if compare_baseline:
+        torch.testing.assert_close(output, _base(inputs), rtol=0.02, atol=0.02)
+    if inputs.captured is not None:
+        torch.testing.assert_close(output, inputs.captured, rtol=0.02, atol=0.02)
+    ids = list(range(inputs.q.shape[0])) if inputs.q.shape[0] <= 65 else _rows(inputs)
+    torch.testing.assert_close(output[ids].float(), reference(inputs, ids), rtol=0.02, atol=0.02)
+    first = output.clone()
+    output.fill_(float("nan"))
+    _call(inputs, output)
+    torch.testing.assert_close(output, first, rtol=0, atol=0)
+    routes = _audit(inputs)
+    assert original_hashes == {n: _hash(getattr(inputs, n)) for n in original_hashes}
+    return routes
+
+
+def _gpu():
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        pytest.skip("requires ROCm gfx942")
+    torch.cuda.set_device(int(os.environ.get("QSA_REPLAY_GPU", "0")))
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx942"):
+        pytest.skip("requires gfx942")
     return torch.device("cuda", torch.cuda.current_device())
 
 
-def _check_implementation_against_baseline(
-    *, inputs: AttentionInputs, sample_count: int, prepared: object | None = None
-) -> None:
-    from . import baseline, implementation
-
-    validate_inputs(inputs=inputs)
-    _assert_local_shapes(inputs=inputs)
-    baseline_prepared = baseline.prepare(inputs=inputs)
-    baseline_out = torch.full_like(inputs.q, float("nan"))
-    baseline.run(inputs=inputs, prepared=baseline_prepared, out=baseline_out)
-    check_output(inputs=inputs, output=baseline_out, sample_count=sample_count)
-
-    if prepared is None:
-        prepared = implementation.prepare(inputs=inputs)
-        assert prepared.mode == "auto"
-    assert isinstance(prepared, implementation.DispatchPlan)
-    out = torch.full_like(inputs.q, float("nan"))
-    implementation.run(inputs=inputs, prepared=prepared, out=out)
-    check_output(
-        inputs=inputs, output=out, sample_count=sample_count, rtol=2e-2, atol=2e-2
-    )
-    torch.testing.assert_close(out, baseline_out, rtol=2e-2, atol=2e-2)
-
-
-@pytest.mark.parametrize("name", ("no_prefix", "chunk_prefill"))
-@pytest.mark.parametrize("selection", ("independent", "shared", "recent"))
-@pytest.mark.parametrize(
-    "attention_tp,layout",
-    (
-        pytest.param(2, "ragged", id="tp2-ragged"),
-        pytest.param(4, "ragged", id="tp4-ragged"),
-        pytest.param(8, "ragged", id="tp8-ragged"),
-        pytest.param(2, "257", id="tp2-m257"),
-        pytest.param(4, "257", id="tp4-m257"),
-        pytest.param(8, "257", id="tp8-m257"),
-        pytest.param(2, "12000", id="tp2-m12000", marks=pytest.mark.perf),
-        pytest.param(4, "12000", id="tp4-m12000", marks=pytest.mark.perf),
-        pytest.param(8, "12000", id="tp8-m12000-correctness"),
-    ),
-)
-def test_implementation_matches_baseline_and_fp32(
-    gpu_device, name, selection, attention_tp, layout
-):
-    spec = _case_spec(
-        name=name, layout=layout, selection=selection, attention_tp=attention_tp
-    )
-    inputs = make_inputs(spec=spec, device=gpu_device)
-    sample_count = inputs.q.shape[0] if layout == "ragged" else 32
-    _check_implementation_against_baseline(inputs=inputs, sample_count=sample_count)
-
-
-@pytest.mark.parametrize("name", ("no_prefix", "chunk_prefill"))
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-@pytest.mark.parametrize("block_n", (32, 64))
-def test_direct_matches_baseline_and_fp32(gpu_device, name, attention_tp, block_n):
-    from . import implementation
-
-    inputs = make_inputs(
-        spec=default_spec(
-            name=name,
-            query_tokens=37,
-            prefix_tokens=3000,
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    prepared = implementation.prepare(
-        inputs=inputs, mode="direct", dense_limit=0, block_n=block_n
-    )
-    assert prepared.mode == "direct"
-    assert prepared.dense.query_counts == (0,)
-    assert prepared.union is None and prepared.direct is not None
-    assert prepared.direct.block_n == block_n
-    assert prepared.direct.query_tile == 4
-    assert not prepared.direct.gated
-    _check_implementation_against_baseline(
-        inputs=inputs, prepared=prepared, sample_count=37
-    )
+@pytest.mark.parametrize("queries,prefixes,heads", CASES)
+def test_qsa(queries, prefixes, heads):
+    device = _gpu()
+    value = _make_case(queries, prefixes, heads, device)
+    if sum(queries):
+        for name in ("k", "v"):
+            original = getattr(value, name)
+            storage = torch.full((original.shape[0] + 4, 1, 256), float("nan"), device=device, dtype=original.dtype)
+            storage[:original.shape[0]].copy_(original)
+            setattr(value, name, storage[:original.shape[0]])
+        with pytest.raises(ValueError, match="overlap"):
+            _call(value, value.q)
+    if prefixes == (12000,):
+        # Disjoint selections and large logits exercise rescaling. The old baseline
+        # pre-scales BF16 Q and is not the FP32 oracle for this construction.
+        for row in range(queries[0]):
+            blocks = torch.arange(512, device=device) + (row % 4) * 600
+            value.indices[row, :2048] = (blocks[:, None] * 4 + torch.arange(4, device=device)).flatten()
+        value.q.mul_(3)
+        value.k.mul_(3)
+    check(value, compare_baseline=prefixes != (12000,))
+    if prefixes == (30000,) and heads == 12:
+        torch.testing.assert_close(qsa(value.q, value.k, value.v, value.indices), _call(value), rtol=0, atol=0)
+        for scale in (float("nan"), 0, -1, True, torch.tensor(0.0625, device=device)):
+            with pytest.raises(ValueError, match="scale"):
+                qsa(value.q, value.k, value.v, value.indices, softmax_scale=scale)
+        with pytest.raises(ValueError, match="Host"):
+            qsa(value.q, value.k, value.v, value.indices, query_lens=(1,))
+        with pytest.raises(ValueError, match="16 Q heads"):
+            qsa(torch.empty((queries[0], 17, 256), device=device, dtype=value.q.dtype), value.k, value.v, value.indices)
+    if prefixes == (30000,):
+        independent = value.indices.clone()
+        changed = _make_case(queries, prefixes, heads, device, seed=51, shared=True)
+        value.indices.copy_(changed.indices)
+        check(value)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            output = _call(value)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                _call(value, output)
+        torch.cuda.current_stream(device).wait_stream(stream)
+        value.v.neg_()
+        for indices in (independent, changed.indices):
+            value.indices.copy_(indices)
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(output.float(), reference(value, list(range(queries[0]))), rtol=0.02, atol=0.02)
 
 
-@pytest.mark.parametrize("name", ("no_prefix", "chunk_prefill"))
-@pytest.mark.parametrize("layout", ("ragged", "257"))
-def test_tp1_baseline_compatibility(gpu_device, name, layout):
-    inputs = make_inputs(
-        spec=_case_spec(
-            name=name, layout=layout, selection="independent", attention_tp=1
-        ),
-        device=gpu_device,
-    )
-    sample_count = inputs.q.shape[0] if layout == "ragged" else 32
-    _check_implementation_against_baseline(inputs=inputs, sample_count=sample_count)
+def _real_files():
+    directory = Path(os.environ.get("QSA_REAL_INPUT_DIR", REAL_INPUTS))
+    paths = sorted(directory.glob("tp*_layer*_m*.pt"))
+    if not paths and "QSA_REAL_INPUT_DIR" in os.environ:
+        raise FileNotFoundError(f"No captured QSA inputs in {directory}")
+    return paths
 
 
-@pytest.mark.parametrize("attention_tp", (1, 2, 4, 8))
-def test_zero_prefix_chunk_matches_baseline_prefill(gpu_device, attention_tp):
-    from . import baseline
-
-    outputs = []
-    for name in ("no_prefix", "chunk_prefill"):
-        spec = default_spec(
-            name=name, query_tokens=41, prefix_tokens=0, attention_tp=attention_tp
-        )
-        inputs = make_inputs(spec=spec, device=gpu_device)
-        _assert_local_shapes(inputs=inputs)
-        prepared = baseline.prepare(inputs=inputs)
-        out = torch.full_like(inputs.q, float("nan"))
-        baseline.run(inputs=inputs, prepared=prepared, out=out)
-        check_output(inputs=inputs, output=out, sample_count=out.shape[0])
-        outputs.append(out)
-    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+@pytest.mark.parametrize("path", _real_files(), ids=lambda p: p.stem)
+def test_real_qsa(path):
+    check(_load(path, _gpu()))
 
 
-@pytest.mark.parametrize("attention_tp,query_tile", ((2, 8), (4, 16), (8, 32)))
-@pytest.mark.parametrize("mode,dense_limit", (("auto", 2051), ("union", 0)))
-def test_local_union_query_tile_cap_and_coverage(
-    gpu_device, attention_tp, query_tile, mode, dense_limit
-):
-    from . import implementation
+def test_sglang_adapter(monkeypatch, tmp_path):
+    """One normal backend flow covers cache/padding, profile capture and lazy exclusion."""
+    pytest.importorskip("sglang")
+    from .sglang import plugin
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.layers.attention.qsa.config import QSAProfile
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from unittest.mock import Mock
 
-    inputs = make_inputs(
-        spec=CaseSpec(
-            name="chunk_prefill",
-            query_lens=(37, 0, 65, 37),
-            prefix_lens=(0, 5, 2047, 12000),
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    prepared = implementation.prepare(
-        inputs=inputs, query_tile=32, mode=mode, dense_limit=dense_limit
-    )
-    assert prepared.mode == mode
-    union = prepared.union
-    assert union is not None
-    group = inputs.q.shape[1] // inputs.k.shape[1]
-    assert (
-        union.query_tile
-        == query_tile
-        == min(32, 1 << ((128 // group).bit_length() - 1))
-    )
-    assert union.group_padded == group
-    counts = tuple(
-        min(length, max(0, dense_limit - prefix))
-        for length, prefix in zip(inputs.spec.query_lens, inputs.spec.prefix_lens)
-    )
-    assert prepared.dense.query_counts == counts
-
-    metadata, query_tiles = [], [-1] * inputs.q.shape[0]
-    coverage = [0] * inputs.q.shape[0]
-    q_start, k_start = 0, 0
-    for length, prefix, count in zip(
-        inputs.spec.query_lens, inputs.spec.prefix_lens, counts
-    ):
-        coverage[q_start : q_start + count] = [1] * count
-        local = count
-        while local < length:
-            end = min(length, (local // query_tile + 1) * query_tile)
-            first, rows = q_start + local, end - local
-            query_tiles[first : first + rows] = [len(metadata)] * rows
-            metadata.append([first, rows, k_start, prefix + length, prefix + local])
-            local = end
-        q_start += length
-        k_start += prefix + length
-    assert union.metadata.cpu().tolist() == metadata
-    assert union.num_tiles == len(metadata)
-    assert union.query_tiles.cpu().tolist() == query_tiles
-    active = union.active.cpu().tolist()
-    assert all(flag in (0, 1) for flag in active)
-    for flag, (first, rows, *_) in zip(active, metadata):
-        if flag:
-            for row in range(first, first + rows):
-                coverage[row] += 1
-    if mode == "union":
-        assert prepared.direct is None
-        assert all(active)
-    else:
-        direct = prepared.direct
-        assert direct is not None and direct.gated
-        assert direct.active.data_ptr() == union.active.data_ptr()
-        assert direct.query_tiles.data_ptr() == union.query_tiles.data_ptr()
-        assert set(active) == {0, 1}
-        for first, rows, *_ in direct.metadata.cpu().tolist():
-            for row in range(first, first + rows):
-                assert query_tiles[row] >= 0
-                if not active[query_tiles[row]]:
-                    coverage[row] += 1
-    assert coverage == [1] * inputs.q.shape[0]
-    _check_implementation_against_baseline(
-        inputs=inputs, prepared=prepared, sample_count=inputs.q.shape[0]
-    )
+    value = _make_case((33,), (3000,), 12, _gpu())
+    pool = Mock()
+    pool.get_key_buffer.return_value = value.k
+    pool.get_value_buffer.return_value = value.v
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.runner = SimpleNamespace(is_draft_worker=False, kv_cache_dtype=torch.bfloat16, ps=ParallelState.trivial())
+    backend.token_to_kv_pool = pool
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=torch.arange(3033, device=value.q.device)[None])
+    backend.qsa_profile = QSAProfile("compressed", 8, 1, 128, 2048, 4, "mrope", False)
+    layer = SimpleNamespace(tp_q_head_num=12, tp_k_head_num=1, tp_v_head_num=1, head_dim=256,
+                            v_head_dim=256, scaling=0.0625, layer_id=3, logit_cap=0,
+                            sliding_window_size=-1, is_cross_attention=False, pos_encoding_mode="NONE")
+    batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, extend_seq_lens_cpu=[33], seq_lens_cpu=[3033],
+                            extend_seq_lens=torch.tensor([33], dtype=torch.int32, device=value.q.device),
+                            req_pool_indices=torch.tensor([0], device=value.q.device),
+                            out_cache_loc=torch.arange(33, device=value.q.device))
+    module = importlib.import_module("sglang.srt.layers.attention.qwen_sparse_attn_backend")
+    original = QwenSparseAttnBackend.forward_extend
+    padded = torch.cat((value.q, torch.full((3, 12, 256), float("nan"), device=value.q.device, dtype=value.q.dtype)))
+    expected = original(backend, padded, value.k, value.v, layer, batch, topk_indices=value.indices)
+    plain, chunk = module.sparse_gqa_fwd_interface_triton, module.sparse_gqa_fwd_interface_triton_ck
+    monkeypatch.setattr(module, "sparse_gqa_fwd_interface_triton", lambda *a: plugin._around_sparse(plain, *a))
+    monkeypatch.setattr(module, "sparse_gqa_fwd_interface_triton_ck", lambda *a: plugin._around_sparse(chunk, *a, chunk=True))
+    monkeypatch.setenv("PYHIP_QSA_VALIDATE", "1")
+    monkeypatch.setenv("PYHIP_QSA_REPORT_DIR", str(tmp_path))
+    monkeypatch.setenv("PYHIP_QSA_DUMP_LAYERS", "3")
+    monkeypatch.setenv("PYHIP_QSA_DUMP_ROWS", "33")
+    monkeypatch.setenv("PYHIP_QSA_DUMP_DIR", str(tmp_path))
+    monkeypatch.setattr(plugin, "_state", None)
+    pool.reset_mock()
+    actual = plugin._around_forward(original, backend, padded, value.k, value.v, layer, batch, topk_indices=value.indices)
+    pool.set_kv_buffer.assert_called_once()
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+    assert bool((actual[-3:] == 0).all())
+    manager = SimpleNamespace(ps=backend.runner.ps)
+    failed = lambda *_: SimpleNamespace(success=False)
+    succeeded = lambda *_: SimpleNamespace(success=True)
+    plugin._profile_start(failed, manager)
+    assert not plugin._state.profiling
+    plugin._profile_start(succeeded, manager)
+    actual = plugin._around_forward(original, backend, padded, value.k, value.v, layer, batch,
+                                     save_kv_cache=False, topk_indices=value.indices)
+    saved = value.q.clone()
+    value.q.zero_()
+    plugin._profile_stop(succeeded, manager)
+    dump_path, = tmp_path.glob("tp0_layer3_m33_*.pt")
+    dump = torch.load(dump_path, weights_only=True)
+    torch.testing.assert_close(dump["tensors"]["q"], saved.cpu(), rtol=0, atol=0)
+    report = json.loads((tmp_path / "qsa_tp0.json").read_text())
+    assert report["calls_per_layer"] == {"3": 1} and len(report["validation"]) == 1
+    check(_load(dump_path, value.q.device))
+    plugin._profile_stop(failed, manager)
+    assert not plugin._state.profiling
+    batch.forward_mode = ForwardMode.DECODE
+    fallback = Mock(return_value="unchanged")
+    assert plugin._around_forward(fallback, backend, value.q, value.k, value.v, layer, batch) == "unchanged"
 
 
-@pytest.mark.parametrize("query_tile", (8, 10, 32))
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-def test_unaligned_union_nan_guards_and_all_masked_tiles(
-    gpu_device, query_tile, attention_tp
-):
-    from . import implementation
+def _gate(folder, phase, gpu):
+    from tests.ops.gr_read.test_gr_read import read_hardware, validate_hardware
 
-    inputs = make_inputs(
-        spec=default_spec(
-            name="chunk_prefill",
-            query_tokens=9,
-            prefix_tokens=56,
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    inputs, guards = _with_nan_kv_guards(inputs=inputs)
-    plan = implementation.prepare(
-        inputs=inputs,
-        query_tile=query_tile,
-        mode="union",
-        dense_limit=0,
-        max_union_inflation=float("inf"),
-    )
-    storage, out = _guarded_output(inputs=inputs)
-    out.fill_(float("nan"))
-    implementation.run(inputs=inputs, prepared=plan, out=out)
-    check_output(inputs=inputs, output=out, sample_count=out.shape[0])
-    assert bool((storage[[0, -1]] == 123).all())
-    assert all(bool(torch.isnan(guard).all()) for guard in guards)
+    snapshot = read_hardware(gpu, Path("/opt/rocm-7.14/bin/amd-smi"))
+    props = torch.cuda.get_device_properties(gpu)
+    pci = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+    snapshot["runtime_pci"] = pci
+    (folder / f"hardware_{phase}.json").write_text(json.dumps(snapshot, indent=2))
+    validate_hardware(snapshot)
+    assert pci.lower() == snapshot["card"]["PCI Bus"].lower()
 
 
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-@pytest.mark.parametrize("block_n", (32, 64))
-def test_direct_cancellation_scales_after_fp32_dot(gpu_device, attention_tp, block_n):
-    from . import implementation
+def benchmark(value, folder, gpu, *, buffers=10, warmup=2, samples=10):
+    from pyhip.testing.misc import cudaPerf
+    from tests.ops.gr_read.test_gr_read import tensor_address
 
-    inputs = make_inputs(
-        spec=default_spec(name="no_prefix", query_tokens=32, attention_tp=attention_tp),
-        device=gpu_device,
-    )
-    inputs.q.zero_()
-    inputs.k.zero_()
-    inputs.v.zero_()
-    inputs.q[1, :, 0::2] = 1
-    inputs.q[1, :, 1::2] = 129 / 128
-    inputs.k[0, :, 0::2] = 129 / 64
-    inputs.k[0, :, 1::2] = -2
-    inputs.k[1] = -inputs.k[0]
-    inputs.v[0].fill_(1)
-    inputs.v[1].fill_(-1)
-    plan = implementation.prepare(
-        inputs=inputs, mode="direct", dense_limit=0, block_n=block_n
-    )
-    assert plan.union is None and plan.direct is not None
-    assert plan.dense.query_counts == (0,)
-    out = torch.full_like(inputs.q, float("nan"))
-    implementation.run(inputs=inputs, prepared=plan, out=out)
-    check_output(inputs=inputs, output=out, sample_count=out.shape[0])
-
-
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-def test_union_graph_rebuild_preserves_current_indices(gpu_device, attention_tp):
-    from . import implementation
-
-    inputs = make_inputs(
-        spec=default_spec(
-            name="chunk_prefill",
-            query_tokens=65,
-            prefix_tokens=3000,
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    plan = implementation.prepare(
-        inputs=inputs, mode="union", dense_limit=0, max_union_inflation=float("inf")
-    )
-    assert plan.union is not None and plan.direct is None
-    out = torch.full_like(inputs.q, float("nan"))
-    warmup = torch.cuda.Stream(device=gpu_device)
-    warmup.wait_stream(torch.cuda.current_stream(gpu_device))
-    with torch.cuda.stream(warmup):
-        for _ in range(2):
-            implementation.rebuild_plan(inputs=inputs, plan=plan)
-            implementation.run(inputs=inputs, prepared=plan, out=out)
-    torch.cuda.current_stream(gpu_device).wait_stream(warmup)
-    check_output(inputs=inputs, output=out, sample_count=65)
-    original = out.clone()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        implementation.rebuild_plan(inputs=inputs, plan=plan)
-        implementation.run(inputs=inputs, prepared=plan, out=out)
-    changed = make_inputs(
-        spec=default_spec(
-            name="chunk_prefill",
-            query_tokens=65,
-            prefix_tokens=3000,
-            attention_tp=attention_tp,
-            seed=51,
-        ),
-        device=gpu_device,
-    )
-    assert not torch.equal(inputs.indices, changed.indices)
-    assert not torch.equal(inputs.block_indices, changed.block_indices)
-    inputs.indices.copy_(changed.indices)
-    inputs.block_indices.copy_(changed.block_indices)
-    validate_inputs(inputs=inputs)
-    out.fill_(float("nan"))
-    graph.replay()
-    torch.cuda.synchronize(gpu_device)
-    check_output(inputs=inputs, output=out, sample_count=65)
-    assert not torch.equal(out, original)
-
-
-@pytest.mark.parametrize("query_tile", (8, 32))
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-def test_forced_union_disjoint_blocks_and_softmax_rescale(
-    gpu_device, query_tile, attention_tp
-):
-    from . import implementation
-
-    inputs = make_inputs(
-        spec=default_spec(
-            name="chunk_prefill",
-            query_tokens=33,
-            prefix_tokens=12000,
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    for row in range(inputs.q.shape[0]):
-        blocks = torch.arange(512, dtype=torch.int32, device=gpu_device)
-        blocks += (row % 4) * 600
-        inputs.block_indices[row] = blocks
-        inputs.indices[row].fill_(-1)
-        inputs.indices[row, :2048] = (
-            blocks[:, None] * 4 + torch.arange(4, dtype=torch.int32, device=gpu_device)
-        ).flatten()
-        visible = 12001 + row
-        inputs.indices[row, 2048 : 2048 + visible % 4] = torch.arange(
-            visible // 4 * 4, visible, dtype=torch.int32, device=gpu_device
-        )
-    validate_inputs(inputs=inputs)
-    # Disjoint early tiles are all masked for some queries; larger scores exercise rescaling.
-    inputs.q.mul_(3)
-    inputs.k.mul_(3)
-    plan = implementation.prepare(
-        inputs=inputs,
-        query_tile=query_tile,
-        mode="union",
-        dense_limit=0,
-        max_union_inflation=float("inf"),
-    )
-    out = torch.empty_like(inputs.q)
-    implementation.run(inputs=inputs, prepared=plan, out=out)
-    check_output(inputs=inputs, output=out, sample_count=33)
-    first = out.clone()
-    implementation.run(inputs=inputs, prepared=plan, out=out)
-    torch.testing.assert_close(out, first, rtol=0, atol=0)
+    if buffers < 1 or samples < buffers or warmup < 0:
+        raise ValueError("Require samples >= buffers >= 1 and warmup >= 0")
+    if not folder.resolve().is_relative_to(DATA.resolve()):
+        raise ValueError("Results must stay under mytest/mydata")
+    folder.mkdir(parents=True, exist_ok=False)
+    sources = [*Path(__file__).parent.glob("*.py"), *Path(__file__).parent.glob("sglang/*.py"),
+               Path(__file__).parent.parent / "mha/_common.py",
+               Path(__file__).parent.parent / "mha/mha_pa_bf16_256_linear_942.py",
+               ROOT / "src/pyhip/testing/misc.py", ROOT / "tests/ops/gr_read/test_gr_read.py"]
+    hashes = lambda: {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
+    report = {"complete": False, "raw": [], "buffers": buffers, "warmup": warmup, "samples": samples,
+              "scope": "qsa: recover+validate+rebuild+dispatch; base: frozen sparse kernel; preallocated outputs, no JIT/indexer/KV gather",
+              "query_lens": value.query_lens, "prefix_lens": value.prefix_lens, "scale": value.scale,
+              "q_shape": list(value.q.shape), "k_shape": list(value.k.shape), "dtype": str(value.q.dtype),
+              "torch": torch.__version__, "hip": torch.version.hip, "source_sha256": hashes(),
+              "capture": getattr(value, "capture", None), "gpu": gpu,
+              "packages": {n: importlib.metadata.version(n) for n in ("triton", "flydsl")}}
+    try:
+        _gate(folder, "before", gpu)
+        check(value)
+        values = [value] + [_metadata(*(getattr(value, n).clone() for n in ("q", "k", "v", "indices")),
+                            value.query_lens, value.prefix_lens, value.scale, value.captured) for _ in range(buffers - 1)]
+        outputs, bases = [torch.empty_like(v.q) for v in values], [torch.empty_like(v.q) for v in values]
+        report["addresses"] = []
+        for data, output, base_out in zip(values, outputs, bases):
+            _call(data, output)
+            _base(data, base_out)
+            torch.testing.assert_close(output, outputs[0], rtol=0, atol=0)
+            torch.testing.assert_close(output, base_out, rtol=0.02, atol=0.02)
+            report["addresses"].append({name: tensor_address(t, output=name in ("out", "base_out")) for name, t in (
+                ("q", data.q), ("k", data.k), ("v", data.v), ("indices", data.indices), ("out", output), ("base_out", base_out))})
+            for _ in range(warmup):
+                _call(data, output); _base(data, base_out)
+        assert all(len({a[name]["pointer"] for a in report["addresses"]}) == buffers for name in report["addresses"][0])
+        expected_qsa = outputs[0].clone()
+        for output, base_out in zip(outputs, bases):
+            output.fill_(float("nan")); base_out.fill_(float("nan"))
+        torch.cuda.synchronize(gpu)
+        _gate(folder, "before_samples", gpu)
+        timer = cudaPerf(name="qsa", verbose=0)
+        if not timer.enable:
+            raise RuntimeError("CUDAPERF disabled timing")
+        for sample in range(samples):
+            bi = sample % buffers
+            for name in (("base", "qsa") if sample % 2 == 0 else ("qsa", "base")):
+                with timer:
+                    (_base if name == "base" else _call)(values[bi], bases[bi] if name == "base" else outputs[bi])
+                elapsed = timer.latencies[-1] * 1e6
+                report["raw"].append({"scope": name, "sample": sample, "buffer": bi, "us": elapsed})
+                assert math.isfinite(elapsed) and elapsed > 0
+        for data, output, expected in zip(values, outputs, bases):
+            torch.testing.assert_close(output, expected_qsa, rtol=0, atol=0)
+            torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
+            for name in ("q", "k", "v", "indices"):
+                torch.testing.assert_close(getattr(data, name), getattr(value, name), rtol=0, atol=0)
+        work = int((value.indices >= 0).sum()) * 4 * value.q.shape[1] * 256
+        report["summary"] = {}
+        base_us = statistics.median(r["us"] for r in report["raw"] if r["scope"] == "base")
+        for name in ("base", "qsa"):
+            elapsed = statistics.median(r["us"] for r in report["raw"] if r["scope"] == name)
+            report["summary"][name] = {"median_us": elapsed, "ratio_to_base": elapsed / base_us,
+                                         "effective_tflops": work / elapsed / 1e6,
+                                         "paired_ratio_median": statistics.median(
+                                             next(r["us"] for r in report["raw"] if r["scope"] == name and r["sample"] == i) /
+                                             next(r["us"] for r in report["raw"] if r["scope"] == "base" and r["sample"] == i)
+                                             for i in range(samples))}
+        report["routes"] = _audit(value)
+        report["useful_flops"] = work
+        report["timed_outputs_bitexact"] = True
+        assert hashes() == report["source_sha256"], "Source changed during measurement"
+        for source in sources:
+            target = folder / "source" / source.relative_to(ROOT)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        _gate(folder, "after", gpu)
+        report["complete"] = True
+    except BaseException as error:
+        report["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        (folder / "result.json").write_text(json.dumps(report, indent=2))
+    return report
 
 
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-@pytest.mark.parametrize("mode", ("auto", "direct"))
-@pytest.mark.parametrize("block_n", (32, 64))
-def test_block_native_modes_match_fp32(
-    gpu_device: torch.device,
-    attention_tp: int,
-    mode: Literal["auto", "direct"],
-    block_n: int,
-) -> None:
-    from . import implementation
-
-    inputs = make_inputs(
-        spec=_case_spec(
-            name="chunk_prefill",
-            layout="ragged",
-            selection="independent",
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    inputs, guards = _with_nan_kv_guards(inputs=inputs)
-    validate_inputs(inputs=inputs)
-    _assert_local_shapes(inputs=inputs)
-    prepared = implementation.prepare(
-        inputs=inputs, mode=mode, dense_limit=0, block_n=block_n
-    )
-    assert prepared.dense.query_counts == (0,) * len(inputs.spec.query_lens)
-    if mode == "direct":
-        assert prepared.union is None and prepared.direct is not None
-    storage, out = _guarded_output(inputs=inputs)
-    out.fill_(float("nan"))
-    implementation.run(inputs=inputs, prepared=prepared, out=out)
-    check_output(inputs=inputs, output=out, sample_count=out.shape[0])
-    assert bool((storage[[0, -1]] == 123).all())
-    assert all(bool(torch.isnan(guard).all()) for guard in guards)
-
-
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-@pytest.mark.parametrize("mode", ("auto", "direct"))
-@pytest.mark.parametrize("prefix_tokens", (0, 2047, 2050, 2051, 12000))
-def test_dense_dispatch_boundaries_match_fp32(
-    gpu_device: torch.device,
-    attention_tp: int,
-    mode: Literal["auto", "direct"],
-    prefix_tokens: int,
-) -> None:
-    from . import implementation
-
-    inputs = make_inputs(
-        spec=default_spec(
-            name="chunk_prefill",
-            query_tokens=33,
-            prefix_tokens=prefix_tokens,
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    validate_inputs(inputs=inputs)
-    _assert_local_shapes(inputs=inputs)
-    prepared = implementation.prepare(inputs=inputs, mode=mode, dense_limit=2051)
-    expected_count = min(33, max(0, 2051 - prefix_tokens))
-    assert prepared.dense.query_counts == (expected_count,)
-    assert len(prepared.dense.calls) == int(expected_count > 0)
-    storage, out = _guarded_output(inputs=inputs)
-    out.fill_(float("nan"))
-    implementation.run(inputs=inputs, prepared=prepared, out=out)
-    check_output(inputs=inputs, output=out, sample_count=out.shape[0])
-    assert bool((storage[[0, -1]] == 123).all())
-
-
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-@pytest.mark.parametrize("limit", (0, 64, 2051))
-def test_dense_only_writes_eligible_ragged_prefixes(
-    gpu_device: torch.device, attention_tp: int, limit: int
-) -> None:
-    from . import dense
-
-    inputs = make_inputs(
-        spec=CaseSpec(
-            name="chunk_prefill",
-            query_lens=(7, 0, 9, 9, 9, 9, 7, 5, 9),
-            prefix_lens=(0, 5, 55, 56, 2047, 2050, 2051, 12000, 3),
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    inputs, guards = _with_nan_kv_guards(inputs=inputs)
-    # The prefix-only request also guards the first request's unaligned KV end.
-    inputs.k[7:12].fill_(float("nan"))
-    inputs.v[7:12].fill_(float("nan"))
-    validate_inputs(inputs=inputs)
-    _assert_local_shapes(inputs=inputs)
-    prepared = dense.prepare(inputs=inputs, limit=limit)
-    expected_counts = tuple(
-        min(length, max(0, limit - prefix))
-        for length, prefix in zip(inputs.spec.query_lens, inputs.spec.prefix_lens)
-    )
-    assert prepared.query_counts == expected_counts
-    expected_calls, written_rows, untouched_rows = [], [], []
-    q_start, k_start = 0, 0
-    for request, (length, prefix, count) in enumerate(
-        zip(inputs.spec.query_lens, inputs.spec.prefix_lens, expected_counts)
-    ):
-        if count:
-            expected_calls.append((request, q_start, count, k_start, prefix + count))
-        written_rows.extend(range(q_start, q_start + count))
-        untouched_rows.extend(range(q_start + count, q_start + length))
-        q_start += length
-        k_start += prefix + length
-    assert [
-        (call.request, call.q_start, call.q_count, call.k_start, call.kv_count)
-        for call in prepared.calls
-    ] == expected_calls
-    for call in prepared.calls:
-        assert call.cu_q.tolist() == [0, call.q_count]
-        assert call.cu_k.tolist() == [0, call.kv_count]
-
-    storage, out = _guarded_output(inputs=inputs)
-    out[written_rows] = float("nan")
-    dense.run(inputs=inputs, prepared=prepared, out=out)
-    if written_rows:
-        actual = out[written_rows].float()
-        expected = sparse_reference(inputs=inputs, rows=written_rows)
-        assert bool(torch.isfinite(actual).all())
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    assert bool((out[untouched_rows] == 123).all())
-    assert bool((storage[[0, -1]] == 123).all())
-    assert all(bool(torch.isnan(guard).all()) for guard in guards)
-
-
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-@pytest.mark.parametrize("mode", ("auto", "direct", "union"))
-def test_sparse_only_rejects_output_alias(gpu_device, attention_tp, mode):
-    from . import implementation
-
-    inputs = make_inputs(
-        spec=default_spec(
-            name="chunk_prefill",
-            query_tokens=33,
-            prefix_tokens=3000,
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    plan = implementation.prepare(inputs=inputs, mode=mode, dense_limit=0)
-    out = inputs.v.flatten()[: inputs.q.numel()].view_as(inputs.q)
-    with pytest.raises(ValueError, match="overlap"):
-        implementation.run(inputs=inputs, prepared=plan, out=out)
-
-
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-def test_direct_unsorted_replacement_input(gpu_device, attention_tp):
-    from . import implementation
-
-    inputs = make_inputs(
-        spec=default_spec(
-            name="chunk_prefill",
-            query_tokens=37,
-            prefix_tokens=3000,
-            attention_tp=attention_tp,
-        ),
-        device=gpu_device,
-    )
-    plan = implementation.prepare(
-        inputs=inputs, mode="direct", dense_limit=0, sort_blocks=False
-    )
-    changed = make_inputs(
-        spec=default_spec(
-            name="chunk_prefill",
-            query_tokens=37,
-            prefix_tokens=3000,
-            attention_tp=attention_tp,
-            seed=99,
-        ),
-        device=gpu_device,
-    )
-    implementation.rebuild_plan(inputs=changed, plan=plan)
-    out = torch.full_like(changed.q, float("nan"))
-    implementation.run(inputs=changed, prepared=plan, out=out)
-    check_output(inputs=changed, output=out, sample_count=37)
-
-
-@pytest.mark.parametrize("attention_tp", (2, 4, 8))
-@pytest.mark.parametrize("block_n", (32, 64))
-def test_auto_graph_gate_flips_rebuild_sorted_direct(gpu_device, attention_tp, block_n):
-    from . import implementation
-
-    def case(selection):
-        return make_inputs(
-            spec=default_spec(
-                name="chunk_prefill",
-                query_tokens=67,
-                prefix_tokens=12000,
-                attention_tp=attention_tp,
-                selection=selection,
-                selection_group=32,
-            ),
-            device=gpu_device,
-        )
-
-    inputs, changed = case("shared"), case("independent")
-    plan = implementation.prepare(inputs=inputs, block_n=block_n)
-    assert plan.union is not None and plan.direct is not None
-    out = torch.empty_like(inputs.q)
-    for _ in range(2):
-        implementation.run(inputs=inputs, prepared=plan, out=out)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        implementation.rebuild_plan(inputs=inputs, plan=plan)
-        implementation.run(inputs=inputs, prepared=plan, out=out)
-    shared_gate = plan.union.active.clone()
-    original_indices, original_blocks = (
-        inputs.indices.clone(),
-        inputs.block_indices.clone(),
-    )
-    for index, blocks in (
-        (changed.indices, changed.block_indices),
-        (original_indices, original_blocks),
-    ):
-        inputs.indices.copy_(index)
-        inputs.block_indices.copy_(blocks)
-        out.fill_(float("nan"))
-        graph.replay()
-        torch.cuda.synchronize(gpu_device)
-        check_output(inputs=inputs, output=out, sample_count=67)
-        if index is changed.indices:
-            assert not torch.equal(shared_gate, plan.union.active)
-
-
-def test_rebuild_uses_input_device_not_ambient_device(gpu_device):
-    from . import implementation
-
-    if torch.cuda.device_count() < 2:
-        pytest.skip("Needs two GPUs to verify device-context restoration")
-    target = (gpu_device.index + 1) % torch.cuda.device_count()
-    inputs = make_inputs(
-        spec=default_spec(
-            name="chunk_prefill", query_tokens=37, prefix_tokens=3000, attention_tp=4
-        ),
-        device=f"cuda:{target}",
-    )
-    ambient = torch.cuda.current_device()
-    plan = implementation.prepare(inputs=inputs)
-    implementation.rebuild_plan(inputs=inputs, plan=plan)
-    assert torch.cuda.current_device() == ambient
-    out = torch.empty_like(inputs.q)
-    implementation.run(inputs=inputs, prepared=plan, out=out)
-    check_output(inputs=inputs, output=out, sample_count=37)
-    assert torch.cuda.current_device() == ambient
+@pytest.mark.perf
+@pytest.mark.parametrize("path", _real_files(), ids=lambda p: p.stem)
+def test_qsa_performance(path):
+    device = _gpu()
+    output = Path(os.environ["QSA_REPLAY_OUTPUT"])
+    assert output.resolve().is_relative_to(DATA.resolve())
+    result = benchmark(_load(path, device), output / path.stem, device.index)
+    assert result["complete"]
+    if os.environ.get("QSA_REPLAY_REQUIRE_HALF") == "1":
+        assert result["summary"]["qsa"]["ratio_to_base"] <= 0.5
 
 
 @pytest.fixture(scope="module", autouse=True)
-def compiled_kernels_do_not_spill():
+def _resources():
     yield
-    if not torch.cuda.is_initialized() or torch.version.hip is None:
+    if not torch.cuda.is_initialized():
         return
-    from . import dense, direct, kernel
-
-    caches = {
-        "union": kernel._COMPILED,
-        "direct": direct._COMPILED,
-        "dense_native": dense.native._COMPILED,
-        "dense_bounded": dense._BOUNDED_COMPILED,
-    }
-    for name, cache in caches.items():
-        for key, compiled in cache.items():
-            for field in (
-                "private_segment_fixed_size",
-                "vgpr_spill_count",
-                "sgpr_spill_count",
-            ):
+    for name, cache in (("union_qsa_bf16_d256", _runtime.union._COMPILED),
+                        ("direct_qsa_bf16_d256", _runtime.direct._COMPILED),
+                        ("dense_mha_bf16_d256", _runtime.dense.native._COMPILED),
+                        ("dense_qsa_bf16_d256_bounded", _runtime.dense._BOUNDED_COMPILED)):
+        for compiled in cache.values():
+            assert re.findall(r'#gpu\.kernel_metadata<"([^"]+)"', compiled._keepalive.ir) == [name]
+            for field in ("private_segment_fixed_size", "vgpr_spill_count", "sgpr_spill_count"):
                 values = re.findall(rf"\b{field}\s*=\s*(\d+)", compiled._keepalive.ir)
-                assert values and not any(map(int, values)), (name, key, field, values)
+                assert values and not any(map(int, values))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--inputs", nargs="*", type=Path)
+    parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--require-half", action="store_true", help="require full QSA <= half the frozen baseline")
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    if any(os.environ.get(n) for n in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")):
+        raise RuntimeError("Use unmasked physical GPU indices")
+    assert args.output.resolve().is_relative_to(DATA.resolve())
+    args.output.mkdir(parents=True, exist_ok=False)
+    torch.cuda.set_device(args.gpu)
+    paths = args.inputs if args.inputs is not None else _real_files()
+    if not paths:
+        raise ValueError("No captured inputs; pass --inputs or QSA_REAL_INPUT_DIR")
+    for path in paths:
+        value = _load(path, f"cuda:{args.gpu}")
+        routes = check(value)
+        result = {"complete": True, "routes": routes} if args.check_only else benchmark(value, args.output / path.stem, args.gpu)
+        print(path.stem, result.get("summary", routes), flush=True)
+        if args.require_half and not args.check_only:
+            assert result["summary"]["qsa"]["ratio_to_base"] <= 0.5
+        del value
+        gc.collect()
+    (args.output / "checks.json").write_text(json.dumps({"inputs": [str(p) for p in paths], "passed": len(paths), "check_only": args.check_only}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,10 +1,10 @@
 """Block-native gfx942 sparse attention, without cross-query union construction.
 
-Four query waves each own one query and its GQA heads for BN32 or BN64.
+Four query waves each own one query and its GQA heads for BN32.
 V loads directly from global memory into registers for the transpose; Q/K
 remain in registers. Only the output transpose uses LDS (32 KiB). Softmax
 is updated once per BN tokens. Sparse addresses are full byte VOFFSETs.
-Optional Triton block sorting is charged to rebuild_plan.
+Triton block sorting is charged to rebuild_plan; only active direct rows sort.
 """
 
 import math
@@ -20,7 +20,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 
-from ..mha.mha_pa_bf16_942 import (
+from ..mha._common import (
     _buffer,
     _buffer_words,
     _exp,
@@ -33,7 +33,6 @@ from ..mha.mha_pa_bf16_942 import (
     _uniform,
     _wait,
 )
-from .contract import AttentionInputs
 
 
 def _load(resource, offset, lane):
@@ -93,18 +92,16 @@ def _pv(p, values, output, alpha):
 
 class DirectPlan(msgspec.Struct, frozen=True, kw_only=True):
     metadata: torch.Tensor
-    block_n: int
     query_tile: int
     num_tiles: int
     active: torch.Tensor
     query_tiles: torch.Tensor
     gated: bool
     source_blocks: torch.Tensor
-    sort_blocks: bool
 
 
 @triton.jit
-def _sort_blocks(
+def direct_qsa_sort_blocks(
     Source,
     Destination,
     Meta,
@@ -129,9 +126,9 @@ def _sort_blocks(
     tl.store(Destination + row * 512 + col, tl.where(ordered < 2147483647, ordered, -1))
 
 
-def rebuild_plan(*, inputs: AttentionInputs, plan: DirectPlan):
-    if plan.sort_blocks and plan.num_tiles:
-        _sort_blocks[(plan.num_tiles * plan.query_tile,)](
+def rebuild_plan(*, inputs, plan: DirectPlan):
+    if plan.num_tiles:
+        direct_qsa_sort_blocks[(plan.num_tiles * plan.query_tile,)](
             inputs.block_indices,
             plan.source_blocks,
             plan.metadata,
@@ -145,20 +142,16 @@ def rebuild_plan(*, inputs: AttentionInputs, plan: DirectPlan):
 
 def prepare(
     *,
-    inputs: AttentionInputs,
-    block_n: int = 32,
+    inputs,
     skip_counts=None,
     union=None,
-    sort_blocks: bool = True,
 ):
-    if block_n not in (32, 64):
-        raise ValueError("Direct block_n must be 32 or 64")
     waves = 4
-    skips = (0,) * len(inputs.spec.query_lens) if skip_counts is None else skip_counts
+    skips = (0,) * len(inputs.query_lens) if skip_counts is None else skip_counts
     metadata = []
     q0, k0 = 0, 0
     for q_len, prefix, skip in zip(
-        inputs.spec.query_lens, inputs.spec.prefix_lens, skips
+        inputs.query_lens, inputs.prefix_lens, skips
     ):
         for local in range(skip, q_len, waves):
             metadata.append(
@@ -175,18 +168,12 @@ def prepare(
     array = np.asarray(metadata, dtype=np.int32).reshape(-1, 5)
     return DirectPlan(
         metadata=torch.from_numpy(array).to(inputs.q.device),
-        block_n=block_n,
         query_tile=waves,
         num_tiles=len(metadata),
         gated=union is not None,
         active=inputs.query_positions if union is None else union.active,
         query_tiles=inputs.query_sequence_ids if union is None else union.query_tiles,
-        source_blocks=(
-            torch.empty_like(inputs.block_indices)
-            if sort_blocks
-            else inputs.block_indices
-        ),
-        sort_blocks=sort_blocks,
+        source_blocks=torch.empty_like(inputs.block_indices),
     )
 
 
@@ -457,7 +444,7 @@ def _body(
     )
 
 
-@flyc.kernel
+@flyc.kernel(name="direct_qsa_bf16_d256")
 def _kernel(
     Q: fx.Tensor,
     K: fx.Tensor,
@@ -576,7 +563,7 @@ def _launch(
 _COMPILED = {}
 
 
-def run(*, inputs: AttentionInputs, prepared: DirectPlan, out: torch.Tensor):
+def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
     if prepared.num_tiles == 0:
         return
     stream = torch.cuda.current_stream(inputs.q.device)
@@ -585,9 +572,7 @@ def run(*, inputs: AttentionInputs, prepared: DirectPlan, out: torch.Tensor):
         inputs.k.view(-1),
         inputs.v.view(-1),
         out.view(-1),
-        (prepared.source_blocks if prepared.sort_blocks else inputs.block_indices).view(
-            -1
-        ),
+        prepared.source_blocks.view(-1),
         prepared.metadata.view(-1),
         prepared.active,
         prepared.query_tiles,
@@ -595,7 +580,7 @@ def run(*, inputs: AttentionInputs, prepared: DirectPlan, out: torch.Tensor):
         inputs.k.shape[1],
         inputs.q.shape[0],
         inputs.k.shape[0],
-        prepared.block_n,
+        32,
         prepared.query_tile * 64,
         prepared.num_tiles * inputs.k.shape[1],
         prepared.gated,

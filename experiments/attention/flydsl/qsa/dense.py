@@ -31,9 +31,9 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 
-from ..mha import mha_pa_bf16_256_942 as base
+from ..mha import _common as base
 from ..mha import mha_pa_bf16_256_linear_942 as native
-from ..mha.mha_pa_bf16_942 import (
+from ..mha._common import (
     _advance_max,
     _buffer,
     _join,
@@ -47,7 +47,6 @@ from ..mha.mha_pa_bf16_942 import (
     _uniform,
     _wait,
 )
-from .contract import AttentionInputs
 
 BM, BN, D, THREADS, LDS_BYTES = 128, 64, 256, 512, 65536
 MAX_DENSE_VISIBLE = 2051
@@ -75,7 +74,7 @@ class DensePlan(msgspec.Struct, frozen=True, kw_only=True):
     limit: int
 
 
-def _check_qkv(inputs: AttentionInputs) -> None:
+def _check_qkv(inputs) -> None:
     if inputs.q.device.type != "cuda" or torch.version.hip is None:
         raise ValueError("Dense QSA requires ROCm/gfx942")
     for tensor in (inputs.q, inputs.k, inputs.v):
@@ -105,24 +104,16 @@ def _check_qkv(inputs: AttentionInputs) -> None:
         raise ValueError("softmax scale must be finite and positive")
 
 
-def prepare(inputs: AttentionInputs, limit: int = MAX_DENSE_VISIBLE) -> DensePlan:
+def prepare(inputs) -> DensePlan:
     """Prepare one direct-view call per eligible request, not per sparse tile.
 
     query_counts has one entry per original request, including zero-query and
     long-prefix requests. The parent must exclude exactly these leading rows
-    from its sparse path. limit=0 disables this branch; limits above 2051 are
-    rejected because the QSA selection is no longer necessarily dense.
+    from its sparse path. The selected dense boundary is fixed at2051.
     """
-    if type(limit) is not int or not 0 <= limit <= MAX_DENSE_VISIBLE:
-        raise ValueError("limit must be an integer in [0, 2051]")
+    limit = MAX_DENSE_VISIBLE
     _check_qkv(inputs)
-    if (
-        inputs.model.head_dim != D
-        or inputs.model.indexer_compress_ratio != 4
-        or inputs.model.block_topk != 512
-    ):
-        raise ValueError("Dense QSA requires D256, compression4, block_topk512")
-    query_lens, prefix_lens = inputs.spec.query_lens, inputs.spec.prefix_lens
+    query_lens, prefix_lens = inputs.query_lens, inputs.prefix_lens
     if len(query_lens) != len(prefix_lens) or any(
         type(n) is not int or not 0 <= n < 2**31 for n in (*query_lens, *prefix_lens)
     ):
@@ -189,15 +180,15 @@ def prepare(inputs: AttentionInputs, limit: int = MAX_DENSE_VISIBLE) -> DensePla
     )
 
 
-def run(inputs: AttentionInputs, prepared: DensePlan, out: torch.Tensor) -> None:
+def run(inputs, prepared: DensePlan, out: torch.Tensor) -> None:
     """Write only prepared eligible prefixes into caller-owned packed output."""
     _check_qkv(inputs)
     if (
         tuple(inputs.q.shape) != prepared.q_shape
         or tuple(inputs.k.shape) != prepared.k_shape
         or inputs.q.device != prepared.device
-        or inputs.spec.query_lens != prepared.query_lens
-        or inputs.spec.prefix_lens != prepared.prefix_lens
+        or inputs.query_lens != prepared.query_lens
+        or inputs.prefix_lens != prepared.prefix_lens
     ):
         raise ValueError("Request layout changed; prepare dense metadata again")
     if (
@@ -617,7 +608,7 @@ def _bounded_body(
     output_fn(o0, o1, inv, output, storage, shared, _pin_i32(tid), H)
 
 
-@flyc.kernel(known_block_size=[THREADS, 1, 1])
+@flyc.kernel(name="dense_qsa_bf16_d256_bounded", known_block_size=[THREADS, 1, 1])
 def _bounded_kernel(
     Q: fx.Tensor,
     K: fx.Tensor,
