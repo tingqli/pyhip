@@ -1,10 +1,20 @@
 """Block-native gfx942 sparse attention, without cross-query union construction.
 
-Four query waves each own one query and its GQA heads for BN32.
+Single-request, four-token-aligned KV uses the private packed implementation
+when combined PK/PV scratch fits the per-plan 64 MiB budget: every call packs
+KV and runs one query wave per CTA. Other shapes and over-budget inputs keep
+the raw KV fallback below. Both paths preserve the public inputs and selection.
+
+In the raw fallback, four query waves each own one query and its GQA heads.
 V loads directly from global memory into registers for the transpose; Q/K
 remain in registers. Only the output transpose uses LDS (32 KiB). Softmax
 is updated once per BN tokens. Sparse addresses are full byte VOFFSETs.
-Triton block sorting is charged to rebuild_plan; only active direct rows sort.
+The shared token-recovery validation already supplies sorted block indices.
+Each wave caches 64 block IDs for eight BN32 steps. K loads group four
+adjacent lanes per token, then transpose at QK consumption. K addresses are
+reused for V; the first V segment is requested before QK. K completion is
+waited at the next QK consumer so PV can overlap its prefetch. Accumulation
+order and RNE probability packing are unchanged.
 """
 
 import math
@@ -14,8 +24,6 @@ import flydsl.expr as fx
 import msgspec
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
@@ -35,6 +43,9 @@ from ..mha._common import (
 )
 
 
+MAX_PACKED_KV_BYTES = 64 * 1024 * 1024
+
+
 def _load(resource, offset, lane):
     parts = [
         _buffer_words(resource, offset + (lane >> 4) * 16 + k * 64) for k in range(8)
@@ -42,20 +53,43 @@ def _load(resource, offset, lane):
     return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
 
 
-def _qk(q, k):
-    q, k = fx.Vector(q).bitcast(fx.Int16), fx.Vector(k).bitcast(fx.Int16)
-    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+def _load_key(resource, offset, lane):
+    # Adjacent four lanes read one token's contiguous 64B, not four tokens.
+    parts = [
+        _buffer_words(resource, offset + (lane & 3) * 16 + k * 64) for k in range(8)
+    ]
+    return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
+
+
+def _qk_pair(q, k0, k1, lane):
+    q = fx.Vector(q).bitcast(fx.Int16)
+    keys = (fx.Vector(k0), fx.Vector(k1))
+    # Inverse of load lane = token * 4 + channel_quarter. Keep K in its load
+    # layout during PV prefetch so the transpose cannot force an early VM wait.
+    source_lane = fx.Int32(((lane & 15) * 4 + (lane >> 4)) * 4)
+    keys = tuple(
+        fx.Vector.from_elements(
+            [
+                fx.Int32(rocdl.ds_bpermute(
+                    fx.Int32.ir_type, source_lane.ir_value(), key[i].ir_value()
+                ))
+                for i in range(32)
+            ],
+            fx.Int32,
+        ).bitcast(fx.Int16)
+        for key in keys
+    )
+    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
     for s in range(16):
         first = (s // 2) * 8 + (s % 2) * 4
-        a = fx.Vector.from_elements([k[first + i] for i in range(4)], fx.Int16)
         b = fx.Vector.from_elements([q[first + i] for i in range(4)], fx.Int16)
-        acc = fx.Vector(
-            rocdl.mfma_f32_16x16x16bf16_1k(
+        for n in range(2):
+            a = fx.Vector.from_elements([keys[n][first + i] for i in range(4)], fx.Int16)
+            acc[n] = fx.Vector(rocdl.mfma_f32_16x16x16bf16_1k(
                 ir.VectorType.get([4], fx.Float32.ir_type),
-                [a.ir_value(), b.ir_value(), acc.ir_value(), 0, 0, 0],
-            )
-        )
-    return acc
+                [a.ir_value(), b.ir_value(), acc[n].ir_value(), 0, 0, 0],
+            ))
+    return acc[0], acc[1]
 
 
 def _pv(p, values, output, alpha):
@@ -85,9 +119,10 @@ def _pv(p, values, output, alpha):
                 [a.ir_value(), p.ir_value(), acc[n].ir_value(), 0, 0, 0],
             )
         )
-    return fx.Vector.from_elements(
+    result = fx.Vector.from_elements(
         [acc[n][i] for n in range(8) for i in range(4)], fx.Float32
     )
+    return result
 
 
 class DirectPlan(msgspec.Struct, frozen=True, kw_only=True):
@@ -98,46 +133,8 @@ class DirectPlan(msgspec.Struct, frozen=True, kw_only=True):
     query_tiles: torch.Tensor
     gated: bool
     source_blocks: torch.Tensor
-
-
-@triton.jit
-def direct_qsa_sort_blocks(
-    Source,
-    Destination,
-    Meta,
-    Active,
-    QueryTiles,
-    WAVES: tl.constexpr,
-    GATED: tl.constexpr,
-):
-    task = tl.program_id(0)
-    tile, local = task // WAVES, task % WAVES
-    rows = tl.load(Meta + tile * 5 + 1)
-    if local >= rows:
-        return
-    row = tl.load(Meta + tile * 5) + local
-    if GATED:
-        group = tl.load(QueryTiles + row)
-        if tl.load(Active + group) != 0:
-            return
-    col = tl.arange(0, 512)
-    blocks = tl.load(Source + row * 512 + col)
-    ordered = tl.sort(tl.where(blocks >= 0, blocks, 2147483647), descending=False)
-    tl.store(Destination + row * 512 + col, tl.where(ordered < 2147483647, ordered, -1))
-
-
-def rebuild_plan(*, inputs, plan: DirectPlan):
-    if plan.num_tiles:
-        direct_qsa_sort_blocks[(plan.num_tiles * plan.query_tile,)](
-            inputs.block_indices,
-            plan.source_blocks,
-            plan.metadata,
-            plan.active,
-            plan.query_tiles,
-            plan.query_tile,
-            plan.gated,
-            num_warps=4,
-        )
+    packed_key: torch.Tensor | None = None
+    packed_value: torch.Tensor | None = None
 
 
 def prepare(
@@ -146,7 +143,21 @@ def prepare(
     skip_counts=None,
     union=None,
 ):
-    waves = 4
+    """Bind private scratch; qsa's recovery refreshes sorted block_indices each call."""
+    # Block packing is request-local and requires complete physical four-token
+    # blocks. Bound both scratch tensors before allocation using host metadata;
+    # ragged/nonmultiple lengths and over-budget KV retain the raw-KV path.
+    packed_bytes = (
+        inputs.k.numel() * inputs.k.element_size()
+        + inputs.v.numel() * inputs.v.element_size()
+    )
+    packed = (
+        len(inputs.query_lens) == 1
+        and inputs.k.shape[0] % 4 == 0
+        and packed_bytes <= MAX_PACKED_KV_BYTES
+        and inputs.k.numel() * 2 + inputs.k.shape[1] * 1536 + 512 < 2**32
+    )
+    waves = 1 if packed else 4
     skips = (0,) * len(inputs.query_lens) if skip_counts is None else skip_counts
     metadata = []
     q0, k0 = 0, 0
@@ -173,30 +184,33 @@ def prepare(
         gated=union is not None,
         active=inputs.query_positions if union is None else union.active,
         query_tiles=inputs.query_sequence_ids if union is None else union.query_tiles,
-        source_blocks=torch.empty_like(inputs.block_indices),
+        source_blocks=inputs.block_indices,
+        packed_key=torch.empty_like(inputs.k) if packed and metadata else None,
+        packed_value=torch.empty_like(inputs.v) if packed and metadata else None,
     )
 
 
-def _source_offset(blocks, row, n, visible, extent, hk):
-    complete = _min(visible // 4, fx.Int32(512))
-    width = complete * 4 + visible % 4
-    block_col = n // 4
-    block = fx.Int32(blocks[row * 512 + _min(block_col, fx.Int32(511))])
+def _source_offset(cached_blocks, n, visible, extent, hk):
+    # Valid positions and token slots are nonnegative; padding is masked below.
+    complete = _min(visible >> 2, fx.Int32(512))
+    width = complete * 4 + (visible & 3)
+    lane_bytes = fx.Int32((_min(n >> 2, fx.Int32(511)) & 63) * 4)
+    block = fx.Int32(rocdl.ds_bpermute(
+        fx.Int32.ir_type, lane_bytes.ir_value(), fx.Int32(cached_blocks).ir_value()
+    ))
     token = (n < complete * 4).select(
-        block * 4 + n % 4, (visible // 4) * 4 + n - complete * 4
+        block * 4 + (n & 3), (visible & -4) + n - complete * 4
     )
     return (n < width).select(token * (hk * 256 * 2), fx.Int32(extent))
 
 
 def _load_v_global(
-    resource, blocks, row, tile, segment, half, lane, visible, extent, hk, bn
+    resource, source_base, tile, segment, half, lane, visible, extent, hk, bn
 ):
     first = tile * bn + segment * 16 + (lane >> 4) * 4
-    complete = _min(visible // 4, fx.Int32(512))
-    width = complete * 4 + visible % 4
-    block = fx.Int32(blocks[row * 512 + _min(first // 4, fx.Int32(511))])
-    block = (first < complete * 4).select(block, visible // 4)
-    base = block * (4 * hk * 256 * 2) + (lane & 15) * 16 + half * 256
+    complete = _min(visible >> 2, fx.Int32(512))
+    width = complete * 4 + (visible & 3)
+    base = source_base + (lane & 15) * 16 + half * 256
     parts = []
     for r in range(4):
         offset = (first + r < width).select(base + r * (hk * 256 * 2), fx.Int32(extent))
@@ -297,7 +311,7 @@ def _body(
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
 ):
-    load, qk, pv = _load, _qk, _pv
+    load, load_key, qk, pv = _load, _load_key, _qk_pair, _pv
     source_offset, load_v, output_fn, enabled = (
         _source_offset,
         _load_v_global,
@@ -320,8 +334,8 @@ def _body(
     position0 = _uniform(META[tile * 5 + 4])
     valid_wave = enabled(wave, rows, first, QUERY_TILES, ACTIVE, GATED, NQ)
     visible = position0 + wave + 1
-    count = _min(visible // 4, fx.Int32(512)) * 4 + visible % 4
-    tiles = valid_wave.select((count + BN - 1) // BN, fx.Int32(0))
+    count = _min(visible >> 2, fx.Int32(512)) * 4 + (visible & 3)
+    tiles = valid_wave.select((count + 31) >> 5, fx.Int32(0))
     qe = (NQ - first) * H * 256 * 2 - hkv * (H // HK) * 256 * 2
     qptr = fx.get_iter(Q) + (fx.Int64(first) * H + hkv * (H // HK)) * 256
     qr = _buffer(fx.make_view(qptr, fx.make_layout(NQ * H * 256, 1)), qe)
@@ -351,29 +365,50 @@ def _body(
         fx.Vector.filled(32, 0.0, fx.Float32)
     )
     scale = fx.Float32(SCALE * math.log2(math.e))
-    initial = source_offset(blocks, row, lane & 15, visible, extent, HK)
+    # One block ID per lane; each BN32 step consumes eight of these IDs.
+    cached_blocks = fx.Int32(blocks[row * 512 + lane])
+    _wait(vmcnt=0)
+    initial = source_offset(cached_blocks, lane >> 2, visible, extent, HK)
     initial = valid_wave.select(initial, fx.Int32(extent))
-    kval = load(kr, initial, lane)
+    kval = load_key(kr, initial, lane)
+    key_offset = initial
+    key_offset1 = source_offset(
+        cached_blocks,
+        _min(fx.Int32(16), (((count + 15) >> 4) - 1) * 16) + (lane >> 2),
+        visible, extent, HK,
+    )
+    key_offset1 = valid_wave.select(key_offset1, fx.Int32(extent))
+    kval1 = load_key(kr, key_offset1, lane)
     _wait(vmcnt=0)
     rocdl.sched_barrier(0)
     for t in range(fx.Int32(0), tiles, fx.Int32(1)):
         kval = fx.Vector(kval)
         all_scores = []
+        v_rows = []
         for segment in fx.range_constexpr(BN // 16):
-            following = _min(t * BN + (segment + 1) * 16, ((count + 15) // 16 - 1) * 16)
-            offset = source_offset(
-                blocks, row, following + (lane & 15), visible, extent, HK
-            )
-            next_k = load(kr, offset, lane)
-            scores = qk(q, kval)
+            # In K's load layout, lanes 0/16/32/48 hold block-first addresses.
+            # Reuse these for V without another dependent block-table load.
+            v_rows.append(fx.Int32(rocdl.ds_bpermute(
+                fx.Int32.ir_type, fx.Int32((lane >> 4) * 64).ir_value(),
+                fx.Int32(key_offset1 if segment else key_offset).ir_value(),
+            )))
+        _wait(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        values0 = load_v(vr, v_rows[0], t, 0, 0, lane, visible, extent, HK, BN)
+        values1 = load_v(vr, v_rows[0], t, 0, 1, lane, visible, extent, HK, BN)
+        rocdl.sched_barrier(0)
+        # The prior iteration's sixteen K requests precede these eight V0
+        # requests. Wait for K at its consumer, leaving V in flight for QK.
+        _wait(vmcnt=8)
+        rocdl.sched_barrier(0)
+        pair = qk(q, kval, kval1, lane)
+        for segment in fx.range_constexpr(BN // 16):
+            scores = pair[segment]
             for i in fx.range_constexpr(4):
                 col = t * BN + segment * 16 + (lane >> 4) * 4 + i
                 all_scores.append(
                     (col < count).select(scores[i] * scale, fx.Float32(float("-inf")))
                 )
-            _wait(vmcnt=0)
-            rocdl.sched_barrier(0)
-            kval = next_k
         candidate = fx.Float32(-1e30)
         for score in all_scores:
             candidate = _maximum(candidate, score)
@@ -394,30 +429,44 @@ def _body(
         o1 = fx.Vector(o1) * alpha
         _wait(lgkmcnt=0)
         rocdl.sched_barrier(0)
-        values0 = load_v(vr, blocks, row, t, 0, 0, lane, visible, extent, HK, BN)
-        values1 = load_v(vr, blocks, row, t, 0, 1, lane, visible, extent, HK, BN)
         _wait(vmcnt=0)
         rocdl.sched_barrier(0)
-        for segment in fx.range_constexpr(BN // 16):
-            p = _pack_bf16(
-                fx.Vector.from_elements(
-                    [probabilities[segment * 4 + i] for i in range(4)], fx.Float32
-                )
-            ).bitcast(fx.Int16)
-            o0 = pv(p, values0, o0, fx.Float32(1.0))
-            if fx.const_expr(segment + 1 < BN // 16):
-                next_values0 = load_v(
-                    vr, blocks, row, t, segment + 1, 0, lane, visible, extent, HK, BN
-                )
-            o1 = pv(p, values1, o1, fx.Float32(1.0))
-            if fx.const_expr(segment + 1 < BN // 16):
-                next_values1 = load_v(
-                    vr, blocks, row, t, segment + 1, 1, lane, visible, extent, HK, BN
-                )
-                _wait(vmcnt=0)
-                rocdl.sched_barrier(0)
-                values0, values1 = next_values0, next_values1
+        if ((t + 1) & 7) == 0:
+            chunk = _min((t + 1) >> 3, fx.Int32(7)) * 64
+            cached_blocks = fx.Int32(blocks[row * 512 + chunk + lane])
+            _wait(vmcnt=0)
+        following = _min((t + 1) * BN, (((count + 15) >> 4) - 1) * 16)
+        following1 = _min((t + 1) * BN + 16, (((count + 15) >> 4) - 1) * 16)
+        key_offset = source_offset(
+            cached_blocks, following + (lane >> 2), visible, extent, HK
+        )
+        key_offset1 = source_offset(
+            cached_blocks, following1 + (lane >> 2), visible, extent, HK
+        )
+        p0 = _pack_bf16(fx.Vector.from_elements(
+            [probabilities[i] for i in range(4)], fx.Float32)).bitcast(fx.Int16)
+        p1 = _pack_bf16(fx.Vector.from_elements(
+            [probabilities[4 + i] for i in range(4)], fx.Float32)).bitcast(fx.Int16)
+        next_values0 = load_v(vr, v_rows[1], t, 1, 0, lane, visible, extent, HK, BN)
+        next_values1 = load_v(vr, v_rows[1], t, 1, 1, lane, visible, extent, HK, BN)
+        rocdl.sched_barrier(0)
+        o0 = pv(p0, values0, o0, fx.Float32(1.0))
+        rocdl.sched_barrier(0)
+        kval = load_key(kr, key_offset, lane)
+        rocdl.sched_barrier(0)
+        o1 = pv(p0, values1, o1, fx.Float32(1.0))
+        rocdl.sched_barrier(0)
+        kval1 = load_key(kr, key_offset1, lane)
+        rocdl.sched_barrier(0)
+        # Eight V loads precede sixteen K loads. Consume V while K stays in
+        # flight; the native load-use waits may be stricter after allocation.
+        _wait(vmcnt=16)
+        rocdl.sched_barrier(0)
+        o0 = pv(p1, next_values0, o0, fx.Float32(1.0))
+        o1 = pv(p1, next_values1, o1, fx.Float32(1.0))
         maximum = updated
+    # Retire the final bounded speculative K prefetch before the epilogue.
+    _wait(vmcnt=0)
     _stage_end()
     inv = (total > 0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
     outptr = fx.get_iter(O) + (fx.Int64(first) * H + hkv * (H // HK)) * 256
@@ -556,7 +605,12 @@ def _launch(
         TASKS,
         GATED,
         SCALE,
-        value_attrs={"passthrough": [["target-features", "-packed-fp32-ops"]]},
+        # gpu-to-rocdl preserves this typed attribute, not generic passthrough.
+        value_attrs={
+            "llvm.target_features": ir.Attribute.parse(
+                '#llvm.target_features<["-packed-fp32-ops"]>'
+            ),
+        },
     ).launch(grid=(TASKS, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
@@ -566,6 +620,10 @@ _COMPILED = {}
 def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
     if prepared.num_tiles == 0:
         return
+    if prepared.packed_key is not None:
+        from . import _direct_packed
+
+        return _direct_packed.run(inputs=inputs, prepared=prepared, out=out)
     stream = torch.cuda.current_stream(inputs.q.device)
     args = (
         inputs.q.view(-1),

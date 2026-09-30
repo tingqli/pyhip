@@ -84,6 +84,20 @@ def _dma(resource, storage, wave, lane, rows, tile, kv_len, hk, packet, is_v, ex
     base_row, base_channel = _copy_coordinates(wave, 0, page)
     base_destination = fx.Int32(base_row * 512 + base_channel * 2)
     immediate = (K_BYTES if is_v else 0) + packet * (512 if page == 4 else 2048)
+    # Keep both scalar address producers in the DS/DMA leaf. Independent asm
+    # results otherwise add hazard nops between SOFFSET, M0 and the LDS read.
+    if not page and read_address is not None and not tail:
+        origin = fx.Int32(rows[0] * (hk * D * 2) + channel * 2)
+        result_type = ir.Type.parse("!llvm.struct<(vector<4xi32>, i32)>")
+        result = llvm.inline_asm(result_type,
+            [fx.Int32(read_address).ir_value(), resource, fx.Int32(voffset).ir_value(),
+             base_destination.ir_value(), origin.ir_value()],
+            f"s_add_u32 $1, $6, {packet * 4 * hk * D * 2}\n"
+            f"s_add_u32 m0, $5, {immediate}\n"
+            f"ds_read_b128 $0, $2 offset:{read_immediate}\n"
+            "buffer_load_dword $4, $3, $1 offen lds",
+            "=&v,=&s,v,s,v,s,s,~{m0},~{scc},~{memory}", has_side_effects=True)
+        return fx.Vector(llvm.extractvalue(ir.VectorType.get([4], fx.Int32.ir_type), result, [0]))
     if page:
         scalar = rows[packet // 4] if page == 4 else rows[packet]
         if page == 4:
@@ -127,9 +141,9 @@ def _read_k(addresses, half, lower_first=False):
     return fx.make_view(fx.get_iter(frag), fx.make_layout((4, 2, 16), (1, 64, 4)))
 
 
-def _read_v(address, half):
+def _read_v(address, half, blocks=2):
     parts = []
-    for block in range(2):
+    for block in range(blocks):
         for row in range(8):
             parts.append(_read_address(address, half * 256 + block * 16384 + row * 512))
     return fx.Vector.from_elements([part[i] for part in parts for i in range(4)], fx.Int32)
@@ -149,18 +163,27 @@ def _v_operands(values, step, progressive):
     return fx.Vector.from_elements(words, fx.Int32)
 
 
-def _pv(probabilities, values, output, progressive=False, prepared=None, center_args=None, summary_args=None):
+def _pack_probabilities(values):
+    # Identical half-up BF16 bits to base._pack; expose permute dependencies
+    # only in the static linear specialization, where scheduling benefits.
+    bits = fx.Vector(values).bitcast(fx.Uint32) + fx.Uint32(0x8000)
+    words = [fx.Int32(rocdl.perm_b32(bits[i + 1].ir_value(), bits[i].ir_value(),
+                                   fx.Int32(0x07060302).ir_value())) for i in range(0, 16, 2)]
+    return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.BFloat16)
+
+
+def _pv(probabilities, values, output, progressive=False, prepared=None, center_args=None, summary_args=None, steps=4):
     p = fx.Vector(probabilities)
     acc = [fx.Vector.from_elements([output[n * 4 + i] for i in range(4)], fx.Float32) for n in range(8)]
     prepared_steps = 0 if prepared is None else prepared.numel // 16
     operands = _v_operands(values, 0, progressive) if prepared is None else fx.Vector.from_elements([prepared[i] for i in range(16)], fx.Int32)
     centered = []
     rocdl.sched_barrier(0)
-    for step in range(4):
+    for step in range(steps):
         if step + 1 < prepared_steps:
             following = fx.Vector.from_elements([prepared[(step + 1) * 16 + i] for i in range(16)], fx.Int32)
         else:
-            following = _v_operands(values, step + 1, progressive) if step < 3 else operands
+            following = _v_operands(values, step + 1, progressive) if step + 1 < steps else operands
         b = fx.Vector.from_elements([p[step * 4 + i] for i in range(4)], fx.BFloat16)
         for n in range(8):
             a = fx.Vector.from_elements([operands[n * 2 + i] for i in range(2)], fx.Int32).bitcast(fx.Int16)
@@ -181,7 +204,7 @@ def _pv(probabilities, values, output, progressive=False, prepared=None, center_
             current, total, sums, row_sum = summary_args
             row_sum = row_sum + ((total + sums[0]) + (sums[1] + sums[2]))
             candidate = base._max(current)
-        if step < 3 and step + 1 >= prepared_steps:
+        if step + 1 < steps and step + 1 >= prepared_steps:
             _schedule(8, 3 if center_args is not None else 2, 20 + step)
         elif summary_args is not None:
             _schedule(8, 3, 23)
@@ -230,15 +253,22 @@ def _output(o0, o1, inv, buffer, storage, shared, tid, heads):
 def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
           H: fx.Constexpr[int], HK: fx.Constexpr[int], NK: fx.Constexpr[int], MAX_PAGES: fx.Constexpr[int],
           PAGE: fx.Constexpr[int], PAGED: fx.Constexpr[bool], CAUSAL: fx.Constexpr[bool],
-          WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool]):
+          WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool],
+          STATIC_Q: fx.Constexpr[int], STATIC_K: fx.Constexpr[int]):
     read_k, read_v, dma, source_rows, pv = _read_k, _read_v, _dma, _source_rows, _pv
     dma_offsets = _dma_offsets
     v_operands = _v_operands
     qk, local_sum, local_max, cross = base._qk, base._sum, base._max, base._cross
     exps, pack, mask, center = base._exps, base._pack, base._mask, base._center
+    if fx.const_expr(STATIC_Q > 0):
+        pack = _pack_probabilities
     rescale, advance_max = _rescale, _advance_max
-    q0, k0 = _uniform(CQ[batch]), _uniform(CK[batch])
-    q_len, kv_len = _uniform(CQ[batch + 1]) - q0, _uniform(CK[batch + 1]) - k0
+    if fx.const_expr(STATIC_Q > 0):
+        q0, k0 = fx.Int32(0), fx.Int32(0)
+        q_len, kv_len = fx.Int32(STATIC_Q), fx.Int32(STATIC_K)
+    else:
+        q0, k0 = _uniform(CQ[batch]), _uniform(CK[batch])
+        q_len, kv_len = _uniform(CQ[batch + 1]) - q0, _uniform(CK[batch + 1]) - k0
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -303,7 +333,8 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
     _stage_end()
 
     @flyc.jit
-    def phase(previous, maximum, row_sum, o0, o1, previous_offsets, current_offsets, next_rows, t):
+    def phase(previous, maximum, row_sum, o0, o1, previous_offsets, current_offsets, next_rows, t,
+              NARROW: fx.Constexpr[bool]):
         previous, maximum, row_sum = fx.Vector(previous), fx.Float32(maximum), fx.Float32(row_sum)
         o0, o1, t = fx.Vector(o0), fx.Vector(o1), fx.Int32(t)
         previous_offsets = fx.Vector(previous_offsets)
@@ -326,7 +357,8 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
         previous = exps(previous)
         _schedule(32, 1, 1, True)
         _stage_end()
-        k = read_k(kr, 1, STAGGER)
+        if fx.const_expr(not NARROW):
+            k = read_k(kr, 1, STAGGER)
         _wait(vmcnt=0)
         if fx.const_expr(STAGGER):
             # Leading DMA owns D[0:128]; retire those eight reads before it
@@ -335,7 +367,9 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
         _stage_end()
         _wait(lgkmcnt=0)
         rocdl.sched_barrier(0)
-        hi = qk(q, k)
+        # A narrow final tile has no live N[32:64] scores. The unchanged mask
+        # turns these placeholders into -inf before any softmax operation.
+        hi = fx.Vector.filled(8, 0.0, fx.Float32) if NARROW else qk(q, k)
         total, probabilities = local_sum(previous), pack(previous)
         offsets = dma_offsets(next_rows, PAGE if PAGED else 0)
         _schedule(32, 3, 2)
@@ -372,27 +406,35 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
 
     if fx.const_expr(not CAUSAL and not WITH_LSE):
         # Four phases amortize scalar offset queue moves in the full path.
-        for t in range(fx.Int32(1), tiles - 3, fx.Int32(4)):
-            for j in fx.range_constexpr(4):
+        unroll = 4
+        narrow_tail = STATIC_Q > 0 and 0 < STATIC_K % BN <= 32 and STATIC_K > BN
+        loop_end = tiles - 1 if narrow_tail else tiles
+        for t in range(fx.Int32(1), loop_end - (unroll - 1), fx.Int32(unroll)):
+            for j in fx.range_constexpr(unroll):
                 scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
-                    scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t + j)
-        remainder = ((tiles - 1) & -4) + 1
-        for t in range(remainder, tiles, fx.Int32(1)):
+                    scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t + j, False)
+        remainder = ((loop_end - 1) & -unroll) + 1
+        for t in range(remainder, loop_end, fx.Int32(1)):
             scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
-                scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t)
+                scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t, False)
+        if fx.const_expr(narrow_tail):
+            scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
+                scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, last, True)
     else:
         # Causal bounds and LSE increase live state; two phases avoid scalar
         # spills observed with four-phase causal/LSE specializations.
         for t in range(fx.Int32(1), tiles - 1, fx.Int32(2)):
             scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
-                scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t)
+                scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t, False)
             scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
-                scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t + 1)
+                scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t + 1, False)
         if (tiles & 1) == 0:
             scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
-                scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, last)
+                scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, last, False)
+    # The narrow drain never reads the upper 32-token V plane.
+    narrow_tail = STATIC_Q > 0 and 0 < STATIC_K % BN <= 32 and STATIC_K > BN
     offsets = fx.Vector(v_offsets)
-    for packet in fx.range_constexpr(16):
+    for packet in fx.range_constexpr(8 if narrow_tail else 16):
         dma(gv, storage, wave, lane, offsets, last, kv_len, HK, packet, True, extent, PAGE if PAGED else 0, True)
     scores = exps(fx.Vector(scores))
     total = local_sum(scores)
@@ -403,15 +445,15 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
     _wait(vmcnt=0, lgkmcnt=0)
     _stage_end()
     _stage_end()
-    v = read_v(vr, 0)
+    v = read_v(vr, 0, 1 if narrow_tail else 2)
     _wait(lgkmcnt=0)
     _stage_end()
-    o0 = pv(probabilities, v, o0)
+    o0 = pv(probabilities, v, o0, steps=2 if narrow_tail else 4)
     _stage_end()
-    v = read_v(vr, 1)
+    v = read_v(vr, 1, 1 if narrow_tail else 2)
     _wait(lgkmcnt=0)
     _stage_end()
-    o1 = pv(probabilities, v, o1)
+    o1 = pv(probabilities, v, o1, steps=2 if narrow_tail else 4)
     _stage_end()
     if fx.const_expr(not STAGGER):
         _stage_end()
@@ -429,18 +471,19 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
 def _work(Q, K, V, O, LSE, CQ, CK, TABLE, storage, work,
           H: fx.Constexpr[int], HK: fx.Constexpr[int], NK: fx.Constexpr[int], B: fx.Constexpr[int],
           MAX_PAGES: fx.Constexpr[int], PAGE: fx.Constexpr[int], PAGED: fx.Constexpr[bool],
-          CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float]):
+          CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
+          STATIC_Q: fx.Constexpr[int], STATIC_K: fx.Constexpr[int]):
     body = _body
     head, batch, qb = work % H, (work // H) % B, work // (H * B)
-    q_len = _uniform(CQ[batch + 1]) - _uniform(CQ[batch])
+    q_len = fx.Int32(STATIC_Q) if STATIC_Q > 0 else _uniform(CQ[batch + 1]) - _uniform(CQ[batch])
     if qb * BM < q_len:
         group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
         if group != 0:
             body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
-                 H, HK, NK, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, True)
+                 H, HK, NK, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, True, STATIC_Q, STATIC_K)
         else:
             body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
-                 H, HK, NK, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, False)
+                 H, HK, NK, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, False, STATIC_Q, STATIC_K)
 
 
 @flyc.kernel(name="dense_mha_bf16_d256", known_block_size=[THREADS, 1, 1])
@@ -449,11 +492,25 @@ def _linear_256_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, L
     H: fx.Constexpr[int], HK: fx.Constexpr[int], NK: fx.Constexpr[int], B: fx.Constexpr[int],
     MAX_Q: fx.Constexpr[int], MAX_PAGES: fx.Constexpr[int], PAGE: fx.Constexpr[int], PAGED: fx.Constexpr[bool],
     CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
-    PERSISTENT: fx.Constexpr[bool], CUS: fx.Constexpr[int]):
+    PERSISTENT: fx.Constexpr[bool], CUS: fx.Constexpr[int], STATIC_Q: fx.Constexpr[int], STATIC_K: fx.Constexpr[int]):
     work_body = _work
     storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, LDS_BYTES, 16]).peek().view(fx.make_layout(LDS_BYTES, 1))
     work = fx.Int32(gpu.block_id("x"))
-    if fx.const_expr(PERSISTENT):
+    if fx.const_expr(PERSISTENT and CAUSAL and B == 1 and not PAGED):
+        # A single request's causal cost grows with qb. Longest-first snake
+        # rows balance persistent workers without changing a tile's arithmetic.
+        query_blocks = (MAX_Q + BM - 1) // BM
+        tasks = H * query_blocks
+        while work < ((tasks + CUS - 1) // CUS) * CUS:
+            row, column = work // CUS, work % CUS
+            rank = row * CUS + ((row & 1) != 0).select(CUS - 1 - column, column)
+            if rank < tasks:
+                head, qb = rank % H, query_blocks - 1 - rank // H
+                mapped = qb * H + head
+                work_body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, mapped,
+                          H, HK, NK, B, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, STATIC_Q, STATIC_K)
+            work = work + CUS
+    elif fx.const_expr(PERSISTENT):
         while work < H * B * ((MAX_Q + BM - 1) // BM):
             query_blocks = (MAX_Q + BM - 1) // BM
             head = work // (B * query_blocks)
@@ -461,11 +518,11 @@ def _linear_256_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, L
             qb = work % query_blocks
             mapped = (qb * B + batch) * H + head
             work_body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, mapped,
-                      H, HK, NK, B, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE)
+                      H, HK, NK, B, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, STATIC_Q, STATIC_K)
             work = work + CUS
     else:
         work_body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, work,
-                  H, HK, NK, B, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE)
+                  H, HK, NK, B, MAX_PAGES, PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, STATIC_Q, STATIC_K)
 
 
 @flyc.jit
@@ -474,10 +531,10 @@ def _launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tens
     H: fx.Constexpr[int], HK: fx.Constexpr[int], NK: fx.Constexpr[int], B: fx.Constexpr[int],
     MAX_Q: fx.Constexpr[int], MAX_PAGES: fx.Constexpr[int], PAGE: fx.Constexpr[int], PAGED: fx.Constexpr[bool],
     CAUSAL: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
-    PERSISTENT: fx.Constexpr[bool], CUS: fx.Constexpr[int], stream: fx.Stream):
+    PERSISTENT: fx.Constexpr[bool], CUS: fx.Constexpr[int], STATIC_Q: fx.Constexpr[int], STATIC_K: fx.Constexpr[int], stream: fx.Stream):
     tasks = H * B * ((MAX_Q + BM - 1) // BM)
     _linear_256_kernel(Q, K, V, O, LSE, CQ, CK, TABLE, H, HK, NK, B, MAX_Q, MAX_PAGES,
-        PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, PERSISTENT, CUS,
+        PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, PERSISTENT, CUS, STATIC_Q, STATIC_K,
         value_attrs={"rocdl.waves_per_eu": 2, "passthrough": [["target-features", "-packed-fp32-ops"]]},
     ).launch(grid=(min(CUS, tasks) if PERSISTENT else tasks, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
@@ -487,17 +544,21 @@ _COMPILED = {}
 
 def run(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, *, out,
         lse=None, page_size=1, causal=False, softmax_scale=None, block_table=None, persistent=True, stream=None):
-    """Internal validated launch; public validation lives in the varlen adapter."""
+    """Internal launch; the central MHA varlen API validates bounds and aliases."""
     if q.numel() == 0:
         return (out, lse) if lse is not None else out
     stream = torch.cuda.current_stream(q.device) if stream is None else stream
     prop = torch.cuda.get_device_properties(q.device)
     table = cu_seqlens_k if block_table is None else block_table.reshape(-1)
     scale = D**-0.5 if softmax_scale is None else float(softmax_scale)
+    # Validated B1/nonpaged offsets are [0, tensor.shape[0]]; maxima alone
+    # cannot establish this for ragged batches or logical paged KV lengths.
+    static = cu_seqlens_q.numel() == 2 and block_table is None and not causal and lse is None
     args = (q.view(-1), k.view(-1), v.view(-1), out.view(-1), q.view(-1) if lse is None else lse.view(-1),
             cu_seqlens_q, cu_seqlens_k, table, q.shape[1], k.shape[1], k.shape[0], cu_seqlens_q.numel() - 1,
             max_seqlen_q, 1 if block_table is None else block_table.shape[1], page_size, block_table is not None,
-            causal, lse is not None, scale, persistent, prop.multi_processor_count, stream)
+            causal, lse is not None, scale, persistent, prop.multi_processor_count,
+            q.shape[0] if static else 0, k.shape[0] if static else 0, stream)
     signature = tuple((a.dtype, tuple(a.shape), tuple(a.stride())) if isinstance(a, torch.Tensor)
                       else ("stream",) if hasattr(a, "cuda_stream") else a for a in args)
     key = (q.device, signature)

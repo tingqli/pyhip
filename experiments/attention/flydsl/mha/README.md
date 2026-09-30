@@ -1,5 +1,28 @@
 # Paged Attention / SWA
 
+## 2026-09-26：B1 Linear causal任务配平
+
+仅B1、非分页、causal、persistent改为长query块优先/蛇形worker分配，tile内MFMA/softmax/wait与输入语义不变。
+H12/HK1/D256，GPU2，10buffers/2warmups/50samples每版ABBA：Q=KV2048 **292.521→161.641µs**，Q=KV8192 **2475.312→1838.490µs**。
+8192达到 **224.297有效 /227.774填充TFLOPS**，含全部慢尾；不是所有causal长度均220T。原ragged/paged/nonpersistent映射保持，noncausal Full完整ELF不变。
+28项D256线性功能回归通过，包括新增B1尾块/LSE/guard/graph；[报告与审计](../../../../mytest/mydata/qsa_linear_direct_20260926_01/README.md)。
+
+## 2026-09-25：D256 linear Full 达到 220T
+
+连续、无页表 **B1/Q10240/KV2583/H24/HK2/D256、noncausal/noLSE、persistent**：
+原版 **3000.075 µs / 216.672T**，优化后 **2932.175 µs / 221.690T**，中位时延下降 **2.26%**。
+物理GPU2/MI308X，原`cudaPerf`、10独立buffer、每版50样本、AB/BA交替，全量100条含慢尾；三次门禁通过。
+测量包含内部预分配`run()`热调用，不含中央varlen验证、JIT/分配/参考，不是整模型性能。
+
+保留非分页DMA地址leaf合并、已验证B1静态长度、最后N32/drain裁剪、仅静态分支的可见概率pack；
+公开API、原FP32容差、必要wait/barrier不变。Full VGPR235→228、SGPR62→52、LDS64KiB、零private/spill。
+新ATT确认4+4wave错相与Memory/Compute互补驻留仍成立，S4/S5的V转置由0/64变为16/48；
+但物理SIMD稳态MFMA union为79.12%，低于原版82.49%，**不宣称无气泡或利用率提升**。
+
+最终**67项BF16 MHA + 20项QSA = 87项功能通过**；包括新增15项static/N32尾部参数，linear总数25。
+最终连续Full整ELF与正式实测一致；随机page1/page4恢复原版整ELF，**分页不宣称220T**，也不替代下文SHUFFLE-5D的历史220/230T目标。
+原始数据、分页回退/隔离、全部失败门禁和ATT表见[本轮完整报告](../../../../mytest/mydata/mha_linear_220t_20260925_01/README.md#L1)。
+
 ## 2026-09-25：D256胜出路径整理
 
 当前D256仅保留两套**不同输入ABI**的已验证实现：
@@ -13,7 +36,7 @@
 `PagedAttention`继续检查5D K/V：K为`[P,HK,Dq/8,S,8]`，V为`[P,HK,S/8,Dv,8]`，page32/64/128。
 `flash_attn_varlen_func`接受连续BF16 `[T,H,256]` Q和`[T,HK,256]` K/V，支持linear/page1/page4；
 完整参数顺序、metadata weakref/版本检查、graph预热约束、alias/跨度检查和LSE返回均保留。
-线性接口的导入和调用示例见[接口说明](../flash_attn_api/README.md)。本次52项BF16回归通过，包含全部10项linear测试；未重测MHA性能。
+线性接口的导入和调用示例见[接口说明](../flash_attn_api/README.md)。整理当时52项BF16回归通过，包含原10项linear测试；该整理轮未重测MHA性能，后续新结果见上节。
 
 删除旧v48设备流水、P-exchange及其测试，DMA模块收敛为上述固定v73路径；Q-DMA、K/V off/split/late、
 write_mix和未采纳v98开关不再作为当前候选。**不是删除公共D256分页支持**。
@@ -160,12 +183,13 @@ OUT=$(mktemp -d "$PWD/mha-results.XXXXXX")
 
 ## pytest：默认功能，性能显式启用
 
-当前统一入口单文件pytest包含62项功能用例（静态参数计数：既有52项，加迁入的10项D256 linear契约）；只有`PYHIP_MHA_PERF=1`时才收集额外33项性能测试。没有独立gather测试。
+当前统一入口单文件pytest包含77项功能用例（原62项加15项D256 static/N32尾部参数，其中67项BF16、10项FP8/SWA）；只有`PYHIP_MHA_PERF=1`时才收集额外33项性能测试。没有独立gather测试。
 迁入用例采用`test_bf16_linear_d256_`前缀，可用标准`-k test_bf16_linear_d256_`筛选。
 独立FP32 oracle、linear/page1/page4逆序页表、GQA、causal/LSE、NaN尾部、guard、stream/graph、metadata失效、错误输入和private/spill检查均保留。
-这10项为已有测试迁移，已随本次52项BF16回归通过；四个`test_bf16_linear_d256_unsupported_options`参数用例不需要GPU。
+linear共25项：原10项加单请求15个KV长度参数，每个新参数内部覆盖persistent/grid；原O `.02`、LSE `.002`容差不变。
+四个`test_bf16_linear_d256_unsupported_options`参数用例不需要GPU。最新67项BF16与20项QSA均通过；未重跑其余10项FP8/SWA。
 新M32实验的21项历史回归已随失败实验移除，不作为当前suite。
-MI308本次数值检查41项功能及27项性能全部通过。BF16覆盖块数边界、所有Dq/Dv128/192和page32/64/128组合、两种调度、无LSE热路径/LSE、NaN尾页、前缀guard及并发stream/graph。
+2026-09-09历史MI308数值检查41项功能及27项性能全部通过。BF16覆盖块数边界、所有Dq/Dv128/192和page32/64/128组合、两种调度、无LSE热路径/LSE、NaN尾页、前缀guard及并发stream/graph。
 
 ```bash
 PYHIP_MHA_GPU=auto "$PY" -m pytest "$MHA" --import-mode=importlib -q

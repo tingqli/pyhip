@@ -49,8 +49,23 @@ def _qsa_recover_blocks(Indices, Positions, Lengths, SequenceIds, Blocks, Errors
     error |= tl.sum((full & ~valid).to(tl.int32), 0) > 0
     error |= tl.sum(duplicate.to(tl.int32), 0) > 0
     error |= tl.sum(bad_slots.to(tl.int32), 0) > 0
-    tl.store(Blocks + row * 512 + columns, blocks)
+    # Duplicate validation already sorted this exact set. Share that ordering
+    # with direct attention instead of sorting into a second buffer later.
+    tl.store(Blocks + row * 512 + columns, tl.where(full, ordered, -1))
     tl.store(Errors + row, error.to(tl.int32))
+
+
+@triton.jit
+def _qsa_check_errors(Errors, Valid, ROWS: tl.constexpr, C: tl.constexpr):
+    # Keep the asynchronous assert without Torch's scratch-using bool reduction
+    # or hot-path temporary tensors. Every call overwrites the private scalar.
+    lane = tl.arange(0, C)
+    error = tl.full((), 0, tl.int32)
+    for start in tl.range(0, ROWS, C, loop_unroll_factor=1):
+        row = start + lane
+        values = tl.load(Errors + row, row < ROWS, 0)
+        error |= tl.max((values != 0).to(tl.int32))
+    tl.store(Valid, error == 0)
 
 
 class _Workspace:
@@ -68,6 +83,7 @@ class _Workspace:
             max_seqlen_q=max(query_lens, default=0), max_seqlen_k=max(lengths, default=0),
         )
         self.errors = torch.empty(q.shape[0], **kw)
+        self.valid = torch.empty((), dtype=torch.bool, device=q.device)
         self.captured = False
         inputs = self.bind(q, k, v, indices)
         self.dense = dense.prepare(inputs=inputs)
@@ -76,6 +92,7 @@ class _Workspace:
             self.union = union.allocate_plan(inputs=inputs, query_tile=32, grid_multiplier=2,
                                             max_union_inflation=4.0, skip_counts=self.dense.query_counts)
             self.direct = direct.prepare(inputs=inputs, skip_counts=self.dense.query_counts, union=self.union)
+            self.union.packed_direct = self.direct.packed_key is not None
 
     def bind(self, q, k, v, indices):
         return SimpleNamespace(q=q, k=k, v=v, indices=indices, **self.metadata)
@@ -160,11 +177,11 @@ def qsa(q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=No
             _qsa_recover_blocks[(q.shape[0],)](
                 indices, inputs.query_positions, inputs.kv_lens,
                 inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=4)
-            torch._assert_async((workspace.errors == 0).all(), "Invalid compressed QSA token/block/tail ABI")
+            _qsa_check_errors[(1,)](workspace.errors, workspace.valid, q.shape[0], 1024, num_warps=4)
+            torch._assert_async(workspace.valid, "Invalid compressed QSA token/block/tail ABI")
         with torch.profiler.record_function("pyhip_qsa.plan_rebuild"):
             if workspace.union is not None:
                 union.rebuild_plan(inputs=inputs, plan=workspace.union)
-                direct.rebuild_plan(inputs=inputs, plan=workspace.direct)
         with torch.profiler.record_function("pyhip_qsa.attention"):
             dense.run(inputs=inputs, prepared=workspace.dense, out=out)
             if workspace.union is not None:

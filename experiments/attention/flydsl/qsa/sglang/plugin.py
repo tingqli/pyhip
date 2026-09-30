@@ -15,6 +15,7 @@ import shutil
 
 _call = ContextVar("pyhip_qsa_forward", default=None)
 _state = None
+_POLICY = "dense2051;packed=pad1.7;raw=rho4"
 _ABI = {
     "sglang.srt.layers.attention.qwen_sparse_attn_backend": "c75dbabacea6e9012428e7dbe695fc49400406fed77272752dce82f9cd8b6113",
     "sglang.srt.layers.attention.qsa.kernel": "7e369f09293fb9b0872c21f0010247ec1e3a696b5ad4809f04d9a730b1031095",
@@ -131,7 +132,7 @@ class _State:
             self.report_dir.mkdir(parents=True, exist_ok=True)
             with (self.report_dir / f"qsa_tp{rank}.json").open("x") as stream:
                 json.dump({"calls_per_layer": dict(self.calls), "validation": self.checks,
-                           "input_snapshots": snapshots, "policy": "auto4/dense2051/sortedBN32"}, stream, indent=2)
+                           "input_snapshots": snapshots, "policy": _POLICY}, stream, indent=2)
         self.pending.clear()
         self.profiling = False
 
@@ -186,7 +187,7 @@ def register():
         (profiler + "._start_profile", _profile_start), (profiler + "._stop_profile", _profile_stop),
     ):
         HookRegistry.register(name, hook, HookType.AROUND)
-    logging.getLogger(__name__).warning("PyHIP QSA enabled: eager EXTEND, auto4/dense2051/sortedBN32")
+    logging.getLogger(__name__).warning("PyHIP QSA enabled: eager EXTEND, 3D only, %s", _POLICY)
 
 
 def build_target(target):
@@ -198,7 +199,7 @@ def build_target(target):
         raise ValueError("Plugin targets must be new directories under mytest/mydata")
     target.mkdir(parents=True, exist_ok=False)
     package = target / "pyhip_qsa_runtime"
-    files = {f"qsa/{name}.py": source / f"{name}.py" for name in ("qsa", "dense", "direct", "union")}
+    files = {f"qsa/{name}.py": source / f"{name}.py" for name in ("qsa", "dense", "direct", "_direct_packed", "union")}
     files.update({f"mha/{name}.py": source.parent / "mha" / f"{name}.py"
                   for name in ("_common", "mha_pa_bf16_256_linear_942")})
     files["qsa/sglang/plugin.py"] = Path(__file__)

@@ -1361,11 +1361,15 @@ def linear_d256_gfx942():
 
 
 def _linear_d256_inputs(device, *, qlens=(0, 7, 33, 65), klens=(3, 33, 65, 129), page=None,
-           heads=12, kv_heads=1, causal=True, persistent=True, scale=0.0625):
+           heads=12, kv_heads=1, causal=True, persistent=True, scale=0.0625, magnitude=1.0):
     generator = torch.Generator(device=device).manual_seed(20260924)
     q = torch.randn((sum(qlens), heads, 256), generator=generator, device=device, dtype=torch.bfloat16)
     keys = [torch.randn((n, kv_heads, 256), generator=generator, device=device, dtype=q.dtype) for n in klens]
     values = [torch.randn(k.shape, generator=generator, device=device, dtype=q.dtype) for k in keys]
+    if magnitude != 1.0:
+        q.mul_(magnitude)
+        for key in keys:
+            key.mul_(magnitude)
     cq, ck = [0], [0]
     for n, k in zip(qlens, klens):
         cq.append(cq[-1] + n)
@@ -1446,6 +1450,62 @@ def test_bf16_linear_d256_empty_self_attention_and_guards(linear_d256_gfx942):
     args["out"] = storage[8:-8].view_as(q)
     first = _linear_d256_check(args, reference)
     assert first[0] is args["out"] and bool((storage[:8] == 123).all()) and bool((storage[-8:] == 123).all())
+
+
+@pytest.mark.parametrize("length,heads,hk", ((129, 6, 2), (2048, 12, 1), (2051, 12, 1)))
+def test_bf16_linear_d256_causal_balance(linear_d256_gfx942, length, heads, hk):
+    """Balanced B1 causal tasks retain LSE, partial blocks, output guards and graph replay."""
+    args, expected = _linear_d256_inputs(
+        linear_d256_gfx942, qlens=(length,), klens=(length,), heads=heads,
+        kv_heads=hk, causal=True, persistent=True,
+    )
+    q = args["q"]
+    storage = torch.full((q.numel() + 16,), 123.0, device=q.device, dtype=q.dtype)
+    args["out"] = storage[8:-8].view_as(q)
+    result = _linear_d256_check(args, expected)
+    saved = result[0].clone()
+    torch.testing.assert_close(_linear_d256_check(args, expected)[0], saved, rtol=0, atol=0)
+    stream = torch.cuda.Stream(device=q.device)
+    stream.wait_stream(torch.cuda.current_stream(q.device))
+    no_lse = args | {"return_lse": False}
+    with torch.cuda.stream(stream):
+        _linear_d256_api().flash_attn_varlen_func(**no_lse)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            _linear_d256_api().flash_attn_varlen_func(**no_lse)
+    torch.cuda.current_stream(q.device).wait_stream(stream)
+    args["out"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize(q.device)
+    torch.testing.assert_close(args["out"].float(), expected[0], rtol=0.02, atol=0.02)
+    assert bool((storage[:8] == 123).all()) and bool((storage[-8:] == 123).all())
+
+
+@pytest.mark.parametrize("length", (1, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 257, 2583))
+def test_bf16_linear_d256_single_request_tail(linear_d256_gfx942, length):
+    """Single-request static bounds and N32 drain retain all heads/rows and guards."""
+    for persistent in (False, True):
+        args, expected = _linear_d256_inputs(linear_d256_gfx942, qlens=(129,), klens=(length,),
+                                           heads=6, kv_heads=2, causal=False, persistent=persistent,
+                                           magnitude=3.0 if length == 2583 else 1.0)
+        q = args["q"]
+        backing = torch.full((q.numel() + 16,), 123.0, device=q.device, dtype=q.dtype)
+        args["out"] = backing[8:-8].view_as(q)
+        actual = _linear_d256_api().flash_attn_varlen_func(**(args | {"return_lse": False}))
+        torch.testing.assert_close(actual.float(), expected[0], rtol=0.02, atol=0.02)
+        saved = actual.clone()
+        _linear_d256_api().flash_attn_varlen_func(**(args | {"return_lse": False}))
+        torch.testing.assert_close(actual, saved, rtol=0, atol=0)
+        assert bool((backing[:8] == 123).all()) and bool((backing[-8:] == 123).all())
+        if length == 95:
+            stream = torch.cuda.Stream(device=q.device)
+            stream.wait_stream(torch.cuda.current_stream(q.device))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                _linear_d256_api().flash_attn_varlen_func(**(args | {"return_lse": False}))
+            graph.replay()
+            torch.cuda.synchronize(q.device)
+            torch.testing.assert_close(actual, saved, rtol=0, atol=0)
 
 
 def test_bf16_linear_d256_streams_graph_and_metadata_invalidation(linear_d256_gfx942):

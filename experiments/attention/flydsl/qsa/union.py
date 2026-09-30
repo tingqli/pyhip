@@ -44,7 +44,15 @@ BM, BN, D, THREADS, LDS_BYTES = 128, 64, 256, 512, 65536
 def _source_rows(table, tile, count, wave, hk):
     lane = fx.Int32(gpu.thread_id("x")) & 63
     index = _min(tile * 16 + (wave & 3) * 4 + (lane & 3), count - 1)
-    block = fx.Int32(table[index])
+    block = fx.Int32(
+        rocdl.raw_ptr_buffer_load(
+            fx.Int32.ir_type,
+            table,
+            fx.Int32(index * 4).ir_value(),
+            fx.Int32(0).ir_value(),
+            fx.Int32(0).ir_value(),
+        )
+    )
     return block * (4 * hk * D * 2) + (wave >> 2) * 256
 
 
@@ -136,6 +144,34 @@ def _mask(
     return values
 
 
+def _prefetch_mask(resource, tile, offset, bq):
+    # S0 issues this request; the existing S2 vmcnt(0) retires it before S3.
+    return fx.Int32(
+        llvm.inline_asm(
+            fx.Int32.ir_type,
+            [
+                resource,
+                fx.Int32(offset).ir_value(),
+                fx.Int32(tile * bq * 16).ir_value(),
+            ],
+            "buffer_load_dword $0, $2, $1, $3 offen",
+            "=v,s,v,s,~{memory}",
+            has_side_effects=True,
+        )
+    )
+
+
+def _apply_mask(scores, bits):
+    # Signed extraction produces 0/-1; bit-select preserves score bits or -inf.
+    # LLVM can use bfe/bfi without a compare and VCC-dependent cndmask per value.
+    values = fx.Vector(scores).bitcast(fx.Int32)
+    result = []
+    for i in range(16):
+        keep = (bits << (31 - i)) >> 31
+        result.append((values[i] & keep) | ((~keep) & fx.Int32(-8388608)))
+    return fx.Vector.from_elements(result, fx.Int32).bitcast(fx.Float32)
+
+
 def _output(
     o0, o1, inv, buffer, shared, tid, heads, g, gp, bq, qvalid, extent, row_offset
 ):
@@ -222,14 +258,17 @@ def _body(
     count = _uniform(COUNTS[tile_id * 2])
     common_tiles = _uniform(COUNTS[tile_id * 2 + 1])
     table = fx.make_view(fx.get_iter(BLOCKS) + tile_id * CAP, fx.make_layout(CAP, 1))
+    table = _buffer(table, CAP * 4)
     masks = fx.make_view(
         fx.get_iter(MEMBERS) + tile_id * (CAP // 16) * BQ * 4,
         fx.make_layout((CAP // 16) * BQ * 4, 1),
     )
+    mask_resource = _buffer(masks, (CAP // 16) * BQ * 16)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     row = row_offset + wave * 16 + (lane & 15)
     query, head = row // GP, row % GP
+    mask_offset = _pin_i32(_min(query, fx.Int32(BQ - 1)) * 16 + (lane >> 4) * 4)
     valid_row = (query < qvalid) & (query < BQ) & (head < (H // HK))
     qextent = (NQ - q0) * H * D * 2 - hkv * (H // HK) * D * 2
     qptr = fx.get_iter(Q) + fx.Int64(q0) * (H * D) + hkv * (H // HK) * D
@@ -356,6 +395,8 @@ def _body(
         o0, o1, t = fx.Vector(o0), fx.Vector(o1), fx.Int32(t)
         previous_offsets = fx.Vector(previous_offsets)
         current_offsets, next_rows = fx.Vector(current_offsets), fx.Int32(next_rows)
+        if fx.const_expr(MASKED):
+            bits = _prefetch_mask(mask_resource, t, mask_offset, BQ)
         future_rows = source_rows(table, _min(t + 2, last), count, wave, HK)
         parts = []
         for n in fx.range_constexpr(2):
@@ -401,9 +442,12 @@ def _body(
         _wait(lgkmcnt=0)
         rocdl.sched_barrier(0)
         hi = qk(q, k)
+        current = _join(lo, hi)
+        if fx.const_expr(MASKED):
+            current = _apply_mask(current, bits)
         total, probabilities = local_sum(previous), pack(previous)
         offsets = dma_offsets(next_rows, 4)
-        _schedule(32, 3, 2)
+        _schedule(32, 2, 2)
         _stage_end()
         sums = cross(total, cross_addresses)
         parts = []
@@ -432,11 +476,6 @@ def _body(
         )
         prepared = v_operands(v, 0, True)
         _stage_end()
-        current = _join(lo, hi)
-        if fx.const_expr(MASKED):
-            current = mask(
-                current, masks, t, query, qvalid, common_tiles, H // HK, GP, BQ
-            )
         o0, row_sum, candidate = pv(
             probabilities,
             v,
@@ -573,6 +612,7 @@ def _kernel(
     MEMBERS: fx.Tensor,
     COUNTS: fx.Tensor,
     ACTIVE: fx.Tensor,
+    ORDER: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Constexpr[int],
@@ -593,11 +633,15 @@ def _kernel(
         .view(fx.make_layout(LDS_BYTES, 1))
     )
     work = fx.Int32(gpu.block_id("x"))
-    while work < TASKS:
+    while work < ((TASKS + GRID - 1) // GRID) * GRID:
         tiles = TASKS // HK
-        mapped = (work % tiles) * HK + work // tiles
+        ordered = _uniform(ORDER[work])
+        mapped = (ordered % tiles) * HK + ordered // tiles
         tile = mapped // (HK * ((BQ * GP + 127) // 128))
-        if _uniform(ACTIVE[tile]) != 0:
+        enabled = fx.Int32(0)
+        if ordered >= 0:
+            enabled = _uniform(ACTIVE[tile])
+        if enabled != 0:
             group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
             if group != 0:
                 body(
@@ -659,6 +703,7 @@ def _launch(
     MEMBERS: fx.Tensor,
     COUNTS: fx.Tensor,
     ACTIVE: fx.Tensor,
+    ORDER: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Constexpr[int],
@@ -682,6 +727,7 @@ def _launch(
         MEMBERS,
         COUNTS,
         ACTIVE,
+        ORDER,
         H,
         HK,
         NQ,
@@ -717,6 +763,7 @@ def run(*, inputs, plan, out):
         plan.score_masks.view(-1),
         plan.counts.view(-1),
         plan.active,
+        plan.task_order,
         inputs.q.shape[1],
         inputs.k.shape[1],
         inputs.q.shape[0],
@@ -763,6 +810,7 @@ class SparsePlan(msgspec.Struct, kw_only=True):
     score_masks: torch.Tensor
     counts: torch.Tensor
     active: torch.Tensor
+    task_order: torch.Tensor
     query_tiles: torch.Tensor
     query_tile: int
     group_padded: int
@@ -771,6 +819,7 @@ class SparsePlan(msgspec.Struct, kw_only=True):
     num_tiles: int
     grid: int
     max_union_inflation: float
+    packed_direct: bool = False
 
 
 @triton.jit
@@ -813,39 +862,57 @@ def union_qsa_compact_membership(
     CAPACITY: tl.constexpr,
     C: tl.constexpr,
     RHO: tl.constexpr,
+    PACKED_DIRECT: tl.constexpr = False,
 ):
     tile = tl.program_id(0)
-    ids = tl.arange(0, C)
-    bits = tl.load(Dense + tile * MAX_BLOCKS + ids, ids < MAX_BLOCKS, 0)
-    valid = bits != 0
+    lanes = tl.arange(0, C)
     rows = tl.load(Meta + tile * 5 + 1)
     first_position = tl.load(Meta + tile * 5 + 4)
     all_queries = tl.full((), 0xFFFFFFFF, tl.uint32) >> (32 - rows)
+    # Bound both scans' live vectors independently of the context length.
+    # The second pass retains the original common-first, ascending block order.
+    count = tl.full((), 0, tl.int32)
+    common_count = tl.full((), 0, tl.int32)
+    for start in tl.range(0, MAX_BLOCKS, C, loop_unroll_factor=1):
+        ids = start + lanes
+        bits = tl.load(Dense + tile * MAX_BLOCKS + ids, ids < MAX_BLOCKS, 0)
+        valid = bits != 0
+        common = valid & (bits.to(tl.uint32) == all_queries) & (ids * 4 + 3 <= first_position)
+        count += tl.sum(valid.to(tl.int32))
+        common_count += tl.sum(common.to(tl.int32))
     queries = tl.arange(0, 32)
     visible = first_position + queries + 1
     selected = tl.minimum(visible // 4, 512) + (visible % 4 != 0).to(tl.int32)
     total = tl.sum(tl.where(queries < rows, selected, 0))
-    count = tl.sum(valid.to(tl.int32))
-    enabled = count * rows <= RHO * total
+    if PACKED_DIRECT:
+        tokens = tl.minimum(visible // 4, 512) * 4 + visible % 4
+        direct_tiles = tl.sum(tl.where(queries < rows, tl.cdiv(tokens, 32), 0))
+        # Union pads to M128/N64; direct pads each query to M16/N32.
+        # The measured full-call crossover allows 17/10 as much padded work.
+        enabled = 160 * tl.cdiv(count, 16) <= 17 * direct_tiles
+    else:
+        enabled = count * rows <= RHO * total
     tl.store(Active + tile, enabled)
     tl.store(Counts + tile * 2, count)
-    tl.store(Counts + tile * 2 + 1, 0)
+    tl.store(Counts + tile * 2 + 1, tl.where(enabled, common_count // 16, 0))
     if enabled:
-        common = (
-            valid
-            & (bits.to(tl.uint32) == all_queries)
-            & (ids * 4 + 3 <= first_position)
-        )
-        common_count = tl.sum(common.to(tl.int32))
-        other = valid & ~common
-        destination = tl.where(
-            common,
-            tl.cumsum(common.to(tl.int32)) - 1,
-            common_count + tl.cumsum(other.to(tl.int32)) - 1,
-        )
-        tl.store(Blocks + tile * CAPACITY + destination, ids, valid)
-        tl.store(Membership + tile * CAPACITY + destination, bits, valid)
-        tl.store(Counts + tile * 2 + 1, common_count // 16)
+        common_base = tl.full((), 0, tl.int32)
+        other_base = common_count
+        for start in tl.range(0, MAX_BLOCKS, C, loop_unroll_factor=1):
+            ids = start + lanes
+            bits = tl.load(Dense + tile * MAX_BLOCKS + ids, ids < MAX_BLOCKS, 0)
+            valid = bits != 0
+            common = valid & (bits.to(tl.uint32) == all_queries) & (ids * 4 + 3 <= first_position)
+            other = valid & ~common
+            destination = tl.where(
+                common,
+                common_base + tl.cumsum(common.to(tl.int32)) - 1,
+                other_base + tl.cumsum(other.to(tl.int32)) - 1,
+            )
+            tl.store(Blocks + tile * CAPACITY + destination, ids, valid)
+            tl.store(Membership + tile * CAPACITY + destination, bits, valid)
+            common_base += tl.sum(common.to(tl.int32))
+            other_base += tl.sum(other.to(tl.int32))
 
 
 @triton.jit
@@ -889,6 +956,38 @@ def union_qsa_score_masks(
         tl.store(Masks + tile * (CAP // 16) * QB * 4 + index, mask, index < elements)
 
 
+@triton.jit
+def union_qsa_order_tasks(
+    Counts,
+    Active,
+    Order,
+    TASKS: tl.constexpr,
+    HK: tl.constexpr,
+    SLICES: tl.constexpr,
+    GRID: tl.constexpr,
+    SIZE: tl.constexpr,
+    SHIFT: tl.constexpr,
+):
+    # Bound each sort's resource usage for large batches. Within each chunk,
+    # longest-first snake rows balance grid-stride workers without a counter.
+    rank = tl.program_id(0) * SIZE + tl.arange(0, SIZE)
+    tile = (rank % (TASKS // HK)) // SLICES
+    valid = rank < TASKS
+    count = tl.load(Counts + tile * 2, valid, 0)
+    active = tl.load(Active + tile, valid, 0)
+    cost = tl.where(active != 0, tl.cdiv(count, 16), 0)
+    key = tl.where(valid, (cost.to(tl.int64) << SHIFT) + (TASKS - 1 - rank), -1)
+    ordered = tl.sort(key, descending=True)
+    task = tl.where(ordered >= 0, TASKS - 1 - (ordered & ((1 << SHIFT) - 1)), -1)
+    row, column = rank // GRID, rank % GRID
+    destination = row * GRID + tl.where(row % 2 == 0, column, GRID - 1 - column)
+    tl.store(
+        Order + destination,
+        task.to(tl.int32),
+        destination < tl.cdiv(TASKS, GRID) * GRID,
+    )
+
+
 def allocate_plan(
     *,
     inputs,
@@ -901,7 +1000,10 @@ def allocate_plan(
     group_padded = group
     if query_tile < 1 or query_tile > 32:
         raise ValueError("Require 1<=BQ<=32")
-    max_queries = 1 << ((128 // group).bit_length() - 1)
+    # TP2 uses 120 of the 128 M rows; other ratios retain their aligned groups.
+    max_queries = (
+        128 // group if group == 12 else 1 << ((128 // group).bit_length() - 1)
+    )
     query_tile = min(query_tile, max_queries)
     skips = (0,) * len(inputs.query_lens) if skip_counts is None else skip_counts
     rows, q0, k0 = [], 0, 0
@@ -925,6 +1027,12 @@ def allocate_plan(
     max_blocks = triton.cdiv(inputs.max_seqlen_k, 4)
     capacity = triton.cdiv(min(max_blocks, query_tile * 513), 16) * 16
     tiles = len(rows)
+    tasks = tiles * inputs.k.shape[1] * triton.cdiv(query_tile * group, 128)
+    grid = min(
+        tasks,
+        torch.cuda.get_device_properties(inputs.q.device).multi_processor_count
+        * (1 if group == 12 else grid_multiplier),
+    )
     kwargs = {"dtype": torch.int32, "device": inputs.q.device}
     return SparsePlan(
         metadata=metadata,
@@ -934,17 +1042,14 @@ def allocate_plan(
         score_masks=torch.empty((tiles, capacity // 16, query_tile, 4), **kwargs),
         counts=torch.empty((tiles, 2), **kwargs),
         active=torch.empty(tiles, **kwargs),
+        task_order=torch.empty(triton.cdiv(tasks, grid) * grid if grid else 0, **kwargs),
         query_tiles=torch.from_numpy(query_tiles).to(inputs.q.device),
         query_tile=query_tile,
         group_padded=group_padded,
         block_capacity=capacity,
         max_blocks=max_blocks,
         num_tiles=tiles,
-        grid=min(
-            tiles * inputs.k.shape[1] * triton.cdiv(query_tile * group, 128),
-            torch.cuda.get_device_properties(inputs.q.device).multi_processor_count
-            * grid_multiplier,
-        ),
+        grid=grid,
         max_union_inflation=max_union_inflation,
     )
 
@@ -973,9 +1078,10 @@ def rebuild_plan(*, inputs, plan: SparsePlan) -> None:
         plan.active,
         plan.max_blocks,
         plan.block_capacity,
-        triton.next_power_of_2(plan.max_blocks),
+        min(1024, triton.next_power_of_2(plan.max_blocks)),
         plan.max_union_inflation,
-        num_warps=4 if plan.max_blocks <= 8192 else 8,
+        plan.packed_direct,
+        num_warps=4,
     )
     union_qsa_score_masks[(plan.num_tiles,)](
         plan.blocks,
@@ -989,3 +1095,27 @@ def rebuild_plan(*, inputs, plan: SparsePlan) -> None:
         256,
         num_warps=4,
     )
+    slices = triton.cdiv(plan.query_tile * plan.group_padded, 128)
+    tasks = plan.num_tiles * inputs.k.shape[1] * slices
+    size = min(4096, triton.next_power_of_2(plan.task_order.numel()))
+    union_qsa_order_tasks[(triton.cdiv(plan.task_order.numel(), size),)](
+        plan.counts,
+        plan.active,
+        plan.task_order,
+        tasks,
+        inputs.k.shape[1],
+        slices,
+        plan.grid,
+        size,
+        max(1, (tasks - 1).bit_length()),
+        num_warps=8,
+    )
+
+
+
+
+
+
+
+
+

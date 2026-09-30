@@ -6,10 +6,11 @@ t rows and their K/V views have P+t rows, so native bottom-right causality
 keeps the absolute position P+j. Requests are launched separately: concatenated
 eligible prefixes cannot describe gaps in the original packed Q/O storage.
 
-The adjacent native linear kernel is used for complete BN64 KV tiles. Other
-lengths use the local, nonpaged specialization below: every K/V byte offset
-is in VOFFSET, with SOFFSET=0, including speculative K loads. Score masking
-alone cannot make the native SOFFSET tail loads physically safe.
+The local nonpaged specialization uses the native linear DMA for complete
+BN64 KV tiles. Other lengths keep every K/V byte offset in VOFFSET, with
+SOFFSET=0, including speculative K loads. Score masking alone cannot make
+the native SOFFSET tail loads physically safe. Longest causal query tiles
+are assigned in alternating worker rows to balance persistent-loop tails.
 
 prepare() transfers only small cumulative-length metadata, once. run() creates
 storage-sharing views, never packs tensors or allocates output, and never reads
@@ -214,22 +215,17 @@ def run(inputs, prepared: DensePlan, out: torch.Tensor) -> None:
         k = inputs.k.narrow(0, call.k_start, call.kv_count)
         v = inputs.v.narrow(0, call.k_start, call.kv_count)
         output = out.narrow(0, call.q_start, call.q_count)
-        if call.kv_count % BN == 0:
-            native.run(
-                q,
-                k,
-                v,
-                call.cu_q,
-                call.cu_k,
-                call.q_count,
-                call.kv_count,
-                out=output,
-                causal=True,
-                softmax_scale=inputs.scale,
-                stream=stream,
-            )
-        else:
-            _run_bounded(q, k, v, output, call, inputs.scale, prepared.num_cus, stream)
+        _run_bounded(q, k, v, output, call, inputs.scale, prepared.num_cus, stream)
+
+
+def _aligned_dma(
+    resource, storage, wave, lane, rows, tile, kv_len, hk, packet, is_v,
+    extent, tail=False, read_address=None, read_immediate=0,
+):
+    return native._dma(
+        resource, storage, wave, lane, rows, tile, kv_len, hk, packet, is_v,
+        extent, 0, tail, read_address, read_immediate,
+    )
 
 
 def _bounded_dma(
@@ -252,6 +248,26 @@ def _bounded_dma(
     lane_bytes = lane * 4 if is_v else (lane ^ (native._k_phase(token) * 4)) * 4
     # rows is request-relative: the host view already includes the packed offset.
     origin = rows[0] * (hk * D * 2) + channel * 2
+    if read_address is not None and not tail:
+        # Like native._dma, keep address producers adjacent to DS/DMA. The
+        # scalar row still enters VOFFSET so the descriptor checks the full byte offset.
+        base_row, base_channel = native._copy_coordinates(wave, 0)
+        destination = fx.Int32(base_row * 512 + base_channel * 2)
+        immediate = (32768 if is_v else 0) + packet * 2048
+        result_type = ir.Type.parse("!llvm.struct<(vector<4xi32>, i32, i32)>")
+        result = llvm.inline_asm(
+            result_type,
+            [fx.Int32(read_address).ir_value(), resource, fx.Int32(lane_bytes).ir_value(),
+             destination.ir_value(), fx.Int32(origin).ir_value()],
+            f"s_add_u32 $1, $7, {packet * 4 * hk * D * 2}\n"
+            "v_add_u32 $2, $1, $5\n"
+            f"s_add_u32 m0, $6, {immediate}\n"
+            f"ds_read_b128 $0, $3 offset:{read_immediate}\n"
+            "buffer_load_dword $2, $4, 0 offen lds",
+            "=&v,=&s,=&v,v,s,v,s,s,~{m0},~{scc},~{memory}",
+            has_side_effects=True,
+        )
+        return fx.Vector(llvm.extractvalue(ir.VectorType.get([4], fx.Int32.ir_type), result, [0]))
     row_bytes = fx.Int32(
         llvm.inline_asm(
             fx.Int32.ir_type,
@@ -324,6 +340,8 @@ def _bounded_body(
     STAGGER: fx.Constexpr[bool],
 ):
     read_k, read_v, dma, pv = native._read_k, native._read_v, _bounded_dma, native._pv
+    if fx.const_expr(NK % BN == 0):
+        dma = _aligned_dma
     dma_offsets, v_operands = native._dma_offsets, native._v_operands
     qk, local_sum, local_max, cross = base._qk, base._sum, base._max, base._cross
     exps, pack, mask, center = base._exps, base._pack, base._mask, base._center
@@ -632,13 +650,19 @@ def _bounded_kernel(
     )
     work = fx.Int32(gpu.block_id("x"))
     query_blocks = (NQ + BM - 1) // BM
-    while work < H * query_blocks:
-        head, qb = work // query_blocks, work % query_blocks
-        group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
-        if group != 0:
-            body(Q, K, V, O, CQ, CK, storage, head, qb, H, HK, NK, SCALE, True)
-        else:
-            body(Q, K, V, O, CQ, CK, storage, head, qb, H, HK, NK, SCALE, False)
+    tasks = H * query_blocks
+    while work < ((tasks + CUS - 1) // CUS) * CUS:
+        # Longest causal tiles first; reverse alternate worker rows to balance
+        # persistent tails without a queue, extra plan, or changed token order.
+        row, column = work // CUS, work % CUS
+        rank = row * CUS + ((row & 1) != 0).select(CUS - 1 - column, column)
+        if rank < tasks:
+            head, qb = rank % H, query_blocks - 1 - rank // H
+            group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
+            if group != 0:
+                body(Q, K, V, O, CQ, CK, storage, head, qb, H, HK, NK, SCALE, True)
+            else:
+                body(Q, K, V, O, CQ, CK, storage, head, qb, H, HK, NK, SCALE, False)
         work = work + CUS
 
 
@@ -729,3 +753,4 @@ def _run_bounded(
 
 
 __all__ = ["DenseCall", "DensePlan", "prepare", "run"]
+

@@ -5,27 +5,30 @@
 | 文件 | 用途 |
 |---|---|
 | [baseline.py](baseline.py) | 两个原SGLang Triton kernel、原launch表、来源/SHA/版权、tensor adapter合一，仅供测试 |
-| [plugin.py](plugin.py) | 原生entry-point五个hook，单调用QSA、原精度校验、可选真实输入采集；同时提供`--build-target`构建入口 |
+| [plugin.py](plugin.py) | 原生entry-point五个3D hook，单调用QSA、原精度校验、可选真实输入采集；同时提供`--build-target`构建入口 |
 | [profile_model.py](profile_model.py) | 一次完成新包构建、原TP2启动/warmup/profile、双rank结果验证和自身进程组清理 |
 
 插件只替换gfx942、BF16 D256、Q12/6/3 KV1的main-runner eager EXTEND；decode、draft/verify、graph/compile、CP/DCP及不支持的attention选项仍走原实现。
-原backend继续负责KV写入/gather、有效query裁剪和padding。只替换最终attention，不替换indexer。
-启用须同时设置`PYHIP_QSA_PREFILL=1`与`SGLANG_PLUGINS=pyhip_flydsl_qsa`；三个上游文件SHA必须匹配。
+原backend继续负责KV写入、有效query裁剪、padding及3D prefix gather；插件仅消费3D K/V，不替换indexer。
+启用须同时设置`PYHIP_QSA_PREFILL=1`与`SGLANG_PLUGINS=pyhip_flydsl_qsa`；三个上游源码SHA必须匹配（backend、kernel、qsa_indexer）。
 
-构建产物是包含dist-info的独立`pyhip_qsa_runtime`包，版本0.2.0；不需pip、不修改SGLang、不把experiments放入server路径。
-父包惰性导入，禁用时不导入Torch/FlyDSL。仅打包QSA四模块、MHA两个依赖与本插件，附来源hash和许可证。
+构建产物是包含dist-info的独立`pyhip_qsa_runtime`包，恢复3D版本0.2.0；不需pip、不把experiments放入server路径。2026-09-28已按用户要求撤回T01的SGLang prefill/decode 5D改动、页表边界及专属测试；既有MHA/cache writer不动。
+父包惰性导入，禁用时不导入Torch/FlyDSL。当前打包QSA五模块（含packed direct）、MHA两个依赖与本插件，共8个源码文件，附来源hash和许可证。
 `--build-target`要求新mytest/mydata子目录；打包目标本身作为独立源码快照保留。
+
+当前3D packed direct保留17/10填充工作比分流，raw保留rho4；没有撤销3D优化。5D因Vvec8与四token选块的布局成本退化而撤回，性能及Vvec4/S4原型限制见[../opt.md](../opt.md)。当前接入不支持QSA 5D，不应为该路径启用vectorized_5d。旧0.3.0/clean2包与5D回放只作历史证据，不可直接套用回退后的SGLang；新使用需构建新target。
 
 ## 1. 运行前准备
 
-以下命令针对本机已有ROCm环境、Qwen3.8模型和**TP2 / GPU0、1 / 端口9080**。不要激活缺少Torch/FlyDSL的PyHIP虚拟环境，也不需要重新安装依赖。
+以下命令针对Qwen3.8模型和**TP2 / GPU0、1 / 端口9080**，后续默认使用PyHIP的.venv。2026-09-28该环境已独立安装与镜像一致的Torch/FlyDSL/Triton/pytest/msgspec及SGLang依赖，实际SGLang/AITER导入通过，仍关闭system-site-packages；不要静默切回系统Python。最新完成本地GPU2正确性及性能重放，**没有重新部署整模型**；具体版本与安装来源见[../opt.md](../opt.md)。
 每个新终端先执行：
 
 ```bash
 ROOT=/opt/lc/pyhip
 DATA="$ROOT/mytest/mydata"
 QSA_SGLANG="$ROOT/experiments/attention/flydsl/qsa/sglang"
-export PATH="/usr/bin:/usr/local/bin:/bin:/opt/rocm-7.14/bin:$PATH"
+PYTHON="$ROOT/.venv/bin/python"
+export PATH="$ROOT/.venv/bin:/opt/rocm-7.14/bin:$PATH"
 export PYTHONDONTWRITEBYTECODE=1
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES GPU_DEVICE_ORDINAL
 unset HSA_CU_MASK ROC_GLOBAL_CU_MASK
@@ -33,7 +36,7 @@ cd "$ROOT"
 ```
 
 原启动脚本内部设置可见卡为0、1、2、3，TP2实际用0、1；下面不是任意GPU映射或TP8启动范例。
-请先确认两卡空闲、9080没有其他服务。三个上游文件SHA若变化，需重新检查接入兼容性，不能只删除校验。
+请先确认两卡空闲、9080没有其他服务。三个上游源码SHA若变化，需重新检查接入兼容性，不能只删除校验。
 
 ## 2. 一键构建、启动并profile（推荐）
 
@@ -41,7 +44,7 @@ cd "$ROOT"
 
 ```bash
 OUT="$DATA/qsa_profile_$(date -u +%Y%m%dT%H%M%SZ)_$$"
-/bin/python3 "$QSA_SGLANG/profile_model.py" --output "$OUT"
+"$PYTHON" "$QSA_SGLANG/profile_model.py" --output "$OUT"
 ```
 
 输出目录必须尚不存在，不要预先`mkdir "$OUT"`。流程为：
@@ -67,17 +70,17 @@ GPU门禁失败就停止，不轮询等待、不修改PTL/时钟/功率；新数
 
 ```bash
 # 同时捕获两层真实Q/K/V、indices和output；默认行数11888/12000。
-/bin/python3 "$QSA_SGLANG/profile_model.py" \
+"$PYTHON" "$QSA_SGLANG/profile_model.py" \
 	--output "$DATA/qsa_inputs_$(date -u +%Y%m%dT%H%M%SZ)_$$" \
 	--dump-layers 3 47
 
 # 不启用插件，采集原SGLang基线。
-/bin/python3 "$QSA_SGLANG/profile_model.py" \
+"$PYTHON" "$QSA_SGLANG/profile_model.py" \
 	--output "$DATA/qsa_baseline_$(date -u +%Y%m%dT%H%M%SZ)_$$" \
 	--baseline
 ```
 
-输入仅在profile期间克隆，CPU转存发生在原profiler停止/导出之后；文件含tensor SHA与布局hash。
+输入仅在profile期间克隆，CPU转存发生在原profiler停止/导出之后；文件含3D Q/K/V、indices、output、tensor SHA与请求布局hash，不再采集5D缓存或页表。
 **输入克隆会扰动trace**；正常profile不传`--dump-layers`，脚本也会清除继承的dump环境变量。
 
 ## 3. 仅启动集成QSA的常驻服务
@@ -89,7 +92,7 @@ GPU门禁失败就停止，不轮询等待、不修改PTL/时钟/功率；新数
 ```bash
 RUN="$DATA/qsa_serve_$(date -u +%Y%m%dT%H%M%SZ)_$$"
 mkdir -p "$RUN/tmp" "$RUN/profiles"
-/bin/python3 "$QSA_SGLANG/plugin.py" --build-target "$RUN/plugin"
+"$PYTHON" "$QSA_SGLANG/plugin.py" --build-target "$RUN/plugin"
 
 export PYTHONPATH="$RUN/plugin"
 export SGLANG_PLUGINS=pyhip_flydsl_qsa PYHIP_QSA_PREFILL=1
@@ -113,6 +116,9 @@ export AITER_CONFIG_GEMM_BF16="$CFG/bf16_tuned_gemm.csv" AITER_CONFIG_FMOE="$CFG
 
 `PYTHONPATH`指向构建目标根目录，不是本源码目录，更不能指向这个名为sglang的子目录。
 修改QSA源码后须构建新target并重启服务；已构建target是冻结副本，不自动跟随源码变动。
+
+2026-09-26：当前源码已将恢复校验的排序结果复用于direct，移除了独立direct排序，并改进direct计算；linear新增B1非分页causal配平。
+本轮仅本地功能/内核验收，未重新部署独立包或采集SGLang整模型profile。新部署须按上节重新build target；旧日志中的排序kernel名称属于历史版本。
 `PYHIP_QSA_VALIDATE=1`只在profile外对每layer/layout首次调用做对照校验，确认稳定后常驻服务可设0；不是开关插件。
 
 ### 3.2 启动TP2服务
@@ -130,7 +136,7 @@ bash /opt/sglang/scripts/launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2
 ```
 
 保持此终端运行；等待`The server is fired up and ready to roll!`。日志应出现
-`PyHIP QSA enabled: eager EXTEND, auto4/dense2051/sortedBN32`，且没有ABI mismatch或hook加载错误。
+`PyHIP QSA enabled: eager EXTEND, 3D only, dense2051;packed=pad1.7;raw=rho4`，且没有ABI mismatch或hook加载错误。
 启用日志表示注册成功；实际替换还要看请求后的profile调用统计。仅服务ready不能证明QSA已接入，因为SGLang会记录插件加载异常后继续启动。
 需要停止时在该前台终端按Ctrl-C；不要全局pkill其他SGLang服务。
 
@@ -141,7 +147,7 @@ bash /opt/sglang/scripts/launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2
 ```bash
 RUN="/opt/lc/pyhip/mytest/mydata/qsa_serve_..."  # 替换为启动终端打印的RUN
 cd "$RUN"
-/bin/python3 /opt/evaluation7/check_acc_long_oai.py > "$RUN/warmup.log" 2>&1
+"$PYTHON" /opt/evaluation7/check_acc_long_oai.py > "$RUN/warmup.log" 2>&1
 cat "$RUN/warmup.log"
 
 BENCH_MODEL=/models/Qwen3.8-Flash-Next-PTPC-FP8 \
@@ -160,8 +166,15 @@ find "$RUN/profiles" -name '*-TP-*.trace.json.gz'
 
 ## 验证范围
 
+T01、clean2及Vvec4/S4的功能/性能记录保留为撤销前历史，见[../opt.md](../opt.md)。当前仅3D，插件仍不接管SGLang graph/compile。最新零spill修复后QSA63项（含3D SGLang backend）正常回归通过；54组完整链的570个实际dispatch三字段均0。53组有效本地性能full无回退，1组GPU门禁失败未计时；此前MHA8192慢阶段未在本轮解决。没有新的整模型部署、真实多卡TP4/8 capture或TTFT/吞吐声明。
+
+已重建[当前零spill独立包manifest](../../../../../mytest/mydata/qsa_zero_spill_20260928_01/plugin_zero_spill/pyhip_qsa_runtime/source_manifest.json)，八源码、0.2.0、三个ABI/五hook注册均核验；包内L3/L47×TP2/4/8六份真实输入通过，72次实际dispatch零spill且未导入experiments。禁用entry-point仍惰性加载。旧target是旧源码快照，使用修复须构建新target；该验证不是整模型部署。下方早期0.2.0/5hook包结果仍为历史。
+
+2026-09-26核心union已更新，性能与限制见[QSA说明](../README.md#L1)。本页构建命令会复制当前核心；旧target仍是冻结副本，须新建target并重启才能使用更新。
+该优化轮完成了源码backend回归和真实输入本地重放，**没有重新构建/部署独立插件或运行整模型profile**；下面0.2.0包的验证属于此前整理轮。
+
 0.2.0独立包的原生5hook、惰性加载和两份真实输入执行已通过，见[整理记录](../../../../../mytest/mydata/qsa_consolidation_20260925_01/README.md)。
-本页命令与当前CLI/环境逐项核对；此次只补文档，没有重新启动整模型，不把旧模型trace标作新插件的端到端验收。
+本页命令已使用新的默认Python环境，兼容ROCm依赖已就绪；仍须检查服务端设备、空闲状态及三个ABI哈希。没有重新启动整模型，不把旧模型trace或最新kernel重放标作本次端到端验收。
 profiler trace不是无profiler吞吐测试；bench duration包含trace导出等待，不能直接解释为常规请求耗时。
 
 真实输入加载、FP32参考、性能、summary均已并入[../test_qsa.py](../test_qsa.py)，没有第二套回放或插件测试文件。

@@ -1,5 +1,30 @@
 # BF16 DQ=DV=256 优化记录
 
+## 2026-09-26：Direct 16×4 K布局与QK前V预取尝试
+
+- [本轮完整报告](../../../../mytest/mydata/qsa_direct_16x4_pipeline_20260926_01/README.md)：按建议实测16×4、16B/lane，0/16/32/48覆盖64B并去K转置，数值正确但正式比当前合并读取慢79–89%；ATT VMEM指令区间72.36%，不是更少DS就更快。
+- 保留有效部分：原合并K+消费端逆转置不变，QK前发V0、用vm8等此前K，让PV1覆盖K预取；退出loop仍排空。最终精确生产核正式L3/47 -2.09/-2.27%，低重合H12/6 -3.89/-3.93%；完整QSA低重合 -3.55/-3.41%。Layer3原earlyzero等待已消失，V0/Kconsumer/V1wait中位均4cycles；只声明实测2–4%而非按wait下降比例推断收益。
+- 全部1400正式+68探索raw及三版ATT已审计，生产246VGPR/42SGPR/32KiBLDS/spill0、25QSA普通回归PASS。原direct Layer3 ATT章节为历史入口版本；新结果不覆盖其原始文件。未修改MHA/union/dense/SGLang或硬件/用户暂存区。
+
+## 2026-09-26：真实Layer3 direct ATT与后续空间
+
+- 按用户“当前目录”要求采集到[direct Layer3 ATT报告](direct_layer3_att_20260926_01/README.md)：TP0/M12000/P0/H12/HK1/D256，强制prepared direct仅[2051,12000)9949行，当前正常路径仍dense2051+union9949/direct0。无kernel/分流改动，无新普通计时。
+- GPU2/a4、CU1/SE0/4SIMD、第三次direct启动，raw ATT30,635,144B；124完整waves(93×65轮+31×64轮)，513856MFMA，精确ELF50731d2e…与最新正式Layer3相同。220VGPR/50SGPR/AGPR0/32KiBLDS/spill0；rocprof CSV资源字段不可当编译器需求。每SIMD观察到最多2resident waves。
+- 内部物理SIMD合并MFMA36.37%、VMEM指令13.29%、VMEM等待23.99%、DS指令11.46%/等待3.07%、VALU10.71%；完整驻留MFMA35.73%、barrier0.24%。约225kcycle长尾与unknown保留，不作HBM归因或把wave stall求和当墙钟。
+- 新的首要调度线索：PC424 vmcnt16之后，PC429(0x2308)又在16条PV1 MFMA前等待下一K0/K1全部16条load，中位444cycles；源码意图是PV1后等K。load目标v66:v129与PV1/loop-tail指令显式VGPR集合不相交，下一消费者为PC493 K转置。尚未定位编译器wait来源，不可直接删除；优先检查是否能将wait固定到真正消费之前。
+- 当前V0 wait PC707中位428cycles，缓存刷新PC716每8轮504cycles；每BN32有64K DS转置/64Vperm/64MFMA/32K/Vx4load。普通内部轮中位4984cycles，QK相邻MFMA发射间隔32cycles；下一优先级是保持合并读取的短组DS/QK交织和有限V0/索引预取，避免原样重复已失败V-before-QK/loop-carriedV。
+- 源级与实际ISA两份伪代码、固定中间双wave时间线、逐阶段/等待/资源审计均在报告。输出epilogue按wave累计约2.23%，不是优先直接耗时；缩LDS若追求更高驻留还受VGPR限制。公开rho4重新标定另属端到端方向，不能由本次强制路径ATT直接推出阈值。
+
+## 2026-09-26：Linear causal复用dense配平
+
+- 仅`PERSISTENT && CAUSAL && B==1 && !PAGED`新增longest-first query块/相邻heads/snake worker行，rank尾部guard；计算体不变，无原子队列或跨CTA等待。
+- GPU2/a4、B1/H12/HK1/D256/BF16、Q=KV2048/8192；正式原cudaPerf10buffer/2warmup/50sampleABBA，200raw门禁通过。2048 292.521→161.641µs(-44.74%)；8192 2475.312→1838.490µs(-25.73%)，224.297有效/227.774填充T。
+- Ragged探索ELF逐字相同，不把时间波动当收益。28D256功能pass，含page/非persistent/ragged/新B1causal LSE/尾部/graph。noncausal10240×2583整ELF仍为d043ace4aab22dbcc2374fdce86f46468ec76880624269944d8cde7afd2981c7，只验代码/数值未重计时。
+- 同轮direct/准备优化探索与失败正式门禁单列，见[完整记录](../../../../mytest/mydata/qsa_linear_direct_20260926_01/README.md)，不把direct探索成功写成正式达标；整个用户暂存index未修改。
+
+> 2026-09-25新增：独立linear连续B1 Full正式达到**221.690T**，见文末及[本轮报告](../../../../mytest/mydata/mha_linear_220t_20260925_01/README.md#L1)。
+> 下述SHUFFLE-5D分页、旧v48/v98的220/230T状态均为原范围历史结论，不由本次连续KV成绩改写。
+
 > 2026-09-25整理：当前代码仅保留v73分页胜出路径与独立linear D256路径；P-exchange、旧v48及未采纳的实验开关已删除。
 > helper抽到`_common`/`_d256`，公共分页ABI不变；下文v98“可选”等说明为当时历史状态。
 > 本次保留路径13个实际ELF与清理前相同；[清理验证](../../../../mytest/mydata/qsa_cleanup_20260925_01/README.md)。
@@ -1036,3 +1061,73 @@ Full Q10240/KV2583/page64，GPU2/BDF `0000:a4:00.0`，2buffer×2round=4样本/�
 	Full ELF dense `b38f7dff1f57a739fe0478a25552be839be9194dbd8f2ce85159cda4d536fff1`、paged1 `a94eda5e4ee23ac6c20ce7ed4ac0c74d3870749938af978e5ede65ce7ce891fc`、paged4 `ef9800a0842c6437797c201492f6a504c7141c5379f56c34e8bbc9b43316178b`。
 - [独立CPU审计](results/d256_linear_20260924/final-audit.json)核对68份报告、1684个保留事件、ELF/资源/哈希、正式候选顺序、门禁、遥测、JUnit及布局/WAR/页寻址/循环覆盖。
 	[接口与使用说明](../flash_attn_api/README.md)、[本轮完整交付](results/d256_linear_20260924/README.md)明确支持范围、metadata warmup与inference-mode限制，以及严格page4时延门槛仍未达成。
+
+## 2026-09-25：当前linear的220T优化与新ATT（v01–v22）
+
+本节v编号仅指本轮linear试验，不复用上面的分页版本含义。
+起点为PyHIP `fbcef5b4c77d89d6ddf741394ffda2ed89b50224` 的当前linear，源SHA
+`501e24a7dbac822fedf92fbd43165b3a0cf1f43b3bf722c050feb0463ccb7834`；不是旧v48/v98机器码。
+
+### 范围与验收
+
+- 沿用B1/Q10240/KV2583/H24/HK2/D256 Full，**无页表、noncausal/noLSE、persistent grid80/block512**，scale1/16。
+	有效650033233920 FLOPs，220T要求≤2954.696518µs；不计padding/softmax FLOPs。
+- 物理GPU2/a4，MI308X80CU、gfx942，系统Python3.10.12、ROCm7.14、FlyDSL0.3.2。
+	原`cudaPerf`不改；探索2buffer/4sample，正式10buffer/50sample/版，各2warmup，AB/BA、同输入地址、独立原生输出。
+	计时含内部`run()`热launch，不含公共varlen验证、JIT/分配/参考；不与旧完整API计时混为同口径。
+- 原FP32 O `.02`、LSE `.002`与同版重复bitexact不变；校验实际被计时的输出。
+	入口/采样前/结束GPU use≤5%、VRAM≤20%、PTL Enabled/VECTOR,F8；不改PTL/功率/频率/NUMA，不轮询门禁。
+	[协议与后续验证补充](../../../../mytest/mydata/mha_linear_220t_20260925_01/PROTOCOL.md#L1)在数据目录保留。
+
+### 保留与拒绝
+
+| 方案 | 结果 |
+|---|---|
+| v01–v08：S4 V pin、PV预算、S6 perm后移、full-tile mask、S5/S7 hint删除、PV operand streaming | 未胜基线；v08 endgate6%无效，均未保留 |
+| v09：非分页SOFFSET/M0/DS/DMA leaf合并 | 探索217.640T vs217.144T，静态nop1275→955；保留到组合，必要wait不删 |
+| v10–v12：query任务次序、early max、GQA/query合并 | 无足够净收益；v11 endgate6%无效，恢复 |
+| v13：已验证B1静态Q/K长度 | 探索218.739T vs216.892T，VGPR228/SGPR52；保留 |
+| v14–v18：1/2 phase展开、S3 max、vector V global+LDS发布、packed-FP32特性 | 未改善；v17 endgate6%无效，恢复 |
+| v19：末N32 QK/读/PV裁剪 | 有效探索220.944T；分页复测endgate6%，未完成矩阵 |
+| v20：去掉末phase的next-K DMA | 探索218.311T，更慢，恢复原地址leaf次序 |
+| v21：末V DMA16→8 | 正式219.276T，门禁通过但未达标 |
+| v22：compiler-visible half-up probability pack | 正式221.690T；分页全局启用回退，最终仅静态分支保留 |
+
+N32条件为静态K>64且余数1…32，非硬编码2583；当前phase的上一tile PV仍全宽，尾drain只去无效N半部。
+动态/分页/causal/LSE继续原pack；QSA共享helper不改。最终无新public开关，原4+4发布/WAR契约保持。
+
+### 正式结果及失败门禁
+
+- **formal v19无效**：100raw中位220.154T，但endgate20%，不判达标、不重试同版；原报告保留。
+- v21为实质V tail DMA变化；其正式轮之前driver增加计时后**每个rotating输入/metadata hash及source hash**检查。
+	结束门禁仍在这些检查后单次读取，明确保留验证工作变化，不改写早期失败记录。
+- **formal v22有效**：原版3000.074983µs/216.672329T，候选**2932.175040µs/221.689778T**；100raw全保留。
+	中位时延−2.2633%、吞吐+2.3157%，配对speedup中位1.022886；不是每个样本都达到220T。
+	entry/before_samples/after use0/1/0%、VRAM0/3/3%，PTL不变；无逐kernel时钟证据解释慢尾。
+- 随机page1/page4全局pack正式分别199.801/206.984T，同场原版213.204/213.957T，出现回退。
+	**最终将新pack限定静态分支**，page1/page4整ELF/资源恢复原版；未再计时恢复后的分页，不将拒绝候选成绩当最终成绩。
+	[完整性能、39份报告/688raw清单与审计](../../../../mytest/mydata/mha_linear_220t_20260925_01/audit.json#L1)包含全部失败门禁。
+
+### 新ATT交织复核
+
+- 新采原版、static+DMA中间版、最终v22；GPU2/CU1/SE0/allSIMD/dispatch673，实际ELF逐一匹配，8/8完整wave、24任务/wave，逐PC MFMA hitcount与CSV一致。
+- S0/2/4/6保持Memory、S1/3/5/7保持MFMA主Compute，4+4wave互补驻留原版99.9896%、最终99.9926%。
+	统计含wait/barrier并显式保留unknown间隙，不等同计算利用率。
+- 原版源码S4准备V但真实perm分布S4/S5为0/64；最终16/48。S5 active628/676→520/520 cycles，S4则568/564→640/632，不能只报Compute缩短不报Memory增加。
+- issue=attempt+stall，MFMA16cycles按physical SIMD两wave求union，只用内部tile5…36共同窗口。
+	稳态MFMA union原版82.4905%、中间73.8694%、最终79.1204%；**最终未提高该局部指标**。
+	最终VMEM completion-wait优先分类占5.7981%，不是HBM延迟或因果证明。
+- 完整动态MFMA1007616→995328（−12288），DMA4 254976→253440（−1536），对应末N32/drain裁剪。
+	尾部不在上述稳态窗口中，普通整体计时才是220T验收依据。
+	[最终viewer manifest](../../../../mytest/mydata/mha_linear_220t_20260925_01/att_v22/ui_output_agent_9315_dispatch_673/filenames.json#L1)、
+	[完整阶段表与限制](../../../../mytest/mydata/mha_linear_220t_20260925_01/README.md#L1)。
+
+### 最终交付验证
+
+- 最终[功能JUnit](../../../../mytest/mydata/mha_linear_220t_20260925_01/release_functional.xml#L1)：**87 passed、0失败/错误/跳过，333.07秒**；67项BF16 MHA与20项QSA。
+	新增一个15参数测试覆盖K1…2583/N32与BN64边界、两调度、guard、graph、大logits；linear当前25项，原容差不变。FP8/SWA10项未重跑。
+- [三布局check-only](../../../../mytest/mydata/mha_linear_220t_20260925_01/release_codegen/result.json#L1)全输出原精度/重复/零spill通过。
+	最终连续Full VGPR228/SGPR52/LDS65536/private0/spill0，**整ELF与正式v22及ATT相同**；最终page1/page4与原版相同。
+- 最终源SHA `0ba71aab4d16e7739243a49cb4e099c5e524867a90f33e6aa1dbbec16d9a5278`；连续Full整ELF
+	`d043ace4aab22dbcc2374fdce86f46468ec76880624269944d8cde7afd2981c7`，不是把正式源SHA套给最后注释/分页隔离版本。
+- 所有改动/临时工具/新数据仅在PyHIP，未改SGLang；本轮未stage/commit/push，先前四份CSV仍保持staged。历史profile、输入与冻结包不变。

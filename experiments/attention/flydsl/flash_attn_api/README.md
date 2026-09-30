@@ -61,11 +61,29 @@ Q/K/V/O指针要求16-byte对齐，所有输入/输出字节跨度小于2GiB；`
 K/V直接DMA到LDS，V在 `ds_read_b128` 后用编译器可见 `v_perm_b32` 做BF16 2×2转置，再进入M16 MFMA。
 **每次热调用只有一个attention kernel，没有KV转换/gather kernel，也没有调用外预转换要求。**
 
-[../mha/test_mha_pa.py](../mha/test_mha_pa.py) 的`test_bf16_linear_d256_`前缀保留**10项**：独立FP32 oracle覆盖linear/page1/page4、
+[../mha/test_mha_pa.py](../mha/test_mha_pa.py) 的`test_bf16_linear_d256_`前缀现有**25项**（原10项+15个static/N32尾部参数）：独立FP32 oracle覆盖linear/page1/page4、
 逆序真实页表、GQA、causal/LSE、NaN尾部、guard、stream/graph、metadata失效与错误输入。
-测试与helpers已并入统一MHA测试入口；private及VGPR/SGPR spill检查保留，未改原有MHA测试。
+新增单请求KV1/31/32/33/63/64/65/95/96/97/127/128/129/257/2583，内部同时验证persistent/grid、Q尾guard与重复bitexact，另含graph与放大logits。
+测试与helpers仍在统一MHA测试入口；原O容差`.02`、LSE`.002`、private及VGPR/SGPR spill检查保留。
 用标准`-k test_bf16_linear_d256_`筛选；四个`test_bf16_linear_d256_unsupported_options`参数用例不需要GPU，
-pytest选卡仍默认`PYHIP_MHA_GPU=current`。历史98项是旧测试矩阵，不冒充当前数量；本次迁移后的10项均已通过，未重测linear性能。
+pytest选卡仍默认`PYHIP_MHA_GPU=current`。历史98项是旧测试矩阵，不冒充当前数量；最新67项BF16 MHA与20项QSA共87项通过，其中包含全部25项linear。
+
+### 2026-09-25：连续 Full 221.69 TFLOPS
+
+B1/Q10240/KV2583/H24/HK2/D256、noncausal/noLSE/persistent、**无页表**：
+原版3000.075µs/216.672T，优化后**2932.175µs/221.690T**。原`cudaPerf`、10独立buffer、每版50样本、AB/BA交替；
+只计内部预分配`run()`热调用，不含本公共API的metadata验证或JIT/分配/参考，不能与旧轮完整API计时无条件合并。
+
+内部在已验证B1无页表noncausal/noLSE时用tensor shape特化长度；多序列、分页、causal/LSE继续使用原动态边界。
+K>64且末块有效token≤32时裁去无效N半块QK/PV与drain V读，保留完整D256、mask和等待。
+非分页DMA地址leaf合并，可见概率pack只在静态分支启用；不新增公共开关，也不改变graph metadata合同。
+
+最终连续Full整ELF与正式实测一致。全局启用pack曾使随机page1/page4变慢，因此最终分页恢复原版整ELF；
+**分页、普通grid及causal/LSE没有本轮220T性能保证**，也不改变原SHUFFLE默认v73。
+ATT确认4+4wave阶段交织仍成立，但局部稳态MFMA union79.12%低于原版82.49%，不把局部trace当整卡性能。
+详见[本轮完整证据、ATT与限制](../../../../mytest/mydata/mha_linear_220t_20260925_01/README.md#L1)。
+
+### 2026-09-24：历史分页验收（保留原结论）
 
 2026-09-24正式Full验收：B1/Q10240/KV2583/H24/HK2/D256、noncausal/noLSE/persistent，10独立buffer×5轮、每候选50样本，原 `cudaPerf`。
 对同场v98，随机page1/page4 **TFLOPS分别低8.90%/9.37%**；时延分别高 **9.77%/10.33%**。
