@@ -53,6 +53,22 @@ V-only/K+V共52项功能检查通过。Full探索4样本K+V为209.449T；完整5
 五候选各50样本中，纯S4后移/组合相对v72的同round/buffer配对比分别约+1.51%/+1.62%；
 本轮又有公共降速与恢复，组合全样本148.349T，探索213.042T并非稳定成绩。详见[对照结果](results/d256_memstage_20260923/README.md)。
 
+**v74–99继续优化，目标提高到230T：**新增可选v98流水线（S0/领先组晚等待、PV分批消费、V M0公共偏移、
+K部分WAR退休、S7 PV/center重叠和任务转置）。26项功能、12项稀有rescale、2项factory回归通过。
+探索Full约221.5T；正式150事件中配对改善约3.85%，但共同变速下全量中位v98 158.636T、v73 159.934T。
+**230T未达成，公共默认仍v73，不以探索快轮替代验收。** 参数、完整样本与限制见[本轮交付说明](results/d256_pipeline230_20260923/README.md)。
+
+**最新ATT（2026-09-24）：**已采集完整**v98 persistent/order2**（含部分K等待与S7融合），不再是旧qfast。
+[Viewer manifest](ui_output_agent_18599_dispatch_393/filenames.json)、[统计CSV](stats_ui_output_agent_18599_dispatch_393.csv)、
+[采集身份与审计](results/d256_v98_att_20260924/README.md)；实际ELF与正式计时版本一致，8/8波完整，无新性能达标声明。
+
+**新增D256 linear（2026-09-24）：**独立 [flash_attn_varlen_func](../flash_attn_api/flash_attn_varlen_d256.py)
+支持BF16 Q/K/V/O `[T,H,D]`、GQA、KV page1/4与任意物理页表；K/V直接DMA到LDS，V通过LDS读取＋`v_perm`转置，热调用仅一个attention kernel，无KV转换。
+[98项功能及资源回归](results/d256_linear_20260924/l30-resource-functional.xml)通过。
+正式Full/persistent每候选50样本，对v98随机page1/page4吞吐低8.90%/9.37%，时延高9.77%/**10.33%**；
+吞吐在10%内，但预先采用的更严格1.10倍时延门槛**page4尚未通过**。相对默认v73时延均在10%内。
+不改变原paged默认或D128接口，使用方式及完整样本见 [linear接口说明](../flash_attn_api/README.md) 和 [本轮证据](results/d256_linear_20260924/README.md)。
+
 **已启用编译缓存，在排查问题时需要检查缓存是否出现问题**。沿用FlyDSL原生默认缓存，无MHA私有持久缓存层或额外缓存开关；缓存不替代正确性检查。
 
 ## 三个性能函数与显式参数集
@@ -123,7 +139,7 @@ OUT=$(mktemp -d "$PWD/mha-results.XXXXXX")
 
 ## pytest：默认功能，性能显式启用
 
-默认统一入口单文件pytest收集52项功能测试（含新增D256默认factory回归）；只有`PYHIP_MHA_PERF=1`时才收集额外33项性能测试。没有独立gather测试。
+默认统一入口单文件pytest收集53项功能测试（含D256默认及可选流水线factory回归）；只有`PYHIP_MHA_PERF=1`时才收集额外33项性能测试。没有独立gather测试。
 新M32实验的21项回归在[test_mha_pa_pexchange.py](test_mha_pa_pexchange.py)，需显式选择该文件；不改变上述默认suite。
 MI308本次数值检查41项功能及27项性能全部通过。BF16覆盖块数边界、所有Dq/Dv128/192和page32/64/128组合、两种调度、无LSE热路径/LSE、NaN尾页、前缀guard及并发stream/graph。
 

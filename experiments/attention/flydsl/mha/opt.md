@@ -964,3 +964,71 @@ Full Q10240/KV2583/page64，GPU2/BDF `0000:a4:00.0`，2buffer×2round=4样本/�
 	[统计CSV](stats_ui_output_agent_18599_dispatch_393.csv)。16文件/132,888,374bytes，逐文件SHA一致，
 	不覆盖旧UI；为ISA映射，Source为空。详见[本次说明](results/d256_v98_att_20260924/README.md)。
 - 保留reserved-M0 warning；没有修改GPU/PTL/时钟/功率/NUMA，没有Git写操作；不以ATT周期冒充性能成绩。
+
+## 2026-09-24：原生D256 linear，KV page1/4（l01–l38）
+
+### 目标、合同与最终状态
+
+- 用户要求Q/K/V/O均为linear `[T,H,D]`，首批支持KV page1/4，接口参考`flash_attn_varlen_func`，V从LDS读后用`v_perm`转置；性能差距不超过10%。
+- 新增独立 [API](../flash_attn_api/flash_attn_varlen_d256.py) 与 [原生内核](mha_pa_bf16_256_linear_942.py)，保留原D128 adapter及D256 SHUFFLE默认v73不变。
+	支持BF16/gfx942/D256/GQA、无表连续KV及任意物理page表、bottom-right causal、FP32自然log LSE、out/stream/graph；热调用仅一个attention dispatch，无KV预转换。
+- 采用原Full B1/Q10240/KV2583/H24/HK2，650033233920有效FLOPs；GPU2/a4，严格gfx/UMC<3%、VRAM≤20%、PTL Enabled/VECTOR,F8；不改GPU策略、不用PMC/ATT、不写Git。
+- **功能完成；吞吐口径相对v98均在10%内。** 但预先声明更严格的全中位时延≤1.10倍v98，最终随机page4为**+10.33%**，仍未通过该门槛，不能改用配对比或四舍五入宣布通过。
+
+### 实现与已采纳优化
+
+- BM128/BN64、8wave/4+4错相、M16 MFMA；K/V各32KiB LDS，Q/O和逻辑算术保持原合同。
+- K逆XOR DMA；V保留row-major LDS，b128读取后采用CK BF16 2×2相同选择器`0x01000504/0x03020706`。
+	用编译器可见`llvm.amdgcn.perm`暴露hazard，不使用gfx950硬件transpose或外部转换kernel。
+- 页表每tile一次向量lookahead，K/V复用同组scalar字节偏移；page4每wave连续16token，只缓存4个页基址。
+- 两组wave分别写低/高D128；K低D读先退休，V高D读跨barrier时与领先低D DMA不相交。CPU逐字节镜像/WAR/bank服务组/`v_perm`/O payload/任务覆盖证明通过。
+- 首K16 V转置放Memory末尾，后续转置与MFMA交错；S5行和/max与PV末段重叠，S7 max/center分段重叠；O采用64KiB CShuffle批量8条LDS read。
+- noncausal/noLSE四tile展开降低页偏移队列PHI搬运；causal/LSE只双展开，避免四展开引起的SGPR spill。
+
+### 主要试验（探索均为每候选4样本，不是正式结论）
+
+| 版本 | 改动/结果 | 实测或失败证据 |
+|---|---|---|
+| l01–l04 | 局部scalar重物化消除12个SGPR spill；opaque perm错误→可见intrinsic；l03缓存仍复用旧ELF，l04实际新ELF后通过 | [l01](results/d256_linear_20260924/l01-smoke.json)、[l04](results/d256_linear_20260924/l04-linear-full.json) 连续177T |
+| l05 | 只有末Vtile需OOB归零；删除稳态32次tail比较/select | [连续204T](results/d256_linear_20260924/l05-linear-full.json)；[随机page1](results/d256_linear_20260924/l05-paged1-full.json)146T、[page4](results/d256_linear_20260924/l05-paged4-full.json)96T |
+| l06–l09 | SMEM查表/有符号除法→向量页请求→三tile预取→预计算byte offset→成组readlane填依赖间距 | [l09 page1](results/d256_linear_20260924/l09-lane-batch-p1.json)185T、[page4](results/d256_linear_20260924/l09-lane-batch-p4.json)185T |
+| l10–l14 | wave低/高D分工与WAR分批退休；偏移准备重叠compute；M0→DS→DMA | [l11](results/d256_linear_20260924/l11-compute-offsets-p1.json)188T；order2及局部PV配对无改善 |
+| l15–l19 | 转置提前一步与MFMA交错，首步移Memory，S7 center交错；head-major任务序 | [l19 page1](results/d256_linear_20260924/l19-headmajor-p1.json)197T、[page4](results/d256_linear_20260924/l19-headmajor-p4.json)199T |
+| l20–l24 | 显式QK交错无收益；O批量read、K/V scalar偏移复用、S5末PV与行统计交错 | [l23 page1](results/d256_linear_20260924/l23-reuse-offsets-p1.json)203T；[l24](results/d256_linear_20260924/l24-summary-overlap.json) dense218T/paged203T |
+| l25–l30 | S1/S3偏移分摊无收益；双展开→page4页内复用→四展开；causal/LSE按资源保留双展开 | [l29](results/d256_linear_20260924/l29-four-unroll.json) paged约213T；[l30资源回归](results/d256_linear_20260924/l30-resource-functional.xml)98通过 |
+| l31–l38 | 八展开、M0四复用、末K裁剪、直接O、DS中途perm、三展开、早exp、分散max均未优于保留版本 | [完整68报告审计](results/d256_linear_20260924/final-audit.json)，全部保留，当前恢复精确l30源码 |
+
+- l17误用只拼FP32的`_join`拼Int32位串，ISA出现有损int→float→int，修复为Int32拼接后通过；l38每step解包覆盖已更新row_sum，修复后仍较慢，均保留原失败。
+- l13 page4 prepared gfx5%门禁失败，未计时，不重试绕过门禁。l32汇编offset修饰符位置错误，两次未计时编译失败后按完整日志修复；M0复用微小收益但VGPR255未采用。
+- **早期l01–l04的GB/s无效：驱动`logical_io_bytes=1`占位错误。** TFLOPS分母和原始时延未变，l05起字节数修为256948224；历史JSON不改写。
+
+### 正式50样本/候选，全量300事件
+
+[l30-all-full-50.json](results/d256_linear_20260924/l30-all-full-50.json)，10独立buffer×5轮、warmup10、repeat1，6候选按round+buffer正反交替，原`cudaPerf`不变。
+构造各原生输入格式、JIT、分配和独立FP32参考均在事件外；linear完整热API调用含在事件内，实际只有一个attention kernel。
+
+| 候选 | 全中位µs | TFLOPS | 时延/v98增幅 | TFLOPS/v98降幅 | 严格时延≤1.10 |
+|---|---:|---:|---:|---:|---|
+| v73/default | 4233.508 | 153.545 | +0.95% | — | 对照 |
+| v98/order2 | 4193.687 | 155.003 | 基准 | 基准 | 对照 |
+| dense page1 | 4374.608 | 148.592 | +4.31% | 4.14% | 通过 |
+| dense page4 | 4481.209 | 145.058 | +6.86% | 6.42% | 通过 |
+| 随机page1 | 4603.270 | 141.211 | +9.77% | 8.90% | 通过 |
+| 随机page4 | 4627.090 | 140.484 | **+10.33%** | **9.37%** | **未通过** |
+
+- 相对当前默认v73，随机page1/page4时延+8.73%/+9.30%。无表page1/4是相同ELF；两组原生allocation与采样条件不同，不能把时差归因为page算法。
+- 同round/buffer配对时延比1.040160/1.038087，不等于全中位数比1.097667/1.103346，不替代验收。
+- 两个早期完整正式轮：[l23](results/d256_linear_20260924/l23-all-full-50.json) paged+10.50%/+10.99%；
+	[l27](results/d256_linear_20260924/l27-all-full-50.json)+9.65%/+10.36%；均保留所有慢尾。后续重测有实质代码变化，不重试同版直到快。
+- 最终原v73/v98及linear都出现共同变速；4次只读遥测gfx1731–1739→1321–1324→1195–1196→1180–1182MHz，wrapper重叠56/43/38/39次。
+	不证明逐kernel时钟或确切降速原因。entry/prepared/sampling/exit gfx0/2/2/2、UMC0、VRAM≤6.3797%、PTL不变，门禁通过不等于固定频率/独占。
+
+### 最终数值、资源与源码身份
+
+- [98项JUnit](results/d256_linear_20260924/l30-resource-functional.xml)0失败/0跳过，445.210秒，包含causal/LSE、page1/4真实随机/逆序、ragged/空Q、KV1…129、多tile、不同GQA、NaN尾部/guard、softmax尺度、rare rescale、stream/graph及metadata重验/拒绝。
+	O原容差`.02`、LSE`.002`、两次逐位重复不变；所有本次测试实际编译特化的private/VGPR spill/SGPR spill均0。
+- 正式60组候选/buffer原FP32和v98逐位对照通过。Full dense VG235/SG62、paged1 VG242/SG106、paged4 VG247/SG68，全部LDS65536、AGPR/private/spills0；未隐藏reserved-M0编译warning。
+- 当前内核逐字节等于正式冻结源，SHA`ac3fcf440f737f7c7f7e4ec439b99d0254efa266726d6ccd0722cd62c5b59e77`。
+	Full ELF dense `b38f7dff1f57a739fe0478a25552be839be9194dbd8f2ce85159cda4d536fff1`、paged1 `a94eda5e4ee23ac6c20ce7ed4ac0c74d3870749938af978e5ede65ce7ce891fc`、paged4 `ef9800a0842c6437797c201492f6a504c7141c5379f56c34e8bbc9b43316178b`。
+- [独立CPU审计](results/d256_linear_20260924/final-audit.json)核对68份报告、1684个保留事件、ELF/资源/哈希、正式候选顺序、门禁、遥测、JUnit及布局/WAR/页寻址/循环覆盖。
+	[接口与使用说明](../flash_attn_api/README.md)、[本轮完整交付](results/d256_linear_20260924/README.md)明确支持范围、metadata warmup与inference-mode限制，以及严格page4时延门槛仍未达成。
