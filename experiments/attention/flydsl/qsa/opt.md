@@ -4790,3 +4790,55 @@ attention profiler分段由`pyhip_qsa.prepare`、`pyhip_qsa.attention`改为`pyh
 本节之前的477,563字节日志保持原样，包括最新indexer decode验收；不改旧trace、冻结包、原始数据、历史性能表或旧研究脚本。历史`qsa()`/文件/内核名称按当时身份阅读，复现旧研究用对应冻结源码，不给活动目录补兼容垫片。本轮无新性能、模型服务或质量结论。
 
 本会话未执行Git暂存、提交、推送或SGLang源码修改。运行期间检测到外部暂存了QSA改名/indexer及另外两份MHA文件，已只读记录[外部Git状态](../../../../mytest/mydata/qsa_attention_names_20260929_01/external_git_transition_final.json)并保留，不恢复旧index、也不把外部动作记成本会话提交。两仓库HEAD在记录时未变；SGLang的HEAD/index未变。新证据只写入本轮数据目录，不新增Markdown文件。
+
+<a id="qsa-package-refactor"></a>
+## 2026-09-29：QSA迁入可安装ops，整体benchmark与单kernel测试分离
+
+用户明确要求本轮新增[benchmarks/qsa/readme.md](../../../../benchmarks/qsa/readme.md)，其中集中记录整体性能、数据来源、测试命令及外部集成代码。旧日志此前485,282字节保留不变，不挪动旧数据或修改冻结包。
+
+- 10个QSA运行时文件迁至[src/pyhip/ops/qsa/flydsl](../../../../src/pyhip/ops/qsa/flydsl)，两个真实共用依赖迁至[src/pyhip/ops/mha/flydsl](../../../../src/pyhip/ops/mha/flydsl)。[逐字迁移证明](../../../../mytest/mydata/qsa_package_refactor_20260929_01/runtime_proof.json)：只重定向MHA导入，12文件的数学/符号/调度/分流不改。
+- 整体[test_attention.py](../../../../benchmarks/qsa/test_attention.py#L1)、[test_indexer.py](../../../../benchmarks/qsa/test_indexer.py#L1)保留真实回放、合成、完整算子/图/adapter正确性和显式性能。组件检查放[tests/ops/qsa](../../../../tests/ops/qsa)。[82个原定义与decorator核对](../../../../mytest/mydata/qsa_package_refactor_20260929_01/test_relocation_proof.json)表明原测试未丢失、原容差未放宽；新增attention9类、indexer7类单kernel功能/性能入口。
+- [完整回归](../../../../mytest/mydata/qsa_package_refactor_20260929_01/regression/execution.json)204通过（原152＋新52），42perf deselected、0skip/失败；[MHA调用方](../../../../mytest/mydata/qsa_package_refactor_20260929_01/mha_regression/execution.json)29通过。21个新旧同输入用例、77对象/83完整函数字节与ABI资源相同，private/VGPRspill/SGPRspill全0，见[设备等价](../../../../mytest/mydata/qsa_package_refactor_20260929_01/equivalence/result.json)。
+- [隔离wheel](../../../../mytest/mydata/qsa_package_refactor_20260929_01/package/manifest.json)包含全部12源码，禁止experiments/tests/benchmarks导入后indexer→attention、同stream预热graph重放通过；原插件7hook及禁用惰性通过。[最终check-only CLI](../../../../mytest/mydata/qsa_package_refactor_20260929_01/cli_checks/result.json)6入口37例通过，输出JSON/CSV、无性能门禁/样本。
+- 整体/组件结果增加summary.json、summary.csv、raw.csv；完整计划中的失败与未运行例不会报complete。原indexer的3秒门禁等待删除，仅单次快照、原use≤5%/VRAM≤20%/PTL要求不改。报告行为属于新增框架，不伪称全为纯搬家。
+- 新性能[入口失败](../../../../mytest/mydata/qsa_package_refactor_20260929_01/measurements/execution.json)：GPU6 use0%、VRAM47%>20%，首个attention例0raw，后续indexer/组件计时未启动。未等待重试/降低门槛/删除失败；README只引用既有已完成整体性能，不称本轮性能复测通过。
+- SGLang临时子目录全部字节不改，按用户要求留待下一轮删除。旧10QSA/2MHA模块仅转发到已安装pyhip，同一对象/缓存，避免两套kernel。**原build_target新生成的target因此需要同版本已安装PyHIP，不再是自足kernel包**；旧自足冻结包不变。此过渡限制已在新README写明，外部直接API不依赖临时插件。
+- 构建初试缺wheel/旧setuptools失败，保留日志；标准PEP517隔离构建成功，不切换Python或改Torch环境。文件移动后编辑器旧缓冲曾把旧正文拼回转发文件，现已按实际磁盘/语法和import身份修正；只保留薄转发。没有SGLang源码/硬件/Git暂存、提交或推送操作。
+
+<a id="qsa-quick-gpu0-3"></a>
+## 2026-09-29：用户指定GPU0–3快速性能检查——采样前门禁失败，0 raw
+
+本轮按“使用gpu0–3，快速验证性能”预定10个独立buffer、2次预热、每scope20样本，原cudaPerf与原正确性/门禁不变。GPU0/1分别跑L3/L47完整attention的TP2/4/8，GPU2跑整体prefill/indexer decode，GPU3跑attention/indexer单kernel。四个独立进程各用一张物理卡，未改源码、参数、GPU设置或旧记录；先复制已核对源码一致的JIT cache，避免写旧缓存。协议与结果见[protocol.json](../../../../mytest/mydata/qsa_quick_perf_20260929_01/protocol.json)、[analysis.json](../../../../mytest/mydata/qsa_quick_perf_20260929_01/analysis.json)。
+
+初始四卡均use0%、VRAM0%、PTL Enabled/VECTOR,F8。但执行时：
+
+| GPU | 首任务 | 失败位置 | use | VRAM | 新raw |
+|---|---|---|---:|---:|---:|
+| 0 | L3 M12000/TP2完整attention | before | 69% | 47% | 0 |
+| 1 | L47 M12000/TP2完整attention | before | 64% | 47% | 0 |
+| 2 | L3 M12000完整prefill indexer | before_samples | 18% | 2% | 0 |
+| 3 | TP2 attention单kernel | before_samples | 9% | 1% | 0 |
+
+每卡失败后停止该卡后续任务，没有反复等待门禁通过、改use≤5%/VRAM≤20%阈值或抢占外部进程。尚未启动各attention任务中的后续TP、GPU2的decode select/forward、GPU3的indexer组件。所有JSON/CSV及失败日志保留；本轮仍不能声称迁移后性能通过，也不以历史数值冒充新测量。
+
+随后仅做一次不计时[显存来源诊断](../../../../mytest/mydata/qsa_quick_perf_20260929_01/setup_memory.json)：GPU0独立进程在PyTorch allocated=reserved=0时，设备已用171,022,372,864B/206,141,652,992B（82.96%）；加载真实输入并完整检查的本进程reserved峰值998,244,352B、allocated峰值883,618,816B。因此后续设备大占用不来自本进程验证缓存；此证据不精确定位先前47%采样瞬间的外部PID。GPU2/3的use可能包含自身预热采样窗，但没有足够证据判定，也未因此豁免门禁。
+
+同问的前导下划线：[_attention_direct_packed.py](../../../../src/pyhip/ops/qsa/flydsl/_attention_direct_packed.py)是`attention_direct.run()`的内部packed分支，依赖其私有计划、PK/PV布局和工作区，沿用原私有模块约定。它不是FlyDSL编译/性能要求，去掉下划线本身不会提升性能；本轮未改名或改代码。两仓库HEAD/index及全部计时源码相对本轮入口不变。后续需要新的稳定空闲窗口再另行授权测量。
+
+<a id="qsa-packed-name-retest"></a>
+## 2026-09-29：packed direct正式模块去掉前导下划线并重测
+
+用户要求“去掉下划线；再测”。正式实现改为[attention_direct_packed.py](../../../../src/pyhip/ops/qsa/flydsl/attention_direct_packed.py#L1)，正式src不再保留旧名。`attention_direct.run()`、benchmark和组件资源测试同步改用新模块名；原GPU符号、kernel正文、scratch契约和分流不改。为了继续保持SGLang临时目录不变，实验目录旧名只保留原6行转发、转发目标改为新模块；不是第二套kernel。
+
+- [命名证明](../../../../mytest/mydata/qsa_quick_perf_20260929_02/rename_proof.json)：核对47个相关Python文件，只允许5个调用/测试/转发文件替换模块名，packed文件本身只移动、字节相同。新旧临时转发导入是同一模块对象；导入不初始化GPU。
+- [packed回归](../../../../mytest/mydata/qsa_quick_perf_20260929_02/gpu3/packed_tests.json)：GPU3上4项通过、0失败/错误/skip，15.236s；覆盖实际packed数值、KV刷新/尾部、scratch/graph复用及两种HK的host布局参考。原资源fixture仍检查private/VGPRspill/SGPRspill全0。
+- 沿用用户指定GPU0–3，10buffer、2warmup、每scope20samples；初始四卡均use0%、VRAM0%、PTL Enabled/VECTOR,F8。每卡独立进程、同卡对照，旧失败记录不改。
+
+| GPU | 首任务 | 失败位置 | use | VRAM | 新raw |
+|---|---|---|---:|---:|---:|
+| 0 | L3 M12000/TP2完整attention | before_samples | 20% | 2% | 0 |
+| 1 | L47 M12000/TP2完整attention | before_samples | 23% | 2% | 0 |
+| 2 | L3 M12000完整prefill indexer | before_samples | 19% | 2% | 0 |
+| 3 | TP2 attention单kernel | before_samples | 9% | 1% | 0 |
+
+详见[重测结果](../../../../mytest/mydata/qsa_quick_perf_20260929_02/analysis.json)。四卡均在准备/自身预热后触发利用率门禁，原阈值未改；低显存不等于没有外部工作，use也可能含自身预热的采样窗口。本轮没有新的普通计时，不能判断性能变好/变差。每卡失败后停止其后续TP或任务，不等待/反复重采/关闭门禁。全部原始失败JSON/CSV、初始和失败硬件快照保留，内核与用户Git暂存状态在运行期间不变；没有提交/推送或SGLang源码修改。

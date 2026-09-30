@@ -1,0 +1,1 @@
+"""Explicit whole-operator QSA correctness and performance entry points."""

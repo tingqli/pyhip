@@ -1,5 +1,7 @@
 # gfx942 QSA：attention 与 indexer
 
+**2026-09-29包迁移：** 计算实现已移至[已安装QSA包](../../../../src/pyhip/ops/qsa/flydsl)，共用MHA依赖移至[已安装MHA包](../../../../src/pyhip/ops/mha/flydsl)。本目录运行时文件仅为临时转发，不再含kernel正文；整体测试为[benchmarks/qsa](../../../../benchmarks/qsa/readme.md)，单kernel测试在[tests/ops/qsa](../../../../tests/ops/qsa)。以下优化历史保留。SGLang子目录本轮逐字不改，旧说明中的测试相对链接和“target无需安装PyHIP”仅适用于迁移前；新target依赖同版本PyHIP，见[过渡集成说明](../../../../benchmarks/qsa/readme.md#5-临时sglang接入与迁移范围)。
+
 > 当前默认：**10个独立输入/输出buffer、每实现128samples、2warmup**。
 > 后续优化记录、补录历史及TP2/4/8统一性能/query比例/逐kernel占比只追加到[opt.md](opt.md)，不新增Markdown报告。
 
@@ -262,11 +264,11 @@ Direct计算候选探索约9.5–9.7%改善，但**最终正式轮采样前门�
 | [attention_union.py](attention_union.py) | BM128/BN64 union attention kernel，消费已准备mask/order；common前缀免mask |
 | [attention_direct.py](attention_direct.py) | direct计划/分派与raw-KV fallback；非预排形状保留四wave合并K/消费端转置路径 |
 | [_attention_direct_packed.py](_attention_direct_packed.py) | 单请求4-token对齐且PK+PV≤64MiB的每次预排+单query wave attention；无K数据转置，私有scratch随图重放刷新 |
-| [test_attention.py](test_attention.py) | 输入生成、FP32 reference、真实输入hash/选择审计、正常测试与性能测试 |
+| [整体attention测试](../../../../benchmarks/qsa/test_attention.py#L1) | 整体正常测试与性能；输入/FP32参考和单kernel检查位于[tests/ops/qsa](../../../../tests/ops/qsa) |
 | [indexer.py](indexer.py) | prefill indexer：Triton q_prep/k_compress（逐bit）、布局与两个FlyDSL kernel launch；decode入口`decode_indexer`（分页logits＋SGLang fast_topk/expand）与`decode_forward`（Triton `_indexer_decode_prep`一次完成q norm/RoPE、ring写入和组边界压缩，逐bit）；无SGLang顶层依赖 |
 | [indexer_logits.py](indexer_logits.py) / [indexer_topk.py](indexer_topk.py) | FlyDSL MFMA relu-logits；每wave一行的top-512块选择及2051 token展开（2026-09-29由HIP改写，逐bit一致） |
 | [indexer_decode.py](indexer_decode.py) | FlyDSL decode分页logits：静态grid、设备端长度，合并1 KiB load经每wave 4 KiB LDS转置，MFMA 16×16×16以头为行 |
-| [test_indexer.py](test_indexer.py) | indexer真实capture/合成重放、插件校验流程与三臂性能；decode合成、graph重放、回退与`--decode`正式性能；decode forward合成/真实权重/多步graph与`--decode-forward`三臂正式性能 |
+| [整体indexer测试](../../../../benchmarks/qsa/test_indexer.py#L1) | indexer真实capture/合成重放、插件校验流程与三臂性能；decode合成、graph重放、回退与`--decode`/`--decode-forward`性能 |
 
 当前auto：packed direct可用时，以$W_U=128\cdot64\lceil U/16\rceil$、$W_D=16\cdot32\sum_i\lceil n_i/32\rceil$比较，$10W_U\le17W_D$时用union，否则direct；$n_i$是实际选中token数。
 raw/ragged仍按$U r \le 4\sum_i s_i$选择，$s_i$为query包含尾块的block数。requested BQ32按M128容量限制，TP2/4/8为**10/16/32**；
@@ -275,7 +277,7 @@ G12的grid上限为CU，其它G为`CU×2`。每次重建后按N64成本排序、
 
 ## 必要测试
 
-[test_attention.py](test_attention.py)是唯一QSA attention测试/回放入口；prefill indexer另由[test_indexer.py](test_indexer.py)覆盖：66项正常测试（prefill 12合成、8真实、8真实hipBLASLt投影、回退、插件校验；decode选择24合成（4/8头）、graph重放、回退；decode forward 7合成、2真实权重、6步graph重放），`-m perf`加`QSA_REPLAY_OUTPUT`跑8个capture三臂性能，CLI另有`--output/--inputs/--gpu/--buffers/--samples/--check-only/--decode/--decode-forward`（`--decode`跑bs1/8/32×3000/16384/65536 key图重放正式矩阵；`--decode-forward`跑bs1/8/32×12000/65536/262144 token整段decode `forward_cuda`的SGLang/select/forward三臂）；`QSA_REPLAY_GPU`选卡，`QSA_INDEXER_INPUT_DIR`覆盖capture目录。
+整体attention入口为[benchmark](../../../../benchmarks/qsa/test_attention.py#L1)，indexer入口为[benchmark](../../../../benchmarks/qsa/test_indexer.py#L1)，单kernel检查已拆至[tests/ops/qsa](../../../../tests/ops/qsa)。当前操作方式与完整数量以[新说明](../../../../benchmarks/qsa/readme.md)为准；下方65项等数字对应历史轮次。`QSA_REPLAY_GPU`选卡，`QSA_INDEXER_INPUT_DIR`覆盖indexer capture目录。
 
 - 普通pytest：13种正常形状（dense边界、TP2/4/8、ragged/空段、NaN尾部、alias、rescale、选择更新和graph），
   8份真实layer/rank/shape输入各跑TP2/4/8 local-head的3D重放、原3D SGLang backend流程、union排序、dense任务/graph、direct共享排序及packed KV刷新/NaN尾/动态graph、分流整数cutoff/HK2/raw/ragged和scratch无回读复用，另含CPU预算边界及TP2/4/8的64MiB边界fallback/graph。异常输入恢复oracle覆盖正/反序launch，共65项，保留逐bit mask、消费后scratch归零和64bit排序fallback；原`rtol=atol=.02`不变。最新.venv实际65通过、24 perf deselected、0skip，见[JUnit](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/validation/tests.xml)。资源fixture同时检查FlyDSL及准备Triton实际ELF三字段。

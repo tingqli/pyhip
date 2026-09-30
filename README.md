@@ -111,6 +111,8 @@ from repository tests or a test-directory `PYTHONPATH`.
 | [GEMM / Linear](src/pyhip/ops/gemm) | Assembly and an ASM/Aiter quantized Linear wrapper |
 | [MoE](src/pyhip/ops/moe) | Assembly, FlyDSL, and an Aiter-compatible autotuned API |
 | [Attention](src/pyhip/ops/attention) | Assembly paged attention |
+| [QSA](src/pyhip/ops/qsa/flydsl) | gfx942 BF16 sparse attention and prefill/decode indexer; [usage and benchmarks](benchmarks/qsa/readme.md) |
+| [MHA](src/pyhip/ops/mha/flydsl) | Shared FlyDSL helpers and gfx942 BF16 D256 linear kernel |
 | [Convolution](src/pyhip/ops/conv) | HIP depthwise and assembly/Gluon pointwise implementations |
 | [GRRead](src/pyhip/ops/gr_read) | FlyDSL down/up projections |
 
@@ -153,6 +155,8 @@ src/pyhip/                  # Installed Python package
 │   ├── gemm/               # asm/ and existing wrappers
 │   ├── moe/                # asm/, flydsl/, autotuned MoE API
 │   ├── attention/          # asm/
+│   ├── qsa/flydsl/         # Sparse attention and indexer
+│   ├── mha/flydsl/         # Shared MHA helpers and D256 linear kernel
 │   ├── conv/               # Wrappers and packaged hip/ sources
 │   └── gr_read/flydsl/      # Down/up projections
 ├── codegen/                # Shared asm/ and flydsl/ authoring tools

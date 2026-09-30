@@ -9,6 +9,7 @@ churn; their function arguments are CLI inputs, not pytest fixtures.
 - [conv](conv/): depthwise convolution correctness and timing CLI.
 - [attention](attention/): paged-attention correctness/timing script.
 - [gr_read](gr_read/readme.md): decode/prefill performance, frozen baselines, integration examples and Markdown reports.
+- [QSA](qsa/readme.md): whole attention/indexer correctness, real-input replay, explicit timing and external integration; single-kernel tests live under [tests/ops/qsa](../tests/ops/qsa).
 
 Run with the same Python environment used to install PyHIP:
 
