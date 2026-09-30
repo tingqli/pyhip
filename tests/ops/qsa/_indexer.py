@@ -1,39 +1,24 @@
-"""Reusable QSA indexer inputs and SGLang/FP64 correctness references."""
+"""Direct tensor fixtures and independent PyTorch references for the QSA indexer.
 
-import contextlib
-import hashlib
+``source.inputs`` is the raw operator keyword mapping; ``source.state`` is an
+independent initial-state snapshot. Projection, fixture planning and references
+are outside the operator boundary. No model, backend, pool object or hook is used.
+"""
+
 import math
 import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
-ROOT = Path(__file__).resolve().parents[3]
-DATA = ROOT / "mytest/mydata"
-AITER_CONFIGS = ROOT / "mytest/sglang_tp2_base_20260925_01/aiter_configs_snapshot"
-os.environ.setdefault("SGLANG_USE_AITER", "1")
-os.environ.setdefault("AITER_CONFIG_GEMM_BF16", str(AITER_CONFIGS / "bf16_tuned_gemm.csv"))
+from pyhip.ops.qsa.flydsl import indexer
 
-from pyhip.ops.qsa.flydsl import indexer  # noqa: E402
-from experiments.attention.flydsl.qsa.sglang import plugin  # noqa: E402
-
-REAL_INPUTS = DATA / "qsa_indexer_20260928_01/capture/inputs"
-BENCHMARK_BUFFERS = 10
-BENCHMARK_SAMPLES = 128
+HEADS, DIM, ROTARY, PAGE = 4, 128, 64, 64
 RATIO, TOPK, WIDTH = 4, 512, 2051
-# (sequence lengths, extend lengths): prefix = sequence - extend.
-CASES = (
-    ((1,), (1,)), ((7,), (7,)), ((1000,), (1000,)), ((2051,), (2051,)), ((2060,), (2060,)),
-    ((5003,), (5003,)), ((3000, 777, 2100), (1976, 777, 2036)), ((20000,), (3616,)),
-    ((33000,), (16616,)), ((70000,), (4096,)), ((131077, 3001), (4101, 3001)), ((262144,), (16384,)),
-)
-
-
-def _hash(tensor):
-    raw = tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes() if tensor.numel() else b""
-    return hashlib.sha256(raw).hexdigest()
+STATE_NAMES = ("key_state", "rope_state", "compressed")
 
 
 def _gpu():
@@ -45,504 +30,459 @@ def _gpu():
     return torch.device("cuda", torch.cuda.current_device())
 
 
-@contextlib.contextmanager
-def _production_rope():
-    # The server's attention backend is aiter, so MRoPE composes cos/sin with Triton.
-    from sglang.srt.layers.rotary_embedding import mrope
-
-    original = mrope.attention_backends
-    mrope.attention_backends = lambda: ("aiter", "aiter")
-    try:
-        yield
-    finally:
-        mrope.attention_backends = original
+def clone_state(state):
+    return {name: value.clone() for name, value in state.items()}
 
 
-def _module(weights, cache, layer, device, section=(11, 11, 10), interleaved=True):
-    from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-    from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
-
-    default = torch.get_default_dtype()
-    torch.set_default_dtype(torch.bfloat16)
-    try:
-        rotary = MRotaryEmbedding(256, 64, 64, 10_000_000, True, torch.bfloat16,
-                                  mrope_section=list(section), mrope_interleaved=interleaved)
-        config = SimpleNamespace(indexer_n_heads=4, indexer_kv_heads=1, indexer_head_dim=128, indexer_budget=2048,
-                                 indexer_compress_ratio=4, hidden_size=2560, rms_norm_eps=1e-6)
-        module = QSAIndexer(config, layer_id=layer, rotary_emb=rotary)
-    finally:
-        torch.set_default_dtype(default)
-    module = module.to(device)
-    rotary.cos_sin_cache = cache.to(device)
-    with torch.no_grad():
-        module.index_qk_proj.weight.copy_(weights["index_qk_weight"])
-        module.q_layernorm.weight.copy_(weights["q_norm_weight"])
-        module.k_layernorm.weight.copy_(weights["k_norm_weight"])
-    return module
+def reset_state(source):
+    for name, value in source.state.items():
+        source.inputs[name].copy_(value)
 
 
-def _pool(state, layer):
-    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-
-    pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
-    pool.full_attention_layer_id_mapping = {layer: 0}
-    pool.qsa_key_state_buffer_pool = [state["key_state"].clone()]
-    pool.qsa_compressed_k_buffer_pool = [state["compressed"].clone()]
-    pool.qsa_rope_position_buffer = state["rope_state"].clone()
-    pool.qsa_compress_ratio, pool.qsa_index_head_dim, pool.qsa_index_kv_heads = RATIO, 128, 1
-    pool.qsa_compressed_page_size, pool.qsa_block_topk, pool.qsa_token_topk = 16, TOPK, 2048
-    return pool
+def _state(device, ring_rows, slots, generator):
+    return dict(
+        key_state=torch.randn((ring_rows, 1, DIM), generator=generator, device=device).to(torch.bfloat16),
+        rope_state=torch.zeros((ring_rows, 3), dtype=torch.int64, device=device),
+        compressed=torch.randn((slots, 1, DIM), generator=generator, device=device).to(torch.bfloat16),
+    )
 
 
-def _metadata(case, pool):
-    from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
-
-    return QSAIndexerMetadata(token_to_kv_pool=pool, compress_ratio=RATIO, block_topk=TOPK, **case.fields)
-
-
-def _batch(case):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-    prefixes = [s - e for s, e in zip(case.seq_lens, case.extend_lens)]
-    return SimpleNamespace(forward_mode=ForwardMode.EXTEND, positions=case.logical,
-                           seq_lens_cpu=torch.tensor(case.seq_lens), extend_seq_lens_cpu=list(case.extend_lens),
-                           extend_prefix_lens_cpu=prefixes)
-
-
-def _state(device, rows, slots, seed):
-    generator = torch.Generator(device=device).manual_seed(seed)
-    return dict(key_state=torch.randn((rows, 1, 128), generator=generator, device=device).to(torch.bfloat16),
-                rope_state=torch.randint(0, 1 << 20, (rows, 3), generator=generator, device=device),
-                compressed=torch.randn((slots, 1, 128), generator=generator, device=device).to(torch.bfloat16))
+def _axis_map(section, interleaved, device):
+    half = ROTARY // 2
+    axes = torch.zeros(half, dtype=torch.int32, device=device)
+    if not section:
+        return axes
+    if len(section) != 3 or min(section) < 0 or sum(section) != half:
+        raise ValueError("MRoPE sections must partition the 32 rotary pairs")
+    s0, s1, s2 = section
+    if interleaved:
+        pairs = torch.arange(half, device=device)
+        axes[(pairs % 3 == 1) & (pairs < 3 * s1)] = 1
+        axes[(pairs % 3 == 2) & (pairs < 3 * s2)] = 2
+    else:
+        axes[s0:s0 + s1] = 1
+        axes[s0 + s1:] = 2
+    return axes
 
 
-def load(path, device):
-    value = torch.load(path, map_location="cpu", weights_only=True)
-    meta, tensors = value["metadata"], value["tensors"]
-    for name, tensor in tensors.items():
-        assert _hash(tensor) == meta["tensor_metadata"][name]["sha256"], (path, name)
-    tensors = {name: tensor.to(device) for name, tensor in tensors.items()}
-    fields = {name.split(".", 1)[1]: tensor for name, tensor in tensors.items() if name.startswith("metadata.")}
-    ring = (int(tensors["metadata.req_pool_indices"].max()) + 1) * RATIO
-    slots = int(max(tensors["compressed_slots"].max(), tensors["metadata.write_locs"].max())) + 1
-    return SimpleNamespace(
-        name=path.stem, layer=meta["layer_id"], seq_lens=tuple(meta["seq_lens"]),
-        extend_lens=tuple(meta["extend_seq_lens"]), hidden=tensors["hidden_states"],
-        positions=tensors["positions"], logical=tensors["batch_positions"], fields=fields,
-        module=_module(tensors, tensors["cos_sin_cache"], meta["layer_id"], device,
-                       meta["mrope_section"], meta["mrope_interleaved"]),
-        state=_state(device, ring, slots, 7), captured=tensors["output"],
-        captured_state=(tensors["ring_rows"], tensors["ring_key_state"], tensors["ring_rope_positions"],
-                        tensors["compressed_slots"], tensors["compressed_keys"]),
-        capture=dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest(), source_tp_rank=meta.get(
-            "tp_rank"), metadata={k: v for k, v in meta.items() if k != "tensor_metadata"}))
+def _rope_matrix(positions):
+    if positions.ndim == 1:
+        return positions[:, None].expand(-1, 3).contiguous()
+    return positions.T.contiguous()
 
 
-def synthetic(seq_lens, extend_lens, device, seed=11):
-    """Page-aligned request slots and SGLang's own extend write plan/ring/rope helpers."""
-    from sglang.srt.layers.attention.qsa.metadata import build_pending_ring_slots, build_rope_position_matrix
-    from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+def _parameters(generator, device, context, *, section=(11, 11, 10), interleaved=True,
+                cache_dtype=torch.bfloat16):
+    return dict(
+        q_weight=(torch.randn(DIM, generator=generator, device=device) / 4).to(torch.bfloat16),
+        k_weight=(torch.randn(DIM, generator=generator, device=device) / 4).to(torch.bfloat16),
+        cos_sin_cache=torch.randn((context + PAGE, ROTARY), generator=generator, device=device).to(cache_dtype),
+        axis_map=_axis_map(section, interleaved, device), q_eps=1e-6, k_eps=1e-6,
+    )
 
+
+def _host_lengths(seq_lens, extend_lens):
+    seq_lens, extend_lens = tuple(seq_lens), tuple(extend_lens)
+    if (not seq_lens or len(seq_lens) != len(extend_lens) or not sum(extend_lens)
+            or any(e < 0 or s < e or (s - e) % RATIO for s, e in zip(seq_lens, extend_lens))):
+        raise ValueError("Require nonempty rows and group-aligned, nonnegative prefixes")
+    return seq_lens, extend_lens, tuple(s - e for s, e in zip(seq_lens, extend_lens))
+
+
+@torch.no_grad()
+def synthetic(seq_lens, extend_lens, device, seed=11, *, section=(11, 11, 10), interleaved=True,
+              position_axes=3, cache_dtype=torch.bfloat16):
+    """Host-planned, page-64 requests; qk is BF16 [rows, (4 + 1) * 128], not attention Q."""
+    seq_lens, extend_lens, prefixes = _host_lengths(seq_lens, extend_lens)
+    if position_axes not in (1, 3):
+        raise ValueError("positions must have one or three axes")
     generator = torch.Generator(device=device).manual_seed(seed)
     rows, batch = sum(extend_lens), len(seq_lens)
-    prefixes = [s - e for s, e in zip(seq_lens, extend_lens)]
-    width = -(-max(seq_lens) // 64) * 64
-    starts = [64 * (1 + i) + i * width for i in range(batch)]
-    table = torch.stack([torch.arange(s, s + width, device=device) for s in starts]).to(torch.int32)
-    lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-    logical = torch.cat([torch.arange(p, s, device=device) for p, s in zip(prefixes, seq_lens)])
-    positions = logical[None].expand(3, -1).contiguous()
-    extend = torch.tensor(extend_lens, device=device)
-    prefix = torch.tensor(prefixes, device=device)
-    write_locs, ends, sequences, members = QwenSparseAttnBackend._qsa_write_plan(
-        token_slot_table=table, start_blocks=prefix // RATIO, end_blocks=lengths.long() // RATIO,
-        capacity=rows // RATIO + batch, compress_ratio=RATIO, row_token_starts=torch.cumsum(extend, 0) - extend,
-        prefix_lens=prefix)
-    to_batch = torch.repeat_interleave(torch.arange(batch, device=device, dtype=torch.int32), extend)
-    requests = torch.arange(1, batch + 1, device=device)
-    fields = dict(sequence_lengths=lengths, token_to_batch_idx=to_batch, token_slot_table=table,
-                  out_cache_loc=torch.zeros(rows, dtype=torch.int64, device=device), req_pool_indices=requests,
-                  write_locs=write_locs, compress_group_positions=ends, compress_sequence_ids=sequences,
-                  compress_member_rows=members,
-                  pending_ring_slots=build_pending_ring_slots(token_to_batch_idx=to_batch, req_pool_indices=requests,
-                                                              sequence_lengths=lengths, logical_positions=logical,
-                                                              compress_ratio=RATIO, is_extend=True),
-                  extend_rope_matrix=build_rope_position_matrix(positions, rows))
-    weights = dict(index_qk_weight=torch.randn((640, 2560), generator=generator, device=device) / 50,
-                   q_norm_weight=torch.randn(128, generator=generator, device=device) / 4,
-                   k_norm_weight=torch.randn(128, generator=generator, device=device) / 4)
-    cache = torch.randn((max(seq_lens) + 64, 64), generator=generator, device=device).to(torch.bfloat16)
+    width = math.ceil(max(seq_lens) / PAGE) * PAGE
+    starts = [PAGE * (1 + request) + request * width for request in range(batch)]
+    table = torch.stack([torch.arange(start, start + width, device=device, dtype=torch.int32)
+                         for start in starts])
+    logical_host, slots_host, groups = [], [], []
+    row_start = 0
+    for request, (length, extend, prefix) in enumerate(zip(seq_lens, extend_lens, prefixes)):
+        for position in range(prefix, length):
+            logical_host.append(position)
+            pending = position >= length // RATIO * RATIO
+            slots_host.append((request + 1) * RATIO + position % RATIO if pending else position % RATIO)
+        for block in range(prefix // RATIO, length // RATIO):
+            groups.append(((starts[request] + block * RATIO) // RATIO,
+                           row_start + block * RATIO - prefix, request, block * RATIO + RATIO - 1))
+        row_start += extend
+    capacity = rows // RATIO + batch
+    groups.extend([(0, 0, 0, RATIO - 1)] * (capacity - len(groups)))
+    plan = torch.tensor(groups, dtype=torch.int64, device=device)
+    logical = torch.tensor(logical_host, dtype=torch.int64, device=device)
+    positions = logical.clone() if position_axes == 1 else torch.stack((logical, logical + 3, logical + 7))
+    state = _state(device, (batch + 1) * RATIO, (starts[-1] + width) // RATIO, generator)
+    inputs = dict(
+        qk=torch.randn((rows, (HEADS + 1) * DIM), generator=generator, device=device).to(torch.bfloat16),
+        heads=HEADS, positions=positions, logical_positions=logical,
+        state_slots=torch.tensor(slots_host, dtype=torch.int64, device=device),
+        write_locs=plan[:, 0].to(torch.int32).contiguous(), member_rows=plan[:, 1].contiguous(),
+        group_sequences=plan[:, 2].contiguous(), group_ends=plan[:, 3].contiguous(),
+        rope_matrix=_rope_matrix(positions), token_slot_table=table,
+        seq_lens=seq_lens, extend_lens=extend_lens,
+        **clone_state(state), **_parameters(generator, device, max(seq_lens), section=section,
+                                            interleaved=interleaved, cache_dtype=cache_dtype),
+    )
     return SimpleNamespace(
-        name=f"synthetic_s{'-'.join(map(str, seq_lens))}_e{'-'.join(map(str, extend_lens))}", layer=3,
-        seq_lens=tuple(seq_lens), extend_lens=tuple(extend_lens),
-        hidden=torch.randn((rows + 3, 2560), generator=generator, device=device).to(torch.bfloat16),
-        positions=torch.cat((positions, positions[:, :3]), dim=1), logical=torch.cat((logical, logical[:3])),
-        fields=fields, module=_module(weights, cache, 3, device),
-        state=_state(device, (batch + 1) * RATIO, (starts[-1] + width) // RATIO + 1, seed), captured=None,
-        captured_state=None, capture=None)
+        name=f"synthetic_s{'-'.join(map(str, seq_lens))}_e{'-'.join(map(str, extend_lens))}",
+        inputs=inputs, state=state, rows=rows, seq_lens=seq_lens, extend_lens=extend_lens,
+        host=dict(prefixes=prefixes, request_ids=tuple(range(1, batch + 1))),
+    )
 
 
-def base(case, pool):
-    with _production_rope(), torch.no_grad():
-        return case.module.forward_cuda(case.hidden, case.positions, _batch(case), _metadata(case, pool))
+@triton.jit
+def _sqrt_fp32_reference(X, Y, size, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(X + offsets, offsets < size, other=0.0)
+    tl.store(Y + offsets, tl.sqrt(value), offsets < size)
 
 
-def pyhip(case, pool, intermediates=False, projection=None):
-    """Plugin adapter + runtime; projection=None keeps SGLang's (bit-exact) index_qk_proj GEMM."""
-    with torch.no_grad():
-        metadata = _metadata(case, pool)
-        inputs = plugin._indexer_inputs(case.module, case.hidden, case.positions, _batch(case), metadata, projection)
-        assert inputs is not None, "adapter rejected an eligible extend call"
-        result = indexer._prefill(inputs.pop("qk"), **inputs)
-        return result if intermediates else result[0]
+def norm_rope_reference(x, coordinates, weight, cache, axis_map, eps):
+    """Independent FP32 RMS tree and per-operation BF16 norm/NeoX RoPE."""
+    shape = x.shape
+    values = x.reshape(-1, DIM).float()
+    squares = (values * values).reshape(-1, 2, 2, 2, 2, 2, 2, 2)
+    for _ in range(4):
+        squares = squares.sum(dim=4)
+    total = squares.sum(dim=3).sum(dim=2).sum(dim=1)
+    variance = total / DIM + eps
+    root = torch.empty_like(variance)
+    # Gemma's Triton path uses v_sqrt_f32, not Torch's corrected sqrtf.
+    # This scalar primitive differs by an FP32 ULP at BF16 rounding boundaries.
+    _sqrt_fp32_reference[(triton.cdiv(root.numel(), 256),)](variance, root, root.numel(), BLOCK=256)
+    rstd = 1.0 / root
+    normalized = (values * rstd[:, None] * (1.0 + weight.float())[None]).to(torch.bfloat16)
+    half = cache.shape[1] // 2
+    pairs = torch.arange(half, device=x.device)
+    position = coordinates.reshape(-1, 3)[:, axis_map.long()]
+    cosine = cache[position, pairs].to(torch.bfloat16).float()
+    sine = cache[position, pairs + half].to(torch.bfloat16).float()
+    left, right = normalized[:, :half].float(), normalized[:, half:2 * half].float()
+    left_cos, right_sin = (left * cosine).to(torch.bfloat16), (right * sine).to(torch.bfloat16)
+    right_cos, left_sin = (right * cosine).to(torch.bfloat16), (left * sine).to(torch.bfloat16)
+    rotated_left = (left_cos.float() - right_sin.float()).to(torch.bfloat16)
+    rotated_right = (right_cos.float() + left_sin.float()).to(torch.bfloat16)
+    return torch.cat((rotated_left, rotated_right, normalized[:, 2 * half:]), dim=-1).reshape(shape)
 
 
-_plugin_state = None
+def _mean_reference(members):
+    total = members[:, 0].float()
+    for member in range(1, RATIO):
+        total = total + members[:, member].float()
+    return (total * (1.0 / RATIO)).to(torch.bfloat16)
 
 
-def fast_projection(module, rows):
-    """The plugin's default hipBLASLt index projection policy (None below its row threshold)."""
-    global _plugin_state
-    if _plugin_state is None:
-        _plugin_state = plugin._State()
-    return _plugin_state.projection(module, rows)
+@torch.no_grad()
+def reference_prep(inputs, initial_state, *, decode=False):
+    """Q, valid state writes and packed keys, without any implementation helper.
+
+    Reserved ring rows 0..3 and compressed slot 0 are inert racing destinations;
+    they have no defined final value and are never used as reference data.
+    """
+    state = clone_state(initial_state)
+    rows = inputs["qk"].shape[0]
+    raw = inputs["qk"].reshape(rows, HEADS + 1, DIM)
+    coordinates = _rope_matrix(inputs["positions"])
+    q = norm_rope_reference(raw[:, :HEADS], coordinates[:, None].expand(-1, HEADS, -1),
+                            inputs["q_weight"], inputs["cos_sin_cache"], inputs["axis_map"], inputs["q_eps"])
+    live = inputs["state_slots"] >= RATIO
+    slots = inputs["state_slots"][live].long()
+    assert slots.unique().numel() == slots.numel(), "valid ring writes must be request-local and unique"
+    state["key_state"][slots, 0] = raw[live, HEADS]
+    state["rope_state"][slots] = coordinates[live]
+    live = inputs["write_locs"] != 0
+    destinations = inputs["write_locs"][live].long()
+    assert destinations.unique().numel() == destinations.numel(), "duplicate compressed destinations"
+    if destinations.numel():
+        if decode:
+            members = inputs["group_locs"][live].long()
+            keys = state["key_state"][members, 0]
+            group_coordinates = state["rope_state"][members[:, 0]]
+        else:
+            first = inputs["member_rows"][live].long()
+            members = first[:, None] + torch.arange(RATIO, device=raw.device)
+            keys = raw[members, HEADS]
+            group_coordinates = inputs["rope_matrix"][first]
+        compressed = norm_rope_reference(_mean_reference(keys), group_coordinates, inputs["k_weight"],
+                                         inputs["cos_sin_cache"], inputs["axis_map"], inputs["k_eps"])
+        state["compressed"][destinations, 0] = compressed
+    packed = None
+    if not decode:
+        keys = [state["compressed"][inputs["token_slot_table"][request, :length // RATIO * RATIO:RATIO].long()
+                                      // RATIO, 0]
+                for request, length in enumerate(inputs["seq_lens"])]
+        packed = torch.cat(keys)
+    return SimpleNamespace(q=q, state=state, packed=packed)
 
 
-def _counts(case):
-    lengths = [s for s, e in zip(case.seq_lens, case.extend_lens) for _ in range(e)]
-    lengths = torch.tensor(lengths, device=case.logical.device)
-    rows = sum(case.extend_lens)
-    return torch.minimum((case.logical[:rows] + 1) // RATIO, lengths // RATIO), lengths
+def assert_exact(actual, expected, label):
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype, label
+    assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)), label
+
+
+def assert_state(source, expected):
+    report = {}
+    for name in STATE_NAMES:
+        lo = 1 if name == "compressed" else RATIO
+        actual, wanted = source.inputs[name][lo:], expected.state[name][lo:]
+        assert_exact(actual, wanted, name)
+        report[f"{name}_rows_written"] = int((wanted != source.state[name][lo:]).flatten(1).any(1).sum())
+    return report
+
+
+def _counts(positions, sequences):
+    return torch.minimum((positions.long() + 1).clamp_min(0), sequences.long().clamp_min(0)) // RATIO
 
 
 def _blocks(output, counts):
-    first = output[:, :TOPK * RATIO:RATIO]
     live = torch.arange(TOPK, device=output.device)[None] < counts.clamp_max(TOPK)[:, None]
-    return torch.where(live, first // RATIO, -1)
+    return torch.where(live, output[:, :TOPK * RATIO:RATIO] // RATIO, -1)
 
 
-def _logits(case, pool, rows):
-    """FP64 reference logits of the given rows over their request's compressed keys."""
-    metadata = _metadata(case, pool)
-    total = sum(case.extend_lens)
-    with _production_rope(), torch.no_grad():
-        q, _, _ = case.module.project_qk(case.hidden[:total], case.positions[:, :total])
-        keys, starts, ends, _ = metadata.get_prefill_mqa_inputs(case.layer, case.logical[:total])
-    q, keys = q[rows].double(), keys[:, 0].double()
-    scores = torch.relu(torch.einsum("mhd,nd->mnh", q, keys)).sum(-1) / math.sqrt(128)
-    return scores, starts[rows], ends[rows]
+def expand_reference(blocks, positions, sequences):
+    """Quartets first, then the visible incomplete group, then every remaining -1."""
+    visible = torch.minimum((positions.long() + 1).clamp_min(0), sequences.long().clamp_min(0))
+    selected = (visible // RATIO).clamp_max(TOPK)
+    column = torch.arange(WIDTH, device=blocks.device)[None].expand(blocks.shape[0], -1)
+    block = blocks.gather(1, (column // RATIO).clamp_max(TOPK - 1))
+    quartets = block * RATIO + column % RATIO
+    tail_offset = column - selected[:, None] * RATIO
+    tail = (tail_offset >= 0) & (tail_offset < (visible % RATIO)[:, None])
+    values = torch.where(column < selected[:, None] * RATIO, quartets,
+                         torch.where(tail, (visible // RATIO * RATIO)[:, None] + tail_offset, -1))
+    return values.to(torch.int32)
 
 
-def _violation(case, pool, rows, blocks):
-    """Worst FP64 (max unchosen - min chosen) / max|logit| over the given rows (pool: base, after its call)."""
-    logits, starts, ends = _logits(case, pool, rows)
-    worst = 0.0
-    for local, row in enumerate(rows.tolist()):
-        count = int(ends[local] - starts[local])
-        values = logits[local, starts[local]:ends[local]]
-        chosen = torch.zeros(count, dtype=torch.bool, device=values.device)
-        chosen[blocks[row][blocks[row] >= 0].long()] = True
-        gap = float(values[~chosen].max() - values[chosen].min()) if count > TOPK else 0.0
-        worst = max(worst, gap / max(float(values.abs().max()), 1e-30))
-    return worst
-
-
-def check(case, *, compare_captured=True):
-    """Compare token ABI, per-row block sets (tie-aware) and pool writes against SGLang eager."""
-    from sglang.srt.layers.attention.qsa.kernel import torch_expand_qsa_block_indices
-
-    rows = sum(case.extend_lens)
-    base_pool, new_pool = _pool(case.state, case.layer), _pool(case.state, case.layer)
-    expected = base(case, base_pool)
-    actual, q, packed = pyhip(case, new_pool, intermediates=True)
-    torch.cuda.synchronize()
-    with _production_rope(), torch.no_grad():
-        q_base, _, _ = case.module.project_qk(case.hidden[:rows], case.positions[:, :rows])
-        keys, _, _, _ = _metadata(case, base_pool).get_prefill_mqa_inputs(case.layer, case.logical[:rows])
-    assert torch.equal(q, q_base), "normed/rotated index Q must be bit-exact"
-    assert torch.equal(packed[:keys.shape[0]], keys[:, 0]), "packed compressed keys must be bit-exact"
-    assert actual.shape == expected.shape == (rows, WIDTH) and actual.dtype == torch.int32
-    counts, lengths = _counts(case)
+def assert_token_abi(actual, positions, sequences):
+    rows = positions.numel()
+    assert actual.shape == (rows, WIDTH) and actual.dtype == torch.int32, "int32 [rows,2051] ABI"
+    counts = _counts(positions, sequences)
     blocks = _blocks(actual, counts)
-    live = torch.arange(TOPK, device=blocks.device)[None] < counts.clamp_max(TOPK)[:, None]
-    assert torch.equal(blocks >= 0, live) and bool((blocks < counts[:, None]).all()), "blocks must be causal"
+    live = torch.arange(TOPK, device=actual.device)[None] < counts.clamp_max(TOPK)[:, None]
+    assert torch.equal(blocks >= 0, live), "missing selected block"
+    assert bool((blocks < counts[:, None]).all()), "noncausal block"
     ordered = torch.where(live, blocks, 1 << 30).sort(dim=1).values
-    assert not bool(((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] < 1 << 30)).any()), "duplicate blocks"
-    torch.testing.assert_close(torch_expand_qsa_block_indices(blocks, case.logical[:rows], lengths, RATIO, 2048),
-                               actual, rtol=0, atol=0)
-    different = (actual.sort(dim=1).values != expected.sort(dim=1).values).any(dim=1)
-    report = dict(case=case.name, rows=rows, different_token_sets=int(different.sum()))
-    if different.any():
-        worst = _violation(case, base_pool, different.nonzero().flatten()[:256], blocks)
-        report["worst_relative_boundary_violation"] = worst
-        assert worst <= 1e-5, report
-    for name, a, b in zip(("key_state", "rope_state", "compressed"),
-                          plugin._indexer_state(_metadata(case, new_pool), case.layer),
-                          plugin._indexer_state(_metadata(case, base_pool), case.layer)):
-        assert torch.equal(a, b), name
-    for name in ("key_state", "rope_state", "compressed"):
-        old, dump = case.state[name], RATIO if name != "compressed" else 1
-        changed = [(_buffer(pool, name) != old).flatten(1).any(1)[dump:] for pool in (base_pool, new_pool)]
-        assert torch.equal(*changed), f"{name} write footprint differs"
-    if compare_captured and case.captured is not None:
-        ring, key_state, rope_state, slots, compressed = case.captured_state
-        captured = (case.captured.sort(dim=1).values != expected.sort(dim=1).values).any(dim=1)
-        report["base_vs_captured_different_token_sets"] = int(captured.sum())
-        report["pyhip_vs_captured_different_token_sets"] = int(
-            (case.captured.sort(dim=1).values != actual.sort(dim=1).values).any(dim=1).sum())
-        # Ring rows keep stale values unless this call leaves pending (incomplete-group) tokens.
-        written = torch.isin(ring, case.fields["pending_ring_slots"][:rows]) & (ring >= RATIO)
-        report["captured_pending_ring_rows"] = int(written.sum())
-        assert torch.equal(new_pool.get_qsa_key_state_buffer(case.layer)[ring[written]], key_state[written])
-        assert torch.equal(new_pool.qsa_rope_position_buffer[ring[written]], rope_state[written])
-        assert torch.equal(new_pool.get_qsa_compressed_k_buffer(case.layer)[slots], compressed)
-    first = actual.clone()
-    again = pyhip(case, _pool(case.state, case.layer))
-    assert torch.equal(again, first), "PyHIP indexer must be deterministic"
+    assert not bool(((ordered[:, 1:] == ordered[:, :-1]) & live[:, 1:]).any()), "duplicate block"
+    assert torch.equal(actual, expand_reference(blocks, positions, sequences)), "token quartet/tail/-1 ABI"
+    return blocks, counts, live, ordered
+
+
+def assert_topk(actual, positions, sequences, exact, *, equal_ties=False):
+    blocks, counts, live, ordered = assert_token_abi(actual, positions, sequences)
+    if equal_ties:
+        lowest = torch.arange(TOPK, device=actual.device)[None].expand_as(blocks)
+        assert torch.equal(ordered[live], lowest[live]), "equal ties must keep lowest block ids"
+    ranked = counts > TOPK
+    worst = 0.0
+    if bool(ranked.any()):
+        scores, selected_blocks, limits = exact[ranked], blocks[ranked].long(), counts[ranked]
+        columns = torch.arange(scores.shape[1], device=actual.device)[None]
+        causal = columns < limits[:, None]
+        assert bool(torch.isfinite(scores[causal]).all()), "nonfinite reference logits"
+        selected = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, selected_blocks, True)
+        high = scores.masked_fill(~causal | selected, -math.inf).amax(1)
+        low = scores.masked_fill(~selected, math.inf).amin(1)
+        scale = scores.abs().masked_fill(~causal, 0).amax(1).clamp_min(1e-30)
+        gap = (high - low) / scale
+        assert bool(torch.isfinite(gap).all()), "nonfinite top-k boundary"
+        worst = max(0.0, float(gap.max()))
+        assert worst <= 1e-5, {"worst_relative_boundary_violation": worst}
+    return dict(worst_relative_boundary_violation=worst, tolerance=1e-5, checked_rows=actual.shape[0])
+
+
+def _scores(q, keys):
+    # Separate heads bound reference memory even at 65536 keys; no MFMA/helper reuse.
+    values = keys.double().T
+    result = torch.zeros((q.shape[0], keys.shape[0]), dtype=torch.float64, device=q.device)
+    for head in range(HEADS):
+        result = result + (q[:, head].double() @ values).relu()
+    return result / math.sqrt(DIM)
+
+
+def _selected_reference(exact, counts):
+    blocks = torch.full((counts.numel(), TOPK), -1, dtype=torch.int32, device=exact.device)
+    take = min(TOPK, exact.shape[1])
+    if take:
+        causal = torch.arange(exact.shape[1], device=exact.device)[None] < counts[:, None]
+        order = exact.masked_fill(~causal, -math.inf).argsort(dim=1, descending=True, stable=True)[:, :take]
+        blocks[:, :take] = torch.where(torch.arange(take, device=exact.device)[None] < counts[:, None], order, -1)
+    return blocks
+
+
+@torch.no_grad()
+def check(source, *, actual=None, q=None, packed=None, expected=None):
+    """Check a prefill invocation against independent prep, state and all-row FP64 selection."""
+    inputs = source.inputs
+    expected = reference_prep(inputs, source.state) if expected is None else expected
+    if actual is None:
+        actual, q, packed = indexer._prefill(**inputs)
+    assert actual.shape == (source.rows, WIDTH) and actual.dtype == torch.int32, "prefill token frame"
+    if q is not None:
+        assert_exact(q, expected.q, "index Q must be bitexact")
+    if packed is not None:
+        assert_exact(packed[:expected.packed.shape[0]], expected.packed, "packed keys must be bitexact")
+    report = dict(case=source.name, rows=source.rows, q_checked=q is not None, packed_checked=packed is not None,
+                  **assert_state(source, expected), different_token_sets=0, worst_relative_boundary_violation=0.0)
+    row_base, key_base = 0, 0
+    for length, extend in zip(source.seq_lens, source.extend_lens):
+        key_count = length // RATIO
+        for offset in range(0, extend, 64):
+            first, last = row_base + offset, row_base + min(offset + 64, extend)
+            positions = inputs["logical_positions"][first:last]
+            sequences = torch.full_like(positions, length)
+            counts = _counts(positions, sequences)
+            visible_keys = min(key_count, (length - extend + min(offset + 64, extend)) // RATIO)
+            exact = _scores(expected.q[first:last], expected.packed[key_base:key_base + visible_keys])
+            checked = assert_topk(actual[first:last], positions, sequences, exact)
+            report["worst_relative_boundary_violation"] = max(report["worst_relative_boundary_violation"],
+                                                                checked["worst_relative_boundary_violation"])
+            tokens = expand_reference(_selected_reference(exact, counts), positions, sequences)
+            report["different_token_sets"] += int((actual[first:last].sort(1).values != tokens.sort(1).values).any(1).sum())
+        row_base, key_base = row_base + extend, key_base + key_count
     return report
 
 
-def check_projection(case):
-    """hipBLASLt projection vs SGLang's GEMM: rounding-level qk, pool and near-tie selection changes only."""
-    rows = sum(case.extend_lens)
-    assert fast_projection(case.module, rows) is not None, "hipBLASLt projection not selected"
-    base_pool, new_pool = _pool(case.state, case.layer), _pool(case.state, case.layer)
-    expected = base(case, base_pool)
-    actual = pyhip(case, new_pool, projection=fast_projection)
-    with torch.no_grad():
-        exact = case.module.index_qk_proj(case.hidden[:rows])[0]
-        fast = fast_projection(case.module, rows)(case.hidden[:rows])
-    torch.cuda.synchronize()
-    different = (actual.sort(dim=1).values != expected.sort(dim=1).values).any(dim=1)
-    # Both are BF16 roundings of FP32 sums in different orders: elements may differ by one output ulp,
-    # or more near cancellation, but never by more than a BF16 ulp of the tensor's scale.
-    error = float((fast.float() - exact.float()).abs().max())
-    scale = float(exact.float().abs().max())
-    report = dict(case=case.name, rows=rows, qk_mismatches=int((fast != exact).sum()), qk_max_abs_error=error,
-                  qk_max_abs=scale, different_token_sets=int(different.sum()))
-    counts, _ = _counts(case)
-    blocks = _blocks(actual, counts)
-    worst = _violation(case, base_pool, different.nonzero().flatten()[:256], blocks) if different.any() else 0.0
-    report["worst_relative_boundary_violation"] = worst
-    for name, a, b in zip(("key_state", "rope_state", "compressed"),
-                          plugin._indexer_state(_metadata(case, new_pool), case.layer),
-                          plugin._indexer_state(_metadata(case, base_pool), case.layer)):
-        report[f"{name}_mismatches"] = int((a != b).sum())
-    assert error <= scale * 2 ** -8 and report["qk_mismatches"] <= fast.numel() // 1000, report
-    assert report["rope_state_mismatches"] == 0, report
-    assert report["different_token_sets"] <= rows // 100 and worst <= 2e-3, report
-    return report
-
-
-def _buffer(pool, name):
-    return {"key_state": pool.qsa_key_state_buffer_pool[0], "rope_state": pool.qsa_rope_position_buffer,
-            "compressed": pool.qsa_compressed_k_buffer_pool[0]}[name]
-
-
-def _real_files():
-    folder = Path(os.environ.get("QSA_INDEXER_INPUT_DIR", REAL_INPUTS))
-    if "QSA_INDEXER_INPUT_DIR" in os.environ and not folder.is_dir():
-        raise FileNotFoundError(folder)
-    return sorted(folder.glob("indexer_tp*_layer*_m*.pt")) if folder.is_dir() else []
-
-
-# (compressed lengths per decode row, page-table width in 16-key pages); 4096 pages is the
-# server's graph width (context 262144). Length 0 rows are CUDA-graph padding rows.
-DECODE_CASES = (
-    ((0,), 4), ((1,), 4), ((17,), 4), ((511,), 64), ((512,), 64), ((513,), 64), ((3000,), 4096),
-    ((5, 0, 777), 64), ((513, 2048, 1, 4096), 256), ((16384,) * 8, 1024),
-    (tuple(3000 + 37 * i for i in range(32)), 4096), ((65536, 65535), 4096),
-)
-
-
-def decode_case(lengths, pages, device, heads=4, seed=5, pool=None):
-    """Random compressed pool of ``pool`` pages, shuffled per-row page tables (stale ids past each length)."""
+def decode_case(lengths, pages, device, heads=HEADS, seed=5, pool=None):
+    """Direct paged Q/K inputs; lengths are compressed-key counts, including graph-padding zero."""
+    if not lengths or min(lengths) < 0 or max(lengths) > pages * 16 or heads not in (4, 8) or pages < 1:
+        raise ValueError("Require 4/8 heads and compressed lengths within the page-table width")
     generator = torch.Generator(device=device).manual_seed(seed)
-    rows, total = len(lengths), pool or sum(-(-n // 16) for n in lengths) + 3
-    assert total >= sum(-(-n // 16) for n in lengths)
-    cache = torch.randn((total * 16, 1, 128), generator=generator, device=device).to(torch.bfloat16)
+    rows, needed = len(lengths), sum(math.ceil(n / 16) for n in lengths)
+    total = needed + 3 if pool is None else pool
+    if total < max(needed, 1):
+        raise ValueError("Not enough independent cache pages")
+    cache = torch.randn((total, 16, 1, DIM), generator=generator, device=device).to(torch.bfloat16)
     order = torch.randperm(total, generator=generator, device=device).to(torch.int32)
     table = order[torch.randint(0, total, (rows, pages), generator=generator, device=device)]
     used = 0
     for row, length in enumerate(lengths):
-        count = -(-length // 16)
+        count = math.ceil(length / 16)
         table[row, :count] = order[used:used + count]
         used += count
-    q = torch.randn((rows, heads, 128), generator=generator, device=device).to(torch.bfloat16)
-    q[:, 4:] = 0
+    q = torch.randn((rows, heads, DIM), generator=generator, device=device).to(torch.bfloat16)
+    q[:, HEADS:] = 0
     compressed = torch.tensor(lengths, dtype=torch.int32, device=device)
-    sequences = compressed * 4 + torch.randint(0, 4, (rows,), generator=generator, device=device).to(torch.int32)
-    return SimpleNamespace(q=q, cache=cache.view(-1, 16, 1, 128), table=table, lengths=compressed,
-                           width=pages * 16, positions=sequences - 1, sequences=sequences,
-                           module=SimpleNamespace(index_n_heads=4, index_head_dim=128, compress_ratio=4,
-                                                  block_topk=TOPK, token_topk=2048, layer_id=3))
+    sequences = compressed * RATIO + torch.randint(0, RATIO, (rows,), generator=generator, device=device).int()
+    inputs = dict(q=q, cache=cache, page_table=table, lengths=compressed,
+                  query_positions=sequences - 1, sequence_lengths=sequences)
+    return SimpleNamespace(name=f"decode_r{rows}_k{'-'.join(map(str, lengths[:4]))}", inputs=inputs, state={},
+                           rows=rows, host=dict(compressed_lengths=tuple(lengths)))
 
 
-def _decode_args(case):
-    return (case.module, case.q, case.cache, case.table, case.lengths, case.width, case.positions, case.sequences)
-
-
-def decode_base(case):
-    from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-
-    return QSAIndexer.select_decode_tokens(*_decode_args(case))
-
-
-def decode_pyhip(case, state=None):
-    from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-
-    return (state or plugin._State()).decode(QSAIndexer.select_decode_tokens, *_decode_args(case))
-
-
-def check_decode(case, actual=None, expected=None):
-    """Paged logits vs FP64 and token sets vs SGLang's decode path (tie-aware); actual defaults to an eager call."""
-    from sglang.srt.layers.attention.qsa.kernel import torch_expand_qsa_block_indices
-
-    from pyhip.ops.qsa.flydsl import indexer_decode
-
-    assert plugin._decode_eligible(*_decode_args(case)[:6])
-    rows = case.q.shape[0]
-    slots = (case.table.long()[:, :, None] * 16 + torch.arange(16, device=case.q.device)).flatten(1)
-    exact = torch.relu(torch.einsum("rhd,rnd->rnh", case.q[:, :4].double(), case.cache.view(-1, 128)[slots].double()))
-    exact = exact.sum(-1) / math.sqrt(128)
-    logits = torch.empty((rows, case.width), dtype=torch.float32, device=case.q.device)
-    indexer_decode.launch(case.q, case.cache, case.table, case.lengths, logits,
-                          float(torch.tensor(1.0) / torch.tensor(math.sqrt(128))))
-    expected = decode_base(case) if expected is None else expected
-    actual = decode_pyhip(case) if actual is None else actual
-    torch.cuda.synchronize()
-    assert actual.shape == expected.shape == (rows, WIDTH) and actual.dtype == torch.int32
-    counts = case.lengths.long()
-    blocks = _blocks(actual, counts)
-    torch.testing.assert_close(torch_expand_qsa_block_indices(blocks, case.positions, case.sequences, RATIO, 2048),
-                               actual, rtol=0, atol=0)
-    different = (actual.sort(dim=1).values != expected.sort(dim=1).values).any(dim=1)
-    report = dict(lengths=[int(n) for n in counts[:4]], rows=rows, width=case.width, heads=case.q.shape[1],
-                  different_token_sets=int(different.sum()), max_logit_error=0.0, worst_boundary_violation=0.0)
-    for row in range(rows):
-        count = int(counts[row])
-        tail = logits[row, count:-(-count // 16) * 16]
-        assert bool(torch.isneginf(tail).all()), "partial-page keys past the length must be -inf"
-        if count == 0:
-            continue
-        values, scale = exact[row, :count], max(float(exact[row, :count].abs().max()), 1e-30)
-        report["max_logit_error"] = max(report["max_logit_error"],
-                                        float((logits[row, :count].double() - values).abs().max()) / scale)
-        if different[row]:
-            chosen = torch.zeros(count, dtype=torch.bool, device=values.device)
-            chosen[blocks[row][blocks[row] >= 0].long()] = True
-            gap = float(values[~chosen].max() - values[chosen].min())
-            report["worst_boundary_violation"] = max(report["worst_boundary_violation"], gap / scale)
-    assert report["max_logit_error"] <= 1e-6 and report["worst_boundary_violation"] <= 1e-5, report
+@torch.no_grad()
+def check_decode(source, actual=None, *, logits=None, q=None, compressed=None):
+    """Check the actual selection/logits; a supplied result is never replaced by another launch."""
+    inputs = source.inputs
+    if actual is None:
+        actual, logits = indexer._decode_select(**inputs)
+    q = inputs["q"] if q is None else q
+    cache = inputs["cache"] if compressed is None else compressed
+    assert actual.shape == (q.shape[0], WIDTH) and actual.dtype == torch.int32, "decode token frame"
+    if logits is not None:
+        assert logits.shape == (q.shape[0], inputs["page_table"].shape[1] * 16) and logits.dtype == torch.float32
+    report = dict(rows=q.shape[0], width=inputs["page_table"].shape[1] * 16, heads=q.shape[1],
+                  different_token_sets=0, max_relative_logit_error=0.0, worst_relative_boundary_violation=0.0)
+    for row, count in enumerate(inputs["lengths"].cpu().tolist()):
+        pages = inputs["page_table"][row, :math.ceil(count / 16)].long()
+        slots = (pages[:, None] * 16 + torch.arange(16, device=q.device)).flatten()[:count]
+        exact = _scores(q[row:row + 1, :HEADS], cache.reshape(-1, DIM)[slots])
+        positions, sequences = inputs["query_positions"][row:row + 1], inputs["sequence_lengths"][row:row + 1]
+        counts = _counts(positions, sequences)
+        assert int(counts[0]) == count, "decode compressed length disagrees with the token frame"
+        checked = assert_topk(actual[row:row + 1], positions, sequences, exact)
+        report["worst_relative_boundary_violation"] = max(report["worst_relative_boundary_violation"],
+                                                            checked["worst_relative_boundary_violation"])
+        tokens = expand_reference(_selected_reference(exact, counts), positions, sequences)
+        report["different_token_sets"] += int(not torch.equal(actual[row].sort().values, tokens[0].sort().values))
+        if logits is not None:
+            assert bool(torch.isneginf(logits[row, count:math.ceil(count / 16) * 16]).all()), "partial-page padding"
+            if count:
+                scale = exact.abs().max().clamp_min(1e-30)
+                error = float((logits[row, :count].double() - exact[0]).abs().max() / scale)
+                assert math.isfinite(error) and error <= 1e-6, {"relative_logit_error": error}
+                report["max_relative_logit_error"] = max(report["max_relative_logit_error"], error)
+    report["logits_checked"] = logits is not None
     return report
 
 
-def decode_forward_case(lengths, device, *, padding=0, seed=17, capture=None, context=65536):
-    """CUDA-graph decode rows over page-aligned request slots; graph metadata from SGLang's own refresh.
-
-    Request r (1..R) owns raw slots [64 * (1 + (r - 1) * P), ...) of a P-page row; padding rows use
-    SGLang's graph fill (request 0, length 1) and only touch the dump ring rows 0..3 / slot 0.
-    """
+@torch.no_grad()
+def decode_forward_case(lengths, device, *, padding=0, seed=17, context=65536):
+    """Static tensor buffers for after-projection decode, with page-64 request allocation."""
+    if not lengths or min(lengths) < 1 or max(lengths) > context or context % PAGE or padding < 0:
+        raise ValueError("Require positive lengths within a page-64 context and nonnegative padding")
     generator = torch.Generator(device=device).manual_seed(seed)
-    requests, rows, pages = len(lengths), len(lengths) + padding, context // 64
+    requests, rows, pages = len(lengths), len(lengths) + padding, context // PAGE
     table = torch.zeros((requests + 1, context), dtype=torch.int32, device=device)
     for request in range(1, requests + 1):
-        table[request] = 64 * (1 + (request - 1) * pages) + torch.arange(context, dtype=torch.int32, device=device)
-    slots = -(-(64 * (1 + requests * pages) // RATIO) // 16) * 16
-    if capture is None:
-        weights = dict(index_qk_weight=torch.randn((640, 2560), generator=generator, device=device) / 50,
-                       q_norm_weight=torch.randn(128, generator=generator, device=device) / 4,
-                       k_norm_weight=torch.randn(128, generator=generator, device=device) / 4)
-        cache = torch.randn((context + 64, 64), generator=generator, device=device).to(torch.bfloat16)
-        module, name = _module(weights, cache, 3, device), "synthetic"
-    else:
-        module, name = load(capture, device).module, capture.stem
-    sequences = torch.tensor(list(lengths) + [1] * padding, dtype=torch.int32, device=device)
-    buffers = dict(sequence_lengths=sequences, token_to_batch_idx=torch.arange(rows, dtype=torch.int32, device=device),
-                   token_slot_table=torch.zeros((rows, 1), dtype=torch.int32, device=device),
-                   out_cache_loc=torch.zeros(rows, dtype=torch.int64, device=device),
-                   req_pool_indices=torch.tensor(list(range(1, requests + 1)) + [0] * padding, dtype=torch.int32,
-                                                 device=device),
-                   graph_write_locs=torch.zeros(rows, dtype=torch.int32, device=device),
-                   graph_compressed_page_table=torch.zeros((rows, pages), dtype=torch.int32, device=device),
-                   graph_compressed_lengths=torch.zeros(rows, dtype=torch.int32, device=device),
-                   graph_prefix_lengths=(sequences - 1).clamp_min(0),
-                   decode_logical_positions=torch.zeros(rows, dtype=torch.int32, device=device),
-                   pending_ring_slots=torch.zeros(rows, dtype=torch.int64, device=device),
-                   graph_ring_group_locs=torch.zeros((rows, RATIO), dtype=torch.int32, device=device))
-    case = SimpleNamespace(name=f"{name}_n{'-'.join(map(str, lengths))}_pad{padding}", layer=module.layer_id,
-                           module=module, table=table, buffers=buffers, requests=requests, rows=rows,
-                           state=_state(device, (requests + 1) * RATIO, slots, seed),
-                           hidden=torch.empty((rows, 2560), dtype=torch.bfloat16, device=device),
-                           positions=torch.empty((3, rows), dtype=torch.int64, device=device), generator=generator)
-    # Ring slot p % 4 of request r last held position p; compression RoPE reads member 0's coordinates.
-    rope = case.state["rope_state"]
-    rope.zero_()
-    for request, length in enumerate(lengths, start=1):
+        table[request] = PAGE * (1 + (request - 1) * pages) + torch.arange(context, device=device)
+    slots = (1 + requests * pages) * 16
+    state = _state(device, (requests + 1) * RATIO, slots, generator)
+    for request, length in enumerate(lengths, 1):
         for position in range(max(0, length - 1 - RATIO), length - 1):
-            rope[request * RATIO + position % RATIO] = torch.tensor([position, position + 3, position + 7])
-    decode_step(case, lengths)
-    return case
+            state["rope_state"][request * RATIO + position % RATIO] = torch.tensor(
+                (position, position + 3, position + 7), device=device)
+    parameters = _parameters(generator, device, context)
+    inputs = dict(qk=torch.empty((rows, (HEADS + 1) * DIM), dtype=torch.bfloat16, device=device),
+                  positions=torch.empty((3, rows), dtype=torch.int64, device=device),
+                  state_slots=torch.empty(rows, dtype=torch.int64, device=device),
+                  group_locs=torch.empty((rows, RATIO), dtype=torch.int32, device=device),
+                  write_locs=torch.empty(rows, dtype=torch.int32, device=device),
+                  page_table=torch.empty((rows, pages), dtype=torch.int32, device=device),
+                  lengths=torch.empty(rows, dtype=torch.int32, device=device),
+                  query_positions=torch.empty(rows, dtype=torch.int32, device=device),
+                  sequence_lengths=torch.empty(rows, dtype=torch.int32, device=device),
+                  **clone_state(state), **parameters)
+    inputs["cache"] = inputs["compressed"].view(-1, 16, 1, DIM)
+    source = SimpleNamespace(name=f"decode_forward_n{'-'.join(map(str, lengths))}_pad{padding}", inputs=inputs,
+                             state=state, table=table, requests=requests, rows=rows, padding=padding, context=context,
+                             host=dict(request_ids=tuple(range(1, requests + 1)) + (0,) * padding),
+                             generator=generator)
+    decode_step(source, lengths)
+    return source
 
 
-def decode_step(case, lengths):
-    """Write this step's lengths, hidden states and 3-axis positions into the static graph inputs."""
-    from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
-
-    device = case.hidden.device
-    case.buffers["sequence_lengths"][:case.requests].copy_(torch.tensor(lengths, dtype=torch.int32))
-    case.buffers["graph_prefix_lengths"].copy_((case.buffers["sequence_lengths"] - 1).clamp_min(0))
-    QwenSparseAttnBackend._update_qsa_cuda_graph_metadata(SimpleNamespace(req_to_token=case.table),
-                                                          _decode_metadata(case, _pool(case.state, case.layer)),
-                                                          case.buffers["req_pool_indices"])
-    case.hidden.copy_(torch.randn(case.hidden.shape, generator=case.generator, device=device))
-    logical = case.buffers["decode_logical_positions"].long()
-    case.positions.copy_(torch.stack([logical, logical + 3, logical + 7]))
-
-
-def _decode_metadata(case, pool):
-    from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
-
-    return QSAIndexerMetadata(token_to_kv_pool=pool, compress_ratio=RATIO, block_topk=TOPK, is_cuda_graph=True,
-                              **case.buffers)
-
-
-def _decode_batch(case):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-    return SimpleNamespace(forward_mode=ForwardMode.DECODE, positions=None, extend_seq_lens_cpu=None,
-                           seq_lens_cpu=case.buffers["sequence_lengths"].cpu())
+@torch.no_grad()
+def decode_step(source, lengths):
+    """Refresh host metadata and existing tensor contents, never graph-visible addresses."""
+    if len(lengths) != source.requests or min(lengths) < 1 or max(lengths) > source.context:
+        raise ValueError("decode step must preserve the request frame and fit the context")
+    inputs, device = source.inputs, source.inputs["qk"].device
+    if max(lengths) + 6 >= inputs["cos_sin_cache"].shape[0]:
+        raise ValueError("RoPE cache does not cover this step's three position axes")
+    source.host["sequence_lengths"] = tuple(lengths) + (1,) * source.padding
+    source.host["compressed_lengths"] = tuple(n // RATIO for n in source.host["sequence_lengths"])
+    source.seq_lens = source.host["sequence_lengths"]
+    sequences = torch.tensor(source.seq_lens, dtype=torch.int64, device=device)
+    requests = torch.tensor(source.host["request_ids"], dtype=torch.int64, device=device)
+    positions = sequences - 1
+    inputs["sequence_lengths"].copy_(sequences)
+    inputs["query_positions"].copy_(positions)
+    inputs["lengths"].copy_(sequences // RATIO)
+    inputs["positions"].copy_(torch.stack((positions, positions + 3, positions + 7)))
+    inputs["state_slots"].copy_(requests * RATIO + positions % RATIO)
+    members = (positions[:, None] - torch.arange(RATIO - 1, -1, -1, device=device)).clamp_min(0)
+    inputs["group_locs"].copy_(requests[:, None] * RATIO + members % RATIO)
+    last_slots = source.table[requests, positions].long()
+    inputs["write_locs"].copy_(torch.where(sequences % RATIO == 0, last_slots // RATIO, 0))
+    inputs["page_table"].copy_(source.table[requests, ::PAGE].long() // PAGE)
+    inputs["qk"].copy_(torch.randn(inputs["qk"].shape, generator=source.generator, device=device))
 
 
-def check_decode_forward(case, base_pool, new_pool, actual, q, expected):
-    """Bit-exact q/ring/compressed writes vs SGLang (dump ring rows 0..3 and slot 0 excluded: padding and
-    non-boundary rows race there in both), then tie-aware selections."""
-    rows = case.rows
-    with _production_rope(), torch.no_grad():
-        q_base = case.module.project_qk(case.hidden[:rows], case.positions[:, :rows])[0]
-    torch.cuda.synchronize()
-    assert torch.equal(q, q_base), "normed/rotated decode Q must be bit-exact"
-    report = dict(case=case.name)
-    for name, lo in (("key_state", RATIO), ("rope_state", RATIO), ("compressed", 1)):
-        old, a, b = case.state[name][lo:], _buffer(new_pool, name)[lo:], _buffer(base_pool, name)[lo:]
-        assert torch.equal(a, b), name
-        report[f"{name}_rows_written"] = int((b != old).flatten(1).any(1).sum())
-    meta = _decode_metadata(case, new_pool)
-    cache, table, lengths, width = meta.get_decode_mqa_inputs(case.layer)
-    view = SimpleNamespace(q=q, cache=cache, table=table, lengths=lengths, width=width, module=case.module,
-                           positions=meta.decode_logical_positions, sequences=meta.get_seqlens_int32())
-    report["selection"] = check_decode(view, actual, expected)
+@torch.no_grad()
+def check_decode_forward(source, actual=None, *, q=None, logits=None, expected=None):
+    expected = reference_prep(source.inputs, source.state, decode=True) if expected is None else expected
+    if actual is None:
+        actual, q, logits = indexer._decode_forward(**source.inputs)
+    if q is not None:
+        assert_exact(q, expected.q, "decode Q must be bitexact, including padding rows")
+    report = dict(case=source.name, q_checked=q is not None, **assert_state(source, expected))
+    report["selection"] = check_decode(source, actual, logits=logits, q=expected.q,
+                                       compressed=expected.state["compressed"])
     return report
-
-
-DECODE_FORWARD_CASES = (((1,), 0), ((4,), 0), ((5, 8, 3, 12), 1), ((12000, 11888, 11667, 11851), 0),
-                        ((4001, 6, 1022, 2), 2), (tuple(3000 + 37 * i for i in range(29)), 3), ((65536,), 0))
-
-
-# Formal decode shapes: decode rows (graph batch) x compressed keys per row, 4096-page (262144-token) tables.
-DECODE_BENCH = tuple((rows, keys) for rows in (1, 8, 32) for keys in (3000, 16384, 65536))
-
-
-# Formal decode-forward shapes: graph rows x sequence length (tokens); tables are 4096 pages wide like the
-# 262144-token server graphs.
-DECODE_FORWARD_BENCH = tuple((rows, length) for rows in (1, 8, 32) for length in (12000, 65536, 262144))

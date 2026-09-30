@@ -53,9 +53,9 @@ def _sort_blocks(values):
     return tl.reshape(cube, (512,))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_BLOCKS"])
 def attention_recover_scatter(Indices, Positions, Lengths, SequenceIds, Blocks, Errors,
-            Dense=None, QueryTiles=None, Meta=None, MAX_BLOCKS: tl.constexpr = 0,
+            Dense=None, QueryTiles=None, Meta=None, MAX_BLOCKS=0,
             REVERSE: tl.constexpr = False):
     row = tl.num_programs(0) - 1 - tl.program_id(0) if REVERSE else tl.program_id(0)
     position = tl.load(Positions + row)
@@ -107,7 +107,7 @@ def attention_recover_scatter(Indices, Positions, Lengths, SequenceIds, Blocks, 
 
 @triton.jit
 def _masks(Blocks, Membership, Masks, tile, count, common_tiles, rows, position, length,
-           QB: tl.constexpr, CAP: tl.constexpr, B: tl.constexpr, part, PARTS: tl.constexpr):
+           QB: tl.constexpr, CAP, B: tl.constexpr, part, PARTS: tl.constexpr):
     columns = tl.arange(0, B)
     end = tl.cdiv(count, 16) * QB * 4
     for start in tl.range(common_tiles * QB * 4 + part * B, end, B * PARTS, loop_unroll_factor=1):
@@ -128,9 +128,9 @@ def _masks(Blocks, Membership, Masks, tile, count, common_tiles, rows, position,
         tl.store(Masks + tile * (CAP // 16) * QB * 4 + index, result, index < end)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_BLOCKS", "CAPACITY"])
 def attention_compact(Dense, Blocks, Membership, Counts, Meta, Active,
-            MAX_BLOCKS: tl.constexpr, CAPACITY: tl.constexpr, C: tl.constexpr,
+            MAX_BLOCKS, CAPACITY, C: tl.constexpr,
             RHO: tl.constexpr, PACKED_DIRECT: tl.constexpr = False,
         CLEAR: tl.constexpr = False, REVERSE: tl.constexpr = False):
     tile = tl.num_programs(0) - 1 - tl.program_id(0) if REVERSE else tl.program_id(0)
@@ -188,7 +188,7 @@ def attention_compact(Dense, Blocks, Membership, Counts, Meta, Active,
 
 @triton.jit
 def _order(Counts, Active, Order, program,
-           TASKS: tl.constexpr, HK: tl.constexpr, SLICES: tl.constexpr, GRID: tl.constexpr,
+           TASKS, HK: tl.constexpr, SLICES: tl.constexpr, GRID,
            SIZE: tl.constexpr, SHIFT: tl.constexpr, WIDE: tl.constexpr):
     rank = program * SIZE + tl.arange(0, SIZE)
     tile = (rank % (TASKS // HK)) // SLICES
@@ -206,17 +206,17 @@ def _order(Counts, Active, Order, program,
     tl.store(Order + destination, task.to(tl.int32), destination < tl.cdiv(TASKS, GRID) * GRID)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS", "TASKS", "GRID", "ORDER_CTAS", "CAP", "TILES"])
 def attention_order_masks_validate(Errors, Valid, Counts=None, Active=None, Order=None,
-           ROWS: tl.constexpr = 0, TASKS: tl.constexpr = 0, HK: tl.constexpr = 1,
-           SLICES: tl.constexpr = 1, GRID: tl.constexpr = 1, SIZE: tl.constexpr = 1,
+           ROWS=0, TASKS=0, HK: tl.constexpr = 1,
+           SLICES: tl.constexpr = 1, GRID=1, SIZE: tl.constexpr = 1,
            SHIFT: tl.constexpr = 1, WIDE: tl.constexpr = False, CHECK: tl.constexpr = True,
-           Blocks=None, Membership=None, Meta=None, Masks=None, ORDER_CTAS: tl.constexpr = 1,
-           QB: tl.constexpr = 1, CAP: tl.constexpr = 16, B: tl.constexpr = 256,
-           PARTS: tl.constexpr = 4, REVERSE: tl.constexpr = False, TILES: tl.constexpr = 1):
+           Blocks=None, Membership=None, Meta=None, Masks=None, ORDER_CTAS=1,
+           QB: tl.constexpr = 1, CAP=16, B: tl.constexpr = 256,
+           PARTS: tl.constexpr = 4, REVERSE: tl.constexpr = False, TILES=1):
     program = tl.program_id(0)
     if Masks is None or program < ORDER_CTAS:
-        if TASKS:
+        if Counts is not None:
             _order(Counts, Active, Order, program, TASKS, HK, SLICES, GRID, SIZE, SHIFT, WIDE)
         if CHECK and program == 0:
             lanes = tl.arange(0, 1024)
@@ -240,8 +240,8 @@ def attention_order_masks_validate(Errors, Valid, Counts=None, Active=None, Orde
                    QB, CAP, B, part, PARTS)
 
 
-@triton.jit
-def attention_scatter_prepared(Blocks, Positions, Meta, Dense, MAX_BLOCKS: tl.constexpr):
+@triton.jit(do_not_specialize=["MAX_BLOCKS"])
+def attention_scatter_prepared(Blocks, Positions, Meta, Dense, MAX_BLOCKS):
     # Prepared-only callers may rebuild a separate plan from recovered blocks.
     tile, local = tl.program_id(0), tl.program_id(1)
     first = tl.load(Meta + tile * 5)

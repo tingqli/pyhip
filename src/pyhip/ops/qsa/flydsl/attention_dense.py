@@ -32,6 +32,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 from pyhip.ops.mha.flydsl import _common as base
 from pyhip.ops.mha.flydsl import mha_pa_bf16_256_linear_942 as native
 from pyhip.ops.mha.flydsl._common import (
@@ -318,7 +319,7 @@ def _bounded_dma(
         offset.ir_value(),
         fx.Int32(0).ir_value(),
         fx.Int32(0).ir_value(),
-        fx.Int32(0).ir_value(),
+        aux=rocdl_aux(0),
     )
 
 
@@ -335,12 +336,13 @@ def _bounded_body(
     qb,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
-    NK: fx.Constexpr[int],
+    NK: fx.Int32,
     SCALE: fx.Constexpr[float],
     STAGGER: fx.Constexpr[bool],
+    ALIGNED: fx.Constexpr[bool],
 ):
     read_k, read_v, dma, pv = native._read_k, native._read_v, _bounded_dma, native._pv
-    if fx.const_expr(NK % BN == 0):
+    if fx.const_expr(ALIGNED):
         dma = _aligned_dma
     dma_offsets, v_operands = native._dma_offsets, native._v_operands
     qk, local_sum, local_max, cross = base._qk, base._sum, base._max, base._cross
@@ -636,10 +638,11 @@ def _bounded_kernel(
     CK: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
-    NK: fx.Constexpr[int],
-    NQ: fx.Constexpr[int],
+    NK: fx.Int32,
+    NQ: fx.Int32,
     SCALE: fx.Constexpr[float],
     CUS: fx.Constexpr[int],
+    ALIGNED: fx.Constexpr[bool],
 ):
     body = _bounded_body
     storage = (
@@ -660,9 +663,9 @@ def _bounded_kernel(
             head, qb = rank % H, query_blocks - 1 - rank // H
             group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
             if group != 0:
-                body(Q, K, V, O, CQ, CK, storage, head, qb, H, HK, NK, SCALE, True)
+                body(Q, K, V, O, CQ, CK, storage, head, qb, H, HK, NK, SCALE, True, ALIGNED)
             else:
-                body(Q, K, V, O, CQ, CK, storage, head, qb, H, HK, NK, SCALE, False)
+                body(Q, K, V, O, CQ, CK, storage, head, qb, H, HK, NK, SCALE, False, ALIGNED)
         work = work + CUS
 
 
@@ -676,31 +679,34 @@ def _bounded_launch(
     CK: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
-    NK: fx.Constexpr[int],
-    NQ: fx.Constexpr[int],
+    NK: fx.Int32,
+    NQ: fx.Int32,
     SCALE: fx.Constexpr[float],
     CUS: fx.Constexpr[int],
+    ALIGNED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     tasks = H * ((NQ + BM - 1) // BM)
-    _bounded_kernel(
-        Q,
-        K,
-        V,
-        O,
-        CQ,
-        CK,
-        H,
-        HK,
-        NK,
-        NQ,
-        SCALE,
-        CUS,
-        value_attrs={
-            "rocdl.waves_per_eu": 2,
-            "passthrough": [["target-features", "-packed-fp32-ops"]],
-        },
-    ).launch(grid=(min(CUS, tasks), 1, 1), block=(THREADS, 1, 1), stream=stream)
+    if NQ > 0:
+        _bounded_kernel(
+            Q,
+            K,
+            V,
+            O,
+            CQ,
+            CK,
+            H,
+            HK,
+            NK,
+            NQ,
+            SCALE,
+            CUS,
+            ALIGNED,
+            value_attrs={
+                "rocdl.waves_per_eu": 2,
+                "passthrough": [["target-features", "-packed-fp32-ops"]],
+            },
+        ).launch(grid=(_min(fx.Int32(CUS), tasks), 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
 _BOUNDED_COMPILED = {}
@@ -729,16 +735,16 @@ def _run_bounded(
         call.q_count,
         float(scale),
         num_cus,
+        call.kv_count % BN == 0,
         stream,
     )
     key = (
         q.device,
         q.shape[1],
         k.shape[1],
-        call.kv_count,
-        call.q_count,
         float(scale),
         num_cus,
+        call.kv_count % BN == 0,
     )
     with torch.cuda.device(q.device), torch.cuda.stream(stream):
         compiled = _BOUNDED_COMPILED.get(key)
@@ -747,9 +753,13 @@ def _run_bounded(
                 raise RuntimeError(
                     "Warm this bounded dense specialization before graph capture"
                 )
-            _BOUNDED_COMPILED[key] = flyc.compile(_bounded_launch, *args)
-        else:
-            compiled(*args)
+            for aligned in (False, True):
+                family_key = (*key[:-1], aligned)
+                _BOUNDED_COMPILED[family_key] = flyc.compile(
+                    _bounded_launch, *args[:9], 0, args[10], args[11], aligned, stream
+                )
+            compiled = _BOUNDED_COMPILED[key]
+        compiled(*args)
 
 
 __all__ = ["DenseCall", "DensePlan", "prepare", "run"]

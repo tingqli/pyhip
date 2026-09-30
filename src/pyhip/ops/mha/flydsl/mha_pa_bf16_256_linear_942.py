@@ -15,6 +15,7 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, rocdl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 if __package__:
     from . import _common as base
@@ -127,7 +128,7 @@ def _dma(resource, storage, wave, lane, rows, tile, kv_len, hk, packet, is_v, ex
         f"s_add_u32 $0, $1, {immediate}", "=s,s,~{scc}", has_side_effects=True))
     rocdl.raw_ptr_buffer_load_lds(resource, fx.to_llvm_ptr(fx.get_iter(storage) + destination),
         fx.Int32(4).ir_value(), offset.ir_value(), fx.Int32(scalar).ir_value(),
-        fx.Int32(0).ir_value(), fx.Int32(0).ir_value())
+        fx.Int32(0).ir_value(), aux=rocdl_aux(0))
 
 
 def _read_k(addresses, half, lower_first=False):

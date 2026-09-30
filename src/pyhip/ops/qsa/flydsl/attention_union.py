@@ -13,6 +13,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 from pyhip.ops.mha.flydsl import _common as base
 from pyhip.ops.mha.flydsl import mha_pa_bf16_256_linear_942 as linear
 from pyhip.ops.mha.flydsl._common import (
@@ -46,7 +47,7 @@ def _source_rows(table, tile, count, wave, hk):
             table,
             fx.Int32(index * 4).ir_value(),
             fx.Int32(0).ir_value(),
-            fx.Int32(0).ir_value(),
+            aux=rocdl_aux(0),
         )
     )
     return block * (4 * hk * D * 2) + (wave >> 2) * 256
@@ -111,7 +112,7 @@ def _bounded_dma(
         fx.Int32(offset).ir_value(),
         fx.Int32(0).ir_value(),
         fx.Int32(0).ir_value(),
-        fx.Int32(0).ir_value(),
+        aux=rocdl_aux(0),
     )
 
 
@@ -229,9 +230,9 @@ def _body(
     work,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
-    NQ: fx.Constexpr[int],
-    NK: fx.Constexpr[int],
-    CAP: fx.Constexpr[int],
+    NQ: fx.Int32,
+    NK: fx.Int32,
+    CAP: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
     SCALE: fx.Constexpr[float],
@@ -611,13 +612,13 @@ def _kernel(
     ORDER: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
-    NQ: fx.Constexpr[int],
-    NK: fx.Constexpr[int],
-    CAP: fx.Constexpr[int],
+    NQ: fx.Int32,
+    NK: fx.Int32,
+    CAP: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
-    TASKS: fx.Constexpr[int],
-    GRID: fx.Constexpr[int],
+    TASKS: fx.Int32,
+    GRID: fx.Int32,
     SCALE: fx.Constexpr[float],
     TAIL_BOUNDS: fx.Constexpr[bool],
 ):
@@ -702,44 +703,45 @@ def _launch(
     ORDER: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
-    NQ: fx.Constexpr[int],
-    NK: fx.Constexpr[int],
-    CAP: fx.Constexpr[int],
+    NQ: fx.Int32,
+    NK: fx.Int32,
+    CAP: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
-    TASKS: fx.Constexpr[int],
-    GRID: fx.Constexpr[int],
+    TASKS: fx.Int32,
+    GRID: fx.Int32,
     SCALE: fx.Constexpr[float],
     TAIL_BOUNDS: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
-    _kernel(
-        Q,
-        K,
-        V,
-        O,
-        META,
-        BLOCKS,
-        MEMBERS,
-        COUNTS,
-        ACTIVE,
-        ORDER,
-        H,
-        HK,
-        NQ,
-        NK,
-        CAP,
-        BQ,
-        GP,
-        TASKS,
-        GRID,
-        SCALE,
-        TAIL_BOUNDS,
-        value_attrs={
-            "rocdl.waves_per_eu": 2,
-            "passthrough": [["target-features", "-packed-fp32-ops"]],
-        },
-    ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
+    if GRID > 0:
+        _kernel(
+            Q,
+            K,
+            V,
+            O,
+            META,
+            BLOCKS,
+            MEMBERS,
+            COUNTS,
+            ACTIVE,
+            ORDER,
+            H,
+            HK,
+            NQ,
+            NK,
+            CAP,
+            BQ,
+            GP,
+            TASKS,
+            GRID,
+            SCALE,
+            TAIL_BOUNDS,
+            value_attrs={
+                "rocdl.waves_per_eu": 2,
+                "passthrough": [["target-features", "-packed-fp32-ops"]],
+            },
+        ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
 _COMPILED = {}
@@ -777,24 +779,18 @@ def run(*, inputs, plan, out):
         ),
         stream,
     )
-    key = (
-        inputs.q.device,
-        tuple(
-            (
-                (a.dtype, tuple(a.shape), tuple(a.stride()))
-                if isinstance(a, torch.Tensor)
-                else ("stream",) if isinstance(a, torch.cuda.Stream) else a
-            )
-            for a in args
-        ),
-    )
+    key = (inputs.q.device, args[10], args[11], args[15], args[16], args[19], args[20])
     with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
         compiled = _COMPILED.get(key)
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm the QSA specialization before graph capture")
-            _COMPILED[key] = flyc.compile(_launch, *args)
-        else:
-            compiled(*args)
+            for tail_bounds in (False, True):
+                family_key = (*key[:-1], tail_bounds)
+                _COMPILED[family_key] = flyc.compile(
+                    _launch, *args[:18], 0, args[19], tail_bounds, stream
+                )
+            compiled = _COMPILED[key]
+        compiled(*args)
 
 

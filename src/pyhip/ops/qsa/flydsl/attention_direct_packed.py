@@ -13,6 +13,7 @@ import torch
 from flydsl._mlir import ir
 from flydsl.expr import gpu, rocdl
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 from pyhip.ops.mha.flydsl._common import (
     _buffer,
     _buffer_words,
@@ -46,7 +47,8 @@ def _pack_block(kr, vr, pk, pv, pair, half, lane, n, hk):
     ) * 2
     target = valid.select(target, fx.Int32(extent))
     rocdl.raw_ptr_buffer_store(
-        key.ir_value(), pk, target.ir_value(), fx.Int32(0).ir_value()
+        key.ir_value(), pk, target.ir_value(), fx.Int32(0).ir_value(),
+        aux=rocdl_aux(0),
     )
     vector = _buffer_words(vr, source)
     words = [vector[i] for i in range(4)]
@@ -80,7 +82,8 @@ def _pack_block(kr, vr, pk, pv, pair, half, lane, n, hk):
         fx.Int32(extent),
     )
     rocdl.raw_ptr_buffer_store(
-        output.ir_value(), pv, target.ir_value(), fx.Int32(0).ir_value()
+        output.ir_value(), pv, target.ir_value(), fx.Int32(0).ir_value(),
+        aux=rocdl_aux(0),
     )
 
 
@@ -99,7 +102,7 @@ def _pack_body(K, V, PK, PV, N, HK):
 @flyc.kernel(name="attention_pack_kv_bf16_d256")
 def _pack(
     K: fx.Tensor, V: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor,
-    N: fx.Constexpr[int], HK: fx.Constexpr[int],
+    N: fx.Int32, HK: fx.Constexpr[int],
 ):
     _pack_body(K, V, PK, PV, N, HK)
 
@@ -107,7 +110,7 @@ def _pack(
 @flyc.kernel(name="attention_pack_kv_bf16_d256")
 def _pack_gated(
     K: fx.Tensor, V: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor, ACTIVE: fx.Tensor,
-    N: fx.Constexpr[int], HK: fx.Constexpr[int], COUNT: fx.Constexpr[int],
+    N: fx.Int32, HK: fx.Constexpr[int], COUNT: fx.Int32,
 ):
     lane = fx.Int32(gpu.thread_id("x")) & 63
     needed = fx.Int32(0)
@@ -241,7 +244,7 @@ def _rescale(output0, output1, alpha):
 def _body(
     Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
     BLOCKS: fx.Tensor, META: fx.Tensor, ACTIVE: fx.Tensor, QUERY_TILES: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Constexpr[int], NK: fx.Constexpr[int],
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Int32, NK: fx.Int32,
     GATED: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
 ):
     storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, 8192, 16]).peek().view(fx.make_layout(8192, 1))
@@ -353,7 +356,7 @@ def _body(
 def _kernel(
     Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
     BLOCKS: fx.Tensor, META: fx.Tensor, ACTIVE: fx.Tensor, QUERY_TILES: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Constexpr[int], NK: fx.Constexpr[int],
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Int32, NK: fx.Int32,
     GATED: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
 ):
     if fx.const_expr(GATED):
@@ -370,28 +373,51 @@ def _kernel(
 def _launch(
     Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor,
     BLOCKS: fx.Tensor, META: fx.Tensor, ACTIVE: fx.Tensor, QUERY_TILES: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Constexpr[int], NK: fx.Constexpr[int],
-    TASKS: fx.Constexpr[int], GATED: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
-    ACTIVE_COUNT: fx.Constexpr[int], stream: fx.Stream,
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Int32, NK: fx.Int32,
+    TASKS: fx.Int32, GATED: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
+    ACTIVE_COUNT: fx.Int32, stream: fx.Stream,
 ):
-    if fx.const_expr(GATED):
-        _pack_gated(K, V, PK, PV, ACTIVE, NK, HK, ACTIVE_COUNT).launch(
-            grid=((NK // 4 * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
-        )
-    else:
-        _pack(K, V, PK, PV, NK, HK).launch(
-            grid=((NK // 4 * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
-        )
-    _kernel(
-        Q, PK, PV, O, BLOCKS, META, ACTIVE, QUERY_TILES,
-        H, HK, NQ, NK, GATED, SCALE,
-        value_attrs={
-            "llvm.target_features": ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')
-        },
-    ).launch(grid=(TASKS, 1, 1), block=(64, 1, 1), stream=stream)
+    if TASKS > 0:
+        if fx.const_expr(GATED):
+            _pack_gated(K, V, PK, PV, ACTIVE, NK, HK, ACTIVE_COUNT).launch(
+                grid=((NK // 4 * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
+            )
+        else:
+            _pack(K, V, PK, PV, NK, HK).launch(
+                grid=((NK // 4 * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
+            )
+        _kernel(
+            Q, PK, PV, O, BLOCKS, META, ACTIVE, QUERY_TILES,
+            H, HK, NQ, NK, GATED, SCALE,
+            value_attrs={
+                "llvm.target_features": ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')
+            },
+        ).launch(grid=(TASKS, 1, 1), block=(64, 1, 1), stream=stream)
 
 
 _COMPILED = {}
+
+
+def _compile(*, inputs, prepared, out):
+    key = (inputs.q.device, inputs.q.shape[1], inputs.k.shape[1], prepared.gated, inputs.scale)
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm packed direct QSA before graph capture")
+        packed_key = inputs.k if prepared.packed_key is None else prepared.packed_key
+        packed_value = inputs.v if prepared.packed_value is None else prepared.packed_value
+        compiled = flyc.compile(
+            _launch,
+            inputs.q.view(-1), inputs.k.view(-1), inputs.v.view(-1), out.view(-1),
+            packed_key.view(-1), packed_value.view(-1),
+            prepared.source_blocks.view(-1), prepared.metadata.view(-1),
+            prepared.active, prepared.query_tiles,
+            inputs.q.shape[1], inputs.k.shape[1], inputs.q.shape[0], inputs.k.shape[0],
+            0, prepared.gated, inputs.scale, prepared.active.numel(),
+            torch.cuda.current_stream(inputs.q.device),
+        )
+        _COMPILED[key] = compiled
+    return compiled
 
 
 def run(*, inputs, prepared, out):
@@ -405,20 +431,7 @@ def run(*, inputs, prepared, out):
         prepared.num_tiles * inputs.k.shape[1], prepared.gated, inputs.scale,
         prepared.active.numel(), stream,
     )
-    key = (
-        inputs.q.device,
-        tuple(
-            (a.dtype, tuple(a.shape), tuple(a.stride())) if isinstance(a, torch.Tensor)
-            else ("stream",) if isinstance(a, torch.cuda.Stream) else a
-            for a in args
-        ),
-    )
     with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
-        compiled = _COMPILED.get(key)
-        if compiled is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("Warm packed direct QSA before graph capture")
-            _COMPILED[key] = flyc.compile(_launch, *args)
-        else:
-            compiled(*args)
+        compiled = _compile(inputs=inputs, prepared=prepared, out=out)
+        compiled(*args)
 

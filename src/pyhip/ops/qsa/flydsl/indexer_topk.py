@@ -17,6 +17,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith, llvm
 from flydsl.expr import gpu, rocdl
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 from pyhip.ops.mha.flydsl._common import _buffer, _uniform
 
 WAVES, TOPK, RATIO = 4, 512, 4
@@ -58,7 +59,7 @@ def _add(address):
 
 def _put(output, index, value):
     rocdl.raw_ptr_buffer_store(fx.Int32(value).ir_value(), output, (fx.Int32(index) * 4).ir_value(),
-                               fx.Int32(0).ir_value())
+                               fx.Int32(0).ir_value(), aux=rocdl_aux(0))
 
 
 def _sync():
@@ -131,7 +132,7 @@ def _group(logits, base, group, lane):
     offset = base + (group * (64 * UNROLL) + lane) * 4
     return fx.Vector.from_elements(
         [fx.Float32(rocdl.raw_ptr_buffer_load(fx.Float32.ir_type, logits, (offset + i * 256).ir_value(),
-                                              fx.Int32(0).ir_value(), fx.Int32(0).ir_value()))
+                                              fx.Int32(0).ir_value(), aux=rocdl_aux(0)))
          for i in range(UNROLL)], fx.Float32)
 
 
@@ -403,14 +404,7 @@ def _select(logits, base, count, lane, bins, chosen, output):
 
 
 @flyc.jit
-def _row(LOGITS, stride, row0, POSITIONS, ROW_INFO, OUT, VALID, local, lane, bins, chosen):
-    row = row0 + local
-    expected, length = _uniform(ROW_INFO[2 * row]), _uniform(ROW_INFO[2 * row + 1])
-    if (lane == 0) & (fx.Int64(POSITIONS[row]) != fx.Int64(expected)):
-        VALID[0] = fx.Int32(0)
-    visible = expected + 1
-    count = visible // RATIO
-    count = (count < length // RATIO).select(count, length // RATIO)
+def _write_row(LOGITS, stride, local, row, count, visible, length, OUT, lane, bins, chosen):
     output = _buffer(fx.make_view(fx.get_iter(OUT) + fx.Int64(row) * WIDTH, fx.make_layout(1, 1)), WIDTH * 4)
     blocks = count
     if count <= TOPK:
@@ -428,6 +422,18 @@ def _row(LOGITS, stride, row0, POSITIONS, ROW_INFO, OUT, VALID, local, lane, bin
         token = tail_start + offset
         value = ((offset < RATIO - 1) & (offset < tail_count) & (token < length)).select(token, fx.Int32(-1))
         _put(output, column, value)
+
+
+@flyc.jit
+def _row(LOGITS, stride, row0, POSITIONS, ROW_INFO, OUT, VALID, local, lane, bins, chosen):
+    row = row0 + local
+    expected, length = _uniform(ROW_INFO[2 * row]), _uniform(ROW_INFO[2 * row + 1])
+    if (lane == 0) & (fx.Int64(POSITIONS[row]) != fx.Int64(expected)):
+        VALID[0] = fx.Int32(0)
+    visible = expected + 1
+    count = visible // RATIO
+    count = (count < length // RATIO).select(count, length // RATIO)
+    _write_row(LOGITS, stride, local, row, count, visible, length, OUT, lane, bins, chosen)
 
 
 @flyc.kernel(name="qsa_indexer_topk", known_block_size=[256, 1, 1])
@@ -463,5 +469,46 @@ def launch(logits, stride, row0, rows, positions, row_info, out, valid):
         compiled = _COMPILED.get(logits.device)
         if compiled is None:
             _COMPILED[logits.device] = flyc.compile(_launch, *args)
+        else:
+            compiled(*args)
+
+
+@flyc.kernel(name="qsa_indexer_decode_topk", known_block_size=[256, 1, 1])
+def _decode_kernel(LOGITS: fx.Tensor, stride: fx.Int32, rows: fx.Int32, LENGTHS: fx.Tensor,
+                   POSITIONS: fx.Tensor, SEQUENCES: fx.Tensor, OUT: fx.Tensor):
+    storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, WAVES * (SCRATCH + CHOSEN), 16]).peek()
+    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(WAVES * (SCRATCH + CHOSEN), 1)))))
+    tid = fx.Int32(gpu.thread_id("x"))
+    wave, lane = _uniform(tid >> 6), tid & 63
+    row = _uniform(fx.Int32(gpu.block_id("x")) * WAVES + wave)
+    if row < rows:
+        count = _uniform(LENGTHS[row])
+        visible = _uniform(POSITIONS[row]) + 1
+        length = _uniform(SEQUENCES[row])
+        _write_row(LOGITS, stride, row, row, count, visible, length, OUT, lane,
+                   shared + wave * SCRATCH, shared + WAVES * SCRATCH + wave * CHOSEN)
+
+
+@flyc.jit
+def _launch_decode(LOGITS: fx.Tensor, stride: fx.Int32, rows: fx.Int32, LENGTHS: fx.Tensor,
+                   POSITIONS: fx.Tensor, SEQUENCES: fx.Tensor, OUT: fx.Tensor,
+                   ctas: fx.Int32, stream: fx.Stream):
+    _decode_kernel(LOGITS, stride, rows, LENGTHS, POSITIONS, SEQUENCES, OUT).launch(
+        grid=(ctas, 1, 1), block=(256, 1, 1), stream=stream)
+
+
+_COMPILED_DECODE = {}
+
+
+def launch_decode(logits, lengths, positions, sequence_lengths, out):
+    rows, stride = logits.shape
+    stream = torch.cuda.current_stream(logits.device)
+    args = (logits.view(-1), stride, rows, lengths, positions, sequence_lengths, out.view(-1),
+            -(-rows // WAVES), stream)
+    key = (logits.device, lengths.dtype, positions.dtype, sequence_lengths.dtype)
+    with torch.cuda.device(logits.device):
+        compiled = _COMPILED_DECODE.get(key)
+        if compiled is None:
+            _COMPILED_DECODE[key] = flyc.compile(_launch_decode, *args)
         else:
             compiled(*args)

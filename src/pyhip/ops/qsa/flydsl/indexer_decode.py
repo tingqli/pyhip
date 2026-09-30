@@ -12,7 +12,7 @@ with the 4 head scores of key j, so ReLU, head sum and scale stay in-lane. Lane 
 g) holds dims [32g, 32g + 32) of head c and of key c, so k-step s pairs dims 32g + 4s + [0, 4): a
 fixed permutation of the D=128 reduction (FP32 order differs from the Torch reference only in
 association). Keys [length, 16 * pages) get -inf and the rest of the row stays unwritten;
-SGLang's fast_topk reads only [0, length).
+the shared FlyDSL top-k masks candidates outside [0, length).
 """
 
 import flydsl.compiler as flyc
@@ -21,6 +21,7 @@ import torch
 from flydsl._mlir import ir
 from flydsl.expr import gpu, rocdl
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 from pyhip.ops.mha.flydsl._common import _buffer, _buffer_words, _uniform
 from .indexer_logits import _lds_load, _lds_store
 from .indexer_topk import _readlane, _sync
@@ -35,7 +36,7 @@ _DROP = 0x40000000
 
 def _buffer_word(resource, offset):
     return fx.Int32(rocdl.raw_ptr_buffer_load(fx.Int32.ir_type, resource, fx.Int32(offset).ir_value(),
-                                              fx.Int32(0).ir_value(), fx.Int32(0).ir_value()))
+                                              fx.Int32(0).ir_value(), aux=rocdl_aux(0)))
 
 
 def _page(keys, page, lane, valid):
@@ -118,7 +119,7 @@ def _kernel(Q: fx.Tensor, K: fx.Tensor, PAGES: fx.Tensor, LENGTHS: fx.Tensor, LO
                 value = _logit(query, [_lds_load(region + address) for address in read], scale)
                 value = (index * PAGE + column < length).select(value, fx.Float32(float("-inf")))
                 rocdl.raw_ptr_buffer_store(value.ir_value(), output, (index * (PAGE * 4) + target).ir_value(),
-                                           fx.Int32(0).ir_value())
+                                           fx.Int32(0).ir_value(), aux=rocdl_aux(0))
                 w0, w1, w2, w3 = n0, n1, n2, n3
 
 

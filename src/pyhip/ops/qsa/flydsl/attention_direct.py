@@ -303,11 +303,11 @@ def _body(
     QUERY_TILES: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
-    NQ: fx.Constexpr[int],
-    NK: fx.Constexpr[int],
+    NQ: fx.Int32,
+    NK: fx.Int32,
     BN: fx.Constexpr[int],
     THREADS: fx.Constexpr[int],
-    TASKS: fx.Constexpr[int],
+    TASKS: fx.Int32,
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
 ):
@@ -505,11 +505,11 @@ def _kernel(
     QUERY_TILES: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
-    NQ: fx.Constexpr[int],
-    NK: fx.Constexpr[int],
+    NQ: fx.Int32,
+    NK: fx.Int32,
     BN: fx.Constexpr[int],
     THREADS: fx.Constexpr[int],
-    TASKS: fx.Constexpr[int],
+    TASKS: fx.Int32,
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
 ):
@@ -578,40 +578,40 @@ def _launch(
     QUERY_TILES: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
-    NQ: fx.Constexpr[int],
-    NK: fx.Constexpr[int],
+    NQ: fx.Int32,
+    NK: fx.Int32,
     BN: fx.Constexpr[int],
     THREADS: fx.Constexpr[int],
-    TASKS: fx.Constexpr[int],
+    TASKS: fx.Int32,
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
     stream: fx.Stream,
 ):
-    _kernel(
-        Q,
-        K,
-        V,
-        O,
-        BLOCKS,
-        META,
-        ACTIVE,
-        QUERY_TILES,
-        H,
-        HK,
-        NQ,
-        NK,
-        BN,
-        THREADS,
-        TASKS,
-        GATED,
-        SCALE,
-        # gpu-to-rocdl preserves this typed attribute, not generic passthrough.
-        value_attrs={
-            "llvm.target_features": ir.Attribute.parse(
-                '#llvm.target_features<["-packed-fp32-ops"]>'
-            ),
-        },
-    ).launch(grid=(TASKS, 1, 1), block=(THREADS, 1, 1), stream=stream)
+    if TASKS > 0:
+        _kernel(
+            Q,
+            K,
+            V,
+            O,
+            BLOCKS,
+            META,
+            ACTIVE,
+            QUERY_TILES,
+            H,
+            HK,
+            NQ,
+            NK,
+            BN,
+            THREADS,
+            TASKS,
+            GATED,
+            SCALE,
+            value_attrs={
+                "llvm.target_features": ir.Attribute.parse(
+                    '#llvm.target_features<["-packed-fp32-ops"]>'
+                ),
+            },
+        ).launch(grid=(TASKS, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
 _COMPILED = {}
@@ -620,9 +620,11 @@ _COMPILED = {}
 def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
     if prepared.num_tiles == 0:
         return
-    if prepared.packed_key is not None:
-        from . import attention_direct_packed
+    from . import attention_direct_packed
 
+    key = (inputs.q.device, inputs.q.shape[1], inputs.k.shape[1],
+           4, prepared.gated, inputs.scale)
+    if prepared.packed_key is not None and key in _COMPILED:
         return attention_direct_packed.run(inputs=inputs, prepared=prepared, out=out)
     stream = torch.cuda.current_stream(inputs.q.device)
     args = (
@@ -639,28 +641,21 @@ def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
         inputs.q.shape[0],
         inputs.k.shape[0],
         32,
-        prepared.query_tile * 64,
+        256,
         prepared.num_tiles * inputs.k.shape[1],
         prepared.gated,
         inputs.scale,
         stream,
-    )
-    key = (
-        inputs.q.device,
-        tuple(
-            (
-                (a.dtype, tuple(a.shape), tuple(a.stride()))
-                if isinstance(a, torch.Tensor)
-                else ("stream",) if isinstance(a, torch.cuda.Stream) else a
-            )
-            for a in args
-        ),
     )
     with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
         compiled = _COMPILED.get(key)
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm direct QSA before graph capture")
-            _COMPILED[key] = flyc.compile(_launch, *args)
+            compiled = flyc.compile(_launch, *args[:14], 0, *args[15:])
+            _COMPILED[key] = compiled
+            attention_direct_packed._compile(inputs=inputs, prepared=prepared, out=out)
+        if prepared.packed_key is not None:
+            attention_direct_packed.run(inputs=inputs, prepared=prepared, out=out)
         else:
             compiled(*args)

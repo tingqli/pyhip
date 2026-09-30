@@ -1,4 +1,4 @@
-"""QSA indexer for gfx942 after ``index_qk_proj``: prefill state/compress prep, logits and top-k; decode logits.
+"""QSA indexer for gfx942 after ``index_qk_proj``: prefill/decode prep, logits and top-k.
 
 BF16 norm/RoPE/mean steps (Triton) round like SGLang's eager chain, bit for bit.
 Logits (FlyDSL MFMA, ``indexer_logits.py``) are the FP32 relu head sum of BF16 dots,
@@ -6,8 +6,8 @@ so only accumulation order differs from the Torch einsum reference. Top-k (FlyDS
 ``indexer_topk.py``) keeps the 512 largest ordered FP32 keys; ties keep the
 lowest block ids. Each row holds the selected blocks' tokens (block order is
 unspecified, like SGLang's radix top-k), then 0..3 causal tail tokens, then -1,
-matching SGLang's fixed-width token ABI. Decode (``decode_indexer``) replaces the paged logits
-(``indexer_decode.py``) and keeps SGLang's top-k and expand; ``decode_forward`` also fuses the
+matching SGLang's fixed-width token ABI. Decode (``decode_indexer``) uses paged logits
+(``indexer_decode.py``) and the shared FlyDSL top-k/expand; ``decode_forward`` also fuses the
 CUDA-graph decode q prep, pending-ring store and group compression into one bit-exact kernel.
 """
 
@@ -356,44 +356,29 @@ def _prefill(qk, *, heads, positions, logical_positions, state_slots, key_state,
     return out, q, packed
 
 
-_zero_starts = {}
-
-
-def _row_starts(device, rows):
-    # fast_topk fills zeros per call when row_starts is None; a persistent read-only buffer
-    # (never allocated while capturing: capture-time allocations are unwritten until replay)
-    # keeps that fill out of every decode graph.
-    zeros = _zero_starts.get(device)
-    if zeros is None or zeros.numel() < rows:
-        if torch.cuda.is_current_stream_capturing():
-            return None
-        zeros = _zero_starts[device] = torch.zeros(max(rows, 256), dtype=torch.int32, device=device)
-    return zeros[:rows]
-
-
 def decode_indexer(q, cache, page_table, lengths, query_positions, sequence_lengths):
-    """SGLang ``QSAIndexer.select_decode_tokens`` for 4 BF16 heads: int32 [rows, 2051] selections.
+    """Paged decode selection for 4 BF16 heads: int32 [rows, 2051] token indices.
 
     q is contiguous [rows, 4 or 8, 128] (heads 4..7 are the fused prep's zero padding), cache the
     [pages, 16, 1, 128] BF16 compressed pool, page_table int32 [rows, P] (rows score 16 * P keys)
     and lengths the int32 compressed lengths. Only the logits change (FlyDSL paged kernel reading
-    each row's own keys instead of the whole table width); SGLang's radix fast_topk and Triton
-    expand run unchanged. Everything is device-side, so the call is CUDA-graph capturable once
-    the FlyDSL kernel was compiled on the device (SGLang's eager warmups do that).
+    each row's own keys instead of the whole table width). FlyDSL top-k and expansion share
+    the prefill selection core. Everything is device-side, so the call is CUDA-graph capturable
+    after eager warmup. Each row has at most MAX_COMPRESSED_KEYS compressed keys.
     """
     return _decode_select(q, cache, page_table, lengths, query_positions, sequence_lengths)[0]
 
 
 def _decode_select(q, cache, page_table, lengths, query_positions, sequence_lengths):
-    from sglang.kernels.ops.elementwise.fast_topk import fast_topk
-    from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
-
     rows, width = q.shape[0], page_table.shape[1] * 16
-    logits = torch.empty((rows, width), dtype=torch.float32, device=q.device)
+    if width > MAX_COMPRESSED_KEYS:
+        raise ValueError(f"Decode supports at most {MAX_COMPRESSED_KEYS} compressed keys per row")
+    logits = torch.empty(rows * width + _PAD, dtype=torch.float32, device=q.device)[:rows * width].view(rows, width)
+    out = torch.empty((rows, _WIDTH), dtype=torch.int32, device=q.device)
     indexer_decode.launch(q, cache, page_table, lengths, logits, float(np.float32(1.0) / np.float32(math.sqrt(128))))
-    blocks = fast_topk(logits, lengths, topk=_TOPK, row_starts=_row_starts(q.device, rows))
-    return expand_qsa_block_indices(blocks, query_positions, sequence_lengths, compress_ratio=_RATIO,
-                                    token_topk=_TOPK * _RATIO), logits
+    indexer_topk.launch_decode(logits, lengths.contiguous(), query_positions.contiguous(),
+                               sequence_lengths.contiguous(), out)
+    return out, logits
 
 
 def decode_forward(qk, **kwargs):

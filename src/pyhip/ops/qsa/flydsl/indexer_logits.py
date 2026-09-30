@@ -16,6 +16,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 
+from pyhip.codegen.flydsl.helpers import rocdl_aux
 from pyhip.ops.mha.flydsl._common import _buffer, _buffer_words, _uniform
 
 HEADS, DIM, BLOCK, ITEM = 4, 128, 32, 6
@@ -78,7 +79,7 @@ def _store(relu, output, block, end, column, half, stride, scale):
         group = block + 8 * j + 4 * half
         offset = (group < end).select((column * stride + group) * 4, fx.Int32(_DROP))
         rocdl.raw_ptr_buffer_store(fx.Vector.from_elements(words, fx.Int32).ir_value(), output,
-                                   offset.ir_value(), fx.Int32(0).ir_value())
+                                   offset.ir_value(), fx.Int32(0).ir_value(), aux=rocdl_aux(0))
 
 
 @flyc.kernel(name="qsa_indexer_logits", known_block_size=[256, 1, 1])
