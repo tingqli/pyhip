@@ -143,7 +143,7 @@ def prepare(
     skip_counts=None,
     union=None,
 ):
-    """Bind private scratch; qsa's recovery refreshes sorted block_indices each call."""
+    """Bind private scratch; attention's recovery refreshes sorted block_indices each call."""
     # Block packing is request-local and requires complete physical four-token
     # blocks. Bound both scratch tensors before allocation using host metadata;
     # ragged/nonmultiple lengths and over-budget KV retain the raw-KV path.
@@ -493,7 +493,7 @@ def _body(
     )
 
 
-@flyc.kernel(name="direct_qsa_bf16_d256")
+@flyc.kernel(name="attention_direct_bf16_d256")
 def _kernel(
     Q: fx.Tensor,
     K: fx.Tensor,
@@ -621,9 +621,9 @@ def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
     if prepared.num_tiles == 0:
         return
     if prepared.packed_key is not None:
-        from . import _direct_packed
+        from . import _attention_direct_packed
 
-        return _direct_packed.run(inputs=inputs, prepared=prepared, out=out)
+        return _attention_direct_packed.run(inputs=inputs, prepared=prepared, out=out)
     stream = torch.cuda.current_stream(inputs.q.device)
     args = (
         inputs.q.view(-1),

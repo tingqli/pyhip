@@ -12,7 +12,7 @@ SOURCE_MANIFEST = {
     "workspace_head": "540d564c19436f28f2644e2247350da56c124452",
     "source_path": "python/sglang/srt/layers/attention/qsa/sparse_attn.py",
     "source_file_sha256": "8e378de61927524a4d3c725bc910a310d31306504bbfa57fc5e27aaee0665d91",
-    "snapshot_path": "baseline.py",
+    "snapshot_path": "attention_baseline.py",
     "hash_scope": "UTF-8 source of each decorated function, including final newline",
     "functions": {
         "_sparse_gqa_prefill": "215b956fac4755f39de59b04c60b3e867f15aa44b27cd55055423b6f29f2f7f3",

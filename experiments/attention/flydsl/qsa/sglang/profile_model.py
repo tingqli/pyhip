@@ -110,7 +110,7 @@ def run(command, path, env, timeout):
             stop(process)
 
 
-def validate(output, baseline, dump_layers, dump_rows):
+def validate(output, baseline, dump_layers, dump_rows, indexer_layers=(), indexer=False):
     traces = sorted((output / "profiles").rglob("*.trace.json.gz"))
     assert len(traces) == 2, traces
     results = sorted(output.glob("sglang_*.jsonl"))
@@ -133,7 +133,7 @@ def validate(output, baseline, dump_layers, dump_rows):
             report = json.loads((output / "qsa" / f"qsa_tp{rank}.json").read_text())
             assert len(report["calls_per_layer"]) == 12 and set(report["calls_per_layer"].values()) == {4}, report
             assert len(report["validation"]) >= 24, report
-            assert any("union_qsa_bf16_d256" in name for name in durations)
+            assert any("attention_union_bf16_d256" in name for name in durations)
             expected = {(layer, size) for layer in dump_layers for size in dump_rows}
             actual = set()
             for name in report["input_snapshots"]:
@@ -142,6 +142,17 @@ def validate(output, baseline, dump_layers, dump_rows):
                 assert (output / "inputs" / name).is_file() and parts[0] == f"tp{rank}"
                 actual.add((int(parts[1][5:]), int(parts[2][1:])))
             assert actual == expected, (actual, expected)
+            if indexer_layers or indexer:
+                assert len(report["indexer_calls_per_layer"]) == 12, report
+                assert set(report["indexer_calls_per_layer"].values()) == {4}, report
+            if indexer:
+                assert report["indexer_validation"], report
+            captured = set()
+            for name in report["indexer_snapshots"]:
+                parts = name[:-3].split("_")
+                assert (output / "inputs" / name).is_file() and parts[1] == f"tp{rank}"
+                captured.add((int(parts[2][5:]), int(parts[3][1:])))
+            assert captured == {(layer, size) for layer in indexer_layers for size in dump_rows}, captured
         summaries.append({"rank": rank, "path": str(path.relative_to(output)), "sha256": digest(path),
                           "kernel_count": len(kernels), "kernel_sum_us": sum(durations.values()), "qsa": report,
                           "top_kernels": [{"name": name, "us": us, "count": counts[name]} for name, us in durations.most_common(20)]})
@@ -154,12 +165,15 @@ def main():
     parser.add_argument("--baseline", action="store_true", help="disable the plugin; use the original model path")
     parser.add_argument("--dump-layers", type=int, nargs="+", default=[])
     parser.add_argument("--dump-rows", type=int, nargs="+", default=[11888, 12000])
+    parser.add_argument("--dump-indexer-layers", type=int, nargs="+", default=[],
+                        help="clone prefill indexer inputs/outputs/pool rows of these layers while profiling")
+    parser.add_argument("--indexer", action="store_true", help="enable the PyHIP prefill indexer replacement")
     args = parser.parse_args()
     output = Path(os.path.abspath(args.output))
     if not output.resolve().is_relative_to(DATA.resolve()):
         raise ValueError("Use a new directory under mytest/mydata")
-    if args.baseline and args.dump_layers:
-        parser.error("Input capture requires the QSA plugin")
+    if args.baseline and (args.dump_layers or args.dump_indexer_layers or args.indexer):
+        parser.error("Input capture and the indexer replacement require the QSA plugin")
     if any(os.environ.get(k) for k in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")):
         raise RuntimeError("This TP2 launcher uses unmasked physical GPUs 0 and 1")
     output.mkdir(parents=True, exist_ok=False)
@@ -182,6 +196,7 @@ def main():
         "XDG_CACHE_HOME": str(cache), "SGLANG_CACHE_DIR": str(cache / "sglang"), "SGLANG_JIT_CACHE_DIR": str(cache / "sglang_jit"),
         "TORCHINDUCTOR_CACHE_DIR": str(cache / "sglang/inductor"), "TRITON_CACHE_DIR": str(cache / "triton"),
         "FLYDSL_RUNTIME_CACHE_DIR": str(cache / "flydsl"), "TORCH_EXTENSIONS_DIR": str(cache / "torch_extensions"), "AITER_JIT_DIR": str(cache / "aiter"),
+        "PYHIP_CACHE_DIR": str(cache / "pyhip"),
     }
     for kind, filename in (("GEMM_A8W8_BPRESHUFFLE", "a8w8_bpreshuffle_tuned_gemm.csv"),
                            ("GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE", "a8w8_blockscale_bpreshuffle_tuned_gemm.csv"),
@@ -191,6 +206,11 @@ def main():
     if args.dump_layers:
         overrides.update(PYHIP_QSA_DUMP_LAYERS=",".join(map(str, args.dump_layers)),
                          PYHIP_QSA_DUMP_ROWS=",".join(map(str, args.dump_rows)), PYHIP_QSA_DUMP_DIR=str(output / "inputs"))
+    if args.dump_indexer_layers:
+        overrides.update(PYHIP_QSA_INDEXER_DUMP_LAYERS=",".join(map(str, args.dump_indexer_layers)),
+                         PYHIP_QSA_DUMP_ROWS=",".join(map(str, args.dump_rows)), PYHIP_QSA_DUMP_DIR=str(output / "inputs"))
+    if args.indexer:
+        overrides["PYHIP_QSA_INDEXER"] = "1"
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYHIP_QSA_")}
     env.update(overrides)
     identity = sources()
@@ -237,7 +257,7 @@ def main():
         snapshot(output, "before_profile", free=False)
         run(["bash", "-o", "pipefail", str(PROFILE)], output / "profile_driver.log", env, 1800)
         snapshot(output, "after_profile", free=False)
-        validate(output, args.baseline, args.dump_layers, args.dump_rows)
+        validate(output, args.baseline, args.dump_layers, args.dump_rows, args.dump_indexer_layers, args.indexer)
         status["capture_validated"] = True
     finally:
         stop(server)

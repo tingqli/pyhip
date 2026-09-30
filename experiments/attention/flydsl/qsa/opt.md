@@ -1343,6 +1343,8 @@ low/high：M2048、P30000、N32048；short：M64、P30000、N30064、低重合�
 
 ### 2. 记号与完整QSA伪代码（CPU调度）
 
+> **历史版本提示（2026-09-29补充）**：以下第2～11节保留2026-09-27的13-launch实现。其恢复/校验和plan拆分已被后续4-launch准备链替代；当前版本见[8-launch主路径与逐kernel伪代码](#qsa-current-pseudocode)，不要按下面旧Torch归约/清零清单理解当前调用。
+
 以下为**当前实现的逻辑伪代码**，不是可运行API，不承诺逐指令/逐cycle等同ISA。保留真实分流、舍入、边界和流水关系；`parallel`、`reduce`等概括lane协作，不能据此重排FP32加法树或删wait/barrier。`softmax_scale`默认1/16；exp实际为AMD FP32 `exp2`近似指令。
 
 | 记号 | 含义 |
@@ -3261,3 +3263,1530 @@ query路由保持：真实M12000 dense均2051/12000=17.092%；L3 TP2/4/8 union39
 没有运行时、SGLang、AITER快照或硬件设置修改；两组只启动本轮独立进程组，结束后均清理，原9078绘图服务保留。系统阶段只进一步更新既有说明文档；HEAD/index和其它既有dirty保留，不commit/push。旧日志前缀334581B、SHA256 `1428a653f3121d99155dd809356a799a1354f73936a320e4a89c5afe9b9b69ed`保持，所有新产物位于本研究目录，无新增Markdown。
 
 尚未覆盖：真实TP4/8系统、饱和并发吞吐、更长输出/长prefix/ragged服务负载、正式模型质量和超长上下文套件。两条prompt的整模型输出非确定性及跨组文本差异未定位，未把其关闭或从性能样本中剔除。系统结果限定为上述实际TP2单客户端12k→5负载，不外推到生产SLA或所有模型。
+
+## 2026-09-28：QSA prefill indexer分析与优化（issue #47 / #53）
+
+请求：读取issue #47，分析并优化indexer部分，先记录优化前数据作为base；attention部分已优化。本节只记录indexer；attention、decode、KV gather和模型其它层不变。研究数据在[qsa_indexer_20260928_01](../../../../mytest/mydata/qsa_indexer_20260928_01)，系统测试在[qsa_indexer_system_20260928_01](../../../../mytest/mydata/qsa_indexer_system_20260928_01)。
+
+### 1. 优化前base（先于任何改动记录）
+
+来源是已有TP2系统trace（qsa_system_20260928_01 native_v2/current_v2各2 rank，两臂indexer代码相同）的CPU重解析：[解析脚本](../../../../mytest/mydata/qsa_indexer_20260928_01/trace_indexer.py)、[逐调用结果](../../../../mytest/mydata/qsa_indexer_20260928_01/base_trace_indexer.json)、[kernel表](../../../../mytest/mydata/qsa_indexer_20260928_01/base_kernel_table_tp0.txt)。每rank 48次prefill indexer调用（12层×4请求，M≈12000）。
+
+| 项 | 数值 |
+|---|---:|
+| indexer GPU kernel累计/调用 | 5.50 ms（每rank 264 ms；同trace QSA attention 133 ms） |
+| GPU span/调用 | 8.35–8.8 ms（每调用3次host同步：2×`positions.max().item()`、1×`seq_lens.tolist()`） |
+| kernel数/调用 | 107 |
+
+| 阶段 | µs/调用 | 占比 | 说明 |
+|---|---:|---:|---|
+| mqa_logits | 3042 | 55% | TileLang未安装，走`torch_qsa_mqa_prefill` FP32 einsum回退 |
+| top-k | 1161 | 21% | radix `fast_topk`，两个chunk |
+| project | 589 | 11% | index_qk_proj GEMM 488（≈80 TFLOPS）+ gemma_rmsnorm 84 + copy 17 |
+| q_rope | 230 | 4% | 逐op BF16 RoPE |
+| compress | 210 | 4% | mean→norm→RoPE→cache |
+| mqa_inputs / expand / select copy / other | 100 / 100 / 59 / 9 | 5% | |
+
+issue中的fused `qsa_index_q_norm_rope_store`没有命中：主attention把`cos_sin_cache`转成BF16，`_use_fused_prep`要求FP32。indexer权重和head在TP间复制，TP2/4/8每rank工作量相同。回放base（完整`QSAIndexer.forward_cuda`，含GEMM，GPU2）见第5节：6302–6510 µs。
+
+### 2. 真实输入捕获与回放
+
+插件增加`PYHIP_QSA_INDEXER_DUMP_LAYERS`，在profile中克隆layer 3/47、M=11888/12000的hidden、positions、metadata、权重和写入前后pool行（TP0/TP1共8个文件，逐tensor SHA256），见[capture](../../../../mytest/mydata/qsa_indexer_20260928_01/capture)。[test_indexer.py](test_indexer.py)用真实`QSAIndexer`+`MRotaryEmbedding`和最小pool重放；base是SGLang自身`forward_cuda`（与captured输出token集合0行差异）。另有9个合成布局：1/7/1000/2051/2060/5003行、三请求带prefix、20000/3616和33000/16616（>16384行chunk）。
+
+### 3. 实现
+
+入口[indexer.py](indexer.py)（无SGLang依赖）接`index_qk_proj`输出；[插件](sglang/plugin.py)在`PYHIP_QSA_INDEXER=1`时AROUND hook `QSAIndexer.forward_cuda`，只接eager EXTEND、gfx942、BF16、4×128头、ratio 4、top512/2048、NeoX rotary 64；其余调用走原路径。107个kernel被替换为GEMM+5个kernel（有prefix时+1个gather），无host同步（位置一致性用`torch._assert_async`在设备上检查）。
+
+| kernel | 实现 | 语义 |
+|---|---|---|
+| `_indexer_q_prep` | Triton，8 token/program | 4头Gemma RMSNorm+NeoX/MRoPE，写q、key_state ring、rope位置；**逐bit复现**SGLang：RMSNorm的DPP归约树（128元素下标bit 3,2,1,0,4,5,6顺序成对相加）与逐op BF16舍入 |
+| `_indexer_k_compress` | Triton，16 group/program | 4成员mean→BF16→norm→RoPE，写compressed cache及按请求打包的K；padding组写slot 0（与ROCm SGLang一致），逐bit一致 |
+| `qsa_indexer_logits` | HIP [indexer_logits.cpp](indexer_logits.cpp) | 128行CTA×512 key工作项；Q常驻VGPR，32-key块经双缓冲XOR swizzle LDS共享；`v_mfma_f32_32x32x8_bf16`以key为行，每lane 4个连续key→16B buffer store；FP32 relu头和×scale，仅累加顺序不同于einsum |
+| `qsa_indexer_topk` | HIP [indexer_topk.cpp](indexer_topk.cpp) | 每wave一行：min/max→256-bin线性digit直方图→阈值bin内≤64候选精确排序；否则ordered-key radix；并列取最小block id；直接展开为2051 token ABI（块token、0..3因果尾、-1） |
+| index_qk_proj | hipBLASLt / SGLang | 默认`PYHIP_QSA_INDEXER_GEMM=hipblaslt`：行数>5120时用固定hipBLASLt solution 90517（MT128x256x64，按kernel名SHA256校验，不匹配则回退）；`=sglang`保持SGLang GEMM，整条prep逐bit一致 |
+
+块输出顺序：阈值bin外的块升序，然后阈值bin内选中块升序；SGLang radix同样不保证顺序，消费者按无序处理，测试按ABI展开和集合比较。
+
+### 4. 正确性
+
+`pytest experiments/attention/flydsl/qsa/test_indexer.py`：27项正常测试全部通过（9合成、8真实、8真实hipBLASLt投影、非适用调用回退、插件校验流程），8项perf按默认deselect；`test_qsa.py::test_sglang_adapter`通过。系统测试结束后在GPU2重跑，结果相同。
+
+- SGLang GEMM模式：q与打包压缩K逐bit相等；key_state/rope/compressed写入值与写入足迹完全相等；输出确定。真实8个capture中token集合不同的行0–2行/约12000行，逐行FP64（使用SGLang q与K）检查全部为0间隙，即PyHIP选择就是FP64 top-512（FP32 einsum与MFMA累加顺序造成的近并列）；合成随机数据有更多精确并列（最坏2.3e-8相对）。
+- 默认hipBLASLt投影：qk约1.1–1.5k/7.7M元素差≤1个BF16 ulp（按张量尺度），rope位置完全相等，compressed 45–75个元素不同；token集合不同22–65行（≤0.55%），每行约1个近并列块，FP64最坏相对边界间隙4.73e-4。门限：≤1%行、≤2e-3。
+- 插件`PYHIP_QSA_VALIDATE=1`：每个(layer, 长度)首次调用用SGLang GEMM跑原路径与PyHIP，要求pool完全相同、不同行必须是FP64近并列（≤1e-5）；之后同布局调用用默认投影。
+
+### 5. 正式回放性能
+
+[formal_v2](../../../../mytest/mydata/qsa_indexer_20260928_01/formal_v2)：GPU2，8个真实capture，每case 10个独立buffer（hidden副本与各自pool），warmup 2，128样本，三臂AB/BA交替，3072条raw全部保留；硬件门禁before/before_samples/after全部通过（PTL Enabled/VECTOR,F8）。首次尝试[formal_v1](../../../../mytest/mydata/qsa_indexer_20260928_01/formal_v1)在before_samples门禁失败（use 19%，为本进程刚结束的warmup，0条raw），保留记录；门禁前增加3 s settle后重跑，不放宽阈值。
+
+| capture | base µs | PyHIP exact µs | PyHIP默认 µs | exact倍数 | 默认倍数 | 配对中位 exact/base | 配对中位 默认/base |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tp0 L3 M11888 | 6422.6 | 783.7 | 504.6 | 8.19 | 12.73 | 0.1216 | 0.0784 |
+| tp0 L3 M12000 | 6510.5 | 781.6 | 510.1 | 8.33 | 12.76 | 0.1201 | 0.0783 |
+| tp0 L47 M11888 | 6310.9 | 783.6 | 503.1 | 8.05 | 12.54 | 0.1239 | 0.0796 |
+| tp0 L47 M12000 | 6398.8 | 781.8 | 513.4 | 8.18 | 12.46 | 0.1220 | 0.0798 |
+| tp1 L3 M11888 | 6398.3 | 781.8 | 504.5 | 8.18 | 12.68 | 0.1217 | 0.0788 |
+| tp1 L3 M12000 | 6496.0 | 781.6 | 512.0 | 8.31 | 12.69 | 0.1203 | 0.0788 |
+| tp1 L47 M11888 | 6302.4 | 782.8 | 502.8 | 8.05 | 12.53 | 0.1238 | 0.0798 |
+| tp1 L47 M12000 | 6378.8 | 782.1 | 511.1 | 8.16 | 12.48 | 0.1226 | 0.0801 |
+
+尾部保留：tp1 L3 M11888同一时段三臂同时出现最大值（base 18411、exact 6033、默认2077 µs），未剔除。TP2/4/8：indexer权重与head在TP间复制，TP4/8每rank运行与上表完全相同的工作；上表即TP2/4/8每rank值，但不是真实TP4/8服务测量。formal_v2之后`indexer.py`与两个`.cpp`未变，插件只改了校验流程（被验证调用强制SGLang GEMM、容差比较），测试只增加用例；计时路径未变。
+
+### 6. 单次调用各kernel占比（L3 M12000，torch profiler，GPU2）
+
+[v5 profile](../../../../mytest/mydata/qsa_indexer_20260928_01/explore/v5_profile.json)：
+
+| kernel | 默认模式 µs | 占比 | exact模式 µs |
+|---|---:|---:|---:|
+| index_qk_proj GEMM | 199.8（hipBLASLt 90517） | 39.8% | 474.7（SGLang默认MT320x160） |
+| `qsa_indexer_logits` | 128.7 | 25.6% | 129.1 |
+| `qsa_indexer_topk` | 124.2 | 24.7% | 123.7 |
+| `_indexer_q_prep` | 35.8 | 7.1% | 34.7 |
+| `_indexer_k_compress` | 9.5 | 1.9% | 9.0 |
+| `_assert_async` | 4.4 | 0.9% | 4.3 |
+
+与base相比：logits 3042→129 µs（23.6×），top-k+expand+select 1320→124 µs，prep（norm/RoPE/compress/输入）约640→45 µs。
+
+### 7. 优化过程与未采用尝试
+
+- top-k：v1每行一CTA线程连续380 µs；v2 CTA合并+ballot 559 µs（SGPR spill）；v2 wave/行寄存器325 µs；v3线性快速路径379 µs（412 SGPR spill）；PMC显示VALU+LDS+延迟受限，v4 readfirstlane统一标量250 µs；v5 8路展开装载147→padding免clamp 143→双缓冲+uint16 chosen 125 µs（全轻行下限约42 µs，即98 MB输出写）。真实logits集中在[1.7,10.7]，FP32高位窗口只有4–12个bin，所以用min/max线性digit。
+- logits：Triton 295 µs→配置扫描最佳234 µs（约80 TFLOPS）→HIP直接装载occupancy 1 172 µs（编译器把K装载串行化为逐16B+vmcnt(0)）→occupancy 2 152→LDS共享150→交换MFMA操作数+16B store 129.6 µs。微基准：32x32x8 BF16为32 cycles/SIMD（约297 TFLOPS）；去掉装载/存储的计算部分达到74% MFMA，其余为ReLU/求和epilogue、LDS读与store。
+- q_prep：每token一program 182 µs→多token 34.6 µs；TB 2–32×warps 1–8扫描均为34–41 µs（全部逐bit），保留TB8/4 warps。
+- GEMM：TunableOp找到90472（183 µs）；hipBLASLt全部2781个solution扫描：56个在M=12000与默认逐bit一致（最快82376，216 µs），但默认heuristic随M换kernel族，固定solution不能对所有M逐bit；默认在M≤5120约80 µs，5376–6144约231–241 µs，9000–12288约476 µs，16616约783 µs，24576约947 µs；90517约60 µs/4096行。故以5120为界。
+
+### 8. 实际TP2系统测试
+
+[协议](../../../../mytest/mydata/qsa_indexer_system_20260928_01/protocol.json)、[冻结身份](../../../../mytest/mydata/qsa_indexer_system_20260928_01/identity.json)、[最终分析](../../../../mytest/mydata/qsa_indexer_system_20260928_01/final_analysis_185655.json)（首轮三臂另见[analysis_182929](../../../../mytest/mydata/qsa_indexer_system_20260928_01/analysis_182929.json)）、[forward时间线](../../../../mytest/mydata/qsa_indexer_system_20260928_01/prefill_forward_timeline_183500.txt)。原launcher/模型/AITER快照，GPU0/1真实TP2，seed 42、chunk 16384、decode graph 32；沿用上一轮系统测试的10条ShareGPT派生prompt（实际11667–12000 token，无prefix cache），每fixture预热2次后128条无profiler请求（并发1、输出5、temperature 0），再用原4条profile脚本采集双rank trace。`PYHIP_QSA_VALIDATE=1`只在profile外对每个(layer,长度)首次调用校验。每个配置单独启动服务，顺序运行、不交错：
+
+- current：仅QSA attention插件（SGLang原indexer）；
+- indexer：＋PyHIP indexer，默认hipBLASLt投影；
+- indexer_exact：＋PyHIP indexer，SGLang GEMM。
+
+首轮三臂后default/exact的TTFT差远小于trace中的GEMM差，按ABBA补测exact_02、indexer_02b以量化服务间波动。全部运行的GPU/PTL门禁、源码冻结校验和自身进程组清理通过。indexer_02在启动前因上一服务刚释放的9080端口bind失败，0样本，[状态](../../../../mytest/mydata/qsa_indexer_system_20260928_01/indexer_02/status.json)保留；换新tag indexer_02b重跑，未放宽门禁。
+
+| 运行 | TTFT中位 ms | 相对current | TTFT p90 / max ms | 请求时延中位 ms | ITL中位 ms | req/s（顺序单客户端） |
+|---|---:|---:|---:|---:|---:|---:|
+| current_01 | 955.13 | — | 967.26 / 995.08 | 1008.82 | 13.423 | 0.990 |
+| indexer_01 | 879.42 | −7.93% | 882.59 / 886.85 | 932.75（−7.54%） | 13.404 | 1.073（+8.40%） |
+| indexer_02b | 881.26 | −7.73% | 885.92 / 891.00 | 934.55（−7.36%） | 13.415 | 1.071（+8.15%） |
+| indexer_exact_01 | 879.75 | −7.89% | 883.09 / 894.74 | 933.23（−7.49%） | 13.422 | 1.073（+8.34%） |
+| indexer_exact_02 | 888.39 | −6.99% | 891.52 / 896.42 | 941.82（−6.64%） | 13.418 | 1.063（+7.35%） |
+
+按fixture分层的TTFT均值差（方括号为单次运行内bootstrap 95% CI）：indexer相对current为−77.76 [−79.24, −76.29]与−75.74 [−77.30, −74.23] ms，exact为−77.48与−68.90 ms。同配置两次服务之间差+2.02 ms（default）和+8.58 ms（exact），远超运行内CI（约±0.5 ms），即**服务间波动约2–9 ms**。profile中两次exact的forward GPU busy只差1.3 ms，这部分波动主要不在prefill GPU执行内，来源未定位。default与exact每请求GPU差约3 ms（12层×约266 µs），小于该波动：两对差为+0.28与+6.84 ms，TTFT不能单独分辨两种GEMM。indexer替换本身（−69～−78 ms）远大于波动。current的fixture内TTFT标准差为2.2–13.9 ms，indexer各运行为0.7–3.9 ms，与移除每请求36次host同步一致。ITL不变，decode未替换。
+
+双rank profile中每rank 48次indexer调用（12层×4请求），按调用平均：
+
+| 运行 | kernel合计/调用 TP0 / TP1 µs | TP0分项 µs |
+|---|---:|---|
+| current_01 | 5502.4 / 5496.7 | mqa_logits 3037.8、top-k 1162.8、project 590.6、q_rope 229.3、compress 210.0、mqa_inputs 102.7、expand 100.8、select 59.7、其它8.8 |
+| indexer_01 / indexer_02b | 524.5 / 524.7；526.9 / 524.8 | GEMM 221.5、logits 129.0、top-k 124.4、q_prep 35.3、compress 9.2、assert 5.1（indexer_01） |
+| indexer_exact_01 / exact_02 | 790.3 / 790.7；790.4 / 789.8 | GEMM 488.4、logits 128.1、top-k 123.9、q_prep 35.7、compress 9.2、assert 5.0（exact_01） |
+
+current每调用GPU span为8410 µs（同步造成空泡），PyHIP为525/790 µs，span≈kernel合计。服务内默认GEMM为221 µs，高于GPU2回放的200 µs；其余kernel与回放一致。
+
+整个prefill forward（profile内，每rank 4次平均，TP0；TP1差≤0.3 ms）：
+
+| 运行 | host forward ms | GPU span ms | GPU busy ms | GPU空闲 ms | host同步/forward |
+|---|---:|---:|---:|---:|---:|
+| current_01 | 932.8 | 943.9 | 905.4 | 38.5 | 44（等待545 ms） |
+| indexer_01 | 345.7 | 849.8 | 845.8 | 4.0 | 8（等待3.4 ms） |
+| indexer_02b | 341.1 | 849.6 | 845.9 | 3.7 | 8 |
+| indexer_exact_01 | 341.9 | 852.1 | 848.5 | 3.6 | 8 |
+| indexer_exact_02 | 352.3 | 853.8 | 849.8 | 4.0 | 8 |
+
+每forward减少的36次同步正是12层×3次indexer同步；余下8次属于SGLang其它部分。替换后host提前约500 ms发完整个forward，prefill为GPU-bound。host时间含profiler with_stack开销，只作profile内对照。
+
+校验与输出：每个indexer运行每rank校验72个调用（12层×6种长度：warmup脚本的97/122及11667/11851/11888/12000），全部通过：key_state/rope/compressed完全相等，不同行均为FP64近并列，最坏相对间隙7.94e-8（门限1e-5）；profile中每rank 12层×4次替换。按样本配对，生成文本与current相同114/128（indexer_01、indexer_02b、indexer_exact_01）和111/128（indexer_exact_02）；差异在fixture 0/5，exact_02另有1条fixture 8。current_01自身对fixture 0/5就有3和6种输出，exact_02同一运行内fixture 8也有2种输出，属于整模型非确定性（与上一轮native/current观察一致），不作为模型质量评测。
+
+TP2/4/8：indexer head与权重在TP间复制，TP4/8每rank的indexer工作与TP2相同（每调用5.50→0.52 ms，第5节回放适用于每rank）；真实TP4/8服务TTFT未测，其它层每rank工作随TP变化，不外推。默认仍用hipBLASLt投影：回放每调用快约270 µs，trace中每请求约3 ms GPU；但本负载TTFT中该收益小于服务间波动。需要逐bit prep时设`PYHIP_QSA_INDEXER_GEMM=sglang`，系统TTFT同样在波动内。
+
+### 9. 限制
+
+- 只替换eager EXTEND prefill；decode indexer、CUDA graph/capture、非gfx942、非BF16/非该头形状均回退原路径。
+- 单请求序列压缩key>16384（L>65536）回退；logits缓冲按256 MiB分chunk。
+- 默认hipBLASLt投影改变GEMM舍入（见第4节）；solution编号依赖hipBLASLt版本，按kernel名哈希校验。
+- top-k块顺序非升序（与SGLang radix一样无序）；多请求/prefix只由合成测试覆盖，真实capture均为单请求无prefix。
+- 系统测试只有真实TP2、单客户端约12k→5；服务间2–9 ms TTFT波动来源未定位。未做模型质量/长上下文评测、真实TP4/8服务、饱和并发吞吐。
+- 没有修改SGLang、AITER、运行时或硬件设置；未commit/push。
+
+## 2026-09-28：indexer长上下文——压缩key上限16384→65536，及top-k/GEMM加速分解
+
+用户追问上节限制“单请求压缩key>16384回退”以及top-k、GEMM分别快多少。本节更正上节第9节第2条；上节文字不改。数据在[qsa_indexer_long_20260928_01](../../../../mytest/mydata/qsa_indexer_long_20260928_01)，驱动[qsa_indexer_long_bench.py](../../../../mytest/qsa_indexer_long_bench.py)。
+
+### 1. 16384上限的来源与放开
+
+16384=256线程×64 key，是第一版top-k（整行驻留寄存器）的容量，改写后没有同步放开。当前top-k每wave一行、按组流式扫描，logits kernel地址为64-bit且按256 MiB分chunk，都与行宽无关。唯一硬约束是top-k在LDS用uint16存选中块号：≤65536个压缩key（262144 token），恰等于模型`max_position_embeddings`=262144。旧上限使chunked prefill（chunk 16384）中总长>65536 token的每个chunk都回退SGLang，即长上下文prefill的大部分。
+
+改动：[indexer.py](indexer.py) `MAX_COMPRESSED_KEYS=65536`；[plugin.py](sglang/plugin.py)改为引用该常量，不再写死16384；两个kernel未改。262144/16384的host layout为16个chunk、15936个logits工作项、256 MiB logits缓冲，首次构建约26 ms并按形状缓存。
+
+正确性：[test_indexer.py](test_indexer.py)新增70000/4096、131077+3001两请求（带prefix、非4对齐尾）、262144/16384三个合成case及262144可用/262148回退边界；共计30项正常测试与`test_sglang_adapter`通过。q、打包K和pool写入仍逐bit一致；不同行均为FP64近并列：1行/1.7e-8、69行/0（短行ReLU为0的精确并列）、3行/5.5e-8。新建独立包用预编译.co跑70000/4096结果相同。抽样512行：真实12k capture与合成长行的top-k均100%走快路径（阈值bin中位13–30、p90≤38，上限64）。
+
+### 2. 长上下文正式性能（合成输入）
+
+GPU2、单请求chunk extend 16384；10 buffers/2 warmup/128 samples、三臂AB/BA，1152条raw全部保留，每组before/before_samples/after门禁通过。输入为随机合成，没有真实长上下文capture；base是SGLang原实现，也就是旧上限下这些调用实际走的路径。indexer在TP间复制，TP2/4/8每rank相同。
+
+| 总长/extend（压缩key） | base µs | exact µs | 默认 µs | exact倍数 | 默认倍数 | 配对中位 默认/base | max base/默认 µs |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 81920/16384（20480） | 33686.7 | 3442.2 | 3375.0 | 9.79 | 9.98 | 0.1002 | 34273.3 / 3398.2 |
+| 131072/16384（32768） | 53064.2 | 5529.9 | 5459.6 | 9.60 | 9.72 | 0.1029 | 53972.5 / 5492.5 |
+| 262144/16384（65536） | 105392.3 | 14664.4 | 14592.3 | 7.19 | 7.22 | 0.1384 | 106440.6 / 14629.4 |
+
+hipBLASLt投影检查：不同行82/105/104（≤0.64%），FP64最坏间隙1.43e-3，在门限内。
+
+### 3. top-k与GEMM分别快多少
+
+top-k（SGLang radix `fast_topk`；PyHIP `qsa_indexer_topk`已含2051 token展开，故另列含expand/select的口径）：
+
+| 来源 | SGLang top-k µs（+expand/select） | PyHIP µs | 倍数（仅top-k / 含展开） |
+|---|---:|---:|---:|
+| 实际TP2 trace，12k | 1162.8（1323.3） | 124.4 | 9.35× / 10.64× |
+| 合成81920/16384 | 4653.6（4925.0） | 1085.7 | 4.29× / 4.54× |
+| 合成131072/16384 | 6923.8（7213.9） | 1931.2 | 3.59× / 3.74× |
+| 合成262144/16384 | 13689.4（14094.7） | 6219.8 | 2.20× / 2.27× |
+
+长行时top-k每行做3次全行扫描（min/max、直方图、收集）并对每元素做LDS直方图原子操作；262144时约12.5 GB读/6.22 ms≈2.0 TB/s。尚未为长行优化，比如由logits epilogue产出行min/max以少一次扫描。logits长行仍为11–14×（26699.5→1920.9、44008.0→3163.9、89482.0→7998.2 µs）。
+
+GEMM（index_qk_proj，[M,2560]×[2560,640] BF16）：PyHIP没有新写GEMM，默认模式仅在M>5120时改用hipBLASLt solution 90517；exact模式不变。
+
+| 口径 | SGLang默认 µs | 90517 µs | 倍数 |
+|---|---:|---:|---:|
+| 单独M扫描 M=12000 | 473.8 | 181.3 | 2.61× |
+| 回放profile（12k，GPU2） | 474.7 | 199.8 | 2.38× |
+| 实际TP2 trace（12k） | 488.4 | 221.5 | 2.20× |
+| 单独M扫描 M=16384 | 286.0 | 239.8 | 1.19× |
+| 长上下文profile（M=16384） | 359.4–360.9 | 294.9–296.2 | 1.22× |
+
+12000行时SGLang默认heuristic选中慢kernel（约80 TFLOPS），90517约177–217 TFLOPS；M=16384时默认已较快，收益降到1.2×。每请求12层，12k时GPU节省约3 ms，但系统TTFT小于服务间波动（见上节）。对比基准，SGLang project还含RMSNorm/copy（合计589 µs），在PyHIP中并入q_prep（35 µs，含RoPE）。
+
+### 4. 限制
+
+- 长上下文性能与正确性均用合成输入；未采集真实长上下文capture，未跑长上下文服务或超长上下文脚本。
+- 超过65536个压缩key（>262144 token，超出模型上限）仍回退SGLang。
+- 没有修改SGLang、AITER、运行时或硬件设置；未commit/push。
+
+## 2026-09-29：indexer logits/top-k由HIP改写为FlyDSL
+
+用户要求把两个cpp用FlyDSL改写。[indexer_logits.py](indexer_logits.py)与[indexer_topk.py](indexer_topk.py)逐步对应原HIP kernel；原源码冻结在[hip_source](../../../../mytest/mydata/qsa_indexer_flydsl_20260929_01/hip_source)，源树中的两个.cpp已删除，前几节指向.cpp的链接仅为历史。数据在[qsa_indexer_flydsl_20260929_01](../../../../mytest/mydata/qsa_indexer_flydsl_20260929_01)，驱动为[逐bit对照](../../../../mytest/qsa_indexer_flydsl_compare.py)与[正式计时](../../../../mytest/qsa_indexer_flydsl_formal.py)。
+
+### 1. 实现与机器码
+
+- logits：CTA/wave划分、Q常驻VGPR、32-key双缓冲XOR swizzle LDS、`rocdl.mfma_f32_32x32x8bf16_1k`的s/h顺序与操作数配对、整数max ReLU、同序头和×scale及按wave行数range check的buffer store都与HIP相同；LDS用LLVM `ptr<3>` load/store（等待由编译器插入），`rocdl.waves_per_eu=2`。ISA与HIP同构：64 MFMA、8 ds_read_b128、4 ds_write_b128、36条b128 load、4条b128 store；VGPR 250（HIP 256）、SGPR 33（29）、LDS 16 KB、scratch 0。
+- top-k：每wave一行、8路预取扫描（buffer load越界返回0）、LDS直方图`atomicrmw add`（wavefront）、ballot/mbcnt/readlane/ds_bpermute及ctpop/cttz/ctlz；radix循环用动态while（无break）。第一版把逐元素条件LDS写改为无分支的丢弃槽写，ISA中exec mask切换只剩7处（HIP 113），12k慢9%、长行慢26–30%；改回`@flyc.jit`条件分支后与HIP同样在无lane命中时跳过写。最终VGPR 56（64）、SGPR 68（93）、LDS 8256 B（8208）、scratch 0，见[FlyDSL ISA](../../../../mytest/mydata/qsa_indexer_flydsl_20260929_01/isa_final)与同目录`hip_*.s`。
+- 尺寸都是运行时Int32、tensor为layout-dynamic，一次编译覆盖全部形状（按device缓存）。每进程首次调用JIT：空FlyDSL磁盘缓存约1.0 s，已有缓存约0.06 s（GPU3，torch/Triton已预热）。插件包不再调用hipcc，也不再携带.co：12个源码、无二进制。
+
+### 2. 正确性：与HIP逐bit一致
+
+[逐bit对照](../../../../mytest/mydata/qsa_indexer_flydsl_20260929_01/bitwise_compare_gpu3.json)覆盖4个真实capture和14个合成case（多请求/prefix、非4对齐、33000/16616、70000/4096、131077+3001、81920/16384、262144/16384）。两实现使用同一q/packed/items和哨兵预填缓冲，整个logits缓冲（含未写区域）、2051 token输出与valid标志逐bit相同。GPU3上`test_indexer.py` 30项正常测试与`test_sglang_adapter`通过；新建独立包在真实capture与70000/4096上的结果与源码一致。
+
+### 3. 正式性能
+
+[formal_v1](../../../../mytest/mydata/qsa_indexer_flydsl_20260929_01/formal_v1)：GPU3，10 buffers/2 warmup/128 samples，三臂AB/BA交替，4608条raw全部保留，每组before/before_samples/after门禁通过（use 0%、VRAM≤2%）。三臂都是完整调用：base为SGLang原实现，HIP/FlyDSL两臂为插件路径＋默认投影，仅logits/top-k实现不同；每个样本都断言HIP与FlyDSL输出逐bit相同。
+
+| case | base µs | HIP µs | FlyDSL µs | 配对中位 FlyDSL/HIP | base/FlyDSL |
+|---|---:|---:|---:|---:|---:|
+| tp0 L3 M11888 | 6423.5 | 511.3 | 495.0 | 0.9648 | 12.98 |
+| tp0 L3 M12000 | 6482.5 | 512.0 | 495.8 | 0.9788 | 13.07 |
+| tp0 L47 M11888 | 6456.0 | 508.5 | 493.5 | 0.9786 | 13.08 |
+| tp0 L47 M12000 | 6533.1 | 512.0 | 496.5 | 0.9735 | 13.16 |
+| tp1 L3 M11888 | 6486.0 | 510.6 | 492.9 | 0.9664 | 13.16 |
+| tp1 L3 M12000 | 6560.7 | 512.5 | 497.3 | 0.9721 | 13.19 |
+| tp1 L47 M11888 | 6377.2 | 508.8 | 495.0 | 0.9711 | 12.88 |
+| tp1 L47 M12000 | 6451.3 | 513.5 | 498.9 | 0.9756 | 12.93 |
+| 合成5003 | 2627.1 | 193.1 | 194.6 | 1.0073 | 13.50 |
+| 合成81920/16384 | 33775.5 | 3381.1 | 3389.6 | 1.0024 | 9.96 |
+| 合成131072/16384 | 53190.8 | 5468.6 | 5492.2 | 1.0046 | 9.68 |
+| 合成262144/16384 | 105076.2 | 14619.8 | 14720.3 | 1.0066 | 7.14 |
+
+尾部保留：131072组FlyDSL最大7781 µs；262144组三臂同一时段最大分别为128759/22507/22089 µs，未剔除。按kernel的事件计时（非正式，同GPU3）：12k logits 150.2–151.1 vs HIP 150.1–153.5 µs，top-k 138.3–141.2 vs 141.9–145.2 µs；262144 logits 8080 vs 7967 µs（+1.4%）、top-k 5324 vs 5217 µs（+2.0%）。indexer权重/head在TP间复制，上表即TP2/4/8每rank值，不是真实TP4/8服务测量。
+
+### 4. 注意与限制
+
+- 另一会话自01:20起在GPU2运行QSA H6正式campaign（qsa_h6_20260929_01，未改动）。本轮01:33–01:47曾在GPU2做逐bit对照和ISA导出，可能扰动该campaign这一时段的计时；此后本轮全部改用GPU3。
+- 12k真实capture快2.1–3.5%，5k与长行慢0.2–0.7%；差异来自LLVM调度，未再调优。
+- 未用FlyDSL版本重跑真实TP2系统服务（kernel逐bit一致，计时接近）；服务每进程首次indexer调用多一次JIT（见第1节）。
+- 未修改SGLang、AITER、运行时或硬件设置；未commit/push。
+
+## 2026-09-29：indexer decode支持可行性分析（未实现）
+
+用户问indexer能否支持decoding、需要哪些工作。本节只做分析，不改代码。数据见[feasibility.json](../../../../mytest/mydata/qsa_indexer_decode_20260929_01/feasibility.json)，脚本为[qsa_indexer_decode_analysis.py](../../../../mytest/qsa_indexer_decode_analysis.py)。
+
+### 1. 当前decode路径及开销
+
+当前插件只接管eager EXTEND。decode由SGLang在CUDA graph中执行（max bs 32，未开speculative）：project_qk、ring写入、按graph buffer的定形压缩、`qsa_mqa_decode`、`fast_topk`、expand。TileLang未安装，MQA走torch fallback：它按graph页表全宽gather并计算。服务`context_len=262144`，所以无论实际上下文多长，每层每步都算65536个压缩key。模型代码没有创建indexer的alt stream；trace中decode graph全部kernel都在同一stream，串行在关键路径上。
+
+现有TP2 trace（indexer_01，12k上下文、bs 1，每rank 20个decode step）：每步kernel合计16.09 ms（含profiler，无profiler ITL为13.4 ms）。12个QSA层的indexer约2.59 ms（16.1%），两rank一致。按kernel顺序启发式归类，每层：
+
+| 部分 | µs/层 | kernel数 | 说明 |
+|---|---:|---:|---|
+| prep（norm/RoPE/ring/定形压缩） | 91.0–91.6 | 20 | 小torch kernel，每个约4.5 µs |
+| MQA（torch fallback） | 107.1–107.5 | 14 | 全宽65536 key的gather、FP32转换、GEMM、relu求和、mask与fill |
+| top-k＋expand | 17.0–17.3 | 2 | fast_topk按65536宽度 |
+
+### 2. 支持decode需要的工作
+
+1. 接入与graph安全：hook decode模式的`forward_cuda`（target_verify/draft_extend等MTP路径暂不接）。全部数据只从设备侧graph buffer读：`graph_compressed_page_table/lengths`、`graph_write_locs`、`graph_ring_group_locs`、`decode_logical_positions`、`pending_ring_slots`。不能有host同步或按CPU长度构建的layout。每个capture bs的grid与workspace固定，FlyDSL在capture前完成编译，padding行与SGLang同样写inert slot 0。
+2. decode prep/压缩融合kernel：新token的q norm＋RoPE、原始key与rope位置写ring；组边界行对4个ring成员求均值再norm＋RoPE写压缩cache。复用已逐bit对齐SGLang的Triton helper。
+3. 分页decode logits：只按页表读取实际长度内的压缩key（16 key/页，4 KB连续）；1行query需改用点积或跨请求打包MFMA；长行拆到多CTA以占满带宽。
+4. decode top-k需要新设计：现有每wave一行的kernel对单行65536 key为469–540 µs，SGLang CTA级`fast_topk`为73–75 µs；3000 key时32 µs对26 µs。需要CTA级或多CTA直方图/radix并融合expand，短行可在一个CTA内融合logits＋top-k。
+5. 验证：逐步与SGLang decode对照（近并列容差），覆盖组边界写入、页边界、多请求不同长度、bs 1–32全部capture尺寸与padding、262144长度；graph capture一次后在长度变化下重放。然后做TP2系统ITL/吞吐（C1与更高并发）与长上下文精度测试，TP4/8标明派生。
+
+### 3. 预期收益（估算，未实测）
+
+只读实际长度并融合小kernel，12k/bs 1时每层有望从约216 µs降到几十µs，每步约节省2 ms（profiled步长的约13–14%）。bs越大收益越大：fallback每层每步gather bs×65536个key。可分阶段：先替换MQA＋top-k＋expand（每层约124 µs），再融合prep/压缩（约91 µs）。以上为基于trace的估计，不是测量结果。
+
+## 2026-09-29：H6 query/head打包、union tile与分流成本校准
+
+本轮只修改attention的host分组，不修改indexer、SGLang或模型配置。入口源码、协议、所有成功/较慢/失败结果在[qsa_h6_20260929_01](../../../../mytest/mydata/qsa_h6_20260929_01)，原始样本重算见[analysis.json](../../../../mytest/mydata/qsa_h6_20260929_01/analysis.json)与[完整表](../../../../mytest/mydata/qsa_h6_20260929_01/tables.txt)。PyHIP .venv、GPU2/a4、原cudaPerf、10独立输入/输出buffer、2warmup、每label/scope128samples，轮转并反向交错；完整调用包含准备、dense、union、pack、direct，不含indexer。
+
+### 1. 已采用的受限布局
+
+[prepare.py](prepare.py) `allocate_plan`仅在以下条件同时成立时采用均衡BQ21：`H/HK=6`、`HK=1`、单请求、prefix=0、允许BQ≥21，且稀疏行数≥`21*num_cus*grid_multiplier`。本机80CU、multiplier2时为3360个稀疏query，即公共入口总行数至少5411。其余TP2/TP8、prefix、ragged、HK>1和小batch保持原分组。
+
+- 仍为M128/BN64/8wave；21query×6head填充126/128槽位，相比16×6的96/128。没有改MFMA、softmax、BF16舍入或设备端地址公式。
+- 从dense结束位置开始将剩余query分成`ceil(rows/21)`组，组大小只相差1，避免旧对齐方式产生只有2/9行的尾组。
+- packed分流仍为`160*ceil(U/16) <= 17*sum(ceil(selected_tokens/32))`。不是无条件全union；raw/ragged仍用rho4。没有新增kernel、active回读或scratch生命周期变化。
+- 修改集中在host `allocate_plan`；其它prepare设备函数与dense/union/direct文件保持原源码。不同分组会改变合法union累加顺序，因此不声称与旧BQ16逐bit一致；精度门限仍`.02/.02`，同版重复必须逐bit一致。
+
+### 2. 主要有效测量
+
+下表均为同场完整`qsa`中位数；非独立kernel中位数相加。所列采样不落入第5节已知同卡干扰窗口。
+
+| 场次/输入 TP4 | 原BQ16 µs | 候选 µs | 时延变化 | 说明 |
+|---|---:|---:|---:|---|
+| 初轮L3 M12000：GP8/BQ16 | 2287.632 | 2276.232 | −0.50% | 空head槽位仍在，未采用 |
+| 初轮L3 M12000：GP6/BQ20 | 2287.632 | 2014.471 | −11.94% | 填充120/128 |
+| 初轮L3 M12000：GP6/BQ21 | 2287.632 | 1977.311 | −13.57% | 填充126/128，尚未均衡尾组 |
+| 扩展L47 M12000：BQ21 | 2267.312 | 1910.130 | −15.75% | 尚未均衡尾组 |
+| 最后L3 M12000：均衡BQ21 | 2284.512 | 1877.310 | **−17.82%** | 采用的布局；配对比0.821806 |
+
+最后L3场次同场未均衡BQ21为1974.131µs；均衡后再省96.821µs。原dense/union/direct行数为2051/9341/608；未均衡BQ21为2051/9940/9，均衡后2051/9949/0。Union N64迭代总数45975→40984；这是实际plan的逻辑工作量，不是HBM计数。完整准备162.140→166.801µs，主要收益来自attention分组和避免小尾组触发direct分支，不是准备kernel加速。
+
+### 3. 未采用的tile/成本方案
+
+- M64四wave：保持32KiB K＋32KiB V LDS，每wave搬两个128-channel半区。CPU DMA/输出payload覆盖及GPU原精度/零spill通过，但L3完整调用3326.178µs（BQ8/GP8）或2911.636µs（BQ10/GP6），对照2287.533µs，明显更慢。不是把wave减半就能把KV搬运减半。
+- M96六wave：前四wave搬KV、后两wave只计算，16×6填满M96。L3为2266.652/2304.632µs（修改成本/原成本），对照2284.512µs；高重合约283µs对290µs，收益不足以引入新设备管线，未采用。
+- BQ21不能全局启用：高重合M2048/P30000场次再次观察到379.562µs对290.082µs（+30.85%，01:57采样，不在干扰窗口）。该batch不足以填满新布局grid且分组跨原共享边界，生产保留原路径。不能把此回归藏进真实输入平均收益。
+- 成本1.3/1.5/1.7/2.0/2.5以及强制union/direct均做了完整scope对照。后段干净share75场次：原639.244µs，BQ21/1.7为634.983µs，2.0为997.085µs，2.5为1119.766µs；放宽阈值会把不划算的行送入union。保留1.7，优先消除分组小尾而不是全局提高阈值。
+- 未实现独立选集的“双query direct”：两个query的K/V集合不同，不能只把6+6头塞入同一个M16并共享K operand；需要另一种精确选集/子矩阵设计。当前direct设备实现不变。
+
+### 4. 验证与未完成项目
+
+新增CPU分组阈值/行覆盖测试与H6 graph选集/V变化测试；完整正常测试**67项通过、24项perf deselect**，见[正常测试收据](../../../../mytest/mydata/qsa_h6_20260929_01/normal_result.json)。首次阈值5410/5411及5412/5413/5414物理尾部5例、NaN guard全部通过，36个实际dispatch三零，见[边界资源](../../../../mytest/mydata/qsa_h6_20260929_01/boundary/resource_audit.json)。使用当前12源码构建器的新独立包通过两层/两长度×TP2/4/8共12例、96dispatch三零，未导入experiments、未执行indexer，见[独立包](../../../../mytest/mydata/qsa_h6_20260929_01/package/result.json)及[资源](../../../../mytest/mydata/qsa_h6_20260929_01/package/resource_audit.json)。
+
+生产L3的dense/union/packed `.text`与已测均衡原型相同，见[机器码对应](../../../../mytest/mydata/qsa_h6_20260929_01/chain/measured_production_text_match.json)。正式性能最终TP2/4/8矩阵、均衡布局其它真实输入时延及逐kernel新profile尚未完成，不能把未均衡BQ21数据当最终生产全矩阵。TP4/8始终为TP2 capture派生local-head，不是实际多卡服务；没有部署模型、测TTFT或更改Git index/commit/push。
+
+[全链54组实际dispatch审计](../../../../mytest/mydata/qsa_h6_20260929_01/chain/resource_audit.json)完成：378dispatch的`private_segment_fixed_size`、`vgpr_spill_count`、`sgpr_spill_count`全部0。8个H6真实capture生产输出/plan与已测均衡原型逐bit相同；TP2/8及未启用的合成范围与原基线输出逐bit相同，见[结果](../../../../mytest/mydata/qsa_h6_20260929_01/chain/result.json)。资源审计不是普通计时；包含正常测试末段重叠的非计时执行，不宣称空闲GPU性能。动态LDS与ELF固定字段分别记录，union实际仍64KiB。8个H6真实capture均为dense2051＋其余全union，但这是数据导致的结果，不是强制全union策略。
+
+### 5. 门禁停止和跨会话干扰
+
+最后[balanced_high_tp4](../../../../mytest/mydata/qsa_h6_20260929_01/balanced_high_tp4/result.json)在采样前门禁GPUuse100%、VRAM1%失败，0条raw；正确性已先执行。立即停止后续性能/trace，不sleep、不换卡重采，也不把较早同case成功数据冒充本场通过。19个完成场次加1个门禁失败场次，18176条raw全部保留。
+
+另一indexer会话后来在本文件记录：01:33–01:47曾使用GPU2。按01:33:00–01:48:00保守窗口，[interference.json](../../../../mytest/mydata/qsa_h6_20260929_01/interference.json)标记12个采样场次可能受扰；即使entry/pre/post门禁通过，也不将这些场次作为独占性能验收依据。精确外部dispatch时间不可用。初轮布局、M64、最后M96/均衡L3及后段share50/share75采样在该窗口外；所有原始记录不改写。
+
+## 2026-09-29：当前TP2/4/8逐分支与准备kernel对照（续测完成：18输入×3TP）
+
+用户要求测试dense、强制direct/union、自动qsa并注明分流数目及其它kernel，随后明确要求完成失败测试并更新已有表格。本节已原位补齐；旧L3成功数据原样保留，旧L47失败收据不改。续测在[qsa_tp_kernels_20260929_02](../../../../mytest/mydata/qsa_tp_kernels_20260929_02)，[续测协议](../../../../mytest/mydata/qsa_tp_kernels_20260929_02/protocol.json)、[完整CPU审计](../../../../mytest/mydata/qsa_tp_kernels_20260929_02/analysis.json)、[运行收据](../../../../mytest/mydata/qsa_tp_kernels_20260929_02/run_result.json)。原数据仍在[qsa_tp_kernels_20260929_01](../../../../mytest/mydata/qsa_tp_kernels_20260929_01)，更新前正文保存为[文档快照](../../../../mytest/mydata/qsa_tp_kernels_20260929_02/opt_before.md.snapshot)。没有修改attention/indexer/SGLang运行源码；当前H6均衡BQ21保持启用。
+
+### 1. 设备、输入与计时边界
+
+- 正式计时前发现GPU2有容器`ps`不可见的外部host PID，改选空闲**物理GPU4／0001:0b:00.0**并整轮固定，不复用GPU2旧结果。MI308X gfx94280CU，PyHIP .venv，Torch2.12.0 ROCm7.14、FlyDSL0.3.2，硬件设置未写。
+- 输入为TP0/1、L3/47、M11888/12000共8个真实capture，加10个合成布局，全部18输入×TP2/4/8完成。真实输入无prefix，H12/H6/H3、HK1、D256；ragged_hk2为HK2、G12/6/3。TP4/8从TP2的Q/output按head裁剪，K/V/indices不变；不是多卡TP4/8服务或通信测量。
+- 每个TP独立10组Q/K/V/indices和输出buffer，路径之间共用输入、输出各自原生allocation；2warmup，每scope128samples，TP和路径按sample轮转/反向交错，原cudaPerf不改。普通分支/准备共71040条raw（含保留的L3 4224条），新增独立组件29568条raw；第一次与全部长尾保留。18份profile共1500次完整调用、9030个GPU kernel，profile与普通中位数分开。
+- dense只覆盖语义等价的前2051行；prepared direct/union均覆盖剩余9949行，direct包含本次KV pack，union已构好精确mask/union表。不能把这三列当覆盖相同行数的完整调用。
+- `qsa`是原公共自动入口，完整12000行，含恢复、校验、构表、mask、dense、union和pack/direct。`full_direct`保留dense前缀、恢复/校验但不构union表，再跑全部稀疏行direct；`full_union`恢复并构全部精确union表/mask后跑dense＋union，不launch direct/pack。两条强制完整路径是研究驱动，不修改公共API。
+- M11888真实输入的dense/稀疏分别2051/9837行。合成dense2048/2051的三种已准备分支都处理全部行，完整qsa只有dense路径，故强制完整两列不重复计时、记“—”。low/high/share50/share75为M2048/P30000，short为M64/P30000，raw为M33/P30000，overbudget为M68/N65540，ragged_hk2为queries(9,0,33)/prefixes(30000,17,5)。ragged有33行dense、9行稀疏，其余长prefix合成无dense；“—”不是0µs。
+
+### 2. Attention分支与完整调用
+
+单位µs，均为原cudaPerf128样本中位数。
+
+| 输入 | TP | dense | 强制direct含pack | 强制union | 自动qsa | full_direct | full_union |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tp0_layer3_m12000 | 2 | 181.661 | 2485.854 | 2794.535 | 2725.875 | 2763.094 | 3147.256 |
+| tp0_layer3_m12000 | 4 | 109.300 | 2460.734 | 1595.168 | 1879.170 | 2656.374 | 1864.931 |
+| tp0_layer3_m12000 | 8 | 107.561 | 2444.113 | 1150.686 | 1434.848 | 2642.514 | 1420.327 |
+| tp0_layer47_m12000 | 2 | 182.001 | 2485.193 | 2704.954 | 2818.115 | 2760.735 | 3057.816 |
+| tp0_layer47_m12000 | 4 | 109.321 | 2459.253 | 1534.748 | 1817.030 | 2656.074 | 1802.829 |
+| tp0_layer47_m12000 | 8 | 108.021 | 2443.653 | 1127.826 | 1409.808 | 2642.573 | 1395.527 |
+| tp0_layer3_m11888 | 2 | 181.761 | 2444.033 | 2364.832 | 2674.194 | 2712.255 | 2708.354 |
+| tp0_layer3_m11888 | 4 | 109.040 | 2409.992 | 1398.148 | 1672.749 | 2605.273 | 1657.629 |
+| tp0_layer3_m11888 | 8 | 108.121 | 2395.813 | 1045.786 | 1320.807 | 2592.593 | 1307.066 |
+| tp0_layer47_m11888 | 2 | 181.841 | 2438.193 | 2597.994 | 2707.274 | 2713.775 | 2947.435 |
+| tp0_layer47_m11888 | 4 | 109.400 | 2411.252 | 1529.408 | 1811.109 | 2606.194 | 1795.309 |
+| tp0_layer47_m11888 | 8 | 107.701 | 2395.373 | 1137.866 | 1419.128 | 2592.774 | 1404.767 |
+| tp1_layer3_m12000 | 2 | 181.520 | 2483.373 | 2789.115 | 2720.614 | 2760.415 | 3140.197 |
+| tp1_layer3_m12000 | 4 | 109.200 | 2457.072 | 1591.069 | 1874.430 | 2654.014 | 1860.150 |
+| tp1_layer3_m12000 | 8 | 107.681 | 2442.692 | 1149.046 | 1432.908 | 2640.654 | 1417.488 |
+| tp1_layer47_m12000 | 2 | 181.541 | 2480.913 | 2695.434 | 2813.134 | 2759.494 | 3048.396 |
+| tp1_layer47_m12000 | 4 | 109.401 | 2457.313 | 1531.808 | 1814.229 | 2652.894 | 1799.210 |
+| tp1_layer47_m12000 | 8 | 107.901 | 2441.953 | 1125.446 | 1408.107 | 2640.414 | 1393.228 |
+| tp1_layer3_m11888 | 2 | 181.581 | 2441.293 | 2353.613 | 2663.494 | 2707.674 | 2696.515 |
+| tp1_layer3_m11888 | 4 | 109.341 | 2408.033 | 1394.027 | 1669.168 | 2603.234 | 1653.708 |
+| tp1_layer3_m11888 | 8 | 107.701 | 2392.472 | 1045.205 | 1320.847 | 2590.073 | 1306.486 |
+| tp1_layer47_m11888 | 2 | 181.561 | 2437.852 | 2590.374 | 2700.014 | 2712.814 | 2938.255 |
+| tp1_layer47_m11888 | 4 | 109.221 | 2410.592 | 1523.708 | 1804.890 | 2607.274 | 1789.689 |
+| tp1_layer47_m11888 | 8 | 107.561 | 2395.733 | 1135.786 | 1416.488 | 2593.274 | 1402.028 |
+| dense2048 | 2 | 162.421 | 299.481 | 172.041 | 174.941 | — | — |
+| dense2048 | 4 | 103.400 | 294.621 | 106.601 | 116.400 | — | — |
+| dense2048 | 8 | 101.620 | 292.121 | 104.161 | 114.621 | — | — |
+| dense2051 | 2 | 180.881 | 387.122 | 175.201 | 194.361 | — | — |
+| dense2051 | 4 | 108.860 | 384.282 | 110.521 | 122.120 | — | — |
+| dense2051 | 8 | 107.340 | 382.482 | 107.721 | 120.421 | — | — |
+| low | 2 | — | 589.363 | 2133.250 | 657.983 | 615.203 | 2236.892 |
+| low | 4 | — | 584.663 | 1906.510 | 643.283 | 610.243 | 2016.810 |
+| low | 8 | — | 582.803 | 1294.386 | 640.063 | 609.763 | 1425.987 |
+| high | 2 | — | 576.642 | 407.242 | 491.822 | 603.643 | 486.103 |
+| high | 4 | — | 570.943 | 215.161 | 291.961 | 597.082 | 287.401 |
+| high | 8 | — | 568.983 | 110.561 | 185.600 | 596.203 | 180.201 |
+| share50 | 2 | — | 585.242 | 1413.886 | 652.743 | 608.602 | 1505.447 |
+| share50 | 4 | — | 580.923 | 1284.986 | 640.543 | 605.422 | 1380.626 |
+| share50 | 8 | — | 579.023 | 996.044 | 636.242 | 605.502 | 1110.885 |
+| share75 | 2 | — | 582.063 | 954.224 | 649.503 | 607.323 | 1038.165 |
+| share75 | 4 | — | 576.443 | 825.044 | 637.363 | 602.443 | 909.724 |
+| share75 | 8 | — | 575.362 | 670.843 | 1218.765 | 601.383 | 768.883 |
+| short | 2 | — | 112.080 | 697.043 | 137.161 | 122.481 | 735.963 |
+| short | 4 | — | 110.761 | 919.445 | 135.021 | 121.320 | 964.244 |
+| short | 8 | — | 109.940 | 1199.325 | 133.801 | 120.361 | 1261.045 |
+| raw | 2 | — | 133.921 | 721.703 | 451.642 | 144.041 | 763.243 |
+| raw | 4 | — | 133.961 | 951.725 | 275.901 | 144.001 | 999.044 |
+| raw | 8 | — | 133.541 | 1253.965 | 275.721 | 144.061 | 1318.366 |
+| overbudget | 2 | — | 137.520 | 805.543 | 168.261 | 146.701 | 870.025 |
+| overbudget | 4 | — | 136.981 | 1181.365 | 561.523 | 146.401 | 1252.486 |
+| overbudget | 8 | — | 135.421 | 1877.769 | 563.303 | 145.961 | 1978.509 |
+| ragged_hk2 | 2 | 14.200 | 133.421 | 663.403 | 171.541 | 156.660 | 715.944 |
+| ragged_hk2 | 4 | 14.220 | 132.780 | 658.523 | 170.241 | 154.821 | 713.803 |
+| ragged_hk2 | 8 | 14.420 | 132.661 | 658.163 | 170.061 | 155.281 | 720.364 |
+
+有效TFLOPS，按实际selected token数×H×4×256计算，不包含union扩展/padding的额外工作。下表保留原L3 M12000数据，全部54形状见[有效TFLOPS表](../../../../mytest/mydata/qsa_tp_kernels_20260929_02/effective_table.txt)：
+
+| scope | TP2 | TP4 | TP8 |
+|---|---:|---:|---:|
+| dense | 142.342 | 118.288 | 60.101 |
+| prepared direct | 100.794 | 50.911 | 25.629 |
+| prepared union | 89.660 | 78.537 | 54.437 |
+| qsa完整 | 101.405 | 73.547 | 48.161 |
+| full_direct | 100.039 | 52.029 | 26.151 |
+| full_union | 87.828 | 74.109 | 48.654 |
+
+本输入自动qsa的TP4比TP2时延低31.06%（1.451×），TP8低47.36%（1.900×）。Prepared direct几乎不随TP缩短；union随query/head打包明显缩短。TP2自动混合比完整强制direct快1.35%、比完整强制union快13.39%；TP4/8强制union只比自动快0.76%/1.01%，两者都已把所有稀疏行送union，差别仍包括gated pack/direct空launch及准备策略。不是据此把公共入口改成强制union。
+
+续测8个真实capture的自动qsa：TP4比TP2快31.06%～37.45%（1.451～1.599×），TP8快47.33%～50.61%（1.899～2.025×）。分流并非全局最优：L47 M12000/TP2自动2818.115µs，强制完整direct2760.735µs；share75/TP8自动1218.765µs，强制direct601.383µs；overbudget/TP4自动561.523µs，强制direct146.401µs。全部慢例保留，本次只测试，不偷偷改路由阈值或用最佳分支替换自动结果。
+
+### 3. 自动qsa的query数、有效任务和实际launch
+
+| 输入 | TP | BQ | dense行 | union行 | direct行 | union任务 | direct有效CTA | qsa launch |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| tp0_layer3_m12000 | 2 | 10 | 2051 | 3929 | 6020 | 393 | 6020 | 8 |
+| tp0_layer3_m12000 | 4 | 21 | 2051 | 9949 | 0 | 474 | 0 | 8 |
+| tp0_layer3_m12000 | 8 | 32 | 2051 | 9949 | 0 | 311 | 0 | 8 |
+| tp0_layer47_m12000 | 2 | 10 | 2051 | 4269 | 5680 | 427 | 5680 | 8 |
+| tp0_layer47_m12000 | 4 | 21 | 2051 | 9949 | 0 | 474 | 0 | 8 |
+| tp0_layer47_m12000 | 8 | 32 | 2051 | 9949 | 0 | 311 | 0 | 8 |
+| tp0_layer3_m11888 | 2 | 10 | 2051 | 7909 | 1928 | 791 | 1928 | 8 |
+| tp0_layer3_m11888 | 4 | 21 | 2051 | 9837 | 0 | 469 | 0 | 8 |
+| tp0_layer3_m11888 | 8 | 32 | 2051 | 9837 | 0 | 308 | 0 | 8 |
+| tp0_layer47_m11888 | 2 | 10 | 2051 | 5599 | 4238 | 560 | 4238 | 8 |
+| tp0_layer47_m11888 | 4 | 21 | 2051 | 9837 | 0 | 469 | 0 | 8 |
+| tp0_layer47_m11888 | 8 | 32 | 2051 | 9837 | 0 | 308 | 0 | 8 |
+| tp1_layer3_m12000 | 2 | 10 | 2051 | 3929 | 6020 | 393 | 6020 | 8 |
+| tp1_layer3_m12000 | 4 | 21 | 2051 | 9949 | 0 | 474 | 0 | 8 |
+| tp1_layer3_m12000 | 8 | 32 | 2051 | 9949 | 0 | 311 | 0 | 8 |
+| tp1_layer47_m12000 | 2 | 10 | 2051 | 4269 | 5680 | 427 | 5680 | 8 |
+| tp1_layer47_m12000 | 4 | 21 | 2051 | 9949 | 0 | 474 | 0 | 8 |
+| tp1_layer47_m12000 | 8 | 32 | 2051 | 9949 | 0 | 311 | 0 | 8 |
+| tp1_layer3_m11888 | 2 | 10 | 2051 | 7909 | 1928 | 791 | 1928 | 8 |
+| tp1_layer3_m11888 | 4 | 21 | 2051 | 9837 | 0 | 469 | 0 | 8 |
+| tp1_layer3_m11888 | 8 | 32 | 2051 | 9837 | 0 | 308 | 0 | 8 |
+| tp1_layer47_m11888 | 2 | 10 | 2051 | 5599 | 4238 | 560 | 4238 | 8 |
+| tp1_layer47_m11888 | 4 | 21 | 2051 | 9837 | 0 | 469 | 0 | 8 |
+| tp1_layer47_m11888 | 8 | 32 | 2051 | 9837 | 0 | 308 | 0 | 8 |
+| dense2048 | 2 | — | 2048 | 0 | 0 | 0 | 0 | 4 |
+| dense2048 | 4 | — | 2048 | 0 | 0 | 0 | 0 | 4 |
+| dense2048 | 8 | — | 2048 | 0 | 0 | 0 | 0 | 4 |
+| dense2051 | 2 | — | 2051 | 0 | 0 | 0 | 0 | 4 |
+| dense2051 | 4 | — | 2051 | 0 | 0 | 0 | 0 | 4 |
+| dense2051 | 8 | — | 2051 | 0 | 0 | 0 | 0 | 4 |
+| low | 2 | 10 | 0 | 0 | 2048 | 0 | 2048 | 7 |
+| low | 4 | 16 | 0 | 0 | 2048 | 0 | 2048 | 7 |
+| low | 8 | 32 | 0 | 0 | 2048 | 0 | 2048 | 7 |
+| high | 2 | 10 | 0 | 2048 | 0 | 205 | 0 | 7 |
+| high | 4 | 16 | 0 | 2048 | 0 | 128 | 0 | 7 |
+| high | 8 | 32 | 0 | 2048 | 0 | 64 | 0 | 7 |
+| share50 | 2 | 10 | 0 | 0 | 2048 | 0 | 2048 | 7 |
+| share50 | 4 | 16 | 0 | 0 | 2048 | 0 | 2048 | 7 |
+| share50 | 8 | 32 | 0 | 0 | 2048 | 0 | 2048 | 7 |
+| share75 | 2 | 10 | 0 | 0 | 2048 | 0 | 2048 | 7 |
+| share75 | 4 | 16 | 0 | 0 | 2048 | 0 | 2048 | 7 |
+| share75 | 8 | 32 | 0 | 192 | 1856 | 6 | 1856 | 7 |
+| short | 2 | 10 | 0 | 0 | 64 | 0 | 64 | 7 |
+| short | 4 | 16 | 0 | 0 | 64 | 0 | 64 | 7 |
+| short | 8 | 32 | 0 | 0 | 64 | 0 | 64 | 7 |
+| raw | 2 | 10 | 0 | 3 | 30 | 1 | 8 | 6 |
+| raw | 4 | 16 | 0 | 1 | 32 | 1 | 8 | 6 |
+| raw | 8 | 32 | 0 | 1 | 32 | 1 | 8 | 6 |
+| overbudget | 2 | 10 | 0 | 0 | 68 | 0 | 17 | 6 |
+| overbudget | 4 | 16 | 0 | 4 | 64 | 1 | 16 | 6 |
+| overbudget | 8 | 32 | 0 | 4 | 64 | 1 | 16 | 6 |
+| ragged_hk2 | 2 | 10 | 33 | 0 | 9 | 0 | 6 | 7 |
+| ragged_hk2 | 4 | 16 | 33 | 0 | 9 | 0 | 6 | 7 |
+| ragged_hk2 | 8 | 32 | 33 | 0 | 9 | 0 | 6 | 7 |
+
+这些是query行/任务数，不是kernel launch数。真实capture三种TP的自动qsa每调用均**8次launch**：recover、compact、order/masks/validate、assert、dense、union、pack、direct各1次。TP4/8的direct行数为0，但pack/direct仍有gated空launch；不能写成“direct kernel未launch”。真实M12000的prepared dense/direct/union分别1/2/1次launch，full_direct/full_union各6次，强制路径仍保留2051行dense。合成纯dense只有4launch；无dense的packed稀疏为7launch、raw为6launch；ragged含两个dense请求launch所以共7次。Raw每CTA最多4query，一个CTA中可能同时有union和direct行，不能用行数除4直接当有效CTA数。
+
+这些数量由新[实际dispatch捕获](../../../../mytest/mydata/qsa_tp_kernels_20260929_01/dispatch_tp0_layer3_m12000/result.json)核实，不是从host注解猜测；总84个捕获dispatch的private/VGPRspill/SGPRspill三字段全0，其ELF与普通计时的编译产物对应。动态LDS与ELF固定LDS分开记录，见[资源审计](../../../../mytest/mydata/qsa_tp_kernels_20260929_01/dispatch_tp0_layer3_m12000/audit.json)。此捕获只验资源/launch，不测时延，不冒充profile占比。
+
+### 4. 其它kernel与准备总时间
+
+| 输入 | TP | prepare完整 | recover_scatter | compact | order_masks_validate | assert |
+|---|---:|---:|---:|---:|---:|---:|
+| tp0_layer3_m12000 | 2 | 137.900 | 93.240 | 22.400 | 24.241 | 6.040 |
+| tp0_layer3_m12000 | 4 | 165.481 | 93.121 | 19.000 | 55.980 | 6.040 |
+| tp0_layer3_m12000 | 8 | 166.921 | 92.740 | 16.120 | 60.120 | 6.040 |
+| tp0_layer47_m12000 | 2 | 140.321 | 93.261 | 22.820 | 26.100 | 6.040 |
+| tp0_layer47_m12000 | 4 | 164.281 | 93.040 | 19.120 | 54.360 | 6.040 |
+| tp0_layer47_m12000 | 8 | 165.041 | 92.620 | 15.800 | 58.640 | 6.040 |
+| tp0_layer3_m11888 | 2 | 150.601 | 92.140 | 24.960 | 35.440 | 6.041 |
+| tp0_layer3_m11888 | 4 | 156.261 | 91.841 | 19.280 | 47.520 | 6.040 |
+| tp0_layer3_m11888 | 8 | 158.120 | 91.341 | 16.060 | 52.800 | 6.041 |
+| tp0_layer47_m11888 | 2 | 142.261 | 92.301 | 22.880 | 29.620 | 6.040 |
+| tp0_layer47_m11888 | 4 | 162.521 | 91.800 | 19.100 | 53.940 | 6.040 |
+| tp0_layer47_m11888 | 8 | 165.441 | 91.280 | 16.760 | 59.840 | 6.040 |
+| tp1_layer3_m12000 | 2 | 138.200 | 93.121 | 22.980 | 24.320 | 6.040 |
+| tp1_layer3_m12000 | 4 | 165.641 | 93.000 | 19.000 | 55.880 | 6.040 |
+| tp1_layer3_m12000 | 8 | 167.281 | 92.641 | 16.441 | 60.081 | 6.040 |
+| tp1_layer47_m12000 | 2 | 140.001 | 93.461 | 23.040 | 26.020 | 6.040 |
+| tp1_layer47_m12000 | 4 | 164.321 | 93.101 | 19.300 | 54.201 | 6.040 |
+| tp1_layer47_m12000 | 8 | 165.681 | 92.601 | 16.200 | 58.681 | 6.040 |
+| tp1_layer3_m11888 | 2 | 150.601 | 92.300 | 24.880 | 35.400 | 6.040 |
+| tp1_layer3_m11888 | 4 | 156.080 | 91.821 | 19.320 | 47.400 | 6.040 |
+| tp1_layer3_m11888 | 8 | 158.541 | 91.520 | 16.500 | 52.861 | 6.040 |
+| tp1_layer47_m11888 | 2 | 142.461 | 92.341 | 23.060 | 29.440 | 6.040 |
+| tp1_layer47_m11888 | 4 | 162.581 | 91.880 | 19.080 | 53.961 | 6.040 |
+| tp1_layer47_m11888 | 8 | 165.060 | 91.200 | 16.240 | 59.480 | 6.040 |
+| dense2048 | 2 | 14.720 | 11.200 | — | 6.080 | 6.040 |
+| dense2048 | 4 | 14.880 | 11.220 | — | 6.080 | 6.000 |
+| dense2048 | 8 | 14.840 | 11.120 | — | 6.160 | 6.040 |
+| dense2051 | 2 | 15.160 | 11.121 | — | 6.200 | 6.040 |
+| dense2051 | 4 | 15.120 | 11.200 | — | 6.200 | 6.040 |
+| dense2051 | 8 | 15.000 | 11.280 | — | 6.160 | 6.040 |
+| low | 2 | 59.801 | 35.940 | 19.620 | 6.640 | 6.040 |
+| low | 4 | 54.441 | 35.680 | 15.240 | 6.160 | 6.040 |
+| low | 8 | 54.620 | 38.800 | 13.020 | 6.160 | 6.040 |
+| high | 2 | 78.401 | 36.800 | 34.480 | 9.040 | 6.040 |
+| high | 4 | 70.980 | 37.400 | 30.200 | 6.080 | 6.040 |
+| high | 8 | 70.240 | 40.841 | 27.020 | 6.160 | 6.040 |
+| share50 | 2 | 61.620 | 36.660 | 20.540 | 6.760 | 6.040 |
+| share50 | 4 | 56.260 | 36.701 | 16.040 | 6.160 | 6.040 |
+| share50 | 8 | 55.921 | 40.120 | 12.640 | 6.160 | 6.040 |
+| share75 | 2 | 60.820 | 36.560 | 20.720 | 6.680 | 6.040 |
+| share75 | 4 | 56.781 | 37.540 | 16.060 | 6.120 | 6.040 |
+| share75 | 8 | 81.460 | 39.780 | 26.440 | 17.600 | 6.040 |
+| short | 2 | 21.000 | 9.960 | 9.520 | 6.160 | 6.040 |
+| short | 4 | 20.980 | 10.080 | 9.560 | 6.120 | 6.040 |
+| short | 8 | 20.860 | 10.120 | 9.480 | 6.040 | 6.040 |
+| raw | 2 | 40.400 | 9.640 | 26.560 | 6.640 | 6.000 |
+| raw | 4 | 37.841 | 9.720 | 26.201 | 6.080 | 6.040 |
+| raw | 8 | 37.480 | 9.640 | 26.240 | 6.120 | 6.040 |
+| overbudget | 2 | 27.641 | 10.000 | 15.960 | 6.160 | 6.000 |
+| overbudget | 4 | 63.701 | 10.120 | 47.280 | 8.440 | 6.040 |
+| overbudget | 8 | 66.960 | 10.080 | 47.540 | 12.440 | 6.040 |
+| ragged_hk2 | 2 | 22.000 | 9.360 | 11.040 | 6.160 | 6.040 |
+| ragged_hk2 | 4 | 21.720 | 9.420 | 10.920 | 6.200 | 6.040 |
+| ragged_hk2 | 8 | 21.920 | 9.340 | 10.800 | 6.320 | 6.040 |
+
+单kernel事件严格按依赖顺序运行，中间有各自cudaPerf事件边界；**不可相加作为完整prepare或qsa时延**。完整54形状的独立pack/direct与auto-route组件在[组件表](../../../../mytest/mydata/qsa_tp_kernels_20260929_02/components_table.txt)，两主例摘录如下。Indexer属于另一计算阶段，本轮未测或改动。
+
+| 输入 | TP | pack独立 | direct kernel独立 | auto union | auto pack | auto direct kernel |
+|---|---:|---:|---:|---:|---:|---:|
+| tp0_layer3_m12000 | 2 | 12.141 | 2508.493 | 848.245 | 11.740 | 1547.008 |
+| tp0_layer3_m12000 | 4 | 12.160 | 2484.413 | 1593.369 | 6.040 | 16.600 |
+| tp0_layer3_m12000 | 8 | 12.120 | 2473.593 | 1150.406 | 6.040 | 15.961 |
+| tp0_layer47_m12000 | 2 | 12.040 | 2506.433 | 975.925 | 11.600 | 1510.368 |
+| tp0_layer47_m12000 | 4 | 12.041 | 2483.893 | 1532.888 | 6.040 | 16.600 |
+| tp0_layer47_m12000 | 8 | 11.920 | 2474.033 | 1128.226 | 6.040 | 16.080 |
+
+独立pack仅测搬运；独立direct kernel读取事先正确准备的PK/PV，不含pack。它与prepared direct总计是分场、不同事件前状态，不能相减或相加推算其它列；例如TP2 L3独立direct大于含pack整段中位并不矛盾。封装复用原设备kernel，134个独立组件的完整`STT_FUNC`机器码与对应原launcher产物逐字一致，见[机器码核验](../../../../mytest/mydata/qsa_tp_kernels_20260929_02/component_machine_match.json)。
+
+新profile内自动qsa，µs/调用均值及该调用kernel总时间占比（**不是普通128样本中位数**）：
+
+| kernel | L3 TP2 | L3 TP4 | L3 TP8 | L47 TP2 | L47 TP4 | L47 TP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| recover_scatter | 95.000 / 3.448% | 91.111 / 4.843% | 91.191 / 6.339% | 94.815 / 3.335% | 91.203 / 5.014% | 91.351 / 6.445% |
+| compact | 21.823 / 0.792% | 16.743 / 0.890% | 14.595 / 1.015% | 22.399 / 0.788% | 17.275 / 0.950% | 15.039 / 1.061% |
+| order_masks_validate | 22.995 / 0.835% | 54.147 / 2.878% | 58.351 / 4.056% | 25.427 / 0.894% | 52.555 / 2.889% | 57.159 / 4.033% |
+| assert | 4.219 / 0.153% | 4.479 / 0.238% | 4.443 / 0.309% | 4.219 / 0.148% | 4.331 / 0.238% | 4.379 / 0.309% |
+| dense | 184.480 / 6.696% | 106.780 / 5.676% | 105.435 / 7.330% | 179.876 / 6.328% | 106.995 / 5.882% | 105.756 / 7.462% |
+| union | 848.339 / 30.791% | 1589.943 / 84.510% | 1146.765 / 79.720% | 974.512 / 34.281% | 1528.507 / 84.035% | 1125.841 / 79.434% |
+| pack | 10.447 / 0.379% | 4.387 / 0.233% | 4.303 / 0.299% | 10.187 / 0.358% | 4.251 / 0.234% | 4.347 / 0.307% |
+| direct | 1567.811 / 56.905% | 13.771 / 0.732% | 13.415 / 0.933% | 1531.275 / 53.867% | 13.767 / 0.757% | 13.459 / 0.950% |
+
+54形状的auto/full_direct/full_union逐kernel均值、占比、次数见[完整profile表](../../../../mytest/mydata/qsa_tp_kernels_20260929_02/profile_table.txt)。共1500个host调用与9030kernel通过correlation逐一匹配；只计`user_annotation`而非镜像的`gpu_user_annotation`。单次profile均值可受首调用空隙/host调度影响，不用它替换普通时延。
+
+### 5. 验证、原失败与续测验收
+
+完整L3三个TP、所有路径均对captured/native及FP32选行用原`.02/.02`检查，最大绝对误差0.015625，dense与capture逐bit相同；同版10buffer重复、guard、精确selection/compact/mask、计时实际输出和源码前后检查通过。普通L3门禁entry/pre/post的use为0/5/0%，VRAM0/6/6%，PTL均Enabled/VECTOR,F8；每10samples间隙的[进程快照](../../../../mytest/mydata/qsa_tp_kernels_20260929_01/ordinary_tp0_layer3_m12000/process_checks.jsonl)只出现该进程的host PID，未发现同卡外部进程，不承诺覆盖快照之间的瞬时任务。
+
+第二组L47在[采样前门禁](../../../../mytest/mydata/qsa_tp_kernels_20260929_01/ordinary_tp0_layer47_m12000/hardware_before_samples.json)use6%（门限5%）、VRAM6%、PTL通过，0条raw，停止整个性能campaign且不重试。该时刻进程列表仅本进程、CU占用0，因此不能将6%直接归因外部干扰，可能为已结束准备工作的遥测窗口，未据此放宽门禁或等待到通过。原[失败记录](../../../../mytest/mydata/qsa_tp_kernels_20260929_01/ordinary_tp0_layer47_m12000/result.json)保留。
+
+上段为原轮次停止状态：当时1输入完成、1输入采样前失败、16输入未运行。用户随后明确要求续测，现已在新目录完成剩余17个普通场次、18个profile场次、18个独立组件场次；合并原L3得到**18输入×3TP全部完成**。新旧raw/结果/失败收据独立存放，不覆盖原“complete=false”。
+
+续测保持相同GPU4、源码、输入、原cudaPerf、10buffer/2warmup/128samples及5%/20%/PTL门槛。调整的是采样前组织顺序：先完成GPU检查/预热和NaN预填，随后完成必须的CPU源码/ELF/地址/布局审计，最后一次性读取门禁；没有sleep或循环等到空闲。AMD全局PID在GPU4上零内存、零引擎、零CU/SDMA的记录保留，但不误判为实际同卡工作；有任一实际用量的外部PID仍拒绝。续测159次门禁全部通过，最高use1%、VRAM8%；加原L3为162次。739次进程快照未发现同卡外部资源占用，不保证捕捉快照间瞬时进程，也不把GPU0/1并行服务影响说成已完全排除。
+
+所有测量输出、原`.02/.02`、input hash、重复bitexact、guards和精确plan/mask检查通过；1424条编译资源记录的三个private/spill字段均0（含重复特化，不等于1424个不同kernel），独立组件134个机器码符号与原kernel一致。保留长尾，如share50/TP4的qsa中位640.543µs、max2250.210µs；不挑快段。较短独立事件普遍比profile中的kernel duration多事件/launch边界成本，不推算硬件周期。
+
+本次只完成离线矩阵；没有新多卡服务、TTFT、indexer测试或运行源码/Git index/commit/push/硬件设置改动。另一会话登记的**QSA-T13多请求混合prefill单元素`.02`越界仍未解决**，不能用本轮capture/合成测试通过替代真实C32场景验收。更新前表格正文有完整快照，旧性能/失败数据及其它会话新增记录保留。
+
+## 2026-09-29：indexer decode第一阶段（分页logits替换，已实现）
+
+用户要求继续实现decode支持。本阶段替换decode MQA，即SGLang按graph全宽做gather的Torch fallback；top-k与expand仍用SGLang原kernel，decode prep/压缩不改（下一阶段）。离线正式结果、ISA与探索数据在[qsa_indexer_decode_20260929_01](../../../../mytest/mydata/qsa_indexer_decode_20260929_01)。系统测试见[v2 study](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_02)及其[分析](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_02/analysis_041225.json)；中止的[v1 study](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_01)保留。本节使用PyHIP .venv；离线测试用GPU3，系统测试用GPU0/1。
+
+### 1. 实现
+
+- **接入**：`PYHIP_QSA_INDEXER_DECODE=1`（默认0，与prefill的`PYHIP_QSA_INDEXER`独立）时，AROUND hook `QSAIndexer.select_decode_tokens`；eager decode和CUDA graph capture都接。复用基础3个及indexer 9个上游SHA，包括`mqa`和`fast_topk`。
+- **资格**：需满足以下条件，否则走原实现：
+  - gfx942；module为4×128头、ratio 4、top512/2048；
+  - q为连续BF16 [rows,4或8,128]，其中8头是fused prep的零padding，只读前4头；rows<65536；
+  - 压缩cache为连续BF16 [pages,16,1,128]，小于2 GiB；
+  - 页表为连续int32 [rows,P]，宽度等于16P；lengths为int32。
+- **运行时**：[indexer.py](indexer.py)的`decode_indexer`依次调用：
+  - `torch.empty`分配[rows,16P]的FP32 logits；
+  - FlyDSL [indexer_decode.py](indexer_decode.py)分页logits；
+  - SGLang `fast_topk(logits, lengths, 512, row_starts=常驻零buffer)`；
+  - SGLang Triton expand。
+
+  每层graph从16个kernel降到3个。零buffer只在非capture时分配；capture中不够大时退回fast_topk自带的zeros，避免缓存capture内存。
+- **Graph安全**：无host同步。grid=(splits,rows)只由静态形状决定，长度和页号都在设备端读取。FlyDSL在SGLang capture前的两次eager warmup中编译，冷缓存约0.5–0.6 s。
+- **Kernel**：
+  - 分工：行r的wave w（CTA x）处理页4x+w、4x+w+4·splits……；splits=min(⌈P/4⌉, ⌈8·CU/rows⌉)。
+  - 每页16个key，占连续4 KiB。页数据用4条1 KiB合并load读入，下一页在寄存器中预取；再经每wave 4 KiB LDS转置，XOR swizzle，两侧均无bank冲突。
+  - 计算：`v_mfma_f32_16x16x16_bf16`以4头为行（行4..15读0）、16个key为列。lane j<16拿到key j的4个头分数，ReLU、头求和、scale都在lane内完成。
+  - 其它：页id每64页一次向量load，再用readlane取出。部分页中超出length的位置写-inf，其余宽度不写（fast_topk只读[0,length)）。
+  - 资源：VGPR 68、SGPR 40、LDS 16 KiB，private与spill均为0，见[ISA](../../../../mytest/mydata/qsa_indexer_decode_20260929_01/isa_final)。
+
+### 2. 访存设计测量（探索性，非正式）
+
+初版按MFMA布局直接load，每个quarter-wave同时访问16个key，即16条cache line，只达到约2 TB/s。下表为GPU3上图重放中位数（µs），单位行×key，8 CTA/CU。标“结果错误”的两个变体只改地址，用来测带宽，计算结果不对。总数据≤256 MiB的集合在重放间可能部分命中MALL。完整数据见[variants_exploratory.json](../../../../mytest/mydata/qsa_indexer_decode_20260929_01/variants_exploratory.json)，脚本为[qsa_decode_variants.py](../../../../mytest/qsa_decode_variants.py)。
+
+| 变体 | 32×3000 | 8×16384 | 32×16384 | 32×65536 |
+|---|---:|---:|---:|---:|
+| 直接MFMA布局load（初版） | 18.8 | 23.5 | 66.3 | 285.9 |
+| 仅合并为1 KiB地址（结果错误） | 11.1 | 16.5 | 30.4 | 166.9 |
+| 仅每quad 64 B地址（结果错误） | 12.6 | 13.7 | 36.3 | 193.5 |
+| 直接load＋页预取 | 23.1 | 27.5 | 68.4 | 260.3 |
+| LDS转置 | 13.2 | 19.5 | 35.9 | 207.8 |
+| **LDS转置＋寄存器页预取（采用）** | 12.5 | 12.9 | 33.1 | 197.8 |
+
+两个LDS版本都与初版逐bit一致。采用版单独计时：logits为3.1/11.1/33.0/171.6 µs（1×3000/32×3000/32×16384/32×65536），32×65536约3.1 TB/s；同条件下fast_topk为12.2/13.9/22.9/51.9 µs，expand约3 µs。
+
+### 3. 正确性
+
+- [test_indexer.py](test_indexer.py)新增decode测试，共26项：
+  - 12种长度/页表组合，q分4头和8头（零padding），共24项。组合覆盖长度0/1/17/511/512/513/3000、含0长度的多行、16384×8、32行3000+37i、65536/65535；页表乱序，长度外为stale页号。
+  - 1项graph capture后改写长度、页表和cache，按三组长度重放。
+  - 1项资格回退。
+- 全部测试：test_indexer 56项＋adapter 1项通过，8项perf deselect。
+- logits相对FP64最大误差≤2.4e-7（阈值1e-6），部分页尾部为-inf。token集合与SGLang decode相同，唯一差异出现在513 key：ReLU后多个key精确为0并列，FP64违例为0。
+- 正式9 shape×10 buffer的token集合全部与SGLang一致。
+- decode不做服务内逐调用校验，因为capture中不能同步。
+
+### 4. 正式性能
+
+GPU3，03:17–03:19。协议：每臂每buffer各capture一个`select_decode_tokens` CUDA graph，重放计时；每个buffer使用独立的随机pool/页表/query；原cudaPerf，10 buffers、2 warmup、128 samples，AB/BA交错；三次门禁全过，2304条raw保留，见[formal_v1](../../../../mytest/mydata/qsa_indexer_decode_20260929_01/formal_v1)。表宽4096页，对应服务的262144上下文。index头和权重在TP间复制，所以TP2/4/8每rank的工作相同；TP4/8数值由此派生，不是多卡实测。
+
+| 行×压缩key | SGLang µs | PyHIP µs | 配对比中位 | 加速 |
+|---|---:|---:|---:|---:|
+| 1×3000 | 110.300 | 22.440 | 0.2025 | 4.9× |
+| 1×16384 | 121.721 | 32.640 | 0.2681 | 3.7× |
+| 1×65536 | 155.921 | 71.021 | 0.4509 | 2.2× |
+| 8×3000 | 473.603 | 24.880 | 0.0525 | 19.0× |
+| 8×16384 | 493.503 | 44.380 | 0.0895 | 11.1× |
+| 8×65536 | 546.663 | 113.001 | 0.2073 | 4.8× |
+| 32×3000 | 1727.569 | 31.720 | 0.0183 | 54.5× |
+| 32×16384 | 1805.110 | 79.001 | 0.0437 | 22.8× |
+| 32×65536 | 1888.890 | 250.182 | 0.1317 | 7.6× |
+
+SGLang的成本几乎只随行数增长，与实际长度基本无关。PyHIP在短上下文下以fast_topk为主（约12 µs）；65536 key时logits与fast_topk（约50 µs）都显著。
+
+### 5. 实际TP2系统
+
+- **v1中止**：study v1沿用`PYHIP_QSA_VALIDATE=1`。current臂的C1完成（128请求，ITL中位13.44ms），C32 warmup也完成。C32第1轮在一个16352行混合prefill中，**QSA attention**的服务内校验失败：1/50233344个元素超过`.02/.02`，最大|diff| 0.02136，位置(13756,5,220)，期望值约0.020。服务因此中止。这与decode改动无关（该臂未开decode），但是attention在多请求混合布局上的真实越界，需要attention工作跟进。原始日志在v1 `current_01/server.log`约37396行。
+- **v2协议**：两臂都设`PYHIP_QSA_VALIDATE=0`（即生产设置），C32每轮使用相同fixture顺序，其余不变。
+  - 顺序服务，GPU0/1，原launcher，seed 42，chunk 16384，decode graph 32。两臂都开prefill indexer，只差`PYHIP_QSA_INDEXER_DECODE`。
+  - 两臂的独立包都是当前13源码，包含其他会话尚未提交的prepare.py（H6分组只作用于TP4形状）。
+  - C1：10条约12k fixture，128请求，输出64，并发1。
+  - C32：1轮warmup＋3轮测量，每轮32并发，输出128。mamba状态池只允许31路同时decode。
+- **清理**：current臂的after_teardown快照在SIGKILL后立即读到显存未释放，因此status为complete=false。测量和profile均已完成；稍后复查显存已释放，见[cleanup_recheck.json](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_02/current_01/cleanup_recheck.json)。decode臂全部通过。
+
+| 指标（中位） | current | decode | 变化 |
+|---|---:|---:|---:|
+| C1 ITL ms（p10/p90） | 13.440（13.401/13.476） | 12.209（12.168/12.254） | −9.16% |
+| C1 TTFT ms | 884.2 | 891.6 | +0.8%（prefill路径未变，服务间差） |
+| C1 请求时延 ms（64 token） | 1730.6 | 1660.7 | −4.0% |
+| C32（31路decode）ITL ms（p10/p90） | 43.261（42.621/43.845） | 23.491（22.930/23.949） | −45.7% |
+| C32 每轮墙钟 s | 36.0 | 33.2–33.4 | 以prefill为主 |
+
+两臂各有一次profile（原4条12000→5脚本），每rank 20个decode graph重放。每层indexer kernel如下，µs，rank0/rank1：
+
+| 部分 | current | decode |
+|---|---:|---:|
+| prep/压缩 | 83.2 / 84.4（19个） | 83.2 / 85.0（19个） |
+| MQA | 112.9 / 113.0（15个） | **4.5 / 4.5（1个）** |
+| fast_topk | 12.4 / 12.0 | 11.9 / 11.9 |
+| expand | 5.0 / 5.1 | 5.0 / 5.3 |
+| 每步kernel总和 | 15985 / 15983 | 14729 / 14727 |
+
+current臂按启发式切分时，fallback第一个`page_table.long()`转换（约6.2 µs）会被算进prep，脚本原值为prep 89.4/90.6、MQA 106.7/106.7；上表已把它归回MQA。每步kernel总和减少约1.26 ms（含profiler），与C1 ITL减少1.23 ms一致。
+
+输出：C1中current臂内部结果唯一的7个fixture，decode臂给出完全相同的文本；C32中对应的6个也相同。fixture 0/5/8（C32还有2）在两臂内部就有多个不同输出，无法据此比较。这不是逐bit或模型质量认证，未跑长上下文精度测试。
+
+### 6. 限制与下一步
+
+- 现在decode indexer每层约105 µs，其中prep/压缩83–85 µs（19个小kernel）占主导，C1每步约1.0 ms（profile）。下一阶段是融合decode prep：q norm/RoPE、ring写入、组边界均值norm RoPE压缩。可复用prefill已逐bit对齐的Triton helper，预计每步再省约0.9 ms，此为估计。
+- fast_topk加expand每层约17 µs（65536 key时约55 µs）。CTA级top-k融合expand预计每层可省10 µs以上，排在prep之后。
+- MTP/target-verify在结构上也会命中这个hook，但speculative未开启，也未测试。65536以上的压缩宽度可以运行，但未测。
+- 未修改SGLang、AITER、硬件设置或其他会话的文件；未commit/push。v1数据、旧prefix正文保留。
+
+补充：记录后最终回归时，`test_decode_graph_replay`原先对SGLang结果做逐集合精确比较，出现1次间歇失败（单独重跑3次通过）。原因是ReLU精确为0的并列key，或近0的符号翻转，改变了fast_topk保留哪一个并列块。该测试已改为与合成用例相同的tie-aware复核：logits对比FP64，FP64边界违例≤1e-5。改后完整回归两次均57通过。此前正式、系统数据使用各自保存的源码快照，不受影响。
+
+## 2026-09-29：TODO追加QSA-T13——attention服务内`.02`校验在多请求混合prefill越界（原始登记，处理进展见后文）
+
+本条接续[TODO总表](opt.md#L1922)的QSA-T01～T12编号，保留indexer会话原始登记。下列“未复现/未定位”是登记时状态；attention会话已复现同一失败并证明旧参考误差，最新处理见[QSA-T13复现与修复](#qsa-t13-resolution)，不改写原日志或失败收据。
+
+- **状态**：未复现、未定位层号、未修复。
+- **触发环境**：[v1 study](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_01)的current臂。
+  - 开关：`PYHIP_QSA_PREFILL=1`、`PYHIP_QSA_INDEXER=1`、`PYHIP_QSA_INDEXER_DECODE=0`、`PYHIP_QSA_VALIDATE=1`。
+  - 实际TP2，GPU0/1，原launcher，seed 42，chunk 16384，max running 32，radix未命中（`#cached-token: 0`）。
+  - 插件为当时13源码的[独立包](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_01/current_01/plugin/pyhip_qsa_runtime/source_manifest.json)，包含当时工作区的prepare.py（H6分组仅作用于H6，TP2的H12不受影响）。
+- **现象**：2026-09-29 03:42:09，TP0在C32第1轮（测量轮）的EXTEND forward中出错。出错位置是`plugin._State.execute`里的`torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)`。
+  - 1/50233344个元素不满足：50233344＝16352行×12个local head×256。
+  - 最大绝对差0.0213623046875，位置(13756, 5, 220)；相对差1.0625，推得|expected|≈0.0201，允许值≈0.0204，超出约5%。
+  - Scheduler异常退出，TP1随后因gloo对端关闭退出，客户端32个请求全部断开。
+- **已知布局线索**：
+  - C32第1轮32个并发请求按fixture`(32+i)%10`提交，即2,3,…,9,0,1,…。实际prompt长度为{0:12000, 1:12000, 2:11888, 3:12000, 4:12000, 5:12000, 6:12000, 7:11667, 8:11851, 9:12000}。prefix全部来自chunked prefill本身。
+  - 异常前最后一条TP0 prefill日志（server.log第36241行）：03:41:46，`#new-seq: 2, #new-token: 16384, #running-req: 24, #queue-req: 4, #pending-token: 76110`。越界输出只有16352行，与16384相差32行，原因未核实。
+  - 新布局出现时会先编译Triton `qsa_order_masks_validate`/`qsa_recover_scatter`（约1.3–2.3 s），再做一次原路径对照。C1、C32 warmup轮及第1轮之前已执行的batch都没有触发断言。
+  - 未知：出错层号（断言信息不含layer）、行13756属于哪个请求段及其prefix、该行走dense/union/direct哪一支、是否能确定性复现。
+- **证据**：
+  - v1 `current_01/server.log`：第37396–37478行为完整traceback，第25080–36241行为第1轮全部prefill batch。
+  - [script_v1.py](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_01/script_v1.py)（hash与v1 identity一致）可按同一协议重跑。
+  - `current_01/ordinary_raw.jsonl`保留C1 128条及warmup轮32条。
+- **影响**：
+  - 离线真实capture和合成用例此前都在原`.02/.02`容差内通过；这是首次在32并发、多请求混合prefill中观察到的单元素越界。
+  - 生产设置（`PYHIP_QSA_VALIDATE=0`）不会中止服务，但输出中同样含有这类误差。
+  - decode第一阶段的v2系统测试改用`PYHIP_QSA_VALIDATE=0`，其结论不依赖这项校验。
+- **建议处理顺序**：
+  1. 在校验失败分支raise之前，先保存layer_id、queries/prefixes、scale以及q/k/v/indices/output/expected，保证下次可离线重放。
+  2. 用script_v1同一协议（`VALIDATE=1`）重跑C32，或直接构造相同的多请求/prefix布局，确认能否复现。
+  3. 与FP32/FP64参考比较，区分误差来自QSA（dense/union/direct分支、归约顺序、BF16舍入）还是SGLang原实现（expected本身也是BF16近似）。
+  4. 若确认只是舍入累积，是否改容差或算法由用户决定，不得自行放宽`.02`，也不能靠删样本或绕路由回避。
+  5. 修复后，在开启`VALIDATE=1`的多请求C32服务上回归，性能对照保留TP2/4/8（TP4/8标注为派生）。
+
+<a id="qsa-current-pseudocode"></a>
+
+## 2026-09-29：当前QSA完整伪代码——H6均衡分组、4个准备kernel、各attention kernel
+
+对应本次TP矩阵冻结的[qsa.py](qsa.py)、[prepare.py](prepare.py)、[dense.py](dense.py)、[union.py](union.py)、[direct.py](direct.py)、[_direct_packed.py](_direct_packed.py)；这些源码在续测前后未变。下面是可核对控制流与数值依赖的伪代码，不是可执行实现，也不是逐cycle ISA。`MFMA`、归约、pack、DMA、shuffle均为kernel内部工作，不额外计launch。保留原FP32加法树、half-up/RNE区别、wait和CTA屏障；不能凭伪代码把不同结合顺序当逐bit等价。后续[QSA-T13定位](#qsa-t13-resolution)只修正服务校验参考，以上attention设备计算与本节伪代码仍未改变。
+
+### P0. 数据契约与host plan
+
+| 记号 | 当前含义 |
+|---|---|
+| Q、K、V、O | 连续BF16 Q/O[M,H,256]，K/V[N,HK,256]；G=H/HK≤16，只支持3D |
+| I | 只读int32[M,2051]，每行≤512个完整4-token块，接0～3个因果尾token，其余−1 |
+| pos、seq、length | 由host query/prefix长度生成的device元数据；token ID是请求内相对编号 |
+| RB、Errors、Valid | 私有int32[M,512]已排序完整块ID、int32[M]错误、预分配bool标量 |
+| Meta[g] | first_query、rows、request_K_base、kv_len、first_position |
+| DM[g,b] | uint32 membership；bit q代表组内query q选中块b；**分配时和每次prepare结束后均为0** |
+| UB、UM、Counts | compact块ID、uint32成员位、(并集块数U, 完整common N64 tile数) |
+| Active、Order、QueryTile | Active=1走union/0走direct；Order为持久worker任务顺序；dense行QueryTile=−1 |
+| Masks[g,nt,q,quarter] | 每word低16bit对应该lane的16个score；跳过完整common前缀的未写区域 |
+| PK、PV | 原K/V的私有按4-token块物理置换，只供packed direct；合计≤64MiB |
+
+```text
+function make_workspace(Q,K,V,I, query_lens,prefix_lens,scale):
+	allocate CU offsets, pos, seq, kv_len, RB, Errors, scalar Valid
+	dense_count[s] = min(query_lens[s], max(0,2051-prefix_lens[s]))
+	make one dense Q/O view and prefix+dense_count K/V view per nonempty dense request
+	if sum(dense_count)==M: return W without union/direct
+
+	G=H/HK; CU=device.multi_processor_count; multiplier=2
+	BQ=min(32,128//G) if G==12 else min(32,power_of_two_floor(128//G))
+	balanced = G==6 and HK==1 and single_request and prefix==0
+			   and sparse_rows >= 21*CU*multiplier
+	if balanced: BQ=21
+	for request s, starting at local=dense_count[s]:
+		remaining_groups=ceil((query_len-local)/BQ)
+		while local<query_len:
+			end=local+ceil((query_len-local)/remaining_groups) if balanced
+				else min(query_len,(local//BQ+1)*BQ)
+			append Meta(first=Q_base+local,rows=end-local,K_base,kv_len,prefix+local)
+			QueryTile[first:first+rows]=new group ID
+			local=end; remaining_groups-=1
+	GP=G                                   # no power-of-two head padding
+	MAX_BLOCKS=ceil(max_request_kv_len/4)
+	CAP=16*ceil(min(MAX_BLOCKS,BQ*513)/16)
+	TASKS=num_groups*HK*ceil(BQ*GP/128)
+	GRID=min(TASKS,CU*(1 if G==12 else 2))
+	allocate zero DM, uninitialized UB/UM/Masks/Counts/Active/Order
+
+	packed = single_request and N%4==0 and bytes(K)+bytes(V)<=64MiB
+			 and 2*K.numel+HK*1536+512 < 2^32
+	direct_rows_per_CTA=1 if packed else 4
+	build direct Meta for sparse suffix in groups of direct_rows_per_CTA
+	if packed and direct has tasks: allocate PK like K, PV like V
+	direct.source_blocks = RB               # no second recovery/sort
+	direct.Active/QueryTile alias union's plan
+	union.packed_direct = PK exists
+	return W
+```
+
+本机80CU时H6门槛是3360个稀疏query；P0公共入口总长至少5411。H12/6/3真实12k的BQ为10/21/32；H6短batch或prefix路径仍BQ16。工作区按device/stream/layout缓存，普通项LRU最多8，captured项固定至graph指针生命周期，可能使总数超过8；不是跨stream共享scratch池。
+
+### P1. 公共`qsa`：host调度与实际launch顺序
+
+```text
+function qsa(Q,K,V,I, query_lens,prefix_lens,scale=1/16,out=None):
+	validate original dtype/3D shape/contiguity/alignment/byte spans/inference-only
+	validate host lengths, finite positive scale, I[M,2051]
+	O=out or empty_like(Q); reject O overlap with Q/K/V/I
+	if M==0: return O
+	with process lock and Q.device:
+		require one GPU per process
+		stream=current_stream(Q.device)
+		W=cache(device,stream,query_lens,prefix_lens,H,HK,scale)
+		if absent: require not graph_capture; W=make_workspace(...)
+		mark W recently used; pin W if graph_capture
+		bind metadata to this call's Q/K/V/I
+
+		launch K1 qsa_recover_scatter(..., W.union if present)
+		if W.union has groups:
+			launch K2 qsa_compact(..., CLEAR=True)
+		launch K3 qsa_order_masks_validate(..., CHECK=True)
+		launch K4 Torch assert_async(W.Valid)
+
+		for nonempty dense request: launch K5 dense_qsa_bf16_d256_bounded
+		if W.union exists:
+			launch K6 union_qsa_bf16_d256(Active,Order,Masks,...)
+			if W.direct.PK exists:
+				launch K7 direct_pack_kv_bf16_d256(...,GATED=True)
+				launch K8p direct_qsa_bf16_d256(...,PK,PV,GATED=True)
+			else:
+				launch K8r direct_qsa_bf16_d256(...,K,V,GATED=True)
+	return O                               # asynchronous; no Valid.item()
+```
+
+同stream launch有序。公开路径不在host读取Active；全union仍launch gated pack/direct，全direct仍launch gated union。典型单请求dense+packed sparse是8launch，raw是7；无dense时分别7/6；纯dense是3个准备/验证＋每非空请求1个dense，单请求4launch。没有旧版CompareEq、BooleanAll、每次DM.zero_、独立mask或排序launch。计时器的device spin不属于QSA。
+
+### K1. `qsa_recover_scatter`：一query一wave，恢复/验证/散射一次读
+
+```text
+kernel qsa_recover_scatter(program, M, REVERSE=single_request):
+	row=M-1-program if REVERSE else program
+	p=pos[row]; length=kv_len[seq[row]]; visible=p+1
+	complete=min(visible//4,512); tail=visible%4; tail_start=visible-tail
+	bad = p<0 or visible>length
+	parallel j=0..511:
+		a,b,c,d=I[row,4*j:4*j+4]            # each tuple loaded once
+		full=j<complete
+		valid=a>=0 and a%4==0 and (b,c,d)==(a+1,a+2,a+3)
+			  and d<visible and d<length
+		if full: bad |= not valid
+		else:
+			expected=(-1,-1,-1,-1)
+			if j==complete:
+				expected[0:tail]=(tail_start,tail_start+1,tail_start+2)[0:tail]
+			bad |= (a,b,c,d)!=expected
+		block[j]=a//4 if full and valid else -1
+		ordered[j]=block[j] if full else INT32_MAX
+	parallel e=0..2:
+		expected=tail_start+e if complete==512 and e<tail else -1
+		bad |= I[row,2048+e]!=expected
+
+	canonical = visible<=2051 and all(block[j]==j for j<complete)
+	if not canonical:
+		ordered=ascending_bitonic_sort_512(ordered)      # 45 min/max rounds
+		bad |= any(ordered[j]==ordered[j-1] for 0<j<complete)
+	RB[row,j]=ordered[j] if j<complete else -1
+	Errors[row]=int(bad)
+
+	if DM exists and QueryTile[row]>=0:
+		g=QueryTile[row]; q=row-Meta[g].first
+		for j<complete with 0<=ordered[j]<MAX_BLOCKS:
+			atomic_OR(DM[g,ordered[j]], uint32(1)<<q, relaxed)
+		if tail!=0 and 0<=visible//4<MAX_BLOCKS:
+			atomic_OR(DM[g,visible//4], uint32(1)<<q, relaxed)
+```
+
+production为64线程/1wave，不是4query/CTA。Canonical跳排序必须先满足完整四元组检查；非canonical在输出前排序并检测重复。非法块先sanitise且散射有范围mask，最终Errors由K3/K4拒绝，不能把无效输入当有效attention继续使用。
+
+### K2. `qsa_compact`：两遍固定宽扫描、决定分支并消费清零DM
+
+```text
+kernel qsa_compact(group g, CLEAR=True, REVERSE=single_request):
+	g=num_groups-1-program if REVERSE else program
+	r=Meta[g].rows; p0=Meta[g].first_position
+	C=min(1024,next_power_of_two(MAX_BLOCKS))             # 4 waves
+	limit=min(MAX_BLOCKS,ceil((p0+r)/4)) if CLEAR else MAX_BLOCKS
+	ALL=uint32(0xffffffff)>>(32-r)
+	U=0; common_count=0
+	for start=0; start<limit; start+=C:
+		ids=start+parallel_range(C)
+		bits=load(DM[g,ids], ids<MAX_BLOCKS, default=0)
+		present=bits!=0
+		common=present and bits==ALL and 4*ids+3<=p0
+		U+=sum(present); common_count+=sum(common)
+	n[q]=4*min((p0+q+1)//4,512)+(p0+q+1)%4
+	if PACKED_DIRECT:
+		enabled=160*ceil(U/16) <= 17*sum(ceil(n[q]/32) for q<r)
+	else:
+		enabled=U*r <= RHO*sum(ceil(n[q]/4) for q<r)      # public RHO=4
+	Active[g]=enabled
+	Counts[g]=(U, common_count//16 if enabled else 0)
+
+	if enabled:
+		common_base=0; other_base=common_count
+		for same C-wide chunk:
+			recompute present/common; other=present and not common
+			destination=common_base+inclusive_scan(common)-1 if common
+						else other_base+inclusive_scan(other)-1
+			store UB[g,destination]=ids, UM[g,destination]=bits where present
+			common_base+=sum(common); other_base+=sum(other)
+			if CLEAR: store DM[g,ids]=0 where ids<MAX_BLOCKS
+	elif CLEAR:
+		for same C-wide chunks: store DM[g,ids]=0 where ids<MAX_BLOCKS
+```
+
+末chunk按`ids<MAX_BLOCKS`界定，可能覆盖到limit后的少量槽位；这些槽位按DM生命周期不变量为0。完整common块升序在前、其余升序在后，不是全局升序；common尾不足16块的部分仍要mask。Disabled组的UB/UM/Masks可留旧值，消费者必须先看Active。Private DM在两种分支都清零，下次无需独立zero kernel。
+
+### K3. `qsa_order_masks_validate`：同一次launch的独立CTA职责
+
+host设置`SIZE=min(4096,next_pow2(Order.numel))`，`ORDER_CTAS=ceil(Order.numel/SIZE)`；当SIZE>1024用8wave，否则4wave；mask粒度B=wave数×64，每union组4个mask CTA。任务key可证明小于2³¹时用int32，否则int64。排序、错误归约、mask写入互不依赖，无inter-CTA自旋。
+
+```text
+kernel qsa_order_masks_validate(program):
+	if no Masks or program<ORDER_CTAS:
+		if TASKS>0:
+			rank=program*SIZE+parallel_range(SIZE)
+			tile=(rank%(TASKS//HK))//SLICES
+			cost=ceil(Counts[tile].U/16) if rank<TASKS and Active[tile] else 0
+			key=(cost<<SHIFT)+(TASKS-1-rank) if rank<TASKS else -1
+			keys=sort_descending(key)                   # within each chunk
+			task=TASKS-1-(keys&((1<<SHIFT)-1)) if keys>=0 else -1
+			worker_row,col=divmod(rank,GRID)
+			dst=worker_row*GRID+(col if worker_row even else GRID-1-col)
+			bounded_store(Order[dst],task)
+		if CHECK and program==0:
+			bad=0
+			for first=0..M step1024:
+				bad |= max(load(Errors[first+lanes], bounded, 0)!=0)
+			Valid=(bad==0)
+	else:
+		g,part=divmod(program-ORDER_CTAS,4)
+		if REVERSE: g=num_groups-1-g
+		if Active[g]==0: return
+		U,common_nt=Counts[g]; r,p0,length=Meta[g].rows,position,kv_len
+		end=ceil(U/16)*BQ*4
+		for start=common_nt*BQ*4+part*B; start<end; start+=4*B:
+			index=start+parallel_range(B)
+			nt=index//(BQ*4); q=(index//4)%BQ; quarter=index%4
+			visible=min(p0+q+1,length); word=0
+			for j=0..3:
+				slot=nt*16+quarter*2+(j//2)*8+j%2
+				safe=slot<U and q<r and index<end
+				member=bounded_load(UM[g,slot],safe,0)
+				block=bounded_load(UB[g,slot],safe,0)
+				selected=safe and ((member>>q)&1)!=0
+				prefix=clamp(visible-4*block,0,4)
+				nibble=(1<<prefix)-1 if selected else 0
+				word |= nibble<<(4*j)
+			bounded_store(Masks[g,index],word,index<end)
+```
+
+每个mask CTA写不相交的连续word分片；Common前缀不生成mask。Order只是稳定cost/tie排序加蛇形分配，不是全局atomic队列；`SLICES=ceil(BQ*GP/128)`，当前公共分组实际为1。
+
+### K4. Torch `_assert_async_cuda_kernel<bool>`
+
+```text
+kernel assert_async(Valid):
+	if not Valid: device_assert("Invalid compressed QSA token/block/tail ABI")
+```
+
+使用预分配Valid，无逐元素bool临时tensor或Torch BooleanAll；device assertion异步报告，不增加host `.item()`同步。
+
+### P2. Dense/union共用的FP32在线softmax逻辑（内联，不是kernel）
+
+```text
+scale2=FP32(softmax_scale*log2(e))
+P_half_up(x)=high16(bits32(x)+0x8000)
+O_RNE(x)=high16(bits32(x)+0x7fff+((bits32(x)>>16)&1))
+
+function M128_N64_pipeline(load_KV, mask, NT):
+	load Q fragment; DMA K[0] -> LDS; wait VMEM/LDS; CTA rendezvous
+	S=mask(QK_MFMA_FP32(Q,K[0]),0)
+	m=max(row_max(S)*scale2,-1e30)+1
+	z=FMA(S,scale2,-m); l=0; A_low=A_high=0
+	prefetch bounded K[1]
+	for t=1..NT-1:
+		S=mask(QK_MFMA_FP32(Q,K[t]),t)
+		P=exp2_FP32(z)                                  # preceding tile
+		l+=row_sum_FP32(P)                              # unquantized denominator
+		A+=PV_MFMA_FP32(P_half_up(P),V[t-1])
+		candidate=row_max(S)*scale2
+		changed=candidate>m+7
+		new_m=candidate+1 if changed else m
+		next_z=FMA(S,scale2,-new_m)
+		if ballot(changed)!=0:
+			alpha=exp2_FP32(m-new_m); A*=alpha; l*=alpha
+		m=new_m; z=next_z
+	P=exp2_FP32(z); l+=row_sum_FP32(P)
+	A+=PV_MFMA_FP32(P_half_up(P),V[NT-1])
+	drain all async loads; O=O_RNE(A*(1/l if l>0 else 0))
+	LDS output shuffle; bounded valid-row stores
+```
+
+这是依赖表达，不是源码指令顺序。实际8wave分4+4错相，phase内交织：V(t−1) DMA/K低半LDS读→QK低半+旧exp→K高半读及发布→QK高半/概率pack→K(t+1) DMA/V低半读→PV低D128+sum/max→V高半读→PV高D128+center/rescale。保留VMEM/LGKM wait与CTA rendezvous：`s_barrier`不是memory-counter wait；不能删尾部drain。浮点归约保留当前局部树及lane16/32/48规则，不把lazy阈值7/偏置1改成其它softmax再宣称逐bit等价。
+
+### K5. `dense_qsa_bf16_d256_bounded`
+
+```text
+kernel dense(Qview,Kview,Vview,Oview,Qn,Kn):
+	allocate 64KiB LDS; BM=128; BN=64; threads=512
+	tasks=H*ceil(Qn/128)
+	for work=blockIdx.x; work<ceil(tasks/CU)*CU; work+=CU:
+		row,col=divmod(work,CU)
+		rank=row*CU+(col if row even else CU-1-col)
+		if rank>=tasks: continue
+		head=rank%H; qb=ceil(Qn/128)-1-rank//H
+		q0=128*qb; valid=min(128,Qn-q0); hkv=head//G
+		NT=min(ceil(Kn/64),max(1,ceil((q0+valid+Kn-Qn)/64)))
+		load_KV(t)=original request K/V[64*t:64*t+64,hkv,:]
+		mask(q,k)=keep iff k<Kn and k<=Kn-Qn+q
+		run M128_N64_pipeline with original waits and 4+4wave stagger
+		write valid q<Qn only
+```
+
+每非空eligible请求独立launch；Qn=dense_count、Kn=prefix+dense_count，bottom-right因果位置恰为原prefix+q。Kn整除64时选aligned DMA，其余完整byte偏移进入VOFFSET以让descriptor检查覆盖真实物理尾；score mask不能代替内存边界。
+
+### K6. `union_qsa_bf16_d256`
+
+```text
+kernel union(Q,K,V,O,Meta,UB,Masks,Counts,Active,Order):
+	allocate 64KiB LDS; BM=128; BN=64; threads=512
+	for work=blockIdx.x; work<ceil(TASKS/GRID)*GRID; work+=GRID:
+		ordered=Order[work]
+		if ordered<0: continue
+		mapped=(ordered%(TASKS//HK))*HK+ordered//(TASKS//HK)
+		g=mapped//(HK*SLICES); hkv=mapped%HK
+		if Active[g]==0: continue                       # before stale UB/Masks reads
+		first,r,k0,length,p0=Meta[g]; U,common_nt=Counts[g]
+		row_offset=((mapped//HK)%SLICES)*128
+		for slot in CTA M128:
+			q,head=divmod(row_offset+slot,GP)
+			valid=q<r and q<BQ and head<G
+			load Q[first+q,hkv*G+head,:] if valid else zero
+		NT=ceil(U/16)
+		load_KV(t):
+			j=0..63; compact_slot=16*t+j//4
+			block=UB[g,min(compact_slot,U-1)]            # bounded repeated last block
+			read original K/V[k0+4*block+j%4,hkv,:]
+		mask(scores,t):
+			if t<common_nt: keep all real query/head scores
+			else: keep each original score bit pattern where Masks bit=1, else -inf
+		run M128_N64_pipeline; no KV pack
+		guarded store each valid query/head through LDS transpose
+```
+
+MASKS传给设备签名中名为`MEMBERS`的参数，不是UM。Common阶段每4个N64 tile展开，后续masked阶段S0预取word、S3消费；只有完整16块common前缀可免mask。物理KV长度非4对齐时切完整VOFFSET边界路径；union并集不等于每query可见集合。
+
+### K7. `direct_pack_kv_bf16_d256`
+
+```text
+kernel pack(K,V,PK,PV,Active,GATED):
+	if GATED:
+		each wave scans Active in chunks of64
+		if ballot(any Active[g]==0)==0: return
+	# 256threads, 4waves; wave pairs cover low/highD128 of one block/head
+	half=(tid//64)%2; lane=tid%64
+	first_pair=blockIdx.x*8+tid//128
+	for u=0..3:
+		pair=first_pair+2*u; block,head=divmod(pair,HK)
+		t=lane//16; d0=half*128+(lane%16)*8
+		load 8 BF16 bits of K and V at (4*block+t,head,d0:d0+8)
+		store K bits using Jk; exchange V token/register bits twice, store using Jv
+		padded pair uses descriptor out-of-bounds/no-op
+
+location(b,h,j)=((4*b+j//256)*HK+h)*256+j%256
+Jk(t,d)=256*(d//64)+128*((d%64)//32)+32*((d%32)//8)+8*t+d%8
+Jv(t,d)=512*(d//128)+128*((d%8)//2)+8*((d%128)//8)+4*(d%2)+t
+PK[location(b,h,Jk(t,d))]=K[4*b+t,h,d]
+PV[location(b,h,Jv(t,d))]=V[4*b+t,h,d]
+```
+
+偏移是BF16元素单位，raw字节地址再×2。每4token/head的1024个元素是双射；只是bit搬运，不量化。有direct工作时处理当前完整物理KV，不只pack选中块；每调用/graph replay刷新。总PK+PV预算64MiB按host形状判断，超限从不分配/launch pack；全union仍有gated检查launch。
+
+### K8p. `direct_qsa_bf16_d256`：packed单query/wave
+
+```text
+kernel packed_direct(Q,PK,PV,O,RB,DirectMeta,Active,QueryTile):
+	tile,hkv=divmod(blockIdx.x,HK)
+	first,rows,k0,length,p0=DirectMeta[tile]              # rows=1, 64threads
+	if GATED and Active[QueryTile[first]]!=0: return
+	visible=p0+1; complete=min(visible//4,512)
+	n=4*complete+visible%4; NT=ceil(n/32)
+	load Q's G heads, mask unused M16 head slots
+	cache first64 sorted RB IDs across lanes
+	token(j)=4*RB[first,j//4]+j%4 if j<4*complete
+			 else 4*(visible//4)+(j-4*complete) if j<n else OOB
+	prefetch two N16 K fragments using PK layout
+	m=-1e30; l=0; A_low=A_high=0; scale2=FP32(scale*log2(e))
+	for t=0..NT-1:
+		derive V addresses from K block bases; issue V0 low/highD128
+		every8iterations prefetch next64 IDs, clamped to last chunk
+		wait K at consumer; paired QK FP32 MFMA for two N16 fragments
+		S=FP32(scores*scale2); mask selected slots>=n to -inf
+		new_m=max(m,row_max_packed(S)); alpha=exp2_FP32(m-new_m)
+		P=exp2_FP32(S-new_m)
+		l=l*alpha+row_sum_packed(P)
+		if ballot(alpha!=1)!=0: A*=alpha
+		wait V0/indices; BF16_RNE pack P0/P1
+		issue V1 low/highD128
+		PV(P0,V0_low); issue bounded next K0
+		PV(P0,V0_high); issue bounded next K1
+		wait V1; PV(P1,V1_low); PV(P1,V1_high)
+		m=new_m
+	wait final speculative K; normalize; RNE pack O
+	transpose via 8KiB LDS; guarded store G valid heads
+```
+
+V中未选future tail的BF16 bits在PV前显式置0，避免0×NaN；K的无效token槽位使用descriptor OOB零返回。P与O都RNE，不是union的P half-up。Packed reduction在lane16/32/48并行取值后按`(v+a)+(b+c)`求和；softmax每tile更新max，不用dense/union的lazy7规则。M16对H12/6/3仍16槽位，不自动变成12/6/3；两个不同query选集不能直接共享同一K operand。
+
+### K8r. 同名`direct_qsa_bf16_d256`：raw四query/wave组回退
+
+```text
+kernel raw_direct(Q,K,V,O,RB,DirectMeta,Active,QueryTile):
+	tile,hkv=divmod(blockIdx.x,HK)
+	first,rows,k0,length,p0=DirectMeta[tile]              # 1<=rows<=4, 256threads
+	needed=any(Active[QueryTile[first+min(w,rows-1)]]==0 for w=0..3) if GATED else True
+	if not needed: whole_CTA_return
+	each wave w=0..3:
+		valid=w<rows and (not GATED or Active[QueryTile[first+min(w,rows-1)]]==0)
+		visible=p0+w+1; n=4*min(visible//4,512)+visible%4
+		NT=ceil(n/32) if valid else 0
+		selected token uses sorted RB plus causal tail, exactly as packed
+		load Q; cache64 IDs; prefetch raw K0/K1 with four adjacent lanes per64B
+		m=-1e30; l=0; A=0
+		for each N32 tile:
+			issue V0, wait K; inverse-lane transpose K for paired MFMA
+			S=QK_FP32*scale2; mask slots>=n
+			new_m=max(m,row_max_raw(S)); alpha=exp2_FP32(m-new_m)
+			P=exp2_FP32(S-new_m); l=l*alpha+row_sum_raw(P); A*=alpha
+			wait V0; refresh IDs every8iterations
+			RNE pack P; issue V1; byte-permute raw V operands before each PV
+			interleave PV(P0,V0_low/high) with next K0/K1; wait V1; PV(P1,V1)
+			m=new_m
+		drain VMEM
+	all waves rendezvous, including invalid/union-routed waves
+	normalize/RNE; 32KiB LDS transpose; store only valid direct query/head
+```
+
+Raw reduction是原顺序lane xor16再xor32，不擅自改为packed加法树；raw每轮rescale，packed可wave一致跳过。Raw可跨union组边界，CTA先看任一wave需要direct，随后逐wave gate；无效wave不能绕过尾部barrier。物理N非4对齐、ragged或超过64MiB预算均走此路径，不使用旧PK/PV。
+
+### K9. `qsa_scatter_prepared`（辅助入口，不在公共8-launch热链）
+
+```text
+kernel qsa_scatter_prepared(group,local_query):
+	first,r=Meta[group].first,Meta[group].rows
+	if local_query>=r: return
+	bit=uint32(1)<<local_query; row=first+local_query
+	for block in RB[row,0:512] where 0<=block<MAX_BLOCKS:
+		atomic_OR(DM[group,block],bit,relaxed)
+	if (pos[row]+1)%4!=0:
+		atomic_OR(DM[group,(pos[row]+1)//4],bit,relaxed)
+
+function rebuild_plan_from_already_recovered_RB(...):
+	launch K9
+	launch K2(CLEAR=True)
+	launch K3(CHECK=False)
+```
+
+该入口依赖RB和positions已合法，不重新做ABI验证；公共qsa使用K1的融合scatter。索引器/Top-K、KV gather、量化、跨rank通信均不属于上述qsa调用。测试的强制完整direct跳过union plan但保留K1/K3/K4；强制完整union使用相同K2的`PACKED_DIRECT=False,RHO=inf`及K3，跳过pack/direct，不改变selected集合。
+
+<a id="qsa-t13-resolution"></a>
+
+## 2026-09-29：QSA-T13复现与修复——旧参考Q预缩放误差；attention不改，服务复验待空闲
+
+**结论：原C32错误已精确复现；失败元素的QSA输出符合FP64，旧SGLang参考自身不符合原`.02/.02`。修正的是服务验证oracle，不是把QSA改成近似旧参考。** 原六个attention文件、prepare/分流、MHA两个依赖、indexer四模块与本轮冻结版本逐字节相同；没有修改SGLang、硬件、Git index/commit/push。
+
+### 1. 原负载与原失败逐元素复现
+
+独立研究[协议](../../../../mytest/mydata/qsa_t13_20260929_01/protocol.json)、[冻结身份](../../../../mytest/mydata/qsa_t13_20260929_01/identity.json)。PyHIP .venv、原launcher和模型、seed42、实际TP2/GPU0、1、chunk16384、max running32、decode graph32、prefill indexer1/decode indexer0、`PYHIP_QSA_VALIDATE=1`。固定10条prompt、原warmup、C1 128×64输出、C32 warmup＋测量轮序列均直接调用原v1协议；原证据和cache不覆盖。
+
+2026-09-29 05:04:22，测量C32第1轮再次触发**同一索引(13756,5,220)、同一绝对差0.0213623046875、同一相对差1.0625、同一1/50,233,344元素失败**。这次断言前已完整保存6个输入/输出张量，不依赖profile或默认12000/11888过滤器：
+
+- [新复现server.log](../../../../mytest/mydata/qsa_t13_20260929_01/reproduce/server.log#L1173-L1255)。
+- [失败输入](../../../../mytest/mydata/qsa_t13_20260929_01/reproduce/failure_inputs/failure_tp0_layer47_m16352_84e42f80153e_pid2048220.pt)，文件SHA256 `fe11d4421472fccd5ecffbbb0be0ccb50d4b3355c9008a8b2caf88aa394c37a8`，含layer/rank/scale、长度、各tensor形状/dtype/SHA。
+- [离线逐bit回放与路由审计](../../../../mytest/mydata/qsa_t13_20260929_01/offline_before/analysis.json)：QSA和旧SGLang都与服务内输出逐bit一致，多次QSA结果逐bit一致，排除“仅服务内瞬态误差”。
+
+确认的布局是layer47、queries=(11936,4416)、prefixes=(64,0)、Q=[16352,12,256]、K/V=[16416,1,256]。失败行属于第二个请求，request-local row1820、prefix0、可见1821token、K起点12000，**走dense而非raw/direct/union**。完整batch dense4038、union12314、direct0，原选择/常用块顺序/mask/清零检查均通过。
+
+日志16384与实际16352的32行差异已解释：server page_size=64；`schedule_policy._update_prefill_budget`先对每个extend长度向上取整再累加`log_input_tokens`。`ceil(11936/64)*64+ceil(4416/64)*64=16384`；并非QSA漏算32行，`enable_mixed_chunk=false`。见[CPU审计](../../../../mytest/mydata/qsa_t13_20260929_01/cpu_evidence.json)。原登记日志的邻近batch不用于猜测请求布局。
+
+### 2. FP64证明与单因素量化反例
+
+从原始indices按每行request-local token取K/V，不使用QSA plan，NumPy FP64计算`softmax((Q Kᵀ)*scale)V`；另外只把Q改为原SGLang的`BF16(Q*scale*log2(e))`，其余仍FP64，单独观察提前量化的影响。
+
+| 失败元素(13756,5,220) | 数值 | 对数学FP64绝对误差 |
+|---|---:|---:|
+| 原QSA（未改） | −0.001220703125 | 0.001220046968 |
+| 原SGLang参考 | +0.0201416015625 | **0.020142257720** |
+| 数学FP64 | −0.000000656157492451 | 0 |
+| 仅模拟旧BF16 Q预缩放，其余FP64 | +0.0190626993790 | 0.019063355537 |
+| 新独立FP32参考 | −0.0000029749915 | 0.0000023188340 |
+
+此处原阈值为`0.02+0.02*abs(FP64)=0.020000013123`。QSA通过，SGLang参考不通过；此前“两近似实现必须相互`.02`接近”的假设不成立。**不是half-up/RNE、H6分组、union排序、raw fallback或KV越界的已证实缺陷。** QSA仍有BF16概率/输出舍入误差，不能称完全精确；但不应为了通过旧对照而增加QSA误差。
+
+永久无capture反例：Q把(1,1.5)重复128次，K把(1.5,−1)重复128次，精确QK=0；四token中交替使用该K和零K、V为±4，数学attention=0。旧Q预缩放后logit≈0.06498255，attention≈0.12991938，远超`.02`。此反例不是调大容差或挑选原batch样本，可独立验证预缩放本身改变问题。
+
+### 3. 修复内容与严格校验范围
+
+[sglang/validation.py](sglang/validation.py)新增只用于opt-in服务验证的独立Triton参考：读原Q/K，不先量化缩放Q；QK用BF16乘法/FP32累加，在FP32 scores上乘scale×log2(e)；每tile更新稳定softmax，概率和V都为FP32、PV用IEEE FP32 dot，输出FP32。直接读取原indices和host累计请求偏移，不引用QSA恢复/构表/attention helper，不返回给模型。
+
+[sglang/plugin.py](sglang/plugin.py)每个首次layer/layout在profile外：
+
+1. 正常计算QSA输出；同跑旧SGLang供兼容性记录。
+2. 计算独立全量FP32参考，对**全部query/head/channel**执行`assert_close(output.float(), expected, rtol=.02, atol=.02)`；未删元素、未改阈值、未按误差重算/换路由。
+3. 新参考失败先保存Q/K/V/indices/output/FP32 expected/legacy expected及身份后**原样重新抛错**；落盘失败也不吞断言。
+4. 全量准确校验通过后记录旧对照的`legacy_close/legacy_error`；旧参考差异发warning并完整保留，不把有问题的旧参考用作数学正确性判据。
+5. 无论哪个参考，模型只得到原QSA output；`checked`只在准确校验通过后更新。
+
+关闭验证或profile时，执行AST与原版相同；未增加热链kernel/同步/临时buffer。独立包新增验证模块，13→14源码；旧13源码包不会自动更新，需要构建新target。indexer验证逻辑/可选decode-forward改动均保持原状。[源码/AST审计](../../../../mytest/mydata/qsa_t13_20260929_01/cpu_evidence.json)。
+
+### 4. 已完成验收与明确未完成项
+
+- [新参考证明](../../../../mytest/mydata/qsa_t13_20260929_01/reference_proof/result.json)：原失败完整50,233,344元素对新参考**0不符**，最大归一化容差占用0.272302；不是只验证出错那一个元素。63行×12head×256包含失败行/邻行、两请求边界、dense/sparse边界，与独立CPU FP64最大绝对差1.65439e-5；另Torch FP32 oracle最大差1.93119e-5。
+- [独立包验收](../../../../mytest/mydata/qsa_t13_20260929_01/package_check_same_shape/result.json)：不导入experiments，真实T13×TP2/4/8准确全量检查通过；新/冻结旧attention在**相同TP形状**逐bit一致。TP2与原服务capture逐bit一致；TP4/8跨head分组只要求原`.02`，不能错误要求与H12 accumulation逐bit一致。
+- [实际热链资源](../../../../mytest/mydata/qsa_t13_20260929_01/package_check_same_shape/resource_audit.json)：3TP共24dispatch，`private_segment_fixed_size/vgpr_spill_count/sgpr_spill_count`全部0。此布局2个dense请求，所以每次4prep＋2dense＋union＋gated raw=8launch；没有pack。新参考H12 ELF三字段均0，192VGPR/57SGPR、动态LDS16384B，固定LDS0不冒充总LDS0；其它已实例化参考specialization亦检查三零。校验用Torch assert的诊断链不等于生产8kernel热链。
+- [最终完整回归](../../../../mytest/mydata/qsa_t13_20260929_01/normal_final.xml)：**81通过、24性能项未选中、0失败、0跳过**，308.66秒；[执行收据](../../../../mytest/mydata/qsa_t13_20260929_01/normal_final_result.json)记录实际测试源码SHA。新增14项覆盖确定性Q预缩放反例H12/H6/H3、旧参考同错不能放行、失败落盘、多请求/零长请求/长prefix/稀疏集合/物理尾/HK2、真实T13×TP2/4/8；原67项不移除。fixture同时检查所有已编译新参考specialization的ELF三项零资源。第一遍79通过/2失败仅因新测试错误要求H6/H3与H12 capture逐bit相同，保留[原JUnit](../../../../mytest/mydata/qsa_t13_20260929_01/normal.xml)，修正测试为同形状重复逐bit＋跨head原`.02/.02`后全量重跑，不改变attention实现或原验收阈值。
+- **修复后真实C32服务尚未完成**：[入口失败收据](../../../../mytest/mydata/qsa_t13_20260929_01/fixed_service/status.json)。GPU0被其他会话服务占用（use78%、VRAM96,734,220,288B），在启动自身服务前门禁停止，0请求，无自动重试/抢卡/改硬件；未向外部服务发请求、未停止外部进程。下一次需获得空闲窗口再授权续测。
+- **没有本轮新性能结论**。attention源码和关闭校验AST未变，原TP2/4/8表格保持其原测量身份，不重标为本轮新数据；服务门禁失败后不再发起正式性能测试。启用新全量FP32验证会增加首次layout校验成本，未计时，不能把其开销与`VALIDATE=0`服务性能混为一谈。
+- 保留所有失败：旧原系统失败、新精确复现、复现驱动cleanup断言、第一版独立包错误要求跨H12/H6逐bit相同的测试失败、服务入口门禁失败。cleanup后独立核验自身PGID无进程且SGLang源码不变，见[清理补审计](../../../../mytest/mydata/qsa_t13_20260929_01/reproduce/completion_audit.json)。不把这些收据改成成功。
+
+## 2026-09-29：indexer decode第二阶段（融合decode prep，已实现）
+
+登记T13后，用户要求“继续下一步”。本阶段接管CUDA graph decode中`QSAIndexer.forward_cuda`的整段：保留SGLang自己的`index_qk_proj` GEMM，其后由一个Triton kernel完成全部prep，再接第一阶段的FlyDSL分页logits，以及SGLang的fast_topk和expand。本会话没有修改attention、prepare、test_qsa或SGLang。
+
+### 1. 实现
+
+- 开关：`PYHIP_QSA_INDEXER_DECODE`现在取`0|select|1`。`select`就是第一阶段，只hook `select_decode_tokens`。`1`是第二阶段：包含select hook，另由`forward_cuda` hook接管graph decode。**第一阶段记录里的`=1`对应现在的`select`。**
+- 适配条件（`plugin._decode_forward_inputs`）：
+  - `ForwardMode.DECODE`且`is_cuda_graph`，graph buffer齐全；module配置为(4,1,128,4,512,2048)。
+  - MRotaryEmbedding（非GLM，0或3段）或RotaryEmbedding；NeoX，rotary 64；cos/sin cache为连续BF16。
+  - int64 positions、ring slots和rope缓冲[.,3]；BF16 key_state和compressed [.,1,128]；int32 group_locs [rows,4]和write_locs。
+  - 任一条件不满足，包括eager decode，都走SGLang `forward_cuda`，仍经过select hook。
+- `indexer._indexer_decode_prep`：每行一个program，4 warps。
+  - q（4头）：gemma RMSNorm加三轴MRoPE，复用prefill已逐bit对齐的`_norm_rope`和`_partner`。
+  - key和三轴位置写入`pending_ring_slots`。
+  - 压缩：按`graph_ring_group_locs`取4个成员，最老的在前，第4个是当前slot。成员若就是本行slot，直接用当前key和位置，因为SGLang先写ring再gather。FP32求和乘1/4后转BF16，与SGLang的float mean一致；随后做k norm，并用member 0的位置做RoPE。
+  - 结果写到`graph_write_locs`。非边界行写slot 0，与SGLang相同。
+- 资源：Triton的三个特化都是VGPR 49、SGPR 62、LDS 0、private 0、spill 0。
+- 每层decode indexer的kernel：
+  - SGLang：GEMM，43个prep kernel，MQA（14个），topk，expand。
+  - 第一阶段：GEMM，43个prep kernel，1个logits，topk，expand。
+  - 第二阶段：GEMM，1个prep kernel，1个logits，topk，expand。
+
+### 2. 正确性
+
+在GPU3上，66项indexer正常测试加SGLang adapter，共67项全部通过。第二阶段新增三组测试：
+
+- 7个合成decode forward用例，覆盖padding行、跨组边界、29行和65536长度。
+- 2个真实权重capture。
+- 一次capture后重放6步CUDA graph（跨组边界），对照SGLang eager graph-metadata路径在同一pool历史上的结果。
+
+以下数据与SGLang逐bit一致：q、ring key、ring rope位置、压缩cache写入。有一处比较排除：dump ring的行0..3和slot 0。padding行和非边界行在两种实现里都会竞争写这些位置。token选择按第一阶段的tie-aware方法复核。
+
+### 3. 正式性能（GPU3，一层decode `forward_cuda`的CUDA graph重放）
+
+口径：每次计时是一次graph重放，覆盖一层decode indexer的全部工作（GEMM、prep、MQA/logits、topk、expand）。三臂如下：
+
+- SGLang：原实现。
+- select：SGLang加第一阶段hook。
+- forward：第二阶段。
+
+其余设置：
+
+- 页表宽4096页（262144 token），与服务graph相同；每行长度相同。
+- 每个buffer用独立的随机pool、hidden和合成权重。
+- 10 buffers、2 warmup、每臂128 samples，AB/BA交替，全部raw保留。
+
+结果见[汇总](../../../../mytest/mydata/qsa_indexer_decode_20260929_01/formal_forward_summary.json)。表中为中位µs，括号内是对SGLang的配对比中位：
+
+| rows×token | SGLang | select | forward | forward/select |
+|---|---|---|---|---|
+| 1×12000 | 221.70 | 128.82 (.580) | 31.24 (.141) | .243 |
+| 1×65536 | 235.04 | 144.32 (.613) | 43.30 (.184) | .300 |
+| 1×262144 | 275.08 | 186.64 (.678) | 80.90 (.294) | .433 |
+| 8×12000 | 672.66 | 189.54 (.278) | 35.74 (.053) | .189 |
+| 8×65536 | 682.46 | 207.86 (.301) | 54.44 (.080) | .262 |
+| 8×262144 | 709.90 | 267.12 (.376) | 117.16 (.165) | .439 |
+| 32×12000 | 2022.71 | 212.88 (.104) | 43.28 (.021) | .203 |
+| 32×65536 | 2037.41 | 260.36 (.128) | 88.74 (.043) | .341 |
+| 32×262144 | 2074.49 | 421.20 (.202) | 252.02 (.121) | .598 |
+
+- 校验：90组buffer中，select和forward的token集合都与SGLang相同；三臂的pool写入逐bit相同。
+- 门禁：use 0%，VRAM ≤12%。
+- 长尾保留，例如32×262144的forward最大值398.4µs。
+- TP：indexer的头与权重在各TP rank间复制，TP2/4/8每rank工作相同。TP4/8的值与上表相同，属推导，不是另行实测。
+
+前三次尝试记录（全部保留）：
+
+- v1（live树）：完成6/9个形状。32×12000在采样前门禁失败：use 0%，VRAM 24% > 20%。原因是本进程自身的3份KV pool、初始state和每个graph独立的内存池。该形状0 raw，未原样重试。
+- v2：降低自身占用。所有graph共用一个CUDA graph内存池（SGLang runner也这样做）；建pool后释放初始state；门禁前`empty_cache`；每个输出在自己的重放后立即检查。完成5/9。第6个形状（8×262144）已采384 raw，随后被源码hash护栏中止：另一会话在04:55:14修改了`qsa/sglang/plugin.py`（attention校验失败采集，不涉及indexer路径）。
+- v3：从冻结源码树运行，但路径经过mydata符号链接，在任何门禁之前就报`relative_to`错误，0 raw。
+- 最终为formal_forward_v4：冻结源码树经解析后的真实路径运行，9/9完成。冻结清单见[formal_forward_v3_tree.json](../../../../mytest/mydata/qsa_indexer_decode_20260929_01/formal_forward_v3_tree.json)。
+- v1、v2已完成的形状与v4中位差约2%以内。例如1×12000的forward为31.8/31.1/31.2µs。
+- v4期间，GPU0/1在运行另一会话的T13服务（gfx 85–100%）。
+
+### 4. 更正：第一阶段和可行性分析低估了SGLang decode prep
+
+第一阶段记录（“每层约105µs，prep/压缩83–85µs（19个kernel），C1每步约1.0ms”）和此前可行性分析（“prep 91µs（20个kernel），indexer占16.09ms步的16.1%”）有同一个问题：分段都从压缩的k norm开始，漏掉了q norm/RoPE和ring写入，每层约24个kernel、约110µs。
+
+正确的分段是`index_qk_proj` GEMM之后、MQA之前的全部kernel。按此只读重算原trace：
+
+- 第一阶段系统v2：
+  - current：prep 197.3/198.9µs（44个kernel，含1个MQA fallback的准备kernel），每步indexer 3.92/3.93ms。
+  - 第一阶段：prep 190.1/194.2µs（43个），每步2.60/2.65ms。
+  - 结果在本次v3分析的`v2_traces_corrected`里。
+- 可行性分析trace：prep 200.5/201.0µs（44个），每步indexer 3.96ms，占16.09ms的24.6%。见[feasibility_corrected.json](../../../../mytest/mydata/qsa_indexer_decode_20260929_01/feasibility_corrected.json)。
+
+原记录不改。上述HTTP ITL/TTFT结果不受影响，受影响的只是逐层归因。
+
+### 5. 实际TP2系统（v3，三臂顺序服务）
+
+- 数据目录：[qsa_indexer_decode_system_20260929_03](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_03)，分析见[analysis_054756.json](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_03/analysis_054756.json)。
+- 驱动：[mytest/qsa_indexer_decode_system.py](../../../../mytest/qsa_indexer_decode_system.py)。运行时副本`script_v3_runtime.py`的hash与identity一致；此后只扩展了analyze。
+- 配置与v2相同：原launcher，TP2，GPU0/1，seed 42，chunk 16384，最大运行32，decode graph 32，`PYHIP_QSA_VALIDATE=0`，三臂都开prefill indexer。
+- 负载：
+  - C1：10条约12k prompt各warmup 2次，然后128请求，并发1，输出64。
+  - C32：1轮warmup加3轮，每轮32路并发，输出128。
+- 插件包在freeze时一次构建，三臂共用；driver也冻结。其他会话之后对live树的修改不会进入服务。该包含有另一会话加的attention失败采集代码，VALIDATE=0时不会执行。
+- 运行顺序为current → forward → select，不交错。
+
+| arm | C1 ITL中位ms | C1 TTFT中位ms | C1请求时延中位ms | C1 req/s（顺序） | C32 ITL中位ms | C32每轮墙钟s |
+|---|---|---|---|---|---|---|
+| current（decode 0） | 13.404 | 886.0 | 1730.0 | 0.578 | 43.644 | 35.93–35.98 |
+| select | 12.253 | 887.2 | 1659.7 | 0.602 | 23.443 | 33.19–33.21 |
+| forward（decode 1） | 10.852 | 887.2 | 1570.4 | 0.636 | 21.186 | 32.73–32.77 |
+
+- forward对current：C1 ITL −19.0%，请求时延 −9.2%，C32 ITL −51.5%。
+- forward对select：C1 ITL −11.4%，C32 ITL −9.6%。
+- TTFT不变，因为prefill没有改动。
+- 与第一阶段v2（13.440→12.209ms、43.261→23.491ms）一致。
+- 微基准推算：1×12000下forward比SGLang每层少190.5µs，12层约2.29ms/步；实测C1 ITL差2.55ms。
+
+Profile（4个12000→5请求，每rank 20个decode graph步，每步12层QSA），每层µs，TP0/TP1：
+
+| arm | GEMM | prep（kernel数） | MQA/logits | topk | expand | indexer/步 | kernel合计/步 |
+|---|---|---|---|---|---|---|---|
+| current | 5.01/5.22 | 196.95/197.98（44） | 106.19/106.43（14） | 12.41/11.99 | 4.94/5.08 | 3906/3920 | 15961/15956 |
+| select | 4.97/5.26 | 190.46/192.40（43） | 4.53/4.55 | 12.25/11.89 | 4.90/5.19 | 2605/2632 | 14662/14662 |
+| forward | 5.02/5.26 | 5.66/5.29（1） | 4.55/4.73 | 12.01/11.63 | 4.96/5.24 | 386.5/385.8 | 12399/12400 |
+
+- forward每步kernel合计比current少约3.56ms（−22.3%），indexer少约90%。
+- profile中小kernel的时长偏大，这个差值不能直接等同ITL。
+
+生成文本：
+
+- 按请求逐个比较，相同的数量：
+  - select对current：C1 97/128，C32 64/96。
+  - forward对current：C1 95/128，C32 64/96。
+  - forward对select：C1 100/128，C32 64/96。
+- C1中fixture 1、3、4、6、7、9在三臂都只有唯一输出，且三臂相同。
+- C32中forward的fixture 3出现2个变体，所以forward相关比较里相同的是1、4、6、7、9。
+- fixture 0、5、8（以及2）在各臂内部就不稳定，current自己也一样：C1里fixture 0的13次请求出现12种输出，fixture 8在C32出现9种。因此跨臂差异不能归因于decode改动。
+- 这不是逐bit或模型质量认证。
+
+尝试记录（全部保留）：
+
+- forward_01、forward_02、select_01：port 9080探测报`EADDRINUSE`，分别在上一臂teardown后23、44、33s启动，可能是TIME_WAIT。未启动服务，0数据。间隔超过60s后正常。
+- forward_03：测量和profile完成。driver在SIGKILL后立即做的after_teardown快照仍看到131.6GB VRAM（释放竞态，与v2 current_01相同）。21s后的`cleanup_recheck.json`显示GPU0/1 VRAM 0.15%，且没有SGLang进程，analyze据此采用该臂，并在报告中注明cleanup依据。
+- current_01、select_02完整通过。
+- 范围：只测了实际TP2。decode indexer每rank工作在TP4/8下相同，但未测TP4/8系统服务。
+
+### 6. 限制与下一步
+
+- 只有CUDA graph decode走融合路径。graph外的eager decode（如bs超过graph上限）仍是SGLang加select hook。MTP/target-verify未测。
+- 融合prep要求每行属于不同请求。普通decode满足；speculative未开，未测。
+- 现在每层decode indexer约32µs：topk 12µs（约37%），prep、GEMM、expand、logits各约5µs。若把它们进一步融合，估计每层最多再省约20µs，C1每步约0.25ms。这只是估计。
+- T13（attention服务内`.02`越界）仍由其他会话处理。
+- opt.md核对：本会话此前的第一阶段段、tie补充和T13段经逐字比对未变。它们前面的TP矩阵段被其他会话原地扩写，不是本会话的修改。
+- 没有commit或push；SGLang未修改。
+
+<a id="qsa-t13-service-closure"></a>
+
+## 2026-09-29：QSA-T13续测闭环——真实TP2 C32、VALIDATE=1全量校验通过
+
+**T13修复后的真实服务回归现已完成。** 本节更新前文“服务复验待空闲/仍由其他会话处理”的状态；原登记、GPU占用导致的入口失败和上轮[未闭环收据](../../../../mytest/mydata/qsa_t13_20260929_01/delivery.json)仍原样保留。用户明确“继续”后，只在新研究[qsa_t13_20260929_02](../../../../mytest/mydata/qsa_t13_20260929_02)续测，没有重跑或重贴之前的内核性能矩阵。
+
+证据：[续测协议](../../../../mytest/mydata/qsa_t13_20260929_02/protocol.json)、[身份与旧证据清单](../../../../mytest/mydata/qsa_t13_20260929_02/identity.json)、[服务状态](../../../../mytest/mydata/qsa_t13_20260929_02/fixed_service/status.json)、[独立全量审计](../../../../mytest/mydata/qsa_t13_20260929_02/analysis.json)、[实际14源码包](../../../../mytest/mydata/qsa_t13_20260929_02/fixed_service/plugin/pyhip_qsa_runtime/source_manifest.json)。
+
+### 1. 原协议完整执行，不改运行时
+
+- PyHIP .venv、原模型/launcher、实际TP2/GPU0、1、seed42、chunk16384、max running32、page64；解析后mem_fraction_static=0.8075、radix关闭、prefill graph disabled、decode full graph/max_bs32，与捕获原失败的服务逐字段一致。
+- `PYHIP_QSA_PREFILL=1`、`PYHIP_QSA_INDEXER=1`、`PYHIP_QSA_INDEXER_DECODE=0`、**`PYHIP_QSA_VALIDATE=1`**。保留准确参考的`.02/.02`及旧SGLang对照记录；新14源码包逐文件等于上轮81项正常测试/独立包通过的版本，attention、prepare、indexer和SGLang均没有本轮改动。
+- 原warmup脚本、固定11888/12000行预热、10条prompt各2次预热后，执行C1 128请求×64输出，再执行C32 1轮预热＋3轮×32并发×128输出。固定fixture和提交次序、实际长度全部匹配原v1协议。
+- 共**256/256请求成功、24,576输出token**：C1 128/128，C32预热32/32，C32测量96/96。另原4请求×5输出双rank profile全部成功；上述256不包含20条fixture预热、2条行数预热、外部warmup或4条profile请求。
+- 32并发是客户端提交数，不等于一次prefill有32个请求。本次实际校验的prefill最多3请求/布局，仍覆盖chunked-prefix混合；mamba池下decode最多31路的原限制未改。
+
+### 2. 原失败点真实经过，准确校验通过
+
+06:14:15 TP0再次经过**layer47、queries=(11936,4416)、prefixes=(64,0)**。日志保留与原失败完全相同的旧参考差异：`1/50233344`，位置`(13756,5,220)`，绝对差`0.0213623046875`，相对差`1.0625`；此前的全输出独立FP32 `.02/.02`校验已通过，所以服务继续完成其余轮次，不再因错误oracle中止。
+
+报告：[TP0校验](../../../../mytest/mydata/qsa_t13_20260929_02/fixed_service/qsa/qsa_tp0.json)、[TP1校验](../../../../mytest/mydata/qsa_t13_20260929_02/fixed_service/qsa/qsa_tp1.json)、[原始server日志](../../../../mytest/mydata/qsa_t13_20260929_02/fixed_service/server.log)。两rank均实际经过原失败布局，TP1该布局旧参考也通过；不以“运行了任意C32请求”代替原失败布局覆盖。
+
+| 每rank校验覆盖 | TP0 | TP1 |
+|---|---:|---:|
+| 不同query/prefix布局 | 77 | 77 |
+| QSA层数 | 12 | 12 |
+| 首次layer/layout全量检查 | 924 | 924 |
+| 其中多请求检查 | 852 | 852 |
+| 其中非零prefix检查 | 828 | 828 |
+| 累计检查query行（含不同层/布局重复） | 14,460,492 | 14,460,492 |
+| 累计检查输出元素 | 44,422,631,424 | 44,422,631,424 |
+| 独立FP32 `.02/.02`失败 | **0** | **0** |
+| 旧SGLang对照差异记录 | 2 | 0 |
+
+两rank合计**1,848次全量比较、88,845,262,848元素**；这些是各首次layer/layout的累计量，不称为同样数量的不同输入。每个布局都覆盖3、7、…、47共12层；最大M16368、最大prefix11776。没有failure dump、Scheduler exception或ABI mismatch。
+
+TP0第二条旧参考差异同为layer47：queries=(8587,7744)、prefixes=(3264,0)，`1/50168832`，位置`(11844,7,220)`、绝对差`0.021484375`。该调用全部元素通过FP32 oracle；旧差异明确记录，未删样本。此第二点没有另存张量重做FP64，不把首个点的单因素因果证明外推成第二点已经单独证明。
+
+既有indexer校验也各924次通过，key/rope/compressed状态相等，已检查的top-k相对边界违例最大1.66399e-7（门限1e-5）。它保留原indexer校验范围，不意味着decode图内每步或整个模型质量已认证。
+
+### 3. profile、机器码与清理证据
+
+- 两rank各48个QSA替换调用（12层×4请求），每次经host annotation/runtime correlation确认**4准备＋4attention、同stream、正确顺序**；不重复统计`gpu_user_annotation`镜像。每rank完整trace 53,390个GPU kernel，3个12000行＋1个11888行EXTEND、20个DECODE step均与原profile脚本一致。
+- 本轮profile中没有独立FP32 reference或PyHIP decode logits kernel，分别对应原“profile外校验”规则和decode replacement=0。QSA含原Torch assert的累计GPU duration为TP0 **132.761ms**、TP1 **132.751ms**；只是48次profile的累计值，不是TTFT或本轮新生产性能对照。
+- [服务实际编译参考资源](../../../../mytest/mydata/qsa_t13_20260929_02/validation_artifact/audit.json)：private/VGPRspill/SGPRspill均0，VGPR192、SGPR57、动态LDS16384B。其整ELF与离线版不同，但完整`STT_FUNC`的5876字节机器码逐字相同（SHA256 `5b641782c5d33008acb7deee907b580cd7f80e743d748c862272947e27a3e989`），见[机器码核对](../../../../mytest/mydata/qsa_t13_20260929_02/validation_artifact/machine_match.json)。因此实际服务使用的是之前与CPU FP64核对过的计算实现；不把此检查外推成整个模型五万kernel三零。
+- 启动前、profile前/后及清理后共8项GPU门禁均通过：use0%，PTL Enabled/VECTOR,F8。服务常驻VRAM88.39%～88.51%按原模型内存例外允许；启动前和清理后均0.1444%，不改变离线20%门槛。
+- [清理收据](../../../../mytest/mydata/qsa_t13_20260929_02/cleanup.json)：本轮PGID2151723已无任何进程，9080空闲；GPU0/1无KFD进程，旧9078绘图服务保留。server_returncode=-9是驱动结束时主动清理，不是运行中崩溃；请求和profile成功在清理前已经验收。
+
+### 4. 验证开启的耗时如实保留，不作为生产性能结论
+
+原始HTTP记录在[ordinary_raw.jsonl](../../../../mytest/mydata/qsa_t13_20260929_02/fixed_service/ordinary_raw.jsonl)，没有剔除新layout编译/校验导致的长请求。C1 TTFT中位888.932ms、ITL13.428ms；C32全部96请求的TTFT中位79.023s、最大285.877s、ITL中位43.362ms。
+
+| C32轮次 | 请求成功 | 整轮墙钟s | TTFT中位s | ITL中位ms |
+|---|---:|---:|---:|---:|
+| 预热0 | 32/32 | 57.870 | 28.900 | 43.413 |
+| 测量1 | 32/32 | 82.238 | 27.488 | 43.305 |
+| 测量2 | 32/32 | 232.955 | 144.659 | 43.339 |
+| 测量3 | 32/32 | 287.591 | 164.288 | 43.407 |
+
+本轮目的是带全量双参考检查完成原错误场景，期间出现大量新的mixed布局及JIT；未单独分解编译、参考计算、host同步和排队各自贡献，不能把全部慢时间精确归因某一项。**不能把这些数据与`VALIDATE=0`的35s轮次做attention性能退化比较，也不能据此声称新优化或SLA。** 本轮不运行新TP2/4/8 kernel性能矩阵、不改之前表格；TP4/8仍只有已报告的派生离线验证。
+
+最终状态：T13的“精确复现→独立FP64定位→修正参考→81项回归/独立包→原真实C32 VALIDATE=1服务复验”已闭环。生成质量、非重复超长文本、真实TP4/8服务及其它TODO不随本项自动完成。旧276份证据、原门禁失败、上轮测试失败和源码快照保持只读；没有SGLang/运行时/硬件/Git提交或推送改动。纯CPU审计首次因mydata symlink下`__file__.relative_to(ROOT)`假设失败，改为核对冻结lexical路径后通过；没有重新采集GPU请求来修正报告。
+
+<a id="qsa-decode-stage2-validate"></a>
+## 2026-09-29：indexer decode第二阶段按VALIDATE=1验收——graph内decode对照，真实TP2全部通过
+
+用户要求验收开`PYHIP_QSA_VALIDATE=1`，第2阶段按T13闭环的标准再验一次。此前VALIDATE=1不检查decode（capture中不能同步），上文第2阶段的v3系统测试用的是VALIDATE=0。本轮先补上graph内的decode校验，再按T13闭环的同一协议，在真实TP2上以decode=1、VALIDATE=1跑完整服务。
+
+证据：[协议](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_04/protocol.json)、[冻结身份](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_04/identity.json)、[服务状态](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_04/validate_01/status.json)、[校验检查](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_04/validate_01/validation_check.json)、[分析](../../../../mytest/mydata/qsa_indexer_decode_system_20260929_04/analysis_075332.json)；驱动[qsa_indexer_decode_validate.py](../../../../mytest/qsa_indexer_decode_validate.py)。
+
+### 1. 新增：VALIDATE=1在decode graph内对照SGLang
+
+代码在[sglang/plugin.py](sglang/plugin.py)（`validated_decode_forward`、`_selection_check`）。[indexer.py](indexer.py)内部的`_decode_select`/`_decode_forward`多返回FP32 logits，公开接口不变。每个graph decode步的每一层：
+
+- 先在同一graph内跑SGLang原`forward_cuda`，其中`select_decode_tokens` hook直通SGLang；记下它写的ring key/rope行和压缩行。再用SGLang的`project_qk`重算q。最后跑PyHIP forward，覆盖同样的行。
+- 逐bit比较：q；真实请求的ring key/rope行（padding行用保留请求0、ring行号<4，排除）；组边界的压缩行（非边界行写slot 0，排除）。
+- 选择：两份选择都须是PyHIP FP32 logits的top-512（相对近并列容差1e-5，与离线FP64判据相同）；完整block数为min(length,512)，每个block 4个token；因果尾token相同。
+- 每层一组int64设备计数（调用、真实行、各类不一致、边界压缩行、集合不同、选择违例）加最大相对边界间隙，不同步、可capture。计数器在SGLang capture前的eager warmup里分配；若在capture中首次分配则直接报错（否则每次重放都会清零）。
+- 下一次eager prefill的第一个decode层读取计数，任一失败即抛`PyHIP QSA decode differs from SGLang`。profile停止时写入报告`indexer_decode_validation`。`select`模式同样计数（键`select:<layer>`）。
+
+实现中发现两点：
+
+1. expand的输出布局是：选中block的token，紧接着因果尾token，其余为−1。尾token不在固定的2048..2050。第一版检查按固定位置解析，在短序列上误报了18次，已改正。
+2. SGLang自己的decode选择在近并列时不可复现：同一输入连续6次调用，有1次在4行里有1行集合不同。所以“集合不同”只记入`different_token_sets`，失败以logits top-k判据为准。
+
+测试新增6项：graph 6步重放计数；q、压缩行、选择三类故障注入，各自被计数并使下一次prefill抛错；select路径校验及reference直通。连续3次全部通过。全量回归87项通过（test_indexer全部，加test_qsa中插件/校验相关项）。
+
+### 2. 真实TP2验收（decode=1、VALIDATE=1）
+
+- 配置：原launcher/模型、GPU0/1、seed42、chunk16384、max running32、decode graph32。解析后配置与v3三臂及T13闭环逐字段相同。标志为`PYHIP_QSA_PREFILL=1`、`PYHIP_QSA_INDEXER=1`、`PYHIP_QSA_INDEXER_DECODE=1`、`PYHIP_QSA_VALIDATE=1`，并设失败dump目录。14源码包在freeze时从通过87项回归的树构建，运行前后身份不变。
+- 协议：原warmup、11888/12000行预热、10条fixture各2次；C1 128请求×64输出；C32 1轮预热＋3轮×32请求×128输出；最后原4请求×5输出profile。**256/256请求成功**，全程07:40–07:53。
+- decode校验（每rank）：12层，每层10300次调用（含capture前eager warmup和全部graph重放）、25644个真实行、6408个边界压缩行。两rank合计247200次调用、615456行。q、ring key、ring rope、压缩行不一致**均为0**，选择违例**0**。集合不同45/44行（约0.015%），最大相对边界间隙1.66e-7，远小于1e-5，属近并列。
+- profile中每rank 20次decode graph重放，每次都含12个PyHIP prep、12个PyHIP logits、24个fast_topk、24个expand（PyHIP加graph内SGLang参考），说明校验在graph内生效。
+- attention：每rank 28个布局×12层=336项，全部元素对独立FP32以`.02/.02`通过（每rank 14,960,996,352个元素），legacy差异0。T13的原失败布局这次没有出现：本驱动C32每轮的fixture次序相同（fixture=位置%10），T13为fixture=sample%10，混合布局不同。
+- prefill indexer：每rank 336项，pool写入逐bit，选择最大相对边界违例1.63e-7。
+- 输出：C1逐样本与v3 current/select/forward及T13相同的请求数为95/99/95/96（共128）。各臂自身稳定的fixture（1,3,4,6,7,9）输出全部相同；其余fixture在每个臂内部也不稳定。C32与v3同次序，相同64/65/64（共96）；与T13只能按fixture比较。
+- 门禁与清理：6次快照GPU0/1 use 0%、PTL Enabled/VECTOR,F8；启动前VRAM 0.145%、清理后0.146%，服务期间86–88%为模型常驻。自有进程组已无进程；server_returncode −9是驱动结束时的清理。9078保留。
+
+### 3. 计时（开启校验，不是性能）
+
+| 阶段 | 请求 | ITL中位 | TTFT中位 | v3 forward（VALIDATE=0）ITL中位 |
+|---|---:|---:|---:|---:|
+| C1 | 128 | 23.597ms | 887.8ms | 10.852ms |
+| C32 | 96 | 57.475ms | 17.476s | 21.186ms |
+
+C32每轮墙钟：预热61.34s，测量39.108/39.046/39.057s（v3 forward约32.7s）。ITL增加来自每步在graph内多跑一遍SGLang indexer（每层约44个prep kernel加全宽Torch MQA）和校验kernel。T13闭环的C32轮次57.9–287.6s主要花在新布局的FP32校验上；本轮布局少（28对77），轮次短得多。两者都不是生产性能，性能以v3（VALIDATE=0）为准。
+
+### 4. 结论与限制
+
+- 第2阶段在VALIDATE=1标准下通过：服务内每个decode步的q和pool写入逐bit一致，选择满足top-512判据；attention和prefill indexer首布局校验全部通过。
+- 未做：TP4/8真实服务（indexer权重和头在TP间复制，每rank的decode工作与TP2相同）、MTP/target-verify、质量评测。常驻服务仍建议VALIDATE=0。没有SGLang、Git提交或推送改动。
+
+<a id="qsa-attention-names"></a>
+## 2026-09-29：attention专属命名整理（含文件名，计算不变）
+
+按用户要求，`qsa`现在是包含attention和indexer的总包，不能再用同名`qsa()`表示其中的attention算子。本轮只整理attention专属文件、入口、内核符号、测试与当前文档；没有改数学、分流、launch数量、容差或工作区生命周期。
+
+### 1. 文件与公开入口
+
+旧文件链接指向本轮冻结副本；活动目录只保留右列，不加旧模块或`qsa()`兼容别名。
+
+| 原文件（冻结副本） | 当前文件 |
+|---|---|
+| [qsa.py](../../../../mytest/mydata/qsa_attention_names_20260929_01/before/qsa/qsa.py#L1) | [attention.py](attention.py) |
+| [prepare.py](../../../../mytest/mydata/qsa_attention_names_20260929_01/before/qsa/prepare.py#L1) | [attention_prepare.py](attention_prepare.py) |
+| [dense.py](../../../../mytest/mydata/qsa_attention_names_20260929_01/before/qsa/dense.py#L1) | [attention_dense.py](attention_dense.py) |
+| [union.py](../../../../mytest/mydata/qsa_attention_names_20260929_01/before/qsa/union.py#L1) | [attention_union.py](attention_union.py) |
+| [direct.py](../../../../mytest/mydata/qsa_attention_names_20260929_01/before/qsa/direct.py#L1) | [attention_direct.py](attention_direct.py) |
+| [_direct_packed.py](../../../../mytest/mydata/qsa_attention_names_20260929_01/before/qsa/_direct_packed.py#L1) | [_attention_direct_packed.py](_attention_direct_packed.py) |
+| [test_qsa.py](../../../../mytest/mydata/qsa_attention_names_20260929_01/before/qsa/test_qsa.py#L1) | [test_attention.py](test_attention.py) |
+| [sglang/baseline.py](../../../../mytest/mydata/qsa_attention_names_20260929_01/before/qsa/sglang/baseline.py#L1) | [sglang/attention_baseline.py](sglang/attention_baseline.py) |
+| [sglang/validation.py](../../../../mytest/mydata/qsa_attention_names_20260929_01/before/qsa/sglang/validation.py#L1) | [sglang/attention_validation.py](sglang/attention_validation.py) |
+
+公开导出改为`from experiments.attention.flydsl.qsa import attention`，调用为`attention(q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=None, out=None)`。参数、3D BF16 D256契约和返回结果不变。[sglang/plugin.py](sglang/plugin.py)惰性导入新模块、调用新入口，构建清单同步更新；独立包仍为14个源码文件。新benchmark的scope/summary键为`attention`，不再是`qsa`；计时边界仍是完整准备加attention，历史JSON键不改写。
+
+### 2. 内核和profiler名称
+
+| 原符号 | 当前符号 |
+|---|---|
+| `qsa_recover_scatter` | `attention_recover_scatter` |
+| `qsa_compact` | `attention_compact` |
+| `qsa_order_masks_validate` | `attention_order_masks_validate` |
+| `qsa_scatter_prepared` | `attention_scatter_prepared` |
+| `dense_qsa_bf16_d256_bounded` | `attention_dense_bf16_d256_bounded` |
+| `union_qsa_bf16_d256` | `attention_union_bf16_d256` |
+| `direct_qsa_bf16_d256` | `attention_direct_bf16_d256` |
+| `direct_pack_kv_bf16_d256` | `attention_pack_kv_bf16_d256` |
+
+raw与packed direct仍共用显示名，须结合artifact/plan区分；普通pack和gated pack两处decorator都已改名。共用MHA的`dense_mha_bf16_d256`和indexer的`qsa_indexer_*`不改。
+
+attention profiler分段由`pyhip_qsa.prepare`、`pyhip_qsa.attention`改为`pyhip_qsa.attention.prepare`、`pyhip_qsa.attention.compute`，采集标记由`pyhip_qsa.capture_inputs`改为`pyhip_qsa.capture_attention`。共享插件名`pyhip_flydsl_qsa`、包名`pyhip_qsa_runtime`、`PYHIP_QSA_*`、`QSA_REPLAY_*`、attention/indexer合并报告名均保留；上游`QSAIndexer`、`QSAProfile`、KV-pool字段和ABI哈希不改。
+
+### 3. 验证与保留的失败
+
+所有GPU检查使用PyHIP .venv、物理GPU6（0001:a5:00.0），不采普通性能。
+
+- [有限命名重现证明](../../../../mytest/mydata/qsa_attention_names_20260929_01/source_proof_final.json)：从冻结的原文件按逐项列出的替换重建当前**18个Python文件，字节和AST均相同**。除名称外，只调整资源测试中按字母排序的两内核名称列表次序。indexer四源码及其测试逐字未变，两份共用MHA依赖逐字未变；不是声称符合“不允许改符号”的纯搬家证明。
+- [最终正常回归](../../../../mytest/mydata/qsa_attention_names_20260929_01/normal_final/summary.json)：**attention 81＋indexer 71＝152 passed，0失败/错误/跳过，32项perf deselected**，342.758s。运行前后18文件哈希一致；含真实TP2 capture及H6/H3派生、T13失败输入、graph/工作区、indexer decode校验回归。PyTorch/SGLang原有15条弃用warning保留。
+- [同输入设备等价](../../../../mytest/mydata/qsa_attention_names_20260929_01/equivalence/result.json)：真实L3、T13混合prefill、raw、超pack预算、shared共5类×TP2/4/8＝**15例**。每例比较冻结旧版本和改名版本，完整输出与计划metadata/counts/active/query_tiles/task_order逐bit相同，重复调用逐bit相同，选行对独立FP32仍以`.02/.02`通过。TP4/8是同头数的新旧派生回放，不是新多卡服务。
+- 同轮导出的**65对编译对象、71对完整`STT_FUNC`机器码**在符号映射后相同；包含dense 6、union 15、raw 9、双内核packed 6、准备29对对象。按ELF内核名逐项匹配寄存器、LDS、参数段和工作组资源；private/VGPR spill/SGPR spill全0，Triton动态LDS另比，不把固定LDS0等同总LDS0。
+- [独立包GPU结果](../../../../mytest/mydata/qsa_attention_names_20260929_01/package/gpu.json)：H12/H6/H3实际调用原容差通过，trace出现新内核名及prepare/compute标记，未导入experiments。[14源码清单](../../../../mytest/mydata/qsa_attention_names_20260929_01/package/manifest_check.json)、[禁用惰性检查](../../../../mytest/mydata/qsa_attention_names_20260929_01/package/disabled.json)、[原生entrypoint和7个hook应用](../../../../mytest/mydata/qsa_attention_names_20260929_01/package/entrypoint.json)均通过。旧target不覆盖，新部署须重建。
+
+第一轮GPU等价执行在最后的资源列表比较退出1，第一轮pytest为152 passed但资源fixture有1个teardown error：[GPU执行收据](../../../../mytest/mydata/qsa_attention_names_20260929_01/equivalence_execution.json)、[pytest失败收据](../../../../mytest/mydata/qsa_attention_names_20260929_01/normal/result.json)。原因是多kernel metadata按符号名字排列：改名前pack在direct前，改名后direct在pack前；并非计算、寄存器或实际launch顺序改变。使用[按ELF名字复审](../../../../mytest/mydata/qsa_attention_names_20260929_01/reaudit.py)对同一批已有产物核验全部资源，并确认真实launch仍pack→direct；不重采GPU等价用例、不放宽三零。修正fixture期望次序后，完整回归另存到最终目录。两个原失败收据保留。
+
+### 4. 历史与范围
+
+本节之前的477,563字节日志保持原样，包括最新indexer decode验收；不改旧trace、冻结包、原始数据、历史性能表或旧研究脚本。历史`qsa()`/文件/内核名称按当时身份阅读，复现旧研究用对应冻结源码，不给活动目录补兼容垫片。本轮无新性能、模型服务或质量结论。
+
+本会话未执行Git暂存、提交、推送或SGLang源码修改。运行期间检测到外部暂存了QSA改名/indexer及另外两份MHA文件，已只读记录[外部Git状态](../../../../mytest/mydata/qsa_attention_names_20260929_01/external_git_transition_final.json)并保留，不恢复旧index、也不把外部动作记成本会话提交。两仓库HEAD在记录时未变；SGLang的HEAD/index未变。新证据只写入本轮数据目录，不新增Markdown文件。

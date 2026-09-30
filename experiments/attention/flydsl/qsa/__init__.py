@@ -1,5 +1,5 @@
-"""gfx942 sparse attention; the only public callable is qsa()."""
+"""QSA attention and indexer components; public attention entry point."""
 
-from .qsa import qsa
+from .attention import attention
 
-__all__ = ["qsa"]
+__all__ = ["attention"]

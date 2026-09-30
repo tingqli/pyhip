@@ -1,6 +1,6 @@
 # Copyright 2023-2024 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
-"""QSA normal correctness, real-data replay and performance in one entry point.
+"""QSA attention correctness, real-data replay and performance in one entry point.
 
 Pytest runs numerical/normal-use checks; -m perf enables timing explicitly.
 CLI --check-only skips timing. All new results live under mytest/mydata.
@@ -32,10 +32,10 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
     __package__ = "experiments.attention.flydsl.qsa"
 
-from . import qsa
-from .sglang.baseline import baseline
+from . import attention
+from .sglang.attention_baseline import baseline
 
-_runtime = importlib.import_module(".qsa", __package__)
+_runtime = importlib.import_module(".attention", __package__)
 ROOT = Path(__file__).resolve().parents[4]
 DATA = ROOT / "mytest/mydata"
 REAL_INPUTS = DATA / "qsa_real_study_20260925/capture/inputs"
@@ -122,7 +122,7 @@ def _tp_case(value, tp_size):
 
 
 def _call(inputs, out=None):
-    return qsa(inputs.q, inputs.k, inputs.v, inputs.indices, query_lens=inputs.query_lens,
+    return attention(inputs.q, inputs.k, inputs.v, inputs.indices, query_lens=inputs.query_lens,
                prefix_lens=inputs.prefix_lens, softmax_scale=inputs.scale, out=out)
 
 
@@ -271,7 +271,7 @@ def _gpu():
 
 
 @pytest.mark.parametrize("queries,prefixes,heads", CASES)
-def test_qsa(queries, prefixes, heads):
+def test_attention(queries, prefixes, heads):
     device = _gpu()
     value = _make_case(queries, prefixes, heads, device)
     if sum(queries):
@@ -294,14 +294,14 @@ def test_qsa(queries, prefixes, heads):
     if prefixes == (2047,):
         check(_make_case(queries, prefixes, heads, device, shared=True))
     if prefixes == (30000,) and heads == 12:
-        torch.testing.assert_close(qsa(value.q, value.k, value.v, value.indices), _call(value), rtol=0, atol=0)
+        torch.testing.assert_close(attention(value.q, value.k, value.v, value.indices), _call(value), rtol=0, atol=0)
         for scale in (float("nan"), 0, -1, True, torch.tensor(0.0625, device=device)):
             with pytest.raises(ValueError, match="scale"):
-                qsa(value.q, value.k, value.v, value.indices, softmax_scale=scale)
+                attention(value.q, value.k, value.v, value.indices, softmax_scale=scale)
         with pytest.raises(ValueError, match="Host"):
-            qsa(value.q, value.k, value.v, value.indices, query_lens=(1,))
+            attention(value.q, value.k, value.v, value.indices, query_lens=(1,))
         with pytest.raises(ValueError, match="16 Q heads"):
-            qsa(torch.empty((queries[0], 17, 256), device=device, dtype=value.q.dtype), value.k, value.v, value.indices)
+            attention(torch.empty((queries[0], 17, 256), device=device, dtype=value.q.dtype), value.k, value.v, value.indices)
     if prefixes == (30000,):
         independent = value.indices.clone()
         changed = _make_case(queries, prefixes, heads, device, seed=51, shared=True)
@@ -334,7 +334,7 @@ def _real_files():
 
 @pytest.mark.parametrize("path", _real_files(), ids=lambda p: p.stem)
 @pytest.mark.parametrize("tp_size", TP_SIZES, ids=lambda tp: f"tp{tp}")
-def test_real_qsa(path, tp_size):
+def test_real_attention(path, tp_size):
     check(_tp_case(_load(path, _gpu()), tp_size))
 
 
@@ -396,7 +396,7 @@ def test_direct_recovered_order():
         workspace = _runtime._Workspace(value.q, value.k, value.v, value.indices,
                                         value.query_lens, value.prefix_lens, value.scale)
         inputs = workspace.bind(value.q, value.k, value.v, value.indices)
-        _runtime.prepare.qsa_recover_scatter[(9,)](
+        _runtime.prepare.attention_recover_scatter[(9,)](
             value.indices, inputs.query_positions, inputs.kv_lens,
             inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=1,
         )
@@ -423,12 +423,12 @@ def test_direct_recovered_order():
             indices[0, 2048] = 29999
         elif corruption == "padding":
             indices[0, 2049] = 0
-        _runtime.prepare.qsa_recover_scatter[(5,)](
+        _runtime.prepare.attention_recover_scatter[(5,)](
             indices, inputs.query_positions, inputs.kv_lens,
             inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=1,
         )
         assert workspace.errors.cpu().tolist() == [int(corruption != "none"), 0, 0, 0, 0]
-        _runtime.prepare.qsa_order_masks_validate[(1,)](workspace.errors, workspace.valid, ROWS=5, num_warps=4)
+        _runtime.prepare.attention_order_masks_validate[(1,)](workspace.errors, workspace.valid, ROWS=5, num_warps=4)
         assert bool(workspace.valid.cpu()) == (corruption == "none")
 
 
@@ -441,10 +441,10 @@ def test_error_check_chunked_graph(rows):
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(stream):
-        _runtime.prepare.qsa_order_masks_validate[(1,)](errors, valid, ROWS=rows, num_warps=4)
+        _runtime.prepare.attention_order_masks_validate[(1,)](errors, valid, ROWS=rows, num_warps=4)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            _runtime.prepare.qsa_order_masks_validate[(1,)](errors, valid, ROWS=rows, num_warps=4)
+            _runtime.prepare.attention_order_masks_validate[(1,)](errors, valid, ROWS=rows, num_warps=4)
     torch.cuda.current_stream(device).wait_stream(stream)
     for row in sorted({0, min(1023, rows - 1), min(1024, rows - 1), rows - 1}):
         for error in (1, -1, 0):
@@ -503,7 +503,7 @@ def test_prepare_recovery_validation(reverse):
     sequences = torch.arange(len(data), dtype=torch.int32, device=device)
     blocks = torch.empty((len(data), 512), dtype=torch.int32, device=device)
     errors = torch.empty(len(data), dtype=torch.int32, device=device)
-    _runtime.prepare.qsa_recover_scatter[(len(data),)](
+    _runtime.prepare.attention_recover_scatter[(len(data),)](
         indices, pos, lens, sequences, blocks, errors, REVERSE=reverse, num_warps=1)
     np.testing.assert_array_equal(blocks.cpu().numpy(), expected_blocks)
     np.testing.assert_array_equal(errors.cpu().numpy(), expected_errors)
@@ -536,7 +536,7 @@ def test_union_compact_chunked(max_blocks):
         membership = torch.full_like(blocks, -777)
         counts = torch.empty((len(rows), 2), dtype=torch.int32, device=device)
         active = torch.empty(len(rows), dtype=torch.int32, device=device)
-        _runtime.prepare.qsa_compact[(len(rows),)](
+        _runtime.prepare.attention_compact[(len(rows),)](
             source, blocks, membership, counts, meta, active, max_blocks, capacity,
             min(1024, triton.next_power_of_2(max_blocks)), rho, packed, num_warps=4)
         b, m = blocks.cpu().numpy(), membership.cpu().numpy().view(np.uint32)
@@ -575,7 +575,7 @@ def test_direct_packed_kv():
         workspace = _runtime._Workspace(value.q, value.k, value.v, value.indices,
                                         value.query_lens, value.prefix_lens, value.scale)
         inputs = workspace.bind(value.q, value.k, value.v, value.indices)
-        _runtime.prepare.qsa_recover_scatter[(length,)](
+        _runtime.prepare.attention_recover_scatter[(length,)](
             value.indices, inputs.query_positions, inputs.kv_lens,
             inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=1,
         )
@@ -637,7 +637,7 @@ def test_direct_packed_kv():
     workspace = _runtime._Workspace(value.q, value.k, value.v, value.indices,
                                     value.query_lens, value.prefix_lens, value.scale)
     inputs = workspace.bind(value.q, value.k, value.v, value.indices)
-    _runtime.prepare.qsa_recover_scatter[(8,)](
+    _runtime.prepare.attention_recover_scatter[(8,)](
         value.indices, inputs.query_positions, inputs.kv_lens,
         inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=1,
     )
@@ -724,7 +724,7 @@ def test_union_direct_routing():
     counts = torch.empty((len(cases), 2), dtype=torch.int32, device=device)
     active = torch.empty(len(cases), dtype=torch.int32, device=device)
     for packed in (False, True):
-        _runtime.prepare.qsa_compact[(len(cases),)](
+        _runtime.prepare.attention_compact[(len(cases),)](
             dense_gpu, blocks, membership, counts, meta_gpu, active,
             capacity, capacity, capacity, 4.0, packed, num_warps=4,
         )
@@ -876,7 +876,7 @@ def test_direct_pack_limit_host(monkeypatch):
 @pytest.mark.parametrize("tp_size", TP_SIZES, ids=lambda tp: f"tp{tp}")
 def test_direct_pack_limit(tp_size, monkeypatch):
     """The real byte cutoff retains raw routing, output guards and graph updates."""
-    from . import _direct_packed
+    from . import _attention_direct_packed
 
     device = _gpu()
     limit = 64 * 1024 * 1024
@@ -903,7 +903,7 @@ def test_direct_pack_limit(tp_size, monkeypatch):
                 with monkeypatch.context() as patch:
                     if not expected:
                         patch.setattr(torch, "empty_like", forbidden)
-                        patch.setattr(_direct_packed, "run", forbidden)
+                        patch.setattr(_attention_direct_packed, "run", forbidden)
                     _call(value, output)
                 key = (device, stream.cuda_stream, value.query_lens, value.prefix_lens, heads, hk, value.scale)
                 workspace = _runtime._workspaces[key]
@@ -923,7 +923,7 @@ def test_direct_pack_limit(tp_size, monkeypatch):
                         patch.setattr(torch.Tensor, method, forbidden)
                     patch.setattr(torch, "empty_like", forbidden)
                     if not expected:
-                        patch.setattr(_direct_packed, "run", forbidden)
+                        patch.setattr(_attention_direct_packed, "run", forbidden)
                     _call(value, output)
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, stream=stream):
@@ -942,6 +942,74 @@ def test_direct_pack_limit(tp_size, monkeypatch):
                     assert routes["union_rows"] > 0 if selection is shared else routes["direct_rows"] > 0
                     assert workspace.direct is plan and workspace.union.packed_direct == expected
             torch.cuda.current_stream(device).wait_stream(stream)
+
+
+def test_h6_query_tiles_host(monkeypatch):
+    """The large full-prefill specialization preserves exact row coverage."""
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: SimpleNamespace(multi_processor_count=80))
+    for queries, prefixes, heads, hk, expected_tile in (
+        ((5410,), (0,), 6, 1, 16), ((5411,), (0,), 6, 1, 21),
+        ((11888,), (0,), 6, 1, 21), ((12000,), (0,), 6, 1, 21),
+        ((12000,), (1,), 6, 1, 16), ((6000, 6000), (0, 0), 6, 1, 16),
+        ((12000,), (0,), 12, 1, 10), ((12000,), (0,), 3, 1, 32),
+        ((12000,), (0,), 12, 2, 16),
+    ):
+        skips = tuple(min(q, max(0, 2051 - p)) for q, p in zip(queries, prefixes))
+        inputs = SimpleNamespace(q=SimpleNamespace(shape=(sum(queries), heads, 256), device=torch.device("cpu")),
+                     k=SimpleNamespace(shape=(sum(queries) + sum(prefixes), hk, 256)),
+                                 query_lens=queries, prefix_lens=prefixes,
+                                 max_seqlen_k=max(q + p for q, p in zip(queries, prefixes)))
+        plan = _runtime.prepare.allocate_plan(inputs=inputs, query_tile=32, skip_counts=skips)
+        assert plan.query_tile == expected_tile and plan.group_padded == heads // hk
+        meta = plan.metadata.tolist()
+        actual = [row for first, count, *_ in meta for row in range(first, first + count)]
+        expected, start = [], 0
+        for count, skip in zip(queries, skips):
+            expected.extend(range(start + skip, start + count))
+            start += count
+        assert actual == expected
+        query_tiles = plan.query_tiles.tolist()
+        for tile, (first, count, *_) in enumerate(meta):
+            assert query_tiles[first:first + count] == [tile] * count
+        assert all(query_tiles[row] == -1 for row in set(range(sum(queries))) - set(expected))
+        if expected_tile == 21:
+            sizes = [row[1] for row in meta]
+            assert len(meta) == math.ceil(len(expected) / 21)
+            assert max(sizes) - min(sizes) <= 1 and max(sizes) <= 21
+            assert min(sizes) >= 20 and plan.grid == 160
+
+
+def test_h6_balanced_graph():
+    """Balanced H6 tiles rebuild exact masks after changing selection and values."""
+    device = _gpu()
+    value = _make_case((5460,), (0,), 6, device, seed=93)
+    check(value)
+    key = (device, torch.cuda.current_stream(device).cuda_stream, value.query_lens,
+           value.prefix_lens, 6, 1, value.scale)
+    plan = _runtime._workspaces[key].union
+    assert plan.query_tile == 21
+    sizes = plan.metadata[:, 1].cpu().tolist()
+    assert min(sizes) >= 20 and max(sizes) == 21
+    independent = value.indices.clone()
+    shared = _make_case((5460,), (0,), 6, device, seed=97, shared=True).indices
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        output = _call(value)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            _call(value, output)
+    torch.cuda.current_stream(device).wait_stream(stream)
+    for selection in (shared, independent, shared):
+        value.indices.copy_(selection)
+        value.v.neg_()
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize(device)
+        ids = _rows(value)
+        torch.testing.assert_close(output[ids].float(), reference(value, ids), rtol=.02, atol=.02)
+        with torch.cuda.stream(stream):
+            _audit(value)
 
 
 def test_union_task_order():
@@ -972,7 +1040,7 @@ def test_union_task_order():
             for shift in (max(1, (tasks - 1).bit_length()), 26):
                 # Exercise the int64 fallback without allocating millions of tasks.
                 wide = (math.ceil(int(counts[:, 0].max()) / 16) << shift) + tasks - 1 >= 2**31
-                _runtime.prepare.qsa_order_masks_validate[(math.ceil(capacity / size),)](
+                _runtime.prepare.attention_order_masks_validate[(math.ceil(capacity / size),)](
                     None, None, counts_gpu, active_gpu, order, 0, tasks, heads, 1, grid, size,
                     shift, wide, False, num_warps=8,
                 )
@@ -1049,6 +1117,145 @@ def test_sglang_adapter(monkeypatch, tmp_path):
     assert plugin._around_forward(fallback, backend, value.q, value.k, value.v, layer, batch) == "unchanged"
 
 
+def test_validation_failure_capture(monkeypatch, tmp_path):
+    """A failed service comparison saves the exact replay and still raises."""
+    from .sglang import attention_validation as validation, plugin
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("PYHIP_QSA_VALIDATE", "1")
+    monkeypatch.setenv("PYHIP_QSA_DUMP_DIR", str(tmp_path))
+    state = plugin._State()
+    q = torch.zeros((2, 12, 256), dtype=torch.bfloat16)
+    k = torch.zeros((6, 1, 256), dtype=torch.bfloat16)
+    v = torch.ones_like(k)
+    indices = torch.full((2, 2051), -1, dtype=torch.int32)
+    output, expected = torch.zeros_like(q), torch.zeros_like(q)
+    output[1, 5, 220] = 1
+    state.runtime = SimpleNamespace(attention=Mock(return_value=output))
+    backend = SimpleNamespace(runner=SimpleNamespace(ps=SimpleNamespace(tp_rank=0)))
+    context = (backend, SimpleNamespace(layer_id=47), (1, 1), (3, 1))
+    original = Mock(return_value=expected)
+    monkeypatch.setattr(validation, "reference", Mock(return_value=expected.float()))
+    with pytest.raises(AssertionError, match="Tensor-likes are not close"):
+        state.execute(context, q, k, v, indices, .0625, original, ())
+    assert not state.checked and not state.checks
+    original.assert_called_once()
+    path, = tmp_path.glob("failure_tp0_layer47_m2_*.pt")
+    saved = torch.load(path, map_location="cpu", weights_only=True)
+    assert saved["metadata"]["validation_failed"]
+    assert saved["metadata"]["query_lens"] == (1, 1)
+    assert saved["metadata"]["prefix_lens"] == (3, 1)
+    for name, value in (("q", q), ("k", k), ("v", v), ("indices", indices),
+                        ("output", output), ("expected", expected.float()), ("legacy_expected", expected)):
+        torch.testing.assert_close(saved["tensors"][name], value, rtol=0, atol=0)
+        assert _hash(value) == saved["metadata"]["tensor_metadata"][name]["sha256"]
+
+
+@pytest.mark.parametrize("heads", (12, 6, 3))
+def test_t13_q_prescaling_reference(heads, monkeypatch, tmp_path):
+    """BF16 prescaling destroys a zero dot product; the service must check the true math."""
+    from .sglang import attention_validation as validation, plugin
+
+    device = _gpu()
+    q = torch.tensor([1., 1.5], device=device, dtype=torch.bfloat16).repeat(128).expand(1, heads, 256).contiguous()
+    k = torch.zeros((4, 1, 256), device=device, dtype=torch.bfloat16)
+    k[::2] = torch.tensor([1.5, -1.], device=device, dtype=torch.bfloat16).repeat(128)
+    v = torch.full_like(k, -4.)
+    v[::2] = 4.
+    indices = torch.full((1, 2051), -1, dtype=torch.int32, device=device)
+    indices[0, :4] = torch.arange(4, device=device)
+    value = _metadata(q, k, v, indices, (1,), (3,))
+    expected64 = (q.double()[0] @ k[:, 0].double().T * value.scale).softmax(-1) @ v[:, 0].double()
+    torch.testing.assert_close(expected64, torch.zeros_like(expected64), rtol=0, atol=0)
+    legacy = _base(value)
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(legacy.double()[0], expected64, rtol=.02, atol=.02)
+    precise = validation.reference(q, k, v, indices, query_lens=(1,), prefix_lens=(3,), scale=value.scale)
+    torch.testing.assert_close(precise.double()[0], expected64, rtol=0, atol=1e-6)
+    monkeypatch.setenv("PYHIP_QSA_VALIDATE", "1")
+    monkeypatch.setenv("PYHIP_QSA_REPORT_DIR", str(tmp_path))
+    backend = SimpleNamespace(runner=SimpleNamespace(ps=SimpleNamespace(tp_rank=0)))
+    state = plugin._State()
+    output = state.execute((backend, SimpleNamespace(layer_id=47), (1,), (3,)), q, k, v, indices,
+                           value.scale, lambda: legacy, ())
+    torch.testing.assert_close(output.double()[0], expected64, rtol=.02, atol=.02)
+    assert state.checks[0]["reference"] == "fp32_selected_tokens" and not state.checks[0]["legacy_close"]
+    assert state.checks[0]["elements"] == heads * 256
+
+
+def test_t13_legacy_agreement_cannot_hide_bad_output(monkeypatch, tmp_path):
+    """Even agreement with the old baseline cannot bypass the mathematical reference."""
+    from .sglang import attention_validation as validation, plugin
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("PYHIP_QSA_VALIDATE", "1")
+    monkeypatch.setenv("PYHIP_QSA_DUMP_DIR", str(tmp_path))
+    q = torch.zeros((1, 3, 256), dtype=torch.bfloat16)
+    k = v = torch.zeros((4, 1, 256), dtype=torch.bfloat16)
+    indices = torch.full((1, 2051), -1, dtype=torch.int32)
+    wrong = torch.ones_like(q)
+    state = plugin._State()
+    state.runtime = SimpleNamespace(attention=Mock(return_value=wrong))
+    monkeypatch.setattr(validation, "reference", Mock(return_value=torch.zeros_like(q, dtype=torch.float32)))
+    backend = SimpleNamespace(runner=SimpleNamespace(ps=SimpleNamespace(tp_rank=0)))
+    with pytest.raises(AssertionError):
+        state.execute((backend, SimpleNamespace(layer_id=47), (1,), (3,)), q, k, v, indices,
+                      .0625, lambda: wrong, ())
+    assert not state.checked and not state.checks
+
+
+@pytest.mark.parametrize("heads,hk", ((12, 1), (6, 1), (3, 1), (12, 2), (6, 2), (3, 2)))
+def test_validation_packed_requests(heads, hk):
+    """The independent oracle covers empty requests, sparse sets, prefixes and physical tails."""
+    from .sglang.attention_validation import reference as service_reference
+
+    value = _make_case((7, 0, 5, 9), (0, 17, 2047, 3000), heads * hk, _gpu())
+    if hk == 2:
+        value.k = torch.cat((value.k, -value.k), dim=1)
+        value.v = torch.cat((value.v, -value.v), dim=1)
+    expected = service_reference(value.q, value.k, value.v, value.indices, query_lens=value.query_lens,
+                                 prefix_lens=value.prefix_lens, scale=value.scale)
+    torch.testing.assert_close(expected, reference(value, list(range(len(value.q)))), rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(_call(value).float(), expected, rtol=.02, atol=.02)
+    for row in (0, 6, 7, 11, 12, 20):
+        selected = value.indices[row].cpu().long()
+        selected = selected[selected >= 0]
+        selected += int(value.cu_k[value.sequence_ids[row]])
+        q = value.q[row].cpu().double().reshape(hk, heads, 256)
+        k = value.k[selected.to(value.k.device)].cpu().double()
+        v = value.v[selected.to(value.v.device)].cpu().double()
+        scores = torch.einsum("ghd,ngd->ghn", q, k) * value.scale
+        expected64 = torch.einsum("ghn,ngd->ghd", scores.softmax(-1), v).reshape(heads * hk, 256)
+        torch.testing.assert_close(expected[row].cpu().double(), expected64, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.parametrize("tp_size", TP_SIZES)
+def test_t13_captured_mixed_prefill(tp_size, monkeypatch, tmp_path):
+    """Captured service failure: unchanged runtime must pass an accurate full-output oracle."""
+    from .sglang import plugin
+
+    paths = sorted((DATA / "qsa_t13_20260929_01/reproduce/failure_inputs").glob("failure_tp0_layer47_m16352_*.pt"))
+    if not paths:
+        pytest.skip("requires the QSA-T13 captured mixed-prefill input")
+    assert len(paths) == 1
+    value = _tp_case(_load(paths[0], _gpu()), tp_size)
+    monkeypatch.setenv("PYHIP_QSA_VALIDATE", "1")
+    monkeypatch.setenv("PYHIP_QSA_REPORT_DIR", str(tmp_path))
+    backend = SimpleNamespace(runner=SimpleNamespace(ps=SimpleNamespace(tp_rank=0)))
+    state = plugin._State()
+    output = state.execute((backend, SimpleNamespace(layer_id=47), value.query_lens, value.prefix_lens),
+                           value.q, value.k, value.v, value.indices, value.scale, lambda: _base(value), ())
+    # H6/H3 change union query grouping relative to the original H12 capture;
+    # cross-layout accumulation is tolerance-equivalent, not bit-exact.
+    tolerance = 0 if tp_size == 2 else .02
+    torch.testing.assert_close(output, value.captured, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(output, _call(value), rtol=0, atol=0)
+    assert state.checks[0]["reference"] == "fp32_selected_tokens"
+    if tp_size in (2, 4):
+        assert not state.checks[0]["legacy_close"]
+    assert _audit(value)["dense_rows"] == 4038
+
+
 def _gate(folder, phase, gpu):
     from tests.ops.gr_read.test_gr_read import read_hardware, validate_hardware
 
@@ -1076,7 +1283,7 @@ def benchmark(value, folder, gpu, *, buffers=BENCHMARK_BUFFERS, warmup=2, sample
                ROOT / "src/pyhip/testing/misc.py", ROOT / "tests/ops/gr_read/test_gr_read.py"]
     hashes = lambda: {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
     report = {"complete": False, "raw": [], "buffers": buffers, "warmup": warmup, "samples": samples,
-              "scope": "qsa: recover+validate+rebuild+dispatch; base: frozen sparse kernel; preallocated outputs, no JIT/indexer/KV gather",
+              "scope": "attention: recover+validate+rebuild+dispatch; base: frozen sparse kernel; preallocated outputs, no JIT/indexer/KV gather",
               "query_lens": value.query_lens, "prefix_lens": value.prefix_lens, "scale": value.scale,
               "q_shape": list(value.q.shape), "k_shape": list(value.k.shape), "dtype": str(value.q.dtype),
               "torch": torch.__version__, "hip": torch.version.hip, "source_sha256": hashes(),
@@ -1099,31 +1306,31 @@ def benchmark(value, folder, gpu, *, buffers=BENCHMARK_BUFFERS, warmup=2, sample
             for _ in range(warmup):
                 _call(data, output); _base(data, base_out)
         assert all(len({a[name]["pointer"] for a in report["addresses"]}) == buffers for name in report["addresses"][0])
-        expected_qsa = outputs[0].clone()
+        expected_attention = outputs[0].clone()
         for output, base_out in zip(outputs, bases):
             output.fill_(float("nan")); base_out.fill_(float("nan"))
         torch.cuda.synchronize(gpu)
         _gate(folder, "before_samples", gpu)
-        timer = cudaPerf(name="qsa", verbose=0)
+        timer = cudaPerf(name="attention", verbose=0)
         if not timer.enable:
             raise RuntimeError("CUDAPERF disabled timing")
         for sample in range(samples):
             bi = sample % buffers
-            for name in (("base", "qsa") if sample % 2 == 0 else ("qsa", "base")):
+            for name in (("base", "attention") if sample % 2 == 0 else ("attention", "base")):
                 with timer:
                     (_base if name == "base" else _call)(values[bi], bases[bi] if name == "base" else outputs[bi])
                 elapsed = timer.latencies[-1] * 1e6
                 report["raw"].append({"scope": name, "sample": sample, "buffer": bi, "us": elapsed})
                 assert math.isfinite(elapsed) and elapsed > 0
         for data, output, expected in zip(values, outputs, bases):
-            torch.testing.assert_close(output, expected_qsa, rtol=0, atol=0)
+            torch.testing.assert_close(output, expected_attention, rtol=0, atol=0)
             torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
             for name in ("q", "k", "v", "indices"):
                 torch.testing.assert_close(getattr(data, name), getattr(value, name), rtol=0, atol=0)
         work = int((value.indices >= 0).sum()) * 4 * value.q.shape[1] * 256
         report["summary"] = {}
         base_us = statistics.median(r["us"] for r in report["raw"] if r["scope"] == "base")
-        for name in ("base", "qsa"):
+        for name in ("base", "attention"):
             elapsed = statistics.median(r["us"] for r in report["raw"] if r["scope"] == name)
             report["summary"][name] = {"median_us": elapsed, "ratio_to_base": elapsed / base_us,
                                          "effective_tflops": work / elapsed / 1e6,
@@ -1152,14 +1359,14 @@ def benchmark(value, folder, gpu, *, buffers=BENCHMARK_BUFFERS, warmup=2, sample
 @pytest.mark.perf
 @pytest.mark.parametrize("path", _real_files(), ids=lambda p: p.stem)
 @pytest.mark.parametrize("tp_size", TP_SIZES, ids=lambda tp: f"tp{tp}")
-def test_qsa_performance(path, tp_size):
+def test_attention_performance(path, tp_size):
     device = _gpu()
     output = Path(os.environ["QSA_REPLAY_OUTPUT"])
     assert output.resolve().is_relative_to(DATA.resolve())
     result = benchmark(_tp_case(_load(path, device), tp_size), output / f"{path.stem}_tp{tp_size}", device.index)
     assert result["complete"]
     if os.environ.get("QSA_REPLAY_REQUIRE_HALF") == "1":
-        assert result["summary"]["qsa"]["ratio_to_base"] <= 0.5
+        assert result["summary"]["attention"]["ratio_to_base"] <= 0.5
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -1167,22 +1374,22 @@ def _resources():
     yield
     if not torch.cuda.is_initialized():
         return
-    for name, cache in (("union_qsa_bf16_d256", _runtime.union._COMPILED),
-                        ("direct_qsa_bf16_d256", _runtime.direct._COMPILED),
+    for name, cache in (("attention_union_bf16_d256", _runtime.union._COMPILED),
+                        ("attention_direct_bf16_d256", _runtime.direct._COMPILED),
                         ("dense_mha_bf16_d256", _runtime.dense.native._COMPILED),
-                        ("dense_qsa_bf16_d256_bounded", _runtime.dense._BOUNDED_COMPILED)):
+                        ("attention_dense_bf16_d256_bounded", _runtime.dense._BOUNDED_COMPILED)):
         for compiled in cache.values():
             assert re.findall(r'#gpu\.kernel_metadata<"([^"]+)"', compiled._keepalive.ir) == [name]
             for field in ("private_segment_fixed_size", "vgpr_spill_count", "sgpr_spill_count"):
                 values = re.findall(rf"\b{field}\s*=\s*(\d+)", compiled._keepalive.ir)
                 assert values and not any(map(int, values))
 
-    from . import _direct_packed
+    from . import _attention_direct_packed
 
-    for compiled in _direct_packed._COMPILED.values():
+    for compiled in _attention_direct_packed._COMPILED.values():
         text = compiled._keepalive.ir
         assert re.findall(r'#gpu\.kernel_metadata<"([^\"]+)"', text) == [
-            "direct_pack_kv_bf16_d256", "direct_qsa_bf16_d256",
+            "attention_direct_bf16_d256", "attention_pack_kv_bf16_d256",
         ]
         for field in ("private_segment_fixed_size", "vgpr_spill_count", "sgpr_spill_count"):
             values = re.findall(rf"\b{field}\s*=\s*(\d+)", text)
@@ -1190,9 +1397,12 @@ def _resources():
 
     # Inspect actual Triton ELFs too; attention-only checks missed planner
     # SGPR spills and large-context private scratch in earlier versions.
+    from .sglang.attention_validation import _selected_attention_fp32
+
     readelf = Path(os.environ.get("ROCM_PATH", "/opt/rocm")) / "llvm/bin/llvm-readelf"
-    functions = (_runtime.prepare.qsa_recover_scatter, _runtime.prepare.qsa_compact,
-                 _runtime.prepare.qsa_order_masks_validate, _runtime.prepare.qsa_scatter_prepared)
+    functions = (_runtime.prepare.attention_recover_scatter, _runtime.prepare.attention_compact,
+                 _runtime.prepare.attention_order_masks_validate, _runtime.prepare.attention_scatter_prepared,
+                 _selected_attention_fp32)
     seen = set()
     for function in functions:
         for cache in function.device_caches.values():
@@ -1220,7 +1430,7 @@ def main():
     parser.add_argument("--samples", type=int, default=BENCHMARK_SAMPLES,
                         help="samples per implementation (default: 128)")
     parser.add_argument("--check-only", action="store_true")
-    parser.add_argument("--require-half", action="store_true", help="require full QSA <= half the frozen baseline")
+    parser.add_argument("--require-half", action="store_true", help="require full attention <= half the frozen baseline")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.buffers < 1 or args.samples < args.buffers:
@@ -1243,7 +1453,7 @@ def main():
                 value, args.output / label, args.gpu, buffers=args.buffers, samples=args.samples)
             print(label, result.get("summary", routes), flush=True)
             if args.require_half and not args.check_only:
-                assert result["summary"]["qsa"]["ratio_to_base"] <= 0.5
+                assert result["summary"]["attention"]["ratio_to_base"] <= 0.5
             del value
         del original
         gc.collect()

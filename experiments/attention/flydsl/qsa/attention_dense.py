@@ -1,4 +1,4 @@
-"""Exact short-context QSA over the original packed BF16 Q/K/V/O buffers.
+"""Exact short-context QSA attention over the original packed BF16 Q/K/V/O buffers.
 
 For a request with M queries and prefix P, only the first
 ``t = min(M, max(0, limit - P))`` queries are dense. Their Q/O views have
@@ -626,7 +626,7 @@ def _bounded_body(
     output_fn(o0, o1, inv, output, storage, shared, _pin_i32(tid), H)
 
 
-@flyc.kernel(name="dense_qsa_bf16_d256_bounded", known_block_size=[THREADS, 1, 1])
+@flyc.kernel(name="attention_dense_bf16_d256_bounded", known_block_size=[THREADS, 1, 1])
 def _bounded_kernel(
     Q: fx.Tensor,
     K: fx.Tensor,

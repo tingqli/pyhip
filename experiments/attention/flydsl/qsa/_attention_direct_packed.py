@@ -25,7 +25,7 @@ from ..mha._common import (
     _uniform,
     _wait,
 )
-from .direct import _enabled, _load, _output
+from .attention_direct import _enabled, _load, _output
 
 
 def _pack_block(kr, vr, pk, pv, pair, half, lane, n, hk):
@@ -96,7 +96,7 @@ def _pack_body(K, V, PK, PV, N, HK):
         _pack_block(kr, vr, pk, pv, first + u * 2, half, lane, N, HK)
 
 
-@flyc.kernel(name="direct_pack_kv_bf16_d256")
+@flyc.kernel(name="attention_pack_kv_bf16_d256")
 def _pack(
     K: fx.Tensor, V: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor,
     N: fx.Constexpr[int], HK: fx.Constexpr[int],
@@ -104,7 +104,7 @@ def _pack(
     _pack_body(K, V, PK, PV, N, HK)
 
 
-@flyc.kernel(name="direct_pack_kv_bf16_d256")
+@flyc.kernel(name="attention_pack_kv_bf16_d256")
 def _pack_gated(
     K: fx.Tensor, V: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor, ACTIVE: fx.Tensor,
     N: fx.Constexpr[int], HK: fx.Constexpr[int], COUNT: fx.Constexpr[int],
@@ -349,7 +349,7 @@ def _body(
     _output(o0, o1, inv, output, shared, tid, H, H // HK, rows, qe, 64, first, QUERY_TILES, ACTIVE, GATED, NQ)
 
 
-@flyc.kernel(name="direct_qsa_bf16_d256")
+@flyc.kernel(name="attention_direct_bf16_d256")
 def _kernel(
     Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
     BLOCKS: fx.Tensor, META: fx.Tensor, ACTIVE: fx.Tensor, QUERY_TILES: fx.Tensor,

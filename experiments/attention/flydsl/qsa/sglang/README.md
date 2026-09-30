@@ -4,16 +4,44 @@
 
 | 文件 | 用途 |
 |---|---|
-| [baseline.py](baseline.py) | 两个原SGLang Triton kernel、原launch表、来源/SHA/版权、tensor adapter合一，仅供测试 |
-| [plugin.py](plugin.py) | 原生entry-point五个3D hook，单调用QSA、原精度校验、可选真实输入采集；同时提供`--build-target`构建入口 |
+| [attention_baseline.py](attention_baseline.py) | 两个原SGLang Triton kernel、原launch表、来源/SHA/版权、tensor adapter合一，仅供attention测试 |
+| [plugin.py](plugin.py) | 原生entry-point五个3D hook＋可选prefill indexer hook＋可选decode indexer hook，单调用QSA、全量FP32参考校验、可选真实输入采集；同时提供`--build-target`构建入口 |
+| [attention_validation.py](attention_validation.py) | opt-in attention服务校验的独立selected-token FP32参考；QK后缩放、FP32概率/PV，不依赖QSA规划器，不替换服务输出 |
 | [profile_model.py](profile_model.py) | 一次完成新包构建、原TP2启动/warmup/profile、双rank结果验证和自身进程组清理 |
 
 插件只替换gfx942、BF16 D256、Q12/6/3 KV1的main-runner eager EXTEND；decode、draft/verify、graph/compile、CP/DCP及不支持的attention选项仍走原实现。
-原backend继续负责KV写入、有效query裁剪、padding及3D prefix gather；插件仅消费3D K/V，不替换indexer。
+原backend继续负责KV写入、有效query裁剪、padding及3D prefix gather；attention只消费3D K/V。默认不替换indexer。
 启用须同时设置`PYHIP_QSA_PREFILL=1`与`SGLANG_PLUGINS=pyhip_flydsl_qsa`；三个上游源码SHA必须匹配（backend、kernel、qsa_indexer）。
 
+**命名整理（2026-09-29）。** 总包仍为`qsa`，同时包含attention和indexer；插件现在惰性导入`qsa.attention`并调用`attention()`。attention侧六个运行时文件统一为`attention_*`命名（公共入口与私有packed例外见[映射](../opt.md#qsa-attention-names)），参考模块也加attention前缀。共享插件/报告包含两部分，故保留`pyhip_qsa_runtime`、`pyhip_flydsl_qsa`、`PYHIP_QSA_*`及`qsa_tp{rank}.json`，不错误地把indexer或SGLang QSA协议改名。新profile的attention分段为`pyhip_qsa.attention.prepare`与`pyhip_qsa.attention.compute`，设备符号为`attention_*`；旧trace、包和来源SHA不回写。部署更新须新建target，旧包不会自动获得新名称。
+
+**QSA-T13校验修复（2026-09-29）。** 原TP2 C32负载已复现layer47、`query_lens=(11936,4416)`、`prefix_lens=(64,0)`的同一元素差异；错误来自原SGLang参考把`Q*scale*log2(e)`提前量化为BF16。独立FP64约−0.000000656，QSA为−0.001220703，原参考为+0.020141602（原参考自身不满足`.02/.02`）。因此不改变attention输出，而改正验证oracle：`PYHIP_QSA_VALIDATE=1`仍对每个首次layer/layout的**全部元素**做`rtol=atol=.02`检查，比较QSA转FP32与独立FP32 selected-token结果；同跑旧SGLang比较并在`legacy_close/legacy_error`保留差异。新参考失败仍抛错，不能以旧参考相同为由放行；不做输出替换或额外路由。新模块只在验证分支惰性导入，关闭校验或profile时原热路径不变。
+
+失败时先把Q/K/V、indices、output、FP32 expected、legacy expected与layer/rank/长度/scale/tensor hash保存到`PYHIP_QSA_DUMP_DIR`，否则使用`PYHIP_QSA_REPORT_DIR/failures`；然后重新抛出原assert。未配置目录只记录位置；落盘失败也不会吞掉数值断言。默认capture仍只在profile期间克隆，**数值失败落盘不受profile/row过滤器限制**。真实失败的全50,233,344元素、新参考63行CPU FP64及独立包TP2/4/8检查见[参考证据](../../../../../mytest/mydata/qsa_t13_20260929_01/reference_proof/result.json)和[独立包结果](../../../../../mytest/mydata/qsa_t13_20260929_01/package_check_same_shape/result.json)。原[入口门禁失败](../../../../../mytest/mydata/qsa_t13_20260929_01/fixed_service/status.json)保留；用户授权续测后，修复后的实际TP2服务现已完成C1 128请求、C32预热32＋3轮96请求和双rank profile，全部成功。两rank各77布局×12层=924项全量FP32 `.02/.02`通过，原失败布局及同一旧参考差异再次出现但准确检查通过；TP0另有1条旧对照差异，均保留日志。见[服务审计](../../../../../mytest/mydata/qsa_t13_20260929_02/analysis.json)与[闭环记录](../opt.md#qsa-t13-service-closure)。此运行启用昂贵校验及新layout JIT，不作为生产性能；服务已清理，新部署仍须显式构建包含验证模块的14源码target。
+
+**可选prefill indexer（2026-09-28）。** `PYHIP_QSA_INDEXER=1`（默认0）时再AROUND hook `QSAIndexer.forward_cuda`，只接eager EXTEND、gfx942、BF16、4×128头、ratio 4、top512/2048、NeoX rotary 64、单请求≤65536个压缩key（262144 token，模型上限）的调用，其余走原实现；另校验9个上游模块SHA（metadata、mqa、qsa_kv_pool、mrope、rotary utils、layernorm、minimax rmsnorm、fast_topk、qwen4_exp）。`PYHIP_QSA_INDEXER_GEMM=hipblaslt|sglang`（默认hipblaslt）：前者在行数>5120时用固定hipBLASLt solution 90517，按kernel名SHA256核验、不符则回退，GEMM舍入与SGLang不同；后者保持SGLang GEMM，prep逐bit一致。`PYHIP_QSA_VALIDATE=1`时每个(layer,长度)首次调用用SGLang GEMM同跑原路径对照。`PYHIP_QSA_INDEXER_DUMP_LAYERS=3,47`在profile中采集indexer真实输入。logits/top-k为FlyDSL kernel，全部形状共用一次编译；每进程首次调用JIT，空`FLYDSL_RUNTIME_CACHE_DIR`约1.0 s、已有缓存约0.06 s。性能、正确性与系统结果见[../opt.md](../opt.md)。
+
+**可选decode indexer（2026-09-29）。** `PYHIP_QSA_INDEXER_DECODE=0|select|1`（默认0，与`PYHIP_QSA_INDEXER`独立），使用同一组上游SHA校验。
+
+- `select`（第一阶段）：AROUND hook `QSAIndexer.select_decode_tokens`，eager decode和CUDA graph capture都接。要求为gfx942；module为4×128头、ratio 4、top512/2048；q为连续的BF16 [rows,4或8,128]（8头是fused prep的零padding，只读前4头）且rows<65536；压缩cache为连续的BF16 [pages,16,1,128]且小于2 GiB；页表为连续的int32 [rows,P]、宽度为16P；lengths为int32。不满足时走原实现。只替换logits：FlyDSL分页kernel按设备端长度读每行自己的压缩key；SGLang原`fast_topk`（row_starts改用常驻零buffer）和Triton expand不变，每层graph从16个kernel减到3个。grid由静态形状决定，没有host同步，由SGLang capture前的两次eager warmup完成FlyDSL编译（冷缓存约0.5–0.6 s）。
+- `1`（第二阶段）：包含`select`，另由`QSAIndexer.forward_cuda` hook整段接管CUDA graph decode（`ForwardMode.DECODE`、`is_cuda_graph`、graph buffer齐全）。SGLang自己的`index_qk_proj` GEMM之后，一个Triton kernel `_indexer_decode_prep`完成q norm/RoPE、pending ring写入（key与三轴rope位置）、组边界均值压缩＋k norm/RoPE及压缩cache写入（非边界行写slot 0，与SGLang相同），再接第一阶段的分页logits、fast_topk与expand；SGLang每层43个prep kernel变为1个。额外要求：MRotaryEmbedding（非GLM，0或3段）或RotaryEmbedding、NeoX、rotary 64、BF16连续cos/sin cache、int64 positions/ring slots/rope缓冲、BF16 key_state/compressed [.,1,128]、int32 group_locs [rows,4]与write_locs；不满足或eager decode时走SGLang `forward_cuda`（仍经`select` hook）。q、ring、rope与压缩写入与SGLang逐bit一致。
+
+**decode的服务内校验（2026-09-29新增）。** 以前`PYHIP_QSA_VALIDATE=1`不检查decode（capture中不能同步）。现在同时开`PYHIP_QSA_INDEXER_DECODE=1`时，每个graph decode步的每层都在同一CUDA graph内做对照：
+
+- 先跑SGLang自己的`forward_cuda`作参考（其中的`select` hook直通SGLang），记下它写的ring行和压缩行；再用SGLang的`project_qk`重算q；最后跑PyHIP forward，覆盖同样的行。
+- 要求逐bit一致：q；真实请求的ring key/rope行（padding行用保留请求0，ring行号<4，排除）；组边界的压缩行（非边界行写slot 0，排除）。
+- 两份token选择都要满足：是PyHIP FP32 logits的top-512（相对近并列容差1e-5，与离线FP64标准相同）；完整block数为min(length,512)，每个block 4个token；因果尾token相同。expand输出的布局是：选中block的token，紧接着尾token，其余为−1。
+- SGLang自己的decode选择在近并列时不可复现：同一输入连续6次调用中，有1次在4行里有1行集合不同。所以“集合不同”只计入`different_token_sets`，不算失败。
+- 结果累加在每层的设备计数器里（int64计数＋最大相对边界间隙），不同步，可capture。下一次eager prefill读取计数，任一失败即抛`PyHIP QSA decode differs from SGLang`。profile停止时写入报告的`indexer_decode_validation`（键`forward:<layer>`）。
+- `select`模式的调用同样计数（键`select:<layer>`）。
+- 开启后每步decode多跑一遍SGLang indexer和检查，计时不能当性能。
+
+真实TP2验收已通过（2026-09-29，decode=1、VALIDATE=1，原C1/C32协议256请求加profile）：每rank 12层×10300次调用、25644个真实行、6408个边界压缩行，q/ring/压缩行不一致和选择违例全为0；集合不同约0.015%，都是近并列（最大相对间隙1.66e-7）；attention与prefill indexer各336项通过。见[分析](../../../../../mytest/mydata/qsa_indexer_decode_system_20260929_04/analysis_075332.json)和[opt.md](../opt.md#qsa-decode-stage2-validate)。
+
+MTP/target-verify在结构上也会命中`select` hook，但未测试（当前启动脚本未开speculative）。
+
 构建产物是包含dist-info的独立`pyhip_qsa_runtime`包，恢复3D版本0.2.0；不需pip、不把experiments放入server路径。2026-09-28已按用户要求撤回T01的SGLang prefill/decode 5D改动、页表边界及专属测试；既有MHA/cache writer不动。
-父包惰性导入，禁用时不导入Torch/FlyDSL。当前打包QSA六模块（含prepare和packed direct）、MHA两个依赖与本插件，共9个源码文件，附来源hash和许可证。
+父包惰性导入，禁用时不导入Torch/FlyDSL。当前打包attention六模块（公共入口、prepare、dense、union、direct、私有packed direct）、indexer四个模块（`indexer.py`、`indexer_logits.py`、`indexer_topk.py`、`indexer_decode.py`）、MHA两个依赖、本插件与attention独立验证模块，共14个源码文件，无预编译二进制，附来源hash和许可证。旧13源码包只作历史，不自动获得T13修复。
 `--build-target`要求新mytest/mydata子目录；打包目标本身作为独立源码快照保留。
 
 当前3D packed direct保留17/10填充工作比分流，raw保留rho4；没有撤销3D优化。5D因Vvec8与四token选块的布局成本退化而撤回，性能及Vvec4/S4原型限制见[../opt.md](../opt.md)。当前接入不支持QSA 5D，不应为该路径启用vectorized_5d。旧0.3.0/clean2包与5D回放只作历史证据，不可直接套用回退后的SGLang；新使用需构建新target。
@@ -78,6 +106,12 @@ GPU门禁失败就停止，不轮询等待、不修改PTL/时钟/功率；新数
 "$PYTHON" "$QSA_SGLANG/profile_model.py" \
 	--output "$DATA/qsa_baseline_$(date -u +%Y%m%dT%H%M%SZ)_$$" \
 	--baseline
+
+# 同时启用PyHIP prefill indexer（PYHIP_QSA_INDEXER=1）。
+# --dump-indexer-layers 3 47采集indexer输入及当时实际路径的输出/pool行；test_indexer的capture不加--indexer（SGLang原indexer）。
+"$PYTHON" "$QSA_SGLANG/profile_model.py" \
+	--output "$DATA/qsa_indexer_$(date -u +%Y%m%dT%H%M%SZ)_$$" \
+	--indexer
 ```
 
 输入仅在profile期间克隆，CPU转存发生在原profiler停止/导出之后；文件含3D Q/K/V、indices、output、tensor SHA与请求布局hash，不再采集5D缓存或页表。
@@ -119,7 +153,7 @@ export AITER_CONFIG_GEMM_BF16="$CFG/bf16_tuned_gemm.csv" AITER_CONFIG_FMOE="$CFG
 
 2026-09-26：当前源码已将恢复校验的排序结果复用于direct，移除了独立direct排序，并改进direct计算；linear新增B1非分页causal配平。
 本轮仅本地功能/内核验收，未重新部署独立包或采集SGLang整模型profile。新部署须按上节重新build target；旧日志中的排序kernel名称属于历史版本。
-`PYHIP_QSA_VALIDATE=1`只在profile外对每layer/layout首次调用做对照校验，确认稳定后常驻服务可设0；不是开关插件。
+`PYHIP_QSA_VALIDATE=1`对attention和prefill indexer只在profile外对每layer/layout首次调用做对照校验；开decode indexer时，每个graph decode步都在graph内对照（见上文“decode的服务内校验”）。确认稳定后常驻服务可设0；它不是插件开关。
 
 ### 3.2 启动TP2服务
 
@@ -168,6 +202,21 @@ find "$RUN/profiles" -name '*-TP-*.trace.json.gz'
 
 T01、clean2及Vvec4/S4的功能/性能记录保留为撤销前历史，见[../opt.md](../opt.md)。当前仅3D，插件仍不接管SGLang graph/compile。单wave恢复/分片mask后QSA65项（含3D SGLang backend）通过；54组完整链378个实际dispatch三字段均0。真实链仍8kernel；36组普通kernel性能及逐kernel分解完成，旧A3停止记录不回填。此前MHA8192慢阶段未解决。
 
+prefill indexer（`PYHIP_QSA_INDEXER=1`）实际TP2系统测试：同负载各128个无profiler请求，TTFT中位955.13→879.42/881.26ms（默认hipBLASLt，两次独立服务）和879.75/888.39ms（`PYHIP_QSA_INDEXER_GEMM=sglang`）；服务间波动2–9ms，两种GEMM在TTFT上不可分辨。每rank 72个校验调用全部通过，trace中每调用5502→525µs。见[../opt.md](../opt.md)与[系统分析](../../../../../mytest/mydata/qsa_indexer_system_20260928_01/final_analysis_185655.json)。
+
+decode indexer第二阶段实际TP2三臂系统测试（顺序服务，`PYHIP_QSA_VALIDATE=0`，三臂都开prefill indexer），decode分别为`0`、`select`、`1`：
+
+| 指标 | `0` | `select` | `1` |
+|---|---|---|---|
+| C1 ITL中位 | 13.404ms | 12.253ms | 10.852ms |
+| C1请求时延中位 | 1730.0ms | 1659.7ms | 1570.4ms |
+| C32 ITL中位 | 43.644ms | 23.443ms | 21.186ms |
+| profile每层prep | 197µs（44个kernel） | 190µs（43个kernel） | 5.3–5.7µs（1个kernel） |
+
+TTFT均约887ms。见[分析](../../../../../mytest/mydata/qsa_indexer_decode_system_20260929_03/analysis_054756.json)。本次插件包在freeze时一次构建，三臂共用。
+
+第一阶段测试（当时`PYHIP_QSA_INDEXER_DECODE=1`，即现在的`select`；两臂都开prefill indexer）实际TP2系统测试，顺序服务，`PYHIP_QSA_VALIDATE=0`。C1（约12k prompt、输出64、128请求）的ITL中位从13.440ms降到12.209ms，请求时延从1730.6ms降到1660.7ms。C32因mamba状态池实际同时31路decode，ITL中位从43.261ms降到23.491ms。profile中每层decode MQA从106.7µs降到4.5µs。见[分析](../../../../../mytest/mydata/qsa_indexer_decode_system_20260929_02/analysis_041225.json)。首次运行开了`PYHIP_QSA_VALIDATE=1`，在C32第1轮因attention校验超容差而中止（[记录](../../../../../mytest/mydata/qsa_indexer_decode_system_20260929_01)）。
+
 最新实际TP2原生/当前系统各128个无profiler请求（固定10条约12k输入、输出5、并发1），TTFT中位1037.031→955.764ms，请求时延1090.343→1009.214ms；顺序启动对照，不是同址交错或饱和吞吐。双rank各12层×4次profile替换核验通过，144项attention原`.02/.02`检查通过；配对生成文本114/128相同，差异集中于两条内部也不稳定的prompt，未做整模型质量认证。见[系统报告](../../../../../mytest/mydata/qsa_system_20260928_01/final_analysis.json)。两个测试服务已清理；未测真实TP4/8系统。
 
 已重建[当前九源码独立包manifest](../../../../../mytest/mydata/qsa_prepare_latency_20260928_01/plugin_optimized/pyhip_qsa_runtime/source_manifest.json)，包含单wave恢复和分片mask准备实现，0.2.0、三个ABI/五hook注册均核验；包内L3/L47×TP2/4/8六例、48次实际dispatch零spill，未导入experiments，禁用entry-point仍惰性加载。动态LDS与固定字段分开核验；旧target是冻结源码，使用更新须构建新target。该验证不是整模型部署，下方早期包结果仍为历史。
@@ -181,5 +230,5 @@ T01、clean2及Vvec4/S4的功能/性能记录保留为撤销前历史，见[../o
 本页命令已使用新的默认Python环境，兼容ROCm依赖已就绪；仍须检查服务端设备、空闲状态及三个ABI哈希。上方2026-09-28系统结果使用新建包与本次模型trace，旧模型/早期包数据只作历史，不能互换标签。
 profiler trace不是无profiler吞吐测试；bench duration包含trace导出等待，不能直接解释为常规请求耗时。
 
-真实输入加载、FP32参考、性能、summary均已并入[../test_qsa.py](../test_qsa.py)，没有第二套回放或插件测试文件。
+真实attention输入加载、FP32参考、性能、summary均已并入[../test_attention.py](../test_attention.py)，没有第二套attention回放或插件测试文件。
 原长期上下文/模型指标测试未由这个快速profile流程替代。

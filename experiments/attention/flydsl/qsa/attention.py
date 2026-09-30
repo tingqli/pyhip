@@ -8,9 +8,12 @@ from types import SimpleNamespace
 
 import torch
 
-from . import dense, direct, prepare, union
+from . import attention_dense as dense
+from . import attention_direct as direct
+from . import attention_prepare as prepare
+from . import attention_union as union
 
-__all__ = ["qsa"]
+__all__ = ["attention"]
 
 
 class _Workspace:
@@ -48,7 +51,7 @@ _lock = threading.RLock()
 _device = None
 
 
-def qsa(q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=None, out=None):
+def attention(q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=None, out=None):
     """Return sparse attention for BF16 Q[M,H,256], K/V[N,HK,256].
 
     indices is contiguous int32[M,2051]: up to 512 complete four-token blocks,
@@ -81,7 +84,7 @@ def qsa(q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=No
     if q.shape[1] // k.shape[1] > 16:
         raise ValueError("At most 16 Q heads per KV head fit the direct fallback wave")
     if torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0] != "gfx942":
-        raise ValueError("QSA requires gfx942")
+        raise ValueError("QSA attention requires gfx942")
     if (indices.shape != (q.shape[0], 2051) or indices.dtype != torch.int32
             or indices.device != q.device or not indices.is_contiguous()
             or indices.numel() * indices.element_size() >= 2**31):
@@ -99,7 +102,7 @@ def qsa(q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=No
         return out
     with _lock, torch.cuda.device(q.device):
         if _device is not None and _device != q.device:
-            raise ValueError("FlyDSL QSA requires one GPU per process")
+            raise ValueError("FlyDSL attention requires one GPU per process")
         _device = q.device
         stream = torch.cuda.current_stream(q.device)
         key = (q.device, stream.cuda_stream, query_lens, prefix_lens, q.shape[1], k.shape[1], scale)
@@ -107,7 +110,7 @@ def qsa(q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=No
         capturing = torch.cuda.is_current_stream_capturing()
         if workspace is None:
             if capturing:
-                raise RuntimeError("Warm QSA on this stream and layout before graph capture")
+                raise RuntimeError("Warm attention on this stream and layout before graph capture")
             workspace = _Workspace(q, k, v, indices, query_lens, prefix_lens, scale)
             _workspaces[key] = workspace
             for stale in list(_workspaces):
@@ -118,9 +121,9 @@ def qsa(q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=No
         _workspaces.move_to_end(key)
         workspace.captured |= capturing
         inputs = workspace.bind(q, k, v, indices)
-        with torch.profiler.record_function("pyhip_qsa.prepare"):
+        with torch.profiler.record_function("pyhip_qsa.attention.prepare"):
             prepare.run(inputs=inputs, plan=workspace.union, errors=workspace.errors, valid=workspace.valid)
-        with torch.profiler.record_function("pyhip_qsa.attention"):
+        with torch.profiler.record_function("pyhip_qsa.attention.compute"):
             dense.run(inputs=inputs, prepared=workspace.dense, out=out)
             if workspace.union is not None:
                 union.run(inputs=inputs, plan=workspace.union, out=out)

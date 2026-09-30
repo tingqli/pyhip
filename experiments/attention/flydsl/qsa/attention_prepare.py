@@ -1,4 +1,4 @@
-"""Exact QSA selection, private union scratch and fused preparation launches.
+"""Exact QSA attention selection, private union scratch and fused preparation launches.
 
 Dense membership is zero when a plan is allocated and after every completed
 build. Recovery scatters into it; its owning compact CTA consumes and clears
@@ -54,7 +54,7 @@ def _sort_blocks(values):
 
 
 @triton.jit
-def qsa_recover_scatter(Indices, Positions, Lengths, SequenceIds, Blocks, Errors,
+def attention_recover_scatter(Indices, Positions, Lengths, SequenceIds, Blocks, Errors,
             Dense=None, QueryTiles=None, Meta=None, MAX_BLOCKS: tl.constexpr = 0,
             REVERSE: tl.constexpr = False):
     row = tl.num_programs(0) - 1 - tl.program_id(0) if REVERSE else tl.program_id(0)
@@ -129,7 +129,7 @@ def _masks(Blocks, Membership, Masks, tile, count, common_tiles, rows, position,
 
 
 @triton.jit
-def qsa_compact(Dense, Blocks, Membership, Counts, Meta, Active,
+def attention_compact(Dense, Blocks, Membership, Counts, Meta, Active,
             MAX_BLOCKS: tl.constexpr, CAPACITY: tl.constexpr, C: tl.constexpr,
             RHO: tl.constexpr, PACKED_DIRECT: tl.constexpr = False,
         CLEAR: tl.constexpr = False, REVERSE: tl.constexpr = False):
@@ -207,7 +207,7 @@ def _order(Counts, Active, Order, program,
 
 
 @triton.jit
-def qsa_order_masks_validate(Errors, Valid, Counts=None, Active=None, Order=None,
+def attention_order_masks_validate(Errors, Valid, Counts=None, Active=None, Order=None,
            ROWS: tl.constexpr = 0, TASKS: tl.constexpr = 0, HK: tl.constexpr = 1,
            SLICES: tl.constexpr = 1, GRID: tl.constexpr = 1, SIZE: tl.constexpr = 1,
            SHIFT: tl.constexpr = 1, WIDE: tl.constexpr = False, CHECK: tl.constexpr = True,
@@ -241,7 +241,7 @@ def qsa_order_masks_validate(Errors, Valid, Counts=None, Active=None, Order=None
 
 
 @triton.jit
-def qsa_scatter_prepared(Blocks, Positions, Meta, Dense, MAX_BLOCKS: tl.constexpr):
+def attention_scatter_prepared(Blocks, Positions, Meta, Dense, MAX_BLOCKS: tl.constexpr):
     # Prepared-only callers may rebuild a separate plan from recovered blocks.
     tile, local = tl.program_id(0), tl.program_id(1)
     first = tl.load(Meta + tile * 5)
@@ -261,16 +261,28 @@ def allocate_plan(*, inputs, query_tile: int, grid_multiplier: int = 2,
     group = inputs.q.shape[1] // inputs.k.shape[1]
     if query_tile < 1 or query_tile > 32:
         raise ValueError("Require 1<=BQ<=32")
-    max_queries = 128 // group if group == 12 else 1 << ((128 // group).bit_length() - 1)
-    query_tile = min(query_tile, max_queries)
     skips = (0,) * len(inputs.query_lens) if skip_counts is None else skip_counts
+    num_cus = torch.cuda.get_device_properties(inputs.q.device).multi_processor_count
+    # Full H6 prefill fills 126/128 MFMA rows. Keep the established tiles for
+    # prefix/ragged work and batches too small to fill the persistent grid.
+    balanced = (group == 6 and inputs.k.shape[1] == 1 and query_tile >= 21
+                and len(inputs.query_lens) == 1 and inputs.prefix_lens[0] == 0
+                and inputs.query_lens[0] - skips[0] >= 21 * num_cus * grid_multiplier)
+    max_queries = 128 // group if group == 12 else 1 << ((128 // group).bit_length() - 1)
+    if balanced:
+        max_queries = 21
+    query_tile = min(query_tile, max_queries)
     rows, q0, k0 = [], 0, 0
     for q_len, prefix, skip in zip(inputs.query_lens, inputs.prefix_lens, skips):
         local = skip
+        remaining = triton.cdiv(q_len - skip, query_tile)
         while local < q_len:
-            end = min(q_len, (local // query_tile + 1) * query_tile)
+            # Avoid a tiny first/last tile selecting direct for only a few rows.
+            end = (local + triton.cdiv(q_len - local, remaining) if balanced
+                   else min(q_len, (local // query_tile + 1) * query_tile))
             rows.append((q0 + local, end - local, k0, q_len + prefix, prefix + local))
             local = end
+            remaining -= 1
         q0 += q_len
         k0 += q_len + prefix
     metadata = torch.from_numpy(np.asarray(rows, dtype=np.int32).reshape(-1, 5)).to(inputs.q.device)
@@ -281,8 +293,7 @@ def allocate_plan(*, inputs, query_tile: int, grid_multiplier: int = 2,
     capacity = triton.cdiv(min(max_blocks, query_tile * 513), 16) * 16
     tiles = len(rows)
     tasks = tiles * inputs.k.shape[1] * triton.cdiv(query_tile * group, 128)
-    grid = min(tasks, torch.cuda.get_device_properties(inputs.q.device).multi_processor_count
-               * (1 if group == 12 else grid_multiplier))
+    grid = min(tasks, num_cus * (1 if group == 12 else grid_multiplier))
     kwargs = {"dtype": torch.int32, "device": inputs.q.device}
     return SparsePlan(
         metadata=metadata, dense_membership=torch.zeros((tiles, max_blocks), **kwargs),
@@ -298,10 +309,10 @@ def allocate_plan(*, inputs, query_tile: int, grid_multiplier: int = 2,
 def _finish(inputs, plan, errors=None, valid=None):
     if plan is None or plan.num_tiles == 0:
         if errors is not None:
-            qsa_order_masks_validate[(1,)](errors, valid, ROWS=inputs.q.shape[0], num_warps=4)
+            attention_order_masks_validate[(1,)](errors, valid, ROWS=inputs.q.shape[0], num_warps=4)
         return
     reverse = len(inputs.query_lens) == 1
-    qsa_compact[(plan.num_tiles,)](plan.dense_membership, plan.blocks, plan.membership,
+    attention_compact[(plan.num_tiles,)](plan.dense_membership, plan.blocks, plan.membership,
         plan.counts, plan.metadata, plan.active, plan.max_blocks, plan.block_capacity,
         min(1024, triton.next_power_of_2(plan.max_blocks)), plan.max_union_inflation,
         plan.packed_direct, CLEAR=True, REVERSE=reverse, num_warps=4)
@@ -312,7 +323,7 @@ def _finish(inputs, plan, errors=None, valid=None):
     wide = ((plan.block_capacity // 16) << shift) + tasks - 1 >= 2**31
     order_ctas = triton.cdiv(plan.task_order.numel(), size)
     warps = 8 if size > 1024 else 4
-    qsa_order_masks_validate[(order_ctas + plan.num_tiles * 4,)](errors, valid, plan.counts, plan.active,
+    attention_order_masks_validate[(order_ctas + plan.num_tiles * 4,)](errors, valid, plan.counts, plan.active,
         plan.task_order, inputs.q.shape[0], tasks, inputs.k.shape[1], slices, plan.grid,
         size, shift, wide, errors is not None, plan.blocks, plan.membership, plan.metadata,
         plan.score_masks, order_ctas, plan.query_tile, plan.block_capacity, warps * 64,
@@ -320,7 +331,7 @@ def _finish(inputs, plan, errors=None, valid=None):
 
 
 def run(*, inputs, plan, errors, valid):
-    qsa_recover_scatter[(inputs.q.shape[0],)](inputs.indices, inputs.query_positions, inputs.kv_lens,
+    attention_recover_scatter[(inputs.q.shape[0],)](inputs.indices, inputs.query_positions, inputs.kv_lens,
         inputs.query_sequence_ids, inputs.block_indices, errors,
         plan.dense_membership if plan is not None else None,
         plan.query_tiles if plan is not None else None, plan.metadata if plan is not None else None,
@@ -331,6 +342,6 @@ def run(*, inputs, plan, errors, valid):
 
 def rebuild_plan(*, inputs, plan):
     if plan.num_tiles:
-        qsa_scatter_prepared[(plan.num_tiles, plan.query_tile)](inputs.block_indices, inputs.query_positions,
+        attention_scatter_prepared[(plan.num_tiles, plan.query_tile)](inputs.block_indices, inputs.query_positions,
                                                   plan.metadata, plan.dense_membership, plan.max_blocks, num_warps=4)
         _finish(inputs, plan)

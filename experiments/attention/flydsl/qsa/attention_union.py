@@ -597,7 +597,7 @@ def _body(
     )
 
 
-@flyc.kernel(name="union_qsa_bf16_d256", known_block_size=[THREADS, 1, 1])
+@flyc.kernel(name="attention_union_bf16_d256", known_block_size=[THREADS, 1, 1])
 def _kernel(
     Q: fx.Tensor,
     K: fx.Tensor,
