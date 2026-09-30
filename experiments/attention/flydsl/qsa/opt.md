@@ -2890,3 +2890,374 @@ QSA选集与route未改：真实M12000每层dense2051行（17.092%）。L3 TP2 u
 本轮“全链零spill已解决”限定于上述当前ROCm/FlyDSL/Triton版本、gfx942、已验证QSA API和测试矩阵。53项完整时延≤3%与54项资源通过分开报告；唯一普通门禁失败与一次profile入口失败均保留。最大本轮current普通样本为overbudget/TP8 full5.387ms（中位0.606ms），其它多层TP2也有约3.9ms长尾，不因此宣布p99 SLA或所有历史绝对最快稳定重现。前轮MHA8192共同慢阶段不是本次任务，MHA源码未改，也未声称其已恢复。
 
 所有新脚本、包、ELF、日志、JSON仅在本研究目录；本节追加前的opt284234字节旧正文及其SHA保留，没有新增Markdown报告。修改范围为两处运行时、原测试入口与既有说明文档，不动SGLang、原暂存项/HEAD/index、旧5D归档或原9078服务；无硬件写入、无自动切换Python、无模型部署。正常测试的Triton ELF门禁和禁止旧Torch归约的热路径/graph检查将持续防止该缺口回流。
+
+## 2026-09-28：准备链提取与融合，保留attention，逐kernel性能分解
+
+响应用户“重构；简化除direct/union/dense之外（减少/合并kernel数目）、优化准备kernel：减少恢复、校验、构表、mask和排序的冗余工作；报告性能数据，包括分解到各个kernel”。基线为已提交的`2cbfe2c`（开始时本地与lc远端分支一致），本轮不自动commit/push、不动SGLang。**最终采用A3融合版：稀疏准备链8个launch降为4个，真实full从12降为8；不是每个融合kernel都更快，compact+mask仍有局部退化，完整数据如下。**
+
+证据入口：[固定协议](../../../../mytest/mydata/qsa_prepare_20260928_01/protocol.json)、[最终CPU审计](../../../../mytest/mydata/qsa_prepare_20260928_01/analysis.json)、[全部逐kernel/普通计时表](../../../../mytest/mydata/qsa_prepare_20260928_01/tables.txt)、[当前源码身份](../../../../mytest/mydata/qsa_prepare_20260928_01/current_identity.json)。原9场有效普通测量、1场结束门禁失败、全部候选/trace/原始样本均保留；**完整54场普通性能矩阵未完成**，不能把profile均值或候选探索当作缺失正式场次。
+
+测量设备固定物理GPU2、PCI `0000:a4:00.0`、MI308X/gfx942/80CU；使用PyHIP [.venv解释器](../../../../.venv/bin/python)，Python3.10.12、Torch2.12.0+ROCm7.14、Triton3.8.0、FlyDSL0.3.2，不切换环境。该解释器链接随工作区环境有效；精确环境和全部门禁快照在研究目录。
+
+### 1. 代码组织及不变部分
+
+- 新[prepare.py](prepare.py)集中selection recovery、校验、`SparsePlan`、scatter、compact/masks、task order和准备调用。公共[qsa.py](qsa.py)保留host契约、workspace/stream/graph生命周期和分流调用；准备阶段只有一次`prepare.run()`。
+- [union.py](union.py)删除准备实现及其NumPy/msgspec/Triton依赖，只保留原union attention。10个attention函数的AST逐个与基线相同，direct/dense/packed-direct源码逐字相同，见[提取证明](../../../../mytest/mydata/qsa_prepare_20260928_01/extraction_proof.json)。正常矩阵131个attention编译产物整ELF/资源也与基线逐个一致；不把算法改动称为纯机械搬迁。
+- 私有prepared-only入口改为`prepare.allocate_plan()`／`prepare.rebuild_plan()`；旧`union.allocate_plan/rebuild_plan`与旧恢复函数不保留compat shim。现有活动测试已迁移；旧研究脚本应使用冻结runtime，不能为运行历史脚本恢复冗余实现。
+- QSA依旧3D only，dense2051、packed direct每call pack及64MiB预算、raw fallback、原`.02/.02`精度、packed pad1.7/raw rho4、common-first顺序、最长优先蛇形分配均不变。不调整任何attention内循环，也不改变输入/输出选中token。
+
+### 2. 四个准备launch如何替代八个
+
+| 基线准备动作 | 当前动作 | 保留的正确性约束 |
+|---|---|---|
+| recover读前2048个token两次、排序、写block表 | `qsa_recover_scatter`一次连续读取2048＋3尾位置，拆出四元组并校验/恢复/散射 | 四token对齐/连续、范围、重复、tail及padding错误都保留 |
+| 全部行都排序，包括已规范的dense前缀 | 仅在`visible≤2051`且已验证block逐个等于其规范序号时跳过排序 | shuffled合法dense仍排序；不是把dense输入校验删除 |
+| 清零dense membership，再另launch逐query scatter | workspace分配时初始化零；recover直接用已读block散射；compact消费后清理 | 初始和每次完成后scratch全零，固定每stream所有权及graph生命周期 |
+| compact与mask分别launch | `qsa_compact_masks`同一CTA完成compact、发布屏障、mask和scratch清理 | 输出完全相同的common-first/其余升序、相同count及每bit mask |
+| mask每block/query检查4个offset | 将有效token数夹到0…4，生成`(1<<n)-1`四bit前缀 | 相同membership、因果及KV长度边界，组内bit布局不变 |
+| sort与error reduction分别launch | `qsa_order_validate`完成稳定排序；第0CTA额外归约errors写`valid` | 其它sort CTA独立写固定Order区，原异步assert随后launch |
+| int64 cost/tie排序key一律使用 | 证明最大key小于$2^{31}$时用int32，否则int64 | 保持cost相等时原task升序、原chunk边界和蛇形输出 |
+| Torch异步assert | 原assert保留 | 非法输入仍拒绝，资源仍0，不使用编译debug开关才生效的检查 |
+
+原热路径：recover → check_errors → assert → clear → scatter → compact → masks → order（8）；当前：recover_scatter → compact_masks → order_validate → assert（4）。完整真实调用还保留dense/union/pack/direct四个launch，因此12→8；无dense的packed场景11→7，raw场景10→6，ragged含dense11→7。dense-only无需稀疏计划，仍是恢复、检查、assert、dense共4个launch，但恢复不再反复读/排序规范前缀。
+
+compact扫描上限由整请求`MAX_BLOCKS`收缩为该tile最后query可见的block前缀；chunk仍≤1024，保留三项零资源。尾部未扫描区域从未被合法scatter写入，分配初始为零；compact在消费的第二遍清理，inactive组也清理同一前缀。**dense_membership是消费后归零的私有暂存，不再保留最终membership副本**；最终selected membership仍在compact表中。测试改为从输入独立计算选集、检查compact顺序及所有已初始化mask，并检查整个scratch归零，未降低选集审计。
+
+该前缀决定循环次数，最后一轮仍按`MAX_BLOCKS`限制加载/清理到chunk边界，超出因果前缀的项应始终为零；并非每一条load都精确截断在`limit`。独立compact组件测试不传mask时仍扫描全域、不清理，以保留其合成membership契约。
+
+同CTA从global compact输出转入mask时保留`tl.debug_barrier()`。曾怀疑ISA缺显式vmcnt0，随后用当前ROCm离线编译带workgroup release/acquire的HIP `__syncthreads()`；gfx942实际同样生成global_store → bare s_barrier → global_load，见[离线代码生成证据](../../../../mytest/mydata/qsa_prepare_20260928_01/barrier_codegen.json)。不以其它架构规则盲加wait或宣称此处必然错，也不把CTA barrier推广为inter-CTA发布；当前每个compact区域只由一个CTA产生/消费。
+
+### 3. 正确性、资源与生命周期
+
+- [最终正常JUnit](../../../../mytest/mydata/qsa_prepare_20260928_01/validation/tests.xml)：**64 passed、24 perf deselected、0 skipped/errors/failures**，961.288s；14条既有Torch deprecation警告。长等待期间实际栈在FlyDSL/LLVM编译，不是GPU死锁。
+- 原63项中的scalar-error graph、compact大域、预算/HK2/ragged、真实capture、路由cutoff、稳定排序及SGLang adapter均保留。新增单pass恢复的独立CPU整数oracle，覆盖early/dense/长prefix、打乱block顺序、重复/损坏四元组、全部3尾位置和padding、int32极值；另有候选对原恢复器的[3444行逐元素等价检查](../../../../mytest/mydata/qsa_prepare_20260928_01/recover_a2_validation/result.json)。排序回归显式覆盖超int32范围的wide fallback，而非只测试小task数。
+- 正常套件新增逐bit mask对照和common-first精确顺序，不仅比较集合。当前148个准备编译记录及131个attention记录全部`private_segment_fixed_size=vgpr_spill_count=sgpr_spill_count=0`。准备资源范围：recover_scatter VGPR40～42/SGPR44～49；compact_masks VGPR23～80/SGPR34～98；order_validate VGPR2～72/SGPR17～34；LDS metadata均0。范围包含各种测试特化，不直接当occupancy证明。
+- [额外生命周期验证](../../../../mytest/mydata/qsa_prepare_20260928_01/lifecycle/result.json)：H12/H6/H3的prepared-only forced union graph重复高/低重合切换、公共输出对冻结版bitexact、scratch消费后全零；热路径禁止zero_/zeros、empty/empty_like及host读取。它覆盖不走融合recover时的`qsa_scatter_prepared`，该辅助kernel不出现在公共hot链。
+- [eager/graph非法输入隔离测试](../../../../mytest/mydata/qsa_prepare_20260928_01/invalid_checks.json)：1025行先热身，再损坏第1024行，在两条路径均由原异步assert kernel触发HSA exception退出。构表虽提前到assert之前，但不使用非法block越界写；最终不能绕过错误拒绝。
+- 54个正式输入布局均另外完成**不计时**的before/current精确计划、guard与完整输出比较。SDK实际enqueue→kernel_id→code-object→ELF metadata逐项检查，包括原Torch assert；当前共**378次dispatch全链三零**，基线相同54布局原570次。资源-only采集保存硬件状态但不要求空闲，不作为性能样本。两rank×两层×两实际行数×TP2/4/8均覆盖；TP4/8仍为TP2 capture派生local-head，非分布式服务。
+
+### 4. 有效普通性能与明确的矩阵中止
+
+原`cudaPerf`、每实现10独立输入/输出buffer、每buffer2warmup、128samples，prep和full直接分别计时，before/current AB/BA。prep仅恢复/校验/构表/mask/sort/原assert，full是真正公共`qsa()`含host边界及attention；首次分配/JIT/reference不计。actual保留输出在任何重跑前回验，输入/plan/source不变；相同输入而非强制相同输出/scratch地址，无硬件/时钟/PTL写入。
+
+以下9个有效case共**4608raw**，各entry/pre/post门禁use≤5%、VRAM≤20%、PTL Enabled/VECTOR,F8通过。单位µs，T为full有效TFLOP/s：
+
+| 输入 | TP | prep before→current | full before→current | full改善 | 当前full有效T |
+|---|---:|---:|---:|---:|---:|
+| dense2048 | 2 | 46.600→18.320 | 205.441→176.521 | 14.08% | 146.058 |
+| dense2048 | 4 | 46.520→18.160 | 146.500→117.761 | 19.62% | 109.470 |
+| dense2048 | 8 | 46.261→17.420 | 144.881→115.920 | 19.99% | 55.604 |
+| dense2051 | 2 | 46.860→18.540 | 223.962→195.041 | 12.91% | 132.577 |
+| dense2051 | 4 | 47.040→18.520 | 152.860→123.740 | 19.05% | 104.485 |
+| dense2051 | 8 | 46.720→17.960 | 151.261→122.320 | 19.13% | 52.849 |
+| low M2048/P30000 | 2 | 88.381→71.781 | 684.824→668.763 | 2.35% | 77.124 |
+| low M2048/P30000 | 4 | 85.640→67.061 | 673.563→655.964 | 2.61% | 39.314 |
+| low M2048/P30000 | 8 | 84.280→63.640 | 668.943→648.324 | 3.08% | 19.889 |
+
+9/9 full在预定≤1.03门槛内，ratio0.800108～0.976547，prep ratio0.376563～0.812181。第10组high/TP2已产生512raw并完成输出核验，但**结束门禁use8%失败**，数据保留却不列为有效时延，其后44组正式普通性能未启动，见[停止记录](../../../../mytest/mydata/qsa_prepare_20260928_01/formal_stop.json)。未重复该失败场次、未降低门槛；后续资源-only与独立逐kernel计时不能把正式矩阵改成完成。
+
+早期候选探索另有A1 short/TP2 prep28.300→20.680µs、full146.141→138.581µs，以及A2真实L3/TP2 prep307.922→238.322µs、full2895.115→2829.335µs，均10buffer/128sample，分别512raw。**不是最终A3公共API正式成绩**；A1/A2 TP8在pre-sample use6%/8%失败，0raw，记录不覆盖。
+
+### 5. 准备kernel逐项事件中位时延
+
+每一行都是**单个kernel**的原cudaPerf事件中位数，单位µs；每种实现每个kernel128samples/10buffers，按完整依赖顺序执行，输入/actual计划核验相同。6组共**9216raw**，18个entry/pre/post门禁通过。每个kernel之间的事件同步/device spin改变了连续链的运行边界，**不得相加后称为full或直接算端到端收益**。
+
+| kernel | L3 TP2 | L3 TP4 | L3 TP8 | L47 TP2 | L47 TP4 | L47 TP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| before recover | 199.661 | 199.981 | 199.581 | 199.741 | 199.581 | 199.801 |
+| before check_errors | 8.360 | 8.120 | 8.441 | 8.120 | 8.360 | 8.120 |
+| before assert | 6.040 | 6.080 | 6.080 | 6.080 | 6.040 | 6.080 |
+| before clear | 8.080 | 7.360 | 6.760 | 8.240 | 7.400 | 6.800 |
+| before scatter | 39.160 | 39.960 | 44.400 | 39.681 | 38.120 | 43.760 |
+| before compact | 18.000 | 19.640 | 13.600 | 19.440 | 19.720 | 13.600 |
+| before masks | 20.660 | 57.680 | 88.560 | 24.320 | 58.540 | 82.241 |
+| before order | 21.280 | 10.160 | 7.280 | 21.080 | 10.181 | 6.840 |
+| current recover_scatter | 159.320 | 159.381 | 159.381 | 159.361 | 159.181 | 159.321 |
+| current compact_masks | 56.760 | 104.920 | 134.500 | 71.821 | 102.300 | 128.840 |
+| current order_validate | 21.040 | 14.000 | 11.960 | 20.680 | 14.040 | 11.960 |
+| current assert | 6.080 | 6.040 | 6.040 | 6.080 | 6.080 | 6.080 |
+
+明确的收益是恢复/scatter合并：当前一个kernel约159µs，对应原恢复约200µs及另一个scatter约38～44µs，并取消clear独立launch。**compact_masks并没有达到“原compact与mask之和更低”**：当前仍有广播query维到原输出布局的转换、融合live-state和全局compact回读，它们是待优化开销，尚无单因素计时把局部退化精确归因到各项；order_validate在TP4/8也比原order单独kernel长，它同时承担错误归约，不能只比较名字中的order。
+
+基于该测量又实现了A4 flat输出mask及A5把count/common/元数据标量直接传给mask的候选；两者输出/资源验证通过，但各自在采样前use7%失败，**没有有效性能数据，不采用**，生产仍为已完成正常回归/分解的A3。候选源码与失败在研究目录保留；不因kernel更少或源码更短自动判断更快。
+
+### 6. 完整调用内的各kernel时间占比（独立profiler）
+
+原版与当前各6场、每场10个独立buffer；分别720/480个GPU kernel，按host annotation/runtime correlation全数关联。原第一场的事件数组并非时间顺序，初解析失败；仅在CPU按timestamp排序重新解析原trace，未重采、未删掉抖动，见[首trace重解析](../../../../mytest/mydata/qsa_prepare_20260928_01/profile_before_tp0_layer3_m12000_tp2/trace_reanalysis.json)。所有12场36次门禁通过。以下是**profile每call平均GPU duration**，不是普通中位，也不是同场AB/BA归因；原首场有assert109µs等长尾，其影响保留。
+
+| current kernel均值µs | L3 TP2 | L3 TP4 | L3 TP8 | L47 TP2 | L47 TP4 | L47 TP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| recover_scatter | 163.812 | 163.796 | 164.080 | 163.868 | 176.808 | 177.944 |
+| compact_masks | 57.123 | 105.859 | 148.528 | 72.255 | 103.428 | 130.524 |
+| order_validate | 19.839 | 12.591 | 10.615 | 19.799 | 12.679 | 10.559 |
+| async assert | 4.447 | 4.567 | 4.343 | 4.507 | 4.483 | 4.655 |
+| dense | 184.808 | 110.408 | 108.864 | 193.780 | 110.535 | 106.151 |
+| union | 867.736 | 1855.105 | 1169.913 | 986.100 | 1905.773 | 1134.761 |
+| pack KV | 10.771 | 8.619 | 4.351 | 10.415 | 8.715 | 4.575 |
+| direct | 1578.003 | 177.392 | 11.819 | 1526.931 | 103.368 | 11.739 |
+| 所有GPU kernel之和 | 2886.539 | 2438.337 | 1622.512 | 2977.656 | 2425.789 | 1580.908 |
+
+| current占GPU kernel总和% | L3 TP2 | L3 TP4 | L3 TP8 | L47 TP2 | L47 TP4 | L47 TP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| recover_scatter | 5.675 | 6.718 | 10.113 | 5.503 | 7.289 | 11.256 |
+| compact_masks | 1.979 | 4.341 | 9.154 | 2.427 | 4.264 | 8.256 |
+| order_validate | 0.687 | 0.516 | 0.654 | 0.665 | 0.523 | 0.668 |
+| async assert | 0.154 | 0.187 | 0.268 | 0.151 | 0.185 | 0.294 |
+| dense | 6.402 | 4.528 | 6.710 | 6.508 | 4.557 | 6.715 |
+| union | 30.061 | 76.081 | 72.105 | 33.117 | 78.563 | 71.779 |
+| pack KV | 0.373 | 0.353 | 0.268 | 0.350 | 0.359 | 0.289 |
+| direct | 54.668 | 7.275 | 0.728 | 51.280 | 4.261 | 0.743 |
+
+原版全GPU和依次3122.116/2678.434/1844.638/3036.832/2478.401/1816.969µs。仅准备部分的profile和由356.170→245.221、364.222→286.813、417.822→327.565、337.630→260.429、348.646→297.397、411.626→323.682µs，跨场平均差约14.7%～31.2%，不能替代缺失的真实full普通计时。完整旧12个kernel每项均值/占比在tables及analysis中给出。attention实际ELF相同而profile时长仍可能不同，因此不把全部差额归因于准备代码。
+
+query路由保持：真实M12000 dense均2051/12000=17.092%；L3 TP2/4/8 union3929/9341/9949、direct6020/608/0，L47为4269/9933/9949、5680/16/0。对应union比例L3 32.742%/77.842%/82.908%、L47 35.575%/82.775%/82.908%。TP8 direct0行时仍保留gated空launch，表中约12µs不是漏算，pack空launch同样保留。
+
+### 7. 独立包、限制及最终完整性
+
+[plugin.py](sglang/plugin.py)打包加入prepare模块，当前为**9源码、0.2.0、5hooks、3上游ABI**。新[manifest](../../../../mytest/mydata/qsa_prepare_20260928_01/plugin_preparation/pyhip_qsa_runtime/source_manifest.json)逐文件与当前一致；禁用entrypoint不导入torch/triton/flydsl/sglang/experiments。启用后两层×TP2/4/8六例原容差和重复bitexact通过，不从experiments导入；[包内48个实际dispatch](../../../../mytest/mydata/qsa_prepare_20260928_01/plugin_execution/resource_audit.json)三零。只构建/注册/执行本地包，不部署模型、不更改SGLang，不把派生local-head称真实TP4/8服务。
+
+未完成项：54场正式普通性能仅9有效、1失败、44未启动；A4/A5无有效性能不采用；compact/mask局部仍可优化；未证明p99或所有历史最佳绝对时延、未处理MHA8192共同慢阶段。性能门禁失败的原因未确定，不无证据归因于clock或温度。新kernel数、分解数据和资源结果已给出，性能覆盖缺口如实保留。
+
+本节前opt298755字节前缀与SHA不改写，所有新产物仅在mytest/mydata研究目录，无新增Markdown。准备迁移有一次大patch留下重复else和partial class的语法残留，已在首次GPU导入前修正并保存[失败记录](../../../../mytest/mydata/qsa_prepare_20260928_01/extraction_patch_failure.json)；最终AST/运行/ELF均通过。两个仓库HEAD/index、四份原有已暂存AITER快照和其它既有dirty文件不动，原9078绘图服务保留，本轮没有新的Git提交或远程推送。
+
+隔离的eager/graph故意assert触发HIP file-based GPU coredump回退；它忽略TMPDIR，最初把两份core写在工程根目录。交付核验发现后已按原字节、mtime和日志对应关系迁入研究目录，合计552138416B，见[core归档审计](../../../../mytest/mydata/qsa_prepare_20260928_01/coredump_archive.json)；失败原始证据未删、不重跑。后续此类隔离检查须显式设置`HSA_COREDUMP_PATTERN`或把工作目录设在该次研究目录。
+
+## 2026-09-28：降低recover_scatter与compact_masks耗时——布局、同步与任务粒度对照
+
+用户追问“recover_scatter和compact_masks为何耗时这么大？任务不均衡还是什么原因，分析并降低”。本轮基线是上节**已交付A3准备实现**，不是更早`2cbfe2c`的12-kernel链；冻结源码、已有dirty/index和旧日志前缀后，在新研究目录完成消融、实现及验收。旧[candidate.py](../../../../mytest/mydata/qsa_prepare_20260928_01/candidate.py)保留历史身份，不在原文件上覆写新算法。入口：[本轮协议](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/protocol.json)、[机制审计](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/initial_analysis.json)、[最终审计](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/analysis.json)、[全部时延/占比表](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/tables.txt)。
+
+**结论：不是单一“任务不均衡”。恢复的主要可消除开销来自四wave排序/布局交换；mask主要受不合适的线程布局与每CTA长循环影响，任务顺序有较小的附加收益。** 已将恢复降到约93µs，并把mask从compact尾部移到排序/校验launch的独立CTA分片中，准备仍4个launch、真实full仍8个。当前真实两层TP2/4/8准备耗时降低**39.97%～45.15%**，完整公共调用降低**3.37%～8.65%**；原选集、排序结果、路由、误差门槛和attention源码/机器码均保持。
+
+### 1. 为什么恢复约159µs：任务足够多，但每行线程组织昂贵
+
+真实M12000恢复grid是**12000个CTA，每query一个**，不是3000个block域条目，也不是attention的80/160个worker。2051个规范dense行跳过排序，其余9949行执行同样的512元素排序；不能凭耗时把它解释为恢复任务太少。gfx942 Triton的`num_warps=4`是**4个64-lane wave，即256线程**，不是CUDA式128线程。
+
+实际A3 TTGIR显示：连续2048-token加载后，reshape/split需要跨线程布局转换；512元素sort跨4wave，归约、排序和gather共同形成**31处静态`s_barrier`**。单wave版没有CTA barrier，仍可能使用wave内DS交换；不是“DS=0”。这是源码/ISA事实，不是ATT统计的动态等待次数或周期。以下首轮同场单kernel中位µs，所有有效候选保留完整错误校验和排序；诊断例另标：
+
+| 恢复布局/配置 | 中位µs | 解释 |
+|---|---:|---|
+| A3连续加载＋4wave | 158.561 | 冻结基线 |
+| 连续加载＋1wave | 128.701 | 同一算法，减少跨wave合作 |
+| 连续加载＋2wave | 172.841 | 少一半wave并不自动更快 |
+| 直接四元组加载＋1wave | 102.961 | 四个offset各读一次，不重新扫描indices |
+| 直接四元组加载＋2wave | 203.281 | 多wave跨布局交换仍昂贵 |
+| 直接四元组加载＋4wave | 226.362 | 不能把“更连续的源码”或更多线程等同更快 |
+| A3加载＋4wave，去sort/duplicate消融 | 89.560 | **仅诊断，不符合接口，不采用** |
+
+单wave四元组写法由LLVM合成为8条`buffer_load_dwordx4`读取完整2048token，尾部另读；A3相同源字节量是每wave8条dword、4wave执行。新写法避免先连续读入再经LDS转成四元组；不伪造16B对齐、不增加越界读取，不从静态load数推断实际HBM字节。
+
+进一步同场控制：普通单wavesort102.760µs → signed min/max比较交换97.401µs；另场min/max97.240 → 有序scatter95.201 → 有序scatter＋反向query launch92.561µs。单wave去sort消融80.901µs仍有明显成本，说明加载、验证、原子散射等也不能忽略；两种去sort差额不能相加或作为精确sort占比。signed min/max仍是512元素、9层合计45轮比较交换，保留−1无效值、INT_MAX填充及重复判定。
+
+反向launch只改变query CTA映射，不改变输出行号；单请求优先处理后部较长前缀，ragged保持正序。其约4µs收益小于wave/布局改动，**“任务顺序是唯一根因”不成立**；没有测CU实际分配/空转或内存PMC，不宣称精确失衡百分比、bank冲突或硬件带宽饱和。最终单wave实现仍使用原`_assert_async`，没有拿删除校验换性能。
+
+### 2. 为什么compact_masks更慢：串行mask工作和不合适的融合边界
+
+从同一输入的精确计划计算，L3 TP2/4/8的构表CTA数为995/622/311，active为393/584/311；对应实际mask输出为2,626,080／10,983,680／14,508,544B。L47为995/622/311、active427/621/311，输出2,959,040／11,539,712／14,131,200B。**TP8不是只有160个构表CTA**；160是attention worker上限。
+
+原A3的TP8 mask每CTA串行循环为1～38轮，中位24轮，L47为2～34轮；每轮生成4个N64 tile的mask。一个CTA必须先完成两遍compact，再独自完成整tile的mask，工作量分布不均且后部CTA循环长。但原mask从`(column, query)`广播布局生成交错输出，实际ISA还需要多次重复加载/重排，不能把全部差额归因于尾部任务。
+
+为分清影响，首先保持一个CTA/原launch数，只换连续输出线性索引和直接传count/common等标量；然后把mask放在排序/校验launch中，使用不同CTA处理不相交mask片。以下计时**直接覆盖compact＋mask＋order/validate＋assert三次launch**，恢复在计时外；不是把三个独立中位相加：
+
+| L3 TP8剩余准备对照 | 中位µs |
+|---|---:|
+| A3广播mask融合 | 146.481 |
+| 连续输出flat mask，仍融合compact | 93.761 |
+| flat＋反向tile顺序 | 89.680 |
+| mask移到排序launch，每tile1CTA，512输出项/8wave | 86.480 |
+| 每tile4CTA分片，512输出项/8wave | 80.980 |
+| 每tile8CTA分片，512输出项/8wave | 82.880 |
+
+第二场A3为146.900µs；4片/256输出项/4wave79.720µs，反向顺序75.700µs；2wave83.760µs，1024项/8wave87.221µs。由此选择4片，而不是无限增加CTA。每片按`start=common*QB*4+part*B`、步长`4B`覆盖连续mask word，四片无重叠；组内每16bit四元组/nibble排列、因果/length和membership判定完全相同。只跳过原先已免mask的common完整N64前缀。
+
+新的mask CTA先检查active，不计算direct tile；排序CTA和第0CTA错误归约独立处理其它输出，不读取mask结果。compact和mask之间已有stream kernel边界，因此不再需要原compact尾部的同CTAglobal发布barrier。此改变把TP8 mask工作分成1244个CTA，与排序共用一次launch；**不是偷偷多加mask kernel，也没有host回读count/active**。
+
+### 3. 正式实现及保持的接口
+
+仅进一步改动既有[prepare.py](prepare.py)与[test_qsa.py](test_qsa.py)：
+
+1. `qsa_recover_scatter`：单wave四元组加载、signed min/max排序、用已排序且范围安全的block做atomic OR；单请求可反序映射。继续输出完全一致的512规范block及error。
+2. `qsa_compact`：原common-first稳定两遍扫描及gate，只构表和消费后清零。`CLEAR=True`采用因果前缀循环界；独立组件`CLEAR=False`仍全域扫描、不清理，保留原测试契约。
+3. `qsa_order_masks_validate`：原稳定cost/tie排序＋有界error归约，加4片mask CTA；排序SIZE>1024用8wave/B512，否则4wave/B256，原安全32bit/64bit key选择不变。prepared-only的`CHECK=False`仍产生完整mask/order。
+4. 原Torch异步assert。错误检查仍在attention前，不因先构表而忽略错误。
+
+完整准备为recover_scatter → compact → order_masks_validate → assert，仍4launch；完整真实8，dense-only4，packed无dense7，raw6，ragged含dense7。旧`qsa_compact_masks`、`qsa_order_validate`只保留在冻结源码，不添加长期compat shim。public `qsa()`、workspace key/LRU/stream/captured生命周期、QSA3D、dense2051、64MiB预算、pad1.7/raw rho4均未改。当前所有attention源文件对A3逐字一致。
+
+### 4. 最终普通性能：36组全部完成
+
+物理GPU2／PCI `0000:a4:00.0`、MI308X/gfx942/80CU，PyHIP [.venv解释器](../../../../.venv/bin/python)，原`cudaPerf`不变；10独立Q/K/V/indices/out allocation，2warmup/每buffer、128samples/实现，before/current AB/BA。full调用真正公共`qsa()`，prep也直接计时；不含首次JIT/reference和输出分配。完整raw保留，实际计时输出未被重跑覆盖即核验；workspace同stream复用，不声称强制cache flush或物理地址完全相同。本轮未单独落盘allocation的mod256/mod4096表。
+
+6真实＋30合成＝**36组、18,432raw、108次普通门禁全部通过**，无本轮门禁失败，full ratio范围0.913248～1.002914，36/36满足预定≤1.03。如下单位µs，“有效T”只计实际选中token的QK/PV工作量，不计准备整数操作：
+
+| 输入 | TP | prep before→current | full before→current | full改善 | 当前有效T |
+|---|---:|---:|---:|---:|---:|
+| L3 M12000 | 2 | 236.162→138.480 | 2829.175→2733.815 | 3.37% | 101.110 |
+| L3 M12000 | 4 | 277.861→163.181 | 2399.393→2286.252 | 4.72% | 60.452 |
+| L3 M12000 | 8 | 304.402→166.961 | 1568.069→1432.467 | 8.65% | 48.241 |
+| L47 M12000 | 2 | 250.242→141.480 | 2927.816→2823.316 | 3.57% | 97.905 |
+| L47 M12000 | 4 | 274.542→164.801 | 2376.153→2267.292 | 4.58% | 60.957 |
+| L47 M12000 | 8 | 298.321→165.641 | 1538.688→1408.087 | 8.49% | 49.077 |
+
+合成dense边界full降低1.07%～2.11%，low降低1.29%～1.69%，high降低4.75%～8.68%；短序列、raw、ragged部分几乎持平。最大full中位回退是overbudget TP2 **171.601→172.101µs（+0.291%）**，short TP8+0.236%；最大prep回退同为overbudget TP2+1.751%，不隐藏。share75 TP8为1277.487→1217.986µs，但原路由限制仍在，不意味着它比强制direct最优。所有36行、配对ratio及有效T见tables；普通当前最大单样本为L3 TP4 full2938.895µs，不删除尾部、不声称p99 SLA。
+
+这些是**新策略对A3的独立36场**，不能回填上节A3对2cbfe2c的44场未测，旧high TP2 post门禁失败依旧失败。本轮真实普通计时只覆盖TP0两层M12000；其它rank/M11888另有正确性/资源覆盖，未声称其普通性能也完成。TP4/8仍为TP2 capture派生local-head，不是新的多卡服务。
+
+### 5. 正式逐kernel中位时延
+
+6组各8个新旧kernel×128sample＝**6144raw**，18次门禁全部通过；每行独立原事件测量，单位µs。**名字与职责改变，旧compact_masks不能只与新compact相比较；也不得相加各独立中位数冒充完整延迟。**
+
+| kernel | L3 TP2 | L3 TP4 | L3 TP8 | L47 TP2 | L47 TP4 | L47 TP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| before recover_scatter | 158.721 | 159.121 | 159.321 | 158.980 | 159.200 | 159.220 |
+| before compact_masks | 56.220 | 104.401 | 134.540 | 71.281 | 102.621 | 128.841 |
+| before order_validate | 20.620 | 14.160 | 12.000 | 20.360 | 14.040 | 12.060 |
+| before assert | 6.040 | 6.080 | 6.040 | 6.040 | 6.080 | 6.040 |
+| current recover_scatter | 92.841 | 92.661 | 92.800 | 92.600 | 92.920 | 92.561 |
+| current compact | 22.320 | 21.360 | 16.720 | 22.440 | 21.760 | 15.940 |
+| current order_masks_validate | 23.560 | 49.000 | 59.761 | 25.600 | 50.880 | 58.600 |
+| current assert | 6.080 | 6.040 | 6.041 | 6.080 | 6.040 | 6.040 |
+
+恢复相对A3降低41.51%～41.87%；compact本体降到16～22µs，但mask仍占TP4/8新准备中的较大部分，59µs不是“所有mask开销消失”。普通prep完整节省97.68～137.44µs由第4节直接计时给出，不由本表加减推断。
+
+### 6. 完整调用内每kernel占比
+
+另6场profile各10before＋10current、AB/BA交错，共960个实际kernel，18次门禁通过。按host annotation＋runtime correlation并按时间戳排序，所有call均8kernel；实际输出bitexact。下表为当前**profile平均µs／占GPU kernel duration总和%**，不是128样本普通中位，也不是TTFT。
+
+| current kernel | L3 TP2 | L3 TP4 | L3 TP8 | L47 TP2 | L47 TP4 | L47 TP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| recover_scatter | 91.700 / 3.323% | 91.603 / 3.963% | 91.580 / 6.259% | 91.623 / 3.213% | 91.484 / 3.989% | 91.468 / 6.411% |
+| compact | 21.555 / 0.781% | 20.275 / 0.877% | 14.615 / 0.999% | 21.991 / 0.771% | 20.607 / 0.898% | 14.859 / 1.042% |
+| order_masks_validate | 22.387 / 0.811% | 47.603 / 2.059% | 58.151 / 3.974% | 24.331 / 0.853% | 49.191 / 2.145% | 56.859 / 3.986% |
+| async assert | 4.479 / 0.162% | 4.491 / 0.194% | 4.455 / 0.304% | 4.363 / 0.153% | 4.627 / 0.202% | 4.599 / 0.322% |
+| dense | 179.620 / 6.510% | 107.412 / 4.647% | 105.784 / 7.230% | 179.680 / 6.301% | 107.420 / 4.683% | 105.888 / 7.422% |
+| union | 857.880 / 31.091% | 1854.793 / 80.238% | 1171.749 / 80.085% | 986.809 / 34.607% | 1908.025 / 83.187% | 1135.917 / 79.623% |
+| pack KV | 10.807 / 0.392% | 8.595 / 0.372% | 4.399 / 0.301% | 10.531 / 0.369% | 8.623 / 0.376% | 4.611 / 0.323% |
+| direct | 1570.807 / 56.929% | 176.856 / 7.651% | 12.407 / 0.848% | 1532.131 / 53.731% | 103.668 / 4.520% | 12.419 / 0.871% |
+
+当前profile GPU总和依次2759.235/2311.628/1463.140/2851.459/2293.645/1426.620µs；before为2860.815/2413.957/1593.664/2970.440/2389.029/1586.176µs，旧8kernel每项也在tables中。attention ELF完全相同而profile值仍有波动，所以速度结论以第4节普通AB/BA为准。
+
+选集/路由对A3逐项相同：dense仍2051/12000=17.092%；L3 union3929/9341/9949、direct6020/608/0；L47 union4269/9933/9949、direct5680/16/0。TP8的空direct/pack gated launch没有删，也计入8kernel和占比。
+
+### 7. 正确性、实际资源与动态LDS口径更正
+
+- [最终正常JUnit](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/validation/tests.xml)：**65 passed、24 perf deselected、0 skipped/errors/failures，924.881s**。原64项基础上，将恢复CPU oracle参数化为正/反序launch；所有损坏四元组、padding/tail、重复及int32极值保留。17项定向检查先通过。正常131个attention编译记录与A3整ELF一致，151个准备记录三字段0。
+- [prepared-only生命周期](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/lifecycle/result.json)三种head数、四次shared/independent选择和V变化，forced union graph、公共before/current bitexact、消费后scratch全零、无热分配/clear/readback均通过。`CHECK=False`下的mask也生成，没有只验public路径。
+- [非法输入隔离](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/invalid_checks.json)：1025行的最后一行损坏，eager/graph两次均由原assert异常退出−6。本轮设置`HSA_COREDUMP_PATTERN`并以研究目录为cwd，两份core直接保存在该目录，未写工程根目录；不是正常测试崩溃或被隐藏的失败。
+- 54输入布局不计时的完整before/current选集/guard/输出精确通过，SDK实际378dispatch逐个匹配ELF，`private_segment_fixed_size=vgpr_spill_count=sgpr_spill_count=0`。正常、正式计时、资源矩阵的对应attention产物均匹配，未改SGLang或attention来掩盖准备回退。
+- **口径更正：之前ELF `.group_segment_fixed_size=0`只证明固定LDS为0，不代表总LDS为0。** Triton另用`metadata.shared`传动态LDS；本轮实际dispatch记录确认恢复2KiB、compact4KiB、排序/mask TP2/4/8为8/4/2KiB，原A3恢复动态8KiB。该更正不影响private/spill三零结论，但不得再把这些准备kernel称为无LDS。
+- 正常特化资源范围：恢复VGPR60/SGPR86～90、动态LDS0～2048B；compact VGPR23～80/SGPR34～98、动态LDS32～16384B；order_masks_validate VGPR2～72/SGPR17～54、动态LDS0～8192B。范围包含组件极端域测试，不直接等于某真实shape的驻留率。
+- 已重建[九源码独立包manifest](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/plugin_optimized/pyhip_qsa_runtime/source_manifest.json)，三ABI/五hook/版本0.2.0不变；禁用入口不导入Torch/Triton/FlyDSL/SGLang/experiments，启用六真实case原精度/repeatbitexact、无experiments导入，48个实际dispatch三零。旧target不自动更新，没有部署整模型。
+
+### 8. 全部尝试、限制及保存范围
+
+五个有效消融场共3968raw，早期组合候选12场6144raw；最终36场18432raw和6场kernel事件6144raw，总普通/诊断raw **34688**，全部保留。诊断nosort是有意不符合完整契约的反事实，绝不纳入生产；A4/A5的旧门禁失败仍保留。本轮三次运行失败分别为GPUTarget元数据不能JSON序列化、Triton分支变量标量/向量冲突、静态constexpr重复赋值，均在采样前0raw；修正研究代码后用新目录。正式迁移的compact缩进残留在GPU导入前AST检出并修正；最终CPU审计首次用正常shape表查所有chain导致缺key，改用同case历史产物后通过；不改写这些失败日志。
+
+结果支持“wave/布局和mask任务粒度是主要可改进因素，任务顺序有次要收益”，不支持关于实际CU负载不均、clock、bank冲突或HBM流量的精确归因；本轮未采ATT/PMC。也不声称每个小shape加速、p99保证、多卡服务或MHA8192慢阶段已解决。
+
+本节追加前[opt.md](opt.md)为317157B／SHA256 `2645e5d10fd865071ab7c58690b2c20456349ccc6db23f785b914392ed38a837`，旧前缀保持。所有脚本/日志/包/ELF/raw/profile放新研究目录，不新建Markdown、不修改旧研究目录；两个仓库HEAD/index、4份已暂存AITER及其它既有修改保留，原9078服务保留。本轮未commit/push、未改硬件/模型服务。
+
+## 2026-09-28：实际TP2系统测试完成——原生SGLang对当前3D QSA
+
+响应“测试在系统中的性能”及“继续前面未完成的测试”。本轮实际加载Qwen3.8-Flash-Next-PTPC-FP8，用原启动脚本在**GPU0/1、TP2、端口9080**顺序运行原生SGLang与当前九源码QSA独立包。不是kernel回放、不是TP4/8派生数据，也不是仅对上一轮A3准备版本的增量比较。两组各128个无profiler请求和各一次双rank profile均完成，继续时核对到current组已经完成，未重复采样。
+
+证据：[固定协议](../../../../mytest/mydata/qsa_system_20260928_01/protocol.json)、[最终系统审计](../../../../mytest/mydata/qsa_system_20260928_01/final_analysis.json)、[逐调用profile核验](../../../../mytest/mydata/qsa_system_20260928_01/profile_call_audit.json)、[汇总表](../../../../mytest/mydata/qsa_system_20260928_01/tables.txt)、[当前系统包manifest](../../../../mytest/mydata/qsa_system_20260928_01/current_v2/plugin/pyhip_qsa_runtime/source_manifest.json)。原始256条HTTP记录、四份trace、全部门禁、配置和启动失败均保留；没有运行时/SGLang源码改动。
+
+### 1. 环境、配置与测试边界
+
+- PyHIP [.venv解释器](../../../../.venv/bin/python)，Python3.10.12、Torch2.12.0+ROCm7.14、Triton3.8.0、FlyDSL0.3.2，模型和tokenizer均为本机同一份数据；两组seed42、AITER attention/MoE及原四份tuned CSV相同。
+- 实际resolved配置：TP2、`chunked_prefill_size=16384`、`max_running_requests=32`、decode full graph/max_bs32、prefill graph disabled、radix cache disabled、page64、BF16 KV。输入的mem_fraction_static0.95经原模型规则解析为**0.8075**；两组server_info只有startup_time/internal_states运行统计不同，其余值一致。
+- 无profiler性能使用[固定10条prompt](../../../../mytest/mydata/qsa_system_20260928_01/prompts.json)，来自原SGLang的ShareGPT随机请求生成器、seed42，名义12000token、输出5token、temperature0、ignoreEOS、并发1。实际长度依次为12000/12000/11888/12000/12000/12000/12000/11667/11851/12000；按sample%10轮换128次，前8条各13次、后2条各12次。每条先预热2次，另保留原用户warmup和11888/12000行预热。
+- 使用原`async_request_sglang_generate`记录HTTP TTFT/latency/ITL；未更改请求计时逻辑，正式采样不启profiler。两组cached_tokens均0。10条是独立请求fixture，不等于server端10份独立GPU buffer，也不保证跨进程物理地址相同。
+- 两组共12份系统阶段快照、24个GPU门禁检查通过：启动前/清理后VRAM约0.144%，采样/profile前后GPU use均0%，PTL Enabled/VECTOR,F8。模型常驻时VRAM约85.6%～85.9%，按**既有系统profile协议允许模型占用**，不是把kernel回放的20%显存门槛偷偷放宽。未写PTL、频率、功率或NUMA。
+- 原生与当前分别启动、同一对GPU顺序测试，不是同址交错AB/BA；startup/JIT/warmup不计正式128请求。二者还分隔了一段操作时间，因此收益报告为该固定负载下的观察对照，不声称控制了全部时序漂移。
+
+### 2. 无profiler系统结果
+
+两组均128/128请求成功、640输出token。完整请求包含prefill、5token输出过程、HTTP/客户端解析；TTFT为首token到达，不是只测QSA。
+
+| 指标 | 原生SGLang | 当前QSA | 变化 |
+|---|---:|---:|---:|
+| TTFT中位 ms | 1037.031 | 955.764 | **降低7.84%** |
+| TTFT平均 ms | 1034.389 | 953.980 | 降低7.77% |
+| 请求时延中位 ms | 1090.343 | 1009.214 | **降低7.44%** |
+| 请求时延平均 ms | 1087.730 | 1007.529 | 降低7.37% |
+| ITL中位 ms | 13.410 | 13.447 | 增加0.28%，基本持平 |
+| 单客户端顺序请求/s | 0.919005 | 0.992129 | 增加7.96% |
+| 同口径输入token/s | 10973.682 | 11846.846 | 增加7.96% |
+| 同口径输出token/s | 4.595023 | 4.960644 | 增加7.96% |
+
+顺序客户端wall为139.281s→129.016s，包含HTTP及本地记录写入，不是饱和服务吞吐。TTFT样本p99为1047.372→961.152ms、最大1059.182→962.442ms；请求时延样本p99为1096.019→1014.442ms、最大1114.822→1015.884ms。全部样本保留，但128次、10条重复prompt和5token输出不能作为生产p99/SLA证明。原生ITL记录511个、当前512个，遵循原客户端按实际非空流式文本计算的口径，没有补造缺失间隔。
+
+### 3. 精度验证的通过项与未证明项
+
+当前插件在profile之外按原`.02/.02`逐元素对照原生attention，两rank各**72项**，覆盖12层×6种请求长度（97、122、11667、11851、11888、12000），均通过。原用户warmup均返回非空Answer；正式请求也没有HTTP失败或少输出token。
+
+**整模型文本并非bitexact：按sample配对只有114/128相同。** 差异集中在fixture0（9/13相同）和fixture5（3/13相同）；原生自身重复文本分别有2/4种，当前3/5种，其余8条fixture两组均稳定相同。原生已存在变化，不能把所有跨组差异直接归因于QSA，但也不能据此证明它们无害。没有采logprob或完整逐层模型精度指标，未运行GSM8K/超长上下文质量套件；本节只声明原attention容差和系统性能验证，不声明整模型精度认证。
+
+### 4. 双rank profile：实际替换及各kernel分解
+
+独立profile使用原4请求、名义12000→5、并发1脚本；每rank实际3个12000＋1个11888 prefill和20个decode step。原始GPU镜像annotation与host annotation各一份，初分析把两者都计作host范围；已仅用CPU重解析为48次真实QSA调用，旧[初版分析](../../../../mytest/mydata/qsa_system_20260928_01/analysis.json)保留，不重采trace。最终逐调用核验每次4准备＋4attention kernel、同stream正确顺序、全部相关ID有匹配。
+
+每rank 12层×4请求＝48次QSA替换；当前不再出现原48个`_sparse_gqa_prefill`，而240个decode用`_sparse_gqa_chunk_prefill`保持原路径。这里比较的是当前完整QSA准备＋dense/union/pack/direct与原sparse prefill，**不含indexer、KV写入/gather等外围工作**：
+
+| rank | 原生48次sparse prefill累计 ms | 当前48次QSA累计 ms | 降低 | 当前每次平均µs |
+|---|---:|---:|---:|---:|
+| TP0 | 467.721 | 132.909 | 71.58% | 2768.937 |
+| TP1 | 466.781 | 132.682 | 71.58% | 2764.203 |
+
+以下为每rank当前48次的**profile每次平均µs／占QSA累计GPU时间%**，不是普通128请求TTFT，也不是独立kernel事件中位：
+
+| QSA kernel | TP0 平均µs / QSA% | TP1 平均µs / QSA% |
+|---|---:|---:|
+| recover_scatter | 91.064 / 3.289% | 90.889 / 3.288% |
+| compact | 21.832 / 0.788% | 21.884 / 0.792% |
+| order_masks_validate | 25.134 / 0.908% | 24.720 / 0.894% |
+| 原Torch异步assert | 4.599 / 0.166% | 4.646 / 0.168% |
+| dense | 180.162 / 6.507% | 179.541 / 6.495% |
+| union | 1037.013 / 37.452% | 1033.714 / 37.396% |
+| pack KV | 9.697 / 0.350% | 9.766 / 0.353% |
+| direct | 1399.435 / 50.541% | 1399.043 / 50.613% |
+
+准备累计TP0/TP1为6.846/6.823ms；attention126.063/125.859ms。系统内恢复约91µs，与上一轮单kernel优化方向一致；此系统对照是**当前全部QSA优化对原生SGLang**，未部署A3臂，不能把TTFT的7.84%全部归因于最后一轮准备优化。
+
+四份trace：
+
+- [原生TP0](../../../../mytest/mydata/qsa_system_20260928_01/native_v2/profiles/1790601267.58837/1790601267.5907702-TP-0.trace.json.gz)
+- [原生TP1](../../../../mytest/mydata/qsa_system_20260928_01/native_v2/profiles/1790601267.58837/1790601267.5907702-TP-1.trace.json.gz)
+- [当前TP0](../../../../mytest/mydata/qsa_system_20260928_01/current_v2/profiles/1790601834.031148/1790601834.0330424-TP-0.trace.json.gz)
+- [当前TP1](../../../../mytest/mydata/qsa_system_20260928_01/current_v2/profiles/1790601834.031148/1790601834.0330424-TP-1.trace.json.gz)
+
+原生每rank57895、当前58229个GPU kernel，四trace合计232248个；替换一个原kernel为8个使总launch增加，另有少量边界事件差异，不能只按总launch数推断变慢。profile工具报告duration49.117/50.927s包含stop_profile导出和同步等待，**不能用于普通吞吐**。上节全链零spill证明仍是QSA本地/独立包资源范围，本轮没有声称整个模型数万kernel全部零spill。
+
+### 5. 单trace三表triage与剩余系统热点
+
+[原始三表输出](../../../../mytest/mydata/qsa_system_20260928_01/triage_current_tp0.txt)为当前TP0单trace只读分析，不是mapping/formal双trace因果分析。摘要如下；累计值均为4个profile请求，不当作单请求wall：
+
+| kernel/算子族 | prefill GPU累计 ms | 占prefill GPU% | 核对 |
+|---|---:|---:|---|
+| AITER TP all-reduce | 509.29 | 14.1% | 真实通信 |
+| HyperConnection第一个GEMM | 373.01 | 10.3% | `_mix_compute`计算 |
+| FP8 PTPC GEMM | 364.05 | 10.1% | 原AITER/CK路径 |
+| `hc_combine` | 256.45 | 7.1% | **本地gated residual，不是通信** |
+| MoE gateup | 218.12 | 6.0% | 原模型计算 |
+| GDN状态kernel | 216.67 | 6.0% | 未替换 |
+
+| 重叠检查 | 结论 |
+|---|---|
+| 单trace自动重叠建议 | 没有达到1%报告门槛的候选；不能据此断言无可重叠空间 |
+| 已验证可消除的通信时间 | 本轮没有此证明，不把509ms等当作可直接删除的收益 |
+
+| 自动融合模式 | 本轮解释 |
+|---|---|
+| shared-expert append | 原始工具给出模式提示；其证据混入QSA top-k/HC激活，不能把“Confirmed”当作整段可融合证明 |
+| QK RoPE＋KV写入 | 通用既有模式线索，不等于当前gfx942此路径具备等价可用实现 |
+| MoE激活＋量化 | decode图中的通用模式线索；未做新融合、未验证收益 |
+
+当前prefill主要仍是TP通信、HC/GEMM、MoE/GDN；QSA仅占当前全GPU累计约3.37%。indexer、KV gather、decode、模型其它层均未改。本轮不在性能验证任务中扩展优化这些组件。
+
+### 6. 环境阻塞修复、完整性及限制
+
+第一次原生服务在ready之前退出、0性能样本；原CLI清理子进程时同时关闭tee，主日志没有完整异常。独立配置解析/HTTP导入诊断定位到缺少`sgl_kernel`（HiSparse模块启动导入），不是QSA数值/性能失败。将镜像已有sglang-kernel0.4.6.post1、匹配Torch2.12.0+ROCm7.14的39个载荷独立安装到PyHIP .venv，逐文件哈希一致、pip check通过、system-site-packages仍false。依赖wheel由已安装egg重建，**不是原wheel归档**，见[依赖来源](../../../../mytest/mydata/qsa_system_20260928_01/dependency/manifest.json)与[安装核验](../../../../mytest/mydata/qsa_system_20260928_01/dependency_installed.json)。诊断脚本曾用列表覆盖CLI变量导致收据写入失败，日志同样保留；修复后native_v2/current_v2完整通过，未放宽门禁。
+
+没有运行时、SGLang、AITER快照或硬件设置修改；两组只启动本轮独立进程组，结束后均清理，原9078绘图服务保留。系统阶段只进一步更新既有说明文档；HEAD/index和其它既有dirty保留，不commit/push。旧日志前缀334581B、SHA256 `1428a653f3121d99155dd809356a799a1354f73936a320e4a89c5afe9b9b69ed`保持，所有新产物位于本研究目录，无新增Markdown。
+
+尚未覆盖：真实TP4/8系统、饱和并发吞吐、更长输出/长prefix/ragged服务负载、正式模型质量和超长上下文套件。两条prompt的整模型输出非确定性及跨组文本差异未定位，未把其关闭或从性能样本中剔除。系统结果限定为上述实际TP2单客户端12k→5负载，不外推到生产SLA或所有模型。

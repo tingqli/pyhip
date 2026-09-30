@@ -15,9 +15,15 @@
 
 此前[恢复3D全面复测](../../../../mytest/mydata/qsa_3d_revalidate_20260928_01/analysis.json)完成QSA48＋MHA28正确性及54＋12组性能，发现Triton compact及Torch验证的全链资源缺口；原失败和全部历史结果保留于[opt.md](opt.md)。TP4/8仍是TP2 capture派生local-head，不是多卡服务。
 
-**最新：全链零spill已修复。** compact改固定宽度两遍扫描，验证改预分配bool标志＋固定宽度检查，保留原异步assert/精度/路由；移除原Torch bool reduce的12B private scratch。63项正常回归通过，54组完整QSA的570个实际dispatch、独立包72个dispatch逐一匹配ELF，private/VGPRspill/SGPRspill均0。见[最终修复审计](../../../../mytest/mydata/qsa_zero_spill_20260928_01/final_analysis.json)。
+此前[全链零spill修复](../../../../mytest/mydata/qsa_zero_spill_20260928_01/final_analysis.json)已消除compact和Torch bool reduce的12B private，保留其53组有效性能及全部失败历史。最新准备重构继续保持三项零资源，不重新引入Torch临时归约。
 
-53组有效性能、60,928条raw中，全部full当前/修复前中位比≤1.03（0.841917～1.015460），真实12k TP2 full L3/L47为**2.917/3.011ms**，超预算TP4/8约快15%。1组因GPU use100%门禁失败、0raw、不重试；独立占比profile因入口use34%停止，没有新的时长占比。资源通过不等于54组性能全完成或所有历史绝对最快重现；原MHA8192慢阶段仍是未解决的独立问题。没有部署模型。
+此前A3已将准备8个launch→4个、真实完整调用12→8，但compact+mask融合局部变慢，原9组有效性能和门禁停止记录保留于[上轮审计](../../../../mytest/mydata/qsa_prepare_20260928_01/analysis.json)。
+
+**最新：单wave恢复＋分片mask，仍保持4个准备/8个真实full launch。** [prepare.py](prepare.py)改为四元组加载、等价min/max排序和有序scatter；compact只构表/清理，mask分4片并入排序/校验launch。恢复从约159降到93µs；两层TP2/4/8的prep降低39.97%～45.15%、full降低3.37%～8.65%。不是仅靠任务调度，也没有增加launch。
+
+65项正常测试、54组378个实际dispatch及独立包48dispatch全链三零。新36组正式普通性能18432raw全部完成，最大full中位回退仅0.291%；6组逐kernel6144raw及6份交错profile完成，见[内核审计](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/analysis.json)和[opt.md](opt.md)。ELF固定LDS=0不等于总LDS=0，动态LDS已补核；三项private/spill仍0。没有回填旧停止矩阵、未处理MHA8192慢阶段。
+
+**实际TP2系统测试已完成。** 原Qwen3.8配置、GPU0/1、同10条约12k prompt、并发1/输出5，各128个无profiler请求：原生SGLang→当前QSA的TTFT中位1037.031→955.764ms（−7.84%），请求时延1090.343→1009.214ms（−7.44%），ITL基本不变。另双rank profile各48次QSA累计GPU约467→133ms；它不是TTFT或普通吞吐分母。两组顺序启动非交错，114/128配对文本相同、两条prompt在原生/当前内部也不稳定；144项attention原容差检查通过，但不是模型质量认证。见[系统审计](../../../../mytest/mydata/qsa_system_20260928_01/final_analysis.json)。测试服务已清理，未测真实TP4/8系统或饱和吞吐。
 
 ## 2026-09-27：独立buffer增至32，重新完成TP2/4/8矩阵（历史）
 
@@ -210,9 +216,10 @@ Direct计算候选探索约9.5–9.7%改善，但**最终正式轮采样前门�
 
 | 文件 | 职责 |
 |---|---|
-| [qsa.py](qsa.py) | 唯一公共函数、token/block校验、共享规范排序的private scratch与分流 |
+| [qsa.py](qsa.py) | 唯一公共函数、host校验、private per-stream workspace与分流调用 |
+| [prepare.py](prepare.py) | 单wave恢复/校验＋有序scatter、compact＋暂存清理、分片精确mask＋稳定排序/错误归约及私有计划 |
 | [dense.py](dense.py) | 每请求前`min(M,max(0,2051-prefix))`行；原tensor视图、因果任务配平，64对齐用native DMA，否则全VOFFSET有界DMA |
-| [union.py](union.py) | membership/compact/mask/gate、动态任务排序和BM128/BN64 union kernel；common前缀免mask |
+| [union.py](union.py) | BM128/BN64 union attention kernel，消费已准备mask/order；common前缀免mask |
 | [direct.py](direct.py) | direct计划/分派与raw-KV fallback；非预排形状保留四wave合并K/消费端转置路径 |
 | [_direct_packed.py](_direct_packed.py) | 单请求4-token对齐且PK+PV≤64MiB的每次预排+单query wave attention；无K数据转置，私有scratch随图重放刷新 |
 | [test_qsa.py](test_qsa.py) | 输入生成、FP32 reference、真实输入hash/选择审计、正常测试与性能测试 |
@@ -227,7 +234,7 @@ G12的grid上限为CU，其它G为`CU×2`。每次重建后按N64成本排序、
 [test_qsa.py](test_qsa.py)是唯一QSA测试/回放入口：
 
 - 普通pytest：13种正常形状（dense边界、TP2/4/8、ragged/空段、NaN尾部、alias、rescale、选择更新和graph），
-  8份真实layer/rank/shape输入各跑TP2/4/8 local-head的3D重放、原3D SGLang backend流程、union排序、dense任务/graph、direct共享排序及packed KV刷新/NaN尾/动态graph、分流整数cutoff/HK2/raw/ragged和scratch无回读复用，另含CPU预算边界及TP2/4/8的64MiB边界fallback/graph。原48项加6项error-check段边界/graph与9项compact大域回归，共63项；原`rtol=atol=.02`不变。最新.venv实际63通过、24 perf deselected、0skip，见[JUnit](../../../../mytest/mydata/qsa_zero_spill_20260928_01/validation_final/tests.xml)。资源fixture同时检查FlyDSL及实际Triton ELF三字段，并禁止热调用重新引入Tensor equality/all和临时分配。
+  8份真实layer/rank/shape输入各跑TP2/4/8 local-head的3D重放、原3D SGLang backend流程、union排序、dense任务/graph、direct共享排序及packed KV刷新/NaN尾/动态graph、分流整数cutoff/HK2/raw/ragged和scratch无回读复用，另含CPU预算边界及TP2/4/8的64MiB边界fallback/graph。异常输入恢复oracle覆盖正/反序launch，共65项，保留逐bit mask、消费后scratch归零和64bit排序fallback；原`rtol=atol=.02`不变。最新.venv实际65通过、24 perf deselected、0skip，见[JUnit](../../../../mytest/mydata/qsa_prepare_latency_20260928_01/validation/tests.xml)。资源fixture同时检查FlyDSL及准备Triton实际ELF三字段。
 - 真实输入默认使用已有8份采集，可用`QSA_REAL_INPUT_DIR`覆盖。
   显式目录不存在/无数据时报错；无本地数据的环境仍可运行合成功能测试。
 - 性能需显式`-m perf`并设置`QSA_REPLAY_OUTPUT`到新的mytest/mydata子目录；24项（8capture×TP2/4/8），每项原cudaPerf、10独立buffer、2warmup、每实现128sample、AB/BA交错。
@@ -237,6 +244,7 @@ G12的grid上限为CU，其它G为`CU×2`。每次重建后按N64成本排序、
 每case默认base/QSA两个scope、共256raw；QSA包括恢复/校验、rebuild和dispatch，预分配输出，不计首次JIT、indexer或KV gather。
 当前入口不再读取5D capture；历史5D研究应使用当时冻结源码与环境，不能直接套用当前3D入口。
 10组Q/K/V/indices/O独立分配；private scratch由单接口在同一stream复用，不等于10份PK/PV或强制cache flush。
+当前membership暂存分配时为零，构表消费后归零；不得把它当永久membership结果读取。prepared-only测试/研究入口是`prepare.allocate_plan/rebuild_plan`，旧准备函数已从union/qsa移除，历史脚本需使用冻结版本。
 
 后续优化及统一性能表集中追加到[opt.md](opt.md)，不再新建Markdown报告；上方各32buffer章节仅保留其历史含义。
 检查**实际计时输出**、重复输入bitexact、真实地址、use≤5%/VRAM≤20%及PTL Enabled/VECTOR,F8；失败保留全部raw、不轮询、不改硬件。

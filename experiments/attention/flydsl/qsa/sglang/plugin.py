@@ -199,7 +199,7 @@ def build_target(target):
         raise ValueError("Plugin targets must be new directories under mytest/mydata")
     target.mkdir(parents=True, exist_ok=False)
     package = target / "pyhip_qsa_runtime"
-    files = {f"qsa/{name}.py": source / f"{name}.py" for name in ("qsa", "dense", "direct", "_direct_packed", "union")}
+    files = {f"qsa/{name}.py": source / f"{name}.py" for name in ("qsa", "prepare", "dense", "direct", "_direct_packed", "union")}
     files.update({f"mha/{name}.py": source.parent / "mha" / f"{name}.py"
                   for name in ("_common", "mha_pa_bf16_256_linear_942")})
     files["qsa/sglang/plugin.py"] = Path(__file__)

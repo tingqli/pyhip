@@ -187,7 +187,9 @@ def _audit(inputs):
         metadata, counts, active = plan.metadata.cpu().tolist(), plan.counts.cpu().tolist(), plan.active.cpu().tolist()
         members = plan.dense_membership.cpu().numpy().view(np.uint32)
         compact, bits = plan.blocks.cpu().numpy(), plan.membership.cpu().numpy().view(np.uint32)
+        masks = plan.score_masks.cpu().numpy().view(np.uint32)
         assert sum(item[1] for item in metadata) == inputs.q.shape[0] - dense_rows
+        assert not np.any(members), "Consumed membership scratch must be zero for the next call"
         union_rows = 0
         for tile, (first, rows, _, _, position) in enumerate(metadata):
             expected = {}
@@ -199,11 +201,28 @@ def _audit(inputs):
                 if visible % 4:
                     b = visible // 4
                     expected[b] = expected.get(b, 0) | (1 << local)
-            assert {int(b): int(members[tile, b]) for b in members[tile].nonzero()[0]} == expected
             assert counts[tile][0] == len(expected)
             if active[tile]:
                 count = counts[tile][0]
                 assert {int(b): int(m) for b, m in zip(compact[tile, :count], bits[tile, :count])} == expected
+                common = sorted(b for b, mask in expected.items()
+                                if mask == (1 << rows) - 1 and b * 4 + 3 <= position)
+                other = sorted(set(expected) - set(common))
+                np.testing.assert_array_equal(compact[tile, :count], common + other)
+                assert counts[tile][1] == len(common) // 16
+                for nt in range(counts[tile][1], math.ceil(count / 16)):
+                    query, quarter = np.arange(plan.query_tile)[:, None], np.arange(4)[None, :]
+                    mask = np.zeros((plan.query_tile, 4), dtype=np.uint32)
+                    for group in range(4):
+                        slot = nt * 16 + quarter * 2 + (group // 2) * 8 + group % 2
+                        safe = np.minimum(slot, count - 1)
+                        valid = (slot < count) & (query < rows)
+                        valid &= ((bits[tile, safe] >> query.astype(np.uint32)) & 1) != 0
+                        for offset in range(4):
+                            token = compact[tile, safe] * 4 + offset
+                            keep = valid & (token <= position + query) & (token < metadata[tile][3])
+                            mask |= keep.astype(np.uint32) << (group * 4 + offset)
+                    np.testing.assert_array_equal(masks[tile, nt], mask)
             total = sum(min((position + i + 1) // 4, 512) + bool((position + i + 1) % 4) for i in range(rows))
             if plan.packed_direct:
                 union_work = math.ceil(len(expected) / 16) * 64 * 128
@@ -377,9 +396,9 @@ def test_direct_recovered_order():
         workspace = _runtime._Workspace(value.q, value.k, value.v, value.indices,
                                         value.query_lens, value.prefix_lens, value.scale)
         inputs = workspace.bind(value.q, value.k, value.v, value.indices)
-        _runtime._qsa_recover_blocks[(9,)](
+        _runtime.prepare.qsa_recover_scatter[(9,)](
             value.indices, inputs.query_positions, inputs.kv_lens,
-            inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=4,
+            inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=1,
         )
         assert not bool(workspace.errors.any())
         plan = _runtime.direct.prepare(inputs=inputs)
@@ -404,12 +423,12 @@ def test_direct_recovered_order():
             indices[0, 2048] = 29999
         elif corruption == "padding":
             indices[0, 2049] = 0
-        _runtime._qsa_recover_blocks[(5,)](
+        _runtime.prepare.qsa_recover_scatter[(5,)](
             indices, inputs.query_positions, inputs.kv_lens,
-            inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=4,
+            inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=1,
         )
         assert workspace.errors.cpu().tolist() == [int(corruption != "none"), 0, 0, 0, 0]
-        _runtime._qsa_check_errors[(1,)](workspace.errors, workspace.valid, 5, 1024, num_warps=4)
+        _runtime.prepare.qsa_order_masks_validate[(1,)](workspace.errors, workspace.valid, ROWS=5, num_warps=4)
         assert bool(workspace.valid.cpu()) == (corruption == "none")
 
 
@@ -422,10 +441,10 @@ def test_error_check_chunked_graph(rows):
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(stream):
-        _runtime._qsa_check_errors[(1,)](errors, valid, rows, 1024, num_warps=4)
+        _runtime.prepare.qsa_order_masks_validate[(1,)](errors, valid, ROWS=rows, num_warps=4)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            _runtime._qsa_check_errors[(1,)](errors, valid, rows, 1024, num_warps=4)
+            _runtime.prepare.qsa_order_masks_validate[(1,)](errors, valid, ROWS=rows, num_warps=4)
     torch.cuda.current_stream(device).wait_stream(stream)
     for row in sorted({0, min(1023, rows - 1), min(1024, rows - 1), rows - 1}):
         for error in (1, -1, 0):
@@ -435,6 +454,59 @@ def test_error_check_chunked_graph(rows):
             torch.cuda.synchronize(device)
             assert bool(valid.cpu()) == (error == 0)
             assert bool(storage[0].cpu()) and bool(storage[2].cpu())
+
+
+@pytest.mark.parametrize("reverse", (False, True))
+def test_prepare_recovery_validation(reverse):
+    """Single-pass recovery retains every block, tail, padding and duplicate check."""
+    device = _gpu()
+    rng = np.random.default_rng(28)
+    data, positions, lengths, expected_blocks, expected_errors = [], [], [], [], []
+    for visible in (1, 2, 3, 4, 5, 7, 8, 2047, 2048, 2049, 2050, 2051, 2052, 12000, 30001):
+        count = min(visible // 4, 512)
+        for shuffle in (False, True):
+            selected = (np.arange(count) if visible // 4 <= 512
+                        else rng.choice(visible // 4, count, replace=False))
+            if shuffle:
+                rng.shuffle(selected)
+            base = np.full(2051, -1, np.int32)
+            base[:count * 4] = (selected[:, None] * 4 + np.arange(4)).reshape(-1)
+            base[count * 4:count * 4 + visible % 4] = np.arange(visible // 4 * 4, visible)
+            variants = [base]
+            for column in sorted({0, 1, 2, 3, 4, 2047, 2048, 2049, 2050, count * 4}):
+                for value in (-2147483648, -2, -1, 0, visible, 2147483644, 2147483647):
+                    changed = base.copy()
+                    changed[column] = value
+                    variants.append(changed)
+            if count >= 2:
+                changed = base.copy()
+                changed[4:8] = changed[:4]
+                variants.append(changed)
+            for indices in variants:
+                recovered, error = [], False
+                for block in indices[:count * 4].reshape(-1, 4).tolist():
+                    valid = (block[0] >= 0 and block[0] % 4 == 0
+                             and block == list(range(block[0], block[0] + 4)) and block[-1] < visible)
+                    error |= not valid
+                    recovered.append(block[0] // 4 if valid else -1)
+                error |= len(set(recovered)) != count
+                tail = list(range(visible // 4 * 4, visible))
+                error |= indices[count * 4:count * 4 + len(tail)].tolist() != tail
+                error |= bool(np.any(indices[count * 4 + len(tail):] != -1))
+                data.append(indices)
+                positions.append(visible - 1)
+                lengths.append(visible + 4)
+                expected_blocks.append(sorted(recovered) + [-1] * (512 - count))
+                expected_errors.append(int(error))
+    indices = torch.from_numpy(np.stack(data)).to(device)
+    pos, lens = (torch.tensor(v, dtype=torch.int32, device=device) for v in (positions, lengths))
+    sequences = torch.arange(len(data), dtype=torch.int32, device=device)
+    blocks = torch.empty((len(data), 512), dtype=torch.int32, device=device)
+    errors = torch.empty(len(data), dtype=torch.int32, device=device)
+    _runtime.prepare.qsa_recover_scatter[(len(data),)](
+        indices, pos, lens, sequences, blocks, errors, REVERSE=reverse, num_warps=1)
+    np.testing.assert_array_equal(blocks.cpu().numpy(), expected_blocks)
+    np.testing.assert_array_equal(errors.cpu().numpy(), expected_errors)
 
 
 @pytest.mark.parametrize("max_blocks", (511, 1024, 1025, 3000, 4097, 8012, 16385, 65536, 1048575))
@@ -464,7 +536,7 @@ def test_union_compact_chunked(max_blocks):
         membership = torch.full_like(blocks, -777)
         counts = torch.empty((len(rows), 2), dtype=torch.int32, device=device)
         active = torch.empty(len(rows), dtype=torch.int32, device=device)
-        _runtime.union.union_qsa_compact_membership[(len(rows),)](
+        _runtime.prepare.qsa_compact[(len(rows),)](
             source, blocks, membership, counts, meta, active, max_blocks, capacity,
             min(1024, triton.next_power_of_2(max_blocks)), rho, packed, num_warps=4)
         b, m = blocks.cpu().numpy(), membership.cpu().numpy().view(np.uint32)
@@ -503,9 +575,9 @@ def test_direct_packed_kv():
         workspace = _runtime._Workspace(value.q, value.k, value.v, value.indices,
                                         value.query_lens, value.prefix_lens, value.scale)
         inputs = workspace.bind(value.q, value.k, value.v, value.indices)
-        _runtime._qsa_recover_blocks[(length,)](
+        _runtime.prepare.qsa_recover_scatter[(length,)](
             value.indices, inputs.query_positions, inputs.kv_lens,
-            inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=4,
+            inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=1,
         )
         assert not bool(workspace.errors.any())
         plan = _runtime.direct.prepare(inputs=inputs)
@@ -565,9 +637,9 @@ def test_direct_packed_kv():
     workspace = _runtime._Workspace(value.q, value.k, value.v, value.indices,
                                     value.query_lens, value.prefix_lens, value.scale)
     inputs = workspace.bind(value.q, value.k, value.v, value.indices)
-    _runtime._qsa_recover_blocks[(8,)](
+    _runtime.prepare.qsa_recover_scatter[(8,)](
         value.indices, inputs.query_positions, inputs.kv_lens,
-        inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=4,
+        inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=1,
     )
     plan = _runtime.direct.prepare(inputs=inputs)
     output = torch.empty_like(value.q)
@@ -652,7 +724,7 @@ def test_union_direct_routing():
     counts = torch.empty((len(cases), 2), dtype=torch.int32, device=device)
     active = torch.empty(len(cases), dtype=torch.int32, device=device)
     for packed in (False, True):
-        _runtime.union.union_qsa_compact_membership[(len(cases),)](
+        _runtime.prepare.qsa_compact[(len(cases),)](
             dense_gpu, blocks, membership, counts, meta_gpu, active,
             capacity, capacity, capacity, 4.0, packed, num_warps=4,
         )
@@ -886,10 +958,6 @@ def test_union_task_order():
         order = torch.empty(capacity, dtype=torch.int32, device=device)
         for enabled in (active, 1 - active):
             active_gpu = torch.from_numpy(enabled.copy()).to(device)
-            _runtime.union.union_qsa_order_tasks[(math.ceil(capacity / size),)](
-                counts_gpu, active_gpu, order, tasks, heads, 1, grid, size,
-                max(1, (tasks - 1).bit_length()), num_warps=8,
-            )
             expected = np.full(capacity, -1, dtype=np.int32)
             for start in range(0, capacity, size):
                 ids = list(range(start, min(start + size, tasks)))
@@ -901,9 +969,16 @@ def test_union_task_order():
                     destination = row * grid + (grid - 1 - column if row % 2 else column)
                     if destination < capacity:
                         expected[destination] = task
-            actual = order.cpu().numpy()
-            np.testing.assert_array_equal(actual, expected)
-            np.testing.assert_array_equal(np.sort(actual[actual >= 0]), np.arange(tasks))
+            for shift in (max(1, (tasks - 1).bit_length()), 26):
+                # Exercise the int64 fallback without allocating millions of tasks.
+                wide = (math.ceil(int(counts[:, 0].max()) / 16) << shift) + tasks - 1 >= 2**31
+                _runtime.prepare.qsa_order_masks_validate[(math.ceil(capacity / size),)](
+                    None, None, counts_gpu, active_gpu, order, 0, tasks, heads, 1, grid, size,
+                    shift, wide, False, num_warps=8,
+                )
+                actual = order.cpu().numpy()
+                np.testing.assert_array_equal(actual, expected)
+                np.testing.assert_array_equal(np.sort(actual[actual >= 0]), np.arange(tasks))
 
 
 def test_sglang_adapter(monkeypatch, tmp_path):
@@ -1116,9 +1191,8 @@ def _resources():
     # Inspect actual Triton ELFs too; attention-only checks missed planner
     # SGPR spills and large-context private scratch in earlier versions.
     readelf = Path(os.environ.get("ROCM_PATH", "/opt/rocm")) / "llvm/bin/llvm-readelf"
-    functions = (_runtime._qsa_recover_blocks, _runtime._qsa_check_errors,
-                 _runtime.union.union_qsa_scatter_membership, _runtime.union.union_qsa_compact_membership,
-                 _runtime.union.union_qsa_score_masks, _runtime.union.union_qsa_order_tasks)
+    functions = (_runtime.prepare.qsa_recover_scatter, _runtime.prepare.qsa_compact,
+                 _runtime.prepare.qsa_order_masks_validate, _runtime.prepare.qsa_scatter_prepared)
     seen = set()
     for function in functions:
         for cache in function.device_caches.values():

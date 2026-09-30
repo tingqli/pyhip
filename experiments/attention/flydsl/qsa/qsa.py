@@ -7,65 +7,10 @@ import threading
 from types import SimpleNamespace
 
 import torch
-import triton
-import triton.language as tl
 
-from . import dense, direct, union
+from . import dense, direct, prepare, union
 
 __all__ = ["qsa"]
-
-
-@triton.jit
-def _qsa_recover_blocks(Indices, Positions, Lengths, SequenceIds, Blocks, Errors):
-    row = tl.program_id(0)
-    position = tl.load(Positions + row)
-    length = tl.load(Lengths + tl.load(SequenceIds + row))
-    visible = position + 1
-    complete = tl.minimum(visible // 4, 512)
-    columns = tl.arange(0, 512)
-    a = tl.load(Indices + row * 2051 + columns * 4)
-    b = tl.load(Indices + row * 2051 + columns * 4 + 1)
-    c = tl.load(Indices + row * 2051 + columns * 4 + 2)
-    d = tl.load(Indices + row * 2051 + columns * 4 + 3)
-    full = columns < complete
-    valid = (a >= 0) & (a % 4 == 0) & (b == a + 1) & (c == a + 2) & (d == a + 3)
-    valid &= (d < visible) & (d < length)
-    blocks = tl.where(full & valid, a // 4, -1)
-    ordered = tl.sort(tl.where(full, blocks, 2147483647), descending=False)
-    previous = tl.gather(ordered, tl.maximum(columns - 1, 0), axis=0)
-    duplicate = full & (columns > 0) & (ordered == previous)
-
-    slots = tl.arange(0, 4096)
-    tokens = tl.load(Indices + row * 2051 + slots, slots < 2051, -1)
-    count = complete * 4 + visible % 4
-    tail = (slots >= complete * 4) & (slots < count)
-    tail_token = (visible // 4) * 4 + slots - complete * 4
-    bad_slots = (slots < 2051) & tl.where(
-        slots >= count,
-        tokens != -1,
-        (tokens < 0) | (tokens >= visible) | (tokens >= length) | (tail & (tokens != tail_token)),
-    )
-    error = (position < 0) | (visible > length)
-    error |= tl.sum((full & ~valid).to(tl.int32), 0) > 0
-    error |= tl.sum(duplicate.to(tl.int32), 0) > 0
-    error |= tl.sum(bad_slots.to(tl.int32), 0) > 0
-    # Duplicate validation already sorted this exact set. Share that ordering
-    # with direct attention instead of sorting into a second buffer later.
-    tl.store(Blocks + row * 512 + columns, tl.where(full, ordered, -1))
-    tl.store(Errors + row, error.to(tl.int32))
-
-
-@triton.jit
-def _qsa_check_errors(Errors, Valid, ROWS: tl.constexpr, C: tl.constexpr):
-    # Keep the asynchronous assert without Torch's scratch-using bool reduction
-    # or hot-path temporary tensors. Every call overwrites the private scalar.
-    lane = tl.arange(0, C)
-    error = tl.full((), 0, tl.int32)
-    for start in tl.range(0, ROWS, C, loop_unroll_factor=1):
-        row = start + lane
-        values = tl.load(Errors + row, row < ROWS, 0)
-        error |= tl.max((values != 0).to(tl.int32))
-    tl.store(Valid, error == 0)
 
 
 class _Workspace:
@@ -89,8 +34,8 @@ class _Workspace:
         self.dense = dense.prepare(inputs=inputs)
         self.union = self.direct = None
         if sum(self.dense.query_counts) != q.shape[0]:
-            self.union = union.allocate_plan(inputs=inputs, query_tile=32, grid_multiplier=2,
-                                            max_union_inflation=4.0, skip_counts=self.dense.query_counts)
+            self.union = prepare.allocate_plan(inputs=inputs, query_tile=32, grid_multiplier=2,
+                                              max_union_inflation=4.0, skip_counts=self.dense.query_counts)
             self.direct = direct.prepare(inputs=inputs, skip_counts=self.dense.query_counts, union=self.union)
             self.union.packed_direct = self.direct.packed_key is not None
 
@@ -173,15 +118,8 @@ def qsa(q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=No
         _workspaces.move_to_end(key)
         workspace.captured |= capturing
         inputs = workspace.bind(q, k, v, indices)
-        with torch.profiler.record_function("pyhip_qsa.recover_blocks"):
-            _qsa_recover_blocks[(q.shape[0],)](
-                indices, inputs.query_positions, inputs.kv_lens,
-                inputs.query_sequence_ids, inputs.block_indices, workspace.errors, num_warps=4)
-            _qsa_check_errors[(1,)](workspace.errors, workspace.valid, q.shape[0], 1024, num_warps=4)
-            torch._assert_async(workspace.valid, "Invalid compressed QSA token/block/tail ABI")
-        with torch.profiler.record_function("pyhip_qsa.plan_rebuild"):
-            if workspace.union is not None:
-                union.rebuild_plan(inputs=inputs, plan=workspace.union)
+        with torch.profiler.record_function("pyhip_qsa.prepare"):
+            prepare.run(inputs=inputs, plan=workspace.union, errors=workspace.errors, valid=workspace.valid)
         with torch.profiler.record_function("pyhip_qsa.attention"):
             dense.run(inputs=inputs, prepared=workspace.dense, out=out)
             if workspace.union is not None:

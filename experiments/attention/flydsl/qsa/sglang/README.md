@@ -13,14 +13,14 @@
 启用须同时设置`PYHIP_QSA_PREFILL=1`与`SGLANG_PLUGINS=pyhip_flydsl_qsa`；三个上游源码SHA必须匹配（backend、kernel、qsa_indexer）。
 
 构建产物是包含dist-info的独立`pyhip_qsa_runtime`包，恢复3D版本0.2.0；不需pip、不把experiments放入server路径。2026-09-28已按用户要求撤回T01的SGLang prefill/decode 5D改动、页表边界及专属测试；既有MHA/cache writer不动。
-父包惰性导入，禁用时不导入Torch/FlyDSL。当前打包QSA五模块（含packed direct）、MHA两个依赖与本插件，共8个源码文件，附来源hash和许可证。
+父包惰性导入，禁用时不导入Torch/FlyDSL。当前打包QSA六模块（含prepare和packed direct）、MHA两个依赖与本插件，共9个源码文件，附来源hash和许可证。
 `--build-target`要求新mytest/mydata子目录；打包目标本身作为独立源码快照保留。
 
 当前3D packed direct保留17/10填充工作比分流，raw保留rho4；没有撤销3D优化。5D因Vvec8与四token选块的布局成本退化而撤回，性能及Vvec4/S4原型限制见[../opt.md](../opt.md)。当前接入不支持QSA 5D，不应为该路径启用vectorized_5d。旧0.3.0/clean2包与5D回放只作历史证据，不可直接套用回退后的SGLang；新使用需构建新target。
 
 ## 1. 运行前准备
 
-以下命令针对Qwen3.8模型和**TP2 / GPU0、1 / 端口9080**，后续默认使用PyHIP的.venv。2026-09-28该环境已独立安装与镜像一致的Torch/FlyDSL/Triton/pytest/msgspec及SGLang依赖，实际SGLang/AITER导入通过，仍关闭system-site-packages；不要静默切回系统Python。最新完成本地GPU2正确性及性能重放，**没有重新部署整模型**；具体版本与安装来源见[../opt.md](../opt.md)。
+以下命令针对Qwen3.8模型和**TP2 / GPU0、1 / 端口9080**，后续默认使用PyHIP的.venv。2026-09-28该环境已独立安装匹配ROCm的Torch/FlyDSL/Triton及SGLang依赖，整服务启动时另补齐镜像sglang-kernel0.4.6.post1的39个精确载荷，仍关闭system-site-packages；不要静默切回系统Python。最新实际TP2原生/当前模型测试已经完成并清理，见[系统审计](../../../../../mytest/mydata/qsa_system_20260928_01/final_analysis.json)；不是常驻部署，版本和来源见[../opt.md](../opt.md)。
 每个新终端先执行：
 
 ```bash
@@ -166,15 +166,19 @@ find "$RUN/profiles" -name '*-TP-*.trace.json.gz'
 
 ## 验证范围
 
-T01、clean2及Vvec4/S4的功能/性能记录保留为撤销前历史，见[../opt.md](../opt.md)。当前仅3D，插件仍不接管SGLang graph/compile。最新零spill修复后QSA63项（含3D SGLang backend）正常回归通过；54组完整链的570个实际dispatch三字段均0。53组有效本地性能full无回退，1组GPU门禁失败未计时；此前MHA8192慢阶段未在本轮解决。没有新的整模型部署、真实多卡TP4/8 capture或TTFT/吞吐声明。
+T01、clean2及Vvec4/S4的功能/性能记录保留为撤销前历史，见[../opt.md](../opt.md)。当前仅3D，插件仍不接管SGLang graph/compile。单wave恢复/分片mask后QSA65项（含3D SGLang backend）通过；54组完整链378个实际dispatch三字段均0。真实链仍8kernel；36组普通kernel性能及逐kernel分解完成，旧A3停止记录不回填。此前MHA8192慢阶段未解决。
 
-已重建[当前零spill独立包manifest](../../../../../mytest/mydata/qsa_zero_spill_20260928_01/plugin_zero_spill/pyhip_qsa_runtime/source_manifest.json)，八源码、0.2.0、三个ABI/五hook注册均核验；包内L3/L47×TP2/4/8六份真实输入通过，72次实际dispatch零spill且未导入experiments。禁用entry-point仍惰性加载。旧target是旧源码快照，使用修复须构建新target；该验证不是整模型部署。下方早期0.2.0/5hook包结果仍为历史。
+最新实际TP2原生/当前系统各128个无profiler请求（固定10条约12k输入、输出5、并发1），TTFT中位1037.031→955.764ms，请求时延1090.343→1009.214ms；顺序启动对照，不是同址交错或饱和吞吐。双rank各12层×4次profile替换核验通过，144项attention原`.02/.02`检查通过；配对生成文本114/128相同，差异集中于两条内部也不稳定的prompt，未做整模型质量认证。见[系统报告](../../../../../mytest/mydata/qsa_system_20260928_01/final_analysis.json)。两个测试服务已清理；未测真实TP4/8系统。
+
+已重建[当前九源码独立包manifest](../../../../../mytest/mydata/qsa_prepare_latency_20260928_01/plugin_optimized/pyhip_qsa_runtime/source_manifest.json)，包含单wave恢复和分片mask准备实现，0.2.0、三个ABI/五hook注册均核验；包内L3/L47×TP2/4/8六例、48次实际dispatch零spill，未导入experiments，禁用entry-point仍惰性加载。动态LDS与固定字段分开核验；旧target是冻结源码，使用更新须构建新target。该验证不是整模型部署，下方早期包结果仍为历史。
+
+本次模型服务另构建[实际使用的系统包](../../../../../mytest/mydata/qsa_system_20260928_01/current_v2/plugin/pyhip_qsa_runtime/source_manifest.json)，九源码与当前实现一致。系统trace证明每次4准备＋4attention launch，但未重新审计整个模型所有kernel的spill；不能将此前QSA三零外推到整模型。
 
 2026-09-26核心union已更新，性能与限制见[QSA说明](../README.md#L1)。本页构建命令会复制当前核心；旧target仍是冻结副本，须新建target并重启才能使用更新。
 该优化轮完成了源码backend回归和真实输入本地重放，**没有重新构建/部署独立插件或运行整模型profile**；下面0.2.0包的验证属于此前整理轮。
 
 0.2.0独立包的原生5hook、惰性加载和两份真实输入执行已通过，见[整理记录](../../../../../mytest/mydata/qsa_consolidation_20260925_01/README.md)。
-本页命令已使用新的默认Python环境，兼容ROCm依赖已就绪；仍须检查服务端设备、空闲状态及三个ABI哈希。没有重新启动整模型，不把旧模型trace或最新kernel重放标作本次端到端验收。
+本页命令已使用新的默认Python环境，兼容ROCm依赖已就绪；仍须检查服务端设备、空闲状态及三个ABI哈希。上方2026-09-28系统结果使用新建包与本次模型trace，旧模型/早期包数据只作历史，不能互换标签。
 profiler trace不是无profiler吞吐测试；bench duration包含trace导出等待，不能直接解释为常规请求耗时。
 
 真实输入加载、FP32参考、性能、summary均已并入[../test_qsa.py](../test_qsa.py)，没有第二套回放或插件测试文件。
