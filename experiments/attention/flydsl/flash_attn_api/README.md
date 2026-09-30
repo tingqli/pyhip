@@ -1,0 +1,92 @@
+# Linear Flash Attention 接口
+
+- [flash_attn_varlen_8wave.py](flash_attn_varlen_8wave.py)：原 D128 adapter，行为未修改。
+- [../mha/mha_pa_bf16_942.py](../mha/mha_pa_bf16_942.py)：gfx942 BF16 D256 linear公共入口为`flash_attn_varlen_func`，不替换原D128接口。
+    同模块的`PagedAttention`仍要求SHUFFLE-5D K/V与page32/64/128；不会把5D分页输入当作linear/page1/page4。
+
+## D256 使用方式
+
+```python
+from experiments.attention.flydsl.mha.mha_pa_bf16_942 import (
+    flash_attn_varlen_func,
+)
+
+# q: BF16 [total_q, H, 256]
+# k/v: BF16 [total_k, HK, 256]
+# cq/ck: CUDA/ROCm int32 [batch + 1]，普通PyTorch张量，有版本计数器
+o = flash_attn_varlen_func(
+    q, k, v, cq, ck, max_seqlen_q, max_seqlen_k,
+    layout="linear", page_size=1,
+)
+
+# 可选：任意物理页映射。k/v仍为扁平token-major [physical_tokens, HK, 256]。
+# block_table: int32 [batch, max_pages]，每项是物理页ID；这里一页4个token。
+o, lse = flash_attn_varlen_func(
+    q, k, v, cq, ck, max_seqlen_q, max_seqlen_k,
+    page_size=4, block_table=block_table,
+    causal=True, return_lse=True, out=out,
+)
+```
+
+### 张量及分页合同
+
+| 项目 | 支持范围 |
+|---|---|
+| GPU/数据类型 | gfx942，BF16，`DQ=DV=256` |
+| Q/O | 连续 `[total_q,H,256]` |
+| K/V | 连续、同shape `[physical_or_linear_tokens,HK,256]`；`H>0`、`HK>0`、`H % HK == 0` |
+| KV page | `page_size=1` 或 `4`；无页表时无需padding，也不做KV转换 |
+| 有页表 | `block_table[b,j]` 指向第 `j` 个逻辑页的物理页；物理token索引为 `block_table[b,t//page_size]*page_size+t%page_size` |
+| 元数据 | CQ/CK同shape int32 `[B+1]`，首项0、非降序、长度不超过给定max；有页表时CK是逻辑KV累计长度 |
+| 尾部 | KV物理存储仅在有页表时要求token数为page的倍数；不读取无效页表列，未使用列允许 `-1`；V尾token在DMA时归零 |
+| GQA | 包含 `H=24/HK=2`；无需展开K/V heads |
+| causal | bottom-right对齐；有query的序列要求 `KV>=Q`；无query段和全空Q支持 |
+| LSE | `return_lse=True` 返回 `(O,LSE)`；LSE是FP32自然对数 `[total_q,H]` |
+| 调度 | `persistent=None/True` 固定驻留CTA；`False` 普通grid |
+| stream/graph | 当前stream或显式 `torch.cuda.Stream`；先在capture外预热相同metadata和编译特化 |
+
+Q/K/V/O指针要求16-byte对齐，所有输入/输出字节跨度小于2GiB；`out`不允许与输入或metadata重叠。
+`softmax_scale`支持有限正host scalar，默认 `1/16`；缺省CK仅支持无页表且Q/K总token数相同的self-attention。
+
+首调用会把CQ/CK及有效页表内容复制到CPU做验证；之后用weakref、版本号、shape和pointer校验缓存，热调用无metadata D2H。
+元数据需在 `torch.inference_mode()` 外创建；Q/K/V可以用于inference。
+使用正常PyTorch操作修改metadata后需在capture外重新调用验证，重新捕获使用新metadata的graph。
+**graph replay不会执行Python验证**，不能在未重新验证时重放任意修改过的页表/边界；不同stream上的输入准备需要调用方建立依赖。
+
+保持原adapter的完整参数顺序，但首版不支持backward/autograd、dropout、soft-cap、bias、ALiBi、局部window/sink、padding边界、attention-prob返回或其他wave数；这些选项显式报错，不静默忽略。
+
+## 实现与验证
+
+原生实现见 [../mha/mha_pa_bf16_256_linear_942.py](../mha/mha_pa_bf16_256_linear_942.py)：
+K/V直接DMA到LDS，V在 `ds_read_b128` 后用编译器可见 `v_perm_b32` 做BF16 2×2转置，再进入M16 MFMA。
+**每次热调用只有一个attention kernel，没有KV转换/gather kernel，也没有调用外预转换要求。**
+
+[../mha/test_mha_pa.py](../mha/test_mha_pa.py) 的`test_bf16_linear_d256_`前缀现有**25项**（原10项+15个static/N32尾部参数）：独立FP32 oracle覆盖linear/page1/page4、
+逆序真实页表、GQA、causal/LSE、NaN尾部、guard、stream/graph、metadata失效与错误输入。
+新增单请求KV1/31/32/33/63/64/65/95/96/97/127/128/129/257/2583，内部同时验证persistent/grid、Q尾guard与重复bitexact，另含graph与放大logits。
+测试与helpers仍在统一MHA测试入口；原O容差`.02`、LSE`.002`、private及VGPR/SGPR spill检查保留。
+用标准`-k test_bf16_linear_d256_`筛选；四个`test_bf16_linear_d256_unsupported_options`参数用例不需要GPU，
+pytest选卡仍默认`PYHIP_MHA_GPU=current`。历史98项是旧测试矩阵，不冒充当前数量；最新67项BF16 MHA与20项QSA共87项通过，其中包含全部25项linear。
+
+### 2026-09-25：连续 Full 221.69 TFLOPS
+
+B1/Q10240/KV2583/H24/HK2/D256、noncausal/noLSE/persistent、**无页表**：
+原版3000.075µs/216.672T，优化后**2932.175µs/221.690T**。原`cudaPerf`、10独立buffer、每版50样本、AB/BA交替；
+只计内部预分配`run()`热调用，不含本公共API的metadata验证或JIT/分配/参考，不能与旧轮完整API计时无条件合并。
+
+内部在已验证B1无页表noncausal/noLSE时用tensor shape特化长度；多序列、分页、causal/LSE继续使用原动态边界。
+K>64且末块有效token≤32时裁去无效N半块QK/PV与drain V读，保留完整D256、mask和等待。
+非分页DMA地址leaf合并，可见概率pack只在静态分支启用；不新增公共开关，也不改变graph metadata合同。
+
+最终连续Full整ELF与正式实测一致。全局启用pack曾使随机page1/page4变慢，因此最终分页恢复原版整ELF；
+**分页、普通grid及causal/LSE没有本轮220T性能保证**，也不改变原SHUFFLE默认v73。
+ATT确认4+4wave阶段交织仍成立，但局部稳态MFMA union79.12%低于原版82.49%，不把局部trace当整卡性能。
+详见[本轮完整证据、ATT与限制](../../../../mytest/mydata/mha_linear_220t_20260925_01/README.md#L1)。
+
+### 2026-09-24：历史分页验收（保留原结论）
+
+2026-09-24正式Full验收：B1/Q10240/KV2583/H24/HK2/D256、noncausal/noLSE/persistent，10独立buffer×5轮、每候选50样本，原 `cudaPerf`。
+对同场v98，随机page1/page4 **TFLOPS分别低8.90%/9.37%**；时延分别高 **9.77%/10.33%**。
+因此吞吐差在10%以内，但预先设置的更严格 `linear_us <= 1.10*v98_us` 门槛，**page4仍未通过**。
+相对当前默认v73，两者时延分别高8.73%/9.30%。不把该Full范围扩大为所有shape或grid的性能保证。
+所有慢样本和失败试验保留，详见 [证据与完整性能表](../mha/results/d256_linear_20260924/README.md)。

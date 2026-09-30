@@ -3,15 +3,22 @@
 BM256/BN64, eight wave64s staggered by one stage. The V128/no-LSE hot path
 keeps VMEM/DS in S0/2/4/6 and MFMA/VALU in S1/3/5/7, following gfx950's
 stage organization. Lane addresses are prepared before memory stages;
-V uses a full 64-bit GLOBAL scalar base, never a buffer descriptor.
+D128/D192 V uses a full 64-bit GLOBAL scalar base, not a buffer descriptor.
 One K slot and two V slots use 49,920/58,240 bytes for D128/D192. Softmax
 lags QK by one tile; cross32 reductions issue in memory stages and retire
 with the operand reads. Optional LSE/V192 retain the checked wide path.
 Ordinary and persistent grids share this body and public tensor layouts.
+DQ=DV=256 defaults to the BM128/BN64 M16 K+V DMA specialization with
+early page lookahead, merged page-ready waits and late S4 LGKM completion.
+PagedAttention retains SHUFFLE-5D KV; flash_attn_varlen_func accepts linear
+D256 Q/K/V, including page1/page4 physical row tables, without conversion.
 """
 
 import functools
+import importlib
 import math
+import weakref
+from numbers import Real
 
 import torch
 import flydsl.compiler as flyc
@@ -19,57 +26,36 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, rocdl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from pyhip.codegen.flydsl.helpers import rocdl_aux
 
+if __package__:
+    from ._common import (
+        _advance_max, _buffer, _buffer_words, _exp, _join, _maximum, _min,
+        _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _prefetch_page,
+        _read_address, _rescale, _schedule, _stage_end, _uniform, _wait,
+    )
+else:
+    from _common import (
+        _advance_max, _buffer, _buffer_words, _exp, _join, _maximum, _min,
+        _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _prefetch_page,
+        _read_address, _rescale, _schedule, _stage_end, _uniform, _wait,
+    )
 
 BM, BN, THREADS = 256, 64, 512
 PADDED_CHUNK = 1040
 LOG2E = math.log2(math.e)
 
 
-def _uniform(value):
-    return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value).ir_value()))
-
-
-def _min(a, b):
-    return (a < b).select(a, b)
-
-
-def _pin_i32(value):
-    return fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [fx.Int32(value).ir_value()],
-                                  "", "=v,0", has_side_effects=True))
-
-
-def _pin(values, chunk=8):
-    values = fx.Vector(values)
-    dtype = values.dtype
-    words = values.bitcast(fx.Int32) if dtype.width < 32 else values
-    result = []
-    for start in range(0, words.numel, chunk):
-        part = fx.Vector.from_elements([words[i] for i in range(start, min(start + chunk, words.numel))], words.dtype)
-        tied = fx.Vector(llvm.inline_asm(part.ir_value().type, [part.ir_value()], "", "=v,0", has_side_effects=True))
-        result.extend(tied[i] for i in range(tied.numel))
-    return fx.Vector.from_elements(result, words.dtype).bitcast(dtype)
-
-
-def _join(a, b):
-    a, b = fx.Vector(a), fx.Vector(b)
-    return fx.Vector.from_elements([a[i] for i in range(a.numel)] + [b[i] for i in range(b.numel)], fx.Float32)
-
-
-def _exp(value):
-    return fx.Float32(llvm.call_intrinsic(fx.Float32.ir_type, "llvm.amdgcn.exp2.f32",
-                                         [fx.Float32(value).ir_value()], [], []))
-
-
-def _maximum(a, b):
-    return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [fx.Float32(a).ir_value(), fx.Float32(b).ir_value()],
-                                    "v_max_f32 $0, $1, $2", "=v,v,v", has_side_effects=False))
-
-
 def _max3(a, b, c):
     return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [a.ir_value(), b.ir_value(), c.ir_value()],
                                     "v_max3_f32 $0, $1, $2, $3", "=v,v,v,v", has_side_effects=False))
+
+
+def _mfma_hazard_wait():
+    # Inline-asm readers of fresh MFMA accumulators get no wait states from LLVM's hazard recognizer.
+    # 11 = NumPasses(8) + 3 for the 32x32 MFMAs of this kernel on gfx942.
+    rocdl.sched_barrier(0)
+    llvm.inline_asm(None, [], "s_nop 10", "", has_side_effects=True)
+    rocdl.sched_barrier(0)
 
 
 def _row_max_local(values):
@@ -103,16 +89,6 @@ def _cross32_async(value, address):
         "ds_bpermute_b32 $0, $1, $2", "=v,v,v,~{memory}", has_side_effects=True))
 
 
-def _pin_s64(value):
-    return fx.Int64(llvm.inline_asm(fx.Int64.ir_type, [fx.Int64(value).ir_value()],
-                                   "", "=s,0", has_side_effects=True))
-
-
-def _advance_max(old, new):
-    return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [old.ir_value(), new.ir_value()],
-                                    "v_mov_b32 $0, $2", "=v,0,v", has_side_effects=True))
-
-
 def _center(values, scale, maximum, begin, end):
     result = []
     for i in range(32):
@@ -129,16 +105,6 @@ def _exp_part(values, begin, end):
     return fx.Vector.from_elements([_exp(values[i]) if begin <= i < end else values[i] for i in range(32)], fx.Float32)
 
 
-def _pack_bf16(values):
-    # gfx942 has no native packed FP32 -> BF16 instruction. Software RNE,
-    # as in the FP8 kernel's output path, is used for O.
-    bits = fx.Vector(values).bitcast(fx.Uint32)
-    rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
-    words = [(rounded[i] >> 16) | (rounded[i + 1] & fx.Uint32(0xFFFF0000))
-             for i in range(0, values.numel, 2)]
-    return fx.Vector.from_elements(words, fx.Uint32)
-
-
 def _pack_probability(values):
     # P uses the established BF16 round-half-up contract. Packing each pair
     # directly avoids materializing 32 RNE tie bits during the QK-high stage.
@@ -151,38 +117,6 @@ def _pack_probability(values):
     return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.BFloat16)
 
 
-def _stage_end():
-    # Compiler fences and CTA rendezvous, not a memory-counter wait.
-    rocdl.sched_barrier(0)
-    rocdl.s_barrier()
-    rocdl.sched_barrier(0)
-
-
-def _wait(*, vmcnt=63, expcnt=7, lgkmcnt=63):
-    rocdl.s_waitcnt((vmcnt & 15) | (expcnt << 4) | (lgkmcnt << 8) | ((vmcnt >> 4) << 14))
-
-
-def _schedule(pairs, count, group, exp=False):
-    for _ in range(pairs):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group)
-        rocdl.sched_group_barrier(0x400 if exp else 0x002, count, group)
-
-
-def _prefetch_page(table, index):
-    address = fx.Int64(fx.ptrtoint(fx.get_iter(table) + index))
-    return fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [address.ir_value()],
-                                  "s_load_dword $0, $1, 0", "=s,s,~{memory}", has_side_effects=True))
-
-
-def _page_ready(value):
-    # A tied '=s,0' result lets register allocation copy the still-pending
-    # SMEM result BEFORE the wait when page32/page64 aliases do not coalesce.
-    # Keep the first read of that register inside the assembly, AFTER waiting.
-    return fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [value.ir_value()],
-                                  "s_waitcnt lgkmcnt(0)\ns_mov_b32 $0, $1",
-                                  "=s,s", has_side_effects=True))
-
-
 def _prefetch_tile(table, tile, last, last_page, page_size):
     # BN64 spans two physical pages at page32; page128 contains two tiles.
     # Clamp every speculative SMEM request, including the second page.
@@ -190,20 +124,6 @@ def _prefetch_tile(table, tile, last, last_page, page_size):
     page0 = _prefetch_page(table, first)
     page1 = _prefetch_page(table, _min(first + 1, last_page)) if page_size == 32 else page0
     return page0, page1
-
-
-def _buffer(tensor, size_bytes):
-    address = fx.Int64(fx.ptrtoint(fx.get_iter(tensor)))
-    pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr"), address.ir_value())
-    return rocdl.make_buffer_rsrc(ir.Type.parse("!llvm.ptr<8>"), pointer,
-                                 fx.Int16(0).ir_value(), fx.Int64(size_bytes).ir_value(),
-                                 fx.Int32(0x27000).ir_value())
-
-
-def _buffer_words(resource, voffset, soffset=0):
-    return fx.Vector(rocdl.raw_ptr_buffer_load(ir.VectorType.get([4], fx.Int32.ir_type), resource,
-                                              fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(),
-                                              aux=rocdl_aux(0)))
 
 
 def _global_words(tensor, offset):
@@ -217,11 +137,6 @@ def _global_words(tensor, offset):
 
 def _lds_words(storage, base, immediate=0):
     address = fx.Int32(fx.ptrtoint(fx.get_iter(storage) + base))
-    return fx.Vector(llvm.inline_asm(ir.VectorType.get([4], fx.Int32.ir_type), [address.ir_value()],
-        f"ds_read_b128 $0, $1 offset:{immediate}", "=v,v,~{memory}", has_side_effects=True))
-
-
-def _read_address(address, immediate=0):
     return fx.Vector(llvm.inline_asm(ir.VectorType.get([4], fx.Int32.ir_type), [address.ir_value()],
         f"ds_read_b128 $0, $1 offset:{immediate}", "=v,v,~{memory}", has_side_effects=True))
 
@@ -444,15 +359,6 @@ def _mask(scores, tile, row, q_len, kv_len, causal: fx.Constexpr[bool]):
 
 
 @flyc.jit
-def _rescale(o0, o1, row_sum, old_max, new_max, ballot):
-    o0, o1, row_sum = fx.Vector(o0), fx.Vector(o1), fx.Float32(row_sum)
-    if ballot != fx.Int64(0):
-        correction = _exp(fx.Float32(old_max) - fx.Float32(new_max))
-        o0, o1, row_sum = o0 * correction, o1 * correction, row_sum * correction
-    return o0, o1, row_sum
-
-
-@flyc.jit
 def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
           H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
           DV: fx.Constexpr[int], PAGE: fx.Constexpr[int], CAUSAL: fx.Constexpr[bool],
@@ -562,6 +468,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     _stage_end()
     hi = _qk(q, k, storage, k_base, 1, DQ, DV, full_k)
     scores = _mask(_join(lo, hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
+    _mfma_hazard_wait()
     maximum = _maximum(_row_max(scores) * scale, fx.Float32(-1.0e30)) + 1.0
     scores = _center(scores, scale, maximum, 0, 32)
     row_sum = fx.Float32(0.0)
@@ -887,6 +794,14 @@ class _PagedAttention:
         self.heads, self.kv_heads, self.dq, self.dv = heads, kv_heads, dq, dv
         self.page_size, self.causal, self.quant_query_mode = page, causal, mode
         self.memory_mode, self.persistent = "lds", persistent
+        self._launch = _launch_attention
+        if dq == dv == 256:
+            if __package__:
+                from .mha_pa_bf16_256_paged_942 import _launch
+            else:
+                from mha_pa_bf16_256_paged_942 import _launch
+            self._launch = _launch
+            self.bf16_backend = "native-m16-dma4-q0-kearly-vearly-interleave1-1-pages1-lateS41"
         self._compiled = {}
 
     def __call__(self, Q, K, V, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
@@ -988,7 +903,7 @@ class _PagedAttention:
                 key = (device, signature)
                 compiled = self._compiled.get(key)
                 if compiled is None:
-                    self._compiled[key] = flyc.compile(_launch_attention, *args)
+                    self._compiled[key] = flyc.compile(self._launch, *args)
                 else:
                     compiled(*args)
         return (out, lse) if return_lse else out
@@ -1002,6 +917,8 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
 
     persistent=False selects FP8's ordinary head/batch/query-tile grid. Both
     paths use the same eight-stage kernel and require no scheduler workspace.
+    Dq/Dv128/192 use BM256. Dq=Dv256 defaults to BM128 M16 K+V DMA,
+    early page lookahead and the S4 completion wait after its barrier.
     """
     if memory_mode != "lds" or key_layout != "vectorized":
         raise NotImplementedError("gfx942 BF16 supports LDS and vectorized K only")
@@ -1016,9 +933,201 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         raise ValueError("head counts, dimensions and page_size must be integers")
     if num_qo_heads <= 0 or num_kv_heads <= 0 or num_qo_heads % num_kv_heads:
         raise ValueError("query heads must be a positive multiple of KV heads")
-    if head_dim_qk not in (128, 192) or head_dim_v not in (128, 192) or page_size not in (32, 64, 128):
-        raise NotImplementedError("gfx942 BF16 supports D128/D192, V128/V192 and pages32/64/128")
+    supported_dims = (head_dim_qk in (128, 192) and head_dim_v in (128, 192)) or head_dim_qk == head_dim_v == 256
+    if not supported_dims or page_size not in (32, 64, 128):
+        raise NotImplementedError("gfx942 BF16 supports Dq/Dv128/192 or Dq=Dv256 and pages32/64/128")
     if quant_query_mode not in ("per-token", "per-tensor"):
         raise ValueError("query scale mode must be per-token or per-tensor")
     return _PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size,
                            is_causal, quant_query_mode, persistent is not False)
+
+
+# ---- D256-only linear/page1/page4 public API; not SHUFFLE-5D KV ----
+
+_VALIDATED = {}
+
+
+@functools.cache
+def _core_run():
+    if __package__:
+        return importlib.import_module(
+            ".mha_pa_bf16_256_linear_942", __package__
+        ).run
+    name = "experiments.attention.flydsl.mha.mha_pa_bf16_256_linear_942"
+    try:
+        return importlib.import_module(name).run
+    except ModuleNotFoundError as exc:
+        if not exc.name or not name.startswith(exc.name + "."):
+            raise
+    # Only standalone loading may need the project root; never add sibling dirs.
+    import sys
+    from pathlib import Path
+
+    root = str(Path(__file__).resolve().parents[4])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return importlib.import_module(name).run
+
+
+def _validate_metadata(tensors, shapes, limits):
+    cq, ck = tensors[:2]
+    table = tensors[2] if len(tensors) == 3 else None
+    key = (tuple(map(id, tensors)), shapes, limits)
+    try:
+        version = tuple((t._version, t.device, tuple(t.shape), t.data_ptr()) for t in tensors)
+    except RuntimeError as exc:
+        raise ValueError("Metadata must have version counters; create it outside inference_mode().") from exc
+    cached = _VALIDATED.get(key)
+    if cached is not None and cached[1] == version and all(
+        ref() is t for ref, t in zip(cached[0], tensors)
+    ):
+        return
+    import torch
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Unwarmed or changed metadata: warm this call outside graph capture first.")
+    qb = cq.cpu().tolist()
+    kb = qb if ck is cq else ck.cpu().tolist()
+    nq, nk = shapes[0][0], shapes[1][0]
+    max_q, max_k, causal, page = limits
+    if (qb[0] != 0 or kb[0] != 0 or qb[-1] != nq
+            or table is None and kb[-1] != nk):
+        raise ValueError("Bounds must start at zero and end at Q/K token counts (K is logical when paged).")
+    qlens = [end - start for start, end in zip(qb, qb[1:])]
+    klens = [end - start for start, end in zip(kb, kb[1:])]
+    if (any(not 0 <= n <= max_q for n in qlens)
+            or any(not 0 <= n <= max_k for n in klens)):
+        raise ValueError("Bounds must be monotonic and sequence lengths must not exceed their maxima.")
+    if any(qn > 0 and (kn == 0 or causal and kn < qn) for qn, kn in zip(qlens, klens)):
+        raise ValueError("Active Q requires nonempty KV; bottom-right causal attention requires KV >= Q.")
+    if table is not None:
+        if nk % page:
+            raise ValueError("With block_table, physical K/V tokens must be a multiple of page_size.")
+        for length, row in zip(klens, table.cpu().tolist()):
+            count = (length + page - 1) // page
+            if count > len(row) or any(p < 0 or p >= nk // page for p in row[:count]):
+                raise ValueError("block_table has missing columns or invalid active physical page IDs.")
+    _VALIDATED[key] = (
+        tuple(weakref.ref(t, lambda _, key=key: _VALIDATED.pop(key, None)) for t in tensors),
+        version,
+    )
+
+
+def _overlaps(a, b):
+    na, nb = a.numel() * a.element_size(), b.numel() * b.element_size()
+    # data_ptr includes view offsets; Python integers preserve full 64-bit pointers.
+    return bool(na and nb and a.data_ptr() <= b.data_ptr() + nb - 1
+                and b.data_ptr() <= a.data_ptr() + na - 1)
+
+
+def flash_attn_varlen_func(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+    min_seqlen_q=0, dropout_p=0.0, softmax_scale=None, logits_soft_cap=0.0,
+    causal=False, window_size=(-1, -1, 0), bias=None, alibi_slopes=None,
+    deterministic=False, return_lse=False, return_attn_probs=False,
+    how_v3_bf16_cvt=1, block_table=None, out=None, cu_seqlens_q_padded=None,
+    cu_seqlens_k_padded=None, sink_ptr=None, layout="linear", key_layout=None,
+    num_waves=8, *, page_size=1, persistent=None, stream=None,
+):
+    """Return BF16 O[NQ,H,256], or (O, FP32 LSE[NQ,H]) with return_lse.
+
+    Q/K/V are contiguous token-major BF16; H must be a positive multiple of HK.
+    Pages are consecutive groups of physical K/V rows; table entries may permute
+    them arbitrarily. Without a table, page_size imposes no padding requirement.
+    Missing CK means self-attention with CQ boundaries and equal Q/K token counts.
+    Causal masking is bottom-right. Q/K/V/O pointers must be 16-byte aligned.
+    Warm metadata and the core specialization before capture; rewarm after edits.
+    Metadata must track PyTorch versions. persistent=None selects True.
+    """
+    import torch
+
+    unsupported = [name for name, value, default in (
+        ("min_seqlen_q", min_seqlen_q, 0), ("dropout_p", dropout_p, 0.0),
+        ("logits_soft_cap", logits_soft_cap, 0.0), ("deterministic", deterministic, False),
+        ("return_attn_probs", return_attn_probs, False), ("how_v3_bf16_cvt", how_v3_bf16_cvt, 1),
+    ) if not isinstance(value, Real) or value != default]
+    unsupported += [name for name, value in (
+        ("bias", bias), ("alibi_slopes", alibi_slopes), ("sink_ptr", sink_ptr),
+        ("cu_seqlens_q_padded", cu_seqlens_q_padded), ("cu_seqlens_k_padded", cu_seqlens_k_padded),
+    ) if value is not None]
+    if (not isinstance(window_size, (tuple, list))
+            or not all(isinstance(x, Real) for x in window_size)
+            or tuple(window_size) not in ((-1, -1), (-1, -1, 0))):
+        unsupported.append("window_size/sinks")
+    if (not isinstance(layout, str) or layout.lower() != "linear"
+            or key_layout is not None and (not isinstance(key_layout, str) or key_layout.lower() != "linear")):
+        unsupported.append("nonlinear layout/key_layout")
+    if unsupported:
+        raise NotImplementedError("D256 varlen attention does not support: " + ", ".join(unsupported))
+    if not isinstance(causal, bool) or not isinstance(return_lse, bool):
+        raise ValueError("causal and return_lse must be bools")
+    if persistent is not None and not isinstance(persistent, bool):
+        raise ValueError("persistent must be bool or None")
+    if type(num_waves) is not int or num_waves != 8:
+        raise NotImplementedError("Only num_waves=8 is supported")
+    if type(page_size) is not int or page_size not in (1, 4):
+        raise NotImplementedError("Only page_size=1 or 4 is supported")
+    for name, value in (("max_seqlen_q", max_seqlen_q), ("max_seqlen_k", max_seqlen_k)):
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < 2**31:
+            raise ValueError(f"{name} must be a nonnegative signed-int32 host bound")
+    if softmax_scale is not None and (not isinstance(softmax_scale, Real) or isinstance(softmax_scale, bool)):
+        raise ValueError("softmax_scale must be a host real scalar or None")
+    scale = 1.0 / 16 if softmax_scale is None else float(softmax_scale)
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("softmax_scale must be finite and positive")
+    if not isinstance(q, torch.Tensor) or not q.is_cuda:
+        raise ValueError("Q must be a device tensor on gfx942")
+    device = q.device
+
+    def check(name, tensor, dtype):
+        if (not isinstance(tensor, torch.Tensor) or tensor.device != device or tensor.dtype != dtype
+                or tensor.layout != torch.strided or not tensor.is_contiguous()):
+            raise ValueError(f"{name} must be contiguous {dtype} on the Q GPU")
+        if tensor.numel() * tensor.element_size() >= 2**31:
+            raise ValueError(f"{name} byte span must be < 2**31")
+        if tensor.requires_grad:
+            raise NotImplementedError("Backward/autograd is not supported")
+
+    for name, tensor in (("Q", q), ("K", k), ("V", v)):
+        check(name, tensor, torch.bfloat16)
+        if tensor.ndim != 3 or tensor.shape[-1] != 256:
+            raise NotImplementedError("Q/K/V must be linear [tokens, heads, 256]")
+        if tensor.data_ptr() % 16:
+            raise ValueError(f"{name} data_ptr must be 16-byte aligned")
+    if k.shape != v.shape or q.shape[1] <= 0 or k.shape[1] <= 0 or q.shape[1] % k.shape[1]:
+        raise ValueError("K/V shapes must match; Q heads must be a positive multiple of KV heads")
+    if cu_seqlens_k is None:
+        if block_table is not None or q.shape[0] != k.shape[0]:
+            raise ValueError("cu_seqlens_k=None requires equal-token self-attention without block_table")
+        cu_seqlens_k = cu_seqlens_q
+    metadata = (cu_seqlens_q, cu_seqlens_k) + (() if block_table is None else (block_table,))
+    for name, tensor in zip(("cu_seqlens_q", "cu_seqlens_k", "block_table"), metadata):
+        check(name, tensor, torch.int32)
+    if (cu_seqlens_q.ndim != 1 or cu_seqlens_q.numel() < 1
+            or cu_seqlens_k.shape != cu_seqlens_q.shape):
+        raise ValueError("CQ/CK must have equal 1D shapes [B+1]")
+    if block_table is not None and (block_table.ndim != 2 or block_table.shape[0] != cu_seqlens_q.numel() - 1):
+        raise ValueError("block_table must have shape [B, max_pages]")
+    if getattr(torch.cuda.get_device_properties(device), "gcnArchName", "").split(":", 1)[0] != "gfx942":
+        raise NotImplementedError("This BF16 D256 backend requires gfx942")
+    stream = torch.cuda.current_stream(device) if stream is None else stream
+    if not isinstance(stream, torch.cuda.Stream) or stream.device != device:
+        raise ValueError("stream must be a torch CUDA/ROCm stream on the Q GPU")
+    with torch.cuda.device(device), torch.cuda.stream(stream):
+        _validate_metadata(metadata, (tuple(q.shape), tuple(k.shape)),
+                           (max_seqlen_q, max_seqlen_k, causal, page_size))
+        if out is None:
+            out = torch.empty_like(q)
+        check("out", out, torch.bfloat16)
+        if out.shape != q.shape or out.data_ptr() % 16:
+            raise ValueError("out must match Q's shape and have a 16-byte-aligned data_ptr")
+        lse = torch.empty(q.shape[:2], dtype=torch.float32, device=device) if return_lse else None
+        sources = (q, k, v) + metadata + (() if lse is None else (lse,))
+        if any(_overlaps(out, tensor) for tensor in sources):
+            raise ValueError("out must not overlap Q/K/V, metadata, or LSE")
+        return _core_run()(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                           out=out, lse=lse, page_size=page_size, causal=causal, softmax_scale=scale,
+                           block_table=block_table, persistent=persistent is not False, stream=stream)
+
+
+__all__ = ["PagedAttention", "flash_attn_varlen_func"]

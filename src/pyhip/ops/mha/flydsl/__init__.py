@@ -1,0 +1,1 @@
+"""FlyDSL multi-head attention kernels and shared device helpers."""

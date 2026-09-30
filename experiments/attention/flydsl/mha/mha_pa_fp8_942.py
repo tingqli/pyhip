@@ -68,6 +68,14 @@ def _max3(a, b, c):
         [a.ir_value(), b.ir_value(), c.ir_value()], "v_max3_f32 $0, $1, $2, $3", "=v,v,v,v", has_side_effects=False))
 
 
+def _mfma_hazard_wait():
+    # Inline-asm readers of fresh MFMA accumulators get no wait states from LLVM's hazard recognizer.
+    # 11 = NumPasses(8) + 3 for the 32x32 MFMAs of this kernel on gfx942.
+    rocdl.sched_barrier(0)
+    llvm.inline_asm(None, [], "s_nop 10", "", has_side_effects=True)
+    rocdl.sched_barrier(0)
+
+
 def _row_max(values):
     # Independent MAX3 chains avoid the 32-deep VALU dependency chain.
     p = [_max3(values[i], values[i + 1], values[i + 2]) for i in range(0, 30, 3)]
@@ -371,6 +379,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     _stage_end()
     hi = _qk(q, k, dtype)
     scores = _mask(_join(lo, hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
+    _mfma_hazard_wait()
     maximum = _maximum(_row_max(scores) * scale, fx.Float32(-1.0e30))
     scores = _center(scores, scale, maximum, 0, 32)
     row_sum = fx.Float32(0.0)
