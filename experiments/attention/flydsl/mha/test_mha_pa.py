@@ -1212,6 +1212,38 @@ def test_bf16_256_default_factory():
             assert native.PagedAttention(24, 2, dq, dv, 64, False)._launch is native._launch_attention
 
 
+def test_bf16_256_pipeline_factory():
+    """Selected pipeline options are validated and do not mutate defaults."""
+    native = BF16_942.load()
+    dma = importlib.import_module(native.__package__ + ".mha_pa_bf16_256_dma_942"
+                                  if native.__package__ else "mha_pa_bf16_256_dma_942")
+    options = dict(dma_query=False, dma_key="early", dma_value="early", early_pages=True,
+                   late_s4_wait=True, lead_wait=3, late_s0_wait=True, pv_columns=2,
+                   m0_offset=True, partial_k_wait=True, pv_s7_overlap=True)
+    for page in (32, 64, 128):
+        for persistent in (True, False):
+            order = 2 if persistent else 0
+            default = native.PagedAttention(24, 2, 256, 256, page, False, persistent=persistent)
+            original_launch = default._launch
+            selected = dma.PagedAttention(24, 2, 256, 256, page, False, persistent=persistent,
+                                           task_order=order, **options)
+            assert selected._launch is dma._launcher(False, 1, True, 1, True, True, True,
+                                                       3, True, 2, True, order, True, True)
+            assert selected is not default and selected._compiled is not default._compiled
+            assert default._launch is original_launch
+    invalid = (dict(lead_wait=True), dict(lead_wait=4), dict(pv_columns=3), dict(m0_offset=1),
+               dict(task_order=3), dict(partial_k_wait=1), dict(pv_s7_overlap=1))
+    for change in invalid:
+        with pytest.raises(ValueError):
+            dma.PagedAttention(24, 2, 256, 256, 64, False, **(options | change))
+    with pytest.raises(NotImplementedError):
+        dma.PagedAttention(24, 2, 256, 256, 64, False, persistent=False, task_order=2, **options)
+    for change in (dict(dma_query=True), dict(dma_key="off"), dict(dma_value="off"),
+                   dict(early_pages=False), dict(late_s4_wait=False), dict(pv_columns=0)):
+        with pytest.raises(NotImplementedError):
+            dma.PagedAttention(24, 2, 256, 256, 64, False, **(options | change))
+
+
 @pytest.mark.parametrize("variant", ("8wave", "persistent"))
 @pytest.mark.parametrize("dq", (128, 192))
 def test_bf16_mha(dq, variant):

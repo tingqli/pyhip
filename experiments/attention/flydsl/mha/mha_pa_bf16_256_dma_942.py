@@ -1,10 +1,13 @@
-"""Opt-in v48 experiment: gfx942 4-byte/lane direct-to-LDS for Q, K or V.
+"""gfx942 D256 DMA pipeline and explicit scheduling experiments.
 
-The public BF16 wrapper, M16 arithmetic, K XOR layout and 64-KiB allocation
-are unchanged. Default V uses GLOBAL; optional V DMA rebuilds a bounded
-descriptor at each tile's full 64-bit address. Q aliases LDS in prologue;
-K/V DMA only overwrite ranges whose readers in both groups have retired.
-No default backend is redirected by importing or constructing this module.
+The public BF16 wrapper explicitly selects the validated v73 combination.
+This module's own factory retains its original experimental defaults (V
+GLOBAL). Optional V DMA uses a full-64-bit tile base; m0_offset compensates
+that base before sharing M0 as the source offset and LDS destination.
+The opt-in v98 pipeline adds late/progressive waits, even-D32-first K WAR
+retirement, S7 PV/center overlap and persistent task order. M16 arithmetic,
+K XOR layout, 64-KiB allocation and public tensor ABI are unchanged.
+Importing or constructing an experiment does not mutate public defaults.
 """
 
 import functools
@@ -125,6 +128,12 @@ def _v_dma_soffset(packet, page_size):
     return (packet % 8 if page_size == 32 else packet) * 2048
 
 
+def _descriptor_words(address, extent):
+    bits = fx.Uint64(address)
+    return fx.Vector.from_elements([fx.Uint32(bits), fx.Uint32(bits >> 32) & fx.Uint32(0xFFFF),
+                                   fx.Uint32(extent), fx.Uint32(0x27000)], fx.Uint32)
+
+
 def _v_resources(base_address, page, second_page, tile, hk, page_size):
     def resource(address, extent):
         pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr"), _pin_s64(address).ir_value())
@@ -168,6 +177,60 @@ def _read_k_vdma(address, half, resources, storage, wave, voffset, page_size,
     fragment = fx.make_rmem_tensor(fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16)
     fragment.store(words.bitcast(fx.BFloat16))
     return fx.make_view(fx.get_iter(fragment), fx.make_layout((4, 2, 16), (1, 64, 4)))
+
+
+def _read_k_m0_vdma(address, resources, wave, page_size):
+    """Share m0 as V SOFFSET; shift each bounded descriptor down by 32 KiB.
+
+    With voffset=lane*4, base' + m0 + voffset is exactly the old V source.
+    PAGE32's second descriptor is shifted by 48 KiB to compensate packet8.
+    m0 still selects the unchanged LDS destination; no duplicate offset SALU.
+    """
+    # M0 is intentionally clobbered in this gfx942 leaf region (LLVM warns
+    # because it is reserved). Every packet sets M0 before using it, with a
+    # DS instruction providing hazard distance; subsequent intrinsic DMA
+    # must set M0 anew. Actual emitted code and zero-spill gates are required.
+    lane = _pin_i32((fx.Int32(gpu.thread_id("x")) & 63) * 4)
+    parts = []
+    for n in range(2):
+        for k in range(8):
+            packet = n * 8 + k
+            resource = resources[1] if page_size == 32 and packet >= 8 else resources[0]
+            parts.append(fx.Vector(llvm.inline_asm(ir.VectorType.get([4], fx.Int32.ir_type),
+                [address[n].ir_value(), resource.ir_value(), lane.ir_value(), fx.Int32(wave * 256).ir_value()],
+                f"s_add_u32 m0, $4, {K_BYTES + packet * 2048}\n"
+                f"ds_read_b128 $0, $1 offset:{k * (4 * K_PITCH)}\n"
+                "buffer_load_dword $3, $2, m0 offen lds",
+                "=&v,v,s,v,s,~{m0},~{scc},~{memory}", has_side_effects=True)))
+    words = fx.Vector.from_elements([part[i] for part in parts for i in range(4)], fx.Int32)
+    frag = fx.make_rmem_tensor(fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16)
+    frag.store(words.bitcast(fx.BFloat16))
+    return fx.make_view(fx.get_iter(frag), fx.make_layout((4, 2, 16), (1, 64, 4)))
+
+
+def _m0_v_resources(base_address, page, second_page, tile, hk, page_size):
+    first_address = base_address + _v_tile_byte_offset(fx.Int64(page), fx.Int64(tile), hk, page_size)
+    first = _descriptor_words(_pin_s64(first_address - K_BYTES), K_BYTES + min(page_size, BN) * D * 2)
+    if page_size == 32:
+        second_address = base_address + _v_tile_byte_offset(fx.Int64(second_page), fx.Int64(tile), hk, page_size)
+        second = _descriptor_words(_pin_s64(second_address - K_BYTES - 16384), LDS_BYTES)
+    else:
+        second = first
+    return first, second
+
+
+def _read_k_leading_first(address):
+    # Leading DMA waves0..3 overwrite only even D32 planes. Retire both N16
+    # reads of those planes before exposing the eight odd-plane reads.
+    parts = {}
+    for parity in range(2):
+        for n in range(2):
+            for k in range(parity, 8, 2):
+                parts[n, k] = _read_address(address[n], 512 + k * (4 * K_PITCH))
+    words = fx.Vector.from_elements([parts[n, k][i] for n in range(2) for k in range(8) for i in range(4)], fx.Int32)
+    frag = fx.make_rmem_tensor(fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16)
+    frag.store(words.bitcast(fx.BFloat16))
+    return fx.make_view(fx.get_iter(frag), fx.make_layout((4, 2, 16), (1, 64, 4)))
 
 
 def _read_k_write_dma(address, publish_address, pending, resource, storage, wave,
@@ -215,14 +278,73 @@ def _read_v_dma(address, half, resource, storage, wave, voffset, page, second_pa
     return frag
 
 
+def _pv_progressive(probabilities, values, output, columns):
+    """Consume oldest V packets without waiting for the entire LDS read train.
+
+    There are sixteen ordered DS reads, two per N16 output. Only S4 or the
+    leading S6 can enter here with outstanding reads; no SMEM is outstanding.
+    Each group waits for ALL packets used by its MFMAs. The final group waits
+    for zero before the scalar cross-row results or next rendezvous are used.
+    """
+    aa, bb = values.load(), fx.Vector(probabilities)
+    acc = [fx.Vector.from_elements([output[n * 4 + i] for i in range(4)], fx.Float32)
+           for n in range(8)]
+    for first in range(0, 8, columns):
+        _wait(lgkmcnt=16 - (first + columns) * 2)
+        rocdl.sched_barrier(0)
+        for step in range(4):
+            b = fx.Vector.from_elements([bb[step * 4 + i] for i in range(4)], fx.BFloat16)
+            for n in range(first, first + columns):
+                a = fx.Vector.from_elements([aa[n * 16 + step * 4 + i] for i in range(4)], fx.BFloat16)
+                acc[n] = fx.Vector(rocdl.mfma_f32_16x16x16bf16_1k(ir.VectorType.get([4], fx.Float32.ir_type),
+                    [a.bitcast(fx.Int16).ir_value(), b.bitcast(fx.Int16).ir_value(), acc[n].ir_value(), 0, 0, 0]))
+        rocdl.sched_barrier(0)
+    return fx.Vector.from_elements([acc[n][i] for n in range(8) for i in range(4)], fx.Float32)
+
+
+def _pv_step(probabilities, values, acc, first, columns):
+    aa, bb = values.load(), fx.Vector(probabilities)
+    for step in range(4):
+        b = fx.Vector.from_elements([bb[step * 4 + i] for i in range(4)], fx.BFloat16)
+        for n in range(first, first + columns):
+            a = fx.Vector.from_elements([aa[n * 16 + step * 4 + i] for i in range(4)], fx.BFloat16)
+            acc[n] = fx.Vector(rocdl.mfma_f32_16x16x16bf16_1k(ir.VectorType.get([4], fx.Float32.ir_type),
+                [a.bitcast(fx.Int16).ir_value(), b.bitcast(fx.Int16).ir_value(), acc[n].ir_value(), 0, 0, 0]))
+
+
+def _pv_s7(probabilities, values, output, current, candidate, maxima, scale, maximum):
+    acc = [fx.Vector.from_elements([output[n * 4 + i] for i in range(4)], fx.Float32) for n in range(8)]
+    centered = []
+    for first in range(0, 8, 2):
+        _wait(lgkmcnt=12 - first * 2)
+        rocdl.sched_barrier(0)
+        _pv_step(probabilities, values, acc, first, 2)
+        if first == 0:
+            candidate = _maximum(_maximum(candidate, maxima[0]), _maximum(maxima[1], maxima[2])) * scale
+            predicate = candidate > maximum + 7.0
+            ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, predicate.ir_value()))
+            new_max = predicate.select(candidate + 1.0, maximum)
+        for i in range(first * 2, first * 2 + 4):
+            centered.append(fx.Float32(llvm.inline_asm(fx.Float32.ir_type,
+                [current[i].ir_value(), scale.ir_value(), new_max.ir_value()],
+                "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False)))
+        _schedule(8, 2, 13 + first)
+        rocdl.sched_barrier(0)
+    return (fx.Vector.from_elements([acc[n][i] for n in range(8) for i in range(4)], fx.Float32),
+            fx.Vector.from_elements(centered, fx.Float32), new_max, ballot)
+
+
 @flyc.jit
 def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
           H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], PAGE: fx.Constexpr[int],
           CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
           SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool],
           Q_DMA: fx.Constexpr[bool], K_DMA: fx.Constexpr[int], INTERLEAVE: fx.Constexpr[bool],
-            V_DMA: fx.Constexpr[int], V_INTERLEAVE: fx.Constexpr[bool],
-            EARLY_PAGES: fx.Constexpr[bool], LATE_S4_WAIT: fx.Constexpr[bool]):
+          V_DMA: fx.Constexpr[int], V_INTERLEAVE: fx.Constexpr[bool],
+          EARLY_PAGES: fx.Constexpr[bool], LATE_S4_WAIT: fx.Constexpr[bool],
+          LEAD_WAIT: fx.Constexpr[int], LATE_S0_WAIT: fx.Constexpr[bool],
+          PV_COLUMNS: fx.Constexpr[int], M0_OFFSET: fx.Constexpr[bool],
+          PARTIAL_K_WAIT: fx.Constexpr[bool], PV_S7_OVERLAP: fx.Constexpr[bool]):
     read_k, read_v, write = base._read_k, base._read_v, base._write
     load_k, load_v, qk, pv = base._load_k, base._load_v, base._qk, base._pv
     local_sum, local_max, cross = base._sum, base._max, base._cross
@@ -231,6 +353,10 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     pages_for_tile, dma_k, read_v_dma = base._pages, _dma_k, _read_v_dma
     read_k_write_dma = _read_k_write_dma
     v_resources, dma_v, read_k_vdma = _v_resources, _dma_v, _read_k_vdma
+    pv_progressive = _pv_progressive
+    m0_v_resources, read_k_m0_vdma = _m0_v_resources, _read_k_m0_vdma
+    read_k_leading_first = _read_k_leading_first
+    pv_s7 = _pv_s7
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -342,7 +468,10 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
             # Issue page lookahead before the DS/DMA train, but do not read
             # or copy its asynchronous scalar result until the S0 tail.
             request, request1 = pages_for_tile(table, t + 2, last, kv_len, PAGE)
-        if fx.const_expr(V_DMA == 1 or V_DMA == 2):
+        if fx.const_expr(M0_OFFSET):
+            resources = m0_v_resources(vbase, previous_page, previous_page1, t - 1, HK, PAGE)
+            k = read_k_m0_vdma(kr, resources, wave, PAGE)
+        elif fx.const_expr(V_DMA == 1 or V_DMA == 2):
             resources = v_resources(vbase, previous_page, previous_page1, t - 1, HK, PAGE)
             k = read_k_vdma(kr, 0, resources, storage, wave, vd, PAGE, 0,
                             16 if V_DMA == 1 else 8, V_INTERLEAVE)
@@ -356,17 +485,26 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
             vp = load_v(vbase, vlane, current_page, t, HK, PAGE, current_page1)
         if fx.const_expr(not EARLY_PAGES):
             request, request1 = pages_for_tile(table, t + 2, last, kv_len, PAGE)
+        if fx.const_expr(LATE_S0_WAIT):
+            # Neither K-low nor the future page is consumed by the partner
+            # at this rendezvous; K overwrite remains protected by S2.
+            _stage_end()
         future_page = _page_ready(request)
         if fx.const_expr(EARLY_PAGES and PAGE != 32):
             future_page1 = future_page
         else:
             future_page1 = _page_ready(request1)
-        _stage_end()
+        if fx.const_expr(LATE_S0_WAIT):
+            rocdl.sched_barrier(0)
+        else:
+            _stage_end()
         lo = qk(q, k)
         previous = exps(previous)
         _schedule(32, 1, 1, True)
         _stage_end()
-        if fx.const_expr(V_DMA == 2 or V_DMA == 3):
+        if fx.const_expr(STAGGER and PARTIAL_K_WAIT):
+            k = read_k_leading_first(kr)
+        elif fx.const_expr(V_DMA == 2 or V_DMA == 3):
             resources = v_resources(vbase, previous_page, previous_page1, t - 1, HK, PAGE)
             k = read_k_vdma(kr, 1, resources, storage, wave, vd, PAGE,
                             8 if V_DMA == 2 else 0, 8 if V_DMA == 2 else 16, V_INTERLEAVE)
@@ -379,15 +517,25 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
             # Retire this group's V DMA by S2. Leading S3 pairs with trailing
             # S2, so the leading S4 V consumer sees both groups' completed DMA.
             _wait(vmcnt=0)
-        _wait(lgkmcnt=0)
+        if fx.const_expr(STAGGER and PARTIAL_K_WAIT):
+            _wait(lgkmcnt=8)
+        elif fx.const_expr(STAGGER or not (LEAD_WAIT & 1)):
+            _wait(lgkmcnt=0)
         _stage_end()
+        if fx.const_expr((not STAGGER and (LEAD_WAIT & 1)) or (STAGGER and PARTIAL_K_WAIT)):
+            # Leading S2 pairs with trailing S1, not an overwrite. The
+            # trailing S2 pre-barrier wait protects leading S4 K DMA;
+            # partial K waits retire even D32 planes there, then drain here.
+            _wait(lgkmcnt=0)
+            rocdl.sched_barrier(0)
         hi = qk(q, k)
         total = local_sum(previous)
         p = pack(previous)
         _schedule(32, 3, 2)
         _stage_end()
         # The leading group's S3 barrier pairs with the trailing group's
-        # S2 (K-high read + lgkmcnt(0)). Therefore S4 is safe to overwrite K.
+        # S2 K-high retirement (even D32 first for partial K waits).
+        # Therefore S4 is safe for the leading group's K DMA.
         sums = cross(total, cross_addresses)
         if fx.const_expr(K_DMA == 1 or K_DMA == 2):
             v = read_v_dma(vr, 0, gk, storage, wave, kd, next_page, next_page1,
@@ -402,12 +550,15 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         if fx.const_expr(not LATE_S4_WAIT):
             _wait(lgkmcnt=0)
         _stage_end()
-        if fx.const_expr(LATE_S4_WAIT):
+        if fx.const_expr(LATE_S4_WAIT and not PV_COLUMNS):
             # This rendezvous does not release a V overwrite. S6 retirement
             # still protects the next S0 DMA; wait before any PV/sum consumer.
             _wait(lgkmcnt=0)
             rocdl.sched_barrier(0)
-        o0 = pv(p, v, o0)
+        if fx.const_expr(PV_COLUMNS):
+            o0 = pv_progressive(p, v, o0, PV_COLUMNS)
+        else:
+            o0 = pv(p, v, o0)
         row_sum = row_sum + ((total + sums[0]) + (sums[1] + sums[2]))
         current = mask(_join(lo, hi), t, row, q_len, kv_len, CAUSAL)
         candidate = local_max(current)
@@ -426,14 +577,26 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
             v = read_v(vr, 1, kw, kp)
         # Each group drains its DMA before the S6 rendezvous; the leading
         # next-S0 reader starts only after the trailing group's S6 has ended.
-        _wait(lgkmcnt=0)
+        if fx.const_expr(STAGGER or not (LEAD_WAIT & 2)):
+            _wait(lgkmcnt=0)
         _stage_end()
-        o1 = pv(p, v, o1)
-        candidate = _maximum(_maximum(candidate, maxima[0]), _maximum(maxima[1], maxima[2])) * scale
-        ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > maximum + 7.0).ir_value()))
-        new_max = (candidate > maximum + 7.0).select(candidate + 1.0, maximum)
-        current = center(current, scale, new_max)
-        _schedule(32, 3, 4)
+        if fx.const_expr(not STAGGER and (LEAD_WAIT & 2) and not PV_COLUMNS):
+            # Leading S6 pairs with trailing S5. The trailing S6 wait is
+            # deliberately unchanged: it retires V reads before next S0 DMA.
+            _wait(lgkmcnt=0)
+            rocdl.sched_barrier(0)
+        if fx.const_expr(not STAGGER and PV_S7_OVERLAP):
+            o1, current, new_max, ballot = pv_s7(p, v, o1, current, candidate, maxima, scale, maximum)
+        elif fx.const_expr(not STAGGER and PV_COLUMNS):
+            o1 = pv_progressive(p, v, o1, PV_COLUMNS)
+        else:
+            o1 = pv(p, v, o1)
+        if fx.const_expr(not (not STAGGER and PV_S7_OVERLAP)):
+            candidate = _maximum(_maximum(candidate, maxima[0]), _maximum(maxima[1], maxima[2])) * scale
+            ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > maximum + 7.0).ir_value()))
+            new_max = (candidate > maximum + 7.0).select(candidate + 1.0, maximum)
+            current = center(current, scale, new_max)
+            _schedule(32, 3, 4)
         o0, o1, row_sum = rescale(o0, o1, row_sum, maximum, new_max, ballot)
         new_max = advance_max(maximum, new_max)
         _stage_end()
@@ -521,8 +684,11 @@ def _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch
           H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], PAGE: fx.Constexpr[int],
           CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
           Q_DMA: fx.Constexpr[bool], K_DMA: fx.Constexpr[int], INTERLEAVE: fx.Constexpr[bool],
-            V_DMA: fx.Constexpr[int], V_INTERLEAVE: fx.Constexpr[bool],
-            EARLY_PAGES: fx.Constexpr[bool], LATE_S4_WAIT: fx.Constexpr[bool]):
+          V_DMA: fx.Constexpr[int], V_INTERLEAVE: fx.Constexpr[bool],
+          EARLY_PAGES: fx.Constexpr[bool], LATE_S4_WAIT: fx.Constexpr[bool],
+          LEAD_WAIT: fx.Constexpr[int], LATE_S0_WAIT: fx.Constexpr[bool],
+          PV_COLUMNS: fx.Constexpr[int], M0_OFFSET: fx.Constexpr[bool],
+          PARTIAL_K_WAIT: fx.Constexpr[bool], PV_S7_OVERLAP: fx.Constexpr[bool]):
     body = _body
     q0 = _uniform(CQ[batch])
     q_len = _uniform(CQ[batch + 1]) - q0
@@ -535,11 +701,13 @@ def _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch
         if group != 0:
             body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
                  H, HK, NP, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, True, Q_DMA, K_DMA, INTERLEAVE,
-                 V_DMA, V_INTERLEAVE, EARLY_PAGES, LATE_S4_WAIT)
+                 V_DMA, V_INTERLEAVE, EARLY_PAGES, LATE_S4_WAIT,
+                 LEAD_WAIT, LATE_S0_WAIT, PV_COLUMNS, M0_OFFSET, PARTIAL_K_WAIT, PV_S7_OVERLAP)
         else:
             body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
                  H, HK, NP, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, False, Q_DMA, K_DMA, INTERLEAVE,
-                 V_DMA, V_INTERLEAVE, EARLY_PAGES, LATE_S4_WAIT)
+                 V_DMA, V_INTERLEAVE, EARLY_PAGES, LATE_S4_WAIT,
+                 LEAD_WAIT, LATE_S0_WAIT, PV_COLUMNS, M0_OFFSET, PARTIAL_K_WAIT, PV_S7_OVERLAP)
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -551,26 +719,42 @@ def _attention_256_dma_kernel_942(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: f
     PERSISTENT: fx.Constexpr[bool], CUS: fx.Constexpr[int],
     Q_DMA: fx.Constexpr[bool], K_DMA: fx.Constexpr[int], INTERLEAVE: fx.Constexpr[bool],
     V_DMA: fx.Constexpr[int], V_INTERLEAVE: fx.Constexpr[bool],
-    EARLY_PAGES: fx.Constexpr[bool], LATE_S4_WAIT: fx.Constexpr[bool]):
+    EARLY_PAGES: fx.Constexpr[bool], LATE_S4_WAIT: fx.Constexpr[bool],
+    LEAD_WAIT: fx.Constexpr[int], LATE_S0_WAIT: fx.Constexpr[bool], PV_COLUMNS: fx.Constexpr[int],
+    M0_OFFSET: fx.Constexpr[bool], TASK_ORDER: fx.Constexpr[int],
+    PARTIAL_K_WAIT: fx.Constexpr[bool], PV_S7_OVERLAP: fx.Constexpr[bool]):
     work_body = _work
     storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, LDS_BYTES, 16]).peek().view(fx.make_layout(LDS_BYTES, 1))
     if fx.const_expr(PERSISTENT):
         work = fx.Int32(gpu.block_id("x"))
         while work < H * B * ((MAX_Q + BM - 1) // BM):
-            head, batch, qb = work % H, (work // H) % B, work // (H * B)
+            if fx.const_expr(TASK_ORDER == 1):
+                query_blocks = (MAX_Q + BM - 1) // BM
+                head, batch, qb = work // (B * query_blocks), (work // query_blocks) % B, work % query_blocks
+            elif fx.const_expr(TASK_ORDER > 1):
+                total = H * B * ((MAX_Q + BM - 1) // BM)
+                columns = total // TASK_ORDER
+                mapped = (work < columns * TASK_ORDER).select((work % TASK_ORDER) * columns + work // TASK_ORDER, work)
+                head, batch, qb = mapped % H, (mapped // H) % B, mapped // (H * B)
+            else:
+                head, batch, qb = work % H, (work // H) % B, work // (H * B)
             work_body(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch, qb,
                       H, HK, NP, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, Q_DMA, K_DMA, INTERLEAVE,
-                      V_DMA, V_INTERLEAVE, EARLY_PAGES, LATE_S4_WAIT)
+                      V_DMA, V_INTERLEAVE, EARLY_PAGES, LATE_S4_WAIT,
+                      LEAD_WAIT, LATE_S0_WAIT, PV_COLUMNS, M0_OFFSET, PARTIAL_K_WAIT, PV_S7_OVERLAP)
             work = work + CUS
     else:
         work_body(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage,
                   fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")), fx.Int32(gpu.block_id("z")),
                   H, HK, NP, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, Q_DMA, K_DMA, INTERLEAVE,
-                  V_DMA, V_INTERLEAVE, EARLY_PAGES, LATE_S4_WAIT)
+                  V_DMA, V_INTERLEAVE, EARLY_PAGES, LATE_S4_WAIT,
+                  LEAD_WAIT, LATE_S0_WAIT, PV_COLUMNS, M0_OFFSET, PARTIAL_K_WAIT, PV_S7_OVERLAP)
 
 
 @functools.cache
-def _launcher(q_dma, k_dma, interleave, v_dma, v_interleave, early_pages, late_s4_wait):
+def _launcher(q_dma, k_dma, interleave, v_dma, v_interleave, early_pages, late_s4_wait,
+              lead_wait=0, late_s0_wait=False, pv_columns=0, m0_offset=False,
+              task_order=0, partial_k_wait=False, pv_s7_overlap=False):
     @flyc.jit
     def launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
         CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor,
@@ -583,6 +767,7 @@ def _launcher(q_dma, k_dma, interleave, v_dma, v_interleave, early_pages, late_s
         _attention_256_dma_kernel_942(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS,
             H, HK, NP, B, MAX_Q, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, PERSISTENT, CUS,
             q_dma, k_dma, interleave, v_dma, v_interleave, early_pages, late_s4_wait,
+            lead_wait, late_s0_wait, pv_columns, m0_offset, task_order, partial_k_wait, pv_s7_overlap,
             value_attrs={"rocdl.waves_per_eu": 2, "passthrough": [["target-features", "-packed-fp32-ops"]]},
         ).launch(grid=grid, block=(THREADS, 1, 1), stream=stream)
     return launch
@@ -594,7 +779,9 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
                    window_left=-1, has_sink=False, *, memory_mode="lds", persistent=None,
                    dma_query=True, dma_key="early", interleave=True,
                    dma_value="off", value_interleave=True,
-                   early_pages=False, late_s4_wait=False):
+                   early_pages=False, late_s4_wait=False,
+                   lead_wait=0, late_s0_wait=False, pv_columns=0, m0_offset=False,
+                   task_order=0, partial_k_wait=False, pv_s7_overlap=False):
     validated = _validate_factory(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size,
         is_causal, quant_query_mode, key_layout, window_left, has_sink,
         memory_mode=memory_mode, persistent=persistent)
@@ -612,13 +799,53 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
         raise NotImplementedError("V DMA and the V-register write_mix diagnostic are separate experiments")
     if not isinstance(early_pages, bool) or not isinstance(late_s4_wait, bool):
         raise ValueError("early_pages and late_s4_wait must be bool")
+    if type(lead_wait) is not int or lead_wait not in range(4) or not isinstance(late_s0_wait, bool):
+        raise ValueError("lead_wait must be an integer in 0..3 and late_s0_wait must be bool")
+    if (lead_wait or late_s0_wait) and not (early_pages and late_s4_wait):
+        raise NotImplementedError("wait trials require the v73 page/S4 combination")
+    if type(pv_columns) is not int or pv_columns not in (0, 1, 2, 4, 8):
+        raise ValueError("pv_columns must be 0, 1, 2, 4 or 8")
+    if pv_columns and not (early_pages and late_s4_wait and (lead_wait & 2)):
+        raise NotImplementedError("progressive PV requires v73 and leading S6 late wait")
+    if not isinstance(m0_offset, bool):
+        raise ValueError("m0_offset must be bool")
+    if m0_offset and not (early_pages and late_s4_wait):
+        raise NotImplementedError("V m0 offset requires the v73 page/S4 combination")
+    if type(task_order) is not int or task_order not in (0, 1, 2, 4, 8, 16):
+        raise ValueError("task_order must be 0, 1, 2, 4, 8 or 16")
+    if task_order and not validated.persistent:
+        raise NotImplementedError("task_order requires persistent scheduling")
+    if not isinstance(partial_k_wait, bool):
+        raise ValueError("partial_k_wait must be bool")
+    if partial_k_wait and not (early_pages and late_s4_wait and pv_columns and lead_wait == 3):
+        raise NotImplementedError("partial K wait requires v73/PV progression and late leading waits")
+    if not isinstance(pv_s7_overlap, bool):
+        raise ValueError("pv_s7_overlap must be bool")
+    if pv_s7_overlap and not (early_pages and late_s4_wait and late_s0_wait and pv_columns and lead_wait == 3):
+        raise NotImplementedError("S7 PV overlap requires the selected progressive-PV combination")
     if (early_pages or late_s4_wait) and (dma_query or dma_key != "early" or dma_value != "early"):
         raise NotImplementedError("memory-stage diagnostics require Q DMA off and K/V DMA early")
     kernel = _PagedAttention(num_qo_heads, num_kv_heads, D, D, page_size,
                              is_causal, quant_query_mode, validated.persistent)
     kernel._launch = _launcher(dma_query, modes[dma_key], interleave, v_modes[dma_value], value_interleave,
                                early_pages, late_s4_wait)
+    if lead_wait or late_s0_wait or pv_columns or m0_offset or task_order or partial_k_wait or pv_s7_overlap:
+        kernel._launch = _launcher(dma_query, modes[dma_key], interleave, v_modes[dma_value], value_interleave,
+                                   early_pages, late_s4_wait, lead_wait, late_s0_wait, pv_columns,
+                                   m0_offset, task_order, partial_k_wait, pv_s7_overlap)
     kernel.bf16_backend = f"native-m16-dma4-q{int(dma_query)}-k{dma_key}-v{dma_value}-interleave{int(interleave)}-{int(value_interleave)}"
     if early_pages or late_s4_wait:
         kernel.bf16_backend += f"-pages{int(early_pages)}-lateS4{int(late_s4_wait)}"
+    if lead_wait or late_s0_wait:
+        kernel.bf16_backend += f"-leadwait{lead_wait}-lateS0{int(late_s0_wait)}"
+    if pv_columns:
+        kernel.bf16_backend += f"-pvcolumns{pv_columns}"
+    if m0_offset:
+        kernel.bf16_backend += f"-m0offset{int(m0_offset)}"
+    if task_order:
+        kernel.bf16_backend += f"-taskorder{task_order}"
+    if partial_k_wait:
+        kernel.bf16_backend += "-partialkwait"
+    if pv_s7_overlap:
+        kernel.bf16_backend += "-pvs7overlap"
     return kernel

@@ -1,7 +1,9 @@
 # BF16 DQ=DV=256 优化记录
 
 > 当前默认：按用户要求启用**v73 K+V DMA＋页表提前/ready合并＋S4 LGKM后移**组合，
-> Q不做DMA；两种调度及page32/64/128均沿用公开入口。**220 TFLOPS 尚未达到**。
+> Q不做DMA；两种调度及page32/64/128均沿用公开入口。2026-09-23新目标为 **230 TFLOPS，尚未达到**。
+> 本轮v74–99探索候选约221.5T；正式50样本遇到共同变速，配对中位改善3.85%，但全量中位验收未通过。
+> 保留v98为显式可选流水线，**不替换v73默认、不声称230T达标**。
 > 下述方案48成绩为历史完整验收，不是新默认成绩：
 > BM128/BN64、8wave、M16、64KiB LDS，GPU2 Full的50样本中位数为
 > **189.626T / 189.319T**（persistent/grid），Short-p64为193.899T / 193.575T。
@@ -845,3 +847,120 @@ Full Q10240/KV2583/page64，GPU2/BDF `0000:a4:00.0`，2buffer×2round=4样本/�
 	同步[README.md](README.md)及本优化记录；DMA设备源码未改。
 	另新增[默认验收驱动](results/d256_default_20260923/validate.py)、[交付说明/文件清单](results/d256_default_20260923/README.md)
 	及本次验证证据，未提交/推送Git。
+
+## 2026-09-23：继续优化，目标提高到230 TFLOPS（v74–98）
+
+- 沿用Full：Q10240/KV2583、DQ=DV256、H24/HK2、page64，完整调用有效工作量650033233920 FLOPs。
+	达到230T需时延不超过2826.231µs；不改变FP32 `.02`、LSE `.002`、概率half-up或输出RNE。
+- GPU2 / `0000:a4:00.0`，原生JIT缓存启用，gfx/UMC严格小于3%、VRAM不超过20%、PTL Enabled/VECTOR,F8；
+	低负载非独占，未修改GPU频率/功率/PTL/NUMA，未使用PMC。所有raw、失败和编译源码快照保留。
+- 本轮每项探索为同场2独立buffer×2轮、每候选4事件、正反顺序交替；原timer不变。
+	v73显式对照Full ELF一直为`d9294dfc824afe4738eb076093430148fa0678ffefb1d2ce143e766842a0f26c`，
+	不能再把旧脚本调用公共入口的`v48`标签当成v48执行；新驱动禁止该标签。
+
+### 探索记录（均为4样本，不是50样本验收）
+
+| 轮次 | 假设与结果 | 同轮v73 / 候选TFLOPS | 证据 |
+|---|---|---:|---|
+| v74 | S0等待跨barrier；仅领先S2/S6后移，落后WAR等待不动 | 212.906 / 216.073 | [六路等待](results/d256_pipeline230_20260923/v74-waits-full.json) |
+| v75 | S4、领先S6的V操作数按N32逐批等LGKM12/8/4/0，其他数学不变 | 212.993 / 217.535 | [PV宽度](results/d256_pipeline230_20260923/v75-pv-full.json) |
+| v76–77 | M0→已有DS→DMA填hazard间隔，K-only约217.7；QK分批等待退化 | 212.940 / 217.700 | [QK与fused-K](results/d256_pipeline230_20260923/v77-qk-full.json) |
+| v78 | 退休当前操作数后提前读下一半K/V，虽无spill但争用/调度成本增加 | 213.264 / 186.076、201.697、173.666 | [prefetch](results/d256_pipeline230_20260923/v78-prefetch-full.json) |
+| v79 | 免LDS输出64/128位，不如原coalesced CShuffle | 213.272 / 212.724、213.536 | [直接输出](results/d256_pipeline230_20260923/v79-output-full.json) |
+| v80、v87 | QK双链与scheduler mask调整均未优于已有组合 | 212.732 / 219.202以下 | [正确mask对照](results/d256_pipeline230_20260923/v87-schedmask-full.json) |
+| v81 | DMA立即数误当只偏移GLOBAL，精度失败，未计时 | 无候选成绩 | [原失败](results/d256_pipeline230_20260923/v81-immediate-full.json) |
+| v82 | 成对删非数据handoff barrier，正确但失去有益错相 | 212.736 / 211.492、214.965、198.517 | [同步精简](results/d256_pipeline230_20260923/v82-prune-full.json) |
+| v83 | V descriptor基址减32KiB，M0兼作SOFFSET，省每packet独立偏移SALU | 213.092 / 218.883 | [V M0](results/d256_pipeline230_20260923/v83-m0-full.json) |
+| v84 | query-block优先或有效前缀转置，不改输出/算术 | 212.519 / 219.847、219.643 | [任务序列](results/d256_pipeline230_20260923/v84-task-full.json) |
+| v85 | page64 K也共用M0，增加descriptor/live range后不如V-only | 212.723 / 217.861 | [K M0](results/d256_pipeline230_20260923/v85-m0-kv-full.json) |
+| v86 | 页请求移S2以允许S0非零LGKM，QK/EXP重排退化 | 212.730 / 215.159 | [S0 progression](results/d256_pipeline230_20260923/v86-s0progress-full.json) |
+| v88 | CShuffle用32/64KiB平面减少尾部同步，32KiB仅小幅 | 212.877 / 219.979、218.540 | [输出平面](results/d256_pipeline230_20260923/v88-outputplane-full.json) |
+| v89 | 领先K/V半发布移入compute使落后等待可后移，正确但减慢 | 212.574 / 211.453、205.360、199.047 | [分半发布](results/d256_pipeline230_20260923/v89-publication-full.json) |
+| v90–91 | **K偶D32面先读，落后S2在交接前只等LGKM8，消费前归零** | 212.636 / 221.167 | [部分WAR](results/d256_pipeline230_20260923/v91-war-overlap-full.json) |
+| v92 | 领先S7每8MFMA内穿插max/center，保持逐输出关联顺序 | 212.417 / 221.603 | [compute overlap](results/d256_pipeline230_20260923/v92-compute-full.json) |
+| v93 | compute `s_setprio`1/3，仅wave仲裁，均退化 | 212.721 / 218.507、218.193 | [priority](results/d256_pipeline230_20260923/v93-priority-full.json) |
+| v94 | 部分WAR后QK逐packet等待，额外调度开销抵消 | 213.081 / 219.201 | [K stream](results/d256_pipeline230_20260923/v94-warstream-full.json) |
+| v95–96 | 最后组合：32KiB输出无收益；order1/order2近似；PV2保留 | 212.873 / 221.421、221.523 | [组合](results/d256_pipeline230_20260923/v95-combo-full.json) |
+| v97 | 修正DMA立即数同时偏移LDS，M0相减后精度通过，但不如V M0 | 213.042 / 217.368、217.048 | [立即数修正](results/d256_pipeline230_20260923/v97-immediate-corrected-full.json) |
+
+- v79两次copy谓词接口编译失败已保留；修为bounded-buffer屏蔽后才进行计时，未放宽检查。
+- `sched_barrier(mask)`中的mask是**允许跨越**的类型，不是阻止的类型；v87按文档另测，未篡改早期记录。
+- GFX9 DMA的立即数同时加到GLOBAL及LDS，v81遗漏LDS补偿，v97已修复并验证；拒绝把失败版本留作可调用分支。
+- v90 [逐字节WAR证明](results/d256_pipeline230_20260923/v90-war-proof.json)：领先wave0–3 K DMA仅写偶D32面；
+	将受威胁的8次read先发、LGKM8退休后才能放行，剩余8次read与领先写集合不相交。落后组消费前仍LGKM0。
+	V对应部分等待虽然也有不相交证明，但实测退化，没有采纳。所有CTA barrier保留。
+
+### 当前候选ATT及收敛验证
+
+- 只采一次qfast ATT（**不是最终部分K/PV7组合trace**），实际ELF
+	`0d670f61ead38a8cda35dbc41408ac3b10d22ede54141b7b3f35b9fae5e5bb98`；
+	[前后原参考/第2、3、4次逐位重复](results/d256_pipeline230_20260923/att-qfast/driver-result.json)通过。
+	[独立审计](results/d256_pipeline230_20260923/att-qfast/analysis.json)：8完整驻留波、3,711,632条动态指令，
+	全部code-map/CSV命中一致，1,007,616 MFMA不变。UI和原ATT保留在该独立证据目录，未覆盖旧UI。
+- 全8波×24任务×tile5…36窗口，领先S0后LGKM中位100cycle；落后S2/S6末LGKM中位148cycle。
+	PV渐进12/8/4/0等待各4cycle。只是本采集的wave跨度，不求和当作整卡耗时，也不由此断言bank冲突。
+- [初步离线审计](results/d256_pipeline230_20260923/preliminary-audit.json)核对37份当时已完成报告，
+	含全部失败；V M0地址54组（含32位进位）、有效前缀转置8196组CPU证明通过。
+- v98清理未采纳分支，只保留等待后移、PV progression、V M0、任务序列、部分K WAR和S7 overlap；
+	原Q/K/V DMA诊断入口保留。[清理后Full](results/d256_pipeline230_20260923/v98-clean-full.json)原参考、
+	两buffer/v73逐位一致均通过，ELF与清理前相同：order2
+	`774d2eaba3e4726e2d2ece80ea1b52ac7a9b21d7a01ae44cbab0caf5a224c889`，
+	order1 `ee9715acaf68c91aaea9658250de4ff65c045be7aff453e352b47c88b6f3ad05`。
+	Full资源VGPR224/SGPR92、LDS65536、AGPR/private/spills0。
+- [完整功能验收](results/d256_pipeline230_20260923/v98-functional.json) **26项记录全部通过**，
+	包含两调度、三页、ragged/空Q/前缀/scales/NaN-tail、causal/full、O/LSE、两项stream/graph。
+	[定向重缩放验收](results/d256_pipeline230_20260923/rescale-check.json)另 **12项通过**：递增logit强制触发lazy-rescale，
+	两个O半部及LSE仍通过原容差、两次逐位重复和v73逐位对照。
+- [factory回归](results/d256_pipeline230_20260923/v98-factory.xml)2项通过、51项未选择；
+	其中新增流水线选项类型/同步前提/缓存隔离回归，公共默认回归不变。未重新运行整个D128/D192 GPU矩阵。
+
+### v98正式150事件验收与未达标结论
+
+[原始50样本/候选](results/d256_pipeline230_20260923/v98-full-50.json)，10个独立buffer×5轮，
+3候选共150事件；每buffer原FP32和两次逐位重复/v73一致检查全部通过。
+最大acc均`2.7790490331192075e-6`。保留每个startup/慢尾，不以较快轮次替换全量中位数。
+
+| 候选 | 全量中位µs | 全量TFLOPS | 全中位比/v73 | 同round/buffer配对比中位 |
+|---|---:|---:|---:|---:|
+| v73默认 | 4064.386 | 159.934 | 1.000000 | 1.000000 |
+| v98，order2 | 4097.646 | 158.636 | 0.991883 | **1.038459** |
+| v98，order1 | 4174.227 | 155.725 | 0.973686 | **1.039051** |
+
+- v73各轮中位3050.799 / 3053.159 / 4064.386 / 4521.868 / 4524.369µs；
+	order2各轮2941.039 / 2942.279 / 4097.646 / 4355.227 / 4350.488µs。
+	全中位跨过共同变速的第3轮，不能把它与配对比混为同一统计量。
+- 四个只读SMI请求区间与timer wrapper分别重叠56/46/41/10次，gfx有效时钟范围
+	1734–1740 → 1373–1377 → 1229–1233 → 1383–1390MHz，socket451/372/333/217W。
+	最后一份是覆盖收尾的请求区间，不是最后每个kernel的确定运行频率；throttle_status为N/A，具体降速原因未证明。
+- entry/prepared/sampling/exit gfx0/0/2/0，UMC均0，VRAM最多5.5679%，PTL一直Enabled/VECTOR,F8。
+	门禁通过不等于固定运行频率或全程独占。
+- **230T未达成；正式全样本中位也未证明候选优于v73。** 因此公共默认保持v73，
+	v98作为有配对改善证据的显式可选实现保留，不用探索221T宣称稳定成绩。
+- 正式验收后新增唯一v99假设：V每2条/K每4条DMA共用M0，利用立即数同时补偿两端地址；
+	同场v73 212.681T、v98 220.825T、batch V/K/KV 219.768/219.100/218.647T，未改善，删除该可执行分支。
+	[v99证据](results/d256_pipeline230_20260923/v99-dmabatch-full.json)全部保留，不是丢弃正式慢轮后重试达标。
+- 最终[交付说明](results/d256_pipeline230_20260923/README.md)记录可选参数、文件和证据。
+	本轮未修改public wrapper、v48共享算术或原timer；未stage/commit/push，旧ATT/UI和其他工作区文件保留。
+- [最终独立审计](results/d256_pipeline230_20260923/final-audit.json)40份报告全部核对通过；
+	当前DMA源SHA`c260fca5fbf4dc4bc07195d8f676c1c5e499d093dbc3e11a02866c454bb599b4`，
+	仅最后模块说明/注释与正式源不同，设备AST相同；[最后factory回归](results/d256_pipeline230_20260923/final-factory.xml)2通过。
+
+## 2026-09-24：v98最快候选身份复核与ATT采集
+
+- 按用户“v98是最快的版本吗，如果是采集att”复核现有v95/v98/v99原始样本：
+	v98为本轮最快保留候选组，order1/order2接近；order2探索221.523T，正式配对比1.038459。
+	正式全量中位未胜v73，不称稳定最快或230T达标。未重跑性能，默认仍v73。
+- 新采集**v98 persistent/order2**，明确启用部分K等待、S7 PV/center融合；不是旧qfast。
+	Full Q10240/KV2583/H24/HK2/D256/page64，grid80、block512，GPU2/a4，SE0/CU1/allSIMD，
+	第3次调用dispatch393，256MiB ATT buffer，无PMC/activity counters。
+- [实际ELF](results/d256_v98_att_20260924/artifact.json)与正式计时版本完全一致：
+	`774d2eaba3e4726e2d2ece80ea1b52ac7a9b21d7a01ae44cbab0caf5a224c889`；VG224/SG92、LDS65536、AGPR/private/spills0。
+	源IR SHA不同且分别留档，未误称IR恒等；当前源码/默认/原timer均未变。
+- [前后数值](results/d256_v98_att_20260924/driver-result.json)原FP32 `.02`通过，acc均2.727154653547892e-6；
+	第2/3/4次逐位重复通过。入口/准备/退出gfx/UMC均0，VRAM283/2229/4629MB，PTL Enabled/VECTOR,F8。
+- [独立ATT审计](results/d256_v98_att_20260924/ui-copy-audit.json)：8/8完整波，每波24任务，
+	3,718,544动态指令、1,007,616 MFMA、254,976 DMA4；CSV/code-map计数一致，全部endpgm，无数据丢失。
+- UI已复制到当前MHA目录：[manifest](ui_output_agent_18599_dispatch_393/filenames.json)、
+	[统计CSV](stats_ui_output_agent_18599_dispatch_393.csv)。16文件/132,888,374bytes，逐文件SHA一致，
+	不覆盖旧UI；为ISA映射，Source为空。详见[本次说明](results/d256_v98_att_20260924/README.md)。
+- 保留reserved-M0 warning；没有修改GPU/PTL/时钟/功率/NUMA，没有Git写操作；不以ATT周期冒充性能成绩。
