@@ -6,7 +6,7 @@
 tests/
   codegen/asm/       Assembly JIT, IR, instruction, and layout regression tests
   ops/
-    conv/           Installed pointwise convolution
+    conv/           Shared HIP depthwise Conv3D and pointwise convolution
     gemm/           Installed ASM/FlyDSL GEMM variants and split-K
     gr_read/        GRRead correctness tests
     moe/            Installed MoE implementations and cross-backend tests
@@ -58,6 +58,10 @@ collection hooks:
 - **ASM codegen/runtime:** basic memory operations, scalar/vector expressions,
   integer division, control flow, SIMT, CSE/DCE/DSE, debug logging, LDS tensors,
   workgroup loads, swizzle, reduction, softmax, and the score/value MFMA check.
+- **Depthwise Conv3D:** forced shared HIP FP16/BF16 correctness, BF16 FMA,
+  nonfinite and exponent-range cases, automatic/forced dispatch, gradients,
+  current-device streams, graphs, and offline gfx942/gfx950 resource checks in
+  [test_conv_depthwise.py](ops/conv/test_conv_depthwise.py).
 - **Installed GEMM:** all existing correctness cases in
   [test_cdna4.py](ops/gemm/test_cdna4.py) and
   [test_a4w4_mxfp4.py](ops/gemm/test_a4w4_mxfp4.py), plus the newly merged FlyDSL
@@ -134,7 +138,7 @@ existing PyHIP JIT cache; use direct pytest commands above when that is unwanted
 | Core tests | [codegen/asm](codegen/asm/) |
 | Parameterized GEMM regressions | [ops/gemm](ops/gemm/) |
 | Experimental gfx950 8-wave block-scale / 4-wave MXFP8 GEMM | [kernels](../src/pyhip/ops/gemm/flydsl/) and [tests](ops/gemm/) |
-| Pointwise convolution | [test_conv_pointwise.py](ops/conv/test_conv_pointwise.py) |
+| Depthwise and pointwise convolution | [test_conv_depthwise.py](ops/conv/test_conv_depthwise.py) and [test_conv_pointwise.py](ops/conv/test_conv_pointwise.py) |
 | GRRead, README, and local collection config | [ops/gr_read](ops/gr_read/) |
 | Cross-backend MoE regression suite | [test_moe.py](ops/moe/test_moe.py) |
 | CLI-only operator timing/model matrices | [benchmarks](../benchmarks/README.md) |

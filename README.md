@@ -111,7 +111,7 @@ from repository tests or a test-directory `PYTHONPATH`.
 | [GEMM / Linear](src/pyhip/ops/gemm) | Assembly and an ASM/Aiter quantized Linear wrapper |
 | [MoE](src/pyhip/ops/moe) | Assembly, FlyDSL, and an Aiter-compatible autotuned API |
 | [Attention](src/pyhip/ops/attention) | Assembly paged attention |
-| [Convolution](src/pyhip/ops/conv) | HIP depthwise and assembly/Gluon pointwise implementations |
+| [Convolution](src/pyhip/ops/conv) | Shared FP16/BF16 HIP depthwise Conv3D implementations |
 | [GRRead](src/pyhip/ops/gr_read) | FlyDSL down/up projections |
 
 Availability in this table does not imply support for every GPU or input shape.
@@ -124,21 +124,6 @@ Other API features are forwarded to Aiter. Fixed kernel tests use
 `pyhip.testing.moe.make_moe_runner`, without autotuning or fallback. The old
 MoE wrappers and their `method="auto"/"jit"` interface have been removed.
 Optional Gluon convolution implementations remain available.
-
-For example, this BF16 grouped pointwise convolution uses the Gluon path:
-
-```python
-import torch
-from pyhip.ops.conv.conv_pointwise import conv_pointwise
-
-x = torch.randn((1, 16, 3, 4, 64), device="cuda", dtype=torch.bfloat16)
-weight = torch.randn((4, 4, 4), device="cuda", dtype=torch.bfloat16)
-bias = torch.randn((16,), device="cuda", dtype=torch.bfloat16)
-
-y = conv_pointwise(x, weight, bias, groups=4, use_gluon=True)
-assert y.shape == x.shape
-```
-
 Other entry points include `pyhip.ops.moe.tuned_moe.fused_moe`,
 `pyhip.ops.moe.asm.moe.moe_2stage_splitk`, and
 `pyhip.ops.moe.flydsl.moe_gemm_2stage.compile_moe_gemm1`. Some are complete

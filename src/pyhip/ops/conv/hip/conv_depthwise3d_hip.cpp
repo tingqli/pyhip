@@ -1,86 +1,97 @@
 /*
-https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv3d.html
-
-
-When groups == in_channels and out_channels == K * in_channels, where K is a positive integer, 
-this operation is also known as a “depthwise convolution”
-here we assume K==1
-
-compile time constant:
-    block-size
-    kernel-size
-    padding
-    dilation
-*/
+ * Shared FP16/BF16 depthwise Conv3D for gfx942 and gfx950.
+ * Native FP16 dot on both targets; native BF16 dot on gfx950; exact BF16
+ * expansion and FP32 FMA on gfx942. Staging, weights and traversal are shared.
+ * OUTPUT_TILE is selected at compile time by the launcher (16 native, 8 FMA).
+ */
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
+#include <type_traits>
 
-//#define PaddingD 0
-//#define PaddingH 2
-//#define PaddingW 2
-#define dilationD 1
-#define dilationH 1
-#define dilationW 1
-#define strideT 1
-#define strideH 1
-#define strideW 1
-
-template<typename T>
-constexpr T div_up(T a, T b) {
-    return (a + b - 1) / b;
-}
-
-constexpr int LDS_SIZE = 32*1024;       // with 64-KB LDS, this allows occupancy=2
 constexpr int weight_size = KD*KH*KW;   // in unit of IO_DTYPE
-constexpr int max_input_size = LDS_SIZE/sizeof(IO_DTYPE) - (weight_size + 31)/32 * 32;
+/*
+ * Allocate exactly the halo buffer we touch (KD * padded_H * padded_W) instead of a
+ * fixed 32-KB slab: LDS is the occupancy limiter once the register pressure is gone,
+ * so handing back the unused ~8 KB buys another workgroup per CU.
+ *
+ * The tail is slack for the innermost loop, which reads a whole dword-aligned run
+ * per kernel row and so can reach up to KW-1 elements past the last output column
+ * of the last row.  Those lanes are multiplied by the zero-padded high half of the
+ * final weight dword, but they must still be backed by real, zeroed LDS: an
+ * out-of-range LDS dword reads back as 0 and would take the valid low half with it.
+ */
+constexpr int halo_size = KD * (PaddingH*2 + BLOCK_H) * (PaddingW*2 + BLOCK_W);
+constexpr int max_input_size = halo_size + 2 * KW;
 
-static_assert(PaddingD == 0);
-using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
+static_assert(PaddingD == 0 && PaddingH == 2 && PaddingW == 2);
+static_assert(KD == 3 && KH == 5 && KW == 5);
+static_assert(BLOCK_H > 0 && BLOCK_W >= 16 && BLOCK_W % 16 == 0);
+static_assert(max_input_size * sizeof(IO_DTYPE) <= 64 * 1024);
 using as3_uint32_ptr = __attribute__((address_space(3))) uint32_t *;
+using fp16x2_t = __attribute__((ext_vector_type(2))) _Float16;
+using bf16x2_t = __attribute__((ext_vector_type(2))) __bf16;
+using io_dtype_t = IO_DTYPE;
 
-template<uint16_t cnt>
-__device__ __inline__ void s_waitcnt_lgkmcnt() {
-    asm volatile ("s_waitcnt lgkmcnt(%0)\n"::"i"(cnt));
-}
+static_assert(std::is_same_v<io_dtype_t, __half> ||
+                  std::is_same_v<io_dtype_t, __hip_bfloat16>,
+              "depthwise Conv3D supports only FP16 and BF16");
 
 template<uint16_t cnt>
 __device__ __inline__ void s_waitcnt_vmcnt() {
     asm volatile ("s_waitcnt vmcnt(%0)\n"::"i"(cnt));
 }
 
-__device__ __inline__ float ds_read_u16_d16_hi(IO_DTYPE* psrc, int imm_offset) {
-    float v;
-    as3_uint32_ptr vaddr = (as3_uint32_ptr)(psrc);
-    asm volatile("ds_read_u16_d16_hi %[vdst], %[vaddr] offset:%[offset]"
-                : [vdst]"=v"((float&)(v))
-                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset)
-                : "memory"
-            );
-    return v;
+// Accumulate two packed 16-bit products into FP32 using the instruction that
+// matches IO_DTYPE. The packed memory and register layout is shared by both
+// formats; only interpretation of each 16-bit lane differs.
+__device__ __inline__ void dot2_acc(float& acc, uint32_t a, uint32_t b) {
+    if constexpr (std::is_same_v<io_dtype_t, __half>) {
+        acc = __builtin_amdgcn_fdot2(__builtin_bit_cast(fp16x2_t, a),
+                                   __builtin_bit_cast(fp16x2_t, b), acc, false);
+    } else {
+#if defined(__gfx950__) && __has_builtin(__builtin_amdgcn_fdot2_f32_bf16) && !BF16_FMA
+        acc = __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(bf16x2_t, a),
+                                           __builtin_bit_cast(bf16x2_t, b), acc, false);
+#else
+        // Typed BF16 pairs give LLVM exact fpext conversions and FP32 FMAs.
+        // The compiler-only scheduling barrier bounds live input conversions
+        // across the unrolled loop; it emits no workgroup synchronization.
+        // Without it, gfx942 register pressure rises substantially.
+        // LDS reads remain ordinary C++ loads with compiler-managed waits.
+        const bf16x2_t av = __builtin_bit_cast(bf16x2_t, a);
+        const bf16x2_t bv = __builtin_bit_cast(bf16x2_t, b);
+        acc = __builtin_fmaf((float)av[0], (float)bv[0], acc);
+        acc = __builtin_fmaf((float)av[1], (float)bv[1], acc);
+        __builtin_amdgcn_sched_barrier(0);
+#endif
+    }
 }
 
-__device__ __inline__ uint32_t ds_read_b32(IO_DTYPE* psrc, int imm_offset=0) {
-    uint32_t v;
-    as3_uint32_ptr vaddr = (as3_uint32_ptr)(psrc);
-    asm volatile("ds_read_b32 %[vdst], %[vaddr] offset:%[offset]"
-                : [vdst]"=v"((uint32_t&)(v))
-                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset)
-                : "memory"
-            );
-    return v;
-}
-
-__device__ __inline__ void v_fmac_f32(float& vdst, float src0, float vsrc1) {
-    // The + modifier implies the operand appears in both input and output lists implicitly
-    asm volatile("v_fmac_f32 %[vdst], %[src0], %[vsrc1]"
-                : [vdst]"+v"(vdst)
-                : [src0]"v"(src0),[vsrc1]"v"(vsrc1));
-}
-__device__ __inline__ void v_dot2c_f32_f16(float& vdst, __half (&src0)[2], __half (&vsrc1)[2]) {
-    asm volatile("v_dot2c_f32_f16 %[vdst], %[src0], %[vsrc1]"
-                : [vdst]"+v"(vdst)
-                : [src0]"v"(src0),[vsrc1]"v"(vsrc1));
+// KW=5 leaves one tap after the two real weight pairs. Consume only that tap
+// so an unused sixth input cannot produce 0*Inf/NaN. The arithmetic choice is
+// compile-time and keeps CDNA3 FP16's dot path and CDNA4's faster scalar tail.
+template<bool Odd>
+__device__ __inline__ void tail_acc(float& acc, uint32_t weight, uint32_t input) {
+    if constexpr (std::is_same_v<io_dtype_t, __half>) {
+#if defined(__gfx942__)
+        // Preserve CDNA3's packed FP16 register allocation; zero the unused lane.
+        dot2_acc(acc, weight, Odd ? input >> 16 : input & 0xffffu);
+#else
+        const float w = (float)__builtin_bit_cast(_Float16, (uint16_t)weight);
+        const float x = (float)__builtin_bit_cast(_Float16, (uint16_t)(Odd ? input >> 16 : input));
+        acc = __builtin_fmaf(w, x, acc);
+#endif
+    } else {
+        // Expand only the real BF16 tap; never consume the unused paired lane.
+        const float w = __builtin_bit_cast(float, weight << 16);
+        const float x = __builtin_bit_cast(float, Odd ? input & 0xffff0000u : input << 16);
+        acc = __builtin_fmaf(w, x, acc);
+#if defined(__gfx950__) && !BF16_FMA
+        // Keep the tail extraction/FMA near the native dots without a runtime barrier.
+        __builtin_amdgcn_sched_barrier(0);
+#endif
+    }
 }
 
 __device__ __inline__ void set_m0(void* base) {
@@ -89,7 +100,6 @@ __device__ __inline__ void set_m0(void* base) {
 }
 
 __device__ __inline__ void global_load_lds_dword(int vaddr, const void* saddr, int imm_offset = 0) {
-    //void * saddr = __builtin_amdgcn_readfirstlane(_saddr);
     asm volatile("global_load_lds_dword %[vaddr], %[saddr] offset:%[offset]"
                 :: [vaddr]"v"(vaddr), [saddr]"s"(saddr), [offset]"i"(imm_offset)
                 : "memory"
@@ -107,7 +117,7 @@ __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
     int iW,
     int oC,        // out_channels = channel_multiplier * in_channels
     int oD,
-    int oH, 
+    int oH,
     int oW)
 {
     const int channel_multiplier = oC / iC;
@@ -115,24 +125,34 @@ __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
     const int out_channel = blockIdx.y;
     const int out_D = blockIdx.z;
     const int in_channel = out_channel / channel_multiplier;
-    int blk_in = (batch * iC + in_channel) * iD + out_D;
-    int blk_out = (batch * oC + out_channel) * oD + out_D;
+    const uint64_t blk_in = (uint64_t(batch) * iC + in_channel) * iD + out_D;
+    const uint64_t blk_out = (uint64_t(batch) * oC + out_channel) * oD + out_D;
 
-    float weight_reg[KD][KH][KW];
-    __shared__ IO_DTYPE s_input[max_input_size];    
+    // 16B-aligned so the dword-wide LDS reads below are always naturally aligned
+    __shared__ __attribute__((aligned(16))) IO_DTYPE s_input[max_input_size];
 
-    kernel += out_channel * weight_size;
+    kernel += uint64_t(out_channel) * weight_size;
     input += blk_in * iH * iW;
     output += blk_out * oH * oW;
 
-    // clear s_input with zero-padding
+    // Clear only halo/tail cells: the interior is overwritten by DMA below.
+    // The first barrier keeps zero stores from racing the incoming DMA.
     constexpr int padded_H = PaddingH*2 + BLOCK_H;
     constexpr int padded_W = PaddingW*2 + BLOCK_W;
-    constexpr int input_size_dw4 = (KD * padded_H * padded_W * sizeof(IO_DTYPE) + sizeof(int32x4_t) - 1)/sizeof(int32x4_t);
-    constexpr int32x4_t vzero = {0};
-    for (int i = threadIdx.x; i < KD * padded_H * padded_W; i += blockDim.x) {
-        s_input[i] = 0.0f; //vzero;
+    #pragma unroll
+    for (int d = 0; d < KD; ++d) {
+        for (int i = threadIdx.x; i < 4 * padded_W; i += blockDim.x) {
+            const int off = i < 2 * padded_W ? i : i + BLOCK_H * padded_W;
+            s_input[d * padded_H * padded_W + off] = 0.0f;
+        }
+        for (int h = threadIdx.x; h < BLOCK_H; h += blockDim.x) {
+            uint32_t* row = reinterpret_cast<uint32_t*>(s_input + (d * padded_H + h + 2) * padded_W);
+            row[0] = 0;
+            row[(padded_W - 2) / 2] = 0;
+        }
     }
+    for (int i = halo_size + threadIdx.x; i < max_input_size; i += blockDim.x)
+        s_input[i] = 0.0f;
     __syncthreads();
 
     constexpr int num_warps = 4;
@@ -151,20 +171,36 @@ __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
                 // each thread loads 2-IO_DTYPE as 1-DWORD
                 set_m0(s_input + off_h1 + 2*__builtin_amdgcn_readfirstlane(w));
                 global_load_lds_dword(off_h0 * sizeof(IO_DTYPE) + w*sizeof_dword, input);
-                // s_input[off_h1 + w] = input[off_h0 + w];
             }
         }
     }
 
-    int ki = 0;
-    #pragma unroll
-    for(int d = 0; d < KD; d ++) {
+    /*
+     * Weights stay packed: two 16-bit values per register, three registers per
+     * (d,h) row instead of
+     * 5 f32 VGPRs.  Row layout: [w0|w1], [w2|w3], [w4|0].
+     * The zero in the high half of the third dword makes the tail term of both
+     * output columns use the same pair helper; unused input bits are masked.
+     */
+    constexpr int NROW = KD * KH;
+    uint32_t wpk[NROW][3];
+    {
+        const uint16_t* __restrict__ kb = reinterpret_cast<const uint16_t*>(kernel);
         #pragma unroll
-        for(int h = 0; h < KH; h++) {
+        for (int r = 0; r < NROW; r++) {
+            const int b = r * KW;
+            wpk[r][0] = (uint32_t)kb[b + 0] | ((uint32_t)kb[b + 1] << 16);
+            wpk[r][1] = (uint32_t)kb[b + 2] | ((uint32_t)kb[b + 3] << 16);
+            wpk[r][2] = (uint32_t)kb[b + 4];
+            /*
+             * The whole block shares one out_channel, so every weight is wave-uniform.
+             * readfirstlane parks all 45 dwords in SGPRs, which v_dot2 can take as
+             * src0 -- 45 VGPRs of weights become 0, and the register budget goes to
+             * accumulators and a wider output tile instead.
+             */
             #pragma unroll
-            for(int w = 0; w < KW; w++) {
-                weight_reg[d][h][w] = kernel[ki++];
-            }
+            for (int j = 0; j < 3; j++)
+                wpk[r][j] = (uint32_t)__builtin_amdgcn_readfirstlane((int)wpk[r][j]);
         }
     }
     float bias_value = 0.0f;
@@ -176,68 +212,78 @@ __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
 
     // conv
     constexpr int num_outputs = BLOCK_H * BLOCK_W;
-    constexpr int KW_PACK = 2;
-    constexpr int KWR = div_up(KW, KW_PACK);
-    static_assert(BLOCK_W % 2 == 0);
+    /*
+     * Output columns computed per thread.  Each kernel row needs OW_TILE+KW-1
+     * 16-bit inputs == OW_TILE/2 + 2 dwords, so a wider tile amortises the LDS
+     * traffic: 3 dwords per 2 outputs at OW_TILE=2 vs 4 dwords per 4 outputs
+     * here.  Halving the ds_read count is what the freed registers buy.
+     */
+    constexpr int OW_TILE = OUTPUT_TILE;
+    constexpr int NDW = OW_TILE / 2 + 2;     // dwords of input per kernel row
+    static_assert(OW_TILE % 2 == 0);
+    static_assert(BLOCK_W % OW_TILE == 0);   // a tile never straddles a row
+    static_assert(KW == 5 && KD == 3 && KH == 5);
 
-    // load inputs from LDS into regs
-    IO_DTYPE input_reg[KD][KH][KWR][KW_PACK];
-    //#pragma nounroll
-    //for (int oh = warp_id; oh < BLOCK_H; oh += num_warps) {
-    //    #pragma unroll
-    //    for (int ow = lane_id; ow < BLOCK_W; ow += warp_size) {
-    for (int oi = KW_PACK*threadIdx.x; oi < num_outputs; oi += KW_PACK*blockDim.x) {
+    // LDS dword offset of kernel row r == (d,h), relative to the thread's base.
+    #define ROW_WOFF(r) ((((r) / KH * (padded_H * padded_W) + (r) % KH * padded_W)) / 2)
+
+    for (int oi = OW_TILE*threadIdx.x; oi < num_outputs; oi += OW_TILE*blockDim.x) {
         const int oh = oi / BLOCK_W;
         const int ow = oi % BLOCK_W;
 
-        const int ih = oh;
-        const int iw = ow;
+        // element (oh + 0, ow + 0) of the padded halo buffer
+        IO_DTYPE* base = s_input + oh * padded_W + ow;
 
-        const int srci0 = (ih) * padded_W + (iw);
+        float sum[OW_TILE];
+        #pragma unroll
+        for (int t = 0; t < OW_TILE; t++) sum[t] = bias_value;
+
         /*
-            unroll下面的固定次数循环，从而偏移量 src_off 都是编译期常量
-        */
-        #pragma unroll
-        for(int d = 0; d < KD; d ++) {
-            #pragma unroll
-            for(int h = 0; h < KH; h++) {
-                #pragma unroll
-                for(int w = 0; w < KW; w+=KW_PACK) {
-                    int src_off = d*(padded_H * padded_W) + (PaddingH + h - KH/2)*padded_W + (PaddingW + w - KW/2);
-                    // reinterpret_cast<uint32_t&>(input_reg[d][h][w/KW_PACK]) = *reinterpret_cast<uint32_t*>(s_input + srci0 + src_off);
-                    reinterpret_cast<uint32_t&>(input_reg[d][h][w/KW_PACK]) = ds_read_b32(s_input + srci0, src_off*sizeof(IO_DTYPE));
-                }
-            }
-        }
-        s_waitcnt_lgkmcnt<0>();
-        __builtin_amdgcn_sched_barrier(0);
+         * Stream one kernel row (NDW dwords) at a time instead of reading all
+         * KD*KH*KW inputs up front, so only one row's worth of input is live at
+         * any point rather than the whole 45-element window.  That, plus the
+         * packed weights below, is what frees the VGPRs.
+         *
+         * These are plain LDS loads rather than ds_read_b32 inline asm: with asm
+         * the scheduler is free to move the reads relative to a hand-written
+         * s_waitcnt, so a manually counted lgkmcnt() does not reliably cover
+         * them.  Letting the compiler own the loads lets it place the waits.
+         */
+        const uint32_t* rowp = reinterpret_cast<const uint32_t*>(base);
 
         #pragma unroll
-        for (int p = 0; p < KW_PACK; p++) {
-            float sum = bias_value;
+        for (int r = 0; r < NROW; r++) {
+            const int rw = ROW_WOFF(r);
+            uint32_t c[NDW];
             #pragma unroll
-            for(int d = 0; d < KD; d ++) {
-                #pragma unroll
-                for(int h = 0; h < KH; h++) {
-                    #pragma unroll
-                    for(int w = 0; w < KW; w+=2) {
-                        if (p == 0) {
-                            // sum += weight_reg[d][h][w+0] * (float)(input_reg[d][h][w/KW_PACK][0]);
-                            v_fmac_f32(sum, weight_reg[d][h][w+0], (float)(input_reg[d][h][w/KW_PACK][0]));
-                            if (w+1 < KW)
-                                //sum += weight_reg[d][h][w+1] * (float)(input_reg[d][h][w/KW_PACK][1]);
-                                v_fmac_f32(sum, weight_reg[d][h][w+1], (float)(input_reg[d][h][w/KW_PACK][1]));
-                        } else {
-                            //sum += weight_reg[d][h][w+0] * (float)(input_reg[d][h][w/KW_PACK][1]);
-                            v_fmac_f32(sum, weight_reg[d][h][w+0], (float)(input_reg[d][h][w/KW_PACK][1]));
-                            if (w+1 < KW)
-                                //sum += weight_reg[d][h][w+1] * (float)(input_reg[d][h][w/KW_PACK+1][0]);
-                                v_fmac_f32(sum, weight_reg[d][h][w+1], (float)(input_reg[d][h][w/KW_PACK+1][0]));
-                        }
-                    }
+            for (int j = 0; j < NDW; j++)
+                c[j] = rowp[rw + j];    // c[j] == (a[2j], a[2j+1])
+
+            /*
+             * Output column ow+t dots this row's 5 weights against a[t..t+4].
+             * Odd t needs the window shifted by one 16-bit value, which v_alignbit_b32
+             * re-packs in a single instruction.  The high half of wpk[r][2] is
+             * zero. The tail helper only consumes the fifth input, avoiding
+             * an unused 0*Inf/NaN lane.
+             */
+            #pragma unroll
+            for (int t = 0; t < OW_TILE; t++) {
+                const int j = t / 2;
+                if ((t & 1) == 0) {
+                    dot2_acc(sum[t], wpk[r][0], c[j + 0]);
+                    dot2_acc(sum[t], wpk[r][1], c[j + 1]);
+                    tail_acc<false>(sum[t], wpk[r][2], c[j + 2]);
+                } else {
+                    dot2_acc(sum[t], wpk[r][0], __builtin_amdgcn_alignbit(c[j + 1], c[j + 0], 16));
+                    dot2_acc(sum[t], wpk[r][1], __builtin_amdgcn_alignbit(c[j + 2], c[j + 1], 16));
+                    tail_acc<true>(sum[t], wpk[r][2], c[j + 2]);
                 }
             }
-            output[oh * oW + ow + p] = (IO_DTYPE)(sum);
         }
+
+        #pragma unroll
+        for (int t = 0; t < OW_TILE; t++)
+            output[oh * oW + ow + t] = (IO_DTYPE)(sum[t]);
     }
+    #undef ROW_WOFF
 }
