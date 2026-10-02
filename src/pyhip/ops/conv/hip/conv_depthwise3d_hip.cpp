@@ -1,18 +1,8 @@
 /*
- * FP16/BF16 packed-dot depthwise Conv3D for PyHIP.
- *
- * gfx950 (CDNA4): FP16 via __builtin_amdgcn_fdot2 and BF16 via
- * __builtin_amdgcn_fdot2_f32_bf16 (dot12-insts).
- * gfx942 (CDNA3): FP16 via __builtin_amdgcn_fdot2 only. The Python wrapper
- * uses PyTorch for BF16 because dot12-insts is unavailable here.
- *
- * IO_DTYPE must be __half or __hip_bfloat16. The kernel shares its packed
- * weights, LDS staging, 16-output tile, and FP32 accumulators across both data
- * types, while dot2_acc selects the matching dot-product builtin at compile
- * time.
- *
- * The wrapper selects this kernel only for the supported 3x5x5 depthwise
- * shape and uses PyTorch for other cases.
+ * Shared FP16/BF16 depthwise Conv3D for gfx942 and gfx950.
+ * Native FP16 dot on both targets; native BF16 dot on gfx950; exact BF16
+ * expansion and FP32 FMA on gfx942. Staging, weights and traversal are shared.
+ * OUTPUT_TILE is selected at compile time by the launcher (16 native, 8 FMA).
  */
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -34,7 +24,10 @@ constexpr int weight_size = KD*KH*KW;   // in unit of IO_DTYPE
 constexpr int halo_size = KD * (PaddingH*2 + BLOCK_H) * (PaddingW*2 + BLOCK_W);
 constexpr int max_input_size = halo_size + 2 * KW;
 
-static_assert(PaddingD == 0);
+static_assert(PaddingD == 0 && PaddingH == 2 && PaddingW == 2);
+static_assert(KD == 3 && KH == 5 && KW == 5);
+static_assert(BLOCK_H > 0 && BLOCK_W >= 16 && BLOCK_W % 16 == 0);
+static_assert(max_input_size * sizeof(IO_DTYPE) <= 64 * 1024);
 using as3_uint32_ptr = __attribute__((address_space(3))) uint32_t *;
 using fp16x2_t = __attribute__((ext_vector_type(2))) _Float16;
 using bf16x2_t = __attribute__((ext_vector_type(2))) __bf16;
@@ -42,7 +35,7 @@ using io_dtype_t = IO_DTYPE;
 
 static_assert(std::is_same_v<io_dtype_t, __half> ||
                   std::is_same_v<io_dtype_t, __hip_bfloat16>,
-              "depthwise_conv_packed_dot supports only FP16 and BF16");
+              "depthwise Conv3D supports only FP16 and BF16");
 
 template<uint16_t cnt>
 __device__ __inline__ void s_waitcnt_vmcnt() {
@@ -55,10 +48,49 @@ __device__ __inline__ void s_waitcnt_vmcnt() {
 __device__ __inline__ void dot2_acc(float& acc, uint32_t a, uint32_t b) {
     if constexpr (std::is_same_v<io_dtype_t, __half>) {
         acc = __builtin_amdgcn_fdot2(__builtin_bit_cast(fp16x2_t, a),
-                                     __builtin_bit_cast(fp16x2_t, b), acc, false);
+                                   __builtin_bit_cast(fp16x2_t, b), acc, false);
     } else {
+#if defined(__gfx950__) && __has_builtin(__builtin_amdgcn_fdot2_f32_bf16) && !BF16_FMA
         acc = __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(bf16x2_t, a),
-                                              __builtin_bit_cast(bf16x2_t, b), acc, false);
+                                           __builtin_bit_cast(bf16x2_t, b), acc, false);
+#else
+        // Typed BF16 pairs give LLVM exact fpext conversions and FP32 FMAs.
+        // The compiler-only scheduling barrier bounds live input conversions
+        // across the unrolled loop; it emits no workgroup synchronization.
+        // Without it, gfx942 register pressure rises substantially.
+        // LDS reads remain ordinary C++ loads with compiler-managed waits.
+        const bf16x2_t av = __builtin_bit_cast(bf16x2_t, a);
+        const bf16x2_t bv = __builtin_bit_cast(bf16x2_t, b);
+        acc = __builtin_fmaf((float)av[0], (float)bv[0], acc);
+        acc = __builtin_fmaf((float)av[1], (float)bv[1], acc);
+        __builtin_amdgcn_sched_barrier(0);
+#endif
+    }
+}
+
+// KW=5 leaves one tap after the two real weight pairs. Consume only that tap
+// so an unused sixth input cannot produce 0*Inf/NaN. The arithmetic choice is
+// compile-time and keeps CDNA3 FP16's dot path and CDNA4's faster scalar tail.
+template<bool Odd>
+__device__ __inline__ void tail_acc(float& acc, uint32_t weight, uint32_t input) {
+    if constexpr (std::is_same_v<io_dtype_t, __half>) {
+#if defined(__gfx942__)
+        // Preserve CDNA3's packed FP16 register allocation; zero the unused lane.
+        dot2_acc(acc, weight, Odd ? input >> 16 : input & 0xffffu);
+#else
+        const float w = (float)__builtin_bit_cast(_Float16, (uint16_t)weight);
+        const float x = (float)__builtin_bit_cast(_Float16, (uint16_t)(Odd ? input >> 16 : input));
+        acc = __builtin_fmaf(w, x, acc);
+#endif
+    } else {
+        // Expand only the real BF16 tap; never consume the unused paired lane.
+        const float w = __builtin_bit_cast(float, weight << 16);
+        const float x = __builtin_bit_cast(float, Odd ? input & 0xffff0000u : input << 16);
+        acc = __builtin_fmaf(w, x, acc);
+#if defined(__gfx950__) && !BF16_FMA
+        // Keep the tail extraction/FMA near the native dots without a runtime barrier.
+        __builtin_amdgcn_sched_barrier(0);
+#endif
     }
 }
 
@@ -68,7 +100,6 @@ __device__ __inline__ void set_m0(void* base) {
 }
 
 __device__ __inline__ void global_load_lds_dword(int vaddr, const void* saddr, int imm_offset = 0) {
-    //void * saddr = __builtin_amdgcn_readfirstlane(_saddr);
     asm volatile("global_load_lds_dword %[vaddr], %[saddr] offset:%[offset]"
                 :: [vaddr]"v"(vaddr), [saddr]"s"(saddr), [offset]"i"(imm_offset)
                 : "memory"
@@ -94,22 +125,34 @@ __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
     const int out_channel = blockIdx.y;
     const int out_D = blockIdx.z;
     const int in_channel = out_channel / channel_multiplier;
-    int blk_in = (batch * iC + in_channel) * iD + out_D;
-    int blk_out = (batch * oC + out_channel) * oD + out_D;
+    const uint64_t blk_in = (uint64_t(batch) * iC + in_channel) * iD + out_D;
+    const uint64_t blk_out = (uint64_t(batch) * oC + out_channel) * oD + out_D;
 
     // 16B-aligned so the dword-wide LDS reads below are always naturally aligned
     __shared__ __attribute__((aligned(16))) IO_DTYPE s_input[max_input_size];
 
-    kernel += out_channel * weight_size;
+    kernel += uint64_t(out_channel) * weight_size;
     input += blk_in * iH * iW;
     output += blk_out * oH * oW;
 
-    // clear s_input with zero-padding
+    // Clear only halo/tail cells: the interior is overwritten by DMA below.
+    // The first barrier keeps zero stores from racing the incoming DMA.
     constexpr int padded_H = PaddingH*2 + BLOCK_H;
     constexpr int padded_W = PaddingW*2 + BLOCK_W;
-    for (int i = threadIdx.x; i < max_input_size; i += blockDim.x) {
-        s_input[i] = 0.0f;
+    #pragma unroll
+    for (int d = 0; d < KD; ++d) {
+        for (int i = threadIdx.x; i < 4 * padded_W; i += blockDim.x) {
+            const int off = i < 2 * padded_W ? i : i + BLOCK_H * padded_W;
+            s_input[d * padded_H * padded_W + off] = 0.0f;
+        }
+        for (int h = threadIdx.x; h < BLOCK_H; h += blockDim.x) {
+            uint32_t* row = reinterpret_cast<uint32_t*>(s_input + (d * padded_H + h + 2) * padded_W);
+            row[0] = 0;
+            row[(padded_W - 2) / 2] = 0;
+        }
     }
+    for (int i = halo_size + threadIdx.x; i < max_input_size; i += blockDim.x)
+        s_input[i] = 0.0f;
     __syncthreads();
 
     constexpr int num_warps = 4;
@@ -137,7 +180,7 @@ __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
      * (d,h) row instead of
      * 5 f32 VGPRs.  Row layout: [w0|w1], [w2|w3], [w4|0].
      * The zero in the high half of the third dword makes the tail term of both
-     * output columns fall out of a single v_dot2 with no masking.
+     * output columns use the same pair helper; unused input bits are masked.
      */
     constexpr int NROW = KD * KH;
     uint32_t wpk[NROW][3];
@@ -175,7 +218,7 @@ __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
      * traffic: 3 dwords per 2 outputs at OW_TILE=2 vs 4 dwords per 4 outputs
      * here.  Halving the ds_read count is what the freed registers buy.
      */
-    constexpr int OW_TILE = 16;
+    constexpr int OW_TILE = OUTPUT_TILE;
     constexpr int NDW = OW_TILE / 2 + 2;     // dwords of input per kernel row
     static_assert(OW_TILE % 2 == 0);
     static_assert(BLOCK_W % OW_TILE == 0);   // a tile never straddles a row
@@ -220,8 +263,8 @@ __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
              * Output column ow+t dots this row's 5 weights against a[t..t+4].
              * Odd t needs the window shifted by one 16-bit value, which v_alignbit_b32
              * re-packs in a single instruction.  The high half of wpk[r][2] is
-             * zero, so the 6th lane it pulls in is multiplied away and needs no
-             * masking -- including the (a[t+5], 0) tail at odd t.
+             * zero. The tail helper only consumes the fifth input, avoiding
+             * an unused 0*Inf/NaN lane.
              */
             #pragma unroll
             for (int t = 0; t < OW_TILE; t++) {
@@ -229,11 +272,11 @@ __global__ void __launch_bounds__(256, 1) conv_depthwise3d_hip(
                 if ((t & 1) == 0) {
                     dot2_acc(sum[t], wpk[r][0], c[j + 0]);
                     dot2_acc(sum[t], wpk[r][1], c[j + 1]);
-                    dot2_acc(sum[t], wpk[r][2], c[j + 2]);
+                    tail_acc<false>(sum[t], wpk[r][2], c[j + 2]);
                 } else {
                     dot2_acc(sum[t], wpk[r][0], __builtin_amdgcn_alignbit(c[j + 1], c[j + 0], 16));
                     dot2_acc(sum[t], wpk[r][1], __builtin_amdgcn_alignbit(c[j + 2], c[j + 1], 16));
-                    dot2_acc(sum[t], wpk[r][2], c[j + 2] >> 16);
+                    tail_acc<true>(sum[t], wpk[r][2], c[j + 2]);
                 }
             }
         }

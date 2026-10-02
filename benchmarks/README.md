@@ -16,10 +16,13 @@ Run with the same Python environment used to install PyHIP:
 python benchmarks/moe/bench_tuned_moe.py --help
 python benchmarks/moe/bench_tuned_moe.py --list-models
 python benchmarks/conv/test_conv_depthwise.py --help
-python benchmarks/conv/test_conv_depthwise.py --shape case3 --depthwise-hip packed --dtype bf16 --iters 100
-python benchmarks/conv/test_conv_depthwise.py --shape case3 --depthwise-hip sgb --dtype bf16 --iters 100
+python benchmarks/conv/test_conv_depthwise.py --dtype both --method hip --cuda-graph
 python benchmarks/gemm/test_w8a8_block_fp8_linear.py
 ```
+
+The depthwise CLI compares PyHIP with Torch on fixed NCDHW inputs `[1,512,61,45,80]`,
+a 3x5x5 filter, and padding `(0,2,2)`, reporting normalized difference and eager or
+optional CUDA graph timings in Markdown, with JSON export via `--output`.
 
 The MoE comparison runs both APIs in one process. Fixed BF16 8-wave and MXFP4
 kernel checks live in the [MoE pytest suite](../tests/ops/moe/README.md), with
