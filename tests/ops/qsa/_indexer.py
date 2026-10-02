@@ -123,8 +123,8 @@ def synthetic(seq_lens, extend_lens, device, seed=11, *, section=(11, 11, 10), i
         qk=torch.randn((rows, (HEADS + 1) * DIM), generator=generator, device=device).to(torch.bfloat16),
         heads=HEADS, positions=positions, logical_positions=logical,
         state_slots=torch.tensor(slots_host, dtype=torch.int64, device=device),
-        write_locs=plan[:, 0].to(torch.int32).contiguous(), member_rows=plan[:, 1].contiguous(),
-        group_sequences=plan[:, 2].contiguous(), group_ends=plan[:, 3].contiguous(),
+        write_locs=plan[:, 0].to(torch.int32).contiguous(), member_rows=plan[:, 1].clone(),
+        group_sequences=plan[:, 2].clone(), group_ends=plan[:, 3].clone(),
         rope_matrix=_rope_matrix(positions), token_slot_table=table,
         seq_lens=seq_lens, extend_lens=extend_lens,
         **clone_state(state), **_parameters(generator, device, max(seq_lens), section=section,
@@ -270,6 +270,7 @@ def assert_token_abi(actual, positions, sequences):
     assert bool((blocks < counts[:, None]).all()), "noncausal block"
     ordered = torch.where(live, blocks, 1 << 30).sort(dim=1).values
     assert not bool(((ordered[:, 1:] == ordered[:, :-1]) & live[:, 1:]).any()), "duplicate block"
+    assert torch.equal(torch.where(live, blocks, 1 << 30), ordered), "blocks must ascend"
     assert torch.equal(actual, expand_reference(blocks, positions, sequences)), "token quartet/tail/-1 ABI"
     return blocks, counts, live, ordered
 

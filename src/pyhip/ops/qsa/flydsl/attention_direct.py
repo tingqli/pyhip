@@ -1,9 +1,10 @@
 """Block-native gfx942 sparse attention, without cross-query union construction.
 
-Single-request, four-token-aligned KV uses the private packed implementation
-when combined PK/PV scratch fits the per-plan 64 MiB budget: every call packs
-KV and runs one query wave per CTA. Other shapes and over-budget inputs keep
-the raw KV fallback below. Both paths preserve the public inputs and selection.
+Layouts whose packed PK/PV scratch fits the per-plan 64 MiB budget use the
+private packed implementation: every call packs each request's KV into
+four-token blocks and runs one query wave per CTA. Over-budget KV keeps the
+raw KV fallback below, where packing would cost more than it saves. Both paths
+preserve the public inputs and selection.
 
 In the raw fallback, four query waves each own one query and its GQA heads.
 V loads directly from global memory into registers for the transpose; Q/K
@@ -25,7 +26,6 @@ import msgspec
 import numpy as np
 import torch
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 
 from pyhip.ops.mha.flydsl._common import (
@@ -36,21 +36,16 @@ from pyhip.ops.mha.flydsl._common import (
     _min,
     _pack_bf16,
     _pin,
-    _read_address,
     _stage_end,
     _uniform,
     _wait,
 )
+from . import attention_direct_packed as packed
+from .attention_direct_packed import _enabled, _load, _output
+from .attention_prepare import allocate_scratch, upload
 
 
 MAX_PACKED_KV_BYTES = 64 * 1024 * 1024
-
-
-def _load(resource, offset, lane):
-    parts = [
-        _buffer_words(resource, offset + (lane >> 4) * 16 + k * 64) for k in range(8)
-    ]
-    return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
 
 
 def _load_key(resource, offset, lane):
@@ -125,69 +120,79 @@ def _pv(p, values, output, alpha):
     return result
 
 
-class DirectPlan(msgspec.Struct, frozen=True, kw_only=True):
+class DirectPlan(msgspec.Struct, kw_only=True):
     metadata: torch.Tensor
     query_tile: int
     num_tiles: int
     active: torch.Tensor
     query_tiles: torch.Tensor
     gated: bool
-    source_blocks: torch.Tensor
+    source_blocks: torch.Tensor | None
+    # Gated launches: K3's any-direct flag and the union tiles (stand-ins when ungated).
+    direct_flag: torch.Tensor
+    union_meta: torch.Tensor
+    union_tile: int = 1
+    union_tiles: int = 0
     packed_key: torch.Tensor | None = None
     packed_value: torch.Tensor | None = None
+    pack_sources: torch.Tensor | None = None
+    pack_shape: tuple = ()
+    pack_dtype: torch.dtype | None = None
+
+
+def scratch_specs(prepared: DirectPlan) -> list:
+    if not prepared.pack_shape:
+        return []
+    return [(name, prepared.pack_shape, prepared.pack_dtype, False) for name in ("packed_key", "packed_value")]
 
 
 def prepare(
     *,
     inputs,
-    skip_counts=None,
     union=None,
+    scratch: bool = True,
 ):
     """Bind private scratch; attention's recovery refreshes sorted block_indices each call."""
-    # Block packing is request-local and requires complete physical four-token
-    # blocks. Bound both scratch tensors before allocation using host metadata;
-    # ragged/nonmultiple lengths and over-budget KV retain the raw-KV path.
-    packed_bytes = (
-        inputs.k.numel() * inputs.k.element_size()
-        + inputs.v.numel() * inputs.v.element_size()
-    )
-    packed = (
-        len(inputs.query_lens) == 1
-        and inputs.k.shape[0] % 4 == 0
-        and packed_bytes <= MAX_PACKED_KV_BYTES
-        and inputs.k.numel() * 2 + inputs.k.shape[1] * 1536 + 512 < 2**32
-    )
+    # Each request with queries packs its KV into whole four-token blocks at a
+    # four-token-aligned scratch base. Over-budget KV keeps the raw-KV path.
+    hk = inputs.k.shape[1]
+    q_lens = np.asarray(inputs.query_lens, dtype=np.int64)
+    lengths = q_lens + np.asarray(inputs.prefix_lens, dtype=np.int64)
+    blocks = np.where(q_lens > 0, -(-lengths // 4), 0)
+    packed = int(blocks.sum()) * 4 * hk * 1024 <= MAX_PACKED_KV_BYTES
     waves = 1 if packed else 4
-    skips = (0,) * len(inputs.query_lens) if skip_counts is None else skip_counts
-    metadata = []
-    q0, k0 = 0, 0
-    for q_len, prefix, skip in zip(
-        inputs.query_lens, inputs.prefix_lens, skips
-    ):
-        for local in range(skip, q_len, waves):
-            metadata.append(
-                (
-                    q0 + local,
-                    min(waves, q_len - local),
-                    k0,
-                    prefix + q_len,
-                    prefix + local,
-                )
-            )
-        q0 += q_len
-        k0 += q_len + prefix
-    array = np.asarray(metadata, dtype=np.int32).reshape(-1, 5)
-    return DirectPlan(
-        metadata=torch.from_numpy(array).to(inputs.q.device),
+    k_starts, p_starts = np.cumsum(lengths) - lengths, np.cumsum(blocks) - blocks
+    counts = -(-q_lens // waves)
+    request = np.repeat(np.arange(len(q_lens)), counts)
+    local = (np.arange(len(request)) - np.repeat(np.cumsum(counts) - counts, counts)) * waves
+    base, extent = (p_starts * 4, blocks * 4) if packed else (k_starts, lengths)
+    metadata = np.stack(((np.cumsum(q_lens) - q_lens)[request] + local,
+                         np.minimum(waves, q_lens[request] - local), base[request], extent[request],
+                         (lengths - q_lens)[request] + local), axis=1)
+    device = inputs.q.device
+    sources = None
+    if packed:
+        owner = np.repeat(np.arange(len(blocks)), blocks)
+        sources = upload(k_starts[owner] + 4 * (np.arange(len(owner)) - p_starts[owner]), device)
+    prepared = DirectPlan(
+        metadata=upload(metadata, device),
         query_tile=waves,
         num_tiles=len(metadata),
         gated=union is not None,
         active=inputs.query_positions if union is None else union.active,
         query_tiles=inputs.query_sequence_ids if union is None else union.query_tiles,
+        direct_flag=inputs.kv_lens if union is None else union.direct_flag,
+        union_meta=inputs.kv_lens if union is None else union.metadata,
+        union_tile=1 if union is None else union.query_tile,
+        union_tiles=0 if union is None else union.num_tiles,
         source_blocks=inputs.block_indices,
-        packed_key=torch.empty_like(inputs.k) if packed and metadata else None,
-        packed_value=torch.empty_like(inputs.v) if packed and metadata else None,
+        pack_sources=sources,
+        pack_shape=(int(blocks.sum()) * 4, hk, 256) if packed else (),
+        pack_dtype=inputs.k.dtype,
     )
+    if scratch:
+        allocate_scratch(prepared, scratch_specs(prepared), device)
+    return prepared
 
 
 def _source_offset(cached_blocks, n, visible, extent, hk):
@@ -216,79 +221,6 @@ def _load_v_global(
         offset = (first + r < width).select(base + r * (hk * 256 * 2), fx.Int32(extent))
         parts.append(_buffer_words(resource, offset))
     return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
-
-
-def _enabled(row, rows, first, query_tiles, active, gated, nq):
-    valid = row < rows
-    if gated:
-        # Padded waves must not inspect a following dense row's sentinel tile -1.
-        tile = fx.Int32(query_tiles[first + _min(row, rows - 1)])
-        valid = valid & (fx.Int32(active[tile]) == 0)
-    return valid
-
-
-def _output(
-    o0,
-    o1,
-    inv,
-    buffer,
-    shared,
-    tid,
-    h,
-    g,
-    rows,
-    extent,
-    threads,
-    first,
-    query_tiles,
-    active,
-    gated,
-    nq,
-):
-    row = (tid >> 6) * 16 + (tid & 15)
-    for half in range(2):
-        acc = o1 if half else o0
-        for i in range(4):
-            values = fx.Vector.from_elements(
-                [acc[n * 4 + i] * inv for n in range(8)], fx.Float32
-            )
-            words = _pack_bf16(values)
-            col = (((tid >> 4) & 3) * 4 + i) * 8 + half * 128
-            address = fx.Int32(shared + ((row * 256 + col) ^ ((row & 7) * 8)) * 2)
-            llvm.inline_asm(
-                ir.Type.parse("!llvm.void"),
-                [address.ir_value(), words.ir_value()],
-                "ds_write_b128 $0, $1",
-                "v,v,~{memory}",
-                has_side_effects=True,
-            )
-    _wait(lgkmcnt=0)
-    _stage_end()
-    parts = []
-    for part in range(8):
-        element = tid * 8 + part * threads * 8
-        parts.append(
-            _read_address(shared + (element ^ (((element // 256) & 7) * 8)) * 2)
-        )
-    _wait(lgkmcnt=0)
-    rocdl.sched_barrier(0)
-    for part in range(8):
-        element = tid * 8 + part * threads * 8
-        r, col = element // 256, element % 256
-        query, head = r // 16, r % 16
-        enabled = _enabled(query, rows, first, query_tiles, active, gated, nq) & (
-            head < g
-        )
-        offset = enabled.select(
-            query * h * 256 + head * 256 + col, fx.Int32(extent // 2)
-        )
-        fragment = fx.make_rmem_tensor(8, fx.BFloat16)
-        fragment.store(parts[part].bitcast(fx.BFloat16))
-        fx.copy(
-            fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16),
-            fragment,
-            fx.make_view(fx.get_iter(buffer) + offset, fx.make_layout(8, 1)),
-        )
 
 
 @flyc.jit
@@ -381,6 +313,7 @@ def _body(
     kval1 = load_key(kr, key_offset1, lane)
     _wait(vmcnt=0)
     rocdl.sched_barrier(0)
+    next_blocks = cached_blocks
     for t in range(fx.Int32(0), tiles, fx.Int32(1)):
         kval = fx.Vector(kval)
         all_scores = []
@@ -396,9 +329,14 @@ def _body(
         rocdl.sched_barrier(0)
         values0 = load_v(vr, v_rows[0], t, 0, 0, lane, visible, extent, HK, BN)
         values1 = load_v(vr, v_rows[0], t, 0, 1, lane, visible, extent, HK, BN)
+        if ((t + 1) & 7) == 0:
+            chunk = _min((t + 1) >> 3, fx.Int32(7)) * 64
+            next_blocks = fx.Int32(blocks[row * 512 + chunk + lane])
         rocdl.sched_barrier(0)
         # The prior iteration's sixteen K requests precede these eight V0
         # requests. Wait for K at its consumer, leaving V in flight for QK.
+        # A block-ID prefetch is younger still; vmcnt(8) then also waits for
+        # the oldest V request on those boundary iterations.
         _wait(vmcnt=8)
         rocdl.sched_barrier(0)
         pair = qk(q, kval, kval1, lane)
@@ -432,9 +370,7 @@ def _body(
         _wait(vmcnt=0)
         rocdl.sched_barrier(0)
         if ((t + 1) & 7) == 0:
-            chunk = _min((t + 1) >> 3, fx.Int32(7)) * 64
-            cached_blocks = fx.Int32(blocks[row * 512 + chunk + lane])
-            _wait(vmcnt=0)
+            cached_blocks = next_blocks
         following = _min((t + 1) * BN, (((count + 15) >> 4) - 1) * 16)
         following1 = _min((t + 1) * BN + 16, (((count + 15) >> 4) - 1) * 16)
         key_offset = source_offset(
@@ -503,6 +439,7 @@ def _kernel(
     META: fx.Tensor,
     ACTIVE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -517,13 +454,15 @@ def _kernel(
     if fx.const_expr(GATED):
         tile = fx.Int32(gpu.block_id("x")) // HK
         first, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
-        needed = fx.Int32(0)
-        for local in fx.range_constexpr(THREADS // 64):
-            row = first + _min(fx.Int32(local), rows - 1)
-            group = _uniform(QUERY_TILES[row])
-            needed = needed | (_uniform(ACTIVE[group]) == 0).select(
-                fx.Int32(1), fx.Int32(0)
-            )
+        needed = (_uniform(DIRECT_FLAG[0]) != 0).select(fx.Int32(1), fx.Int32(0))
+        if needed != 0:
+            needed = fx.Int32(0)
+            for local in fx.range_constexpr(THREADS // 64):
+                row = first + _min(fx.Int32(local), rows - 1)
+                group = _uniform(QUERY_TILES[row])
+                needed = needed | (_uniform(ACTIVE[group]) == 0).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
         if needed != 0:
             body(
                 Q,
@@ -576,6 +515,7 @@ def _launch(
     META: fx.Tensor,
     ACTIVE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -597,6 +537,7 @@ def _launch(
             META,
             ACTIVE,
             QUERY_TILES,
+            DIRECT_FLAG,
             H,
             HK,
             NQ,
@@ -617,16 +558,9 @@ def _launch(
 _COMPILED = {}
 
 
-def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
-    if prepared.num_tiles == 0:
-        return
-    from . import attention_direct_packed
-
-    key = (inputs.q.device, inputs.q.shape[1], inputs.k.shape[1],
-           4, prepared.gated, inputs.scale)
-    if prepared.packed_key is not None and key in _COMPILED:
-        return attention_direct_packed.run(inputs=inputs, prepared=prepared, out=out)
-    stream = torch.cuda.current_stream(inputs.q.device)
+def _bound(inputs, prepared, out, stream):
+    """(compiled launcher, its arguments) of the packed or raw variant for this plan."""
+    tasks = prepared.num_tiles * inputs.k.shape[1]
     args = (
         inputs.q.view(-1),
         inputs.k.view(-1),
@@ -636,26 +570,47 @@ def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
         prepared.metadata.view(-1),
         prepared.active,
         prepared.query_tiles,
+        prepared.direct_flag,
         inputs.q.shape[1],
         inputs.k.shape[1],
         inputs.q.shape[0],
         inputs.k.shape[0],
         32,
         256,
-        prepared.num_tiles * inputs.k.shape[1],
+        tasks,
         prepared.gated,
         inputs.scale,
         stream,
     )
-    with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
-        compiled = _COMPILED.get(key)
-        if compiled is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("Warm direct QSA before graph capture")
-            compiled = flyc.compile(_launch, *args[:14], 0, *args[15:])
-            _COMPILED[key] = compiled
-            attention_direct_packed._compile(inputs=inputs, prepared=prepared, out=out)
-        if prepared.packed_key is not None:
-            attention_direct_packed.run(inputs=inputs, prepared=prepared, out=out)
-        else:
-            compiled(*args)
+    key = (inputs.q.device, inputs.q.shape[1], inputs.k.shape[1], prepared.gated, inputs.scale)
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm direct QSA before graph capture")
+        # Both variants initialize together: a later packed/raw layout switch never JITs.
+        with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
+            compiled = _COMPILED[key] = (flyc.compile(_launch, *args[:15], 0, *args[16:]),
+                                         packed.compile_launch(inputs, prepared, out, stream))
+    if prepared.packed_key is not None:
+        return compiled[1], packed.launch_args(inputs, prepared, out, tasks, stream)
+    return compiled[0], args
+
+
+def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
+    if prepared.num_tiles == 0:
+        return
+    with torch.cuda.device(inputs.q.device):
+        compiled, args = _bound(inputs, prepared, out, torch.cuda.current_stream(inputs.q.device))
+        compiled(*args)
+
+
+def launcher(*, inputs, prepared: DirectPlan, out: torch.Tensor):
+    """launch(q, k, v, out) taking flat views, with this plan's other arguments prebuilt.
+
+    Valid while the plan's scratch bindings and the current stream stay the same.
+    """
+    if prepared.num_tiles == 0:
+        return None
+    compiled, args = _bound(inputs, prepared, out, torch.cuda.current_stream(inputs.q.device))
+    tail = args[4:]
+    return lambda q, k, v, o: compiled(q, k, v, o, *tail)

@@ -1,14 +1,17 @@
 """Exact per-row top-512 of QSA indexer logits for gfx942 (FlyDSL), expanded to request-local token ids.
 
-One wave owns one query row (four rows per 256-thread CTA, no CTA barriers); block j is lane
-j % 64 of slot j / 64. Every pass sweeps wave-uniform slot groups with UNROLL independent
-coalesced loads in flight. Fast path: one 256-bin histogram of a monotone linear digit between
-the row min and max; blocks above the threshold bin are kept and the <= 64 threshold-bin keys
-are ranked exactly. Otherwise an ordered-key radix select finds the exact 512th key. Ties keep
-the lowest block ids. Row order is deterministic: kept blocks outside the resolving bin
-ascending, then the resolving-bin picks ascending (consumers treat order as unspecified).
-Output: 4 tokens per block, causal tail, -1.
+Prefill: one wave owns one query row (four rows per 256-thread CTA, no CTA barriers), and the logits
+kernel supplies the row's (min, max) bits. Decode: one 8-wave CTA owns a row; waves take contiguous
+slot-group ranges and per-wave histogram counts place their outputs, so results match the one-wave
+selection. Block j is lane j % 64 of slot j / 64; every pass sweeps wave-uniform slot groups with
+UNROLL independent coalesced loads in flight. Fast path: one 256-bin histogram of a monotone linear
+digit between the row min and max; blocks above the threshold bin are kept and the <= 64
+threshold-bin keys are ranked exactly. Otherwise an ordered-key radix select finds the exact 512th
+key. Ties keep the lowest block ids. The two ascending runs (kept, then resolving picks) are merged:
+rows hold ascending blocks, 4 tokens each, then the causal tail, then -1.
 """
+
+from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -18,7 +21,7 @@ from flydsl._mlir.dialects import arith, llvm
 from flydsl.expr import gpu, rocdl
 
 from pyhip.codegen.flydsl.helpers import rocdl_aux
-from pyhip.ops.mha.flydsl._common import _buffer, _uniform
+from pyhip.ops.mha.flydsl._common import _buffer, _min, _uniform
 
 WAVES, TOPK, RATIO = 4, 512, 4
 WIDTH = TOPK * RATIO + RATIO - 1
@@ -136,6 +139,10 @@ def _group(logits, base, group, lane):
          for i in range(UNROLL)], fx.Float32)
 
 
+def _groups(count):
+    return (count + 64 * UNROLL - 1) // (64 * UNROLL)
+
+
 def _slots(value, group, lane, count):
     for i in range(UNROLL):
         j = (group * UNROLL + i) * 64 + lane
@@ -154,7 +161,10 @@ def _clear(bins, lane):
 
 def _threshold(bins, need, lane):
     """(bin, count above it, its size) for the bin holding the need-th largest element."""
-    owned = [_load(bins + (lane * (BINS // 64) + i) * 4) for i in range(BINS // 64)]
+    return _threshold_owned([_load(bins + (lane * (BINS // 64) + i) * 4) for i in range(BINS // 64)], need, lane)
+
+
+def _threshold_owned(owned, need, lane):
     inclusive = owned[0] + owned[1] + owned[2] + owned[3]
     for offset in (1, 2, 4, 8, 16, 32):
         source = ((lane - offset) & 63) * 4
@@ -181,14 +191,13 @@ def _minmax_group(value, group, lane, count, low, high, nan):
 
 
 @flyc.jit
-def _sweep_minmax(logits, base, count, lane):
+def _sweep_minmax(logits, base, count, lane, first, last):
     low, high, nan = fx.Float32(float("inf")), fx.Float32(float("-inf")), fx.Int32(0)
-    groups = (count + 64 * UNROLL - 1) // (64 * UNROLL)
-    following = _group(logits, base, fx.Int32(0), lane)
-    for index in range(fx.Int32(0), groups, fx.Int32(1)):
+    following = _group(logits, base, _min(first, last - 1), lane)
+    for index in range(first, last, fx.Int32(1)):
         group = fx.Int32(index)
         value = following
-        if group + 1 < groups:
+        if group + 1 < last:
             following = _group(logits, base, group + 1, lane)
         low, high, nan = _minmax_group(value, group, lane, count, low, high, nan)
     return low, high, nan
@@ -200,13 +209,12 @@ def _hist_group(value, group, lane, count, bins, low, scale):
 
 
 @flyc.jit
-def _sweep_hist(logits, base, count, lane, bins, low, scale):
-    groups = (count + 64 * UNROLL - 1) // (64 * UNROLL)
-    following = _group(logits, base, fx.Int32(0), lane)
-    for index in range(fx.Int32(0), groups, fx.Int32(1)):
+def _sweep_hist(logits, base, count, lane, bins, low, scale, first, last):
+    following = _group(logits, base, _min(first, last - 1), lane)
+    for index in range(first, last, fx.Int32(1)):
         group = fx.Int32(index)
         value = following
-        if group + 1 < groups:
+        if group + 1 < last:
             following = _group(logits, base, group + 1, lane)
         _hist_group(value, group, lane, count, bins, low, scale)
 
@@ -246,14 +254,12 @@ def _keep_tie(condition, chosen, tied_base, ties, mask, need, j):
 
 
 @flyc.jit
-def _sweep_gather(logits, base, count, lane, bins, chosen, low, scale, bin):
-    kept, gathered = fx.Int32(0), fx.Int32(0)
-    groups = (count + 64 * UNROLL - 1) // (64 * UNROLL)
-    following = _group(logits, base, fx.Int32(0), lane)
-    for index in range(fx.Int32(0), groups, fx.Int32(1)):
+def _sweep_gather(logits, base, count, lane, bins, chosen, low, scale, bin, first, last, kept, gathered):
+    following = _group(logits, base, _min(first, last - 1), lane)
+    for index in range(first, last, fx.Int32(1)):
         group = fx.Int32(index)
         value = following
-        if group + 1 < groups:
+        if group + 1 < last:
             following = _group(logits, base, group + 1, lane)
         kept, gathered = _gather_group(value, group, lane, count, bins, chosen, low, scale, bin, kept, gathered)
 
@@ -287,14 +293,13 @@ def _keys_group(value, group, lane, count, high_key, low_key):
 
 
 @flyc.jit
-def _sweep_keys(logits, base, count, lane):
+def _sweep_keys(logits, base, count, lane, first, last):
     high_key, low_key = fx.Int32(0), fx.Int32(-1)
-    groups = (count + 64 * UNROLL - 1) // (64 * UNROLL)
-    following = _group(logits, base, fx.Int32(0), lane)
-    for index in range(fx.Int32(0), groups, fx.Int32(1)):
+    following = _group(logits, base, _min(first, last - 1), lane)
+    for index in range(first, last, fx.Int32(1)):
         group = fx.Int32(index)
         value = following
-        if group + 1 < groups:
+        if group + 1 < last:
             following = _group(logits, base, group + 1, lane)
         high_key, low_key = _keys_group(value, group, lane, count, high_key, low_key)
     return high_key, low_key
@@ -308,13 +313,12 @@ def _radix_group(value, group, lane, count, bins, prefix, prefix_mask, shift, wi
 
 
 @flyc.jit
-def _sweep_radix(logits, base, count, lane, bins, prefix, prefix_mask, shift, width):
-    groups = (count + 64 * UNROLL - 1) // (64 * UNROLL)
-    following = _group(logits, base, fx.Int32(0), lane)
-    for index in range(fx.Int32(0), groups, fx.Int32(1)):
+def _sweep_radix(logits, base, count, lane, bins, prefix, prefix_mask, shift, width, first, last):
+    following = _group(logits, base, _min(first, last - 1), lane)
+    for index in range(first, last, fx.Int32(1)):
         group = fx.Int32(index)
         value = following
-        if group + 1 < groups:
+        if group + 1 < last:
             following = _group(logits, base, group + 1, lane)
         _radix_group(value, group, lane, count, bins, prefix, prefix_mask, shift, width)
 
@@ -334,89 +338,279 @@ def _select_group(value, group, lane, count, chosen, prefix, prefix_mask, whole,
 
 
 @flyc.jit
-def _sweep_select(logits, base, count, lane, chosen, prefix, prefix_mask, whole, need):
-    kept, ties = fx.Int32(0), fx.Int32(0)
-    groups = (count + 64 * UNROLL - 1) // (64 * UNROLL)
-    following = _group(logits, base, fx.Int32(0), lane)
-    for index in range(fx.Int32(0), groups, fx.Int32(1)):
+def _sweep_select(logits, base, count, lane, chosen, prefix, prefix_mask, whole, need, first, last, kept, ties):
+    following = _group(logits, base, _min(first, last - 1), lane)
+    for index in range(first, last, fx.Int32(1)):
         group = fx.Int32(index)
         value = following
-        if group + 1 < groups:
+        if group + 1 < last:
             following = _group(logits, base, group + 1, lane)
         kept, ties = _select_group(value, group, lane, count, chosen, prefix, prefix_mask, whole, need, kept, ties)
 
 
-@flyc.jit
-def _radix(logits, base, count, lane, bins, chosen):
-    # Ordered-key radix: live keys share bits above `top`; <= 8-bit digits refine the 512th key.
-    high_key, low_key = _sweep_keys(logits, base, count, lane)
-    high_key, low_key = _reduce(high_key, _umax), _reduce(low_key, _umin)
+def _key_range(high_key, low_key):
+    """(top differing bit or -1, prefix mask, prefix) shared by all live ordered keys."""
     differ = high_key ^ low_key
     top = (differ == 0).select(fx.Int32(-1), 31 - _intrinsic("llvm.ctlz.i32", fx.Int32, differ, fx.Boolean(False)))
     shifted = (fx.Int32(2) << (top & 31)) - 1
     prefix_mask = (top < 0).select(fx.Int32(-1), (top == 31).select(fx.Int32(0), ~shifted))
-    prefix = high_key & prefix_mask
+    return top, prefix_mask, high_key & prefix_mask
+
+
+def _space(waves, wave, lane, hist, cand, chosen, merged, hist_base=None, red=None):
+    """LDS of one row's selection, shared by `waves` waves (a trace-time int; 1 = wave-private row).
+
+    hist: this wave's 257-int histogram (wave w at hist_base + w * HIST when waves > 1); cand: 64
+    candidate keys, then their ids (may alias hist); chosen: 512 uint16 block ids; merged: 1 KiB of
+    finished scratch for the ascending merge; red: 4 reduction words per wave (waves > 1).
+    """
+    return SimpleNamespace(waves=waves, wave=wave, lane=lane, thread=lane if waves == 1 else wave * 64 + lane,
+                           threads=64 * waves, hist=hist, cand=cand, chosen=chosen, merged=merged,
+                           hist_base=hist_base, red=red)
+
+
+def _sync_of(row):
+    return _sync if row.waves == 1 else _cta_sync
+
+
+def _row_sync(row):
+    _sync_of(row)()
+
+
+def _span(row, count):
+    """This wave's slot groups [first, last): all of them, or a contiguous 1/waves share."""
+    groups = _groups(count)
+    if row.waves == 1:
+        return fx.Int32(0), groups
+    per = (groups + row.waves - 1) // row.waves
+    first = _min(row.wave * per, groups)
+    return first, _min(first + per, groups)
+
+
+def _exchange(row, values):
+    """Per-wave values of every wave of the row (after one CTA barrier)."""
+    for slot, value in enumerate(values):
+        _store(row.red + row.wave * 16 + slot * 4, value)
+    _cta_sync()
+    return [[_load(row.red + w * 16 + slot * 4) for w in range(row.waves)] for slot in range(len(values))]
+
+
+def _below_wave(values, wave):
+    total = fx.Int32(0)
+    for w, value in enumerate(values):
+        total = total + (fx.Int32(w) < wave).select(value, fx.Int32(0))
+    return total
+
+
+def _bases(row, above, inside):
+    """Where this wave's outputs start: exclusive prefix over the row's waves."""
+    if row.waves == 1:
+        return fx.Int32(0), fx.Int32(0)
+    aboves, insides = _exchange(row, [above, inside])
+    return _below_wave(aboves, row.wave), _below_wave(insides, row.wave)
+
+
+def _row_minmax(row, low, high, nan):
+    """Row (min, max, any NaN) from this wave's partial sweep."""
+    low, high = _reduce(low, _minnum), _reduce(high, _maxnum)
+    nan = (_ballot(nan != 0) != 0).select(fx.Int32(1), fx.Int32(0))
+    if row.waves == 1:
+        return low, high, nan
+    lows, highs, nans = _exchange(row, [low.bitcast(fx.Int32), high.bitcast(fx.Int32), nan])
+    low, high, nan = fx.Float32(float("inf")), fx.Float32(float("-inf")), fx.Int32(0)
+    for value in lows:
+        low = _minnum(low, value.bitcast(fx.Float32))
+    for value in highs:
+        high = _maxnum(high, value.bitcast(fx.Float32))
+    for value in nans:
+        nan = nan | value
+    return low, high, nan
+
+
+def _key_bounds(row, high_key, low_key):
+    high_key, low_key = _reduce(high_key, _umax), _reduce(low_key, _umin)
+    if row.waves == 1:
+        return high_key, low_key
+    highs, lows = _exchange(row, [high_key, low_key])
+    high_key, low_key = fx.Int32(0), fx.Int32(-1)
+    for value in highs:
+        high_key = _umax(high_key, value)
+    for value in lows:
+        low_key = _umin(low_key, value)
+    return high_key, low_key
+
+
+def _row_threshold(row, need):
+    """(bin, count above it, its size) of the need-th largest element over the row's waves."""
+    if row.waves == 1:
+        return _threshold(row.hist, need, row.lane)
+    owned = []
+    for i in range(BINS // 64):
+        total = fx.Int32(0)
+        for w in range(row.waves):
+            total = total + _load(row.hist_base + w * HIST + (row.lane * (BINS // 64) + i) * 4)
+        owned.append(total)
+    return _threshold_owned(owned, need, row.lane)
+
+
+def _split(row, bin):
+    """This wave's (count above bin, count in bin)."""
+    above = fx.Int32(0)
+    for i in range(BINS // 64):
+        index = row.lane * (BINS // 64) + i
+        above = above + (index > bin).select(_load(row.hist + index * 4), fx.Int32(0))
+    return _reduce(above, lambda a, b: a + b), _load(row.hist + bin * 4)
+
+
+def _gather_bases(row, bin):
+    if row.waves == 1:
+        _sync()
+        return fx.Int32(0), fx.Int32(0)
+    return _bases(row, *_split(row, bin))
+
+
+@flyc.jit
+def _radix(logits, base, count, row):
+    # Ordered-key radix: live keys share bits above `top`; <= 8-bit digits refine the 512th key.
+    first, last = _span(row, count)
+    high_key, low_key = _sweep_keys(logits, base, count, row.lane, first, last)
+    top, prefix_mask, prefix = _key_range(*_key_bounds(row, high_key, low_key))
     need, whole = fx.Int32(TOPK), fx.Int32(0)
+    # This wave's keys above the resolved prefix, and in its current bin (all live keys at first).
+    mine = fx.Int32(0)
+    inside = _min(last * (64 * UNROLL), count) - first * (64 * UNROLL)
+    inside = (inside > 0).select(inside, fx.Int32(0))
     while (top >= 0) & (whole == 0):
         width = (top + 1 < 8).select(top + 1, fx.Int32(8))
         shift = top - width + 1
+        _row_sync(row)
+        _clear(row.hist, row.lane)
         _sync()
-        _clear(bins, lane)
-        _sync()
-        _sweep_radix(logits, base, count, lane, bins, prefix, prefix_mask, shift, width)
-        _sync()
-        bin, above, size = _threshold(bins, need, lane)
+        _sweep_radix(logits, base, count, row.lane, row.hist, prefix, prefix_mask, shift, width, first, last)
+        _row_sync(row)
+        bin, above, size = _row_threshold(row, need)
+        higher, inside = _split(row, bin)
+        mine = mine + higher
         need = need - above
         prefix = prefix | (bin << shift)
         prefix_mask = prefix_mask | (((fx.Int32(1) << width) - 1) << shift)
         whole = (size == need).select(fx.Int32(1), fx.Int32(0))
         top = (size == need).select(top, shift - 1)
     # Keys above the 512th key ascending, then the kept ties ascending.
-    _sweep_select(logits, base, count, lane, chosen, prefix, prefix_mask, whole, need)
+    _row_sync(row)
+    kept, ties = _bases(row, mine + (whole != 0).select(inside, fx.Int32(0)), (whole != 0).select(fx.Int32(0), inside))
+    _sweep_select(logits, base, count, row.lane, row.chosen, prefix, prefix_mask, whole, need, first, last,
+                  kept, ties)
+    return TOPK - need
+
+
+def _max(a, b):
+    return (a > b).select(a, b)
+
+
+def _emit_ascending(output, chosen, merged, split, lane, threads, sync):
+    # chosen[:split] (A) and chosen[split:] (B) are ascending. Merge path: each thread binary
+    # searches where its output diagonal crosses the runs, merges its outputs into LDS `merged`
+    # (1 KiB of finished scratch), and coalesced 16-byte stores then write four tokens per block.
+    per = TOPK // threads
+    diagonal = lane * per
+    count = fx.Int32(TOPK) - split
+    low = _max(diagonal - count, fx.Int32(0))
+    high = _min(diagonal, split)
+    for _ in range(10):
+        active = low < high
+        mid = (low + high) >> 1
+        a = _load16(chosen + _min(mid, fx.Int32(TOPK - 1)) * 2)
+        b = _load16(chosen + _min(_max(split + diagonal - mid - 1, fx.Int32(0)), fx.Int32(TOPK - 1)) * 2)
+        right = a < b
+        low = (active & right).select(mid + 1, low)
+        high = active.select(right.select(high, mid), high)
+    i, j = low, diagonal - low
+    for k in range(per):
+        a = (i < split).select(_load16(chosen + _min(i, fx.Int32(TOPK - 1)) * 2), fx.Int32(1 << 16))
+        b = (j < count).select(_load16(chosen + _min(split + j, fx.Int32(TOPK - 1)) * 2), fx.Int32(1 << 16))
+        first = a < b
+        _store16(merged + (diagonal + k) * 2, first.select(a, b))
+        i = first.select(i + 1, i)
+        j = first.select(j, j + 1)
+    sync()
+    for k in range(TOPK // threads):
+        index = lane + k * threads
+        value = _load16(merged + index * 2)
+        tokens = fx.Vector.from_elements([value * RATIO + r for r in range(RATIO)], fx.Int32)
+        rocdl.raw_ptr_buffer_store(tokens.ir_value(), output, (index * (RATIO * 4)).ir_value(),
+                                   fx.Int32(0).ir_value(), aux=rocdl_aux(0))
 
 
 @flyc.jit
-def _select(logits, base, count, lane, bins, chosen, output):
-    low, high, nan = _sweep_minmax(logits, base, count, lane)
-    low, high = _reduce(low, _minnum), _reduce(high, _maxnum)
+def _rank_row(row, size, above):
+    if fx.const_expr(row.waves == 1):
+        _rank(row.cand, row.chosen, row.lane, size, above)
+    else:
+        if row.wave == 0:
+            _rank(row.cand, row.chosen, row.lane, size, above)
+
+
+@flyc.jit
+def _select(logits, base, count, row, low, high, nan):
+    """Top-512 block ids of a row whose logits lie in [low, high] (nan: any NaN) into row.chosen, as
+    two ascending runs; returns where the second run starts."""
+    first, last = _span(row, count)
     scale = fx.Float32(float(BINS)) / (high - low)
     done = fx.Int32(0)
-    if ((_ballot(nan != 0) == 0) & _finite(low) & _finite(high) & (high > low) & _finite(scale)):
+    split = fx.Int32(0)
+    if ((nan == 0) & _finite(low) & _finite(high) & (high > low) & _finite(scale)):
         # x <= y implies digit(x) <= digit(y): bins partition blocks by value.
-        _clear(bins, lane)
+        _clear(row.hist, row.lane)
         _sync()
-        _sweep_hist(logits, base, count, lane, bins, low, scale)
-        _sync()
-        bin, above, size = _threshold(bins, fx.Int32(TOPK), lane)
+        _sweep_hist(logits, base, count, row.lane, row.hist, low, scale, first, last)
+        _row_sync(row)
+        bin, above, size = _row_threshold(row, fx.Int32(TOPK))
         if size <= CANDIDATES:
-            _sync()
-            _sweep_gather(logits, base, count, lane, bins, chosen, low, scale, bin)
-            _sync()
-            _rank(bins, chosen, lane, size, above)
+            kept, gathered = _gather_bases(row, bin)
+            _sweep_gather(logits, base, count, row.lane, row.cand, row.chosen, low, scale, bin, first, last,
+                          kept, gathered)
+            _row_sync(row)
+            _rank_row(row, size, above)
             done = fx.Int32(1)
+            split = above
     if done == 0:
-        _radix(logits, base, count, lane, bins, chosen)
-    _sync()
-    for i in range(TOPK * RATIO // 64):
-        token = lane + i * 64
-        value = _load16(chosen + (token >> 2) * 2) * RATIO + (token & (RATIO - 1))
-        _put(output, token, value)
+        split = _radix(logits, base, count, row)
+    return split
+
+
+def _bounds(logits, base, count, row, STATS, index):
+    """The row's (low, high, any NaN): from the logits kernel's stats if given, else swept here."""
+    if STATS is None:
+        first, last = _span(row, count)
+        return _row_minmax(row, *_sweep_minmax(logits, base, count, row.lane, first, last))
+    # (min bits, ~max bits) of logits >= 0 over a superset of this row's causal keys: any NaN
+    # orders above +inf. Wider bounds keep the digit monotone, so selection stays exact.
+    low = fx.Int32(_uniform(STATS[2 * index]))
+    high = ~fx.Int32(_uniform(STATS[2 * index + 1]))
+    return (low.bitcast(fx.Float32), high.bitcast(fx.Float32),
+            _ugt(high, fx.Int32(0x7F800000)).select(fx.Int32(1), fx.Int32(0)))
 
 
 @flyc.jit
-def _write_row(LOGITS, stride, local, row, count, visible, length, OUT, lane, bins, chosen):
-    output = _buffer(fx.make_view(fx.get_iter(OUT) + fx.Int64(row) * WIDTH, fx.make_layout(1, 1)), WIDTH * 4)
+def _write_row(LOGITS, stride, local, out_row, count, visible, length, OUT, row, STATS):
+    # Logits row `local` (row stride `stride`) selects output row `out_row`.
+    output = _buffer(fx.make_view(fx.get_iter(OUT) + fx.Int64(out_row) * WIDTH, fx.make_layout(1, 1)), WIDTH * 4)
     blocks = count
     if count <= TOPK:
-        for token in range(lane, count * RATIO, fx.Int32(64)):
+        for token in range(row.thread, count * RATIO, fx.Int32(row.threads)):
             _put(output, token, token)
     else:
         blocks = fx.Int32(TOPK)
         logits = _buffer(LOGITS, fx.Int32(0x7FFFFFF0))
-        _select(logits, local * stride * 4, count, lane, bins, chosen, output)
+        base = local * stride * 4
+        low, high, nan = _bounds(logits, base, count, row, STATS, out_row)
+        split = _select(logits, base, count, row, low, high, nan)
+        _row_sync(row)
+        _emit_ascending(output, row.chosen, row.merged, split, row.thread, row.threads, _sync_of(row))
     tail_start = visible // RATIO * RATIO
     tail_count = visible - tail_start
-    for index in range(blocks * RATIO + lane, fx.Int32(WIDTH), fx.Int32(64)):
+    for index in range(blocks * RATIO + row.thread, fx.Int32(WIDTH), fx.Int32(row.threads)):
         column = fx.Int32(index)
         offset = column - blocks * RATIO
         token = tail_start + offset
@@ -425,76 +619,105 @@ def _write_row(LOGITS, stride, local, row, count, visible, length, OUT, lane, bi
 
 
 @flyc.jit
-def _row(LOGITS, stride, row0, POSITIONS, ROW_INFO, OUT, VALID, local, lane, bins, chosen):
-    row = row0 + local
-    expected, length = _uniform(ROW_INFO[2 * row]), _uniform(ROW_INFO[2 * row + 1])
-    if (lane == 0) & (fx.Int64(POSITIONS[row]) != fx.Int64(expected)):
-        VALID[0] = fx.Int32(0)
+def _row(LOGITS, stride, row0, POSITIONS, ROW_INFO, OUT, STATS, local, row):
+    index = row0 + local
+    expected, length = _uniform(ROW_INFO[2 * index]), _uniform(ROW_INFO[2 * index + 1])
+    if fx.Int64(POSITIONS[index]) != fx.Int64(expected):
+        # s_trap 2: the queue enters the error state and the process aborts.
+        llvm.intr_trap()
     visible = expected + 1
     count = visible // RATIO
     count = (count < length // RATIO).select(count, length // RATIO)
-    _write_row(LOGITS, stride, local, row, count, visible, length, OUT, lane, bins, chosen)
+    _write_row(LOGITS, stride, local, index, count, visible, length, OUT, row, STATS)
 
 
 @flyc.kernel(name="qsa_indexer_topk", known_block_size=[256, 1, 1])
 def _kernel(LOGITS: fx.Tensor, stride: fx.Int32, row0: fx.Int32, rows: fx.Int32, POSITIONS: fx.Tensor,
-            ROW_INFO: fx.Tensor, OUT: fx.Tensor, VALID: fx.Tensor):
+            ROW_INFO: fx.Tensor, OUT: fx.Tensor, STATS: fx.Tensor):
     storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, WAVES * (SCRATCH + CHOSEN), 16]).peek()
     shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(WAVES * (SCRATCH + CHOSEN), 1)))))
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     local = _uniform(fx.Int32(gpu.block_id("x")) * WAVES + wave)
+    # One wave per row: the histogram scratch also holds the candidates and the merge.
+    bins = shared + wave * SCRATCH
+    row = _space(1, wave, lane, bins, bins, shared + WAVES * SCRATCH + wave * CHOSEN, bins)
     if local < rows:
-        _row(LOGITS, stride, row0, POSITIONS, ROW_INFO, OUT, VALID, local, lane, shared + wave * SCRATCH,
-             shared + WAVES * SCRATCH + wave * CHOSEN)
+        _row(LOGITS, stride, row0, POSITIONS, ROW_INFO, OUT, STATS, local, row)
 
 
 @flyc.jit
 def _launch(LOGITS: fx.Tensor, stride: fx.Int32, row0: fx.Int32, rows: fx.Int32, POSITIONS: fx.Tensor,
-            ROW_INFO: fx.Tensor, OUT: fx.Tensor, VALID: fx.Tensor, ctas: fx.Int32, stream: fx.Stream):
-    _kernel(LOGITS, stride, row0, rows, POSITIONS, ROW_INFO, OUT, VALID).launch(
-        grid=(ctas, 1, 1), block=(256, 1, 1), stream=stream)
+            ROW_INFO: fx.Tensor, OUT: fx.Tensor, STATS: fx.Tensor, ctas: fx.Int32, stream: fx.Stream):
+    if ctas > 0:
+        _kernel(LOGITS, stride, row0, rows, POSITIONS, ROW_INFO, OUT, STATS).launch(
+            grid=(ctas, 1, 1), block=(256, 1, 1), stream=stream)
 
 
 _COMPILED = {}
 
 
-def launch(logits, stride, row0, rows, positions, row_info, out, valid):
+def _compiled(cache, key, launcher, args, count_index):
+    # Compile with zero work (no kernel runs), then call: first use never hides inside a capture.
+    compiled = cache.get(key)
+    if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm the QSA indexer before graph capture")
+        compiled = cache[key] = flyc.compile(launcher, *args[:count_index], 0, *args[count_index + 1:])
+    return compiled
+
+
+def launch(logits, stride, row0, rows, positions, row_info, out, stats):
     """Rows [row0, row0 + rows) of out from logits rows [0, rows) (row stride `stride`); row_info holds
-    (query position, sequence length) per row; valid is cleared if positions disagree."""
+    (query position, sequence length) per row, and a row whose position disagrees traps. stats [rows, 2]
+    int32 holds (min bits, ~max bits) of each row's logits from the logits kernel."""
     stream = torch.cuda.current_stream(logits.device)
-    args = (logits.view(-1), stride, row0, rows, positions, row_info.view(-1), out.view(-1), valid,
+    args = (logits.view(-1), stride, row0, rows, positions, row_info.view(-1), out.view(-1), stats.view(-1),
             -(-rows // WAVES), stream)
     with torch.cuda.device(logits.device):
-        compiled = _COMPILED.get(logits.device)
-        if compiled is None:
-            _COMPILED[logits.device] = flyc.compile(_launch, *args)
-        else:
-            compiled(*args)
+        _compiled(_COMPILED, logits.device, _launch, args, 8)(*args)
 
 
-@flyc.kernel(name="qsa_indexer_decode_topk", known_block_size=[256, 1, 1])
+# Decode: one CTA of DECODE_WAVES waves per row. Waves own contiguous slot-group ranges, so each
+# wave's histogram counts give its output offsets: row order and bits match the one-wave selection.
+# LDS: per-wave histograms, per-wave reduction words, 64 candidates (keys, ids), chosen ids.
+DECODE_WAVES = 8
+HIST = (BINS + 1) * 4
+D_RED = DECODE_WAVES * HIST
+D_CAND = D_RED + DECODE_WAVES * 16
+D_CHOSEN = D_CAND + 2 * CANDIDATES * 4
+D_BYTES = D_CHOSEN + TOPK * 2
+
+
+def _cta_sync():
+    llvm.fence(llvm.AtomicOrdering.seq_cst, syncscope="workgroup")
+    rocdl.s_barrier()
+    llvm.fence(llvm.AtomicOrdering.seq_cst, syncscope="workgroup")
+
+
+@flyc.kernel(name="qsa_indexer_decode_topk", known_block_size=[64 * DECODE_WAVES, 1, 1])
 def _decode_kernel(LOGITS: fx.Tensor, stride: fx.Int32, rows: fx.Int32, LENGTHS: fx.Tensor,
                    POSITIONS: fx.Tensor, SEQUENCES: fx.Tensor, OUT: fx.Tensor):
-    storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, WAVES * (SCRATCH + CHOSEN), 16]).peek()
-    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(WAVES * (SCRATCH + CHOSEN), 1)))))
+    storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, D_BYTES, 16]).peek()
+    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(D_BYTES, 1)))))
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
-    row = _uniform(fx.Int32(gpu.block_id("x")) * WAVES + wave)
-    if row < rows:
-        count = _uniform(LENGTHS[row])
-        visible = _uniform(POSITIONS[row]) + 1
-        length = _uniform(SEQUENCES[row])
-        _write_row(LOGITS, stride, row, row, count, visible, length, OUT, lane,
-                   shared + wave * SCRATCH, shared + WAVES * SCRATCH + wave * CHOSEN)
+    row = fx.Int32(gpu.block_id("x"))
+    count = _uniform(LENGTHS[row])
+    visible = _uniform(POSITIONS[row]) + 1
+    length = _uniform(SEQUENCES[row])
+    space = _space(DECODE_WAVES, wave, lane, shared + wave * HIST, shared + D_CAND, shared + D_CHOSEN, shared,
+                   hist_base=shared, red=shared + D_RED)
+    _write_row(LOGITS, stride, row, row, count, visible, length, OUT, space, None)
 
 
 @flyc.jit
 def _launch_decode(LOGITS: fx.Tensor, stride: fx.Int32, rows: fx.Int32, LENGTHS: fx.Tensor,
                    POSITIONS: fx.Tensor, SEQUENCES: fx.Tensor, OUT: fx.Tensor,
                    ctas: fx.Int32, stream: fx.Stream):
-    _decode_kernel(LOGITS, stride, rows, LENGTHS, POSITIONS, SEQUENCES, OUT).launch(
-        grid=(ctas, 1, 1), block=(256, 1, 1), stream=stream)
+    if ctas > 0:
+        _decode_kernel(LOGITS, stride, rows, LENGTHS, POSITIONS, SEQUENCES, OUT).launch(
+            grid=(ctas, 1, 1), block=(64 * DECODE_WAVES, 1, 1), stream=stream)
 
 
 _COMPILED_DECODE = {}
@@ -503,12 +726,7 @@ _COMPILED_DECODE = {}
 def launch_decode(logits, lengths, positions, sequence_lengths, out):
     rows, stride = logits.shape
     stream = torch.cuda.current_stream(logits.device)
-    args = (logits.view(-1), stride, rows, lengths, positions, sequence_lengths, out.view(-1),
-            -(-rows // WAVES), stream)
+    args = (logits.view(-1), stride, rows, lengths, positions, sequence_lengths, out.view(-1), rows, stream)
     key = (logits.device, lengths.dtype, positions.dtype, sequence_lengths.dtype)
     with torch.cuda.device(logits.device):
-        compiled = _COMPILED_DECODE.get(key)
-        if compiled is None:
-            _COMPILED_DECODE[key] = flyc.compile(_launch_decode, *args)
-        else:
-            compiled(*args)
+        _compiled(_COMPILED_DECODE, key, _launch_decode, args, 7)(*args)

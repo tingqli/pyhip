@@ -1,4 +1,4 @@
-"""Synthetic full QSA/forced-direct/forced-union and matched causal dense comparison.
+"""Synthetic full QSA, forced direct/union and complete-causal-prefix comparison.
 
 No model, captured dataset or integration hooks are used. Every timed output is
 checked; allocation, references and JIT are outside the unchanged cudaPerf timer.
@@ -13,7 +13,6 @@ import statistics
 import sys
 from types import SimpleNamespace
 
-import msgspec
 import numpy as np
 import pytest
 import torch
@@ -29,55 +28,54 @@ from tests.ops.qsa._benchmark import (
     recording_matrix, source_files, write_summary,
 )
 
-SCOPES = ("qsa", "forced_direct", "forced_union", "prefix_dense", "prefix_qsa",
-          "prefix_direct", "prefix_union")
+SCOPES = ("qsa", "forced_direct", "forced_union", "prefix_qsa", "prefix_direct", "prefix_union")
 
 
 def _case(value, scope):
     workspace = _runtime._Workspace(value.q, value.k, value.v, value.indices,
                                     value.query_lens, value.prefix_lens, value.scale)
-    if scope in ("prefix_direct", "prefix_union"):
-        skips = (0,)
-        workspace.dense = msgspec.structs.replace(workspace.dense, calls=(), query_counts=skips)
-        inputs = workspace.bind(value.q, value.k, value.v, value.indices)
-        workspace.union = _runtime.prepare.allocate_plan(inputs=inputs, query_tile=32, skip_counts=skips)
-        workspace.direct = _runtime.direct.prepare(inputs=inputs, skip_counts=skips, union=workspace.union)
-    if scope in ("forced_direct", "prefix_direct", "forced_union", "prefix_union") and workspace.union is not None:
-        workspace.union.max_union_inflation = -1.0 if scope.endswith("direct") else math.inf
-        workspace.union.packed_direct = False
+    inputs = workspace.bind(value.q, value.k, value.v, value.indices)
+    if scope.endswith("direct"):
+        # Direct-only: no union plan, ungated direct over every row.
+        workspace.union = None
+        workspace.direct = _runtime.direct.prepare(inputs=inputs)
+    elif scope.endswith("union"):
+        if workspace.union is None:
+            workspace.union = _runtime.prepare.allocate_plan(inputs=inputs, query_tile=32)
+            workspace.direct = _runtime.direct.prepare(inputs=inputs, union=workspace.union)
+        workspace.union.union_ratio = math.inf
+        workspace.union.routing = False
     return SimpleNamespace(value=value, scope=scope, workspace=workspace, output=torch.empty_like(value.q))
 
 
 def _run(case):
     w, v = case.workspace, case.value
     inputs = w.bind(v.q, v.k, v.v, v.indices)
-    if case.scope != "prefix_dense":
-        _runtime.prepare.run(inputs=inputs, plan=w.union, errors=w.errors, valid=w.valid)
-    _runtime.dense.run(inputs=inputs, prepared=w.dense, out=case.output)
+    _runtime.prepare.run(inputs=inputs, plan=w.union)
     if w.union is not None:
         _runtime.union.run(inputs=inputs, plan=w.union, out=case.output)
-        _runtime.direct.run(inputs=inputs, prepared=w.direct, out=case.output)
+    _runtime.direct.run(inputs=inputs, prepared=w.direct, out=case.output)
     return case.output
 
 
 def _routes(case):
     plan = case.workspace.union
     rows = len(case.value.q)
-    dense = sum(case.workspace.dense.query_counts)
     union = 0
     union_pairs = selected_pairs = 0
     if plan is not None:
         meta, active, counts = plan.metadata.cpu().tolist(), plan.active.cpu().tolist(), plan.counts.cpu().tolist()
         for row, enabled, count in zip(meta, active, counts):
             first, n, _, _, pos = row
-            union += n * enabled
-            union_pairs += n * count[0]
-            selected_pairs += sum(min((pos + i + 1) // 4, 512) + bool((pos + i + 1) % 4) for i in range(n))
-        if case.scope.endswith("direct"):
-            assert not any(active)
+            if enabled:
+                union += n
+                union_pairs += n * count
+                selected_pairs += sum(min((pos + i + 1) // 4, 512) + bool((pos + i + 1) % 4) for i in range(n))
         if case.scope.endswith("union"):
             assert all(active)
-    return dict(rows=rows, dense_rows=dense, union_rows=union, direct_rows=rows - dense - union,
+    if case.scope.endswith("direct"):
+        assert plan is None
+    return dict(rows=rows, union_planned=plan is not None, union_rows=union, direct_rows=rows - union,
                 union_inflation=union_pairs / selected_pairs if selected_pairs else None)
 
 
@@ -89,12 +87,12 @@ def _scope_table(name, report):
     rows = []
     for scope, route in report["routes"].items():
         timing = report["summary"].get(scope, {})
-        rows.append((scope, route["rows"], route["dense_rows"], route["union_rows"], route["direct_rows"],
+        rows.append((scope, route["rows"], route["union_rows"], route["direct_rows"],
                      route["union_inflation"], timing.get("median_us"), timing.get("min_us"),
                      timing.get("max_us"), timing.get("effective_tflops")))
     status = "complete" if report["complete"] else report.get("error", "incomplete")
     title = f"\n{name}: TP{report['tp_size']}, {report['rows']} rows, GPU {report['gpu']} ({status})"
-    return "\n".join([title, format_table(("Scope", "Rows", "Dense", "Union", "Direct", "Inflation",
+    return "\n".join([title, format_table(("Scope", "Rows", "Union", "Direct", "Inflation",
                                              "Median_us", "Min_us", "Max_us", "TFLOPS"), rows)])
 
 
@@ -112,9 +110,9 @@ def benchmark(rows, tp_size, folder, gpu, *, buffers=10, samples=128, check_only
     hashes = lambda: {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
     report = dict(complete=False, raw=[], summary={}, gpu=gpu, tp_size=tp_size, buffers=buffers,
                   warmup=2, samples=samples, rows=rows, synthetic=True, check_only=check_only,
-                  source_sha256=hashes(), routes={}, scope="qsa/forced_*: full rebuilt plan and dispatch, private "
-                  "workspace; argument/cache lookup, output allocation and JIT excluded equally. prefix_* uses "
-                  "only the identical complete causal prefix; prefix_dense excludes preparation.")
+                  source_sha256=hashes(), routes={}, scope="qsa/forced_union: full rebuilt plan and dispatch; "
+                  "forced_direct: no union plan. Private workspace; argument/cache lookup, output allocation "
+                  "and JIT excluded equally. prefix_* uses only the identical complete causal prefix.")
     try:
         with torch.cuda.device(gpu):
             host, config = make_case(rows, 24 // tp_size, seed=seed)

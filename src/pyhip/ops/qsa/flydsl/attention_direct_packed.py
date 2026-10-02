@@ -9,8 +9,8 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 
 from pyhip.codegen.flydsl.helpers import rocdl_aux
@@ -22,21 +22,102 @@ from pyhip.ops.mha.flydsl._common import (
     _min,
     _pack_bf16,
     _pin,
+    _read_address,
     _stage_end,
     _uniform,
     _wait,
 )
-from .attention_direct import _enabled, _load, _output
 
 
-def _pack_block(kr, vr, pk, pv, pair, half, lane, n, hk):
+def _load(resource, offset, lane):
+    parts = [
+        _buffer_words(resource, offset + (lane >> 4) * 16 + k * 64) for k in range(8)
+    ]
+    return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
+
+
+def _enabled(row, rows, first, query_tiles, active, gated, nq):
+    valid = row < rows
+    if gated:
+        # Padded waves read the tile's last row; valid already excludes them.
+        tile = fx.Int32(query_tiles[first + _min(row, rows - 1)])
+        valid = valid & (fx.Int32(active[tile]) == 0)
+    return valid
+
+
+def _output(
+    o0,
+    o1,
+    inv,
+    buffer,
+    shared,
+    tid,
+    h,
+    g,
+    rows,
+    extent,
+    threads,
+    first,
+    query_tiles,
+    active,
+    gated,
+    nq,
+):
+    row = (tid >> 6) * 16 + (tid & 15)
+    for half in range(2):
+        acc = o1 if half else o0
+        for i in range(4):
+            values = fx.Vector.from_elements(
+                [acc[n * 4 + i] * inv for n in range(8)], fx.Float32
+            )
+            words = _pack_bf16(values)
+            col = (((tid >> 4) & 3) * 4 + i) * 8 + half * 128
+            address = fx.Int32(shared + ((row * 256 + col) ^ ((row & 7) * 8)) * 2)
+            llvm.inline_asm(
+                ir.Type.parse("!llvm.void"),
+                [address.ir_value(), words.ir_value()],
+                "ds_write_b128 $0, $1",
+                "v,v,~{memory}",
+                has_side_effects=True,
+            )
+    _wait(lgkmcnt=0)
+    _stage_end()
+    parts = []
+    for part in range(8):
+        element = tid * 8 + part * threads * 8
+        parts.append(
+            _read_address(shared + (element ^ (((element // 256) & 7) * 8)) * 2)
+        )
+    _wait(lgkmcnt=0)
+    rocdl.sched_barrier(0)
+    for part in range(8):
+        element = tid * 8 + part * threads * 8
+        r, col = element // 256, element % 256
+        query, head = r // 16, r % 16
+        enabled = _enabled(query, rows, first, query_tiles, active, gated, nq) & (
+            head < g
+        )
+        offset = enabled.select(
+            query * h * 256 + head * 256 + col, fx.Int32(extent // 2)
+        )
+        fragment = fx.make_rmem_tensor(8, fx.BFloat16)
+        fragment.store(parts[part].bitcast(fx.BFloat16))
+        fx.copy(
+            fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16),
+            fragment,
+            fx.make_view(fx.get_iter(buffer) + offset, fx.make_layout(8, 1)),
+        )
+
+
+def _pack_block(kr, vr, pk, pv, sources, pair, half, lane, packed, hk, source_extent, extent):
     block, head = pair // hk, pair % hk
-    valid = pair < n // 4 * hk
-    extent = n * hk * 512
+    valid = pair < packed * hk
+    start = fx.Int32(sources[_min(block, packed - 1)])
     token, chunk = lane >> 4, lane & 15
     dim = half * 128 + chunk * 8
+    # Tokens past a request's end are masked by the direct kernel.
     source = valid.select(
-        ((block * 4 + token) * hk + head) * 512 + dim * 2, fx.Int32(extent)
+        ((start + token) * hk + head) * 512 + dim * 2, fx.Int32(source_extent)
     )
     key = _buffer_words(kr, source)
     target = (
@@ -88,39 +169,33 @@ def _pack_block(kr, vr, pk, pv, pair, half, lane, n, hk):
 
 
 @flyc.jit
-def _pack_body(K, V, PK, PV, N, HK):
+def _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK):
     tid = fx.Int32(gpu.thread_id("x"))
     lane, half = tid & 63, (tid >> 6) & 1
     first = fx.Int32(gpu.block_id("x")) * 8 + (tid >> 7)
-    extent = N * HK * 512
-    kr, vr = _buffer(K, extent), _buffer(V, extent)
+    source_extent, extent = N * HK * 512, PACKED * 4 * HK * 512
+    kr, vr = _buffer(K, source_extent), _buffer(V, source_extent)
     pk, pv = _buffer(PK, extent), _buffer(PV, extent)
     for u in fx.range_constexpr(4):
-        _pack_block(kr, vr, pk, pv, first + u * 2, half, lane, N, HK)
+        _pack_block(kr, vr, pk, pv, SOURCES, first + u * 2, half, lane, PACKED, HK,
+                    source_extent, extent)
 
 
 @flyc.kernel(name="attention_pack_kv_bf16_d256")
 def _pack(
-    K: fx.Tensor, V: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor,
-    N: fx.Int32, HK: fx.Constexpr[int],
+    K: fx.Tensor, V: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor, SOURCES: fx.Tensor,
+    N: fx.Int32, PACKED: fx.Int32, HK: fx.Constexpr[int],
 ):
-    _pack_body(K, V, PK, PV, N, HK)
+    _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK)
 
 
 @flyc.kernel(name="attention_pack_kv_bf16_d256")
 def _pack_gated(
-    K: fx.Tensor, V: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor, ACTIVE: fx.Tensor,
-    N: fx.Int32, HK: fx.Constexpr[int], COUNT: fx.Int32,
+    K: fx.Tensor, V: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor, SOURCES: fx.Tensor, DIRECT_FLAG: fx.Tensor,
+    N: fx.Int32, PACKED: fx.Int32, HK: fx.Constexpr[int],
 ):
-    lane = fx.Int32(gpu.thread_id("x")) & 63
-    needed = fx.Int32(0)
-    for first in range(fx.Int32(0), fx.Int32(COUNT), fx.Int32(64)):
-        index = first + lane
-        active = fx.Int32(ACTIVE[_min(index, fx.Int32(COUNT - 1))])
-        needed = needed | ((index < COUNT) & (active == 0)).select(fx.Int32(1), fx.Int32(0))
-    ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (needed != 0).ir_value()))
-    if ballot != 0:
-        _pack_body(K, V, PK, PV, N, HK)
+    if _uniform(DIRECT_FLAG[0]) != 0:
+        _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK)
 
 
 def _key_offset(cached, n, visible, extent, hk):
@@ -242,21 +317,18 @@ def _rescale(output0, output1, alpha):
 
 @flyc.jit
 def _body(
-    Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
-    BLOCKS: fx.Tensor, META: fx.Tensor, ACTIVE: fx.Tensor, QUERY_TILES: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Int32, NK: fx.Int32,
-    GATED: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
+    Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, BLOCKS: fx.Tensor, META: fx.Tensor,
+    tile, hkv, H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Int32, NK: fx.Int32,
+    SCALE: fx.Constexpr[float],
 ):
     storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, 8192, 16]).peek().view(fx.make_layout(8192, 1))
     shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
-    task = fx.Int32(gpu.block_id("x"))
-    tile, hkv = task // HK, task % HK
     first, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
     k0, kv_len = _uniform(META[tile * 5 + 2]), _uniform(META[tile * 5 + 3])
     position0 = _uniform(META[tile * 5 + 4])
-    valid_wave = _enabled(wave, rows, first, QUERY_TILES, ACTIVE, GATED, NQ)
+    valid_wave = _enabled(wave, rows, first, None, None, False, NQ)
     visible = position0 + wave + 1
     count = _min(visible >> 2, fx.Int32(512)) * 4 + (visible & 3)
     tiles = valid_wave.select((count + 31) >> 5, fx.Int32(0))
@@ -291,7 +363,7 @@ def _body(
         rocdl.sched_barrier(0)
         values0 = _value_load(vr, vrow0, t, 0, 0, lane, visible, HK)
         values1 = _value_load(vr, vrow0, t, 0, 1, lane, visible, HK)
-        if (((t + 1) & 7) == 0) & (t < 2147483647):
+        if ((t + 1) & 7) == 0:
             chunk = _min((t + 1) >> 3, fx.Int32(7)) * 64
             next_cached = fx.Int32(blocks[row * 512 + chunk + lane])
         rocdl.sched_barrier(0)
@@ -319,7 +391,7 @@ def _body(
         rocdl.sched_barrier(0)
         _wait(vmcnt=0)
         rocdl.sched_barrier(0)
-        if (((t + 1) & 7) == 0) & (t < 2147483647):
+        if ((t + 1) & 7) == 0:
             cached = next_cached
         following0 = _min((t + 1) * 32, (((count + 15) >> 4) - 1) * 16)
         following1 = _min((t + 1) * 32 + 16, (((count + 15) >> 4) - 1) * 16)
@@ -340,98 +412,80 @@ def _body(
         rocdl.sched_barrier(0)
         _wait(vmcnt=16)
         rocdl.sched_barrier(0)
-        if t < tiles:
-            o0 = _pv(p1, next_values0, o0)
-            o1 = _pv(p1, next_values1, o1)
+        o0 = _pv(p1, next_values0, o0)
+        o1 = _pv(p1, next_values1, o1)
         maximum = updated
     _wait(vmcnt=0)
     _stage_end()
     inv = (total > 0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
     outptr = fx.get_iter(O) + (fx.Int64(first) * H + hkv * (H // HK)) * 256
     output = rocdl.make_buffer_tensor(fx.make_view(outptr, fx.make_layout(NQ * H * 256, 1)), num_records_bytes=qe)
-    _output(o0, o1, inv, output, shared, tid, H, H // HK, rows, qe, 64, first, QUERY_TILES, ACTIVE, GATED, NQ)
+    _output(o0, o1, inv, output, shared, tid, H, H // HK, rows, qe, 64, first, None, None, False, NQ)
 
 
 @flyc.kernel(name="attention_direct_bf16_d256")
 def _kernel(
-    Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
-    BLOCKS: fx.Tensor, META: fx.Tensor, ACTIVE: fx.Tensor, QUERY_TILES: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Int32, NK: fx.Int32,
-    GATED: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
+    Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, BLOCKS: fx.Tensor, META: fx.Tensor,
+    ACTIVE: fx.Tensor, UNION_META: fx.Tensor, H: fx.Constexpr[int], HK: fx.Constexpr[int],
+    NQ: fx.Int32, NK: fx.Int32, GATED: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
 ):
+    task = fx.Int32(gpu.block_id("x"))
     if fx.const_expr(GATED):
-        tile = fx.Int32(gpu.block_id("x")) // HK
-        first = _uniform(META[tile * 5])
-        group = _uniform(QUERY_TILES[first])
-        if _uniform(ACTIVE[group]) == 0:
-            _body(Q, K, V, O, BLOCKS, META, ACTIVE, QUERY_TILES, H, HK, NQ, NK, GATED, SCALE)
+        # Grid (row * HK + head, union tile): one round of independent loads gates a slot.
+        tile, local = fx.Int32(gpu.block_id("y")), task // HK
+        first, rows = _uniform(UNION_META[tile * 5]), _uniform(UNION_META[tile * 5 + 1])
+        if (_uniform(ACTIVE[tile]) == 0) & (local < rows):
+            _body(Q, K, V, O, BLOCKS, META, first + local, task % HK, H, HK, NQ, NK, SCALE)
     else:
-        _body(Q, K, V, O, BLOCKS, META, ACTIVE, QUERY_TILES, H, HK, NQ, NK, GATED, SCALE)
+        _body(Q, K, V, O, BLOCKS, META, task // HK, task % HK, H, HK, NQ, NK, SCALE)
 
 
 @flyc.jit
 def _launch(
     Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, PK: fx.Tensor, PV: fx.Tensor,
-    BLOCKS: fx.Tensor, META: fx.Tensor, ACTIVE: fx.Tensor, QUERY_TILES: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Int32, NK: fx.Int32,
-    TASKS: fx.Int32, GATED: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
-    ACTIVE_COUNT: fx.Int32, stream: fx.Stream,
+    SOURCES: fx.Tensor, BLOCKS: fx.Tensor, META: fx.Tensor, ACTIVE: fx.Tensor, UNION_META: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor, H: fx.Constexpr[int], HK: fx.Constexpr[int], NQ: fx.Int32, NK: fx.Int32,
+    PACKED: fx.Int32, BQ: fx.Int32, TILES: fx.Int32, TASKS: fx.Int32, GATED: fx.Constexpr[bool],
+    SCALE: fx.Constexpr[float], stream: fx.Stream,
 ):
     if TASKS > 0:
         if fx.const_expr(GATED):
-            _pack_gated(K, V, PK, PV, ACTIVE, NK, HK, ACTIVE_COUNT).launch(
-                grid=((NK // 4 * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
+            _pack_gated(K, V, PK, PV, SOURCES, DIRECT_FLAG, NK, PACKED, HK).launch(
+                grid=((PACKED * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
             )
         else:
-            _pack(K, V, PK, PV, NK, HK).launch(
-                grid=((NK // 4 * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
+            _pack(K, V, PK, PV, SOURCES, NK, PACKED, HK).launch(
+                grid=((PACKED * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
             )
-        _kernel(
-            Q, PK, PV, O, BLOCKS, META, ACTIVE, QUERY_TILES,
-            H, HK, NQ, NK, GATED, SCALE,
+        kernel = _kernel(
+            Q, PK, PV, O, BLOCKS, META, ACTIVE, UNION_META,
+            H, HK, NQ, PACKED * 4, GATED, SCALE,
             value_attrs={
                 "llvm.target_features": ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')
             },
-        ).launch(grid=(TASKS, 1, 1), block=(64, 1, 1), stream=stream)
-
-
-_COMPILED = {}
-
-
-def _compile(*, inputs, prepared, out):
-    key = (inputs.q.device, inputs.q.shape[1], inputs.k.shape[1], prepared.gated, inputs.scale)
-    compiled = _COMPILED.get(key)
-    if compiled is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Warm packed direct QSA before graph capture")
-        packed_key = inputs.k if prepared.packed_key is None else prepared.packed_key
-        packed_value = inputs.v if prepared.packed_value is None else prepared.packed_value
-        compiled = flyc.compile(
-            _launch,
-            inputs.q.view(-1), inputs.k.view(-1), inputs.v.view(-1), out.view(-1),
-            packed_key.view(-1), packed_value.view(-1),
-            prepared.source_blocks.view(-1), prepared.metadata.view(-1),
-            prepared.active, prepared.query_tiles,
-            inputs.q.shape[1], inputs.k.shape[1], inputs.q.shape[0], inputs.k.shape[0],
-            0, prepared.gated, inputs.scale, prepared.active.numel(),
-            torch.cuda.current_stream(inputs.q.device),
         )
-        _COMPILED[key] = compiled
-    return compiled
+        if fx.const_expr(GATED):
+            kernel.launch(grid=(BQ * HK, TILES, 1), block=(64, 1, 1), stream=stream)
+        else:
+            kernel.launch(grid=(TASKS, 1, 1), block=(64, 1, 1), stream=stream)
 
 
-def run(*, inputs, prepared, out):
-    stream = torch.cuda.current_stream(inputs.q.device)
-    args = (
+def launch_args(inputs, prepared, out, tasks, stream):
+    # A raw plan compiles this path ahead of time with its public KV as stand-ins.
+    packed_key = inputs.k if prepared.packed_key is None else prepared.packed_key
+    packed_value = inputs.v if prepared.packed_value is None else prepared.packed_value
+    sources = prepared.metadata.view(-1) if prepared.pack_sources is None else prepared.pack_sources
+    return (
         inputs.q.view(-1), inputs.k.view(-1), inputs.v.view(-1), out.view(-1),
-        prepared.packed_key.view(-1), prepared.packed_value.view(-1),
+        packed_key.view(-1), packed_value.view(-1), sources,
         prepared.source_blocks.view(-1), prepared.metadata.view(-1),
-        prepared.active, prepared.query_tiles,
+        prepared.active, prepared.union_meta.view(-1), prepared.direct_flag,
         inputs.q.shape[1], inputs.k.shape[1], inputs.q.shape[0], inputs.k.shape[0],
-        prepared.num_tiles * inputs.k.shape[1], prepared.gated, inputs.scale,
-        prepared.active.numel(), stream,
+        packed_key.shape[0] // 4, prepared.union_tile, prepared.union_tiles, tasks, prepared.gated,
+        inputs.scale, stream,
     )
-    with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
-        compiled = _compile(inputs=inputs, prepared=prepared, out=out)
-        compiled(*args)
+
+
+def compile_launch(inputs, prepared, out, stream):
+    return flyc.compile(_launch, *launch_args(inputs, prepared, out, 0, stream))
 

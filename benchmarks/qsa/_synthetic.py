@@ -1,9 +1,10 @@
 """Capture-free, correlated QSA selections and a small-row CPU FP32 oracle.
 
 The profile names are qualitative historical-layer analogues, not fitted
-capture statistics. At M12000/H12, the mixed preset aims at about 17% dense,
-35--40% union and 45--50% direct. Only the measured planner counts establish
-the actual split; different heads, lengths and window boundaries change it.
+capture statistics. At M12000/H12, the mixed preset has about 17% complete
+causal-prefix rows; the remaining rows mix high- and low-sharing windows. Only
+the measured planner counts establish the actual union/direct split; different
+heads, lengths and window boundaries change it.
 """
 
 import math
@@ -89,11 +90,10 @@ a lucky draw of a handful of high-sharing windows.
         components={name: dict(PROFILES[name]) for name in components}, windows=windows,
         high_sharing_rows=high_rows, low_sharing_rows=rows - dense - high_rows,
         actual_high_sharing_fraction=high_rows / (rows - dense) if rows > dense else None,
-        dense_eligible_rows=dense, complete_blocks=512, block_tokens=4, causal_tail="0..3",
+        complete_prefix_rows=dense, complete_blocks=512, block_tokens=4, causal_tail="0..3",
         q_shape=list(value.q.shape), kv_shape=list(k.shape), prefix=0,
         note="Synthetic correlation approximates historical selections; profile parameters are assumptions, "
-             "not measured capture statistics. Routing targets apply roughly to M12000/H12 only; "
-             "use the reported actual dense/union/direct counts.",
+             "not measured capture statistics. Use the reported actual union/direct counts.",
     )
     return value, config
 

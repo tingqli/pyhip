@@ -53,48 +53,61 @@ def _source_rows(table, tile, count, wave, hk):
     return block * (4 * hk * D * 2) + (wave >> 2) * 256
 
 
-def _bounded_dma(
+def _union_dma(
     resource,
     storage,
     wave,
     lane,
     rows,
     tile,
-    kv_len,
+    compact_len,
+    limits,
     hk,
     packet,
     is_v,
     extent,
-    page,
     tail=False,
     read_address=None,
     read_immediate=0,
 ):
-    # Raw-buffer bounds exclude SOFFSET; partial physical blocks need full VOFFSET.
+    # Token k of a block reads SOFFSET min(row, limits[k]) + k rows: a partial final block re-reads
+    # the request's last token, whose K is masked and V weighted 0; with fewer than k + 1 tokens
+    # the limit is 0 and the range-checked VOFFSET + offset returns 0, so reads stay in the request.
     token, _ = linear._copy_coordinates(wave, packet, 4)
-    channel_offset = lane * 4 if is_v else (lane ^ (linear._k_phase(token) * 4)) * 4
-    offset = rows[packet // 4] + (packet & 3) * (hk * D * 2) + channel_offset
+    voffset = lane * 4 if is_v else (lane ^ (linear._k_phase(token) * 4)) * 4
+    step = (packet & 3) * hk * D * 2
+    # The instruction offset also moves the LDS destination, which M0 takes back; M0 must stay
+    # non-negative, otherwise (HK > 1) the step goes into VOFFSET.
+    destination_offset = (32768 if is_v else 0) + packet * 512
+    offset = step if step < 4096 and step <= destination_offset else 0
+    if step != offset:
+        voffset = voffset + step
     if tail:
-        offset = (tile * BN + token < kv_len).select(offset, fx.Int32(extent))
+        voffset = (tile * BN + token < compact_len).select(voffset, fx.Int32(extent))
     base_row, base_channel = linear._copy_coordinates(wave, 0, 4)
     base_destination = fx.Int32(base_row * 512 + base_channel * 2)
-    immediate = (32768 if is_v else 0) + packet * 512
+    immediate = destination_offset - offset
+    row, limit = rows[packet // 4], limits[packet & 3]
     if read_address is not None:
+        result = llvm.inline_asm(
+            ir.Type.parse("!llvm.struct<(vector<4xi32>, i32)>"),
+            [
+                fx.Int32(read_address).ir_value(),
+                resource,
+                fx.Int32(voffset).ir_value(),
+                base_destination.ir_value(),
+                fx.Int32(row).ir_value(),
+                fx.Int32(limit).ir_value(),
+            ],
+            "s_min_u32 $1, $6, $7\n"
+            f"s_add_u32 m0, $5, {immediate}\n"
+            f"ds_read_b128 $0, $2 offset:{read_immediate}\n"
+            f"buffer_load_dword $4, $3, $1 offen offset:{offset} lds",
+            "=&v,=&s,v,s,v,s,s,s,~{m0},~{scc},~{memory}",
+            has_side_effects=True,
+        )
         return fx.Vector(
-            llvm.inline_asm(
-                ir.VectorType.get([4], fx.Int32.ir_type),
-                [
-                    fx.Int32(read_address).ir_value(),
-                    resource,
-                    fx.Int32(offset).ir_value(),
-                    base_destination.ir_value(),
-                ],
-                f"s_add_u32 m0, $4, {immediate}\n"
-                f"ds_read_b128 $0, $1 offset:{read_immediate}\n"
-                "buffer_load_dword $3, $2, 0 offen lds",
-                "=&v,v,s,v,s,~{m0},~{scc},~{memory}",
-                has_side_effects=True,
-            )
+            llvm.extractvalue(ir.VectorType.get([4], fx.Int32.ir_type), result, [0])
         )
     destination = fx.Int32(
         llvm.inline_asm(
@@ -109,36 +122,11 @@ def _bounded_dma(
         resource,
         fx.to_llvm_ptr(fx.get_iter(storage) + destination),
         fx.Int32(4).ir_value(),
+        fx.Int32(voffset).ir_value(),
+        fx.Int32(_min(row, limit)).ir_value(),
         fx.Int32(offset).ir_value(),
-        fx.Int32(0).ir_value(),
-        fx.Int32(0).ir_value(),
         aux=rocdl_aux(0),
     )
-
-
-@flyc.jit
-def _mask(
-    scores,
-    masks,
-    tile,
-    query,
-    qvalid,
-    common_tiles,
-    G: fx.Constexpr[int],
-    GP: fx.Constexpr[int],
-    BQ: fx.Constexpr[int],
-):
-    values = fx.Vector(scores)
-    if tile >= common_tiles:
-        lane = fx.Int32(gpu.thread_id("x")) & 63
-        offset = (tile * BQ + _min(query, fx.Int32(BQ - 1))) * 4 + (lane >> 4)
-        bits = fx.Int32(masks[offset])
-        result = []
-        for i in fx.range_constexpr(16):
-            allowed = ((bits >> i) & 1) != 0
-            result.append(allowed.select(values[i], fx.Float32(float("-inf"))))
-        values = fx.Vector.from_elements(result, fx.Float32)
-    return values
 
 
 def _prefetch_mask(resource, tile, offset, bq):
@@ -149,9 +137,9 @@ def _prefetch_mask(resource, tile, offset, bq):
             [
                 resource,
                 fx.Int32(offset).ir_value(),
-                fx.Int32(tile * bq * 16).ir_value(),
+                fx.Int32(tile * bq * 8).ir_value(),
             ],
-            "buffer_load_dword $0, $2, $1, $3 offen",
+            "buffer_load_ushort $0, $2, $1, $3 offen",
             "=v,s,v,s,~{memory}",
             has_side_effects=True,
         )
@@ -236,14 +224,11 @@ def _body(
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
     SCALE: fx.Constexpr[float],
-    TAIL_BOUNDS: fx.Constexpr[bool],
     STAGGER: fx.Constexpr[bool],
 ):
-    read_k, read_v, dma, pv = linear._read_k, linear._read_v, linear._dma, linear._pv
-    if fx.const_expr(TAIL_BOUNDS):
-        dma = _bounded_dma
+    read_k, read_v, pv = linear._read_k, linear._read_v, linear._pv
     dma_offsets, v_operands = linear._dma_offsets, linear._v_operands
-    source_rows, mask, output_fn = _source_rows, _mask, _output
+    source_rows, output_fn = _source_rows, _output
     qk, local_sum, local_max, cross = base._qk, base._sum, base._max, base._cross
     exps, pack, center = base._exps, base._pack, base._center
     rescale, advance_max = _rescale, _advance_max
@@ -252,20 +237,19 @@ def _body(
     row_offset = ((work // HK) % slices) * 128
     q0, qvalid = _uniform(META[tile_id * 5]), _uniform(META[tile_id * 5 + 1])
     k0, kv_len = _uniform(META[tile_id * 5 + 2]), _uniform(META[tile_id * 5 + 3])
-    count = _uniform(COUNTS[tile_id * 2])
-    common_tiles = _uniform(COUNTS[tile_id * 2 + 1])
+    count = _uniform(COUNTS[tile_id])
     table = fx.make_view(fx.get_iter(BLOCKS) + tile_id * CAP, fx.make_layout(CAP, 1))
     table = _buffer(table, CAP * 4)
     masks = fx.make_view(
         fx.get_iter(MEMBERS) + tile_id * (CAP // 16) * BQ * 4,
         fx.make_layout((CAP // 16) * BQ * 4, 1),
     )
-    mask_resource = _buffer(masks, (CAP // 16) * BQ * 16)
+    mask_resource = _buffer(masks, (CAP // 16) * BQ * 8)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     row = row_offset + wave * 16 + (lane & 15)
     query, head = row // GP, row % GP
-    mask_offset = _pin_i32(_min(query, fx.Int32(BQ - 1)) * 16 + (lane >> 4) * 4)
+    mask_offset = _pin_i32(_min(query, fx.Int32(BQ - 1)) * 8 + (lane >> 4) * 2)
     valid_row = (query < qvalid) & (query < BQ) & (head < (H // HK))
     qextent = (NQ - q0) * H * D * 2 - hkv * (H // HK) * D * 2
     qptr = fx.get_iter(Q) + fx.Int64(q0) * (H * D) + hkv * (H // HK) * D
@@ -273,6 +257,10 @@ def _body(
     qoffset = valid_row.select((query * H * D + head * D) * 2, fx.Int32(qextent))
     q = base._q_fragment(gq, qoffset, lane)
     extent = (kv_len * HK - hkv) * D * 2
+    limit = (kv_len - 1) * (HK * D * 2) + (wave >> 2) * 256
+    limits = tuple(
+        (limit > k * HK * D * 2).select(limit - k * HK * D * 2, fx.Int32(0)) for k in range(4)
+    )
     gk = _buffer(
         fx.make_view(
             fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * D,
@@ -306,10 +294,11 @@ def _body(
     rows0 = source_rows(table, fx.Int32(0), count, wave, HK)
     rows1 = source_rows(table, _min(fx.Int32(1), last), count, wave, HK)
     rows2 = source_rows(table, _min(fx.Int32(2), last), count, wave, HK)
+    bits = _prefetch_mask(mask_resource, fx.Int32(0), mask_offset, BQ)
     offsets = dma_offsets(rows0, 4)
     v_offsets = offsets
     for packet in fx.range_constexpr(16):
-        dma(
+        _union_dma(
             gk,
             storage,
             wave,
@@ -317,11 +306,11 @@ def _body(
             offsets,
             fx.Int32(0),
             compact_len,
+            limits,
             HK,
             packet,
             False,
             extent,
-            4,
         )
     _wait(vmcnt=0, lgkmcnt=0)
     _stage_end()
@@ -340,9 +329,7 @@ def _body(
     _wait(lgkmcnt=0)
     _stage_end()
     hi = qk(q, k)
-    scores = mask(
-        _join(lo, hi), masks, fx.Int32(0), query, qvalid, common_tiles, H // HK, GP, BQ
-    )
+    scores = _apply_mask(_join(lo, hi), bits)
     maximum = local_max(scores)
     maximum = _maximum(maximum, maximum.shuffle_xor(16, 64))
     maximum = _maximum(maximum, maximum.shuffle_xor(32, 64))
@@ -353,7 +340,7 @@ def _body(
     offsets = dma_offsets(rows1, 4)
     current_offsets = offsets
     for packet in fx.range_constexpr(16):
-        dma(
+        _union_dma(
             gk,
             storage,
             wave,
@@ -361,11 +348,11 @@ def _body(
             offsets,
             _min(fx.Int32(1), last),
             compact_len,
+            limits,
             HK,
             packet,
             False,
             extent,
-            4,
         )
     _wait(vmcnt=0, lgkmcnt=0)
     _stage_end()
@@ -382,7 +369,6 @@ def _body(
         current_offsets,
         next_rows,
         t,
-        MASKED: fx.Constexpr[bool],
     ):
         previous, maximum, row_sum = (
             fx.Vector(previous),
@@ -392,14 +378,13 @@ def _body(
         o0, o1, t = fx.Vector(o0), fx.Vector(o1), fx.Int32(t)
         previous_offsets = fx.Vector(previous_offsets)
         current_offsets, next_rows = fx.Vector(current_offsets), fx.Int32(next_rows)
-        if fx.const_expr(MASKED):
-            bits = _prefetch_mask(mask_resource, t, mask_offset, BQ)
+        bits = _prefetch_mask(mask_resource, t, mask_offset, BQ)
         future_rows = source_rows(table, _min(t + 2, last), count, wave, HK)
         parts = []
         for n in fx.range_constexpr(2):
             for step in fx.range_constexpr(8):
                 parts.append(
-                    dma(
+                    _union_dma(
                         gv,
                         storage,
                         wave,
@@ -407,11 +392,11 @@ def _body(
                         previous_offsets,
                         t - 1,
                         compact_len,
+                        limits,
                         HK,
                         n * 8 + step,
                         True,
                         extent,
-                        4,
                         read_address=kr[n * 2 + step % 2],
                         read_immediate=(step // 2) * 128,
                     )
@@ -439,9 +424,7 @@ def _body(
         _wait(lgkmcnt=0)
         rocdl.sched_barrier(0)
         hi = qk(q, k)
-        current = _join(lo, hi)
-        if fx.const_expr(MASKED):
-            current = _apply_mask(current, bits)
+        current = _apply_mask(_join(lo, hi), bits)
         total, probabilities = local_sum(previous), pack(previous)
         offsets = dma_offsets(next_rows, 4)
         _schedule(32, 2, 2)
@@ -451,7 +434,7 @@ def _body(
         for block in fx.range_constexpr(2):
             for r in fx.range_constexpr(8):
                 parts.append(
-                    dma(
+                    _union_dma(
                         gk,
                         storage,
                         wave,
@@ -459,11 +442,11 @@ def _body(
                         offsets,
                         _min(t + 1, last),
                         compact_len,
+                        limits,
                         HK,
                         block * 8 + r,
                         False,
                         extent,
-                        4,
                         read_address=vr,
                         read_immediate=block * 16384 + r * 512,
                     )
@@ -502,42 +485,13 @@ def _body(
         _stage_end()
         return current, new_max, row_sum, o0, o1, current_offsets, offsets, future_rows
 
-    common_end = (common_tiles > 1).select(common_tiles, fx.Int32(1))
-    for t in range(fx.Int32(1), common_end - 3, fx.Int32(4)):
-        for j in fx.range_constexpr(4):
-            scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
-                scores,
-                maximum,
-                row_sum,
-                o0,
-                o1,
-                v_offsets,
-                current_offsets,
-                rows2,
-                t + j,
-                False,
-            )
-    remainder = ((common_end - 1) & -4) + 1
-    for t in range(remainder, common_end, fx.Int32(1)):
+    for t in range(fx.Int32(1), tiles, fx.Int32(1)):
         scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
-            scores,
-            maximum,
-            row_sum,
-            o0,
-            o1,
-            v_offsets,
-            current_offsets,
-            rows2,
-            t,
-            False,
-        )
-    for t in range(common_end, tiles, fx.Int32(1)):
-        scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2 = phase(
-            scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t, True
+            scores, maximum, row_sum, o0, o1, v_offsets, current_offsets, rows2, t
         )
     offsets = fx.Vector(v_offsets)
     for packet in fx.range_constexpr(16):
-        dma(
+        _union_dma(
             gv,
             storage,
             wave,
@@ -545,11 +499,11 @@ def _body(
             offsets,
             last,
             compact_len,
+            limits,
             HK,
             packet,
             True,
             extent,
-            4,
             True,
         )
     scores = exps(fx.Vector(scores))
@@ -620,7 +574,6 @@ def _kernel(
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SCALE: fx.Constexpr[float],
-    TAIL_BOUNDS: fx.Constexpr[bool],
 ):
     body = _body
     storage = (
@@ -631,12 +584,10 @@ def _kernel(
     )
     work = fx.Int32(gpu.block_id("x"))
     while work < ((TASKS + GRID - 1) // GRID) * GRID:
-        tiles = TASKS // HK
-        ordered = _uniform(ORDER[work])
-        mapped = (ordered % tiles) * HK + ordered // tiles
+        mapped = _uniform(ORDER[work])
         tile = mapped // (HK * ((BQ * GP + 127) // 128))
         enabled = fx.Int32(0)
-        if ordered >= 0:
+        if mapped >= 0:
             enabled = _uniform(ACTIVE[tile])
         if enabled != 0:
             group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
@@ -660,7 +611,6 @@ def _kernel(
                     BQ,
                     GP,
                     SCALE,
-                    TAIL_BOUNDS,
                     True,
                 )
             else:
@@ -683,7 +633,6 @@ def _kernel(
                     BQ,
                     GP,
                     SCALE,
-                    TAIL_BOUNDS,
                     False,
                 )
         work = work + GRID
@@ -711,7 +660,6 @@ def _launch(
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SCALE: fx.Constexpr[float],
-    TAIL_BOUNDS: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if GRID > 0:
@@ -736,7 +684,6 @@ def _launch(
             TASKS,
             GRID,
             SCALE,
-            TAIL_BOUNDS,
             value_attrs={
                 "rocdl.waves_per_eu": 2,
                 "passthrough": [["target-features", "-packed-fp32-ops"]],
@@ -747,11 +694,8 @@ def _launch(
 _COMPILED = {}
 
 
-def run(*, inputs, plan, out):
-    if plan.num_tiles == 0:
-        return
-    stream = torch.cuda.current_stream(inputs.q.device)
-    args = (
+def _args(inputs, plan, out, stream):
+    return (
         inputs.q.view(-1),
         inputs.k.view(-1),
         inputs.v.view(-1),
@@ -774,23 +718,41 @@ def run(*, inputs, plan, out):
         * ((plan.query_tile * plan.group_padded + 127) // 128),
         plan.grid,
         inputs.scale,
-        any(
-            (q + p) % 4 for q, p in zip(inputs.query_lens, inputs.prefix_lens)
-        ),
         stream,
     )
-    key = (inputs.q.device, args[10], args[11], args[15], args[16], args[19], args[20])
-    with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
-        compiled = _COMPILED.get(key)
-        if compiled is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("Warm the QSA specialization before graph capture")
-            for tail_bounds in (False, True):
-                family_key = (*key[:-1], tail_bounds)
-                _COMPILED[family_key] = flyc.compile(
-                    _launch, *args[:18], 0, args[19], tail_bounds, stream
-                )
-            compiled = _COMPILED[key]
-        compiled(*args)
+
+
+def _compiled(inputs, args, stream):
+    key = (inputs.q.device, args[10], args[11], args[15], args[16], args[19])
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm the QSA specialization before graph capture")
+        with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
+            compiled = _COMPILED[key] = flyc.compile(_launch, *args[:18], 0, args[19], stream)
+    return compiled
+
+
+def run(*, inputs, plan, out):
+    if plan.num_tiles == 0:
+        return
+    stream = torch.cuda.current_stream(inputs.q.device)
+    args = _args(inputs, plan, out, stream)
+    with torch.cuda.device(inputs.q.device):
+        _compiled(inputs, args, stream)(*args)
+
+
+def launcher(*, inputs, plan, out):
+    """launch(q, k, v, out) taking flat views, with this plan's other arguments prebuilt.
+
+    Valid while the plan's scratch bindings and the current stream stay the same.
+    """
+    if plan.num_tiles == 0:
+        return None
+    stream = torch.cuda.current_stream(inputs.q.device)
+    args = _args(inputs, plan, out, stream)
+    compiled = _compiled(inputs, args, stream)
+    tail = args[4:]
+    return lambda q, k, v, o: compiled(q, k, v, o, *tail)
 
 

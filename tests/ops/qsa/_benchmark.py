@@ -24,11 +24,11 @@ def default_output(name):
 
 
 def kernel_name(symbol):
-    for name in ("attention_recover_scatter", "attention_compact", "attention_order_masks_validate",
-                 "attention_dense", "attention_union", "attention_pack_kv", "attention_direct",
+    for name in ("attention_recover_scatter", "attention_compact", "attention_order_masks",
+                 "attention_union", "attention_pack_kv", "attention_direct",
                  "indexer_q_prep", "indexer_k_compress", "indexer_decode_prep",
                  "qsa_indexer_decode_logits", "qsa_indexer_decode_topk", "qsa_indexer_logits",
-                 "qsa_indexer_topk", "assert_async"):
+                 "qsa_indexer_topk"):
         if name in symbol:
             return name
     return symbol

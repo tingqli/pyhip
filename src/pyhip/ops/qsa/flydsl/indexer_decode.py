@@ -23,7 +23,7 @@ from flydsl.expr import gpu, rocdl
 
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 from pyhip.ops.mha.flydsl._common import _buffer, _buffer_words, _uniform
-from .indexer_logits import _lds_load, _lds_store
+from .indexer_logits import _buffer_word, _lds_load, _lds_store
 from .indexer_topk import _readlane, _sync
 
 HEADS, DIM, PAGE, WAVES = 4, 128, 16, 4
@@ -32,11 +32,6 @@ PAGE_BYTES = PAGE * DIM * 2
 CTAS_PER_CU = 8
 # Byte offset that fails every buffer range check.
 _DROP = 0x40000000
-
-
-def _buffer_word(resource, offset):
-    return fx.Int32(rocdl.raw_ptr_buffer_load(fx.Int32.ir_type, resource, fx.Int32(offset).ir_value(),
-                                              fx.Int32(0).ir_value(), aux=rocdl_aux(0)))
 
 
 def _page(keys, page, lane, valid):
@@ -127,22 +122,19 @@ def _kernel(Q: fx.Tensor, K: fx.Tensor, PAGES: fx.Tensor, LENGTHS: fx.Tensor, LO
 def _launch(Q: fx.Tensor, K: fx.Tensor, PAGES: fx.Tensor, LENGTHS: fx.Tensor, LOGITS: fx.Tensor,
             q_stride: fx.Int32, page_stride: fx.Int32, width: fx.Int32, splits: fx.Int32, key_bytes: fx.Int32,
             scale: fx.Float32, rows: fx.Int32, stream: fx.Stream):
-    _kernel(Q, K, PAGES, LENGTHS, LOGITS, q_stride, page_stride, width, splits, key_bytes, scale).launch(
-        grid=(splits, rows, 1), block=(256, 1, 1), stream=stream)
+    if rows > 0:
+        _kernel(Q, K, PAGES, LENGTHS, LOGITS, q_stride, page_stride, width, splits, key_bytes, scale).launch(
+            grid=(splits, rows, 1), block=(256, 1, 1), stream=stream)
 
 
 _COMPILED = {}
-
-
-def compiled(device):
-    return device in _COMPILED
 
 
 def launch(q, cache, page_table, lengths, logits, scale):
     """q: [rows, >=4, 128] BF16 (heads 0..3 used, row stride a multiple of 8); cache: compressed K
     [slots, 1, 128] BF16 (any view, < 2 GiB); page_table: [rows, pages] int32 (page p of row r holds
     keys 16p..16p+15 at slots 16 * page_table[r, p] + [0, 16)); lengths: [rows] int32; logits:
-    [rows, 16 * pages] FP32, contiguous. Compiles on the first call per device (not graph-capturable)."""
+    [rows, 16 * pages] FP32, contiguous. Compiles on the first call per device; warm it before capture."""
     rows, width = logits.shape
     count = torch.cuda.get_device_properties(q.device).multi_processor_count
     splits = max(1, min(-(-page_table.shape[1] // WAVES), -(-count * CTAS_PER_CU // rows)))
@@ -152,6 +144,7 @@ def launch(q, cache, page_table, lengths, logits, scale):
     with torch.cuda.device(q.device):
         function = _COMPILED.get(q.device)
         if function is None:
-            _COMPILED[q.device] = flyc.compile(_launch, *args)
-        else:
-            function(*args)
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Warm the QSA decode indexer before graph capture")
+            function = _COMPILED[q.device] = flyc.compile(_launch, *args[:11], 0, stream)
+        function(*args)
