@@ -40,18 +40,21 @@ def compile_packed_down_reduce(down, *, n, topk, workspace=None):
     Every invocation rebuilds inverse, even for identical tensor pointers.
     Warm once before graph capture; sorting, quantization and weight shuffle
     are caller responsibilities. The down configuration determines the
-    native sorting/packing stride; the ten-tensor launch ABI is unchanged.
+    sorting capacity and packed row stride separately; the ten-tensor launch
+    ABI is unchanged.
     """
     workspace = DownReduceWorkspace() if workspace is None else workspace
-    sort_block_m = down.config["block_m"]
-    assert sort_block_m in (128, 256) and down.config["output_layout"] == "packed"
+    packed_rows = down.config.get("packed_rows", down.config["block_m"])
+    sort_block_m = down.config.get("sort_block_m", down.config["block_m"])
+    assert sort_block_m in (128, 256) and packed_rows in (128, 256)
+    assert down.config["output_layout"] == "packed"
     inverse_kernel = invert_sorted_ids(topk)
-    reduce = make_moe_sum(n=n, topk=topk, sort_block_m=sort_block_m)
+    reduce = make_moe_sum(n=n, topk=topk, sort_block_m=packed_rows)
 
     def buffers(args):
         output, input_q, expert_ids = args[0], args[1], args[7]
         assert output.shape == (input_q.shape[0], n) and output.dtype == torch.bfloat16
-        assert input_q.shape[1:] == (topk, 256)
+        assert input_q.shape[1:] == (topk, down.config.get("k", 256))
         assert output.is_cuda and output.is_contiguous() and output.device == input_q.device
         storage, inverse = workspace.prepare(output, input_q, expert_ids, sort_block_m=sort_block_m)
         return storage[:expert_ids.numel() * sort_block_m], inverse

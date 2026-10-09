@@ -68,6 +68,98 @@ small batches, but does not guarantee higher accuracy, lower latency, or exact
 equivalence to the quantized computation. Cache hits do not repeat this check.
 Block-mode caches from the previous, activation-quantized-only policy are retuned.
 
+#### FlyDSL block-scale GateUp with two Down implementations
+
+`fly_blockscale` runs entirely through `_run_fly`, with packaged
+[GateUp](flydsl/moe_fp8_blockscale_stage1.py),
+[M128 Down](flydsl/moe_fp8_blockscale_stage2.py), and
+[routed 8-wave Down](flydsl/moe_8wave_down.py). M128 uses
+[packed TOPK reduce](flydsl/moe_packed_reduce.py); the routed path uses
+preallocated `torch.sum`. There are no runtime imports from experiments or the
+standalone benchmark. The original `jit_blockscale` and `jit_8wave` candidates
+keep their ASM stages.
+
+This path targets **gfx950**, BF16 inputs, **W128×128 / A1×128 FP8**, separated
+SiLU without clamp, and **both weights preshuffled** with Aiter's 16×16 layout.
+It retains both Aiter activation quantizations. **H is a positive multiple of
+256**; the K/I constraint depends on `down_path`:
+
+| `down_path` | Down tile / output | I (= Down K) | Final reduce |
+|---|---|---|---|
+| `default` | M128/N128, independent, packed128 | Positive multiple of256 | Custom packed gather |
+| `persistent` | M128/N128, 8 sharded queues, packed128 | Positive multiple of256 | Custom packed gather |
+| `8wave` | M256/N32 or N64, global atomic queue, routed | Positive multiple of128, subject to full-K resource limits | Torch sum over TOPK |
+
+`num_oc_splits` is a compile-time N partition, not split-K. The tuner searches
+**1/2/4/8** splits aligned to 128 output columns for both implementations.
+The 8-wave factory also requires at least three N tiles per split and checks
+the actual four-slot B ring, metadata, and scale LDS extent against gfx950's
+160 KiB. Invalid candidates are rejected before GPU execution by the normal
+prune path; enumeration is not a guarantee that a tile fits. N64 necessarily
+exceeds LDS at K640, N32 at K1280; large N can consume additional scale storage.
+The factory additionally supports N128 tiles (not in the default search).
+I128/I384/I640 can now use the full FlyDSL path without padding.
+
+The `8wave` path is not a K-streaming implementation. It retains all A/B K
+fragments, applies each K128 block's FP32 scales/FMA in order, then multiplies
+routing weights and converts once to BF16. Its output is `[tokens,topk,H]`;
+`torch.sum(..., out=out)` needs no inverse map. The single int32 counter is
+caller-owned and cleared on every launch, including graph replay. Code is
+cached per device/static shape, not with a shared counter. The low-level wrapper
+requires routed output, input/scale descriptors, and masked-offset margins to
+fit its 32-bit buffer addressing. This resource-bounded K128 support does not
+replace M128's larger-K path.
+
+For M128, Down's compile-time `k` is I. K256 retains the original PF3/paired N pipeline;
+larger K uses a runtime loop over K256 chunks with two fixed N64/K256 LDS
+slots. The unified `_compile_m128_streaming_down(..., k=256)` returns the exact
+`_compile_m128_down` launcher: removing a one-iteration K loop alone would not
+restore cached A/scales, N lookahead, or overlapped packing. Each K128 dot uses
+its own FP32 A/B scales and contributes to the same
+FP32 accumulator in K order. Routing multiplication and BF16 conversion occur
+only after all K chunks, with no BF16 partial sums or extra split-K reduction.
+A scales remain physically `[K/128,tokens*topk]`, B scales are
+`[E,H/128,K/128]`; K participates in the streaming compiler cache key.
+Streaming LDS is 33800 bytes (independent) or 33804 bytes (persistent), not
+proportional to K. This is a general-K path, not a claim that larger K retains
+the K256 pipeline's performance.
+
+Both implementations share **sort256** metadata with GateUp. GateUp produces
+128 fused intermediate columns per workgroup; M128 Down uses **M128/N128**, always compiled with
+`is_sorted_bm_256=True`. Two Down halves share `expert_ids[m128_block//2]`.
+Native sorting places padding after real routes, so an invalid first ID skips
+an entirely empty half before metadata/weight loads. Partial halves retain
+per-row masks. The API's `block_size_M` refers to sorting, so this candidate
+accepts 256, not 128, despite its Down compute tile.
+
+M128 Down allocates `[expert_capacity*256,H]`, but writes **packed128/N64** storage,
+not row-major or routed output. Each call fills an inverse map with -1 and
+rebuilds valid `(token, slot)` positions; custom reduce gathers packed128
+BF16 routes, accumulates TOPK in FP32, and writes the caller's BF16 output.
+Sorting, both quantizations, both GEMMs, inverse construction, and reduce are
+included in full-path timing.
+
+Launchers use the input device's current stream and cache code per device/static
+shape, not tensors. No `.item()` or host trimming is used. M128 persistent Down has
+eight shards and 512 workers, independent of OC splits; each call owns a fresh
+256-word queue, including its initialization in graph capture. Each shard's
+last terminal worker resets its head using that shard's actual task count.
+Thus cached callables and separately captured graphs do not share queue state.
+The low-level Down requires packed output plus its OOB offset margin below
+4 GiB. The K256 factory also checks the full cached B-scale storage against
+gfx950's 160 KiB LDS limit; increasing N per OC split increases that storage.
+GateUp retains its 31-bit byte-address checks.
+
+Block-mode model keys include `block_gateup_revision=2` to invalidate the old
+ASM-Down `fly_blockscale` configs; other quantization modes retain their keys.
+Block weights with I greater than 256 additionally use `block_down_k_revision=1`
+for the K256-multiple streaming path. `block_down_8wave_revision=1` refreshes
+block-mode winners, including K256, to compare the newly added routed path;
+non-block keys and the v6 artifact name remain unchanged.
+Accuracy admission still uses the same independent reference and
+`calc_diff <= 0.02`. Availability is not a speedup claim; compare full calls
+with the existing benchmark's `--quant block --retune`.
+
 ### 3. Validate, tune, and compare
 
 [bench_tuned_moe.py](../../../../benchmarks/moe/bench_tuned_moe.py) uses shared

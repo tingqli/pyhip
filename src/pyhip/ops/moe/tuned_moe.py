@@ -172,7 +172,8 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
 
     def add(impl, gm=16, dm=16, gn=64, dn=64, **kwargs):
         """保留 caller 的 M 设置；FlyDSL 的 tile/资源限制交给编译检查。"""
-        if block_m not in (None, 0, -1, dm):
+        sorting_m = 256 if impl == "fly_blockscale" else dm
+        if block_m not in (None, 0, -1, sorting_m):
             return
         # ASM wrapper 用整除计算 launch grid，不能丢掉最后一个 N tile。
         if impl.startswith("jit_") and ((2 * i) % gn or h % dn):
@@ -200,6 +201,18 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
                     if h % (splits * 128) == 0 and h // splits >= 256:
                         add(impl, 256, 256, 256, 64,
                             down_path="persistent", num_oc_splits=splits)
+            # GateUp 固定 sort256；M128 为 packed，8wave 为 routed、支持 K128 倍数。
+            if (kind == "block" and i % 128 == 0 and h % 256 == 0
+                    and all(getattr(w, "is_shuffled", False) for w in (w1, w2))):
+                for splits in (1, 2, 4, 8):
+                    if h % (splits * 128) == 0:
+                        if i % 256 == 0:
+                            for path in ("default", "persistent"):
+                                add("fly_blockscale", 256, 128, 256, 128,
+                                    down_path=path, num_oc_splits=splits)
+                        for dn in (32, 64):
+                            add("fly_blockscale", 256, 256, 256, dn,
+                                down_path="8wave", num_oc_splits=splits)
 
     # 其余本地 kernel 要求两份权重都已 shuffle。
     if not all(getattr(w, "is_shuffled", False) for w in (w1, w2)):
@@ -227,7 +240,7 @@ def _configs(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
                     add("jit_mxfp4_4wave", m, m, n, 128)
 
     if kind == "block":
-        return configs  # 当前 FlyDSL kernel 不支持 128×128 block scale。
+        return configs  # 其余 FlyDSL decode/prefill 路径不支持 128×128 block scale。
     if batch_bucket <= 32:
         down_ns = (32,) if kind == "fp4" else (64,)
         if kind == "fp4" and batch_bucket == 1:
@@ -411,8 +424,57 @@ def _run_8wave(x, w1, w2, ids, weights, options, out, m, gn, dn,
 
 
 def _run_fly(x, w1, w2, ids, weights, options, out, impl, gm, dm, gn, dn,
-             decode_alg, down_path, padding, tile_k_gate=0):
+             decode_alg, down_path, padding, tile_k_gate=0, num_oc_splits=1):
     """执行 FlyDSL 的两阶段 MoE，每次调用都重新获取当前 stream。"""
+    b, h = x.shape
+    e, n1, _ = w1.shape
+    i, topk = n1 // 2, ids.shape[1]
+    if impl == "fly_blockscale":
+        from .flydsl.moe_fp8_blockscale_stage1 import fp8_blockscale_stage1
+        from .flydsl.moe_fp8_blockscale_stage2 import M128_QUEUE_SIZE, make_m128_down
+        from .flydsl.moe_packed_reduce import make_moe_sum
+        from .flydsl.moe_gemm_2stage.moe_reduce import invert_sorted_ids
+
+        if ((gm, gn) != (256, 256) or i <= 0 or i % 128 or h % 256
+                or down_path not in ("default", "persistent", "8wave")
+                or options["block_size_M"] not in (None, 0, -1, 256)):
+            raise ValueError("fly_blockscale requires sort256, GateUp N256, I multiple of128 and H multiple of256")
+        if (w1.dtype != torch.float8_e4m3fn or w2.dtype != w1.dtype
+                or options["quant_type"] not in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128)
+                or options["activation"] != aiter.ActivationType.Silu or options["swiglu_limit"]
+                or options["gate_mode"] != GateMode.SEPARATED
+                or not all(getattr(w, "is_shuffled", False) for w in (w1, w2))):
+            raise ValueError("fly_blockscale requires shuffled FP8 block-scale weights and separated SiLU")
+        persistent = down_path == "persistent"
+        routed = down_path == "8wave"
+        if routed:
+            from .flydsl.moe_8wave_down import flydsl_moe_gemm_8wave_down
+            down = flydsl_moe_gemm_8wave_down(n=h, k=i, topk=topk, num_experts=e,
+                                             block_m=dm, block_n=dn, num_oc_splits=num_oc_splits)
+        else:
+            if (dm, dn) != (128, 128):
+                raise ValueError("fly_blockscale default/persistent requires Down M128/N128")
+            down = make_m128_down(n=h, k=i, topk=topk, num_experts=e, persistent=persistent,
+                                  is_sorted_bm_256=True, num_oc_splits=num_oc_splits)
+        si, sw, se, valid, _ = moe_sorting(ids, weights, e, h, x.dtype, 256, output=out)
+        quantize = aiter.get_hip_quant(aiter.QuantType.per_1x128)
+        aq, a_scale = quantize(x, quant_dtype=w1.dtype, transpose_scale=True)
+        mid = torch.empty((b, topk, i), dtype=x.dtype, device=x.device)
+        fp8_blockscale_stage1(aq, w1, a_scale, options["w1_scale"], si, se, valid, mid)
+        dq, d_scale = quantize(mid, quant_dtype=w2.dtype, num_rows_factor=topk, transpose_scale=True)
+        routes = torch.empty((b, topk, h) if routed else (se.numel() * 256, h), dtype=x.dtype, device=x.device)
+        # 每次调用/graph 独占队列，代码缓存不保存 tensor 或跨 stream 共享 heads。
+        counter = (torch.zeros(M128_QUEUE_SIZE, dtype=torch.int32, device=x.device) if persistent
+                   else torch.empty(1, dtype=torch.int32, device=x.device))
+        down(routes, dq, w2, d_scale, options["w2_scale"].view(e, h // 128, i // 128),
+             si, sw, se, valid, counter)
+        if routed:
+            torch.sum(routes, dim=1, out=out)
+            return out
+        inverse = torch.full((b, topk), -1, dtype=torch.int32, device=x.device)
+        invert_sorted_ids(topk)(si, inverse, valid, si.numel(), b)
+        return make_moe_sum(n=h, topk=topk, sort_block_m=128)(out, routes, inverse)
+
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -434,9 +496,6 @@ def _run_fly(x, w1, w2, ids, weights, options, out, impl, gm, dm, gn, dn,
         q, scale = aiter.get_hip_quant(qtype)(t.view(-1, t.shape[-1]), quant_dtype=w1.dtype)
         return q, scale.to(torch.float32).contiguous()
 
-    b, h = x.shape
-    e, n1, _ = w1.shape
-    i, topk = n1 // 2, ids.shape[1]
     stream = torch.cuda.current_stream(x.device)
     kind = "bf16" if w1.dtype == torch.bfloat16 else "fp4" if w1.dtype == torch.float4_e2m1fn_x2 else "fp8"
     quant = {aiter.QuantType.No: "no", aiter.QuantType.per_Token: "ptpc",
@@ -523,10 +582,10 @@ def _fmoe_wrapper(hidden_states, w1, w2, topk_weight, topk_ids, *, options,
     if _impl in ("jit_8wave", "jit_blockscale"):
         return _run_8wave(hidden_states, w1, w2, topk_ids, topk_weight, options, out,
                           tile_m_down, tile_n_gate, tile_n_down, down_path, num_oc_splits)
-    if _impl in ("fly_decode", "fly_prefill"):
+    if _impl in ("fly_decode", "fly_prefill", "fly_blockscale"):
         return _run_fly(hidden_states, w1, w2, topk_ids, topk_weight, options, out,
                         _impl, tile_m_gate, tile_m_down, tile_n_gate, tile_n_down,
-                        decode_alg, down_path, padding, tile_k_gate)
+                        decode_alg, down_path, padding, tile_k_gate, num_oc_splits)
     raise ValueError(f"unknown MoE implementation: {_impl}")
 
 
@@ -587,6 +646,11 @@ def _model_key(call):
     if call["quant_type"] in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128):
         # 新策略同时搜索 A8W8/A16W8，不复用只允许 A1x128 激活的旧 winner。
         values["block_activation_quant"] = "per_1x128_or_bf16"
+        # 只刷新 block 模式的候选缓存；其它精度的既有配置不受影响。
+        values["block_gateup_revision"] = 2  # M128 packed Down + custom reduce，旧 ASM Down 配置不再适用。
+        values["block_down_8wave_revision"] = 1  # 新增 K128 routed 路径，旧 winner 需重新比较。
+        if call["w2"].shape[-1] > 256:
+            values["block_down_k_revision"] = 1  # M128 流式 Down 的独立修订，只用于 I>256。
     for name, value in call.items():
         if isinstance(value, torch.Tensor):
             shape = tuple(value.shape)

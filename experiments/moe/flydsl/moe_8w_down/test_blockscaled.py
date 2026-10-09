@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""M256/M128 packed paths plus retained PyHIP/FlyDSL BN32/BN64 baselines."""
+"""M256/M128 sort128/sort256 paths, PyHIP/BN64 baselines and optional BN32."""
 
 import argparse
+from functools import partial
 from pathlib import Path
 import sys
 
@@ -29,13 +30,17 @@ else:
 from pyhip.ops.moe.flydsl.moe_gemm_2stage.moe_reduce import invert_sorted_ids
 
 
-def make_m128_priority3_down(*, n, k=256, topk, num_experts):
-    return m128_kernel.make_m128_down(n=n, k=k, topk=topk, num_experts=num_experts)
-
-
-def make_m128_persistent_down(*, n, k=256, topk, num_experts):
+def make_m128_priority3_down(*, n, k=256, topk, num_experts, is_sorted_bm_256=False,
+                             num_oc_splits=8):
     return m128_kernel.make_m128_down(n=n, k=k, topk=topk, num_experts=num_experts,
-                                      persistent=True)
+                                      is_sorted_bm_256=is_sorted_bm_256, num_oc_splits=num_oc_splits)
+
+
+def make_m128_persistent_down(*, n, k=256, topk, num_experts, is_sorted_bm_256=False,
+                              num_oc_splits=8):
+    return m128_kernel.make_m128_down(n=n, k=k, topk=topk, num_experts=num_experts,
+                                      persistent=True, is_sorted_bm_256=is_sorted_bm_256,
+                                      num_oc_splits=num_oc_splits)
 
 
 def make_m256_swizzle_down(*, n, k=256, topk, num_experts):
@@ -51,20 +56,51 @@ CANDIDATES = {
     "256x128": ("256x128", 128, make_m256_swizzle_down),
     "128x128": ("128x128", 128, make_m128_priority3_down),
     "128x128 persist": ("128x128 persist", 128, make_m128_persistent_down),
+    "128x128 sort256": ("128x128 sort256", 128, partial(make_m128_priority3_down, is_sorted_bm_256=True)),
+    "128x128 persist sort256": ("128x128 persist sort256", 128, partial(make_m128_persistent_down, is_sorted_bm_256=True)),
 }
-DEFAULT_CANDIDATES = tuple(CANDIDATES)
-M128_CANDIDATES = ("128x128", "128x128 persist")
+DEFAULT_CANDIDATES = tuple(key for key in CANDIDATES if key != "flydsl_bn32")
+M128_SORT128_CANDIDATES = ("128x128", "128x128 persist")
+M128_SORT256_CANDIDATES = ("128x128 sort256", "128x128 persist sort256")
+M128_CANDIDATES = (*M128_SORT128_CANDIDATES, *M128_SORT256_CANDIDATES)
 PACKED_CANDIDATES = ("256x128 persist", "256x128", *M128_CANDIDATES)
-SORT_BLOCK_M = {key: 128 if key in M128_CANDIDATES else 256 for key in CANDIDATES}
+SORT_BLOCK_M = {key: 128 if key in M128_SORT128_CANDIDATES else 256 for key in CANDIDATES}
 ACTIVATION_QUANT = aiter.get_hip_quant(aiter.QuantType.per_1x128)
 
 
-def select_candidates(n, candidates=None):
+def _inter_dim_skip_reason(candidate, n, inter_dim):
+    if candidate in ("256x128", "256x128 persist") and inter_dim != 256:
+        return "fixed M256 kernel requires inter-dim=256"
+    if candidate in M128_CANDIDATES and inter_dim % 256:
+        return "M128 kernel requires inter-dim to be a multiple of 256"
+    if candidate == "pyhip" and inter_dim > 384:
+        # This full-K ASM tile already exhausts its VGPR allocator at K512.
+        return "full-K PyHIP register tile supports inter-dim up to 384"
+    if candidate in ("flydsl_bn32", "flydsl_bn64"):
+        block_n = CANDIDATES[candidate][1]
+        if n // 4 < 3 * block_n:
+            return f"fixed OC4 requires at least 3 N{block_n} tiles per split; N={n}"
+        # SharedStorage holds four whole-K B tiles, two M256 metadata arrays,
+        # and the split's weight scales. Avoid a fatal backend LDS overflow.
+        lds_bytes = 4 * block_n * inter_dim + 2 * 256 * 4 + (n // 512) * (inter_dim // 128) * 4
+        if lds_bytes > 160 * 1024:
+            return f"whole-K B ring and metadata need {lds_bytes} LDS bytes, exceeding gfx950's 163840"
+    return None
+
+
+def select_candidates(n, candidates=None, *, inter_dim=256):
     if n <= 0 or n % 512:
         raise ValueError("N must be a positive multiple of 512")
+    if not isinstance(inter_dim, int) or inter_dim <= 0 or inter_dim % 128:
+        raise ValueError("inter-dim must be a positive multiple of 128 for block-scale quantization")
     selected = list(DEFAULT_CANDIDATES if candidates is None else candidates)
     if not selected or any(key not in CANDIDATES for key in selected):
         raise ValueError("select at least one known candidate")
+    for key in selected.copy():
+        reason = _inter_dim_skip_reason(key, n, inter_dim)
+        if reason:
+            print(f"SKIP {key}: {reason}; inter-dim={inter_dim}")
+            selected.remove(key)
     for key in M128_CANDIDATES:
         if key in selected and n % 1024:
             reason = f"{key}: fixed OC8 requires N to be a positive multiple of 1024"
@@ -119,10 +155,14 @@ def with_torch_sum(down, workspace):
     return launch
 
 
-def make_packed_pipeline(candidate, *, n, k=256, topk, num_experts, workspace=None):
+def make_packed_pipeline(candidate, *, n, k=256, topk, num_experts, workspace=None,
+                         is_sorted_bm_256=False, num_oc_splits=8):
     """Compose each local packed kernel with matching inverse/reducer strides."""
     assert candidate in PACKED_CANDIDATES
-    down = CANDIDATES[candidate][2](n=n, k=k, topk=topk, num_experts=num_experts)
+    options = ({"is_sorted_bm_256": is_sorted_bm_256 or SORT_BLOCK_M[candidate] == 256,
+                "num_oc_splits": num_oc_splits}
+               if candidate in M128_CANDIDATES else {})
+    down = CANDIDATES[candidate][2](n=n, k=k, topk=topk, num_experts=num_experts, **options)
     return compile_packed_down_reduce(down, n=n, topk=topk, workspace=workspace)
 
 
@@ -167,18 +207,18 @@ def resort_inputs(inputs, assignments, routing, *, n, experts, sort_block_m):
     return (*inputs[:4], ids, weights, eids, valid, inputs[-1])
 
 
-def make_case(tokens, n, experts, topk, seed, *, sort_block_m=256):
+def make_case(tokens, n, experts, topk, seed, *, sort_block_m=256, k=256):
     """Real quantization/shuffle and explicit AITER sorting alignment."""
     assert n % 512 == 0 and 0 < topk <= min(experts, 255)
-    assert sort_block_m in (128, 256)
+    assert sort_block_m in (128, 256) and k > 0 and k % 128 == 0
     torch.manual_seed(seed)
-    a_bf16 = torch.randn((tokens, topk, 256), dtype=torch.bfloat16, device="cuda")
-    w_bf16 = torch.randn((experts, n, 256), dtype=torch.bfloat16, device="cuda")
+    a_bf16 = torch.randn((tokens, topk, k), dtype=torch.bfloat16, device="cuda")
+    w_bf16 = torch.randn((experts, n, k), dtype=torch.bfloat16, device="cuda")
     a, sa = ACTIVATION_QUANT(a_bf16, quant_dtype=dtypes.fp8, transpose_scale=True)
-    blocks = w_bf16.view(experts, n // 128, 128, 2, 128).permute(0, 1, 3, 2, 4).contiguous()
+    blocks = w_bf16.view(experts, n // 128, 128, k // 128, 128).permute(0, 1, 3, 2, 4).contiguous()
     qblocks, sb = aiter.pertoken_quant(blocks.view(experts, -1, 128 * 128), quant_dtype=dtypes.fp8)
-    w = qblocks.view(experts, n // 128, 2, 128, 128).permute(0, 1, 3, 2, 4).contiguous().view(experts, n, 256)
-    sb = sb.view(experts, n // 128, 2)
+    w = qblocks.view(experts, n // 128, k // 128, 128, 128).permute(0, 1, 3, 2, 4).contiguous().view(experts, n, k)
+    sb = sb.view(experts, n // 128, k // 128)
     assignments, routing = make_routing(tokens, topk, experts, seed + 1)
     ids, routes, eids, valid, _ = moe_sorting(assignments, routing, experts, n, torch.bfloat16, sort_block_m, None, None, 0)
     reference = torch_reference_down(a, sa, w, sb, assignments, routing)
@@ -246,36 +286,43 @@ def count_live_m_blocks(ids, valid_rows, tokens, topk, block_m):
 
 
 def run_test(tokens=16384, model_dim=6144, experts=384, topk=8, seed=1234,
-             candidates=None, profile=False, reduce_output=True):
+             candidates=None, profile=False, reduce_output=True, is_sorted_bm_256=False,
+             inter_dim=256):
     """Compare packed candidates and retained baselines on shared storage.
 
-    K256 is fixed; legacy baselines use OC1, M256 OC4, and M128 OC8.
+    inter_dim is K; PyHIP uses OC1, legacy FlyDSL/M256 OC4, and M128 OC8.
     BF16 routes are checked before TOPK sum so rounding near
     cancellation is not confused with a reduction correctness regression.
     """
+    candidates = select_candidates(model_dim, candidates, inter_dim=inter_dim)
+    if not candidates:
+        print(f"SKIP: no selected kernels support inter-dim={inter_dim}")
+        return []
     assert torch.cuda.is_available() and torch.cuda.get_device_properties().gcnArchName.startswith("gfx950")
-    candidates = select_candidates(model_dim, candidates)
     assert not profile or len(candidates) == 1
-    args, reference_routes = make_case(tokens, model_dim, experts, topk, seed)
+    args, reference_routes = make_case(tokens, model_dim, experts, topk, seed, k=inter_dim)
     a, b, eids = args[0], args[1], args[6]
-    baseline = make_pyhip_down(n=model_dim, k=256, topk=topk, num_experts=experts)
-    baseline_routes = torch.empty_like(reference_routes)
-    baseline(baseline_routes, *args)
-    torch.cuda.synchronize()
-    baseline_error = error_stats(baseline_routes, reference_routes)
-    assert baseline_error["status"] == "PASS", f"PyHIP down vs Torch: {baseline_error}"
-    reference = baseline_routes.sum(dim=1) if reduce_output else reference_routes
-    del baseline_routes
+    baseline = None
+    reference = None if reduce_output else reference_routes
+    if _inter_dim_skip_reason("pyhip", model_dim, inter_dim) is None:
+        baseline = make_pyhip_down(n=model_dim, k=inter_dim, topk=topk, num_experts=experts)
+        baseline_routes = torch.empty_like(reference_routes)
+        baseline(baseline_routes, *args)
+        torch.cuda.synchronize()
+        baseline_error = error_stats(baseline_routes, reference_routes)
+        assert baseline_error["status"] == "PASS", f"PyHIP down vs Torch: {baseline_error}"
+        reference = baseline_routes.sum(dim=1) if reduce_output else reference_routes
+        del baseline_routes
     output = torch.empty((tokens, model_dim), dtype=torch.bfloat16, device="cuda")
     workspace = DownReduceWorkspace()
     storage, _ = workspace.prepare(output, a, eids)
     routed = storage[:tokens * topk].view(tokens, topk, model_dim)
     sorted_inputs = {256: args}
-    if any(key in M128_CANDIDATES for key in candidates):
+    if not is_sorted_bm_256 and any(key in M128_SORT128_CANDIDATES for key in candidates):
         assignments, routing = make_routing(tokens, topk, experts, seed + 1)
         sorted_inputs[128] = resort_inputs(args, assignments, routing, n=model_dim, experts=experts, sort_block_m=128)
-    flops = 2 * tokens * topk * model_dim * 256
-    weight_bytes = model_dim * 256 * b.element_size()
+    flops = 2 * tokens * topk * model_dim * inter_dim
+    weight_bytes = model_dim * inter_dim * b.element_size()
     intermediate_bytes = tokens * topk * model_dim * 2
     other_bytes = a.numel() * a.element_size() + intermediate_bytes
     reduce_bytes = intermediate_bytes + output.numel() * 2 if reduce_output else 0
@@ -283,7 +330,7 @@ def run_test(tokens=16384, model_dim=6144, experts=384, topk=8, seed=1234,
 
     for key in candidates:
         name, block_n, factory = CANDIDATES[key]
-        sort_block_m = SORT_BLOCK_M[key]
+        sort_block_m = 256 if is_sorted_bm_256 else SORT_BLOCK_M[key]
         args = sorted_inputs[sort_block_m]
         ids, eids, valid = args[4], args[6], args[7]
         inputs = (output, *args)
@@ -296,7 +343,8 @@ def run_test(tokens=16384, model_dim=6144, experts=384, topk=8, seed=1234,
         storage.fill_(torch.nan)
         output.fill_(torch.nan)
         if packed_output:
-            down = factory(n=model_dim, k=256, topk=topk, num_experts=experts)
+            options = {"is_sorted_bm_256": sort_block_m == 256} if key in M128_CANDIDATES else {}
+            down = factory(n=model_dim, k=inter_dim, topk=topk, num_experts=experts, **options)
             pipeline = compile_packed_down_reduce(down, n=model_dim, topk=topk, workspace=workspace)
             pipeline.poison_workspace(*inputs)
             launch = (lambda: pipeline(*inputs)) if reduce_output else (lambda: down(packed, *args))
@@ -304,21 +352,20 @@ def run_test(tokens=16384, model_dim=6144, experts=384, topk=8, seed=1234,
             components = pipeline.benchmark_components(*inputs) if reduce_output else {}
         else:
             routed_down = baseline if factory is None else factory(
-                n=model_dim, k=256, topk=topk, num_experts=experts,
-                block_m=256, block_n=block_n, num_oc_splits=1,
+                n=model_dim, k=inter_dim, topk=topk, num_experts=experts,
+                block_m=256, block_n=block_n, num_oc_splits=4,
             )
-            routed_down.config = {"block_m": 256, "block_n": block_n, "num_oc_splits": 1,
-                                  "persistent_workgroups": 256, "output_layout": "routed"}
             routed_pipeline = with_torch_sum(routed_down, workspace)
             launch = (lambda: routed_pipeline(*inputs)) if reduce_output else (lambda: routed_down(routed, *args))
             config = routed_pipeline.config if reduce_output else routed_down.config
             components = routed_pipeline.benchmark_components(*inputs) if reduce_output else {}
-        config = {**config, "sort_block_m": sort_block_m, "num_waves": config.get("num_waves", 8),
+        config = {**config, "k": inter_dim, "sort_block_m": sort_block_m, "num_waves": config.get("num_waves", 8),
                   "persistent_workgroups": config.get("persistent_workgroups", 0)}
         work_tasks = (count_live_m_blocks(ids, valid_rows, tokens, topk, 128)
-                      if key == "128x128" else valid_blocks)
+                      if key == "128x128" or (key in M128_CANDIDATES and sort_block_m == 256)
+                      else valid_blocks)
         compute_rows = work_tasks * config["block_m"]
-        padded_flops = 2 * compute_rows * model_dim * 256
+        padded_flops = 2 * compute_rows * model_dim * inter_dim
         down_bytes = other_bytes + work_tasks * weight_bytes
         elapsed, times = None, {}
         inverse_bytes = (valid_rows + 2 * tokens * topk) * 4 if reduce_output and packed_output else 0
@@ -331,21 +378,28 @@ def run_test(tokens=16384, model_dim=6144, experts=384, topk=8, seed=1234,
             _, elapsed = pyhip.run_perftest(launch, num_warmup=2, num_iters=10, num_copies=1,
                 num_flops=padded_flops, num_bytes=total_bytes, num_verbose=1,
                 num_name=key + ("_total" if reduce_output else "_down"),
-                num_spec_tag=f"M={tokens * topk},N={model_dim},K=256")
+                num_spec_tag=f"M={tokens * topk},N={model_dim},K={inter_dim}")
             for label, component in components.items():
                 _, times[label] = pyhip.run_perftest(component, num_warmup=2, num_iters=10,
                                                    num_copies=1, num_verbose=0, num_name=f"{key}_{label}")
             launch()
         torch.cuda.synchronize()
         if packed_output:
-            decoded = unpack_routes(packed, ids, valid, tokens, topk, sort_block_m=sort_block_m)
+            decoded = unpack_routes(packed, ids, valid, tokens, topk,
+                                    sort_block_m=config.get("packed_rows", config["block_m"]))
             down_error = error_stats(decoded, reference_routes)
             assert down_error["status"] == "PASS", f"{key} packed down vs Torch: {down_error}"
+        else:
+            down_error = error_stats(routed, reference_routes)
+            assert down_error["status"] == "PASS", f"{key} routed down vs Torch: {down_error}"
         actual = output if reduce_output else decoded if packed_output else routed
-        errors = error_stats(actual, reference)
+        # Without a supported PyHIP baseline, independently validate GEMM routes
+        # above, then check reduce on those exact BF16 values (no extra rounding).
+        expected = reference if reference is not None else (decoded if packed_output else routed).sum(dim=1)
+        errors = error_stats(actual, expected)
         down_us = times.get("gemm") if reduce_output else elapsed
         reduce_us = times.get("reduce")
-        stats = {"name": name, "candidate": key, "block_n": block_n, "config": config,
+        stats = {"name": name, "candidate": key, "block_n": block_n, "inter_dim": inter_dim, "config": config,
                  "valid_expert_blocks": valid_blocks, "valid_padded_rows": valid_rows,
                  "sort_block_m": sort_block_m, "unique_experts": unique_experts,
                  "work_tasks": work_tasks, "compute_rows": compute_rows,
@@ -353,6 +407,8 @@ def run_test(tokens=16384, model_dim=6144, experts=384, topk=8, seed=1234,
                  "down_rw_bytes": down_bytes, "down_ideal_rw_bytes": down_ideal,
                  "reduce_rw_bytes": reduce_bytes, "inverse_rw_bytes": inverse_bytes,
                  "measurement_scope": "down+reduce+inverse_if_needed" if reduce_output else "down",
+                 "sum_reference": "validated_pyhip_routes" if baseline is not None else "validated_candidate_routes",
+                 "down_diff": down_error["diff"], "down_mismatches": down_error["mismatches"],
                  "components_us": times, **errors,
                  **performance(elapsed, flops, padded_flops, total_bytes, ideal_bytes),
                  **{"down_" + name: value for name, value in performance(down_us, flops, padded_flops, down_bytes, down_ideal).items()},
@@ -362,24 +418,32 @@ def run_test(tokens=16384, model_dim=6144, experts=384, topk=8, seed=1234,
             del decoded
 
     props = torch.cuda.get_device_properties(a.device)
-    print(f"\nShape: tokens={tokens}, TOPK={topk}, E={experts}, N={model_dim}, K=256; {props.name}, CUs={props.multi_processor_count}")
-    print("M256: N128, OC4, persistent256, PF3, B SC1, packed NT output; custom reduce256/2048/NT.")
-    if "128x128" in candidates:
+    print(f"\nShape: tokens={tokens}, TOPK={topk}, E={experts}, N={model_dim}, K={inter_dim}; {props.name}, CUs={props.multi_processor_count}")
+    if any(key in candidates for key in ("256x128", "256x128 persist")):
+        print("M256: N128, OC4, persistent256, PF3, B SC1, packed NT output; custom reduce256/2048/NT.")
+    if inter_dim == 256 and any(key in candidates for key in ("128x128", "128x128 sort256")):
         print("M128: 4-wave independent CTA, OC8, PF3/ring4, transpose width2, virtual-worker N phase, SC1/NT stores, Memory priority3, early B + spaced DMA.")
     if "256x128" in candidates:
         print("M256 nonpersistent: unchanged 8-wave pipeline, width8 valid-prefix transpose, counter preserved.")
-    if "128x128 persist" in candidates:
+    if inter_dim == 256 and any(key in candidates for key in ("128x128 persist", "128x128 persist sort256")):
         print("M128 persistent: 512 workers, width4/8 shards, paired B publication/ring4, cached scales, DPP masks, SC1/NT stores; last-exit queue reset included.")
-    print("Reference: independent Torch block-scale routes; final sum uses validated PyHIP BF16 routes. rtol=atol=0.01.")
-    print("Sorting: M128 uses128, M256/legacy use256; identical semantic routes, separate sorted metadata. Sorting is outside timing.")
+    if inter_dim > 256 and any(key in M128_CANDIDATES for key in candidates):
+        print("M128: 4-wave/OC8, K256 chunks in a fixed double buffer; independent width2 or persistent512/width4/8 shards; FP32 across all K before BF16.")
+    sum_reference = "validated PyHIP BF16 routes" if baseline is not None else "each candidate's independently validated BF16 routes"
+    print(f"Reference: independent Torch block-scale routes; final sum uses {sum_reference}. rtol=atol=0.01.")
+    if all(result["sort_block_m"] == 256 for result in results):
+        print("Sorting: all candidates share sort256; M128 checks each half's first ID, skips empty halves, and retains packed128 output. Sorting is outside timing.")
+    else:
+        print("Sorting: native M128 uses128; sort256 variants share metadata with M256/legacy. All M128 outputs stay packed128. Sorting is outside timing.")
     print("Timing: same A/B/scales/intermediate/final addresses, required counter/queue reset included, warmup2/iters10.")
     print("Down is independently timed; Total includes inverse rebuild and reduce, never a component sum.")
-    print("Work/bytes: executed padded rows; A once + B per executed M-block (or once per unique expert, ideal) + valid BF16 writes; not HBM counters.")
+    print("Work/bytes: logical model of executed padded rows; A once + B per M-block (or once per unique expert, ideal) + valid BF16 writes; excludes repeated A loads, not HBM counters.")
     if not reduce_output:
         print("Down-only compares M256/M128 PACKED output with baseline ROUTED output after untimed Torch decoding.")
     if profile:
         print("Profile:23 direct launches, no performance timings.")
     rows = [[title, *(r["config"].get(field, "N/A") for r in results)] for title, field in (
+        ("Inter dim (K)", "k"),
         ("Block M", "block_m"), ("Sorting block M", "sort_block_m"), ("Block N", "block_n"), ("Waves per CTA", "num_waves"), ("OC splits", "num_oc_splits"),
         ("Persistent CTAs", "persistent_workgroups"), ("Down output layout", "output_layout"),
         ("Reduce implementation", "reduction"),
@@ -409,7 +473,9 @@ def run_test(tokens=16384, model_dim=6144, experts=384, topk=8, seed=1234,
     rows.extend([["Max abs error", *(f"{r['max_abs']:.6g}" for r in results)],
                  ["Mean abs error", *(f"{r['mean_abs']:.6g}" for r in results)],
                  ["calc_diff", *(f"{r['diff']:.6g}" for r in results)],
-                 ["Mismatches", *(r["mismatches"] for r in results)]])
+                 ["Mismatches", *(r["mismatches"] for r in results)],
+                 ["Down calc_diff vs Torch", *(f"{r['down_diff']:.6g}" for r in results)],
+                 ["Down mismatches vs Torch", *(r["down_mismatches"] for r in results)]])
     print_markdown_table(["Metric", *(r["name"] for r in results)], rows)
     assert all(r["status"] == "PASS" for r in results), "correctness failed"
     print("PASS: all executed kernels match the validated reference")
@@ -419,6 +485,77 @@ def run_test(tokens=16384, model_dim=6144, experts=384, topk=8, seed=1234,
 def require_gpu():
     if not torch.cuda.is_available() or not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
         pytest.skip("gfx950 required")
+
+
+@pytest.mark.parametrize("k,block_n,n,splits,topk,experts", [
+    (128, 64, 1024, 4, 2, 4), (384, 64, 1536, 3, 2, 4),
+    (512, 64, 1024, 4, 2, 4), (640, 32, 1024, 8, 2, 4),
+    (1152, 32, 1024, 4, 2, 4), (128, 128, 1024, 2, 2, 4),
+    (256, 128, 1024, 2, 2, 4), (128, 32, 512, 4, 130, 130),
+])
+def test_packaged_8wave_down_graph(k, block_n, n, splits, topk, experts):
+    require_gpu()
+    from pyhip.ops.moe.flydsl.moe_8wave_down import flydsl_moe_gemm_8wave_down as packaged
+    assert legacy_flydsl_down is packaged
+    tokens = 3 if topk > 128 else 33
+    args, reference = make_case(tokens, n, experts, topk, 2601, k=k)
+    ids, eids, valid, counter = args[4], args[6], args[7], args[8]
+    valid_rows = int(valid[0].item())
+    # The allocated capacity tail is not part of the valid sorted prefix.
+    eids[valid_rows // 256:].fill_(0x7FFFFFFF)
+    ids[valid_rows:].fill_(0x7FFFFFFF)
+    args[5][valid_rows:].fill_(torch.nan)
+    storage = torch.full((reference.numel() + 64,), -123, dtype=reference.dtype, device="cuda")
+    output = storage[32:-32].view_as(reference)
+    down = packaged(n=n, k=k, topk=topk, num_experts=experts, block_n=block_n, num_oc_splits=splits)
+    assert down.config["output_layout"] == "routed" and down.config["k"] == k
+    assert down.config["lds_bytes"] <= 160 * 1024
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        assert down(output, *args) is output
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            down(output, *args)
+            down(output, *args)
+    stream.synchronize()
+    original_ids = ids.clone()
+    sentinel = (topk << 24) | tokens
+    if sentinel >= 1 << 31:
+        sentinel -= 1 << 32
+    for state in ("valid", "invalid", "empty", "restore"):
+        if state == "invalid":
+            ids[:valid_rows].fill_(sentinel)
+        elif state == "empty":
+            valid.zero_()
+        elif state == "restore":
+            ids.copy_(original_ids)
+            valid[0] = valid_rows
+        output.fill_(torch.nan)
+        counter.fill_(0x123456)
+        graph.replay()
+        torch.cuda.synchronize()
+        if state in ("valid", "restore"):
+            assert error_stats(output, reference)["status"] == "PASS"
+        else:
+            assert torch.isnan(output).all()
+        assert (storage[:32] == -123).all() and (storage[-32:] == -123).all()
+        assert counter.item() == (0 if state == "empty" else valid_rows // 256 * splits) + 256
+
+
+@pytest.mark.parametrize("changes,reason", [
+    (dict(k=0), "multiple of128"), (dict(k=192), "multiple of128"),
+    (dict(k=256.0), "multiple of128"), (dict(num_oc_splits=0), "positive integer"),
+    (dict(num_oc_splits=3), "divisible"), (dict(block_m=128), "M256"),
+    (dict(block_n=96), "N32/N64/N128"),
+    (dict(block_n=64, num_oc_splits=8), "3 N tiles"),
+    (dict(k=640, block_n=64), "LDS"), (dict(k=1280), "LDS"),
+])
+def test_packaged_8wave_down_constraints(changes, reason):
+    from pyhip.ops.moe.flydsl.moe_8wave_down import flydsl_moe_gemm_8wave_down as packaged
+    with pytest.raises(ValueError, match=reason):
+        packaged(**(dict(n=1024, k=256, topk=2, num_experts=4, block_n=32, num_oc_splits=1) | changes))
 
 
 @pytest.mark.parametrize("candidate,tokens,n,experts,topk", [("256x128 persist", *shape) for shape in (
@@ -606,6 +743,432 @@ def test_native_sorting_expert_boundaries(persistent):
     assert down.config["sort_block_m"] == down.config["packed_rows"] == block_m
 
 
+@pytest.mark.parametrize("candidate", M128_SORT256_CANDIDATES)
+@pytest.mark.parametrize("tokens,n,experts,topk", [
+    (1, 1024, 3, 1), (257, 1024, 4, 2), (129, 6144, 4, 2),
+    (4097, 1024, 4, 2), (1, 1024, 130, 130),
+])
+def test_m128_sort256_pipeline(candidate, tokens, n, experts, topk):
+    """Shared sort256, packed128 output, signed slots and repeated queue use."""
+    require_gpu()
+    args, reference = make_case(tokens, n, experts, topk, 2101, sort_block_m=256)
+    baseline = torch.empty_like(reference)
+    make_pyhip_down(n=n, k=256, topk=topk, num_experts=experts)(baseline, *args)
+    assert error_stats(baseline, reference)["status"] == "PASS"
+    down = CANDIDATES[candidate][2](n=n, topk=topk, num_experts=experts)
+    pipeline = compile_packed_down_reduce(down, n=n, topk=topk)
+    output = torch.full((tokens, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    inputs = (output, *args)
+    args[-1].fill_(0x123456)
+    pipeline.poison_workspace(*inputs)
+    assert pipeline(*inputs) is output
+    assert down.config["is_sorted_bm_256"] and down.config["sort_block_m"] == 256
+    assert down.config["block_m"] == down.config["packed_rows"] == 128
+    assert pipeline.workspace.data.shape == (args[6].numel() * 256, n)
+    if tokens == 4097:
+        assert int(args[7][0]) // 128 * 8 > 512
+    if topk == 130:
+        assert (args[4][:int(args[7][0])] < 0).any()
+
+    def check():
+        torch.cuda.synchronize()
+        decoded = unpack_routes(pipeline.workspace.data, args[4], args[7], tokens, topk, sort_block_m=128)
+        assert error_stats(decoded, reference)["status"] == "PASS"
+        torch.testing.assert_close(output, baseline.sum(dim=1), rtol=0.01, atol=0.01)
+        assert args[-1].item() == 0x123456
+        if down.config["persistent"]:
+            assert down.workspace["heads"].count_nonzero().item() == 0
+
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pipeline(*inputs)
+        pipeline(*inputs)
+    for _ in range(2):
+        pipeline.poison_workspace(*inputs)
+        output.fill_(torch.nan)
+        graph.replay()
+        check()
+
+
+@pytest.mark.parametrize("candidate", M128_SORT256_CANDIDATES)
+def test_m128_sort256_empty_halves(candidate):
+    """Native expert tails, hostile capacity, invalid/valid0/restore in a graph."""
+    require_gpu()
+    n, experts, topk = 1024, 8, 1
+    counts = torch.tensor([0, 1, 127, 128, 129, 255, 256, 257], device="cuda")
+    assignments = torch.repeat_interleave(torch.arange(experts, device="cuda"), counts).to(torch.int32)[:, None]
+    tokens = assignments.shape[0]
+    routing = ((torch.arange(tokens, device="cuda", dtype=torch.float32) % 8 + 1) / 8)[:, None]
+    ids, routes, eids, valid, _ = moe_sorting(assignments, routing, experts, n, torch.bfloat16, 256, None, None, 0)
+    valid_rows = int(valid[0])
+    padded = (counts + 255) // 256
+    assert valid_rows == int(padded.sum()) * 256
+    torch.testing.assert_close(eids[:valid_rows // 256],
+        torch.repeat_interleave(torch.arange(experts, dtype=torch.int32, device="cuda"), padded), rtol=0, atol=0)
+    encoded = ids[:valid_rows].to(torch.int64)
+    live = ((encoded & 0xFFFFFF) < tokens) & (((encoded >> 24) & 0xFF) < topk)
+    halves = live.view(-1, 128)
+    assert torch.equal(halves[:, 0], halves.any(dim=1))
+    assert (~halves[:, 0]).any() and halves[1::2, 0].any()
+    # No task may inspect these valid-looking IDs or invalid expert pointers.
+    ids[valid_rows:], routes[valid_rows:] = 0, 123
+    eids[valid_rows // 256:] = 0x7FFFFFFF
+    a = torch.zeros((tokens, topk, 256), dtype=torch.bfloat16, device="cuda")
+    a[..., 0], a[..., 128] = 1, 2
+    w = torch.zeros((experts, n, 256), dtype=torch.bfloat16, device="cuda")
+    w[..., 0] = torch.arange(1, experts + 1, device="cuda")[:, None]
+    w[..., 128] = -w[..., 0]
+    sa = torch.ones((2, tokens), dtype=torch.float32, device="cuda")
+    sb = torch.ones((experts, n // 128, 2), dtype=torch.float32, device="cuda")
+    sb[..., 1] = 0.25
+    expected = ((assignments.float() + 1) * routing * 0.5).to(torch.bfloat16).expand(-1, n)
+    counter = torch.full((1,), 0x123456, dtype=torch.int32, device="cuda")
+    rows = eids.numel() * 256
+    packed_guard = torch.full((rows + 2, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    output_guard = torch.full((tokens + 2, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    packed, output = packed_guard[1:-1], output_guard[1:-1]
+    workspace = DownReduceWorkspace()
+    workspace.data = packed
+    down = CANDIDATES[candidate][2](n=n, topk=topk, num_experts=experts)
+    pipeline = compile_packed_down_reduce(down, n=n, topk=topk, workspace=workspace)
+    args = (output, a.to(torch.float8_e4m3fn), shuffle_weight(w.to(torch.float8_e4m3fn), layout=(16, 16)),
+            sa, sb, ids, routes, eids, valid, counter)
+    pipeline(*args)
+    original_ids, original_eids = ids.clone(), eids.clone()
+
+    def check(real):
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected if real else torch.zeros_like(expected), rtol=0, atol=0)
+        assert torch.isnan(packed_guard[[0, -1]]).all() and torch.isnan(output_guard[[0, -1]]).all()
+        assert torch.isnan(packed[valid_rows:]).all() and counter.item() == 0x123456
+        assert workspace.data.data_ptr() == packed.data_ptr()
+        if real:
+            physical = packed[:valid_rows].view(-1, n // 64, 128, 64).permute(0, 2, 1, 3)
+            assert torch.isnan(physical[~halves]).all()
+        else:
+            assert torch.isnan(packed).all() and (workspace.inverse == -1).all()
+        if down.config["persistent"]:
+            assert down.workspace["heads"].count_nonzero().item() == 0
+
+    check(True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pipeline(*args)
+        pipeline(*args)
+    for state in ("valid", "invalid", "empty", "restore"):
+        if state == "invalid":
+            ids[:valid_rows].fill_((topk << 24) | tokens)
+            eids.fill_(0x7FFFFFFF)  # Empty halves must skip before expert/scale/B loads.
+        elif state == "empty":
+            valid.zero_()
+        elif state == "restore":
+            ids.copy_(original_ids)
+            eids.copy_(original_eids)
+            valid[0] = valid_rows
+        pipeline.poison_workspace(*args)
+        output.fill_(torch.nan)
+        graph.replay()
+        check(state in ("valid", "restore"))
+
+
+@pytest.mark.parametrize("reduce_output", [False, True])
+def test_m128_sort256_metrics(reduce_output, capsys):
+    require_gpu()
+    results = run_test(tokens=65, model_dim=1024, experts=4, topk=2, candidates=M128_SORT256_CANDIDATES,
+                       reduce_output=reduce_output)
+    assert "all candidates share sort256" in capsys.readouterr().out
+    assert len(results) == 2
+    for result in results:
+        assert result["status"] == "PASS" and result["sort_block_m"] == 256
+        assert result["config"]["packed_rows"] == 128 and result["config"]["is_sorted_bm_256"]
+        assert result["compute_rows"] == result["work_tasks"] * 128 == result["valid_padded_rows"] // 2
+        assert result["work_tasks"] == result["valid_expert_blocks"]
+        assert result["down_elapsed_us"] > 0 and result["elapsed_us"] > 0
+
+
+@pytest.mark.parametrize("candidate", M128_SORT128_CANDIDATES)
+def test_m128_sort256_factory_and_cli(candidate, monkeypatch):
+    factory = CANDIDATES[candidate][2]
+    options = dict(n=1024, topk=1, num_experts=2)
+    native, shared = factory(**options), factory(**options, is_sorted_bm_256=True)
+    assert native is not shared and shared is factory(**options, is_sorted_bm_256=True)
+    assert native.config["sort_block_m"] == 128 and not native.config["is_sorted_bm_256"]
+    assert shared.config["sort_block_m"] == 256 and shared.config["packed_rows"] == 128
+    calls = []
+    monkeypatch.setattr(sys, "argv", [__file__, "--is-sorted-bm-256", "--candidate", candidate])
+    monkeypatch.setattr(sys.modules[__name__], "run_test", lambda **kw: calls.append(kw))
+    main()
+    assert len(calls) == 1 and calls[0]["is_sorted_bm_256"] and calls[0]["candidates"] == [candidate]
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("sort_block_m", [128, 256])
+@pytest.mark.parametrize("n,splits", [
+    (128, 1), (256, 2), (512, 1), (1024, 2), (1024, 4), (1024, 8),
+    (768, 3), (1280, 5), (2048, 16),
+])
+def test_m128_oc_splits(n, splits, sort_block_m, persistent):
+    """Three native M blocks give uneven shard counts for OC1/2/3/4/5."""
+    require_gpu()
+    from pyhip.ops.moe.flydsl.moe_fp8_blockscale_stage2 import make_m128_down, M128_QUEUE_SIZE
+
+    tokens, experts, topk = 17, 3, 1
+    assignments = (torch.arange(tokens, device="cuda", dtype=torch.int32) % experts)[:, None]
+    routing = ((torch.arange(tokens, device="cuda", dtype=torch.float32) % 4 + 1) / 4)[:, None]
+    ids, routes, eids, valid, _ = moe_sorting(assignments, routing, experts, n, torch.bfloat16,
+                                             sort_block_m, None, None, 0)
+    valid_rows = int(valid[0])
+    assert valid_rows == experts * sort_block_m
+    a = torch.zeros((tokens, topk, 256), dtype=torch.bfloat16, device="cuda")
+    a[..., 0], a[..., 128] = 1, 2
+    w = torch.zeros((experts, n, 256), dtype=torch.bfloat16, device="cuda")
+    w[..., 0] = torch.arange(1, experts + 1, device="cuda")[:, None]
+    w[..., 128] = -w[..., 0]
+    sa = torch.ones((2, tokens), dtype=torch.float32, device="cuda")
+    sb = torch.ones((experts, n // 128, 2), dtype=torch.float32, device="cuda")
+    sb[..., 1] = 0.25
+    expected = ((assignments.float() + 1) * routing * 0.5).to(torch.bfloat16).expand(-1, n)
+    ids[valid_rows:], routes[valid_rows:] = 0, 123
+    eids[experts:] = 0x7FFFFFFF
+    down = make_m128_down(n=n, topk=topk, num_experts=experts, persistent=persistent,
+                          is_sorted_bm_256=sort_block_m == 256, num_oc_splits=splits)
+    assert down.config["num_oc_splits"] == splits and not hasattr(down, "workspace")
+    rows = eids.numel() * sort_block_m
+    guard = torch.full((rows + 2, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    packed = guard[1:-1]
+    queue = torch.zeros(M128_QUEUE_SIZE if persistent else 1, dtype=torch.int32, device="cuda")
+    if not persistent:
+        queue.fill_(0x123456)
+    inverse = torch.empty((tokens, topk), dtype=torch.int32, device="cuda")
+    output = torch.empty((tokens, n), dtype=torch.bfloat16, device="cuda")
+    tensors = (packed, a.to(torch.float8_e4m3fn), shuffle_weight(w.to(torch.float8_e4m3fn), layout=(16, 16)),
+               sa, sb, ids, routes, eids, valid, queue)
+    reduce = make_moe_sum(n=n, topk=topk, sort_block_m=128)
+
+    def run():
+        down(*tensors)
+        inverse.fill_(-1)
+        invert_sorted_ids(topk)(ids, inverse, valid, ids.numel(), tokens)
+        reduce(output, packed, inverse)
+
+    def check(real):
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected if real else torch.zeros_like(expected), rtol=0, atol=0)
+        assert torch.isnan(guard[[0, -1]]).all() and torch.isnan(packed[valid_rows:]).all()
+        if persistent:
+            assert queue.count_nonzero().item() == 0
+        else:
+            assert queue.item() == 0x123456
+        if not real:
+            assert torch.isnan(packed).all()
+
+    run()
+    check(True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+        run()
+    original_ids = ids.clone()
+    for state in ("valid", "invalid", "empty", "restore"):
+        if state == "invalid":
+            ids[:valid_rows].fill_((topk << 24) | tokens)
+        elif state == "empty":
+            valid.zero_()
+        elif state == "restore":
+            ids.copy_(original_ids)
+            valid[0] = valid_rows
+        packed.fill_(torch.nan)
+        output.fill_(torch.nan)
+        graph.replay()
+        check(state in ("valid", "restore"))
+
+
+@pytest.mark.parametrize("n,splits", [(512, 0), (512, -1), (512, 3), (256, 4), (768, 2.0)])
+def test_m128_rejects_invalid_oc_splits(n, splits):
+    with pytest.raises(ValueError, match="num_oc_splits"):
+        m128_kernel.make_m128_down(n=n, topk=1, num_experts=1, num_oc_splits=splits)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_m128_k256_lds_limit(persistent):
+    from pyhip.ops.moe.flydsl.moe_fp8_blockscale_stage2 import make_m128_down
+
+    options = dict(topk=1, num_experts=1, persistent=persistent, num_oc_splits=1)
+    # K256 caches all B scales in LDS; the next N128 block crosses 160 KiB.
+    largest_n = 1519616
+    assert make_m128_down(n=largest_n, **options).config["lds_bytes"] <= 160 * 1024
+    with pytest.raises(ValueError, match="LDS"):
+        make_m128_down(n=largest_n + 128, **options)
+    assert make_m128_down(n=1 << 21, k=512, **options).config["lds_bytes"] <= 160 * 1024
+    assert make_m128_down(n=1 << 21, **(options | {"num_oc_splits": 2})).config["lds_bytes"] <= 160 * 1024
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("is_sorted_bm_256", [False, True])
+@pytest.mark.parametrize("splits", [1, 2, 3, 4, 8])
+def test_m128_k256_compiler_specialization(persistent, is_sorted_bm_256, splits):
+    """The unified K256 entry must reuse the same launcher, not just match output."""
+    require_gpu()
+    from pyhip.ops.moe.flydsl import moe_fp8_blockscale_stage2 as stage2
+    from pyhip.ops.moe.flydsl.moe_gemm_2stage.common import get_device_cache_key
+
+    key, n, topk, experts = get_device_cache_key(), 6144, 2, 4
+    original = stage2._compile_m128_down(key, n, topk, experts, persistent, is_sorted_bm_256, splits)
+    unified = stage2._compile_m128_streaming_down(key, n, 256, topk, experts, persistent,
+                                                 is_sorted_bm_256, splits)
+    assert unified is original
+    assert stage2._compile_m128_streaming_down(key, n, 512, topk, experts, persistent,
+                                              is_sorted_bm_256, splits) is not original
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("sort_block_m", [128, 256])
+@pytest.mark.parametrize("k,n,splits,tokens,topk", [
+    (512, 1024, 1, 17, 2), (512, 1024, 4, 257, 3),
+    (768, 1536, 3, 33, 2), (1024, 1024, 8, 17, 2),
+    (1280, 1024, 2, 65, 2), (2048, 1024, 4, 17, 2),
+    (2560, 512, 2, 17, 2),  # Must not accidentally dispatch to the K256 kernel.
+    (4096, 512, 2, 1, 2), (768, 1024, 8, 4097, 2),
+])
+def test_m128_k_multiples(k, n, splits, tokens, topk, sort_block_m, persistent):
+    """Real quantization and reference across odd/even K256 ring iterations."""
+    require_gpu()
+    args, reference = make_case(tokens, n, 4, topk, 2301, sort_block_m=sort_block_m, k=k)
+    down = m128_kernel.make_m128_down(n=n, k=k, topk=topk, num_experts=4, persistent=persistent,
+                                      is_sorted_bm_256=sort_block_m == 256, num_oc_splits=splits)
+    assert down.config["k"] == k
+    # Streaming storage is fixed, independent of K and the OC packet count.
+    assert down.config["lds_bytes"] == (2 * 4096 + 128 * 2 + 2 + int(persistent)) * 4
+    assert down is m128_kernel.make_m128_down(n=n, k=k, topk=topk, num_experts=4, persistent=persistent,
+                                             is_sorted_bm_256=sort_block_m == 256, num_oc_splits=splits)
+    rows = args[6].numel() * sort_block_m
+    guard = torch.full((rows + 2, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    packed = guard[1:-1]
+    output_guard = torch.full((tokens + 2, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    output = output_guard[1:-1]
+    args[-1].fill_(0x123456)
+    down(packed, *args)
+    actual = unpack_routes(packed, args[4], args[7], tokens, topk, sort_block_m=128)
+    assert error_stats(actual, reference)["status"] == "PASS"
+    expected = actual.sum(dim=1)  # Validate BF16 route rounding before TOPK cancellation.
+    workspace = DownReduceWorkspace()
+    workspace.data = packed
+    pipeline = compile_packed_down_reduce(down, n=n, topk=topk, workspace=workspace)
+    inputs = (output, *args)
+    pipeline(*inputs)
+
+    def check(real):
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected if real else torch.zeros_like(expected), rtol=0.01, atol=0.01)
+        assert torch.isnan(guard[[0, -1]]).all() and torch.isnan(output_guard[[0, -1]]).all()
+        assert args[-1].item() == 0x123456
+        if persistent:
+            assert down.workspace["heads"].count_nonzero().item() == 0
+        if not real:
+            assert torch.isnan(packed).all()
+
+    check(True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pipeline(*inputs)
+        pipeline(*inputs)
+    valid_rows = int(args[7][0])
+    original_ids = args[4].clone()
+    for state in ("valid", "invalid", "empty", "restore"):
+        if state == "invalid":
+            args[4][:valid_rows].fill_((topk << 24) | tokens)
+        elif state == "empty":
+            args[7].zero_()
+        elif state == "restore":
+            args[4].copy_(original_ids)
+            args[7][0] = valid_rows
+        pipeline.poison_workspace(*inputs)
+        graph.replay()
+        check(state in ("valid", "restore"))
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("k", [512, 768, 1792])
+@pytest.mark.parametrize("case", ["last_k", "cross_chunk_cancellation"])
+def test_m128_k_block_scales(k, case, persistent):
+    """Detect missing tail K blocks, scale aliasing and BF16 partial rounding."""
+    require_gpu()
+    tokens, topk, experts, n = 3, 1, 3, 384
+    assignments = torch.arange(experts, dtype=torch.int32, device="cuda")[:, None]
+    routing = torch.full((tokens, topk), .5, device="cuda")
+    ids, routes, eids, valid, _ = moe_sorting(assignments, routing, experts, n, torch.bfloat16, 256, None, None, 0)
+    a = torch.zeros((tokens, topk, k), dtype=torch.bfloat16, device="cuda")
+    w = torch.zeros((experts, n, k), dtype=torch.bfloat16, device="cuda")
+    sa = torch.ones((k // 128, tokens * topk), device="cuda")
+    sb = torch.ones((experts, n // 128, k // 128), device="cuda")
+    if case == "last_k":
+        a[..., -128] = 1
+        w[..., -128] = 2
+        sa[-1] = torch.arange(1, tokens + 1, device="cuda")
+        sb[:, :, -1] = torch.arange(1, experts + 1, device="cuda")[:, None] * torch.tensor([1., 2., 4.], device="cuda")
+        expected = (torch.arange(1, tokens + 1, device="cuda").float().square()[:, None]
+                    * torch.tensor([1., 2., 4.], device="cuda").repeat_interleave(128)[None, :]).bfloat16()
+    else:
+        # BF16-rounding the first K256 chunk would erase the residual .03125.
+        a[..., 0] = a[..., 128] = a[..., -128] = 1
+        w[..., 0], w[..., 128], w[..., -128] = 1, 1, -1
+        sb[..., 0], sb[..., 1], sb[..., -1] = 256., .03125, 256.
+        expected = torch.full((tokens, n), .015625, dtype=torch.bfloat16, device="cuda")
+    args = (a.to(torch.float8_e4m3fn), shuffle_weight(w.to(torch.float8_e4m3fn), layout=(16, 16)),
+            sa, sb, ids, routes, eids, valid, torch.zeros(1, dtype=torch.int32, device="cuda"))
+    down = m128_kernel.make_m128_down(n=n, k=k, topk=topk, num_experts=experts,
+                                      persistent=persistent, is_sorted_bm_256=True, num_oc_splits=3)
+    packed = torch.full((eids.numel() * 256, n), torch.nan, dtype=torch.bfloat16, device="cuda")
+    down(packed, *args)
+    actual = unpack_routes(packed, ids, valid, tokens, topk, sort_block_m=128)
+    torch.testing.assert_close(actual[:, 0], expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        down(packed, *args)
+        down(packed, *args)
+    packed.fill_(torch.nan)
+    graph.replay()
+    actual = unpack_routes(packed, ids, valid, tokens, topk, sort_block_m=128)
+    torch.testing.assert_close(actual[:, 0], expected, rtol=0, atol=0)
+    if persistent:
+        assert down.workspace["heads"].count_nonzero().item() == 0
+
+
+@pytest.mark.parametrize("k", [0, -256, 128, 384, 512.0])
+def test_m128_rejects_invalid_k(k):
+    with pytest.raises(ValueError, match="positive integer multiple of256"):
+        m128_kernel.make_m128_down(n=1024, k=k, topk=1, num_experts=1)
+
+
+def test_m128_oc_shard_reset_interleavings():
+    """Each shard's terminal threshold uses its own count, including zero."""
+    import random
+
+    for tasks in (0, 1, 2, 3, 6, 7, 8, 9, 12, 15, 24, 65, 513, 1031):
+        for shard in range(8):
+            count = (tasks + 7 - shard) // 8
+            assert count == len(range(shard, tasks, 8))
+            rng = random.Random(tasks * 8 + shard)
+            waiting, pending, seen, head = list(range(64)), {}, [], 0
+            reset = False
+            while waiting or pending:
+                if waiting and (not pending or rng.randrange(2)):
+                    assert not reset
+                    worker = waiting.pop(rng.randrange(len(waiting)))
+                    pending[worker], head = head, head + 1
+                else:
+                    worker = rng.choice(list(pending))
+                    rank = pending.pop(worker)
+                    if rank < count:
+                        seen.append(rank * 8 + shard)
+                        waiting.append(worker)
+                    elif rank == count + 63:
+                        assert not waiting and all(value >= count for value in pending.values())
+                        head, reset = 0, True
+            assert reset and head == 0 and sorted(seen) == list(range(shard, tasks, 8))
+
+
 @pytest.mark.parametrize("n", [1024, 2048, 3072, 5120, 6144, 8192])
 def test_m128_self_reset_lifecycle(n):
     """Private heads close every launch; only public buffers are poisoned."""
@@ -689,16 +1252,21 @@ def test_m128_self_reset_interleavings():
             assert reset and head == 0 and sorted(seen) == list(range(blocks))
 
 
-@pytest.mark.parametrize("n", [512, 1024])
+@pytest.mark.parametrize("n", [512, 1536, 1024])
 @pytest.mark.parametrize("reduce_output", [False, True])
 def test_down_and_total_metrics(n, reduce_output, capsys):
     require_gpu()
     results = run_test(tokens=513, model_dim=n, experts=4, topk=2, reduce_output=reduce_output)
     printed = capsys.readouterr().out
-    expected_candidates = [key for key in DEFAULT_CANDIDATES if n % 1024 == 0 or key not in M128_CANDIDATES]
+    expected_candidates = [key for key in DEFAULT_CANDIDATES
+                           if (n % 1024 == 0 or key not in M128_CANDIDATES)
+                           and (n != 512 or key != "flydsl_bn64")]
     assert [r["candidate"] for r in results] == expected_candidates
     assert all(r["status"] == "PASS" for r in results)
     for row in results:
+        assert row["inter_dim"] == row["config"]["k"] == 256
+        if row["candidate"] == "pyhip":
+            assert row["config"]["num_oc_splits"] == 1
         assert row["elapsed_us"] > 0 and row["down_elapsed_us"] > 0
         assert row["unique_experts"] == 4 and row["valid_expert_blocks"] > 4
         assert row["rw_bytes"] == row["down_rw_bytes"] + row["reduce_rw_bytes"] + row["inverse_rw_bytes"]
@@ -709,7 +1277,11 @@ def test_down_and_total_metrics(n, reduce_output, capsys):
         assert row["valid_padded_rows"] == row["valid_expert_blocks"] * row["sort_block_m"]
         if row["candidate"] in M128_CANDIDATES:
             assert row["config"]["packed_rows"] == 128
-            assert row["valid_padded_rows"] == row["compute_rows"]
+            assert row["config"]["is_sorted_bm_256"] == (row["candidate"] in M128_SORT256_CANDIDATES)
+            if row["candidate"] in M128_SORT128_CANDIDATES:
+                assert row["valid_padded_rows"] == row["compute_rows"]
+            else:
+                assert row["compute_rows"] <= row["valid_padded_rows"]
         assert row["down_padded_tflops"] == f"{2 * row['compute_rows'] * n * 256 / row['down_elapsed_us'] / 1e6:.3f}"
         assert row["down_rw_bytes"] == 513 * 2 * 256 + row["work_tasks"] * n * 256 + 513 * 2 * n * 2
         if reduce_output:
@@ -726,20 +1298,71 @@ def test_down_and_total_metrics(n, reduce_output, capsys):
         assert all(config[key] == value for key, value in m128_kernel.M128_CONTINUOUS_VMEM_CONFIG.items())
         assert config["num_waves"] == 4 and not config["persistent"]
         assert independent["compute_rows"] <= next(r for r in results if r["candidate"] == "256x128 persist")["compute_rows"]
+        for candidate in M128_SORT256_CANDIDATES:
+            shared = next(r for r in results if r["candidate"] == candidate)
+            assert shared["compute_rows"] == independent["compute_rows"]
     else:
         assert "SKIP 128x128" in printed
-    assert "FlyDSL BN32" in printed and "FlyDSL BN64" in printed and "speedup vs FlyDSL BN64" in printed
+    assert "FlyDSL BN32" not in printed and "FlyDSL BN64" in printed and "speedup vs FlyDSL BN64" in printed
     assert "Mean abs error" in printed and "calc_diff" in printed
-    for row in results[1:3]:
+    for row in (r for r in results if r["candidate"] == "flydsl_bn64"):
         assert row["config"]["output_layout"] == "routed"
-        assert row["config"]["block_n"] == (32 if row["candidate"] == "flydsl_bn32" else 64)
+        assert row["config"]["block_n"] == 64
+        assert row["config"]["num_oc_splits"] == 4 and row["config"]["lds_bytes"] <= 160 * 1024
         if reduce_output:
             assert row["config"]["reduction"] == "torch" and not row["config"]["includes_inverse"]
 
 
+@pytest.mark.parametrize("inter_dim,candidates,expected", [
+    (128, tuple(CANDIDATES), ("pyhip", "flydsl_bn32", "flydsl_bn64")),
+    (384, None, ("pyhip", "flydsl_bn64")),
+    (512, None, ("flydsl_bn64", *M128_CANDIDATES)),
+    (768, None, M128_CANDIDATES),
+    (1024, ("flydsl_bn32", *M128_SORT256_CANDIDATES), ("flydsl_bn32", *M128_SORT256_CANDIDATES)),
+    (1152, ("flydsl_bn32",), ("flydsl_bn32",)),
+    (4096, ("128x128", "128x128 persist sort256"), ("128x128", "128x128 persist sort256")),
+])
+@pytest.mark.parametrize("reduce_output", [False, True])
+def test_inter_dim_metrics(inter_dim, candidates, expected, reduce_output, monkeypatch, capsys):
+    require_gpu()
+    if inter_dim > 384:
+        def unsupported_baseline(**kwargs):
+            pytest.fail("unsupported PyHIP baseline must not be compiled")
+        monkeypatch.setattr(sys.modules[__name__], "make_pyhip_down", unsupported_baseline)
+    tokens, n, topk = 33, 1024, 2
+    results = run_test(tokens=tokens, model_dim=n, experts=4, topk=topk,
+                       inter_dim=inter_dim, candidates=candidates, reduce_output=reduce_output)
+    printed = capsys.readouterr().out
+    assert [row["candidate"] for row in results] == list(expected)
+    assert f"K={inter_dim}" in printed and "Down calc_diff vs Torch" in printed
+    for row in results:
+        assert row["status"] == "PASS" and row["down_mismatches"] == f"0/{tokens * topk * n}"
+        assert row["inter_dim"] == row["config"]["k"] == inter_dim
+        assert row["elapsed_us"] > 0 and row["down_elapsed_us"] > 0
+        flops = 2 * tokens * topk * n * inter_dim
+        assert row["effective_tflops"] == f"{flops / row['elapsed_us'] / 1e6:.3f}"
+        assert row["down_effective_tflops"] == f"{flops / row['down_elapsed_us'] / 1e6:.3f}"
+        assert row["down_padded_tflops"] == f"{2 * row['compute_rows'] * n * inter_dim / row['down_elapsed_us'] / 1e6:.3f}"
+        other_bytes = tokens * topk * inter_dim + tokens * topk * n * 2
+        assert row["down_rw_bytes"] == other_bytes + row["work_tasks"] * n * inter_dim
+        assert row["down_ideal_rw_bytes"] == other_bytes + row["unique_experts"] * n * inter_dim
+        assert row["rw_bytes"] == row["down_rw_bytes"] + row["reduce_rw_bytes"] + row["inverse_rw_bytes"]
+        if reduce_output:
+            reference = "validated_pyhip_routes" if inter_dim <= 384 else "validated_candidate_routes"
+            assert row["sum_reference"] == reference
+            assert row["reduce_rw_bytes"] == (tokens * topk + tokens) * n * 2
+            assert bool(row["inverse_rw_bytes"]) == (row["candidate"] in PACKED_CANDIDATES)
+        else:
+            assert row["reduce_rw_bytes"] == row["inverse_rw_bytes"] == 0
+
+
 def test_m128_selection_and_import(capsys):
+    assert "flydsl_bn32" in CANDIDATES and "flydsl_bn32" not in DEFAULT_CANDIDATES
+    assert select_candidates(6144, ["flydsl_bn32"]) == ["flydsl_bn32"]
+    assert all(key in DEFAULT_CANDIDATES for key in M128_SORT256_CANDIDATES)
     assert select_candidates(6144) == list(DEFAULT_CANDIDATES)
-    assert select_candidates(512) == [key for key in DEFAULT_CANDIDATES if key not in M128_CANDIDATES]
+    assert select_candidates(512) == [key for key in DEFAULT_CANDIDATES
+                                       if key not in M128_CANDIDATES and key != "flydsl_bn64"]
     printed = capsys.readouterr().out
     assert select_candidates(1024, PACKED_CANDIDATES) == list(PACKED_CANDIDATES)
     for candidate in M128_CANDIDATES:
@@ -747,6 +1370,9 @@ def test_m128_selection_and_import(capsys):
         assert select_candidates(1024, [candidate]) == [candidate]
         with pytest.raises(ValueError, match="OC8"):
             select_candidates(512, [candidate])
+        pipeline = make_packed_pipeline(candidate, n=1024, topk=1, num_experts=2)
+        assert pipeline.config["sort_block_m"] == SORT_BLOCK_M[candidate]
+        assert pipeline.config["packed_rows"] == 128
     paths = list(sys.path)
     main_down = sys.modules[(__package__ + "." if __package__ else "") + "moe_multistage_down"]
     main_pipeline = sys.modules[(__package__ + "." if __package__ else "") + "moe_multistage_pipeline"]
@@ -756,6 +1382,20 @@ def test_m128_selection_and_import(capsys):
     assert sys.modules[(__package__ + "." if __package__ else "") + "moe_multistage_down"] is main_down
     assert sys.modules[(__package__ + "." if __package__ else "") + "moe_multistage_pipeline"] is main_pipeline
     assert main_pipeline.make_moe_sum is make_moe_sum
+
+
+@pytest.mark.parametrize("inter_dim", [128, 256, 512])
+def test_legacy_bn64_selection_requires_three_tiles(inter_dim, monkeypatch, capsys):
+    assert select_candidates(512, ["flydsl_bn64"], inter_dim=inter_dim) == []
+    assert select_candidates(512, ["flydsl_bn32"], inter_dim=inter_dim) == ["flydsl_bn32"]
+    assert select_candidates(1024, ["flydsl_bn64"], inter_dim=inter_dim) == ["flydsl_bn64"]
+    calls = []
+    monkeypatch.setattr(sys, "argv", [__file__, "--model-dim", "512", "--inter-dim", str(inter_dim),
+                                      "--candidate", "flydsl_bn64"])
+    monkeypatch.setattr(sys.modules[__name__], "run_test", lambda **kw: calls.append(kw))
+    main()
+    printed = capsys.readouterr().out
+    assert not calls and "SKIP flydsl_bn64:" in printed and "no selected kernels support" in printed
 
 
 def test_live_m_blocks_ignore_padding_and_capacity():
@@ -789,6 +1429,86 @@ def test_cli_scope(monkeypatch, argv, scope):
     assert len(calls) == 1 and calls[0]["reduce_output"] is scope
     expected = argv[argv.index("--candidate") + 1:] if "--candidate" in argv else list(DEFAULT_CANDIDATES)
     assert calls[0]["candidates"] == expected and calls[0]["profile"] == ("--profile" in argv)
+    assert calls[0]["inter_dim"] == 256
+
+
+@pytest.mark.parametrize("inter_dim,candidates,expected", [
+    (128, None, ("pyhip", "flydsl_bn64")),
+    (384, None, ("pyhip", "flydsl_bn64")),
+    (512, None, ("flydsl_bn64", *M128_CANDIDATES)),
+    (640, None, ()),
+    (768, None, M128_CANDIDATES),
+    (4096, None, M128_CANDIDATES),
+    (512, PACKED_CANDIDATES, M128_CANDIDATES),
+    (384, ("128x128",), ()),
+    (1152, ("flydsl_bn32", "flydsl_bn64"), ("flydsl_bn32",)),
+    (1280, ("flydsl_bn32", "128x128 persist sort256"), ("128x128 persist sort256",)),
+])
+def test_inter_dim_selection_and_cli(inter_dim, candidates, expected, monkeypatch, capsys):
+    assert select_candidates(6144, candidates, inter_dim=inter_dim) == list(expected)
+    printed = capsys.readouterr().out
+    for candidate in DEFAULT_CANDIDATES if candidates is None else candidates:
+        assert (f"SKIP {candidate}:" in printed) == (candidate not in expected)
+    calls = []
+    argv = [__file__, "--inter-dim", str(inter_dim)]
+    if candidates is not None:
+        argv.extend(["--candidate", *candidates])
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(sys.modules[__name__], "run_test", lambda **kw: calls.append(kw))
+    main()
+    if expected:
+        assert len(calls) == 1 and calls[0]["inter_dim"] == inter_dim
+        assert calls[0]["candidates"] == list(expected)
+    else:
+        assert not calls and "no selected kernels support" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("inter_dim", [-128, 0, 64, 129, 257])
+def test_inter_dim_rejects_invalid_values(inter_dim, monkeypatch, capsys):
+    with pytest.raises(ValueError, match="positive multiple of 128"):
+        select_candidates(6144, inter_dim=inter_dim)
+    monkeypatch.setattr(sys, "argv", [__file__, "--inter-dim", str(inter_dim)])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2 and "positive multiple of 128" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("n,expected", [(983040, ["flydsl_bn64"]), (983552, [])])
+def test_inter_dim_lds_includes_scale_storage(n, expected):
+    # BN64/K512 ring + metadata leaves 30720 bytes for this OC4 split's scales.
+    assert select_candidates(n, ["flydsl_bn64"], inter_dim=512) == expected
+
+
+@pytest.mark.parametrize("inter_dim,candidates,profile", [
+    (640, None, False), (512, ["256x128"], True), (128, ["128x128"], False),
+])
+def test_inter_dim_all_skipped_without_gpu_work(inter_dim, candidates, profile, monkeypatch, capsys):
+    def unexpected_prepare(*args, **kwargs):
+        pytest.fail("all-skipped runs must not prepare inputs or compile a baseline")
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "make_case", unexpected_prepare)
+    monkeypatch.setattr(module, "make_pyhip_down", unexpected_prepare)
+    assert run_test(inter_dim=inter_dim, candidates=candidates, profile=profile) == []
+    printed = capsys.readouterr().out
+    assert "no selected kernels support" in printed and "PASS" not in printed
+
+
+@pytest.mark.parametrize("candidate", ["128x128", "256x128"])
+@pytest.mark.parametrize("reduce_output", [False, True])
+def test_cli_inter_dim_profile(candidate, reduce_output, monkeypatch, capsys):
+    argv = [__file__, "--profile", "--inter-dim", "512", "--is-sorted-bm-256", "--candidate", candidate]
+    if reduce_output:
+        argv.extend(["--mode", "down-reduce"])
+    calls = []
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(sys.modules[__name__], "run_test", lambda **kw: calls.append(kw))
+    main()
+    if candidate == "128x128":
+        assert len(calls) == 1 and calls[0]["inter_dim"] == 512
+        assert calls[0]["profile"] and calls[0]["is_sorted_bm_256"]
+        assert calls[0]["reduce_output"] is reduce_output
+    else:
+        assert not calls and "no selected kernels support" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("candidate", M128_CANDIDATES)
@@ -950,23 +1670,31 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=16384)
     parser.add_argument("--model-dim", type=int, default=6144)
+    parser.add_argument("--inter-dim", type=int, default=256,
+                        help="GEMM K (positive multiple of 128, default: 256); unsupported kernels are skipped")
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--candidate", choices=DEFAULT_CANDIDATES, nargs="+", default=None)
+    parser.add_argument("--candidate", choices=tuple(CANDIDATES), nargs="+", default=None)
     parser.add_argument("--mode", choices=("down-reduce", "down"), default=None)
+    parser.add_argument("--is-sorted-bm-256", action="store_true",
+                        help="compile both M128 paths for shared sort256 metadata; output stays packed128")
     parser.add_argument("--profile", action="store_true", help="23 direct launches; defaults to packed down-only")
     args = parser.parse_args()
     if args.profile and (args.candidate is None or len(args.candidate) != 1):
         parser.error("--profile requires exactly one --candidate")
     try:
-        candidates = select_candidates(args.model_dim, args.candidate)
+        candidates = select_candidates(args.model_dim, args.candidate, inter_dim=args.inter_dim)
     except ValueError as error:
         parser.error(str(error))
+    if not candidates:
+        print(f"SKIP: no selected kernels support inter-dim={args.inter_dim}")
+        return
     mode = args.mode or ("down" if args.profile else "down-reduce")
     run_test(tokens=args.tokens, model_dim=args.model_dim, experts=args.experts,
              topk=args.topk, seed=args.seed, candidates=candidates,
-             profile=args.profile, reduce_output=mode == "down-reduce")
+             profile=args.profile, reduce_output=mode == "down-reduce",
+             is_sorted_bm_256=args.is_sorted_bm_256, inter_dim=args.inter_dim)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,44 @@
 # MoE down：相对PyHIP的优化与四个固定case
 
-本文对应2026-09-14清理后的主代码，包含B32k的packed大buffer寻址修复。以测试中的 **PyHIP FP8 down＋Torch TOPK sum** 为基线，先列公共增量，再分别说明 **256x128 persist、256x128、128x128、128x128 persist**。历史筛选数字不作为每项优化的独立收益证明。
+本文基于2026-09-14清理后的主代码，包含B32k的packed大buffer寻址修复，以及2026-09-30新增的M128消费sort256模式。以测试中的 **PyHIP FP8 down＋Torch TOPK sum** 为基线，先列公共增量，再分别说明 **256x128 persist、256x128、128x128、128x128 persist**。历史筛选数字不作为每项优化的独立收益证明。
+
+M128和custom reduce的正式实现现位于
+[src M128 Down](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py)和
+[src packed reduce](../../../../src/pyhip/ops/moe/flydsl/moe_packed_reduce.py)。本目录保留实验入口，
+不再维护两份device kernel。下文的OC8和自复位`T/8+63`均是**默认配置**的例子；
+新编译参数`num_oc_splits`及通用复位公式见5.2节。
+M128还支持任意正的K256倍数，K>256采用固定双缓冲流式实现，见5.3节；
+后续PF3/pair发布和性能图表仍描述K256快路径，不能直接套用到大K。
+
+原FlyDSL BN32/BN64 routed实现也已移至
+[src 8wave Down](../../../../src/pyhip/ops/moe/flydsl/moe_8wave_down.py)，
+其[global→LDS helper](../../../../src/pyhip/ops/moe/flydsl/moe_8wave_down_utils.py)一起迁入。
+本目录的[旧入口](moe_8wave_down.py)仅re-export，测试仍复用同一份kernel。
+完整MoE通过`fly_blockscale/down_path="8wave"`接入，支持I为128倍数，
+N32/N64和OC1/2/4/8参与调优；保留全K资源上限、routed BF16输出和Torch TOPK sum。
+原M128的`default/persistent`及packed custom reduce保持不变。
 
 ## 1. 名称、任务粒度与基线
 
-[case入口和工厂](test_blockscaled.py#L25-L51)保留七项；旧FlyDSL BN32/BN64仍作对照，本文重点说明四个packed case。
+[case入口和工厂](test_blockscaled.py)默认运行八项：PyHIP、FlyDSL BN64、两条M256路径，以及M128 independent/persistent各自的sort128和sort256配置。FlyDSL BN32不再默认运行，但可通过`--candidate flydsl_bn32`显式选择。本文重点说明四种packed实现及其排序配置。
 
-`Mx128`中的M是计算/排序行块；128是该实现的N128组织单位，**不是一次任务只算128列**。B的实际DMA和单个Compute以 **N64×K256** packet进行。一次逻辑任务覆盖`M × (N / OC分片数)`，内部循环多个packet。
+`--inter-dim`指定GEMM的K，缺省256；输入量化、scale形状、kernel编译和FLOPs/字节模型
+均使用实际K。它必须是正的128倍数，不做隐式padding。候选不支持指定K时打印原因并
+`SKIP`，包括通过`--candidate`显式选择的候选；若全部跳过，不分配测试输入，也不打印PASS。
+
+| 候选 | 本测试的K支持范围 |
+|---|---|
+| 两条M256 packed路径 | 仅256 |
+| 四条M128路径 | 正的256倍数；N仍须满足默认OC8的1024倍数约束 |
+| PyHIP ASM BN64 | 128、256、384；当前全K寄存器布局在K512耗尽VGPR |
+| FlyDSL BN64 | 正的128倍数，四槽B ring＋metadata＋scale不得超过160KiB LDS；K640起必定超限 |
+| FlyDSL BN32（显式选择） | 同上，K1280起必定超限；也根据实际N计算scale LDS大小 |
+
+例如默认候选配合`--inter-dim 512`运行BN64和四条M128路径；`--inter-dim 768`只运行
+四条M128路径。跳过只依据已知约束，不捕获并忽略其他编译错误或数值失败。
+实验中的FlyDSL BN32/BN64固定OC4，每份至少三个N tile；因此N512跳过BN64，BN32仍可显式选择。
+
+`Mx128`中的M是计算/packed行块，默认也等于排序粒度；M128可通过`is_sorted_bm_256=True`消费sort256。128是该实现的N128组织单位，**不是一次任务只算128列**。B的实际DMA和单个Compute以 **N64×K256** packet进行。一次逻辑任务覆盖`M × (N / OC分片数)`，内部循环多个packet。
 
 | case | M／sort粒度 | waves/CTA | OC分片数S | 一次逻辑任务的N范围 | 调度 | task swizzle | 输出策略 |
 |---|---:|---:|---:|---|---|---|---|
@@ -15,6 +47,8 @@
 | **256x128** | 256 | 8 | 4 | N/4 | 每task独立CTA | **width8** | packed，NT／aux2 |
 | **128x128** | 128 | 4 | 8 | N/8 | 每task独立CTA | **width2** | packed，SC1/NT／aux18 |
 | **128x128 persist** | 128 | 4 | 8 | N/8 | 512个persistent CTA，8个逻辑分片队列 | **width4** | packed，SC1/NT／aux18 |
+| **128x128 sort256** | 128／256 | 4 | 8 | N/8 | 每task独立CTA，首ID判空 | **width2** | packed128，SC1/NT／aux18 |
+| **128x128 persist sort256** | 128／256 | 4 | 8 | N/8 | 512个persistent CTA，空半块继续领号 | **width4** | packed128，SC1/NT／aux18 |
 
 以上CTA数量是launch/work分配方式，不等于同时驻留数量。硬件为gfx950／MI350X，256 CUs、8 XCDs；`width2/4/8`是逻辑置换宽度，不是使用的物理XCD个数。
 
@@ -45,7 +79,7 @@ PyHIP基线OC1，一个claim计算整个N。新M256为OC4，新M128为OC8，多�
 | M256／sort256／OC4 | 196608 | 768 | 3072 | 1536 | 24 |
 | M128／sort128／OC8 | 148096 | 1157 | 9256 | 768 | 12 |
 
-收益意图是更细的负载平衡和N维并行；代价是更多task启动/领号/metadata，以及A按OC重复加载。不同OC读不同B列，合起来才是一份该M块所需的B，**不要再把B字节总量乘OC**。代码：[M256划分](moe_multistage_down.py#L118-L143)、[M128划分](moe_multistage_down_m128.py#L34-L55)。
+收益意图是更细的负载平衡和N维并行；代价是更多task启动/领号/metadata，以及A按OC重复加载。不同OC读不同B列，合起来才是一份该M块所需的B，**不要再把B字节总量乘OC**。代码：[M256划分](moe_multistage_down.py#L118-L143)、[M128划分](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L96-L115)。
 
 ### 2.2 把“反量化＋上一结果打包”穿插在MFMA之间
 
@@ -55,7 +89,7 @@ PyHIP已有延迟反量化队列，但其BF16/routing打包位于当前MFMA批�
 - 以`pending/dequant`短队列延迟消费MFMA结果，用独立操作填依赖间隔；源码`remaining=7`是调度预算，不是所有ISA间隔都严格7条VALU的保证。
 - 地址预先准备，热点片段局部pin到VGPR；uniform scale经标量广播，控制长生命周期值，避免意外spill。
 
-代码：[M256 compute_stage](moe_multistage_down.py#L340-L418)、[M128 compute](moe_multistage_down_m128.py#L263-L339)、[寄存器/地址helper](moe_multistage_down.py#L39-L62)。M128与M256实际store时机不同，见后文各case。
+代码：[M256 compute_stage](moe_multistage_down.py#L340-L418)、[M128 compute](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L323-L396)、[寄存器/地址helper](moe_multistage_down.py#L39-L62)。M128与M256实际store时机不同，见后文各case。
 
 ### 2.3 从routed scatter改为packed合并写，再由专用reduce消费
 
@@ -63,7 +97,7 @@ PyHIP沿原token/slot写routed行；同wave的相邻排序行可能落在不相�
 
 `[sorted_M_block, global_N64, row_in_M_block, col64]`。
 
-在原BF16/permlane基础上，增加[行低位与列位的DPP交换](moe_multistage_down.py#L64-L115)，让相应lane的16B store组成连续128B地址片段；**不是一条线程指令写128B**，也不需要C进LDS。M256的[packed地址](moe_multistage_down.py#L256-L266)与M128的[地址/目标行掩码](moe_multistage_down_m128.py#L177-L214)都必须和重排匹配。
+在原BF16/permlane基础上，增加[行低位与列位的DPP交换](moe_multistage_down.py#L64-L115)，让相应lane的16B store组成连续128B地址片段；**不是一条线程指令写128B**，也不需要C进LDS。M256的[packed地址](moe_multistage_down.py#L256-L266)与M128的[地址/目标行掩码](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L237-L275)都必须和重排匹配。
 
 新的消费者直接从packed布局gather：
 
@@ -71,7 +105,7 @@ PyHIP沿原token/slot写routed行；同wave的相邻排序行可能落在不相�
 2. 256线程、2048列/CTA，提前读TOPK位置和片段，FP32顺序累加后转BF16。
 3. 没有额外的“先restore成routed再sum”中间步骤；但inverse和gather本身有成本，必须计入Full。
 
-代码：[inverse有效前缀](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/moe_reduce.py#L110-L136)、[packed reducer](moe_multistage_reduce.py#L20-L59)、[共享pipeline](moe_multistage_pipeline.py#L34-L82)。
+代码：[inverse有效前缀](../../../../src/pyhip/ops/moe/flydsl/moe_gemm_2stage/moe_reduce.py#L110-L136)、[packed reducer](../../../../src/pyhip/ops/moe/flydsl/moe_packed_reduce.py#L23-L62)、[共享pipeline](moe_multistage_pipeline.py#L34-L82)。
 
 若排序位置为l、输出列为j、Block M为B，则packed元素索引为：
 
@@ -81,13 +115,13 @@ $$
 
 实际分配是`[capacity_blocks*B,N]`，OC不增加行数。二维shape只是存储容器，不能直接当普通行主序结果。更大的padding分配容量不等于有效输出写流量。
 
-M256的[输出descriptor](moe_multistage_down.py#L239-L244)现在按M块重建：先以64位元素运算计算`output + Int64(m_block) * (256*N)`，再用块内32位offset和块尾OOB sentinel。这样总packed容量可超过4GiB，而无效行不会因全局sentinel溢出而写回低地址。[reducer](moe_multistage_reduce.py#L41-L57)对每route同样使用64位M块基址，非法inverse先选安全基址再屏蔽load。原有store/load向量宽度、cache policy和布局不变。
+M256的[输出descriptor](moe_multistage_down.py#L239-L244)现在按M块重建：先以64位元素运算计算`output + Int64(m_block) * (256*N)`，再用块内32位offset和块尾OOB sentinel。这样总packed容量可超过4GiB，而无效行不会因全局sentinel溢出而写回低地址。[reducer](../../../../src/pyhip/ops/moe/flydsl/moe_packed_reduce.py#L35-L55)对每route同样使用64位M块基址，非法inverse先选安全基址再屏蔽load。原有store/load向量宽度、cache policy和布局不变。
 
 ### 2.4 明确B/C的cache policy，保持原数值顺序
 
 四个新case的B DMA均为aux16／SC1；M256输出aux2／NT，M128输出aux18／SC1+NT。专用reduce中间读取aux2／NT，最终输出aux0。PyHIP基线的[Buffer load默认未加SC1](../../../../src/pyhip/codegen/asm/asmjit.py#L672-L684)，[store调用没有NT扩展标志](../../../../src/pyhip/ops/moe/asm/moe_gemm_8wave.py#L1099-L1110)。这些是当前实测选择，不是通用“开NT就快”的规则。
 
-四个case仍保持：K128 partial分别缩放→第二项FP32 FMA→routing乘法→每route BF16 RNE→TOPK FP32 sum→最终BF16。没有把scale/routing重结合，也没有在BF16舍入前跨route求和。代码：[M256显式FMA](moe_multistage_down.py#L377-L383)、[M128显式FMA](moe_multistage_down_m128.py#L295-L302)、[严格相消回归](test_blockscaled.py#L515-L555)。
+四个case仍保持：K128 partial分别缩放→第二项FP32 FMA→routing乘法→每route BF16 RNE→TOPK FP32 sum→最终BF16。没有把scale/routing重结合，也没有在BF16舍入前跨route求和。代码：[M256显式FMA](moe_multistage_down.py#L377-L383)、[M128显式FMA](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L355-L363)、[严格相消回归](test_blockscaled.py#L515-L555)。
 
 ## 3. 256x128 persist
 
@@ -121,7 +155,85 @@ M256的[输出descriptor](moe_multistage_down.py#L239-L244)现在按M块重建�
 - **提前3包B，PF3逐包发布**；每次Memory把q+3的4次DMA补充分散到16次LDS读之间。Memory priority3、Compute priority0。
 - **Compute内分散store**：在q的Compute中写q−2、打包q−1、计算q，保持最多几批结果的明确生存期。不同于M256主要在下一Memory发旧C store。
 
-代码：[shape和width选择](moe_multistage_down_m128.py#L34-L55)、[任务转置/空块检查](moe_multistage_down_m128.py#L91-L131)、[N phase与prologue](moe_multistage_down_m128.py#L139-L165)、[PF3/refill](moe_multistage_down_m128.py#L221-L261)、[Compute store/pack](moe_multistage_down_m128.py#L263-L339)。
+代码：[shape检查与工厂](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py)、[任务转置/空块检查](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L145-L158)、[N phase与prologue](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L199-L225)、[PF3/refill](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L282-L321)、[Compute store/pack](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L323-L396)。
+
+### 5.1 可选：共享sort256，跳过空M128半块
+
+`make_m128_down(..., is_sorted_bm_256=True)`同时支持独立和persistent路径；默认`False`仍使用原生sort128。参数参与工厂缓存/编译，不增加运行时tensor参数。
+
+- `sorted_ids/sorted_weights/expert_ids/valid_ids`直接传入`moe_sorting(..., block_size=256)`的输出，不复制expert数组，也不在host读取valid长度。
+- 逻辑M128块`m`从`sorted_ids[m*128]`开始，两半共用`expert_ids[m//2]`；任务域仍为`valid_ids[0]//128*8`，其中valid包含padding，不是实际route数。
+- 原生排序保证每个专家的真实route连续、padding仅在尾部。因此首项的token或slot无效时，整个M128块均为空，可在expert/scale/A/B加载前跳过。首项有效只说明该块非空，**后续逐行mask仍保留**。此规则不适用于人为插入空洞的稀疏sorted数组。
+- 输出容量是`[expert_ids.numel()*256,N]`，物理布局仍为`[M128块,N64,128,64]`；inverse保留原排序位置，reducer按128行读取。排序粒度与packed行数不能混用。
+- persistent空任务照常完成claim，再领取下一项；不提前结束worker，也不缩减队列计数。因此末terminal rank自复位规则不变，空半块无输出写回，inverse/reduce不会读取这些padding。
+
+[测试入口](test_blockscaled.py)默认同时列出`128x128`、`128x128 persist`、`128x128 sort256`、`128x128 persist sort256`，其Sorting block M分别是128、128、256、256，无需额外开关。仍可用`--is-sorted-bm-256`把原生M128候选切换为sort256；所有M128路径均按packed128解码和reduce。执行行数只计非空M128块；排序、padding判定的统计在计时外，kernel内的检查/claim属于Down计时。减少padding计算不代表已经证明端到端加速。
+
+### 5.2 编译期 `num_oc_splits`
+
+`make_m128_down(..., num_oc_splits=8)`默认保留OC8，独立和persistent都支持其他正整数。
+要求`N % (num_oc_splits*128) == 0`，即每份至少包含两个N64 packet，
+不会切开N128 scale块。该参数参与编译缓存，并真实改变任务/列索引，而非仅修改显示metadata。
+
+- `n_split=N/S`、`packets=n_split/64`、任务总数`T=valid_ids[0]/128*S`。
+- `m=task//S`、`oc=task%S`；排序粒度、packed128输出和inverse/reduce布局不变。
+- Persistent仍为8个shard、512个worker。shard `h`的任务数为`(T+7-h)//8`，
+	末terminal rank改为`(T+7-h)//8+63`，覆盖OC1/2/3等导致任务数不能被8整除的情况。
+- 实验工厂保持公开单元素counter不变，私有heads只首次清零并在kernel内自复位；
+	同一实验callable仍不可跨stream并发。src工厂不持有tensor，persistent需要调用方传入
+	256个清零int32 words；完整`tuned_moe`为每次调用/graph独立分配，避免共享队列。
+
+默认benchmark中的四条M128路径仍采用OC8。定向pytest覆盖OC1/2/3/4/5/8/16、两种排序、两种调度、
+N128/N256的custom reduce、容量尾部、valid0/恢复和双launch graph。候选数变化不代表已经测得加速。
+
+### 5.3 编译期 `k`：任意正的256倍数
+
+`make_m128_down(..., k=512)`及更大的256倍数使用同一十tensor接口；默认仍为256。
+原K256编译体保持不变，更大的K由独立的固定资源路径处理：
+
+- 每个N64输出packet依次遍历全部K256 chunk，B保留两个16KiB LDS槽，计算期间预取
+	后续chunk。槽复用前等待全部LDS读者，末尾不预取K范围之外的数据。
+- `shuffle_weight(16,16)`中相邻N16组跨度为`16*K`字节；每次从四个N16组各取一个
+	K256切片，而不是把大K的权重误当作连续N64/K256存储。
+- A只加载当前K256片段，A scale为物理`[K/128,tokens*topk]`，B scale为
+	`[experts,N/128,K/128]`。每个K128 dot按顺序FP32缩放/累加，全部K结束后才执行
+	routing乘法和BF16打包，不增加split-K或BF16中间累加。
+- 双缓冲加metadata的LDS固定为33800/33804字节（independent/persistent），
+	不随K扩大。K是编译缓存的一部分，循环次数为`K/256`；仍须满足输入、scale、
+	每OC权重窗口和packed输出的32位buffer地址限制。
+- `compile_packed_down_reduce`使用工厂的实际K校验输入；默认八列benchmark仍为K256，
+	不改变原对照口径。新增pytest覆盖K512/768/1024/1280/1792/2048/4096、sort128/256、
+	两种调度、OC1/2/3/4/8、尾K和跨chunk相消，以及invalid/valid0/恢复的双launch graph。
+
+新增路径首先保证大K支持和固定资源占用，不声称已达到K256快路径的流水效率。
+
+#### K256 特化与通用循环的性能区别
+
+统一入口`_compile_m128_streaming_down(..., k=256)`明确返回原
+`_compile_m128_down`的**同一个launcher**；不是把通用K循环跑一次。两者缓存命中后
+共享同一个compiled function，原PF3/pair发布、A/scale复用及交错打包均保持不变。
+
+2026-09-30在gfx950/FlyDSL0.3.2上强制绕过该特化的对照：tokens16384、N6144、
+K256、E384、TOPK8、OC8、seed1234。每对共享A/B/scale/输出地址，沿用
+`run_perftest`，warmup2/10samples，两轮ABBA；仅计Down，排序/参考检查在计时外。
+没有锁频或性能门槛，以下只代表该次测量：
+
+| Sorting M | 调度 | 原N流水 us | 强制通用体 us | 通用/原 |
+|---|---|---:|---:|---:|
+| 128 | independent | 474.75 | 980.28 | 2.06x |
+| 128 | persistent | 482.77 | 1000.08 | 2.07x |
+| 256 | independent | 524.11 | 1167.76 | 2.23x |
+| 256 | persistent | 486.91 | 1008.24 | 2.07x |
+
+实际ELF中K256的内层K循环已被折叠，退化来自不同的流水：通用体每个N64重新加载A/scale、
+完整等待并同步、所有MFMA后才打包，没有原实现的跨N预取和打包重叠。强制K256时还曾
+多发一个不使用的K256预取，使每N64有8条B DMA而非所需4条；该预取现已加编译期边界。
+同一persistent shape的通用体VGPR156、SGPR67、spill0，原流水VGPR203、SGPR78、spill0，
+因此不能将慢速归因于spill或“代码更大”。这些是指令请求，不等同于实际HBM流量。
+
+特化后的四组同址复测中，统一/原入口时延比为0.993～1.001；**相同机器码/launcher**
+是等价性的依据，时延差异属于本次采样波动。K>256仍用独立的通用流水，本次没有宣称
+其已获得原N流水的优化水平。
 
 ## 6. 128x128 persist
 
@@ -147,7 +259,7 @@ M256的[输出descriptor](moe_multistage_down.py#L239-L244)现在按M块重建�
 | shard | 一组共享同一head的worker及其可领取的virtual task编号；共有8组 |
 | B packet | task内部的一块N64×K256 FP8权重；N6144时一个task依次消费12包，而不是领取12个task |
 
-因此`grid=512, block=256`是512个CTA，不是512线程，也不是512个任务。实际能同时驻留多少CTA仍受LDS/寄存器和硬件调度限制。[worker定义与launch](moe_multistage_down_m128.py#L68-L74)、[grid/block配置](moe_multistage_down_m128.py#L389-L396)。
+因此`grid=512, block=256`是512个CTA，不是512线程，也不是512个任务。实际能同时驻留多少CTA仍受LDS/寄存器和硬件调度限制。[worker定义](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L124-L128)、[grid/block配置](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L449-L457)。
 
 #### 谁共享哪个队列？
 
@@ -157,7 +269,7 @@ worker用`h=worker%8`选head。同一分片的worker为：
 - shard1：worker1、9、17、…、505；
 - …；shard7：worker7、15、23、…、511。
 
-每shard恰好64个worker。**它们共享一个global head，不是每worker各有一个counter**。内部buffer有256个int32，真正的8个head位于元素0、32、64、…、224：`head[h]`的地址相隔32个int32，即128B，其他位置是间隔空间。[head寻址](moe_multistage_down_m128.py#L76-L85)、[私有buffer分配](moe_multistage_down_m128.py#L419-L422)。
+每shard恰好64个worker。**它们共享一个global head，不是每worker各有一个counter**。内部buffer有256个int32，真正的8个head位于元素0、32、64、…、224：`head[h]`的地址相隔32个int32，即128B，其他位置是间隔空间。[head寻址](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L132-L143)、[实验私有buffer分配](moe_multistage_down_m128.py#L29-L40)。
 
 #### 一次领取如何变成实际GEMM任务？
 
@@ -167,7 +279,7 @@ worker用`h=worker%8`选head。同一分片的worker为：
 4. 对v做width4任务置换，得到$t=F_4(v)$；再解码$m=t//8$、$oc=t\bmod8$，加载`expert_ids[m]`并计算该M块的这一段输出列。
 5. **整个task的所有N packet计算完成**，且必要DMA/LDS访问结束后，该CTA才回到同一claim站点再次领号。
 
-默认T=9256，每shard的有效rank为0～1156，对应1157个任务，由64个worker竞争领取。先完成的worker可以多领，慢worker少领；平均约18.1 task/worker，不是固定分配18个。代码：[单claim/广播/while循环](moe_multistage_down_m128.py#L76-L98)、[切换任务前的等待](moe_multistage_down_m128.py#L369-L379)。
+默认T=9256，每shard的有效rank为0～1156，对应1157个任务，由64个worker竞争领取。先完成的worker可以多领，慢worker少领；平均约18.1 task/worker，不是固定分配18个。代码：[单claim/广播/while循环](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L132-L150)、[切换任务前的等待](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L434-L439)。
 
 例如在shard0中，**假设**某次领取先后顺序如下；这只是演示，不是硬件保证的worker顺序：
 
@@ -227,11 +339,11 @@ N相位只置换task内的列遍历，不改变结果位置：
 - C写回当前M块、OC下的第p(q)个packed N64位置，不能按未旋转的q顺序落盘。
 - LDS仍用q%4分配槽。例如worker8的启动四槽放的是实际N64块2、3、4、5，而不是0、1、2、3。
 
-代码：[N映射和B DMA](moe_multistage_down_m128.py#L139-L160)、[scale索引](moe_multistage_down_m128.py#L247-L253)、[C写回](moe_multistage_down_m128.py#L211-L214)。
+代码：[N映射和B DMA](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L199-L218)、[scale索引](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L306-L313)、[C写回](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L265-L275)。
 
 **为什么用worker而不是rank？** 这样同一shard中的不同CTA有固定的N起点，避免每次拿到新任务都统一从N64块0开始；可能分散局部B读取/写回请求的热点和等待。若换成rank，起点会随动态领号变化，访问时序和复用距离也随之改变，是另一种调度实验，不能当等价替换。不同任务不一定同时开始，因此这不是强制错开时间或保证消除stall。
 
-此外，虽然worker的值固定，代码仍在**每个task内**用带副作用的标量identity asm重新物化`phase_worker`，约束LLVM不要将大量衍生N偏移长期保存在外层while的SGPR中。这不改变$\phi$，也不是刷新缓存；它针对的是编译器的寄存器生存期。[对应实现及注释](moe_multistage_down_m128.py#L139-L145)。
+此外，虽然worker的值固定，代码仍在**每个task内**用带副作用的标量identity asm重新物化`phase_worker`，约束LLVM不要将大量衍生N偏移长期保存在外层while的SGPR中。这不改变$\phi$，也不是刷新缓存；它针对的是编译器的寄存器生存期。[对应实现及注释](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L199-L204)。
 
 #### 动图：把6.1和6.2连起来看
 
@@ -267,18 +379,18 @@ N相位只置换task内的列遍历，不改变结果位置：
 
 每行Memory之后仍逐包执行Compute；**不是把两包一次性读入寄存器、合并成一个Compute**。例如q2读B2时补B4/B5，后者可以与Compute q2、Memory/Compute q3重叠；到q4才必须完成它们。
 
-“分散补两包”的实现也不是一条32KiB指令：每个`dma_turn`发16B/lane×256线程＝4KiB，4个turn组成一包；稳态偶数Memory用8个turn补两包，并穿插在当前包的LDS读取之间。启动时**每包一个**`asyncmark()`；稳态8个turn之后**下一pair共一个**mark。`wait_asyncmark`的数字是标记检查点距离，**不能直接当作裸`vmcnt`的数值**。[启动及DMA](moe_multistage_down_m128.py#L152-L165)、[8-turn refill和mark](moe_multistage_down_m128.py#L222-L246)。
+“分散补两包”的实现也不是一条32KiB指令：每个`dma_turn`发16B/lane×256线程＝4KiB，4个turn组成一包；稳态偶数Memory用8个turn补两包，并穿插在当前包的LDS读取之间。启动时**每包一个**`asyncmark()`；稳态8个turn之后**下一pair共一个**mark。`wait_asyncmark`的数字是标记检查点距离，**不能直接当作裸`vmcnt`的数值**。[启动及DMA](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L212-L223)、[8-turn refill和mark](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L282-L305)。
 
 为什么奇数包可以不做publication barrier？例如B3已在q2与B2一起发布；q2/q3期间只覆写S0/S1，不碰B2/B3的S2/S3。下一次q4的barrier又确保所有wave已结束对S2/S3的读取，才将它们用于B6/B7。因此需要同时满足**数据已发布**与**旧槽读者已退出**，不能只保留其中一个条件。
 
-这里省的是**重复的pair发布同步**：Q=12时，内部B publication barrier从逐包12次变成偶数q的6次；不包括metadata、领号及task收尾的同步。每个Memory内的`lgkmcnt=0`仍保留，确保该包已从LDS进入寄存器；task尾部也仍排空必要访问。Q=2时只启动两包且q0用`wait_asyncmark(0)`；Q=4时四包启动后不再refill。[逐包LDS等待](moe_multistage_down_m128.py#L254-L261)、[task收尾](moe_multistage_down_m128.py#L369-L376)。
+这里省的是**重复的pair发布同步**：Q=12时，内部B publication barrier从逐包12次变成偶数q的6次；不包括metadata、领号及task收尾的同步。每个Memory内的`lgkmcnt=0`仍保留，确保该包已从LDS进入寄存器；task尾部也仍排空必要访问。Q=2时只启动两包且q0用`wait_asyncmark(0)`；Q=4时四包启动后不再refill。[逐包LDS等待](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L314-L321)、[task收尾](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L434-L439)。
 
 ### 6.4 配套的scale复用、mask和队列生命周期
 
-- 两包对应同一N128，所以偶数包读取两个K128 scale，奇数包直接复用寄存器中的值；并不改变跨K的FP32乘法/FMA顺序。[scale复用](moe_multistage_down_m128.py#L247-L253)。
-- 输出目标valid位用DPP从已加载的行mask精确交换，省去重复ID读取。移除整CTA空route ballot，但输入/输出逐行掩码仍在；valid前缀之外不执行GEMM，valid0仍做终止claim。[DPP mask](moe_multistage_down_m128.py#L187-L208)。
-- 每shard64个worker各领取一次越界rank后退出。返回最后rank=`T/8+63`的worker可将head置零，因为其他worker已领取终止rank，不能再claim。首次分配置零，此后reset在Down内完成；没有跨CTA自旋，也没有单独清零kernel。**若改成256 workers，每shard只有32个worker，不能仍使用+63。**[自复位](moe_multistage_down_m128.py#L381-L387)。
-- 128B head间距用于隔离热点，不是通用L2 line大小声明。公开counter保持原值，私有head不能由调用者修改。缓存callable**不能跨stream并发**；换reduce workspace不能隔离同一个down queue。[状态拥有者](moe_multistage_down_m128.py#L400-L436)、[生命周期/交错回归](test_blockscaled.py#L603-L683)。
+- 两包对应同一N128，所以偶数包读取两个K128 scale，奇数包直接复用寄存器中的值；并不改变跨K的FP32乘法/FMA顺序。[scale复用](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L306-L313)。
+- 输出目标valid位用DPP从已加载的行mask精确交换，省去重复ID读取。移除整CTA空route ballot，但输入/输出逐行掩码仍在；valid前缀之外不执行GEMM，valid0仍做终止claim。[DPP mask](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L249-L264)。
+- 每shard64个worker各领取一次越界rank后退出。返回最后rank=`(T+7-h)//8+63`的worker可将head置零，因为其他worker已领取终止rank，不能再claim；默认OC8时简化为`T/8+63`。实验入口首次分配置零，此后reset在Down内完成；没有跨CTA自旋。**若改成256 workers，每shard只有32个worker，不能仍使用+63。**[自复位](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L441-L447)。
+- 128B head间距用于隔离热点，不是通用L2 line大小声明。实验公开counter保持原值，私有head不能由调用者修改。实验缓存callable**不能跨stream并发**；换reduce workspace不能隔离同一个down queue。[实验状态拥有者](moe_multistage_down_m128.py#L17-L44)、[生命周期/交错回归](test_blockscaled.py)。src调用方持有的queue则可为不同stream独立分配。
 
 ## 7. 任务swizzle：worker领取的编号如何变成(M块, OC)
 
@@ -293,7 +405,7 @@ N相位只置换task内的列遍历，不改变结果位置：
 | 128x128 | 独立CTA的block ID | width2转置 |
 | 128x128 persist | shard rank r和home h拼成v=8r+h | width4转置 |
 
-后三项都先得到t，再用各自的OC分片数S解码`m=t//S, oc=t%S`。**width只改变编号顺序，不代表wave数、worker数或启用的物理XCD数。**代码：[M256分支](moe_multistage_down.py#L188-L211)、[M128分支](moe_multistage_down_m128.py#L72-L98)。
+后三项都先得到t，再用各自的OC分片数S解码`m=t//S, oc=t%S`。**width只改变编号顺序，不代表wave数、worker数或启用的物理XCD数。**代码：[M256分支](moe_multistage_down.py#L188-L211)、[M128分支](../../../../src/pyhip/ops/moe/flydsl/moe_fp8_blockscale_stage2.py#L128-L158)。
 
 ### 7.2 有效前缀转置及尾部
 
@@ -364,9 +476,11 @@ M128通过home shard $h=worker\bmod8$、$v=8r+h$保证$v\bmod8=h$。即使物理
 
 ## 8. 使用、验证与证据边界
 
-- 模型输入固定K256、FP8 E4M3FN；M256要求N为512倍数，M128要求N为1024倍数。A scale物理K-major；B scale为`[experts,N/128,2]`；默认真实量化/排序/shuffle见[make_case](test_blockscaled.py#L163-L180)。
+- 默认benchmark输入为K256、FP8 E4M3FN；`--inter-dim`修改K并按第1节规则跳过不支持的候选。M256仍要求K256/N为512倍数，M128工厂支持任意正的K256倍数及`N%(num_oc_splits*128)==0`，默认OC8时N须为1024倍数。A scale物理K-major；B scale为`[experts,N/128,K/128]`；真实量化/排序/shuffle见[make_case](test_blockscaled.py)。
 - [工厂](test_blockscaled.py#L25-L51)返回down callable；[compile_packed_down_reduce](moe_multistage_pipeline.py#L34-L82)接收已选down，自动使用128/256 stride。返回的十tensor接口最终输出`[tokens,N]` BF16；单独down输出packed，勿重复TOPK sum。
-- `--candidate`使用本文四个名称，有空格的case参数需作为一个shell参数传递；`--mode down`只测Down，默认测完整流程；`--profile`单候选23次直接launch。参见[CLI](test_blockscaled.py#L942)。
+- `--candidate`使用第1节列出的名称，有空格的case参数需作为一个shell参数传递；`--mode down`只测Down，默认测完整流程；`--profile`单候选23次直接launch，也支持`--inter-dim`。参见[CLI](test_blockscaled.py)。
+- 每个候选的BF16 routes始终与独立Torch参考按原`rtol=atol=0.01`校验。PyHIP可用时保留共同的PyHIP routes.sum参考；不可用时，不再强行编译ASM，而是以各候选已经通过独立校验的实际BF16 routes.sum检查reduce，避免独立BF16舍入在相消处放大误差。表格分别展示Down对Torch的diff/mismatch和最终输出误差。
+- FLOPs和权重字节数使用实际K；字节模型仍是A一次、B按执行M块（或理想每expert一次）及输出写回，不计流式路径重复加载A等开销，不是实测HBM流量。
 - 普通计时保留原warmup2/iters10/copies1、同址正反对照；Down包含需要的counter/queue重置，Full直接测down＋inverse清空/重建＋reduce。量化/排序/参考/解码/投毒在计时外。[计时与检查](test_blockscaled.py#L311-L352)。
 - B32k（tokens32768／N6144／K256／E384／TOPK8／seed1234）已通过默认七case。[实测容量](../../../../tests/flydsl/moe_8w_down/analysis/batch32k_20260914/native_capacity.json)为sort256 **4.125GiB**、sort128 **3.5625GiB**；不缩减allocation，不替换native sorting。[七case结果](../../../../tests/flydsl/moe_8w_down/analysis/batch32k_20260914/batch32k.json)在原容差内均为0 mismatch，M256/M128的route也在计时外解码验证。
 - 当前[73项回归通过](../../../../tests/flydsl/moe_8w_down/analysis/batch32k_20260914/tests_first.log)，包含[M256两个scheduler跨4GiB写回、guard、capacity tail与graph replay](test_blockscaled.py#L795-L889)，以及[128/256 reducer跨4GiB读取、非法inverse和列尾mask](test_blockscaled.py#L892-L939)。B32k的有效M256前缀只有3.375GiB，因此另设真正读写高地址的边界测试，不能仅用大allocation通过代替。

@@ -177,6 +177,203 @@ def test_jit_blockscale(tokens, tile_m, tile_n_down, down_path, record_property)
     _run_jit_blockscale(model, tokens, tile_m, tile_n_down, down_path, record_property)
 
 
+def _fly_blockscale_config(splits=1, down_path="persistent", tile_n_down=64):
+    return dict(_impl="fly_blockscale", tile_m_gate=256,
+                tile_m_down=256 if down_path == "8wave" else 128,
+                tile_n_gate=256, tile_n_down=tile_n_down if down_path == "8wave" else 128,
+                down_path=down_path, num_oc_splits=splits)
+
+
+def _prepare_fly_blockscale(model, tokens, routing="balanced"):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("FlyDSL blockscale GateUp requires gfx950")
+    call = _prepare(model, tokens, "block", routing="random" if routing == "random" else "balanced")
+    call["hidden_states"].mul_(50)
+    if routing == "skewed":
+        call["topk_ids"].copy_(torch.arange(model["TOPK"], dtype=torch.int32)[None, :])
+    return call
+
+
+@pytest.mark.parametrize("down_path", ["default", "persistent"])
+@pytest.mark.parametrize("tokens, hidden, experts, topk, splits, routing", [
+    (1, 256, 3, 2, 1, "balanced"),
+    (33, 512, 4, 2, 1, "balanced"),
+    (33, 512, 4, 2, 4, "balanced"),
+    (257, 1024, 5, 3, 2, "random"),
+    (257, 1024, 5, 3, 4, "random"),
+    (257, 1024, 5, 3, 8, "random"),
+    (513, 768, 7, 2, 3, "skewed"),
+    (65, 6144, 3, 2, 4, "random"),
+    (257, 256, 130, 2, 1, "balanced"),  # >256 WG: exercise a full XCD batch.
+], ids=["m1", "h512-split1", "h512-split4", "split2", "split4",
+        "split8", "skewed-split3", "k6144", "xcd-batch"])
+def test_fly_blockscale(tokens, hidden, experts, topk, splits, routing, down_path):
+    model = dict(HIDDEN_SIZE=hidden, INTER_SIZE=256, TP=1, E=experts, TOPK=topk)
+    _check(_prepare_fly_blockscale(model, tokens, routing), _fly_blockscale_config(splits, down_path))
+
+
+@pytest.mark.parametrize("tokens", [1, 33, 257], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("inter,hidden,down_n,splits", [
+    (128, 256, 64, 1), (256, 1024, 64, 4), (384, 768, 64, 3),
+    (512, 1024, 64, 2), (640, 1024, 32, 8), (768, 512, 32, 4),
+    (896, 512, 32, 1), (1024, 1024, 32, 4), (1152, 512, 32, 2),
+    (128, 512, 128, 1), (256, 512, 128, 1), (384, 6144, 64, 4),
+])
+def test_fly_blockscale_8wave(tokens, inter, hidden, down_n, splits):
+    model = dict(HIDDEN_SIZE=hidden, INTER_SIZE=inter, TP=1, E=5, TOPK=3)
+    call = _prepare_fly_blockscale(model, tokens, "random")
+    _check(call, _fly_blockscale_config(splits, "8wave", down_n))
+
+
+@pytest.mark.parametrize("down_path", ["default", "persistent"])
+@pytest.mark.parametrize("inter,hidden,splits", [(512, 512, 1), (768, 768, 3),
+    (1024, 1024, 8), (1792, 512, 2), (4096, 512, 4)])
+def test_fly_blockscale_k_multiples(inter, hidden, splits, down_path):
+    model = dict(HIDDEN_SIZE=hidden, INTER_SIZE=inter, TP=1, E=4, TOPK=2)
+    call = _prepare_fly_blockscale(model, 33, "random")
+    runner, _ = _check(call, _fly_blockscale_config(splits, down_path))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner(**call)
+        result = runner(**call)
+    for value in (0.0, .05):
+        call["hidden_states"].fill_(value)
+        call["topk_ids"].copy_((call["topk_ids"] + 1) % 4)
+        reference = torch_reference(call)
+        call["output"].fill_(float("nan"))
+        graph.replay()
+        check = check_output(result, call["output"], reference)
+        assert check["status"] == "PASS", check
+
+
+@pytest.mark.parametrize("data_case", ["zero_input", "zero_scale", "zero_gate", "zero_up", "last_k"])
+@pytest.mark.parametrize("down_path", ["default", "persistent", "8wave"])
+def test_fly_blockscale_special_values(data_case, down_path):
+    inter = 384 if down_path == "8wave" else 256
+    model = dict(HIDDEN_SIZE=512, INTER_SIZE=inter, TP=1, E=5, TOPK=3)
+    call = _prepare_fly_blockscale(model, 97, "random")
+    if data_case == "zero_input":
+        call["hidden_states"].zero_()
+    elif data_case == "zero_scale":
+        call["w1_scale"].zero_()
+    elif data_case == "last_k":
+        call["w1_scale"][..., :-1].zero_()
+    else:
+        # Aiter's separated shuffle keeps the whole gate/up halves contiguous.
+        half = slice(None, inter) if data_case == "zero_gate" else slice(inter, None)
+        call["w1"].view(torch.uint8)[:, half].zero_()
+    _check(call, _fly_blockscale_config(2, down_path))
+    if data_case != "last_k":
+        assert not torch.count_nonzero(call["output"])
+
+
+def test_fly_blockscale_stage1_capacity_graph():
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("FlyDSL blockscale GateUp requires gfx950")
+    from aiter.ops.shuffle import shuffle_weight
+    from pyhip.ops.moe.flydsl.moe_fp8_blockscale_stage1 import fp8_blockscale_stage1
+
+    tokens, hidden, inter = 17, 256, 128
+    a = torch.ones((tokens, hidden), dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    w = shuffle_weight(torch.ones((1, 2 * inter, hidden), dtype=torch.bfloat16).to(a.dtype))
+    sa = torch.ones((hidden // 128, tokens), dtype=torch.float32)
+    sb = torch.ones((1, 2 * inter // 128, hidden // 128), dtype=torch.float32)
+    # Only block 0 is valid. Capacity tail is not block-aligned and must not be read.
+    si = torch.zeros(2 * 256 + 7, dtype=torch.int32)
+    si[:256].fill_((1 << 24) | tokens)
+    si[:tokens] = torch.arange(tokens, dtype=torch.int32)
+    se = torch.tensor([0, 0x7FFFFFFF, 0x7FFFFFFF], dtype=torch.int32)
+    valid = torch.tensor([256, tokens], dtype=torch.int32)
+    storage = torch.full((tokens * inter + 32,), -123, dtype=torch.bfloat16)
+    out = storage[16:-16].view(tokens, 1, inter)
+
+    def run():
+        return fp8_blockscale_stage1(a, w, sa, sb, si, se, valid, out)
+
+    run()
+    # Every dot is 256, so saturated SiLU(gate) * up is exactly 65536.
+    assert torch.equal(out, torch.full_like(out, 65536))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+        result = run()
+    for count in (256, 0, 256):
+        valid[0] = count
+        out.fill_(13)
+        graph.replay()
+        assert result is out
+        assert torch.equal(out, torch.full_like(out, 65536 if count else 13))
+        assert (storage[:16] == -123).all() and (storage[-16:] == -123).all()
+
+
+@pytest.mark.parametrize("splits", [1, 2, 8], ids=lambda n: f"split{n}")
+@pytest.mark.parametrize("down_path", ["default", "persistent", "8wave"])
+def test_fly_blockscale_stream_graph(splits, down_path):
+    model = dict(HIDDEN_SIZE=1024, INTER_SIZE=384 if down_path == "8wave" else 256, TP=1, E=7, TOPK=2)
+    call = _prepare_fly_blockscale(model, 257, "random")
+    runner, _ = _check(call, _fly_blockscale_config(splits, down_path, tile_n_down=32))
+    storage = torch.full((call["output"].numel() + 64,), -123, dtype=torch.bfloat16)
+    call["output"] = storage[32:-32].view_as(call["output"])
+    original = call["hidden_states"].clone()
+    original_ids = call["topk_ids"].clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runner(**call)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            runner(**call)
+            result = runner(**call)
+    stream.synchronize()
+    for factor, skewed in ((1.0, False), (0.0, True), (-.75, False)):
+        call["hidden_states"].copy_(original * factor)
+        # Change the valid block count without changing sorting buffer capacity.
+        call["topk_ids"].copy_(torch.arange(2, dtype=torch.int32)[None, :] if skewed else (original_ids + 1) % 7)
+        call["topk_weight"].mul_(-.5)
+        reference = torch_reference(call)
+        call["output"].fill_(float("nan"))
+        graph.replay()
+        check = check_output(result, call["output"], reference)
+        assert check["status"] == "PASS", check
+        assert (storage[:32] == -123).all() and (storage[-32:] == -123).all()
+
+
+@pytest.mark.parametrize("down_path", ["persistent", "8wave"])
+def test_fly_blockscale_concurrent_graphs(down_path):
+    """Cached code must not make captured calls share persistent queue heads."""
+    model = dict(HIDDEN_SIZE=512, INTER_SIZE=384 if down_path == "8wave" else 256, TP=1, E=3, TOPK=2)
+    runner = make_moe_runner(_fly_blockscale_config(down_path=down_path))
+    streams, graphs, calls, references = [], [], [], []
+    for index in range(2):
+        call = _prepare_fly_blockscale(model, 257, "random")
+        call["hidden_states"].mul_(index + 1)
+        call["topk_ids"].copy_((call["topk_ids"] + index) % 3)
+        references.append(torch_reference(call))
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            runner(**call)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                runner(**call)
+                runner(**call)
+        stream.synchronize()
+        calls.append(call)
+        streams.append(stream)
+        graphs.append(graph)
+    for _ in range(3):
+        for stream, graph, call in zip(streams, graphs, calls):
+            with torch.cuda.stream(stream):
+                call["output"].fill_(float("nan"))
+                graph.replay()
+        for stream in streams:
+            stream.synchronize()
+        for call, reference in zip(calls, references):
+            check = check_output(call["output"], call["output"], reference)
+            assert check["status"] == "PASS", check
+
+
 @pytest.mark.parametrize("tokens", [1, 17, 64, 257], ids=lambda m: f"m{m}")
 def test_asm_one_stage(tokens):
     _check(_prepare(SMALL_MODEL, tokens, "bf16"), dict(_impl="jit_1stage"))
@@ -356,6 +553,22 @@ def test_jit_mxfp4_perf(model_name, tokens, impl, tile_m, tile_n_gate, record_pr
 def test_jit_blockscale_perf(model_name, tokens,  record_property):
     _run_jit_blockscale(MOE_MODELS[model_name], tokens, 256, 64, "persistent",
                        record_property)
+
+
+@pytest.mark.perf
+@pytest.mark.parametrize("tokens", [8192, 16384], ids=lambda m: f"m{m}")
+def test_fly_blockscale_perf(tokens, record_property):
+    call = _prepare_fly_blockscale(MOE_MODELS["qwen35_397B_k256"], tokens)
+    _measure(call, _fly_blockscale_config(), record_property)
+
+
+@pytest.mark.perf
+@pytest.mark.parametrize("tokens", [8192, 16384], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("inter,down_n", [(256, 64), (384, 64), (640, 32)])
+def test_fly_blockscale_8wave_perf(tokens, inter, down_n, record_property):
+    model = MOE_MODELS["qwen35_397B_k256"] | dict(INTER_SIZE=inter, TP=1)
+    call = _prepare_fly_blockscale(model, tokens)
+    _measure(call, _fly_blockscale_config(4, "8wave", down_n), record_property)
 
 
 @pytest.mark.perf

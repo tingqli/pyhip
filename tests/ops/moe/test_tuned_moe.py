@@ -1153,6 +1153,194 @@ def test_blockscale_config_constraints(monkeypatch):
     assert not _native_configs(call)
 
 
+def test_fly_blockscale_candidates():
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+
+    def candidates(call):
+        return [c.all_kwargs() for c in tm._configs(**_tune_arguments(call))
+                if c.all_kwargs()["_impl"] == "fly_blockscale"]
+
+    call = _block_call(tokens=33, hidden=1024, inter=256)
+    configs = candidates(call)
+    packed = [c for c in configs if c["down_path"] != "8wave"]
+    routed = [c for c in configs if c["down_path"] == "8wave"]
+    assert {(c["num_oc_splits"], c["down_path"]) for c in packed} == {
+        (splits, path) for splits in (1, 2, 4, 8) for path in ("default", "persistent")}
+    assert all((c["tile_m_gate"], c["tile_m_down"], c["tile_n_gate"], c["tile_n_down"])
+               == (256, 128, 256, 128) for c in packed)
+    assert {(c["num_oc_splits"], c["tile_n_down"]) for c in routed} == {
+        (splits, bn) for splits in (1, 2, 4, 8) for bn in (32, 64)}
+    assert all((c["tile_m_gate"], c["tile_m_down"], c["tile_n_gate"])
+               == (256, 256, 256) for c in routed)
+    assert candidates(call | {"block_size_M": 256}) == configs  # Sorting M, not compute M.
+    assert not candidates(call | {"block_size_M": 128})
+    assert not candidates(call | {"swiglu_limit": .01})
+    assert not candidates(_block_call(hidden=384, inter=256))
+    for inter in (128, 384, 640, 896, 1152):
+        assert candidates(_block_call(hidden=1024, inter=inter)) == routed
+    for inter in (512, 768, 1280, 4096):
+        assert candidates(_block_call(hidden=1024, inter=inter)) == configs
+    assert {c["num_oc_splits"] for c in candidates(_block_call(hidden=256, inter=256))} == {1, 2}
+    assert not candidates(_block_call(shuffled=(False, True)))
+    assert not candidates(_block_call(shuffled=(True, False)))
+    assert not candidates(_fly_call(tokens=33, hidden=1024, inter=256))
+    key = bench.json.loads(_tune_arguments(call)["model_key"])
+    assert key["block_gateup_revision"] == 2
+    assert key["block_down_8wave_revision"] == 1
+    assert "block_down_k_revision" not in key
+    key = bench.json.loads(_tune_arguments(_block_call(hidden=1024, inter=512))["model_key"])
+    assert key["block_down_k_revision"] == 1
+    assert "block_down_8wave_revision" not in bench.json.loads(_tune_arguments(_fly_call())["model_key"])
+
+
+@pytest.mark.parametrize("down_path", ["default", "persistent"])
+def test_fly_blockscale_uses_packaged_down(monkeypatch, down_path):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+    from pyhip.ops.moe.flydsl import moe_fp8_blockscale_stage2 as stage2, moe_packed_reduce as reduce
+
+    call = _block_call(tokens=33, hidden=512, inter=256)
+    observed = []
+    build_down, build_reduce = stage2.make_m128_down, reduce.make_moe_sum
+
+    def capture_down(**kwargs):
+        observed.append(("down", kwargs))
+        return build_down(**kwargs)
+
+    def capture_reduce(**kwargs):
+        observed.append(("reduce", kwargs))
+        return build_reduce(**kwargs)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("fly_blockscale must not dispatch to ASM or use torch.sum")
+
+    reference = torch_reference(call)
+    monkeypatch.setattr(tm, "_run_8wave", unexpected)
+    monkeypatch.setattr(torch, "sum", unexpected)
+    monkeypatch.setattr(stage2, "make_m128_down", capture_down)
+    monkeypatch.setattr(reduce, "make_moe_sum", capture_reduce)
+    config = dict(_impl="fly_blockscale", tile_m_gate=256, tile_m_down=128,
+                  tile_n_gate=256, tile_n_down=128, down_path=down_path, num_oc_splits=4)
+    result = tm._fmoe_wrapper(**_tune_arguments(call), **config)
+    assert observed == [
+        ("down", dict(n=512, k=256, topk=2, num_experts=4, persistent=down_path == "persistent",
+                      is_sorted_bm_256=True, num_oc_splits=4)),
+        ("reduce", dict(n=512, topk=2, sort_block_m=128)),
+    ]
+    monkeypatch.undo()
+    _check(result, call, reference)
+
+
+@pytest.mark.parametrize("inter,bn,splits", [(128, 64, 2), (384, 64, 1), (640, 32, 4)])
+def test_fly_blockscale_8wave_uses_packaged_down(monkeypatch, inter, bn, splits):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+    from pyhip.ops.moe.flydsl import moe_8wave_down as stage2, moe_fp8_blockscale_stage2 as packed
+    from pyhip.ops.moe.flydsl import moe_packed_reduce
+
+    call = _block_call(tokens=33, hidden=512, inter=inter)
+    reference = torch_reference(call)
+    observed = []
+    build, torch_sum = stage2.flydsl_moe_gemm_8wave_down, torch.sum
+
+    def capture_down(**kwargs):
+        observed.append(("down", kwargs))
+        down = build(**kwargs)
+        def launch(output, *inputs):
+            assert output.shape == (33, 2, 512) and inputs[-1].numel() == 1
+            return down(output, *inputs)
+        return launch
+
+    def capture_sum(routes, *, dim, out):
+        observed.append(("sum", routes.shape, dim, out is call["output"]))
+        return torch_sum(routes, dim=dim, out=out)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("8wave must use the packaged routed kernel, not ASM or M128/packed reduce")
+
+    monkeypatch.setattr(tm, "_run_8wave", unexpected)
+    monkeypatch.setattr(packed, "make_m128_down", unexpected)
+    monkeypatch.setattr(moe_packed_reduce, "make_moe_sum", unexpected)
+    monkeypatch.setattr(stage2, "flydsl_moe_gemm_8wave_down", capture_down)
+    monkeypatch.setattr(torch, "sum", capture_sum)
+    config = dict(_impl="fly_blockscale", tile_m_gate=256, tile_m_down=256,
+                  tile_n_gate=256, tile_n_down=bn, down_path="8wave", num_oc_splits=splits)
+    result = tm._fmoe_wrapper(**_tune_arguments(call), **config)
+    assert observed == [("down", dict(n=512, k=inter, topk=2, num_experts=4,
+                                      block_m=256, block_n=bn, num_oc_splits=splits)),
+                        ("sum", (33, 2, 512), 1, True)]
+    monkeypatch.undo()
+    _check(result, call, reference)
+
+
+@pytest.mark.parametrize("inter,bn,splits,reason", [
+    (640, 64, 1, "LDS"), (1280, 32, 1, "LDS"), (128, 64, 8, "3 N tiles"),
+])
+def test_fly_blockscale_8wave_rejected_configs(inter, bn, splits, reason, capsys):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+    call = _block_call(tokens=1, hidden=1024, inter=inter)
+    tuning = _tune_arguments(call)
+    bad = tm.Config(_impl="fly_blockscale", tile_m_gate=256, tile_m_down=256,
+                    tile_n_gate=256, tile_n_down=bn, down_path="8wave", num_oc_splits=splits)
+    good = tm.Config(_impl="fly_blockscale", tile_m_gate=256,
+                     tile_m_down=128 if inter == 1280 else 256, tile_n_gate=256,
+                     tile_n_down=128 if inter == 1280 else 32,
+                     down_path="default" if inter == 1280 else "8wave", num_oc_splits=1)
+    assert tm._prune_invalid_configs([bad, good], tuning) == [good]
+    assert reason in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("changes", [
+    dict(tile_m_down=256), dict(tile_n_down=64), dict(tile_m_gate=128),
+    dict(num_oc_splits=3), dict(down_path="invalid"),
+])
+def test_fly_blockscale_rejects_old_or_invalid_config(changes):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+    call = _block_call(tokens=1, hidden=512, inter=256)
+    config = dict(_impl="fly_blockscale", tile_m_gate=256, tile_m_down=128,
+                  tile_n_gate=256, tile_n_down=128, down_path="persistent", num_oc_splits=1)
+    with pytest.raises(ValueError):
+        tm._fmoe_wrapper(**_tune_arguments(call), **(config | changes))
+
+
+@pytest.mark.parametrize("inter", [128, 256, 384, 512, 640])
+def test_fly_blockscale_tuning_cache(monkeypatch, tmp_path, inter):
+    if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
+        pytest.skip("requires gfx950")
+    call = _block_call(tokens=33, hidden=512, inter=inter)
+    configs = [c for c in tm._configs(**_tune_arguments(call))
+               if c.all_kwargs()["_impl"] == "fly_blockscale"]
+    assert configs
+    tuner = tm.autotune(configs=configs, key=["batch_bucket", "model_key"],
+                        prune_configs_by=tm._prune_invalid_configs,
+                        artifact_name="fly_blockscale_test")(tm._fmoe_wrapper)
+    monkeypatch.setattr(tm, "_autotuned_fmoe", tuner)
+    monkeypatch.setattr(tm, "record_dispatch", True)
+    monkeypatch.setenv("FLYDSL_AUTOTUNE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("FLYDSL_AUTOTUNE", "1")
+    _check(tm.fused_moe(**call), call, torch_reference(call))
+    winner = tm.last_dispatch.copy()
+    assert winner["_impl"] == "fly_blockscale"
+    if inter % 256:
+        assert winner["down_path"] == "8wave"
+        if inter == 640:
+            assert winner["tile_n_down"] == 32
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("cache hit must not retune")
+
+    monkeypatch.setenv("FLYDSL_AUTOTUNE", "0")
+    monkeypatch.setattr(tuner, "configs", unexpected)
+    # Same token bucket, different tensors and runtime token/sorting capacity.
+    other = _block_call(tokens=35, hidden=512, inter=inter)
+    assert _tune_arguments(other)["model_key"] == _tune_arguments(call)["model_key"]
+    _check(tm.fused_moe(**other), other, torch_reference(other))
+    assert tm.last_dispatch == winner
+
+
 def test_blockscale_tuning_cache(monkeypatch, tmp_path):
     if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx950"):
         pytest.skip("requires gfx950")
