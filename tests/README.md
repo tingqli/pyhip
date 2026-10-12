@@ -10,6 +10,7 @@ tests/
     gemm/           Installed ASM/FlyDSL GEMM variants and split-K
     gr_read/        GRRead correctness tests
     moe/            Installed MoE implementations and cross-backend tests
+    qsa/            Basic sparse attention/indexer correctness and graph replay
 ```
 
 Do not infer CPU-only behavior from `codegen`: these tests launch GPU kernels.
@@ -20,6 +21,10 @@ assertions, tolerances, and skip rules are unchanged.
 GRRead is a separate, explicitly selected suite. It warns outside gfx942 and
 continues rather than skipping; its current gfx950 numerical failures are not
 part of the default regression baseline.
+
+QSA correctness uses the two test files under [ops/qsa](ops/qsa).
+Capture-free performance and branch comparisons are separate CLI scripts in
+[benchmarks/qsa](../benchmarks/qsa/readme.md); they do not start SGLang services.
 
 ## Running
 
