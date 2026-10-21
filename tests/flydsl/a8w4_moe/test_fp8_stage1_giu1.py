@@ -359,37 +359,45 @@ def compile_fp8_stage1_giu1(
         b_gate_base = n_tile * (BLOCK_N * hidden_size)
         b_up_base = b_gate_base + intermediate_size * hidden_size
 
-        def ac_a(buf, ki, m_slice, bottom=0):
+        def raw_g2s_a(lds_dst, voffset, ki):
             rocdl.raw_ptr_buffer_load_lds(
                 a_rsrc,
-                ab_dma[buf][m_slice] if const_expr(bottom) else at_dma[buf][m_slice],
+                lds_dst,
                 fx.Int32(16),
-                a_voffsets[bottom][m_slice],
+                voffset,
                 fx.Int32(ki * BLOCK_K),
                 fx.Int32(0),
                 fx.Int32(0),
             )
 
-        def ac_b(buf, ki, is_up=0):
+        def async_copy_At(lds_idx, ki, m_slice):
+            raw_g2s_a(at_dma[lds_idx][m_slice], a_voffsets[0][m_slice], ki)
+
+        def async_copy_Ab(lds_idx, ki, m_slice):
+            raw_g2s_a(ab_dma[lds_idx][m_slice], a_voffsets[1][m_slice], ki)
+
+        def raw_g2s_b(lds_dst, src_base, ki):
             for chunk in range_constexpr(2):
                 rocdl.raw_ptr_buffer_load_lds(
                     b_rsrc,
-                    br_dma[buf][chunk] if const_expr(is_up) else bl_dma[buf][chunk],
+                    lds_dst[chunk],
                     fx.Int32(16),
                     b_voffset,
-                    fx.Int32(
-                        (b_up_base if const_expr(is_up) else b_gate_base)
-                        + ki * (BLOCK_K * 16)
-                        + chunk * 1024
-                    ),
+                    fx.Int32(src_base + ki * (BLOCK_K * 16) + chunk * 1024),
                     fx.Int32(0),
                     fx.Int32(0),
                 )
 
-        def ac_scale_a(buf, ki):
+        def async_copy_Bl(lds_idx, ki):
+            raw_g2s_b(bl_dma[lds_idx], b_gate_base, ki)
+
+        def async_copy_Br(lds_idx, ki):
+            raw_g2s_b(br_dma[lds_idx], b_up_base, ki)
+
+        def async_copy_scale_a(lds_idx, ki):
             rocdl.raw_ptr_buffer_load_lds(
                 scale_a_rsrc,
-                scale_dma[buf],
+                scale_dma[lds_idx],
                 fx.Int32(4),
                 scale_a_voffset,
                 fx.Int32(ki * num_tokens * 4),
@@ -397,24 +405,26 @@ def compile_fp8_stage1_giu1(
                 fx.Int32(0),
             )
 
-        def rd_a(buf, m_slice, bottom=0):
-            view = a_bottom[buf][m_slice] if const_expr(bottom) else a_top[buf][m_slice]
-            fx.copy(copy_atom, copy_a.partition_S(view), dest_a)
+        def lds_rd_At(lds_idx, m_slice):
+            fx.copy(copy_atom, copy_a.partition_S(a_top[lds_idx][m_slice]), dest_a)
 
-        def rd_bl(buf):
-            fx.copy(copy_atom, copy_b.partition_S(b_gate[buf]), dest_bl)
+        def lds_rd_Ab(lds_idx, m_slice):
+            fx.copy(copy_atom, copy_a.partition_S(a_bottom[lds_idx][m_slice]), dest_a)
 
-        def rd_br(buf):
-            fx.copy(copy_atom, copy_b.partition_S(b_up[buf]), dest_br)
+        def lds_rd_Bl(lds_idx):
+            fx.copy(copy_atom, copy_b.partition_S(b_gate[lds_idx]), dest_bl)
+
+        def lds_rd_Br(lds_idx):
+            fx.copy(copy_atom, copy_b.partition_S(b_up[lds_idx]), dest_br)
 
         scale_copy = fx.make_copy_atom(fx.UniversalCopy32b(), Float32)
 
-        def rd_scale_a(buf, bottom, m_slice):
+        def lds_rd_scale_a(lds_idx, bottom, m_slice):
             values = []
             for m0 in range_constexpr(2):
                 index = wave_m * 256 + bottom * 128 + wave_m * 16 + lane_id % 16
                 index = index + (m_slice * 2 + m0) * 32
-                ptr = lds.scale_a0.ptr if const_expr(buf == 0) else lds.scale_a1.ptr
+                ptr = lds.scale_a0.ptr if const_expr(lds_idx == 0) else lds.scale_a1.ptr
                 src = fx.make_view(
                     fx.add_offset(ptr, fx.make_int_tuple(index)), fx.make_layout(1, 1)
                 )
@@ -423,7 +433,7 @@ def compile_fp8_stage1_giu1(
                 values.append(Vec(frag.load())[0])
             return Vec.from_elements(values, Float32)
 
-        def rd_scale_b(ki):
+        def load_scale_b(ki):
             offset = fx.Int32((n_tile * kb_count + ki) * 4)
             result = _llvm.inline_asm(
                 ir.Type.parse("!llvm.struct<(f32, f32)>"),
@@ -520,9 +530,9 @@ def compile_fp8_stage1_giu1(
 
         def begin_compute_phase():
             rocdl.sched_barrier(0)
-            rocdl.s_barrier()
-            rocdl.sched_barrier(0)
             rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+            rocdl.sched_barrier(0)
+            rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
         def end_compute_phase():
@@ -548,17 +558,17 @@ def compile_fp8_stage1_giu1(
         rocdl.sched_barrier(0)
         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=0))
         rocdl.sched_barrier(0)
-        ac_scale_a(0, fx.Int32(0))
+        async_copy_scale_a(lds_idx=0, ki=fx.Int32(0))
         rocdl.sched_barrier(0)
-        ac_b(0, 0)
+        async_copy_Bl(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
-        ac_a(0, 0, 0)
-        ac_a(0, 0, 1)
+        async_copy_At(lds_idx=0, ki=0, m_slice=0)
+        async_copy_At(lds_idx=0, ki=0, m_slice=1)
         rocdl.sched_barrier(0)
-        ac_b(0, 0, 1)
+        async_copy_Br(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
-        ac_a(0, 0, 0, 1)
-        ac_a(0, 0, 1, 1)
+        async_copy_Ab(lds_idx=0, ki=0, m_slice=0)
+        async_copy_Ab(lds_idx=0, ki=0, m_slice=1)
         rocdl.sched_barrier(0)
         # The complementary barrier follows the final FIFO drain.
         if wave_id >= 4:
@@ -570,19 +580,19 @@ def compile_fp8_stage1_giu1(
         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=4))
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
-        ac_scale_a(1, fx.Int32(1))
+        async_copy_scale_a(lds_idx=1, ki=fx.Int32(1))
         rocdl.sched_barrier(0)
-        ac_a(1, 1, 0)
-        ac_a(1, 1, 1)
+        async_copy_At(lds_idx=1, ki=1, m_slice=0)
+        async_copy_At(lds_idx=1, ki=1, m_slice=1)
         rocdl.sched_barrier(0)
-        ac_b(1, 1)
+        async_copy_Bl(lds_idx=1, ki=1)
         rocdl.sched_barrier(0)
-        ac_b(1, 1, 1)
+        async_copy_Br(lds_idx=1, ki=1)
         rocdl.sched_barrier(0)
         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=7))
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
-        rd_bl(0)
+        lds_rd_Bl(lds_idx=0)
         frag_p.fill(0)
         initial = [
             c_tl.load(),
@@ -604,47 +614,51 @@ def compile_fp8_stage1_giu1(
             old_b = fx.Float32(states[6])
             frag_bl.store(Vec(states[7]).bitcast(Float8E4M3FN))
             kiter = fx.Int32(k_index)
-            for k_tile in range_constexpr(2):
-                ki = kiter + k_tile
+            for unroll_idx in range_constexpr(2):
+                tick = unroll_idx
+                tock = 1 - unroll_idx
+                ki = kiter + unroll_idx
                 for m_slice in range_constexpr(2):
-                    rd_a(k_tile, m_slice)
-                    top_scale = rd_scale_a(k_tile, 0, m_slice)
+                    lds_rd_At(lds_idx=tick, m_slice=m_slice)
+                    top_scale = lds_rd_scale_a(lds_idx=tick, bottom=0, m_slice=m_slice)
                     if const_expr(m_slice == 0):
-                        b_scale = rd_scale_b(ki)
+                        b_scale = load_scale_b(ki=ki)
                     # One bottom M-slice DMA per M slice instead of two in slice0.
-                    ac_a(1 - k_tile, ki + 1, m_slice, 1)
+                    async_copy_Ab(lds_idx=tock, ki=ki + 1, m_slice=m_slice)
                     begin_compute_phase()
-                    # New TL; consume BR from the preceding M slice/K k_tile.
+                    # New TL; consume BR from the preceding M slice/K tile.
                     compute(c_br, frag_bl, old_a, old_b, 1 - m_slice)
                     end_compute_phase()
                     if const_expr(m_slice == 0):
-                        rd_br(k_tile)
+                        lds_rd_Br(lds_idx=tick)
                     begin_compute_phase()
                     compute(c_tl, frag_br, top_scale, b_scale[0], m_slice)
                     end_compute_phase()
                     # At this TR end barrier both staggered groups have finished
                     # TL's LDS reads. Refill only this independent top entry.
-                    ac_a(k_tile, ki + 2, m_slice)
-                    rd_a(k_tile, m_slice, 1)
-                    bottom_scale = rd_scale_a(k_tile, 1, m_slice)
+                    async_copy_At(lds_idx=tick, ki=ki + 2, m_slice=m_slice)
+                    lds_rd_Ab(lds_idx=tick, m_slice=m_slice)
+                    bottom_scale = lds_rd_scale_a(
+                        lds_idx=tick, bottom=1, m_slice=m_slice
+                    )
                     if const_expr(m_slice == 0):
                         # B registers persist through slice1; LDS can be reused.
-                        ac_b(k_tile, ki + 2)
+                        async_copy_Bl(lds_idx=tick, ki=ki + 2)
                     begin_compute_phase()
                     compute(c_tr, frag_bl, top_scale, b_scale[1], m_slice)
                     end_compute_phase()
                     if const_expr(m_slice == 0):
-                        ac_b(k_tile, ki + 2, 1)
+                        async_copy_Br(lds_idx=tick, ki=ki + 2)
                         # A_b(ki,slice1) has eight younger VMEM operations here:
                         # prior top[s1]+scale, then bottom[s0]+top[s0]+Bgate*2+Bup*2.
                         # Complete it before slice1 can read that entry.
                         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=8))
                     else:
-                        ac_scale_a(k_tile, ki + 2)
+                        async_copy_scale_a(lds_idx=tick, ki=ki + 2)
                         # Seven younger ops follow top(ki+2,slice0): Bgate*2,
                         # Bup*2,bottom[s1],top[s1],scale. Earlier B(ki+1) is ready too.
                         rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=7))
-                        rd_bl(1 - k_tile)
+                        lds_rd_Bl(lds_idx=tock)
                     begin_compute_phase()
                     compute(c_bl, frag_br, bottom_scale, b_scale[0], m_slice)
                     end_compute_phase()
@@ -703,51 +717,52 @@ def compile_fp8_stage1_giu1(
                     & (slot < topk)
                     & (sorted_base + row < valid_rows)
                 )
-                g0, g1 = Vec(gates[None, 0, row_repeat].load()), Vec(
-                    gates[None, 1, row_repeat].load()
-                )
-                u0, u1 = Vec(ups[None, 0, row_repeat].load()), Vec(
-                    ups[None, 1, row_repeat].load()
-                )
-                v0 = [silu_mul(g0[i], u0[i]) for i in range_constexpr(4)]
-                v1 = [silu_mul(g1[i], u1[i]) for i in range_constexpr(4)]
-                p0 = rocdl.cvt_pk_bf16_f32(v0[0], v0[1])
-                p1 = rocdl.cvt_pk_bf16_f32(v0[2], v0[3])
-                p2 = rocdl.cvt_pk_bf16_f32(v1[0], v1[1])
-                p3 = rocdl.cvt_pk_bf16_f32(v1[2], v1[3])
-                swap0 = rocdl.permlane16_swap(
-                    pair_type, arith._to_raw(p0), arith._to_raw(p2), False, False
-                )
-                swap1 = rocdl.permlane16_swap(
-                    pair_type, arith._to_raw(p1), arith._to_raw(p3), False, False
-                )
-                packed = Vec.from_elements(
-                    [
-                        fx.Int32(_llvm.extractvalue(T.i32, swap0, [0])),
-                        fx.Int32(_llvm.extractvalue(T.i32, swap1, [0])),
-                        fx.Int32(_llvm.extractvalue(T.i32, swap0, [1])),
-                        fx.Int32(_llvm.extractvalue(T.i32, swap1, [1])),
-                    ],
-                    fx.Int32,
-                )
-                lane_group = lane_id // 16
-                col = (
-                    n_tile * 128
-                    + lane_group % 2 * 64
-                    + wave_n * 16
-                    + lane_group // 2 * 8
-                )
-                address = (
-                    (token * topk + slot) * intermediate_size + fx.Int32(col)
-                ) * 2
-                address = valid.select(address, fx.Int32(BUFFER_LIMIT))
-                rocdl.raw_ptr_buffer_store(
-                    packed.ir_value(),
-                    c_rsrc,
-                    address.ir_value(),
-                    fx.Int32(0).ir_value(),
-                    aux=ir.IntegerAttr.get(T.i32, 0),
-                )
+                if valid:
+                    g0, g1 = Vec(gates[None, 0, row_repeat].load()), Vec(
+                        gates[None, 1, row_repeat].load()
+                    )
+                    u0, u1 = Vec(ups[None, 0, row_repeat].load()), Vec(
+                        ups[None, 1, row_repeat].load()
+                    )
+                    v0 = [silu_mul(g0[i], u0[i]) for i in range_constexpr(4)]
+                    v1 = [silu_mul(g1[i], u1[i]) for i in range_constexpr(4)]
+                    p0 = rocdl.cvt_pk_bf16_f32(v0[0], v0[1])
+                    p1 = rocdl.cvt_pk_bf16_f32(v0[2], v0[3])
+                    p2 = rocdl.cvt_pk_bf16_f32(v1[0], v1[1])
+                    p3 = rocdl.cvt_pk_bf16_f32(v1[2], v1[3])
+                    swap0 = rocdl.permlane16_swap(
+                        pair_type, arith._to_raw(p0), arith._to_raw(p2), False, False
+                    )
+                    swap1 = rocdl.permlane16_swap(
+                        pair_type, arith._to_raw(p1), arith._to_raw(p3), False, False
+                    )
+                    packed = Vec.from_elements(
+                        [
+                            fx.Int32(_llvm.extractvalue(T.i32, swap0, [0])),
+                            fx.Int32(_llvm.extractvalue(T.i32, swap1, [0])),
+                            fx.Int32(_llvm.extractvalue(T.i32, swap0, [1])),
+                            fx.Int32(_llvm.extractvalue(T.i32, swap1, [1])),
+                        ],
+                        fx.Int32,
+                    )
+                    lane_group = lane_id // 16
+                    col = (
+                        n_tile * 128
+                        + lane_group % 2 * 64
+                        + wave_n * 16
+                        + lane_group // 2 * 8
+                    )
+                    address = (
+                        (token * topk + slot) * intermediate_size + fx.Int32(col)
+                    ) * 2
+                    address = valid.select(address, fx.Int32(BUFFER_LIMIT))
+                    rocdl.raw_ptr_buffer_store(
+                        packed.ir_value(),
+                        c_rsrc,
+                        address.ir_value(),
+                        fx.Int32(0).ir_value(),
+                        aux=ir.IntegerAttr.get(T.i32, 0),
+                    )
 
         store_gate_up(c_tl, c_tr, 0)
         store_gate_up(c_bl, c_br, 1)
@@ -1100,12 +1115,15 @@ def run_case(
     xcd_swizzle=True,
     group_size_m=1,
     benchmark=False,
+    compare_jit=False,
     warmup=5,
     iterations=20,
     data_clones=4,
 ):
     import pyhip
 
+    if compare_jit and not benchmark:
+        raise ValueError("compare_jit requires benchmark=True")
     if benchmark and (iterations <= 0 or data_clones <= 0 or warmup < 0):
         raise ValueError("require iterations/clones > 0 and warmup >= 0")
     inputs = prepare_inputs(
@@ -1190,8 +1208,57 @@ def run_case(
                     for value in args
                 )
             )
+        kernels = {"flydsl": kernel}
+        if compare_jit:
+            from pyhip.contrib.moe_gemm_8wave import moe_gemm_8wave_g1u1
+
+            def launch_jit(*launch_args):
+                a, weight, scale_a, scale_b, ids, experts, valid, out = launch_args[:8]
+                token_count, block_count = launch_args[8:10]
+                grid = block_count * (intermediate_size // BLOCK_N)
+                moe_gemm_8wave_g1u1(
+                    [grid],
+                    [512],
+                    False,
+                    "fp8",
+                    SORT_BLOCK_M,
+                    2 * BLOCK_N,
+                    num_experts,
+                    2 * intermediate_size,
+                    hidden_size,
+                    True,
+                    True,
+                    topk,
+                    ids.data_ptr(),
+                    None,
+                    experts.data_ptr(),
+                    valid.data_ptr(),
+                    weight.data_ptr(),
+                    scale_b.data_ptr(),
+                    a.data_ptr(),
+                    scale_a.data_ptr(),
+                    out.data_ptr(),
+                    token_count,
+                    grid,
+                )
+
+            kernels["moe_jit"] = launch_jit
+            previous = None
+            for repeat in range(3):
+                output.fill_(float("nan"))
+                launch_jit(*args)
+                torch.cuda.synchronize()
+                if not bool(torch.isfinite(output).all()):
+                    raise AssertionError("non-finite or unwritten MoE JIT output")
+                jit_diff = pyhip.calc_diff(output.float(), reference, diff_thr=0.00001)
+                torch.testing.assert_close(output, reference, rtol=0.05, atol=0.01)
+                if previous is not None:
+                    torch.testing.assert_close(output, previous, rtol=0, atol=0)
+                previous = output.clone()
+                print(f"moe_jit accuracy: repeat={repeat + 1} calc_diff={jit_diff:.9g}", flush=True)
         for i in range(warmup):
-            kernel(*arg_sets[i % data_clones])
+            for launch in kernels.values():
+                launch(*arg_sets[i % data_clones])
         torch.cuda.synchronize()
         effective_flops = 4 * tokens * topk * intermediate_size * hidden_size
         padded_flops = (
@@ -1202,13 +1269,18 @@ def run_case(
             for value in args
             if isinstance(value, torch.Tensor)
         )
-        samples = []
+        samples_by_kernel = {name: [] for name in kernels}
         for i in range(iterations):
-            with pyhip.cudaPerf(
-                effective_flops, byte_count, name="fp8_stage1", verbose=0
-            ) as perf:
-                kernel(*arg_sets[(warmup + i) % data_clones])
-            samples.append(perf.dt_ms * 1000)
+            launches = list(kernels.items())
+            if i % 2:
+                launches.reverse()
+            for name, launch in launches:
+                with pyhip.cudaPerf(
+                    effective_flops, byte_count, name=f"fp8_stage1_{name}", verbose=0
+                ) as perf:
+                    launch(*arg_sets[(warmup + i) % data_clones])
+                samples_by_kernel[name].append(perf.dt_ms * 1000)
+        samples = samples_by_kernel["flydsl"]
         best_us = min(samples)
         # Both rates use the same best latency and count gate/up GEMM FLOPs.
         valid_tflops = effective_flops / best_us / 1e6
@@ -1223,6 +1295,18 @@ def run_case(
                 "clones": data_clones,
             }
         )
+        if compare_jit:
+            jit_samples = samples_by_kernel["moe_jit"]
+            jit_median = statistics.median(jit_samples)
+            row["moe_jit"] = {
+                "correct": True,
+                "repeatable": True,
+                "diff": jit_diff,
+                "best_us": min(jit_samples),
+                "median_us": jit_median,
+                "samples_us": jit_samples,
+            }
+            row["speedup_vs_jit"] = jit_median / row["median_us"]
     print("STAGE1_RESULT " + json.dumps(row), flush=True)
     return row
 
@@ -1271,8 +1355,11 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--data-clones", type=int, default=4)
+    parser.add_argument("--compare-jit", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.compare_jit and not args.benchmark:
+        parser.error("--compare-jit requires --benchmark")
     check_native_weight_layout()
     check_a_slice_layout()
     if args.layout_check:
@@ -1309,6 +1396,7 @@ def main():
                 routing=args.routing,
                 data_case=args.data_case,
                 benchmark=args.benchmark,
+                compare_jit=args.compare_jit,
                 warmup=args.warmup,
                 iterations=args.iterations,
                 data_clones=args.data_clones,
