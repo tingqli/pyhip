@@ -16,7 +16,8 @@ The compute pipeline is the 8-wave, 256x256, half-M single-FIFO GEMM:
 TL[s0]/TR[s0]/BL[s0]/BR[s0], then TL[s1]/TR[s1]/BL[s1]/BR[s1].
 Here s0/s1 denote slice0/slice1; left/right mean gate/up.
 Each phase interleaves old-partial FP32 FMA with independent new MFMA.
-Each A64xK128 M slice has an independent LDS entry and a single DMA instruction.
+DMA and wait placement follows the aiter blockscale GEMM's split-M schedule;
+each A half loads both A64xK128 M-slice entries together, one DMA each.
 Workgroups use 256-WG XCD batches, with no M grouping by default.
 I must be a multiple of 128 and K a multiple of 256 (at least 256).
 The module is importable; CLI modes include --small-accuracy, --accuracy,
@@ -370,11 +371,13 @@ def compile_fp8_stage1_giu1(
                 fx.Int32(0),
             )
 
-        def async_copy_At(lds_idx, ki, m_slice):
-            raw_g2s_a(at_dma[lds_idx][m_slice], a_voffsets[0][m_slice], ki)
+        def async_copy_At(lds_idx, ki):
+            for m_slice in range_constexpr(2):
+                raw_g2s_a(at_dma[lds_idx][m_slice], a_voffsets[0][m_slice], ki)
 
-        def async_copy_Ab(lds_idx, ki, m_slice):
-            raw_g2s_a(ab_dma[lds_idx][m_slice], a_voffsets[1][m_slice], ki)
+        def async_copy_Ab(lds_idx, ki):
+            for m_slice in range_constexpr(2):
+                raw_g2s_a(ab_dma[lds_idx][m_slice], a_voffsets[1][m_slice], ki)
 
         def raw_g2s_b(lds_dst, src_base, ki):
             for chunk in range_constexpr(2):
@@ -562,13 +565,11 @@ def compile_fp8_stage1_giu1(
         rocdl.sched_barrier(0)
         async_copy_Bl(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
-        async_copy_At(lds_idx=0, ki=0, m_slice=0)
-        async_copy_At(lds_idx=0, ki=0, m_slice=1)
+        async_copy_At(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
         async_copy_Br(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
-        async_copy_Ab(lds_idx=0, ki=0, m_slice=0)
-        async_copy_Ab(lds_idx=0, ki=0, m_slice=1)
+        async_copy_Ab(lds_idx=0, ki=0)
         rocdl.sched_barrier(0)
         # The complementary barrier follows the final FIFO drain.
         if wave_id >= 4:
@@ -582,8 +583,7 @@ def compile_fp8_stage1_giu1(
         rocdl.sched_barrier(0)
         async_copy_scale_a(lds_idx=1, ki=fx.Int32(1))
         rocdl.sched_barrier(0)
-        async_copy_At(lds_idx=1, ki=1, m_slice=0)
-        async_copy_At(lds_idx=1, ki=1, m_slice=1)
+        async_copy_At(lds_idx=1, ki=1)
         rocdl.sched_barrier(0)
         async_copy_Bl(lds_idx=1, ki=1)
         rocdl.sched_barrier(0)
@@ -623,20 +623,19 @@ def compile_fp8_stage1_giu1(
                     top_scale = lds_rd_scale_a(lds_idx=tick, bottom=0, m_slice=m_slice)
                     if const_expr(m_slice == 0):
                         b_scale = load_scale_b(ki=ki)
-                    # One bottom M-slice DMA per M slice instead of two in slice0.
-                    async_copy_Ab(lds_idx=tock, ki=ki + 1, m_slice=m_slice)
+                        async_copy_Ab(lds_idx=tock, ki=ki + 1)
                     begin_compute_phase()
                     # New TL; consume BR from the preceding M slice/K tile.
                     compute(c_br, frag_bl, old_a, old_b, 1 - m_slice)
                     end_compute_phase()
                     if const_expr(m_slice == 0):
                         lds_rd_Br(lds_idx=tick)
+                    else:
+                        # Both At[tick] slices were last read two or more phases ago.
+                        async_copy_At(lds_idx=tick, ki=ki + 2)
                     begin_compute_phase()
                     compute(c_tl, frag_br, top_scale, b_scale[0], m_slice)
                     end_compute_phase()
-                    # At this TR end barrier both staggered groups have finished
-                    # TL's LDS reads. Refill only this independent top entry.
-                    async_copy_At(lds_idx=tick, ki=ki + 2, m_slice=m_slice)
                     lds_rd_Ab(lds_idx=tick, m_slice=m_slice)
                     bottom_scale = lds_rd_scale_a(
                         lds_idx=tick, bottom=1, m_slice=m_slice
@@ -644,20 +643,16 @@ def compile_fp8_stage1_giu1(
                     if const_expr(m_slice == 0):
                         # B registers persist through slice1; LDS can be reused.
                         async_copy_Bl(lds_idx=tick, ki=ki + 2)
+                    else:
+                        # Only the six ki+2 At/Bl/Br DMAs may remain in flight.
+                        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=6))
                     begin_compute_phase()
                     compute(c_tr, frag_bl, top_scale, b_scale[1], m_slice)
                     end_compute_phase()
                     if const_expr(m_slice == 0):
                         async_copy_Br(lds_idx=tick, ki=ki + 2)
-                        # A_b(ki,slice1) has eight younger VMEM operations here:
-                        # prior top[s1]+scale, then bottom[s0]+top[s0]+Bgate*2+Bup*2.
-                        # Complete it before slice1 can read that entry.
-                        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=8))
                     else:
                         async_copy_scale_a(lds_idx=tick, ki=ki + 2)
-                        # Seven younger ops follow top(ki+2,slice0): Bgate*2,
-                        # Bup*2,bottom[s1],top[s1],scale. Earlier B(ki+1) is ready too.
-                        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=7))
                         lds_rd_Bl(lds_idx=tock)
                     begin_compute_phase()
                     compute(c_bl, frag_br, bottom_scale, b_scale[0], m_slice)
@@ -970,7 +965,7 @@ def prepare_inputs(
         torch.randn(
             (num_experts, 2 * intermediate_size // 128, 128, kb, 128), device="cuda"
         )
-        * 0.2
+        * 0.1
     )
     b_scale = b_source.abs().amax(dim=(2, 4)).clamp_min(1e-8) / 448.0
     b_raw = (
