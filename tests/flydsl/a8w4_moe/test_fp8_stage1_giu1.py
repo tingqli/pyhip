@@ -50,6 +50,8 @@ BLOCK_N = 128
 BLOCK_K = 128
 TOKEN_MASK = 0xFFFFFF
 BUFFER_LIMIT = 0x7FFFFFFF
+# As an unsigned voffset this is past every buffer below 4 GiB, so loads return 0.
+OOB_OFFSET = -1
 
 
 def validate_parameters(tokens, intermediate_size, hidden_size, topk, num_experts):
@@ -61,16 +63,16 @@ def validate_parameters(tokens, intermediate_size, hidden_size, topk, num_expert
         raise ValueError("hidden_size must be a multiple of 256 and at least 256")
     if not 0 < topk < 256 or num_experts < topk:
         raise ValueError("require 0 < topk < 256 and num_experts >= topk")
-    extents = (
-        tokens * hidden_size,
-        tokens * (hidden_size // 128) * 4,
-        tokens * topk * intermediate_size * 2,
-        2 * intermediate_size * hidden_size,
-    )
-    if max(extents) >= BUFFER_LIMIT:
-        raise ValueError(
-            "A/scales/output and each expert's weight must fit 31-bit byte offsets"
-        )
+    # Buffer descriptors hold a 32-bit byte count.
+    extents = {
+        "a (tokens*K)": tokens * hidden_size,
+        "a_scale (tokens*K/128*4)": tokens * (hidden_size // 128) * 4,
+        "output (tokens*topk*I*2)": tokens * topk * intermediate_size * 2,
+        "weight per expert (2*I*K)": 2 * intermediate_size * hidden_size,
+    }
+    over = [f"{name}={size:,}" for name, size in extents.items() if size >= 2**32]
+    if over:
+        raise ValueError("buffer byte extents must be < 4 GiB: " + ", ".join(over))
 
 
 def _buffer_resource(tensor, num_records_bytes, base_byte_offset=0):
@@ -204,16 +206,14 @@ def compile_fp8_stage1_giu1(
             T.i32, expert_rsrc, block_id * 4, fx.Int32(0)
         )
         expert = fx.Int32(rocdl.readfirstlane(T.i32, arith._to_raw(expert)))
-        a_rsrc = _buffer_resource(
-            arg_a, arith._to_raw(fx.Int32(num_tokens * hidden_size))
-        )
+        a_rsrc = _buffer_resource(arg_a, fx.Int64(num_tokens) * hidden_size)
         b_rsrc = _buffer_resource(
             arg_b,
             2 * intermediate_size * hidden_size,
             fx.Int64(expert) * (2 * intermediate_size * hidden_size),
         )
         scale_a_rsrc = _buffer_resource(
-            arg_scale_a, arith._to_raw(fx.Int32(num_tokens * kb_count * 4))
+            arg_scale_a, fx.Int64(num_tokens) * (kb_count * 4)
         )
         scale_b_rsrc = _buffer_resource(
             arg_scale_b,
@@ -310,13 +310,13 @@ def compile_fp8_stage1_giu1(
                 slot = (fused >> 24) & 255
                 valid = (token < num_tokens) & (slot < topk)
                 offset = token * hidden_size + fx.Int32((tid % 8) * 16)
-                offsets.append(valid.select(offset, fx.Int32(BUFFER_LIMIT)))
+                offsets.append(valid.select(offset, fx.Int32(OOB_OFFSET)))
             a_voffsets.append(offsets)
 
         scale_id = sorted_id(tid % SORT_BLOCK_M)
         scale_token = scale_id & TOKEN_MASK
         scale_valid = (scale_token < num_tokens) & (((scale_id >> 24) & 255) < topk)
-        scale_a_voffset = scale_valid.select(scale_token * 4, fx.Int32(BUFFER_LIMIT))
+        scale_a_voffset = scale_valid.select(scale_token * 4, fx.Int32(OOB_OFFSET))
         wave_dma_base = rocdl.readfirstlane(
             T.i32,
             arith._to_raw(
@@ -693,7 +693,7 @@ def compile_fp8_stage1_giu1(
             rocdl.raw_ptr_buffer_load(T.i32, valid_rsrc, fx.Int32(0), fx.Int32(0))
         )
         c_rsrc = _buffer_resource(
-            arg_c, arith._to_raw(fx.Int32(num_tokens * topk * intermediate_size * 2))
+            arg_c, fx.Int64(num_tokens) * (topk * intermediate_size * 2)
         )
         pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
 
@@ -750,7 +750,6 @@ def compile_fp8_stage1_giu1(
                     address = (
                         (token * topk + slot) * intermediate_size + fx.Int32(col)
                     ) * 2
-                    address = valid.select(address, fx.Int32(BUFFER_LIMIT))
                     rocdl.raw_ptr_buffer_store(
                         packed.ir_value(),
                         c_rsrc,
