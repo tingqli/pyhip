@@ -1,21 +1,19 @@
 """gfx942 BF16 paged attention with alternating memory and compute stages.
 
-BM256/BN64, eight wave64s staggered by one stage. The V128/no-LSE hot path
-keeps VMEM/DS in S0/2/4/6 and MFMA/VALU in S1/3/5/7, following gfx950's
-stage organization. Lane addresses are prepared before memory stages;
-D128/D192 V uses a full 64-bit GLOBAL scalar base, not a buffer descriptor.
-One K slot and two V slots use 49,920/58,240 bytes for D128/D192. Softmax
-lags QK by one tile; cross32 reductions issue in memory stages and retire
-with the operand reads. Optional LSE/V192 retain the checked wide path.
-Ordinary and persistent grids share this body and public tensor layouts.
-DQ=DV=256 defaults to the BM128/BN64 M16 K+V DMA specialization with
-early page lookahead, merged page-ready waits and late S4 LGKM completion.
-PagedAttention retains SHUFFLE-5D KV; flash_attn_varlen_func accepts linear
-D256 Q/K/V, including page1/page4 physical row tables, without conversion.
+Dq/Dv 128/192 use BM256/BN64 (32x32x8 MFMA), eight wave64s in two groups that are
+staggered by one stage. Each KV tile runs eight stages: even stages issue VMEM/LDS,
+odd stages MFMA/VALU, and the two groups interleave them. ``_body_v128`` is the
+DV128/no-LSE hot path (LDS addresses prepared outside the loop, V through 64-bit
+GLOBAL loads, one K slot and a two-slot V ring: 49,920/58,240 LDS bytes for
+D128/D192). ``_body_wide`` keeps the checked LSE/V192 path with cooperative
+copies. Dq = Dv = 256 dispatches to mha_pa_bf16_256_paged_942 (BM128/BN64, K/V
+DMA). Persistent and ordinary grids share these bodies and the SHUFFLE-5D ABI.
+
+``flash_attn_varlen_func`` is the D256 linear/page1/page4 API backed by
+mha_pa_bf16_256_linear_942 (no KV conversion).
 """
 
 import functools
-import importlib
 import math
 import weakref
 from numbers import Real
@@ -27,59 +25,16 @@ from flydsl.expr import gpu, rocdl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 
-if __package__:
-    from ._common import (
-        _advance_max, _buffer, _buffer_words, _exp, _join, _maximum, _min,
-        _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _prefetch_page,
-        _read_address, _rescale, _schedule, _stage_end, _uniform, _wait,
-    )
-else:
-    from _common import (
-        _advance_max, _buffer, _buffer_words, _exp, _join, _maximum, _min,
-        _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _prefetch_page,
-        _read_address, _rescale, _schedule, _stage_end, _uniform, _wait,
-    )
+from ._common import (
+    _advance_max, _buffer, _buffer_words, _center_part, _exp_part, _join, _maximum, _mfma_hazard_wait,
+    _min, _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _read_address, _read_page_g2r, _rescale,
+    _row_max, _row_max_local, _row_sum, _row_sum_local, _schedule, _stage_end, _uniform, _wait,
+)
 
 BM, BN, THREADS = 256, 64, 512
 PADDED_CHUNK = 1040
+V_SLOT = 16640  # one DV128 V tile: 16 padded 1040-byte chunks
 LOG2E = math.log2(math.e)
-
-
-def _max3(a, b, c):
-    return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [a.ir_value(), b.ir_value(), c.ir_value()],
-                                    "v_max3_f32 $0, $1, $2, $3", "=v,v,v,v", has_side_effects=False))
-
-
-def _mfma_hazard_wait():
-    # Inline-asm readers of fresh MFMA accumulators get no wait states from LLVM's hazard recognizer.
-    # 11 = NumPasses(8) + 3 for the 32x32 MFMAs of this kernel on gfx942.
-    rocdl.sched_barrier(0)
-    llvm.inline_asm(None, [], "s_nop 10", "", has_side_effects=True)
-    rocdl.sched_barrier(0)
-
-
-def _row_max_local(values):
-    p = [_max3(values[i], values[i + 1], values[i + 2]) for i in range(0, 30, 3)]
-    a = _max3(_max3(p[0], p[1], p[2]), _max3(p[3], p[4], p[5]), _max3(p[6], p[7], p[8]))
-    b = _max3(p[9], values[30], values[31])
-    return _max3(a, b, fx.Float32(-1.0e30))
-
-
-def _row_max(values):
-    value = _row_max_local(values)
-    return _maximum(value, value.shuffle_xor(32, 64))
-
-
-def _row_sum_local(values):
-    partials = [values[i] + values[i + 1] for i in range(0, 32, 2)]
-    for width in (8, 4, 2, 1):
-        partials = [partials[2 * i] + partials[2 * i + 1] for i in range(width)]
-    return partials[0]
-
-
-def _row_sum(values):
-    value = _row_sum_local(values)
-    return value + value.shuffle_xor(32, 64)
 
 
 def _cross32_async(value, address):
@@ -87,22 +42,6 @@ def _cross32_async(value, address):
     # compiler/CTA boundary. This shuffle does not allocate LDS storage.
     return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [address.ir_value(), value.ir_value()],
         "ds_bpermute_b32 $0, $1, $2", "=v,v,v,~{memory}", has_side_effects=True))
-
-
-def _center(values, scale, maximum, begin, end):
-    result = []
-    for i in range(32):
-        value = values[i]
-        if begin <= i < end:
-            value = fx.Float32(llvm.inline_asm(
-                fx.Float32.ir_type, [value.ir_value(), scale.ir_value(), maximum.ir_value()],
-                "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False))
-        result.append(value)
-    return _pin(fx.Vector.from_elements(result, fx.Float32), 32)
-
-
-def _exp_part(values, begin, end):
-    return fx.Vector.from_elements([_exp(values[i]) if begin <= i < end else values[i] for i in range(32)], fx.Float32)
 
 
 def _pack_probability(values):
@@ -117,16 +56,16 @@ def _pack_probability(values):
     return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.BFloat16)
 
 
-def _prefetch_tile(table, tile, last, last_page, page_size):
-    # BN64 spans two physical pages at page32; page128 contains two tiles.
+def _read_tile_pages_g2r(table, tile, last, last_page, page_size):
+    """Page ids (first, second) of a KV tile: BN64 spans two page32 pages; page128 holds two tiles."""
     # Clamp every speculative SMEM request, including the second page.
     first = _min(tile, last) * BN // page_size
-    page0 = _prefetch_page(table, first)
-    page1 = _prefetch_page(table, _min(first + 1, last_page)) if page_size == 32 else page0
+    page0 = _read_page_g2r(table, first)
+    page1 = _read_page_g2r(table, _min(first + 1, last_page)) if page_size == 32 else page0
     return page0, page1
 
 
-def _global_words(tensor, offset):
+def _read_global_g2r(tensor, offset):
     # A genuine 64-bit GLOBAL pointer; never replace V with a raw descriptor.
     pointer = fx.get_iter(tensor) + fx.Int64(offset)
     source = fx.make_view(pointer, fx.make_layout(8, 1))
@@ -135,38 +74,40 @@ def _global_words(tensor, offset):
     return fragment.load().bitcast(fx.Int32)
 
 
-def _lds_words(storage, base, immediate=0):
+def _read_s2r(storage, base, immediate=0):
     address = fx.Int32(fx.ptrtoint(fx.get_iter(storage) + base))
     return fx.Vector(llvm.inline_asm(ir.VectorType.get([4], fx.Int32.ir_type), [address.ir_value()],
         f"ds_read_b128 $0, $1 offset:{immediate}", "=v,v,~{memory}", has_side_effects=True))
 
 
-def _write_address(address, words, rounds, immediate=0):
+def _store_r2s(address, words, rounds, immediate=0):
+    """ds_write_b128 of `rounds` 16-byte words at a precomputed LDS address, 8320 bytes apart."""
     for i in range(rounds):
         part = fx.Vector.from_elements([words[i * 4 + j] for j in range(4)], fx.Int32)
         llvm.inline_asm(ir.Type.parse("!llvm.void"), [address.ir_value(), part.ir_value()],
             f"ds_write_b128 $0, $1 offset:{immediate + i * 8320}", "v,v,~{memory}", has_side_effects=True)
 
 
-def _k_address(lane_offset, page0, page1, tile, half_page, hk, dq, page_size):
+# ---- DV128 hot path: per-lane addresses are prepared once, stages only issue ----
+
+def _k_g2r_offset(lane_offset, page0, page1, tile, half_page, hk, dq, page_size):
     page = half_page.select(page1, page0) if page_size == 32 else page0
     return _pin_i32(lane_offset + page * (hk * page_size * dq * 2) + (tile * BN % page_size) * 16)
 
 
-def _load_k_address(resource, address, dq, page_size):
-    # Per-chunk SOFFSET is scalar; even page32 keeps its divergent physical
-    # page in the precomputed VOFFSET, never in a scalar waterfall.
+def _read_k_g2r(resource, address, dq, page_size):
+    """K tile into staging VGPRs; page32's divergent page sits in VOFFSET, never a scalar waterfall."""
     parts = [_buffer_words(resource, address, i * page_size * 128) for i in range(dq // 64)]
     return fx.Vector.from_elements([p[j] for p in parts for j in range(4)], fx.Int32)
 
 
-def _v_addresses(base, page0, page1, tile, hk, page_size):
+def _v_g2r_bases(base, page0, page1, tile, hk, page_size):
     first = base + fx.Int64(page0) * (hk * page_size * 256) + fx.Int64(tile * BN % page_size) * 256
     second = base + fx.Int64(page1) * (hk * page_size * 256) if page_size == 32 else first + 8192
     return _pin_s64(first), _pin_s64(second)
 
 
-def _load_v_address(first, second, lane_offset):
+def _read_v_g2r(first, second, lane_offset):
     # Full 64-bit SGPR address plus lane-relative VGPR byte offset. This is
     # GLOBAL, not BUFFER, and does not truncate the tensor's GPU base.
     parts = [fx.Vector(llvm.inline_asm(ir.VectorType.get([4], fx.Int32.ir_type),
@@ -175,7 +116,8 @@ def _load_v_address(first, second, lane_offset):
     return fx.Vector.from_elements([p[j] for p in parts for j in range(4)], fx.Int32)
 
 
-def _k_fragment_address(address, half, dq):
+def _read_k_s2r(address, half, dq):
+    """Keys 32 * half .. 32 * half + 31 as the QK A operand, from the pinned LDS read address."""
     parts = [_read_address(address, half * 512 + d * 2080) for d in range(dq // 16)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = _mma().make_fragment_A(fx.make_rmem_tensor(fx.make_layout((32, dq), (1, 32)), fx.BFloat16))
@@ -183,8 +125,9 @@ def _k_fragment_address(address, half, dq):
     return frag
 
 
-def _v_fragment_address(address, half, slot=0):
-    parts = [_read_address(address, slot * 16640 + half * 1040 + n * 512 + k * 4160)
+def _read_v_s2r(address, half, slot=0):
+    """V dims 64 * half .. 64 * half + 63 of ring slot `slot` as the PV A operand."""
+    parts = [_read_address(address, slot * V_SLOT + half * 1040 + n * 512 + k * 4160)
              for n in range(2) for k in range(4)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = fx.make_rmem_tensor(fx.make_layout((8, 4, 2), (1, 8, 32)), fx.BFloat16)
@@ -192,7 +135,9 @@ def _v_fragment_address(address, half, slot=0):
     return frag
 
 
-def _load_k(resource, tid, page0, page1, tile, hk, dq, page_size):
+# ---- Cooperative tile copies (LSE/V192 path and the D128 prologue) ----
+
+def _read_k_tile_g2r(resource, tid, page0, page1, tile, hk, dq, page_size):
     if dq == 192:
         tid = _pin_i32(fx.Int32(gpu.thread_id("x"))) & 511
     parts = []
@@ -211,7 +156,7 @@ def _load_k(resource, tid, page0, page1, tile, hk, dq, page_size):
     return fx.Vector.from_elements([p[j] for p in parts for j in range(4)], fx.Int32)
 
 
-def _load_v(tensor, tid, page0, page1, tile, hkv, hk, dv, page_size, bounded=False):
+def _read_v_tile_g2r(tensor, tid, page0, page1, tile, hkv, hk, dv, page_size, bounded=False):
     if bounded:
         tid = _pin_i32(fx.Int32(gpu.thread_id("x"))) & 511
     parts = []
@@ -222,11 +167,11 @@ def _load_v(tensor, tid, page0, page1, tile, hkv, hk, dv, page_size, bounded=Fal
         within = token % page_size + (tile * BN) % page_size
         offset = ((fx.Int64(page) * hk + fx.Int64(hkv)) * (page_size * dv)
                   + fx.Int64(within // 8) * (dv * 8) + fx.Int64(column) * 8)
-        parts.append(_global_words(tensor, offset))
+        parts.append(_read_global_g2r(tensor, offset))
     return fx.Vector.from_elements([p[j] for p in parts for j in range(4)], fx.Int32)
 
 
-def _cooperative_store(storage, tid, words, slot_offset, rounds, key=False, bounded=False):
+def _store_tile_r2s(storage, tid, words, slot_offset, rounds, key=False, bounded=False):
     if bounded:
         tid = _pin_i32(fx.Int32(gpu.thread_id("x"))) & 511
     atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
@@ -251,7 +196,7 @@ def _mma():
                              (None, None, fx.make_layout((4, 2, 2), (1, 8, 4))))
 
 
-def _q_fragment(resource, row_offset, lane, dq):
+def _read_q_g2r(resource, row_offset, lane, dq):
     parts = [_buffer_words(resource, row_offset + (lane >> 5) * 16 + d * 32) for d in range(dq // 16)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = _mma().make_fragment_B(fx.make_rmem_tensor(fx.make_layout((BM, dq), (1, BM)), fx.BFloat16))
@@ -259,23 +204,24 @@ def _q_fragment(resource, row_offset, lane, dq):
     return frag
 
 
-def _k_fragment(storage, base, half, dq, dv, full=False):
+def _read_k_tile_s2r(storage, base, half, dq, dv, full=False):
+    """Keys 32 * half .. + 31 from the K slot; D192/V192 without `full` read only the first K64 chunk."""
     width = 64 if (dq == 192 or dv == 192) and not full else dq
-    parts = [_lds_words(storage, base, half * 512 + d * 2080) for d in range(width // 16)]
+    parts = [_read_s2r(storage, base, half * 512 + d * 2080) for d in range(width // 16)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = _mma().make_fragment_A(fx.make_rmem_tensor(fx.make_layout((32, width), (1, 32)), fx.BFloat16))
     frag.store(words.bitcast(fx.BFloat16))
     return frag
 
 
-def _v_fragment(storage, base, slot, half, dq, dv):
+def _read_v_tile_s2r(storage, base, slot, half, dq, dv):
     width = dv // 2
     parts = []
     for n in range(width // 32):
         for k in range(BN // 16):
             byte = (2 * k * dv + half * width + n * 32) * 16
-            parts.append(_lds_words(storage, ((dq + slot * dv) // 8) * PADDED_CHUNK + base,
-                                    (byte // 1024) * PADDED_CHUNK + byte % 1024))
+            parts.append(_read_s2r(storage, ((dq + slot * dv) // 8) * PADDED_CHUNK + base,
+                                   (byte // 1024) * PADDED_CHUNK + byte % 1024))
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = fx.make_rmem_tensor(fx.make_layout((8, 4, width // 32), (1, 8, 32)), fx.BFloat16)
     frag.store(words.bitcast(fx.BFloat16))
@@ -308,7 +254,7 @@ def _qk(q, k, storage, base, half, dq, dv, full=False):
         for chunk in range(dq // 64):
             if chunk:
                 rocdl.sched_barrier(0)
-                k = _k_fragment(storage, base + chunk * 8320, half, 64, dv)
+                k = _read_k_tile_s2r(storage, base + chunk * 8320, half, 64, dv)
                 _wait(lgkmcnt=0)
                 # Inline LDS reads are opaque to LLVM's wait insertion. A
                 # scheduler fence prevents the following MFMAs from moving
@@ -358,340 +304,14 @@ def _mask(scores, tile, row, q_len, kv_len, causal: fx.Constexpr[bool]):
     return values
 
 
-@flyc.jit
-def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
-          H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
-          DV: fx.Constexpr[int], PAGE: fx.Constexpr[int], CAUSAL: fx.Constexpr[bool],
-          PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
-          SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool]):
-    # Explicit closure dependency for the helper used only by nested phase.
-    rescale = _rescale
-    bounded = DQ == 192 or DV == 192 or WITH_LSE
-    v_ring = DV == 128 and (DQ == 128 or not WITH_LSE)
-    full_k = DQ == 192 and DV == 128 and not WITH_LSE
-    separate = DV == 128 and not WITH_LSE
-    # Explicit dependencies for helpers used by the nested phase after AST
-    # rewriting; keep the native cache sensitive to every scheduling edit.
-    read_k, read_v, write_lds = _k_fragment_address, _v_fragment_address, _write_address
-    k_address, load_k_address = _k_address, _load_k_address
-    v_addresses, load_v_address = _v_addresses, _load_v_address
-    sum_local, max_local, cross_async = _row_sum_local, _row_max_local, _cross32_async
-    advance_max = _advance_max
-    tid = fx.Int32(gpu.thread_id("x"))
-    wave, lane = _uniform(tid >> 6), tid & 63
-    q_start = qb * BM
-    row = q_start + wave * 32 + (lane & 31)
-    valid = _min(fx.Int32(BM), q_len - q_start)
-    hkv = head // (H // HK)
-    q_ptr = fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(q_start)) * (H * DQ) + fx.Int64(head) * DQ)
-    gq = _buffer(fx.make_view(q_ptr, fx.make_layout(BM * H * DQ, 1)), valid * H * DQ * 2)
-    gk = _buffer(fx.make_view(fx.get_iter(K) + hkv * PAGE * DQ,
-                            fx.make_layout((NP * HK - hkv) * PAGE * DQ, 1)),
-                 (NP * HK - hkv) * PAGE * DQ * 2)
-    q = _q_fragment(gq, (wave * 32 + (lane & 31)) * (H * DQ * 2), lane, DQ)
-    scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
-    if fx.const_expr(PER_TOKEN):
-        scale = scale * rocdl.make_buffer_tensor(QS, max_size=False)[(q0 + row) * H + head]
-    else:
-        scale = scale * QS[0]
-    scale = fx.Float32(scale)
-    tiles = (kv_len + BN - 1) // BN
-    if fx.const_expr(CAUSAL):
-        end = (q_start + valid + kv_len - q_len + BN - 1) // BN
-        tiles = _min(tiles, (end > 0).select(end, fx.Int32(1)))
-    last, last_page = tiles - 1, (kv_len - 1) // PAGE
-    page00, page01 = _prefetch_tile(table, fx.Int32(0), last, last_page, PAGE)
-    page10, page11 = _prefetch_tile(table, fx.Int32(1), last, last_page, PAGE)
-    page20, page21 = _prefetch_tile(table, fx.Int32(2), last, last_page, PAGE)
-    page00, page01 = _page_ready(page00), _page_ready(page01)
-    page10, page11 = _page_ready(page10), _page_ready(page11)
-    page20, page21 = _page_ready(page20), _page_ready(page21)
-    # BF16 P carries eight consecutive keys per b128, not FP8's sixteen.
-    k_row = (lane & 3) | ((lane & 4) << 1) | ((lane & 8) >> 1) | (lane & 16)
-    k_base = (lane >> 5) * PADDED_CHUNK + ((k_row * 16) ^ ((k_row & 16) << 2))
-    v_base = (lane >> 5) * (DV // 64) * PADDED_CHUNK + (lane & 31) * 16
-    k_bytes = (DQ // 8) * PADDED_CHUNK
-    kr_address = kw_address = vr_address = vw_address = k_lane = v_lane = cross_address = fx.Int32(0)
-    v_global_base = fx.Int64(0)
-    half_page = (lane & 32) != 0
-    if fx.const_expr(separate):
-        shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
-        within = (tid & 63) * 16
-        kr_address = _pin_i32(shared + k_base)
-        kw_address = _pin_i32(shared + (tid >> 6) * PADDED_CHUNK + (within ^ ((within & 256) >> 2)))
-        vr_address = _pin_i32(shared + k_bytes + v_base)
-        vw_address = _pin_i32(shared + k_bytes + (tid >> 6) * PADDED_CHUNK + within)
-        k_lane = _pin_i32((tid >> 6) * (PAGE * 16) + (tid & (min(PAGE, BN) - 1)) * 16)
-        v_lane = _pin_i32(tid * 16)
-        cross_address = _pin_i32((lane ^ 32) * 4)
-        v_global_base = _pin_s64(fx.Int64(fx.ptrtoint(fx.get_iter(V))) + fx.Int64(hkv) * (PAGE * DV * 2))
-    v_pending = fx.Vector.filled(DV // 16, 0, fx.Int32)
-    if fx.const_expr(separate):
-        k0_address = k_address(k_lane, page00, page01, fx.Int32(0), half_page, HK, DQ, PAGE)
-        k0 = load_k_address(gk, k0_address, DQ, PAGE)
-        v0, v1 = v_addresses(v_global_base, page00, page01, fx.Int32(0), HK, PAGE)
-        v_pending = load_v_address(v0, v1, v_lane)
-    else:
-        k0 = _load_k(gk, tid, page00, page01, fx.Int32(0), HK, DQ, PAGE)
-        v_pending = _load_v(V, tid, page00, page01, fx.Int32(0), hkv, HK, DV, PAGE, bounded)
-    _wait(vmcnt=0)
-    if fx.const_expr(separate):
-        write_lds(kw_address, k0, DQ // 64)
-        write_lds(vw_address, v_pending, 2)
-    else:
-        _cooperative_store(storage, tid, k0, 0, DQ // 64, True, bounded)
-        _cooperative_store(storage, tid, v_pending, k_bytes, DV // 64, bounded=bounded)
-    _wait(vmcnt=0, lgkmcnt=0)
-    _stage_end()
-    if fx.const_expr(STAGGER):
-        _stage_end()
+def _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, heads, dv):
+    """O * inv to BF16, C-shuffled through LDS (r2s b64, s2r b128), then b128 row stores (r2g).
 
-    if fx.const_expr(separate and DQ == 192):
-        k = read_k(kr_address, 0, DQ)
-    else:
-        k = _k_fragment(storage, k_base, 0, DQ, DV, full_k)
-    _wait(lgkmcnt=0)
-    _stage_end()
-    lo = _qk(q, k, storage, k_base, 0, DQ, DV, full_k)
-    o0 = _pin(fx.Vector.filled(DV // 4, 0.0, fx.Float32))
-    o1 = _pin(fx.Vector.filled(DV // 4, 0.0, fx.Float32))
-    _schedule(DQ // 8, 3, 5)
-    _stage_end()
-    k1 = fx.Vector.filled(DQ // 16, 0, fx.Int32)
-    if fx.const_expr(separate and DQ == 192):
-        k = read_k(kr_address, 1, DQ)
-        k1_address = k_address(k_lane, page10, page11, _min(fx.Int32(1), last), half_page, HK, DQ, PAGE)
-        k1 = load_k_address(gk, k1_address, DQ, PAGE)
-    else:
-        k = _k_fragment(storage, k_base, 1, DQ, DV, full_k)
-    _wait(lgkmcnt=0)
-    _stage_end()
-    hi = _qk(q, k, storage, k_base, 1, DQ, DV, full_k)
-    scores = _mask(_join(lo, hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
-    _mfma_hazard_wait()
-    maximum = _maximum(_row_max(scores) * scale, fx.Float32(-1.0e30)) + 1.0
-    scores = _center(scores, scale, maximum, 0, 32)
-    row_sum = fx.Float32(0.0)
-    _stage_end()
-    if fx.const_expr((DQ == 192 or DV == 192) and not separate):
-        # Retain the wide-path prologue rendezvous. Streaming variants read
-        # K inside QK-high, so both groups must finish before replacing K0.
-        _stage_end()
-    # Both groups have read K0. The only K slot can now hold K1.
-    if fx.const_expr(not separate or DQ == 128):
-        k1 = _load_k(gk, tid, page10, page11, _min(fx.Int32(1), last), HK, DQ, PAGE)
-    _wait(vmcnt=0)
-    if fx.const_expr(separate):
-        write_lds(kw_address, k1, DQ // 64)
-    else:
-        _cooperative_store(storage, tid, k1, 0, DQ // 64, True, bounded)
-    _wait(lgkmcnt=0)
-    _stage_end()
-    # Single-slot BF16 differs from FP8's prepublished K1 ring. The leading
-    # group must wait one additional stage for the trailing group's K1 writes
-    # before entering S0; an LGKM wait alone cannot cover another wave.
-    _stage_end()
-
-    @flyc.jit
-    def phase(previous, maximum, row_sum, o0, o1, v_pending, current0, current1, next0, next1, t,
-              CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
-        previous, maximum, row_sum = fx.Vector(previous), fx.Float32(maximum), fx.Float32(row_sum)
-        o0, o1, v_pending, t = fx.Vector(o0), fx.Vector(o1), fx.Vector(v_pending), fx.Int32(t)
-        current_slot = (t & 1) if DQ == 192 and v_ring else CUR
-        previous_slot = ((t - 1) & 1) if DQ == 192 and v_ring else PREV
-        # S0 memory: K(t).lo from LDS + V(t) GLOBAL + scalar page lookahead.
-        # Lane offsets are loop-invariant; changing V bases uses SGPRs only.
-        if fx.const_expr(separate):
-            k = read_k(kr_address, 0, DQ)
-        else:
-            k = _k_fragment(storage, k_base, 0, DQ, DV, full_k)
-        rocdl.sched_barrier(0)
-        if fx.const_expr(not v_ring):
-            _cooperative_store(storage, tid, v_pending, k_bytes, DV // 64, bounded=bounded)
-        request0, request1 = _prefetch_tile(table, t + 2, last, last_page, PAGE)
-        v_staging = fx.Vector.filled(DV // 16, 0, fx.Int32)
-        if fx.const_expr(not full_k and not separate):
-            v_staging = _load_v(V, tid, current0, current1, t, hkv, HK, DV, PAGE, bounded)
-        k_staging = fx.Vector.filled(DQ // 16, 0, fx.Int32)
-        if fx.const_expr(separate):
-            v_first, v_second = v_addresses(v_global_base, current0, current1, t, HK, PAGE)
-            v_staging = load_v_address(v_first, v_second, v_lane)
-        else:
-            k_staging = _load_k(gk, tid, next0, next1, _min(t + 1, last), HK, DQ, PAGE)
-        rocdl.sched_barrier(0)
-        future0, future1 = _page_ready(request0), _page_ready(request1)
-        _stage_end()
-        # S1 compute: QK(t).lo + first 24 exps of softmax(t-1). Dynamic
-        # D192 V-ring addresses are materialized here, not in S2/S4/S6.
-        lo = _qk(q, k, storage, k_base, 0, DQ, DV, full_k)
-        p = fx.Vector.filled(32, 0.0, fx.BFloat16)
-        local_sum = fx.Float32(0.0)
-        v_read, v_write = vr_address, vw_address
-        if fx.const_expr(separate):
-            if fx.const_expr(full_k):
-                v_read = _pin_i32(vr_address + previous_slot * 16640)
-                v_write = _pin_i32(vw_address + current_slot * 16640)
-        previous = _pin(_exp_part(previous, 0, 24), 32)
-        _schedule(DQ // 8, 2, 1, True)
-        _stage_end()
-        # S2 memory: publish V(t) in its alternate slot, then read K(t).hi.
-        # Retire staging registers before allocating the full K fragment.
-        other_sum = fx.Float32(0.0)
-        if fx.const_expr(separate):
-            _wait(vmcnt=0)
-            write_lds(v_write, v_staging, 2, CUR * 16640 if DQ == 128 else 0)
-            k = read_k(kr_address, 1, DQ)
-        else:
-            k = _k_fragment(storage, k_base, 1, DQ, DV, full_k)
-        if fx.const_expr(v_ring and not full_k and not separate):
-            _wait(vmcnt=DQ // 64)
-            _cooperative_store(storage, tid, v_staging, k_bytes + current_slot * (DV // 8) * PADDED_CHUNK,
-                               DV // 64, bounded=bounded)
-        _wait(lgkmcnt=0)
-        _stage_end()
-        # S3 compute: QK(t).hi + remaining exp/local sum/P(t-1), and the
-        # divergent page32 K address for the following memory stage.
-        hi = _qk(q, k, storage, k_base, 1, DQ, DV, full_k)
-        previous = _exp_part(previous, 24, 32)
-        if fx.const_expr(separate):
-            local_sum = sum_local(previous)
-        else:
-            row_sum = row_sum + _row_sum(previous)
-        p = _pack_probability(previous)
-        _schedule(4, 2, 2, True)
-        _schedule(DQ // 8 - 4, 8, 2)
-        k_fetch = fx.Int32(0)
-        if fx.const_expr(separate):
-            k_fetch = k_address(k_lane, next0, next1, _min(t + 1, last), half_page, HK, DQ, PAGE)
-        _stage_end()
-        # S4 memory: issue cross32(sum), read V(t-1).lo and prefetch K(t+1).
-        # The shuffle shares the final LDS wait; no immediate dependent use.
-        if fx.const_expr(separate):
-            other_sum = cross_async(local_sum, cross_address)
-            v = read_v(v_read, 0, PREV if DQ == 128 else 0)
-        else:
-            v = _v_fragment(storage, v_base, previous_slot if v_ring else 0, 0, DQ, DV)
-        _wait(vmcnt=0)
-        if fx.const_expr(separate):
-            k_staging = load_k_address(gk, k_fetch, DQ, PAGE)
-        if fx.const_expr(((DQ == 128 and DV == 128) or full_k) and not separate):
-            _cooperative_store(storage, tid, k_staging, 0, DQ // 64, True, bounded)
-        _wait(lgkmcnt=0)
-        _stage_end()
-        # S5 compute: PV(t-1).lo + mask/local max of QK(t), finish sum(t-1).
-        current = _mask(_join(lo, hi), t, row, q_len, kv_len, CAUSAL)
-        o0 = _pv(p, v, o0, DV)
-        local_max = fx.Float32(0.0)
-        ballot, new_max = fx.Int64(0), maximum
-        split = 12 if STAGGER else 6
-        if fx.const_expr(separate):
-            row_sum = row_sum + (local_sum + other_sum)
-            local_max = max_local(current)
-            _schedule(DV // 8, 2, 3)
-        else:
-            candidate = _row_max(current) * scale
-            ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > maximum + 7.0).ir_value()))
-            new_max = (candidate > maximum + 7.0).select(candidate + 1.0, maximum)
-            current = _center(current, scale, new_max, 0, split)
-            _schedule(3, 5, 3)
-            rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 3)
-            rocdl.sched_group_barrier(0x002, 3, 3)
-            rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, 3)
-            rocdl.sched_group_barrier(rocdl.mask_mfma, 2, 3)
-            rocdl.sched_group_barrier(0x002, 10, 3)
-            _schedule(DV // 8 - 6, 5, 3)
-        _stage_end()
-        # S6 memory: cross32(max), V(t-1).hi and K(t+1) publication. Both
-        # groups retired their current K reads before this single-slot write.
-        other_max = fx.Float32(0.0)
-        if fx.const_expr(separate):
-            other_max = cross_async(local_max, cross_address)
-            v = read_v(v_read, 1, PREV if DQ == 128 else 0)
-            _wait(vmcnt=0)
-            write_lds(kw_address, k_staging, DQ // 64)
-        else:
-            v = _v_fragment(storage, v_base, previous_slot if v_ring else 0, 1, DQ, DV)
-        if fx.const_expr((DQ == 192 or DV == 192) and not full_k):
-            # The partner's S3 streams K through the end of QK-high.
-            # S4 would overwrite its last chunks. S6 follows BOTH readers
-            # and still leaves two stages before the next K-low read.
-            _cooperative_store(storage, tid, k_staging, 0, DQ // 64, True, bounded)
-        _wait(lgkmcnt=0)
-        _stage_end()
-        # S7 compute: PV(t-1).hi + complete max/center(t) and lazy rescale.
-        o1 = _pv(p, v, o1, DV)
-        if fx.const_expr(separate):
-            candidate = _maximum(local_max, other_max) * scale
-            ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > maximum + 7.0).ir_value()))
-            new_max = (candidate > maximum + 7.0).select(candidate + 1.0, maximum)
-            current = _center(current, scale, new_max, 0, 32)
-        else:
-            current = _center(current, scale, new_max, split, 32)
-        _schedule(DV // 8, 4, 4)
-        o0, o1, row_sum = rescale(o0, o1, row_sum, maximum, new_max, ballot)
-        if fx.const_expr(separate):
-            new_max = advance_max(maximum, new_max)
-        _stage_end()
-        pending = fx.Vector.filled(DV // 16, 0, fx.Int32) if v_ring else v_staging
-        return current, new_max, row_sum, o0, o1, pending, next0, next1, future0, future1
-
-    if fx.const_expr(v_ring and DQ == 128):
-        # FP8's two-phase unroll keeps V ring indices compile-time constants.
-        for t in range(fx.Int32(1), tiles - 1, fx.Int32(2)):
-            scores, maximum, row_sum, o0, o1, v_pending, page10, page11, page20, page21 = phase(
-                scores, maximum, row_sum, o0, o1, v_pending, page10, page11, page20, page21, t, 1, 0)
-            scores, maximum, row_sum, o0, o1, v_pending, page10, page11, page20, page21 = phase(
-                scores, maximum, row_sum, o0, o1, v_pending, page10, page11, page20, page21, t + 1, 0, 1)
-        if (tiles & 1) == 0:
-            scores, maximum, row_sum, o0, o1, v_pending, page10, page11, page20, page21 = phase(
-                scores, maximum, row_sum, o0, o1, v_pending, page10, page11, page20, page21, last, 1, 0)
-    else:
-        # D192 ring indices are scalar t&1 values. Keeping a single phase
-        # avoids the large register-pressure increase of double unrolling.
-        for t in range(fx.Int32(1), tiles, fx.Int32(1)):
-            scores, maximum, row_sum, o0, o1, v_pending, page10, page11, page20, page21 = phase(
-                scores, maximum, row_sum, o0, o1, v_pending, page10, page11, page20, page21, t, 0, 0)
-
-    # Single-slot variants publish the last prefetched V here, after both
-    # preceding S6 readers. Ring variants published it during S2/S4.
-    if fx.const_expr(not v_ring):
-        _cooperative_store(storage, tid, v_pending, k_bytes, DV // 64, bounded=bounded)
-    scores = _exp_part(fx.Vector(scores), 0, 32)
-    row_sum = fx.Float32(row_sum) + _row_sum(scores)
-    p = _pack_probability(scores)
-    _wait(vmcnt=0, lgkmcnt=0)
-    _stage_end()
-    if fx.const_expr(not v_ring):
-        # Wait for the trailing group's final single-slot V publication.
-        _stage_end()
-    v = _v_fragment(storage, v_base, (last & 1) if v_ring else 0, 0, DQ, DV)
-    _wait(lgkmcnt=0)
-    rocdl.sched_barrier(0)
-    v.store(_v_tail(v.load(), kv_len - last * BN))
-    _stage_end()
-    o0 = _pv(p, v, o0, DV)
-    _stage_end()
-    v = _v_fragment(storage, v_base, (last & 1) if v_ring else 0, 1, DQ, DV)
-    _wait(lgkmcnt=0)
-    rocdl.sched_barrier(0)
-    v.store(_v_tail(v.load(), kv_len - last * BN))
-    _stage_end()
-    o1 = _pv(p, v, o1, DV)
-    _stage_end()
-    if fx.const_expr(not STAGGER):
-        _stage_end()
-
-    inv = (row_sum > 0.0).select(fx.Float32(1.0) / row_sum, fx.Float32(0.0)) * VS[0]
-    out_tid = _pin_i32(fx.Int32(gpu.thread_id("x")))
-    out_row = (out_tid >> 6) * 32 + (out_tid & 31)
-    optr = fx.get_iter(O) + ((fx.Int64(q0) + fx.Int64(q_start)) * (H * DV) + fx.Int64(head) * DV)
-    obuf = rocdl.make_buffer_tensor(fx.make_view(optr, fx.make_layout(BM * H * DV, 1)),
-                                    num_records_bytes=valid * H * DV * 2)
-    # FP8 C-shuffle: reuse 32 KiB, one 64-column slice at a time. The public
-    # token-major output is unchanged; V192 simply has a third slice.
+    Reuses 32 KiB of LDS for one 64-column slice at a time (V192 has a third slice).
+    """
     atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16)
     outputs = _join(o0, o1)
-    for half in fx.range_constexpr(DV // 64):
+    for half in fx.range_constexpr(dv // 64):
         for n in fx.range_constexpr(2):
             for group in fx.range_constexpr(4):
                 val = fx.Vector.from_elements([outputs[half * 32 + n * 16 + group * 4 + i] * inv for i in range(4)], fx.Float32)
@@ -707,21 +327,557 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
             element = out_tid * 8 + i * THREADS * 8
             read_row, read_col = element // 64, element % 64
             element = element ^ ((read_row & 14) * 4)
-            words = _lds_words(storage, element * 2)
+            words = _read_s2r(storage, element * 2)
             _wait(lgkmcnt=0)
             rocdl.sched_barrier(0)
             src = fx.make_rmem_tensor(8, fx.BFloat16)
             src.store(fx.Vector.from_elements([
                 ((read_row & 1) == 0).select(words[j], words[j ^ 2]) for j in range(4)
             ], fx.Int32).bitcast(fx.BFloat16))
-            offset = read_row * (H * DV) + half * 64 + read_col
+            offset = read_row * (heads * dv) + half * 64 + read_col
             fx.copy(atom, src, fx.make_view(fx.get_iter(obuf) + offset, fx.make_layout(8, 1)))
         _stage_end()
+
+
+@flyc.jit
+def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
+               H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
+               DV: fx.Constexpr[int], PAGE: fx.Constexpr[int], CAUSAL: fx.Constexpr[bool],
+               PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
+               SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool]):
+    """DV128 without LSE (Dq 128/192): query rows 256 * qb .. + 255 of one head over KV tiles t.
+
+    LDS: one K slot of (Dq / 8) * 1040 bytes and a two-slot V ring (V(t) in slot t & 1).
+    Page ids run two tiles ahead of QK, K one tile ahead (g2r in S4, r2s in S6 of phase
+    t - 1, after both groups read K(t - 1)) and V one tile ahead (GLOBAL g2r in S0, r2s
+    in S2). Phase t runs QK and the row max of tile t and, one tile behind, the
+    exponentials, row sum and PV of tile t - 1. Even stages are memory (VMEM/LDS),
+    odd stages compute (MFMA/VALU); waves 4-7 (STAGGER) run one stage behind waves 0-3.
+    Row sums/maxima of the two lane halves meet through ds_bpermute in memory stages.
+
+    stage  phase t; cur = t & 1, prev = (t - 1) & 1
+    S0     s2r K(t) keys 0-31; s_load pages(t+2); g2r V(t)
+    S1     QK: S(t) keys 0-31          softmax: P(t-1) = exp2(S'(t-1)), values 0-23
+    S2     V(t) lands; r2s V(t) -> [cur]; s2r K(t) keys 32-63
+    S3     QK: S(t) keys 32-63         softmax: P(t-1) values 24-31, lane row sum, P to BF16
+    S4     exchange row sums; s2r V(t-1) dims 0-63 [prev]; g2r K(t+1)
+    S5     PV: O dims 0-63 += P V      softmax: l += row sum; mask S(t), lane row max
+    S6     exchange row maxima; s2r V(t-1) dims 64-127 [prev]; K(t+1) lands; r2s K(t+1)
+    S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
+
+    Softmax in log2 units: S' = S * scale - m, P = exp2(S'), l = sum(P) and O = sum(P V);
+    the output is O / l * v_descale. m starts at the first row max + 1 and moves to a
+    later row max + 1 only when that exceeds m + 7, rescaling O and l.
+    """
+    # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
+    _helpers = (_read_k_g2r, _k_g2r_offset, _v_g2r_bases, _read_v_g2r, _store_r2s, _read_k_s2r, _read_v_s2r,
+                _read_k_tile_g2r, _read_k_tile_s2r, _read_v_tile_s2r, _qk, _pv, _mask, _v_tail, _join,
+                _mfma_hazard_wait, _maximum, _row_max, _row_max_local, _row_sum, _row_sum_local, _center_part,
+                _exp_part, _pack_probability, _cross32_async, _rescale, _advance_max, _pin, _schedule,
+                _stage_end, _wait)
+    tid = fx.Int32(gpu.thread_id("x"))
+    wave, lane = _uniform(tid >> 6), tid & 63
+    q_start = qb * BM
+    row = q_start + wave * 32 + (lane & 31)
+    valid = _min(fx.Int32(BM), q_len - q_start)
+    hkv = head // (H // HK)
+    q_ptr = fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(q_start)) * (H * DQ) + fx.Int64(head) * DQ)
+    gq = _buffer(fx.make_view(q_ptr, fx.make_layout(BM * H * DQ, 1)), valid * H * DQ * 2)
+    gk = _buffer(fx.make_view(fx.get_iter(K) + hkv * PAGE * DQ,
+                            fx.make_layout((NP * HK - hkv) * PAGE * DQ, 1)),
+                 (NP * HK - hkv) * PAGE * DQ * 2)
+    # Q stays in registers for every KV tile.
+    q = _read_q_g2r(gq, (wave * 32 + (lane & 31)) * (H * DQ * 2), lane, DQ)
+    scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
+    if fx.const_expr(PER_TOKEN):
+        scale = scale * rocdl.make_buffer_tensor(QS, max_size=False)[(q0 + row) * H + head]
+    else:
+        scale = scale * QS[0]
+    scale = fx.Float32(scale)
+    tiles = (kv_len + BN - 1) // BN
+    if fx.const_expr(CAUSAL):
+        end = (q_start + valid + kv_len - q_len + BN - 1) // BN
+        tiles = _min(tiles, (end > 0).select(end, fx.Int32(1)))
+    last, last_page = tiles - 1, (kv_len - 1) // PAGE
+    # Page ids of tiles 0-2; every later phase t requests pages(t+2).
+    pages_0 = _read_tile_pages_g2r(table, fx.Int32(0), last, last_page, PAGE)
+    pages_1 = _read_tile_pages_g2r(table, fx.Int32(1), last, last_page, PAGE)
+    pages_2 = _read_tile_pages_g2r(table, fx.Int32(2), last, last_page, PAGE)
+    pages_0 = _page_ready(pages_0[0]), _page_ready(pages_0[1])
+    pages_1 = _page_ready(pages_1[0]), _page_ready(pages_1[1])
+    pages_2 = _page_ready(pages_2[0]), _page_ready(pages_2[1])
+    # BF16 P carries eight consecutive keys per b128, not FP8's sixteen.
+    k_row = (lane & 3) | ((lane & 4) << 1) | ((lane & 8) >> 1) | (lane & 16)
+    k_base = (lane >> 5) * PADDED_CHUNK + ((k_row * 16) ^ ((k_row & 16) << 2))
+    v_base = (lane >> 5) * (DV // 64) * PADDED_CHUNK + (lane & 31) * 16
+    k_bytes = (DQ // 8) * PADDED_CHUNK
+    half_page = (lane & 32) != 0
+    # Loop-invariant lane addresses: LDS read/write (r/w) bases, K/V g2r lane offsets.
+    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
+    within = (tid & 63) * 16
+    k_s2r = _pin_i32(shared + k_base)
+    k_r2s = _pin_i32(shared + (tid >> 6) * PADDED_CHUNK + (within ^ ((within & 256) >> 2)))
+    v_s2r = _pin_i32(shared + k_bytes + v_base)
+    v_r2s = _pin_i32(shared + k_bytes + (tid >> 6) * PADDED_CHUNK + within)
+    k_lane = _pin_i32((tid >> 6) * (PAGE * 16) + (tid & (min(PAGE, BN) - 1)) * 16)
+    v_lane = _pin_i32(tid * 16)
+    cross_address = _pin_i32((lane ^ 32) * 4)
+    v_global_base = _pin_s64(fx.Int64(fx.ptrtoint(fx.get_iter(V))) + fx.Int64(hkv) * (PAGE * DV * 2))
+
+    def read_k_g2r(pages, tile):
+        return _read_k_g2r(gk, _k_g2r_offset(k_lane, pages[0], pages[1], tile, half_page, HK, DQ, PAGE), DQ, PAGE)
+
+    def read_v_g2r(pages, tile):
+        first, second = _v_g2r_bases(v_global_base, pages[0], pages[1], tile, HK, PAGE)
+        return _read_v_g2r(first, second, v_lane)
+
+    def prologue():
+        """K(0), V(0) -> LDS; QK S(0), m and S'(0); K(1) -> LDS (D192 loads it during QK(0))."""
+        # Memory: g2r K(0), V(0); r2s K(0) and V(0) -> [0].
+        k_0 = read_k_g2r(pages_0, fx.Int32(0))
+        v_0 = read_v_g2r(pages_0, fx.Int32(0))
+        _wait(vmcnt=0)
+        _store_r2s(k_r2s, k_0, DQ // 64)
+        _store_r2s(v_r2s, v_0, 2)
+        _wait(vmcnt=0, lgkmcnt=0)
+        _stage_end()
+        if fx.const_expr(STAGGER):
+            # Waves 4-7 fall one stage behind.
+            _stage_end()
+        # Memory: s2r K(0) keys 0-31.
+        if fx.const_expr(DQ == 192):
+            k_lo = _read_k_s2r(k_s2r, 0, DQ)
+        else:
+            k_lo = _read_k_tile_s2r(storage, k_base, 0, DQ, DV, True)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # Compute: QK S(0) keys 0-31; O = 0.
+        s_lo = _qk(q, k_lo, storage, k_base, 0, DQ, DV, True)
+        o0 = _pin(fx.Vector.filled(DV // 4, 0.0, fx.Float32))
+        o1 = _pin(fx.Vector.filled(DV // 4, 0.0, fx.Float32))
+        _schedule(DQ // 8, 3, 5)
+        _stage_end()
+        # Memory: s2r K(0) keys 32-63 (D192 also issues g2r K(1)).
+        if fx.const_expr(DQ == 192):
+            k_hi = _read_k_s2r(k_s2r, 1, DQ)
+            k_1 = read_k_g2r(pages_1, _min(fx.Int32(1), last))
+        else:
+            k_hi = _read_k_tile_s2r(storage, k_base, 1, DQ, DV, True)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # Compute: QK S(0) keys 32-63; softmax m and S'(0).
+        s_hi = _qk(q, k_hi, storage, k_base, 1, DQ, DV, True)
+        s_0 = _mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
+        _mfma_hazard_wait()
+        row_max = _maximum(_row_max(s_0) * scale, fx.Float32(-1.0e30)) + 1.0
+        s_0 = _center_part(s_0, scale, row_max, 0, 32)
+        row_sum = fx.Float32(0.0)
+        _stage_end()
+        # Memory: both groups read K(0); g2r K(1) (D128) and r2s it into the single K slot.
+        if fx.const_expr(DQ == 128):
+            k_1 = _read_k_tile_g2r(gk, tid, pages_1[0], pages_1[1], _min(fx.Int32(1), last), HK, DQ, PAGE)
+        _wait(vmcnt=0)
+        _store_r2s(k_r2s, k_1, DQ // 64)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # The leading group waits one more stage for the trailing group's K(1)
+        # writes; an LGKM wait alone cannot cover another wave.
+        _stage_end()
+        return s_0, row_max, row_sum, o0, o1, *pages_1, *pages_2
+
+    @flyc.jit
+    def phase(s_prev, row_max, row_sum, o0, o1, page_cur0, page_cur1, page_next0, page_next1, t,
+              CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
+        """Phase t (table in _body_v128); page_cur*/page_next* are the page ids of tiles t and t+1.
+
+        D128 unrolls two phases so CUR/PREV are constants; D192 runs one phase per trip and
+        derives the V slots from t.
+        """
+        s_prev, row_max, row_sum = fx.Vector(s_prev), fx.Float32(row_max), fx.Float32(row_sum)
+        o0, o1, t = fx.Vector(o0), fx.Vector(o1), fx.Int32(t)
+        slot_cur = (t & 1) if DQ == 192 else CUR
+        slot_prev = ((t - 1) & 1) if DQ == 192 else PREV
+        # S0 memory: s2r K(t) keys 0-31; s_load pages(t+2); g2r V(t) (SGPR bases only change).
+        k_lo = _read_k_s2r(k_s2r, 0, DQ)
+        rocdl.sched_barrier(0)
+        requests_next2 = _read_tile_pages_g2r(table, t + 2, last, last_page, PAGE)
+        v_cur = read_v_g2r((page_cur0, page_cur1), t)
+        rocdl.sched_barrier(0)
+        page_next2_0, page_next2_1 = _page_ready(requests_next2[0]), _page_ready(requests_next2[1])
+        _stage_end()
+        # S1 compute: QK S(t) keys 0-31; P(t-1) values 0-23. D192 ring addresses are made here.
+        s_lo = _qk(q, k_lo, storage, k_base, 0, DQ, DV, True)
+        v_read, v_write = v_s2r, v_r2s
+        if fx.const_expr(DQ == 192):
+            v_read = _pin_i32(v_s2r + slot_prev * V_SLOT)
+            v_write = _pin_i32(v_r2s + slot_cur * V_SLOT)
+        p_prev = _pin(_exp_part(s_prev, 0, 24), 32)
+        _schedule(DQ // 8, 2, 1, True)
+        _stage_end()
+        # S2 memory: r2s V(t) -> [cur] once it lands; s2r K(t) keys 32-63.
+        _wait(vmcnt=0)
+        _store_r2s(v_write, v_cur, 2, CUR * V_SLOT if DQ == 128 else 0)
+        k_hi = _read_k_s2r(k_s2r, 1, DQ)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # S3 compute: QK S(t) keys 32-63; P(t-1) values 24-31, lane row sum, BF16 P; K(t+1) address.
+        s_hi = _qk(q, k_hi, storage, k_base, 1, DQ, DV, True)
+        p_prev = _exp_part(p_prev, 24, 32)
+        lane_sum = _row_sum_local(p_prev)
+        p_bf16 = _pack_probability(p_prev)
+        _schedule(4, 2, 2, True)
+        _schedule(DQ // 8 - 4, 8, 2)
+        k_next_offset = _k_g2r_offset(k_lane, page_next0, page_next1, _min(t + 1, last), half_page, HK, DQ, PAGE)
+        _stage_end()
+        # S4 memory: exchange row sums; s2r V(t-1) dims 0-63; g2r K(t+1).
+        other_sum = _cross32_async(lane_sum, cross_address)
+        v_lo = _read_v_s2r(v_read, 0, PREV if DQ == 128 else 0)
+        _wait(vmcnt=0)
+        k_next = _read_k_g2r(gk, k_next_offset, DQ, PAGE)
+        # The shuffle shares this LDS wait; it has no consumer before S5.
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # S5 compute: PV O dims 0-63; l += row sum; mask S(t) and its lane row max.
+        s_cur = _mask(_join(s_lo, s_hi), t, row, q_len, kv_len, CAUSAL)
+        o0 = _pv(p_bf16, v_lo, o0, DV)
+        row_sum = row_sum + (lane_sum + other_sum)
+        lane_max = _row_max_local(s_cur)
+        _schedule(DV // 8, 2, 3)
+        _stage_end()
+        # S6 memory: exchange row maxima; s2r V(t-1) dims 64-127; r2s K(t+1) after both groups read K(t).
+        other_max = _cross32_async(lane_max, cross_address)
+        v_hi = _read_v_s2r(v_read, 1, PREV if DQ == 128 else 0)
+        _wait(vmcnt=0)
+        _store_r2s(k_r2s, k_next, DQ // 64)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # S7 compute: PV O dims 64-127; new m and S'(t); lazy rescale of O and l.
+        o1 = _pv(p_bf16, v_hi, o1, DV)
+        candidate = _maximum(lane_max, other_max) * scale
+        ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > row_max + 7.0).ir_value()))
+        new_max = (candidate > row_max + 7.0).select(candidate + 1.0, row_max)
+        s_cur = _center_part(s_cur, scale, new_max, 0, 32)
+        _schedule(DV // 8, 4, 4)
+        o0, o1, row_sum = _rescale(o0, o1, row_sum, row_max, new_max, ballot)
+        new_max = _advance_max(row_max, new_max)
+        _stage_end()
+        return s_cur, new_max, row_sum, o0, o1, page_next0, page_next1, page_next2_0, page_next2_1
+
+    def epilogue(state):
+        """exp, row sum and PV of the last tile; V(last) already sits in slot last & 1."""
+        s_last, row_max, row_sum, o0, o1 = state[:5]
+        p_last = _exp_part(fx.Vector(s_last), 0, 32)
+        row_sum = fx.Float32(row_sum) + _row_sum(p_last)
+        p_bf16 = _pack_probability(p_last)
+        _wait(vmcnt=0, lgkmcnt=0)
+        _stage_end()
+        # Memory: s2r V(last) dims 0-63; zero rows past kv_len (0 * NaN is NaN).
+        v_lo = _read_v_tile_s2r(storage, v_base, last & 1, 0, DQ, DV)
+        _wait(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        v_lo.store(_v_tail(v_lo.load(), kv_len - last * BN))
+        _stage_end()
+        # Compute: PV O dims 0-63.
+        o0 = _pv(p_bf16, v_lo, o0, DV)
+        _stage_end()
+        # Memory: s2r V(last) dims 64-127.
+        v_hi = _read_v_tile_s2r(storage, v_base, last & 1, 1, DQ, DV)
+        _wait(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        v_hi.store(_v_tail(v_hi.load(), kv_len - last * BN))
+        _stage_end()
+        # Compute: PV O dims 64-127.
+        o1 = _pv(p_bf16, v_hi, o1, DV)
+        _stage_end()
+        if fx.const_expr(not STAGGER):
+            # Waves 0-3 wait for waves 4-7 before the output shuffle reuses LDS.
+            _stage_end()
+        return row_max, row_sum, o0, o1
+
+    # Pipeline: prologue stages K(0)/V(0), runs QK(0) and stages K(1); phases t = 1 .. tiles - 1;
+    # epilogue finishes PV(last).
+    state = prologue()
+    if fx.const_expr(DQ == 128):
+        # Two phases per trip keep the V ring slots compile-time constants.
+        for t in range(fx.Int32(1), tiles - 1, fx.Int32(2)):
+            state = phase(*state, t, 1, 0)
+            state = phase(*state, t + 1, 0, 1)
+        if (tiles & 1) == 0:
+            state = phase(*state, last, 1, 0)
+    else:
+        # D192 derives the slots from t; a single phase avoids doubling register pressure.
+        for t in range(fx.Int32(1), tiles, fx.Int32(1)):
+            state = phase(*state, t, 0, 0)
+    row_max, row_sum, o0, o1 = epilogue(state)
+
+    inv = (row_sum > 0.0).select(fx.Float32(1.0) / row_sum, fx.Float32(0.0)) * VS[0]
+    out_tid = _pin_i32(fx.Int32(gpu.thread_id("x")))
+    out_row = (out_tid >> 6) * 32 + (out_tid & 31)
+    optr = fx.get_iter(O) + ((fx.Int64(q0) + fx.Int64(q_start)) * (H * DV) + fx.Int64(head) * DV)
+    obuf = rocdl.make_buffer_tensor(fx.make_view(optr, fx.make_layout(BM * H * DV, 1)),
+                                    num_records_bytes=valid * H * DV * 2)
+    _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, H, DV)
+
+
+@flyc.jit
+def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
+               H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
+               DV: fx.Constexpr[int], PAGE: fx.Constexpr[int], CAUSAL: fx.Constexpr[bool],
+               PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
+               SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool]):
+    """LSE or DV192: query rows 256 * qb .. + 255 of one head over KV tiles t, cooperative copies.
+
+    LDS: one K slot; V uses a two-slot ring for D128/V128 (V(t) in slot t & 1) and one
+    slot otherwise. Page ids run two tiles ahead and K one tile ahead (g2r in S0; r2s
+    into the single slot in S4 for D128/V128, in S6 when D192/V192 QK streams K64
+    chunks through S3). V(t) is loaded in S0; the ring publishes it in S2, the single
+    slot in S0 of phase t + 1. Same stage roles and softmax as _body_v128, except the
+    row sum/max reductions use lane shuffles inside compute stages.
+
+    stage  phase t; ring: cur = t & 1, prev = (t - 1) & 1
+    S0     s2r K(t) keys 0-31; single slot: r2s V(t-1); s_load pages(t+2); g2r V(t), K(t+1)
+    S1     QK: S(t) keys 0-31          softmax: P(t-1) values 0-23
+    S2     s2r K(t) keys 32-63; ring: V(t) lands, r2s V(t) -> [cur]
+    S3     QK: S(t) keys 32-63         softmax: P(t-1) values 24-31, l += row sum, P to BF16
+    S4     s2r V(t-1) dims 0-63; K(t+1) lands; D128/V128: r2s K(t+1)
+    S5     PV: O dims 0-63 += P V      softmax: mask S(t), new m, S'(t) values 0..split
+    S6     s2r V(t-1) dims 64-DV; D192/V192: r2s K(t+1)
+    S7     PV: rest of O += P V        softmax: S'(t) values split..31; rescale O and l
+    """
+    # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
+    _helpers = (_read_k_tile_g2r, _read_v_tile_g2r, _store_tile_r2s, _read_k_tile_s2r, _read_v_tile_s2r,
+                _qk, _pv, _mask, _v_tail, _join, _mfma_hazard_wait, _maximum, _row_max, _row_sum,
+                _center_part, _exp_part, _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait)
+    tid = fx.Int32(gpu.thread_id("x"))
+    wave, lane = _uniform(tid >> 6), tid & 63
+    q_start = qb * BM
+    row = q_start + wave * 32 + (lane & 31)
+    valid = _min(fx.Int32(BM), q_len - q_start)
+    hkv = head // (H // HK)
+    v_ring = DV == 128 and DQ == 128
+    q_ptr = fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(q_start)) * (H * DQ) + fx.Int64(head) * DQ)
+    gq = _buffer(fx.make_view(q_ptr, fx.make_layout(BM * H * DQ, 1)), valid * H * DQ * 2)
+    gk = _buffer(fx.make_view(fx.get_iter(K) + hkv * PAGE * DQ,
+                            fx.make_layout((NP * HK - hkv) * PAGE * DQ, 1)),
+                 (NP * HK - hkv) * PAGE * DQ * 2)
+    # Q stays in registers for every KV tile.
+    q = _read_q_g2r(gq, (wave * 32 + (lane & 31)) * (H * DQ * 2), lane, DQ)
+    scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
+    if fx.const_expr(PER_TOKEN):
+        scale = scale * rocdl.make_buffer_tensor(QS, max_size=False)[(q0 + row) * H + head]
+    else:
+        scale = scale * QS[0]
+    scale = fx.Float32(scale)
+    tiles = (kv_len + BN - 1) // BN
+    if fx.const_expr(CAUSAL):
+        end = (q_start + valid + kv_len - q_len + BN - 1) // BN
+        tiles = _min(tiles, (end > 0).select(end, fx.Int32(1)))
+    last, last_page = tiles - 1, (kv_len - 1) // PAGE
+    pages_0 = _read_tile_pages_g2r(table, fx.Int32(0), last, last_page, PAGE)
+    pages_1 = _read_tile_pages_g2r(table, fx.Int32(1), last, last_page, PAGE)
+    pages_2 = _read_tile_pages_g2r(table, fx.Int32(2), last, last_page, PAGE)
+    pages_0 = _page_ready(pages_0[0]), _page_ready(pages_0[1])
+    pages_1 = _page_ready(pages_1[0]), _page_ready(pages_1[1])
+    pages_2 = _page_ready(pages_2[0]), _page_ready(pages_2[1])
+    k_row = (lane & 3) | ((lane & 4) << 1) | ((lane & 8) >> 1) | (lane & 16)
+    k_base = (lane >> 5) * PADDED_CHUNK + ((k_row * 16) ^ ((k_row & 16) << 2))
+    v_base = (lane >> 5) * (DV // 64) * PADDED_CHUNK + (lane & 31) * 16
+    k_bytes = (DQ // 8) * PADDED_CHUNK
+
+    def read_k_g2r(pages, tile):
+        return _read_k_tile_g2r(gk, tid, pages[0], pages[1], tile, HK, DQ, PAGE)
+
+    def read_v_g2r(pages, tile):
+        return _read_v_tile_g2r(V, tid, pages[0], pages[1], tile, hkv, HK, DV, PAGE, True)
+
+    def store_k_r2s(words):
+        _store_tile_r2s(storage, tid, words, 0, DQ // 64, True, True)
+
+    def store_v_r2s(words, slot=0):
+        _store_tile_r2s(storage, tid, words, k_bytes + slot * (DV // 8) * PADDED_CHUNK, DV // 64, bounded=True)
+
+    def prologue():
+        """K(0), V(0) -> LDS; QK S(0), m and S'(0); K(1) -> LDS."""
+        k_0 = read_k_g2r(pages_0, fx.Int32(0))
+        v_0 = read_v_g2r(pages_0, fx.Int32(0))
+        _wait(vmcnt=0)
+        store_k_r2s(k_0)
+        store_v_r2s(v_0)
+        _wait(vmcnt=0, lgkmcnt=0)
+        _stage_end()
+        if fx.const_expr(STAGGER):
+            # Waves 4-7 fall one stage behind.
+            _stage_end()
+        # Memory: s2r K(0) keys 0-31 (D192/V192: first K64 chunk).
+        k_lo = _read_k_tile_s2r(storage, k_base, 0, DQ, DV)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # Compute: QK S(0) keys 0-31; O = 0.
+        s_lo = _qk(q, k_lo, storage, k_base, 0, DQ, DV)
+        o0 = _pin(fx.Vector.filled(DV // 4, 0.0, fx.Float32))
+        o1 = _pin(fx.Vector.filled(DV // 4, 0.0, fx.Float32))
+        _schedule(DQ // 8, 3, 5)
+        _stage_end()
+        # Memory: s2r K(0) keys 32-63.
+        k_hi = _read_k_tile_s2r(storage, k_base, 1, DQ, DV)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # Compute: QK S(0) keys 32-63; softmax m and S'(0).
+        s_hi = _qk(q, k_hi, storage, k_base, 1, DQ, DV)
+        s_0 = _mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
+        _mfma_hazard_wait()
+        row_max = _maximum(_row_max(s_0) * scale, fx.Float32(-1.0e30)) + 1.0
+        s_0 = _center_part(s_0, scale, row_max, 0, 32)
+        row_sum = fx.Float32(0.0)
+        _stage_end()
+        if fx.const_expr(DQ == 192 or DV == 192):
+            # Streaming QK reads K through the end of QK-high: both groups must finish first.
+            _stage_end()
+        # Memory: g2r K(1) and r2s it into the single K slot.
+        k_1 = read_k_g2r(pages_1, _min(fx.Int32(1), last))
+        _wait(vmcnt=0)
+        store_k_r2s(k_1)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # The leading group waits one more stage for the trailing group's K(1) writes.
+        _stage_end()
+        return s_0, row_max, row_sum, o0, o1, v_0, *pages_1, *pages_2
+
+    @flyc.jit
+    def phase(s_prev, row_max, row_sum, o0, o1, v_pending, page_cur0, page_cur1, page_next0, page_next1, t,
+              CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
+        """Phase t (table in _body_wide); v_pending is the staged V(t-1) of the single-slot path."""
+        s_prev, row_max, row_sum = fx.Vector(s_prev), fx.Float32(row_max), fx.Float32(row_sum)
+        o0, o1, v_pending, t = fx.Vector(o0), fx.Vector(o1), fx.Vector(v_pending), fx.Int32(t)
+        # S0 memory: s2r K(t) keys 0-31; single slot publishes V(t-1); pages(t+2); g2r V(t), K(t+1).
+        k_lo = _read_k_tile_s2r(storage, k_base, 0, DQ, DV)
+        rocdl.sched_barrier(0)
+        if fx.const_expr(not v_ring):
+            store_v_r2s(v_pending)
+        requests_next2 = _read_tile_pages_g2r(table, t + 2, last, last_page, PAGE)
+        v_cur = read_v_g2r((page_cur0, page_cur1), t)
+        k_next = read_k_g2r((page_next0, page_next1), _min(t + 1, last))
+        rocdl.sched_barrier(0)
+        page_next2_0, page_next2_1 = _page_ready(requests_next2[0]), _page_ready(requests_next2[1])
+        _stage_end()
+        # S1 compute: QK S(t) keys 0-31; P(t-1) values 0-23.
+        s_lo = _qk(q, k_lo, storage, k_base, 0, DQ, DV)
+        p_prev = _pin(_exp_part(s_prev, 0, 24), 32)
+        _schedule(DQ // 8, 2, 1, True)
+        _stage_end()
+        # S2 memory: s2r K(t) keys 32-63; the ring publishes V(t) -> [cur] once V lands.
+        k_hi = _read_k_tile_s2r(storage, k_base, 1, DQ, DV)
+        if fx.const_expr(v_ring):
+            _wait(vmcnt=DQ // 64)
+            store_v_r2s(v_cur, CUR)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # S3 compute: QK S(t) keys 32-63; P(t-1) values 24-31, l += row sum, BF16 P.
+        s_hi = _qk(q, k_hi, storage, k_base, 1, DQ, DV)
+        p_prev = _exp_part(p_prev, 24, 32)
+        row_sum = row_sum + _row_sum(p_prev)
+        p_bf16 = _pack_probability(p_prev)
+        _schedule(4, 2, 2, True)
+        _schedule(DQ // 8 - 4, 8, 2)
+        _stage_end()
+        # S4 memory: s2r V(t-1) dims 0-63; D128/V128 publishes K(t+1) (both groups read K(t)).
+        v_lo = _read_v_tile_s2r(storage, v_base, PREV if v_ring else 0, 0, DQ, DV)
+        _wait(vmcnt=0)
+        if fx.const_expr(DQ == 128 and DV == 128):
+            store_k_r2s(k_next)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # S5 compute: PV O dims 0-63; mask S(t), lazy new m and S'(t) values 0..split.
+        s_cur = _mask(_join(s_lo, s_hi), t, row, q_len, kv_len, CAUSAL)
+        o0 = _pv(p_bf16, v_lo, o0, DV)
+        candidate = _row_max(s_cur) * scale
+        ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > row_max + 7.0).ir_value()))
+        new_max = (candidate > row_max + 7.0).select(candidate + 1.0, row_max)
+        split = 12 if STAGGER else 6
+        s_cur = _center_part(s_cur, scale, new_max, 0, split)
+        _schedule(3, 5, 3)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 3)
+        rocdl.sched_group_barrier(0x002, 3, 3)
+        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, 3)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, 3)
+        rocdl.sched_group_barrier(0x002, 10, 3)
+        _schedule(DV // 8 - 6, 5, 3)
+        _stage_end()
+        # S6 memory: s2r V(t-1) dims 64-DV. D192/V192 publish K(t+1) only now: the partner
+        # group's S3 streams K until the end of QK-high, two stages before the next K read.
+        v_hi = _read_v_tile_s2r(storage, v_base, PREV if v_ring else 0, 1, DQ, DV)
+        if fx.const_expr(DQ == 192 or DV == 192):
+            store_k_r2s(k_next)
+        _wait(lgkmcnt=0)
+        _stage_end()
+        # S7 compute: rest of PV; S'(t) values split..31; lazy rescale of O and l.
+        o1 = _pv(p_bf16, v_hi, o1, DV)
+        s_cur = _center_part(s_cur, scale, new_max, split, 32)
+        _schedule(DV // 8, 4, 4)
+        o0, o1, row_sum = _rescale(o0, o1, row_sum, row_max, new_max, ballot)
+        _stage_end()
+        v_pending = fx.Vector.filled(DV // 16, 0, fx.Int32) if v_ring else v_cur
+        return s_cur, new_max, row_sum, o0, o1, v_pending, page_next0, page_next1, page_next2_0, page_next2_1
+
+    def epilogue(state):
+        """Single slot: r2s V(last). exp, row sum and PV of the last tile."""
+        s_last, row_max, row_sum, o0, o1, v_pending = state[:6]
+        if fx.const_expr(not v_ring):
+            # Publish V(last) after both groups' S6 readers of V(last - 1).
+            store_v_r2s(v_pending)
+        p_last = _exp_part(fx.Vector(s_last), 0, 32)
+        row_sum = fx.Float32(row_sum) + _row_sum(p_last)
+        p_bf16 = _pack_probability(p_last)
+        _wait(vmcnt=0, lgkmcnt=0)
+        _stage_end()
+        if fx.const_expr(not v_ring):
+            # Wait for the trailing group's V(last) publication.
+            _stage_end()
+        # Memory: s2r V(last) dims 0-63; zero rows past kv_len.
+        v_lo = _read_v_tile_s2r(storage, v_base, (last & 1) if v_ring else 0, 0, DQ, DV)
+        _wait(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        v_lo.store(_v_tail(v_lo.load(), kv_len - last * BN))
+        _stage_end()
+        o0 = _pv(p_bf16, v_lo, o0, DV)
+        _stage_end()
+        # Memory: s2r V(last) dims 64-DV.
+        v_hi = _read_v_tile_s2r(storage, v_base, (last & 1) if v_ring else 0, 1, DQ, DV)
+        _wait(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        v_hi.store(_v_tail(v_hi.load(), kv_len - last * BN))
+        _stage_end()
+        o1 = _pv(p_bf16, v_hi, o1, DV)
+        _stage_end()
+        if fx.const_expr(not STAGGER):
+            _stage_end()
+        return row_max, row_sum, o0, o1
+
+    state = prologue()
+    if fx.const_expr(v_ring):
+        # Two phases per trip keep the V ring slots compile-time constants.
+        for t in range(fx.Int32(1), tiles - 1, fx.Int32(2)):
+            state = phase(*state, t, 1, 0)
+            state = phase(*state, t + 1, 0, 1)
+        if (tiles & 1) == 0:
+            state = phase(*state, last, 1, 0)
+    else:
+        for t in range(fx.Int32(1), tiles, fx.Int32(1)):
+            state = phase(*state, t, 0, 0)
+    row_max, row_sum, o0, o1 = epilogue(state)
+
+    inv = (row_sum > 0.0).select(fx.Float32(1.0) / row_sum, fx.Float32(0.0)) * VS[0]
+    out_tid = _pin_i32(fx.Int32(gpu.thread_id("x")))
+    out_row = (out_tid >> 6) * 32 + (out_tid & 31)
+    optr = fx.get_iter(O) + ((fx.Int64(q0) + fx.Int64(q_start)) * (H * DV) + fx.Int64(head) * DV)
+    obuf = rocdl.make_buffer_tensor(fx.make_view(optr, fx.make_layout(BM * H * DV, 1)),
+                                    num_records_bytes=valid * H * DV * 2)
+    _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, H, DV)
     if fx.const_expr(WITH_LSE):
         if ((out_tid & 63) < 32) & (out_row < valid):
             log_l = fx.Float32(llvm.call_intrinsic(fx.Float32.ir_type, "llvm.log2.f32", [row_sum.ir_value()], [], []))
             LSE[(q0 + q_start + out_row) * H + head] = (row_sum > 0.0).select(
-                (fx.Float32(maximum) + log_l) * fx.Float32(math.log(2.0)), fx.Float32(float("-inf")))
+                (fx.Float32(row_max) + log_l) * fx.Float32(math.log(2.0)), fx.Float32(float("-inf")))
 
 
 @flyc.jit
@@ -731,7 +887,9 @@ def _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch
           PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float]):
     # AST rewriting lifts branch bodies into local functions. Capture the
     # compute dependency before the branch so the native cache follows it.
-    body = _body
+    body = _body_wide
+    if fx.const_expr(DV == 128 and not WITH_LSE):
+        body = _body_v128
     q0 = _uniform(CQ[batch])
     q_len = _uniform(CQ[batch + 1]) - q0
     start = _uniform(KI[batch])
@@ -796,10 +954,7 @@ class _PagedAttention:
         self.memory_mode, self.persistent = "lds", persistent
         self._launch = _launch_attention
         if dq == dv == 256:
-            if __package__:
-                from .mha_pa_bf16_256_paged_942 import _launch
-            else:
-                from mha_pa_bf16_256_paged_942 import _launch
+            from .mha_pa_bf16_256_paged_942 import _launch
             self._launch = _launch
             self.bf16_backend = "native-m16-dma4-q0-kearly-vearly-interleave1-1-pages1-lateS41"
         self._compiled = {}
@@ -948,26 +1103,11 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
 _VALIDATED = {}
 
 
-@functools.cache
-def _core_run():
-    if __package__:
-        return importlib.import_module(
-            ".mha_pa_bf16_256_linear_942", __package__
-        ).run
-    name = "experiments.attention.flydsl.mha.mha_pa_bf16_256_linear_942"
-    try:
-        return importlib.import_module(name).run
-    except ModuleNotFoundError as exc:
-        if not exc.name or not name.startswith(exc.name + "."):
-            raise
-    # Only standalone loading may need the project root; never add sibling dirs.
-    import sys
-    from pathlib import Path
+def _linear_run():
+    # Imported on first use: listing or collecting tests must not build the D256 kernel module.
+    from .mha_pa_bf16_256_linear_942 import run
 
-    root = str(Path(__file__).resolve().parents[4])
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    return importlib.import_module(name).run
+    return run
 
 
 def _validate_metadata(tensors, shapes, limits):
@@ -1126,7 +1266,7 @@ def flash_attn_varlen_func(
         sources = (q, k, v) + metadata + (() if lse is None else (lse,))
         if any(_overlaps(out, tensor) for tensor in sources):
             raise ValueError("out must not overlap Q/K/V, metadata, or LSE")
-        return _core_run()(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+        return _linear_run()(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                            out=out, lse=lse, page_size=page_size, causal=causal, softmax_scale=scale,
                            block_table=block_table, persistent=persistent is not False, stream=stream)
 

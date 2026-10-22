@@ -1,4 +1,16 @@
-"""Shared gfx942 BF16 arithmetic, raw-buffer operations and pipeline barriers."""
+"""Shared FlyDSL helpers of the gfx942 MHA kernels (also used by QSA).
+
+Data-movement names follow the MoE kernels: g = global memory, s = LDS
+(shared), r = registers. ``read_x_g2r`` loads global data into registers,
+``read_x_g2s`` copies it straight into LDS (``buffer_load ... lds``),
+``store_x_r2s``/``read_x_s2r`` write/read LDS and ``store_x_r2g`` writes the
+result. Read helpers only issue instructions; kernels place every wait.
+
+1. Scalar/vector utilities, raw buffers, page ids and stage barriers.
+2. BM256 32x32-MFMA softmax pieces of the D128/D192 BF16 and FP8 kernels.
+3. BM128/BN64 D256 geometry, 16x16 MFMA fragments and softmax of the paged
+   and linear D256 kernels.
+"""
 
 import math
 
@@ -9,6 +21,8 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
+
+# ---- 1. Utilities, raw buffers, page ids and stage barriers ----
 
 def _uniform(value):
     return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value).ir_value()))
@@ -61,8 +75,7 @@ def _advance_max(old, new):
 
 
 def _pack_bf16(values):
-    # gfx942 has no native packed FP32 -> BF16 instruction. Software RNE,
-    # as in the FP8 kernel's output path, is used for O.
+    # gfx942 has no native packed FP32 -> BF16 instruction; software RNE for O.
     bits = fx.Vector(values).bitcast(fx.Uint32)
     rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
     words = [(rounded[i] >> 16) | (rounded[i + 1] & fx.Uint32(0xFFFF0000))
@@ -78,16 +91,19 @@ def _stage_end():
 
 
 def _wait(*, vmcnt=63, expcnt=7, lgkmcnt=63):
+    # gfx94x s_waitcnt encoding; an omitted counter is not waited on.
     rocdl.s_waitcnt((vmcnt & 15) | (expcnt << 4) | (lgkmcnt << 8) | ((vmcnt >> 4) << 14))
 
 
 def _schedule(pairs, count, group, exp=False):
+    # Interleave one MFMA with `count` VALU (0x002) or transcendental (0x400) ops.
     for _ in range(pairs):
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group)
         rocdl.sched_group_barrier(0x400 if exp else 0x002, count, group)
 
 
-def _prefetch_page(table, index):
+def _read_page_g2r(table, index):
+    """s_load_dword of one page id; _page_ready makes it usable."""
     address = fx.Int64(fx.ptrtoint(fx.get_iter(table) + index))
     return fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [address.ir_value()],
                                   "s_load_dword $0, $1, 0", "=s,s,~{memory}", has_side_effects=True))
@@ -103,6 +119,7 @@ def _page_ready(value):
 
 
 def _buffer(tensor, size_bytes):
+    """Raw buffer descriptor; loads at or past size_bytes return zero, stores are dropped."""
     address = fx.Int64(fx.ptrtoint(fx.get_iter(tensor)))
     pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr"), address.ir_value())
     return rocdl.make_buffer_rsrc(ir.Type.parse("!llvm.ptr<8>"), pointer,
@@ -111,12 +128,14 @@ def _buffer(tensor, size_bytes):
 
 
 def _buffer_words(resource, voffset, soffset=0):
+    """One 16-byte buffer_load (g2r) at byte offsets voffset + soffset."""
     return fx.Vector(rocdl.raw_ptr_buffer_load(ir.VectorType.get([4], fx.Int32.ir_type), resource,
                                               fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(),
                                               aux=rocdl_aux(0)))
 
 
 def _read_address(address, immediate=0):
+    """One ds_read_b128 (s2r) at a precomputed LDS byte address; asynchronous until lgkmcnt."""
     return fx.Vector(llvm.inline_asm(ir.VectorType.get([4], fx.Int32.ir_type), [address.ir_value()],
         f"ds_read_b128 $0, $1 offset:{immediate}", "=v,v,~{memory}", has_side_effects=True))
 
@@ -130,11 +149,68 @@ def _rescale(o0, o1, row_sum, old_max, new_max, ballot):
     return o0, o1, row_sum
 
 
-# ---- D256-only geometry, MFMA fragments, softmax and paged LDS readers ----
-# The helpers above remain dimension-independent; these use BM128/BN64/D256.
+# ---- 2. BM256 32x32-MFMA softmax (one query row per lane pair, 32 scores per lane) ----
+
+def _max3(a, b, c):
+    return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [a.ir_value(), b.ir_value(), c.ir_value()],
+                                    "v_max3_f32 $0, $1, $2, $3", "=v,v,v,v", has_side_effects=False))
+
+
+def _mfma_hazard_wait():
+    # Inline-asm readers of fresh MFMA accumulators get no wait states from LLVM's hazard recognizer.
+    # 11 = NumPasses(8) + 3 for the 32x32 MFMAs of this kernel on gfx942.
+    rocdl.sched_barrier(0)
+    llvm.inline_asm(None, [], "s_nop 10", "", has_side_effects=True)
+    rocdl.sched_barrier(0)
+
+
+def _row_max_local(values):
+    # Independent MAX3 chains avoid the 32-deep VALU dependency chain.
+    p = [_max3(values[i], values[i + 1], values[i + 2]) for i in range(0, 30, 3)]
+    a = _max3(_max3(p[0], p[1], p[2]), _max3(p[3], p[4], p[5]), _max3(p[6], p[7], p[8]))
+    b = _max3(p[9], values[30], values[31])
+    return _max3(a, b, fx.Float32(-1.0e30))
+
+
+def _row_max(values):
+    value = _row_max_local(values)
+    return _maximum(value, value.shuffle_xor(32, 64))
+
+
+def _row_sum_local(values):
+    partials = [values[i] + values[i + 1] for i in range(0, 32, 2)]
+    for width in (8, 4, 2, 1):
+        partials = [partials[2 * i] + partials[2 * i + 1] for i in range(width)]
+    return partials[0]
+
+
+def _row_sum(values):
+    value = _row_sum_local(values)
+    return value + value.shuffle_xor(32, 64)
+
+
+def _center_part(values, scale, maximum, begin, end):
+    """S' = S * scale - m for scores begin..end-1; the rest pass through."""
+    result = []
+    for i in range(32):
+        value = values[i]
+        if begin <= i < end:
+            value = fx.Float32(llvm.inline_asm(
+                fx.Float32.ir_type, [value.ir_value(), scale.ir_value(), maximum.ir_value()],
+                "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False))
+        result.append(value)
+    return _pin(fx.Vector.from_elements(result, fx.Float32), 32)
+
+
+def _exp_part(values, begin, end):
+    """P = exp2(S') for scores begin..end-1; the rest pass through."""
+    return fx.Vector.from_elements([_exp(values[i]) if begin <= i < end else values[i] for i in range(32)], fx.Float32)
+
+
+# ---- 3. D256 BM128/BN64: 16x16 MFMA fragments and softmax (16 scores per lane) ----
 
 BM, BN, D, THREADS = 128, 64, 256, 512
-K_PITCH, K_BYTES, V_BYTES = 1024, 32768, 32768
+K_BYTES, V_BYTES = 32768, 32768
 LDS_BYTES = K_BYTES + V_BYTES
 LOG2E = math.log2(math.e)
 
@@ -144,7 +220,8 @@ def _mma():
                              fx.make_layout((1, 8, 1), (1, 1, 0)))
 
 
-def _q_fragment(resource, offset, lane):
+def _read_q_g2r(resource, offset, lane):
+    """Q rows of this lane as the QK B operand; Q stays in registers for every KV tile."""
     parts = [_buffer_words(resource, offset + (lane >> 4) * 16 + k * 64) for k in range(8)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = _mma().make_fragment_B(fx.make_rmem_tensor(fx.make_layout((BM, D), (1, BM)), fx.BFloat16))
@@ -152,25 +229,8 @@ def _q_fragment(resource, offset, lane):
     return frag
 
 
-def _read_k(address, half):
-    parts = [_read_address(address[n], half * 512 + k * (4 * K_PITCH))
-             for n in range(2) for k in range(8)]
-    words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
-    storage = fx.make_rmem_tensor(fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16)
-    storage.store(words.bitcast(fx.BFloat16))
-    return fx.make_view(fx.get_iter(storage), fx.make_layout((4, 2, 16), (1, 64, 4)))
-
-
-def _read_v(address, half):
-    parts = [_read_address(address, half * 2048 + n * 256 + k * 16384)
-             for n in range(8) for k in range(2)]
-    words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
-    frag = fx.make_rmem_tensor(fx.make_layout((4, 4, 8), (1, 4, 16)), fx.BFloat16)
-    frag.store(words.bitcast(fx.BFloat16))
-    return frag
-
-
 def _qk(q, k):
+    """S = K Q^T for 32 keys: 16 scores per lane (two 16x16 tiles of eight waves)."""
     mma = _mma()
     acc = mma.make_fragment_C(fx.make_rmem_tensor(fx.make_layout((32, BM), (1, 32)), fx.Float32))
     acc.fill(0.0)
@@ -179,6 +239,7 @@ def _qk(q, k):
 
 
 def _pv(probabilities, values, output):
+    """O += P V for one 128-dimension half of V."""
     mma = _mma()
     p = mma.make_fragment_B(fx.make_rmem_tensor(fx.make_layout((BM, BN), (1, BM)), fx.BFloat16))
     p.store(probabilities)
@@ -210,6 +271,7 @@ def _max(values):
 
 
 def _cross(value, addresses):
+    """Exchange a row statistic with the three other lane groups of the row (ds_bpermute)."""
     return tuple(fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [address.ir_value(), value.ir_value()],
         "ds_bpermute_b32 $0, $1, $2", "=v,v,v,~{memory}", has_side_effects=True)) for address in addresses)
 
@@ -225,6 +287,7 @@ def _exps(values):
 
 
 def _pack(values):
+    """P to BF16 (round half up) with one v_perm_b32 per pair."""
     bits = fx.Vector(values).bitcast(fx.Uint32) + fx.Uint32(0x8000)
     selector = fx.Int32(0x07060302)
     words = [fx.Int32(llvm.inline_asm(fx.Int32.ir_type,
@@ -235,6 +298,7 @@ def _pack(values):
 
 @flyc.jit
 def _mask(scores, tile, row, q_len, kv_len, CAUSAL: fx.Constexpr[bool]):
+    """-inf for keys past the KV length or right of the bottom-right causal diagonal."""
     scores = fx.Vector(scores)
     if fx.const_expr(CAUSAL):
         if row - (fx.Int32(gpu.thread_id("x")) & 15) + kv_len - q_len < (tile + 1) * BN:
@@ -252,6 +316,7 @@ def _mask(scores, tile, row, q_len, kv_len, CAUSAL: fx.Constexpr[bool]):
 
 @flyc.jit
 def _v_tail(values, remaining):
+    """Zero V rows past the KV length: P = 0 times a NaN pad would still be NaN."""
     words = fx.Vector(values).bitcast(fx.Int32)
     if remaining < BN:
         limit = _pin_i32(remaining - ((fx.Int32(gpu.thread_id("x")) >> 4) & 3) * 8)
@@ -263,10 +328,3 @@ def _v_tail(values, remaining):
             masks.append(mask)
         words = fx.Vector.from_elements([words[i] & masks[i % 8] for i in range(words.numel)], fx.Int32)
     return words.bitcast(fx.BFloat16)
-
-
-def _pages(table, tile, last, kv_len, page_size):
-    first = _min(tile, last) * BN // page_size
-    page0 = _prefetch_page(table, first)
-    page1 = _prefetch_page(table, _min(first + 1, (kv_len - 1) // page_size)) if page_size == 32 else page0
-    return page0, page1

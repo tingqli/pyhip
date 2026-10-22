@@ -226,7 +226,7 @@ def _body(
     SCALE: fx.Constexpr[float],
     STAGGER: fx.Constexpr[bool],
 ):
-    read_k, read_v, pv = linear._read_k, linear._read_v, linear._pv
+    read_k, read_v, pv = linear._read_k_s2r, linear._read_v_s2r, linear._pv
     dma_offsets, v_operands = linear._dma_offsets, linear._v_operands
     source_rows, output_fn = _source_rows, _output
     qk, local_sum, local_max, cross = base._qk, base._sum, base._max, base._cross
@@ -255,7 +255,7 @@ def _body(
     qptr = fx.get_iter(Q) + fx.Int64(q0) * (H * D) + hkv * (H // HK) * D
     gq = _buffer(fx.make_view(qptr, fx.make_layout(NQ * H * D, 1)), qextent)
     qoffset = valid_row.select((query * H * D + head * D) * 2, fx.Int32(qextent))
-    q = base._q_fragment(gq, qoffset, lane)
+    q = base._read_q_g2r(gq, qoffset, lane)
     extent = (kv_len * HK - hkv) * D * 2
     limit = (kv_len - 1) * (HK * D * 2) + (wave >> 2) * 256
     limits = tuple(

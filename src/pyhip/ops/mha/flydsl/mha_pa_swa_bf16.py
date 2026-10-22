@@ -1,9 +1,10 @@
 """Single-wave gfx942/gfx950 BF16 SWA: 64 threads, native 16x16 MFMA.
 
 Each CTA owns 16 or 32 query rows and visits only their visible KV-tile union.
-K/V are read directly from page64 SHUFFLE-5D caches into registers: no gather,
-LDS allocation, cross-wave barrier, persistent queue, or multi-wave fallback.
-gfx950 retains its K32 MFMA path; gfx942 splits each K32 into two native K16s.
+K/V are read directly from page64 SHUFFLE-5D caches into registers (g2r): no
+gather, LDS allocation, cross-wave barrier, persistent queue, or multi-wave
+fallback. gfx950 retains its K32 MFMA path; gfx942 splits each K32 into two
+native K16s. The per-tile pipelines are described in the two kernels.
 """
 
 import functools
@@ -17,39 +18,25 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
-try:
-    from ._dsl import select, rmem, resource, wait
-except ImportError:
-    from _dsl import select, rmem, resource, wait
+from ._common import _exp, _min, _uniform
+from ._dsl import select, rmem, resource, wait
 
 
 BM, DV, PAGE, THREADS = 16, 128, 64, 64
 LOG2E = math.log2(math.e)
 
 
-def _uniform(value):
-    return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value).ir_value()))
-
-
-def _min(a, b):
-    return (a < b).select(a, b)
-
-
 def _max(a, b):
     return (a > b).select(a, b)
 
 
-def _page(table, index):
+def _read_page_g2r(table, index):
+    """Page id of a KV page via SMEM, waited on before return."""
     address = fx.Int64(fx.ptrtoint(fx.get_iter(table) + fx.Int64(index)))
     value = fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [address.ir_value()],
                                     "s_load_dword $0, $1, 0", "=s,s,~{memory}", has_side_effects=True))
     return fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [value.ir_value()],
                                    "s_waitcnt lgkmcnt(0)", "=s,0", has_side_effects=True))
-
-
-def _exp(value):
-    return fx.Float32(llvm.call_intrinsic(fx.Float32.ir_type, "llvm.amdgcn.exp2.f32",
-                                         [fx.Float32(value).ir_value()], [], []))
 
 
 def _maxf(a, b):
@@ -100,17 +87,13 @@ def _mma(k, arch):
                              fx.make_layout((1, 1, 1), (1, 1, 1)))
 
 
-def _load(resource, voffset, soffset, words=4):
+def _read_g2r(resource, voffset, soffset, words=4):
     return fx.Vector(rocdl.raw_ptr_buffer_load(ir.VectorType.get([words], fx.Int32.ir_type), as_ir_value(resource),
                                               fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(), aux=rocdl_aux(0)))
 
 
-def _resource(tensor, size):
-    return resource(tensor, size)
-
-
-def _q_load(resource, lane, dq, qrow, arch, row_base=0):
-    parts = [_load(resource, (((lane & 15) + row_base) * qrow + (lane >> 4) * 8 + k * 32) * 2, 0)
+def _read_q_g2r(resource, lane, dq, qrow, arch, row_base=0):
+    parts = [_read_g2r(resource, (((lane & 15) + row_base) * qrow + (lane >> 4) * 8 + k * 32) * 2, 0)
              for k in range(dq // 32)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = _mma(32, arch).make_fragment_B(rmem((BM, dq), fx.BFloat16))
@@ -118,19 +101,19 @@ def _q_load(resource, lane, dq, qrow, arch, row_base=0):
     return frag
 
 
-def _k_load(resource, lane, tile, physical, dq, hk, bn):
+def _read_k_g2r(resource, lane, tile, physical, dq, hk, bn):
     parts = []
     base = physical * (hk * PAGE * dq * 2) + (tile & 63) * 16
     for n in range(bn // 16):
         row = lane & 15 if bn == 16 else (lane & 3) + ((lane & 12) << 1) + (n & 1) * 4 + (n // 2) * 32
         for k in range(dq // 32):
             offset = (((lane >> 4) + k * 4) * PAGE + row) * 16
-            parts.append(_load(resource, offset, base))
+            parts.append(_read_g2r(resource, offset, base))
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     return words
 
 
-def _v_load(resource, lane, tile, physical, hk, bn):
+def _read_v_g2r(resource, lane, tile, physical, hk, bn):
     atom_k = 16 if bn == 16 else 32
     parts = []
     base = physical * (hk * PAGE * DV * 2) + (tile & 63) * (DV * 2)
@@ -138,7 +121,7 @@ def _v_load(resource, lane, tile, physical, hk, bn):
         for k in range(bn // atom_k):
             token = (lane >> 4) * (atom_k // 4) + k * atom_k
             offset = (token // 8 * DV + n * 16 + (lane & 15)) * 16 + (token & 7) * 2
-            parts.append(_load(resource, offset, base, atom_k // 8))
+            parts.append(_read_g2r(resource, offset, base, atom_k // 8))
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(atom_k // 8)], fx.Int32)
     return words
 
@@ -266,6 +249,11 @@ def _swa_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool],
     WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], BN: fx.Constexpr[int], ARCH: fx.Constexpr[int]):
+    """16 query rows per wave over the visible KV tiles [first, end) of BN keys.
+
+    Prefetch distance one tile: K/V(first) g2r before the loop; iteration `tile` waits
+    for K/V(tile), runs QK, the online softmax and PV, then issues g2r K/V(tile + BN).
+    """
     head, batch, qb = fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")), fx.Int32(gpu.block_id("z"))
     lane = fx.Int32(gpu.thread_id("x"))
     q0 = _uniform(CQ[batch])
@@ -279,13 +267,13 @@ def _swa_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.
         row = qstart + (lane & 15)
         hkv = head // (H // HK)
         table = fx.make_view(fx.get_iter(PAGES) + fx.Int64(start), fx.make_layout(pages, 1))
-        gq = _resource(fx.make_view(fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(qstart)) * QROW + fx.Int64(head) * QHEAD),
+        gq = resource(fx.make_view(fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(qstart)) * QROW + fx.Int64(head) * QHEAD),
                                      fx.make_layout(BM * QROW, 1)), valid_q * QROW * 2)
-        gk = _resource(fx.make_view(fx.get_iter(K) + (fx.Int64(hkv) * PAGE * DQ),
+        gk = resource(fx.make_view(fx.get_iter(K) + (fx.Int64(hkv) * PAGE * DQ),
                                      fx.make_layout((NP * HK - hkv) * PAGE * DQ, 1)), (NP * HK - hkv) * PAGE * DQ * 2)
-        gv = _resource(fx.make_view(fx.get_iter(V) + (fx.Int64(hkv) * PAGE * DV),
+        gv = resource(fx.make_view(fx.get_iter(V) + (fx.Int64(hkv) * PAGE * DV),
                                      fx.make_layout((NP * HK - hkv) * PAGE * DV, 1)), (NP * HK - hkv) * PAGE * DV * 2)
-        q = _q_load(gq, lane, DQ, QROW, ARCH)
+        q = _read_q_g2r(gq, lane, DQ, QROW, ARCH)
         scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
         if fx.const_expr(PER_TOKEN):
             scale = scale * rocdl.make_buffer_tensor(QS, max_size=False)[(q0 + row) * H + head]
@@ -301,18 +289,21 @@ def _swa_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.
             total = _exp(sink - maximum) * fx.Float32(0.25)
         wait(vmcnt=0)
         if first < end:
-            page = _page(table, first >> 6)
-            k = _k_load(gk, lane, first, page, DQ, HK, BN)
-            vw = _v_load(gv, lane, first, page, HK, BN)
+            # Prefetch: g2r K/V(first).
+            page = _read_page_g2r(table, first >> 6)
+            k = _read_k_g2r(gk, lane, first, page, DQ, HK, BN)
+            vw = _read_v_g2r(gv, lane, first, page, HK, BN)
             for tile in range(first, end, fx.Int32(BN)):
+                # K/V(tile) land; QK, online softmax and PV of tile.
                 wait(vmcnt=0)
                 vw = _mask_v(vw, lane, tile, kv_len, BN)
                 output, maximum, total = _compute(q, k, vw, output, maximum, total, scale,
                                                   row, tile, kv_len, q_len, WINDOW, BN, DQ, ARCH)
+                # Prefetch: g2r K/V(tile + BN).
                 if tile + BN < end:
-                    page = _page(table, (tile + BN) >> 6)
-                    k = _k_load(gk, lane, tile + BN, page, DQ, HK, BN)
-                    vw = _v_load(gv, lane, tile + BN, page, HK, BN)
+                    page = _read_page_g2r(table, (tile + BN) >> 6)
+                    k = _read_k_g2r(gk, lane, tile + BN, page, DQ, HK, BN)
+                    vw = _read_v_g2r(gv, lane, tile + BN, page, HK, BN)
         outbuf = rocdl.make_buffer_tensor(fx.make_view(
             fx.get_iter(O) + ((fx.Int64(q0) + fx.Int64(qstart)) * OROW + fx.Int64(head) * OHEAD),
             fx.make_layout(BM * OROW, 1)), num_records_bytes=valid_q * OROW * 2)
@@ -358,6 +349,11 @@ def _swa32_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: f
     QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
     WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool],
     WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], BN: fx.Constexpr[int], ARCH: fx.Constexpr[int]):
+    """32 query rows per wave (two 16-row MFMA halves) over the visible KV tiles of BN keys.
+
+    Per tile: g2r K(tile) and wait; g2r V(tile) overlaps QK and both halves' online
+    softmax; wait for V(tile), then PV of both halves.
+    """
     head, batch, qb = fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")), fx.Int32(gpu.block_id("z"))
     lane = fx.Int32(gpu.thread_id("x"))
     q0 = _uniform(CQ[batch])
@@ -371,13 +367,13 @@ def _swa32_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: f
         row = qstart + (lane & 15)
         hkv = head // (H // HK)
         table = fx.make_view(fx.get_iter(PAGES) + fx.Int64(start), fx.make_layout(pages, 1))
-        gq = _resource(fx.make_view(fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(qstart)) * QROW + fx.Int64(head) * QHEAD),
+        gq = resource(fx.make_view(fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(qstart)) * QROW + fx.Int64(head) * QHEAD),
                                      fx.make_layout(32 * QROW, 1)), valid_q * QROW * 2)
-        gk = _resource(fx.make_view(fx.get_iter(K) + (fx.Int64(hkv) * PAGE * DQ),
+        gk = resource(fx.make_view(fx.get_iter(K) + (fx.Int64(hkv) * PAGE * DQ),
                                      fx.make_layout((NP * HK - hkv) * PAGE * DQ, 1)), (NP * HK - hkv) * PAGE * DQ * 2)
-        gv = _resource(fx.make_view(fx.get_iter(V) + (fx.Int64(hkv) * PAGE * DV),
+        gv = resource(fx.make_view(fx.get_iter(V) + (fx.Int64(hkv) * PAGE * DV),
                                      fx.make_layout((NP * HK - hkv) * PAGE * DV, 1)), (NP * HK - hkv) * PAGE * DV * 2)
-        q_lo, q_hi = _q_load(gq, lane, DQ, QROW, ARCH), _q_load(gq, lane, DQ, QROW, ARCH, 16)
+        q_lo, q_hi = _read_q_g2r(gq, lane, DQ, QROW, ARCH), _read_q_g2r(gq, lane, DQ, QROW, ARCH, 16)
         scale0 = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
         scale1 = scale0
         if fx.const_expr(PER_TOKEN):
@@ -397,11 +393,12 @@ def _swa32_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: f
         output0, output1 = fx.Vector.filled(32, 0.0, fx.Float32), fx.Vector.filled(32, 0.0, fx.Float32)
         wait(vmcnt=0)
         for tile in range(first, end, fx.Int32(BN)):
-            page = _page(table, tile >> 6)
-            kw = _k_load(gk, lane, tile, page, DQ, HK, BN)
+            # g2r K(tile); g2r V(tile) is issued once K landed and overlaps QK/softmax.
+            page = _read_page_g2r(table, tile >> 6)
+            kw = _read_k_g2r(gk, lane, tile, page, DQ, HK, BN)
             wait(vmcnt=0)
             rocdl.sched_barrier(0)
-            vw = _v_load(gv, lane, tile, page, HK, BN)
+            vw = _read_v_g2r(gv, lane, tile, page, HK, BN)
             score0, score1 = _qk_pair(q_lo, q_hi, kw, DQ, BN, ARCH)
             p0, output0, maximum0, total0 = _softmax_tile(score0, output0, maximum0, total0, scale0,
                                                         row, tile, kv_len, q_len, WINDOW, BN, ARCH)

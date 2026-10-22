@@ -1,16 +1,9 @@
-"""Small, local FlyDSL 0.2/0.3 compatibility helpers (no global patching)."""
+"""Small, local FlyDSL layout and buffer adapters of the gfx950 and SWA kernels (no global patching)."""
 
 import flydsl.expr as fx
 from flydsl.expr import rocdl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-
-
-def static_view(value):
-    """Materialize type-known layout metadata instead of a deep layout DAG."""
-    if isinstance(value, fx.Tensor) and value.type.layout.is_static:
-        return fx.make_view(fx.get_iter(value), fx.static(value.type.layout))
-    return value
 
 
 def select(value, indices):
@@ -25,29 +18,6 @@ def select(value, indices):
             layout = fx.make_layout(fx.select(value.shape, indices), fx.select(value.stride, indices))
         return fx.make_view(fx.get_iter(value), layout)
     return fx.select(value, indices)
-
-
-def group(value, begin, end):
-    if isinstance(value, fx.Tensor):
-        if value.shape.is_static and value.stride.is_static:
-            shape, stride = value.shape.to_py_value(), value.stride.to_py_value()
-            grouped = lambda x: tuple(x[:begin]) + (tuple(x[begin:end]),) + tuple(x[end:])
-            return fx.make_view(fx.get_iter(value), fx.make_layout(grouped(shape), grouped(stride)))
-        return fx.make_view(fx.get_iter(value), fx.make_layout(
-            fx.group(value.shape, begin, end), fx.group(value.stride, begin, end)))
-    return fx.group(value, begin, end)
-
-
-def composition(value, tiler):
-    if isinstance(value, fx.Tensor):
-        return static_view(fx.make_view(fx.get_iter(value), fx.composition(value.layout, tiler)))
-    return fx.composition(value, tiler)
-
-
-def flat_divide(value, divisor):
-    if isinstance(value, fx.Tensor):
-        return static_view(fx.make_view(fx.get_iter(value), fx.flat_divide(value.layout, divisor)))
-    return fx.flat_divide(value, divisor)
 
 
 def rmem(shape, dtype):

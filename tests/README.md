@@ -10,6 +10,7 @@ tests/
     gemm/           Installed ASM/FlyDSL GEMM variants and split-K
     gr_read/        GRRead correctness tests
     moe/            Installed MoE implementations and cross-backend tests
+    mha/            FlyDSL paged/linear MHA correctness, streams and graph replay
     qsa/            Basic sparse attention/indexer correctness and graph replay
 ```
 
@@ -25,6 +26,10 @@ part of the default regression baseline.
 QSA correctness uses the two test files under [ops/qsa](ops/qsa).
 Capture-free performance and branch comparisons are separate CLI scripts in
 [benchmarks/qsa](../benchmarks/qsa/readme.md); they do not start SGLang services.
+
+MHA correctness uses [ops/mha](ops/mha) (`test_paged.py`, `test_linear.py`;
+select the device with `MHA_TEST_GPU`). Performance and AITER comparisons are in
+[benchmarks/mha](../benchmarks/mha/readme.md).
 
 ## Running
 

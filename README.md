@@ -112,7 +112,7 @@ from repository tests or a test-directory `PYTHONPATH`.
 | [MoE](src/pyhip/ops/moe) | Assembly, FlyDSL, and an Aiter-compatible autotuned API |
 | [Attention](src/pyhip/ops/attention) | Assembly paged attention |
 | [QSA](src/pyhip/ops/qsa/flydsl) | gfx942 BF16 sparse attention and prefill/decode indexer; [usage and benchmarks](benchmarks/qsa/readme.md) |
-| [MHA](src/pyhip/ops/mha/flydsl) | Shared FlyDSL helpers and gfx942 BF16 D256 linear kernel |
+| [MHA](src/pyhip/ops/mha/flydsl) | FlyDSL paged attention (gfx942 BF16/FP8, gfx950 BF16, SWA) and gfx942 BF16 D256 varlen attention; [usage and benchmarks](benchmarks/mha/readme.md) |
 | [Convolution](src/pyhip/ops/conv) | HIP depthwise and assembly/Gluon pointwise implementations |
 | [GRRead](src/pyhip/ops/gr_read) | FlyDSL down/up projections |
 
