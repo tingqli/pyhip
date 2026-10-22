@@ -10,6 +10,7 @@ churn; their function arguments are CLI inputs, not pytest fixtures.
 - [attention](attention/): paged-attention correctness/timing script.
 - [gr_read](gr_read/readme.md): decode/prefill performance, frozen baselines, integration examples and Markdown reports.
 - [QSA](qsa/readme.md): capture-free attention branch comparisons and after-projection indexer timing; basic operator tests live under [tests/ops/qsa](../tests/ops/qsa).
+- [MHA](mha/readme.md): paged BF16/FP8/SWA and D256 varlen attention accuracy and performance, with AITER comparisons and integration notes; unit tests live under [tests/ops/mha](../tests/ops/mha).
 
 Run with the same Python environment used to install PyHIP:
 
