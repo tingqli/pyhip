@@ -18,6 +18,8 @@ Here s0/s1 denote slice0/slice1; left/right mean gate/up.
 Each phase interleaves old-partial FP32 FMA with independent new MFMA.
 DMA and wait placement follows the aiter blockscale GEMM's split-M schedule;
 each A half loads both A64xK128 M-slice entries together, one DMA each.
+With k_rotate, expert e walks its K tiles from tile e % KB (wrapping), so
+concurrent workgroups do not request the same K column in lockstep.
 Workgroups use 256-WG XCD batches, with no M grouping by default.
 I must be a multiple of 128 and K a multiple of 256 (at least 256).
 The module is importable; CLI modes include --small-accuracy, --accuracy,
@@ -103,6 +105,7 @@ def compile_fp8_stage1_giu1(
     *,
     xcd_swizzle=True,
     group_size_m=1,
+    k_rotate=True,
 ):
     """Build a half-M, single-FIFO kernel for AIter-native FP8 weight bytes.
 
@@ -207,11 +210,15 @@ def compile_fp8_stage1_giu1(
         )
         expert = fx.Int32(rocdl.readfirstlane(T.i32, arith._to_raw(expert)))
         a_rsrc = _buffer_resource(arg_a, fx.Int64(num_tokens) * hidden_size)
-        b_rsrc = _buffer_resource(
-            arg_b,
-            2 * intermediate_size * hidden_size,
-            fx.Int64(expert) * (2 * intermediate_size * hidden_size),
+        b_slab = BLOCK_N * hidden_size
+        b_gate_base = fx.Int64(expert) * (2 * intermediate_size * hidden_size) + (
+            fx.Int64(n_tile) * b_slab
         )
+        b_gate_rsrc = _buffer_resource(arg_b, b_slab, b_gate_base)
+        b_up_rsrc = _buffer_resource(
+            arg_b, b_slab, b_gate_base + intermediate_size * hidden_size
+        )
+        k_off = expert % kb_count
         scale_a_rsrc = _buffer_resource(
             arg_scale_a, fx.Int64(num_tokens) * (kb_count * 4)
         )
@@ -338,13 +345,7 @@ def compile_fp8_stage1_giu1(
         )
 
         def b_dma_ptrs(views):
-            return [
-                [
-                    _lds_byte_ptr(fx.get_iter(view), b_wave_base + chunk * 1024)
-                    for chunk in range_constexpr(2)
-                ]
-                for view in views
-            ]
+            return [_lds_byte_ptr(fx.get_iter(view), b_wave_base) for view in views]
 
         bl_dma = b_dma_ptrs(b_gate)
         br_dma = b_dma_ptrs(b_up)
@@ -357,45 +358,60 @@ def compile_fp8_stage1_giu1(
         # A wave copies an N16/K64 slab, two slabs cover K128. No host-side
         # weight conversion; the matching LDS view preserves MFMA operands.
         b_voffset = fx.Int32(wave_id * (16 * hidden_size) + lane_id * 16)
-        b_gate_base = n_tile * (BLOCK_N * hidden_size)
-        b_up_base = b_gate_base + intermediate_size * hidden_size
 
-        def raw_g2s_a(lds_dst, voffset, ki):
+        def k_tile(ki):
+            if const_expr(not k_rotate):
+                return ki
+            t = k_off + ki
+            return (t < kb_count).select(t, t - kb_count)
+
+        def tile_soffset(ki, tile_bytes):
+            # Prefetches past the last K tile are all-lane OOB and move no data.
+            value = fx.Int32(k_tile(ki) * tile_bytes)
+            if const_expr(isinstance(ki, int)):
+                return value
+            return (ki < kb_count).select(value, fx.Int32(-1))
+
+        def raw_g2s_a(lds_dst, voffset, soffset):
             rocdl.raw_ptr_buffer_load_lds(
                 a_rsrc,
                 lds_dst,
                 fx.Int32(16),
                 voffset,
-                fx.Int32(ki * BLOCK_K),
+                soffset,
                 fx.Int32(0),
                 fx.Int32(0),
             )
 
         def async_copy_At(lds_idx, ki):
+            soffset = tile_soffset(ki, BLOCK_K)
             for m_slice in range_constexpr(2):
-                raw_g2s_a(at_dma[lds_idx][m_slice], a_voffsets[0][m_slice], ki)
+                raw_g2s_a(at_dma[lds_idx][m_slice], a_voffsets[0][m_slice], soffset)
 
         def async_copy_Ab(lds_idx, ki):
+            soffset = tile_soffset(ki, BLOCK_K)
             for m_slice in range_constexpr(2):
-                raw_g2s_a(ab_dma[lds_idx][m_slice], a_voffsets[1][m_slice], ki)
+                raw_g2s_a(ab_dma[lds_idx][m_slice], a_voffsets[1][m_slice], soffset)
 
-        def raw_g2s_b(lds_dst, src_base, ki):
+        def raw_g2s_b(rsrc, lds_dst, ki):
+            soffset = tile_soffset(ki, BLOCK_K * 16)
             for chunk in range_constexpr(2):
+                # The immediate offset advances both the global and the LDS address.
                 rocdl.raw_ptr_buffer_load_lds(
-                    b_rsrc,
-                    lds_dst[chunk],
+                    rsrc,
+                    lds_dst,
                     fx.Int32(16),
                     b_voffset,
-                    fx.Int32(src_base + ki * (BLOCK_K * 16) + chunk * 1024),
-                    fx.Int32(0),
+                    soffset,
+                    fx.Int32(chunk * 1024),
                     fx.Int32(0),
                 )
 
         def async_copy_Bl(lds_idx, ki):
-            raw_g2s_b(bl_dma[lds_idx], b_gate_base, ki)
+            raw_g2s_b(b_gate_rsrc, bl_dma[lds_idx], ki)
 
         def async_copy_Br(lds_idx, ki):
-            raw_g2s_b(br_dma[lds_idx], b_up_base, ki)
+            raw_g2s_b(b_up_rsrc, br_dma[lds_idx], ki)
 
         def async_copy_scale_a(lds_idx, ki):
             rocdl.raw_ptr_buffer_load_lds(
@@ -403,7 +419,7 @@ def compile_fp8_stage1_giu1(
                 scale_dma[lds_idx],
                 fx.Int32(4),
                 scale_a_voffset,
-                fx.Int32(ki * num_tokens * 4),
+                tile_soffset(ki, num_tokens * 4),
                 fx.Int32(0),
                 fx.Int32(0),
             )
@@ -437,7 +453,7 @@ def compile_fp8_stage1_giu1(
             return Vec.from_elements(values, Float32)
 
         def load_scale_b(ki):
-            offset = fx.Int32((n_tile * kb_count + ki) * 4)
+            offset = fx.Int32((n_tile * kb_count + k_tile(ki)) * 4)
             result = _llvm.inline_asm(
                 ir.Type.parse("!llvm.struct<(f32, f32)>"),
                 [
@@ -1108,6 +1124,7 @@ def run_case(
     data_case="random",
     xcd_swizzle=True,
     group_size_m=1,
+    k_rotate="auto",
     benchmark=False,
     compare_jit=False,
     warmup=5,
@@ -1133,6 +1150,9 @@ def run_case(
         (tokens, topk, intermediate_size), device="cuda", dtype=torch.bfloat16
     )
     args = make_launch_args(inputs, output)
+    if k_rotate == "auto":
+        # Measured: rotation wins with <= 2 blocks per expert, costs a little beyond.
+        k_rotate = inputs["expert_ids"].numel() <= 2 * num_experts
     launcher = compile_fp8_stage1_giu1(
         intermediate_size,
         hidden_size,
@@ -1140,6 +1160,7 @@ def run_case(
         num_experts,
         xcd_swizzle=xcd_swizzle,
         group_size_m=group_size_m,
+        k_rotate=k_rotate in (True, "on"),
     )
     kernel = flyc.compile[{"opt_level": 2}](launcher, *args)
     reference = stage1_reference(inputs, intermediate_size)
@@ -1178,6 +1199,7 @@ def run_case(
         "data_case": data_case,
         "xcd_swizzle": xcd_swizzle,
         "group_size_m": group_size_m,
+        "k_rotate": k_rotate in (True, "on"),
         "valid_routes": tokens * topk,
         "padded_routes": inputs["sorted_ids"].numel(),
         "correct": True,
@@ -1346,6 +1368,8 @@ def main():
     )
     parser.add_argument("--no-xcd-swizzle", action="store_true")
     parser.add_argument("--group-size-m", type=int, default=1)
+    # Per-expert K start rotation; auto enables it for <= 2 blocks per expert.
+    parser.add_argument("--k-rotate", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--data-clones", type=int, default=4)
@@ -1362,7 +1386,11 @@ def main():
         raise RuntimeError("FP8 MFMA requires gfx950")
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
-    common = {"xcd_swizzle": not args.no_xcd_swizzle, "group_size_m": args.group_size_m}
+    common = {
+        "xcd_swizzle": not args.no_xcd_swizzle,
+        "group_size_m": args.group_size_m,
+        "k_rotate": args.k_rotate,
+    }
     if args.accuracy_matrix:
         cases = [
             (96, 128, 256, 2, 3, "balanced", "random"),
