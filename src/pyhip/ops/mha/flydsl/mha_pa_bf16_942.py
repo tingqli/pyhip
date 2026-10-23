@@ -15,6 +15,7 @@ mha_pa_bf16_256_linear_942 (no KV conversion).
 
 import functools
 import math
+import os
 import weakref
 from numbers import Real
 
@@ -36,6 +37,8 @@ BM, BN, THREADS = 256, 64, 512
 PADDED_CHUNK = 1040
 V_SLOT = 16640  # one DV128 V tile: 16 padded 1040-byte chunks
 LOG2E = math.log2(math.e)
+# P to BF16: RNE like O, or ties away from zero ("1": one VALU less per value in QK-high). Read at import.
+_P_BF16_RTA = os.environ.get("AITER_FLYDSL_MHA_P_BF16_RTA", "0").lower() in ("1", "true")
 
 
 def _cross32_async(value, address):
@@ -46,8 +49,8 @@ def _cross32_async(value, address):
 
 
 def _pack_probability(values):
-    # P uses the established BF16 round-half-up contract. Packing each pair
-    # directly avoids materializing 32 RNE tie bits during the QK-high stage.
+    if not _P_BF16_RTA:
+        return _pack_bf16(values).bitcast(fx.BFloat16)
     bits = fx.Vector(values).bitcast(fx.Uint32) + fx.Uint32(0x8000)
     selector = fx.Int32(0x07060302)
     words = [fx.Int32(llvm.inline_asm(

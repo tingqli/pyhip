@@ -375,7 +375,7 @@ body(task):
         DMA V(t−1)进V区，同时从LDS读K(t)的lo半 → lo = QK
         P = exp2(P − m)                         # 上一步的未归一化概率（一条FMA S·scale − m在logit近1e11时差上千）
         读K(t)的hi半 → hi = QK；S = mask(lo‖hi, bits(t))
-        P16 = BF16(P)                           # +0x8000后取高16位（四舍五入）
+        P16 = BF16(P)                           # RNE（_pack_bf16，与O相同）
         DMA K(t+1)进K区，同时从LDS读V(t−1)的前128维，用perm_b32转成PV的A操作数（每lane：1维 × 4个token）
         O[:, 0:128] += V^T·P16^T                # 4个16-token段 × 8条MFMA 16×16×16
         l += P的行和（lane内16个求和，再加同行另外3个lane的）；cand = S的lane内最大值

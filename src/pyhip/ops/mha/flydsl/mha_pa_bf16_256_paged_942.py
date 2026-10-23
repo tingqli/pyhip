@@ -19,7 +19,7 @@ from flydsl.expr import gpu, rocdl
 
 from ._common import (
     BM, BN, D, K_BYTES, LDS_BYTES, LOG2E, THREADS,
-    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _mask, _max, _maximum, _min, _pack,
+    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _mask, _max, _maximum, _min,
     _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _pv, _qk, _read_address, _read_page_g2r,
     _read_q_g2r, _rescale, _scale, _schedule, _schedule_exps, _stage_end, _sum, _uniform, _v_tail, _wait,
 )
@@ -209,7 +209,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     """
     # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
     _helpers = (_read_k_packet_g2s, _read_k_s2r, _read_v_s2r, _read_k_s2r_v_g2s, _read_v_s2r_k_g2s,
-                _read_v_packet_g2s, _v_tile_resources, _qk, _pv, _sum, _max, _cross, _scale, _exps, _pack,
+                _read_v_packet_g2s, _v_tile_resources, _qk, _pv, _sum, _max, _cross, _scale, _exps, _pack_bf16,
                 _mask, _v_tail, _rescale, _advance_max, _join, _maximum, _pin, _schedule, _schedule_exps,
                 _stage_end, _wait)
     tid = fx.Int32(gpu.thread_id("x"))
@@ -327,7 +327,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         # Step 1 compute: QK S(t) keys 32-63; row sum of P(t-1), P to BF16.
         s_hi = _qk(q, k_hi)
         lane_sum = _sum(p_prev)
-        p_bf16 = _pack(p_prev)
+        p_bf16 = _pack_bf16(p_prev).bitcast(fx.BFloat16)
         _schedule(32, 3, 2)
         _stage_end()
         # Step 2 memory: exchange row sums; g2s K(t+1) between the s2r of V(t-1) dims 0-127.
@@ -375,7 +375,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         lane_sum = lane_sum + lane_sum.shuffle_xor(16, 64)
         lane_sum = lane_sum + lane_sum.shuffle_xor(32, 64)
         row_sum = fx.Float32(row_sum) + lane_sum
-        p_bf16 = _pack(p_last)
+        p_bf16 = _pack_bf16(p_last).bitcast(fx.BFloat16)
         _wait(vmcnt=0, lgkmcnt=0)
         _stage_end()
         _stage_end()

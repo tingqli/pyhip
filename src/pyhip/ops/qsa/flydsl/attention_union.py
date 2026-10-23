@@ -231,7 +231,7 @@ def _body(
     dma_offsets, v_operands = linear._dma_offsets, linear._v_operands
     source_rows, output_fn = _source_rows, _output
     qk, local_sum, local_max, cross = base._qk, base._sum, base._max, base._cross
-    exps, pack, scale_scores = base._exps, base._pack, base._scale
+    exps, pack, scale_scores = base._exps, _pack_bf16, base._scale
     rescale, advance_max = _rescale, _advance_max
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
@@ -425,7 +425,7 @@ def _body(
         rocdl.sched_barrier(0)
         hi = qk(q, k)
         current = _apply_mask(_join(lo, hi), bits)
-        total, probabilities = local_sum(previous), pack(previous)
+        total, probabilities = local_sum(previous), pack(previous).bitcast(fx.BFloat16)
         offsets = dma_offsets(next_rows, 4)
         _schedule(32, 2, 2)
         _stage_end()
@@ -511,7 +511,7 @@ def _body(
     total = total + total.shuffle_xor(16, 64)
     total = total + total.shuffle_xor(32, 64)
     row_sum = fx.Float32(row_sum) + total
-    probabilities = pack(scores)
+    probabilities = pack(scores).bitcast(fx.BFloat16)
     _wait(vmcnt=0, lgkmcnt=0)
     _stage_end()
     _stage_end()

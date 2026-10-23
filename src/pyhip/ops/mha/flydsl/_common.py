@@ -93,10 +93,14 @@ def _advance_max(old, new):
 
 
 def _pack_bf16(values):
-    # gfx942 has no native packed FP32 -> BF16 instruction; software RNE for O.
+    # gfx942 has no native packed FP32 -> BF16 instruction; software RNE for P and O (NaN not quieted).
     bits = fx.Vector(values).bitcast(fx.Uint32)
     rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
-    words = [(rounded[i] >> 16) | (rounded[i + 1] & fx.Uint32(0xFFFF0000))
+    # One opaque v_perm_b32 per pair (element i in the low half); rocdl.perm_b32 cost BF16 942 up to 28%.
+    selector = fx.Int32(0x07060302)
+    words = [fx.Uint32(llvm.inline_asm(fx.Int32.ir_type, [rounded[i + 1].ir_value(), rounded[i].ir_value(),
+                                                          selector.ir_value()],
+                                       "v_perm_b32 $0, $1, $2, $3", "=v,v,v,s", has_side_effects=True))
              for i in range(0, values.numel, 2)]
     return fx.Vector.from_elements(words, fx.Uint32)
 
@@ -340,16 +344,6 @@ def _scale(values, scale):
 
 def _exps(values, maximum):
     return fx.Vector.from_elements([_exp(values[i] - maximum) for i in range(16)], fx.Float32)
-
-
-def _pack(values):
-    """P to BF16 (round half up) with one v_perm_b32 per pair."""
-    bits = fx.Vector(values).bitcast(fx.Uint32) + fx.Uint32(0x8000)
-    selector = fx.Int32(0x07060302)
-    words = [fx.Int32(llvm.inline_asm(fx.Int32.ir_type,
-        [bits[i + 1].ir_value(), bits[i].ir_value(), selector.ir_value()],
-        "v_perm_b32 $0, $1, $2, $3", "=v,v,v,s", has_side_effects=True)) for i in range(0, 16, 2)]
-    return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.BFloat16)
 
 
 @flyc.jit

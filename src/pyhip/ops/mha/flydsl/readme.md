@@ -143,7 +143,10 @@ S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
   直接改成先舍入再减m（每个分数多一条VALU）实测D128 −4.4%、D192 −3.5%、D128带LSE −2.7%；
   两个分支合并为一个时V192（已溢出到scratch）因多一次dwordx4溢出慢5%。
 - D128每次循环展开两个phase，使`cur/prev`成为常量；D192每次一个phase，槽号由t计算。
-- O按`O/l·v_descale`转BF16（软件RNE，`_pack_bf16`），由`_store_o_tile_r2g`写回。
+- P与O都用`_pack_bf16`转BF16（软件RNE，NaN不规范化）；O按`O/l·v_descale`转换，由`_store_o_tile_r2g`写回。
+  RNE比`+0x8000`（舍入到最近、平局远离零，RTA）每个P多一条VALU，落在VALU已满的S3：相对RTA，D128慢3.8%、
+  causal 4.4%、LSE 4.9%、V192 3.5%、D192 0.6%、[164800, 7, 128] 1.7%。import前设置环境变量
+  `AITER_FLYDSL_MHA_P_BF16_RTA=1`可让本kernel的P改用RTA（主循环与改动前逐条相同，输出逐位一致）；两种舍入只在恰好的平局上不同。
 
 `_body_wide`（LSE或V192）用协作拷贝（cooperative g2r→r2s），行和/行最大值在compute stage用lane shuffle归约，
 其余阶段角色相同；S6读V的64–Dv维，S7完成其余PV。
@@ -305,13 +308,14 @@ S7     PV: O dims 64-127 += P V    softmax: l += row sum, S'(t); rescale O and l
    `_stage_end`（`sched_barrier`+`s_barrier`+`sched_barrier`，不是内存等待）、`_wait`（显式`s_waitcnt`编码）、
    `_schedule`/`_schedule_exps`（`sched_group_barrier`交错MFMA与VALU/TRANS；后者每步先减m再exp）、`_read_page_g2r`/`_page_ready`
    （s_load页号；等待与第一次读取放在同一段asm，避免RA在等待前复制尚未到达的SGPR）、`_buffer`/`_buffer_words`、
-   `_read_address`（`ds_read_b128`）、`_rescale`。
+   `_read_address`（`ds_read_b128`）、`_rescale`、`_pack_bf16`（P与O转BF16：`bits + 0x7FFF + lsb`的软件RNE，
+   每对一条`v_perm_b32`拼高半；不规范化NaN，gfx950用硬件`v_cvt_pk_bf16_f32`）。
 2. BM256 32×32 softmax：`_row_max_local`/`_row_max`、`_row_sum_local`/`_row_sum`、`_center_part`（FMA `S·scale − m`）、
    `_reround`/`_reround_if`（把S'舍入到ulp(m)的整数倍，|m| ≥ 2^22后的精确规则）、`_exp_part`（`exp2(S')`）、
    `_mfma_hazard_wait`（MFMA结果被inline asm读取前`s_nop 10`：gfx942 32×32 MFMA需要NumPasses(8)+3个等待周期，
    LLVM hazard recognizer不保护inline asm消费者）。
 3. D256几何与16×16 MFMA片段：`_mma`、`_read_q_g2r`、`_qk`、`_pv`、`_sum`、`_max`（用`llvm.maxnum`让MFMA→max依赖对LLVM可见；
-   曾经的不透明max树在grid重复逐位检查中失败）、`_cross`（`ds_bpermute`交换）、`_scale`、`_exps`（`exp2(S' − m)`）、`_pack`、`_mask`、`_v_tail`。
+   曾经的不透明max树在grid重复逐位检查中失败）、`_cross`（`ds_bpermute`交换）、`_scale`、`_exps`（`exp2(S' − m)`）、`_mask`、`_v_tail`。
 
 **FlyDSL磁盘缓存注意**：缓存key只扫描函数自身`co_names`引用的helper（及闭包标量），不扫描嵌套闭包里引用的helper。
 因此每个含闭包的主体开头都有`_helpers = (...)`元组，列出闭包用到的helper，使修改它们会改变缓存key。

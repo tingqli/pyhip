@@ -21,7 +21,7 @@ from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 from ._common import (
-    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _mask, _max, _maximum, _min, _pack,
+    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _mask, _max, _maximum, _min,
     _pack_bf16, _pin, _pin_i32, _qk, _read_address, _read_q_g2r, _rescale, _scale, _schedule, _schedule_exps,
     _stage_end, _sum, _uniform, _wait,
 )
@@ -182,12 +182,16 @@ def _v_operands(values, step, progressive):
 
 
 def _pack_probabilities(values):
-    # Identical half-up BF16 bits to _common._pack; expose permute dependencies
-    # only in the static linear specialization, where scheduling benefits.
-    bits = fx.Vector(values).bitcast(fx.Uint32) + fx.Uint32(0x8000)
-    words = [fx.Int32(rocdl.perm_b32(bits[i + 1].ir_value(), bits[i].ir_value(),
+    # The RNE bits of _common._pack_bf16; exposing the permutes helps only the static specialization.
+    bits = fx.Vector(values).bitcast(fx.Uint32)
+    rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
+    words = [fx.Int32(rocdl.perm_b32(rounded[i + 1].ir_value(), rounded[i].ir_value(),
                                    fx.Int32(0x07060302).ir_value())) for i in range(0, 16, 2)]
     return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.BFloat16)
+
+
+def _pack(values):
+    return _pack_bf16(values).bitcast(fx.BFloat16)
 
 
 def _pv(probabilities, values, output, progressive=False, prepared=None, center_args=None, summary_args=None, steps=4):
