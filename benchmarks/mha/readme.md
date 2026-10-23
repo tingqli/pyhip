@@ -142,6 +142,10 @@ PYTHONPATH=src python3 -m pytest benchmarks/mha/test_mha.py -s      # 各suite�
 cudaPerf事件计时（每次计时前GPU spin 2 ms），10 buffer×5轮=50样本的中位数；时间单位µs，TFLOPS只计可见QK/PV。
 `persistent`/`grid`为同一kernel的两种调度，加速比为相对AITER。全部候选精度检查通过（BF16 acc约2–3e-6，FP8约3e-4）。
 
+此后按aiter PR #6576评审意见修复极端logit（见[源码readme第12节](../../src/pyhip/ops/mha/flydsl/readme.md)）：
+BF16 D128/D192分页、FP8与SWA的输出与改动前逐位一致，交替A/B耗时变化在±1.1%以内（FP8 causal D128快2.1%），
+D256分页/linear在±0.3%以内，复用D256 helper的QSA union kernel快约2%；下表未重测。
+
 ### 3.1 BF16分页（`bf16-mha`，B1）
 
 | case | 形状（Q/KV，H/HK，Dq/Dv，page） | persistent | grid | AITER | 加速比 |
@@ -166,15 +170,21 @@ cudaPerf事件计时（每次计时前GPU spin 2 ms），10 buffer×5轮=50样�
 
 ### 3.2 FP8分页（`fp8-mha`，自有kernel）
 
-| case | 形状（Q/KV，H/HK，Dq，Q scale） | µs | TFLOPS |
-|---|---|---:|---:|
-| fp8-full-token-d128 | 10240/2583，16/1，128，per-token | 649.2 | 333.7 |
-| fp8-full-token-d192 | 10240/2583，16/1，192，per-token | 681.6 | 397.4 |
-| fp8-causal-token-d128 | 32768/32768，16/1，128，per-token，causal | 16376 | 268.6 |
-| fp8-causal-token-d192 | 32768/32768，16/1，192，per-token，causal | 17388 | 316.2 |
-| fp8-full-tensor-d128 | 10240/2560，8/1，128，per-tensor | 313.1 | 343.0 |
-| fp8-full-tensor-d192 | 10240/2560，16/1，192，per-tensor | 659.3 | 407.2 |
-| fp8-causal-tensor-d192 | 32768/32768，16/1，192，per-tensor，causal | 17410 | 315.8 |
+2026-10-22 FP8 VALU重排后在GPU 7同址重测（GPU 0–5当时有外部负载），“改前”为同GPU、同协议的旧kernel；
+输出与改前逐位一致。原始数据：`mytest/mydata/mha_shape_164800_h7_20261022/bench_fp8_{orig,v7}/result.json`。
+
+| case | 形状（Q/KV，H/HK，Dq，Q scale） | 改前µs（TFLOPS） | 当前µs（TFLOPS） | 提升 |
+|---|---|---:|---:|---:|
+| fp8-full-token-d128 | 10240/2583，16/1，128，per-token | 649.5（333.6T） | 574.4（377.2T） | +13.1% |
+| fp8-full-token-d192 | 10240/2583，16/1，192，per-token | 682.5（396.8T） | 660.6（410.0T） | +3.3% |
+| fp8-causal-token-d128 | 32768/32768，16/1，128，per-token，causal | 16414（268.0T） | 14357（306.4T） | +14.3% |
+| fp8-causal-token-d192 | 32768/32768，16/1，192，per-token，causal | 17450（315.1T） | 15342（358.3T） | +13.7% |
+| fp8-full-tensor-d128 | 10240/2560，8/1，128，per-tensor | 313.6（342.4T） | 274.9（390.6T） | +14.1% |
+| fp8-full-tensor-d192 | 10240/2560，16/1，192，per-tensor | 659.9（406.8T） | 635.6（422.4T） | +3.8% |
+| fp8-causal-tensor-d192 | 32768/32768，16/1，192，per-tensor，causal | 17489（314.4T） | 15339（358.4T） | +14.0% |
+
+长序列持续负载（[164800, 7, 128]全MHA，空闲5 s、预热3次后50次背靠背取平均，GPU 7）：per-token/per-tensor均为
+382.7/381.2T→405.9T。此时功耗约630 W、时钟1.78→1.71 GHz，受功耗上限限制；同条件hipBLASLt FP8 GEMM 16384³为399.2T。
 
 ### 3.3 SWA（`swa`，causal，W128，sink，Q16384，H16/1）
 

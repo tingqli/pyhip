@@ -18,8 +18,9 @@ from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 from ._common import (
-    _buffer, _center_part, _exp, _exp_part, _join, _maximum, _mfma_hazard_wait, _min, _pack_bf16,
-    _pin, _pin_i32, _read_page_g2r, _row_max, _row_sum, _schedule, _stage_end, _uniform, _wait,
+    _MAX_FLOOR, _buffer, _center_part, _exp, _exp_part, _join, _max3, _maximum, _mfma_hazard_wait, _min,
+    _pack_bf16, _pin, _pin_i32, _read_page_g2r, _reround_if, _row_max, _row_sum, _schedule, _softmax_scale,
+    _stage_end, _uniform, _wait,
 )
 
 BM, BN, DV, THREADS = 256, 64, 128, 512
@@ -35,13 +36,141 @@ def _page_ready_tied(value):
                                   "s_waitcnt lgkmcnt(0)", "=s,0", has_side_effects=True))
 
 
-def _pack_probability(values, dtype):
+def _pack_step(values, k):
+    """FP8 words 2k and 2k + 1 of P (values 8k .. 8k + 7): the PV B operand of K-step k."""
     words = []
-    for i in range(0, 32, 4):
-        lo = rocdl.cvt_pk_fp8_f32(fx.Int32.ir_type, values[i], values[i + 1], fx.Int32(0), False)
+    for i in (8 * k, 8 * k + 4):
+        # The high-half conversion overwrites bits 16-31, so the low one needs no zeroed input.
+        lo = rocdl.cvt_pk_fp8_f32(fx.Int32.ir_type, values[i], values[i + 1], llvm.mlir_poison(fx.Int32.ir_type), False)
         hi = rocdl.cvt_pk_fp8_f32(fx.Int32.ir_type, values[i + 2], values[i + 3], lo, True)
         words.append(fx.Int32(hi))
+    return words
+
+
+def _pack_probability(values, dtype):
+    words = [word for k in range(4) for word in _pack_step(values, k)]
     return _pin(fx.Vector.from_elements(words, fx.Int32).bitcast(dtype))
+
+
+def _mfma(a_words, b_words, acc):
+    a = fx.Vector.from_elements(list(a_words), fx.Int32).bitcast(fx.Int64)[0]
+    b = fx.Vector.from_elements(list(b_words), fx.Int32).bitcast(fx.Int64)[0]
+    return fx.Vector(rocdl.mfma_f32_32x32x16_fp8_fp8_(ir.VectorType.get([16], fx.Float32.ir_type), a.ir_value(),
+                                                     b.ir_value(), fx.Vector(acc).ir_value(), 0, 0,
+                                                     rocdl._blgp_attr(0)))
+
+
+def _add(a, b):
+    # Opaque scalar add: SLP would form v_pk_add_f32, which waits for in-flight MFMAs.
+    return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [fx.Float32(a).ir_value(), fx.Float32(b).ir_value()],
+                                    "v_add_f32 $0, $1, $2", "=v,v,v", has_side_effects=False))
+
+
+def _max_tree(values):
+    """_row_max_local, one MAX3 per step; the last step yields the lane's row max."""
+    p = []
+    for i in range(0, 30, 3):
+        p.append(_max3(values[i], values[i + 1], values[i + 2]))
+        yield None
+    q = []
+    for i in range(0, 9, 3):
+        q.append(_max3(p[i], p[i + 1], p[i + 2]))
+        yield None
+    b = _max3(p[9], values[30], values[31])
+    yield None
+    a = _max3(q[0], q[1], q[2])
+    yield None
+    yield _max3(a, b, fx.Float32(_MAX_FLOOR))
+
+
+def _sum_tree(values):
+    """_row_sum_local, one add per step; the last step yields the lane's row sum."""
+    partials = []
+    for i in range(0, 32, 2):
+        partials.append(_add(values[i], values[i + 1]))
+        yield None
+    for width in (8, 4, 2):
+        merged = []
+        for i in range(width):
+            merged.append(_add(partials[2 * i], partials[2 * i + 1]))
+            yield None
+        partials = merged
+    yield _add(partials[0], partials[1])
+
+
+def _center(value, scale, maximum):
+    return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [value.ir_value(), scale.ir_value(), maximum.ir_value()],
+                                    "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False))
+
+
+def _pv_lo_with_max(p_prev, v_words, o0, o1, s_cur):
+    """S5 in fenced program order: PV MFMAs of dims 0-63 by K-step; the FP8 conversion of the
+    next K-step rides behind the first MFMA and MAX3 of S(t) behind the second, so the tree and
+    its xor32 ds_bpermute issue before the last K-step, which takes the first 16 adds of the
+    row sum of P(t-1). Returns P words, O, the row max and the row-sum generator."""
+    tree = _max_tree(fx.Vector(s_cur))
+    sums = _sum_tree(p_prev)
+    p_words = _pack_step(p_prev, 0)
+    local = other = None
+    for k in range(4):
+        for m in range(2):
+            rocdl.sched_barrier(0)
+            i = 8 * m + 2 * k
+            acc = _mfma((v_words[i], v_words[i + 1]), p_words[2 * k:2 * k + 2], o1 if m else o0)
+            o0, o1 = (o0, acc) if m else (acc, o1)
+            rocdl.sched_barrier(0)
+            if k == 3:
+                for _ in range(8):
+                    next(sums)
+            elif m == 0:
+                p_words += _pack_step(p_prev, k + 1)
+            else:
+                for _ in range(6 if k == 2 else 5):
+                    local = next(tree)
+                if k == 2:
+                    other = local.shuffle_xor(32, 64)
+    row_max = _maximum(local, other)
+    rocdl.sched_barrier(0)
+    return p_words, o0, o1, row_max, sums
+
+
+def _pv_hi_with_sum(p_words, v_words, o2, o3, sums, s_cur, scale, maximum):
+    """S7 in fenced program order: six VALU after each PV MFMA (dims 64-127): the rest of the
+    row sum, its xor32 ds_bpermute, then S'(t). Returns O, the two partial sums and S'(t)."""
+    s_cur = fx.Vector(s_cur)
+    out = {}
+
+    def valu():
+        for _ in range(15):
+            local = next(sums)
+            yield
+        out["local"], out["other"] = local, local.shuffle_xor(32, 64)
+        yield
+        out["centered"] = []
+        for i in range(32):
+            out["centered"].append(_center(s_cur[i], scale, maximum))
+            yield
+
+    ops = valu()
+    for k in range(4):
+        for m in range(2):
+            rocdl.sched_barrier(0)
+            i = 8 * m + 2 * k
+            acc = _mfma((v_words[i], v_words[i + 1]), p_words[2 * k:2 * k + 2], o3 if m else o2)
+            o2, o3 = (o2, acc) if m else (acc, o3)
+            rocdl.sched_barrier(0)
+            for _ in range(6):
+                next(ops)
+    rocdl.sched_barrier(0)
+    centered = _pin(fx.Vector.from_elements(out["centered"], fx.Float32), 32)
+    return o2, o3, out["local"], out["other"], centered
+
+
+def _schedule_qk_exp(dq, group):
+    # Two exponentials (16 issue cycles each) per dependent QK MFMA link; D192 has 12 links for 16.
+    links = dq // 16
+    _schedule(16 - links, 2, group, True)
+    _schedule(2 * links - 16, 1, group, True)
 
 
 def _read_g2r(resource, voffset, soffset, count=4):
@@ -105,14 +234,18 @@ def _read_k_s2r(storage, base, slot, half, dq, dtype):
     return frag
 
 
-def _read_v_s2r(storage, base, slot, half, dq, dtype):
-    """Dims 64 * half .. 64 * half + 63 of the V tile in LDS slot `slot`, as the PV A operand."""
+def _read_v_words(storage, base, slot, half, dq):
+    """Dims 64 * half .. 64 * half + 63 of the V tile in LDS slot `slot`: 16 words, MFMA (k, m) uses 8m + 2k, +1."""
     k_tile = (dq // 16) * PADDED_CHUNK
     parts = [_read_s2r(storage, 2 * k_tile + slot * V_TILE + base + half * PADDED_CHUNK,
                        n * 512 + k * 4160) for n in range(2) for k in range(2)]
-    words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
+    return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
+
+
+def _read_v_s2r(storage, base, slot, half, dq, dtype):
+    """_read_v_words as the PV A operand fragment."""
     frag = fx.make_rmem_tensor(fx.make_layout((8, 4, 2), (1, 8, 32)), dtype)
-    frag.store(words.bitcast(dtype))
+    frag.store(_read_v_words(storage, base, slot, half, dq).bitcast(dtype))
     return frag
 
 
@@ -167,15 +300,30 @@ def _mask(scores, tile, row, q_len, kv_len, causal: fx.Constexpr[bool]):
     return values
 
 
+def _unlikely(condition):
+    # Branch weights: LLVM lays the guarded block out of the fall-through path. One hinted
+    # branch for rescale and exact rule measured +0.6% over the BF16 kernels' two branches.
+    return fx.Boolean(llvm.intr_expect(fx.Boolean(condition).ir_value(), fx.Boolean(False).ir_value()))
+
+
 @flyc.jit
-def _rescale(o0, o1, o2, o3, row_sum, old_max, new_max, ballot):
+def _rescale(o0, o1, o2, o3, row_sum, s_cur, old_max, new_max, ballot, exact):
+    """Lazy rescale of O and l when m moved, plus the exact rule for S'(t).
+
+    The FMA S * scale - m is up to ulp(m) / 2 off the rounded m. Once some |m| >= 2^22
+    (checked when m moves, then sticky), S'(t) is also rounded to a multiple of ulp(m).
+    """
     o0, o1, o2, o3 = fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3)
-    row_sum = fx.Float32(row_sum)
-    if ballot != fx.Int64(0):
-        correction = _exp(fx.Float32(old_max) - fx.Float32(new_max))
-        o0, o1, o2, o3 = o0 * correction, o1 * correction, o2 * correction, o3 * correction
-        row_sum = row_sum * correction
-    return o0, o1, o2, o3, row_sum
+    row_sum, s_cur, ballot, exact = fx.Float32(row_sum), fx.Vector(s_cur), fx.Int64(ballot), fx.Int64(exact)
+    if _unlikely((ballot | exact) != fx.Int64(0)):
+        if ballot != fx.Int64(0):
+            correction = _exp(fx.Float32(old_max) - fx.Float32(new_max))
+            o0, o1, o2, o3 = o0 * correction, o1 * correction, o2 * correction, o3 * correction
+            row_sum = row_sum * correction
+            big = fx.absf(fx.Float32(new_max)) >= 2.0**22
+            exact = exact | fx.Int64(rocdl.ballot(fx.Int64.ir_type, big.ir_value()))
+        s_cur = _reround_if(s_cur, new_max, exact)
+    return o0, o1, o2, o3, row_sum, s_cur, exact
 
 
 def _store_o_tile_r2g(outputs, inv, storage, obuf, out_tid, out_row, heads):
@@ -232,22 +380,33 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
 
     stage  phase t; cur = t & 1, prev = (t - 1) & 1
     S0     s2r K(t) keys 0-31 [cur]; s_load page(t+3); g2r V(t), K(t+2)
-    S1     QK: S(t) keys 0-31          softmax: P(t-1) = exp2(S'(t-1)), values 0-23
+    S1     QK: S(t) keys 0-31          softmax: P(t-1) = exp2(S'(t-1)), values 0-15
     S2     s2r K(t) keys 32-63 [cur]; V(t) lands; r2s V(t) -> [cur]
-    S3     QK: S(t) keys 32-63         softmax: P(t-1) values 24-31, l += row sum, P to FP8
-    S4     s2r V(t-1) dims 0-63 [prev]; K(t+2) lands; r2s K(t+2) -> [cur]
-    S5     PV: O dims 0-63 += P V      softmax: mask S(t), new m, S'(t) values 0..split
-    S6     s2r V(t-1) dims 64-127 [prev]
-    S7     PV: O dims 64-127 += P V    softmax: S'(t) values split..31; rescale O and l
+    S3     QK: S(t) keys 32-63         softmax: P(t-1) values 16-31
+    S4     s2r V(t-1) dims 0-63 [prev]; K(t+2) lands; r2s K(t+2) -> [cur]; mask S(t)
+    S5     PV: O dims 0-63 += P V      softmax: P(t-1) to FP8, row max of S(t), row-sum adds
+    S6     s2r V(t-1) dims 64-127 [prev]; new m
+    S7     PV: O dims 64-127 += P V    softmax: l += row sum, S'(t); rescale O and l
 
-    Softmax in log2 units: S' = S * scale - m, P = exp2(S'), l = sum(P) and O = sum(P V);
-    the output is O / l * v_descale. m moves to a larger row max only when that exceeds
-    m by more than 6 (FP8-FNUZ keeps P finite), rescaling O and l.
+    Compute stages are bound by the VALU issue port (an exp2 takes 16 cycles, a
+    conversion 8): S1/S3 fit two exponentials per link of their dependent QK MFMA
+    chain, and S5/S7 issue the PV MFMAs in fenced program order with the rest of the
+    softmax between them. Memory stages keep only short VALU work, since the other
+    group's compute stage on the same SIMD starves it.
+
+    Softmax in log2 units: S' = S * scale - m (one FMA), P = exp2(S'), l = sum(P) and
+    O = sum(P V); the output is O / l * v_descale. m moves to a larger row max only when
+    that exceeds m by more than 6 (FP8-FNUZ keeps P finite), rescaling O and l. The FMA
+    is up to ulp(m) / 2 off the rounded m: once some |m| >= 2^22 (checked when m moves,
+    then sticky), S7's lazy-rescale branch also rounds S'(t) to a multiple of ulp(m),
+    which matches the D256 kernels' rounded products.
     """
     # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
     _helpers = (_read_kv_g2r, _store_kv_r2s, _read_k_s2r, _read_v_s2r, _page_ready_tied, _qk, _pv, _mask,
                 _v_tail, _join, _mfma_hazard_wait, _maximum, _row_max, _row_sum, _center_part, _exp_part,
-                _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait)
+                _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait, _schedule_qk_exp, _read_v_words,
+                _pack_step, _mfma, _add, _max3, _max_tree, _sum_tree, _center, _pv_lo_with_max, _pv_hi_with_sum,
+                _reround_if)
     dtype = Q.dtype
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
@@ -326,8 +485,11 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         s_hi = _qk(q, k_hi, dtype)
         s_0 = _mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
         _mfma_hazard_wait()
-        row_max = _maximum(_row_max(s_0) * scale, fx.Float32(-1.0e30))
+        row_max = _maximum(_row_max(s_0) * scale, fx.Float32(_MAX_FLOOR))
         s_0 = _center_part(s_0, scale, row_max, 0, 32)
+        # The exact rule of _rescale for S'(0); exact carries it through the phases.
+        exact = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (fx.absf(row_max) >= 2.0**22).ir_value()))
+        s_0 = _reround_if(s_0, row_max, exact)
         row_sum = fx.Float32(0.0)
         _stage_end()
         # Memory: s_load page(3); K(2) g2r and r2s into the retired slot 0.
@@ -338,18 +500,19 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         # lgkmcnt(0) completes the K(2) writes and makes page(3) usable.
         page3 = _page_ready_tied(page3_request)
         _stage_end()
-        return s_0, row_max, row_sum, o0, o1, o2, o3, page0, page1, page2, page3
+        return s_0, row_max, row_sum, o0, o1, o2, o3, page0, page1, page2, page3, exact
 
     @flyc.jit
-    def phase(s_prev, row_max, row_sum, o0, o1, o2, o3, page_prev, page_cur, page_next, page_next2, t,
+    def phase(s_prev, row_max, row_sum, o0, o1, o2, o3, page_prev, page_cur, page_next, page_next2, exact, t,
               CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
         """Phase t (table in _body): page_prev .. page_next2 are the page ids of tiles t-1 .. t+2.
 
-        CUR = t & 1 is the slot of K(t), V(t) and K(t+2); PREV holds V(t-1).
+        CUR = t & 1 is the slot of K(t), V(t) and K(t+2); PREV holds V(t-1). exact carries
+        the exact rule of _rescale.
         """
         s_prev, row_max, row_sum = fx.Vector(s_prev), fx.Float32(row_max), fx.Float32(row_sum)
         o0, o1, o2, o3 = fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3)
-        t = fx.Int32(t)
+        exact, t = fx.Int64(exact), fx.Int32(t)
         # S0 memory: s2r K(t) keys 0-31 first; its lgkmcnt wait comes last.
         k_lo = _read_k_s2r(storage, k_s2r_base, CUR, 0, DQ, dtype)
         # Compiler-only fence: keep address setup and VMEM after the LDS reads.
@@ -362,10 +525,10 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         # lgkmcnt(0): K(t) keys 0-31 and page(t+3) ready; V(t)/K(t+2) stay in flight.
         page_next3 = _page_ready_tied(page_next3_request)
         _stage_end()
-        # S1 compute: QK S(t) keys 0-31; P(t-1) values 0-23.
+        # S1 compute: QK S(t) keys 0-31; P(t-1) values 0-15.
         s_lo = _qk(q, k_lo, dtype)
-        p_prev = _pin(_exp_part(s_prev, 0, 24), 32)
-        _schedule(DQ // 16, 2 if DQ == 192 else 3, 1, True)
+        p_prev = _pin(_exp_part(s_prev, 0, 16), 32)
+        _schedule_qk_exp(DQ, 1)
         _stage_end()
         # S2 memory: s2r K(t) keys 32-63; r2s V(t) once it lands.
         k_hi = _read_k_s2r(storage, k_s2r_base, CUR, 1, DQ, dtype)
@@ -374,50 +537,38 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         _store_kv_r2s(storage, tid, v_cur, v_slot[CUR], 2)
         _wait(lgkmcnt=0)
         _stage_end()
-        # S3 compute: QK S(t) keys 32-63; P(t-1) values 24-31, l and FP8 P.
+        # S3 compute: QK S(t) keys 32-63; P(t-1) values 16-31.
         s_hi = _qk(q, k_hi, dtype)
-        p_prev = _exp_part(p_prev, 24, 32)
-        row_sum = row_sum + _row_sum(p_prev)
-        p_fp8 = _pack_probability(p_prev, dtype)
-        _schedule(4, 2, 2, True)
-        _schedule(DQ // 16 - 4, 8, 2)
+        p_prev = _pin(_exp_part(p_prev, 16, 32), 32)
+        _schedule_qk_exp(DQ, 2)
         _stage_end()
-        # S4 memory: s2r V(t-1) dims 0-63; r2s K(t+2) into slot CUR, which both groups have read.
-        v_lo = _read_v_s2r(storage, v_s2r_base, PREV, 0, DQ, dtype)
+        # S4 memory: s2r V(t-1) dims 0-63; r2s K(t+2) into slot CUR, which both groups have read; mask S(t).
+        v_lo = _read_v_words(storage, v_s2r_base, PREV, 0, DQ)
         _wait(vmcnt=0)
         _store_kv_r2s(storage, tid, k_next2, CUR * k_slot, DQ // 64, True)
         # lgkmcnt(0): V(t-1) dims 0-63 ready, K(t+2) published, pending shuffles done.
         _wait(lgkmcnt=0)
-        _stage_end()
         s_cur = _mask(_join(s_lo, s_hi), t, row, q_len, kv_len, CAUSAL)
-        # S5 compute: PV O dims 0-63; lazy new max of S(t) and S'(t) values 0..split.
-        o0, o1 = _pv(p_fp8, v_lo, o0, o1, dtype)
-        candidate = _row_max(s_cur) * scale
+        _stage_end()
+        # S5 compute: FP8 P(t-1); PV O dims 0-63; row max of S(t); first adds of the row sum.
+        p_words, o0, o1, local_max, sums = _pv_lo_with_max(p_prev, v_lo, o0, o1, s_cur)
+        _stage_end()
+        # S6 memory: s2r V(t-1) dims 64-127 (V(t-1) is a full page in every main phase); lazy new max.
+        v_hi = _read_v_words(storage, v_s2r_base, PREV, 1, DQ)
+        rocdl.sched_barrier(0)
+        candidate = local_max * scale
         ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - row_max > 6.0).ir_value()))
         new_max = (ballot != fx.Int64(0)).select(_maximum(row_max, candidate), row_max)
-        split = 12 if STAGGER else 6
-        s_cur = _center_part(s_cur, scale, new_max, 0, split)
-        # Interleave the local MAX3 tree with the first four PV MFMAs, then issue the
-        # xor32 ds_bpermute and two PV MFMAs before its v_max consumer (hints only).
-        _schedule(3, 5, 3)
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 3)
-        rocdl.sched_group_barrier(0x002, 3, 3)
-        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, 3)
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 2, 3)
-        rocdl.sched_group_barrier(0x002, 10, 3)
-        _schedule(2, 5, 3)
-        _stage_end()
-        # S6 memory: s2r V(t-1) dims 64-127 (V(t-1) is a full page in every main phase).
-        v_hi = _read_v_s2r(storage, v_s2r_base, PREV, 1, DQ, dtype)
+        rocdl.sched_barrier(0)
         _wait(vmcnt=0, lgkmcnt=0)
         _stage_end()
-        # S7 compute: PV O dims 64-127; S'(t) values split..31; lazy rescale of O and l.
-        o2, o3 = _pv(p_fp8, v_hi, o2, o3, dtype)
-        s_cur = _center_part(s_cur, scale, new_max, split, 32)
-        _schedule(8, 4, 4)
-        o0, o1, o2, o3, row_sum = _rescale(o0, o1, o2, o3, row_sum, row_max, new_max, ballot)
+        # S7 compute: PV O dims 64-127; l += row sum of P(t-1); S'(t); lazy rescale of O and l.
+        o2, o3, local_sum, other_sum, s_cur = _pv_hi_with_sum(p_words, v_hi, o2, o3, sums, s_cur, scale, new_max)
+        row_sum = row_sum + (local_sum + other_sum)
+        o0, o1, o2, o3, row_sum, s_cur, exact = _rescale(o0, o1, o2, o3, row_sum, s_cur, row_max, new_max, ballot,
+                                                         exact)
         _stage_end()
-        return s_cur, new_max, row_sum, o0, o1, o2, o3, page_cur, page_next, page_next2, page_next3
+        return s_cur, new_max, row_sum, o0, o1, o2, o3, page_cur, page_next, page_next2, page_next3, exact
 
     def epilogue(state):
         """exp, row sum and PV of the last tile; V(last) already sits in slot last & 1."""
@@ -523,7 +674,9 @@ def _launch_attention(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LS
     DQ: fx.Constexpr[int], CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float], stream: fx.Stream):
     _attention_kernel_942(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, H, HK, NP, DQ,
-        CAUSAL, PER_TOKEN, WITH_LSE, SCALE, value_attrs={"rocdl.waves_per_eu": 2},
+        CAUSAL, PER_TOKEN, WITH_LSE, SCALE,
+        value_attrs={"rocdl.waves_per_eu": 2,
+                     "llvm.target_features": ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')},
     ).launch(grid=(H, B, (MAX_Q + BM - 1) // BM), block=(THREADS, 1, 1), stream=stream)
 
 
@@ -538,9 +691,12 @@ class _PagedAttention:
                  kv_last_page_lens, out=None, sink_ptr=None, stream=None, *, return_lse=False, lse=None, softmax_scale=None):
         """Run native FNUZ attention with caller-owned asynchronous metadata.
 
-        Descales must be finite and strictly positive. Prefix sums/page IDs,
-        last-page lengths and maximum lengths must describe the current input;
-        they are never synchronized back to the host. Warm before graph capture.
+        Descales must be finite and strictly positive, and softmax_scale * log2(e)
+        * q_descale * k_descale a positive finite FP32. K/V within each KV length
+        must be finite: rows of a causal tile share its V, so a non-finite value
+        also reaches rows that mask its key. Prefix sums/page IDs, last-page
+        lengths and maximum lengths must describe the current input; they are
+        never synchronized back to the host. Warm before graph capture.
         """
         if not Q.is_cuda or "gfx942" not in torch.cuda.get_device_properties(Q.device).gcnArchName:
             raise NotImplementedError("this public kernel requires gfx942; use the separate cross-compile validation harness elsewhere")
@@ -573,9 +729,7 @@ class _PagedAttention:
             raise ValueError("descales must be contiguous device FP32")
         if k_descale.numel() != 1 or v_descale.numel() != 1 or q_descale.numel() not in (1, Q.shape[0] * self.heads):
             raise ValueError("expected scalar K/V and scalar or per-token/head Q descales")
-        scale = self.dq**-0.5 if softmax_scale is None else float(softmax_scale)
-        if not math.isfinite(scale) or scale <= 0:
-            raise ValueError("softmax_scale must be finite and positive")
+        scale = _softmax_scale(softmax_scale, self.dq**-0.5)
         stream = torch.cuda.current_stream(Q.device) if stream is None else stream
         if stream.device != Q.device:
             raise ValueError("stream must belong to the input GPU")

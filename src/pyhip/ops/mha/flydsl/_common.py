@@ -13,9 +13,11 @@ result. Read helpers only issue instructions; kernels place every wait.
 """
 
 import math
+from numbers import Real
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
@@ -23,6 +25,22 @@ from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 
 # ---- 1. Utilities, raw buffers, page ids and stage barriers ----
+
+# Lowest finite float32: floors an empty row's -inf max without clipping any finite logit.
+_MAX_FLOOR = -3.4028234663852886e38
+
+
+def _softmax_scale(softmax_scale, default):
+    """Validated host softmax scale; default when None."""
+    if isinstance(softmax_scale, (torch.Tensor, bool)) or not isinstance(softmax_scale, (Real, type(None))):
+        raise TypeError("softmax_scale must be a host real scalar or None")
+    scale = default if softmax_scale is None else float(softmax_scale)
+    # The kernels multiply masked -inf scores by it: an FP32 zero would give NaN.
+    scaled = scale * math.log2(math.e)
+    if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
+        raise ValueError("softmax_scale * log2(e) must be finite and positive in FP32")
+    return scale
+
 
 def _uniform(value):
     return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value).ir_value()))
@@ -102,6 +120,16 @@ def _schedule(pairs, count, group, exp=False):
         rocdl.sched_group_barrier(0x400 if exp else 0x002, count, group)
 
 
+def _schedule_exps(pairs, count, group, mfmas=1):
+    # Per step: `count` subtractions S' - m, an MFMA, their exponentials, then mfmas - 1 more MFMAs.
+    for _ in range(pairs):
+        rocdl.sched_group_barrier(0x002, count, group)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group)
+        rocdl.sched_group_barrier(0x400, count, group)
+        if mfmas > 1:
+            rocdl.sched_group_barrier(rocdl.mask_mfma, mfmas - 1, group)
+
+
 def _read_page_g2r(table, index):
     """s_load_dword of one page id; _page_ready makes it usable."""
     address = fx.Int64(fx.ptrtoint(fx.get_iter(table) + index))
@@ -169,7 +197,7 @@ def _row_max_local(values):
     p = [_max3(values[i], values[i + 1], values[i + 2]) for i in range(0, 30, 3)]
     a = _max3(_max3(p[0], p[1], p[2]), _max3(p[3], p[4], p[5]), _max3(p[6], p[7], p[8]))
     b = _max3(p[9], values[30], values[31])
-    return _max3(a, b, fx.Float32(-1.0e30))
+    return _max3(a, b, fx.Float32(_MAX_FLOOR))
 
 
 def _row_max(values):
@@ -190,7 +218,7 @@ def _row_sum(values):
 
 
 def _center_part(values, scale, maximum, begin, end):
-    """S' = S * scale - m for scores begin..end-1; the rest pass through."""
+    """S' = S * scale - m (one FMA) for scores begin..end-1; the rest pass through."""
     result = []
     for i in range(32):
         value = values[i]
@@ -200,6 +228,31 @@ def _center_part(values, scale, maximum, begin, end):
                 "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False))
         result.append(value)
     return _pin(fx.Vector.from_elements(result, fx.Float32), 32)
+
+
+def _reround(values, maximum):
+    """FMA-centered S' = S * scale - m (32 scores) rounded to a multiple of ulp(m).
+
+    That is round(S * scale) - m (see _scale), up to ties and the binade edge of m. The
+    FMA alone leaves S' of the row max up to ulp(m) / 2 off zero.
+    """
+    # (x + c) - c with c = 1.5 * 2^exponent(m) rounds x to a multiple of ulp(m). In place:
+    # this runs in cold branches of kernels near their VGPR limit.
+    c = ((fx.Float32(maximum).bitcast(fx.Int32) & fx.Int32(0x7F800000)) | fx.Int32(0x00400000)).bitcast(fx.Float32)
+    values = fx.Vector(values)
+    return fx.Vector.from_elements([fx.Float32(llvm.inline_asm(
+        fx.Float32.ir_type, [values[i].ir_value(), c.ir_value()],
+        "v_add_f32 $0, $0, $2\nv_sub_f32 $0, $0, $2", "=v,0,v", has_side_effects=False)) for i in range(32)],
+        fx.Float32)
+
+
+@flyc.jit
+def _reround_if(values, maximum, exact):
+    """_reround when the ballot mask exact is nonzero."""
+    values = fx.Vector(values)
+    if fx.Int64(exact) != fx.Int64(0):
+        values = _reround(values, maximum)
+    return values
 
 
 def _exp_part(values, begin, end):
@@ -276,14 +329,17 @@ def _cross(value, addresses):
         "ds_bpermute_b32 $0, $1, $2", "=v,v,v,~{memory}", has_side_effects=True)) for address in addresses)
 
 
-def _center(values, scale, maximum):
-    return fx.Vector.from_elements([fx.Float32(llvm.inline_asm(
-        fx.Float32.ir_type, [values[i].ir_value(), scale.ir_value(), maximum.ir_value()],
-        "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False)) for i in range(16)], fx.Float32)
+def _scale(values, scale):
+    """S * scale, pinned in its stage.
+
+    Rounded like the row max m: an FMA S * scale - m is up to ulp(m) / 2 off, so exp2
+    overflows or underflows once logits approach 1e11.
+    """
+    return _pin(fx.Vector(values) * scale)
 
 
-def _exps(values):
-    return fx.Vector.from_elements([_exp(values[i]) for i in range(16)], fx.Float32)
+def _exps(values, maximum):
+    return fx.Vector.from_elements([_exp(values[i] - maximum) for i in range(16)], fx.Float32)
 
 
 def _pack(values):

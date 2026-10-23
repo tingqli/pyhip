@@ -35,19 +35,21 @@ read类helper只**发射**指令、返回异步结果；所有`s_waitcnt`都由k
 - 主体结构统一为`prologue()` → `phase(*state, t, ...)`循环 → `epilogue(state)`：
   state是按固定顺序传递的元组（循环携带值），phase的docstring说明每个分量的tile编号，
   主体docstring给出逐stage表（预取几个tile、哪个编号的数据在哪个stage发起/落地/被读）。
-- softmax统一用log2单位：`S' = S·scale·log2e − m`，`P = exp2(S')`，`l = ΣP`，`O = ΣP·V`，输出`O / l`；
-  m只在新行最大值超过m一个阈值时才前移（lazy rescale），从而大部分tile不需要缩放O和l。
+- softmax统一用log2单位（scale已含log2e）：`S' = S·scale − m`，`P = exp2(S')`，`l = ΣP`，`O = ΣP·V`，输出`O / l`；
+  m是舍入后`S·scale`的行最大值，只在新行最大值超过m一个阈值时才前移（lazy rescale），从而大部分tile不需要缩放O和l。
+  D256与SWA先舍入`S·scale`再减m（与aiter union相同）；gfx942 BF16 BM256、FP8与gfx950用一条FMA，
+  某行|m| ≥ 2^22后再把S'舍入到ulp(m)的整数倍，结果与先舍入相同（见第3.3、6节）。QSA union复用D256的helper，同样先舍入。
 
 ### 0.3 主体与预取距离一览
 
 | kernel | 主体 | 页号 | K | V | 计算 |
 |---|---|---|---|---|---|
-| BF16 D128/D192 V128无LSE | [_body_v128](mha_pa_bf16_942.py#L343) | t+2（S0 s_load） | t+1：S4 g2r，S6 r2s（单槽） | t：S0 g2r（64-bit GLOBAL），S2 r2s到`[cur]` | QK(t)，exp/PV(t−1) |
-| BF16 LSE或V192 | [_body_wide](mha_pa_bf16_942.py#L623) | t+2 | t+1：S0 g2r，S4/S6 r2s | t：S0 g2r；环形S2发布，单槽下一phase S0发布 | 同上 |
-| FP8 | [_body](mha_pa_fp8_942.py#L219) | t+3 | t+2：S0 g2r，S4 r2s（双槽） | t：S0 g2r，S2 r2s（双槽） | 同上 |
+| BF16 D128/D192 V128无LSE | [_body_v128](mha_pa_bf16_942.py#L363) | t+2（S0 s_load） | t+1：S4 g2r，S6 r2s（单槽） | t：S0 g2r（64-bit GLOBAL），S2 r2s到`[cur]` | QK(t)，exp/PV(t−1) |
+| BF16 LSE或V192 | [_body_wide](mha_pa_bf16_942.py#L649) | t+2 | t+1：S0 g2r，S4/S6 r2s | t：S0 g2r；环形S2发布，单槽下一phase S0发布 | 同上 |
+| FP8 | [_body](mha_pa_fp8_942.py#L367) | t+3 | t+2：S0 g2r，S4 r2s（双槽） | t：S0 g2r，S2 r2s（双槽） | 同上 |
 | BF16 D256 paged | [_body](mha_pa_bf16_256_paged_942.py#L182) | t+2（step0） | t+1：step2 DMA，step3落地 | t−1：step0 DMA，step1落地 | 同上 |
-| BF16 D256 linear | [_body](mha_pa_bf16_256_linear_942.py#L281) | 行地址t+2（step0 g2r） | t+1：step2 DMA | t−1：step0 DMA | 同上 |
-| gfx950 BF16 | [_attention_body](mha_pa_bf16_950.py#L299) | t+2（S1） | t+2：S4/S6 DMA（双槽） | t：S0或S2 DMA（双槽） | 同上 |
+| BF16 D256 linear | [_body](mha_pa_bf16_256_linear_942.py#L280) | 行地址t+2（step0 g2r） | t+1：step2 DMA | t−1：step0 DMA | 同上 |
+| gfx950 BF16 | [_attention_body](mha_pa_bf16_950.py#L309) | t+2（S1） | t+2：S4/S6 DMA（双槽） | t：S0或S2 DMA（双槽） | 同上 |
 | SWA QT16 | [_swa_kernel](mha_pa_swa_bf16.py#L245) | 下一tile | 下一tile：g2r（寄存器，无LDS） | 下一tile：g2r | 当前tile |
 | SWA QT32 | [_swa32_kernel](mha_pa_swa_bf16.py#L345) | 当前tile | 当前tile g2r后等待 | 与QK/softmax重叠 | 当前tile |
 
@@ -103,7 +105,8 @@ PagedAttention(...)                    # functools.cache工厂：校验静态配
 - `persistent=None/True`（默认）：`min(CU, 任务数)`个常驻CTA按grid-stride取任务，任务序号按head最快、
   再batch、再query块展开；无原子计数器、无workspace、无初始化dispatch，多stream和graph之间没有共享可变状态。
   `persistent=False`：普通网格`(H, B, QB)`。两者共用同一个主体。
-- `waves_per_eu=2`、关闭packed-fp32（`-packed-fp32-ops`）是固定编译属性。
+- `waves_per_eu=2`、关闭packed-fp32（`-packed-fp32-ops`）是固定编译属性；后者经`llvm.target_features`设置
+  （`passthrough`形式会在lowering中丢失，此前实际未生效，ISA里仍有`v_pk_mul_f32`）。
 
 ### 3.2 LDS布局
 
@@ -133,6 +136,12 @@ S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
 - exp按24+8分到S1/S3两次QK旁边（`_schedule`用`sched_group_barrier`把MFMA与VALU/TRANS交错），
   掩码和新m的计算放在S5/S7的PV旁。
 - m从首个行最大值+1开始，只有后续行最大值超过m+7才前移到新最大值+1，并按ballot只在有行需要时缩放O和l（`_rescale`）。
+- S'(t)由S7一条FMA `S·scale − m`得到。FMA用精确乘积而m是舍入值，S'(max)偏离0最多ulp(m)/2，logit近1e11时
+  exp2上溢或下溢。因此m前移时`_rescale`的分支顺带检查|m| ≥ 2^22；一旦成立（sticky，ballot掩码随state传递），
+  另一个分支把S'(t)舍入到ulp(m)的整数倍（`_reround`：`(x + c) − c`，`c = 1.5·2^exponent(m)`），等于先舍入`S·scale`
+  再减m（至多差一个ulp(m)）；prologue的S'(0)同理。热路径只多一次标量比较与跳转，正常输入输出与改动前逐位一致。
+  直接改成先舍入再减m（每个分数多一条VALU）实测D128 −4.4%、D192 −3.5%、D128带LSE −2.7%；
+  两个分支合并为一个时V192（已溢出到scratch）因多一次dwordx4溢出慢5%。
 - D128每次循环展开两个phase，使`cur/prev`成为常量；D192每次一个phase，槽号由t计算。
 - O按`O/l·v_descale`转BF16（软件RNE，`_pack_bf16`），由`_store_o_tile_r2g`写回。
 
@@ -163,7 +172,7 @@ S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
 ```text
 step  memory stage                                compute stage
 0     s_load pages(t+2); g2s V(t-1) with s2r      QK: S(t) keys 0-31
-      K(t) keys 0-31 between its packets          softmax: P(t-1) = exp2(S'(t-1))
+      K(t) keys 0-31 between its packets          softmax: P(t-1) = exp2(S'(t-1) - m)
 1     s2r K(t) keys 32-63; V(t-1) lands           QK: S(t) keys 32-63
                                                   softmax: row sum of P(t-1), P to BF16
 2     exchange row sums; g2s K(t+1) with s2r      PV: O dims 0-127 += P(t-1) V(t-1)
@@ -178,7 +187,7 @@ S4的LGKM等待移到barrier之后、首个消费者之前。page32/64/128、per
 
 ## 5. gfx942 BF16 D256 linear（[mha_pa_bf16_256_linear_942.py](mha_pa_bf16_256_linear_942.py)）
 
-公开入口为[flash_attn_varlen_func](mha_pa_bf16_942.py#L1164)：连续THD输入、无KV格式转换，热调用只有一个attention kernel。
+公开入口为[flash_attn_varlen_func](mha_pa_bf16_942.py#L1200)：连续THD输入、无KV格式转换，热调用只有一个attention kernel。
 
 ### 5.1 布局与搬运
 
@@ -197,7 +206,7 @@ S4的LGKM等待移到barrier之后、首个消费者之前。page32/64/128、per
 ```text
 step  memory stage                                compute stage
 0     g2r rows(t+2); g2s V(t-1) with s2r K(t)     QK: S(t) keys 0-31
-      keys 0-31 between its packets               softmax: P(t-1) = exp2(S'(t-1))
+      keys 0-31 between its packets               softmax: P(t-1) = exp2(S'(t-1) - m)
 1     s2r K(t) keys 32-63; V(t-1) lands           QK: S(t) keys 32-63
                                                   softmax: row sum of P(t-1), P to BF16
 2     exchange row sums; g2s K(t+1) with s2r      mask S(t); PV: O dims 0-127 += P V
@@ -210,12 +219,13 @@ step  memory stage                                compute stage
   领先组随后的K(t+1) DMA先覆盖K的D[0:128]，其余读只涉及D[128:256]。step3只读V的高128维，
   领先组下一step0的V DMA只写低半，落后组的DMA在本组step3退休之后才发起。
 - softmax的VALU折叠进PV：`_pv(summary_args=...)`在最后一步顺带完成`l += 行和`和S(t)的lane最大值，
-  `_pv(center_args=...)`在第一步算出新m，随后四步逐段完成`S' = S·scale − m`，最后按ballot lazy rescale。
+  `_pv(center_args=...)`在第一步算出新m，随后四步逐段完成`S' = S·scale`（固定在本stage），
+  下一phase的step0做`exp2(S' − m)`，最后按ballot lazy rescale。QSA union复用同一个`_pv`。
 - 主循环：noncausal且无LSE时每次展开4个phase（摊销SOFFSET队列移动）；causal或LSE每次2个phase
   （4个会让标量寄存器溢出）。
 - 静态B1 noncausal且最后一tile不超过32个key时，最后一tile走NARROW phase（无keys 32–63），
   epilogue只drain第一个32-token V平面。B1非分页、noncausal、无LSE时Q/K长度作为编译期常量（`STATIC_Q/STATIC_K`）。
-- persistent且B1非分页causal时，任务按“最长query块优先、蛇形分配到CTA”排序（[_linear_256_kernel](mha_pa_bf16_256_linear_942.py#L576)），
+- persistent且B1非分页causal时，任务按“最长query块优先、蛇形分配到CTA”排序（[_linear_256_kernel](mha_pa_bf16_256_linear_942.py#L575)），
   平衡因果负载而不改变tile内算术。
 
 ### 5.3 API行为
@@ -234,19 +244,33 @@ BF16 BM256版本的蓝本：同样的8 wave、8 stage、STAGGER与“QK(t)+PV(t�
 ```text
 stage  phase t; cur = t & 1, prev = (t - 1) & 1
 S0     s2r K(t) keys 0-31 [cur]; s_load page(t+3); g2r V(t), K(t+2)
-S1     QK: S(t) keys 0-31          softmax: P(t-1) = exp2(S'(t-1)), values 0-23
+S1     QK: S(t) keys 0-31          softmax: P(t-1) = exp2(S'(t-1)), values 0-15
 S2     s2r K(t) keys 32-63 [cur]; V(t) lands; r2s V(t) -> [cur]
-S3     QK: S(t) keys 32-63         softmax: P(t-1) values 24-31, l += row sum, P to FP8
-S4     s2r V(t-1) dims 0-63 [prev]; K(t+2) lands; r2s K(t+2) -> [cur]
-S5     PV: O dims 0-63 += P V      softmax: mask S(t), new m, S'(t) values 0..split
-S6     s2r V(t-1) dims 64-127 [prev]
-S7     PV: O dims 64-127 += P V    softmax: S'(t) values split..31; rescale O and l
+S3     QK: S(t) keys 32-63         softmax: P(t-1) values 16-31
+S4     s2r V(t-1) dims 0-63 [prev]; K(t+2) lands; r2s K(t+2) -> [cur]; mask S(t)
+S5     PV: O dims 0-63 += P V      softmax: P(t-1) to FP8, row max of S(t), row-sum adds
+S6     s2r V(t-1) dims 64-127 [prev]; new m
+S7     PV: O dims 64-127 += P V    softmax: l += row sum, S'(t); rescale O and l
 ```
 
 - K与V各两个LDS槽，K比QK领先两个tile、页号领先三个tile；全部为寄存器中转的协作拷贝（g2r→r2s），
   不用direct-to-LDS DMA、LDS转置指令或原生FP32→BF16转换。LDS：D128 33,280、D192 41,600字节（16维×64 key的1040字节chunk）。
 - P量化为FP8参与PV；m的前移阈值为6，保证FP8-FNUZ下P有限。输出`O/l·v_descale`。
+- **S'的中心化**：S7用一条FMA `S·scale − m`，精确规则与BF16 BM256相同（第3.3节）。|m| ≥ 2^24时FMA误差可使
+  FP8的P超过240，logit近1e11时exp2上溢或下溢。直接先舍入再减m每个分数多一条VALU，实测FP8慢7%
+  （GPU7 16384²×H7：414.6→385.5T）。FP8把lazy rescale与精确规则合并为一个分支并加`llvm.expect`冷路径提示
+  （`_unlikely`）：不加提示慢1%，用BF16的两个分支慢0.6%；BF16则相反（带LSE时加提示慢1.2%）。
+  输出与改动前逐位一致。
 - 只保留LDS模式（旧register模式已删除）；不支持persistent、SWA和sink。
+- **compute stage受VALU发射口限制**（ATT实测：`v_exp_f32`占16周期、`v_cvt_pk_fp8_f32`占8、VALU与MFMA发射各4；
+  同一累加器的32×32 MFMA链每环约36周期）。FP8每个compute stage只有8个MFMA（256周期），softmax VALU必须均摊：
+  - S1/S3：每个QK依赖链环节放2个exp（16+16+4≈36），QK与exp同时饱和。
+  - S5/S7：`_pv_lo_with_max`/`_pv_hi_with_sum`用`sched_barrier`按程序顺序发射PV MFMA（两个累加器交替），
+    下一个K-step的FP8转换跟在第一个MFMA后，MAX3树跟在第二个后，xor32 `ds_bpermute`提前一个K-step发出；
+    行和拆成S5的16个加法和S7的15个加法，S7再做S'(t)的32个FMA。
+  - memory stage只放短VALU（S4的mask、S6的新m）：同SIMD上另一组的compute wave占满发射口时，memory wave的VALU会被饿死（实测停顿130周期）。
+  - 行和用inline asm标量`v_add_f32`：LLVM SLP会把它合成`v_pk_add_f32`，而packed FP32在SIMD有MFMA执行时停顿（实测176周期）；
+    同理S'(t)不用`v_pk_fma_f32`（A/B慢5%）。各加法/最大值的结合顺序与改动前相同，输出与改动前逐位一致。
 
 ## 7. gfx950 BF16（[mha_pa_bf16_950.py](mha_pa_bf16_950.py)）
 
@@ -254,10 +278,10 @@ S7     PV: O dims 64-127 += P V    softmax: S'(t) values split..31; rescale O an
 
 - BM256，8 wave，K/V各两个槽并全部用direct-to-LDS DMA（`_dma_g2s`）；Q先DMA到V区域再读入寄存器，
   因此V区按Q的大小分配：D128 99,840、D192 149,760字节。
-- 阶段表见[_attention_body](mha_pa_bf16_950.py#L299)：页号t+2在S1 s_load；K(t+2)在S4/S6 DMA进`[cur]`
+- 阶段表见[_attention_body](mha_pa_bf16_950.py#L309)：页号t+2在S1 s_load；K(t+2)在S4/S6 DMA进`[cur]`
   （STAGGER组把第一个D64 chunk放S4、其余放S6）；V(t)在S0（STAGGER）或S2 DMA，下一phase读取。m前移阈值为8。
 - causal、无窗口且任务数≥512时启用MERGE：一个CTA先正向做第qb块，再**反向**扫描镜像块`QB−1−qb`，
-  把最短和最长的因果query块配对以平衡负载并复用L2（[_attention_sequence](mha_pa_bf16_950.py#L643)）。
+  把最短和最长的因果query块配对以平衡负载并复用L2（[_attention_sequence](mha_pa_bf16_950.py#L664)）。
 - B1、任务数≥1024且窗口较窄（D192≤128、D128≤64）时启用PRUNE：只为可见的tile做wave级QK/PV。
 - SWA：`window_left≥0`要求bottom-right causal；sink是每个query头一个值为0的虚拟key，只加到`l`。
 - `persistent=None/False`为单次普通网格；`persistent=True`使用每(device, stream, grid)缓存的8字节调度头
@@ -275,16 +299,19 @@ S7     PV: O dims 64-127 += P V    softmax: S'(t) values split..31; rescale O an
 
 ## 9. 共用helper（[_common.py](_common.py)）
 
-1. 标量/向量工具与同步：`_uniform`（readfirstlane）、`_pin`/`_pin_i32`（空asm绑定值，阻止重算与跨阶段移动）、
+1. 标量/向量工具与同步：`_MAX_FLOOR`（最小有限FP32，作行最大值下限，不截断任何有限logit）、
+   `_softmax_scale`（host校验：张量/bool抛`TypeError`，`softmax_scale·log2e`须是正的有限FP32）、
+   `_uniform`（readfirstlane）、`_pin`/`_pin_i32`（空asm绑定值，阻止重算与跨阶段移动）、
    `_stage_end`（`sched_barrier`+`s_barrier`+`sched_barrier`，不是内存等待）、`_wait`（显式`s_waitcnt`编码）、
-   `_schedule`（`sched_group_barrier`交错MFMA与VALU/TRANS）、`_read_page_g2r`/`_page_ready`
+   `_schedule`/`_schedule_exps`（`sched_group_barrier`交错MFMA与VALU/TRANS；后者每步先减m再exp）、`_read_page_g2r`/`_page_ready`
    （s_load页号；等待与第一次读取放在同一段asm，避免RA在等待前复制尚未到达的SGPR）、`_buffer`/`_buffer_words`、
    `_read_address`（`ds_read_b128`）、`_rescale`。
-2. BM256 32×32 softmax：`_row_max_local`/`_row_max`、`_row_sum_local`/`_row_sum`、`_center_part`、`_exp_part`、
+2. BM256 32×32 softmax：`_row_max_local`/`_row_max`、`_row_sum_local`/`_row_sum`、`_center_part`（FMA `S·scale − m`）、
+   `_reround`/`_reround_if`（把S'舍入到ulp(m)的整数倍，|m| ≥ 2^22后的精确规则）、`_exp_part`（`exp2(S')`）、
    `_mfma_hazard_wait`（MFMA结果被inline asm读取前`s_nop 10`：gfx942 32×32 MFMA需要NumPasses(8)+3个等待周期，
    LLVM hazard recognizer不保护inline asm消费者）。
 3. D256几何与16×16 MFMA片段：`_mma`、`_read_q_g2r`、`_qk`、`_pv`、`_sum`、`_max`（用`llvm.maxnum`让MFMA→max依赖对LLVM可见；
-   曾经的不透明max树在grid重复逐位检查中失败）、`_cross`（`ds_bpermute`交换）、`_center`、`_exps`、`_pack`、`_mask`、`_v_tail`。
+   曾经的不透明max树在grid重复逐位检查中失败）、`_cross`（`ds_bpermute`交换）、`_scale`、`_exps`（`exp2(S' − m)`）、`_pack`、`_mask`、`_v_tail`。
 
 **FlyDSL磁盘缓存注意**：缓存key只扫描函数自身`co_names`引用的helper（及闭包标量），不扫描嵌套闭包里引用的helper。
 因此每个含闭包的主体开头都有`_helpers = (...)`元组，列出闭包用到的helper，使修改它们会改变缓存key。
@@ -335,3 +362,44 @@ S7     PV: O dims 64-127 += P V    softmax: S'(t) values split..31; rescale O an
 - **2026-09-26 B1 causal配平**：最长query块优先+蛇形CTA分配。H12/HK1：Q=KV2048 292.5→161.6µs，8192 2475.3→1838.5µs。
 - **inline asm hazard修复**：`_max`改为`llvm.maxnum`、`_mfma_hazard_wait`在inline asm读取MFMA结果前补足间隔；
   `_page_ready`把`s_waitcnt`与首次读取放进同一段asm。
+- **2026-10-22 FP8 VALU重排**（见第6节）：ATT显示原S1（24个exp）与S3（8个exp＋行和＋FP8转换）受发射口限制，
+  memory stage空等，SIMD MFMA busy 65.1%；重排后75.8%，每tile周期3044→约2590，输出逐位不变。
+  GPU7同址：16384²×H7 D128 360.6→414.9T，D192 429→443T，causal D128/D192 +14%；FP8 benchmark全部case +3.3%–14.3%。
+  长序列持续负载（[164800,7,128]、50次背靠背）382.7→405.9T，受功耗限制（约630 W，时钟1.78→1.71 GHz），
+  同条件hipBLASLt FP8 GEMM 16384³为399.2T。未采纳：exp放进memory stage（−8%，发射口争用且QK依赖链变长）、
+  `s_setprio`提高compute wave优先级（更慢）、`v_pk_fma_f32`中心化（−5%）、D192把FP8转换移入S3（−15%）。
+
+## 12. 与aiter PR #6576 union评审意见对齐（2026-10-22）
+
+逐条核对[aiter PR #6576](https://github.com/ROCm/aiter/pull/6576)（QSA union kernel）的评审意见，本目录中适用的修复如下。
+QSA只随共用helper改动（第2、3行）；其余同类问题（行最大值下限、`softmax_scale`校验、K/V说明、测试）留待独立PR。
+
+| 评审意见 | 本仓库的处理 |
+|---|---|
+| 行最大值下限−1e30截断更小的有限logit | 全部MHA kernel改用`_MAX_FLOOR`（最小有限FP32）；SWA只需这一项 |
+| FMA `S·scale − m`与舍入后的m差至多ulp(m)/2，logit近1e11时exp2上溢/下溢 | D256 paged/linear与aiter相同：先舍入`S·scale`再减m（`_scale`、`_exps`、`_schedule_exps`、`_pv`），复用这些helper的QSA union随之改变；gfx942 BF16 BM256、FP8与gfx950保留FMA，|m| ≥ 2^22后用`_reround`（第3.3、6节） |
+| `passthrough`形式的target-features在lowering中丢失 | BF16 BM256、D256 paged/linear与QSA union改用`llvm.target_features`，FP8补上同一属性。QSA union若只换helper，新增的标量乘、减会被合成`v_pk_*`，kernel慢约8.5% |
+| host的`softmax_scale`校验 | `_softmax_scale`：张量/bool抛`TypeError`；`softmax_scale·log2e`须是正的有限FP32，否则`ValueError` |
+| 非有限K/V经共享的V污染被掩码的行 | 各入口docstring写明KV长度内的K/V须有限 |
+| 测试参考把NaN一并置0 | `_mha.torch_reference`只把没有可见key的行置0，其余NaN照常传播 |
+| 测试跨stream同步（`wait_stream`） | 已有；weakref arena不适用（MHA无arena） |
+
+另修复gfx950 persistent的mailbox竞争：没有barrier的任务（如空KV）可能让tid 0在其他wave读到上一个ticket前改写它，
+`_next_ticket`先做一次`_stage_end()`。
+
+新增测试：paged/linear的`test_extreme_logits`（logit近1e11与低于−1e30，O应为1）、`test_logits_cross_exact_threshold`
+（前两个tile |m| < 2^22，第三个tile把m抬到约2^28（FP8）或2^36（BF16），覆盖规则中途生效）、`softmax_scale`的
+TypeError/ValueError用例。改动前的代码在除SWA近1e11外的全部用例上失败（输出0、inf或NaN）。
+
+性能（MI308X，基线为改动前副本，交替A/B中位数，新/旧耗时；BF16 BM256、FP8、SWA输出与改动前逐位一致）：
+
+| kernel | 结果 |
+|---|---|
+| BF16 BM256（GPU6） | D128 −1.1%、D128 causal +0.2%、D192 +0.5%、D128带LSE +0.8%、V192 +0.5% |
+| FP8（GPU7） | D128 −0.1%、D128 causal −2.1%、D192 +0.3% |
+| D256 paged / linear full / linear causal（GPU7） | −0.1% / +0.3% / +0.3% |
+| SWA（GPU7） | −0.1% |
+| QSA M12000 TP2/4/8（GPU6，顺序运行） | union kernel −1.8%/−2.0%/−2.1%，整体qsa −0.6%/−1.1%/−2.0% |
+
+gfx950只做了交叉编译（80/80）：热路径的`v_fma_f32`/`v_mul_f32`/`v_exp_f32`条数与VGPR和改动前完全相同，
+新增的`v_add_f32`/`v_sub_f32`都在`_reround`冷分支里，未在gfx950上运行和计时。

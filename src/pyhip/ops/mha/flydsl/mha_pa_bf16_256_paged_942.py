@@ -19,9 +19,9 @@ from flydsl.expr import gpu, rocdl
 
 from ._common import (
     BM, BN, D, K_BYTES, LDS_BYTES, LOG2E, THREADS,
-    _advance_max, _buffer, _center, _cross, _exps, _join, _mask, _max, _maximum, _min, _pack,
+    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _mask, _max, _maximum, _min, _pack,
     _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _pv, _qk, _read_address, _read_page_g2r,
-    _read_q_g2r, _rescale, _schedule, _stage_end, _sum, _uniform, _v_tail, _wait,
+    _read_q_g2r, _rescale, _scale, _schedule, _schedule_exps, _stage_end, _sum, _uniform, _v_tail, _wait,
 )
 
 K_PITCH = 1024  # LDS bytes between the K rows of one wave
@@ -194,7 +194,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
 
     step  memory stage                                compute stage
     0     s_load pages(t+2); g2s V(t-1) with s2r      QK: S(t) keys 0-31
-          K(t) keys 0-31 between its packets          softmax: P(t-1) = exp2(S'(t-1))
+          K(t) keys 0-31 between its packets          softmax: P(t-1) = exp2(S'(t-1) - m)
     1     s2r K(t) keys 32-63; V(t-1) lands           QK: S(t) keys 32-63
                                                       softmax: row sum of P(t-1), P to BF16
     2     exchange row sums; g2s K(t+1) with s2r      PV: O dims 0-127 += P(t-1) V(t-1)
@@ -202,14 +202,16 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     3     exchange row maxima; K(t+1) lands;          PV: O dims 128-255 += P(t-1) V(t-1)
           s2r V(t-1) dims 128-255                     softmax: m, S'(t); rescale O and l
 
-    Softmax in log2 units: S' = S * scale - m, P = exp2(S'), l = sum(P) and O = sum(P V);
-    the output is O / l * v_descale. m starts at the first row max + 1 and moves to a
-    later row max + 1 only when that exceeds m + 7, rescaling O and l.
+    Softmax in log2 units: S' = S * scale, P = exp2(S' - m), l = sum(P) and O = sum(P V);
+    the output is O / l * v_descale. S' is rounded before m is subtracted, like m itself.
+    m starts at the first row max + 1 and moves to a later row max + 1 only when that
+    exceeds m + 7, rescaling O and l.
     """
     # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
     _helpers = (_read_k_packet_g2s, _read_k_s2r, _read_v_s2r, _read_k_s2r_v_g2s, _read_v_s2r_k_g2s,
-                _read_v_packet_g2s, _v_tile_resources, _qk, _pv, _sum, _max, _cross, _center, _exps, _pack,
-                _mask, _v_tail, _rescale, _advance_max, _join, _maximum, _pin, _schedule, _stage_end, _wait)
+                _read_v_packet_g2s, _v_tile_resources, _qk, _pv, _sum, _max, _cross, _scale, _exps, _pack,
+                _mask, _v_tail, _rescale, _advance_max, _join, _maximum, _pin, _schedule, _schedule_exps,
+                _stage_end, _wait)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -281,12 +283,11 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         _stage_end()
         # Compute: QK S(0) keys 32-63; softmax m and S'(0).
         s_hi = _qk(q, k_hi)
-        s_0 = _mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
+        s_0 = _scale(_mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL), scale)
         row_max = _max(s_0)
         row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
         row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
-        row_max = _maximum(row_max * scale, fx.Float32(-1.0e30)) + 1.0
-        s_0 = _center(s_0, scale, row_max)
+        row_max = _maximum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
         row_sum = fx.Float32(0.0)
         _stage_end()
         # Memory: g2s K(1); no compute.
@@ -313,10 +314,10 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         else:
             page_next2_1 = _page_ready(requests_next2[1])
         _stage_end()
-        # Step 0 compute: QK S(t) keys 0-31; P(t-1) = exp2(S'(t-1)).
+        # Step 0 compute: QK S(t) keys 0-31; P(t-1) = exp2(S'(t-1) - m).
         s_lo = _qk(q, k_lo)
-        p_prev = _exps(s_prev)
-        _schedule(32, 1, 1, True)
+        p_prev = _exps(s_prev, row_max)
+        _schedule_exps(16, 1, 1, 2)
         _stage_end()
         # Step 1 memory: s2r K(t) keys 32-63; V(t-1) lands.
         k_hi = _read_k_s2r(k_s2r, 1)
@@ -354,7 +355,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         candidate = _maximum(_maximum(lane_max, other_maxima[0]), _maximum(other_maxima[1], other_maxima[2])) * scale
         ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > row_max + 7.0).ir_value()))
         new_max = (candidate > row_max + 7.0).select(candidate + 1.0, row_max)
-        s_cur = _center(s_cur, scale, new_max)
+        s_cur = _scale(s_cur, scale)
         _schedule(32, 3, 4)
         o0, o1, row_sum = _rescale(o0, o1, row_sum, row_max, new_max, ballot)
         new_max = _advance_max(row_max, new_max)
@@ -369,7 +370,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         v_last_resources = _v_tile_resources(v_base, page_last0, page_last1, last, HK, PAGE)
         for packet in fx.range_constexpr(16):
             _read_v_packet_g2s(v_last_resources, storage, wave, v_g2s, PAGE, packet)
-        p_last = _exps(fx.Vector(s_last))
+        p_last = _exps(fx.Vector(s_last), fx.Float32(row_max))
         lane_sum = _sum(p_last)
         lane_sum = lane_sum + lane_sum.shuffle_xor(16, 64)
         lane_sum = lane_sum + lane_sum.shuffle_xor(32, 64)
@@ -475,5 +476,6 @@ def _launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tens
     grid = (min(CUS, H * B * ((MAX_Q + BM - 1) // BM)), 1, 1) if PERSISTENT else (H, B, (MAX_Q + BM - 1) // BM)
     _attention_256_dma_kernel_942(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS,
         H, HK, NP, B, MAX_Q, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, PERSISTENT, CUS,
-        value_attrs={"rocdl.waves_per_eu": 2, "passthrough": [["target-features", "-packed-fp32-ops"]]},
+        value_attrs={"rocdl.waves_per_eu": 2,
+                     "llvm.target_features": ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')},
     ).launch(grid=grid, block=(THREADS, 1, 1), stream=stream)

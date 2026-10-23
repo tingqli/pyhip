@@ -26,9 +26,10 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 
 from ._common import (
-    _advance_max, _buffer, _buffer_words, _center_part, _exp_part, _join, _maximum, _mfma_hazard_wait,
-    _min, _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _read_address, _read_page_g2r, _rescale,
-    _row_max, _row_max_local, _row_sum, _row_sum_local, _schedule, _stage_end, _uniform, _wait,
+    _MAX_FLOOR, _advance_max, _buffer, _buffer_words, _center_part, _exp, _exp_part, _join, _maximum,
+    _mfma_hazard_wait, _min, _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _read_address, _read_page_g2r,
+    _reround_if, _row_max, _row_max_local, _row_sum, _row_sum_local, _schedule, _softmax_scale, _stage_end,
+    _uniform, _wait,
 )
 
 BM, BN, THREADS = 256, 64, 512
@@ -304,6 +305,25 @@ def _mask(scores, tile, row, q_len, kv_len, causal: fx.Constexpr[bool]):
     return values
 
 
+@flyc.jit
+def _rescale(o0, o1, row_sum, s_cur, old_max, new_max, ballot, exact):
+    """Lazy rescale of O and l when m moved, plus the exact rule for S'(t).
+
+    The FMA S * scale - m is up to ulp(m) / 2 off the rounded m. Once some |m| >= 2^22
+    (checked when m moves, then sticky), S'(t) is also rounded to a multiple of ulp(m).
+    """
+    o0, o1, row_sum, s_cur = fx.Vector(o0), fx.Vector(o1), fx.Float32(row_sum), fx.Vector(s_cur)
+    ballot, exact = fx.Int64(ballot), fx.Int64(exact)
+    if ballot != fx.Int64(0):
+        correction = _exp(fx.Float32(old_max) - fx.Float32(new_max))
+        o0, o1, row_sum = o0 * correction, o1 * correction, row_sum * correction
+        big = fx.absf(fx.Float32(new_max)) >= 2.0**22
+        exact = exact | fx.Int64(rocdl.ballot(fx.Int64.ir_type, big.ir_value()))
+    # A separate branch: merged into the one above, V192 (spilling) lost 5%.
+    s_cur = _reround_if(s_cur, new_max, exact)
+    return o0, o1, row_sum, s_cur, exact
+
+
 def _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, heads, dv):
     """O * inv to BF16, C-shuffled through LDS (r2s b64, s2r b128), then b128 row stores (r2g).
 
@@ -365,16 +385,19 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     S6     exchange row maxima; s2r V(t-1) dims 64-127 [prev]; K(t+1) lands; r2s K(t+1)
     S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
 
-    Softmax in log2 units: S' = S * scale - m, P = exp2(S'), l = sum(P) and O = sum(P V);
-    the output is O / l * v_descale. m starts at the first row max + 1 and moves to a
-    later row max + 1 only when that exceeds m + 7, rescaling O and l.
+    Softmax in log2 units: S' = S * scale - m (one FMA), P = exp2(S'), l = sum(P) and
+    O = sum(P V); the output is O / l * v_descale. m starts at the first row max + 1 and
+    moves to a later row max + 1 only when that exceeds m + 7, rescaling O and l. The
+    FMA is up to ulp(m) / 2 off the rounded m: once some |m| >= 2^22 (checked when m
+    moves, then sticky), a cold branch of _rescale also rounds S'(t) to a multiple of
+    ulp(m), which matches the D256 kernels' rounded products.
     """
     # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
     _helpers = (_read_k_g2r, _k_g2r_offset, _v_g2r_bases, _read_v_g2r, _store_r2s, _read_k_s2r, _read_v_s2r,
                 _read_k_tile_g2r, _read_k_tile_s2r, _read_v_tile_s2r, _qk, _pv, _mask, _v_tail, _join,
                 _mfma_hazard_wait, _maximum, _row_max, _row_max_local, _row_sum, _row_sum_local, _center_part,
                 _exp_part, _pack_probability, _cross32_async, _rescale, _advance_max, _pin, _schedule,
-                _stage_end, _wait)
+                _stage_end, _wait, _reround_if)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -469,8 +492,11 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         s_hi = _qk(q, k_hi, storage, k_base, 1, DQ, DV, True)
         s_0 = _mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
         _mfma_hazard_wait()
-        row_max = _maximum(_row_max(s_0) * scale, fx.Float32(-1.0e30)) + 1.0
+        row_max = _maximum(_row_max(s_0) * scale, fx.Float32(_MAX_FLOOR)) + 1.0
         s_0 = _center_part(s_0, scale, row_max, 0, 32)
+        # The exact rule of _rescale for S'(0); exact carries it through the phases.
+        exact = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (fx.absf(row_max) >= 2.0**22).ir_value()))
+        s_0 = _reround_if(s_0, row_max, exact)
         row_sum = fx.Float32(0.0)
         _stage_end()
         # Memory: both groups read K(0); g2r K(1) (D128) and r2s it into the single K slot.
@@ -483,18 +509,18 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         # The leading group waits one more stage for the trailing group's K(1)
         # writes; an LGKM wait alone cannot cover another wave.
         _stage_end()
-        return s_0, row_max, row_sum, o0, o1, *pages_1, *pages_2
+        return s_0, row_max, row_sum, o0, o1, *pages_1, *pages_2, exact
 
     @flyc.jit
-    def phase(s_prev, row_max, row_sum, o0, o1, page_cur0, page_cur1, page_next0, page_next1, t,
+    def phase(s_prev, row_max, row_sum, o0, o1, page_cur0, page_cur1, page_next0, page_next1, exact, t,
               CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
         """Phase t (table in _body_v128); page_cur*/page_next* are the page ids of tiles t and t+1.
 
         D128 unrolls two phases so CUR/PREV are constants; D192 runs one phase per trip and
-        derives the V slots from t.
+        derives the V slots from t. exact carries the exact rule of _rescale.
         """
         s_prev, row_max, row_sum = fx.Vector(s_prev), fx.Float32(row_max), fx.Float32(row_sum)
-        o0, o1, t = fx.Vector(o0), fx.Vector(o1), fx.Int32(t)
+        o0, o1, exact, t = fx.Vector(o0), fx.Vector(o1), fx.Int64(exact), fx.Int32(t)
         slot_cur = (t & 1) if DQ == 192 else CUR
         slot_prev = ((t - 1) & 1) if DQ == 192 else PREV
         # S0 memory: s2r K(t) keys 0-31; s_load pages(t+2); g2r V(t) (SGPR bases only change).
@@ -558,10 +584,10 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         new_max = (candidate > row_max + 7.0).select(candidate + 1.0, row_max)
         s_cur = _center_part(s_cur, scale, new_max, 0, 32)
         _schedule(DV // 8, 4, 4)
-        o0, o1, row_sum = _rescale(o0, o1, row_sum, row_max, new_max, ballot)
+        o0, o1, row_sum, s_cur, exact = _rescale(o0, o1, row_sum, s_cur, row_max, new_max, ballot, exact)
         new_max = _advance_max(row_max, new_max)
         _stage_end()
-        return s_cur, new_max, row_sum, o0, o1, page_next0, page_next1, page_next2_0, page_next2_1
+        return s_cur, new_max, row_sum, o0, o1, page_next0, page_next1, page_next2_0, page_next2_1, exact
 
     def epilogue(state):
         """exp, row sum and PV of the last tile; V(last) already sits in slot last & 1."""
@@ -647,7 +673,8 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
     _helpers = (_read_k_tile_g2r, _read_v_tile_g2r, _store_tile_r2s, _read_k_tile_s2r, _read_v_tile_s2r,
                 _qk, _pv, _mask, _v_tail, _join, _mfma_hazard_wait, _maximum, _row_max, _row_sum,
-                _center_part, _exp_part, _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait)
+                _center_part, _exp_part, _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait,
+                _reround_if)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -726,8 +753,11 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         s_hi = _qk(q, k_hi, storage, k_base, 1, DQ, DV)
         s_0 = _mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
         _mfma_hazard_wait()
-        row_max = _maximum(_row_max(s_0) * scale, fx.Float32(-1.0e30)) + 1.0
+        row_max = _maximum(_row_max(s_0) * scale, fx.Float32(_MAX_FLOOR)) + 1.0
         s_0 = _center_part(s_0, scale, row_max, 0, 32)
+        # The exact rule of _rescale for S'(0); exact carries it through the phases.
+        exact = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (fx.absf(row_max) >= 2.0**22).ir_value()))
+        s_0 = _reround_if(s_0, row_max, exact)
         row_sum = fx.Float32(0.0)
         _stage_end()
         if fx.const_expr(DQ == 192 or DV == 192):
@@ -741,14 +771,18 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         _stage_end()
         # The leading group waits one more stage for the trailing group's K(1) writes.
         _stage_end()
-        return s_0, row_max, row_sum, o0, o1, v_0, *pages_1, *pages_2
+        return s_0, row_max, row_sum, o0, o1, v_0, *pages_1, *pages_2, exact
 
     @flyc.jit
-    def phase(s_prev, row_max, row_sum, o0, o1, v_pending, page_cur0, page_cur1, page_next0, page_next1, t,
+    def phase(s_prev, row_max, row_sum, o0, o1, v_pending, page_cur0, page_cur1, page_next0, page_next1, exact, t,
               CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
-        """Phase t (table in _body_wide); v_pending is the staged V(t-1) of the single-slot path."""
+        """Phase t (table in _body_wide); v_pending is the staged V(t-1) of the single-slot path.
+
+        exact carries the exact rule of _rescale.
+        """
         s_prev, row_max, row_sum = fx.Vector(s_prev), fx.Float32(row_max), fx.Float32(row_sum)
         o0, o1, v_pending, t = fx.Vector(o0), fx.Vector(o1), fx.Vector(v_pending), fx.Int32(t)
+        exact = fx.Int64(exact)
         # S0 memory: s2r K(t) keys 0-31; single slot publishes V(t-1); pages(t+2); g2r V(t), K(t+1).
         k_lo = _read_k_tile_s2r(storage, k_base, 0, DQ, DV)
         rocdl.sched_barrier(0)
@@ -814,10 +848,11 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         o1 = _pv(p_bf16, v_hi, o1, DV)
         s_cur = _center_part(s_cur, scale, new_max, split, 32)
         _schedule(DV // 8, 4, 4)
-        o0, o1, row_sum = _rescale(o0, o1, row_sum, row_max, new_max, ballot)
+        o0, o1, row_sum, s_cur, exact = _rescale(o0, o1, row_sum, s_cur, row_max, new_max, ballot, exact)
         _stage_end()
         v_pending = fx.Vector.filled(DV // 16, 0, fx.Int32) if v_ring else v_cur
-        return s_cur, new_max, row_sum, o0, o1, v_pending, page_next0, page_next1, page_next2_0, page_next2_1
+        return (s_cur, new_max, row_sum, o0, o1, v_pending, page_next0, page_next1, page_next2_0, page_next2_1,
+                exact)
 
     def epilogue(state):
         """Single slot: r2s V(last). exp, row sum and PV of the last tile."""
@@ -941,7 +976,8 @@ def _launch_attention(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LS
     grid = (min(CUS, H * B * ((MAX_Q + BM - 1) // BM)), 1, 1) if PERSISTENT else (H, B, (MAX_Q + BM - 1) // BM)
     _attention_kernel_942(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, H, HK, NP, B,
         MAX_Q, DQ, DV, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, PERSISTENT, CUS,
-        value_attrs={"rocdl.waves_per_eu": 2, "passthrough": [["target-features", "-packed-fp32-ops"]]},
+        value_attrs={"rocdl.waves_per_eu": 2,
+                     "llvm.target_features": ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')},
     ).launch(grid=grid, block=(THREADS, 1, 1), stream=stream)
 
 
@@ -964,10 +1000,14 @@ class _PagedAttention:
                  kv_last_page_lens, out=None, sink_ptr=None, stream=None, *, return_lse=False, lse=None, softmax_scale=None):
         """Run with contiguous SHUFFLE-5D KV and asynchronous device metadata.
 
-        Descales are finite positive FP32. Metadata must be consistent/in-bounds;
-        no GPU metadata is copied to the host. Active KV must be nonempty and
-        causal KV >= Q. Caller output/LSE must not overlap inputs or each other.
-        Empty Q returns without dispatch. Warm before graph capture.
+        Descales are finite positive FP32 and the scale product
+        softmax_scale * log2(e) * q_descale * k_descale must stay a positive
+        finite FP32. K/V within each KV length must be finite: rows of a causal
+        tile share its V, so a non-finite value also reaches rows that mask its
+        key. Metadata must be consistent/in-bounds; no GPU metadata is copied to
+        the host. Active KV must be nonempty and causal KV >= Q. Caller output/LSE
+        must not overlap inputs or each other. Empty Q returns without dispatch.
+        Warm before graph capture.
         """
         if not isinstance(causal, bool) or causal != self.causal or not isinstance(return_lse, bool):
             raise ValueError("causal must match the factory; return_lse must be bool")
@@ -1025,11 +1065,7 @@ class _PagedAttention:
             raise ValueError("K/V descales must each contain one value")
         if q_descale.numel() != 1 and (self.quant_query_mode != "per-token" or q_descale.numel() != tokens * self.heads):
             raise ValueError("Q descale must be scalar or one value per token/head")
-        if isinstance(softmax_scale, (torch.Tensor, bool)):
-            raise ValueError("softmax_scale must be a host scalar or None")
-        scale = self.dq**-0.5 if softmax_scale is None else float(softmax_scale)
-        if not math.isfinite(scale) or scale <= 0:
-            raise ValueError("softmax_scale must be finite and positive")
+        scale = _softmax_scale(softmax_scale, self.dq**-0.5)
         out_shape, lse_shape = (tokens, self.heads, self.dv), (tokens, self.heads)
         if tokens * self.heads * self.dv * 2 >= 2**31:
             raise NotImplementedError("output byte span must fit signed int32 addressing")
@@ -1177,6 +1213,8 @@ def flash_attn_varlen_func(
     them arbitrarily. Without a table, page_size imposes no padding requirement.
     Missing CK means self-attention with CQ boundaries and equal Q/K token counts.
     Causal masking is bottom-right. Q/K/V/O pointers must be 16-byte aligned.
+    K/V rows within each KV length must be finite: rows of a causal tile share its
+    V, so a non-finite value also reaches rows that mask its key.
     Warm metadata and the core specialization before capture; rewarm after edits.
     Metadata must track PyTorch versions. persistent=None selects True.
     """
@@ -1211,11 +1249,7 @@ def flash_attn_varlen_func(
     for name, value in (("max_seqlen_q", max_seqlen_q), ("max_seqlen_k", max_seqlen_k)):
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < 2**31:
             raise ValueError(f"{name} must be a nonnegative signed-int32 host bound")
-    if softmax_scale is not None and (not isinstance(softmax_scale, Real) or isinstance(softmax_scale, bool)):
-        raise ValueError("softmax_scale must be a host real scalar or None")
-    scale = 1.0 / 16 if softmax_scale is None else float(softmax_scale)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("softmax_scale must be finite and positive")
+    scale = _softmax_scale(softmax_scale, 1.0 / 16)
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise ValueError("Q must be a device tensor on gfx942")
     device = q.device

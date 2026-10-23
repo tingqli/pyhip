@@ -18,7 +18,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
-from ._common import _exp, _min, _uniform
+from ._common import _MAX_FLOOR, _exp, _min, _softmax_scale, _uniform
 from ._dsl import select, rmem, resource, wait
 
 
@@ -281,7 +281,7 @@ def _swa_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.
             scale = scale * QS[0]
         first = _max(qstart + kv_len - q_len - WINDOW, fx.Int32(0)) & -BN
         end = _max(_min(qstart + valid_q + kv_len - q_len, kv_len), fx.Int32(0))
-        maximum, total = fx.Float32(-1.0e30), fx.Float32(0.0)
+        maximum, total = fx.Float32(_MAX_FLOOR), fx.Float32(0.0)
         output = fx.Vector.filled(DV // 4, 0.0, fx.Float32)
         if fx.const_expr(HAS_SINK):
             sink = fx.Float32(SINK[head]) * fx.Float32(LOG2E)
@@ -384,7 +384,7 @@ def _swa32_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: f
             scale0, scale1 = scale0 * QS[0], scale1 * QS[0]
         first = _max(qstart + kv_len - q_len - WINDOW, fx.Int32(0)) & -BN
         end = _max(_min(qstart + valid_q + kv_len - q_len, kv_len), fx.Int32(0))
-        maximum0, total0 = fx.Float32(-1.0e30), fx.Float32(0.0)
+        maximum0, total0 = fx.Float32(_MAX_FLOOR), fx.Float32(0.0)
         if fx.const_expr(HAS_SINK):
             sink = fx.Float32(SINK[head]) * fx.Float32(LOG2E)
             maximum0 = _maxf(maximum0, sink)
@@ -483,9 +483,7 @@ class _SWA:
             raise ValueError("descales must be contiguous device FP32")
         if k_descale.numel() != 1 or v_descale.numel() != 1 or q_descale.numel() not in (1, Q.shape[0] * self.heads):
             raise ValueError("expected scalar K/V and scalar or per-token/head Q descales")
-        scale = self.dq**-0.5 if softmax_scale is None else float(softmax_scale)
-        if not math.isfinite(scale) or scale <= 0:
-            raise ValueError("softmax_scale must be finite and positive")
+        scale = _softmax_scale(softmax_scale, self.dq**-0.5)
         stream = torch.cuda.current_stream(Q.device) if stream is None else stream
         if stream.device != Q.device:
             raise ValueError("stream must belong to the input GPU")
@@ -526,7 +524,9 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
     Explicit query_tile={16,32} and block_n={16,32,64} allow measured tuning.
     Caller-owned device metadata must describe valid pages/lengths, with actual
     query lengths bounded by max_seqlen_q. Sink logits are unscaled natural
-    logits (finite or -inf), and contribute no value to the numerator.
+    logits (finite or -inf), and contribute no value to the numerator. K/V
+    within each KV length must be finite: rows of a tile share its V, so a
+    non-finite value also reaches rows that mask its key.
     """
     if head_dim_qk not in (128, 192) or (head_dim_v, page_size, key_layout) != (DV, PAGE, "vectorized"):
         raise NotImplementedError("SWA supports BF16 D128/D192 V128 page64 SHUFFLE-5D only")

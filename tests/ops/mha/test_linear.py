@@ -138,6 +138,21 @@ def test_streams_graph_and_metadata_invalidation(device):
             flash_attn_varlen_func(**args)
 
 
+@pytest.mark.parametrize("page", (None, 4))
+@pytest.mark.parametrize("q_value,k_value", ((65536.0, 66048.0), (2.0**50, -(2.0**50))),
+                         ids=("near_1e11", "below_-1e30"))
+def test_extreme_logits(device, page, q_value, k_value):
+    """Constant Q/K and V = 1 give O = 1: logits near 1e11 (an FMA against the rounded
+    max is thousands off) and below the former -1e30 floor."""
+    args, _ = linear_inputs(device, qlens=(65, 129), klens=(193, 257), page=page, heads=6, kv_heads=2,
+                            causal=True, reference=False)
+    args["q"].fill_(q_value)
+    args["k"].fill_(k_value)
+    args["v"].fill_(1.0)
+    out = flash_attn_varlen_func(**(args | {"return_lse": False}))
+    torch.testing.assert_close(out.float(), torch.ones_like(out, dtype=torch.float32), rtol=0, atol=0.01)
+
+
 @pytest.mark.parametrize("option", ({"dropout_p": 0.1}, {"num_waves": 4}, {"page_size": 2}, {"bias": 0}))
 def test_unsupported_options(option):
     args = dict(q=None, k=None, v=None, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0)
@@ -147,7 +162,10 @@ def test_unsupported_options(option):
 
 def test_invalid_scale_metadata_and_alias(device):
     args, _ = linear_inputs(device, page=4, reference=False)
-    for scale in (0, -1, float("nan"), float("inf")):
+    for scale in (torch.tensor(0.1), True):
+        with pytest.raises(TypeError, match="softmax_scale"):
+            flash_attn_varlen_func(**(args | {"softmax_scale": scale}))
+    for scale in (0, -1, float("nan"), float("inf"), 1e-46, 3e38):
         with pytest.raises(ValueError, match="softmax_scale"):
             flash_attn_varlen_func(**(args | {"softmax_scale": scale}))
     with pytest.raises(ValueError, match="overlap"):

@@ -293,7 +293,8 @@ def torch_reference(case, causal, softmax_scale=None, *, return_lse=False):
                 logits = torch.cat((logits, case.sinks[:, None, None].expand(-1, end - start, 1)), -1)
             if return_lse:
                 lse[offset + start:offset + end] = logits.logsumexp(-1).transpose(0, 1)
-            probabilities = logits.softmax(-1).nan_to_num(0.0)
+            # Only rows without a visible key output 0; any other NaN must propagate.
+            probabilities = logits.softmax(-1).masked_fill(torch.isneginf(logits).all(-1, keepdim=True), 0.0)
             if case.sinks is not None:
                 probabilities = probabilities[..., :-1]
             output[offset + start:offset + end] = (probabilities @ v[:, first:last]).transpose(0, 1)

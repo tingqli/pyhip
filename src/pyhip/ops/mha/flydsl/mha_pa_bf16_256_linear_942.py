@@ -21,9 +21,9 @@ from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 from ._common import (
-    _advance_max, _buffer, _center, _cross, _exps, _join, _mask, _max, _maximum, _min, _pack,
-    _pack_bf16, _pin, _pin_i32, _qk, _read_address, _read_q_g2r, _rescale, _schedule, _stage_end,
-    _sum, _uniform, _wait,
+    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _mask, _max, _maximum, _min, _pack,
+    _pack_bf16, _pin, _pin_i32, _qk, _read_address, _read_q_g2r, _rescale, _scale, _schedule, _schedule_exps,
+    _stage_end, _sum, _uniform, _wait,
 )
 
 BM, BN, D, THREADS = 128, 64, 256, 512
@@ -194,13 +194,13 @@ def _pv(probabilities, values, output, progressive=False, prepared=None, center_
     """O += P V over one V half (transposed in registers with v_perm), softmax VALU folded in.
 
     summary_args = (S, lane sum, other sums, l) also returns l + row sum and the lane max of S;
-    center_args = (S, lane max, other maxima, scale, m) returns S * scale - m', m' and the ballot.
+    center_args = (S, lane max, other maxima, scale, m) returns S * scale, m' and the ballot.
     """
     p = fx.Vector(probabilities)
     acc = [fx.Vector.from_elements([output[n * 4 + i] for i in range(4)], fx.Float32) for n in range(8)]
     prepared_steps = 0 if prepared is None else prepared.numel // 16
     operands = _v_operands(values, 0, progressive) if prepared is None else fx.Vector.from_elements([prepared[i] for i in range(16)], fx.Int32)
-    centered = []
+    scaled = []
     rocdl.sched_barrier(0)
     for step in range(steps):
         if step + 1 < prepared_steps:
@@ -220,9 +220,7 @@ def _pv(probabilities, values, output, progressive=False, prepared=None, center_
                 ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, predicate.ir_value()))
                 new_max = predicate.select(candidate + 1.0, maximum)
             for i in range(step * 4, step * 4 + 4):
-                centered.append(fx.Float32(llvm.inline_asm(fx.Float32.ir_type,
-                    [current[i].ir_value(), scale.ir_value(), new_max.ir_value()],
-                    "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False)))
+                scaled.append(fx.Float32(current[i]) * scale)
         if summary_args is not None and step == 3:
             current, total, sums, row_sum = summary_args
             row_sum = row_sum + ((total + sums[0]) + (sums[1] + sums[2]))
@@ -235,7 +233,8 @@ def _pv(probabilities, values, output, progressive=False, prepared=None, center_
         operands = following
     result = fx.Vector.from_elements([acc[n][i] for n in range(8) for i in range(4)], fx.Float32)
     if center_args is not None:
-        return result, fx.Vector.from_elements(centered, fx.Float32), new_max, ballot
+        # Pinned: unpinned, LLVM sinks the scaling into the next memory stage.
+        return result, _pin(fx.Vector.from_elements(scaled, fx.Float32)), new_max, ballot
     if summary_args is not None:
         return result, row_sum, candidate
     return result
@@ -294,7 +293,7 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
 
     step  memory stage                                compute stage
     0     g2r rows(t+2); g2s V(t-1) with s2r K(t)     QK: S(t) keys 0-31
-          keys 0-31 between its packets               softmax: P(t-1) = exp2(S'(t-1))
+          keys 0-31 between its packets               softmax: P(t-1) = exp2(S'(t-1) - m)
     1     s2r K(t) keys 32-63; V(t-1) lands           QK: S(t) keys 32-63
                                                       softmax: row sum of P(t-1), P to BF16
     2     exchange row sums; g2s K(t+1) with s2r      mask S(t); PV: O dims 0-127 += P V
@@ -305,15 +304,16 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
     A static B1 noncausal shape whose last tile has at most 32 keys runs that tile as a
     NARROW phase (no keys 32-63) and drains only the first 32-token V plane.
 
-    Softmax in log2 units: S' = S * scale - m, P = exp2(S'), l = sum(P) and O = sum(P V);
-    the output is O / l. m starts at the first row max + 1 and moves to a later row max
-    + 1 only when that exceeds m + 7, rescaling O and l.
+    Softmax in log2 units: S' = S * scale, P = exp2(S' - m), l = sum(P) and O = sum(P V);
+    the output is O / l. S' is rounded before m is subtracted, like m itself. m starts at
+    the first row max + 1 and moves to a later row max + 1 only when that exceeds m + 7,
+    rescaling O and l.
     """
     # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
     _helpers = (_read_kv_rows_g2r, _dma_offsets, _read_packet_g2s, _k_reads, _v_reads, _k_operand, _words,
                 _read_k_s2r, _read_v_s2r, _v_operands, _pv, _qk, _sum, _max, _cross, _exps, _pack,
-                _pack_probabilities, _mask, _center, _rescale, _advance_max, _join, _maximum, _pin,
-                _schedule, _stage_end, _wait)
+                _pack_probabilities, _mask, _scale, _rescale, _advance_max, _join, _maximum, _pin,
+                _schedule, _schedule_exps, _stage_end, _wait)
     pack = _pack_probabilities if STATIC_Q > 0 else _pack
     if fx.const_expr(STATIC_Q > 0):
         q0, k0 = fx.Int32(0), fx.Int32(0)
@@ -401,12 +401,11 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
         _stage_end()
         # Compute: QK S(0) keys 32-63; softmax m and S'(0).
         s_hi = _qk(q, k_hi)
-        s_0 = _mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
+        s_0 = _scale(_mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL), scale)
         row_max = _max(s_0)
         row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
         row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
-        row_max = _maximum(row_max * scale, fx.Float32(-1.0e30)) + 1.0
-        s_0 = _center(s_0, scale, row_max)
+        row_max = _maximum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
         row_sum = fx.Float32(0.0)
         _stage_end()
         # Memory: g2s K(1); no compute.
@@ -430,12 +429,12 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
         rows_next2 = read_rows_g2r(_min(t + 2, last))
         k_lo = _k_operand(read_v_g2s(soffsets_prev, s2r=_k_reads(k_s2r, 0)))
         _stage_end()
-        # Step 0 compute: QK S(t) keys 0-31; P(t-1) = exp2(S'(t-1)).
+        # Step 0 compute: QK S(t) keys 0-31; P(t-1) = exp2(S'(t-1) - m).
         _wait(lgkmcnt=0)
         rocdl.sched_barrier(0)
         s_lo = _qk(q, k_lo)
-        p_prev = _exps(s_prev)
-        _schedule(32, 1, 1, True)
+        p_prev = _exps(s_prev, row_max)
+        _schedule_exps(16, 1, 1, 2)
         _stage_end()
         # Step 1 memory: s2r K(t) keys 32-63 (none for a NARROW tile); V(t-1) lands.
         if fx.const_expr(not NARROW):
@@ -489,7 +488,7 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
         # Memory: g2s V(last); a narrow tail drains only the first 32-token plane.
         read_v_g2s(fx.Vector(soffsets_last), tail_tile=last, packets=8 if narrow_tail else 16)
         # P(last) and l are computed while V(last) lands.
-        p_last = _exps(fx.Vector(s_last))
+        p_last = _exps(fx.Vector(s_last), fx.Float32(row_max))
         lane_sum = _sum(p_last)
         lane_sum = lane_sum + lane_sum.shuffle_xor(16, 64)
         lane_sum = lane_sum + lane_sum.shuffle_xor(32, 64)
@@ -621,7 +620,8 @@ def _launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tens
     tasks = H * B * ((MAX_Q + BM - 1) // BM)
     _linear_256_kernel(Q, K, V, O, LSE, CQ, CK, TABLE, H, HK, NK, B, MAX_Q, MAX_PAGES,
         PAGE, PAGED, CAUSAL, WITH_LSE, SCALE, PERSISTENT, CUS, STATIC_Q, STATIC_K,
-        value_attrs={"rocdl.waves_per_eu": 2, "passthrough": [["target-features", "-packed-fp32-ops"]]},
+        value_attrs={"rocdl.waves_per_eu": 2,
+                     "llvm.target_features": ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')},
     ).launch(grid=(min(CUS, tasks) if PERSISTENT else tasks, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 

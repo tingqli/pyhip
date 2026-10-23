@@ -144,3 +144,80 @@ def test_fp8_mha(dq, causal, mode):
     w = Workload("fp8_lds_edges", (0, 7, 33, 129), (63, 65, 193, 257), dq=dq,
                  heads=6, kv_heads=2, causal=causal, scale_mode=mode)
     check_paged(w, [FP8], poison_tail=True)
+
+
+# (Q, K, Q/K descale) for BF16 and FP8, giving equal logits per row: near +1e11 an FMA
+# S * scale - m against the rounded max is thousands off (the FP8 K = 120 makes S * scale
+# inexact); near -2e31 they sit below the former -1e30 floor.
+EXTREME_LOGITS = {
+    "near_1e11": ((65536.0, 66048.0, 1.0), (128.0, 120.0, 2.0**9)),
+    "below_-1e30": ((2.0**50, -(2.0**50), 1.0), (128.0, -120.0, 2.0**45)),
+}
+
+
+def _constant_case(backend, dq, q_value, k_value, descale, small_k=None):
+    """Constant Q/K (K = small_k on the first two pages of each sequence), V = 1: every output is 1."""
+    case = make_case((65, 129), (193, 257), dtype=backend.dtype, dq=dq, dv=256 if dq == 256 else 128,
+                     heads=4, kv_heads=2, mode="per-tensor", poison_tail=False,
+                     window_left=128 if backend == SWA else -1, source_dtype=torch.bfloat16)
+
+    def fill(tensor, value):
+        tensor.copy_(torch.full(tensor.shape, value, device=tensor.device).to(tensor.dtype))
+
+    fill(case.q, q_value)
+    fill(case.k_pages, k_value)
+    fill(case.v_pages, 1.0)
+    if small_k is not None:
+        for pos in (0, 1, 4, 5):
+            fill(case.k_pages[case.page_order[pos]], small_k)
+    case.qs.fill_(descale)
+    case.ks.fill_(descale)
+    case.k, case.v = vectorize_kv(case.k_pages, case.v_pages)
+    return case
+
+
+@pytest.mark.parametrize("logits", tuple(EXTREME_LOGITS))
+@pytest.mark.parametrize("causal", (False, True))
+@pytest.mark.parametrize("backend,dq", [(BF16_942, 128), (BF16_942, 192), (BF16_942, 256), (BF16_942_GRID, 128),
+                                        (FP8, 128), (FP8, 192), (SWA, 128), (BF16_950, 128)],
+                         ids=lambda value: value.name if hasattr(value, "name") else f"d{value}")
+def test_extreme_logits(backend, dq, causal, logits):
+    """Constant Q/K and V = 1 give O = 1 at logits near 1e11 and below -1e30."""
+    require(*(("gfx942", "gfx950") if backend.arch == "both" else (backend.arch,)))
+    if backend == SWA and not causal:
+        pytest.skip("single-wave SWA is causal")
+    q_value, k_value, descale = EXTREME_LOGITS[logits][backend.fp8]
+    case = _constant_case(backend, dq, q_value, k_value, descale)
+    call, out, _ = make_call(case, backend, causal)
+    call()
+    torch.testing.assert_close(out.float(), torch.ones_like(out, dtype=torch.float32), rtol=0, atol=0.01)
+
+
+@pytest.mark.parametrize("backend,dq,lse", [(FP8, 128, False), (BF16_942, 128, False), (BF16_942, 192, False),
+                                            (BF16_942, 128, True)],
+                         ids=("fp8", "bf16-d128", "bf16-d192", "bf16-d128-lse"))
+def test_logits_cross_exact_threshold(backend, dq, lse):
+    """Tiles 0-1 keep |m| < 2^22 (FMA centering); tile 2 raises m to ~2^28 (FP8) or ~2^36
+    (BF16), where only the exact rule keeps P(max) = 1 (FP8 would pass 240, BF16 2^128)."""
+    require("gfx942")
+    q_value, k_value, descale = (128.0, 120.0, 41.25) if backend.fp8 else (65536.0, 66048.0, 1.0)
+    case = _constant_case(backend, dq, q_value, k_value, descale, small_k=1.0)
+    for causal in (False, True):
+        call, out, _ = make_call(case, backend, causal)
+        call(lse=torch.empty(case.q.shape[:2], device="cuda") if lse else None)
+        torch.testing.assert_close(out.float(), torch.ones_like(out, dtype=torch.float32), rtol=0, atol=0.01)
+
+
+@pytest.mark.parametrize("backend", (BF16_942, FP8, SWA, BF16_950), ids=lambda b: b.name)
+def test_softmax_scale_validation(backend):
+    """Host scalars only; softmax_scale * log2(e) must be a positive finite FP32."""
+    require(*(("gfx942", "gfx950") if backend.arch == "both" else (backend.arch,)))
+    case = make_case((7,), (65,), dtype=backend.dtype, dq=128, heads=2, kv_heads=1, poison_tail=False,
+                     window_left=16 if backend == SWA else -1, source_dtype=torch.bfloat16)
+    call, _, _ = make_call(case, backend, backend == SWA)
+    for scale in (torch.tensor(0.1), True):
+        with pytest.raises(TypeError, match="softmax_scale"):
+            call(softmax_scale=scale)
+    for scale in (0.0, -1.0, float("nan"), float("inf"), 1e-46, 3e38):
+        with pytest.raises(ValueError, match="softmax_scale"):
+            call(softmax_scale=scale)

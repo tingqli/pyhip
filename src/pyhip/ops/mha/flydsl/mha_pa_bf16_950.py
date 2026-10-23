@@ -18,7 +18,9 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
-from ._common import _exp, _min, _pin, _pin_i32, _schedule, _stage_end, _uniform
+from ._common import (
+    _MAX_FLOOR, _exp, _min, _pin, _pin_i32, _reround_if, _schedule, _softmax_scale, _stage_end, _uniform,
+)
 from ._dsl import select, rmem, resource, wait
 
 
@@ -88,7 +90,7 @@ def _cross32(value, maximum=False):
 
 def _row_max(scores):
     scores = fx.Vector(scores)
-    result = fx.Float32(-1.0e30)
+    result = fx.Float32(_MAX_FLOOR)
     for i in range(32):
         result = result.maximumf(scores[i])
     return _cross32(result, True)
@@ -264,9 +266,15 @@ def _mask(scores, tile, wave_row, kv_len, q_len, causal: fx.Constexpr[bool], win
 
 
 @flyc.jit
-def _rescale(o0, o1, o2, o3, old_max, new_max, row_sum, mask):
+def _rescale(o0, o1, o2, o3, old_max, new_max, row_sum, mask, s_cur, exact):
+    """Lazy rescale of O and l when m moved, plus the exact rule for S'(t).
+
+    The FMA S * scale - m is up to ulp(m) / 2 off the rounded m. Once some |m| >= 2^22
+    (checked when m moves, then sticky), S'(t) is also rounded to a multiple of ulp(m).
+    """
     o0, o1, o2, o3 = fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3)
     old_max, new_max, row_sum = fx.Float32(old_max), fx.Float32(new_max), fx.Float32(row_sum)
+    mask, s_cur, exact = fx.Int64(mask), fx.Vector(s_cur), fx.Int64(exact)
     if mask != fx.Int64(0):
         correction = _exp(old_max - new_max)
         o0 = o0 * correction
@@ -274,7 +282,9 @@ def _rescale(o0, o1, o2, o3, old_max, new_max, row_sum, mask):
         o2 = o2 * correction
         o3 = o3 * correction
         row_sum = row_sum * correction
-    return o0, o1, o2, o3, row_sum
+        exact = exact | fx.Int64(rocdl.ballot(fx.Int64.ir_type, (fx.absf(new_max) >= 2.0**22).ir_value()))
+    s_cur = _reround_if(s_cur, new_max, exact)
+    return o0, o1, o2, o3, row_sum, s_cur, exact
 
 def _store_o_r2g(outputs, inv, o_buf, out_tid, out_row, orow):
     """O * inv to BF16 (cvt_pk), lane halves swapped with permlane32 into 16-byte row pieces."""
@@ -327,13 +337,17 @@ def _attention_body(
     S6     s2r V(t-1) dims 64-127 [prev]; STAGGER: g2s rest of K(t+2)
     S7     PV: O dims 64-127 += P V; softmax: S'(t) values split..31; rescale O and l
 
-    Softmax in log2 units: S' = S * scale - m, P = exp2(S'), l = sum(P) and O = sum(P V);
-    the output is O / l * v_descale. m moves to a larger row max only when that exceeds m
-    by more than 8. A sink is one zero-value virtual key per head that only adds to l.
+    Softmax in log2 units: S' = S * scale - m (one FMA), P = exp2(S'), l = sum(P) and
+    O = sum(P V); the output is O / l * v_descale. m moves to a larger row max only when
+    that exceeds m by more than 8. The FMA is up to ulp(m) / 2 off the rounded m: once
+    some |m| >= 2^22 (checked when m moves, then sticky), a cold branch of _rescale also
+    rounds S'(t) to a multiple of ulp(m). A sink is one zero-value virtual key per head
+    that only adds to l.
     """
     # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
     _helpers = (_dma_g2s, _read_qk_s2r, _read_v_s2r, _qk, _pv, _mask, _mask_v_tail, _join, _row_max, _row_sum,
-                _exp, _exp_slice, _center_slice, _rescale, _page_ready, _pin, _pin_f32, _schedule, _stage_end, wait)
+                _exp, _exp_slice, _center_slice, _rescale, _page_ready, _pin, _pin_f32, _schedule, _stage_end, wait,
+                _reround_if)
     K_CHUNKS = DQ // 64
     K_TILE = 8 * K_CHUNKS * 520
     KEEP_VMCNT = K_CHUNKS + 2
@@ -466,7 +480,7 @@ def _attention_body(
         # Compute: QK S(0) keys 32-63; softmax m (with the sink) and S'(0).
         s_hi = _qk(q_frag, k_hi, visible_wave_tile(fx.Int32(0)))
         s_0 = _mask(_join(s_lo, s_hi), data_tile(fx.Int32(0)), wave_row, kv_len, q_len, CAUSAL, WINDOW)
-        row_max = (_row_max(s_0) * scale).maximumf(fx.Float32(-1.0e30))
+        row_max = (_row_max(s_0) * scale).maximumf(fx.Float32(_MAX_FLOOR))
         row_sum = fx.Float32(0.0)
         if fx.const_expr(HAS_SINK):
             # One zero-value virtual key per head. row_sum is already reduced
@@ -475,18 +489,24 @@ def _attention_body(
             row_max = row_max.maximumf(sink_log2)
             row_sum = _exp(sink_log2 - row_max)
         s_0 = _center_slice(s_0, scale, row_max, 0, 32)
+        # The exact rule of _rescale for S'(0); exact carries it through the phases.
+        exact = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (fx.absf(row_max) >= 2.0**22).ir_value()))
+        s_0 = _reround_if(s_0, row_max, exact)
         wait(vmcnt=2)
         _stage_end()
         # Memory: g2s K(2) into the retired slot 0.
         read_k_g2s(page2, 0)
         _stage_end()
-        return q_frag, (s_0, row_max, row_sum, o0, o1, o2, o3, page1, page2)
+        return q_frag, (s_0, row_max, row_sum, o0, o1, o2, o3, page1, page2, exact)
 
     @flyc.jit
-    def phase(s_prev, row_max, row_sum, o0, o1, o2, o3, page_cur, page_next, t,
+    def phase(s_prev, row_max, row_sum, o0, o1, o2, o3, page_cur, page_next, exact, t,
               CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
-        """Phase t (table in _attention_body); page_cur/page_next are the page ids of tiles t and t+1."""
-        s_prev = fx.Vector(s_prev)
+        """Phase t (table in _attention_body); page_cur/page_next are the page ids of tiles t and t+1.
+
+        exact carries the exact rule of _rescale.
+        """
+        s_prev, exact = fx.Vector(s_prev), fx.Int64(exact)
         o0, o1, o2, o3 = fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3)
         row_max, row_sum, t = fx.Float32(row_max), fx.Float32(row_sum), fx.Int32(t)
         # S0 memory: s2r K(t) keys 0-31; STAGGER: g2s V(t).
@@ -575,9 +595,10 @@ def _attention_body(
         else:
             _schedule(2, 3, 4)
             _schedule(5, 4, 4)
-        o0, o1, o2, o3, row_sum = _rescale(o0, o1, o2, o3, row_max, new_max, row_sum, ballot)
+        o0, o1, o2, o3, row_sum, s_cur, exact = _rescale(o0, o1, o2, o3, row_max, new_max, row_sum, ballot, s_cur,
+                                                         exact)
         _stage_end()
-        return s_cur, new_max, row_sum, o0, o1, o2, o3, page_next, page_next2
+        return s_cur, new_max, row_sum, o0, o1, o2, o3, page_next, page_next2, exact
 
     def epilogue(state):
         """exp, row sum and PV of the last tile; V(last) sits in slot last & 1."""
@@ -746,6 +767,9 @@ def _atomic_increment(counter, index):
 
 @flyc.jit
 def _next_ticket(counter, mailbox, tid):
+    # Every wave read the previous ticket before this rendezvous; a task without
+    # barriers (empty KV) would otherwise let tid 0 overwrite it first.
+    _stage_end()
     if tid == 0:
         mailbox[0] = _atomic_increment(counter, 0)
         wait(lgkmcnt=0)
@@ -905,6 +929,9 @@ class _PagedAttention:
                  kv_last_page_lens, out=None, sink_ptr=None, stream=None, *, return_lse=False, lse=None, softmax_scale=None):
         """Run paged attention; descales must be finite and strictly positive.
 
+        softmax_scale * log2(e) * q_descale * k_descale must be a positive finite
+        FP32. K/V within each KV length must be finite: rows of a causal tile share
+        its V, so a non-finite value also reaches rows that mask its key.
         A sink is an unscaled natural-logit, per query head, for a virtual key
         with value zero. Finite sink logits and -inf (disabled) are supported.
         GPU metadata values (page IDs, prefix sums, last-page lengths and the
@@ -934,8 +961,7 @@ class _PagedAttention:
             raise ValueError("sequence-length bounds must be nonnegative")
         if K.numel() * K.element_size() >= 2**31:
             raise NotImplementedError("physical KV cache must fit the signed 32-bit buffer offset")
-        if softmax_scale is not None and (not math.isfinite(softmax_scale) or softmax_scale <= 0):
-            raise ValueError("softmax_scale must be finite and positive")
+        scale = _softmax_scale(softmax_scale, 1 / math.sqrt(self.dq))
         batch = cu_seqlens_q.numel() - 1
         if batch < 1 or kv_indptr.numel() != batch + 1 or kv_last_page_lens.numel() != batch:
             raise ValueError("inconsistent batch metadata")
@@ -971,8 +997,7 @@ class _PagedAttention:
                 self.heads, self.kv_heads, K.shape[0], batch, max_seqlen_q,
                 self.dq, self.window_left, self.has_sink,
                 Q.stride(0), Q.stride(1), out.stride(0), out.stride(1),
-                q_descale.numel() != 1, self.causal, lse is not None,
-                float(1 / math.sqrt(self.dq) if softmax_scale is None else softmax_scale),
+                q_descale.numel() != 1, self.causal, lse is not None, scale,
             )
             if self.persistent:
                 counter, grid = self._scheduler(Q.device, stream, batch, max_seqlen_q)

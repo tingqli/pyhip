@@ -266,7 +266,7 @@ union受最长任务限制，指提案1中最长tile的步数M大于全部union�
 - 每个mask CTA处理一个tile（从最后一个tile开始），4个wave分别处理part 0–3：part p负责的N64步nt满足`nt mod 64`∈[16p, 16p+16)。wave内lane//4选nt，lane%4为quarter（每个N64步的64列分为4组，每组16列）。
 - 一个N64步对应并集里的16个slot（16nt..16nt+15）。quarter q负责slot 16nt+2q、+2q+1、+2q+8、+2q+9，正是K5的MFMA里该lane持有的16个分数列（每块4个token）。
 - 对tile的每个query：可见token数vis = min(pos0+query+1, kv_len)。对每个slot：该query选了这个块，就取块内可见token的位`(1 << clamp(vis − 4·块号, 0, 4)) − 1`（完整块0xF，尾块只有前vis%4位），否则为0。4个slot的4位拼成16位，写入`score_masks[tile, nt, query, quarter]`。
-- K5每步每lane只读一个16位字（[_prefetch_mask](attention_union.py#L132)，`buffer_load_ushort`），第i位为0的分数列置为−inf（[_apply_mask](attention_union.py#L149)）。
+- K5每步每lane只读一个16位字（[_prefetch_mask](attention_union.py#L133)，`buffer_load_ushort`），第i位为0的分数列置为−inf（[_apply_mask](attention_union.py#L150)）。
 
 示例：BQ=2，两行位置为161、162，vis分别为162、163：完整块都是0–39，因果尾都在块40，分别有2、3个token。某N64步quarter 0的4个slot依次为块5、9、33、40（并集升序，slot 2–7是9与33之间的其它块）；q0选了块5、33和尾块40，q1选了块9、33和尾块40。
 
@@ -336,7 +336,7 @@ _masks(cta):                                      # 每CTA 4个wave，每个wave
             score_masks[tile, nt, q, quarter] = nib_0 | nib_1 << 4 | nib_2 << 8 | nib_3 << 12   # int16
 ```
 
-#### 1.2.6 K5 union（[_kernel](attention_union.py#L556)、[_body](attention_union.py#L208)、[phase](attention_union.py#L362)）
+#### 1.2.6 K5 union（[_kernel](attention_union.py#L556)、[_body](attention_union.py#L209)、[phase](attention_union.py#L362)）
 
 K5是持久kernel：GRID个CTA循环领取`task_order`中的任务，一个任务算完一个(tile, KV头, 128行切片)的attention输出。8个wave合起来是一个128行×64列的分数块：128行是tile的BQ个query × G个头（BQ·G ≤ 128时slices = 1），64列是并集中的16个块（一个N64步）。
 
@@ -366,14 +366,14 @@ body(task):
 
     # 序幕：t = 0
     DMA K(0) → 等待 → STAGGER组多过一个barrier → 读K(0)的lo/hi两半 → S = mask(QK)
-    m = max(行最大值(S)·scale, −1e30) + 1        # −1e30防止整行被mask时出现−inf − (−inf)
-    P = S·scale − m（下一阶段再取exp2）；l = 0；O = 0（每lane 64个FP32：本行256维中的64维）
+    m = max(行最大值(S·scale), −1e30) + 1        # −1e30防止整行被mask时出现−inf − (−inf)
+    P = S·scale（先舍入，与m一样；下一阶段取exp2(P − m)）；l = 0；O = 0（每lane 64个FP32：本行256维中的64维）
     DMA K(1)
     # 稳态：每个phase算“上一步的PV”和“本步的QK”
     for t in 1 .. steps−1:
         预取bits(t)，查第t+2步的块号
         DMA V(t−1)进V区，同时从LDS读K(t)的lo半 → lo = QK
-        P = exp2(P)                             # 上一步的未归一化概率
+        P = exp2(P − m)                         # 上一步的未归一化概率（一条FMA S·scale − m在logit近1e11时差上千）
         读K(t)的hi半 → hi = QK；S = mask(lo‖hi, bits(t))
         P16 = BF16(P)                           # +0x8000后取高16位（四舍五入）
         DMA K(t+1)进K区，同时从LDS读V(t−1)的前128维，用perm_b32转成PV的A操作数（每lane：1维 × 4个token）
@@ -382,9 +382,9 @@ body(task):
         读V(t−1)的后128维 → O[:, 128:256] += V^T·P16^T
         new = max(同行4个lane的cand)·scale；m' = new + 1 if new > m + 7 else m
         if wave内有行m' ≠ m: O ·= exp2(m − m')；l ·= exp2(m − m')   # 未变的行乘1
-        P = S·scale − m'；m = m'
+        P = S·scale；m = m'
     # 收尾
-    DMA V(steps−1)（越过4·count的token读0：V若是NaN，P = 0也屏蔽不了）；P = exp2(P)；l += P的行和
+    DMA V(steps−1)（越过4·count的token读0：V若是NaN，P = 0也屏蔽不了）；P = exp2(P − m)；l += P的行和
     O += V^T·BF16(P)^T（前、后128维各一次）
     inv = 1/l if l > 0 else 0
     O·inv → BF16（RNE）→ 写进LDS（XOR swizzle）→ barrier → 按行优先读出 → 有效行写out[q0 + query, hkv·G + head, :]
@@ -810,6 +810,7 @@ low/high/NaN：decode没有stats，先多扫一遍：各wave算自己那段的mi
 - **10-08 prefill_indexer改为显式参数**：签名从`(qk, **kwargs)`改为显式关键字参数（原`_run`并入，`_run`和`_prefill`删除）。新增可选`q_out`接收归一化后的q；SGLang数值校验靠它取回q，按请求取压缩key的逻辑移到校验方。SGLang用显式关键字绑定一次调用（`functools.partial`），校验经同一绑定运行PyHIP。
 - **10-08 decode入口与prefill对齐**：`decode_forward(qk, **kwargs)`改为显式参数并更名`decode_indexer`，与prefill同义的参数同名（`query_positions`→`logical_positions`、`sequence_lengths`→`seq_lens`）；去掉`cache`，直接按16-key页读`compressed`（SGLang的cache本就是它的reshape）。SGLang只用这一个decode入口；只选块的旧`decode_indexer(q, cache, …)`、`_decode_select`、`_decode_forward`和benchmark的select模式（`--keys`）删除，数值校验改用`q_out`、`logits_out`取回Q和logits。原select测试覆盖的边界（511–513个key、非512倍数的528-key页表、65536个key上限）并入decode测试。删除前benchmark说明中的select数据：3000 key B1/B32整体18.720/25.441微秒；长行65536 key B1/B8/B32整体47.640/88.020/217.421微秒，其余见[长行数据](../../../../../mytest/mydata/qsa_perf_final_20261002_01/official_decode_long/kernels.txt)。两项接口改动后的TEST=1服务验收全部通过（GPU0/1被其他会话占用，用户启动脚本复制一份只把设备改为4–7）：普通decode的TP2/TP4每rank 372次attention校验，每层31次prefill、292次graph decode校验；MTP（EAGLE 3/1/4）TP2/TP4每rank每层30/31次prefill、216/248次verify校验，MTP草稿层另有30/31次prefill校验；日志无异常、无设备端断言。[验收](../../../../../mytest/mydata/qsa_api_service_20261008_01/summary.json)
 - **10-10 decode入口的host检查**：按PR #57的Copilot review，`decode_indexer`在launch前做与`prefill_indexer`共用的检查（`_check_shared`：头数、D128、rotary维度、qk/positions/ring/压缩池/权重的dtype与形状、压缩池小于2GiB），另检查B、P > 0和各[B]、[B,4]、[B,P]整型张量，非法输入抛`ValueError`，不再走到kernel；`logical_positions`接受int32或int64（SGLang的verify测试传int64）。PyHIP indexer测试32项（新增7项非法输入）、SGLang `test_pyhip_qsa` 3项和benchmark说明里的decode示例均通过。[日志](../../../../../mytest/mydata/pr57_copilot_review_20261010_01)
+- **10-22 K5随MHA共用helper改为先舍入`S·scale`再减m**：MHA按aiter PR #6576评审意见修改了K5复用的`_pv`、`_exps`（并删去`_center`），K5随之改用`_scale`、`exps(P, m)`与`_schedule_exps`（原来一条FMA对舍入后的m在logit近1e11时差上千）。K5的`passthrough`形式target-features在lowering中丢失，新增的标量乘、减被合成`v_pk_*`（每个kernel 140→188条），union kernel慢约8.5%；同时改用`llvm.target_features`后反而快：GPU6同协议先后运行，M12000 TP2/4/8的union kernel 952.4/1223.2/963.8→935.4/1198.9/943.3微秒（−1.8%/−2.0%/−2.1%），整体qsa−0.6%/−1.1%/−2.0%。行最大值下限−1e30、`softmax_scale`校验、非有限K/V说明与极端logit测试留待独立PR。[基线](../../../../../mytest/mydata/union_review_20261022/qsa_split_base)、[只改helper](../../../../../mytest/mydata/union_review_20261022/qsa_split_forced)、[当前](../../../../../mytest/mydata/union_review_20261022/qsa_split_forced_tf)
 
 ### 评估过但未采用
 
