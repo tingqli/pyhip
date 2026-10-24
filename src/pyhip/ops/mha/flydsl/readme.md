@@ -136,6 +136,10 @@ S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
 - exp按24+8分到S1/S3两次QK旁边（`_schedule`用`sched_group_barrier`把MFMA与VALU/TRANS交错），
   掩码和新m的计算放在S5/S7的PV旁。
 - m从首个行最大值+1开始，只有后续行最大值超过m+7才前移到新最大值+1，并按ballot只在有行需要时缩放O和l（`_rescale`）。
+- import前设置`AITER_FLYDSL_MHA_EXACT_MAX=1`关闭lazy（`_first_max`/`_next_max`，`_body_v128`与`_body_wide`）：m取行最大值本身，
+  行最大值每变大一次就缩放；最大key的P为1，精度与AITER相同（3.6）。代价是重缩放（wave内任一行前移就进入冷分支）：
+  D128 +7.6%、causal +5.5%、D192 +8.6%、LSE +6.3%、V192 +3.2%、[164800, 7, 128] +0.2%（KV越长，新最大值越集中在前面的tile）。
+  默认关闭时主循环与改动前逐条相同，输出逐位一致。
 - S'(t)由S7一条FMA `S·scale − m`得到。FMA用精确乘积而m是舍入值，S'(max)偏离0最多ulp(m)/2，logit近1e11时
   exp2上溢或下溢。因此m前移时`_rescale`的分支顺带检查|m| ≥ 2^22；一旦成立（sticky，ballot掩码随state传递），
   另一个分支把S'(t)舍入到ulp(m)的整数倍（`_reround`：`(x + c) − c`，`c = 1.5·2^exponent(m)`），等于先舍入`S·scale`
@@ -159,6 +163,129 @@ S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
 | full D192 persistent / grid | 254 / 256 | 75 / 56 | 58,240 | 0 |
 | causal D128 persistent / grid | 232 / 228 | 74 / 58 | 49,920 | 0 |
 | causal D192 persistent / grid | 256 / 254 | 77 / 60 | 58,240 | 0 |
+
+### 3.5 D128伪代码与精度损失（`_body_v128`，Dq = Dv = 128，无LSE）
+
+按一行query写（实际每wave 32行，一行的64个key由lane r与r+32各持32个）；log2单位。注释中`[E*]`后是该步引入的误差范围：
+u = 2^-24为FP32单位舍入，n为KV tile数（[164800, 7, 128]时n = 2575），“典型”按舍入误差随机估计；推导见下表。
+未标注的步骤是精确的（`−inf`遮挡、越界V行置0、lane间交换、BF16输入搬运）。D192只是QK的K维为192。
+
+```text
+scale = FP32(FP32(softmax_scale·log2e) · k_descale · q_descale)   # [E1] scale相对 ≤ 3u ≈ 1.8e-7
+q = Q[row, 0:128]                         # BF16，整个KV循环常驻寄存器
+# prologue：tile 0
+S = q · K(0)ᵀ                             # 32×32×8 BF16 MFMA；[E2] |ΔS| ≲ 16u·Σ|q_i·k_i|（D192为24u）
+S = mask(S)                               # 越界/因果遮挡置−inf
+m = max(rowmax(S)·scale, FLOOR) + 1       # [E3] 无（softmax对m平移不变）
+S' = fma(S, scale, −m)                    # [E4] P相对 ≤ ln2·ulp(S')/2 ≤ 2.7e-6（|S'| < 128）
+if 有行|m| ≥ 2^22: S' = reround(S', m)    # 冷分支，此后sticky；[E4] |ΔS'| ≤ ulp(m)/2（≥ 0.25），同FP32参考
+l = 0; O = 0
+for t = 1 .. tiles−1:                     # D128每趟展开两个phase；S0–S7见3.3
+    P = exp2(S'(t−1))                     # S1算24个、S3算8个；[E5] P相对 ≤ 0.783 ulp ≈ 9.3e-8
+    l_lane = Σ P(本lane 32个)              # S3，5层成对求和树；[E6] 相对 ≤ 5u ≈ 3e-7
+    P16 = BF16(P)                         # S3，RNE（RTA开关见3.3）；[E7] 每个P相对 ≤ 2^-8 ≈ 3.9e-3
+    S = q · K(t)ᵀ                         # S1、S3；[E2] 同上
+    l += l_lane + l_lane(另一半lane)        # S4交换，S5相加；[E6] l相对 ≲ (n+6)u ≈ 1.5e-4，典型 √n·u ≈ 3e-6
+    O[0:64]   += P16 · V(t−1)[:, 0:64]    # S5；[E8] |ΔO| ≲ 8n·u·ΣP16·|V|（8n·u ≈ 1.2e-3，典型 √(8n)·u ≈ 9e-6）
+    O[64:128] += P16 · V(t−1)[:, 64:128]  # S7；[E8] 同上
+    S = mask(S); cand = rowmax(S)·scale   # S5、S7；[E3] 无
+    m' = cand + 1 if cand > m + 7 else m  # [E3] 无
+    S' = fma(S, scale, −m')               # [E4] 同上
+    if 有行m' ≠ m:                        # ballot，冷分支
+        c = exp2(m − m'); O ·= c; l ·= c  # [E9] c相对ε ≤ 2.8e-6，即前移前的P统一乘(1+ε)；O·c、l·c各 ≤ u
+        有行|m'| ≥ 2^22 → 此后S'都reround
+    m = m'
+# epilogue：tile last
+P = exp2(S'(last)); l += ΣP(两半lane); P16 = BF16(P)   # [E5][E6][E7] 同上
+V(last)中超出kv_len的行置0; O += P16 · V(last)          # [E8] 同上
+inv = (l > 0 ? 1/l : 0) · v_descale       # IEEE除法；[E10] 相对 ≤ 2u ≈ 1.2e-7
+out = BF16(O · inv)                       # RNE（_pack_bf16）；[E11] 相对 ≤ 2^-8 + u ≈ 3.9e-3
+# [E6/E7] O用P16、l用P：out整行乘(1+δ̄)，δ̄ = ΣP·δ/ΣP（P16 = P·(1+δ)），|δ̄| ≤ 2^-8；
+#         权重分散时δ̄ ≈ 0，单个key主导时δ̄ ≈ 该key的δ
+```
+
+| 标记 | 运算 | 推导与说明 |
+|---|---|---|
+| E1 | scale | softmax_scale·log2e转FP32、乘k_descale、乘q_descale各舍入一次（descale为1时精确）。同一行共用scale，只改变同行key之间的相对权重：P相对 ≈ ln2·\|ΔS'\|·3u（ΔS'为该key与行最大值之差），可忽略 |
+| E2 | QK MFMA | BF16乘积在FP32中精确；按每条MFMA对累加器舍入一次估计，Dq = 128时每个S经16条MFMA链式累加（D192为24条）。对P的影响为相对 ≈ ln2·scale·\|ΔS\| |
+| E3 | m（行最大值·scale、+1、比较m+7） | softmax对m平移不变，m取什么值都不引入误差，只决定E4中S'的大小 |
+| E4 | `S' = fma(S, scale, −m)` | 乘积精确、只在最后舍入一次，P相对 = ln2·\|ΔS'\|。m是舍入值而乘积精确，\|logit\|很大时S'(max)偏离−1最多ulp(m)/2（exp2溢出，见3.3）；\|m\| ≥ 2^22后`_reround`对齐“先舍入S·scale再减m”的参考，误差就是FP32表示S·scale本身的误差 |
+| E5 | `v_exp_f32` | 硬件近似：[−126, 8]全部FP32输入实测最大0.783 ulp（正确舍入为0.5）；S' < −126时P < 2^-126，贡献可忽略 |
+| E6 | l的FP32求和 | 一个P经过的舍入：lane内5层成对树、两半相加、之后每个tile的累加，共 ≤ n + 6次。**l累加的是未舍入的FP32 P，而PV用的是BF16的P16（E7）**，后果见伪代码最后两行 |
+| E7 | P→BF16 | kernel内部最大的单项误差；RNE与RTA只在恰好的平局上不同，10个精度用例结果在三位有效数字上相同 |
+| E8 | PV MFMA | P16·V乘积精确；每个tile 8条MFMA（64个key，每条8个）链式累加到O，链长8n，估计方式同E2 |
+| E9 | 重缩放 | c = exp2(m − m')：减法误差 ≤ ulp(m − m')/2（\|m − m'\| < 128时对c为相对 ≤ 2.7e-6；更远时c ≤ 2^-128，旧部分可忽略），再加exp2的0.783 ulp。O和l乘同一个c，但之后的tile按m'累加，所以c的误差ε等于把前移前所有key的权重统一乘(1+ε)，输出相对误差 ≲ \|ε\|；m只在超过m+7时前移，次数少 |
+| E10 | 1/l、·v_descale | 除法正确舍入（`v_div_scale/v_rcp/v_div_fmas/v_div_fixup`），再一次乘法（v_descale为1时精确） |
+| E11 | O·inv → BF16 | 输出格式本身的误差，即下表的“理想” |
+
+[164800, 7, 128]、BF16、全可见、P为RNE时的实测（512个采样行对FP64参考的相对L2误差）：
+
+| 输入 | 本kernel | AITER | 理想（FP64结果直接RNE到BF16，只有E11） |
+|---|---:|---:|---:|
+| normal（随机Q/K/V） | 2.35e-3 | 2.33e-3 | 1.66e-3 |
+| peaked（每行一个突出的key） | 2.01e-3 | 1.69e-3 | 1.65e-3 |
+| sinks（32个随机位置的key logit大、V×10） | 2.28e-3 | 1.81e-3 | 1.65e-3 |
+| ascending（logit随位置增大） | 2.30e-3 | 2.01e-3 | 1.66e-3 |
+
+normal比理想多出的误差主要来自E7，AITER同样把P舍入为BF16，量级相同。peaked/sinks/ascending比AITER大，来自E6与E7的不一致：
+本kernel的m懒更新（只在超过m+7时前移），主导key的P尾数任意，其BF16舍入误差直接留在O/l里；
+AITER的m每次都取精确行最大值，主导key的P恰为1（BF16可精确表示）。`AITER_FLYDSL_MHA_EXACT_MAX=1`改为每次精确更新m，
+精度与AITER相同（3.6）。
+
+### 3.6 精确max的D128伪代码（`AITER_FLYDSL_MHA_EXACT_MAX=1`）
+
+import前设置`AITER_FLYDSL_MHA_EXACT_MAX=1`后，`_body_v128`与`_body_wide`的m取行最大值本身：`_first_max`不加1，
+`_next_max`去掉m+7的余量，其余代码不变；其他kernel（FP8、D256、gfx950、SWA）不受影响。最大key的S' = r，
+|r| ≤ ulp(S_max·scale)/2（FMA的精确乘积减去舍入后的m），P = 2^r：|S·scale| < 128时BF16舍入后就是1，
+E6与E7的不一致只剩非最大key的部分。性能代价见3.3。记号同3.5，`★`标出与3.5不同的地方。
+
+```text
+scale = FP32(FP32(softmax_scale·log2e) · k_descale · q_descale)   # [E1] scale相对 ≤ 3u ≈ 1.8e-7
+q = Q[row, 0:128]                         # BF16，整个KV循环常驻寄存器
+# prologue：tile 0
+S = q · K(0)ᵀ                             # 32×32×8 BF16 MFMA；[E2] |ΔS| ≲ 16u·Σ|q_i·k_i|（D192为24u）
+S = mask(S)                               # 越界/因果遮挡置−inf
+m = max(rowmax(S)·scale, FLOOR)           # ★不加1（_first_max）；[E3] 无
+S' = fma(S, scale, −m)                    # [E4] P相对 ≤ ln2·ulp(S')/2 ≤ 2.7e-6（|S'| < 128）；★最大key的S' = r
+if 有行|m| ≥ 2^22: S' = reround(S', m)    # 冷分支，此后sticky；[E4] |ΔS'| ≤ ulp(m)/2（≥ 0.25），同FP32参考
+l = 0; O = 0
+for t = 1 .. tiles−1:                     # D128每趟展开两个phase；S0–S7见3.3
+    P = exp2(S'(t−1))                     # S1算24个、S3算8个；[E5] P相对 ≤ 0.783 ulp ≈ 9.3e-8；★P ≤ 2^r ≈ 1
+    l_lane = Σ P(本lane 32个)              # S3，5层成对求和树；[E6] 相对 ≤ 5u ≈ 3e-7
+    P16 = BF16(P)                         # S3，RNE；[E7] 每个P相对 ≤ 2^-8 ≈ 3.9e-3；★最大key ≤ ln2·|r|（|S·scale| < 128时 ≤ 2.7e-6）
+    S = q · K(t)ᵀ                         # S1、S3；[E2] 同上
+    l += l_lane + l_lane(另一半lane)        # S4交换，S5相加；[E6] l相对 ≲ (n+6)u ≈ 1.5e-4，典型 √n·u ≈ 3e-6
+    O[0:64]   += P16 · V(t−1)[:, 0:64]    # S5；[E8] |ΔO| ≲ 8n·u·ΣP16·|V|（8n·u ≈ 1.2e-3，典型 √(8n)·u ≈ 9e-6）
+    O[64:128] += P16 · V(t−1)[:, 64:128]  # S7；[E8] 同上
+    S = mask(S); cand = rowmax(S)·scale   # S5、S7；[E3] 无
+    m' = cand if cand > m else m          # ★行最大值变大就前移（_next_max）；[E3] 无
+    S' = fma(S, scale, −m')               # [E4] 同上
+    if 有行m' ≠ m:                        # ballot，冷分支；★wave内任一行前移就进入，随机输入集中在前面的tile
+        c = exp2(m − m'); O ·= c; l ·= c  # [E9] 每次c相对ε ≤ 2.8e-6（m、m'接近时减法精确，只剩exp2），O·c、l·c各 ≤ u；★每行至多n次
+        有行|m'| ≥ 2^22 → 此后S'都reround
+    m = m'
+# epilogue：tile last
+P = exp2(S'(last)); l += ΣP(两半lane); P16 = BF16(P)   # [E5][E6][E7] 同上
+V(last)中超出kv_len的行置0; O += P16 · V(last)          # [E8] 同上
+inv = (l > 0 ? 1/l : 0) · v_descale       # IEEE除法；[E10] 相对 ≤ 2u ≈ 1.2e-7
+out = BF16(O · inv)                       # RNE（_pack_bf16）；[E11] 相对 ≤ 2^-8 + u ≈ 3.9e-3
+# [E6/E7] ★O用P16、l用P，但最大key的δ ≈ 0：out整行乘(1+δ̄)，|δ̄| ≤ 2^-8·(1 − w_max)，
+#         w_max为最大key的权重；一个key主导时δ̄ → 0，多个大key（sinks、ascending）时仍在
+```
+
+[164800, 7, 128]、BF16、全可见、P为RNE的实测（同3.5，512个采样行对FP64参考的相对L2误差）：
+
+| 输入 | lazy（默认） | 精确max | AITER | 理想 |
+|---|---:|---:|---:|---:|
+| normal | 2.35e-3 | 2.33e-3 | 2.33e-3 | 1.66e-3 |
+| peaked | 2.01e-3 | 1.69e-3 | 1.69e-3 | 1.65e-3 |
+| offset（logit约724 ± 11） | 2.03e-3 | 1.70e-3 | 1.70e-3 | 1.65e-3 |
+| sinks | 2.28e-3 | 1.81e-3 | 1.81e-3 | 1.65e-3 |
+| ascending | 2.30e-3 | 2.02e-3 | 2.01e-3 | 1.66e-3 |
+
+其余输入（flat、zero_q、v_outliers、self_similar）三种实现相差不超过0.01e-3；所有logit相等且约5e10时（精确规则路径）
+本kernel两种模式都是1.69e-3，AITER的输出错误（相对误差1）。精确max下仍高于理想的部分来自E7（非最大key的P16，
+normal 2.33e-3 ≈ √2 × 1.66e-3，即E7与E11各占一半方差）和E6/E7的残余（sinks、ascending）。
 
 ## 4. gfx942 BF16 D256 paged（[mha_pa_bf16_256_paged_942.py](mha_pa_bf16_256_paged_942.py)）
 
