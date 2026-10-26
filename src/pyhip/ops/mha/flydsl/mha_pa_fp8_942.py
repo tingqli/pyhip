@@ -19,8 +19,8 @@ from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 from ._common import (
-    _MAX_FLOOR, _buffer, _center_part, _exp, _exp_part, _join, _max3, _maximum, _mfma_hazard_wait, _min,
-    _pack_bf16, _pin, _pin_i32, _read_page_g2r, _reround_if, _row_max, _row_sum, _schedule, _softmax_scale,
+    _MAX_FLOOR, _buffer, _center_part, _exp, _exp_part, _intrinsic, _join, _max3, _maximum, _mfma_hazard_wait,
+    _min, _pack_bf16, _pin, _pin_i32, _read_page_g2r, _reround_if, _row_max, _row_sum, _schedule, _softmax_scale,
     _stage_end, _uniform, _wait,
 )
 
@@ -28,7 +28,8 @@ BM, BN, DV, THREADS = 256, 64, 128, 512
 PADDED_CHUNK = 1040
 V_TILE = 8 * PADDED_CHUNK
 LOG2E = math.log2(math.e)
-# m: lazy, or "1": the running row max - 7 (P of the max key is exactly 128 in FP8; a rescale per raised max).
+# m: lazy, or "1": also moved (to row max - 2) when a new row max carries about l / 8 or more, so that the P of
+# such a dominant key is exactly 4 in FP8. Read at import.
 _EXACT_MAX = os.environ.get("AITER_FLYDSL_MHA_EXACT_MAX", "0").lower() in ("1", "true")
 
 
@@ -106,21 +107,24 @@ def _center(value, scale, maximum):
                                     "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False))
 
 
-def _offset_max(row_max):
-    # P <= 2^7.5 < 240. From |m| >= 2^22 the exact rule of _rescale already gives the max key P = 1; m - 7 may round.
-    return (fx.absf(row_max) < 2.0**22).select(row_max - 7.0, row_max)
-
-
 def _first_max(scores, scale):
     row_max = _maximum(_row_max(scores) * scale, fx.Float32(_MAX_FLOOR))
-    return _offset_max(row_max) if _EXACT_MAX else row_max
+    return row_max - 2.0 if _EXACT_MAX else row_max
 
 
-def _next_max(candidate, row_max):
-    """Ballot of the rows whose m moves, and the new m: lazily, all rows take their row max once one exceeds m + 6."""
+def _next_max(local_max, scale, row_max, row_sum, t):
+    """Ballot of the rows whose m moves, and the new m. Lazily all rows of the wave take their row max once one
+    exceeds m + 6; with _EXACT_MAX they move to max(m, row max - 2), also once 2^(row max - m) passes about l / 8."""
     if _EXACT_MAX:
-        target = _offset_max(candidate)
-        return fx.Int64(rocdl.ballot(fx.Int64.ir_type, (target > row_max).ir_value())), _maximum(row_max, target)
+        # m moves when gap + 3 > med3(e, 5, 9), gap = row max - m, l in [2^(e-1), 2^e): gap > 6, or gap > 2 and
+        # 2^gap > l / 8..l / 4. Tile 1's l still lacks P(0), so only gap > 6 there.
+        candidate = _intrinsic(fx.Float32, "llvm.fma.f32", local_max, scale, 3.0)
+        exponent = _intrinsic(fx.Int32, "llvm.amdgcn.frexp.exp.i32.f32", row_sum).to(fx.Float32)
+        lower = (fx.Int32(t) > fx.Int32(1)).select(fx.Float32(5.0), fx.Float32(9.0))
+        threshold = _intrinsic(fx.Float32, "llvm.amdgcn.fmed3.f32", exponent, lower, 9.0)
+        ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - row_max > threshold).ir_value()))
+        return ballot, (ballot != fx.Int64(0)).select(_maximum(row_max, candidate - 5.0), row_max)
+    candidate = local_max * scale
     ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - row_max > 6.0).ir_value()))
     return ballot, (ballot != fx.Int64(0)).select(_maximum(row_max, candidate), row_max)
 
@@ -419,7 +423,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     Softmax in log2 units: S' = S * scale - m (one FMA), P = exp2(S'), l = sum(P) and
     O = sum(P V); the output is O / l * v_descale. m moves to a larger row max only when
     that exceeds m by more than 6 (FP8-FNUZ keeps P finite), rescaling O and l; with
-    AITER_FLYDSL_MHA_EXACT_MAX=1, m is the running row max - 7 (_first_max, _next_max). The FMA
+    AITER_FLYDSL_MHA_EXACT_MAX=1 also when a new max carries about l / 8 (_next_max). The FMA
     is up to ulp(m) / 2 off the rounded m: once some |m| >= 2^22 (checked when m moves,
     then sticky), S7's lazy-rescale branch also rounds S'(t) to a multiple of ulp(m),
     which matches the D256 kernels' rounded products.
@@ -429,7 +433,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
                 _v_tail, _join, _mfma_hazard_wait, _maximum, _row_max, _row_sum, _center_part, _exp_part,
                 _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait, _schedule_qk_exp, _read_v_words,
                 _pack_step, _mfma, _add, _max3, _max_tree, _sum_tree, _center, _pv_lo_with_max, _pv_hi_with_sum,
-                _reround_if, _offset_max, _first_max, _next_max)
+                _reround_if, _first_max, _intrinsic, _next_max)
     dtype = Q.dtype
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
@@ -579,7 +583,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         # S6 memory: s2r V(t-1) dims 64-127 (V(t-1) is a full page in every main phase); new m.
         v_hi = _read_v_words(storage, v_s2r_base, PREV, 1, DQ)
         rocdl.sched_barrier(0)
-        ballot, new_max = _next_max(local_max * scale, row_max)
+        ballot, new_max = _next_max(local_max, scale, row_max, row_sum, t)
         rocdl.sched_barrier(0)
         _wait(vmcnt=0, lgkmcnt=0)
         _stage_end()

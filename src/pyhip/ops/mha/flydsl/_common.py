@@ -77,6 +77,10 @@ def _exp(value):
                                          [fx.Float32(value).ir_value()], [], []))
 
 
+def _intrinsic(result, name, *args):
+    return result(llvm.call_intrinsic(result.ir_type, name, [fx.Float32(a).ir_value() for a in args], [], []))
+
+
 def _maximum(a, b):
     return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [fx.Float32(a).ir_value(), fx.Float32(b).ir_value()],
                                     "v_max_f32 $0, $1, $2", "=v,v,v", has_side_effects=False))

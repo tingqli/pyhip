@@ -27,7 +27,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 
 from ._common import (
-    _MAX_FLOOR, _advance_max, _buffer, _buffer_words, _center_part, _exp, _exp_part, _join, _maximum,
+    _MAX_FLOOR, _advance_max, _buffer, _buffer_words, _center_part, _exp, _exp_part, _intrinsic, _join, _maximum,
     _mfma_hazard_wait, _min, _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _read_address, _read_page_g2r,
     _reround_if, _row_max, _row_max_local, _row_sum, _row_sum_local, _schedule, _softmax_scale, _stage_end,
     _uniform, _wait,
@@ -39,7 +39,8 @@ V_SLOT = 16640  # one DV128 V tile: 16 padded 1040-byte chunks
 LOG2E = math.log2(math.e)
 # P to BF16: RNE like O, or ties away from zero ("1": one VALU less per value in QK-high). Read at import.
 _P_BF16_RTA = os.environ.get("AITER_FLYDSL_MHA_P_BF16_RTA", "0").lower() in ("1", "true")
-# m: lazy, or "1": the running row max (P of the max key is exactly 1 in BF16; a rescale per raised max).
+# m: lazy, or "1": also moved (to row max + 1) when a new row max carries about l / 8 or more, so that the P of
+# such a dominant key is exactly 1/2 in BF16. Read at import.
 _EXACT_MAX = os.environ.get("AITER_FLYDSL_MHA_EXACT_MAX", "0").lower() in ("1", "true")
 
 
@@ -63,15 +64,21 @@ def _pack_probability(values):
 
 
 def _first_max(scores, scale):
-    row_max = _maximum(_row_max(scores) * scale, fx.Float32(_MAX_FLOOR))
-    return row_max if _EXACT_MAX else row_max + 1.0
+    return _maximum(_row_max(scores) * scale, fx.Float32(_MAX_FLOOR)) + 1.0
 
 
-def _next_max(candidate, row_max):
-    """Ballot of the rows whose m moves, and the new m: lazily the row max + 1 once it exceeds m + 7."""
+def _next_max(local_max, scale, row_max, row_sum):
+    """Ballot of the rows whose m moves, and the new m: lazily a row takes its max + 1 once that exceeds m + 7;
+    with _EXACT_MAX the whole wave moves to max(m, max + 1), also once some 2^(max - m) passes about l / 8."""
     if _EXACT_MAX:
-        ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > row_max).ir_value()))
-        return ballot, (candidate > row_max).select(candidate, row_max)
+        # Moves when max - m > med3(e - 3, -1, 7) (+3 folded into the FMA), l in [2^(e-1), 2^e) incl. P(t-1):
+        # a new max (m = old max + 1) whose P passes l / 8..l / 4, or any max past m + 7.
+        candidate = _intrinsic(fx.Float32, "llvm.fma.f32", local_max, scale, 3.0)
+        exponent = _intrinsic(fx.Int32, "llvm.amdgcn.frexp.exp.i32.f32", row_sum).to(fx.Float32)
+        threshold = _intrinsic(fx.Float32, "llvm.amdgcn.fmed3.f32", exponent, 2.0, 10.0)
+        ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - row_max > threshold).ir_value()))
+        return ballot, (ballot != fx.Int64(0)).select(_maximum(row_max, candidate - 2.0), row_max)
+    candidate = local_max * scale
     ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > row_max + 7.0).ir_value()))
     return ballot, (candidate > row_max + 7.0).select(candidate + 1.0, row_max)
 
@@ -407,7 +414,7 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     Softmax in log2 units: S' = S * scale - m (one FMA), P = exp2(S'), l = sum(P) and
     O = sum(P V); the output is O / l * v_descale. m starts at the first row max + 1 and
     moves to a later row max + 1 only when that exceeds m + 7, rescaling O and l
-    (AITER_FLYDSL_MHA_EXACT_MAX=1: m is the running row max). The
+    (AITER_FLYDSL_MHA_EXACT_MAX=1: also when a new max carries about l / 8, _next_max). The
     FMA is up to ulp(m) / 2 off the rounded m: once some |m| >= 2^22 (checked when m
     moves, then sticky), a cold branch of _rescale also rounds S'(t) to a multiple of
     ulp(m), which matches the D256 kernels' rounded products.
@@ -417,7 +424,7 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
                 _read_k_tile_g2r, _read_k_tile_s2r, _read_v_tile_s2r, _qk, _pv, _mask, _v_tail, _join,
                 _mfma_hazard_wait, _maximum, _row_max, _row_max_local, _row_sum, _row_sum_local, _center_part,
                 _exp_part, _pack_probability, _cross32_async, _rescale, _advance_max, _pin, _schedule,
-                _stage_end, _wait, _reround_if, _first_max, _next_max)
+                _stage_end, _wait, _reround_if, _first_max, _intrinsic, _next_max)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -599,8 +606,7 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         _stage_end()
         # S7 compute: PV O dims 64-127; new m and S'(t); lazy rescale of O and l.
         o1 = _pv(p_bf16, v_hi, o1, DV)
-        candidate = _maximum(lane_max, other_max) * scale
-        ballot, new_max = _next_max(candidate, row_max)
+        ballot, new_max = _next_max(_maximum(lane_max, other_max), scale, row_max, row_sum)
         s_cur = _center_part(s_cur, scale, new_max, 0, 32)
         _schedule(DV // 8, 4, 4)
         o0, o1, row_sum, s_cur, exact = _rescale(o0, o1, row_sum, s_cur, row_max, new_max, ballot, exact)
@@ -693,7 +699,7 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     _helpers = (_read_k_tile_g2r, _read_v_tile_g2r, _store_tile_r2s, _read_k_tile_s2r, _read_v_tile_s2r,
                 _qk, _pv, _mask, _v_tail, _join, _mfma_hazard_wait, _maximum, _row_max, _row_sum,
                 _center_part, _exp_part, _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait,
-                _reround_if, _first_max, _next_max)
+                _reround_if, _first_max, _intrinsic, _next_max)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -843,8 +849,7 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         # S5 compute: PV O dims 0-63; mask S(t), lazy new m and S'(t) values 0..split.
         s_cur = _mask(_join(s_lo, s_hi), t, row, q_len, kv_len, CAUSAL)
         o0 = _pv(p_bf16, v_lo, o0, DV)
-        candidate = _row_max(s_cur) * scale
-        ballot, new_max = _next_max(candidate, row_max)
+        ballot, new_max = _next_max(_row_max(s_cur), scale, row_max, row_sum)
         split = 12 if STAGGER else 6
         s_cur = _center_part(s_cur, scale, new_max, 0, split)
         _schedule(3, 5, 3)
