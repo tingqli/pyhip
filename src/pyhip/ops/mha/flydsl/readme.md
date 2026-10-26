@@ -139,7 +139,7 @@ S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
 - import前设置`AITER_FLYDSL_MHA_EXACT_MAX=1`关闭lazy（`_first_max`/`_next_max`，`_body_v128`与`_body_wide`）：m取行最大值本身，
   行最大值每变大一次就缩放；最大key的P为1，精度与AITER相同（3.6）。代价是重缩放（wave内任一行前移就进入冷分支）：
   D128 +7.6%、causal +5.5%、D192 +8.6%、LSE +6.3%、V192 +3.2%、[164800, 7, 128] +0.2%（KV越长，新最大值越集中在前面的tile）。
-  默认关闭时主循环与改动前逐条相同，输出逐位一致。
+  默认关闭时主循环与改动前逐条相同，输出逐位一致。FP8 kernel也读取该变量（第6节）。
 - S'(t)由S7一条FMA `S·scale − m`得到。FMA用精确乘积而m是舍入值，S'(max)偏离0最多ulp(m)/2，logit近1e11时
   exp2上溢或下溢。因此m前移时`_rescale`的分支顺带检查|m| ≥ 2^22；一旦成立（sticky，ballot掩码随state传递），
   另一个分支把S'(t)舍入到ulp(m)的整数倍（`_reround`：`(x + c) − c`，`c = 1.5·2^exponent(m)`），等于先舍入`S·scale`
@@ -235,7 +235,7 @@ AITER的m每次都取精确行最大值，主导key的P恰为1（BF16可精确�
 ### 3.6 精确max的D128伪代码（`AITER_FLYDSL_MHA_EXACT_MAX=1`）
 
 import前设置`AITER_FLYDSL_MHA_EXACT_MAX=1`后，`_body_v128`与`_body_wide`的m取行最大值本身：`_first_max`不加1，
-`_next_max`去掉m+7的余量，其余代码不变；其他kernel（FP8、D256、gfx950、SWA）不受影响。最大key的S' = r，
+`_next_max`去掉m+7的余量，其余代码不变；FP8见第6节，其他kernel（D256、gfx950、SWA）不受影响。最大key的S' = r，
 |r| ≤ ulp(S_max·scale)/2（FMA的精确乘积减去舍入后的m），P = 2^r：|S·scale| < 128时BF16舍入后就是1，
 E6与E7的不一致只剩非最大key的部分。性能代价见3.3。记号同3.5，`★`标出与3.5不同的地方。
 
@@ -385,7 +385,15 @@ S7     PV: O dims 64-127 += P V    softmax: l += row sum, S'(t); rescale O and l
 
 - K与V各两个LDS槽，K比QK领先两个tile、页号领先三个tile；全部为寄存器中转的协作拷贝（g2r→r2s），
   不用direct-to-LDS DMA、LDS转置指令或原生FP32→BF16转换。LDS：D128 33,280、D192 41,600字节（16维×64 key的1040字节chunk）。
-- P量化为FP8参与PV；m的前移阈值为6，保证FP8-FNUZ下P有限。输出`O/l·v_descale`。
+- P量化为FP8参与PV；m的前移阈值为6，保证FP8-FNUZ下P有限（P ≤ 64）。输出`O/l·v_descale`。
+- **精确max**：import前设置`AITER_FLYDSL_MHA_EXACT_MAX=1`（与BF16共用；`_first_max`/`_next_max`）后，m取行最大值减7，
+  行最大值每变大一次就前移并缩放。最大key的P恰为128（FP8可精确表示），其余P整体放大2^7，下溢为0的更少；
+  |m| ≥ 2^22时不减7（`_offset_max`：精确规则已让最大key的P为1，m − 7也可能被舍入），P ≤ 2^7.5 < 240。
+  lazy时m可比行最大值低至多6，主导key的P尾数任意，其FP8舍入（至多6.25%）因l累加FP32的P而留在O/l里（精度见本节末）。
+  主循环每phase VALU +1、SALU −4、VGPR不变，代价主要来自更常进入的重缩放分支（FP8每个tile的MFMA时间只有BF16的一半，
+  相对代价约为BF16的两倍）：D128（16384²×H7）+17.5%、causal +12.2%、D192 +20.4%、LSE +17.2%、
+  per-tensor D128（10240×2560）+23.3%、[164800, 7, 128] +2.0%（GPU7交替A/B中位数；KV越短，新最大值越密）。
+  默认关闭时主循环与改动前逐条相同，输出逐位一致。
 - **S'的中心化**：S7用一条FMA `S·scale − m`，精确规则与BF16 BM256相同（第3.3节）。|m| ≥ 2^24时FMA误差可使
   FP8的P超过240，logit近1e11时exp2上溢或下溢。直接先舍入再减m每个分数多一条VALU，实测FP8慢7%
   （GPU7 16384²×H7：414.6→385.5T）。FP8把lazy rescale与精确规则合并为一个分支并加`llvm.expect`冷路径提示
@@ -401,6 +409,22 @@ S7     PV: O dims 64-127 += P V    softmax: l += row sum, S'(t); rescale O and l
   - memory stage只放短VALU（S4的mask、S6的新m）：同SIMD上另一组的compute wave占满发射口时，memory wave的VALU会被饿死（实测停顿130周期）。
   - 行和用inline asm标量`v_add_f32`：LLVM SLP会把它合成`v_pk_add_f32`，而packed FP32在SIMD有MFMA执行时停顿（实测176周期）；
     同理S'(t)不用`v_pk_fma_f32`（A/B慢5%）。各加法/最大值的结合顺序与改动前相同，输出与改动前逐位一致。
+
+[164800, 7, 128]、全可见、Q/K/V按per-tensor amax量化为FP8（输入同3.5）的实测（512个采样行对反量化输入FP64参考的相对L2误差）：
+
+| 输入 | lazy（默认） | 精确max | AITER FP8 | 理想 |
+|---|---:|---:|---:|---:|
+| normal | 2.60e-2 | 2.57e-2 | 2.63e-2 | 1.66e-3 |
+| peaked | 1.69e-2 | 5.97e-3 | 6.06e-3 | 1.65e-3 |
+| offset | 1.39e-2 | 6.48e-3 | 6.63e-3 | 1.67e-3 |
+| ascending | 2.23e-2 | 1.30e-2 | 1.33e-2 | 1.66e-3 |
+| sinks | 2.25e-2 | 1.29e-2 | 1.29e-2 | 1.66e-3 |
+| self_similar（K = Q + 噪声） | 6.24e-3 | 1.76e-3 | 6.24e-3 | 1.66e-3 |
+
+normal类输入的误差主要是P的FP8舍入（3位尾数，RMS约2.6%），三种实现量级相同。flat、v_outliers、zero_q三者相差不超过3%；
+所有logit相等且约5e10时两种模式都是1.67e-3，AITER FP8输出NaN。per-token Q scale的结果相差不超过3%。m取行最大值本身
+（不减7）时除上述NaN外与AITER逐项一致到3位有效数字；减7让小P少下溢为0（self_similar）。相对未量化的原始输入，
+误差另含输入量化（normal为5.3e-2）。
 
 ## 7. gfx950 BF16（[mha_pa_bf16_950.py](mha_pa_bf16_950.py)）
 

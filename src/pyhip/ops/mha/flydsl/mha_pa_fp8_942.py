@@ -8,6 +8,7 @@ conversion is used. ``_body`` documents the pipeline; see also readme.md.
 
 import functools
 import math
+import os
 
 import torch
 import flydsl.compiler as flyc
@@ -27,6 +28,8 @@ BM, BN, DV, THREADS = 256, 64, 128, 512
 PADDED_CHUNK = 1040
 V_TILE = 8 * PADDED_CHUNK
 LOG2E = math.log2(math.e)
+# m: lazy, or "1": the running row max - 7 (P of the max key is exactly 128 in FP8; a rescale per raised max).
+_EXACT_MAX = os.environ.get("AITER_FLYDSL_MHA_EXACT_MAX", "0").lower() in ("1", "true")
 
 
 def _page_ready_tied(value):
@@ -101,6 +104,25 @@ def _sum_tree(values):
 def _center(value, scale, maximum):
     return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [value.ir_value(), scale.ir_value(), maximum.ir_value()],
                                     "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False))
+
+
+def _offset_max(row_max):
+    # P <= 2^7.5 < 240. From |m| >= 2^22 the exact rule of _rescale already gives the max key P = 1; m - 7 may round.
+    return (fx.absf(row_max) < 2.0**22).select(row_max - 7.0, row_max)
+
+
+def _first_max(scores, scale):
+    row_max = _maximum(_row_max(scores) * scale, fx.Float32(_MAX_FLOOR))
+    return _offset_max(row_max) if _EXACT_MAX else row_max
+
+
+def _next_max(candidate, row_max):
+    """Ballot of the rows whose m moves, and the new m: lazily, all rows take their row max once one exceeds m + 6."""
+    if _EXACT_MAX:
+        target = _offset_max(candidate)
+        return fx.Int64(rocdl.ballot(fx.Int64.ir_type, (target > row_max).ir_value())), _maximum(row_max, target)
+    ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - row_max > 6.0).ir_value()))
+    return ballot, (ballot != fx.Int64(0)).select(_maximum(row_max, candidate), row_max)
 
 
 def _pv_lo_with_max(p_prev, v_words, o0, o1, s_cur):
@@ -308,7 +330,7 @@ def _unlikely(condition):
 
 @flyc.jit
 def _rescale(o0, o1, o2, o3, row_sum, s_cur, old_max, new_max, ballot, exact):
-    """Lazy rescale of O and l when m moved, plus the exact rule for S'(t).
+    """Rescale of O and l when m moved (_next_max), plus the exact rule for S'(t).
 
     The FMA S * scale - m is up to ulp(m) / 2 off the rounded m. Once some |m| >= 2^22
     (checked when m moves, then sticky), S'(t) is also rounded to a multiple of ulp(m).
@@ -396,7 +418,8 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
 
     Softmax in log2 units: S' = S * scale - m (one FMA), P = exp2(S'), l = sum(P) and
     O = sum(P V); the output is O / l * v_descale. m moves to a larger row max only when
-    that exceeds m by more than 6 (FP8-FNUZ keeps P finite), rescaling O and l. The FMA
+    that exceeds m by more than 6 (FP8-FNUZ keeps P finite), rescaling O and l; with
+    AITER_FLYDSL_MHA_EXACT_MAX=1, m is the running row max - 7 (_first_max, _next_max). The FMA
     is up to ulp(m) / 2 off the rounded m: once some |m| >= 2^22 (checked when m moves,
     then sticky), S7's lazy-rescale branch also rounds S'(t) to a multiple of ulp(m),
     which matches the D256 kernels' rounded products.
@@ -406,7 +429,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
                 _v_tail, _join, _mfma_hazard_wait, _maximum, _row_max, _row_sum, _center_part, _exp_part,
                 _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait, _schedule_qk_exp, _read_v_words,
                 _pack_step, _mfma, _add, _max3, _max_tree, _sum_tree, _center, _pv_lo_with_max, _pv_hi_with_sum,
-                _reround_if)
+                _reround_if, _offset_max, _first_max, _next_max)
     dtype = Q.dtype
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
@@ -485,7 +508,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         s_hi = _qk(q, k_hi, dtype)
         s_0 = _mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL)
         _mfma_hazard_wait()
-        row_max = _maximum(_row_max(s_0) * scale, fx.Float32(_MAX_FLOOR))
+        row_max = _first_max(s_0, scale)
         s_0 = _center_part(s_0, scale, row_max, 0, 32)
         # The exact rule of _rescale for S'(0); exact carries it through the phases.
         exact = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (fx.absf(row_max) >= 2.0**22).ir_value()))
@@ -553,12 +576,10 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         # S5 compute: FP8 P(t-1); PV O dims 0-63; row max of S(t); first adds of the row sum.
         p_words, o0, o1, local_max, sums = _pv_lo_with_max(p_prev, v_lo, o0, o1, s_cur)
         _stage_end()
-        # S6 memory: s2r V(t-1) dims 64-127 (V(t-1) is a full page in every main phase); lazy new max.
+        # S6 memory: s2r V(t-1) dims 64-127 (V(t-1) is a full page in every main phase); new m.
         v_hi = _read_v_words(storage, v_s2r_base, PREV, 1, DQ)
         rocdl.sched_barrier(0)
-        candidate = local_max * scale
-        ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - row_max > 6.0).ir_value()))
-        new_max = (ballot != fx.Int64(0)).select(_maximum(row_max, candidate), row_max)
+        ballot, new_max = _next_max(local_max * scale, row_max)
         rocdl.sched_barrier(0)
         _wait(vmcnt=0, lgkmcnt=0)
         _stage_end()
