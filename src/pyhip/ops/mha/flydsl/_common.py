@@ -82,6 +82,7 @@ def _intrinsic(result, name, *args):
 
 
 def _maximum(a, b):
+    # Opaque to LLVM's MFMA hazard checks; the D256 kernels use _maxnum.
     return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [fx.Float32(a).ir_value(), fx.Float32(b).ir_value()],
                                     "v_max_f32 $0, $1, $2", "=v,v,v", has_side_effects=False))
 
@@ -113,6 +114,18 @@ def _stage_end():
     # Compiler fences and CTA rendezvous, not a memory-counter wait.
     rocdl.sched_barrier(0)
     rocdl.s_barrier()
+    rocdl.sched_barrier(0)
+
+
+def _align8():
+    """The next instruction starts 8-byte aligned (at most one s_nop of padding).
+
+    gfx942 fetches 32-byte blocks: in a dense run of 8-byte VALU/MFMA instructions that starts at an address
+    = 4 (mod 8), every fourth one straddles two blocks and the wave idles ~4 cycles before it (ATT). The parity
+    of a run otherwise follows from all code before it. It only costs where the run is issue-bound.
+    """
+    rocdl.sched_barrier(0)
+    llvm.inline_asm(None, [], ".p2align 3", "", has_side_effects=True)
     rocdl.sched_barrier(0)
 
 
@@ -174,6 +187,19 @@ def _read_address(address, immediate=0):
     """One ds_read_b128 (s2r) at a precomputed LDS byte address; asynchronous until lgkmcnt."""
     return fx.Vector(llvm.inline_asm(ir.VectorType.get([4], fx.Int32.ir_type), [address.ir_value()],
         f"ds_read_b128 $0, $1 offset:{immediate}", "=v,v,~{memory}", has_side_effects=True))
+
+
+def _load_address(address, immediate=0):
+    """_read_address that LLVM sees, so it adds the MFMA hazard wait states; volatile keeps the issue order."""
+    pointer = fx.inttoptr(fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16), fx.Int32(address) + immediate)
+    return fx.Vector(fx.generic_load(pointer, count=4, volatile=True))
+
+
+def _load_lds(storage, offset, immediate=0):
+    """_load_address at a byte offset into an LDS allocation; its alias scope spares waits for DMA into others."""
+    pointer = fx.recast_iter(fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16),
+                             fx.get_iter(storage) + (fx.Int32(offset) + immediate))
+    return fx.Vector(fx.generic_load(pointer, count=4, volatile=True))
 
 
 @flyc.jit
@@ -329,6 +355,11 @@ def _max(values):
     for width in (4, 2, 1):
         parts = [maximum(parts[2 * i], parts[2 * i + 1]) for i in range(width)]
     return parts[0]
+
+
+def _maxnum(a, b):
+    # nnan: a bare v_max_f32 without canonicalizing maxes, visible to LLVM's MFMA hazard checks.
+    return fx.Float32(fx.maxnumf(fx.Float32(a), fx.Float32(b), fastmath="nnan"))
 
 
 def _cross(value, addresses):

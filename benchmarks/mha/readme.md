@@ -146,6 +146,44 @@ cudaPerf事件计时（每次计时前GPU spin 2 ms），10 buffer×5轮=50样�
 BF16 D128/D192分页、FP8与SWA的输出与改动前逐位一致，交替A/B耗时变化在±1.1%以内（FP8 causal D128快2.1%），
 D256分页/linear在±0.3%以内，复用D256 helper的QSA union kernel快约2%；下表未重测。
 
+2026-10-27（相对父提交0cff467）：BF16 D128的S3配平与stage取指对齐，FP8的S7取指对齐、行和配平与per-tensor scale入SGPR
+（[源码readme第3.3、6节](../../src/pyhip/ops/mha/flydsl/readme.md)），以及D256与gfx950的inline asm hazard修复（第13节）。
+424个配置（默认、高精度与RTA模式）和下文交替A/B的68个大shape的输出都与父提交逐位一致（源码readme第13节），
+集成测试64个结果的逐buffer精度与父提交相同。本协议加`--skip-aiter`
+在GPU 6、7上按相反顺序各跑一次A/B，原始数据与逐case对比见`mytest/mydata/mha_bench_ab_20261027/`（`compare.md`为协议中位数，
+`fast_cluster.md`为全频样本）。同GPU耗时变化（两块GPU的范围；受降频影响的shape按全频样本，即不超过该case最小值1.1倍的样本）：
+
+| kernel | persistent | grid |
+|---|---:|---:|
+| BF16 D128 full、short p32/p64 | −4.8%到−6.2% | −3.3%到−5.0% |
+| BF16 D128 causal、long-p32 | −4.3%到−5.6% | −1.9%到−3.1% |
+| FP8（7个shape，只有普通网格） | — | −0.8%到−1.3% |
+| D256分页 full、short p32/p64 | −0.2%到+0.5% | +0.4%到+1.0% |
+| D256分页 causal、long-p32 | 见下文交替A/B | 见下文交替A/B |
+| D256 linear | −0.5%到+0.3% | −0.8%到+0.3% |
+
+机器码未变的BF16 D192与SWA可作噪声参照：稳定shape在±0.6%以内，D192 causal的全频样本在±1.7%以内。
+D256分页的causal与long-p32每次只有5–13个全频样本，两块GPU的结果不一致（−1.3%到+3.9%）。smoke shape（6–21µs）的变化在±2.2%以内，
+与机器码未变的SWA smoke相当。长shape仍出现3.4节所述的降频，样本在全频与降频两档之间切换，协议中位数取决于两档样本的比例：
+如linear-causal-8192 persistent中位数−3.8%到−4.1%，全频样本−0.3%到+0.1%；bf16-mha-long-p32 grid中位数+1.7%到+2.0%，
+全频样本−3.0%到−3.1%。
+
+为排除降频的影响，另用两个进程（父提交、本提交）在同一GPU上交替计时68个case：每轮各跑约40 ms的一组调用
+（每次调用前GPU spin，与cudaPerf相同），组间空闲0.25 s，共10轮、先后顺序逐轮交换，取逐轮配对比值的中位数；
+在GPU 6、7上各跑一遍，先手相反。机器码未变的BF16 D128带LSE与D192在−0.07%到+0.02%之间，可作噪声下限。
+
+| kernel（case数） | 两块GPU的配对中位数 |
+|---|---:|
+| BF16 D128（18；含混合长度、decode、page32/128、普通网格） | −3.7%到−7.8%（中位−5.5%） |
+| FP8（15） | −0.7%到−2.0%（中位−1.2%） |
+| D256分页（17） | −0.6%到+0.6%（中位+0.2%） |
+| D256 linear（13） | −1.3%到+0.7%（中位0.0%） |
+
+D256分页慢得最多的是混合长度causal、普通网格、page32与16384²（+0.3%到+0.6%），decode形状与非causal LSE快0.2%到0.6%；
+linear非causal带LSE慢约0.7%、16384² causal慢约0.5%，混合长度causal与普通网格causal快0.5%到1.3%，
+causal page4在两块GPU上一快一慢（−0.5%、+0.4%）。
+脚本与逐case结果：`mytest/mydata/mha_more_cases_20261027/`（`ab_perf.py`、`perf_summary.md`）。下表未重测。
+
 ### 3.1 BF16分页（`bf16-mha`，B1）
 
 | case | 形状（Q/KV，H/HK，Dq/Dv，page） | persistent | grid | AITER | 加速比 |

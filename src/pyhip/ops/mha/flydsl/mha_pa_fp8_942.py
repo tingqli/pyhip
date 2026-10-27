@@ -19,9 +19,9 @@ from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 from ._common import (
-    _MAX_FLOOR, _buffer, _center_part, _exp, _exp_part, _intrinsic, _join, _max3, _maximum, _mfma_hazard_wait,
-    _min, _pack_bf16, _pin, _pin_i32, _read_page_g2r, _reround_if, _row_max, _row_sum, _schedule, _softmax_scale,
-    _stage_end, _uniform, _wait,
+    _MAX_FLOOR, _align8, _buffer, _center_part, _exp, _exp_part, _intrinsic, _join, _max3, _maximum,
+    _mfma_hazard_wait, _min, _pack_bf16, _pin, _pin_i32, _read_page_g2r, _reround_if, _row_max, _row_sum, _schedule,
+    _softmax_scale, _stage_end, _uniform, _wait,
 )
 
 BM, BN, DV, THREADS = 256, 64, 128, 512
@@ -31,6 +31,8 @@ LOG2E = math.log2(math.e)
 # m: lazy, or "1": also moved (to row max - 2) when a new row max carries about l / 8 or more, so that the P of
 # such a dominant key is exactly 4 in FP8. Read at import.
 _EXACT_MAX = os.environ.get("AITER_FLYDSL_MHA_EXACT_MAX", "0").lower() in ("1", "true")
+# S5 does the first 14 of the 31 adds of the lane row sum of P(t-1), S7 the other 17.
+_S5_SUM_ADDS = 14
 
 
 def _page_ready_tied(value):
@@ -102,9 +104,11 @@ def _sum_tree(values):
     yield _add(partials[0], partials[1])
 
 
-def _center(value, scale, maximum):
+def _center(value, scale, maximum, uniform=False):
+    # A uniform (per-tensor) scale is read as an SGPR.
     return fx.Float32(llvm.inline_asm(fx.Float32.ir_type, [value.ir_value(), scale.ir_value(), maximum.ir_value()],
-                                    "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False))
+                                    "v_fma_f32 $0, $1, $2, -$3", "=v,v,s,v" if uniform else "=v,v,v,v",
+                                    has_side_effects=False))
 
 
 def _first_max(scores, scale):
@@ -132,8 +136,8 @@ def _next_max(local_max, scale, row_max, row_sum, t):
 def _pv_lo_with_max(p_prev, v_words, o0, o1, s_cur):
     """S5 in fenced program order: PV MFMAs of dims 0-63 by K-step; the FP8 conversion of the
     next K-step rides behind the first MFMA and MAX3 of S(t) behind the second, so the tree and
-    its xor32 ds_bpermute issue before the last K-step, which takes the first 16 adds of the
-    row sum of P(t-1). Returns P words, O, the row max and the row-sum generator."""
+    its xor32 ds_bpermute issue before the last K-step, which takes the first _S5_SUM_ADDS adds
+    of the row sum of P(t-1). Returns P words, O, the row max and the row-sum generator."""
     tree = _max_tree(fx.Vector(s_cur))
     sums = _sum_tree(p_prev)
     p_words = _pack_step(p_prev, 0)
@@ -146,7 +150,7 @@ def _pv_lo_with_max(p_prev, v_words, o0, o1, s_cur):
             o0, o1 = (o0, acc) if m else (acc, o1)
             rocdl.sched_barrier(0)
             if k == 3:
-                for _ in range(8):
+                for _ in range(_S5_SUM_ADDS // 2):
                     next(sums)
             elif m == 0:
                 p_words += _pack_step(p_prev, k + 1)
@@ -160,24 +164,28 @@ def _pv_lo_with_max(p_prev, v_words, o0, o1, s_cur):
     return p_words, o0, o1, row_max, sums
 
 
-def _pv_hi_with_sum(p_words, v_words, o2, o3, sums, s_cur, scale, maximum):
-    """S7 in fenced program order: six VALU after each PV MFMA (dims 64-127): the rest of the
-    row sum, its xor32 ds_bpermute, then S'(t). Returns O, the two partial sums and S'(t)."""
+def _pv_hi_with_sum(p_words, v_words, o2, o3, sums, s_cur, scale, maximum, uniform):
+    """S7 in fenced program order: seven VALU after each PV MFMA (one after the last; dims 64-127):
+    the rest of the row sum, its xor32 ds_bpermute, then S'(t). The shuffle and the FMAs after it
+    are a dense run of 8-byte instructions, so it starts 8-byte aligned (_align8). Returns O, the
+    two partial sums and S'(t)."""
     s_cur = fx.Vector(s_cur)
     out = {}
 
     def valu():
-        for _ in range(15):
+        for _ in range(31 - _S5_SUM_ADDS):
             local = next(sums)
             yield
+        _align8()
         out["local"], out["other"] = local, local.shuffle_xor(32, 64)
         yield
         out["centered"] = []
         for i in range(32):
-            out["centered"].append(_center(s_cur[i], scale, maximum))
+            out["centered"].append(_center(s_cur[i], scale, maximum, uniform))
             yield
 
     ops = valu()
+    per_mfma = -(-(64 - _S5_SUM_ADDS) // 8)
     for k in range(4):
         for m in range(2):
             rocdl.sched_barrier(0)
@@ -185,8 +193,8 @@ def _pv_hi_with_sum(p_words, v_words, o2, o3, sums, s_cur, scale, maximum):
             acc = _mfma((v_words[i], v_words[i + 1]), p_words[2 * k:2 * k + 2], o3 if m else o2)
             o2, o3 = (o2, acc) if m else (acc, o3)
             rocdl.sched_barrier(0)
-            for _ in range(6):
-                next(ops)
+            for _ in range(per_mfma):
+                next(ops, None)
     rocdl.sched_barrier(0)
     centered = _pin(fx.Vector.from_elements(out["centered"], fx.Float32), 32)
     return o2, o3, out["local"], out["other"], centered
@@ -433,7 +441,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
                 _v_tail, _join, _mfma_hazard_wait, _maximum, _row_max, _row_sum, _center_part, _exp_part,
                 _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait, _schedule_qk_exp, _read_v_words,
                 _pack_step, _mfma, _add, _max3, _max_tree, _sum_tree, _center, _pv_lo_with_max, _pv_hi_with_sum,
-                _reround_if, _first_max, _intrinsic, _next_max)
+                _reround_if, _first_max, _intrinsic, _next_max, _align8)
     dtype = Q.dtype
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
@@ -455,6 +463,8 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     else:
         scale = scale * QS[0]
     scale = fx.Float32(scale)
+    if fx.const_expr(not PER_TOKEN):
+        scale = _uniform(scale.bitcast(fx.Int32)).bitcast(fx.Float32)
     tiles = (kv_len + BN - 1) // BN
     if fx.const_expr(CAUSAL):
         end = (q_start + valid + kv_len - q_len + BN - 1) // BN
@@ -588,7 +598,8 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         _wait(vmcnt=0, lgkmcnt=0)
         _stage_end()
         # S7 compute: PV O dims 64-127; l += row sum of P(t-1); S'(t); lazy rescale of O and l.
-        o2, o3, local_sum, other_sum, s_cur = _pv_hi_with_sum(p_words, v_hi, o2, o3, sums, s_cur, scale, new_max)
+        o2, o3, local_sum, other_sum, s_cur = _pv_hi_with_sum(p_words, v_hi, o2, o3, sums, s_cur, scale, new_max,
+                                                               not PER_TOKEN)
         row_sum = row_sum + (local_sum + other_sum)
         o0, o1, o2, o3, row_sum, s_cur, exact = _rescale(o0, o1, o2, o3, row_sum, s_cur, row_max, new_max, ballot,
                                                          exact)

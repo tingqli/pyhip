@@ -294,6 +294,10 @@ def _store_o_r2g(outputs, inv, o_buf, out_tid, out_row, orow):
         vals = outputs[g // 2]
         begin = (g & 1) * 8
         packed = [rocdl.cvt_pk_bf16_f32(vals[begin + i] * inv, vals[begin + i + 1] * inv) for i in range(0, 8, 2)]
+        # cvt_pk_bf16_f32 is inline asm: LLVM misses the 2 wait states a permlane needs after a VALU write.
+        rocdl.sched_barrier(0)
+        llvm.inline_asm(None, [], "s_nop 1", "", has_side_effects=True)
+        rocdl.sched_barrier(0)
         pairs = [rocdl.permlane32_swap(pair_type, packed[i], packed[i + 2], False, True) for i in range(2)]
         words = fx.Vector.from_elements([
             fx.Int32(llvm.extractvalue(fx.Int32.ir_type, pairs[i & 1], [i // 2])) for i in range(4)

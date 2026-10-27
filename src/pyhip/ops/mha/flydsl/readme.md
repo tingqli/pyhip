@@ -19,7 +19,7 @@ gfx950 BF16分页注意力（含SWA/sink）以及gfx942/gfx950单wave SWA。本�
 | `read_x_s2r` | LDS → 寄存器 | `_read_k_s2r`、`_read_v_s2r` |
 | `store_x_r2g` | 寄存器 → global | `_store_o_tile_r2g`、`_store_o_r2g` |
 | `_shuffle_o_r2s2r` | 经LDS重排输出（r2s后s2r） | D256 linear的O |
-| `_read_k_s2r_v_g2s` | 一段asm里交织两件事：读K（s2r），同时DMA V（g2s） | D256 paged |
+| `_read_k_s2r_v_g2s` | 交织两件事：读K（s2r）与DMA V（g2s）逐条交替发出 | D256 paged |
 
 read类helper只**发射**指令、返回异步结果；所有`s_waitcnt`都由kernel主体在阶段边界显式放置（`_wait`）。
 
@@ -150,6 +150,17 @@ S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
   `ds_bpermute`交换（`_cross32_async`），与同stage的独立DS读共用一次等待，不在compute stage插入shuffle。
 - exp按24+8分到S1/S3两次QK旁边（`_schedule`用`sched_group_barrier`把MFMA与VALU/TRANS交错），
   掩码和新m的计算放在S5/S7的PV旁。
+- D128的S3原来是最长的stage：8个exp、31个行和加法、约80条BF16转换VALU挤在16个MFMA之间，ATT中领先组S3与落后组S2
+  同时运行的slot中位数752周期（其余slot约520–650）。D128只在S3做lane行和的第一层（16个成对和），S5完成其余4层，
+  S6与行最大值一起交换，S7在求新m之前加到l上（`_next_max`的高精度判据要用含P(t−1)的l）；加法与顺序不变，
+  输出逐位一致。该slot降到556周期，VGPR +16（无spill，见3.4）。D192这样做会溢出到scratch，保持上表。
+- D128主循环的stage从8字节对齐处开始（`_stage_end_aligned`：barrier后`_align8`，即`.p2align 3`，至多一条`s_nop 0`）。
+  gfx942按32字节块取指：8字节VALU/MFMA组成的密集段若从地址≡4 (mod 8)开始，每第4条跨两个块，ATT中wave在它之前
+  空等4周期，S3每次多约86周期。不对齐时每个循环副本的奇偶由它前面的全部代码决定：同一循环代码只在kernel入口加
+  几个`s_nop`，D128就在4.50–4.66 ms之间变化（每个跨块的副本约1.6%）；对齐后只由stage内部决定，D128的S3都不跨块。
+  D192的S3对齐后反而跨块（+1.5%），所以D192与`_body_wide`仍用`_stage_end`，ISA与改动前相同。
+  两项合计（GPU7交替A/B中位数，相对改动前）：D128 per-token −5.7%、per-tensor −5.7%、causal −6.5%，
+  高精度模式D128 −5.6%、causal −5.2%；[164800, 7, 128]持平（−0.1%，持续负载时功耗接近650 W上限）。
 - m从首个行最大值+1开始，只有后续行最大值超过m+7才前移到新最大值+1，并按ballot只在有行需要时缩放O和l（`_rescale`）。
 - import前设置`AITER_FLYDSL_MHA_EXACT_MAX=1`开启高精度模式（`_next_max`，`_body_v128`与`_body_wide`）：除超过m+7外，
   新行最大值的P = 2^(max − m)超过约l/8（l已含P(t−1)）时也前移，整个wave取max(m, 行最大值+1)：该key的P恰为1/2
@@ -172,20 +183,20 @@ S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
 `_body_wide`（LSE或V192）用协作拷贝（cooperative g2r→r2s），行和/行最大值在compute stage用lane shuffle归约，
 其余阶段角色相同；S6读V的64–Dv维，S7完成其余PV。
 
-### 3.4 资源（MI308X，FlyDSL 0.3.4.1，ISA实测）
+### 3.4 资源（MI308X，FlyDSL 0.3.4.1，ISA实测；2048²，D128 full为H8/HK8，其余H16/HK1）
 
 | specialization | VGPR | SGPR | LDS | scratch/spill |
 |---|---:|---:|---:|---:|
-| full D128 persistent / grid | 228 / 226 | 72 / 54 | 49,920 | 0 |
-| full D192 persistent / grid | 254 / 256 | 75 / 56 | 58,240 | 0 |
-| causal D128 persistent / grid | 232 / 228 | 74 / 58 | 49,920 | 0 |
-| causal D192 persistent / grid | 256 / 254 | 77 / 60 | 58,240 | 0 |
+| full D128 persistent / grid | 246 / 244 | 72 / 58 | 49,920 | 0 |
+| full D192 persistent / grid | 254 / 252 | 75 / 60 | 58,240 | 0 |
+| causal D128 persistent / grid | 251 / 246 | 75 / 62 | 49,920 | 0 |
+| causal D192 persistent / grid | 256 / 254 | 80 / 63 | 58,240 | 0 |
 
 ### 3.5 D128伪代码与精度损失（`_body_v128`，Dq = Dv = 128，无LSE）
 
 按一行query写（实际每wave 32行，一行的64个key由lane r与r+32各持32个）；log2单位。注释中`[E*]`后是该步引入的误差范围：
 u = 2^-24为FP32单位舍入，n为KV tile数（[164800, 7, 128]时n = 2575），“典型”按舍入误差随机估计；推导见下表。
-未标注的步骤是精确的（`−inf`遮挡、越界V行置0、lane间交换、BF16输入搬运）。D192只是QK的K维为192。
+未标注的步骤是精确的（`−inf`遮挡、越界V行置0、lane间交换、BF16输入搬运）。D192只是QK的K维为192，且行和在S3算完、S4交换、S5相加（3.3）。
 
 ```text
 scale = FP32(FP32(softmax_scale·log2e) · k_descale · q_descale)   # [E1] scale相对 ≤ 3u ≈ 1.8e-7
@@ -199,10 +210,10 @@ if 有行|m| ≥ 2^22: S' = reround(S', m)    # 冷分支，此后sticky；[E4] 
 l = 0; O = 0
 for t = 1 .. tiles−1:                     # D128每趟展开两个phase；S0–S7见3.3
     P = exp2(S'(t−1))                     # S1算24个、S3算8个；[E5] P相对 ≤ 0.783 ulp ≈ 9.3e-8
-    l_lane = Σ P(本lane 32个)              # S3，5层成对求和树；[E6] 相对 ≤ 5u ≈ 3e-7
+    l_lane = Σ P(本lane 32个)              # S3第一层、S5其余4层的成对求和树；[E6] 相对 ≤ 5u ≈ 3e-7
     P16 = BF16(P)                         # S3，RNE（RTA开关见3.3）；[E7] 每个P相对 ≤ 2^-8 ≈ 3.9e-3
     S = q · K(t)ᵀ                         # S1、S3；[E2] 同上
-    l += l_lane + l_lane(另一半lane)        # S4交换，S5相加；[E6] l相对 ≲ (n+6)u ≈ 1.5e-4，典型 √n·u ≈ 3e-6
+    l += l_lane + l_lane(另一半lane)        # S6交换，S7相加；[E6] l相对 ≲ (n+6)u ≈ 1.5e-4，典型 √n·u ≈ 3e-6
     O[0:64]   += P16 · V(t−1)[:, 0:64]    # S5；[E8] |ΔO| ≲ 8n·u·ΣP16·|V|（8n·u ≈ 1.2e-3，典型 √(8n)·u ≈ 9e-6）
     O[64:128] += P16 · V(t−1)[:, 64:128]  # S7；[E8] 同上
     S = mask(S); cand = rowmax(S)·scale   # S5、S7；[E3] 无
@@ -268,10 +279,10 @@ if 有行|m| ≥ 2^22: S' = reround(S', m)    # 冷分支，此后sticky；[E4] 
 l = 0; O = 0
 for t = 1 .. tiles−1:                     # D128每趟展开两个phase；S0–S7见3.3
     P = exp2(S'(t−1))                     # S1算24个、S3算8个；[E5] P相对 ≤ 0.783 ulp ≈ 9.3e-8
-    l_lane = Σ P(本lane 32个)              # S3，5层成对求和树；[E6] 相对 ≤ 5u ≈ 3e-7
+    l_lane = Σ P(本lane 32个)              # S3第一层、S5其余4层的成对求和树；[E6] 相对 ≤ 5u ≈ 3e-7
     P16 = BF16(P)                         # S3，RNE；[E7] 每个P相对 ≤ 2^-8 ≈ 3.9e-3；★前移时的最大key ≤ ln2·|r|
     S = q · K(t)ᵀ                         # S1、S3；[E2] 同上
-    l += l_lane + l_lane(另一半lane)        # S4交换，S5相加；[E6] l相对 ≲ (n+6)u ≈ 1.5e-4，典型 √n·u ≈ 3e-6
+    l += l_lane + l_lane(另一半lane)        # S6交换，S7相加；[E6] l相对 ≲ (n+6)u ≈ 1.5e-4，典型 √n·u ≈ 3e-6
     O[0:64]   += P16 · V(t−1)[:, 0:64]    # S5；[E8] |ΔO| ≲ 8n·u·ΣP16·|V|（8n·u ≈ 1.2e-3，典型 √(8n)·u ≈ 9e-6）
     O[64:128] += P16 · V(t−1)[:, 64:128]  # S7；[E8] 同上
     S = mask(S); cand = rowmax(S)·scale   # S5、S7；[E3] 无
@@ -312,12 +323,14 @@ normal 2.33e-3、sinks 1.81e-3、ascending 2.02e-3，其余与高精度模式相
 `PagedAttention(Dq=Dv=256)`自动分派到这里（`bf16_backend`以`-pages1-lateS41`结尾）。
 
 - BM128/BN64，8 wave×16行，`v_mfma_f32_16x16x16_bf16`；Q一次读入寄存器（`_read_q_g2r`）并在全部tile复用。
-- LDS只有一个K tile（32 KiB，每wave的K行间距`K_PITCH=1024`）和一个V tile（32 KiB）。
+- LDS只有一个V tile（32 KiB）和一个K tile（32 KiB，每wave的K行间距`K_PITCH=1024`），是两个独立的LDS分配：
+  K/V的读与DMA因此有各自的alias scope，LLVM不会为另一块的DMA在读之前插`vmcnt`等待。V在地址0，asm算出的V DMA目的地址直接作M0。
 - K/V都用direct-to-LDS DMA：`buffer_load_dword ... lds`每lane一dword、每个packet写2 KiB，一个tile 16个packet。
   V的每个tile按其所在页的完整64-bit地址重建buffer描述符（`_v_tile_resources`；page32时一个tile跨两页，用两个描述符），
   buffer指令只携带tile内相对偏移，页号×页跨度不在32-bit里计算。
-- “交织”：`_read_k_s2r_v_g2s`在同一段asm里把V(t−1)的每个DMA packet与K(t)的一次`ds_read_b128`配对；
-  `_read_v_s2r_k_g2s`把K(t+1)的DMA与V(t−1)的读配对。DS读为VMEM提供M0→VMEM的必要间隔，省去nop。
+- “交织”：`_read_k_s2r_v_g2s`把V(t−1)的每个DMA packet与K(t)的一次`ds_read_b128`交替发出；
+  `_read_v_s2r_k_g2s`把K(t+1)的DMA与V(t−1)的读交替发出。DS读为VMEM提供M0→VMEM的必要间隔，省去nop。
+  LDS读用`_load_lds`（LLVM可见的volatile load），LLVM据此补足MFMA之后的hazard等待（第13节）。
 
 ```text
 step  memory stage                                compute stage
@@ -350,6 +363,7 @@ S4的LGKM等待移到barrier之后、首个消费者之前。page32/64/128、per
   再用`readlane`取出每个packet的SOFFSET（`_dma_offsets`），没有发散的标量waterfall。
 - `_read_packet_g2s`把SOFFSET/M0的标量计算、一次可选`ds_read_b128`和DMA放在同一段asm（同一leaf），
   避免独立asm结果之间的hazard nop；`_k_reads`/`_v_reads`是K/V读计划（slot、地址、立即数，按发射顺序）。
+  其余K/V读（`_read_k_s2r`/`_read_v_s2r`）和O shuffle的读用`_load_address`（LLVM可见，第13节）。
 
 ### 5.2 流水线（`_body`）
 
@@ -386,6 +400,7 @@ step  memory stage                                compute stage
   输出与Q/K/V/metadata/LSE重叠、`softmax_scale`非正有限值、长度超过上界等抛`ValueError`。
 - 资源：full persistent VGPR228/SGPR52；causal B1 VGPR232/SGPR63；page1 VGPR242/SGPR106；page4 VGPR247/SGPR68；
   均LDS 65,536、零scratch/spill（单元测试在模块结束时检查本次编译的全部specialization）。
+  LDS读改为LLVM可见后（第13节），causal/page1/page4/ragged的VGPR又多3–7个，仍无spill。
 
 ## 6. gfx942 FP8（[mha_pa_fp8_942.py](mha_pa_fp8_942.py)）
 
@@ -426,8 +441,20 @@ S7     PV: O dims 64-127 += P V    softmax: l += row sum, S'(t); rescale O and l
   - S1/S3：每个QK依赖链环节放2个exp（16+16+4≈36），QK与exp同时饱和。
   - S5/S7：`_pv_lo_with_max`/`_pv_hi_with_sum`用`sched_barrier`按程序顺序发射PV MFMA（两个累加器交替），
     下一个K-step的FP8转换跟在第一个MFMA后，MAX3树跟在第二个后，xor32 `ds_bpermute`提前一个K-step发出；
-    行和拆成S5的16个加法和S7的15个加法，S7再做S'(t)的32个FMA。
+    行和拆成S5的14个加法和S7的17个加法（`_S5_SUM_ADDS`），S7每个MFMA后7条VALU（最后一个后只剩1条），
+    再做S'(t)的32个FMA。ATT（一个CU，D128）中S5所在slot约368周期（16个`v_cvt_pk_fp8_f32`各占8），
+    S1/S3为296，S7（对齐后，见下）约304。原来S5做16个、S7每个MFMA后6条；挪走2个加法后S5与S7所在slot各短8–12周期，
+    GPU7交替A/B各形状快0.6–0.9%；挪4–6个相近，挪8个快0.3–0.8%，16个全挪+1.4%（S7变成发射口受限），
+    挪进S6（memory stage）+1.2%。
   - memory stage只放短VALU（S4的mask、S6的新m）：同SIMD上另一组的compute wave占满发射口时，memory wave的VALU会被饿死（实测停顿130周期）。
+  - S7取指对齐：S7的`ds_bpermute`与其后的32个FMA、PV MFMA是一段8字节指令的密集段，它前面4字节的
+    `v_add_f32`/`s_nop`个数决定这段是否从≡4 (mod 8)开始、每第4条跨32字节取指块（3.3）。`_align8`在
+    `ds_bpermute`前对齐：HEAD各build里不少S7每次有8–9条跨块，对齐后为0，ISA只多填充的`s_nop`。
+    GPU7交替A/B（四轮）：D128 −0.8%到−1.0%、LSE −0.65%到−0.8%、D192与causal −0.15%到−0.5%、
+    per-tensor与[164800, 7, 128]持平；高精度模式0到−0.7%。S5的密集段短且`v_cvt_pk_fp8_f32`占8周期，跨块不暴露：
+    在S5每组VALU前也对齐，多数形状反而慢0.2–0.7%。
+  - per-tensor时scale用`readfirstlane`放进SGPR，S'(t)的FMA直接读它（`_center`），每条FMA少读一个VGPR；
+    ATT中S7所在slot再短约16–20周期，per-tensor D128（16384²×H7）再快0.65–1.0%（两轮）。per-token的scale按行不同，代码不变。
   - 行和用inline asm标量`v_add_f32`：LLVM SLP会把它合成`v_pk_add_f32`，而packed FP32在SIMD有MFMA执行时停顿（实测176周期）；
     同理S'(t)不用`v_pk_fma_f32`（A/B慢5%）。各加法/最大值的结合顺序与改动前相同，输出与改动前逐位一致。
 
@@ -463,6 +490,8 @@ per-token Q scale的结果相差不超过3%。758a1856（每个新最大值都�
 - SWA：`window_left≥0`要求bottom-right causal；sink是每个query头一个值为0的虚拟key，只加到`l`。
 - `persistent=None/False`为单次普通网格；`persistent=True`使用每(device, stream, grid)缓存的8字节调度头
   （原子ticket + 完成计数，最后一个CTA复位），graph重放需在各自捕获stream上预热。
+- O写回`_store_o_r2g`：FlyDSL的`rocdl.cvt_pk_bf16_f32`是inline asm，LLVM不知道它刚写了VGPR，`permlane32_swap`读它前
+  只隔1个等待状态（规则要求2个），两者之间显式`s_nop 1`（第13节）。
 - 本机为gfx942：gfx950 kernel在本次重构中只做了交叉编译（`COMPILE_ONLY=1 ARCH=gfx950`）的ISA对比，未在gfx950上执行。
 
 ## 8. 单wave SWA（[mha_pa_swa_bf16.py](mha_pa_swa_bf16.py)）
@@ -479,17 +508,22 @@ per-token Q scale的结果相差不超过3%。758a1856（每个新最大值都�
 1. 标量/向量工具与同步：`_MAX_FLOOR`（最小有限FP32，作行最大值下限，不截断任何有限logit）、
    `_softmax_scale`（host校验：张量/bool抛`TypeError`，`softmax_scale·log2e`须是正的有限FP32）、
    `_uniform`（readfirstlane）、`_pin`/`_pin_i32`（空asm绑定值，阻止重算与跨阶段移动）、
-   `_stage_end`（`sched_barrier`+`s_barrier`+`sched_barrier`，不是内存等待）、`_wait`（显式`s_waitcnt`编码）、
+   `_stage_end`（`sched_barrier`+`s_barrier`+`sched_barrier`，不是内存等待）、`_align8`（`.p2align 3`，发射口受限的
+   8字节指令密集段不跨32字节取指块，见3.3）、`_wait`（显式`s_waitcnt`编码）、
    `_schedule`/`_schedule_exps`（`sched_group_barrier`交错MFMA与VALU/TRANS；后者每步先减m再exp）、`_read_page_g2r`/`_page_ready`
    （s_load页号；等待与第一次读取放在同一段asm，避免RA在等待前复制尚未到达的SGPR）、`_buffer`/`_buffer_words`、
-   `_read_address`（`ds_read_b128`）、`_rescale`、`_pack_bf16`（P与O转BF16：`bits + 0x7FFF + lsb`的软件RNE，
+   `_read_address`（asm `ds_read_b128`）与`_load_address`/`_load_lds`（同一读取的volatile `generic_load`，LLVM据此补MFMA
+   hazard等待；`_load_lds`按LDS分配取偏移并带其alias scope；D256使用，见第13节）、`_rescale`、
+   `_pack_bf16`（P与O转BF16：`bits + 0x7FFF + lsb`的软件RNE，
    每对一条`v_perm_b32`拼高半；不规范化NaN，gfx950用硬件`v_cvt_pk_bf16_f32`）。
 2. BM256 32×32 softmax：`_row_max_local`/`_row_max`、`_row_sum_local`/`_row_sum`、`_center_part`（FMA `S·scale − m`）、
    `_reround`/`_reround_if`（把S'舍入到ulp(m)的整数倍，|m| ≥ 2^22后的精确规则）、`_exp_part`（`exp2(S')`）、
+   `_maximum`（asm `v_max_f32`，对LLVM不透明）、
    `_mfma_hazard_wait`（MFMA结果被inline asm读取前`s_nop 10`：gfx942 32×32 MFMA需要NumPasses(8)+3个等待周期，
    LLVM hazard recognizer不保护inline asm消费者）。
 3. D256几何与16×16 MFMA片段：`_mma`、`_read_q_g2r`、`_qk`、`_pv`、`_sum`、`_max`（用`llvm.maxnum`让MFMA→max依赖对LLVM可见；
-   曾经的不透明max树在grid重复逐位检查中失败）、`_cross`（`ds_bpermute`交换）、`_scale`、`_exps`（`exp2(S' − m)`）、`_mask`、`_v_tail`。
+   曾经的不透明max树在grid重复逐位检查中失败）、`_maxnum`（两数的`maxnumf` nnan，即裸`v_max_f32`）、
+   `_cross`（`ds_bpermute`交换）、`_scale`、`_exps`（`exp2(S' − m)`）、`_mask`、`_v_tail`。
 
 **FlyDSL磁盘缓存注意**：缓存key只扫描函数自身`co_names`引用的helper（及闭包标量），不扫描嵌套闭包里引用的helper。
 因此每个含闭包的主体开头都有`_helpers = (...)`元组，列出闭包用到的helper，使修改它们会改变缓存key。
@@ -546,6 +580,18 @@ per-token Q scale的结果相差不超过3%。758a1856（每个新最大值都�
   长序列持续负载（[164800,7,128]、50次背靠背）382.7→405.9T，受功耗限制（约630 W，时钟1.78→1.71 GHz），
   同条件hipBLASLt FP8 GEMM 16384³为399.2T。未采纳：exp放进memory stage（−8%，发射口争用且QK依赖链变长）、
   `s_setprio`提高compute wave优先级（更慢）、`v_pk_fma_f32`中心化（−5%）、D192把FP8转换移入S3（−15%）。
+- **2026-10-27 BF16 D128 S3配平与取指对齐**（对照gfx950-gluon-tutorials的attention，见3.3）：采纳S3行和后移
+  （单独D128 −4.3%）与D128主循环stage 8字节对齐（再−1.2%，并消除kernel入口代码长度带来的约±1.6%布局抖动）。
+  未采纳：memory stage开头加`s_nop`节拍（S0/S2/S4/S6各1–16个等待周期，都在±0.2%内）；per-tensor时把scale放SGPR
+  作中心化FMA的操作数（未对齐时随布局−1.5%到+1.7%，对齐后在±0.3%内，差别来自取指而非SGPR）；每条max3/FMA/
+  `v_perm`前也`.p2align 3`（跨块从每副本约28条降到0–2条，但比只在stage开头对齐慢0.2–0.8%）；D192也对齐（+1.5%）；
+  配平后S7的中心化FMA段错位（每phase约11条跨块），在第一条FMA前对齐反而慢0到0.5%：BF16的S7有16个MFMA，
+  受MFMA限制，取指气泡被掩盖。
+- **2026-10-27 FP8**（同一组思路，见第6节）：采纳S7取指对齐、行和2个加法从S5挪到S7、per-tensor scale放SGPR。
+  合计（GPU7交替A/B，相对改动前）：D128 −1.85%、per-tensor D128 −1.65%、causal −1.0%、D192 −1.2%、LSE −1.9%、
+  [164800, 7, 128] −0.7%；高精度模式−0.45%到−1.1%。未采纳：S2开头加`s_nop 3`（默认模式−0.8%到+0.2%，
+  高精度模式−0.3%到+0.9%）；行和挪进S6或16个全挪（+1.2%、+1.4%）；S5也对齐（多数慢0.2–0.7%）。FP8的softmax
+  VALU已按发射口均摊（10-22），四个compute stage都受发射口或MFMA限制，配平只剩S5与S7之间的少量余地。
 
 ## 12. 与aiter PR #6576 union评审意见对齐（2026-10-22）
 
@@ -581,3 +627,45 @@ TypeError/ValueError用例。改动前的代码在除SWA近1e11外的全部用�
 
 gfx950只做了交叉编译（80/80）：热路径的`v_fma_f32`/`v_mul_f32`/`v_exp_f32`条数与VGPR和改动前完全相同，
 新增的`v_add_f32`/`v_sub_f32`都在`_reround`冷分支里，未在gfx950上运行和计时。
+
+## 13. inline asm的hazard审计与修复（2026-10-27）
+
+LLVM的hazard recognizer不分析inline asm里的指令：MFMA之后由asm读写相关VGPR、asm写VGPR之后紧跟permlane，
+都可能少插等待状态。aiter PR #6576的评审也要求union kernel去掉这类asm。
+
+- **审计**：离线编译72个specialization（gfx942默认36个、高精度模式15个、P转BF16 RTA 9个，gfx950 12个；不初始化GPU），
+  按LLVM自身的GFX940/GFX950等待规则检查反汇编的每条控制流边；D256另用LDS仿真器跑38个动态场景，检查DMA与DS读写的先后和M0。
+  脚本未入库：`mytest/mydata/mha_hazards_20261027/capture.py`与`mytest/mydata/mha_hazards_recheck_20261027/`。
+- **发现**：63处等待不足，全部紧挨inline asm。
+  - D256 gfx942 42处（linear 24、paged 18）：asm `v_max_f32`（`_maximum`）或asm `ds_read_b128`（`_read_address`）在4-pass
+    `v_mfma_f32_16x16x16_bf16`之后过早改写该MFMA仍要读的C（26处）或仍要写的结果（16处）寄存器。
+  - gfx950 21处：`_store_o_r2g`中FlyDSL的`rocdl.cvt_pk_bf16_f32`是inline asm，`permlane32_swap`读它的结果前只隔1个等待状态（要求2个）。
+  - D256这些点用匹配的探针和现有测试都没有在硬件上复现，gfx950只交叉编译；但同类规则在gfx942上可以触发：
+    FP8 32×32×16 MFMA之后立即用`v_mov`改写其C的最后一个VGPR，结果出错，补足7个等待状态后正常。
+- **修复**（只改D256与gfx950）：
+  - D256的LDS读改为LLVM可见的volatile `generic_load`（linear用`_load_address`，paged用`_load_lds`），仍是同样的
+    `ds_read_b128`、同样的发射顺序，LLVM据此补足MFMA之后的等待；跨lane行最大值用`_maxnum`（`maxnumf` nnan，即裸`v_max_f32`）。
+  - paged参照PR #6576的union把K/V拆成两个LDS分配。只有一个数组、指针来自`inttoptr`时，LLVM分不清K读与V DMA，
+    在每个`ds_read`前插`vmcnt(0)`（62处），paged慢5.4倍；拆开后各有alias scope。V放在地址0，asm算出的V DMA目的地址直接作M0
+    （V在0x8000时每个packet多一条`s_add_i32 m0`，共64条）。
+  - paged step0：`_page_ready`的asm等待已经退休了K(t)的读，但LLVM看不到，会在之后的MFMA前逐个补`lgkmcnt`（每个循环副本15个），
+    所以在它之前显式`_wait(lgkmcnt=0)`。
+  - gfx950：`cvt_pk_bf16_f32`与`permlane32_swap`之间`sched_barrier`、`s_nop 1`、`sched_barrier`。
+  - BF16 BM256与FP8保留asm `_maximum`：它们在asm读MFMA结果前已有`_mfma_hazard_wait`，没有违例；全局换成`maxnumf`后
+    FP8 D128与BF16 D192慢1.1–1.2%（代码布局变化）。
+- **正确性**：72个specialization全部满足规则；除D256的9个和gfx950的12个外，二进制与改动前逐字节相同，
+  gfx950只在O写回多了`s_nop`。LDS仿真38个场景（228万条动态指令、31.3万次LDS事件）无竞争、无未写先读、无未知地址。
+  复用linear读取helper的QSA union同样没有违例，等待数与VGPR不变。`tests/ops/mha`默认与高精度模式均117 passed、7 skipped；
+  `tests/ops/qsa` 81 passed，另2项trap stderr文本检查在改动前同样失败。另有424个配置（BF16 BM256 96个×默认/高精度/RTA，
+  FP8 32个×默认/高精度，D256 paged 24个、linear 48个；覆盖D128/D192/V192、page 1/4/32/64/128、causal、LSE、persistent/grid、
+  per-token/per-tensor、GQA、变长、decode、空KV与Q>KV）与FP32参考的误差都在阈值内，3次重复逐位一致；
+  D256的72个配置各重复30次（同一GPU上6个进程并发）也逐位一致。
+- **精度**：上述424个配置和性能测试的68个大shape（O与LSE）都与父提交0cff467逐位一致；
+  集成测试全部64个结果的逐buffer精度也与父提交相同。第3.5、3.6、6节的误差分析不变。
+- **代码与资源**：paged每个specialization少37–40条指令，`s_waitcnt`只多显式的2个，LDS读前的`vmcnt`等待数不变，VGPR不变或少1–2个；
+  linear的causal/page1/page4/ragged VGPR多3–7个，static/narrow不变或少2个，均无spill。
+- **性能**：两个进程在同一GPU上交替计时（[使用文档第3节](../../../../../benchmarks/mha/readme.md)）：D256 paged 17个case
+  在−0.6%到+0.6%之间（中位+0.2%），linear 13个case在−1.3%到+0.7%之间（中位0.0%），机器码未变的对照组在±0.1%以内。
+  gfx950未计时。
+- **剩余inline asm**：D256仍有linear中DMA与`ds_read_b128`同leaf的`_read_packet_g2s`、`_cross`（`ds_bpermute`）、
+  O shuffle的`ds_write`、`_page_ready`的等待等。当前没有违例，但结果取决于寄存器分配；改动这些kernel后应重跑审计。

@@ -18,9 +18,9 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 
 from ._common import (
-    BM, BN, D, K_BYTES, LDS_BYTES, LOG2E, THREADS,
-    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _mask, _max, _maximum, _min,
-    _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _pv, _qk, _read_address, _read_page_g2r,
+    BM, BN, D, K_BYTES, LOG2E, THREADS, V_BYTES,
+    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _load_lds, _mask, _max, _maxnum, _min,
+    _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _pv, _qk, _read_page_g2r,
     _read_q_g2r, _rescale, _scale, _schedule, _schedule_exps, _stage_end, _sum, _uniform, _v_tail, _wait,
 )
 
@@ -35,9 +35,9 @@ def _read_tile_pages_g2r(table, tile, last, kv_len, page_size):
     return page0, page1
 
 
-def _read_k_s2r(address, half):
+def _read_k_s2r(k_lds, offsets, half):
     """Keys 32 * half .. 32 * half + 31 as the QK A operand."""
-    parts = [_read_address(address[n], half * 512 + k * (4 * K_PITCH))
+    parts = [_load_lds(k_lds, offsets[n], half * 512 + k * (4 * K_PITCH))
              for n in range(2) for k in range(8)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     storage = fx.make_rmem_tensor(fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16)
@@ -45,9 +45,9 @@ def _read_k_s2r(address, half):
     return fx.make_view(fx.get_iter(storage), fx.make_layout((4, 2, 16), (1, 64, 4)))
 
 
-def _read_v_s2r(address, half):
+def _read_v_s2r(v_lds, offset, half):
     """V dims 128 * half .. 128 * half + 127 as the PV A operand."""
-    parts = [_read_address(address, half * 2048 + n * 256 + k * 16384)
+    parts = [_load_lds(v_lds, offset, half * 2048 + n * 256 + k * 16384)
              for n in range(8) for k in range(2)]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = fx.make_rmem_tensor(fx.make_layout((4, 4, 8), (1, 4, 16)), fx.BFloat16)
@@ -111,44 +111,44 @@ def _v_tile_resources(base_address, page, second_page, tile, hk, page_size):
     return first, second
 
 
-def _read_v_packet_g2s(resources, storage, wave, voffset, page_size, packet):
+def _read_v_packet_g2s(resources, v_lds, wave, voffset, page_size, packet):
     resource = resources[1] if page_size == 32 and packet >= 8 else resources[0]
     destination = fx.Int32(llvm.inline_asm(fx.Int32.ir_type,
         [fx.Int32(wave * 256).ir_value()],
-        f"s_add_u32 $0, $1, {K_BYTES + packet * 2048}", "=s,s,~{scc}", has_side_effects=True))
+        f"s_add_u32 $0, $1, {packet * 2048}", "=s,s,~{scc}", has_side_effects=True))
     offset = fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [],
         f"s_mov_b32 $0, {_v_g2s_soffset(packet, page_size)}", "=s", has_side_effects=True))
-    _dma_dword_g2s(resource, storage, destination, voffset, offset)
+    _dma_dword_g2s(resource, v_lds, destination, voffset, offset)
 
 
-def _read_k_s2r_v_g2s(address, half, resources, storage, wave, voffset, page_size):
+def _read_k_s2r_v_g2s(k_lds, offsets, half, resources, v_lds, wave, voffset, page_size):
     """s2r K keys 32 * half .. + 31, with the 16 V(t-1) DMA packets issued between the reads."""
     parts = []
     for n in range(2):
         for k in range(8):
-            parts.append(_read_address(address[n], half * 512 + k * (4 * K_PITCH)))
-            _read_v_packet_g2s(resources, storage, wave, voffset, page_size, n * 8 + k)
+            parts.append(_load_lds(k_lds, offsets[n], half * 512 + k * (4 * K_PITCH)))
+            _read_v_packet_g2s(resources, v_lds, wave, voffset, page_size, n * 8 + k)
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     fragment = fx.make_rmem_tensor(fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16)
     fragment.store(words.bitcast(fx.BFloat16))
     return fx.make_view(fx.get_iter(fragment), fx.make_layout((4, 2, 16), (1, 64, 4)))
 
 
-def _read_v_s2r_k_g2s(address, half, resource, storage, wave, voffset, page, second_page,
+def _read_v_s2r_k_g2s(v_lds, offset, half, resource, k_lds, wave, voffset, page, second_page,
                       tile, hk, page_size):
     """s2r V dims 128 * half .. + 127, with the 16 K(t+1) DMA packets issued between the reads."""
     parts = []
     for n in range(8):
         for k in range(2):
-            parts.append(_read_address(address, half * 2048 + n * 256 + k * 16384))
-            _read_k_packet_g2s(resource, storage, wave, voffset, page, second_page, tile, hk, page_size, n * 2 + k)
+            parts.append(_load_lds(v_lds, offset, half * 2048 + n * 256 + k * 16384))
+            _read_k_packet_g2s(resource, k_lds, wave, voffset, page, second_page, tile, hk, page_size, n * 2 + k)
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = fx.make_rmem_tensor(fx.make_layout((4, 4, 8), (1, 4, 16)), fx.BFloat16)
     frag.store(words.bitcast(fx.BFloat16))
     return frag
 
 
-def _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, shared, heads):
+def _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, heads):
     """O * inv to BF16, C-shuffled through LDS (r2s b64, s2r b128), then b128 row stores (r2g)."""
     outputs = _join(o0, o1)
     atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16)
@@ -166,8 +166,7 @@ def _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, shared, head
         for i in fx.range_constexpr(2):
             element = out_tid * 8 + i * THREADS * 8
             read_row, read_col = element // 64, element % 64
-            address = shared + (element ^ ((read_row & 14) * 4)) * 2
-            words = _read_address(address)
+            words = _load_lds(storage, (element ^ ((read_row & 14) * 4)) * 2)
             _wait(lgkmcnt=0)
             rocdl.sched_barrier(0)
             src = fx.make_rmem_tensor(8, fx.BFloat16)
@@ -179,7 +178,7 @@ def _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, shared, head
 
 
 @flyc.jit
-def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
+def _body(Q, K, V, O, LSE, QS, KS, VS, table, k_lds, v_lds, q0, q_len, kv_len, head, qb,
           H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], PAGE: fx.Constexpr[int],
           CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
           SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool]):
@@ -209,9 +208,9 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     """
     # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
     _helpers = (_read_k_packet_g2s, _read_k_s2r, _read_v_s2r, _read_k_s2r_v_g2s, _read_v_s2r_k_g2s,
-                _read_v_packet_g2s, _v_tile_resources, _qk, _pv, _sum, _max, _cross, _scale, _exps, _pack_bf16,
-                _mask, _v_tail, _rescale, _advance_max, _join, _maximum, _pin, _schedule, _schedule_exps,
-                _stage_end, _wait)
+                _read_v_packet_g2s, _load_lds, _v_tile_resources, _qk, _pv, _sum, _max, _cross, _scale, _exps,
+                _pack_bf16, _mask, _v_tail, _rescale, _advance_max, _join, _maxnum, _pin, _schedule,
+                _schedule_exps, _stage_end, _wait)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -242,20 +241,19 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     pages_0 = _page_ready(pages_0[0]), _page_ready(pages_0[1])
     pages_1 = _page_ready(pages_1[0]), _page_ready(pages_1[1])
     pages_2 = _page_ready(pages_2[0]), _page_ready(pages_2[1])
-    # Loop-invariant addresses: K/V LDS read bases (s2r), DMA lane offsets (g2s), lane exchanges.
-    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
+    # Loop-invariant addresses: K/V LDS read offsets (s2r), DMA lane offsets (g2s), lane exchanges.
     key_row = (lane & 3) + ((lane & 12) << 1)
-    k_s2r = tuple(_pin_i32(shared + (lane >> 4) * K_PITCH + (((key_row + n * 4) * 16) ^ (((lane >> 4) & 1) * 64)))
+    k_s2r = tuple(_pin_i32((lane >> 4) * K_PITCH + (((key_row + n * 4) * 16) ^ (((lane >> 4) & 1) * 64)))
                   for n in range(2))
     k_g2s = _pin_i32(_k_g2s_voffset(tid, PAGE))
-    v_s2r = _pin_i32(shared + K_BYTES + (lane >> 4) * 4096 + (lane & 15) * 16)
+    v_s2r = _pin_i32((lane >> 4) * 4096 + (lane & 15) * 16)
     v_g2s = _pin_i32(_v_g2s_voffset(tid))
     v_base = _pin_s64(fx.Int64(fx.ptrtoint(fx.get_iter(V))) + fx.Int64(hkv) * (PAGE * D * 2))
     cross_addresses = tuple(_pin_i32((lane ^ offset) * 4) for offset in (16, 32, 48))
 
     def read_k_g2s(pages, tile):
         for packet in fx.range_constexpr(16):
-            _read_k_packet_g2s(gk, storage, wave, k_g2s, pages[0], pages[1], tile, HK, PAGE, packet)
+            _read_k_packet_g2s(gk, k_lds, wave, k_g2s, pages[0], pages[1], tile, HK, PAGE, packet)
 
     def prologue():
         """K(0) g2s; QK S(0), m and S'(0); K(1) g2s."""
@@ -268,7 +266,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
             # Waves 4-7 fall one stage behind.
             _stage_end()
         # Memory: s2r K(0) keys 0-31.
-        k_lo = _read_k_s2r(k_s2r, 0)
+        k_lo = _read_k_s2r(k_lds, k_s2r, 0)
         _wait(lgkmcnt=0)
         _stage_end()
         # Compute: QK S(0) keys 0-31; O = 0.
@@ -278,16 +276,16 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         _schedule(32, 3, 5)
         _stage_end()
         # Memory: s2r K(0) keys 32-63.
-        k_hi = _read_k_s2r(k_s2r, 1)
+        k_hi = _read_k_s2r(k_lds, k_s2r, 1)
         _wait(lgkmcnt=0)
         _stage_end()
         # Compute: QK S(0) keys 32-63; softmax m and S'(0).
         s_hi = _qk(q, k_hi)
         s_0 = _scale(_mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL), scale)
         row_max = _max(s_0)
-        row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
-        row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
-        row_max = _maximum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
+        row_max = _maxnum(row_max, row_max.shuffle_xor(16, 64))
+        row_max = _maxnum(row_max, row_max.shuffle_xor(32, 64))
+        row_max = _maxnum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
         row_sum = fx.Float32(0.0)
         _stage_end()
         # Memory: g2s K(1); no compute.
@@ -307,7 +305,9 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         # Step 0 memory: s_load pages(t+2); g2s V(t-1) between the s2r of K(t) keys 0-31.
         requests_next2 = _read_tile_pages_g2r(table, t + 2, last, kv_len, PAGE)
         v_prev_resources = _v_tile_resources(v_base, page_prev0, page_prev1, t - 1, HK, PAGE)
-        k_lo = _read_k_s2r_v_g2s(k_s2r, 0, v_prev_resources, storage, wave, v_g2s, PAGE)
+        k_lo = _read_k_s2r_v_g2s(k_lds, k_s2r, 0, v_prev_resources, v_lds, wave, v_g2s, PAGE)
+        # _page_ready's asm wait retires these K reads too; LLVM would add per-MFMA waits for them.
+        _wait(lgkmcnt=0)
         page_next2_0 = _page_ready(requests_next2[0])
         if fx.const_expr(PAGE != 32):
             page_next2_1 = page_next2_0
@@ -320,7 +320,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         _schedule_exps(16, 1, 1, 2)
         _stage_end()
         # Step 1 memory: s2r K(t) keys 32-63; V(t-1) lands.
-        k_hi = _read_k_s2r(k_s2r, 1)
+        k_hi = _read_k_s2r(k_lds, k_s2r, 1)
         _wait(vmcnt=0)
         _wait(lgkmcnt=0)
         _stage_end()
@@ -332,7 +332,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         _stage_end()
         # Step 2 memory: exchange row sums; g2s K(t+1) between the s2r of V(t-1) dims 0-127.
         other_sums = _cross(lane_sum, cross_addresses)
-        v_lo = _read_v_s2r_k_g2s(v_s2r, 0, gk, storage, wave, k_g2s, page_next0, page_next1,
+        v_lo = _read_v_s2r_k_g2s(v_lds, v_s2r, 0, gk, k_lds, wave, k_g2s, page_next0, page_next1,
                                  _min(t + 1, last), HK, PAGE)
         _stage_end()
         # Step 2 compute: the barrier does not cover the V reads; retire them before the first PV.
@@ -347,12 +347,12 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         # Step 3 memory: exchange row maxima; K(t+1) lands; s2r V(t-1) dims 128-255.
         other_maxima = _cross(lane_max, cross_addresses)
         _wait(vmcnt=0)
-        v_hi = _read_v_s2r(v_s2r, 1)
+        v_hi = _read_v_s2r(v_lds, v_s2r, 1)
         _wait(lgkmcnt=0)
         _stage_end()
         # Step 3 compute: PV O dims 128-255; new m and S'(t); lazy rescale of O and l.
         o1 = _pv(p_bf16, v_hi, o1)
-        candidate = _maximum(_maximum(lane_max, other_maxima[0]), _maximum(other_maxima[1], other_maxima[2])) * scale
+        candidate = _maxnum(_maxnum(lane_max, other_maxima[0]), _maxnum(other_maxima[1], other_maxima[2])) * scale
         ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate > row_max + 7.0).ir_value()))
         new_max = (candidate > row_max + 7.0).select(candidate + 1.0, row_max)
         s_cur = _scale(s_cur, scale)
@@ -369,7 +369,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         # Memory: g2s V(last), with P(last) and l computed while it lands.
         v_last_resources = _v_tile_resources(v_base, page_last0, page_last1, last, HK, PAGE)
         for packet in fx.range_constexpr(16):
-            _read_v_packet_g2s(v_last_resources, storage, wave, v_g2s, PAGE, packet)
+            _read_v_packet_g2s(v_last_resources, v_lds, wave, v_g2s, PAGE, packet)
         p_last = _exps(fx.Vector(s_last), fx.Float32(row_max))
         lane_sum = _sum(p_last)
         lane_sum = lane_sum + lane_sum.shuffle_xor(16, 64)
@@ -380,7 +380,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         _stage_end()
         _stage_end()
         # Memory: s2r V(last) dims 0-127, zeroing rows past kv_len (0 * NaN is NaN).
-        v_lo = _read_v_s2r(v_s2r, 0)
+        v_lo = _read_v_s2r(v_lds, v_s2r, 0)
         _wait(lgkmcnt=0)
         rocdl.sched_barrier(0)
         v_lo.store(_v_tail(v_lo.load(), kv_len - last * BN))
@@ -389,7 +389,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
         o0 = _pv(p_bf16, v_lo, o0)
         _stage_end()
         # Memory: s2r V(last) dims 128-255.
-        v_hi = _read_v_s2r(v_s2r, 1)
+        v_hi = _read_v_s2r(v_lds, v_s2r, 1)
         _wait(lgkmcnt=0)
         rocdl.sched_barrier(0)
         v_hi.store(_v_tail(v_hi.load(), kv_len - last * BN))
@@ -414,7 +414,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
     optr = fx.get_iter(O) + ((fx.Int64(q0) + fx.Int64(q_start)) * (H * D) + fx.Int64(head) * D)
     obuf = rocdl.make_buffer_tensor(fx.make_view(optr, fx.make_layout(BM * H * D, 1)),
                                     num_records_bytes=valid * H * D * 2)
-    _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, shared, H)
+    _store_o_tile_r2g(o0, o1, inv, k_lds, obuf, out_tid, out_row, H)
     if fx.const_expr(WITH_LSE):
         if ((out_tid & 63) < 16) & (out_row < valid):
             log_l = fx.Float32(llvm.call_intrinsic(fx.Float32.ir_type, "llvm.log2.f32", [row_sum.ir_value()], [], []))
@@ -423,7 +423,7 @@ def _body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, 
 
 
 @flyc.jit
-def _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch, qb,
+def _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, k_lds, v_lds, head, batch, qb,
           H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], PAGE: fx.Constexpr[int],
           CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float]):
     body = _body
@@ -436,10 +436,10 @@ def _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch
     if qb * BM < q_len:
         group = _uniform(fx.Int32(gpu.thread_id("x")) >> 8)
         if group != 0:
-            body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
+            body(Q, K, V, O, LSE, QS, KS, VS, table, k_lds, v_lds, q0, q_len, kv_len, head, qb,
                  H, HK, NP, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, True)
         else:
-            body(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
+            body(Q, K, V, O, LSE, QS, KS, VS, table, k_lds, v_lds, q0, q_len, kv_len, head, qb,
                  H, HK, NP, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, False)
 
 
@@ -451,16 +451,20 @@ def _attention_256_dma_kernel_942(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: f
     PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float],
     PERSISTENT: fx.Constexpr[bool], CUS: fx.Constexpr[int]):
     work_body = _work
-    storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, LDS_BYTES, 16]).peek().view(fx.make_layout(LDS_BYTES, 1))
+    # Separate LDS globals: their alias scopes keep LLVM from waiting on V DMA before K reads and vice versa.
+    # V first (LDS address 0): the asm V DMA destination is then M0 itself.
+    allocator = fx.SharedAllocator()
+    v_lds, k_lds = (allocator.allocate(fx.Array[fx.Int8, size, 16]).peek().view(fx.make_layout(size, 1))
+                    for size in (V_BYTES, K_BYTES))
     if fx.const_expr(PERSISTENT):
         work = fx.Int32(gpu.block_id("x"))
         while work < H * B * ((MAX_Q + BM - 1) // BM):
             head, batch, qb = work % H, (work // H) % B, work // (H * B)
-            work_body(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch, qb,
+            work_body(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, k_lds, v_lds, head, batch, qb,
                       H, HK, NP, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE)
             work = work + CUS
     else:
-        work_body(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage,
+        work_body(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, k_lds, v_lds,
                   fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")), fx.Int32(gpu.block_id("z")),
                   H, HK, NP, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE)
 

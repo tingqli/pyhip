@@ -21,8 +21,8 @@ from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
 from ._common import (
-    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _mask, _max, _maximum, _min,
-    _pack_bf16, _pin, _pin_i32, _qk, _read_address, _read_q_g2r, _rescale, _scale, _schedule, _schedule_exps,
+    _MAX_FLOOR, _advance_max, _buffer, _cross, _exps, _join, _mask, _max, _maxnum, _min,
+    _pack_bf16, _pin, _pin_i32, _qk, _load_address, _read_q_g2r, _rescale, _scale, _schedule, _schedule_exps,
     _stage_end, _sum, _uniform, _wait,
 )
 
@@ -159,12 +159,12 @@ def _k_operand(parts):
 def _read_k_s2r(addresses, half, lower_first=False):
     parts = [None] * 16
     for slot, address, immediate in _k_reads(addresses, half, lower_first):
-        parts[slot] = _read_address(address, immediate)
+        parts[slot] = _load_address(address, immediate)
     return _k_operand(parts)
 
 
 def _read_v_s2r(address, half, blocks=2):
-    return _words([_read_address(at, immediate) for _, at, immediate in _v_reads(address, half, blocks)])
+    return _words([_load_address(at, immediate) for _, at, immediate in _v_reads(address, half, blocks)])
 
 
 def _v_operands(values, step, progressive):
@@ -219,7 +219,7 @@ def _pv(probabilities, values, output, progressive=False, prepared=None, center_
         if center_args is not None:
             current, candidate, maxima, scale, maximum = center_args
             if step == 0:
-                candidate = _maximum(_maximum(candidate, maxima[0]), _maximum(maxima[1], maxima[2])) * scale
+                candidate = _maxnum(_maxnum(candidate, maxima[0]), _maxnum(maxima[1], maxima[2])) * scale
                 predicate = candidate > maximum + 7.0
                 ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, predicate.ir_value()))
                 new_max = predicate.select(candidate + 1.0, maximum)
@@ -263,7 +263,7 @@ def _shuffle_o_r2s2r(o0, o1, inv, shared, tid):
     for part in range(8):
         element = tid * 8 + part * THREADS * 8
         read_row = element // 256
-        parts.append(_read_address(shared + (element ^ ((read_row & 7) * 8)) * 2))
+        parts.append(_load_address(shared + (element ^ ((read_row & 7) * 8)) * 2))
     _wait(lgkmcnt=0)
     rocdl.sched_barrier(0)
     return parts
@@ -315,8 +315,8 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
     """
     # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
     _helpers = (_read_kv_rows_g2r, _dma_offsets, _read_packet_g2s, _k_reads, _v_reads, _k_operand, _words,
-                _read_k_s2r, _read_v_s2r, _v_operands, _pv, _qk, _sum, _max, _cross, _exps, _pack,
-                _pack_probabilities, _mask, _scale, _rescale, _advance_max, _join, _maximum, _pin,
+                _read_k_s2r, _read_v_s2r, _load_address, _v_operands, _pv, _qk, _sum, _max, _cross, _exps, _pack,
+                _pack_probabilities, _mask, _scale, _rescale, _advance_max, _join, _maxnum, _pin,
                 _schedule, _schedule_exps, _stage_end, _wait)
     pack = _pack_probabilities if STATIC_Q > 0 else _pack
     if fx.const_expr(STATIC_Q > 0):
@@ -407,9 +407,9 @@ def _body(Q, K, V, O, LSE, CQ, CK, TABLE, storage, head, batch, qb,
         s_hi = _qk(q, k_hi)
         s_0 = _scale(_mask(_join(s_lo, s_hi), fx.Int32(0), row, q_len, kv_len, CAUSAL), scale)
         row_max = _max(s_0)
-        row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
-        row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
-        row_max = _maximum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
+        row_max = _maxnum(row_max, row_max.shuffle_xor(16, 64))
+        row_max = _maxnum(row_max, row_max.shuffle_xor(32, 64))
+        row_max = _maxnum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
         row_sum = fx.Float32(0.0)
         _stage_end()
         # Memory: g2s K(1); no compute.

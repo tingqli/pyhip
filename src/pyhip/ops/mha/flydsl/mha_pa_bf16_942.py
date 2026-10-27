@@ -27,10 +27,10 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 
 from ._common import (
-    _MAX_FLOOR, _advance_max, _buffer, _buffer_words, _center_part, _exp, _exp_part, _intrinsic, _join, _maximum,
-    _mfma_hazard_wait, _min, _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _read_address, _read_page_g2r,
-    _reround_if, _row_max, _row_max_local, _row_sum, _row_sum_local, _schedule, _softmax_scale, _stage_end,
-    _uniform, _wait,
+    _MAX_FLOOR, _advance_max, _align8, _buffer, _buffer_words, _center_part, _exp, _exp_part, _intrinsic, _join,
+    _maximum, _mfma_hazard_wait, _min, _pack_bf16, _page_ready, _pin, _pin_i32, _pin_s64, _read_address,
+    _read_page_g2r, _reround_if, _row_max, _row_max_local, _row_sum, _row_sum_local, _schedule, _softmax_scale,
+    _stage_end, _uniform, _wait,
 )
 
 BM, BN, THREADS = 256, 64, 512
@@ -42,6 +42,24 @@ _P_BF16_RTA = os.environ.get("AITER_FLYDSL_MHA_P_BF16_RTA", "0").lower() in ("1"
 # m: lazy, or "1": also moved (to row max + 1) when a new row max carries about l / 8 or more, so that the P of
 # such a dominant key is exactly 1/2 in BF16. Read at import.
 _EXACT_MAX = os.environ.get("AITER_FLYDSL_MHA_EXACT_MAX", "0").lower() in ("1", "true")
+
+
+def _stage_end_aligned():
+    """_stage_end, then the next stage starts 8-byte aligned (_align8; D128 main loop).
+
+    Unaligned, the parity of each D128 loop copy followed from all code before it, about 1.6% per affected copy;
+    aligned, it follows from the stage alone, and D128's dense S3 runs stay aligned. D192's S3 is misaligned this
+    way (+1.5%), so it keeps _stage_end.
+    """
+    _stage_end()
+    _align8()
+
+
+def _row_sum_tail(pairs):
+    """_row_sum_local after its first level: the sum of 16 pair sums, in the same order."""
+    for width in (8, 4, 2, 1):
+        pairs = [pairs[2 * i] + pairs[2 * i + 1] for i in range(width)]
+    return pairs[0]
 
 
 def _cross32_async(value, address):
@@ -411,6 +429,10 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     S6     exchange row maxima; s2r V(t-1) dims 64-127 [prev]; K(t+1) lands; r2s K(t+1)
     S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
 
+    D128 offloads the longest stage, S3: it keeps only the first level of the lane row sum,
+    S5 finishes it, S6 exchanges it with the row maxima and S7 adds it to l before the new m
+    (same additions in the same order).
+
     Softmax in log2 units: S' = S * scale - m (one FMA), P = exp2(S'), l = sum(P) and
     O = sum(P V); the output is O / l * v_descale. m starts at the first row max + 1 and
     moves to a later row max + 1 only when that exceeds m + 7, rescaling O and l
@@ -424,7 +446,8 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
                 _read_k_tile_g2r, _read_k_tile_s2r, _read_v_tile_s2r, _qk, _pv, _mask, _v_tail, _join,
                 _mfma_hazard_wait, _maximum, _row_max, _row_max_local, _row_sum, _row_sum_local, _center_part,
                 _exp_part, _pack_probability, _cross32_async, _rescale, _advance_max, _pin, _schedule,
-                _stage_end, _wait, _reround_if, _first_max, _intrinsic, _next_max)
+                _stage_end, _wait, _reround_if, _first_max, _intrinsic, _next_max, _row_sum_tail,
+                _stage_end_aligned, _align8)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -550,6 +573,7 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         o0, o1, exact, t = fx.Vector(o0), fx.Vector(o1), fx.Int64(exact), fx.Int32(t)
         slot_cur = (t & 1) if DQ == 192 else CUR
         slot_prev = ((t - 1) & 1) if DQ == 192 else PREV
+        stage_end = _stage_end_aligned if DQ == 128 else _stage_end
         # S0 memory: s2r K(t) keys 0-31; s_load pages(t+2); g2r V(t) (SGPR bases only change).
         k_lo = _read_k_s2r(k_s2r, 0, DQ)
         rocdl.sched_barrier(0)
@@ -557,7 +581,7 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         v_cur = read_v_g2r((page_cur0, page_cur1), t)
         rocdl.sched_barrier(0)
         page_next2_0, page_next2_1 = _page_ready(requests_next2[0]), _page_ready(requests_next2[1])
-        _stage_end()
+        stage_end()
         # S1 compute: QK S(t) keys 0-31; P(t-1) values 0-23. D192 ring addresses are made here.
         s_lo = _qk(q, k_lo, storage, k_base, 0, DQ, DV, True)
         v_read, v_write = v_s2r, v_r2s
@@ -566,52 +590,65 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
             v_write = _pin_i32(v_r2s + slot_cur * V_SLOT)
         p_prev = _pin(_exp_part(s_prev, 0, 24), 32)
         _schedule(DQ // 8, 2, 1, True)
-        _stage_end()
+        stage_end()
         # S2 memory: r2s V(t) -> [cur] once it lands; s2r K(t) keys 32-63.
         _wait(vmcnt=0)
         _store_r2s(v_write, v_cur, 2, CUR * V_SLOT if DQ == 128 else 0)
         k_hi = _read_k_s2r(k_s2r, 1, DQ)
         _wait(lgkmcnt=0)
-        _stage_end()
-        # S3 compute: QK S(t) keys 32-63; P(t-1) values 24-31, lane row sum, BF16 P; K(t+1) address.
+        stage_end()
+        # S3 compute: QK S(t) keys 32-63; P(t-1) values 24-31, lane row sum (D128: pair sums), BF16 P;
+        # K(t+1) address.
         s_hi = _qk(q, k_hi, storage, k_base, 1, DQ, DV, True)
         p_prev = _exp_part(p_prev, 24, 32)
-        lane_sum = _row_sum_local(p_prev)
+        if fx.const_expr(DQ == 128):
+            sum_pairs = [p_prev[i] + p_prev[i + 1] for i in range(0, 32, 2)]
+        else:
+            lane_sum = _row_sum_local(p_prev)
         p_bf16 = _pack_probability(p_prev)
         _schedule(4, 2, 2, True)
-        _schedule(DQ // 8 - 4, 8, 2)
+        _schedule(DQ // 8 - 4, 7 if DQ == 128 else 8, 2)
         k_next_offset = _k_g2r_offset(k_lane, page_next0, page_next1, _min(t + 1, last), half_page, HK, DQ, PAGE)
-        _stage_end()
-        # S4 memory: exchange row sums; s2r V(t-1) dims 0-63; g2r K(t+1).
-        other_sum = _cross32_async(lane_sum, cross_address)
+        stage_end()
+        # S4 memory: exchange row sums (D192); s2r V(t-1) dims 0-63; g2r K(t+1).
+        if fx.const_expr(DQ == 192):
+            other_sum = _cross32_async(lane_sum, cross_address)
         v_lo = _read_v_s2r(v_read, 0, PREV if DQ == 128 else 0)
         _wait(vmcnt=0)
         k_next = _read_k_g2r(gk, k_next_offset, DQ, PAGE)
-        # The shuffle shares this LDS wait; it has no consumer before S5.
+        # D192's shuffle shares this LDS wait; it has no consumer before S5.
         _wait(lgkmcnt=0)
-        _stage_end()
-        # S5 compute: PV O dims 0-63; l += row sum; mask S(t) and its lane row max.
+        stage_end()
+        # S5 compute: PV O dims 0-63; l += row sum (D128: lane row sum); mask S(t) and its lane row max.
         s_cur = _mask(_join(s_lo, s_hi), t, row, q_len, kv_len, CAUSAL)
         o0 = _pv(p_bf16, v_lo, o0, DV)
-        row_sum = row_sum + (lane_sum + other_sum)
+        if fx.const_expr(DQ == 192):
+            row_sum = row_sum + (lane_sum + other_sum)
         lane_max = _row_max_local(s_cur)
-        _schedule(DV // 8, 2, 3)
-        _stage_end()
-        # S6 memory: exchange row maxima; s2r V(t-1) dims 64-127; r2s K(t+1) after both groups read K(t).
+        if fx.const_expr(DQ == 128):
+            lane_sum = _row_sum_tail(sum_pairs)
+        _schedule(DV // 8, 4 if DQ == 128 else 2, 3)
+        stage_end()
+        # S6 memory: exchange row maxima (D128: and row sums); s2r V(t-1) dims 64-127; r2s K(t+1) after
+        # both groups read K(t).
         other_max = _cross32_async(lane_max, cross_address)
+        if fx.const_expr(DQ == 128):
+            other_sum = _cross32_async(lane_sum, cross_address)
         v_hi = _read_v_s2r(v_read, 1, PREV if DQ == 128 else 0)
         _wait(vmcnt=0)
         _store_r2s(k_r2s, k_next, DQ // 64)
         _wait(lgkmcnt=0)
-        _stage_end()
-        # S7 compute: PV O dims 64-127; new m and S'(t); lazy rescale of O and l.
+        stage_end()
+        # S7 compute: PV O dims 64-127; D128: l += row sum; new m and S'(t); lazy rescale of O and l.
         o1 = _pv(p_bf16, v_hi, o1, DV)
+        if fx.const_expr(DQ == 128):
+            row_sum = row_sum + (lane_sum + other_sum)
         ballot, new_max = _next_max(_maximum(lane_max, other_max), scale, row_max, row_sum)
         s_cur = _center_part(s_cur, scale, new_max, 0, 32)
         _schedule(DV // 8, 4, 4)
         o0, o1, row_sum, s_cur, exact = _rescale(o0, o1, row_sum, s_cur, row_max, new_max, ballot, exact)
         new_max = _advance_max(row_max, new_max)
-        _stage_end()
+        stage_end()
         return s_cur, new_max, row_sum, o0, o1, page_next0, page_next1, page_next2_0, page_next2_1, exact
 
     def epilogue(state):
