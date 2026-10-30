@@ -21,7 +21,7 @@ import triton
 import triton.language as tl
 
 from . import indexer_decode, indexer_logits, indexer_topk
-from .attention_prepare import upload
+from .sparse_prefill_prepare import upload
 
 __all__ = ["MAX_COMPRESSED_KEYS", "decode_indexer", "prefill_indexer"]
 
