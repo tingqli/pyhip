@@ -121,6 +121,33 @@ def test_bf16_strided_q(dq, dv, return_lse):
             torch.testing.assert_close(actual, results[0], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dq,dv,page,return_lse", ((128, 128, 64, False), (192, 128, 64, False), (192, 128, 128, False),
+                                                   (192, 128, 64, True), (128, 192, 64, False), (192, 128, 32, False)))
+def test_bf16_kv_pool_beyond_4gib(dq, dv, page, return_lse):
+    """Odd pages moved past 4 GiB of K are bit-exact; page32 K keeps a 32-bit pool buffer and is rejected."""
+    require("gfx942")
+    case = make_case((0, 7, 33, 513), (31, 33, 97, 545), dq=dq, dv=dv, page=page, heads=12, kv_heads=3,
+                     q_offset=5, table_offset=3, nonunit_scales=True, source_dtype=torch.bfloat16)
+    pages = case.k.shape[0]
+    high = 2**32 // case.k[0].nbytes + 1
+    remap = torch.arange(pages, device="cuda")
+    remap = torch.where(remap % 2 == 1, remap + high, remap)
+    k = torch.empty((high + pages, *case.k.shape[1:]), device="cuda", dtype=case.k.dtype)
+    v = torch.empty((high + pages, *case.v.shape[1:]), device="cuda", dtype=case.v.dtype)
+    k[remap], v[remap] = case.k, case.v
+    large = replace(case, k=k, v=v, indices=remap[case.indices.long()].int())
+    if page == 32:
+        with pytest.raises(NotImplementedError, match="K byte span"):
+            make_call(large, BF16_942, True)[0]()
+        return
+    for backend in (BF16_942, BF16_942_GRID):
+        results = []
+        for pool in (case, large):
+            lse = torch.full(case.q.shape[:2], -123.0, device="cuda") if return_lse else None
+            results.append(make_call(pool, backend, True)[0](return_lse=return_lse, lse=lse))
+        torch.testing.assert_close(results[1], results[0], rtol=0, atol=0)
+
+
 def test_bf16_q_layout_rejections():
     """D256 reads contiguous Q only; overlapping Q rows would defeat the zero-filled tail rows."""
     require("gfx942")

@@ -149,9 +149,32 @@ def _k_g2r_offset(lane_offset, page0, page1, tile, half_page, hk, dq, page_size)
     return _pin_i32(lane_offset + page * (hk * page_size * dq * 2) + (tile * BN % page_size) * 16)
 
 
-def _read_k_g2r(resource, address, dq, page_size):
-    """K tile into staging VGPRs; page32's divergent page sits in VOFFSET, never a scalar waterfall."""
-    parts = [_buffer_words(resource, address, i * page_size * 128) for i in range(dq // 64)]
+def _k_g2r_bases(base, page, tile, hk, dq, page_size):
+    """64-bit SGPR address of each DQ/64 part (8 columns) of a page64/page128 K tile."""
+    first = base + fx.Int64(page) * (hk * page_size * dq * 2)
+    if page_size == 128:
+        first = first + fx.Int64(tile & 1) * (BN * 16)
+    return [_pin_s64(first + i * page_size * 128) for i in range(dq // 64)]
+
+
+def _global_words(address, lane_offset):
+    """One 16-byte global_load_dwordx4 at a 64-bit SGPR address plus a VGPR byte offset."""
+    return fx.Vector(llvm.inline_asm(ir.VectorType.get([4], fx.Int32.ir_type),
+        [lane_offset.ir_value(), address.ir_value()], "global_load_dwordx4 $0, $1, $2",
+        "=v,v,s,~{memory}", has_side_effects=True))
+
+
+def _read_k_g2r(resource, address, lane_offset, dq, page_size):
+    """K tile into staging VGPRs.
+
+    Page32 tiles span two pages split between the lane halves: one 32-bit buffer over the pool with
+    the divergent page in VOFFSET (never a scalar waterfall). Larger pages: `address` holds the
+    _k_g2r_bases, so the pool may exceed 4 GiB.
+    """
+    if page_size == 32:
+        parts = [_buffer_words(resource, address, i * page_size * 128) for i in range(dq // 64)]
+    else:
+        parts = [_global_words(base, lane_offset) for base in address]
     return fx.Vector.from_elements([p[j] for p in parts for j in range(4)], fx.Int32)
 
 
@@ -164,9 +187,7 @@ def _v_g2r_bases(base, page0, page1, tile, hk, page_size):
 def _read_v_g2r(first, second, lane_offset):
     # Full 64-bit SGPR address plus lane-relative VGPR byte offset. This is
     # GLOBAL, not BUFFER, and does not truncate the tensor's GPU base.
-    parts = [fx.Vector(llvm.inline_asm(ir.VectorType.get([4], fx.Int32.ir_type),
-        [lane_offset.ir_value(), address.ir_value()], "global_load_dwordx4 $0, $1, $2",
-        "=v,v,s,~{memory}", has_side_effects=True)) for address in (first, second)]
+    parts = [_global_words(address, lane_offset) for address in (first, second)]
     return fx.Vector.from_elements([p[j] for p in parts for j in range(4)], fx.Int32)
 
 
@@ -191,22 +212,23 @@ def _read_v_s2r(address, half, slot=0):
 
 # ---- Cooperative tile copies (LSE/V192 path and the D128 prologue) ----
 
-def _read_k_tile_g2r(resource, tid, page0, page1, tile, hk, dq, page_size):
+def _read_k_tile_g2r(resource, bases, tid, page0, page1, tile, hk, dq, page_size):
+    """Cooperative K tile g2r; page64/page128 read from the tile's _k_g2r_bases."""
     if dq == 192:
         tid = _pin_i32(fx.Int32(gpu.thread_id("x"))) & 511
+    if page_size != 32:
+        # Atom tid + i * THREADS is token tid % BN of column tid // BN + 8i: the bases add the 8i.
+        return _read_k_g2r(resource, bases, (tid // BN) * (page_size * 16) + (tid % BN) * 16, dq, page_size)
     parts = []
     for i in range(dq // 64):
         atom = tid + i * THREADS
         token, column = atom % BN, atom // BN
-        page = (token < 32).select(page0, page1) if page_size == 32 else page0
+        page = (token < 32).select(page0, page1)
         within = token % page_size + (tile * BN) % page_size
         offset = column * page_size * 16 + within * 16
-        if page_size == 32:
-            # Different halves of a wave copy different pages. Their page
-            # offset belongs in VOFFSET, not scalar SOFFSET (which waterfalls).
-            parts.append(_buffer_words(resource, offset + page * (hk * page_size * dq * 2)))
-        else:
-            parts.append(_buffer_words(resource, offset, page * (hk * page_size * dq * 2)))
+        # Different halves of a wave copy different pages. Their page
+        # offset belongs in VOFFSET, not scalar SOFFSET (which waterfalls).
+        parts.append(_buffer_words(resource, offset + page * (hk * page_size * dq * 2)))
     return fx.Vector.from_elements([p[j] for p in parts for j in range(4)], fx.Int32)
 
 
@@ -414,7 +436,7 @@ def _store_o_tile_r2g(o0, o1, inv, storage, obuf, out_tid, out_row, heads, dv):
 
 @flyc.jit
 def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
-               H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
+               H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Int32, DQ: fx.Constexpr[int],
                DV: fx.Constexpr[int], QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], PAGE: fx.Constexpr[int],
                CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
                SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool]):
@@ -431,7 +453,7 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     stage  phase t; cur = t & 1, prev = (t - 1) & 1
     S0     s2r K(t) keys 0-31; s_load pages(t+2); g2r V(t)
     S1     QK: S(t) keys 0-31          softmax: P(t-1) = exp2(S'(t-1)), values 0-23
-    S2     V(t) lands; r2s V(t) -> [cur]; s2r K(t) keys 32-63
+    S2     V(t) lands; r2s V(t) -> [cur]; s2r K(t) keys 32-63; page64/128: K(t+1) page bases
     S3     QK: S(t) keys 32-63         softmax: P(t-1) values 24-31, lane row sum, P to BF16
     S4     exchange row sums; s2r V(t-1) dims 0-63 [prev]; g2r K(t+1)
     S5     PV: O dims 0-63 += P V      softmax: l += row sum; mask S(t), lane row max
@@ -460,7 +482,7 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
                 _mfma_hazard_wait, _maximum, _row_max, _row_max_local, _row_sum, _row_sum_local, _center_part,
                 _exp_part, _pack_probability, _cross32_async, _rescale, _advance_max, _pin, _schedule,
                 _stage_end, _wait, _reround_if, _first_max, _intrinsic, _next_max, _row_sum_tail,
-                _stage_end_aligned, _align8, _interleave)
+                _stage_end_aligned, _align8, _interleave, _k_g2r_bases, _global_words)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -470,9 +492,13 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     q_ptr = fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(q_start)) * QROW + fx.Int64(head) * QHEAD)
     # Rows past `valid` read zero: the host keeps QROW >= DQ.
     gq = _buffer(fx.make_view(q_ptr, fx.make_layout(BM * QROW, 1)), valid * QROW * 2)
-    gk = _buffer(fx.make_view(fx.get_iter(K) + hkv * PAGE * DQ,
-                            fx.make_layout((NP * HK - hkv) * PAGE * DQ, 1)),
-                 (NP * HK - hkv) * PAGE * DQ * 2)
+    gk, k_global_base = None, None
+    if fx.const_expr(PAGE == 32):
+        gk = _buffer(fx.make_view(fx.get_iter(K) + hkv * PAGE * DQ,
+                                fx.make_layout((NP * HK - hkv) * PAGE * DQ, 1)),
+                     (NP * HK - hkv) * PAGE * DQ * 2)
+    else:
+        k_global_base = _pin_s64(fx.Int64(fx.ptrtoint(fx.get_iter(K))) + fx.Int64(hkv) * (PAGE * DQ * 2))
     # Q stays in registers for every KV tile.
     q = _read_q_g2r(gq, (wave * 32 + (lane & 31)) * (QROW * 2), lane, DQ)
     scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
@@ -512,7 +538,11 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     v_global_base = _pin_s64(fx.Int64(fx.ptrtoint(fx.get_iter(V))) + fx.Int64(hkv) * (PAGE * DV * 2))
 
     def read_k_g2r(pages, tile):
-        return _read_k_g2r(gk, _k_g2r_offset(k_lane, pages[0], pages[1], tile, half_page, HK, DQ, PAGE), DQ, PAGE)
+        if fx.const_expr(PAGE == 32):
+            address = _k_g2r_offset(k_lane, pages[0], pages[1], tile, half_page, HK, DQ, PAGE)
+        else:
+            address = _k_g2r_bases(k_global_base, pages[0], tile, HK, DQ, PAGE)
+        return _read_k_g2r(gk, address, k_lane, DQ, PAGE)
 
     def read_v_g2r(pages, tile):
         first, second = _v_g2r_bases(v_global_base, pages[0], pages[1], tile, HK, PAGE)
@@ -565,7 +595,11 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         _stage_end()
         # Memory: both groups read K(0); g2r K(1) (D128) and r2s it into the single K slot.
         if fx.const_expr(DQ == 128):
-            k_1 = _read_k_tile_g2r(gk, tid, pages_1[0], pages_1[1], _min(fx.Int32(1), last), HK, DQ, PAGE)
+            tile_1 = _min(fx.Int32(1), last)
+            bases_1 = None
+            if fx.const_expr(PAGE != 32):
+                bases_1 = _k_g2r_bases(k_global_base, pages_1[0], tile_1, HK, DQ, PAGE)
+            k_1 = _read_k_tile_g2r(gk, bases_1, tid, pages_1[0], pages_1[1], tile_1, HK, DQ, PAGE)
         _wait(vmcnt=0)
         _store_r2s(k_r2s, k_1, DQ // 64)
         _wait(lgkmcnt=0)
@@ -613,10 +647,13 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         _wait(vmcnt=0)
         _store_r2s(v_write, v_cur, 2, CUR * V_SLOT if DQ == 128 else 0)
         k_hi = _read_k_s2r(k_s2r, 1, DQ)
+        if fx.const_expr(PAGE != 32):
+            # The SALU of K(t+1)'s 64-bit page bases runs while the LDS reads drain.
+            k_next = _k_g2r_bases(k_global_base, page_next0, _min(t + 1, last), HK, DQ, PAGE)
         _wait(lgkmcnt=0)
         stage_end()
         # S3 compute: QK S(t) keys 32-63; P(t-1) values 24-31, lane row sum (D128: pair sums), BF16 P;
-        # K(t+1) address.
+        # page32: K(t+1) address.
         s_hi = _qk(q, k_hi, storage, k_base, 1, DQ, DV, True)
         p_prev = _exp_part(p_prev, 24, 32)
         if fx.const_expr(DQ == 128):
@@ -633,14 +670,15 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         else:
             _schedule(4, 2, 2, True)
             _schedule(DQ // 8 - 4, 7, 2)
-        k_next_offset = _k_g2r_offset(k_lane, page_next0, page_next1, _min(t + 1, last), half_page, HK, DQ, PAGE)
+        if fx.const_expr(PAGE == 32):
+            k_next = _k_g2r_offset(k_lane, page_next0, page_next1, _min(t + 1, last), half_page, HK, DQ, PAGE)
         stage_end()
         # S4 memory: exchange row sums (D192); s2r V(t-1) dims 0-63; g2r K(t+1).
         if fx.const_expr(DQ == 192):
             other_sum = _cross32_async(lane_sum, cross_address)
         v_lo = _read_v_s2r(v_read, 0, PREV if DQ == 128 else 0)
         _wait(vmcnt=0)
-        k_next = _read_k_g2r(gk, k_next_offset, DQ, PAGE)
+        k_next = _read_k_g2r(gk, k_next, k_lane, DQ, PAGE)
         if fx.const_expr(DQ == 192):
             # The mask's skip branch is a taken jump; here it no longer delays the first MFMA of S5.
             s_cur = _mask(_join(s_lo, s_hi), t, row, q_len, kv_len, CAUSAL)
@@ -742,7 +780,7 @@ def _body_v128(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
 
 @flyc.jit
 def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, head, qb,
-               H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
+               H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Int32, DQ: fx.Constexpr[int],
                DV: fx.Constexpr[int], QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], PAGE: fx.Constexpr[int],
                CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
                SCALE: fx.Constexpr[float], STAGGER: fx.Constexpr[bool]):
@@ -769,7 +807,7 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     _helpers = (_read_k_tile_g2r, _read_v_tile_g2r, _store_tile_r2s, _read_k_tile_s2r, _read_v_tile_s2r,
                 _qk, _pv, _mask, _v_tail, _join, _mfma_hazard_wait, _maximum, _row_max, _row_sum,
                 _center_part, _exp_part, _pack_probability, _rescale, _pin, _schedule, _stage_end, _wait,
-                _reround_if, _first_max, _intrinsic, _next_max)
+                _reround_if, _first_max, _intrinsic, _next_max, _k_g2r_bases, _global_words, _read_k_g2r)
     tid = fx.Int32(gpu.thread_id("x"))
     wave, lane = _uniform(tid >> 6), tid & 63
     q_start = qb * BM
@@ -780,9 +818,13 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     q_ptr = fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(q_start)) * QROW + fx.Int64(head) * QHEAD)
     # Rows past `valid` read zero: the host keeps QROW >= DQ.
     gq = _buffer(fx.make_view(q_ptr, fx.make_layout(BM * QROW, 1)), valid * QROW * 2)
-    gk = _buffer(fx.make_view(fx.get_iter(K) + hkv * PAGE * DQ,
-                            fx.make_layout((NP * HK - hkv) * PAGE * DQ, 1)),
-                 (NP * HK - hkv) * PAGE * DQ * 2)
+    gk, k_global_base = None, None
+    if fx.const_expr(PAGE == 32):
+        gk = _buffer(fx.make_view(fx.get_iter(K) + hkv * PAGE * DQ,
+                                fx.make_layout((NP * HK - hkv) * PAGE * DQ, 1)),
+                     (NP * HK - hkv) * PAGE * DQ * 2)
+    else:
+        k_global_base = _pin_s64(fx.Int64(fx.ptrtoint(fx.get_iter(K))) + fx.Int64(hkv) * (PAGE * DQ * 2))
     # Q stays in registers for every KV tile.
     q = _read_q_g2r(gq, (wave * 32 + (lane & 31)) * (QROW * 2), lane, DQ)
     scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
@@ -807,8 +849,10 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
     v_base = (lane >> 5) * (DV // 64) * PADDED_CHUNK + (lane & 31) * 16
     k_bytes = (DQ // 8) * PADDED_CHUNK
 
-    def read_k_g2r(pages, tile):
-        return _read_k_tile_g2r(gk, tid, pages[0], pages[1], tile, HK, DQ, PAGE)
+    def read_k_g2r(pages, tile, bases=None):
+        if fx.const_expr(PAGE != 32 and bases is None):
+            bases = _k_g2r_bases(k_global_base, pages[0], tile, HK, DQ, PAGE)
+        return _read_k_tile_g2r(gk, bases, tid, pages[0], pages[1], tile, HK, DQ, PAGE)
 
     def read_v_g2r(pages, tile):
         return _read_v_tile_g2r(V, tid, pages[0], pages[1], tile, hkv, HK, DV, PAGE, True)
@@ -881,12 +925,16 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
         exact = fx.Int64(exact)
         # S0 memory: s2r K(t) keys 0-31; single slot publishes V(t-1); pages(t+2); g2r V(t), K(t+1).
         k_lo = _read_k_tile_s2r(storage, k_base, 0, DQ, DV)
+        k_bases = None
+        if fx.const_expr(PAGE != 32):
+            # The SALU of K(t+1)'s 64-bit page bases issues among the K(t) LDS reads.
+            k_bases = _k_g2r_bases(k_global_base, page_next0, _min(t + 1, last), HK, DQ, PAGE)
         rocdl.sched_barrier(0)
         if fx.const_expr(not v_ring):
             store_v_r2s(v_pending)
         requests_next2 = _read_tile_pages_g2r(table, t + 2, last, last_page, PAGE)
         v_cur = read_v_g2r((page_cur0, page_cur1), t)
-        k_next = read_k_g2r((page_next0, page_next1), _min(t + 1, last))
+        k_next = read_k_g2r((page_next0, page_next1), _min(t + 1, last), k_bases)
         rocdl.sched_barrier(0)
         page_next2_0, page_next2_1 = _page_ready(requests_next2[0]), _page_ready(requests_next2[1])
         _stage_end()
@@ -1011,7 +1059,7 @@ def _body_wide(Q, K, V, O, LSE, QS, KS, VS, table, storage, q0, q_len, kv_len, h
 
 @flyc.jit
 def _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch, qb,
-          H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
+          H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Int32, DQ: fx.Constexpr[int],
           DV: fx.Constexpr[int], QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], PAGE: fx.Constexpr[int],
           CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
           SCALE: fx.Constexpr[float]):
@@ -1039,32 +1087,32 @@ def _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
 def _attention_kernel_942(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
     CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], B: fx.Constexpr[int],
-    MAX_Q: fx.Constexpr[int], DQ: fx.Constexpr[int], DV: fx.Constexpr[int], QROW: fx.Constexpr[int],
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Int32, B: fx.Int32,
+    BLOCKS: fx.Int32, DQ: fx.Constexpr[int], DV: fx.Constexpr[int], QROW: fx.Constexpr[int],
     QHEAD: fx.Constexpr[int], PAGE: fx.Constexpr[int], CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool],
     WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], PERSISTENT: fx.Constexpr[bool], CUS: fx.Constexpr[int]):
     size = ((DQ + (2 if DV == 128 and (DQ == 128 or not WITH_LSE) else 1) * DV) // 8) * PADDED_CHUNK
     storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, size, 16]).peek().view(fx.make_layout(size, 1))
-    blocks = (MAX_Q + BM - 1) // BM
     if fx.const_expr(PERSISTENT):
         # A fixed resident grid revisits the SAME FP8-derived body. Grid-stride
         # work assignment needs no shared counter, allocation, or reset kernel;
         # independent streams and captured graphs have no mutable shared state.
         # Query blocks run longest first (causal cost grows with qb) and every other
         # round of CUS tasks is reversed (snake), which evens out the per-CTA totals.
-        tasks = H * B * blocks
+        tasks = H * B * BLOCKS
         worker, rnd = fx.Int32(gpu.block_id("x")), fx.Int32(0)
         while rnd < (tasks + CUS - 1) // CUS:
             task = rnd * CUS + ((rnd & 1) == 0).select(worker, CUS - 1 - worker)
             if task < tasks:
-                head, batch, qb = task % H, (task // H) % B, blocks - 1 - task // (H * B)
+                pair = task // H
+                head, batch, qb = task % H, pair % B, BLOCKS - 1 - pair // B
                 _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch, qb,
                       H, HK, NP, DQ, DV, QROW, QHEAD, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE)
             rnd = rnd + 1
     else:
         # Blocks dispatch with z slowest: the longest causal query blocks start first.
         head, batch = fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y"))
-        qb = blocks - 1 - fx.Int32(gpu.block_id("z"))
+        qb = BLOCKS - 1 - fx.Int32(gpu.block_id("z"))
         _work(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, storage, head, batch, qb,
               H, HK, NP, DQ, DV, QROW, QHEAD, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE)
 
@@ -1072,14 +1120,15 @@ def _attention_kernel_942(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor
 @flyc.jit
 def _launch_attention(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
     CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor, QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], B: fx.Constexpr[int],
-    MAX_Q: fx.Constexpr[int], DQ: fx.Constexpr[int], DV: fx.Constexpr[int], QROW: fx.Constexpr[int],
+    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Int32, B: fx.Int32,
+    BLOCKS: fx.Int32, DQ: fx.Constexpr[int], DV: fx.Constexpr[int], QROW: fx.Constexpr[int],
     QHEAD: fx.Constexpr[int], PAGE: fx.Constexpr[int], CAUSAL: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool],
     WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], PERSISTENT: fx.Constexpr[bool], CUS: fx.Constexpr[int],
     stream: fx.Stream):
-    grid = (min(CUS, H * B * ((MAX_Q + BM - 1) // BM)), 1, 1) if PERSISTENT else (H, B, (MAX_Q + BM - 1) // BM)
+    tasks = H * B * BLOCKS
+    grid = ((tasks < CUS).select(tasks, CUS), 1, 1) if PERSISTENT else (H, B, BLOCKS)
     _attention_kernel_942(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, H, HK, NP, B,
-        MAX_Q, DQ, DV, QROW, QHEAD, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, PERSISTENT, CUS,
+        BLOCKS, DQ, DV, QROW, QHEAD, PAGE, CAUSAL, PER_TOKEN, WITH_LSE, SCALE, PERSISTENT, CUS,
         value_attrs={"rocdl.waves_per_eu": 2,
                      "llvm.target_features": ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')},
     ).launch(grid=grid, block=(THREADS, 1, 1), stream=stream)
@@ -1097,7 +1146,7 @@ class _PagedAttention:
             from .mha_pa_bf16_256_paged_942 import _launch
             self._launch = _launch
             self.bf16_backend = "native-m16-dma4-q0-kearly-vearly-interleave1-1-pages1-lateS41"
-        self._compiled = {}
+        self._compiled, self._row_strides = {}, {}
 
     def __call__(self, Q, K, V, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
                  max_seqlen_q, max_seqlen_k, causal, q_descale, k_descale, v_descale,
@@ -1105,8 +1154,11 @@ class _PagedAttention:
         """Run with contiguous SHUFFLE-5D KV and asynchronous device metadata.
 
         Dq128/192 Q may be strided over tokens and heads (unit-stride Dq, token rows
-        at least Dq apart), e.g. a slice of a fused QKV projection; each stride pair
-        compiles its own specialization. D256 needs contiguous Q.
+        at least Dq apart), e.g. a slice of a fused QKV projection. D256 needs
+        contiguous Q. Dq128/192 pass the batch, query bound and KV pool size at run
+        time, so one kernel serves every batch of a model; each Q stride pair
+        compiles its own (one-token calls reuse a compiled row stride). D256
+        compiles the batch, query bound and pool size in.
         Descales are finite positive FP32 and the scale product
         softmax_scale * log2(e) * q_descale * k_descale must stay a positive
         finite FP32. K/V within each KV length must be finite: rows of a causal
@@ -1136,14 +1188,20 @@ class _PagedAttention:
         if Q.ndim != 3 or Q.shape[1:] != (self.heads, self.dq):
             raise ValueError("Q must be [tokens, query heads, Dq]")
         tokens = Q.shape[0]
-        # Size-1 dimensions take contiguous strides: contiguous Q keeps its specialization.
-        q_row = Q.stride(0) if tokens > 1 else self.heads * self.dq
+        # A size-1 token axis may carry any stride: keep a valid one.
+        q_row = Q.stride(0) if tokens > 1 or Q.stride(0) >= self.dq else self.heads * self.dq
         q_head = Q.stride(1) if self.heads > 1 else self.dq
         if Q.stride(2) != 1 or q_row < self.dq:
             raise ValueError("Q needs a unit-stride Dq and token rows at least Dq apart")
         q_span = (tokens - 1) * q_row + (self.heads - 1) * q_head + self.dq if tokens else 0
-        # A query block's lane offsets and Q buffer bound reach BM rows.
-        for name, span in (("Q", max(q_span, BM * q_row)), ("K", K.numel()), ("V", V.numel())):
+        # A query block's lane offsets and Q buffer bound reach BM rows. Dq/Dv 128/192 read V and
+        # page64/page128 K from 64-bit page bases; page32 K and D256 K/V use 32-bit pool offsets.
+        spans = [("Q", max(q_span, BM * q_row))]
+        if self.dq == 256 or self.page_size == 32:
+            spans.append(("K", K.numel()))
+        if self.dq == 256:
+            spans.append(("V", V.numel()))
+        for name, span in spans:
             if span * 2 >= 2**31:
                 raise NotImplementedError(f"{name} byte span must fit signed int32 addressing")
         if (K.ndim != 5 or V.ndim != 5
@@ -1172,6 +1230,9 @@ class _PagedAttention:
             raise ValueError("inconsistent batch metadata shapes")
         if tokens and (max_seqlen_k == 0 or K.shape[0] == 0 or kv_page_indices.numel() == 0):
             raise NotImplementedError("active sequences require nonempty KV")
+        blocks = (max_seqlen_q + BM - 1) // BM
+        if self.dq != 256 and self.heads * batch * blocks >= 2**31:
+            raise NotImplementedError("heads * batch * query blocks must fit signed int32")
         for name, tensor in (("q_descale", q_descale), ("k_descale", k_descale), ("v_descale", v_descale)):
             if (not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.float32
                     or tensor.device != device or tensor.layout != torch.strided or not tensor.is_contiguous()):
@@ -1197,18 +1258,29 @@ class _PagedAttention:
             if return_lse and lse is None:
                 lse = torch.empty(lse_shape, device=device, dtype=torch.float32)
             if tokens:
-                # The D256 launcher reads contiguous Q and takes no Q strides.
-                args = (Q.as_strided((q_span,), (1,)), K.view(-1), V.view(-1), out.view(-1),
-                        lse.view(-1) if lse is not None else k_descale.view(-1),
-                        cu_seqlens_q, kv_indptr, kv_page_indices, kv_last_page_lens,
-                        q_descale.view(-1), k_descale.view(-1), v_descale.view(-1),
-                        self.heads, self.kv_heads, K.shape[0], batch, max_seqlen_q, self.dq, self.dv,
-                        *(() if self.dq == 256 else (q_row, q_head)),
-                        self.page_size, self.causal, q_descale.numel() != 1, lse is not None, scale,
-                        self.persistent, properties.multi_processor_count, stream)
-                signature = tuple((a.dtype, tuple(a.shape)) if isinstance(a, torch.Tensor)
-                                  else ("stream",) if hasattr(a, "cuda_stream") else a for a in args)
-                key = (device, signature)
+                # Dq/Dv 128/192 take K/V as [pages, page elements]: FlyDSL packs dynamic shapes as
+                # int32, which a flat view of a pool past 2**31 elements would overflow.
+                kv = (K.view(-1), V.view(-1)) if self.dq == 256 else (K.flatten(1), V.flatten(1))
+                tensors = (Q.as_strided((q_span,), (1,)), *kv, out.view(-1),
+                           lse.view(-1) if lse is not None else k_descale.view(-1),
+                           cu_seqlens_q, kv_indptr, kv_page_indices, kv_last_page_lens,
+                           q_descale.view(-1), k_descale.view(-1), v_descale.view(-1))
+                flags = (self.page_size, self.causal, q_descale.numel() != 1, lse is not None, scale,
+                         self.persistent, properties.multi_processor_count)
+                if self.dq == 256:
+                    # The D256 launcher compiles the pool size, batch and query bound in; its Q is contiguous.
+                    consts = (self.heads, self.kv_heads, K.shape[0], batch, max_seqlen_q, self.dq, self.dv, *flags)
+                    scalars = consts
+                else:
+                    known = self._row_strides.setdefault((device, q_head, flags), q_row)
+                    # A single token never reads past its row: any compiled row stride (all >= Dq) serves it.
+                    q_row = known if tokens == 1 else q_row
+                    consts = (self.heads, self.kv_heads, self.dq, self.dv, q_row, q_head, *flags)
+                    scalars = (self.heads, self.kv_heads, K.shape[0], batch, blocks, self.dq, self.dv,
+                               q_row, q_head, *flags)
+                args = (*tensors, *scalars, stream)
+                # Shapes, strides and runtime scalars are kernel arguments; only these select code.
+                key = (device, tuple(t.dtype for t in tensors), consts)
                 compiled = self._compiled.get(key)
                 if compiled is None:
                     # flyc.compile also launches this first call.

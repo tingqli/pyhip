@@ -44,7 +44,7 @@ out = attn(q, k_cache, v_cache, cu_seqlens_q, None, kv_indptr, kv_page_indices,
 | 参数 | 形状/类型 |
 |---|---|
 | `q` | `[T, H, Dq]`，最后一维连续；gfx942 BF16 Dq/Dv 128/192、gfx950与SWA允许行、头stride（如融合QKV投影输出的切片，gfx942要求行间距≥Dq）；gfx942 FP8与D256须连续 |
-| `k_cache` / `v_cache` | SHUFFLE-5D：K `[P, HK, Dq/v, page, v]`，V `[P, HK, page/v, Dv, v]`，v=16字节/元素（BF16为8，FP8为16），连续 |
+| `k_cache` / `v_cache` | SHUFFLE-5D：K `[P, HK, Dq/v, page, v]`，V `[P, HK, page/v, Dv, v]`，v=16字节/元素（BF16为8，FP8为16），连续；gfx942 BF16 page32的K与D256的K/V须 < 2 GiB（其余用64-bit页基址，可超过4 GiB） |
 | `cu_seqlens_q` | int32 `[B+1]`，Q前缀和 |
 | `kv_indptr` / `kv_page_indices` | int32 `[B+1]` / `[页数]`：序列b的页是`kv_page_indices[kv_indptr[b]:kv_indptr[b+1]]` |
 | `kv_last_page_lens` | int32 `[B]`，最后一页有效token数（1..page）；KV长度=`(页数-1)·page+last` |
@@ -91,9 +91,10 @@ out = flash_attn_varlen_func(q, k, v, cu_q, cu_k, max_q, max_k, block_table=tabl
 
 ### 1.3 编译、缓存、stream与graph
 
-- 每个specialization首次调用时编译（数秒）。头数、维度、page、causal、scale、LSE、persistent、CU数，
-  以及**批大小B、`max_seqlen_q`、物理页数（K/V第0维）**等都是编译期常量，取值变化会触发新的编译。
-  服务集成时应固定KV页池大小，并对B/`max_seqlen_q`分桶后预热，避免在线编译。
+- 每个specialization首次调用时编译（数秒）。gfx942 BF16 Dq/Dv 128/192把头数、维度、page、causal、scale、LSE、
+  per-token Q scale、persistent、CU数和Q步长编进kernel；批大小B、`max_seqlen_q`、物理页数（K/V第0维）是运行时参数，
+  同一模型配置只编译一次，服务集成无需分桶或预热多个变体。D256与其他kernel仍把批大小、`max_seqlen_q`、页数等
+  编进kernel，取值变化会触发新的编译：服务集成时应固定KV页池大小，并对B/`max_seqlen_q`分桶后预热。
 - FlyDSL持久缓存默认开启。升级或修改PyHIP后若结果异常，先清空缓存或设`FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d)`；
   `FLYDSL_RUNTIME_ENABLE_CACHE=0`完全关闭磁盘缓存。
 - 热路径不把GPU metadata复制回host，可放进CUDA graph；capture前须在eager下预热同一specialization（线性API在capture中遇到
@@ -188,6 +189,10 @@ causal page4在两块GPU上一快一慢（−0.5%、+0.4%）。
 （[源码readme第2、3.1、3.3节](../../src/pyhip/ops/mha/flydsl/readme.md)），输出逐位不变。MI300X上MiMo prefill形状
 （H16/HK1、D192/V128、causal）的交替A/B快4.8%–13.5%（源码readme第11节），本suite的MI300X实测见3.5节；
 3.1–3.4节（MI308X）未重测。
+
+2026-10-30：K改用64-bit页基址，批大小、query块数与页池大小改为运行时参数（源码readme第11节），输出逐位不变。
+同进程交替A/B：无LSE的D192/D128在−0.3%到+0.35%之间（0.1 ms的B8短形状+1.0%），LSE在−0.9%到+0.6%之间；3.5节未重测。
+MiMo prefill的组件与E2E性能、精度见3.6节。
 
 ### 3.1 BF16分页（`bf16-mha`，B1）
 
@@ -296,6 +301,108 @@ test_mha.py，另把改前（`b0a42a0`）kernel的副本作为两个候选放进
 - 小shape（Q65/KV129）：D128 17.0–17.1µs（改前17.1–17.2），D192 18.6µs（改前19.3–19.4，−3.5%到−4.0%）。
 - 按test_mha.py原协议（不预调用）在GPU 0、1上各跑一遍：相对改前causal −11.8%到−16.4%、D192非causal −1.2%到−3.1%；
   D128非causal的grid −0.7%到+0.3%，persistent却+0.3%到+1.5%，即上述位置偏差（persistent在两端，改前kernel在中间）。
+
+### 3.6 MiMo-V2.6-Flash全注意力prefill（MI300X，2026-10-30）
+
+MiMo-V2.6-Flash的48层中有9层全注意力（其余为W128 SWA）。按sglang的attention DP2×TP4部署，每个rank为H16/HK1、
+D192/V128、page64、bottom-right causal，Q是融合QKV投影输出的strided切片（行间距3392个元素）。代码：PyHIP `f55f549`，
+sglang `feat/mimo-ck-linear-prefill`分支`f53bcae0f8`（`SGLANG_USE_PYHIP_MIMO_PREFILL=1`）。对照为同一分支的FlyPA（默认路径）
+与CK（`SGLANG_MIMO_CK_LINEAR_PREFILL=1`：每层先把SHUFFLE-5D KV gather成线性KV，再调AITER `mha_varlen_fwd`）。环境同3.5节。
+
+**组件（单卡kernel）**。sglang的`evaluation/mimo_v26_flash/repro_flypa_ck_prefill/benchmark.py`（本地加了PyHIP候选，
+并把CK拆成kernel与gather两个graph，未入库）：单序列，FlyPA用sglang的调优配置（8 wave、`manual_schedule=False`、
+`cooperative_v=False`），各候选录成HIP graph后交替重放，每次计时前先空跑同一graph，CUDA event计时，取10个样本的中位数，
+单位ms。Q=32768对应E2E里每个DP组的一个chunk（全局65536÷DP2），KV=已有前缀+本chunk。数据（未入库）：
+`/root/workspace/data/att_pyhip_mha/component_20261030/`。
+
+| Q | KV | FlyPA | CK kernel | CK gather | CK合计 | PyHIP（TFLOPS） | 对CK | 对FlyPA |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8192 | 8192 | 1.346 | 0.784 | 0.023 | 0.791 | 0.742（463T） | 1.07 | 1.81 |
+| 32768 | 32768 | 15.82 | 10.51 | 0.063 | 10.57 | 9.21（597T） | 1.15 | 1.72 |
+| 32768 | 65536 | 43.09 | 33.00 | 0.110 | 33.46 | 27.26（605T） | 1.23 | 1.58 |
+| 32768 | 131072 | 94.91 | 75.52 | 0.152 | 75.03 | 63.21（609T） | 1.19 | 1.50 |
+| 32768 | 262144 | 195.6 | 157.1 | 0.301 | 157.4 | 134.4（614T） | 1.17 | 1.46 |
+| 32768 | 524288 | 396.3 | 323.0 | 0.590 | 323.3 | 271.8（627T） | 1.19 | 1.46 |
+| 32768 | 983040 | 777.5 | 672.3 | 1.085 | 674.8 | 540.2（600T） | 1.25 | 1.44 |
+| 18432 | 378880 | 166.2 | 135.8 | 0.432 | 136.5 | 113.7（614T） | 1.20 | 1.46 |
+
+- PyHIP比CK（含gather）快1.07–1.25倍、比FlyPA快1.44–1.81倍。
+- CK的gather最多1.1 ms（不到CK合计的0.2%），差距来自CK的attention kernel本身。三个CK列是分别录的graph，
+  合计与两项之和的差为噪声。
+- 单元测试：`tests/ops/mha`的gfx942 BF16子集58项通过（含冷编译约12分钟），sglang
+  `test/manual/test_mimo_pyhip_prefill.py` 6项通过（多序列不等长、末页NaN、padding、与FlyPA对齐、graph重放、多stream）。
+
+**E2E（8×MI300X）**。dummy权重（`--load-format dummy`），attention DP2×TP4、EP1、BF16 KV，chunked prefill全局65536
+（每组32768），max running 192。客户端为sglang的`evaluation/run_benchmark_mimo_pro_prefill.sh`（bench_serving random数据，
+每请求输出1 token即只测prefill，4个预热请求不计），每行跑一次。CK、FlyPA与“PyHIP旧”取自同配置的前一轮
+（“PyHIP旧”为`bf536ee`加旧集成：`max_seqlen_q`按2的幂分桶，首次调用时预热32个变体），本轮只重跑PyHIP。
+吞吐单位为input tok/s；对CK、对FlyPA为PyHIP列的变化。
+
+限容池（`--max-total-tokens 5242880`，SWA比例0.0658）：
+
+| ISL/并发 | CK | FlyPA | PyHIP旧 | PyHIP | 对CK | 对FlyPA | 中位TTFT s（CK/FlyPA/PyHIP） |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 8K/32 | 69,346 | 71,532 | 74,291 | 71,989；重跑74,293 | +3.8%；+7.1% | +0.6%；+3.9% | 3.56/3.60/3.60（重跑3.47） |
+| 16K/32 | 72,746 | 68,406 | 72,721 | 72,693 | −0.1% | +6.3% | 7.12/7.61/7.16 |
+| 32K/32 | 68,844 | 61,459 | 69,347 | 69,599 | +1.1% | +13.2% | 15.2/17.0/14.3 |
+| 64K/32 | 61,426 | 48,270 | 62,621 | 62,867 | +2.3% | +30.2% | 33.6/41.5/32.9 |
+| 128K/16 | 47,299 | 32,904 | 50,030 | 50,242 | +6.2% | +52.7% | 43.8/63.1/41.6 |
+| 256K/8 | 33,757 | 21,475 | 37,088 | 37,267 | +10.4% | +73.5% | 61.5/96.8/55.8 |
+| 512K/4 | 23,132 | 13,268 | 26,731 | 26,874 | +16.2% | +102.6% | 88.7/156.3/77.9 |
+| 960K/4 | 14,639 | 8,351 | 17,235 | 17,507 | +19.6% | +109.6% | 267.2/470.7/223.3 |
+
+默认池（不限容，SWA比例0.03；K池4.11 GiB/层，走K的64-bit页基址）：
+
+| ISL/并发 | CK | FlyPA | PyHIP旧 | PyHIP | 对CK | 对FlyPA | 中位TTFT s（CK/FlyPA/PyHIP） |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 8K/32 | 73,319 | 70,700 | 74,758 | 73,989；重跑74,258 | +0.9%；+1.3% | +4.7%；+5.0% | 3.51/3.66/3.48（重跑3.46） |
+| 64K/32 | 60,087 | 47,058 | 62,671 | 62,917 | +4.7% | +33.7% | 34.2/41.4/32.7 |
+
+- 与旧集成相比，16K–960K在−0.04%到+1.6%之间，与kernel级交替A/B一致。8K首轮为−3.1%（限容）与−1.0%，
+  重跑为0.0%与−0.7%，属单次运行的波动（CK自己的8K限容比默认池低5.4%，那一次偏低）。
+- 对CK：kernel快1.15–1.25倍，E2E收益随attention占比增大：16K持平，32K–64K +1%到+5%，128K起+6%到+20%。
+- 启动：sglang的FlyDSL模块把`FLYDSL_RUNTIME_ENABLE_CACHE`默认设为0，服务不写FlyDSL磁盘缓存，每次启动都在
+  首次prefill时编译。旧集成编译32个变体，客户端阶段比现在长237 s（默认池）与270 s（限容），计时部分相差
+  不到20 s；现在每个rank只编一个kernel，落在预热请求里。
+- 全部请求完成，服务日志无报错。FlyPA为本分支版本（不含另一分支的FlyPA tail mask修复`e8737be`）。
+  原始数据（未入库）：`/root/workspace/data/mimo_e2e/`的`ab_20261030T021114Z`与`rerun_pyhip_20261030T144232Z`。
+
+**精度**。`/root/workspace/data/att_pyhip_mha/accuracy_mimo.py`（未入库，结果在同目录`accuracy_20261030/`）按sglang的
+调用方式（per-tensor单位scale、`softmax_scale=192^-0.5`、`cu_seqlens_k=None`、Q为融合QKV切片）调用PyHIP、FlyPA与CK，
+把每个输出行与FP64参考比较（FP64下对同一组BF16输入计算）。KV页随机散布在18万页、预填NaN的池里（K 4.4 GB，
+共10,120个K页位于4 GiB之后），不满的末页尾部为NaN，Q的活动行之后是NaN行，输出缓冲预填哨兵值。
+“理想”是把FP64结果舍入到BF16的误差，即BF16输出的下限。共104个case、904个序列、30.8亿个输出元素。
+
+| 组（case数） | 覆盖 |
+|---|---|
+| 形状（18） | B1，H16与H8（TP8），Q 1–32768，KV 1–983040（含Q1/KV983040、Q32768/KV983040），randn输入 |
+| 分布（22） | Q=KV 8192与Q32768/KV262144各9种：normal、peaked（每行一个key高出约4√Dq）、offset（logit约724）、sinks（32个突出的key，其V×10）、ascending、flat、zero_q、v_outliers（1%的V×100）、self_similar；另有zero_q、sinks、offset、ascending在KV 983040 |
+| 随机batch（64） | 864个序列：B 2–32，每批extend token不超过4096/16384/32768（16%的序列只有1 token），58%带前缀（KV最大261897），30个batch为非normal分布，H16与H8 |
+
+相对RMS误差为‖O−R‖/‖R‖（中位/最大）；最差行为每个（token, head）输出向量‖o−r‖/‖r‖的最大值：
+
+| 组 | PyHIP | FlyPA | CK | 理想 |
+|---|---:|---:|---:|---:|
+| 形状：相对RMS | 2.32e-3/2.40e-3 | 2.32e-3/2.40e-3 | 6.07e-3/6.16e-3 | 1.66e-3/1.66e-3 |
+| 形状：最差行 | 3.9e-3 | 3.8e-3 | 9.4e-3 | 2.4e-3 |
+| 分布：相对RMS | 2.07e-3/2.35e-3 | 2.07e-3/2.35e-3 | 5.76e-3/6.20e-3 | 1.64e-3/1.68e-3 |
+| 分布：最差行 | 5.7e-3 | 5.5e-3 | 1.6e-2 | 3.4e-3 |
+| 随机batch：相对RMS | 2.02e-3/2.31e-3 | 2.04e-3/2.31e-3 | 5.37e-3/6.11e-3 | 1.61e-3/1.68e-3 |
+| 随机batch：最差行 | 6.0e-3 | 6.0e-3 | 1.2e-2 | 3.7e-3 |
+
+- PyHIP与FlyPA的误差几乎相同（逐case相对RMS之比0.97–1.02），是理想下限的1.00–1.45倍；系统偏差（误差在参考上的投影，
+  −4.5e-5到3.4e-4）与理想舍入的范围相同。peaked（输出就是一行V）与单key时与理想相同，flat、zero_q（KV 983040的均匀注意力）
+  与理想几乎相同。
+- CK的误差是PyHIP的1.9–4.0倍，104个case的输出全部系统偏小0.10%–0.57%（单key时也偏小0.1%，PyHIP与FlyPA此时与V逐位相同）。
+- 逐元素`rtol=atol=0.02`只在V被放大的两种分布（sinks的V×10、v_outliers的V×100，共13个case、3.6亿个元素）中超限：
+  PyHIP 3887个、FlyPA 3906个、CK 9667个。超限的是相消后远小于所在行量级的元素（sinks Q8192：|R|中位数为行RMS的2.8%，
+  误差不超过行RMS的1.2%），所在行的相对误差不超过0.6%；其余分布与全部形状没有超限。
+- PyHIP逐位一致：重复调用104/104，persistent与普通网格104/104，batch中每个序列单独调用64/64，把query拆成两个chunk
+  （前一个chunk的KV相应变短，同chunked prefill）37/37。
+- 三个后端都没有写padding行（104/104），NaN尾页与NaN行没有进入输出（非有限值0个）；CK的gather与原KV逐位相同。
+- E2E的任务精度（如GSM8K）需要真实权重，本机只有dummy权重，未测。其他配置（Dq/Dv 128/192的四种组合、page32/128、LSE、
+  GQA 1–16、per-token scale、普通网格等）由单元测试与随机sweep覆盖：sweep的240个配置与改动前逐位相同，O全部在FP32参考的
+  `rtol=atol=0.02`以内、LSE误差不超过0.002。
 
 ## 4. 指标与协议
 

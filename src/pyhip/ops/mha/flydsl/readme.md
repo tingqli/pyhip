@@ -59,8 +59,8 @@ read类helper只**发射**指令、返回异步结果；所有`s_waitcnt`都由k
 
 | kernel | 主体 | 页号 | K | V | 计算 |
 |---|---|---|---|---|---|
-| BF16 D128/D192 V128无LSE | [_body_v128](mha_pa_bf16_942.py#L363) | t+2（S0 s_load） | t+1：S4 g2r，S6 r2s（单槽） | t：S0 g2r（64-bit GLOBAL），S2 r2s到`[cur]` | QK(t)，exp/PV(t−1) |
-| BF16 LSE或V192 | [_body_wide](mha_pa_bf16_942.py#L649) | t+2 | t+1：S0 g2r，S4/S6 r2s | t：S0 g2r；环形S2发布，单槽下一phase S0发布 | 同上 |
+| BF16 D128/D192 V128无LSE | [_body_v128](mha_pa_bf16_942.py#L439) | t+2（S0 s_load） | t+1：S4 g2r（page≥64为64-bit GLOBAL），S6 r2s（单槽） | t：S0 g2r（64-bit GLOBAL），S2 r2s到`[cur]` | QK(t)，exp/PV(t−1) |
+| BF16 LSE或V192 | [_body_wide](mha_pa_bf16_942.py#L780) | t+2 | t+1：S0 g2r（page≥64为64-bit GLOBAL），S4/S6 r2s | t：S0 g2r；环形S2发布，单槽下一phase S0发布 | 同上 |
 | FP8 | [_body](mha_pa_fp8_942.py#L367) | t+3 | t+2：S0 g2r，S4 r2s（双槽） | t：S0 g2r，S2 r2s（双槽） | 同上 |
 | BF16 D256 paged | [_body](mha_pa_bf16_256_paged_942.py#L182) | t+2（step0） | t+1：step2 DMA，step3落地 | t−1：step0 DMA，step1落地 | 同上 |
 | BF16 D256 linear | [_body](mha_pa_bf16_256_linear_942.py#L280) | 行地址t+2（step0 g2r） | t+1：step2 DMA | t−1：step0 DMA | 同上 |
@@ -85,16 +85,17 @@ read类helper只**发射**指令、返回异步结果；所有`s_waitcnt`都由k
 
 ```text
 PagedAttention(...)                    # functools.cache工厂：校验静态配置，返回_PagedAttention
-  └─ _PagedAttention.__call__(...)     # host校验dtype/形状/连续性/2 GiB跨度/scale；不读GPU metadata
-       └─ flyc.compile(_launch_attention, *args)   # 按(device, 参数签名)缓存；首调编译并执行
+  └─ _PagedAttention.__call__(...)     # host校验dtype/形状/连续性/32-bit寻址跨度/scale；不读GPU metadata
+       └─ flyc.compile(_launch_attention, *args)   # 按(device, 张量dtype, 编译期常量)缓存；首调编译并执行
             └─ _attention_kernel_942    # persistent：min(CU, 任务数)个CTA grid-stride；否则grid=(H, B, QB)
                  └─ _work(head, batch, qb)          # 读CQ/KI/LAST得到q_len、kv_len、页表视图
                       └─ _body_v128 / _body_wide(STAGGER=wave>=4)
                            prologue → phase(t=1..tiles-1) → epilogue → O/l → store_o_r2g (+LSE)
 ```
 
-头数、维度、page、causal、scale、LSE、persistent、CU数以及`B`、`MAX_Q`、物理页数`NP`、Q的token/head步长等形状参数是编译期常量
-（各kernel略有不同）；不同取值会编译新的specialization（见使用文档的集成注意事项）。
+gfx942 BF16 Dq/Dv 128/192的编译期常量是头数、维度、page、causal、scale、LSE、per-token Q scale、persistent、CU数和Q的
+token/head步长；批大小`B`、query块数（`max_seqlen_q`按256向上取整）与物理页数`NP`是运行时参数，
+同一模型配置的所有batch共用一个kernel。D256仍把`B`、`MAX_Q`、`NP`编进kernel；其他kernel见各自源码。
 
 ## 2. 数据布局
 
@@ -102,13 +103,18 @@ PagedAttention(...)                    # functools.cache工厂：校验静态配
   K：`[P, HK, Dq/v, page, v]`，V：`[P, HK, page/v, Dv, v]`。一个页内同一组v维（K）或同一组v个token（V）连续，
   一次16字节读即得到MFMA操作数片段。由普通`[P, page, HK, D]`页转换见
   [tests/ops/mha/_mha.py](../../../../../tests/ops/mha/_mha.py)的`vectorize_kv`。
+- **KV池大小**：gfx942 BF16 Dq/Dv 128/192的V与page64/page128的K按tile在SGPR里算64-bit页基址
+  （`_v_g2r_bases`/`_k_g2r_bases`），以`global_load_dwordx4 v, voff, s[base]`读取，每层KV池可超过4 GiB。
+  page32的一个K tile跨两页、两页分属同一条指令的两半lane，仍用整池32-bit buffer，要求每层K < 2 GiB；
+  D256的K/V同样要求 < 2 GiB。
 - **metadata**：`cu_seqlens_q[B+1]`（Q前缀和），`kv_indptr[B+1]`（每个序列在`kv_page_indices`中的页区间），
   `kv_page_indices`（物理页号），`kv_last_page_lens[B]`（最后一页有效token数，1..page）。
   KV长度 = `(页数−1)·page + last`。metadata全部留在GPU上，kernel不回读host，热路径无同步、可被graph捕获。
 - **scale**：FP32；Q可为per-tensor `[1]`或per-token `[T,H,1]`（FP8在量化域计算，BF16通常全1），K/V各一个标量。
   `softmax_scale`默认`Dq^-0.5`。
 - **Q**：`[T,H,Dq]`。gfx950、SWA与gfx942 BF16 Dq/Dv 128/192允许token/head跨步（Dq维步长为1），如融合QKV投影输出的切片，
-  不必先拷贝成连续；gfx942 BF16要求token行间距≥Dq（查询块中超出序列末尾的行由buffer边界读成0），步长是编译期常量。
+  不必先拷贝成连续；gfx942 BF16要求token行间距≥Dq（查询块中超出序列末尾的行由buffer边界读成0），步长是编译期常量
+  （单token只读自己一行，复用同一配置已编译kernel的行步长）。
   gfx942 FP8与D256要求连续Q。
 - **输出**：O为BF16 `[T,H,Dv]`；可选LSE为FP32 `[T,H]`、自然对数。gfx950与SWA允许空KV序列（输出0；gfx950的LSE为sink或`-inf`），
   gfx942 BF16要求活动序列KV非空，causal时每个序列KV≥Q。
@@ -365,7 +371,7 @@ S4的LGKM等待移到barrier之后、首个消费者之前。page32/64/128、per
 
 ## 5. gfx942 BF16 D256 linear（[mha_pa_bf16_256_linear_942.py](mha_pa_bf16_256_linear_942.py)）
 
-公开入口为[flash_attn_varlen_func](mha_pa_bf16_942.py#L1200)：连续THD输入、无KV格式转换，热调用只有一个attention kernel。
+公开入口为[flash_attn_varlen_func](mha_pa_bf16_942.py#L1363)：连续THD输入、无KV格式转换，热调用只有一个attention kernel。
 
 ### 5.1 布局与搬运
 
@@ -621,6 +627,42 @@ per-token Q scale的结果相差不超过3%。758a1856（每个新最大值都�
   O转换的指令顺序随之略变），主循环除寄存器编号外一致。
   MI300X交替计时：strided与连续Q相差±0.6%以内；相对“拷贝成连续+kernel”，D192 causal Q=KV 32768快1.1%、
   Q18432/KV378880快0.1%、Q1000/KV2100快7.4%，D128 causal 32768²快0.8%、full 10240/2583快5.2%。
+- **2026-10-30 K的64-bit页基址**（MI300X，FlyDSL 0.3.2，见第2节）：page64/page128的K原来用整池一个32-bit buffer，
+  `页号×页跨度`在int32的VOFFSET里算，host因此要求每层K < 2 GiB；MiMo默认池（11.49M token/rank = 179,572页×24 KiB，
+  4.11 GiB/层）被拒。现在与V相同：K(t+1)每个Dq/64部分的64位页基址在SGPR里算（`_k_g2r_bases`），
+  `global_load_dwordx4 v, voff, s[base]`读；page32（一个tile的两页分属两半lane）与D256不变。K/V以`[页数, 页元素]`
+  传给launcher：FlyDSL按int32打包动态shape，一维view超过2^31个元素（4 GiB BF16）会在host端溢出。
+  基址每个phase是D192 9条、D128 7条SALU（页号乘步长、每部分一对`s_add_u32`/`s_addc_u32`）。放在S3（MFMA间隙）或S4
+  （与ds_read交织）时D192/D128多数慢0.2–0.7%；只换成GLOBAL读、不加每tile SALU的对照在−0.6%到+0.3%之间；
+  最终放在S2的LDS读之后、`lgkmcnt(0)`之前（wave本就在等LDS），`_body_wide`在S0与K(t)的LDS读交织。
+  K基址的pin若挪到scale读取之后，scale读回到`s_load`，
+  但主循环整体后移4字节，D192同进程交替12组全部慢0.2%–1.4%，故保留在Q读取之前（scale读为VMEM，每任务一次）。
+  结果：10个配置（D128/D192、page32/64/128、LSE、V192、grid）与HEAD逐位相同，page32的ISA逐字节相同，
+  counter/wait state审计0违例；D192 page64 SGPR 60→57、VGPR 254不变，D128 SGPR 58→60、VGPR 248→247，0 spill；
+  随机sweep 240个配置（page32/64/128、D128/D192、V128/V192、LSE、grid与persistent）逐位相同；新测试把奇数页放到4 GiB之后，
+  与紧凑池逐位相同。
+  同进程交替计时（30–60个样本中位数，新/旧，persistent与grid）：D192 causal Q=KV 8192、32768，Q32768/KV65536、
+  KV262144，Q18432/KV378880共22组在−0.3%到+0.35%之间（中位+0.05%）；D128 causal 8192²–KV262144共6组在−0.1%到
+  +0.2%之间；同一协议的A/A对照（旧/旧）22组在−0.7%到+0.3%之间（中位−0.1%）；LSE（`_body_wide`）D192/D128 causal
+  8192²与32768²共8组在−0.9%到+0.5%之间。
+- **2026-10-30 运行时的batch、query块数与页池大小**（MI300X，FlyDSL 0.3.2，见第1、2节）：D128/D192原来把批大小`B`、
+  `max_seqlen_q`和物理页数`NP`编进kernel，`_PagedAttention`又按全部参数的shape缓存launcher：每个新的（B,
+  max_seqlen_q, 页池）组合都要编译约4 s，sglang集成因此把`max_seqlen_q`按2的幂分桶并预热32个变体，缓存条目还随
+  不同shape无限增长。现在三者都是运行时参数（query块数在host算好；persistent grid由launcher取`min(CU, H·B·块数)`；
+  任务解码的`pair % B`、`pair // B`成为运行时除法，倒数在入口算一次，每任务约35条SALU），缓存key只含device、
+  张量dtype和编译期常量，host检查`H·B·块数 < 2^31`；D256不变。Q步长仍是编译期常量：做成运行时参数时
+  tile循环的VGPR编号整体后移、D192两份循环的取指跨块数由31/35变为36/36，D192短形状慢+0.1%到+0.5%，
+  每任务重新pin行步长也没有消除；单token调用只读自己一行，复用同一配置已编译kernel的行步长
+  （PyTorch会把单token融合QKV切片的步长改成连续值），因此sglang里只编译一个kernel。
+  结果：9组batch（B 1–8、单token、不同页池、strided与连续Q）在4种配置下由36个kernel降为8个（每种配置
+  连续与strided Q各一个），输出与HEAD逐位相同。tile循环与HEAD逐条相同（VGPR编号也相同，只差SGPR编号与位置）；
+  Q=KV 32768时D192 SGPR 80→86、D128 75→81，VGPR与spill不变（D192带LSE仍为1个、V192仍为65个），
+  counter/wait state审计0违例；随机sweep 240个配置与HEAD逐位相同，单元测试58项、sglang集成测试6项通过。
+  同进程交替计时（40个样本中位数，新/旧，persistent）：D192 B1 Q1000/KV2100 +0.34%、8192² +0.24%、
+  32768² −0.04%、Q32768/KV262144 +0.10%；B8 strided Q512/KV1024 +0.99%（0.1 ms）、其余三组−0.05%到+0.06%；
+  D128 −0.03%到+0.27%；LSE 8192² +0.61%、32768² +0.04%；同协议A/A对照−0.17%到+0.38%。
+  E2E（8×MI300X，attention DP2×TP4，dummy权重）与分桶+预热的旧集成相比，16K–960K的吞吐在−0.04%到+1.6%之间，
+  每次起服务少编译约4分钟；组件、E2E与精度见[benchmarks readme 3.6节](../../../../../benchmarks/mha/readme.md)。
 
 ## 12. 与aiter PR #6576 union评审意见对齐（2026-10-22）
 
