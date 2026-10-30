@@ -13,7 +13,7 @@ FlyDSL多头注意力kernel的集成方法、测试命令和当前性能。实�
 | gfx942 FP8分页注意力 | [mha_pa_fp8_942.py](../../src/pyhip/ops/mha/flydsl/mha_pa_fp8_942.py) |
 | gfx950 BF16分页注意力（SWA、sink） | [mha_pa_bf16_950.py](../../src/pyhip/ops/mha/flydsl/mha_pa_bf16_950.py) |
 | gfx942/gfx950单wave SWA | [mha_pa_swa_bf16.py](../../src/pyhip/ops/mha/flydsl/mha_pa_swa_bf16.py) |
-| 单元测试（80项） | [test_paged.py](../../tests/ops/mha/test_paged.py)、[test_linear.py](../../tests/ops/mha/test_linear.py) |
+| 单元测试（129项） | [test_paged.py](../../tests/ops/mha/test_paged.py)、[test_linear.py](../../tests/ops/mha/test_linear.py) |
 | 共用输入、FP32参考与检查 | [_mha.py](../../tests/ops/mha/_mha.py) |
 | 集成测试：精度+性能（本目录） | [test_mha.py](test_mha.py) |
 
@@ -43,7 +43,7 @@ out = attn(q, k_cache, v_cache, cu_seqlens_q, None, kv_indptr, kv_page_indices,
 
 | 参数 | 形状/类型 |
 |---|---|
-| `q` | `[T, H, Dq]`，gfx942为连续张量；gfx950/SWA允许行、头stride（最后一维连续） |
+| `q` | `[T, H, Dq]`，最后一维连续；gfx942 BF16 Dq/Dv 128/192、gfx950与SWA允许行、头stride（如融合QKV投影输出的切片，gfx942要求行间距≥Dq）；gfx942 FP8与D256须连续 |
 | `k_cache` / `v_cache` | SHUFFLE-5D：K `[P, HK, Dq/v, page, v]`，V `[P, HK, page/v, Dv, v]`，v=16字节/元素（BF16为8，FP8为16），连续 |
 | `cu_seqlens_q` | int32 `[B+1]`，Q前缀和 |
 | `kv_indptr` / `kv_page_indices` | int32 `[B+1]` / `[页数]`：序列b的页是`kv_page_indices[kv_indptr[b]:kv_indptr[b+1]]` |
@@ -104,7 +104,7 @@ out = flash_attn_varlen_func(q, k, v, cu_q, cu_k, max_q, max_k, block_table=tabl
 ## 2. 测试与性能复现
 
 ```bash
-# 单元测试：80项（gfx942全部执行；冷编译约17分钟）
+# 单元测试：129项（gfx942上7项gfx950专用或不适用而跳过；冷编译约17分钟）
 MHA_TEST_GPU=0 PYTHONPATH=src python3 -m pytest tests/ops/mha -q
 
 # 集成测试：列出case（不初始化GPU）
@@ -184,6 +184,11 @@ linear非causal带LSE慢约0.7%、16384² causal慢约0.5%，混合长度causal�
 causal page4在两块GPU上一快一慢（−0.5%、+0.4%）。
 脚本与逐case结果：`mytest/mydata/mha_more_cases_20261027/`（`ab_perf.py`、`perf_summary.md`）。下表未重测。
 
+2026-10-29：BF16 D128/D192的任务改为长query块优先、persistent蛇形分配，D192的compute stage按ATT配平，Q可带行/头stride
+（[源码readme第2、3.1、3.3节](../../src/pyhip/ops/mha/flydsl/readme.md)），输出逐位不变。MI300X上MiMo prefill形状
+（H16/HK1、D192/V128、causal）的交替A/B快4.8%–13.5%（源码readme第11节），本suite的MI300X实测见3.5节；
+3.1–3.4节（MI308X）未重测。
+
 ### 3.1 BF16分页（`bf16-mha`，B1）
 
 | case | 形状（Q/KV，H/HK，Dq/Dv，page） | persistent | grid | AITER | 加速比 |
@@ -255,6 +260,42 @@ causal page4在两块GPU上一快一慢（−0.5%、+0.4%）。
 未降频时page1/page4比非分页慢约4%。表中保留按协议计算的中位数，不剔除样本。
 
 causal的persistent路径使用“最长query块优先+蛇形分配”，比普通网格快8–16%。
+
+### 3.5 MI300X（BF16 D128/D192，2026-10-29）
+
+环境：MI300X（gfx942，304 CU，功耗上限750 W，未固定时钟），Python 3.12.3，torch 2.11.0+rocm7.2，ROCm 7.2.4，FlyDSL 0.3.2，
+Triton 3.7.0，AITER `2b81433bb`。FlyDSL 0.3.2没有`flydsl.expr.generic_load`，D256分页/linear无法编译，未测。
+
+3.1节中D128/D192的10个case与2个smoke shape；输入、逐buffer精度检查、cudaPerf计时和中位数（10 buffer×5轮=50样本）同
+test_mha.py，另把改前（`b0a42a0`）kernel的副本作为两个候选放进同一进程，与当前kernel共用buffer、轮次和GPU。
+与test_mha.py只有一处不同：每次计时前先在同一buffer上不计时地调用该候选一次。test_mha.py逐样本正反交替候选顺序，
+排在两端的候选有一半样本紧跟在另一buffer的调用之后（cache中没有本buffer的数据），非causal shape的这部分样本慢0.3%–2.4%，
+中间的候选不受影响；3.1节的persistent与AITER列就在两端。GPU 0、1同时各跑一遍：表中耗时为GPU 0，加速比（对AITER）
+与相对改前的耗时变化为两块GPU的范围。全部候选精度检查通过（acc 2.2–2.9e-6）。脚本与逐样本数据（未入库）：
+`/root/workspace/data/att_pyhip_mha/`的`bench_mi300x.py --prime`与`bench_primed_g{0,1}.json`。
+
+| case | persistent | grid | AITER | 加速比 | 相对改前：persistent | 相对改前：grid |
+|---|---:|---:|---:|---:|---:|---:|
+| bf16-full-d128 | 538.1（402.7T） | 542.0（399.8T） | 576.4（375.9T） | 1.04–1.07 | −1.1%到+0.3% | −1.7%到+1.0% |
+| bf16-full-d192 | 651.7（415.6T） | 650.1（416.6T） | 647.0（418.6T） | 0.99–1.06 | −1.0%到−4.2% | 0.0%到−4.2% |
+| bf16-causal-d128 | 7672.6（573.2T） | 7737.5（568.4T） | 9820.7（447.9T） | 1.24–1.28 | −12.8%到−15.4% | −12.5%到−14.6% |
+| bf16-causal-d192 | 9352.8（587.8T） | 9389.1（585.5T） | 10642（516.6T） | 1.11–1.14 | −16.7%到−18.6% | −16.6%到−17.7% |
+| bf16-mha-long-p32 | 4103.4（418.7T） | 4112.4（417.8T） | 4487.0（382.9T） | 1.09 | −0.6%到+0.4% | −0.1%到+1.3% |
+| bf16-mha-short-p32 | 316.5（339.3T） | 317.1（338.6T） | 342.6（313.5T） | 1.08 | −0.2%到0.0% | −0.1%到0.0% |
+| bf16-mha-short-p64 | 317.1（338.6T） | 316.5（339.3T） | 341.7（314.2T） | 1.08 | +0.1%到+0.3% | −0.3%到−0.4% |
+| bf16-mha-long-p32-d192 | 4945.6（434.2T） | 4952.4（433.6T） | 4777.0（449.5T） | 0.96–0.99 | −3.4%到−3.8% | −3.2%到−3.6% |
+| bf16-mha-short-p32-d192 | 388.5（345.5T） | 388.4（345.6T） | 378.2（354.9T） | 0.97 | −2.2%到−2.3% | −2.2% |
+| bf16-mha-short-p64-d192 | 386.7（347.1T） | 387.8（346.1T） | 378.9（354.2T） | 0.98 | −1.9%到−2.1% | −2.0% |
+
+- causal（Q=KV 32768，H16/HK1）快12.5%–18.6%：最长的query块先开始（persistent蛇形分配，普通网格qb反序），
+  D192另有compute stage配平；GPU 0上568–588T。
+- D192非causal的H8/HK8 shape快1.9%–3.8%（compute stage配平），bf16-full-d192在GPU 0上快0.0%–1.0%、GPU 1上快4.2%；
+  D128非causal与改前相差±1.7%以内，与两块GPU之间的差异相当。
+- 对AITER：D128全部shape与D192 causal快1.04–1.28倍；D192非causal的H8/HK8 shape AITER快1%–4%，bf16-full-d192在GPU 0上
+  持平（0.99–1.00）、GPU 1上快1.05–1.06倍。MI300X上两者的差距远小于MI308X（3.1节1.42–1.52倍）。
+- 小shape（Q65/KV129）：D128 17.0–17.1µs（改前17.1–17.2），D192 18.6µs（改前19.3–19.4，−3.5%到−4.0%）。
+- 按test_mha.py原协议（不预调用）在GPU 0、1上各跑一遍：相对改前causal −11.8%到−16.4%、D192非causal −1.2%到−3.1%；
+  D128非causal的grid −0.7%到+0.3%，persistent却+0.3%到+1.5%，即上述位置偏差（persistent在两端，改前kernel在中间）。
 
 ## 4. 指标与协议
 

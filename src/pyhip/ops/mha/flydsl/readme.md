@@ -72,7 +72,7 @@ read类helper只**发射**指令、返回异步结果；所有`s_waitcnt`都由k
 
 | 文件 | 入口 | 架构/类型 | 维度、页与功能 | LDS |
 |---|---|---|---|---|
-| [mha_pa_bf16_942.py](mha_pa_bf16_942.py) | `PagedAttention`、`flash_attn_varlen_func` | gfx942 BF16 | Dq/Dv∈{128,192}或Dq=Dv=256；page 32/64/128；causal、LSE；persistent/普通网格 | 49,920（D128）/58,240（D192） |
+| [mha_pa_bf16_942.py](mha_pa_bf16_942.py) | `PagedAttention`、`flash_attn_varlen_func` | gfx942 BF16 | Dq/Dv∈{128,192}或Dq=Dv=256；page 32/64/128；causal、LSE；persistent/普通网格；Dq/Dv 128/192时strided Q | 49,920（D128）/58,240（D192） |
 | [mha_pa_bf16_256_paged_942.py](mha_pa_bf16_256_paged_942.py) | 由`PagedAttention`在D256时分派 | gfx942 BF16 | D256 BM128/BN64，K/V DMA | 65,536 |
 | [mha_pa_bf16_256_linear_942.py](mha_pa_bf16_256_linear_942.py) | `run`（由`flash_attn_varlen_func`调用；QSA复用helper） | gfx942 BF16 | 线性THD K/V、page1/page4；causal、LSE | 65,536 |
 | [mha_pa_fp8_942.py](mha_pa_fp8_942.py) | `PagedAttention` | gfx942 FP8 e4m3fnuz | Dq∈{128,192}、Dv=128、page64；per-token/per-tensor Q scale | 33,280（D128）/41,600（D192） |
@@ -93,7 +93,7 @@ PagedAttention(...)                    # functools.cache工厂：校验静态配
                            prologue → phase(t=1..tiles-1) → epilogue → O/l → store_o_r2g (+LSE)
 ```
 
-头数、维度、page、causal、scale、LSE、persistent、CU数以及`B`、`MAX_Q`、物理页数`NP`等形状参数是编译期常量
+头数、维度、page、causal、scale、LSE、persistent、CU数以及`B`、`MAX_Q`、物理页数`NP`、Q的token/head步长等形状参数是编译期常量
 （各kernel略有不同）；不同取值会编译新的specialization（见使用文档的集成注意事项）。
 
 ## 2. 数据布局
@@ -107,6 +107,9 @@ PagedAttention(...)                    # functools.cache工厂：校验静态配
   KV长度 = `(页数−1)·page + last`。metadata全部留在GPU上，kernel不回读host，热路径无同步、可被graph捕获。
 - **scale**：FP32；Q可为per-tensor `[1]`或per-token `[T,H,1]`（FP8在量化域计算，BF16通常全1），K/V各一个标量。
   `softmax_scale`默认`Dq^-0.5`。
+- **Q**：`[T,H,Dq]`。gfx950、SWA与gfx942 BF16 Dq/Dv 128/192允许token/head跨步（Dq维步长为1），如融合QKV投影输出的切片，
+  不必先拷贝成连续；gfx942 BF16要求token行间距≥Dq（查询块中超出序列末尾的行由buffer边界读成0），步长是编译期常量。
+  gfx942 FP8与D256要求连续Q。
 - **输出**：O为BF16 `[T,H,Dv]`；可选LSE为FP32 `[T,H]`、自然对数。gfx950与SWA允许空KV序列（输出0；gfx950的LSE为sink或`-inf`），
   gfx942 BF16要求活动序列KV非空，causal时每个序列KV≥Q。
 - **D256线性API**：Q/K/V连续BF16 `[tokens, heads, 256]`；`block_table[B, max_pages]`时K/V是物理行
@@ -117,9 +120,13 @@ PagedAttention(...)                    # functools.cache工厂：校验静态配
 ### 3.1 任务与调度
 
 - 一个任务 = (head, batch, 256行query块)；512线程=8 wave，每wave 32行，QK/PV用`v_mfma_f32_32x32x8_bf16`。
-- `persistent=None/True`（默认）：`min(CU, 任务数)`个常驻CTA按grid-stride取任务，任务序号按head最快、
-  再batch、再query块展开；无原子计数器、无workspace、无初始化dispatch，多stream和graph之间没有共享可变状态。
-  `persistent=False`：普通网格`(H, B, QB)`。两者共用同一个主体。
+- `persistent=None/True`（默认）：`min(CU, 任务数)`个常驻CTA按grid-stride取任务；无原子计数器、无workspace、
+  无初始化dispatch，多stream和graph之间没有共享可变状态。任务按query块从大到小排（causal右下角对齐时qb越大KV越长），
+  块内head最快、再batch；每CU个任务为一轮，奇数轮反向分给CTA（蛇形），使各CTA的KV tile总数接近。
+  `persistent=False`：普通网格`(H, B, QB)`，z映射为`QB−1−z`，硬件先派发最长的query块。两者共用同一个主体。
+  MI300X（304 CU）H16/HK1 causal时最慢CTA比平均多的tile：Q=KV 32768由+14.4%降到+2.0%，Q32768/KV65536 +7.4%→+3.3%，
+  KV262144 +4.6%→+3.8%，Q18432/KV378880 +6.1%→+5.4%（其余来自任务数不能被304整除：2048个任务每CTA 6或7个，
+  1152个每CTA 3或4个）。
 - `waves_per_eu=2`、关闭packed-fp32（`-packed-fp32-ops`）是固定编译属性；后者经`llvm.target_features`设置
   （`passthrough`形式会在lowering中丢失，此前实际未生效，ISA里仍有`v_pk_mul_f32`）。
 
@@ -175,6 +182,14 @@ S7     PV: O dims 64-127 += P V    softmax: new m, S'(t); rescale O and l
   直接改成先舍入再减m（每个分数多一条VALU）实测D128 −4.4%、D192 −3.5%、D128带LSE −2.7%；
   两个分支合并为一个时V192（已溢出到scratch）因多一次dwordx4溢出慢5%。
 - D128每次循环展开两个phase，使`cur/prev`成为常量；D192每次一个phase，槽号由t计算。
+- D192的compute stage按ATT配平（MI300X，32768² causal，8个CU的32个SIMD）：原S1每个MFMA旁放2个exp
+  （16+16+4 = 36周期 > 32周期的32×32×8 MFMA），后12个MFMA空着；S3每个MFMA旁配8条VALU（VOP3窗口要44–48周期）、
+  最后5个MFMA空着；S7的barrier在rescale/reround两个冷分支的跳过（taken跳转）之后，另一组的下一个compute stage
+  因此晚到约36–48周期，S5开头掩码的跳过分支另加8–16周期。现在S1每个MFMA旁1个exp（`_interleave`，另各留1条VALU/SALU），
+  S3前8个MFMA各1个exp+2条VALU、后14个各6条VALU、最后2个留给不透明的`v_perm`（它们不算VALU组，否则会拖在最后
+  一个MFMA之后），掩码移到S4，S7的barrier提到冷分支之前。每SIMD每tile的周期5629→5180（理想5120），
+  SIMD的MFMA忙碌89.9%→97.6%，VGPR仍为256、无spill，输出逐位不变。未采纳：S3只舍入、S4再`v_perm`打包，
+  或改用LLVM可见的`llvm.amdgcn.perm`，都溢出到scratch（每tile约8100周期）。D128的主循环未改动。
 - P与O都用`_pack_bf16`转BF16（软件RNE，NaN不规范化）；O按`O/l·v_descale`转换，由`_store_o_tile_r2g`写回。
   RNE比`+0x8000`（舍入到最近、平局远离零，RTA）每个P多一条VALU，落在VALU已满的S3：相对RTA，D128慢3.8%、
   causal 4.4%、LSE 4.9%、V192 3.5%、D192 0.6%、[164800, 7, 128] 1.7%。import前设置环境变量
@@ -592,6 +607,20 @@ per-token Q scale的结果相差不超过3%。758a1856（每个新最大值都�
   [164800, 7, 128] −0.7%；高精度模式−0.45%到−1.1%。未采纳：S2开头加`s_nop 3`（默认模式−0.8%到+0.2%，
   高精度模式−0.3%到+0.9%）；行和挪进S6或16个全挪（+1.2%、+1.4%）；S5也对齐（多数慢0.2–0.7%）。FP8的softmax
   VALU已按发射口均摊（10-22），四个compute stage都受发射口或MFMA限制，配平只剩S5与S7之间的少量余地。
+- **2026-10-29 任务顺序与D192 stage配平**（MI300X，FlyDSL 0.3.2，见3.1、3.3）：ATT显示MiMo prefill形状
+  （H16/HK1、D192/V128、causal）的SIMD MFMA忙碌89.9%，空闲来自S1/S3的exp与VALU超出MFMA窗口、冷分支推迟barrier，
+  另有静态grid-stride造成的CTA负载不均（Q=KV 32768时最慢CTA多14.4%）。同进程交替计时（同一graph先空跑一次再计时，
+  10–20个样本中位数，新/旧，persistent/grid，输出逐位相同）：D192 causal Q=KV 32768 −13.5%/−12.3%、
+  Q32768/KV65536 −10.1%/−9.5%、KV262144 −6.9%/−6.7%、Q18432/KV378880 −4.8%/−4.2%；D128 causal Q=KV 32768
+  （只受任务顺序影响）−11.5%/−10.8%；D192 full 10240/2583 −3.7%/−3.4%、20480² −2.6%/−2.8%；D128 full持平（±0.2%）。
+  ATT周期下降多于耗时：持续负载时功耗在750 W上限，时钟由约1.07–1.13 GHz降到0.98–1.06 GHz。
+  未做：K(t+1)提前一个stage发起（D192寄存器已满）、跨任务预取下一任务的Q（循环外的开头/收尾占1.9%的时间，其中75%没有MFMA）。
+- **2026-10-29 strided Q**（见第2节）：BF16 D128/D192的Q行/head步长改为编译期常量`QROW`/`QHEAD`，融合QKV的Q切片
+  可直接传入。连续Q的步长就是原常量：D128/D192、LSE、V192、普通网格、full共6个配置的最终ISA与改动前逐字节相同。
+  strided Q的输出与连续Q逐位相同；ISA只在开头的Q地址不同（D128的收尾另多两条O地址的标量移位，连续时与Q共用，
+  O转换的指令顺序随之略变），主循环除寄存器编号外一致。
+  MI300X交替计时：strided与连续Q相差±0.6%以内；相对“拷贝成连续+kernel”，D192 causal Q=KV 32768快1.1%、
+  Q18432/KV378880快0.1%、Q1000/KV2100快7.4%，D128 causal 32768²快0.8%、full 10240/2583快5.2%。
 
 ## 12. 与aiter PR #6576 union评审意见对齐（2026-10-22）
 

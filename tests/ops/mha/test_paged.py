@@ -1,5 +1,7 @@
 """Paged MHA (SHUFFLE-5D KV) correctness: BF16 gfx942/gfx950, FP8 gfx942 and SWA."""
 
+from dataclasses import replace
+
 import torch
 import pytest
 
@@ -99,6 +101,37 @@ def test_bf16_layout_contract(page, dq, dv):
             for buffer in (out, lse):
                 assert bool((buffer[:valid.start] == -123).all())
                 assert bool((buffer[valid.stop:] == -123).all())
+
+
+@pytest.mark.parametrize("dq,dv,return_lse", ((128, 128, False), (192, 128, False), (192, 128, True), (128, 192, False)))
+def test_bf16_strided_q(dq, dv, return_lse):
+    """Q strided over tokens and heads (padded rows, head-major) is bit-exact with contiguous Q."""
+    require("gfx942")
+    case = make_case((0, 7, 33, 513), (31, 33, 97, 545), dq=dq, dv=dv, heads=12, kv_heads=3,
+                     q_offset=5, nonunit_scales=True, source_dtype=torch.bfloat16)
+    padded = torch.zeros(case.q.shape[0], 13, dq + 16, device="cuda", dtype=case.q.dtype)[:, :12, :dq]
+    padded.copy_(case.q)
+    head_major = case.q.transpose(0, 1).contiguous().transpose(0, 1)
+    for backend in (BF16_942, BF16_942_GRID):
+        results = []
+        for q in (case.q, padded, head_major):
+            lse = torch.full(case.q.shape[:2], -123.0, device="cuda") if return_lse else None
+            results.append(make_call(replace(case, q=q), backend, True)[0](return_lse=return_lse, lse=lse))
+        for actual in results[1:]:
+            torch.testing.assert_close(actual, results[0], rtol=0, atol=0)
+
+
+def test_bf16_q_layout_rejections():
+    """D256 reads contiguous Q only; overlapping Q rows would defeat the zero-filled tail rows."""
+    require("gfx942")
+    case = make_case((7,), (33,), dq=256, dv=256, heads=24, kv_heads=2, layout="padded",
+                     source_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="contiguous"):
+        make_call(case, BF16_942, False)[0]()
+    case = make_case((7,), (33,), dq=192, heads=12, kv_heads=3, source_dtype=torch.bfloat16)
+    case = replace(case, q=case.q[:1].expand(case.q.shape[0], -1, -1))
+    with pytest.raises(ValueError, match="rows at least Dq apart"):
+        make_call(case, BF16_942, False)[0]()
 
 
 @pytest.mark.parametrize("backend", (BF16_942, BF16_942_GRID), ids=lambda b: b.name)
