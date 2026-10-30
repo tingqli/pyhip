@@ -62,6 +62,32 @@ def _call(inputs, out=None):
                      prefix_lens=inputs.prefix_lens, softmax_scale=inputs.scale, out=out)
 
 
+def _paged(inputs, pool_rows=None, first_page=1, seed=0, page=64):
+    """(K pool, V pool, int32 slots): each request's packed K/V scattered to random `page`-token
+    pages from `first_page` on, every other pool row NaN (SGLang's QSA pools use page 64)."""
+    lengths = [q + p for q, p in zip(inputs.query_lens, inputs.prefix_lens)]
+    counts = [-(-n // page) for n in lengths]
+    pool_rows = pool_rows or (2 * sum(counts) + first_page) * page
+    pages = first_page + np.random.default_rng(seed).permutation(pool_rows // page - first_page)[:sum(counts)]
+    slots, first = [], 0
+    for n, count in zip(lengths, counts):
+        tokens = np.arange(n)
+        slots.append(pages[first:first + count][tokens // page] * page + tokens % page)
+        first += count
+    slots = torch.from_numpy(np.concatenate(slots).astype(np.int32)).to(inputs.q.device)
+    pools = []
+    for packed in (inputs.k, inputs.v):
+        pool = torch.full((pool_rows, *packed.shape[1:]), float("nan"), dtype=packed.dtype, device=packed.device)
+        pool[slots.long()] = packed
+        pools.append(pool)
+    return (*pools, slots)
+
+
+def _call_paged(inputs, pool_k, pool_v, slots, out=None):
+    return attention(inputs.q, pool_k, pool_v, inputs.indices, query_lens=inputs.query_lens,
+                     prefix_lens=inputs.prefix_lens, softmax_scale=inputs.scale, out=out, kv_slots=slots)
+
+
 def _base(inputs):
     return full_reference(inputs.q, inputs.k, inputs.v, inputs.indices,
                           query_lens=inputs.query_lens, prefix_lens=inputs.prefix_lens, scale=inputs.scale)

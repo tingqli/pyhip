@@ -11,7 +11,8 @@ import torch
 from tests.ops.qsa import _indexer as helpers
 
 
-# Sequence/extend lengths cover short rows, the 512-key boundary and packed prefixes.
+# Sequence/extend lengths cover short rows, the 512-key boundary, packed prefixes, rows crossing 65536 keys
+# (int32 chosen ids) and the 1M-token limit.
 PREFILL_CASES = (
     ((1,), (1,)),
     ((7,), (7,)),
@@ -19,15 +20,20 @@ PREFILL_CASES = (
     ((2052,), (2052,)),
     ((2177,), (129,)),
     ((2055, 16, 13), (7, 0, 9)),
+    ((262148, 300), (128, 300)),
+    ((1048576,), (64,)),
 )
 # Sequence lengths, padding rows and context: 2044-2052 tokens straddle the 512-key top-k on a 528-key page
-# table (not a multiple of 512); 262144 tokens reach the 65536-key limit.
+# table (not a multiple of 512); 262144 tokens fill the uint16 top-k, longer rows select with int32 ids up to
+# the 1M-token limit.
 DECODE_CASES = (
     ((1,), 0, 64),
     ((5, 8, 3, 12), 1, 256),
     ((2044, 2048, 2052), 0, 2112),
     ((12000, 11888, 11667, 11851), 0, 16384),
     ((262144,), 0, 262144),
+    ((262148, 300000, 9), 1, 300032),
+    ((1048576,), 0, 1048576),
 )
 # TARGET_VERIFY windows: first-row lengths cover every alignment of the compression boundary.
 VERIFY_CASES = (
@@ -56,7 +62,7 @@ def _check_prefill(source):
 
 
 @pytest.mark.parametrize("seq_lens,extend_lens", PREFILL_CASES,
-                         ids=("short", "tail", "topk-limit", "topk-over", "prefix", "multi"))
+                         ids=("short", "tail", "topk-limit", "topk-over", "prefix", "multi", "wide", "max-keys"))
 def test_prefill_operator(seq_lens, extend_lens, device):
     _check_prefill(helpers.synthetic(seq_lens, extend_lens, device))
 
@@ -124,7 +130,8 @@ def test_prep_kernels_compile_once(device):
 
 
 @pytest.mark.parametrize("lengths,padding,context", DECODE_CASES,
-                         ids=("short", "mixed-padded", "topk-boundary", "long-ragged", "max-keys"))
+                         ids=("short", "mixed-padded", "topk-boundary", "long-ragged", "narrow-limit", "wide",
+                              "max-keys"))
 def test_decode_operator(lengths, padding, context, device):
     source = helpers.decode_case(lengths, device, padding=padding, context=context)
     expected = helpers.reference_prep(source.inputs, source.state, decode=True)
@@ -200,13 +207,16 @@ def test_verify_graph_replay(device):
     assert _addresses(source) == addresses
 
 
+@pytest.mark.parametrize("split", (False, True), ids=("wave-rows", "split-rows"))
+@pytest.mark.parametrize("counts,stride", (((20000, 600, 65536, 513), 65536),
+                                           ((70000, 600, 262144, 513, 65537), 262144)), ids=("narrow", "wide"))
 @pytest.mark.parametrize("pattern", ("random", "ties", "dense-threshold", "nan", "inf"))
-def test_decode_topk_matches_row_kernel(pattern, device):
-    """The CTA-per-row decode top-k reproduces the one-wave prefill row kernel bit for bit."""
+def test_decode_topk_matches_row_kernel(pattern, counts, stride, split, device, monkeypatch):
+    """The CTA-per-row decode top-k reproduces the prefill row kernel (one wave per row, or a CTA's four
+    waves per row) bit for bit, with uint16 (rows of at most 65536 keys) and int32 chosen ids."""
     from pyhip.ops.qsa.flydsl import indexer_topk
 
-    counts = (20000, 600, 65536, 513)
-    stride = 65536 + 512
+    monkeypatch.setattr(indexer_topk, "SPLIT_KEYS", 0 if split else 1 << 30)
     generator = torch.Generator(device=device).manual_seed(11)
     logits = torch.randn((len(counts), stride), generator=generator, device=device)
     if pattern == "ties":
@@ -221,17 +231,23 @@ def test_decode_topk_matches_row_kernel(pattern, device):
     lengths = torch.tensor(counts, dtype=torch.int32, device=device)
     positions = lengths.long() * 4 + 2
     sequences = (positions + 1).int()
-    decode = torch.full((len(counts), 2051), -7, dtype=torch.int32, device=device)
-    indexer_topk.launch_decode(logits, lengths, positions, sequences, decode)
-    row_info = torch.stack((positions.int(), sequences), dim=1).contiguous()
-    rows = torch.full_like(decode, -7)
-    # The row kernel takes each row's (min bits, ~max bits) from the logits kernel; NaN orders above +inf.
+    # Both kernels take each row's (min bits, ~max bits) from the logits kernel; NaN orders above +inf.
     causal = torch.arange(stride, device=device)[None] < lengths[:, None]
     finite = causal & ~logits.isnan()
     high = torch.where(finite, logits, float("-inf")).amax(1).view(torch.int32)
     high = torch.where((causal & logits.isnan()).any(1), 0x7FC00000, high)
     stats = torch.stack((torch.where(finite, logits, float("inf")).amin(1).view(torch.int32), ~high),
                         dim=1).contiguous()
-    indexer_topk.launch(logits, stride, 0, len(counts), positions, row_info, rows, stats)
+    # Decode holds them in the first of the row's stats slots; the rest stay all ones.
+    slots = torch.full((len(counts), indexer_topk.STAT_SLOTS, 2), -1, dtype=torch.int32, device=device)
+    slots[:, 0] = stats
+    decode = torch.full((len(counts), 2051), -7, dtype=torch.int32, device=device)
+    indexer_topk.launch_decode(logits, lengths, positions, sequences, decode, slots)
+    row_info = torch.stack((positions.int(), sequences), dim=1).contiguous()
+    rows = torch.full_like(decode, -7)
+    # The row kernel reads prefill chunks stored key-block-major.
+    group = indexer_topk.GROUP_KEYS
+    blocked = logits.view(len(counts), stride // group, group).transpose(0, 1).contiguous()
+    indexer_topk.launch(blocked, stride, 0, len(counts), group, positions, row_info, rows, stats)
     torch.cuda.synchronize(device)
     assert torch.equal(decode, rows)

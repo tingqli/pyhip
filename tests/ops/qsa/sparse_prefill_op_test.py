@@ -93,8 +93,9 @@ CASES = {
     **PERF_CASES,
     **{name: shape for name, (shape, _) in CONSTANT_CASES.items()},
 }
-# name -> (captured union layout, layout whose first call then grows the scratch arena)
-GRAPH_CASES = {"graph_ragged_4": ("ragged_4", "chunk_1024_ctx_132096")}
+# name -> (captured union layout, layout whose first call then grows the scratch arena:
+# its packed KV outgrows the captured layout's)
+GRAPH_CASES = {"graph_ragged_4": ("ragged_4", "chunk_1024_ctx_31024_random")}
 
 # Sharing levels of real Qwen3.8 indexer selections at layers 3 and 47.
 CORRELATED_PROFILES = (

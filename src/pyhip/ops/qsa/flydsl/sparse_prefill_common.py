@@ -21,13 +21,12 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 
 # for inline asm and target features
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
-
-import torch
 
 
 def get_gfx_runtime():
@@ -38,7 +37,9 @@ def get_gfx_runtime():
 
 def get_cu_num():
     """CU count of the current GPU, as aiter.jit.utils.chip_info.get_cu_num."""
-    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
 
 
 # ---- Platform calibration and private resource policy ----
@@ -48,6 +49,7 @@ WORKSPACE_CACHE = 8  # layouts kept per process; captured workspaces are never e
 ARENA_GROWTH_PERCENT = 125  # a growing arena takes at least this share of its size
 SCRATCH_ALIGN = 256  # bytes between the scratch views of an arena
 UNION_SCRATCH_LIMIT = 4 << 30  # union scratch bytes; past it a layout runs direct only
+MAX_ROW_PACKED_KV_BYTES = 1 << 30  # PK+PV bytes of the pack_tokens_per_row rule
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,6 +68,9 @@ class Platform:
     union_min_rows_per_head: int
     wide_tiles_per_cu: float  # full H6/H3 prefill: BQ21/BQ42 from this many tiles/CU
     max_packed_kv_bytes: int  # direct packs KV while PK+PV fits, else reads the raw KV
+    # Past that budget, direct still packs a context of at most this many tokens per query row
+    # (packing copies the whole context each call).
+    pack_tokens_per_row: int
 
 
 PLATFORMS = {
@@ -83,6 +88,7 @@ PLATFORMS = {
         union_min_rows_per_head=64,
         wide_tiles_per_cu=1.0,
         max_packed_kv_bytes=64 * 1024 * 1024,
+        pack_tokens_per_row=32,
     ),
 }
 OVERRIDE = "AITER_QSA_PLATFORM"
@@ -273,6 +279,31 @@ def _buffer(tensor, size_bytes):
     """Byte-addressed buffer pointer over tensor; loads at or past size_bytes return zero."""
     return rocdl.make_buffer_ptr(
         fx.recast_iter(fx.Int8, fx.get_iter(tensor)), num_records_bytes=size_bytes
+    )
+
+
+def _buffer_at(address, size_bytes):
+    """Raw buffer resource at a 64-bit global address; loads at or past size_bytes return zero."""
+    pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr"), fx.Int64(address).ir_value())
+    return rocdl.make_buffer_rsrc(
+        ir.Type.parse("!llvm.ptr<8>"),
+        pointer,
+        fx.Int16(0).ir_value(),
+        fx.Int64(size_bytes).ir_value(),
+        fx.Int32(0x27000).ir_value(),
+    )
+
+
+def _raw_words(resource, offset):
+    """Four words at byte offset of a raw buffer resource such as _buffer_at's."""
+    return fx.Vector(
+        rocdl.raw_ptr_buffer_load(
+            ir.VectorType.get([4], fx.Int32.ir_type),
+            resource,
+            fx.Int32(offset),
+            fx.Int32(0),
+            0,
+        )
     )
 
 

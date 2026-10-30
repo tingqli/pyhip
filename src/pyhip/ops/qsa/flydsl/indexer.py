@@ -25,16 +25,23 @@ from .sparse_prefill_prepare import upload
 
 __all__ = ["MAX_COMPRESSED_KEYS", "decode_indexer", "prefill_indexer"]
 
-_LOGITS_BUDGET_BYTES = 256 * 1024 * 1024
-# The top-k kernel keeps chosen block ids as uint16.
-MAX_COMPRESSED_KEYS = 65536
-# Logits CTA tile rows and keys per work item (a multiple of the kernel's 32-key block).
+# Prefill logits chunks stay within the budget, but grow to _CHUNK_ROWS rows (under 2 GiB) so long rows
+# still give the top-k enough CTAs; 1M-token rows then use about 1.1 GiB.
+_LOGITS_BUDGET_BYTES = 512 * 1024 * 1024
+_CHUNK_ROWS = 1024
+# 1M tokens; top-k rows wider than 65536 keys switch to int32 chosen block ids.
+MAX_COMPRESSED_KEYS = 262144
+# Logits CTA tile rows and keys per work item (a multiple of the kernel's 32-key block); prefill logits are
+# stored in key blocks of _KC keys, one top-k slot group each, written block by block.
 _BM, _KC = 128, indexer_logits.ITEM_KEYS
+# Rows sit _PITCH floats apart in a key block: a 2 KiB (512-float) pitch measured 22-26% slower logits.
+_PITCH = _KC + 32
 # Tokens per q-prep program and compressed groups per compress program.
 _TB, _GB = 8, 16
 _TOPK, _RATIO, _WIDTH = 512, 4, 2051
 # The top-k kernel reads rows up to the next 512-value boundary (8 slots x 64 lanes).
 _PAD = 512
+_STAT_SLOTS = tl.constexpr(indexer_topk.STAT_SLOTS)
 
 
 @triton.jit
@@ -143,14 +150,17 @@ def _ring_member(KeyState, loc, own, key, cols, D: tl.constexpr):
     return tl.where(own, key, tl.load(KeyState + loc * D + cols)).to(tl.float32)
 
 
-@triton.jit(do_not_specialize=["position_stride"])
+@triton.jit(do_not_specialize=["position_stride", "stat_words"])
 def _indexer_decode_prep(QK, Q, QWeight, KWeight, KeyState, RopeState, Compressed, Slots, GroupLocs, WriteLocs,
-                         Positions, position_stride, Cache, Axis, n_cols, q_eps, k_eps, H: tl.constexpr,
-                         D: tl.constexpr, ROT: tl.constexpr, RATIO: tl.constexpr, CACHE_STRIDE: tl.constexpr,
-                         COMPRESS: tl.constexpr):
+                         Positions, position_stride, Cache, Axis, Stats, stat_words, n_cols, q_eps, k_eps,
+                         H: tl.constexpr, D: tl.constexpr, ROT: tl.constexpr, RATIO: tl.constexpr,
+                         CACHE_STRIDE: tl.constexpr, COMPRESS: tl.constexpr):
     # One CUDA-graph decode row: q norm/RoPE, pending-ring store, then SGLang's fixed-shape
     # compression of the group ending at this token (oldest member first, written to WriteLocs).
     row = tl.program_id(0)
+    # Long rows' logits (min bits, ~max bits) slots start all ones; the logits kernel folds into them.
+    words = tl.arange(0, 2 * _STAT_SLOTS)
+    tl.store(Stats + row * stat_words + words, tl.full((2 * _STAT_SLOTS,), -1, tl.int32), mask=words < stat_words)
     cols = tl.arange(0, D)
     other = _partner(cols, ROT)
     heads = tl.arange(0, H)
@@ -245,7 +255,9 @@ class _Layout:
             while end < len(owner):
                 grown = max(width, -(-int(bounds[end]) // 4) * 4)
                 rows = int(firsts[end] + sizes[end] - firsts[begin])
-                if end > begin and rows * grown * 4 > _LOGITS_BUDGET_BYTES:
+                size = rows * -(-grown // _KC) * _PITCH * 4
+                if end > begin and (size >= 2**31 or size > _LOGITS_BUDGET_BYTES
+                                    and firsts[end] - firsts[begin] >= _CHUNK_ROWS):
                     break
                 width, end = grown, end + 1
             row0 = int(firsts[begin])
@@ -254,10 +266,13 @@ class _Layout:
             steps = -(-bounds[keep] // _KC)
             tile = np.repeat(keep, steps)
             key = (np.arange(len(tile)) - np.repeat(np.cumsum(steps) - steps, steps)) * _KC
+            # Consecutive CTAs fill one key block's consecutive tiles: a sequential write stream.
+            order = np.lexsort((tile, key))
+            tile, key = tile[order], key[order]
             parts.append(np.stack((firsts[tile], firsts[tile] - row0, sizes[tile], owner[tile], key,
                                    np.minimum(key + _KC, bounds[tile])), axis=1).reshape(-1))
             chunks.append((row0, rows, width, len(tile)))
-            self.logits_elements = max(self.logits_elements, rows * width)
+            self.logits_elements = max(self.logits_elements, rows * -(-width // _KC) * _PITCH)
             begin = end
         # One pinned asynchronous upload: a new layout never drains the stream.
         data = upload(np.concatenate(parts), device)
@@ -389,12 +404,13 @@ def prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key
     logits = torch.empty(max(layout.logits_elements, 1) + _PAD, dtype=torch.float32, device=device)
     scale = float(np.float32(1.0) / np.float32(math.sqrt(head_dim)))
     for chunk in layout.chunks:
-        view = logits[:chunk.rows * chunk.width].view(chunk.rows, chunk.width)
+        view = logits[:chunk.rows * -(-chunk.width // _KC) * _PITCH]
         # The first call compiles the logits kernel even without work, so no later request does.
         if chunk.items.shape[0] or q.device not in indexer_logits._COMPILED:
-            indexer_logits.launch(q, compressed, token_slot_table, view, chunk.items, chunk.width, scale, stats)
-        indexer_topk.launch(view, chunk.width, chunk.row0, chunk.rows, logical_positions, layout.row_info, out,
-                            stats)
+            indexer_logits.launch(q, compressed, token_slot_table, view, chunk.items, chunk.rows, _PITCH, scale,
+                                  stats)
+        indexer_topk.launch(view, chunk.width, chunk.row0, chunk.rows, _PITCH, logical_positions, layout.row_info,
+                            out, stats)
     return out
 
 
@@ -412,11 +428,12 @@ def decode_indexer(qk, *, positions, logical_positions, state_slots, key_state, 
     request, so the compression runs as a second launch after every row's ring store, in SGLang's order.
 
     Selection reads ``compressed`` as 16-key pages: page p of a row holds keys 16 * page_table[row, p] +
-    [0, 16) (``page_table`` int32 [rows, pages], at most 65536 keys per row). ``lengths``, ``logical_positions``
-    and ``seq_lens`` (int32 [rows]; ``logical_positions`` may be int64) are each row's compressed-key count,
-    query position and sequence length. Everything stays on device, so the call is CUDA-graph capturable
-    after an eager warmup. If given, ``q_out`` (BF16 [rows, 4, D]) receives the normalized index queries and
-    ``logits_out`` (FP32 [rows, 16 * pages] whose storage extends 512 values past it) the logits.
+    [0, 16) (``page_table`` int32 [rows, pages], at most ``MAX_COMPRESSED_KEYS`` keys per row). ``lengths``,
+    ``logical_positions`` and ``seq_lens`` (int32 [rows]; ``logical_positions`` may be int64) are each row's
+    compressed-key count, query position and sequence length. Everything stays on device, so the call is
+    CUDA-graph capturable after an eager warmup. If given, ``q_out`` (BF16 [rows, 4, D]) receives the
+    normalized index queries and ``logits_out`` (FP32 [rows, 16 * pages] whose storage extends 512 values
+    past it) the logits.
     """
     if qk.ndim != 2 or page_table.ndim != 2 or 0 in (qk.shape[0], page_table.shape[1]):
         raise ValueError("qk and page_table must be 2-D with at least one row and one page")
@@ -424,6 +441,9 @@ def decode_indexer(qk, *, positions, logical_positions, state_slots, key_state, 
     width = page_table.shape[1] * 16
     if width > MAX_COMPRESSED_KEYS:
         raise ValueError(f"Decode supports at most {MAX_COMPRESSED_KEYS} compressed keys per row")
+    # Top-k addresses the logits with 32-bit byte offsets.
+    if (rows * width + _PAD) * 4 >= 2**31:
+        raise ValueError("Decode logits must stay under 2 GiB")
     rotary_dim = _check_shared(qk, rows, heads, positions, state_slots, key_state, rope_state, compressed,
                                cos_sin_cache, axis_map, q_weight, k_weight)
     for tensor, name in ((write_locs, "write_locs"), (lengths, "lengths")):
@@ -449,18 +469,22 @@ def decode_indexer(qk, *, positions, logical_positions, state_slots, key_state, 
     if logits is None:
         logits = torch.empty(rows * width + _PAD, dtype=torch.float32, device=qk.device)[:rows * width]
         logits = logits.view(rows, width)
+    stats = torch.empty((rows, indexer_topk.STAT_SLOTS, 2), dtype=torch.int32, device=qk.device)
+    # Rows wider than LONG_KEYS select over several CTAs from the logits kernel's stats.
+    long = width > indexer_topk.LONG_KEYS
     _indexer_decode_prep[(rows,)](qk, q, q_weight, k_weight, key_state, rope_state, compressed, state_slots,
                                   group_locs, write_locs, positions,
-                                  positions.stride(0) if positions.ndim == 2 else 0, cos_sin_cache, axis_map,
-                                  head_dim, q_eps, k_eps, H=heads, D=head_dim, ROT=rotary_dim, RATIO=_RATIO,
-                                  CACHE_STRIDE=cos_sin_cache.stride(0), COMPRESS=not verify, num_warps=4)
+                                  positions.stride(0) if positions.ndim == 2 else 0, cos_sin_cache, axis_map, stats,
+                                  stats[0].numel() if long else 0, head_dim, q_eps, k_eps, H=heads, D=head_dim,
+                                  ROT=rotary_dim, RATIO=_RATIO, CACHE_STRIDE=cos_sin_cache.stride(0),
+                                  COMPRESS=not verify, num_warps=4)
     if verify:
         _indexer_ring_compress[(rows,)](key_state, rope_state, compressed, group_locs, write_locs, cos_sin_cache,
                                         axis_map, k_weight, head_dim, k_eps, D=head_dim, ROT=rotary_dim,
                                         RATIO=_RATIO, CACHE_STRIDE=cos_sin_cache.stride(0), num_warps=4)
     out = torch.empty((rows, _WIDTH), dtype=torch.int32, device=qk.device)
     indexer_decode.launch(q, compressed, page_table, lengths, logits,
-                          float(np.float32(1.0) / np.float32(math.sqrt(head_dim))))
+                          float(np.float32(1.0) / np.float32(math.sqrt(head_dim))), stats if long else None)
     indexer_topk.launch_decode(logits, lengths.contiguous(), logical_positions.contiguous(), seq_lens.contiguous(),
-                               out)
+                               out, stats if long else None)
     return out

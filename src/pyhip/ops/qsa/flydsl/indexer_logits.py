@@ -87,7 +87,7 @@ def _scores(key, query):
     return [_relu(value) for value in acc]
 
 
-def _store(relu, output, block, end, column, half, stride, scale, low, high):
+def _store(relu, output, block, end, column, half, start, pitch, scale, low, high):
     # Also folds the bits of every key the tile writes for this row (all logits are >= 0, so
     # unsigned bit order is float order and any NaN sorts above +inf) into its running min/max.
     for j in range(4):
@@ -103,9 +103,9 @@ def _store(relu, output, block, end, column, half, stride, scale, low, high):
                 low, high = _umin(low, bits), _umax(high, bits)
                 words.append(bits)
         # A 4-key group past `end` is dropped; a partial group only spills into columns
-        # [end, end + 3], which no row reads as a causal logit.
+        # [end, end + 3] of the item's key block, which no row reads as a causal logit.
         group = block + 8 * j + 4 * half
-        offset = (group < end).select((column * stride + group) * 4, fx.Int32(_DROP))
+        offset = (group < end).select((column * pitch + group - start) * 4, fx.Int32(_DROP))
         rocdl.raw_ptr_buffer_store(fx.Vector.from_elements(words, fx.Int32).ir_value(), output,
                                    offset.ir_value(), fx.Int32(0).ir_value(), aux=rocdl_aux(0))
     return low, high
@@ -118,7 +118,7 @@ def _fold(stats, offset, value):
 
 @flyc.kernel(name="qsa_indexer_logits", known_block_size=[256, 1, 1])
 def _kernel(Q: fx.Tensor, K: fx.Tensor, TABLE: fx.Tensor, LOGITS: fx.Tensor, ITEMS: fx.Tensor, STATS: fx.Tensor,
-            table_stride: fx.Int32, key_bytes: fx.Int32, stride: fx.Int32, scale: fx.Float32):
+            table_stride: fx.Int32, key_bytes: fx.Int32, block_stride: fx.Int32, pitch: fx.Int32, scale: fx.Float32):
     # Key c's 16-byte chunk j lives at c * 16 + (j ^ (c & 7)): conflict-free ds_read_b128. The
     # item's key byte offsets in the compressed pool follow the two key blocks.
     storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, 2 * BLOCK_BYTES + 4 * ITEM_KEYS, 16]).peek()
@@ -146,9 +146,11 @@ def _kernel(Q: fx.Tensor, K: fx.Tensor, TABLE: fx.Tensor, LOGITS: fx.Tensor, ITE
               for i in range(8)] for h in range(HEADS)]
 
     # Buffer stores are range checked against the wave's rows, so padded rows are dropped without
-    # branches; 4-key groups starting past `end` push their offset out of range.
-    output = _buffer(fx.make_view(fx.get_iter(LOGITS) + fx.Int64(local0 + 32 * wave) * fx.Int64(stride),
-                                  fx.make_layout(1, 1)), wave_rows * stride * 4)
+    # branches; 4-key groups starting past `end` push their offset out of range. An item covers one
+    # 512-key block, so its rows' logits are one contiguous stretch.
+    output = _buffer(fx.make_view(fx.get_iter(LOGITS) + fx.Int64(start // ITEM_KEYS) * fx.Int64(block_stride)
+                                  + fx.Int64(local0 + 32 * wave) * fx.Int64(pitch), fx.make_layout(1, 1)),
+                     wave_rows * pitch * 4)
     # Thread t copies 32 bytes (chunks 2(t%8), 2(t%8)+1) of key t/8 of each block into LDS.
     copy_key, copy_chunk = tid >> 3, (tid & 7) * 2
     keys = _buffer(fx.make_view(fx.get_iter(K), fx.make_layout(1, 1)), key_bytes)
@@ -176,7 +178,7 @@ def _kernel(Q: fx.Tensor, K: fx.Tensor, TABLE: fx.Tensor, LOGITS: fx.Tensor, ITE
             upcoming = _lds_load_word(offsets + _min(current + 2 * BLOCK - start + copy_key, ITEM_KEYS - 1) * 4)
         base = shared + buffer * (BLOCK * 256)
         key = [_lds_load(base + address) for address in read]
-        low, high = _store(_scores(key, query), output, current, end, column, half, stride, scale, low, high)
+        low, high = _store(_scores(key, query), output, current, end, column, half, start, pitch, scale, low, high)
         if more:
             base = shared + (buffer ^ 1) * (BLOCK * 256)
             _lds_store(base + stage0, staged0)
@@ -195,32 +197,33 @@ def _kernel(Q: fx.Tensor, K: fx.Tensor, TABLE: fx.Tensor, LOGITS: fx.Tensor, ITE
 
 @flyc.jit
 def _launch(Q: fx.Tensor, K: fx.Tensor, TABLE: fx.Tensor, LOGITS: fx.Tensor, ITEMS: fx.Tensor, STATS: fx.Tensor,
-            table_stride: fx.Int32, key_bytes: fx.Int32, stride: fx.Int32, scale: fx.Float32, items: fx.Int32,
-            stream: fx.Stream):
+            table_stride: fx.Int32, key_bytes: fx.Int32, block_stride: fx.Int32, pitch: fx.Int32, scale: fx.Float32,
+            items: fx.Int32, stream: fx.Stream):
     if items > 0:
-        _kernel(Q, K, TABLE, LOGITS, ITEMS, STATS, table_stride, key_bytes, stride, scale,
+        _kernel(Q, K, TABLE, LOGITS, ITEMS, STATS, table_stride, key_bytes, block_stride, pitch, scale,
                 value_attrs={"rocdl.waves_per_eu": 2}).launch(grid=(items, 1, 1), block=(256, 1, 1), stream=stream)
 
 
 _COMPILED = {}
 
 
-def launch(q, compressed, table, logits, items, stride, scale, stats):
+def launch(q, compressed, table, logits, items, rows, pitch, scale, stats):
     """items: [n, 6] int32 (row0, local0, rows <= 128, request, start, end), one CTA each; wave w
-    owns rows [32w, 32w + 32) and writes logits row local0 + 32w + m. Key j of the request is
-    compressed slot table[request, 4j] / 4 (compressed: [slots, 1, 128] BF16 < 2 GiB; table:
-    int32 rows with unit column stride). Chunk ends other than the tile's causal bound are
-    multiples of 32, and the row stride is a multiple of 4. stats [rows, 2] int32 must start all
-    ones: each row folds in (min bits, ~max bits) of the keys its tiles write, a superset of its
-    causal keys."""
+    owns rows [32w, 32w + 32). Key j of the request is compressed slot table[request, 4j] / 4
+    (compressed: [slots, 1, 128] BF16 < 2 GiB; table: int32 rows with unit column stride). Logits of
+    the chunk's `rows` rows are key-block-major: key j of row r at
+    [(j // ITEM_KEYS) * rows + r] * pitch + j % ITEM_KEYS (pitch >= ITEM_KEYS, a multiple of 4). Item
+    starts are multiples of ITEM_KEYS, and ends other than the tile's causal bound multiples of 32.
+    stats [rows, 2] int32 must start all ones: each row folds in (min bits, ~max bits) of the keys its
+    tiles write, a superset of its causal keys."""
     stream = torch.cuda.current_stream(q.device)
     flat_table = table.as_strided(((table.shape[0] - 1) * table.stride(0) + table.shape[1],), (1,))
     args = (q.view(-1), compressed.view(-1), flat_table, logits.view(-1), items.view(-1), stats.view(-1),
-            table.stride(0), compressed.numel() * 2, stride, scale, items.shape[0], stream)
+            table.stride(0), compressed.numel() * 2, rows * pitch, pitch, scale, items.shape[0], stream)
     with torch.cuda.device(q.device):
         compiled = _COMPILED.get(q.device)
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm the QSA indexer before graph capture")
-            compiled = _COMPILED[q.device] = flyc.compile(_launch, *args[:10], 0, stream)
+            compiled = _COMPILED[q.device] = flyc.compile(_launch, *args[:11], 0, stream)
         compiled(*args)
