@@ -1,6 +1,6 @@
 # QSA实现与优化记录
 
-本目录是gfx942 QSA attention与indexer的生产实现，使用方法、测试命令和当前性能见[benchmark说明](../../../../../benchmarks/qsa/readme.md)。第0–3节对应当前源码（2026-10-30，attention按AITER#6576的结构重排之后），说明每个kernel的作用、数据流和伪代码，行号链接指向函数定义；第4节是文件、接口、编译、已知限制和当前数据来源；第5节是优化历史。
+本目录是gfx942 QSA attention与indexer的生产实现，使用方法、测试命令和当前性能见[benchmark说明](../../../../../benchmarks/qsa/readme.md)。第0–3节对应当前源码（2026-10-30，attention按AITER#6576的结构重排、raw direct改按K3的行组列表发CTA之后），说明每个kernel的作用、数据流和伪代码，行号链接指向函数定义；第4节是文件、接口、编译、已知限制和当前数据来源；第5节是优化历史。
 
 - [benchmark说明](../../../../../benchmarks/qsa/readme.md)只记录当前使用说明、最终有效性能和验收状态。改动、评估、回退和未采用的方案只追加到第5节，每项写清改动、结果和证据；源码改动后同步第0–4节。
 - 原始数据、trace和冻结源码保留在mytest/mydata，不改写。功能通过、单kernel性能、完整调用和服务结果分别表述。
@@ -26,11 +26,11 @@ Attention沿用AITER [#6576](https://github.com/ROCm/aiter/pull/6576)（`2544b29
 |---|---|---|---|
 | K1 | sparse_prefill_recover_scatter（名称沿用AITER，那里K1还把行位散射进dense位图） | ⌈M/4⌉×256，每行一个wave | 不校验选择；把每行的T个块号还原并升序排序，写block_indices |
 | K2 | sparse_prefill_compact | tiles×256（BQ≤21）或×512（BQ32/42），动态LDS≤32KiB | 读tile各行的block_indices求并集：计数、逐tile提案、压缩块表与成员；program 0复位direct_flag |
-| K3 | sparse_prefill_order_masks | (排序CTA+tiles)×256 | 全局路由（步数阈值）、union任务排序与active、精确mask；有slot表时另写池块号和尾行 |
+| K3 | sparse_prefill_order_masks | (排序CTA+tiles+列表CTA)×256 | 全局路由（步数阈值）、union任务排序与active、精确mask；有slot表时另写池块号和尾行；raw direct有union计划时另写含direct行的行组列表 |
 | K5 | sparse_prefill_union_bf16_d256 | min(tasks, CU)×512，64KiB | tile内query共享并集块，M128×N64流水 |
-| K6 | sparse_prefill_pack_kv_bf16_d256（gated时为…_pack_kv_gated_bf16_d256） | ⌈packed块·HK/8⌉×256 | 各请求KV按4-token块重排成MFMA操作数顺序；gated时先读direct_flag |
+| K6 | sparse_prefill_pack_kv_bf16_d256（gated时为…_pack_kv_gated_bf16_d256） | ⌈packed块·HK/8⌉×256 | 各请求KV按4-token块重排成MFMA操作数顺序；gated时先读direct_flag[0] |
 | K7 | sparse_prefill_direct_packed_bf16_d256 | gated为(BQ·HK, tiles)×64，否则rows·HK×64；8KiB | union未接手的行，每wave一个query×一个KV头 |
-| K7′ | sparse_prefill_direct_bf16_d256（raw，不打包时，见1.2.2） | Σ⌈rows_r/4⌉·HK×256，32KiB | 同上；4个wave为同请求连续4个query，直接读原KV |
+| K7′ | sparse_prefill_direct_bf16_d256（raw，不打包时，见1.2.2） | Σ⌈rows_r/4⌉·HK×256，32KiB | 同上；4个wave为同请求连续4个query，直接读原KV；有union计划时前面的CTA按K3的列表取行组 |
 
 传入`kv_slots`时K/V是token池（见1.2.9）：launch序列不变，K3另为union tile写池块号和尾行，K5、K6、K7′按池行取址，K1、K2和packed K7不变；池的字节跨度超过`_MAX_SPAN`（4GiB−1MiB）时K7′换成64位global读的WIDE变体。
 
@@ -42,10 +42,11 @@ attention把query分成两路计算：union让一个tile的BQ行共享这些行�
 
 1. **K1（每行一个wave）**：把该行选中的至多T个完整块（T = (indices宽度−3)/4，256/512/768/1024）还原成块号并升序排序，写入`block_indices`，K2和direct都读它。K1不检查选择布局（见1.2.3）。
 2. **K2（每tile一个CTA）**：读本tile各行的`block_indices`和各行的因果尾块，求出`blocks`（tile内各行所选块的并集，升序）和`membership`（每块被哪些行选中，第i位是tile的第i行）。tile的因果范围放得进LDS时，每个块号一个成员字，各行把自己那一位原子或进LDS，再按块号顺序压缩非0的字；范围更长时每次处理65536个块的窗口：先置存在位图，对位图做前缀和得到每块在并集里的序号，再按序号在LDS里累积成员字。例如tile首行是第100行，第103行选了块5，块5的成员字就有第3位。代价比较：direct为各行BN32步数之和；union为并集块数按16对齐，一个N64步记为16个BN32步。union不超过direct的1.7倍时提案为1（union），否则为0（direct）；超过1.7倍就停止压缩。
-3. **K3（一次launch，两类CTA并行）**：
-   - 排序CTA汇总全部tile的提案和代价，用标定的延迟模型选一个步数阈值L：union只保留步数≤L的提案1 tile，更长的改走direct。只有union受最长任务限制时，才在8档L（全部保留、6档降级、全部不保留）里选模型最快的一档，而且须比全部保留快5%以上。然后写`active[tile]`和`direct_flag`，并把union任务（tile×KV头×128行切片）按N64步数降序、蛇形排进持久grid（`task_order`）。
+3. **K3（一次launch，三类CTA并行）**：
+   - 排序CTA汇总全部tile的提案和代价，用标定的延迟模型选一个步数阈值L：union只保留步数≤L的提案1 tile，更长的改走direct。只有union受最长任务限制时，才在8档L（全部保留、6档降级、全部不保留）里选模型最快的一档，而且须比全部保留快5%以上。然后写`active[tile]`和`direct_flag[0]`，并把union任务（tile×KV头×128行切片）按N64步数降序、蛇形排进持久grid（`task_order`）。
    - mask CTA为提案1的tile生成`score_masks`：对每个N64步、每个query，标出该query选中且因果可见的token。mask与路由并行生成，被路由改走direct的tile，其mask不会被读取。
-4. **之后**：K5 union按`task_order`只处理active的tile；`direct_flag`=1时，K6先把KV重排成direct的操作数顺序，K7再处理非active tile的行。不建计划时，K6/K7无条件执行，K7处理全部行。
+   - 列表CTA（只在direct走raw且有union计划时有，每256个raw行组一个）：自己也算一遍L，找出含走direct的行的行组（同请求连续4行），把编号写进`direct_list`，个数累加到`direct_flag[1]`。
+4. **之后**：K5 union按`task_order`只处理active的tile；`direct_flag[0]`=1时，K6先把KV重排成direct的操作数顺序，K7再处理非active tile的行；raw时K7′的前`direct_flag[1]`个CTA按`direct_list`取行组。不建计划时，K6/K7（或K7′）无条件执行，处理全部行。
 
 三个launch之间的kernel边界就是全局同步点：K2要等tile内所有行写完`block_indices`，K3的路由要等所有tile算完代价。在kernel内部做全局同步更慢（见第5节“10-02 K1–K4的减少与融合”）。
 
@@ -54,7 +55,8 @@ attention把query分成两路计算：union让一个tile的BQ行共享这些行�
 | `block_indices[M,T]` | K1 | K2、K7 | 每行升序块号，其余为-1 |
 | `blocks`、`membership[tiles,CAP]` | K2 | K3 mask CTA；K5只读`blocks` | tile并集的块号（升序）和成员位 |
 | `counts[tiles]`、`costs[tiles,3]` | K2 | K3；K5另读`counts` | 并集块数；(direct步数, 最长行步数, 提案) |
-| `active[tiles]`、`direct_flag` | K3（`direct_flag`先由K2清0） | K5、K6、K7 | tile是否走union；是否有行走direct |
+| `active[tiles]`、`direct_flag[2]` | K3（`direct_flag`先由K2清0） | K5、K6、K7、K7′ | tile是否走union；[0]是否有行走direct，[1]是`direct_list`的长度 |
+| `direct_list[raw行组数]` | K3列表CTA | K7′ | 含direct行的raw行组编号（CTA内按编号升序，CTA之间的先后不定） |
 | `task_order` | K3 | K5 | union任务的执行顺序 |
 | `score_masks[tiles,CAP/16,BQ,4]` | K3 | K5 | 每N64步、每query要保留的token位（int16） |
 
@@ -88,7 +90,7 @@ attention(q[M,H,256], k/v[N,HK,256], indices[M,4T+3], query_lens?, prefix_lens?,
 
 没有首次调用预编译：每个kernel变体在第一次用到时编译（见4.3）。
 
-#### 1.2.2 工作区、scratch与计划（[_Arena](attention.py#L50)、[_Workspace](attention.py#L76)、[allocate_plan](sparse_prefill_prepare.py#L1275)、[direct.prepare](sparse_prefill_direct.py#L169)）
+#### 1.2.2 工作区、scratch与计划（[_Arena](attention.py#L50)、[_Workspace](attention.py#L76)、[allocate_plan](sparse_prefill_prepare.py#L1375)、[direct.prepare](sparse_prefill_direct.py#L171)）
 
 ```python
 class _Workspace:      # 每个新的(device, stream, layout)创建一次
@@ -119,7 +121,7 @@ allocate_plan:
     MAXB = ceil(max_kv/4)；CAP = 16·ceil(min(MAXB, BQ·(T+1))/16)
     slices = ceil(BQ·G/128)；tasks = tiles·HK·slices；grid = min(tasks, CU)   # union CTA用满一个CU的64KiB LDS
     route_costs = (HK·slices/grid, direct_cu_step·HK/CU, direct_fixed + pack_block·packed块数·HK)   # µs，Platform的MI308X标定：0.304、41、0.0041
-    设备张量：metadata、counts[tiles]、costs[tiles,3]、active[tiles]、task_order、direct_flag、query_tiles[M]
+    设备张量：metadata、counts[tiles]、costs[tiles,3]、active[tiles]、task_order、direct_flag[2]、query_tiles[M]
     arena：blocks/membership[tiles,CAP]（成员BQ>32时为i64）、score_masks[tiles,CAP/16,BQ,4] i16
     slotted时另有pool_blocks[tiles,CAP]、tails[tiles]（K3写、K5读）
 
@@ -133,11 +135,13 @@ direct.prepare:
         # slotted时raw的k_start/kv_len是slot表中的下标范围；packed时pack从池里读，PK/PV与原来相同
     packed时 pack_sources[b] = 所属请求的k_start + 4·(块在请求内的序号)；PK/PV [Σblocks·4, HK, 256]放arena
     gated = (union存在)：复用union的active、query_tiles、direct_flag、metadata、BQ；否则用无关张量占位
+    raw且gated：group_list = empty(行组数)；把direct的meta和group_list交给union计划（direct_meta、direct_list、direct_groups = 行组数），
+        K3据此加列表CTA；其它情况direct_groups = 0，K3不加
 ```
 
 Platform（[sparse_prefill_common.py](sparse_prefill_common.py#L56)）按gfx型号和CU数取MI308X的标定（路由模型系数、union阈值1.7、建计划的最少行数、打包预算等）；环境变量`AITER_QSA_PLATFORM`可覆盖其中的项（如`union_step=3.0,max_packed_kv_bytes=0`），只用于实验。
 
-#### 1.2.3 K1 恢复（[_recover_kernel](sparse_prefill_prepare.py#L245)、[_recover_row](sparse_prefill_prepare.py#L201)）
+#### 1.2.3 K1 恢复（[_recover_kernel](sparse_prefill_prepare.py#L251)、[_recover_row](sparse_prefill_prepare.py#L207)）
 
 ```python
 # 每CTA 4个wave，每个wave一行；从最后一行发起：因果请求里越靠后的行可见块越多，先发最重的行
@@ -154,11 +158,11 @@ block_indices[row, col] = blk[col] if col < C else -1   # K2（并集）和K7（
 
 K1不检查选择布局：组内4个token不连续、块重复、超出因果范围或缺少因果尾时结果错误，不报错；同一stream的工作区共用scratch，错误还可能影响该stream之后的调用。因果尾不由K1读，K2、K3和direct都按位置推出（最后不满4个的token）。名称里的scatter来自AITER，那里K1还把行位写进dense位图；本仓库的K2直接读`block_indices`求并集（10-29），K1不散射。
 
-#### 1.2.4 K2 计数/公式/并集（[_tile](sparse_prefill_prepare.py#L622)、[_dense](sparse_prefill_prepare.py#L528)、[_window](sparse_prefill_prepare.py#L577)、[_blocks](sparse_prefill_prepare.py#L450)、[lds_layout](sparse_prefill_prepare.py#L824)）
+#### 1.2.4 K2 计数/公式/并集（[_tile](sparse_prefill_prepare.py#L628)、[_dense](sparse_prefill_prepare.py#L534)、[_window](sparse_prefill_prepare.py#L583)、[_blocks](sparse_prefill_prepare.py#L456)、[lds_layout](sparse_prefill_prepare.py#L832)）
 
 ```python
 # 每tile一个CTA：BQ≤21时256线程，BQ为32/42时512线程；从最后一个tile发起（因果请求里最后的tile块最多）
-# program 0顺便把direct_flag清0，K3发现有tile不走union时再置1
+# program 0顺便把direct_flag的两个字清0：K3发现有tile不走union时把[0]置1，列表CTA在[1]上累加行组数
 rows, pos0 = meta[tile]                         # tile的行数、首行位置
 end = min(MAXB, ceil((pos0+rows)/4))            # 最后一行可见的块数：各行的块都在[0, end)内
 
@@ -203,15 +207,16 @@ costs[tile] = (direct_tiles, longest, 1 if 未超出预算 else 0)
 # 工作量随选中的块数增长；只有窗口路径每32个块另加一个位图字，1M时每tile最多4个窗口
 ```
 
-#### 1.2.5 K3 路由/排序/mask（[_order_masks_kernel](sparse_prefill_prepare.py#L1077)、[_route](sparse_prefill_prepare.py#L879)、[_route_cost](sparse_prefill_prepare.py#L849)、[_order](sparse_prefill_prepare.py#L942)、[_masks](sparse_prefill_prepare.py#L1007)）
+#### 1.2.5 K3 路由/排序/mask（[_order_masks_kernel](sparse_prefill_prepare.py#L1146)、[_route](sparse_prefill_prepare.py#L887)、[_route_cost](sparse_prefill_prepare.py#L857)、[_order](sparse_prefill_prepare.py#L950)、[_masks](sparse_prefill_prepare.py#L1076)、[_direct_groups](sparse_prefill_prepare.py#L1024)）
 
-K3是一次launch里两类互不依赖、并行执行的CTA：
+K3是一次launch里三类互不依赖、并行执行的CTA：
 
 - 排序CTA（`task_order`长度不超过4096时只有1个）：
   1. 全局路由：算出一个步数阈值L，union只保留N64步数不超过L的提案1 tile，更长的改走direct。只有union受最长任务限制时L才会小于最长步数（降级最长的一批，最多全部改走direct），否则保留全部提案1 tile。
-  2. 发布结果：`active[tile]`（1 = 走union）；有任一tile走direct时`direct_flag` = 1，K6/K7据此决定是否执行。
+  2. 发布结果：`active[tile]`（1 = 走union）；有任一tile走direct时`direct_flag[0]` = 1，K6/K7据此决定是否执行（raw的K7′看列表CTA写的`direct_flag[1]`）。
   3. 给union任务排序：任务 = (tile, KV头, 128行切片)，按N64步数从长到短排，再蛇形分给持久grid的各CTA，写入`task_order`。
 - mask CTA（每tile一个，4个wave各管1/4的N64步）：为提案1的tile生成`score_masks`，即每个N64步、每个query在64个key列里要保留哪些token。mask只依赖K2的输出，不等路由结果；被路由改走direct的tile，其mask不会被K5读取。
+- 列表CTA（direct走raw且有union计划时才有，每256个raw行组一个，每线程一个行组）：与排序CTA一样先算L，再按与`_order`相同的判据检查行组的4行，有一行所在tile不走union就把行组编号写进`direct_list`。K7′的gated grid仍是每个行组一个CTA（×HK），但前`direct_flag[1]`个按列表取行组、其余立即退出，有计算的CTA编号连续（见1.2.8与第5节10-30（续3））。
 
 输入：K2写的`counts`（并集块数U）、`costs`（direct步数和、最长行步数、提案）、`blocks`/`membership`和`meta`。host参数：TASKS = tiles·HK·slices、GRID、排序宽度SIZE、键移位SHIFT/WIDE、排序CTA数、QB（=BQ）、CAP，以及`allocate_plan`按layout算好的三个时延系数：TASK_SHARE = HK·slices/grid，DIRECT_STEP = 0.304·HK/CU，DIRECT_FIXED = 41 + 0.0041·packed块数·HK。下文的各系数（10、3.2、0.7、0.05、41、0.0041、0.304）都取自Platform（见1.2.2）。
 
@@ -290,13 +295,14 @@ slices = ceil(BQ·G/128)；TASKS = tiles·HK·slices
 numel = len(task_order) = ceil(TASKS/GRID)·GRID
 SIZE = min(numel, 4096)；order_ctas = ceil(numel/SIZE)
 SHIFT = max(1, bit_length(TASKS−1))；WIDE = ((CAP/16) << SHIFT) + TASKS−1 ≥ 2^31      # 键是否要用int64
-grid = order_ctas + tiles                         # 每个tile一个mask CTA；所有CTA都是4 warps
+grid = order_ctas + tiles + ceil(groups/256)     # 每个tile一个mask CTA；groups = plan.direct_groups（raw且gated时为raw行组数，否则为0）；所有CTA都是4 warps
 # SIZE、SHIFT、QB、CAP、TASKS都是运行时参数：每线程1/2/4/8/16个键（≤256–≤4096个键）的五档排序编译在同一kernel里，按SIZE选一档
 
 _order_masks_kernel(pid):
-    if pid < order_ctas:                          # 排序CTA
+    if pid < order_ctas or pid ≥ order_ctas + tiles:   # 排序CTA与列表CTA
         L = _route() if 开启路由 else 2^31−1    # 关闭路由时保留全部提案1 tile
-        _order(pid, L)
+        if pid < order_ctas: _order(pid, L)
+        else: _direct_groups(pid − order_ctas − tiles, L)
     else:
         _masks(pid − order_ctas)
 
@@ -321,13 +327,21 @@ _order(pid, L):
     active = costs[tile].p == 1 and ceil(counts[tile]/16) ≤ L
     if rank < TASKS/HK and rank % slices == 0:    # 每个tile由KV头0的切片0发布
         active_out[tile] = active
-        if not active: direct_flag = 1            # K2的program 0已清0
+        if not active: direct_flag[0] = 1         # K2的program 0已清0
     cost = active ? ceil(counts[tile]/16) : 0     # 不走union的任务排到最后
     key = (cost << SHIFT) + (TASKS−1−rank)；rank ≥ TASKS的位置为−1；WIDE时用int64
     sorted = sort(key, 降序)                       # 每个排序CTA只排自己的SIZE个rank
     r_task = TASKS−1 − (sorted的低SHIFT位)          # 还原rank
     task = (r_task mod (TASKS/HK))·HK + r_task // (TASKS/HK)    # 换成tile优先编号，给K5；补位（键为−1）写−1
     第j名（j = pid·SIZE + i）写到 order[r·GRID + (r为偶数 ? c : GRID−1−c)]，(r, c) = divmod(j, GRID)
+
+_direct_groups(chunk, L):                         # 每线程一个raw行组（direct.prepare的meta：同请求连续至多4行）
+    g = chunk·256 + tid；first, rows = direct_meta[min(g, groups−1)]
+    direct = 存在i < 4：tile = query_tiles[first + min(i, rows−1)] 不满足 (提案==1 且 ceil(counts[tile]/16) ≤ L)
+    listed = g < groups and direct
+    n = 本CTA的listed个数（每个wave ballot计数，经LDS汇总）
+    线程0：base = atomic_add(direct_flag[1], n)（返回旧值，agent范围、monotonic）
+    if listed: direct_list[base + 本CTA内编号更小的listed个数] = g   # CTA内按行组升序，CTA之间的先后取决于原子操作的顺序
 
 _masks(cta):                                      # 每CTA 4个wave，每个wave一个(tile, part)
     tile = tiles−1 − cta；part = wave             # 从最后一个tile开始
@@ -423,7 +437,7 @@ for (block, hkv) in 本组的4对（仅block < packed_blocks）:
 请求最后一块中超出请求长度的token照常拷贝（下一个请求的数据，或越界读到的0）；K7把它们的分数置−inf、V置0
 ```
 
-#### 1.2.8 K7 packed direct与K7′ raw direct（[packed _kernel](sparse_prefill_direct_packed.py#L574)、[packed _body](sparse_prefill_direct_packed.py#L394)、[raw _kernel](sparse_prefill_direct.py#L585)、[raw _body](sparse_prefill_direct.py#L324)）
+#### 1.2.8 K7 packed direct与K7′ raw direct（[packed _kernel](sparse_prefill_direct_packed.py#L574)、[packed _body](sparse_prefill_direct_packed.py#L394)、[raw _kernel](sparse_prefill_direct.py#L595)、[raw _body](sparse_prefill_direct.py#L333)）
 
 ```python
 # packed，gated（有union计划）：grid (BQ·HK, union tiles)，64线程 = 1 wave；tile = blockIdx.y，local = blockIdx.x // HK，hkv = blockIdx.x % HK
@@ -453,7 +467,9 @@ body(row, hkv)：                                  # 1个wave = 1个query × 1�
     O ·= (1/l if l > 0 else 0) → BF16（RNE）→ LDS转置（8KiB）→ 有效head（< G）写out[row, hkv·G + head, :]
 
 # raw（不打包时，见1.2.2；直接读原K/V）：grid Σ_r ceil(q_r/4)·HK，256线程 = 4个wave = 同请求连续4个query（各一个wave）
-#   gated：direct_flag ≠ 0，且4行中至少一行所在tile不走union才执行；每个wave再查自己那行，走union的行不算也不写
+#   gated：CTA b在b//HK < direct_flag[1]时算行组direct_list[b//HK]（K3列表CTA写，见1.2.5）、KV头b%HK，其余CTA只读这一个字就退出；
+#     每个wave再查自己那行，走union的行不算也不写。有计算的CTA总是编号最小的一段，不随union/direct行的交替方式集中到一部分CU上
+#     （此前按行组编号发CTA、在CTA内判断，见第5节10-30（续3））
 #   LDS 32KiB只用于输出转置
 #   每个wave的计算与packed相同，区别在K/V的取法：
 #   K：n = 段起点 + (lane>>2)；相邻4个lane读同一token的512B（lane&3选16B，每lane读8次），QK前用ds_bpermute换成A操作数布局
@@ -824,7 +840,6 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - 长行decode logits的耗时随buffer所在显存位置分成快慢两组，相差13–19%。长上下文prefill logits也随buffer位置波动（P245760约±30%）。
 - 1M上下文仍很慢：prefill indexer是O(L²)，上下文末尾16384行的chunk每层约46ms（P245760约9.4ms），其中logits约25.6ms（约4.4 TFLOP，约170 TFLOP/s；写出约18GB FP32 logits）、top-k约20.8ms（直方图与收集两遍读约34GB，约1.6TB/s）（16块1024行的profiler合计，[数据](../../../../../mytest/mydata/qsa_1m_impl_20261029_01/chunk_rows_1m/chunk_rows.json)）。线性外推整条1M prompt的indexer每rank约18秒，各TP rank重复计算；logits块最多约1.1GiB。Decode每层B1/B8约50/197µs，B8以logits（176µs）为主。Attention上下文末尾16384行的chunk每层H12全union约3.4ms、全direct约10.2–10.6ms。
 - SGLang对带prefix的chunk传该层的K/V池和packed slot表（`qwen_sparse_attn_backend`经`PyHIPAttention.can_read_kv_slots`判断：int32、一维连续、同设备、K/V池连续），不满足时退回`index_select`拷贝。TP2/TP4服务的每层K池约2.49/3.30GiB；TP8在`MEM_FRACTION_STATIC=0.93`时为4.50GiB（同步前4.30GiB），raw direct用WIDE。Raw direct只在上下文超过行数的32倍（或PK+PV超过1GiB）时使用，16384行的chunk为512k以上；合成测试中1M的原地读比拷贝快1.3–1.8ms/层，4.5GiB池的1M分散选择（WIDE）快0.58–1.04ms/层（见benchmark说明第2节）。
-- Raw direct的gated grid每4行一个CTA，按行号排列。union与direct的tile以16–32行交替时，raw direct的耗时接近全部行都走direct：TP4、M16384、上下文128k、一半行走direct时为5.02ms（全部走direct为6.00ms），交替窗口≥64行时为2.89–2.91ms；packed direct每行一个CTA，不受影响（2.67–2.73ms）。推测是CTA按编号轮流分给各shader engine，有计算的CTA集中到一部分上，未用计数器确认。按行数打包后16384行的chunk在512k以内不走raw；1M或行数少的chunk仍可能遇到。[32行交替与全direct](../../../../../mytest/mydata/qsa_wide_20261030_01/mixed_profile/tp4_128k.json)、[窗口扫描](../../../../../mytest/mydata/qsa_wide_20261030_01/mixed_profile/tp4_128k_windows.json)
 - K2的LDS按每CU两个CTA的32KiB预算分配：tile的最长因果范围超过8184块（BQ42用64位成员时4092块，约32k/16k token）时走按65536块窗口的多遍路径。16k–32k上下文的K2因此比AITER的dense K2慢（热缓存32k H3 117 vs 27µs），K1不再散射dense位图而快（311→202µs），整次调用热缓存时持平或更快（32k H3/H6/H12 −0.6%/−0.5%/−0.03%）；AITER op test自己的计时协议下32k仍慢0.4–1.2%。预算加大到64KiB或成员窗口加到32KiB时每CU只能放一个CTA，256k/1M的K2慢50–80%，未采用。
 - 选择不校验（原K1的逐行校验与trap随AITER结构删除）：上游选择出错时只得到错误结果，进程不会中止。
 - 各变体第一次用到才编译（同AITER，不再有首次调用的整体预编译）：缓存为空时，服务中第一个建union计划的prefill（如12k）约12–15秒，第一个带prefix的chunk（slot表变体）约13秒，H6/H3第一次出现16/32行tile的chunk另需7–12秒，池超过4GiB时的WIDE约1秒，都落在触发它的请求上（10-30冷缓存服务中第一条11888 token请求TP2/TP4为17.1/12.8秒，缓存命中时约1.1秒）。SGLang自带的预热请求很短，只编译不建计划的变体；服务应保留FlyDSL持久缓存（命中时0.02–0.4秒），或在预热中覆盖实际会出现的布局（本页服务协议的11888/12000 token预热覆盖12k prefill，覆盖不到带prefix的chunk）。
@@ -978,6 +993,42 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - **host下发**（`mytest/qsa_aiter_sync_host.py`，GPU保持忙，60次中位数；新代码、重排前各一个进程，都以冻结的同步提交为同进程对照）：建计划时新代码95.4–99.1µs，比同步提交多0.5–3.8µs（平均1.9µs），比重排前多约3.4µs；不建计划时57.9–59.6µs，比同步提交少约1.0µs、比重排前多约1.2µs；prefill_indexer约202µs不变。[数据](../../../../../mytest/mydata/qsa_aiter_sync_20261030_01/final/host/summary.json)
 - **服务**（`mytest/qsa_service_20261030c.py`，协议同10-29；TP2用GPU2、3，TP4用GPU2–5，TP8验收用8卡）：数值验收（TEST=1）TP2/TP4/TP8各36请求全部通过：每个rank的12层都有带prefix的chunk，attention校验各444次，每层prefill indexer 37次、graph decode 293次，日志无异常；TP8设`MEM_FRACTION_STATIC=0.93`，每层K池9437696行、4.50GiB（同步前4.30GiB），100000 token请求的最后一个chunk（1696行）raw direct用WIDE变体。FlyDSL缓存从空开始，验收服务的第一条11888 token预热请求在TP2/TP4用了17.1/12.8秒（同步前4.1秒，当时的预编译在启动时完成），缓存命中后约1.1秒。性能（TEST=0，C1–C8各32请求，复用验收服务编好的缓存）：PyHIP相对原生吞吐TP2 +34.2%/+31.9%/+36.7%/+40.3%、TP4 +39.8%/+43.7%/+49.7%/+52.0%；与同步前同协议相比，PyHIP −2.7%～+1.9%、原生−1.2%～+2.4%。差得最多的是TP2 C2的PyHIP（166.5→162.1 token/s）：TP2两组重测为+35.2%/+34.9%/+37.4%/+41.7%（C2 166.7 token/s）；该负载C2的两个prefill chunk（两请求12000+4384行；带4384 token prefix、经slot表读池的7616行）单卡逐例计时（`mytest/qsa_aiter_sync_c2_layouts.py`），新代码与同步提交逐bit相同、持平或快0–3.1%，比重排前快0.9–5.2%。6个性能服务（24场测量）的计时窗口内FlyDSL/Triton缓存没有新写入，日志没有编译。[汇总](../../../../../mytest/mydata/qsa_aiter_sync_service_20261030_01/summary.json)、[TP2重测](../../../../../mytest/mydata/qsa_aiter_sync_service_20261030_01/repeat_tp2.json)、[C2布局](../../../../../mytest/mydata/qsa_aiter_sync_20261030_01/final/c2_layouts/summary.json)、[缓存检查](../../../../../mytest/mydata/qsa_aiter_sync_service_20261030_01/cache_writes.json)
 
+### 2026-10-30（续3）：raw direct按K3写出的行组列表发CTA
+
+10-30（续）测到：union与direct以16–32行交替时，raw direct只算一半的行，耗时却接近全部行走direct（gated grid每4行一个CTA、按行号排列，在CTA内判断有没有direct行）。用户要求两种改法都试：方案A由K3写出含direct行的行组列表，raw direct的前若干个CTA按列表取行组；方案B由host把gated grid的行组按编号打散。对照是HEAD（`ffae4db`）的冻结副本，方案B是该副本只改host的变体（[补丁](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/planb_direct.patch)，未进源码）；数据在[qsa_raw_sched_20261030_01](../../../../../mytest/mydata/qsa_raw_sched_20261030_01)，脚本为`mytest/qsa_raw_sched_*.py`。
+
+- **方案A（采用，[补丁](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/plan_a.patch)）**：K3在排序CTA和mask CTA之后，为每256个raw行组加一个列表CTA（只在raw且有union计划时有）。每线程一个行组，按与`_order`相同的判据看4行中有没有不走union的行；wave ballot计数后，线程0对`direct_flag[1]`原子加，得到写入位置，再把行组编号写进`direct_list`（1.2.5）。K2的program 0把`direct_flag`两个字都清0。Raw direct的gated grid大小不变：CTA b在b//HK < `direct_flag[1]`时算行组`direct_list[b//HK]`，其余只读这一个字就退出（1.2.8）。行组之间互不依赖，列表在CTA之间的先后不定不影响输出。ISA：gated raw direct的VGPR 246不变，SGPR 55/58→49/52，指令少约58条；K3的VGPR 95不变，SGPR spill（溢到VGPR lane）13→23，指令多约211条，无scratch；K2不变。[改前](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/isa_base.txt)、[改后](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/isa_live.txt)
+- **方案B（未采用）**：host按一个排列重排gated raw的行组，CTA b算行组perm[b]。试了三种排列（H6、128k强制raw、事件计时，16/32行交替与64/256行交替）：
+  - 每256组内位反转：−35.0%/−35.1%与+52.9%/+65.3%，把一种2的幂交替周期换成了另一种。
+  - 每256组内固定随机排列：−22.9%/−27.7%与+11.7%/+12.2%。
+  - slot16（CTA b取第b%16段的第b//16个行组，16段各为连续的1/16）：−34.5%/−34.5%与+0.9%/+1.2%，均匀分散+0.8%。
+
+  [位反转](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/planb_probe_h6_128k.json)、[随机](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/planb_random256_h6_128k.json)、[slot16](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/planb_slot16_h6_128k.json)
+- **A/B**（`mytest/qsa_raw_sched_ab.py`）：对照、方案B（slot16）、方案A在同一进程、同一输入上测，事件计时整次调用，3轮正反交替、每轮3次，取中位数，FlyDSL缓存关闭。布局为上下文末尾16384行的128k（强制raw）和1M（按规则走raw），以及100k请求最后一个chunk（1696行，按规则走raw）；选择为共享、分散和N行交替，H12/H6/H3。45例三臂输出逐bit相同，都走gated raw。
+  - 方案A：受影响的18例快5.8–37.5%。128k H12的16/32/64/256行交替−14.3/−23.6/−19.0/−5.8%，H6的16/32行−35.0/−34.9%，H3的32行−37.5%；1M H12的16/32/64行−11.6/−19.2/−16.0%，H6 −31.9/−29.6%，H3 −32.8%；100k H12 −11.2/−23.7%，H6 −33.7/−33.6%，H3 −33.4%。其余27例为−1.7%～+0.3%，包括共享、分散和不造成集中的交替周期（H6/H3的64/256行、H3的16行）。
+  - 方案B（slot16）：同样18例快2.8–36.8%，多数比A少0–1个百分点，100k少4–13个百分点；其余27例−2.2%～+1.3%，分散选择+0.6%～+1.2%。A相对B的中位数为−0.8%。
+  - H3的16行交替不受影响：32行的tile同时含两种行，整个tile都走direct，与调度无关。
+
+  [A/B](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/ab_all.json)
+- **slot表**（同一脚本加`--slots`，只比对照与方案A，1M与100k）：池为上下文2倍时，受影响的11例快13.1–37.0%，其余16例−1.0%～+0.9%；4.5GiB池（WIDE）时快13.2–36.9%，其余−0.9%～+2.0%。54例输出逐bit相同。[2倍池](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/ab_slots_pool2x.json)、[4.5GiB池](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/ab_slots_wide.json)
+- **逐kernel**（`mytest/qsa_raw_sched_kernels.py`，torch.profiler，两轮交替）：
+  - 32行交替时，raw direct在100k快187–267µs，在1M快2.06–3.00ms。
+  - 1M共享选择时没有direct行，raw direct的空launch由12.7µs降到5.0µs（CTA只读一个字就退出）。
+  - 1M的32行交替中，方案A一侧的union、K1、K2、K3慢15–26%。调用之间空闲200ms后两侧相同：union 525/522µs、K2 236/237µs、K1 146/146µs、K3 26.9/26.6µs。即连续调用时，前一次满载的direct改变了GPU的频率状态，不是这些kernel本身变慢；整次调用的事件计时已包含这一影响。
+
+  [逐kernel](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/kernels_100k_1m.json)、[空闲200ms](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/kernels_1m_gap200.json)
+- **不走raw的调用**：
+  - 与冻结对照比较138例（`mytest/qsa_head_ab.py`，同10-30）：输出全部逐bit相同，中位数+0.04%、合计+0.04%，各例−3.2%～+1.6%。超过±1%的5例都是P30k/P0的小用例，有快有慢。
+  - K3在P0 M1024/M2051和P30k M2048上（torch.profiler，4轮ABBA、每轮50次）相差−0.3～+0.25µs。
+  - 12k基准（`benchmarks/qsa/test_attention.py`，两轮交替）逐kernel不变。整体auto QSA TP2/4/8由2473.9/1849.1/1066.6变为2473.8/1849.6/1066.8µs；2051行完整前缀由198.7/136.4/134.0变为198.9/137.2/135.1µs，同一臂两轮之间相差−1.0～+2.6µs。
+
+  [138例](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/head_ab/head_ab.json)、[K3](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/k3_nonraw.json)、[12k](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/kernel_perf/summary_ab.json)
+- **选A的理由**：
+  - A不依赖硬件把CTA分给各计算单元的方式；列表在每个CTA之内仍按行组编号升序；共享选择时gated raw的空launch也更快。
+  - B的slot16只在“CTA按编号模16分配”时成立，均匀分散时慢约1%；另两种排列在别的交替周期上更慢。
+  - B的结果与10-30（续）的推测一致：CTA按编号轮流分配，有计算的CTA集中到一部分计算单元上。这一点仍未用计数器确认。
+- **正确性**：QSA测试112项通过（含gated raw、slot表、WIDE和graph用例，FlyDSL缓存为空）；SGLang `test_pyhip_qsa` 6项（17个子测试）通过。[QSA](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/pytest_qsa.log)、[SGLang](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/sglang_test.log)
+
 ### 评估过但未采用
 
 | 方案 | 结论 | 证据 |
@@ -1003,3 +1054,4 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 | K/V改用64位global读，去掉4GiB池上限（10-30） | 全部改用时raw direct慢4.8–13.0%（几何平均6.8%）；structured buffer同样在4GiB回绕。之后只对≥4GiB的池采用，见10-30（续） | [汇总](../../../../../mytest/mydata/qsa_global64_20261030_01/summary.json) |
 | 加大pack预算，整段打包代替raw direct（10-30） | 打包代价随整段上下文增长（均匀分散选择、全走direct，设备时间ABBA，TP2/4/8）：M16384在128k–512k快0.3–2.9%（连续K/V）、4.8–10.8%（slot表、页序随机），1M仍慢8.9–14.3%；M2048/4096在128k更快、256k互有快慢，512k起全更慢；M64–M512慢8.9–493%。120例输出与raw逐bit相同。固定加大预算会拖慢小批；按行数判断（约上下文 ≤ 32·行数时打包）可在128k–512k的大chunk上省几个百分点，之后按此采用，见10-30（续）；pack本身同样受4GiB池的限制（已改为按块建描述符） | [数据](../../../../../mytest/mydata/qsa_pack_budget_20261030_01/run/pack_budget.json) |
 | K2的LDS预算64KiB、成员窗口32KiB、窗口偏移改为运行时值（10-30） | 前两种每CU只能放一个CTA：32k H3的K2最快（84/112µs，采用的32KiB为119µs），但256k/1M的K2慢75–85%（1M共享H12 450→805µs）；运行时偏移使1M共享H12的K2慢4%（449→469µs）。输出都与AITER逐bit相同 | [数据](../../../../../mytest/mydata/qsa_aiter_sync_20261030_01/k2_variants) |
+| raw direct的gated grid由host按编号打散行组（10-30，方案B） | 每256组内位反转：16/32行交替快35%，64/256行交替慢53%/65%；固定随机排列：快23%/28%，慢12%；slot16（CTA b取第b%16段，各段连续）与采用的K3列表（方案A）接近，但多数少0–1个百分点、100k少4–13个，均匀分散慢0.6–1.2%，且依赖CTA按编号模16分配。采用方案A，见10-30（续3） | [位反转](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/planb_probe_h6_128k.json)、[随机](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/planb_random256_h6_128k.json)、[slot16与A](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/ab_all.json) |

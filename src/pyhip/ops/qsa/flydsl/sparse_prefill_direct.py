@@ -155,6 +155,8 @@ class DirectPlan:
     slotted: bool = False
     # The pool spans more than 4 GiB: raw direct uses 64-bit global loads.
     wide: bool = False
+    # Gated raw: K3's list of the row groups holding a direct row (count in direct_flag[1]).
+    group_list: torch.Tensor | None = None
 
 
 def scratch_specs(prepared: DirectPlan) -> list:
@@ -219,9 +221,15 @@ def prepare(
         sources = upload(
             k_starts[owner] + 4 * (np.arange(len(owner)) - p_starts[owner]), device
         )
+    metadata = upload(metadata, device)
+    group_list = None
+    if not packed and union is not None:
+        group_list = torch.empty(len(metadata), dtype=torch.int32, device=device)
+        union.direct_meta, union.direct_list = metadata, group_list
+        union.direct_groups = len(metadata)
     standin = inputs.query_positions  # tensor slots ungated launches do not read
     prepared = DirectPlan(
-        metadata=upload(metadata, device),
+        metadata=metadata,
         query_tile=waves,
         num_tiles=len(metadata),
         gated=union is not None,
@@ -237,6 +245,7 @@ def prepare(
         pack_dtype=inputs.k.dtype,
         slotted=slotted,
         wide=inputs.wide,
+        group_list=group_list,
     )
     if scratch:
         allocate_scratch(prepared, scratch_specs(prepared), device)
@@ -338,6 +347,7 @@ def _body(
     BN: fx.Constexpr[int],
     THREADS: fx.Constexpr[int],
     TASKS: fx.Int32,
+    TASK: fx.Int32,
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
     TOPK: fx.Constexpr[int],
@@ -360,7 +370,7 @@ def _body(
     )
     tid = fx.thread_idx.x
     wave, lane = _uniform(tid >> 6), tid & 63
-    task = fx.block_idx.x
+    task = TASK
     tile, hkv = task // HK, task % HK
     first, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
     k0, kv_len = _uniform(META[tile * 5 + 2]), _uniform(META[tile * 5 + 3])
@@ -593,6 +603,7 @@ def _kernel(
     ACTIVE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
+    GROUP_LIST: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -608,18 +619,11 @@ def _kernel(
 ):
     body = _body
     if fx.const_expr(GATED):
-        tile = fx.block_idx.x // HK
-        first, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
-        needed = (_uniform(DIRECT_FLAG[0]) != 0).select(fx.Int32(1), fx.Int32(0))
-        if needed != 0:
-            needed = fx.Int32(0)
-            for local in fx.range_constexpr(THREADS // 64):
-                row = first + _min(fx.Int32(local), rows - 1)
-                group = _uniform(QUERY_TILES[row])
-                needed = needed | (_uniform(ACTIVE[group]) == 0).select(
-                    fx.Int32(1), fx.Int32(0)
-                )
-        if needed != 0:
+        # K3 listed the groups holding a direct row: they take the first CTAs, so the dispatch
+        # slots share them evenly whatever the union/direct row pattern.
+        index = fx.block_idx.x // HK
+        if index < _uniform(DIRECT_FLAG[1]):
+            task = _uniform(GROUP_LIST[index]) * HK + fx.block_idx.x % HK
             body(
                 Q,
                 K,
@@ -637,6 +641,7 @@ def _kernel(
                 BN,
                 THREADS,
                 TASKS,
+                task,
                 GATED,
                 SCALE,
                 TOPK,
@@ -661,6 +666,7 @@ def _kernel(
             BN,
             THREADS,
             TASKS,
+            fx.block_idx.x,
             GATED,
             SCALE,
             TOPK,
@@ -681,6 +687,7 @@ def _launch(
     ACTIVE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
+    GROUP_LIST: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -707,6 +714,7 @@ def _launch(
             ACTIVE,
             QUERY_TILES,
             DIRECT_FLAG,
+            GROUP_LIST,
             H,
             HK,
             NQ,
@@ -744,6 +752,11 @@ def _bound(inputs, prepared, out, stream):
         prepared.active,
         prepared.query_tiles,
         prepared.direct_flag,
+        (
+            prepared.metadata.view(-1)
+            if prepared.group_list is None
+            else prepared.group_list
+        ),
         inputs.q.shape[1],
         inputs.k.shape[1],
         inputs.q.shape[0],
@@ -777,7 +790,7 @@ def _bound(inputs, prepared, out, stream):
             if key not in _COMPILED:
                 _COMPILED[key] = packed.compile_launch(inputs, prepared, out, stream)
             compiled = _COMPILED[(*key, prepared.wide)] = flyc.compile(
-                _launch, *args[:16], 0, *args[17:]
+                _launch, *args[:17], 0, *args[18:]
             )
     if prepared.packed_key is not None:
         return _COMPILED[key], packed.launch_args(inputs, prepared, out, tasks, stream)

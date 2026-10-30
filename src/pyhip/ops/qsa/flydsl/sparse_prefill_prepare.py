@@ -20,6 +20,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 
@@ -82,6 +83,11 @@ class SparsePlan:
     slotted: bool = False
     pool_blocks: torch.Tensor | None = None
     tails: torch.Tensor | None = None
+    # Gated raw direct (set by its plan): K3 lists the row groups holding a direct row, so the
+    # direct grid runs them first. direct_flag[1] counts them.
+    direct_meta: torch.Tensor | None = None
+    direct_list: torch.Tensor | None = None
+    direct_groups: int = 0
 
 
 def _ballot(pred):
@@ -693,7 +699,9 @@ def _tile(
         _put(costs, fx.Int32(1), row_steps)
         _put(costs, fx.Int32(2), (over == 0).select(fx.Int32(1), fx.Int32(0)))
         if program == 0:
-            _put(_resource(DIRECT_FLAG, 4), fx.Int32(0), fx.Int32(0))
+            flag = _resource(DIRECT_FLAG, 8)
+            _put(flag, fx.Int32(0), fx.Int32(0))
+            _put(flag, fx.Int32(1), fx.Int32(0))
 
 
 @flyc.kernel(name="sparse_prefill_compact", known_block_size=[COMPACT_THREADS[0], 1, 1])
@@ -996,6 +1004,67 @@ def _order(
             ORDER[destination] = task
 
 
+def _claim(flag, count):
+    """Atomically add count to flag[1]; returns the previous value."""
+    address = fx.Int64(fx.ptrtoint(fx.get_iter(flag))) + 4
+    pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), address.ir_value())
+    return fx.Int32(
+        llvm.atomicrmw(
+            llvm.AtomicBinOp.add,
+            pointer,
+            fx.Int32(count).ir_value(),
+            llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+            alignment=4,
+        )
+    )
+
+
+@flyc.jit
+def _direct_groups(
+    COUNTS: fx.Tensor,
+    COSTS: fx.Tensor,
+    QUERY_TILES: fx.Tensor,
+    GROUP_META: fx.Tensor,
+    GROUP_LIST: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor,
+    scratch,
+    chunk,
+    threshold,
+    GROUPS: fx.Int32,
+):
+    """Append this CTA's raw direct row groups that hold a row of a direct tile to GROUP_LIST
+    (count in DIRECT_FLAG[1]), in group order within the CTA."""
+    tid = fx.thread_idx.x
+    wave = _uniform(tid >> 6)
+    group = chunk * THREADS + tid
+    index = _min(group, GROUPS - 1)
+    first, rows = GROUP_META[index * 5], GROUP_META[index * 5 + 1]
+    direct = fx.Int32(0)
+    # A raw group holds up to four rows; the route matches _order's.
+    for local in fx.range_constexpr(4):
+        tile = QUERY_TILES[first + _min(fx.Int32(local), rows - 1)]
+        steps = (COUNTS[tile] + 15) >> 4
+        active = (COSTS[tile * 3 + 2] == 1) & (steps <= threshold)
+        direct = direct | active.select(fx.Int32(0), fx.Int32(1))
+    listed = (group < GROUPS) & (direct != 0)
+    mask = _ballot(listed)
+    scratch[wave] = _count(mask)
+    fx.gpu.barrier()
+    totals = [scratch[w] for w in range(THREADS // 64)]
+    total = totals[0]
+    for w in fx.range_constexpr(1, THREADS // 64):
+        total = total + totals[w]
+    if tid == 0:
+        scratch[THREADS // 64] = _claim(DIRECT_FLAG, total)
+    fx.gpu.barrier()
+    base = scratch[THREADS // 64]
+    for w in fx.range_constexpr(THREADS // 64 - 1):
+        base = base + (fx.Int32(w) < wave).select(totals[w], fx.Int32(0))
+    if listed:
+        GROUP_LIST[base + _below(mask)] = group
+
+
 def _slot(MEMBERSHIP, BLOCKS, slot, live):
     slot = live.select(slot, fx.Int32(0))
     member = MEMBERSHIP[slot]
@@ -1087,6 +1156,9 @@ def _order_masks_kernel(
     MASKS: fx.Tensor,
     POOL_BLOCKS: fx.Tensor,
     TAILS: fx.Tensor,
+    QUERY_TILES: fx.Tensor,
+    GROUP_META: fx.Tensor,
+    GROUP_LIST: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -1095,6 +1167,7 @@ def _order_masks_kernel(
     QB: fx.Int32,
     CAP: fx.Int32,
     TILES: fx.Int32,
+    GROUPS: fx.Int32,
     TASK_SHARE: fx.Float32,
     DIRECT_STEP: fx.Float32,
     DIRECT_FIXED: fx.Float32,
@@ -1112,7 +1185,8 @@ def _order_masks_kernel(
         .view(fx.make_layout(ORDER_WORDS, 1))
     )
     program = fx.block_idx.x
-    if program < ORDER_CTAS:
+    # Order CTAs, then one mask CTA per tile, then the raw direct group-list CTAs.
+    if (program < ORDER_CTAS) | (program >= ORDER_CTAS + TILES):
         threshold = fx.Int32(INT_MAX)
         if fx.const_expr(ROUTE):
             threshold = _route(
@@ -1125,28 +1199,42 @@ def _order_masks_kernel(
                 DIRECT_FIXED,
                 ROUTE_MODEL,
             )
-        for width in fx.range_constexpr(len(SORT_WIDTHS)):
-            width = SORT_WIDTHS[width]
-            lower = 0 if width == 1 else THREADS * width // 2
-            if (SIZE > lower) & (SIZE <= THREADS * width):
-                _order(
-                    COUNTS,
-                    COSTS,
-                    ACTIVE,
-                    ORDER,
-                    DIRECT_FLAG,
-                    scratch,
-                    program,
-                    threshold,
-                    TASKS,
-                    GRID,
-                    SIZE,
-                    SHIFT,
-                    HK,
-                    SLICES,
-                    WIDE,
-                    width,
-                )
+        if program < ORDER_CTAS:
+            for width in fx.range_constexpr(len(SORT_WIDTHS)):
+                width = SORT_WIDTHS[width]
+                lower = 0 if width == 1 else THREADS * width // 2
+                if (SIZE > lower) & (SIZE <= THREADS * width):
+                    _order(
+                        COUNTS,
+                        COSTS,
+                        ACTIVE,
+                        ORDER,
+                        DIRECT_FLAG,
+                        scratch,
+                        program,
+                        threshold,
+                        TASKS,
+                        GRID,
+                        SIZE,
+                        SHIFT,
+                        HK,
+                        SLICES,
+                        WIDE,
+                        width,
+                    )
+        else:
+            _direct_groups(
+                COUNTS,
+                COSTS,
+                QUERY_TILES,
+                GROUP_META,
+                GROUP_LIST,
+                DIRECT_FLAG,
+                scratch,
+                program - ORDER_CTAS - TILES,
+                threshold,
+                GROUPS,
+            )
     else:
         # Mask CTAs pack one (tile, part) per wave.
         task = (program - ORDER_CTAS) * 4 + _uniform(fx.thread_idx.x >> 6)
@@ -1182,6 +1270,9 @@ def _order_masks_launch(
     MASKS: fx.Tensor,
     POOL_BLOCKS: fx.Tensor,
     TAILS: fx.Tensor,
+    QUERY_TILES: fx.Tensor,
+    GROUP_META: fx.Tensor,
+    GROUP_LIST: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -1190,6 +1281,7 @@ def _order_masks_launch(
     QB: fx.Int32,
     CAP: fx.Int32,
     TILES: fx.Int32,
+    GROUPS: fx.Int32,
     TASK_SHARE: fx.Float32,
     DIRECT_STEP: fx.Float32,
     DIRECT_FIXED: fx.Float32,
@@ -1215,6 +1307,9 @@ def _order_masks_launch(
             MASKS,
             POOL_BLOCKS,
             TAILS,
+            QUERY_TILES,
+            GROUP_META,
+            GROUP_LIST,
             TASKS,
             GRID,
             SIZE,
@@ -1223,6 +1318,7 @@ def _order_masks_launch(
             QB,
             CAP,
             TILES,
+            GROUPS,
             TASK_SHARE,
             DIRECT_STEP,
             DIRECT_FIXED,
@@ -1232,7 +1328,11 @@ def _order_masks_launch(
             ROUTE,
             ROUTE_MODEL,
             SLOTTED,
-        ).launch(grid=(ORDER_CTAS + TILES, 1, 1), block=(THREADS, 1, 1), stream=stream)
+        ).launch(
+            grid=(ORDER_CTAS + TILES + (GROUPS + THREADS - 1) // THREADS, 1, 1),
+            block=(THREADS, 1, 1),
+            stream=stream,
+        )
 
 
 def _cdiv(a, b):
@@ -1352,7 +1452,7 @@ def allocate_plan(
         costs=torch.empty((tiles, 3), **kwargs),
         active=torch.empty(tiles, **kwargs),
         task_order=torch.empty(_cdiv(tasks, grid) * grid if grid else 0, **kwargs),
-        direct_flag=torch.empty(1, **kwargs),
+        direct_flag=torch.empty(2, **kwargs),
         query_tiles=upload(np.repeat(np.arange(tiles), sizes), inputs.q.device),
         query_tile=query_tile,
         group_padded=group,
@@ -1454,6 +1554,9 @@ def _launches(inputs, plan, stream):
         plan.score_masks.view(-1),
         plan.pool_blocks.view(-1) if plan.slotted else standin,
         plan.tails if plan.slotted else standin,
+        plan.query_tiles,
+        plan.direct_meta.view(-1) if plan.direct_groups else standin,
+        plan.direct_list if plan.direct_groups else standin,
         tasks,
         plan.grid,
         size,
@@ -1462,6 +1565,7 @@ def _launches(inputs, plan, stream):
         plan.query_tile,
         plan.block_capacity,
         plan.num_tiles,
+        plan.direct_groups,
         *plan.route_costs,
         hk,
         slices,
@@ -1480,7 +1584,7 @@ def _launches(inputs, plan, stream):
         members64,
         plan.slotted,
     )
-    yield _compiled(_order_masks_launch, args, 19, constants), args
+    yield _compiled(_order_masks_launch, args, 22, constants), args
 
 
 def run(*, inputs, plan):
