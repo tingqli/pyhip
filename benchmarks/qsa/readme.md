@@ -6,18 +6,19 @@ QSA分为indexer（选token）与attention（计算输出）。本页只维护�
 
 | 内容 | 入口 |
 |---|---|
-| 完整attention：恢复/校验/分流/构表/union/direct | [attention.py](../../src/pyhip/ops/qsa/flydsl/attention.py#L179) |
+| 完整attention：恢复/分流/构表/union/direct | [attention.py](../../src/pyhip/ops/qsa/flydsl/attention.py#L219)（入口）及同目录的`sparse_prefill_*.py`（kernel） |
 | prefill indexer、decode indexer（含MTP verify） | [indexer.py](../../src/pyhip/ops/qsa/flydsl/indexer.py) |
-| 共用MHA helper与BF16 D256线性内核 | [_common.py](../../src/pyhip/ops/mha/flydsl/_common.py)、[mha_pa_bf16_256_linear_942.py](../../src/pyhip/ops/mha/flydsl/mha_pa_bf16_256_linear_942.py) |
+| indexer共用的MHA helper | [_common.py](../../src/pyhip/ops/mha/flydsl/_common.py) |
 | 合成attention三分支/完整调用 | [test_attention.py](test_attention.py) |
 | 合成indexer完整调用 | [test_indexer.py](test_indexer.py) |
 | Attention/indexer基本功能 | [test_attention.py](../../tests/ops/qsa/test_attention.py)、[test_indexer.py](../../tests/ops/qsa/test_indexer.py) |
+| AITER op test：精度与耗时，对照SGLang原生Triton | [sparse_prefill_op_test.py](../../tests/ops/qsa/sparse_prefill_op_test.py) |
 | 当前逐kernel性能 | 随上述两个benchmark默认输出，无独立对照脚本 |
 | 共用数据/参考、记录和JSON/CSV导出 | [_attention.py](../../tests/ops/qsa/_attention.py)、[_indexer.py](../../tests/ops/qsa/_indexer.py)、[_benchmark.py](../../tests/ops/qsa/_benchmark.py) |
 
-目标为 **ROCm gfx942（MI308X）、BF16**。使用与ROCm匹配的PyTorch、FlyDSL、Triton，以及NumPy、msgspec和pytest；当前验证环境为Python3.10.12、Torch2.12/ROCm7.14、FlyDSL0.3.2、Triton3.8。基础PyHIP安装不会自动安装全部可选GPU依赖。
+目标为 **ROCm gfx942（MI308X）、BF16**。使用与ROCm匹配的PyTorch、FlyDSL、Triton，以及NumPy和pytest；AITER op test另需AITER（`aiter.test_common`）、pandas和tabulate。当前验证环境为Python3.10.12、Torch2.12/ROCm7.14、FlyDSL0.4.0（与AITER `2544b2927`固定的版本相同）、Triton3.8。基础PyHIP安装不会自动安装全部可选GPU依赖。
 
-Attention、prefill indexer和decode indexer的计算实现均不依赖SGLang、AITER或experiments/tests/benchmarks。Decode的top-k和token展开使用PyHIP自身的FlyDSL实现，与prefill共享选择核心。测试使用独立tensor夹具和精度参考，不创建模型或临时adapter；只有第5节的服务集成需要SGLang。
+Attention沿用AITER [#6576](https://github.com/ROCm/aiter/pull/6576)的源码结构和kernel名（`sparse_prefill_*`），K1–K3、union和direct全部是FlyDSL；Triton只用于indexer的I1、I2、D0、D0′四个prep kernel。Attention、prefill indexer和decode indexer的计算实现均不依赖SGLang、AITER或experiments/tests/benchmarks。Decode的top-k和token展开使用PyHIP自身的FlyDSL实现，与prefill共享选择核心。测试使用独立tensor夹具和精度参考，不创建模型或临时adapter；只有第5节的服务集成需要SGLang。
 
 ```bash
 # 在已配置ROCm/PyTorch/FlyDSL的环境安装；不要用CUDA版PyTorch替换ROCm版。
@@ -28,7 +29,7 @@ python -m pip install -e .
 
 FlyDSL的持久编译缓存在源码只改了嵌套helper时可能返回旧kernel。升级或修改PyHIP后，先清空该缓存，或为测试设置新的空目录：`export FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d)`。
 
-所有kernel都在各入口的第一次调用时编译，之后任何批次组合都不再编译：每种head形状（H, HK, scale）第一次调用attention时，编译该形状可能用到的全部变体（不建计划、每种union tile行数）；prefill indexer、decode和MTP verify（`decode_indexer(verify=True)`）的kernel在各自第一次调用时编译。Triton和FlyDSL缓存都为空时，第一次attention在H12/H6/H3（TP2/4/8）约需36/39/68秒，第一次prefill indexer约2秒，第一次decode约3秒。服务应在启动或预热阶段完成这些调用；CUDA graph capture中不编译，capture前仍须eager预热。
+Attention的kernel变体在第一次用到时编译（与AITER相同）：head形状、union tile行数、选择宽度T、是否传slot表、池是否超过4GiB等编译期参数每出现一种新组合编译一次，之后同一组合的任何长度都不再编译。FlyDSL缓存为空时，第一个建union计划的调用（如12k prefill）约14–15秒，不建计划的小调用约1.7秒，H6/H3第一次用到16/32行tile的带prefix chunk约7–12秒，第一次传slot表约13秒，池超过4GiB的WIDE约1秒；持久缓存命中时0.02–0.4秒。Prefill indexer、decode和MTP verify（`decode_indexer(verify=True)`）的kernel在各自第一次调用时编译（top-k一次编译uint16/int32块号、长行共行和decode长行多CTA的全部变体），缓存为空时第一次prefill indexer约6秒、第一次decode约6.5秒。服务应保留FlyDSL持久缓存，或在启动预热中发出实际会出现的布局（含带prefix的长请求），否则编译落在触发它的请求上；CUDA graph capture中不编译，capture前仍须eager预热。
 
 ## 1. 整体正确性与合成性能
 
@@ -47,11 +48,15 @@ QSA_REPLAY_GPU=2 .venv/bin/python -m pytest -q \
   --lengths 12000 --output mytest/mydata/qsa_prefill_perf_new
 .venv/bin/python benchmarks/qsa/test_indexer.py --gpu 2 --mode decode \
   --rows 1 32 --lengths 12000 --perf --output mytest/mydata/qsa_decode_perf_new
+
+# AITER op test：功能、graph和1k–32k prefill用例的精度与耗时，对照SGLang原生Triton
+HIP_VISIBLE_DEVICES=2 .venv/bin/python tests/ops/qsa/sparse_prefill_op_test.py
+HIP_VISIBLE_DEVICES=2 .venv/bin/python tests/ops/qsa/sparse_prefill_op_test.py -c prefill_12000 -g 12 6 3
 ```
 
-不依赖真实capture或数据集。CLI默认执行整体性能和当前逐kernel计时；`--check-only`仅验证，`--perf`作为兼容参数保留。省略`--output`时自动创建mytest/mydata下的新目录。Attention默认M12000、TP2/4/8；indexer默认prefill12000和decode的1/32行x12000token。Attention的qsa/forced_direct/forced_union比较相同选择；prefix_*三项只比较共同的2051行完整因果前缀，不能与长稀疏选择当作同语义。
+不依赖真实capture或数据集。CLI默认执行整体性能和当前逐kernel计时；`--check-only`仅验证，`--perf`作为兼容参数保留。省略`--output`时自动创建mytest/mydata下的新目录。Attention默认M12000、TP2/4/8；indexer默认prefill12000和decode的1/32行x12000token。Attention的qsa/forced_direct/forced_union比较相同选择；prefix_*三项只比较共同的2051行完整因果前缀，不能与长稀疏选择当作同语义。AITER op test（`-g`是每个KV头的Q头数，12/6/3即TP2/4/8）在控制台打印markdown表：PyHIP与Triton的耗时、TFLOPS、TB/s和与torch参考的不符数（`.02/.02`）。
 
-Attention完整计时含恢复/校验/构表/分流、必要KV pack及计算，不含公共入口检查、workspace查找、输出分配、JIT、indexer或服务KV gather。Indexer两种模式都从投影后输入开始，不含projection GEMM；prefill为eager调用，decode为单次graph replay，包含完整prep和selection。
+Attention完整计时含恢复/构表/分流、必要KV pack及计算，不含公共入口检查、workspace查找、输出分配、JIT、indexer或服务KV gather。Indexer两种模式都从投影后输入开始，不含projection GEMM；prefill为eager调用，decode为单次graph replay，包含完整prep和selection。
 
 原cudaPerf、10独立buffer、2warmup、128samples，保留首尾和慢样本。Attention基本精度`.02/.02`不变，indexer按完整token ABI、FP64 top-k边界`1e-5`及逐bit缓存状态校验；decode返回顺序不要求固定。输出为summary.json/CSV、raw.csv、逐例JSON、源码和地址证据。`complete=false`的数据不能作为有效性能。
 
@@ -75,80 +80,117 @@ Kernel/算子benchmark不检查GPU利用率、显存占用或PTL，不限制GPU/
 
 ```text
 Case               Kernel                              Median_us   Status
-m12000_tp2         0:attention_recover_scatter            <实测值>    valid/invalid
-m12000_tp2         3:attention_union                      <实测值>    valid/invalid
+m12000_tp2         0:sparse_prefill_recover_scatter       <实测值>    valid/invalid
+m12000_tp2         3:sparse_prefill_union                 <实测值>    valid/invalid
 prefill_n12000     0:indexer_q_prep                       <实测值>    valid/invalid
 decode_r1_n12000   1:qsa_indexer_decode_logits            <实测值>    valid/invalid
 ```
 
 ### 当前实测
 
-2026-10-02/03，MI308X/gfx942，原cudaPerf、10buffers、2warmup、128samples，每次运行使用新建的FlyDSL缓存目录，均在GPU2（PCI 0000:a4:00.0）上实测。Attention是2026-10-04把K3路由改为单一步数阈值之后重测的；indexer是10-02去掉整数特化和首次调用预编译之后测的。每次开始前8张卡use均为0%。Attention测量期间，本会话在GPU5、GPU6上同时运行check-only和pytest；indexer测量期间，本会话在GPU4–6上运行编译清单；都没有使用GPU2。按当前协议未做硬件门禁。各组均通过正确性与源码哈希检查。单位为微秒，取全部样本中位数；单节点图重放包含该launch的固定开销，不能把这些中位数相加作为整体调用时间。
+Attention为2026-10-30同步AITER #6576并重新应用之后重测：MI308X/gfx942，GPU2，原cudaPerf、10buffers、2warmup、128samples，两轮（每轮新建FlyDSL缓存目录），表中为两轮各自中位数的平均。Indexer源码在同步中未改，数据为10-29在同一GPU、同一协议下的测量。按当前协议未做硬件门禁。各组均通过正确性与源码哈希检查。单位为微秒；单节点图重放包含该launch的固定开销，不能把这些中位数相加作为整体调用时间。
 
-Attention：M=N=12000、D256、KV1，默认合成选择及自动分流。TP2/4/8是单卡H12/H6/H3形状。完整因果前缀行也和其它行一样在union/direct间选择；总行数少于`max(384, 64*H/HK)`（H12为768，H6/H3为384）时不建union计划，全部走direct。各请求KV按4-token对齐后PK+PV不超过64MiB时direct走packed（含多请求和KV长度非4倍数），超出时走raw。逐tile公式之后，attention_order_masks再做一次全局路由：union受最长任务限制时选一个步数阈值，把更长的union tile改走direct，最多全部改走direct。Union tile为H12 10行、H6 16行、H3 32行；大单请求无prefix且行数足够时H6取21行、H3取42行，本例TP4/TP8即为21/42。本例union/direct行数为TP2 6330/5670、TP4 10053/1947、TP8 12000/0。合成选择的块号乱序，attention_recover_scatter逐行排序；PyHIP prefill indexer的升序输出同样排序，只有块号恰为0,1,2,…的完整因果前缀行跳过排序。
+Attention：M=N=12000、D256、KV1，默认合成选择及自动分流。TP2/4/8是单卡H12/H6/H3形状。完整因果前缀行也和其它行一样在union/direct间选择；总行数少于`max(384, 64*H/HK)`（H12为768，H6/H3为384）时不建union计划，全部走direct。各请求KV按4-token对齐后PK+PV不超过64MiB时direct走packed（含多请求和KV长度非4倍数）；超出时若上下文token数不超过行数的32倍且PK+PV不超过1GiB仍走packed，否则走raw。逐tile公式之后，sparse_prefill_order_masks再做一次全局路由：union受最长任务限制时选一个步数阈值，把更长的union tile改走direct，最多全部改走direct。Union tile为H12 10行、H6 16行、H3 32行；大单请求无prefix且行数足够时H6取21行、H3取42行，本例TP4/TP8即为21/42。本例union/direct行数为TP2 6330/5670、TP4 10053/1947、TP8 12000/0。合成选择的块号乱序，sparse_prefill_recover_scatter逐行排序；PyHIP prefill indexer的升序输出同样排序，只有块号恰为0,1,2,…的完整因果前缀行跳过排序。选择不校验。
 
 | Kernel | TP2/H12 | TP4/H6 | TP8/H3 |
 |---|---:|---:|---:|
-| attention_recover_scatter（含逐行校验） | 100.601 | 99.140 | 101.481 |
-| attention_compact | 27.320 | 19.360 | 17.720 |
-| attention_order_masks（含全局路由） | 36.301 | 30.000 | 41.820 |
-| attention_union | 944.925 | 1219.287 | 951.305 |
-| attention_pack_kv | 17.740 | 15.600 | 9.640 |
-| attention_direct（packed） | 1427.908 | 542.623 | 14.601 |
+| sparse_prefill_recover_scatter | 77.451 | 76.381 | 75.900 |
+| sparse_prefill_compact | 27.010 | 21.721 | 23.380 |
+| sparse_prefill_order_masks（含全局路由） | 24.080 | 31.120 | 38.630 |
+| sparse_prefill_union | 937.145 | 1196.716 | 939.865 |
+| sparse_prefill_pack_kv | 17.540 | 15.570 | 9.501 |
+| sparse_prefill_direct（packed） | 1429.547 | 542.253 | 14.540 |
 
-TP8全部12000行走union，pack/direct只测得gated空分支启动开销，不是实际direct耗时。整体auto QSA另测为2515.173 / 1895.651 / 1100.786微秒；2051行完整因果前缀（prefix_qsa，KV长度不是4的倍数）为204.981 / 142.181 / 135.921微秒。
+TP8全部12000行走union，pack/direct只测得gated空分支启动开销，不是实际direct耗时。整体auto QSA另测为2474.413 / 1849.579 / 1065.995微秒；2051行完整因果前缀（prefix_qsa，KV长度不是4的倍数）为199.211 / 136.881 / 134.011微秒。sparse_prefill_compact只读tile各行选中的块，耗时随选中块数增长，不随上下文长度线性增长。
+
+AITER op test的性能用例（单请求完整prefill，T=512，模拟真实indexer相邻行约共享一半块的correlated选择；AITER `run_perftest`，10组轮换输入，torch.profiler统计设备时间）：PyHIP与SGLang原生Triton（无prefix时调用`sparse_gqa_fwd_interface_triton`）的每次调用耗时，GPU3，两轮各新建FlyDSL缓存目录、取较小值，单位微秒；两者与torch参考在`.02/.02`下全部一致。
+
+| 长度 | H12（TP2）PyHIP / Triton | H6（TP4） | H3（TP8） |
+|---:|---|---|---|
+| 1024 | 84.6 / 284.4（3.4×） | 84.7 / 277.0（3.3×） | 81.8 / 276.4（3.4×） |
+| 2048 | 198.4 / 983.1（5.0×） | 135.2 / 930.3（6.9×） | 132.2 / 928.7（7.0×） |
+| 4096 | 676.7 / 2751.3（4.1×） | 334.8 / 2723.5（8.1×） | 245.2 / 2718.6（11.1×） |
+| 8192 | 1609.4 / 6435.9（4.0×） | 999.5 / 6379.0（6.4×） | 632.2 / 6381.8（10.1×） |
+| 12000 | 2472.8 / 9957.9（4.0×） | 1849.4 / 9854.6（5.3×） | 1068.9 / 9859.2（9.2×） |
+| 16384 | 4222.5 / 13944.9（3.3×） | 2829.2 / 13816.6（4.9×） | 1952.5 / 13816.2（7.1×） |
+| 32768 | 9916.0 / 29013.6（2.9×） | 8490.6 / 28740.6（3.4×） | 7108.7 / 28730.5（4.0×） |
 
 Prefill indexer：M12000、4个D128 Q头、ratio4、top512；投影GEMM不在计时范围。logits按token_slot_table直接从压缩key池读取所有key（含prefix），不另拷key。
 
 | Kernel | 中位耗时 |
 |---|---:|
-| indexer_q_prep | 39.760 |
-| indexer_k_compress | 13.920 |
-| qsa_indexer_logits | 136.381 |
-| qsa_indexer_topk（含位置校验） | 123.320 |
+| indexer_q_prep | 39.780 |
+| indexer_k_compress | 14.080 |
+| qsa_indexer_logits | 136.341 |
+| qsa_indexer_topk（含位置校验） | 123.561 |
 
-整体prefill_indexer另测为291.061微秒，包含公开入口内的分配与准备。
+整体prefill_indexer另测为292.862微秒，包含公开入口内的分配与准备。
 
-Decode indexer：每请求3000个压缩key（12000 token），包含投影后的prep和选块，不含GEMM。Decode top-k每行一个512线程CTA，与prefill共用同一选择实现。
+Decode indexer：每请求3000个压缩key（12000 token），包含投影后的prep和选块，不含GEMM。Decode top-k每行一个512线程CTA，与prefill共用同一选择实现；页表宽度超过32768个压缩key时另加两个launch，把每行分给多个CTA（见下面的1M）。
 
 | Kernel | B1 | B32 |
 |---|---:|---:|
-| indexer_decode_prep | 9.960 | 10.920 |
-| qsa_indexer_decode_logits | 9.840 | 16.680 |
-| qsa_indexer_decode_topk（含展开） | 14.640 | 15.320 |
+| indexer_decode_prep | 10.000 | 10.840 |
+| qsa_indexer_decode_logits | 9.840 | 16.800 |
+| qsa_indexer_decode_topk（含展开） | 14.600 | 15.200 |
 
-整体图重放B1/B32为22.240 / 31.400微秒。
+整体图重放B1/B32为22.120 / 31.320微秒。
 
-以上为当前版本绝对性能，不包含旧新对照；attention共3个case、18行kernel结果、2304条整体raw，indexer为prefill 1个case、decode 2个case，共10行kernel结果、384条整体raw，均未筛除慢样本。记录索引保留在[源码readme](../../src/pyhip/ops/qsa/flydsl/readme.md)，复现只需本页已跟踪入口。
+1M上下文（262144个压缩key）：decode按本协议B1/B8整体图重放50.420 / 197.261微秒，FP64选择校验全部通过（`--mode decode --rows 1 8 --lengths 1048576`）。其中prep 10.640/11.080、logits 25.680/175.981；top-k分三个kernel：qsa_indexer_decode_topk_hist（每行分给多个CTA，各统计一段的直方图）10.040/13.160，qsa_indexer_decode_topk_gather（找到第512大所在的bin，各段写出更高bin的块和该bin的候选）13.020/16.240，qsa_indexer_decode_topk（每行一个CTA排名候选、归并并展开）13.760/13.721。Prefill indexer按CUDA事件计时整次调用（3轮、每轮随机buffer位置；多chunk调用中torch.profiler会丢kernel记录，不用于此处）：上下文末尾16384行每层约46.1ms，前缀245760时约9.43ms。Attention同样按事件计时整次调用（上下文末尾16384行、每层，H12/H6/H3，GPU1，与冻结的同步提交同进程交替）：每32行共享448块、另各选最近64块时全部走union，为3.46/1.89/1.14ms（同步提交4.28/2.50/1.55ms）；均匀分散的选择全部走direct，为10.56/10.36/10.06ms（同步提交11.89/11.48/10.66ms）。下面slot表测量中同样两种选择用连续K/V调用的一列（GPU5）为3.40/1.90/1.13ms与10.21–10.34/10.20/10.08–10.14ms，与重排前同协议相差−3.7%～+0.0%。
 
-公开入口的CPU下发时间（GPU保持忙，60次中位数，TP2/4/8相同）：attention建union计划时约87µs，不建计划时约54µs；prefill_indexer在M12000时约195µs，3请求时约247µs。图重放不含这部分；eager prefill中GPU时间短于它的调用（如2051行完整前缀、64行长prefix）受host限制。
+K/V按slot表原地读取（`attention(..., kv_slots=...)`，见第4节）：SGLang的K/V在按页分配的token池里，此前每层先用`index_select`把整段上下文拷成连续K/V再调用attention。下表为2026-10-30按当前源码在GPU5上测，上下文末尾16384行的chunk、每层，同一输入三种调用交替测（3轮、顺序正反交替、每轮3次，CUDA事件计时整次调用，中位数），输出逐bit相同：拷贝 = SGLang原做法（两次`index_select`加attention），原地 = 传池和slot表。池为上下文的2倍、64-token页，页序连续（如服务刚启动时一个长请求）或随机打乱；其余行填NaN。表中为三次独立运行的中位数，单位微秒，正数表示原地更快，H12/H6/H3（TP2/4/8单卡形状）：
+
+| 上下文 | 共享选择（union） | 分散选择（direct），页序连续 | 分散选择（direct），页序随机 |
+|---:|---|---|---|
+| 32768 | 59–67 / 41–46 / 37–39 | 36 / 55 / 18 | 42 / 6 / 41 |
+| 65536 | 118–130 / 83–104 / 65–66 | 57 / 56 / 47 | −4 / 33 / 34 |
+| 131072 | 148–176 / 87–216 / 155–267 | 168 / 133 / 129 | 162 / 150 / 119 |
+| 262144 | 336–462 / 321–350 / 310–330 | 326 / 253 / 288 | 341 / 300 / 312 |
+| 524288 | 671–709 / 670–698 / 654–707 | 791 / 671 / 638 | 907 / 673 / 607 |
+| 1048576 | 1351–1438 / 1323–1445 / 1336–1447 | 1467 / 1477 / 1393 | 1717 / 1704 / 1698 |
+
+池超过4GiB时（4.5GiB的池，上下文的页随机散在整个池里，同样的协议）：
+
+| 上下文 | 共享选择（union） | 分散选择（direct） |
+|---:|---|---|
+| 131072 | 179 / 169 / 157 | 143 / 146 / 144 |
+| 262144 | 348 / 350 / 333 | 333 / 295 / 292 |
+| 1048576 | 1426 / 1409 / 1419 | 1001 / 1041 / 579 |
+
+原地读省掉了拷贝（1M时每层约1.4ms和1GiB临时显存）。上下文不超过行数的32倍（16384行的chunk即512k以内）时direct先按slot表打包整段上下文，与读连续K/V相当；1M时raw direct直接按池地址读，与读连续K/V相差−0.9%～+3.1%。池超过4GiB时raw direct改用64位global读，1M分散选择比读连续K/V慢0.3%（H6）、2.0%（H12）、9.5%（H3），仍比拷贝快；union和打包与4GiB以内的池相同。64k以内两种方式都打包，差值在测量波动内。同一组内三种调用交替测量，组间受buffer位置影响，只比较同一行内的数。
+
+以上为当前版本绝对性能，不包含旧新对照；attention每轮3个case、18行kernel结果、2304条整体raw，indexer为prefill 1个case、decode 2个case，共10行kernel结果、384条整体raw，均未筛除慢样本。记录索引保留在[源码readme](../../src/pyhip/ops/qsa/flydsl/readme.md)，复现只需本页已跟踪入口。
+
+公开入口的CPU下发时间（GPU保持忙，60次中位数，TP2/4/8相近）：attention建union计划时约95–99µs，不建计划时约58–60µs；prefill_indexer在M12000和3请求时都约201–202µs。图重放不含这部分；eager prefill中GPU时间短于它的调用（如2051行完整前缀、64行长prefix）受host限制。
 
 ## 3. 最终服务性能对比
 
-2026-10-04，PyHIP为本页描述的当前实现（HEAD `601c01e`之上的工作区改动），SGLang HEAD `c3c4bc8`，gfx942/MI308X，模型Qwen3.8-Flash-Next-PTPC-FP8。PyHIP使用独立FlyDSL decode top-k/展开。原生与PyHIP在相同TP及配置下测量C1/C2/C4/C8，共16场、512请求；每场32请求、名义12000输入/350输出、服务seed42，计时关闭数值校验和profiler。源码哈希、请求量、配置一致性及整轮入口/出口检查均通过。
+2026-10-30，PyHIP为提交`14592cb`（attention同步AITER #6576）的下一个提交（重新应用按slot表直读K/V、4GiB以上的池、按行数打包和窗口版K2；测量时是与之相同的工作区），SGLang为HEAD `4475222`之上的工作区改动（带prefix的chunk把该层的K/V池和slot表交给PyHIP），AITER `2544b2927`（本机按当前源码重建），FlyDSL 0.4.0，gfx942/MI308X，模型Qwen3.8-Flash-Next-PTPC-FP8。原生与PyHIP在相同TP及配置下测量C1/C2/C4/C8，共16场、512请求；每场32请求、名义12000输入/350输出、服务seed 42，计时关闭数值校验和profiler。源码哈希（与本页数值验收的服务相同）、请求量和配置一致性检查均通过。
 
-服务配置为chunked prefill 16384、最大运行请求32、decode graph最大batch 32、关闭radix cache、AITER attention/MoE backend。两组的实际`mem_fraction_static`一致：TP2为0.8075、TP4为0.7225；服务和客户端沿用4个CPU线程。
+服务配置为chunked prefill 16384、最大运行请求32、decode graph最大batch 32、关闭radix cache、AITER attention/MoE backend。两组的实际`mem_fraction_static`一致：TP2为0.8075、TP4为0.7225；服务和客户端沿用4个CPU线程。“原生”与“PyHIP”是同一SGLang服务只改`SGLANG_USE_PYHIP_QSA`（0/1）：原生组在12个QSA层用SGLang自带的indexer（prefill和decode选块）与prefill稀疏attention，PyHIP组把这三部分换成PyHIP的kernel。decode阶段的稀疏attention、indexer的投影GEMM以及模型其余部分（GEMM、MoE、线性attention层等）两组相同；两组也都用launcher默认的PyHIP GR read（`SGLANG_GR_READ_FLYDSL=1`），所以原生组并非完全不含PyHIP。AITER的BF16 GEMM调优表固定为09-25快照（`AITER_CONFIG_GEMM_BF16`，原因见第5节），其余调优表用AITER默认；`SGLANG_PLUGINS=none`。
 
 | TP | 并发 | 原生token/s | PyHIP token/s | 吞吐变化 | TTFT中位数(ms，原生/PyHIP) | ITL中位数(ms，原生/PyHIP) | TTFT p99(ms，原生/PyHIP) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 1 | 61.066 | 75.029 | +22.86% | 1046.033 / 881.239 | 13.416 / 10.840 | 1061.528 / 894.048 |
-| 2 | 2 | 94.867 | 119.243 | +25.69% | 2040.948 / 1398.219 | 15.257 / 11.856 | 2061.682 / 1743.694 |
-| 2 | 4 | 127.894 | 162.101 | +26.75% | 4207.044 / 3529.918 | 19.002 / 14.361 | 4844.628 / 4137.701 |
-| 2 | 8 | 169.357 | 223.683 | +32.08% | 6820.034 / 5705.494 | 22.866 / 15.425 | 8571.052 / 7141.292 |
-| 4 | 1 | 65.860 | 81.790 | +24.19% | 844.297 / 680.019 | 12.800 / 10.313 | 860.221 / 689.080 |
-| 4 | 2 | 104.564 | 134.445 | +28.58% | 1639.680 / 1099.245 | 14.446 / 11.121 | 1660.176 / 1330.014 |
-| 4 | 4 | 148.010 | 197.280 | +33.29% | 3412.374 / 2712.255 | 16.622 / 12.031 | 5236.036 / 4027.899 |
-| 4 | 8 | 195.293 | 271.719 | +39.13% | 5517.120 / 4376.158 | 21.111 / 13.681 | 6976.845 / 5531.324 |
+| 2 | 1 | 84.512 | 113.384 | +34.16% | 950.872 / 787.858 | 9.086 / 6.500 | 986.961 / 809.017 |
+| 2 | 2 | 122.868 | 162.060 | +31.90% | 1856.319 / 1290.308 | 10.921 / 7.616 | 1886.102 / 1576.600 |
+| 2 | 4 | 167.511 | 228.931 | +36.67% | 3585.215 / 2485.449 | 13.191 / 8.716 | 3762.511 / 3070.482 |
+| 2 | 8 | 203.707 | 285.806 | +40.30% | 6001.831 / 4049.230 | 17.831 / 10.636 | 7527.835 / 6078.533 |
+| 4 | 1 | 95.050 | 132.866 | +39.79% | 736.990 / 569.227 | 8.431 / 5.915 | 751.010 / 576.042 |
+| 4 | 2 | 139.644 | 200.704 | +43.73% | 1439.870 / 1096.675 | 10.148 / 6.811 | 1493.548 / 1116.888 |
+| 4 | 4 | 192.887 | 288.675 | +49.66% | 2831.525 / 1824.651 | 12.137 / 7.583 | 2976.432 / 2214.936 |
+| 4 | 8 | 242.649 | 368.849 | +52.01% | 4653.291 / 2982.716 | 16.240 / 8.916 | 5872.715 / 4436.445 |
 
-各并发档在服务内共享warm cache，smoke及11888/12000预热不变；两种实现顺序运行，各自按C1、C2、C4、C8测量，不是交错同址或饱和吞吐测试。整轮仅入口和全部服务退出后各检查一次GPU状态，不证明采样期间持续隔离。默认`SGLANG_USE_PYHIP_QSA=0`保持不变。
+每个服务就绪后先做smoke和11888/12000两次预热，再用同样参数跑一轮不计时的8请求C8，然后在同一服务内依次测C1、C2、C4、C8。两种实现顺序运行，不是交错同址或饱和吞吐测试；整轮仅在入口和全部服务退出后各检查一次GPU状态，不证明采样期间持续隔离。本轮TP2用GPU2、3，TP4用GPU2–5（GPU6、7当时被其它进程占用）。C4、C8的TTFT主要由排队决定，分布成簇，中位数可能落在两簇之间，不宜单独比较。默认`SGLANG_USE_PYHIP_QSA=0`保持不变。
 
-PyHIP的kernel都在各入口的第一次调用时编译（见“目录和依赖”末段）：decode的kernel在SGLang启动时的CUDA graph capture中编译，prefill indexer和attention在SGLang自带的预热请求中编译，都在服务打印就绪之前完成；若用`--skip-server-warmup`启动，这次编译会落在第一个真实请求上。上表的Triton缓存复制自较早一轮服务（已含SGLang原生kernel在这些负载下的变体），FlyDSL缓存清空后重建，服务启动后的每一次Triton编译都记录。两组16场测量中都没有Triton编译，PyHIP的FlyDSL kernel全部在数值验收服务的启动阶段编完；测量中只有原生TP4 C4遇到一次AITER FlyDSL MoE kernel的新档位编译，日志中没有可见停顿。缓存为空时，SGLang原生kernel（如apply_interleaved_rope_kernel、_sparse_gqa_chunk_prefill）和AITER MoE也会在服务中按新形状编译：一次冷缓存测量中原生TP2在C4/C8各编译19/12次（每rank合计6.0/3.4秒），吞吐低约5%–6%。新环境应先用代表性负载预热，或保留编译缓存。
+表中TP2 C2的PyHIP（162.1 token/s）比同配置的其它测量低约2.7%：之后在同样的GPU2、3上把TP2两组各重测一遍（期间没有其它测量），PyHIP为114.595/166.693/229.428/286.176 token/s（C1–C8），相对原生+35.2%/+34.9%/+37.4%/+41.7%，C2为166.7；同一负载C2的两个prefill chunk（两请求12000+4384行；带4384 token prefix的7616行，经slot表读池）单卡逐例计时也没有变慢，所以是服务测量的波动。
 
-本轮独立数值验收TP2/TP4各35请求全部通过，TEST=1，覆盖24k分块和32并发；每个rank的12个QSA层都完成attention与prefill indexer校验（各372次）。这不是模型质量或生成文本bitexact验收。12份独立rank trace确认各PyHIP rank运行当前decode top-k（4请求profile中每rank 240次），原生组无该kernel；profile计时不混入本表。原始证据与过程由[源码readme](../../src/pyhip/ops/qsa/flydsl/readme.md)索引，本页命令不依赖本地未提交研究脚本或报告。
+PyHIP attention的kernel变体在第一次用到时编译（见“目录和依赖”末段）：decode的kernel在SGLang启动时的CUDA graph capture中编译；SGLang自带的预热请求很短，只编译不建计划的变体，12k prefill和带prefix的chunk用到的变体在第一个这样的请求中编译。本轮FlyDSL缓存从空开始：数值验收服务的第一条11888 token预热请求在TP2/TP4用了17.1/12.8秒（缓存命中时约1.1秒）；性能服务复用验收服务编好的缓存（验收负载含24000/100000 token请求和32并发，覆盖带prefix的chunk），Triton等缓存复制自10-30上一轮服务。16场测量中服务日志没有Triton编译或AITER构建，计时窗口内FlyDSL/Triton缓存没有新写入。缓存为空时，SGLang原生kernel（如apply_interleaved_rope_kernel、_sparse_gqa_chunk_prefill）和AITER MoE也会在服务中按新形状编译：10-02的一次冷缓存测量中原生TP2在C4/C8各编译19/12次（每rank合计6.0/3.4秒），吞吐低约5%–6%。新环境应先用代表性负载预热，或保留编译缓存。
+
+数值验收（TEST=1，2026-10-30按当前源码）TP2/TP4/TP8各36请求全部通过：12000与24000 token各一条、32条并发、1条9 token短请求和1条100000 token请求（chunk 16384，最后一个chunk带98304 token的prefix，attention经slot表直接读K/V池）。TP2/TP4用默认配置，每层K池2.49/3.30GiB；TP8把`MEM_FRACTION_STATIC`设为0.93（实际0.7905），每层K池9437696行、4.50GiB，验证池超过4GiB时的原地读（100000 token请求的最后一个chunk为1696行、上下文超过行数的32倍，raw direct用WIDE变体）。每个rank的12个QSA层都有带prefix的chunk；每个rank完成attention校验444次，每层prefill indexer校验37次、graph decode校验293次；日志无异常，没有设备端断言。这不是模型质量或生成文本bitexact验收。原始证据与过程由[源码readme](../../src/pyhip/ops/qsa/flydsl/readme.md)索引，本页命令不依赖本地未提交研究脚本或报告。
 
 ### MTP（EAGLE 3/1/4）
 
-2026-10-08，模型、launcher、服务配置和32请求、名义12000输入/350输出的协议同上（实际`mem_fraction_static`仍为TP2 0.8075、TP4 0.7225），SGLang另加`--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`（QSA要求topk为1、草稿token不超过4）。两组都开MTP；PyHIP组的indexer在prefill和CUDA graph TARGET_VERIFY中由PyHIP计算，verify的attention、draft模型和draft extend仍是SGLang原生。SGLang的pending ring为每个请求2×ratio个槽：verify窗口跨过压缩边界时，不会再覆盖该组在窗口之前的成员。PyHIP为HEAD `cd07379`之上的工作区改动，SGLang为HEAD `c3c4bc8`之上的工作区改动。
+2026-10-08测，早于上表，环境不同：当时的AITER尚未重建、四类AITER调优表（a8w8 bpreshuffle、a8w8 blockscale bpreshuffle、BF16 GEMM、FMoE）都固定为09-25快照，FlyDSL 0.3.2，launcher还没有PyHIP GR read；绝对值不能与上表直接比较。模型、服务配置和32请求、名义12000输入/350输出的协议与上表相同（实际`mem_fraction_static`仍为TP2 0.8075、TP4 0.7225），SGLang另加`--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`（QSA要求topk为1、草稿token不超过4）。两组都开MTP；PyHIP组的indexer在prefill和CUDA graph TARGET_VERIFY中由PyHIP计算，verify的attention、draft模型和draft extend仍是SGLang原生。SGLang的pending ring为每个请求2×ratio个槽：verify窗口跨过压缩边界时，不会再覆盖该组在窗口之前的成员。PyHIP为HEAD `cd07379`之上的工作区改动，SGLang为HEAD `c3c4bc8`之上的工作区改动。
 
 | TP | 并发 | 原生token/s | PyHIP token/s | 吞吐变化 | TTFT中位数(ms，原生/PyHIP) | ITL中位数(ms，原生/PyHIP) | 接受长度(原生/PyHIP) |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -161,7 +203,7 @@ PyHIP的kernel都在各入口的第一次调用时编译（见“目录和依赖
 | 4 | 4 | 181.547 | 242.920 | +33.81% | 959.175 / 755.141 | 9.879 / 6.733 | 3.49 / 3.51 |
 | 4 | 8 | 220.971 | 312.808 | +41.56% | 2057.562 / 1673.210 | 13.188 / 7.641 | 3.50 / 3.52 |
 
-16场测量中都没有服务中的Triton编译。C8的TTFT主要由排队决定（解码更快时请求到达更密，与prefill交错更多），不宜单独比较。C1 profile中每个verify graph的indexer由约5.6ms降到0.35ms，verify graph在TP2由21.56ms降到16.18ms、TP4由19.74ms降到14.21ms（profiler给每个kernel多算约1µs）。与上表非MTP的PyHIP相比，MTP+PyHIP的吞吐在TP2高10%–34%、TP4高15%–41%，并发越高收益越小。
+16场测量中都没有服务中的Triton编译。C8的TTFT主要由排队决定（解码更快时请求到达更密，与prefill交错更多），不宜单独比较。C1 profile中每个verify graph的indexer由约5.6ms降到0.35ms，verify graph在TP2由21.56ms降到16.18ms、TP4由19.74ms降到14.21ms（profiler给每个kernel多算约1µs）。与同一环境下10-04测的非MTP PyHIP相比，MTP+PyHIP的吞吐在TP2高10%–34%、TP4高15%–41%，并发越高收益越小。
 
 接受长度两边相当。ring修复之前的同一协议中PyHIP低1%–4%，原因已查明（[逐请求研究](../../mytest/mydata/qsa_accept_study_20261008_01/summary.json)：64个同协议prompt，C1贪心，四种组合各跑两轮）：两边生成的文本相同时，每一步接受的草稿相同，同一段文本的teacher-forced似然也相同；差距全部来自生成的文本不同。prefill的微小数值差在near-tie处翻转贪心选择，原生自己两轮之间也有45%的prompt输出不同、接受长度差2.3%；基准的32个prompt里有2个在当时的PyHIP下稳定走到更难预测的分支，占了约75%的差距。所以这里的接受长度只能在几个百分点内比较，不反映精度高低。
 
@@ -190,11 +232,25 @@ out = torch.empty_like(q)
 attention(q, k, v, indices, query_lens=(m,), prefix_lens=(0,), out=out)
 ```
 
-约束：Q/O为连续BF16 `[M,H,256]`，K/V为连续BF16 `[N,HK,256]`，`H/HK≤16`，16B对齐、inference-only；QSA不接受5D KV。`indices`是连续int32 `[M,2051]`，每行最多512个完整唯一四token块（块可乱序），接该query的0–3因果尾token，再填−1；ID为请求内逻辑token。`query_lens`/`prefix_lens`是host长度，packed请求的K/V按请求拼接；默认单请求prefix=`N-M`。默认scale=1/16，`out`不与输入重叠。违反上述选择布局的行会在GPU上trap，进程中止。
+约束：Q/O为连续BF16 `[M,H,256]`，K/V为连续BF16 `[N,HK,256]`，`H/HK≤16`，16B对齐、inference-only；QSA不接受5D KV。Q和每个请求的K（V同）的字节数都不超过4GiB−1MiB（HK=1时一个请求约838万token），整批packed K/V不受此限。`indices`是连续int32 `[M,4T+3]`，T为256/512/768/1024（由宽度决定，indexer输出的2051宽即T=512）：因果窗口有v个token的行，前`4·min(v//4, T)`列恰为min(v//4, T)个不同的完整四token块（块内4个token依次写出，块可乱序），接v%4个因果尾token，其余填−1；ID为请求内逻辑token。选择不校验：块数不对、缺尾token或块重复时结果错误，不报错。K/V须为有限值。`query_lens`/`prefix_lens`是host长度，packed请求的K/V按请求拼接；默认单请求prefix=`N-M`。默认scale=1/16，`scale·log2(e)`须是有限的正FP32；`out`不与输入重叠。
+
+K/V在按页分配的token池里时，可传`kv_slots`原地读取，不必先拷成连续K/V：`kv_slots`是同设备连续int32 `[N]`，第i项是packed上下文第i个token（请求按顺序拼接）在池中的行号；K/V为池`[P,HK,256]`，大小不限，池超过4GiB−1MiB时raw direct改用64位global读（比buffer读慢约0–10%）。每个请求的每个四token块（请求内token 4j..4j+3，含请求末尾不满4个token的块）须占池中连续4行且起始行是4的倍数，页大小为4的倍数的分页池满足这一点；不满块多出的行值任意，slot值不校验。结果与先按`kv_slots`拷出连续K/V再调用逐bit相同。SGLang的chunked prefill对带prefix的chunk这样调用。
+
+```python
+# 接上例：把K/V放进64-token页的池，页序打乱
+pool_rows = 4 * 64
+pages = torch.randperm(pool_rows // 64 - 1, device=device)[: (m + 63) // 64] + 1
+slots = (pages[:, None] * 64 + torch.arange(64, device=device)).flatten()[:m].int().contiguous()
+k_pool = torch.zeros(pool_rows, hk, d, device=device, dtype=torch.bfloat16)
+v_pool = torch.zeros_like(k_pool)
+k_pool[slots.long()], v_pool[slots.long()] = k, v
+in_place = attention(q, k_pool, v_pool, indices, query_lens=(m,), prefix_lens=(0,), kv_slots=slots)
+assert torch.equal(in_place, out)
+```
 
 ### Indexer接口
 
-[prefill_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L323)和[decode_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L401)都从调用方`index_qk_proj`之后的`qk`开始，返回同一种token选择，可原样交给attention。除`qk`外都是关键字参数，两个入口中同名参数含义相同；只依赖PyHIP，不需要SGLang/AITER。
+[prefill_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L338)和[decode_indexer](../../src/pyhip/ops/qsa/flydsl/indexer.py#L417)都从调用方`index_qk_proj`之后的`qk`开始，返回同一种token选择，可原样交给attention。除`qk`外都是关键字参数，两个入口中同名参数含义相同；只依赖PyHIP，不需要SGLang/AITER。
 
 共同约定：
 
@@ -202,7 +258,7 @@ attention(q, k, v, indices, query_lens=(m,), prefix_lens=(0,), out=out)
 - 所有tensor在同一GPU，除表中注明外必须连续。`key_state`、`rope_state`、`compressed`原地更新。
 - 槽号全部由调用方给出。SGLang的pending ring每请求8个槽（压缩比的2倍）：请求r（从1开始）的位置p在槽`8r + p%8`；请求0从不分配，`[0,8)`是dump行。首token物理槽为s的4-token组，压缩key在`compressed[s//4]`；slot 0是惰性写入位置。dump行和slot 0会被并发写入，不能当数据读。
 - 返回int32 `[rows,2051]`：每行先是选中的压缩块，按块号升序、每块展开成4个token（最多2048个）；紧接着是0–3个因果尾token（最后一个完整组之后、到query本身为止）；其余填−1。Token ID是请求内逻辑位置。位置p的query可见`(p+1)//4`个压缩key，不超过512个时全选；分数相同时取块号小的。
-- 第一次调用时编译（缓存为空时prefill约2秒、decode约3秒），之后任何长度组合都不再编译。
+- 第一次调用时编译（缓存为空时prefill约6秒、decode约6.5秒），之后任何长度组合都不再编译。
 
 下面的示例共用这组参数（普通RoPE，rotary_dim=64）：
 
@@ -256,7 +312,7 @@ T是本批query行数（各请求的行按请求顺序拼接），R是请求数�
 注意事项：
 
 - 只用于eager调用：host按`(seq_lens, extend_lens)`规划布局（缓存最近8种），一次pinned上传，不同步stream。
-- 单请求最多65536个压缩key（262144 token）；logits临时缓冲每块不超过256MiB。
+- 单请求最多262144个压缩key（1M token）；宽度超过65536个key的logits行用32位块号的top-k变体，两种变体在第一次调用时一起编译。logits临时缓冲按512MiB分块，长行时每块至少1024行（1M末尾约1.1GiB）。
 - Chunked prefill时，前面各块写入的压缩key由logits经`token_slot_table`读取；每块只压缩4个成员都在本块的组，所以prefix必须按4对齐。
 - 每次调用返回新分配的indices，之后的调用不会改写。
 
@@ -308,7 +364,7 @@ B是行数（每行一个query token，含CUDA graph的padding行），P是页�
 | `group_locs` | int32 `[B,4]` | 以本位置结尾的组的4个成员（位置p−3..p，最早的在前，小于0时按0）在ring中的槽`8r + 成员位置%8` |
 | `write_locs` | int32 `[B]` | 本token补满一组（`seq_lens%4==0`）时该组的压缩槽，否则0 |
 | `compressed` | BF16 `[C,1,128]`，小于2GiB | 压缩key池，按每页16个key读取；本步补满的组先写入，再参与本步选择 |
-| `page_table` | int32 `[B,P]`，P ≤ 4096 | 本行第p页对应压缩key `16·page_table[row,p] + [0,16)`；logits宽16·P |
+| `page_table` | int32 `[B,P]`，P ≤ 16384 | 本行第p页对应压缩key `16·page_table[row,p] + [0,16)`；logits宽16·P，`B·16·P`个FP32须小于2GiB |
 | `lengths` | int32 `[B]` | 本行可见的压缩key数，= `seq_lens // 4` |
 | `verify` | bool | False：各行必须属于不同请求；True：MTP的TARGET_VERIFY窗口，一个请求占连续W（≤4）行 |
 | `q_out` | 可选，BF16 `[B,4,128]` | 写入归一化并加RoPE后的index Q |
@@ -317,6 +373,7 @@ B是行数（每行一个query token，含CUDA graph的padding行），P是页�
 注意事项：
 
 - 所有metadata都在设备上，可在CUDA graph中capture。必须先eager调用一次以完成编译（第一次`verify=True`另编译verify用的两个kernel），未预热就在capture中调用会报错。重放前原地更新各张量的内容，地址不能变。
+- 页表宽度超过32768个压缩key（131072 token）时，top-k另加两个launch，把实际长度也超过它的行分给多个CTA统计直方图、收集候选；所需统计与临时缓冲在调用内分配，可以capture。
 - `verify=False`时prep只看得到本行自己的ring写入，所以同一请求不能占多行。`verify=True`时压缩在所有行写完ring之后另起一个launch（与SGLang顺序一致）；ring每请求必须有8个槽，窗口才不会覆盖组内窗口之前的成员。
 - 调用前，prefill和之前各步写入的`key_state`、`rope_state`、`compressed`必须已就绪。
 - padding行用请求0：`state_slots`、`group_locs`指向dump行，`write_locs`和`lengths`为0；其输出忽略。
@@ -412,19 +469,23 @@ graph.replay()  # 重放前可原地更新同形状Q/K/V和合法indices
 
 SGLang直接依赖已安装PyHIP，`SGLANG_USE_PYHIP_QSA=0/1`选择原生/PyHIP，`SGLANG_TEST_PYHIP_QSA=1`仅用于数值验收。性能计时必须关闭数值检查，GEMM保持原SGLang路径，不使用临时插件。
 
-以下直接使用SGLang已提交的launcher和Python benchmark模块。先在一个终端启动服务；TP_SIZE取2或4，SGLANG_USE_PYHIP_QSA取0或1。四种配置依次运行，不并行占用相同GPU。两种实现使用相同模型、seed、预热、请求长度及内存配置。
+以下直接使用SGLang已提交的launcher和Python benchmark模块。先在一个终端启动服务；TP_SIZE取2或4，SGLANG_USE_PYHIP_QSA取0或1。四种配置依次运行，不并行占用相同GPU。两种实现使用相同模型、seed、预热、请求长度及内存配置。launcher不再固定设备，用`CUDA_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES`选卡；其默认模型已改为PLE-BF16版本，第3节的表用`MODEL_PATH`指定PTPC-FP8。
+
+本机当前环境另需两处设置（原因见[源码readme](../../src/pyhip/ops/qsa/flydsl/readme.md)第5节10-29条目）：AITER `2544b2927`的`model_configs/qwen38_flash_next_bf16_tuned_gemm.csv`给BF16 GEMM的hipBLASLt解在本机会选到FP8 kernel，启动预热时GPU访问错误，所以`AITER_CONFIG_GEMM_BF16`指向此前各轮用的09-25调优表；venv里登记的`pyhip_monokernel`插件已无模块，`SGLANG_PLUGINS=none`跳过它（不设只多打印traceback）。
 
 ```bash
 cd /opt/sglang
-PATH="/opt/lc/pyhip/.venv/bin:$PATH" TP_SIZE=2 \
-  HOST=127.0.0.1 PORT=9080 SGLANG_USE_PYHIP_QSA=1 SGLANG_TEST_PYHIP_QSA=0 \
+PATH="/opt/lc/pyhip/.venv/bin:$PATH" TP_SIZE=2 CUDA_VISIBLE_DEVICES=0,1 HIP_VISIBLE_DEVICES=0,1 \
+  MODEL_PATH=/models/Qwen3.8-Flash-Next-PTPC-FP8 SERVED_MODEL_NAME=Qwen/Qwen3.8-Flash-Next-PTPC-FP8 \
+  HOST=127.0.0.1 PORT=9080 SGLANG_USE_PYHIP_QSA=1 SGLANG_TEST_PYHIP_QSA=0 SGLANG_PLUGINS=none \
+  AITER_CONFIG_GEMM_BF16=/opt/lc/pyhip/mytest/sglang_tp2_base_20260925_01/aiter_configs_snapshot/bf16_tuned_gemm.csv \
   LOG_FILE=/opt/lc/pyhip/mytest/mydata/qsa_serving_new/tp2_pyhip/server.log \
   bash scripts/launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh --random-seed 42
 ```
 
 MTP对照在上面的launcher命令后追加`--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`，其余不变。
 
-服务就绪并完成统一预热后，在另一终端执行。替换输出目录标识以匹配当前TP/实现；每种配置依次测C1/C2/C4/C8：
+服务就绪并完成统一预热后（第3节的表另用同样参数先跑一轮不计时的8请求C8），在另一终端执行。替换输出目录标识以匹配当前TP/实现；每种配置依次测C1/C2/C4/C8：
 
 ```bash
 cd /opt/lc/pyhip
