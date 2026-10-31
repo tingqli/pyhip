@@ -28,6 +28,7 @@ from pyhip.ops.mha.flydsl._common import (
     _read_address,
     _rescale,
     _schedule,
+    _schedule_exps,
     _stage_end,
     _uniform,
     _wait,
@@ -226,11 +227,11 @@ def _body(
     SCALE: fx.Constexpr[float],
     STAGGER: fx.Constexpr[bool],
 ):
-    read_k, read_v, pv = linear._read_k, linear._read_v, linear._pv
+    read_k, read_v, pv = linear._read_k_s2r, linear._read_v_s2r, linear._pv
     dma_offsets, v_operands = linear._dma_offsets, linear._v_operands
     source_rows, output_fn = _source_rows, _output
     qk, local_sum, local_max, cross = base._qk, base._sum, base._max, base._cross
-    exps, pack, center = base._exps, base._pack, base._center
+    exps, pack, scale_scores = base._exps, _pack_bf16, base._scale
     rescale, advance_max = _rescale, _advance_max
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
@@ -255,7 +256,7 @@ def _body(
     qptr = fx.get_iter(Q) + fx.Int64(q0) * (H * D) + hkv * (H // HK) * D
     gq = _buffer(fx.make_view(qptr, fx.make_layout(NQ * H * D, 1)), qextent)
     qoffset = valid_row.select((query * H * D + head * D) * 2, fx.Int32(qextent))
-    q = base._q_fragment(gq, qoffset, lane)
+    q = base._read_q_g2r(gq, qoffset, lane)
     extent = (kv_len * HK - hkv) * D * 2
     limit = (kv_len - 1) * (HK * D * 2) + (wave >> 2) * 256
     limits = tuple(
@@ -329,12 +330,11 @@ def _body(
     _wait(lgkmcnt=0)
     _stage_end()
     hi = qk(q, k)
-    scores = _apply_mask(_join(lo, hi), bits)
+    scores = scale_scores(_apply_mask(_join(lo, hi), bits), scale)
     maximum = local_max(scores)
     maximum = _maximum(maximum, maximum.shuffle_xor(16, 64))
     maximum = _maximum(maximum, maximum.shuffle_xor(32, 64))
-    maximum = _maximum(maximum * scale, fx.Float32(-1.0e30)) + 1.0
-    scores = center(scores, scale, maximum)
+    maximum = _maximum(maximum, fx.Float32(-1.0e30)) + 1.0
     row_sum = fx.Float32(0.0)
     _stage_end()
     offsets = dma_offsets(rows1, 4)
@@ -413,8 +413,8 @@ def _body(
         _wait(lgkmcnt=0)
         rocdl.sched_barrier(0)
         lo = qk(q, k)
-        previous = exps(previous)
-        _schedule(32, 1, 1, True)
+        previous = exps(previous, maximum)
+        _schedule_exps(16, 1, 1, 2)
         _stage_end()
         k = read_k(kr, 1, STAGGER)
         _wait(vmcnt=0)
@@ -425,7 +425,7 @@ def _body(
         rocdl.sched_barrier(0)
         hi = qk(q, k)
         current = _apply_mask(_join(lo, hi), bits)
-        total, probabilities = local_sum(previous), pack(previous)
+        total, probabilities = local_sum(previous), pack(previous).bitcast(fx.BFloat16)
         offsets = dma_offsets(next_rows, 4)
         _schedule(32, 2, 2)
         _stage_end()
@@ -506,12 +506,12 @@ def _body(
             extent,
             True,
         )
-    scores = exps(fx.Vector(scores))
+    scores = exps(fx.Vector(scores), fx.Float32(maximum))
     total = local_sum(scores)
     total = total + total.shuffle_xor(16, 64)
     total = total + total.shuffle_xor(32, 64)
     row_sum = fx.Float32(row_sum) + total
-    probabilities = pack(scores)
+    probabilities = pack(scores).bitcast(fx.BFloat16)
     _wait(vmcnt=0, lgkmcnt=0)
     _stage_end()
     _stage_end()
@@ -686,7 +686,9 @@ def _launch(
             SCALE,
             value_attrs={
                 "rocdl.waves_per_eu": 2,
-                "passthrough": [["target-features", "-packed-fp32-ops"]],
+                "llvm.target_features": ir.Attribute.parse(
+                    '#llvm.target_features<["-packed-fp32-ops"]>'
+                ),
             },
         ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
 

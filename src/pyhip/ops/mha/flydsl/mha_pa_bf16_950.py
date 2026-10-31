@@ -1,10 +1,10 @@
 """Direct-paged gfx950 BF16 D128/D192, V128 attention with SWA/sinks.
 
-The attention kernel reads SHUFFLE-5D page64 K/V through the current page table.
-No gather, linear-KV workspace, data cache or auxiliary GPU launch is used.
-OPUS's Q/V LDS alias, compile-time wave groups and ping/pong pipeline are retained.
-Only LDS mode is supported; persistent=None keeps the original single-launch
-non-persistent default. Local FlyDSL adapters do not alter the native schedule.
+The attention kernel reads SHUFFLE-5D page64 K/V through the current page table
+with direct-to-LDS DMA. No gather, linear-KV workspace, data cache or auxiliary
+GPU launch is used. OPUS's Q/V LDS alias, compile-time wave groups and the
+eight-stage ping/pong pipeline (see ``_attention_body``) are retained. Only LDS
+mode is supported; persistent=None keeps the single-launch non-persistent grid.
 """
 
 import functools
@@ -18,10 +18,10 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 
-try:
-    from ._dsl import select, rmem, resource, wait
-except ImportError:
-    from _dsl import select, rmem, resource, wait
+from ._common import (
+    _MAX_FLOOR, _exp, _min, _pin, _pin_i32, _reround_if, _schedule, _softmax_scale, _stage_end, _uniform,
+)
+from ._dsl import select, rmem, resource, wait
 
 
 BM, BN, DV, THREADS = 256, 64, 128, 512
@@ -29,19 +29,11 @@ V_TILE = 8 * 2 * 520
 LOG2E = math.log2(math.e)
 
 
-def _min(a, b):
-    return (a < b).select(a, b)
-
-
 def _max(a, b):
     return (a > b).select(a, b)
 
 
-def _uniform(value):
-    return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value).ir_value()))
-
-
-def _prefetch_page(table, index):
+def _read_page_g2r(table, index):
     # Page indices are wave-uniform. SMEM avoids draining the in-flight KV
     # DMA queue, unlike a global_load + vmcnt(0) + readfirstlane sequence.
     address = fx.Int64(fx.ptrtoint(fx.get_iter(table) + fx.Int64(index)))
@@ -61,25 +53,12 @@ def _page_ready(value, vmcnt=None):
     ))
 
 
-def _exp(value):
-    value = fx.Float32(value)
-    return fx.Float32(llvm.call_intrinsic(
-        fx.Float32.ir_type, "llvm.amdgcn.exp2.f32", [value.ir_value()], [], []
-    ))
-
-
 def _scale_sub(value, scale, maximum):
     value, scale, maximum = fx.Float32(value), fx.Float32(scale), fx.Float32(maximum)
     # Keep scalar FMA: packed FP32 VALU cannot co-issue with this MFMA schedule.
     return fx.Float32(llvm.inline_asm(
         fx.Float32.ir_type, [value.ir_value(), scale.ir_value(), maximum.ir_value()],
         "v_fma_f32 $0, $1, $2, -$3", "=v,v,v,v", has_side_effects=False
-    ))
-
-
-def _pin_i32(value):
-    return fx.Int32(llvm.inline_asm(
-        fx.Int32.ir_type, [fx.Int32(value).ir_value()], "", "=v,0", has_side_effects=True
     ))
 
 
@@ -99,22 +78,6 @@ def _join(left, right, count=16, dtype=fx.Float32):
     )
 
 
-def _pin(values, chunk=8):
-    # Chunked tied operands avoid demanding one contiguous 32/64-VGPR block.
-    values = fx.Vector(values)
-    dtype = values.dtype
-    if dtype.width < 32:
-        values = values.bitcast(fx.Int32)
-    chunks = []
-    for start in range(0, values.numel, chunk):
-        part = _slice(values, start, min(chunk, values.numel - start), values.dtype)
-        part = fx.Vector(llvm.inline_asm(
-            part.ir_value().type, [part.ir_value()], "", "=v,0", has_side_effects=True
-        ))
-        chunks.extend(part[i] for i in range(part.numel))
-    return fx.Vector.from_elements(chunks, values.dtype).bitcast(dtype)
-
-
 def _cross32(value, maximum=False):
     pair = rocdl.permlane32_swap(
         ir.Type.parse("!llvm.struct<(i32, i32)>"),
@@ -127,7 +90,7 @@ def _cross32(value, maximum=False):
 
 def _row_max(scores):
     scores = fx.Vector(scores)
-    result = fx.Float32(-1.0e30)
+    result = fx.Float32(_MAX_FLOOR)
     for i in range(32):
         result = result.maximumf(scores[i])
     return _cross32(result, True)
@@ -156,19 +119,7 @@ def _center_slice(scores, scale, maximum, start, end):
     ), 32)
 
 
-def _stage_end():
-    rocdl.sched_barrier(0)
-    rocdl.s_barrier()
-    rocdl.sched_barrier(0)
-
-
-def _schedule(pairs, valu, group, exp=False):
-    for _ in range(pairs):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group)
-        rocdl.sched_group_barrier(0x400 if exp else 0x002, valu, group)
-
-
-def _dma(resource, storage, destination, voffset, soffset):
+def _dma_g2s(resource, storage, destination, voffset, soffset):
     rocdl.raw_ptr_buffer_load_lds(
         as_ir_value(resource), as_ir_value(fx.to_llvm_ptr(fx.get_iter(storage) + destination)),
         as_ir_value(fx.Int32(16)), as_ir_value(fx.Int32(voffset)), as_ir_value(fx.Int32(soffset)),
@@ -176,7 +127,7 @@ def _dma(resource, storage, destination, voffset, soffset):
     )
 
 
-def _read_operand(storage, base, immediate=0):
+def _read_s2r(storage, base, immediate=0):
     # The copy atoms currently model all direct-LDS DMA as one aliasing store:
     # they insert vmcnt(0) even when the phase reads a different ring buffer.
     # Match OPUS's explicit LDS-read boundary; the caller owns lgkmcnt(0) and
@@ -191,22 +142,22 @@ def _read_operand(storage, base, immediate=0):
     )).bitcast(fx.BFloat16)
 
 
-def _read_qk(storage, base, dq, q=False):
+def _read_qk_s2r(storage, base, dq, q=False):
     mma = _tiled_mma()
     tile = rmem((BM if q else BN // 2, dq), fx.BFloat16)
     result = mma.make_fragment_B(tile) if q else mma.make_fragment_A(tile)
     for k in range(dq // 16):
         offset = (k // 4) * 16448 + (k % 4) * 16 if q else k * 1040
-        result[None, 0, k].store(_read_operand(storage, base, offset))
+        result[None, 0, k].store(_read_s2r(storage, base, offset))
     return result
 
 
-def _read_v(storage, base):
+def _read_v_s2r(storage, base):
     # K permutes token bits 2/3 so consecutive P registers correspond to
     # eight consecutive tokens. V can then use native b128 reads, no transpose.
     # Assemble packed words before the BF16 store: repeated BF16 slice stores
     # followed by the tail-mask bitcast otherwise introduce redundant BFI moves.
-    chunks = [_read_operand(storage, base, n * 256 + k * 2080).bitcast(fx.Int32)
+    chunks = [_read_s2r(storage, base, n * 256 + k * 2080).bitcast(fx.Int32)
               for n in range(2) for k in range(4)]
     words = fx.Vector.from_elements([part[i] for part in chunks for i in range(4)], fx.Int32)
     result = rmem(fx.make_layout((8, 4, 2), (1, 8, 32)), fx.BFloat16)
@@ -315,9 +266,15 @@ def _mask(scores, tile, wave_row, kv_len, q_len, causal: fx.Constexpr[bool], win
 
 
 @flyc.jit
-def _rescale(o0, o1, o2, o3, old_max, new_max, row_sum, mask):
+def _rescale(o0, o1, o2, o3, old_max, new_max, row_sum, mask, s_cur, exact):
+    """Lazy rescale of O and l when m moved, plus the exact rule for S'(t).
+
+    The FMA S * scale - m is up to ulp(m) / 2 off the rounded m. Once some |m| >= 2^22
+    (checked when m moves, then sticky), S'(t) is also rounded to a multiple of ulp(m).
+    """
     o0, o1, o2, o3 = fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3)
     old_max, new_max, row_sum = fx.Float32(old_max), fx.Float32(new_max), fx.Float32(row_sum)
+    mask, s_cur, exact = fx.Int64(mask), fx.Vector(s_cur), fx.Int64(exact)
     if mask != fx.Int64(0):
         correction = _exp(old_max - new_max)
         o0 = o0 * correction
@@ -325,7 +282,31 @@ def _rescale(o0, o1, o2, o3, old_max, new_max, row_sum, mask):
         o2 = o2 * correction
         o3 = o3 * correction
         row_sum = row_sum * correction
-    return o0, o1, o2, o3, row_sum
+        exact = exact | fx.Int64(rocdl.ballot(fx.Int64.ir_type, (fx.absf(new_max) >= 2.0**22).ir_value()))
+    s_cur = _reround_if(s_cur, new_max, exact)
+    return o0, o1, o2, o3, row_sum, s_cur, exact
+
+def _store_o_r2g(outputs, inv, o_buf, out_tid, out_row, orow):
+    """O * inv to BF16 (cvt_pk), lane halves swapped with permlane32 into 16-byte row pieces."""
+    out_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16)
+    pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    for g in fx.range_constexpr(8):
+        vals = outputs[g // 2]
+        begin = (g & 1) * 8
+        packed = [rocdl.cvt_pk_bf16_f32(vals[begin + i] * inv, vals[begin + i + 1] * inv) for i in range(0, 8, 2)]
+        # cvt_pk_bf16_f32 is inline asm: LLVM misses the 2 wait states a permlane needs after a VALU write.
+        rocdl.sched_barrier(0)
+        llvm.inline_asm(None, [], "s_nop 1", "", has_side_effects=True)
+        rocdl.sched_barrier(0)
+        pairs = [rocdl.permlane32_swap(pair_type, packed[i], packed[i + 2], False, True) for i in range(2)]
+        words = fx.Vector.from_elements([
+            fx.Int32(llvm.extractvalue(fx.Int32.ir_type, pairs[i & 1], [i // 2])) for i in range(4)
+        ], fx.Int32)
+        src = rmem(fx.make_layout(8, 1), fx.BFloat16)
+        src.store(words.bitcast(fx.BFloat16))
+        offset = out_row * orow + ((out_tid >> 5) & 1) * 8 + g * 16
+        dst = fx.make_view(fx.get_iter(o_buf) + offset, fx.make_layout(8, 1))
+        fx.copy(out_atom, src, dst)
 
 
 @flyc.jit
@@ -340,6 +321,37 @@ def _attention_body(
     REVERSE: fx.Constexpr[bool] = False, MERGED: fx.Constexpr[bool] = False,
     PRUNE_SWA: fx.Constexpr[bool] = False,
 ):
+    """One task: query rows 256 * qb .. + 255 of one head over its visible KV tiles.
+
+    Position t = 0 .. tiles-1 walks the visible tiles (backwards for the REVERSE mirror
+    pass of a MERGED causal pair). LDS holds two K slots and two V slots (tile t in slot
+    t & 1); Q first lands in the V region and moves to registers. Page ids run two tiles
+    ahead, K two tiles ahead (DMA in S4/S6 of phase t - 2) and V in the same phase (DMA
+    in S0 or S2, read in phase t + 1). Phase t runs QK and the row max of tile t and,
+    one tile behind, the exponentials, row sum and PV of tile t - 1. Even stages are
+    memory (DMA/LDS), odd stages compute; waves 4-7 (STAGGER) run one stage behind.
+
+    stage  phase t; cur = t & 1, prev = (t - 1) & 1
+    S0     s2r K(t) keys 0-31 [cur]; STAGGER: g2s V(t) -> [cur]
+    S1     s_load page(t+2); QK: S(t) keys 0-31; softmax: P(t-1) values 0-23
+    S2     s2r K(t) keys 32-63 [cur]; no STAGGER: g2s V(t) -> [cur]; page(t+2) and K(t+1) ready
+    S3     QK: S(t) keys 32-63; softmax: P(t-1) values 24-31, l += row sum, P to BF16
+    S4     s2r V(t-1) dims 0-63 [prev]; g2s K(t+2) -> [cur] (STAGGER: first D64 chunk); mask S(t)
+    S5     PV: O dims 0-63 += P V; softmax: new m, S'(t) values 0..split
+    S6     s2r V(t-1) dims 64-127 [prev]; STAGGER: g2s rest of K(t+2)
+    S7     PV: O dims 64-127 += P V; softmax: S'(t) values split..31; rescale O and l
+
+    Softmax in log2 units: S' = S * scale - m (one FMA), P = exp2(S'), l = sum(P) and
+    O = sum(P V); the output is O / l * v_descale. m moves to a larger row max only when
+    that exceeds m by more than 8. The FMA is up to ulp(m) / 2 off the rounded m: once
+    some |m| >= 2^22 (checked when m moves, then sticky), a cold branch of _rescale also
+    rounds S'(t) to a multiple of ulp(m). A sink is one zero-value virtual key per head
+    that only adds to l.
+    """
+    # FlyDSL keys its disk cache on helpers named in this function's own code, not in closures.
+    _helpers = (_dma_g2s, _read_qk_s2r, _read_v_s2r, _qk, _pv, _mask, _mask_v_tail, _join, _row_max, _row_sum,
+                _exp, _exp_slice, _center_slice, _rescale, _page_ready, _pin, _pin_f32, _schedule, _stage_end, wait,
+                _reround_if)
     K_CHUNKS = DQ // 64
     K_TILE = 8 * K_CHUNKS * 520
     KEEP_VMCNT = K_CHUNKS + 2
@@ -368,7 +380,7 @@ def _attention_body(
     )
     if fx.const_expr(MERGED):
         # Keep the shared scalar scale out of VGPRs across both paired passes.
-        scale_bits = _prefetch_page(KS, fx.Int32(0))
+        scale_bits = _read_page_g2r(KS, fx.Int32(0))
         scale = _page_ready(scale_bits).bitcast(fx.Float32) * fx.Float32(SCALE * LOG2E)
     else:
         scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
@@ -396,14 +408,15 @@ def _attention_body(
         # Q-only coordinates must die after each prologue, not be hoisted
         # across both paired passes and spilled throughout the hot loop.
         q_lane = _pin_i32(lane)
+    # DMA lane offsets (g2s) and LDS read bases (s2r) of Q, K and V.
     local_g = wave + (q_lane >> 3) * 8
-    gq_off = (local_g * QROW + (q_lane & 7) * 8) * 2
-    gk_off = (wave * 512 + lane * 8) * 2
-    gv_off = ((wave >> 1) * 1024 + (wave & 1) * 512 + lane * 8) * 2
+    q_g2s = (local_g * QROW + (q_lane & 7) * 8) * 2
+    k_g2s = (wave * 512 + lane * 8) * 2
+    v_g2s = ((wave >> 1) * 1024 + (wave & 1) * 512 + lane * 8) * 2
     k_row = (lane & 19) | ((lane & 4) << 1) | ((lane & 8) >> 1)
-    rk = k_row * 8 + (lane >> 5) * 520
-    rq = (q_lane & 7) * 2056 + wave * 256 + ((q_lane >> 3) & 3) * 64 + (q_lane >> 5) * 8
-    rv = (lane & 31) * 8 + (lane >> 5) * 1040
+    k_s2r = k_row * 8 + (lane >> 5) * 520
+    q_s2r = (q_lane & 7) * 2056 + wave * 256 + ((q_lane >> 3) & 3) * 64 + (q_lane >> 5) * 8
+    v_s2r = (lane & 31) * 8 + (lane >> 5) * 1040
 
     def data_tile(position):
         return first + (last - position if REVERSE else position)
@@ -412,84 +425,104 @@ def _attention_body(
         return ((data_tile(position) * BN < wave_row + kv_len - q_len + 32)
                 & (data_tile(position) * BN + BN > wave_row + kv_len - q_len - WINDOW)) if PRUNE_SWA else None
 
-    def load_k(physical, slot, begin=0, end=K_CHUNKS):
+    def read_k_g2s(physical, slot, begin=0, end=K_CHUNKS):
         offset = physical * (BN * HK * DQ * 2)
         for d in fx.range_constexpr(begin, end):
-            _dma(gk, storage, slot * K_TILE + (d * 8 + wave) * 520,
-                 gk_off + d * (64 * BN * 2), offset)
+            _dma_g2s(gk, storage, slot * K_TILE + (d * 8 + wave) * 520,
+                     k_g2s + d * (64 * BN * 2), offset)
 
-    def load_v(physical, slot):
+    def read_v_g2s(physical, slot):
         offset = physical * (BN * HK * DV * 2)
         for d in fx.range_constexpr(2):
-            _dma(gv, storage, 2 * K_TILE + slot * V_TILE + (d * 8 + wave) * 520,
-                  gv_off + d * (32 * DV * 2), offset)
+            _dma_g2s(gv, storage, 2 * K_TILE + slot * V_TILE + (d * 8 + wave) * 520,
+                     v_g2s + d * (32 * DV * 2), offset)
 
-    page0 = _prefetch_page(TABLE, data_tile(fx.Int32(0)))
-    page1 = _prefetch_page(TABLE, data_tile(_min(fx.Int32(1), last)))
-    page2 = _prefetch_page(TABLE, data_tile(_min(fx.Int32(2), last)))
-    # Q aliases the entire V region until Q has been read into registers.
-    for d in fx.range_constexpr(K_CHUNKS):
-        for n in fx.range_constexpr(4):
-            _dma(gq, storage, 2 * K_TILE + (d * 8 + wave) * 2056 + n * 512,
-                 gq_off + d * 128 + n * 64 * QROW * 2, fx.Int32(0))
-    page0 = _page_ready(page0)
-    page1 = _page_ready(page1)
-    page2 = _page_ready(page2)
-    load_k(page0, 0)
-    wait(vmcnt=K_CHUNKS)
-    _stage_end()
-    q_frag = _read_qk(storage, 2 * K_TILE + rq, DQ, True)
-    load_k(page1, 1)
-    wait(lgkmcnt=0, vmcnt=K_CHUNKS)
-    _stage_end()
-    if fx.const_expr(STAGGER):
+    def prologue():
+        """Pages 0-2; Q g2s into the V region, K(0) -> [0], K(1) -> [1]; Q s2r; V(0) -> [0];
+        QK S(0), m and S'(0); K(2) -> [0]."""
+        page0 = _read_page_g2r(TABLE, data_tile(fx.Int32(0)))
+        page1 = _read_page_g2r(TABLE, data_tile(_min(fx.Int32(1), last)))
+        page2 = _read_page_g2r(TABLE, data_tile(_min(fx.Int32(2), last)))
+        # Memory: g2s Q; it aliases the entire V region until Q is read into registers.
+        for d in fx.range_constexpr(K_CHUNKS):
+            for n in fx.range_constexpr(4):
+                _dma_g2s(gq, storage, 2 * K_TILE + (d * 8 + wave) * 2056 + n * 512,
+                         q_g2s + d * 128 + n * 64 * QROW * 2, fx.Int32(0))
+        page0 = _page_ready(page0)
+        page1 = _page_ready(page1)
+        page2 = _page_ready(page2)
+        read_k_g2s(page0, 0)
+        # vmcnt(K_CHUNKS): Q landed; K(0) may still be in flight.
+        wait(vmcnt=K_CHUNKS)
         _stage_end()
-
-    k_frag = _read_qk(storage, rk, DQ)
-    load_v(page0, 0)
-    wait(lgkmcnt=0)
-    _stage_end()
-    s0 = _qk(q_frag, k_frag, visible_wave_tile(fx.Int32(0)))
-    o0 = fx.Vector.filled(16, 0.0, fx.Float32)
-    o1 = fx.Vector.filled(16, 0.0, fx.Float32)
-    o2 = fx.Vector.filled(16, 0.0, fx.Float32)
-    o3 = fx.Vector.filled(16, 0.0, fx.Float32)
-    _schedule(DQ // 16, 3 if DQ == 192 else 5, 5)
-    o0, o1, o2, o3 = _pin(o0), _pin(o1), _pin(o2), _pin(o3)
-    _stage_end()
-    k_frag = _read_qk(storage, rk + 256, DQ)
-    wait(lgkmcnt=0)
-    _stage_end()
-    s1 = _qk(q_frag, k_frag, visible_wave_tile(fx.Int32(0)))
-    scores = _mask(_join(s0, s1), data_tile(fx.Int32(0)), wave_row, kv_len, q_len, CAUSAL, WINDOW)
-    maximum = (_row_max(scores) * scale).maximumf(fx.Float32(-1.0e30))
-    row_sum = fx.Float32(0.0)
-    if fx.const_expr(HAS_SINK):
-        # One zero-value virtual key per head. row_sum is already reduced
-        # across lane +/-32, so the sink contributes once, not twice.
-        sink_log2 = fx.Float32(SINK[head]) * fx.Float32(LOG2E)
-        maximum = maximum.maximumf(sink_log2)
-        row_sum = _exp(sink_log2 - maximum)
-    scores = _center_slice(scores, scale, maximum, 0, 32)
-    wait(vmcnt=2)
-    _stage_end()
-    load_k(page2, 0)
-    _stage_end()
-
-    @flyc.jit
-    def phase(previous, maximum, row_sum, o0, o1, o2, o3, current_page, next_page, t, CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
-        previous = fx.Vector(previous)
-        o0, o1, o2, o3 = fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3)
-        maximum, row_sum, t = fx.Float32(maximum), fx.Float32(row_sum), fx.Int32(t)
-        # S0/S1: memory of t, then QK(t) + exp(t-1).
-        k = _read_qk(storage, CUR * K_TILE + rk, DQ)
+        # Memory: s2r Q (stays in registers); g2s K(1).
+        q_frag = _read_qk_s2r(storage, 2 * K_TILE + q_s2r, DQ, True)
+        read_k_g2s(page1, 1)
+        wait(lgkmcnt=0, vmcnt=K_CHUNKS)
+        _stage_end()
         if fx.const_expr(STAGGER):
-            load_v(current_page, CUR)
+            # Waves 4-7 fall one stage behind.
+            _stage_end()
+        # Memory: s2r K(0) keys 0-31; g2s V(0) now that Q left the V region.
+        k_lo = _read_qk_s2r(storage, k_s2r, DQ)
+        read_v_g2s(page0, 0)
         wait(lgkmcnt=0)
         _stage_end()
-        future_page = _prefetch_page(TABLE, data_tile(_min(t + 2, last)))
-        lo = _qk(q_frag, k, visible_wave_tile(t))
-        previous = _pin(_exp_slice(previous, 0, 24), 32)
+        # Compute: QK S(0) keys 0-31; O = 0.
+        s_lo = _qk(q_frag, k_lo, visible_wave_tile(fx.Int32(0)))
+        o0 = fx.Vector.filled(16, 0.0, fx.Float32)
+        o1 = fx.Vector.filled(16, 0.0, fx.Float32)
+        o2 = fx.Vector.filled(16, 0.0, fx.Float32)
+        o3 = fx.Vector.filled(16, 0.0, fx.Float32)
+        _schedule(DQ // 16, 3 if DQ == 192 else 5, 5)
+        o0, o1, o2, o3 = _pin(o0), _pin(o1), _pin(o2), _pin(o3)
+        _stage_end()
+        # Memory: s2r K(0) keys 32-63.
+        k_hi = _read_qk_s2r(storage, k_s2r + 256, DQ)
+        wait(lgkmcnt=0)
+        _stage_end()
+        # Compute: QK S(0) keys 32-63; softmax m (with the sink) and S'(0).
+        s_hi = _qk(q_frag, k_hi, visible_wave_tile(fx.Int32(0)))
+        s_0 = _mask(_join(s_lo, s_hi), data_tile(fx.Int32(0)), wave_row, kv_len, q_len, CAUSAL, WINDOW)
+        row_max = (_row_max(s_0) * scale).maximumf(fx.Float32(_MAX_FLOOR))
+        row_sum = fx.Float32(0.0)
+        if fx.const_expr(HAS_SINK):
+            # One zero-value virtual key per head. row_sum is already reduced
+            # across lane +/-32, so the sink contributes once, not twice.
+            sink_log2 = fx.Float32(SINK[head]) * fx.Float32(LOG2E)
+            row_max = row_max.maximumf(sink_log2)
+            row_sum = _exp(sink_log2 - row_max)
+        s_0 = _center_slice(s_0, scale, row_max, 0, 32)
+        # The exact rule of _rescale for S'(0); exact carries it through the phases.
+        exact = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (fx.absf(row_max) >= 2.0**22).ir_value()))
+        s_0 = _reround_if(s_0, row_max, exact)
+        wait(vmcnt=2)
+        _stage_end()
+        # Memory: g2s K(2) into the retired slot 0.
+        read_k_g2s(page2, 0)
+        _stage_end()
+        return q_frag, (s_0, row_max, row_sum, o0, o1, o2, o3, page1, page2, exact)
+
+    @flyc.jit
+    def phase(s_prev, row_max, row_sum, o0, o1, o2, o3, page_cur, page_next, exact, t,
+              CUR: fx.Constexpr[int], PREV: fx.Constexpr[int]):
+        """Phase t (table in _attention_body); page_cur/page_next are the page ids of tiles t and t+1.
+
+        exact carries the exact rule of _rescale.
+        """
+        s_prev, exact = fx.Vector(s_prev), fx.Int64(exact)
+        o0, o1, o2, o3 = fx.Vector(o0), fx.Vector(o1), fx.Vector(o2), fx.Vector(o3)
+        row_max, row_sum, t = fx.Float32(row_max), fx.Float32(row_sum), fx.Int32(t)
+        # S0 memory: s2r K(t) keys 0-31; STAGGER: g2s V(t).
+        k_lo = _read_qk_s2r(storage, CUR * K_TILE + k_s2r, DQ)
+        if fx.const_expr(STAGGER):
+            read_v_g2s(page_cur, CUR)
+        wait(lgkmcnt=0)
+        _stage_end()
+        # S1 compute: s_load page(t+2); QK S(t) keys 0-31; P(t-1) values 0-23.
+        page_next2 = _read_page_g2r(TABLE, data_tile(_min(t + 2, last)))
+        s_lo = _qk(q_frag, k_lo, visible_wave_tile(t))
+        p_prev = _pin(_exp_slice(s_prev, 0, 24), 32)
         if fx.const_expr(DQ == 128):
             _schedule(8, 3, 1, True)
         elif fx.const_expr(STAGGER):
@@ -502,17 +535,18 @@ def _attention_body(
             _schedule(1, 2, 1, True)
             _schedule(8, 3, 1, True)
         _stage_end()
-        # S2/S3: second QK half + remaining exp, sum, BF16 P.
-        k = _read_qk(storage, CUR * K_TILE + rk + 256, DQ)
+        # S2 memory: s2r K(t) keys 32-63; no STAGGER: g2s V(t).
+        k_hi = _read_qk_s2r(storage, CUR * K_TILE + k_s2r + 256, DQ)
         if fx.const_expr(not STAGGER):
-            load_v(current_page, CUR)
+            read_v_g2s(page_cur, CUR)
         # One instruction retains both the rolling DMA and page/LDS waits.
-        future_page = _page_ready(future_page, KEEP_VMCNT)
+        page_next2 = _page_ready(page_next2, KEEP_VMCNT)
         _stage_end()
-        hi = _qk(q_frag, k, visible_wave_tile(t))
-        previous = _exp_slice(previous, 24, 32)
-        row_sum = _pin_f32(row_sum + _row_sum(previous))
-        p = _pin(previous.to(fx.BFloat16), 16)
+        # S3 compute: QK S(t) keys 32-63; P(t-1) values 24-31, l += row sum, BF16 P.
+        s_hi = _qk(q_frag, k_hi, visible_wave_tile(t))
+        p_prev = _exp_slice(p_prev, 24, 32)
+        row_sum = _pin_f32(row_sum + _row_sum(p_prev))
+        p_bf16 = _pin(p_prev.to(fx.BFloat16), 16)
         _schedule(2, 3, 2, True)
         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 2)
         rocdl.sched_group_barrier(0x400, 2, 2)
@@ -525,109 +559,108 @@ def _attention_body(
             _schedule(2, 6, 2)
             _schedule(1, 2, 2)
         _stage_end()
-        current = _join(lo, hi)
-        # S4/S5: V(t-1), K(t+2), then PV + current softmax head.
-        v = _read_v(storage, 2 * K_TILE + PREV * V_TILE + rv)
-        load_k(future_page, CUR, 0, 1 if STAGGER else K_CHUNKS)
-        current = _mask(current, data_tile(t), wave_row, kv_len, q_len, CAUSAL, WINDOW)
+        s_cur = _join(s_lo, s_hi)
+        # S4 memory: s2r V(t-1) dims 0-63 [PREV]; g2s K(t+2) -> [CUR]; mask S(t).
+        v_lo = _read_v_s2r(storage, 2 * K_TILE + PREV * V_TILE + v_s2r)
+        read_k_g2s(page_next2, CUR, 0, 1 if STAGGER else K_CHUNKS)
+        s_cur = _mask(s_cur, data_tile(t), wave_row, kv_len, q_len, CAUSAL, WINDOW)
         wait(lgkmcnt=0)
         if fx.const_expr(REVERSE):
             # Forward phases consume t-1 <= tiles-2: these V pages are full.
             # Reverse traversal can consume the partial final page at t=1.
             rocdl.sched_barrier(0)
-            v.store(_mask_v_tail(v.load(), kv_len - data_tile(t - 1) * BN))
+            v_lo.store(_mask_v_tail(v_lo.load(), kv_len - data_tile(t - 1) * BN))
         _stage_end()
-        o0, o1 = _pv(p, v, o0, o1, visible_wave_tile(t - 1))
-        candidate = _row_max(current) * scale
-        mask = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - maximum > 8.0).ir_value()))
-        new_max = _pin_f32((mask != fx.Int64(0)).select(maximum.maximumf(candidate), maximum))
+        # S5 compute: PV O dims 0-63; lazy new m of S(t) and S'(t) values 0..split.
+        o0, o1 = _pv(p_bf16, v_lo, o0, o1, visible_wave_tile(t - 1))
+        candidate = _row_max(s_cur) * scale
+        ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, (candidate - row_max > 8.0).ir_value()))
+        new_max = _pin_f32((ballot != fx.Int64(0)).select(row_max.maximumf(candidate), row_max))
         split = 12 if STAGGER else 6
-        current = _center_slice(current, scale, new_max, 0, split)
+        s_cur = _center_slice(s_cur, scale, new_max, 0, split)
         for count in (5, 5, 6, 4, 2, 4, 4, 4):
             _schedule(1, count, 3)
         _stage_end()
-        # S6/S7: other V half, then finish PV and conditional rescale.
-        v = _read_v(storage, 2 * K_TILE + PREV * V_TILE + 520 + rv)
+        # S6 memory: s2r V(t-1) dims 64-127 [PREV]; STAGGER: g2s the rest of K(t+2).
+        v_hi = _read_v_s2r(storage, 2 * K_TILE + PREV * V_TILE + 520 + v_s2r)
         if fx.const_expr(STAGGER):
-            load_k(future_page, CUR, 1, K_CHUNKS)
+            read_k_g2s(page_next2, CUR, 1, K_CHUNKS)
         wait(lgkmcnt=0, vmcnt=KEEP_VMCNT)
         if fx.const_expr(REVERSE):
             rocdl.sched_barrier(0)
-            v.store(_mask_v_tail(v.load(), kv_len - data_tile(t - 1) * BN))
+            v_hi.store(_mask_v_tail(v_hi.load(), kv_len - data_tile(t - 1) * BN))
         _stage_end()
-        o2, o3 = _pv(p, v, o2, o3, visible_wave_tile(t - 1))
-        current = _center_slice(current, scale, new_max, split, 32)
+        # S7 compute: PV O dims 64-127; S'(t) values split..31; lazy rescale of O and l.
+        o2, o3 = _pv(p_bf16, v_hi, o2, o3, visible_wave_tile(t - 1))
+        s_cur = _center_slice(s_cur, scale, new_max, split, 32)
         if fx.const_expr(STAGGER):
             for count in (3, 2, 2, 2, 3, 3, 4, 4):
                 _schedule(1, count, 4)
         else:
             _schedule(2, 3, 4)
             _schedule(5, 4, 4)
-        o0, o1, o2, o3, row_sum = _rescale(o0, o1, o2, o3, maximum, new_max, row_sum, mask)
+        o0, o1, o2, o3, row_sum, s_cur, exact = _rescale(o0, o1, o2, o3, row_max, new_max, row_sum, ballot, s_cur,
+                                                         exact)
         _stage_end()
-        return current, new_max, row_sum, o0, o1, o2, o3, next_page, future_page
+        return s_cur, new_max, row_sum, o0, o1, o2, o3, page_next, page_next2, exact
 
+    def epilogue(state):
+        """exp, row sum and PV of the last tile; V(last) sits in slot last & 1."""
+        s_last, row_max, row_sum, o0, o1, o2, o3 = state[:7]
+        row_max, row_sum = fx.Float32(row_max), fx.Float32(row_sum)
+        # vmcnt(K_CHUNKS): V(last) landed; the speculative K DMA may still be in flight.
+        wait(vmcnt=K_CHUNKS)
+        _stage_end()
+        p_last = _exp_slice(s_last, 0, 32)
+        row_sum = row_sum + _row_sum(p_last)
+        p_bf16 = _pin(p_last.to(fx.BFloat16))
+        _stage_end()
+        last_slot = (tiles - 1) & 1
+        # Memory: s2r V(last) dims 0-63, zeroing rows past kv_len (0 * NaN is NaN).
+        v_lo = _read_v_s2r(storage, 2 * K_TILE + last_slot * V_TILE + v_s2r)
+        wait(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        v_lo.store(_mask_v_tail(v_lo.load(), kv_len - data_tile(last) * BN))
+        _stage_end()
+        o0, o1 = _pv(p_bf16, v_lo, o0, o1, visible_wave_tile(last))
+        _stage_end()
+        # Memory: s2r V(last) dims 64-127.
+        v_hi = _read_v_s2r(storage, 2 * K_TILE + last_slot * V_TILE + 520 + v_s2r)
+        wait(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        v_hi.store(_mask_v_tail(v_hi.load(), kv_len - data_tile(last) * BN))
+        _stage_end()
+        o2, o3 = _pv(p_bf16, v_hi, o2, o3, visible_wave_tile(last))
+        rocdl.sched_barrier(0)
+        if fx.const_expr(not STAGGER):
+            rocdl.s_barrier()
+        return row_max, row_sum, (o0, o1, o2, o3)
+
+    # Pipeline: prologue stages Q, K(0..2), V(0) and runs QK(0); phase t = 1 .. tiles - 1
+    # (two per trip with constant slots); epilogue finishes PV(last).
+    q_frag, state = prologue()
     for t in range(fx.Int32(1), tiles - 1, fx.Int32(2)):
         rocdl.sched_barrier(0)
-        scores, maximum, row_sum, o0, o1, o2, o3, page1, page2 = phase(scores, maximum, row_sum, o0, o1, o2, o3, page1, page2, t, 1, 0)
+        state = phase(*state, t, 1, 0)
         rocdl.sched_barrier(0)
-        scores, maximum, row_sum, o0, o1, o2, o3, page1, page2 = phase(scores, maximum, row_sum, o0, o1, o2, o3, page1, page2, t + 1, 0, 1)
+        state = phase(*state, t + 1, 0, 1)
         rocdl.sched_barrier(0)
     rocdl.sched_barrier(0)
     if (tiles & 1) == 0:
-        scores, maximum, row_sum, o0, o1, o2, o3, page1, page2 = phase(scores, maximum, row_sum, o0, o1, o2, o3, page1, page2, tiles - 1, 1, 0)
-
-    maximum, row_sum = fx.Float32(maximum), fx.Float32(row_sum)
-    wait(vmcnt=K_CHUNKS)
-    _stage_end()
-    scores = _exp_slice(scores, 0, 32)
-    row_sum = row_sum + _row_sum(scores)
-    p = _pin(scores.to(fx.BFloat16))
-    _stage_end()
-    last_slot = (tiles - 1) & 1
-    v = _read_v(storage, 2 * K_TILE + last_slot * V_TILE + rv)
-    wait(lgkmcnt=0)
-    rocdl.sched_barrier(0)
-    v.store(_mask_v_tail(v.load(), kv_len - data_tile(last) * BN))
-    _stage_end()
-    o0, o1 = _pv(p, v, o0, o1, visible_wave_tile(last))
-    _stage_end()
-    v = _read_v(storage, 2 * K_TILE + last_slot * V_TILE + 520 + rv)
-    wait(lgkmcnt=0)
-    rocdl.sched_barrier(0)
-    v.store(_mask_v_tail(v.load(), kv_len - data_tile(last) * BN))
-    _stage_end()
-    o2, o3 = _pv(p, v, o2, o3, visible_wave_tile(last))
-    rocdl.sched_barrier(0)
-    if fx.const_expr(not STAGGER):
-        rocdl.s_barrier()
+        state = phase(*state, tiles - 1, 1, 0)
+    row_max, row_sum, outputs = epilogue(state)
 
     out_tid = fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [tid.ir_value()], "", "=v,0", has_side_effects=True))
     out_row = (out_tid >> 6) * 32 + (out_tid & 31)
     o_ptr = fx.get_iter(O) + ((fx.Int64(q0) + fx.Int64(q_start)) * OROW + fx.Int64(head) * OHEAD)
     o_buf = rocdl.make_buffer_tensor(fx.make_view(o_ptr, fx.make_layout((BM, DV), (OROW, 1))), num_records_bytes=q_valid * OROW * 2)
-    out_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16)
     inv = (row_sum > 0.0).select(fx.Float32(1.0) / row_sum, fx.Float32(0.0)) * VS[0]
-    outputs = (o0, o1, o2, o3)
-    pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    for g in fx.range_constexpr(8):
-        vals = outputs[g // 2]
-        begin = (g & 1) * 8
-        packed = [rocdl.cvt_pk_bf16_f32(vals[begin + i] * inv, vals[begin + i + 1] * inv) for i in range(0, 8, 2)]
-        pairs = [rocdl.permlane32_swap(pair_type, packed[i], packed[i + 2], False, True) for i in range(2)]
-        words = fx.Vector.from_elements([
-            fx.Int32(llvm.extractvalue(fx.Int32.ir_type, pairs[i & 1], [i // 2])) for i in range(4)
-        ], fx.Int32)
-        src = rmem(fx.make_layout(8, 1), fx.BFloat16)
-        src.store(words.bitcast(fx.BFloat16))
-        offset = out_row * OROW + ((out_tid >> 5) & 1) * 8 + g * 16
-        dst = fx.make_view(fx.get_iter(o_buf) + offset, fx.make_layout(8, 1))
-        fx.copy(out_atom, src, dst)
+    _store_o_r2g(outputs, inv, o_buf, out_tid, out_row, OROW)
     if fx.const_expr(WITH_LSE):
         if (out_tid & 63) < 32:
             if out_row < q_valid:
                 log_l = fx.Float32(llvm.call_intrinsic(fx.Float32.ir_type, "llvm.log2.f32", [row_sum.ir_value()], [], []))
-                lse = (row_sum > 0.0).select((maximum + log_l) * fx.Float32(math.log(2.0)), fx.Float32(float("-inf")))
+                lse = (row_sum > 0.0).select((row_max + log_l) * fx.Float32(math.log(2.0)), fx.Float32(float("-inf")))
                 LSE[(q0 + q_start + out_row) * H + head] = lse
 
 
@@ -738,6 +771,9 @@ def _atomic_increment(counter, index):
 
 @flyc.jit
 def _next_ticket(counter, mailbox, tid):
+    # Every wave read the previous ticket before this rendezvous; a task without
+    # barriers (empty KV) would otherwise let tid 0 overwrite it first.
+    _stage_end()
     if tid == 0:
         mailbox[0] = _atomic_increment(counter, 0)
         wait(lgkmcnt=0)
@@ -897,6 +933,9 @@ class _PagedAttention:
                  kv_last_page_lens, out=None, sink_ptr=None, stream=None, *, return_lse=False, lse=None, softmax_scale=None):
         """Run paged attention; descales must be finite and strictly positive.
 
+        softmax_scale * log2(e) * q_descale * k_descale must be a positive finite
+        FP32. K/V within each KV length must be finite: rows of a causal tile share
+        its V, so a non-finite value also reaches rows that mask its key.
         A sink is an unscaled natural-logit, per query head, for a virtual key
         with value zero. Finite sink logits and -inf (disabled) are supported.
         GPU metadata values (page IDs, prefix sums, last-page lengths and the
@@ -926,8 +965,7 @@ class _PagedAttention:
             raise ValueError("sequence-length bounds must be nonnegative")
         if K.numel() * K.element_size() >= 2**31:
             raise NotImplementedError("physical KV cache must fit the signed 32-bit buffer offset")
-        if softmax_scale is not None and (not math.isfinite(softmax_scale) or softmax_scale <= 0):
-            raise ValueError("softmax_scale must be finite and positive")
+        scale = _softmax_scale(softmax_scale, 1 / math.sqrt(self.dq))
         batch = cu_seqlens_q.numel() - 1
         if batch < 1 or kv_indptr.numel() != batch + 1 or kv_last_page_lens.numel() != batch:
             raise ValueError("inconsistent batch metadata")
@@ -963,8 +1001,7 @@ class _PagedAttention:
                 self.heads, self.kv_heads, K.shape[0], batch, max_seqlen_q,
                 self.dq, self.window_left, self.has_sink,
                 Q.stride(0), Q.stride(1), out.stride(0), out.stride(1),
-                q_descale.numel() != 1, self.causal, lse is not None,
-                float(1 / math.sqrt(self.dq) if softmax_scale is None else softmax_scale),
+                q_descale.numel() != 1, self.causal, lse is not None, scale,
             )
             if self.persistent:
                 counter, grid = self._scheduler(Q.device, stream, batch, max_seqlen_q)

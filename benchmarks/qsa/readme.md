@@ -85,6 +85,8 @@ decode_r1_n12000   1:qsa_indexer_decode_logits            <实测值>    valid/i
 
 2026-10-02/03，MI308X/gfx942，原cudaPerf、10buffers、2warmup、128samples，每次运行使用新建的FlyDSL缓存目录，均在GPU2（PCI 0000:a4:00.0）上实测。Attention是2026-10-04把K3路由改为单一步数阈值之后重测的；indexer是10-02去掉整数特化和首次调用预编译之后测的。每次开始前8张卡use均为0%。Attention测量期间，本会话在GPU5、GPU6上同时运行check-only和pytest；indexer测量期间，本会话在GPU4–6上运行编译清单；都没有使用GPU2。按当前协议未做硬件门禁。各组均通过正确性与源码哈希检查。单位为微秒，取全部样本中位数；单节点图重放包含该launch的固定开销，不能把这些中位数相加作为整体调用时间。
 
+2026-10-22 attention_union随MHA共用helper改为先舍入`S·scale`再减m，并改用`llvm.target_features`：GPU6同协议先后运行，TP2/4/8的union kernel快1.8%/2.0%/2.1%，整体快0.6%/1.1%/2.0%；下表未重测，见源码readme优化历史10-22条。
+
 Attention：M=N=12000、D256、KV1，默认合成选择及自动分流。TP2/4/8是单卡H12/H6/H3形状。完整因果前缀行也和其它行一样在union/direct间选择；总行数少于`max(384, 64*H/HK)`（H12为768，H6/H3为384）时不建union计划，全部走direct。各请求KV按4-token对齐后PK+PV不超过64MiB时direct走packed（含多请求和KV长度非4倍数），超出时走raw。逐tile公式之后，attention_order_masks再做一次全局路由：union受最长任务限制时选一个步数阈值，把更长的union tile改走direct，最多全部改走direct。Union tile为H12 10行、H6 16行、H3 32行；大单请求无prefix且行数足够时H6取21行、H3取42行，本例TP4/TP8即为21/42。本例union/direct行数为TP2 6330/5670、TP4 10053/1947、TP8 12000/0。合成选择的块号乱序，attention_recover_scatter逐行排序；PyHIP prefill indexer的升序输出同样排序，只有块号恰为0,1,2,…的完整因果前缀行跳过排序。
 
 | Kernel | TP2/H12 | TP4/H6 | TP8/H3 |
