@@ -67,15 +67,14 @@ def run_test(
 ):
     from pyhip.ops.gemm.flydsl.gemm_mxfp8_4w import compile_gemm_fp8
 
-    assert N % (256 if PRESHUFFLE_B else 8) == 0
-    assert not B_MXFP4 or not PRESHUFFLE_B
+    assert N % ((16 if B_MXFP4 else 256) if PRESHUFFLE_B else 8) == 0
     if B_LDS_SWIZZLE is None:
         B_LDS_SWIZZLE = True if B_MXFP4 else USE_SWIZZLE
     shuffle_weight = _load_shuffle_weight() if PRESHUFFLE_B else None
     mxfp8_quant = _load_mxfp8_quant() if (with_scale or B_MXFP4) else None
 
     def _shuffle_b(x):
-        return shuffle_weight(x, layout=(16, 64)) if PRESHUFFLE_B else x
+        return shuffle_weight(x, layout=(16, 16 if B_MXFP4 else 64)) if PRESHUFFLE_B else x
 
     def _permute_scale(scale, padded_rows):
         scale = scale.view(torch.uint8)
@@ -357,11 +356,12 @@ def test_accuracy(M, N, K, with_scale, B_MXFP4):
     ],
 )
 @pytest.mark.parametrize("with_scale", [False, True])
-def test_layout_accuracy(options, with_scale):
-    if with_scale or options.get("PRESHUFFLE_B", False):
+@pytest.mark.parametrize("B_MXFP4", [False, True])
+def test_layout_accuracy(options, with_scale, B_MXFP4):
+    if with_scale or B_MXFP4 or options.get("PRESHUFFLE_B", False):
         pytest.importorskip("aiter")
     assert run_test(
-        M=256, N=256, K=512, with_scale=with_scale, B_MXFP4=False, perf=False, **options
+        M=256, N=256, K=512, with_scale=with_scale, B_MXFP4=B_MXFP4, perf=False, **options
     )
 
 
@@ -374,6 +374,52 @@ def test_mxfp4_padding_accuracy(M, N, K, with_scale):
         M, N, K, with_scale=with_scale, B_MXFP4=True,
         B_LDS_SWIZZLE=False, perf=False,
     )
+
+
+@pytest.mark.usefixtures("cdna4_device")
+@pytest.mark.parametrize("M,N,K", [(33, 64, 512), (257, 272, 768), (300, 512, 6144)])
+@pytest.mark.parametrize("b_lds_swizzle", [True, False])
+def test_mxfp4_preshuffle_matches_raw(M, N, K, b_lds_swizzle):
+    """Preshuffled MXFP4 B changes only DMA source addresses."""
+    pytest.importorskip("aiter")
+    from pyhip.ops.gemm.flydsl.gemm_mxfp8_4w import compile_gemm_fp8
+
+    shuffle_weight = _load_shuffle_weight()
+    quant, dtypes, e8m0_to_f32, mxfp4_to_f32 = _load_mxfp8_quant()
+
+    def mx_quant(rows, dtype, scale):
+        x = (torch.randn((rows, K), device="cuda") * scale).to(torch.bfloat16)
+        return quant(x, quant_dtype=dtype, scale_type=dtypes.fp8_e8m0, shuffle=False)
+
+    def permute_scale(scale, rows):
+        padded = torch.full((div_up(rows, 256) * 256, K // 32), 127,
+                            device="cuda", dtype=torch.uint8)
+        padded[:rows] = scale.view(torch.uint8)
+        packed = padded.view(-1, 4, 32, K // 32).permute(3, 0, 2, 1).contiguous()
+        return packed.view(torch.int32)
+
+    a, scale_a = mx_quant(M, dtypes.fp8, 0.75)
+    b, scale_b = mx_quant(N, dtypes.fp4x2, 3.0)
+    scales = (permute_scale(scale_a, M), permute_scale(scale_b, N))
+    outputs = []
+    for preshuffle_b in (False, True):
+        weight = shuffle_weight(b, layout=(16, 16)) if preshuffle_b else b
+        out = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+        args = (a.view(torch.int8), weight.view(torch.int8), *scales,
+                out.view(-1), M, torch.cuda.current_stream())
+        launcher = compile_gemm_fp8(
+            TILE_M, TILE_N, TILE_K, N, K, b_lds_swizzle=b_lds_swizzle,
+            preshuffle_b=preshuffle_b, with_scale=True, b_mxfp4=True,
+        )
+        flyc.compile[{"opt_level": 2}](launcher, *args)(*args)
+        torch.cuda.synchronize()
+        outputs.append(out)
+
+    scale_a_f32 = e8m0_to_f32(scale_a).repeat_interleave(32, dim=1)
+    scale_b_f32 = e8m0_to_f32(scale_b).repeat_interleave(32, dim=1)
+    ref = ((a.float() * scale_a_f32) @ (mxfp4_to_f32(b) * scale_b_f32).t()).bfloat16()
+    assert torch.equal(outputs[0], outputs[1])
+    assert pyhip.calc_diff(outputs[1].float(), ref, diff_thr=0.00001) <= 0.00001
 
 
 @pytest.mark.perf

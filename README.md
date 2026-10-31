@@ -54,7 +54,7 @@ from repository tests or a test-directory `PYTHONPATH`.
 
 | Operator family | Implementations currently present |
 |---|---|
-| [GEMM / Linear](src/pyhip/ops/gemm) | Assembly and an ASM/Aiter quantized Linear wrapper |
+| [GEMM / Linear](src/pyhip/ops/gemm) | Assembly, FlyDSL, quantized Linear, and an Aiter-compatible autotuned A8W4 API |
 | [MoE](src/pyhip/ops/moe) | Assembly, FlyDSL, and an Aiter-compatible autotuned API |
 | [Attention](src/pyhip/ops/attention) | Assembly paged attention |
 | [Convolution](src/pyhip/ops/conv) | HIP depthwise and assembly/Gluon pointwise implementations |
@@ -70,6 +70,12 @@ Other API features are forwarded to Aiter. Fixed kernel tests use
 `pyhip.testing.moe.make_moe_runner`, without autotuning or fallback. The old
 MoE wrappers and their `method="auto"/"jit"` interface have been removed.
 Optional Gluon convolution implementations remain available.
+
+MXFP8 x MXFP4 GEMM uses
+`pyhip.ops.gemm.tuned_gemm_a8w4.gemm_a8w4_mxfp8`, with Aiter's ops signature.
+On gfx950 it validates and autotunes Aiter/PyHIP candidates, then reuses FlyDSL
+winner caches or exported JSON configurations. See the
+[A8W4 GEMM guide](src/pyhip/ops/gemm/README.md) for the input layouts and workflow.
 
 For example, this BF16 grouped pointwise convolution uses the Gluon path:
 
@@ -96,7 +102,7 @@ their signatures rather than assuming identical call conventions.
 ```text
 src/pyhip/                  # Installed Python package
 ├── ops/                    # Operators, grouped by operation and backend
-│   ├── gemm/               # asm/ and existing wrappers
+│   ├── gemm/               # asm/, flydsl/, autotuned A8W4 API and Linear wrappers
 │   ├── moe/                # asm/, flydsl/, autotuned MoE API
 │   ├── attention/          # asm/
 │   ├── conv/               # Wrappers and packaged hip/ sources

@@ -16,6 +16,7 @@ python benchmarks/moe/bench_tuned_moe.py --help
 python benchmarks/moe/bench_tuned_moe.py --list-models
 python benchmarks/conv/test_conv_depthwise.py --help
 python benchmarks/gemm/test_w8a8_block_fp8_linear.py
+python benchmarks/gemm/tune_gemm_a8w4.py --help
 ```
 
 The MoE comparison runs both APIs in one process. Fixed BF16 8-wave and MXFP4
@@ -28,6 +29,12 @@ For same-shape Aiter vs autotuned PyHIP MoE comparisons, use
 with the fixed-kernel pytest suite, validates both backends independently, and
 exports raw timings without backend-specific shape padding. See the
 [MoE benchmark guide](moe/README.md) for the protocol and result statuses.
+
+For MXFP8 x MXFP4 GEMM, [tune_gemm_a8w4.py](gemm/tune_gemm_a8w4.py) uses the
+same runtime autotuner as the public API, supports JSON config export/reuse,
+and compares the best Aiter candidate with automatic Aiter/PyHIP dispatch.
+See the [A8W4 GEMM guide](../src/pyhip/ops/gemm/README.md) for layout constraints,
+cache controls and the rotating-buffer timing protocol.
 
 GRRead keeps its benchmark CLI in
 [bench_gr_read_compare.py](../tests/ops/gr_read/bench_gr_read_compare.py), beside

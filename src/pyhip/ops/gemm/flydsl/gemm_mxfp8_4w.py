@@ -174,9 +174,9 @@ def _compile_gemm_fp8_cached(
     assert BLOCK_K == 128
     assert K % 256 == 0
     assert N % 8 == 0
-    # 目前不支持mxfp4 weight preshuffle.
-    # preshuffle只支持mxfp8 for now.
-    assert not b_mxfp4 or not preshuffle_b
+    # MXFP4 preshuffle reads Aiter's shuffle_weight(16, 16) bytes through the
+    # same DMA slots as raw B; whole 16-row blocks keep OOB rows outside N.
+    assert not (b_mxfp4 and preshuffle_b) or N % 16 == 0
     if b_lds_swizzle is None:
         b_lds_swizzle = True if b_mxfp4 else lds_swizzle
     if not b_mxfp4 and b_lds_swizzle != lds_swizzle:
@@ -577,7 +577,7 @@ def _compile_gemm_fp8_cached(
                     ((BLOCK_K, b_group16), 1),
                 )
                 _rd_b = _wr_b
-        if const_expr(preshuffle_b):
+        if const_expr(preshuffle_b and not b_mxfp4):
             _b_lds = fx.make_layout(
                 ((16, BLOCK_N // 16), (16, BLOCK_K // 16)), ((16, 2048), (1, 256))
             )
@@ -630,7 +630,7 @@ def _compile_gemm_fp8_cached(
         # ----g2s raw API: B DMA copy vmem offset and lds offset. ----
         # B :计算vmem 的 行，列 以及 LDS的offset.
         def b_copy_slots(copy_round):
-            if const_expr(preshuffle_b):
+            if const_expr(preshuffle_b and not b_mxfp4):
                 physical_slot = tid + copy_round * 256
                 nb = physical_slot // 128
                 in_nb = physical_slot % 128
@@ -652,7 +652,16 @@ def _compile_gemm_fp8_cached(
                     row = chunk * 16 + lane_id // 4
                     col_byte = (lane_id % 4) * 16
                     lds_byte = chunk * (b_group16 // 2)
-                src_byte = fx.Int32(row) * (K // 2) + fx.Int32(col_byte)
+                if const_expr(preshuffle_b):
+                    # Shuffled 16-row block: [16-byte K chunk][row % 16][16 bytes].
+                    # Only the global source changes; the LDS tile is identical.
+                    src_byte = (
+                        fx.Int32(row) // 16 * (16 * (K // 2))
+                        + fx.Int32(col_byte) // 16 * 256
+                        + fx.Int32(row) % 16 * 16
+                    )
+                else:
+                    src_byte = fx.Int32(row) * (K // 2) + fx.Int32(col_byte)
             else:
                 row, col_byte, lds_byte = fp8_copy_slots(
                     copy_round, b_lds_swizzle, swizzle_b_specs
@@ -661,7 +670,7 @@ def _compile_gemm_fp8_cached(
             return fx.Int32(src_byte), lds_byte
 
         b_copy_rounds = 2 if b_mxfp4 else 4
-        b_k_stride = 16 * BLOCK_K if preshuffle_b else BLOCK_K // (2 if b_mxfp4 else 1)
+        b_k_stride = (16 if preshuffle_b else 1) * BLOCK_K // (2 if b_mxfp4 else 1)
 
         def make_b_voffsets(row_tile):
             tile_byte = fx.Int32(row_tile) * BLOCK_N * (K // (2 if b_mxfp4 else 1))
