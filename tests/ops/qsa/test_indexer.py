@@ -1,5 +1,6 @@
 """Public QSA indexer correctness with synthetic inputs and independent references."""
 
+from collections import OrderedDict
 import os
 from pathlib import Path
 import subprocess
@@ -65,6 +66,17 @@ def _check_prefill(source):
                          ids=("short", "tail", "topk-limit", "topk-over", "prefix", "multi", "wide", "max-keys"))
 def test_prefill_operator(seq_lens, extend_lens, device):
     _check_prefill(helpers.synthetic(seq_lens, extend_lens, device))
+
+
+def test_prefill_logits_chunks(device, monkeypatch):
+    """Rows split over many logits chunks (some starting inside a request, some spanning two, all reusing one
+    logits buffer) select exactly like the reference, every row checked."""
+    monkeypatch.setattr(helpers.indexer, "_LOGITS_BUDGET_BYTES", 1 << 20)
+    monkeypatch.setattr(helpers.indexer, "_CHUNK_ROWS", 128)
+    monkeypatch.setattr(helpers.indexer, "_layouts", OrderedDict())
+    source = helpers.synthetic((10240, 300, 4100), (2048, 300, 4100), device)
+    assert len(helpers.indexer._layout(source.seq_lens, source.extend_lens, device).chunks) > 1
+    _check_prefill(source)
 
 
 def test_prefill_frame_and_output_ownership(device):
@@ -251,3 +263,37 @@ def test_decode_topk_matches_row_kernel(pattern, counts, stride, split, device, 
     indexer_topk.launch(blocked, stride, 0, len(counts), group, positions, row_info, rows, stats)
     torch.cuda.synchronize(device)
     assert torch.equal(decode, rows)
+
+
+def test_topk_output_over_int32_elements(device):
+    """A 1M-row prefill's int32 [rows, 2051] output holds over 2**31 - 1 elements, which FlyDSL's int32 tensor
+    dims cannot describe flattened: the top-k takes it 2-D, and the last rows land where they belong."""
+    from pyhip.ops.qsa.flydsl import indexer_topk
+
+    counts, stride, total = (4000, 600, 2048, 513), 4096, 1 << 20
+    rows, row0 = len(counts), total - len(counts)
+    generator = torch.Generator(device=device).manual_seed(5)
+    logits = torch.randn((rows, stride), generator=generator, device=device).abs()
+    lengths = torch.tensor(counts, dtype=torch.int32, device=device)
+    positions = lengths.long() * 4 + 2
+    row_info = torch.stack((positions.int(), (positions + 1).int()), dim=1).contiguous()
+    causal = torch.arange(stride, device=device)[None] < lengths[:, None]
+    stats = torch.stack((torch.where(causal, logits, float("inf")).amin(1).view(torch.int32),
+                         ~torch.where(causal, logits, float("-inf")).amax(1).view(torch.int32)), dim=1).contiguous()
+    group = indexer_topk.GROUP_KEYS
+    blocked = logits.view(rows, stride // group, group).transpose(0, 1).contiguous()
+    expected = torch.full((rows, 2051), -7, dtype=torch.int32, device=device)
+    indexer_topk.launch(blocked, stride, 0, rows, group, positions, row_info, expected, stats)
+
+    def last_rows(values):
+        frame = torch.zeros((total, *values.shape[1:]), dtype=values.dtype, device=device)
+        frame[row0:] = values
+        return frame
+
+    out = torch.empty((total, 2051), dtype=torch.int32, device=device)
+    out[row0 - 1:] = -7
+    indexer_topk.launch(blocked, stride, row0, rows, group, last_rows(positions), last_rows(row_info), out,
+                        last_rows(stats))
+    torch.cuda.synchronize(device)
+    assert out.numel() >= 2**31
+    assert torch.equal(out[row0:], expected) and bool((out[row0 - 1] == -7).all())

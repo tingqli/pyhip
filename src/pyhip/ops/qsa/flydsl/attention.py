@@ -249,10 +249,10 @@ def attention(
     K/V packed by those slots. A pool may exceed 4 GiB (raw direct then uses 64-bit
     loads); slot values are not validated. Hot calls
     rebuild the selection: per-layout plans share one private per-stream scratch
-    arena. out is optional and must not alias Q/K/V. Warm the same stream and
-    layout before graph capture. Captured workspaces stay pinned for graph pointer
-    lifetime and share their stream's scratch: do not replay them concurrently
-    with each other or with that stream's calls.
+    arena. out is optional and must not alias Q/K/V, indices or kv_slots. Warm the
+    same stream and layout before graph capture. Captured workspaces stay pinned for
+    graph pointer lifetime and share their stream's scratch: do not replay them
+    concurrently with each other or with that stream's calls.
     Each kernel variant compiles on its first use: a few seconds with empty FlyDSL
     caches. One GPU per process (TP uses separate workers).
     """
@@ -351,12 +351,12 @@ def attention(
     ):
         raise ValueError("out must be aligned, contiguous and match Q")
     begin, end = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
-    for source in (q, k, v, indices):
+    for source in (q, k, v, indices) + (() if kv_slots is None else (kv_slots,)):
         if (
             begin < source.data_ptr() + source.numel() * source.element_size()
             and source.data_ptr() < end
         ):
-            raise ValueError("out must not overlap Q/K/V or indices")
+            raise ValueError("out must not overlap Q/K/V, indices or kv_slots")
     if q.shape[0] == 0:
         return out
     with _lock, torch.cuda.device(q.device):

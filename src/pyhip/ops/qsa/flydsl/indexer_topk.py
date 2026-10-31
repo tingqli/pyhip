@@ -751,7 +751,8 @@ def launch(logits, width, row0, rows, pitch, positions, row_info, out, stats):
     stats [rows, 2] int32 holds (min bits, ~max bits) of each row's logits from the logits kernel."""
     stream = torch.cuda.current_stream(logits.device)
     wide, split = width > NARROW_KEYS, width >= SPLIT_KEYS
-    args = (logits.view(-1), rows * pitch, pitch, row0, rows, positions, row_info.view(-1), out.view(-1),
+    # out stays [rows, 2051]: FlyDSL passes tensor dims as int32, and a 1M-row prefill's flat out exceeds that.
+    args = (logits.view(-1), rows * pitch, pitch, row0, rows, positions, row_info.view(-1), out,
             stats.view(-1), rows if split else -(-rows // WAVES), wide, split, stream)
     with torch.cuda.device(logits.device):
         variants = [(w, s) for w in (False, True) for s in (False, True)]
@@ -1101,7 +1102,7 @@ def launch_decode(logits, lengths, positions, sequence_lengths, out, stats=None)
         launch_parts = _compiled(_COMPILED_PARTS, device, _launch_parts, args, 8, [()])[()]
         if parts:
             launch_parts(*args)
-        args = (logits.view(-1), stride, rows, lengths, positions, sequence_lengths, out.view(-1), stats, *long,
+        args = (logits.view(-1), stride, rows, lengths, positions, sequence_lengths, out, stats, *long,
                 parts, rows, wide, parts > 0, stream)
         key = (device, lengths.dtype, positions.dtype, sequence_lengths.dtype)
         variants = [(wide_ids, long_rows) for wide_ids in (False, True) for long_rows in (False, True)]

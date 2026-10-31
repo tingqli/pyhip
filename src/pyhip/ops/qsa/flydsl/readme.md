@@ -71,7 +71,7 @@ attention(q[M,H,256], k/v[N,HK,256], indices[M,4T+3], query_lens?, prefix_lens?,
     Q/K/V：3D、连续BF16、D256、16B对齐；H%HK==0且H/HK≤16；gfx942
     字节跨度：Q和每个请求的K/V（有slot表时只查Q）≤ _MAX_SPAN = 4GiB−1MiB   # 无符号32位字节偏移，1MiB余量给越界哨兵
     indices：同设备连续int32 [M,4T+3]，T∈{256,512,768,1024}，字节数 < 2GiB
-    out可省略，给出时须同形、连续、16B对齐，且不与Q/K/V/indices重叠
+    out可省略，给出时须同形、连续、16B对齐，且不与Q/K/V/indices/kv_slots重叠
     if M == 0: return out
     with 全局锁, 切到q所在设备:
         每进程只允许一张GPU
@@ -820,7 +820,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - Attention只接受3D BF16 Q/O `[M,H,256]`、K/V `[N,HK,256]`和int32 `[M,4T+3]`选择（T = 256/512/768/1024，由宽度决定）：行的因果窗口有v个token时，前`4·min(v//4, T)`列恰为min(v//4, T)个不同的完整四token块（块内4个token依次写出，块可乱序），接v%4个因果尾token，其余为−1。local heads共享选择，`H/HK ≤ 16`。只支持gfx942；5D布局已撤销。
 - 选择不校验：块数不对、缺尾token或块重复时结果错误（同一stream之后的调用也可能受影响），不报错也不trap。K/V须为有限值：同一tile的行共享union的块，一行选中的非有限值也会影响没选它的行。
 - 字节跨度：Q和每个请求的K（V同）都不超过4GiB−1MiB（`_MAX_SPAN`）。kernel的buffer字节偏移按无符号32位算，1MiB余量让越界哨兵加上lane偏移不回绕；K/V按请求起点寻址，整批packed K/V不受此限（HK1时一个请求约8M token）。
-- `softmax_scale`是host标量（默认1/16），`scale·log2(e)`须是有限的正FP32（kernel用它乘被mask的−inf分数，为0时得NaN）；`query_lens`/`prefix_lens`是小于2^31的host整数；`out`不得与Q/K/V/indices重叠。
+- `softmax_scale`是host标量（默认1/16），`scale·log2(e)`须是有限的正FP32（kernel用它乘被mask的−inf分数，为0时得NaN）；`query_lens`/`prefix_lens`是小于2^31的host整数；`out`不得与Q/K/V/indices/kv_slots重叠。
 - `kv_slots`（同设备连续int32 `[N]`）给出时，K/V是token池`[P,HK,256]`，第i项是packed上下文第i个token的池行。每个请求的每个四token块（含请求末尾不满的块）须占池中连续4行、起始行是4的倍数（页大小为4的倍数的分页池满足），不满块多出的行值任意；slot值不校验。union和pack按块建buffer描述符，池大小不受限；池的字节数超过`_MAX_SPAN`时raw direct改用64位global读（WIDE，比buffer读慢约0–10%）。结果与按slot表拷出连续K/V再调用逐bit相同。
 - Indexer为独立的D128投影、4个Q头和1个K头、ratio4/top512，最多262144个压缩key（1M token）。Prefill输出每行块号升序，可原样交给attention。`prefill_indexer`和`decode_indexer`除`qk`外都是显式关键字参数，同名参数含义相同；可选的`q_out`（decode另有`logits_out`）取回归一化后的index Q（和logits）。
 - 不另设校验launch：attention和indexer的入口在launch前只在host检查张量的dtype、形状、设备、对齐和长度，非法时抛`ValueError`（`softmax_scale`传tensor时抛`TypeError`）；prefill top-k发现query位置与host布局不符时执行`s_trap 2`，GPU队列出错，进程以HSA异常（code 0x1016，日志含kernel名）中止。Decode不校验位置。
@@ -1028,6 +1028,15 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
   - B的slot16只在“CTA按编号模16分配”时成立，均匀分散时慢约1%；另两种排列在别的交替周期上更慢。
   - B的结果与10-30（续）的推测一致：CTA按编号轮流分配，有计算的CTA集中到一部分计算单元上。这一点仍未用计数器确认。
 - **正确性**：QSA测试112项通过（含gated raw、slot表、WIDE和graph用例，FlyDSL缓存为空）；SGLang `test_pyhip_qsa` 6项（17个子测试）通过。[QSA](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/pytest_qsa.log)、[SGLang](../../../../../mytest/mydata/qsa_raw_sched_20261030_01/sglang_test.log)
+
+### 2026-10-31：38e0d93之后的FlyDSL旧缓存
+
+PR #62 review修复后用默认FlyDSL缓存跑QSA全套测试，gated raw用例（如`test_kv_slots_pool_above_4gib[raw-gated]`）在同一进程先有其他attention调用时，K3（`sparse_prefill_order_masks`）内存访问错误，进程中止；未修改的`38e0d93`同样出错，`ffae4db`、`14592cb`不出错，换新的`FLYDSL_RUNTIME_CACHE_DIR`后同一repro通过。数据与脚本在[qsa_flydsl_cache_key_20261031_01](../../../../../mytest/mydata/qsa_flydsl_cache_key_20261031_01)。
+
+- **原因**（即4.3所述的缓存键问题）：FlyDSL 0.4.0按AST改写后的函数给`@flyc.jit`建键，运行时`if`分支里调用的kernel与helper不进依赖遍历。QSA的11个launcher开头都是零任务判断（如`if TILES > 0:`），kernel都在这个`if`里，键只含launcher自身源码：只改kernel体或helper（同一文件、`sparse_prefill_common.py`、`mha/flydsl/_common.py`等）都不换键（[逐launcher统计](../../../../../mytest/mydata/qsa_flydsl_cache_key_20261031_01/deps_walk.txt)）。K2 `_compact_launch`的键因此在`ffae4db`与`38e0d93`相同（`0b33c107…`）。10-30（续3）只改了K2的kernel体（`_tile`同时清`direct_flag[1]`），默认缓存里`ffae4db`之前编的K2（10-30 12:11）继续被取用；K3的列表CTA从`direct_flag[1]`的残留值开始原子加，写到`direct_list`之外。残留值是复用显存里的旧数据，单独跑或换顺序时可能为0而不出错。
+- **干净环境下正确**：同一repro（先一次H12、16行、3000前缀的调用，再800行、70000前缀的H3 gated raw）在K2之后读`direct_flag`，新编的K2为[0, 0]并通过，旧K2为[0, 1065598834]，K3内存访问错误。`38e0d93`提交时的测试在空缓存下进行，10-30（续3）的A/B关闭了FlyDSL缓存；10-30 TP2与10-31 1M服务各用独立缓存，其中的K2在`38e0d93`提交后编译。
+- **合并不受影响**：按FlyDSL的键与按原函数建的键，对比`edde17b`（dev）、`14592cb`、`ffae4db`、`38e0d93`和本分支的全部QSA launcher，找键不变而kernel变了的：dev→本分支20个共有launcher中19个换键，`indexer_topk._collect`及其依赖未变，`codegen/flydsl`、`mha/flydsl`未改；只有`ffae4db`→`38e0d93`的K2，即只影响跑过`ffae4db`且没清缓存的环境。[对比](../../../../../mytest/mydata/qsa_flydsl_cache_key_20261031_01/upgrade_paths/summary.txt)
+- **处理**：代码不改。删掉本机两处旧K2（`~/.flydsl/cache`与`qsa_aiter_sync_service_20261030_01`的服务缓存）后，默认缓存与空缓存下QSA测试各114项通过，SGLang `test_pyhip_qsa` 7项（17个子测试）通过；两个缓存共有的98项（其中90项是10-30/31留下的）编译结果（`_ir_text`，含kernel二进制）完全相同。试过在包的`__init__`把`qsa/flydsl`、`mha/flydsl`、`codegen/flydsl`登记到FlyDSL的`EXTRA_SOURCE_DIRS`（其中任一`.py`改动都换键），因它是FlyDSL的进程级设置，之后建键的其他kernel（包括AITER的）也随之换键，未采用。根本修复在FlyDSL：`_ensure_cache_manager`改用`_original_func`建键。
 
 ### 评估过但未采用
 

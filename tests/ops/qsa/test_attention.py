@@ -211,3 +211,9 @@ def test_kv_slots_input_errors():
     ):
         with pytest.raises(ValueError, match="kv_slots|lengths"):
             _call_paged(value, pool_k, pool_v, table)
+    # An output sharing the slot table's storage would overwrite slot ids the kernels still read.
+    arena = torch.empty(value.q.numel() * value.q.element_size(), dtype=torch.uint8, device=slots.device)
+    aliased = arena[4096:4096 + slots.numel() * 4].view(torch.int32)
+    aliased.copy_(slots)
+    with pytest.raises(ValueError, match="overlap"):
+        _call_paged(value, pool_k, pool_v, aliased, out=arena.view(torch.bfloat16).view(value.q.shape))
