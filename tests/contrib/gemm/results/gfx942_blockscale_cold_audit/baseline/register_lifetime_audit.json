@@ -1,0 +1,13 @@
+{
+  "trace": "/tmp/gfx942_perf/cold_baseline_att/ui_output_agent_41747_dispatch_180",
+  "counts": {
+    "instructions_checked": 4791592,
+    "waits_checked": 161616,
+    "mfma_result_reads_checked": 6815744,
+    "complete_waves_checked": 104
+  },
+  "minimum_mfma_read_margin_cycles": 16,
+  "violations": [],
+  "semantics": "Track async destinations in actual dynamic ISA; native buffer waits retire oldest operations, mixed SMEM kept pending until lgkmcnt(0). MFMA read timing uses a 16-cycle window.",
+  "scope": "Recorded wave executions; cross-wave LDS lifetime is checked separately by the source/barrier protocol model."
+}

@@ -1,0 +1,179 @@
+{
+  "version": "v25",
+  "source": "v25.py",
+  "source_sha256": "156866068257ef124b1b452806cb125cbd1e86b888235456b4a4dbd7a8dbefde",
+  "previous_frozen_versions": "../gfx942_blockscale_top3/manifest.json",
+  "constraints": {
+    "waves": 8,
+    "tile": [
+      256,
+      256,
+      128
+    ],
+    "m_split": true
+  },
+  "correctness": {
+    "record": "correctness.xml",
+    "atol": 0.01,
+    "rtol": 0.01,
+    "mismatch_ratio": 0,
+    "calc_diff_limit": 1e-05,
+    "pytest_cases": 12
+  },
+  "results": [
+    {
+      "shape": [
+        4096,
+        4096,
+        16384
+      ],
+      "preshuffle_b": false,
+      "median_us": 1413.3660197257996,
+      "median_tflops": 388.96917444969813,
+      "max_tflops": 391.60691693745497,
+      "diff": 9.41510264329537e-06,
+      "record": "v25_original_shapes.json",
+      "samples": 32
+    },
+    {
+      "shape": [
+        4096,
+        4096,
+        16384
+      ],
+      "preshuffle_b": true,
+      "median_us": 1343.3854579925537,
+      "median_tflops": 409.23162493474547,
+      "max_tflops": 420.15967322502223,
+      "diff": 9.218850844483484e-06,
+      "record": "v25_original_shapes.json",
+      "samples": 32
+    },
+    {
+      "shape": [
+        16384,
+        3584,
+        6144
+      ],
+      "preshuffle_b": false,
+      "median_us": 1672.8864908218384,
+      "median_tflops": 431.3230513168423,
+      "max_tflops": 433.6038205714631,
+      "diff": 8.62523843303542e-06,
+      "record": "v25_original_shapes.json",
+      "samples": 32
+    },
+    {
+      "shape": [
+        16384,
+        3584,
+        6144
+      ],
+      "preshuffle_b": true,
+      "median_us": 1485.9249591827393,
+      "median_tflops": 485.59282975154815,
+      "max_tflops": 487.1398554722809,
+      "diff": 8.466274779350691e-06,
+      "record": "v25_original_shapes.json",
+      "samples": 32
+    },
+    {
+      "shape": [
+        16384,
+        3392,
+        6144
+      ],
+      "preshuffle_b": false,
+      "median_us": 1651.1669754981995,
+      "median_tflops": 413.5861546394795,
+      "max_tflops": 414.66124780703575,
+      "diff": 8.795955395601851e-06,
+      "record": "v25_original_shapes.json",
+      "samples": 32
+    },
+    {
+      "shape": [
+        16384,
+        3392,
+        6144
+      ],
+      "preshuffle_b": true,
+      "median_us": 1482.7260375022888,
+      "median_tflops": 460.57045117678786,
+      "max_tflops": 461.9162950004605,
+      "diff": 8.715121780022983e-06,
+      "record": "v25_original_shapes.json",
+      "samples": 32
+    },
+    {
+      "shape": [
+        8192,
+        8192,
+        16384
+      ],
+      "preshuffle_b": false,
+      "median_us": 4518.357038497925,
+      "median_tflops": 486.686474047,
+      "max_tflops": 489.78003305575345,
+      "diff": 9.157149556515698e-06,
+      "record": "v25_8192_8192_16384.json",
+      "samples": 32
+    },
+    {
+      "shape": [
+        8192,
+        8192,
+        16384
+      ],
+      "preshuffle_b": true,
+      "median_us": 4284.416913986206,
+      "median_tflops": 513.260800640906,
+      "max_tflops": 519.7730671400907,
+      "diff": 9.171997046086844e-06,
+      "record": "v25_8192_8192_16384.json",
+      "samples": 32
+    }
+  ],
+  "paired_record": "v11_v25_3584_preshuffle.json",
+  "paired_summary": {
+    "v11": {
+      "n": 32,
+      "median_us": 1500.0454783439636,
+      "min_us": 1475.8449792861938,
+      "max_us": 1534.0460538864136,
+      "median_tflops": 481.0217531035056,
+      "diff": 8.544522318576497e-06
+    },
+    "v25": {
+      "n": 32,
+      "median_us": 1469.884991645813,
+      "min_us": 1441.3260221481326,
+      "max_us": 1507.5650215148926,
+      "median_tflops": 490.89181114781223,
+      "diff": 8.544522318576497e-06
+    }
+  },
+  "profile": {
+    "record": "profile/report.json",
+    "layout": "preshuffled B",
+    "shape": [
+      16384,
+      3584,
+      6144
+    ],
+    "complete_waves": 368,
+    "raw_trace_directory": "/tmp/gfx942_perf/att_best_v25"
+  },
+  "measurement": "GPU0 MI308X gfx942; PTL Enabled VECTOR,F8; original cudaPerf; 32 rotating inputs; all samples retained.",
+  "artifacts_sha256": {
+    "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=False-N=3392-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "de82f9c9f5c4a23292939523d17b1816be80091ffe41f03d8ef44b4d7e8aa713",
+    "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=False-N=3584-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "335be88368a21b14076ae12ce4db213176454207d3e97cf673841dc938bb801c",
+    "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=False-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "45fe47f468b91b1c82bca86209eb53ce933157bb492432610ceb83e8d7078f07",
+    "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=False-N=8192-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "5bbfdf4ca09f86bccf151776c247c21c9c35f3637dd14281f82de1fe72dfda77",
+    "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=3392-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "7a3cfe0faa4af42ef6e1cca5445f8544b5867c53698f083d09eaf814cb901f89",
+    "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=3584-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "83dbdb94216746aa76d0c296cdd4634a7b7e466ab1a6e94b0f4dc646c2a82927",
+    "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "98e53be4163c1ed7c18d87505cc28a62d05618e6619510c694826628c9aa3df8",
+    "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=8192-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "729b837096ea44dfd053282c5c2e6863e1bc614a4dfb74dc4cf49d85e219e3b9"
+  },
+  "target_status": "8192x8192x16384: 486.7 TFLOPS plain B and 513.3 TFLOPS preshuffled B medians. These results do not imply 500 TFLOPS for all shapes."
+}

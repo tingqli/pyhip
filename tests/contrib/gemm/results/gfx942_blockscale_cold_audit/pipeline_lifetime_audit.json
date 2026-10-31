@@ -1,0 +1,253 @@
+{
+  "source": "/mywork/pyhip/src/contrib/gemm_fp8_gfx942.py",
+  "source_sha256": "156866068257ef124b1b452806cb125cbd1e86b888235456b4a4dbd7a8dbefde",
+  "cases": [
+    {
+      "k_blocks": 1,
+      "vm_checks": 43,
+      "partial_checks": 128,
+      "lds_checks": 8,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 2,
+      "vm_checks": 85,
+      "partial_checks": 256,
+      "lds_checks": 16,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 3,
+      "vm_checks": 127,
+      "partial_checks": 384,
+      "lds_checks": 24,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 4,
+      "vm_checks": 169,
+      "partial_checks": 512,
+      "lds_checks": 32,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 5,
+      "vm_checks": 211,
+      "partial_checks": 640,
+      "lds_checks": 40,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 6,
+      "vm_checks": 253,
+      "partial_checks": 768,
+      "lds_checks": 48,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 7,
+      "vm_checks": 295,
+      "partial_checks": 896,
+      "lds_checks": 56,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 8,
+      "vm_checks": 337,
+      "partial_checks": 1024,
+      "lds_checks": 64,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 9,
+      "vm_checks": 379,
+      "partial_checks": 1152,
+      "lds_checks": 72,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 10,
+      "vm_checks": 421,
+      "partial_checks": 1280,
+      "lds_checks": 80,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 11,
+      "vm_checks": 463,
+      "partial_checks": 1408,
+      "lds_checks": 88,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 12,
+      "vm_checks": 505,
+      "partial_checks": 1536,
+      "lds_checks": 96,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 13,
+      "vm_checks": 547,
+      "partial_checks": 1664,
+      "lds_checks": 104,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 14,
+      "vm_checks": 589,
+      "partial_checks": 1792,
+      "lds_checks": 112,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 15,
+      "vm_checks": 631,
+      "partial_checks": 1920,
+      "lds_checks": 120,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 16,
+      "vm_checks": 673,
+      "partial_checks": 2048,
+      "lds_checks": 128,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 17,
+      "vm_checks": 715,
+      "partial_checks": 2176,
+      "lds_checks": 136,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 31,
+      "vm_checks": 1303,
+      "partial_checks": 3968,
+      "lds_checks": 248,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 32,
+      "vm_checks": 1345,
+      "partial_checks": 4096,
+      "lds_checks": 256,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 63,
+      "vm_checks": 2647,
+      "partial_checks": 8064,
+      "lds_checks": 504,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 64,
+      "vm_checks": 2689,
+      "partial_checks": 8192,
+      "lds_checks": 512,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 127,
+      "vm_checks": 5335,
+      "partial_checks": 16256,
+      "lds_checks": 1016,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 128,
+      "vm_checks": 5377,
+      "partial_checks": 16384,
+      "lds_checks": 1024,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 129,
+      "vm_checks": 5419,
+      "partial_checks": 16512,
+      "lds_checks": 1032,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    },
+    {
+      "k_blocks": 255,
+      "vm_checks": 10711,
+      "partial_checks": 32640,
+      "lds_checks": 2040,
+      "minimum_mfma_distance": 2,
+      "wrong_wait_negative_control_caught": true,
+      "early_lds_reuse_negative_control_caught": true
+    }
+  ],
+  "global_buffer_bounds_checks": 1032192,
+  "lds_layout_checks": 4096,
+  "lds_slots": 4,
+  "lds_bytes": 32768,
+  "protocol": {
+    "B_packet_publication": "Q[p] fully published by barrier generation 2*p",
+    "B_packet_read": "group g starts at generation 2*p+g; retires reads before 2*p+2+g",
+    "B_slot_overwrite": "Q[p+4] first written after generation 2*p+6; latest old read retirement is 2*p+3",
+    "A": "two register banks; prefetch k+1 never overwrites k; k-start wait covers all A and A-scale producers",
+    "B_staging": "two banks; VM wait completes Q[p+1] before ds_write; same bank then receives Q[p+3]",
+    "B_scale": "next-bank SMEM issued at packet 1 after compute-entry lgkmcnt(0); later compute-entry lgkmcnt(0) completes it before next K",
+    "partial": "each partial is retired before overwrite; MFMA and DQ use distinct current/previous partials",
+    "early_barrier": "preshuffle barrier precedes only final register-only MFMA/DQ; every LDS read is already complete",
+    "epilogue": "full-wave lane exchange precedes masked stores; final group0 barrier balances group1 entry"
+  },
+  "assumptions": [
+    "native gfx942 buffer and DS wait-counter completion semantics",
+    "M>0, N%16=0, K>=128 and K%128=0",
+    "32-bit buffer offsets and extents do not overflow",
+    "correct 512-thread launch and exact grid"
+  ],
+  "scope": "source-derived logical lifetime and address proof, not a hardware race detector or proof for arbitrary unsupported shapes"
+}

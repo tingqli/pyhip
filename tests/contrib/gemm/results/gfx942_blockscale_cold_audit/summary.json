@@ -1,0 +1,170 @@
+{
+  "shape": [
+    8192,
+    8192,
+    16384
+  ],
+  "source_sha256": "156866068257ef124b1b452806cb125cbd1e86b888235456b4a4dbd7a8dbefde",
+  "source": "../gfx942_blockscale_v25/v25.py",
+  "cold_cache": {
+    "definition": "32 independent A/B allocations, sequential rotation; no immediate address reuse and no explicit cache flush",
+    "AB_bytes": 8589934592,
+    "bytes_between_reuse": 8321499136,
+    "hardware_max_data_cache_bytes": 268435456,
+    "samples_per_layout": 64,
+    "results": [
+      {
+        "preshuffle_b": false,
+        "median_us": 4535.7561111450195,
+        "median_tflops": 484.8195541529838,
+        "diff": 9.157149556515698e-06
+      },
+      {
+        "preshuffle_b": true,
+        "median_us": 4280.895948410034,
+        "median_tflops": 513.6829490959102,
+        "diff": 9.171997046086844e-06
+      }
+    ],
+    "record": "cold_audit_8192_64.json"
+  },
+  "lifetime": {
+    "source_audit": "pipeline_lifetime_audit.json",
+    "dynamic_isa_audit": "baseline/register_lifetime_audit.json",
+    "K_lengths_checked": 25,
+    "global_bounds_checks": 1032192,
+    "LDS_layout_checks": 4096,
+    "dynamic_counts": {
+      "instructions_checked": 4791592,
+      "waits_checked": 161616,
+      "mfma_result_reads_checked": 6815744,
+      "complete_waves_checked": 104
+    },
+    "minimum_MFMA_read_margin_cycles": 16,
+    "resources": {
+      "vgpr": 240,
+      "next_free_sgpr": 36,
+      "lds_bytes": 32768,
+      "scratch_bytes": 0
+    },
+    "result": "No violations in source-derived protocol checks and captured dynamic ISA; 12 guard/tail/graph tests pass.",
+    "limits": [
+      "native gfx942 buffer and DS wait-counter completion semantics",
+      "M>0, N%16=0, K>=128 and K%128=0",
+      "32-bit buffer offsets and extents do not overflow",
+      "correct 512-thread launch and exact grid",
+      "This is not a hardware race detector and does not prove unsupported shapes or arbitrary launches."
+    ]
+  },
+  "phase_efficiency": {
+    "baseline": {
+      "definitions": {
+        "prologue": "resident-batch begin until both waves reach the first MFMA of K block 1; includes startup and K block 0",
+        "mainloop": "both resident waves are within K blocks 1..K_blocks-2",
+        "epilogue": "first resident wave reaches final K block until both waves end; includes final K block, DQ drain, conversion and stores",
+        "mfma_efficiency": "union of 16-cycle MFMA windows, starting at successful issue (attempt+stall), divided by phase cycles"
+      },
+      "phases": {
+        "prologue": {
+          "cycles": 534240,
+          "mfma_busy_cycles": 239616,
+          "mean_cycles_per_resident_batch": 10273.846153846154,
+          "lifetime_fraction": 0.01795308968963576,
+          "mfma_efficiency": 0.4485175202156334
+        },
+        "mainloop": {
+          "cycles": 28524764,
+          "mfma_busy_cycles": 26810368,
+          "mean_cycles_per_resident_batch": 548553.1538461539,
+          "lifetime_fraction": 0.958572264277653,
+          "mfma_efficiency": 0.9398979777711746
+        },
+        "epilogue": {
+          "cycles": 698548,
+          "mfma_busy_cycles": 212992,
+          "mean_cycles_per_resident_batch": 13433.615384615385,
+          "lifetime_fraction": 0.023474646032711294,
+          "mfma_efficiency": 0.3049067494288152
+        }
+      },
+      "full_lifetime_mfma_efficiency": 0.9161699860257322
+    },
+    "no_dq": {
+      "definitions": {
+        "prologue": "resident-batch begin until both waves reach the first MFMA of K block 1; includes startup and K block 0",
+        "mainloop": "both resident waves are within K blocks 1..K_blocks-2",
+        "epilogue": "first resident wave reaches final K block until both waves end; includes final K block, DQ drain, conversion and stores",
+        "mfma_efficiency": "union of 16-cycle MFMA windows, starting at successful issue (attempt+stall), divided by phase cycles"
+      },
+      "phases": {
+        "prologue": {
+          "cycles": 531588,
+          "mfma_busy_cycles": 239616,
+          "mean_cycles_per_resident_batch": 10222.846153846154,
+          "lifetime_fraction": 0.0179420309460443,
+          "mfma_efficiency": 0.4507550960518296
+        },
+        "mainloop": {
+          "cycles": 28395904,
+          "mfma_busy_cycles": 26810368,
+          "mean_cycles_per_resident_batch": 546075.0769230769,
+          "lifetime_fraction": 0.9584117555492282,
+          "mfma_efficiency": 0.9441632145255879
+        },
+        "epilogue": {
+          "cycles": 700592,
+          "mfma_busy_cycles": 212992,
+          "mean_cycles_per_resident_batch": 13472.923076923076,
+          "lifetime_fraction": 0.023646213504727474,
+          "mfma_efficiency": 0.3040171740470916
+        }
+      },
+      "full_lifetime_mfma_efficiency": 0.9201734408475418
+    }
+  },
+  "profile_scope": {
+    "shader_engine": 0,
+    "CU": 0,
+    "SIMDs": 4,
+    "complete_waves_per_variant": 104,
+    "profile_dispatch": 33,
+    "note": "The 33rd call returns to buffer0 after warmups of buffers0..31; all sampled wave instructions are complete."
+  },
+  "dq_ablation": {
+    "ordinary_timing_record": "dq_cold_compare.json",
+    "normal_median_us": 4280.736446380615,
+    "no_DQ_median_us": 4204.095840454102,
+    "time_reduction_percent": 1.7903603010017983,
+    "normal_effective_TFLOPS": 513.7020891373226,
+    "no_DQ_equivalent_MFMA_TFLOPS": 523.0668707387209,
+    "correct_gemm": false,
+    "caveat": "DQ-free output is zero, not a valid GEMM. Same MFMA/load/wait/barrier/resource sequence; removed instructions also change PC alignment and arbitration."
+  },
+  "conclusion": "Preshuffled B exceeds 500 TFLOPS under independent-buffer cold-cache timing; sampled mainloop is near compute-bound, not DQ-bound. Plain B remains about 485 TFLOPS.",
+  "files_sha256": {
+    "baseline/cold_baseline_att.log": "55dfef5fe5c8a1a7f29ecaf253deba4381df18eb743643941dcbe3535bb1290f",
+    "baseline/cold_baseline_att.yaml": "df44add9edefd191a75f727c436910bebf710d465dbd40cb4aa846f3600d6ba2",
+    "baseline/cold_baseline_att_run.json": "e349a5e87078507b7a41146572aed2ba6043c9a823be2ab7e0cd1ade682f21dc",
+    "baseline/decoded_trace.tar.gz": "8cbc33ff57093cff8d9389b3ce5836d59637000728be910452d33b187db2d84f",
+    "baseline/phase_efficiency.json": "7295f21fcf04fc37795722d516beaa08b3d5f2a0216f1e82c6890be12105f94f",
+    "baseline/register_lifetime_audit.json": "c1f474c2c4136a1e8e9edd4eb27e00ce2a483fecff2ebaefe73ca2865aae7090",
+    "baseline/report.json": "7cd923814d7992ffdf9de7b775dc5060fb0871b120e59d2d17aa3ae434e0db28",
+    "cold_audit_8192_64.json": "c39e4d152e79b06081a05a7fdc7789ea912c3be05297d29535d21c9d6b239d11",
+    "cold_audit_8192_64.log": "ad956170bec67188c25f92cbee9501041294d554712e3259910b5b5a4bb07c4c",
+    "cold_audit_cache_info.json": "23981eba4ccf7740c7322688a99601b9a1938457477f6e4026bd8ee72540caeb",
+    "cold_audit_correctness.xml": "ee76cd7c0e7f02874059589dadd3627fca0506fe409acf2e5b03eb40939a0f3e",
+    "dq_cold_compare.json": "d0223afd0c37d674f078a36d6d3d7a158862424d745b602d108279daff941070",
+    "dq_cold_compare.log": "8deb73d4ece555bb0d989d23bfae62cc215d60ac5add6867417f007c3a9e17da",
+    "no_dq/cold_no_dq_att.log": "9357f0988defce1fffdda87bcf7e3bc85eeed350bf8fea61eccd5565b356e9ae",
+    "no_dq/cold_no_dq_att.yaml": "b67041c3d6eb8e9e9bb6945d92284de9df3224ff239153b83c0c7594af0dbd93",
+    "no_dq/cold_no_dq_att_run.json": "9724d01d71cf1e23f3526e7d7c08141ea628e95dd7679778d962daf378189fec",
+    "no_dq/decoded_trace.tar.gz": "857e735deb29c18207a67123beb2bbc86873308e945c4a6c52960c2d3806ddb0",
+    "no_dq/no_dq_8192.co": "cf7856613024b60a52c9e724b23a88ffc2a0aca64750c398e6979313b9f5f03e",
+    "no_dq/no_dq_8192.s": "fc734f4973e316d8711f850bc6f60e840f1d2bde0f4a20d02c297b90e349868b",
+    "no_dq/no_dq_8192_manifest.json": "5378a5776c258ea4d995cc7803d064ad3c0e56632c1bc796821cd4e9fa67398a",
+    "no_dq/phase_efficiency.json": "c15111a7a791e516dfa221c12911a24da237d33e23d97262df3bb48d72cf322d",
+    "no_dq/report.json": "c97361a41d615f0b467781b600525302c028601e697e9148f28c36c2c9855e77",
+    "pipeline_lifetime_audit.json": "61f4ce352fa8b4ed90d57d4ab8cbfaf55b3be977ac4eb1ab165655b1a3ad8b61",
+    "reproduction_tools.tar.gz": "2ce3c43da63ff52d10b6d2dc5782fecbff98ea5ed922cd20271fe8a011418b93"
+  }
+}

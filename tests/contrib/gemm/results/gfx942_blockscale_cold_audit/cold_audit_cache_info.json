@@ -1,0 +1,107 @@
+{
+    "gpu_data": [
+        {
+            "gpu": 0,
+            "cache_info": [
+                {
+                    "cache": 0,
+                    "cache_properties": [
+                        "DATA_CACHE",
+                        "SIMD_CACHE"
+                    ],
+                    "cache_size": {
+                        "value": 32,
+                        "unit": "KB"
+                    },
+                    "cache_level": 1,
+                    "max_num_cu_shared": 1,
+                    "num_cache_instance": 80
+                },
+                {
+                    "cache": 1,
+                    "cache_properties": [
+                        "INST_CACHE",
+                        "SIMD_CACHE"
+                    ],
+                    "cache_size": {
+                        "value": 64,
+                        "unit": "KB"
+                    },
+                    "cache_level": 1,
+                    "max_num_cu_shared": 1,
+                    "num_cache_instance": 18
+                },
+                {
+                    "cache": 2,
+                    "cache_properties": [
+                        "INST_CACHE",
+                        "SIMD_CACHE"
+                    ],
+                    "cache_size": {
+                        "value": 64,
+                        "unit": "KB"
+                    },
+                    "cache_level": 1,
+                    "max_num_cu_shared": 2,
+                    "num_cache_instance": 31
+                },
+                {
+                    "cache": 3,
+                    "cache_properties": [
+                        "DATA_CACHE",
+                        "SIMD_CACHE"
+                    ],
+                    "cache_size": {
+                        "value": 16,
+                        "unit": "KB"
+                    },
+                    "cache_level": 1,
+                    "max_num_cu_shared": 1,
+                    "num_cache_instance": 18
+                },
+                {
+                    "cache": 4,
+                    "cache_properties": [
+                        "DATA_CACHE",
+                        "SIMD_CACHE"
+                    ],
+                    "cache_size": {
+                        "value": 16,
+                        "unit": "KB"
+                    },
+                    "cache_level": 1,
+                    "max_num_cu_shared": 2,
+                    "num_cache_instance": 31
+                },
+                {
+                    "cache": 5,
+                    "cache_properties": [
+                        "DATA_CACHE",
+                        "SIMD_CACHE"
+                    ],
+                    "cache_size": {
+                        "value": 4096,
+                        "unit": "KB"
+                    },
+                    "cache_level": 2,
+                    "max_num_cu_shared": 80,
+                    "num_cache_instance": 1
+                },
+                {
+                    "cache": 6,
+                    "cache_properties": [
+                        "DATA_CACHE",
+                        "SIMD_CACHE"
+                    ],
+                    "cache_size": {
+                        "value": 262144,
+                        "unit": "KB"
+                    },
+                    "cache_level": 3,
+                    "max_num_cu_shared": 80,
+                    "num_cache_instance": 1
+                }
+            ]
+        }
+    ]
+}

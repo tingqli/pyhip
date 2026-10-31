@@ -1,0 +1,75 @@
+{
+  "scope": {
+    "gpu": "MI308X gfx942",
+    "bdf": "0000:0a:00.0",
+    "shape": [
+      16384,
+      3584,
+      6144
+    ],
+    "preshuffle_b": false,
+    "samples_per_version": 32,
+    "timer": "original pyhip.cudaPerf",
+    "input_buffers": 32,
+    "same_addresses": true,
+    "output_dtype": "bfloat16"
+  },
+  "ranking_evidence": "retain_top3_ranking.json",
+  "versions": [
+    {
+      "version": "v11",
+      "source": "v11.py",
+      "source_sha256": "2fa56e39c69648dad6b5a2a80a1c3228868e60f485e940e53f3fb2e104d8b0b7",
+      "code_object": "artifacts/v11/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=False-N=3584-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+      "code_object_sha256": "f1b0f5152d1ff67b8f4725fabdf4d287697b8f611ad190704e7d62ed11fa53ea",
+      "text_sha256": "4b4e3dbdc8f35770bc92dec6e058c828f783e7107f0ac302482f11db600e0651",
+      "rebuilt_text_matches": true,
+      "correctness_cases": 13,
+      "summary": {
+        "n": 32,
+        "median_us": 1577.926516532898,
+        "min_us": 1565.7659769058228,
+        "max_us": 1598.4059572219849,
+        "median_tflops": 457.2801700002083,
+        "diff": 8.544522318576497e-06
+      }
+    },
+    {
+      "version": "v8",
+      "source": "v8.py",
+      "source_sha256": "faa338181fe59e5819ab7163788239a6e7db5561a1ab1429454f7bdf39a0f492",
+      "code_object": "artifacts/v8/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=False-N=3584-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+      "code_object_sha256": "3230204252cc670a96d56f7c127debf1bc4f95cc8dff9c83213adf8ead3041ac",
+      "text_sha256": "17ee490dfb1d0225a67b4686f81818b5cae9e2348bf50e58c5c4c1ba0163ab5b",
+      "rebuilt_text_matches": true,
+      "correctness_cases": 13,
+      "summary": {
+        "n": 32,
+        "median_us": 1594.1460132598877,
+        "min_us": 1587.2459411621094,
+        "max_us": 1605.885982513428,
+        "median_tflops": 452.62761361017664,
+        "diff": 8.544522318576497e-06
+      }
+    },
+    {
+      "version": "v12",
+      "source": "v12.py",
+      "source_sha256": "9be84b8498417cb4ccc17d7fd53c554e974e0fc05203c971fc862089719ae741",
+      "code_object": "artifacts/v12/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=False-N=3584-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+      "code_object_sha256": "cfa52fae8bec4d475c50cae94fc115285f67a95cfdefd333d9f8c8a377e13fa2",
+      "text_sha256": "3226139bb1d8da961b2984451f2bbe0f306ebc40821f8a38be1a5f8a44b09b40",
+      "rebuilt_text_matches": true,
+      "correctness_cases": 13,
+      "summary": {
+        "n": 32,
+        "median_us": 1599.8660326004028,
+        "min_us": 1542.2450304031372,
+        "max_us": 1666.6860580444336,
+        "median_tflops": 451.0093289218686,
+        "diff": 8.544522318576497e-06
+      }
+    }
+  ],
+  "note": "Ranking is specific to the recorded shape/layout/run; close variants may change order. No 500 TFLOPS claim."
+}

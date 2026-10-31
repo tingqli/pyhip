@@ -1,0 +1,1466 @@
+{
+  "dispatch": "/tmp/gfx942_perf/att_best_v25/ui_output_agent_16361_dispatch_22",
+  "geometry": {
+    "att_tick_cycles": 4,
+    "cores_per_n": 4,
+    "mfma_execution_cycles": 16,
+    "mfma_per_core": 32,
+    "n_blocks": 48
+  },
+  "internal_window_coverage": 0.9288654729106431,
+  "lifecycle": {
+    "inter_batch_gap": {
+      "count": 168,
+      "cycles": 109828,
+      "horizon_fraction": 0.0022926885804619547,
+      "max": 11008,
+      "mean": 653.7380952380952,
+      "p50": 220.0,
+      "p95": 2133.6000000000004
+    },
+    "lifetime_cycles": 47793756,
+    "resident_batches": 184,
+    "sampled_active_waves_per_simd_histogram": {
+      "22": 8,
+      "24": 8
+    },
+    "segments": {
+      "epilogue": {
+        "count": 184,
+        "cycles": 1616704,
+        "lifecycle_fraction": 0.033826678112513275,
+        "max": 8948,
+        "mean": 8786.434782608696,
+        "p50": 8792.0,
+        "p95": 8903.4
+      },
+      "prologue": {
+        "count": 184,
+        "cycles": 964240,
+        "lifecycle_fraction": 0.020175020352030924,
+        "max": 6060,
+        "mean": 5240.434782608696,
+        "p50": 5192.0,
+        "p95": 5750.799999999999
+      },
+      "steady": {
+        "count": 184,
+        "cycles": 45212812,
+        "lifecycle_fraction": 0.9459983015354558,
+        "max": 456360,
+        "mean": 245721.80434782608,
+        "p50": 200624.0,
+        "p95": 456152.19999999995
+      }
+    }
+  },
+  "schema_version": 2,
+  "static": {
+    "active_workgroups": 896,
+    "critical_path_inflation_fraction": 0.0714285714285714,
+    "cu_capacity_loss_fraction": 0.06666666666666665,
+    "cu_count": 80,
+    "launch_workgroups": 896,
+    "resident_batches_per_simd_histogram": {
+      "11": 256,
+      "12": 64
+    },
+    "resident_waves_per_simd": 2,
+    "simd_batch_capacity_loss_fraction": 0.0,
+    "simd_wave_capacity_loss_fraction": 0.0,
+    "simds_per_cu": 4,
+    "tasks_per_cu_histogram": {
+      "11": 64,
+      "12": 16
+    },
+    "uniform_early_exit_workgroups": 0,
+    "waves_per_simd_histogram": {
+      "22": 256,
+      "24": 64
+    },
+    "waves_per_wg": 8,
+    "zero_task_cus": 0,
+    "zero_wave_simds": 0
+  },
+  "steady": {
+    "all_waves_same_category": {
+      "barrier": {
+        "cycles": 486936.0,
+        "equivalent_16cycle_slots": 30433.5,
+        "fraction": 0.011594647378765243
+      },
+      "other": {
+        "cycles": 46924.0,
+        "equivalent_16cycle_slots": 2932.75,
+        "fraction": 0.0011173280135401372
+      }
+    },
+    "busy_16cycle_slots": 2066688.0,
+    "categories": {
+      "LDS issue": {
+        "cycles": 497416,
+        "details": {
+          "issue-stall": {
+            "cycles": 196512.0,
+            "equivalent_16cycle_slots": 12282.0,
+            "fraction": 0.3950656995351979
+          },
+          "service": {
+            "cycles": 300904.0,
+            "equivalent_16cycle_slots": 18806.5,
+            "fraction": 0.6049343004648021
+          }
+        },
+        "equivalent_16cycle_slots": 31088.5,
+        "opcodes": {
+          "ds_read_b128": {
+            "cycles": 58092.0,
+            "equivalent_16cycle_slots": 3630.75,
+            "fraction": 0.11678755810026216
+          },
+          "ds_write_b128": {
+            "cycles": 439324.0,
+            "equivalent_16cycle_slots": 27457.75,
+            "fraction": 0.8832124418997378
+          }
+        },
+        "phases": {
+          "core0->1": {
+            "cycles": 235844.0,
+            "equivalent_16cycle_slots": 14740.25,
+            "fraction": 0.47413834697717805
+          },
+          "core1->2": {
+            "cycles": 235396.0,
+            "equivalent_16cycle_slots": 14712.25,
+            "fraction": 0.4732376923942937
+          },
+          "core2->3": {
+            "cycles": 8344.0,
+            "equivalent_16cycle_slots": 521.5,
+            "fraction": 0.01677469160622095
+          },
+          "tail": {
+            "cycles": 17832.0,
+            "equivalent_16cycle_slots": 1114.5,
+            "fraction": 0.035849269022307284
+          }
+        },
+        "sources": {
+          "ds_read_b128 v[196:199], v13": {
+            "cycles": 1436.0,
+            "equivalent_16cycle_slots": 89.75,
+            "fraction": 0.00288691960049536
+          },
+          "ds_read_b128 v[196:199], v13 offset:16384": {
+            "cycles": 296.0,
+            "equivalent_16cycle_slots": 18.5,
+            "fraction": 0.0005950753494057288
+          },
+          "ds_read_b128 v[196:199], v13 offset:24576": {
+            "cycles": 188.0,
+            "equivalent_16cycle_slots": 11.75,
+            "fraction": 0.0003779532624603953
+          },
+          "ds_read_b128 v[196:199], v13 offset:8192": {
+            "cycles": 2004.0,
+            "equivalent_16cycle_slots": 125.25,
+            "fraction": 0.004028820946652299
+          },
+          "ds_read_b128 v[200:203], v5": {
+            "cycles": 1452.0,
+            "equivalent_16cycle_slots": 90.75,
+            "fraction": 0.0029190858355983723
+          },
+          "ds_read_b128 v[200:203], v5 offset:16384": {
+            "cycles": 252.0,
+            "equivalent_16cycle_slots": 15.75,
+            "fraction": 0.0005066182028724448
+          },
+          "ds_read_b128 v[200:203], v5 offset:24576": {
+            "cycles": 188.0,
+            "equivalent_16cycle_slots": 11.75,
+            "fraction": 0.0003779532624603953
+          },
+          "ds_read_b128 v[200:203], v5 offset:8192": {
+            "cycles": 2812.0,
+            "equivalent_16cycle_slots": 175.75,
+            "fraction": 0.005653215819354423
+          },
+          "ds_read_b128 v[204:207], v13 offset:10240": {
+            "cycles": 4816.0,
+            "equivalent_16cycle_slots": 301.0,
+            "fraction": 0.009682036766006723
+          },
+          "ds_read_b128 v[204:207], v13 offset:18432": {
+            "cycles": 180.0,
+            "equivalent_16cycle_slots": 11.25,
+            "fraction": 0.0003618701449088891
+          },
+          "ds_read_b128 v[204:207], v13 offset:2048": {
+            "cycles": 1500.0,
+            "equivalent_16cycle_slots": 93.75,
+            "fraction": 0.0030155845409074095
+          },
+          "ds_read_b128 v[204:207], v13 offset:26624": {
+            "cycles": 216.0,
+            "equivalent_16cycle_slots": 13.5,
+            "fraction": 0.000434244173890667
+          },
+          "ds_read_b128 v[208:211], v5 offset:10240": {
+            "cycles": 4464.0,
+            "equivalent_16cycle_slots": 279.0,
+            "fraction": 0.00897437959374045
+          },
+          "ds_read_b128 v[208:211], v5 offset:18432": {
+            "cycles": 156.0,
+            "equivalent_16cycle_slots": 9.75,
+            "fraction": 0.0003136207922543706
+          },
+          "ds_read_b128 v[208:211], v5 offset:2048": {
+            "cycles": 1532.0,
+            "equivalent_16cycle_slots": 95.75,
+            "fraction": 0.003079917011113434
+          },
+          "ds_read_b128 v[208:211], v5 offset:26624": {
+            "cycles": 200.0,
+            "equivalent_16cycle_slots": 12.5,
+            "fraction": 0.0004020779387876546
+          },
+          "ds_read_b128 v[212:215], v13 offset:12288": {
+            "cycles": 4964.0,
+            "equivalent_16cycle_slots": 310.25,
+            "fraction": 0.009979574440709587
+          },
+          "ds_read_b128 v[212:215], v13 offset:20480": {
+            "cycles": 196.0,
+            "equivalent_16cycle_slots": 12.25,
+            "fraction": 0.0003940363800119015
+          },
+          "ds_read_b128 v[212:215], v13 offset:28672": {
+            "cycles": 208.0,
+            "equivalent_16cycle_slots": 13.0,
+            "fraction": 0.0004181610563391608
+          },
+          "ds_read_b128 v[212:215], v13 offset:4096": {
+            "cycles": 1648.0,
+            "equivalent_16cycle_slots": 103.0,
+            "fraction": 0.003313122215610274
+          },
+          "ds_read_b128 v[216:219], v5 offset:12288": {
+            "cycles": 5856.0,
+            "equivalent_16cycle_slots": 366.0,
+            "fraction": 0.011772842047702526
+          },
+          "ds_read_b128 v[216:219], v5 offset:20480": {
+            "cycles": 208.0,
+            "equivalent_16cycle_slots": 13.0,
+            "fraction": 0.0004181610563391608
+          },
+          "ds_read_b128 v[216:219], v5 offset:28672": {
+            "cycles": 212.0,
+            "equivalent_16cycle_slots": 13.25,
+            "fraction": 0.00042620261511491385
+          },
+          "ds_read_b128 v[216:219], v5 offset:4096": {
+            "cycles": 1992.0,
+            "equivalent_16cycle_slots": 124.5,
+            "fraction": 0.0040046962703250396
+          },
+          "ds_read_b128 v[220:223], v13 offset:14336": {
+            "cycles": 6984.0,
+            "equivalent_16cycle_slots": 436.5,
+            "fraction": 0.014040561622464899
+          },
+          "ds_read_b128 v[220:223], v13 offset:22528": {
+            "cycles": 240.0,
+            "equivalent_16cycle_slots": 15.0,
+            "fraction": 0.0004824935265451855
+          },
+          "ds_read_b128 v[220:223], v13 offset:30720": {
+            "cycles": 232.0,
+            "equivalent_16cycle_slots": 14.5,
+            "fraction": 0.0004664104089936793
+          },
+          "ds_read_b128 v[220:223], v13 offset:6144": {
+            "cycles": 1652.0,
+            "equivalent_16cycle_slots": 103.25,
+            "fraction": 0.003321163774386027
+          },
+          "ds_read_b128 v[224:227], v5 offset:14336": {
+            "cycles": 9768.0,
+            "equivalent_16cycle_slots": 610.5,
+            "fraction": 0.01963748653038905
+          },
+          "ds_read_b128 v[224:227], v5 offset:22528": {
+            "cycles": 264.0,
+            "equivalent_16cycle_slots": 16.5,
+            "fraction": 0.0005307428791997041
+          },
+          "ds_read_b128 v[224:227], v5 offset:30720": {
+            "cycles": 264.0,
+            "equivalent_16cycle_slots": 16.5,
+            "fraction": 0.0005307428791997041
+          },
+          "ds_read_b128 v[224:227], v5 offset:6144": {
+            "cycles": 1712.0,
+            "equivalent_16cycle_slots": 107.0,
+            "fraction": 0.0034417871560223235
+          },
+          "ds_write_b128 v2, v[164:167] offset:24576": {
+            "cycles": 233604.0,
+            "equivalent_16cycle_slots": 14600.25,
+            "fraction": 0.46963507406275634
+          },
+          "ds_write_b128 v2, v[164:167] offset:8192": {
+            "cycles": 4908.0,
+            "equivalent_16cycle_slots": 306.75,
+            "fraction": 0.009866992617849044
+          },
+          "ds_write_b128 v2, v[184:187]": {
+            "cycles": 6636.0,
+            "equivalent_16cycle_slots": 414.75,
+            "fraction": 0.01334094600897438
+          },
+          "ds_write_b128 v2, v[184:187] offset:16384": {
+            "cycles": 194176.0,
+            "equivalent_16cycle_slots": 12136.0,
+            "fraction": 0.3903694292101581
+          }
+        },
+        "stall_fraction": 0.05570410002136711,
+        "steady_fraction": 0.011844191270630827
+      },
+      "LDS wait": {
+        "cycles": 33164,
+        "details": {
+          "completion wait": {
+            "cycles": 33164.0,
+            "equivalent_16cycle_slots": 2072.75,
+            "fraction": 1.0
+          }
+        },
+        "equivalent_16cycle_slots": 2072.75,
+        "opcodes": {
+          "s_waitcnt": {
+            "cycles": 33164.0,
+            "equivalent_16cycle_slots": 2072.75,
+            "fraction": 1.0
+          }
+        },
+        "phases": {
+          "core0->1": {
+            "cycles": 12276.0,
+            "equivalent_16cycle_slots": 767.25,
+            "fraction": 0.37016041490773127
+          },
+          "core1->2": {
+            "cycles": 644.0,
+            "equivalent_16cycle_slots": 40.25,
+            "fraction": 0.019418646725364853
+          },
+          "core2->3": {
+            "cycles": 2172.0,
+            "equivalent_16cycle_slots": 135.75,
+            "fraction": 0.06549270293088892
+          },
+          "tail": {
+            "cycles": 18072.0,
+            "equivalent_16cycle_slots": 1129.5,
+            "fraction": 0.544928235436015
+          }
+        },
+        "sources": {
+          "s_waitcnt lgkmcnt(0)": {
+            "cycles": 27120.0,
+            "equivalent_16cycle_slots": 1695.0,
+            "fraction": 0.8177541912917622
+          },
+          "s_waitcnt lgkmcnt(8)": {
+            "cycles": 6044.0,
+            "equivalent_16cycle_slots": 377.75,
+            "fraction": 0.18224580870823784
+          }
+        },
+        "stall_fraction": 0.003713935163140347,
+        "steady_fraction": 0.0007896825982662414
+      },
+      "VALU execution": {
+        "cycles": 4,
+        "details": {
+          "service": {
+            "cycles": 4.0,
+            "equivalent_16cycle_slots": 0.25,
+            "fraction": 1.0
+          }
+        },
+        "equivalent_16cycle_slots": 0.25,
+        "opcodes": {
+          "v_fmac_f32_e32": {
+            "cycles": 4.0,
+            "equivalent_16cycle_slots": 0.25,
+            "fraction": 1.0
+          }
+        },
+        "phases": {
+          "core1": {
+            "cycles": 4.0,
+            "equivalent_16cycle_slots": 0.25,
+            "fraction": 1.0
+          }
+        },
+        "sources": {
+          "v_fmac_f32_e32 v61, v31, v6": {
+            "cycles": 4.0,
+            "equivalent_16cycle_slots": 0.25,
+            "fraction": 1.0
+          }
+        },
+        "stall_fraction": 4.479477943722527e-07,
+        "steady_fraction": 9.52457602540395e-08
+      },
+      "VMEM issue": {
+        "cycles": 7801900,
+        "details": {
+          "issue-stall": {
+            "cycles": 7782008.0,
+            "equivalent_16cycle_slots": 486375.5,
+            "fraction": 0.9974503646547636
+          },
+          "service": {
+            "cycles": 19892.0,
+            "equivalent_16cycle_slots": 1243.25,
+            "fraction": 0.002549635345236417
+          }
+        },
+        "equivalent_16cycle_slots": 487618.75,
+        "opcodes": {
+          "buffer_load_dword": {
+            "cycles": 2389384.0,
+            "equivalent_16cycle_slots": 149336.5,
+            "fraction": 0.3062566810648688
+          },
+          "buffer_load_dwordx4": {
+            "cycles": 5412516.0,
+            "equivalent_16cycle_slots": 338282.25,
+            "fraction": 0.6937433189351312
+          }
+        },
+        "phases": {
+          "core0->1": {
+            "cycles": 7619724.0,
+            "equivalent_16cycle_slots": 476232.75,
+            "fraction": 0.9766497904356631
+          },
+          "core1->2": {
+            "cycles": 71464.0,
+            "equivalent_16cycle_slots": 4466.5,
+            "fraction": 0.009159820043835476
+          },
+          "core2->3": {
+            "cycles": 103152.0,
+            "equivalent_16cycle_slots": 6447.0,
+            "fraction": 0.013221394788448967
+          },
+          "tail": {
+            "cycles": 7560.0,
+            "equivalent_16cycle_slots": 472.5,
+            "fraction": 0.0009689947320524488
+          }
+        },
+        "sources": {
+          "buffer_load_dword v162, v11, s[8:11], s17 offen": {
+            "cycles": 1616.0,
+            "equivalent_16cycle_slots": 101.0,
+            "fraction": 0.00020712903267152872
+          },
+          "buffer_load_dword v163, v10, s[8:11], s17 offen": {
+            "cycles": 266320.0,
+            "equivalent_16cycle_slots": 16645.0,
+            "fraction": 0.03413527474076827
+          },
+          "buffer_load_dword v192, v11, s[8:11], s17 offen": {
+            "cycles": 920.0,
+            "equivalent_16cycle_slots": 57.5,
+            "fraction": 0.0001179199938476525
+          },
+          "buffer_load_dword v193, v10, s[8:11], s17 offen": {
+            "cycles": 2120528.0,
+            "equivalent_16cycle_slots": 132533.0,
+            "fraction": 0.27179635729758134
+          },
+          "buffer_load_dwordx4 v[164:167], v3, s[28:31], s17 offen": {
+            "cycles": 2764.0,
+            "equivalent_16cycle_slots": 172.75,
+            "fraction": 0.00035427267716838206
+          },
+          "buffer_load_dwordx4 v[164:167], v7, s[28:31], s17 offen": {
+            "cycles": 29964.0,
+            "equivalent_16cycle_slots": 1872.75,
+            "fraction": 0.0038406029300554994
+          },
+          "buffer_load_dwordx4 v[168:171], v15, s[24:27], s17 offen": {
+            "cycles": 1424.0,
+            "equivalent_16cycle_slots": 89.0,
+            "fraction": 0.00018251964265114909
+          },
+          "buffer_load_dwordx4 v[172:175], v12, s[24:27], s17 offen": {
+            "cycles": 19416.0,
+            "equivalent_16cycle_slots": 1213.5,
+            "fraction": 0.002488624565810892
+          },
+          "buffer_load_dwordx4 v[176:179], v14, s[24:27], s17 offen": {
+            "cycles": 241828.0,
+            "equivalent_16cycle_slots": 15114.25,
+            "fraction": 0.030996039426293594
+          },
+          "buffer_load_dwordx4 v[180:183], v16, s[24:27], s17 offen": {
+            "cycles": 544.0,
+            "equivalent_16cycle_slots": 34.0,
+            "fraction": 6.972660505774234e-05
+          },
+          "buffer_load_dwordx4 v[184:187], v4, s[28:31], s17 offen": {
+            "cycles": 1458112.0,
+            "equivalent_16cycle_slots": 91132.0,
+            "fraction": 0.18689191094476987
+          },
+          "buffer_load_dwordx4 v[184:187], v8, s[28:31], s17 offen": {
+            "cycles": 71004.0,
+            "equivalent_16cycle_slots": 4437.75,
+            "fraction": 0.00910086004691165
+          },
+          "buffer_load_dwordx4 v[188:191], v15, s[24:27], s17 offen": {
+            "cycles": 836.0,
+            "equivalent_16cycle_slots": 52.25,
+            "fraction": 0.00010715338571373639
+          },
+          "buffer_load_dwordx4 v[228:231], v14, s[24:27], s17 offen": {
+            "cycles": 3532936.0,
+            "equivalent_16cycle_slots": 220808.5,
+            "fraction": 0.45283020802625
+          },
+          "buffer_load_dwordx4 v[232:235], v12, s[24:27], s17 offen": {
+            "cycles": 22084.0,
+            "equivalent_16cycle_slots": 1380.25,
+            "fraction": 0.0028305925479690844
+          },
+          "buffer_load_dwordx4 v[236:239], v16, s[24:27], s17 offen": {
+            "cycles": 31604.0,
+            "equivalent_16cycle_slots": 1975.25,
+            "fraction": 0.004050808136479575
+          }
+        },
+        "stall_fraction": 0.8737109742282195,
+        "steady_fraction": 0.18577447423149768
+      },
+      "VMEM wait": {
+        "cycles": 48848,
+        "details": {
+          "completion wait": {
+            "cycles": 48848.0,
+            "equivalent_16cycle_slots": 3053.0,
+            "fraction": 1.0
+          }
+        },
+        "equivalent_16cycle_slots": 3053.0,
+        "opcodes": {
+          "s_waitcnt": {
+            "cycles": 48848.0,
+            "equivalent_16cycle_slots": 3053.0,
+            "fraction": 1.0
+          }
+        },
+        "phases": {
+          "tail": {
+            "cycles": 48848.0,
+            "equivalent_16cycle_slots": 3053.0,
+            "fraction": 1.0
+          }
+        },
+        "sources": {
+          "s_waitcnt vmcnt(1)": {
+            "cycles": 48848.0,
+            "equivalent_16cycle_slots": 3053.0,
+            "fraction": 1.0
+          }
+        },
+        "stall_fraction": 0.00547033846487395,
+        "steady_fraction": 0.0011631412242223303
+      },
+      "barrier": {
+        "cycles": 501356,
+        "details": {
+          "stall": {
+            "cycles": 501356.0,
+            "equivalent_16cycle_slots": 31334.75,
+            "fraction": 1.0
+          }
+        },
+        "equivalent_16cycle_slots": 31334.75,
+        "opcodes": {
+          "s_barrier": {
+            "cycles": 501356.0,
+            "equivalent_16cycle_slots": 31334.75,
+            "fraction": 1.0
+          }
+        },
+        "phases": {
+          "core0": {
+            "cycles": 59572.0,
+            "equivalent_16cycle_slots": 3723.25,
+            "fraction": 0.11882175539935694
+          },
+          "core0->1": {
+            "cycles": 62212.0,
+            "equivalent_16cycle_slots": 3888.25,
+            "fraction": 0.12408747476842802
+          },
+          "core1": {
+            "cycles": 114014.0,
+            "equivalent_16cycle_slots": 7125.875,
+            "fraction": 0.22741126066108713
+          },
+          "core1->2": {
+            "cycles": 85498.0,
+            "equivalent_16cycle_slots": 5343.625,
+            "fraction": 0.17053351311243906
+          },
+          "core2": {
+            "cycles": 28694.0,
+            "equivalent_16cycle_slots": 1793.375,
+            "fraction": 0.05723278468792634
+          },
+          "core2->3": {
+            "cycles": 20014.0,
+            "equivalent_16cycle_slots": 1250.875,
+            "fraction": 0.03991973767143507
+          },
+          "core3": {
+            "cycles": 54620.0,
+            "equivalent_16cycle_slots": 3413.75,
+            "fraction": 0.10894454240100847
+          },
+          "tail": {
+            "cycles": 76732.0,
+            "equivalent_16cycle_slots": 4795.75,
+            "fraction": 0.15304893129831895
+          }
+        },
+        "sources": {
+          "s_barrier": {
+            "cycles": 501356.0,
+            "equivalent_16cycle_slots": 31334.75,
+            "fraction": 1.0
+          }
+        },
+        "stall_fraction": 0.05614532859882378,
+        "steady_fraction": 0.011938008344481056
+      },
+      "other": {
+        "cycles": 46924,
+        "details": {
+          "SALU/control": {
+            "cycles": 28640.0,
+            "equivalent_16cycle_slots": 1790.0,
+            "fraction": 0.6103486488790384
+          },
+          "other service": {
+            "cycles": 18022.0,
+            "equivalent_16cycle_slots": 1126.375,
+            "fraction": 0.38406785440286423
+          },
+          "scheduler ready": {
+            "cycles": 262.0,
+            "equivalent_16cycle_slots": 16.375,
+            "fraction": 0.005583496718097349
+          }
+        },
+        "equivalent_16cycle_slots": 2932.75,
+        "opcodes": {
+          "<ready>": {
+            "cycles": 262.0,
+            "equivalent_16cycle_slots": 16.375,
+            "fraction": 0.005583496718097349
+          },
+          "s_add_u32": {
+            "cycles": 26040.0,
+            "equivalent_16cycle_slots": 1627.5,
+            "fraction": 0.5549399028215838
+          },
+          "s_load_dword": {
+            "cycles": 18022.0,
+            "equivalent_16cycle_slots": 1126.375,
+            "fraction": 0.38406785440286423
+          },
+          "s_lshl_b32": {
+            "cycles": 954.0,
+            "equivalent_16cycle_slots": 59.625,
+            "fraction": 0.02033074759185065
+          },
+          "s_lshr_b32": {
+            "cycles": 1646.0,
+            "equivalent_16cycle_slots": 102.875,
+            "fraction": 0.03507799846560396
+          }
+        },
+        "phases": {
+          "core0->1": {
+            "cycles": 32628.0,
+            "equivalent_16cycle_slots": 2039.25,
+            "fraction": 0.6953371409087035
+          },
+          "core1->2": {
+            "cycles": 14296.0,
+            "equivalent_16cycle_slots": 893.5,
+            "fraction": 0.3046628590912966
+          }
+        },
+        "sources": {
+          "<ready>": {
+            "cycles": 262.0,
+            "equivalent_16cycle_slots": 16.375,
+            "fraction": 0.005583496718097349
+          },
+          "s_add_u32 s17, 0x80, s12": {
+            "cycles": 22216.0,
+            "equivalent_16cycle_slots": 1388.5,
+            "fraction": 0.47344642400477366
+          },
+          "s_add_u32 s17, 4, s17": {
+            "cycles": 2124.0,
+            "equivalent_16cycle_slots": 132.75,
+            "fraction": 0.04526468331770522
+          },
+          "s_add_u32 s17, s13, s17": {
+            "cycles": 30.0,
+            "equivalent_16cycle_slots": 1.875,
+            "fraction": 0.0006393316852783224
+          },
+          "s_add_u32 s17, s6, s17": {
+            "cycles": 360.0,
+            "equivalent_16cycle_slots": 22.5,
+            "fraction": 0.007671980223339868
+          },
+          "s_add_u32 s17, s7, s17": {
+            "cycles": 1310.0,
+            "equivalent_16cycle_slots": 81.875,
+            "fraction": 0.027917483590486746
+          },
+          "s_load_dword s20, s[14:15], s17": {
+            "cycles": 516.0,
+            "equivalent_16cycle_slots": 32.25,
+            "fraction": 0.010996504986787146
+          },
+          "s_load_dword s21, s[14:15], s17": {
+            "cycles": 8564.0,
+            "equivalent_16cycle_slots": 535.25,
+            "fraction": 0.1825078850907851
+          },
+          "s_load_dword s22, s[14:15], s17": {
+            "cycles": 418.0,
+            "equivalent_16cycle_slots": 26.125,
+            "fraction": 0.008908021481544626
+          },
+          "s_load_dword s23, s[14:15], s17": {
+            "cycles": 8524.0,
+            "equivalent_16cycle_slots": 532.75,
+            "fraction": 0.18165544284374732
+          },
+          "s_lshl_b32 s17, s17, 4": {
+            "cycles": 746.0,
+            "equivalent_16cycle_slots": 46.625,
+            "fraction": 0.015898047907254284
+          },
+          "s_lshl_b32 s17, s5, 2": {
+            "cycles": 208.0,
+            "equivalent_16cycle_slots": 13.0,
+            "fraction": 0.004432699684596368
+          },
+          "s_lshr_b32 s17, s12, 5": {
+            "cycles": 1646.0,
+            "equivalent_16cycle_slots": 102.875,
+            "fraction": 0.03507799846560396
+          }
+        },
+        "stall_fraction": 0.005254875575780896,
+        "steady_fraction": 0.0011173280135401372
+      }
+    },
+    "first_n": 2,
+    "idle_16cycle_slots": 558100.75,
+    "joint_category_phase": {
+      "LDS issue@core0->1 + LDS wait@core0->1": {
+        "cycles": 8676.0,
+        "equivalent_16cycle_slots": 542.25,
+        "fraction": 0.00020658805399101165
+      },
+      "LDS issue@core0->1 + LDS wait@tail": {
+        "cycles": 10280.0,
+        "equivalent_16cycle_slots": 642.5,
+        "fraction": 0.0002447816038528815
+      },
+      "LDS issue@core0->1 + barrier@core0": {
+        "cycles": 3684.0,
+        "equivalent_16cycle_slots": 230.25,
+        "fraction": 8.772134519397037e-05
+      },
+      "LDS issue@core0->1 + barrier@core1": {
+        "cycles": 37984.0,
+        "equivalent_16cycle_slots": 2374.0,
+        "fraction": 0.000904453739372359
+      },
+      "LDS issue@core0->1 + other@core0->1": {
+        "cycles": 175220.0,
+        "equivalent_16cycle_slots": 10951.25,
+        "fraction": 0.0041722405279282
+      },
+      "LDS issue@core1->2 + LDS wait@core0->1": {
+        "cycles": 77688.0,
+        "equivalent_16cycle_slots": 4855.5,
+        "fraction": 0.001849863155653955
+      },
+      "LDS issue@core1->2 + LDS wait@core1->2": {
+        "cycles": 2768.0,
+        "equivalent_16cycle_slots": 173.0,
+        "fraction": 6.591006609579532e-05
+      },
+      "LDS issue@core1->2 + barrier@core1": {
+        "cycles": 860.0,
+        "equivalent_16cycle_slots": 53.75,
+        "fraction": 2.047783845461849e-05
+      },
+      "LDS issue@core1->2 + barrier@core2": {
+        "cycles": 620.0,
+        "equivalent_16cycle_slots": 38.75,
+        "fraction": 1.4763092839376121e-05
+      },
+      "LDS issue@core1->2 + other@core0->1": {
+        "cycles": 153460.0,
+        "equivalent_16cycle_slots": 9591.25,
+        "fraction": 0.003654103592146225
+      },
+      "LDS issue@core2->3 + LDS wait@core1->2": {
+        "cycles": 1708.0,
+        "equivalent_16cycle_slots": 106.75,
+        "fraction": 4.066993962847486e-05
+      },
+      "LDS issue@core2->3 + LDS wait@core2->3": {
+        "cycles": 4928.0,
+        "equivalent_16cycle_slots": 308.0,
+        "fraction": 0.00011734277663297665
+      },
+      "LDS issue@core2->3 + barrier@core2": {
+        "cycles": 1608.0,
+        "equivalent_16cycle_slots": 100.5,
+        "fraction": 3.828879562212388e-05
+      },
+      "LDS issue@core2->3 + barrier@core3": {
+        "cycles": 100.0,
+        "equivalent_16cycle_slots": 6.25,
+        "fraction": 2.3811440063509873e-06
+      },
+      "LDS issue@tail + barrier@core0": {
+        "cycles": 620.0,
+        "equivalent_16cycle_slots": 38.75,
+        "fraction": 1.4763092839376121e-05
+      },
+      "LDS issue@tail + barrier@core3": {
+        "cycles": 17212.0,
+        "equivalent_16cycle_slots": 1075.75,
+        "fraction": 0.00040984250637313195
+      },
+      "LDS wait@core0->1 + VMEM issue@core0->1": {
+        "cycles": 1552.0,
+        "equivalent_16cycle_slots": 97.0,
+        "fraction": 3.695535497856732e-05
+      },
+      "LDS wait@core0->1 + VMEM issue@core1->2": {
+        "cycles": 13428.0,
+        "equivalent_16cycle_slots": 839.25,
+        "fraction": 0.0003197400171728106
+      },
+      "LDS wait@core0->1 + barrier@core0": {
+        "cycles": 264.0,
+        "equivalent_16cycle_slots": 16.5,
+        "fraction": 6.286220176766607e-06
+      },
+      "LDS wait@core0->1 + barrier@core1": {
+        "cycles": 3144.0,
+        "equivalent_16cycle_slots": 196.5,
+        "fraction": 7.486316755967504e-05
+      },
+      "LDS wait@core0->1 + other@core0->1": {
+        "cycles": 832.0,
+        "equivalent_16cycle_slots": 52.0,
+        "fraction": 1.9811118132840214e-05
+      },
+      "LDS wait@core0->1 + other@core1->2": {
+        "cycles": 8036.0,
+        "equivalent_16cycle_slots": 502.25,
+        "fraction": 0.00019134873235036534
+      },
+      "LDS wait@core1->2 + VMEM issue@core1->2": {
+        "cycles": 424.0,
+        "equivalent_16cycle_slots": 26.5,
+        "fraction": 1.0096050586928185e-05
+      },
+      "LDS wait@core1->2 + VMEM issue@core2->3": {
+        "cycles": 328.0,
+        "equivalent_16cycle_slots": 20.5,
+        "fraction": 7.810152340831239e-06
+      },
+      "LDS wait@core1->2 + barrier@core1": {
+        "cycles": 96.0,
+        "equivalent_16cycle_slots": 6.0,
+        "fraction": 2.2858982460969478e-06
+      },
+      "LDS wait@core1->2 + barrier@core2": {
+        "cycles": 88.0,
+        "equivalent_16cycle_slots": 5.5,
+        "fraction": 2.0954067255888688e-06
+      },
+      "LDS wait@core1->2 + other@core1->2": {
+        "cycles": 288.0,
+        "equivalent_16cycle_slots": 18.0,
+        "fraction": 6.857694738290844e-06
+      },
+      "LDS wait@core1->2 + other@core2->3": {
+        "cycles": 172.0,
+        "equivalent_16cycle_slots": 10.75,
+        "fraction": 4.0955676909236984e-06
+      },
+      "LDS wait@core2->3 + VMEM issue@core2->3": {
+        "cycles": 1140.0,
+        "equivalent_16cycle_slots": 71.25,
+        "fraction": 2.7145041672401256e-05
+      },
+      "LDS wait@core2->3 + VMEM wait@tail": {
+        "cycles": 848.0,
+        "equivalent_16cycle_slots": 53.0,
+        "fraction": 2.019210117385637e-05
+      },
+      "LDS wait@core2->3 + barrier@core2": {
+        "cycles": 216.0,
+        "equivalent_16cycle_slots": 13.5,
+        "fraction": 5.143271053718133e-06
+      },
+      "LDS wait@core2->3 + barrier@core3": {
+        "cycles": 12.0,
+        "equivalent_16cycle_slots": 0.75,
+        "fraction": 2.8573728076211847e-07
+      },
+      "LDS wait@core2->3 + other@core2->3": {
+        "cycles": 536.0,
+        "equivalent_16cycle_slots": 33.5,
+        "fraction": 1.2762931874041292e-05
+      },
+      "LDS wait@core2->3 + other@tail": {
+        "cycles": 1408.0,
+        "equivalent_16cycle_slots": 88.0,
+        "fraction": 3.35265076094219e-05
+      },
+      "LDS wait@tail + VMEM issue@core0->1": {
+        "cycles": 1924.0,
+        "equivalent_16cycle_slots": 120.25,
+        "fraction": 4.5813210682192995e-05
+      },
+      "LDS wait@tail + VMEM wait@tail": {
+        "cycles": 23384.0,
+        "equivalent_16cycle_slots": 1461.5,
+        "fraction": 0.0005568067144451149
+      },
+      "LDS wait@tail + barrier@core0": {
+        "cycles": 148.0,
+        "equivalent_16cycle_slots": 9.25,
+        "fraction": 3.5240931293994614e-06
+      },
+      "LDS wait@tail + barrier@core3": {
+        "cycles": 2076.0,
+        "equivalent_16cycle_slots": 129.75,
+        "fraction": 4.94325495718465e-05
+      },
+      "LDS wait@tail + other@core0->1": {
+        "cycles": 1092.0,
+        "equivalent_16cycle_slots": 68.25,
+        "fraction": 2.600209254935278e-05
+      },
+      "LDS wait@tail + other@tail": {
+        "cycles": 14756.0,
+        "equivalent_16cycle_slots": 922.25,
+        "fraction": 0.0003513616095771517
+      },
+      "VALU execution@core1 + barrier@core1->2": {
+        "cycles": 4.0,
+        "equivalent_16cycle_slots": 0.25,
+        "fraction": 9.52457602540395e-08
+      },
+      "VMEM issue@core0->1 + barrier@core0": {
+        "cycles": 1976428.0,
+        "equivalent_16cycle_slots": 123526.75,
+        "fraction": 0.04706159686184269
+      },
+      "VMEM issue@core0->1 + barrier@core1": {
+        "cycles": 5636940.0,
+        "equivalent_16cycle_slots": 352308.75,
+        "fraction": 0.13422365895160135
+      },
+      "VMEM issue@core0->1 + other@core0->1": {
+        "cycles": 2880.0,
+        "equivalent_16cycle_slots": 180.0,
+        "fraction": 6.857694738290844e-05
+      },
+      "VMEM issue@core1->2 + barrier@core1": {
+        "cycles": 2720.0,
+        "equivalent_16cycle_slots": 170.0,
+        "fraction": 6.476711697274685e-05
+      },
+      "VMEM issue@core1->2 + barrier@core2": {
+        "cycles": 31588.0,
+        "equivalent_16cycle_slots": 1974.25,
+        "fraction": 0.0007521557687261499
+      },
+      "VMEM issue@core1->2 + other@core0->1": {
+        "cycles": 23304.0,
+        "equivalent_16cycle_slots": 1456.5,
+        "fraction": 0.0005549017992400341
+      },
+      "VMEM issue@core2->3 + barrier@core2": {
+        "cycles": 101336.0,
+        "equivalent_16cycle_slots": 6333.5,
+        "fraction": 0.0024129560902758367
+      },
+      "VMEM issue@core2->3 + barrier@core3": {
+        "cycles": 348.0,
+        "equivalent_16cycle_slots": 21.75,
+        "fraction": 8.286381142101436e-06
+      },
+      "VMEM issue@tail + barrier@core0": {
+        "cycles": 156.0,
+        "equivalent_16cycle_slots": 9.75,
+        "fraction": 3.71458464990754e-06
+      },
+      "VMEM issue@tail + barrier@core3": {
+        "cycles": 7404.0,
+        "equivalent_16cycle_slots": 462.75,
+        "fraction": 0.0001762999022302271
+      },
+      "VMEM wait@tail + barrier@core3": {
+        "cycles": 24616.0,
+        "equivalent_16cycle_slots": 1538.5,
+        "fraction": 0.000586142408603359
+      },
+      "barrier@core0 + barrier@core0->1": {
+        "cycles": 39708.0,
+        "equivalent_16cycle_slots": 2481.75,
+        "fraction": 0.0009455046620418501
+      },
+      "barrier@core0 + barrier@tail": {
+        "cycles": 77748.0,
+        "equivalent_16cycle_slots": 4859.25,
+        "fraction": 0.0018512918420577657
+      },
+      "barrier@core0 + other@core0->1": {
+        "cycles": 620.0,
+        "equivalent_16cycle_slots": 38.75,
+        "fraction": 1.4763092839376121e-05
+      },
+      "barrier@core0 + other@tail": {
+        "cycles": 224.0,
+        "equivalent_16cycle_slots": 14.0,
+        "fraction": 5.333762574226212e-06
+      },
+      "barrier@core0->1 + barrier@core1": {
+        "cycles": 84716.0,
+        "equivalent_16cycle_slots": 5294.75,
+        "fraction": 0.0020172099564203026
+      },
+      "barrier@core1 + barrier@core1->2": {
+        "cycles": 138616.0,
+        "equivalent_16cycle_slots": 8663.5,
+        "fraction": 0.0033006465758434844
+      },
+      "barrier@core1 + other@core0->1": {
+        "cycles": 2236.0,
+        "equivalent_16cycle_slots": 139.75,
+        "fraction": 5.3242379982008074e-05
+      },
+      "barrier@core1 + other@core1->2": {
+        "cycles": 112.0,
+        "equivalent_16cycle_slots": 7.0,
+        "fraction": 2.666881287113106e-06
+      },
+      "barrier@core1->2 + barrier@core2": {
+        "cycles": 30404.0,
+        "equivalent_16cycle_slots": 1900.25,
+        "fraction": 0.0007239630236909541
+      },
+      "barrier@core1->2 + other@core1": {
+        "cycles": 988.0,
+        "equivalent_16cycle_slots": 61.75,
+        "fraction": 2.3525702782747754e-05
+      },
+      "barrier@core2 + barrier@core2->3": {
+        "cycles": 25824.0,
+        "equivalent_16cycle_slots": 1614.0,
+        "fraction": 0.000614906628200079
+      },
+      "barrier@core2 + other@core1->2": {
+        "cycles": 192.0,
+        "equivalent_16cycle_slots": 12.0,
+        "fraction": 4.5717964921938956e-06
+      },
+      "barrier@core2 + other@core2->3": {
+        "cycles": 388.0,
+        "equivalent_16cycle_slots": 24.25,
+        "fraction": 9.23883874464183e-06
+      },
+      "barrier@core2->3 + barrier@core3": {
+        "cycles": 14204.0,
+        "equivalent_16cycle_slots": 887.75,
+        "fraction": 0.0003382176946620942
+      },
+      "barrier@core3 + barrier@tail": {
+        "cycles": 75716.0,
+        "equivalent_16cycle_slots": 4732.25,
+        "fraction": 0.0018029069958487136
+      },
+      "barrier@core3 + other@core2->3": {
+        "cycles": 12.0,
+        "equivalent_16cycle_slots": 0.75,
+        "fraction": 2.8573728076211847e-07
+      },
+      "barrier@core3 + other@tail": {
+        "cycles": 9648.0,
+        "equivalent_16cycle_slots": 603.0,
+        "fraction": 0.00022973277373274326
+      },
+      "other@core0->1 + other@core0->1": {
+        "cycles": 18332.0,
+        "equivalent_16cycle_slots": 1145.75,
+        "fraction": 0.00043651131924426296
+      },
+      "other@core0->1 + other@core1->2": {
+        "cycles": 28592.0,
+        "equivalent_16cycle_slots": 1787.0,
+        "fraction": 0.0006808166942958743
+      }
+    },
+    "last_n_exclusive": 46,
+    "mfma_busy_cycles": 33067008,
+    "mfma_busy_fraction": 0.7873730790716015,
+    "mfma_idle_cycles": 8929612,
+    "mfma_idle_fraction": 0.21262692092839852,
+    "total_16cycle_slots": 2624788.75,
+    "total_cycles": 41996620
+  },
+  "trace": {
+    "active_wave_files": 368,
+    "complete_wave_files": 368,
+    "opcode_stats": {
+      "buffer_load_dword": {
+        "count": 35328,
+        "service_cycles": 296744,
+        "stall_cycles": 3059688
+      },
+      "buffer_load_dwordx4": {
+        "count": 141312,
+        "service_cycles": 1216336,
+        "stall_cycles": 7501792
+      },
+      "buffer_store_dwordx4": {
+        "count": 5888,
+        "service_cycles": 23580,
+        "stall_cycles": 898784
+      },
+      "ds_bpermute_b32": {
+        "count": 23552,
+        "service_cycles": 188416,
+        "stall_cycles": 17272
+      },
+      "ds_read_b128": {
+        "count": 565248,
+        "service_cycles": 2313228,
+        "stall_cycles": 4008244
+      },
+      "ds_write_b128": {
+        "count": 70656,
+        "service_cycles": 1461228,
+        "stall_cycles": 663972
+      },
+      "s_abs_i32": {
+        "count": 736,
+        "service_cycles": 2944,
+        "stall_cycles": 720
+      },
+      "s_add_i32": {
+        "count": 1840,
+        "service_cycles": 7404,
+        "stall_cycles": 12896
+      },
+      "s_add_u32": {
+        "count": 263856,
+        "service_cycles": 1055732,
+        "stall_cycles": 74048
+      },
+      "s_addc_u32": {
+        "count": 1104,
+        "service_cycles": 4416,
+        "stall_cycles": 0
+      },
+      "s_and_saveexec_b64": {
+        "count": 5888,
+        "service_cycles": 23552,
+        "stall_cycles": 0
+      },
+      "s_ashr_i32": {
+        "count": 1472,
+        "service_cycles": 5888,
+        "stall_cycles": 12576
+      },
+      "s_barrier": {
+        "count": 142048,
+        "service_cycles": 0,
+        "stall_cycles": 29839800
+      },
+      "s_branch": {
+        "count": 8464,
+        "service_cycles": 33856,
+        "stall_cycles": 0
+      },
+      "s_cbranch_execz": {
+        "count": 5888,
+        "service_cycles": 23552,
+        "stall_cycles": 0
+      },
+      "s_cbranch_scc0": {
+        "count": 9936,
+        "service_cycles": 39868,
+        "stall_cycles": 0
+      },
+      "s_cmp_eq_u32": {
+        "count": 736,
+        "service_cycles": 3192,
+        "stall_cycles": 736
+      },
+      "s_cmp_ge_u32": {
+        "count": 736,
+        "service_cycles": 2944,
+        "stall_cycles": 264
+      },
+      "s_cmp_gt_u32": {
+        "count": 368,
+        "service_cycles": 1472,
+        "stall_cycles": 0
+      },
+      "s_cmp_lt_u32": {
+        "count": 9200,
+        "service_cycles": 36800,
+        "stall_cycles": 0
+      },
+      "s_cselect_b32": {
+        "count": 1472,
+        "service_cycles": 5888,
+        "stall_cycles": 0
+      },
+      "s_endpgm": {
+        "count": 368,
+        "service_cycles": 285776,
+        "stall_cycles": 0
+      },
+      "s_load_dword": {
+        "count": 35696,
+        "service_cycles": 142896,
+        "stall_cycles": 252
+      },
+      "s_load_dwordx2": {
+        "count": 1840,
+        "service_cycles": 7408,
+        "stall_cycles": 7588
+      },
+      "s_lshl_b32": {
+        "count": 125488,
+        "service_cycles": 519752,
+        "stall_cycles": 4744
+      },
+      "s_lshr_b32": {
+        "count": 37904,
+        "service_cycles": 151616,
+        "stall_cycles": 1216
+      },
+      "s_min_u32": {
+        "count": 1104,
+        "service_cycles": 4416,
+        "stall_cycles": 0
+      },
+      "s_mov_b32": {
+        "count": 6624,
+        "service_cycles": 26496,
+        "stall_cycles": 776
+      },
+      "s_mov_b64": {
+        "count": 5888,
+        "service_cycles": 23552,
+        "stall_cycles": 108
+      },
+      "s_mul_hi_u32": {
+        "count": 1104,
+        "service_cycles": 4416,
+        "stall_cycles": 0
+      },
+      "s_mul_i32": {
+        "count": 6256,
+        "service_cycles": 25028,
+        "stall_cycles": 11896
+      },
+      "s_nop": {
+        "count": 1104,
+        "service_cycles": 0,
+        "stall_cycles": 27948
+      },
+      "s_setprio": {
+        "count": 141312,
+        "service_cycles": 0,
+        "stall_cycles": 565248
+      },
+      "s_sub_i32": {
+        "count": 3680,
+        "service_cycles": 14720,
+        "stall_cycles": 3448
+      },
+      "s_sub_u32": {
+        "count": 2944,
+        "service_cycles": 11776,
+        "stall_cycles": 380
+      },
+      "s_waitcnt": {
+        "count": 218592,
+        "service_cycles": 0,
+        "stall_cycles": 2464676
+      },
+      "s_xor_b32": {
+        "count": 736,
+        "service_cycles": 2944,
+        "stall_cycles": 60
+      },
+      "v_add_f32_e32": {
+        "count": 47104,
+        "service_cycles": 188416,
+        "stall_cycles": 1776
+      },
+      "v_add_u32_e32": {
+        "count": 26864,
+        "service_cycles": 107456,
+        "stall_cycles": 12
+      },
+      "v_and_b32_e32": {
+        "count": 2208,
+        "service_cycles": 8836,
+        "stall_cycles": 0
+      },
+      "v_and_b32_e64": {
+        "count": 368,
+        "service_cycles": 1472,
+        "stall_cycles": 0
+      },
+      "v_cmp_gt_u32_e32": {
+        "count": 5888,
+        "service_cycles": 23552,
+        "stall_cycles": 188
+      },
+      "v_cmp_ne_u32_e64": {
+        "count": 5888,
+        "service_cycles": 23552,
+        "stall_cycles": 336
+      },
+      "v_cndmask_b32_e32": {
+        "count": 23552,
+        "service_cycles": 94208,
+        "stall_cycles": 4180
+      },
+      "v_cvt_f32_u32_e32": {
+        "count": 368,
+        "service_cycles": 1472,
+        "stall_cycles": 4348
+      },
+      "v_cvt_u32_f32_e32": {
+        "count": 368,
+        "service_cycles": 1472,
+        "stall_cycles": 100
+      },
+      "v_fmac_f32_e32": {
+        "count": 2263936,
+        "service_cycles": 9163180,
+        "stall_cycles": 1060980
+      },
+      "v_lshlrev_b32_e32": {
+        "count": 11776,
+        "service_cycles": 47104,
+        "stall_cycles": 1272
+      },
+      "v_lshlrev_b32_e64": {
+        "count": 368,
+        "service_cycles": 1472,
+        "stall_cycles": 0
+      },
+      "v_lshrrev_b32_e32": {
+        "count": 1472,
+        "service_cycles": 5908,
+        "stall_cycles": 1472
+      },
+      "v_lshrrev_b32_e64": {
+        "count": 368,
+        "service_cycles": 1472,
+        "stall_cycles": 0
+      },
+      "v_mfma_f32_16x16x32_fp8_fp8": {
+        "count": 2260992,
+        "service_cycles": 9091384,
+        "stall_cycles": 15598800
+      },
+      "v_min_u32_e32": {
+        "count": 736,
+        "service_cycles": 2944,
+        "stall_cycles": 0
+      },
+      "v_mov_b32_e32": {
+        "count": 53728,
+        "service_cycles": 214912,
+        "stall_cycles": 0
+      },
+      "v_mul_f32_e32": {
+        "count": 141680,
+        "service_cycles": 566720,
+        "stall_cycles": 0
+      },
+      "v_mul_u32_u24_e32": {
+        "count": 6992,
+        "service_cycles": 27968,
+        "stall_cycles": 1384
+      },
+      "v_perm_b32": {
+        "count": 23552,
+        "service_cycles": 94208,
+        "stall_cycles": 5444
+      },
+      "v_rcp_iflag_f32_e32": {
+        "count": 368,
+        "service_cycles": 5876,
+        "stall_cycles": 116872
+      },
+      "v_readfirstlane_b32": {
+        "count": 736,
+        "service_cycles": 2956,
+        "stall_cycles": 3180
+      },
+      "v_xor_b32_e32": {
+        "count": 1472,
+        "service_cycles": 5888,
+        "stall_cycles": 0
+      }
+    },
+    "physical_simds": 16,
+    "static_instructions": 2309,
+    "static_mfma_instructions": 512,
+    "wave_files": 368
+  }
+}
