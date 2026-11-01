@@ -108,6 +108,25 @@ def test_kv_over_2gib(monkeypatch):
     assert len(_runtime._workspaces) == 1
 
 
+@pytest.mark.parametrize("heads,tile", ((6, 21), (3, 42)), ids=("h6-bq21", "h3-bq42"))
+def test_full_prefill_wide_tiles(heads, tile, monkeypatch):
+    """A full single-request H6/H3 prefill that fills the persistent grid takes the BQ21/BQ42
+    union tiles (BQ42 with 64-bit membership); sampled rows match the reference."""
+    monkeypatch.setattr(_runtime, "_workspaces", OrderedDict())
+    device = _gpu()
+    rows = 2 * _runtime.prepare.wide_tile_rows(tile)
+    value = _make_case((rows,), (0,), heads, device)
+    output = _call(value)
+    plan = _latest().union
+    assert plan.query_tile == tile and bool(plan.active.any())
+    assert plan.membership.dtype == (torch.int64 if tile > 32 else torch.int32)
+    picks = sorted({0, tile - 1, tile, 2047, 2051, rows - 1, *range(0, rows, rows // 61)})
+    torch.testing.assert_close(
+        output[picks].float(), reference(value, picks), rtol=0.02, atol=0.02
+    )
+    assert torch.equal(_call(value).view(torch.int16), output.view(torch.int16))
+
+
 def _same_paged(value, pool_k, pool_v, slots):
     expected = _call(value)
     for table in (slots, slots.clone()):
@@ -217,3 +236,18 @@ def test_kv_slots_input_errors():
     aliased.copy_(slots)
     with pytest.raises(ValueError, match="overlap"):
         _call_paged(value, pool_k, pool_v, aliased, out=arena.view(torch.bfloat16).view(value.q.shape))
+
+
+def test_kv_slots_over_max_span():
+    """A slot table past 2**32 - 2**20 bytes is rejected before any launch: the kernels read it
+    through unsigned 32-bit buffer offsets and upload each request's start in it as int32."""
+    device = _gpu()
+    context = 1 << 30
+    q = torch.zeros((1, 12, 256), dtype=torch.bfloat16, device=device)
+    pool_k, pool_v = (torch.zeros((64, 1, 256), dtype=q.dtype, device=device) for _ in range(2))
+    indices = torch.full((1, 2051), -1, dtype=torch.int32, device=device)
+    indices[0, :2048] = torch.arange(2048, dtype=torch.int32, device=device)
+    slots = torch.zeros(context, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="kv_slots"):
+        _runtime.attention(q, pool_k, pool_v, indices, query_lens=(1,), prefix_lens=(context - 1,),
+                           kv_slots=slots)

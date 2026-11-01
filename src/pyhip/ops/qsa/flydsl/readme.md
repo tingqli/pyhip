@@ -66,7 +66,7 @@ attention把query分成两路计算：union让一个tile的BQ行共享这些行�
 attention(q[M,H,256], k/v[N,HK,256], indices[M,4T+3], query_lens?, prefix_lens?, softmax_scale?, out?, kv_slots?):
     # host检查，每次调用都做，不读GPU数据
     scale = 1/16 if softmax_scale is None else float(softmax_scale)   # scale·log2(e)须是有限、为正的FP32值
-    kv_slots给出时：同设备连续int32 [keys]，K/V是池[P,HK,256]；否则keys = N
+    kv_slots给出时：同设备连续int32 [keys]、字节数 ≤ _MAX_SPAN，K/V是池[P,HK,256]；否则keys = N
     query_lens默认(M,)；prefix_lens默认：单请求(keys-M,)，多请求全0；各长度为int且0 ≤ 长度 < 2^31，Σq==M、Σ(q+p)==keys
     Q/K/V：3D、连续BF16、D256、16B对齐；H%HK==0且H/HK≤16；gfx942
     字节跨度：Q和每个请求的K/V（有slot表时只查Q）≤ _MAX_SPAN = 4GiB−1MiB   # 无符号32位字节偏移，1MiB余量给越界哨兵
@@ -813,7 +813,7 @@ D2（_select_long）：
 | [indexer_topk.py](indexer_topk.py) | I5/D2：prefill与decode共用的top-512选择、升序归并和token展开；decode长行的D2a/D2b |
 | [indexer_decode.py](indexer_decode.py) | D1 decode logits（按页表读压缩key，长页表时顺带折叠min/max） |
 
-Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`），公共入口仍是`attention.py`的`attention`（SGLang按此导入）。测试：[sparse_prefill_op_test.py](../../../../../tests/ops/qsa/sparse_prefill_op_test.py)是AITER `op_tests/test_flydsl_qsa_sparse_prefill.py`的副本，只改了import，以及graph用例中让arena增长的布局（改为`chunk_1024_ctx_31024_random`：原布局在PyHIP走raw direct、不打包，scratch不比被capture的布局大）；它依赖AITER（`aiter.test_common`）、pandas和tabulate，与SGLang原生Triton实现和torch参考比较精度与耗时。[test_attention.py](../../../../../tests/ops/qsa/test_attention.py)把其中的功能、常量和graph用例按H12/6/3包成pytest，另加slot表（含4GiB以上的池）、按行数打包和packed K/V超过2GiB等PyHIP用例。
+Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`），公共入口仍是`attention.py`的`attention`（SGLang按此导入）。测试：[sparse_prefill_op_test.py](../../../../../tests/ops/qsa/sparse_prefill_op_test.py)是AITER `op_tests/test_flydsl_qsa_sparse_prefill.py`的副本，只改了import，以及graph用例中让arena增长的布局（改为`chunk_1024_ctx_31024_random`：原布局在PyHIP走raw direct、不打包，scratch不比被capture的布局大）；它依赖AITER（`aiter.test_common`）、pandas和tabulate，与SGLang原生Triton实现和torch参考比较精度与耗时。[test_attention.py](../../../../../tests/ops/qsa/test_attention.py)把其中的功能、常量和graph用例按H12/6/3包成pytest，另加slot表（含4GiB以上的池、slot表的大小上限）、按行数打包、packed K/V超过2GiB和整段H6/H3 prefill的BQ21/BQ42等PyHIP用例。
 
 ### 4.2 接口
 
@@ -821,7 +821,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - 选择不校验：块数不对、缺尾token或块重复时结果错误（同一stream之后的调用也可能受影响），不报错也不trap。K/V须为有限值：同一tile的行共享union的块，一行选中的非有限值也会影响没选它的行。
 - 字节跨度：Q和每个请求的K（V同）都不超过4GiB−1MiB（`_MAX_SPAN`）。kernel的buffer字节偏移按无符号32位算，1MiB余量让越界哨兵加上lane偏移不回绕；K/V按请求起点寻址，整批packed K/V不受此限（HK1时一个请求约8M token）。
 - `softmax_scale`是host标量（默认1/16），`scale·log2(e)`须是有限的正FP32（kernel用它乘被mask的−inf分数，为0时得NaN）；`query_lens`/`prefix_lens`是小于2^31的host整数；`out`不得与Q/K/V/indices/kv_slots重叠。
-- `kv_slots`（同设备连续int32 `[N]`）给出时，K/V是token池`[P,HK,256]`，第i项是packed上下文第i个token的池行。每个请求的每个四token块（含请求末尾不满的块）须占池中连续4行、起始行是4的倍数（页大小为4的倍数的分页池满足），不满块多出的行值任意；slot值不校验。union和pack按块建buffer描述符，池大小不受限；池的字节数超过`_MAX_SPAN`时raw direct改用64位global读（WIDE，比buffer读慢约0–10%）。结果与按slot表拷出连续K/V再调用逐bit相同。
+- `kv_slots`（同设备连续int32 `[N]`，字节数不超过`_MAX_SPAN`：pack按无符号32位buffer偏移读它，各请求在其中的起点按int32上传）给出时，K/V是token池`[P,HK,256]`，第i项是packed上下文第i个token的池行。每个请求的每个四token块（含请求末尾不满的块）须占池中连续4行、起始行是4的倍数（页大小为4的倍数的分页池满足），不满块多出的行值任意；slot值不校验。union和pack按块建buffer描述符，池大小不受限；池的字节数超过`_MAX_SPAN`时raw direct改用64位global读（WIDE，比buffer读慢约0–10%）。结果与按slot表拷出连续K/V再调用逐bit相同。
 - Indexer为独立的D128投影、4个Q头和1个K头、ratio4/top512，最多262144个压缩key（1M token）。Prefill输出每行块号升序，可原样交给attention。`prefill_indexer`和`decode_indexer`除`qk`外都是显式关键字参数，同名参数含义相同；可选的`q_out`（decode另有`logits_out`）取回归一化后的index Q（和logits）。
 - 不另设校验launch：attention和indexer的入口在launch前只在host检查张量的dtype、形状、设备、对齐和长度，非法时抛`ValueError`（`softmax_scale`传tensor时抛`TypeError`）；prefill top-k发现query位置与host布局不符时执行`s_trap 2`，GPU队列出错，进程以HSA异常（code 0x1016，日志含kernel名）中止。Decode不校验位置。
 
@@ -1037,6 +1037,16 @@ PR #62 review修复后用默认FlyDSL缓存跑QSA全套测试，gated raw用例�
 - **干净环境下正确**：同一repro（先一次H12、16行、3000前缀的调用，再800行、70000前缀的H3 gated raw）在K2之后读`direct_flag`，新编的K2为[0, 0]并通过，旧K2为[0, 1065598834]，K3内存访问错误。`38e0d93`提交时的测试在空缓存下进行，10-30（续3）的A/B关闭了FlyDSL缓存；10-30 TP2与10-31 1M服务各用独立缓存，其中的K2在`38e0d93`提交后编译。
 - **合并不受影响**：按FlyDSL的键与按原函数建的键，对比`edde17b`（dev）、`14592cb`、`ffae4db`、`38e0d93`和本分支的全部QSA launcher，找键不变而kernel变了的：dev→本分支20个共有launcher中19个换键，`indexer_topk._collect`及其依赖未变，`codegen/flydsl`、`mha/flydsl`未改；只有`ffae4db`→`38e0d93`的K2，即只影响跑过`ffae4db`且没清缓存的环境。[对比](../../../../../mytest/mydata/qsa_flydsl_cache_key_20261031_01/upgrade_paths/summary.txt)
 - **处理**：代码不改。删掉本机两处旧K2（`~/.flydsl/cache`与`qsa_aiter_sync_service_20261030_01`的服务缓存）后，默认缓存与空缓存下QSA测试各114项通过，SGLang `test_pyhip_qsa` 7项（17个子测试）通过；两个缓存共有的98项（其中90项是10-30/31留下的）编译结果（`_ir_text`，含kernel二进制）完全相同。试过在包的`__init__`把`qsa/flydsl`、`mha/flydsl`、`codegen/flydsl`登记到FlyDSL的`EXTRA_SOURCE_DIRS`（其中任一`.py`改动都换键），因它是FlyDSL的进程级设置，之后建键的其他kernel（包括AITER的）也随之换键，未采用。根本修复在FlyDSL：`_ensure_cache_manager`改用`_original_func`建键。
+
+### 2026-11-01：PR #62第二轮review
+
+推送`f133e0e`后Copilot复审，提出一条行内意见，总评另列两条之前漏掉的问题，并仍把10-31的top-k输出问题列为未解决。
+
+- **slot表大小**：`kv_slots`的字节数超过`_MAX_SPAN`时抛`ValueError`。pack按无符号32位buffer偏移读slot表，各请求在表中的起点按int32上传，FlyDSL也按int32传维度；此前不检查，表过大时launch失败或读错行。
+- **BQ21/BQ42覆盖**：10-30同步AITER时删掉了H3 BQ42的回归用例，pytest不再覆盖整段prefill的BQ21/BQ42 tile。补`test_full_prefill_wide_tiles`：H6 3360行、H3 6720行（各为`wide_tile_rows`的2倍），断言tile为21/42、membership位宽、有tile走union，抽样行对参考，重复调用逐bit相同。
+- **打包预算（未改，用户决定）**：bot指出`AITER_QSA_PLATFORM`把`max_packed_kv_bytes`调到4 GiB以上时，有slot表的布局会打包出各超过4 GiB的PK/PV，而pack与packed kernel按无符号32位字节偏移寻址PK/PV。默认预算（64 MiB；按行数规则≤1 GiB）下PK/PV各不超过512 MiB。
+- **top-k输出（未改）**：该线程已resolve。1M行prefill里其余按一维传给FlyDSL的张量都在int32内：q为[rows,4,128]，约5.4亿个元素；logits块≤512 MiB；row_info、stats为[rows,2]。
+- **验证**：新用例在修复前4 GiB slot表一项失败（未报错），BQ21/BQ42两项通过；修复后QSA测试117项、SGLang `test_pyhip_qsa` 7项（17个子测试）通过。
 
 ### 评估过但未采用
 

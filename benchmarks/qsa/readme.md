@@ -234,7 +234,7 @@ attention(q, k, v, indices, query_lens=(m,), prefix_lens=(0,), out=out)
 
 约束：Q/O为连续BF16 `[M,H,256]`，K/V为连续BF16 `[N,HK,256]`，`H/HK≤16`，16B对齐、inference-only；QSA不接受5D KV。Q和每个请求的K（V同）的字节数都不超过4GiB−1MiB（HK=1时一个请求约838万token），整批packed K/V不受此限。`indices`是连续int32 `[M,4T+3]`，T为256/512/768/1024（由宽度决定，indexer输出的2051宽即T=512）：因果窗口有v个token的行，前`4·min(v//4, T)`列恰为min(v//4, T)个不同的完整四token块（块内4个token依次写出，块可乱序），接v%4个因果尾token，其余填−1；ID为请求内逻辑token。选择不校验：块数不对、缺尾token或块重复时结果错误，不报错。K/V须为有限值。`query_lens`/`prefix_lens`是host长度，packed请求的K/V按请求拼接；默认单请求prefix=`N-M`。默认scale=1/16，`scale·log2(e)`须是有限的正FP32；`out`不与输入重叠。
 
-K/V在按页分配的token池里时，可传`kv_slots`原地读取，不必先拷成连续K/V：`kv_slots`是同设备连续int32 `[N]`，第i项是packed上下文第i个token（请求按顺序拼接）在池中的行号；K/V为池`[P,HK,256]`，大小不限，池超过4GiB−1MiB时raw direct改用64位global读（比buffer读慢约0–10%）。每个请求的每个四token块（请求内token 4j..4j+3，含请求末尾不满4个token的块）须占池中连续4行且起始行是4的倍数，页大小为4的倍数的分页池满足这一点；不满块多出的行值任意，slot值不校验。结果与先按`kv_slots`拷出连续K/V再调用逐bit相同。SGLang的chunked prefill对带prefix的chunk这样调用。
+K/V在按页分配的token池里时，可传`kv_slots`原地读取，不必先拷成连续K/V：`kv_slots`是同设备连续int32 `[N]`（字节数不超过4GiB−1MiB），第i项是packed上下文第i个token（请求按顺序拼接）在池中的行号；K/V为池`[P,HK,256]`，大小不限，池超过4GiB−1MiB时raw direct改用64位global读（比buffer读慢约0–10%）。每个请求的每个四token块（请求内token 4j..4j+3，含请求末尾不满4个token的块）须占池中连续4行且起始行是4的倍数，页大小为4的倍数的分页池满足这一点；不满块多出的行值任意，slot值不校验。结果与先按`kv_slots`拷出连续K/V再调用逐bit相同。SGLang的chunked prefill对带prefix的chunk这样调用。
 
 ```python
 # 接上例：把K/V放进64-token页的池，页序打乱

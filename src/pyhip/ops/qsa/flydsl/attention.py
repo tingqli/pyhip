@@ -243,11 +243,11 @@ def attention(
 
     Host query_lens/prefix_lens describe packed requests. For one request they
     default to (M,) and (N-M,). Plans are built and cached per layout. With kv_slots
-    (contiguous int32[N], packed token -> pool row), K/V are a token pool [P,HK,256]
-    read in place: each request's four-token blocks must occupy four consecutive pool
-    rows (pool pages a multiple of four tokens), and the result is the same as for
-    K/V packed by those slots. A pool may exceed 4 GiB (raw direct then uses 64-bit
-    loads); slot values are not validated. Hot calls
+    (contiguous int32[N] of at most 2**32 - 2**20 bytes, packed token -> pool row), K/V
+    are a token pool [P,HK,256] read in place: each request's four-token blocks must
+    occupy four consecutive pool rows (pool pages a multiple of four tokens), and the
+    result is the same as for K/V packed by those slots. A pool may exceed 4 GiB (raw
+    direct then uses 64-bit loads); slot values are not validated. Hot calls
     rebuild the selection: per-layout plans share one private per-stream scratch
     arena. out is optional and must not alias Q/K/V, indices or kv_slots. Warm the
     same stream and layout before graph capture. Captured workspaces stay pinned for
@@ -274,6 +274,10 @@ def attention(
         or not kv_slots.is_contiguous()
     ):
         raise ValueError("kv_slots must be a contiguous device int32 [N] tensor")
+    # The kernels read the slot table through unsigned 32-bit buffer offsets and upload each
+    # request's start in it as int32.
+    if kv_slots is not None and kv_slots.numel() * kv_slots.element_size() > _MAX_SPAN:
+        raise ValueError("kv_slots requires a byte span <= 2**32 - 2**20")
     keys = k.shape[0] if kv_slots is None else kv_slots.shape[0]
     query_lens = (q.shape[0],) if query_lens is None else tuple(query_lens)
     if prefix_lens is None:
