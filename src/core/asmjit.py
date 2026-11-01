@@ -2203,12 +2203,21 @@ class JIT:
                     
                     min_k = find_min_k(d, n_max)
                     ceil_sd = (2**min_k + d - 1)//d
-                    assert ceil_sd < 2**32, f"{d=} {min_k=} {ceil_sd=} {shift_right=}"
                     if shift_right > 0:
                         Instruction(bb, f"s_lshr_b32", loc=loc)(dst_expr, src0_operand, shift_right)
                         src0_operand = dst_expr
-                    Instruction(bb, f"s_mul_hi_u32", loc=loc)(dst_expr, src0_operand, ceil_sd)
-                    Instruction(bb, f"s_lshr_b32", loc=loc)(dst_expr, dst_expr, min_k-32)
+                    if ceil_sd < 2**32:
+                        Instruction(bb, f"s_mul_hi_u32", loc=loc)(dst_expr, src0_operand, ceil_sd)
+                        Instruction(bb, f"s_lshr_b32", loc=loc)(dst_expr, dst_expr, min_k-32)
+                    else:
+                        # 33-bit magic (e.g. d=7,21): q = (((n - t) >> 1) + t) >> (k - 33), t = mulhi(n, magic - 2^32)
+                        assert ceil_sd < 2**33 and min_k > 32, f"{d=} {min_k=} {ceil_sd=} {shift_right=}"
+                        temp = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="temp")
+                        Instruction(bb, f"s_mul_hi_u32", loc=loc)(temp, src0_operand, ceil_sd - 2**32)
+                        Instruction(bb, f"s_sub_u32", loc=loc)(dst_expr, src0_operand, temp)
+                        Instruction(bb, f"s_lshr_b32", loc=loc)(dst_expr, dst_expr, 1)
+                        Instruction(bb, f"s_add_u32", loc=loc)(dst_expr, dst_expr, temp)
+                        Instruction(bb, f"s_lshr_b32", loc=loc)(dst_expr, dst_expr, min_k-33)
                 else:
                     """
                     consider negative as a mirror of positive
