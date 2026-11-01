@@ -1,0 +1,526 @@
+{
+  "date": "2026-10-31",
+  "selected_version": "r3",
+  "source": "src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py",
+  "source_sha256": "8a627da81c67dfb6b369c955eb224c5759e7b5cbb1cf9394da8e04775cea794c",
+  "reference": "/sgl-workspace/aiter/aiter/ops/flydsl/kernels/gemm_a8w8_blockscale_8wave.py",
+  "reference_sha256": "1b48020bcc5074c6b9f2622a9dea9bfe8ad15ae7f56f16bc79f6d8814b130160",
+  "contract": "MI308/gfx942, FP8 E4M3FNUZ, FP32 K128 block scales and FMA accumulation, BF16 output; ScaleA[KB,M], ScaleB[ceil(N/128),KB]",
+  "layout": "256x256 tile, 512 threads, real (M,N) wave grid (2,4), A/B each occupy 32KiB LDS; no gfx950 16-byte direct-to-LDS instructions",
+  "selected_change": "Right B LDS reads issue after the stage-0 publication barrier and overlap left-side MFMA; shared B slots are not overwritten until their consumers retire",
+  "baseline_preservation": {
+    "current_source_sha256": "9b92d999a9e663538c6760ad51aff120e0ed754cfbf88a6c734afeedf4627c44",
+    "frozen_v32_sha256": "a9b77198b483da589992710ddbfb07983f55594a8c67584f3cb7e1eb3f5daa20",
+    "ast_identical": true,
+    "performance_rechecks": {
+      "4096": {
+        "v32": {
+          "median_us": 1271.66748046875,
+          "median_tflops": 432.3109793492197,
+          "samples": 64,
+          "diff": 8.984809310996766e-06,
+          "sweep_medians_us": [
+            1270.3670263290405,
+            1271.8474864959717
+          ]
+        },
+        "current8x1": {
+          "median_us": 1269.3275213241577,
+          "median_tflops": 433.10792892483477,
+          "samples": 64,
+          "diff": 8.984809310996766e-06,
+          "sweep_medians_us": [
+            1267.6469683647156,
+            1270.4079747200012
+          ]
+        }
+      },
+      "8192": {
+        "baseline": {
+          "median_us": 4281.805515289307,
+          "median_tflops": 513.5738294744617,
+          "samples": 64,
+          "diff": 9.18036636010644e-06,
+          "sweep_medians_us": [
+            4281.785011291504,
+            4282.545566558838
+          ]
+        },
+        "current8x1": {
+          "median_us": 4276.585102081299,
+          "median_tflops": 514.2007473396927,
+          "samples": 64,
+          "diff": 9.18036636010644e-06,
+          "sweep_medians_us": [
+            4275.22611618042,
+            4277.525424957275
+          ]
+        }
+      }
+    }
+  },
+  "hardware_peak": {
+    "device": "MI308X",
+    "bdf": "0001:0b:00.0",
+    "compute_units": 80,
+    "maximum_gfx_hz": 1850000000,
+    "dense_fp8_flops_per_cu_cycle": 4096,
+    "dense_fp8_peak_tflops": 606.208,
+    "not_sparse_peak": true,
+    "caveat": "Maximum-clock theoretical arithmetic roof; actual clocks, data movement, scaling and stores prevent treating this as guaranteed GEMM throughput"
+  },
+  "selected_performance": [
+    {
+      "shape": [
+        4096,
+        4096,
+        16384
+      ],
+      "candidate": {
+        "median_us": 1326.8280029296875,
+        "median_tflops": 414.33841664037686,
+        "samples": 64,
+        "diff": 5.690338866770617e-09,
+        "sweep_medians_us": [
+          1326.8679976463318,
+          1326.5680074691772
+        ]
+      },
+      "same_run_8x1": {
+        "median_us": 1271.0869908332825,
+        "median_tflops": 432.5084104020279,
+        "samples": 64,
+        "diff": 8.984809310996766e-06,
+        "sweep_medians_us": [
+          1270.0470089912415,
+          1271.8475461006165
+        ]
+      },
+      "percent_of_max_clock_dense_peak": 68.34921621627839
+    },
+    {
+      "shape": [
+        8192,
+        8192,
+        16384
+      ],
+      "candidate": {
+        "median_us": 4339.745044708252,
+        "median_tflops": 506.7171534036128,
+        "samples": 64,
+        "diff": 5.729095309270349e-09,
+        "sweep_medians_us": [
+          4338.865518569946,
+          4342.725038528442
+        ]
+      },
+      "same_run_8x1": {
+        "median_us": 4268.465042114258,
+        "median_tflops": 515.1789305653489,
+        "samples": 64,
+        "diff": 9.18036636010644e-06,
+        "sweep_medians_us": [
+          4265.124559402466,
+          4268.905162811279
+        ]
+      },
+      "percent_of_max_clock_dense_peak": 83.58800170958035
+    }
+  ],
+  "experiments": {
+    "r2": "Original both-B-first LDS read schedule: recorded 394.9T/482.1T",
+    "r3": "Overlap right B read with left compute: selected",
+    "r4": "SMEM B-scale, no stable benefit: 412.2T/505.2T",
+    "r5": "Compute priority boost, regression: 410.2T/500.9T",
+    "r6": "16-byte output coalescing passed directed correctness; cold timing blocked by external GPU4 process; not selected"
+  },
+  "comparisons": {
+    "r3": [
+      {
+        "shape": [
+          4096,
+          4096,
+          16384
+        ],
+        "preshuffle_b": true,
+        "summary": {
+          "current8x1": {
+            "median_us": 1271.0869908332825,
+            "median_tflops": 432.5084104020279,
+            "samples": 64,
+            "diff": 8.984809310996766e-06,
+            "sweep_medians_us": [
+              1270.0470089912415,
+              1271.8475461006165
+            ]
+          },
+          "fly2x4": {
+            "median_us": 1326.8280029296875,
+            "median_tflops": 414.33841664037686,
+            "samples": 64,
+            "diff": 5.690338866770617e-09,
+            "sweep_medians_us": [
+              1326.8679976463318,
+              1326.5680074691772
+            ]
+          }
+        },
+        "artifacts": {
+          "current8x1": {
+            "path": "/mywork/pyhip/src/contrib/gemm_fp8_gfx942.py",
+            "sha256": "9b92d999a9e663538c6760ad51aff120e0ed754cfbf88a6c734afeedf4627c44"
+          },
+          "fly2x4": {
+            "path": "/mywork/pyhip/src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py",
+            "sha256": "8a627da81c67dfb6b369c955eb224c5759e7b5cbb1cf9394da8e04775cea794c"
+          }
+        }
+      },
+      {
+        "shape": [
+          8192,
+          8192,
+          16384
+        ],
+        "preshuffle_b": true,
+        "summary": {
+          "current8x1": {
+            "median_us": 4268.465042114258,
+            "median_tflops": 515.1789305653489,
+            "samples": 64,
+            "diff": 9.18036636010644e-06,
+            "sweep_medians_us": [
+              4265.124559402466,
+              4268.905162811279
+            ]
+          },
+          "fly2x4": {
+            "median_us": 4339.745044708252,
+            "median_tflops": 506.7171534036128,
+            "samples": 64,
+            "diff": 5.729095309270349e-09,
+            "sweep_medians_us": [
+              4338.865518569946,
+              4342.725038528442
+            ]
+          }
+        },
+        "artifacts": {
+          "current8x1": {
+            "path": "/mywork/pyhip/src/contrib/gemm_fp8_gfx942.py",
+            "sha256": "9b92d999a9e663538c6760ad51aff120e0ed754cfbf88a6c734afeedf4627c44"
+          },
+          "fly2x4": {
+            "path": "/mywork/pyhip/src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py",
+            "sha256": "8a627da81c67dfb6b369c955eb224c5759e7b5cbb1cf9394da8e04775cea794c"
+          }
+        }
+      }
+    ],
+    "r4": [
+      {
+        "shape": [
+          4096,
+          4096,
+          16384
+        ],
+        "preshuffle_b": true,
+        "summary": {
+          "current8x1": {
+            "median_us": 1269.592523574829,
+            "median_tflops": 433.01752623750207,
+            "samples": 64,
+            "diff": 8.984809310996766e-06,
+            "sweep_medians_us": [
+              1269.5919871330261,
+              1269.8525190353394
+            ]
+          },
+          "fly2x4": {
+            "median_us": 1333.693504333496,
+            "median_tflops": 412.2055120623359,
+            "samples": 64,
+            "diff": 5.690338866770617e-09,
+            "sweep_medians_us": [
+              1331.7739963531494,
+              1334.0734839439392
+            ]
+          }
+        },
+        "artifacts": {
+          "current8x1": {
+            "path": "/mywork/pyhip/src/contrib/gemm_fp8_gfx942.py",
+            "sha256": "9b92d999a9e663538c6760ad51aff120e0ed754cfbf88a6c734afeedf4627c44"
+          },
+          "fly2x4": {
+            "path": "/mywork/pyhip/src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py",
+            "sha256": "246860825c3650d5ab369ee09b2573afca80aa0ce1f8c213f04ba0a33494ea32"
+          }
+        }
+      },
+      {
+        "shape": [
+          8192,
+          8192,
+          16384
+        ],
+        "preshuffle_b": true,
+        "summary": {
+          "current8x1": {
+            "median_us": 4272.884130477905,
+            "median_tflops": 514.646123883085,
+            "samples": 64,
+            "diff": 9.18036636010644e-06,
+            "sweep_medians_us": [
+              4267.18282699585,
+              4275.843858718872
+            ]
+          },
+          "fly2x4": {
+            "median_us": 4352.365016937256,
+            "median_tflops": 505.24789327055225,
+            "samples": 64,
+            "diff": 5.729095309270349e-09,
+            "sweep_medians_us": [
+              4352.164506912231,
+              4352.445125579834
+            ]
+          }
+        },
+        "artifacts": {
+          "current8x1": {
+            "path": "/mywork/pyhip/src/contrib/gemm_fp8_gfx942.py",
+            "sha256": "9b92d999a9e663538c6760ad51aff120e0ed754cfbf88a6c734afeedf4627c44"
+          },
+          "fly2x4": {
+            "path": "/mywork/pyhip/src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py",
+            "sha256": "246860825c3650d5ab369ee09b2573afca80aa0ce1f8c213f04ba0a33494ea32"
+          }
+        }
+      }
+    ],
+    "r5": [
+      {
+        "shape": [
+          4096,
+          4096,
+          16384
+        ],
+        "preshuffle_b": true,
+        "summary": {
+          "current8x1": {
+            "median_us": 1269.873023033142,
+            "median_tflops": 432.9218779487782,
+            "samples": 64,
+            "diff": 8.984809310996766e-06,
+            "sweep_medians_us": [
+              1269.45298910141,
+              1269.9530124664307
+            ]
+          },
+          "fly2x4": {
+            "median_us": 1340.1739597320557,
+            "median_tflops": 410.21227870888794,
+            "samples": 64,
+            "diff": 5.690338866770617e-09,
+            "sweep_medians_us": [
+              1340.3540253639221,
+              1340.034008026123
+            ]
+          }
+        },
+        "artifacts": {
+          "current8x1": {
+            "path": "/mywork/pyhip/src/contrib/gemm_fp8_gfx942.py",
+            "sha256": "9b92d999a9e663538c6760ad51aff120e0ed754cfbf88a6c734afeedf4627c44"
+          },
+          "fly2x4": {
+            "path": "/mywork/pyhip/src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py",
+            "sha256": "c15ade1aeb89309c8faffd6c44f8db5bcec7efaa183795c263f1f8d4060db523"
+          }
+        }
+      },
+      {
+        "shape": [
+          8192,
+          8192,
+          16384
+        ],
+        "preshuffle_b": true,
+        "summary": {
+          "current8x1": {
+            "median_us": 4272.384405136108,
+            "median_tflops": 514.7063201776537,
+            "samples": 64,
+            "diff": 9.18036636010644e-06,
+            "sweep_medians_us": [
+              4269.004106521606,
+              4273.205041885376
+            ]
+          },
+          "fly2x4": {
+            "median_us": 4389.945983886719,
+            "median_tflops": 500.9226226526493,
+            "samples": 64,
+            "diff": 5.729095309270349e-09,
+            "sweep_medians_us": [
+              4389.446020126343,
+              4390.005588531494
+            ]
+          }
+        },
+        "artifacts": {
+          "current8x1": {
+            "path": "/mywork/pyhip/src/contrib/gemm_fp8_gfx942.py",
+            "sha256": "9b92d999a9e663538c6760ad51aff120e0ed754cfbf88a6c734afeedf4627c44"
+          },
+          "fly2x4": {
+            "path": "/mywork/pyhip/src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py",
+            "sha256": "c15ade1aeb89309c8faffd6c44f8db5bcec7efaa183795c263f1f8d4060db523"
+          }
+        }
+      }
+    ]
+  },
+  "correctness": {
+    "pytest_cases": 24,
+    "repeated_nan_runs": 3,
+    "prefix_suffix_guard": true,
+    "graph_replay": true,
+    "atol": 0.01,
+    "rtol": 0.01,
+    "allowed_mismatch_ratio": 0,
+    "calc_diff_max": 1e-05
+  },
+  "lifetime": {
+    "source_barrier_model": {
+      "source": "/mywork/pyhip/src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py",
+      "source_sha256": "8a627da81c67dfb6b369c955eb224c5759e7b5cbb1cf9394da8e04775cea794c",
+      "records": [
+        {
+          "K_blocks": 1,
+          "barriers_per_wave": 10,
+          "lds_vector_reads_checked": 12288
+        },
+        {
+          "K_blocks": 2,
+          "barriers_per_wave": 18,
+          "lds_vector_reads_checked": 24576
+        },
+        {
+          "K_blocks": 3,
+          "barriers_per_wave": 26,
+          "lds_vector_reads_checked": 36864
+        },
+        {
+          "K_blocks": 4,
+          "barriers_per_wave": 34,
+          "lds_vector_reads_checked": 49152
+        },
+        {
+          "K_blocks": 5,
+          "barriers_per_wave": 42,
+          "lds_vector_reads_checked": 61440
+        },
+        {
+          "K_blocks": 7,
+          "barriers_per_wave": 58,
+          "lds_vector_reads_checked": 86016
+        },
+        {
+          "K_blocks": 8,
+          "barriers_per_wave": 66,
+          "lds_vector_reads_checked": 98304
+        },
+        {
+          "K_blocks": 16,
+          "barriers_per_wave": 130,
+          "lds_vector_reads_checked": 196608
+        },
+        {
+          "K_blocks": 17,
+          "barriers_per_wave": 138,
+          "lds_vector_reads_checked": 208896
+        },
+        {
+          "K_blocks": 128,
+          "barriers_per_wave": 1026,
+          "lds_vector_reads_checked": 1572864
+        }
+      ],
+      "partial_FMA_elements_checked": 24448,
+      "negative_controls": {
+        "early_A_overwrite": "('read/write in same barrier epoch', 2)",
+        "missing_B_publication": "('wrong/unpublished LDS generation', 1, ('b', 0), 0, None)",
+        "wrong_partial_destination": ""
+      },
+      "violations": [],
+      "scope": "Memory stages/prologue extracted from source AST; producer tokens, scales and register reuse checked; all eight waves and 16-byte LDS vectors compared per barrier epoch",
+      "limitations": [
+        "Assumes LLVM retires each LDS read before its first MFMA use and each DS write before the explicit lgkmcnt(0)/publication barrier",
+        "The barrier-epoch model checks all orderings between epochs, not individual instruction timing within a wave",
+        "Dynamic async register waits and MFMA result latency must additionally be checked against generated ISA/ATT",
+        "Partial arithmetic ordering is a symbolic check of the current pair-FIFO formula, not a floating-point simulator"
+      ]
+    },
+    "actual_isa_wait_checks": {
+      "4096": {
+        "isa": "/tmp/gfx942_perf/flydsl_2x4/r3_codegen/4096.s",
+        "isa_sha256": "52c8a32f73c8373def86c852082ada5aa3cfb75c735f972b444f96e44f644bdf",
+        "counts": {
+          "instructions_checked": 205312,
+          "waits_checked": 7712,
+          "barriers": 4104,
+          "mfma_instructions_checked": 65536,
+          "control_paths_checked": 4
+        },
+        "negative_controls": {
+          "looser_vmcnt": "('0x1a5c', 'load-use without wait', 'ds_write_b128 v145, v[24:27]', [('v', 24), ('v', 25), ('v', 26), ('v', 27)])",
+          "looser_lgkmcnt": "('0x171c', 'load-use without wait', 's_add_i32 s3, s24, 0xff', [('s', 24)])"
+        },
+        "violations": [],
+        "scope": "Actual disassembled control flow, all forward-branch combinations and exact K-loop count; VMEM/LGKM load-use and WAW based on oldest-first counter retirement, SMEM conservatively requires lgkmcnt(0)",
+        "limitations": [
+          "Not an instruction-cycle model of MFMA result latency",
+          "Cross-wave LDS publication/retirement checked by separate source/barrier audit",
+          "Forward branch combinations include impossible wave-group combinations, making register checks conservative"
+        ]
+      },
+      "8192": {
+        "isa": "/tmp/gfx942_perf/flydsl_2x4/r3_codegen/8192.s",
+        "isa_sha256": "d2081a30773b1e54f3d1c8ea9810f8ed12e9a2e388c60e9890a4ca213cf70296",
+        "counts": {
+          "instructions_checked": 205312,
+          "waits_checked": 7712,
+          "barriers": 4104,
+          "mfma_instructions_checked": 65536,
+          "control_paths_checked": 4
+        },
+        "negative_controls": {
+          "looser_vmcnt": "('0x1a60', 'load-use without wait', 'ds_write_b128 v145, v[24:27]', [('v', 24), ('v', 25), ('v', 26), ('v', 27)])",
+          "looser_lgkmcnt": "('0x171c', 'load-use without wait', 's_add_i32 s3, s24, 0xff', [('s', 24)])"
+        },
+        "violations": [],
+        "scope": "Actual disassembled control flow, all forward-branch combinations and exact K-loop count; VMEM/LGKM load-use and WAW based on oldest-first counter retirement, SMEM conservatively requires lgkmcnt(0)",
+        "limitations": [
+          "Not an instruction-cycle model of MFMA result latency",
+          "Cross-wave LDS publication/retirement checked by separate source/barrier audit",
+          "Forward branch combinations include impossible wave-group combinations, making register checks conservative"
+        ]
+      }
+    },
+    "resource": {
+      "vgpr": 250,
+      "lds_bytes": 65536,
+      "scratch_bytes": 0
+    }
+  },
+  "limitations": [
+    "Hardware peak has not been reached; no claim of a 606.2T kernel",
+    "r3 dynamic ATT/MFMA cycle-margin audit is pending because GPUs became occupied; source and static ISA audits are not a race-detector proof",
+    "The available r2 ATT is retained only as a diagnostic of the previous version",
+    "r6 cold benchmark was stopped at entry, not retried or reported as passed",
+    "The 8x1 performance recheck covers the two target square shapes; other historical shapes were preserved but not all re-timed",
+    "Experimental direct entry requires contiguous same-device buffers honoring the documented dtype and scale layout; no automatic production dispatch switch"
+  ]
+}

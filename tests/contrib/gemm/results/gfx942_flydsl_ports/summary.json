@@ -1,0 +1,464 @@
+{
+ "date": "2026-11-01",
+ "device": "MI308X gfx942, GPU4 BDF 0001:0b:00.0, PTL Enabled VECTOR,F8",
+ "peak_tflops_at_1850MHz": 606.208,
+ "protocol": "32 disjoint A/B/scale buffers, full warmup then 32 timed launches per variant, forward and reverse sweeps (64 samples), original pyhip.cudaPerf",
+ "kernels": {
+  "8x1": {
+   "source": "src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_8x1.py",
+   "sha256": "fdc04f8a30b2eb47e372495b90850d88ccbc654294e872d49d84c2e51f663757",
+   "port_of": "src/contrib/gemm_fp8_gfx942.py (PyHIP v32)",
+   "resources": "242 VGPR, 32 KiB LDS, 0 scratch (PyHIP: 240 VGPR)"
+  },
+  "4x2-lds": {
+   "source": "src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_4x2_lds.py",
+   "sha256": "013642164649cc3df9d0ef3b0152e0daf9af3280d43fd068b8be31ef7cb7ed3e",
+   "port_of": "src/contrib/gemm_fp8_gfx942_4x2_lds.py (PyHIP r2)",
+   "resources": "240 VGPR, 64 KiB LDS, 0 scratch (PyHIP: 249 VGPR)",
+   "note": "B-scale helper deduplicated after timing; exported ELFs byte-identical to the timed build"
+  },
+  "2x4": {
+   "source": "src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py",
+   "sha256": "8a627da81c67dfb6b369c955eb224c5759e7b5cbb1cf9394da8e04775cea794c",
+   "note": "native FlyDSL r3, see ../gfx942_flydsl_2x4",
+   "resources": "250 VGPR, 64 KiB LDS, 0 scratch"
+  },
+  "common": {
+   "source": "src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_common.py",
+   "sha256": "b55c2a35b31502c8e4ae8c9b7052b9ff125b53e72590b5cb87b77301509d0da3"
+  }
+ },
+ "equivalence": "Both ports keep the PyHIP tile order, MFMA/dequant order, barrier/4+4 stagger protocol and BF16 packing (v_add_f32 of the 0x8000 pattern, high half); outputs are bitwise identical to PyHIP for 24 cases each (12 shapes x 2 B layouts, 3 NaN-filled runs, guards, CUDA graph)",
+ "performance": {
+  "8x1_flydsl_vs_pyhip_v32": [
+   {
+    "shape": [
+     4096,
+     4096,
+     16384
+    ],
+    "preshuffle_b": true,
+    "pyhip_v32": {
+     "median_us": 1270.05,
+     "median_tflops": 432.9,
+     "percent_of_606T": 71.4,
+     "samples": 64,
+     "calc_diff": 8.984809310996766e-06
+    },
+    "flydsl_8x1": {
+     "median_us": 1279.01,
+     "median_tflops": 429.8,
+     "percent_of_606T": 70.9,
+     "samples": 64,
+     "calc_diff": 8.984809310996766e-06
+    },
+    "flydsl_vs_pyhip_tflops_ratio": 0.9928
+   },
+   {
+    "shape": [
+     4096,
+     4096,
+     16384
+    ],
+    "preshuffle_b": false,
+    "pyhip_v32": {
+     "median_us": 1416.55,
+     "median_tflops": 388.1,
+     "percent_of_606T": 64.0,
+     "samples": 64,
+     "calc_diff": 8.984809310996766e-06
+    },
+    "flydsl_8x1": {
+     "median_us": 1427.57,
+     "median_tflops": 385.1,
+     "percent_of_606T": 63.5,
+     "samples": 64,
+     "calc_diff": 8.984809310996766e-06
+    },
+    "flydsl_vs_pyhip_tflops_ratio": 0.9923
+   },
+   {
+    "shape": [
+     8192,
+     8192,
+     16384
+    ],
+    "preshuffle_b": true,
+    "pyhip_v32": {
+     "median_us": 4271.68,
+     "median_tflops": 514.8,
+     "percent_of_606T": 84.9,
+     "samples": 64,
+     "calc_diff": 9.18036636010644e-06
+    },
+    "flydsl_8x1": {
+     "median_us": 4285.96,
+     "median_tflops": 513.1,
+     "percent_of_606T": 84.6,
+     "samples": 64,
+     "calc_diff": 9.18036636010644e-06
+    },
+    "flydsl_vs_pyhip_tflops_ratio": 0.9967
+   },
+   {
+    "shape": [
+     8192,
+     8192,
+     16384
+    ],
+    "preshuffle_b": false,
+    "pyhip_v32": {
+     "median_us": 4541.9,
+     "median_tflops": 484.2,
+     "percent_of_606T": 79.9,
+     "samples": 64,
+     "calc_diff": 9.18036636010644e-06
+    },
+    "flydsl_8x1": {
+     "median_us": 4613.46,
+     "median_tflops": 476.7,
+     "percent_of_606T": 78.6,
+     "samples": 64,
+     "calc_diff": 9.18036636010644e-06
+    },
+    "flydsl_vs_pyhip_tflops_ratio": 0.9845
+   }
+  ],
+  "4x2_lds_flydsl_vs_pyhip": [
+   {
+    "shape": [
+     4096,
+     4096,
+     16384
+    ],
+    "preshuffle_b": true,
+    "pyhip_4x2_lds": {
+     "median_us": 1297.47,
+     "median_tflops": 423.7,
+     "percent_of_606T": 69.9,
+     "samples": 64,
+     "calc_diff": 8.984809310996766e-06
+    },
+    "flydsl_4x2_lds": {
+     "median_us": 1301.31,
+     "median_tflops": 422.5,
+     "percent_of_606T": 69.7,
+     "samples": 64,
+     "calc_diff": 8.984809310996766e-06
+    },
+    "flydsl_vs_pyhip_tflops_ratio": 0.9972
+   },
+   {
+    "shape": [
+     4096,
+     4096,
+     16384
+    ],
+    "preshuffle_b": false,
+    "pyhip_4x2_lds": {
+     "median_us": 1352.41,
+     "median_tflops": 406.5,
+     "percent_of_606T": 67.1,
+     "samples": 64,
+     "calc_diff": 8.984809310996766e-06
+    },
+    "flydsl_4x2_lds": {
+     "median_us": 1348.07,
+     "median_tflops": 407.8,
+     "percent_of_606T": 67.3,
+     "samples": 64,
+     "calc_diff": 8.984809310996766e-06
+    },
+    "flydsl_vs_pyhip_tflops_ratio": 1.0032
+   },
+   {
+    "shape": [
+     8192,
+     8192,
+     16384
+    ],
+    "preshuffle_b": true,
+    "pyhip_4x2_lds": {
+     "median_us": 4269.84,
+     "median_tflops": 515.0,
+     "percent_of_606T": 85.0,
+     "samples": 64,
+     "calc_diff": 9.18036636010644e-06
+    },
+    "flydsl_4x2_lds": {
+     "median_us": 4280.68,
+     "median_tflops": 513.7,
+     "percent_of_606T": 84.7,
+     "samples": 64,
+     "calc_diff": 9.18036636010644e-06
+    },
+    "flydsl_vs_pyhip_tflops_ratio": 0.9975
+   },
+   {
+    "shape": [
+     8192,
+     8192,
+     16384
+    ],
+    "preshuffle_b": false,
+    "pyhip_4x2_lds": {
+     "median_us": 4373.16,
+     "median_tflops": 502.8,
+     "percent_of_606T": 82.9,
+     "samples": 64,
+     "calc_diff": 9.18036636010644e-06
+    },
+    "flydsl_4x2_lds": {
+     "median_us": 4366.66,
+     "median_tflops": 503.6,
+     "percent_of_606T": 83.1,
+     "samples": 64,
+     "calc_diff": 9.18036636010644e-06
+    },
+    "flydsl_vs_pyhip_tflops_ratio": 1.0016
+   }
+  ]
+ },
+ "port_lessons": [
+  "Peeling the last K block outside the dynamic loop let LLVM sink its dequant FMAs past the epilogue barrier: 256 VGPR + 50 spilled. Running every block in the loop with clamped next-block indices gives 242 VGPR, 0 scratch.",
+  "small rmem fill(0) broke fly-layout-lowering without diagnostics; explicit Vec.filled stores compile.",
+  "A sched_barrier only after each {MFMA, FMA} pair let LLVM place the FMA before its MFMA, one MFMA after the producer; XDL hazards forced s_nop 4 and ATT showed 2.29% VALU stall (MFMA busy 90.97% vs PyHIP 93.82%). A second sched_barrier between MFMA and FMA restores strict alternation (gap 0.3-1.6% to PyHIP).",
+  "B scales use inline s_buffer_load_dword (the tracked SMEM intrinsic gets conservative waits, as in the gfx950 reference); every consumer is behind lgkmcnt(0), verified by the ISA wait audit."
+ ],
+ "att_8192_preshuffle_unfenced_port": {
+  "pyhip_v32": {
+   "mfma_busy_percent": 93.82,
+   "idle_categories_percent": {
+    "LDS issue": 1.724,
+    "LDS wait": 0.151,
+    "VALU execution": 0.0,
+    "VMEM issue": 0.979,
+    "VMEM wait": 0.472,
+    "barrier": 2.721,
+    "other": 0.137
+   },
+   "complete_waves": 96
+  },
+  "flydsl_8x1_v2_unfenced": {
+   "mfma_busy_percent": 90.97,
+   "idle_categories_percent": {
+    "LDS issue": 1.755,
+    "LDS wait": 0.09,
+    "VALU execution": 2.289,
+    "VMEM issue": 0.965,
+    "VMEM wait": 0.213,
+    "barrier": 3.715,
+    "other": 0.002
+   },
+   "complete_waves": 104
+  }
+ },
+ "isa_wait_audit": {
+  "4x2_v1_4096_p1": {
+   "instructions_checked": 193696,
+   "waits_checked": 6688,
+   "barriers": 4104,
+   "mfma_instructions_checked": 65536,
+   "control_paths_checked": 4
+  },
+  "4x2_v1_8192_p0": {
+   "instructions_checked": 193112,
+   "waits_checked": 6688,
+   "barriers": 4104,
+   "mfma_instructions_checked": 65536,
+   "control_paths_checked": 4
+  },
+  "4x2_v1_8192_p1": {
+   "instructions_checked": 193700,
+   "waits_checked": 6688,
+   "barriers": 4104,
+   "mfma_instructions_checked": 65536,
+   "control_paths_checked": 4
+  },
+  "8x1_v3_4096_p1": {
+   "instructions_checked": 186400,
+   "waits_checked": 6548,
+   "barriers": 4104,
+   "mfma_instructions_checked": 65536,
+   "control_paths_checked": 4
+  },
+  "8x1_v3_8192_p0": {
+   "instructions_checked": 185796,
+   "waits_checked": 6548,
+   "barriers": 4104,
+   "mfma_instructions_checked": 65536,
+   "control_paths_checked": 4
+  },
+  "8x1_v3_8192_p1": {
+   "instructions_checked": 186332,
+   "waits_checked": 6548,
+   "barriers": 4104,
+   "mfma_instructions_checked": 65536,
+   "control_paths_checked": 4
+  }
+ },
+ "ablation_2x4_r3": {
+  "att_8192_mfma_busy_percent": 91.86,
+  "att_8192_idle_categories_percent": {
+   "LDS issue": 3.928,
+   "LDS wait": 1.016,
+   "VALU execution": 1.236,
+   "VMEM issue": 0.875,
+   "VMEM wait": 0.083,
+   "barrier": 0.916,
+   "other": 0.085
+  },
+  "same_layout_elf_ablations": {
+   "8192": {
+    "r3": {
+     "median_us": 4331.2,
+     "speedup_vs_r3": 1.0,
+     "equivalent_tflops": 507.7
+    },
+    "nodq": {
+     "median_us": 4297.7,
+     "speedup_vs_r3": 1.0078,
+     "equivalent_tflops": 511.7
+    },
+    "nobar": {
+     "median_us": 4736.2,
+     "speedup_vs_r3": 0.9145,
+     "equivalent_tflops": 464.3
+    },
+    "nowr": {
+     "median_us": 4293.6,
+     "speedup_vs_r3": 1.0088,
+     "equivalent_tflops": 512.2
+    },
+    "nord": {
+     "median_us": 4305.3,
+     "speedup_vs_r3": 1.006,
+     "equivalent_tflops": 510.8
+    },
+    "nolds": {
+     "median_us": 4287.3,
+     "speedup_vs_r3": 1.0102,
+     "equivalent_tflops": 512.9
+    },
+    "novmem": {
+     "median_us": 4211.4,
+     "speedup_vs_r3": 1.0284,
+     "equivalent_tflops": 522.2
+    },
+    "mfmabar": {
+     "median_us": 4160.4,
+     "speedup_vs_r3": 1.041,
+     "equivalent_tflops": 528.6
+    },
+    "mfma": {
+     "median_us": 4399.8,
+     "speedup_vs_r3": 0.9844,
+     "equivalent_tflops": 499.8
+    }
+   },
+   "4096": {
+    "r3": {
+     "median_us": 1322.9,
+     "speedup_vs_r3": 1.0,
+     "equivalent_tflops": 415.6
+    },
+    "nodq": {
+     "median_us": 1311.1,
+     "speedup_vs_r3": 1.009,
+     "equivalent_tflops": 419.3
+    },
+    "nobar": {
+     "median_us": 1444.8,
+     "speedup_vs_r3": 0.9157,
+     "equivalent_tflops": 380.5
+    },
+    "nowr": {
+     "median_us": 1315.0,
+     "speedup_vs_r3": 1.006,
+     "equivalent_tflops": 418.1
+    },
+    "nord": {
+     "median_us": 1317.4,
+     "speedup_vs_r3": 1.0042,
+     "equivalent_tflops": 417.3
+    },
+    "nolds": {
+     "median_us": 1313.1,
+     "speedup_vs_r3": 1.0075,
+     "equivalent_tflops": 418.7
+    },
+    "novmem": {
+     "median_us": 1294.5,
+     "speedup_vs_r3": 1.022,
+     "equivalent_tflops": 424.7
+    },
+    "mfmabar": {
+     "median_us": 1280.8,
+     "speedup_vs_r3": 1.0329,
+     "equivalent_tflops": 429.2
+    },
+    "mfma": {
+     "median_us": 1352.1,
+     "speedup_vs_r3": 0.9784,
+     "equivalent_tflops": 406.6
+    }
+   }
+  },
+  "removed_by_variant": {
+   "nodq": "v_fmac/v_mul dequant",
+   "nobar": "all s_barrier incl. 4+4 stagger pair",
+   "nowr": "ds_write",
+   "nord": "ds_read",
+   "nolds": "ds_read+ds_write",
+   "novmem": "buffer_load",
+   "mfmabar": "everything except MFMA, barriers, waits, SALU",
+   "mfma": "everything except MFMA, waits, SALU"
+  },
+  "probe_sclk_and_cycles": {
+   "8192": {
+    "event_us": 4329.197883605957,
+    "wg_span_us": 4319.5,
+    "cus": 80.0,
+    "sclk_ghz_median": 1.7861562204518986,
+    "sclk_ghz_min": 1.7764299315053584,
+    "sclk_ghz_max": 1.8093880725946425,
+    "prologue_cycles_median": 3180.0,
+    "loop_cycles_per_kblock_median": 4449.2734375,
+    "loop_cycles_per_kblock_p05": 4437.84375,
+    "loop_cycles_per_kblock_p95": 4475.4375,
+    "epilogue_cycles_median": 8476.0,
+    "wg_total_cycles_median": 581500.0,
+    "same_cu_gap_ns_median": 5600.0,
+    "same_cu_gap_ns_p95": 7136.999999999998,
+    "first_start_to_last_start_us": 3995.06
+   },
+   "4096": {
+    "event_us": 1327.206015586853,
+    "wg_span_us": 1318.345,
+    "cus": 80.0,
+    "sclk_ghz_median": 1.7897934739785055,
+    "sclk_ghz_min": 1.7744588483540633,
+    "sclk_ghz_max": 1.8511243814630014,
+    "prologue_cycles_median": 4707.0,
+    "loop_cycles_per_kblock_median": 4442.3125,
+    "loop_cycles_per_kblock_p05": 4435.53125,
+    "loop_cycles_per_kblock_p95": 4470.16796875,
+    "epilogue_cycles_median": 8323.0,
+    "wg_total_cycles_median": 581858.0,
+    "same_cu_gap_ns_median": 5520.0,
+    "same_cu_gap_ns_p95": 7080.0,
+    "first_start_to_last_start_us": 1000.19
+   }
+  },
+  "conclusions": [
+   "Removing dequant saves 0.8-0.9%; cache-resident K0 reloads give no gain, so neither DQ nor HBM/L2 limits the r3 main loop.",
+   "Keeping only MFMA+barriers is 4.1% (8192) / 3.3% (4096) faster than r3: the in-loop instruction overhead ceiling. Removing barriers is 8.5% slower: the 4+4 stagger sync is required.",
+   "Per-WG s_memtime/s_memrealtime probes: median SCLK 1.786 GHz (8192) under load, not 1.85; main loop 4449 cycles per K block vs 4096 ideal (92.1%); 4096x4096 additionally loses 20% to 256 WGs on 80 CUs (4 rounds)."
+  ],
+  "note": "Ablation variants are not GEMMs; outputs were checked only for complete overwrite/zero contracts"
+ },
+ "limitations": [
+  "Performance measured for K=16384 square shapes on one MI308X; other shapes covered for correctness only",
+  "ISA wait audit checks single-wave counter semantics; cross-wave LDS reuse relies on the unchanged PyHIP barrier protocol"
+ ]
+}

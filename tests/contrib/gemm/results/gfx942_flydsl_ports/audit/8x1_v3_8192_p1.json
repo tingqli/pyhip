@@ -1,0 +1,22 @@
+{
+  "isa": "/tmp/gfx942_perf/flydsl_ports/8x1_v3/8192_p1.s",
+  "isa_sha256": "42920c254451c60d1d7d26374845c6515e2409dd938d82bf7864ccd3f5959097",
+  "counts": {
+    "instructions_checked": 186332,
+    "waits_checked": 6548,
+    "barriers": 4104,
+    "mfma_instructions_checked": 65536,
+    "control_paths_checked": 4
+  },
+  "negative_controls": {
+    "looser_vmcnt": "('0x1adc', 'load-use without wait', 'ds_write_b128 v145, v[12:15]', [('v', 12), ('v', 13), ('v', 14), ('v', 15)])",
+    "looser_lgkmcnt": "('0x171c', 'load-use without wait', 's_add_i32 s3, s28, 0xff', [('s', 28)])"
+  },
+  "violations": [],
+  "scope": "Actual disassembled control flow, all forward-branch combinations and exact K-loop count; VMEM/LGKM load-use and WAW based on oldest-first counter retirement, SMEM conservatively requires lgkmcnt(0)",
+  "limitations": [
+    "Not an instruction-cycle model of MFMA result latency",
+    "Cross-wave LDS publication/retirement checked by separate source/barrier audit",
+    "Forward branch combinations include impossible wave-group combinations, making register checks conservative"
+  ]
+}

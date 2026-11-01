@@ -1,0 +1,245 @@
+{
+ "kernel": "8x1",
+ "records": [
+  {
+   "shape": [
+    256,
+    256,
+    128
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.338000926699785e-06
+  },
+  {
+   "shape": [
+    256,
+    256,
+    128
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.079584025377784e-06
+  },
+  {
+   "shape": [
+    257,
+    272,
+    256
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.028517259006662e-06
+  },
+  {
+   "shape": [
+    257,
+    272,
+    256
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.326192942775812e-06
+  },
+  {
+   "shape": [
+    17,
+    528,
+    384
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.011193842416553e-06
+  },
+  {
+   "shape": [
+    17,
+    528,
+    384
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.523073682265014e-06
+  },
+  {
+   "shape": [
+    129,
+    272,
+    512
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.250862502778844e-06
+  },
+  {
+   "shape": [
+    129,
+    272,
+    512
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.253836239036083e-06
+  },
+  {
+   "shape": [
+    255,
+    528,
+    640
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.313210947075156e-06
+  },
+  {
+   "shape": [
+    255,
+    528,
+    640
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.225191627908579e-06
+  },
+  {
+   "shape": [
+    257,
+    272,
+    2048
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.079579380537716e-06
+  },
+  {
+   "shape": [
+    257,
+    272,
+    2048
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.23688425755087e-06
+  },
+  {
+   "shape": [
+    1,
+    4096,
+    128
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.76304130748018e-06
+  },
+  {
+   "shape": [
+    1,
+    4096,
+    128
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 9.11353653243463e-06
+  },
+  {
+   "shape": [
+    129,
+    4096,
+    256
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.253288533377479e-06
+  },
+  {
+   "shape": [
+    129,
+    4096,
+    256
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.29008578240309e-06
+  },
+  {
+   "shape": [
+    257,
+    4096,
+    384
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.2344339653595e-06
+  },
+  {
+   "shape": [
+    257,
+    4096,
+    384
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.24954207612194e-06
+  },
+  {
+   "shape": [
+    4097,
+    4096,
+    512
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.242952460713049e-06
+  },
+  {
+   "shape": [
+    4097,
+    4096,
+    512
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.237830200652496e-06
+  },
+  {
+   "shape": [
+    255,
+    4096,
+    640
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.25419620198442e-06
+  },
+  {
+   "shape": [
+    255,
+    4096,
+    640
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.225796132133034e-06
+  },
+  {
+   "shape": [
+    257,
+    4096,
+    2048
+   ],
+   "preshuffle_b": false,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.211822387749201e-06
+  },
+  {
+   "shape": [
+    257,
+    4096,
+    2048
+   ],
+   "preshuffle_b": true,
+   "bitwise_identical_to_pyhip": true,
+   "calc_diff": 8.23852949549675e-06
+  }
+ ]
+}

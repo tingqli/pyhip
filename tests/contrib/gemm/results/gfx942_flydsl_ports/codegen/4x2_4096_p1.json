@@ -1,0 +1,48 @@
+{
+ "kernel": "4x2_lds",
+ "N": 4096,
+ "K": 16384,
+ "preshuffle_b": true,
+ "elf": "/tmp/gfx942_perf/flydsl_ports/4x2_v1/4096_p1.co",
+ "sha256": "d116f7aac00fb4e38d032cc6b9111fc1a4061a0db75bae1e2269b3c6a07f8ced",
+ "resources": {
+  "agpr_count": 0,
+  "group_segment_fixed_size": 65536,
+  "private_segment_fixed_size": 0,
+  "sgpr_count": 50,
+  "sgpr_spill_count": 0,
+  "vgpr_count": 240,
+  "vgpr_spill_count": 0
+ },
+ "total_instructions": 1812,
+ "total_mfma": 256,
+ "scratch": [],
+ "loops": [
+  {
+   "begin": "0x1e7c",
+   "end": "0x2fac",
+   "instructions": 744,
+   "mfma": 256,
+   "counts": {
+    "v_mfma_f32_16x16x32_fp8_fp8": 256,
+    "v_fmac_f32_e32": 256,
+    "ds_read_b128": 48,
+    "v_mul_f32_e32": 32,
+    "s_waitcnt": 26,
+    "s_nop": 24,
+    "ds_write_b128": 16,
+    "buffer_load_dword": 16,
+    "buffer_load_dwordx4": 16,
+    "s_barrier": 16,
+    "s_setprio": 16,
+    "s_add_i32": 7,
+    "s_buffer_load_dword": 4,
+    "s_lshl_b32": 3,
+    "s_cmpk_lg_i32": 2,
+    "s_addk_i32": 2,
+    "s_cselect_b32": 1,
+    "s_or_b32": 1
+   }
+  }
+ ]
+}
