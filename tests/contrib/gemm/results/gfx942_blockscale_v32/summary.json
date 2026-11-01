@@ -1,0 +1,487 @@
+{
+  "date": "2026-10-31",
+  "version": "v32",
+  "source": "/mywork/pyhip/src/contrib/gemm_fp8_gfx942.py",
+  "source_sha256": "a9b77198b483da589992710ddbfb07983f55594a8c67584f3cb7e1eb3f5daa20",
+  "test_source_sha256": "b3ba83eff88f25203373cf275ba94126b2443e5fc7a4adc7a62403d952414d50",
+  "change": "For preshuffled N4096, remap logical N64 packet p to p XOR ((blockIdx.x//4)&3); remap B-scale and output consistently",
+  "preserved": [
+    "256x256 tile",
+    "8 waves",
+    "M split=1",
+    "K128 scale/FMA order",
+    "v25 MFMA/DQ/wait/barrier pipeline",
+    "240 VGPR",
+    "32 KiB LDS",
+    "zero scratch"
+  ],
+  "timing": {
+    "baseline": {
+      "median_us": 1347.0929861068726,
+      "median_tflops": 408.1053197944457,
+      "samples": 64,
+      "diff": 8.984809310996766e-06,
+      "sweep_medians_us": [
+        1347.9530215263367,
+        1345.7759618759155
+      ]
+    },
+    "v32": {
+      "median_us": 1267.5560116767883,
+      "median_tflops": 433.71323146560974,
+      "samples": 64,
+      "diff": 8.984809310996766e-06,
+      "sweep_medians_us": [
+        1268.1739926338196,
+        1267.4959897994995
+      ]
+    }
+  },
+  "latency_reduction_pct": 5.904341812360537,
+  "throughput_improvement_pct": 6.274829174993912,
+  "timing_protocol": "32 independent A/B buffers; forward/reverse full sweeps with full warmup before each; no immediate variant same-address reuse",
+  "att_scope": "Same 14 physical SE/CU/SIMD locations; all complete waves; both resident waves inside K2..125; no CU-idle denominator",
+  "att_condition": "PTL Enabled/VECTOR,F8; 16-SE mask, one SIMD/CU, 1GiB trace buffer; target kernel iteration 33 after 32 disjoint cold inputs",
+  "att": {
+    "v25_4096": {
+      "mfma_efficiency_pct": 85.84702355507706,
+      "total_active_mainloop_cycles": 28961060,
+      "mfma_busy_cycles": 24862208,
+      "idle_categories_pct": {
+        "LDS issue": 1.2677436530292745,
+        "LDS wait": 0.07110236987182099,
+        "VALU execution": 0.0,
+        "VMEM issue": 1.6335866159594987,
+        "VMEM wait": 0.3410510526893698,
+        "barrier": 10.530567596628025,
+        "other": 0.3089251567449534
+      },
+      "physical_simds": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          3,
+          0,
+          0
+        ],
+        [
+          4,
+          0,
+          0
+        ],
+        [
+          5,
+          0,
+          0
+        ],
+        [
+          6,
+          0,
+          0
+        ],
+        [
+          7,
+          0,
+          0
+        ],
+        [
+          8,
+          0,
+          0
+        ],
+        [
+          9,
+          0,
+          0
+        ],
+        [
+          12,
+          0,
+          0
+        ],
+        [
+          13,
+          0,
+          0
+        ],
+        [
+          14,
+          0,
+          0
+        ],
+        [
+          15,
+          0,
+          0
+        ]
+      ],
+      "complete_waves": 98,
+      "code_object": {
+        "path": "/tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+        "sha256": "98e53be4163c1ed7c18d87505cc28a62d05618e6619510c694826628c9aa3df8"
+      },
+      "analysis": "v25_4096_wide_stalls.json",
+      "run": "v25_4096_wide_att_run.json"
+    },
+    "v32_4096": {
+      "mfma_efficiency_pct": 94.25240873523714,
+      "total_active_mainloop_cycles": 25301660,
+      "mfma_busy_cycles": 23847424,
+      "idle_categories_pct": {
+        "LDS issue": 0.9322550378117483,
+        "LDS wait": 0.02964232386333545,
+        "VALU execution": 0.0,
+        "VMEM issue": 0.3005494501151308,
+        "VMEM wait": 0.024362037905813295,
+        "barrier": 4.106481551012858,
+        "other": 0.3543008640539791
+      },
+      "physical_simds": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          3,
+          0,
+          0
+        ],
+        [
+          4,
+          0,
+          0
+        ],
+        [
+          5,
+          0,
+          0
+        ],
+        [
+          6,
+          0,
+          0
+        ],
+        [
+          7,
+          0,
+          0
+        ],
+        [
+          8,
+          0,
+          0
+        ],
+        [
+          9,
+          0,
+          0
+        ],
+        [
+          12,
+          0,
+          0
+        ],
+        [
+          13,
+          0,
+          0
+        ],
+        [
+          14,
+          0,
+          0
+        ],
+        [
+          15,
+          0,
+          0
+        ]
+      ],
+      "complete_waves": 94,
+      "code_object": {
+        "path": "/tmp/gfx942_perf/cache_v32/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+        "sha256": "1edd863d6bfd53153afa0a8ae00558fb61070cac157b5168cd5c795649e9e730"
+      },
+      "analysis": "v32_4096_wide_stalls.json",
+      "run": "v32_4096_wide_att_run.json"
+    },
+    "v25_8192": {
+      "mfma_efficiency_pct": 94.05828073612918,
+      "total_active_mainloop_cycles": 98178856,
+      "mfma_busy_cycles": 92345344,
+      "idle_categories_pct": {
+        "LDS issue": 0.8816440069336314,
+        "LDS wait": 0.025052237316759936,
+        "VALU execution": 0.0,
+        "VMEM issue": 0.7048360799803982,
+        "VMEM wait": 0.06448231582572117,
+        "barrier": 3.873795392360245,
+        "other": 0.39190923145407197
+      },
+      "physical_simds": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          3,
+          0,
+          0
+        ],
+        [
+          4,
+          0,
+          0
+        ],
+        [
+          5,
+          0,
+          0
+        ],
+        [
+          6,
+          0,
+          0
+        ],
+        [
+          7,
+          0,
+          0
+        ],
+        [
+          8,
+          0,
+          0
+        ],
+        [
+          9,
+          0,
+          0
+        ],
+        [
+          12,
+          0,
+          0
+        ],
+        [
+          13,
+          0,
+          0
+        ],
+        [
+          14,
+          0,
+          0
+        ],
+        [
+          15,
+          0,
+          0
+        ]
+      ],
+      "complete_waves": 364,
+      "code_object": {
+        "path": "/tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=8192-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+        "sha256": "729b837096ea44dfd053282c5c2e6863e1bc614a4dfb74dc4cf49d85e219e3b9"
+      },
+      "analysis": "v25_8192_wide_stalls.json",
+      "run": "v25_8192_wide_att_run.json"
+    }
+  },
+  "validation": {
+    "pipeline_tests": 24,
+    "additional_untouched_path_guard_graph_controls": 5,
+    "unchanged_device_text": [
+      {
+        "N": 8192,
+        "K": 16384,
+        "preshuffle_b": true,
+        "text_sha256": "8f3711b37453eb5976a9ddbb259ed262e88546d482edba7c1b9512e05795d99e",
+        "identical": true
+      },
+      {
+        "N": 8192,
+        "K": 16384,
+        "preshuffle_b": false,
+        "text_sha256": "38568cd470eb4420b1da85ebb45812bd9f681ffe3fdca09072bfced811378bd5",
+        "identical": true
+      },
+      {
+        "N": 4096,
+        "K": 16384,
+        "preshuffle_b": false,
+        "text_sha256": "88e378e3cb4fc8a8869c8ba36a58203573aa5d1edaa09e632ca607633473f391",
+        "identical": true
+      },
+      {
+        "N": 3584,
+        "K": 6144,
+        "preshuffle_b": true,
+        "text_sha256": "f0e7fa47e6d8c5086246df2641bdd54029505ce5622db8aadf0dfe604cfb4d1c",
+        "identical": true
+      },
+      {
+        "N": 3392,
+        "K": 6144,
+        "preshuffle_b": true,
+        "text_sha256": "f19b10aa3955194cf267d2ddb94d1bb02320961b6e351bbe2637ee8ccc9a4685",
+        "identical": true
+      }
+    ],
+    "profiled_final_text_sha256": "1761344590d89680778471f65919ddacd60b6aae77ba2bd99c33ed028d1a41e1"
+  },
+  "mechanism_supported": "Cross-WG B request ordering exposes VMEM stalls and propagates to publication barriers; address-only phase permutation reduces both without changing the mainloop instructions",
+  "mechanism_not_proven": "Exact TCC bank, fabric partition or hardware queue causing the contention; PMC at Disabled PTL cannot prove this for Enabled ATT",
+  "experiments": [
+    {
+      "version": "v26",
+      "change": "Current B LDS reads before waiting for next B VMEM; full DS retirement before publication",
+      "median_us": 1336.6649746894836,
+      "median_tflops": 411.28915943631426,
+      "calc_diff": 9.41510264329537e-06,
+      "source_sha256": "cbd6baa214a7e307838257fca701c2f89b6e4243319402d8ff1cb47e8f65cadf",
+      "artifacts": {
+        "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "8cc8f31de01245e69e5f7110c7f57d3bcebf9b5368676f0c3c8dfe344b5b1bd5"
+      },
+      "comparison_scope": "Screening in separate allocations/runs; see final_v32_pair.json for same-address acceptance"
+    },
+    {
+      "version": "v27",
+      "change": "Four B staging banks, prefetch q+5 instead of q+3; baseline LDS order",
+      "median_us": 1347.1649885177612,
+      "median_tflops": 408.08350764287394,
+      "calc_diff": 9.41510264329537e-06,
+      "source_sha256": "09dcb782c85487460f286a239d10580780753e6f9be1fda46e58786dd8aed736",
+      "artifacts": {
+        "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "e325561e0b494d15c81435b244e58c24803bc86d6188099429d0142d8629edb6"
+      },
+      "comparison_scope": "Screening in separate allocations/runs; see final_v32_pair.json for same-address acceptance"
+    },
+    {
+      "version": "v28",
+      "change": "Task groups 8 to 2; baseline mainloop",
+      "median_us": 1355.6450009346008,
+      "median_tflops": 405.5308089573528,
+      "calc_diff": 9.41510264329537e-06,
+      "source_sha256": "a81b96ea26eb281ea99a346b40d49a7130e8cd1922d6e26b182e95bfc88e455c",
+      "artifacts": {
+        "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "325e32b9a1416437954668a1e7276846b8e99520ca34bd3e3ef431f76046bb24"
+      },
+      "comparison_scope": "Screening in separate allocations/runs; see final_v32_pair.json for same-address acceptance"
+    },
+    {
+      "version": "v29",
+      "change": "Task groups 8 to 1; baseline mainloop",
+      "median_us": 1316.1849975585938,
+      "median_tflops": 417.688862057954,
+      "calc_diff": 9.41510264329537e-06,
+      "source_sha256": "5cc9e7bb2b7e1a6bd6a1422be9aea3f18e6d113f5293875cfb90f23b7fbedfc2",
+      "artifacts": {
+        "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "7997327c9dcfeb0cbec092ee41f9ca91db0d11a9a324353709294435fdf8fca8"
+      },
+      "comparison_scope": "Screening in separate allocations/runs; see final_v32_pair.json for same-address acceptance"
+    },
+    {
+      "version": "v30",
+      "change": "v29 plus row group 8 to 16",
+      "median_us": 1354.5050024986267,
+      "median_tflops": 405.87211776543984,
+      "calc_diff": 9.41510264329537e-06,
+      "source_sha256": "a9cbff94474a586f93822dacbb89828a59adb8a0df83782c033049778aec01bb",
+      "artifacts": {
+        "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "80e83b6456190405da8cee28654951742196b7fcf44e8efaf9204537abeb904c"
+      },
+      "comparison_scope": "Screening in separate allocations/runs; see final_v32_pair.json for same-address acceptance"
+    },
+    {
+      "version": "v31",
+      "change": "Two N128 phases selected by (blockIdx.x//4)&1",
+      "median_us": 1288.765013217926,
+      "median_tflops": 426.57568156301124,
+      "calc_diff": 9.41510264329537e-06,
+      "source_sha256": "b6c7fa6efef6fe5fe3d52b7c02bc89576e82d2af4f53b3d867ae401a9c925632",
+      "artifacts": {
+        "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "f297d8ca7451aa053e44b2b17190976885cdedee15ac21e0292a4d8de6361d48"
+      },
+      "comparison_scope": "Screening in separate allocations/runs; see final_v32_pair.json for same-address acceptance"
+    },
+    {
+      "version": "v32",
+      "change": "Four N64 XOR phases selected by (blockIdx.x//4)&3",
+      "median_us": 1267.645001411438,
+      "median_tflops": 433.68278443561377,
+      "calc_diff": 9.41510264329537e-06,
+      "source_sha256": "87d27d2b69216658dc8b67b3e55f8713d145b5a567aba089290e063dcdbb0628",
+      "artifacts": {
+        "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "708af270db073f9cd6a38316e8e88aba1a3ba65544839178b7781010d92a7aef"
+      },
+      "comparison_scope": "Screening in separate allocations/runs; see final_v32_pair.json for same-address acceptance"
+    },
+    {
+      "version": "v33",
+      "change": "v32 plus task groups 8 to 1",
+      "median_us": 1271.8050479888916,
+      "median_tflops": 432.2642175051359,
+      "calc_diff": 9.41510264329537e-06,
+      "source_sha256": "1555a86664062ede9805afd85f36bd05886d04985b2000d680b6898ee490934d",
+      "artifacts": {
+        "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "7df224e4278c20bd76f95185e209c1e853b7c32e997cbdb64de32f3893cc0ea0"
+      },
+      "comparison_scope": "Screening in separate allocations/runs; see final_v32_pair.json for same-address acceptance"
+    },
+    {
+      "version": "v34",
+      "change": "Four N64 phases selected by blockIdx.x&3",
+      "median_us": 1334.185004234314,
+      "median_tflops": 412.0536598322088,
+      "calc_diff": 9.41510264329537e-06,
+      "source_sha256": "72ae315ff79519ca6d61e55c0c313598e1e87c2c77c634ee06c820021936f84d",
+      "artifacts": {
+        "gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co": "5b779fae6d776957d1d6476ae602673b65171d554dd45cf6d195d3c5e44810ce"
+      },
+      "comparison_scope": "Screening in separate allocations/runs; see final_v32_pair.json for same-address acceptance"
+    }
+  ],
+  "limitations": [
+    "ATT is sampled physical SIMD activity, not full-device utilization or ordinary benchmark latency",
+    "One target dispatch per ATT configuration; do not claim statistical equivalence from the 0.19 percentage-point margin",
+    "The 8192 all-16-SE/all-4-SIMD trace lost data and is excluded; its log remains archived",
+    "Adjacent M3840/M5120 performance validation stopped at entry because six other GPU processes appeared; not rerun and not claimed passed",
+    "Other runtime M/K values in the N4096 branch have correctness coverage but no general performance guarantee"
+  ]
+}

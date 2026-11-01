@@ -1,0 +1,11 @@
+jobs:
+    -
+        kernel_include_regex: .*gemm_a8w8_blockscale_8wave_gfx942.*
+        kernel_iteration_range: "[33]"
+        output_directory: /tmp/gfx942_perf/symmetric_load/shape4096_att
+        output_format: [json]
+        advanced_thread_trace: true
+        att_target_cu: 0
+        att_shader_engine_mask: "0xffff"
+        att_simd_select: "0xf"
+        att_buffer_size: "0x20000000"

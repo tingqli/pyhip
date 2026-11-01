@@ -25,6 +25,9 @@ PERF_VERBOSE = 0
 import pyhip
 from pyhip.contrib.gemm_fp8 import gemm_8wave_fp8bf16fp16
 from pyhip.contrib.gemm_fp8_gfx942 import gemm_a8w8_blockscale_8wave_gfx942
+from pyhip.contrib.gemm_fp8_gfx942_4x2_lds import (
+    gemm_a8w8_blockscale_8wave_gfx942_4x2_lds,
+)
 
 torch.set_printoptions(
     linewidth=3000,
@@ -222,10 +225,12 @@ def txest_gemm(dtype, m, n, k, ck_preshuffle=True):
     return ret
 
 
-def run_gfx942(x, weight, out, x_scale_t, w_scale, preshuffle_b):
+def run_gfx942(x, weight, out, x_scale_t, w_scale, preshuffle_b, kernel=None):
     rows, depth = x.shape
     cols = weight.shape[0]
-    gemm_a8w8_blockscale_8wave_gfx942(
+    if kernel is None:
+        kernel = gemm_a8w8_blockscale_8wave_gfx942
+    kernel(
         [pyhip.div_up(rows, 256) * pyhip.div_up(cols, 256)],
         [512],
         preshuffle_b,
@@ -240,13 +245,30 @@ def run_gfx942(x, weight, out, x_scale_t, w_scale, preshuffle_b):
     )
 
 
+@pytest.mark.parametrize(
+    "kernel",
+    [gemm_a8w8_blockscale_8wave_gfx942, gemm_a8w8_blockscale_8wave_gfx942_4x2_lds],
+    ids=["8x1", "4x2-lds"],
+)
 @pytest.mark.parametrize("preshuffle_b", [False, True])
 @pytest.mark.parametrize(
     "rows,cols,depth",
-    [(256, 256, 128), (257, 272, 256), (17, 528, 384),
-     (129, 272, 512), (255, 528, 640), (257, 272, 2048)],
+    [
+        (256, 256, 128),
+        (257, 272, 256),
+        (17, 528, 384),
+        (129, 272, 512),
+        (255, 528, 640),
+        (257, 272, 2048),
+        (1, 4096, 128),
+        (129, 4096, 256),
+        (257, 4096, 384),
+        (4097, 4096, 512),
+        (255, 4096, 640),
+        (257, 4096, 2048),
+    ],
 )
-def test_gfx942_pipeline(rows, cols, depth, preshuffle_b):
+def test_gfx942_pipeline(rows, cols, depth, preshuffle_b, kernel):
     if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx942":
         pytest.skip("gfx942 pipeline")
     x = (torch.randn((rows, depth), device="cuda") / 10).to(dtypes.fp8)
@@ -260,13 +282,13 @@ def test_gfx942_pipeline(rows, cols, depth, preshuffle_b):
     output = storage[64:-64].view(rows, cols)
     for _ in range(3):
         output.fill_(float("nan"))
-        run_gfx942(x, weight, output, scale_a, scale_b, preshuffle_b)
+        run_gfx942(x, weight, output, scale_a, scale_b, preshuffle_b, kernel)
         assert checkAllclose(reference, output, msg="gfx942", tol_err_ratio=0) == 0
         pyhip.calc_diff(reference, output, diff_thr=1e-5)
         assert torch.all(storage[:64] == 123) and torch.all(storage[-64:] == 123)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        run_gfx942(x, weight, output, scale_a, scale_b, preshuffle_b)
+        run_gfx942(x, weight, output, scale_a, scale_b, preshuffle_b, kernel)
     output.fill_(float("nan"))
     graph.replay()
     assert checkAllclose(reference, output, msg="gfx942 graph", tol_err_ratio=0) == 0
@@ -283,18 +305,25 @@ def bench_gfx942(m, n, k, num_repeats=32, preshuffle_b=False, sample_gate=None):
     reference = run_torch(x, weight, scale_a, scale_b).cpu()
     scale_a = scale_a.T.contiguous()
     weight = shuffle_weight(weight, layout=(16, 16)) if preshuffle_b else weight
-    buffers = [tuple(tensor.clone() for tensor in (x, weight, scale_a, scale_b))
-               for _ in range(32)]
+    buffers = [
+        tuple(tensor.clone() for tensor in (x, weight, scale_a, scale_b))
+        for _ in range(32)
+    ]
     intervals = sorted(
         (tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.itemsize)
-        for group in buffers for tensor in group
+        for group in buffers
+        for tensor in group
     )
-    assert all(previous[1] <= current[0] for previous, current in zip(intervals, intervals[1:]))
+    assert all(
+        previous[1] <= current[0] for previous, current in zip(intervals, intervals[1:])
+    )
     tensor_bytes = [tensor.numel() * tensor.itemsize for tensor in buffers[0]]
     ab_bytes = sum(tensor_bytes[:2])
     output = torch.empty((m, n), dtype=dtypes.bf16, device="cuda")
     for activation, weights, activation_scale, weight_scale in buffers:
-        run_gfx942(activation, weights, output, activation_scale, weight_scale, preshuffle_b)
+        run_gfx942(
+            activation, weights, output, activation_scale, weight_scale, preshuffle_b
+        )
     torch.cuda.synchronize()
 
     def validate_output(label):
@@ -312,15 +341,30 @@ def bench_gfx942(m, n, k, num_repeats=32, preshuffle_b=False, sample_gate=None):
     for sample in range(num_repeats):
         buffer_index = sample % len(buffers)
         activation, weights, activation_scale, weight_scale = buffers[buffer_index]
-        with pyhip.cudaPerf(flops, rw_bytes, name="gfx942", verbose=PERF_VERBOSE) as perf:
-            run_gfx942(activation, weights, output, activation_scale, weight_scale, preshuffle_b)
-        samples.extend({"sample": sample, "buffer": buffer_index, "us": seconds * 1e6}
-                       for seconds in perf.latencies)
+        with pyhip.cudaPerf(
+            flops, rw_bytes, name="gfx942", verbose=PERF_VERBOSE
+        ) as perf:
+            run_gfx942(
+                activation,
+                weights,
+                output,
+                activation_scale,
+                weight_scale,
+                preshuffle_b,
+            )
+        samples.extend(
+            {"sample": sample, "buffer": buffer_index, "us": seconds * 1e6}
+            for seconds in perf.latencies
+        )
     torch.cuda.synchronize()
     report = {
-        "shape": [m, n, k], "preshuffle_b": preshuffle_b,
-        "flops": flops, "samples": samples,
-        "input_pointers": [[tensor.data_ptr() for tensor in group] for group in buffers],
+        "shape": [m, n, k],
+        "preshuffle_b": preshuffle_b,
+        "flops": flops,
+        "samples": samples,
+        "input_pointers": [
+            [tensor.data_ptr() for tensor in group] for group in buffers
+        ],
         "output_pointer": output.data_ptr(),
         "cache_protocol": {
             "mode": "rotating_independent_inputs",
@@ -333,8 +377,13 @@ def bench_gfx942(m, n, k, num_repeats=32, preshuffle_b=False, sample_gate=None):
             "allocation_intervals_disjoint": True,
             "explicit_cache_flush": False,
         },
-        "input_storage_pointers": [[tensor.untyped_storage().data_ptr() for tensor in group] for group in buffers],
-        "input_storage_offsets": [[tensor.storage_offset() for tensor in group] for group in buffers],
+        "input_storage_pointers": [
+            [tensor.untyped_storage().data_ptr() for tensor in group]
+            for group in buffers
+        ],
+        "input_storage_offsets": [
+            [tensor.storage_offset() for tensor in group] for group in buffers
+        ],
     }
     print("GFX942_RAW " + json.dumps(report), flush=True)
     report["diff"] = validate_output("gfx942 timed")
@@ -344,9 +393,12 @@ def bench_gfx942(m, n, k, num_repeats=32, preshuffle_b=False, sample_gate=None):
         report["median_us"] = median(sample["us"] for sample in samples)
         report["median_tflops"] = flops / (report["median_us"] * 1e6)
         report["max_tflops"] = flops / (min(sample["us"] for sample in samples) * 1e6)
-        print(f"gfx942 {m}x{n}x{k} preshuffle={preshuffle_b}: "
-              f"{report['median_us']:.3f} us, {report['median_tflops']:.1f} median TFLOPS, "
-              f"{report['max_tflops']:.1f} max TFLOPS, diff={report['diff']:.3e}", flush=True)
+        print(
+            f"gfx942 {m}x{n}x{k} preshuffle={preshuffle_b}: "
+            f"{report['median_us']:.3f} us, {report['median_tflops']:.1f} median TFLOPS, "
+            f"{report['max_tflops']:.1f} max TFLOPS, diff={report['diff']:.3e}",
+            flush=True,
+        )
     return report
 
 

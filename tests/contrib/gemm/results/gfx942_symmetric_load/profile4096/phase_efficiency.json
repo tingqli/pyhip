@@ -1,0 +1,5527 @@
+{
+  "trace": "/tmp/gfx942_perf/symmetric_load/shape4096_att/ui_output_agent_52238_dispatch_180",
+  "complete_waves": 392,
+  "physical_simds": 56,
+  "resident_batches": 196,
+  "definitions": {
+    "prologue": "resident-batch begin until both waves reach the first MFMA of K block 1; includes startup and K block 0",
+    "mainloop": "both resident waves are within K blocks 1..K_blocks-2",
+    "epilogue": "first resident wave reaches final K block until both waves end; includes final K block, DQ drain, conversion and stores",
+    "mfma_efficiency": "union of 16-cycle MFMA windows, starting at successful issue (attempt+stall), divided by phase cycles"
+  },
+  "scope": "sampled physical SIMD union, not whole-GPU utilization or ordinary kernel latency",
+  "phases": {
+    "prologue": {
+      "cycles": 2166084,
+      "mfma_busy_cycles": 903168,
+      "mean_cycles_per_resident_batch": 11051.448979591836,
+      "lifetime_fraction": 0.0171706438339042,
+      "mfma_efficiency": 0.4169588991008659
+    },
+    "mainloop": {
+      "cycles": 121287124,
+      "mfma_busy_cycles": 101054464,
+      "mean_cycles_per_resident_batch": 618811.8571428572,
+      "lifetime_fraction": 0.9614484054369885,
+      "mfma_efficiency": 0.8331837763751411
+    },
+    "epilogue": {
+      "cycles": 2697216,
+      "mfma_busy_cycles": 802816,
+      "mean_cycles_per_resident_batch": 13761.30612244898,
+      "lifetime_fraction": 0.02138095072910734,
+      "mfma_efficiency": 0.2976461655277145
+    }
+  },
+  "full_lifetime_mfma_efficiency": 0.8145866239815412,
+  "batches": [
+    {
+      "physical_simd": [
+        0,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se0_sm0_sl0_wv0.json",
+        "se0_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13856,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3325635103926097
+        },
+        "mainloop": {
+          "cycles": 787740,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.654510371442354
+        },
+        "epilogue": {
+          "cycles": 13840,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29595375722543354
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se0_sm0_sl0_wv1.json",
+        "se0_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11296,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.40793201133144474
+        },
+        "mainloop": {
+          "cycles": 557364,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9250400097602285
+        },
+        "epilogue": {
+          "cycles": 12996,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3151738996614343
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se0_sm0_sl0_wv2.json",
+        "se0_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9732,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47348951911220716
+        },
+        "mainloop": {
+          "cycles": 521656,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883601453831644
+        },
+        "epilogue": {
+          "cycles": 14920,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.27453083109919574
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se0_sm0_sl0_wv3.json",
+        "se0_sm0_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10040,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4589641434262948
+        },
+        "mainloop": {
+          "cycles": 524428,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9831359118887626
+        },
+        "epilogue": {
+          "cycles": 13312,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3076923076923077
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se0_sm1_sl0_wv0.json",
+        "se0_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13868,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.33227574271704646
+        },
+        "mainloop": {
+          "cycles": 787764,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6544904311443529
+        },
+        "epilogue": {
+          "cycles": 14080,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2909090909090909
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se0_sm1_sl0_wv1.json",
+        "se0_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11304,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.40764331210191085
+        },
+        "mainloop": {
+          "cycles": 557364,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9250400097602285
+        },
+        "epilogue": {
+          "cycles": 13244,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3092721232256116
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se0_sm1_sl0_wv2.json",
+        "se0_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9728,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47368421052631576
+        },
+        "mainloop": {
+          "cycles": 521656,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883601453831644
+        },
+        "epilogue": {
+          "cycles": 14952,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2739432851792402
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se0_sm1_sl0_wv3.json",
+        "se0_sm1_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10036,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45914707054603426
+        },
+        "mainloop": {
+          "cycles": 524432,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9831284132165848
+        },
+        "epilogue": {
+          "cycles": 13472,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30403800475059384
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se0_sm2_sl0_wv0.json",
+        "se0_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13868,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.33227574271704646
+        },
+        "mainloop": {
+          "cycles": 787744,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6545070479749766
+        },
+        "epilogue": {
+          "cycles": 13952,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29357798165137616
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se0_sm2_sl0_wv1.json",
+        "se0_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11296,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.40793201133144474
+        },
+        "mainloop": {
+          "cycles": 557364,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9250400097602285
+        },
+        "epilogue": {
+          "cycles": 13124,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.31209996952148733
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se0_sm2_sl0_wv2.json",
+        "se0_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9732,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47348951911220716
+        },
+        "mainloop": {
+          "cycles": 521656,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883601453831644
+        },
+        "epilogue": {
+          "cycles": 15000,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2730666666666667
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se0_sm2_sl0_wv3.json",
+        "se0_sm2_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10036,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45914707054603426
+        },
+        "mainloop": {
+          "cycles": 524432,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9831284132165848
+        },
+        "epilogue": {
+          "cycles": 13432,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3049434187016081
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se0_sm3_sl0_wv0.json",
+        "se0_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13864,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3323716099249856
+        },
+        "mainloop": {
+          "cycles": 787852,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6544173271121987
+        },
+        "epilogue": {
+          "cycles": 13880,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29510086455331414
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se0_sm3_sl0_wv1.json",
+        "se0_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11308,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4074991156703219
+        },
+        "mainloop": {
+          "cycles": 557364,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9250400097602285
+        },
+        "epilogue": {
+          "cycles": 13312,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3076923076923077
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se0_sm3_sl0_wv2.json",
+        "se0_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9744,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4729064039408867
+        },
+        "mainloop": {
+          "cycles": 521656,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883601453831644
+        },
+        "epilogue": {
+          "cycles": 15128,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.27075621364357483
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        0,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se0_sm3_sl0_wv3.json",
+        "se0_sm3_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10032,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45933014354066987
+        },
+        "mainloop": {
+          "cycles": 524428,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9831359118887626
+        },
+        "epilogue": {
+          "cycles": 13328,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30732292917166865
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se1_sm0_sl0_wv0.json",
+        "se1_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13704,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3362521891418564
+        },
+        "mainloop": {
+          "cycles": 787388,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6548029688031821
+        },
+        "epilogue": {
+          "cycles": 14336,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2857142857142857
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se1_sm0_sl0_wv1.json",
+        "se1_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11480,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4013937282229965
+        },
+        "mainloop": {
+          "cycles": 557196,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9253189182980495
+        },
+        "epilogue": {
+          "cycles": 13192,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.31049120679199516
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se1_sm0_sl0_wv2.json",
+        "se1_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9812,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4696290256828373
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 14976,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.27350427350427353
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se1_sm0_sl0_wv3.json",
+        "se1_sm0_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10056,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45823389021479716
+        },
+        "mainloop": {
+          "cycles": 524460,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9830759257140678
+        },
+        "epilogue": {
+          "cycles": 13176,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3108682452944748
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se1_sm1_sl0_wv0.json",
+        "se1_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13700,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3363503649635036
+        },
+        "mainloop": {
+          "cycles": 787428,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.654769705928669
+        },
+        "epilogue": {
+          "cycles": 14412,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28420760477379964
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se1_sm1_sl0_wv1.json",
+        "se1_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11492,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4009745910198399
+        },
+        "mainloop": {
+          "cycles": 557196,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9253189182980495
+        },
+        "epilogue": {
+          "cycles": 13364,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3064950613588746
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se1_sm1_sl0_wv2.json",
+        "se1_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9820,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46924643584521386
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 15176,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.26989984185556143
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se1_sm1_sl0_wv3.json",
+        "se1_sm1_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10052,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45841623557500993
+        },
+        "mainloop": {
+          "cycles": 524464,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9830684279569236
+        },
+        "epilogue": {
+          "cycles": 13440,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3047619047619048
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se1_sm2_sl0_wv0.json",
+        "se1_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13704,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3362521891418564
+        },
+        "mainloop": {
+          "cycles": 787388,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6548029688031821
+        },
+        "epilogue": {
+          "cycles": 14260,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28723702664796635
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se1_sm2_sl0_wv1.json",
+        "se1_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11492,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4009745910198399
+        },
+        "mainloop": {
+          "cycles": 557196,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9253189182980495
+        },
+        "epilogue": {
+          "cycles": 13276,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3085266646580295
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se1_sm2_sl0_wv2.json",
+        "se1_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9808,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4698205546492659
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 15160,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.27018469656992083
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se1_sm2_sl0_wv3.json",
+        "se1_sm2_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10052,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45841623557500993
+        },
+        "mainloop": {
+          "cycles": 524464,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9830684279569236
+        },
+        "epilogue": {
+          "cycles": 13368,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3064033512866547
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se1_sm3_sl0_wv0.json",
+        "se1_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13700,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3363503649635036
+        },
+        "mainloop": {
+          "cycles": 787496,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6547131667970377
+        },
+        "epilogue": {
+          "cycles": 14412,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28420760477379964
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se1_sm3_sl0_wv1.json",
+        "se1_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11488,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4011142061281337
+        },
+        "mainloop": {
+          "cycles": 557196,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9253189182980495
+        },
+        "epilogue": {
+          "cycles": 13268,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3087126921917395
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se1_sm3_sl0_wv2.json",
+        "se1_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9820,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46924643584521386
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 15040,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2723404255319149
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        1,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se1_sm3_sl0_wv3.json",
+        "se1_sm3_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10064,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4578696343402226
+        },
+        "mainloop": {
+          "cycles": 524460,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9830759257140678
+        },
+        "epilogue": {
+          "cycles": 13264,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3088057901085645
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se2_sm0_sl0_wv0.json",
+        "se2_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 14252,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.32332304238001686
+        },
+        "mainloop": {
+          "cycles": 787332,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6548495425055758
+        },
+        "epilogue": {
+          "cycles": 13896,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2947610823258492
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se2_sm0_sl0_wv1.json",
+        "se2_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11276,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.40865555161404754
+        },
+        "mainloop": {
+          "cycles": 557268,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9251993654758572
+        },
+        "epilogue": {
+          "cycles": 13052,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.31382163653079986
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se2_sm0_sl0_wv2.json",
+        "se2_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9824,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46905537459283386
+        },
+        "mainloop": {
+          "cycles": 521648,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883753028862374
+        },
+        "epilogue": {
+          "cycles": 14840,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.27601078167115906
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se2_sm0_sl0_wv3.json",
+        "se2_sm0_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10064,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4578696343402226
+        },
+        "mainloop": {
+          "cycles": 524332,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9833159143443467
+        },
+        "epilogue": {
+          "cycles": 13276,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3085266646580295
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se2_sm1_sl0_wv0.json",
+        "se2_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 14264,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.32305103757711723
+        },
+        "mainloop": {
+          "cycles": 787356,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6548295815361793
+        },
+        "epilogue": {
+          "cycles": 14004,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2924878606112539
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se2_sm1_sl0_wv1.json",
+        "se2_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11284,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.40836582772066643
+        },
+        "mainloop": {
+          "cycles": 557268,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9251993654758572
+        },
+        "epilogue": {
+          "cycles": 13312,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3076923076923077
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se2_sm1_sl0_wv2.json",
+        "se2_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9820,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46924643584521386
+        },
+        "mainloop": {
+          "cycles": 521648,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883753028862374
+        },
+        "epilogue": {
+          "cycles": 15004,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2729938683017862
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se2_sm1_sl0_wv3.json",
+        "se2_sm1_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10060,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.458051689860835
+        },
+        "mainloop": {
+          "cycles": 524332,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9833159143443467
+        },
+        "epilogue": {
+          "cycles": 13292,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.308155281372254
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se2_sm2_sl0_wv0.json",
+        "se2_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 14268,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3229604709840202
+        },
+        "mainloop": {
+          "cycles": 787332,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6548495425055758
+        },
+        "epilogue": {
+          "cycles": 14132,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.289838664024908
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se2_sm2_sl0_wv1.json",
+        "se2_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11276,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.40865555161404754
+        },
+        "mainloop": {
+          "cycles": 557268,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9251993654758572
+        },
+        "epilogue": {
+          "cycles": 13184,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3106796116504854
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se2_sm2_sl0_wv2.json",
+        "se2_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9820,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46924643584521386
+        },
+        "mainloop": {
+          "cycles": 521648,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883753028862374
+        },
+        "epilogue": {
+          "cycles": 14920,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.27453083109919574
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se2_sm2_sl0_wv3.json",
+        "se2_sm2_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10060,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.458051689860835
+        },
+        "mainloop": {
+          "cycles": 524332,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9833159143443467
+        },
+        "epilogue": {
+          "cycles": 13400,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3056716417910448
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se2_sm3_sl0_wv0.json",
+        "se2_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 14264,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.32305103757711723
+        },
+        "mainloop": {
+          "cycles": 787440,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.654759727725287
+        },
+        "epilogue": {
+          "cycles": 13924,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2941683424303361
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se2_sm3_sl0_wv1.json",
+        "se2_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11288,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.40822111977321046
+        },
+        "mainloop": {
+          "cycles": 557268,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9251993654758572
+        },
+        "epilogue": {
+          "cycles": 13372,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30631169608136405
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se2_sm3_sl0_wv2.json",
+        "se2_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9832,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46867371847030104
+        },
+        "mainloop": {
+          "cycles": 521648,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883753028862374
+        },
+        "epilogue": {
+          "cycles": 14904,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.274825550187869
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        2,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se2_sm3_sl0_wv3.json",
+        "se2_sm3_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10056,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45823389021479716
+        },
+        "mainloop": {
+          "cycles": 524332,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9833159143443467
+        },
+        "epilogue": {
+          "cycles": 13432,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3049434187016081
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se3_sm0_sl0_wv0.json",
+        "se3_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13568,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.33962264150943394
+        },
+        "mainloop": {
+          "cycles": 787576,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.654646662671285
+        },
+        "epilogue": {
+          "cycles": 14440,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2836565096952909
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se3_sm0_sl0_wv1.json",
+        "se3_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11416,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4036440084092502
+        },
+        "mainloop": {
+          "cycles": 557720,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9244495445743384
+        },
+        "epilogue": {
+          "cycles": 13120,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3121951219512195
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se3_sm0_sl0_wv2.json",
+        "se3_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11100,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4151351351351351
+        },
+        "mainloop": {
+          "cycles": 634120,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8130700813726108
+        },
+        "epilogue": {
+          "cycles": 13484,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30376742806288937
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se3_sm1_sl0_wv0.json",
+        "se3_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13576,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.33942251031231585
+        },
+        "mainloop": {
+          "cycles": 787688,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6545535795898884
+        },
+        "epilogue": {
+          "cycles": 14308,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28627341347497903
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se3_sm1_sl0_wv1.json",
+        "se3_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11412,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4037854889589905
+        },
+        "mainloop": {
+          "cycles": 557720,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9244495445743384
+        },
+        "epilogue": {
+          "cycles": 13376,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3062200956937799
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se3_sm1_sl0_wv2.json",
+        "se3_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11220,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4106951871657754
+        },
+        "mainloop": {
+          "cycles": 634108,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8130854680906092
+        },
+        "epilogue": {
+          "cycles": 13388,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3059456229459217
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se3_sm2_sl0_wv0.json",
+        "se3_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13564,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3397227956355057
+        },
+        "mainloop": {
+          "cycles": 787576,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.654646662671285
+        },
+        "epilogue": {
+          "cycles": 14244,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2875596742488065
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se3_sm2_sl0_wv1.json",
+        "se3_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11412,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4037854889589905
+        },
+        "mainloop": {
+          "cycles": 557724,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9244429144164498
+        },
+        "epilogue": {
+          "cycles": 13320,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3075075075075075
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se3_sm2_sl0_wv2.json",
+        "se3_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11096,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4152847873107426
+        },
+        "mainloop": {
+          "cycles": 634124,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8130649525960222
+        },
+        "epilogue": {
+          "cycles": 13608,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3009994121105232
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se3_sm3_sl0_wv0.json",
+        "se3_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13576,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.33942251031231585
+        },
+        "mainloop": {
+          "cycles": 787576,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.654646662671285
+        },
+        "epilogue": {
+          "cycles": 14372,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2849986084052324
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se3_sm3_sl0_wv1.json",
+        "se3_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11424,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.40336134453781514
+        },
+        "mainloop": {
+          "cycles": 557724,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9244429144164498
+        },
+        "epilogue": {
+          "cycles": 13388,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3059456229459217
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        3,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se3_sm3_sl0_wv2.json",
+        "se3_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11132,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4139417894358606
+        },
+        "mainloop": {
+          "cycles": 634120,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8130700813726108
+        },
+        "epilogue": {
+          "cycles": 13600,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30117647058823527
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se4_sm0_sl0_wv0.json",
+        "se4_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12928,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3564356435643564
+        },
+        "mainloop": {
+          "cycles": 791208,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6516415405304294
+        },
+        "epilogue": {
+          "cycles": 14232,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28780213603147836
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se4_sm0_sl0_wv1.json",
+        "se4_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9740,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4731006160164271
+        },
+        "mainloop": {
+          "cycles": 560972,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9190904358862831
+        },
+        "epilogue": {
+          "cycles": 13184,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3106796116504854
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se4_sm0_sl0_wv2.json",
+        "se4_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10496,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.43902439024390244
+        },
+        "mainloop": {
+          "cycles": 623772,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.826558421987521
+        },
+        "epilogue": {
+          "cycles": 13560,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30206489675516224
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se4_sm1_sl0_wv0.json",
+        "se4_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13036,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.35348266339367906
+        },
+        "mainloop": {
+          "cycles": 791096,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6517337971624177
+        },
+        "epilogue": {
+          "cycles": 14244,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2875596742488065
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se4_sm1_sl0_wv1.json",
+        "se4_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9748,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47271235125153876
+        },
+        "mainloop": {
+          "cycles": 560972,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9190904358862831
+        },
+        "epilogue": {
+          "cycles": 13456,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30439952437574314
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se4_sm1_sl0_wv2.json",
+        "se4_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10604,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4345529988683516
+        },
+        "mainloop": {
+          "cycles": 623700,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8266538399871733
+        },
+        "epilogue": {
+          "cycles": 13688,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2992402104032729
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se4_sm2_sl0_wv0.json",
+        "se4_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12928,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3564356435643564
+        },
+        "mainloop": {
+          "cycles": 791212,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6516382461337795
+        },
+        "epilogue": {
+          "cycles": 14348,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.285475327571787
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se4_sm2_sl0_wv1.json",
+        "se4_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9740,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4731006160164271
+        },
+        "mainloop": {
+          "cycles": 560976,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9190838823764297
+        },
+        "epilogue": {
+          "cycles": 13332,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30723072307230725
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se4_sm2_sl0_wv2.json",
+        "se4_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10496,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.43902439024390244
+        },
+        "mainloop": {
+          "cycles": 623776,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8265531216334069
+        },
+        "epilogue": {
+          "cycles": 13640,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3002932551319648
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se4_sm3_sl0_wv0.json",
+        "se4_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12916,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3567668008671415
+        },
+        "mainloop": {
+          "cycles": 791324,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6515460165494791
+        },
+        "epilogue": {
+          "cycles": 14284,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28675441052926354
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se4_sm3_sl0_wv1.json",
+        "se4_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9744,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4729064039408867
+        },
+        "mainloop": {
+          "cycles": 560976,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9190838823764297
+        },
+        "epilogue": {
+          "cycles": 13508,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30322771690849865
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        4,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se4_sm3_sl0_wv2.json",
+        "se4_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10500,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.43885714285714283
+        },
+        "mainloop": {
+          "cycles": 623884,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8264100377634304
+        },
+        "epilogue": {
+          "cycles": 13724,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29845526085689306
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se5_sm0_sl0_wv0.json",
+        "se5_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13368,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.34470377019748655
+        },
+        "mainloop": {
+          "cycles": 790360,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6523407055012905
+        },
+        "epilogue": {
+          "cycles": 14136,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.289756649688738
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se5_sm0_sl0_wv1.json",
+        "se5_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9952,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4630225080385852
+        },
+        "mainloop": {
+          "cycles": 560680,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.919569094670757
+        },
+        "epilogue": {
+          "cycles": 13148,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3115302707636142
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se5_sm0_sl0_wv2.json",
+        "se5_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9596,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.48020008336807
+        },
+        "mainloop": {
+          "cycles": 523132,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9855715192341512
+        },
+        "epilogue": {
+          "cycles": 13300,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30796992481203006
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se5_sm0_sl0_wv3.json",
+        "se5_sm0_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9772,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4715513712648383
+        },
+        "mainloop": {
+          "cycles": 521652,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883677240765875
+        },
+        "epilogue": {
+          "cycles": 13160,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.31124620060790276
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se5_sm1_sl0_wv0.json",
+        "se5_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13476,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3419412288512912
+        },
+        "mainloop": {
+          "cycles": 790248,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6524331602231198
+        },
+        "epilogue": {
+          "cycles": 14256,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.287317620650954
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se5_sm1_sl0_wv1.json",
+        "se5_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9964,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4624648735447611
+        },
+        "mainloop": {
+          "cycles": 560680,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.919569094670757
+        },
+        "epilogue": {
+          "cycles": 13308,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30778479110309587
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se5_sm1_sl0_wv2.json",
+        "se5_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9604,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47980008329862556
+        },
+        "mainloop": {
+          "cycles": 523132,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9855715192341512
+        },
+        "epilogue": {
+          "cycles": 13312,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3076923076923077
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se5_sm1_sl0_wv3.json",
+        "se5_sm1_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9768,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47174447174447176
+        },
+        "mainloop": {
+          "cycles": 521652,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883677240765875
+        },
+        "epilogue": {
+          "cycles": 13424,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30512514898688914
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se5_sm2_sl0_wv0.json",
+        "se5_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13368,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.34470377019748655
+        },
+        "mainloop": {
+          "cycles": 790364,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6523374040315602
+        },
+        "epilogue": {
+          "cycles": 14260,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28723702664796635
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se5_sm2_sl0_wv1.json",
+        "se5_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9972,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4620938628158845
+        },
+        "mainloop": {
+          "cycles": 560680,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.919569094670757
+        },
+        "epilogue": {
+          "cycles": 13216,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3099273607748184
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se5_sm2_sl0_wv2.json",
+        "se5_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9596,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.48020008336807
+        },
+        "mainloop": {
+          "cycles": 523132,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9855715192341512
+        },
+        "epilogue": {
+          "cycles": 13416,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3053070960047704
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se5_sm2_sl0_wv3.json",
+        "se5_sm2_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9772,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4715513712648383
+        },
+        "mainloop": {
+          "cycles": 521652,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883677240765875
+        },
+        "epilogue": {
+          "cycles": 13356,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3066786463012878
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se5_sm3_sl0_wv0.json",
+        "se5_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13356,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3450134770889488
+        },
+        "mainloop": {
+          "cycles": 790476,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6522449764445727
+        },
+        "epilogue": {
+          "cycles": 14260,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28723702664796635
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se5_sm3_sl0_wv1.json",
+        "se5_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9960,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46265060240963857
+        },
+        "mainloop": {
+          "cycles": 560724,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9194969361040369
+        },
+        "epilogue": {
+          "cycles": 13376,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3062200956937799
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se5_sm3_sl0_wv2.json",
+        "se5_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9600,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.48
+        },
+        "mainloop": {
+          "cycles": 523132,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9855715192341512
+        },
+        "epilogue": {
+          "cycles": 13468,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3041283041283041
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        5,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se5_sm3_sl0_wv3.json",
+        "se5_sm3_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9776,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4713584288052373
+        },
+        "mainloop": {
+          "cycles": 521652,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9883677240765875
+        },
+        "epilogue": {
+          "cycles": 13240,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3093655589123867
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se6_sm0_sl0_wv0.json",
+        "se6_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12920,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.356656346749226
+        },
+        "mainloop": {
+          "cycles": 791304,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6515624842032898
+        },
+        "epilogue": {
+          "cycles": 14096,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2905788876276958
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se6_sm0_sl0_wv1.json",
+        "se6_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9752,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4725184577522559
+        },
+        "mainloop": {
+          "cycles": 560672,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.919582215626962
+        },
+        "epilogue": {
+          "cycles": 13352,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3067705212702217
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se6_sm0_sl0_wv2.json",
+        "se6_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9684,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4758364312267658
+        },
+        "mainloop": {
+          "cycles": 522772,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9862502199811772
+        },
+        "epilogue": {
+          "cycles": 13016,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3146896127842655
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se6_sm0_sl0_wv3.json",
+        "se6_sm0_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9712,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4744645799011532
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13092,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.31286281698747326
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se6_sm1_sl0_wv0.json",
+        "se6_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12916,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3567668008671415
+        },
+        "mainloop": {
+          "cycles": 791328,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6515427231186057
+        },
+        "epilogue": {
+          "cycles": 14096,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2905788876276958
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se6_sm1_sl0_wv1.json",
+        "se6_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9748,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47271235125153876
+        },
+        "mainloop": {
+          "cycles": 560696,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9195428538816043
+        },
+        "epilogue": {
+          "cycles": 13480,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3038575667655786
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se6_sm1_sl0_wv2.json",
+        "se6_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9696,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4752475247524752
+        },
+        "mainloop": {
+          "cycles": 522772,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9862502199811772
+        },
+        "epilogue": {
+          "cycles": 13144,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.31162507608034085
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se6_sm1_sl0_wv3.json",
+        "se6_sm1_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9720,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4740740740740741
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13336,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30713857228554287
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se6_sm2_sl0_wv0.json",
+        "se6_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12924,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3565459610027855
+        },
+        "mainloop": {
+          "cycles": 791304,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6515624842032898
+        },
+        "epilogue": {
+          "cycles": 14192,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28861330326944756
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se6_sm2_sl0_wv1.json",
+        "se6_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9752,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4725184577522559
+        },
+        "mainloop": {
+          "cycles": 560672,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.919582215626962
+        },
+        "epilogue": {
+          "cycles": 13468,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3041283041283041
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se6_sm2_sl0_wv2.json",
+        "se6_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9704,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4748557295960429
+        },
+        "mainloop": {
+          "cycles": 522772,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9862502199811772
+        },
+        "epilogue": {
+          "cycles": 13192,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.31049120679199516
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se6_sm2_sl0_wv3.json",
+        "se6_sm2_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9712,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4744645799011532
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13220,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30983358547655065
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se6_sm3_sl0_wv0.json",
+        "se6_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13040,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.35337423312883437
+        },
+        "mainloop": {
+          "cycles": 791300,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6515657778339441
+        },
+        "epilogue": {
+          "cycles": 14208,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2882882882882883
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se6_sm3_sl0_wv1.json",
+        "se6_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9740,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4731006160164271
+        },
+        "mainloop": {
+          "cycles": 560672,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.919582215626962
+        },
+        "epilogue": {
+          "cycles": 13380,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30612855007473844
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se6_sm3_sl0_wv2.json",
+        "se6_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9692,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4754436648782501
+        },
+        "mainloop": {
+          "cycles": 522772,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9862502199811772
+        },
+        "epilogue": {
+          "cycles": 13212,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3100211928549803
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        6,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se6_sm3_sl0_wv3.json",
+        "se6_sm3_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9716,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47426924660354053
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13208,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.31011508176862507
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se7_sm0_sl0_wv0.json",
+        "se7_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12864,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3582089552238806
+        },
+        "mainloop": {
+          "cycles": 791216,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6516349517704394
+        },
+        "epilogue": {
+          "cycles": 13848,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29578278451761986
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se7_sm0_sl0_wv1.json",
+        "se7_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9860,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46734279918864097
+        },
+        "mainloop": {
+          "cycles": 561036,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9189855909424707
+        },
+        "epilogue": {
+          "cycles": 13388,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3059456229459217
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se7_sm0_sl0_wv2.json",
+        "se7_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9796,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4703960800326664
+        },
+        "mainloop": {
+          "cycles": 522556,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9866578892979891
+        },
+        "epilogue": {
+          "cycles": 13324,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3074151906334434
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se7_sm0_sl0_wv3.json",
+        "se7_sm0_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9776,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4713584288052373
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13212,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3100211928549803
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se7_sm1_sl0_wv0.json",
+        "se7_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12908,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3569879144716455
+        },
+        "mainloop": {
+          "cycles": 791168,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.651674486329073
+        },
+        "epilogue": {
+          "cycles": 13956,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.293493837775867
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se7_sm1_sl0_wv1.json",
+        "se7_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9872,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46677471636953
+        },
+        "mainloop": {
+          "cycles": 561144,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9188087193305106
+        },
+        "epilogue": {
+          "cycles": 13436,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3048526347127121
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se7_sm1_sl0_wv2.json",
+        "se7_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9804,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4700122399020808
+        },
+        "mainloop": {
+          "cycles": 522556,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9866578892979891
+        },
+        "epilogue": {
+          "cycles": 13336,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30713857228554287
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se7_sm1_sl0_wv3.json",
+        "se7_sm1_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9772,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4715513712648383
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13468,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3041283041283041
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se7_sm2_sl0_wv0.json",
+        "se7_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12868,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.35809760646565125
+        },
+        "mainloop": {
+          "cycles": 791216,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6516349517704394
+        },
+        "epilogue": {
+          "cycles": 14004,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2924878606112539
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se7_sm2_sl0_wv1.json",
+        "se7_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9880,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46639676113360323
+        },
+        "mainloop": {
+          "cycles": 561032,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9189921430506638
+        },
+        "epilogue": {
+          "cycles": 13468,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3041283041283041
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se7_sm2_sl0_wv2.json",
+        "se7_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9796,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4703960800326664
+        },
+        "mainloop": {
+          "cycles": 522556,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9866578892979891
+        },
+        "epilogue": {
+          "cycles": 13444,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3046712288009521
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se7_sm2_sl0_wv3.json",
+        "se7_sm2_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9776,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4713584288052373
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13412,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3053981509096332
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se7_sm3_sl0_wv0.json",
+        "se7_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12980,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3550077041602465
+        },
+        "mainloop": {
+          "cycles": 791204,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6516448349603895
+        },
+        "epilogue": {
+          "cycles": 13992,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29273870783304745
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se7_sm3_sl0_wv1.json",
+        "se7_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9868,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46696392379408186
+        },
+        "mainloop": {
+          "cycles": 561072,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.918926626172755
+        },
+        "epilogue": {
+          "cycles": 13404,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30558042375410327
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se7_sm3_sl0_wv2.json",
+        "se7_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9800,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47020408163265304
+        },
+        "mainloop": {
+          "cycles": 522556,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9866578892979891
+        },
+        "epilogue": {
+          "cycles": 13492,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30358731099911057
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        7,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se7_sm3_sl0_wv3.json",
+        "se7_sm3_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9780,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47116564417177914
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13288,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3082480433473811
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se8_sm0_sl0_wv0.json",
+        "se8_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13088,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.35207823960880197
+        },
+        "mainloop": {
+          "cycles": 787956,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6543309524897329
+        },
+        "epilogue": {
+          "cycles": 14152,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28942905596382135
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se8_sm0_sl0_wv1.json",
+        "se8_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9740,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4731006160164271
+        },
+        "mainloop": {
+          "cycles": 578488,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8912613571932347
+        },
+        "epilogue": {
+          "cycles": 13632,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3004694835680751
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se8_sm0_sl0_wv2.json",
+        "se8_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9652,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4774140074595939
+        },
+        "mainloop": {
+          "cycles": 522916,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9859786275424733
+        },
+        "epilogue": {
+          "cycles": 13468,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3041283041283041
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se8_sm0_sl0_wv3.json",
+        "se8_sm0_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9692,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4754436648782501
+        },
+        "mainloop": {
+          "cycles": 524160,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9836385836385836
+        },
+        "epilogue": {
+          "cycles": 13140,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3117199391171994
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se8_sm1_sl0_wv0.json",
+        "se8_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13116,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3513266239707228
+        },
+        "mainloop": {
+          "cycles": 787924,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6543575268680736
+        },
+        "epilogue": {
+          "cycles": 14260,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28723702664796635
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se8_sm1_sl0_wv1.json",
+        "se8_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9736,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4732949876746097
+        },
+        "mainloop": {
+          "cycles": 578488,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8912613571932347
+        },
+        "epilogue": {
+          "cycles": 13908,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29450675870002874
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se8_sm1_sl0_wv2.json",
+        "se8_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9664,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4768211920529801
+        },
+        "mainloop": {
+          "cycles": 522916,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9859786275424733
+        },
+        "epilogue": {
+          "cycles": 13728,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29836829836829837
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se8_sm1_sl0_wv3.json",
+        "se8_sm1_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9700,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47505154639175257
+        },
+        "mainloop": {
+          "cycles": 524160,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9836385836385836
+        },
+        "epilogue": {
+          "cycles": 13164,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.31115162564570037
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se8_sm2_sl0_wv0.json",
+        "se8_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13088,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.35207823960880197
+        },
+        "mainloop": {
+          "cycles": 787956,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6543309524897329
+        },
+        "epilogue": {
+          "cycles": 14324,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2859536442334543
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se8_sm2_sl0_wv1.json",
+        "se8_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9740,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4731006160164271
+        },
+        "mainloop": {
+          "cycles": 578488,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8912613571932347
+        },
+        "epilogue": {
+          "cycles": 13788,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2970699158688715
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se8_sm2_sl0_wv2.json",
+        "se8_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9664,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4768211920529801
+        },
+        "mainloop": {
+          "cycles": 522916,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9859786275424733
+        },
+        "epilogue": {
+          "cycles": 13552,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3022432113341204
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se8_sm2_sl0_wv3.json",
+        "se8_sm2_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9688,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4756399669694467
+        },
+        "mainloop": {
+          "cycles": 524160,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9836385836385836
+        },
+        "epilogue": {
+          "cycles": 13284,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30834086118638965
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se8_sm3_sl0_wv0.json",
+        "se8_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13212,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.34877384196185285
+        },
+        "mainloop": {
+          "cycles": 787948,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6543375958819617
+        },
+        "epilogue": {
+          "cycles": 14232,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28780213603147836
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se8_sm3_sl0_wv1.json",
+        "se8_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9736,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4732949876746097
+        },
+        "mainloop": {
+          "cycles": 578600,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8910888351192534
+        },
+        "epilogue": {
+          "cycles": 13836,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29603931772188496
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se8_sm3_sl0_wv2.json",
+        "se8_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9660,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47701863354037266
+        },
+        "mainloop": {
+          "cycles": 522916,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9859786275424733
+        },
+        "epilogue": {
+          "cycles": 13520,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3029585798816568
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        8,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se8_sm3_sl0_wv3.json",
+        "se8_sm3_sl1_wv3.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9700,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47505154639175257
+        },
+        "mainloop": {
+          "cycles": 524160,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9836385836385836
+        },
+        "epilogue": {
+          "cycles": 13300,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30796992481203006
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se9_sm0_sl0_wv0.json",
+        "se9_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13300,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3464661654135338
+        },
+        "mainloop": {
+          "cycles": 787848,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6544206496684639
+        },
+        "epilogue": {
+          "cycles": 14312,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28619340413638905
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se9_sm0_sl0_wv1.json",
+        "se9_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11752,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.39210347174948945
+        },
+        "mainloop": {
+          "cycles": 661900,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.7789454600392809
+        },
+        "epilogue": {
+          "cycles": 13408,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3054892601431981
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se9_sm0_sl0_wv2.json",
+        "se9_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9616,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47920133111480867
+        },
+        "mainloop": {
+          "cycles": 558668,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9228808523130017
+        },
+        "epilogue": {
+          "cycles": 13944,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2937464142283419
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se9_sm1_sl0_wv0.json",
+        "se9_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13420,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.34336810730253353
+        },
+        "mainloop": {
+          "cycles": 787764,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6544904311443529
+        },
+        "epilogue": {
+          "cycles": 14288,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2866741321388578
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se9_sm1_sl0_wv1.json",
+        "se9_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11764,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3917035022101326
+        },
+        "mainloop": {
+          "cycles": 662008,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.7788183828594216
+        },
+        "epilogue": {
+          "cycles": 13568,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3018867924528302
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se9_sm1_sl0_wv2.json",
+        "se9_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9624,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47880299251870323
+        },
+        "mainloop": {
+          "cycles": 558776,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9227024782739416
+        },
+        "epilogue": {
+          "cycles": 13968,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.293241695303551
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se9_sm2_sl0_wv0.json",
+        "se9_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13296,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.34657039711191334
+        },
+        "mainloop": {
+          "cycles": 787852,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6544173271121987
+        },
+        "epilogue": {
+          "cycles": 14432,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2838137472283814
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se9_sm2_sl0_wv1.json",
+        "se9_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11768,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.39157036029911624
+        },
+        "mainloop": {
+          "cycles": 661896,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.7789501673978994
+        },
+        "epilogue": {
+          "cycles": 13620,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30073421439060205
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se9_sm2_sl0_wv2.json",
+        "se9_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9612,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4794007490636704
+        },
+        "mainloop": {
+          "cycles": 558672,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9228742446372827
+        },
+        "epilogue": {
+          "cycles": 14080,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2909090909090909
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se9_sm3_sl0_wv0.json",
+        "se9_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 13332,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.34563456345634563
+        },
+        "mainloop": {
+          "cycles": 787920,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6543608488171387
+        },
+        "epilogue": {
+          "cycles": 14364,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2851573377889167
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se9_sm3_sl0_wv1.json",
+        "se9_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 11876,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.388009430784776
+        },
+        "mainloop": {
+          "cycles": 661824,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.7790349095832124
+        },
+        "epilogue": {
+          "cycles": 13456,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30439952437574314
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        9,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se9_sm3_sl0_wv2.json",
+        "se9_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9624,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47880299251870323
+        },
+        "mainloop": {
+          "cycles": 558708,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9228147798134267
+        },
+        "epilogue": {
+          "cycles": 14148,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28951088493073224
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se12_sm0_sl0_wv0.json",
+        "se12_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12452,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.37006103437198845
+        },
+        "mainloop": {
+          "cycles": 792644,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6504609887919419
+        },
+        "epilogue": {
+          "cycles": 14084,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2908264697529111
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se12_sm0_sl0_wv1.json",
+        "se12_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10060,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.458051689860835
+        },
+        "mainloop": {
+          "cycles": 555864,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.927536231884058
+        },
+        "epilogue": {
+          "cycles": 13372,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30631169608136405
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se12_sm0_sl0_wv2.json",
+        "se12_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9792,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47058823529411764
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13900,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29467625899280575
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se12_sm1_sl0_wv0.json",
+        "se12_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12544,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3673469387755102
+        },
+        "mainloop": {
+          "cycles": 792556,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6505332115333176
+        },
+        "epilogue": {
+          "cycles": 14192,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28861330326944756
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se12_sm1_sl0_wv1.json",
+        "se12_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10052,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45841623557500993
+        },
+        "mainloop": {
+          "cycles": 555864,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.927536231884058
+        },
+        "epilogue": {
+          "cycles": 13628,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3005576753742295
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se12_sm1_sl0_wv2.json",
+        "se12_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9784,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47097301717089124
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 14144,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2895927601809955
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se12_sm2_sl0_wv0.json",
+        "se12_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12444,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3702989392478303
+        },
+        "mainloop": {
+          "cycles": 792648,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6504577063210908
+        },
+        "epilogue": {
+          "cycles": 14024,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29207073588134624
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se12_sm2_sl0_wv1.json",
+        "se12_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10052,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45841623557500993
+        },
+        "mainloop": {
+          "cycles": 555864,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.927536231884058
+        },
+        "epilogue": {
+          "cycles": 13556,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3021540277367955
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se12_sm2_sl0_wv2.json",
+        "se12_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9788,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47078054760931753
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 14028,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2919874536641004
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se12_sm3_sl0_wv0.json",
+        "se12_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12460,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.36982343499197434
+        },
+        "mainloop": {
+          "cycles": 792752,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6503723737057743
+        },
+        "epilogue": {
+          "cycles": 13988,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2928224192164713
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se12_sm3_sl0_wv1.json",
+        "se12_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10060,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.458051689860835
+        },
+        "mainloop": {
+          "cycles": 555864,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.927536231884058
+        },
+        "epilogue": {
+          "cycles": 13452,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3044900386559619
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        12,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se12_sm3_sl0_wv2.json",
+        "se12_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9780,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47116564417177914
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 14212,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28820714888826343
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se13_sm0_sl0_wv0.json",
+        "se13_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12552,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.367112810707457
+        },
+        "mainloop": {
+          "cycles": 792364,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6506908441070013
+        },
+        "epilogue": {
+          "cycles": 14248,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.287478944413251
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se13_sm0_sl0_wv1.json",
+        "se13_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10140,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4544378698224852
+        },
+        "mainloop": {
+          "cycles": 555780,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9276764187268344
+        },
+        "epilogue": {
+          "cycles": 13240,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3093655589123867
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se13_sm0_sl0_wv2.json",
+        "se13_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9856,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4675324675324675
+        },
+        "mainloop": {
+          "cycles": 521760,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.988163140141061
+        },
+        "epilogue": {
+          "cycles": 13844,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2958682461716267
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se13_sm1_sl0_wv0.json",
+        "se13_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12668,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3637511840858857
+        },
+        "mainloop": {
+          "cycles": 792264,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6507729746650106
+        },
+        "epilogue": {
+          "cycles": 14248,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.287478944413251
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se13_sm1_sl0_wv1.json",
+        "se13_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10148,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45407962160031534
+        },
+        "mainloop": {
+          "cycles": 555780,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9276764187268344
+        },
+        "epilogue": {
+          "cycles": 13484,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30376742806288937
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se13_sm1_sl0_wv2.json",
+        "se13_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9860,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46734279918864097
+        },
+        "mainloop": {
+          "cycles": 521760,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.988163140141061
+        },
+        "epilogue": {
+          "cycles": 14088,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29074389551391255
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se13_sm2_sl0_wv0.json",
+        "se13_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12544,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3673469387755102
+        },
+        "mainloop": {
+          "cycles": 792368,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6506875593158734
+        },
+        "epilogue": {
+          "cycles": 14184,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2887760857304005
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se13_sm2_sl0_wv1.json",
+        "se13_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10152,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45390070921985815
+        },
+        "mainloop": {
+          "cycles": 555780,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9276764187268344
+        },
+        "epilogue": {
+          "cycles": 13432,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3049434187016081
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se13_sm2_sl0_wv2.json",
+        "se13_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9848,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.46791226645004064
+        },
+        "mainloop": {
+          "cycles": 521760,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.988163140141061
+        },
+        "epilogue": {
+          "cycles": 13976,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29307384087006294
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se13_sm3_sl0_wv0.json",
+        "se13_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12576,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.366412213740458
+        },
+        "mainloop": {
+          "cycles": 792436,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6506317229404015
+        },
+        "epilogue": {
+          "cycles": 14260,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28723702664796635
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se13_sm3_sl0_wv1.json",
+        "se13_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10144,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45425867507886436
+        },
+        "mainloop": {
+          "cycles": 555780,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9276764187268344
+        },
+        "epilogue": {
+          "cycles": 13500,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3034074074074074
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        13,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se13_sm3_sl0_wv2.json",
+        "se13_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9856,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4675324675324675
+        },
+        "mainloop": {
+          "cycles": 521760,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.988163140141061
+        },
+        "epilogue": {
+          "cycles": 13960,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2934097421203438
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se14_sm0_sl0_wv0.json",
+        "se14_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12780,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.36056338028169016
+        },
+        "mainloop": {
+          "cycles": 792356,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6506974137887516
+        },
+        "epilogue": {
+          "cycles": 14024,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29207073588134624
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se14_sm0_sl0_wv1.json",
+        "se14_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10100,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45623762376237625
+        },
+        "mainloop": {
+          "cycles": 555996,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9273160238562868
+        },
+        "epilogue": {
+          "cycles": 13188,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3105853806490749
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se14_sm0_sl0_wv2.json",
+        "se14_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9780,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47116564417177914
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13776,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29732868757259
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se14_sm1_sl0_wv0.json",
+        "se14_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12784,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.360450563204005
+        },
+        "mainloop": {
+          "cycles": 792356,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6506974137887516
+        },
+        "epilogue": {
+          "cycles": 14048,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29157175398633256
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se14_sm1_sl0_wv1.json",
+        "se14_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10092,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45659928656361476
+        },
+        "mainloop": {
+          "cycles": 555996,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9273160238562868
+        },
+        "epilogue": {
+          "cycles": 13308,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30778479110309587
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se14_sm1_sl0_wv2.json",
+        "se14_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9772,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4715513712648383
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 14068,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2911572362809212
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se14_sm2_sl0_wv0.json",
+        "se14_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12772,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3607892264328218
+        },
+        "mainloop": {
+          "cycles": 792360,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6506941289312939
+        },
+        "epilogue": {
+          "cycles": 13960,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2934097421203438
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se14_sm2_sl0_wv1.json",
+        "se14_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10096,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45641838351822506
+        },
+        "mainloop": {
+          "cycles": 555996,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9273160238562868
+        },
+        "epilogue": {
+          "cycles": 13364,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3064950613588746
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se14_sm2_sl0_wv2.json",
+        "se14_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9776,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.4713584288052373
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 13956,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.293493837775867
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se14_sm3_sl0_wv0.json",
+        "se14_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12780,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.36056338028169016
+        },
+        "mainloop": {
+          "cycles": 792472,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6506021663856894
+        },
+        "epilogue": {
+          "cycles": 14008,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2924043403769275
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se14_sm3_sl0_wv1.json",
+        "se14_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10104,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45605700712589076
+        },
+        "mainloop": {
+          "cycles": 555996,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9273160238562868
+        },
+        "epilogue": {
+          "cycles": 13388,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3059456229459217
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        14,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se14_sm3_sl0_wv2.json",
+        "se14_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 9768,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.47174447174447176
+        },
+        "mainloop": {
+          "cycles": 521632,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9884056192871603
+        },
+        "epilogue": {
+          "cycles": 14140,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28967468175388966
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se15_sm0_sl0_wv0.json",
+        "se15_sm0_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12496,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3687580025608195
+        },
+        "mainloop": {
+          "cycles": 792320,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6507269789983845
+        },
+        "epilogue": {
+          "cycles": 14148,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28951088493073224
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se15_sm0_sl0_wv1.json",
+        "se15_sm0_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10152,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45390070921985815
+        },
+        "mainloop": {
+          "cycles": 555728,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9277632222957994
+        },
+        "epilogue": {
+          "cycles": 13464,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.30421865715983365
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        0
+      ],
+      "wave_files": [
+        "se15_sm0_sl0_wv2.json",
+        "se15_sm0_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12324,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.373904576436222
+        },
+        "mainloop": {
+          "cycles": 625044,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8248763287064591
+        },
+        "epilogue": {
+          "cycles": 13544,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3024217365623154
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se15_sm1_sl0_wv0.json",
+        "se15_sm1_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12532,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.36769869135014366
+        },
+        "mainloop": {
+          "cycles": 792276,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.650763117903357
+        },
+        "epilogue": {
+          "cycles": 14264,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2871564778463264
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se15_sm1_sl0_wv1.json",
+        "se15_sm1_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10160,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45354330708661417
+        },
+        "mainloop": {
+          "cycles": 555728,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9277632222957994
+        },
+        "epilogue": {
+          "cycles": 13716,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29862933799941677
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        1
+      ],
+      "wave_files": [
+        "se15_sm1_sl0_wv2.json",
+        "se15_sm1_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12376,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.37233354880413705
+        },
+        "mainloop": {
+          "cycles": 625036,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8248868865153367
+        },
+        "epilogue": {
+          "cycles": 13516,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3030482391240012
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se15_sm2_sl0_wv0.json",
+        "se15_sm2_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12492,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3688760806916426
+        },
+        "mainloop": {
+          "cycles": 792320,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6507269789983845
+        },
+        "epilogue": {
+          "cycles": 14060,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.29132290184921766
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se15_sm2_sl0_wv1.json",
+        "se15_sm2_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10160,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45354330708661417
+        },
+        "mainloop": {
+          "cycles": 555728,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9277632222957994
+        },
+        "epilogue": {
+          "cycles": 13664,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2997658079625293
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        2
+      ],
+      "wave_files": [
+        "se15_sm2_sl0_wv2.json",
+        "se15_sm2_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12324,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.373904576436222
+        },
+        "mainloop": {
+          "cycles": 625040,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.824881607577115
+        },
+        "epilogue": {
+          "cycles": 13660,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.2998535871156662
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se15_sm3_sl0_wv0.json",
+        "se15_sm3_sl1_wv0.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12604,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.365598222786417
+        },
+        "mainloop": {
+          "cycles": 792312,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.6507335494098284
+        },
+        "epilogue": {
+          "cycles": 14216,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.28812605514912776
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se15_sm3_sl0_wv1.json",
+        "se15_sm3_sl1_wv1.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 10152,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.45390070921985815
+        },
+        "mainloop": {
+          "cycles": 555728,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.9277632222957994
+        },
+        "epilogue": {
+          "cycles": 13540,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3025110782865583
+        }
+      }
+    },
+    {
+      "physical_simd": [
+        15,
+        0,
+        3
+      ],
+      "wave_files": [
+        "se15_sm3_sl0_wv2.json",
+        "se15_sm3_sl1_wv2.json"
+      ],
+      "phases": {
+        "prologue": {
+          "cycles": 12444,
+          "mfma_busy_cycles": 4608,
+          "mfma_efficiency": 0.3702989392478303
+        },
+        "mainloop": {
+          "cycles": 625036,
+          "mfma_busy_cycles": 515584,
+          "mfma_efficiency": 0.8248868865153367
+        },
+        "epilogue": {
+          "cycles": 13592,
+          "mfma_busy_cycles": 4096,
+          "mfma_efficiency": 0.3013537374926427
+        }
+      }
+    }
+  ]
+}

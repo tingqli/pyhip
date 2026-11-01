@@ -23,6 +23,9 @@ def gemm_a8w8_blockscale_8wave_gfx942(
     assert N % 16 == 0 and K >= 128 and K % 128 == 0
     tile_m, tile_n, tile_k = 256, 256, 128
     block_m, block_n = tb_swizzle(J, J.blockIdx.x, M, tile_m, tile_n, N, 8, 8)
+    packet_phase = (
+        J.gpr("su32", (J.blockIdx.x // 4) & 3) if preshuffle_b and N == 4096 else 0
+    )
     row_base = J.gpr("su32", block_m * tile_m)
     col_base = J.gpr("su32", block_n * tile_n)
     rows = J.gpr("su32")
@@ -52,7 +55,7 @@ def gemm_a8w8_blockscale_8wave_gfx942(
     # Row-dependent offsets stay in voffset: gfx9 raw buffers do not range-check soffset.
     load_b = J.gpr(4, "vu32")
     for packet in range(4):
-        load_b[packet] = lane_b + packet * (packet_n * K)
+        load_b[packet] = lane_b + (packet ^ packet_phase) * (packet_n * K)
     buffer_a = J.Buffer(pA, rows * K)
     buffer_b = J.Buffer(pB, cols * K)
     buffer_c = J.Buffer(pC, rows * (N * 2))
@@ -69,10 +72,18 @@ def gemm_a8w8_blockscale_8wave_gfx942(
         load_scale_a[m_slice] = load_scale_a[m_slice] * 4
     scale_rows_b = (N + 127) // 128
     scale_offset_b = J.gpr(2, "su32")
-    scale_offset_b[0] = (col_base // 128) * ((K // 128) * 4)
-    scale_offset_b[1] = scale_offset_b[0] + (K // 128) * 4
+    if preshuffle_b and N == 4096:
+        scale_offset_b[0] = (col_base // 128 + packet_phase // 2) * ((K // 128) * 4)
+        scale_offset_b[1] = (col_base // 128 + (1 ^ (packet_phase // 2))) * (
+            (K // 128) * 4
+        )
+    else:
+        scale_offset_b[0] = (col_base // 128) * ((K // 128) * 4)
+        scale_offset_b[1] = scale_offset_b[0] + (K // 128) * 4
     # The last N tile may have no second 128-column scale row.
-    J.s_min_u32(scale_offset_b[1], scale_offset_b[1], (scale_rows_b - 1) * (K // 128) * 4)
+    J.s_min_u32(
+        scale_offset_b[1], scale_offset_b[1], (scale_rows_b - 1) * (K // 128) * 4
+    )
     load_a = J.gpr(2, 2, "vu32")
     read_b = J.gpr(2, "vu32")
     for half_k in range(2):
@@ -100,7 +111,9 @@ def gemm_a8w8_blockscale_8wave_gfx942(
             return
         m_slice, half_k = divmod(part, 2)
         offset = k_offset + 128 if ahead else k_offset
-        buffer_a.load_dwordx4(operands_a[slot, m_slice, half_k], load_a[m_slice, half_k], offset)
+        buffer_a.load_dwordx4(
+            operands_a[slot, m_slice, half_k], load_a[m_slice, half_k], offset
+        )
 
     def prefetch_scale_b(slot, ahead):
         for col_index in range(2):
@@ -136,7 +149,9 @@ def gemm_a8w8_blockscale_8wave_gfx942(
         if q % 4 == 0 and q:
             needed += [("a", q // 4, part) for part in a_order]
         wait_budgets.append(
-            len(requests) - 1 - max(requests.index(t) for t in needed) if needed else None
+            len(requests) - 1 - max(requests.index(t) for t in needed)
+            if needed
+            else None
         )
         requests += stage_tokens(q)
     for q in range(4, total_packets - 4):
@@ -148,7 +163,8 @@ def gemm_a8w8_blockscale_8wave_gfx942(
             if wait_budgets[q] is not None:
                 J.s_waitcnt(mod=f"vmcnt({wait_budgets[q]})")
                 J.ds_write_b128(
-                    write_b, staging_b[packet % 2],
+                    write_b,
+                    staging_b[packet % 2],
                     mod=f"offset:{lds_b + ((packet + 1) % 4) * packet_bytes}",
                 )
             for token in stage_tokens(q):
@@ -159,7 +175,8 @@ def gemm_a8w8_blockscale_8wave_gfx942(
             for rep_n in range(4):
                 for half_k in range(2):
                     J.ds_read_b128(
-                        operands_b[rep_n, half_k], read_b[half_k],
+                        operands_b[rep_n, half_k],
+                        read_b[half_k],
                         mod=f"offset:{lds_b + packet * packet_bytes + rep_n * 16 * 128}",
                     )
             J.s_waitcnt(mod="lgkmcnt(8)")
@@ -177,22 +194,30 @@ def gemm_a8w8_blockscale_8wave_gfx942(
                     half_k, word_pair = divmod(k_step, 2)
                     J.v_mfma_f32_16x16x32_fp8_fp8(
                         partial[rep_n],
-                        operands_b[rep_n, half_k, word_pair * 2:word_pair * 2 + 1],
-                        operands_a[slot, m_slice, half_k, word_pair * 2:word_pair * 2 + 1],
+                        operands_b[rep_n, half_k, word_pair * 2 : word_pair * 2 + 1],
+                        operands_a[
+                            slot, m_slice, half_k, word_pair * 2 : word_pair * 2 + 1
+                        ],
                         0 if k_step == 0 else partial[rep_n],
                     )
                     if index == 0:
                         J.v_mul_f32(
-                            partial_scale[m_slice], scale_b[slot, packet // 2],
+                            partial_scale[m_slice],
+                            scale_b[slot, packet // 2],
                             scale_a[slot, m_slice],
                         )
                     if index < 8:
-                        dq_slice, dq_packet, dq_rep = 1 - m_slice, previous_packet, 2 + index // 4
+                        dq_slice, dq_packet, dq_rep = (
+                            1 - m_slice,
+                            previous_packet,
+                            2 + index // 4,
+                        )
                     else:
                         dq_slice, dq_packet, dq_rep = m_slice, packet, (index - 8) // 4
                     J.v_fmac_f32(
                         accum[dq_slice, dq_packet * 4 + dq_rep, index % 4],
-                        partial[dq_rep, index % 4], partial_scale[dq_slice],
+                        partial[dq_rep, index % 4],
+                        partial_scale[dq_slice],
                     )
             J.s_setprio(0)
             if not preshuffle_b:
@@ -242,18 +267,28 @@ def gemm_a8w8_blockscale_8wave_gfx942(
     output_col = J.gpr(col_base + ((lane_group & 1) * 2 + lane_group // 2) * 8)
     for m_slice in range(2):
         for rep_n in range(0, 16, 2):
-            column = J.gpr(output_col + rep_n * 16)
+            column = J.gpr(output_col + (rep_n ^ (packet_phase * 4)) * 16)
             offset = J.gpr((local_row + m_slice * 128) * (N * 2) + column * 2)
-            J.uni_cvt_pk_bf16_f32(packed[0], accum[m_slice, rep_n, 0], accum[m_slice, rep_n, 1])
-            J.uni_cvt_pk_bf16_f32(packed[1], accum[m_slice, rep_n, 2], accum[m_slice, rep_n, 3])
-            J.uni_cvt_pk_bf16_f32(packed[2], accum[m_slice, rep_n + 1, 0], accum[m_slice, rep_n + 1, 1])
-            J.uni_cvt_pk_bf16_f32(packed[3], accum[m_slice, rep_n + 1, 2], accum[m_slice, rep_n + 1, 3])
+            J.uni_cvt_pk_bf16_f32(
+                packed[0], accum[m_slice, rep_n, 0], accum[m_slice, rep_n, 1]
+            )
+            J.uni_cvt_pk_bf16_f32(
+                packed[1], accum[m_slice, rep_n, 2], accum[m_slice, rep_n, 3]
+            )
+            J.uni_cvt_pk_bf16_f32(
+                packed[2], accum[m_slice, rep_n + 1, 0], accum[m_slice, rep_n + 1, 1]
+            )
+            J.uni_cvt_pk_bf16_f32(
+                packed[3], accum[m_slice, rep_n + 1, 2], accum[m_slice, rep_n + 1, 3]
+            )
             for word in range(4):
                 J.ds_bpermute_b32(exchanged[word], exchange_lane, packed[word])
             J.s_waitcnt(mod="lgkmcnt(0)")
             J.v_cmp_ne_u32("vcc", odd_group, 0)
             for word in range(2):
                 J.v_cndmask_b32(packed[word], packed[word], exchanged[word + 2], "vcc")
-                J.v_cndmask_b32(packed[word + 2], exchanged[word], packed[word + 2], "vcc")
+                J.v_cndmask_b32(
+                    packed[word + 2], exchanged[word], packed[word + 2], "vcc"
+                )
             with J.ExecMask(column < N):
                 buffer_c.store_dwordx4(packed, offset, 0)

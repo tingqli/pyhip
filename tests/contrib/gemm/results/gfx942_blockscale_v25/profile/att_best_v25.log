@@ -1,0 +1,54 @@
+W20261031 00:22:04.339034 140413226983936 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.060590 sec
+W20261031 00:22:04.339556 140413226983936 simple_timer.cpp:55] [rocprofv3] 'python att_run.py 16384 3584 6144 1' ::     0.000000 sec
+W20261031 00:22:05.929411 139652229362176 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.063980 sec
+W20261031 00:22:05.929926 139652229362176 simple_timer.cpp:55] [rocprofv3] '/opt/rocm/llvm/bin/amdgpu-arch' ::     0.000000 sec
+W20261031 00:22:05.930100 139652229362176 simple_timer.cpp:55] [rocprofv3] '/opt/rocm/llvm/bin/amdgpu-arch' ::     0.000175 sec
+W20261031 00:22:05.930490 139652229362176 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000345 sec
+W20261031 00:22:05.930554 139652229362176 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000414 sec
+ATT_PTL_ENTRY True ['VECTOR', 'F8']
+W20261031 00:22:07.580508 140315329831424 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.065003 sec
+W20261031 00:22:07.581017 140315329831424 simple_timer.cpp:55] [rocprofv3] '/opt/rocm-7.2.4/bin/hipconfig --version' ::     0.000000 sec
+W20261031 00:22:07.693832 140278495552000 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.063603 sec
+W20261031 00:22:07.694257 140278495552000 simple_timer.cpp:55] [rocprofv3] 'sh -c -- /opt/rocm-7.2.4/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W20261031 00:22:07.809015 140094334689856 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.064190 sec
+W20261031 00:22:07.811078 140094334689856 simple_timer.cpp:55] [rocprofv3] '/opt/rocm-7.2.4/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W20261031 00:22:07.812331 140094334689856 simple_timer.cpp:55] [rocprofv3] '/opt/rocm-7.2.4/lib/llvm/bin/clang++ --version' ::     0.001253 sec
+W20261031 00:22:07.812757 140094334689856 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000377 sec
+W20261031 00:22:07.812829 140094334689856 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000455 sec
+W20261031 00:22:07.821364 140315329831424 simple_timer.cpp:55] [rocprofv3] '/opt/rocm-7.2.4/bin/hipconfig --version' ::     0.240347 sec
+W20261031 00:22:07.821710 140315329831424 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000309 sec
+W20261031 00:22:07.821764 140315329831424 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000368 sec
+W20261031 00:22:08.316801 140413226983936 tool.cpp:2422] HSA version 8.20.4 initialized (instance=0)
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+W20261031 00:22:08.838581 139673517556224 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.060337 sec
+W20261031 00:22:08.839074 139673517556224 simple_timer.cpp:55] [rocprofv3] '/bin/sh /sbin/ldconfig -p' ::     0.000000 sec
+E20261031 00:22:09.840418 140413226983936 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_gfx942_code_object_id_1.out
+E20261031 00:22:15.303610 140413226983936 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_gfx942_code_object_id_2.out
+E20261031 00:22:15.334368 140413226983936 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_gfx942_code_object_id_3.out
+E20261031 00:22:16.361259 140413226983936 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_gfx942_code_object_id_4.out
+E20261031 00:22:17.808692 140413226983936 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_gfx942_code_object_id_5.out
+E20261031 00:22:18.890390 140413226983936 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_gfx942_code_object_id_6.out
+E20261031 00:22:19.644112 140413226983936 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_gfx942_code_object_id_7.out
+W20261031 00:22:21.981894 139867627381312 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.065416 sec
+W20261031 00:22:21.982592 139867627381312 simple_timer.cpp:55] [rocprofv3] '/opt/rocm/llvm/bin/llvm-objdump --dynamic-syms --demangle /tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=3584-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co' ::     0.000000 sec
+W20261031 00:22:21.982865 139867627381312 simple_timer.cpp:55] [rocprofv3] '/opt/rocm/llvm/bin/llvm-objdump --dynamic-syms --demangle /tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=3584-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co' ::     0.000273 sec
+W20261031 00:22:21.983244 139867627381312 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000339 sec
+W20261031 00:22:21.983318 139867627381312 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000417 sec
+W20261031 00:22:22.096331 140189132780096 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.060167 sec
+W20261031 00:22:22.096895 140189132780096 simple_timer.cpp:55] [rocprofv3] '/opt/rocm/llvm/bin/llvm-objdump --dynamic-syms /tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=3584-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co' ::     0.000000 sec
+W20261031 00:22:22.097041 140189132780096 simple_timer.cpp:55] [rocprofv3] '/opt/rocm/llvm/bin/llvm-objdump --dynamic-syms /tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=3584-K=6144--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co' ::     0.000147 sec
+W20261031 00:22:22.097364 140189132780096 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000291 sec
+W20261031 00:22:22.097417 140189132780096 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000349 sec
+E20261031 00:22:22.104920 140413226983936 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_gfx942_code_object_id_8.out
+E20261031 00:22:22.127399 140403244267200 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_16361_shader_engine_0_22.att
+E20261031 00:22:22.134330 140403244267200 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_16361_shader_engine_1_22.att
+E20261031 00:22:22.142554 140403244267200 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_16361_shader_engine_2_22.att
+E20261031 00:22:22.149581 140403244267200 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_16361_shader_engine_3_22.att
+[aiter] att[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+ATT_DIFF 8.544522318576497e-06
+ATT_PTL_EXIT True ['VECTOR', 'F8']
+W20261031 00:22:22.767423 140413226983936 simple_timer.cpp:55] [rocprofv3] 'python att_run.py 16384 3584 6144 1' ::    18.427867 sec
+E20261031 00:22:22.813383 140413226983936 output_stream.cpp:111] Opened result file: /tmp/gfx942_perf/att_best_v25/hjbog-srdc-52.amd.com/179517_results.json
+W20261031 00:22:35.818108 140413226983936 simple_timer.cpp:55] [rocprofv3] output generation ::    13.005162 sec
+W20261031 00:22:35.819275 140413226983936 simple_timer.cpp:55] [rocprofv3] tool finalization ::    13.006342 sec

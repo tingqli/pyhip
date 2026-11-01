@@ -1,0 +1,271 @@
+{
+  "date": "2026-10-31",
+  "baseline": "v25, preshuffled B, K16384, 256x256 tile, 8 waves",
+  "scope": "Whole target kernel, all hardware instances; not an active-mainloop-only counter window",
+  "condition": "PMC automatically disables PTL; no PTL, clock or power setting was changed by the harness",
+  "protocol": "32 disjoint A/B/scale clones; warm buffers 0..31, capture target kernel iteration 33 on buffer 0",
+  "samples_per_shape_per_group": 1,
+  "formula_source": "ROCm 7.2.4 rocprofiler-compute gfx942/0300_memory_chart.yaml",
+  "formulas": {
+    "vl1d_hit_pct": "100 * (1 - (TCP_TCC_READ_REQ_sum + TCP_TCC_WRITE_REQ_sum) / TCP_TOTAL_CACHE_ACCESSES_sum); target ISA has no atomics",
+    "l2_hit_pct": "100 * TCC_HIT_sum / (TCC_HIT_sum + TCC_MISS_sum)",
+    "fabric_read_cycles": "TCC_EA0_RDREQ_LEVEL_sum / TCC_EA0_RDREQ_sum",
+    "tcp_pending_stall_pct": "100 * TCP_PENDING_STALL_CYCLES_sum / TCP_GATE_EN1_sum"
+  },
+  "caveats": [
+    "Cannot directly transfer Disabled-PTL PMC results to Enabled-PTL ATT or ordinary timing",
+    "Groups are separate processes/allocations, not same-address paired samples",
+    "No estimate of run-to-run variance from one target dispatch per group",
+    "Summed TCP stall cycles are not additive wall-time or MFMA-idle cycles",
+    "Fabric read cycles include the external request path; not a direct HBM-only latency measurement",
+    "No byte conversion of mixed 32/64-byte external read requests"
+  ],
+  "shapes": {
+    "4096": {
+      "shape": [
+        4096,
+        4096,
+        16384
+      ],
+      "workgroups": 256,
+      "metrics": {
+        "vl1d_hit_pct": 70.609457026083,
+        "l2_hit_pct": 39.420652446561675,
+        "fabric_read_cycles": 378.2556615392296,
+        "tcp_pending_stall_pct": 25.924064042710526,
+        "tcp_read_tagconflict_pct": 18.69552316708139,
+        "tcp_tcr_stall_pct": 0.0
+      },
+      "per_wg": {
+        "TCP_TCC_READ_REQ_sum": 97526.2421875,
+        "TCP_TCC_WRITE_REQ_sum": 2016.0,
+        "TCP_TOTAL_CACHE_ACCESSES_sum": 338688.0,
+        "TCC_HIT_sum": 39884.62890625,
+        "TCC_MISS_sum": 61292.359375,
+        "TCC_READ_sum": 99128.98828125,
+        "TCC_EA0_RDREQ_DRAM_CREDIT_STALL_sum": 0.0,
+        "TCC_EA0_RDREQ_DRAM_sum": 60247.01171875,
+        "TCC_EA0_RDREQ_LEVEL_sum": 22788773.2734375,
+        "TCC_EA0_RDREQ_sum": 60247.01171875,
+        "TCP_GATE_EN1_sum": 1039307.63671875,
+        "TCP_PENDING_STALL_CYCLES_sum": 269430.77734375,
+        "TCP_READ_TAGCONFLICT_STALL_CYCLES_sum": 194304.0,
+        "TCP_TCR_TCP_STALL_CYCLES_sum": 0.0
+      },
+      "groups": {
+        "l1": {
+          "csv": "pmc4096_l1_single/hjbog-srdc-52.amd.com/271271_counter_collection.csv",
+          "run_report": "pmc4096_l1_single_run.json",
+          "dispatch_id": 180,
+          "profiled_duration_us": 2423.45,
+          "code_object": {
+            "path": "/tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+            "sha256": "98e53be4163c1ed7c18d87505cc28a62d05618e6619510c694826628c9aa3df8"
+          },
+          "checks": {
+            "warmup_0_baseline": {
+              "calc_diff": 9.41510264329537e-06
+            },
+            "timed_0_baseline": {
+              "calc_diff": 9.41510264329537e-06
+            }
+          },
+          "ptl": [
+            false,
+            false,
+            false
+          ],
+          "counters": {
+            "TCP_TCC_READ_REQ_sum": 24966718.0,
+            "TCP_TCC_WRITE_REQ_sum": 516096.0,
+            "TCP_TOTAL_CACHE_ACCESSES_sum": 86704128.0
+          }
+        },
+        "l2": {
+          "csv": "pmc4096_l2_single/hjbog-srdc-52.amd.com/269883_counter_collection.csv",
+          "run_report": "pmc4096_l2_single_run.json",
+          "dispatch_id": 180,
+          "profiled_duration_us": 2423.41,
+          "code_object": {
+            "path": "/tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+            "sha256": "98e53be4163c1ed7c18d87505cc28a62d05618e6619510c694826628c9aa3df8"
+          },
+          "checks": {
+            "warmup_0_baseline": {
+              "calc_diff": 9.41510264329537e-06
+            },
+            "timed_0_baseline": {
+              "calc_diff": 9.41510264329537e-06
+            }
+          },
+          "ptl": [
+            false,
+            false,
+            false
+          ],
+          "counters": {
+            "TCC_HIT_sum": 10210465.0,
+            "TCC_MISS_sum": 15690844.0,
+            "TCC_READ_sum": 25377021.0
+          }
+        },
+        "memory": {
+          "csv": "pmc4096_memory_single/hjbog-srdc-52.amd.com/272007_counter_collection.csv",
+          "run_report": "pmc4096_memory_single_run.json",
+          "dispatch_id": 180,
+          "profiled_duration_us": 2423.73,
+          "code_object": {
+            "path": "/tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=4096-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+            "sha256": "98e53be4163c1ed7c18d87505cc28a62d05618e6619510c694826628c9aa3df8"
+          },
+          "checks": {
+            "warmup_0_baseline": {
+              "calc_diff": 9.41510264329537e-06
+            },
+            "timed_0_baseline": {
+              "calc_diff": 9.41510264329537e-06
+            }
+          },
+          "ptl": [
+            false,
+            false,
+            false
+          ],
+          "counters": {
+            "TCC_EA0_RDREQ_DRAM_CREDIT_STALL_sum": 0.0,
+            "TCC_EA0_RDREQ_DRAM_sum": 15423235.0,
+            "TCC_EA0_RDREQ_LEVEL_sum": 5833925958.0,
+            "TCC_EA0_RDREQ_sum": 15423235.0,
+            "TCP_GATE_EN1_sum": 266062755.0,
+            "TCP_PENDING_STALL_CYCLES_sum": 68974279.0,
+            "TCP_READ_TAGCONFLICT_STALL_CYCLES_sum": 49741824.0,
+            "TCP_TCR_TCP_STALL_CYCLES_sum": 0.0
+          }
+        }
+      }
+    },
+    "8192": {
+      "shape": [
+        8192,
+        8192,
+        16384
+      ],
+      "workgroups": 1024,
+      "metrics": {
+        "vl1d_hit_pct": 70.60953833481113,
+        "l2_hit_pct": 39.419312367115715,
+        "fabric_read_cycles": 365.00729067898897,
+        "tcp_pending_stall_pct": 29.498645462203545,
+        "tcp_read_tagconflict_pct": 23.01843701675137,
+        "tcp_tcr_stall_pct": 0.0
+      },
+      "per_wg": {
+        "TCP_TCC_READ_REQ_sum": 97912.974609375,
+        "TCP_TCC_WRITE_REQ_sum": 2024.0,
+        "TCP_TOTAL_CACHE_ACCESSES_sum": 340032.0,
+        "TCC_HIT_sum": 39870.2138671875,
+        "TCC_MISS_sum": 61273.6455078125,
+        "TCC_READ_sum": 99095.859375,
+        "TCC_EA0_RDREQ_DRAM_CREDIT_STALL_sum": 0.0,
+        "TCC_EA0_RDREQ_DRAM_sum": 62556.732421875,
+        "TCC_EA0_RDREQ_LEVEL_sum": 22833663.415039062,
+        "TCC_EA0_RDREQ_sum": 62556.732421875,
+        "TCP_GATE_EN1_sum": 844123.3427734375,
+        "TCP_PENDING_STALL_CYCLES_sum": 249004.9521484375,
+        "TCP_READ_TAGCONFLICT_STALL_CYCLES_sum": 194304.0,
+        "TCP_TCR_TCP_STALL_CYCLES_sum": 0.0
+      },
+      "groups": {
+        "l1": {
+          "csv": "pmc8192_l1_single/hjbog-srdc-52.amd.com/270967_counter_collection.csv",
+          "run_report": "pmc8192_l1_single_run.json",
+          "dispatch_id": 180,
+          "profiled_duration_us": 7909.512,
+          "code_object": {
+            "path": "/tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=8192-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+            "sha256": "729b837096ea44dfd053282c5c2e6863e1bc614a4dfb74dc4cf49d85e219e3b9"
+          },
+          "checks": {
+            "warmup_0_baseline": {
+              "calc_diff": 9.157149556515698e-06
+            },
+            "timed_0_baseline": {
+              "calc_diff": 9.157149556515698e-06
+            }
+          },
+          "ptl": [
+            false,
+            false,
+            false
+          ],
+          "counters": {
+            "TCP_TCC_READ_REQ_sum": 100262886.0,
+            "TCP_TCC_WRITE_REQ_sum": 2072576.0,
+            "TCP_TOTAL_CACHE_ACCESSES_sum": 348192768.0
+          }
+        },
+        "l2": {
+          "csv": "pmc8192_l2_single/hjbog-srdc-52.amd.com/270470_counter_collection.csv",
+          "run_report": "pmc8192_l2_single_run.json",
+          "dispatch_id": 180,
+          "profiled_duration_us": 7908.751,
+          "code_object": {
+            "path": "/tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=8192-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+            "sha256": "729b837096ea44dfd053282c5c2e6863e1bc614a4dfb74dc4cf49d85e219e3b9"
+          },
+          "checks": {
+            "warmup_0_baseline": {
+              "calc_diff": 9.157149556515698e-06
+            },
+            "timed_0_baseline": {
+              "calc_diff": 9.157149556515698e-06
+            }
+          },
+          "ptl": [
+            false,
+            false,
+            false
+          ],
+          "counters": {
+            "TCC_HIT_sum": 40827099.0,
+            "TCC_MISS_sum": 62744213.0,
+            "TCC_READ_sum": 101474160.0
+          }
+        },
+        "memory": {
+          "csv": "pmc8192_memory_single/hjbog-srdc-52.amd.com/272311_counter_collection.csv",
+          "run_report": "pmc8192_memory_single_run.json",
+          "dispatch_id": 180,
+          "profiled_duration_us": 7908.432,
+          "code_object": {
+            "path": "/tmp/gfx942_perf/cache_v25/gemm_a8w8_blockscale_8wave_gfx942-1-preshuffle_b=True-N=8192-K=16384--mywork-pyhip-src-contrib-gemm_fp8_gfx942.py-10.co",
+            "sha256": "729b837096ea44dfd053282c5c2e6863e1bc614a4dfb74dc4cf49d85e219e3b9"
+          },
+          "checks": {
+            "warmup_0_baseline": {
+              "calc_diff": 9.157149556515698e-06
+            },
+            "timed_0_baseline": {
+              "calc_diff": 9.157149556515698e-06
+            }
+          },
+          "ptl": [
+            false,
+            false,
+            false
+          ],
+          "counters": {
+            "TCC_EA0_RDREQ_DRAM_CREDIT_STALL_sum": 0.0,
+            "TCC_EA0_RDREQ_DRAM_sum": 64058094.0,
+            "TCC_EA0_RDREQ_LEVEL_sum": 23381671337.0,
+            "TCC_EA0_RDREQ_sum": 64058094.0,
+            "TCP_GATE_EN1_sum": 864382303.0,
+            "TCP_PENDING_STALL_CYCLES_sum": 254981071.0,
+            "TCP_READ_TAGCONFLICT_STALL_CYCLES_sum": 198967296.0,
+            "TCP_TCR_TCP_STALL_CYCLES_sum": 0.0
+          }
+        }
+      }
+    }
+  }
+}
