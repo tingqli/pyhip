@@ -234,7 +234,7 @@ class _Chunk:
 class _Layout:
     """Host-derived per-forward plan; device tensors are read-only and shared."""
 
-    def __init__(self, seq_lens, extend_lens, device):
+    def __init__(self, seq_lens, extend_lens, device, row_range=None):
         seq, extend = np.asarray(seq_lens, dtype=np.int64), np.asarray(extend_lens, dtype=np.int64)
         prefix, compressed = seq - extend, seq // _RATIO
         row_base = np.cumsum(extend) - extend
@@ -246,6 +246,12 @@ class _Layout:
         start = (np.arange(len(owner)) - np.repeat(np.cumsum(counts) - counts, counts)) * _BM
         sizes = np.minimum(_BM, extend[owner] - start)
         firsts = row_base[owner] + start
+        if row_range is not None:
+            # Only the tiles' rows inside the range get logits and top-k; bounds follow each clipped tile.
+            low, high = np.maximum(firsts, row_range[0]), np.minimum(firsts + sizes, row_range[1])
+            kept = low < high
+            owner, start = owner[kept], (start + low - firsts)[kept]
+            firsts, sizes = low[kept], (high - low)[kept]
         bounds = np.minimum((prefix[owner] + start + sizes) // _RATIO, compressed[owner])
         parts = [info.reshape(-1)]
         chunks, self.logits_elements = [], 0
@@ -287,12 +293,12 @@ _layouts = OrderedDict()
 _lock = threading.Lock()
 
 
-def _layout(seq_lens, extend_lens, device):
-    key = (device, seq_lens, extend_lens)
+def _layout(seq_lens, extend_lens, device, row_range=None):
+    key = (device, seq_lens, extend_lens, row_range)
     with _lock:
         layout = _layouts.get(key)
         if layout is None:
-            layout = _layouts[key] = _Layout(seq_lens, extend_lens, device)
+            layout = _layouts[key] = _Layout(seq_lens, extend_lens, device, row_range)
             while len(_layouts) > 8:
                 _layouts.popitem(last=False)
         _layouts.move_to_end(key)
@@ -337,7 +343,8 @@ def _check_shared(qk, rows, heads, positions, state_slots, key_state, rope_state
 
 def prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key_state, rope_state, write_locs,
                     member_rows, group_sequences, group_ends, rope_matrix, compressed, token_slot_table,
-                    cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps, seq_lens, extend_lens, q_out=None):
+                    cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps, seq_lens, extend_lens, q_out=None,
+                    row_range=None, out=None):
     """Return int32 [T, 2051] token selections and update the QSA pending/compressed caches.
 
     qk is the contiguous BF16 ``index_qk_proj`` output [T, (heads + 1) * D] (heads=4, D=128). Host
@@ -356,6 +363,11 @@ def prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key
     [positions, rotary_dim]) and ``axis_map`` (int32 [rotary_dim / 2]) give the multi-axis RoPE,
     ``q_weight``/``k_weight`` (BF16 [D]) and ``q_eps``/``k_eps`` the Gemma RMSNorms. If given,
     ``q_out`` (BF16 [T, heads, D]) receives the normalized index queries.
+
+    ``row_range=(first, end)`` selects only rows [first, end), e.g. one tensor-parallel rank's share; the
+    caches and ``q_out`` are still updated for every row. If given, ``out`` (contiguous int32 [>= T, 2051],
+    not aliasing any input) receives the selected rows in place, leaves its other rows untouched and is
+    returned.
     """
     device, head_dim = qk.device, q_weight.numel()
     rows = sum(extend_lens)
@@ -384,10 +396,22 @@ def prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key
     if q_out is not None:
         _check(q_out, "q_out", torch.bfloat16, (rows, heads, head_dim))
         tensors += (q_out,)
+    if out is not None:
+        _check(out, "out", torch.int32)
+        if out.ndim != 2 or out.shape[0] < rows or out.shape[1] != _WIDTH:
+            raise ValueError(f"out must be int32 [>= {rows}, {_WIDTH}], got {tuple(out.shape)}")
+        tensors += (out,)
     if any(t.device != device for t in tensors):
         raise ValueError("All indexer tensors must be on one device")
+    if row_range is not None:
+        row_range = tuple(row_range)
+        if (len(row_range) != 2 or any(type(r) is not int for r in row_range)
+                or not 0 <= row_range[0] <= row_range[1] <= rows):
+            raise ValueError(f"row_range must be (first, end) with 0 <= first <= end <= {rows}")
+        if row_range == (0, rows):
+            row_range = None
 
-    layout = _layout(tuple(seq_lens), tuple(extend_lens), device)
+    layout = _layout(tuple(seq_lens), tuple(extend_lens), device, row_range)
     q = torch.empty((rows, heads, head_dim), dtype=torch.bfloat16, device=device) if q_out is None else q_out
     stats = torch.empty((rows, 2), dtype=torch.int32, device=device)
     _indexer_q_prep[(-(-rows // _TB),)](qk, q, q_weight, key_state, rope_state, state_slots, positions,
@@ -400,7 +424,7 @@ def prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key
                                                   k_weight, compressed, groups, head_dim, k_eps, GB=_GB, H=heads,
                                                   D=head_dim, ROT=rotary_dim, RATIO=_RATIO,
                                                   CACHE_STRIDE=cos_sin_cache.stride(0), num_warps=4)
-    out = torch.empty((rows, _WIDTH), dtype=torch.int32, device=device)
+    out = torch.empty((rows, _WIDTH), dtype=torch.int32, device=device) if out is None else out
     logits = torch.empty(max(layout.logits_elements, 1) + _PAD, dtype=torch.float32, device=device)
     scale = float(np.float32(1.0) / np.float32(math.sqrt(head_dim)))
     for chunk in layout.chunks:

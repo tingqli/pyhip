@@ -281,7 +281,7 @@ k_weight = torch.zeros(D, device=device, dtype=torch.bfloat16)
 indices = prefill_indexer(qk, *, heads, positions, logical_positions, state_slots, key_state, rope_state,
                           write_locs, member_rows, group_sequences, group_ends, rope_matrix, compressed,
                           token_slot_table, cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps,
-                          seq_lens, extend_lens, q_out=None)           # → int32 [T, 2051]
+                          seq_lens, extend_lens, q_out=None, row_range=None, out=None)   # → int32 [T, 2051]
 ```
 
 T是本批query行数（各请求的行按请求顺序拼接），R是请求数，G是本批写压缩key的组数（可含padding），S、C分别是ring和压缩池的槽数，N是RoPE表的行数。
@@ -308,13 +308,16 @@ T是本批query行数（各请求的行按请求顺序拼接），R是请求数�
 | `q_weight`、`k_weight` | BF16 `[128]` | Gemma RMSNorm权重，按`x·rstd·(1+w)`作用于q和k |
 | `q_eps`、`k_eps` | float | RMSNorm的epsilon |
 | `q_out` | 可选，BF16 `[T,4,128]` | 给定时写入归一化并加RoPE后的index Q（SGLang数值校验用） |
+| `row_range` | 可选，host `(first, end)`，`0 ≤ first ≤ end ≤ T` | 只为这些行算logits和top-k（如TP一个rank的那一段）；prep、缓存和`q_out`仍覆盖全部行 |
+| `out` | 可选，连续int32 `[≥T,2051]`，不与输入重叠 | 给定时把选中的行写进它（按行号原位），其它行不动，并返回它 |
 
 注意事项：
 
-- 只用于eager调用：host按`(seq_lens, extend_lens)`规划布局（缓存最近8种），一次pinned上传，不同步stream。
+- 只用于eager调用：host按`(seq_lens, extend_lens, row_range)`规划布局（缓存最近8种），一次pinned上传，不同步stream。
 - 单请求最多262144个压缩key（1M token）；宽度超过65536个key的logits行用32位块号的top-k变体，两种变体在第一次调用时一起编译。logits临时缓冲按512MiB分块，长行时每块至少1024行（1M末尾约1.1GiB）。
 - Chunked prefill时，前面各块写入的压缩key由logits经`token_slot_table`读取；每块只压缩4个成员都在本块的组，所以prefix必须按4对齐。
-- 每次调用返回新分配的indices，之后的调用不会改写。
+- 不传`out`时每次调用返回新分配的indices，之后的调用不会改写。
+- TP切分（SGLang `SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER`）：各rank以相同输入调用，只传自己的`row_range`，写进同一形状的共享`out`里自己那段，再all-gather；拼起来与整批调用逐bit相同。
 
 示例：单请求、没有prefix。真实调用时`qk`来自`index_qk_proj`，缓存和槽号来自调用方的KV管理。
 

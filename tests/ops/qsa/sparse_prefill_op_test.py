@@ -630,14 +630,15 @@ def test_qsa_sparse_attention(case, heads):
 
 
 def released(pointer):
-    """Whether the caching allocator holds device address pointer in a free block."""
+    """Whether device address pointer is outside every active caching-allocator block
+    (a segment returned to HIP no longer appears in the snapshot)."""
     for segment in torch.cuda.memory_snapshot():
         address = segment["address"]
         for block in segment["blocks"]:
             if address <= pointer < address + block["size"]:
                 return block["state"] != "active_allocated"
             address += block["size"]
-    return False
+    return True
 
 
 @benchmark()

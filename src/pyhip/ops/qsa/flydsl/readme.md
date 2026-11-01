@@ -513,7 +513,7 @@ SGLang的K/V在按页分配的token池里。传入`kv_slots`时，kernel直接�
 
 ### 2.1 调用链
 
-SGLang在每个QSA层的extend forward中调用一次，各TP rank重复计算，不随TP变化。依次发出下列launch（编号沿用，I3、I6已删除）；每块logits不超过512MiB（行很长时每块至少1024行，1M上下文约1.1GiB），长上下文时I4、I5按块重复。
+SGLang在每个QSA层的extend forward中调用一次，各TP rank重复计算，不随TP变化；SGLang开启`SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER`且chunk足够大时，各rank只为自己那段行做I4、I5（`row_range`），再all-gather（第5节11-01（续））。依次发出下列launch（编号沿用，I3、I6已删除）；每块logits不超过512MiB（行很长时每块至少1024行，1M上下文约1.1GiB），长上下文时I4、I5按块重复。
 
 | # | Kernel（实现） | grid×block | 作用 |
 |---|---|---|---|
@@ -542,14 +542,14 @@ SGLang在每个QSA层的extend forward中调用一次，各TP rank重复计算�
 prefill_indexer(qk[T,640], *, heads=4, positions, logical_positions, state_slots, key_state, rope_state,
                 write_locs, member_rows, group_sequences, group_ends, rope_matrix, compressed,
                 token_slot_table, cos_sin_cache, axis_map, q_weight, k_weight, q_eps, k_eps,
-                seq_lens, extend_lens, q_out=None):
+                seq_lens, extend_lens, q_out=None, row_range=None, out=None):
     host检查：4头、D128、rotary维度约束、每请求≤262144个压缩key（1M token）、各张量的dtype/形状/设备、压缩池<2GiB
     # group_sequences、group_ends只检查形状，kernel不用
-    layout = _layout(seq_lens, extend_lens)      # 按长度LRU缓存8个；numpy规划，一次pinned上传，不同步stream
+    layout = _layout(seq_lens, extend_lens, row_range)   # 按长度和行范围LRU缓存8个；numpy规划，一次pinned上传，不同步stream
     q = q_out或empty[T,4,128]；stats = empty[T,2]  # SGLang数值校验传q_out取回q
-    I1                                           # q norm/RoPE、ring写、stats复位
+    I1                                           # q norm/RoPE、ring写、stats复位（总是全部行：缓存每个rank都要完整）
     if groups: I2                                # 本次凑满的4-token组写进压缩池
-    out = empty[T,2051]
+    out = out或empty[T,2051]                     # 给定的out须为int32 [≥T,2051]，只写row_range内的行
     logits = empty[最大块rows·⌈width/512⌉·544 + 512] FP32
     # key块主序：块内第r行的第j个key在 [(j//512)·rows + r]·544 + j%512（行距544：2KiB行距使12k logits慢22–26%）
     for chunk in layout.chunks:                  # 每块 ≤ 512MiB，或不足1024行时继续加tile（< 2GiB）
@@ -557,10 +557,11 @@ prefill_indexer(qk[T,640], *, heads=4, positions, logical_positions, state_slots
         I5 → out[row0 : row0+rows]               # 宽度>65536用int32块号变体，≥16384时4个wave共一行；位置不符时trap
     return out
 
-_Layout(seq_lens, extend_lens):                  # 只由host长度决定
+_Layout(seq_lens, extend_lens, row_range):       # 只由host长度和行范围决定
     prefix_r = seq_r - extend_r；compressed_r = seq_r//4       # 请求r的压缩key数
-    row_info[row] = (prefix_r + i, seq_r)        # 每行应有的位置与序列长度：I5据此校验位置并确定count
-    每请求按128行切tile：bound = min((prefix_r + start + size)//4, compressed_r)   # tile最后一行可见的压缩key数
+    row_info[row] = (prefix_r + i, seq_r)        # 每行应有的位置与序列长度：I5据此校验位置并确定count（总是全部行）
+    每请求按128行切tile；row_range给出时只留与它相交的部分（tile截断）
+    bound = min((prefix_r + start + size)//4, compressed_r)   # tile（截断后）最后一行可见的压缩key数
     分块：依次加入tile，直到本块logits超过512MiB且已有1024行，或达到2GiB（width = 块内最大bound按4取整）
     item：只为bound > 512的tile建（≤512时I5全选，不需要logits），按KC=512切key区间
           → (row0, local0, rows, request, start, end)             # local0为块内的行号
@@ -822,7 +823,7 @@ Attention的kernel文件名和kernel名沿用AITER #6576（`sparse_prefill_*`）
 - 字节跨度：Q和每个请求的K（V同）都不超过4GiB−1MiB（`_MAX_SPAN`）。kernel的buffer字节偏移按无符号32位算，1MiB余量让越界哨兵加上lane偏移不回绕；K/V按请求起点寻址，整批packed K/V不受此限（HK1时一个请求约8M token）。
 - `softmax_scale`是host标量（默认1/16），`scale·log2(e)`须是有限的正FP32（kernel用它乘被mask的−inf分数，为0时得NaN）；`query_lens`/`prefix_lens`是小于2^31的host整数；`out`不得与Q/K/V/indices/kv_slots重叠。
 - `kv_slots`（同设备连续int32 `[N]`，字节数不超过`_MAX_SPAN`：pack按无符号32位buffer偏移读它，各请求在其中的起点按int32上传）给出时，K/V是token池`[P,HK,256]`，第i项是packed上下文第i个token的池行。每个请求的每个四token块（含请求末尾不满的块）须占池中连续4行、起始行是4的倍数（页大小为4的倍数的分页池满足），不满块多出的行值任意；slot值不校验。union和pack按块建buffer描述符，池大小不受限；池的字节数超过`_MAX_SPAN`时raw direct改用64位global读（WIDE，比buffer读慢约0–10%）。结果与按slot表拷出连续K/V再调用逐bit相同。
-- Indexer为独立的D128投影、4个Q头和1个K头、ratio4/top512，最多262144个压缩key（1M token）。Prefill输出每行块号升序，可原样交给attention。`prefill_indexer`和`decode_indexer`除`qk`外都是显式关键字参数，同名参数含义相同；可选的`q_out`（decode另有`logits_out`）取回归一化后的index Q（和logits）。
+- Indexer为独立的D128投影、4个Q头和1个K头、ratio4/top512，最多262144个压缩key（1M token）。Prefill输出每行块号升序，可原样交给attention。`prefill_indexer`和`decode_indexer`除`qk`外都是显式关键字参数，同名参数含义相同；可选的`q_out`（decode另有`logits_out`）取回归一化后的index Q（和logits）。`prefill_indexer`可选`row_range=(first, end)`只为这些行做logits和top-k（I1、I2和缓存仍覆盖全部行），并可传`out`（int32 `[≥T,2051]`，不与输入重叠）只写这些行、原样返回，供TP各rank分段计算后all-gather。
 - 不另设校验launch：attention和indexer的入口在launch前只在host检查张量的dtype、形状、设备、对齐和长度，非法时抛`ValueError`（`softmax_scale`传tensor时抛`TypeError`）；prefill top-k发现query位置与host布局不符时执行`s_trap 2`，GPU队列出错，进程以HSA异常（code 0x1016，日志含kernel名）中止。Decode不校验位置。
 
 ### 4.3 Graph、scratch与编译
@@ -1047,6 +1048,24 @@ PR #62 review修复后用默认FlyDSL缓存跑QSA全套测试，gated raw用例�
 - **打包预算（未改，用户决定）**：bot指出`AITER_QSA_PLATFORM`把`max_packed_kv_bytes`调到4 GiB以上时，有slot表的布局会打包出各超过4 GiB的PK/PV，而pack与packed kernel按无符号32位字节偏移寻址PK/PV。默认预算（64 MiB；按行数规则≤1 GiB）下PK/PV各不超过512 MiB。
 - **top-k输出（未改）**：该线程已resolve。1M行prefill里其余按一维传给FlyDSL的张量都在int32内：q为[rows,4,128]，约5.4亿个元素；logits块≤512 MiB；row_info、stats为[rows,2]。
 - **验证**：新用例在修复前4 GiB slot表一项失败（未报错），BQ21/BQ42两项通过；修复后QSA测试117项、SGLang `test_pyhip_qsa` 7项（17个子测试）通过。
+
+### 2026-11-01（续）：prefill indexer按TP切分行
+
+1M上下文末尾16384行的chunk，单卡indexer每层45.3 ms：logits 25.7 ms（57%，约170 TFLOP/s），top-k 19.2 ms（42%），prep 0.4 ms；SGLang的每个TP rank都重复算这一份。数据与脚本在[qsa_indexer_1m_split_20261101_01](../../../../../mytest/mydata/qsa_indexer_1m_split_20261101_01)。
+
+- **PyHIP**：`prefill_indexer`加`row_range=(first, end)`和`out`。I1、I2仍处理全部行（I1同时写pending ring，I2写压缩池，每个rank都要完整的缓存）；`_Layout`只保留与范围相交的tile（截断后按最后一行重算bound），I4、I5只算这些行，按行号写进调用方的`out`。kernel不变。
+- **SGLang**（`SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER`，默认关）：attention-TP组内按等长连续行切（K = ⌈T/tp⌉），每个rank写进共享的`[tp·K, 2051]`里自己那段，再用`all_gather_into_tensor`原地汇集。原地RCCL all-gather `[16384, 2051]` int32在TP2为1.43 ms（每rank收47 GB/s），TP4为0.76 ms（134 GB/s）；indexer约1.06e-5 µs/(行·key)，TP2约在平均每行1.6万个压缩key时持平。因此只在chunk≥2048行、平均每行≥32768个压缩key时切，留约2倍余量。长上下文的chunk里各行key数几乎相同，等长切即平衡。
+- **测试**：`test_prefill_row_ranges`（3种布局各切2/3/7份，跨请求、tile和logits块，含空范围）与整批调用逐bit相同，范围外的行不写，缓存与参考一致；QSA测试120项通过。SGLang `test_prefill_rows_split_across_ranks`用假的attention-TP组：切2/3份与不切逐bit相同，门槛以下不gather；把偏移改错或让门槛恒真都会失败。`test_pyhip_qsa` 8项通过。
+- **服务**（TP2，GPU0/1，YaRN，`--context-length 1000000`，脚本由10-31的改来）：开启切分、TEST=1验收通过：含999648 token的请求，每个rank 12层各有93次prefill indexer、309次graph decode校验，attention 1116次，日志无异常。C1、350 token、各2次的A/B：
+
+  | 输入 | TTFT 关 → 开 | TPOT 关 / 开 |
+  |---:|---|---|
+  | 131072 | 8.45 → 8.46 s（没有chunk达到门槛） | 7.11 / 7.23 ms |
+  | 262144 | 17.48 → 17.25 s（−1.3%） | 7.15 / 7.34 ms |
+  | 524288 | 38.06 → 36.17 s（−5.0%） | 7.29 / 7.30 ms |
+  | 999648 | 86.06 → 76.18 s（−11.5%） | 7.43 / 7.45 ms |
+
+  decode路径没有改动，TPOT的差别来自两次起服务。[验收与A/B](../../../../../mytest/mydata/qsa_indexer_1m_split_20261101_01/service_summary.json)
 
 ### 评估过但未采用
 

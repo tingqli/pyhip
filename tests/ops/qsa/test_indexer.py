@@ -79,6 +79,32 @@ def test_prefill_logits_chunks(device, monkeypatch):
     _check_prefill(source)
 
 
+@pytest.mark.parametrize("seq_lens,extend_lens", (((2055, 16, 13), (7, 0, 9)), ((2177, 4100), (129, 4100)),
+                                                  ((10240, 300, 4100), (2048, 300, 4100))),
+                         ids=("multi", "prefix", "chunks"))
+def test_prefill_row_ranges(seq_lens, extend_lens, device, monkeypatch):
+    """Row ranges (a tensor-parallel rank's share, cutting requests, tiles and logits chunks; possibly empty)
+    write exactly the full call's rows into a shared output, leave its other rows alone and still update the
+    caches for every row."""
+    monkeypatch.setattr(helpers.indexer, "_LOGITS_BUDGET_BYTES", 1 << 20)
+    monkeypatch.setattr(helpers.indexer, "_CHUNK_ROWS", 128)
+    monkeypatch.setattr(helpers.indexer, "_layouts", OrderedDict())
+    source = helpers.synthetic(seq_lens, extend_lens, device)
+    expected = helpers.reference_prep(source.inputs, source.state)
+    full = helpers.indexer.prefill_indexer(**source.inputs)
+    rows = full.shape[0]
+    for parts in (2, 3, 7):
+        share = -(-rows // parts)
+        out = torch.full((share * parts, full.shape[1]), -7, dtype=torch.int32, device=device)
+        for part in range(parts):
+            helpers.reset_state(source)
+            first, end = min(part * share, rows), min((part + 1) * share, rows)
+            assert helpers.indexer.prefill_indexer(**source.inputs, row_range=(first, end), out=out) is out
+            helpers.assert_state(source, expected)
+            assert bool((out[end:] == -7).all())
+        helpers.assert_exact(out[:rows], full, f"{parts} row ranges")
+
+
 def test_prefill_frame_and_output_ownership(device):
     source = helpers.synthetic((2055, 13), (7, 9), device, cache_dtype=torch.float32)
     # The public ABI allows a noncontiguous RoPE axis stride, but unit token stride.
