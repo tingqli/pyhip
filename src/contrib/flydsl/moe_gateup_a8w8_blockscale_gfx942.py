@@ -31,7 +31,7 @@ from .gemm_a8w8_blockscale_gfx942_8x1 import (
     TILE_K,
     _lds_dwords,
 )
-from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2, s_buffer_load_f32
+from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne, s_buffer_load_f32
 from .helpers import BufferTensor
 
 SORT_BLOCK_M = 256
@@ -379,7 +379,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942(
             def column_pair(m_slice, column):
                 """16 B per lane: 8 consecutive BF16 columns of subtile column (even lane groups) or column + 1."""
                 halves = [
-                    pack_bf16x2(
+                    pack_bf16x2_rne(
                         silu_mul(
                             Vec(accum[None, m_slice * 16 + column + side].load()),
                             Vec(accum[None, m_slice * 16 + 8 + column + side].load()),

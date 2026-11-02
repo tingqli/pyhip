@@ -48,3 +48,10 @@ def pack_bf16x2(values):
     bias = fx.Int32(0x8000).bitcast(fx.Float32)
     bits = [(fx.Float32(values[index]) + bias).bitcast(fx.Int32) for index in range(4)]
     return [bits[pair * 2] >> 16 & 0xFFFF | bits[pair * 2 + 1] & -65536 for pair in range(2)]
+
+
+def pack_bf16x2_rne(values):
+    """Four FP32 -> two BF16x2 dwords, rounded to nearest even (pack_bf16x2 truncates normal values)."""
+    bits = [fx.Float32(values[index]).bitcast(fx.Int32) for index in range(4)]
+    rounded = [bit + (0x7FFF + (bit >> 16 & 1)) for bit in bits]
+    return [rounded[pair * 2] >> 16 & 0xFFFF | rounded[pair * 2 + 1] & -65536 for pair in range(2)]

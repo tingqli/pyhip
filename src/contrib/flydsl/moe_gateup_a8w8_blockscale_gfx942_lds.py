@@ -14,6 +14,10 @@ B rows are placed in LDS so that every wave's gate (and up) columns are contiguo
 K blocks sit in one VGPR and are read with v_readlane, so the K loop issues no scalar loads.
 With persistent=True one resident workgroup per CU loops over its tasks; the SiLU + store epilogue of a
 task overlaps the route and first-K-block loads of the next one, and the stores drain under its K loop.
+With fp8_out=True (non-persistent) the output is the Down kernel's input instead: SiLU(gate) * up quantized
+to FP8 per (row, 128 columns) with FP32 scale amax / 240, at sorted row block * 256 + row of
+[blocks * 256, I] (scales [I/128, blocks * 256]). Row maxima meet in LDS across the waves along N, and the
+FP8 tile goes through LDS so that every dwordx4 store writes 8 full rows x 128 B.
 """
 
 import functools
@@ -28,7 +32,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2
+from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
 from .helpers import BufferTensor
 from .moe_gateup_a8w8_blockscale_gfx942 import LOG2E, OOB_OFFSET, SORT_BLOCK_M, TILE_N, TOKEN_MASK, validate_parameters
 
@@ -36,6 +40,8 @@ TILE_K = 128
 PACKET_ROWS = 64
 PACKET_DWORDS = PACKET_ROWS * TILE_K // 4
 LAYOUTS = ("2x4", "4x2")
+# Largest finite FP8 E4M3FNUZ (gfx942).
+FP8_MAX = 240.0
 
 
 def _lds_dwords(row, column):
@@ -45,17 +51,19 @@ def _lds_dwords(row, column):
 
 @functools.cache
 def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-    inter_dim, hidden_dim, topk, num_experts, layout="2x4", xcd_swizzle=True, workers=0, pair_blocks=False
+    inter_dim, hidden_dim, topk, num_experts, layout="2x4", xcd_swizzle=True, workers=0, pair_blocks=False, fp8_out=False
 ):
     """workers > 0: at most that many resident workgroups loop over the tasks (persistent).
 
     pair_blocks: aligned block pairs of one expert run N-tile-major, so both blocks stream each B tile at the
     same time and share it in L2; other tasks keep the block-major order.
+    fp8_out: sorted-row FP8 output with per (row, 128 columns) scales (see the module doc).
     """
     validate_parameters(1, inter_dim, hidden_dim, topk, num_experts)
     assert layout in LAYOUTS, layout
     assert workers % 8 == 0, "resident workgroups are spread evenly over the 8 XCDs"
     persistent = workers > 0
+    assert not (fp8_out and persistent), "fp8_out is non-persistent only"
     I, K = inter_dim, hidden_dim
     KB = K // TILE_K
     assert 2 * KB <= 64, "B scales of all K blocks must fit in one VGPR (hidden_dim <= 4096)"
@@ -84,12 +92,16 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
         ab: fx.Array[fx.Int32, 8 * PACKET_DWORDS, 16]
 
     B_BASE = 4 * PACKET_DWORDS
+    # fp8_out: per-row |x| maxima of each wave along N, 4 dwords per row after the FP8 tile (A area).
+    ROW_MAX_BASE = B_BASE
+    col_waves = 4 if stream_a else 2
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def gateup_kernel(
         pA: fx.Pointer,
         pB: fx.Pointer,
         pC: fx.Pointer,
+        pScaleC: fx.Pointer,
         pScaleA: fx.Pointer,
         pScaleB: fx.Pointer,
         pSortedIds: fx.Pointer,
@@ -224,6 +236,9 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
             scale_a_rsrc = rsrc_of(pScaleA, num_tokens * (KB * 4))
             scale_b_rsrc = rsrc_of(pScaleB, num_experts * scale_rows_b * (KB * 4))
             c_rsrc = rsrc_of(pC, num_tokens * (topk * I * 2))
+            if const_expr(fp8_out):
+                fp8_rsrc = rsrc_of(pC, num_blocks * (SORT_BLOCK_M * I))
+                fp8_scale_rsrc = rsrc_of(pScaleC, num_blocks * (SORT_BLOCK_M * (I // 128) * 4))
             zero = fx.Int32(0).ir_value()
 
             def task_scale_b(expert, n_tile, thread):
@@ -260,8 +275,8 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
 
             lds = fx.SharedAllocator().allocate(SharedTiles).peek()
 
-            def lds_view(dwords):
-                return fx.make_view(lds.ab.ptr + dwords, fx.make_layout(4, 1))
+            def lds_view(dwords, count=4):
+                return fx.make_view(lds.ab.ptr + dwords, fx.make_layout(count, 1))
 
             def read_a_slice(j, half_k):
                 return lds_view(a_read[j % 2 if stream_a else 0][half_k] + slice_packet[j] * PACKET_DWORDS).load()
@@ -499,7 +514,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
             def column_pair(lanes, m_slice, gate):
                 """16 B per lane: 8 consecutive BF16 columns of gate slice `gate` (even lane groups) or gate + 1."""
                 halves = [
-                    pack_bf16x2(
+                    pack_bf16x2_rne(
                         silu_mul(
                             Vec(accum[None, acc_index(m_slice, gate + side)].load()),
                             Vec(accum[None, acc_index(m_slice, gate_slices + gate + side)].load()),
@@ -552,6 +567,75 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                     for dwords, offset in zip(slice_words(lanes, j), slice_offsets(lanes, row_offsets_out[j])):
                         store(dwords, offset)
 
+            def row_max(row):
+                partial = Vec(lds_view(ROW_MAX_BASE + row * 4, col_waves).load()).bitcast(fx.Float32)
+                peak = partial[0]
+                for wave_col in range_constexpr(1, col_waves):
+                    peak = fx.arith.maxnumf(peak, partial[wave_col])
+                return peak
+
+            def fp8_epilogue(block, n_tile):
+                # Padding rows (zero A rows) are written too: FP8 zeros with scale 0.
+                finish_k_loop()
+                values = [
+                    [
+                        silu_mul(
+                            Vec(accum[None, acc_index(m_slice, gate)].load()),
+                            Vec(accum[None, acc_index(m_slice, gate_slices + gate)].load()),
+                        )
+                        for gate in range_constexpr(gate_slices)
+                    ]
+                    for m_slice in range_constexpr(m_slices)
+                ]
+                for m_slice in range_constexpr(m_slices):
+                    peak = fx.Float32(0.0)
+                    for gate_values in values[m_slice]:
+                        for value in gate_values:
+                            peak = fx.arith.maxnumf(peak, fx.math.absf(value))
+                    # Lanes l, l ^ 16, l ^ 32, l ^ 48 hold this wave's other columns of row l % 16.
+                    for shift in (16, 32):
+                        other = rocdl.ds_bpermute(T.i32, fx.Int32((lane ^ shift) * 4).ir_value(), peak.bitcast(fx.Int32).ir_value())
+                        peak = fx.arith.maxnumf(peak, fx.Int32(other).bitcast(fx.Float32))
+                    if lane < 16:
+                        lds_view(ROW_MAX_BASE + (slice_rows[m_slice] + lane) * 4 + wave_n, 1).store(
+                            Vec.from_elements([peak.bitcast(fx.Int32)], fx.Int32)
+                        )
+                rocdl.s_waitcnt(lgkmcnt=0)
+                barrier()
+                for m_slice in range_constexpr(m_slices):
+                    row = slice_rows[m_slice] + lane % 16
+                    amax = row_max(row)
+                    # |x| <= amax keeps x * 240 / amax within the FP8 range after rounding.
+                    inverse = (amax > 0.0).select(fx.Float32(rocdl.rcp(T.f32, amax.ir_value())) * FP8_MAX, fx.Float32(0.0))
+                    for gate in range_constexpr(gate_slices):
+                        q = [values[m_slice][gate][element] * inverse for element in range_constexpr(4)]
+                        low = rocdl.cvt_pk_fp8_f32(T.i32, q[0], q[1], fx.Int32(0), False)
+                        word = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q[2], q[3], low, True))
+                        # 4 FP8 columns 4 g .. 4 g + 3 of the 16-column chunk; lane group g = lane // 16.
+                        lds_view(_lds_dwords(row, wave_n * gate_slices + gate) + lane // 16, 1).store(
+                            Vec.from_elements([word], fx.Int32)
+                        )
+                rocdl.s_waitcnt(lgkmcnt=0)
+                barrier()
+                for part in range_constexpr(4):
+                    out_row = part * 64 + tid // 8
+                    rocdl.raw_ptr_buffer_store(
+                        Vec(lds_view(_lds_dwords(out_row, tid % 8)).load()).ir_value(),
+                        fp8_rsrc,
+                        ((block * SORT_BLOCK_M + out_row) * I + n_tile * TILE_N + tid % 8 * 16).ir_value(),
+                        zero,
+                        aux=ir.IntegerAttr.get(T.i32, 0),
+                    )
+                scale_row = tid % SORT_BLOCK_M
+                scale_offset = ((n_tile * num_blocks + block) * SORT_BLOCK_M + scale_row) * 4
+                rocdl.raw_ptr_buffer_store(
+                    (row_max(scale_row) * (1.0 / FP8_MAX)).ir_value(),
+                    fp8_scale_rsrc,
+                    (tid < SORT_BLOCK_M).select(scale_offset, fx.Int32(OOB_OFFSET)).ir_value(),
+                    zero,
+                    aux=ir.IntegerAttr.get(T.i32, 0),
+                )
+
             if const_expr(not persistent):
                 block, n_tile, pair_expert = task_coords(task)
                 expert = pair_expert if pair_blocks else uniform(load_i32(expert_rsrc, block * 4))
@@ -571,7 +655,10 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                     write_s(pro_packet)
                 start_k_loop()
                 k_loop(ops)
-                final_epilogue(block, n_tile, tid)
+                if const_expr(fp8_out):
+                    fp8_epilogue(block, n_tile)
+                else:
+                    final_epilogue(block, n_tile, tid)
             else:
                 # All four held packets of K block 0 load at once (the K loop stages two at a time).
                 h_first = fx.make_rmem_tensor(fx.make_layout((4, 4), (1, 4)), fx.Int32)
@@ -649,6 +736,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
         pA: fx.Pointer,
         pB: fx.Pointer,
         pC: fx.Pointer,
+        pScaleC: fx.Pointer,
         pScaleA: fx.Pointer,
         pScaleB: fx.Pointer,
         pSortedIds: fx.Pointer,
@@ -662,7 +750,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
         if const_expr(persistent):
             grid_x = (grid_x < workers).select(grid_x, fx.Int32(workers))
         gateup_kernel(
-            pA, pB, pC, pScaleA, pScaleB, pSortedIds, pExpertIds, pNumValid, num_tokens, num_blocks,
+            pA, pB, pC, pScaleC, pScaleA, pScaleB, pSortedIds, pExpertIds, pNumValid, num_tokens, num_blocks,
             value_attrs={"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]},
         ).launch(
             grid=(grid_x, 1, 1),
@@ -682,28 +770,39 @@ def _resident_workgroups(device):
 
 def moe_gateup_a8w8_blockscale_gfx942_lds(
     a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out, layout="2x4", xcd_swizzle=True, persistent=False,
-    pair_blocks=False,
+    pair_blocks=False, out_scale_t=None, topk=None,
 ):
     """Same arguments and result as moe_gateup_a8w8_blockscale_gfx942; layout is "2x4" or "4x2".
 
     persistent=True runs one resident workgroup per CU over all tasks; an int sets the worker count.
     pair_blocks=True orders tasks so that consecutive blocks share each B tile in L2.
+    With out_scale_t (pass topk too): out is the Down kernel's sorted-row FP8 input [blocks * 256, I] and
+    out_scale_t its FP32 scales [I/128, blocks * 256] (non-persistent only).
     """
     tokens, hidden_dim = a.shape
     num_experts, two_inter, _ = w1.shape
     inter_dim = two_inter // 2
-    topk = out.shape[1]
     num_blocks = expert_ids.numel()
+    fp8_out = out_scale_t is not None
+    if fp8_out:
+        assert topk is not None and not persistent
+        capacity = num_blocks * SORT_BLOCK_M
+        assert out.shape == (capacity, inter_dim) and out.element_size() == 1
+        assert out_scale_t.shape == (inter_dim // 128, capacity) and out_scale_t.dtype == torch.float32
+        assert capacity * inter_dim < OOB_OFFSET, "FP8 output too large for one buffer descriptor"
+    else:
+        topk = out.shape[1]
     validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts)
     assert sorted_ids.numel() >= num_blocks * SORT_BLOCK_M
     workers = _resident_workgroups(a.device) if persistent is True else int(persistent)
     launch = compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), workers, bool(pair_blocks)
+        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), workers, bool(pair_blocks), fp8_out
     )
     launch(
         flyc.from_c_void_p(fx.Int32, a.data_ptr()),
         flyc.from_c_void_p(fx.Int32, w1.data_ptr()),
         flyc.from_c_void_p(fx.Int32, out.data_ptr()),
+        flyc.from_c_void_p(fx.Float32, (out_scale_t if fp8_out else out).data_ptr()),
         flyc.from_c_void_p(fx.Float32, a_scale_t.data_ptr()),
         flyc.from_c_void_p(fx.Float32, w1_scale.data_ptr()),
         flyc.from_c_void_p(fx.Int32, sorted_ids.data_ptr()),

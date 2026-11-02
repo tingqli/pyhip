@@ -36,6 +36,11 @@ def make_routes(tokens, topk, experts, routing, generator):
         expert = torch.randint(0, experts, (tokens,), generator=generator)
         slot = torch.randint(0, topk, (tokens,), generator=generator)
         return token, slot, expert
+    if routing == "ep8":
+        # One EP8 rank of top-k over 8 * experts global experts: each token has 0 to topk local routes.
+        ids = torch.rand((tokens, 8 * experts), generator=generator).topk(topk, dim=1).indices
+        token, slot = (ids < experts).nonzero(as_tuple=True)
+        return token, slot, ids[token, slot]
     if routing == "random":
         topk_ids = torch.rand((tokens, experts), generator=generator).topk(topk, dim=1).indices
     elif routing == "balanced":
@@ -108,11 +113,13 @@ def make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing="random", 
     }
 
 
-def reference(inputs):
+def silu_mul_fp32(inputs):
+    """FP32 SiLU(gate) * up [tokens, topk, I] of every route and the routed [tokens, topk] mask."""
     tokens, inter_dim, hidden_dim, topk, experts = inputs["shape"]
     kb = hidden_dim // 128
     a_dequant = (inputs["a"].float().view(tokens, kb, 128) * inputs["a_scale_t"].t()[:, :, None]).view(tokens, hidden_dim)
-    out = torch.full((tokens, topk, inter_dim), float("nan"), device="cuda", dtype=torch.bfloat16)
+    values = torch.zeros((tokens, topk, inter_dim), device="cuda")
+    routed = torch.zeros((tokens, topk), device="cuda", dtype=torch.bool)
     token, slot, expert = inputs["routes"]
     for e in range(experts):
         rows = (expert == e).nonzero().squeeze(1)
@@ -123,8 +130,35 @@ def reference(inputs):
             * inputs["w1_scale"][e][:, None, :, None]
         ).view(2 * inter_dim, hidden_dim)
         gate, up = (a_dequant[token[rows]] @ b_dequant.t()).split(inter_dim, dim=-1)
-        out[token[rows], slot[rows]] = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+        values[token[rows], slot[rows]] = torch.nn.functional.silu(gate) * up
+        routed[token[rows], slot[rows]] = True
+    return values, routed
+
+
+def reference(inputs):
+    values, routed = silu_mul_fp32(inputs)
+    out = values.to(torch.bfloat16)
+    out[~routed] = float("nan")
     return out
+
+
+def sorted_fp8_reference(inputs):
+    """FP32 SiLU(gate) * up at sorted rows [0, num_valid) (zeros at padding) and its scales amax / 240 per 128 columns."""
+    tokens, inter_dim, hidden_dim, topk, experts = inputs["shape"]
+    values, _ = silu_mul_fp32(inputs)
+    num_valid = int(inputs["num_valid_ids"][0])
+    ids = inputs["sorted_ids"][:num_valid].long()
+    token, slot = ids & 0xFFFFFF, ids >> 24 & 0xFF
+    valid = (token < tokens) & (slot < topk)
+    rows = torch.where(valid[:, None], values[token.clamp(max=tokens - 1), slot.clamp(max=topk - 1)], 0.0)
+    scale = rows.view(num_valid, -1, 128).abs().amax(-1) / torch.finfo(dtypes.fp8).max
+    return rows, scale
+
+
+def quantize_fp8(rows, scale):
+    fp8_max = torch.finfo(dtypes.fp8).max
+    quantized = (rows.view(rows.shape[0], -1, 128) / scale[:, :, None].clamp_min(1e-30)).clamp(-fp8_max, fp8_max)
+    return quantized.to(dtypes.fp8).view(rows.shape)
 
 
 def run_kernel(inputs, out, layout="8x1", **kw):
@@ -149,6 +183,27 @@ def check(inputs, out, expected):
     torch.testing.assert_close(actual, wanted, rtol=0.05, atol=0.01)
     diff = pyhip.calc_diff(actual, wanted)
     assert diff < 1e-5, f"calc_diff {diff}"
+    # Truncating instead of rounding to nearest biases every value toward zero by ~0.3%.
+    bias = ((actual - wanted) * wanted.sign()).mean() / wanted.abs().mean()
+    assert abs(bias) < 5e-4, f"BF16 rounding bias {bias:.2e}"
+    return diff
+
+
+def check_fp8_sorted(inputs, a2, a2_scale_t, sentinel):
+    rows, scale = sorted_fp8_reference(inputs)
+    num_valid = rows.shape[0]
+    kernel_scale = a2_scale_t.t()[:num_valid]
+    torch.testing.assert_close(kernel_scale, scale, rtol=1e-4, atol=0)
+    dequant = (a2[:num_valid].float().view(num_valid, -1, 128) * kernel_scale[:, :, None]).view(num_valid, -1)
+    diff = pyhip.calc_diff(dequant, rows)
+    assert diff < 1e-3, f"calc_diff {diff}"
+    # Requantized with the kernel's scales, only FP32 rounding differences may flip an FP8 rounding.
+    requant = quantize_fp8(rows, kernel_scale)
+    mismatch = (requant.view(torch.uint8) != a2[:num_valid].view(torch.uint8)).float().mean().item()
+    assert mismatch < 0.01, f"FP8 mismatch {mismatch:.4f}"
+    # Capacity past the valid blocks is never written.
+    assert (a2[num_valid:].view(torch.uint8) == sentinel).all()
+    assert a2_scale_t[:, num_valid:].isnan().all()
     return diff
 
 
@@ -201,6 +256,41 @@ def test_gateup(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blo
         if previous is not None:
             assert torch.equal(out.view(torch.int16), previous.view(torch.int16))
         previous = out.clone()
+
+
+@pytest.mark.parametrize(
+    "tokens,inter_dim,hidden_dim,topk,experts,routing,extra_blocks",
+    [
+        (200, 256, 512, 2, 4, "random", 2),
+        (300, 256, 512, 2, 3, "random", 1),
+        (1000, 256, 384, 4, 8, "random", 0),
+        (4096, 128, 256, 8, 32, "balanced", 1),
+        (1024, 2048, 4096, 8, 32, "ep_uniform", 3),
+        (2048, 2048, 4096, 8, 32, "ep8", 1),
+    ],
+)
+@pytest.mark.parametrize(
+    "config",
+    [dict(layout="2x4"), dict(layout="4x2"), dict(layout="4x2", xcd_swizzle=False), dict(layout="2x4", pair_blocks=True)],
+    ids=["lds-2x4", "lds-4x2", "lds-4x2-linear", "lds-2x4-pair"],
+)
+def test_gateup_fp8_sorted(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks, config):
+    if not is_gfx942():
+        pytest.skip("gfx942 kernel")
+    inputs = make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=extra_blocks)
+    capacity = inputs["expert_ids"].numel() * SORT_BLOCK_M
+    a2 = torch.empty((capacity, inter_dim), device="cuda", dtype=torch.uint8)
+    a2_scale_t = torch.empty((inter_dim // 128, capacity), device="cuda")
+    previous = None
+    for _ in range(2):
+        a2.fill_(0x55)
+        a2_scale_t.fill_(float("nan"))
+        run_kernel(inputs, a2.view(dtypes.fp8), out_scale_t=a2_scale_t, topk=topk, **config)
+        torch.cuda.synchronize()
+        check_fp8_sorted(inputs, a2.view(dtypes.fp8), a2_scale_t, 0x55)
+        if previous is not None:
+            assert torch.equal(a2, previous[0]) and torch.equal(a2_scale_t.view(torch.int32), previous[1].view(torch.int32))
+        previous = a2.clone(), a2_scale_t.clone()
 
 
 def sustained(fn, flops, seconds):
@@ -335,7 +425,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden-dim", type=int, default=4096)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--experts", type=int, default=32)
-    parser.add_argument("--routing", default="ep_uniform", choices=["ep_uniform", "ep_random", "random", "balanced"])
+    parser.add_argument("--routing", default="ep_uniform", choices=["ep_uniform", "ep_random", "ep8", "random", "balanced"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--clones", type=int, default=4)
