@@ -330,6 +330,11 @@ def _buffer_store_words(words, buffer, offset):
 def _load_lds(storage, offset, immediate=0):
     # Volatile keeps the hand-written order; the LDS variable's GEP gives it an alias scope.
     ptr = fx.get_iter(storage) + (fx.Int32(offset) + immediate)
+    if not hasattr(fx, "generic_load"):
+        # FlyDSL before 0.4.0 (AITER qwen38-flash-next-dev pins 0.3.2): the same load in LLVM.
+        vector = ir.VectorType.get([4], fx.Int32.ir_type)
+        ptr = fx.to_llvm_ptr(ptr)
+        return fx.Vector(llvm.load(vector, ptr, alignment=16, volatile_=True))
     ptr = fx.recast_iter(
         fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16), ptr
     )

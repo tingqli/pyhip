@@ -127,6 +127,43 @@ def test_full_prefill_wide_tiles(heads, tile, monkeypatch):
     assert torch.equal(_call(value).view(torch.int16), output.view(torch.int16))
 
 
+@pytest.mark.parametrize(
+    "heads,rows,shared",
+    ((12, 40, False), (3, 64, False), (6, 48, True)),
+    ids=("h12-random", "h3-random", "h6-shared"),
+)
+def test_union_across_windows(heads, rows, shared, monkeypatch):
+    """Union tiles whose causal range spans two K2 windows (more than 65536 blocks): each tile's
+    block count, block list and per-row membership match its rows' selections, random selections
+    filling several LDS membership chunks in the first window; the rows match the reference."""
+    _all_union(monkeypatch)
+    value = _make_case((rows,), (300000,), heads, _gpu(), shared=shared)
+    output = _call(value)
+    plan = _latest().union
+    window = _runtime.prepare.WINDOW_BLOCKS
+    width = plan.membership.element_size() * 8
+    chunk = _runtime.prepare.MEMBER_BYTES * 8 // width
+    assert plan.max_blocks > window and bool(plan.active.all())
+    indices = value.indices.cpu().numpy()
+    counts, blocks = plan.counts.cpu().numpy(), plan.blocks.cpu().numpy()
+    membership = plan.membership.cpu().numpy()
+    for tile, (first, size) in enumerate(plan.metadata.cpu().numpy()[:, :2]):
+        # A row's blocks: its complete blocks and its causal tail block.
+        selected = [set((row[row >= 0] // 4).tolist()) for row in indices[first:first + size]]
+        union = sorted(set().union(*selected))
+        assert union[0] < window <= union[-1]
+        assert shared or sum(block < window for block in union) > chunk
+        count = int(counts[tile])
+        assert count == len(union) and blocks[tile, :count].tolist() == union
+        expected = [
+            sum(1 << j for j, row in enumerate(selected) if block in row) for block in union
+        ]
+        assert [int(bits) & ((1 << width) - 1) for bits in membership[tile, :count]] == expected
+    torch.testing.assert_close(
+        output.float(), reference(value, range(rows)), rtol=0.02, atol=0.02
+    )
+
+
 def _same_paged(value, pool_k, pool_v, slots):
     expected = _call(value)
     for table in (slots, slots.clone()):

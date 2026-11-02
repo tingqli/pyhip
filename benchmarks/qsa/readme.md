@@ -16,7 +16,7 @@ QSA分为indexer（选token）与attention（计算输出）。本页只维护�
 | 当前逐kernel性能 | 随上述两个benchmark默认输出，无独立对照脚本 |
 | 共用数据/参考、记录和JSON/CSV导出 | [_attention.py](../../tests/ops/qsa/_attention.py)、[_indexer.py](../../tests/ops/qsa/_indexer.py)、[_benchmark.py](../../tests/ops/qsa/_benchmark.py) |
 
-目标为 **ROCm gfx942（MI308X）、BF16**。使用与ROCm匹配的PyTorch、FlyDSL、Triton，以及NumPy和pytest；AITER op test另需AITER（`aiter.test_common`）、pandas和tabulate。当前验证环境为Python3.10.12、Torch2.12/ROCm7.14、FlyDSL0.4.0（与AITER `2544b2927`固定的版本相同）、Triton3.8。基础PyHIP安装不会自动安装全部可选GPU依赖。
+目标为 **ROCm gfx942（MI308X）、BF16**。使用与ROCm匹配的PyTorch、FlyDSL、Triton，以及NumPy和pytest；AITER op test另需AITER（`aiter.test_common`）、pandas和tabulate。当前验证环境为Python3.10.12、Torch2.12/ROCm7.14、FlyDSL0.4.0（与AITER `2544b2927`固定的版本相同）、Triton3.8；FlyDSL 0.3.2（AITER `qwen38-flash-next-dev`固定的版本）下QSA测试与SGLang `test_pyhip_qsa`也通过。基础PyHIP安装不会自动安装全部可选GPU依赖。
 
 Attention沿用AITER [#6576](https://github.com/ROCm/aiter/pull/6576)的源码结构和kernel名（`sparse_prefill_*`），K1–K3、union和direct全部是FlyDSL；Triton只用于indexer的I1、I2、D0、D0′四个prep kernel。Attention、prefill indexer和decode indexer的计算实现均不依赖SGLang、AITER或experiments/tests/benchmarks。Decode的top-k和token展开使用PyHIP自身的FlyDSL实现，与prefill共享选择核心。测试使用独立tensor夹具和精度参考，不创建模型或临时adapter；只有第5节的服务集成需要SGLang。
 
