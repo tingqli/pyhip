@@ -36,7 +36,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
-from .helpers import BufferTensor
+from .helpers import BufferTensor, run_compiled
 
 SORT_BLOCK_M = 256
 TILE_N = 128
@@ -52,7 +52,7 @@ LAYOUTS = ("2x4", "4x2")
 FP8_MAX = 240.0
 
 
-def validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts):
+def validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts, fp8_out=False):
     if not 0 < tokens <= TOKEN_MASK:
         raise ValueError(f"tokens must be in [1, {TOKEN_MASK}]")
     if inter_dim <= 0 or inter_dim % TILE_N:
@@ -66,8 +66,10 @@ def validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts):
         "a": tokens * hidden_dim,
         "a_scale": tokens * (hidden_dim // TILE_K) * 4,
         "weight tile": (inter_dim + TILE_N) * hidden_dim,
-        "output": tokens * topk * inter_dim * 2,
     }
+    # The FP8 sorted-row output is sized by the sort capacity, which the caller checks.
+    if not fp8_out:
+        extents["output"] = tokens * topk * inter_dim * 2
     over = [f"{name}={size:,}" for name, size in extents.items() if size >= OOB_OFFSET]
     if over:
         raise ValueError("buffer byte extents too large: " + ", ".join(over))
@@ -823,13 +825,14 @@ def moe_gateup_a8w8_blockscale_gfx942_lds(
         assert capacity * inter_dim < OOB_OFFSET, "FP8 output too large for one buffer descriptor"
     else:
         topk = out.shape[1]
-    validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts)
+    validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts, fp8_out)
     assert sorted_ids.numel() >= num_blocks * SORT_BLOCK_M
     workers = _resident_workgroups(a.device) if persistent is True else int(persistent)
     launch = compile_moe_gateup_a8w8_blockscale_gfx942_lds(
         inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), workers, bool(pair_blocks), fp8_out
     )
-    launch(
+    run_compiled(
+        launch,
         flyc.from_c_void_p(fx.Int32, a.data_ptr()),
         flyc.from_c_void_p(fx.Int32, w1.data_ptr()),
         flyc.from_c_void_p(fx.Int32, out.data_ptr()),

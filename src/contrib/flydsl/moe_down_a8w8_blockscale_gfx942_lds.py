@@ -33,7 +33,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
-from .helpers import BufferTensor
+from .helpers import BufferTensor, run_compiled
 from .moe_gateup_a8w8_blockscale_gfx942_lds import (
     LAYOUTS, OOB_OFFSET, PACKET_DWORDS, PACKET_ROWS, SORT_BLOCK_M, TILE_K, TOKEN_MASK, _lds_dwords,
 )
@@ -743,7 +743,8 @@ def compile_moe_route_counts(topk):
 def moe_route_counts(sorted_ids, num_valid_ids, expert_ids, counts, topk):
     """counts [tokens] int32 = number of local routes of each token (refilled)."""
     counts.zero_()
-    compile_moe_route_counts(topk)(
+    run_compiled(
+        compile_moe_route_counts(topk),
         flyc.from_c_void_p(fx.Int32, sorted_ids.data_ptr()),
         flyc.from_c_void_p(fx.Int32, num_valid_ids.data_ptr()),
         flyc.from_c_void_p(fx.Int32, counts.data_ptr()),
@@ -755,25 +756,34 @@ def moe_route_counts(sorted_ids, num_valid_ids, expert_ids, counts, topk):
 
 
 @functools.cache
-def compile_moe_zero_rows(hidden_dim):
-    """out[token] = 0 unless counts[token] == 1 (those rows are stored by the single_store Down kernel)."""
+def compile_moe_zero_rows(hidden_dim, bounded=False):
+    """out[token] = 0 unless counts[token] == 1 (those rows are stored by the single_store Down kernel).
+
+    bounded: only tokens below num_rows[0] (device int32, e.g. an EP receive count) are cleared.
+    """
     H = hidden_dim
     chunks = H // 8
     # 4 tokens per wave, 16 per workgroup: one workgroup per token is dispatch bound (~23 us at 32K tokens).
     tokens_per_wave = 4
 
     @flyc.kernel(known_block_size=[256, 1, 1])
-    def zero_kernel(pCounts: fx.Pointer, pOut: fx.Pointer, num_tokens: fx.Int32):
+    def zero_kernel(pCounts: fx.Pointer, pOut: fx.Pointer, pNumRows: fx.Pointer, num_tokens: fx.Int32):
         wave = fx.Int32(rocdl.readfirstlane(T.i32, (fx.thread_idx.x // 64).ir_value()))
         lane = fx.thread_idx.x % 64
         counts = fx.get_iter(
             fx.rocdl.make_buffer_tensor(fx.make_view(pCounts, fx.make_layout(1, 1)), max_size=False, num_records_bytes=num_tokens * 4)
         )
+        limit = num_tokens
+        if const_expr(bounded):
+            num_rows = fx.get_iter(
+                fx.rocdl.make_buffer_tensor(fx.make_view(pNumRows, fx.make_layout(1, 1)), max_size=False, num_records_bytes=4)
+            )
+            limit = fx.Int32(rocdl.s_buffer_load(num_rows, fx.Int32(0)))
         out_rsrc = _rsrc_of(pOut, num_tokens * (H * 2))
         for slot in range_constexpr(tokens_per_wave):
             token = (fx.Int32(fx.block_idx.x) * 4 + wave) * tokens_per_wave + slot
             # Past num_tokens the count reads 0 and the stores fall out of the descriptor.
-            if fx.Int32(rocdl.s_buffer_load(counts, token)) != 1:
+            if (fx.Int32(rocdl.s_buffer_load(counts, token)) != 1) & (token < limit):
                 for part in range_constexpr((chunks + 63) // 64):
                     chunk = lane + part * 64
                     rocdl.raw_ptr_buffer_store(
@@ -785,19 +795,26 @@ def compile_moe_zero_rows(hidden_dim):
                     )
 
     @flyc.jit
-    def launch(pCounts: fx.Pointer, pOut: fx.Pointer, num_tokens: fx.Int32, stream: fx.Stream = fx.Stream(None)):
-        zero_kernel(pCounts, pOut, num_tokens).launch(
+    def launch(
+        pCounts: fx.Pointer, pOut: fx.Pointer, pNumRows: fx.Pointer, num_tokens: fx.Int32, stream: fx.Stream = fx.Stream(None)
+    ):
+        zero_kernel(pCounts, pOut, pNumRows, num_tokens).launch(
             grid=((num_tokens + 4 * tokens_per_wave - 1) // (4 * tokens_per_wave), 1, 1), block=(256, 1, 1), stream=stream
         )
 
     return launch
 
 
-def moe_zero_rows(out, counts):
-    """Zero the rows of out [tokens, H] whose token does not have exactly one local route."""
-    compile_moe_zero_rows(out.shape[1])(
+def moe_zero_rows(out, counts, num_rows=None):
+    """Zero the rows of out [tokens, H] whose token does not have exactly one local route.
+
+    num_rows: optional device int32 tensor; rows from num_rows[0] on are left untouched.
+    """
+    run_compiled(
+        compile_moe_zero_rows(out.shape[1], num_rows is not None),
         flyc.from_c_void_p(fx.Int32, counts.data_ptr()),
         flyc.from_c_void_p(fx.Int32, out.data_ptr()),
+        flyc.from_c_void_p(fx.Int32, (counts if num_rows is None else num_rows).data_ptr()),
         out.shape[0],
         torch.cuda.current_stream(),
     )
@@ -821,7 +838,8 @@ def _launch_down(
     launch = compile_moe_down_a8w8_blockscale_gfx942_lds(
         hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store
     )
-    launch(
+    run_compiled(
+        launch,
         flyc.from_c_void_p(fx.Int32, a2.data_ptr()),
         flyc.from_c_void_p(fx.Int32, w2.data_ptr()),
         flyc.from_c_void_p(fx.Int32, target.data_ptr()),

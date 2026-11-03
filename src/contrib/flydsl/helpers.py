@@ -7,6 +7,7 @@ import types
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
@@ -18,6 +19,23 @@ from flydsl.expr.typing import as_ir_value, is_generic_address_space, is_target_
 
 def div_up(x, y):
     return (x + y - 1) // y
+
+
+def run_compiled(launch, *args):
+    """Runs a @flyc.jit launcher through its CompiledFunction for the current device.
+
+    Calling the JitFunction costs 60-90 us of host time per launch, the CompiledFunction a few us. The first call
+    on a device compiles (or loads from the FlyDSL cache) and runs it.
+    """
+    by_device = getattr(launch, "_compiled_by_device", None)
+    if by_device is None:
+        by_device = launch._compiled_by_device = {}
+    device = torch.cuda.current_device()
+    compiled = by_device.get(device)
+    if compiled is None:
+        by_device[device] = flyc.compile(launch, *args)
+    else:
+        compiled(*args)
 
 
 def div_e(x, y):

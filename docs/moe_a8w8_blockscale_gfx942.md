@@ -83,7 +83,7 @@ Down和流水线的数字都是32K、µs；有两个值时是"ep_uniform / ep8�
 - `out`必须是本rank私有的。普通store会覆盖同一行里其他生产者的结果，例如多卡往同一个buffer原子累加。实测这种用法会出错，所以默认关闭。
 - `zero_out=False`时，单路的行是覆盖而不是累加，不能用来往已有内容上累加。
 - 收益取决于单路token的比例：`ep_uniform`是100%（全部store，不用清零）；真实EP8路由约60%（32K Down −6%）；非EP（所有路由都在本卡）没有收益。
-- 接入aiter/MORI的EP时，`moe_route_counts`和`moe_zero_rows`的范围要限制在`num_local_tokens`以内，目前还没做。
+- 接入aiter/MORI的EP时，`moe_zero_rows`可以传`num_rows=num_local_tokens`，接收buffer里有效行之后的行不动；`moe_route_counts`只数有效的sorted行，本来就有界。见第6节。
 
 ## 5. 复现
 
@@ -95,7 +95,7 @@ Down和流水线的数字都是32K、µs；有两个值时是"ep_uniform / ep8�
 | ROCm / HIP | 7.2.4 / 7.2.26015 |
 | PyTorch | 2.11.0+rocm7.2，Python 3.12 |
 | FlyDSL | 0.4.0（`pip show flydsl`） |
-| aiter | https://github.com/luocheng25/aiter.git 分支`tq/moe_gemm_blockscale`，commit `0ea121f3`，源码目录直接import。asm kernel列表来自`hsa/gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_silu.csv` |
+| aiter | 第2节：容器自带的`/sgl-workspace/aiter`（ROCm/aiter `285579b62`，有本地改动），benchmark的JSON里记录为`v0.1.14-rc0-1708-g285579b62-dirty`。第6节：https://github.com/luocheng25/aiter.git 分支`tq/moe_gemm_blockscale`，commit `0ea121f3`加第6节的hook，源码目录直接import。asm kernel列表来自`hsa/gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_silu.csv` |
 | pyhip | 分支`luwei/942-fp8-blockwise` |
 
 ```bash
@@ -111,6 +111,7 @@ export HIP_VISIBLE_DEVICES=0
 python -m pytest -q tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py    # GateUp，69例
 python -m pytest -q tests/contrib/moe/test_down_a8w8_blockscale_gfx942.py      # Down、single_store、GateUp→Down，69例
 python -m pytest -q tests/contrib/moe/test_fmoe_a8w8_blockscale_asm_gfx942.py  # aiter asm，44例
+python -m pytest -q tests/contrib/moe/test_aiter_fused_moe_flydsl_gfx942.py    # 经aiter.fused_moe走FlyDSL，5例（需要带第6节hook的aiter）
 ```
 
 ### 5.3 与aiter对比
@@ -154,4 +155,41 @@ done
 - **默认不用逐次cudaPerf**：逐次计时每次都要sync，GPU在两次调用之间空闲，时钟会降，短kernel因此最多慢约30%。8K GateUp紧接着预热时是310 µs，逐次sync稳定在410 µs；asm一个长kernel只受约1%影响，所以这种测法对我们不公平。`--timing cudaperf`可以复现这种测法：8K/16K我们慢10–15%，B对调优asm的加速比降到约1.4–1.5x。
 - **不要交错单次调用**：ABBA交错时，排在空闲或轻kernel之后的变体最多慢28%。所以改成每个变体一个block，先连续预热50 ms。
 - **"不含sort"不要直接用没有sort的变体**：这些变体的`out`在计时前一刻被64–256 MB的填充写过，会让我们的GateUp+Down慢16/7/82 µs（8K/16K/32K），asm不受影响。summary用的是完整路径减去计时区间内的sort段。两个`[prep NaN+sort]`对照组验证过：计时前状态相同时，sort带来的增量两边一样，asm +51/+95/+167，我们+51/+93/+165。
-- **Host开销**：asm每次调用入队约40 µs，我们200–430 µs。queued模式下host始终跑在GPU前面，这部分不进计时。实际模型里GPU一直有活，或者用CUDA graph，也是这样。
+- **Host开销**：asm每次调用入队约40 µs，我们200–430 µs（当时每个FlyDSL kernel都走`JitFunction`调用，60–90 µs）。queued模式下host始终跑在GPU前面，这部分不进计时。现在第一次调用之后走缓存的`CompiledFunction`（`helpers.run_compiled`），每个kernel 11–23 µs。
+
+## 6. 接入aiter.fused_moe（`AITER_FMOE_FP8_BLOCKSCALE_FLYDSL=1`）
+
+- **位置**：aiter（luocheng25/aiter `tq/moe_gemm_blockscale`）的`_fused_moe_impl`，在查tuned config和sort之前判断：能走就调用[`fused_moe_a8w8_blockscale_gfx942`](../src/contrib/flydsl/moe_a8w8_blockscale_gfx942.py)，不能就每种原因记一次warning，然后走原来的路径（gfx942上是1-stage asm）。必须在sort之前接管，因为我们要block 256的sort，而且sort不能清零`out`。SGLang的调用链`moe_runner/aiter.py` → `aiter.fused_moe` → `fused_moe_` → `_fused_moe_impl` → `fused_moe_1stage`正好经过这里。
+- **接管条件**：
+  - gfx942；128×128 block-scale的FP8权重和激活，g1u1 SiLU，routing weight在Down里乘，BF16输出，gate/up分开存放。
+  - 没有bias、padding、swiglu_limit、a2_scale、stage2_scatter。
+  - 权重和scale连续，布局和asm一样：shuffle_weight(16,16)，FP32 scale `[E, 2I/128, H/128]`、`[E, H/128, I/128]`。
+  - `topk_ids.shape[0]` ≥ `AITER_FMOE_FP8_BLOCKSCALE_FLYDSL_MIN_TOKENS`，默认4096。
+  - pyhip能import，并且排序后的FP8中间结果放得进一个2 GiB的buffer descriptor。
+- **激活**：BF16输入在里面用aiter的per-1x128量化（`num_rows=num_local_tokens`）；FP8输入（MORI FP8 dispatch）要带token-major的`a1_scale [tokens, H/128]`。转置成GateUp要的`[H/128, tokens]`时，stride用buffer行数（`.t().contiguous()`）。aiter的`partial_transpose`用的是`num_local_tokens`，和GateUp不一致。
+- **EP和all-to-all**：`expert_mask`、`num_local_tokens`、dispatch policy照常交给`moe_sorting`；`moe_zero_rows`只清`num_local_tokens`以内的行；有`output=`（例如MORI combine的staging buffer）时原地写，有效行之后不动。
+- **测试**：[test_aiter_fused_moe_flydsl_gfx942.py](../tests/contrib/moe/test_aiter_fused_moe_flydsl_gfx942.py)覆盖EP + BF16输入、MORI式FP8输入 + `num_local_tokens` + `output`（有效行之后是垃圾数据和NaN）、非EP三种用法。
+
+实测：`aiter.fused_moe`整次调用，含sort和激活处理，单位µs，2026-11-03 GPU0空闲。MiMo-V2.6-Flash一个EP8 rank，random top-8。buffer行数等于EP组这一步的token数，其中有本地路由的token排在前面（约66%）。aiter默认走未调优的1-stage asm（`vs_silu_1tg_ps_32x256`）。
+
+| EP组token数 | 有效token | asm（默认） | FlyDSL | 加速比 |
+|---:|---:|---:|---:|---:|
+| 2048 | 1341 | 379 | 478 | 0.79x |
+| 4096 | 2700 | 545 | 480 | 1.14x |
+| 8192 | 5415 | 951 | 702 | 1.35x |
+| 16384 | 10781 | 1646 | 1034 | 1.59x |
+| 32768 | 21667 | 3220 | 1941 | 1.66x |
+
+- 所有token都在本卡、BF16输入（`--mode ep`）的32768：asm 3403，FlyDSL 2102，1.62x。
+- calc_diff：FlyDSL 2.5–2.6e-6，asm 1.3e-5。
+- 2048以下是asm更快：GateUp在小M时被权重读取卡住，我们还多4次launch。
+- 复现：`HIP_VISIBLE_DEVICES=0 python tests/contrib/moe/test_aiter_fused_moe_flydsl_gfx942.py --tokens 32768 [--mode ep]`。
+
+还没解决的问题：
+
+- **2 GiB上限**：排序后的FP8中间结果是`(ceil(tokens*8/256)+32)*256`行 × I。I=2048时buffer行数超过约13万就放不下，会自动回退到asm。MORI不裁剪接收buffer时（例如8×16384=131072行）就会碰到，需要SGLang按实际token数裁剪接收上限，或者给GateUp/Down加64位基址。
+- **额外显存**：asm 1-stage没有中间buffer；我们在32768行时要约570 MB（FP8中间结果加scale），每次调用从torch caching allocator分配，SGLang的显存预留要留出这部分。
+- **首次编译**：每个进程第一次调用要准备4个FlyDSL kernel，冷缓存时现场编译。服务启动时要预热，或者把FlyDSL的磁盘缓存带进镜像。
+- **FlyDSL版本**：这些kernel用FlyDSL 0.4.0，aiter自己固定的是0.3.4.1，部署时要确认aiter自己的FlyDSL kernel在0.4.0下也正常。
+- **只在MI300X验证过**（304 CU，8个XCD），其他gfx942型号没测。prefill以外（CUDA graph捕获）也没测。
+- 本卡有多条路由的token仍然用BF16 atomic，累加顺序不固定，和asm一样。
