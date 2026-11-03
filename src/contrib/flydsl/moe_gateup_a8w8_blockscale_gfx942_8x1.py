@@ -68,7 +68,7 @@ def validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts):
 
 
 @functools.cache
-def compile_moe_gateup_a8w8_blockscale_gfx942(
+def compile_moe_gateup_a8w8_blockscale_gfx942_8x1(
     inter_dim, hidden_dim, topk, num_experts, xcd_swizzle=True, b_stages=2, a_schedule="spread", b_aux=0, fixed_k=False
 ):
     """fixed_k is benchmark-only: every K block reloads block 0 (cache-resident upper bound, not a GEMM)."""
@@ -443,7 +443,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942(
     return launch
 
 
-def moe_gateup_a8w8_blockscale_gfx942(
+def moe_gateup_a8w8_blockscale_gfx942_8x1(
     a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out, xcd_swizzle=True, b_stages=2, a_schedule="spread", b_aux=0, fixed_k=False
 ):
     """a[T,K] fp8, w1[E,2I,K] fp8 shuffle_weight(16,16), a_scale_t[K/128,T], w1_scale[E,2I/128,K/128] fp32.
@@ -458,7 +458,7 @@ def moe_gateup_a8w8_blockscale_gfx942(
     num_blocks = expert_ids.numel()
     validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts)
     assert sorted_ids.numel() >= num_blocks * SORT_BLOCK_M
-    launch = compile_moe_gateup_a8w8_blockscale_gfx942(
+    launch = compile_moe_gateup_a8w8_blockscale_gfx942_8x1(
         inter_dim, hidden_dim, topk, num_experts, bool(xcd_swizzle), int(b_stages), a_schedule, int(b_aux), bool(fixed_k)
     )
     launch(

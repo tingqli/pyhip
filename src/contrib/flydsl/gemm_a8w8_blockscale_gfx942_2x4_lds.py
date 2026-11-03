@@ -34,7 +34,7 @@ def _lds_dwords(row, column):
 
 
 @functools.cache
-def compile_gemm_a8w8_blockscale_gfx942_2x4(N, K, preshuffle_b):
+def compile_gemm_a8w8_blockscale_gfx942_2x4_lds(N, K, preshuffle_b):
     assert N % 16 == 0 and K >= TILE_K and K % TILE_K == 0
     KB = K // TILE_K
     n_tiles = (N + TILE_N - 1) // TILE_N
@@ -345,11 +345,11 @@ def compile_gemm_a8w8_blockscale_gfx942_2x4(N, K, preshuffle_b):
     return launch
 
 
-def gemm_a8w8_blockscale_gfx942_2x4(x, weight, out, x_scale_t, w_scale, preshuffle_b):
+def gemm_a8w8_blockscale_gfx942_2x4_lds(x, weight, out, x_scale_t, w_scale, preshuffle_b):
     """x[M,K], weight[N,K] (optionally preshuffled), x_scale_t[K/128,M], w_scale[ceil(N/128),K/128]."""
     M, K = x.shape
     N = weight.shape[0]
-    launch = compile_gemm_a8w8_blockscale_gfx942_2x4(N, K, bool(preshuffle_b))
+    launch = compile_gemm_a8w8_blockscale_gfx942_2x4_lds(N, K, bool(preshuffle_b))
     launch(
         flyc.from_c_void_p(fx.Int32, x.data_ptr()),
         flyc.from_c_void_p(fx.Int32, weight.data_ptr()),

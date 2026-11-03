@@ -35,9 +35,9 @@ def _kernel(name):
         from pyhip.contrib.flydsl.gemm_a8w8_blockscale_gfx942_4x2_lds import gemm_a8w8_blockscale_gfx942_4x2_lds
 
         return gemm_a8w8_blockscale_gfx942_4x2_lds
-    from pyhip.contrib.flydsl.gemm_a8w8_blockscale_gfx942 import gemm_a8w8_blockscale_gfx942_2x4
+    from pyhip.contrib.flydsl.gemm_a8w8_blockscale_gfx942_2x4_lds import gemm_a8w8_blockscale_gfx942_2x4_lds
 
-    return gemm_a8w8_blockscale_gfx942_2x4
+    return gemm_a8w8_blockscale_gfx942_2x4_lds
 
 
 def run_torch(x, weight, x_scale, w_scale):

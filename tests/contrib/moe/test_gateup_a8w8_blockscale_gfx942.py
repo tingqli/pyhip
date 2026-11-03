@@ -162,7 +162,7 @@ def quantize_fp8(rows, scale):
 
 
 def run_kernel(inputs, out, layout="8x1", **kw):
-    from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942 import moe_gateup_a8w8_blockscale_gfx942
+    from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942_8x1 import moe_gateup_a8w8_blockscale_gfx942_8x1
     from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942_lds import moe_gateup_a8w8_blockscale_gfx942_lds
 
     args = (
@@ -170,7 +170,7 @@ def run_kernel(inputs, out, layout="8x1", **kw):
         inputs["sorted_ids"], inputs["expert_ids"], inputs["num_valid_ids"], out,
     )
     if layout == "8x1":
-        return moe_gateup_a8w8_blockscale_gfx942(*args, **kw)
+        return moe_gateup_a8w8_blockscale_gfx942_8x1(*args, **kw)
     return moe_gateup_a8w8_blockscale_gfx942_lds(*args, layout=layout, **kw)
 
 

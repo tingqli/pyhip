@@ -292,7 +292,7 @@ MI308X / gfx942，GPU0 独占，PTL 为 Enabled / VECTOR,F8。使用原 `cudaPer
 |---|---|---|---|
 | 8x1 | [gemm_a8w8_blockscale_gfx942_8x1.py](../../../../../src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_8x1.py) | PyHIP v32移植 | 242 VGPR、32 KiB LDS、0 scratch |
 | 4x2-LDS | [gemm_a8w8_blockscale_gfx942_4x2_lds.py](../../../../../src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_4x2_lds.py) | PyHIP 4x2-LDS移植 | 240 VGPR、64 KiB LDS、0 scratch |
-| 2x4 | [gemm_a8w8_blockscale_gfx942.py](../../../../../src/contrib/flydsl/gemm_a8w8_blockscale_gfx942.py) | FlyDSL原生r3 | 250 VGPR、64 KiB LDS、0 scratch |
+| 2x4 | [gemm_a8w8_blockscale_gfx942_2x4_lds.py](../../../../../src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_2x4_lds.py) | FlyDSL原生r3 | 250 VGPR、64 KiB LDS、0 scratch |
 
 两个移植版保留PyHIP的tile映射、MFMA/DQ顺序、barrier与4+4错相协议，以及gfx942 BF16打包（`v_add_f32`加`0x8000`位型后取高半）。12个shape×两种B布局各24例与PyHIP输出**逐位一致**，含NaN填充、guard与Graph。性能为GPU4同址32-buffer冷输入、正反两轮各64样本：
 

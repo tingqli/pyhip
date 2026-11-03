@@ -3,7 +3,7 @@
 
 """gfx942 FP8 block-scale MoE GateUp (BM256) on 2x4 / 4x2 wave grids, A and B both staged through LDS.
 
-Same interface and results as moe_gateup_a8w8_blockscale_gfx942 (8x1 grid). Per K128 block, A rows are
+Same interface and results as moe_gateup_a8w8_blockscale_gfx942_8x1. Per K128 block, A rows are
 gathered by sorted ID with eight lanes per row (128 B per row per load) into a 32 KiB LDS tile, and the B
 packets gate0, gate1, up0, up1 (64 rows each) fill another 32 KiB. The pipeline follows
 gemm_a8w8_blockscale_gfx942_4x2_lds: one operand is read for the whole K block at stage 0 ("held"), the
@@ -34,7 +34,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
 from .helpers import BufferTensor
-from .moe_gateup_a8w8_blockscale_gfx942 import LOG2E, OOB_OFFSET, SORT_BLOCK_M, TILE_N, TOKEN_MASK, validate_parameters
+from .moe_gateup_a8w8_blockscale_gfx942_8x1 import LOG2E, OOB_OFFSET, SORT_BLOCK_M, TILE_N, TOKEN_MASK, validate_parameters
 
 TILE_K = 128
 PACKET_ROWS = 64
@@ -772,7 +772,7 @@ def moe_gateup_a8w8_blockscale_gfx942_lds(
     a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out, layout="2x4", xcd_swizzle=True, persistent=False,
     pair_blocks=False, out_scale_t=None, topk=None,
 ):
-    """Same arguments and result as moe_gateup_a8w8_blockscale_gfx942; layout is "2x4" or "4x2".
+    """Same arguments and result as moe_gateup_a8w8_blockscale_gfx942_8x1; layout is "2x4" or "4x2".
 
     persistent=True runs one resident workgroup per CU over all tasks; an int sets the worker count.
     pair_blocks=True orders tasks so that consecutive blocks share each B tile in L2.
