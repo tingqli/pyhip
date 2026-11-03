@@ -65,7 +65,7 @@ Down和流水线的数字都是32K、µs；有两个值时是"ep_uniform / ep8�
 
 | 提交 | 改动 | 效果 |
 |---|---|---|
-| `cea2b4a` | GateUp：FlyDSL 8x1和2x4/4x2 LDS kernel | 2x4冷cache 433/740/820/约900 TF（4K/8K/16K/32K），见GateUp文档 |
+| `cea2b4a` | GateUp：FlyDSL 8x1和2x4/4x2 LDS kernel（8x1后来删除） | 2x4冷cache 433/740/820/约900 TF（4K/8K/16K/32K），见GateUp文档 |
 | `45afb76` | Down kernel：BM256×BN256，复用GateUp的K循环；每个wave先经LDS转置，一条atomic写2行×128 B（不转置时atomic请求约4倍） | atomic（清零+Down）847 / 887，比"写行+单独FP32 reduce"的889 / 947快5–6%；atomic只比普通store慢约5%（798 vs 762）；Down用4x2比2x4快6–8% |
 | `45afb76` | MoE的BF16输出改为round-to-nearest-even | 原来从PyHIP抄来的打包是截断，整体偏小0.28% |
 | `45afb76` | `sorted_a2`：A2按排序后的行连续读。原来按`[T, topk, I]` gather，L1 TLB miss是GateUp的8倍 | mainloop MFMA效率59%→91–92%；atomic总时间850→711 / 895→729 |
@@ -108,7 +108,7 @@ python -c "import amdsmi"         # 空闲检查用；缺少时：pip install /o
 
 ```bash
 export HIP_VISIBLE_DEVICES=0
-python -m pytest -q tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py    # GateUp，89例
+python -m pytest -q tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py    # GateUp，69例
 python -m pytest -q tests/contrib/moe/test_down_a8w8_blockscale_gfx942.py      # Down、single_store、GateUp→Down，69例
 python -m pytest -q tests/contrib/moe/test_fmoe_a8w8_blockscale_asm_gfx942.py  # aiter asm，44例
 ```

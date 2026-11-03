@@ -161,16 +161,13 @@ def quantize_fp8(rows, scale):
     return quantized.to(dtypes.fp8).view(rows.shape)
 
 
-def run_kernel(inputs, out, layout="8x1", **kw):
-    from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942_8x1 import moe_gateup_a8w8_blockscale_gfx942_8x1
+def run_kernel(inputs, out, layout="2x4", **kw):
     from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942_lds import moe_gateup_a8w8_blockscale_gfx942_lds
 
     args = (
         inputs["a"], inputs["w1"], inputs["a_scale_t"], inputs["w1_scale"],
         inputs["sorted_ids"], inputs["expert_ids"], inputs["num_valid_ids"], out,
     )
-    if layout == "8x1":
-        return moe_gateup_a8w8_blockscale_gfx942_8x1(*args, **kw)
     return moe_gateup_a8w8_blockscale_gfx942_lds(*args, layout=layout, **kw)
 
 
@@ -220,10 +217,6 @@ def check_fp8_sorted(inputs, a2, a2_scale_t, sentinel):
 @pytest.mark.parametrize(
     "config",
     [
-        dict(xcd_swizzle=True, b_stages=4, a_schedule="spread"),
-        dict(xcd_swizzle=False, b_stages=4, a_schedule="spread"),
-        dict(xcd_swizzle=True, b_stages=2, a_schedule="spread"),
-        dict(xcd_swizzle=True, b_stages=4, a_schedule="early"),
         dict(layout="2x4"),
         dict(layout="4x2"),
         dict(layout="4x2", xcd_swizzle=False),
@@ -236,9 +229,8 @@ def check_fp8_sorted(inputs, a2, a2_scale_t, sentinel):
         dict(layout="4x2", persistent=8, pair_blocks=True),
     ],
     ids=[
-        "xcd-b4-spread", "linear-b4-spread", "xcd-b2-spread", "xcd-b4-early", "lds-2x4", "lds-4x2", "lds-4x2-linear",
-        "lds-2x4-persistent", "lds-2x4-persistent8", "lds-4x2-persistent8", "lds-2x4-persistent16-linear",
-        "lds-2x4-pair", "lds-4x2-persistent8-pair",
+        "lds-2x4", "lds-4x2", "lds-4x2-linear", "lds-2x4-persistent", "lds-2x4-persistent8", "lds-4x2-persistent8",
+        "lds-2x4-persistent16-linear", "lds-2x4-pair", "lds-4x2-persistent8-pair",
     ],
 )
 def test_gateup(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks, config):

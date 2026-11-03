@@ -34,8 +34,9 @@ from flydsl.expr.typing import Vector as Vec
 
 from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
 from .helpers import BufferTensor
-from .moe_gateup_a8w8_blockscale_gfx942_8x1 import OOB_OFFSET, SORT_BLOCK_M, TOKEN_MASK
-from .moe_gateup_a8w8_blockscale_gfx942_lds import LAYOUTS, PACKET_DWORDS, PACKET_ROWS, TILE_K, _lds_dwords
+from .moe_gateup_a8w8_blockscale_gfx942_lds import (
+    LAYOUTS, OOB_OFFSET, PACKET_DWORDS, PACKET_ROWS, SORT_BLOCK_M, TILE_K, TOKEN_MASK, _lds_dwords,
+)
 
 TILE_N = 256
 # Atomic epilogue transpose tile per wave: 16 rows x 32 dwords; a 34-dword pitch keeps writes and reads conflict free.

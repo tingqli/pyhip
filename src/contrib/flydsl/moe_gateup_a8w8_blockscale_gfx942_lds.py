@@ -3,11 +3,14 @@
 
 """gfx942 FP8 block-scale MoE GateUp (BM256) on 2x4 / 4x2 wave grids, A and B both staged through LDS.
 
-Same interface and results as moe_gateup_a8w8_blockscale_gfx942_8x1. Per K128 block, A rows are
-gathered by sorted ID with eight lanes per row (128 B per row per load) into a 32 KiB LDS tile, and the B
-packets gate0, gate1, up0, up1 (64 rows each) fill another 32 KiB. The pipeline follows
-gemm_a8w8_blockscale_gfx942_4x2_lds: one operand is read for the whole K block at stage 0 ("held"), the
-other streams one 64-row packet per stage.
+out[token, slot] = BF16(SiLU(gate) * up) for every route, gate and up from one FP8 GEMM. B is aiter
+shuffle_weight(16,16) of [E, 2I, K] (gate rows, then up rows); scales are FP32: A [K/128, tokens], B
+[E, 2I/128, K/128]. Sorted IDs are (slot << 24) | token as from aiter moe_sorting(256); padding rows use an
+invalid token or slot, and blocks past ceil(num_valid_ids[0] / 256) are never read, so sort buffers may keep
+spare capacity. Per K128 block, A rows are gathered by sorted ID with eight lanes per row (128 B per row per
+load) into a 32 KiB LDS tile, and the B packets gate0, gate1, up0, up1 (64 rows each) fill another 32 KiB.
+The pipeline follows gemm_a8w8_blockscale_gfx942_4x2_lds: one operand is read for the whole K block at
+stage 0 ("held"), the other streams one 64-row packet per stage.
   2x4: 2 waves along M (128 rows) x 4 along N (32 gate + 32 up columns); B is held, A streams.
   4x2: 4 waves along M (64 rows) x 2 along N (64 gate + 64 up columns); A is held, B streams.
 B rows are placed in LDS so that every wave's gate (and up) columns are contiguous. The B scales of all
@@ -34,14 +37,40 @@ from flydsl.expr.typing import Vector as Vec
 
 from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
 from .helpers import BufferTensor
-from .moe_gateup_a8w8_blockscale_gfx942_8x1 import LOG2E, OOB_OFFSET, SORT_BLOCK_M, TILE_N, TOKEN_MASK, validate_parameters
 
+SORT_BLOCK_M = 256
+TILE_N = 128
 TILE_K = 128
+TOKEN_MASK = 0xFFFFFF
+# Past every descriptor used here; stays out of range after adding a tile-local byte offset.
+OOB_OFFSET = 0x7FFF0000
+LOG2E = 1.4426950408889634
 PACKET_ROWS = 64
 PACKET_DWORDS = PACKET_ROWS * TILE_K // 4
 LAYOUTS = ("2x4", "4x2")
 # Largest finite FP8 E4M3FNUZ (gfx942).
 FP8_MAX = 240.0
+
+
+def validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts):
+    if not 0 < tokens <= TOKEN_MASK:
+        raise ValueError(f"tokens must be in [1, {TOKEN_MASK}]")
+    if inter_dim <= 0 or inter_dim % TILE_N:
+        raise ValueError("inter_dim must be a positive multiple of 128")
+    if hidden_dim < TILE_K or hidden_dim % TILE_K:
+        raise ValueError("hidden_dim must be a positive multiple of 128")
+    if not 0 < topk < 256 or num_experts <= 0:
+        raise ValueError("require 0 < topk < 256 and num_experts > 0")
+    # Descriptor byte counts and every voffset must stay below OOB_OFFSET.
+    extents = {
+        "a": tokens * hidden_dim,
+        "a_scale": tokens * (hidden_dim // TILE_K) * 4,
+        "weight tile": (inter_dim + TILE_N) * hidden_dim,
+        "output": tokens * topk * inter_dim * 2,
+    }
+    over = [f"{name}={size:,}" for name, size in extents.items() if size >= OOB_OFFSET]
+    if over:
+        raise ValueError("buffer byte extents too large: " + ", ".join(over))
 
 
 def _lds_dwords(row, column):
@@ -772,8 +801,10 @@ def moe_gateup_a8w8_blockscale_gfx942_lds(
     a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out, layout="2x4", xcd_swizzle=True, persistent=False,
     pair_blocks=False, out_scale_t=None, topk=None,
 ):
-    """Same arguments and result as moe_gateup_a8w8_blockscale_gfx942_8x1; layout is "2x4" or "4x2".
+    """a[T,K] fp8, w1[E,2I,K] fp8 shuffle_weight(16,16), a_scale_t[K/128,T], w1_scale[E,2I/128,K/128] fp32.
 
+    sorted_ids[blocks*256] / expert_ids[blocks] / num_valid_ids[>=1] int32 as from aiter moe_sorting(256);
+    out[T,topk,I] bf16 receives SiLU(gate) * up for every valid route. layout is "2x4" or "4x2".
     persistent=True runs one resident workgroup per CU over all tasks; an int sets the worker count.
     pair_blocks=True orders tasks so that consecutive blocks share each B tile in L2.
     With out_scale_t (pass topk too): out is the Down kernel's sorted-row FP8 input [blocks * 256, I] and

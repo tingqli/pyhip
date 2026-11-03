@@ -9,9 +9,9 @@
   - `ep_uniform`：每token一个本地route，每个expert恰好`T/32`行。
   - `ep_random`：每token的本地expert随机，expert负载不均（更接近真实）。
 - Kernel（`src/contrib/flydsl/`）：
-  - `moe_gateup_a8w8_blockscale_gfx942_8x1`：8x1 wave，A直接读进VGPR，B经LDS。
-  - `moe_gateup_a8w8_blockscale_gfx942_lds`：2x4（默认）/4x2 wave，A、B都经LDS；选项`persistent`、`pair_blocks`。
-- 测试：`tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py`，13组配置×5个shape，共65例。
+  - `moe_gateup_a8w8_blockscale_gfx942_lds`：2x4（默认）/4x2 wave，A、B都经LDS；选项`persistent`、`pair_blocks`、FP8输出（`out_scale_t`）。
+  - 8x1 wave版本（A直接读进VGPR，B经LDS）已删除：不支持FP8输出，也不比2x4快。下文保留它当时的测量。
+- 测试：`tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py`，9组配置×5个shape，加上FP8输出等用例，共69例。
 
 ## 2. 测试方法
 
