@@ -151,10 +151,12 @@ def check(out, expected, routed, magnitude):
         dict(layout="4x2", reduce="atomic", xcd_swizzle=False),
         dict(layout="4x2", reduce="atomic", sorted_a2=True),
         dict(layout="2x4", reduce="kernel", sorted_a2=True),
+        dict(layout="4x2", reduce="atomic", sorted_a2=True, single_store=True),
+        dict(layout="2x4", reduce="atomic", single_store=True),
     ],
     ids=[
         "2x4-atomic", "2x4-kernel", "4x2-atomic", "4x2-kernel", "2x4-kernel-linear", "4x2-atomic-linear",
-        "4x2-atomic-sorted", "2x4-kernel-sorted",
+        "4x2-atomic-sorted", "2x4-kernel-sorted", "4x2-atomic-sorted-single", "2x4-atomic-single",
     ],
 )
 def test_down(tokens, hidden_dim, inter_dim, topk, experts, routing, extra_blocks, config):
@@ -173,6 +175,31 @@ def test_down(tokens, hidden_dim, inter_dim, topk, experts, routing, extra_block
         if config["reduce"] == "kernel" and previous is not None:
             assert torch.equal(out.view(torch.int16), previous.view(torch.int16))
         previous = out.clone()
+
+
+@pytest.mark.parametrize("tokens,topk,experts,routing,extra_blocks", [(300, 2, 3, "random", 1), (2048, 8, 32, "ep8", 2)])
+def test_route_counts(tokens, topk, experts, routing, extra_blocks):
+    from pyhip.contrib.flydsl.moe_down_a8w8_blockscale_gfx942_lds import moe_route_counts
+
+    if not is_gfx942():
+        pytest.skip("gfx942 kernel")
+    generator = torch.Generator().manual_seed(0)
+    token, slot, expert = make_routes(tokens, topk, experts, routing, generator)
+    sorted_ids, expert_ids, num_valid_ids = sort_routes(token, slot, expert, tokens, topk, experts, extra_blocks)
+    counts = torch.full((tokens,), -7, device="cuda", dtype=torch.int32)
+    moe_route_counts(sorted_ids, num_valid_ids, expert_ids, counts, topk)
+    torch.cuda.synchronize()
+    assert torch.equal(counts.cpu(), torch.bincount(token, minlength=tokens).to(torch.int32))
+
+
+def test_validate_extents():
+    from pyhip.contrib.flydsl.moe_down_a8w8_blockscale_gfx942_lds import validate_parameters
+
+    # aiter's EP sort of 32K tokens over 256 global experts at block 256 has 327680 rows: a 2.68 GB rows buffer,
+    # which only the reduce mode allocates.
+    validate_parameters(32768, 4096, 2048, 8, 32, 327680, sorted_a2=True, atomic=True)
+    with pytest.raises(ValueError, match="rows="):
+        validate_parameters(32768, 4096, 2048, 8, 32, 327680, sorted_a2=True, atomic=False)
 
 
 @pytest.mark.parametrize(
@@ -211,9 +238,9 @@ def test_gateup_down_fp8_pipeline(tokens, hidden_dim, inter_dim, topk, experts, 
     )
     expected, routed, magnitude = reference(inputs)
     out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    for reduce in ("atomic", "kernel"):
+    for reduce, single_store in (("atomic", False), ("atomic", True), ("kernel", False)):
         out.fill_(float("nan"))
-        run_kernel(inputs, out, sorted_a2=True, layout=down_layout, reduce=reduce)
+        run_kernel(inputs, out, sorted_a2=True, layout=down_layout, reduce=reduce, single_store=single_store)
         torch.cuda.synchronize()
         check(out, expected, routed, magnitude)
 

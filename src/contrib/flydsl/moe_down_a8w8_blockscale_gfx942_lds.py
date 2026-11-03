@@ -13,7 +13,9 @@ one workgroup takes a 256-row sorted block and 256 hidden columns.
   4x2: 4 waves along M (64 rows) x 2 along N (128 columns); A is held, B streams.
 A token's routes are summed in one of two ways:
   atomic=True: BF16 y is added into out [tokens, H] (zeroed beforehand) with global_atomic_pk_add_bf16. Each
-      wave transposes its tile through LDS so that one atomic covers two rows x 128 contiguous bytes.
+      wave transposes its tile through LDS so that one atomic covers two rows x 128 contiguous bytes. With
+      single_store, rows of tokens with one local route (route_counts from compile_moe_route_counts) are plain
+      stores: nothing else adds to them.
   atomic=False: BF16 y is stored at its sorted position in rows [blocks * 256, H], and inverse[token, slot]
       receives that position (filled with -1 beforehand); compile_moe_down_reduce then sums every token's routes
       in FP32, in slot order.
@@ -41,7 +43,7 @@ TRANSPOSE_PITCH = 34
 REDUCE_COLUMNS = 16
 
 
-def validate_parameters(tokens, hidden_dim, inter_dim, topk, num_experts, capacity=SORT_BLOCK_M, sorted_a2=False):
+def validate_parameters(tokens, hidden_dim, inter_dim, topk, num_experts, capacity=SORT_BLOCK_M, sorted_a2=False, atomic=True):
     if not 0 < tokens <= TOKEN_MASK:
         raise ValueError(f"tokens must be in [1, {TOKEN_MASK}]")
     if hidden_dim <= 0 or hidden_dim % TILE_N or hidden_dim // REDUCE_COLUMNS > 1024:
@@ -57,8 +59,9 @@ def validate_parameters(tokens, hidden_dim, inter_dim, topk, num_experts, capaci
         "a2_scale": a2_rows * (inter_dim // TILE_K) * 4,
         "weight tile": TILE_N * inter_dim,
         "output": tokens * hidden_dim * 2,
-        "rows": capacity * hidden_dim * 2,
     }
+    if not atomic:
+        extents["rows"] = capacity * hidden_dim * 2
     over = [f"{name}={size:,}" for name, size in extents.items() if size >= OOB_OFFSET]
     if over:
         raise ValueError("buffer byte extents too large: " + ", ".join(over))
@@ -73,10 +76,11 @@ def _rsrc_of(ptr, num_records_bytes):
 
 @functools.cache
 def compile_moe_down_a8w8_blockscale_gfx942_lds(
-    hidden_dim, inter_dim, topk, num_experts, layout="2x4", xcd_swizzle=True, atomic=True, sorted_a2=False
+    hidden_dim, inter_dim, topk, num_experts, layout="2x4", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False
 ):
     validate_parameters(1, hidden_dim, inter_dim, topk, num_experts, sorted_a2=sorted_a2)
     assert layout in LAYOUTS, layout
+    assert atomic or not single_store
     H, K = hidden_dim, inter_dim
     KB = K // TILE_K
     n_tiles = H // TILE_N
@@ -128,6 +132,7 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
         pExpertIds: fx.Pointer,
         pNumValid: fx.Pointer,
         pInverse: fx.Pointer,
+        pRouteCounts: fx.Pointer,
         num_tokens: fx.Int32,
         num_blocks: fx.Int32,
     ):
@@ -459,7 +464,14 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                 token_offsets = []
                 for fused in out_ids:
                     _, out_token, out_valid = decode(fused)
-                    token_offsets.append(out_valid.select(out_token * (H * 2), fx.Int32(-1)))
+                    row_offset = out_token * (H * 2)
+                    if const_expr(single_store):
+                        # Bit 0 marks the token's only local route: a plain store, no other route adds to it.
+                        routes = load_i32(
+                            _rsrc_of(pRouteCounts, num_tokens * 4), out_valid.select(out_token * 4, fx.Int32(OOB_OFFSET))
+                        )
+                        row_offset = row_offset | (routes == 1).select(fx.Int32(1), fx.Int32(0))
+                    token_offsets.append(out_valid.select(row_offset, fx.Int32(-1)))
                 out_base = fx.Int64(fx.ptrtoint(pOut)).ir_value()
                 transpose = wave * (16 * TRANSPOSE_PITCH)
                 write_base = transpose + lane % 16 * TRANSPOSE_PITCH + lane // 16 * 2
@@ -492,14 +504,27 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                         for i in range_constexpr(8):
                             value = fx.Int32(llvm.extractvalue(T.i32, copies, [i]))
                             row_offset = row_offsets[i]
-                            if row_offset >= 0:
-                                llvm.inline_asm(
-                                    None,
-                                    [(row_offset + column_base + c * 128).ir_value(), value.ir_value(), out_base],
-                                    "global_atomic_pk_add_bf16 $0, $1, $2",
-                                    "v,v,s",
-                                    has_side_effects=True,
-                                )
+                            if const_expr(single_store):
+                                address = ((row_offset & -2) + column_base + c * 128).ir_value()
+                                if (row_offset >= 0) & ((row_offset & 1) == 1):
+                                    llvm.inline_asm(
+                                        None, [address, value.ir_value(), out_base], "global_store_dword $0, $1, $2", "v,v,s",
+                                        has_side_effects=True,
+                                    )
+                                if (row_offset >= 0) & ((row_offset & 1) == 0):
+                                    llvm.inline_asm(
+                                        None, [address, value.ir_value(), out_base], "global_atomic_pk_add_bf16 $0, $1, $2", "v,v,s",
+                                        has_side_effects=True,
+                                    )
+                            else:
+                                if row_offset >= 0:
+                                    llvm.inline_asm(
+                                        None,
+                                        [(row_offset + column_base + c * 128).ir_value(), value.ir_value(), out_base],
+                                        "global_atomic_pk_add_bf16 $0, $1, $2",
+                                        "v,v,s",
+                                        has_side_effects=True,
+                                    )
             else:
                 row_offsets_out = []
                 for row, fused in zip(lane_rows, out_ids):
@@ -578,12 +603,14 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
         pExpertIds: fx.Pointer,
         pNumValid: fx.Pointer,
         pInverse: fx.Pointer,
+        pRouteCounts: fx.Pointer,
         num_tokens: fx.Int32,
         num_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         down_kernel(
-            pA, pB, pOut, pScaleA, pScaleB, pSortedIds, pSortedWeights, pExpertIds, pNumValid, pInverse, num_tokens, num_blocks,
+            pA, pB, pOut, pScaleA, pScaleB, pSortedIds, pSortedWeights, pExpertIds, pNumValid, pInverse, pRouteCounts,
+            num_tokens, num_blocks,
             value_attrs={"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]},
         ).launch(
             grid=((num_blocks * n_tiles + 7) // 8 * 8, 1, 1),
@@ -673,20 +700,125 @@ def moe_down_reduce(rows, inverse, out):
     return out
 
 
+@functools.cache
+def compile_moe_route_counts(topk):
+    """counts[token] += 1 for every valid sorted ID (counts zeroed by the caller): local routes per token."""
+
+    @flyc.kernel(known_block_size=[SORT_BLOCK_M, 1, 1])
+    def count_kernel(pSortedIds: fx.Pointer, pNumValid: fx.Pointer, pCounts: fx.Pointer, num_tokens: fx.Int32, num_blocks: fx.Int32):
+        zero = fx.Int32(0).ir_value()
+        position = fx.Int32(fx.block_idx.x) * SORT_BLOCK_M + fx.thread_idx.x
+        valid_rows = fx.Int32(rocdl.raw_ptr_buffer_load(T.i32, _rsrc_of(pNumValid, 4), zero, zero, zero))
+        fused = fx.Int32(
+            rocdl.raw_ptr_buffer_load(T.i32, _rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), (position * 4).ir_value(), zero, zero)
+        )
+        token = fused & TOKEN_MASK
+        slot = (fused >> 24) & 255
+        if (token < num_tokens) & (slot < topk) & (position < valid_rows):
+            llvm.inline_asm(
+                None,
+                [(token * 4).ir_value(), fx.Int32(1).ir_value(), fx.Int64(fx.ptrtoint(pCounts)).ir_value()],
+                "global_atomic_add $0, $1, $2",
+                "v,v,s",
+                has_side_effects=True,
+            )
+
+    @flyc.jit
+    def launch(
+        pSortedIds: fx.Pointer,
+        pNumValid: fx.Pointer,
+        pCounts: fx.Pointer,
+        num_tokens: fx.Int32,
+        num_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        count_kernel(pSortedIds, pNumValid, pCounts, num_tokens, num_blocks).launch(
+            grid=(num_blocks, 1, 1), block=(SORT_BLOCK_M, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def moe_route_counts(sorted_ids, num_valid_ids, expert_ids, counts, topk):
+    """counts [tokens] int32 = number of local routes of each token (refilled)."""
+    counts.zero_()
+    compile_moe_route_counts(topk)(
+        flyc.from_c_void_p(fx.Int32, sorted_ids.data_ptr()),
+        flyc.from_c_void_p(fx.Int32, num_valid_ids.data_ptr()),
+        flyc.from_c_void_p(fx.Int32, counts.data_ptr()),
+        counts.numel(),
+        expert_ids.numel(),
+        torch.cuda.current_stream(),
+    )
+    return counts
+
+
+@functools.cache
+def compile_moe_zero_rows(hidden_dim):
+    """out[token] = 0 unless counts[token] == 1 (those rows are stored by the single_store Down kernel)."""
+    H = hidden_dim
+    chunks = H // 8
+    # 4 tokens per wave, 16 per workgroup: one workgroup per token is dispatch bound (~23 us at 32K tokens).
+    tokens_per_wave = 4
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def zero_kernel(pCounts: fx.Pointer, pOut: fx.Pointer, num_tokens: fx.Int32):
+        wave = fx.Int32(rocdl.readfirstlane(T.i32, (fx.thread_idx.x // 64).ir_value()))
+        lane = fx.thread_idx.x % 64
+        counts = fx.get_iter(
+            fx.rocdl.make_buffer_tensor(fx.make_view(pCounts, fx.make_layout(1, 1)), max_size=False, num_records_bytes=num_tokens * 4)
+        )
+        out_rsrc = _rsrc_of(pOut, num_tokens * (H * 2))
+        for slot in range_constexpr(tokens_per_wave):
+            token = (fx.Int32(fx.block_idx.x) * 4 + wave) * tokens_per_wave + slot
+            # Past num_tokens the count reads 0 and the stores fall out of the descriptor.
+            if fx.Int32(rocdl.s_buffer_load(counts, token)) != 1:
+                for part in range_constexpr((chunks + 63) // 64):
+                    chunk = lane + part * 64
+                    rocdl.raw_ptr_buffer_store(
+                        Vec.filled(4, 0, fx.Int32).ir_value(),
+                        out_rsrc,
+                        (chunk < chunks).select(chunk * 16, fx.Int32(OOB_OFFSET)).ir_value(),
+                        (token * (H * 2)).ir_value(),
+                        aux=ir.IntegerAttr.get(T.i32, 0),
+                    )
+
+    @flyc.jit
+    def launch(pCounts: fx.Pointer, pOut: fx.Pointer, num_tokens: fx.Int32, stream: fx.Stream = fx.Stream(None)):
+        zero_kernel(pCounts, pOut, num_tokens).launch(
+            grid=((num_tokens + 4 * tokens_per_wave - 1) // (4 * tokens_per_wave), 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def moe_zero_rows(out, counts):
+    """Zero the rows of out [tokens, H] whose token does not have exactly one local route."""
+    compile_moe_zero_rows(out.shape[1])(
+        flyc.from_c_void_p(fx.Int32, counts.data_ptr()),
+        flyc.from_c_void_p(fx.Int32, out.data_ptr()),
+        out.shape[0],
+        torch.cuda.current_stream(),
+    )
+    return out
+
+
 def _launch_down(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, target, inverse, layout, xcd_swizzle,
-    atomic, tokens, topk,
+    atomic, tokens, topk, route_counts=None,
 ):
     sorted_a2 = a2.dim() == 2
     inter_dim = a2.shape[-1]
     num_experts, hidden_dim, _ = w2.shape
     num_blocks = expert_ids.numel()
     capacity = num_blocks * SORT_BLOCK_M
-    validate_parameters(tokens, hidden_dim, inter_dim, topk, num_experts, capacity, sorted_a2)
+    validate_parameters(tokens, hidden_dim, inter_dim, topk, num_experts, capacity, sorted_a2, atomic)
     assert sorted_ids.numel() >= capacity and sorted_weights.numel() >= capacity
     assert a2.shape[0] >= capacity if sorted_a2 else a2.shape[:2] == (tokens, topk)
+    single_store = route_counts is not None
+    assert not single_store or route_counts.shape == (tokens,) and route_counts.dtype == torch.int32
     launch = compile_moe_down_a8w8_blockscale_gfx942_lds(
-        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2
+        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store
     )
     launch(
         flyc.from_c_void_p(fx.Int32, a2.data_ptr()),
@@ -699,6 +831,7 @@ def _launch_down(
         flyc.from_c_void_p(fx.Int32, expert_ids.data_ptr()),
         flyc.from_c_void_p(fx.Int32, num_valid_ids.data_ptr()),
         flyc.from_c_void_p(fx.Int32, inverse.data_ptr()),
+        flyc.from_c_void_p(fx.Int32, (route_counts if single_store else inverse).data_ptr()),
         tokens,
         num_blocks,
         torch.cuda.current_stream(),
@@ -722,6 +855,7 @@ def moe_down_rows_a8w8_blockscale_gfx942_lds(
 def moe_down_a8w8_blockscale_gfx942_lds(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out,
     layout="2x4", xcd_swizzle=True, reduce="atomic", zero_out=True, rows=None, inverse=None, topk=None,
+    single_store=False, route_counts=None,
 ):
     """out [tokens, H] BF16 = sum over each token's routes of routing weight * (a2 row @ w2[expert]^T).
 
@@ -729,18 +863,25 @@ def moe_down_a8w8_blockscale_gfx942_lds(
     a2_scale_t [I/128, blocks * 256] (then pass topk); w2 shuffle_weight(16,16) of [E, H, I] FP8,
     w2_scale [E, H/128, I/128], sorted_weights [blocks * 256] FP32 alongside sorted_ids.
     reduce="atomic": the Down kernel adds every route into out with BF16 atomics (zero_out=False keeps out's
-    contents). reduce="kernel": the Down kernel writes rows and inverse (optional preallocated buffers),
-    then moe_down_reduce writes out.
+    contents); single_store=True stores the rows of single-route tokens instead (route_counts: precomputed
+    moe_route_counts, else computed here) and zero_out then clears only the other rows. reduce="kernel": the
+    Down kernel writes rows and inverse (optional preallocated buffers), then moe_down_reduce writes out.
     """
     assert reduce in ("atomic", "kernel"), reduce
     topk = a2.shape[1] if a2.dim() == 3 else topk
     assert topk is not None, "pass topk with a sorted-row a2"
     if reduce == "atomic":
+        if single_store and route_counts is None:
+            route_counts = torch.empty(out.shape[0], device=out.device, dtype=torch.int32)
+            moe_route_counts(sorted_ids, num_valid_ids, expert_ids, route_counts, topk)
         if zero_out:
-            out.zero_()
+            if single_store:
+                moe_zero_rows(out, route_counts)
+            else:
+                out.zero_()
         _launch_down(
             a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, out, layout, xcd_swizzle,
-            True, out.shape[0], topk,
+            True, out.shape[0], topk, route_counts if single_store else None,
         )
         return out
     if rows is None:
