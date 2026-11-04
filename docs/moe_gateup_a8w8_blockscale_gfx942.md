@@ -9,9 +9,9 @@
   - `ep_uniform`：每token一个本地route，每个expert恰好`T/32`行。
   - `ep_random`：每token的本地expert随机，expert负载不均（更接近真实）。
 - Kernel（`src/contrib/flydsl/`）：
-  - `moe_gateup_a8w8_blockscale_gfx942_lds`：2x4（默认）/4x2 wave，A、B都经LDS；选项`persistent`、`pair_blocks`、FP8输出（`out_scale_t`）。
+  - `moe_gateup_a8w8_blockscale_gfx942_lds`：`layout="2x4_pf1"`（默认）/`"4x2_pf1"`，即M×N的wave排布，global load比写LDS早1个stage；A、B都经LDS；选项`pair_blocks`、FP8输出（`out_scale_t`）。常驻版本（`persistent`）已删除，见4.5。
   - 8x1 wave版本（A直接读进VGPR，B经LDS）已删除：不支持FP8输出，也不比2x4快。下文保留它当时的测量。
-- 测试：`tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py`，9组配置×5个shape，加上FP8输出等用例，共69例。
+- 测试：`tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py`，5组配置×5个shape，加上FP8输出的24例，共49例。
 
 ## 2. 测试方法
 
@@ -63,9 +63,10 @@
   - `s_endpgm`隐式等所有store写完1.7k。
 - 上限：同时去掉SiLU和store，快3.7%/3.1%/5.5%。
 
-### 4.5 常驻kernel（`persistent=True`）
+### 4.5 常驻kernel（`persistent=True`，已删除）
 
-- 结果：任务切换时间缩短（16K从20.3k降到16.9k cycle，8K从22.6k降到约18k），但冷cache和连续运行的墙钟时间都不变，原因见4.1。默认关闭。
+- 结果：任务切换时间缩短（16K从20.3k降到16.9k cycle，8K从22.6k降到约18k），但冷cache和连续运行的墙钟时间都不变，原因见4.1。
+- 2026-11-04复测（GPU3空闲，冷cache，2x4 BF16输出，正反交错5轮×10次）：相对非常驻，`ep8` 4K/8K/16K/32K为−0.3%/+1.0%/0.0%/+0.9%，`ep_uniform`为−0.3%/+0.7%/+0.3%/+0.7%，输出逐位相同。没有收益，融合流程用的FP8输出又不支持常驻，所以删除。
 - 实现中的坑：
   - 下一任务的读必须在任何输出store之前发出。TLB miss的store会堵住CU按序处理的访存队列，排在后面的读被卡约3.5k cycle。
   - store不能堆到全部SiLU之后（发射卡顿约9k cycle），要和SiLU交错。
@@ -86,6 +87,7 @@
 - `pair_blocks=True`：相邻且属于同一expert的两个block按N tile交错执行，在L2共享B。
   - 16K `ep_uniform`快2.2–2.6%（L2 miss从7.37M降到5.54M）；`ep_random` 16K快1.0%；8K不变。
   - 不检查expert的版本在`ep_random`下反而慢1–1.5%：成对的block跨expert，把原本相邻的同expert block拆开了。
+  - 2026-11-04复测（同4.5的协议，输出逐位相同）：FP8输出`ep8` 4K/8K/16K/32K为+0.2%/−1.0%/−0.5%/−0.1%，`ep_uniform`为+0.3%/+0.2%/−3.5%/−1.2%；BF16输出`ep8`为+0.2%/−0.3%/−1.3%/−0.7%。有收益，保留，默认仍关闭。
 
 ### 4.8 反量化与GEMM核心
 
@@ -97,4 +99,4 @@
 1. 按64行跳过全padding的块（真实负载收益最大；4K上限−13.7%）。
 2. 反量化改用`v_pk_fma_f32`（上限3–4%，预计1.5–2%）。
 3. SiLU用packed指令（预计0.5–1%）。
-4. 决定`pair_blocks`是否默认开启。
+4. 决定`pair_blocks`是否默认开启（FP8输出16K `ep_uniform`快3.5%，`ep8`最多快1%，4K持平）。

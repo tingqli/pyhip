@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FP8 block-scale fused MoE: GateUp 2x4 with FP8 sorted-row output, then Down 4x2 with single_store.
+"""gfx942 FP8 block-scale fused MoE: GateUp 2x4_pf1 with FP8 sorted-row output, then Down 4x2_pf1 with single_store.
 
 This is what aiter.fused_moe runs in place of the 1-stage asm kernel fmoe_fp8_blockscale_g1u1 when
 AITER_FMOE_FP8_BLOCKSCALE_FLYDSL=1 (see docs/moe_a8w8_blockscale_gfx942.md). Inputs use the asm kernel's layouts:
@@ -26,8 +26,8 @@ from .moe_gateup_a8w8_blockscale_gfx942_lds import (
     validate_parameters as validate_gateup,
 )
 
-GATEUP_LAYOUT = "2x4"
-DOWN_LAYOUT = "4x2"
+GATEUP_LAYOUT = "2x4_pf1"
+DOWN_LAYOUT = "4x2_pf1"
 
 
 def max_sorted_blocks(tokens, topk, local_experts):

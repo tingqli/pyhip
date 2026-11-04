@@ -9,8 +9,8 @@ Per route y = routing weight * (A2 row @ W2[expert]^T): A2 is FP8 [tokens, topk,
 [I/128, blocks * 256]): a block's rows are then contiguous instead of spread over the whole [tokens, topk, I]
 tensor, which thrashes the L1 TLB on every K block. The K loop is the one of moe_gateup_a8w8_blockscale_gfx942_lds;
 one workgroup takes a 256-row sorted block and 256 hidden columns.
-  2x4: 2 waves along M (128 rows) x 4 along N (64 columns); B is held, A streams.
-  4x2: 4 waves along M (64 rows) x 2 along N (128 columns); A is held, B streams.
+  2x4_pf1: 2 waves along M (128 rows) x 4 along N (64 columns); B is held, A streams.
+  4x2_pf1: 4 waves along M (64 rows) x 2 along N (128 columns); A is held, B streams.
 A token's routes are summed in one of two ways:
   atomic=True: BF16 y is added into out [tokens, H] (zeroed beforehand) with global_atomic_pk_add_bf16. Each
       wave transposes its tile through LDS so that one atomic covers two rows x 128 contiguous bytes. With
@@ -77,7 +77,7 @@ def _rsrc_of(ptr, num_records_bytes):
 
 @functools.cache
 def compile_moe_down_a8w8_blockscale_gfx942_lds(
-    hidden_dim, inter_dim, topk, num_experts, layout="2x4", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False
+    hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False
 ):
     validate_parameters(1, hidden_dim, inter_dim, topk, num_experts, sorted_a2=sorted_a2)
     assert layout in LAYOUTS, layout
@@ -87,7 +87,7 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
     n_tiles = H // TILE_N
     b_k_bytes = TILE_K * 16
     scale_rows_b = H // 128
-    stream_a = layout == "2x4"
+    stream_a = layout == "2x4_pf1"
     # 16-row M / N slices per wave.
     m_slices = 8 if stream_a else 4
     n_slices = 32 // m_slices
@@ -859,7 +859,7 @@ def _launch_down(
 
 def moe_down_rows_a8w8_blockscale_gfx942_lds(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, rows, inverse,
-    layout="2x4", xcd_swizzle=True,
+    layout="2x4_pf1", xcd_swizzle=True,
 ):
     """Down kernel only: rows [blocks * 256, H] BF16 per sorted position, inverse [tokens, topk] (refilled)."""
     assert rows.shape[0] >= expert_ids.numel() * SORT_BLOCK_M
@@ -873,7 +873,7 @@ def moe_down_rows_a8w8_blockscale_gfx942_lds(
 
 def moe_down_a8w8_blockscale_gfx942_lds(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out,
-    layout="2x4", xcd_swizzle=True, reduce="atomic", zero_out=True, rows=None, inverse=None, topk=None,
+    layout="2x4_pf1", xcd_swizzle=True, reduce="atomic", zero_out=True, rows=None, inverse=None, topk=None,
     single_store=False, route_counts=None,
 ):
     """out [tokens, H] BF16 = sum over each token's routes of routing weight * (a2 row @ w2[expert]^T).

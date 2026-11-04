@@ -8,8 +8,8 @@
 - 路由`ep_uniform`（专家均分）：每个token恰好1个本地路由，每个本地expert分到T/32行。
 - 我们的流程：
   1. aiter `moe_sorting`，block 256，EP方式（全局expert id + `expert_mask`）。
-  2. GateUp 2x4，`out_scale_t=`（fp8_out）：epilogue里把SiLU(gate)·up按(row, 128)量化成FP8，按排序后的行写出A2 `[blocks*256, I]`。
-  3. Down 4x2，读排序后的A2，`reduce="atomic"`，有两种写法：
+  2. GateUp `2x4_pf1`，`out_scale_t=`（fp8_out）：epilogue里把SiLU(gate)·up按(row, 128)量化成FP8，按排序后的行写出A2 `[blocks*256, I]`。
+  3. Down `4x2_pf1`，读排序后的A2，`reduce="atomic"`，有两种写法：
      - **atomic**：每一路用BF16 `global_atomic_pk_add_bf16`加进`out [T, H]`。`out`需要先清零，由aiter的sort顺带完成。
      - **B（`single_store=True`）**：本卡只有1路的token直接`global_store_dword`。`moe_route_counts`统计每个token的本地路数，`moe_zero_rows`只清零count≠1的行；sort不再清零`out`（传一个空的moe_buf）。
 - 对手：aiter `fmoe_fp8_blockscale_g1u1`，gfx942上的1-stage asm，GateUp、SiLU、量化、Down在一个kernel里。输入和`aiter.fused_moe`在gfx942上喂给它的一样：预先量化好的FP8 a1加转置的scale。激活量化两边都不计时。
@@ -76,7 +76,7 @@ Down和流水线的数字都是32K、µs；有两个值时是"ep_uniform / ep8�
 
 - **清零放到另一个stream，和GateUp并行**：慢1–4%。GateUp占满了每个CU的寄存器，清零kernel只能在GateUp收尾时才上得去，还要分走功耗。
 - **常驻kernel，把atomic推到下一个任务的K循环里**：gfx942上普通读和atomic共用`vmcnt`，K循环等数据时也要等atomic确认。第一版proxy测得更慢，但后来发现proxy本身有问题，没有在真实kernel上实现。
-- **GateUp常驻kernel**：任务切换变短，但在750 W功耗墙下墙钟时间不变。`pair_blocks`只在16K快约2%，默认关闭。见GateUp文档。
+- **GateUp常驻kernel**：任务切换变短，但在750 W功耗墙下墙钟时间不变（2026-11-04复测−0.3%～+1.0%），已删除。`pair_blocks`保留、默认关闭：FP8输出在16K `ep_uniform`快3.5%，`ep8`最多快1%。见GateUp文档4.5、4.7。
 
 ## 4. single_store的适用条件
 

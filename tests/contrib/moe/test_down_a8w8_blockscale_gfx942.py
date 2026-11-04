@@ -143,16 +143,16 @@ def check(out, expected, routed, magnitude):
 @pytest.mark.parametrize(
     "config",
     [
-        dict(layout="2x4", reduce="atomic"),
-        dict(layout="2x4", reduce="kernel"),
-        dict(layout="4x2", reduce="atomic"),
-        dict(layout="4x2", reduce="kernel"),
-        dict(layout="2x4", reduce="kernel", xcd_swizzle=False),
-        dict(layout="4x2", reduce="atomic", xcd_swizzle=False),
-        dict(layout="4x2", reduce="atomic", sorted_a2=True),
-        dict(layout="2x4", reduce="kernel", sorted_a2=True),
-        dict(layout="4x2", reduce="atomic", sorted_a2=True, single_store=True),
-        dict(layout="2x4", reduce="atomic", single_store=True),
+        dict(layout="2x4_pf1", reduce="atomic"),
+        dict(layout="2x4_pf1", reduce="kernel"),
+        dict(layout="4x2_pf1", reduce="atomic"),
+        dict(layout="4x2_pf1", reduce="kernel"),
+        dict(layout="2x4_pf1", reduce="kernel", xcd_swizzle=False),
+        dict(layout="4x2_pf1", reduce="atomic", xcd_swizzle=False),
+        dict(layout="4x2_pf1", reduce="atomic", sorted_a2=True),
+        dict(layout="2x4_pf1", reduce="kernel", sorted_a2=True),
+        dict(layout="4x2_pf1", reduce="atomic", sorted_a2=True, single_store=True),
+        dict(layout="2x4_pf1", reduce="atomic", single_store=True),
     ],
     ids=[
         "2x4-atomic", "2x4-kernel", "4x2-atomic", "4x2-kernel", "2x4-kernel-linear", "4x2-atomic-linear",
@@ -206,7 +206,7 @@ def test_validate_extents():
     "tokens,hidden_dim,inter_dim,topk,experts,routing",
     [(300, 512, 256, 2, 3, "random"), (1024, 4096, 2048, 8, 32, "ep_uniform"), (2048, 4096, 2048, 8, 32, "ep8")],
 )
-@pytest.mark.parametrize("gateup_layout,down_layout", [("2x4", "4x2"), ("4x2", "2x4")])
+@pytest.mark.parametrize("gateup_layout,down_layout", [("2x4_pf1", "4x2_pf1"), ("4x2_pf1", "2x4_pf1")])
 def test_gateup_down_fp8_pipeline(tokens, hidden_dim, inter_dim, topk, experts, routing, gateup_layout, down_layout):
     """GEMM1 writes the sorted-row FP8 A2 and its scales; GEMM2 reads them with sorted_a2."""
     if not is_gfx942():
@@ -327,7 +327,7 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--experts", type=int, default=32)
     parser.add_argument("--routing", default="ep_uniform", choices=["ep_uniform", "ep_random", "ep8", "random", "balanced"])
-    parser.add_argument("--layouts", nargs="+", default=["2x4", "4x2"])
+    parser.add_argument("--layouts", nargs="+", default=["2x4_pf1", "4x2_pf1"])
     parser.add_argument("--sorted-a2", action="store_true", help="also time the sorted-row A2 input")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check", action="store_true")

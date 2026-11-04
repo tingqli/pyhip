@@ -161,7 +161,7 @@ def quantize_fp8(rows, scale):
     return quantized.to(dtypes.fp8).view(rows.shape)
 
 
-def run_kernel(inputs, out, layout="2x4", **kw):
+def run_kernel(inputs, out, layout="2x4_pf1", **kw):
     from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942_lds import moe_gateup_a8w8_blockscale_gfx942_lds
 
     args = (
@@ -217,21 +217,13 @@ def check_fp8_sorted(inputs, a2, a2_scale_t, sentinel):
 @pytest.mark.parametrize(
     "config",
     [
-        dict(layout="2x4"),
-        dict(layout="4x2"),
-        dict(layout="4x2", xcd_swizzle=False),
-        dict(layout="2x4", persistent=True),
-        # Few workers so each loops over many tasks (odd K blocks, dead last prefetch, XCD ranges).
-        dict(layout="2x4", persistent=8),
-        dict(layout="4x2", persistent=8),
-        dict(layout="2x4", persistent=16, xcd_swizzle=False),
-        dict(layout="2x4", pair_blocks=True),
-        dict(layout="4x2", persistent=8, pair_blocks=True),
+        dict(layout="2x4_pf1"),
+        dict(layout="4x2_pf1"),
+        dict(layout="4x2_pf1", xcd_swizzle=False),
+        dict(layout="2x4_pf1", pair_blocks=True),
+        dict(layout="4x2_pf1", pair_blocks=True),
     ],
-    ids=[
-        "lds-2x4", "lds-4x2", "lds-4x2-linear", "lds-2x4-persistent", "lds-2x4-persistent8", "lds-4x2-persistent8",
-        "lds-2x4-persistent16-linear", "lds-2x4-pair", "lds-4x2-persistent8-pair",
-    ],
+    ids=["lds-2x4", "lds-4x2", "lds-4x2-linear", "lds-2x4-pair", "lds-4x2-pair"],
 )
 def test_gateup(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks, config):
     if not is_gfx942():
@@ -263,7 +255,12 @@ def test_gateup(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blo
 )
 @pytest.mark.parametrize(
     "config",
-    [dict(layout="2x4"), dict(layout="4x2"), dict(layout="4x2", xcd_swizzle=False), dict(layout="2x4", pair_blocks=True)],
+    [
+        dict(layout="2x4_pf1"),
+        dict(layout="4x2_pf1"),
+        dict(layout="4x2_pf1", xcd_swizzle=False),
+        dict(layout="2x4_pf1", pair_blocks=True),
+    ],
     ids=["lds-2x4", "lds-4x2", "lds-4x2-linear", "lds-2x4-pair"],
 )
 def test_gateup_fp8_sorted(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks, config):

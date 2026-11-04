@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FP8 block-scale GEMM on a 2x4 wave grid; A and B are both staged through LDS.
+"""gfx942 FP8 block-scale GEMM on a 2x4 wave grid, A and B staged through LDS with a 2-stage load lead (pf2).
 
 C[M,N] = A[M,K] @ B[N,K]^T with ScaleA[K/128, M] and ScaleB[ceil(N/128), K/128],
 BF16 output. B is either plain [N,K] or aiter shuffle_weight(B, layout=(16, 16)).
 Each 256x256 WG tile uses 8 waves: wave_m = wave // 4 owns 128 rows, wave_n = wave % 4
 owns 64 columns. LDS holds one K128 tile of A and B (32 KiB each) as four 64-row packets;
-packets are refilled from VGPR staging two stages after their global loads are issued.
+packets are refilled from VGPR staging as soon as they are free, two stages after their global
+loads are issued, so some loads run two K blocks ahead (the pf1 kernel: one stage, one K block).
 """
 
 import functools
@@ -34,7 +35,7 @@ def _lds_dwords(row, column):
 
 
 @functools.cache
-def compile_gemm_a8w8_blockscale_gfx942_2x4_lds(N, K, preshuffle_b):
+def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf2(N, K, preshuffle_b):
     assert N % 16 == 0 and K >= TILE_K and K % TILE_K == 0
     KB = K // TILE_K
     n_tiles = (N + TILE_N - 1) // TILE_N
@@ -345,11 +346,11 @@ def compile_gemm_a8w8_blockscale_gfx942_2x4_lds(N, K, preshuffle_b):
     return launch
 
 
-def gemm_a8w8_blockscale_gfx942_2x4_lds(x, weight, out, x_scale_t, w_scale, preshuffle_b):
+def gemm_a8w8_blockscale_gfx942_2x4_lds_pf2(x, weight, out, x_scale_t, w_scale, preshuffle_b):
     """x[M,K], weight[N,K] (optionally preshuffled), x_scale_t[K/128,M], w_scale[ceil(N/128),K/128]."""
     M, K = x.shape
     N = weight.shape[0]
-    launch = compile_gemm_a8w8_blockscale_gfx942_2x4_lds(N, K, bool(preshuffle_b))
+    launch = compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf2(N, K, bool(preshuffle_b))
     launch(
         flyc.from_c_void_p(fx.Int32, x.data_ptr()),
         flyc.from_c_void_p(fx.Int32, weight.data_ptr()),

@@ -1,4 +1,4 @@
-"""Correctness tests for the three FlyDSL gfx942 FP8 block-scale GEMM kernels (8x1, 4x2-LDS, 2x4)."""
+"""Correctness tests for the three FlyDSL gfx942 FP8 block-scale GEMM kernels (8x1, 2x4-LDS pf1, 2x4-LDS pf2)."""
 
 import pytest
 import torch
@@ -31,13 +31,13 @@ def _kernel(name):
         from pyhip.contrib.flydsl.gemm_a8w8_blockscale_gfx942_8x1 import gemm_a8w8_blockscale_gfx942_8x1
 
         return gemm_a8w8_blockscale_gfx942_8x1
-    if name == "4x2-lds":
-        from pyhip.contrib.flydsl.gemm_a8w8_blockscale_gfx942_4x2_lds import gemm_a8w8_blockscale_gfx942_4x2_lds
+    if name == "2x4-lds-pf1":
+        from pyhip.contrib.flydsl.gemm_a8w8_blockscale_gfx942_2x4_lds_pf1 import gemm_a8w8_blockscale_gfx942_2x4_lds_pf1
 
-        return gemm_a8w8_blockscale_gfx942_4x2_lds
-    from pyhip.contrib.flydsl.gemm_a8w8_blockscale_gfx942_2x4_lds import gemm_a8w8_blockscale_gfx942_2x4_lds
+        return gemm_a8w8_blockscale_gfx942_2x4_lds_pf1
+    from pyhip.contrib.flydsl.gemm_a8w8_blockscale_gfx942_2x4_lds_pf2 import gemm_a8w8_blockscale_gfx942_2x4_lds_pf2
 
-    return gemm_a8w8_blockscale_gfx942_2x4_lds
+    return gemm_a8w8_blockscale_gfx942_2x4_lds_pf2
 
 
 def run_torch(x, weight, x_scale, w_scale):
@@ -51,7 +51,7 @@ def run_torch(x, weight, x_scale, w_scale):
     return F.linear(x, weight.to(torch.float32) * w_scale).to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("kernel", ["8x1", "4x2-lds", "2x4"])
+@pytest.mark.parametrize("kernel", ["8x1", "2x4-lds-pf1", "2x4-lds-pf2"])
 @pytest.mark.parametrize("preshuffle_b", [False, True])
 @pytest.mark.parametrize("rows,cols,depth", SHAPES)
 def test_gfx942_flydsl_blockscale(rows, cols, depth, preshuffle_b, kernel):

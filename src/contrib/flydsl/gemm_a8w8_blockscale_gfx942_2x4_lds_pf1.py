@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL port of the PyHIP gfx942 4x2-LDS FP8 block-scale GEMM (contrib/gemm_fp8_gfx942_4x2_lds.py).
+"""gfx942 FP8 block-scale GEMM on a 2x4 wave grid, A and B staged through LDS with a 1-stage load lead (pf1).
 
-C[M,N] = A[M,K] @ B[N,K]^T with ScaleA[K/128,M] and ScaleB[ceil(N/128),K/128], BF16 output.
-The gfx950 (N, M) = (4, 2) quadrant mapping: wave_m = wave // 4 and wave_n = wave % 4. A and B
-are both copied cooperatively into 32 KiB LDS each (four 64-row packets). B operands are read
-once per K block; A packet p is read in stage p. Tile order, MFMA/dequant order, barriers and
-BF16 packing follow the PyHIP kernel, so both produce bitwise identical outputs.
+FlyDSL port of the PyHIP 4x2-LDS kernel (contrib/gemm_fp8_gfx942_4x2_lds.py, which names the grid in gfx950's
+(N, M) order). C[M,N] = A[M,K] @ B[N,K]^T with ScaleA[K/128,M] and ScaleB[ceil(N/128),K/128], BF16 output.
+wave_m = wave // 4 owns 128 rows, wave_n = wave % 4 owns 64 columns. A and B are both copied cooperatively
+into 32 KiB LDS each (four 64-row packets). B operands are read once per K block; A packet p is read in
+stage p. Each packet of the next K block is loaded during this block and written to LDS one stage later.
+Tile order, MFMA/dequant order, barriers and BF16 packing follow the PyHIP kernel, so both produce bitwise
+identical outputs.
 """
 
 import functools
@@ -35,7 +37,7 @@ def _lds_dwords(row, column):
 
 
 @functools.cache
-def compile_gemm_a8w8_blockscale_gfx942_4x2_lds(N, K, preshuffle_b):
+def compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(N, K, preshuffle_b):
     assert N % 16 == 0 and K >= TILE_K and K % TILE_K == 0
     KB = K // TILE_K
     scale_rows_b = (N + 127) // 128
@@ -340,11 +342,11 @@ def compile_gemm_a8w8_blockscale_gfx942_4x2_lds(N, K, preshuffle_b):
     return launch
 
 
-def gemm_a8w8_blockscale_gfx942_4x2_lds(x, weight, out, x_scale_t, w_scale, preshuffle_b):
+def gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(x, weight, out, x_scale_t, w_scale, preshuffle_b):
     """x[M,K], weight[N,K] (optionally preshuffled), x_scale_t[K/128,M], w_scale[ceil(N/128),K/128]."""
     M, K = x.shape
     N = weight.shape[0]
-    launch = compile_gemm_a8w8_blockscale_gfx942_4x2_lds(N, K, bool(preshuffle_b))
+    launch = compile_gemm_a8w8_blockscale_gfx942_2x4_lds_pf1(N, K, bool(preshuffle_b))
     launch(
         flyc.from_c_void_p(fx.Int32, x.data_ptr()),
         flyc.from_c_void_p(fx.Int32, weight.data_ptr()),

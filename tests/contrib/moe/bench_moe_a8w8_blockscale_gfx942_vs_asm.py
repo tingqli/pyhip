@@ -3,7 +3,7 @@
 One EP8 rank of MiMo-V2.6-Flash (hidden 4096, moe_inter 2048, 256 experts, top-8: 32 local experts) on the inputs of
 test_fmoe_a8w8_blockscale_asm_gfx942.make_inputs: FP8 activations with per-(token, 128) scales and 128x128
 block-scaled FP8 weights, which is what aiter.fused_moe hands the asm kernel on gfx942. Ours: aiter moe_sorting(256)
--> GateUp 2x4 with fp8_out (FP8 per (row, 128) in sorted-row order) -> Down 4x2 on the sorted A2, routes added with
+-> GateUp 2x4_pf1 with fp8_out (FP8 per (row, 128) in sorted-row order) -> Down 4x2_pf1 on the sorted A2, routes added with
 BF16 atomics ("atomic"), or stored for tokens with one local route ("B", single_store). Every variant writes its own
 output, which the test's check() validates after timing; the summary compares both with the fastest asm kernel.
 
@@ -48,8 +48,8 @@ def parse_args(argv=None):
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--warmup-ms", type=float, default=50.0)
     parser.add_argument("--timing", default="queued", choices=["queued", "cudaperf"])
-    parser.add_argument("--gemm1-layout", default="2x4")
-    parser.add_argument("--gemm2-layout", default="4x2")
+    parser.add_argument("--gemm1-layout", default="2x4_pf1")
+    parser.add_argument("--gemm2-layout", default="4x2_pf1")
     parser.add_argument("--no-gate", action="store_true", help="skip the amdsmi idle-GPU gate (run marked invalid)")
     parser.add_argument("--dry-run", action="store_true", help="run and check every variant twice, no timing")
     parser.add_argument("--host-time", action="store_true", help="print each variant's host enqueue time and exit")

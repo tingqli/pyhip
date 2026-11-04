@@ -284,19 +284,21 @@ MI308X / gfx942，GPU0 独占，PTL 为 Enabled / VECTOR,F8。使用原 `cudaPer
 
 本次归档包含源码、调用测试、公共映射helper、版本快照、配置、原始性能/ATT/PMC、失败记录和逐文件SHA-256清单。它是基于上述仓库的工作成果快照，不是完整Python/ROCm环境镜像；不包含无关的core/test工作树修改。恢复后应先检查manifest，再在实际环境做目标验证。N4096邻近M性能门禁失败、PMC自动关闭PTL和ATT采样范围的限制均保留，不补写为通过。
 
-## FlyDSL版本：8x1、4x2-LDS与2x4
+## FlyDSL版本：8x1、2x4-LDS pf1与2x4-LDS pf2
 
 2026-11-01，三个kernel均以FlyDSL独立实现，原PyHIP汇编源码保持不变：
 
 | Kernel | FlyDSL源码 | 来源 | 资源 |
 |---|---|---|---|
 | 8x1 | [gemm_a8w8_blockscale_gfx942_8x1.py](../../../../../src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_8x1.py) | PyHIP v32移植 | 242 VGPR、32 KiB LDS、0 scratch |
-| 4x2-LDS | [gemm_a8w8_blockscale_gfx942_4x2_lds.py](../../../../../src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_4x2_lds.py) | PyHIP 4x2-LDS移植 | 240 VGPR、64 KiB LDS、0 scratch |
-| 2x4 | [gemm_a8w8_blockscale_gfx942_2x4_lds.py](../../../../../src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_2x4_lds.py) | FlyDSL原生r3 | 250 VGPR、64 KiB LDS、0 scratch |
+| 2x4-LDS pf1 | [gemm_a8w8_blockscale_gfx942_2x4_lds_pf1.py](../../../../../src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_2x4_lds_pf1.py) | PyHIP 4x2-LDS移植 | 240 VGPR、64 KiB LDS、0 scratch |
+| 2x4-LDS pf2 | [gemm_a8w8_blockscale_gfx942_2x4_lds_pf2.py](../../../../../src/contrib/flydsl/gemm_a8w8_blockscale_gfx942_2x4_lds_pf2.py) | FlyDSL原生r3 | 250 VGPR、64 KiB LDS、0 scratch |
+
+2026-11-04改名：两者wave排布相同（M向2个×N向4个；PyHIP的"4x2"按gfx950的(N, M)顺序），区别在global load比写LDS早1个stage（`_2x4_lds_pf1`，即4x2-LDS）还是2个stage（`_2x4_lds_pf2`，即2x4 r3）。
 
 两个移植版保留PyHIP的tile映射、MFMA/DQ顺序、barrier与4+4错相协议，以及gfx942 BF16打包（`v_add_f32`加`0x8000`位型后取高半）。12个shape×两种B布局各24例与PyHIP输出**逐位一致**，含NaN填充、guard与Graph。性能为GPU4同址32-buffer冷输入、正反两轮各64样本：
 
-| Shape / B | PyHIP 8x1 v32 | FlyDSL 8x1 | PyHIP 4x2-LDS | FlyDSL 4x2-LDS | FlyDSL 2x4 r3 |
+| Shape / B | PyHIP 8x1 v32 | FlyDSL 8x1 | PyHIP 4x2-LDS | FlyDSL 2x4-LDS pf1 | FlyDSL 2x4-LDS pf2 (r3) |
 |---|---:|---:|---:|---:|---:|
 | 4096 预重排 | 432.9T | 429.8T | 423.7T | 422.5T | 414.3T |
 | 4096 普通 | 388.1T | 385.1T | 406.5T | 407.8T | - |
