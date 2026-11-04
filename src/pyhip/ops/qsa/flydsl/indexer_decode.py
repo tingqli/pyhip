@@ -12,7 +12,9 @@ with the 4 head scores of key j, so ReLU, head sum and scale stay in-lane. Lane 
 g) holds dims [32g, 32g + 32) of head c and of key c, so k-step s pairs dims 32g + 4s + [0, 4): a
 fixed permutation of the D=128 reduction (FP32 order differs from the Torch reference only in
 association). Keys [length, 16 * pages) get -inf and the rest of the row stays unwritten;
-the shared FlyDSL top-k masks candidates outside [0, length).
+the shared FlyDSL top-k masks candidates outside [0, length). For rows the top-k spreads over several
+CTAs, each wave also folds the (min bits, ~max bits) of the row's scored keys into one of the row's
+stats slots with unsigned atomic min.
 """
 
 import flydsl.compiler as flyc
@@ -23,8 +25,8 @@ from flydsl.expr import gpu, rocdl
 
 from pyhip.codegen.flydsl.helpers import rocdl_aux
 from pyhip.ops.mha.flydsl._common import _buffer, _buffer_words, _uniform
-from .indexer_logits import _buffer_word, _lds_load, _lds_store
-from .indexer_topk import _readlane, _sync
+from .indexer_logits import _buffer_word, _fold, _lds_load, _lds_store
+from .indexer_topk import STAT_SLOTS, _readlane, _reduce, _sync, _umax, _umin
 
 HEADS, DIM, PAGE, WAVES = 4, 128, 16, 4
 PAGE_BYTES = PAGE * DIM * 2
@@ -65,9 +67,9 @@ def _logit(query, key, scale):
 
 
 @flyc.kernel(name="qsa_indexer_decode_logits", known_block_size=[256, 1, 1])
-def _kernel(Q: fx.Tensor, K: fx.Tensor, PAGES: fx.Tensor, LENGTHS: fx.Tensor, LOGITS: fx.Tensor,
+def _kernel(Q: fx.Tensor, K: fx.Tensor, PAGES: fx.Tensor, LENGTHS: fx.Tensor, LOGITS: fx.Tensor, STATS: fx.Tensor,
             q_stride: fx.Int32, page_stride: fx.Int32, width: fx.Int32, splits: fx.Int32, key_bytes: fx.Int32,
-            scale: fx.Float32):
+            scale: fx.Float32, FOLD: fx.Constexpr[bool]):
     storage = fx.SharedAllocator().allocate(fx.Array[fx.Int8, WAVES * PAGE_BYTES, 16]).peek()
     shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(WAVES * PAGE_BYTES, 1)))))
     tid = fx.Int32(gpu.thread_id("x"))
@@ -96,6 +98,7 @@ def _kernel(Q: fx.Tensor, K: fx.Tensor, PAGES: fx.Tensor, LENGTHS: fx.Tensor, LO
         read = [column * 256 + (((4 * group + t) ^ (column & 7)) * 16) for t in range(4)]
         target = (lane < PAGE).select(column * 4, fx.Int32(_DROP))
         step = splits * WAVES
+        low, high = fx.Int32(-1), fx.Int32(0)
         for chunk in range(first, pages, step * 64):
             # Lane i holds the page id of this wave's i-th page in the chunk (ids past the row load 0).
             begin = fx.Int32(chunk)
@@ -112,39 +115,57 @@ def _kernel(Q: fx.Tensor, K: fx.Tensor, PAGES: fx.Tensor, LENGTHS: fx.Tensor, LO
                 _stage(region, write, (w0, w1, w2, w3))
                 _sync()
                 value = _logit(query, [_lds_load(region + address) for address in read], scale)
-                value = (index * PAGE + column < length).select(value, fx.Float32(float("-inf")))
+                live = index * PAGE + column < length
+                value = live.select(value, fx.Float32(float("-inf")))
+                if fx.const_expr(FOLD):
+                    bits = value.bitcast(fx.Int32)
+                    live = live & (lane < PAGE)
+                    low = _umin(low, live.select(bits, fx.Int32(-1)))
+                    high = _umax(high, live.select(bits, fx.Int32(0)))
                 rocdl.raw_ptr_buffer_store(value.ir_value(), output, (index * (PAGE * 4) + target).ir_value(),
                                            fx.Int32(0).ir_value(), aux=rocdl_aux(0))
                 w0, w1, w2, w3 = n0, n1, n2, n3
+        if fx.const_expr(FOLD):
+            low, high = _reduce(low, _umin), _reduce(high, _umax)
+            stats = _buffer(fx.make_view(fx.get_iter(STATS) + fx.Int64(row) * (2 * STAT_SLOTS),
+                                         fx.make_layout(1, 1)), 8 * STAT_SLOTS)
+            offset = (lane == 0).select(((split * WAVES + wave) % STAT_SLOTS) * 8, fx.Int32(_DROP))
+            _fold(stats, offset, low)
+            _fold(stats, offset + 4, ~high)
 
 
 @flyc.jit
-def _launch(Q: fx.Tensor, K: fx.Tensor, PAGES: fx.Tensor, LENGTHS: fx.Tensor, LOGITS: fx.Tensor,
+def _launch(Q: fx.Tensor, K: fx.Tensor, PAGES: fx.Tensor, LENGTHS: fx.Tensor, LOGITS: fx.Tensor, STATS: fx.Tensor,
             q_stride: fx.Int32, page_stride: fx.Int32, width: fx.Int32, splits: fx.Int32, key_bytes: fx.Int32,
-            scale: fx.Float32, rows: fx.Int32, stream: fx.Stream):
+            scale: fx.Float32, rows: fx.Int32, FOLD: fx.Constexpr[bool], stream: fx.Stream):
     if rows > 0:
-        _kernel(Q, K, PAGES, LENGTHS, LOGITS, q_stride, page_stride, width, splits, key_bytes, scale).launch(
-            grid=(splits, rows, 1), block=(256, 1, 1), stream=stream)
+        _kernel(Q, K, PAGES, LENGTHS, LOGITS, STATS, q_stride, page_stride, width, splits, key_bytes, scale,
+                FOLD).launch(grid=(splits, rows, 1), block=(256, 1, 1), stream=stream)
 
 
 _COMPILED = {}
 
 
-def launch(q, cache, page_table, lengths, logits, scale):
+def launch(q, cache, page_table, lengths, logits, scale, stats=None):
     """q: [rows, >=4, 128] BF16 (heads 0..3 used, row stride a multiple of 8); cache: compressed K
     [slots, 1, 128] BF16 (any view, < 2 GiB); page_table: [rows, pages] int32 (page p of row r holds
     keys 16p..16p+15 at slots 16 * page_table[r, p] + [0, 16)); lengths: [rows] int32; logits:
-    [rows, 16 * pages] FP32, contiguous. Compiles on the first call per device; warm it before capture."""
+    [rows, 16 * pages] FP32, contiguous. If given, stats [rows, STAT_SLOTS, 2] int32 must start all ones,
+    and each wave folds (min bits, ~max bits) of its scored keys into one pair. Compiles both variants on
+    the first call per device; warm it before capture."""
     rows, width = logits.shape
     count = torch.cuda.get_device_properties(q.device).multi_processor_count
     splits = max(1, min(-(-page_table.shape[1] // WAVES), -(-count * CTAS_PER_CU // rows)))
     stream = torch.cuda.current_stream(q.device)
-    args = (q.view(-1), cache.view(-1), page_table.view(-1), lengths, logits.view(-1), q.stride(0),
-            page_table.stride(0), width, splits, cache.numel() * 2, scale, rows, stream)
+    fold = stats is not None
+    args = (q.view(-1), cache.view(-1), page_table.view(-1), lengths, logits.view(-1),
+            (stats if fold else lengths).view(-1), q.stride(0), page_table.stride(0), width, splits,
+            cache.numel() * 2, scale, rows, fold, stream)
     with torch.cuda.device(q.device):
-        function = _COMPILED.get(q.device)
-        if function is None:
+        functions = _COMPILED.get(q.device)
+        if functions is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm the QSA decode indexer before graph capture")
-            function = _COMPILED[q.device] = flyc.compile(_launch, *args[:11], 0, stream)
-        function(*args)
+            functions = _COMPILED[q.device] = {variant: flyc.compile(_launch, *args[:12], 0, variant, stream)
+                                               for variant in (False, True)}
+        functions[fold](*args)
