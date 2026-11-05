@@ -167,6 +167,9 @@ def main(argv=None):
             inputs["topk_ids"], inputs["topk_weights"], E * EP, H, dtypes.bf16, block_m, inputs["expert_mask"],
             output=out if zero else no_zero,
         )
+        if block_m == 256:
+            # Older aiter moe_sorting does not round sorted_ids up to whole blocks; the valid blocks fit below it.
+            expert_ids = expert_ids[: sorted_ids.numel() // block_m]
         return dict(sorted_ids=sorted_ids, sorted_weights=sorted_weights, sorted_expert_ids=expert_ids,
                     num_valid_ids=num_valid_ids, out=out, block_m=block_m)
 
