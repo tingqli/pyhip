@@ -76,7 +76,7 @@ Down和流水线的数字都是32K、µs；有两个值时是"ep_uniform / ep8�
 
 - **清零放到另一个stream，和GateUp并行**：慢1–4%。GateUp占满了每个CU的寄存器，清零kernel只能在GateUp收尾时才上得去，还要分走功耗。
 - **常驻kernel，把atomic推到下一个任务的K循环里**：gfx942上普通读和atomic共用`vmcnt`，K循环等数据时也要等atomic确认。第一版proxy测得更慢，但后来发现proxy本身有问题，没有在真实kernel上实现。
-- **GateUp常驻kernel**：任务切换变短，但在750 W功耗墙下墙钟时间不变（2026-11-04复测−0.3%～+1.0%），已删除。`pair_blocks`保留、默认关闭：FP8输出在16K `ep_uniform`快3.5%，`ep8`最多快1%。见GateUp文档4.5、4.7。
+- **GateUp常驻kernel**：任务切换变短，但在750 W功耗墙下墙钟时间不变（2026-11-04复测−0.3%～+1.0%），已删除。`pair_blocks`保留、默认关闭：FP8输出在16K `ep_uniform`快3.5%，`ep8`最多快1%。见GateUp文档4.5、4.7。接入`aiter.fused_moe`后（a2a EP8均衡路由）整次调用16K快0.9%、32K快0.4–0.5%，见6.1节。
 
 ## 4. single_store的适用条件
 
@@ -193,3 +193,61 @@ done
 - **FlyDSL版本**：这些kernel用FlyDSL 0.4.0，aiter自己固定的是0.3.4.1，部署时要确认aiter自己的FlyDSL kernel在0.4.0下也正常。
 - **只在MI300X验证过**（304 CU，8个XCD），其他gfx942型号没测。prefill以外（CUDA graph捕获）也没测。
 - 本卡有多条路由的token仍然用BF16 atomic，累加顺序不固定，和asm一样。
+
+### 6.1 a2a EP8均衡路由：pair_blocks、各kernel时间、ATT阶段占比（2026-11-04）
+
+条件：`aiter.fused_moe`整次调用，MORI式FP8接收buffer加`num_local_tokens`，buffer行数等于EP组token数。EP8（256个全局expert，本卡32个），`balanced`路由：每个本地expert恰好T/32行（16K为512行、32K为1024行，没有padding），有本地路由的token占65.6%。`single_store=True`。权重和接收buffer各5份，每次调用换一份（冷cache）。asm、FlyDSL、FlyDSL+`pair_blocks`三条路径按全部6种顺序交错，共12轮，每段8次预热、16次计时。GPU3，测前测后都空闲。共测了两次，第二次用的是下面的脚本。脚本：[bench_fused_moe_a2a_gfx942.py](../tests/contrib/moe/bench_fused_moe_a2a_gfx942.py)。
+
+整次调用，中位数，µs（两次运行）：
+
+| T | 有效token | asm（默认） | FlyDSL | FlyDSL+pair | pair_blocks | 加速比（FlyDSL / +pair） |
+|---:|---:|---:|---:|---:|---|---|
+| 16384 | 10752 | 1658 / 1660 | 1020 / 1022 | 1011 / 1012 | −0.87% / −0.94%，23/24轮更快 | 1.63x / 1.64x |
+| 32768 | 21504 | 3189 / 3197 | 1829 / 1829 | 1821 / 1819 | −0.43% / −0.54%，15/24轮更快 | 1.74–1.75x / 1.75–1.76x |
+
+- `pair_blocks`只改GateUp的任务顺序。GateUp kernel本身（profiler，交错8轮×40次）：16K 596→588 µs（−1.5%，8/8轮），32K 1084→1075 µs（−0.8%，8/8轮）。那次运行里不受影响的Down也差了0.8%，第二次运行Down不变（630.3 / 630.7 µs），所以32K的收益也成立，但很小。
+- 正确性：calc_diff asm 1.3e-5，FlyDSL 2.6–2.7e-6。本卡只有1路的token，开不开`pair_blocks`逐位相同。2路以上的token用BF16 atomic，累加顺序不固定：16K同一配置重跑一次，这些token有1.9–3.4%的元素不同，开`pair_blocks`时（2.2–3.0%）也在这个范围内；32K两次都没有出现不同。
+
+各kernel时间（torch profiler，20次调用的中位数，µs；相加比整次调用略长）：
+
+| kernel | 16K | 32K |
+|---|---:|---:|
+| a1_scale转置（`.t().contiguous()`） | 8.2 | 13.5 |
+| moe_sorting（block 256，不清零，4个kernel） | 49 | 82 |
+| `moe_route_counts`（清零 + 计数） | 11.7 | 12.1 |
+| `moe_zero_rows` | 12.5 | 20.7 |
+| GateUp | 612 | 1087 |
+| Down | 351 | 630 |
+| asm路径：moe_sorting（block 32，清零`out`）/ `partial_transpose` / asm kernel | 60 / 6.5 / 1602 | 99 / 7.1 / 3084 |
+
+ATT阶段占比：rocprofv3 1.1.0 `--att`，16个SE各取CU 1的SIMD 0，buffer 1 GiB，采第7、8、9次调用的GateUp和Down（每个尺寸各3个dispatch）。
+
+- 两个kernel都是250 VGPR加64 KiB LDS，每个CU同时只跑一个8-wave workgroup，被采的SIMD上正好是同一个workgroup的G0、G1各一个wave。
+- 阶段按K循环（最常走的那条回跳）划分：prolog是workgroup开始到两个wave都进入K循环；mainloop是两个wave都在循环内；epilog是第一个wave出循环到workgroup结束。
+- MFMA效率：两个wave的MFMA执行窗口（从成功发射起算16 cycle）取并集，除以阶段的cycle数。所有MFMA都在K循环内（每个wave GateUp 4096条、Down 2048条）。
+- 下表每格是3个dispatch的范围（32K GateUp去掉下面说的例外，是2个），括号内是每个workgroup的平均cycle数。ATT期间的时钟是0.87–1.17 GHz。
+
+| kernel | T | prolog | mainloop | epilog | mainloop MFMA效率 | 整个workgroup MFMA效率 | 每个workgroup |
+|---|---:|---|---|---|---:|---:|---:|
+| GateUp | 16K | 4.9–6.3%（7.8–10.2k） | 86.2–87.5%（140k） | 7.5–7.7%（12.2k） | 92.8–93.1% | 80.6–82.1% | 160–163k cycle |
+| GateUp | 32K | 4.7–5.3%（7.5–8.5k） | 87.1–87.6%（140k） | 7.6–7.7%（12.2k） | 93.0–93.1% | 81.6–82.2% | 约160k cycle |
+| Down | 16K | 12.7–13.2%（13.0–13.7k） | 64.6–67.3%（69k） | 19.9–22.7%（20.5–24.2k） | 93.4–93.6% | 61.3–63.8% | 103–107k cycle |
+| Down | 32K | 10.1–10.9%（9.9–10.6k） | 71.3–71.4%（69.5k） | 17.8–18.5%（17.3–18.1k） | 92.7–93.1% | 67.1–67.4% | 约97k cycle |
+
+- GateUp的K是4096，循环16次。prolog（读路由和scale、装第一个K block）约8k cycle，epilog（SiLU、FP8量化、按排序后的行写出）约12k cycle，两段合计约13%，这段时间几乎没有MFMA。
+- Down的K只有2048，循环8次。prolog和epilog的绝对时间和GateUp同一量级，所以占比高：mainloop只有65–71%，整个workgroup的MFMA效率是61–67%。epilog的p95达到30–36k cycle（atomic和store）。16K的prolog和epilog cycle数比32K多，是因为那几次的时钟更高（1.16 vs 1.0 GHz），按µs算差别不大。
+- 两个kernel的mainloop MFMA效率都在93%左右，和GateUp文档4.2一致。剩下的约7%（每个workgroup GateUp约10k、Down约4.5k cycle）是barrier、LDS和等待。
+- 空workgroup：grid按最坏情况的block数分配（`max_sorted_blocks`：16K为544个block×16个N tile=8704个workgroup，实际干活的只有1024个；32K为16896个，干活的2048个）。多出来的workgroup读到有效block数就退出，每个约440 cycle，在被采的SIMD上占kernel时间的0–3.3%。
+- 例外：32K第8次调用的GateUp，所有被采CU上的第3轮workgroup同时变慢，K循环从140k变成297k cycle。多出来的时间在`s_waitcnt vmcnt`（每个wave 61.6k，正常是2.6k cycle）和barrier上。第7、9次调用都没有出现，原因没有确认，上表不含这个dispatch。
+- ATT会拖慢kernel：GateUp在ATT下16K/32K的跨度是621–685 / 1134–1325 µs，正常计时是596–612 / 1084–1087 µs。所以ATT只用来看占比和效率，不看绝对时间。
+
+复现（ATT的解码库`librocprof-trace-decoder.so`的安装见[profile-gpu.md](profile-gpu.md)）：
+
+```bash
+cd tests/contrib/moe
+HIP_VISIBLE_DEVICES=3 python bench_fused_moe_a2a_gfx942.py time --tokens 16384 32768 --json a2a.json
+HIP_VISIBLE_DEVICES=3 rocprofv3 --att --att-library-path <解码库目录> --att-target-cu 1 --att-shader-engine-mask 0xffff \
+    --att-simd-select 0x1 --att-buffer-size 0x40000000 --kernel-include-regex "gateup_kernel_0|down_kernel_0" \
+    --kernel-iteration-range "[7, 9]" -d att16k -o att -- python bench_fused_moe_a2a_gfx942.py run --tokens 16384 --calls 10
+python bench_fused_moe_a2a_gfx942.py phases att16k/ui_output_agent_*_dispatch_* --json phases16k.json
+```
