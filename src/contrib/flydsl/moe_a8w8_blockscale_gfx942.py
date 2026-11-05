@@ -63,6 +63,11 @@ def fused_moe_a8w8_blockscale_gfx942(
     blocks = min(sorted_expert_ids.numel(), max_sorted_blocks(tokens, topk, w1.shape[0]))
     expert_ids = sorted_expert_ids[:blocks]
     capacity = blocks * SORT_BLOCK_M
+    if sorted_ids.numel() < capacity:
+        # Older aiter moe_sorting does not round its buffers up to whole blocks; pad with its empty-slot ID.
+        pad = capacity - sorted_ids.numel()
+        sorted_ids = torch.cat([sorted_ids, sorted_ids.new_full((pad,), (topk << 24) | tokens)])
+        sorted_weights = torch.cat([sorted_weights, sorted_weights.new_zeros(pad)])
     a2 = torch.empty((capacity, inter_dim), device=a1.device, dtype=a1.dtype)
     a2_scale_t = torch.empty((inter_dim // 128, capacity), device=a1.device, dtype=torch.float32)
     route_counts = None
