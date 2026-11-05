@@ -187,11 +187,11 @@ done
 
 还没解决的问题：
 
-- **2 GiB上限**：排序后的FP8中间结果是`(ceil(tokens*8/256)+32)*256`行 × I。I=2048时buffer行数超过约13万就放不下，会自动回退到asm。MORI不裁剪接收buffer时（例如8×16384=131072行）就会碰到，需要SGLang按实际token数裁剪接收上限，或者给GateUp/Down加64位基址。
+- **2 GiB上限**：排序后的FP8中间结果是`(ceil(tokens*8/256)+32)*256`行 × I。I=2048时buffer行数超过约13万就放不下，会自动回退到asm。MORI不裁剪接收buffer时（例如8×16384=131072行）就会碰到，需要SGLang按实际token数裁剪接收上限，或者给GateUp/Down加64位基址。MiMo端到端测试用`SGLANG_MORI_MOE_MAX_INPUT_TOKENS=32768`裁剪，见6.2。
 - **额外显存**：asm 1-stage没有中间buffer；我们在32768行时要约570 MB（FP8中间结果加scale），每次调用从torch caching allocator分配，SGLang的显存预留要留出这部分。
 - **首次编译**：每个进程第一次调用要准备4个FlyDSL kernel，冷缓存时现场编译。服务启动时要预热，或者把FlyDSL的磁盘缓存带进镜像。
-- **FlyDSL版本**：这些kernel用FlyDSL 0.4.0，aiter自己固定的是0.3.4.1，部署时要确认aiter自己的FlyDSL kernel在0.4.0下也正常。
-- **只在MI300X验证过**（304 CU，8个XCD），其他gfx942型号没测。prefill以外（CUDA graph捕获）也没测。
+- **FlyDSL版本**：这些kernel用FlyDSL 0.4.0开发，aiter自己固定的是0.3.4.1。MiMo baseline用FlyDSL 0.3.2，只需把`rocdl.s_buffer_load`换成普通buffer读加`readfirstlane`，见6.2。
+- **只在MI300X验证过**（304 CU，8个XCD），其他gfx942型号没测。小batch（decode、DFlash verify）时比asm慢，端到端decode吞吐还没测。
 - 本卡有多条路由的token仍然用BF16 atomic，累加顺序不固定，和asm一样。
 
 ### 6.1 a2a EP8均衡路由：pair_blocks、各kernel时间、ATT阶段占比（2026-11-04）
@@ -251,3 +251,7 @@ HIP_VISIBLE_DEVICES=3 rocprofv3 --att --att-library-path <解码库目录> --att
     --kernel-iteration-range "[7, 9]" -d att16k -o att -- python bench_fused_moe_a2a_gfx942.py run --tokens 16384 --calls 10
 python bench_fused_moe_a2a_gfx942.py phases att16k/ui_output_agent_*_dispatch_* --json phases16k.json
 ```
+
+### 6.2 MiMo-V2.6-Flash端到端（SGLang DP2 + attention TP4 + EP8，2026-11-05）
+
+按MiMo评测指南搭baseline，把这些kernel cherry-pick到baseline的pyhip（`xiaomi-355-opt`）和aiter上：8K–256K prefill吞吐+6.6%到+10.3%，GSM8K 97.50%（baseline 97.57%）。环境、改动、测试方法和完整数据见[moe_a8w8_blockscale_gfx942_mimo_e2e.md](moe_a8w8_blockscale_gfx942_mimo_e2e.md)。
