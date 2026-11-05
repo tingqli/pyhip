@@ -10,6 +10,7 @@ churn; their function arguments are CLI inputs, not pytest fixtures.
 - [attention](attention/): paged-attention correctness/timing script.
 - [gr_read](gr_read/readme.md): decode/prefill performance, frozen baselines, integration examples and Markdown reports.
 - [QSA](qsa/readme.md): capture-free attention branch comparisons and after-projection indexer timing; basic operator tests live under [tests/ops/qsa](../tests/ops/qsa).
+- [gr_write](gr_write/readme.md): GR write + per-branch RMSNorm prefill timing, gate/apply breakdown and design notes.
 
 Run with the same Python environment used to install PyHIP:
 

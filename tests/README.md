@@ -9,6 +9,7 @@ tests/
     conv/           Installed pointwise convolution
     gemm/           Installed ASM/FlyDSL GEMM variants and split-K
     gr_read/        GRRead correctness tests
+    gr_write/       GRWrite (hc_combine + per-branch RMSNorm) correctness tests
     moe/            Installed MoE implementations and cross-backend tests
     qsa/            Basic sparse attention/indexer correctness and graph replay
 ```
@@ -25,6 +26,9 @@ part of the default regression baseline.
 QSA correctness uses the two test files under [ops/qsa](ops/qsa).
 Capture-free performance and branch comparisons are separate CLI scripts in
 [benchmarks/qsa](../benchmarks/qsa/readme.md); they do not start SGLang services.
+
+GRWrite is also selected explicitly; see [ops/gr_write](ops/gr_write/readme.md).
+It was validated on MI308X / gfx942 and likewise warns elsewhere.
 
 ## Running
 
@@ -141,6 +145,7 @@ existing PyHIP JIT cache; use direct pytest commands above when that is unwanted
 | Experimental gfx950 8-wave block-scale / 4-wave MXFP8 GEMM | [kernels](../src/pyhip/ops/gemm/flydsl/) and [tests](ops/gemm/) |
 | Pointwise convolution | [test_conv_pointwise.py](ops/conv/test_conv_pointwise.py) |
 | GRRead, README, and local collection config | [ops/gr_read](ops/gr_read/) |
+| GRWrite, README, and local collection config | [ops/gr_write](ops/gr_write/) |
 | Cross-backend MoE regression suite | [test_moe.py](ops/moe/test_moe.py) |
 | CLI-only operator timing/model matrices | [benchmarks](../benchmarks/README.md) |
 | Kernel prototypes, local checks, and profiler groups | [experiments](../experiments/README.md) |
