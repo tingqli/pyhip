@@ -581,7 +581,7 @@ combine     ：只读 out[0..4]
 
 ### 5.2 输出和大小
 
-容量公式：`M·topk + E·block_m − topk`，其中 E 是全局 expert 数（`expert_mask.numel()` = 256）。
+容量公式：`M·topk + E·block_m − topk`，其中 E 是全局 expert 数（`expert_mask.numel()` = 256）。推导见 9.1 第三步。
 
 | 输出 | 类型 | 大小 | GPU0（M = 131072，block 256） | 有效部分 |
 |---|---|---|---|---|
@@ -642,7 +642,9 @@ sorted_expert_ids（容量 4352）
   - GateUp 和 Down：由有效块数得到任务数。
   - route_counts：只统计位置 < `[0]` 的排序行。
   - `[1]` pyhip 不用，它直接用 `num_local_tokens`。
-- 补充：本地 expert 一条路由都没有时，不同的 sort 实现可能给它 0 块，也可能给 1 个全是补齐行的块。两种情况 kernel 都能正确处理。
+- 本地 expert 一条路由都没有时，**不占块**：aiter opus sort 的 `SkipExpertsWithZeroTokens` 默认是 true，这个 expert 不会出现在 `sorted_expert_ids` 里，也不计入 `num_valid_ids[0]`。
+  - 单 kernel（小 M）和多阶段（P0/P1/P23，大 M）两条路径都在 GPU 上验证过。
+  - 例：M = 32768，让本地 expert 5、7 没有路由，得到 137 块，等于只给有路由的 expert 补齐的块数。
 
 ### 5.4 怎么识别有效：四层判断
 
@@ -772,9 +774,40 @@ pid ≥ 2272 的 WG 没有任务，读完 num_valid_ids 就退出（共 63776 �
 | a2_scale_t | 16 × 块数 × 256 × 4 B | 64.5 MiB | 16.5 MiB | FlyDSL |
 
 - ¹ 用 `SGLANG_MORI_MOE_MAX_INPUT_TOKENS` 截断时，MORI 的 buffer 本身还是 131072 行，只是传给 MoE 的是前 32768 行。模式 B 的输入一般是 BF16（256 MiB），在 fused_moe 里再量化成 FP8。
-- a2 的块数按最坏情况取：`min(⌈8M/256⌉ + 32, sorted_ids 容量 / 256)`。GPU0 实际只用 142 块，即 74 MB。
+- a2 的块数 = `min(⌈8M/256⌉ + 32, ⌊sorted_ids 容量 / 256⌋)`：两项都是有效块数的上界，推导见 9.1。GPU0 实际只用 142 块，即 a2 数据约 74 MB。
 - 2 GiB 限制：M = 131072 时 a2 有 2,164,260,864 B，超过 buffer descriptor 的上限 0x7FFF0000。现在每个 256 行块用自己的 64 位基址，所以没问题；新的上限是 out [M, 4096] BF16 不超过 2 GiB，即 M ≤ 262135。
 - base asm 是 1-stage kernel，没有中间 buffer。FlyDSL 在 M = 131072 时每次调用多用约 2.1 GiB，M = 32768 时约 0.54 GiB，都从 torch 的缓存分配器拿，各层复用。
+
+### 9.1 a2 容量公式怎么推导
+
+a2 按有效块数的上界预分配。M 是 buffer 行数（131072），不是实际 token 数。两个上界取较小值：
+
+$$
+B = \min\left(\left\lceil\frac{8M}{256}\right\rceil + 32,\ \left\lfloor\frac{S}{256}\right\rfloor\right)
+$$
+
+**第一项：按本卡 32 个 expert 推**
+
+- 本地路由最多 M × topk = 8M 条（最坏情况下一个 token 的 8 个 expert 都在本卡）。
+- 每个 expert 单独补齐到 256 的倍数，比按总数算最多多 1 个尾块，所以块数 ≤ ⌊R/256⌋ + 32。例如两个 expert 各 257 条路由要 4 块，而 ⌈514/256⌉ 只有 3 块。
+
+**第二项：按 aiter 的排序 buffer 推**
+
+- `sorted_ids` 长度 S = M·topk + E·b − topk，其中 E = 256（全局 expert），b = 256。
+- 来历：k 个有路由的 expert 各最多补 b − 1 行，其余空 expert 各最多占 1 块，合计 ≤ M·topk + k(b − 1) + (E − k)·b = M·topk + E·b − k。每个 token 选 topk 个不同 expert，所以 k ≥ topk，得到 S。这个公式按"空 expert 也占 1 块"的最坏情况算；当前 sort 跳过空 expert（5.3 节），实际用量更少。
+- sort 写出的行数是 256 的倍数且 ≤ S，所以块数 ≤ ⌊S/256⌋（向下取整，S = 1114104 = 4351 × 256 + 248）。
+
+**代入**
+
+| | EP8，M = 131072 | EP8，M = 32768 | 非 EP，M = 131072 |
+|---|---:|---:|---:|
+| 第一项 | 4128 | 1056 | 4352（本地 expert = 256） |
+| 第二项 | 4351 | 1279 | 4351 |
+| a2 预分配 | **4128 块，2064 MiB** | **1056 块，528 MiB** | **4351 块，2175.5 MiB** |
+
+- EP8 由第一项决定（尾块只按本卡 32 个 expert 预留）；非 EP 由第二项决定（"− topk" 正好少 1 块）。
+- 实际只执行 142 块、36352 行，由 `num_valid_ids[0]` 决定。按形状预分配，是为了 host 不用同步读这些计数。
+- 当前代码的第二项用的是 `sorted_expert_ids.numel()` = ⌈S/256⌉（[代码](../../src/contrib/flydsl/moe_a8w8_blockscale_gfx942.py#L52)）。EP8 下结果相同；非 EP 会多 1 块，`route_counts` 会多读 `sorted_ids` 末尾之后的 8 个 int32（落在 torch 512 B 对齐余量内，结果仍正确）。
 
 ## 10. 性能
 
