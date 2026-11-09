@@ -1,12 +1,18 @@
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl._mlir.dialects import fly, llvm, vector, gpu, scf, rocdl
 from flydsl._mlir import ir
+from flydsl.expr.meta import dsl_loc_tracing
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import is_target_address_space
 
 import functools
 import types
 import inspect
+
+import torch
 
 
 def div_up(x, y):
@@ -560,3 +566,70 @@ def dump_ir(enable_debug_info=True):
     ir._globals.set_loc_tracebacks_frame_limit(40)
     ir._globals.set_loc_tracebacks_enabled(True)
     os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+
+
+# Used by the gfx942 FP8 block-scale MoE kernels (moe_*_a8w8_blockscale_gfx942*).
+
+
+def run_compiled(launch, *args):
+    """Runs a @flyc.jit launcher through its CompiledFunction for the current device.
+
+    Calling the JitFunction costs 60-90 us of host time per launch, the CompiledFunction a few us. The first call
+    on a device compiles (or loads from the FlyDSL cache) and runs it.
+    """
+    by_device = getattr(launch, "_compiled_by_device", None)
+    if by_device is None:
+        by_device = launch._compiled_by_device = {}
+    device = torch.cuda.current_device()
+    compiled = by_device.get(device)
+    if compiled is None:
+        by_device[device] = flyc.compile(launch, *args)
+    else:
+        compiled(*args)
+
+
+def _offset_i32(value):
+    """A ready i32 SSA value or a 32-bit compile-time integer; truncation and unit scaling happen before."""
+    if isinstance(value, (fx.Int32, fx.Uint32)):
+        return value.ir_value()
+    if isinstance(value, ir.Value) and isinstance(value.type, ir.IntegerType) and value.type.width == 32:
+        return value
+    if isinstance(value, int) and not isinstance(value, bool) and -(1 << 31) <= value < (1 << 32):
+        return fx.Uint32(value & 0xFFFFFFFF).ir_value()
+    raise TypeError("offset needs a precomputed 32-bit SSA value or a 32-bit compile-time integer")
+
+
+class BufferTensor(fx.Tensor):
+    """One native buffer access per load; keeps no extra dynamic Python state."""
+
+    @dsl_loc_tracing
+    def __getitem__(self, coord):
+        result = super().__getitem__(coord)
+        return type(self)(result) if isinstance(result, fx.Tensor) else result
+
+    def _packet_bits(self):
+        if not is_target_address_space(self.address_space, TargetAddressSpace.BufferDesc):
+            raise TypeError("explicit buffer access needs a BufferDesc tensor")
+        if not self.layout.is_static or fx.rank(self.layout) != 1 or self.stride.to_py_value() not in (1, (1,)):
+            raise ValueError("explicit buffer access takes a static contiguous 1-D packet")
+        bits = fx.size(self).to_py_value() * self.dtype.width
+        if bits not in (32, 64, 128):
+            raise ValueError("packets are 32/64/128 bits; issue 16 B + 8 B as two requests")
+        return bits
+
+    @dsl_loc_tracing
+    def load(self, *, voffset_bytes=None, soffset_bytes=0, aux=0):
+        if voffset_bytes is None:
+            if not isinstance(soffset_bytes, int) or soffset_bytes != 0 or aux != 0:
+                raise ValueError("an explicit soffset/aux needs the full voffset_bytes")
+            return super().load()
+        bits = self._packet_bits()
+        if not isinstance(aux, int):
+            raise TypeError("aux must be a compile-time integer")
+        resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(self))
+        result = rocdl.RawPtrBufferLoadOp(
+            ir.VectorType.get([bits // 32], fx.Uint32.ir_type), resource,
+            _offset_i32(voffset_bytes), _offset_i32(soffset_bytes),
+            aux=ir.IntegerAttr.get(fx.Int32.ir_type, aux),
+        ).result
+        return Vec(result).bitcast(self.dtype)
