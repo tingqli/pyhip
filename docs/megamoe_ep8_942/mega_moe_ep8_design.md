@@ -379,5 +379,59 @@ trace（最终版本）：span 2090–2440 µs，CU忙碌比例0.93–0.95；每
   - GateUp/Down主循环本身的能耗（MFMA以外的VALU反量化、LDS读）。
   - rank间负载不均（这次的路由下148 vs 139个block），加上不同GPU在功耗墙下的时钟不同，最慢的rank决定总时间。
 
+## 6. kernel流程图
 
-重新生成图：`python docs/moe_942_ep8/images/mega_moe.py /tmp/fonts`。
+![mega kernel流程](images/mega_moe_flow.png)
+
+- 一次调用：quant → ep_prep → ep_plan → mega kernel → ep_finish，都在同一个stream上，中间不经过host同步。
+- mega kernel里每个WG循环：领票 → 跑任务 → 在任务的epilogue开头预领下一张票。
+- 任务之间只有两种等待：
+  - GateUp等`arrived[b]`：数据来自8个源rank的producer。
+  - Down等`done[b]`：本rank同一个block的16个GateUp tile。
+- 通信藏在哪里：
+  - dispatch：每个队列的前2张票是producer（共16个WG）。它们在前约450 µs里发数据，其余WG同时计算已经到齐的block。
+  - combine：每个Down任务的epilogue直接对源rank的out做BF16原子加。这些原子加分散在所有Down任务里，和后面的GateUp/Down计算重叠。
+
+## 7. 通信藏住了多少（profile）
+
+方法：[tests/contrib/moe/ep8/profile_ep8_mega_overlap.py](../../tests/contrib/moe/ep8/profile_ep8_mega_overlap.py)。
+
+```
+torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py   # 默认100次 × 4轮
+```
+
+- 把peer指针表换成本卡的scratch buffer，让一部分通信不走xGMI，而是写到本卡：
+  - local-dispatch：producer的数据（recv_a、recv_scale、down_ids、recv_w）写到本卡。
+  - local-combine：Down的BF16原子加加到本卡。
+  - local：两者都写本卡。
+- arrived和done flag仍然发到对端，所以任务顺序和同步完全一样，只少了xGMI上的数据。这些模式的输出是错的，只用来计时。
+- 先用正常模式跑一次，让接收buffer里是真实数据（全0的数据功耗低，会让时钟偏高）。
+- 每种模式连续跑100次（和实际一样处在功耗墙下），4种模式轮流跑4轮。取最慢rank的中位数；同一台机器上别的任务只会让某一轮变慢，所以每种模式取最快的一轮，并把每轮的数都打出来。
+- p2p − local 就是还露在外面的通信时间。
+
+作为对照，如果通信不和计算重叠：
+
+| | 数据量 | 单独跑的时间 | 依据 |
+|---|---|---|---|
+| dispatch（按路由） | 134 MB | 约430 µs | 2.1节P2P实测约312 GB/s |
+| combine（远端BF16原子加） | 267 MB | 约790 µs | 2.1节实测约339 GB/s |
+| 合计 | 401 MB | **约1220 µs** | |
+| 基线露在外面的通信 | | 1250 µs | MORI dispatch 331 + combine 920（5.5节同一次测量） |
+
+结果（每卡4096 token，随机路由，BF16 combine；每种模式100次连续调用为一轮，跑4轮；GPU前后都空闲）：
+
+| 模式 | 一层 µs（4轮最快） | 一层 µs（4轮中位数） | 比p2p少 |
+|---|---|---|---|
+| p2p（正常） | 2476 | 2504 | |
+| local-dispatch | 2422 | 2434 | 54–70 |
+| local-combine | 2437 | 2455 | 39–50 |
+| local | 2385 | 2387 | **91–117** |
+
+- 露在外面的通信只有约**90–120 µs**，其中dispatch约55–70 µs，combine约40–50 µs，两者基本可以相加。
+- 不重叠时通信约1220 µs，所以**约90–93%的通信被计算藏住了**。基线露在外面的是约1250 µs。
+- 剩下露出来的主要是：
+  - dispatch：前几个block的数据到齐之前，GateUp只能等。local-dispatch下producer从约560 µs缩到约300 µs，GateUp平均等待从约28 µs降到约14 µs。
+  - combine：xGMI上的原子加和store跟GEMM抢功耗和内存带宽（5.6），表现为Down任务稍慢，而不是在等。
+
+
+重新生成图：`python docs/megamoe_ep8_942/images/mega_moe.py /tmp/fonts`。

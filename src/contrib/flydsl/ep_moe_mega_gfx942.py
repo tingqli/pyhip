@@ -3,7 +3,7 @@
 
 """gfx942 EP8 MoE mega kernel: dispatch, GateUp and Down (with the combine) in one launch.
 
-See docs/moe_942_ep8/mega_moe_ep8_design.md. ep_prep (ep_moe_comm_gfx942.cpp) runs first and builds the plan.
+See docs/megamoe_ep8_942/mega_moe_ep8_design.md. ep_prep (ep_moe_comm_gfx942.cpp) runs first and builds the plan.
 Workgroups take task tickets from per-XCD queues (persistent: one workgroup per CU taking tickets until the queues
 are empty). A workgroup takes a ticket only when it is running and its current task (if any) waits for nothing more,
 and a task only waits for lower tickets of its queue or for data that sources push without waiting, so the grid

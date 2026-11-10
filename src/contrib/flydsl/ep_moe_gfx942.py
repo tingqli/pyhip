@@ -1,5 +1,5 @@
 """gfx942 EP MoE with the all-to-all fused into the MoE kernels (MiMo-V2.6-Flash EP8: H 4096, I 2048, 256 experts,
-top-8, FP8 128x128 block scales). See docs/moe_942_ep8/mega_moe_ep8_design.md.
+top-8, FP8 128x128 block scales). See docs/megamoe_ep8_942/mega_moe_ep8_design.md.
 
 No MORI and no sort. Per call, on one stream:
   ep_prep      count routes per global expert, exchange the count rows, derive every route's sorted row
