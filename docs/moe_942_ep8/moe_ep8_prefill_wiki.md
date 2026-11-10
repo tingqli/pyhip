@@ -79,10 +79,10 @@
 
 ![两种模式对比](images/ep8_modes_compare.png)
 
-- 三张图都由 [images/ep8_modes.py](images/ep8_modes.py) 生成，数字和本文场景一致。重新生成：`python docs/images/ep8_modes.py <字体目录>`，目录里要有 notofonts/noto-cjk 的 `NotoSansSC-{Regular,Medium,Bold}.otf`。
+- 三张图都由 [images/ep8_modes.py](images/ep8_modes.py) 生成，数字和本文场景一致。重新生成：`python docs/moe_942_ep8/images/ep8_modes.py <字体目录>`，目录里要有 notofonts/noto-cjk 的 `NotoSansSC-{Regular,Medium,Bold}.otf`。
 - 模式 A：每卡 attention 之后的 4096 个 token 就是 MORI 的发送输入，MORI 直接读取并写到目标卡，GPU0 共发出 21626 份。
   - 16384 只是每卡输入的上限，它决定了接收 buffer 的大小（见 3.3）。
-  - GPU0 的接收 buffer 有 131072 行，只有前 21667 行有效，按来源卡排列。
+  - GPU0 的接收 buffer 有 131072 行，只有前 21667 行有效。每行一个 token，先后顺序由 MORI 决定，不按 expert 排（见 6 节）。
 - 模式 B：没有 MORI。attention 之后每卡都拿到两个 DP 组的全部 32768 个 token，其中 11101 个在 GPU0 上没有 expert，结果为 0。MoE 之后再做一次 8 卡 all-reduce，每卡取回本 DP 组的 16384 行。
 
 ### 3.2 模式 A：all2all（MORI）
@@ -406,7 +406,7 @@ GPU7：w·E250(x)
 - EP 多传的原因：
   - 两次都是对全部 32768 行做 all-reduce，每卡要发 2 × 7/8 = 1.75 倍的张量大小。
   - MoE 之前那次 buffer 有一半是 0（另一个 DP 组的位置），也照样要传。
-- 计算方法：all-reduce 每卡发 2(p−1)/p × 张量大小；reduce-scatter 和 all-gather 每卡各发 (p−1)/p × 张量大小。
+- 计算方法：all-reduce 每卡发 2(p−1)/p × 张量大小；reduce-scatter 和 all-gather 每卡各发 (p−1)/p × 张量大小。算法图解见 [collectives_wiki.md](collectives_wiki.md)。
 - EP 的 MAX_LEN 写法（reduce-scatter + all-gather）约 640 MiB，仍然比 all2all 多 1.7 倍。
 - 这里只比数据量，没有实测通信时间：
   - all2all 的 attention 通信只在 4 卡组内进行，每卡只用到 7 条 xGMI 链路中的 3 条。
@@ -697,6 +697,21 @@ MORI combine         out 前 21667 行
 | K6 | Down | 66048 | out [131072, 4096] | 2272 个任务：13111 行 store + 19533 条路由 atomic | 715 |
 | — | MORI combine | — | — | 读 out 前 21667 行 | — |
 | | 合计 | | | | 2022 |
+
+**数据按什么排**：MoE 的输入和输出都按 token 排，只有中间结果 a2 按 expert 排。按 expert 的顺序靠 `sorted_ids` 间接取数据，不重排 a1。
+
+| 张量 | 形状和排法 | 怎么读写 |
+|---|---|---|
+| a1 | [M, 4096] FP8，第 r 行 = 接收 buffer 里第 r 个 token | GateUp 按排序 id 里的 token 号读整行：地址 = token × 4096（[代码](../../src/contrib/flydsl/moe_gateup_a8w8_blockscale_gfx942_lds.py#L234)） |
+| a1_scale | MORI 给的是 [M, 32]，按 token；kernel 要的是 [32, M]，按 K 块 | FlyDSL 用 `.t().contiguous()` 转置全部 M 行（K1）；base 用 `partial_transpose` 只转前 n 行 |
+| a2 | [块数 × 256, 2048] FP8，第 i 行 = 排序位置 i（按 expert） | GateUp 按排序位置写，Down 连续读，不再 gather |
+| out | [M, 4096] BF16，按 token，和 a1 同一行号 | Down 按 token 号写回（store 或 atomic），combine 读前 n 行 |
+
+- a1 就是 [token, hidden]：行号就是 token 号，从 0 到 M − 1 由小到大。
+  - 模式 A 的 token 号是接收 buffer 里的本地编号，不是 batch 里的全局编号。哪个 token 落在第几行由 MORI 决定，combine 再按 MORI 自己记录的映射送回来源卡；kernel 不依赖这个顺序。
+  - 模式 B 是全局顺序：前 16384 行是 DP0 的 token，后 16384 行是 DP1 的。
+- `sorted_ids` 里同一个 expert 的条目也按 token 号由小到大（sort 按行号顺序扫描），所以 GateUp gather 一个块时读到的 a1 行号是递增的，但不连续。
+- 1-stage asm（`fmoe_fp8_blockscale_g1u1`）的输入一样：a1 按 token 排，scale 用转置后的 [32, n]。
 
 ## 7. 无效数据怎么读写
 
