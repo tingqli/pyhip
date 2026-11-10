@@ -1,0 +1,86 @@
+{
+ "tasks=304 streams=16 chunk=2KiB": {
+  "median_us": 104.74099963903427,
+  "tbps": 3.043384205789112
+ },
+ "tasks=304 streams=16 chunk=4KiB": {
+  "median_us": 81.32700249552727,
+  "tbps": 3.9195727645013254
+ },
+ "tasks=304 streams=8 chunk=2KiB": {
+  "median_us": 76.5560008585453,
+  "tbps": 4.163842160316015
+ },
+ "tasks=304 streams=8 chunk=4KiB": {
+  "median_us": 76.81700214743614,
+  "tbps": 4.149694665097513
+ },
+ "tasks=304 streams=8 chunk=8KiB": {
+  "median_us": 76.43649727106094,
+  "tbps": 4.170352061915925
+ },
+ "tasks=304 streams=4 chunk=8KiB": {
+  "median_us": 75.21349936723709,
+  "tbps": 4.238163450467704
+ },
+ "tasks=304 streams=1 chunk=32KiB": {
+  "median_us": 74.61199909448624,
+  "tbps": 4.272330293634454
+ },
+ "tasks=512 streams=16 chunk=2KiB": {
+  "median_us": 126.22999399900436,
+  "tbps": 4.253116830570669
+ },
+ "tasks=512 streams=16 chunk=4KiB": {
+  "median_us": 122.14099988341331,
+  "tbps": 4.395501203629059
+ },
+ "tasks=512 streams=8 chunk=2KiB": {
+  "median_us": 119.81550231575966,
+  "tbps": 4.480813430845867
+ },
+ "tasks=512 streams=8 chunk=4KiB": {
+  "median_us": 121.7000000178814,
+  "tbps": 4.411429021537531
+ },
+ "tasks=512 streams=8 chunk=8KiB": {
+  "median_us": 123.84549900889397,
+  "tbps": 4.3350054406211775
+ },
+ "tasks=512 streams=4 chunk=8KiB": {
+  "median_us": 119.99600008130074,
+  "tbps": 4.474073399415436
+ },
+ "tasks=512 streams=1 chunk=32KiB": {
+  "median_us": 119.03349682688713,
+  "tbps": 4.510250696749524
+ },
+ "tasks=608 streams=16 chunk=2KiB": {
+  "median_us": 146.57749980688095,
+  "tbps": 4.349468430284083
+ },
+ "tasks=608 streams=16 chunk=4KiB": {
+  "median_us": 147.64000475406647,
+  "tbps": 4.3181670785095285
+ },
+ "tasks=608 streams=8 chunk=2KiB": {
+  "median_us": 140.78399538993835,
+  "tbps": 4.528456563788953
+ },
+ "tasks=608 streams=8 chunk=4KiB": {
+  "median_us": 140.8040001988411,
+  "tbps": 4.527813180731262
+ },
+ "tasks=608 streams=8 chunk=8KiB": {
+  "median_us": 147.47949689626694,
+  "tbps": 4.322866713116225
+ },
+ "tasks=608 streams=4 chunk=8KiB": {
+  "median_us": 140.2829959988594,
+  "tbps": 4.54462925788371
+ },
+ "tasks=608 streams=1 chunk=32KiB": {
+  "median_us": 139.50100541114807,
+  "tbps": 4.57010475387622
+ }
+}

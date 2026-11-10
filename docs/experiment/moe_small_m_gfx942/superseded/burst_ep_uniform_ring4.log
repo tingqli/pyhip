@@ -1,0 +1,165 @@
+GATE {"stage": "entry", "time": 1794134097.9536862, "bdf": "0000:0c:00.0", "activity": [2, 1, 1, 61, 52], "vram_used_mb": 190356, "vram_total_mb": 196592, "power_w": 238, "pids": 19, "pass": false}
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+ENV {"gpu": "AMD Instinct MI300X", "arch": "gfx942:sramecc+:xnack-", "cus": 304, "torch": "2.11.0+rocm7.2", "hip": "7.2.26015", "flydsl": "0.4.0"}
+HBM probe: 4.95 TB/s median (1 GiB nontemporal read)
+[aiter] import [module_moe_sorting_opus] under /sgl-workspace/aiter/aiter/jit/module_moe_sorting_opus.so
+[aiter] LoadKernel: _ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x128.co
+[aiter] LoadKernel: _ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256.co
+[aiter] LoadKernel: _ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x128.co
+[aiter] LoadKernel: _ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128.co
+[aiter] LoadKernel: _ZN5aiter49fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x128.co
+[aiter] LoadKernel: _ZN5aiter49fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256.co
+[aiter] LoadKernel: _ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co
+[aiter] LoadKernel: _ZN5aiter43fmoe_bf16_blockscaleFp8_g1u1_vs_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_64x256.co
+GATE {"stage": "T=256 before sampling", "time": 1794134108.4901052, "bdf": "0000:0c:00.0", "activity": [1, 0, 0, 0, 0], "vram_used_mb": 192968, "vram_total_mb": 196592, "power_w": 187, "pids": 20, "pass": false}
+GATE {"stage": "T=256 round 0", "time": 1794134109.7841294, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 192968, "vram_total_mb": 196592, "power_w": 187, "pids": 20, "pass": false}
+GATE {"stage": "T=256 round 1", "time": 1794134111.0637553, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 192968, "vram_total_mb": 196592, "power_w": 187, "pids": 20, "pass": false}
+GATE {"stage": "T=256 round 2", "time": 1794134112.3511417, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 192968, "vram_total_mb": 196592, "power_w": 187, "pids": 20, "pass": false}
+GATE {"stage": "T=256 round 3", "time": 1794134113.6437237, "bdf": "0000:0c:00.0", "activity": [4, 2, 1, 0, 31], "vram_used_mb": 192968, "vram_total_mb": 196592, "power_w": 230, "pids": 20, "pass": false}
+
+T=256 ep_uniform: 256 local routes, routes/expert min 8 max 8, 12.9 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         261.1    254.4-272.1         248.2    49.3    3.08   8.09e-06  pass
+  asm vs_32x128                    270.0    265.4-280.4         257.2    47.7    2.98   1.40e-05  pass
+  asm vs_32x256                    262.8    255.7-275.8         249.6    49.0    3.06   8.11e-06  pass
+  asm novs_ps_32x128               264.2    255.0-277.4         251.3    48.8    3.05   1.39e-05  pass
+  asm novs_ps_32x256               260.6    253.1-267.4         247.4    49.4    3.09   8.10e-06  pass
+  asm vs_ps_32x128                 268.5    262.2-276.1         254.9    48.0    3.00   1.40e-05  pass
+  asm vs_ps_32x256                 260.3    255.9-270.2         247.1    49.5    3.09   8.13e-06  pass
+  asm novs_32x128                  272.2    262.8-281.7         259.0    47.3    2.96   1.40e-05  pass
+  asm novs_32x256                  265.8    258.6-273.0         253.0    48.5    3.03   8.13e-06  pass
+  asm vs_psx_64x256                261.3    255.7-264.0         247.7    49.3    3.08   8.14e-06  pass
+  asm vs_64x256                    265.5    258.2-274.4         251.9    48.5    3.03   8.14e-06  pass
+  small                            213.5    206.4-217.9         200.1    60.4    3.77   1.38e-06  pass
+  small: 1.219x vs tuned asm vs_ps_32x256 (with sort), 1.235x without sort; 1.223x vs asm auto
+GATE {"stage": "T=512 before sampling", "time": 1794134114.5523021, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 193027, "vram_total_mb": 196592, "power_w": 185, "pids": 20, "pass": false}
+GATE {"stage": "T=512 round 0", "time": 1794134115.8473237, "bdf": "0000:0c:00.0", "activity": [24, 9, 3, 1, 1], "vram_used_mb": 193027, "vram_total_mb": 196592, "power_w": 188, "pids": 20, "pass": false}
+GATE {"stage": "T=512 round 1", "time": 1794134117.14045, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 196122, "vram_total_mb": 196592, "power_w": 184, "pids": 20, "pass": false}
+GATE {"stage": "T=512 round 2", "time": 1794134118.4353914, "bdf": "0000:0c:00.0", "activity": [10, 4, 1, 19, 10], "vram_used_mb": 193515, "vram_total_mb": 196592, "power_w": 212, "pids": 20, "pass": false}
+GATE {"stage": "T=512 round 3", "time": 1794134119.7350512, "bdf": "0000:0c:00.0", "activity": [7, 18, 7, 2, 9], "vram_used_mb": 193538, "vram_total_mb": 196592, "power_w": 228, "pids": 20, "pass": false}
+
+T=512 ep_uniform: 512 local routes, routes/expert min 16 max 16, 25.8 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         272.0    267.9-280.9         255.1    94.7    2.96   8.10e-06  pass
+  asm vs_32x128                    284.1    272.5-293.2         266.8    90.7    2.83   1.39e-05  pass
+  asm vs_32x256                    276.5    268.6-283.4         259.6    93.2    2.91   8.13e-06  pass
+  asm novs_ps_32x128               279.7    272.2-287.2         263.2    92.1    2.88   1.39e-05  pass
+  asm novs_ps_32x256               274.1    266.8-282.2         256.6    94.0    2.94   8.10e-06  pass
+  asm vs_ps_32x128                 276.2    268.7-288.9         259.7    93.3    2.92   1.39e-05  pass
+  asm vs_ps_32x256                 271.4    267.9-279.8         254.5    94.9    2.97   8.13e-06  pass
+  asm novs_32x128                  285.2    278.1-296.2         267.7    90.4    2.82   1.39e-05  pass
+  asm novs_32x256                  275.3    268.4-286.7         257.9    93.6    2.93   8.10e-06  FAIL 845 elements off, worst by 1.69 (rms 1.9)
+  asm vs_psx_64x256                271.7    267.2-278.5         253.7    94.8    2.96   8.09e-06  pass
+  asm vs_64x256                    275.4    269.0-280.2         257.3    93.6    2.92   8.13e-06  pass
+  small                            216.6    211.1-232.8         200.8   119.0    3.72   1.37e-06  pass
+  small: 1.253x vs tuned asm vs_ps_32x256 (with sort), 1.267x without sort; 1.256x vs asm auto
+GATE {"stage": "T=1024 before sampling", "time": 1794134120.668211, "bdf": "0000:0c:00.0", "activity": [14, 6, 16, 6, 6], "vram_used_mb": 193824, "vram_total_mb": 196592, "power_w": 227, "pids": 20, "pass": false}
+GATE {"stage": "T=1024 round 0", "time": 1794134121.9666448, "bdf": "0000:0c:00.0", "activity": [11, 4, 1, 1, 2], "vram_used_mb": 193825, "vram_total_mb": 196592, "power_w": 203, "pids": 20, "pass": false}
+GATE {"stage": "T=1024 round 1", "time": 1794134123.2616942, "bdf": "0000:0c:00.0", "activity": [5, 2, 13, 5, 13], "vram_used_mb": 193824, "vram_total_mb": 196592, "power_w": 215, "pids": 20, "pass": false}
+GATE {"stage": "T=1024 round 2", "time": 1794134124.5647519, "bdf": "0000:0c:00.0", "activity": [10, 14, 5, 2, 1], "vram_used_mb": 193824, "vram_total_mb": 196592, "power_w": 190, "pids": 20, "pass": false}
+GATE {"stage": "T=1024 round 3", "time": 1794134125.8658733, "bdf": "0000:0c:00.0", "activity": [4, 2, 1, 0, 0], "vram_used_mb": 193824, "vram_total_mb": 196592, "power_w": 187, "pids": 20, "pass": false}
+
+T=1024 ep_uniform: 1024 local routes, routes/expert min 32 max 32, 51.5 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         291.3    286.0-299.9         271.9   176.9    2.76   8.12e-06  pass
+  asm vs_32x128                    318.7    304.9-329.0         299.0   161.7    2.53   1.40e-05  pass
+  asm vs_32x256                    292.5    287.0-303.4         273.1   176.2    2.75   8.11e-06  pass
+  asm novs_ps_32x128               304.1    295.8-314.0         284.4   169.5    2.65   1.39e-05  pass
+  asm novs_ps_32x256               294.1    287.6-306.4         274.0   175.2    2.74   8.11e-06  pass
+  asm vs_ps_32x128                 308.8    302.8-319.2         289.5   166.9    2.61   1.39e-05  pass
+  asm vs_ps_32x256                 293.4    286.5-297.8         273.6   175.7    2.74   8.09e-06  pass
+  asm novs_32x128                  313.1    305.5-326.7         294.4   164.6    2.57   1.39e-05  pass
+  asm novs_32x256                  293.1    288.6-300.9         273.2   175.8    2.75   8.06e-06  FAIL 2234 elements off, worst by 1.36 (rms 1.87)
+  asm vs_psx_64x256                290.4    286.3-294.4         268.8   177.5    2.77   8.11e-06  pass
+  asm vs_64x256                    294.5    289.4-316.4         273.4   175.0    2.73   8.09e-06  pass
+  small                            224.0    219.9-230.9         206.0   230.1    3.60   1.38e-06  pass
+  small: 1.296x vs tuned asm vs_psx_64x256 (with sort), 1.305x without sort; 1.301x vs asm auto
+GATE {"stage": "T=2048 before sampling", "time": 1794134126.7875261, "bdf": "0000:0c:00.0", "activity": [3, 1, 0, 0, 0], "vram_used_mb": 194124, "vram_total_mb": 196592, "power_w": 187, "pids": 20, "pass": false}
+GATE {"stage": "T=2048 round 0", "time": 1794134128.1612785, "bdf": "0000:0c:00.0", "activity": [3, 1, 0, 0, 0], "vram_used_mb": 194124, "vram_total_mb": 196592, "power_w": 187, "pids": 20, "pass": false}
+GATE {"stage": "T=2048 round 1", "time": 1794134129.5445957, "bdf": "0000:0c:00.0", "activity": [3, 1, 1, 1, 0], "vram_used_mb": 194125, "vram_total_mb": 196592, "power_w": 209, "pids": 24, "pass": false}
+GATE {"stage": "T=2048 round 2", "time": 1794134131.0154326, "bdf": "0000:0c:00.0", "activity": [4, 1, 1, 0, 0], "vram_used_mb": 194125, "vram_total_mb": 196592, "power_w": 187, "pids": 24, "pass": false}
+GATE {"stage": "T=2048 round 3", "time": 1794134132.437779, "bdf": "0000:0c:00.0", "activity": [3, 1, 0, 0, 0], "vram_used_mb": 194125, "vram_total_mb": 196592, "power_w": 187, "pids": 24, "pass": false}
+
+T=2048 ep_uniform: 2048 local routes, routes/expert min 64 max 64, 103.1 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         340.7    332.9-350.3         306.2   302.5    2.36   8.17e-06  pass
+  asm vs_32x128                    473.0    463.2-479.2         440.7   217.9    1.70   1.40e-05  pass
+  asm vs_32x256                    352.1    340.0-383.1         317.6   292.8    2.29   8.14e-06  pass
+  asm novs_ps_32x128               469.3    460.1-483.0         436.8   219.6    1.72   1.40e-05  pass
+  asm novs_ps_32x256               355.5    335.7-396.4         320.4   290.0    2.27   8.19e-06  pass
+  asm vs_ps_32x128                 477.8    469.3-489.1         445.1   215.7    1.69   1.40e-05  pass
+  asm vs_ps_32x256                 348.1    335.0-391.8         314.3   296.1    2.31   8.16e-06  pass
+  asm novs_32x128                  461.6    452.7-473.9         428.2   223.3    1.74   1.40e-05  pass
+  asm novs_32x256                  351.8    343.4-395.0         318.5   293.0    2.29   8.16e-06  pass
+  asm vs_psx_64x256                328.3    323.7-335.1         295.4   314.0    2.45   8.15e-06  pass
+  asm vs_64x256                    334.6    328.1-345.2         302.8   308.1    2.41   8.17e-06  pass
+  small                            263.5    255.7-268.7         230.3   391.2    3.06   1.41e-06  pass
+  small: 1.246x vs tuned asm vs_psx_64x256 (with sort), 1.283x without sort; 1.293x vs asm auto
+GATE {"stage": "T=4096 before sampling", "time": 1794134133.4786105, "bdf": "0000:0c:00.0", "activity": [4, 1, 0, 0, 0], "vram_used_mb": 194679, "vram_total_mb": 196592, "power_w": 187, "pids": 26, "pass": false}
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990726: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990726: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990726: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990726: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990726: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990726: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990726: No such file or directory
+Unable to open queues directory for process 1990720: No such file or directory
+Unable to open queues directory for process 1990726: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+Unable to open queues directory for process 1990740: No such file or directory
+GATE {"stage": "T=4096 round 0", "time": 1794134135.073345, "bdf": "0000:0c:00.0", "activity": [9, 3, 3, 1, 0], "vram_used_mb": 194679, "vram_total_mb": 196592, "power_w": 186, "pids": 24, "pass": false}
+GATE {"stage": "T=4096 round 1", "time": 1794134136.4702034, "bdf": "0000:0c:00.0", "activity": [4, 2, 1, 0, 0], "vram_used_mb": 194679, "vram_total_mb": 196592, "power_w": 187, "pids": 24, "pass": false}
+GATE {"stage": "T=4096 round 2", "time": 1794134137.8674724, "bdf": "0000:0c:00.0", "activity": [4, 2, 1, 0, 0], "vram_used_mb": 194679, "vram_total_mb": 196592, "power_w": 188, "pids": 24, "pass": false}
+GATE {"stage": "T=4096 round 3", "time": 1794134139.277209, "bdf": "0000:0c:00.0", "activity": [4, 1, 1, 0, 0], "vram_used_mb": 194679, "vram_total_mb": 196592, "power_w": 187, "pids": 24, "pass": false}
+
+T=4096 ep_uniform: 4096 local routes, routes/expert min 128 max 128, 206.2 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         596.7    556.9-609.8         555.1   345.5    1.35   8.13e-06  pass
+  asm vs_32x128                    745.8    727.6-756.1         710.7   276.4    1.08   1.40e-05  pass
+  asm vs_32x256                    587.3    563.7-601.1         545.8   351.1    1.37   8.15e-06  pass
+  asm novs_ps_32x128               739.7    729.2-751.6         703.9   278.7    1.09   1.40e-05  pass
+  asm novs_ps_32x256               595.3    551.9-614.1         552.8   346.3    1.35   8.12e-06  pass
+  asm vs_ps_32x128                 747.5    729.0-762.9         711.8   275.8    1.08   1.40e-05  pass
+  asm vs_ps_32x256                 588.7    558.4-609.3         548.7   350.2    1.37   8.10e-06  pass
+  asm novs_32x128                  735.1    720.2-756.9         698.6   280.4    1.10   1.39e-05  pass
+  asm novs_32x256                  588.1    566.1-598.6         545.9   350.6    1.37   8.11e-06  pass
+  asm vs_psx_64x256                532.9    497.4-549.1         490.2   386.8    1.51   8.11e-06  pass
+  asm vs_64x256                    530.0    491.8-543.2         488.0   389.0    1.52   8.13e-06  pass
+  small                            404.2    381.8-424.2         361.7   510.1    1.99   1.39e-06  pass
+  small: 1.311x vs tuned asm vs_64x256 (with sort), 1.349x without sort; 1.476x vs asm auto
+GATE {"stage": "end", "time": 1794134140.1327786, "bdf": "0000:0c:00.0", "activity": [0, 0, 0, 0, 0], "vram_used_mb": 192037, "vram_total_mb": 196592, "power_w": 187, "pids": 24, "pass": false}
+gates FAIL (results contaminated by other GPU work)

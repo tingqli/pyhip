@@ -14,6 +14,7 @@
      - **B（`single_store=True`）**：本卡只有1路的token直接`global_store_dword`。`moe_route_counts`统计每个token的本地路数，`moe_zero_rows`只清零count≠1的行；sort不再清零`out`（传一个空的moe_buf）。
 - 对手：aiter `fmoe_fp8_blockscale_g1u1`，gfx942上的1-stage asm，GateUp、SiLU、量化、Down在一个kernel里。输入和`aiter.fused_moe`在gfx942上喂给它的一样：预先量化好的FP8 a1加转置的scale。激活量化两边都不计时。
 - "调优后的asm"：CSV里所有kernel实测最快的那个，tuner也是这样选的。
+- 每个本地expert ≤128行（T ≤ 4K）时BM256 tile一半以上是padding：`fused_moe_a8w8_blockscale_gfx942_sort`用256行sort表，GateUp/Down在kernel内看每个block的第128行，无效（≤128个route）的block走4-wave small-M kernel，其余走BM256（`big_blocks_only`），见[record/moe_small_m_gfx942.md](record/moe_small_m_gfx942.md)。
 
 ## 2. 结果
 

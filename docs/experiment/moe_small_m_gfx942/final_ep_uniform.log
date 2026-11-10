@@ -1,0 +1,1551 @@
+GATE {"stage": "entry", "time": 1794137561.496822, "bdf": "0000:0c:00.0", "activity": [0, 0, 0, 0, 0], "vram_used_mb": 283, "vram_total_mb": 196592, "power_w": 155, "pids": 0, "pass": true}
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+ENV {"gpu": "AMD Instinct MI300X", "arch": "gfx942:sramecc+:xnack-", "cus": 304, "torch": "2.11.0+rocm7.2", "hip": "7.2.26015", "flydsl": "0.4.0"}
+HBM probe: 4.96 TB/s median (1 GiB nontemporal read)
+[aiter] import [module_moe_sorting_opus] under /sgl-workspace/aiter/aiter/jit/module_moe_sorting_opus.so
+[aiter] LoadKernel: _ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x128.co
+[aiter] LoadKernel: _ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256.co
+[aiter] LoadKernel: _ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x128.co
+[aiter] LoadKernel: _ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128.co
+[aiter] LoadKernel: _ZN5aiter49fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x128.co
+[aiter] LoadKernel: _ZN5aiter49fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256.co
+[aiter] LoadKernel: _ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co
+[aiter] LoadKernel: _ZN5aiter43fmoe_bf16_blockscaleFp8_g1u1_vs_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_64x256.co
+GATE {"stage": "T=256 before sampling", "time": 1794137570.7438858, "bdf": "0000:0c:00.0", "activity": [2, 1, 0, 0, 0], "vram_used_mb": 2878, "vram_total_mb": 196592, "power_w": 188, "pids": 1, "pass": true}
+GATE {"stage": "T=256 round 0", "time": 1794137573.9846568, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2878, "vram_total_mb": 196592, "power_w": 189, "pids": 1, "pass": true}
+GATE {"stage": "T=256 round 1", "time": 1794137577.2401316, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2878, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+GATE {"stage": "T=256 round 2", "time": 1794137580.4656558, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2878, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+GATE {"stage": "T=256 round 3", "time": 1794137583.6914341, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2878, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+
+T=256 ep_uniform: 256 local routes, routes/expert min 8 max 8, 12.9 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         261.7    257.1-268.3         247.7    49.2    3.08   8.11e-06  pass
+  asm vs_32x128                    267.4    263.2-280.0         253.3    48.2    3.01   1.38e-05  pass
+  asm vs_32x256                    262.9    255.7-271.5         248.9    49.0    3.06   8.08e-06  pass
+  asm novs_ps_32x128               266.4    255.8-286.2         252.9    48.4    3.02   1.39e-05  pass
+  asm novs_ps_32x256               260.8    255.6-271.9         246.9    49.4    3.09   8.13e-06  pass
+  asm vs_ps_32x128                 264.4    252.1-276.3         250.6    48.7    3.05   1.39e-05  pass
+  asm vs_ps_32x256                 260.4    256.1-267.9         246.2    49.5    3.09   8.13e-06  pass
+  asm novs_32x128                  272.0    262.6-283.6         258.2    47.4    2.96   1.39e-05  pass
+  asm novs_32x256                  263.8    256.2-270.0         249.4    48.8    3.05   8.10e-06  pass
+  asm vs_psx_64x256                268.8    264.5-273.8         252.5    47.9    3.00   8.04e-06  pass
+  asm vs_64x256                    269.1    265.5-277.3         253.0    47.9    2.99   8.11e-06  pass
+  bm256                            429.0    408.4-452.9         414.3    30.0    1.88   1.38e-06  pass
+  small                            215.5    210.5-245.6         200.7    59.8    3.74   1.38e-06  pass
+  k: sort256NZ                      10.4      9.7-13.2           10.4  1236.1   77.26        nan  
+  k: sort128NZ                      10.4      9.7-12.8           10.4  1238.5   77.40        nan  
+  k: sort128Z                       11.0     10.1-13.9           11.0  1168.6   73.04        nan  
+  k: counts                          8.4      7.5-11.5            8.4  1534.0   95.88        nan  
+  k: zero_rows                       6.1      5.8-10.5            6.1  2100.6  131.29        nan  
+  k: gateup256                     264.6    248.0-274.0         264.6    48.7    3.04        nan  
+  k: down256                       150.6    147.6-157.0         150.6    85.5    5.35        nan  
+  k: gateup_small                  131.6    126.7-138.4         131.6    97.9    6.12        nan  
+  k: down_small                     68.2     66.9-70.8           68.2   189.0   11.81        nan  
+  k: down_small_atomic              68.2     66.4-70.6           68.2   189.0   11.82        nan  
+  k: asm auto                      246.9    239.2-251.7         246.9    52.2    3.26        nan  
+  k: asm vs_32x128                 256.9    248.5-264.4         256.9    50.2    3.14        nan  
+  k: asm vs_32x256                 246.4    241.1-256.2         246.4    52.3    3.27        nan  
+  k: asm novs_ps_32x128            250.7    238.9-261.8         250.7    51.4    3.21        nan  
+  k: asm novs_ps_32x256            247.7    242.2-253.7         247.7    52.0    3.25        nan  
+  k: asm vs_ps_32x128              250.9    243.6-258.9         250.9    51.4    3.21        nan  
+  k: asm vs_ps_32x256              247.7    242.5-254.9         247.7    52.0    3.25        nan  
+  k: asm novs_32x128               255.8    247.4-266.1         255.8    50.4    3.15        nan  
+  k: asm novs_32x256               247.6    243.6-257.6         247.6    52.0    3.25        nan  
+  k: asm vs_psx_64x256             261.1    249.7-282.7         261.1    49.3    3.08        nan  
+  k: asm vs_64x256                 255.7    248.6-276.9         255.7    50.4    3.15        nan  
+  bm256: 0.607x vs tuned asm vs_ps_32x256 (with sort), 0.594x without sort; 0.610x vs asm auto
+  small: 1.209x vs tuned asm vs_ps_32x256 (with sort), 1.226x without sort; 1.215x vs asm auto
+GATE {"stage": "T=512 before sampling", "time": 1794137584.6093955, "bdf": "0000:0c:00.0", "activity": [3, 1, 0, 0, 0], "vram_used_mb": 2966, "vram_total_mb": 196592, "power_w": 189, "pids": 1, "pass": true}
+GATE {"stage": "T=512 round 0", "time": 1794137587.8124807, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2966, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+GATE {"stage": "T=512 round 1", "time": 1794137591.0494637, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2966, "vram_total_mb": 196592, "power_w": 191, "pids": 1, "pass": true}
+GATE {"stage": "T=512 round 2", "time": 1794137594.312094, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2966, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+GATE {"stage": "T=512 round 3", "time": 1794137597.5377295, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2966, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+
+T=512 ep_uniform: 512 local routes, routes/expert min 16 max 16, 25.8 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         274.8    268.8-285.5         257.0    93.8    2.93   8.12e-06  pass
+  asm vs_32x128                    288.0    277.7-296.4         270.2    89.5    2.80   1.40e-05  pass
+  asm vs_32x256                    272.4    267.1-284.4         254.8    94.6    2.96   8.12e-06  pass
+  asm novs_ps_32x128               278.7    272.1-292.1         260.7    92.5    2.89   1.39e-05  pass
+  asm novs_ps_32x256               275.1    269.2-282.6         256.6    93.7    2.93   8.11e-06  pass
+  asm vs_ps_32x128                 281.6    269.8-291.0         263.5    91.5    2.86   1.40e-05  pass
+  asm vs_ps_32x256                 274.0    268.2-281.6         256.4    94.1    2.94   8.14e-06  pass
+  asm novs_32x128                  292.0    282.2-297.4         272.3    88.2    2.76   1.38e-05  pass
+  asm novs_32x256                  274.1    267.8-288.3         255.2    94.0    2.94   8.09e-06  FAIL 1108 elements off, worst by 0.839 (rms 1.9)
+  asm vs_psx_64x256                279.3    275.2-283.1         259.5    92.3    2.88   8.05e-06  pass
+  asm vs_64x256                    280.5    276.7-315.3         260.7    91.9    2.87   8.12e-06  pass
+  bm256                            431.9    416.2-464.1         413.5    59.7    1.86   1.37e-06  pass
+  small                            220.2    213.7-250.6         201.7   117.0    3.66   1.37e-06  pass
+  k: sort256NZ                      12.3     11.4-14.8           12.3  2100.4   65.64        nan  
+  k: sort128NZ                      12.3     11.4-15.6           12.3  2087.0   65.22        nan  
+  k: sort128Z                       12.7     11.9-15.2           12.7  2034.1   63.57        nan  
+  k: counts                          8.4      7.5-11.2            8.4  3075.5   96.11        nan  
+  k: zero_rows                       6.0      5.8-7.9             6.0  4270.8  133.46        nan  
+  k: gateup256                     275.5    259.3-288.5         275.5    93.6    2.92        nan  
+  k: down256                       149.5    143.0-151.9         149.5   172.4    5.39        nan  
+  k: gateup_small                  146.8    132.3-159.9         146.8   175.6    5.49        nan  
+  k: down_small                     68.3     67.2-75.7           68.3   377.5   11.80        nan  
+  k: down_small_atomic              68.2     67.2-71.8           68.2   378.0   11.81        nan  
+  k: asm auto                      256.2    250.1-265.8         256.2   100.6    3.14        nan  
+  k: asm vs_32x128                 268.9    258.3-281.3         268.9    95.8    3.00        nan  
+  k: asm vs_32x256                 259.1    251.8-264.6         259.1    99.4    3.11        nan  
+  k: asm novs_ps_32x128            264.2    257.0-281.8         264.2    97.5    3.05        nan  
+  k: asm novs_ps_32x256            256.6    250.4-262.4         256.6   100.4    3.14        nan  
+  k: asm vs_ps_32x128              263.1    251.9-277.6         263.1    97.9    3.06        nan  
+  k: asm vs_ps_32x256              257.1    251.8-264.6         257.1   100.2    3.13        nan  
+  k: asm novs_32x128               270.0    259.1-278.2         270.0    95.4    2.98        nan  
+  k: asm novs_32x256               260.3    253.5-269.9         260.3    99.0    3.09        nan  
+  k: asm vs_psx_64x256             258.3    252.3-266.7         258.3    99.8    3.12        nan  
+  k: asm vs_64x256                 262.6    256.3-286.3         262.6    98.1    3.07        nan  
+  bm256: 0.631x vs tuned asm vs_32x256 (with sort), 0.616x without sort; 0.636x vs asm auto
+  small: 1.237x vs tuned asm vs_32x256 (with sort), 1.263x without sort; 1.248x vs asm auto
+GATE {"stage": "T=1024 before sampling", "time": 1794137598.4779332, "bdf": "0000:0c:00.0", "activity": [3, 1, 0, 0, 0], "vram_used_mb": 3278, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+GATE {"stage": "T=1024 round 0", "time": 1794137601.7375047, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3278, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+GATE {"stage": "T=1024 round 1", "time": 1794137605.017285, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3278, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+GATE {"stage": "T=1024 round 2", "time": 1794137608.2850585, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3278, "vram_total_mb": 196592, "power_w": 190, "pids": 1, "pass": true}
+GATE {"stage": "T=1024 round 3", "time": 1794137611.551054, "bdf": "0000:0c:00.0", "activity": [5, 4, 1, 1, 2], "vram_used_mb": 3278, "vram_total_mb": 196592, "power_w": 224, "pids": 10, "pass": true}
+
+T=1024 ep_uniform: 1024 local routes, routes/expert min 32 max 32, 51.5 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         290.2    285.7-295.4         269.4   177.6    2.78   8.10e-06  pass
+  asm vs_32x128                    319.0    309.9-332.2         298.4   161.6    2.52   1.39e-05  pass
+  asm vs_32x256                    291.8    286.3-297.7         270.5   176.7    2.76   8.17e-06  pass
+  asm novs_ps_32x128               306.7    296.2-320.4         285.0   168.0    2.63   1.39e-05  pass
+  asm novs_ps_32x256               290.5    287.1-295.6         269.4   177.4    2.77   8.10e-06  pass
+  asm vs_ps_32x128                 314.1    303.0-331.0         292.3   164.1    2.56   1.39e-05  pass
+  asm vs_ps_32x256                 291.8    286.4-297.9         271.0   176.6    2.76   8.15e-06  pass
+  asm novs_32x128                  313.2    306.7-325.3         292.3   164.5    2.57   1.39e-05  pass
+  asm novs_32x256                  292.1    286.9-299.0         271.0   176.4    2.76   8.12e-06  pass
+  asm vs_psx_64x256                292.3    285.9-298.4         269.4   176.3    2.76   8.07e-06  pass
+  asm vs_64x256                    295.3    290.1-303.9         272.5   174.5    2.73   8.14e-06  pass
+  bm256                            443.0    421.8-459.0         422.9   116.3    1.82   1.38e-06  pass
+  small                            248.6    219.6-260.6         229.0   207.3    3.24   1.38e-06  pass
+  k: sort256NZ                      12.7     11.9-13.4           12.7  4055.2   63.36        nan  
+  k: sort128NZ                      12.7     11.9-13.2           12.7  4048.8   63.26        nan  
+  k: sort128Z                       13.9     13.2-14.5           13.9  3720.7   58.14        nan  
+  k: counts                          8.4      7.5-8.7             8.4  6165.8   96.34        nan  
+  k: zero_rows                       5.9      5.7-7.1             5.9  8745.2  136.64        nan  
+  k: gateup256                     279.6    267.1-293.6         279.6   184.3    2.88        nan  
+  k: down256                       145.8    144.7-149.0         145.8   353.6    5.53        nan  
+  k: gateup_small                  150.1    145.5-158.5         150.1   343.3    5.36        nan  
+  k: down_small                     81.9     71.8-84.2           81.9   629.2    9.83        nan  
+  k: down_small_atomic              81.0     79.0-83.4           81.0   636.4    9.94        nan  
+  k: asm auto                      272.7    268.3-303.4         272.7   189.0    2.95        nan  
+  k: asm vs_32x128                 298.2    289.7-308.3         298.2   172.9    2.70        nan  
+  k: asm vs_32x256                 272.6    267.9-285.4         272.6   189.1    2.95        nan  
+  k: asm novs_ps_32x128            290.7    280.7-299.2         290.7   177.3    2.77        nan  
+  k: asm novs_ps_32x256            270.6    264.6-279.2         270.6   190.4    2.98        nan  
+  k: asm vs_ps_32x128              293.6    284.3-301.1         293.6   175.5    2.74        nan  
+  k: asm vs_ps_32x256              273.5    265.9-301.3         273.5   188.4    2.94        nan  
+  k: asm novs_32x128               294.8    287.8-307.1         294.8   174.8    2.73        nan  
+  k: asm novs_32x256               276.7    268.9-303.8         276.7   186.3    2.91        nan  
+  k: asm vs_psx_64x256             273.4    267.2-296.6         273.4   188.5    2.95        nan  
+  k: asm vs_64x256                 280.2    269.2-309.6         280.2   183.9    2.87        nan  
+  bm256: 0.655x vs tuned asm auto (with sort), 0.637x without sort; 0.655x vs asm auto
+  small: 1.167x vs tuned asm auto (with sort), 1.176x without sort; 1.167x vs asm auto
+GATE {"stage": "T=2048 before sampling", "time": 1794137612.599941, "bdf": "0000:0c:00.0", "activity": [4, 1, 0, 0, 0], "vram_used_mb": 3622, "vram_total_mb": 196592, "power_w": 190, "pids": 10, "pass": true}
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556149: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556168: No such file or directory
+Unable to open queues directory for process 2556196: No such file or directory
+Unable to open queues directory for process 2556182: No such file or directory
+Unable to open queues directory for process 2556162: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556208: No such file or directory
+Unable to open queues directory for process 2556206: No such file or directory
+Unable to open queues directory for process 2556189: No such file or directory
+Unable to open queues directory for process 2556213: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+Unable to open queues directory for process 2556234: No such file or directory
+Unable to open queues directory for process 2556222: No such file or directory
+Unable to open queues directory for process 2556240: No such file or directory
+Unable to open queues directory for process 2556259: No such file or directory
+Unable to open queues directory for process 2556257: No such file or directory
+Unable to open queues directory for process 2556247: No such file or directory
+GATE {"stage": "T=2048 round 0", "time": 1794137616.3678498, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3624, "vram_total_mb": 196592, "power_w": 191, "pids": 10, "pass": true}
+GATE {"stage": "T=2048 round 1", "time": 1794137619.7096043, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 4125, "vram_total_mb": 196592, "power_w": 191, "pids": 10, "pass": true}
+GATE {"stage": "T=2048 round 2", "time": 1794137623.089115, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 4125, "vram_total_mb": 196592, "power_w": 188, "pids": 10, "pass": true}
+GATE {"stage": "T=2048 round 3", "time": 1794137626.452397, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 1, 0], "vram_used_mb": 4125, "vram_total_mb": 196592, "power_w": 187, "pids": 10, "pass": true}
+
+T=2048 ep_uniform: 2048 local routes, routes/expert min 64 max 64, 103.1 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         381.3    344.7-400.9         345.3   270.4    2.11   8.16e-06  pass
+  asm vs_32x128                    462.8    456.3-474.2         432.2   222.7    1.74   1.40e-05  pass
+  asm vs_32x256                    350.6    339.9-392.4         314.9   294.0    2.30   8.15e-06  pass
+  asm novs_ps_32x128               459.5    451.3-465.5         429.3   224.3    1.75   1.40e-05  pass
+  asm novs_ps_32x256               345.8    337.8-384.7         311.0   298.1    2.33   8.17e-06  pass
+  asm vs_ps_32x128                 468.1    460.9-477.6         437.4   220.2    1.72   1.40e-05  pass
+  asm vs_ps_32x256                 347.7    337.4-388.5         311.9   296.5    2.32   8.18e-06  pass
+  asm novs_32x128                  453.6    445.3-465.9         421.8   227.2    1.78   1.39e-05  pass
+  asm novs_32x256                  381.5    340.4-397.4         347.5   270.2    2.11   8.16e-06  pass
+  asm vs_psx_64x256                332.4    324.2-337.1         296.8   310.1    2.42   8.20e-06  pass
+  asm vs_64x256                    342.0    330.6-373.3         305.9   301.4    2.35   8.15e-06  pass
+  bm256                            461.0    453.1-478.2         430.4   223.6    1.75   1.41e-06  pass
+  small                            288.4    280.9-330.8         251.3   357.4    2.79   1.41e-06  pass
+  k: sort256NZ                      18.7     17.8-19.2           18.7  5499.6   42.97        nan  
+  k: sort128NZ                      18.8     17.9-19.4           18.8  5476.2   42.78        nan  
+  k: sort128Z                       21.8     20.9-22.9           21.8  4717.6   36.86        nan  
+  k: counts                          8.3      7.5-8.9             8.3 12420.7   97.04        nan  
+  k: zero_rows                       5.9      5.7-7.1             5.9 17372.4  135.72        nan  
+  k: gateup256                     293.8    275.6-302.9         293.8   350.9    2.74        nan  
+  k: down256                       150.6    149.2-156.3         150.6   684.3    5.35        nan  
+  k: gateup_small                  185.2    155.8-204.8         185.2   556.6    4.35        nan  
+  k: down_small                     96.6     94.0-99.6           96.6  1066.8    8.33        nan  
+  k: down_small_atomic              98.9     89.6-111.0          98.9  1042.4    8.14        nan  
+  k: asm auto                      342.3    307.0-361.7         342.3   301.1    2.35        nan  
+  k: asm vs_32x128                 440.8    435.4-447.6         440.8   233.8    1.83        nan  
+  k: asm vs_32x256                 333.2    308.0-365.6         333.2   309.3    2.42        nan  
+  k: asm novs_ps_32x128            435.8    423.9-448.5         435.8   236.5    1.85        nan  
+  k: asm novs_ps_32x256            344.2    303.5-358.4         344.2   299.4    2.34        nan  
+  k: asm vs_ps_32x128              442.3    430.9-455.4         442.3   233.0    1.82        nan  
+  k: asm vs_ps_32x256              351.4    343.9-361.2         351.4   293.3    2.29        nan  
+  k: asm novs_32x128               435.1    427.7-444.3         435.1   236.9    1.85        nan  
+  k: asm novs_32x256               347.9    308.3-359.6         347.9   296.3    2.31        nan  
+  k: asm vs_psx_64x256             306.6    295.6-336.9         306.6   336.2    2.63        nan  
+  k: asm vs_64x256                 324.2    298.4-345.0         324.2   317.9    2.48        nan  
+  bm256: 0.721x vs tuned asm vs_psx_64x256 (with sort), 0.690x without sort; 0.827x vs asm auto
+  small: 1.152x vs tuned asm vs_psx_64x256 (with sort), 1.181x without sort; 1.322x vs asm auto
+GATE {"stage": "T=4096 before sampling", "time": 1794137627.458765, "bdf": "0000:0c:00.0", "activity": [4, 2, 1, 0, 0], "vram_used_mb": 4811, "vram_total_mb": 196592, "power_w": 187, "pids": 10, "pass": true}
+GATE {"stage": "T=4096 round 0", "time": 1794137630.8953788, "bdf": "0000:0c:00.0", "activity": [5, 2, 2, 2, 1], "vram_used_mb": 5496, "vram_total_mb": 196592, "power_w": 187, "pids": 10, "pass": true}
+GATE {"stage": "T=4096 round 1", "time": 1794137634.3280025, "bdf": "0000:0c:00.0", "activity": [17, 16, 14, 16, 12], "vram_used_mb": 6200, "vram_total_mb": 196592, "power_w": 234, "pids": 10, "pass": false}
+GATE {"stage": "T=4096 round 2", "time": 1794137637.8592768, "bdf": "0000:0c:00.0", "activity": [23, 14, 15, 19, 20], "vram_used_mb": 7865, "vram_total_mb": 196592, "power_w": 236, "pids": 10, "pass": false}
+GATE {"stage": "T=4096 round 3", "time": 1794137641.3793147, "bdf": "0000:0c:00.0", "activity": [29, 25, 21, 24, 20], "vram_used_mb": 9589, "vram_total_mb": 196592, "power_w": 276, "pids": 10, "pass": false}
+
+T=4096 ep_uniform: 4096 local routes, routes/expert min 128 max 128, 206.2 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         571.7    562.4-584.8         534.2   360.6    1.41   8.17e-06  pass
+  asm vs_32x128                    738.4    722.3-757.5         706.0   279.2    1.09   1.39e-05  pass
+  asm vs_32x256                    571.2    528.7-585.3         532.4   360.9    1.41   8.14e-06  pass
+  asm novs_ps_32x128               725.7    713.6-742.1         691.0   284.1    1.11   1.39e-05  pass
+  asm novs_ps_32x256               572.0    554.4-588.1         532.9   360.4    1.41   8.13e-06  pass
+  asm vs_ps_32x128                 737.3    724.0-795.4         703.9   279.6    1.09   1.39e-05  pass
+  asm vs_ps_32x256                 567.8    559.0-581.1         530.8   363.1    1.42   8.15e-06  pass
+  asm novs_32x128                  719.6    698.2-768.9         685.3   286.5    1.12   1.39e-05  pass
+  asm novs_32x256                  560.2    551.5-573.4         522.1   368.0    1.44   8.12e-06  pass
+  asm vs_psx_64x256                516.0    475.9-694.9         470.3   399.5    1.56   8.15e-06  pass
+  asm vs_64x256                    493.5    473.9-514.1         454.8   417.8    1.63   8.13e-06  pass
+  bm256                            491.0    479.3-511.7         458.6   419.9    1.64   1.39e-06  pass
+  small                            386.5    380.2-398.2         344.7   533.4    2.08   1.39e-06  pass
+  k: sort256NZ                      19.2     18.2-19.8           19.2 10757.3   42.02        nan  
+  k: sort128NZ                      19.1     18.1-19.6           19.1 10780.1   42.11        nan  
+  k: sort128Z                       26.3     25.5-27.1           26.3  7844.5   30.64        nan  
+  k: counts                          8.2      7.5-9.0             8.2 25083.2   97.98        nan  
+  k: zero_rows                       6.0      5.7-7.5             6.0 34282.6  133.92        nan  
+  k: gateup256                     301.3    293.8-328.4         301.3   684.2    2.67        nan  
+  k: down256                       171.2    158.0-180.9         171.2  1204.1    4.70        nan  
+  k: gateup_small                  225.9    217.7-236.1         225.9   912.4    3.56        nan  
+  k: down_small                    133.1    128.9-140.5         133.1  1549.3    6.05        nan  
+  k: down_small_atomic             134.9    131.0-145.0         134.9  1528.3    5.97        nan  
+  k: asm auto                      535.9    527.4-551.6         535.9   384.7    1.50        nan  
+  k: asm vs_32x128                 704.3    697.6-719.5         704.3   292.7    1.14        nan  
+  k: asm vs_32x256                 529.4    524.6-535.0         529.4   389.4    1.52        nan  
+  k: asm novs_ps_32x128            690.0    680.4-703.0         690.0   298.8    1.17        nan  
+  k: asm novs_ps_32x256            523.9    496.7-537.8         523.9   393.5    1.54        nan  
+  k: asm vs_ps_32x128              709.3    698.0-719.6         709.3   290.7    1.14        nan  
+  k: asm vs_ps_32x256              528.5    512.3-542.1         528.5   390.1    1.52        nan  
+  k: asm novs_32x128               686.1    674.4-696.9         686.1   300.5    1.17        nan  
+  k: asm novs_32x256               524.2    518.0-535.9         524.2   393.3    1.54        nan  
+  k: asm vs_psx_64x256             480.1    470.2-488.1         480.1   429.4    1.68        nan  
+  k: asm vs_64x256                 467.2    460.3-490.3         467.2   441.3    1.72        nan  
+  bm256: 1.005x vs tuned asm vs_64x256 (with sort), 0.992x without sort; 1.164x vs asm auto
+  small: 1.277x vs tuned asm vs_64x256 (with sort), 1.319x without sort; 1.479x vs asm auto
+GATE {"stage": "end", "time": 1794137642.2125657, "bdf": "0000:0c:00.0", "activity": [22, 21, 27, 20, 15], "vram_used_mb": 7147, "vram_total_mb": 196592, "power_w": 234, "pids": 10, "pass": false}
+gates FAIL (results contaminated by other GPU work)

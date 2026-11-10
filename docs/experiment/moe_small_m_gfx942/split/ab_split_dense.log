@@ -1,0 +1,4 @@
+rows=128 blocks=32 extra=128 gateup small=  199.2us (1.000x)  split=  202.2us (0.985x)
+rows=128 blocks=32 extra=128 down   small=  109.2us (1.000x)  split=  111.7us (0.978x)
+rows= 64 blocks=32 extra=128 gateup small=  131.6us (1.000x)  split=  135.0us (0.975x)
+rows= 64 blocks=32 extra=128 down   small=   73.7us (1.000x)  split=   77.6us (0.950x)

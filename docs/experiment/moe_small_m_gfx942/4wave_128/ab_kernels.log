@@ -1,0 +1,13 @@
+# tools/ab_kernels.py --impls c64 down128 cur old8 --rows 16 32 64 96 112 128 (strict idle gating), GPU 2, 6 rounds x 10 calls, median us; cur = 128 x 256 tiles for GateUp and Down, down128 = the same with a 128-column Down tile
+rows= 16 gateup c64=  122.5us (1.000x)  down128=  117.4us (1.043x)  cur=  116.9us (1.048x)  old8=  125.5us (0.976x)
+rows= 16 down   c64=   65.6us (1.000x)  down128=   66.0us (0.993x)  cur=   63.6us (1.031x)  old8=   66.8us (0.982x)
+rows= 32 gateup c64=  128.3us (1.000x)  down128=  120.0us (1.070x)  cur=  120.8us (1.063x)  old8=  125.2us (1.025x)
+rows= 32 down   c64=   69.4us (1.000x)  down128=   69.0us (1.005x)  cur=   65.6us (1.058x)  old8=   70.1us (0.990x)
+rows= 64 gateup c64=  146.1us (1.000x)  down128=  131.6us (1.111x)  cur=  131.5us (1.111x)  old8=  139.2us (1.050x)
+rows= 64 down   c64=   78.4us (1.000x)  down128=   77.3us (1.015x)  cur=   74.3us (1.055x)  old8=   77.5us (1.011x)
+rows= 96 gateup c64=  176.2us (1.000x)  down128=  157.2us (1.120x)  cur=  158.0us (1.115x)  old8=  167.1us (1.054x)
+rows= 96 down   c64=   97.3us (1.000x)  down128=   93.5us (1.040x)  cur=   87.0us (1.118x)  old8=   95.1us (1.022x)
+rows=112 gateup c64=  194.7us (1.000x)  down128=  182.0us (1.070x)  cur=  182.8us (1.065x)  old8=  186.9us (1.042x)
+rows=112 down   c64=  109.4us (1.000x)  down128=  105.8us (1.034x)  cur=   99.6us (1.098x)  old8=  107.5us (1.018x)
+rows=128 gateup c64=  209.7us (1.000x)  down128=  199.2us (1.052x)  cur=  198.3us (1.057x)  old8=  205.8us (1.019x)
+rows=128 down   c64=  118.9us (1.000x)  down128=  115.1us (1.033x)  cur=  108.7us (1.093x)  old8=  119.0us (0.999x)

@@ -1,0 +1,17 @@
+HBM read_u4 grid=304             median    217.1 us  4.95 TB/s  best  4.99 TB/s
+HBM read_u4 grid=608             median    220.4 us  4.87 TB/s  best  4.91 TB/s
+HBM read_u4 grid=1216            median    234.2 us  4.58 TB/s  best  4.61 TB/s
+HBM read_u4 grid=2432            median    234.5 us  4.58 TB/s  best  4.60 TB/s
+HBM read_u8 grid=304             median    217.8 us  4.93 TB/s  best  4.96 TB/s
+HBM read_u8 grid=608             median    219.2 us  4.90 TB/s  best  4.92 TB/s
+HBM read_u8 grid=1216            median    230.2 us  4.66 TB/s  best  4.70 TB/s
+HBM read_u8 grid=2432            median    231.9 us  4.63 TB/s  best  4.65 TB/s
+HBM read512_u8 grid=304          median    217.9 us  4.93 TB/s  best  4.95 TB/s
+HBM read512_u8 grid=608          median    221.6 us  4.85 TB/s  best  4.87 TB/s
+HBM read512_u8 grid=1216         median    232.8 us  4.61 TB/s  best  4.64 TB/s
+HBM read512_u8 grid=2432         median    233.8 us  4.59 TB/s  best  4.61 TB/s
+MFMA burst 4 waves/SIMD: median   2214.9 us  1151.3 TF  best  1174.2 TF
+MFMA burst 8 waves/SIMD: median   2115.9 us  1205.2 TF  best  1227.0 TF
+MFMA sustained 2 s:  1151.0 TF
+GEMM _scaled_mm M=8192 N=K=8192: median    978.3 us  1123.9 TF  best  1236.2 TF
+GEMM _scaled_mm M=4096 N=K=8192: median    512.0 us  1073.8 TF  best  1292.4 TF

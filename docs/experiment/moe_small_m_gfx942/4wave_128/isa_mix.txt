@@ -1,0 +1,25 @@
+# tools/isa_mix.py <impl> <gateup|down> <S>: K-loop instructions per wave and K block, one slice-count variant compiled alone (MiMo shapes: GateUp K 4096, Down K 2048). c64 = 64-column 4-wave, old8 = 8-wave (128 x 256 tile, 8 waves x 2 x 16 weight rows), cur = 128 x 256 4-wave (4 x 16 rows per wave).
+c64    gateup S=1: per wave and K block mfma 8, buffer_load 6, ds_read 3, ds_write 2, s_barrier 2, s_waitcnt 8, valu 20, salu/branch/nop 6.5
+old8   gateup S=1: per wave and K block mfma 8, buffer_load 6, ds_read 3, ds_write 2, s_barrier 1, s_waitcnt 6.5, valu 18, salu/branch/nop 7
+cur    gateup S=1: per wave and K block mfma 16, buffer_load 10, ds_read 3, ds_write 2, s_barrier 2, s_waitcnt 10.5, valu 21, salu/branch/nop 16
+c64    gateup S=2: per wave and K block mfma 16, buffer_load 6, ds_read 5, ds_write 2, s_barrier 2, s_waitcnt 10, valu 22, salu/branch/nop 10
+old8   gateup S=2: per wave and K block mfma 16, buffer_load 6, ds_read 5, ds_write 2, s_barrier 1, s_waitcnt 7, valu 22, salu/branch/nop 9
+cur    gateup S=2: per wave and K block mfma 32, buffer_load 10, ds_read 5, ds_write 2, s_barrier 2, s_waitcnt 12.5, valu 39, salu/branch/nop 16
+c64    gateup S=4: per wave and K block mfma 32, buffer_load 7, ds_read 11, ds_write 3, s_barrier 2, s_waitcnt 15.5, valu 42, salu/branch/nop 10
+old8   gateup S=4: per wave and K block mfma 32, buffer_load 6, ds_read 11, ds_write 2, s_barrier 1, s_waitcnt 11, valu 42, salu/branch/nop 10
+cur    gateup S=4: per wave and K block mfma 64, buffer_load 11, ds_read 11, ds_write 3, s_barrier 2, s_waitcnt 17.5, valu 75, salu/branch/nop 16
+c64    gateup S=8: per wave and K block mfma 64, buffer_load 9, ds_read 23, ds_write 5, s_barrier 2, s_waitcnt 25, valu 82, salu/branch/nop 10
+old8   gateup S=8: per wave and K block mfma 64, buffer_load 7, ds_read 23, ds_write 3, s_barrier 1, s_waitcnt 19, valu 82, salu/branch/nop 10.5
+cur    gateup S=8: per wave and K block mfma 128, buffer_load 13, ds_read 24, ds_write 5, s_barrier 2, s_waitcnt 34.5, valu 146.5, salu/branch/nop 24
+c64    down   S=1: per wave and K block mfma 8, buffer_load 6, ds_read 3, ds_write 2, s_barrier 2, s_waitcnt 8, valu 28, salu/branch/nop 6
+old8   down   S=1: per wave and K block mfma 8, buffer_load 6, ds_read 3, ds_write 2, s_barrier 1, s_waitcnt 5.5, valu 16.5, salu/branch/nop 6
+cur    down   S=1: per wave and K block mfma 16, buffer_load 10, ds_read 3, ds_write 2, s_barrier 2, s_waitcnt 10.5, valu 19.5, salu/branch/nop 14.5
+c64    down   S=2: per wave and K block mfma 16, buffer_load 6, ds_read 6, ds_write 2, s_barrier 2, s_waitcnt 9, valu 38, salu/branch/nop 8
+old8   down   S=2: per wave and K block mfma 16, buffer_load 6, ds_read 5, ds_write 2, s_barrier 1, s_waitcnt 7.5, valu 19.5, salu/branch/nop 8
+cur    down   S=2: per wave and K block mfma 32, buffer_load 10, ds_read 5, ds_write 2, s_barrier 2, s_waitcnt 12.5, valu 36.5, salu/branch/nop 14.5
+c64    down   S=4: per wave and K block mfma 32, buffer_load 7, ds_read 12, ds_write 3, s_barrier 2, s_waitcnt 14.5, valu 74, salu/branch/nop 8
+old8   down   S=4: per wave and K block mfma 32, buffer_load 6, ds_read 11, ds_write 2, s_barrier 1, s_waitcnt 11.5, valu 37.5, salu/branch/nop 9
+cur    down   S=4: per wave and K block mfma 64, buffer_load 11, ds_read 11, ds_write 3, s_barrier 2, s_waitcnt 17.5, valu 70.5, salu/branch/nop 14.5
+c64    down   S=8: per wave and K block mfma 64, buffer_load 9, ds_read 24, ds_write 5, s_barrier 2, s_waitcnt 24, valu 146, salu/branch/nop 8
+old8   down   S=8: per wave and K block mfma 64, buffer_load 7, ds_read 23, ds_write 3, s_barrier 1, s_waitcnt 19, valu 73.5, salu/branch/nop 9.5
+cur    down   S=8: per wave and K block mfma 128, buffer_load 13, ds_read 24, ds_write 5, s_barrier 2, s_waitcnt 34.5, valu 138, salu/branch/nop 22.5

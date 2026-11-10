@@ -22,6 +22,7 @@ A token's routes are summed in one of two ways:
 """
 
 import functools
+from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -35,7 +36,7 @@ from flydsl.expr.typing import Vector as Vec
 from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
 from .helpers import BufferTensor, run_compiled
 from .moe_gateup_a8w8_blockscale_gfx942_lds import (
-    LAYOUTS, OOB_OFFSET, PACKET_DWORDS, PACKET_ROWS, SORT_BLOCK_M, TILE_K, TOKEN_MASK, _lds_dwords,
+    LAYOUTS, OOB_OFFSET, PACKET_DWORDS, PACKET_ROWS, SMALL_M_ROWS, SORT_BLOCK_M, TILE_K, TOKEN_MASK, _lds_dwords,
 )
 
 TILE_N = 256
@@ -77,11 +78,18 @@ def _rsrc_of(ptr, num_records_bytes):
 
 @functools.cache
 def compile_moe_down_a8w8_blockscale_gfx942_lds(
-    hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False
+    hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False,
+    big_blocks_only=False, merged=None,
 ):
+    """merged: plugin that maps workgroups to tasks itself (merged.task) and runs the blocks with no route at row 128
+    in the same launch (merged.body); see docs/record/moe_small_m_gfx942.md. merged.key (str) must change with the
+    plugin's code: the FlyDSL kernel cache keys on closure scalars and on sources next to this file only."""
     validate_parameters(1, hidden_dim, inter_dim, topk, num_experts, sorted_a2=sorted_a2)
     assert layout in LAYOUTS, layout
     assert atomic or not single_store
+    assert merged is None or (atomic and sorted_a2 and not single_store and not big_blocks_only)
+    merged_key = None if merged is None else merged.key
+    assert merged_key is None or isinstance(merged_key, str)
     H, K = hidden_dim, inter_dim
     KB = K // TILE_K
     n_tiles = H // TILE_N
@@ -159,19 +167,35 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
         valid_rows = uniform(load_i32(_rsrc_of(pNumValid, 4), 0))
         valid_blocks = (valid_rows + (SORT_BLOCK_M - 1)) // SORT_BLOCK_M
         valid_blocks = (valid_blocks < num_blocks).select(valid_blocks, num_blocks)
-        num_tasks = valid_blocks * n_tiles
-        if const_expr(xcd_swizzle):
-            # Hardware deals workgroups round-robin over 8 XCDs: give each XCD a contiguous task
-            # range so the N tiles of a sorted block (same A rows) share one L2.
-            xcd_tasks = (num_tasks + 7) >> 3
-            xcd_slot = pid >> 3
-            task = (pid & 7) * xcd_tasks + xcd_slot
-            active = (xcd_slot < xcd_tasks) & (task < num_tasks)
+        lds = fx.SharedAllocator().allocate(SharedTiles).peek()
+        if const_expr(merged is not None):
+            merged_task = merged.task(
+                SimpleNamespace(
+                    pid=pid, tid=tid, valid_blocks=valid_blocks, num_tokens=num_tokens, num_blocks=num_blocks,
+                    pSortedIds=pSortedIds, scan=lds.ab.ptr, big_tiles=n_tiles,
+                )
+            )
+            task = merged_task.block * n_tiles + merged_task.tile
+            active = merged_task.active
         else:
-            task = pid
-            active = task < num_tasks
+            num_tasks = valid_blocks * n_tiles
+            if const_expr(xcd_swizzle):
+                # Hardware deals workgroups round-robin over 8 XCDs: give each XCD a contiguous task
+                # range so the N tiles of a sorted block (same A rows) share one L2.
+                xcd_tasks = (num_tasks + 7) >> 3
+                xcd_slot = pid >> 3
+                task = (pid & 7) * xcd_tasks + xcd_slot
+                active = (xcd_slot < xcd_tasks) & (task < num_tasks)
+            else:
+                task = pid
+                active = task < num_tasks
+            if const_expr(big_blocks_only):
+                # Blocks with no route at row 128 belong to the small-M Down.
+                probe = uniform(load_i32(_rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), ((task // n_tiles) * SORT_BLOCK_M + SMALL_M_ROWS) * 4))
+                active = active & ((probe & TOKEN_MASK) < num_tokens) & (((probe >> 24) & 255) < topk)
 
-        if active:
+        def big_body():
+            """The BM256 task `task`."""
             zero = fx.Int32(0).ir_value()
             sorted_rsrc = _rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4))
             weight_rsrc = _rsrc_of(pSortedWeights, num_blocks * (SORT_BLOCK_M * 4))
@@ -250,8 +274,6 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
             else:
                 a_read = [[_lds_dwords(wave_m * 16 + lane % 16, lane // 16 + h * 4) for h in range(2)]]
                 b_read = [[_lds_dwords(wave_n * 32 + r * 16 + lane % 16, lane // 16 + h * 4) for h in range(2)] for r in range(2)]
-
-            lds = fx.SharedAllocator().allocate(SharedTiles).peek()
 
             def lds_view(dwords, count=4):
                 return fx.make_view(lds.ab.ptr + dwords, fx.make_layout(count, 1))
@@ -592,6 +614,23 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                 if n_tile == 0:
                     write_inverse()
 
+        def small_ctx():
+            return SimpleNamespace(
+                pA=pA, pB=pB, pOut=pOut, pScaleOut=pScaleA, pScaleA=pScaleA, pScaleB=pScaleB, pSortedIds=pSortedIds,
+                pSortedWeights=pSortedWeights, pExpertIds=pExpertIds, num_tokens=num_tokens, num_blocks=num_blocks, tid=tid,
+                lds_base=lds.ab.ptr,
+            )
+
+        if const_expr(merged is not None):
+            if active:
+                if merged_task.big:
+                    big_body()
+                else:
+                    merged.body(small_ctx(), merged_task.block, merged_task.tile)
+        else:
+            if active:
+                big_body()
+
     @flyc.jit
     def launch(
         pA: fx.Pointer,
@@ -609,12 +648,16 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
         num_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        if const_expr(merged_key is not None):
+            grid_x = merged.grid(num_blocks)
+        else:
+            grid_x = (num_blocks * n_tiles + 7) // 8 * 8
         down_kernel(
             pA, pB, pOut, pScaleA, pScaleB, pSortedIds, pSortedWeights, pExpertIds, pNumValid, pInverse, pRouteCounts,
             num_tokens, num_blocks,
             value_attrs={"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]},
         ).launch(
-            grid=((num_blocks * n_tiles + 7) // 8 * 8, 1, 1),
+            grid=(grid_x, 1, 1),
             block=(512, 1, 1),
             stream=stream,
         )
@@ -706,12 +749,12 @@ def compile_moe_route_counts(topk):
     """counts[token] += 1 for every valid sorted ID (counts zeroed by the caller): local routes per token."""
 
     @flyc.kernel(known_block_size=[SORT_BLOCK_M, 1, 1])
-    def count_kernel(pSortedIds: fx.Pointer, pNumValid: fx.Pointer, pCounts: fx.Pointer, num_tokens: fx.Int32, num_blocks: fx.Int32):
+    def count_kernel(pSortedIds: fx.Pointer, pNumValid: fx.Pointer, pCounts: fx.Pointer, num_tokens: fx.Int32, num_rows: fx.Int32):
         zero = fx.Int32(0).ir_value()
         position = fx.Int32(fx.block_idx.x) * SORT_BLOCK_M + fx.thread_idx.x
         valid_rows = fx.Int32(rocdl.raw_ptr_buffer_load(T.i32, _rsrc_of(pNumValid, 4), zero, zero, zero))
         fused = fx.Int32(
-            rocdl.raw_ptr_buffer_load(T.i32, _rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), (position * 4).ir_value(), zero, zero)
+            rocdl.raw_ptr_buffer_load(T.i32, _rsrc_of(pSortedIds, num_rows * 4), (position * 4).ir_value(), zero, zero)
         )
         token = fused & TOKEN_MASK
         slot = (fused >> 24) & 255
@@ -730,18 +773,18 @@ def compile_moe_route_counts(topk):
         pNumValid: fx.Pointer,
         pCounts: fx.Pointer,
         num_tokens: fx.Int32,
-        num_blocks: fx.Int32,
+        num_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        count_kernel(pSortedIds, pNumValid, pCounts, num_tokens, num_blocks).launch(
-            grid=(num_blocks, 1, 1), block=(SORT_BLOCK_M, 1, 1), stream=stream
+        count_kernel(pSortedIds, pNumValid, pCounts, num_tokens, num_rows).launch(
+            grid=((num_rows + SORT_BLOCK_M - 1) // SORT_BLOCK_M, 1, 1), block=(SORT_BLOCK_M, 1, 1), stream=stream
         )
 
     return launch
 
 
-def moe_route_counts(sorted_ids, num_valid_ids, expert_ids, counts, topk):
-    """counts [tokens] int32 = number of local routes of each token (refilled)."""
+def moe_route_counts(sorted_ids, num_valid_ids, expert_ids, counts, topk, block_m=SORT_BLOCK_M):
+    """counts [tokens] int32 = number of local routes of each token (refilled); block_m: rows per sorted block."""
     counts.zero_()
     run_compiled(
         compile_moe_route_counts(topk),
@@ -749,7 +792,7 @@ def moe_route_counts(sorted_ids, num_valid_ids, expert_ids, counts, topk):
         flyc.from_c_void_p(fx.Int32, num_valid_ids.data_ptr()),
         flyc.from_c_void_p(fx.Int32, counts.data_ptr()),
         counts.numel(),
-        expert_ids.numel(),
+        expert_ids.numel() * block_m,
         torch.cuda.current_stream(),
     )
     return counts
@@ -823,7 +866,7 @@ def moe_zero_rows(out, counts, num_rows=None):
 
 def _launch_down(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, target, inverse, layout, xcd_swizzle,
-    atomic, tokens, topk, route_counts=None,
+    atomic, tokens, topk, route_counts=None, big_blocks_only=False,
 ):
     sorted_a2 = a2.dim() == 2
     inter_dim = a2.shape[-1]
@@ -836,7 +879,7 @@ def _launch_down(
     single_store = route_counts is not None
     assert not single_store or route_counts.shape == (tokens,) and route_counts.dtype == torch.int32
     launch = compile_moe_down_a8w8_blockscale_gfx942_lds(
-        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store
+        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store, bool(big_blocks_only)
     )
     run_compiled(
         launch,
@@ -874,7 +917,7 @@ def moe_down_rows_a8w8_blockscale_gfx942_lds(
 def moe_down_a8w8_blockscale_gfx942_lds(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out,
     layout="2x4_pf1", xcd_swizzle=True, reduce="atomic", zero_out=True, rows=None, inverse=None, topk=None,
-    single_store=False, route_counts=None,
+    single_store=False, route_counts=None, big_blocks_only=False,
 ):
     """out [tokens, H] BF16 = sum over each token's routes of routing weight * (a2 row @ w2[expert]^T).
 
@@ -885,8 +928,10 @@ def moe_down_a8w8_blockscale_gfx942_lds(
     contents); single_store=True stores the rows of single-route tokens instead (route_counts: precomputed
     moe_route_counts, else computed here) and zero_out then clears only the other rows. reduce="kernel": the
     Down kernel writes rows and inverse (optional preallocated buffers), then moe_down_reduce writes out.
+    big_blocks_only (atomic): skip blocks with no route at row 128, which the small-M Down takes.
     """
     assert reduce in ("atomic", "kernel"), reduce
+    assert reduce == "atomic" or not big_blocks_only
     topk = a2.shape[1] if a2.dim() == 3 else topk
     assert topk is not None, "pass topk with a sorted-row a2"
     if reduce == "atomic":
@@ -900,7 +945,7 @@ def moe_down_a8w8_blockscale_gfx942_lds(
                 out.zero_()
         _launch_down(
             a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, out, layout, xcd_swizzle,
-            True, out.shape[0], topk, route_counts if single_store else None,
+            True, out.shape[0], topk, route_counts if single_store else None, big_blocks_only,
         )
         return out
     if rows is None:

@@ -1,0 +1,21 @@
+rows=256 blocks=128 extra=928 gateup bm256= 1430.0us (1.000x)  merged= 1488.9us (0.960x)  direct= 1483.6us (0.964x)  nobody= 1473.2us (0.971x)  [4 rounds with foreign kernels]
+rows=256 blocks=128 extra=928 down   bm256=  752.1us (1.000x)  merged=  851.7us (0.883x)  direct=  856.6us (0.878x)  nobody=  857.4us (0.877x)
+rows=256 blocks=128 extra=0 down   bm256=  604.1us (1.000x)  nobody=  609.0us (0.992x)
+rows=256 blocks=128 extra=928 gateup bm256= 1443.0us (1.000x)  nobody= 1483.8us (0.972x)  exact= 1451.1us (0.994x)
+rows=256 blocks=128 extra=928 down   bm256=  740.1us (1.000x)  nobody=  870.1us (0.851x)  exact=  863.6us (0.857x)
+rows=256 blocks=128 extra=0 gateup bm256= 1417.5us (1.000x)  nobody= 1413.0us (1.003x)
+rows=256 blocks=128 extra=1 down   bm256=  604.7us (1.000x)  exact=  614.9us (0.983x)
+rows=256 blocks=128 extra=128 down   bm256=  606.9us (1.000x)  exact=  613.7us (0.989x)
+rows=256 blocks=128 extra=400 down   bm256=  613.4us (1.000x)  exact=  638.3us (0.961x)
+rows=256 blocks=128 extra=1 a2_pad=927 down   bm256=  602.5us (1.000x)  exact=  614.1us (0.981x)
+rows=256 blocks=128 extra=600 down   bm256=  612.0us (1.000x)  exact=  664.0us (0.922x)
+rows=256 blocks=128 extra=800 down   bm256=  611.9us (1.000x)  exact=  702.3us (0.871x)
+rows=256 blocks=128 extra=928 nb_override=129 down   bm256=  611.9us (1.000x)  exact=  620.5us (0.986x)
+rows=256 blocks=128 extra=928 down   bm256=  625.9us (1.000x)
+rows=256 blocks=128 extra=928 down   exact=  731.5us (1.000x)
+rows=256 blocks=128 extra=928 down   nobody=  739.8us (1.000x)
+# after the plugin cache-key fix (earlier lines above: direct/nobody/exact were the cached run1 merged kernel)
+rows=256 blocks=128 extra=928 gateup bm256= 1433.4us (1.000x)  merged= 1426.2us (1.005x)  direct= 1455.5us (0.985x)  nobody= 1462.1us (0.980x)  exact= 1432.2us (1.001x)  [4 rounds with foreign kernels]
+rows=256 blocks=128 extra=928 down   bm256=  742.0us (1.000x)  merged=  758.5us (0.978x)  direct=  745.5us (0.995x)  nobody=  735.5us (1.009x)  exact=  725.8us (1.022x)  [4 rounds with foreign kernels]
+rows=256 blocks=128 extra=928 gateup bm256= 1406.3us (1.000x)  merged= 1450.3us (0.970x)  direct= 1448.9us (0.971x)  nobody= 1451.8us (0.969x)  exact= 1441.9us (0.975x)  [4 rounds with foreign kernels]
+rows=256 blocks=128 extra=928 down   bm256=  762.6us (1.000x)  merged=  735.1us (1.037x)  direct=  748.6us (1.019x)  nobody=  754.4us (1.011x)  exact=  761.4us (1.002x)  [3 rounds with foreign kernels]

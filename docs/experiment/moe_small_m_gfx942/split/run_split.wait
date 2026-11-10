@@ -1,0 +1,15 @@
+06:58:45 final_ep_uniform attempt 1 start
+07:00:19 final_ep_uniform done (0 lines with redone blocks)
+07:00:51 final_random attempt 1 start
+07:02:26 final_random done (0 lines with redone blocks)
+07:02:58 burst_ep_uniform attempt 1 start
+07:03:53 burst_ep_uniform attempt 1: gates failed
+07:04:24 burst_ep_uniform attempt 2 start
+07:05:17 burst_ep_uniform done (0 lines with redone blocks)
+07:05:49 burst_random attempt 1 start
+07:06:43 burst_random done (0 lines with redone blocks)
+07:07:14 final_large_random attempt 1 start
+07:08:08 final_large_random done (0 lines with redone blocks)
+07:10:03 final_large_ep_uniform attempt 1 start
+07:10:59 final_large_ep_uniform done (0 lines with redone blocks)
+07:10:59 all done

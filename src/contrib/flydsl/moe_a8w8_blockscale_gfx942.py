@@ -8,6 +8,12 @@ AITER_FMOE_FP8_BLOCKSCALE_FLYDSL=1 (see docs/moe_a8w8_blockscale_gfx942.md). Inp
 a1 [tokens, H] FP8 with a1_scale_t [H/128, tokens] FP32, w1 / w2 aiter shuffle_weight(16,16) of [E, 2I, H] /
 [E, H, I] FP8 with FP32 scales [E, 2I/128, H/128] / [E, H/128, I/128], and the routes as from aiter
 moe_sorting(block_size=256) with an empty moe_buf, so out is not zeroed by the sort.
+
+fused_moe_a8w8_blockscale_gfx942_mixed runs on the same 256-row sort table and decides per sorted block at run time:
+a block with no route at row 128 (at most 128 routes) runs the 4-wave small-M kernels
+(moe_small_m_a8w8_blockscale_gfx942, docs/record/moe_small_m_gfx942.md), the others the BM256 kernels
+(big_blocks="split": the small-M kernels, as two 128-row tasks).
+fused_moe_a8w8_blockscale_gfx942_sort sorts and runs it.
 """
 
 import torch
@@ -19,6 +25,7 @@ from .moe_down_a8w8_blockscale_gfx942_lds import (
 )
 from .moe_down_a8w8_blockscale_gfx942_lds import validate_parameters as validate_down
 from .moe_gateup_a8w8_blockscale_gfx942_lds import (
+    SMALL_M_ROWS,
     SORT_BLOCK_M,
     moe_gateup_a8w8_blockscale_gfx942_lds,
 )
@@ -81,3 +88,70 @@ def fused_moe_a8w8_blockscale_gfx942(
         reduce="atomic", zero_out=False, topk=topk, single_store=single_store, route_counts=route_counts,
     )
     return out
+
+
+def fused_moe_a8w8_blockscale_gfx942_mixed(
+    a1, a1_scale_t, w1, w1_scale, w2, w2_scale, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out, topk,
+    ring=2, big_blocks="bm256",
+):
+    """fused_moe_a8w8_blockscale_gfx942 on routes from aiter moe_sorting(256) that was handed out as moe_buf (so out
+    is zeroed): each sorted block with no route at row 128 runs the small-M GateUp and Down, the others (big blocks)
+    the BM256 ones (big_blocks="bm256") or the small-M ones as two 128-row tasks ("split"); the Downs add into out
+    with BF16 atomics. ring: B ring of the small-M kernels.
+    """
+    from .moe_small_m_a8w8_blockscale_gfx942 import moe_down_small_m, moe_gateup_small_m
+
+    assert big_blocks in ("bm256", "split"), big_blocks
+    tokens = a1.shape[0]
+    inter_dim = w2.shape[2]
+    blocks = min(sorted_expert_ids.numel(), max_sorted_blocks(tokens, topk, w1.shape[0]))
+    expert_ids = sorted_expert_ids[:blocks]
+    capacity = blocks * SORT_BLOCK_M
+    a2 = torch.empty((capacity, inter_dim), device=a1.device, dtype=a1.dtype)
+    # Both GateUps write their blocks' rows of the same per-128-column scales.
+    a2_scale_t = torch.empty((inter_dim // 128, capacity), device=a1.device, dtype=torch.float32)
+    # An expert gets at most one route per token: with <= 128 tokens no block reaches row 128.
+    has_big = tokens > SMALL_M_ROWS
+    split = has_big and big_blocks == "split"
+    bm256 = has_big and big_blocks == "bm256"
+    moe_gateup_small_m(
+        a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, a2_scale_t, topk, ring, all_blocks=split
+    )
+    if bm256:
+        moe_gateup_a8w8_blockscale_gfx942_lds(
+            a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, layout=GATEUP_LAYOUT,
+            out_scale_t=a2_scale_t, topk=topk, big_blocks_only=True,
+        )
+    moe_down_small_m(
+        a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, topk, ring,
+        all_blocks=split,
+    )
+    if bm256:
+        moe_down_a8w8_blockscale_gfx942_lds(
+            a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, layout=DOWN_LAYOUT,
+            reduce="atomic", zero_out=False, topk=topk, big_blocks_only=True,
+        )
+    return out
+
+
+def fused_moe_a8w8_blockscale_gfx942_sort(
+    a1, a1_scale_t, w1, w1_scale, w2, w2_scale, topk_ids, topk_weights, out, expert_mask=None, num_local_tokens=None,
+    big_blocks="bm256",
+):
+    """aiter moe_sorting(256) with out as moe_buf (zeroed), then fused_moe_a8w8_blockscale_gfx942_mixed.
+
+    topk_ids [tokens, topk] holds global expert ids; expert_mask [global experts] marks this rank's (EP), and
+    num_local_tokens (device int32) bounds the valid rows of an all-to-all receive buffer; the sort zeroes all of out.
+    """
+    from aiter import dtypes
+    from aiter.fused_moe import moe_sorting
+
+    global_experts = w1.shape[0] if expert_mask is None else expert_mask.numel()
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weights, global_experts, w2.shape[1], dtypes.bf16, SORT_BLOCK_M, expert_mask, num_local_tokens,
+        output=out,
+    )
+    return fused_moe_a8w8_blockscale_gfx942_mixed(
+        a1, a1_scale_t, w1, w1_scale, w2, w2_scale, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out,
+        topk_ids.shape[1], big_blocks=big_blocks,
+    )

@@ -1,0 +1,36 @@
+# ATT summaries (rocprofv3 --att, SE0 CU1, 4 SIMDs; 32 synthetic blocks; ticks = gfx clock, 1.235 GHz in these runs)
+
+## lane-scale variant (variants/moe_small_m_4wave_lane_scales.py), GateUp, 128 rows (S=8): /tmp/att_phases.py (one barrier per K block)
+to_first_mfma    n=  512 median     -12  p10   -1030  p90     779  mean     -36
+mfma_span        n=  512 median    1116  p10    1080  p90    1819  mean    1283
+tail_to_barrier  n=  512 median     918  p10     289  p90    1758  mean    1075
+barrier_wait     n=  512 median       0  p10       0  p90       0  mean       0
+period           n=  512 median    2616  p10    1644  p90    5025  mean    2956
+vm_wait          n=  512 median      72  p10      60  p90     107  mean      76
+issue_stall      n=  512 median     894  p10      93  p90    2857  mean    1140
+
+## current kernel, GateUp, 128 rows (S=8): tools/att_phases2.py
+period       n=  336 median    2014  p10    1748  p90    4141  mean    2394
+compute      n=  336 median    1536  p10    1379  p90    3528  mean    1910
+bar1_wait    n=  336 median      60  p10       4  p90     341  mean     143
+memory       n=  336 median     216  p10     -72  p90     305  mean     153
+bar2_wait    n=  336 median      12  p10       4  p90      48  mean      18
+mfma_span    n=  336 median    1144  p10    1112  p90    2753  mean    1485
+stall ticks by instruction group (K loop): {'mfma': '47.3%', 'lds': '17.0%', 'waitcnt': '15.8%', 'vmem': '14.2%', 'valu': '4.9%', 'salu/other': '0.6%'}
+se0_sm0: 3 waves, 2-wave window 56072 ticks, MFMA pipe busy 74.5%
+se0_sm1: 3 waves, 2-wave window 56128 ticks, MFMA pipe busy 74.6%
+se0_sm2: 3 waves, 2-wave window 56108 ticks, MFMA pipe busy 75.5%
+se0_sm3: 3 waves, 2-wave window 56160 ticks, MFMA pipe busy 75.7%
+
+## current kernel, GateUp, 64 rows (S=4), GPU 2: tools/att_phases2.py
+period       n=  448 median    1412  p10    1076  p90    2600  mean    1662
+compute      n=  448 median    1002  p10     760  p90    2065  mean    1224
+bar1_wait    n=  448 median     108  p10       4  p90     657  mean     218
+memory       n=  448 median      72  p10    -426  p90     176  mean     -34
+bar2_wait    n=  448 median      12  p10       4  p90      20  mean      14
+mfma_span    n=  448 median     564  p10     536  p90    1052  mean     664
+stall ticks by instruction group (K loop): {'vmem': '38.6%', 'mfma': '29.1%', 'waitcnt': '17.8%', 'lds': '10.7%', 'valu': '2.8%', 'salu/other': '1.0%'}
+se0_sm0: 4 waves, 2-wave window 45244 ticks, MFMA pipe busy 52.5%
+se0_sm1: 4 waves, 2-wave window 45228 ticks, MFMA pipe busy 52.4%
+se0_sm2: 4 waves, 2-wave window 45276 ticks, MFMA pipe busy 52.1%
+se0_sm3: 4 waves, 2-wave window 45284 ticks, MFMA pipe busy 52.6%

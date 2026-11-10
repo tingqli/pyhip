@@ -1,0 +1,25 @@
+# VGPRs per slice count, one variant per compile without the occupancy cap (amdgpu-waves-per-eu "1,1"), MiMo shapes
+# (GateUp K 4096, Down K 2048), compile probe (FLYDSL_DUMP_IR 22_final_isa.s .vgpr_count / .vgpr_spill_count).
+# 256 = the 2-waves-per-SIMD limit. 128 x 256 MFMA tile per workgroup, 4 x 16 weight rows per wave.
+# full: two partial sets, next-slice A prefetch, two A staging slots; light: one partial set, half-slice A reads,
+# one A staging slot (compile_moe_small_m.schedule). plain128 = the first 128-column GateUp (B row offsets in
+# voffset, no opaque tid copies), variants/moe_small_m_4wave_128col_plain.py.
+slices  GateUp full  GateUp light  GateUp plain128  Down full  Down light
+1       142          126           158              142        124
+2       168          143           183              -          -
+3       188          162           -                -          -
+4       207          178           223              204        178
+5       226          200           248              226        200
+6       242          216           256 + 2 spilled  242        214
+7       256 + 19     238           256 + 38         256 + 18   236
+8       256 + 46     254           256 + 64         256 + 43   252
+# Kernels as built (all 8 variants, "2,2", full up to 6 slices, light 7-8): GateUp 256 VGPRs, Down 254, none spilled;
+# LDS 18432 B / 16896 B. 64-column version: GateUp 198, Down 208. Down with a 128-column tile (2 x 16 rows per wave,
+# full layout for every slice count): 169.
+# Pitfalls on the way (record section 7.4):
+# - Before the per-variant opaque tid copies, the full GateUp kernel spilled 18-20 VGPRs: SimplifyCFG hoisted the
+#   identical prologue of the 7- and 8-slice arms above the dispatch and the structurized branch kept those A rows
+#   alive through the 7-slice K loop. Epilogue indices merged by GVN with the prologue's spilled 7 more.
+# - With K = 256 (one K-loop iteration) LLVM flattened the loop and the Down kernel spilled 118 VGPRs (468 B scratch);
+#   these launches allocate no scratch, so it faulted (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION). An opaque trip
+#   count keeps the loop: 254 VGPRs, no scratch.

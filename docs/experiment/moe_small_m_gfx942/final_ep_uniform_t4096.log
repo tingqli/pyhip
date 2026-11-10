@@ -1,0 +1,62 @@
+GATE {"stage": "entry", "time": 1794137993.4476218, "bdf": "0000:0c:00.0", "activity": [0, 0, 0, 0, 0], "vram_used_mb": 283, "vram_total_mb": 196592, "power_w": 152, "pids": 0, "pass": true}
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+ENV {"gpu": "AMD Instinct MI300X", "arch": "gfx942:sramecc+:xnack-", "cus": 304, "torch": "2.11.0+rocm7.2", "hip": "7.2.26015", "flydsl": "0.4.0"}
+HBM probe: 4.95 TB/s median (1 GiB nontemporal read)
+[aiter] import [module_moe_sorting_opus] under /sgl-workspace/aiter/aiter/jit/module_moe_sorting_opus.so
+[aiter] LoadKernel: _ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x128.co
+[aiter] LoadKernel: _ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256.co
+[aiter] LoadKernel: _ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x128.co
+[aiter] LoadKernel: _ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x128.co
+[aiter] LoadKernel: _ZN5aiter49fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x128E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x128.co
+[aiter] LoadKernel: _ZN5aiter49fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256.co
+[aiter] LoadKernel: _ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co
+[aiter] LoadKernel: _ZN5aiter43fmoe_bf16_blockscaleFp8_g1u1_vs_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_64x256.co
+GATE {"stage": "T=4096 before sampling", "time": 1794138003.264992, "bdf": "0000:0c:00.0", "activity": [3, 1, 0, 0, 0], "vram_used_mb": 4244, "vram_total_mb": 196592, "power_w": 186, "pids": 1, "pass": true}
+GATE {"stage": "T=4096 round 0", "time": 1794138006.620844, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 4244, "vram_total_mb": 196592, "power_w": 187, "pids": 1, "pass": true}
+GATE {"stage": "T=4096 round 1", "time": 1794138009.9717462, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 4244, "vram_total_mb": 196592, "power_w": 187, "pids": 1, "pass": true}
+GATE {"stage": "T=4096 round 2", "time": 1794138013.3276029, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 4244, "vram_total_mb": 196592, "power_w": 188, "pids": 1, "pass": true}
+GATE {"stage": "T=4096 round 3", "time": 1794138016.6924298, "bdf": "0000:0c:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 4244, "vram_total_mb": 196592, "power_w": 188, "pids": 1, "pass": true}
+
+T=4096 ep_uniform: 4096 local routes, routes/expert min 128 max 128, 206.2 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         556.8    550.0-570.3         518.6   370.3    1.45   8.13e-06  pass
+  asm vs_32x128                    726.3    710.5-732.1         693.0   283.8    1.11   1.40e-05  pass
+  asm vs_32x256                    557.6    525.2-569.9         522.1   369.7    1.44   8.13e-06  pass
+  asm novs_ps_32x128               712.8    693.0-730.6         679.6   289.2    1.13   1.39e-05  pass
+  asm novs_ps_32x256               562.8    551.3-584.4         525.3   366.3    1.43   8.12e-06  pass
+  asm vs_ps_32x128                 753.6    728.8-766.4         719.3   273.6    1.07   1.39e-05  pass
+  asm vs_ps_32x256                 570.5    558.6-591.1         532.9   361.4    1.41   8.15e-06  pass
+  asm novs_32x128                  708.1    688.3-724.6         674.1   291.1    1.14   1.40e-05  pass
+  asm novs_32x256                  562.8    540.3-579.7         525.4   366.3    1.43   8.13e-06  pass
+  asm vs_psx_64x256                504.6    492.7-529.4         465.1   408.5    1.60   8.11e-06  pass
+  asm vs_64x256                    494.3    473.4-523.8         454.5   417.1    1.63   8.13e-06  pass
+  bm256                            481.1    471.4-495.9         449.4   428.5    1.67   1.39e-06  pass
+  small                            371.6    364.9-382.0         332.2   554.8    2.17   1.39e-06  pass
+  k: sort256NZ                      19.0     18.1-19.3           19.0 10871.3   42.47        nan  
+  k: sort128NZ                      18.8     18.0-19.3           18.8 10964.1   42.83        nan  
+  k: sort128Z                       26.3     25.5-26.6           26.3  7832.6   30.60        nan  
+  k: counts                          8.4      7.6-8.9             8.4 24663.0   96.34        nan  
+  k: zero_rows                       5.9      5.7-7.1             5.9 35216.7  137.57        nan  
+  k: gateup256                     301.5    291.9-314.3         301.5   683.9    2.67        nan  
+  k: down256                       164.6    162.9-167.4         164.6  1252.2    4.89        nan  
+  k: gateup_small                  228.3    213.6-249.9         228.3   902.8    3.53        nan  
+  k: down_small                    128.4    122.8-134.4         128.4  1605.9    6.27        nan  
+  k: down_small_atomic             129.6    126.2-135.5         129.6  1590.8    6.21        nan  
+  k: asm auto                      539.7    507.3-549.9         539.7   382.0    1.49        nan  
+  k: asm vs_32x128                 696.6    687.5-712.3         696.6   296.0    1.16        nan  
+  k: asm vs_32x256                 531.1    524.2-540.3         531.1   388.2    1.52        nan  
+  k: asm novs_ps_32x128            688.5    673.8-698.0         688.5   299.4    1.17        nan  
+  k: asm novs_ps_32x256            539.8    531.0-547.5         539.8   381.9    1.49        nan  
+  k: asm vs_ps_32x128              708.1    689.5-714.5         708.1   291.2    1.14        nan  
+  k: asm vs_ps_32x256              538.8    504.4-561.6         538.8   382.6    1.49        nan  
+  k: asm novs_32x128               680.7    668.5-693.1         680.7   302.8    1.18        nan  
+  k: asm novs_32x256               520.8    496.0-532.5         520.8   395.9    1.55        nan  
+  k: asm vs_psx_64x256             477.2    454.1-493.3         477.2   432.0    1.69        nan  
+  k: asm vs_64x256                 477.7    465.7-492.8         477.7   431.5    1.69        nan  
+  bm256: 1.028x vs tuned asm vs_64x256 (with sort), 1.011x without sort; 1.157x vs asm auto
+  small: 1.330x vs tuned asm vs_64x256 (with sort), 1.368x without sort; 1.498x vs asm auto
+GATE {"stage": "end", "time": 1794138017.5123508, "bdf": "0000:0c:00.0", "activity": [0, 0, 0, 0, 0], "vram_used_mb": 1604, "vram_total_mb": 196592, "power_w": 188, "pids": 1, "pass": true}
+gates PASS

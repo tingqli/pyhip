@@ -1,0 +1,20 @@
+# tools/pmc_compare.py (first version: 3 s idle before each run, no in-run activity check), GPU 2, 2026-11-10 01:33-01:37 while GPU 2 showed 0 % GFX activity; median of 3 launches per counter group. Instruction and traffic counts agree with isa_mix.txt; cycle ratios are less certain.
+== gateup, 32 rows per block (32 blocks)
+                                                     c64        old8         cur
+  launch us (median of the counter runs)           130.6       129.3       122.9
+  waves                                             4096        4096        2048
+  MFMA instructions                              2.1e+06     2.1e+06     2.1e+06
+  VMEM loads / MFMA                                0.406       0.404       0.332
+  VMEM stores+atomics / MFMA                      0.0039      0.0039      0.0020
+  LDS instructions / MFMA                          0.465       0.471       0.232
+  VALU (incl. MFMA) / MFMA                         2.812       2.824       2.618
+  SALU / MFMA                                      0.820       0.775       0.623
+  SMEM / MFMA                                     0.0078      0.0078      0.0039
+  LDS bank-conflict cycles / LDS instr             0.126       0.241       0.513
+  wave cycles waiting on dependencies (%)           42.6        25.9        63.7
+  wave cycles issuing (%)                           17.6        13.7        16.9
+  MFMA busy / SQ busy cycles                        7.23        7.22        7.36
+  L2 requests / MFMA                               2.990       2.506       2.517
+  L2 hit rate (%)                                   32.0        18.8        19.2
+  HBM read requests (M)                             4.25        4.25        4.25
+== gateup, 128 rows per block (32 blocks)

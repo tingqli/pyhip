@@ -1,0 +1,592 @@
+GATE {"stage": "entry", "time": 1794204429.3463287, "bdf": "0000:22:00.0", "activity": [0, 0, 0, 0, 0], "vram_used_mb": 284, "vram_total_mb": 196592, "power_w": 153, "pids": 1, "pass": true}
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+ENV {"gpu": "AMD Instinct MI300X", "arch": "gfx942:sramecc+:xnack-", "cus": 304, "torch": "2.11.0+rocm7.2", "hip": "7.2.26015", "flydsl": "0.4.0"}
+HBM probe: 4.97 TB/s median (1 GiB nontemporal read)
+[aiter] import [module_moe_sorting_opus] under /sgl-workspace/aiter/aiter/jit/module_moe_sorting_opus.so
+[aiter] LoadKernel: _ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256.co
+[aiter] LoadKernel: _ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co
+[aiter] LoadKernel: _ZN5aiter43fmoe_bf16_blockscaleFp8_g1u1_vs_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_64x256.co
+GATE {"stage": "T=256 before sampling", "time": 1794204440.6578147, "bdf": "0000:22:00.0", "activity": [1, 1, 0, 0, 0], "vram_used_mb": 2879, "vram_total_mb": 196592, "power_w": 188, "pids": 5, "pass": true}
+GATE {"stage": "T=256 round 0", "time": 1794204443.3466463, "bdf": "0000:22:00.0", "activity": [6, 3, 2, 2, 2], "vram_used_mb": 2879, "vram_total_mb": 196592, "power_w": 225, "pids": 6, "pass": false}
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+Unable to open queues directory for process 113638: No such file or directory
+GATE {"stage": "T=256 round 1", "time": 1794204446.0624714, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2879, "vram_total_mb": 196592, "power_w": 189, "pids": 5, "pass": true}
+GATE {"stage": "T=256 round 2", "time": 1794204448.9341886, "bdf": "0000:22:00.0", "activity": [4, 1, 1, 0, 0], "vram_used_mb": 2879, "vram_total_mb": 196592, "power_w": 189, "pids": 13, "pass": true}
+Unable to open queues directory for process 115160: No such file or directory
+GATE {"stage": "T=256 round 3", "time": 1794204451.7196913, "bdf": "0000:22:00.0", "activity": [10, 5, 3, 8, 3], "vram_used_mb": 2880, "vram_total_mb": 196592, "power_w": 216, "pids": 19, "pass": false}
+
+T=256 ep_uniform: 256 local routes, routes/expert min 8 max 8, 12.9 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         261.9    257.5-272.5         247.7    49.2    3.07   8.09e-06  pass
+  asm vs_32x256                    263.7    257.2-276.3         250.0    48.9    3.05   8.12e-06  pass
+  asm novs_ps_32x256               263.3    258.0-265.9         249.5    48.9    3.06   8.09e-06  pass
+  asm vs_ps_32x256                 261.4    257.8-268.1         247.7    49.3    3.08   8.09e-06  pass
+  asm vs_psx_64x256                271.8    266.1-275.6         256.7    47.4    2.96   8.13e-06  pass
+  asm vs_64x256                    270.8    265.0-275.4         255.6    47.6    2.97   8.03e-06  pass
+  bm256                            422.7    408.8-459.6         409.2    30.5    1.91   1.38e-06  pass
+  small                            209.0    205.0-211.4         195.1    61.6    3.85   1.38e-06  pass
+  old8                             242.5    212.7-256.4         227.2    53.1    3.32   1.38e-06  pass
+  c64                              217.6    214.9-222.2         204.0    59.2    3.70        nan  
+  k: sort256NZ                       9.5      9.4-9.8             9.5  1350.3   84.40        nan  
+  k: sort256Z                       10.0      9.8-10.2           10.0  1285.5   80.35        nan  
+  k: counts                          7.5      7.3-8.2             7.5  1727.9  107.99        nan  
+  k: zero_rows                       5.8      5.7-6.5             5.8  2231.9  139.50        nan  
+  k: gateup256                     259.7    252.9-269.6         259.7    49.6    3.10        nan  
+  k: down256                       147.1    134.5-150.6         147.1    87.6    5.47        nan  
+  k: gateup256_big                   5.7      5.7-6.6             5.7  2255.4  140.96        nan  
+  k: down256_big                     5.8      5.7-6.6             5.8  2231.9  139.50        nan  
+  k: gateup_small                  138.5    121.9-142.1         138.5    93.0    5.81        nan  
+  k: down_small                     69.3     68.2-70.6           69.3   185.9   11.62        nan  
+  k: sort128Z                        9.9      9.7-10.2            9.9  1301.1   81.32        nan  
+  k: gateup_old8                   133.0    127.1-148.7         133.0    96.9    6.05        nan  
+  k: down_old8                      70.6     68.1-81.6           70.6   182.5   11.41        nan  
+  k: asm auto                      250.8    244.9-257.2         250.8    51.4    3.21        nan  
+  k: asm vs_32x256                 253.6    245.7-281.4         253.6    50.8    3.18        nan  
+  k: asm novs_ps_32x256            250.1    243.9-257.6         250.1    51.5    3.22        nan  
+  k: asm vs_ps_32x256              248.8    244.0-259.5         248.8    51.8    3.24        nan  
+  k: asm vs_psx_64x256             251.8    245.6-259.2         251.8    51.2    3.20        nan  
+  k: asm vs_64x256                 275.0    252.1-288.3         275.0    46.9    2.93        nan  
+  bm256: 0.618x vs tuned asm vs_ps_32x256 (with sort), 0.605x without sort; 0.620x vs asm auto
+  small: 1.251x vs tuned asm vs_ps_32x256 (with sort), 1.269x without sort; 1.253x vs asm auto
+  old8: 1.078x vs tuned asm vs_ps_32x256 (with sort), 1.090x without sort; 1.080x vs asm auto
+  c64: 1.201x vs tuned asm vs_ps_32x256 (with sort), 1.214x without sort; 1.204x vs asm auto
+GATE {"stage": "T=512 before sampling", "time": 1794204452.7801998, "bdf": "0000:22:00.0", "activity": [4, 3, 1, 0, 0], "vram_used_mb": 2987, "vram_total_mb": 196592, "power_w": 187, "pids": 13, "pass": true}
+GATE {"stage": "T=512 round 0", "time": 1794204455.498544, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 2987, "vram_total_mb": 196592, "power_w": 190, "pids": 13, "pass": true}
+GATE {"stage": "T=512 round 1", "time": 1794204458.2469802, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3490, "vram_total_mb": 196592, "power_w": 190, "pids": 13, "pass": true}
+GATE {"stage": "T=512 round 2", "time": 1794204460.9425068, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3490, "vram_total_mb": 196592, "power_w": 187, "pids": 13, "pass": true}
+GATE {"stage": "T=512 round 3", "time": 1794204463.6858144, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3490, "vram_total_mb": 196592, "power_w": 187, "pids": 13, "pass": true}
+
+T=512 ep_uniform: 512 local routes, routes/expert min 16 max 16, 25.8 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         273.5    269.6-278.6         255.9    94.2    2.94   8.10e-06  pass
+  asm vs_32x256                    277.2    268.8-285.9         259.8    93.0    2.91   8.11e-06  pass
+  asm novs_ps_32x256               277.4    269.3-286.5         259.5    92.9    2.90   8.11e-06  pass
+  asm vs_ps_32x256                 276.6    270.0-285.1         259.3    93.2    2.91   8.11e-06  pass
+  asm vs_psx_64x256                279.0    276.1-282.4         259.7    92.4    2.89   8.12e-06  pass
+  asm vs_64x256                    294.8    279.8-313.4         276.7    87.4    2.73   8.13e-06  pass
+  bm256                            422.9    413.9-451.6         404.9    60.9    1.90   1.37e-06  pass
+  small                            215.0    210.4-219.6         198.5   119.9    3.75   1.37e-06  pass
+  old8                             218.3    213.7-252.9         201.1   118.0    3.69   1.37e-06  pass
+  c64                              249.9    219.8-257.0         223.2   103.1    3.22        nan  
+  k: sort256NZ                      11.4     11.3-11.5           11.4  2255.4   70.48        nan  
+  k: sort256Z                       11.9     11.7-12.1           11.9  2171.4   67.86        nan  
+  k: counts                          7.4      7.3-8.1             7.4  3483.8  108.87        nan  
+  k: zero_rows                       5.8      5.7-7.0             5.8  4479.0  139.97        nan  
+  k: gateup256                     263.6    256.9-273.3         263.6    97.8    3.05        nan  
+  k: down256                       149.0    140.2-156.3         149.0   172.9    5.40        nan  
+  k: gateup256_big                   5.7      5.7-6.6             5.7  4495.0  140.47        nan  
+  k: down256_big                     5.7      5.7-6.6             5.7  4510.3  140.95        nan  
+  k: gateup_small                  139.1    137.2-143.9         139.1   185.3    5.79        nan  
+  k: down_small                     69.5     68.4-81.5           69.5   370.7   11.58        nan  
+  k: sort128Z                       11.8     11.7-12.0           11.8  2178.9   68.09        nan  
+  k: gateup_old8                   146.8    130.6-153.0         146.8   175.5    5.49        nan  
+  k: down_old8                      70.1     68.0-73.2           70.1   367.7   11.49        nan  
+  k: asm auto                      258.7    253.8-267.8         258.7    99.6    3.11        nan  
+  k: asm vs_32x256                 259.6    255.5-272.5         259.6    99.3    3.10        nan  
+  k: asm novs_ps_32x256            259.6    253.3-270.4         259.6    99.3    3.10        nan  
+  k: asm vs_ps_32x256              260.3    254.6-266.1         260.3    99.0    3.09        nan  
+  k: asm vs_psx_64x256             258.6    253.1-284.8         258.6    99.6    3.11        nan  
+  k: asm vs_64x256                 266.6    254.9-284.7         266.6    96.7    3.02        nan  
+  bm256: 0.647x vs tuned asm auto (with sort), 0.632x without sort; 0.647x vs asm auto
+  small: 1.272x vs tuned asm auto (with sort), 1.289x without sort; 1.272x vs asm auto
+  old8: 1.253x vs tuned asm auto (with sort), 1.272x without sort; 1.253x vs asm auto
+  c64: 1.095x vs tuned asm auto (with sort), 1.146x without sort; 1.095x vs asm auto
+GATE {"stage": "T=1024 before sampling", "time": 1794204464.6471097, "bdf": "0000:22:00.0", "activity": [3, 1, 0, 0, 0], "vram_used_mb": 3782, "vram_total_mb": 196592, "power_w": 187, "pids": 13, "pass": true}
+GATE {"stage": "T=1024 round 0", "time": 1794204467.4274964, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3782, "vram_total_mb": 196592, "power_w": 187, "pids": 13, "pass": true}
+GATE {"stage": "T=1024 round 1", "time": 1794204470.1999617, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 4468, "vram_total_mb": 196592, "power_w": 191, "pids": 13, "pass": true}
+GATE {"stage": "T=1024 round 2", "time": 1794204473.0538864, "bdf": "0000:22:00.0", "activity": [15, 14, 14, 9, 13], "vram_used_mb": 5240, "vram_total_mb": 196592, "power_w": 239, "pids": 13, "pass": false}
+GATE {"stage": "T=1024 round 3", "time": 1794204475.834744, "bdf": "0000:22:00.0", "activity": [27, 19, 18, 14, 17], "vram_used_mb": 7056, "vram_total_mb": 196592, "power_w": 240, "pids": 13, "pass": false}
+
+T=1024 ep_uniform: 1024 local routes, routes/expert min 32 max 32, 51.5 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         293.2    287.6-302.8         271.1   175.8    2.75   8.09e-06  pass
+  asm vs_32x256                    296.0    290.2-302.3         273.4   174.1    2.72   8.14e-06  FAIL 479 elements off, worst by 0.974 (rms 1.87)
+  asm novs_ps_32x256               295.2    289.9-318.1         273.2   174.6    2.73   8.17e-06  pass
+  asm vs_ps_32x256                 292.5    287.9-305.3         271.2   176.2    2.75   8.12e-06  pass
+  asm vs_psx_64x256                289.7    284.9-296.4         268.0   177.9    2.78   8.10e-06  pass
+  asm vs_64x256                    304.6    294.2-329.8         281.2   169.2    2.64   8.10e-06  pass
+  bm256                            425.5    421.4-448.3         405.0   121.1    1.89   1.38e-06  pass
+  small                            227.2    223.0-232.2         207.6   226.8    3.54   1.38e-06  pass
+  old8                             251.8    223.3-263.3         230.1   204.7    3.20   1.38e-06  pass
+  c64                              260.0    231.0-267.3         239.9   198.2    3.10        nan  
+  k: sort256NZ                      11.8     11.3-12.0           11.8  4372.6   68.32        nan  
+  k: sort256Z                       13.1     12.9-13.6           13.1  3943.4   61.61        nan  
+  k: counts                          7.4      7.3-122.0           7.4  6967.6  108.87        nan  
+  k: zero_rows                       5.8      5.7-6.5             5.8  8926.9  139.48        nan  
+  k: gateup256                     271.9    267.2-281.3         271.9   189.6    2.96        nan  
+  k: down256                       147.5    142.6-156.3         147.5   349.3    5.46        nan  
+  k: gateup256_big                   5.7      5.7-6.5             5.7  8989.2  140.46        nan  
+  k: down256_big                     5.7      5.7-6.6             5.7  8990.0  140.47        nan  
+  k: gateup_small                  144.2    142.7-146.3         144.2   357.5    5.59        nan  
+  k: down_small                     82.1     80.6-84.0           82.1   628.0    9.81        nan  
+  k: sort128Z                       13.1     12.9-13.3           13.1  3943.4   61.61        nan  
+  k: gateup_old8                   147.9    129.0-156.5         147.9   348.4    5.44        nan  
+  k: down_old8                      81.6     80.4-83.4           81.6   631.6    9.87        nan  
+  k: asm auto                      273.3    266.8-295.4         273.3   188.5    2.95        nan  
+  k: asm vs_32x256                 278.7    268.2-300.4         278.7   185.0    2.89        nan  
+  k: asm novs_ps_32x256            270.8    265.6-276.4         270.8   190.3    2.97        nan  
+  k: asm vs_ps_32x256              290.3    270.9-307.5         290.3   177.5    2.77        nan  
+  k: asm vs_psx_64x256             269.9    267.3-274.4         269.9   190.9    2.98        nan  
+  k: asm vs_64x256                 283.1    269.6-317.8         283.1   182.0    2.84        nan  
+  bm256: 0.681x vs tuned asm vs_psx_64x256 (with sort), 0.662x without sort; 0.689x vs asm auto
+  small: 1.275x vs tuned asm vs_psx_64x256 (with sort), 1.291x without sort; 1.290x vs asm auto
+  old8: 1.151x vs tuned asm vs_psx_64x256 (with sort), 1.164x without sort; 1.164x vs asm auto
+  c64: 1.114x vs tuned asm vs_psx_64x256 (with sort), 1.117x without sort; 1.128x vs asm auto
+GATE {"stage": "T=2048 before sampling", "time": 1794204476.7633133, "bdf": "0000:22:00.0", "activity": [15, 20, 19, 19, 17], "vram_used_mb": 7642, "vram_total_mb": 196592, "power_w": 236, "pids": 13, "pass": false}
+GATE {"stage": "T=2048 round 0", "time": 1794204479.6200385, "bdf": "0000:22:00.0", "activity": [15, 12, 4, 2, 1], "vram_used_mb": 15064, "vram_total_mb": 196592, "power_w": 204, "pids": 13, "pass": false}
+GATE {"stage": "T=2048 round 1", "time": 1794204482.5120535, "bdf": "0000:22:00.0", "activity": [7, 4, 1, 0, 1], "vram_used_mb": 38699, "vram_total_mb": 196592, "power_w": 235, "pids": 13, "pass": false}
+GATE {"stage": "T=2048 round 2", "time": 1794204485.4506798, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 1, 1], "vram_used_mb": 38703, "vram_total_mb": 196592, "power_w": 236, "pids": 13, "pass": true}
+GATE {"stage": "T=2048 round 3", "time": 1794204488.317981, "bdf": "0000:22:00.0", "activity": [8, 4, 2, 2, 2], "vram_used_mb": 38713, "vram_total_mb": 196592, "power_w": 237, "pids": 13, "pass": false}
+
+T=2048 ep_uniform: 2048 local routes, routes/expert min 64 max 64, 103.1 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         360.5    329.8-370.6         325.6   285.9    2.23   8.15e-06  pass
+  asm vs_32x256                    342.2    329.0-372.3         308.1   301.2    2.35   8.17e-06  pass
+  asm novs_ps_32x256               364.1    328.0-377.8         328.2   283.1    2.21   8.19e-06  pass
+  asm vs_ps_32x256                 368.0    330.8-374.6         330.6   280.1    2.19   8.17e-06  pass
+  asm vs_psx_64x256                359.8    327.4-368.8         324.6   286.5    2.24   8.14e-06  pass
+  asm vs_64x256                    359.0    326.1-369.4         323.1   287.1    2.24   8.20e-06  pass
+  bm256                            464.9    457.9-485.8         434.8   221.7    1.73   1.41e-06  pass
+  small                            286.4    282.2-291.6         252.1   359.9    2.81   1.41e-06  pass
+  old8                             285.0    278.6-294.6         249.0   361.7    2.83   1.41e-06  pass
+  c64                              304.0    296.6-311.3         269.1   339.1    2.65        nan  
+  k: sort256NZ                      17.8     17.6-18.6           17.8  5790.6   45.24        nan  
+  k: sort256Z                       20.9     20.7-21.3           20.9  4930.1   38.52        nan  
+  k: counts                          7.4      7.2-8.2             7.4 13897.7  108.58        nan  
+  k: zero_rows                       5.8      5.7-7.3             5.8 17853.9  139.48        nan  
+  k: gateup256                     292.4    284.2-300.1         292.4   352.6    2.75        nan  
+  k: down256                       154.0    146.8-160.6         154.0   669.5    5.23        nan  
+  k: gateup256_big                   5.7      5.7-7.0             5.7 17980.0  140.47        nan  
+  k: down256_big                     5.8      5.7-6.6             5.8 17915.9  139.97        nan  
+  k: gateup_small                  178.9    151.4-185.6         178.9   576.2    4.50        nan  
+  k: down_small                     91.6     89.1-109.9          91.6  1125.7    8.79        nan  
+  k: sort128Z                       20.9     20.7-21.4           20.9  4934.9   38.55        nan  
+  k: gateup_old8                   185.0    163.3-194.1         185.0   557.0    4.35        nan  
+  k: down_old8                      90.9     87.4-106.6          90.9  1133.9    8.86        nan  
+  k: asm auto                      334.0    328.2-337.8         334.0   308.6    2.41        nan  
+  k: asm vs_32x256                 335.8    328.6-343.8         335.8   307.0    2.40        nan  
+  k: asm novs_ps_32x256            331.7    327.6-339.9         331.7   310.7    2.43        nan  
+  k: asm vs_ps_32x256              331.7    301.4-340.8         331.7   310.8    2.43        nan  
+  k: asm vs_psx_64x256             298.7    293.6-338.1         298.7   345.1    2.70        nan  
+  k: asm vs_64x256                 328.4    299.2-336.5         328.4   313.9    2.45        nan  
+  bm256: 0.736x vs tuned asm vs_32x256 (with sort), 0.708x without sort; 0.775x vs asm auto
+  small: 1.195x vs tuned asm vs_32x256 (with sort), 1.222x without sort; 1.259x vs asm auto
+  old8: 1.201x vs tuned asm vs_32x256 (with sort), 1.237x without sort; 1.265x vs asm auto
+  c64: 1.126x vs tuned asm vs_32x256 (with sort), 1.145x without sort; 1.186x vs asm auto
+GATE {"stage": "T=4096 before sampling", "time": 1794204489.2786622, "bdf": "0000:22:00.0", "activity": [5, 2, 15, 9, 4], "vram_used_mb": 39418, "vram_total_mb": 196592, "power_w": 236, "pids": 13, "pass": false}
+GATE {"stage": "T=4096 round 0", "time": 1794204492.223597, "bdf": "0000:22:00.0", "activity": [19, 7, 3, 2, 2], "vram_used_mb": 39427, "vram_total_mb": 196592, "power_w": 234, "pids": 13, "pass": false}
+GATE {"stage": "T=4096 round 1", "time": 1794204495.1064832, "bdf": "0000:22:00.0", "activity": [8, 3, 2, 1, 1], "vram_used_mb": 39427, "vram_total_mb": 196592, "power_w": 236, "pids": 13, "pass": false}
+GATE {"stage": "T=4096 round 2", "time": 1794204498.0451953, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 39427, "vram_total_mb": 196592, "power_w": 188, "pids": 13, "pass": true}
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+Unable to open queues directory for process 123032: No such file or directory
+Unable to open queues directory for process 123045: No such file or directory
+GATE {"stage": "T=4096 round 3", "time": 1794204502.1648293, "bdf": "0000:22:00.0", "activity": [4, 2, 1, 3, 1], "vram_used_mb": 40520, "vram_total_mb": 196592, "power_w": 232, "pids": 13, "pass": true}
+
+T=4096 ep_uniform: 4096 local routes, routes/expert min 128 max 128, 206.2 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         560.7    550.3-567.8         524.4   367.7    1.44   8.14e-06  pass
+  asm vs_32x256                    547.6    523.4-559.6         509.5   376.5    1.47   8.12e-06  pass
+  asm novs_ps_32x256               557.8    537.7-570.3         521.4   369.6    1.44   8.12e-06  pass
+  asm vs_ps_32x256                 562.5    548.9-573.2         525.1   366.5    1.43   8.12e-06  pass
+  asm vs_psx_64x256                495.2    475.7-510.9         457.6   416.3    1.63   8.10e-06  pass
+  asm vs_64x256                    500.1    472.2-511.4         462.2   412.2    1.61   8.13e-06  pass
+  bm256                            480.8    474.0-490.9         449.8   428.8    1.67   1.39e-06  pass (+1 contaminated blocks redone)
+  small                            375.6    371.5-385.7         336.6   548.9    2.14   1.39e-06  pass
+  old8                             371.8    360.9-382.6         332.5   554.5    2.17   1.39e-06  pass
+  c64                              400.7    393.9-405.8         362.0   514.4    2.01        nan  
+  k: sort256NZ                      18.3     18.1-18.6           18.3 11263.9   44.00        nan  
+  k: sort256Z                       25.7     25.5-26.1           25.7  8022.0   31.34        nan  
+  k: counts                          7.5      7.3-7.6             7.5 27644.4  107.99        nan  
+  k: zero_rows                       5.7      5.7-5.9             5.7 35956.8  140.46        nan  
+  k: gateup256                     301.5    294.9-309.2         301.5   683.8    2.67        nan  
+  k: down256                       163.5    159.3-165.2         163.5  1260.8    4.92        nan  
+  k: gateup256_big                   6.4      6.4-6.5             6.4 32136.9  125.53        nan  
+  k: down256_big                     6.5      6.4-6.5             6.5 31937.8  124.76        nan  
+  k: gateup_small                  220.0    207.0-233.5         220.0   937.1    3.66        nan  
+  k: down_small                    128.0    120.8-131.4         128.0  1610.7    6.29        nan  
+  k: sort128Z                       25.5     25.3-27.3           25.5  8078.6   31.56        nan  
+  k: gateup_old8                   218.9    209.0-226.1         218.9   941.8    3.68        nan  
+  k: down_old8                     128.0    125.4-130.7         128.0  1610.4    6.29        nan  
+  k: asm auto                      529.2    513.5-539.9         529.2   389.6    1.52        nan  
+  k: asm vs_32x256                 521.6    514.3-527.6         521.6   395.3    1.54        nan  
+  k: asm novs_ps_32x256            529.5    524.7-538.5         529.5   389.3    1.52        nan  
+  k: asm vs_ps_32x256              529.4    524.7-538.3         529.4   389.4    1.52        nan  
+  k: asm vs_psx_64x256             476.1    445.9-504.9         476.1   433.0    1.69        nan  
+  k: asm vs_64x256                 464.7    459.2-469.8         464.7   443.7    1.73        nan  
+  bm256: 1.030x vs tuned asm vs_psx_64x256 (with sort), 1.018x without sort; 1.166x vs asm auto
+  small: 1.318x vs tuned asm vs_psx_64x256 (with sort), 1.360x without sort; 1.493x vs asm auto
+  old8: 1.332x vs tuned asm vs_psx_64x256 (with sort), 1.376x without sort; 1.508x vs asm auto
+  c64: 1.236x vs tuned asm vs_psx_64x256 (with sort), 1.264x without sort; 1.399x vs asm auto
+GATE {"stage": "end", "time": 1794204503.0028758, "bdf": "0000:22:00.0", "activity": [15, 5, 2, 1, 0], "vram_used_mb": 49264, "vram_total_mb": 196592, "power_w": 192, "pids": 13, "pass": false}
+gates FAIL (results contaminated by other GPU work)

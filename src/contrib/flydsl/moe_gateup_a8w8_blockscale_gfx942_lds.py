@@ -37,6 +37,8 @@ from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
 from .helpers import BufferTensor, run_compiled
 
 SORT_BLOCK_M = 256
+# A block with no route at this row (at most 128 routes) runs the small-M kernels; see big_blocks_only.
+SMALL_M_ROWS = 128
 TILE_N = 128
 TILE_K = 128
 TOKEN_MASK = 0xFFFFFF
@@ -80,14 +82,23 @@ def _lds_dwords(row, column):
 
 @functools.cache
 def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-    inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, pair_blocks=False, fp8_out=False
+    inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, pair_blocks=False, fp8_out=False,
+    big_blocks_only=False, merged=None,
 ):
     """pair_blocks: aligned block pairs of one expert run N-tile-major, so both blocks stream each B tile at the
     same time and share it in L2; other tasks keep the block-major order.
     fp8_out: sorted-row FP8 output with per (row, 128 columns) scales (see the module doc).
+    big_blocks_only: skip blocks with no route at row 128, which the small-M kernels take.
+    merged: plugin that maps workgroups to tasks itself (merged.task) and runs the blocks with no route at row 128
+    in the same launch (merged.body); see docs/record/moe_small_m_gfx942.md. merged.key (str) must change with the
+    plugin's code: the FlyDSL kernel cache keys on closure scalars and on sources next to this file only.
     """
     validate_parameters(1, inter_dim, hidden_dim, topk, num_experts)
     assert layout in LAYOUTS, layout
+    assert not (big_blocks_only and pair_blocks)
+    assert merged is None or (fp8_out and not big_blocks_only and not pair_blocks)
+    merged_key = None if merged is None else merged.key
+    assert merged_key is None or isinstance(merged_key, str)
     I, K = inter_dim, hidden_dim
     KB = K // TILE_K
     assert 2 * KB <= 64, "B scales of all K blocks must fit in one VGPR (hidden_dim <= 4096)"
@@ -162,19 +173,34 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
         valid_rows = uniform(load_i32(rsrc_of(pNumValid, 4), 0))
         valid_blocks = (valid_rows + (SORT_BLOCK_M - 1)) // SORT_BLOCK_M
         valid_blocks = (valid_blocks < num_blocks).select(valid_blocks, num_blocks)
-        num_tasks = valid_blocks * n_tiles
-        if const_expr(xcd_swizzle):
-            # Hardware deals workgroups round-robin over 8 XCDs: give each XCD a contiguous task
-            # range so the N tiles of a sorted block (same A rows) share one L2.
-            chunk = (num_tasks + 7) >> 3
-            xcd_slot = pid >> 3
-            task = (pid & 7) * chunk + xcd_slot
-            active = (xcd_slot < chunk) & (task < num_tasks)
+        lds = fx.SharedAllocator().allocate(SharedTiles).peek()
+        if const_expr(merged is not None):
+            merged_task = merged.task(
+                SimpleNamespace(
+                    pid=pid, tid=tid, valid_blocks=valid_blocks, num_tokens=num_tokens, num_blocks=num_blocks,
+                    pSortedIds=pSortedIds, scan=lds.ab.ptr, big_tiles=n_tiles,
+                )
+            )
+            task = merged_task.block * n_tiles + merged_task.tile
+            active = merged_task.active
         else:
-            task = pid
-            active = task < num_tasks
+            num_tasks = valid_blocks * n_tiles
+            if const_expr(xcd_swizzle):
+                # Hardware deals workgroups round-robin over 8 XCDs: give each XCD a contiguous task
+                # range so the N tiles of a sorted block (same A rows) share one L2.
+                chunk = (num_tasks + 7) >> 3
+                xcd_slot = pid >> 3
+                task = (pid & 7) * chunk + xcd_slot
+                active = (xcd_slot < chunk) & (task < num_tasks)
+            else:
+                task = pid
+                active = task < num_tasks
+            if const_expr(big_blocks_only):
+                probe = uniform(load_i32(rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), ((task // n_tiles) * SORT_BLOCK_M + SMALL_M_ROWS) * 4))
+                active = active & ((probe & TOKEN_MASK) < num_tokens) & (((probe >> 24) & 255) < topk)
 
-        if active:
+        def big_body():
+            """The BM256 task `task`."""
             sorted_rsrc = rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4))
             expert_rsrc = rsrc_of(pExpertIds, num_blocks * 4)
 
@@ -280,8 +306,6 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
             else:
                 a_read = [[_lds_dwords(wave_m * 16 + lane % 16, lane // 16 + h * 4) for h in range(2)]]
                 b_read = [[_lds_dwords(wave_n * 32 + r * 16 + lane % 16, lane // 16 + h * 4) for h in range(2)] for r in range(2)]
-
-            lds = fx.SharedAllocator().allocate(SharedTiles).peek()
 
             def lds_view(dwords, count=4):
                 return fx.make_view(lds.ab.ptr + dwords, fx.make_layout(count, 1))
@@ -667,6 +691,23 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
             else:
                 final_epilogue(block, n_tile)
 
+        def small_ctx():
+            return SimpleNamespace(
+                pA=pA, pB=pB, pOut=pC, pScaleOut=pScaleC, pScaleA=pScaleA, pScaleB=pScaleB, pSortedIds=pSortedIds,
+                pSortedWeights=None, pExpertIds=pExpertIds, num_tokens=num_tokens, num_blocks=num_blocks, tid=tid,
+                lds_base=lds.ab.ptr,
+            )
+
+        if const_expr(merged is not None):
+            if active:
+                if merged_task.big:
+                    big_body()
+                else:
+                    merged.body(small_ctx(), merged_task.block, merged_task.tile)
+        else:
+            if active:
+                big_body()
+
     @flyc.jit
     def launch(
         pA: fx.Pointer,
@@ -682,7 +723,10 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
         num_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        grid_x = (num_blocks * n_tiles + 7) // 8 * 8
+        if const_expr(merged_key is not None):
+            grid_x = merged.grid(num_blocks)
+        else:
+            grid_x = (num_blocks * n_tiles + 7) // 8 * 8
         gateup_kernel(
             pA, pB, pC, pScaleC, pScaleA, pScaleB, pSortedIds, pExpertIds, pNumValid, num_tokens, num_blocks,
             value_attrs={"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]},
@@ -698,7 +742,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
 
 def moe_gateup_a8w8_blockscale_gfx942_lds(
     a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out, layout="2x4_pf1", xcd_swizzle=True,
-    pair_blocks=False, out_scale_t=None, topk=None,
+    pair_blocks=False, out_scale_t=None, topk=None, big_blocks_only=False,
 ):
     """a[T,K] fp8, w1[E,2I,K] fp8 shuffle_weight(16,16), a_scale_t[K/128,T], w1_scale[E,2I/128,K/128] fp32.
 
@@ -724,7 +768,7 @@ def moe_gateup_a8w8_blockscale_gfx942_lds(
     validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts, fp8_out)
     assert sorted_ids.numel() >= num_blocks * SORT_BLOCK_M
     launch = compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out
+        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out, bool(big_blocks_only)
     )
     run_compiled(
         launch,
