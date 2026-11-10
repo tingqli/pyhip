@@ -9,10 +9,12 @@ a1 [tokens, H] FP8 with a1_scale_t [H/128, tokens] FP32, w1 / w2 aiter shuffle_w
 [E, H, I] FP8 with FP32 scales [E, 2I/128, H/128] / [E, H/128, I/128], and the routes as from aiter
 moe_sorting(block_size=256) with an empty moe_buf, so out is not zeroed by the sort.
 
-fused_moe_a8w8_blockscale_gfx942_mixed runs on the same 256-row sort table and decides per sorted block at run time:
-a block with no route at row 128 (at most 128 routes) runs the 4-wave small-M kernels
-(moe_small_m_a8w8_blockscale_gfx942, docs/record/moe_small_m_gfx942.md), the others the BM256 kernels
-(big_blocks="split": the small-M kernels, as two 128-row tasks).
+fused_moe_a8w8_blockscale_gfx942_mixed runs on the same 256-row sort table and decides per sorted block at run time
+whether the block has a route at row 128 (more than 128 routes): big_blocks="merged" (default) runs every block in
+one GateUp and one Down launch, BM256 tiles for those blocks and 8-wave pair tasks for the others
+(moe_merged_a8w8_blockscale_gfx942); "bm256" runs the 4-wave small-M kernels (moe_small_m_a8w8_blockscale_gfx942) on
+the small blocks and the BM256 kernels on the others, "split" the small-M kernels on all, a big block as two 128-row
+tasks (docs/record/moe_small_m_gfx942.md).
 fused_moe_a8w8_blockscale_gfx942_sort sorts and runs it.
 """
 
@@ -92,16 +94,19 @@ def fused_moe_a8w8_blockscale_gfx942(
 
 def fused_moe_a8w8_blockscale_gfx942_mixed(
     a1, a1_scale_t, w1, w1_scale, w2, w2_scale, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out, topk,
-    ring=2, big_blocks="bm256",
+    ring=2, big_blocks="merged",
 ):
     """fused_moe_a8w8_blockscale_gfx942 on routes from aiter moe_sorting(256) that was handed out as moe_buf (so out
-    is zeroed): each sorted block with no route at row 128 runs the small-M GateUp and Down, the others (big blocks)
-    the BM256 ones (big_blocks="bm256") or the small-M ones as two 128-row tasks ("split"); the Downs add into out
-    with BF16 atomics. ring: B ring of the small-M kernels.
+    is zeroed), the Downs adding into out with BF16 atomics. Sorted blocks with a route at row 128 (big) and the others:
+    "merged": one GateUp and one Down launch, BM256 tiles for big blocks and pair tasks for the others (falls back to
+    "bm256" past moe_merged_a8w8_blockscale_gfx942.MAX_BLOCKS sort blocks); "bm256": small-M GateUp / Down for the
+    small blocks, BM256 ones for the big ones; "split": small-M ones for all, a big block as two 128-row tasks.
+    ring: B ring of the small-M kernels.
     """
+    from .moe_merged_a8w8_blockscale_gfx942 import MAX_BLOCKS, moe_down_merged, moe_gateup_merged
     from .moe_small_m_a8w8_blockscale_gfx942 import moe_down_small_m, moe_gateup_small_m
 
-    assert big_blocks in ("bm256", "split"), big_blocks
+    assert big_blocks in ("merged", "bm256", "split"), big_blocks
     tokens = a1.shape[0]
     inter_dim = w2.shape[2]
     blocks = min(sorted_expert_ids.numel(), max_sorted_blocks(tokens, topk, w1.shape[0]))
@@ -110,10 +115,14 @@ def fused_moe_a8w8_blockscale_gfx942_mixed(
     a2 = torch.empty((capacity, inter_dim), device=a1.device, dtype=a1.dtype)
     # Both GateUps write their blocks' rows of the same per-128-column scales.
     a2_scale_t = torch.empty((inter_dim // 128, capacity), device=a1.device, dtype=torch.float32)
+    if big_blocks == "merged" and blocks <= MAX_BLOCKS:
+        moe_gateup_merged(a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, a2_scale_t, topk)
+        moe_down_merged(a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, topk)
+        return out
     # An expert gets at most one route per token: with <= 128 tokens no block reaches row 128.
     has_big = tokens > SMALL_M_ROWS
     split = has_big and big_blocks == "split"
-    bm256 = has_big and big_blocks == "bm256"
+    bm256 = has_big and big_blocks != "split"
     moe_gateup_small_m(
         a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, a2_scale_t, topk, ring, all_blocks=split
     )
@@ -136,7 +145,7 @@ def fused_moe_a8w8_blockscale_gfx942_mixed(
 
 def fused_moe_a8w8_blockscale_gfx942_sort(
     a1, a1_scale_t, w1, w1_scale, w2, w2_scale, topk_ids, topk_weights, out, expert_mask=None, num_local_tokens=None,
-    big_blocks="bm256",
+    big_blocks="merged",
 ):
     """aiter moe_sorting(256) with out as moe_buf (zeroed), then fused_moe_a8w8_blockscale_gfx942_mixed.
 

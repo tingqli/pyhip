@@ -1,6 +1,6 @@
 """Correctness of the 4-wave small-M FP8 block-scale MoE kernels on gfx942: 256-row sort blocks with no route at row
 128 run the small-M kernels, the others the BM256 kernels (big_blocks_only) or, with all_blocks, the small-M kernels
-as two 128-row tasks."""
+as two 128-row tasks; and of the merged kernels (one launch per stage: BM256 tiles and 8-wave pair tasks)."""
 
 import argparse
 
@@ -299,14 +299,14 @@ def test_gateup_down_small_m(tokens, inter_dim, hidden_dim, topk, experts, routi
         check_down(out, expected, routed, magnitude)
 
 
-@pytest.mark.parametrize("big_blocks", ["bm256", "split"])
+@pytest.mark.parametrize("big_blocks", ["merged", "bm256", "split"])
 @pytest.mark.parametrize(
     "tokens,routing", [(64, "random"), (256, "ep_uniform"), (1000, "random"), (4096, "random"), (6144, "random"), (8192, "ep_uniform")]
 )
 def test_fused_mixed_aiter_sort(tokens, routing, big_blocks):
     """fused_moe_a8w8_blockscale_gfx942_mixed on aiter's EP moe_sorting(256) of a MiMo-V2.6-Flash EP8 rank (sort zeroes
     out): small-M blocks only, mixed (T=4096/6144 random) and big blocks only (T=8192), against the asm test's
-    reference; big blocks on the BM256 kernels or split into two small-M tasks."""
+    reference; one merged launch per stage, big blocks on the BM256 kernels or split into two small-M tasks."""
     import test_fmoe_a8w8_blockscale_asm_gfx942 as asm_t
     from aiter.fused_moe import moe_sorting
     from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import fused_moe_a8w8_blockscale_gfx942_mixed
@@ -331,9 +331,12 @@ def test_fused_mixed_aiter_sort(tokens, routing, big_blocks):
         asm_t.check(inputs, out, expected)
 
 
-@pytest.mark.parametrize("tokens,routing,big_blocks", [(1024, "random", "bm256"), (8192, "ep_uniform", "bm256"), (8192, "ep_uniform", "split")])
+@pytest.mark.parametrize(
+    "tokens,routing,big_blocks",
+    [(1024, "random", "bm256"), (8192, "ep_uniform", "bm256"), (8192, "ep_uniform", "split"), (8192, "random", "merged")],
+)
 def test_dispatch_sort(tokens, routing, big_blocks):
-    """fused_moe_a8w8_blockscale_gfx942_sort: one 256-row sort, small-M or BM256 (or split) per block."""
+    """fused_moe_a8w8_blockscale_gfx942_sort: one 256-row sort, merged, or small-M or BM256 (or split) per block."""
     import test_fmoe_a8w8_blockscale_asm_gfx942 as asm_t
     from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import fused_moe_a8w8_blockscale_gfx942_sort
 
@@ -349,6 +352,81 @@ def test_dispatch_sort(tokens, routing, big_blocks):
     )
     torch.cuda.synchronize()
     asm_t.check(inputs, out, expected)
+
+
+def test_merged_capacity_fallback(monkeypatch):
+    """Past the merged task scan's sort blocks, big_blocks="merged" runs the small-M + BM256 kernels."""
+    import test_fmoe_a8w8_blockscale_asm_gfx942 as asm_t
+    from pyhip.contrib.flydsl import moe_merged_a8w8_blockscale_gfx942 as merged
+    from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import fused_moe_a8w8_blockscale_gfx942_sort
+
+    if not is_gfx942():
+        pytest.skip("gfx942 kernel")
+    monkeypatch.setattr(merged, "MAX_BLOCKS", 1)
+    monkeypatch.setattr(merged, "moe_gateup_merged", None)
+    inputs = asm_t.make_inputs(1000, 2048, 4096, 8, 32, 8, "random")
+    out = torch.full((1000, 4096), float("nan"), device="cuda", dtype=torch.bfloat16)
+    expected = asm_t.reference(inputs)
+    fused_moe_a8w8_blockscale_gfx942_sort(
+        inputs["a"], inputs["a_scale_t"], inputs["w1"], inputs["w1_scale"], inputs["w2"], inputs["w2_scale"],
+        inputs["topk_ids"], inputs["topk_weights"], out, inputs["expert_mask"],
+    )
+    torch.cuda.synchronize()
+    asm_t.check(inputs, out, expected)
+
+
+MERGED_SHAPES = [
+    # tokens, inter, hidden, topk, experts, routing, extra blocks: small blocks only, big blocks with rows 128..255 partly
+    # used, full blocks with small tails, a MiMo EP8 mix, big blocks only.
+    (512, 2048, 4096, 8, 32, "random", 1),
+    (400, 256, 512, 2, 4, "random", 1),
+    (600, 256, 512, 2, 4, "random", 1),
+    (1100, 256, 512, 4, 16, "random", 0),
+    (2048, 2048, 4096, 8, 32, "random", 0),
+    (6144, 2048, 4096, 8, 32, "ep_uniform", 1),
+]
+
+
+@pytest.mark.parametrize("tokens,inter_dim,hidden_dim,topk,experts,routing,extra_blocks", MERGED_SHAPES)
+def test_gateup_down_merged(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks):
+    """The merged GateUp writes the bytes of the small-M GateUp plus the BM256 one (big_blocks_only) and nothing else;
+    the merged Down adds every route of the valid blocks."""
+    from test_down_a8w8_blockscale_gfx942 import check as check_down
+    from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942_lds import moe_gateup_a8w8_blockscale_gfx942_lds
+    from pyhip.contrib.flydsl.moe_merged_a8w8_blockscale_gfx942 import moe_down_merged, moe_gateup_merged
+
+    if not is_gfx942():
+        pytest.skip("gfx942 kernel")
+    inputs = make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=extra_blocks)
+    capacity = inputs["expert_ids"].numel() * BLOCK_M
+    gateup_inputs = (inputs["a"], inputs["w1"], inputs["a_scale_t"], inputs["w1_scale"], inputs["sorted_ids"],
+                     inputs["expert_ids"], inputs["num_valid_ids"])
+
+    def buffers():
+        return (torch.full((capacity, inter_dim), 0x55, device="cuda", dtype=torch.uint8),
+                torch.full((inter_dim // SCALE_COLUMNS, capacity), float("nan"), device="cuda"))
+
+    a2_ref, a2_scale_ref = buffers()
+    run_gateup(inputs, a2_ref.view(dtypes.fp8), a2_scale_ref)
+    moe_gateup_a8w8_blockscale_gfx942_lds(
+        *gateup_inputs, a2_ref.view(dtypes.fp8), layout="2x4_pf1", out_scale_t=a2_scale_ref, topk=topk, big_blocks_only=True,
+    )
+    a2, a2_scale = buffers()
+    for _ in range(2):
+        moe_gateup_merged(*gateup_inputs, a2.view(dtypes.fp8), a2_scale, topk)
+        torch.cuda.synchronize()
+        assert torch.equal(a2, a2_ref) and torch.equal(a2_scale.view(torch.int32), a2_scale_ref.view(torch.int32))
+    check_gateup(inputs, a2.view(dtypes.fp8), a2_scale, 0x55, all_blocks=True)
+    expected, routed, magnitude = down_reference(inputs, a2, a2_scale, all_blocks=True)
+    out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
+    for _ in range(2):
+        out.zero_()
+        moe_down_merged(
+            a2.view(dtypes.fp8), inputs["w2"], a2_scale, inputs["w2_scale"], inputs["sorted_ids"], inputs["sorted_weights"],
+            inputs["expert_ids"], inputs["num_valid_ids"], out, topk,
+        )
+        torch.cuda.synchronize()
+        check_down(out, expected, routed, magnitude)
 
 
 if __name__ == "__main__":

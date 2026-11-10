@@ -4,6 +4,10 @@ Record: [docs/record/moe_small_m_gfx942.md §8](../../../record/moe_small_m_gfx9
 kernels on every block, dense task list, in `src`) is described in [../split/](../split/README.md); this directory
 holds option A and the session that measures both.
 
+Option A now lives in `src/contrib/flydsl/moe_merged_a8w8_blockscale_gfx942.py` and is the default of
+`fused_moe_a8w8_blockscale_gfx942_sort` / `_mixed` (`big_blocks="merged"`, record §8.7). The code below and the tools
+here are the version measured in run 4 (commit 806d8fe, branch `luwei/942-fp8-blockwise-backup-b`).
+
 ## Code
 
 - `variants/moe_small_m_8wave_pair.py`

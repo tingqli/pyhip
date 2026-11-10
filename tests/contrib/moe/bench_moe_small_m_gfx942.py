@@ -12,6 +12,9 @@ test_fmoe_a8w8_blockscale_asm_gfx942.make_inputs. Paths (each writes its own out
                  (row, 128)).
   split:         as small with big_blocks="split": the small-M kernels take every block, a block with a route at
                  row 128 as two 128-row tasks (no BM256 launch).
+  merged:        as small with big_blocks="merged" (the default of fused_moe_a8w8_blockscale_gfx942_sort): one merged
+                 GateUp and one merged Down launch, BM256 tiles for blocks with a route at row 128 and 8-wave pair
+                 tasks for the others.
 Kernel-only variants ("k:" prefix) time one kernel with the routes sorted (256) beforehand.
 
 Method (docs/record/moe_small_m_gfx942.md): queued blocks as in bench_moe_a8w8_blockscale_gfx942_vs_asm.py (head-start
@@ -43,7 +46,7 @@ def parse_args(argv=None):
     parser.add_argument("--routing", default="ep_uniform", choices=["ep_uniform", "random", "balanced"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--asm", nargs="*", help="asm kernels (default: all host-sorted kernels of the CSV); auto is always kept")
-    parser.add_argument("--paths", nargs="+", default=["asm", "bm256", "small"], choices=["asm", "bm256", "small", "split"])
+    parser.add_argument("--paths", nargs="+", default=["asm", "bm256", "small"], choices=["asm", "bm256", "small", "split", "merged"])
     parser.add_argument("--kernels", action="store_true", help="also time single kernels (sorts, counts, GateUp, Down)")
     parser.add_argument("--ring", type=int, default=2)
     parser.add_argument("--b-aux", type=int, default=2)
@@ -130,6 +133,7 @@ def main(argv=None):
     import test_fmoe_a8w8_blockscale_asm_gfx942 as asm_t
     from aiter import dtypes
     from aiter.fused_moe import moe_sorting
+    from pyhip.contrib.flydsl import moe_merged_a8w8_blockscale_gfx942 as merged
     from pyhip.contrib.flydsl import moe_small_m_a8w8_blockscale_gfx942 as small
     from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import (
         fused_moe_a8w8_blockscale_gfx942, fused_moe_a8w8_blockscale_gfx942_mixed, max_sorted_blocks,
@@ -220,6 +224,8 @@ def main(argv=None):
             variants["small"] = (None, path_small, expected, True)
         if "split" in args.paths:
             variants["split"] = (None, lambda c: path_small(c, "split"), expected, True)
+        if "merged" in args.paths:
+            variants["merged"] = (None, lambda c: path_small(c, "merged"), expected, True)
         if args.kernels:
             s256 = sort(256, False)
             blocks = min(s256["sorted_expert_ids"].numel(), max_sorted_blocks(tokens, TOPK, E))
@@ -266,6 +272,13 @@ def main(argv=None):
                 variants["k: down_split"] = (None, lambda c: small.moe_down_small_m(
                     a2, c["w2"], a2_scale, c["w2_scale"], s256["sorted_ids"], s256["sorted_weights"], e256,
                     s256["num_valid_ids"], out, TOPK, args.ring, args.b_aux, all_blocks=True), None, True)
+            if "merged" in args.paths:
+                variants["k: gateup_merged"] = (None, lambda c: merged.moe_gateup_merged(
+                    c["a"], c["w1"], c["a_scale_t"], c["w1_scale"], s256["sorted_ids"], e256, s256["num_valid_ids"], a2, a2_scale,
+                    TOPK), None, True)
+                variants["k: down_merged"] = (None, lambda c: merged.moe_down_merged(
+                    a2, c["w2"], a2_scale, c["w2_scale"], s256["sorted_ids"], s256["sorted_weights"], e256, s256["num_valid_ids"],
+                    out, TOPK), None, True)
             for k in asm_names if "asm" in args.paths else []:
                 sk = sort(asm_t.KERNELS[k]["block_m"], True)
                 variants[f"k: asm {k}"] = (out.zero_, lambda c, k=k, sk=sk: asm_t.run_kernel(c, sk, k), None, True)
@@ -382,7 +395,7 @@ def main(argv=None):
             print(f"  {name:28s} {med[name]:9.1f} {spread} {without_sort(name):10.1f} {flops / med[name] / 1e6:7.1f} "
                   f"{weight_bytes / med[name] / 1e6:7.2f}  {diffs.get(name, float('nan')):9.2e}  {checks.get(name, '')}{redo}", flush=True)
         if tuned:
-            for ours in ("bm256", "small", "split"):
+            for ours in ("bm256", "small", "split", "merged"):
                 if ours in med:
                     print(f"  {ours}: {med[tuned] / med[ours]:.3f}x vs tuned {tuned} (with sort), "
                           f"{without_sort(tuned) / without_sort(ours):.3f}x without sort; "

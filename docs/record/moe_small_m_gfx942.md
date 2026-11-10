@@ -1,9 +1,9 @@
 # gfx942 FP8 block-scale MoE：每 expert ≤128 routes 的 small-M 分支（分析、实现、优化记录）
 
-本文记录三版实现和一次运行时选路的尝试。**当前代码是第三版**（§7）：第二版的 4 wave、每 CU 2 个 workgroup、256 行 sort 表内分支不变，
-每个 workgroup 的输出 tile 从 128×128（GateUp 64 列）改为 128×256。§8 是两种在 kernel 内按 block 选路、每个 stage
-只 launch 一次的方案：B（split，已进 `src`，`big_blocks="split"`）和 A（merged，plugin 在实验目录，`src` 里有 BM256 的
-`merged=` hook）。§6 是第二版（4 wave、与 BM256 共用 256 行 sort 表、
+本文记录三版实现和一次运行时选路的尝试。**当前默认路径是 §8 的方案 A**（merged）：`fused_moe_a8w8_blockscale_gfx942_sort` /
+`_mixed` 默认 `big_blocks="merged"`，每个 stage 一次 launch，有第 128 行的 block 走 BM256 tile，其余走 8-wave pair 任务
+（`src/contrib/flydsl/moe_merged_a8w8_blockscale_gfx942.py`）；`"split"` 是方案 B，`"bm256"` 是第三版（§7：4 wave、每 CU 2 个
+workgroup、128×256 输出 tile 的 small-M kernel 加 BM256 kernel，两次 launch）。§6 是第二版（4 wave、与 BM256 共用 256 行 sort 表、
 在 kernel 内按 block 选择路径），§1–§5 是第一版（8 wave、128 行 sort、host 端按 shape 选择）的分析与优化过程，roofline
 部分各版通用；前两版源码作为对照保存在
 [docs/experiment/moe_small_m_gfx942/4wave/variants/](../experiment/moe_small_m_gfx942/4wave/variants/)。
@@ -13,18 +13,18 @@
 第三版 [docs/experiment/moe_small_m_gfx942/4wave_128/README.md](../experiment/moe_small_m_gfx942/4wave_128/README.md)，
 §8 [docs/experiment/moe_small_m_gfx942/merged/README.md](../experiment/moe_small_m_gfx942/merged/README.md)、
 [docs/experiment/moe_small_m_gfx942/split/README.md](../experiment/moe_small_m_gfx942/split/README.md)。
-代码（第三版）：
+代码：
 
 - [src/contrib/flydsl/moe_small_m_a8w8_blockscale_gfx942.py](../../src/contrib/flydsl/moe_small_m_a8w8_blockscale_gfx942.py)：
   4-wave small-M GateUp / Down kernel（`moe_gateup_small_m`、`moe_down_small_m`；`all_blocks=True` 是方案 B）。
+- [src/contrib/flydsl/moe_merged_a8w8_blockscale_gfx942.py](../../src/contrib/flydsl/moe_merged_a8w8_blockscale_gfx942.py)：
+  方案 A 的 pair 任务、任务扫描 plugin 和 `moe_gateup_merged`、`moe_down_merged`。
 - [src/contrib/flydsl/moe_a8w8_blockscale_gfx942.py](../../src/contrib/flydsl/moe_a8w8_blockscale_gfx942.py)：
-  `fused_moe_a8w8_blockscale_gfx942_mixed`（256 行 sort 表上 small-M 与 BM256 各自跳过对方的 block；
-  `big_blocks="split"` 时全部由 small-M 处理）、`fused_moe_a8w8_blockscale_gfx942_sort`（sort + mixed）。
+  `fused_moe_a8w8_blockscale_gfx942_mixed`（256 行 sort 表；`big_blocks="merged"` 默认，`"bm256"` 时 small-M 与 BM256
+  各自跳过对方的 block，`"split"` 时全部由 small-M 处理）、`fused_moe_a8w8_blockscale_gfx942_sort`（sort + mixed）。
 - [src/contrib/flydsl/moe_gateup_a8w8_blockscale_gfx942_lds.py](../../src/contrib/flydsl/moe_gateup_a8w8_blockscale_gfx942_lds.py)、
   [src/contrib/flydsl/moe_down_a8w8_blockscale_gfx942_lds.py](../../src/contrib/flydsl/moe_down_a8w8_blockscale_gfx942_lds.py)：
   BM256 kernel 的 `big_blocks_only`，以及方案 A 用的 `merged=` hook。
-- [docs/experiment/moe_small_m_gfx942/merged/variants/moe_small_m_8wave_pair.py](../experiment/moe_small_m_gfx942/merged/variants/moe_small_m_8wave_pair.py)：
-  方案 A 的 pair kernel 与 plugin（`fused_moe_merged`）。
 - [tests/contrib/moe/test_moe_small_m_gfx942.py](../../tests/contrib/moe/test_moe_small_m_gfx942.py)、
   [tests/contrib/moe/bench_moe_small_m_gfx942.py](../../tests/contrib/moe/bench_moe_small_m_gfx942.py)、
   [tests/contrib/moe/roofline_probe_gfx942.py](../../tests/contrib/moe/roofline_probe_gfx942.py)、
@@ -36,18 +36,18 @@
 
 - 要求：kernel 内按每个 256 行 block 的实际 route 数选择，每个 stage 一次 launch。先试 B，再试 A。
   - B（split，`src`）：全部用 4-wave small-M kernel，有第 128 行的 block 拆成两个 128 行任务。
-  - A（merged，实验代码 + `src` 的 BM256 `merged=` hook）：一个 8-wave kernel，大 block 走 BM256 tile，其余走 pair 任务。
+  - A（merged，`src`，现为默认）：一个 8-wave kernel，大 block 走 BM256 tile，其余走 pair 任务。
   - 两者都用 kernel 内的稠密任务表（ballot + `mbcnt` 扫描 sort 表）。
 - 结果（相对 tuned asm，含 sort，§8.5）：
   - B 在 T≤4096 最好或接近最好，random T=4096 为 1.129×；T≥6144 比 A 慢 0–21%（10 个点中 7 个慢 9% 以上）。
   - A 在 20 个点里最差比最好的路径慢 8%，在 random T=8192（1.313×）和大 T random 最好。
   - 两者都消除了第三版在 random T=4096 / 8192 的短板（0.923× / 1.054×）和空 launch。
-- 建议单一运行时路径用 A。A 在大 T ep_uniform 与 bm256 路径差 5–8%，差别来自路径（`single_store` / 清零），
+- 采用 A 作为默认运行时路径（§8.7）。A 在大 T ep_uniform 与 bm256 路径差 5–8%，差别来自路径（`single_store` / 清零），
   不来自 kernel。
 - 方法上的教训：FlyDSL 磁盘缓存（import aiter 后开启）的键不含 plugin 对象，A 的前三次正式运行测的都是第一版
   kernel（§8.4 第 3 点）；现在 plugin 带源码哈希 key。
 
-### 第三版（当前代码，§7）
+### 第三版（§7，`big_blocks="bm256"`）
 
 - 每个 workgroup 输出 128×256 的 MFMA tile：GateUp 128 个 gate + 128 个对应 up 权重行（128 个输出列），Down 256 个输出列；
   每个 wave 4×16 行权重。仍是 4 wave + occupancy 2（GateUp 256、Down 254 VGPR，不 spill；LDS 18 / 16.5 KiB）。
@@ -264,7 +264,7 @@ asm 为 8e-6–1.4e-5。`test_moe_small_m_gfx942.py` 46 个用例通过（GateUp
   并在 task 之间连续预取权重以接近 4.9 TB/s；(2) 一个 expert 超过 128 route 时把尾块并入同一 task（共享 B，S 到 10），
   避免权重读两遍；(3) 按 block 大小从大到小调度（LPT），缓解混合大小 block 的尾部。
 
-## 6. 第二版：4 wave + 256 行 sort 表内分支（当前代码）
+## 6. 第二版：4 wave + 256 行 sort 表内分支
 
 数据：[docs/experiment/moe_small_m_gfx942/4wave/README.md](../experiment/moe_small_m_gfx942/4wave/README.md)。
 
@@ -349,7 +349,7 @@ asm 为 8e-6–1.4e-5。`test_moe_small_m_gfx942.py` 46 个用例通过（GateUp
 - 空 launch：BM256 kernel 改为 persistent（grid = CU 数），无大 block 时每个 WG 只做一次判断。
 - 4-wave 的 A 流量：让同一 block 相邻 N tile 的两个 WG 落在同一 CU 才能共享 L1，目前的调度无法保证。
 
-## 7. 第三版：每个 workgroup 128×256 输出 tile（当前代码）
+## 7. 第三版：每个 workgroup 128×256 输出 tile（`big_blocks="bm256"`）
 
 数据：[docs/experiment/moe_small_m_gfx942/4wave_128/README.md](../experiment/moe_small_m_gfx942/4wave_128/README.md)。
 
@@ -413,7 +413,7 @@ Down（4 组）与 GateUp 基本相同：full S=6 242、light S=7/8 236 / 252。
 
 ### 7.5 结果
 
-kernel 级交替 A/B（µs，6 轮中位数；c64 = 第二版，down128 = 当前代码改回 128 列 Down）：
+kernel 级交替 A/B（µs，6 轮中位数；c64 = 第二版，down128 = 第三版改回 128 列 Down）：
 
 | rows | GateUp c64 | GateUp cur | GateUp old8 | Down c64 | Down down128 | Down cur | Down old8 |
 |---|---|---|---|---|---|---|---|
@@ -510,7 +510,7 @@ kernel 级交替 A/B（µs，6 轮中位数；c64 = 第二版，down128 = 当前
 - **测试**：`test_moe_small_m_gfx942.py` 36 passed、1 skipped。新增用例：SPLIT_SHAPES、SPLIT_DOWN_SHAPES、fused 的
   `big_blocks=bm256/split`、dispatch T=8192 split。
 
-### 8.3 方案 A（实验代码：`merged/variants/moe_small_m_8wave_pair.py`）
+### 8.3 方案 A（`src/contrib/flydsl/moe_merged_a8w8_blockscale_gfx942.py`，§8.7；run4 测的是实验目录 `merged/variants/moe_small_m_8wave_pair.py`）
 
 - **第 1 步（pair kernel）**：8 个 wave，一个 WG 取一个 block 和两个相邻 N tile。半组 h 的计算与 4-wave kernel 的一个 WG
   相同；A 及其 scale 只读一次、写 LDS 一次，8 个 wave 共用 barrier。
@@ -558,7 +558,7 @@ kernel 级交替 A/B（µs，6 轮中位数；c64 = 第二版，down128 = 当前
    - 修正：辅助逻辑放进函数，冲突的名字改名（`chunk` → `xcd_chunk`）。
    - 在 kernel 外定义、含动态 `if` 的函数要先过 `ASTRewriter.transform`。
 
-### 8.5 结果（run4，当前代码）
+### 8.5 结果（run4）
 
 - 运行：`merged/tools/run_ab.sh`，GPU 1，所有运行的 amdsmi 门限第一次就通过。merged 与 split 都是新 key 下重新编译的。
 - 路径都含 sort。各路径：
@@ -641,7 +641,34 @@ kernel 中位数（µs，持续态）。"两次 launch" 是 small-M + BM256 两�
   2. 刚过 128 route 的 block 不再按 256 行整块算：例如改为第 192 行有效才算大 block，129..191 route 的 block 拆成两个
      pair 任务（行半）。这是 B 的做法，只用在 A 的这一类 block 上。
   3. pair 任务在 S=8 时的 4–9% 差距：两个半组错开半个 K block，或给每个半组单独的 barrier。
-- 方案 B 已进 `src`（`big_blocks="split"`，默认仍是 `"bm256"`）。
-- 方案 A 的 plugin 还在实验目录，`src` 里只有 BM256 的 `merged=` hook；要进 `src`，需要把 plugin 和 pair emitter 搬过去，
-  并加测试。
+- 方案 B 已进 `src`（`big_blocks="split"`）。方案 A 已进 `src` 并成为默认，见 §8.7。
+
+### 8.7 A 进入 `src`
+
+- 实验目录的 `merged/variants/moe_small_m_8wave_pair.py`（run4 测的版本，commit 806d8fe，备份分支
+  `luwei/942-fp8-blockwise-backup-b`）搬到 `src/contrib/flydsl/moe_merged_a8w8_blockscale_gfx942.py`，内容如下：
+  - pair 任务：`compile_pair_tasks` 只返回 emitter 和它的 LDS 区域，去掉了实验用的独立 pair kernel。
+  - 插件：`merged_plugin`、`MergedPlugin`、`source_key`。
+  - 入口：`moe_gateup_merged`、`moe_down_merged`。
+- 相对 run4 版本的改动，MiMo 形状下的任务分配不变：
+  - grid 和扫描上界按每个 block 的 tile 数（记为 t，MiMo 为 16）计算，不再写死 16。grid =
+    `8·(⌈t·num_blocks/8⌉ + 1)`，扫描上界为每个 XCD `⌈t·valid/8⌉ + 1` 个 slot。旧上界是
+    `⌈t·valid/8⌉ + ⌈(t/2)·valid/8⌉`（约 3·valid），全为大 block 时超出 2·valid 的 slot（受 grid 限制）只扫描不干活；
+    现在每个 XCD 最多 1 个。
+  - 断言：BM256 与 pair 的 tile 数一致；pair 任务装得进 BM256 kernel 的 64 KiB LDS。pair 的参数检查本来就要求
+    tile 数为偶数。
+  - `SCAN_BLOCKS` 由 3 改为 4：最多覆盖 2048 个 sort block，topk=8、32 个本地 expert 时 T ≤ 64512。
+- `fused_moe_a8w8_blockscale_gfx942_mixed` / `_sort` 加 `big_blocks="merged"` 并设为默认。sort 容量超过
+  `MAX_BLOCKS` 时退回 `"bm256"`。aiter 入口 `fused_moe_a8w8_blockscale_gfx942`（BM256 + `single_store`）不变。
+- 测试（`test_moe_small_m_gfx942.py`，50 passed、1 skipped）：
+  - `test_gateup_down_merged`：6 个形状，含 sort 容量之外的垃圾 block。merged GateUp 与 small-M + BM256 两次 launch
+    逐位相同，Down 对全部 route 的参考通过。
+  - fused / dispatch 测试加 `merged`。
+  - `test_merged_capacity_fallback`：把 `MAX_BLOCKS` 设成 1，检查退回路径。
+  - BM256 的 GateUp / Down 测试（`test_gateup_a8w8_blockscale_gfx942.py`、`test_down_a8w8_blockscale_gfx942.py`）：118 passed。
+- `bench_moe_small_m_gfx942.py` 加 `--paths merged` 和 `k: gateup_merged` / `k: down_merged`。实验目录的 tools 仍对应
+  run4 的版本。
+- `src` 版本的性能还没有重测：提交时 8 张 GPU 都被外部任务占满（100%、约 740 W），bench 的空闲检查不通过。
+  与 run4 版本的差别只在扫描（每个线程多一个 probe、多一个 ballot 位平面）和上界，待 GPU 空闲后用
+  `--paths asm bm256 small split merged` 复测。
 
