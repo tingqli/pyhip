@@ -13,6 +13,7 @@
   3. **去掉中间步骤**：不在接收端再做一次sort，不经过host。
 - 942上按同样思路做，预算是**约2100–2500 µs**，比现在快30%以上（时间减少31%–42%）。
 - 实测（step 3，见5.5）：mega约**2450 µs**，同一进程里的基线约3540 µs，**快30–31%**。GPU在功耗墙下运行（5.6），再往下主要靠省能量。
+- dispatch和combine都用FP8时，8卡合计8k–32k token下mega快17%–32%；32k时约95%的通信被藏住。见 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)。
 
 ![时间线](images/mega_moe_timeline.png)
 
@@ -246,6 +247,7 @@
 - [x] step 1：结果正确，但比基线慢。下面是实测和原因。
 - [x] step 2：没有单独做，直接并进了step 3。
 - [x] step 3：一个persistent mega kernel，**比基线快约30–31%**（5.4–5.6）。
+- [x] FP8 combine、token扫描和32k的重叠分析：[fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)。
 
 ### 5.1 step 1实测（8卡，每卡4096 token）
 

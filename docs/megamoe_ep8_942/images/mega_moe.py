@@ -203,7 +203,109 @@ def flow():
     fig.savefig(HERE / "mega_moe_flow.png", bbox_inches="tight")
 
 
+# Measured 2026-11-10, 8x MI300X, MiMo MoE layer, FP8 dispatch + FP8 combine: slowest rank's median us per layer.
+SWEEP = {  # total tokens: (baseline, mega) for random / balanced routing
+    "random": {8192: (1081, 900), 12288: (1446, 1052), 16384: (1822, 1366), 32768: (3410, 2419)},
+    "balanced": {8192: (974, 788), 12288: (1446, 1042), 16384: (1641, 1300), 32768: (3288, 2236)},
+}
+
+
+def sweep_chart():
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), dpi=150, sharey=True)
+    for ax, (routing, points) in zip(axes, SWEEP.items()):
+        xs = range(len(points))
+        base = [b for b, _ in points.values()]
+        mega = [m for _, m in points.values()]
+        ax.bar([x - 0.2 for x in xs], base, width=0.38, color=C["misc"], label="基线：MORI FP8 dispatch + FlyDSL MoE + MORI FP8 combine")
+        ax.bar([x + 0.2 for x in xs], mega, width=0.38, color=C["gemm1"], label="mega kernel（FP8 combine）")
+        for x, b, m in zip(xs, base, mega):
+            ax.text(x + 0.2, m + 40, f"-{(1 - m / b) * 100:.0f}%", ha="center", fontsize=10, fontweight="bold")
+        ax.set_xticks(list(xs), [f"{t // 1024}k\n（每卡{t // 8}）" for t in points])
+        ax.set_title("随机路由" if routing == "random" else "均衡路由（每个expert路由数相同）", fontsize=11)
+        ax.set_xlabel("8卡总token数")
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+    axes[0].set_ylabel("一层MoE时间 (µs)")
+    axes[0].legend(fontsize=9, loc="upper left", frameon=False)
+    fig.tight_layout()
+    fig.savefig(HERE / "fp8_sweep.png")
+
+
+def stages_32k():
+    """Per-stage time of the rank on the critical path (the one that waits least at the end), 32k tokens."""
+    fig, ax = plt.subplots(figsize=(13, 3.9), dpi=150)
+    rows = [
+        ("基线\nMORI + FlyDSL MoE", 3374, [(19.8, C["misc"], ""), (327.7, C["comm"], "dispatch\n328"),
+                                          (2266.1, C["gemm1"], "MoE（sort + GateUp + Down）2266"),
+                                          (722.0, C["comm"], "combine 722")]),
+        ("step 1：通信放进kernel\n但kernel之间不重叠", 3979, [(17.4, C["misc"], ""), (39.4, C["prep"], ""),
+                                                    (722.0, C["comm"], "dispatch\n722"), (1579.9, C["gemm1"], "GateUp 1580"),
+                                                    (1404.1, C["gemm2"], "Down + 远端FP8 store\n1404"),
+                                                    (18.7, C["wait"], ""), (63.2, C["comm"], "")]),
+        ("mega kernel：重叠", 2434, [(20.4, C["misc"], ""), (48.6, C["prep"], ""),
+                                    (2262.1, C["gemm1"], "mega kernel 2262（dispatch、GateUp、Down、combine交错）"),
+                                    (8.3, C["wait"], ""), (80.3, C["comm"], "")]),
+    ]
+    for y, (label, total, parts) in zip((2.2, 1.2, 0.2), rows):
+        x = 0
+        for width, color, text in parts:
+            bar(ax, y, x, width, color, text, fs=9, fc="black" if color == C["wait"] else "white")
+            x += width
+        ax.text(x + 40, y, f"{total} µs", va="center", fontsize=11, fontweight="bold")
+    ax.annotate("reduce 80", (2399, 0.2), (2560, -0.35), fontsize=9, arrowprops=dict(arrowstyle="-", color="#666666"))
+    ax.annotate("prep 49", (45, 0.2), (-30, -0.35), fontsize=9, arrowprops=dict(arrowstyle="-", color="#666666"))
+    ax.set_yticks([2.2, 1.2, 0.2], [r[0] for r in rows], fontsize=10)
+    ax.set_xlim(0, 4300)
+    ax.set_ylim(-0.6, 2.7)
+    ax.set_xlabel("时间 (µs)：8卡共32k token（每卡4096），随机路由，FP8 dispatch + FP8 combine")
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.tick_params(axis="y", length=0)
+    fig.tight_layout()
+    fig.savefig(HERE / "stages_32k.png")
+
+
+# Rank 0 (148 blocks, the slowest) of one traced call, 32k tokens, FP8 combine: share of the 304 CUs per 100 us.
+CU_SHARES = [  # producer, GateUp, Down, waiting for data / done tiles, taking a ticket
+    (0.05, 0.02, 0.00, 0.88, 0.05), (0.05, 0.54, 0.00, 0.40, 0.00), (0.05, 0.79, 0.00, 0.15, 0.00),
+    (0.05, 0.84, 0.00, 0.10, 0.00), (0.05, 0.83, 0.00, 0.11, 0.00), (0.04, 0.70, 0.08, 0.16, 0.02),
+    (0.00, 0.65, 0.28, 0.01, 0.06), (0.00, 0.58, 0.32, 0.02, 0.07), (0.00, 0.83, 0.16, 0.01, 0.01),
+    (0.00, 0.51, 0.44, 0.02, 0.02), (0.00, 0.80, 0.19, 0.01, 0.01), (0.00, 0.55, 0.42, 0.02, 0.01),
+    (0.00, 0.79, 0.19, 0.01, 0.01), (0.00, 0.59, 0.38, 0.01, 0.01), (0.00, 0.73, 0.25, 0.01, 0.01),
+    (0.00, 0.63, 0.35, 0.01, 0.01), (0.00, 0.71, 0.26, 0.01, 0.01), (0.00, 0.66, 0.32, 0.01, 0.01),
+    (0.00, 0.67, 0.30, 0.01, 0.01), (0.00, 0.59, 0.39, 0.01, 0.01), (0.00, 0.21, 0.73, 0.02, 0.03),
+    (0.00, 0.21, 0.63, 0.08, 0.04), (0.00, 0.04, 0.19, 0.05, 0.00), (0.00, 0.00, 0.05, 0.00, 0.00),
+]
+
+
+def cu_timeline_chart():
+    fig, ax = plt.subplots(figsize=(13, 4.2), dpi=150)
+    xs = [i * 100 + 50 for i in range(len(CU_SHARES))]
+    series = list(zip(*CU_SHARES))
+    idle = [1 - sum(s) for s in CU_SHARES]
+    labels = ["producer（发dispatch数据）", "GateUp", "Down（epilogue里发combine数据）", "等数据 / 等GateUp完成", "领票", "空闲"]
+    colors = [C["comm"], C["gemm1"], C["gemm2"], "#C9C9C9", "#7F7F7F", "white"]
+    ax.stackplot(xs, *series, idle, labels=labels, colors=colors, edgecolor="#DDDDDD", linewidth=0.3, step="mid")
+    ax.axvspan(0, 500, color="#4C9BE8", alpha=0.06)
+    ax.axvspan(2000, 2400, color="#999999", alpha=0.08)
+    ax.text(250, 1.03, "启动：等前几个block的数据\n约170 µs·CU", ha="center", fontsize=9)
+    ax.text(1250, 1.03, "稳定段：98–99% 的CU在算", ha="center", fontsize=9)
+    ax.text(2200, 1.03, "收尾：最后几组的Down\n约110 µs·CU", ha="center", fontsize=9)
+    ax.set_xlim(0, 2400)
+    ax.set_ylim(0, 1.15)
+    ax.set_xlabel("kernel内时间 (µs)，rank 0（148个block，最慢的rank）")
+    ax.set_ylabel("304个CU的占比")
+    ax.legend(fontsize=8.5, loc="lower center", ncol=6, frameon=False, bbox_to_anchor=(0.5, -0.38))
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(HERE / "cu_timeline_32k.png")
+
+
 if __name__ == "__main__":
     timeline()
     roles()
     flow()
+    sweep_chart()
+    stages_32k()
+    cu_timeline_chart()
