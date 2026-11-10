@@ -46,7 +46,7 @@ P2P_AUX = 19
 @functools.cache
 def compile_ep_mega(
     hidden_dim, inter_dim, topk, token_shift, producers=32, lag=2, gateup_layout="2x4_pf1", down_layout="4x2_pf1", xcd_queues=True,
-    relaxed=True, persistent=True, queue_order="paired", tasks_per_wg=1, trace=False,
+    relaxed=True, persistent=True, queue_order="paired", tasks_per_wg=1, trace=False, combine="bf16",
 ):
     """xcd_queues: one task queue per XCD (producers split evenly), so the tiles of a block share that XCD's L2; a
     workgroup whose queue is empty takes tasks from the next queues. lag counts units (block groups) of one queue.
@@ -57,6 +57,8 @@ def compile_ep_mega(
     lines are kept coherent by probes, and nothing reads it before it is written within a launch.
     persistent: workgroups loop over tickets (launch about one per CU) instead of running one task each, and take
     the next ticket during the current task's epilogue.
+    combine: "bf16" adds every route into its source rank's out with BF16 atomics; "fp8" stores it as an FP8 row
+    with 1x128 scales into the source rank's comb[token, slot] (pOutTable / pOutScaleTable), summed afterwards.
     trace: every task writes int32 trace[8 s: 8 s + 8] (s = queue * queue_cap + ticket) = (start, wait done, end) in
     100 MHz ticks (low 32 bits of s_memrealtime), XCC id << 24 | HW_ID bits [8, 16) | kind (1 producer, 2 GateUp,
     3 Down), the time its workgroup began taking the ticket and, for producers, when wave 0 finished its first three
@@ -66,7 +68,10 @@ def compile_ep_mega(
     gateup = gateup_task_emitter(
         I, H, topk, E_LOCAL, gateup_layout, fp8_out=True, a_scale_token_major=True, store_aux=16 if relaxed else 0
     )
-    down = down_task_emitter(H, I, topk, E_LOCAL, down_layout, atomic=True, sorted_a2=True, remote_token_shift=token_shift)
+    down = down_task_emitter(
+        H, I, topk, E_LOCAL, down_layout, atomic=True, sorted_a2=True, remote_token_shift=token_shift,
+        fp8_routes=combine == "fp8",
+    )
     # Closures must hold the emitters themselves: FlyDSL's cache key only recurses into callable closure values.
     emit_gateup, emit_down, SharedTiles = gateup.emit, down.emit, gateup.SharedTiles
     NG, ND = gateup.n_tiles, down.n_tiles
@@ -99,6 +104,7 @@ def compile_ep_mega(
         pDownIds: fx.Pointer,
         pRecvW: fx.Pointer,
         pOutTable: fx.Pointer,
+        pOutScaleTable: fx.Pointer,
         pExpertIds: fx.Pointer,
         pNumValid: fx.Pointer,
         pSched: fx.Pointer,
@@ -366,7 +372,7 @@ def compile_ep_mega(
             hook, holder = prefetch_hook()
             emit_down(
                 lds, pA2, pW2, pOutTable, pA2Scale, pW2Scale, pDownIds, pRecvW, pOutTable, pOutTable, NPES << token_shift,
-                num_blocks, True, lambda: (block, tile, expert), tid=tid, epilog_hook=hook,
+                num_blocks, True, lambda: (block, tile, expert), tid=tid, epilog_hook=hook, pOutScale=pOutScaleTable,
             )
             record(*at, waited, 3, cycles() - began)
             return holder[0] if holder else fx.Int32(-1)
@@ -415,8 +421,8 @@ def compile_ep_mega(
 
         kernel_pointers = (
             pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, pW2, pW2Scale, pDownIds, pRecvW, pOutTable,
-            pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo, pPeerA, pPeerScale,
-            pPeerIds, pPeerW, pPeerWs, pTrace,
+            pOutScaleTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo, pPeerA,
+            pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace,
         )
 
         def reload_args():
@@ -439,13 +445,13 @@ def compile_ep_mega(
 
         def rebind(values):
             nonlocal pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, pW2, pW2Scale, pDownIds, pRecvW
-            nonlocal pOutTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo
-            nonlocal pPeerA, pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, num_routes, num_tokens, me, num_blocks
-            nonlocal tid, lane, wave, sched, rows_cap
+            nonlocal pOutTable, pOutScaleTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute
+            nonlocal pSendInfo, pPeerA, pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, num_routes, num_tokens, me
+            nonlocal num_blocks, tid, lane, wave, sched, rows_cap
             (
                 pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, pW2, pW2Scale, pDownIds, pRecvW, pOutTable,
-                pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo, pPeerA, pPeerScale,
-                pPeerIds, pPeerW, pPeerWs, pTrace, num_routes, num_tokens, me, num_blocks, tid,
+                pOutScaleTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo, pPeerA,
+                pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, num_routes, num_tokens, me, num_blocks, tid,
             ) = values
             lane = tid % 64
             wave = _uniform(tid // 64)
@@ -486,6 +492,7 @@ def compile_ep_mega(
         pDownIds: fx.Pointer,
         pRecvW: fx.Pointer,
         pOutTable: fx.Pointer,
+        pOutScaleTable: fx.Pointer,
         pExpertIds: fx.Pointer,
         pNumValid: fx.Pointer,
         pSched: fx.Pointer,
@@ -510,8 +517,8 @@ def compile_ep_mega(
     ):
         mega_kernel(
             pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, pW2, pW2Scale, pDownIds, pRecvW, pOutTable,
-            pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo, pPeerA, pPeerScale,
-            pPeerIds, pPeerW, pPeerWs, pTrace, num_routes, num_tokens, me, num_blocks,
+            pOutScaleTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo, pPeerA,
+            pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, num_routes, num_tokens, me, num_blocks,
             value_attrs={"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]},
         ).launch(grid=(num_workgroups, 1, 1), block=(512, 1, 1), stream=stream)
 
@@ -538,17 +545,19 @@ def ep_mega(op, x_fp8, x_scale, topk_w, producers=32, lag=2, xcd_queues=True, re
     launch = compile_ep_mega(
         op.hidden, op.inter, op.topk, op.token_shift, producers, lag, xcd_queues=xcd_queues, relaxed=relaxed,
         persistent=persistent, queue_order=queue_order, tasks_per_wg=tasks_per_wg, trace=trace is not None,
+        combine=op.combine,
     )
     grid = int(os.environ.get("MEGA_GRID", 0)) or -(-mega_grid(op, producers) // tasks_per_wg)
     if persistent:
         grid = min(grid, torch.cuda.get_device_properties(x_fp8.device).multi_processor_count)
     t = op.tables
+    fp8 = op.combine == "fp8"
     ptr = lambda tensor: flyc.from_c_void_p(fx.Int32, tensor.data_ptr())
     run_compiled(
         launch,
         ptr(op.recv_a), ptr(op.w1), ptr(op.a2), ptr(op.a2_scale_t), ptr(op.recv_scale), ptr(op.w1_scale), ptr(op.gu_ids),
-        ptr(op.w2), ptr(op.w2_scale), ptr(op.down_ids), ptr(op.recv_w), ptr(t["out"]),
-        ptr(op.expert_ids), ptr(op.num_valid), ptr(op.sched), ptr(op.ws),
+        ptr(op.w2), ptr(op.w2_scale), ptr(op.down_ids), ptr(op.recv_w), ptr(t["comb" if fp8 else "out"]),
+        ptr(t["comb_scale" if fp8 else "out"]), ptr(op.expert_ids), ptr(op.num_valid), ptr(op.sched), ptr(op.ws),
         ptr(x_fp8), ptr(x_scale), ptr(topk_w), ptr(op.send_route), ptr(op.send_info),
         ptr(t["recv_a"]), ptr(t["recv_scale"]), ptr(t["down_ids"]), ptr(t["recv_w"]), ptr(t["ws"]),
         ptr(op.sched if trace is None else trace),

@@ -4,7 +4,9 @@
 
     torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --tokens 4096
 
-Each rank owns 32 of the 256 experts and sends `--tokens` tokens routed to random top-8 experts.
+Each rank owns 32 of the 256 experts and sends `--tokens` tokens routed to top-8 experts: random ones, or with
+`--routing balanced` the same number of routes for every expert. `--combine fp8` makes both combines FP8 (MORI
+fp8_blockwise like SGLANG_MORI_COMBINE_DTYPE=fp8; the mega path stores FP8 rows with 1x128 scales and sums them).
 """
 
 import argparse
@@ -41,30 +43,39 @@ def setup():
     return rank, world
 
 
-def make_mori_op(rank, world, capacity, block_num, warps):
+def make_mori_op(rank, world, capacity, block_num, warps, combine="bf16"):
+    if combine == "fp8":
+        # One FP32 scale per 128 hidden columns (the default 56 fits H = 7168).
+        os.environ["MORI_FP8_COMBINE_SCALE_DIM"] = str(H // 128)
     kwargs = dict(
         data_type=dtypes.fp8, rank=rank, world_size=world, hidden_dim=H, scale_dim=H // 128, scale_type_size=4,
         max_token_type_size=2, max_num_inp_token_per_rank=capacity, num_experts_per_rank=EXPERTS // world,
         num_experts_per_token=TOPK, warp_num_per_block=warps, block_num=block_num, max_total_recv_tokens=0,
         kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode, gpu_per_node=8, rdma_block_num=0,
-        num_qp_per_pe=2, quant_type="none",
+        num_qp_per_pe=2, quant_type="fp8_blockwise" if combine == "fp8" else "none",
     )
     valid = {f.name for f in dataclasses.fields(mori.ops.EpDispatchCombineConfig)}
     return mori.ops.EpDispatchCombineOp(mori.ops.EpDispatchCombineConfig(**{k: v for k, v in kwargs.items() if k in valid}))
 
 
-def make_routes(rank, tokens, seed):
+def make_routes(rank, tokens, seed, routing="random"):
     """This rank's tokens and their top-8 routes."""
     g = torch.Generator().manual_seed(seed + rank)
     x = (torch.randn((tokens, H), generator=g) * 0.5).to(torch.bfloat16).cuda()
-    ids = torch.rand((tokens, EXPERTS), generator=g).topk(TOPK, dim=1).indices.to(torch.int32).cuda()
+    if routing == "balanced":
+        # Token t takes entries 8 t .. 8 t + 7 (mod 256) of a random permutation: every expert gets tokens * 8 / 256.
+        assert tokens * TOPK % EXPERTS == 0
+        slots = (torch.arange(tokens)[:, None] * TOPK + torch.arange(TOPK)[None, :]) % EXPERTS
+        ids = torch.randperm(EXPERTS, generator=g)[slots].to(torch.int32).cuda()
+    else:
+        ids = torch.rand((tokens, EXPERTS), generator=g).topk(TOPK, dim=1).indices.to(torch.int32).cuda()
     w = torch.rand((tokens, TOPK), generator=g) + 0.1
     return x, ids, (w / w.sum(dim=1, keepdim=True)).cuda()
 
 
-def make_layer(rank, world, tokens, seed):
+def make_layer(rank, world, tokens, seed, routing="random"):
     """This rank's tokens, routes and local expert weights (the same global weights on every run)."""
-    x, ids, w = make_routes(rank, tokens, seed)
+    x, ids, w = make_routes(rank, tokens, seed, routing)
     torch.manual_seed(seed + 1000 + rank)
     e = EXPERTS // world
     w1, w1_scale = block_quant(e, 2 * I, H, 0.2)
@@ -132,13 +143,13 @@ class Mega:
     """pyhip EPMoEGfx942: P2P dispatch + GateUp + Down with the combine fused into its epilogue."""
 
     def __init__(self, rank, world, layer, tokens, mode="mega", producers=16, lag=2, xcd_queues=True, relaxed=True,
-                 persistent=True, queue_order="paired", tasks_per_wg=1):
+                 persistent=True, queue_order="paired", tasks_per_wg=1, combine="bf16"):
         from pyhip.contrib.flydsl.ep_moe_gfx942 import EPMoEGfx942
 
         self.L = layer
         self.op = EPMoEGfx942(rank, world, layer["w1"], layer["w1_scale"], layer["w2"], layer["w2_scale"], TOPK, tokens,
                               mode=mode, producers=producers, lag=lag, xcd_queues=xcd_queues, relaxed=relaxed,
-                              persistent=persistent, queue_order=queue_order, tasks_per_wg=tasks_per_wg)
+                              persistent=persistent, queue_order=queue_order, tasks_per_wg=tasks_per_wg, combine=combine)
         self.quant = get_hip_quant(QuantType.per_1x128)
 
     def run(self, x, ids, weights):
@@ -156,6 +167,17 @@ class Mega:
             state["out"] = self.op.forward(state["a"], state["scale"], L["ids"], L["weights"])
 
         return state, [("quant", quant), ("mega", mega)]
+
+
+def stage_medians(events, iters):
+    """Median us of each EPMoEGfx942 stage over the last `iters` calls of its (name, event) stage_events."""
+    stages = {}
+    for i in [i for i, (name, _) in enumerate(events) if name == "start"][-iters:]:
+        for (_, a), (name, b) in zip(events[i:], events[i + 1:]):
+            if name == "start":
+                break
+            stages.setdefault(name, []).append(a.elapsed_time(b) * 1e3)
+    return {name: statistics.median(times) for name, times in stages.items()}
 
 
 def bench(impl, rank, world, args):
@@ -177,19 +199,14 @@ def bench(impl, rank, world, args):
         if rank == 0:
             print(f"flydsl hook rejected: {reasons!r}")
     out = state["out"].clone()
+    if isinstance(impl, Mega):
+        # Stage events of the timed calls themselves: calls separated by a synchronize would add each rank's host skew
+        # to the count exchange and the finish barrier.
+        impl.op.stage_events = []
     med, loop = run_timed(phases, args.iters, args.warmup)
     if isinstance(impl, Mega):
-        stages = {}
-        for _ in range(5):
-            impl.op.stage_events = []
-            for _, fn in phases:
-                fn()
-            torch.cuda.synchronize()
-            ev = impl.op.stage_events
-            for (_, a), (name, b) in zip(ev[:-1], ev[1:]):
-                stages.setdefault(name, []).append(a.elapsed_time(b) * 1e3)
-        impl.op.stage_events = None
-        med.update({f"[{k}]": statistics.median(v) for k, v in stages.items()})
+        ev, impl.op.stage_events = impl.op.stage_events, None
+        med.update({f"[{k}]": v for k, v in stage_medians(ev, args.iters).items()})
     # Repeated calls must reproduce the first output (stale data / missing synchronization shows up here).
     repeat = float((state["out"].float() - out.float()).abs().max())
     row = dict(rank=rank, recv_tokens=recv_n, local_routes=local_routes, loop_us=loop, repeat_maxdiff=repeat,
@@ -208,28 +225,37 @@ def bench(impl, rank, world, args):
 
 
 def check_alternating(mega, rank, world, args, layer):
-    """mega on inputs A, B, A, B, ... must match the step1 path on each (stale data between calls shows up here)."""
+    """mega on inputs A, B, A, B, ... must match the step1 path on each (stale data between calls shows up here).
+
+    With the FP8 combine, also reports the difference to the BF16 combine (the FP8 rounding of every route)."""
     import pyhip
 
-    ref_op = Mega(rank, world, layer, args.tokens, mode="step1")
-    inputs = [(layer["x"], layer["ids"], layer["weights"]), make_routes(rank, args.tokens, args.seed + 77)]
-    refs = [ref_op.run(*inp).clone() for inp in inputs]
-    worst = 0.0
+    inputs = [(layer["x"], layer["ids"], layer["weights"]), make_routes(rank, args.tokens, args.seed + 77, args.routing)]
+    combines = [mega.op.combine] + (["bf16"] if mega.op.combine == "fp8" else [])
+    refs = {}
+    for combine in combines:
+        ref_op = Mega(rank, world, layer, args.tokens, mode="step1", combine=combine)
+        refs[combine] = [ref_op.run(*inp).clone() for inp in inputs]
+    worst = {combine: 0.0 for combine in combines}
     for it in range(6):
         out = mega.run(*inputs[it % 2]).float()
-        ref = refs[it % 2].float()
-        worst = max(worst, float(pyhip.calc_diff(out, ref)))
+        for combine in combines:
+            worst[combine] = max(worst[combine], float(pyhip.calc_diff(out, refs[combine][it % 2].float())))
     torch.cuda.synchronize()
     worsts = [None] * world
     dist.all_gather_object(worsts, worst)
     if rank == 0:
-        print("alternating inputs, worst calc_diff vs step1 per rank: " + " ".join(f"{w:.2e}" for w in worsts))
+        for combine in combines:
+            print(f"alternating inputs, worst calc_diff vs step1 ({combine} combine) per rank: "
+                  + " ".join(f"{w[combine]:.2e}" for w in worsts))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=4096, help="tokens sent by each rank")
-    parser.add_argument("--capacity", type=int, default=4096, help="MORI max_num_inp_token_per_rank")
+    parser.add_argument("--capacity", type=int, default=0, help="MORI max_num_inp_token_per_rank (default: --tokens)")
+    parser.add_argument("--routing", default="random", choices=["random", "balanced"])
+    parser.add_argument("--combine", default="bf16", choices=["bf16", "fp8"], help="combine data type of both paths")
     parser.add_argument("--block-num", type=int, default=80)
     parser.add_argument("--warps", type=int, default=16)
     parser.add_argument("--iters", type=int, default=20)
@@ -256,14 +282,14 @@ def main():
             ep_moe_gfx942.build_kernels()
         dist.barrier()
         ep_moe_gfx942.build_kernels()
-    layer = make_layer(rank, world, args.tokens, args.seed)
+    layer = make_layer(rank, world, args.tokens, args.seed, args.routing)
     report, outputs = {}, {}
     if args.mode in ("baseline", "both"):
-        op = make_mori_op(rank, world, args.capacity, args.block_num, args.warps)
+        op = make_mori_op(rank, world, args.capacity or args.tokens, args.block_num, args.warps, args.combine)
         report["baseline"], outputs["baseline"] = bench(Baseline(op, layer), rank, world, args)
     if args.mode in ("mega", "both"):
         mega = Mega(rank, world, layer, args.tokens, args.ep_mode, args.producers, args.lag, not args.one_queue, not args.strict_sync,
-                    not args.relaunch, args.queue_order, args.tasks_per_wg)
+                    not args.relaunch, args.queue_order, args.tasks_per_wg, args.combine)
         if args.check_alt:
             check_alternating(mega, rank, world, args, layer)
         report["mega"], outputs["mega"] = bench(mega, rank, world, args)

@@ -271,3 +271,47 @@ __global__ void ep_finish(int me, int epoch, int* ws, const uint64_t* __restrict
         wait_eq_sys(ws + FFLAG + threadIdx.x, epoch);
     }
 }
+
+__device__ inline uint32_t bf16_rne(float f) {
+    uint32_t u = __float_as_uint(f);
+    return (u + 0x7FFF + ((u >> 16) & 1)) >> 16;
+}
+
+// FP8 combine on the source rank (after ep_finish): out[t] = BF16(sum over slots of comb[t][slot] * its 1x128 scale),
+// in slot order. comb [T, topk, H] FP8 (e4m3fnuz), comb_scale [T, topk, H / 128]; 16 columns per thread, topk <= 8.
+__global__ void __launch_bounds__(256) ep_combine_fp8(const uint8_t* __restrict__ comb, const float* __restrict__ comb_scale,
+                                                      uint16_t* __restrict__ out, int num_tokens, int topk, int hidden) {
+    constexpr int MAX_TOPK = 8;
+    const int chunks = hidden / 16;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_tokens * chunks) return;
+    const int token = i / chunks, chunk = i % chunks;
+    // All slots' loads first: a loop bound only known at run time would wait for each slot's load in turn.
+    uint4 q[MAX_TOPK];
+    float scale[MAX_TOPK];
+#pragma unroll
+    for (int slot = 0; slot < MAX_TOPK; ++slot) {
+        const size_t row = static_cast<size_t>(token) * topk + slot;
+        q[slot] = slot < topk ? *reinterpret_cast<const uint4*>(comb + row * hidden + chunk * 16) : make_uint4(0, 0, 0, 0);
+        scale[slot] = slot < topk ? comb_scale[row * (hidden / 128) + chunk / 8] : 0.0f;
+    }
+    float acc[16] = {};
+#pragma unroll
+    for (int slot = 0; slot < MAX_TOPK; ++slot) {
+        const uint32_t words[4] = {q[slot].x, q[slot].y, q[slot].z, q[slot].w};
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(words[w], false);
+            const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(words[w], true);
+            acc[w * 4 + 0] += lo[0] * scale[slot];
+            acc[w * 4 + 1] += lo[1] * scale[slot];
+            acc[w * 4 + 2] += hi[0] * scale[slot];
+            acc[w * 4 + 3] += hi[1] * scale[slot];
+        }
+    }
+    uint32_t packed[8];
+    for (int k = 0; k < 8; ++k) packed[k] = bf16_rne(acc[2 * k]) | bf16_rne(acc[2 * k + 1]) << 16;
+    uint4* dst = reinterpret_cast<uint4*>(out + static_cast<size_t>(token) * hidden + chunk * 16);
+    dst[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    dst[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+}

@@ -7,6 +7,8 @@ No MORI and no sort. Per call, on one stream:
                with BF16 atomics into its source rank's out (P2P)
   mode="step1": the same as separate kernels: ep_dispatch, GateUp (token-major A scales), Down (remote atomics)
   ep_finish    all ranks' adds done -> out is complete
+combine="fp8": Down stores each route's row as FP8 (1x128 scales) into comb[token, slot] of its source rank instead of
+adding it, and ep_combine_fp8 sums the slots after ep_finish.
 Buffers that peers write are MORI symmetric-heap tensors; the kernels get int64 tables of the peer addresses.
 """
 
@@ -45,17 +47,24 @@ def ep_dispatch(x, x_scale, topk_ids, topk_w, route_idx, send_base, num_routes, 
 def ep_finish(me, epoch, ws, ws_peers): ...
 
 
+@pyhip.module(_SRC)
+def ep_combine_fp8(comb, comb_scale, out, num_tokens, topk, hidden): ...
+
+
 def build_kernels():
     """Compile the HIP kernels once (call on one rank before the others load them)."""
-    for k in (ep_prep, ep_plan, ep_dispatch, ep_finish):
+    for k in (ep_prep, ep_plan, ep_dispatch, ep_finish, ep_combine_fp8):
         k.build()
 
 
 class EPMoEGfx942:
     def __init__(self, rank, world, w1, w1_scale, w2, w2_scale, topk, max_tokens, s_cap=None, dispatch_wgs=64, mode="mega",
-                 producers=16, lag=2, xcd_queues=True, relaxed=True, persistent=True, queue_order="paired", tasks_per_wg=1):
+                 producers=16, lag=2, xcd_queues=True, relaxed=True, persistent=True, queue_order="paired", tasks_per_wg=1,
+                 combine="bf16"):
         assert world == NPES and w1.shape[0] == E_LOCAL, "kernels are specialized for EP8 x 32 local experts"
         assert mode in ("mega", "step1"), mode
+        assert combine in ("bf16", "fp8") and (combine == "bf16" or topk <= 8), (combine, topk)
+        self.combine = combine
         self.rank, self.world, self.topk = rank, world, topk
         self.mode, self.producers, self.lag, self.xcd_queues, self.relaxed = mode, producers, lag, xcd_queues, relaxed
         self.persistent, self.queue_order, self.tasks_per_wg = persistent, queue_order, tasks_per_wg
@@ -81,13 +90,18 @@ class EPMoEGfx942:
         self.recv_w = sym((S,), torch.float32)
         self.ws = sym((ARRIVED + S // SORT_BLOCK_M,), torch.int32)
         self.out = sym((self.tcap, H), torch.bfloat16)
+        names = ["recv_a", "recv_scale", "down_ids", "recv_w", "ws", "out"]
+        if combine == "fp8":
+            self.comb = sym((self.tcap * topk, H), torch.uint8)
+            self.comb_scale = sym((self.tcap * topk, H // 128), torch.float32)
+            names += ["comb", "comb_scale"]
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
 
         def table(t):
             return torch.tensor([ms.shmem_ptr_p2p(t.data_ptr(), rank, p) for p in range(world)], dtype=torch.int64, device=dev)
 
-        self.tables = {name: table(getattr(self, name)) for name in ("recv_a", "recv_scale", "down_ids", "recv_w", "ws", "out")}
+        self.tables = {name: table(getattr(self, name)) for name in names}
         self.route_idx = torch.empty(self.tcap * topk, dtype=torch.int32, device=dev)
         self.send_base = torch.empty(NPES * E_LOCAL, dtype=torch.int32, device=dev)
         self.gu_ids = torch.empty(S, dtype=torch.int32, device=dev)
@@ -122,7 +136,8 @@ class EPMoEGfx942:
         t = self.tables
         out = self.out[:T]
         self._mark("start")
-        out.zero_()
+        if self.combine == "bf16":
+            out.zero_()
         routes = T * self.topk
         ep_prep([1], [1024], topk_ids, routes, self.rank, self.epoch, self.route_idx, self.ws, t["ws"], self.send_base,
                 self.num_valid, self.s_cap, self.status, self.sched, self.plan)
@@ -135,7 +150,7 @@ class EPMoEGfx942:
             self._mark("mega")
             ep_finish([1], [64], self.rank, self.epoch, self.ws, t["ws"])
             self._mark("finish")
-            return out
+            return self._combine(out)
         ep_dispatch([self.dispatch_wgs], [256], x_fp8, x_scale, topk_ids, topk_w, self.route_idx, self.send_base, routes,
                     self.topk, self.hidden, self.rank, self.epoch, self.token_shift, self.s_cap, t["recv_a"], t["recv_scale"],
                     t["down_ids"], t["recv_w"], self.ws, t["ws"], self.status)
@@ -158,11 +173,20 @@ class EPMoEGfx942:
         self._mark("gateup")
         moe_down_remote_a8w8_blockscale_gfx942_lds(
             self.a2.view(fp8), self.w2, self.a2_scale_t, self.w2_scale, self.down_ids, self.recv_w, self.expert_ids,
-            self.num_valid, out_table, self.token_shift, self.topk, layout=DOWN_LAYOUT,
+            self.num_valid, t["comb"] if self.combine == "fp8" else out_table, self.token_shift, self.topk, layout=DOWN_LAYOUT,
+            scale_table=t["comb_scale"] if self.combine == "fp8" else None,
         )
         self._mark("down")
         ep_finish([1], [64], self.rank, self.epoch, self.ws, t["ws"])
         self._mark("finish")
+        return self._combine(out)
+
+    def _combine(self, out):
+        """FP8 combine: sum each token's slots into out (every route's row is in comb once ep_finish returned)."""
+        if self.combine == "fp8":
+            T, H = out.shape
+            ep_combine_fp8([-(-T * H // 16 // 256)], [256], self.comb, self.comb_scale, out, T, self.topk, H)
+            self._mark("combine")
         return out
 
     def rows_needed(self):

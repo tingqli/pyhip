@@ -19,6 +19,8 @@ A token's routes are summed in one of two ways:
   atomic=False: BF16 y is stored at its sorted position in rows [blocks * 256, H], and inverse[token, slot]
       receives that position (filled with -1 beforehand); compile_moe_down_reduce then sums every token's routes
       in FP32, in slot order.
+  fp8_routes (EP combine in FP8, 4x2 only): y of route (token, slot) is quantized per 128 columns and stored at
+      row token * topk + slot of its source rank's comb buffer; the source rank then sums the slots.
 """
 
 import functools
@@ -36,12 +38,15 @@ from flydsl.expr.typing import Vector as Vec
 from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
 from .helpers import BufferTensor, run_compiled, s_buffer_load
 from .moe_gateup_a8w8_blockscale_gfx942_lds import (
-    LAYOUTS, OOB_OFFSET, PACKET_DWORDS, PACKET_ROWS, SORT_BLOCK_M, TILE_K, TOKEN_MASK, _lds_dwords, _load_i32, _uniform,
+    FP8_MAX, LAYOUTS, OOB_OFFSET, PACKET_DWORDS, PACKET_ROWS, SORT_BLOCK_M, TILE_K, TOKEN_MASK, _lds_dwords, _load_i32,
+    _uniform,
 )
 
 TILE_N = 256
 # Atomic epilogue transpose tile per wave: 16 rows x 32 dwords; a 34-dword pitch keeps writes and reads conflict free.
 TRANSPOSE_PITCH = 34
+# FP8 epilogue tile per wave: 16 rows x 128 B, rows 16-byte aligned for the 16 B reads.
+FP8_PITCH = 36
 REDUCE_COLUMNS = 16
 
 
@@ -79,19 +84,23 @@ def _rsrc_of(ptr, num_records_bytes):
 @functools.cache
 def down_task_emitter(
     hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", atomic=True, sorted_a2=False, single_store=False,
-    remote_token_shift=0,
+    remote_token_shift=0, fp8_routes=False,
 ):
     """One Down task (256 sorted rows x 256 hidden columns) for use inside a kernel.
 
     Returns SimpleNamespace(SharedTiles, n_tiles, emit); emit(lds, pA, pB, pOut, pScaleA, pScaleB, pSortedIds,
     pSortedWeights, pInverse, pRouteCounts, num_tokens, num_blocks, active, coords) runs the task when `active`
     (an i1 or Python bool), with coords() giving its (block, N tile, expert) and lds a SharedTiles allocation.
+    With fp8_routes, pOut and pOutScale are int64 tables of the ranks' comb [Tcap, topk, H] FP8 and
+    [Tcap, topk, H / 128] FP32 bases.
     """
     validate_parameters(1, hidden_dim, inter_dim, topk, num_experts, sorted_a2=sorted_a2)
     assert layout in LAYOUTS, layout
     assert atomic or not single_store
     remote = remote_token_shift > 0
     assert not remote or atomic and not single_store
+    # One wave then holds a whole 128-column scale group of its rows.
+    assert not fp8_routes or remote and layout == "4x2_pf1"
     H, K = hidden_dim, inter_dim
     KB = K // TILE_K
     n_tiles = H // TILE_N
@@ -134,7 +143,7 @@ def down_task_emitter(
     @flyc.jit
     def emit_task(
         lds, pA, pB, pOut, pScaleA, pScaleB, pSortedIds, pSortedWeights, pInverse, pRouteCounts, num_tokens, num_blocks,
-        active, coords, tid=None, epilog_hook=None,
+        active, coords, tid=None, epilog_hook=None, pOutScale=None,
     ):
         if const_expr(tid is None):
             tid = fx.thread_idx.x
@@ -437,7 +446,72 @@ def down_task_emitter(
                 fx.Float32(rocdl.raw_ptr_buffer_load(T.f32, weight_rsrc, ((block * SORT_BLOCK_M + row) * 4).ir_value(), zero, zero))
                 for row in lane_rows
             ]
-            if const_expr(atomic):
+
+            def table_base(table_rsrc, rank_offset):
+                return (fx.Uint64(fx.Uint32(load_i32(table_rsrc, rank_offset + 4))) << 32) | fx.Uint64(
+                    fx.Uint32(load_i32(table_rsrc, rank_offset))
+                )
+
+            if const_expr(fp8_routes):
+                data_rsrc, scale_rsrc = _rsrc_of(pOut, 64 * 8), _rsrc_of(pOutScale, 64 * 8)
+                data_lo, data_hi, scale_addresses, row_ok = [], [], [], []
+                for fused in out_ids:
+                    _, out_token, out_valid = decode(fused)
+                    rank_offset = out_valid.select((out_token >> remote_token_shift) * 8, fx.Int32(OOB_OFFSET))
+                    route = (out_token & ((1 << remote_token_shift) - 1)) * topk + ((fused >> 24) & 255)
+                    data = table_base(data_rsrc, rank_offset) + fx.Uint64(fx.Uint32(route * H + n_tile * TILE_N + wave_n * 128))
+                    data_lo.append(fx.Int32(fx.Uint32(data)))
+                    data_hi.append(fx.Int32(fx.Uint32(data >> 32)))
+                    scale_addresses.append(
+                        table_base(scale_rsrc, rank_offset) + fx.Uint64(fx.Uint32((route * (H // 128) + n_tile * 2 + wave_n) * 4))
+                    )
+                    row_ok.append(out_valid.select(fx.Int32(1), fx.Int32(0)))
+                transpose = wave * (16 * FP8_PITCH)
+                finish_k_loop()
+                # LLVM does not count the asm stores: retire every load first so no later vmcnt wait covers them.
+                rocdl.s_waitcnt(vmcnt=0)
+                for j in range_constexpr(m_slices):
+                    values = [
+                        [Vec(accum[None, acc_index(j, n_slice)].load())[e] * weights[j] for e in range_constexpr(4)]
+                        for n_slice in range_constexpr(n_slices)
+                    ]
+                    peak = fx.Float32(0.0)
+                    for slice_values in values:
+                        for value in slice_values:
+                            peak = fx.arith.maxnumf(peak, fx.math.absf(value))
+                    # Lanes l, l ^ 16, l ^ 32, l ^ 48 hold the wave's other columns of row l % 16.
+                    for shift in (16, 32):
+                        other = rocdl.ds_bpermute(T.i32, fx.Int32((lane ^ shift) * 4).ir_value(), peak.bitcast(fx.Int32).ir_value())
+                        peak = fx.arith.maxnumf(peak, fx.Int32(other).bitcast(fx.Float32))
+                    inverse = (peak > 0.0).select(fx.Float32(rocdl.rcp(T.f32, peak.ir_value())) * FP8_MAX, fx.Float32(0.0))
+                    for n_slice in range_constexpr(n_slices):
+                        q = [values[n_slice][e] * inverse for e in range_constexpr(4)]
+                        low = rocdl.cvt_pk_fp8_f32(T.i32, q[0], q[1], fx.Int32(0), False)
+                        word = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q[2], q[3], low, True))
+                        # Columns 16 n_slice + 4 g .. + 3 of row lane % 16, g = lane // 16.
+                        lds_view(transpose + lane % 16 * FP8_PITCH + n_slice * 4 + lane // 16, 1).store(
+                            Vec.from_elements([word], fx.Int32)
+                        )
+                    for half in range_constexpr(2):
+                        # 16 B per lane: bytes 16 (lane % 8) .. of row lane // 8 + 8 half; lane r < 16 holds row r's address.
+                        row = lane // 8 + half * 8
+                        chunk = Vec(lds_view(transpose + row * FP8_PITCH + lane % 8 * 4).load())
+                        source = (row * 4).ir_value()
+                        lo, hi, ok = [
+                            fx.Int32(rocdl.ds_bpermute(T.i32, source, value.ir_value())) for value in (data_lo[j], data_hi[j], row_ok[j])
+                        ]
+                        address = ((fx.Uint64(fx.Uint32(hi)) << 32) | fx.Uint64(fx.Uint32(lo))) + fx.Uint64(fx.Uint32(lane % 8 * 16))
+                        if ok != 0:
+                            llvm.inline_asm(
+                                None, [address.ir_value(), chunk.ir_value()], "global_store_dwordx4 $0, $1, off sc0 sc1 nt", "v,v",
+                                has_side_effects=True,
+                            )
+                    if (lane < 16) & (row_ok[j] != 0):
+                        llvm.inline_asm(
+                            None, [scale_addresses[j].ir_value(), (peak * (1.0 / FP8_MAX)).bitcast(fx.Int32).ir_value()],
+                            "global_store_dword $0, $1, off sc0 sc1 nt", "v,v", has_side_effects=True,
+                        )
+            elif const_expr(atomic):
                 token_offsets = []
                 row_lo, row_hi = [], []
                 for fused in out_ids:
@@ -447,9 +521,7 @@ def down_task_emitter(
                         # 64-bit base of the token's row in its rank's out; -1 offsets still mark invalid rows.
                         table_rsrc = _rsrc_of(pOut, 64 * 8)
                         rank_offset = out_valid.select((out_token >> remote_token_shift) * 8, fx.Int32(OOB_OFFSET))
-                        base = (fx.Uint64(fx.Uint32(load_i32(table_rsrc, rank_offset + 4))) << 32) | fx.Uint64(
-                            fx.Uint32(load_i32(table_rsrc, rank_offset))
-                        )
+                        base = table_base(table_rsrc, rank_offset)
                         address = base + fx.Uint64(fx.Uint32((out_token & ((1 << remote_token_shift) - 1)) * (H * 2)))
                         row_lo.append(fx.Int32(fx.Uint32(address)))
                         row_hi.append(fx.Int32(fx.Uint32(address >> 32)))
@@ -602,11 +674,14 @@ def down_task_emitter(
 @functools.cache
 def compile_moe_down_a8w8_blockscale_gfx942_lds(
     hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False,
-    remote_token_shift=0,
+    remote_token_shift=0, fp8_routes=False,
 ):
     """remote_token_shift > 0 (EP combine): the out pointer is an int64 table of the ranks' out [Tcap, H] bases,
-    a sorted ID's token is rank << remote_token_shift | token, and every route is added into that rank's row."""
-    down = down_task_emitter(hidden_dim, inter_dim, topk, num_experts, layout, atomic, sorted_a2, single_store, remote_token_shift)
+    a sorted ID's token is rank << remote_token_shift | token, and every route is added into that rank's row.
+    fp8_routes: out and inverse are the comb / comb scale tables of down_task_emitter instead."""
+    down = down_task_emitter(
+        hidden_dim, inter_dim, topk, num_experts, layout, atomic, sorted_a2, single_store, remote_token_shift, fp8_routes
+    )
     # Closures must hold the emitter itself: FlyDSL's cache key only recurses into callable closure values.
     emit_task, SharedTiles, n_tiles = down.emit, down.SharedTiles, down.n_tiles
 
@@ -649,7 +724,7 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
         lds = fx.SharedAllocator().allocate(SharedTiles).peek()
         emit_task(
             lds, pA, pB, pOut, pScaleA, pScaleB, pSortedIds, pSortedWeights, pInverse, pRouteCounts, num_tokens, num_blocks,
-            active, coords,
+            active, coords, pOutScale=pInverse if fp8_routes else None,
         )
 
     @flyc.jit
@@ -883,7 +958,7 @@ def moe_zero_rows(out, counts, num_rows=None):
 
 def _launch_down(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, target, inverse, layout, xcd_swizzle,
-    atomic, tokens, topk, route_counts=None, remote_token_shift=0,
+    atomic, tokens, topk, route_counts=None, remote_token_shift=0, fp8_routes=False,
 ):
     sorted_a2 = a2.dim() == 2
     inter_dim = a2.shape[-1]
@@ -897,7 +972,7 @@ def _launch_down(
     assert not single_store or route_counts.shape == (tokens,) and route_counts.dtype == torch.int32
     launch = compile_moe_down_a8w8_blockscale_gfx942_lds(
         hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store,
-        int(remote_token_shift),
+        int(remote_token_shift), bool(fp8_routes),
     )
     run_compiled(
         launch,
@@ -920,17 +995,21 @@ def _launch_down(
 
 def moe_down_remote_a8w8_blockscale_gfx942_lds(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out_table, token_shift, topk,
-    layout="2x4_pf1", xcd_swizzle=True,
+    layout="2x4_pf1", xcd_swizzle=True, scale_table=None,
 ):
     """EP combine fused into Down: every route is added with BF16 atomics into out[rank][token] of its source rank.
 
     a2 / a2_scale_t are sorted-row; sorted_ids hold rank << token_shift | token | slot << 24 (invalid rows: -1);
     out_table is an int64 tensor of the ranks' out [1 << token_shift, H] BF16 bases (zeroed beforehand).
+    scale_table (FP8 combine, layout 4x2_pf1): out_table holds the ranks' comb [1 << token_shift, topk, H] FP8 bases
+    and scale_table their [1 << token_shift, topk, H / 128] FP32 scales; each route's row is stored there instead.
     """
     assert out_table.dtype == torch.int64 and out_table.numel() <= 64 and token_shift > 0
+    fp8 = scale_table is not None
     _launch_down(
-        a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out_table, out_table, layout,
-        xcd_swizzle, True, out_table.numel() << token_shift, topk, None, token_shift,
+        a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out_table,
+        scale_table if fp8 else out_table, layout, xcd_swizzle, True, out_table.numel() << token_shift, topk, None, token_shift,
+        fp8,
     )
 
 

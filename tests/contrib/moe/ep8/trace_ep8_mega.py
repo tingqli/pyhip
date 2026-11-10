@@ -66,6 +66,8 @@ def main():
     parser.add_argument("--queue-order", default="paired", choices=["interleaved", "contiguous", "paired"])
     parser.add_argument("--tasks-per-wg", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--routing", default="random", choices=["random", "balanced"])
+    parser.add_argument("--combine", default="bf16", choices=["bf16", "fp8"])
     parser.add_argument("--save", default="")
     args = parser.parse_args()
     rank, world = bench.setup()
@@ -76,9 +78,9 @@ def main():
         ep_moe_gfx942.build_kernels()
     dist.barrier()
     ep_moe_gfx942.build_kernels()
-    layer = bench.make_layer(rank, world, args.tokens, args.seed)
+    layer = bench.make_layer(rank, world, args.tokens, args.seed, args.routing)
     mega = bench.Mega(rank, world, layer, args.tokens, "mega", args.producers, args.lag, not args.one_queue, not args.strict_sync,
-                      not args.relaunch, args.queue_order, args.tasks_per_wg)
+                      not args.relaunch, args.queue_order, args.tasks_per_wg, args.combine)
     op = mega.op
     entries = trace_entries(op, args.producers)
     op.trace = torch.zeros(entries, dtype=torch.int32, device="cuda")
