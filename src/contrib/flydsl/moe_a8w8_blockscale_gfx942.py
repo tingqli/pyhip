@@ -60,7 +60,8 @@ def fused_moe_a8w8_blockscale_gfx942(
     """
     tokens = a1.shape[0]
     inter_dim = w2.shape[2]
-    blocks = min(sorted_expert_ids.numel(), max_sorted_blocks(tokens, topk, w1.shape[0]))
+    # aiter's sorted_ids holds tokens * topk + E * 256 - topk entries (not whole blocks); the valid blocks fit in its floor.
+    blocks = min(sorted_expert_ids.numel(), sorted_ids.numel() // SORT_BLOCK_M, max_sorted_blocks(tokens, topk, w1.shape[0]))
     expert_ids = sorted_expert_ids[:blocks]
     capacity = blocks * SORT_BLOCK_M
     a2 = torch.empty((capacity, inter_dim), device=a1.device, dtype=a1.dtype)

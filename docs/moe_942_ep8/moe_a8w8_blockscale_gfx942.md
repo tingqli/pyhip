@@ -190,7 +190,7 @@ done
 - **2 GiB上限**：排序后的FP8中间结果是`(ceil(tokens*8/256)+32)*256`行 × I。I=2048时buffer行数超过约13万就放不下，会自动回退到asm。MORI不裁剪接收buffer时（例如8×16384=131072行）就会碰到，需要SGLang按实际token数裁剪接收上限，或者给GateUp/Down加64位基址。MiMo端到端测试用`SGLANG_MORI_MOE_MAX_INPUT_TOKENS=32768`裁剪，见6.2。
 - **额外显存**：asm 1-stage没有中间buffer；我们在32768行时要约570 MB（FP8中间结果加scale），每次调用从torch caching allocator分配，SGLang的显存预留要留出这部分。
 - **首次编译**：每个进程第一次调用要准备4个FlyDSL kernel，冷缓存时现场编译。服务启动时要预热，或者把FlyDSL的磁盘缓存带进镜像。
-- **FlyDSL版本**：这些kernel用FlyDSL 0.4.0开发，aiter自己固定的是0.3.4.1。MiMo baseline用FlyDSL 0.3.2，只需把`rocdl.s_buffer_load`换成普通buffer读加`readfirstlane`，见6.2。
+- **FlyDSL版本**：这些kernel用FlyDSL 0.4.0开发，aiter自己固定的是0.3.4.1。`rocdl.s_buffer_load`只有0.4才有，现在统一改用`helpers.s_buffer_load`（同一个`llvm.amdgcn.s.buffer.load.i32`），FlyDSL 0.3.2和0.4.0都能编译，GateUp/Down测试在两个版本上都通过。
 - **只在MI300X验证过**（304 CU，8个XCD），其他gfx942型号没测。小batch（decode、DFlash verify）时比asm慢，端到端decode吞吐还没测。
 - 本卡有多条路由的token仍然用BF16 atomic，累加顺序不固定，和asm一样。
 

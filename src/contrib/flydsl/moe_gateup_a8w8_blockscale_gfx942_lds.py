@@ -34,7 +34,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
-from .helpers import BufferTensor, run_compiled
+from .helpers import BufferTensor, run_compiled, s_buffer_load
 
 SORT_BLOCK_M = 256
 TILE_N = 128
@@ -78,13 +78,32 @@ def _lds_dwords(row, column):
     return row * (TILE_K // 4) + ((row ^ column) & 7) * 4
 
 
+def _rsrc_of(ptr, num_records_bytes):
+    tensor = fx.rocdl.make_buffer_tensor(
+        fx.make_view(ptr, fx.make_layout(1, 1)), max_size=False, num_records_bytes=num_records_bytes
+    )
+    return fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
+
+
+def _load_i32(rsrc, voffset):
+    zero = fx.Int32(0).ir_value()
+    return fx.Int32(rocdl.raw_ptr_buffer_load(T.i32, rsrc, fx.Int32(voffset).ir_value(), zero, zero))
+
+
+def _uniform(value):
+    return fx.Int32(rocdl.readfirstlane(T.i32, value.ir_value()))
+
+
 @functools.cache
-def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-    inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, pair_blocks=False, fp8_out=False
+def gateup_task_emitter(
+    inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", fp8_out=False, a_scale_token_major=False, store_aux=0
 ):
-    """pair_blocks: aligned block pairs of one expert run N-tile-major, so both blocks stream each B tile at the
-    same time and share it in L2; other tasks keep the block-major order.
-    fp8_out: sorted-row FP8 output with per (row, 128 columns) scales (see the module doc).
+    """One GateUp task (256 sorted rows x 128 gate + 128 up columns) for use inside a kernel.
+
+    Returns SimpleNamespace(SharedTiles, n_tiles, emit); emit(lds, pA, pB, pC, pScaleC, pScaleA, pScaleB, pSortedIds,
+    num_tokens, num_blocks, active, coords) runs the task when `active` (an i1 or Python bool), with coords() giving
+    its (block, N tile, expert) and lds a SharedTiles allocation. store_aux: cache bits of the output stores (16, sc1:
+    written through to memory, so other XCDs see them after a vmcnt wait without an L2 write-back).
     """
     validate_parameters(1, inter_dim, hidden_dim, topk, num_experts)
     assert layout in LAYOUTS, layout
@@ -120,21 +139,13 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
     ROW_MAX_BASE = B_BASE
     col_waves = 4 if stream_a else 2
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
-    def gateup_kernel(
-        pA: fx.Pointer,
-        pB: fx.Pointer,
-        pC: fx.Pointer,
-        pScaleC: fx.Pointer,
-        pScaleA: fx.Pointer,
-        pScaleB: fx.Pointer,
-        pSortedIds: fx.Pointer,
-        pExpertIds: fx.Pointer,
-        pNumValid: fx.Pointer,
-        num_tokens: fx.Int32,
-        num_blocks: fx.Int32,
+    @flyc.jit
+    def emit_task(
+        lds, pA, pB, pC, pScaleC, pScaleA, pScaleB, pSortedIds, num_tokens, num_blocks, active, coords, tid=None,
+        epilog_hook=None,
     ):
-        tid = fx.thread_idx.x
+        if const_expr(tid is None):
+            tid = fx.thread_idx.x
         lane = tid % 64
         wave = tid // 64
         group = fx.Int32(rocdl.readfirstlane(T.i32, (tid // 256).ir_value()))
@@ -144,60 +155,10 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
         else:
             wave_m = fx.Int32(rocdl.readfirstlane(T.i32, (wave // 2).ir_value()))
             wave_n = fx.Int32(rocdl.readfirstlane(T.i32, (wave % 2).ir_value()))
-        pid = fx.Int32(fx.block_idx.x)
-
-        def rsrc_of(ptr, num_records_bytes):
-            tensor = fx.rocdl.make_buffer_tensor(
-                fx.make_view(ptr, fx.make_layout(1, 1)), max_size=False, num_records_bytes=num_records_bytes
-            )
-            return fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
-
-        def load_i32(rsrc, voffset):
-            zero = fx.Int32(0).ir_value()
-            return fx.Int32(rocdl.raw_ptr_buffer_load(T.i32, rsrc, fx.Int32(voffset).ir_value(), zero, zero))
-
-        def uniform(value):
-            return fx.Int32(rocdl.readfirstlane(T.i32, value.ir_value()))
-
-        valid_rows = uniform(load_i32(rsrc_of(pNumValid, 4), 0))
-        valid_blocks = (valid_rows + (SORT_BLOCK_M - 1)) // SORT_BLOCK_M
-        valid_blocks = (valid_blocks < num_blocks).select(valid_blocks, num_blocks)
-        num_tasks = valid_blocks * n_tiles
-        if const_expr(xcd_swizzle):
-            # Hardware deals workgroups round-robin over 8 XCDs: give each XCD a contiguous task
-            # range so the N tiles of a sorted block (same A rows) share one L2.
-            chunk = (num_tasks + 7) >> 3
-            xcd_slot = pid >> 3
-            task = (pid & 7) * chunk + xcd_slot
-            active = (xcd_slot < chunk) & (task < num_tasks)
-        else:
-            task = pid
-            active = task < num_tasks
+        rsrc_of, load_i32 = _rsrc_of, _load_i32
 
         if active:
             sorted_rsrc = rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4))
-            expert_rsrc = rsrc_of(pExpertIds, num_blocks * 4)
-
-            def task_coords(task_id):
-                """(block, N tile, expert or None) of a task."""
-                task_block = task_id // n_tiles
-                task_tile = task_id - task_block * n_tiles
-                if const_expr(not pair_blocks):
-                    return task_block, task_tile, None
-                expert_ptr = fx.get_iter(
-                    fx.rocdl.make_buffer_tensor(fx.make_view(pExpertIds, fx.make_layout(1, 1)), max_size=False, num_records_bytes=num_blocks * 4)
-                )
-                pair_first = uniform(task_id) // (2 * n_tiles) * 2
-                first_expert = fx.Int32(rocdl.s_buffer_load(expert_ptr, pair_first))
-                second_expert = fx.Int32(rocdl.s_buffer_load(expert_ptr, pair_first + 1))
-                pair_slot = task_id - pair_first * n_tiles
-                interleave = (pair_first + 1 < valid_blocks) & (first_expert == second_expert)
-                coords_block = interleave.select(pair_first + (pair_slot & 1), task_block)
-                return (
-                    coords_block,
-                    interleave.select(pair_slot >> 1, task_tile),
-                    (coords_block == pair_first).select(first_expert, second_expert),
-                )
 
             def route_ids(block, rows):
                 return [load_i32(sorted_rsrc, (block * SORT_BLOCK_M + row) * 4) for row in rows]
@@ -234,7 +195,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                     a_offsets.append(valid.select(token * K + tid % 8 * 16, fx.Int32(OOB_OFFSET)))
                 for fused in sa_ids:
                     token, _, valid = decode(fused)
-                    sa_offsets.append(valid.select(token * 4, fx.Int32(OOB_OFFSET)))
+                    sa_offsets.append(valid.select(token * (KB * 4 if a_scale_token_major else 4), fx.Int32(OOB_OFFSET)))
                 return a_offsets, sa_offsets
 
             a_tensor = fx.rocdl.make_buffer_tensor(
@@ -281,8 +242,6 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 a_read = [[_lds_dwords(wave_m * 16 + lane % 16, lane // 16 + h * 4) for h in range(2)]]
                 b_read = [[_lds_dwords(wave_n * 32 + r * 16 + lane % 16, lane // 16 + h * 4) for h in range(2)] for r in range(2)]
 
-            lds = fx.SharedAllocator().allocate(SharedTiles).peek()
-
             def lds_view(dwords, count=4):
                 return fx.make_view(lds.ab.ptr + dwords, fx.make_layout(count, 1))
 
@@ -313,8 +272,9 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                     return b_packet.load(voffset_bytes=b_voffsets[packet], soffset_bytes=k_block * b_k_bytes)
 
                 def load_scale_a(k_block, j):
+                    scale_soffset = k_block * 4 if const_expr(a_scale_token_major) else k_block * num_tokens * 4
                     value = rocdl.raw_ptr_buffer_load(
-                        T.f32, scale_a_rsrc, fx.Int32(sa_offsets[j]).ir_value(), fx.Int32(k_block * num_tokens * 4).ir_value(), zero
+                        T.f32, scale_a_rsrc, fx.Int32(sa_offsets[j]).ir_value(), fx.Int32(scale_soffset).ir_value(), zero
                     )
                     return Vec.from_elements([fx.Float32(value)], fx.Float32)
 
@@ -543,7 +503,8 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
 
             def store(dwords, offset):
                 rocdl.raw_ptr_buffer_store(
-                    Vec.from_elements(dwords, fx.Int32).ir_value(), c_rsrc, offset.ir_value(), zero, aux=ir.IntegerAttr.get(T.i32, 0)
+                    Vec.from_elements(dwords, fx.Int32).ir_value(), c_rsrc, offset.ir_value(), zero,
+                    aux=ir.IntegerAttr.get(T.i32, store_aux),
                 )
 
             def slice_words(lanes, j):
@@ -632,7 +593,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                         fp8_rsrc,
                         ((block * SORT_BLOCK_M + out_row) * I + n_tile * TILE_N + tid % 8 * 16).ir_value(),
                         zero,
-                        aux=ir.IntegerAttr.get(T.i32, 0),
+                        aux=ir.IntegerAttr.get(T.i32, store_aux),
                     )
                 scale_row = tid % SORT_BLOCK_M
                 scale_offset = ((n_tile * num_blocks + block) * SORT_BLOCK_M + scale_row) * 4
@@ -641,11 +602,10 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                     fp8_scale_rsrc,
                     (tid < SORT_BLOCK_M).select(scale_offset, fx.Int32(OOB_OFFSET)).ir_value(),
                     zero,
-                    aux=ir.IntegerAttr.get(T.i32, 0),
+                    aux=ir.IntegerAttr.get(T.i32, store_aux),
                 )
 
-            block, n_tile, pair_expert = task_coords(task)
-            expert = pair_expert if pair_blocks else uniform(load_i32(expert_rsrc, block * 4))
+            block, n_tile, expert = coords()
             a_offsets, sa_offsets = task_offsets(route_ids(block, copy_rows()), route_ids(block, slice_lane_rows()))
             ops = task_ops(n_tile, expert, a_offsets, sa_offsets, task_scale_b(expert, n_tile))
             for pro_packet in range_constexpr(4):
@@ -662,10 +622,89 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 write_s(pro_packet)
             start_k_loop()
             k_loop(ops)
+            if const_expr(epilog_hook is not None):
+                epilog_hook()
             if const_expr(fp8_out):
                 fp8_epilogue(block, n_tile)
             else:
                 final_epilogue(block, n_tile)
+
+    return SimpleNamespace(SharedTiles=SharedTiles, n_tiles=n_tiles, emit=emit_task)
+
+
+@functools.cache
+def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
+    inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, pair_blocks=False, fp8_out=False,
+    a_scale_token_major=False,
+):
+    """pair_blocks: aligned block pairs of one expert run N-tile-major, so both blocks stream each B tile at the
+    same time and share it in L2; other tasks keep the block-major order.
+    fp8_out: sorted-row FP8 output with per (row, 128 columns) scales (see the module doc).
+    a_scale_token_major: A scales are [T, K/128] (as quantized) instead of [K/128, T].
+    """
+    gateup = gateup_task_emitter(inter_dim, hidden_dim, topk, num_experts, layout, fp8_out, a_scale_token_major)
+    # Closures must hold the emitter itself: FlyDSL's cache key only recurses into callable closure values.
+    emit_task, SharedTiles, n_tiles = gateup.emit, gateup.SharedTiles, gateup.n_tiles
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def gateup_kernel(
+        pA: fx.Pointer,
+        pB: fx.Pointer,
+        pC: fx.Pointer,
+        pScaleC: fx.Pointer,
+        pScaleA: fx.Pointer,
+        pScaleB: fx.Pointer,
+        pSortedIds: fx.Pointer,
+        pExpertIds: fx.Pointer,
+        pNumValid: fx.Pointer,
+        num_tokens: fx.Int32,
+        num_blocks: fx.Int32,
+    ):
+        pid = fx.Int32(fx.block_idx.x)
+        valid_rows = _uniform(_load_i32(_rsrc_of(pNumValid, 4), 0))
+        valid_blocks = (valid_rows + (SORT_BLOCK_M - 1)) // SORT_BLOCK_M
+        valid_blocks = (valid_blocks < num_blocks).select(valid_blocks, num_blocks)
+        num_tasks = valid_blocks * n_tiles
+        if const_expr(xcd_swizzle):
+            # Hardware deals workgroups round-robin over 8 XCDs: give each XCD a contiguous task
+            # range so the N tiles of a sorted block (same A rows) share one L2.
+            chunk = (num_tasks + 7) >> 3
+            xcd_slot = pid >> 3
+            task = (pid & 7) * chunk + xcd_slot
+            active = (xcd_slot < chunk) & (task < num_tasks)
+        else:
+            task = pid
+            active = task < num_tasks
+
+        def task_coords(task_id):
+            """(block, N tile, expert or None) of a task."""
+            task_block = task_id // n_tiles
+            task_tile = task_id - task_block * n_tiles
+            if const_expr(not pair_blocks):
+                return task_block, task_tile, None
+            expert_ptr = fx.get_iter(
+                fx.rocdl.make_buffer_tensor(fx.make_view(pExpertIds, fx.make_layout(1, 1)), max_size=False, num_records_bytes=num_blocks * 4)
+            )
+            pair_first = _uniform(task_id) // (2 * n_tiles) * 2
+            first_expert = fx.Int32(s_buffer_load(expert_ptr, pair_first))
+            second_expert = fx.Int32(s_buffer_load(expert_ptr, pair_first + 1))
+            pair_slot = task_id - pair_first * n_tiles
+            interleave = (pair_first + 1 < valid_blocks) & (first_expert == second_expert)
+            coords_block = interleave.select(pair_first + (pair_slot & 1), task_block)
+            return (
+                coords_block,
+                interleave.select(pair_slot >> 1, task_tile),
+                (coords_block == pair_first).select(first_expert, second_expert),
+            )
+
+        def coords():
+            block, n_tile, pair_expert = task_coords(task)
+            if const_expr(pair_blocks):
+                return block, n_tile, pair_expert
+            return block, n_tile, _uniform(_load_i32(_rsrc_of(pExpertIds, num_blocks * 4), block * 4))
+
+        lds = fx.SharedAllocator().allocate(SharedTiles).peek()
+        emit_task(lds, pA, pB, pC, pScaleC, pScaleA, pScaleB, pSortedIds, num_tokens, num_blocks, active, coords)
 
     @flyc.jit
     def launch(
@@ -698,10 +737,11 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
 
 def moe_gateup_a8w8_blockscale_gfx942_lds(
     a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out, layout="2x4_pf1", xcd_swizzle=True,
-    pair_blocks=False, out_scale_t=None, topk=None,
+    pair_blocks=False, out_scale_t=None, topk=None, a_scale_token_major=False,
 ):
     """a[T,K] fp8, w1[E,2I,K] fp8 shuffle_weight(16,16), a_scale_t[K/128,T], w1_scale[E,2I/128,K/128] fp32.
 
+    a_scale_token_major=True: a_scale_t is the [T,K/128] scale as quantized (not transposed).
     sorted_ids[blocks*256] / expert_ids[blocks] / num_valid_ids[>=1] int32 as from aiter moe_sorting(256);
     out[T,topk,I] bf16 receives SiLU(gate) * up for every valid route. layout is "2x4_pf1" or "4x2_pf1".
     pair_blocks=True orders tasks so that consecutive blocks share each B tile in L2.
@@ -724,7 +764,8 @@ def moe_gateup_a8w8_blockscale_gfx942_lds(
     validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts, fp8_out)
     assert sorted_ids.numel() >= num_blocks * SORT_BLOCK_M
     launch = compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out
+        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out,
+        bool(a_scale_token_major),
     )
     run_compiled(
         launch,

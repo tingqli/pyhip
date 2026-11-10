@@ -38,6 +38,69 @@ def run_compiled(launch, *args):
         compiled(*args)
 
 
+def s_buffer_load(ptr, offset):
+    """Wave-uniform i32 at i32 element `offset` of a buffer-tensor iterator: FlyDSL 0.4's rocdl.s_buffer_load, also on 0.3."""
+    i32 = ir.IntegerType.get_signless(32)
+    rsrc = llvm.ptrtoint(ir.IntegerType.get_signless(128), fx.rocdl.get_buffer_rsrc(ptr))
+    value = llvm.call_intrinsic(
+        i32,
+        "llvm.amdgcn.s.buffer.load.i32",
+        [llvm.bitcast(ir.VectorType.get([4], i32), rsrc), (fx.Int32(offset) * 4).ir_value(), fx.Int32(0).ir_value()],
+        [],
+        [],
+    )
+    return fx.Int32(value)
+
+
+def global_ptr(addr):
+    """!llvm.ptr<1> at the i64 byte address `addr`."""
+    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), fx.Int64(addr).ir_value())
+
+
+def atomic_add_i32(addr, value, scope="agent-one-as"):
+    """Monotonic i32 fetch-add at an i64 address ("agent-one-as": device, "one-as": system); returns the old value."""
+    op = llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add, global_ptr(addr), fx.Int32(value).ir_value(), llvm.AtomicOrdering.monotonic,
+        syncscope=scope, alignment=4,
+    )
+    return fx.Int32(op.result)
+
+
+def load_i32_atomic(addr, scope="agent-one-as"):
+    """Monotonic i32 load at an i64 address, coherent at `scope` (for polling a flag)."""
+    i32 = ir.IntegerType.get_signless(32)
+    return fx.Int32(llvm.LoadOp(i32, global_ptr(addr), alignment=4, ordering=llvm.AtomicOrdering.monotonic, syncscope=scope).result)
+
+
+def fence(ordering, scope="agent-one-as"):
+    """LLVM fence: "release" writes back dirty L2 lines and waits for prior memory ops, "acquire" invalidates caches."""
+    llvm.FenceOp(getattr(llvm.AtomicOrdering, ordering), syncscope=scope)
+
+
+@flyc.jit
+def spin_wait_ge(addr, target, scope, l1_only=False):
+    """Poll the i32 at `addr` until it is >= target, then acquire at `scope`.
+
+    l1_only: invalidate only the L1 instead (`buffer_inv sc0`). On gfx942 the scoped acquire also walks the L2 for
+    non-local (MTYPE NC) lines; local memory lines are kept coherent by probes, so data in local memory that was
+    written through (or written back) before the flag needs only the L1 invalidated.
+    """
+    seen = load_i32_atomic(addr, scope)
+    while seen < target:
+        fx.rocdl.s_sleep(2)
+        seen = load_i32_atomic(addr, scope)
+    if l1_only:
+        llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "buffer_inv sc0", "", has_side_effects=True)
+    else:
+        fence("acquire", scope)
+
+
+def buffer_rsrc_at(addr, num_bytes):
+    """Buffer resource for `num_bytes` at an i64 address (e.g. a peer's buffer from a pointer table)."""
+    ptr = fx.inttoptr(fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 16), fx.Int64(addr))
+    return fx.rocdl.get_buffer_rsrc(fx.rocdl.make_buffer_ptr(ptr, num_records_bytes=num_bytes))
+
+
 def div_e(x, y):
     assert x % y == 0, f"expect {x} % {y} == 0"
     return x // y

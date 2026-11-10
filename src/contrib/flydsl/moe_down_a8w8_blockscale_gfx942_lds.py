@@ -22,6 +22,7 @@ A token's routes are summed in one of two ways:
 """
 
 import functools
+from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -33,9 +34,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
-from .helpers import BufferTensor, run_compiled
+from .helpers import BufferTensor, run_compiled, s_buffer_load
 from .moe_gateup_a8w8_blockscale_gfx942_lds import (
-    LAYOUTS, OOB_OFFSET, PACKET_DWORDS, PACKET_ROWS, SORT_BLOCK_M, TILE_K, TOKEN_MASK, _lds_dwords,
+    LAYOUTS, OOB_OFFSET, PACKET_DWORDS, PACKET_ROWS, SORT_BLOCK_M, TILE_K, TOKEN_MASK, _lds_dwords, _load_i32, _uniform,
 )
 
 TILE_N = 256
@@ -76,12 +77,21 @@ def _rsrc_of(ptr, num_records_bytes):
 
 
 @functools.cache
-def compile_moe_down_a8w8_blockscale_gfx942_lds(
-    hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False
+def down_task_emitter(
+    hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", atomic=True, sorted_a2=False, single_store=False,
+    remote_token_shift=0,
 ):
+    """One Down task (256 sorted rows x 256 hidden columns) for use inside a kernel.
+
+    Returns SimpleNamespace(SharedTiles, n_tiles, emit); emit(lds, pA, pB, pOut, pScaleA, pScaleB, pSortedIds,
+    pSortedWeights, pInverse, pRouteCounts, num_tokens, num_blocks, active, coords) runs the task when `active`
+    (an i1 or Python bool), with coords() giving its (block, N tile, expert) and lds a SharedTiles allocation.
+    """
     validate_parameters(1, hidden_dim, inter_dim, topk, num_experts, sorted_a2=sorted_a2)
     assert layout in LAYOUTS, layout
     assert atomic or not single_store
+    remote = remote_token_shift > 0
+    assert not remote or atomic and not single_store
     H, K = hidden_dim, inter_dim
     KB = K // TILE_K
     n_tiles = H // TILE_N
@@ -121,23 +131,13 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
 
     B_BASE = 4 * PACKET_DWORDS
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
-    def down_kernel(
-        pA: fx.Pointer,
-        pB: fx.Pointer,
-        pOut: fx.Pointer,
-        pScaleA: fx.Pointer,
-        pScaleB: fx.Pointer,
-        pSortedIds: fx.Pointer,
-        pSortedWeights: fx.Pointer,
-        pExpertIds: fx.Pointer,
-        pNumValid: fx.Pointer,
-        pInverse: fx.Pointer,
-        pRouteCounts: fx.Pointer,
-        num_tokens: fx.Int32,
-        num_blocks: fx.Int32,
+    @flyc.jit
+    def emit_task(
+        lds, pA, pB, pOut, pScaleA, pScaleB, pSortedIds, pSortedWeights, pInverse, pRouteCounts, num_tokens, num_blocks,
+        active, coords, tid=None, epilog_hook=None,
     ):
-        tid = fx.thread_idx.x
+        if const_expr(tid is None):
+            tid = fx.thread_idx.x
         lane = tid % 64
         wave = tid // 64
         group = fx.Int32(rocdl.readfirstlane(T.i32, (tid // 256).ir_value()))
@@ -147,29 +147,7 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
         else:
             wave_m = fx.Int32(rocdl.readfirstlane(T.i32, (wave // 2).ir_value()))
             wave_n = fx.Int32(rocdl.readfirstlane(T.i32, (wave % 2).ir_value()))
-        pid = fx.Int32(fx.block_idx.x)
-
-        def load_i32(rsrc, voffset):
-            zero = fx.Int32(0).ir_value()
-            return fx.Int32(rocdl.raw_ptr_buffer_load(T.i32, rsrc, fx.Int32(voffset).ir_value(), zero, zero))
-
-        def uniform(value):
-            return fx.Int32(rocdl.readfirstlane(T.i32, value.ir_value()))
-
-        valid_rows = uniform(load_i32(_rsrc_of(pNumValid, 4), 0))
-        valid_blocks = (valid_rows + (SORT_BLOCK_M - 1)) // SORT_BLOCK_M
-        valid_blocks = (valid_blocks < num_blocks).select(valid_blocks, num_blocks)
-        num_tasks = valid_blocks * n_tiles
-        if const_expr(xcd_swizzle):
-            # Hardware deals workgroups round-robin over 8 XCDs: give each XCD a contiguous task
-            # range so the N tiles of a sorted block (same A rows) share one L2.
-            xcd_tasks = (num_tasks + 7) >> 3
-            xcd_slot = pid >> 3
-            task = (pid & 7) * xcd_tasks + xcd_slot
-            active = (xcd_slot < xcd_tasks) & (task < num_tasks)
-        else:
-            task = pid
-            active = task < num_tasks
+        load_i32 = _load_i32
 
         if active:
             zero = fx.Int32(0).ir_value()
@@ -177,9 +155,7 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
             weight_rsrc = _rsrc_of(pSortedWeights, num_blocks * (SORT_BLOCK_M * 4))
             route_rows = num_tokens * topk
             a2_rows = num_blocks * SORT_BLOCK_M if sorted_a2 else route_rows
-            block = task // n_tiles
-            n_tile = task - block * n_tiles
-            expert = uniform(load_i32(_rsrc_of(pExpertIds, num_blocks * 4), block * 4))
+            block, n_tile, expert = coords()
 
             def route_ids(rows):
                 return [load_i32(sorted_rsrc, (block * SORT_BLOCK_M + row) * 4) for row in rows]
@@ -250,8 +226,6 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
             else:
                 a_read = [[_lds_dwords(wave_m * 16 + lane % 16, lane // 16 + h * 4) for h in range(2)]]
                 b_read = [[_lds_dwords(wave_n * 32 + r * 16 + lane % 16, lane // 16 + h * 4) for h in range(2)] for r in range(2)]
-
-            lds = fx.SharedAllocator().allocate(SharedTiles).peek()
 
             def lds_view(dwords, count=4):
                 return fx.make_view(lds.ab.ptr + dwords, fx.make_layout(count, 1))
@@ -455,6 +429,8 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                 run_k(KB % 2, k_block)
                 run_k(1 - KB % 2, k_block + 1)
 
+            if const_expr(epilog_hook is not None):
+                epilog_hook()
             # Output rows are reloaded here (not kept through the K loop) so the loads overlap the drain.
             out_ids = route_ids(lane_rows)
             weights = [
@@ -463,9 +439,21 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
             ]
             if const_expr(atomic):
                 token_offsets = []
+                row_lo, row_hi = [], []
                 for fused in out_ids:
                     _, out_token, out_valid = decode(fused)
                     row_offset = out_token * (H * 2)
+                    if const_expr(remote):
+                        # 64-bit base of the token's row in its rank's out; -1 offsets still mark invalid rows.
+                        table_rsrc = _rsrc_of(pOut, 64 * 8)
+                        rank_offset = out_valid.select((out_token >> remote_token_shift) * 8, fx.Int32(OOB_OFFSET))
+                        base = (fx.Uint64(fx.Uint32(load_i32(table_rsrc, rank_offset + 4))) << 32) | fx.Uint64(
+                            fx.Uint32(load_i32(table_rsrc, rank_offset))
+                        )
+                        address = base + fx.Uint64(fx.Uint32((out_token & ((1 << remote_token_shift) - 1)) * (H * 2)))
+                        row_lo.append(fx.Int32(fx.Uint32(address)))
+                        row_hi.append(fx.Int32(fx.Uint32(address >> 32)))
+                        row_offset = fx.Int32(0)
                     if const_expr(single_store):
                         # Bit 0 marks the token's only local route: a plain store, no other route adds to it.
                         routes = load_i32(
@@ -487,6 +475,13 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                         fx.Int32(rocdl.ds_bpermute(T.i32, ((lane // 32 + 2 * i) * 4).ir_value(), token_offsets[j].ir_value()))
                         for i in range_constexpr(8)
                     ]
+                    if const_expr(remote):
+                        row_addresses = []
+                        for i in range_constexpr(8):
+                            source = ((lane // 32 + 2 * i) * 4).ir_value()
+                            lo = fx.Uint32(fx.Int32(rocdl.ds_bpermute(T.i32, source, row_lo[j].ir_value())))
+                            hi = fx.Uint32(fx.Int32(rocdl.ds_bpermute(T.i32, source, row_hi[j].ir_value())))
+                            row_addresses.append(((fx.Uint64(hi) << 32) | fx.Uint64(lo)) + fx.Uint64(fx.Uint32(column_base)))
                     for c in range_constexpr(col_groups):
                         for n_local in range_constexpr(4):
                             lds_view(write_base + n_local * 8, 2).store(
@@ -505,7 +500,16 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                         for i in range_constexpr(8):
                             value = fx.Int32(llvm.extractvalue(T.i32, copies, [i]))
                             row_offset = row_offsets[i]
-                            if const_expr(single_store):
+                            if const_expr(remote):
+                                if row_offset >= 0:
+                                    llvm.inline_asm(
+                                        None,
+                                        [(row_addresses[i] + fx.Uint64(c * 128)).ir_value(), value.ir_value()],
+                                        "global_atomic_pk_add_bf16 $0, $1, off",
+                                        "v,v",
+                                        has_side_effects=True,
+                                    )
+                            elif const_expr(single_store):
                                 address = ((row_offset & -2) + column_base + c * 128).ir_value()
                                 if (row_offset >= 0) & ((row_offset & 1) == 1):
                                     llvm.inline_asm(
@@ -592,6 +596,62 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                 if n_tile == 0:
                     write_inverse()
 
+    return SimpleNamespace(SharedTiles=SharedTiles, n_tiles=n_tiles, emit=emit_task)
+
+
+@functools.cache
+def compile_moe_down_a8w8_blockscale_gfx942_lds(
+    hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False,
+    remote_token_shift=0,
+):
+    """remote_token_shift > 0 (EP combine): the out pointer is an int64 table of the ranks' out [Tcap, H] bases,
+    a sorted ID's token is rank << remote_token_shift | token, and every route is added into that rank's row."""
+    down = down_task_emitter(hidden_dim, inter_dim, topk, num_experts, layout, atomic, sorted_a2, single_store, remote_token_shift)
+    # Closures must hold the emitter itself: FlyDSL's cache key only recurses into callable closure values.
+    emit_task, SharedTiles, n_tiles = down.emit, down.SharedTiles, down.n_tiles
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def down_kernel(
+        pA: fx.Pointer,
+        pB: fx.Pointer,
+        pOut: fx.Pointer,
+        pScaleA: fx.Pointer,
+        pScaleB: fx.Pointer,
+        pSortedIds: fx.Pointer,
+        pSortedWeights: fx.Pointer,
+        pExpertIds: fx.Pointer,
+        pNumValid: fx.Pointer,
+        pInverse: fx.Pointer,
+        pRouteCounts: fx.Pointer,
+        num_tokens: fx.Int32,
+        num_blocks: fx.Int32,
+    ):
+        pid = fx.Int32(fx.block_idx.x)
+        valid_rows = _uniform(_load_i32(_rsrc_of(pNumValid, 4), 0))
+        valid_blocks = (valid_rows + (SORT_BLOCK_M - 1)) // SORT_BLOCK_M
+        valid_blocks = (valid_blocks < num_blocks).select(valid_blocks, num_blocks)
+        num_tasks = valid_blocks * n_tiles
+        if const_expr(xcd_swizzle):
+            # Hardware deals workgroups round-robin over 8 XCDs: give each XCD a contiguous task
+            # range so the N tiles of a sorted block (same A rows) share one L2.
+            xcd_tasks = (num_tasks + 7) >> 3
+            xcd_slot = pid >> 3
+            task = (pid & 7) * xcd_tasks + xcd_slot
+            active = (xcd_slot < xcd_tasks) & (task < num_tasks)
+        else:
+            task = pid
+            active = task < num_tasks
+
+        def coords():
+            block = task // n_tiles
+            return block, task - block * n_tiles, _uniform(_load_i32(_rsrc_of(pExpertIds, num_blocks * 4), block * 4))
+
+        lds = fx.SharedAllocator().allocate(SharedTiles).peek()
+        emit_task(
+            lds, pA, pB, pOut, pScaleA, pScaleB, pSortedIds, pSortedWeights, pInverse, pRouteCounts, num_tokens, num_blocks,
+            active, coords,
+        )
+
     @flyc.jit
     def launch(
         pA: fx.Pointer,
@@ -649,7 +709,7 @@ def compile_moe_down_reduce(hidden_dim, topk):
         acc = fx.make_rmem_tensor(fx.make_layout((8, 2), (1, 8)), fx.Float32)
         acc.fill(0)
         for slot in range_constexpr(topk):
-            position = fx.Int32(rocdl.s_buffer_load(inverse, token * topk + slot))
+            position = fx.Int32(s_buffer_load(inverse, token * topk + slot))
             if position >= 0:
                 for half in range_constexpr(2):
                     words = Vec(rows.load(voffset_bytes=tid * 16 + half * half_bytes, soffset_bytes=position * (H * 2)))
@@ -778,12 +838,12 @@ def compile_moe_zero_rows(hidden_dim, bounded=False):
             num_rows = fx.get_iter(
                 fx.rocdl.make_buffer_tensor(fx.make_view(pNumRows, fx.make_layout(1, 1)), max_size=False, num_records_bytes=4)
             )
-            limit = fx.Int32(rocdl.s_buffer_load(num_rows, fx.Int32(0)))
+            limit = fx.Int32(s_buffer_load(num_rows, fx.Int32(0)))
         out_rsrc = _rsrc_of(pOut, num_tokens * (H * 2))
         for slot in range_constexpr(tokens_per_wave):
             token = (fx.Int32(fx.block_idx.x) * 4 + wave) * tokens_per_wave + slot
             # Past num_tokens the count reads 0 and the stores fall out of the descriptor.
-            if (fx.Int32(rocdl.s_buffer_load(counts, token)) != 1) & (token < limit):
+            if (fx.Int32(s_buffer_load(counts, token)) != 1) & (token < limit):
                 for part in range_constexpr((chunks + 63) // 64):
                     chunk = lane + part * 64
                     rocdl.raw_ptr_buffer_store(
@@ -823,7 +883,7 @@ def moe_zero_rows(out, counts, num_rows=None):
 
 def _launch_down(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, target, inverse, layout, xcd_swizzle,
-    atomic, tokens, topk, route_counts=None,
+    atomic, tokens, topk, route_counts=None, remote_token_shift=0,
 ):
     sorted_a2 = a2.dim() == 2
     inter_dim = a2.shape[-1]
@@ -836,7 +896,8 @@ def _launch_down(
     single_store = route_counts is not None
     assert not single_store or route_counts.shape == (tokens,) and route_counts.dtype == torch.int32
     launch = compile_moe_down_a8w8_blockscale_gfx942_lds(
-        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store
+        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store,
+        int(remote_token_shift),
     )
     run_compiled(
         launch,
@@ -854,6 +915,22 @@ def _launch_down(
         tokens,
         num_blocks,
         torch.cuda.current_stream(),
+    )
+
+
+def moe_down_remote_a8w8_blockscale_gfx942_lds(
+    a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out_table, token_shift, topk,
+    layout="2x4_pf1", xcd_swizzle=True,
+):
+    """EP combine fused into Down: every route is added with BF16 atomics into out[rank][token] of its source rank.
+
+    a2 / a2_scale_t are sorted-row; sorted_ids hold rank << token_shift | token | slot << 24 (invalid rows: -1);
+    out_table is an int64 tensor of the ranks' out [1 << token_shift, H] BF16 bases (zeroed beforehand).
+    """
+    assert out_table.dtype == torch.int64 and out_table.numel() <= 64 and token_shift > 0
+    _launch_down(
+        a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out_table, out_table, layout,
+        xcd_swizzle, True, out_table.numel() << token_shift, topk, None, token_shift,
     )
 
 
