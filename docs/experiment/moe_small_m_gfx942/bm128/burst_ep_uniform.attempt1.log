@@ -1,0 +1,474 @@
+GATE {"stage": "entry", "time": 1794367577.0790262, "bdf": "0000:22:00.0", "activity": [0, 0, 0, 0, 0], "vram_used_mb": 284, "vram_total_mb": 196592, "power_w": 153, "pids": 12, "pass": true}
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+ENV {"gpu": "AMD Instinct MI300X", "arch": "gfx942:sramecc+:xnack-", "cus": 304, "torch": "2.11.0+rocm7.2", "hip": "7.2.26015", "flydsl": "0.4.0"}
+HBM probe: 4.95 TB/s median (1 GiB nontemporal read)
+[aiter] import [module_moe_sorting_opus] under /sgl-workspace/aiter/aiter/jit/module_moe_sorting_opus.so
+[aiter] LoadKernel: _ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256.co
+[aiter] LoadKernel: _ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co
+[aiter] LoadKernel: _ZN5aiter43fmoe_bf16_blockscaleFp8_g1u1_vs_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_64x256.co
+GATE {"stage": "T=256 before sampling", "time": 1794367587.0713794, "bdf": "0000:22:00.0", "activity": [1, 0, 0, 0, 0], "vram_used_mb": 3338, "vram_total_mb": 196592, "power_w": 187, "pids": 12, "pass": true}
+GATE {"stage": "T=256 round 0", "time": 1794367588.312899, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3338, "vram_total_mb": 196592, "power_w": 187, "pids": 12, "pass": true}
+GATE {"stage": "T=256 round 1", "time": 1794367589.544578, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3338, "vram_total_mb": 196592, "power_w": 187, "pids": 12, "pass": true}
+GATE {"stage": "T=256 round 2", "time": 1794367590.7785473, "bdf": "0000:22:00.0", "activity": [4, 2, 1, 0, 0], "vram_used_mb": 3338, "vram_total_mb": 196592, "power_w": 187, "pids": 12, "pass": true}
+GATE {"stage": "T=256 round 3", "time": 1794367592.009363, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3338, "vram_total_mb": 196592, "power_w": 188, "pids": 12, "pass": true}
+
+T=256 ep_uniform: 256 local routes, routes/expert min 8 max 8, 12.9 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         266.0    260.1-271.9         252.7    48.4    3.03   8.12e-06  pass
+  asm vs_32x256                    272.6    264.4-280.4         258.8    47.3    2.95   8.16e-06  pass
+  asm novs_ps_32x256               267.5    261.9-274.4         253.3    48.2    3.01   8.08e-06  pass
+  asm vs_ps_32x256                 267.4    258.9-275.1         253.5    48.2    3.01   8.13e-06  pass
+  asm vs_psx_64x256                261.1    257.8-266.7         247.1    49.3    3.08   8.05e-06  pass
+  asm vs_64x256                    270.5    265.3-283.3         256.1    47.6    2.98   8.12e-06  pass
+  bm256                            465.7    446.7-491.5         450.5    27.7    1.73   1.38e-06  pass
+  bm128                            308.9    296.7-319.4         294.5    41.7    2.61   1.38e-06  pass
+  small                            204.1    201.4-209.2         190.8    63.1    3.95   1.38e-06  pass
+  split                            200.3    197.3-205.1         187.4    64.3    4.02   1.38e-06  pass
+  merged                           200.6    198.9-204.3         187.7    64.2    4.01   1.38e-06  pass
+  bm256: 0.561x vs tuned asm vs_psx_64x256 (with sort), 0.548x without sort; 0.571x vs asm auto
+  bm128: 0.846x vs tuned asm vs_psx_64x256 (with sort), 0.839x without sort; 0.861x vs asm auto
+  small: 1.279x vs tuned asm vs_psx_64x256 (with sort), 1.295x without sort; 1.303x vs asm auto
+  split: 1.304x vs tuned asm vs_psx_64x256 (with sort), 1.319x without sort; 1.328x vs asm auto
+  merged: 1.302x vs tuned asm vs_psx_64x256 (with sort), 1.316x without sort; 1.326x vs asm auto
+GATE {"stage": "T=512 before sampling", "time": 1794367592.9194944, "bdf": "0000:22:00.0", "activity": [2, 1, 0, 0, 0], "vram_used_mb": 3420, "vram_total_mb": 196592, "power_w": 188, "pids": 12, "pass": true}
+GATE {"stage": "T=512 round 0", "time": 1794367594.1525838, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3420, "vram_total_mb": 196592, "power_w": 187, "pids": 12, "pass": true}
+GATE {"stage": "T=512 round 1", "time": 1794367595.3862734, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 3420, "vram_total_mb": 196592, "power_w": 188, "pids": 12, "pass": true}
+GATE {"stage": "T=512 round 2", "time": 1794367596.6203914, "bdf": "0000:22:00.0", "activity": [4, 2, 1, 0, 0], "vram_used_mb": 4109, "vram_total_mb": 196592, "power_w": 184, "pids": 12, "pass": true}
+GATE {"stage": "T=512 round 3", "time": 1794367597.8640656, "bdf": "0000:22:00.0", "activity": [15, 11, 11, 12, 11], "vram_used_mb": 4451, "vram_total_mb": 196592, "power_w": 236, "pids": 12, "pass": false}
+
+T=512 ep_uniform: 512 local routes, routes/expert min 16 max 16, 25.8 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         273.0    264.5-283.5         255.6    94.4    2.95   8.13e-06  pass
+  asm vs_32x256                    278.8    268.7-292.2         261.5    92.4    2.89   8.14e-06  pass
+  asm novs_ps_32x256               275.9    269.3-287.2         257.6    93.4    2.92   8.14e-06  pass
+  asm vs_ps_32x256                 277.4    265.5-286.9         259.9    92.9    2.90   8.14e-06  pass
+  asm vs_psx_64x256                273.4    266.4-279.3         255.2    94.3    2.95   8.06e-06  pass
+  asm vs_64x256                    281.4    270.5-286.9         262.3    91.6    2.86   8.16e-06  pass
+  bm256                            474.6    445.5-499.3         455.7    54.3    1.70   1.37e-06  pass
+  bm128                            316.5    306.0-353.7         297.0    81.4    2.54   1.37e-06  pass
+  small                            207.9    204.9-211.8         192.4   123.9    3.87   1.37e-06  pass
+  split                            203.8    201.0-206.9         188.0   126.4    3.95   1.37e-06  pass
+  merged                           205.6    202.6-208.6         190.5   125.4    3.92   1.37e-06  pass
+  bm256: 0.575x vs tuned asm auto (with sort), 0.561x without sort; 0.575x vs asm auto
+  bm128: 0.863x vs tuned asm auto (with sort), 0.861x without sort; 0.863x vs asm auto
+  small: 1.313x vs tuned asm auto (with sort), 1.329x without sort; 1.313x vs asm auto
+  split: 1.339x vs tuned asm auto (with sort), 1.360x without sort; 1.339x vs asm auto
+  merged: 1.328x vs tuned asm auto (with sort), 1.342x without sort; 1.328x vs asm auto
+GATE {"stage": "T=1024 before sampling", "time": 1794367598.8293815, "bdf": "0000:22:00.0", "activity": [15, 15, 16, 11, 9], "vram_used_mb": 5092, "vram_total_mb": 196592, "power_w": 237, "pids": 12, "pass": false}
+GATE {"stage": "T=1024 round 0", "time": 1794367600.0792372, "bdf": "0000:22:00.0", "activity": [30, 29, 28, 28, 28], "vram_used_mb": 5706, "vram_total_mb": 196592, "power_w": 240, "pids": 12, "pass": false}
+GATE {"stage": "T=1024 round 1", "time": 1794367601.3221338, "bdf": "0000:22:00.0", "activity": [31, 30, 43, 20, 19], "vram_used_mb": 6986, "vram_total_mb": 196592, "power_w": 237, "pids": 12, "pass": false}
+GATE {"stage": "T=1024 round 2", "time": 1794367602.585086, "bdf": "0000:22:00.0", "activity": [23, 16, 7, 8, 15], "vram_used_mb": 7358, "vram_total_mb": 196592, "power_w": 238, "pids": 12, "pass": false}
+GATE {"stage": "T=1024 round 3", "time": 1794367603.8696945, "bdf": "0000:22:00.0", "activity": [5, 14, 16, 20, 20], "vram_used_mb": 11122, "vram_total_mb": 196592, "power_w": 249, "pids": 12, "pass": false}
+
+T=1024 ep_uniform: 1024 local routes, routes/expert min 32 max 32, 51.5 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         285.9    280.9-292.7         265.6   180.3    2.82   8.08e-06  pass
+  asm vs_32x256                    286.0    282.1-291.4         266.4   180.2    2.82   8.15e-06  pass
+  asm novs_ps_32x256               285.1    279.3-291.0         265.9   180.8    2.82   8.11e-06  pass
+  asm vs_ps_32x256                 286.0    281.2-290.2         266.0   180.2    2.82   8.17e-06  pass
+  asm vs_psx_64x256                281.2    274.8-290.3         261.2   183.3    2.86   8.10e-06  pass
+  asm vs_64x256                    284.2    277.1-293.1         261.9   181.4    2.83   8.07e-06  pass
+  bm256                            490.1    471.8-512.0         468.1   105.2    1.64   1.38e-06  pass
+  bm128                            329.2    316.4-356.8         308.3   156.6    2.45   1.38e-06  pass
+  small                            215.6    212.5-220.6         198.8   239.1    3.74   1.38e-06  pass
+  split                            211.9    208.4-217.9         193.9   243.2    3.80   1.38e-06  pass
+  merged                           211.1    208.5-216.2         194.5   244.2    3.82   1.38e-06  pass
+  bm256: 0.574x vs tuned asm vs_psx_64x256 (with sort), 0.558x without sort; 0.583x vs asm auto
+  bm128: 0.854x vs tuned asm vs_psx_64x256 (with sort), 0.847x without sort; 0.868x vs asm auto
+  small: 1.305x vs tuned asm vs_psx_64x256 (with sort), 1.314x without sort; 1.326x vs asm auto
+  split: 1.327x vs tuned asm vs_psx_64x256 (with sort), 1.347x without sort; 1.349x vs asm auto
+  merged: 1.332x vs tuned asm vs_psx_64x256 (with sort), 1.343x without sort; 1.354x vs asm auto
+GATE {"stage": "T=2048 before sampling", "time": 1794367604.8229675, "bdf": "0000:22:00.0", "activity": [24, 18, 12, 10, 4], "vram_used_mb": 14960, "vram_total_mb": 196592, "power_w": 209, "pids": 12, "pass": false}
+GATE {"stage": "T=2048 round 0", "time": 1794367606.1126018, "bdf": "0000:22:00.0", "activity": [4, 59, 85, 48, 18], "vram_used_mb": 15506, "vram_total_mb": 196592, "power_w": 240, "pids": 12, "pass": false}
+GATE {"stage": "T=2048 round 1", "time": 1794367607.4154205, "bdf": "0000:22:00.0", "activity": [15, 5, 2, 2, 1], "vram_used_mb": 41028, "vram_total_mb": 196592, "power_w": 229, "pids": 12, "pass": false}
+GATE {"stage": "T=2048 round 2", "time": 1794367608.6853962, "bdf": "0000:22:00.0", "activity": [15, 12, 11, 12, 12], "vram_used_mb": 41032, "vram_total_mb": 196592, "power_w": 238, "pids": 12, "pass": false}
+GATE {"stage": "T=2048 round 3", "time": 1794367609.9644988, "bdf": "0000:22:00.0", "activity": [38, 39, 42, 40, 39], "vram_used_mb": 41032, "vram_total_mb": 196592, "power_w": 242, "pids": 12, "pass": false}
+
+T=2048 ep_uniform: 2048 local routes, routes/expert min 64 max 64, 103.1 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         338.2    329.3-381.6         303.7   304.8    2.38   8.16e-06  pass
+  asm vs_32x256                    375.0    330.3-387.4         335.6   274.8    2.15   8.11e-06  pass
+  asm novs_ps_32x256               360.6    331.7-382.6         322.9   285.9    2.23   8.14e-06  pass
+  asm vs_ps_32x256                 339.8    330.8-378.3         305.2   303.4    2.37   8.14e-06  pass
+  asm vs_psx_64x256                328.5    321.4-360.9         293.4   313.8    2.45   8.18e-06  pass
+  asm vs_64x256                    328.5    323.0-355.7         294.4   313.8    2.45   8.18e-06  pass
+  bm256                            518.2    477.1-547.3         484.9   198.9    1.55   1.41e-06  pass
+  bm128                            387.2    349.3-400.7         352.1   266.2    2.08   1.41e-06  pass
+  small                            254.5    246.8-284.4         224.7   405.0    3.16   1.41e-06  pass
+  split                            247.5    241.1-276.8         216.3   416.4    3.25   1.41e-06  pass
+  merged                           252.0    246.4-257.8         219.6   409.0    3.20   1.41e-06  pass
+  bm256: 0.634x vs tuned asm vs_psx_64x256 (with sort), 0.605x without sort; 0.653x vs asm auto
+  bm128: 0.848x vs tuned asm vs_psx_64x256 (with sort), 0.833x without sort; 0.873x vs asm auto
+  small: 1.291x vs tuned asm vs_psx_64x256 (with sort), 1.306x without sort; 1.329x vs asm auto
+  split: 1.327x vs tuned asm vs_psx_64x256 (with sort), 1.356x without sort; 1.366x vs asm auto
+  merged: 1.303x vs tuned asm vs_psx_64x256 (with sort), 1.336x without sort; 1.342x vs asm auto
+GATE {"stage": "T=4096 before sampling", "time": 1794367610.9777591, "bdf": "0000:22:00.0", "activity": [40, 37, 34, 30, 38], "vram_used_mb": 41588, "vram_total_mb": 196592, "power_w": 244, "pids": 12, "pass": false}
+GATE {"stage": "T=4096 round 0", "time": 1794367612.2928398, "bdf": "0000:22:00.0", "activity": [43, 39, 35, 39, 32], "vram_used_mb": 41588, "vram_total_mb": 196592, "power_w": 241, "pids": 12, "pass": false}
+GATE {"stage": "T=4096 round 1", "time": 1794367613.5934713, "bdf": "0000:22:00.0", "activity": [32, 32, 36, 35, 32], "vram_used_mb": 41588, "vram_total_mb": 196592, "power_w": 240, "pids": 12, "pass": false}
+GATE {"stage": "T=4096 round 2", "time": 1794367614.9466388, "bdf": "0000:22:00.0", "activity": [39, 36, 33, 33, 36], "vram_used_mb": 41588, "vram_total_mb": 196592, "power_w": 242, "pids": 12, "pass": false}
+GATE {"stage": "T=4096 round 3", "time": 1794367616.2982113, "bdf": "0000:22:00.0", "activity": [38, 34, 31, 34, 35], "vram_used_mb": 41588, "vram_total_mb": 196592, "power_w": 243, "pids": 12, "pass": false}
+
+T=4096 ep_uniform: 4096 local routes, routes/expert min 128 max 128, 206.2 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         580.8    560.7-608.2         540.2   354.9    1.39   8.13e-06  pass
+  asm vs_32x256                    580.5    567.7-597.5         538.0   355.1    1.39   8.13e-06  pass
+  asm novs_ps_32x256               586.7    575.4-609.0         544.4   351.4    1.37   8.13e-06  pass
+  asm vs_ps_32x256                 586.9    571.9-597.8         545.4   351.3    1.37   8.14e-06  pass
+  asm vs_psx_64x256                533.5    507.3-559.2         492.0   386.4    1.51   8.08e-06  pass
+  asm vs_64x256                    524.2    512.9-537.1         482.6   393.2    1.54   8.13e-06  pass
+  bm256                            543.6    510.0-589.3         508.7   379.3    1.48   1.39e-06  pass
+  bm128                            407.4    384.8-434.4         371.1   506.1    1.98   1.39e-06  pass
+  small                            390.9    376.5-423.3         349.0   527.4    2.06   1.39e-06  pass
+  split                            386.2    357.8-422.1         343.0   533.8    2.09   1.39e-06  pass
+  merged                           384.8    352.8-400.7         344.2   535.8    2.09   1.39e-06  pass
+  bm256: 0.964x vs tuned asm vs_64x256 (with sort), 0.949x without sort; 1.068x vs asm auto
+  bm128: 1.287x vs tuned asm vs_64x256 (with sort), 1.300x without sort; 1.426x vs asm auto
+  small: 1.341x vs tuned asm vs_64x256 (with sort), 1.383x without sort; 1.486x vs asm auto
+  split: 1.357x vs tuned asm vs_64x256 (with sort), 1.407x without sort; 1.504x vs asm auto
+  merged: 1.362x vs tuned asm vs_64x256 (with sort), 1.402x without sort; 1.509x vs asm auto
+GATE {"stage": "T=6144 before sampling", "time": 1794367617.356713, "bdf": "0000:22:00.0", "activity": [34, 29, 35, 34, 32], "vram_used_mb": 42188, "vram_total_mb": 196592, "power_w": 241, "pids": 12, "pass": false}
+GATE {"stage": "T=6144 round 0", "time": 1794367618.7118807, "bdf": "0000:22:00.0", "activity": [32, 36, 33, 30, 33], "vram_used_mb": 42188, "vram_total_mb": 196592, "power_w": 243, "pids": 12, "pass": false}
+GATE {"stage": "T=6144 round 1", "time": 1794367620.0663278, "bdf": "0000:22:00.0", "activity": [37, 34, 32, 32, 34], "vram_used_mb": 42188, "vram_total_mb": 196592, "power_w": 242, "pids": 12, "pass": false}
+GATE {"stage": "T=6144 round 2", "time": 1794367621.5150192, "bdf": "0000:22:00.0", "activity": [33, 36, 33, 31, 30], "vram_used_mb": 42188, "vram_total_mb": 196592, "power_w": 243, "pids": 12, "pass": false}
+GATE {"stage": "T=6144 round 3", "time": 1794367622.8706317, "bdf": "0000:22:00.0", "activity": [36, 32, 30, 35, 14], "vram_used_mb": 42188, "vram_total_mb": 196592, "power_w": 211, "pids": 12, "pass": false}
+
+T=6144 ep_uniform: 6144 local routes, routes/expert min 192 max 192, 309.2 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         785.8    761.3-817.7         735.6   393.5    1.02   8.11e-06  pass
+  asm vs_32x256                    772.6    749.0-803.6         723.8   400.2    1.04   8.14e-06  pass
+  asm novs_ps_32x256               781.3    756.8-808.3         731.6   395.8    1.03   8.15e-06  pass
+  asm vs_ps_32x256                 774.4    759.9-808.4         726.5   399.3    1.04   8.12e-06  pass
+  asm vs_psx_64x256                743.1    724.7-769.4         693.7   416.1    1.08   8.12e-06  pass
+  asm vs_64x256                    723.9    711.6-752.1         672.4   427.2    1.11   8.12e-06  pass
+  bm256                            564.4    543.8-617.0         519.5   547.9    1.43   1.40e-06  pass
+  bm128                            572.8    555.9-626.7         528.3   539.9    1.41   1.40e-06  pass
+  small                            598.6    569.9-661.9         544.3   516.6    1.35   1.40e-06  pass
+  split                            650.1    630.1-684.9         599.5   475.7    1.24   1.40e-06  pass
+  merged                           594.3    578.7-630.7         539.5   520.4    1.36   1.40e-06  pass
+  bm256: 1.283x vs tuned asm vs_64x256 (with sort), 1.294x without sort; 1.392x vs asm auto
+  bm128: 1.264x vs tuned asm vs_64x256 (with sort), 1.273x without sort; 1.372x vs asm auto
+  small: 1.209x vs tuned asm vs_64x256 (with sort), 1.235x without sort; 1.313x vs asm auto
+  split: 1.113x vs tuned asm vs_64x256 (with sort), 1.122x without sort; 1.209x vs asm auto
+  merged: 1.218x vs tuned asm vs_64x256 (with sort), 1.246x without sort; 1.322x vs asm auto
+GATE {"stage": "T=8192 before sampling", "time": 1794367624.0314176, "bdf": "0000:22:00.0", "activity": [31, 34, 33, 31, 29], "vram_used_mb": 42746, "vram_total_mb": 196592, "power_w": 243, "pids": 12, "pass": false}
+GATE {"stage": "T=8192 round 0", "time": 1794367625.4336975, "bdf": "0000:22:00.0", "activity": [37, 31, 27, 33, 31], "vram_used_mb": 42746, "vram_total_mb": 196592, "power_w": 242, "pids": 12, "pass": false}
+GATE {"stage": "T=8192 round 1", "time": 1794367626.8439069, "bdf": "0000:22:00.0", "activity": [39, 36, 35, 34, 36], "vram_used_mb": 42746, "vram_total_mb": 196592, "power_w": 250, "pids": 12, "pass": false}
+GATE {"stage": "T=8192 round 2", "time": 1794367629.2946358, "bdf": "0000:22:00.0", "activity": [18, 13, 12, 7, 32], "vram_used_mb": 47168, "vram_total_mb": 196592, "power_w": 307, "pids": 16, "pass": false}
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775047: No such file or directory
+Unable to open queues directory for process 775045: No such file or directory
+Unable to open queues directory for process 775046: No such file or directory
+Unable to open queues directory for process 775044: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+Unable to open queues directory for process 775082: No such file or directory
+GATE {"stage": "T=8192 round 3", "time": 1794367630.837394, "bdf": "0000:22:00.0", "activity": [84, 94, 49, 23, 8], "vram_used_mb": 48616, "vram_total_mb": 196592, "power_w": 232, "pids": 12, "pass": false}
+
+T=8192 ep_uniform: 8192 local routes, routes/expert min 256 max 256, 412.3 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         939.3    919.1-963.7         887.1   439.0    0.86   8.18e-06  pass
+  asm vs_32x256                    939.2    911.7-991.5         884.5   439.0    0.86   8.15e-06  pass
+  asm novs_ps_32x256               946.1    925.2-975.4         892.7   435.8    0.85   8.15e-06  pass
+  asm vs_ps_32x256                 968.6    942.0-1219.4        912.9   425.7    0.83   8.18e-06  pass
+  asm vs_psx_64x256                957.1    936.9-1268.7        904.5   430.8    0.84   8.14e-06  pass
+  asm vs_64x256                    906.7    898.2-993.4         854.2   454.7    0.89   8.13e-06  pass
+  bm256                            617.8    574.7-717.5         568.8   667.4    1.30   1.41e-06  pass
+  bm128                            627.8    578.8-667.3         578.7   656.8    1.28   1.41e-06  pass
+  small                            656.6    641.5-716.8         598.2   628.0    1.23   1.41e-06  pass
+  split                            646.4    608.8-701.4         591.5   637.9    1.25   1.41e-06  pass (+1 contaminated blocks redone)
+  merged                           638.1    614.5-662.6         579.7   646.1    1.26   1.41e-06  pass
+  bm256: 1.468x vs tuned asm vs_64x256 (with sort), 1.502x without sort; 1.520x vs asm auto
+  bm128: 1.444x vs tuned asm vs_64x256 (with sort), 1.476x without sort; 1.496x vs asm auto
+  small: 1.381x vs tuned asm vs_64x256 (with sort), 1.428x without sort; 1.431x vs asm auto
+  split: 1.403x vs tuned asm vs_64x256 (with sort), 1.444x without sort; 1.453x vs asm auto
+  merged: 1.421x vs tuned asm vs_64x256 (with sort), 1.474x without sort; 1.472x vs asm auto
+GATE {"stage": "end", "time": 1794367631.6862957, "bdf": "0000:22:00.0", "activity": [1, 2, 2, 8, 6], "vram_used_mb": 60961, "vram_total_mb": 196592, "power_w": 226, "pids": 12, "pass": false}
+gates FAIL (results contaminated by other GPU work)

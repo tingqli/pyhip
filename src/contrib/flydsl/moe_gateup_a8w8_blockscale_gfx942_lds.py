@@ -29,6 +29,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -83,12 +84,15 @@ def _lds_dwords(row, column):
 @functools.cache
 def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
     inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, pair_blocks=False, fp8_out=False,
-    big_blocks_only=False, merged=None,
+    big_blocks_only=False, merged=None, bm128=False,
 ):
     """pair_blocks: aligned block pairs of one expert run N-tile-major, so both blocks stream each B tile at the
     same time and share it in L2; other tasks keep the block-major order.
     fp8_out: sorted-row FP8 output with per (row, 128 columns) scales (see the module doc).
     big_blocks_only: skip blocks with no route at row 128, which the small-M kernels take.
+    bm128 (2x4_pf1): a block with no route at row 128 runs a 128-row pipeline in the same workgroup (two stages per
+    K block, no loads, MFMAs or stores for rows 128..255; with fp8_out those rows are not written). Same grid and
+    task order as without it.
     merged: plugin that maps workgroups to tasks itself (merged.task) and runs the blocks with no route at row 128
     in the same launch (merged.body); see docs/record/moe_small_m_gfx942.md. merged.key (str) must change with the
     plugin's code: the FlyDSL kernel cache keys on closure scalars and on sources next to this file only.
@@ -97,6 +101,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
     assert layout in LAYOUTS, layout
     assert not (big_blocks_only and pair_blocks)
     assert merged is None or (fp8_out and not big_blocks_only and not pair_blocks)
+    assert not bm128 or (layout == "2x4_pf1" and not pair_blocks and not big_blocks_only and merged is None)
     merged_key = None if merged is None else merged.key
     assert merged_key is None or isinstance(merged_key, str)
     I, K = inter_dim, hidden_dim
@@ -199,8 +204,11 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 probe = uniform(load_i32(rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), ((task // n_tiles) * SORT_BLOCK_M + SMALL_M_ROWS) * 4))
                 active = active & ((probe & TOKEN_MASK) < num_tokens) & (((probe >> 24) & 255) < topk)
 
-        def big_body():
-            """The BM256 task `task`."""
+        def big_body(tile_rows=SORT_BLOCK_M):
+            """The BM256 task `task`; tile_rows=128: the 128-row pipeline (bm128)."""
+            # 2x4: A packets streamed per K block (4x2 always 4); 16-row M slices per wave.
+            stages = tile_rows // PACKET_ROWS
+            used_slices = m_slices * tile_rows // SORT_BLOCK_M
             sorted_rsrc = rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4))
             expert_rsrc = rsrc_of(pExpertIds, num_blocks * 4)
 
@@ -247,10 +255,10 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
             copy_col = tid % 8
 
             def copy_rows():
-                return [tid // 8 + copy_packet * PACKET_ROWS for copy_packet in range_constexpr(4)]
+                return [tid // 8 + copy_packet * PACKET_ROWS for copy_packet in range_constexpr(stages)]
 
             def slice_lane_rows():
-                return [slice_rows[j] + tid % 16 for j in range_constexpr(m_slices)]
+                return [slice_rows[j] + tid % 16 for j in range_constexpr(used_slices)]
 
             def task_offsets(a_ids, sa_ids):
                 """A copy and scale_a byte offsets of a block's rows."""
@@ -353,9 +361,9 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 rocdl.s_barrier()
                 rocdl.sched_barrier(0)
 
-            # The streamed operand stages all four packets of the next block, the held one two slots.
-            s_stage = fx.make_rmem_tensor(fx.make_layout((4, 4), (1, 4)), fx.Int32)
-            h_stage = fx.make_rmem_tensor(fx.make_layout((4, 2), (1, 4)), fx.Int32)
+            # The streamed operand stages all packets of the next block, the held one two slots (bm128: four).
+            s_stage = fx.make_rmem_tensor(fx.make_layout((4, stages), (1, 4)), fx.Int32)
+            h_stage = fx.make_rmem_tensor(fx.make_layout((4, 2 if stages == 4 else 4), (1, 4)), fx.Int32)
             # held column slice * 2 + half_k for the four held slices of the current block.
             held = fx.make_rmem_tensor(fx.make_layout((4, 8), (1, 4)), fx.Int32)
             # 2x4: scale_a column (stage parity) * 2 + slice-in-stage; 4x2: (block parity) * 4 + slice.
@@ -392,20 +400,25 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
             def held_word(index, half_k, word):
                 return Vec(held[None, index * 2 + half_k].load()).bitcast(fx.Int64)[word]
 
-            last_pair = stage_pairs(3)[3]
+            last_pair = stage_pairs(stages - 1)[3]
 
             def run_k(ops, parity, k_block):
                 # The last block re-fetches clamped blocks so it stays inside the loop body.
                 k_next = (k_block + 1 < KB).select(k_block + 1, KB - 1)
                 previous = last_pair
-                for stage in range_constexpr(4):
+                for stage in range_constexpr(stages):
                     if const_expr(stage == 0):
-                        write_s(3)
-                    else:
+                        write_s(stages - 1)
+                    elif const_expr(stages == 4):
                         write_s(stage - 1)
                         write_h(stage - 1, h_stage[None, (stage - 1) % 2].load())
                         if const_expr(stage == 3):
                             write_h(3, h_stage[None, 1].load())
+                    else:
+                        # bm128: the four B packets of the next block, loaded in stage 0.
+                        write_s(0)
+                        for packet in range_constexpr(4):
+                            write_h(packet, h_stage[None, packet].load())
                     rocdl.sched_barrier(0)
                     if const_expr(stage == 0):
                         read_held()
@@ -417,7 +430,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                     rocdl.sched_barrier(0)
                     if const_expr(stream_a):
                         for next_i in range_constexpr(2):
-                            if const_expr(stage < 3):
+                            if const_expr(stage < stages - 1):
                                 scale_a[None, (stage + 1) % 2 * 2 + next_i].store(ops.load_scale_a(k_block, (stage + 1) * 2 + next_i))
                             else:
                                 scale_a[None, next_i].store(ops.load_scale_a(k_next, next_i))
@@ -425,10 +438,14 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                         for next_j in range_constexpr(4):
                             scale_a[None, (1 - parity) * 4 + next_j].store(ops.load_scale_a(k_next, next_j))
                     load_s(ops, k_next, stage)
-                    if const_expr(stage < 3):
-                        load_h(ops, k_next, stage, stage % 2)
-                    if const_expr(stage == 2):
-                        load_h(ops, k_next, 3, 1)
+                    if const_expr(stages == 4):
+                        if const_expr(stage < 3):
+                            load_h(ops, k_next, stage, stage % 2)
+                        if const_expr(stage == 2):
+                            load_h(ops, k_next, 3, 1)
+                    elif const_expr(stage == 0):
+                        for packet in range_constexpr(4):
+                            load_h(ops, k_next, packet, packet)
                     rocdl.sched_barrier(0)
                     rocdl.s_waitcnt(lgkmcnt=0)
                     barrier()
@@ -595,7 +612,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 row_offsets_out = out_offsets(route_ids(block, slice_lane_rows()), n_tile)
                 finish_k_loop()
                 lanes = output_lanes()
-                for j in range_constexpr(m_slices):
+                for j in range_constexpr(used_slices):
                     for dwords, offset in zip(slice_words(lanes, j), slice_offsets(lanes, row_offsets_out[j])):
                         store(dwords, offset)
 
@@ -607,7 +624,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 return peak
 
             def fp8_epilogue(block, n_tile):
-                # Padding rows (zero A rows) are written too: FP8 zeros with scale 0.
+                # Padding rows of the tile (zero A rows) are written too: FP8 zeros with scale 0.
                 finish_k_loop()
                 values = [
                     [
@@ -617,9 +634,9 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                         )
                         for gate in range_constexpr(gate_slices)
                     ]
-                    for m_slice in range_constexpr(m_slices)
+                    for m_slice in range_constexpr(used_slices)
                 ]
-                for m_slice in range_constexpr(m_slices):
+                for m_slice in range_constexpr(used_slices):
                     peak = fx.Float32(0.0)
                     for gate_values in values[m_slice]:
                         for value in gate_values:
@@ -634,7 +651,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                         )
                 rocdl.s_waitcnt(lgkmcnt=0)
                 barrier()
-                for m_slice in range_constexpr(m_slices):
+                for m_slice in range_constexpr(used_slices):
                     row = slice_rows[m_slice] + lane % 16
                     amax = row_max(row)
                     # |x| <= amax keeps x * 240 / amax within the FP8 range after rounding.
@@ -649,7 +666,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                         )
                 rocdl.s_waitcnt(lgkmcnt=0)
                 barrier()
-                for part in range_constexpr(4):
+                for part in range_constexpr(tile_rows // 64):
                     out_row = part * 64 + tid // 8
                     rocdl.raw_ptr_buffer_store(
                         Vec(lds_view(_lds_dwords(out_row, tid % 8)).load()).ir_value(),
@@ -663,7 +680,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 rocdl.raw_ptr_buffer_store(
                     (row_max(scale_row) * (1.0 / FP8_MAX)).ir_value(),
                     fp8_scale_rsrc,
-                    (tid < SORT_BLOCK_M).select(scale_offset, fx.Int32(OOB_OFFSET)).ir_value(),
+                    (tid < tile_rows).select(scale_offset, fx.Int32(OOB_OFFSET)).ir_value(),
                     zero,
                     aux=ir.IntegerAttr.get(T.i32, 0),
                 )
@@ -672,7 +689,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
             expert = pair_expert if pair_blocks else uniform(load_i32(expert_rsrc, block * 4))
             a_offsets, sa_offsets = task_offsets(route_ids(block, copy_rows()), route_ids(block, slice_lane_rows()))
             ops = task_ops(n_tile, expert, a_offsets, sa_offsets, task_scale_b(expert, n_tile))
-            for pro_packet in range_constexpr(4):
+            for pro_packet in range_constexpr(stages):
                 load_s(ops, 0, pro_packet)
             for pair_begin in range_constexpr(0, 4, 2):
                 for pro_packet in range_constexpr(pair_begin, pair_begin + 2):
@@ -682,7 +699,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 rocdl.sched_barrier(0)
             for pro_slice in range_constexpr(2 if stream_a else 4):
                 scale_a[None, pro_slice].store(ops.load_scale_a(0, pro_slice))
-            for pro_packet in range_constexpr(4):
+            for pro_packet in range_constexpr(stages):
                 write_s(pro_packet)
             start_k_loop()
             k_loop(ops)
@@ -704,6 +721,17 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                     big_body()
                 else:
                     merged.body(small_ctx(), merged_task.block, merged_task.tile)
+        elif const_expr(bm128):
+            if active:
+                # Valid routes are a prefix of the block: no route at row 128 leaves rows 128..255 empty.
+                bottom_id = uniform(load_i32(rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), ((task // n_tiles) * SORT_BLOCK_M + SMALL_M_ROWS) * 4))
+                if ((bottom_id & TOKEN_MASK) < num_tokens) & (((bottom_id >> 24) & 255) < topk):
+                    big_body()
+                    # Distinct last instructions: SimplifyCFG must not sink the two pipelines' common tail into one block.
+                    llvm.inline_asm(None, [], "; bm256 task", "", has_side_effects=True)
+                else:
+                    big_body(SMALL_M_ROWS)
+                    llvm.inline_asm(None, [], "; bm128 task", "", has_side_effects=True)
         else:
             if active:
                 big_body()
@@ -742,7 +770,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
 
 def moe_gateup_a8w8_blockscale_gfx942_lds(
     a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out, layout="2x4_pf1", xcd_swizzle=True,
-    pair_blocks=False, out_scale_t=None, topk=None, big_blocks_only=False,
+    pair_blocks=False, out_scale_t=None, topk=None, big_blocks_only=False, bm128=False,
 ):
     """a[T,K] fp8, w1[E,2I,K] fp8 shuffle_weight(16,16), a_scale_t[K/128,T], w1_scale[E,2I/128,K/128] fp32.
 
@@ -751,6 +779,8 @@ def moe_gateup_a8w8_blockscale_gfx942_lds(
     pair_blocks=True orders tasks so that consecutive blocks share each B tile in L2.
     With out_scale_t (pass topk too): out is the Down kernel's sorted-row FP8 input [blocks * 256, I] and
     out_scale_t its FP32 scales [I/128, blocks * 256].
+    bm128=True (2x4_pf1): blocks with at most 128 routes run the 128-row pipeline; their sorted rows 128..255 of the
+    FP8 output are not written.
     """
     tokens, hidden_dim = a.shape
     num_experts, two_inter, _ = w1.shape
@@ -768,7 +798,8 @@ def moe_gateup_a8w8_blockscale_gfx942_lds(
     validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts, fp8_out)
     assert sorted_ids.numel() >= num_blocks * SORT_BLOCK_M
     launch = compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out, bool(big_blocks_only)
+        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out, bool(big_blocks_only),
+        bm128=bool(bm128),
     )
     run_compiled(
         launch,

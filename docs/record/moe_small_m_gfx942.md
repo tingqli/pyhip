@@ -3,7 +3,8 @@
 本文记录三版实现和一次运行时选路的尝试。**当前默认路径是 §8 的方案 A**（merged）：`fused_moe_a8w8_blockscale_gfx942_sort` /
 `_mixed` 默认 `big_blocks="merged"`，每个 stage 一次 launch，有第 128 行的 block 走 BM256 tile，其余走 8-wave pair 任务
 （`src/contrib/flydsl/moe_merged_a8w8_blockscale_gfx942.py`）；`"split"` 是方案 B，`"bm256"` 是第三版（§7：4 wave、每 CU 2 个
-workgroup、128×256 输出 tile 的 small-M kernel 加 BM256 kernel，两次 launch）。§6 是第二版（4 wave、与 BM256 共用 256 行 sort 表、
+workgroup、128×256 输出 tile 的 small-M kernel 加 BM256 kernel，两次 launch）。aiter 入口 `fused_moe_a8w8_blockscale_gfx942`
+（BM256 + `single_store`）的 GateUp / Down 内加了 128 行分支（`bm128`，默认开，grid 不变，§9）。§6 是第二版（4 wave、与 BM256 共用 256 行 sort 表、
 在 kernel 内按 block 选择路径），§1–§5 是第一版（8 wave、128 行 sort、host 端按 shape 选择）的分析与优化过程，roofline
 部分各版通用；前两版源码作为对照保存在
 [docs/experiment/moe_small_m_gfx942/4wave/variants/](../experiment/moe_small_m_gfx942/4wave/variants/)。
@@ -12,7 +13,8 @@ workgroup、128×256 输出 tile 的 small-M kernel 加 BM256 kernel，两次 la
 第二版 [docs/experiment/moe_small_m_gfx942/4wave/README.md](../experiment/moe_small_m_gfx942/4wave/README.md)，
 第三版 [docs/experiment/moe_small_m_gfx942/4wave_128/README.md](../experiment/moe_small_m_gfx942/4wave_128/README.md)，
 §8 [docs/experiment/moe_small_m_gfx942/merged/README.md](../experiment/moe_small_m_gfx942/merged/README.md)、
-[docs/experiment/moe_small_m_gfx942/split/README.md](../experiment/moe_small_m_gfx942/split/README.md)。
+[docs/experiment/moe_small_m_gfx942/split/README.md](../experiment/moe_small_m_gfx942/split/README.md)，
+§9 [docs/experiment/moe_small_m_gfx942/bm128/README.md](../experiment/moe_small_m_gfx942/bm128/README.md)。
 代码：
 
 - [src/contrib/flydsl/moe_small_m_a8w8_blockscale_gfx942.py](../../src/contrib/flydsl/moe_small_m_a8w8_blockscale_gfx942.py)：
@@ -24,13 +26,22 @@ workgroup、128×256 输出 tile 的 small-M kernel 加 BM256 kernel，两次 la
   各自跳过对方的 block，`"split"` 时全部由 small-M 处理）、`fused_moe_a8w8_blockscale_gfx942_sort`（sort + mixed）。
 - [src/contrib/flydsl/moe_gateup_a8w8_blockscale_gfx942_lds.py](../../src/contrib/flydsl/moe_gateup_a8w8_blockscale_gfx942_lds.py)、
   [src/contrib/flydsl/moe_down_a8w8_blockscale_gfx942_lds.py](../../src/contrib/flydsl/moe_down_a8w8_blockscale_gfx942_lds.py)：
-  BM256 kernel 的 `big_blocks_only`，以及方案 A 用的 `merged=` hook。
+  BM256 kernel 的 `big_blocks_only`、`bm128`（§9），以及方案 A 用的 `merged=` hook。
 - [tests/contrib/moe/test_moe_small_m_gfx942.py](../../tests/contrib/moe/test_moe_small_m_gfx942.py)、
   [tests/contrib/moe/bench_moe_small_m_gfx942.py](../../tests/contrib/moe/bench_moe_small_m_gfx942.py)、
   [tests/contrib/moe/roofline_probe_gfx942.py](../../tests/contrib/moe/roofline_probe_gfx942.py)、
   [tests/contrib/moe/gpu_contention.py](../../tests/contrib/moe/gpu_contention.py)。
 
 ## 0. 结论
+
+### BM256 kernel 内的 128 行分支（§9，aiter 路径）
+
+- grid、workgroup、任务顺序与 aiter 路径的 BM256 相同；block 的第 128 行无 route 时，GateUp / Down 跑 128 行
+  流水线。`fused_moe_a8w8_blockscale_gfx942` 默认开启，aiter 侧不用改。BM256 的 K 循环 opcode 不变。
+- 相对 tuned asm（含 sort）：T ≤ 2048 从 0.55–0.79× 提到 0.83–1.03×；ep_uniform T=4096 从 1.04× 提到 1.28×；
+  T ≥ 6144 与 BM256 持平或更好（ep_uniform T=12288 1.61×）。
+- T ≤ 2048 的速度只有各点最好路径（small / split / merged，asm 的 1.15–1.44×）的 0.64–0.75 倍；random T=8192 为
+  merged 的 0.89–0.90 倍。
 
 ### 运行时按 block 选路（§8）
 
@@ -668,7 +679,89 @@ kernel 中位数（µs，持续态）。"两次 launch" 是 small-M + BM256 两�
   - BM256 的 GateUp / Down 测试（`test_gateup_a8w8_blockscale_gfx942.py`、`test_down_a8w8_blockscale_gfx942.py`）：118 passed。
 - `bench_moe_small_m_gfx942.py` 加 `--paths merged` 和 `k: gateup_merged` / `k: down_merged`。实验目录的 tools 仍对应
   run4 的版本。
-- `src` 版本的性能还没有重测：提交时 8 张 GPU 都被外部任务占满（100%、约 740 W），bench 的空闲检查不通过。
-  与 run4 版本的差别只在扫描（每个线程多一个 probe、多一个 ballot 位平面）和上界，待 GPU 空闲后用
-  `--paths asm bm256 small split merged` 复测。
+- `src` 版本的性能在 §9 的会话（2026-11-11）中复测：与 run4 相比，tuned asm 的倍数在 −5%…+7% 之内（例如 ep T=256
+  突发态 1.288× vs 1.280×，random T=8192 突发态 1.327× vs 1.313×，ep T=4096 突发态 1.412× vs 1.319×）。
+
+## 9. BM256 kernel 内的 128 行分支（`bm128`，aiter 路径）
+
+数据与复现：[docs/experiment/moe_small_m_gfx942/bm128/README.md](../experiment/moe_small_m_gfx942/bm128/README.md)。
+
+### 9.1 动机
+
+- §6–§8 的 small-M、split、merged 都有自己的 workgroup 形状或 grid：4-wave、每 CU 两个 workgroup，或者 kernel 内
+  的任务扫描。接入 aiter 要改 aiter 那一侧的路径。
+- aiter 的 GateUp 已有同类做法：luocheng25/aiter 3bc0b50（"gemm1: per-block BM256/BM128 dual pipeline in the GateUp
+  kernel"，gfx950）。
+- 本节把这个做法用到 gfx942 的 GateUp 和 Down：grid、workgroup（8 wave、64 KiB LDS）、任务顺序都与 aiter 路径的
+  BM256 相同，只在 kernel 内多一个 128 行分支。
+
+### 9.2 实现（`bm128=True`：GateUp 2x4_pf1，Down 4x2_pf1 atomic）
+
+- 每个 workgroup 读自己 block 第 128 行的 sorted ID（一次 uniform load）。该行无效时 block 至多 128 个 route，跑
+  128 行流水线；否则跑原 BM256 流水线。代码上是 `big_body()` 和 `big_body(128)` 两份。
+- GateUp（A 流式、B 驻留）：
+  - 每个 K block 2 个 stage（原来 4 个），只读 A packet 0、1；每个 wave 只算 M slice 0..3。
+  - 下一个 K block 的 4 个 B packet 在 stage 0 发出，stage 1 写入 LDS。
+  - FP8 epilogue 只写 0..127 行；128..255 行不写（Down 从不读 padding 行）。
+- Down（A 驻留、B 流式）：只读 A packet 0、1；每个 stage 4 个 MFMA pair 中只算 2 个（M slice 0、1）；每个 K block
+  仍是 4 个 stage。
+- 两条流水线末尾各放一条不同的空 inline asm。没有它时，LLVM SimplifyCFG 把两份 Down epilogue 的公共尾部下沉到同一个
+  block：atomic 的 SGPR 基址（`"s"` 操作数）变成存在 VGPR 里的 phi，`v_readfirstlane` 读到被覆盖的值，GPU 访存错误
+  （地址 0x14000）。
+- `fused_moe_a8w8_blockscale_gfx942` 默认 `bm128=True`，aiter 侧的调用不用改。
+- 机器码（MiMo 形状）：
+  - `bm128=False` 时 `22_final_isa.s` 与上一个 commit 逐字节相同：GateUp FP8、Down atomic sorted（有无
+    `single_store`）、route counts、zero rows。
+  - `bm128=True` 时 BM256 的 K 循环与原 kernel opcode 相同（GateUp 743 条、Down 708 条 / 2 个 K block）；128 行 K 循环
+    分别为 399 条和 406 条。
+  - VGPR 250 / 246 不变，无 spill；SGPR 54 → 72、61 → 69。
+- 测试（共 199 passed、1 skipped）：
+  - GateUp BF16 输出加 bm128 配置；Down 加两个 bm128 配置。
+  - `test_gateup_down_bm128`：六种 block 构成（全部 ≤128、恰好 128、恰好 129、混合、MiMo EP8 每 expert ~64 / ~128）。
+    bm128 GateUp 计算的行与 BM256 逐位相同，其余行不写；Down 开或关 bm128 都通过参考。
+  - `test_fused_entry`：aiter sort 加 `fused_moe_a8w8_blockscale_gfx942`，T = 64 / 1000 / 4096 / 8192，bm128 开、关。
+
+### 9.3 结果（相对 tuned asm，含 sort；2026-11-11 GPU1，gates 全部通过）
+
+| | T | 256 | 512 | 1024 | 2048 | 4096 | 6144 | 8192 |
+|---|---|---|---|---|---|---|---|---|
+| ep_uniform 持续态 | bm256 | 0.619× | 0.631× | 0.685× | 0.710× | 1.041× | 1.355× | 1.641× |
+| | bm128 | 0.841× | 0.859× | 0.878× | 0.911× | 1.277× | 1.353× | 1.655× |
+| | merged | 1.250× | 1.139× | 1.251× | 1.213× | 1.360× | 1.290× | 1.545× |
+| random 持续态 | bm256 | 0.619× | 0.648× | 0.647× | 0.792× | 1.081× | 1.321× | 1.231× |
+| | bm128 | 0.836× | 0.858× | 0.877× | 1.007× | 1.044× | 1.331× | 1.234× |
+| | merged | 1.275× | 1.278× | 1.180× | 1.340× | 1.030× | 1.310× | 1.393× |
+| ep_uniform 突发态 | bm128 | 0.842× | 0.857× | 0.888× | 0.924× | 1.263× | 1.258× | 1.563× |
+| random 突发态 | bm128 | 0.826× | 0.859× | 0.839× | 1.030× | 1.043× | 1.241× | 1.196× |
+
+大 T（持续态）：ep_uniform T=12288 / 16384 / 32768 为 1.611× / 1.569× / 1.618×（bm256 1.388× / 1.578× / 1.623×）；
+random 为 1.433× / 1.560× / 1.458×（bm256 1.330× / 1.547× / 1.443×）。
+
+- 与 bm256 比（时间）：
+  - T ≤ 2048：0.65–0.79。
+  - ep_uniform T=4096（每个 block 恰好 128 个 route）：0.76–0.82；ep_uniform T=12288（每个 expert 256 + 128）：0.86。
+  - 其余点 0.93–1.005。
+  - 例外是 random T=4096 持续态：路径上 1.036，但两个 kernel 单测都更快（GateUp 289.5 vs 298.4 µs，Down 159.5 vs
+    163.2 µs）。这一点的路径样本与前一个被测变体有关；突发态同一点是 0.967。
+- 与各点最好的路径比：
+  - T ≤ 2048：0.64–0.75。small、split、merged 在这一段是 asm 的 1.15–1.44×。
+  - T = 4096：0.88–0.95。
+  - T ≥ 6144：差距 ≤ 1.2%，只有 random T=8192 例外（0.886 / 0.901，merged 最好）。
+- kernel（T ≤ 2048，持续态）：
+  - GateUp：bm128 190–213 µs，BM256 261–289 µs，small-M / merged 127–167 µs。
+  - Down：bm128 109–123 µs，BM256 144–156 µs，small-M / merged 66–96 µs。
+- T ≤ 2048 剩下差距的可能来源（推断，未单独测量）：
+  - 同一 grid 下每个 CU 只驻留一个 8-wave workgroup（64 KiB LDS）。
+  - ≤ 128 个 route 的 block 仍按 128 行计算：T=256 时每个 expert 8 行，94% 是 padding。
+  - B 每个 K block 经 LDS 读入寄存器。
+  - 对照之下，small-M / merged 每 CU 两个 4-wave workgroup，并按 16 行 slice 在 1..8 个之间选。
+
+### 9.4 对 aiter 的意义
+
+- aiter hook 调用的入口没变，默认即走 bm128。
+- 与 asm 的交点：
+  - aiter 的 `AITER_FMOE_FP8_BLOCKSCALE_FLYDSL_MIN_TOKENS` 默认 4096。
+  - bm128 在 T=2048 时：random 是 asm 的 1.007× / 1.030×，ep_uniform 是 0.911× / 0.924×。
+  - T ≤ 1024 时为 0.83–0.89×。
+  - 因此阈值保持 4096；random 类负载可以降到 2048。
 

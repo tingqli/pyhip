@@ -1,0 +1,987 @@
+GATE {"stage": "entry", "time": 1794367967.2522345, "bdf": "0000:22:00.0", "activity": [0, 0, 0, 0, 0], "vram_used_mb": 787, "vram_total_mb": 196592, "power_w": 187, "pids": 11, "pass": true}
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+ENV {"gpu": "AMD Instinct MI300X", "arch": "gfx942:sramecc+:xnack-", "cus": 304, "torch": "2.11.0+rocm7.2", "hip": "7.2.26015", "flydsl": "0.4.0"}
+HBM probe: 4.95 TB/s median (1 GiB nontemporal read)
+[aiter] import [module_moe_sorting_opus] under /sgl-workspace/aiter/aiter/jit/module_moe_sorting_opus.so
+[aiter] LoadKernel: _ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256.co
+[aiter] LoadKernel: _ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256.co
+[aiter] LoadKernel: _ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co
+[aiter] LoadKernel: _ZN5aiter43fmoe_bf16_blockscaleFp8_g1u1_vs_silu_64x256E hsaco: /sgl-workspace/aiter/hsa//gfx942/fmoe/silu/fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_64x256.co
+GATE {"stage": "T=256 before sampling", "time": 1794367978.850344, "bdf": "0000:22:00.0", "activity": [14, 12, 16, 15, 15], "vram_used_mb": 4665, "vram_total_mb": 196592, "power_w": 240, "pids": 12, "pass": false}
+GATE {"stage": "T=256 round 0", "time": 1794367980.0892532, "bdf": "0000:22:00.0", "activity": [16, 23, 25, 23, 21], "vram_used_mb": 5117, "vram_total_mb": 196592, "power_w": 241, "pids": 12, "pass": false}
+GATE {"stage": "T=256 round 1", "time": 1794367981.3267481, "bdf": "0000:22:00.0", "activity": [29, 28, 24, 28, 27], "vram_used_mb": 5745, "vram_total_mb": 196592, "power_w": 244, "pids": 12, "pass": false}
+GATE {"stage": "T=256 round 2", "time": 1794367982.6111536, "bdf": "0000:22:00.0", "activity": [16, 19, 22, 24, 25], "vram_used_mb": 6861, "vram_total_mb": 196592, "power_w": 237, "pids": 12, "pass": false}
+GATE {"stage": "T=256 round 3", "time": 1794367983.8566878, "bdf": "0000:22:00.0", "activity": [7, 3, 1, 0, 12], "vram_used_mb": 10616, "vram_total_mb": 196592, "power_w": 244, "pids": 12, "pass": false}
+
+T=256 ep_uniform: 256 local routes, routes/expert min 8 max 8, 12.9 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         259.0    251.3-263.3         245.8    49.8    3.11   8.13e-06  pass
+  asm vs_32x256                    260.9    254.8-269.1         248.3    49.4    3.09   8.15e-06  pass
+  asm novs_ps_32x256               260.4    253.1-279.5         247.5    49.5    3.09   8.21e-06  pass
+  asm vs_ps_32x256                 259.6    254.0-275.9         246.8    49.6    3.10   8.10e-06  pass
+  asm vs_psx_64x256                259.9    254.9-265.1         247.3    49.6    3.10   8.10e-06  pass
+  asm vs_64x256                    265.0    258.6-290.5         251.5    48.6    3.04   8.13e-06  pass
+  bm256                            455.8    445.8-483.5         441.1    28.3    1.77   1.38e-06  pass
+  bm128                            309.9    295.3-332.0         295.7    41.6    2.60   1.38e-06  pass
+  small                            200.7    198.1-205.7         188.6    64.2    4.01   1.38e-06  pass
+  split                            197.3    194.0-200.3         185.1    65.3    4.08   1.38e-06  pass
+  merged                           202.0    197.9-205.5         189.9    63.8    3.99   1.38e-06  pass
+  bm256: 0.568x vs tuned asm auto (with sort), 0.557x without sort; 0.568x vs asm auto
+  bm128: 0.836x vs tuned asm auto (with sort), 0.831x without sort; 0.836x vs asm auto
+  small: 1.291x vs tuned asm auto (with sort), 1.303x without sort; 1.291x vs asm auto
+  split: 1.313x vs tuned asm auto (with sort), 1.328x without sort; 1.313x vs asm auto
+  merged: 1.282x vs tuned asm auto (with sort), 1.294x without sort; 1.282x vs asm auto
+GATE {"stage": "T=512 before sampling", "time": 1794367984.785277, "bdf": "0000:22:00.0", "activity": [23, 23, 18, 18, 20], "vram_used_mb": 11018, "vram_total_mb": 196592, "power_w": 250, "pids": 12, "pass": false}
+GATE {"stage": "T=512 round 0", "time": 1794367986.0352168, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 14365, "vram_total_mb": 196592, "power_w": 201, "pids": 12, "pass": true}
+GATE {"stage": "T=512 round 1", "time": 1794367987.2914119, "bdf": "0000:22:00.0", "activity": [15, 37, 27, 14, 9], "vram_used_mb": 40431, "vram_total_mb": 196592, "power_w": 249, "pids": 12, "pass": false}
+GATE {"stage": "T=512 round 2", "time": 1794367988.5531025, "bdf": "0000:22:00.0", "activity": [4, 2, 1, 5, 7], "vram_used_mb": 40434, "vram_total_mb": 196592, "power_w": 236, "pids": 12, "pass": false}
+GATE {"stage": "T=512 round 3", "time": 1794367989.828087, "bdf": "0000:22:00.0", "activity": [14, 16, 23, 8, 16], "vram_used_mb": 40438, "vram_total_mb": 196592, "power_w": 236, "pids": 12, "pass": false}
+
+T=512 ep_uniform: 512 local routes, routes/expert min 16 max 16, 25.8 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         272.2    266.3-276.7         255.4    94.7    2.96   8.10e-06  pass
+  asm vs_32x256                    272.7    266.8-281.6         256.7    94.5    2.95   8.12e-06  pass
+  asm novs_ps_32x256               273.9    264.9-281.7         257.0    94.1    2.94   8.15e-06  pass
+  asm vs_ps_32x256                 271.0    263.6-276.7         254.3    95.1    2.97   8.17e-06  pass
+  asm vs_psx_64x256                267.3    263.2-275.0         250.0    96.4    3.01   8.12e-06  pass
+  asm vs_64x256                    274.6    269.0-284.3         257.1    93.8    2.93   8.05e-06  pass
+  bm256                            475.9    461.7-503.7         457.0    54.1    1.69   1.37e-06  pass
+  bm128                            334.7    309.3-366.9         314.6    77.0    2.41   1.37e-06  pass
+  small                            207.1    203.4-211.6         191.9   124.4    3.89   1.37e-06  pass
+  split                            201.1    198.4-209.1         186.3   128.1    4.00   1.37e-06  pass
+  merged                           206.1    202.4-210.9         190.7   125.0    3.91   1.37e-06  pass
+  bm256: 0.562x vs tuned asm vs_psx_64x256 (with sort), 0.547x without sort; 0.572x vs asm auto
+  bm128: 0.799x vs tuned asm vs_psx_64x256 (with sort), 0.795x without sort; 0.813x vs asm auto
+  small: 1.291x vs tuned asm vs_psx_64x256 (with sort), 1.303x without sort; 1.314x vs asm auto
+  split: 1.329x vs tuned asm vs_psx_64x256 (with sort), 1.342x without sort; 1.353x vs asm auto
+  merged: 1.297x vs tuned asm vs_psx_64x256 (with sort), 1.311x without sort; 1.321x vs asm auto
+GATE {"stage": "T=1024 before sampling", "time": 1794367990.777389, "bdf": "0000:22:00.0", "activity": [26, 23, 24, 19, 25], "vram_used_mb": 40737, "vram_total_mb": 196592, "power_w": 243, "pids": 12, "pass": false}
+GATE {"stage": "T=1024 round 0", "time": 1794367992.0453513, "bdf": "0000:22:00.0", "activity": [43, 43, 38, 34, 36], "vram_used_mb": 40737, "vram_total_mb": 196592, "power_w": 246, "pids": 12, "pass": false}
+GATE {"stage": "T=1024 round 1", "time": 1794367993.3123348, "bdf": "0000:22:00.0", "activity": [40, 35, 40, 43, 41], "vram_used_mb": 40737, "vram_total_mb": 196592, "power_w": 245, "pids": 12, "pass": false}
+GATE {"stage": "T=1024 round 2", "time": 1794367994.5771832, "bdf": "0000:22:00.0", "activity": [39, 42, 46, 47, 46], "vram_used_mb": 40737, "vram_total_mb": 196592, "power_w": 245, "pids": 12, "pass": false}
+GATE {"stage": "T=1024 round 3", "time": 1794367995.8201067, "bdf": "0000:22:00.0", "activity": [44, 44, 48, 48, 47], "vram_used_mb": 40737, "vram_total_mb": 196592, "power_w": 246, "pids": 12, "pass": false}
+
+T=1024 ep_uniform: 1024 local routes, routes/expert min 32 max 32, 51.5 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         288.7    282.7-295.5         269.4   178.5    2.79   8.10e-06  pass
+  asm vs_32x256                    291.0    284.5-296.5         271.0   177.1    2.77   8.10e-06  pass
+  asm novs_ps_32x256               290.3    285.5-294.2         270.4   177.5    2.77   8.15e-06  pass
+  asm vs_ps_32x256                 288.9    285.5-295.8         268.6   178.4    2.79   8.08e-06  pass
+  asm vs_psx_64x256                285.6    280.3-293.2         264.4   180.4    2.82   8.12e-06  pass
+  asm vs_64x256                    291.6    286.6-296.6         269.8   176.8    2.76   8.15e-06  pass
+  bm256                            492.2    463.2-530.4         470.2   104.7    1.64   1.38e-06  pass
+  bm128                            331.5    317.0-358.7         310.4   155.5    2.43   1.38e-06  pass
+  small                            215.7    212.6-220.3         198.9   238.9    3.73   1.38e-06  pass
+  split                            211.6    208.1-217.5         194.6   243.5    3.80   1.38e-06  pass
+  merged                           214.0    211.0-218.5         196.8   240.9    3.76   1.38e-06  pass
+  bm256: 0.580x vs tuned asm vs_psx_64x256 (with sort), 0.562x without sort; 0.587x vs asm auto
+  bm128: 0.862x vs tuned asm vs_psx_64x256 (with sort), 0.852x without sort; 0.871x vs asm auto
+  small: 1.324x vs tuned asm vs_psx_64x256 (with sort), 1.329x without sort; 1.338x vs asm auto
+  split: 1.350x vs tuned asm vs_psx_64x256 (with sort), 1.358x without sort; 1.364x vs asm auto
+  merged: 1.335x vs tuned asm vs_psx_64x256 (with sort), 1.344x without sort; 1.349x vs asm auto
+GATE {"stage": "T=2048 before sampling", "time": 1794367996.7252533, "bdf": "0000:22:00.0", "activity": [44, 47, 49, 48, 48], "vram_used_mb": 41033, "vram_total_mb": 196592, "power_w": 245, "pids": 12, "pass": false}
+GATE {"stage": "T=2048 round 0", "time": 1794367997.9843826, "bdf": "0000:22:00.0", "activity": [46, 49, 46, 46, 45], "vram_used_mb": 41033, "vram_total_mb": 196592, "power_w": 246, "pids": 12, "pass": false}
+GATE {"stage": "T=2048 round 1", "time": 1794367999.2522464, "bdf": "0000:22:00.0", "activity": [49, 49, 46, 45, 42], "vram_used_mb": 41033, "vram_total_mb": 196592, "power_w": 245, "pids": 12, "pass": false}
+GATE {"stage": "T=2048 round 2", "time": 1794368000.516232, "bdf": "0000:22:00.0", "activity": [47, 43, 41, 37, 43], "vram_used_mb": 41033, "vram_total_mb": 196592, "power_w": 246, "pids": 12, "pass": false}
+GATE {"stage": "T=2048 round 3", "time": 1794368001.7730403, "bdf": "0000:22:00.0", "activity": [44, 41, 41, 39, 34], "vram_used_mb": 41033, "vram_total_mb": 196592, "power_w": 246, "pids": 12, "pass": false}
+
+T=2048 ep_uniform: 2048 local routes, routes/expert min 64 max 64, 103.1 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         342.0    335.5-397.0         309.1   301.4    2.35   8.16e-06  pass
+  asm vs_32x256                    350.0    338.6-413.7         315.2   294.5    2.30   8.16e-06  pass
+  asm novs_ps_32x256               381.0    339.1-396.0         343.1   270.6    2.11   8.19e-06  pass
+  asm vs_ps_32x256                 344.1    333.8-388.1         310.5   299.6    2.34   8.16e-06  pass
+  asm vs_psx_64x256                330.2    323.9-344.0         296.3   312.2    2.44   8.17e-06  pass
+  asm vs_64x256                    337.2    329.2-351.6         305.4   305.7    2.39   8.17e-06  pass
+  bm256                            520.3    483.6-549.9         488.2   198.1    1.55   1.41e-06  pass
+  bm128                            373.5    350.4-391.7         339.3   276.0    2.16   1.41e-06  pass
+  small                            264.4    254.2-288.8         230.7   389.9    3.05   1.41e-06  pass
+  split                            252.5    244.9-287.3         220.2   408.3    3.19   1.41e-06  pass
+  merged                           250.2    245.0-282.3         219.6   412.0    3.22   1.41e-06  pass
+  bm256: 0.635x vs tuned asm vs_psx_64x256 (with sort), 0.607x without sort; 0.657x vs asm auto
+  bm128: 0.884x vs tuned asm vs_psx_64x256 (with sort), 0.873x without sort; 0.916x vs asm auto
+  small: 1.249x vs tuned asm vs_psx_64x256 (with sort), 1.284x without sort; 1.294x vs asm auto
+  split: 1.308x vs tuned asm vs_psx_64x256 (with sort), 1.345x without sort; 1.355x vs asm auto
+  merged: 1.320x vs tuned asm vs_psx_64x256 (with sort), 1.349x without sort; 1.367x vs asm auto
+GATE {"stage": "T=4096 before sampling", "time": 1794368002.7078614, "bdf": "0000:22:00.0", "activity": [32, 35, 16, 6, 2], "vram_used_mb": 41589, "vram_total_mb": 196592, "power_w": 194, "pids": 12, "pass": false}
+GATE {"stage": "T=4096 round 0", "time": 1794368004.0013561, "bdf": "0000:22:00.0", "activity": [39, 37, 35, 30, 36], "vram_used_mb": 41589, "vram_total_mb": 196592, "power_w": 245, "pids": 12, "pass": false}
+GATE {"stage": "T=4096 round 1", "time": 1794368005.2932796, "bdf": "0000:22:00.0", "activity": [34, 36, 34, 31, 33], "vram_used_mb": 41589, "vram_total_mb": 196592, "power_w": 245, "pids": 12, "pass": false}
+GATE {"stage": "T=4096 round 2", "time": 1794368006.5894241, "bdf": "0000:22:00.0", "activity": [37, 36, 34, 34, 33], "vram_used_mb": 41589, "vram_total_mb": 196592, "power_w": 245, "pids": 12, "pass": false}
+GATE {"stage": "T=4096 round 3", "time": 1794368008.9839494, "bdf": "0000:22:00.0", "activity": [10, 12, 17, 18, 21], "vram_used_mb": 42374, "vram_total_mb": 196592, "power_w": 258, "pids": 12, "pass": false}
+
+T=4096 ep_uniform: 4096 local routes, routes/expert min 128 max 128, 206.2 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         591.8    567.2-613.3         551.9   348.3    1.36   8.12e-06  pass (+1 contaminated blocks redone)
+  asm vs_32x256                    600.9    573.8-616.9         558.6   343.1    1.34   8.16e-06  pass
+  asm novs_ps_32x256               596.8    579.7-649.3         555.3   345.4    1.35   8.12e-06  pass
+  asm vs_ps_32x256                 603.8    580.1-662.2         562.5   341.4    1.33   8.12e-06  pass
+  asm vs_psx_64x256                540.7    522.4-703.1         500.2   381.3    1.49   8.13e-06  pass
+  asm vs_64x256                    532.6    513.5-586.1         491.1   387.1    1.51   8.12e-06  pass
+  bm256                            555.6    526.7-630.5         520.5   371.0    1.45   1.39e-06  pass
+  bm128                            417.5    387.4-459.9         380.1   493.7    1.93   1.39e-06  pass
+  small                            382.7    375.5-412.8         342.4   538.7    2.10   1.39e-06  pass
+  split                            406.0    355.4-427.3         362.3   507.8    1.98   1.39e-06  pass
+  merged                           400.4    360.9-418.4         359.0   514.9    2.01   1.39e-06  pass
+  bm256: 0.959x vs tuned asm vs_64x256 (with sort), 0.944x without sort; 1.065x vs asm auto
+  bm128: 1.275x vs tuned asm vs_64x256 (with sort), 1.292x without sort; 1.417x vs asm auto
+  small: 1.392x vs tuned asm vs_64x256 (with sort), 1.434x without sort; 1.546x vs asm auto
+  split: 1.312x vs tuned asm vs_64x256 (with sort), 1.356x without sort; 1.458x vs asm auto
+  merged: 1.330x vs tuned asm vs_64x256 (with sort), 1.368x without sort; 1.478x vs asm auto
+GATE {"stage": "T=6144 before sampling", "time": 1794368009.9984095, "bdf": "0000:22:00.0", "activity": [23, 41, 17, 8, 3], "vram_used_mb": 47006, "vram_total_mb": 196592, "power_w": 242, "pids": 20, "pass": false}
+Unable to open queues directory for process 831629: No such file or directory
+Unable to open queues directory for process 831629: No such file or directory
+Unable to open queues directory for process 831629: No such file or directory
+Unable to open queues directory for process 831629: No such file or directory
+Unable to open queues directory for process 831629: No such file or directory
+Unable to open queues directory for process 831629: No such file or directory
+Unable to open queues directory for process 831629: No such file or directory
+Unable to open KFD process directory for process 831642: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+Unable to open queues directory for process 831642: No such file or directory
+Unable to open queues directory for process 831660: No such file or directory
+Unable to open queues directory for process 831659: No such file or directory
+Unable to open queues directory for process 831657: No such file or directory
+Unable to open queues directory for process 831645: No such file or directory
+Unable to open queues directory for process 831658: No such file or directory
+Unable to open queues directory for process 831646: No such file or directory
+GATE {"stage": "T=6144 round 0", "time": 1794368011.935844, "bdf": "0000:22:00.0", "activity": [8, 3, 1, 0, 0], "vram_used_mb": 48316, "vram_total_mb": 196592, "power_w": 214, "pids": 12, "pass": false}
+GATE {"stage": "T=6144 round 1", "time": 1794368014.3437774, "bdf": "0000:22:00.0", "activity": [3, 1, 0, 0, 0], "vram_used_mb": 165944, "vram_total_mb": 196592, "power_w": 157, "pids": 12, "pass": false}
+GATE {"stage": "T=6144 round 2", "time": 1794368015.6992824, "bdf": "0000:22:00.0", "activity": [5, 2, 1, 0, 0], "vram_used_mb": 166548, "vram_total_mb": 196592, "power_w": 188, "pids": 12, "pass": false}
+GATE {"stage": "T=6144 round 3", "time": 1794368017.0518556, "bdf": "0000:22:00.0", "activity": [5, 2, 2, 1, 0], "vram_used_mb": 166846, "vram_total_mb": 196592, "power_w": 191, "pids": 12, "pass": false}
+
+T=6144 ep_uniform: 6144 local routes, routes/expert min 192 max 192, 309.2 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         790.9    769.1-820.2         741.7   391.0    1.02   8.16e-06  pass (+1 contaminated blocks redone)
+  asm vs_32x256                    782.1    751.3-808.7         730.8   395.4    1.03   8.12e-06  pass
+  asm novs_ps_32x256               784.6    763.8-821.4         735.9   394.1    1.03   8.15e-06  pass
+  asm vs_ps_32x256                 792.6    776.7-827.7         744.1   390.2    1.02   8.18e-06  pass
+  asm vs_psx_64x256                738.7    724.5-757.1         688.9   418.6    1.09   8.16e-06  pass
+  asm vs_64x256                    736.2    720.6-757.1         684.8   420.0    1.09   8.14e-06  pass
+  bm256                            604.9    547.6-1401.8        555.4   511.2    1.33   1.40e-06  pass
+  bm128                            593.3    560.7-1418.9        544.7   521.2    1.36   1.40e-06  pass
+  small                            613.6    577.0-1840.1        559.0   504.0    1.31   1.40e-06  pass
+  split                            678.7    653.1-1376.6        625.4   455.7    1.19   1.40e-06  pass
+  merged                           593.2    572.3-637.8         538.9   521.3    1.36   1.40e-06  pass
+  bm256: 1.217x vs tuned asm vs_64x256 (with sort), 1.233x without sort; 1.308x vs asm auto
+  bm128: 1.241x vs tuned asm vs_64x256 (with sort), 1.257x without sort; 1.333x vs asm auto
+  small: 1.200x vs tuned asm vs_64x256 (with sort), 1.225x without sort; 1.289x vs asm auto
+  split: 1.085x vs tuned asm vs_64x256 (with sort), 1.095x without sort; 1.165x vs asm auto
+  merged: 1.241x vs tuned asm vs_64x256 (with sort), 1.271x without sort; 1.333x vs asm auto
+GATE {"stage": "T=8192 before sampling", "time": 1794368018.0517852, "bdf": "0000:22:00.0", "activity": [4, 2, 1, 1, 0], "vram_used_mb": 167432, "vram_total_mb": 196592, "power_w": 190, "pids": 12, "pass": false}
+GATE {"stage": "T=8192 round 0", "time": 1794368019.4545674, "bdf": "0000:22:00.0", "activity": [4, 2, 1, 0, 0], "vram_used_mb": 167433, "vram_total_mb": 196592, "power_w": 191, "pids": 12, "pass": false}
+Unable to open KFD process directory for process 832552: No such file or directory
+Unable to open queues directory for process 832553: No such file or directory
+GATE {"stage": "T=8192 round 1", "time": 1794368020.8643472, "bdf": "0000:22:00.0", "activity": [4, 3, 2, 2, 5], "vram_used_mb": 167483, "vram_total_mb": 196592, "power_w": 229, "pids": 19, "pass": false}
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832557: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832557: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832557: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832557: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832557: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+Unable to open queues directory for process 832557: No such file or directory
+Unable to open queues directory for process 832555: No such file or directory
+Unable to open queues directory for process 832556: No such file or directory
+GATE {"stage": "T=8192 round 2", "time": 1794368023.157157, "bdf": "0000:22:00.0", "activity": [4, 2, 1, 0, 0], "vram_used_mb": 167484, "vram_total_mb": 196592, "power_w": 191, "pids": 20, "pass": false}
+GATE {"stage": "T=8192 round 3", "time": 1794368024.5600193, "bdf": "0000:22:00.0", "activity": [9, 16, 18, 20, 20], "vram_used_mb": 167696, "vram_total_mb": 196592, "power_w": 244, "pids": 20, "pass": false}
+
+T=8192 ep_uniform: 8192 local routes, routes/expert min 256 max 256, 412.3 GFLOP, weights 768 MiB
+  variant                      median us        p10-p90 us no-sort us  TFLOPS TB/s(w)  calc_diff  check
+  asm auto                         953.3    924.3-974.4         900.0   432.5    0.84   8.17e-06  pass
+  asm vs_32x256                    945.3    925.4-967.5         892.4   436.2    0.85   8.17e-06  pass
+  asm novs_ps_32x256               955.3    932.0-970.4         900.6   431.6    0.84   8.14e-06  pass
+  asm vs_ps_32x256                 952.5    928.3-976.5         899.6   432.9    0.85   8.20e-06  pass
+  asm vs_psx_64x256                938.6    910.6-970.9         889.4   439.3    0.86   8.14e-06  pass
+  asm vs_64x256                    918.6    908.8-933.6         868.8   448.8    0.88   8.18e-06  pass
+  bm256                            600.4    568.8-634.5         555.1   686.7    1.34   1.41e-06  pass
+  bm128                            605.3    581.4-642.6         558.5   681.2    1.33   1.41e-06  pass
+  small                            633.5    619.2-670.9         576.4   650.9    1.27   1.41e-06  pass
+  split                            645.5    633.2-693.0         591.8   638.7    1.25   1.41e-06  pass
+  merged                           636.2    607.2-671.8         578.4   648.1    1.27   1.41e-06  pass
+  bm256: 1.530x vs tuned asm vs_64x256 (with sort), 1.565x without sort; 1.588x vs asm auto
+  bm128: 1.518x vs tuned asm vs_64x256 (with sort), 1.556x without sort; 1.575x vs asm auto
+  small: 1.450x vs tuned asm vs_64x256 (with sort), 1.507x without sort; 1.505x vs asm auto
+  split: 1.423x vs tuned asm vs_64x256 (with sort), 1.468x without sort; 1.477x vs asm auto
+  merged: 1.444x vs tuned asm vs_64x256 (with sort), 1.502x without sort; 1.499x vs asm auto
+GATE {"stage": "end", "time": 1794368025.4314916, "bdf": "0000:22:00.0", "activity": [1, 2, 1, 0, 0], "vram_used_mb": 164015, "vram_total_mb": 196592, "power_w": 208, "pids": 20, "pass": false}
+gates FAIL (results contaminated by other GPU work)

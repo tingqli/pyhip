@@ -55,7 +55,10 @@ def prepare(tokens, clones):
 
     if not getattr(fused, "_bench_pair_blocks", False):
         gateup = fused.moe_gateup_a8w8_blockscale_gfx942_lds
-        fused.moe_gateup_a8w8_blockscale_gfx942_lds = lambda *a, **kw: gateup(*a, pair_blocks=_pair_blocks["on"], **kw)
+        # pair_blocks runs the BM256 pipeline on every block (no bm128).
+        fused.moe_gateup_a8w8_blockscale_gfx942_lds = lambda *a, **kw: gateup(
+            *a, pair_blocks=_pair_blocks["on"], **{**kw, "bm128": kw.get("bm128", False) and not _pair_blocks["on"]}
+        )
         fused._bench_pair_blocks = True
     os.environ[f"{ENV}_MIN_TOKENS"] = "1"
     inputs = make_inputs(tokens, I, H, TOPK, E, EP, "balanced")

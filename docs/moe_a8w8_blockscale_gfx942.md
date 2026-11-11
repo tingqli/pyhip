@@ -14,7 +14,9 @@
      - **B（`single_store=True`）**：本卡只有1路的token直接`global_store_dword`。`moe_route_counts`统计每个token的本地路数，`moe_zero_rows`只清零count≠1的行；sort不再清零`out`（传一个空的moe_buf）。
 - 对手：aiter `fmoe_fp8_blockscale_g1u1`，gfx942上的1-stage asm，GateUp、SiLU、量化、Down在一个kernel里。输入和`aiter.fused_moe`在gfx942上喂给它的一样：预先量化好的FP8 a1加转置的scale。激活量化两边都不计时。
 - "调优后的asm"：CSV里所有kernel实测最快的那个，tuner也是这样选的。
-- 每个本地expert ≤128行（T ≤ 4K）时BM256 tile一半以上是padding：`fused_moe_a8w8_blockscale_gfx942_sort`用256行sort表，GateUp/Down各一次launch（默认`big_blocks="merged"`），kernel内看每个block的第128行：有效（>128个route）的block走BM256 tile，其余走8-wave pair任务；`"bm256"`/`"split"`为4-wave small-M kernel的两种做法，见[record/moe_small_m_gfx942.md](record/moe_small_m_gfx942.md)。
+- 每个本地expert ≤128行（T ≤ 4K）时BM256 tile一半以上是padding：
+  - aiter入口`fused_moe_a8w8_blockscale_gfx942`默认`bm128=True`：grid与workgroup不变，GateUp/Down在kernel内读每个block的第128行，无route时跑128行流水线（GateUp每K block 2个stage，Down只算两个M slice）。T≤2048相对tuned asm从0.55–0.79×提到0.83–1.03×，ep_uniform T=4096从1.04×到1.28×，见[record §9](record/moe_small_m_gfx942.md)。
+  - `fused_moe_a8w8_blockscale_gfx942_sort`用256行sort表，GateUp/Down各一次launch（默认`big_blocks="merged"`），kernel内看每个block的第128行：有效（>128个route）的block走BM256 tile，其余走8-wave pair任务；`"bm256"`/`"split"`为4-wave small-M kernel的两种做法，见[record/moe_small_m_gfx942.md](record/moe_small_m_gfx942.md)。
 
 ## 2. 结果
 

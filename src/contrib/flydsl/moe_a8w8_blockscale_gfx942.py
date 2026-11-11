@@ -60,12 +60,13 @@ def unsupported_reason(tokens, hidden_dim, inter_dim, topk, local_experts):
 
 def fused_moe_a8w8_blockscale_gfx942(
     a1, a1_scale_t, w1, w1_scale, w2, w2_scale, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out, topk,
-    num_rows=None, single_store=True,
+    num_rows=None, single_store=True, bm128=True,
 ):
     """out [tokens, H] BF16 = sum over each token's local routes of routing weight * Down(SiLU(gate) * up).
 
     num_rows: optional device int32 tensor with the valid token count (EP all-to-all receive buffers); rows of out
     at or past it are left untouched. single_store=False adds every route with BF16 atomics into a zeroed out.
+    bm128: sorted blocks with at most 128 routes run the 128-row pipelines of both kernels (same grids).
     """
     tokens = a1.shape[0]
     inter_dim = w2.shape[2]
@@ -83,11 +84,11 @@ def fused_moe_a8w8_blockscale_gfx942(
         out.zero_()
     moe_gateup_a8w8_blockscale_gfx942_lds(
         a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, layout=GATEUP_LAYOUT,
-        out_scale_t=a2_scale_t, topk=topk,
+        out_scale_t=a2_scale_t, topk=topk, bm128=bm128,
     )
     moe_down_a8w8_blockscale_gfx942_lds(
         a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, layout=DOWN_LAYOUT,
-        reduce="atomic", zero_out=False, topk=topk, single_store=single_store, route_counts=route_counts,
+        reduce="atomic", zero_out=False, topk=topk, single_store=single_store, route_counts=route_counts, bm128=bm128,
     )
     return out
 

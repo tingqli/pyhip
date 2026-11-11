@@ -222,8 +222,9 @@ def check_fp8_sorted(inputs, a2, a2_scale_t, sentinel):
         dict(layout="4x2_pf1", xcd_swizzle=False),
         dict(layout="2x4_pf1", pair_blocks=True),
         dict(layout="4x2_pf1", pair_blocks=True),
+        dict(layout="2x4_pf1", bm128=True),
     ],
-    ids=["lds-2x4", "lds-4x2", "lds-4x2-linear", "lds-2x4-pair", "lds-4x2-pair"],
+    ids=["lds-2x4", "lds-4x2", "lds-4x2-linear", "lds-2x4-pair", "lds-4x2-pair", "lds-2x4-bm128"],
 )
 def test_gateup(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks, config):
     if not is_gfx942():

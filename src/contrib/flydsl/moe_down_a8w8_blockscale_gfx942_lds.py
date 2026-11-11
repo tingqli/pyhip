@@ -79,15 +79,18 @@ def _rsrc_of(ptr, num_records_bytes):
 @functools.cache
 def compile_moe_down_a8w8_blockscale_gfx942_lds(
     hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False,
-    big_blocks_only=False, merged=None,
+    big_blocks_only=False, merged=None, bm128=False,
 ):
     """merged: plugin that maps workgroups to tasks itself (merged.task) and runs the blocks with no route at row 128
     in the same launch (merged.body); see docs/record/moe_small_m_gfx942.md. merged.key (str) must change with the
-    plugin's code: the FlyDSL kernel cache keys on closure scalars and on sources next to this file only."""
+    plugin's code: the FlyDSL kernel cache keys on closure scalars and on sources next to this file only.
+    bm128 (4x2_pf1, atomic): a block with no route at row 128 runs a 128-row pipeline in the same workgroup (A rows
+    128..255 neither loaded nor multiplied). Same grid and task order as without it."""
     validate_parameters(1, hidden_dim, inter_dim, topk, num_experts, sorted_a2=sorted_a2)
     assert layout in LAYOUTS, layout
     assert atomic or not single_store
     assert merged is None or (atomic and sorted_a2 and not single_store and not big_blocks_only)
+    assert not bm128 or (layout == "4x2_pf1" and atomic and not big_blocks_only and merged is None)
     merged_key = None if merged is None else merged.key
     assert merged_key is None or isinstance(merged_key, str)
     H, K = hidden_dim, inter_dim
@@ -194,8 +197,11 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                 probe = uniform(load_i32(_rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), ((task // n_tiles) * SORT_BLOCK_M + SMALL_M_ROWS) * 4))
                 active = active & ((probe & TOKEN_MASK) < num_tokens) & (((probe >> 24) & 255) < topk)
 
-        def big_body():
-            """The BM256 task `task`."""
+        def big_body(tile_rows=SORT_BLOCK_M):
+            """The BM256 task `task`; tile_rows=128: the 128-row pipeline (bm128)."""
+            # 4x2: A packets held per K block, one M slice per wave each (2x4 always 4 and 8).
+            held_packets = 4 if stream_a else tile_rows // PACKET_ROWS
+            used_slices = m_slices * tile_rows // SORT_BLOCK_M
             zero = fx.Int32(0).ir_value()
             sorted_rsrc = _rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4))
             weight_rsrc = _rsrc_of(pSortedWeights, num_blocks * (SORT_BLOCK_M * 4))
@@ -222,12 +228,12 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                 slice_packet = list(range(4))
                 slice_offset = [0] * 4
             slice_rows = [slice_packet[j] * PACKET_ROWS + slice_offset[j] + wave_m * 16 for j in range_constexpr(m_slices)]
-            lane_rows = [slice_rows[j] + lane % 16 for j in range_constexpr(m_slices)]
+            lane_rows = [slice_rows[j] + lane % 16 for j in range_constexpr(used_slices)]
             copy_row = tid // 8
             copy_col = tid % 8
 
             a_offsets, sa_offsets = [], []
-            copy_rows = [copy_row + copy_packet * PACKET_ROWS for copy_packet in range_constexpr(4)]
+            copy_rows = [copy_row + copy_packet * PACKET_ROWS for copy_packet in range_constexpr(4 if stream_a else held_packets)]
             for row, fused in zip(copy_rows, route_ids(copy_rows)):
                 a_row, _, a_valid = decode(fused)
                 a_row = block * SORT_BLOCK_M + row if sorted_a2 else a_row
@@ -336,8 +342,8 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                     lds_view(a_write + packet * PACKET_DWORDS).store(value)
 
             def read_held():
-                # 2x4: the four N slices of B; 4x2: the four M slices of A.
-                for held_index in range_constexpr(4):
+                # 2x4: the four N slices of B; 4x2: the M slices of A.
+                for held_index in range_constexpr(held_packets):
                     for held_half in range_constexpr(2):
                         value = read_b_slice(held_index, held_half) if stream_a else read_a_slice(held_index, held_half)
                         held[None, held_index * 2 + held_half].store(value)
@@ -345,7 +351,11 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
             def held_word(index, half_k, word):
                 return Vec(held[None, index * 2 + half_k].load()).bitcast(fx.Int64)[word]
 
-            last_pair = stage_pairs(3)[3]
+            def pairs_of(stage):
+                # 4x2 pair i is M slice i.
+                return stage_pairs(stage)[: 4 * tile_rows // SORT_BLOCK_M]
+
+            last_pair = pairs_of(3)[-1]
 
             def run_k(parity, k_block):
                 # The last block re-fetches clamped blocks so it stays inside the loop body.
@@ -356,8 +366,9 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                         write_s(3)
                     else:
                         write_s(stage - 1)
-                        write_h(stage - 1, h_stage[None, (stage - 1) % 2].load())
-                        if const_expr(stage == 3):
+                        if const_expr(stage - 1 < held_packets):
+                            write_h(stage - 1, h_stage[None, (stage - 1) % 2].load())
+                        if const_expr(stage == 3 and held_packets == 4):
                             write_h(3, h_stage[None, 1].load())
                     rocdl.sched_barrier(0)
                     if const_expr(stage == 0):
@@ -375,18 +386,18 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                             else:
                                 scale_a[None, next_i].store(load_scale_a(k_next, next_i))
                     elif const_expr(stage == 0):
-                        for next_j in range_constexpr(4):
+                        for next_j in range_constexpr(used_slices):
                             scale_a[None, (1 - parity) * 4 + next_j].store(load_scale_a(k_next, next_j))
                     load_s(k_next, stage)
-                    if const_expr(stage < 3):
+                    if const_expr(stage < min(3, held_packets)):
                         load_h(k_next, stage, stage % 2)
-                    if const_expr(stage == 2):
+                    if const_expr(stage == 2 and held_packets == 4):
                         load_h(k_next, 3, 1)
                     rocdl.sched_barrier(0)
                     rocdl.s_waitcnt(lgkmcnt=0)
                     barrier()
                     rocdl.s_setprio(3)
-                    for pair_id, (m_slice, n_pair) in enumerate(stage_pairs(stage)):
+                    for pair_id, (m_slice, n_pair) in enumerate(pairs_of(stage)):
                         # Every pair of a stage alternates partial slots: entries pair_id % 2 * 2 + {0, 1}.
                         base, old_base = pair_id % 2 * 2, (pair_id + 1) % 2 * 2
                         for k_step in range_constexpr(4):
@@ -448,13 +459,13 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
             # Prologue: K block 0 into LDS.
             for pro_packet in range_constexpr(4):
                 load_s(0, pro_packet)
-            for pair_begin in range_constexpr(0, 4, 2):
+            for pair_begin in range_constexpr(0, held_packets, 2):
                 for pro_packet in range_constexpr(pair_begin, pair_begin + 2):
                     load_h(0, pro_packet, pro_packet % 2)
                 for pro_packet in range_constexpr(pair_begin, pair_begin + 2):
                     write_h(pro_packet, h_stage[None, pro_packet % 2].load())
                 rocdl.sched_barrier(0)
-            for pro_slice in range_constexpr(2 if stream_a else 4):
+            for pro_slice in range_constexpr(2 if stream_a else used_slices):
                 scale_a[None, pro_slice].store(load_scale_a(0, pro_slice))
             for pro_packet in range_constexpr(4):
                 write_s(pro_packet)
@@ -503,7 +514,7 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                 finish_k_loop()
                 # LLVM does not count the asm atomics: retire every load first so no later vmcnt wait covers them.
                 rocdl.s_waitcnt(vmcnt=0)
-                for j in range_constexpr(m_slices):
+                for j in range_constexpr(used_slices):
                     # Atomic i of a group covers rows 2i (lanes 0-31) and 2i + 1 (lanes 32-63) of slice j.
                     row_offsets = [
                         fx.Int32(rocdl.ds_bpermute(T.i32, ((lane // 32 + 2 * i) * 4).ir_value(), token_offsets[j].ir_value()))
@@ -581,7 +592,7 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                         odd_group.select(right[pair], exchanged[pair]) for pair in range_constexpr(2)
                     ]
 
-                for j in range_constexpr(m_slices):
+                for j in range_constexpr(used_slices):
                     partner = row_swap(row_offsets_out[j])
                     offsets = [low_rows.select(row_offsets_out[j], partner), low_rows.select(partner, row_offsets_out[j])]
                     for c in range_constexpr(col_groups):
@@ -627,6 +638,18 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
                     big_body()
                 else:
                     merged.body(small_ctx(), merged_task.block, merged_task.tile)
+        elif const_expr(bm128):
+            if active:
+                # Valid routes are a prefix of the block: no route at row 128 leaves rows 128..255 empty.
+                bottom_id = uniform(load_i32(_rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), ((task // n_tiles) * SORT_BLOCK_M + SMALL_M_ROWS) * 4))
+                if ((bottom_id & TOKEN_MASK) < num_tokens) & (((bottom_id >> 24) & 255) < topk):
+                    big_body()
+                    # Distinct last instructions: SimplifyCFG must not sink the two pipelines' common tail into one
+                    # block (phis of the atomics' SGPR base miscompile).
+                    llvm.inline_asm(None, [], "; bm256 task", "", has_side_effects=True)
+                else:
+                    big_body(SMALL_M_ROWS)
+                    llvm.inline_asm(None, [], "; bm128 task", "", has_side_effects=True)
         else:
             if active:
                 big_body()
@@ -866,7 +889,7 @@ def moe_zero_rows(out, counts, num_rows=None):
 
 def _launch_down(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, target, inverse, layout, xcd_swizzle,
-    atomic, tokens, topk, route_counts=None, big_blocks_only=False,
+    atomic, tokens, topk, route_counts=None, big_blocks_only=False, bm128=False,
 ):
     sorted_a2 = a2.dim() == 2
     inter_dim = a2.shape[-1]
@@ -879,7 +902,8 @@ def _launch_down(
     single_store = route_counts is not None
     assert not single_store or route_counts.shape == (tokens,) and route_counts.dtype == torch.int32
     launch = compile_moe_down_a8w8_blockscale_gfx942_lds(
-        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store, bool(big_blocks_only)
+        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store, bool(big_blocks_only),
+        bm128=bool(bm128),
     )
     run_compiled(
         launch,
@@ -917,7 +941,7 @@ def moe_down_rows_a8w8_blockscale_gfx942_lds(
 def moe_down_a8w8_blockscale_gfx942_lds(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out,
     layout="2x4_pf1", xcd_swizzle=True, reduce="atomic", zero_out=True, rows=None, inverse=None, topk=None,
-    single_store=False, route_counts=None, big_blocks_only=False,
+    single_store=False, route_counts=None, big_blocks_only=False, bm128=False,
 ):
     """out [tokens, H] BF16 = sum over each token's routes of routing weight * (a2 row @ w2[expert]^T).
 
@@ -929,9 +953,10 @@ def moe_down_a8w8_blockscale_gfx942_lds(
     moe_route_counts, else computed here) and zero_out then clears only the other rows. reduce="kernel": the
     Down kernel writes rows and inverse (optional preallocated buffers), then moe_down_reduce writes out.
     big_blocks_only (atomic): skip blocks with no route at row 128, which the small-M Down takes.
+    bm128 (4x2_pf1, atomic): blocks with at most 128 routes run the 128-row pipeline.
     """
     assert reduce in ("atomic", "kernel"), reduce
-    assert reduce == "atomic" or not big_blocks_only
+    assert reduce == "atomic" or not (big_blocks_only or bm128)
     topk = a2.shape[1] if a2.dim() == 3 else topk
     assert topk is not None, "pass topk with a sorted-row a2"
     if reduce == "atomic":
@@ -945,7 +970,7 @@ def moe_down_a8w8_blockscale_gfx942_lds(
                 out.zero_()
         _launch_down(
             a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, out, layout, xcd_swizzle,
-            True, out.shape[0], topk, route_counts if single_store else None, big_blocks_only,
+            True, out.shape[0], topk, route_counts if single_store else None, big_blocks_only, bm128,
         )
         return out
     if rows is None:

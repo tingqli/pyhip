@@ -153,10 +153,13 @@ def check(out, expected, routed, magnitude):
         dict(layout="2x4_pf1", reduce="kernel", sorted_a2=True),
         dict(layout="4x2_pf1", reduce="atomic", sorted_a2=True, single_store=True),
         dict(layout="2x4_pf1", reduce="atomic", single_store=True),
+        dict(layout="4x2_pf1", reduce="atomic", bm128=True),
+        dict(layout="4x2_pf1", reduce="atomic", sorted_a2=True, single_store=True, bm128=True),
     ],
     ids=[
         "2x4-atomic", "2x4-kernel", "4x2-atomic", "4x2-kernel", "2x4-kernel-linear", "4x2-atomic-linear",
-        "4x2-atomic-sorted", "2x4-kernel-sorted", "4x2-atomic-sorted-single", "2x4-atomic-single",
+        "4x2-atomic-sorted", "2x4-kernel-sorted", "4x2-atomic-sorted-single", "2x4-atomic-single", "4x2-atomic-bm128",
+        "4x2-atomic-sorted-single-bm128",
     ],
 )
 def test_down(tokens, hidden_dim, inter_dim, topk, experts, routing, extra_blocks, config):
@@ -243,6 +246,99 @@ def test_gateup_down_fp8_pipeline(tokens, hidden_dim, inter_dim, topk, experts, 
         run_kernel(inputs, out, sorted_a2=True, layout=down_layout, reduce=reduce, single_store=single_store)
         torch.cuda.synchronize()
         check(out, expected, routed, magnitude)
+
+
+BM128_SHAPES = [
+    # tokens, hidden, inter, topk, experts, routing: every block <= 128 routes, exactly 128 (row 127 the last route),
+    # exactly 129 (BM256 only), mixed around 128 with Down K/128 = 3, MiMo-V2.6-Flash EP8 ranks (~64 and ~128 per expert).
+    (200, 512, 256, 2, 4, "random"),
+    (512, 512, 256, 8, 32, "balanced"),
+    (516, 512, 256, 8, 32, "balanced"),
+    (1000, 768, 384, 4, 32, "random"),
+    (2048, 4096, 2048, 8, 32, "ep8"),
+    (4096, 4096, 2048, 8, 32, "ep8"),
+]
+
+
+@pytest.mark.parametrize("tokens,hidden_dim,inter_dim,topk,experts,routing", BM128_SHAPES)
+def test_gateup_down_bm128(tokens, hidden_dim, inter_dim, topk, experts, routing):
+    """bm128: blocks with no route at row 128 run the 128-row pipelines. GateUp equals the BM256 kernel bit for bit on
+    every row it computes and leaves rows 128..255 of those blocks unwritten; Down (either way) on that output."""
+    if not is_gfx942():
+        pytest.skip("gfx942 kernel")
+    gateup = make_gateup_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=1)
+    inputs = make_inputs(tokens, hidden_dim, inter_dim, topk, experts, routing, extra_blocks=1)
+    assert torch.equal(gateup["sorted_ids"][: -SORT_BLOCK_M], inputs["sorted_ids"][: -SORT_BLOCK_M])
+    capacity = inputs["expert_ids"].numel() * SORT_BLOCK_M
+    results = []
+    for bm128 in (False, True):
+        a2 = torch.full((capacity, inter_dim), 0x55, device="cuda", dtype=torch.uint8)
+        a2_scale_t = torch.full((inter_dim // 128, capacity), float("nan"), device="cuda")
+        run_gateup(gateup, a2.view(dtypes.fp8), out_scale_t=a2_scale_t, topk=topk, layout="2x4_pf1", bm128=bm128)
+        results.append((a2, a2_scale_t))
+    torch.cuda.synchronize()
+    (a2_full, scale_full), (a2, a2_scale_t) = results
+    num_valid = int(inputs["num_valid_ids"][0])
+    probe = inputs["sorted_ids"][:num_valid].view(-1, SORT_BLOCK_M)[:, 128].long()
+    big = ((probe & 0xFFFFFF) < tokens) & ((probe >> 24 & 0xFF) < topk)
+    written = (big[:, None] | (torch.arange(SORT_BLOCK_M, device="cuda") < 128)).view(-1)
+    assert torch.equal(a2[:num_valid][written], a2_full[:num_valid][written])
+    assert (a2[:num_valid][~written] == 0x55).all() and (a2[num_valid:] == 0x55).all()
+    scale, scale_full = a2_scale_t.t()[:num_valid], scale_full.t()[:num_valid]
+    assert torch.equal(scale[written].view(torch.int32), scale_full[written].view(torch.int32))
+    assert scale[~written].isnan().all() and a2_scale_t[:, num_valid:].isnan().all()
+    # The reference reads the same FP8 rows in [tokens, topk] order.
+    ids = inputs["sorted_ids"][:num_valid].long()
+    token, slot = ids & 0xFFFFFF, ids >> 24 & 0xFF
+    positions = ((token < tokens) & (slot < topk)).nonzero().squeeze(1)
+    routed_rows = token[positions] * topk + slot[positions]
+    a2_routed = torch.zeros((tokens * topk, inter_dim), device="cuda", dtype=torch.uint8)
+    a2_routed[routed_rows] = a2[positions]
+    scale_routed = torch.ones((tokens * topk, inter_dim // 128), device="cuda")
+    scale_routed[routed_rows] = a2_scale_t.t()[positions]
+    inputs.update(
+        a2=a2_routed.view(dtypes.fp8).view(tokens, topk, inter_dim),
+        a2_scale_t=scale_routed.t().contiguous(),
+        a2_sorted=a2.view(dtypes.fp8),
+        a2_scale_sorted_t=a2_scale_t,
+    )
+    expected, routed, magnitude = reference(inputs)
+    out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
+    for single_store, bm128 in ((False, True), (True, True), (True, False)):
+        out.fill_(float("nan"))
+        run_kernel(inputs, out, sorted_a2=True, layout="4x2_pf1", reduce="atomic", single_store=single_store, bm128=bm128)
+        torch.cuda.synchronize()
+        check(out, expected, routed, magnitude)
+
+
+@pytest.mark.parametrize("bm128", [False, True])
+@pytest.mark.parametrize("tokens,routing", [(64, "random"), (1000, "random"), (4096, "random"), (8192, "ep_uniform")])
+def test_fused_entry(tokens, routing, bm128):
+    """fused_moe_a8w8_blockscale_gfx942 (what aiter.fused_moe calls) on aiter's EP moe_sorting(256) without zeroing, a
+    MiMo-V2.6-Flash EP8 rank: small blocks only, mixed (T=4096 random) and big blocks only (T=8192)."""
+    import test_fmoe_a8w8_blockscale_asm_gfx942 as asm_t
+    from aiter.fused_moe import moe_sorting
+    from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import fused_moe_a8w8_blockscale_gfx942
+
+    if not is_gfx942():
+        pytest.skip("gfx942 kernel")
+    inter_dim, hidden_dim, topk, experts, ep = 2048, 4096, 8, 32, 8
+    inputs = asm_t.make_inputs(tokens, inter_dim, hidden_dim, topk, experts, ep, routing)
+    expected = asm_t.reference(inputs)
+    out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
+    no_zero = torch.empty((0, 0), device="cuda", dtype=torch.bfloat16)
+    for _ in range(2):
+        out.fill_(float("nan"))
+        sorted_ids, sorted_weights, expert_ids, num_valid_ids, _ = moe_sorting(
+            inputs["topk_ids"], inputs["topk_weights"], experts * ep, hidden_dim, dtypes.bf16, SORT_BLOCK_M,
+            inputs["expert_mask"], output=no_zero,
+        )
+        fused_moe_a8w8_blockscale_gfx942(
+            inputs["a"], inputs["a_scale_t"], inputs["w1"], inputs["w1_scale"], inputs["w2"], inputs["w2_scale"], sorted_ids,
+            sorted_weights, expert_ids, num_valid_ids, out, topk, bm128=bm128,
+        )
+        torch.cuda.synchronize()
+        asm_t.check(inputs, out, expected)
 
 
 def benchmark(args):

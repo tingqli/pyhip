@@ -4,7 +4,9 @@ One EP8 rank of MiMo-V2.6-Flash (hidden 4096, moe_inter 2048, 256 experts, top-8
 test_fmoe_a8w8_blockscale_asm_gfx942.make_inputs. Paths (each writes its own out and is checked after timing):
   asm <k>:       aiter moe_sorting(block_m of k, zeroing out) + the asm kernel k ("sort+asm" in the summary)
   bm256:         moe_sorting(256, no zeroing) + route counts + zero rows + GateUp 2x4_pf1 FP8 + Down 4x2_pf1 single_store
-                 (fused_moe_a8w8_blockscale_gfx942)
+                 (fused_moe_a8w8_blockscale_gfx942 with bm128=False)
+  bm128:         as bm256 with bm128=True (the entry's default): in both kernels a block with no route at row 128 runs
+                 the 128-row pipeline; same grids
   small:         moe_sorting(256, zeroing out) + fused_moe_a8w8_blockscale_gfx942_mixed: sorted blocks with no route at
                  row 128 run the 4-wave small-M GateUp / Down, the others the BM256 ones (big_blocks_only, launched only
                  when tokens > 128); both Downs add with BF16 atomics (the path fused_moe_a8w8_blockscale_gfx942_sort
@@ -46,7 +48,7 @@ def parse_args(argv=None):
     parser.add_argument("--routing", default="ep_uniform", choices=["ep_uniform", "random", "balanced"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--asm", nargs="*", help="asm kernels (default: all host-sorted kernels of the CSV); auto is always kept")
-    parser.add_argument("--paths", nargs="+", default=["asm", "bm256", "small"], choices=["asm", "bm256", "small", "split", "merged"])
+    parser.add_argument("--paths", nargs="+", default=["asm", "bm256", "small"], choices=["asm", "bm256", "bm128", "small", "split", "merged"])
     parser.add_argument("--kernels", action="store_true", help="also time single kernels (sorts, counts, GateUp, Down)")
     parser.add_argument("--ring", type=int, default=2)
     parser.add_argument("--b-aux", type=int, default=2)
@@ -197,12 +199,12 @@ def main(argv=None):
             mark("sort")
             asm_t.run_kernel(c, s, k)
 
-        def path_bm256(c):
+        def path_bm256(c, bm128=False):
             s = sort(256, False)
             mark("sort")
             fused_moe_a8w8_blockscale_gfx942(
                 c["a"], c["a_scale_t"], c["w1"], c["w1_scale"], c["w2"], c["w2_scale"], s["sorted_ids"], s["sorted_weights"],
-                s["sorted_expert_ids"], s["num_valid_ids"], out, TOPK,
+                s["sorted_expert_ids"], s["num_valid_ids"], out, TOPK, bm128=bm128,
             )
 
         def path_small(c, big_blocks="bm256"):
@@ -220,6 +222,8 @@ def main(argv=None):
                 variants[f"asm {k}"] = (None, lambda c, k=k: path_asm(c, k), expected, True)
         if "bm256" in args.paths:
             variants["bm256"] = (None, path_bm256, expected, True)
+        if "bm128" in args.paths:
+            variants["bm128"] = (None, lambda c: path_bm256(c, True), expected, True)
         if "small" in args.paths:
             variants["small"] = (None, path_small, expected, True)
         if "split" in args.paths:
@@ -236,18 +240,18 @@ def main(argv=None):
             counts = torch.empty(tokens, device="cuda", dtype=torch.int32)
             moe_route_counts(s256["sorted_ids"], s256["num_valid_ids"], e256, counts, TOPK)
 
-            def gateup256(c, big_blocks_only):
+            def gateup256(c, big_blocks_only, bm128=False):
                 moe_gateup_a8w8_blockscale_gfx942_lds(
                     c["a"], c["w1"], c["a_scale_t"], c["w1_scale"], s256["sorted_ids"], e256, s256["num_valid_ids"], a2,
-                    layout="2x4_pf1", out_scale_t=a2_scale_t, topk=TOPK, big_blocks_only=big_blocks_only,
+                    layout="2x4_pf1", out_scale_t=a2_scale_t, topk=TOPK, big_blocks_only=big_blocks_only, bm128=bm128,
                 )
 
-            def down256(c, big_blocks_only):
+            def down256(c, big_blocks_only, bm128=False):
                 moe_down_a8w8_blockscale_gfx942_lds(
                     a2, c["w2"], a2_scale_t, c["w2_scale"], s256["sorted_ids"], s256["sorted_weights"], e256,
                     s256["num_valid_ids"], out, layout="4x2_pf1", reduce="atomic", zero_out=False, topk=TOPK,
                     single_store=not big_blocks_only, route_counts=None if big_blocks_only else counts,
-                    big_blocks_only=big_blocks_only,
+                    big_blocks_only=big_blocks_only, bm128=bm128,
                 )
 
             variants["k: sort256NZ"] = (None, lambda c: sort(256, False), None, False)
@@ -256,6 +260,9 @@ def main(argv=None):
             variants["k: zero_rows"] = (None, lambda c: moe_zero_rows(out, counts), None, False)
             variants["k: gateup256"] = (None, lambda c: gateup256(c, False), None, True)
             variants["k: down256"] = (None, lambda c: down256(c, False), None, True)
+            if "bm128" in args.paths:
+                variants["k: gateup_bm128"] = (None, lambda c: gateup256(c, False, True), None, True)
+                variants["k: down_bm128"] = (None, lambda c: down256(c, False, True), None, True)
             if tokens > small.SMALL_M_ROWS:
                 variants["k: gateup256_big"] = (None, lambda c: gateup256(c, True), None, True)
                 variants["k: down256_big"] = (None, lambda c: down256(c, True), None, True)
@@ -395,7 +402,7 @@ def main(argv=None):
             print(f"  {name:28s} {med[name]:9.1f} {spread} {without_sort(name):10.1f} {flops / med[name] / 1e6:7.1f} "
                   f"{weight_bytes / med[name] / 1e6:7.2f}  {diffs.get(name, float('nan')):9.2e}  {checks.get(name, '')}{redo}", flush=True)
         if tuned:
-            for ours in ("bm256", "small", "split", "merged"):
+            for ours in ("bm256", "bm128", "small", "split", "merged"):
                 if ours in med:
                     print(f"  {ours}: {med[tuned] / med[ours]:.3f}x vs tuned {tuned} (with sort), "
                           f"{without_sort(tuned) / without_sort(ours):.3f}x without sort; "
