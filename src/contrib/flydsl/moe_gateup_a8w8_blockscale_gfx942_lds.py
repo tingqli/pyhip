@@ -38,7 +38,7 @@ from .gemm_a8w8_blockscale_gfx942_common import pack_bf16x2_rne
 from .helpers import BufferTensor, run_compiled
 
 SORT_BLOCK_M = 256
-# A block with no route at this row (at most 128 routes) runs the small-M kernels; see big_blocks_only.
+# A block with no route at this row holds at most 128 routes (bm128, merged pair tasks).
 SMALL_M_ROWS = 128
 TILE_N = 128
 TILE_K = 128
@@ -84,12 +84,11 @@ def _lds_dwords(row, column):
 @functools.cache
 def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
     inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, pair_blocks=False, fp8_out=False,
-    big_blocks_only=False, merged=None, bm128=False,
+    merged=None, bm128=False,
 ):
     """pair_blocks: aligned block pairs of one expert run N-tile-major, so both blocks stream each B tile at the
     same time and share it in L2; other tasks keep the block-major order.
     fp8_out: sorted-row FP8 output with per (row, 128 columns) scales (see the module doc).
-    big_blocks_only: skip blocks with no route at row 128, which the small-M kernels take.
     bm128 (2x4_pf1): a block with no route at row 128 runs a 128-row pipeline in the same workgroup (two stages per
     K block, no loads, MFMAs or stores for rows 128..255; with fp8_out those rows are not written). Same grid and
     task order as without it.
@@ -99,9 +98,8 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
     """
     validate_parameters(1, inter_dim, hidden_dim, topk, num_experts)
     assert layout in LAYOUTS, layout
-    assert not (big_blocks_only and pair_blocks)
-    assert merged is None or (fp8_out and not big_blocks_only and not pair_blocks)
-    assert not bm128 or (layout == "2x4_pf1" and not pair_blocks and not big_blocks_only and merged is None)
+    assert merged is None or (fp8_out and not pair_blocks)
+    assert not bm128 or (layout == "2x4_pf1" and not pair_blocks and merged is None)
     merged_key = None if merged is None else merged.key
     assert merged_key is None or isinstance(merged_key, str)
     I, K = inter_dim, hidden_dim
@@ -200,9 +198,6 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
             else:
                 task = pid
                 active = task < num_tasks
-            if const_expr(big_blocks_only):
-                probe = uniform(load_i32(rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), ((task // n_tiles) * SORT_BLOCK_M + SMALL_M_ROWS) * 4))
-                active = active & ((probe & TOKEN_MASK) < num_tokens) & (((probe >> 24) & 255) < topk)
 
         def big_body(tile_rows=SORT_BLOCK_M):
             """The BM256 task `task`; tile_rows=128: the 128-row pipeline (bm128)."""
@@ -770,7 +765,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
 
 def moe_gateup_a8w8_blockscale_gfx942_lds(
     a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out, layout="2x4_pf1", xcd_swizzle=True,
-    pair_blocks=False, out_scale_t=None, topk=None, big_blocks_only=False, bm128=False,
+    pair_blocks=False, out_scale_t=None, topk=None, bm128=False,
 ):
     """a[T,K] fp8, w1[E,2I,K] fp8 shuffle_weight(16,16), a_scale_t[K/128,T], w1_scale[E,2I/128,K/128] fp32.
 
@@ -798,8 +793,7 @@ def moe_gateup_a8w8_blockscale_gfx942_lds(
     validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts, fp8_out)
     assert sorted_ids.numel() >= num_blocks * SORT_BLOCK_M
     launch = compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out, bool(big_blocks_only),
-        bm128=bool(bm128),
+        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out, bm128=bool(bm128),
     )
     run_compiled(
         launch,

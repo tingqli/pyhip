@@ -1,8 +1,9 @@
 # Option B: the small-M kernels on every block (`all_blocks`, `big_blocks="split"`)
 
-Record: [docs/record/moe_small_m_gfx942.md §8](../../../record/moe_small_m_gfx942.md). The current code (dense task
-list, v2) is measured together with option A in [../merged/](../merged/README.md); this directory holds the first
-version (v1) and the A/B runs that led to v2.
+Record: [docs/record/moe_small_m_gfx942.md §8](../../../record/moe_small_m_gfx942.md). The dense-task-list version
+(v2) is measured together with option A in [../merged/](../merged/README.md); this directory holds the first
+version (v1) and the A/B runs that led to v2. Option B and the small-M module were removed from `src` afterwards
+(record §10); v2 is in commit da764f5.
 
 - **v1** (source no longer in the tree, hashes in `sources.sha256`): `compile_moe_small_m(all_blocks=True)` with tasks
   (block, N tile, row half), the row half fastest; a half-1 task exits at once unless the block has a route at row 128.

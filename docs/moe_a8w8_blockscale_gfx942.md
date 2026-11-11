@@ -16,7 +16,7 @@
 - "调优后的asm"：CSV里所有kernel实测最快的那个，tuner也是这样选的。
 - 每个本地expert ≤128行（T ≤ 4K）时BM256 tile一半以上是padding：
   - aiter入口`fused_moe_a8w8_blockscale_gfx942`默认`bm128=True`：grid与workgroup不变，GateUp/Down在kernel内读每个block的第128行，无route时跑128行流水线（GateUp每K block 2个stage，Down只算两个M slice）。T≤2048相对tuned asm从0.55–0.79×提到0.83–1.03×，ep_uniform T=4096从1.04×到1.28×，见[record §9](record/moe_small_m_gfx942.md)。
-  - `fused_moe_a8w8_blockscale_gfx942_sort`用256行sort表，GateUp/Down各一次launch（默认`big_blocks="merged"`），kernel内看每个block的第128行：有效（>128个route）的block走BM256 tile，其余走8-wave pair任务；`"bm256"`/`"split"`为4-wave small-M kernel的两种做法，见[record/moe_small_m_gfx942.md](record/moe_small_m_gfx942.md)。
+  - `fused_moe_a8w8_blockscale_gfx942_sort`用256行sort表（sort清零out），GateUp/Down各一次launch，kernel内看每个block的第128行：有效（>128个route）的block走BM256 tile，其余走8-wave pair任务（merged），见[record/moe_small_m_gfx942.md](record/moe_small_m_gfx942.md)。原来的4-wave small-M kernel与`big_blocks="bm256"`/`"split"`已删除（record §10）。
 
 ## 2. 结果
 

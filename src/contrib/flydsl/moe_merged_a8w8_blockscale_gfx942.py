@@ -5,11 +5,12 @@
 moe_small_m_gfx942.md §8, option A): the BM256 kernels in their merged mode run every sorted block, a block with a
 route at row 128 as BM256 tasks (256 rows x one N tile) and the others as pair tasks.
 
-- Pair task (emit_pair): one 8-wave workgroup takes a block with at most 128 routes and two adjacent N tiles. Half h
-  (waves 4 h .. 4 h + 3) computes N tile 2 p + h as a workgroup of the 4-wave small-M kernel does
-  (moe_small_m_a8w8_blockscale_gfx942: every wave 4 x 16 weight rows, run-time slice count, light register layout for
-  7 or 8 slices, GateUp's FP8 per (row, 128 columns) output, Down's BF16 atomics). The A tile and its scales are
-  loaded once for both halves, by all 512 threads; all 8 waves share the barriers.
+- Pair task (emit_pair): one 8-wave workgroup takes a block with at most 128 routes and two adjacent N tiles; half h
+  (waves 4 h .. 4 h + 3) computes N tile 2 p + h. Every wave owns 4 x 16 weight rows and streams them from global
+  memory straight into VGPRs (shuffle_weight(16,16) is MFMA-ready); the A tile and its scales go through LDS, loaded
+  once for both halves by all 512 threads; all 8 waves share the barriers. The K loop exists for 1 to 8 sixteen-row
+  slices and a block takes the smallest that covers its routes (the light register layout for 7 or 8). GateUp writes
+  SiLU(gate) * up as FP8 per (row, 128 columns), Down adds with BF16 atomics. Design history: the record, §6-§8.
 - Task list (merged_plugin): every workgroup scans the row-128 IDs of the valid blocks (ballot + mbcnt prefix) and
   takes a slot of a dense list, per XCD the BM256 tasks first, then the pair tasks; workgroups past the last slot
   skip the scan. The grid follows the sort capacity.
@@ -728,8 +729,8 @@ def merged_plugin(mode, n_dim, k_dim, topk, num_experts):
 
 def moe_gateup_merged(a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, a2_scale, topk):
     """GateUp of every block in one launch (BM256 2x4_pf1 tiles for blocks with a route at row 128, pair tasks for the
-    others); a2 [blocks * 256, I] FP8 and a2_scale [I/128, blocks * 256] as
-    moe_small_m_a8w8_blockscale_gfx942.moe_gateup_small_m."""
+    others); a2 [blocks * 256, I] FP8 and a2_scale [I/128, blocks * 256] as the BM256 GateUp's fp8_out (rows a pair
+    task does not use are not written)."""
     from .moe_gateup_a8w8_blockscale_gfx942_lds import compile_moe_gateup_a8w8_blockscale_gfx942_lds
 
     tokens, hidden_dim = a.shape

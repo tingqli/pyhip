@@ -2,6 +2,9 @@
 
 过程与结论见 [docs/record/moe_small_m_gfx942.md](../../record/moe_small_m_gfx942.md)。本目录只放数据、复现命令和由数据直接得出的表。
 
+4-wave small-M kernel、`big_blocks` 选项、BM256 的 `big_blocks_only` 和 bench 的 small / split 路径已从代码中删除（record
+§10）：本目录和各子目录里用到它们的工具要在 commit da764f5 上运行。
+
 **本页是第一版**（8 wave、128 行 sort、host 端按 shape 选择）的数据。当前代码是第三版（4 wave、256 行 sort 表内分支、每个
 workgroup 128×256 输出 tile），数据在 [4wave_128/README.md](4wave_128/README.md)；第二版（GateUp 64 列）与两版的同会话对照在
 [4wave/README.md](4wave/README.md)。第一版源码保存在

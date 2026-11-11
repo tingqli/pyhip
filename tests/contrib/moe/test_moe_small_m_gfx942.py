@@ -1,6 +1,6 @@
-"""Correctness of the 4-wave small-M FP8 block-scale MoE kernels on gfx942: 256-row sort blocks with no route at row
-128 run the small-M kernels, the others the BM256 kernels (big_blocks_only) or, with all_blocks, the small-M kernels
-as two 128-row tasks; and of the merged kernels (one launch per stage: BM256 tiles and 8-wave pair tasks)."""
+"""Correctness of the merged FP8 block-scale MoE path on gfx942 (fused_moe_a8w8_blockscale_gfx942_mixed / _sort): one
+GateUp and one Down launch over a 256-row sort table, BM256 tiles for the blocks with a route at row 128 and 8-wave
+pair tasks for the others."""
 
 import argparse
 
@@ -98,17 +98,17 @@ def dequant_blocks(weight, scale):
     return (weight.float().view(n // 128, 128, k // 128, 128) * scale[:, None, :, None]).view(n, k)
 
 
-def small_positions(inputs, all_blocks=False):
-    """Valid sorted positions in [0, num_valid) of the blocks the small-M kernels take (no route at row 128, or all
-    with all_blocks), and the mask of those blocks' positions."""
+def valid_positions(inputs):
+    """Mask of the routed sorted positions in [0, num_valid)."""
     tokens, _, _, topk, _ = inputs["shape"]
     num_valid = int(inputs["num_valid_ids"][0])
     ids = inputs["sorted_ids"][:num_valid].long()
-    valid = ((ids & 0xFFFFFF) < tokens) & ((ids >> 24 & 0xFF) < topk)
-    small_block = ~valid.view(-1, BLOCK_M)[:, SMALL_ROWS]
-    if all_blocks:
-        small_block = torch.ones_like(small_block)
-    return valid & small_block.repeat_interleave(BLOCK_M), small_block.repeat_interleave(BLOCK_M)
+    return ((ids & 0xFFFFFF) < tokens) & ((ids >> 24 & 0xFF) < topk)
+
+
+def big_rows(inputs):
+    """Mask of the positions in [0, num_valid) of the blocks with a route at row 128 (the BM256 tasks)."""
+    return valid_positions(inputs).view(-1, BLOCK_M)[:, SMALL_ROWS].repeat_interleave(BLOCK_M)
 
 
 def gateup_reference(inputs):
@@ -132,95 +132,35 @@ def gateup_reference(inputs):
     return rows, scale
 
 
-def run_gateup(inputs, a2, a2_scale, **kw):
-    from pyhip.contrib.flydsl.moe_small_m_a8w8_blockscale_gfx942 import moe_gateup_small_m
-
-    return moe_gateup_small_m(
-        inputs["a"], inputs["w1"], inputs["a_scale_t"], inputs["w1_scale"], inputs["sorted_ids"], inputs["expert_ids"],
-        inputs["num_valid_ids"], a2, a2_scale, inputs["shape"][3], **kw,
-    )
-
-
-def check_gateup(inputs, a2, a2_scale, sentinel, all_blocks=False):
-    """a2_scale [I/128, capacity] as the kernel writes it."""
+def check_gateup(inputs, a2, a2_scale, sentinel):
+    """Every routed row of a2 against the reference; a2_scale [I/128, capacity] as the kernel writes it. The capacity
+    past the valid blocks is left alone."""
     rows, scale = gateup_reference(inputs)
     num_valid = rows.shape[0]
-    small, small_block = small_positions(inputs, all_blocks)
-    assert small.any(), "no small-M block in this case"
+    valid = valid_positions(inputs)
     row_scale = a2_scale.t()
-    kernel_scale = row_scale[:num_valid][small]
-    torch.testing.assert_close(kernel_scale, scale[small], rtol=1e-4, atol=0)
-    got = a2[:num_valid][small]
+    kernel_scale = row_scale[:num_valid][valid]
+    torch.testing.assert_close(kernel_scale, scale[valid], rtol=1e-4, atol=0)
+    got = a2[:num_valid][valid]
     dequant = (got.float().view(-1, scale.shape[1], SCALE_COLUMNS) * kernel_scale[:, :, None]).view(got.shape[0], -1)
-    diff = pyhip.calc_diff(dequant, rows[small])
+    diff = pyhip.calc_diff(dequant, rows[valid])
     assert diff < 1e-3, f"calc_diff {diff}"
     # Requantized with the kernel's scales, only FP32 rounding differences may flip an FP8 rounding.
     fp8_max = torch.finfo(dtypes.fp8).max
-    requant = (rows[small].view(got.shape[0], -1, SCALE_COLUMNS) / kernel_scale[:, :, None].clamp_min(1e-30))
+    requant = (rows[valid].view(got.shape[0], -1, SCALE_COLUMNS) / kernel_scale[:, :, None].clamp_min(1e-30))
     requant = requant.clamp(-fp8_max, fp8_max).to(dtypes.fp8).view(got.shape)
     mismatch = (requant.view(torch.uint8) != got.view(torch.uint8)).float().mean().item()
     assert mismatch < 0.01, f"FP8 mismatch {mismatch:.4f}"
-    # The BM256 blocks and the capacity past the valid blocks are left alone.
-    assert (a2[:num_valid][~small_block].view(torch.uint8) == sentinel).all()
     assert (a2[num_valid:].view(torch.uint8) == sentinel).all()
-    assert row_scale[:num_valid][~small_block].isnan().all() and row_scale[num_valid:].isnan().all()
+    assert row_scale[num_valid:].isnan().all()
     return diff
 
 
-GATEUP_SHAPES = [
-    # tokens, inter, hidden, topk, experts, routing, extra blocks
-    (200, 256, 512, 2, 4, "random", 2),
-    # ~300 / ~275 routes per expert: a BM256 block and a small-M block each.
-    (600, 256, 512, 2, 4, "random", 1),
-    (1100, 256, 512, 4, 16, "random", 0),
-    (64, 128, 512, 8, 32, "balanced", 1),
-    (512, 2048, 4096, 8, 32, "random", 1),
-    (1024, 2048, 4096, 8, 32, "ep_uniform", 0),
-    (4096, 2048, 4096, 8, 32, "ep_uniform", 2),
-    (2048, 2048, 4096, 8, 32, "ep8", 1),
-]
-
-# Blocks with a route at row 128, for all_blocks: rows 128..255 partly used (~200 and 192 routes per expert), full
-# blocks with small tails (~300, ~275), and full blocks only (512).
-SPLIT_SHAPES = [
-    (400, 256, 512, 2, 4, "random", 1),
-    (600, 256, 512, 2, 4, "random", 1),
-    (1100, 256, 512, 4, 16, "random", 0),
-    (6144, 2048, 4096, 8, 32, "ep_uniform", 1),
-    (2048, 2048, 4096, 8, 32, "random", 0),
-]
-
-
-@pytest.mark.parametrize(
-    "tokens,inter_dim,hidden_dim,topk,experts,routing,extra_blocks,all_blocks",
-    [shape + (False,) for shape in GATEUP_SHAPES] + [shape + (True,) for shape in SPLIT_SHAPES],
-)
-def test_gateup_small_m(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks, all_blocks):
-    if not is_gfx942():
-        pytest.skip("gfx942 kernel")
-    if (hidden_dim // 128) % 2:
-        pytest.skip("the K loop is unrolled by 2: K / 128 must be even")
-    inputs = make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=extra_blocks)
-    capacity = inputs["expert_ids"].numel() * BLOCK_M
-    a2 = torch.empty((capacity, inter_dim), device="cuda", dtype=torch.uint8)
-    a2_scale = torch.empty((inter_dim // SCALE_COLUMNS, capacity), device="cuda")
-    previous = None
-    for _ in range(2):
-        a2.fill_(0x55)
-        a2_scale.fill_(float("nan"))
-        run_gateup(inputs, a2.view(dtypes.fp8), a2_scale, all_blocks=all_blocks)
-        torch.cuda.synchronize()
-        check_gateup(inputs, a2.view(dtypes.fp8), a2_scale, 0x55, all_blocks)
-        if previous is not None:
-            assert torch.equal(a2, previous[0]) and torch.equal(a2_scale.view(torch.int32), previous[1].view(torch.int32))
-        previous = a2.clone(), a2_scale.clone()
-
-
-def down_reference(inputs, a2, a2_scale, all_blocks=False):
-    """test_down_a8w8_blockscale_gfx942.reference over the small-M blocks' routes, A dequantized per 128 columns:
+def down_reference(inputs, a2, a2_scale):
+    """test_down_a8w8_blockscale_gfx942.reference over the routes of the valid blocks, A dequantized per 128 columns:
     BF16 per route (weight applied), each token's routes summed in FP32; the routed mask and sum of |route|."""
     tokens, inter_dim, hidden_dim, topk, experts = inputs["shape"]
-    positions = small_positions(inputs, all_blocks)[0].nonzero().squeeze(1)
+    positions = valid_positions(inputs).nonzero().squeeze(1)
     ids = inputs["sorted_ids"][positions].long()
     token, slot = ids & 0xFFFFFF, ids >> 24 & 0xFF
     expert = inputs["expert_ids"].long().repeat_interleave(BLOCK_M)[positions]
@@ -245,68 +185,13 @@ def down_reference(inputs, a2, a2_scale, all_blocks=False):
     return out.to(torch.bfloat16), routed, magnitude
 
 
-def run_down(inputs, a2, a2_scale, out, **kw):
-    from pyhip.contrib.flydsl.moe_small_m_a8w8_blockscale_gfx942 import moe_down_small_m
-
-    return moe_down_small_m(
-        a2, inputs["w2"], a2_scale, inputs["w2_scale"], inputs["sorted_ids"], inputs["sorted_weights"], inputs["expert_ids"],
-        inputs["num_valid_ids"], out, inputs["shape"][3], **kw,
-    )
-
-
-DOWN_SHAPES = [
-    # tokens, inter, hidden, topk, experts, routing, extra blocks
-    (200, 256, 512, 2, 4, "random", 2),
-    (1100, 256, 512, 4, 16, "random", 0),
-    (64, 128, 256, 8, 32, "balanced", 1),
-    (512, 2048, 4096, 8, 32, "random", 1),
-    (4096, 2048, 4096, 8, 32, "ep_uniform", 0),
-    (2048, 2048, 4096, 8, 32, "ep8", 1),
-]
-
-SPLIT_DOWN_SHAPES = [
-    (400, 256, 512, 2, 4, "random", 1),
-    (1100, 256, 512, 4, 16, "random", 0),
-    (6144, 2048, 4096, 8, 32, "ep_uniform", 1),
-]
-
-
-@pytest.mark.parametrize(
-    "tokens,inter_dim,hidden_dim,topk,experts,routing,extra_blocks,all_blocks",
-    [shape + (False,) for shape in DOWN_SHAPES] + [shape + (True,) for shape in SPLIT_DOWN_SHAPES],
-)
-def test_gateup_down_small_m(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks, all_blocks):
-    """GateUp writes the sorted FP8 rows (checked), Down reads them; the Down reference uses the same FP8 rows."""
-    from test_down_a8w8_blockscale_gfx942 import check as check_down
-
-    if not is_gfx942():
-        pytest.skip("gfx942 kernel")
-    if (inter_dim // 128) % 2 or (hidden_dim // 128) % 2:
-        pytest.skip("the K loop is unrolled by 2: K / 128 must be even")
-    inputs = make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=extra_blocks)
-    capacity = inputs["expert_ids"].numel() * BLOCK_M
-    a2 = torch.full((capacity, inter_dim), 0x55, device="cuda", dtype=torch.uint8)
-    a2_scale = torch.full((inter_dim // SCALE_COLUMNS, capacity), float("nan"), device="cuda")
-    run_gateup(inputs, a2.view(dtypes.fp8), a2_scale, all_blocks=all_blocks)
-    torch.cuda.synchronize()
-    check_gateup(inputs, a2.view(dtypes.fp8), a2_scale, 0x55, all_blocks)
-    expected, routed, magnitude = down_reference(inputs, a2, a2_scale, all_blocks)
-    out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    for _ in range(2):
-        out.zero_()
-        run_down(inputs, a2.view(dtypes.fp8), a2_scale, out, all_blocks=all_blocks)
-        torch.cuda.synchronize()
-        check_down(out, expected, routed, magnitude)
-
-
-@pytest.mark.parametrize("big_blocks", ["merged", "bm256", "split"])
 @pytest.mark.parametrize(
     "tokens,routing", [(64, "random"), (256, "ep_uniform"), (1000, "random"), (4096, "random"), (6144, "random"), (8192, "ep_uniform")]
 )
-def test_fused_mixed_aiter_sort(tokens, routing, big_blocks):
+def test_fused_mixed_aiter_sort(tokens, routing):
     """fused_moe_a8w8_blockscale_gfx942_mixed on aiter's EP moe_sorting(256) of a MiMo-V2.6-Flash EP8 rank (sort zeroes
-    out): small-M blocks only, mixed (T=4096/6144 random) and big blocks only (T=8192), against the asm test's
-    reference; one merged launch per stage, big blocks on the BM256 kernels or split into two small-M tasks."""
+    out): small blocks only, mixed (T=4096/6144 random) and big blocks only (T=8192), against the asm test's
+    reference."""
     import test_fmoe_a8w8_blockscale_asm_gfx942 as asm_t
     from aiter.fused_moe import moe_sorting
     from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import fused_moe_a8w8_blockscale_gfx942_mixed
@@ -325,18 +210,15 @@ def test_fused_mixed_aiter_sort(tokens, routing, big_blocks):
         )
         fused_moe_a8w8_blockscale_gfx942_mixed(
             inputs["a"], inputs["a_scale_t"], inputs["w1"], inputs["w1_scale"], inputs["w2"], inputs["w2_scale"], sorted_ids,
-            sorted_weights, expert_ids, num_valid_ids, out, topk, big_blocks=big_blocks,
+            sorted_weights, expert_ids, num_valid_ids, out, topk,
         )
         torch.cuda.synchronize()
         asm_t.check(inputs, out, expected)
 
 
-@pytest.mark.parametrize(
-    "tokens,routing,big_blocks",
-    [(1024, "random", "bm256"), (8192, "ep_uniform", "bm256"), (8192, "ep_uniform", "split"), (8192, "random", "merged")],
-)
-def test_dispatch_sort(tokens, routing, big_blocks):
-    """fused_moe_a8w8_blockscale_gfx942_sort: one 256-row sort, merged, or small-M or BM256 (or split) per block."""
+@pytest.mark.parametrize("tokens,routing", [(1024, "random"), (8192, "ep_uniform"), (8192, "random")])
+def test_dispatch_sort(tokens, routing):
+    """fused_moe_a8w8_blockscale_gfx942_sort: one 256-row sort, then the merged kernels."""
     import test_fmoe_a8w8_blockscale_asm_gfx942 as asm_t
     from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import fused_moe_a8w8_blockscale_gfx942_sort
 
@@ -348,14 +230,14 @@ def test_dispatch_sort(tokens, routing, big_blocks):
     expected = asm_t.reference(inputs)
     fused_moe_a8w8_blockscale_gfx942_sort(
         inputs["a"], inputs["a_scale_t"], inputs["w1"], inputs["w1_scale"], inputs["w2"], inputs["w2_scale"],
-        inputs["topk_ids"], inputs["topk_weights"], out, inputs["expert_mask"], big_blocks=big_blocks,
+        inputs["topk_ids"], inputs["topk_weights"], out, inputs["expert_mask"],
     )
     torch.cuda.synchronize()
     asm_t.check(inputs, out, expected)
 
 
 def test_merged_capacity_fallback(monkeypatch):
-    """Past the merged task scan's sort blocks, big_blocks="merged" runs the small-M + BM256 kernels."""
+    """Past the merged task scan's sort blocks, fused_moe_a8w8_blockscale_gfx942_mixed runs the BM256 kernels (bm128)."""
     import test_fmoe_a8w8_blockscale_asm_gfx942 as asm_t
     from pyhip.contrib.flydsl import moe_merged_a8w8_blockscale_gfx942 as merged
     from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import fused_moe_a8w8_blockscale_gfx942_sort
@@ -389,8 +271,8 @@ MERGED_SHAPES = [
 
 @pytest.mark.parametrize("tokens,inter_dim,hidden_dim,topk,experts,routing,extra_blocks", MERGED_SHAPES)
 def test_gateup_down_merged(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks):
-    """The merged GateUp writes the bytes of the small-M GateUp plus the BM256 one (big_blocks_only) and nothing else;
-    the merged Down adds every route of the valid blocks."""
+    """The merged GateUp writes the BM256 GateUp's bytes for the blocks with a route at row 128, routed rows within the
+    reference's tolerance for the others, and nothing past the valid blocks; the merged Down adds every route."""
     from test_down_a8w8_blockscale_gfx942 import check as check_down
     from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942_lds import moe_gateup_a8w8_blockscale_gfx942_lds
     from pyhip.contrib.flydsl.moe_merged_a8w8_blockscale_gfx942 import moe_down_merged, moe_gateup_merged
@@ -399,6 +281,8 @@ def test_gateup_down_merged(tokens, inter_dim, hidden_dim, topk, experts, routin
         pytest.skip("gfx942 kernel")
     inputs = make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=extra_blocks)
     capacity = inputs["expert_ids"].numel() * BLOCK_M
+    num_valid = int(inputs["num_valid_ids"][0])
+    big = big_rows(inputs)
     gateup_inputs = (inputs["a"], inputs["w1"], inputs["a_scale_t"], inputs["w1_scale"], inputs["sorted_ids"],
                      inputs["expert_ids"], inputs["num_valid_ids"])
 
@@ -407,17 +291,21 @@ def test_gateup_down_merged(tokens, inter_dim, hidden_dim, topk, experts, routin
                 torch.full((inter_dim // SCALE_COLUMNS, capacity), float("nan"), device="cuda"))
 
     a2_ref, a2_scale_ref = buffers()
-    run_gateup(inputs, a2_ref.view(dtypes.fp8), a2_scale_ref)
     moe_gateup_a8w8_blockscale_gfx942_lds(
-        *gateup_inputs, a2_ref.view(dtypes.fp8), layout="2x4_pf1", out_scale_t=a2_scale_ref, topk=topk, big_blocks_only=True,
+        *gateup_inputs, a2_ref.view(dtypes.fp8), layout="2x4_pf1", out_scale_t=a2_scale_ref, topk=topk,
     )
     a2, a2_scale = buffers()
+    previous = None
     for _ in range(2):
         moe_gateup_merged(*gateup_inputs, a2.view(dtypes.fp8), a2_scale, topk)
         torch.cuda.synchronize()
-        assert torch.equal(a2, a2_ref) and torch.equal(a2_scale.view(torch.int32), a2_scale_ref.view(torch.int32))
-    check_gateup(inputs, a2.view(dtypes.fp8), a2_scale, 0x55, all_blocks=True)
-    expected, routed, magnitude = down_reference(inputs, a2, a2_scale, all_blocks=True)
+        assert torch.equal(a2[:num_valid][big], a2_ref[:num_valid][big])
+        assert torch.equal(a2_scale.t()[:num_valid][big].view(torch.int32), a2_scale_ref.t()[:num_valid][big].view(torch.int32))
+        if previous is not None:
+            assert torch.equal(a2, previous[0]) and torch.equal(a2_scale.view(torch.int32), previous[1].view(torch.int32))
+        previous = a2.clone(), a2_scale.clone()
+    check_gateup(inputs, a2.view(dtypes.fp8), a2_scale, 0x55)
+    expected, routed, magnitude = down_reference(inputs, a2, a2_scale)
     out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
     for _ in range(2):
         out.zero_()
@@ -433,6 +321,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", type=int, default=0)
     args = parser.parse_args()
-    shape = GATEUP_SHAPES[args.case]
-    test_gateup_small_m(*shape, False)
-    print("gateup ok", shape)
+    shape = MERGED_SHAPES[args.case]
+    test_gateup_down_merged(*shape)
+    print("merged ok", shape)

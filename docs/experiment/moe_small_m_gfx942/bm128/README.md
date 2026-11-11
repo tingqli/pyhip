@@ -50,6 +50,9 @@ pipeline in the GateUp kernel", gfx950), here for both gfx942 kernels.
 GPU=1 tools/run_bm128.sh && python tools/summarize_bm128.py > summary.md
 ```
 
+`run_bm128.sh` needs the tree of commit da764f5: the small / split paths and the small-M module were removed afterwards
+(record §10).
+
 ## Results (2026-11-11, GPU 1, all gates PASS)
 
 MI300X, MiMo-V2.6-Flash EP8 rank (I 2048, H 4096, 32 local experts, top-8), cold weights, medians with sort, speedup

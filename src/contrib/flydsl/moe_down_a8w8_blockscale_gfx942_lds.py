@@ -79,7 +79,7 @@ def _rsrc_of(ptr, num_records_bytes):
 @functools.cache
 def compile_moe_down_a8w8_blockscale_gfx942_lds(
     hidden_dim, inter_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, atomic=True, sorted_a2=False, single_store=False,
-    big_blocks_only=False, merged=None, bm128=False,
+    merged=None, bm128=False,
 ):
     """merged: plugin that maps workgroups to tasks itself (merged.task) and runs the blocks with no route at row 128
     in the same launch (merged.body); see docs/record/moe_small_m_gfx942.md. merged.key (str) must change with the
@@ -89,8 +89,8 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
     validate_parameters(1, hidden_dim, inter_dim, topk, num_experts, sorted_a2=sorted_a2)
     assert layout in LAYOUTS, layout
     assert atomic or not single_store
-    assert merged is None or (atomic and sorted_a2 and not single_store and not big_blocks_only)
-    assert not bm128 or (layout == "4x2_pf1" and atomic and not big_blocks_only and merged is None)
+    assert merged is None or (atomic and sorted_a2 and not single_store)
+    assert not bm128 or (layout == "4x2_pf1" and atomic and merged is None)
     merged_key = None if merged is None else merged.key
     assert merged_key is None or isinstance(merged_key, str)
     H, K = hidden_dim, inter_dim
@@ -192,10 +192,6 @@ def compile_moe_down_a8w8_blockscale_gfx942_lds(
             else:
                 task = pid
                 active = task < num_tasks
-            if const_expr(big_blocks_only):
-                # Blocks with no route at row 128 belong to the small-M Down.
-                probe = uniform(load_i32(_rsrc_of(pSortedIds, num_blocks * (SORT_BLOCK_M * 4)), ((task // n_tiles) * SORT_BLOCK_M + SMALL_M_ROWS) * 4))
-                active = active & ((probe & TOKEN_MASK) < num_tokens) & (((probe >> 24) & 255) < topk)
 
         def big_body(tile_rows=SORT_BLOCK_M):
             """The BM256 task `task`; tile_rows=128: the 128-row pipeline (bm128)."""
@@ -889,7 +885,7 @@ def moe_zero_rows(out, counts, num_rows=None):
 
 def _launch_down(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, target, inverse, layout, xcd_swizzle,
-    atomic, tokens, topk, route_counts=None, big_blocks_only=False, bm128=False,
+    atomic, tokens, topk, route_counts=None, bm128=False,
 ):
     sorted_a2 = a2.dim() == 2
     inter_dim = a2.shape[-1]
@@ -902,8 +898,7 @@ def _launch_down(
     single_store = route_counts is not None
     assert not single_store or route_counts.shape == (tokens,) and route_counts.dtype == torch.int32
     launch = compile_moe_down_a8w8_blockscale_gfx942_lds(
-        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store, bool(big_blocks_only),
-        bm128=bool(bm128),
+        hidden_dim, inter_dim, topk, num_experts, layout, bool(xcd_swizzle), atomic, sorted_a2, single_store, bm128=bool(bm128),
     )
     run_compiled(
         launch,
@@ -941,7 +936,7 @@ def moe_down_rows_a8w8_blockscale_gfx942_lds(
 def moe_down_a8w8_blockscale_gfx942_lds(
     a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out,
     layout="2x4_pf1", xcd_swizzle=True, reduce="atomic", zero_out=True, rows=None, inverse=None, topk=None,
-    single_store=False, route_counts=None, big_blocks_only=False, bm128=False,
+    single_store=False, route_counts=None, bm128=False,
 ):
     """out [tokens, H] BF16 = sum over each token's routes of routing weight * (a2 row @ w2[expert]^T).
 
@@ -952,11 +947,10 @@ def moe_down_a8w8_blockscale_gfx942_lds(
     contents); single_store=True stores the rows of single-route tokens instead (route_counts: precomputed
     moe_route_counts, else computed here) and zero_out then clears only the other rows. reduce="kernel": the
     Down kernel writes rows and inverse (optional preallocated buffers), then moe_down_reduce writes out.
-    big_blocks_only (atomic): skip blocks with no route at row 128, which the small-M Down takes.
     bm128 (4x2_pf1, atomic): blocks with at most 128 routes run the 128-row pipeline.
     """
     assert reduce in ("atomic", "kernel"), reduce
-    assert reduce == "atomic" or not (big_blocks_only or bm128)
+    assert reduce == "atomic" or not bm128
     topk = a2.shape[1] if a2.dim() == 3 else topk
     assert topk is not None, "pass topk with a sorted-row a2"
     if reduce == "atomic":
@@ -970,7 +964,7 @@ def moe_down_a8w8_blockscale_gfx942_lds(
                 out.zero_()
         _launch_down(
             a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, out, layout, xcd_swizzle,
-            True, out.shape[0], topk, route_counts if single_store else None, big_blocks_only, bm128,
+            True, out.shape[0], topk, route_counts if single_store else None, bm128,
         )
         return out
     if rows is None:
