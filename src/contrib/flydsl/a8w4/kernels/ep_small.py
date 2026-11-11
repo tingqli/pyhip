@@ -16,8 +16,8 @@ ramps (first W bytes arrive several us after launch) plus the prep kernel itself
   ``out`` and (a8w4) quantize x rows to fp8 (bit-identical to quantize_rows).
   Only a8w4 gemm1 items (x8) and gemm2 items (zeroed out) wait for it.
 * Items, static round robin over the grid, all gemm1 items first:
-  gemm1 item = (m-block, 16*C1*NW inter cols) -> SiLU(gate)*up as **bf16** rows
-  of ``inter`` (deterministic position = sorted row);
+  gemm1 item = (m-block, 16*C1*NW inter cols) -> act(gate)*up (SiLU / SiTUv2) as
+  **bf16** rows of ``inter`` (deterministic position = sorted row);
   gemm2 item = (m-block, 16*C2*NW out cols): waits for the m-block's gemm1 counter,
   stages the bf16 rows (a8w4: quantized per (row, 128) on the fly, the 3-launch
   path's intermediate quant: ``_make_core(AQ8=True)``) and adds the routed result
@@ -39,7 +39,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from .._vendor import buffer_ops
 from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, silu_mul_batch, situ_params
+from .._vendor.act import gate_up_act, situ_params
 from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
 from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
 from .._vendor.mxfp4_gemm_common import (
@@ -134,9 +134,11 @@ def _signal2(arg_ctr, top, sub0, bx, grid, tx):
 
 
 @functools.cache
-def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3, DBG=0):
+def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3, DBG=0,
+                     ACT="silu"):
     FP8 = ADT == "fp8"
     assert ADT in ("fp8", "bf16")
+    assert ACT in ("silu", "situv2"), ACT
     assert EL <= 32 and TOPK == 8
     NT = 64 * NW
     NI1 = 16 * C1 * NW  # gemm1 inter cols per item (wave: C1 gate + C1 up 16-col blocks)
@@ -160,7 +162,8 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
     LDS_BYTES = (L_TOK8 + MAXM * 2) * 4
     assert LDS_BYTES <= 32768, LDS_BYTES  # 2 WGs per CU
     kname = (f"ep_small_{ADT}_h{H}_i{I}_e{EL}_bm{BM}_nw{NW}_c{C1}x{C2}_pf{PF}"
-             f"_r{'x'.join(map(str, ROWV))}_m{MAXM}_s{SCH}_d{DBG}")
+             f"_r{'x'.join(map(str, ROWV))}_m{MAXM}_s{SCH}_d{DBG}"
+             + ("" if ACT == "silu" else f"_{ACT}"))
 
     @fx.struct
     class SharedStorage:
@@ -382,6 +385,9 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
                 _raw(fx.Int64(a["inter"])), num_records_bytes=_raw(
                     fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I * 2)))
             ccol = col0 + lane_div_16 * fx.Int32(4)
+            situ = None
+            if const_expr(ACT == "situv2"):
+                situ = situ_params(*[fx.Float32(a[k]) for k in ("sb", "sbr", "lb", "lbr", "lim")])
             for mi in range_constexpr(MR):
                 for c in range_constexpr(C1):
                     g4 = Vec(fx.memref_load_vec(acc[0, c][mi]))
@@ -392,7 +398,7 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
                     else:
                         gv = [fx.Float32(g4[v]) * fac[0, c, v] for v in range(4)]
                         uv = [fx.Float32(u4[v]) * fac[1, c, v] for v in range(4)]
-                    y = silu_mul_batch(gv, uv)
+                    y = gate_up_act(ACT, gv, uv, situ)
                     w2 = Vec.from_elements([EP._bf16x2_rne(y[0], y[1]),
                                             EP._bf16x2_rne(y[2], y[3])], fx.Int32)
                     buffer_ops.buffer_store(
@@ -502,7 +508,8 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
 
     @flyc.jit
     def _entry(arg_x, arg_x8, arg_xs, arg_ids, arg_wts, arg_w1, arg_w1s, arg_w1e, arg_w2,
-               arg_w2s, arg_w2e, arg_out, arg_inter, arg_ctr, i32_m, i32_e0):
+               arg_w2s, arg_w2e, arg_out, arg_inter, arg_ctr, i32_m, i32_e0, f32_sb, f32_sbr,
+               f32_lb, f32_lbr, f32_lim):
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         lds_i32 = fx.Int32(fx.ptrtoint(lds_ptr))
         lds = lds_typed_ptr(lds_i32, T.i32)
@@ -513,7 +520,8 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
         wave = fx.Int32(rocdl.readfirstlane(T.i32, _raw(tx // fx.Int32(64))))
         a = dict(x=arg_x, x8=arg_x8, xs=arg_xs, ids=arg_ids, wts=arg_wts, w1=arg_w1,
                  w1s=arg_w1s, w1e=arg_w1e, w2=arg_w2, w2s=arg_w2s, w2e=arg_w2e, out=arg_out,
-                 inter=arg_inter, ctr=arg_ctr, m=i32_m, e0=i32_e0, grid=grid)
+                 inter=arg_inter, ctr=arg_ctr, m=i32_m, e0=i32_e0, grid=grid, sb=f32_sb,
+                 sbr=f32_sbr, lb=f32_lb, lbr=f32_lbr, lim=f32_lim)
         _route(lds, a, wave, lane, tx)
         nmb = fx.Int32(rocdl.readfirstlane(T.i32, _raw(lds[fx.Int32(L_OFF + EL)]))) // fx.Int32(BM)
         ng1 = nmb * fx.Int32(NB1)
@@ -532,19 +540,26 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
     def kernel(arg_x: fx.Int64, arg_x8: fx.Int64, arg_xs: fx.Int64, arg_ids: fx.Int64,
                arg_wts: fx.Int64, arg_w1: fx.Int64, arg_w1s: fx.Int64, arg_w1e: fx.Int64,
                arg_w2: fx.Int64, arg_w2s: fx.Int64, arg_w2e: fx.Int64, arg_out: fx.Int64,
-               arg_inter: fx.Int64, arg_ctr: fx.Int64, i32_m: fx.Int32, i32_e0: fx.Int32):
+               arg_inter: fx.Int64, arg_ctr: fx.Int64, i32_m: fx.Int32, i32_e0: fx.Int32,
+               f32_sb: fx.Float32, f32_sbr: fx.Float32, f32_lb: fx.Float32,
+               f32_lbr: fx.Float32, f32_lim: fx.Float32):
         _entry(arg_x, arg_x8, arg_xs, arg_ids, arg_wts, arg_w1, arg_w1s, arg_w1e, arg_w2,
-               arg_w2s, arg_w2e, arg_out, arg_inter, arg_ctr, i32_m, i32_e0)
+               arg_w2s, arg_w2e, arg_out, arg_inter, arg_ctr, i32_m, i32_e0, f32_sb, f32_sbr,
+               f32_lb, f32_lbr, f32_lim)
 
     @flyc.jit
     def launch(arg_x: fx.Int64, arg_x8: fx.Int64, arg_xs: fx.Int64, arg_ids: fx.Int64,
                arg_wts: fx.Int64, arg_w1: fx.Int64, arg_w1s: fx.Int64, arg_w1e: fx.Int64,
                arg_w2: fx.Int64, arg_w2s: fx.Int64, arg_w2e: fx.Int64, arg_out: fx.Int64,
                arg_inter: fx.Int64, arg_ctr: fx.Int64, i32_m: fx.Int32, i32_e0: fx.Int32,
-               i32_grid: fx.Int32, stream: fx.Stream):
+               f32_sb: fx.Float32, f32_sbr: fx.Float32, f32_lb: fx.Float32,
+               f32_lbr: fx.Float32, f32_lim: fx.Float32, i32_grid: fx.Int32,
+               stream: fx.Stream):
         kernel(arg_x, arg_x8, arg_xs, arg_ids, arg_wts, arg_w1, arg_w1s, arg_w1e, arg_w2,
-               arg_w2s, arg_w2e, arg_out, arg_inter, arg_ctr, i32_m,
-               i32_e0).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(NT, 1, 1), stream=stream)
+               arg_w2s, arg_w2e, arg_out, arg_inter, arg_ctr, i32_m, i32_e0, f32_sb,
+               f32_sbr, f32_lb, f32_lbr,
+               f32_lim).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(NT, 1, 1),
+                               stream=stream)
 
     return launch, dict(CAP=CAP, NMBMAX=CAP // BM, LDS_BYTES=LDS_BYTES, NI1=NI1, NO2=NO2)
 
@@ -567,9 +582,11 @@ def _scratch(dev, adt, maxm, H, I, cap, nmbmax):
 SMALL_CFG = dict(bm=32, nw=2, c1=1, c2=4, pf=4, rowv=(16, 32), wpc=2)
 
 
-def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, adt="fp8", maxm=512, cfg=None):
+def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, adt="fp8", maxm=512, cfg=None,
+                 act="silu", **situ):
     """Fused small-batch EP8 MoE (one launch): bf16 x [M, H] -> bf16 [M, H]; same
-    contract as ``ep_gemm.ep_moe``. ``M <= maxm`` (compile-time capacity)."""
+    contract as ``ep_gemm.ep_moe`` (incl. ``act`` / ``situ``). ``M <= maxm``
+    (compile-time capacity)."""
     cfg = dict(SMALL_CFG, **(cfg or {}))
     M, H = x.shape
     E = W["w2"].shape[0]
@@ -579,7 +596,7 @@ def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, adt="fp8", maxm=512, cfg=N
     launch, info = compile_ep_small(
         H=H, I=I, EL=E, TOPK=K, ADT=adt, BM=cfg["bm"], NW=cfg["nw"], C1=cfg["c1"],
         C2=cfg["c2"], PF=cfg["pf"], ROWV=tuple(cfg["rowv"]), MAXM=maxm,
-        SCH=cfg.get("sch", 3), DBG=cfg.get("dbg", 0))
+        SCH=cfg.get("sch", 3), DBG=cfg.get("dbg", 0), ACT=act)
     s = _scratch(x.device, adt, maxm, H, I, info["CAP"], info["NMBMAX"])
     out = torch.empty((M, H), dtype=torch.bfloat16, device=x.device)
     grid = NUM_CU * cfg["wpc"]
@@ -588,5 +605,5 @@ def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, adt="fp8", maxm=512, cfg=N
         topk_weights.data_ptr(), W["w1"].data_ptr(), W["w1_scale"].data_ptr(),
         W["w1_exp"].data_ptr(), W["w2"].data_ptr(), W["w2_scale"].data_ptr(),
         W["w2_exp"].data_ptr(), out.data_ptr(), s["inter"].data_ptr(), s["ctr"].data_ptr(),
-        int(M), int(e0), int(grid), torch.cuda.current_stream())
+        int(M), int(e0), *G1.situ_args(**situ), int(grid), torch.cuda.current_stream())
     return out

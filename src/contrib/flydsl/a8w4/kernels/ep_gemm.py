@@ -8,10 +8,14 @@ EP8 shape per rank: model_dim H 4096, full inter_dim I 2048, 32 local experts (o
 ``prepare_weights`` into the ``fast_dec=2`` form of doc-mimo (nibble-reordered W,
 per-group scale deltas, per-channel max exponent), shared by both activation types:
 
-  * ``a8w4``  : A = fp8 FNUZ (x per token row, the SiLU output per (row, 128) group),
-                MFMA 16x16x32 fp8; W decodes fp4 -> fp8 through the fd2 byte LUT.
-  * ``a16w4`` : A = bf16 (x as is, SiLU output bf16), MFMA 16x16x16 bf16; W decodes
-                fp4 -> fp8 (same LUT, exact) -> f32 (v_cvt_pk_f32_fp8) -> bf16.
+  * ``a8w4``  : A = fp8 FNUZ (x per token row, the activation output per (row, 128)
+                group), MFMA 16x16x32 fp8; W decodes fp4 -> fp8 through the fd2 byte
+                LUT.
+  * ``a16w4`` : A = bf16 (x as is, activation output bf16), MFMA 16x16x16 bf16; W
+                decodes fp4 -> fp8 (same LUT, exact) -> f32 (v_cvt_pk_f32_fp8) -> bf16.
+
+The gate/up activation (gemm1 epilogue) is SiLU or SiTUv2 (``act``; SiTUv2 betas
+and clamp are runtime launch args).
 
 Both W decodes carry the per-32-K-group scale relative to the output channel's max
 group scale; the channel factor 2**(max-132) is applied in the epilogue.
@@ -46,7 +50,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from .._vendor import buffer_ops
 from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, silu_mul_batch, situ_params
+from .._vendor.act import gate_up_act, situ_params
 from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
 from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
 from .._vendor.mxfp4_gemm_common import (
@@ -716,15 +720,19 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
 
 
 # =============================================================================
-# gemm1: gate|up + SiLU
+# gemm1: gate|up + activation (SiLU / SiTUv2)
 # =============================================================================
 
 
 @functools.cache
 def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB=256,
-                     acm=2, SCH=1, ST=None, PRIO=0, TR=False, ORDER=False, ZRC=False):
-    """Stage 1: ``h = SiLU(A W1g^T) * (A W1u^T)`` for the sorted rows of one expert
+                     acm=2, SCH=1, ST=None, PRIO=0, TR=False, ORDER=False, ZRC=False,
+                     XG=False, DYN=False, ACT="silu"):
+    """Stage 1: ``h = act(A W1g^T) * (A W1u^T)`` for the sorted rows of one expert
     block, NI inter columns per WG.
+
+    ``ACT``: "silu" or "situv2" (as tp_gemm1: SiTUv2 beta / linear_beta / clamp
+    limit are runtime f32 launch args, see ``G1.situ_args``; silu ignores them).
 
     ``ADT``: "fp8" (A = fp8 x + f32 row scale; out = fp8 [sorted, I] by sorted row
     + f32 scale per (row, 128 cols) group, ``[sorted, I/128]``) or "bf16" (A = bf16
@@ -732,9 +740,18 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
     ``BM``: sorting block; ``ROWV``: row variants compiled in (ascending, last =
     BM): a WG runs the smallest one that covers its valid rows. ``PF``: W prefetch
     distance in K tiles; ``bcm``: W load cache modifier (2 = nt).
+    ``XG`` (fp8): x scales are per (token, 128-K group), ``[M, H/128]`` (e.g. a
+    blockwise-quantized EP dispatch): one accumulator rescaled by s_{g-1}/s_g at
+    every group start (as gemm2), times s_last in the epilogue.
+    ``DYN``: the grid may be smaller than the tile bound (WGs stride over tiles), and
+    instead of zeroing ``zero`` up front, rows < num_valid_ids[1] with != 1 local
+    route (``arg_rc``) are zeroed after the tiles.
     """
     FP8 = ADT == "fp8"
     assert ADT in ("fp8", "bf16")
+    assert ACT in ("silu", "situv2"), ACT
+    assert not XG or FP8, "XG: grouped x scales are fp8 only"
+    assert not (DYN and ZRC), "DYN does its own route-count-aware zeroing"
     K, N2 = H, 2 * I
     AB = 1 if FP8 else 2
     NB = I // NI
@@ -747,6 +764,15 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
     assert not (TR and FP8) or (QG1 % NIW == 0 and NI % QG1 == 0), \
         "TR a8w4 epilogue: every wave inside one 128-col quant group"
     LDS_BYTES = max(2 * BM * ARB, BM * NI * 2)
+    # XG: ratio table [G][BM] f32 + fin [BM] after the A double buffer (the bf16
+    # epilogue tile and the TR amax table stay below it)
+    G = H // QG1
+    KS = 32 if FP8 else 16  # K per MFMA step
+    TK = ARB // (1 if FP8 else 2)
+    RATIO_OFF = 2 * BM * ARB
+    if XG:
+        assert TK % QG1 == 0 and BM * NI * 2 <= RATIO_OFF and BM * NW * 4 <= RATIO_OFF
+        LDS_BYTES = RATIO_OFF + (G + 1) * BM * 4
     assert LDS_BYTES <= 65536, LDS_BYTES
     kname = (
         f"ep_gemm1_{ADT}_h{H}_i{I}_e{NE}_bm{BM}_ni{NI}_r{'x'.join(map(str, ROWV))}"
@@ -754,6 +780,8 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
         + (f"_acm{acm}" if acm != 2 else "") + (f"_s{SCH}" if SCH != 1 else "")
         + (f"_st{ST}" if ST is not None else "") + (f"_p{PRIO}" if PRIO else "")
         + ("_tr" if TR else "") + ("_o" if ORDER else "") + ("_zrc" if ZRC else "")
+        + ("_xg" if XG else "") + ("_dyn" if DYN else "")
+        + ("" if ACT == "silu" else f"_{ACT}")
         + ("_tl" if TL else "")
     )
     # route-count-aware zeroing of gemm2's out [M, H] bf16: <= ZRC_UPT units / thread
@@ -762,7 +790,7 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
     TLP = tl_buffer().data_ptr() if TL else 0  # closure scalar -> in the cache key
 
     def _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
-              arg_out, arg_outs, i32_m, m_block, n_block, lane, wave, tx):
+              arg_out, arg_outs, i32_m, m_block, n_block, lane, wave, tx, situ):
         lane_div_16 = lane // fx.Int32(16)
         lane_mod_16 = lane % fx.Int32(16)
         e = fx.Int32(rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block))))
@@ -790,13 +818,72 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
                           a_num_bytes=fx.Int64(i32_m) * fx.Int64(K * AB), ARB=ARB, acm=acm,
                           SCH=SCH, ST_STEP=ST, PRIO=PRIO, TR=TR)
         lds_i32 = fx.Int32(fx.ptrtoint(lds_ptr))
+        lds_f32 = lds_typed_ptr(lds_i32, T.f32)
 
         def row_base16(row):  # gather x rows by token (padding token = M -> OOB -> 0)
             tok = fx.Int32(_global_i32_at(arg_sids, bx_m + row)) & fx.Int32(0x00FFFFFF)
             return tok * fx.Int32(K * AB // 16)
 
+        def build_ratios(R):
+            """XG, LDS: ratio[g][r] = s[tok_r][g-1] / s[tok_r][g] (ratio[0] = 1),
+            fin[r] = s[tok_r][G-1]; a zero scale (all-zero group, padding row) acts
+            as 1 (its fp8 values are 0)."""
+            xs_tiles = _global_i32_buffer_tiles(
+                arg_xs, fx.Int64(i32_m) * fx.Int64(G * 4), 1)
+            xs_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+            one = fx.Float32(1.0)
+            for p in range_constexpr(-(-(R * G) // NT)):
+                idx = tx + fx.Int32(p * NT)
+                r = idx // fx.Int32(G)
+                g = idx % fx.Int32(G)
+                ok = r < fx.Int32(R)
+                rr = ok.select(r, fx.Int32(0))
+                tok = fx.Int32(_global_i32_at(arg_sids, bx_m + rr)) & fx.Int32(0x00FFFFFF)
+                srow = tok * fx.Int32(G)
+                cur = G1._buffer_i32_scalar_read(xs_tiles, srow + g, xs_atom).bitcast(fx.Float32)
+                prv = G1._buffer_i32_scalar_read(
+                    xs_tiles, srow + fx.max(g - fx.Int32(1), fx.Int32(0)), xs_atom
+                ).bitcast(fx.Float32)
+                cur = (cur == fx.Float32(0.0)).select(one, cur)
+                prv = (prv == fx.Float32(0.0)).select(one, prv)
+                ratio = (g == fx.Int32(0)).select(one, prv / cur)
+                _lds_f32_store_masked(lds_f32, fx.Int32(RATIO_OFF // 4) + g * fx.Int32(BM) + rr,
+                                      ratio, ok)
+                _lds_f32_store_masked(lds_f32, fx.Int32(RATIO_OFF // 4 + G * BM) + rr, cur,
+                                      ok & (g == fx.Int32(G - 1)))
+
+        def ratio4(base_f32, mi):
+            """this lane's 4 rows (L//16)*4 + v of 16-row block mi from an f32 [BM] row."""
+            off = (base_f32 + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)) * fx.Int32(4)
+            return Vec(lds_vec_load(lds_i32, off, Vec.make_type(4, fx.Float32), fx.Float32,
+                                    align=16))
+
+        def hook(acc, kt, s):
+            kk = s * KS  # K offset of step s in the tile
+            if const_expr(kk % QG1 != 0):
+                return
+            gidx = kt * fx.Int32(TK // QG1) + fx.Int32(kk // QG1)
+            for key in acc:
+                for mi in range_constexpr(len(acc[key])):
+                    if const_expr(TR):  # lane: row mi*16 + L%16, 4 columns
+                        rt = lds_f32[fx.Int32(RATIO_OFF // 4 + mi * 16) + gidx * fx.Int32(BM)
+                                     + lane_mod_16]
+                        a4 = Vec(acc[key][mi].load())
+                        acc[key][mi].store(Vec.from_elements(
+                            [a4[v] * rt for v in range(4)], fx.Float32))
+                    else:
+                        rt = ratio4(fx.Int32(RATIO_OFF // 4) + gidx * fx.Int32(BM), mi)
+                        a4 = Vec(acc[key][mi].load())
+                        acc[key][mi].store(Vec.from_elements(
+                            [a4[v] * rt[v] for v in range(4)], fx.Float32))
+
+        def fin_of(r):
+            return fx.Float32(lds_f32[fx.Int32(RATIO_OFF // 4 + G * BM) + r])
+
         def run_rows(R):
-            acc = core(R, row_base16)
+            if const_expr(XG):
+                build_ratios(R)  # visible to all waves after the K loop's first barrier
+            acc = core(R, row_base16, hook if XG else None)
             if const_expr(TR):
                 _epilogue_tr(R, acc)
             else:
@@ -804,7 +891,7 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
 
         def _epilogue_tr(R, acc):
             """Transposed acc (lane: row L%16 of each 16-row block, 4 consecutive
-            columns): dequant -> SiLU(gate)*up in registers, then a8w4: row amax
+            columns): dequant -> act(gate)*up in registers, then a8w4: row amax
             over the lane's columns, the 4 lane groups (xor 16 / 32) and the NW waves
             (LDS [row][NW] f32) -> fp8 dword stores + one f32 scale per row; a16w4:
             bf16 (RNE) 8 B stores."""
@@ -814,7 +901,9 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
                     for r in rows]
             valid = [t < i32_m for t in toks]
             fac = {k: G1._channel_factor(v) for k, v in exps.items()}
-            if const_expr(FP8):
+            if const_expr(XG):
+                rs = [fin_of(r) for r in rows]
+            elif const_expr(FP8):
                 xs_tiles = _global_i32_buffer_tiles(arg_xs, fx.Int64(i32_m) * fx.Int64(4), 1)
                 xs_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
                 rs = [G1._buffer_i32_scalar_read(xs_tiles, t, xs_atom).bitcast(fx.Float32)
@@ -830,10 +919,9 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
                     else:
                         gv = [fx.Float32(g4[v]) * fac[0, c, v] for v in range(4)]
                         uv = [fx.Float32(u4[v]) * fac[1, c, v] for v in range(4)]
-                    ys[mi, c] = silu_mul_batch(gv, uv)
+                    ys[mi, c] = gate_up_act(ACT, gv, uv, situ)
             col = n_block * fx.Int32(NI) + wave * fx.Int32(NIW) + lane_div_16 * fx.Int32(4)
             if const_expr(FP8):
-                lds_f32 = lds_typed_ptr(lds_i32, T.f32)
                 for mi in range_constexpr(MR):
                     am = fx.Float32(0.0)
                     for c in range_constexpr(NC):
@@ -886,18 +974,20 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
                             // fx.Int32(2), mask=valid[mi])
 
         def _epilogue(R, acc):
-            """dequant -> SiLU(gate)*up -> bf16 LDS tile [R, NI] -> fp8 (row, NI)
+            """dequant -> act(gate)*up -> bf16 LDS tile [R, NI] -> fp8 (row, NI)
             quant (a8w4) or bf16 rows, 16 B stores by sorted row."""
             MR = R // 16
             lds_bf16 = lds_typed_ptr(lds_i32, T.bf16)
             fac = {k: G1._channel_factor(v) for k, v in exps.items()}
-            if const_expr(FP8):
+            if const_expr(FP8 and not XG):
                 xs_tiles = _global_i32_buffer_tiles(arg_xs, fx.Int64(i32_m) * fx.Int64(4), 1)
                 xs_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
             for mi in range_constexpr(MR):
                 for v in range_constexpr(4):
                     rit = fx.Int32(mi * 16 + v) + lane_div_16 * fx.Int32(4)
-                    if const_expr(FP8):
+                    if const_expr(XG):
+                        rs = fin_of(rit)
+                    elif const_expr(FP8):
                         tok = fx.Int32(_global_i32_at(arg_sids, bx_m + rit)) & fx.Int32(0x00FFFFFF)
                         rs = G1._buffer_i32_scalar_read(xs_tiles, tok, xs_atom).bitcast(fx.Float32)
                     for c in range_constexpr(NC):
@@ -909,7 +999,7 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
                         else:
                             gv = gv * fac[0, c]
                             uv = uv * fac[1, c]
-                        y = silu_mul_batch([gv], [uv])[0]
+                        y = gate_up_act(ACT, [gv], [uv], situ)[0]
                         col = wave * fx.Int32(NIW) + fx.Int32(c * 16) + lane_mod_16
                         lds_bf16[rit * fx.Int32(NI) + col] = y.to(fx.BFloat16)
             gpu.barrier()
@@ -994,8 +1084,36 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
         raw: fx.Array[fx.Uint8, LDS_BYTES, 16]
 
     @flyc.jit
+    def _zero_dyn(arg_zero, arg_rc, arg_cumsum, bx, grid, tx):
+        """DYN: rows r = bx, bx + grid, ... < num_valid_ids[1] of gemm2's out with
+        != 1 local route are zeroed (single-route rows are stored whole by gemm2;
+        rows past the valid count are never read). One wave-uniform count per row."""
+        mv = fx.Int32(rocdl.readfirstlane(T.i32, _raw(fx.Int32(
+            _global_i32_at(arg_cumsum, fx.Int32(1))))))
+        rc = global_typed_ptr(arg_rc, T.i32)
+        n16 = mv * fx.Int32(ZRC_ROW16)
+        rs = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_zero)), num_records_bytes=_raw(fx.Int64(n16) * fx.Int64(16)))
+        z = Vec.filled(4, 0, fx.Int32)
+        r = bx
+        while r < mv:
+            rcv = fx.Int32(rocdl.readfirstlane(T.i32, _raw(fx.Int32(rc[r]))))
+            for k in range_constexpr(ZRC_UPT):
+                u = fx.Int32(k * NT) + tx
+                ok = (u < fx.Int32(ZRC_ROW16)) & (rcv != fx.Int32(1))
+                buffer_ops.buffer_store(
+                    z, rs, ok.select(r * fx.Int32(ZRC_ROW16) + u, n16) * fx.Int32(4))
+            r = r + grid
+
+    @flyc.jit
     def _entry(arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_cumsum, arg_sids,
-               arg_out, arg_outs, i32_m, arg_zero, i32_zero16, arg_sched, arg_rc):
+               arg_out, arg_outs, i32_m, arg_zero, i32_zero16, arg_sched, arg_rc,
+               f32_sb, f32_sbr, f32_lb, f32_lbr, f32_lim):
+        if const_expr(ACT == "situv2"):
+            situ = situ_params(fx.Float32(f32_sb), fx.Float32(f32_sbr), fx.Float32(f32_lb),
+                               fx.Float32(f32_lbr), fx.Float32(f32_lim))
+        else:
+            situ = None
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx = fx.Int32(gpu.thread_id("x"))
         bx = fx.Int32(gpu.block_id("x"))
@@ -1005,7 +1123,8 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
         if const_expr(ZRC):
             zpre = _zero_rc_pre(arg_rc, i32_zero16, i32_m, ZRC_ROW16, bx, grid)
         else:
-            _zero_slice(arg_zero, i32_zero16, bx, grid, tx, NT)
+            if const_expr(not DYN):
+                _zero_slice(arg_zero, i32_zero16, bx, grid, tx, NT)
         bound = _global_i32_at(arg_cumsum, fx.Int32(0)) // fx.Int32(BM) * fx.Int32(NB)
         if const_expr(ORDER):
             lo, hi, nwg = _bucket_bounds(arg_sched, bx, grid, NB)
@@ -1016,43 +1135,64 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
                     t0 = _tl_now()
                 txo, laneo, waveo = _opaque_tx(tx)
                 _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
-                      arg_out, arg_outs, i32_m, m_block, n_block, laneo, waveo, txo)
+                      arg_out, arg_outs, i32_m, m_block, n_block, laneo, waveo, txo, situ)
                 if const_expr(TL):
                     _tl_record(TLP, t, bx, m_block, t0, tx)
                 t = t + nwg
                 if t < hi:
                     gpu.barrier()
         else:
-            if bx < bound:
-                tile = _xcd_tile(bx, bound)
-                m_block, n_block = _tile_of(tile, NB)
-                if const_expr(TL):
-                    t0 = _tl_now()
-                txo, laneo, waveo = _opaque_tx(tx)
-                _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
-                      arg_out, arg_outs, i32_m, m_block, n_block, laneo, waveo, txo)
-                if const_expr(TL):
-                    _tl_record(TLP, tile, bx, m_block, t0, tx)
+            if const_expr(DYN):
+                t = bx
+                while t < bound:
+                    m_block, n_block = _tile_of(_xcd_tile(t, bound), NB)
+                    txo, laneo, waveo = _opaque_tx(tx)
+                    _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids,
+                          arg_sids, arg_out, arg_outs, i32_m, m_block, n_block, laneo,
+                          waveo, txo, situ)
+                    t = t + grid
+                    if t < bound:
+                        gpu.barrier()
+            else:
+                if bx < bound:
+                    tile = _xcd_tile(bx, bound)
+                    m_block, n_block = _tile_of(tile, NB)
+                    if const_expr(TL):
+                        t0 = _tl_now()
+                    txo, laneo, waveo = _opaque_tx(tx)
+                    _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids,
+                          arg_sids, arg_out, arg_outs, i32_m, m_block, n_block, laneo,
+                          waveo, txo, situ)
+                    if const_expr(TL):
+                        _tl_record(TLP, tile, bx, m_block, t0, tx)
         if const_expr(ZRC):
             _zero_rc_post(arg_zero, i32_zero16, ZRC_ROW16, ZRC_UPT, zpre, bx, tx, NT)
+        if const_expr(DYN):
+            _zero_dyn(arg_zero, arg_rc, arg_cumsum, bx, grid, tx)
 
     @flyc.kernel(name=kname, known_block_size=[NT, 1, 1])
     def kernel(arg_x: fx.Int64, arg_xs: fx.Int64, arg_w: fx.Int64, arg_ws: fx.Int64,
                arg_wexp: fx.Int64, arg_eids: fx.Int64, arg_cumsum: fx.Int64,
                arg_sids: fx.Int64, arg_out: fx.Int64, arg_outs: fx.Int64,
                i32_m: fx.Int32, arg_zero: fx.Int64, i32_zero16: fx.Int32,
-               arg_sched: fx.Int64, arg_rc: fx.Int64):
+               arg_sched: fx.Int64, arg_rc: fx.Int64, f32_sb: fx.Float32,
+               f32_sbr: fx.Float32, f32_lb: fx.Float32, f32_lbr: fx.Float32,
+               f32_lim: fx.Float32):
         _entry(arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_cumsum, arg_sids,
-               arg_out, arg_outs, i32_m, arg_zero, i32_zero16, arg_sched, arg_rc)
+               arg_out, arg_outs, i32_m, arg_zero, i32_zero16, arg_sched, arg_rc,
+               f32_sb, f32_sbr, f32_lb, f32_lbr, f32_lim)
 
     @flyc.jit
     def launch(arg_x: fx.Int64, arg_xs: fx.Int64, arg_w: fx.Int64, arg_ws: fx.Int64,
                arg_wexp: fx.Int64, arg_eids: fx.Int64, arg_cumsum: fx.Int64,
                arg_sids: fx.Int64, arg_out: fx.Int64, arg_outs: fx.Int64,
                i32_m: fx.Int32, arg_zero: fx.Int64, i32_zero16: fx.Int32,
-               arg_sched: fx.Int64, arg_rc: fx.Int64, i32_grid: fx.Int32, stream: fx.Stream):
+               arg_sched: fx.Int64, arg_rc: fx.Int64, f32_sb: fx.Float32,
+               f32_sbr: fx.Float32, f32_lb: fx.Float32, f32_lbr: fx.Float32,
+               f32_lim: fx.Float32, i32_grid: fx.Int32, stream: fx.Stream):
         kernel(arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_cumsum, arg_sids,
                arg_out, arg_outs, i32_m, arg_zero, i32_zero16, arg_sched, arg_rc,
+               f32_sb, f32_sbr, f32_lb, f32_lbr, f32_lim,
                value_attrs=({"rocdl.waves_per_eu": wpe} if wpe else None),
                ).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(NT, 1, 1), stream=stream)
 
@@ -1061,19 +1201,31 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
 
 def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, out_scale,
              *, adt, block_m, ni=128, rowv=None, pf=2, bcm=2, wpe=None, nw=4, arb=256,
-             zero=None, acm=2, sch=1, st=None, prio=0, tr=False, sched=None, zero_rc=None):
+             zero=None, acm=2, sch=1, st=None, prio=0, tr=False, sched=None, zero_rc=None,
+             x_group=False, dyn=False, grid=None, act="silu", situ_beta=1.0,
+             situ_linear_beta=1.0, swiglu_limit=float("inf")):
     """Host launcher. ``x``: fp8 [M, H] (+ ``x_scale`` f32 [M]) or bf16 [M, H];
     ``out``: fp8 (u8) [sorted, I] + ``out_scale`` f32 [sorted, I/128], or bf16
     [sorted, I]; ``W`` from ``prepare_weights``. ``zero``: optional tensor (e.g.
     gemm2's output) the WGs set to 0 on the way (nbytes % 16 == 0). ``sched``: the
     prep's tile schedule (XCD buckets, longest tiles first) instead of the plain
     m-major order. ``zero_rc``: prep's local route counts -> only rows with != 1
-    route are zeroed (``zero`` = gemm2's out [M, H] run with ``single_store``)."""
+    route are zeroed (``zero`` = gemm2's out [M, H] run with ``single_store``).
+    ``x_group``: ``x_scale`` is f32 [M, H/128] (per token and 128-K group).
+    ``dyn``: prep ran with ``m_valid``: only rows < num_valid_ids[1] of ``zero`` with
+    != 1 route (``zero_rc`` required) are zeroed; ``grid`` (a multiple of 8) may be
+    below the tile bound (the WGs stride over the tiles).
+    ``act``: "silu" or "situv2" with ``situ_beta`` / ``situ_linear_beta`` /
+    ``swiglu_limit`` (+inf: no clamp), as ``G1.a8w4_gemm1``."""
     M, H = x.shape
     NE, N2, _ = W["w1"].shape
     I = N2 // 2
-    grid = _grid(sorted_expert_ids.numel() * (I // ni), sched)
-    if zero_rc is not None:
+    if grid is None:
+        grid = _grid(sorted_expert_ids.numel() * (I // ni), sched)
+    if dyn:
+        assert zero is not None and zero_rc is not None and grid % 8 == 0
+        zrc = False
+    elif zero_rc is not None:
         assert zero is not None and zero.shape == (M, H) and zero.dtype == torch.bfloat16
         # a WG's share must span <= 2 rows (<= one row of units); else zero all rows
         zrc = -(-(M * H * 2 // 16) // grid) <= H * 2 // 16
@@ -1082,7 +1234,8 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
     launch = compile_ep_gemm1(H=H, I=I, NE=NE, ADT=adt, BM=block_m, NI=ni,
                               ROWV=tuple(rowv or (block_m,)), PF=pf, bcm=bcm, wpe=wpe,
                               NW=nw, ARB=arb, acm=acm, SCH=sch, ST=st, PRIO=prio, TR=tr,
-                              ORDER=sched is not None, ZRC=zrc)
+                              ORDER=sched is not None, ZRC=zrc, XG=x_group, DYN=dyn,
+                              ACT=act)
     _run_compiled(
         launch, x.data_ptr(), x_scale.data_ptr() if x_scale is not None else 0,
         W["w1"].data_ptr(), W["w1_scale"].data_ptr(), W["w1_exp"].data_ptr(),
@@ -1091,7 +1244,9 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
         int(M), zero.data_ptr() if zero is not None else 0,
         int(zero.numel() * zero.element_size() // 16) if zero is not None else 0,
         sched.data_ptr() if sched is not None else 0,
-        zero_rc.data_ptr() if zrc else 0, grid, torch.cuda.current_stream())
+        zero_rc.data_ptr() if (zrc or dyn) else 0,
+        *G1.situ_args(situ_beta, situ_linear_beta, swiglu_limit),
+        int(grid), torch.cuda.current_stream())
     return out
 
 
@@ -1102,7 +1257,8 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
 
 @functools.cache
 def compile_ep_gemm2(*, H, I, NE, ADT, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB=256,
-                     acm=2, SCH=1, ST=None, PRIO=0, TR=False, ORDER=False, SST=False):
+                     acm=2, SCH=1, ST=None, PRIO=0, TR=False, ORDER=False, SST=False,
+                     DYN=False):
     """Stage 2: ``out[token] += w_route * (A W2^T)`` for the sorted rows of one
     expert block, NO output columns per WG (bf16x2 atomics, ``out`` pre-zeroed).
 
@@ -1134,7 +1290,7 @@ def compile_ep_gemm2(*, H, I, NE, ADT, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4
         + (f"_acm{acm}" if acm != 2 else "") + (f"_s{SCH}" if SCH != 1 else "")
         + (f"_st{ST}" if ST is not None else "") + (f"_p{PRIO}" if PRIO else "")
         + ("_tr" if TR else "") + ("_o" if ORDER else "") + ("_sst" if SST else "")
-        + ("_tl" if TL else "")
+        + ("_dyn" if DYN else "") + ("_tl" if TL else "")
     )
     assert not (SST and TR), "single_store: LDS-staged epilogue only"
     TLP = tl_buffer().data_ptr() if TL else 0  # closure scalar -> in the cache key
@@ -1337,16 +1493,29 @@ def compile_ep_gemm2(*, H, I, NE, ADT, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4
                 if t < hi:
                     gpu.barrier()
         else:
-            if bx < bound:
-                tile = _xcd_tile(bx, bound)
-                m_block, n_block = _tile_of(tile, NB)
-                if const_expr(TL):
-                    t0 = _tl_now()
-                txo, laneo, waveo = _opaque_tx(tx)
-                _body(lds_ptr, arg_a, arg_as, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
-                      arg_sw, arg_out, i32_m, i32_sorted, m_block, n_block, laneo, waveo, txo)
-                if const_expr(TL):
-                    _tl_record(TLP, tile, bx, m_block, t0, tx)
+            if const_expr(DYN):  # the grid may be below the tile bound: stride
+                t = bx
+                while t < bound:
+                    m_block, n_block = _tile_of(_xcd_tile(t, bound), NB)
+                    txo, laneo, waveo = _opaque_tx(tx)
+                    _body(lds_ptr, arg_a, arg_as, arg_w, arg_ws, arg_wexp, arg_eids,
+                          arg_sids, arg_sw, arg_out, i32_m, i32_sorted, m_block, n_block,
+                          laneo, waveo, txo)
+                    t = t + grid
+                    if t < bound:
+                        gpu.barrier()
+            else:
+                if bx < bound:
+                    tile = _xcd_tile(bx, bound)
+                    m_block, n_block = _tile_of(tile, NB)
+                    if const_expr(TL):
+                        t0 = _tl_now()
+                    txo, laneo, waveo = _opaque_tx(tx)
+                    _body(lds_ptr, arg_a, arg_as, arg_w, arg_ws, arg_wexp, arg_eids,
+                          arg_sids, arg_sw, arg_out, i32_m, i32_sorted, m_block, n_block,
+                          laneo, waveo, txo)
+                    if const_expr(TL):
+                        _tl_record(TLP, tile, bx, m_block, t0, tx)
 
     @flyc.kernel(name=kname, known_block_size=[NT, 1, 1])
     def kernel(arg_a: fx.Int64, arg_as: fx.Int64, arg_w: fx.Int64, arg_ws: fx.Int64,
@@ -1372,7 +1541,8 @@ def compile_ep_gemm2(*, H, I, NE, ADT, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4
 
 def ep_gemm2(a, a_scale, W, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
              out, *, adt, block_m, no=128, rowv=None, pf=2, bcm=2, wpe=None, nw=4, arb=256,
-             acm=2, sch=1, st=None, prio=0, tr=False, sched=None, single_store=False):
+             acm=2, sch=1, st=None, prio=0, tr=False, sched=None, single_store=False,
+             dyn=False, grid=None):
     """Host launcher. ``a``: fp8 (u8) [sorted, I] + ``a_scale`` f32 [sorted, I/128] or
     bf16 [sorted, I]; ``out`` bf16 [tokens, H], pre-zeroed, atomically accumulated.
     ``sched``: see ``ep_gemm1``. ``single_store``: rows of tokens with one local
@@ -1385,14 +1555,16 @@ def ep_gemm2(a, a_scale, W, sorted_ids, sorted_weights, sorted_expert_ids, num_v
     launch = compile_ep_gemm2(H=H, I=I, NE=NE, ADT=adt, BM=block_m, NO=no,
                               ROWV=tuple(rowv or (block_m,)), PF=pf, bcm=bcm, wpe=wpe,
                               NW=nw, ARB=arb, acm=acm, SCH=sch, ST=st, PRIO=prio, TR=tr,
-                              ORDER=sched is not None, SST=single_store)
-    grid = _grid(sorted_expert_ids.numel() * (H // no), sched)
+                              ORDER=sched is not None, SST=single_store, DYN=dyn)
+    if grid is None:
+        grid = _grid(sorted_expert_ids.numel() * (H // no), sched)
+    assert not dyn or grid % 8 == 0
     _run_compiled(
         launch, a.data_ptr(), a_scale.data_ptr() if a_scale is not None else 0,
         W["w2"].data_ptr(), W["w2_scale"].data_ptr(), W["w2_exp"].data_ptr(),
         sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), sorted_ids.data_ptr(),
         sorted_weights.data_ptr(), out.data_ptr(), int(M), int(sorted_rows),
-        sched.data_ptr() if sched is not None else 0, grid, torch.cuda.current_stream())
+        sched.data_ptr() if sched is not None else 0, int(grid), torch.cuda.current_stream())
     return out
 
 
@@ -1431,12 +1603,13 @@ def pick_cfg(tokens):
             return CFGS[name]
 
 
-def ep_moe(x, W, topk_weights, topk_ids, *, e0, adt="fp8", cfg=None):
+def ep_moe(x, W, topk_weights, topk_ids, *, e0, adt="fp8", cfg=None, act="silu", **situ):
     """EP8 local MoE: bf16 x [M, H] -> bf16 [M, H] = sum over the token's LOCAL
     experts of w * expert(x) (global ``topk_ids``; the rank owns the experts
     [e0, e0 + E), E = the local weight count, in that order).
     ``adt``: "fp8" (a8w4) or "bf16" (a16w4); ``cfg``: an entry of ``CFGS`` (None:
-    ``pick_cfg(M)``).
+    ``pick_cfg(M)``). ``act``: "silu" or "situv2"; ``situ``: situ_beta /
+    situ_linear_beta / swiglu_limit (see ``ep_gemm1``).
     3 launches: prep (sort + x quant), gemm1 (+ zeroes the output), gemm2."""
     M, H = x.shape
     cfg = cfg if cfg is not None else pick_cfg(M)
@@ -1450,7 +1623,8 @@ def ep_moe(x, W, topk_weights, topk_ids, *, e0, adt="fp8", cfg=None):
     sorted_size = seids.numel() * bm
     sc = sched if cfg.get("sched", True) else None
     sst = cfg.get("sst", True)  # single-route tokens: store in gemm2, no zeroing
-    g1 = dict(dict(rowv=rowv, sched=sc, zero_rc=rc if sst else None), **cfg["g1"])
+    g1 = dict(dict(rowv=rowv, sched=sc, zero_rc=rc if sst else None, act=act, **situ),
+              **cfg["g1"])
     g2 = dict(dict(rowv=rowv, sched=sc, single_store=sst), **cfg["g2"])
     if not fp8:
         g1.pop("arb", None)  # a16w4: one 128-K W chunk = 256 A bytes per row
@@ -1467,4 +1641,59 @@ def ep_moe(x, W, topk_weights, topk_ids, *, e0, adt="fp8", cfg=None):
         a_s = None
         ep_gemm1(x, None, W, sids, seids, nv, a, None, adt=adt, block_m=bm, zero=out, **g1)
     ep_gemm2(a, a_s, W, sids, sw, seids, nv, out, adt=adt, block_m=bm, **g2)
+    return out
+
+
+def _dyn_grid(tiles):
+    return max(8, -(-tiles // 8) * 8)
+
+
+def ep_moe_dyn(x, x_scale, W, topk_weights, topk_ids, m_valid, *, e0, est_tokens=None,
+               out=None, cfg=None, act="silu", **situ):
+    """a8w4 EP MoE on an all-to-all receive buffer (e.g. MORI dispatch).
+
+    ``x`` [M, H] is capacity sized: only rows [0, m_valid[0]) are valid (``m_valid``:
+    int32 device tensor, read by the kernels, so no host sync / CUDA-graph safe);
+    ``topk_ids`` (global ids, the rank owns [e0, e0 + E)) / ``topk_weights``
+    [M, topk] likewise. ``x``: fp8 FNUZ with ``x_scale`` f32 [M, H/128] (blockwise
+    dispatch quant) or [M] / [M, 1] (per token), or bf16 with ``x_scale`` None
+    (quantized per token by the prep).
+    ``est_tokens``: host estimate of the valid rows, only for the config and the
+    GEMM grids (the WGs stride over the tiles, so any value is correct).
+    ``act`` / ``situ``: as ``ep_moe``.
+    Returns bf16 [M, H] (or ``out``); rows >= m_valid are left undefined."""
+    M, H = x.shape
+    est = M if est_tokens is None else max(1, min(M, int(est_tokens)))
+    cfg = cfg if cfg is not None else pick_cfg(est)
+    E = W["w2"].shape[0]
+    K = topk_ids.shape[1]
+    bm = cfg["bm"]
+    rowv = cfg.get("rowv", (bm,))
+    I = W["w2"].shape[2] * 2
+    quant = x.dtype == torch.bfloat16
+    sids, sw, seids, nv, x8, xs, sched, rc = PR.ep_prep(
+        topk_ids, topk_weights, x, e0=e0, block_m=bm, quant=quant, num_local=E,
+        m_valid=m_valid)
+    x_group = False
+    if not quant:
+        x8 = x
+        if x_scale.dim() == 2 and x_scale.shape[1] > 1:
+            assert x_scale.shape == (M, H // QG1), x_scale.shape
+            xs, x_group = x_scale.contiguous(), True
+        else:
+            xs = x_scale.reshape(M).contiguous()
+    sorted_size = seids.numel() * bm
+    sc = sched if cfg.get("sched", True) else None
+    # grid: the m-blocks the estimate can produce (capped by the capacity)
+    nblk = min(seids.numel(), est * K // bm + E)
+    g1 = dict(dict(rowv=rowv, sched=sc, zero_rc=rc, act=act, **situ), **cfg["g1"])
+    g2 = dict(dict(rowv=rowv, sched=sc, single_store=True), **cfg["g2"])
+    if out is None:
+        out = torch.empty((M, H), dtype=torch.bfloat16, device=x.device)
+    a = torch.empty((sorted_size, I), dtype=torch.uint8, device=x.device)
+    a_s = torch.empty((sorted_size, I // QG1), dtype=torch.float32, device=x.device)
+    ep_gemm1(x8, xs, W, sids, seids, nv, a, a_s, adt="fp8", block_m=bm, zero=out,
+             x_group=x_group, dyn=True, grid=_dyn_grid(nblk * (I // g1["ni"])), **g1)
+    ep_gemm2(a, a_s, W, sids, sw, seids, nv, out, adt="fp8", block_m=bm, dyn=True,
+             grid=_dyn_grid(nblk * (H // g2["no"])), **g2)
     return out

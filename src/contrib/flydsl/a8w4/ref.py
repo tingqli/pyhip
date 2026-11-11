@@ -12,9 +12,10 @@ import torch
 from .weights import prepare_weights, shuffle_mxfp4
 
 ACTS = ("silu", "situv2")
-# SiTUv2 params used by the tests: the clamp sits inside the gate/up range of the
-# random data (std ~64), so clamped and free values both occur.
-SITU = dict(situ_beta=4.0, situ_linear_beta=25.0, swiglu_limit=64.0)
+# SiTUv2 params used by the tests: the clamp (16) sits well inside the gate/up range
+# of the random data (std ~64), so most values are clamped and a missing or wrong
+# clamp changes the result far beyond the test tolerance (cos diff ~0.1).
+SITU = dict(situ_beta=4.0, situ_linear_beta=25.0, swiglu_limit=16.0)
 ROUTINGS = ("uniform", "hot")
 HOT_EXPERT_DIV = 32  # "hot": 1/32 of the experts get a +2 score bias
 HOT_EXPERT_BIAS = 2.0
@@ -105,18 +106,28 @@ def _quant_fp8(a, group):
     return ((g / s).to(torch.float8_e4m3fnuz).float() * s).view(a.shape)
 
 
-def ref_moe(x, topk_weights, topk_ids, raw, expert_offset=0, act="silu", situ=None):
+def quant_fp8_groups(x, group=128):
+    """x [M, H] -> (fp8 FNUZ [M, H], f32 scale [M, H/group]), one scale per (row,
+    ``group`` columns): the layout of a blockwise-fp8 EP dispatch (``a8w4_moe_dyn``)."""
+    g = x.float().view(x.shape[0], -1, group)
+    s = g.abs().amax(-1, keepdim=True).clamp(min=1e-30) / 240.0
+    return (g / s).to(torch.float8_e4m3fnuz).view(x.shape), s.view(x.shape[0], -1)
+
+
+def ref_moe(x, topk_weights, topk_ids, raw, expert_offset=0, act="silu", situ=None,
+            quant_x=True):
     """fp32 reference of this rank's partial MoE [tokens, H]: experts
     [expert_offset, expert_offset + E) of the global ``topk_ids``; x and the
     activation output are fp8-quantized as the kernels do (x per row, the
     intermediate per (row, 128 cols)), so the remaining differences are
-    accumulation order and the bf16 output."""
+    accumulation order and the bf16 output. ``quant_x=False``: x is used as given
+    (an already fp8-quantized input, dequantized)."""
     tokens, H = x.shape
     E, n2, _ = raw["w1q"].shape
     inter = n2 // 2
     loc = topk_ids.long() - expert_offset
     loc = torch.where((loc >= 0) & (loc < E), loc, torch.full_like(loc, -1))
-    xf = _quant_fp8(x.float(), H)
+    xf = _quant_fp8(x.float(), H) if quant_x else x.float()
     out = torch.zeros((tokens, H), dtype=torch.float32, device=x.device)
     for e in loc[loc >= 0].unique().tolist():
         tok, slot = torch.nonzero(loc == e, as_tuple=True)

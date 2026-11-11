@@ -13,6 +13,10 @@ in ``W``. TP (each rank: all experts, a 1/tp slice of inter_dim) is the case
 expert_offset = 0, num_experts = E; EP (each rank: E whole experts) passes the global
 ids. Either way ``out`` is this rank's partial sum; the caller reduces across ranks.
 
+``a8w4_moe_dyn`` is the EP variant for all-to-all receive buffers (e.g. MORI
+dispatch): capacity-sized inputs whose valid row count is a device tensor, x in bf16
+or in fp8 with per-(token, 128) scales; no host sync, CUDA-graph safe.
+
 Kernel families (all consume the same ``W``; see README.md):
   tp2k   moe_sorting -> x row quant -> gemm1 (q8s epilogue) -> gemm2 (atomic scatter)
   tp1k   moe_sorting -> x row quant -> one fused gemm1 + gemm2 kernel (BM 64)
@@ -39,6 +43,7 @@ from .weights import weight_shape
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV = os.path.join(HERE, "configs", "a8w4_moe_tuned.csv")
 KINDS = ("tp2k", "tp1k", "tp1kq", "ep3k", "ep1k")
+ACTS = ("silu", "situv2")  # every kernel family implements both
 EP_MAX_LOCAL_EXPERTS = 32  # ep_prep / ep_small: one wave holds the per-expert scans
 EP_SMALL_MAXM = 512  # ep1k compile-time token capacity
 
@@ -89,6 +94,8 @@ def supported(cfg, shape, *, act="silu", capturing=False, tokens=None):
     only; a tuned table holds just configs that ran on its shape."""
     H, I, E, EGl, topk = shape
     k = cfg["kind"]
+    if act not in ACTS:
+        return False
     if k.startswith("tp"):
         if I % 256 or H % 512:
             return False
@@ -97,8 +104,8 @@ def supported(cfg, shape, *, act="silu", capturing=False, tokens=None):
         if k == "tp1k":
             return (I // 128) % cfg["ksplit"] == 0 and I // cfg["ksplit"] <= 512
         return I == 256 and not capturing  # tp1kq: host-side launch epoch
-    # EP family: SiLU only, <= 32 local experts, 64 % topk == 0, M < 65536
-    if act != "silu" or E > EP_MAX_LOCAL_EXPERTS or 64 % topk or H % 512:
+    # EP family: <= 32 local experts, 64 % topk == 0, M < 65536
+    if E > EP_MAX_LOCAL_EXPERTS or 64 % topk or H % 512:
         return False
     if tokens is not None and tokens >= 65536:
         return False
@@ -177,11 +184,11 @@ def _run_tp1kq(cfg, x, W, tw, ti, shape, e0, akw):
 
 
 def _run_ep3k(cfg, x, W, tw, ti, shape, e0, akw):
-    return EG.ep_moe(x, W, tw, ti, e0=e0, adt="fp8", cfg=EG.CFGS[cfg["cfg"]])
+    return EG.ep_moe(x, W, tw, ti, e0=e0, adt="fp8", cfg=EG.CFGS[cfg["cfg"]], **akw)
 
 
 def _run_ep1k(cfg, x, W, tw, ti, shape, e0, akw):
-    return ES.ep_moe_small(x, W, tw, ti, e0=e0, adt="fp8", maxm=cfg["maxm"])
+    return ES.ep_moe_small(x, W, tw, ti, e0=e0, adt="fp8", maxm=cfg["maxm"], **akw)
 
 
 RUNNERS = dict(tp2k=_run_tp2k, tp1k=_run_tp1k, tp1kq=_run_tp1kq, ep3k=_run_ep3k,
@@ -195,11 +202,7 @@ def run_config(cfg, x, W, topk_weights, topk_ids, *, expert_offset=0, num_expert
         cfg = parse_config(cfg)
     E, H, I = weight_shape(W)
     shape = (H, I, E, num_experts or E, topk_ids.shape[1])
-    akw = {}
-    if cfg["kind"].startswith("tp"):
-        akw = dict(act=act, **(situ or {}))
-    elif act != "silu":
-        raise ValueError(f"{config_name(cfg)}: EP kernels implement SiLU only")
+    akw = dict(act=act, **(situ or {}))
     return RUNNERS[cfg["kind"]](cfg, x, W, topk_weights, topk_ids, shape, expert_offset, akw)
 
 
@@ -242,24 +245,45 @@ def lookup_config(shape, tokens, *, act="silu", capturing=False, routing="unifor
                   csv_path=DEFAULT_CSV):
     """Fastest supported config of the first tuned point >= ``tokens`` (the largest
     point if beyond the table); ``default_config`` if the shape is not tuned."""
-    rows = None
-    if csv_path and os.path.exists(csv_path):
-        rows = _load_table(csv_path, os.path.getmtime(csv_path)).get((*shape, routing))
+    rows = _table_rows(shape, routing, csv_path)
     if rows:
         return _pick(rows, shape, tokens, act, capturing)
     return default_config(shape, tokens, act, capturing)
 
 
+def _table_rows(shape, routing, csv_path):
+    if not csv_path or not os.path.exists(csv_path):
+        return None
+    return _load_table(csv_path, os.path.getmtime(csv_path)).get((*shape, routing))
+
+
+def _point(rows, tokens):
+    """Candidates of the first tuned point >= tokens (the largest point beyond)."""
+    return next((c for n, c in rows if n >= tokens), rows[-1][1])
+
+
 def _pick(rows, shape, tokens, act, capturing):
-    cands = rows[-1][1]
-    for n, c in rows:
-        if n >= tokens:
-            cands = c
-            break
-    for _, cfg in cands:
+    for _, cfg in _point(rows, tokens):
         if supported(cfg, shape, act=act, capturing=capturing, tokens=tokens):
             return cfg
     return default_config(shape, tokens, act, capturing)
+
+
+def dyn_config(shape, tokens, *, act="silu", routing="uniform", csv_path=DEFAULT_CSV):
+    """Config of ``a8w4_moe_dyn`` (EP kernels only): the fastest supported ``ep3k``
+    config of the tuned point >= ``tokens``, else the EP auto thresholds."""
+    ok = lambda c: c["kind"] == "ep3k" and supported(c, shape, act=act)  # noqa: E731
+    rows = _table_rows(shape, routing, csv_path)
+    if rows:
+        for _, cfg in _point(rows, tokens):
+            if ok(cfg):
+                return cfg
+    names = [n for lim, n in EG.AUTO if lim is None or tokens <= lim]
+    for name in names + [n for _, n in EG.AUTO]:
+        if ok(dict(kind="ep3k", cfg=name)):
+            return dict(kind="ep3k", cfg=name)
+    raise ValueError(f"a8w4_moe_dyn: (H, I, E, E_global, topk) = {shape} is not "
+                     "supported by the EP kernels (see supported())")
 
 
 # =============================================================================
@@ -275,7 +299,7 @@ def a8w4_moe(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
     topk_ids int32 [M, topk] (global expert ids). expert_offset / num_experts: the
     rank owns global experts [expert_offset, expert_offset + E) of num_experts
     (defaults: 0 / E = TP). act: "silu" | "situv2" (situ: dict(situ_beta,
-    situ_linear_beta, swiglu_limit); TP kernels only). config: a config (dict or
+    situ_linear_beta, swiglu_limit); all kernel families). config: a config (dict or
     name, see ``config_name``) to force, else the tuned table at ``csv_path`` decides.
     Under CUDA-graph capture only graph-safe configs are picked."""
     E, H, I = weight_shape(W)
@@ -283,6 +307,8 @@ def a8w4_moe(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
     assert x.dtype == torch.bfloat16 and x.shape == (M, H) and x.is_contiguous(), x.shape
     assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
     assert topk_weights.shape == (M, topk)
+    if M == 0:
+        return x.new_empty((0, H))
     shape = (H, I, E, num_experts or E, topk)
     if config is None:
         config = lookup_config(shape, M, act=act,
@@ -290,3 +316,41 @@ def a8w4_moe(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
                                routing=routing, csv_path=csv_path)
     return run_config(config, x, W, topk_weights, topk_ids, expert_offset=expert_offset,
                       num_experts=num_experts, act=act, situ=situ)
+
+
+def a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_offset=0,
+                 num_experts=None, act="silu", situ=None, est_tokens=None, out=None,
+                 config=None, routing="uniform", csv_path=DEFAULT_CSV):
+    """EP MoE on a capacity-sized all-to-all receive buffer (e.g. MORI dispatch).
+
+    Only rows [0, m_valid[0]) of ``x`` / ``topk_ids`` / ``topk_weights`` [M, ...] are
+    valid; ``m_valid`` is an int32 device tensor read by the kernels (no host sync,
+    one CUDA graph serves any count up to M). ``x``: bf16 [M, H] (``x_scale`` None,
+    quantized per row by the prep) or fp8 FNUZ [M, H] with ``x_scale`` f32 [M, H/128]
+    (per (token, 128) block, e.g. MORI's blockwise fp8 dispatch) or [M] (per token).
+    ``topk_ids`` are global; the rank owns [expert_offset, expert_offset + E).
+    ``act`` / ``situ``: as ``a8w4_moe``.
+    ``est_tokens`` (default M): host estimate of the valid rows, only used to pick
+    the config and size the grids (the workgroups stride over the actual tiles, so
+    any value is correct). Returns bf16 [M, H] (written into ``out`` if given); rows
+    >= m_valid are undefined. EP kernels only (<= 32 local experts, M < 65536; see
+    ``supported``)."""
+    E, H, I = weight_shape(W)
+    M, topk = topk_ids.shape
+    assert x.shape == (M, H) and x.is_contiguous(), x.shape
+    assert x.dtype in (torch.bfloat16, torch.float8_e4m3fnuz), x.dtype
+    assert (x.dtype == torch.bfloat16) == (x_scale is None), "fp8 x needs x_scale"
+    assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
+    assert m_valid.dtype == torch.int32 and m_valid.is_cuda, m_valid
+    if M == 0:
+        return out if out is not None else x.new_empty((0, H), dtype=torch.bfloat16)
+    shape = (H, I, E, num_experts or E, topk)
+    est = M if est_tokens is None else max(1, min(M, int(est_tokens)))
+    if config is None:
+        config = dyn_config(shape, est, act=act, routing=routing, csv_path=csv_path)
+    elif isinstance(config, str):
+        config = parse_config(config)
+    assert config["kind"] == "ep3k", f"{config_name(config)}: a8w4_moe_dyn runs ep3k only"
+    return EG.ep_moe_dyn(x, x_scale, W, topk_weights, topk_ids, m_valid, e0=expert_offset,
+                         est_tokens=est, out=out, cfg=EG.CFGS[config["cfg"]], act=act,
+                         **(situ or {}))

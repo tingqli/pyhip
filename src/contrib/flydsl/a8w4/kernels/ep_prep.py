@@ -25,6 +25,12 @@ The row order inside an expert depends on atomic order (not deterministic).
 x quant: one wave per row; each wave first loads the topk ids of all its rows (lane i
 = row i) and ballots the rows with a local expert, then walks them with the next
 row's x loads issued before the current row is reduced and packed.
+
+``MDYN`` (EP all-to-all receive buffers, e.g. MORI): ``M`` is the buffer capacity
+(padding token id, buffer layout) while only the first ``m_valid`` rows (an i32 read
+on device, clamped to M) are sorted / quantized; ``num_valid_ids[1]`` = m_valid. A
+MULTI-compiled kernel then picks the single-WG sort at run time when the valid
+entries fit one WG.
 """
 
 import functools
@@ -97,9 +103,10 @@ def _latomic_add(lds_i32, idx, val):
 
 
 @functools.cache
-def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI):
+def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
     """Sort coverage: grid * 256 * EPT >= M * TOPK (MULTI) or 256 * EPT (single)."""
     assert H % 512 == 0
+    assert EL <= 32, "padded-count scan runs over 32 lanes"
     CH = H // 512  # 16 B (8 bf16) loads per lane per row
     # LDS (i32): cnt[EL+1] (slot EL = dummy for non-local entries), base[EL],
     # gcnt[EL], off[EL+1], per wave: quant row count + 64 compacted rows
@@ -111,7 +118,8 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI):
     L_RCNT = 5 * EL + 22
     L_ROWS = L_RCNT + NT // 64
     LDS_I32 = L_ROWS + NT
-    kname = f"ep_prep_h{H}_k{TOPK}_e{EL}_bm{BM}_ept{EPT}_q{int(QUANT)}_m{int(MULTI)}"
+    kname = (f"ep_prep_h{H}_k{TOPK}_e{EL}_bm{BM}_ept{EPT}_q{int(QUANT)}_m{int(MULTI)}"
+             + ("_dyn" if MDYN else ""))
 
     @fx.struct
     class SharedStorage:
@@ -134,7 +142,7 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI):
         xs = global_typed_ptr(arg_xs, T.f32)
         # lane i: does row gw + i*tw have a local expert? compact those rows in LDS
         my_t = gw + lane * tw
-        my_tc = fx.min(my_t, i32_m - fx.Int32(1))
+        my_tc = fx.max(fx.min(my_t, i32_m - fx.Int32(1)), fx.Int32(0))
         loc = fx.Int32(0)
         for k in range_constexpr(TOPK):
             e = fx.Int32(ids[my_tc * fx.Int32(TOPK) + fx.Int32(k)]) - i32_e0
@@ -383,15 +391,16 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI):
                                                                + fx.Int32(SCHED_BORDER)) * fx.Int64(4),
                                 T.i32)
 
-    def _finish_sort(lds_i32, lds, arg_sids, arg_sw, arg_seids, arg_nv, ent, i32_m, me, tx):
+    def _finish_sort(lds_i32, lds, arg_sids, arg_sw, arg_seids, arg_nv, ent, i32_m, i32_mv,
+                     me, tx):
         sids = global_typed_ptr(arg_sids, T.i32)
         sw = global_typed_ptr(arg_sw, T.f32)
         for es, pos, w, idc, single in ent:
             _scatter(lds, sids, sw, es, pos, w, idc, single)
-        _pad_and_nv(lds_i32, lds, sids, sw, arg_seids, arg_nv, i32_m, me, tx)
+        _pad_and_nv(lds_i32, lds, sids, sw, arg_seids, arg_nv, i32_m, i32_mv, me, tx)
 
     @flyc.jit
-    def _pad_and_nv(lds_i32, lds, sids, sw, arg_seids, arg_nv, i32_m, me, tx):
+    def _pad_and_nv(lds_i32, lds, sids, sw, arg_seids, arg_nv, i32_m, i32_mv, me, tx):
         if me == fx.Int32(0):
             # the GEMM schedule lives in the same buffer, after the cap // BM block ids
             nblk = (i32_m * fx.Int32(TOPK)) // fx.Int32(BM) + fx.Int32(EL)
@@ -403,21 +412,21 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI):
             if tx == fx.Int32(0):
                 nv = global_typed_ptr(arg_nv, T.i32)
                 nv[fx.Int32(0)] = lds[fx.Int32(L_OFF + EL)]
-                nv[fx.Int32(1)] = i32_m
+                nv[fx.Int32(1)] = i32_mv
 
     @flyc.jit
     def _single_sort(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids, arg_nv,
-                     i32_m, i32_e0, tx):
-        """whole sort in one WG, LDS only (M * TOPK <= 256 * EPT)."""
+                     i32_m, i32_mv, i32_e0, tx):
+        """whole sort in one WG, LDS only (m_valid * TOPK <= 256 * EPT)."""
         ent = _count(lds_i32, arg_ids, arg_w, _rc_ptr(arg_seids, i32_m), fx.Int32(0),
-                     i32_m * fx.Int32(TOPK), i32_e0, tx)
+                     i32_mv * fx.Int32(TOPK), i32_e0, tx)
         gpu.barrier()
         _copy_counts(lds, tx)
         gpu.barrier()
         _prefix(lds, tx)
         gpu.barrier()
-        _finish_sort(lds_i32, lds, arg_sids, arg_sw, arg_seids, arg_nv, ent, i32_m, fx.Int32(0),
-                     tx)
+        _finish_sort(lds_i32, lds, arg_sids, arg_sw, arg_seids, arg_nv, ent, i32_m, i32_mv,
+                     fx.Int32(0), tx)
 
     @flyc.jit
     def _copy_counts(lds, tx):
@@ -456,7 +465,7 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI):
 
     @flyc.jit
     def _entry(arg_ids, arg_w, arg_x, arg_x8, arg_xs, arg_sids, arg_sw, arg_seids, arg_nv,
-               arg_ws, i32_m, i32_e0):
+               arg_ws, i32_m, i32_e0, arg_mv):
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         lds_i32 = fx.Int32(fx.ptrtoint(lds_ptr))
         lds = lds_typed_ptr(lds_i32, T.i32)
@@ -469,57 +478,86 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI):
             lds[fx.Int32(L_CNT) + tx] = fx.Int32(0)
         if tx < fx.Int32(NT // 64):
             lds[fx.Int32(L_RCNT) + tx] = fx.Int32(0)
+        # valid rows: the capacity, or a device count clamped to [0, capacity]
+        if const_expr(MDYN):
+            i32_mv = fx.max(fx.min(fx.Int32(rocdl.readfirstlane(T.i32, _raw(
+                fx.Int32(global_typed_ptr(arg_mv, T.i32)[fx.Int32(0)])))), i32_m), fx.Int32(0))
+        else:
+            i32_mv = i32_m
         gpu.barrier()
         # WGs [0, n_sort): sort; [n_sort, grid): x quant (no sync with the sort)
-        n_sort = (i32_m * fx.Int32(TOPK) + fx.Int32(EPT * NT - 1)) // fx.Int32(EPT * NT)
+        n_sort = fx.max((i32_mv * fx.Int32(TOPK) + fx.Int32(EPT * NT - 1)) // fx.Int32(EPT * NT),
+                        fx.Int32(1))
         if const_expr(not MULTI):
             n_sort = fx.Int32(1)
         if bx < n_sort:
             _sort_role(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids, arg_nv,
-                       arg_ws, i32_m, i32_e0, n_sort, bx, tx)
+                       arg_ws, i32_m, i32_mv, i32_e0, n_sort, bx, tx)
         if const_expr(QUANT):
             if bx >= n_sort:
-                _quant(lds_i32, lds, arg_x, arg_x8, arg_xs, arg_ids, i32_m, i32_e0,
+                _quant(lds_i32, lds, arg_x, arg_x8, arg_xs, arg_ids, i32_mv, i32_e0,
                        (bx - n_sort) * fx.Int32(NT // 64) + wave,
                        (grid - n_sort) * fx.Int32(NT // 64), lane, wave)
 
+    def _multi_sort(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids, arg_nv,
+                    arg_ws, i32_m, i32_mv, i32_e0, n_sort, bx, tx):
+        ent = _count(lds_i32, arg_ids, arg_w, _rc_ptr(arg_seids, i32_m),
+                     bx * fx.Int32(EPT * NT), i32_mv * fx.Int32(TOPK), i32_e0, tx)
+        gpu.barrier()
+        _reserve(lds, arg_ws, tx)
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+        _grid_sync(arg_ws, n_sort, tx)
+        gpu.barrier()
+        _read_counts(lds, arg_ws, tx)
+        gpu.barrier()
+        _prefix(lds, tx)
+        gpu.barrier()
+        _finish(arg_ws, n_sort, tx)  # counts already read by this WG
+        _finish_sort(lds_i32, lds, arg_sids, arg_sw, arg_seids, arg_nv, ent, i32_m, i32_mv,
+                     bx, tx)
+
+    @flyc.jit
+    def _sort_dyn(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids, arg_nv,
+                  arg_ws, i32_m, i32_mv, i32_e0, n_sort, bx, tx):
+        """MULTI + MDYN: the valid entries may fit one WG -> LDS-only sort."""
+        if n_sort == fx.Int32(1):
+            _single_sort(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids,
+                         arg_nv, i32_m, i32_mv, i32_e0, tx)
+        else:
+            _multi_sort(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids, arg_nv,
+                        arg_ws, i32_m, i32_mv, i32_e0, n_sort, bx, tx)
+
     @flyc.jit
     def _sort_role(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids, arg_nv,
-                   arg_ws, i32_m, i32_e0, n_sort, bx, tx):
+                   arg_ws, i32_m, i32_mv, i32_e0, n_sort, bx, tx):
         if const_expr(not MULTI):
             _single_sort(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids,
-                         arg_nv, i32_m, i32_e0, tx)
+                         arg_nv, i32_m, i32_mv, i32_e0, tx)
         else:
-            ent = _count(lds_i32, arg_ids, arg_w, _rc_ptr(arg_seids, i32_m),
-                         bx * fx.Int32(EPT * NT), i32_m * fx.Int32(TOPK), i32_e0, tx)
-            gpu.barrier()
-            _reserve(lds, arg_ws, tx)
-            rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
-            _grid_sync(arg_ws, n_sort, tx)
-            gpu.barrier()
-            _read_counts(lds, arg_ws, tx)
-            gpu.barrier()
-            _prefix(lds, tx)
-            gpu.barrier()
-            _finish(arg_ws, n_sort, tx)  # counts already read by this WG
-            _finish_sort(lds_i32, lds, arg_sids, arg_sw, arg_seids, arg_nv, ent, i32_m, bx, tx)
+            if const_expr(MDYN):
+                _sort_dyn(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids,
+                          arg_nv, arg_ws, i32_m, i32_mv, i32_e0, n_sort, bx, tx)
+            else:
+                _multi_sort(lds_i32, lds, arg_ids, arg_w, arg_sids, arg_sw, arg_seids,
+                            arg_nv, arg_ws, i32_m, i32_mv, i32_e0, n_sort, bx, tx)
 
     @flyc.kernel(name=kname, known_block_size=[NT, 1, 1])
     def kernel(arg_ids: fx.Int64, arg_w: fx.Int64, arg_x: fx.Int64, arg_x8: fx.Int64,
                arg_xs: fx.Int64, arg_sids: fx.Int64, arg_sw: fx.Int64, arg_seids: fx.Int64,
-               arg_nv: fx.Int64, arg_ws: fx.Int64, i32_m: fx.Int32, i32_e0: fx.Int32):
+               arg_nv: fx.Int64, arg_ws: fx.Int64, i32_m: fx.Int32, i32_e0: fx.Int32,
+               arg_mv: fx.Int64):
         _entry(arg_ids, arg_w, arg_x, arg_x8, arg_xs, arg_sids, arg_sw, arg_seids, arg_nv,
-               arg_ws, i32_m, i32_e0)
+               arg_ws, i32_m, i32_e0, arg_mv)
 
     @flyc.jit
     def launch(arg_ids: fx.Int64, arg_w: fx.Int64, arg_x: fx.Int64, arg_x8: fx.Int64,
                arg_xs: fx.Int64, arg_sids: fx.Int64, arg_sw: fx.Int64, arg_seids: fx.Int64,
                arg_nv: fx.Int64, arg_ws: fx.Int64, i32_m: fx.Int32, i32_e0: fx.Int32,
-               i32_grid: fx.Int32, stream: fx.Stream):
+               arg_mv: fx.Int64, i32_grid: fx.Int32, stream: fx.Stream):
         kernel(arg_ids, arg_w, arg_x, arg_x8, arg_xs, arg_sids, arg_sw, arg_seids, arg_nv,
-               arg_ws, i32_m, i32_e0).launch(grid=(fx.Int64(i32_grid), 1, 1),
-                                             block=(NT, 1, 1), stream=stream)
+               arg_ws, i32_m, i32_e0, arg_mv).launch(grid=(fx.Int64(i32_grid), 1, 1),
+                                                     block=(NT, 1, 1), stream=stream)
 
     return launch
 
@@ -534,13 +572,15 @@ def _workspace(device, n):
     return _WS[key]
 
 
-def ep_prep(topk_ids, topk_weights, x, *, e0, block_m, quant, num_local=32):
+def ep_prep(topk_ids, topk_weights, x, *, e0, block_m, quant, num_local=32, m_valid=None):
     """-> (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, x8, xs,
     sched, route_counts); ``x8``/``xs`` are None unless ``quant`` (x bf16 [M, H] ->
     fp8 + f32 row scale). ``sched``: the GEMMs' tile schedule (see SCHED_BORDER):
     XCD bucket starts and the m-block order (``sched[SCHED_BORDER:]``, first
     num_valid_ids[0] // block_m valid). ``route_counts``: int32 [M], local routes per
-    token. Sorted ids carry SID_SINGLE for tokens with exactly one local route."""
+    token. Sorted ids carry SID_SINGLE for tokens with exactly one local route.
+    ``m_valid``: optional int32 device tensor; only rows [0, m_valid[0]) of the
+    (capacity-sized) inputs are sorted / quantized, num_valid_ids[1] = m_valid."""
     M, K = topk_ids.shape
     H = x.shape[1]
     dev = topk_ids.device
@@ -568,11 +608,12 @@ def ep_prep(topk_ids, topk_weights, x, *, e0, block_m, quant, num_local=32):
     assert not quant or M <= n_quant * (NT // 64) * 64
     grid = n_sort + n_quant
     launch = compile_ep_prep(H=H, TOPK=K, EL=num_local, BM=block_m, EPT=ept, QUANT=quant,
-                             MULTI=multi)
+                             MULTI=multi, MDYN=m_valid is not None)
     ws = _workspace(dev, num_local + 2)
     _run_compiled(
         launch, topk_ids.data_ptr(), topk_weights.data_ptr(), x.data_ptr(),
         x8.data_ptr() if quant else 0, xs.data_ptr() if quant else 0, sids.data_ptr(),
         sw.data_ptr(), seids.data_ptr(), nv.data_ptr(), ws.data_ptr(), int(M), int(e0),
+        m_valid.data_ptr() if m_valid is not None else 0,
         int(grid), torch.cuda.current_stream())
     return sids, sw, seids, nv, x8, xs, sched, rc

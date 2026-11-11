@@ -8,7 +8,10 @@
   TP8 and EP8 per-rank shapes (EP: rank 3, global expert ids);
 * ``a8w4_moe`` with the tuned table, including token counts between tuned points;
 * CUDA-graph capture: only graph-safe configs are picked, replay matches eager;
-* SiTUv2 on the TP kernels; the EP kernels refuse it.
+* SiTUv2 on every kernel family (TP and EP, incl. ``a8w4_moe_dyn``);
+* ``a8w4_moe_dyn`` on an all-to-all receive buffer (device-side valid count, stale
+  rows past it, bf16 or blockwise-fp8 x), incl. one CUDA graph replayed with
+  different counts.
 """
 
 import os
@@ -18,7 +21,15 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from a8w4 import a8w4_moe, lookup_config, parse_config, run_config, supported  # noqa: E402
+from a8w4 import (  # noqa: E402
+    a8w4_moe,
+    a8w4_moe_dyn,
+    dyn_config,
+    lookup_config,
+    parse_config,
+    run_config,
+    supported,
+)
 from a8w4 import ref as R  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
@@ -99,21 +110,119 @@ def test_cuda_graph(case, tokens):
     assert R.cos_diff(eager.float(), out.float()) < 1e-5
 
 
-@pytest.mark.parametrize("name", CONFIGS["tp8"])
-def test_situv2_tp(name):
-    W, x, tw, ti, ref = data("tp8", 300, act="situv2", situ=R.SITU)
-    out = run_config(parse_config(name), x, W, tw, ti, act="situv2", situ=R.SITU)
+@pytest.mark.parametrize("case,name", [(c, n) for c in SHAPES for n in CONFIGS[c]])
+def test_situv2_config(case, name):
+    H, I, E, EGl, K, e0 = SHAPES[case]
+    W, x, tw, ti, ref = data(case, 300, act="situv2", situ=R.SITU)
+    out = run_config(parse_config(name), x, W, tw, ti, expert_offset=e0, num_experts=EGl,
+                     act="situv2", situ=R.SITU)
     assert R.cos_diff(ref, out.float()) < COS_TOL
 
 
-def test_situv2_ep_dispatch():
+@pytest.mark.parametrize("case,tokens", [("tp8", 100), ("ep8", 5), ("ep8", 3000)])
+def test_situv2_dispatch(case, tokens):
+    """The table picks the same kernels for SiTUv2 as for SiLU (EP shape: EP family)."""
+    H, I, E, EGl, K, e0 = SHAPES[case]
+    shape = (H, I, E, EGl, K)
+    assert lookup_config(shape, tokens, act="situv2") == lookup_config(shape, tokens)
+    W, x, tw, ti, ref = data(case, tokens, act="situv2", situ=R.SITU, seed=7)
+    raw = weights(case)[1]
+    no_clamp = dict(R.SITU, swiglu_limit=float("inf"))
+    ref_no_clamp = R.ref_moe(x, tw, ti, raw, e0, "situv2", no_clamp)
+    assert R.cos_diff(ref, ref_no_clamp) > 10 * COS_TOL  # the clamp is exercised
+    out = a8w4_moe(x, W, tw, ti, expert_offset=e0, num_experts=EGl, act="situv2",
+                   situ=R.SITU)
+    assert R.cos_diff(ref, out.float()) < COS_TOL
+    with pytest.raises(ValueError):  # betas must be > 0
+        a8w4_moe(x, W, tw, ti, expert_offset=e0, num_experts=EGl, act="situv2",
+                 situ=dict(R.SITU, situ_beta=0.0))
+
+
+def recv_buffer(capacity, valid, seed, fp8):
+    """An EP all-to-all receive buffer of the ep8 case: rows [0, valid) are tokens with
+    >= 1 local route (global ids); the rows past ``valid`` are stale (NaN x, random
+    ids) and must be ignored. -> (x, x_scale, topk_weights, topk_ids, reference x)."""
     H, I, E, EGl, K, e0 = SHAPES["ep8"]
-    cfg = lookup_config((H, I, E, EGl, K), 64, act="situv2")
-    assert cfg["kind"].startswith("tp")  # EP kernels are SiLU-only
-    with pytest.raises(ValueError):
-        W, x, tw, ti, _ = data("ep8", 8)
-        run_config(parse_config("ep3k t16"), x, W, tw, ti, expert_offset=e0, num_experts=EGl,
-                   act="situv2", situ=R.SITU)
+    x, tw, ti = R.make_routing(capacity, H, EGl, K, seed=seed)
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    forced = torch.randint(e0, e0 + E, (capacity,), device="cuda", generator=g)
+    has_local = ((ti >= e0) & (ti < e0 + E)).any(-1)
+    ti[:, 0] = torch.where(has_local, ti[:, 0], forced.to(torch.int32))
+    ti[valid:] = torch.randint(0, EGl, ti[valid:].shape, device="cuda", generator=g,
+                               dtype=torch.int32)
+    x[valid:] = float("nan")
+    if not fp8:
+        return x, None, tw, ti, x
+    xq, xs = R.quant_fp8_groups(x)
+    x_ref = (xq.float().view(capacity, -1, 128) * xs.unsqueeze(-1)).view(capacity, H)
+    return xq, xs, tw, ti, x_ref
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("valid", [0, 1, 37, 300])
+def test_dyn_vs_ref(fp8, valid):
+    H, I, E, EGl, K, e0 = SHAPES["ep8"]
+    W, raw = weights("ep8")
+    capacity = 512
+    x, xs, tw, ti, x_ref = recv_buffer(capacity, valid, seed=valid, fp8=fp8)
+    m_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
+    out = a8w4_moe_dyn(x, W, tw, ti, m_valid, x_scale=xs, expert_offset=e0, num_experts=EGl,
+                       est_tokens=max(valid, 1))
+    assert out.shape == (capacity, H) and out.dtype == torch.bfloat16
+    if valid:
+        ref = R.ref_moe(x_ref[:valid], tw[:valid], ti[:valid], raw, e0, quant_x=not fp8)
+        assert R.cos_diff(ref, out[:valid].float()) < COS_TOL
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("valid,capacity", [(37, 512), (1500, 2048)])  # s16 / m64 (TR)
+def test_dyn_situv2(fp8, valid, capacity):
+    H, I, E, EGl, K, e0 = SHAPES["ep8"]
+    W, raw = weights("ep8")
+    x, xs, tw, ti, x_ref = recv_buffer(capacity, valid, seed=valid, fp8=fp8)
+    m_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
+    out = a8w4_moe_dyn(x, W, tw, ti, m_valid, x_scale=xs, expert_offset=e0, num_experts=EGl,
+                       act="situv2", situ=R.SITU, est_tokens=valid)
+    ref = R.ref_moe(x_ref[:valid], tw[:valid], ti[:valid], raw, e0, "situv2", R.SITU,
+                    quant_x=not fp8)
+    assert R.cos_diff(ref, out[:valid].float()) < COS_TOL
+
+
+def test_dyn_cuda_graph():
+    """One capture serves any device-side valid count; the estimate (128) may be below
+    it: the workgroups stride over the actual tiles."""
+    H, I, E, EGl, K, e0 = SHAPES["ep8"]
+    W, raw = weights("ep8")
+    capacity = 512
+    x, xs, tw, ti, _ = recv_buffer(capacity, capacity, seed=1, fp8=True)
+    m_valid = torch.tensor([64], dtype=torch.int32, device="cuda")
+    out = torch.empty((capacity, H), dtype=torch.bfloat16, device="cuda")
+    run = lambda: a8w4_moe_dyn(x, W, tw, ti, m_valid, x_scale=xs, expert_offset=e0,  # noqa: E731
+                               num_experts=EGl, est_tokens=128, out=out)
+    run()  # warm-up: compiles, allocates the prep workspace
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+    for valid in (64, 1, 400, 0, 512):
+        x2, xs2, tw2, ti2, x_ref = recv_buffer(capacity, valid, seed=10 + valid, fp8=True)
+        for dst, src in ((x, x2), (xs, xs2), (tw, tw2), (ti, ti2)):
+            dst.copy_(src)
+        m_valid.fill_(valid)
+        g.replay()
+        torch.cuda.synchronize()
+        if valid:
+            ref = R.ref_moe(x_ref[:valid], tw2[:valid], ti2[:valid], raw, e0, quant_x=False)
+            assert R.cos_diff(ref, out[:valid].float()) < COS_TOL, valid
+
+
+def test_dyn_config():
+    H, I, E, EGl, K, e0 = SHAPES["ep8"]
+    for tokens in (1, 300, 3000, 40000):
+        cfg = dyn_config((H, I, E, EGl, K), tokens)
+        assert cfg["kind"] == "ep3k" and supported(cfg, (H, I, E, EGl, K))
+    with pytest.raises(ValueError):  # TP8 shape: 256 local experts, no EP kernels
+        dyn_config(SHAPES["tp8"][:5], 16)
 
 
 if __name__ == "__main__":

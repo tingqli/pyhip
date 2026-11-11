@@ -1,6 +1,6 @@
 # a8w4：MiMo-V2.6-Flash 的 A8W4 MoE（gfx942，FlyDSL；TP / EP 一套接口）
 
-fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）。TP 和 EP 共用一个入口 `a8w4_moe`：每次调用按（shape，token 数）查调优表，从 5 类 kernel 里选出当前上下文（激活函数、是否在 CUDA graph capture 中、token 数）允许的最快配置。调优表覆盖 XiaomiMiMo/MiMo-V2.6-Flash(-RL) 的 TP8、EP8 每卡 shape（另有 TP4），1–32768 tokens。
+fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）。TP 和 EP 共用一个入口 `a8w4_moe`：每次调用按（shape，token 数）查调优表，从 5 类 kernel 里选出当前上下文（激活函数、是否在 CUDA graph capture 中、token 数）允许的最快配置。EP 的 all-to-all 接收缓冲区（例如 MORI dispatch：按容量分配，有效行数只在 device 上）用 `a8w4_moe_dyn`，不做 host 同步，可以放进 CUDA graph（2.4 节）。调优表覆盖 XiaomiMiMo/MiMo-V2.6-Flash(-RL) 的 TP8、EP8 每卡 shape（另有 TP4），1–32768 tokens。
 
 本目录是一个独立的 Python 包。kernel 只依赖 torch 和 FlyDSL 0.3.2，aiter 的 FlyDSL helper 已复制到 `_vendor/`。aiter 只在三处用到：TP 族 kernel 的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
 
@@ -24,9 +24,10 @@ fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）�
 ## 1. 快速开始
 
 ```python
+# 在 pyhip 里：from pyhip.contrib.flydsl.a8w4 import ...；单独复制出去时：
 import sys
 sys.path.insert(0, "/path/to/dir_that_contains_a8w4")
-from a8w4 import a8w4_moe, prepare_weights, shuffle_mxfp4
+from a8w4 import a8w4_moe, a8w4_moe_dyn, prepare_weights, shuffle_mxfp4
 
 # 加载权重时做一次
 W = prepare_weights(w1, w2, w1_scale, w2_scale)            # 已是 aiter a16w4 preshuffle 格式的 mxfp4 权重
@@ -36,6 +37,9 @@ W = prepare_weights(*shuffle_mxfp4(w1q, w1s, w2q, w2s))    # 或者：未 shuffl
 out = a8w4_moe(x, W, topk_weights, topk_ids)                        # TP：之后在 TP 组内 all-reduce
 out = a8w4_moe(x, W, topk_weights, topk_ids,
                expert_offset=ep_rank * E_local, num_experts=256)   # EP：之后跨 EP 组求和
+# EP + all-to-all（例如 MORI）：x 是按容量分配的接收缓冲区，有效行数 m_valid 是 int32 device 张量
+out = a8w4_moe_dyn(x8, W, topk_weights, topk_ids, m_valid, x_scale=x8_scale,
+                   expert_offset=ep_rank * E_local, num_experts=256)
 ```
 
 在包含 `a8w4/` 的目录下运行：
@@ -68,7 +72,7 @@ E 是 `W` 中的本地专家数，e0 = `expert_offset`。
 | `topk_ids` | int32 [M, topk]，全局专家 id。EP kernel 只处理 [e0, e0+E) 内的 id，其他值（包括 -1）视为不属于本卡；TP 族 kernel 走 aiter `moe_sorting`，id 必须落在 [0, num_experts) 内 |
 | `W` | `prepare_weights` 的输出 |
 | `expert_offset` / `num_experts` | 见上；默认 0 / E，即 TP |
-| `act`, `situ` | `"silu"`（默认）或 `"situv2"`；`situ=dict(situ_beta, situ_linear_beta, swiglu_limit)`。situv2 只有 TP 族支持 |
+| `act`, `situ` | `"silu"`（默认）或 `"situv2"`；`situ=dict(situ_beta, situ_linear_beta, swiglu_limit)`。两族 kernel 都支持（5.8 节） |
 | `config` | 强制使用某个配置（dict 或名字，例如 `"ep3k l128"`），不查表 |
 | `routing`, `csv_path` | 调优表的 key 和路径，默认 `"uniform"` 与 `configs/a8w4_moe_tuned.csv` |
 | 返回 | 新分配的 bf16 [M, H] |
@@ -80,7 +84,9 @@ E 是 `W` 中的本地专家数，e0 = `expert_offset`。
 | `prepare_weights(w1, w2, w1_scale, w2_scale)` | 把 preshuffle 好的 mxfp4 权重转成 fd2 格式的 dict（5.2 节）。只做一次，结果所有 kernel 共用 |
 | `shuffle_mxfp4(w1q, w1s, w2q, w2s)` | 未 shuffle 的 checkpoint 张量 → `prepare_weights` 的输入（调用 `aiter.ops.shuffle`） |
 | `run_config(cfg, x, W, tw, ti, ...)` | 跑指定配置，不查表 |
+| `a8w4_moe_dyn(x, W, tw, ti, m_valid, x_scale=, ...)` | EP all-to-all 接收缓冲区（有效行数在 device 上），见 2.4 |
 | `lookup_config(shape, tokens, act=, capturing=, routing=, csv_path=)` | 查表得到配置；`shape = (H, I, E, E_global, topk)` |
+| `dyn_config(shape, tokens, routing=, csv_path=)` | `a8w4_moe_dyn` 用的配置（6.2 节）；EP kernel 不支持该 shape 时抛 `ValueError` |
 | `supported(cfg, shape, act=, capturing=, tokens=)` | 某个配置在该 shape / 上下文下能否运行（只检查结构限制） |
 | `default_config(shape, tokens)` | 表里没有该 shape 时的回退配置 |
 | `config_name` / `parse_config` | 配置 dict ↔ 名字 |
@@ -103,12 +109,41 @@ E 是 `W` 中的本地专家数，e0 = `expert_offset`。
 - **并发**：`ep_prep`、`ep1k`、`tp1kq` 的全局计数器和 workspace 是每张卡一份（由 kernel 内最后一个 WG 复位）。同一 stream 上的顺序调用没有问题；如果框架会在同一张卡的两个 stream 上并发执行 MoE（例如两个 micro-batch 各用一个 stream），要先改成每个 stream 一份 workspace。
 - **输出**：结果由 bf16x2 atomic 累加得到，topk > 1 时多次运行的结果不逐位相同，cos 差约 1e-7（EP）到 1e-5（TP，token 很少时）。
 
+### 2.4 `a8w4_moe_dyn`：EP all-to-all 接收缓冲区（MORI）
+
+EP 用 all-to-all（例如 MORI）分发 token 时，本卡收到的是按容量分配的缓冲区：只有前 `m_valid[0]` 行有效，而这个数只在 device 上，host 要读就得同步一次。`a8w4_moe_dyn` 直接在这个缓冲区上计算：
+
+```python
+out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=None,
+                   expert_offset=0, num_experts=None, act="silu", situ=None,
+                   est_tokens=None, out=None, config=None, routing="uniform",
+                   csv_path=DEFAULT_CSV)
+```
+
+| 参数 | 要求 |
+|---|---|
+| `x` | [M, H]，M 是缓冲区容量，连续。两种格式：bf16（`x_scale=None`，由 prep 按行量化）；fp8 FNUZ 加 `x_scale`，`x_scale` 为 f32 [M, H/128]（每（token, 128）一个，即 MORI 的 blockwise fp8 dispatch）或 [M]（每 token 一个） |
+| `topk_ids` / `topk_weights` | int32 / f32 [M, topk]，全局专家 id。只有前 m_valid 行有效 |
+| `m_valid` | int32 device 张量。kernel 读 `m_valid[0]`，并截到 [0, M] |
+| `est_tokens` | host 端对有效行数的估计，默认 M。只用来选配置和定 GEMM 的 grid；WG 会循环处理全部实际 tile，所以估计偏低也正确，只是会慢 |
+| `out` | 可选，bf16 [M, H]，返回值就是它。第 m_valid 行及以后的内容未定义 |
+| `config` | 强制使用某个配置，只能是 `ep3k` |
+| `act`, `situ` | 同 `a8w4_moe` |
+
+- **只走 EP kernel（ep3k）**：要求本地专家 ≤ 32、64 % topk == 0、M < 65536。更大的缓冲区要分块调用，sglang 每块 32768 行。
+- **配置**：`dyn_config(shape, est_tokens)`，见 6.2 节。
+- **没有 host 同步**：同一个 CUDA graph 可以服务任意 m_valid ≤ M。
+  - capture 时 M 是容量；eager 时调用方可以先读出计数，只传有效的前几行（sglang 就是这样做的）；
+  - 两者的 M 不同，可能用到不同的编译变体（ep_prep 按 M·topk 是否超过 2048 分为单 WG / 多 WG 排序）；
+  - capture 期间第一次编译、加载 kernel 是可以的：FlyDSL 缓存为空时 capture 和 replay 都正常。
+- **性能**见 7.7 节。bf16 输入且估计准确时与 `a8w4_moe` 相同；fp8 分组 scale 输入在 ≥512 tokens 时慢 3–8%；估计值等于容量时，小 batch 多 14–28 us。
+
 ## 3. 文件与依赖
 
 ```
 a8w4/
   __init__.py                  公开接口
-  moe.py                       a8w4_moe、5 类 runner、能力过滤 supported()、调优表查找
+  moe.py                       a8w4_moe / a8w4_moe_dyn、5 类 runner、能力过滤 supported()、调优表查找（lookup_config / dyn_config）
   weights.py                   prepare_weights（fd2 权重）、shuffle_mxfp4、weight_shape
   tune.py                      调优 CLI：tune / merge / show / verify / candidates
   ref.py                       测试与调优用：随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
@@ -120,8 +155,8 @@ a8w4/
     tp_gemm2.py                TP 族 gemm2（down + 路由加权 atomic 写回；base / nt4）
     tp_fmoe.py                 tp1k：BM 64 单 kernel 融合 MoE
     tp_fmoe_q.py               tp1kq：tp1k 的 persistent 工作队列版
-    ep_prep.py                 ep3k 的 prep：本地专家排序 + x 量化 + tile 调度 + 路数统计
-    ep_gemm.py                 ep3k 的 gemm1 / gemm2、配置表 CFGS、入口 ep_moe
+    ep_prep.py                 ep3k 的 prep：本地专家排序 + x 量化 + tile 调度 + 路数统计；m_valid 变体（MDYN）
+    ep_gemm.py                 ep3k 的 gemm1 / gemm2、配置表 CFGS、入口 ep_moe 和 ep_moe_dyn（XG、DYN 变体）
     ep_small.py                ep1k：单 launch 的小 batch 融合
   _vendor/                     从 aiter/ops/flydsl/kernels（aiter 7cd70aca8）复制的 FlyDSL helper，import 已改为相对路径
 ```
@@ -148,7 +183,7 @@ EP 族（`ep3k` / `ep1k`）和 `prepare_weights` 在运行时都不需要 aiter�
 | `tp2k` | moe_sorting → row_quant → gemm1（q8s）→ gemm2（4） | TP 小 / 中 batch | I % 256、H % 512；`g2nt4` 只支持 I = 256 | 是 |
 | `tp1k` | moe_sorting → row_quant → 融合 kernel（3） | TP 大 batch | I % 256；每个 CTA ≤ 512 列 inter | 是 |
 | `tp1kq` | 同上，融合 kernel 换成 persistent 工作队列（3） | TP 4096 tokens 左右 | 只支持 I = 256 | **否** |
-| `ep3k` | ep_prep → ep gemm1 → ep gemm2（3） | EP 全部 batch | 本地专家 ≤ 32、只有 SiLU、64 % topk == 0、gemm2 的 K 循环 I/ARB ≥ 8、M < 65536 | 是 |
+| `ep3k` | ep_prep → ep gemm1 → ep gemm2（3） | EP 全部 batch；`a8w4_moe_dyn` 只用它 | 本地专家 ≤ 32、64 % topk == 0、gemm2 的 K 循环 I/ARB ≥ 8、M < 65536 | 是 |
 | `ep1k` | 单个 persistent launch（1） | EP 极小 batch（实测没有一个点最快） | 同 ep3k，另需 topk = 8、I % 2048、M ≤ 512 | 是 |
 
 配置名的格式：
@@ -306,6 +341,17 @@ gemm2：A2·W2ᵀ（按 128-K 组的 scale 重标定）× 通道因子 × 路由
 
 ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄 n-tile（NO 64），让更多 CU 同时读 W，对 ≤8 tokens 有效。
 
+**接收缓冲区变体**（`ep_moe_dyn`，即 `a8w4_moe_dyn` 的实现，来自 sglang PR #45 的 `ep8_moe_dyn`）
+
+- **`ep_prep(m_valid=...)`（MDYN）**：
+  - M 是缓冲区容量，决定填充 token id 和各 buffer 的布局；
+  - 只对前 m_valid 行排序和量化（m_valid 在 device 上读，截到 [0, M]），`num_valid_ids[1]` 写成 m_valid；
+  - 按 M 编译成多 WG 排序的 kernel，如果运行时发现有效条目放得进一个 WG，就改走单 WG 的 LDS 排序。
+- **gemm1 `XG`**：x 的 scale 按（token, 128）分组时，处理方式与 gemm2 的 A 分组 scale 相同：只用一组累加器，每组开头乘 s_{g−1}/s_g，epilogue 再乘最后一组的 scale。
+- **gemm1 / gemm2 `DYN`**：
+  - grid 按 `est_tokens` 开：`nblk = min(块数上限, est·topk/bm + E)`，WG 以 grid 为步长循环处理全部实际 tile；
+  - gemm1 不再按 M 清零整个 `out`，改为在 tile 之后，只清零有效行中本卡路数 ≠ 1 的行。单路的行由 gemm2 整行写入，无效行不会被读。
+
 ### 5.7 ep1k：单 launch 的小 batch 融合（`ep_small.ep_moe_small`）
 
 - **路由**：每个 WG 自己算一遍路由，不做全局排序。每个 wave 读 64 个 token 的 topk id，用 ballot 为每个（专家, 64 token）建一个 64 位 mask。专家 e 的第 k 行就是它 mask 中第 k 个置位的 token，结果是确定的，所有 WG 算出来一致。
@@ -318,10 +364,11 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 ### 5.8 激活
 
 - **silu**：`silu(g)·u`，所有 kernel 都支持。
-- **situv2**（只有 TP 族支持）：
+- **situv2**（所有 kernel 都支持）：
   - 公式：`β·tanh(g/β)·sigmoid(g) · β_l·tanh(u/β_l)`，计算前先 clamp：g ≤ L，|u| ≤ L；
-  - β、1/β、β_l、1/β_l、L 是 5 个运行时 f32 launch 参数；kernel 按 act 分别编译；
-  - 比 silu 慢 0–5%。
+  - β、1/β、β_l、1/β_l、L 是 5 个运行时 f32 launch 参数（`tp_gemm1.situ_args` 生成，β ≤ 0 时报 `ValueError`）；kernel 按 act 分别编译，kernel 名加 `_situv2`；silu 也带这 5 个参数，但不使用；
+  - 位置：TP 族在 gemm1 / 融合 kernel 的 epilogue；EP 族在 ep gemm1 的两种 epilogue（TR 和非 TR）以及 ep1k 的 gemm1 item。都调用同一个 `_vendor/act.gate_up_act`，gemm2 不变；
+  - TP 族比 silu 慢 0–5%。EP 族多出的也只是 epilogue 里的 VALU（tanh、sigmoid 各一组 exp2 + rcp）。
 - MiMo-V2.6-Flash 用的是 SiLU（sglang `mimo_v2.py` 要求 `hidden_act == "silu"`），调优表也是按 SiLU 测的。
 
 ## 6. 调优机制
@@ -330,7 +377,7 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 
 列：`model_dim, inter_dim, experts, experts_global, topk, routing, num_tokens, config, us, cos`。
 
-**每个点保存全部候选的耗时**，而不是只存最快的那个，这样运行时才能按上下文过滤（situv2 时排除 EP 族，capture 时排除 tp1kq，超过 512 tokens 时排除 ep1k）。现有内容：
+**每个点保存全部候选的耗时**，而不是只存最快的那个，这样运行时才能按上下文过滤（capture 时排除 tp1kq，超过 512 tokens 时排除 ep1k）。现有内容：
 
 - 3 个 shape（TP8 4096/256/256/256/8、TP4 4096/512/256/256/8、EP8 4096/2048/32/256/8），routing 都是 uniform；
 - 每个 shape 35 个点（1, 2, 3, 4, 6, 8, 12, … , 24576, 32768）；
@@ -342,6 +389,7 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 2. 取第一个 `num_tokens ≥ M` 的点；M 超过最大点时取最大点。
 3. 在该点的候选中，按耗时从小到大，返回第一个满足 `supported(cfg, shape, act, capturing, tokens=M)` 的配置。
 4. 表里没有这个 shape 时用 `default_config`：EP kernel 能跑就按原来的 EP 阈值选（≤8 t16、≤480 s16、≤960 s32、≤2176 m64、其余 l128），否则用 `tp2k bm64 g1bcm1 g2base`。
+5. `dyn_config`（`a8w4_moe_dyn` 用）：同样按 `est_tokens` 取点，但只考虑 ep3k 候选。表里没有该 shape 时按上面的 EP 阈值；阈值对应的配置不支持时，依次试其他 ep3k 配置；都不支持则抛 `ValueError`。
 
 表按文件路径和 mtime 缓存，文件更新后自动重新读取。
 
@@ -488,20 +536,50 @@ profile 中的 kernel 名：
   - 大 batch 的绝对值有 ±5–8% 的抖动，来自路由抽样和功耗状态；
   - 小 batch 的 EP 结果取决于本卡抽到几个专家，例如在 tune verify 中，5 tokens 测得 44 us，6 tokens 的表值是 38 us。
 
+### 7.7 `a8w4_moe_dyn`（EP8 shape，接收缓冲区）
+
+缓冲区容量 8192 行，前 tokens 行有效，每行至少有一路落在本卡（rank 3）。其余条件同 7.1，单位 us。每行都有本地路由，而 7.3 是均匀路由（部分 token 没有本地专家），所以同样的 tokens 下比 7.3 的表值慢。
+
+| tokens | 配置 | `a8w4_moe`（bf16，查表） | dyn，bf16 | dyn，fp8 + 每（token, 128）scale | dyn，fp8，`est_tokens` = 8192 |
+|---:|---|---:|---:|---:|---:|
+| 1 | ep3k t16 | 34.4 | 34.8 | 35.7 | 49.5 |
+| 16 | ep3k t16 | 75.9 | 75.4 | 76.1 | 90.8 |
+| 128 | ep3k t16 | 136.5 | 135.6 | 136.8 | 165.1 |
+| 512 | ep3k s32 | 156.6 | 161.9 | 166.9 | 177.4 |
+| 2048 | ep3k l128 | 324.4 | 328.4 | 350.7 | 351.8 |
+| 8192 | ep3k l128 | 993.6 | 987.1 | 1047.5 | 1060.2 |
+
+- **bf16 输入**：dyn 与 `a8w4_moe` 相差在 ±3% 以内。
+- **fp8 分组 scale（XG）**：≤128 tokens 没有差别；512 tokens 起慢 3–8%，来自 gemm1 每组开头的比值缩放。fp8 dispatch 的好处在通信：all-to-all 的字节数减半（代价是发送端多一次量化），这部分不在表里。
+- **估计值等于容量**：配置变成 l128，grid 按容量开，1–128 tokens 多 14–28 us。capture 时估计值应尽量接近实际行数，sglang 用的是 DP 的 token 数元数据。
+
 ## 8. 正确性与测试
 
 - **参考实现**：`ref.ref_moe` 是 fp32 参考，按 kernel 的方式模拟 fp8 量化：x 每行量化一次，中间结果每（行, 128 列）量化一次。剩下的差别只来自累加顺序和 bf16 输出。阈值是 cos 差 < 5e-3，实测 1e-5 到 3.5e-4。
-- **`tests/test_a8w4_moe.py`**：本机结果为 58 passed、1 skipped（ep1k 在 600 tokens 时不支持）。覆盖范围：
+- **`tests/test_a8w4_moe.py`**：本机结果为 83 passed、1 skipped（ep1k 在 600 tokens 时不支持）。覆盖范围：
   - 每类 kernel 对参考实现，用 TP8 和 EP8 shape；EP 用 rank 3、全局专家 id，tokens 取 1 / 77 / 600；
   - `a8w4_moe` 查表调用，tokens 包括不在调优点上的值；
   - CUDA graph：capture 期间只选 graph-safe 配置，多次 replay 的结果与 eager 一致；
-  - situv2：TP 族结果正确；EP 族遇到 situv2 时抛 `ValueError`，查表退回 TP 族；
-  - `w2_exp` 确实是 `w2_scale` 尾部的 view。
+  - situv2：
+    - 两个 shape 上的全部配置（tp2k / tp1k / tp1kq，ep3k 的 5 个配置，ep1k）对参考实现；
+    - 查表时 situv2 与 silu 选中同样的配置，`a8w4_moe` 端到端正确；β = 0 时抛 `ValueError`；
+    - `a8w4_moe_dyn`：s16（非 TR）和 m64（TR）两种 epilogue，bf16 / fp8 输入；
+  - `w2_exp` 确实是 `w2_scale` 尾部的 view；
+  - `a8w4_moe_dyn` 对参考实现：bf16 输入和 fp8 分组 scale 输入，容量 512，有效行数 0 / 1 / 37 / 300，无效行填 NaN 和随机 id；
+  - `a8w4_moe_dyn` 的 CUDA graph：估计值 128，一次 capture 后依次用有效行数 64 / 1 / 400 / 0 / 512 replay，结果与 eager 一致；
+  - `dyn_config`：只返回支持的 ep3k 配置；TP8 shape（256 个本地专家）抛 `ValueError`。
+- **sglang**：`test/registered/unit/layers/quantization/test_mxfp4_aiter_a16w4_moe.py` 覆盖了以下场景：
+  - TP；
+  - EP 全局 id：TP 族加 expert mask，以及 EP 族的 5 个配置；
+  - MORI 接收缓冲区：fp8 / bf16、Normal / LL、分块；
+  - MORI 路径的 CUDA graph：capture 时用 DP 元数据估计行数，replay 时的行数高于估计值；
+  - situv2：TP、EP 全局 id、MORI 三条路径对参考实现，以及参数检查。
 - **与实验版 kernel 一致**（`doc-mimo/kernels/` 下的原文件）：
   - `prepare_weights` 与原 TP、EP 两套权重准备逐字节相同；
   - 行量化、TP gemm1 的 q8s 输出逐位相同；
   - topk=1 时每个输出元素只被 atomic 加一次，tp2k / tp1k / tp1kq / ep3k 全部配置在 1 / 300 / 3000 tokens 下与原 kernel 逐位相同；
   - topk=8 时，新旧 kernel 之间的 cos 差与原 kernel 自身两次运行之间的差在同一量级（1e-7 – 1e-5）。
+- **与 sglang PR #45 的 `ep8_moe_dyn` 一致**：topk=1 时 t16 / s32 / l128、bf16 / fp8 输入逐位相同；topk=8 时 cos 差约 3e-7，与 PR 版自身两次运行之间的差相同。
 
 ## 9. 继续开发的注意点
 
@@ -516,7 +594,7 @@ profile 中的 kernel 名：
 | tp2k gemm2 nt4 | 512 的倍数 | 只能是 256 | |
 | tp1k | 256 的倍数 | 256 的倍数，(I/128) % ksplit == 0，每个 CTA ≤ 512 列 | |
 | tp1kq | 256 的倍数 | 只能是 256 | 不是 graph-safe |
-| ep3k | 512 的倍数 | I/ARB ≥ 8 且为 4 的倍数（ARB 128：I ≥ 1024；ARB 256：I ≥ 2048） | 本地专家 ≤ 32，64 % topk == 0，M < 65536，只有 SiLU |
+| ep3k | 512 的倍数 | I/ARB ≥ 8 且为 4 的倍数（ARB 128：I ≥ 1024；ARB 256：I ≥ 2048） | 本地专家 ≤ 32，64 % topk == 0，M < 65536（`a8w4_moe_dyn` 的 M 是缓冲区容量） |
 | ep1k | 同上 | I % 2048 == 0 | 同上，另需 topk = 8、M ≤ 512 |
 | 32 位偏移 | W1 字节数 E·I·H < 4 GiB；tokens·H < 2^31 | | sorted id 中 token 占 24 位 |
 
@@ -570,10 +648,26 @@ profile 中的 kernel 名：
 ### 9.6 集成到推理框架
 
 - **加载权重时**：调用 `prepare_weights`。fd2 权重会替换原 mxfp4 权重；原权重如果还要给别的路径用，需要另外保留。
-- **warmup**：capture 每个 batch size 之前都要先用同样的 M eager 调用一次。配置按 token 数选择，ep_prep 也按 M·topk 是否超过 2048 分成两种编译变体，所以 warmup 的 M 必须与 capture 的 M 相同。
+- **warmup**：capture 前先用同样的 M eager 调用一次。配置按 token 数选择，ep_prep 也按 M·topk 是否超过 2048 分成两种编译变体，TP 族的 expert mask 等缓存也在第一次调用时分配。capture 期间第一次编译、加载 kernel 本身可以工作（在 `a8w4_moe_dyn` 上验证过），但缓存张量会分配到 graph 的私有内存池里。
 - **跨卡归约**：TP 用 all-reduce，EP 用 reduce-scatter / combine。
   - 如果 EP 是先 all-gather 再计算（每卡都拿到全部 token），`x` 就是全部 token，输出要做 reduce-scatter；
   - DeepEP 低延迟模式那种按专家打包的布局 [E_local, max_tokens, H] 不符合本接口的约定，需要先转换。
+  - MORI 那种按 token 打包的接收缓冲区用 `a8w4_moe_dyn`。
+- **sglang**：`python/sglang/srt/layers/quantization/mxfp4_aiter_a16w4_moe.py` 中的 `Mxfp4AiterA16W4MoEMethod` 用一个 method 覆盖三种部署。
+  - **TP**：`a8w4_moe(x, W, tw, ti)`。
+  - **EP，`--moe-a2a-backend none`**：
+    - 每卡拿到全部 token 和全局 id，调用 `a8w4_moe(..., expert_offset=ep_rank*E_local, num_experts=E_global)`；
+    - 由 MoE 的 all-reduce 求和；
+    - 本地专家超过 32 时走 TP 族加 expert mask。
+  - **EP，`--moe-a2a-backend mori`**：`a8w4_moe_dyn` 直接读 MORI 的接收缓冲区。
+    - method 向 dispatcher 报告 `weight_dtype=float8_e4m3fnuz`，MORI 就按 blockwise fp8（每 128 列一个 f32 scale）分发；`SGLANG_MORI_DISPATCH_DTYPE=bf16` 也能用，fp4 分发不支持。
+    - 输出按容量分配，MORI combine 只读前 total_recv 行。
+    - eager 时读一次计数（每层一次同步），只算有效行。
+    - capture 时算整个容量，`est_tokens` 取自 DP 的 token 数元数据。
+    - 缓冲区超过 32768 行时分块调用。
+  - **加载时检查形状**（`create_weights`）：TP 族要求 H % 512 == 0、I % 256 == 0；MORI 要求 EP kernel 能跑（本地专家 ≤ 32 等）。
+  - **激活**：`activation="silu"`，或 `"situv2"`（`MoeRunnerConfig` 的 `situ_beta` / `situ_linear_beta` 必须设置且 > 0；clamp 上限取 `gemm1_clamp_limit` 或 `swiglu_limit`，未设置表示不 clamp）。
+  - **不支持的配置直接报错**：SiLU 带 clamp、silu / situv2 以外的激活、fused shared experts、`apply_router_weight_on_input`，以及除 none / mori 之外的 a2a backend。
 
 ## 10. 踩过的坑
 
@@ -620,7 +714,20 @@ profile 中的 kernel 名：
 
 20. **容器自带的 FlyDSL 是 0.1.5，本包需要 0.3.2。** 用 `pip install --target <目录>` 装到独立目录，再通过 `PYTHONPATH` 生效。
 21. **aiter 的 JIT `.so` 与源码版本不一致**（`module_aiter_core` 缺 `MlaVersion`）。设置 `AITER_JIT_DIR=<新目录>`，让 aiter 在那里重新编译，不改动共享环境。
-22. **aiter 的 `import` 无条件依赖 `pyhip`，而容器里没有这个包。** 用一个 sitecustomize 把整个 `pyhip` 包 stub 掉即可，A8W4 路径不会用到它。
+22. **本包现在放在 pyhip 里（`pyhip.contrib.flydsl.a8w4`）。**
+    - 非 editable 安装时，`pyproject.toml` 要列出 `a8w4`、`a8w4._vendor`、`a8w4.kernels` 三个子包，并用 package-data 带上 `configs/*.csv`。漏了子包会 import 失败；漏了 CSV 不报错，查表会静默退回默认配置。
+    - aiter 的 import 依赖 pyhip，要用源码里的 pyhip（例如 `pip install -e`）。早先把 pyhip stub 掉的做法不再适用。
+
+**EP all-to-all（MORI）**
+
+23. **接收缓冲区只有前 total_recv 行有效，后面是旧数据**（NaN、随机的 id 都可能出现）。kernel 必须从 device 读有效行数；如果按 M 排序，旧行的路由会混进来。
+24. **capture 时 host 不知道有效行数。**
+    - grid 只能按估计值开，所以 GEMM 改成 WG 循环处理 tile（DYN）；
+    - `out` 的清零改为只清有效行，按容量清零是白做的工作；
+    - 估计值偏大会选到大 batch 的配置，小 batch 慢 14–28 us（7.7 节）。
+25. **ep_prep 的 sorted id 中 token 占 24 位，排序 WG 必须同时驻留。** 所以一次调用要求 M < 65536，更大的接收缓冲区要分块。分块时：
+    - 第一块直接传计数张量，kernel 会截到块大小；
+    - 后面的块传 clamp(total − 起点, 0, 块大小)，全程在 device 上算。
 
 ## 11. 后续方向
 
@@ -633,7 +740,7 @@ profile 中的 kernel 名：
   - 重写 gemm2：用更大的 M tile，解码后的 W 经 LDS 在多个 wave 之间共用，参考 pyhip 的 Down，16K tokens 有望快约 6%；
   - 提高 gemm1 的 MFMA 利用率；
   - TP 在 8192 tokens 时排序加量化还要 75 us，换成合并的 prep 能省一半左右。
-- **按需要补**：EP 族的 situv2；hot 路由的调优表；其他模型（例如 MiMo-V2.6-Pro TP8：H 6144、384 个专家）的调优。
+- **按需要补**：situv2 的耗时测量与调优表；hot 路由的调优表；其他模型（例如 MiMo-V2.6-Pro TP8：H 6144、384 个专家）的调优。
 
 ## 12. 来源
 
@@ -655,6 +762,7 @@ profile 中的 kernel 名：
 | `kernels/ep_prep.py` | `ep8_prep.py` |
 | `kernels/ep_gemm.py` | `ep8_moe.py` |
 | `kernels/ep_small.py` | `ep8_small.py` |
+| `kernels/ep_prep.py` 的 MDYN、`kernels/ep_gemm.py` 的 XG / DYN 和 `ep_moe_dyn` | sglang PR #45（sammysun0711/sglang）中 `flydsl_moe_ep_w4a8_gfx942/` 的 `ep8_prep.py`、`ep8_moe.py`（`ep8_moe_dyn` 的 `rank` 参数改为 `e0`） |
 | `weights.py` | `test_flydsl_moe_a16wfp4.a8w4_prepare_weights` + `ep8_moe.prepare_weights` |
 | `moe.py`、`tune.py` | `a8w4_moe_tune.py`（TP）+ `ep8_moe.CFGS / AUTO`（EP） |
 | `ref.py` | `ep8_common.py`、`a8w4_moe_tune.torch_ref` 的参考实现和计时部分 |
