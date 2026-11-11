@@ -47,7 +47,7 @@ def make_inputs(tokens, hidden_dim, inter_dim, topk, experts, routing="random", 
     sorted_weights = torch.where(
         routed, topk_weights[sorted_token.clamp(max=tokens - 1), sorted_slot.clamp(max=topk - 1)], 0.0
     ).float()
-    # Sorted-row A2 for sorted_a2=True: position p holds the A2 row of sorted_ids[p], zeros for padding.
+    # Kernel input: sorted-row A2, position p holds the A2 row of sorted_ids[p], zeros for padding.
     position_rows = torch.where(routed, sorted_token * topk + sorted_slot, 0)
     a2_sorted = a2.view(torch.uint8)[position_rows]
     a2_sorted[~routed] = 0
@@ -102,15 +102,17 @@ def reference(inputs):
     return out.to(torch.bfloat16), routed, magnitude
 
 
-def kernel_args(inputs, sorted_a2=False):
-    a2, a2_scale = ("a2_sorted", "a2_scale_sorted_t") if sorted_a2 else ("a2", "a2_scale_t")
-    return [inputs[n] for n in (a2, "w2", a2_scale, "w2_scale", "sorted_ids", "sorted_weights", "expert_ids", "num_valid_ids")]
+def kernel_args(inputs):
+    return [
+        inputs[n]
+        for n in ("a2_sorted", "w2", "a2_scale_sorted_t", "w2_scale", "sorted_ids", "sorted_weights", "expert_ids", "num_valid_ids")
+    ]
 
 
-def run_kernel(inputs, out, sorted_a2=False, **kw):
+def run_kernel(inputs, out, **kw):
     from pyhip.contrib.flydsl.moe_down_a8w8_blockscale_gfx942_lds import moe_down_a8w8_blockscale_gfx942_lds
 
-    return moe_down_a8w8_blockscale_gfx942_lds(*kernel_args(inputs, sorted_a2), out, topk=inputs["shape"][3], **kw)
+    return moe_down_a8w8_blockscale_gfx942_lds(*kernel_args(inputs), out, inputs["shape"][3], **kw)
 
 
 def check(out, expected, routed, magnitude):
@@ -142,25 +144,8 @@ def check(out, expected, routed, magnitude):
 )
 @pytest.mark.parametrize(
     "config",
-    [
-        dict(layout="2x4_pf1", reduce="atomic"),
-        dict(layout="2x4_pf1", reduce="kernel"),
-        dict(layout="4x2_pf1", reduce="atomic"),
-        dict(layout="4x2_pf1", reduce="kernel"),
-        dict(layout="2x4_pf1", reduce="kernel", xcd_swizzle=False),
-        dict(layout="4x2_pf1", reduce="atomic", xcd_swizzle=False),
-        dict(layout="4x2_pf1", reduce="atomic", sorted_a2=True),
-        dict(layout="2x4_pf1", reduce="kernel", sorted_a2=True),
-        dict(layout="4x2_pf1", reduce="atomic", sorted_a2=True, single_store=True),
-        dict(layout="2x4_pf1", reduce="atomic", single_store=True),
-        dict(layout="4x2_pf1", reduce="atomic", bm128=True),
-        dict(layout="4x2_pf1", reduce="atomic", sorted_a2=True, single_store=True, bm128=True),
-    ],
-    ids=[
-        "2x4-atomic", "2x4-kernel", "4x2-atomic", "4x2-kernel", "2x4-kernel-linear", "4x2-atomic-linear",
-        "4x2-atomic-sorted", "2x4-kernel-sorted", "4x2-atomic-sorted-single", "2x4-atomic-single", "4x2-atomic-bm128",
-        "4x2-atomic-sorted-single-bm128",
-    ],
+    [dict(), dict(single_store=True), dict(bm128=True), dict(single_store=True, bm128=True)],
+    ids=["atomic", "single", "bm128", "single-bm128"],
 )
 def test_down(tokens, hidden_dim, inter_dim, topk, experts, routing, extra_blocks, config):
     if not is_gfx942():
@@ -168,16 +153,11 @@ def test_down(tokens, hidden_dim, inter_dim, topk, experts, routing, extra_block
     inputs = make_inputs(tokens, hidden_dim, inter_dim, topk, experts, routing, extra_blocks=extra_blocks)
     expected, routed, magnitude = reference(inputs)
     out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    previous = None
     for _ in range(2):
         out.fill_(float("nan"))
         run_kernel(inputs, out, **config)
         torch.cuda.synchronize()
         check(out, expected, routed, magnitude)
-        # BF16 atomics sum in arrival order; the reduce kernel's order is fixed.
-        if config["reduce"] == "kernel" and previous is not None:
-            assert torch.equal(out.view(torch.int16), previous.view(torch.int16))
-        previous = out.clone()
 
 
 @pytest.mark.parametrize("tokens,topk,experts,routing,extra_blocks", [(300, 2, 3, "random", 1), (2048, 8, 32, "ep8", 2)])
@@ -198,20 +178,18 @@ def test_route_counts(tokens, topk, experts, routing, extra_blocks):
 def test_validate_extents():
     from pyhip.contrib.flydsl.moe_down_a8w8_blockscale_gfx942_lds import validate_parameters
 
-    # aiter's EP sort of 32K tokens over 256 global experts at block 256 has 327680 rows: a 2.68 GB rows buffer,
-    # which only the reduce mode allocates.
-    validate_parameters(32768, 4096, 2048, 8, 32, 327680, sorted_a2=True, atomic=True)
-    with pytest.raises(ValueError, match="rows="):
-        validate_parameters(32768, 4096, 2048, 8, 32, 327680, sorted_a2=True, atomic=False)
+    # aiter's EP sort of 32K tokens over 256 global experts at block 256 has 327680 rows (a 640 MiB A2).
+    validate_parameters(32768, 4096, 2048, 8, 32, 327680)
+    with pytest.raises(ValueError, match="a2="):
+        validate_parameters(32768, 4096, 2048, 8, 32, 1 << 20)
 
 
 @pytest.mark.parametrize(
     "tokens,hidden_dim,inter_dim,topk,experts,routing",
     [(300, 512, 256, 2, 3, "random"), (1024, 4096, 2048, 8, 32, "ep_uniform"), (2048, 4096, 2048, 8, 32, "ep8")],
 )
-@pytest.mark.parametrize("gateup_layout,down_layout", [("2x4_pf1", "4x2_pf1"), ("4x2_pf1", "2x4_pf1")])
-def test_gateup_down_fp8_pipeline(tokens, hidden_dim, inter_dim, topk, experts, routing, gateup_layout, down_layout):
-    """GEMM1 writes the sorted-row FP8 A2 and its scales; GEMM2 reads them with sorted_a2."""
+def test_gateup_down_fp8_pipeline(tokens, hidden_dim, inter_dim, topk, experts, routing):
+    """GEMM1 writes the sorted-row FP8 A2 and its scales; GEMM2 reads them."""
     if not is_gfx942():
         pytest.skip("gfx942 kernel")
     gateup = make_gateup_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=1)
@@ -220,7 +198,7 @@ def test_gateup_down_fp8_pipeline(tokens, hidden_dim, inter_dim, topk, experts, 
     capacity = inputs["expert_ids"].numel() * SORT_BLOCK_M
     a2 = torch.full((capacity, inter_dim), 0x55, device="cuda", dtype=torch.uint8)
     a2_scale_t = torch.full((inter_dim // 128, capacity), float("nan"), device="cuda")
-    run_gateup(gateup, a2.view(dtypes.fp8), out_scale_t=a2_scale_t, topk=topk, layout=gateup_layout)
+    run_gateup(gateup, a2.view(dtypes.fp8), a2_scale_t, topk)
     torch.cuda.synchronize()
     check_fp8_sorted(gateup, a2.view(dtypes.fp8), a2_scale_t, 0x55)
     # The reference reads the same FP8 rows in [tokens, topk] order.
@@ -241,9 +219,9 @@ def test_gateup_down_fp8_pipeline(tokens, hidden_dim, inter_dim, topk, experts, 
     )
     expected, routed, magnitude = reference(inputs)
     out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    for reduce, single_store in (("atomic", False), ("atomic", True), ("kernel", False)):
+    for single_store in (False, True):
         out.fill_(float("nan"))
-        run_kernel(inputs, out, sorted_a2=True, layout=down_layout, reduce=reduce, single_store=single_store)
+        run_kernel(inputs, out, single_store=single_store)
         torch.cuda.synchronize()
         check(out, expected, routed, magnitude)
 
@@ -274,7 +252,7 @@ def test_gateup_down_bm128(tokens, hidden_dim, inter_dim, topk, experts, routing
     for bm128 in (False, True):
         a2 = torch.full((capacity, inter_dim), 0x55, device="cuda", dtype=torch.uint8)
         a2_scale_t = torch.full((inter_dim // 128, capacity), float("nan"), device="cuda")
-        run_gateup(gateup, a2.view(dtypes.fp8), out_scale_t=a2_scale_t, topk=topk, layout="2x4_pf1", bm128=bm128)
+        run_gateup(gateup, a2.view(dtypes.fp8), a2_scale_t, topk, bm128=bm128)
         results.append((a2, a2_scale_t))
     torch.cuda.synchronize()
     (a2_full, scale_full), (a2, a2_scale_t) = results
@@ -306,7 +284,7 @@ def test_gateup_down_bm128(tokens, hidden_dim, inter_dim, topk, experts, routing
     out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
     for single_store, bm128 in ((False, True), (True, True), (True, False)):
         out.fill_(float("nan"))
-        run_kernel(inputs, out, sorted_a2=True, layout="4x2_pf1", reduce="atomic", single_store=single_store, bm128=bm128)
+        run_kernel(inputs, out, single_store=single_store, bm128=bm128)
         torch.cuda.synchronize()
         check(out, expected, routed, magnitude)
 
@@ -342,11 +320,7 @@ def test_fused_entry(tokens, routing, bm128):
 
 
 def benchmark(args):
-    from pyhip.contrib.flydsl.moe_down_a8w8_blockscale_gfx942_lds import (
-        moe_down_a8w8_blockscale_gfx942_lds,
-        moe_down_reduce,
-        moe_down_rows_a8w8_blockscale_gfx942_lds,
-    )
+    from pyhip.contrib.flydsl.moe_down_a8w8_blockscale_gfx942_lds import moe_down_a8w8_blockscale_gfx942_lds
 
     tokens, hidden_dim, inter_dim, topk, experts = args.tokens, args.hidden_dim, args.inter_dim, args.topk, args.experts
     inputs = make_inputs(tokens, hidden_dim, inter_dim, topk, experts, args.routing, seed=args.seed)
@@ -354,40 +328,18 @@ def benchmark(args):
     blocks = int(inputs["num_valid_ids"][0].item()) // SORT_BLOCK_M
     flops = 2 * routes * hidden_dim * inter_dim
     out = torch.empty((tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    rows = torch.empty((inputs["expert_ids"].numel() * SORT_BLOCK_M, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    inverse = torch.empty((tokens, topk), device="cuda", dtype=torch.int32)
-    variants = [(layout, sorted_a2) for sorted_a2 in ((False, True) if args.sorted_a2 else (False,)) for layout in args.layouts]
     if args.check:
         expected, routed, magnitude = reference(inputs)
-        for layout, sorted_a2 in variants:
-            for reduce in ("atomic", "kernel"):
-                out.fill_(float("nan"))
-                run_kernel(inputs, out, sorted_a2=sorted_a2, layout=layout, reduce=reduce)
-                torch.cuda.synchronize()
-                print(f"check {layout} sorted_a2={sorted_a2} {reduce}: calc_diff={check(out, expected, routed, magnitude):.3e}", flush=True)
-    cases = {}
-    for layout, sorted_a2 in variants:
-        args_ = kernel_args(inputs, sorted_a2)
-        tag = f"{layout}{' sorted A2' if sorted_a2 else ''}"
-        cases[f"{tag} atomic (zero + down)"] = (
-            None, lambda args_=args_, layout=layout: moe_down_a8w8_blockscale_gfx942_lds(*args_, out, layout=layout, topk=topk)
-        )
-        cases[f"{tag} atomic down only"] = (
-            out.zero_,
-            lambda args_=args_, layout=layout: moe_down_a8w8_blockscale_gfx942_lds(*args_, out, layout=layout, zero_out=False, topk=topk),
-        )
-        cases[f"{tag} kernel (fill + down + reduce)"] = (
-            None,
-            lambda args_=args_, layout=layout: moe_down_a8w8_blockscale_gfx942_lds(
-                *args_, out, layout=layout, reduce="kernel", rows=rows, inverse=inverse, topk=topk
-            ),
-        )
-        cases[f"{tag} rows (fill + down)"] = (
-            None, lambda args_=args_, layout=layout: moe_down_rows_a8w8_blockscale_gfx942_lds(*args_, rows, inverse, layout=layout)
-        )
-    moe_down_rows_a8w8_blockscale_gfx942_lds(*kernel_args(inputs), rows, inverse, layout=args.layouts[0])
-    cases["reduce only"] = (None, lambda: moe_down_reduce(rows, inverse, out))
-    cases["zero out"] = (None, out.zero_)
+        out.fill_(float("nan"))
+        run_kernel(inputs, out)
+        torch.cuda.synchronize()
+        print(f"check: calc_diff={check(out, expected, routed, magnitude):.3e}", flush=True)
+    args_ = kernel_args(inputs)
+    cases = {
+        "atomic (zero + down)": (None, lambda: moe_down_a8w8_blockscale_gfx942_lds(*args_, out, topk)),
+        "atomic down only": (out.zero_, lambda: moe_down_a8w8_blockscale_gfx942_lds(*args_, out, topk, zero_out=False)),
+        "zero out": (None, out.zero_),
+    }
     # A 1 GiB read before every sample evicts L2 and MALL.
     flush = torch.zeros(1 << 28, device="cuda", dtype=torch.int32)
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -423,8 +375,6 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--experts", type=int, default=32)
     parser.add_argument("--routing", default="ep_uniform", choices=["ep_uniform", "ep_random", "ep8", "random", "balanced"])
-    parser.add_argument("--layouts", nargs="+", default=["2x4_pf1", "4x2_pf1"])
-    parser.add_argument("--sorted-a2", action="store_true", help="also time the sorted-row A2 input")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--reps", type=int, default=3)

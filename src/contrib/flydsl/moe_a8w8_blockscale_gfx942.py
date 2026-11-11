@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FP8 block-scale fused MoE: GateUp 2x4_pf1 with FP8 sorted-row output, then Down 4x2_pf1 with single_store.
+"""gfx942 FP8 block-scale fused MoE: GateUp (2x4 waves) with FP8 sorted-row output, then Down (4x2 waves) with single_store.
 
 This is what aiter.fused_moe runs in place of the 1-stage asm kernel fmoe_fp8_blockscale_g1u1 when
 AITER_FMOE_FP8_BLOCKSCALE_FLYDSL=1 (see docs/moe_a8w8_blockscale_gfx942.md). Inputs use the asm kernel's layouts:
@@ -32,9 +32,6 @@ from .moe_gateup_a8w8_blockscale_gfx942_lds import (
     validate_parameters as validate_gateup,
 )
 
-GATEUP_LAYOUT = "2x4_pf1"
-DOWN_LAYOUT = "4x2_pf1"
-
 
 def max_sorted_blocks(tokens, topk, local_experts):
     """Upper bound on the 256-row blocks the sort emits: at most one partial block per local expert."""
@@ -47,9 +44,9 @@ def unsupported_reason(tokens, hidden_dim, inter_dim, topk, local_experts):
         return "hidden_dim > 4096 (GateUp keeps all K-block B scales in one VGPR)"
     capacity = max_sorted_blocks(tokens, topk, local_experts) * SORT_BLOCK_M
     try:
-        validate_gateup(tokens, inter_dim, hidden_dim, topk, local_experts, fp8_out=True)
+        validate_gateup(tokens, inter_dim, hidden_dim, topk, local_experts)
         # Also bounds the sorted FP8 intermediate [capacity, I] by one buffer descriptor.
-        validate_down(tokens, hidden_dim, inter_dim, topk, local_experts, capacity, sorted_a2=True, atomic=True)
+        validate_down(tokens, hidden_dim, inter_dim, topk, local_experts, capacity)
     except ValueError as error:
         return str(error)
     return ""
@@ -80,12 +77,11 @@ def fused_moe_a8w8_blockscale_gfx942(
     else:
         out.zero_()
     moe_gateup_a8w8_blockscale_gfx942_lds(
-        a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, layout=GATEUP_LAYOUT,
-        out_scale_t=a2_scale_t, topk=topk, bm128=bm128,
+        a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, a2_scale_t, topk, bm128=bm128
     )
     moe_down_a8w8_blockscale_gfx942_lds(
-        a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, layout=DOWN_LAYOUT,
-        reduce="atomic", zero_out=False, topk=topk, single_store=single_store, route_counts=route_counts, bm128=bm128,
+        a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, topk,
+        zero_out=False, single_store=single_store, route_counts=route_counts, bm128=bm128,
     )
     return out
 
@@ -111,12 +107,11 @@ def fused_moe_a8w8_blockscale_gfx942_mixed(
         moe_down_merged(a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, topk)
         return out
     moe_gateup_a8w8_blockscale_gfx942_lds(
-        a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, layout=GATEUP_LAYOUT,
-        out_scale_t=a2_scale_t, topk=topk, bm128=True,
+        a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, a2_scale_t, topk, bm128=True
     )
     moe_down_a8w8_blockscale_gfx942_lds(
-        a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, layout=DOWN_LAYOUT,
-        reduce="atomic", zero_out=False, topk=topk, bm128=True,
+        a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, topk,
+        zero_out=False, bm128=True,
     )
     return out
 

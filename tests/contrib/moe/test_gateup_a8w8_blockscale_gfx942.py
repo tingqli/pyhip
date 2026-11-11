@@ -135,13 +135,6 @@ def silu_mul_fp32(inputs):
     return values, routed
 
 
-def reference(inputs):
-    values, routed = silu_mul_fp32(inputs)
-    out = values.to(torch.bfloat16)
-    out[~routed] = float("nan")
-    return out
-
-
 def sorted_fp8_reference(inputs):
     """FP32 SiLU(gate) * up at sorted rows [0, num_valid) (zeros at padding) and its scales amax / 240 per 128 columns."""
     tokens, inter_dim, hidden_dim, topk, experts = inputs["shape"]
@@ -161,29 +154,14 @@ def quantize_fp8(rows, scale):
     return quantized.to(dtypes.fp8).view(rows.shape)
 
 
-def run_kernel(inputs, out, layout="2x4_pf1", **kw):
+def run_kernel(inputs, out, out_scale_t, topk, **kw):
     from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942_lds import moe_gateup_a8w8_blockscale_gfx942_lds
 
     args = (
         inputs["a"], inputs["w1"], inputs["a_scale_t"], inputs["w1_scale"],
-        inputs["sorted_ids"], inputs["expert_ids"], inputs["num_valid_ids"], out,
+        inputs["sorted_ids"], inputs["expert_ids"], inputs["num_valid_ids"], out, out_scale_t, topk,
     )
-    return moe_gateup_a8w8_blockscale_gfx942_lds(*args, layout=layout, **kw)
-
-
-def check(inputs, out, expected):
-    routed = ~expected[:, :, 0].isnan()
-    # Unrouted (token, slot) entries keep their NaN sentinel.
-    assert out[~routed].isnan().all(), "kernel wrote an unrouted slot"
-    actual, wanted = out[routed].float(), expected[routed].float()
-    assert torch.isfinite(actual).all(), "non-finite or unwritten routed output"
-    torch.testing.assert_close(actual, wanted, rtol=0.05, atol=0.01)
-    diff = pyhip.calc_diff(actual, wanted)
-    assert diff < 1e-5, f"calc_diff {diff}"
-    # Truncating instead of rounding to nearest biases every value toward zero by ~0.3%.
-    bias = ((actual - wanted) * wanted.sign()).mean() / wanted.abs().mean()
-    assert abs(bias) < 5e-4, f"BF16 rounding bias {bias:.2e}"
-    return diff
+    return moe_gateup_a8w8_blockscale_gfx942_lds(*args, **kw)
 
 
 def check_fp8_sorted(inputs, a2, a2_scale_t, sentinel):
@@ -212,59 +190,10 @@ def check_fp8_sorted(inputs, a2, a2_scale_t, sentinel):
         (1000, 256, 384, 4, 8, "random", 0),
         (4096, 128, 256, 8, 32, "balanced", 1),
         (1024, 2048, 4096, 8, 32, "ep_uniform", 3),
-    ],
-)
-@pytest.mark.parametrize(
-    "config",
-    [
-        dict(layout="2x4_pf1"),
-        dict(layout="4x2_pf1"),
-        dict(layout="4x2_pf1", xcd_swizzle=False),
-        dict(layout="2x4_pf1", pair_blocks=True),
-        dict(layout="4x2_pf1", pair_blocks=True),
-        dict(layout="2x4_pf1", bm128=True),
-    ],
-    ids=["lds-2x4", "lds-4x2", "lds-4x2-linear", "lds-2x4-pair", "lds-4x2-pair", "lds-2x4-bm128"],
-)
-def test_gateup(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks, config):
-    if not is_gfx942():
-        pytest.skip("gfx942 kernel")
-    inputs = make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=extra_blocks)
-    expected = reference(inputs)
-    out = torch.empty((tokens, topk, inter_dim), device="cuda", dtype=torch.bfloat16)
-    previous = None
-    for _ in range(2):
-        out.fill_(float("nan"))
-        run_kernel(inputs, out, **config)
-        torch.cuda.synchronize()
-        check(inputs, out, expected)
-        if previous is not None:
-            assert torch.equal(out.view(torch.int16), previous.view(torch.int16))
-        previous = out.clone()
-
-
-@pytest.mark.parametrize(
-    "tokens,inter_dim,hidden_dim,topk,experts,routing,extra_blocks",
-    [
-        (200, 256, 512, 2, 4, "random", 2),
-        (300, 256, 512, 2, 3, "random", 1),
-        (1000, 256, 384, 4, 8, "random", 0),
-        (4096, 128, 256, 8, 32, "balanced", 1),
-        (1024, 2048, 4096, 8, 32, "ep_uniform", 3),
         (2048, 2048, 4096, 8, 32, "ep8", 1),
     ],
 )
-@pytest.mark.parametrize(
-    "config",
-    [
-        dict(layout="2x4_pf1"),
-        dict(layout="4x2_pf1"),
-        dict(layout="4x2_pf1", xcd_swizzle=False),
-        dict(layout="2x4_pf1", pair_blocks=True),
-    ],
-    ids=["lds-2x4", "lds-4x2", "lds-4x2-linear", "lds-2x4-pair"],
-)
-def test_gateup_fp8_sorted(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks, config):
+def test_gateup_fp8_sorted(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks):
     if not is_gfx942():
         pytest.skip("gfx942 kernel")
     inputs = make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=extra_blocks)
@@ -275,7 +204,7 @@ def test_gateup_fp8_sorted(tokens, inter_dim, hidden_dim, topk, experts, routing
     for _ in range(2):
         a2.fill_(0x55)
         a2_scale_t.fill_(float("nan"))
-        run_kernel(inputs, a2.view(dtypes.fp8), out_scale_t=a2_scale_t, topk=topk, **config)
+        run_kernel(inputs, a2.view(dtypes.fp8), a2_scale_t, topk)
         torch.cuda.synchronize()
         check_fp8_sorted(inputs, a2.view(dtypes.fp8), a2_scale_t, 0x55)
         if previous is not None:
@@ -328,12 +257,13 @@ def benchmark(args):
     inputs = make_inputs(tokens, inter_dim, hidden_dim, topk, experts, args.routing, seed=args.seed)
     routes = inputs["routes"][0].numel()
     flops = 4 * routes * inter_dim * hidden_dim
-    out = torch.empty((tokens, topk, inter_dim), device="cuda", dtype=torch.bfloat16)
-    out.fill_(float("nan"))
-    run_kernel(inputs, out, xcd_swizzle=not args.no_xcd_swizzle)
+    capacity = inputs["expert_ids"].numel() * SORT_BLOCK_M
+    out = torch.full((capacity, inter_dim), 0x55, device="cuda", dtype=torch.uint8)
+    out_scale_t = torch.full((inter_dim // 128, capacity), float("nan"), device="cuda")
+    run_kernel(inputs, out.view(dtypes.fp8), out_scale_t, topk)
     torch.cuda.synchronize()
     if args.check:
-        print(f"check: calc_diff={check(inputs, out, reference(inputs)):.3e}", flush=True)
+        print(f"check: calc_diff={check_fp8_sorted(inputs, out.view(dtypes.fp8), out_scale_t, 0x55):.3e}", flush=True)
     validated = out.clone()
     clones = [inputs] + [
         dict(inputs, **{name: inputs[name].clone() for name in ("a", "w1", "a_scale_t", "w1_scale")})
@@ -341,7 +271,7 @@ def benchmark(args):
     ]
 
     def call(index):
-        run_kernel(clones[index % len(clones)], out, xcd_swizzle=not args.no_xcd_swizzle)
+        run_kernel(clones[index % len(clones)], out.view(dtypes.fp8), out_scale_t, topk)
 
     for index in range(len(clones)):
         call(index)
@@ -352,7 +282,7 @@ def benchmark(args):
             call(index)
         samples.append(perf.latencies[0] * 1e6)
     torch.cuda.synchronize()
-    assert torch.equal(out.view(torch.int16), validated.view(torch.int16)), "timed output differs"
+    assert torch.equal(out, validated), "timed output differs"
     median_us = statistics.median(samples)
     blocks = int(inputs["num_valid_ids"][0].item()) // SORT_BLOCK_M
     report = {
@@ -422,6 +352,5 @@ if __name__ == "__main__":
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument("--dense", action="store_true", help="also time the dense 8x1 GEMM at M=routes")
     parser.add_argument("--sustained", type=float, default=0, help="seconds of back-to-back launches with clock telemetry")
-    parser.add_argument("--no-xcd-swizzle", action="store_true")
     parser.add_argument("--json")
     benchmark(parser.parse_args())

@@ -4,14 +4,14 @@
 
 ## 1. 范围
 
-- 算子：MoE GEMM1，`out[token, slot] = BF16(SiLU(gate) * up)`，gate/up来自同一FP8 GEMM。A为FP8、每(token, K128)一个scale；B为FP8、每(128列, K128)一个scale；路由为aiter `moe_sorting`的256行block格式。
+- 算子：MoE GEMM1，SiLU(gate) * up，gate/up来自同一FP8 GEMM。A为FP8、每(token, K128)一个scale；B为FP8、每(128列, K128)一个scale；路由为aiter `moe_sorting`的256行block格式。现在只输出Down用的排序后FP8 A2（每(row, 128)一个scale）；本文多数测量用的是当时的BF16输出`out[token, slot]`。
 - 形状：MiMo EP8单rank，`I=2048`、`K(hidden)=4096`、32个本地expert、topk=8，FLOPs=`4*T*I*K`。
   - `ep_uniform`：每token一个本地route，每个expert恰好`T/32`行。
   - `ep_random`：每token的本地expert随机，expert负载不均（更接近真实）。
 - Kernel（`src/contrib/flydsl/`）：
-  - `moe_gateup_a8w8_blockscale_gfx942_lds`：`layout="2x4_pf1"`（默认）/`"4x2_pf1"`，即M×N的wave排布，global load比写LDS早1个stage；A、B都经LDS；选项`pair_blocks`、FP8输出（`out_scale_t`）。常驻版本（`persistent`）已删除，见4.5。
+  - `moe_gateup_a8w8_blockscale_gfx942_lds`：2x4的M×N wave排布，global load比写LDS早1个stage（`2x4_pf1`）；A、B都经LDS；排序后的FP8输出；可选`bm128`。`layout="4x2_pf1"`、`pair_blocks`、BF16输出、`xcd_swizzle=False`在`1a4fc73`之后删除（[record §11](record/moe_small_m_gfx942.md)），常驻版本（`persistent`）更早删除，见4.5。下文用到这些选项的数据要在`1a4fc73`或更早的版本复现。
   - 8x1 wave版本（A直接读进VGPR，B经LDS）已删除：不支持FP8输出，也不比2x4快。下文保留它当时的测量。
-- 测试：`tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py`，5组配置×5个shape，加上FP8输出的24例，共49例。
+- 测试：`tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py`，FP8输出6个shape；`bm128`在`test_down_a8w8_blockscale_gfx942.py`的`test_gateup_down_bm128`里测。
 
 ## 2. 测试方法
 
@@ -89,6 +89,7 @@
   - 不检查expert的版本在`ep_random`下反而慢1–1.5%：成对的block跨expert，把原本相邻的同expert block拆开了。
   - 2026-11-04复测（同4.5的协议，输出逐位相同）：FP8输出`ep8` 4K/8K/16K/32K为+0.2%/−1.0%/−0.5%/−0.1%，`ep_uniform`为+0.3%/+0.2%/−3.5%/−1.2%；BF16输出`ep8`为+0.2%/−0.3%/−1.3%/−0.7%。有收益，保留，默认仍关闭。
   - 2026-11-04在`aiter.fused_moe`里测（a2a EP8，`balanced`路由，每个expert 512/1024行，冷cache，两次运行）：GateUp kernel 16K快1.5%、32K快0.8%；整次调用16K快0.9%（23/24轮更快），32K快0.4–0.5%（15/24轮）。见[MoE文档6.1](moe_a8w8_blockscale_gfx942.md)。
+  - 收益太小，`1a4fc73`之后删除。
 
 ### 4.8 反量化与GEMM核心
 
@@ -100,4 +101,4 @@
 1. 按64行跳过全padding的块（真实负载收益最大；4K上限−13.7%）。
 2. 反量化改用`v_pk_fma_f32`（上限3–4%，预计1.5–2%）。
 3. SiLU用packed指令（预计0.5–1%）。
-4. 决定`pair_blocks`是否默认开启（FP8输出16K `ep_uniform`快3.5%，`ep8`最多快1%，4K持平；融合流程a2a EP8均衡路由整次调用16K快0.9%、32K快0.5%）。
+4. `pair_blocks`：收益太小（FP8输出16K `ep_uniform`快3.5%，`ep8`最多快1%，4K持平；融合流程a2a EP8均衡路由整次调用16K快0.9%、32K快0.5%），已删除（见4.7）。

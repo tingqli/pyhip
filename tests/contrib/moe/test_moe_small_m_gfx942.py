@@ -291,9 +291,7 @@ def test_gateup_down_merged(tokens, inter_dim, hidden_dim, topk, experts, routin
                 torch.full((inter_dim // SCALE_COLUMNS, capacity), float("nan"), device="cuda"))
 
     a2_ref, a2_scale_ref = buffers()
-    moe_gateup_a8w8_blockscale_gfx942_lds(
-        *gateup_inputs, a2_ref.view(dtypes.fp8), layout="2x4_pf1", out_scale_t=a2_scale_ref, topk=topk,
-    )
+    moe_gateup_a8w8_blockscale_gfx942_lds(*gateup_inputs, a2_ref.view(dtypes.fp8), a2_scale_ref, topk)
     a2, a2_scale = buffers()
     previous = None
     for _ in range(2):

@@ -1,4 +1,4 @@
-"""Audit of the gfx942 MoE GateUp / Down LDS pipeline (layouts 2x4_pf1, 4x2_pf1) on the final ISA.
+"""Audit of the gfx942 MoE GateUp (2x4_pf1 wave grid) / Down (4x2_pf1) LDS pipeline on the final ISA.
 
 Checks, per kernel, on the instruction stream LLVM actually emitted:
   - barrier pairing: every wave executes the same number of s_barrier; the group-conditional barriers that
@@ -30,8 +30,6 @@ from dataclasses import dataclass, field
 T, I, H, TOPK, E = 1024, 2048, 4096, 8, 32
 CONFIGS = {
     "gateup_2x4_pf1": dict(kernel="gateup", layout="2x4_pf1", kb=H // 128),
-    "gateup_4x2_pf1": dict(kernel="gateup", layout="4x2_pf1", kb=H // 128),
-    "down_2x4_pf1": dict(kernel="down", layout="2x4_pf1", kb=I // 128),
     "down_4x2_pf1": dict(kernel="down", layout="4x2_pf1", kb=I // 128),
 }
 PACKET_BYTES, B_BASE_BYTES = 8192, 32768
@@ -909,12 +907,12 @@ def dump_one(config, out_dir):
         inputs = make_inputs(T, I, H, TOPK, E, "ep8")
         capacity = inputs["expert_ids"].numel() * SORT_BLOCK_M
         out = torch.empty((capacity, I), device="cuda", dtype=dtypes.fp8)
-        run_kernel(inputs, out, layout=cfg["layout"], out_scale_t=torch.empty((I // 128, capacity), device="cuda"), topk=TOPK)
+        run_kernel(inputs, out, torch.empty((I // 128, capacity), device="cuda"), TOPK)
     else:
         from test_down_a8w8_blockscale_gfx942 import make_inputs, run_kernel
 
         out = torch.empty((T, H), device="cuda", dtype=torch.bfloat16)
-        run_kernel(make_inputs(T, H, I, TOPK, E, "ep8"), out, layout=cfg["layout"], reduce="atomic", sorted_a2=True, single_store=True)
+        run_kernel(make_inputs(T, H, I, TOPK, E, "ep8"), out, single_store=True)
     torch.cuda.synchronize()
 
 

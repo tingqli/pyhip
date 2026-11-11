@@ -8,8 +8,8 @@
 - 路由`ep_uniform`（专家均分）：每个token恰好1个本地路由，每个本地expert分到T/32行。
 - 我们的流程：
   1. aiter `moe_sorting`，block 256，EP方式（全局expert id + `expert_mask`）。
-  2. GateUp `2x4_pf1`，`out_scale_t=`（fp8_out）：epilogue里把SiLU(gate)·up按(row, 128)量化成FP8，按排序后的行写出A2 `[blocks*256, I]`。
-  3. Down `4x2_pf1`，读排序后的A2，`reduce="atomic"`，有两种写法：
+  2. GateUp（2x4 wave排布）：epilogue里把SiLU(gate)·up按(row, 128)量化成FP8，按排序后的行写出A2 `[blocks*256, I]`。
+  3. Down（4x2 wave排布），读排序后的A2，有两种写法：
      - **atomic**：每一路用BF16 `global_atomic_pk_add_bf16`加进`out [T, H]`。`out`需要先清零，由aiter的sort顺带完成。
      - **B（`single_store=True`）**：本卡只有1路的token直接`global_store_dword`。`moe_route_counts`统计每个token的本地路数，`moe_zero_rows`只清零count≠1的行；sort不再清零`out`（传一个空的moe_buf）。
 - 对手：aiter `fmoe_fp8_blockscale_g1u1`，gfx942上的1-stage asm，GateUp、SiLU、量化、Down在一个kernel里。输入和`aiter.fused_moe`在gfx942上喂给它的一样：预先量化好的FP8 a1加转置的scale。激活量化两边都不计时。
@@ -17,6 +17,7 @@
 - 每个本地expert ≤128行（T ≤ 4K）时BM256 tile一半以上是padding：
   - aiter入口`fused_moe_a8w8_blockscale_gfx942`默认`bm128=True`：grid与workgroup不变，GateUp/Down在kernel内读每个block的第128行，无route时跑128行流水线（GateUp每K block 2个stage，Down只算两个M slice）。T≤2048相对tuned asm从0.55–0.79×提到0.83–1.03×，ep_uniform T=4096从1.04×到1.28×，见[record §9](record/moe_small_m_gfx942.md)。
   - `fused_moe_a8w8_blockscale_gfx942_sort`用256行sort表（sort清零out），GateUp/Down各一次launch，kernel内看每个block的第128行：有效（>128个route）的block走BM256 tile，其余走8-wave pair任务（merged），见[record/moe_small_m_gfx942.md](record/moe_small_m_gfx942.md)。原来的4-wave small-M kernel与`big_blocks="bm256"`/`"split"`已删除（record §10）。
+- BM256 GateUp / Down现在只有上面这一种配置。其他编译期选项（另一种wave排布`layout`、`xcd_swizzle=False`、`pair_blocks`、GateUp的BF16输出、Down读未排序的A2、`reduce="kernel"`）在`1a4fc73`之后删除（record §11）。第3节、6.1节里用到它们的数据要在那一版复现。
 
 ## 2. 结果
 
@@ -68,7 +69,7 @@ Down和流水线的数字都是32K、µs；有两个值时是"ep_uniform / ep8�
 
 | 提交 | 改动 | 效果 |
 |---|---|---|
-| `cea2b4a` | GateUp：FlyDSL 8x1和2x4/4x2 LDS kernel（8x1后来删除） | 2x4冷cache 433/740/820/约900 TF（4K/8K/16K/32K），见GateUp文档 |
+| `cea2b4a` | GateUp：FlyDSL 8x1和2x4/4x2 LDS kernel（8x1后来删除，4x2在`1a4fc73`之后删除） | 2x4冷cache 433/740/820/约900 TF（4K/8K/16K/32K），见GateUp文档 |
 | `45afb76` | Down kernel：BM256×BN256，复用GateUp的K循环；每个wave先经LDS转置，一条atomic写2行×128 B（不转置时atomic请求约4倍） | atomic（清零+Down）847 / 887，比"写行+单独FP32 reduce"的889 / 947快5–6%；atomic只比普通store慢约5%（798 vs 762）；Down用4x2比2x4快6–8% |
 | `45afb76` | MoE的BF16输出改为round-to-nearest-even | 原来从PyHIP抄来的打包是截断，整体偏小0.28% |
 | `45afb76` | `sorted_a2`：A2按排序后的行连续读。原来按`[T, topk, I]` gather，L1 TLB miss是GateUp的8倍 | mainloop MFMA效率59%→91–92%；atomic总时间850→711 / 895→729 |
@@ -79,7 +80,7 @@ Down和流水线的数字都是32K、µs；有两个值时是"ep_uniform / ep8�
 
 - **清零放到另一个stream，和GateUp并行**：慢1–4%。GateUp占满了每个CU的寄存器，清零kernel只能在GateUp收尾时才上得去，还要分走功耗。
 - **常驻kernel，把atomic推到下一个任务的K循环里**：gfx942上普通读和atomic共用`vmcnt`，K循环等数据时也要等atomic确认。第一版proxy测得更慢，但后来发现proxy本身有问题，没有在真实kernel上实现。
-- **GateUp常驻kernel**：任务切换变短，但在750 W功耗墙下墙钟时间不变（2026-11-04复测−0.3%～+1.0%），已删除。`pair_blocks`保留、默认关闭：FP8输出在16K `ep_uniform`快3.5%，`ep8`最多快1%。见GateUp文档4.5、4.7。接入`aiter.fused_moe`后（a2a EP8均衡路由）整次调用16K快0.9%、32K快0.4–0.5%，见6.1节。
+- **GateUp常驻kernel**：任务切换变短，但在750 W功耗墙下墙钟时间不变（2026-11-04复测−0.3%～+1.0%），已删除。`pair_blocks`（默认关闭）：FP8输出在16K `ep_uniform`快3.5%，`ep8`最多快1%，见GateUp文档4.5、4.7；接入`aiter.fused_moe`后（a2a EP8均衡路由）整次调用16K快0.9%、32K快0.4–0.5%，见6.1节。收益太小，`1a4fc73`之后删除。
 
 ## 4. single_store的适用条件
 
@@ -111,8 +112,8 @@ python -c "import amdsmi"         # 空闲检查用；缺少时：pip install /o
 
 ```bash
 export HIP_VISIBLE_DEVICES=0
-python -m pytest -q tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py    # GateUp，69例
-python -m pytest -q tests/contrib/moe/test_down_a8w8_blockscale_gfx942.py      # Down、single_store、GateUp→Down，69例
+python -m pytest -q tests/contrib/moe/test_gateup_a8w8_blockscale_gfx942.py    # GateUp，6例
+python -m pytest -q tests/contrib/moe/test_down_a8w8_blockscale_gfx942.py      # Down、single_store、bm128、GateUp→Down、aiter入口，44例
 python -m pytest -q tests/contrib/moe/test_fmoe_a8w8_blockscale_asm_gfx942.py  # aiter asm，44例
 python -m pytest -q tests/contrib/moe/test_aiter_fused_moe_flydsl_gfx942.py    # 经aiter.fused_moe走FlyDSL，5例（需要带第6节hook的aiter）
 ```
@@ -199,7 +200,7 @@ done
 
 ### 6.1 a2a EP8均衡路由：pair_blocks、各kernel时间、ATT阶段占比（2026-11-04）
 
-条件：`aiter.fused_moe`整次调用，MORI式FP8接收buffer加`num_local_tokens`，buffer行数等于EP组token数。EP8（256个全局expert，本卡32个），`balanced`路由：每个本地expert恰好T/32行（16K为512行、32K为1024行，没有padding），有本地路由的token占65.6%。`single_store=True`。权重和接收buffer各5份，每次调用换一份（冷cache）。asm、FlyDSL、FlyDSL+`pair_blocks`三条路径按全部6种顺序交错，共12轮，每段8次预热、16次计时。GPU3，测前测后都空闲。共测了两次，第二次用的是下面的脚本。脚本：[bench_fused_moe_a2a_gfx942.py](../tests/contrib/moe/bench_fused_moe_a2a_gfx942.py)。
+条件：`aiter.fused_moe`整次调用，MORI式FP8接收buffer加`num_local_tokens`，buffer行数等于EP组token数。EP8（256个全局expert，本卡32个），`balanced`路由：每个本地expert恰好T/32行（16K为512行、32K为1024行，没有padding），有本地路由的token占65.6%。`single_store=True`。权重和接收buffer各5份，每次调用换一份（冷cache）。asm、FlyDSL、FlyDSL+`pair_blocks`三条路径按全部6种顺序交错，共12轮，每段8次预热、16次计时。GPU3，测前测后都空闲。共测了两次，第二次用的是下面的脚本。脚本：[bench_fused_moe_a2a_gfx942.py](../tests/contrib/moe/bench_fused_moe_a2a_gfx942.py)。`pair_blocks`和脚本的FlyDSL+pair路径在`1a4fc73`之后删除，现在`time`只比asm和FlyDSL；下表的+pair两列要在那一版复现。
 
 整次调用，中位数，µs（两次运行）：
 

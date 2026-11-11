@@ -1,5 +1,5 @@
-"""aiter.fused_moe on gfx942 with MORI-style all-to-all EP8 FP8 input and balanced routing: asm vs FlyDSL (GateUp
-pair_blocks off / on) timing, per-kernel times, and the ATT prolog / K-loop / epilog split of the FlyDSL kernels.
+"""aiter.fused_moe on gfx942 with MORI-style all-to-all EP8 FP8 input and balanced routing: asm vs FlyDSL timing,
+per-kernel times, and the ATT prolog / K-loop / epilog split of the FlyDSL kernels.
 
   time:   HIP_VISIBLE_DEVICES=3 python bench_fused_moe_a2a_gfx942.py time --tokens 16384 32768 --json a2a.json
   ATT:    HIP_VISIBLE_DEVICES=3 rocprofv3 --att --att-library-path DECODER_DIR --att-target-cu 1 \\
@@ -31,35 +31,24 @@ from pathlib import Path
 
 ENV = "AITER_FMOE_FP8_BLOCKSCALE_FLYDSL"
 I, H, TOPK, E, EP = 2048, 4096, 8, 32, 8
-PATHS = ("asm", "flydsl", "flydsl+pair")
+PATHS = ("asm", "flydsl")
 MFMA_CYCLES = 16
 REALTIME_HZ = 100e6
 WAVE_RE = re.compile(r"se(\d+)_sm(\d+)_sl(\d+)_wv(\d+)\.json")
 PHASES = ("prolog", "mainloop", "epilog")
 
-_pair_blocks = {"on": False}
-
 
 def select(path):
     os.environ[ENV] = "0" if path == "asm" else "1"
-    _pair_blocks["on"] = path == "flydsl+pair"
 
 
 def prepare(tokens, clones):
     """(case, clone sets, call) for an a2a receive buffer of `tokens` rows."""
     import aiter.fused_moe as fm
-    import pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 as fused
     from aiter import ActivationType, QuantType, dtypes
     from test_aiter_fused_moe_flydsl_gfx942 import a2a_inputs
     from test_fmoe_a8w8_blockscale_asm_gfx942 import make_inputs
 
-    if not getattr(fused, "_bench_pair_blocks", False):
-        gateup = fused.moe_gateup_a8w8_blockscale_gfx942_lds
-        # pair_blocks runs the BM256 pipeline on every block (no bm128).
-        fused.moe_gateup_a8w8_blockscale_gfx942_lds = lambda *a, **kw: gateup(
-            *a, pair_blocks=_pair_blocks["on"], **{**kw, "bm128": kw.get("bm128", False) and not _pair_blocks["on"]}
-        )
-        fused._bench_pair_blocks = True
     os.environ[f"{ENV}_MIN_TOKENS"] = "1"
     inputs = make_inputs(tokens, I, H, TOPK, E, EP, "balanced")
     case, buffers = a2a_inputs(inputs, tokens)
@@ -92,7 +81,7 @@ def time_paths(args):
         n, routes = case["shape"][0], case["routes"][0].numel()
         expected = reference(case)
         outs, diffs = {}, {}
-        for key, path in (("asm", "asm"), ("flydsl", "flydsl"), ("flydsl+pair", "flydsl+pair"), ("rerun", "flydsl")):
+        for key, path in (("asm", "asm"), ("flydsl", "flydsl"), ("rerun", "flydsl")):
             select(path)
             outs[key] = call(sets[0])[:n].clone()
             torch.cuda.synchronize()
@@ -100,8 +89,8 @@ def time_paths(args):
         # Tokens with one local route are stored once; the others add BF16 atomics in run-dependent order.
         single = torch.bincount(case["routes"][0], minlength=n) == 1
         bits = {k: v.view(torch.int16) for k, v in outs.items()}
-        assert torch.equal(bits["flydsl"][single], bits["flydsl+pair"][single]), "pair_blocks changed a single-route row"
-        multi_differ = {k: (bits["flydsl"][~single] != bits[k][~single]).float().mean().item() for k in ("rerun", "flydsl+pair")}
+        assert torch.equal(bits["flydsl"][single], bits["rerun"][single]), "a rerun changed a single-route row"
+        multi_differ = (bits["flydsl"][~single] != bits["rerun"][~single]).float().mean().item()
         del outs, bits, expected
 
         def segment(start):
@@ -143,15 +132,12 @@ def time_paths(args):
                              for k in range(per_call)]
 
         med = {p: statistics.median(s for r in rounds for s in r[p]) for p in PATHS}
-        paired = [statistics.median(r["flydsl"]) / statistics.median(r["flydsl+pair"]) for r in rounds]
         print(f"T={tokens}: {n} valid rows, {routes} local routes", flush=True)
         for p in PATHS:
             values = sorted(s for r in rounds for s in r[p])
             print(f"  {p:12s} median {med[p]:8.1f} us  p10-p90 {values[len(values) // 10]:.1f}-{values[len(values) * 9 // 10]:.1f}"
                   f"  calc_diff {diffs[p]:.2e}  asm/this {med['asm'] / med[p]:.3f}x")
-        print(f"  pair_blocks: {(med['flydsl+pair'] / med['flydsl'] - 1) * 100:+.2f}%, faster in {sum(x > 1 for x in paired)}/{len(paired)} "
-              f"rounds; multi-route elements differing from flydsl: rerun {multi_differ['rerun'] * 100:.2f}%, "
-              f"pair {multi_differ['flydsl+pair'] * 100:.2f}%")
+        print(f"  multi-route elements differing between two FlyDSL runs: {multi_differ * 100:.2f}%")
         for p in PATHS:
             print(f"  kernels {p}: " + ", ".join(f"{name[:40]} {dur:.1f}" for name, dur in kernels[p]), flush=True)
         results.append(dict(tokens=tokens, valid_rows=n, routes=routes, calc_diff=diffs, multi_route_differ=multi_differ,
@@ -286,12 +272,12 @@ def phases_report(r):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    timing = sub.add_parser("time", help="asm / FlyDSL / FlyDSL+pair_blocks, all 6 orders interleaved")
+    timing = sub.add_parser("time", help="asm / FlyDSL, both orders interleaved")
     timing.add_argument("--tokens", type=int, nargs="+", default=[16384, 32768], help="receive-buffer rows")
     timing.add_argument("--clones", type=int, default=5)
     timing.add_argument("--iters", type=int, default=16)
     timing.add_argument("--warmup", type=int, default=8)
-    timing.add_argument("--repeat", type=int, default=2, help="passes over the 6 path orders")
+    timing.add_argument("--repeat", type=int, default=2, help="passes over the path orders")
     timing.add_argument("--profile-calls", type=int, default=20)
     timing.add_argument("--json")
     run = sub.add_parser("run", help="fused_moe calls of one path, for rocprofv3 --att")

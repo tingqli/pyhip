@@ -728,8 +728,8 @@ def merged_plugin(mode, n_dim, k_dim, topk, num_experts):
 
 
 def moe_gateup_merged(a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, a2_scale, topk):
-    """GateUp of every block in one launch (BM256 2x4_pf1 tiles for blocks with a route at row 128, pair tasks for the
-    others); a2 [blocks * 256, I] FP8 and a2_scale [I/128, blocks * 256] as the BM256 GateUp's fp8_out (rows a pair
+    """GateUp of every block in one launch (BM256 tiles for blocks with a route at row 128, pair tasks for the
+    others); a2 [blocks * 256, I] FP8 and a2_scale [I/128, blocks * 256] as the BM256 GateUp writes them (rows a pair
     task does not use are not written)."""
     from .moe_gateup_a8w8_blockscale_gfx942_lds import compile_moe_gateup_a8w8_blockscale_gfx942_lds
 
@@ -743,8 +743,7 @@ def moe_gateup_merged(a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_va
     assert a2_scale.shape == (inter_dim // A2_SCALE_COLUMNS, capacity) and a2_scale.dtype == torch.float32
     validate_parameters("gateup", tokens, inter_dim, hidden_dim, topk, num_experts, capacity)
     launch = compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-        inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, fp8_out=True,
-        merged=merged_plugin("gateup", inter_dim, hidden_dim, topk, num_experts),
+        inter_dim, hidden_dim, topk, num_experts, merged=merged_plugin("gateup", inter_dim, hidden_dim, topk, num_experts)
     )
     run_compiled(
         launch,
@@ -756,7 +755,7 @@ def moe_gateup_merged(a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_va
 
 
 def moe_down_merged(a2, w2, a2_scale, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, topk):
-    """Down of every block in one launch (BM256 4x2_pf1 tiles with BF16 atomics for blocks with a route at row 128,
+    """Down of every block in one launch (BM256 tiles with BF16 atomics for blocks with a route at row 128,
     pair tasks for the others) into a zeroed out [tokens, H]."""
     from .moe_down_a8w8_blockscale_gfx942_lds import compile_moe_down_a8w8_blockscale_gfx942_lds
 
@@ -769,14 +768,12 @@ def moe_down_merged(a2, w2, a2_scale, w2_scale, sorted_ids, sorted_weights, expe
     assert a2_scale.shape == (inter_dim // A2_SCALE_COLUMNS, capacity) and a2_scale.dtype == torch.float32
     validate_parameters("down", tokens, hidden_dim, inter_dim, topk, num_experts, capacity)
     launch = compile_moe_down_a8w8_blockscale_gfx942_lds(
-        hidden_dim, inter_dim, topk, num_experts, layout="4x2_pf1", xcd_swizzle=True, atomic=True, sorted_a2=True,
-        merged=merged_plugin("down", hidden_dim, inter_dim, topk, num_experts),
+        hidden_dim, inter_dim, topk, num_experts, merged=merged_plugin("down", hidden_dim, inter_dim, topk, num_experts)
     )
     run_compiled(
         launch,
         _ptr(fx.Int32, a2), _ptr(fx.Int32, w2), _ptr(fx.Int32, out), _ptr(fx.Float32, a2_scale), _ptr(fx.Float32, w2_scale),
         _ptr(fx.Int32, sorted_ids), _ptr(fx.Float32, sorted_weights), _ptr(fx.Int32, expert_ids),
-        _ptr(fx.Int32, num_valid_ids), _ptr(fx.Int32, sorted_ids), _ptr(fx.Int32, sorted_ids), tokens, num_blocks,
-        torch.cuda.current_stream(),
+        _ptr(fx.Int32, num_valid_ids), _ptr(fx.Int32, sorted_ids), tokens, num_blocks, torch.cuda.current_stream(),
     )
     return out

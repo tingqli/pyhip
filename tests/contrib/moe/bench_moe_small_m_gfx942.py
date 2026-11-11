@@ -230,14 +230,13 @@ def main(argv=None):
             def gateup256(c, bm128):
                 moe_gateup_a8w8_blockscale_gfx942_lds(
                     c["a"], c["w1"], c["a_scale_t"], c["w1_scale"], s256["sorted_ids"], e256, s256["num_valid_ids"], a2,
-                    layout="2x4_pf1", out_scale_t=a2_scale_t, topk=TOPK, bm128=bm128,
+                    a2_scale_t, TOPK, bm128=bm128,
                 )
 
             def down256(c, bm128):
                 moe_down_a8w8_blockscale_gfx942_lds(
                     a2, c["w2"], a2_scale_t, c["w2_scale"], s256["sorted_ids"], s256["sorted_weights"], e256,
-                    s256["num_valid_ids"], out, layout="4x2_pf1", reduce="atomic", zero_out=False, topk=TOPK,
-                    single_store=True, route_counts=counts, bm128=bm128,
+                    s256["num_valid_ids"], out, TOPK, zero_out=False, single_store=True, route_counts=counts, bm128=bm128,
                 )
 
             variants["k: sort256NZ"] = (None, lambda c: sort(256, False), None, False)

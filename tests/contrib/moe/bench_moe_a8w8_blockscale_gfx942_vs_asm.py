@@ -3,7 +3,7 @@
 One EP8 rank of MiMo-V2.6-Flash (hidden 4096, moe_inter 2048, 256 experts, top-8: 32 local experts) on the inputs of
 test_fmoe_a8w8_blockscale_asm_gfx942.make_inputs: FP8 activations with per-(token, 128) scales and 128x128
 block-scaled FP8 weights, which is what aiter.fused_moe hands the asm kernel on gfx942. Ours: aiter moe_sorting(256)
--> GateUp 2x4_pf1 with fp8_out (FP8 per (row, 128) in sorted-row order) -> Down 4x2_pf1 on the sorted A2, routes added with
+-> GateUp (2x4 waves, FP8 per (row, 128) in sorted-row order) -> Down (4x2 waves) on the sorted A2, routes added with
 BF16 atomics ("atomic"), or stored for tokens with one local route ("B", single_store). Every variant writes its own
 output, which the test's check() validates after timing; the summary compares both with the fastest asm kernel.
 
@@ -48,8 +48,6 @@ def parse_args(argv=None):
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--warmup-ms", type=float, default=50.0)
     parser.add_argument("--timing", default="queued", choices=["queued", "cudaperf"])
-    parser.add_argument("--gemm1-layout", default="2x4_pf1")
-    parser.add_argument("--gemm2-layout", default="4x2_pf1")
     parser.add_argument("--no-gate", action="store_true", help="skip the amdsmi idle-GPU gate (run marked invalid)")
     parser.add_argument("--dry-run", action="store_true", help="run and check every variant twice, no timing")
     parser.add_argument("--host-time", action="store_true", help="print each variant's host enqueue time and exit")
@@ -192,13 +190,13 @@ def main(argv=None):
     def gemm1(c, s):
         moe_gateup_a8w8_blockscale_gfx942_lds(
             c["a"], c["w1"], c["a_scale_t"], c["w1_scale"], s["sorted_ids"], s["sorted_expert_ids"], s["num_valid_ids"],
-            a2, layout=args.gemm1_layout, out_scale_t=a2_scale_t, topk=TOPK,
+            a2, a2_scale_t, TOPK,
         )
 
     def gemm2(c, s, out, route_counts=None):
         moe_down_a8w8_blockscale_gfx942_lds(
             a2, c["w2"], a2_scale_t, c["w2_scale"], s["sorted_ids"], s["sorted_weights"], s["sorted_expert_ids"],
-            s["num_valid_ids"], out, layout=args.gemm2_layout, reduce="atomic", topk=TOPK, zero_out=False,
+            s["num_valid_ids"], out, TOPK, zero_out=False,
             single_store=route_counts is not None, route_counts=route_counts,
         )
 

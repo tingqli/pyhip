@@ -3,7 +3,8 @@
 本文记录三版实现、一次运行时选路的尝试和 BM256 kernel 内的 128 行分支。**现在的代码只有两条路径**（§10）：
 aiter 入口 `fused_moe_a8w8_blockscale_gfx942`（BM256 + `single_store`，GateUp / Down 内的 128 行分支 `bm128` 默认开，
 §9）；`fused_moe_a8w8_blockscale_gfx942_sort` / `_mixed` 的方案 A（merged，§8），每个 stage 一次 launch，有第 128 行的
-block 走 BM256 tile，其余走 8-wave pair 任务（`src/contrib/flydsl/moe_merged_a8w8_blockscale_gfx942.py`）。第一至第三版
+block 走 BM256 tile，其余走 8-wave pair 任务（`src/contrib/flydsl/moe_merged_a8w8_blockscale_gfx942.py`）。BM256 GateUp / Down
+本身也只保留这两条路径用到的配置（§11）。第一至第三版
 和方案 B 的 4-wave small-M kernel 已从 `src` 删除，最后一版在 commit da764f5。§7 是第三版（4 wave、每 CU 2 个
 workgroup、128×256 输出 tile 的 small-M kernel 加 BM256 kernel，两次 launch），§6 是第二版（4 wave、与 BM256 共用 256 行 sort 表、
 在 kernel 内按 block 选择路径），§1–§5 是第一版（8 wave、128 行 sort、host 端按 shape 选择）的分析与优化过程，roofline
@@ -33,10 +34,13 @@ workgroup、128×256 输出 tile 的 small-M kernel 加 BM256 kernel，两次 la
 
 ## 0. 结论
 
-### 精简（§10）
+### 精简（§10、§11）
 
 - 只保留 BM256 + bm128（aiter 路径）和 merged（`_sort` / `_mixed`）。4-wave small-M kernel、方案 B（split）、第三版的两次
   launch 路径和 BM256 的 `big_blocks_only` 已删除；保留的 kernel 机器码不变。
+- BM256 GateUp / Down 只保留 aiter 路径的配置：GateUp 2x4 + 排序后的 FP8 输出，Down 4x2 + 排序后的 A2 + BF16 atomic，
+  可选 `single_store`、`bm128`、`merged`。`layout`、`xcd_swizzle`、`pair_blocks`、GateUp 的 BF16 输出、Down 的未排序 A2 和
+  `reduce="kernel"` 已删除（最后一版 1a4fc73）。GateUp 机器码不变；Down 少一个 kernel 参数，只有 kernarg 偏移和 SGPR 分配不同。
 
 ### BM256 kernel 内的 128 行分支（§9，aiter 路径）
 
@@ -789,4 +793,44 @@ random 为 1.433× / 1.560× / 1.458×（bm256 1.330× / 1.547× / 1.443×）。
 - bench（`bench_moe_small_m_gfx942.py`）的 paths 只剩 asm、bm256、bm128、merged。
 - 实验目录里的工具用到了已删的代码（small-M 模块、`big_blocks`、`big_blocks_only`、bench 的 small / split 路径），
   要在 da764f5 上运行。
+
+## 11. 精简：BM256 GateUp / Down 只保留 aiter 路径的配置
+
+- 删除的是只给测试和对照用的编译期选项，aiter 路径和 merged 都不用：
+  - GateUp：`layout`（只留 2x4_pf1）、`xcd_swizzle`（总是开）、`pair_blocks`、BF16 输出 `out[T, topk, I]`。现在只写排序后的
+    FP8 A2，`out_scale_t`、`topk` 成为必填参数。
+  - Down：`layout`（只留 4x2_pf1）、`xcd_swizzle`、未排序的 A2（按 `[T, topk, I]` gather）、`reduce="kernel"`（写 rows 和
+    inverse，再由 `moe_down_reduce` 求和；包括 `moe_down_rows_a8w8_blockscale_gfx942_lds`、`compile_moe_down_reduce`、
+    kernel 参数 `pInverse`）。H ≤ 16384 的限制只来自 reduce kernel（每个 token 一个 H/16 线程的 workgroup），一并去掉。
+  - 删除前的最后一版在 commit 1a4fc73。
+- 现在的接口：
+  - `moe_gateup_a8w8_blockscale_gfx942_lds(a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out,
+    out_scale_t, topk, bm128=False)`。
+  - `moe_down_a8w8_blockscale_gfx942_lds(a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids,
+    num_valid_ids, out, topk, zero_out=True, single_store=False, route_counts=None, bm128=False)`，a2 为
+    `[blocks*256, I]`。
+  - compile 函数只剩 `merged`、`bm128`，Down 另有 `single_store`。
+- 机器码（MiMo 形状，与 1a4fc73 比，`FLYDSL_RUNTIME_ENABLE_CACHE=0`）：
+  - GateUp（bm128 开、关）和 merged GateUp 逐字节相同。
+  - Down 去掉 `pInverse` 后 kernarg 从 96 字节变为 88 字节，num_tokens / num_blocks 的偏移从 0x58 变为 0x50。
+    不带 `single_store` 的 Down（bm128 开、关）和 merged Down 只有这个立即数和 kernarg 元数据不同。
+  - 带 `single_store` 时 pNumValid 与 pRouteCounts 变成相邻参数，两条 `s_load_dwordx2` 合成一条 `s_load_dwordx4`，
+    SGPR 重新分配：K 循环 opcode 相同，只是 SGPR 编号不同。
+  - VGPR（Down 246、merged Down 250）、SGPR、LDS 都不变；route counts、zero rows kernel 逐字节相同。
+  - `audit_moe_pipeline_gfx942.py`（只剩 gateup_2x4_pf1、down_4x2_pf1）两个 kernel 都 PASS。
+- 测试：
+  - GateUp 只剩 `test_gateup_fp8_sorted`（6 个 shape），BF16 输出的 `test_gateup` 及 4x2、`pair_blocks`、linear 配置已删除。
+  - Down：`test_down` 有 4 个配置（atomic、single_store、bm128、single_store + bm128），各跑 6 个 shape。
+    `test_gateup_down_fp8_pipeline` 只测 GateUp → Down（atomic、single_store）。`test_validate_extents` 改为检查 A2 的
+    描述符上限。
+  - 三个文件（GateUp、Down、merged）共 66 passed。`test_aiter_fused_moe_flydsl_gfx942.py` 的 5 例因本机 aiter 没有 hook
+    被跳过，aiter 入口由 `test_fused_entry` 覆盖。
+- bench 和工具：
+  - `bench_moe_a8w8_blockscale_gfx942_vs_asm.py` 去掉 `--gemm1-layout` / `--gemm2-layout`。
+  - `bench_fused_moe_a2a_gfx942.py` 去掉 FlyDSL+pair 路径，只比 asm 和 FlyDSL。
+  - Down 测试文件的 `benchmark()` 去掉 layout、未排序 A2、reduce kernel 的变体；GateUp 的 `benchmark()` 改为 FP8 输出，
+    去掉 `--no-xcd-swizzle`。
+- 文档中用到这些选项的数据，要在 1a4fc73 或更早的版本上复现：
+  - [moe_gateup_a8w8_blockscale_gfx942.md](../moe_gateup_a8w8_blockscale_gfx942.md) 的 4x2、`pair_blocks`、BF16 输出；
+  - [moe_a8w8_blockscale_gfx942.md](../moe_a8w8_blockscale_gfx942.md) §3、§6.1 的 `pair_blocks`。
 

@@ -37,6 +37,9 @@ pipeline in the GateUp kernel", gfx950), here for both gfx942 kernels.
   - `test_fused_entry`: `fused_moe_a8w8_blockscale_gfx942` on aiter's EP sort (no zeroing), T = 64 / 1000 / 4096 /
     8192, bm128 off and on, against the asm test's reference.
 - 199 passed, 1 skipped (`test_down_*`, `test_gateup_*`, `test_moe_small_m_gfx942.py`).
+- After 1a4fc73 the BM256 kernels keep only the aiter configuration (record §11): the BF16-output GateUp test and the
+  2x4 / kernel-reduce / unsorted-A2 Down configurations are gone; bm128 is tested by the `test_down` configs `bm128`,
+  `single-bm128`, `test_gateup_down_bm128` and `test_fused_entry`.
 
 ## Tools (`tools/`)
 
