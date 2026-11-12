@@ -428,9 +428,10 @@ def fig_expert_rows():
 
 
 # Model of one queue (XCD 0, 38 CUs) following the kernel's rules, with measured mean phase lengths (us, rank 0 trace)
-# and data-arrival times per queue position (positions 0-3 by ~300 us, 4-7 by ~610 us, the rest before they are needed).
-MODEL = dict(ticket=3.5, G=(4.7, 162.8, 12.7), D=(3.8, 70.0, 15.3), P=790.0,
-             arrive=[300] * 4 + [610] * 4 + [700] * 4 + [790] * 4)
+# and data-arrival times per queue position (tile-0 waits of positions 0-3 and 5 in the trace, the rest interpolated
+# up to the producers' end; later positions arrive before they are needed).
+MODEL = dict(ticket=3.4, G=(5.3, 159.1, 15.6), D=(3.7, 74.3, 14.5), P=705.0,
+             arrive=[89, 121, 164, 210, 280, 356, 400, 445, 490, 535, 580, 625, 665, 705, 705, 705])
 
 
 def simulate_queue(queue=0):
@@ -538,9 +539,9 @@ def fig_swimlane_model():
         for d in ds[:2]:
             arrow(ax, (last["end"], row_of[last["cu"]]), (d["waited"], row_of[d["cu"]]), color=color, lw=1.2, rad=0.08, ms=9)
     ax.axvline(MODEL["arrive"][0], color="#2E7D32", lw=1.2, ls="--")
-    ax.text(MODEL["arrive"][0] + 3, -0.75, "队列位置0–3的数据到齐（arrived[b] = 256）", color="#2E7D32", fontsize=9, va="bottom")
-    ax.axvline(MODEL["arrive"][4], color="#2E7D32", lw=1.0, ls=":")
-    ax.text(MODEL["arrive"][4] + 3, -0.75, "位置4–7到齐", color="#2E7D32", fontsize=9, va="bottom")
+    ax.text(MODEL["arrive"][0] + 3, -0.75, "队列位置0的数据到齐（arrived[b] = 256）", color="#2E7D32", fontsize=9, va="bottom")
+    ax.axvline(MODEL["arrive"][3], color="#2E7D32", lw=1.0, ls=":")
+    ax.text(MODEL["arrive"][3] + 3, -0.75, "位置3到齐", color="#2E7D32", fontsize=9, va="bottom")
     ax.set_title("按代码逻辑模拟的泳道图：rank 0 的 XCD 0（队列0，38个CU，514张票）。每条泳道一个CU；输入用实测的平均阶段时长和数据到达时间；"
                  "箭头：e0_blk0 的16个GateUp tile都完成（done = 16）后，它的Down才能开始（实际要等队列把D g0的票发出来）", fontsize=12, loc="left", pad=28)
     fig.tight_layout()
@@ -607,7 +608,7 @@ def fig_budget(tasks):
     ax.text(0, y - 0.48, "窄条：" + small, fontsize=9, va="center", color="#444444")
     mfma_ideal_cycles = (2048 * MFMA_CYCLES["G"] + 2048 * MFMA_CYCLES["D"]) / 304
     ax.barh(2.0, b["mfma"], left=0, height=0.5, color="#2E7D32")
-    ax.text(b["mfma"] + 20, 2.0, f"{b['mfma']:.0f} µs：全部只做MFMA（功耗墙下实测时钟约1.11 GHz）", va="center", fontsize=10)
+    ax.text(b["mfma"] + 20, 2.0, f"{b['mfma']:.0f} µs：全部只做MFMA（功耗墙下实测时钟约1.0 GHz）", va="center", fontsize=10)
     ax.barh(1.2, mfma_ideal_cycles / 2100, left=0, height=0.5, color="#81C784")
     ax.text(mfma_ideal_cycles / 2100 + 20, 1.2, f"{mfma_ideal_cycles / 2100:.0f} µs：全部只做MFMA（2.1 GHz，不受功耗墙限制）", va="center",
             fontsize=10)
@@ -615,7 +616,7 @@ def fig_budget(tasks):
     ax.barh(0.4, 790, left=430, height=0.5, color="#1565C0")
     ax.text(215, 0.4, "dispatch ≈430", ha="center", va="center", fontsize=8.6, color="white")
     ax.text(825, 0.4, "combine（BF16远端原子加）≈790", ha="center", va="center", fontsize=8.6, color="white")
-    ax.text(1240, 0.4, "通信单独跑约1220 µs（P2P实测带宽）；mega里露出来的约223 µs（profile：p2p − local）", va="center", fontsize=10)
+    ax.text(1240, 0.4, "通信单独跑约1220 µs（P2P实测带宽）；mega里露出来的约145 µs（profile：p2p − local）", va="center", fontsize=10)
     ax.set_yticks([3.0, 2.0, 1.2, 0.4], ["实测：rank 0 每个CU的平均时间", "MFMA下限（实测时钟）", "MFMA下限（2.1 GHz）", "通信量折算的时间"],
                   fontsize=10)
     ax.set_xlim(0, 2900)

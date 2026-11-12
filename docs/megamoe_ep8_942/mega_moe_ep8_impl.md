@@ -26,13 +26,14 @@
 - 任务之间的等待：GateUp(b) 的 tile 0 等 block b 的数据到齐（`arrived[b]`，由 8 个源 rank 的 producer 累加），把这个 block
   的 A scale 转置后置 `scaled[b]`，其余 15 个 tile 等 `scaled[b]`；Down(b) 等 block b 的 16 个 GateUp tile 做完（`done[b]`）。
   任务只等更早的票或 producer，producer 不等任何东西，所以不会死锁。
-- 例子（均匀路由，BF16 combine）：一层 2336 µs，其中 mega kernel 约 2190–2220 µs。kernel 里每个 CU 的时间：
-  MFMA 本身 51%，K 循环里的非 MFMA 时间 16%，启动时等数据 15%，任务的 prologue/epilogue 10.5%，其余 8%。
-  这些是 GateUp 还按 token 读 A scale 时测的；改成每个 block 转置一次以后一层快 74–100 µs（第 2.5 节）。
-- 通信约 82% 被藏住（单独跑约 1220 µs，露出约 223 µs）。prologue/epilogue 完全没有被藏住（一个 CU 同时只跑一个任务）。
+- 例子（均匀路由，BF16 combine，2026-11-12 的当前版本）：一层 2132–2146 µs，其中 mega kernel 约 2017–2019 µs。
+  kernel 里每个 CU 的时间（rank 0 的 trace，span 2119 µs）：MFMA 本身 65%，K 循环里的非 MFMA 时间 10%，任务的
+  prologue/epilogue 12%，GateUp 等数据 6%，其余 7%。比最初的版本（2336 µs）快了约 200 µs：GateUp 的 A scale 每个 block
+  转置一次（第 2.5 节）、dispatch 全局按 key 发送（第 3.4 节）。
+- 通信约 88% 被藏住（单独跑约 1220 µs，露出约 145 µs）。prologue/epilogue 完全没有被藏住（一个 CU 同时只跑一个任务）。
   理论极限和还能拿回多少见第 8 节。
 - combine 有两种：BF16（默认，远端原子加进源 rank 的 `out`）和 FP8（每条路由一行 FP8 store 到源 rank，`ep_finish` 之后
-  按 slot 求和）。同日实测 FP8 一层快约 78 µs，而且结果确定。同一 token 落在同一 rank 上的几条路由先加起来能少约 1/3 的
+  按 slot 求和）。同日实测 FP8 一层快约 50 µs，而且结果确定。同一 token 落在同一 rank 上的几条路由先加起来能少约 1/3 的
   combine 字节，但在 mega kernel 里要跨任务归约，暂不做；dispatch 侧去重更值得评估。见第 9 节。
 
 ## 1. 例子参数、每卡的数量和 buffer
@@ -143,9 +144,10 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 - `route_idx[r]`（`ep_prep`）：本卡第 r 条路由（token r // 8、slot r % 8）是本卡发给同一个 global expert 的第几条。
   目标行 = expert 在目标 rank 上的起始行 + 8 × route_idx + 本卡 rank（第 2.1 节）。
 - `plan`（`ep_prep` 写给 `ep_plan`）：每个 global expert 的总路由数、8 个源里最少的路由数、在目标 rank 上的起始行，
-  每个目标 rank 的总行数，以及每个目标 rank 8 个队列的起始 block。
-- `send_route[k]` / `send_info[k]`（`ep_plan`）：producer 的发送顺序。slice j 是第 256j 到 256j+255 项（slice 内已按
-  key 排好），producer wave j 依次发：
+  每个目标 rank 的总行数，每个目标 rank 8 个队列的起始 block，以及每个 key 在 `send_route` 里的起始位置（本卡发往这个
+  key 的路由数的前缀和）和 `ep_plan` 占位置用的游标。
+- `send_route[k]` / `send_info[k]`（`ep_plan`）：producer 的发送顺序，整个数组按 key 排好（同一个 key 里的顺序每次调用
+  可能不同）。每 8 项是一个 chunk，producer WG p 发第 p、p + 16、p + 32……个 chunk（第 3.4 节）：
   - `send_route[k]` = 路由号 r（token = r >> 3，slot = r & 7）；
   - `send_info[k]` = 目标行 | global expert << 17（目标 rank = expert >> 5）；超出 `s_cap` 时为 −1，这条路由不发。
 - `send_base`（[256]）只给 step1 的 `ep_dispatch` 用：每个源的路由在 expert 里连续排，不交错。
@@ -237,8 +239,11 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 - 正确性：FP8 combine 下和 step1 路径（单独的 GateUp kernel）交替输入逐位相同；BF16 combine 下 calc_diff 1.2e-5（原子加顺序）。
 - 省下的 K 循环时间没有全部变成一层的时间：GateUp 变快以后，启动段等 dispatch 数据更久（GateUp 平均等待 44 → 63 µs，
   稳定段只多 0.4 µs），producer 也慢了（约 480 → 615 µs），时钟也低了一些（GateUp 约 1090 → 1030 MHz）。
-  dispatch 的发送顺序（第 8.4 节第 2 项）因此更重要了。
+  dispatch 的发送顺序（第 3.4 节、第 8.4 节第 3 项）因此更重要了。
 - bench / trace 加 `--token-major-scales` 回到按 token 读，用来做 A/B。
+- 注意：转置里算 `rows_cap` 的乘积要用一个不透明副本（`s_mov_b32` 内联汇编）。否则 LLVM 把它和 GateUp 里相同的乘积合成
+  一个 phi，当成 divergent 放进 VGPR，GateUp 的 12 条行号 load 和 K 循环每次迭代的 10 条 scale load 都会包进 waterfall
+  循环。改掉以后 GateUp prologue 约 6.8k → 5k cycle，一层再快约 5–9 µs（[ATT 文档](mega_moe_ep8_att.md)第 5.2 节）。
 
 ## 3. GPU0 的 304 个 CU 怎么分工
 
@@ -285,16 +290,20 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 4. 票号 < 0（所有队列都空）就退出。
 
 **预领**：GateUp / Down 任务在 epilogue 开头（K 循环刚结束）就对 home 队列做原子加，结果到下一次 `take_ticket` 才读。
-这时任务已经不再等任何东西，持票不会挡住别人；原子加的延迟藏在 epilogue 里。领票平均 2.5–4.7 µs。
+这时任务已经不再等任何东西，持票不会挡住别人；原子加的延迟藏在 epilogue 里。领票平均约 3.4 µs（从上一个任务
+的 wave 0 到达领票 barrier 算起，大部分是等同一个 WG 里最慢的 wave）。
 
 原子加只由 lane 0 做，地址经过一个不透明的 VGPR：否则 LLVM 的 atomic optimizer 会生成 64 步循环，并立刻读回结果。
 
 ### 3.4 producer
 
-- 16 个 producer WG × 8 wave = 128 个 wave。`ep_plan` 把本卡的 32768 条路由切成 128 个 slice（每个 256 条），
-  wave j（j = WG 号 × 8 + wave）发 slice j。
-- slice 内按 **key** 排序：key = 这条路由的目标 block 在目标队列里的位置（0..15）。所以每个 wave 先发各目标队列第 0 个
-  block 的数据，再发第 1 个……，让各卡的队列头先凑齐。
+- 16 个 producer WG × 8 wave = 128 个 wave。`ep_plan` 把本卡的 32768 条路由按 **key** 全局排好：key = 这条路由的目标
+  block 在目标队列里的位置（0..62；更靠后的和超出 `s_cap` 的都是 63）。每 8 条一个 chunk，共 4096 个。
+- producer WG p 发第 p、p + 16、p + 32……个 chunk，WG 里的 8 个 wave 用 LDS 里的一个计数轮流领下一个。
+  - 所有 producer 一起先发各目标队列第 0 个 block 的数据，再发第 1 个……：队列位置 0 的 block 在每个源发完约 2 个
+    chunk 后就到齐，不用等每个 wave 先发完自己那段的前 8 个 chunk（第 8.4 节）。
+  - 同一个 SIMD 上第二个 wave 发得慢，少领几个 chunk，一个 WG 的 8 个 wave 一起结束。
+  - 用一个全局计数让 128 个 wave 一起领，测下来一样快；LDS 计数不和票计数挤同一个 cache line。
 - 每次 8 条路由（一个 chunk）：
   1. lane 0–7 读 8 条路由的 `send_route` / `send_info`（目标行、global expert）。
   2. 对每条路由读本卡 `x` 的 FP8 行（4 × `buffer_load_dwordx4`，4 KB）、scale（lane 0–7 各 16 B）、路由权重。
@@ -332,9 +341,9 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 | lag | Down 比 GateUp 晚几组，默认 2。lead = min(组数, lag) |
 | head / tail | 队列开头只有 GateUp 的 lead 组；最后只有 Down 的 lead 组 |
 | producer / consumer | 前 2 张票的 WG 发 dispatch 数据，其余任务（GateUp / Down）都是 consumer 的活 |
-| slice | `ep_plan` 把本卡路由切成 producers × 8 = 128 段，每个 producer wave 发一段 |
-| chunk | producer wave 一次处理的 8 条路由（load → P2P store → vmcnt(0) → arrived 原子加） |
-| key | 发送顺序的排序键：目标 block 在目标队列里的位置 |
+| slice | `ep_plan` 的一个 WG 处理的一段本卡路由（128 个 WG，每段最多 1024 条） |
+| chunk | 发送顺序里连续的 8 条路由；producer wave 一次发一个（load → P2P store → vmcnt(0) → arrived 原子加） |
+| key | 发送顺序的排序键：目标 block 在目标队列里的位置（0..62，更靠后或丢掉的为 63） |
 | expected[b] | block b 应收到的路由数（满 block 为 256），`ep_plan` 写 |
 | arrived[b] | block b 已经写到的路由数，8 个源 rank 的 producer 原子加 |
 | done[b] | block b 做完的 GateUp tile 数，到 16 后 Down(b) 才能开始 |
@@ -397,15 +406,19 @@ threadfence_system;  for p: ws_p.CFLAG[me] = epoch (release)
 wait ws.CFLAG[0..7] == epoch
 total[g] = Σ_s C[s][g];  fewest[g] = min_s C[s][g];  expert_base[g] = 目标 rank 上的起始行（256 对齐）
 sched.ticket[0..16) = 0;  sched.done[] = 0;  sched.scaled[] = 0;  num_valid = 本卡行数;  plan 表（队列起点等）
+for 本卡路由的每个 (expert g, 目标 block):  key_hist[key] += 本卡发到这个 block 的路由数   # 行号随 idx 递增，按区间算
+plan.key_base[k] = Σ_{k'<k} key_hist[k'];  plan.key_cursor[] = 0
 ```
 
-### 6.3 `ep_plan`（128 个 WG，每个 producer wave 一个 slice）
+### 6.3 `ep_plan`（128 个 WG，每个 WG 一段路由）
 
 ```text
-slice j = 本卡路由 [256j, 256j + 256)
+slice j = 本卡路由 [per·j, per·j + per)，per = ⌈路由数 / 128⌉ ≤ 1024
 for 每条路由 r:  g = topk_ids[r];  row = mega_row(g, route_idx[r])        # base[g] + 8·idx + me（用完的源往前压紧）
                  info = row | g << 17（超出 s_cap 为 −1）;  key = row 所在 block 在目标队列里的位置
-slice 内按 key 计数排序 -> send_route[256j ..], send_info[256j ..]
+                 rank_in_wg = atomicAdd(key_count[key], 1)                  # LDS
+for key k:  start[k] = plan.key_base[k] + atomicAdd(plan.key_cursor[k], key_count[k])   # 每个 WG 在 key 的区间里占一段
+send_route[start[key] + rank_in_wg] = r;  send_info[...] = info
 for 本卡 block b（各 WG 分摊）: expert_ids[b], expected[b] = 行数, gu_ids[256b + t] = 行号或 −1, padding 行 down_ids = −1
 ```
 
@@ -434,11 +447,13 @@ while ticket >= 0:
             down_tile(block, tile)                           # 预领 -> next；epilogue: BF16 atomics -> out[src][token]
     queue, ticket = take_ticket(after_task, next)
 
-produce(p): for wave w: for chunk in slice (p·8 + w), 8 routes:
+produce(p): LDS count = 0; barrier
+  for wave w: chunk = p + 16 · (LDS count++); while chunk < 4096: (8 routes of send_route[8·chunk ..])
     load 8 routes' x rows (4 KB), scales (128 B), weights
     P2P store rows / scales / down_id / weight to the destination (sc0 nt sc1)
     s_waitcnt vmcnt(0)
     lane i < 8: system atomic_add(dest.ws.arrived[row_i / 256], 1)
+    chunk = p + 16 · (LDS count++)             # issued at the chunk's start
 ```
 
 GateUp / Down 的 tile 内部（prologue 装第一个 K block、每个 K block 4 个 stage、两组 wave 错开一个 barrier、epilogue 经
@@ -461,13 +476,14 @@ ep_combine_fp8（FP8 combine）: out[t] = BF16(Σ_slot comb[t][slot] · scale)�
 
 - 每个 CU 第一次在 t ≈ 0 领票；之后在每个 GateUp / Down 任务的 epilogue 开头预领下一张，producer 在结束时领。
 - GateUp 等它的 block 数据到齐，Down 等它的 block 的 16 个 GateUp 都结束。
-- 输入用实测的平均值（rank 0 trace）：GateUp prologue / K 循环 / epilogue = 4.7 / 162.8 / 12.7 µs，Down = 3.8 / 70.0 /
-  15.3 µs，领票 3.5 µs，producer 790 µs；队列位置 0–3 的数据在 300 µs 到齐，4–7 在 610 µs。
+- 输入用实测的平均值（rank 0 trace）：GateUp prologue / K 循环 / epilogue = 5.3 / 159.1 / 15.6 µs，Down = 3.7 / 74.3 /
+  14.5 µs，领票 3.4 µs，producer 705 µs；队列位置 0–3 的数据在 89–210 µs 到齐，位置 5 在约 356 µs，更后面的位置在用到
+  之前就到了。
 
 从图上可以读出这个设计的几个特点：
 
 1. **启动**：36 个 CU 一开始就领到了 GateUp 票（e0_blk0..3），全部在等数据，直到第一批 block 到齐。这段时间只有 2 个
-   producer CU 在干活。
+   producer CU 在干活。全局按 key 发送以后，队列位置 0 的 block 在约 90 µs 就到齐了（之前是约 300 µs）。
 2. **稳定段**：GateUp 和 Down 交替。Down(g) 被领走时，组 g 的 GateUp 早就做完了，所以 Down 基本不等。
 3. **收尾**：最后两组只剩 Down，任务少、时间短，各 CU 结束时间参差，留下几十 µs 的空闲。
 
@@ -478,11 +494,12 @@ ep_combine_fp8（FP8 combine）: out[t] = BF16(Σ_slot comb[t][slot] · scale)�
 `trace_ep8_mega.py --routing balanced --save` 记下每个任务的领票时刻、等到的时刻、K 循环开始和结束（shader clock，按
 任务的平均时钟换算成 µs）、结束时刻和所在的 CU。图是 rank 0 的 XCD 0。和模拟一致的地方：
 
-- 第一个 GateUp 的数据在 321 µs 才到齐，前 288 个 GateUp 任务平均等了约 330 µs（第 8 节的最大一项浪费）。
-- 两个 producer CU 的 wave 0 在约 590 µs 发完，但同一个 WG 里另外几个 wave 还要再发约 200 µs，所以这两个 CU 到
-  约 800 µs 才开始做 GateUp / Down（浅蓝色斜线段）。
-- Down 任务几乎不等（平均 1.9 µs）；GateUp 任务稳定段等数据也只有约 2 µs。
-- 最后 100 µs 里各 CU 陆续结束；XCD 0 有 19 个任务是从别的队列偷来的。
+- 第一个 GateUp 的数据在 84 µs 到齐，第一轮的 288 个 GateUp 任务平均等了约 110 µs（全局发送顺序之前是第一个
+  321 µs、平均约 330 µs）。
+- producer WG 的 8 个 wave 一起领 chunk，650–765 µs 一起发完，之后 8–22 µs 就开始做 GateUp / Down（之前 wave 0
+  发完以后还要等同一个 WG 里的其他 wave 约 200 µs）。
+- Down 任务几乎不等（平均 1.5 µs）；GateUp 任务稳定段等数据也只有约 2 µs。
+- 最后约 130 µs 里各 CU 陆续结束；XCD 0 有 6 个任务是从别的队列偷来的。
 
 ## 8. 理论极限和遮盖率
 
@@ -491,60 +508,58 @@ ep_combine_fp8（FP8 combine）: out[t] = BF16(Σ_slot comb[t][slot] · scale)�
 | 口径 | 每卡时间 | 怎么算 |
 |---|---|---|
 | MFMA 下限，2.1 GHz | **631 µs** | 每个 CU 1.325M 个 SIMD cycle：GateUp 2048 × 131072 + Down 2048 × 65536，除以 304（每个 K block 每个 SIMD 4096 cycle） |
-| MFMA 下限，实测时钟 | **约 1190 µs** | 功耗墙（750 W）下实测时钟约 1.11 GHz（GateUp 1108 MHz、Down 1132 MHz） |
+| MFMA 下限，实测时钟 | **约 1370 µs** | 功耗墙（750 W）下实测时钟约 1.0 GHz（GateUp 953 MHz、Down 1028 MHz）；K 循环里 stall 少了、功耗高了，时钟比最初的版本（约 1.11 GHz）低 |
 | 通信量（BF16 combine） | 约 1220 µs | dispatch 的 FP8 行 134 MB / 约 312 GB/s ≈ 430 µs，combine 268 MB / 约 339 GB/s ≈ 790 µs（P2P 实测带宽），可以和计算重叠 |
 | 通信量（FP8 combine） | 约 830 µs | combine 每条路由 4 KB + 128 B |
-| 实测：mega kernel | 2190–2220 µs | 300 次调用的中位数（各 rank），一层 2336 µs（含量化 20、prep 54、finish 29–68） |
+| 实测：mega kernel | 2017–2019 µs | 300 次调用的中位数（最慢的 rank），一层 2132–2146 µs（含量化 20、prep 63、finish 119–127） |
 
-所以这个 kernel 现在大约是“实测时钟下 MFMA 下限”的 1.85 倍。通信不是瓶颈：它比 MFMA 下限还短，而且 82% 已经藏住了。
+所以这个 kernel 现在大约是“实测时钟下 MFMA 下限”的 1.5 倍。通信不是瓶颈：它比 MFMA 下限还短，而且 88% 已经藏住了。
 
 ### 8.2 时间花在哪
 
 ![rank 0 每个 CU 的时间分解](images/impl_budget.png)
 
-rank 0 一次调用的 trace，304 个 CU 的平均（kernel span 2336 µs）：
+rank 0 一次调用的 trace，304 个 CU 的平均（kernel span 2119 µs）：
 
 | 用途 | 每个 CU | 占比 | 说明 |
 |---|---|---|---|
-| MFMA | 1189 µs | 50.9% | K 循环里 MFMA 本身（按每个任务实测的时钟换算） |
-| K 循环里的非 MFMA | 380 µs | 16.3% | GateUp K 循环的 MFMA 效率 73%（单独跑的 GateUp 是 93%），Down 83%；原因见 ATT 文档 |
-| 等数据（GateUp） | 345 µs | 14.8% | 几乎全部在启动时：前 288 个 GateUp 平均等 334 µs |
-| prologue + epilogue | 245 µs | 10.5% | GateUp 每个任务 4.7 + 12.7 µs，Down 3.8 + 15.3 µs（Down 的 epilogue 发 combine 原子加） |
-| 收尾空闲 | 81 µs | 3.5% | 最后的 Down 任务 |
-| producer | 41 µs | 1.8% | 16 个 CU 各约 790 µs |
-| 领票 / 分派 | 41 µs | 1.8% | 每个任务 2.5–4.7 µs |
-| 等 GateUp（Down） | 13 µs | 0.6% | lag = 2 让 Down 基本不用等 |
+| MFMA | 1368 µs | 64.5% | K 循环里 MFMA 本身（按每个任务实测的时钟换算） |
+| K 循环里的非 MFMA | 204 µs | 9.6% | GateUp K 循环的 MFMA 效率约 90%（单独跑的 GateUp 是 93%），Down 约 82%；见 ATT 文档第 5 节 |
+| prologue + epilogue | 263 µs | 12.4% | GateUp 每个任务 5.3 + 15.6 µs，Down 3.7 + 14.5 µs（Down 的 epilogue 发 combine 原子加） |
+| 等数据（GateUp） | 117 µs | 5.5% | 大部分在启动时：第一轮的 288 个 GateUp 平均等 110 µs |
+| 收尾空闲 | 70 µs | 3.3% | 最后的 Down 任务 |
+| 领票 / 分派 | 49 µs | 2.3% | 每个任务约 3.4 µs |
+| producer | 38 µs | 1.8% | 16 个 CU 各约 705 µs |
+| 等 GateUp（Down） | 10 µs | 0.5% | lag = 2 让 Down 基本不用等 |
 
 ### 8.3 遮盖率
 
 | 项 | 单独做要多久 | mega 里露出来的 | 遮盖率 | 依据 |
 |---|---|---|---|---|
-| dispatch 数据传输（xGMI） | 约 430 µs | 118 µs | 约 73% | profile：p2p 2338 vs local-dispatch 2220 µs |
-| combine 数据传输（xGMI） | 约 790 µs | 163 µs | 约 79% | p2p vs local-combine 2175 µs |
-| 两者合计 | 约 1220 µs | 223 µs | 约 82% | p2p vs local 2115 µs（两者不完全可加） |
-| 启动时等第一批数据 | — | 每个 CU 约 330 µs（前 288 个任务） | 基本没藏住 | trace；即使 dispatch 写本卡（local-dispatch），GateUp 平均仍等 23 µs |
-| 任务 prologue / epilogue | 每个 CU 245 µs | 245 µs | 0% | 一个 CU 只有一个 WG，任务之间串行；只有领票的原子加藏在 epilogue 里 |
-| K 循环内的访存 | — | 380 µs | — | 属于主循环本身的效率，见 ATT 文档 |
+| dispatch 数据传输（xGMI） | 约 430 µs | 60 µs | 约 86% | profile：p2p 2138 vs local-dispatch 2079 µs |
+| combine 数据传输（xGMI） | 约 790 µs | 109 µs | 约 86% | p2p vs local-combine 2030 µs |
+| 两者合计 | 约 1220 µs | 145 µs | 约 88% | p2p vs local 1994 µs（两者不完全可加） |
+| 启动时等第一批数据 | — | 第一轮 288 个任务平均 110 µs | — | trace；全局发送顺序之前是约 330 µs |
+| 任务 prologue / epilogue | 每个 CU 263 µs | 263 µs | 0% | 一个 CU 只有一个 WG，任务之间串行；只有领票的原子加藏在 epilogue 里 |
+| K 循环内的访存 | — | 204 µs | — | 属于主循环本身的效率，见 ATT 文档 |
 
-（随机路由、BF16 combine 时露出约 90–120 µs，遮盖率 90–93%；FP8 combine、32k 随机路由时约 95%，见
-[mega_moe_ep8_design.md](mega_moe_ep8_design.md) 第 7 节和 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)。
-均匀路由下所有队列同时要数据，启动时等得更久。）
+（上面的露出是均匀路由、BF16 combine；FP8 combine 时 18 / 46 / 69 µs（第 9.2 节）。更早版本的随机路由数据见
+[mega_moe_ep8_design.md](mega_moe_ep8_design.md) 第 7 节和 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)。）
 
 ### 8.4 还能拿回多少
 
-按 CU 时间算，离实测时钟下的 MFMA 下限还差约 1150 µs，主要是四项：
+按 CU 时间算，离实测时钟下的 MFMA 下限还差约 750 µs，主要是四项：
 
-1. **K 循环效率（380 µs）**：GateUp 的 K 循环在 mega 里只有 73% 的 MFMA 效率，单独跑同样的 GateUp（A scale 转置存）是 93%。
-   ATT 显示差距主要来自按 token 存的 A scale（每次读 16 个不同的 cache line）。做到 93% 可省约 290 µs 的 CU 时间。
-   **已实现**（第 2.5 节）：K 循环的 MFMA 效率到 91%，一层快 74–100 µs。
-2. **启动时等数据（345 µs）**：第一批 block 的数据要等每个 producer wave 发完自己 slice 里排在前面的约 8 个 chunk，
-   而且同一个 WG 里的 wave 快慢不一。dispatch 总时间受 xGMI 带宽限制（producer 加到 32 个反而更慢），要改的是先发什么：
-   全局按 key 排序后轮流分给各 wave（模拟：第一个 block 在第 2 个 chunk 后就到齐），估计能省一半以上。
-3. **prologue / epilogue（245 µs）**：现在完全串行。要藏住需要让下一个任务的 prologue 和当前任务的 epilogue 重叠
-   （例如 epilogue 期间先发下一个 tile 的第一个 K block 的 load），或者让一个 CU 同时有两个任务。
+1. **prologue / epilogue（263 µs）**：现在完全串行。试过的小改动（prologue 不读行号、一次往返装第一个 K block）都没有
+   收益（ATT 文档第 5.3 节）。要藏住需要让下一个任务的 prologue 和当前任务的 epilogue 重叠（例如 epilogue 期间先发
+   下一个 tile 的第一个 K block 的 load，但 kernel 已经用到 256 个 VGPR），或者让一个 CU 同时有两个任务。
+2. **K 循环效率（204 µs）**：GateUp 已经到约 90%（第 2.5 节的转置，并去掉了它带来的 waterfall 循环）。Down 约 82%，
+   等的是每个 stage 写 W2 之前的 `vmcnt`；把 W2 提前两个 stage 发没有缩短 K 循环（ATT 文档第 5.3 节）。
+3. **启动时等数据（117 µs）**：**已实现**全局按 key 发送（第 3.4 节），第一个 block 从 321 µs 提前到 84 µs，
+   等数据从 345 降到 117 µs，一层快约 100 µs。剩下的是第一轮任务等每个源发完头几个 chunk。
 4. **收尾和领票（约 120 µs）**。
 
-另外，combine 改用 FP8 已经实现：实测一层快约 78 µs，结果确定，代价是每条路由多一次 FP8 量化（第 9 节）。
+另外，combine 改用 FP8 已经实现：实测一层快约 50 µs，结果确定，代价是每条路由多一次 FP8 量化（第 9 节）。
 
 注意功耗墙：GPU 在 750 W 上限运行，K 循环里的 stall 本身耗电少，去掉 stall 时钟会降一些，省下的 cycle 不会全部变成
 时间（单独跑的 GateUp：K 循环少 14% 的 cycle，时间只少 3%）。启动和收尾的空闲段功耗低，去掉它们更接近一比一地省时间。
@@ -577,41 +592,40 @@ epilogue 的 `atomic` / `fp8_routes` 两个分支，以及 [ep_moe_comm_gfx942.c
 
 ### 9.2 实测对比
 
-2026-11-12，均匀路由，8 卡共 32k token，GPU 测前测后都空闲。
+2026-11-12，当前版本（转置 A scale、全局发送顺序、去掉 waterfall 循环），均匀路由，8 卡共 32k token，GPU 测前测后都空闲。
 
 一层的时间：bench 按 BF16、FP8、FP8、BF16 的顺序跑 4 次，每次 300 次调用，取每个 rank 的中位数，再取最慢的 rank。每格两个数
 是同一种 combine 的两次；各行分别取最慢的 rank，所以加起来不等于一层。
 
 | | BF16 | FP8 |
 |---|---|---|
-| 一层 | 2338 / 2341 µs | 2264 / 2257 µs |
-| prep（BF16 含 `out` 清零） | 55 / 55 | 48 / 48 |
-| mega kernel | 2242 / 2233 | 2097 / 2088 |
-| finish | 82 / 81 | 93 / 90 |
-| `ep_combine_fp8` | — | 79 / 80 |
+| 一层 | 2146 / 2132 µs | 2084 / 2093 µs |
+| prep（BF16 含 `out` 清零） | 63 / 63 | 56 / 56 |
+| mega kernel | 2019 / 2017 | 1887 / 1894 |
+| finish | 127 / 119 | 143 / 155 |
+| `ep_combine_fp8` | — | 80 / 80 |
 
 Down 任务：profile 每种模式跑 100 次 × 4 轮，取最快一轮之后的一次 trace，8 个 rank 平均；cycle 按各自的实测时钟换算成 µs。
 “写本卡”是 profile 的 local-combine 模式：combine 的目标换成本卡的 scratch，同步不变，只少了 xGMI 流量。
 
 | | 时钟 | prologue / K 循环 / epilogue | 一个 Down 任务 |
 |---|---|---|---|
-| BF16，远端原子加 | 1146 MHz | 3.7 / 66.4 / 14.9 µs | 85 µs |
-| BF16，原子加写本卡 | 1051 MHz | 3.3 / 67.6 / 9.6 µs | 81 µs |
-| FP8，远端 store | 1106 MHz | 3.2 / 64.9 / 8.0 µs | 76 µs |
-| FP8，store 写本卡 | 1100 MHz | 3.1 / 64.5 / 5.7 µs | 74 µs |
+| BF16，远端原子加 | 1037 MHz | 3.5 / 72.4 / 15.0 µs | 91 µs |
+| BF16，原子加写本卡 | 976 MHz | 3.6 / 73.3 / 10.9 µs | 88 µs |
+| FP8，远端 store | 1014 MHz | 3.4 / 70.4 / 8.5 µs | 82 µs |
+| FP8，store 写本卡 | 988 MHz | 3.4 / 71.9 / 6.4 µs | 82 µs |
 
-通信露出（profile 的一层时间，µs）。FP8 的各个模式都包含 `ep_combine_fp8`，所以 FP8 的露出不含这 79 µs：
+通信露出（profile 的一层时间，µs）。FP8 的各个模式都包含 `ep_combine_fp8`，所以 FP8 的露出不含这 80 µs：
 
 | | p2p | local-dispatch | local-combine | local | 露出：dispatch / combine / 两者 |
 |---|---|---|---|---|---|
-| BF16 | 2340 | 2235 | 2188 | 2116 | 104 / 152 / 224 |
-| FP8 | 2272 | 2191 | 2198 | 2130 | 81 / 74 / 142 |
+| BF16 | 2138 | 2079 | 2030 | 1994 | 60 / 109 / 145 |
+| FP8 | 2084 | 2067 | 2038 | 2015 | 18 / 46 / 69 |
 
-- BF16 的代价在远端原子加：epilogue 从写本卡时的 9.6 µs 涨到 14.9 µs。按 cycle 看 K 循环也多了 5k（76.1k vs 71.1k），
-  但那是时钟不同：远端原子加 stall 多、功耗低，时钟升到 1146 MHz，同样的访存时间折成的 cycle 更多；按 µs 算 K 循环没有变慢。
-- FP8 的远端 store 只让 epilogue 多约 2 µs。每个 Down 任务比 BF16 少约 9 µs，GateUp 任务少约 2 µs（175 → 173 µs），
-  按每个 CU 各约 6.7 个算约 75 µs；mega kernel 实测快约 145 µs，其余部分没有逐项拆开。扣掉 `ep_combine_fp8` 的 79 µs 等，
-  一层净快约 78 µs（3.3%）。
+- BF16 的代价在远端原子加：epilogue 从写本卡时的 10.9 µs 涨到 15.0 µs。
+- FP8 的远端 store 只让 epilogue 多约 2 µs，每个 Down 任务比 BF16 少约 9 µs。mega kernel 快约 130 µs，扣掉
+  `ep_combine_fp8` 的 80 µs 和更长的 finish，一层净快约 50 µs（2.4%）。改成全局发送顺序以后 BF16 的通信露出也少了
+  （224 → 145 µs），FP8 的优势比之前（约 78 µs）小。
 - 取舍：FP8 更快、结果确定，代价是每条路由一次 FP8 量化（calc_diff 3.35e-4）。精度能接受的话可以默认用 FP8。
 
 ### 9.3 同一 rank 上的几条路由要不要先加起来
@@ -654,7 +668,7 @@ Down 任务：profile 每种模式跑 100 次 × 4 轮，取最快一轮之后�
 
 **更值得做的。**
 
-1. 精度能接受的话，默认用 FP8 combine：已经实现，一层快约 78 µs，结果确定（第 9.2 节）。
+1. 精度能接受的话，默认用 FP8 combine：已经实现，一层快约 50 µs，结果确定（第 9.2 节）。
 2. 把 `ep_combine_fp8`（79 µs）挪进 mega kernel 的收尾：收尾时各 CU 陆续空闲（第 8.2 节，约 81 µs），可以先加已经到齐的
    token。需要每个 token 的到达计数；最后一批 Down 写的 token 仍然要等到最后，只能藏住一部分。
 3. dispatch 侧去重。同样的冗余在 dispatch 也有：一个 token 平均被发到同一个 rank 1.5 次，dispatch 的约 139 MB 里约 1/3
@@ -664,7 +678,7 @@ Down 任务：profile 每种模式跑 100 次 × 4 轮，取最快一轮之后�
    - 每条路由照常写自己的 `down_ids` / `recv_w`，并给所在 block 的 `arrived` 加 1；
    - GateUp 按 `down_ids` 找 A 行和 A scale，不再用 `gu_ids`。
 
-   收益是 producer 的 store 少约 1/3（producer 现在受 VMEM 发射限制），启动时等数据的时间（每个 CU 约 345 µs，第 8.2 节）
+   收益是 producer 的 store 少约 1/3（producer 现在受 VMEM 发射限制），启动时等数据的时间（每个 CU 约 117 µs，第 8.2 节）
    会缩短。风险是一个 block 的 256 行 A 从连续的 1 MB 变成散在 134 MB 里，可能有 TLB 问题（Down 的 `sorted_a2` 就是为了
    避开 A 行分散带来的 TLB 抖动），要实测。
 
@@ -690,16 +704,14 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py --
 torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mode mega --routing balanced --iters 300 --warmup 20 --token-major-scales
 ```
 
-第 1–8 节的数据（2026-11-11，8×MI300X，GPU 测前测后都空闲，GateUp 当时还按 token 读 A scale）：
+第 0–9 节的数据（2026-11-12，当前版本：转置 A scale、全局发送顺序、去掉 waterfall 循环；8×MI300X，每次运行前后 GPU
+都空闲）：
 
-- bench：一层 2336 µs（quant 20，prep 54，mega kernel 2187–2219，finish 29–68），交替输入和 step1 比 calc_diff 1.15e-5。
-- profile（100 次 × 4 轮，取最快的一轮）：p2p 2338，local-dispatch 2220，local-combine 2175，local 2115 µs。
-- trace（rank 0）：span 2336 µs；GateUp 平均跑 180 µs、等 51 µs；Down 平均跑 89 µs、等 1.9 µs；CU 忙碌比例 0.94。
-- MORI 基线需要 aiter 的 FlyDSL hook，这台机器的 aiter 没有；bench 这时直接调用 hook 会调的函数（`moe_sorting(256)` +
-  `fused_moe_a8w8_blockscale_gfx942`）。之前同样参数的对比：随机路由 BF16 combine 基线 3534 µs、
-  mega 2449 µs；均匀路由 FP8 combine 基线 3288 µs、mega 2236 µs。
+- bench（BF16、FP8、FP8、BF16 各 300 次）：BF16 一层 2146 / 2132 µs（quant 20，prep 63，mega kernel 2019 / 2017，
+  finish 127 / 119），FP8 2084 / 2093 µs。交替输入和 step1 比：BF16 calc_diff 1.2e-5，FP8 逐位相同。
+- profile（100 次 × 4 轮，取最快的一轮）：BF16 p2p 2138，local-dispatch 2079，local-combine 2030，local 1994 µs。
+- trace（rank 0）：span 2119 µs；GateUp 平均跑 180 µs、等 17 µs；Down 平均跑 93 µs、等 1.5 µs；时钟 953 / 1028 MHz。
+- 日志在 `/tmp/doc_refresh`（没有放进仓库）；路由统计（第 9.3 节）用 bench 的 `make_routes`（seed 0，8 个 rank）在 CPU 上算。
+- MORI 基线和 token 扫描见 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md) 第 4.1 节。
 
-第 9 节的数据：2026-11-12，同一台机器，GPU 测前测后都空闲，也是按 token 读 A scale 时测的。bench 和 profile 的数字见第 9.2 节；
-路由统计用 bench 的 `make_routes`（seed 0，8 个 rank）在 CPU 上算。
-
-第 2.5 节的数据：2026-11-12，同一台机器，每次运行前后 GPU 都空闲；ABBA 日志和 trace 在 `/tmp/scale_t`（没有放进仓库）。
+第 2.5 节的 A/B（按 token 读 vs 转置）：2026-11-12，发送顺序改之前的版本，ABBA 日志和 trace 在 `/tmp/scale_t`。

@@ -17,6 +17,8 @@ ATT 分析和后续优化方向见 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)。
 - 942上按同样思路做，预算是**约2100–2500 µs**，比现在快30%以上（时间减少31%–42%）。
 - 实测（step 3，见5.5）：mega约**2450 µs**，同一进程里的基线约3540 µs，**快30–31%**。GPU在功耗墙下运行（5.6），再往下主要靠省能量。
 - dispatch和combine都用FP8时，8卡合计8k–32k token下mega快17%–32%；32k时约95%的通信被藏住。见 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)。
+- 2026-11-12（转置A scale、全局发送顺序之后）：每卡256–4096 token、BF16和FP8 combine、随机和均衡路由下都快14%–30%；
+  每卡4096 token时BF16 combine随机路由3171 → 2392 µs、均衡路由3064 → 2149 µs（同一文档第4.1节）。
 
 ![时间线](images/mega_moe_timeline.png)
 
@@ -324,7 +326,7 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mod
 
 代码：[src/contrib/flydsl/ep_moe_mega_gfx942.py](../../src/contrib/flydsl/ep_moe_mega_gfx942.py)，`ep_prep`/`ep_plan`在[ep_moe_comm_gfx942.cpp](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp)。
 
-每次调用3个kernel：`ep_prep`（1个WG，交换计数、算各expert的起点）→ `ep_plan`（每个producer wave一个slice，排好发送顺序、写`gu_ids`/`expert_ids`/每个block的期望路由数）→ mega kernel。和第4节设计不同的地方，以及每一步的效果：
+每次调用3个kernel：`ep_prep`（1个WG，交换计数、算各expert的起点和每个发送key的起始位置）→ `ep_plan`（128个WG，排好全局发送顺序、写`gu_ids`/`expert_ids`/每个block的期望路由数）→ mega kernel。和第4节设计不同的地方，以及每一步的效果：
 
 | 做法 | 为什么 | 效果 |
 |---|---|---|
@@ -333,6 +335,7 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mod
 | Down比GateUp晚`lag=2`组 | combine流量分散到整个kernel | |
 | 到达计数按block（每256行一个），不是按(src, expert) | GateUp只等自己这个block的约2个源的数据 | |
 | 每个block的行按源rank交错排列；发送顺序按“目标队列里第几个block”排，同一个key里混合不同目标rank | 每个block的数据尽早到齐，链路负载均匀 | G_wait 30 → 13–20 µs；P_run回到约400 µs |
+| 发送顺序从“每个producer wave一段、段内按key排”改成“全局按key排、16个producer WG轮流取chunk、WG内的wave用LDS计数领”（2026-11-12） | 均匀路由下每段只装各expert的同一个block，队列头的block要等每个wave发完8个chunk | 均匀路由一层 2250 → 2150 µs；随机路由基本不变 |
 | relaxed同步：GateUp写a2用sc1（写穿透），两种等待只invalidate L1（`buffer_inv sc0`） | 等的数据都在本卡显存，本卡L2对本卡显存由probe保持一致，不需要每个任务写回/失效整个L2 | GateUp快约7% |
 | 领票前先用普通load看8个队列计数，只对还有票的队列做原子加 | 空WG对热点计数器做原子加会严重拖慢正在运行的任务 | 省约700 µs |
 | `ep_plan`改成多WG | 单WG的prep在计数交换后还要90–120 µs | kernel启动延迟约15 µs |

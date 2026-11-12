@@ -163,6 +163,11 @@ MFMA 本身每个 GateUp 任务 131k、每个 Down 任务 65.5k cycle。不算�
 
 ### 4.1 发送顺序：让队列头的 block 先到（启动等数据 345 µs → 估计约 100–150 µs）
 
+**已实现**（[实现文档](mega_moe_ep8_impl.md)第 3.4 节，2026-11-12）：全局按 key 排序，16 个 producer WG 轮流取 chunk，WG 内的
+wave 用 LDS 计数领。BF16 combine，ABBA 各 300 次：均匀路由一层 2250 → 2150 µs，随机路由 2406 → 2395 µs（在噪声内）。
+均匀路由下 GateUp 平均等数据约 55 → 18 µs；producer 跑得更久（约 610 → 650–730 µs，GateUp 更早开始和它抢资源）。
+一个全局计数让 128 个 wave 一起领，测下来和 LDS 计数一样快；只静态轮流分配（不动态领）单次测量慢约 20–35 µs。下面是实现之前的分析。
+
 - 现在：每个 producer wave 只排自己 slice 内的顺序，队列位置 0 的数据要等每个 slice 的前 8 个 chunk。
 - 做法：每个源 rank 把全部路由按 key 全局排序，再把第 i 条分给 wave i % 128。所有 wave 第一个 chunk 就开始发位置 0，
   位置 0 在第 2 个 chunk 后到齐，位置 1 在第 4 个之后。
@@ -198,6 +203,8 @@ MFMA 本身每个 GateUp 任务 131k、每个 Down 任务 65.5k cycle。不算�
   3. 让一个 CU 同时跑两个任务（LDS 和寄存器各减半，例如 BM128 的 tile），一个任务的 epilogue 和另一个的 K 循环自然重叠。
      改动最大，K 循环本身的效率也要重新调。
 - 上限：245 µs 全部藏住约 10% 的 CU 时间。
+- 2026-11-12 试过的小改动都没有收益（第 5.3 节）：prologue 的关键路径是一次访存往返加上几百条指令的发射，
+  只有跨任务重叠（做法 1、3）才能再大幅缩短。kernel 已经用到 256 个 VGPR，做法 1 要先给暂存寄存器腾出位置。
 
 ### 4.4 K 循环里的 LDS 等待（GateUp 约 14k cycle / 任务）
 
@@ -210,8 +217,62 @@ MFMA 本身每个 GateUp 任务 131k、每个 Down 任务 65.5k cycle。不算�
   任务表（kind、block、tile、expert），kernel 里一次 load 就够，不用每个任务重算。
 - 收尾（81 µs）：最后两组只剩 Down。可以把最后几组的 Down 按 N 再切小，或让最后的 GateUp 组提前（lag 只在前面起作用）。
 
-## 5. 数据和脚本
+## 5. 复测（2026-11-12，转置 A scale 和全局发送顺序之后）
 
+### 5.1 采集和每个任务的阶段
+
+和第 2 节一样采（8 个 SE 各取 CU 1 的全部 4 个 SIMD，第 30、31 次调用），均匀路由，BF16 combine，代码是全局发送顺序那一版
+（修 waterfall 之前）。下表是两次 dispatch 里 wave 0 的均值（cycle，千）：
+
+| 阶段 | GateUp | Down |
+|---|---|---|
+| 领票 | 2.3 / 3.6 | 3.4 / 4.4 |
+| 分派（tile 1–15 含等 `scaled`，见下） | 16.2 / 17.6 | 2.6 / 2.7 |
+| prologue | 6.6 / 7.0 | 5.1 / 5.3 |
+| K 循环（MFMA 效率） | 144.7 / 149.4（90.9% / 88.0%） | 78.6 / 82.2（83.7% / 79.9%） |
+| epilogue | 13.4 / 14.0 | 19.2 / 18.0 |
+
+- GateUp 现在有两个自旋等待：tile 0 等 `arrived`，tile 1–15 等 `scaled`。`att_mega_phases.py` 只认代码里最后一个
+  （`arrived`），所以 tile 1–15 等 `scaled` 的时间算进了“分派”。单独统计：等 `scaled` 的中位数 460 cycle，均值 14k 由启动时
+  少数等了 130k–185k 的任务拉高。稳定段 tile 0 的转置不让其它 tile 多等。
+- 按上一个任务的种类分：Down 之后的 Down，均值上分派 +3k、K 循环 +6–9k、epilogue +3–8k；中位数几乎一样（K 循环
+  70.5–73.6k vs 70.5–74.5k），是少数任务特别慢。Down 之后的分派主要在等 barrier（2.4–3.2k）：同一个 WG 里 G1 的 wave
+  还在发远端原子加；读 `expert` 的 `vmcnt` 等待（要等前面的原子加完成）只有 0.3–0.6k。
+
+### 5.2 GateUp 里的 waterfall 循环（已修）
+
+- 现象：GateUp prologue 的 12 条 `gu_ids` load，和 K 循环里每次迭代 10 条 A scale load，各自包在 waterfall 循环里
+  （`v_readfirstlane` 拼描述符或 soffset、`s_and_saveexec`、`s_cbranch_execnz`）。prologue 里这 12 条就要约 1.1k cycle。
+- 原因：tile 0 的转置（第 4.2 节）算了和 GateUp 相同的 `rows_cap` 乘积（`rows_cap × 4` 等）。LLVM 把转置分支和另一条
+  路径上的同一个值合成一个 phi，当成 divergent 放进 VGPR，用到它的 buffer 描述符和 soffset 就只能逐 lane 做。
+  `--token-major-scales`（不转置）编出来是 0 个。
+- 修法：转置里用 `rows_cap` 的一个不透明副本（`s_mov_b32` 内联汇编），LLVM 不再合并，waterfall 循环 22 → 0。自旋循环
+  改成 wave-uniform 的退出、lane 0 的原子加去掉分支，都没有消掉它们。
+- 效果（trace）：GateUp prologue 6.8k → 4.6–5.4k cycle，K 循环约 −3k；BF16 combine ABBA：均匀路由 2148 → 2139 µs，
+  随机路由 2398 → 2393 µs。
+- 检查方法：`FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=...` 只在 rank 0 上跑一次，数 `*_final_isa.s` 里的 `s_cbranch_execnz`。
+
+### 5.3 试过但没有收益的改动
+
+都是 BF16 combine，ABBA 各 300 次，和当时的基线比（均匀 / 随机路由，一层 µs）：
+
+| 改动 | 均匀 | 随机 | trace / 备注 |
+|---|---|---|---|
+| GateUp、Down 的 prologue 不读行号（行是连续的，有效行数就是 `expected`） | +4 | +11 | GateUp prologue 没变，Down 少 0.4k |
+| prologue 一次发出 held 操作数的 4 个 packet 和 scale（一次往返，不是两次） | −1.5 | +6 | prologue 基本没变 |
+| Down K 循环把 W2 packet 提前两个 stage 发（同样的寄存器） | −14 | −3 | Down K 循环没变；多了 1 个 VGPR 的 spill |
+| 一个 unit 里 GateUp、Down 每 2 个任务交替（而不是先 32 个 GateUp 再 32 个 Down） | +8 | +71 | |
+| 4 个 block（而不是 2 个）共享一个权重 tile | +53 | +3 | |
+
+- prologue：修完 waterfall 之后 GateUp 约 4.6k、Down 约 3.7k cycle，其中等 `vmcnt` 约 2k（一次访存往返），其余主要是
+  几百条地址计算等指令的发射。两个 prologue 改动只换了等哪条 load，没有缩短往返。
+- Down K 循环：一个 Down stage 只有约 1k cycle（GateUp 的一半），等得最久的是每个 K block stage 1 写 W2 packet 之前
+  的 `vmcnt`（约 1.2k cycle / 次）。提前发也没有缩短 K 循环，可能卡在带宽或排队上，不是单纯的延迟。
+- 以上改动都已撤回。
+
+## 6. 数据和脚本
+
+- 第 5 节的 ATT 原始数据在 `/tmp/opt1/att4_new`（全部 SIMD），ISA 在 `/tmp/opt1/isa_*`，没有放进仓库。
 - 本文数据：2026-11-11，8×MI300X，GPU 测前测后都空闲。ATT 原始数据在 `/tmp/mega_doc/att`（SIMD 0）、`/tmp/mega_doc/att4`
   （全部 SIMD）、`/tmp/mega_doc/att_gu0`、`att_gu1`（单独跑 GateUp），没有放进仓库。
 - 采集和分析：第 2 节的命令；`att_mega_phases.py`；`att_gateup_scale_layout.py`；`bench_fused_moe_a2a_gfx942.py phases`。
