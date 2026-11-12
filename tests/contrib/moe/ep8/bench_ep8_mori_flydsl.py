@@ -7,6 +7,8 @@
 Each rank owns 32 of the 256 experts and sends `--tokens` tokens routed to top-8 experts: random ones, or with
 `--routing balanced` the same number of routes for every expert. `--combine fp8` makes both combines FP8 (MORI
 fp8_blockwise like SGLANG_MORI_COMBINE_DTYPE=fp8; the mega path stores FP8 rows with 1x128 scales and sums them).
+With an aiter that lacks the hook, the baseline calls what the hook runs (aiter moe_sorting(256) + pyhip
+fused_moe_a8w8_blockscale_gfx942) directly, at every token count.
 """
 
 import argparse
@@ -86,10 +88,31 @@ def make_layer(rank, world, tokens, seed, routing="random"):
                 w2=shuffle_weight(w2, layout=(16, 16)), w1_scale=w1_scale, w2_scale=w2_scale, mask=mask)
 
 
+def flydsl_fused_moe(a1, w1, w2, topk_weights, topk_ids, expert_mask, w1_scale, w2_scale, a1_scale, num_local_tokens):
+    """What aiter's AITER_FMOE_FP8_BLOCKSCALE_FLYDSL hook runs on MORI's FP8 receive buffer: moe_sorting(256) without
+    zeroing, the token-major a1_scale transposed, pyhip GateUp + Down; rows past num_local_tokens are left untouched."""
+    from aiter.fused_moe import moe_sorting
+    from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import fused_moe_a8w8_blockscale_gfx942, unsupported_reason
+
+    rows, hidden = a1.shape
+    reason = unsupported_reason(rows, hidden, w2.shape[2], topk_ids.shape[1], w1.shape[0])
+    assert not reason, reason
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weights, expert_mask.numel(), hidden, dtypes.bf16, 256, expert_mask, num_local_tokens,
+        output=torch.empty((0, 0), device=a1.device, dtype=dtypes.bf16),
+    )
+    out = torch.empty((rows, hidden), device=a1.device, dtype=dtypes.bf16)
+    return fused_moe_a8w8_blockscale_gfx942(
+        a1, a1_scale.t().contiguous(), w1, w1_scale, w2, w2_scale, sorted_ids, sorted_weights, sorted_expert_ids,
+        num_valid_ids, out, topk_ids.shape[1], num_rows=num_local_tokens,
+    )
+
+
 class Baseline:
     def __init__(self, op, layer):
         self.op, self.L = op, layer
         self.quant = get_hip_quant(QuantType.per_1x128)
+        self.shim = not hasattr(fm, "_flydsl_gfx942_fp8_blockscale_unsupported")
 
     def phases(self):
         L = self.L
@@ -103,6 +126,12 @@ class Baseline:
             state["recv_x"], state["recv_w"], state["recv_scale"], state["recv_ids"], state["recv_n"] = out
 
         def moe():
+            if self.shim:
+                state["moe_out"] = flydsl_fused_moe(
+                    state["recv_x"], L["w1"], L["w2"], state["recv_w"], state["recv_ids"], L["mask"], L["w1_scale"],
+                    L["w2_scale"], state["recv_scale"], state["recv_n"],
+                )
+                return
             state["moe_out"] = fm.fused_moe(
                 state["recv_x"], L["w1"], L["w2"], state["recv_w"], state["recv_ids"], expert_mask=L["mask"],
                 activation=ActivationType.Silu, quant_type=QuantType.per_128x128, w1_scale=L["w1_scale"],
@@ -184,7 +213,8 @@ def bench(impl, rank, world, args):
     state, phases = impl.phases()
     recv_n = local_routes = -1
     baseline = isinstance(impl, Baseline)
-    if baseline:
+    hooked = baseline and not impl.shim
+    if hooked:
         real_check = fm._flydsl_gfx942_fp8_blockscale_unsupported
         reasons = []
         fm._flydsl_gfx942_fp8_blockscale_unsupported = lambda *a, **k: reasons.append(real_check(*a, **k)) or reasons[-1]
@@ -194,10 +224,12 @@ def bench(impl, rank, world, args):
             recv_n = int(state["recv_n"].item())
             local_routes = int(((state["recv_ids"][:recv_n] // (EXPERTS // world)) == rank).sum().item())
     torch.cuda.synchronize()
-    if baseline:
+    if hooked:
         fm._flydsl_gfx942_fp8_blockscale_unsupported = real_check
         if rank == 0:
             print(f"flydsl hook rejected: {reasons!r}")
+    elif baseline and rank == 0:
+        print("aiter has no FlyDSL hook: the baseline MoE calls moe_sorting(256) + pyhip fused_moe_a8w8_blockscale_gfx942")
     out = state["out"].clone()
     if isinstance(impl, Mega):
         # Stage events of the timed calls themselves: calls separated by a synchronize would add each rank's host skew

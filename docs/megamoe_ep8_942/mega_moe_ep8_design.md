@@ -4,6 +4,9 @@
 
 参考代码：`/mywork/aiter`（ROCm/aiter main 51ca4216f）的`aiter/ops/flydsl/kernels/mega_moe/`，提交a060781a9“MegaMoEV2: fuse Dispatch, GEMM1, GEMM2 and Combine into one kernel”。
 
+给开发者的实现说明（数据布局、任务划分、同步变量、代码流程、泳道图、理论极限、BF16 / FP8 combine 的取舍）见 [mega_moe_ep8_impl.md](mega_moe_ep8_impl.md)；
+ATT 分析和后续优化方向见 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)。本文是设计过程和历次实测。
+
 ## 1. 结论
 
 - 当前EP8一层MoE（每卡4096 token）总共约**3650 µs**：dispatch 330 + MoE 2280 + combine 950 + quant 18。通信和计算是串行的，GEMM主循环以外的部分占了约40%。

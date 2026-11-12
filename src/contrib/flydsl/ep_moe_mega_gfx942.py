@@ -62,8 +62,8 @@ def compile_ep_mega(
     trace: every task writes int32 trace[8 s: 8 s + 8] (s = queue * queue_cap + ticket) = (start, wait done, end) in
     100 MHz ticks (low 32 bits of s_memrealtime), XCC id << 24 | HW_ID bits [8, 16) | kind (1 producer, 2 GateUp,
     3 Down), the time its workgroup began taking the ticket and, for producers, when wave 0 finished its first three
-    chunks; for GateUp and Down, the shader clocks (s_memtime) between wait done and end instead (the effective clock
-    under the power limit)."""
+    chunks; for GateUp and Down, the shader clocks (s_memtime) from wait done to the end, to the K loop's start and to
+    its end instead (the effective clock under the power limit, and the prologue / K loop / epilogue split)."""
     H, I = hidden_dim, inter_dim
     gateup = gateup_task_emitter(
         I, H, topk, E_LOCAL, gateup_layout, fp8_out=True, a_scale_token_major=True, store_aux=16 if relaxed else 0
@@ -220,14 +220,14 @@ def compile_ep_mega(
             rocdl.s_barrier()
             return queue, ticket, entry
 
-        def record(queue, ticket, entry, started, waited, kind, run_cycles=None):
+        def record(queue, ticket, entry, started, waited, kind, run_cycles=None, loop_cycles=()):
             if const_expr(trace):
                 ended = clock()
                 where = (hwreg("HW_REG_XCC_ID") << 24) | (hwreg("HW_REG_HW_ID") & 0xFF00) | kind
                 if wave == 0:
                     rsrc = _rsrc_of(pTrace, queues * queue_cap(num_blocks) * 32)
                     offset = (lane == 0).select((queue * queue_cap(num_blocks) + ticket) * 32, fx.Int32(OOB_OFFSET))
-                    tail = entry if run_cycles is None else Vec.from_elements([entry, run_cycles], fx.Int32)
+                    tail = entry if run_cycles is None else Vec.from_elements([entry, run_cycles, *loop_cycles], fx.Int32)
                     for part, words in enumerate([Vec.from_elements([started, waited, ended, where], fx.Int32), tail]):
                         rocdl.raw_ptr_buffer_store(
                             words.ir_value(), rsrc, (offset + part * 16).ir_value(), zero,
@@ -341,6 +341,23 @@ def compile_ep_mega(
 
             return hook, holder
 
+        def loop_marks(hook):
+            """Trace: (K-loop start hook, epilogue hook, marks); marks get wave 0's shader clocks at the K loop's start
+            and end (trace words 6, 7, relative to the end of the wait)."""
+            marks = []
+            if const_expr(not trace):
+                return None, hook, marks
+
+            def start():
+                marks.append(cycles())
+
+            def end():
+                marks.append(cycles())
+                if const_expr(hook is not None):
+                    hook()
+
+            return start, end, marks
+
         def gateup_task(block, tile, expert, at):
             # Only this block's routes: about two sources' worth, not the whole expert.
             expected = _uniform(_load_i32(_rsrc_of(pSched, (SCHED_EXPECTED + 2 * num_blocks) * 4), (SCHED_EXPECTED + block) * 4))
@@ -350,9 +367,10 @@ def compile_ep_mega(
             waited = clock()
             began = cycles()
             hook, holder = prefetch_hook()
+            loop_start, hook, marks = loop_marks(hook)
             emit_gateup(
                 lds, pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, rows_cap, num_blocks, True,
-                lambda: (block, tile, expert), tid=tid, epilog_hook=hook,
+                lambda: (block, tile, expert), tid=tid, epilog_hook=hook, kloop_hook=loop_start,
             )
             rocdl.s_waitcnt(vmcnt=0)
             rocdl.s_barrier()
@@ -360,7 +378,7 @@ def compile_ep_mega(
                 if const_expr(not relaxed):
                     fence("release", "agent-one-as")
                 lane0_add(sched + fx.Int64((SCHED_EXPECTED + num_blocks + block) * 4), 1)
-            record(*at, waited, 2, cycles() - began)
+            record(*at, waited, 2, cycles() - began, [mark - began for mark in marks])
             return holder[0] if holder else fx.Int32(-1)
 
         def down_task(block, tile, expert, at):
@@ -370,11 +388,13 @@ def compile_ep_mega(
             waited = clock()
             began = cycles()
             hook, holder = prefetch_hook()
+            loop_start, hook, marks = loop_marks(hook)
             emit_down(
                 lds, pA2, pW2, pOutTable, pA2Scale, pW2Scale, pDownIds, pRecvW, pOutTable, pOutTable, NPES << token_shift,
                 num_blocks, True, lambda: (block, tile, expert), tid=tid, epilog_hook=hook, pOutScale=pOutScaleTable,
+                kloop_hook=loop_start,
             )
-            record(*at, waited, 3, cycles() - began)
+            record(*at, waited, 3, cycles() - began, [mark - began for mark in marks])
             return holder[0] if holder else fx.Int32(-1)
 
         def run_task(queue, ticket, entry):

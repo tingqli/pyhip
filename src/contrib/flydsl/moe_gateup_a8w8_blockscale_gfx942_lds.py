@@ -142,7 +142,7 @@ def gateup_task_emitter(
     @flyc.jit
     def emit_task(
         lds, pA, pB, pC, pScaleC, pScaleA, pScaleB, pSortedIds, num_tokens, num_blocks, active, coords, tid=None,
-        epilog_hook=None,
+        epilog_hook=None, kloop_hook=None,
     ):
         if const_expr(tid is None):
             tid = fx.thread_idx.x
@@ -621,6 +621,8 @@ def gateup_task_emitter(
             for pro_packet in range_constexpr(4):
                 write_s(pro_packet)
             start_k_loop()
+            if const_expr(kloop_hook is not None):
+                kloop_hook()
             k_loop(ops)
             if const_expr(epilog_hook is not None):
                 epilog_hook()

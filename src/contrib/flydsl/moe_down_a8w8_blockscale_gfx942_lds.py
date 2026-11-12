@@ -143,7 +143,7 @@ def down_task_emitter(
     @flyc.jit
     def emit_task(
         lds, pA, pB, pOut, pScaleA, pScaleB, pSortedIds, pSortedWeights, pInverse, pRouteCounts, num_tokens, num_blocks,
-        active, coords, tid=None, epilog_hook=None, pOutScale=None,
+        active, coords, tid=None, epilog_hook=None, pOutScale=None, kloop_hook=None,
     ):
         if const_expr(tid is None):
             tid = fx.thread_idx.x
@@ -430,6 +430,8 @@ def down_task_emitter(
             # Waves 4-7 trail by one barrier so their memory phase overlaps waves 0-3 compute.
             if group == 1:
                 barrier()
+            if const_expr(kloop_hook is not None):
+                kloop_hook()
 
             if const_expr(KB % 2):
                 run_k(0, fx.Int32(0))

@@ -92,7 +92,7 @@ def main():
     if rank == 0:
         print(f"{args.ep_mode} tokens/rank={args.tokens} {args.routing} {args.combine} combine, iters={args.iters} "
               f"rounds={args.rounds}, fastest round per mode; layer and span = slowest rank, others = rank mean")
-        print("mode            layer_us span_us | P_run P_end | G_wait G_run D_run | busy | MHz G/D")
+        print("mode            layer_us span_us | P_run P_end | G_wait G_run D_run | busy | MHz G/D | kclk G pro/loop/epi D pro/loop/epi")
         summary = {}
         for mode, rounds in results.items():
             rows = min(rounds, key=lambda rows: max(r["total"] for r in rows))
@@ -105,9 +105,11 @@ def main():
                 continue
             s["span"] = max(r["span"] for r in rows)
             s.update({key: statistics.mean(r[key] for r in rows)
-                      for key in ("P_run", "P_last_end", "G_wait", "G_run", "D_run", "busy", "G_mhz", "D_mhz")})
+                      for key in ("P_run", "P_last_end", "G_wait", "G_run", "D_run", "busy", "G_mhz", "D_mhz", "G_pro", "G_loop",
+                                  "G_epi", "D_pro", "D_loop", "D_epi")})
             print(f"{mode:15s} {s['total']:8.0f} {s['span']:7.0f} | {s['P_run']:5.0f} {s['P_last_end']:5.0f} | "
                   f"{s['G_wait']:6.1f} {s['G_run']:5.0f} {s['D_run']:5.0f} | {s['busy']:.2f} | {s['G_mhz']:4.0f} {s['D_mhz']:4.0f}"
+                  f" | {s['G_pro']:.1f}/{s['G_loop']:.1f}/{s['G_epi']:.1f} {s['D_pro']:.1f}/{s['D_loop']:.1f}/{s['D_epi']:.1f}"
                   f" | slowest rank: {stages}")
         for mode in ("local-dispatch", "local-combine", "local"):
             print(f"exposed by {mode.removeprefix('local-') if mode != 'local' else 'both'}: "

@@ -37,6 +37,11 @@ def summarize(trace, queue_cap):
         out[kind + "_mhz"] = statistics.mean(
             (r[5] & 0xFFFFFFFF) / max(rel(r[2]) - rel(r[1]), TICK_US) for _, r in sel
         ) if sel and kind != "P" else 0.0
+        # GateUp / Down: shader clocks (thousands) of the prologue, the K loop and the epilogue (words 6, 7, 5).
+        for name, first, last in (("pro", None, 6), ("loop", 6, 7), ("epi", 7, 5)):
+            out[f"{kind}_{name}"] = statistics.mean(
+                ((r[last] & 0xFFFFFFFF) - (0 if first is None else r[first] & 0xFFFFFFFF)) / 1000 for _, r in sel
+            ) if sel and kind != "P" else 0.0
         out[kind + "_last_end"] = max((rel(r[2]) for _, r in sel), default=0.0)
         out[kind + "_first_start"] = min((rel(r[1]) for _, r in sel), default=0.0)
         # Tasks that ran on another XCD than their queue's.
@@ -99,22 +104,24 @@ def main():
     gathered = [None] * world
     dist.all_gather_object(gathered, stats)
     if args.save:
-        traces = [None] * world
+        traces, experts = [None] * world, [None] * world
         dist.all_gather_object(traces, op.trace.cpu())
+        dist.all_gather_object(experts, op.expert_ids[: stats["blocks"]].cpu())
         if rank == 0:
-            torch.save(dict(args=vars(args), traces=traces, stats=gathered), args.save)
+            torch.save(dict(args=vars(args), traces=traces, expert_ids=experts, stats=gathered), args.save)
     if rank == 0:
         print(f"producers={args.producers} lag={args.lag} queues={1 if args.one_queue else 8} "
               f"sync={'strict' if args.strict_sync else 'relaxed'} {'relaunch' if args.relaunch else 'persistent'} "
               f"{args.queue_order} (us from the first task)")
         print("rank blocks  span | P_run P_end | G_n stol G_wait G_run G_end | D_n stol D_first D_wait D_run D_end | CUs busy "
-              "| ticket gap | MHz G/D | start")
+              "| ticket gap | MHz G/D | start | kclk G pro/loop/epi D pro/loop/epi")
         for r, s in enumerate(gathered):
             print(f"{r:4d} {s['blocks']:6d} {s['span']:5.0f} | {s['P_run']:5.0f} {s['P_last_end']:5.0f} | "
                   f"{s['G_n']:4d} {s['G_stolen']:4d} {s['G_wait']:6.1f} {s['G_run']:5.0f} {s['G_last_end']:5.0f} | "
                   f"{s['D_n']:4d} {s['D_stolen']:4d} {s['D_first_start']:7.0f} {s['D_wait']:6.1f} {s['D_run']:5.0f} "
                   f"{s['D_last_end']:5.0f} | {s['cus']:4d} {s['busy']:.2f} | {s['ticket']:6.1f} {s['gap']:5.1f} | "
-                  f"{s['G_mhz']:4.0f} {s['D_mhz']:4.0f} | {s['start_lag']:5.0f} {s['prep']}")
+                  f"{s['G_mhz']:4.0f} {s['D_mhz']:4.0f} | {s['start_lag']:5.0f} {s['prep']} | "
+                  f"{s['G_pro']:.1f}/{s['G_loop']:.1f}/{s['G_epi']:.1f} {s['D_pro']:.1f}/{s['D_loop']:.1f}/{s['D_epi']:.1f}")
     dist.barrier()
     bench.mori.shmem.shmem_finalize()
     dist.destroy_process_group()
