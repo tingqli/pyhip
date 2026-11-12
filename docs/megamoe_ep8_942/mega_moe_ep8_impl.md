@@ -2,7 +2,7 @@
 
 这份文档写给要照着做一遍实现的开发者：数据放在哪里、任务怎么切、304 个 CU 怎么分工和互相等待、有哪些同步变量、
 代码按什么顺序执行，以及这个 kernel 离理论极限还有多远。设计的来龙去脉和历次实测见
-[mega_moe_ep8_design.md](mega_moe_ep8_design.md)，FP8 combine 和 token 扫描见
+[mega_moe_ep8_design.md](mega_moe_ep8_design.md)（2026-11-12 这一轮被采纳的优化记录在它的第 8 节），FP8 combine 和 token 扫描见
 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)，ATT 分析和后续优化方向见
 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)。本文与代码不一致时以代码为准。
 

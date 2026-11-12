@@ -18,7 +18,8 @@ ATT 分析和后续优化方向见 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)。
 - 实测（step 3，见5.5）：mega约**2450 µs**，同一进程里的基线约3540 µs，**快30–31%**。GPU在功耗墙下运行（5.6），再往下主要靠省能量。
 - dispatch和combine都用FP8时，8卡合计8k–32k token下mega快17%–32%；32k时约95%的通信被藏住。见 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)。
 - 2026-11-12（转置A scale、全局发送顺序之后）：每卡256–4096 token、BF16和FP8 combine、随机和均衡路由下都快14%–30%；
-  每卡4096 token时BF16 combine随机路由3171 → 2392 µs、均衡路由3064 → 2149 µs（同一文档第4.1节）。
+  每卡4096 token时BF16 combine随机路由3171 → 2392 µs、均衡路由3064 → 2149 µs（同一文档第4.1节）。这一轮采纳的三项优化
+  记录在第8节：均匀路由BF16一层2341 → 2139 µs（−8.6%）。
 
 ![时间线](images/mega_moe_timeline.png)
 
@@ -253,6 +254,7 @@ ATT 分析和后续优化方向见 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)。
 - [x] step 2：没有单独做，直接并进了step 3。
 - [x] step 3：一个persistent mega kernel，**比基线快约30–31%**（5.4–5.6）。
 - [x] FP8 combine、token扫描和32k的重叠分析：[fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)。
+- [x] 第二轮优化（2026-11-12，第8节）：GateUp的A scale每个block转置一次、全局发送顺序、去掉GateUp的waterfall循环。
 
 ### 5.1 step 1实测（8卡，每卡4096 token）
 
@@ -440,6 +442,92 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py   
 - 剩下露出来的主要是：
   - dispatch：前几个block的数据到齐之前，GateUp只能等。local-dispatch下producer从约560 µs缩到约300 µs，GateUp平均等待从约28 µs降到约14 µs。
   - combine：xGMI上的原子加和store跟GEMM抢功耗和内存带宽（5.6），表现为Down任务稍慢，而不是在等。
+
+## 8. 第二轮优化记录（2026-11-12）
+
+只记被采纳、有效果的改动，按提交顺序。每一项的依据来自 [ATT文档](mega_moe_ep8_att.md)，实现细节在
+[实现文档](mega_moe_ep8_impl.md)。数字是8卡共32k token、均匀和随机路由下一层的时间（测量方法见8.4）：
+
+| 版本 | 提交 | 均匀 BF16 | 均匀 FP8 | 随机 BF16 |
+|---|---|---|---|---|
+| 改前：GateUp按token读A scale | c24be69 加 `--token-major-scales` | 2341 | 2287 | 2478 |
+| 8.1 A scale每个block转置一次 | c24be69 | 2250 | 2186 | 2404 |
+| 8.2 全局发送顺序 | a27f976 | 2150 | — | 2395 |
+| 8.3 去掉GateUp的waterfall循环 | a1b23eb | 2139 | 2084 / 2093 | 2393 |
+| 合计 | | −202 µs（−8.6%） | 约−200 µs（−8.7%） | −85 µs（−3.4%） |
+
+- 每一行是和上一版本在同一轮ABBA里测的，和上一行的“改后”会差几µs（比如a27f976那轮里旧版本测出2250，a1b23eb那轮里是2148）。
+  FP8在a1b23eb上是文档数据那轮（BF16、FP8、FP8、BF16）测的，同一轮BF16是2146 / 2132。
+- 随机路由收益小：启动时本来就等得少，一层时间主要由最忙的rank（148 vs 139个block）决定。
+- 和基线（MORI + FlyDSL）比：每卡256–4096 token下快14%–30%，见 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md) 第4.1节。
+
+### 8.1 GateUp的A scale每个block转置一次（c24be69）
+
+- **问题**：mega里GateUp的K循环MFMA效率只有73%–79%，单独跑同样的GateUp是93%。mega读的是源rank按路由写来的
+  `recv_scale [rows, K/128]`，一条scale load的16行落在16个cache line上，每个CU每个K block约1024次cache line访问，
+  是A、B数据本身的两倍。单独跑GateUp、只换这一个布局，K循环从140k变成164k cycle（ATT文档3.3节）。
+- **做法**（实现文档2.5节；`ep_moe_mega_gfx942.py`的`transpose_block_scales`、`gateup_task`）：
+  - block b的tile 0等到`arrived[b]`后，把这个block的256 × 32个scale转置写到本卡的`recv_scale_t[k][256b + r]`
+    （padding行写0，sc1写穿透），`s_waitcnt vmcnt(0)` + barrier之后`scaled[b] += 1`。
+  - tile 1–15改等`scaled[b] ≥ 1`。tile 0的票号比同一个block的其他tile小，不会死锁。
+  - 所有tile的K循环按转置布局读scale，一条load只碰1个cache line。
+  - 新增`sched`里的`scaled[]`（`ep_prep`清零）和`EPMoEGfx942.recv_scale_t`。`transpose_scales=False`（bench / trace的
+    `--token-major-scales`）回到旧路径，用来做A/B。
+- **效果**：GateUp K循环174k → 144k cycle（MFMA效率75% → 91%），tile 0的转置每次约5k cycle。一层：均匀BF16
+  −91 µs（−3.9%），均匀FP8 −100 µs（−4.4%），随机BF16 −74 µs（−3.0%）。
+- **代价**：省下的cycle没有全部变成时间。启动时GateUp等dispatch更久（平均44 → 63 µs），producer变慢（约480 → 615 µs），
+  时钟低了一些（GateUp约1090 → 1030 MHz）。等数据因此成了MFMA以外最大的一项，引出了8.2。
+- **正确性**：FP8 combine和step1在交替输入下逐位相同；BF16 calc_diff 1.2e-5（原子加顺序）。
+
+### 8.2 全局发送顺序（a27f976）
+
+- **问题**：8.1之后，GateUp等数据占rank 0每个CU 433 µs（18.9%），几乎都在启动时。原来`ep_plan`把本卡路由切成128段，
+  每个producer wave只在自己那段里按key（目标block在目标队列里的位置）排序。均匀路由下每段只装各expert的同一个block，
+  队列位置0的block要等每个wave发完前8个chunk，第一个block的数据约321 µs才到齐（转置之前的trace）。同一个SIMD上第二个
+  wave还慢约40%，producer WG要多占CU约200 µs（ATT文档3.5、3.6节）。
+- **做法**（实现文档1.6、3.4、6.2–6.4节；`ep_moe_comm_gfx942.cpp`的`mega_row`、`route_key`、`PLAN_KEY_BASE` /
+  `PLAN_KEY_CURSOR`，`ep_moe_mega_gfx942.py`的`produce`）：
+  - `ep_prep`：本卡发给expert g的路由，行号随序号递增，每个目标block对应一段连续的序号（前`fewest`条有闭式，
+    之后二分）；按段把路由数加到key的直方图，前缀和写进`plan`。
+  - `ep_plan`：每个WG数自己那段路由在各个key里的个数，用`plan`里每个key的游标原子加占一段位置。整个
+    `send_route` / `send_info`按key排好（同一个key里的顺序每次调用可能不同）。
+  - producer WG p发第p、p + 16、p + 32……个chunk，WG里的8个wave用LDS第2个字（两个票槽之后）上的计数轮流领。
+- **效果**：BF16一层：均匀2250 → 2150 µs（−100，−4.5%），随机2406 → 2395 µs（在噪声内）。均匀路由的trace：第一个
+  block的数据在84 µs到齐，GateUp等数据（每个CU）433 → 117 µs；一个producer WG的8个wave一起结束（650–765 µs）。
+- **代价**：`ep_prep`多6–10 µs（bench的prep均匑56 → 62 µs，随机61 → 70 µs）；producer跑得更久（约610 →
+  650–730 µs），因为GateUp更早开始和它抢带宽和功耗。
+- **比较过的变体**：一个全局计数让128个wave一起领，均匀−112、随机−5 µs，和LDS计数一样快；采用LDS是因为
+  全局计数的原子加和票计数在同一个cache line上。只静态轮流分配、不动态领，单次测量慢22–35 µs。
+- **正确性**：FP8 combine两种路由都和step1逐位相同。
+
+### 8.3 去掉GateUp的waterfall循环（a1b23eb）
+
+- **问题**：8.2之后重新采的ATT里，GateUp prologue的12条`gu_ids` load和K循环每次迭代的10条A scale load各自包在
+  waterfall循环里（`v_readfirstlane`拼描述符或soffset、`s_and_saveexec`、`s_cbranch_execnz`），prologue里这12条就要约
+  1.1k cycle。这是8.1引入的：`--token-major-scales`编出来没有。
+- **原因**：tile 0的转置算了和GateUp相同的`rows_cap`乘积（描述符的字节数、soffset里的`rows_cap × 4`）。LLVM把分支
+  里的和分支之后的合成一个phi，当成divergent放进VGPR，用到它的描述符和soffset只能逐lane做。
+- **做法**：`transpose_block_scales`里用`rows_cap`的不透明副本（`s_mov_b32`内联汇编，输出约束`=s`）。让自旋等待的
+  退出变成wave-uniform、lane 0的原子加去掉分支，都试过，消不掉这些循环。
+- **效果**：waterfall循环22 → 0（VGPR仍是256，没有scratch）。trace：GateUp prologue 6.4k–7.1k → 4.8k–5.4k cycle，
+  K循环约−4k cycle。BF16一层：均匀2148 → 2139 µs，随机2398 → 2393 µs。
+- **检查方法**：只在rank 0上设`FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=<目录>`跑一次bench，数
+  `<目录>/mega_kernel_0/*_final_isa.s`里的`s_cbranch_execnz`；有没有溢出看`private_segment_fixed_size`。
+- **正确性**：FP8 combine两种路由都和step1逐位相同。
+
+### 8.4 测量方法
+
+- 旧、新版本按ABBA顺序各跑两次：`bench_ep8_mori_flydsl.py --mode mega --iters 300 --warmup 20`，取每个rank的中位数、
+  再取最慢的rank，两次平均。两次之间差5–10 µs很常见，小于约5 µs的差别当作没变。
+- 每次运行前后用`amd-smi monitor`确认8卡GFX利用率 ≤ 5%、显存 ≤ 20%：同机另一个容器会间歇地占满GPU。
+- 旧版本用`git archive <提交> src`解到别的目录，用它自己的`PYTHONPATH`，并且设单独的`PYHIP_CACHE_DIR`：pyhip的HIP
+  模块（`ep_moe_comm_gfx942.cpp`）按文件名缓存在`~/.pyhip`，只在源文件更新时重编，不分开的话旧版本会加载新版本编出的`.co`。
+- 正确性用`--check-alt`（A、B两组输入交替，和step1路径比）：FP8 combine要求逐位相同，BF16允许原子加顺序带来的约1e-5。
+
+### 8.5 没有采纳的尝试
+
+都已撤回，数字和原因见ATT文档5.3节：prologue不读行号；prologue一次往返装第一个K block；Down K循环把W2提前两个
+stage发；一个unit里GateUp和Down交替排；4个block共享一个权重tile。
 
 
 重新生成图：`python docs/megamoe_ep8_942/images/mega_moe.py /tmp/fonts`。

@@ -160,6 +160,7 @@ MFMA 本身每个 GateUp 任务 131k、每个 Down 任务 65.5k cycle。不算�
 ## 4. 优化方向（按预计收益排序）
 
 收益按 rank 0 每个 CU 的时间估算（kernel span 2336 µs）。功耗墙下 stall 换成时间要打折扣，空闲段接近一比一。
+已经采纳的改动（4.1、4.2 和第 5.2 节）汇总记录在 [mega_moe_ep8_design.md](mega_moe_ep8_design.md) 第 8 节。
 
 ### 4.1 发送顺序：让队列头的 block 先到（启动等数据 345 µs → 估计约 100–150 µs）
 
