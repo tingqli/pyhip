@@ -391,8 +391,12 @@ def compile_ep_mega(
         def transpose_block_scales(block, expected, flag):
             """GateUp tile 0: block's A scales from recv_scale [rows, KB] into pRecvScaleT [KB, rows] (padding rows 0),
             then flag += 1. Thread t copies row t % 256, K blocks [KB/2 (t // 256), +KB/2)."""
-            src = _rsrc_of(pRecvScale, rows_cap * (KB * 4))
-            dst = _rsrc_of(pRecvScaleT, rows_cap * (KB * 4))
+            # An opaque copy of rows_cap: with rows_cap itself, LLVM merges the products here and the GateUp's equal
+            # ones into a VGPR phi after this branch, and wraps the GateUp's row-id and K-loop scale loads (their
+            # descriptor and soffset) in waterfall loops.
+            rows = fx.Int32(llvm.inline_asm(T.i32, [rows_cap.ir_value()], "s_mov_b32 $0, $1", "=s,s", has_side_effects=True))
+            src = _rsrc_of(pRecvScale, rows * (KB * 4))
+            dst = _rsrc_of(pRecvScaleT, rows * (KB * 4))
             row = tid % SORT_BLOCK_M
             half = _uniform(tid // SORT_BLOCK_M)
             sorted_row = block * SORT_BLOCK_M + row
@@ -404,7 +408,7 @@ def compile_ep_mega(
             for i in range_constexpr(KB // 2):
                 rocdl.raw_ptr_buffer_store(
                     parts[i // 4][i % 4].ir_value(), dst, (sorted_row * 4).ir_value(),
-                    ((half * (KB // 2) + i) * rows_cap * 4).ir_value(), aux=ir.IntegerAttr.get(T.i32, 16 if relaxed else 0),
+                    ((half * (KB // 2) + i) * rows * 4).ir_value(), aux=ir.IntegerAttr.get(T.i32, 16 if relaxed else 0),
                 )
             rocdl.s_waitcnt(vmcnt=0)
             rocdl.s_barrier()
