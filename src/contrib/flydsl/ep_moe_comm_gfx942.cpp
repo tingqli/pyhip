@@ -25,12 +25,15 @@ constexpr int MAX_KEYS = 64;
 constexpr int ROUTE_BATCH = 8;
 constexpr int SLICE_PER_THREAD = 4;
 // ep_prep -> ep_plan tables (int32): totals [E_GLOBAL], fewest routes from one source [E_GLOBAL], expert bases
-// [E_GLOBAL + NPES], first block of each destination's 8 mega-kernel queues and its block count [NPES][9].
+// [E_GLOBAL + NPES], first block of each destination's 8 mega-kernel queues and its block count [NPES][9], first send
+// position of each key [MAX_KEYS], and the per-key cursors ep_plan's workgroups reserve their ranges with [MAX_KEYS].
 constexpr int PLAN_TOTAL = 0;
 constexpr int PLAN_MIN = E_GLOBAL;
 constexpr int PLAN_BASE = 2 * E_GLOBAL;
 constexpr int PLAN_QSTART = 3 * E_GLOBAL + NPES;
-constexpr int PLAN_INTS = PLAN_QSTART + NPES * 9;
+constexpr int PLAN_KEY_BASE = PLAN_QSTART + NPES * 9;
+constexpr int PLAN_KEY_CURSOR = PLAN_KEY_BASE + MAX_KEYS;
+constexpr int PLAN_INTS = PLAN_KEY_CURSOR + MAX_KEYS;
 // send_info: destination row in bits [0, 17), global expert above.
 constexpr int ROW_BITS = 17;
 
@@ -39,6 +42,32 @@ __device__ inline int load_acquire_sys(int* p) { return __hip_atomic_load(p, __A
 __device__ inline int load_relaxed_sys(int* p) { return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM); }
 __device__ inline void wait_eq_sys(int* p, int v) {
     while (load_acquire_sys(p) != v) __builtin_amdgcn_s_sleep(1);
+}
+
+// Mega-kernel row of this rank's idx-th route to global expert g: source s's i-th route sits at virtual position 8 i + s
+// (compacted where sources run out). counts [NPES][E_GLOBAL]; fewest and base per global expert.
+__device__ inline int mega_row(int g, int idx, int me, const int* counts, const int* fewest, const int* base) {
+    int pos = idx * NPES + me;
+    if (idx >= fewest[g]) {
+        pos = 0;
+        for (int s = 0; s < NPES; ++s) {
+            int c = counts[s * E_GLOBAL + g], k = idx + (s < me ? 1 : 0);
+            pos += c < k ? c : k;
+        }
+    }
+    return base[g] + pos;
+}
+
+// Send-order key of a route to `row` of global expert g: the block's position in its destination's queue (qstart
+// [NPES][9]); MAX_KEYS - 1 for later positions and dropped routes.
+__device__ inline int route_key(int g, int row, int s_cap, const int* qstart) {
+    if (row >= s_cap) return MAX_KEYS - 1;
+    const int* qs = qstart + g / E_LOCAL * 9;
+    int block = row / BLOCK_M, q = block >= qs[4] ? 4 : 0;
+    q += block >= qs[q + 2] ? 2 : 0;
+    q += block >= qs[q + 1] ? 1 : 0;
+    int pos = block - qs[q];
+    return pos < MAX_KEYS - 1 ? pos : MAX_KEYS - 1;
 }
 
 // One workgroup of 1024 threads per rank: count exchange and plan tables (ep_plan then plans the routes).
@@ -57,6 +86,8 @@ __global__ void __launch_bounds__(1024) ep_prep(const int* __restrict__ topk_ids
     __shared__ int sbase[E_GLOBAL];
     __shared__ int total[E_GLOBAL];
     __shared__ int min_count[E_GLOBAL];
+    __shared__ int qstart[NPES * 9];
+    __shared__ int key_hist[MAX_KEYS];
     const int tid = threadIdx.x;
     if (tid == 0) status[3] = static_cast<int>(__builtin_amdgcn_s_memrealtime());
     for (int i = tid; i < E_GLOBAL; i += blockDim.x) hist[i] = 0;
@@ -128,7 +159,43 @@ __global__ void __launch_bounds__(1024) ep_prep(const int* __restrict__ topk_ids
     for (int i = tid; i < E_GLOBAL + NPES; i += blockDim.x) plan[PLAN_BASE + i] = expert_base[i];
     if (tid < NPES * 9) {
         int d = tid / 9, q = tid % 9, rows = expert_base[E_GLOBAL + d];
-        plan[PLAN_QSTART + tid] = (rows < s_cap ? rows : s_cap) / BLOCK_M * q / 8;
+        qstart[tid] = (rows < s_cap ? rows : s_cap) / BLOCK_M * q / 8;
+        plan[PLAN_QSTART + tid] = qstart[tid];
+    }
+    if (tid < MAX_KEYS) {
+        key_hist[tid] = 0;
+        plan[PLAN_KEY_CURSOR + tid] = 0;
+    }
+    __syncthreads();
+    // Routes per send key: ep_plan places every route at its key's base plus its rank within the key. This rank's
+    // routes to expert g are idx = 0 .. C[me][g] - 1 and their rows grow with idx, so each block takes a range of idx.
+    if (tid < E_GLOBAL) {
+        const int g = tid, n = counts[me * E_GLOBAL + g], fewest = min_count[g];
+        for (int lo = 0; lo < n;) {
+            int row = mega_row(g, lo, me, counts, min_count, expert_base);
+            int end = (row / BLOCK_M + 1) * BLOCK_M, hi = n;
+            if (lo < fewest) {
+                // Rows base + 8 idx + me up to fewest: the first idx at or past the next block.
+                hi = (end - expert_base[g] - me + NPES - 1) / NPES;
+                hi = hi < fewest ? hi : fewest;
+            } else {
+                for (int a = lo + 1, b = n; a < b;) {
+                    int mid = (a + b) / 2;
+                    if (mega_row(g, mid, me, counts, min_count, expert_base) >= end) b = hi = mid;
+                    else a = mid + 1;
+                }
+            }
+            hi = hi < n ? hi : n;
+            atomicAdd(&key_hist[route_key(g, row, s_cap, qstart)], hi - lo);
+            lo = hi;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (int k = 0, acc = 0; k < MAX_KEYS; ++k) {
+            plan[PLAN_KEY_BASE + k] = acc;
+            acc += key_hist[k];
+        }
     }
     if (tid == 0) {
         int rows = expert_base[E_GLOBAL + me];
@@ -139,17 +206,18 @@ __global__ void __launch_bounds__(1024) ep_prep(const int* __restrict__ topk_ids
     }
 }
 
-// Routing plan, one workgroup of 256 threads per producer wave of the mega kernel (slices = producers * 8):
-//   send_route / send_info [T*TOPK]: workgroup j sorts routes [j S, (j + 1) S) (S = ceil(routes / slices)) by when
-//   the destination's mega-kernel queues need them (block position in the queue) into the same range; the
-//   producer wave j sends that range in order. info = destination row | global expert << ROW_BITS, -1 past s_cap.
+// Routing plan, one workgroup of 256 threads per slice of this rank's routes (slices = producers * 8):
+//   send_route / send_info [T*TOPK]: all routes sorted by when the destinations' mega-kernel queues need them (block
+//   position in the queue, the send key): workgroup j places the routes of slice j at their key's base (ep_prep) plus
+//   a range reserved with an atomic on the key's cursor, so the order within a key varies from call to call. The
+//   producers send this array chunk by chunk. info = destination row | global expert << ROW_BITS, -1 past s_cap.
 //   gu_ids [s_cap] / expert_ids [s_cap/256] / sched expected rows per block: this rank's sorted blocks.
 //   down_ids [s_cap] (symmetric, local view): padding rows set to -1 here; producers fill the valid rows.
-// Mega-kernel rows of an expert interleave the sources: source s's i-th route sits at virtual position 8 i + s
-// (compacted where sources run out), so every block holds about 32 routes of each source and the first blocks of all
-// queues load all senders evenly. (ep_dispatch keeps contiguous per-source rows at send_base.)
+// Mega-kernel rows of an expert interleave the sources (mega_row), so every block holds about 32 routes of each source
+// and the first blocks of all queues load all senders evenly. (ep_dispatch keeps contiguous per-source rows at
+// send_base.)
 __global__ void __launch_bounds__(256) ep_plan(const int* __restrict__ topk_ids, const int* __restrict__ route_idx,
-                                               int num_routes, int me, int s_cap, const int* __restrict__ plan,
+                                               int num_routes, int me, int s_cap, int* plan,
                                                const int* __restrict__ ws, int* send_route, int* send_info, int* gu_ids,
                                                int* down_ids, int* expert_ids, int* sched) {
     __shared__ int tab[PLAN_INTS];
@@ -160,26 +228,6 @@ __global__ void __launch_bounds__(256) ep_plan(const int* __restrict__ topk_ids,
     if (tid < MAX_KEYS) key_count[tid] = 0;
     __syncthreads();
     const int *total = tab + PLAN_TOTAL, *fewest = tab + PLAN_MIN, *base = tab + PLAN_BASE, *qstart = tab + PLAN_QSTART;
-    auto mega_row = [&](int g, int idx) {
-        int pos = idx * NPES + me;
-        if (idx >= fewest[g]) {
-            pos = 0;
-            for (int s = 0; s < NPES; ++s) {
-                int c = ws[s * E_GLOBAL + g], k = idx + (s < me ? 1 : 0);
-                pos += c < k ? c : k;
-            }
-        }
-        return base[g] + pos;
-    };
-    auto route_key = [&](int g, int row) {
-        if (row >= s_cap) return MAX_KEYS - 1;
-        const int* qs = qstart + g / E_LOCAL * 9;
-        int block = row / BLOCK_M, q = block >= qs[4] ? 4 : 0;
-        q += block >= qs[q + 2] ? 2 : 0;
-        q += block >= qs[q + 1] ? 1 : 0;
-        int pos = block - qs[q];
-        return pos < MAX_KEYS - 1 ? pos : MAX_KEYS - 1;
-    };
     int per = (num_routes + gridDim.x - 1) / gridDim.x, begin = blockIdx.x * per;
     int end = begin + per < num_routes ? begin + per : num_routes;
     int route[SLICE_PER_THREAD], info[SLICE_PER_THREAD], key[SLICE_PER_THREAD], rank[SLICE_PER_THREAD];
@@ -187,18 +235,16 @@ __global__ void __launch_bounds__(256) ep_plan(const int* __restrict__ topk_ids,
     for (int j = 0; j < SLICE_PER_THREAD; ++j) {
         route[j] = begin + j * blockDim.x + tid;
         if (route[j] < end) {
-            int g = topk_ids[route[j]], row = mega_row(g, route_idx[route[j]]);
+            int g = topk_ids[route[j]], row = mega_row(g, route_idx[route[j]], me, ws, fewest, base);
             info[j] = row < s_cap ? (row | g << ROW_BITS) : -1;
-            key[j] = route_key(g, row);
+            key[j] = route_key(g, row, s_cap, qstart);
             rank[j] = atomicAdd(&key_count[key[j]], 1);
         }
     }
     __syncthreads();
-    if (tid == 0) {
-        for (int k = 0, acc = begin; k < MAX_KEYS; ++k) {
-            key_next[k] = acc;
-            acc += key_count[k];
-        }
+    if (tid < MAX_KEYS) {
+        int n = key_count[tid];
+        key_next[tid] = tab[PLAN_KEY_BASE + tid] + (n > 0 ? atomicAdd(&plan[PLAN_KEY_CURSOR + tid], n) : 0);
     }
     __syncthreads();
 #pragma unroll

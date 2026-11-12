@@ -266,17 +266,37 @@ def compile_ep_mega(
             def lane_value(values, j):
                 return fx.Int32(rocdl.readlane(T.i32, values.ir_value(), fx.Int32(j).ir_value()))
 
-            # Wave j of the producers sends the routes ep_plan sorted into slice j, in order. (Sending faster, the
-            # previous chunk's stores retiring under this chunk's loads, was measured slower overall: the GateUp
-            # tasks of the first blocks then run against more memory and power contention.)
-            per_slice = (num_routes + (producers * 8 - 1)) // (producers * 8)
-            start = (index * 8 + wave) * per_slice
-            stop = (start + per_slice < num_routes).select(start + per_slice, num_routes)
+            # The send list is sorted by when the destinations' queues need the routes. Producer workgroup `index`
+            # sends its chunks index, index + producers, ... of CHUNK routes, its waves taking the next one from a
+            # counter in LDS word 2 (after the ticket slots): all producers send the earliest blocks first, and a
+            # workgroup's waves finish together. (One global counter for all 128 producer waves measured the same, with
+            # its atomics on the ticket counters' cache line. Sending faster, the previous chunk's stores retiring
+            # under this chunk's loads, was measured slower overall: the GateUp tasks of the first blocks then run
+            # against more memory and power contention.)
+            chunks = (num_routes + (CHUNK - 1)) // CHUNK
+            counter = llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), fx.Int32(fx.ptrtoint(lds.ab.ptr + 2)).ir_value())
+            if wave == 0:
+                ticket_slot(2).store(Vec.from_elements([fx.Int32(0)], fx.Int32))
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.s_barrier()
+
+            def claim():
+                taken = fx.Int32(0)
+                if lane == 0:
+                    taken = fx.Int32(
+                        llvm.AtomicRMWOp(
+                            llvm.AtomicBinOp.add, counter, fx.Int32(1).ir_value(), llvm.AtomicOrdering.monotonic,
+                            syncscope="workgroup", alignment=4,
+                        ).result
+                    )
+                return taken
+
+            chunk = index + producers * _uniform(claim())
             done = fx.Int32(0)
-            next_route = start
-            while next_route < stop:
-                position = next_route + lane
-                mine = (lane < CHUNK) & (position < stop)
+            while chunk < chunks:
+                position = chunk * CHUNK + lane
+                claimed = claim()
+                mine = (lane < CHUNK) & (position < num_routes)
                 offset = mine.select(position * 4, oob)
                 routes = _load_i32(route_rsrc, offset)
                 infos = _load_i32(info_rsrc, offset)
@@ -332,7 +352,7 @@ def compile_ep_mega(
                         aux=ir.IntegerAttr.get(T.i32, 0),
                     )
                 done = done + 1
-                next_route = next_route + CHUNK
+                chunk = index + producers * _uniform(claimed)
 
         def prefetch_hook():
             """Epilog hook taking the next ticket of the home queue while the epilogue runs: the task has no waits

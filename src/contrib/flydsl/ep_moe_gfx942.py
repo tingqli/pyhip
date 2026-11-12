@@ -111,8 +111,9 @@ class EPMoEGfx942:
         self.status = torch.zeros(8, dtype=torch.int32, device=dev)
         self.send_route = torch.empty(self.tcap * topk, dtype=torch.int32, device=dev)
         self.send_info = torch.empty(self.tcap * topk, dtype=torch.int32, device=dev)
-        self.plan = torch.empty(3 * NPES * E_LOCAL + NPES + NPES * 9, dtype=torch.int32, device=dev)
-        # ep_plan: one workgroup per producer wave, each sorting up to 1024 routes.
+        # ep_prep -> ep_plan tables, then the base and the cursor of each of the 64 send keys.
+        self.plan = torch.empty(3 * NPES * E_LOCAL + NPES + NPES * 9 + 2 * 64, dtype=torch.int32, device=dev)
+        # ep_plan: one workgroup per slice of up to 1024 routes.
         self.slices = producers * 8
         assert self.tcap * topk <= self.slices * 1024, "too many routes per ep_plan slice"
         self.sched = torch.zeros(SCHED_EXPECTED + 3 * (S // SORT_BLOCK_M), dtype=torch.int32, device=dev)
