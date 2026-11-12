@@ -48,6 +48,10 @@ out = a8w4_moe_dyn(x8, W, topk_weights, topk_ids, m_valid, x_scale=x8_scale,
 pytest -q a8w4/tests/test_a8w4_moe.py                        # 正确性（gfx942）
 python -m a8w4.tune show   --case mimo-v2.6-flash-tp8         # 查看调优表：每个 token 数选中的配置
 python -m a8w4.tune verify --case mimo-v2.6-flash-ep8         # 按表实际调用：耗时、正确性、与未调优默认值对比
+pytest -q a8w4/tests/test_a8w4_mori_ep8.py                   # 8 卡 EP8 整层：MORI dispatch + a8w4_moe_dyn + MORI combine 对参考实现
+python a8w4/tests/test_a8w4_mori_ep8.py --act silu situv2     # 整层性能（总 token 64..4096），SiLU / SiTUv2 对比；更多用法见 8.1 节
+pytest -q a8w4/tests/test_a8w4_mori_tp8.py                   # 8 卡 TP8 整层：a8w4_moe + all-reduce（aiter custom / RCCL）对参考实现
+python a8w4/tests/test_a8w4_mori_tp8.py --act silu situv2     # TP8 整层性能（batch 64..4096），SiLU / SiTUv2 对比；更多用法见 8.2 节
 ```
 
 ## 2. 接口与约定
@@ -149,6 +153,8 @@ a8w4/
   ref.py                       测试与调优用：随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   configs/a8w4_moe_tuned.csv   调优表（每个点保存全部候选的耗时）
   tests/test_a8w4_moe.py       pytest
+  tests/test_a8w4_mori_ep8.py  8 卡 EP8 整层（MORI dispatch → a8w4_moe_dyn → MORI combine）：pytest 查正确性，命令行测性能（8.1 节）
+  tests/test_a8w4_mori_tp8.py  8 卡 TP8 整层（a8w4_moe → all-reduce），EP8 脚本的 TP 对照：pytest 查正确性，命令行测性能（8.2 节）
   kernels/                     FlyDSL device 代码
     row_quant.py               x 按行 fp8 量化（行数是运行时参数）
     tp_gemm1.py                TP 族 gemm1（gate|up + 激活 + q8s 量化 epilogue）；fd2 权重准备函数也在这里
@@ -587,6 +593,7 @@ profile 中的 kernel 名：
 - **EP 族**：≤512 tokens 慢 1–2%；≥1024 tokens（m64 / l128，TR epilogue，每个 tile 的行更多）慢 2–3%。
 - **`a8w4_moe_dyn`**：与上面相近，8192 tokens 时慢 4.4%。
 - **TP 族**：慢 1.5–4.7%，与实验版在 MI325X 上的结果（0–5%）一致。
+- **整层（MORI EP8 / TP8）**：dispatch / combine / all-reduce 与激活无关，SiTUv2 只影响 MoE 一段。命令见 8.1、8.2 节（`--act silu situv2`）。
 
 ## 8. 正确性与测试
 
@@ -603,6 +610,16 @@ profile 中的 kernel 名：
   - `a8w4_moe_dyn` 对参考实现：bf16 输入和 fp8 分组 scale 输入，容量 512，有效行数 0 / 1 / 37 / 300，无效行填 NaN 和随机 id；
   - `a8w4_moe_dyn` 的 CUDA graph：估计值 128，一次 capture 后依次用有效行数 64 / 1 / 400 / 0 / 512 replay，结果与 eager 一致；
   - `dyn_config`：只返回支持的 ep3k 配置；TP8 shape（256 个本地专家）抛 `ValueError`。
+- **`tests/test_a8w4_mori_ep8.py`**（8 张 gfx942，需要 mori）：按 sglang `--moe-a2a-backend mori`（normal 模式，IntraNode kernel）的步骤跑一整层 EP8 MoE：aiter 每（token, 128）fp8 量化 → MORI dispatch → `a8w4_moe_dyn` → MORI combine。
+  - 参考值：每卡用 fp32 算本卡专家在所有卡 token 上的结果（x 用 dispatch 出去的 fp8 反量化值），再跨卡求和；
+  - 每卡 token 数：每卡 64、不均匀（含空闲卡和只有 1 个 token 的卡）、每卡 4096（MORI 容量上限）；
+  - MoE 的两种调用：eager（只算收到的行）和 CUDA graph（整个接收缓冲区，`est_tokens` = 总 token 数）；
+  - 检查每卡收到的行数与路由一致、cos 差 < 5e-3。用法见 8.1。
+- **`tests/test_a8w4_mori_tp8.py`**（8 张 gfx942，不需要 mori）：按 sglang `--tp 8` 的步骤跑一整层 TP8 MoE：每卡持有整个 batch 和全部专家的 1/8 inter_dim，`a8w4_moe` 算本卡的部分和 → all-reduce。
+  - 参考值：每卡用 fp32 算本卡权重分片的结果，再跨卡求和；
+  - tokens 取 1 / 77 / 600 / 4096，覆盖 tp2k base / nt4、eager 的 tp1kq 和 capture 下的 tp1k；
+  - 两种前向（eager、CUDA graph）× 两种 all-reduce（aiter custom all-reduce、torch / RCCL）；
+  - cos 差 < 5e-3（实测约 1e-4）。用法见 8.2。
 - **sglang**：`test/registered/unit/layers/quantization/test_mxfp4_aiter_a16w4_moe.py` 覆盖了以下场景：
   - TP；
   - EP 全局 id：TP 族加 expert mask，以及 EP 族的 5 个配置；
@@ -615,6 +632,96 @@ profile 中的 kernel 名：
   - topk=1 时每个输出元素只被 atomic 加一次，tp2k / tp1k / tp1kq / ep3k 全部配置在 1 / 300 / 3000 tokens 下与原 kernel 逐位相同；
   - topk=8 时，新旧 kernel 之间的 cos 差与原 kernel 自身两次运行之间的差在同一量级（1e-7 – 1e-5）。
 - **与 sglang PR #45 的 `ep8_moe_dyn` 一致**：topk=1 时 t16 / s32 / l128、bf16 / fp8 输入逐位相同；topk=8 时 cos 差约 3e-7，与 PR 版自身两次运行之间的差相同。
+
+### 8.1 整层测试与性能（MORI EP8）
+
+在包含 `a8w4/` 的目录下运行，需要 8 张 gfx942 和 mori：
+
+```bash
+# 正确性（约 40 s）
+pytest -q a8w4/tests/test_a8w4_mori_ep8.py
+
+# 性能：MiMo-V2.6-Flash EP8，总 token 64..4096（平均分到 8 卡），分解 quant / dispatch / moe / combine
+python a8w4/tests/test_a8w4_mori_ep8.py
+
+# 只测几个 token 数、多测几轮；MoE 按 sglang CUDA graph 下的方式调用
+python a8w4/tests/test_a8w4_mori_ep8.py -t 256 1024 --iters 50 --graph
+
+# SiLU 与 SiTUv2 对比，指定 shape
+python a8w4/tests/test_a8w4_mori_ep8.py --act silu situv2 \
+    --model-dim 4096 --inter-dim 2048 --experts 256 --topk 8 -t 512 4096 --iters 20
+```
+
+| 选项 | 含义 | 默认 |
+|---|---|---|
+| `-t` | 总 token 数（8 卡合计，平均分到每卡），可给多个；每卡最多 4096（MORI 容量） | 64 128 256 512 1024 2048 4096 |
+| `--act` | `silu` / `situv2`，两个都给时并排对比 | `silu` |
+| `--model-dim` / `--inter-dim` | hidden / moe_intermediate_size | 4096 / 2048 |
+| `--experts` / `--topk` | 全局专家数（8 的倍数）/ top-k | 256 / 8 |
+| `--graph` | MoE 按 CUDA graph 下的方式调用：整个接收缓冲区，`est_tokens` = 总 token 数。不加时按 eager 方式：只算收到的行，`est_tokens` = 收到的行数 | eager |
+| `--iters` / `--warmup` | 每个点的计时轮数 / 预热次数 | 20 / 3 |
+
+- **输出**：
+  - 每个 token 数先对参考实现检查一次，再计时；
+  - 每种激活一张表：每卡收到的行数、选中的 a8w4 配置、quant / dispatch / moe（各卡平均 / 最慢）/ combine 各自的耗时、四项之和、e2e；
+  - 两种激活都给时，最后再打一张 moe 和 e2e 的 situv2 / silu 对比表。
+- **计时方法**：
+  - 每轮先清空 L2 和 MALL，权重是冷的；
+  - host 屏障后 GPU 先空转，等 host 把整层的 launch 都排好，所以不计 host 开销，相当于 graph 回放；eager 方式下读接收计数的那次同步也不计入；
+  - 再用 MORI 的 device barrier 让 8 卡同时开始；
+  - 每轮跑两次：一次在每个阶段前加 barrier，单独计时各阶段（取最慢的卡）；一次四个阶段连着跑，最慢的卡的总时间就是 e2e。
+- **shape 限制**：只走 EP kernel，限制见 9.1 节 ep3k 一行（每卡本地专家 ≤ 32、64 % topk == 0、H 是 512 的倍数等）。不支持的 shape 会报 `ValueError`。
+- **SiTUv2 参数**：用 `ref.SITU`（β 4、β_l 25、clamp 16），取值不影响耗时。
+- **其他**：路由是均匀随机的（softmax 后取 top-k 再归一化）。GPU 被别的进程占用时结果不可信，严重时会卡住：MORI 和 ep_prep 都要求相关 WG 同时驻留。
+
+### 8.2 整层测试与性能（TP8）
+
+EP8 脚本的 TP 对照，对应 sglang `--tp 8`（不开 EP，没有 all-to-all）。每卡持有整个 batch（TP attention 之后各卡的 hidden states 和路由相同），以及全部专家的 1/8 inter_dim。每卡按 sglang 的顺序算一层：
+
+1. **moe**：`a8w4_moe(x, W_rank, topk_weights, topk_ids)` 得到本卡的部分和。查表选 TP 族 kernel，x 在 kernel 内按行量化。
+2. **allreduce**：跨卡求和。默认用 aiter 的 custom all-reduce（sglang 在 ROCm 上的默认，out of place，超过大小上限时回退 RCCL）；`--allreduce torch` 用 `torch.distributed.all_reduce`（RCCL）。
+
+在包含 `a8w4/` 的目录下运行，需要 8 张 gfx942，不需要 mori：
+
+```bash
+# 正确性（约 1 min；第一次运行还要 JIT 编译 aiter 的 all-reduce 模块）
+pytest -q a8w4/tests/test_a8w4_mori_tp8.py
+
+# 性能：MiMo-V2.6-Flash TP8，batch 64..4096，分解 moe / allreduce
+python a8w4/tests/test_a8w4_mori_tp8.py
+
+# CUDA graph 回放
+python a8w4/tests/test_a8w4_mori_tp8.py --graph -t 64 4096 --iters 50
+
+# RCCL all-reduce，SiLU 与 SiTUv2 对比，指定 shape
+python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
+    --model-dim 4096 --inter-dim 2048 --experts 256 --topk 8 -t 512 4096 --iters 20
+```
+
+| 选项 | 含义 | 默认 |
+|---|---|---|
+| `-t` | batch 的 token 数，可给多个。每卡都持有全部 token，所以和 EP8 脚本的总 token 数直接对应 | 64 128 256 512 1024 2048 4096 |
+| `--allreduce` | `aiter`：aiter custom all-reduce，超过大小上限时走 RCCL；`torch`：`torch.distributed.all_reduce`（RCCL） | `aiter` |
+| `--graph` | 回放 CUDA graph，按 sglang capture decode 的方式：MoE 只选 graph-safe 配置（4096 tokens 时用 tp1k 而不是 tp1kq），aiter all-reduce 直接读注册过的输入。不加时 eager 调用 | eager |
+| `--act` | `silu` / `situv2`，两个都给时并排对比 | `silu` |
+| `--model-dim` / `--inter-dim` | hidden / 模型的 moe_intermediate_size（每卡 1/8） | 4096 / 2048 |
+| `--experts` / `--topk` | 专家数 / top-k | 256 / 8 |
+| `--iters` / `--warmup` | 每个点的计时轮数 / 预热次数 | 20 / 3 |
+
+- **输出**：
+  - 每个 token 数先对参考实现检查一次，再计时；
+  - 每种激活一张表：选中的 a8w4 配置、moe（各卡平均 / 最慢）、allreduce、实际走的 all-reduce 路径（`aiter custom` / `rccl`）、两项之和、e2e；
+  - 两种激活都给时，最后再打一张 moe 和 e2e 的 situv2 / silu 对比表。
+- **计时方法**：与 8.1 相同（冷 L2 / MALL，GPU 空转等 host 排好 launch，device barrier 后各卡同时开始，每轮分阶段计时和连着跑各一次）。device barrier 改用 1 个元素的 RCCL all-reduce。
+- **all-reduce 路径**：
+  - aiter custom all-reduce 处理 ≤ 64 MiB 的输入（H 4096 时 T ≤ 8192），更大的回退 RCCL。窗口可用 `AITER_CUSTOM_AR_MAX_SIZE` / `AITER_CUSTOM_AR_MIN_SIZE` 调整；
+  - eager 时 aiter 先把输入拷进自己注册过的缓冲区再归约；
+  - graph 下 capture 结束时把 graph 里的输入地址注册给各卡，省掉这次拷贝。
+- **shape 限制**：只走 TP 族 kernel。每卡的 inter_dim（`--inter-dim` / 8）须是 256 的倍数，H 须是 512 的倍数（9.1 节 tp2k / tp1k 各行）。调优表里只有 MiMo-V2.6-Flash TP8 / TP4 的 shape，其他 shape 用未调优的 `default_config`（tp2k bm64 base）。
+- **其他**：
+  - x 和路由在 rank 0 生成后广播，每卡的权重分片随机生成（seed = rank）；
+  - SiTUv2 参数同 8.1；
+  - 文件名沿用 `mori` 前缀，与 EP8 脚本成对，但 TP 路径不用 MORI。
 
 ## 9. 继续开发的注意点
 
