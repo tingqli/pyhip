@@ -9,10 +9,14 @@ allowed in its context (activation, CUDA-graph capture, token count).
     python -m a8w4.tune merge /tmp/p*.csv            # into configs/a8w4_moe_tuned.csv
     python -m a8w4.tune show --case mimo-v2.6-flash-tp8
     python -m a8w4.tune verify --case mimo-v2.6-flash-ep8 -t 1 100 3000
+    # SiTUv2 experts: their own rows (act column), same commands with --act situv2
+    python -m a8w4.tune tune --act situv2 --case mimo-v2.6-flash-ep8 -t 1 2 4 --out /tmp/s0.csv
 
 Run from the directory that contains ``a8w4/`` (or put it on PYTHONPATH);
 ``python a8w4/tune.py ...`` works too. Timing: cold caches (L2 + MALL flushed),
 host launch overhead excluded, median of ``--iters`` (see ``ref.time_cold``).
+SiTUv2 runs with ``ref.SITU`` (its betas / clamp are launch arguments: no effect on
+the time). See configs/README.md for the commands that produced the shipped table.
 """
 
 import argparse
@@ -76,21 +80,32 @@ def candidates(shape):
     return [c for c in out if supported(c, shape)]
 
 
+def _situ(act):
+    """SiTUv2 parameters of the tuner (``ref.SITU``); None for SiLU."""
+    return R.SITU if act == "situv2" else None
+
+
 def _key(r):
     return tuple(str(r[k]) for k in ("model_dim", "inter_dim", "experts", "experts_global",
-                                     "topk", "routing", "num_tokens", "config"))
+                                     "topk", "routing", "act", "num_tokens", "config"))
+
+
+def _read_rows(path):
+    """Rows of a table file; rows of files written before the act column are SiLU."""
+    with open(path) as fh:
+        rows = list(csv.DictReader(fh))
+    for r in rows:
+        r["act"] = r.get("act") or "silu"
+    return rows
 
 
 def write_rows(path, new_rows):
-    """Merge rows into ``path`` (same shape / point / config replaced), sorted."""
-    old = []
-    if os.path.exists(path):
-        with open(path) as fh:
-            old = list(csv.DictReader(fh))
+    """Merge rows into ``path`` (same shape / act / point / config replaced), sorted."""
+    old = _read_rows(path) if os.path.exists(path) else []
     keys = {_key(r) for r in new_rows}
     rows = [r for r in old if _key(r) not in keys] + list(new_rows)
     rows.sort(key=lambda r: (int(r["model_dim"]), int(r["inter_dim"]), int(r["experts"]),
-                             int(r["experts_global"]), int(r["topk"]), r["routing"],
+                             int(r["experts_global"]), int(r["topk"]), r["routing"], r["act"],
                              int(r["num_tokens"]), float(r["us"])))
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
@@ -109,28 +124,32 @@ def _case(args):
     return tuple(shape), e0
 
 
-def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log=print):
+def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log=print,
+         act="silu"):
     """Per token count, ``rounds`` rounds, each with a fresh routing draw (at small
     batches the per-rank work depends on the draw): check every candidate against
     the reference, time it (candidates interleaved, so clock / power drift hits all
-    of them); store the median per candidate."""
+    of them); store the median per candidate. ``act``: the experts' activation (its
+    rows are stored under that act)."""
     H, I, E, EGl, K = shape
+    situ = _situ(act)
     W, raw = R.make_weights(E, H, I)
     cands = candidates(shape)
-    log(f"shape H{H} I{I} E{E}/{EGl} top{K} e0 {e0}: {len(cands)} candidates")
+    log(f"shape H{H} I{I} E{E}/{EGl} top{K} e0 {e0} act {act}: {len(cands)} candidates")
     for tok in tokens:
-        names = [config_name(c) for c in cands if supported(c, shape, tokens=tok)]
+        names = [config_name(c) for c in cands if supported(c, shape, act=act, tokens=tok)]
         times = {n: [] for n in names}
         cos = dict.fromkeys(names, 0.0)
         bad = {}
         for rnd in range(rounds):
             x, tw, ti = R.make_routing(tok, H, EGl, K, seed=101 * tok + rnd, routing=routing)
-            ref = R.ref_moe(x, tw, ti, raw, e0)
+            ref = R.ref_moe(x, tw, ti, raw, e0, act, situ)
             for name in names:
                 if name in bad:
                     continue
                 fn = lambda name=name: run_config(name, x, W, tw, ti,  # noqa: E731
-                                                  expert_offset=e0, num_experts=EGl)
+                                                  expert_offset=e0, num_experts=EGl,
+                                                  act=act, situ=situ)
                 try:
                     c = R.cos_diff(ref, fn().float())
                 except Exception as ex:  # noqa: BLE001
@@ -147,8 +166,8 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
                 continue
             us = sorted(times[name])[len(times[name]) // 2]
             rows.append(dict(model_dim=H, inter_dim=I, experts=E, experts_global=EGl, topk=K,
-                             routing=routing, num_tokens=tok, config=name, us=f"{us:.1f}",
-                             cos=f"{cos[name]:.1e}"))
+                             routing=routing, act=act, num_tokens=tok, config=name,
+                             us=f"{us:.1f}", cos=f"{cos[name]:.1e}"))
         msgs = [f"{n}: {m}" for n, m in bad.items()]
         rows.sort(key=lambda r: float(r["us"]))
         if rows:
@@ -158,46 +177,48 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
         torch.cuda.empty_cache()
 
 
-def _points(csv_path, shape, routing):
-    rows = _load_table(csv_path, os.path.getmtime(csv_path)).get((*shape, routing))
+def _points(csv_path, shape, routing, act):
+    rows = _load_table(csv_path, os.path.getmtime(csv_path)).get((*shape, routing, act))
     if not rows:
-        raise SystemExit(f"no rows for {shape} {routing} in {csv_path}")
+        raise SystemExit(f"no rows for {shape} {routing} {act} in {csv_path}")
     return rows
 
 
-def show(shape, csv_path, routing="uniform"):
+def show(shape, csv_path, routing="uniform", act="silu"):
     """Markdown: per point the fastest config, the fastest of each family and the
     graph-safe pick when it differs."""
     print("| tokens | best | us | best TP family | us | best EP family | us | graph-safe pick |")
     print("|---:|---|---:|---|---:|---|---:|---|")
-    for n, cands in _points(csv_path, shape, routing):
+    for n, cands in _points(csv_path, shape, routing, act):
         us0, best = cands[0]
         tp = next(((u, c) for u, c in cands if c["kind"].startswith("tp")), (None, None))
         ep = next(((u, c) for u, c in cands if c["kind"].startswith("ep")), (None, None))
-        safe = lookup_config(shape, n, capturing=True, routing=routing, csv_path=csv_path)
+        safe = lookup_config(shape, n, act=act, capturing=True, routing=routing,
+                             csv_path=csv_path)
         cell = lambda uc: (config_name(uc[1]), f"{uc[0]:.1f}") if uc[1] else ("-", "-")  # noqa: E731
         print(f"| {n} | {config_name(best)} | {us0:.1f} | {' | '.join(cell(tp))} | "
               f"{' | '.join(cell(ep))} | "
               f"{'' if safe == best else config_name(safe)} |")
 
 
-def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print):
+def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print, act="silu"):
     """``a8w4_moe`` (table lookup) at each token count, also between tuned points:
     cos vs the reference, time vs the table entry and vs the untuned default."""
     H, I, E, EGl, K = shape
+    situ = _situ(act)
     W, raw = R.make_weights(E, H, I)
-    pts = dict(_points(csv_path, shape, routing))
+    pts = dict(_points(csv_path, shape, routing, act))
     for tok in tokens:
         x, tw, ti = R.make_routing(tok, H, EGl, K, seed=7 + tok, routing=routing)
-        ref = R.ref_moe(x, tw, ti, raw, e0)
-        cfg = lookup_config(shape, tok, routing=routing, csv_path=csv_path)
+        ref = R.ref_moe(x, tw, ti, raw, e0, act, situ)
+        cfg = lookup_config(shape, tok, act=act, routing=routing, csv_path=csv_path)
         fn = lambda: a8w4_moe(x, W, tw, ti, expert_offset=e0, num_experts=EGl,  # noqa: E731
-                              routing=routing, csv_path=csv_path)
+                              act=act, situ=situ, routing=routing, csv_path=csv_path)
         c = R.cos_diff(ref, fn().float())
         us = R.time_cold(fn, iters=iters)
-        dflt = default_config(shape, tok)
+        dflt = default_config(shape, tok, act)
         dus = R.time_cold(lambda: run_config(dflt, x, W, tw, ti, expert_offset=e0,
-                                             num_experts=EGl), iters=iters)
+                                             num_experts=EGl, act=act, situ=situ), iters=iters)
         n = next((p for p in sorted(pts) if p >= tok), max(pts))
         tus = next(u for u, cc in pts[n] if cc == cfg)
         log(f"tok {tok:6d} -> point {n:6d}: {config_name(cfg):24s} {us:8.1f} us (table {tus:8.1f})"
@@ -208,8 +229,7 @@ def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print):
 def merge(parts, csv_path):
     rows = []
     for p in parts:
-        with open(p) as fh:
-            rows += list(csv.DictReader(fh))
+        rows += _read_rows(p)
     write_rows(csv_path, rows)
     print(f"merged {len(rows)} rows from {len(parts)} files into {csv_path}")
 
@@ -223,6 +243,8 @@ def main():
     p.add_argument("--expert-offset", type=int, default=0)
     p.add_argument("-t", type=int, nargs="*", default=None, help="token counts")
     p.add_argument("--routing", default="uniform", choices=R.ROUTINGS)
+    p.add_argument("--act", default="silu", choices=R.ACTS,
+                   help="experts' activation: tune / show / verify its rows (situv2: ref.SITU)")
     p.add_argument("--csv", default=DEFAULT_CSV)
     p.add_argument("--out", default=None, help="tune: output file (default --csv)")
     p.add_argument("--iters", type=int, default=20)
@@ -237,12 +259,12 @@ def main():
             print(config_name(c))
     elif args.mode == "tune":
         tune(shape, e0, args.t or TOKENS, args.out or args.csv, args.routing, args.iters,
-             args.rounds, log)
+             args.rounds, log, args.act)
     elif args.mode == "show":
-        show(shape, args.csv, args.routing)
+        show(shape, args.csv, args.routing, args.act)
     else:
         verify(shape, e0, args.t or [1, 3, 20, 100, 300, 1000, 3000, 10000], args.csv,
-               args.routing, args.iters, log)
+               args.routing, args.iters, log, args.act)
 
 
 if __name__ == "__main__":

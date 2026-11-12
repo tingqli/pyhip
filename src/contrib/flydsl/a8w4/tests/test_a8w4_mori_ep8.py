@@ -264,7 +264,7 @@ def _bench(layer, x, tw, ti, count, args, iters, warmup, spin):
         iso.append(t)
         e2e.append(t2)
         late += (h1 > SPIN_US) + (h2 > SPIN_US)  # the GPU may have waited for the host
-    cfg = dyn_config(SHAPE, args[1])["cfg"] if args[0] else "-"
+    cfg = dyn_config(SHAPE, args[1], act=layer.act)["cfg"] if args[0] else "-"
     return dict(recv=count, cfg=cfg, iso=iso, e2e=e2e, late=late)
 
 

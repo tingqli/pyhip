@@ -210,20 +210,22 @@ def run_config(cfg, x, W, topk_weights, topk_ids, *, expert_offset=0, num_expert
 # tuned table
 # =============================================================================
 
-FIELDS = ["model_dim", "inter_dim", "experts", "experts_global", "topk", "routing",
+FIELDS = ["model_dim", "inter_dim", "experts", "experts_global", "topk", "routing", "act",
           "num_tokens", "config", "us", "cos"]
 
 
 @functools.lru_cache(maxsize=8)
 def _load_table(path, mtime):
-    """{(H, I, E, E_global, topk, routing): sorted [(num_tokens, [(us, cfg), ...])]}:
-    every candidate measured at every point, fastest first."""
+    """{(H, I, E, E_global, topk, routing, act): sorted [(num_tokens, [(us, cfg), ...])]}:
+    every candidate measured at every point, fastest first. Rows without an ``act``
+    (tables written before the column existed) are SiLU."""
     del mtime  # cache key only: reload when the file changes
     pts = {}
     with open(path) as fh:
         for r in csv.DictReader(fh):
             key = (int(r["model_dim"]), int(r["inter_dim"]), int(r["experts"]),
-                   int(r["experts_global"]), int(r["topk"]), r["routing"])
+                   int(r["experts_global"]), int(r["topk"]), r["routing"],
+                   r.get("act") or "silu")
             pts.setdefault(key, {}).setdefault(int(r["num_tokens"]), []).append(
                 (float(r["us"]), parse_config(r["config"])))
     return {k: sorted((t, sorted(c, key=lambda x: x[0])) for t, c in v.items())
@@ -244,17 +246,21 @@ def default_config(shape, tokens, act="silu", capturing=False):
 def lookup_config(shape, tokens, *, act="silu", capturing=False, routing="uniform",
                   csv_path=DEFAULT_CSV):
     """Fastest supported config of the first tuned point >= ``tokens`` (the largest
-    point if beyond the table); ``default_config`` if the shape is not tuned."""
-    rows = _table_rows(shape, routing, csv_path)
+    point if beyond the table) among the rows of ``act``; ``default_config`` if the
+    shape is not tuned."""
+    rows = _table_rows(shape, routing, csv_path, act)
     if rows:
         return _pick(rows, shape, tokens, act, capturing)
     return default_config(shape, tokens, act, capturing)
 
 
-def _table_rows(shape, routing, csv_path):
+def _table_rows(shape, routing, csv_path, act="silu"):
+    """Tuned points of (shape, routing, act). A shape tuned only for SiLU serves the
+    other activations from its SiLU rows (the configs rank alike, README 7.8)."""
     if not csv_path or not os.path.exists(csv_path):
         return None
-    return _load_table(csv_path, os.path.getmtime(csv_path)).get((*shape, routing))
+    table = _load_table(csv_path, os.path.getmtime(csv_path))
+    return table.get((*shape, routing, act)) or table.get((*shape, routing, "silu"))
 
 
 def _point(rows, tokens):
@@ -271,9 +277,10 @@ def _pick(rows, shape, tokens, act, capturing):
 
 def dyn_config(shape, tokens, *, act="silu", routing="uniform", csv_path=DEFAULT_CSV):
     """Config of ``a8w4_moe_dyn`` (EP kernels only): the fastest supported ``ep3k``
-    config of the tuned point >= ``tokens``, else the EP auto thresholds."""
+    config of the tuned point >= ``tokens`` (rows of ``act``), else the EP auto
+    thresholds."""
     ok = lambda c: c["kind"] == "ep3k" and supported(c, shape, act=act)  # noqa: E731
-    rows = _table_rows(shape, routing, csv_path)
+    rows = _table_rows(shape, routing, csv_path, act)
     if rows:
         for _, cfg in _point(rows, tokens):
             if ok(cfg):

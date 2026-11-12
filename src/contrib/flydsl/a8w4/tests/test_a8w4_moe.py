@@ -7,6 +7,7 @@
 * every kernel family vs the fp8-emulating fp32 reference, on the MiMo-V2.6-Flash
   TP8 and EP8 per-rank shapes (EP: rank 3, global expert ids);
 * ``a8w4_moe`` with the tuned table, including token counts between tuned points;
+* the table's act key (SiTUv2 rows, SiLU fallback, tables without the act column);
 * CUDA-graph capture: only graph-safe configs are picked, replay matches eager;
 * SiTUv2 on every kernel family (TP and EP, incl. ``a8w4_moe_dyn``);
 * ``a8w4_moe_dyn`` on an all-to-all receive buffer (device-side valid count, stale
@@ -14,6 +15,7 @@
   different counts.
 """
 
+import csv
 import os
 import sys
 
@@ -31,6 +33,7 @@ from a8w4 import (  # noqa: E402
     supported,
 )
 from a8w4 import ref as R  # noqa: E402
+from a8w4.moe import FIELDS  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -121,10 +124,11 @@ def test_situv2_config(case, name):
 
 @pytest.mark.parametrize("case,tokens", [("tp8", 100), ("ep8", 5), ("ep8", 3000)])
 def test_situv2_dispatch(case, tokens):
-    """The table picks the same kernels for SiTUv2 as for SiLU (EP shape: EP family)."""
+    """SiTUv2 calls pick from the table's situv2 rows (EP shape: an EP kernel)."""
     H, I, E, EGl, K, e0 = SHAPES[case]
     shape = (H, I, E, EGl, K)
-    assert lookup_config(shape, tokens, act="situv2") == lookup_config(shape, tokens)
+    kind = lookup_config(shape, tokens, act="situv2")["kind"]
+    assert kind.startswith("ep" if case == "ep8" else "tp"), kind
     W, x, tw, ti, ref = data(case, tokens, act="situv2", situ=R.SITU, seed=7)
     raw = weights(case)[1]
     no_clamp = dict(R.SITU, swiglu_limit=float("inf"))
@@ -136,6 +140,33 @@ def test_situv2_dispatch(case, tokens):
     with pytest.raises(ValueError):  # betas must be > 0
         a8w4_moe(x, W, tw, ti, expert_offset=e0, num_experts=EGl, act="situv2",
                  situ=dict(R.SITU, situ_beta=0.0))
+
+
+def test_table_act(tmp_path):
+    """The act column keys the table; an act without rows of its own uses the SiLU rows,
+    and so do tables written before the column existed."""
+    shape = SHAPES["ep8"][:5]
+    row = dict(zip(("model_dim", "inter_dim", "experts", "experts_global", "topk"), shape),
+               routing="uniform", num_tokens=64, cos="0")
+    rows = [dict(row, act=act, config=name, us=us) for act, name, us in (
+        ("silu", "ep3k t16", 10), ("silu", "ep3k s32", 11),
+        ("situv2", "ep3k s32", 10), ("situv2", "ep3k t16", 11))]
+
+    def write(path, fields, rows):
+        with open(path, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        return str(path)
+
+    both = write(tmp_path / "both.csv", FIELDS, rows)
+    for pick in (lookup_config, dyn_config):
+        assert pick(shape, 64, csv_path=both)["cfg"] == "t16"
+        assert pick(shape, 64, act="situv2", csv_path=both)["cfg"] == "s32"
+    silu = rows[:2]
+    old = write(tmp_path / "old.csv", [f for f in FIELDS if f != "act"], silu)
+    for path in (write(tmp_path / "silu.csv", FIELDS, silu), old):
+        assert lookup_config(shape, 64, act="situv2", csv_path=path)["cfg"] == "t16"
 
 
 def recv_buffer(capacity, valid, seed, fp8):

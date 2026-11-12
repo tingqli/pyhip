@@ -1,6 +1,6 @@
 # a8w4：MiMo-V2.6-Flash 的 A8W4 MoE（gfx942，FlyDSL；TP / EP 一套接口）
 
-fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）。TP 和 EP 共用一个入口 `a8w4_moe`：每次调用按（shape，token 数）查调优表，从 5 类 kernel 里选出当前上下文（激活函数、是否在 CUDA graph capture 中、token 数）允许的最快配置。EP 的 all-to-all 接收缓冲区（例如 MORI dispatch：按容量分配，有效行数只在 device 上）用 `a8w4_moe_dyn`，不做 host 同步，可以放进 CUDA graph（2.4 节）。调优表覆盖 XiaomiMiMo/MiMo-V2.6-Flash(-RL) 的 TP8、EP8 每卡 shape（另有 TP4），1–32768 tokens。
+fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）。TP 和 EP 共用一个入口 `a8w4_moe`：每次调用按（shape，token 数）查调优表，从 5 类 kernel 里选出当前上下文（激活函数、是否在 CUDA graph capture 中、token 数）允许的最快配置。EP 的 all-to-all 接收缓冲区（例如 MORI dispatch：按容量分配，有效行数只在 device 上）用 `a8w4_moe_dyn`，不做 host 同步，可以放进 CUDA graph（2.4 节）。调优表覆盖 XiaomiMiMo/MiMo-V2.6-Flash(-RL) 的 TP8、EP8 每卡 shape（另有 TP4），1–32768 tokens，SiLU 与 SiTUv2 各一组（TP4 只有 SiLU）。
 
 本目录是一个独立的 Python 包。kernel 只依赖 torch 和 FlyDSL 0.3.2，aiter 的 FlyDSL helper 已复制到 `_vendor/`。aiter 只在三处用到：TP 族 kernel 的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
 
@@ -76,7 +76,7 @@ E 是 `W` 中的本地专家数，e0 = `expert_offset`。
 | `topk_ids` | int32 [M, topk]，全局专家 id。EP kernel 只处理 [e0, e0+E) 内的 id，其他值（包括 -1）视为不属于本卡；TP 族 kernel 走 aiter `moe_sorting`，id 必须落在 [0, num_experts) 内 |
 | `W` | `prepare_weights` 的输出 |
 | `expert_offset` / `num_experts` | 见上；默认 0 / E，即 TP |
-| `act`, `situ` | `"silu"`（默认）或 `"situv2"`；`situ=dict(situ_beta, situ_linear_beta, swiglu_limit)`。两族 kernel 都支持（5.8 节） |
+| `act`, `situ` | `"silu"`（默认）或 `"situv2"`；`situ=dict(situ_beta, situ_linear_beta, swiglu_limit)`。两族 kernel 都支持（5.8 节）；查表用该 act 的行（6.2 节） |
 | `config` | 强制使用某个配置（dict 或名字，例如 `"ep3k l128"`），不查表 |
 | `routing`, `csv_path` | 调优表的 key 和路径，默认 `"uniform"` 与 `configs/a8w4_moe_tuned.csv` |
 | 返回 | 新分配的 bf16 [M, H] |
@@ -90,7 +90,7 @@ E 是 `W` 中的本地专家数，e0 = `expert_offset`。
 | `run_config(cfg, x, W, tw, ti, ...)` | 跑指定配置，不查表 |
 | `a8w4_moe_dyn(x, W, tw, ti, m_valid, x_scale=, ...)` | EP all-to-all 接收缓冲区（有效行数在 device 上），见 2.4 |
 | `lookup_config(shape, tokens, act=, capturing=, routing=, csv_path=)` | 查表得到配置；`shape = (H, I, E, E_global, topk)` |
-| `dyn_config(shape, tokens, routing=, csv_path=)` | `a8w4_moe_dyn` 用的配置（6.2 节）；EP kernel 不支持该 shape 时抛 `ValueError` |
+| `dyn_config(shape, tokens, act=, routing=, csv_path=)` | `a8w4_moe_dyn` 用的配置（6.2 节）；EP kernel 不支持该 shape 时抛 `ValueError` |
 | `supported(cfg, shape, act=, capturing=, tokens=)` | 某个配置在该 shape / 上下文下能否运行（只检查结构限制） |
 | `default_config(shape, tokens)` | 表里没有该 shape 时的回退配置 |
 | `config_name` / `parse_config` | 配置 dict ↔ 名字 |
@@ -152,6 +152,7 @@ a8w4/
   tune.py                      调优 CLI：tune / merge / show / verify / candidates
   ref.py                       测试与调优用：随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   configs/a8w4_moe_tuned.csv   调优表（每个点保存全部候选的耗时）
+  configs/README.md            调优表的内容与生成命令
   tests/test_a8w4_moe.py       pytest
   tests/test_a8w4_mori_ep8.py  8 卡 EP8 整层（MORI dispatch → a8w4_moe_dyn → MORI combine）：pytest 查正确性，命令行测性能（8.1 节）
   tests/test_a8w4_mori_tp8.py  8 卡 TP8 整层（a8w4_moe → all-reduce），EP8 脚本的 TP 对照：pytest 查正确性，命令行测性能（8.2 节）
@@ -375,23 +376,26 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
   - β、1/β、β_l、1/β_l、L 是 5 个运行时 f32 launch 参数（`tp_gemm1.situ_args` 生成，β ≤ 0 时报 `ValueError`）；kernel 按 act 分别编译，kernel 名加 `_situv2`；silu 也带这 5 个参数，但不使用；
   - 位置：TP 族在 gemm1 / 融合 kernel 的 epilogue；EP 族在 ep gemm1 的两种 epilogue（TR 和非 TR）以及 ep1k 的 gemm1 item。都调用同一个 `_vendor/act.gate_up_act`，gemm2 不变；
   - 实测（7.8 节）比 silu 慢：EP 族（ep3k）0.8–3.1%，`a8w4_moe_dyn` 0.6–4.4%，TP 族 1.5–4.7%。多出的只是 gemm1 epilogue 里的 VALU（tanh、sigmoid 各一组 exp2 + rcp），大 batch 时占比稍高。
-- MiMo-V2.6-Flash 用的是 SiLU（sglang `mimo_v2.py` 要求 `hidden_act == "silu"`），调优表也是按 SiLU 测的。
+- MiMo-V2.6-Flash 用的是 SiLU（sglang `mimo_v2.py` 要求 `hidden_act == "silu"`）。调优表里 SiLU 和 SiTUv2 是分开的两组行（6.1 节）。
 
 ## 6. 调优机制
 
 ### 6.1 调优表 `configs/a8w4_moe_tuned.csv`
 
-列：`model_dim, inter_dim, experts, experts_global, topk, routing, num_tokens, config, us, cos`。
+列：`model_dim, inter_dim, experts, experts_global, topk, routing, act, num_tokens, config, us, cos`。
 
 **每个点保存全部候选的耗时**，而不是只存最快的那个，这样运行时才能按上下文过滤（capture 时排除 tp1kq，超过 512 tokens 时排除 ep1k）。现有内容：
 
 - 3 个 shape（TP8 4096/256/256/256/8、TP4 4096/512/256/256/8、EP8 4096/2048/32/256/8），routing 都是 uniform；
-- 每个 shape 35 个点（1, 2, 3, 4, 6, 8, 12, … , 24576, 32768）；
-- 共 1140 行。
+- act：3 个 shape 都有 silu 行，TP8、EP8 另有 situv2 行；
+- 每组（shape, act）35 个点（1, 2, 3, 4, 6, 8, 12, … , 24576, 32768）；
+- 共 2000 行（silu 1140、situv2 860）。
+
+各组的来源和生成命令见 [configs/README.md](configs/README.md)。
 
 ### 6.2 查表规则（`lookup_config`）
 
-1. key 为 (H, I, E, E_global, topk, routing)。
+1. key 为 (H, I, E, E_global, topk, routing, act)。该 shape 没有调用时那个 act 的行时，用同 shape 的 silu 行（例如 TP4 的 situv2）；没有 act 列的旧表全部按 silu 读。
 2. 取第一个 `num_tokens ≥ M` 的点；M 超过最大点时取最大点。
 3. 在该点的候选中，按耗时从小到大，返回第一个满足 `supported(cfg, shape, act, capturing, tokens=M)` 的配置。
 4. 表里没有这个 shape 时用 `default_config`：EP kernel 能跑就按原来的 EP 阈值选（≤8 t16、≤480 s16、≤960 s32、≤2176 m64、其余 l128），否则用 `tp2k bm64 g1bcm1 g2base`。
@@ -432,6 +436,7 @@ done; wait
 python -m a8w4.tune merge /tmp/ep8_*.csv          # 合并进 configs/a8w4_moe_tuned.csv
 python -m a8w4.tune show   --case mimo-v2.6-flash-ep8
 python -m a8w4.tune verify --case mimo-v2.6-flash-ep8 -t 1 100 3000 20000
+# situv2：同样的命令加 --act situv2，结果写成 act=situv2 的行（完整命令见 configs/README.md）
 
 # 新 shape：H,I,E_local,E_global,topk（也可以把它加进 tune.py 的 CASES）
 python -m a8w4.tune tune --shape 6144,256,384,384,8 --out /tmp/new.csv
@@ -439,7 +444,11 @@ python -m a8w4.tune tune --shape 6144,256,384,384,8 --out /tmp/new.csv
 
 - **调优时机器要空闲**：调优时 8 张卡各跑一个进程，事后在空闲卡上单独复测，大 batch 的结果与表中数值相差 ±5–8%，方向不固定。
 - **路由分布**：`--routing hot`（1/32 的专家分数 +2）会写成另一组行，调用时用 `a8w4_moe(..., routing="hot")` 选这组表。
-- **situv2**：表是按 SiLU 测的。situv2 下各配置都稳定地慢 1–5%（7.8 节），选择顺序基本不变，只有候选之间相差 < 3% 的点，最快的配置可能会变。要正式用 situv2，最好按 situv2 重新调优（tuner 需要加 `act` 参数，见 9.3）。
+- **situv2**：`--act situv2` 按 situv2 计时，结果写成单独的一组行，调用时按 act 查（6.2 节）。
+  - 参数取 `ref.SITU`。β / clamp 是 launch 参数，不影响耗时，所以这组行对任意 SiTUv2 参数都适用。
+  - TP8、EP8 已按 situv2 调优。同一配置、同一点上，situv2 / silu 的中位数是 1.022（TP8）和 1.012（EP8），p5–p95 分别为 0.992–1.055 和 0.975–1.045。
+  - 35 个点里，TP8 有 8 个点（16、48、64、128、320、448、640、16384）、EP8 有 4 个点（96、192、320、1536）选中的配置与 silu 不同，都是候选之间本来就相差很小的点。按 situv2 实测，新的选择比沿用 silu 的选择只快 0–1.3%，在测量误差以内。
+  - capture 时，TP8 4096 tokens 的选择从 `tp1k bcm1 ks1` 变成 `tp2k bm64 g1bcm1 g2nt4`（silu 下两者相差不到 0.1%）。
 
 ## 7. 性能
 
@@ -561,7 +570,7 @@ profile 中的 kernel 名：
 
 ### 7.8 SiTUv2 与 SiLU 的耗时
 
-条件同 7.1；两种激活交替测 3 轮，取中位数，单位 us。配置由调优表选，situv2 与 silu 选中的配置相同。SiTUv2 的 β / clamp 是运行时参数，取值不影响耗时。
+条件同 7.1；两种激活交替测 3 轮，取中位数，单位 us。这些数是在表里还没有 situv2 行时测的：两种激活都按 silu 行选配置，所以每列比较的是同一个配置。SiTUv2 的 β / clamp 是运行时参数，取值不影响耗时。按 situv2 调优之后的选择差别见 6.3 节。
 
 **EP8（rank 3），`a8w4_moe`**
 
@@ -598,13 +607,14 @@ profile 中的 kernel 名：
 ## 8. 正确性与测试
 
 - **参考实现**：`ref.ref_moe` 是 fp32 参考，按 kernel 的方式模拟 fp8 量化：x 每行量化一次，中间结果每（行, 128 列）量化一次。剩下的差别只来自累加顺序和 bf16 输出。阈值是 cos 差 < 5e-3，实测 1e-5 到 3.5e-4。
-- **`tests/test_a8w4_moe.py`**：本机结果为 83 passed、1 skipped（ep1k 在 600 tokens 时不支持）。覆盖范围：
+- **`tests/test_a8w4_moe.py`**：本机结果为 84 passed、1 skipped（ep1k 在 600 tokens 时不支持）。覆盖范围：
   - 每类 kernel 对参考实现，用 TP8 和 EP8 shape；EP 用 rank 3、全局专家 id，tokens 取 1 / 77 / 600；
   - `a8w4_moe` 查表调用，tokens 包括不在调优点上的值；
+  - 调优表的 act key：`lookup_config` 和 `dyn_config` 分别查 silu、situv2 的行；没有 situv2 行的 shape，以及没有 act 列的旧表，退回 silu 行；
   - CUDA graph：capture 期间只选 graph-safe 配置，多次 replay 的结果与 eager 一致；
   - situv2：
     - 两个 shape 上的全部配置（tp2k / tp1k / tp1kq，ep3k 的 5 个配置，ep1k）对参考实现；
-    - 查表时 situv2 与 silu 选中同样的配置，`a8w4_moe` 端到端正确；β = 0 时抛 `ValueError`；
+    - 查表用 situv2 的行（EP shape 选中 EP 族），`a8w4_moe` 端到端正确；β = 0 时抛 `ValueError`；
     - `a8w4_moe_dyn`：s16（非 TR）和 m64（TR）两种 epilogue，bf16 / fp8 输入；
   - `w2_exp` 确实是 `w2_scale` 尾部的 view；
   - `a8w4_moe_dyn` 对参考实现：bf16 输入和 fp8 分组 scale 输入，容量 512，有效行数 0 / 1 / 37 / 300，无效行填 NaN 和随机 id；
@@ -761,7 +771,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 4. 在 `tune.candidates()` 里加入候选。
 5. 在 `tests/` 里加对参考实现的用例，然后重新调优并 merge。
 
-如果要按 situv2 调优：`tune()` 和 `run_config` 的调用需要加 `act=...`，并把 act 写进 CSV 的 key（目前 key 不含 act）。
+按某个激活调优：`tune --act <act>`，结果写成该 act 的一组行（CSV 的 act 列），命令见 [configs/README.md](configs/README.md)。
 
 ### 9.4 修改 kernel 的流程
 
@@ -882,7 +892,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
   - 重写 gemm2：用更大的 M tile，解码后的 W 经 LDS 在多个 wave 之间共用，参考 pyhip 的 Down，16K tokens 有望快约 6%；
   - 提高 gemm1 的 MFMA 利用率；
   - TP 在 8192 tokens 时排序加量化还要 75 us，换成合并的 prep 能省一半左右。
-- **按需要补**：按 situv2 重新调优；hot 路由的调优表；其他模型（例如 MiMo-V2.6-Pro TP8：H 6144、384 个专家）的调优。
+- **按需要补**：TP4 的 situv2 行；hot 路由的调优表；其他模型（例如 MiMo-V2.6-Pro TP8：H 6144、384 个专家）的调优。
 
 ## 12. 来源
 
