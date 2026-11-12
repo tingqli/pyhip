@@ -26,5 +26,12 @@ packages = [
     "pyhip.contrib.common",
     "pyhip.contrib.gluon",
     "pyhip.contrib.flydsl",
+    "pyhip.contrib.flydsl.a8w4",
+    "pyhip.contrib.flydsl.a8w4._vendor",
+    "pyhip.contrib.flydsl.a8w4.kernels",
 ]
 package-dir = {"pyhip" = "src"}
+
+[tool.setuptools.package-data]
+# the a8w4 MoE kernel-selection table (read at run time next to moe.py)
+"pyhip.contrib.flydsl.a8w4" = ["configs/*.csv", "README.md"]
