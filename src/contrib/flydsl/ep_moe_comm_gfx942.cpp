@@ -5,7 +5,8 @@
 // [3][NPES]: count row / dispatch / combine of rank s finished, each holding the call's epoch, then
 // arrived [s_cap / BLOCK_M]: routes already written into each sorted block here (added by the sources' producers).
 // Schedule workspace `sched` (local, int32): [0, 8) task tickets of the per-XCD queues, [SCHED_EXPECTED + b] routes
-// sorted block b receives, [SCHED_EXPECTED + s_cap / BLOCK_M + b] GateUp tiles finished of block b.
+// sorted block b receives, [SCHED_EXPECTED + s_cap / BLOCK_M + b] GateUp tiles finished of block b,
+// [SCHED_EXPECTED + 2 s_cap / BLOCK_M + b] set once the mega kernel transposed block b's A scales.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -112,7 +113,10 @@ __global__ void __launch_bounds__(1024) ep_prep(const int* __restrict__ topk_ids
         if (e == E_LOCAL - 1) expert_base[E_GLOBAL + d] = base + (total[tid] + BLOCK_M - 1) / BLOCK_M * BLOCK_M;
         send_base[tid] = base + sbase[tid];
     }
-    for (int b = tid; b < s_cap / BLOCK_M; b += blockDim.x) sched[SCHED_EXPECTED + s_cap / BLOCK_M + b] = 0;
+    for (int b = tid; b < s_cap / BLOCK_M; b += blockDim.x) {
+        sched[SCHED_EXPECTED + s_cap / BLOCK_M + b] = 0;
+        sched[SCHED_EXPECTED + 2 * (s_cap / BLOCK_M) + b] = 0;
+    }
     if (tid < SCHED_EXPECTED) sched[tid] = 0;
     __syncthreads();
     // Plan tables for ep_plan: totals, fewest routes from one source, expert bases, and the first block of each of

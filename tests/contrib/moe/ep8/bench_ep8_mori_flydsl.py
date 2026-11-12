@@ -172,13 +172,14 @@ class Mega:
     """pyhip EPMoEGfx942: P2P dispatch + GateUp + Down with the combine fused into its epilogue."""
 
     def __init__(self, rank, world, layer, tokens, mode="mega", producers=16, lag=2, xcd_queues=True, relaxed=True,
-                 persistent=True, queue_order="paired", tasks_per_wg=1, combine="bf16"):
+                 persistent=True, queue_order="paired", tasks_per_wg=1, combine="bf16", transpose_scales=True):
         from pyhip.contrib.flydsl.ep_moe_gfx942 import EPMoEGfx942
 
         self.L = layer
         self.op = EPMoEGfx942(rank, world, layer["w1"], layer["w1_scale"], layer["w2"], layer["w2_scale"], TOPK, tokens,
                               mode=mode, producers=producers, lag=lag, xcd_queues=xcd_queues, relaxed=relaxed,
-                              persistent=persistent, queue_order=queue_order, tasks_per_wg=tasks_per_wg, combine=combine)
+                              persistent=persistent, queue_order=queue_order, tasks_per_wg=tasks_per_wg, combine=combine,
+                              transpose_scales=transpose_scales)
         self.quant = get_hip_quant(QuantType.per_1x128)
 
     def run(self, x, ids, weights):
@@ -302,6 +303,7 @@ def main():
     parser.add_argument("--relaunch", action="store_true", help="one task per workgroup instead of persistent ones")
     parser.add_argument("--queue-order", default="paired", choices=["interleaved", "contiguous", "paired"])
     parser.add_argument("--tasks-per-wg", type=int, default=1)
+    parser.add_argument("--token-major-scales", action="store_true", help="GateUp reads recv_scale as received (no transpose)")
     parser.add_argument("--check-alt", action="store_true", help="compare against step1 on alternating inputs")
     parser.add_argument("--json", default="")
     args = parser.parse_args()
@@ -321,7 +323,7 @@ def main():
         report["baseline"], outputs["baseline"] = bench(Baseline(op, layer), rank, world, args)
     if args.mode in ("mega", "both"):
         mega = Mega(rank, world, layer, args.tokens, args.ep_mode, args.producers, args.lag, not args.one_queue, not args.strict_sync,
-                    not args.relaunch, args.queue_order, args.tasks_per_wg, args.combine)
+                    not args.relaunch, args.queue_order, args.tasks_per_wg, args.combine, not args.token_major_scales)
         if args.check_alt:
             check_alternating(mega, rank, world, args, layer)
         report["mega"], outputs["mega"] = bench(mega, rank, world, args)

@@ -60,7 +60,7 @@ def build_kernels():
 class EPMoEGfx942:
     def __init__(self, rank, world, w1, w1_scale, w2, w2_scale, topk, max_tokens, s_cap=None, dispatch_wgs=64, mode="mega",
                  producers=16, lag=2, xcd_queues=True, relaxed=True, persistent=True, queue_order="paired", tasks_per_wg=1,
-                 combine="bf16"):
+                 combine="bf16", transpose_scales=True):
         assert world == NPES and w1.shape[0] == E_LOCAL, "kernels are specialized for EP8 x 32 local experts"
         assert mode in ("mega", "step1"), mode
         assert combine in ("bf16", "fp8") and (combine == "bf16" or topk <= 8), (combine, topk)
@@ -68,6 +68,7 @@ class EPMoEGfx942:
         self.rank, self.world, self.topk = rank, world, topk
         self.mode, self.producers, self.lag, self.xcd_queues, self.relaxed = mode, producers, lag, xcd_queues, relaxed
         self.persistent, self.queue_order, self.tasks_per_wg = persistent, queue_order, tasks_per_wg
+        self.transpose_scales = transpose_scales
         self.w1, self.w1_scale, self.w2, self.w2_scale = w1, w1_scale, w2, w2_scale
         self.hidden, self.inter = w1.shape[2], w2.shape[2]
         self.token_shift = max(int(max_tokens - 1).bit_length(), 1)
@@ -114,7 +115,9 @@ class EPMoEGfx942:
         # ep_plan: one workgroup per producer wave, each sorting up to 1024 routes.
         self.slices = producers * 8
         assert self.tcap * topk <= self.slices * 1024, "too many routes per ep_plan slice"
-        self.sched = torch.zeros(SCHED_EXPECTED + 2 * (S // SORT_BLOCK_M), dtype=torch.int32, device=dev)
+        self.sched = torch.zeros(SCHED_EXPECTED + 3 * (S // SORT_BLOCK_M), dtype=torch.int32, device=dev)
+        # The mega kernel's GateUp A scales, transposed block by block from recv_scale.
+        self.recv_scale_t = torch.empty((H // 128, S), dtype=torch.float32, device=dev)
         self.a2 = torch.empty((S, I), dtype=torch.uint8, device=dev)
         self.a2_scale_t = torch.empty((I // 128, S), dtype=torch.float32, device=dev)
         self.epoch = 0
@@ -146,7 +149,7 @@ class EPMoEGfx942:
         self._mark("prep")
         if self.mode == "mega":
             ep_mega(self, x_fp8, x_scale, topk_w, self.producers, self.lag, self.xcd_queues, self.relaxed, self.persistent,
-                    self.queue_order, self.tasks_per_wg, self.trace)
+                    self.queue_order, self.tasks_per_wg, self.trace, self.transpose_scales)
             self._mark("mega")
             ep_finish([1], [64], self.rank, self.epoch, self.ws, t["ws"])
             self._mark("finish")

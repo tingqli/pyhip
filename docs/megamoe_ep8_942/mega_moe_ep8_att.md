@@ -8,7 +8,8 @@
 - **K 循环没有想象中高效。** 单独跑同样的 GateUp（128 个满 block）时 K 循环的 MFMA 效率是 93%，在 mega 里只有 73–79%；
   Down 是 83–86%（单独跑也是约 93%）。
   - GateUp 的差距主要来自 A 的 scale 布局：mega 读按 token 存的 `recv_scale`，每条 scale load 碰 16 个不同的 cache line。
-    同一个 GateUp 单独跑、只换这一个布局，K 循环从 140k 变成 164k cycle（93.0% → 79.5%）。
+    同一个 GateUp 单独跑、只换这一个布局，K 循环从 140k 变成 164k cycle（93.0% → 79.5%）。已改成每个 block 转置一次，
+    mega 里 GateUp K 循环到 91%，一层快 74–100 µs（第 4.2 节）。
   - GateUp / Down 是否在同一个 XCD 上混跑、xGMI 上有没有流量，对 K 循环几乎没有影响（lag = 8 和 local 模式下都还是约 170k）。
 - **K 循环里 MFMA 空闲的直接原因**（GateUp 每个任务约 41k cycle）：等 barrier 时最后到达的那个 wave，要么在等自己的
   global load（`vmcnt`）或者 load 发不出去（VMEM 发射口忙），约 43%；要么在等 LDS 指令完成（`lgkmcnt`），约 33%；
@@ -172,6 +173,9 @@ MFMA 本身每个 GateUp 任务 131k、每个 Down 任务 65.5k cycle。不算�
 - 风险：均匀路由下收益最大，随机路由下也有（位置 0 从第 5 个 chunk 提前到第 2 个）。要用交替输入的正确性测试回归。
 
 ### 4.2 GateUp 的 A scale（K 循环 380 µs 里的约 150 µs）
+
+**已按做法 1 实现**（[实现文档](mega_moe_ep8_impl.md)第 2.5 节，2026-11-12）：GateUp K 循环 174k → 144k cycle（MFMA 效率
+75% → 91%），tile 0 的转置每次约 5k cycle；一层快 74–100 µs（3.0%–4.4%）。下面是实现之前的分析。
 
 - 现在：K 循环每个 K block 读 8 个 M slice 的按 token 存的 scale，cache line 访问是数据的两倍。
 - 做法（任选其一）：

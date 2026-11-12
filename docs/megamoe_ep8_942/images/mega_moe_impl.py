@@ -278,7 +278,7 @@ def fig_partition():
     y = 2.6
     flow = [
         (0.5, 17.5, C["P"], "8个源rank的producer\n（每rank 16 WG × 8 wave）\n按 ep_plan 排好的顺序，每次8条路由：\n读x的FP8行+scale+权重 → P2P store"),
-        (23.5, 17.0, C["G"], "GateUp 任务 G(b, n)\n等 arrived[b] ≥ expected[b]（=256）\n256行 × 256个W1行，K=4096\nSiLU·up → FP8 + 每128列scale"),
+        (23.5, 17.0, C["G"], "GateUp 任务 G(b, n)\nN0 等 arrived[b] ≥ expected[b]，转置A scale\n其余tile等 scaled[b] ≥ 1\n256行 × 256个W1行，K=4096 → FP8 a2"),
         (46.0, 17.0, C["D"], "Down 任务 D(b, n)\n等 done[b] ≥ 16（16个GateUp tile）\n256行 × 256个hidden列，K=2048\n× 路由权重 → BF16"),
         (68.5, 13.5, "#555555", "源rank的 out[token]\n（BF16，对称堆，ep_prep前清零）"),
         (85.5, 14.0, C["prep"], "ep_finish（1 WG）\nFFLAG[s] = epoch 互发\n等齐8个 → out可用"),

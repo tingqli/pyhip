@@ -14,6 +14,8 @@ needs no co-residency. Each queue holds:
                   traffic its epilogue sends, runs under the GateUp of later blocks instead of after all of it.
 GateUp(b) waits until arrived[b] reaches the routes block b receives, writes a2 and counts done[b];
 Down(b) waits until done[b] == NG and adds its rows into the source ranks' out with BF16 atomics.
+With transpose_scales, only GateUp(b, 0) waits for arrived[b]: it copies block b's A scales into the [K/128, rows]
+layout and sets scaled[b], which the block's other GateUp tiles wait for.
 """
 
 import functools
@@ -32,7 +34,8 @@ from .helpers import atomic_add_i32, buffer_rsrc_at, fence, load_i32_atomic, run
 from .moe_down_a8w8_blockscale_gfx942_lds import down_task_emitter
 from .moe_gateup_a8w8_blockscale_gfx942_lds import OOB_OFFSET, SORT_BLOCK_M, _load_i32, _rsrc_of, _uniform, gateup_task_emitter
 
-# Must match ep_moe_comm_gfx942.cpp. ws: ... then arrived [blocks]; sched: tickets, expected [blocks], done [blocks].
+# Must match ep_moe_comm_gfx942.cpp. ws: ... then arrived [blocks]; sched: tickets, expected [blocks], done [blocks],
+# scaled [blocks].
 NPES, E_LOCAL = 8, 32
 ARRIVED = NPES * NPES * E_LOCAL + 3 * NPES
 SCHED_EXPECTED = 16
@@ -46,7 +49,7 @@ P2P_AUX = 19
 @functools.cache
 def compile_ep_mega(
     hidden_dim, inter_dim, topk, token_shift, producers=32, lag=2, gateup_layout="2x4_pf1", down_layout="4x2_pf1", xcd_queues=True,
-    relaxed=True, persistent=True, queue_order="paired", tasks_per_wg=1, trace=False, combine="bf16",
+    relaxed=True, persistent=True, queue_order="paired", tasks_per_wg=1, trace=False, combine="bf16", transpose_scales=True,
 ):
     """xcd_queues: one task queue per XCD (producers split evenly), so the tiles of a block share that XCD's L2; a
     workgroup whose queue is empty takes tasks from the next queues. lag counts units (block groups) of one queue.
@@ -59,14 +62,18 @@ def compile_ep_mega(
     the next ticket during the current task's epilogue.
     combine: "bf16" adds every route into its source rank's out with BF16 atomics; "fp8" stores it as an FP8 row
     with 1x128 scales into the source rank's comb[token, slot] (pOutTable / pOutScaleTable), summed afterwards.
+    transpose_scales: GateUp tile 0 of a block copies the block's A scales from the token-major recv_scale [rows, K/128]
+    into pRecvScaleT [K/128, rows], so that a K block's scale load of 16 rows touches one cache line instead of 16.
     trace: every task writes int32 trace[8 s: 8 s + 8] (s = queue * queue_cap + ticket) = (start, wait done, end) in
     100 MHz ticks (low 32 bits of s_memrealtime), XCC id << 24 | HW_ID bits [8, 16) | kind (1 producer, 2 GateUp,
     3 Down), the time its workgroup began taking the ticket and, for producers, when wave 0 finished its first three
     chunks; for GateUp and Down, the shader clocks (s_memtime) from wait done to the end, to the K loop's start and to
     its end instead (the effective clock under the power limit, and the prologue / K loop / epilogue split)."""
     H, I = hidden_dim, inter_dim
+    KB = H // 128
     gateup = gateup_task_emitter(
-        I, H, topk, E_LOCAL, gateup_layout, fp8_out=True, a_scale_token_major=True, store_aux=16 if relaxed else 0
+        I, H, topk, E_LOCAL, gateup_layout, fp8_out=True, a_scale_token_major=not transpose_scales,
+        store_aux=16 if relaxed else 0,
     )
     down = down_task_emitter(
         H, I, topk, E_LOCAL, down_layout, atomic=True, sorted_a2=True, remote_token_shift=token_shift,
@@ -78,6 +85,8 @@ def compile_ep_mega(
     unit = NG + ND
     topk_shift = topk.bit_length() - 1
     assert 1 << topk_shift == topk and H % 1024 == 0 and H // 128 * 4 <= 16 * 64
+    # The transpose: each thread copies half a row's scales with dwordx4 loads.
+    assert not transpose_scales or KB % 8 == 0
     scale_lanes = H // 128 * 4 // 16
     queues = 8 if xcd_queues else 1
     assert producers % queues == 0
@@ -120,6 +129,7 @@ def compile_ep_mega(
         pPeerW: fx.Pointer,
         pPeerWs: fx.Pointer,
         pTrace: fx.Pointer,
+        pRecvScaleT: fx.Pointer,
         num_routes: fx.Int32,
         num_tokens: fx.Int32,
         me: fx.Int32,
@@ -358,19 +368,57 @@ def compile_ep_mega(
 
             return start, end, marks
 
+        def transpose_block_scales(block, expected, flag):
+            """GateUp tile 0: block's A scales from recv_scale [rows, KB] into pRecvScaleT [KB, rows] (padding rows 0),
+            then flag += 1. Thread t copies row t % 256, K blocks [KB/2 (t // 256), +KB/2)."""
+            src = _rsrc_of(pRecvScale, rows_cap * (KB * 4))
+            dst = _rsrc_of(pRecvScaleT, rows_cap * (KB * 4))
+            row = tid % SORT_BLOCK_M
+            half = _uniform(tid // SORT_BLOCK_M)
+            sorted_row = block * SORT_BLOCK_M + row
+            src_offset = (row < expected).select(sorted_row * (KB * 4) + half * (KB * 2), fx.Int32(OOB_OFFSET))
+            parts = [
+                Vec(rocdl.raw_ptr_buffer_load(T.i32x4, src, (src_offset + i * 16).ir_value(), zero, zero))
+                for i in range_constexpr(KB // 8)
+            ]
+            for i in range_constexpr(KB // 2):
+                rocdl.raw_ptr_buffer_store(
+                    parts[i // 4][i % 4].ir_value(), dst, (sorted_row * 4).ir_value(),
+                    ((half * (KB // 2) + i) * rows_cap * 4).ir_value(), aux=ir.IntegerAttr.get(T.i32, 16 if relaxed else 0),
+                )
+            rocdl.s_waitcnt(vmcnt=0)
+            rocdl.s_barrier()
+            if wave == 0:
+                if const_expr(not relaxed):
+                    fence("release", "agent-one-as")
+                lane0_add(flag, 1)
+
         def gateup_task(block, tile, expert, at):
             # Only this block's routes: about two sources' worth, not the whole expert.
             expected = _uniform(_load_i32(_rsrc_of(pSched, (SCHED_EXPECTED + 2 * num_blocks) * 4), (SCHED_EXPECTED + block) * 4))
-            if wave == 0:
-                spin_wait_ge(fx.Int64(fx.ptrtoint(pWs)) + fx.Int64((ARRIVED + block) * 4), expected, "one-as", relaxed)
+            arrived = fx.Int64(fx.ptrtoint(pWs)) + fx.Int64((ARRIVED + block) * 4)
+            if const_expr(transpose_scales):
+                scaled = sched + fx.Int64((SCHED_EXPECTED + 2 * num_blocks + block) * 4)
+                if wave == 0:
+                    # scaled[b] is set after arrived[b] was complete.
+                    if tile == 0:
+                        spin_wait_ge(arrived, expected, "one-as", relaxed)
+                    else:
+                        spin_wait_ge(scaled, 1, "agent-one-as", relaxed)
+            else:
+                if wave == 0:
+                    spin_wait_ge(arrived, expected, "one-as", relaxed)
             rocdl.s_barrier()
             waited = clock()
             began = cycles()
+            if const_expr(transpose_scales):
+                if tile == 0:
+                    transpose_block_scales(block, expected, scaled)
             hook, holder = prefetch_hook()
             loop_start, hook, marks = loop_marks(hook)
             emit_gateup(
-                lds, pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, rows_cap, num_blocks, True,
-                lambda: (block, tile, expert), tid=tid, epilog_hook=hook, kloop_hook=loop_start,
+                lds, pRecvA, pW1, pA2, pA2Scale, pRecvScaleT if transpose_scales else pRecvScale, pW1Scale, pGuIds,
+                rows_cap, num_blocks, True, lambda: (block, tile, expert), tid=tid, epilog_hook=hook, kloop_hook=loop_start,
             )
             rocdl.s_waitcnt(vmcnt=0)
             rocdl.s_barrier()
@@ -442,7 +490,7 @@ def compile_ep_mega(
         kernel_pointers = (
             pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, pW2, pW2Scale, pDownIds, pRecvW, pOutTable,
             pOutScaleTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo, pPeerA,
-            pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace,
+            pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, pRecvScaleT,
         )
 
         def reload_args():
@@ -466,12 +514,12 @@ def compile_ep_mega(
         def rebind(values):
             nonlocal pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, pW2, pW2Scale, pDownIds, pRecvW
             nonlocal pOutTable, pOutScaleTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute
-            nonlocal pSendInfo, pPeerA, pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, num_routes, num_tokens, me
-            nonlocal num_blocks, tid, lane, wave, sched, rows_cap
+            nonlocal pSendInfo, pPeerA, pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, pRecvScaleT, num_routes, num_tokens
+            nonlocal me, num_blocks, tid, lane, wave, sched, rows_cap
             (
                 pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, pW2, pW2Scale, pDownIds, pRecvW, pOutTable,
                 pOutScaleTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo, pPeerA,
-                pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, num_routes, num_tokens, me, num_blocks, tid,
+                pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, pRecvScaleT, num_routes, num_tokens, me, num_blocks, tid,
             ) = values
             lane = tid % 64
             wave = _uniform(tid // 64)
@@ -528,6 +576,7 @@ def compile_ep_mega(
         pPeerW: fx.Pointer,
         pPeerWs: fx.Pointer,
         pTrace: fx.Pointer,
+        pRecvScaleT: fx.Pointer,
         num_routes: fx.Int32,
         num_tokens: fx.Int32,
         me: fx.Int32,
@@ -538,7 +587,7 @@ def compile_ep_mega(
         mega_kernel(
             pRecvA, pW1, pA2, pA2Scale, pRecvScale, pW1Scale, pGuIds, pW2, pW2Scale, pDownIds, pRecvW, pOutTable,
             pOutScaleTable, pExpertIds, pNumValid, pSched, pWs, pX, pXScale, pTopkW, pSendRoute, pSendInfo, pPeerA,
-            pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, num_routes, num_tokens, me, num_blocks,
+            pPeerScale, pPeerIds, pPeerW, pPeerWs, pTrace, pRecvScaleT, num_routes, num_tokens, me, num_blocks,
             value_attrs={"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]},
         ).launch(grid=(num_workgroups, 1, 1), block=(512, 1, 1), stream=stream)
 
@@ -557,7 +606,7 @@ def trace_entries(op, producers):
 
 
 def ep_mega(op, x_fp8, x_scale, topk_w, producers=32, lag=2, xcd_queues=True, relaxed=True, persistent=True,
-            queue_order="paired", tasks_per_wg=1, trace=None):
+            queue_order="paired", tasks_per_wg=1, trace=None, transpose_scales=True):
     """Run the mega kernel for an EPMoEGfx942 `op` whose ep_prep ran for this call.
 
     trace: optional int32 tensor of trace_entries(op, producers) entries (see compile_ep_mega).
@@ -565,7 +614,7 @@ def ep_mega(op, x_fp8, x_scale, topk_w, producers=32, lag=2, xcd_queues=True, re
     launch = compile_ep_mega(
         op.hidden, op.inter, op.topk, op.token_shift, producers, lag, xcd_queues=xcd_queues, relaxed=relaxed,
         persistent=persistent, queue_order=queue_order, tasks_per_wg=tasks_per_wg, trace=trace is not None,
-        combine=op.combine,
+        combine=op.combine, transpose_scales=transpose_scales,
     )
     grid = int(os.environ.get("MEGA_GRID", 0)) or -(-mega_grid(op, producers) // tasks_per_wg)
     if persistent:
@@ -580,7 +629,7 @@ def ep_mega(op, x_fp8, x_scale, topk_w, producers=32, lag=2, xcd_queues=True, re
         ptr(t["comb_scale" if fp8 else "out"]), ptr(op.expert_ids), ptr(op.num_valid), ptr(op.sched), ptr(op.ws),
         ptr(x_fp8), ptr(x_scale), ptr(topk_w), ptr(op.send_route), ptr(op.send_info),
         ptr(t["recv_a"]), ptr(t["recv_scale"]), ptr(t["down_ids"]), ptr(t["recv_w"]), ptr(t["ws"]),
-        ptr(op.sched if trace is None else trace),
+        ptr(op.sched if trace is None else trace), ptr(op.recv_scale_t),
         x_fp8.shape[0] * op.topk, x_fp8.shape[0], op.rank, op.s_cap // SORT_BLOCK_M, grid,
         torch.cuda.current_stream(),
     )

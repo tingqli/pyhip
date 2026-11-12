@@ -23,10 +23,12 @@
   中间不经过 host 同步。dispatch、GateUp、Down 和 combine 全部在 mega kernel 里。
 - mega kernel 是 persistent 的：304 个 WG，每个 CU 一个（64 KB LDS，512 线程）。每个 XCD 一个任务队列，WG 用原子加
   领“票”，票号决定做什么：前 2 张票是 producer（把本卡的路由 P2P 写到目标卡），其余是 GateUp 或 Down 任务。
-- 任务之间只有两种等待：GateUp(b) 等 block b 的数据到齐（`arrived[b]`，由 8 个源 rank 的 producer 累加），
-  Down(b) 等 block b 的 16 个 GateUp tile 做完（`done[b]`）。producer 不等任何东西，所以不会死锁。
+- 任务之间的等待：GateUp(b) 的 tile 0 等 block b 的数据到齐（`arrived[b]`，由 8 个源 rank 的 producer 累加），把这个 block
+  的 A scale 转置后置 `scaled[b]`，其余 15 个 tile 等 `scaled[b]`；Down(b) 等 block b 的 16 个 GateUp tile 做完（`done[b]`）。
+  任务只等更早的票或 producer，producer 不等任何东西，所以不会死锁。
 - 例子（均匀路由，BF16 combine）：一层 2336 µs，其中 mega kernel 约 2190–2220 µs。kernel 里每个 CU 的时间：
   MFMA 本身 51%，K 循环里的非 MFMA 时间 16%，启动时等数据 15%，任务的 prologue/epilogue 10.5%，其余 8%。
+  这些是 GateUp 还按 token 读 A scale 时测的；改成每个 block 转置一次以后一层快 74–100 µs（第 2.5 节）。
 - 通信约 82% 被藏住（单独跑约 1220 µs，露出约 223 µs）。prologue/epilogue 完全没有被藏住（一个 CU 同时只跑一个任务）。
   理论极限和还能拿回多少见第 8 节。
 - combine 有两种：BF16（默认，远端原子加进源 rank 的 `out`）和 FP8（每条路由一行 FP8 store 到源 rank，`ep_finish` 之后
@@ -73,7 +75,8 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 | `x_fp8` / `x_scale` | [T, 4096] FP8 / [T, 32] FP32 | 调用方 | aiter per-1x128 量化 | 本卡 token 的激活和每 128 列的 scale；producer 读来发给目标 rank |
 | `topk_ids` / `topk_w` | [T, 8] i32 / [T, 8] FP32 | 调用方 | 路由 | 每个 token 的 8 个 global expert 和路由权重；`ep_prep` / `ep_plan` 读 ids，producer 读权重 |
 | `recv_a` | [73728, 4096] FP8（302 MB） | 对称堆 | 源 rank 的 producer（P2P） | GateUp 的 A：第 r 行是本卡收到的第 r 条路由的 token 激活（行布局见第 2.1 节） |
-| `recv_scale` | [73728, 32] FP32（9.4 MB） | 对称堆 | 源 rank 的 producer | `recv_a` 每行每 128 列的 scale，按行存（和源 rank 量化时一样），GateUp 的 A scale |
+| `recv_scale` | [73728, 32] FP32（9.4 MB） | 对称堆 | 源 rank 的 producer | `recv_a` 每行每 128 列的 scale，按行存（和源 rank 量化时一样）。每个 block 的 GateUp tile 0 把它转置到 `recv_scale_t` |
+| `recv_scale_t` | [32, 73728] FP32（9.4 MB） | 本地 | GateUp(b, 0) | GateUp 的 A scale：`recv_scale` 按 block 转置成 [K/128, 行]，K 循环里一条 scale load 的 16 行在同一个 cache line（第 2.5 节） |
 | `down_ids` | [73728] i32 | 对称堆 | producer（有效行）、`ep_plan`（padding 行写 −1） | 每行的结果要加到哪里：源 rank、token、slot。Down 的 epilogue 用（第 1.3 节） |
 | `recv_w` | [73728] FP32 | 对称堆 | producer | 每行的路由权重，Down 乘到结果上再加回源 rank（第 1.3 节） |
 | `gu_ids` | [73728] i32 | 本地 | `ep_plan` | GateUp 的行表：有效行 r 写 r，padding 行写 −1。GateUp 据此读 `recv_a` 第 r 行，padding 行补 0 |
@@ -84,7 +87,7 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 | `out` | [4096, 4096] BF16（33.5 MB） | 对称堆 | 各 rank 的 Down 任务（远端原子加） | 本卡 token 的 MoE 输出；调用前清零，`forward()` 返回 `out[:T]` |
 | `comb` / `comb_scale` | [32768, 4096] FP8 / [32768, 32] FP32 | 对称堆 | 各 rank 的 Down 任务 | 只在 FP8 combine 时分配：每条路由一行 FP8 结果，`ep_combine_fp8` 按 slot 求和写进 `out` |
 | `ws` | [2072 + 288] i32 | 对称堆 | `ep_prep`、producer、`ep_finish` | 跨卡的计数矩阵、各 rank 的 flag、每个 block 的 `arrived` 计数（第 1.4 节） |
-| `sched` | [16 + 2 × 288] i32 | 本地 | `ep_prep`、`ep_plan`、mega kernel | 队列的票计数、每个 block 的 `expected` 和 `done`（第 1.5 节） |
+| `sched` | [16 + 3 × 288] i32 | 本地 | `ep_prep`、`ep_plan`、mega kernel | 队列的票计数、每个 block 的 `expected`、`done` 和 `scaled`（第 1.5 节） |
 | `route_idx` / `send_route` / `send_info` / `plan` | [32768] / [32768] / [32768] / [848] i32 | 本地 | `ep_prep` / `ep_plan` | 发送计划：每条路由发到哪一行、按什么顺序发（第 1.6 节） |
 | `status` | [8] i32 | 本地 | `ep_prep` | [1] 本卡需要的行数（检查容量），[2..4] 时间戳（trace 对齐用），[0] 只有 step1 用 |
 
@@ -128,10 +131,11 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 | [8, 16) | 保留 | — | — | `ep_prep` 清零 |
 | [16, 16 + 288) | expected[b]：block b 应收到的路由数（满 block 256，expert 的最后一个 block 可能不满） | `ep_plan` | GateUp(b, *) 读，作为 arrived[b] 的目标值 | 每次调用重写 |
 | [16 + 288, 16 + 576) | done[b]：block b 已完成的 GateUp tile 数 | GateUp(b, n) 写完 `a2` 后设备范围原子加 1 | Down(b, *) 等到 ≥ 16 | `ep_prep` 清零 |
+| [16 + 576, 16 + 864) | scaled[b]：block b 的 A scale 已经转置到 `recv_scale_t` | GateUp(b, 0) 转置写完后设备范围原子加 1 | GateUp(b, 1..15) 等到 ≥ 1 | `ep_prep` 清零 |
 
 - 票号 ≥ 514（队列里的任务数）表示队列已空。计数会超过 514（预领和偷票都会多加），不影响正确性。
-- done 只在本卡用，放在本地的 `sched`；arrived 要被别的 rank 加，所以放在对称堆的 `ws` 里。
-- 288 = s_cap / 256 是按容量分配的，只有前 `num_valid / 256` 个 block 的 expected / done 有意义。
+- done、scaled 只在本卡用，放在本地的 `sched`；arrived 要被别的 rank 加，所以放在对称堆的 `ws` 里。
+- 288 = s_cap / 256 是按容量分配的，只有前 `num_valid / 256` 个 block 的 expected / done / scaled 有意义。
 - 同步语义（用哪种范围的原子、等到之后失效哪一级缓存）见第 5 节。
 
 ### 1.6 发送计划：`route_idx`、`plan`、`send_route`、`send_info`
@@ -172,7 +176,7 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 
 | 项 | 内容 |
 |---|---|
-| 输入行 | `recv_a` 的 block b：256 行 × 4096 B（FP8），scale 是 `recv_scale[256b .. 256b+255][k]` |
+| 输入行 | `recv_a` 的 block b：256 行 × 4096 B（FP8），scale 是 `recv_scale_t[k][256b .. 256b+255]`（tile 0 先从 `recv_scale` 转置过来） |
 | 权重 | W1[e] 的 gate 行 n·128 .. n·128+127 和 up 行 2048 + n·128 .. +127，共 256 行，K = H = 4096（32 个 K block） |
 | tile | 256 行 × 256 个权重行（输出 128 列），2x4 wave（2 个沿 M，4 个沿 N），每个 wave 128 VGPR 累加器 |
 | 计算 | FP8 MFMA 16x16x32，块缩放用 FP32 累加；SiLU(gate)·up；每行每 128 列一个 FP8 scale |
@@ -185,7 +189,7 @@ GateUp 的输出留在本卡：同一个 block 的 Down 任务也在本卡（同
 K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独跑的 BM256 GateUp 一样，见
 [moe_gateup_a8w8_blockscale_gfx942.md](../moe_942_ep8/moe_gateup_a8w8_blockscale_gfx942.md)（带图的版本是
 `luwei/942-fp8-blockwise` 分支上的 `docs/design_moe_a8w8_blockscale_gfx942.md` 第 3 节）。mega 里的区别：A 的 scale
-读 `recv_scale`（每行 32 个 FP32，按行存），不是转置的 `[K/128, T]`。
+由源 rank 按行写进 `recv_scale`，每个 block 的 tile 0 先把它转置到 `recv_scale_t`（第 2.5 节）。
 
 ### 2.3 Down 任务 D(b, n)
 
@@ -210,6 +214,31 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 - `G e0_blk1_N3`：expert 0 的第 1 个 block（rank 上的 block 1，行 256–511），W1 的 gate/up 第 3 个 128 列 tile。
 - `D e5_blk2_N15`：expert 5 的第 2 个 block（block 22），hidden 列 3840–4095。
 - 均匀路由下 block b = 4e + blk；一般情况下用 `expert_ids[b]` 查 expert。
+
+### 2.5 GateUp 的 A scale：每个 block 转置一次
+
+- **为什么**：源 rank 把每条路由的 32 个 scale 连续写进 `recv_scale` 的一行。GateUp 的 K 循环每个 K block 要读
+  256 行各一个 scale，按 token 存时一条 load 的 16 行落在 16 个 cache line 上，每个 CU 每个 K block 约 1024 次 cache line
+  访问，比 A、B 数据本身还多一倍（[ATT 文档](mega_moe_ep8_att.md)第 3.3 节）。单独的 MoE 算子读的是转置过的 scale。
+- **做法**：block b 的 tile 0 等到 `arrived[b]` 之后，先把这个 block 的 256 × 32 个 scale 转置写到本卡的
+  `recv_scale_t[k][256b + r]`（padding 行写 0，sc1 写穿透），`s_waitcnt vmcnt(0)` + barrier 之后 `scaled[b] += 1`。
+  线程 t 负责第 t % 256 行的一半 K block：4 条 dwordx4 load，16 条 dword store。
+- 其余 15 个 tile 不再等 `arrived[b]`，改等 `scaled[b] ≥ 1`（置位时数据已经到齐）。tile 0 的票号更小，不会死锁（第 3.5 节）。
+- 所有 tile 的 K 循环按转置布局读 scale，一条 load 只碰 1 个 cache line，和单独的 MoE 算子一样。
+- **效果**（2026-11-12，均匀路由，BF16 combine，trace）：GateUp K 循环 174k → 144k cycle（MFMA 效率 75% → 91%），
+  tile 0 的转置每次约 5k cycle。一层的时间（两种版本按 ABBA 各跑 300 次，最慢 rank 的中位数）：
+
+| 配置 | 按 token 读 | 每个 block 转置 | 变化 |
+|---|---|---|---|
+| 均匀路由，BF16 combine | 2341 µs | 2250 µs | −91 µs（−3.9%） |
+| 均匀路由，FP8 combine | 2287 µs | 2186 µs | −100 µs（−4.4%） |
+| 随机路由，BF16 combine | 2478 µs | 2404 µs | −74 µs（−3.0%） |
+
+- 正确性：FP8 combine 下和 step1 路径（单独的 GateUp kernel）交替输入逐位相同；BF16 combine 下 calc_diff 1.2e-5（原子加顺序）。
+- 省下的 K 循环时间没有全部变成一层的时间：GateUp 变快以后，启动段等 dispatch 数据更久（GateUp 平均等待 44 → 63 µs，
+  稳定段只多 0.4 µs），producer 也慢了（约 480 → 615 µs），时钟也低了一些（GateUp 约 1090 → 1030 MHz）。
+  dispatch 的发送顺序（第 8.4 节第 2 项）因此更重要了。
+- bench / trace 加 `--token-major-scales` 回到按 token 读，用来做 A/B。
 
 ## 3. GPU0 的 304 个 CU 怎么分工
 
@@ -276,9 +305,10 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 
 ### 3.5 为什么不会死锁
 
-- GateUp 等的是 producer 写的数据，producer 一定会写完。
-- Down(b) 等的是 GateUp(b, *)，它们的票号都更小（同一队列里 GateUp(g) 的票都在 Down(g) 之前），已经在某个正在运行
-  的 WG 手里；持票的 WG 要么在跑这个任务，要么在 epilogue（不再等待），跑完就做它。
+- GateUp(b, 0) 等的是 producer 写的数据，producer 一定会写完。
+- GateUp(b, 1..15) 等 GateUp(b, 0) 置 `scaled[b]`；tile 0 在队列里排在同一个 block 的其他 tile 前面，票号更小。
+- Down(b) 等的是 GateUp(b, *)，它们的票号都更小（同一队列里 GateUp(g) 的票都在 Down(g) 之前）。
+- 更小的票已经在某个正在运行的 WG 手里；持票的 WG 要么在跑这个任务，要么在 epilogue（不再等待），跑完就做它。
 - grid 不超过 CU 数，WG 都常驻。前提是同一时间没有别的进程占着这块 GPU。
 
 ## 4. 术语表
@@ -308,6 +338,7 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 | expected[b] | block b 应收到的路由数（满 block 为 256），`ep_plan` 写 |
 | arrived[b] | block b 已经写到的路由数，8 个源 rank 的 producer 原子加 |
 | done[b] | block b 做完的 GateUp tile 数，到 16 后 Down(b) 才能开始 |
+| scaled[b] | block b 的 A scale 已由 GateUp(b, 0) 转置到 `recv_scale_t`，GateUp(b, 1..15) 等它 |
 | epoch | host 每次调用加 1；跨卡 flag 存 epoch，比较相等，不用清零 |
 | G0 / G1 | 一个任务里 wave 0–3 / 4–7；K 循环中两组错开一个 barrier |
 | relaxed | 默认的同步方式：GateUp 写 `a2` 用 sc1 写穿透，等待之后只 invalidate L1（`buffer_inv sc0`） |
@@ -321,10 +352,11 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 |---|---|---|---|---|---|---|
 | `ws.C[s][g]` | 源 rank s 发给 global expert g 的路由数 | 每次覆盖 | rank s 的 `ep_prep`：对 8 个 rank 的 `ws` 做 relaxed 系统范围 store | 不直接等，由 CFLAG 保护 | — | 每个 rank 读全矩阵算行号和 block 表 |
 | `ws.CFLAG[s]` | rank s 的计数行已经写到我这里 | 不清零，存 epoch | rank s 的 `ep_prep`：`__threadfence_system` 后系统范围 release store | 每个 rank 的 `ep_prep`（1 个 WG，8 个线程各等一个 s） | == epoch（8 个都到） | 也给 `out` 清零加了顺序：`ep_prep` 的系统 fence 把清零写回显存，别的 rank 看到 CFLAG 之后才可能往 `out` 加 |
-| `ws.arrived[b]` | 本卡 block b 已写到的路由数 | 本卡 `ep_prep` 写 0，在发 CFLAG 之前 | 8 个源 rank 的 producer：一个 chunk 的 P2P store `s_waitcnt vmcnt(0)` 之后，每条路由一次系统范围原子加 1 | 本卡 GateUp(b, *) 的 wave 0：系统范围 load 自旋（`s_sleep 2`），等到后 `buffer_inv sc0`，WG barrier | ≥ `expected[b]`（满 block 为 256） | 源 rank 要先等齐 8 个 CFLAG 才会启动 mega kernel，所以不会加在清零之前 |
+| `ws.arrived[b]` | 本卡 block b 已写到的路由数 | 本卡 `ep_prep` 写 0，在发 CFLAG 之前 | 8 个源 rank 的 producer：一个 chunk 的 P2P store `s_waitcnt vmcnt(0)` 之后，每条路由一次系统范围原子加 1 | 本卡 GateUp(b, 0) 的 wave 0：系统范围 load 自旋（`s_sleep 2`），等到后 `buffer_inv sc0`，WG barrier | ≥ `expected[b]`（满 block 为 256） | 源 rank 要先等齐 8 个 CFLAG 才会启动 mega kernel，所以不会加在清零之前 |
 | `sched.ticket[q]` | 队列 q 的下一张票 | `ep_prep` 写 0 | 任何 WG 的 wave 0 lane 0：设备范围原子加 1（领票和预领） | 没人等；领票前用普通 load 看哪些队列还有票 | < 514 才有效 | 每个 XCD 一个计数，避免全卡一个热点 |
 | `sched.expected[b]` | block b 应收的路由数 | `ep_plan` 写 | `ep_plan`（普通 store） | GateUp 任务读（不等） | — | 只等自己这个 block，不等整个 expert |
 | `sched.done[b]` | block b 已完成的 GateUp tile 数 | `ep_prep` 写 0 | GateUp(b, n) 的 wave 0 lane 0：`a2` 写穿透、`s_waitcnt vmcnt(0)`、barrier 之后，设备范围原子加 1 | 本卡 Down(b, *) 的 wave 0：设备范围 load 自旋，等到后 `buffer_inv sc0`，WG barrier | ≥ 16（NG） | 数据都在本卡显存，本卡 L2 对本卡显存靠 probe 保持一致，所以只需失效 L1 |
+| `sched.scaled[b]` | block b 的 A scale 已转置到 `recv_scale_t` | `ep_prep` 写 0 | GateUp(b, 0) 的 wave 0 lane 0：转置写穿透、`s_waitcnt vmcnt(0)`、barrier 之后，设备范围原子加 1 | 本卡 GateUp(b, 1..15) 的 wave 0：设备范围 load 自旋，等到后 `buffer_inv sc0`，WG barrier | ≥ 1 | tile 0 置位前已经等到 `arrived[b]`，所以其余 tile 不用再等 `arrived` |
 | `ws.FFLAG[s]` | rank s 的 mega kernel 已结束（它往各卡 `out` 的原子加都完成了） | 不清零，存 epoch | rank s 的 `ep_finish`：`__threadfence_system` 后对 8 个 rank 系统范围 release store | 每个 rank 的 `ep_finish`（8 个线程） | == epoch（8 个都到） | 之后 `out` 可以用 |
 | LDS 票号 | WG 内广播 (队列, 票号) | — | wave 0 写 LDS | 全部 wave | barrier | 前后各一个 barrier，避免和任务的 LDS 冲突 |
 | `ws.DFLAG[s]`、`status[0]` | step1 的 dispatch 完成标志、完成的 WG 数 | | `ep_dispatch` | `ep_dispatch` 的最后一个 WG | | mega 路径不用 |
@@ -364,7 +396,7 @@ for peer p, expert g: ws_p.C[me][g] = hist[g]             # relaxed 系统 store
 threadfence_system;  for p: ws_p.CFLAG[me] = epoch (release)
 wait ws.CFLAG[0..7] == epoch
 total[g] = Σ_s C[s][g];  fewest[g] = min_s C[s][g];  expert_base[g] = 目标 rank 上的起始行（256 对齐）
-sched.ticket[0..16) = 0;  sched.done[] = 0;  num_valid = 本卡行数;  plan 表（队列起点等）
+sched.ticket[0..16) = 0;  sched.done[] = 0;  sched.scaled[] = 0;  num_valid = 本卡行数;  plan 表（队列起点等）
 ```
 
 ### 6.3 `ep_plan`（128 个 WG，每个 producer wave 一个 slice）
@@ -388,9 +420,13 @@ while ticket >= 0:
         kind, block, tile = decode(queue, ticket)            # 第 3.2 节
         if kind == G:
             expected = sched.expected[block]
-            wave 0: spin until ws.arrived[block] >= expected; buffer_inv sc0
+            if tile == 0: wave 0: spin until ws.arrived[block] >= expected; buffer_inv sc0
+            else:         wave 0: spin until sched.scaled[block] >= 1; buffer_inv sc0
             barrier
-            gateup_tile(block, tile)                         # K 循环结束时 wave 0 预领下一张票 -> next
+            if tile == 0:                                    # 第 2.5 节
+                recv_scale_t[k][256·block + r] = recv_scale[256·block + r][k]   # padding 行写 0，sc1
+                s_waitcnt vmcnt(0); barrier; wave 0 lane 0: atomic_add(sched.scaled[block], 1)
+            gateup_tile(block, tile)                         # A scale 读 recv_scale_t；K 循环结束时预领下一张票 -> next
             s_waitcnt vmcnt(0); barrier; wave 0 lane 0: atomic_add(sched.done[block], 1)
         else:
             wave 0: spin until sched.done[block] >= 16; buffer_inv sc0
@@ -500,6 +536,7 @@ rank 0 一次调用的 trace，304 个 CU 的平均（kernel span 2336 µs）：
 
 1. **K 循环效率（380 µs）**：GateUp 的 K 循环在 mega 里只有 73% 的 MFMA 效率，单独跑同样的 GateUp（A scale 转置存）是 93%。
    ATT 显示差距主要来自按 token 存的 A scale（每次读 16 个不同的 cache line）。做到 93% 可省约 290 µs 的 CU 时间。
+   **已实现**（第 2.5 节）：K 循环的 MFMA 效率到 91%，一层快 74–100 µs。
 2. **启动时等数据（345 µs）**：第一批 block 的数据要等每个 producer wave 发完自己 slice 里排在前面的约 8 个 chunk，
    而且同一个 WG 里的 wave 快慢不一。dispatch 总时间受 xGMI 带宽限制（producer 加到 32 个反而更慢），要改的是先发什么：
    全局按 key 排序后轮流分给各 wave（模拟：第一个 block 在第 2 个 chunk 后就到齐），估计能省一半以上。
@@ -649,15 +686,20 @@ for c in bf16 fp8 fp8 bf16; do
   torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mode mega --routing balanced --combine $c --iters 300 --warmup 20
 done
 torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py --routing balanced --combine fp8
+# A scale 的 A/B（第 2.5 节）：加 --token-major-scales 是按 token 读的旧路径
+torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mode mega --routing balanced --iters 300 --warmup 20 --token-major-scales
 ```
 
-第 1–8 节的数据（2026-11-11，8×MI300X，GPU 测前测后都空闲）：
+第 1–8 节的数据（2026-11-11，8×MI300X，GPU 测前测后都空闲，GateUp 当时还按 token 读 A scale）：
 
 - bench：一层 2336 µs（quant 20，prep 54，mega kernel 2187–2219，finish 29–68），交替输入和 step1 比 calc_diff 1.15e-5。
 - profile（100 次 × 4 轮，取最快的一轮）：p2p 2338，local-dispatch 2220，local-combine 2175，local 2115 µs。
 - trace（rank 0）：span 2336 µs；GateUp 平均跑 180 µs、等 51 µs；Down 平均跑 89 µs、等 1.9 µs；CU 忙碌比例 0.94。
-- MORI 基线在这台机器的 aiter 上跑不了（缺 FlyDSL hook）。之前同样参数的对比：随机路由 BF16 combine 基线 3534 µs、
+- MORI 基线需要 aiter 的 FlyDSL hook，这台机器的 aiter 没有；bench 这时直接调用 hook 会调的函数（`moe_sorting(256)` +
+  `fused_moe_a8w8_blockscale_gfx942`）。之前同样参数的对比：随机路由 BF16 combine 基线 3534 µs、
   mega 2449 µs；均匀路由 FP8 combine 基线 3288 µs、mega 2236 µs。
 
-第 9 节的数据：2026-11-12，同一台机器，GPU 测前测后都空闲。bench 和 profile 的数字见第 9.2 节；路由统计用 bench 的
-`make_routes`（seed 0，8 个 rank）在 CPU 上算。
+第 9 节的数据：2026-11-12，同一台机器，GPU 测前测后都空闲，也是按 token 读 A scale 时测的。bench 和 profile 的数字见第 9.2 节；
+路由统计用 bench 的 `make_routes`（seed 0，8 个 rank）在 CPU 上算。
+
+第 2.5 节的数据：2026-11-12，同一台机器，每次运行前后 GPU 都空闲；ABBA 日志和 trace 在 `/tmp/scale_t`（没有放进仓库）。
