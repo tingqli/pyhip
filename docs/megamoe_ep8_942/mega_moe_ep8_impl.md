@@ -4,7 +4,8 @@
 代码按什么顺序执行，以及这个 kernel 离理论极限还有多远。设计的来龙去脉和历次实测见
 [mega_moe_ep8_design.md](mega_moe_ep8_design.md)（2026-11-12 这一轮被采纳的优化记录在它的第 8 节），FP8 combine 和 token 扫描见
 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)，ATT 分析和后续优化方向见
-[mega_moe_ep8_att.md](mega_moe_ep8_att.md)。本文与代码不一致时以代码为准。
+[mega_moe_ep8_att.md](mega_moe_ep8_att.md)，`ep_prep` / `ep_plan` 的步骤、泳道图和实测分段见
+[ep_prep_plan.md](ep_prep_plan.md)。本文与代码不一致时以代码为准。
 
 | 文件 | 内容 |
 |---|---|
@@ -410,6 +411,8 @@ for 本卡路由的每个 (expert g, 目标 block):  key_hist[key] += 本卡发�
 plan.key_base[k] = Σ_{k'<k} key_hist[k'];  plan.key_cursor[] = 0
 ```
 
+每一步的细节、计数交换为什么是对的、实测分段（均匀路由 41.4 µs）见 [ep_prep_plan.md](ep_prep_plan.md) 第 3 节。
+
 ### 6.3 `ep_plan`（128 个 WG，每个 WG 一段路由）
 
 ```text
@@ -421,6 +424,8 @@ for key k:  start[k] = plan.key_base[k] + atomicAdd(plan.key_cursor[k], key_coun
 send_route[start[key] + rank_in_wg] = r;  send_info[...] = info
 for 本卡 block b（各 WG 分摊）: expert_ids[b], expected[b] = 行数, gu_ids[256b + t] = 行号或 −1, padding 行 down_ids = −1
 ```
+
+发送顺序的例子和实测（9.6 µs）见 [ep_prep_plan.md](ep_prep_plan.md) 第 4 节。
 
 ### 6.4 mega kernel（每个 WG）
 
