@@ -29,6 +29,8 @@ KERNELS = (("dynamic_per_group_scaled_quant", "quant"), ("FillFunctor", "fill"),
            ("ep_plan", "ep_plan"), ("mega_kernel", "mega"))
 PHASES = ("entry", "route_idx", "counts", "exchange", "tables", "exit")
 PLAN_KEY_BASE = 3 * 256 + 8 + 8 * 9
+# send_info = destination row | global expert << ROW_BITS (ep_moe_comm_gfx942.cpp).
+ROW_BITS = 19
 DARK = "#333333"
 COL = dict(quant="#9E9E9E", fill="#C9C9C9", plan="#F5A623", mega="#4C9BE8")
 PREP_PARTS = (("编号 route_idx", "#2E7D32"), ("写计数 + fence", "#66BB6A"), ("发 CFLAG、等齐 8 个", "#E0E0E0"),
@@ -98,7 +100,7 @@ def send_list(path):
     per_wg = {}
     for wg, n in runs:
         per_wg[wg] = per_wg.get(wg, 0) + n
-    dest = ((info[:8] >> 17) >> 5).tolist()
+    dest = ((info[:8] >> ROW_BITS) >> 5).tolist()
     return dict(sizes=sizes, key0_runs=runs, key0_wgs=[len(per_wg), min(per_wg.values()), max(per_wg.values())],
                 chunk0=dict(tokens=(route[:8] >> 3).tolist(), dest=dest), blocks=d["num_valid"] // 256,
                 qstart=d["plan"][3 * 256 + 8:3 * 256 + 8 + 9].tolist())
@@ -115,8 +117,8 @@ def token_trace(path, token):
     rows = []
     for r in range(token * 8, token * 8 + 8):
         p = where[r]
-        rows.append(dict(route=r, expert=int(d["ids"].view(-1)[r]), idx=int(d["route_idx"][r]), dest=info[p] >> 22,
-                         row=info[p] & ((1 << 17) - 1), pos=p, key=max(k for k in range(64) if base[k] <= p)))
+        rows.append(dict(route=r, expert=int(d["ids"].view(-1)[r]), idx=int(d["route_idx"][r]), dest=info[p] >> (ROW_BITS + 5),
+                         row=info[p] & ((1 << ROW_BITS) - 1), pos=p, key=max(k for k in range(64) if base[k] <= p)))
     return rows
 
 
@@ -232,7 +234,7 @@ def check_model(directory):
             base, routes = m.key_base(me) + [len(m.ids[me])], m.routes(me)
             for p, (r, info) in enumerate(zip(d["send_route"].tolist(), d["send_info"].tolist())):
                 _, g, row, k = routes[r]
-                assert info == (row | g << 17 if row < m.s_cap else -1) and base[k] <= p < base[k + 1], (me, p)
+                assert info == (row | g << ROW_BITS if row < m.s_cap else -1) and base[k] <= p < base[k + 1], (me, p)
             blocks = m.blocks(me)
             assert d["expert_ids"][:len(blocks)].tolist() == [e for e, _ in blocks]
             assert d["sched"][16:16 + len(blocks)].tolist() == [n for _, n in blocks]
@@ -359,7 +361,7 @@ def fig_plan_flow():
     lane(ax, 13.0, 29.5, "rank r：\nmega\nkernel", "#EEF4FB")
     steps = [
         (9.5, 10.4, "⑪ plan 表 → LDS\n（976 个 int：\ntotal、fewest、\nbase、qstart、\nkey_base）", "#FFE0A3"),
-        (19.9, 17.6, "⑫ 每个线程 1–4 条路由 r：\ng = topk_ids[r]\nrow = mega_row(g, route_idx[r])\ninfo = row | g << 17\n（超出 s_cap 为 −1）\nkey = row 所在 block 在\n目标队列里的位置", "#F5A623"),
+        (19.9, 17.6, f"⑫ 每个线程 1–4 条路由 r：\ng = topk_ids[r]\nrow = mega_row(g, route_idx[r])\ninfo = row | g << {ROW_BITS}\n（超出 s_cap 为 −1）\nkey = row 所在 block 在\n目标队列里的位置", "#F5A623"),
         (37.5, 9.6, "⑬ rank_in_wg =\natomicAdd(\nkey_count[key])\n（LDS）", "#F5A623"),
         (47.1, 13.6, "⑭ 每个有路由的 key k：\nstart[k] = key_base[k]\n+ atomicAdd(\nkey_cursor[k],\nkey_count[k])\n（全局原子加，\n占一段位置）", orange),
         (60.7, 12.0, "⑮ at = start[key]\n+ rank_in_wg\nsend_route[at] = r\nsend_info[at] = info", orange),

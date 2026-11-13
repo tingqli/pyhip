@@ -34,8 +34,8 @@ constexpr int PLAN_QSTART = 3 * E_GLOBAL + NPES;
 constexpr int PLAN_KEY_BASE = PLAN_QSTART + NPES * 9;
 constexpr int PLAN_KEY_CURSOR = PLAN_KEY_BASE + MAX_KEYS;
 constexpr int PLAN_INTS = PLAN_KEY_CURSOR + MAX_KEYS;
-// send_info: destination row in bits [0, 17), global expert above.
-constexpr int ROW_BITS = 17;
+// send_info: destination row in bits [0, 19), global expert above.
+constexpr int ROW_BITS = 19;
 
 __device__ inline void store_release_sys(int* p, int v) { __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM); }
 __device__ inline int load_acquire_sys(int* p) { return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM); }

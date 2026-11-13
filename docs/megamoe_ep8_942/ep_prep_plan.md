@@ -249,7 +249,7 @@ T = 4096 时 s_cap = 2 × 4096 × 8 + 32 × 256 = 73728（288 个 block）。`pl
 1. ⑪ 976 个 int 的 `plan` 读进 LDS（`tab`），`key_count[64]` 清零。
 2. ⑫ WG j 处理本卡路由 [per·j, per·j + per)，per = ⌈路由数 / 128⌉（32768 条时 256，每个线程 1 条；最多 1024，
    `forward()` 里有 assert）。每条路由：g = `topk_ids[r]`；row = `mega_row(g, route_idx[r], me)`（慢路径直接读显存里的
-   `ws.C`）；info = row | g << 17，row ≥ s_cap 时是 −1（这条路由丢掉）；key = `route_key(g, row)`。
+   `ws.C`）；info = row | g << 19，row ≥ s_cap 时是 −1（这条路由丢掉）；key = `route_key(g, row)`。
 3. ⑬ rank = `atomicAdd(&key_count[key], 1)`（LDS）：这条路由在本 WG 这个 key 里的序号。
 4. ⑭ 线程 k（k < 64）：本 WG 在 key k 有 n > 0 条，就对全局的 `key_cursor[k]` 原子加 n；返回值加上 `key_base[k]` 是本 WG
    在 key k 里那一段的起点。

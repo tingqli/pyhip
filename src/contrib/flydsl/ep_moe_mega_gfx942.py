@@ -39,7 +39,7 @@ from .moe_gateup_a8w8_blockscale_gfx942_lds import OOB_OFFSET, SORT_BLOCK_M, _lo
 NPES, E_LOCAL = 8, 32
 ARRIVED = NPES * NPES * E_LOCAL + 3 * NPES
 SCHED_EXPECTED = 16
-ROW_BITS = 17
+ROW_BITS = 19
 # Routes per producer wave between two signals.
 CHUNK = 8
 # sc0 nt sc1: written through to the destination, so a vmcnt wait covers visibility before the signal.
@@ -70,6 +70,9 @@ def compile_ep_mega(
     chunks; for GateUp and Down, the shader clocks (s_memtime) from wait done to the end, to the K loop's start and to
     its end instead (the effective clock under the power limit, and the prologue / K loop / epilogue split)."""
     H, I = hidden_dim, inter_dim
+    # A closure value: FlyDSL's cache key holds closure scalars but not the module globals that nested functions read,
+    # so with ROW_BITS itself a changed width would reuse a cached kernel built with the old one.
+    row_bits = ROW_BITS
     KB = H // 128
     gateup = gateup_task_emitter(
         I, H, topk, E_LOCAL, gateup_layout, fp8_out=True, a_scale_token_major=not transpose_scales,
@@ -320,8 +323,8 @@ def compile_ep_mega(
                     weight = _load_i32(w_rsrc, ok.select(route * 4, oob))
                     pending.append((route, lane_value(infos, j), ok, token, data, scales, weight))
                 for route, info, ok, token, data, scales, weight in pending:
-                    row = info & ((1 << ROW_BITS) - 1)
-                    dest = ok.select(info >> (ROW_BITS + 5), fx.Int32(0))
+                    row = info & ((1 << row_bits) - 1)
+                    dest = ok.select(info >> (row_bits + 5), fx.Int32(0))
                     a_dst = peer_rsrc(0, dest, rows_cap * H)
                     for part in range_constexpr(H // 1024):
                         rocdl.raw_ptr_buffer_store(
@@ -336,10 +339,10 @@ def compile_ep_mega(
                     rocdl.raw_ptr_buffer_store(down_id.ir_value(), peer_rsrc(2, dest, rows_cap * 4), row_off, zero, aux=aux)
                     rocdl.raw_ptr_buffer_store(weight.ir_value(), peer_rsrc(3, dest, rows_cap * 4), row_off, zero, aux=aux)
                 rocdl.s_waitcnt(vmcnt=0)
-                expert = infos >> ROW_BITS
+                expert = infos >> row_bits
                 source = ((expert >> 5) & (NPES - 1)) * 4
                 ws_lo, ws_hi = [fx.Uint32(rocdl.ds_bpermute(T.i32, source.ir_value(), half.ir_value())) for half in bases[4]]
-                block_of_row = (infos & ((1 << ROW_BITS) - 1)) // SORT_BLOCK_M
+                block_of_row = (infos & ((1 << row_bits) - 1)) // SORT_BLOCK_M
                 arrived = fx.Int64((fx.Uint64(ws_hi) << 32) | fx.Uint64(ws_lo)) + fx.Int64((ARRIVED + block_of_row) * 4)
                 if send:
                     atomic_add_i32(arrived, 1, "one-as")

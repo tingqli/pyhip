@@ -20,7 +20,7 @@ from mori.shmem import mori_shmem_create_tensor
 
 import pyhip
 
-from .ep_moe_mega_gfx942 import ARRIVED, SCHED_EXPECTED, ep_mega
+from .ep_moe_mega_gfx942 import ARRIVED, ROW_BITS, SCHED_EXPECTED, ep_mega
 from .moe_down_a8w8_blockscale_gfx942_lds import moe_down_remote_a8w8_blockscale_gfx942_lds
 from .moe_gateup_a8w8_blockscale_gfx942_lds import SORT_BLOCK_M, moe_gateup_a8w8_blockscale_gfx942_lds
 
@@ -73,9 +73,10 @@ class EPMoEGfx942:
         self.hidden, self.inter = w1.shape[2], w2.shape[2]
         self.token_shift = max(int(max_tokens - 1).bit_length(), 1)
         self.tcap = 1 << self.token_shift
-        # Rows this rank can receive: twice the average route count, plus one partial block per expert.
-        self.s_cap = s_cap or (2 * self.tcap * topk + E_LOCAL * SORT_BLOCK_M)
-        assert self.s_cap % SORT_BLOCK_M == 0
+        # Rows this rank can receive: twice the average route count, plus one partial block per expert, at most what
+        # send_info's row field holds (more rows than that are dropped like any row past s_cap).
+        self.s_cap = s_cap or min(2 * self.tcap * topk + E_LOCAL * SORT_BLOCK_M, 1 << ROW_BITS)
+        assert self.s_cap % SORT_BLOCK_M == 0 and self.s_cap <= 1 << ROW_BITS, self.s_cap
         self.dispatch_wgs = dispatch_wgs
         dev = torch.device("cuda", torch.cuda.current_device())
         H, I, S = self.hidden, self.inter, self.s_cap

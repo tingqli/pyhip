@@ -150,7 +150,8 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 - `send_route[k]` / `send_info[k]`（`ep_plan`）：producer 的发送顺序，整个数组按 key 排好（同一个 key 里的顺序每次调用
   可能不同）。每 8 项是一个 chunk，producer WG p 发第 p、p + 16、p + 32……个 chunk（第 3.4 节）：
   - `send_route[k]` = 路由号 r（token = r >> 3，slot = r & 7）；
-  - `send_info[k]` = 目标行 | global expert << 17（目标 rank = expert >> 5）；超出 `s_cap` 时为 −1，这条路由不发。
+  - `send_info[k]` = 目标行 | global expert << 19（目标 rank = expert >> 5）；超出 `s_cap` 时为 −1，这条路由不发。行号占
+    19 位，所以 `s_cap` ≤ 2^19。
 - `send_base`（[256]）只给 step1 的 `ep_dispatch` 用：每个源的路由在 expert 里连续排，不交错。
 
 ## 2. 数据放在哪里，任务的 tile
@@ -418,7 +419,7 @@ plan.key_base[k] = Σ_{k'<k} key_hist[k'];  plan.key_cursor[] = 0
 ```text
 slice j = 本卡路由 [per·j, per·j + per)，per = ⌈路由数 / 128⌉ ≤ 1024
 for 每条路由 r:  g = topk_ids[r];  row = mega_row(g, route_idx[r])        # base[g] + 8·idx + me（用完的源往前压紧）
-                 info = row | g << 17（超出 s_cap 为 −1）;  key = row 所在 block 在目标队列里的位置
+                 info = row | g << 19（超出 s_cap 为 −1）;  key = row 所在 block 在目标队列里的位置
                  rank_in_wg = atomicAdd(key_count[key], 1)                  # LDS
 for key k:  start[k] = plan.key_base[k] + atomicAdd(plan.key_cursor[k], key_count[k])   # 每个 WG 在 key 的区间里占一段
 send_route[start[key] + rank_in_wg] = r;  send_info[...] = info
