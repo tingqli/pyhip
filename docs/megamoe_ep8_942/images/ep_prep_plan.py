@@ -33,6 +33,11 @@ DARK = "#333333"
 COL = dict(quant="#9E9E9E", fill="#C9C9C9", plan="#F5A623", mega="#4C9BE8")
 PREP_PARTS = (("编号 route_idx", "#2E7D32"), ("写计数 + fence", "#66BB6A"), ("发 CFLAG、等齐 8 个", "#E0E0E0"),
               ("读计数、建表", "#8E24AA"), ("key 直方图", "#CE93D8"))
+# Section 5.1's example: 2 ranks x 2 local experts, top-2, 6 tokens per rank, blocks of 4 rows, 2 queues per rank; ep_plan
+# with 2 workgroups (workgroup 1's atomic on key 0 lands first), 2 producers sending chunks of 2 routes.
+EXAMPLE = dict(ids=[[0, 2, 1, 0, 3, 0, 2, 1, 0, 3, 2, 3], [1, 3, 0, 1, 2, 1, 3, 2, 1, 0, 3, 1]], npes=2, e_local=2,
+               block_m=4, queues=2, s_cap=64)
+EXAMPLE_FIRST = {0: [1, 0]}
 
 
 # ----------------------------------------------------------------------------------------------- data
@@ -99,16 +104,141 @@ def send_list(path):
                 qstart=d["plan"][3 * 256 + 8:3 * 256 + 8 + 9].tolist())
 
 
+def token_trace(path, token):
+    """Rank 0's routes of one token: expert, route_idx, destination rank / row, send position (balanced dump)."""
+    import torch
+
+    d = torch.load(path, weights_only=False)[0]
+    route, info = d["send_route"].tolist(), d["send_info"].tolist()
+    where = {r: p for p, r in enumerate(route)}
+    base = d["plan"][PLAN_KEY_BASE:PLAN_KEY_BASE + 64].tolist()
+    rows = []
+    for r in range(token * 8, token * 8 + 8):
+        p = where[r]
+        rows.append(dict(route=r, expert=int(d["ids"].view(-1)[r]), idx=int(d["route_idx"][r]), dest=info[p] >> 22,
+                         row=info[p] & ((1 << 17) - 1), pos=p, key=max(k for k in range(64) if base[k] <= p)))
+    return rows
+
+
 def extract(directory):
     directory = Path(directory)
     data = dict(
         timeline=dict(balanced=kernel_timeline(directory), random=kernel_timeline(directory / "random")),
         phases={r: phase_medians(directory / f"phases_{r}.json") for r in ("balanced", "random")},
         send_list={r: send_list(directory / f"tables_{r}.pt") for r in ("balanced", "random")},
+        token_trace=token_trace(directory / "tables_balanced.pt", 928),
     )
     DATA.parent.mkdir(exist_ok=True)
     DATA.write_text(json.dumps(data))
     print("wrote", DATA)
+
+
+# ----------------------------------------------------------------------------------------------- model
+
+
+class Model:
+    """ep_prep + ep_plan in Python, the kernels' constants as parameters: section 5.1's example runs it with small ones,
+    check_model() with the real ones against the kernels' tables. ids[s]: rank s's route experts (route r = token *
+    topk + slot); route_idx defaults to route order (the kernel's order within a batch varies)."""
+
+    def __init__(self, ids, npes, e_local, block_m, queues, s_cap, route_idx=None, max_keys=64):
+        self.ids, self.npes, self.e_local, self.block_m, self.queues = ids, npes, e_local, block_m, queues
+        self.s_cap, self.max_keys = s_cap, max_keys
+        e_global = npes * e_local
+        if route_idx is None:
+            route_idx = []
+            for routes in ids:
+                seen = [0] * e_global
+                route_idx.append([])
+                for g in routes:
+                    route_idx[-1].append(seen[g])
+                    seen[g] += 1
+        self.route_idx = route_idx
+        self.counts = [[routes.count(g) for g in range(e_global)] for routes in ids]
+        self.total = [sum(c[g] for c in self.counts) for g in range(e_global)]
+        self.fewest = [min(c[g] for c in self.counts) for g in range(e_global)]
+        self.base, self.rows = [0] * e_global, [0] * npes
+        for d in range(npes):
+            for g in range(d * e_local, (d + 1) * e_local):
+                self.base[g] = self.rows[d]
+                self.rows[d] += -(-self.total[g] // block_m) * block_m
+        self.qstart = [[min(rows, s_cap) // block_m * q // queues for q in range(queues + 1)] for rows in self.rows]
+
+    def row(self, g, idx, me):
+        if idx < self.fewest[g]:
+            return self.base[g] + idx * self.npes + me
+        return self.base[g] + sum(min(c[g], idx + (s < me)) for s, c in enumerate(self.counts))
+
+    def key(self, g, row):
+        if row >= self.s_cap:
+            return self.max_keys - 1
+        qs, block = self.qstart[g // self.e_local], row // self.block_m
+        q = max(q for q in range(self.queues) if qs[q] <= block)
+        return min(block - qs[q], self.max_keys - 1)
+
+    def routes(self, me):
+        """(route, expert, row, key) of each of rank me's routes."""
+        out = []
+        for r, g in enumerate(self.ids[me]):
+            row = self.row(g, self.route_idx[me][r], me)
+            out.append((r, g, row, self.key(g, row)))
+        return out
+
+    def key_base(self, me):
+        hist = [0] * self.max_keys
+        for *_, k in self.routes(me):
+            hist[k] += 1
+        return [sum(hist[:k]) for k in range(self.max_keys)]
+
+    def send_list(self, me, wgs, first=None):
+        """[(route, expert, row, key, workgroup)] in send order; first[k] lists the workgroups in the order their
+        atomics on key k's cursor land (default: workgroup order)."""
+        routes, base = self.routes(me), self.key_base(me)
+        per = -(-len(routes) // wgs)
+        out = [None] * len(routes)
+        for k in range(self.max_keys):
+            at = base[k]
+            for j in (first or {}).get(k, range(wgs)):
+                for x in routes[j * per:(j + 1) * per]:
+                    if x[3] == k:
+                        out[at] = (*x, j)
+                        at += 1
+        return out
+
+    def blocks(self, me):
+        """(local expert, expected rows) of each of rank me's sorted blocks."""
+        out = []
+        for b in range(min(self.rows[me], self.s_cap) // self.block_m):
+            e = max(e for e in range(self.e_local) if self.base[me * self.e_local + e] <= b * self.block_m)
+            g = me * self.e_local + e
+            out.append((e, min(self.block_m, self.total[g] - (b * self.block_m - self.base[g]))))
+        return out
+
+
+def check_model(directory):
+    """The model against every rank's kernel tables (tables_{balanced,random}.pt): plan, send_info of every route and
+    its key range, block tables."""
+    import torch
+
+    for routing in ("balanced", "random"):
+        dumps = torch.load(Path(directory) / f"tables_{routing}.pt", weights_only=False)
+        m = Model([d["ids"].view(-1).tolist() for d in dumps], 8, 32, 256, 8, 73728,
+                  route_idx=[d["route_idx"].tolist() for d in dumps])
+        for me, d in enumerate(dumps):
+            plan = d["plan"].tolist()
+            assert d["counts"].tolist() == m.counts
+            assert plan[:256] == m.total and plan[256:512] == m.fewest and plan[512:776] == m.base + m.rows
+            assert plan[776:848] == sum(m.qstart, []) and plan[848:912] == m.key_base(me)
+            base, routes = m.key_base(me) + [len(m.ids[me])], m.routes(me)
+            for p, (r, info) in enumerate(zip(d["send_route"].tolist(), d["send_info"].tolist())):
+                _, g, row, k = routes[r]
+                assert info == (row | g << 17 if row < m.s_cap else -1) and base[k] <= p < base[k + 1], (me, p)
+            blocks = m.blocks(me)
+            assert d["expert_ids"][:len(blocks)].tolist() == [e for e, _ in blocks]
+            assert d["sched"][16:16 + len(blocks)].tolist() == [n for _, n in blocks]
+            gu = d["gu_ids"][:256 * len(blocks)].view(-1, 256)
+            assert all(gu[b].tolist() == [256 * b + t if t < n else -1 for t in range(256)] for b, (_, n) in enumerate(blocks))
+        print(f"model matches the kernels' tables: {routing}, 8 ranks")
 
 
 # ----------------------------------------------------------------------------------------------- figures
@@ -332,15 +462,108 @@ def fig_send_list(data):
     save(fig, "prep_plan_sendlist.png")
 
 
+def fig_example():
+    """Section 5.1's small example end to end: inputs and numbering, the tables, the receive rows, rank 0's send list."""
+    m = Model(**EXAMPLE)
+    topk, chunk = 2, 2
+    sends = m.send_list(0, 2, first=EXAMPLE_FIRST)
+    expert_col = ["#FFD27A", "#F3D1E8", "#C6E2FF", "#D4EDC9"]
+    source_col = ["#1565C0", "#E8743B"]
+    key_col = ["#A5D6A7", "#E1BEE7"]
+    fig, ax = canvas(24, 15.5)
+
+    ax.text(0, 99.6, "(a) 输入和 ② 编号：r = 路由号（2t + slot），e = expert，# = route_idx", fontsize=13, fontweight="bold",
+            color=DARK, va="top")
+    for s in range(2):
+        x0 = 1 + s * 23.5
+        ax.text(x0 + 3.4, 93.6, f"rank {s} 的 6 个 token", fontsize=11.5, fontweight="bold", color=source_col[s], va="center")
+        for t in range(6):
+            y = 87.8 - t * 4.4
+            ax.text(x0 + 2.8, y + 1.9, f"t{t}", ha="right", va="center", fontsize=10.5, color=DARK)
+            for slot in range(topk):
+                r = t * topk + slot
+                g = m.ids[s][r]
+                box(ax, x0 + 3.4 + slot * 9.4, y, 9.0, 3.8, expert_col[g], f"r{r}：e{g}  #{m.route_idx[s][r]}", fs=10.5,
+                    round_=False)
+    ax.text(0, 57.8, "③–⑧ 交换后两个 rank 算出同样的表（e0、e1 在 rank 0，e2、e3 在 rank 1）", fontsize=11.5, fontweight="bold",
+            color=DARK, va="top")
+    table = [("C[0][g]（rank 0 发的）", m.counts[0]), ("C[1][g]（rank 1 发的）", m.counts[1]), ("total", m.total),
+             ("fewest", m.fewest), ("base（目标 rank 上的起始行）", m.base)]
+    for i, (name, values) in enumerate(table):
+        y = 50.5 - i * 3.6
+        ax.text(1, y + 1.6, name, va="center", fontsize=10.5, color=DARK)
+        for g, v in enumerate(values):
+            box(ax, 22 + g * 6.0, y, 5.6, 3.2, expert_col[g] if i < 2 else "#F4F4F4", str(v), fs=10.5, round_=False)
+    for g in range(4):
+        ax.text(22 + g * 6.0 + 2.8, 55.2, f"e{g}", ha="center", va="center", fontsize=10.5, fontweight="bold", color=DARK)
+    ax.text(1, 31.6, f"每个 rank 的行数 {m.rows}，2 个队列：qstart = {m.qstart[0]}（block 0–1 是队列 0，2–3 是队列 1）",
+            fontsize=10.5, color=DARK, va="center")
+
+    ax.text(49, 99.6, "(b) 接收端的行（每格一行：源 rank、token、route_idx），block = 4 行", fontsize=13, fontweight="bold",
+            color=DARK, va="top")
+    cells = [[None] * 16 for _ in range(2)]
+    for s in range(2):
+        for r, g, row, _ in m.routes(s):
+            cells[g // 2][row] = (s, r // topk, m.route_idx[s][r])
+    cw = 3.0
+    for d in range(2):
+        y = 84.5 - d * 27.0
+        ax.text(49, y + 8.6, f"rank {d}（e{2 * d}、e{2 * d + 1}）", fontsize=11.5, fontweight="bold", color=DARK, va="center")
+        blocks = m.blocks(d)
+        for b, (e, n) in enumerate(blocks):
+            g = 2 * d + e
+            x0 = 49 + b * (4 * cw + 0.8)
+            for i in range(4):
+                c = cells[d][4 * b + i]
+                text, color = ("pad", "#E0E0E0") if c is None else (f"s{c[0]} t{c[1]}\n#{c[2]}", source_col[c[0]])
+                box(ax, x0 + i * cw, y, cw - 0.2, 6.2, color, text, fs=9.5, fc=DARK if c is None else "white", round_=False)
+                ax.text(x0 + i * cw + cw / 2, y + 6.9, str(4 * b + i), ha="center", va="center", fontsize=8.5, color="#777777")
+            q = max(q for q in range(2) if m.qstart[d][q] <= b)
+            ax.text(x0 + 2 * cw, y - 3.9, f"b{b}：e{g} 第 {(4 * b - m.base[g]) // 4 + 1} 块\n队列 {q} 第 {b - m.qstart[d][q]} 个"
+                    f" → key {m.key(g, 4 * b)}\nexpected = {n}", ha="center", va="center", fontsize=9.5, color=DARK,
+                    linespacing=1.3)
+    ax.text(49, 47.0, "• e0：rank 0 发了 4 条、rank 1 发了 2 条（fewest = 2）。#0、#1 两轮按 2·idx + s 交错（行 0–3），"
+            "rank 0 的 #2、#3 压紧到行 4、5\n  （不压紧就是 4、6，中间空一行）；e1 里 rank 1 的 #2–#4 同样压紧到行 12–14。",
+            fontsize=10, color=DARK, va="top", linespacing=1.4)
+
+    ax.text(0, 26.6, "(c) rank 0 的 send_route（ep_plan 2 个 WG：WG 0 管 r0–r5，WG 1 管 r6–r11；key 0 上 WG 1 的原子加先到）",
+            fontsize=13, fontweight="bold", color=DARK, va="top")
+    cw = 7.6
+    for p, (r, g, row, k, j) in enumerate(sends):
+        x0 = 1 + p * cw
+        box(ax, x0, 9.5, cw - 0.3, 7.6, key_col[k], f"r{r}（t{r // topk}）\n→ rank {g // 2} 行 {row}", fs=10, round_=False)
+        ax.text(x0 + cw / 2, 18.0, str(p), ha="center", va="center", fontsize=9, color="#777777")
+    runs = []
+    for p, (*_, k, j) in enumerate(sends):
+        if runs and runs[-1][1:] == [k, j]:
+            runs[-1][0].append(p)
+        else:
+            runs.append([[p], k, j])
+    for ps, k, j in runs:
+        a, b = 1 + ps[0] * cw, 1 + (ps[-1] + 1) * cw - 0.3
+        ax.plot([a, a, b, b], [19.4, 20.2, 20.2, 19.4], color=DARK, lw=1.0)
+        ax.text((a + b) / 2, 21.4, f"key {k}：WG {j}", ha="center", va="center", fontsize=10, color=DARK)
+    for c in range(len(sends) // chunk):
+        a, b = 1 + c * chunk * cw, 1 + (c + 1) * chunk * cw - 0.3
+        ax.plot([a, a, b, b], [8.6, 7.8, 7.8, 8.6], color=DARK, lw=1.0)
+        ax.text((a + b) / 2, 6.2, f"chunk {c} → producer {c % 2}", ha="center", va="center", fontsize=10, color=DARK)
+    ax.text(1, 2.0, "key_base = [0, 8]：key 0 有 8 条（发往两个 rank 上各队列第 0 个 block），key 1 有 4 条。两个 producer 先一起发"
+            " chunk 0–3（key 0），再发 key 1。", fontsize=10.5, color=DARK, va="center")
+    save(fig, "prep_plan_example.png")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("font_dir", nargs="?", default="/tmp/fonts")
     parser.add_argument("--from-dir")
+    parser.add_argument("--check-model", metavar="DIR", help="compare the model with the tables_*.pt dumps in DIR")
     args = parser.parse_args()
     for f in Path(args.font_dir).glob("NotoSansSC-*.otf"):
         font_manager.fontManager.addfont(str(f))
     plt.rcParams["font.family"] = "Noto Sans SC"
     plt.rcParams["axes.unicode_minus"] = False
+    if args.check_model:
+        check_model(args.check_model)
     if args.from_dir:
         extract(args.from_dir)
     data = json.loads(DATA.read_text())
@@ -348,6 +571,7 @@ def main():
     fig_prep_flow()
     fig_plan_flow()
     fig_send_list(data)
+    fig_example()
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ mega kernel 之前有两个小的 HIP kernel：`ep_prep` 和其他 rank 交换�
 | [ep_moe_gfx942.py](../../src/contrib/flydsl/ep_moe_gfx942.py) | `EPMoEGfx942.forward()`（[第 134 行](../../src/contrib/flydsl/ep_moe_gfx942.py#L134)）：依次下发 `out` 清零、`ep_prep`、`ep_plan`、mega kernel |
 | [images/ep_prep_plan.py](images/ep_prep_plan.py) | 本文的图（`python docs/megamoe_ep8_942/images/ep_prep_plan.py /tmp/fonts`），数据在 [images/data/prep_plan.json](images/data/prep_plan.json) |
 
-步骤编号全文统一：①–⑩ 是 `ep_prep`，⑪–⑯ 是 `ep_plan`。
+步骤编号全文统一：①–⑩ 是 `ep_prep`，⑪–⑯ 是 `ep_plan`。第一次读可以先看第 5.1 节的缩小例子（2 个 rank、每个数都能手算）
+和第 5.2 节一个真实 token 的 8 条路由，再看第 3、4 节。
 
 ## 0. 一页总结
 
@@ -282,7 +283,66 @@ T = 4096 时 s_cap = 2 × 4096 × 8 + 32 × 256 = 73728（288 个 block）。`pl
 9.6 µs（均匀路由）/ 9.8 µs（随机路由），没有分段测。每个线程只有 1 条路由，推测时间主要是几段串行的访存（读 `plan`、
 读 `topk_ids` / `route_idx`、全局原子加、分散的 store）加上 kernel 启动和结束。
 
-## 5. 例子：rank 0 的表
+## 5. 实例
+
+### 5.1 一个缩小的例子（每个数都能手算）
+
+把常数缩小：2 个 rank（NPES = 2），每个 rank 2 个本地 expert（e0、e1 在 rank 0，e2、e3 在 rank 1），top-2，每个 rank
+6 个 token（12 条路由），block = 4 行，每个目标 rank 2 个队列；`ep_plan` 2 个 WG（每个 6 条路由），producer 2 个，
+chunk = 2 条。公式和代码完全一样，只是 8 换成 2（快路径行号 2·idx + s）、256 换成 4。下面的数由
+[images/ep_prep_plan.py](images/ep_prep_plan.py) 里的 `Model` 算出；同一个 `Model` 用真实常数跑，和 8 个 rank 的 kernel
+输出逐项一致（`--check-model`，第 6 节）。
+
+![缩小的例子：输入、表、接收端的行、rank 0 的发送列表](images/prep_plan_example.png)
+
+1. **② 编号**（图 (a)）：rank 0 发给 e0 的 4 条是 r0、r3、r5、r8，编号 #0–#3；发给 e1 的是 r2、r7（#0、#1），依此类推。
+   这里按路由号的顺序编号；kernel 里同一轮的先后不定，只要求每个 expert 的编号不重不漏。
+2. **③–⑥ 交换**：rank 0 把 hist = [4, 2, 3, 3] 写到两个 rank 的 C[0]，rank 1 把 [2, 5, 2, 3] 写到 C[1]，各自发 CFLAG。
+   两边都看到两个 CFLAG 以后，手里是同一个 C。
+3. **⑦ 表**：total = [6, 7, 5, 6]，fewest = [2, 2, 2, 3]。e0 在 rank 0 从行 0 开始，占 ⌈6 / 4⌉ · 4 = 8 行，所以 e1 从行 8
+   开始；rank 1 上 e2 从行 0、e3 从行 8。两个 rank 都是 16 行、4 个 block，qstart = [0, 2, 4]。
+4. **行号**（`mega_row`，图 (b)）：
+   - 快路径（idx < fewest）：行 = base + 2·idx + s。rank 0 的 r3（e0 #1）→ 0 + 2 + 0 = 2；rank 1 的 r2（e0 #0）→ 1。
+   - 慢路径：rank 0 的 r5（e0 #2）→ 0 + min(4, 2) + min(2, 2) = 4，r8（e0 #3）→ min(4, 3) + min(2, 3) = 5。rank 1 已经
+     没有 e0 的路由了，所以 rank 0 的这两条紧挨着放，不留空行。rank 1 的 r11（e1 #4）→ 8 + min(2, 4 + 1) + min(5, 4) = 14。
+   - e0 的 6 行之后是 2 行 padding（行 6、7），e1 的 7 行之后是 1 行（行 15）。
+5. **key**：block 0、1 是队列 0 的第 0、1 个，block 2、3 是队列 1 的第 0、1 个，所以 block 0、2 的路由是 key 0，block 1、3
+   的是 key 1。rank 0 的 12 条里 8 条 key 0，4 条 key 1。
+6. **⑨ key 直方图**（rank 0，按段算）：e0 的 #0–#1 在 block 0（公式 hi = ⌈(4 − 0 − 0) / 2⌉ = 2），#2–#3 在 block 1
+   （fewest 之后，二分）；e1 的 #0–#1 在 block 2；e2 的 #0–#1 在 block 0、#2 在 block 1；e3 的 #0–#1 在 block 2、#2 在
+   block 3。key 0 = 2 + 2 + 2 + 2 = 8，key 1 = 2 + 1 + 1 = 4，key_base = [0, 8]。
+7. **⑪–⑮ `ep_plan`**（图 (c)）：WG 0 管 r0–r5（key 0 有 5 条，key 1 有 1 条），WG 1 管 r6–r11（key 0 有 3 条，key 1 有
+   3 条）。key 0 上 WG 1 的原子加先到：WG 1 占位置 0–2，WG 0 占 3–7；key 1 上 WG 0 先到：WG 0 占 8，WG 1 占 9–11。
+   换一个先后，key 里的顺序会变，每条路由的目标行不变。
+8. **⑯ block 表**（rank 0 作为目标）：`expert_ids` = [0, 0, 1, 1]，expected = [4, 2, 4, 3]；行 6、7、15 是 padding，
+   `gu_ids` 和 `down_ids` 都是 −1。
+9. **producer**：chunk c（2 条）归 producer c mod 2。两个 producer 先一起发 chunk 0–3（key 0：两个 rank 上各队列的第一个
+   block），再发 key 1。rank 0 的 block 0 要等 4 行：r0（rank 0 的 chunk 1）、r3（rank 0 的 chunk 3），以及 rank 1 发来的
+   2 行；4 行都到了，`arrived[0]` = expected[0] = 4，GateUp(0, *) 才开始。
+
+### 5.2 跟着一个 token 走（真实数据）
+
+均匀路由下 rank 0 的 token 928（发送列表的第一个 chunk 里有它）。8 条路由的编号都是 30（快路径：行 = base + 8·30 + 0）：
+
+| slot | 路由 r | expert（目标 rank 的本地 expert） | 行 | block | 队列位置 = key | send_route 位置 | chunk（producer WG） |
+|---|---|---|---|---|---|---|---|
+| 0 | 7424 | 215（rank 6 的 e23） | 23792 | 92 | 12 | 24576 | 3072（WG 0） |
+| 1 | 7425 | 24（rank 0 的 e24） | 24816 | 96 | 0 | 0 | 0（WG 0） |
+| 2 | 7426 | 25（rank 0 的 e25） | 25840 | 100 | 4 | 8192 | 1024（WG 0） |
+| 3 | 7427 | 115（rank 3 的 e19） | 19696 | 76 | 12 | 24577 | 3072（WG 0） |
+| 4 | 7428 | 178（rank 5 的 e18） | 18672 | 72 | 8 | 16384 | 2048（WG 0） |
+| 5 | 7429 | 11（rank 0 的 e11） | 11504 | 44 | 12 | 24578 | 3072（WG 0） |
+| 6 | 7430 | 147（rank 4 的 e19） | 19696 | 76 | 12 | 24579 | 3072（WG 0） |
+| 7 | 7431 | 236（rank 7 的 e12） | 12528 | 48 | 0 | 1 | 0（WG 0） |
+
+- 例：expert 24 在 rank 0 上从行 1024 × 24 = 24576 开始，行 24576 + 240 = 24816 在 block 96；队列 6 是 block 96–111，
+  所以是队列里的第 0 个，key 0。它排在整个发送列表的第 0 位。
+- 8 条路由去 6 个 rank（发给 rank 0 自己的 3 条也走 P2P store），分在 4 个 key 里：key 0 的 2 条最先发（chunk 0），key 12 的
+  4 条在同一个 chunk 里。producer 每发一个 chunk 就读一次这个 token 的 4 KB 行，所以这一行被读了 4 次；换来的是所有源按
+  队列位置的顺序发送。
+- 4 个位置都是 8192 的倍数，所以 chunk 号都是 16 的倍数，碰巧都由 producer WG 0 发。
+
+### 5.3 rank 0 的完整表
 
 均匀路由（每个 expert 从每个源各收 128 条）：
 
@@ -324,8 +384,8 @@ torchrun --nproc_per_node=8 --no-python /tmp/prep/kt_all.sh tests/contrib/moe/ep
     --mode mega --routing balanced --combine bf16 --iters 40 --warmup 5
 # 2. ep_prep 的分段时间戳 -> /tmp/prep/phases_{balanced,random}.json
 # 3. 每个 rank 一次调用之后的表 -> /tmp/prep/tables_{balanced,random}.pt
-# 4. 汇总数据并画图
-python docs/megamoe_ep8_942/images/ep_prep_plan.py /tmp/fonts --from-dir /tmp/prep
+# 4. 汇总数据并画图；--check-model 拿第 5.1 节的 Model 和 8 个 rank 的 kernel 输出逐项比对
+python docs/megamoe_ep8_942/images/ep_prep_plan.py /tmp/fonts --from-dir /tmp/prep --check-model /tmp/prep
 ```
 
 - 第 2 步（脚本不在仓库里）：复制 `ep_moe_comm_gfx942.cpp`，在 `ep_prep` 里加 3 个时间戳：编号循环后的 `__syncthreads()`
@@ -334,7 +394,9 @@ python docs/megamoe_ep8_942/images/ep_prep_plan.py /tmp/fonts --from-dir /tmp/pr
   `ep_moe_gfx942.ep_prep` 后跑 bench 的 `Mega`（预热 10 次、测 60 次），每次调用后取 `status`，以 `status[2]`（交换完成）
   为 0 换算成 µs（100 MHz）。JSON 是 `{"routing", "iters", "ranks": [8 个 rank 的 [{entry, route_idx, counts, exchange,
   tables, exit}, …]]}`。
-- 第 3 步（脚本不在仓库里）：跑 3 次调用后，每个 rank 把 `ws[:2048]`（计数）、`plan`、`route_idx`、`send_route`、
-  `send_info`、`num_valid`、`expert_ids`、`sched`、`gu_ids`、`status` 拷到 CPU，`all_gather_object` 后 rank 0 用
-  `torch.save` 存成 8 个 dict 的 list。
-- 第 4 步只读 rank 0 的表；不加 `--from-dir` 时直接用仓库里的 `images/data/prep_plan.json` 画图。
+- 第 3 步（脚本不在仓库里）：跑 3 次调用后，每个 rank 把 `topk_ids`、`ws[:2048]`（计数）、`plan`、`route_idx`、
+  `send_route`、`send_info`、`num_valid`、`expert_ids`、`sched`、`gu_ids`、`status` 拷到 CPU，`all_gather_object` 后 rank 0
+  用 `torch.save` 存成 8 个 dict 的 list。
+- 第 4 步的画图只读 rank 0 的表；不加 `--from-dir` 时直接用仓库里的 `images/data/prep_plan.json` 画图。`--check-model`
+  对 8 个 rank 检查 plan 表、每条路由的 `send_info` 和它所在的 key 区间、`expert_ids`、expected、`gu_ids`（`route_idx` 用 kernel
+  的，因为编号顺序每次不同）。
