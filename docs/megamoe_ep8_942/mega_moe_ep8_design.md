@@ -20,6 +20,9 @@ ATT 分析和后续优化方向见 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)。
 - 2026-11-12（转置A scale、全局发送顺序之后）：每卡256–4096 token、BF16和FP8 combine、随机和均衡路由下都快14%–30%；
   每卡4096 token时BF16 combine随机路由3171 → 2392 µs、均衡路由3064 → 2149 µs（同一文档第4.1节）。这一轮采纳的三项优化
   记录在第8节：均匀路由BF16一层2341 → 2139 µs（−8.6%）。
+- 2026-11-13 接入sglang跑MiMo-V2.6-Flash（EP8 prefill，第9节）：输入吞吐比MORI高9.5%–13.6%（fake路由）、
+  9.9%–10.7%（真实路由），平均TTFT低9%–11%；GSM8K和MORI一致（0.897对0.902，在同一实现几次运行的波动内）。
+  过程中修了`send_info`行号位宽的bug（每卡要收的行超过2^17时卡死）。
 
 ![时间线](images/mega_moe_timeline.png)
 
@@ -528,6 +531,129 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py   
 
 都已撤回，数字和原因见ATT文档5.3节：prologue不读行号；prologue一次往返装第一个K block；Down K循环把W2提前两个
 stage发；一个unit里GateUp和Down交替排；4个block共享一个权重tile。
+
+## 9. sglang集成测试（MiMo-V2.6-Flash，2026-11-13）
+
+按[MiMo评测指南](https://github.com/sammysun0711/sglang/blob/mimo-opt-mxfp4-dflash/evaluation/mimo_v26_flash/mimo-v2.6-flash-mopd-evaluation-guide.md)
+里EP8的prefill配置跑真实模型：DP2 × attention TP4，EP8，MORI FP8 dispatch / BF16 combine，全局chunked prefill 32768
+（每个DP 16384，SP之后每卡约4096 token进MoE）。把MoE层换成mega kernel，和MORI + AITER（FlyDSL）MoE比。
+
+### 9.1 环境
+
+没有按指南重装容器，全部用`PYTHONPATH`叠加，不动系统里的包：
+
+| 组件 | 用的版本 | 说明 |
+|---|---|---|
+| sglang | `sammysun0711/sglang`的`mimo-opt-mxfp4-dflash`（eb86ca1）源码 | 系统里是上游0.5.22，没有MiMo的MXFP4→FP8转换 |
+| aiter | `sammysun0711/aiter`的`integration/mimo-fp4-dflash`（e80744c）源码，CK按指南打patch | fork的sglang要它的`mimo_*` kernel；第一次启动JIT编译约10分钟 |
+| FlyDSL | 0.3.2（指南要求，单独装到一个目录） | mega kernel在0.3.2下照常编译：随机路由每卡4096 token一层2373 µs，和step1比calc_diff 1.2e-5 |
+| transformers | 5.8.1（单独目录） | 系统的5.19和fork的配置注册冲突 |
+| MORI | 系统里的 | |
+| 模型 | `/data/models/MiMo-V2.6-Flash-MOPD` | MXFP4 expert加载时转成FP8 128×128（shuffle过），和bench的权重布局相同 |
+
+关掉DFlash（target-only）。`PERFORMANCE_MODE=1`（fake路由）测prefill性能，`=0`（真实路由）测精度，也测了一遍性能。
+
+### 9.2 接入
+
+补丁在[sglang_mimo_mega_moe.patch](../../tests/contrib/moe/ep8/sglang_mimo_mega_moe.patch)（对fork的eb86ca1）：
+
+- `MiMoV2MoE.forward_deepep`里，`SGLANG_USE_PYHIP_MEGA_MOE=1`并且这一步有任何一个rank在做prefill时，调
+  `EPMoEGfx942.forward`（quant + mega + `ep_finish`），否则照旧走MORI。decode的CUDA graph（捕获时）不用mega：
+  mega每次调用的epoch是host参数，不能被graph固定下来。
+- 所有MoE层共用一个op：对称buffer按每卡16384 token分配（`s_cap` = 270336行，每卡约2 GB），每层调用前换成这一层的
+  权重指针。
+- 没有token的rank也要调用（它还要给别的rank算自己的expert），按0个token走；padding行（expert是−1）改成发给expert 0、
+  权重0。输出是对称buffer的view，返回前拷一份。
+- 遇到的三个问题：
+  1. 一开始用`forward_batch.global_num_tokens_cpu`的最大值决定走哪条路。这个配置下`require_mlp_tp_gather`是False，
+     它只有本DP组的token数，两个DP组判断不一样：一组进了mega（在MORI的`shmem_malloc`里等），一组进了MORI的
+     dispatch，死锁。改成`is_extend_in_batch`：DP attention的MLP sync在8个rank之间all-gather过它，各rank一致。
+  2. 指南默认`MORI_SHMEM_MODE=ISOLATION`。这个模式下MORI的`shmem_ptr_p2p`只认static heap里的地址，对mega的对称
+     buffer返回0，`ep_prep`往空指针加偏移的地方写计数，GPU memory access fault。改用
+     `MORI_SHMEM_MODE=STATIC_HEAP MORI_SHMEM_HEAP_SIZE=16GiB`（MORI自己的buffer和mega的buffer都放进heap）。要在
+     ISOLATION模式下用，pyhip需要自己交换IPC handle来建peer表。
+  3. 真实路由下启动预热卡死（8卡GFX 100%，host停在synchronize）。原因在pyhip：`send_info`里行号原来只有17位
+     （`ROW_BITS`），每卡16384 token时默认`s_cap` = 270336行，超过2^17 = 131072。一个rank要收的行超过131072时，
+     行号溢出到expert字段，数据发到错的rank和行，GateUp等不到`arrived`。预热的prompt是同一个token重复
+     （`[100] * n`），路由很集中；fake路由下每卡3–4万行，bench默认每卡4096 token（`s_cap` = 73728），都碰不到。
+     只把`s_cap`限制到2^17（其他不变）预热就通过了。最后的改法是行号放宽到19位：`s_cap`最大2^19（H = 4096时
+     行号 × H仍在int32里），默认`s_cap`不变（每卡平均路由数的2倍），显式传入更大的值时assert。bench每卡
+     16384 token随机路由（每个rank约13.5万行，超过2^17）和step1比calc_diff 1.15e-5。
+     改位宽时另一个坑：FlyDSL的编译缓存key不包含嵌套函数里读的模块全局变量，直接改`ROW_BITS`会拿到
+     缓存里17位的旧kernel（HIP侧已经按源文件时间重编），bench卡死。mega kernel现在用闭包里的`row_bits`，
+     缓存key随它变。
+
+### 9.3 prefill性能
+
+指南的`run_benchmark_mimo_pro_prefill.sh`，`customer_pressure`里的4K / 16K / 64K三个点（输出1个token，`--flush-cache`）。
+输入token吞吐（tok/s）：
+
+| 输入长度，并发 | MORI ISOLATION（指南默认） | MORI STATIC_HEAP | mega STATIC_HEAP | mega比MORI STATIC_HEAP |
+|---|---|---|---|---|
+| 4096，96 | 122785 | 118850，121615 | 134884，138353 | +13.6%（+10.9% – +16.4%） |
+| 16384，32 | 113946 | 114887，114284 | 127743，129534 | +12.3%（+11.2% – +13.3%） |
+| 65536，32 | 90929 | 90875，91467 | 99636，100094 | +9.5%（+8.9% – +10.1%） |
+
+平均TTFT（ms）：
+
+| 输入长度，并发 | MORI ISOLATION | MORI STATIC_HEAP | mega STATIC_HEAP | mega比MORI STATIC_HEAP |
+|---|---|---|---|---|
+| 4096，96 | 3107 | 3163，3142 | 2830，2757 | −11.4% |
+| 16384，32 | 4433 | 4437，4436 | 3968，3933 | −11.0% |
+| 65536，32 | 20385 | 20334，20256 | 18536，18466 | −8.8% |
+
+- STATIC_HEAP的两种各跑了两次，最后一列是两次平均的比，括号里是两两相比的范围。同一配置两次之间差0.5–2.6%
+  （4K最大）。mega的第1次是行号17位的版本（fake路由下每卡不到4万行，碰不到溢出），第2次是最后的代码。
+- 和指南默认的ISOLATION比，mega +11.3% / +12.9% / +9.8%。MORI自己在4K时static heap慢2.1%，16K、64K差别在
+  1%以内。
+- 64K时收益小一些，推测是注意力的比例更大。每次运行前GPU都空闲。
+
+真实路由（`PERFORMANCE_MODE=0`，都用STATIC_HEAP，mega是最后的代码，各跑一次），吞吐和平均TTFT：
+
+| 输入长度，并发 | MORI | mega | mega比MORI |
+|---|---|---|---|
+| 4096，96 | 105623，3606 | 116096，3289 | 吞吐 +9.9%，TTFT −8.8% |
+| 16384，32 | 97877，5189 | 108366，4645 | 吞吐 +10.7%，TTFT −10.5% |
+| 65536，32 | 79645，23232 | 87533，21115 | 吞吐 +9.9%，TTFT −9.1% |
+
+- 两边都比fake路由慢12–16%（每层等最慢的rank）。mega的收益在4K从13.6%降到9.9%，16K从12.3%降到10.7%，
+  64K差不多。
+- 采样到的调用里每卡最多4096 token、要收58368行（平均32768行的1.78倍）。
+- `s_cap`限制在2^17的版本跑过一次：116713 / 109658 / 87174，和上表差1.2%以内。
+
+### 9.4 精度
+
+GSM8K（`sglang.test.few_shot_gsm8k`，5-shot，1319题，并发128，真实路由，STATIC_HEAP）：
+
+| | 准确率 | invalid |
+|---|---|---|
+| MORI，2次 | 0.904，0.899 | 0.000，0.001 |
+| mega，3次 | 0.895，0.902，0.895 | 0.001，0.002，0.001 |
+
+- mega的前两次是`s_cap`限制在2^17的版本（没有行被丢掉，算法和最后的代码一样），第3次是最后的代码。
+- 逐题比两次运行：同一实现的两次之间，生成文本完全相同的18.7–20.2%，最后的数字相同的89.1–90.1%；MORI和mega
+  之间是17.3–20.2%和89.1–90.1%。并发128时每次batch的组成不同，greedy生成很快分叉，所以完全相同的只有五分之一。
+- MORI和mega之间的差别和同一实现两次之间的差别一样大。平均准确率0.897对0.902，差0.004，小于mega自己3次
+  之间的波动（0.895–0.902），没有看到精度损失。
+
+### 9.5 复现
+
+```bash
+# 环境：<pyhip_path>是一个目录，里面的pyhip链接到本仓库的src；其余是单独装包的目录和源码目录
+export PYTHONPATH=<transformers 5.8.1>:<flydsl 0.3.2>:<aiter fork>:<sglang fork>/python:<pyhip_path>:<mori>/python
+export FLYDSL_RUNTIME_CACHE_DIR=<一个只给0.3.2用的目录>     # 不和FlyDSL 0.4.0的编译缓存混用
+cd <sglang fork> && git apply <pyhip>/tests/contrib/moe/ep8/sglang_mimo_mega_moe.patch
+cd evaluation/mimo_v26_flash
+# mega（MORI用static heap）；去掉SGLANG_USE_PYHIP_MEGA_MOE就是MORI基线
+SGLANG_USE_PYHIP_MEGA_MOE=1 MORI_SHMEM_MODE=STATIC_HEAP MORI_SHMEM_HEAP_SIZE=16GiB ENABLE_DFLASH=0 PERFORMANCE_MODE=1 \
+  MODEL_PATH=/data/models/MiMo-V2.6-Flash-MOPD/ ./launch_mimo_v26_flash_dp2_tp8_ep8_dpa_accuracy_baseline.sh
+# 另一个终端
+cd <sglang fork>/evaluation && BENCHMARK_PRESET=customer_pressure TOKEN_LIST_OVERRIDE="4096 16384 65536" \
+  HOST=127.0.0.1 MODEL=/data/models/MiMo-V2.6-Flash-MOPD ./run_benchmark_mimo_pro_prefill.sh
+# 精度：用PERFORMANCE_MODE=0启动，然后
+python -m sglang.test.few_shot_gsm8k --data-path <GSM8K test.jsonl> --num-questions 1319 --parallel 128 \
+  --host 127.0.0.1 --port 30001
+```
 
 
 重新生成图：`python docs/megamoe_ep8_942/images/mega_moe.py /tmp/fonts`。

@@ -1,0 +1,117 @@
+diff --git a/python/sglang/srt/configs/qwen3_asr.py b/python/sglang/srt/configs/qwen3_asr.py
+index cb3252b..bf2ce3a 100644
+--- a/python/sglang/srt/configs/qwen3_asr.py
++++ b/python/sglang/srt/configs/qwen3_asr.py
+@@ -164,5 +164,5 @@ class Qwen3ASRConfig(PretrainedConfig):
+         return self.thinker_config.text_config
+ 
+ 
+-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
+-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
++AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
++AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig, exist_ok=True)
+diff --git a/python/sglang/srt/layers/moe/pyhip_mega_moe.py b/python/sglang/srt/layers/moe/pyhip_mega_moe.py
+new file mode 100644
+index 0000000..75728aa
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/pyhip_mega_moe.py
+@@ -0,0 +1,83 @@
++"""EP8 MoE through pyhip's mega kernel (dispatch + GateUp + Down + combine in one persistent kernel) for MiMo.
++
++SGLANG_USE_PYHIP_MEGA_MOE=1 sends the batches of MiMoV2MoE.forward_deepep that contain a prefill on any rank through
++pyhip.contrib.flydsl.ep_moe_gfx942.EPMoEGfx942 instead of MORI dispatch -> AITER MoE -> MORI combine. The kernel is a
++collective of the 8 EP ranks, so every rank must take the same path for a layer call: the choice uses only
++is_extend_in_batch, which the DP-attention MLP sync all-gathers (idle ranks run the layer with 0 tokens). The local
++token counts are not gathered in this configuration (require_mlp_tp_gather is False). CUDA-graph captures (decode)
++keep MORI: the kernel's call epoch is a host argument.
++
++    SGLANG_PYHIP_MEGA_MOE_MAX_TOKENS   tokens per EP rank the buffers hold (default: MORI's dispatch capacity)
++"""
++
++import logging
++import os
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_op = None
++_quant = None
++_calls = 0
++
++
++def enabled() -> bool:
++    return os.environ.get("SGLANG_USE_PYHIP_MEGA_MOE", "0") == "1"
++
++
++def _max_tokens() -> int:
++    return int(os.environ.get("SGLANG_PYHIP_MEGA_MOE_MAX_TOKENS",
++                              os.environ.get("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "16384")))
++
++
++def use_mega(forward_batch) -> bool:
++    if not enabled() or forward_batch is None or torch.cuda.is_current_stream_capturing():
++        return False
++    return bool(getattr(forward_batch, "is_extend_in_batch", False))
++
++
++def _get_op(experts):
++    global _op, _quant
++    if _op is None:
++        from aiter import QuantType, get_hip_quant
++        from pyhip.contrib.flydsl.ep_moe_gfx942 import EPMoEGfx942
++
++        from sglang.srt.distributed import get_moe_expert_parallel_rank, get_moe_expert_parallel_world_size
++
++        rank, world = get_moe_expert_parallel_rank(), get_moe_expert_parallel_world_size()
++        _op = EPMoEGfx942(rank, world, experts.w13_weight, experts.w13_weight_scale_inv, experts.w2_weight,
++                          experts.w2_weight_scale_inv, experts.top_k, _max_tokens())
++        _quant = get_hip_quant(QuantType.per_1x128)
++        logger.info("pyhip mega MoE: rank %d/%d, %d tokens per rank, s_cap %d rows", rank, world, _op.tcap, _op.s_cap)
++    return _op
++
++
++def run(experts, hidden_states: torch.Tensor, topk_output) -> torch.Tensor:
++    """MoE output [T, H] (BF16) of this rank's tokens; experts is the layer's DeepEPMoE (FP8 128x128 weights)."""
++    global _calls
++    op = _get_op(experts)
++    op.w1, op.w1_scale = experts.w13_weight, experts.w13_weight_scale_inv
++    op.w2, op.w2_scale = experts.w2_weight, experts.w2_weight_scale_inv
++    ids = topk_output.topk_ids
++    weights = topk_output.topk_weights.float()
++    # Padded rows carry expert -1: route them to expert 0 with weight 0 (their output rows are discarded).
++    pad = ids < 0
++    ids = torch.where(pad, torch.zeros_like(ids), ids).to(torch.int32)
++    weights = torch.where(pad, torch.zeros_like(weights), weights)
++    if hidden_states.shape[0] == 0:
++        # Idle rank: no routes to send, but it still serves its experts to the other ranks.
++        hidden = hidden_states.shape[1]
++        x_fp8 = torch.empty((0, hidden), dtype=experts.w13_weight.dtype, device=hidden_states.device)
++        x_scale = torch.empty((0, hidden // 128), dtype=torch.float32, device=hidden_states.device)
++        ids = ids.reshape(0, experts.top_k)
++        weights = weights.reshape(0, experts.top_k)
++    else:
++        x_fp8, x_scale = _quant(hidden_states, quant_dtype=experts.w13_weight.dtype)
++    out = op.forward(x_fp8, x_scale, ids.contiguous(), weights.contiguous()).clone()
++    _calls += 1
++    if _calls == 1 or (_calls % 4700 == 0):
++        needed = op.rows_needed()
++        logger.info("pyhip mega MoE call %d: %d tokens, %d rows needed of %d", _calls, hidden_states.shape[0], needed,
++                    op.s_cap)
++    return out
+diff --git a/python/sglang/srt/models/mimo_v2.py b/python/sglang/srt/models/mimo_v2.py
+index 40ae059..e1b97aa 100644
+--- a/python/sglang/srt/models/mimo_v2.py
++++ b/python/sglang/srt/models/mimo_v2.py
+@@ -567,6 +567,11 @@ class MiMoV2MoE(nn.Module):
+         else:
+             topk_output = self.topk.empty_topk_output(hidden_states.device)
+ 
++        from sglang.srt.layers.moe import pyhip_mega_moe
++
++        if pyhip_mega_moe.use_mega(forward_batch):
++            return pyhip_mega_moe.run(self.experts, hidden_states, topk_output)
++
+         final_hidden_states = self.experts(
+             hidden_states=hidden_states, topk_output=topk_output
+         )
