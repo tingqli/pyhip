@@ -1,0 +1,1222 @@
+{
+ "balanced_256": {
+  "mori": {
+   "quant": 7.136499974876642,
+   "dispatch": 45.665500685572624,
+   "moe": 454.0650099515915,
+   "combine": 109.9730022251606,
+   "total": 618.8045144081116
+  },
+  "mega_bench": 535.011500120163,
+  "step1": {
+   "p2p": {
+    "layer": 592.0,
+    "stages": {
+     "prep": 35.0,
+     "dispatch": 60.0,
+     "gateup": 271.0,
+     "down": 193.0,
+     "finish": 9.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 578.0,
+    "stages": {
+     "prep": 36.0,
+     "dispatch": 45.0,
+     "gateup": 270.0,
+     "down": 191.0,
+     "finish": 17.0
+    }
+   },
+   "local-combine": {
+    "layer": 554.0,
+    "stages": {
+     "prep": 34.0,
+     "dispatch": 63.0,
+     "gateup": 276.0,
+     "down": 156.0,
+     "finish": 6.0
+    }
+   },
+   "local": {
+    "layer": 532.0,
+    "stages": {
+     "prep": 35.0,
+     "dispatch": 45.0,
+     "gateup": 267.0,
+     "down": 153.0,
+     "finish": 12.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 524.0,
+    "stages": {
+     "prep": 37.0,
+     "mega": 434.0,
+     "finish": 32.0
+    },
+    "span": 489.0,
+    "P_run": 23.0,
+    "P_end": 29.0,
+    "G_wait": 15.7,
+    "G_run": 153.0,
+    "D_run": 76.0,
+    "busy": 0.9,
+    "G_mhz": 1057.0,
+    "D_mhz": 1144.0
+   },
+   "local-dispatch": {
+    "layer": 519.0,
+    "stages": {
+     "prep": 37.0,
+     "mega": 440.0,
+     "finish": 22.0
+    },
+    "span": 492.0,
+    "P_run": 18.0,
+    "P_end": 23.0,
+    "G_wait": 13.5,
+    "G_run": 159.0,
+    "D_run": 78.0,
+    "busy": 0.9,
+    "G_mhz": 1057.0,
+    "D_mhz": 1143.0
+   },
+   "local-combine": {
+    "layer": 525.0,
+    "stages": {
+     "prep": 39.0,
+     "mega": 432.0,
+     "finish": 38.0
+    },
+    "span": 493.0,
+    "P_run": 23.0,
+    "P_end": 28.0,
+    "G_wait": 15.2,
+    "G_run": 157.0,
+    "D_run": 77.0,
+    "busy": 0.91,
+    "G_mhz": 1028.0,
+    "D_mhz": 1121.0
+   },
+   "local": {
+    "layer": 518.0,
+    "stages": {
+     "prep": 38.0,
+     "mega": 436.0,
+     "finish": 28.0
+    },
+    "span": 491.0,
+    "P_run": 18.0,
+    "P_end": 23.0,
+    "G_wait": 13.3,
+    "G_run": 158.0,
+    "D_run": 78.0,
+    "busy": 0.9,
+    "G_mhz": 1022.0,
+    "D_mhz": 1104.0
+   }
+  }
+ },
+ "balanced_512": {
+  "mori": {
+   "quant": 7.37700005993247,
+   "dispatch": 71.5245008468628,
+   "moe": 506.08497858047485,
+   "combine": 145.29450237751007,
+   "total": 731.5639853477478
+  },
+  "mega_bench": 602.185994386673,
+  "step1": {
+   "p2p": {
+    "layer": 787.0,
+    "stages": {
+     "prep": 35.0,
+     "dispatch": 101.0,
+     "gateup": 301.0,
+     "down": 278.0,
+     "finish": 56.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 754.0,
+    "stages": {
+     "prep": 36.0,
+     "dispatch": 66.0,
+     "gateup": 304.0,
+     "down": 305.0,
+     "finish": 23.0
+    }
+   },
+   "local-combine": {
+    "layer": 654.0,
+    "stages": {
+     "prep": 38.0,
+     "dispatch": 106.0,
+     "gateup": 296.0,
+     "down": 166.0,
+     "finish": 26.0
+    }
+   },
+   "local": {
+    "layer": 613.0,
+    "stages": {
+     "prep": 37.0,
+     "dispatch": 72.0,
+     "gateup": 298.0,
+     "down": 171.0,
+     "finish": 14.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 604.0,
+    "stages": {
+     "prep": 39.0,
+     "mega": 521.0,
+     "finish": 25.0
+    },
+    "span": 565.0,
+    "P_run": 66.0,
+    "P_end": 74.0,
+    "G_wait": 36.1,
+    "G_run": 155.0,
+    "D_run": 81.0,
+    "busy": 0.9,
+    "G_mhz": 1041.0,
+    "D_mhz": 1123.0
+   },
+   "local-dispatch": {
+    "layer": 581.0,
+    "stages": {
+     "prep": 37.0,
+     "mega": 508.0,
+     "finish": 15.0
+    },
+    "span": 555.0,
+    "P_run": 44.0,
+    "P_end": 58.0,
+    "G_wait": 26.9,
+    "G_run": 165.0,
+    "D_run": 84.0,
+    "busy": 0.9,
+    "G_mhz": 987.0,
+    "D_mhz": 1092.0
+   },
+   "local-combine": {
+    "layer": 591.0,
+    "stages": {
+     "prep": 40.0,
+     "mega": 496.0,
+     "finish": 34.0
+    },
+    "span": 511.0,
+    "P_run": 66.0,
+    "P_end": 73.0,
+    "G_wait": 35.5,
+    "G_run": 151.0,
+    "D_run": 76.0,
+    "busy": 0.92,
+    "G_mhz": 1064.0,
+    "D_mhz": 1136.0
+   },
+   "local": {
+    "layer": 558.0,
+    "stages": {
+     "prep": 40.0,
+     "mega": 473.0,
+     "finish": 29.0
+    },
+    "span": 536.0,
+    "P_run": 43.0,
+    "P_end": 56.0,
+    "G_wait": 24.1,
+    "G_run": 167.0,
+    "D_run": 83.0,
+    "busy": 0.92,
+    "G_mhz": 972.0,
+    "D_mhz": 1047.0
+   }
+  }
+ },
+ "balanced_1024": {
+  "mori": {
+   "quant": 8.459500037133694,
+   "dispatch": 110.85499823093414,
+   "moe": 562.314510345459,
+   "combine": 222.1515029668808,
+   "total": 903.9415121078491
+  },
+  "mega_bench": 759.5889866352081,
+  "step1": {
+   "p2p": {
+    "layer": 1265.0,
+    "stages": {
+     "prep": 36.0,
+     "dispatch": 188.0,
+     "gateup": 361.0,
+     "down": 591.0,
+     "finish": 64.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 1187.0,
+    "stages": {
+     "prep": 36.0,
+     "dispatch": 105.0,
+     "gateup": 358.0,
+     "down": 539.0,
+     "finish": 132.0
+    }
+   },
+   "local-combine": {
+    "layer": 837.0,
+    "stages": {
+     "prep": 40.0,
+     "dispatch": 201.0,
+     "gateup": 360.0,
+     "down": 207.0,
+     "finish": 10.0
+    }
+   },
+   "local": {
+    "layer": 756.0,
+    "stages": {
+     "prep": 40.0,
+     "dispatch": 118.0,
+     "gateup": 356.0,
+     "down": 202.0,
+     "finish": 22.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 729.0,
+    "stages": {
+     "prep": 40.0,
+     "mega": 655.0,
+     "finish": 15.0
+    },
+    "span": 651.0,
+    "P_run": 139.0,
+    "P_end": 152.0,
+    "G_wait": 56.4,
+    "G_run": 170.0,
+    "D_run": 103.0,
+    "busy": 0.89,
+    "G_mhz": 953.0,
+    "D_mhz": 1109.0
+   },
+   "local-dispatch": {
+    "layer": 714.0,
+    "stages": {
+     "prep": 41.0,
+     "mega": 636.0,
+     "finish": 13.0
+    },
+    "span": 638.0,
+    "P_run": 89.0,
+    "P_end": 107.0,
+    "G_wait": 37.5,
+    "G_run": 176.0,
+    "D_run": 103.0,
+    "busy": 0.88,
+    "G_mhz": 920.0,
+    "D_mhz": 1090.0
+   },
+   "local-combine": {
+    "layer": 678.0,
+    "stages": {
+     "prep": 43.0,
+     "mega": 585.0,
+     "finish": 31.0
+    },
+    "span": 616.0,
+    "P_run": 138.0,
+    "P_end": 150.0,
+    "G_wait": 56.1,
+    "G_run": 177.0,
+    "D_run": 87.0,
+    "busy": 0.92,
+    "G_mhz": 917.0,
+    "D_mhz": 1002.0
+   },
+   "local": {
+    "layer": 632.0,
+    "stages": {
+     "prep": 43.0,
+     "mega": 556.0,
+     "finish": 14.0
+    },
+    "span": 576.0,
+    "P_run": 91.0,
+    "P_end": 104.0,
+    "G_wait": 35.8,
+    "G_run": 175.0,
+    "D_run": 87.0,
+    "busy": 0.91,
+    "G_mhz": 926.0,
+    "D_mhz": 994.0
+   }
+  }
+ },
+ "balanced_2048": {
+  "mori": {
+   "quant": 12.167999986559153,
+   "dispatch": 184.74499881267548,
+   "moe": 1086.9824886322021,
+   "combine": 384.5455050468445,
+   "total": 1668.682038784027
+  },
+  "mega_bench": 1195.9335207939148,
+  "step1": {
+   "p2p": {
+    "layer": 2084.0,
+    "stages": {
+     "prep": 42.0,
+     "dispatch": 384.0,
+     "gateup": 701.0,
+     "down": 900.0,
+     "finish": 30.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 1913.0,
+    "stages": {
+     "prep": 42.0,
+     "dispatch": 213.0,
+     "gateup": 714.0,
+     "down": 888.0,
+     "finish": 38.0
+    }
+   },
+   "local-combine": {
+    "layer": 1558.0,
+    "stages": {
+     "prep": 43.0,
+     "dispatch": 390.0,
+     "gateup": 688.0,
+     "down": 380.0,
+     "finish": 35.0
+    }
+   },
+   "local": {
+    "layer": 1381.0,
+    "stages": {
+     "prep": 43.0,
+     "dispatch": 215.0,
+     "gateup": 707.0,
+     "down": 386.0,
+     "finish": 7.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 1180.0,
+    "stages": {
+     "prep": 45.0,
+     "mega": 1082.0,
+     "finish": 31.0
+    },
+    "span": 1086.0,
+    "P_run": 274.0,
+    "P_end": 292.0,
+    "G_wait": 27.8,
+    "G_run": 159.0,
+    "D_run": 97.0,
+    "busy": 0.92,
+    "G_mhz": 1049.0,
+    "D_mhz": 1113.0
+   },
+   "local-dispatch": {
+    "layer": 1147.0,
+    "stages": {
+     "prep": 46.0,
+     "mega": 1053.0,
+     "finish": 28.0
+    },
+    "span": 1064.0,
+    "P_run": 201.0,
+    "P_end": 213.0,
+    "G_wait": 17.9,
+    "G_run": 160.0,
+    "D_run": 94.0,
+    "busy": 0.91,
+    "G_mhz": 1013.0,
+    "D_mhz": 1113.0
+   },
+   "local-combine": {
+    "layer": 1081.0,
+    "stages": {
+     "prep": 50.0,
+     "mega": 945.0,
+     "finish": 57.0
+    },
+    "span": 1015.0,
+    "P_run": 272.0,
+    "P_end": 290.0,
+    "G_wait": 27.8,
+    "G_run": 156.0,
+    "D_run": 80.0,
+    "busy": 0.93,
+    "G_mhz": 1032.0,
+    "D_mhz": 1066.0
+   },
+   "local": {
+    "layer": 1060.0,
+    "stages": {
+     "prep": 51.0,
+     "mega": 909.0,
+     "finish": 79.0
+    },
+    "span": 932.0,
+    "P_run": 200.0,
+    "P_end": 210.0,
+    "G_wait": 18.1,
+    "G_run": 154.0,
+    "D_run": 77.0,
+    "busy": 0.93,
+    "G_mhz": 1059.0,
+    "D_mhz": 1117.0
+   }
+  }
+ },
+ "balanced_4096": {
+  "mori": {
+   "quant": 17.80099980533123,
+   "dispatch": 374.0815073251724,
+   "moe": 1864.5130395889282,
+   "combine": 781.960517168045,
+   "total": 3053.7309646606445
+  },
+  "mega_bench": 2133.2919597625732,
+  "step1": {
+   "p2p": {
+    "layer": 4125.0,
+    "stages": {
+     "prep": 46.0,
+     "dispatch": 712.0,
+     "gateup": 1352.0,
+     "down": 1817.0,
+     "finish": 143.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 3737.0,
+    "stages": {
+     "prep": 47.0,
+     "dispatch": 357.0,
+     "gateup": 1288.0,
+     "down": 1813.0,
+     "finish": 173.0
+    }
+   },
+   "local-combine": {
+    "layer": 2697.0,
+    "stages": {
+     "prep": 53.0,
+     "dispatch": 761.0,
+     "gateup": 1194.0,
+     "down": 650.0,
+     "finish": 11.0
+    }
+   },
+   "local": {
+    "layer": 2367.0,
+    "stages": {
+     "prep": 56.0,
+     "dispatch": 437.0,
+     "gateup": 1169.0,
+     "down": 645.0,
+     "finish": 34.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 2132.0,
+    "stages": {
+     "prep": 63.0,
+     "mega": 1927.0,
+     "finish": 108.0
+    },
+    "span": 2038.0,
+    "P_run": 600.0,
+    "P_end": 648.0,
+    "G_wait": 16.7,
+    "G_run": 163.0,
+    "D_run": 92.0,
+    "busy": 0.94,
+    "G_mhz": 1002.0,
+    "D_mhz": 1030.0
+   },
+   "local-dispatch": {
+    "layer": 2071.0,
+    "stages": {
+     "prep": 62.0,
+     "mega": 1926.0,
+     "finish": 51.0
+    },
+    "span": 2087.0,
+    "P_run": 433.0,
+    "P_end": 455.0,
+    "G_wait": 11.5,
+    "G_run": 167.0,
+    "D_run": 93.0,
+    "busy": 0.94,
+    "G_mhz": 978.0,
+    "D_mhz": 1004.0
+   },
+   "local-combine": {
+    "layer": 2033.0,
+    "stages": {
+     "prep": 66.0,
+     "mega": 1698.0,
+     "finish": 223.0
+    },
+    "span": 2080.0,
+    "P_run": 634.0,
+    "P_end": 684.0,
+    "G_wait": 17.0,
+    "G_run": 170.0,
+    "D_run": 87.0,
+    "busy": 0.96,
+    "G_mhz": 958.0,
+    "D_mhz": 987.0
+   },
+   "local": {
+    "layer": 1991.0,
+    "stages": {
+     "prep": 64.0,
+     "mega": 1689.0,
+     "finish": 200.0
+    },
+    "span": 1980.0,
+    "P_run": 472.0,
+    "P_end": 497.0,
+    "G_wait": 12.3,
+    "G_run": 171.0,
+    "D_run": 88.0,
+    "busy": 0.96,
+    "G_mhz": 946.0,
+    "D_mhz": 967.0
+   }
+  }
+ },
+ "random_256": {
+  "mori": {
+   "quant": 7.37700005993247,
+   "dispatch": 42.357999831438065,
+   "moe": 450.79800486564636,
+   "combine": 120.99799886345863,
+   "total": 622.3125159740448
+  },
+  "mega_bench": 533.1069827079773,
+  "step1": {
+   "p2p": {
+    "layer": 599.0,
+    "stages": {
+     "prep": 38.0,
+     "dispatch": 59.0,
+     "gateup": 269.0,
+     "down": 181.0,
+     "finish": 36.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 587.0,
+    "stages": {
+     "prep": 38.0,
+     "dispatch": 44.0,
+     "gateup": 275.0,
+     "down": 183.0,
+     "finish": 27.0
+    }
+   },
+   "local-combine": {
+    "layer": 560.0,
+    "stages": {
+     "prep": 37.0,
+     "dispatch": 61.0,
+     "gateup": 267.0,
+     "down": 148.0,
+     "finish": 27.0
+    }
+   },
+   "local": {
+    "layer": 542.0,
+    "stages": {
+     "prep": 38.0,
+     "dispatch": 45.0,
+     "gateup": 264.0,
+     "down": 148.0,
+     "finish": 27.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 508.0,
+    "stages": {
+     "prep": 38.0,
+     "mega": 440.0,
+     "finish": 12.0
+    },
+    "span": 484.0,
+    "P_run": 24.0,
+    "P_end": 29.0,
+    "G_wait": 16.9,
+    "G_run": 153.0,
+    "D_run": 77.0,
+    "busy": 0.91,
+    "G_mhz": 1056.0,
+    "D_mhz": 1129.0
+   },
+   "local-dispatch": {
+    "layer": 522.0,
+    "stages": {
+     "prep": 39.0,
+     "mega": 438.0,
+     "finish": 19.0
+    },
+    "span": 491.0,
+    "P_run": 16.0,
+    "P_end": 21.0,
+    "G_wait": 13.6,
+    "G_run": 153.0,
+    "D_run": 78.0,
+    "busy": 0.9,
+    "G_mhz": 1057.0,
+    "D_mhz": 1123.0
+   },
+   "local-combine": {
+    "layer": 513.0,
+    "stages": {
+     "prep": 39.0,
+     "mega": 440.0,
+     "finish": 19.0
+    },
+    "span": 486.0,
+    "P_run": 23.0,
+    "P_end": 29.0,
+    "G_wait": 17.0,
+    "G_run": 156.0,
+    "D_run": 77.0,
+    "busy": 0.91,
+    "G_mhz": 1036.0,
+    "D_mhz": 1121.0
+   },
+   "local": {
+    "layer": 523.0,
+    "stages": {
+     "prep": 39.0,
+     "mega": 456.0,
+     "finish": 7.0
+    },
+    "span": 493.0,
+    "P_run": 16.0,
+    "P_end": 22.0,
+    "G_wait": 13.9,
+    "G_run": 154.0,
+    "D_run": 76.0,
+    "busy": 0.9,
+    "G_mhz": 1047.0,
+    "D_mhz": 1125.0
+   }
+  }
+ },
+ "random_512": {
+  "mori": {
+   "quant": 7.61799979954958,
+   "dispatch": 66.65350124239922,
+   "moe": 505.6445002555847,
+   "combine": 153.2125025987625,
+   "total": 733.4880232810974
+  },
+  "mega_bench": 609.904021024704,
+  "step1": {
+   "p2p": {
+    "layer": 785.0,
+    "stages": {
+     "prep": 36.0,
+     "dispatch": 103.0,
+     "gateup": 303.0,
+     "down": 299.0,
+     "finish": 25.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 753.0,
+    "stages": {
+     "prep": 37.0,
+     "dispatch": 68.0,
+     "gateup": 309.0,
+     "down": 302.0,
+     "finish": 17.0
+    }
+   },
+   "local-combine": {
+    "layer": 656.0,
+    "stages": {
+     "prep": 38.0,
+     "dispatch": 111.0,
+     "gateup": 293.0,
+     "down": 167.0,
+     "finish": 23.0
+    }
+   },
+   "local": {
+    "layer": 620.0,
+    "stages": {
+     "prep": 39.0,
+     "dispatch": 73.0,
+     "gateup": 292.0,
+     "down": 167.0,
+     "finish": 27.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 603.0,
+    "stages": {
+     "prep": 40.0,
+     "mega": 512.0,
+     "finish": 32.0
+    },
+    "span": 526.0,
+    "P_run": 63.0,
+    "P_end": 69.0,
+    "G_wait": 33.5,
+    "G_run": 151.0,
+    "D_run": 81.0,
+    "busy": 0.89,
+    "G_mhz": 1069.0,
+    "D_mhz": 1158.0
+   },
+   "local-dispatch": {
+    "layer": 586.0,
+    "stages": {
+     "prep": 39.0,
+     "mega": 509.0,
+     "finish": 17.0
+    },
+    "span": 534.0,
+    "P_run": 46.0,
+    "P_end": 57.0,
+    "G_wait": 26.8,
+    "G_run": 152.0,
+    "D_run": 81.0,
+    "busy": 0.89,
+    "G_mhz": 1062.0,
+    "D_mhz": 1148.0
+   },
+   "local-combine": {
+    "layer": 592.0,
+    "stages": {
+     "prep": 41.0,
+     "mega": 498.0,
+     "finish": 34.0
+    },
+    "span": 545.0,
+    "P_run": 62.0,
+    "P_end": 70.0,
+    "G_wait": 33.6,
+    "G_run": 154.0,
+    "D_run": 77.0,
+    "busy": 0.91,
+    "G_mhz": 1049.0,
+    "D_mhz": 1116.0
+   },
+   "local": {
+    "layer": 572.0,
+    "stages": {
+     "prep": 42.0,
+     "mega": 482.0,
+     "finish": 32.0
+    },
+    "span": 531.0,
+    "P_run": 42.0,
+    "P_end": 55.0,
+    "G_wait": 25.6,
+    "G_run": 168.0,
+    "D_run": 82.0,
+    "busy": 0.92,
+    "G_mhz": 962.0,
+    "D_mhz": 1049.0
+   }
+  }
+ },
+ "random_1024": {
+  "mori": {
+   "quant": 8.659999817609787,
+   "dispatch": 108.02850127220154,
+   "moe": 728.3765077590942,
+   "combine": 216.29749983549118,
+   "total": 1062.2050166130066
+  },
+  "mega_bench": 884.8375082015991,
+  "step1": {
+   "p2p": {
+    "layer": 1240.0,
+    "stages": {
+     "prep": 39.0,
+     "dispatch": 192.0,
+     "gateup": 475.0,
+     "down": 483.0,
+     "finish": 31.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 1170.0,
+    "stages": {
+     "prep": 40.0,
+     "dispatch": 111.0,
+     "gateup": 474.0,
+     "down": 483.0,
+     "finish": 43.0
+    }
+   },
+   "local-combine": {
+    "layer": 1015.0,
+    "stages": {
+     "prep": 41.0,
+     "dispatch": 204.0,
+     "gateup": 459.0,
+     "down": 249.0,
+     "finish": 41.0
+    }
+   },
+   "local": {
+    "layer": 937.0,
+    "stages": {
+     "prep": 42.0,
+     "dispatch": 119.0,
+     "gateup": 480.0,
+     "down": 259.0,
+     "finish": 16.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 864.0,
+    "stages": {
+     "prep": 43.0,
+     "mega": 784.0,
+     "finish": 15.0
+    },
+    "span": 807.0,
+    "P_run": 145.0,
+    "P_end": 157.0,
+    "G_wait": 29.2,
+    "G_run": 159.0,
+    "D_run": 85.0,
+    "busy": 0.91,
+    "G_mhz": 1024.0,
+    "D_mhz": 1169.0
+   },
+   "local-dispatch": {
+    "layer": 825.0,
+    "stages": {
+     "prep": 43.0,
+     "mega": 736.0,
+     "finish": 24.0
+    },
+    "span": 1277.0,
+    "P_run": 110.0,
+    "P_end": 130.0,
+    "G_wait": 84.9,
+    "G_run": 199.0,
+    "D_run": 105.0,
+    "busy": 0.93,
+    "G_mhz": 239200.0,
+    "D_mhz": 114561.0
+   },
+   "local-combine": {
+    "layer": 812.0,
+    "stages": {
+     "prep": 45.0,
+     "mega": 662.0,
+     "finish": 87.0
+    },
+    "span": 96125.0,
+    "P_run": 172.0,
+    "P_end": 184.0,
+    "G_wait": 29786.4,
+    "G_run": 196.0,
+    "D_run": 98.0,
+    "busy": 0.99,
+    "G_mhz": 15858.0,
+    "D_mhz": 1007.0
+   },
+   "local": {
+    "layer": 791.0,
+    "stages": {
+     "prep": 45.0,
+     "mega": 649.0,
+     "finish": 74.0
+    },
+    "span": 756.0,
+    "P_run": 92.0,
+    "P_end": 102.0,
+    "G_wait": 17.4,
+    "G_run": 157.0,
+    "D_run": 79.0,
+    "busy": 0.92,
+    "G_mhz": 1025.0,
+    "D_mhz": 1090.0
+   }
+  }
+ },
+ "random_2048": {
+  "mori": {
+   "quant": 11.746999807655811,
+   "dispatch": 176.8674999475479,
+   "moe": 1235.3444695472717,
+   "combine": 366.2029951810837,
+   "total": 1792.4869656562805
+  },
+  "mega_bench": 1360.2319955825806,
+  "step1": {
+   "p2p": {
+    "layer": 2122.0,
+    "stages": {
+     "prep": 42.0,
+     "dispatch": 376.0,
+     "gateup": 793.0,
+     "down": 879.0,
+     "finish": 6.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 1954.0,
+    "stages": {
+     "prep": 44.0,
+     "dispatch": 209.0,
+     "gateup": 811.0,
+     "down": 775.0,
+     "finish": 95.0
+    }
+   },
+   "local-combine": {
+    "layer": 1698.0,
+    "stages": {
+     "prep": 47.0,
+     "dispatch": 387.0,
+     "gateup": 749.0,
+     "down": 423.0,
+     "finish": 69.0
+    }
+   },
+   "local": {
+    "layer": 1530.0,
+    "stages": {
+     "prep": 47.0,
+     "dispatch": 223.0,
+     "gateup": 770.0,
+     "down": 432.0,
+     "finish": 31.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 1356.0,
+    "stages": {
+     "prep": 50.0,
+     "mega": 1183.0,
+     "finish": 98.0
+    },
+    "span": 1329.0,
+    "P_run": 296.0,
+    "P_end": 311.0,
+    "G_wait": 23.4,
+    "G_run": 158.0,
+    "D_run": 88.0,
+    "busy": 0.92,
+    "G_mhz": 1059.0,
+    "D_mhz": 1085.0
+   },
+   "local-dispatch": {
+    "layer": 1318.0,
+    "stages": {
+     "prep": 51.0,
+     "mega": 1179.0,
+     "finish": 64.0
+    },
+    "span": 1377.0,
+    "P_run": 209.0,
+    "P_end": 219.0,
+    "G_wait": 14.9,
+    "G_run": 161.0,
+    "D_run": 89.0,
+    "busy": 0.92,
+    "G_mhz": 1026.0,
+    "D_mhz": 1048.0
+   },
+   "local-combine": {
+    "layer": 1294.0,
+    "stages": {
+     "prep": 52.0,
+     "mega": 1058.0,
+     "finish": 157.0
+    },
+    "span": 1296.0,
+    "P_run": 294.0,
+    "P_end": 312.0,
+    "G_wait": 23.2,
+    "G_run": 156.0,
+    "D_run": 80.0,
+    "busy": 0.93,
+    "G_mhz": 1051.0,
+    "D_mhz": 1067.0
+   },
+   "local": {
+    "layer": 1277.0,
+    "stages": {
+     "prep": 54.0,
+     "mega": 1005.0,
+     "finish": 191.0
+    },
+    "span": 1275.0,
+    "P_run": 206.0,
+    "P_end": 217.0,
+    "G_wait": 14.6,
+    "G_run": 155.0,
+    "D_run": 81.0,
+    "busy": 0.93,
+    "G_mhz": 1038.0,
+    "D_mhz": 1065.0
+   }
+  }
+ },
+ "random_4096": {
+  "mori": {
+   "quant": 18.32200028002262,
+   "dispatch": 333.5475027561188,
+   "moe": 2048.0754375457764,
+   "combine": 751.4100074768066,
+   "total": 3160.1760387420654
+  },
+  "mega_bench": 2388.358473777771,
+  "step1": {
+   "p2p": {
+    "layer": 4086.0,
+    "stages": {
+     "prep": 53.0,
+     "dispatch": 733.0,
+     "gateup": 1380.0,
+     "down": 1564.0,
+     "finish": 321.0
+    }
+   },
+   "local-dispatch": {
+    "layer": 3731.0,
+    "stages": {
+     "prep": 53.0,
+     "dispatch": 394.0,
+     "gateup": 1429.0,
+     "down": 1591.0,
+     "finish": 209.0
+    }
+   },
+   "local-combine": {
+    "layer": 2934.0,
+    "stages": {
+     "prep": 60.0,
+     "dispatch": 791.0,
+     "gateup": 1265.0,
+     "down": 694.0,
+     "finish": 95.0
+    }
+   },
+   "local": {
+    "layer": 2583.0,
+    "stages": {
+     "prep": 61.0,
+     "dispatch": 470.0,
+     "gateup": 1254.0,
+     "down": 714.0,
+     "finish": 52.0
+    }
+   }
+  },
+  "mega": {
+   "p2p": {
+    "layer": 2382.0,
+    "stages": {
+     "prep": 69.0,
+     "mega": 2255.0,
+     "finish": 10.0
+    },
+    "span": 2491.0,
+    "P_run": 726.0,
+    "P_end": 774.0,
+    "G_wait": 16.7,
+    "G_run": 160.0,
+    "D_run": 94.0,
+    "busy": 0.94,
+    "G_mhz": 1058.0,
+    "D_mhz": 1063.0
+   },
+   "local-dispatch": {
+    "layer": 2328.0,
+    "stages": {
+     "prep": 70.0,
+     "mega": 1982.0,
+     "finish": 237.0
+    },
+    "span": 2334.0,
+    "P_run": 476.0,
+    "P_end": 503.0,
+    "G_wait": 10.1,
+    "G_run": 167.0,
+    "D_run": 91.0,
+    "busy": 0.95,
+    "G_mhz": 964.0,
+    "D_mhz": 981.0
+   },
+   "local-combine": {
+    "layer": 2303.0,
+    "stages": {
+     "prep": 70.0,
+     "mega": 2175.0,
+     "finish": 8.0
+    },
+    "span": 2207.0,
+    "P_run": 663.0,
+    "P_end": 705.0,
+    "G_wait": 15.5,
+    "G_run": 157.0,
+    "D_run": 80.0,
+    "busy": 0.95,
+    "G_mhz": 1060.0,
+    "D_mhz": 1073.0
+   },
+   "local": {
+    "layer": 2280.0,
+    "stages": {
+     "prep": 71.0,
+     "mega": 2122.0,
+     "finish": 21.0
+    },
+    "span": 2254.0,
+    "P_run": 475.0,
+    "P_end": 501.0,
+    "G_wait": 10.1,
+    "G_run": 163.0,
+    "D_run": 84.0,
+    "busy": 0.95,
+    "G_mhz": 984.0,
+    "D_mhz": 1006.0
+   }
+  }
+ }
+}

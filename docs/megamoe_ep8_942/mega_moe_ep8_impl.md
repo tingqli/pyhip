@@ -548,7 +548,8 @@ rank 0 一次调用的 trace，304 个 CU 的平均（kernel span 2119 µs）：
 | 任务 prologue / epilogue | 每个 CU 263 µs | 263 µs | 0% | 一个 CU 只有一个 WG，任务之间串行；只有领票的原子加藏在 epilogue 里 |
 | K 循环内的访存 | — | 204 µs | — | 属于主循环本身的效率，见 ATT 文档 |
 
-（上面的露出是均匀路由、BF16 combine；FP8 combine 时 18 / 46 / 69 µs（第 9.2 节）。更早版本的随机路由数据见
+（上面的露出是均匀路由、BF16 combine；FP8 combine 时 18 / 46 / 69 µs（第 9.2 节）。每卡 256–4096 token、两种路由下的露出
+见 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md) 第 4.3 节：512–4096 token 时 31–141 µs，256 token 时在噪声内。更早版本的随机路由数据见
 [mega_moe_ep8_design.md](mega_moe_ep8_design.md) 第 7 节和 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)。）
 
 ### 8.4 还能拿回多少

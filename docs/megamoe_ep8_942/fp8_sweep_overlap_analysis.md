@@ -6,6 +6,8 @@
 
 - 2026-11-12 的当前版本：每卡256–4096 token、两种combine、两种路由下，mega都比基线快，14%–30%（第4.1节）。下面其余
   的数字是第一次扫描时的版本。
+- 2026-11-13，当前版本、BF16 combine：dispatch和combine没有完全藏住。每卡512–4096 token时还露出31–141 µs
+  （一层的4%–13%），每卡256 token时在噪声内；串行时这些通信要57–1758 µs，mega藏住了74%–93%（第4.3节）。
 - dispatch和combine都用FP8时，mega kernel比基线（MORI FP8 dispatch + FlyDSL MoE + MORI FP8 combine）快 **17%–32%**。token越多，快得越多：8卡共32k token时随机路由快29%，均衡路由快32%。
 - 32k token、随机路由时：
   - 基线 3374 µs。
@@ -106,6 +108,59 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/trace_ep8_mega.py --combine fp
   - 从12k到16k，基线的MoE只多了7%（1022 → 1094 µs），mega多了25%（1042 → 1300 µs）。
   - 原因还没细查，可能和这几点有关：空行的数据是0，功耗低；空行不用发combine数据；每个队列只有8个block，流水线短。
 - 32k时，均衡路由比随机路由快约180 µs（2236 vs 2419）。随机路由下最忙的rank有148个block，最闲的有139个，最慢的rank决定总时间。
+
+### 4.3 当前版本：各token数下dispatch和combine还露出多少（2026-11-13，BF16 combine）
+
+![各token数下的通信遮盖](images/overlap_sweep.png)
+
+方法和第5.1节一样：`profile_ep8_mega_overlap.py`把dispatch的数据（`recv_a`、`recv_scale`、`down_ids`、`recv_w`）
+和/或combine的原子加换到本卡的scratch，到达计数和flag照常发，所以调度和同步不变，只少了xGMI流量。每种模式100次 ×
+4轮，取最快一轮里最慢rank的一层时间。mega的p2p − local就是还露在外面的通信；同样跑一遍step1（通信在单独的kernel
+里，不重叠），它的p2p − local就是这些通信本身要花的时间。MORI基线取`--mode both`里最慢的rank。代码同第4.1节
+（a1b23eb），每次跑之前和之后GPU都空闲。单位µs：
+
+| 每卡token | 路由 | MORI基线 dispatch / MoE / combine / 合计 | step1 一层 / 其中通信 | mega 一层 / local | mega露出 dispatch / combine / 合计 | 露出占一层 | 藏住（相对step1的通信） |
+|---|---|---|---|---|---|---|---|
+| 256 | 均衡 | 46 / 454 / 110 / 619 | 592 / 60 | 524 / 518 | 5 / −1 / 6 | 噪声内 | ≈100% |
+| 512 | 均衡 | 72 / 506 / 145 / 732 | 787 / 174 | 604 / 558 | 23 / 13 / 46 | 7.6% | 74% |
+| 1024 | 均衡 | 111 / 562 / 222 / 904 | 1265 / 509 | 729 / 632 | 15 / 51 / 97 | 13.3% | 81% |
+| 2048 | 均衡 | 185 / 1087 / 385 / 1669 | 2084 / 703 | 1180 / 1060 | 33 / 99 / 120 | 10.2% | 83% |
+| 4096 | 均衡 | 374 / 1865 / 782 / 3054 | 4125 / 1758 | 2132 / 1991 | 61 / 99 / 141 | 6.6% | 92% |
+| 256 | 随机 | 42 / 451 / 121 / 622 | 599 / 57 | 508 / 523 | −14 / −5 / −15 | 噪声内 | ≈100% |
+| 512 | 随机 | 67 / 506 / 153 / 733 | 785 / 165 | 603 / 572 | 17 / 11 / 31 | 5.1% | 81% |
+| 1024 | 随机 | 108 / 728 / 216 / 1062 | 1240 / 303 | 864 / 791 | 39 / 52 / 73 | 8.4% | 76% |
+| 2048 | 随机 | 177 / 1235 / 366 / 1792 | 2122 / 592 | 1356 / 1277 | 38 / 62 / 79 | 5.8% | 87% |
+| 4096 | 随机 | 334 / 2048 / 751 / 3160 | 4086 / 1503 | 2382 / 2280 | 54 / 79 / 102 | 4.3% | 93% |
+
+- **没有完全藏住，但剩得不多**：每卡512–4096 token时还露出31–141 µs，占一层的4%–13%；每卡256 token时在噪声内
+  （同一模式4轮之间差10–35 µs）。dispatch和combine分开测的露出加起来不等于合计（两者会互相影响）。
+- **串行时这些通信要57–1758 µs**，mega藏住了其中74%–93%，token越多藏得越多。step1里最贵的是BF16 combine的远端
+  原子加（每卡4096 token、均衡路由时1428 µs）。和MORI比：同一配置下MORI的dispatch + combine是374 + 782 µs。
+- **dispatch露出15–61 µs**：启动时GateUp要等前几个block的数据。trace里GateUp的平均等待p2p比local多3–20 µs
+  （每卡1024、均衡：56 vs 36 µs），producer发完的时刻也更晚（每卡4096、均衡：648 vs 497 µs）。
+- **combine露出51–99 µs（每卡1024 token以上）**：Down的epilogue往源rank发BF16原子加。gfx942上store和load共用
+  vmcnt，下一个任务第一次等vmcnt时要等这些远端原子加完成，所以每个Down任务都慢一些（平均每个Down任务p2p比local
+  多4–20 µs：每卡1024、均衡103 vs 87，每卡2048、均衡97 vs 77）；最后一批Down的原子加也没有计算可以遮。
+- **露得最多的是每卡1024–2048 token、均衡路由（10%–13%）**：每个队列只有4–8个block（2–4组），Down比GateUp晚2组，
+  所以Down大多排在GateUp做完之后（每卡1024时全部在队尾），combine的流量没有GateUp可以遮。
+- 同样的token数，随机路由露得比均衡路由少（少15–41 µs），原因没有查。
+- 可以再试的（没试过）：token少时减小lag，让Down更早和GateUp交错；FP8 combine的写少一半，每卡4096、均衡时只露出
+  69 µs（实现文档第9.2节），但它在源rank上多一个约80 µs的求和kernel。
+
+复现（数据和图在[images/data/overlap_sweep.json](images/data/overlap_sweep.json)、
+[images/overlap_sweep.py](images/overlap_sweep.py)）：
+
+```
+for t in 4096 2048 1024 512 256; do for r in balanced random; do
+  torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mode both --combine bf16 --routing $r \
+      --tokens $t --iters 100 --warmup 20 --json /tmp/overlap/bench_${r}_${t}.json
+  torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py --combine bf16 --routing $r --tokens $t \
+      > /tmp/overlap/mega_${r}_${t}.log
+  torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py --combine bf16 --routing $r --tokens $t \
+      --ep-mode step1 > /tmp/overlap/step1_${r}_${t}.log
+done; done
+python docs/megamoe_ep8_942/images/overlap_sweep.py /tmp/fonts --from-dir /tmp/overlap
+```
 
 ## 5. 32k：基线 → kernel之间不重叠 → mega kernel
 
