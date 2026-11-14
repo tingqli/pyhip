@@ -1,0 +1,29 @@
+# v2b (tp_prep.py before the adaptive rng; rng = 2048 fixed, nsmin 16) kernel-only timings, prof.py, GPU0
+# cold = L2 flushed, kernel_times sum; warm-e2e = time_cold(flush=False) incl. launch
+## prof.py 1 16 1024 2048 4096 8192 32768 --variants 'aiter;v1;v2a;v2;v2n8;v2n32;v2-pad;v2-sort;v2-quant'
+T=    1 bm=32 kernel us cold/warm-e2e:  aiter 12.6/14.4  v1 14.2/16.4  v2a 13.0/15.2  v2 3.8/6.1  v2n8 3.8/6.1  v2n32 3.8/6.1  v2-pad 3.8/6.1  v2-sort 4.0/6.4  v2-quant 3.7/5.9
+T=   16 bm=32 kernel us cold/warm-e2e:  aiter 17.1/19.2  v1 17.8/20.2  v2a 18.4/20.7  v2 4.9/6.5  v2n8 5.0/6.6  v2n32 4.7/6.3  v2-pad 4.8/6.4  v2-sort 5.0/6.6  v2-quant 4.3/6.3
+T= 1024 bm=64 kernel us cold/warm-e2e:  aiter 17.9/19.7  v1 17.1/18.4  v2a 21.2/23.1  v2 11.9/13.3  v2n8 13.1/14.5  v2n32 11.2/12.5  v2-pad 10.8/12.2  v2-sort 7.6/8.9  v2-quant 9.5/11.1
+T= 2048 bm=64 kernel us cold/warm-e2e:  aiter 29.5/30.0  v1 20.7/21.3  v2a 28.7/28.9  v2 15.1/16.4  v2n8 16.3/17.8  v2n32 14.4/15.8  v2-pad 14.3/15.6  v2-sort 10.3/11.2  v2-quant 11.2/13.1
+T= 4096 bm=64 kernel us cold/warm-e2e:  aiter 39.6/40.9  v1 38.2/40.4  v2a 40.6/41.9  v2 23.1/25.0  v2n8 23.3/24.9  v2n32 22.4/24.6  v2-pad 22.2/24.1  v2-sort 19.6/21.3  v2-quant 13.3/15.3
+T= 8192 bm=64 kernel us cold/warm-e2e:  aiter 59.5/60.7  v1 47.1/48.8  v2a 49.8/51.0  v2 40.4/42.4  v2n8 40.2/42.0  v2n32 40.4/42.2  v2-pad 40.3/42.3  v2-sort 36.1/37.8  v2-quant 18.1/19.8
+T=32768 bm=64 kernel us cold/warm-e2e:  aiter 228.2/230.0  v1 186.7/188.1  v2a 188.8/189.6  v2 184.3/185.9  v2n8 184.3/185.8  v2n32 183.9/185.1  v2-pad 183.8/185.9  v2-sort 177.9/179.5  v2-quant 49.0/50.8
+
+## sort-part breakdown (quant skipped): '-x' = part x left out. NB: without hist all
+## offsets are 0 -> the scatter stores collapse onto a few lines (cheap); without the
+## scatter the own-route loads are dead-code eliminated, so parts are not additive.
+T= 1024 bm=64 kernel us cold/warm-e2e:  v2-quant 9.3/11.0  v2-quant-pad 8.4/10.1  v2-quant-hist 3.8/5.8  v2-quant-scatter 5.0/6.8  v2-quant-pad-scatter-hist 3.6/5.8  v2n32-quant 8.7/10.5  v2u4-quant 9.5/11.2  v2-sort-quant 2.2/5.8
+T= 2048 bm=64 kernel us cold/warm-e2e:  v2-quant 11.2/13.1  v2-quant-pad 10.1/12.1  v2-quant-hist 3.8/5.9  v2-quant-scatter 6.3/8.1  v2-quant-pad-scatter-hist 3.3/5.8  v2n32-quant 10.5/12.5  v2u4-quant 11.3/13.3  v2-sort-quant 2.3/5.8
+
+## routes per sort WG (rng) sweep: r<N> = rng N (n_sort = max(16, M*K/N))
+T= 1024 bm=64 kernel us cold/warm-e2e:  aiter 17.8/19.6  v2 11.9/13.4  v2r256 7.6/9.1  v2r512 8.2/10.0  v2r1024 9.7/11.5  v2r256-quant 4.6/6.3  v2r512-quant 6.0/7.6  v2-quant 9.3/11.1
+T= 2048 bm=64 kernel us cold/warm-e2e:  aiter 30.3/30.5  v2 15.2/16.4  v2r256 11.4/12.0  v2r512 11.3/12.3  v2r1024 12.6/14.2  v2r256-quant 6.0/7.7  v2r512-quant 6.8/8.5  v2-quant 11.1/13.0
+T= 4096 bm=64 kernel us cold/warm-e2e:  aiter 39.6/40.7  v2 23.0/24.9  v2r256 20.9/22.3  v2r512 20.3/22.1  v2r1024 20.6/22.5  v2r256-quant 8.9/10.5  v2r512-quant 9.3/10.9  v2-quant 13.4/15.2
+T= 8192 bm=64 kernel us cold/warm-e2e:  aiter 59.3/60.7  v2 40.4/41.9  v2r256 41.8/43.6  v2r512 38.9/40.6  v2r1024 39.0/40.7  v2r256-quant 14.8/16.5  v2r512-quant 15.1/16.6  v2-quant 18.4/19.7
+T=16384 bm=64 kernel us cold/warm-e2e:  aiter 117.8/120.3  v2 87.8/91.9  v2r256 98.7/101.0  v2r512 92.5/94.7  v2r1024 89.2/91.0  v2r256-quant 29.7/31.5  v2r512-quant 26.3/27.9  v2-quant 28.0/29.9
+T=32768 bm=64 kernel us cold/warm-e2e:  aiter 228.0/230.0  v2 184.1/184.6  v2r256 241.6/242.2  v2r512 203.0/204.8  v2r1024 194.0/195.0  v2r256-quant 93.1/94.7  v2r512-quant 54.6/56.2  v2-quant 48.8/50.5
+
+## larger rng at large T
+T= 8192 bm=64 kernel us cold/warm-e2e:  v2r1024 39.1/40.8  v2r2048 40.1/41.9  v2r4096 43.9/45.8  v2r8192 45.5/49.0  v2r4096-quant 22.9/25.0  v2r8192-quant 30.5/33.2
+T=16384 bm=64 kernel us cold/warm-e2e:  v2r1024 86.4/89.0  v2r2048 90.4/92.8  v2r4096 86.9/88.6  v2r8192 94.2/96.3  v2r4096-quant 32.1/34.3  v2r8192-quant 38.8/40.9
+T=32768 bm=64 kernel us cold/warm-e2e:  v2r1024 194.2/195.7  v2r2048 184.5/186.3  v2r4096 183.8/185.2  v2r8192 187.5/188.2  v2r4096-quant 52.1/54.1  v2r8192-quant 54.6/56.4

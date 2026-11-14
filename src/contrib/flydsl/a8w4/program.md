@@ -5,7 +5,7 @@
 ## 理解问题
 阅读 README.md 明确：
  - 本目录kernel的优化目标
- - 目前尝试过的优化方案，包括有效和无效的
+ - 目前尝试过的优化方案(experiments/log_*.md)，包括有效和无效的
 
 ## 调研优化思路
 
@@ -13,6 +13,7 @@
  - 根据对 README.md 的理解总结搜索关键词
  - vllm-project/humming, rocm/aiter, DeepEP, DeepGEMM、ByteDance Flux / COMET, MegaBlocks（Stanford / Databricks 开源）, TensorRT-LLM，SGLang / vLLM，Megatron-LM，FlashInfer 以及 TokenSpeed 等项目的当前代码以及open PR
  - 分析理解如何适配到a8w4 moe tp/ep/mega 的优化
+ - 提示：目前主要关注的total_num_tokens范围是1024~32768
 
 ## 逐个尝试
 整理本次收集到的优化思路，对照 experiments/log_xxx.md 中已经尝试过的实验 (xxx是年月日)，形成本次值得尝试的列表，并逐项尝试，尝试产出和实验结果都记录到experiments子目录下的对应子目录中。

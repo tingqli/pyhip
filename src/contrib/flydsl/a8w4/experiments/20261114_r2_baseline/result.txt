@@ -1,0 +1,29 @@
+# HIP_VISIBLE_DEVICES=0 python breakdown.py ep8 1 2 4 8 16 --local 1  (each token routes to exactly 1 local expert)
+ep8 T=    1 cfg='ep3k t16' e2e    34.8 us  kernels    33.0  cos 1.3e-04  ep_gemm1 18.9  ep_prep 7.7  ep_gemm2 6.5
+ep8 T=    2 cfg='ep3k t16' e2e    35.4 us  kernels    33.3  cos 3.3e-05  ep_gemm1 18.4  ep_prep 7.7  ep_gemm2 7.2
+ep8 T=    4 cfg='ep3k t16' e2e    36.3 us  kernels    34.2  cos 1.1e-04  ep_gemm1 18.6  ep_gemm2 7.9  ep_prep 7.7
+ep8 T=    8 cfg='ep3k t16' e2e    48.9 us  kernels    46.7  cos 5.2e-05  ep_gemm1 24.5  ep_gemm2 14.4  ep_prep 7.8
+ep8 T=   16 cfg='ep3k t16' e2e    66.6 us  kernels    64.5  cos 8.6e-05  ep_gemm1 36.6  ep_gemm2 20.0  ep_prep 7.9
+
+# HIP_VISIBLE_DEVICES=1 python breakdown.py tp8 1 2 4 8 16  (uniform routing; kernel_0 = row_quant)
+tp8 T=    1 cfg='tp2k bm32 g1bcm2 g2base' e2e    43.6 us  kernels    42.1  cos 3.5e-05  a8w4_gemm1 24.3  moe_sorting 8.6  a8w4_gemm2 4.8  kernel_0 4.5
+tp8 T=    2 cfg='tp2k bm32 g1bcm2 g2base' e2e    44.3 us  kernels    42.5  cos 1.2e-04  a8w4_gemm1 24.3  moe_sorting 8.7  a8w4_gemm2 5.0  kernel_0 4.5
+tp8 T=    4 cfg='tp2k bm32 g1bcm2 g2nt4' e2e    45.8 us  kernels    44.0  cos 1.8e-04  a8w4_gemm1 24.4  moe_sorting 9.1  a8w4_gemm2 6.0  kernel_0 4.4
+tp8 T=    8 cfg='tp2k bm32 g1bcm2 g2nt4' e2e    53.2 us  kernels    50.8  cos 1.2e-04  a8w4_gemm1 25.6  a8w4_gemm2 11.4  moe_sorting 9.5  kernel_0 4.4
+tp8 T=   16 cfg='tp2k bm32 g1bcm1 g2base' e2e    70.7 us  kernels    68.4  cos 9.3e-05  a8w4_gemm1 31.7  a8w4_gemm2 18.8  moe_sorting 13.4  kernel_0 4.5
+
+# focus range (total tokens 1024 - 32768): HIP_VISIBLE_DEVICES=1 python breakdown.py tp8 1024 2048 4096 8192 16384 32768
+tp8 T= 1024 cfg='tp2k bm64 g1bcm2 g2nt4' e2e   214.9 us  kernels   212.0  cos 8.9e-05  a8w4_gemm1 113.7  a8w4_gemm2 79.1  moe_sorting 12.8  kernel_0 6.3
+tp8 T= 2048 cfg='tp1k bcm1 ks1' e2e   340.2 us  kernels   341.0  cos 9.5e-05  a8w4_fmoe_bm64 307.3  moe_sorting 22.2  kernel_0 11.5
+tp8 T= 4096 cfg='tp1kq bcm1' e2e   503.1 us  kernels   504.6  cos 8.8e-05  a8w4_fmoe_bm64q 460.2  moe_sorting 25.5  kernel_0 18.9
+tp8 T= 8192 cfg='tp1k bcm1 ks1' e2e   854.2 us  kernels   857.9  cos 8.9e-05  a8w4_fmoe_bm64 791.1  moe_sorting 34.9  kernel_0 32.0
+tp8 T=16384 cfg='tp1k bcm1 ks1' e2e  1631.8 us  kernels  1608.2  cos 8.9e-05  a8w4_fmoe_bm64 1497.5  kernel_0 58.6  moe_sorting 52.1
+tp8 T=32768 cfg='tp1k bcm1 ks1' e2e  3013.2 us  kernels  3032.8  cos 8.9e-05  a8w4_fmoe_bm64 2809.2  kernel_0 130.9  moe_sorting 92.7
+
+# HIP_VISIBLE_DEVICES=0 python breakdown.py ep8 1024 2048 4096 8192 16384 32768 --local 0  (uniform routing over all 256 experts, 32 local)
+ep8 T= 1024 cfg='ep3k m64' e2e   195.9 us  kernels   193.7  cos 2.7e-05  ep_gemm1 114.2  ep_gemm2 68.2  ep_prep 11.3
+ep8 T= 2048 cfg='ep3k l128' e2e   291.2 us  kernels   289.1  cos 2.4e-05  ep_gemm1 167.0  ep_gemm2 107.2  ep_prep 14.8
+ep8 T= 4096 cfg='ep3k l128' e2e   477.5 us  kernels   475.4  cos 2.6e-05  ep_gemm1 276.1  ep_gemm2 176.6  ep_prep 22.7
+ep8 T= 8192 cfg='ep3k l128' e2e   757.5 us  kernels   764.6  cos 2.4e-05  ep_gemm1 452.2  ep_gemm2 280.0  ep_prep 32.4
+ep8 T=16384 cfg='ep3k l128' e2e  1405.4 us  kernels  1435.0  cos 2.3e-05  ep_gemm1 852.8  ep_gemm2 527.4  ep_prep 54.8
+ep8 T=32768 cfg='ep3k l128' e2e  2598.7 us  kernels  2623.8  cos 2.6e-05  ep_gemm1 1614.0  ep_gemm2 908.4  ep_prep 101.3

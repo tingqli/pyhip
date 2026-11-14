@@ -1,0 +1,504 @@
+diff --git a/../kernels/ep_gemm.py b/20261114_splitk_gemm1/ep_gemm_sk.py
+index cd5b918..9223cc6 100644
+--- a/../kernels/ep_gemm.py
++++ b/20261114_splitk_gemm1/ep_gemm_sk.py
+@@ -48,12 +48,12 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+ from flydsl.expr.typing import T
+ from flydsl.expr.typing import Vector as Vec
+ 
+-from .._vendor import buffer_ops
+-from .._vendor import buffer_ops as bo
+-from .._vendor.act import gate_up_act, situ_params
+-from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
+-from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
+-from .._vendor.mxfp4_gemm_common import (
++from a8w4._vendor import buffer_ops
++from a8w4._vendor import buffer_ops as bo
++from a8w4._vendor.act import gate_up_act, situ_params
++from a8w4._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
++from a8w4._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
++from a8w4._vendor.mxfp4_gemm_common import (
+     _gep1,
+     _global_base_ptr1,
+     _global_i32_buffer_tiles,
+@@ -63,10 +63,10 @@ from .._vendor.mxfp4_gemm_common import (
+     lds_typed_ptr,
+     lds_vec_load,
+ )
+-from .._vendor.tensor_shim import _run_compiled
+-from .._vendor.tensor_shim import _to_raw as _raw
+-from . import ep_prep as PR  # noqa: E402
+-from . import tp_gemm1 as G1  # noqa: E402
++from a8w4._vendor.tensor_shim import _run_compiled
++from a8w4._vendor.tensor_shim import _to_raw as _raw
++from a8w4.kernels import ep_prep as PR  # noqa: E402
++from a8w4.kernels import tp_gemm1 as G1  # noqa: E402
+ 
+ 
+ HERE = os.path.dirname(os.path.abspath(__file__))
+@@ -155,6 +155,31 @@ def _masked_lds_store(atom, reg, dst, ok):
+         fx.copy(atom, reg, dst)
+ 
+ 
++# split-K (experiment): cross-WG partial exchange
++SK_ST_CM = 16  # sc1: partials written through (read by the last WG, on any XCD)
++SK_LD_CM = 17  # sc0|sc1: device-coherent loads (miss the XCD's non-coherent L2)
++SK_CNT_STRIDE = 32  # i32 between two tile counters (own 128 B line)
++
++
++def _lds_store_i32(ptr, idx, val):
++    ptr[idx] = val
++
++
++@flyc.jit
++def _sk_ticket(arg_cnt, cnt_off, slot, wave, lane):
++    """One thread takes the WG's ticket (device-scope fetch-add on the tile counter)
++    into the LDS slot; every wave waits for it."""
++    if wave == fx.Int32(0):
++        if lane == fx.Int32(0):
++            ptr = _gep1(_global_base_ptr1(arg_cnt), cnt_off * fx.Int32(4))
++            old = fx.Int32(llvm.AtomicRMWOp(
++                llvm.AtomicBinOp.add, ptr, _raw(fx.Int32(1)), llvm.AtomicOrdering.monotonic,
++                syncscope="agent", alignment=4).res)
++            _lds_store_i32(slot, fx.Int32(0), old)
++    rocdl.s_waitcnt(lgkmcnt=0)
++    gpu.barrier()
++
++
+ @flyc.jit
+ def _lds_f32_store_masked(lds_f32, idx, val, ok):
+     if ok:
+@@ -330,7 +355,7 @@ def _row_pads(arg_sids, bx_m, rowv, i32_m):
+ 
+ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, tx, NT,
+                arg_w, arg_ws, arg_a, a_num_bytes, ARB=256, acm=2, SCH=1, ST_STEP=None,
+-               PRIO=0, TR=False, AQ8=False):
++               PRIO=0, TR=False, AQ8=False, KSPL=1):
+     """Trace-time builder of the streamed-W K loop.
+ 
+     ``cols``: list of (key, n0, skey): the 16-col W blocks this wave owns (``n0`` =
+@@ -352,9 +377,13 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+     TK = ARB // AB
+     KG = TK // 128
+     assert KG >= 1, "a K tile holds whole 128-K W chunks"
+-    KT = K // TK
++    # split-K: run() covers KT tiles starting at its runtime tile offset kt_off; the W /
++    # scale / A addressing keeps the full-K strides
++    assert K % (TK * KSPL) == 0, (K, TK, KSPL)
++    KT = K // TK // KSPL
+     STEPS = TK // (32 if FP8 else 16)  # MFMA K steps per tile
+-    assert PF >= 1 and KT % (2 * PF) == 0 and KT // (2 * PF) >= 2, (KT, PF)
++    assert PF >= 1 and KT % (2 * PF) == 0 and KT // (2 * PF) >= (1 if KSPL > 1 else 2), \
++        (KT, PF)
+     W_STEP = 0
+     ST_STEP = STEPS // 2 if ST_STEP is None else ST_STEP
+     assert 0 <= ST_STEP < STEPS
+@@ -426,7 +455,8 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+     def swz(row, col16):
+         return col16 ^ (row & fx.Int32(CH - 1))
+ 
+-    def run(R, row_base16, hook=None, pre_a=None):
++    def run(R, row_base16, hook=None, pre_a=None, kt_off=None):
++        ko = fx.Int32(0) if kt_off is None else kt_off  # first (global) K tile
+         MR = R // 16
+         A_LOADS = -(-(R * CH) // NT)  # 16 B A chunks per thread per tile
+         AU = 2 if AQ8 else 1  # 16 B source units per LDS chunk
+@@ -455,7 +485,7 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+                       for _ in range(A_LOADS)]
+ 
+         def load_a(kt):
+-            k16 = kt * fx.Int32(CH * AU)
++            k16 = (kt + ko) * fx.Int32(CH * AU)
+             for i in range_constexpr(A_LOADS):
+                 for h in range_constexpr(AU):
+                     fx.copy(a_atom, fx.slice(a_tiles, (None, a_src[i] + k16 + fx.Int32(h))),
+@@ -580,7 +610,7 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+         # p = (kt // PF) % 2; the loop body covers 2*PF tiles.
+         wbufs = [[new_wbuf() for _ in range(2)] for _ in range(PF)]
+         for u in range_constexpr(PF):
+-            load_w(wbufs[u][0], fx.Int32(u))
++            load_w(wbufs[u][0], fx.Int32(u) + ko)
+         if const_expr(pre_a is not None):
+             pre_a()  # e.g. wait for A's producer; the W prefetch is already in flight
+         a_sources()
+@@ -597,9 +627,9 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+                 store_a(fx.Int32(1) - slot, last=last_a)
+             if const_expr(load_next2):
+                 load_a(kt + fx.Int32(2))
+-            raw, lut = read_w(wbufs[u][p], kt)
++            raw, lut = read_w(wbufs[u][p], kt + ko)
+             if const_expr(more_w):
+-                load_w(wbufs[u][1 - p], kt + fx.Int32(PF))
++                load_w(wbufs[u][1 - p], kt + fx.Int32(PF) + ko)
+             rocdl.sched_barrier(0)
+             compute(raw, lut, slot, kt)
+ 
+@@ -612,13 +642,13 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+             slot = kt % fx.Int32(2)
+             rocdl.s_waitcnt(lgkmcnt=0)
+             gpu.barrier()  # A(kt) visible; slot (kt+1)%2 free (read at kt-1)
+-            raw, lut = read_w(wbufs[u][p], kt)
++            raw, lut = read_w(wbufs[u][p], kt + ko)
+             a_pair = [read_a2(mi, 0, slot) for mi in range_constexpr(MR)]
+             b_cur = decode_b(raw, lut, 0)
+             rocdl.sched_barrier(0)
+             for s in range_constexpr(STEPS):
+                 if const_expr(s == W_STEP and more_w):
+-                    load_w(wbufs[u][1 - p], kt + fx.Int32(PF))
++                    load_w(wbufs[u][1 - p], kt + fx.Int32(PF) + ko)
+                 if const_expr(s == ST_STEP and store_next):
+                     store_a(fx.Int32(1) - slot, last=last_a)
+                     if const_expr(load_next2):
+@@ -665,7 +695,7 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+ 
+         def tile_step_v3(kt, u, p, more_w, store_next, load_next2, last_a=False):
+             slot = kt % fx.Int32(2)
+-            raw, lut = read_w(wbufs[u][p], kt)  # W regs only: before the barrier
++            raw, lut = read_w(wbufs[u][p], kt + ko)  # W regs only: before the barrier
+             b_cur = decode_b(raw, lut, 0)
+             rocdl.s_waitcnt(lgkmcnt=0)
+             gpu.barrier()  # A(kt) visible; slot (kt+1)%2 free (read at kt-1)
+@@ -674,7 +704,7 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+             rocdl.sched_barrier(0)
+             for s in range_constexpr(STEPS):
+                 if const_expr(s == W_STEP and more_w):
+-                    load_w(wbufs[u][1 - p], kt + fx.Int32(PF))
++                    load_w(wbufs[u][1 - p], kt + fx.Int32(PF) + ko)
+                 if const_expr(s == ST_STEP and store_next):
+                     store_a(fx.Int32(1) - slot, last=last_a)
+                     if const_expr(load_next2):
+@@ -705,7 +735,8 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+                     kt = fx.Int32(it) * fx.Int32(2 * PF) + fx.Int32(q)
+                     tile_step(kt, q % PF, q // PF, True, True, True)
+ 
+-        _k_loop()
++        if const_expr(KT // (2 * PF) > 1):
++            _k_loop()
+         for q in range_constexpr(2 * PF):  # last 2*PF tiles
+             kt = KT - 2 * PF + q
+             tile_step(fx.Int32(kt), q % PF, q // PF, kt + PF < KT, kt + 1 < KT, kt + 2 < KT,
+@@ -727,10 +758,19 @@ def _make_core(*, FP8, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, t
+ @functools.cache
+ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB=256,
+                      acm=2, SCH=1, ST=None, PRIO=0, TR=False, ORDER=False, ZRC=False,
+-                     XG=False, DYN=False, ACT="silu"):
++                     XG=False, DYN=False, ACT="silu", SK=1, SKT=0):
+     """Stage 1: ``h = act(A W1g^T) * (A W1u^T)`` for the sorted rows of one expert
+     block, NI inter columns per WG.
+ 
++    ``SK`` (split-K experiment): SK WGs per (m-block, n-block) tile, WG ``bx`` takes
++    split ``bx % SK`` (K/SK of H) of tile ``bx // SK`` (plain m-major order). Each
++    publishes its f32 accumulators (only lanes holding valid rows) written through
++    (sc1) to ``arg_part``, then bumps the tile's counter in ``arg_cnt``; the last
++    arriver sums the SK partials in split order (deterministic), resets the counter
++    (graph replay) and runs the unchanged epilogue. ``SKT`` > 0: split only when the
++    valid tile count (from num_valid_ids, on device) is <= SKT, else the plain
++    full-K path (the grid is always SK x the tile capacity; idle WGs exit).
++
+     ``ACT``: "silu" or "situv2" (as tp_gemm1: SiTUv2 beta / linear_beta / clamp
+     limit are runtime f32 launch args, see ``G1.situ_args``; silu ignores them).
+ 
+@@ -773,6 +813,13 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
+     if XG:
+         assert TK % QG1 == 0 and BM * NI * 2 <= RATIO_OFF and BM * NW * 4 <= RATIO_OFF
+         LDS_BYTES = RATIO_OFF + (G + 1) * BM * 4
++    assert SK == 1 or not (XG or DYN or ORDER), "split-K: plain order, per-row x scales"
++    SK_SLOT = LDS_BYTES  # split-K: i32 ticket broadcast slot past everything else
++    if SK > 1:
++        LDS_BYTES += 16
++    KTS = H // TK // SK  # K tiles per split
++    NKEY = 2 * NC
++    PART16 = NW * NKEY * (BM // 16) * 64  # 16 B units per (tile, split)
+     assert LDS_BYTES <= 65536, LDS_BYTES
+     kname = (
+         f"ep_gemm1_{ADT}_h{H}_i{I}_e{NE}_bm{BM}_ni{NI}_r{'x'.join(map(str, ROWV))}"
+@@ -782,7 +829,8 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
+         + ("_tr" if TR else "") + ("_o" if ORDER else "") + ("_zrc" if ZRC else "")
+         + ("_xg" if XG else "") + ("_dyn" if DYN else "")
+         + ("" if ACT == "silu" else f"_{ACT}")
+-        + ("_tl" if TL else "")
++        + ("_tl" if TL else "") + (f"_sk{SK}" if SK > 1 else "")
++        + (f"t{SKT}" if SK > 1 and SKT else "")
+     )
+     # route-count-aware zeroing of gemm2's out [M, H] bf16: <= ZRC_UPT units / thread
+     ZRC_ROW16 = H * 2 // 16
+@@ -790,7 +838,8 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
+     TLP = tl_buffer().data_ptr() if TL else 0  # closure scalar -> in the cache key
+ 
+     def _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
+-              arg_out, arg_outs, i32_m, m_block, n_block, lane, wave, tx, situ):
++              arg_out, arg_outs, i32_m, m_block, n_block, lane, wave, tx, situ,
++              arg_part=None, arg_cnt=None, tile_id=None, ks=None):
+         lane_div_16 = lane // fx.Int32(16)
+         lane_mod_16 = lane % fx.Int32(16)
+         e = fx.Int32(rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block))))
+@@ -816,7 +865,8 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
+                           lds_ptr=lds_ptr, LDS_BYTES=LDS_BYTES, lane=lane, tx=tx, NT=NT,
+                           arg_w=arg_w, arg_ws=arg_ws, arg_a=arg_x,
+                           a_num_bytes=fx.Int64(i32_m) * fx.Int64(K * AB), ARB=ARB, acm=acm,
+-                          SCH=SCH, ST_STEP=ST, PRIO=PRIO, TR=TR)
++                          SCH=SCH, ST_STEP=ST, PRIO=PRIO, TR=TR,
++                          KSPL=SK if ks is not None else 1)
+         lds_i32 = fx.Int32(fx.ptrtoint(lds_ptr))
+         lds_f32 = lds_typed_ptr(lds_i32, T.f32)
+ 
+@@ -880,15 +930,85 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
+         def fin_of(r):
+             return fx.Float32(lds_f32[fx.Int32(RATIO_OFF // 4 + G * BM) + r])
+ 
+-        def run_rows(R):
+-            if const_expr(XG):
+-                build_ratios(R)  # visible to all waves after the K loop's first barrier
+-            acc = core(R, row_base16, hook if XG else None)
++        def epilogue_any(R, acc):
+             if const_expr(TR):
+                 _epilogue_tr(R, acc)
+             else:
+                 _epilogue(R, acc)
+ 
++        def run_rows(R):
++            if const_expr(XG):
++                build_ratios(R)  # visible to all waves after the K loop's first barrier
++            if const_expr(SK > 1 and ks is not None):
++                acc = core(R, row_base16, None, kt_off=ks * fx.Int32(KTS))
++                sk_finish(R, acc)
++            else:
++                acc = core(R, row_base16, hook if XG else None)
++                epilogue_any(R, acc)
++
++        def sk_finish(R, acc):
++            """split-K: publish this split's partial, take a ticket; the last of the SK
++            WGs sums the partials (split order) and runs the epilogue."""
++            MR = R // 16
++            nbytes = SK * PART16 * 16
++            rs = buffer_ops.create_buffer_resource_from_addr(
++                _raw(fx.Int64(arg_part) + fx.Int64(tile_id) * fx.Int64(nbytes)),
++                num_records_bytes=_raw(fx.Int64(nbytes)))
++            # a lane's rows: (L//16)*4 + v (TR: L%16) of block mi; valid rows are a
++            # prefix of the block, so the lane's first row decides
++            oks = []
++            for mi in range_constexpr(MR):
++                if const_expr(TR):
++                    r0 = fx.Int32(mi * 16) + lane_mod_16
++                else:
++                    r0 = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)
++                tok = fx.Int32(_global_i32_at(arg_sids, bx_m + r0)) & fx.Int32(0x00FFFFFF)
++                oks.append(tok < i32_m)
++            units = {}
++            for ki in range_constexpr(NKEY):
++                key = (ki // NC, ki % NC)
++                for mi in range_constexpr(MR):
++                    u = ((wave * fx.Int32(NKEY) + fx.Int32(ki)) * fx.Int32(BM // 16)
++                         + fx.Int32(mi)) * fx.Int32(64) + lane
++                    units[key, mi] = u
++                    buffer_ops.buffer_store(Vec(fx.memref_load_vec(acc[key][mi])), rs,
++                                            (ks * fx.Int32(PART16) + u) * fx.Int32(4),
++                                            mask=oks[mi], cache_modifier=SK_ST_CM)
++            rocdl.s_waitcnt(vmcnt=0)  # partials written through before the ticket
++            gpu.barrier()
++            slot = lds_typed_ptr(lds_i32 + fx.Int32(SK_SLOT), T.i32)
++            cnt_off = tile_id * fx.Int32(SK_CNT_STRIDE)
++            _sk_ticket(arg_cnt, cnt_off, slot, wave, lane)
++            old = fx.Int32(rocdl.readfirstlane(T.i32, _raw(fx.Int32(slot[fx.Int32(0)]))))
++            is_last = old == fx.Int32(SK - 1)
++            rs_cnt = buffer_ops.create_buffer_resource_from_addr(
++                _raw(fx.Int64(arg_cnt)), num_records_bytes=_raw(
++                    (fx.Int64(cnt_off) + fx.Int64(1)) * fx.Int64(4)))
++
++            def _reduce_and_epilogue():
++                # reset for the next launch / graph replay (all SK tickets taken)
++                buffer_ops.buffer_store(fx.Int32(0), rs_cnt, cnt_off,
++                                        mask=tx == fx.Int32(0), cache_modifier=SK_ST_CM)
++                for (key, mi), u in units.items():
++                    tot = None
++                    for s in range(SK):
++                        p = Vec(buffer_ops.buffer_load(
++                            rs, (fx.Int32(s * PART16) + u) * fx.Int32(4), vec_width=4,
++                            dtype=T.f32, mask=oks[mi], cache_modifier=SK_LD_CM))
++                        if tot is None:
++                            tot = [fx.Float32(p[v]) for v in range(4)]
++                        else:
++                            tot = [tot[v] + fx.Float32(p[v]) for v in range(4)]
++                    acc[key][mi].store(Vec.from_elements(tot, fx.Float32))
++                epilogue_any(R, acc)
++
++            @flyc.jit
++            def _tail():
++                if is_last:
++                    _reduce_and_epilogue()
++
++            _tail()
++
+         def _epilogue_tr(R, acc):
+             """Transposed acc (lane: row L%16 of each 16-row block, 4 consecutive
+             columns): dequant -> act(gate)*up in registers, then a8w4: row amax
+@@ -1105,10 +1225,31 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
+                     z, rs, ok.select(r * fx.Int32(ZRC_ROW16) + u, n16) * fx.Int32(4))
+             r = r + grid
+ 
++    @flyc.jit
++    def _split_tiles(bx, bound, tx, lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp,
++                     arg_eids, arg_sids, arg_out, arg_outs, i32_m, situ, arg_part, arg_cnt):
++        if bx < bound * fx.Int32(SK):
++            tid = bx // fx.Int32(SK)
++            ks = bx % fx.Int32(SK)
++            m_block, n_block = _tile_of(tid, NB)
++            txo, laneo, waveo = _opaque_tx(tx)
++            _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
++                  arg_out, arg_outs, i32_m, m_block, n_block, laneo, waveo, txo, situ,
++                  arg_part, arg_cnt, tid, ks)
++
++    @flyc.jit
++    def _plain_tiles(bx, bound, tx, lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp,
++                     arg_eids, arg_sids, arg_out, arg_outs, i32_m, situ):
++        if bx < bound:
++            m_block, n_block = _tile_of(_xcd_tile(bx, bound), NB)
++            txo, laneo, waveo = _opaque_tx(tx)
++            _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
++                  arg_out, arg_outs, i32_m, m_block, n_block, laneo, waveo, txo, situ)
++
+     @flyc.jit
+     def _entry(arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_cumsum, arg_sids,
+                arg_out, arg_outs, i32_m, arg_zero, i32_zero16, arg_sched, arg_rc,
+-               f32_sb, f32_sbr, f32_lb, f32_lbr, f32_lim):
++               f32_sb, f32_sbr, f32_lb, f32_lbr, f32_lim, arg_part, arg_cnt):
+         if const_expr(ACT == "situv2"):
+             situ = situ_params(fx.Float32(f32_sb), fx.Float32(f32_sbr), fx.Float32(f32_lb),
+                                fx.Float32(f32_lbr), fx.Float32(f32_lim))
+@@ -1154,17 +1295,32 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
+                     if t < bound:
+                         gpu.barrier()
+             else:
+-                if bx < bound:
+-                    tile = _xcd_tile(bx, bound)
+-                    m_block, n_block = _tile_of(tile, NB)
+-                    if const_expr(TL):
+-                        t0 = _tl_now()
+-                    txo, laneo, waveo = _opaque_tx(tx)
+-                    _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids,
+-                          arg_sids, arg_out, arg_outs, i32_m, m_block, n_block, laneo,
+-                          waveo, txo, situ)
+-                    if const_expr(TL):
+-                        _tl_record(TLP, tile, bx, m_block, t0, tx)
++                if const_expr(SK > 1):
++                    if const_expr(SKT == 0):
++                        _split_tiles(bx, bound, tx, lds_ptr, arg_x, arg_xs, arg_w, arg_ws,
++                                     arg_wexp, arg_eids, arg_sids, arg_out, arg_outs, i32_m,
++                                     situ, arg_part, arg_cnt)
++                    else:
++                        if bound <= fx.Int32(SKT):
++                            _split_tiles(bx, bound, tx, lds_ptr, arg_x, arg_xs, arg_w,
++                                         arg_ws, arg_wexp, arg_eids, arg_sids, arg_out,
++                                         arg_outs, i32_m, situ, arg_part, arg_cnt)
++                        else:
++                            _plain_tiles(bx, bound, tx, lds_ptr, arg_x, arg_xs, arg_w,
++                                         arg_ws, arg_wexp, arg_eids, arg_sids, arg_out,
++                                         arg_outs, i32_m, situ)
++                else:
++                    if bx < bound:
++                        tile = _xcd_tile(bx, bound)
++                        m_block, n_block = _tile_of(tile, NB)
++                        if const_expr(TL):
++                            t0 = _tl_now()
++                        txo, laneo, waveo = _opaque_tx(tx)
++                        _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids,
++                              arg_sids, arg_out, arg_outs, i32_m, m_block, n_block, laneo,
++                              waveo, txo, situ)
++                        if const_expr(TL):
++                            _tl_record(TLP, tile, bx, m_block, t0, tx)
+         if const_expr(ZRC):
+             _zero_rc_post(arg_zero, i32_zero16, ZRC_ROW16, ZRC_UPT, zpre, bx, tx, NT)
+         if const_expr(DYN):
+@@ -1177,10 +1333,10 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
+                i32_m: fx.Int32, arg_zero: fx.Int64, i32_zero16: fx.Int32,
+                arg_sched: fx.Int64, arg_rc: fx.Int64, f32_sb: fx.Float32,
+                f32_sbr: fx.Float32, f32_lb: fx.Float32, f32_lbr: fx.Float32,
+-               f32_lim: fx.Float32):
++               f32_lim: fx.Float32, arg_part: fx.Int64, arg_cnt: fx.Int64):
+         _entry(arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_cumsum, arg_sids,
+                arg_out, arg_outs, i32_m, arg_zero, i32_zero16, arg_sched, arg_rc,
+-               f32_sb, f32_sbr, f32_lb, f32_lbr, f32_lim)
++               f32_sb, f32_sbr, f32_lb, f32_lbr, f32_lim, arg_part, arg_cnt)
+ 
+     @flyc.jit
+     def launch(arg_x: fx.Int64, arg_xs: fx.Int64, arg_w: fx.Int64, arg_ws: fx.Int64,
+@@ -1189,10 +1345,11 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
+                i32_m: fx.Int32, arg_zero: fx.Int64, i32_zero16: fx.Int32,
+                arg_sched: fx.Int64, arg_rc: fx.Int64, f32_sb: fx.Float32,
+                f32_sbr: fx.Float32, f32_lb: fx.Float32, f32_lbr: fx.Float32,
+-               f32_lim: fx.Float32, i32_grid: fx.Int32, stream: fx.Stream):
++               f32_lim: fx.Float32, arg_part: fx.Int64, arg_cnt: fx.Int64,
++               i32_grid: fx.Int32, stream: fx.Stream):
+         kernel(arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_cumsum, arg_sids,
+                arg_out, arg_outs, i32_m, arg_zero, i32_zero16, arg_sched, arg_rc,
+-               f32_sb, f32_sbr, f32_lb, f32_lbr, f32_lim,
++               f32_sb, f32_sbr, f32_lb, f32_lbr, f32_lim, arg_part, arg_cnt,
+                value_attrs=({"rocdl.waves_per_eu": wpe} if wpe else None),
+                ).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(NT, 1, 1), stream=stream)
+ 
+@@ -1203,7 +1360,7 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
+              *, adt, block_m, ni=128, rowv=None, pf=2, bcm=2, wpe=None, nw=4, arb=256,
+              zero=None, acm=2, sch=1, st=None, prio=0, tr=False, sched=None, zero_rc=None,
+              x_group=False, dyn=False, grid=None, act="silu", situ_beta=1.0,
+-             situ_linear_beta=1.0, swiglu_limit=float("inf")):
++             situ_linear_beta=1.0, swiglu_limit=float("inf"), sk=1, sk_tiles=0):
+     """Host launcher. ``x``: fp8 [M, H] (+ ``x_scale`` f32 [M]) or bf16 [M, H];
+     ``out``: fp8 (u8) [sorted, I] + ``out_scale`` f32 [sorted, I/128], or bf16
+     [sorted, I]; ``W`` from ``prepare_weights``. ``zero``: optional tensor (e.g.
+@@ -1220,8 +1377,13 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
+     M, H = x.shape
+     NE, N2, _ = W["w1"].shape
+     I = N2 // 2
++    tiles = sorted_expert_ids.numel() * (I // ni)
++    if sk > 1:
++        assert sched is None and not dyn and not x_group
++        # adaptive: the split path only runs for <= sk_tiles valid tiles
++        grid = max(tiles, min(tiles, sk_tiles) * sk) if sk_tiles else tiles * sk
+     if grid is None:
+-        grid = _grid(sorted_expert_ids.numel() * (I // ni), sched)
++        grid = _grid(tiles, sched)
+     if dyn:
+         assert zero is not None and zero_rc is not None and grid % 8 == 0
+         zrc = False
+@@ -1235,7 +1397,8 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
+                               ROWV=tuple(rowv or (block_m,)), PF=pf, bcm=bcm, wpe=wpe,
+                               NW=nw, ARB=arb, acm=acm, SCH=sch, ST=st, PRIO=prio, TR=tr,
+                               ORDER=sched is not None, ZRC=zrc, XG=x_group, DYN=dyn,
+-                              ACT=act)
++                              ACT=act, SK=sk, SKT=sk_tiles if sk > 1 else 0)
++    part, cnt = _sk_buffers(tiles, sk, nw, block_m, ni, x.device) if sk > 1 else (None, None)
+     _run_compiled(
+         launch, x.data_ptr(), x_scale.data_ptr() if x_scale is not None else 0,
+         W["w1"].data_ptr(), W["w1_scale"].data_ptr(), W["w1_exp"].data_ptr(),
+@@ -1246,10 +1409,31 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
+         sched.data_ptr() if sched is not None else 0,
+         zero_rc.data_ptr() if (zrc or dyn) else 0,
+         *G1.situ_args(situ_beta, situ_linear_beta, swiglu_limit),
++        part.data_ptr() if part is not None else 0, cnt.data_ptr() if cnt is not None else 0,
+         int(grid), torch.cuda.current_stream())
+     return out
+ 
+ 
++_SK_BUFS = {}
++
++
++def _sk_buffers(tiles, sk, nw, block_m, ni, device):
++    """split-K scratch: f32 partials [tiles, sk, PART16 * 4] and zeroed i32 tile
++    counters (SK_CNT_STRIDE apart; the last arriver resets its counter), grown on
++    demand and reused (graph-safe: same buffers on every call)."""
++    part16 = nw * 2 * (ni // nw // 16) * (block_m // 16) * 64
++    need_p = tiles * sk * part16 * 4
++    need_c = tiles * SK_CNT_STRIDE
++    key = str(device)
++    p, c = _SK_BUFS.get(key, (None, None))
++    if p is None or p.numel() < need_p:
++        p = torch.empty(need_p, dtype=torch.float32, device=device)
++    if c is None or c.numel() < need_c:
++        c = torch.zeros(need_c, dtype=torch.int32, device=device)
++    _SK_BUFS[key] = (p, c)
++    return p, c
++
++
+ # =============================================================================
+ # gemm2: down-proj + routed bf16x2 atomic scatter
+ # =============================================================================

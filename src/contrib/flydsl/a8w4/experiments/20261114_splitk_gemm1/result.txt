@@ -1,0 +1,394 @@
+# cd src/contrib/flydsl/a8w4/experiments/20261114_splitk_gemm1 (run from src/contrib/flydsl with the a8w4/experiments/... path); MI300X gfx942
+
+# HIP_VISIBLE_DEVICES=0 python run.py check  (EP8 'ep3k t16', each token -> 1 or 2 local experts; max|d base| = 0: split order is fixed)
+local=1 T=  1 base         cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk1p2        cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk1p4        cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk2p2        cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk2p4        cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk4p1        cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk4p2        cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk8p1        cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk4p2a128    cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk8p2a128    cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk16p1a128   cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 base         cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk1p2        cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk1p4        cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk2p2        cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk2p4        cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk4p1        cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk4p2        cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk8p1        cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk4p2a128    cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk8p2a128    cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk16p1a128   cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 base         cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk1p2        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk1p4        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk2p2        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk2p4        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk4p1        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk4p2        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk8p1        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk4p2a128    cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk8p2a128    cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk16p1a128   cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 base         cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk1p2        cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk1p4        cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk2p2        cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk2p4        cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk4p1        cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk4p2        cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk8p1        cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk4p2a128    cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk8p2a128    cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk16p1a128   cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 base         cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk1p2        cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk1p4        cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk2p2        cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk2p4        cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk4p1        cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk4p2        cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk8p1        cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk4p2a128    cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk8p2a128    cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk16p1a128   cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 base         cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk1p2        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk1p4        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk2p2        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk2p4        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk4p1        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk4p2        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk8p1        cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk4p2a128    cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk8p2a128    cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk16p1a128   cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 base         cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk1p2        cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk1p4        cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk2p2        cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk2p4        cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk4p1        cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk4p2        cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk8p1        cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk4p2a128    cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk8p2a128    cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk16p1a128   cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 base         cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk1p2        cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk1p4        cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk2p2        cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk2p4        cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk4p1        cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk4p2        cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk8p1        cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk4p2a128    cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk8p2a128    cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk16p1a128   cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 base         cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk1p2        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk1p4        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk2p2        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk2p4        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk4p1        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk4p2        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk8p1        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk4p2a128    cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk8p2a128    cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk16p1a128   cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 base         cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk1p2        cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk1p4        cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk2p2        cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk2p4        cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk4p1        cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk4p2        cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk8p1        cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk4p2a128    cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk8p2a128    cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk16p1a128   cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 base         cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk1p2        cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk1p4        cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk2p2        cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk2p4        cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk4p1        cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk4p2        cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk8p1        cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk4p2a128    cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk8p2a128    cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk16p1a128   cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 base         cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk1p2        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk1p4        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk2p2        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk2p4        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk4p1        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk4p2        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk8p1        cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk4p2a128    cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk8p2a128    cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk16p1a128   cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 base         cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk1p2        cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk1p4        cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk2p2        cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk2p4        cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk4p1        cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk4p2        cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk8p1        cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk4p2a128    cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk8p2a128    cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk16p1a128   cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  8 base         cos 5.3e-05  max|d base| 1.024e+03  stable False  FAIL
+local=0 T=  8 sk1p2        cos 5.2e-05  max|d base| 5.120e+02  stable False  FAIL
+local=0 T=  8 sk1p4        cos 5.2e-05  max|d base| 5.120e+02  stable False  FAIL
+local=0 T=  8 sk2p2        cos 5.2e-05  max|d base| 5.120e+02  stable False  FAIL
+local=0 T=  8 sk2p4        cos 5.2e-05  max|d base| 1.024e+03  stable False  FAIL
+local=0 T=  8 sk4p1        cos 5.2e-05  max|d base| 5.120e+02  stable False  FAIL
+local=0 T=  8 sk4p2        cos 5.2e-05  max|d base| 5.120e+02  stable False  FAIL
+local=0 T=  8 sk8p1        cos 5.2e-05  max|d base| 5.120e+02  stable False  FAIL
+local=0 T=  8 sk4p2a128    cos 5.3e-05  max|d base| 5.120e+02  stable False  FAIL
+local=0 T=  8 sk8p2a128    cos 5.2e-05  max|d base| 1.024e+03  stable False  FAIL
+local=0 T=  8 sk16p1a128   cos 5.2e-05  max|d base| 5.120e+02  stable True  OK
+local=0 T= 16 base         cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk1p2        cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk1p4        cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk2p2        cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk2p4        cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk4p1        cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk4p2        cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk8p1        cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk4p2a128    cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk8p2a128    cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk16p1a128   cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+graph sk1p2        max cos vs eager 0.0e+00 OK
+graph sk1p4        max cos vs eager 0.0e+00 OK
+graph sk2p2        max cos vs eager 0.0e+00 OK
+graph sk2p4        max cos vs eager 0.0e+00 OK
+graph sk4p1        max cos vs eager 0.0e+00 OK
+graph sk4p2        max cos vs eager 0.0e+00 OK
+graph sk8p1        max cos vs eager 0.0e+00 OK
+graph sk4p2a128    max cos vs eager 0.0e+00 OK
+graph sk8p2a128    max cos vs eager 0.0e+00 OK
+graph sk16p1a128   max cos vs eager 0.0e+00 OK
+10 FAILURES
+
+# HIP_VISIBLE_DEVICES=0 python run.py bench 1 2 4 8 16 --local 1 --variants base,sk1p2,sk1p4,sk2p2,sk2p4,sk4p1,sk4p2,sk8p1,sk4p2a128,sk8p2a128,sk16p1a128  (static split)
+local=1 T=   1 e2e(us)  base 34.8(+0%)  sk1p2 34.6(-0%)  sk1p4 34.8(+0%)  sk2p2 29.4(-15%)  sk2p4 29.9(-14%)  sk4p1 27.0(-22%)  sk4p2 26.5(-24%)  sk8p1 26.0(-25%)  sk4p2a128 26.9(-23%)  sk8p2a128 25.8(-26%)  sk16p1a128 29.0(-16%)
+local=1 T=   1 gemm1(us)  base 18.9  sk1p2 18.8  sk1p4 18.8  sk2p2 13.5  sk2p4 14.1  sk4p1 11.2  sk4p2 10.6  sk8p1 10.3  sk4p2a128 11.0  sk8p2a128 10.1  sk16p1a128 13.8
+local=1 T=   2 e2e(us)  base 35.0(+0%)  sk1p2 35.0(+0%)  sk1p4 35.2(+1%)  sk2p2 30.6(-13%)  sk2p4 31.2(-11%)  sk4p1 30.9(-12%)  sk4p2 29.3(-16%)  sk8p1 30.1(-14%)  sk4p2a128 30.2(-14%)  sk8p2a128 30.5(-13%)  sk16p1a128 32.1(-8%)
+local=1 T=   2 gemm1(us)  base 18.6  sk1p2 18.5  sk1p4 18.7  sk2p2 14.2  sk2p4 14.8  sk4p1 14.7  sk4p2 12.9  sk8p1 14.4  sk4p2a128 13.9  sk8p2a128 14.8  sk16p1a128 15.8
+local=1 T=   4 e2e(us)  base 35.2(+0%)  sk1p2 35.2(-0%)  sk1p4 35.4(+0%)  sk2p2 31.2(-11%)  sk2p4 32.0(-9%)  sk4p1 31.9(-10%)  sk4p2 30.1(-15%)  sk8p1 33.0(-6%)  sk4p2a128 31.6(-10%)  sk8p2a128 32.6(-7%)  sk16p1a128 37.0(+5%)
+local=1 T=   4 gemm1(us)  base 18.7  sk1p2 18.7  sk1p4 18.8  sk2p2 14.8  sk2p4 15.6  sk4p1 15.4  sk4p2 13.6  sk8p1 16.6  sk4p2a128 15.1  sk8p2a128 16.1  sk16p1a128 20.8
+local=1 T=   8 e2e(us)  base 47.9(+0%)  sk1p2 47.8(-0%)  sk1p4 48.5(+1%)  sk2p2 48.9(+2%)  sk2p4 49.4(+3%)  sk4p1 52.2(+9%)  sk4p2 51.4(+7%)  sk8p1 56.6(+18%)  sk4p2a128 52.5(+10%)  sk8p2a128 57.5(+20%)  sk16p1a128 65.4(+37%)
+local=1 T=   8 gemm1(us)  base 23.4  sk1p2 23.4  sk1p4 23.9  sk2p2 24.8  sk2p4 25.5  sk4p1 28.5  sk4p2 27.7  sk8p1 32.5  sk4p2a128 28.3  sk8p2a128 33.1  sk16p1a128 40.7
+local=1 T=  16 e2e(us)  base 66.8(+0%)  sk1p2 66.6(-0%)  sk1p4 67.8(+2%)  sk2p2 70.6(+6%)  sk2p4 74.9(+12%)  sk4p1 74.9(+12%)  sk4p2 75.0(+12%)  sk8p1 81.0(+21%)  sk4p2a128 73.3(+10%)  sk8p2a128 83.2(+25%)  sk16p1a128 95.4(+43%)
+local=1 T=  16 gemm1(us)  base 37.1  sk1p2 36.7  sk1p4 37.8  sk2p2 40.4  sk2p4 44.6  sk4p1 44.3  sk4p2 44.6  sk8p1 50.3  sk4p2a128 42.9  sk8p2a128 51.4  sk16p1a128 63.2
+
+# same, --local 2
+local=2 T=   1 e2e(us)  base 34.8(+0%)  sk1p2 34.8(+0%)  sk1p4 34.9(+0%)  sk2p2 29.7(-15%)  sk2p4 30.3(-13%)  sk4p1 27.6(-21%)  sk4p2 27.5(-21%)  sk8p1 28.3(-18%)  sk4p2a128 27.7(-20%)  sk8p2a128 29.1(-16%)  sk16p1a128 31.2(-10%)
+local=2 T=   1 gemm1(us)  base 18.9  sk1p2 18.8  sk1p4 19.0  sk2p2 13.8  sk2p4 14.6  sk4p1 12.0  sk4p2 11.7  sk8p1 12.7  sk4p2a128 12.0  sk8p2a128 13.5  sk16p1a128 15.3
+local=2 T=   2 e2e(us)  base 36.6(+0%)  sk1p2 36.8(+0%)  sk1p4 36.9(+1%)  sk2p2 34.6(-5%)  sk2p4 34.8(-5%)  sk4p1 35.3(-4%)  sk4p2 34.4(-6%)  sk8p1 35.6(-3%)  sk4p2a128 34.9(-5%)  sk8p2a128 35.7(-2%)  sk16p1a128 39.8(+9%)
+local=2 T=   2 gemm1(us)  base 18.9  sk1p2 18.9  sk1p4 19.1  sk2p2 16.8  sk2p4 17.2  sk4p1 17.6  sk4p2 16.8  sk8p1 18.3  sk4p2a128 17.5  sk8p2a128 18.2  sk16p1a128 22.2
+local=2 T=   4 e2e(us)  base 45.2(+0%)  sk1p2 45.2(+0%)  sk1p4 45.7(+1%)  sk2p2 45.1(-0%)  sk2p4 45.8(+1%)  sk4p1 48.2(+7%)  sk4p2 47.8(+6%)  sk8p1 50.0(+11%)  sk4p2a128 48.1(+6%)  sk8p2a128 50.2(+11%)  sk16p1a128 55.2(+22%)
+local=2 T=   4 gemm1(us)  base 23.0  sk1p2 22.8  sk1p4 21.1  sk2p2 22.8  sk2p4 23.6  sk4p1 26.4  sk4p2 26.2  sk8p1 28.1  sk4p2a128 26.6  sk8p2a128 28.6  sk16p1a128 33.4
+local=2 T=   8 e2e(us)  base 70.0(+0%)  sk1p2 70.0(+0%)  sk1p4 70.8(+1%)  sk2p2 74.3(+6%)  sk2p4 78.3(+12%)  sk4p1 78.5(+12%)  sk4p2 79.0(+13%)  sk8p1 85.8(+23%)  sk4p2a128 78.2(+12%)  sk8p2a128 86.5(+24%)  sk16p1a128 100.0(+43%)
+local=2 T=   8 gemm1(us)  base 38.0  sk1p2 38.0  sk1p4 38.8  sk2p2 41.4  sk2p4 44.9  sk4p1 46.2  sk4p2 46.4  sk8p1 53.3  sk4p2a128 45.9  sk8p2a128 54.2  sk16p1a128 66.4
+local=2 T=  16 e2e(us)  base 98.9(+0%)  sk1p2 98.8(-0%)  sk1p4 103.2(+4%)  sk2p2 100.3(+1%)  sk2p4 105.7(+7%)  sk4p1 103.6(+5%)  sk4p2 103.1(+4%)  sk8p1 115.9(+17%)  sk4p2a128 104.0(+5%)  sk8p2a128 117.9(+19%)  sk16p1a128 140.7(+42%)
+local=2 T=  16 gemm1(us)  base 58.1  sk1p2 58.0  sk1p4 62.5  sk2p2 59.7  sk2p4 65.0  sk4p1 62.8  sk4p2 62.7  sk8p1 75.5  sk4p2a128 63.4  sk8p2a128 76.5  sk16p1a128 99.0
+
+# HIP_VISIBLE_DEVICES=2 python run_tp.py check  (TP8 tuned tp2k, gemm1 replaced)
+T=  1 base         cos 3.6e-05  cos vs base 1.3e-05  run jitter 1.4e-05  OK
+T=  1 sk1p2        cos 3.6e-05  cos vs base 8.6e-06  run jitter 1.3e-05  OK
+T=  1 sk2p2        cos 3.5e-05  cos vs base 1.2e-05  run jitter 1.3e-05  OK
+T=  1 sk4p2        cos 3.6e-05  cos vs base 1.1e-05  run jitter 1.3e-05  OK
+T=  1 sk8p1        cos 3.5e-05  cos vs base 1.1e-05  run jitter 1.3e-05  OK
+T=  1 sk8p2a128    cos 3.6e-05  cos vs base 1.3e-05  run jitter 1.3e-05  OK
+T=  1 sk16p1a128   cos 3.5e-05  cos vs base 1.2e-05  run jitter 1.3e-05  OK
+T=  1 sk4p2w4      cos 3.6e-05  cos vs base 1.3e-05  run jitter 1.2e-05  OK
+T=  1 sk8p1w4      cos 3.5e-05  cos vs base 1.2e-05  run jitter 1.3e-05  OK
+T=  2 base         cos 1.2e-04  cos vs base 8.6e-06  run jitter 1.0e-05  OK
+T=  2 sk1p2        cos 1.2e-04  cos vs base 1.0e-05  run jitter 1.2e-05  OK
+T=  2 sk2p2        cos 1.2e-04  cos vs base 1.2e-05  run jitter 1.2e-05  OK
+T=  2 sk4p2        cos 1.2e-04  cos vs base 8.1e-06  run jitter 1.0e-05  OK
+T=  2 sk8p1        cos 1.2e-04  cos vs base 1.1e-05  run jitter 1.1e-05  OK
+T=  2 sk8p2a128    cos 1.2e-04  cos vs base 9.5e-06  run jitter 9.0e-06  OK
+T=  2 sk16p1a128   cos 1.2e-04  cos vs base 1.1e-05  run jitter 1.1e-05  OK
+T=  2 sk4p2w4      cos 1.2e-04  cos vs base 8.6e-06  run jitter 1.1e-05  OK
+T=  2 sk8p1w4      cos 1.2e-04  cos vs base 1.0e-05  run jitter 9.9e-06  OK
+T=  4 base         cos 1.8e-04  cos vs base 1.1e-05  run jitter 1.3e-05  OK
+T=  4 sk1p2        cos 1.8e-04  cos vs base 1.1e-05  run jitter 1.2e-05  OK
+T=  4 sk2p2        cos 1.8e-04  cos vs base 1.1e-05  run jitter 1.3e-05  OK
+T=  4 sk4p2        cos 1.8e-04  cos vs base 1.2e-05  run jitter 1.2e-05  OK
+T=  4 sk8p1        cos 1.8e-04  cos vs base 1.1e-05  run jitter 1.2e-05  OK
+T=  4 sk8p2a128    cos 1.8e-04  cos vs base 1.1e-05  run jitter 1.2e-05  OK
+T=  4 sk16p1a128   cos 1.8e-04  cos vs base 1.2e-05  run jitter 1.2e-05  OK
+T=  4 sk4p2w4      cos 1.8e-04  cos vs base 1.1e-05  run jitter 1.1e-05  OK
+T=  4 sk8p1w4      cos 1.8e-04  cos vs base 1.1e-05  run jitter 1.2e-05  OK
+T=  8 base         cos 1.2e-04  cos vs base 9.1e-06  run jitter 1.0e-05  OK
+T=  8 sk1p2        cos 1.2e-04  cos vs base 1.1e-05  run jitter 8.8e-06  OK
+T=  8 sk2p2        cos 1.2e-04  cos vs base 1.1e-05  run jitter 9.4e-06  OK
+T=  8 sk4p2        cos 1.2e-04  cos vs base 1.0e-05  run jitter 9.0e-06  OK
+T=  8 sk8p1        cos 1.2e-04  cos vs base 1.1e-05  run jitter 8.8e-06  OK
+T=  8 sk8p2a128    cos 1.2e-04  cos vs base 1.1e-05  run jitter 9.7e-06  OK
+T=  8 sk16p1a128   cos 1.2e-04  cos vs base 1.1e-05  run jitter 9.2e-06  OK
+T=  8 sk4p2w4      cos 1.2e-04  cos vs base 1.0e-05  run jitter 9.3e-06  OK
+T=  8 sk8p1w4      cos 1.2e-04  cos vs base 1.1e-05  run jitter 9.2e-06  OK
+T= 16 base         cos 9.3e-05  cos vs base 6.1e-06  run jitter 6.0e-06  OK
+T= 16 sk1p2        cos 9.4e-05  cos vs base 6.3e-06  run jitter 5.3e-06  OK
+T= 16 sk2p2        cos 9.3e-05  cos vs base 6.4e-06  run jitter 5.6e-06  OK
+T= 16 sk4p2        cos 9.3e-05  cos vs base 6.6e-06  run jitter 5.5e-06  OK
+T= 16 sk8p1        cos 9.3e-05  cos vs base 6.4e-06  run jitter 5.6e-06  OK
+T= 16 sk8p2a128    cos 9.3e-05  cos vs base 6.1e-06  run jitter 5.7e-06  OK
+T= 16 sk16p1a128   cos 9.3e-05  cos vs base 6.2e-06  run jitter 5.7e-06  OK
+T= 16 sk4p2w4      cos 9.4e-05  cos vs base 6.2e-06  run jitter 5.5e-06  OK
+T= 16 sk8p1w4      cos 9.3e-05  cos vs base 6.4e-06  run jitter 5.5e-06  OK
+ALL OK
+
+# HIP_VISIBLE_DEVICES=2 python run_tp.py bench 1 2 4 8 16 --variants base,sk1p2,sk2p2,sk4p2,sk8p1,sk8p2a128,sk16p1a128,sk4p2w4,sk8p1w4
+tp8 T=   1 [tp2k bm32 g1bcm2 g2base] e2e(us)  base 43.6(+0%)  sk1p2 38.2(-12%)  sk2p2 32.8(-25%)  sk4p2 29.9(-31%)  sk8p1 28.8(-34%)  sk8p2a128 28.7(-34%)  sk16p1a128 30.2(-31%)  sk4p2w4 30.2(-31%)  sk8p1w4 28.9(-34%)
+tp8 T=   1 gemm1(us)  base 24.4  sk1p2 19.0  sk2p2 13.7  sk4p2 10.7  sk8p1 9.7  sk8p2a128 9.6  sk16p1a128 11.0  sk4p2w4 11.0  sk8p1w4 9.7
+tp8 T=   2 [tp2k bm32 g1bcm2 g2base] e2e(us)  base 44.1(+0%)  sk1p2 38.8(-12%)  sk2p2 34.1(-23%)  sk4p2 32.2(-27%)  sk8p1 32.0(-27%)  sk8p2a128 32.0(-28%)  sk16p1a128 35.1(-20%)  sk4p2w4 32.3(-27%)  sk8p1w4 32.5(-26%)
+tp8 T=   2 gemm1(us)  base 24.5  sk1p2 19.1  sk2p2 14.4  sk4p2 12.4  sk8p1 12.3  sk8p2a128 12.4  sk16p1a128 15.2  sk4p2w4 12.5  sk8p1w4 12.7
+tp8 T=   4 [tp2k bm32 g1bcm2 g2nt4] e2e(us)  base 47.5(+0%)  sk1p2 42.6(-10%)  sk2p2 40.3(-15%)  sk4p2 39.0(-18%)  sk8p1 41.4(-13%)  sk8p2a128 41.1(-13%)  sk16p1a128 44.7(-6%)  sk4p2w4 39.3(-17%)  sk8p1w4 43.5(-8%)
+tp8 T=   4 gemm1(us)  base 24.4  sk1p2 19.2  sk2p2 17.4  sk4p2 15.8  sk8p1 18.1  sk8p2a128 18.0  sk16p1a128 21.5  sk4p2w4 16.2  sk8p1w4 20.5
+tp8 T=   8 [tp2k bm32 g1bcm2 g2nt4] e2e(us)  base 53.6(+0%)  sk1p2 52.0(-3%)  sk2p2 52.6(-2%)  sk4p2 53.9(+1%)  sk8p1 57.6(+7%)  sk8p2a128 57.1(+7%)  sk16p1a128 64.3(+20%)  sk4p2w4 52.6(-2%)  sk8p1w4 59.6(+11%)
+tp8 T=   8 gemm1(us)  base 26.4  sk1p2 24.7  sk2p2 24.8  sk4p2 26.5  sk8p1 29.9  sk8p2a128 29.9  sk16p1a128 37.2  sk4p2w4 24.9  sk8p1w4 32.0
+tp8 T=  16 [tp2k bm32 g1bcm1 g2base] e2e(us)  base 71.4(+0%)  sk1p2 72.2(+1%)  sk2p2 77.2(+8%)  sk4p2 79.5(+11%)  sk8p1 83.4(+17%)  sk8p2a128 83.7(+17%)  sk16p1a128 100.5(+41%)  sk4p2w4 79.3(+11%)  sk8p1w4 87.3(+22%)
+tp8 T=  16 gemm1(us)  base 32.7  sk1p2 34.2  sk2p2 38.9  sk4p2 40.5  sk8p1 45.1  sk8p2a128 44.7  sk16p1a128 61.1  sk4p2w4 41.3  sk8p1w4 49.7
+
+# adaptive split (t64: split only when <= 64 valid tiles, decided on device), full grid: run.py bench --local 1 --variants base,sk4p2,sk4p2t64,sk8p1t64
+local=1 T=   1 e2e(us)  base 34.4(+0%)  sk4p2 26.3(-23%)  sk4p2t64 26.5(-23%)  sk8p1t64 25.6(-26%)
+local=1 T=   1 gemm1(us)  base 18.8  sk4p2 10.8  sk4p2t64 10.9  sk8p1t64 10.3
+local=1 T=   2 e2e(us)  base 35.0(+0%)  sk4p2 29.3(-16%)  sk4p2t64 29.3(-16%)  sk8p1t64 30.2(-14%)
+local=1 T=   2 gemm1(us)  base 18.5  sk4p2 12.7  sk4p2t64 12.7  sk8p1t64 13.5
+local=1 T=   4 e2e(us)  base 35.2(+0%)  sk4p2 30.3(-14%)  sk4p2t64 30.4(-14%)  sk8p1t64 33.2(-6%)
+local=1 T=   4 gemm1(us)  base 18.4  sk4p2 13.9  sk4p2t64 13.8  sk8p1t64 16.6
+local=1 T=   8 e2e(us)  base 48.8(+0%)  sk4p2 51.5(+6%)  sk4p2t64 49.7(+2%)  sk8p1t64 50.5(+4%)
+local=1 T=   8 gemm1(us)  base 24.6  sk4p2 27.5  sk4p2t64 26.1  sk8p1t64 26.9
+local=1 T=  16 e2e(us)  base 67.0(+0%)  sk4p2 75.1(+12%)  sk4p2t64 67.7(+1%)  sk8p1t64 68.6(+2%)
+local=1 T=  16 gemm1(us)  base 36.9  sk4p2 44.5  sk4p2t64 37.6  sk8p1t64 38.5
+
+# same, --local 2
+local=2 T=   1 e2e(us)  base 34.6(+0%)  sk4p2 27.1(-21%)  sk4p2t64 27.2(-21%)  sk8p1t64 27.5(-21%)
+local=2 T=   1 gemm1(us)  base 19.0  sk4p2 11.7  sk4p2t64 11.8  sk8p1t64 12.6
+local=2 T=   2 e2e(us)  base 36.2(+0%)  sk4p2 34.4(-5%)  sk4p2t64 34.4(-5%)  sk8p1t64 36.0(-1%)
+local=2 T=   2 gemm1(us)  base 18.7  sk4p2 16.8  sk4p2t64 16.7  sk8p1t64 18.6
+local=2 T=   4 e2e(us)  base 44.9(+0%)  sk4p2 47.9(+7%)  sk4p2t64 45.0(+0%)  sk8p1t64 45.9(+2%)
+local=2 T=   4 gemm1(us)  base 22.5  sk4p2 26.1  sk4p2t64 22.9  sk8p1t64 23.8
+local=2 T=   8 e2e(us)  base 70.0(+0%)  sk4p2 78.7(+12%)  sk4p2t64 71.0(+1%)  sk8p1t64 72.0(+3%)
+local=2 T=   8 gemm1(us)  base 37.8  sk4p2 45.7  sk4p2t64 38.7  sk8p1t64 39.6
+local=2 T=  16 e2e(us)  base 99.2(+0%)  sk4p2 103.0(+4%)  sk4p2t64 99.4(+0%)  sk8p1t64 99.1(-0%)
+local=2 T=  16 gemm1(us)  base 58.9  sk4p2 62.6  sk4p2t64 58.8  sk8p1t64 58.9
+
+# same on TP8: run_tp.py check + bench
+T=  1 base         cos 3.5e-05  cos vs base 1.3e-05  run jitter 1.3e-05  OK
+T=  1 sk4p2t64     cos 3.5e-05  cos vs base 1.1e-05  run jitter 1.3e-05  OK
+T=  1 sk8p1t64     cos 3.5e-05  cos vs base 1.1e-05  run jitter 1.3e-05  OK
+T=  4 base         cos 1.8e-04  cos vs base 1.2e-05  run jitter 1.3e-05  OK
+T=  4 sk4p2t64     cos 1.8e-04  cos vs base 1.2e-05  run jitter 1.2e-05  OK
+T=  4 sk8p1t64     cos 1.8e-04  cos vs base 1.2e-05  run jitter 1.2e-05  OK
+T=  8 base         cos 1.2e-04  cos vs base 9.7e-06  run jitter 1.0e-05  OK
+T=  8 sk4p2t64     cos 1.2e-04  cos vs base 1.0e-05  run jitter 8.8e-06  OK
+T=  8 sk8p1t64     cos 1.2e-04  cos vs base 9.9e-06  run jitter 8.5e-06  OK
+T= 16 base         cos 9.4e-05  cos vs base 6.6e-06  run jitter 6.3e-06  OK
+T= 16 sk4p2t64     cos 9.3e-05  cos vs base 7.0e-06  run jitter 5.5e-06  OK
+T= 16 sk8p1t64     cos 9.3e-05  cos vs base 6.7e-06  run jitter 5.6e-06  OK
+ALL OK
+tp8 T=   1 [tp2k bm32 g1bcm2 g2base] e2e(us)  base 43.5(+0%)  sk1p2 38.1(-12%)  sk4p2 29.9(-31%)  sk4p2t64 29.9(-31%)  sk8p1t64 28.9(-34%)
+tp8 T=   1 gemm1(us)  base 24.3  sk1p2 19.0  sk4p2 10.7  sk4p2t64 10.8  sk8p1t64 10.2
+tp8 T=   2 [tp2k bm32 g1bcm2 g2base] e2e(us)  base 44.1(+0%)  sk1p2 38.8(-12%)  sk4p2 32.2(-27%)  sk4p2t64 32.1(-27%)  sk8p1t64 32.2(-27%)
+tp8 T=   2 gemm1(us)  base 24.3  sk1p2 19.0  sk4p2 13.1  sk4p2t64 13.2  sk8p1t64 12.3
+tp8 T=   4 [tp2k bm32 g1bcm2 g2nt4] e2e(us)  base 46.2(+0%)  sk1p2 41.2(-11%)  sk4p2 37.7(-18%)  sk4p2t64 37.9(-18%)  sk8p1t64 40.1(-13%)
+tp8 T=   4 gemm1(us)  base 24.3  sk1p2 19.1  sk4p2 15.7  sk4p2t64 15.7  sk8p1t64 16.9
+tp8 T=   8 [tp2k bm32 g1bcm2 g2nt4] e2e(us)  base 52.6(+0%)  sk1p2 50.4(-4%)  sk4p2 53.2(+1%)  sk4p2t64 50.5(-4%)  sk8p1t64 51.2(-3%)
+tp8 T=   8 gemm1(us)  base 25.7  sk1p2 23.4  sk4p2 26.2  sk4p2t64 23.6  sk8p1t64 23.9
+tp8 T=  16 [tp2k bm32 g1bcm1 g2base] e2e(us)  base 70.2(+0%)  sk1p2 71.0(+1%)  sk4p2 78.5(+12%)  sk4p2t64 71.4(+2%)  sk8p1t64 73.4(+5%)
+tp8 T=  16 gemm1(us)  base 32.1  sk1p2 33.4  sk4p2 39.7  sk4p2t64 33.6  sk8p1t64 36.1
+
+# adaptive v2 (grid shrunk to the split tile count; the shipped ep_gemm_sk.py): run.py check
+local=1 T=  1 sk4p2t64     cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  1 sk8p1t64     cos 5.2e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk4p2t64     cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  2 sk8p1t64     cos 4.1e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk4p2t64     cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  4 sk8p1t64     cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk4p2t64     cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T=  8 sk8p1t64     cos 9.0e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk4p2t64     cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=1 T= 16 sk8p1t64     cos 9.5e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk4p2t64     cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  1 sk8p1t64     cos 5.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk4p2t64     cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  2 sk8p1t64     cos 4.6e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk4p2t64     cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  4 sk8p1t64     cos 6.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk4p2t64     cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T=  8 sk8p1t64     cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk4p2t64     cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=2 T= 16 sk8p1t64     cos 1.3e-04  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk4p2t64     cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  1 sk8p1t64     cos 0.0e+00  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk4p2t64     cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  2 sk8p1t64     cos 9.8e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk4p2t64     cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  4 sk8p1t64     cos 5.0e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T=  8 sk4p2t64     cos 5.3e-05  max|d base| 1.024e+03  stable True  OK
+local=0 T=  8 sk8p1t64     cos 5.2e-05  max|d base| 5.120e+02  stable True  OK
+local=0 T= 16 sk4p2t64     cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+local=0 T= 16 sk8p1t64     cos 8.3e-05  max|d base| 0.000e+00  stable True  OK
+graph sk4p2t64     max cos vs eager 0.0e+00 OK
+graph sk8p1t64     max cos vs eager 0.0e+00 OK
+ALL OK
+
+# adaptive v2: run.py bench 1 2 4 8 16 --local 1 --variants base,sk4p2t64,sk8p1t64
+local=1 T=   1 e2e(us)  base 34.6(+0%)  sk4p2t64 26.5(-23%)  sk8p1t64 25.0(-28%)
+local=1 T=   1 gemm1(us)  base 18.8  sk4p2t64 10.7  sk8p1t64 9.4
+local=1 T=   2 e2e(us)  base 34.6(+0%)  sk4p2t64 28.9(-16%)  sk8p1t64 27.7(-20%)
+local=1 T=   2 gemm1(us)  base 18.5  sk4p2t64 12.8  sk8p1t64 11.5
+local=1 T=   4 e2e(us)  base 35.0(+0%)  sk4p2t64 30.0(-14%)  sk8p1t64 32.4(-8%)
+local=1 T=   4 gemm1(us)  base 18.4  sk4p2t64 13.5  sk8p1t64 15.0
+local=1 T=   8 e2e(us)  base 47.9(+0%)  sk4p2t64 48.3(+1%)  sk8p1t64 49.0(+2%)
+local=1 T=   8 gemm1(us)  base 24.7  sk4p2t64 25.1  sk8p1t64 26.1
+local=1 T=  16 e2e(us)  base 66.6(+0%)  sk4p2t64 66.5(-0%)  sk8p1t64 67.2(+1%)
+local=1 T=  16 gemm1(us)  base 36.7  sk4p2t64 36.1  sk8p1t64 37.0
+
+# adaptive v2: same, --local 2
+local=2 T=   1 e2e(us)  base 34.5(+0%)  sk4p2t64 27.3(-21%)  sk8p1t64 26.0(-25%)
+local=2 T=   1 gemm1(us)  base 18.9  sk4p2t64 11.8  sk8p1t64 10.7
+local=2 T=   2 e2e(us)  base 36.5(+0%)  sk4p2t64 34.3(-6%)  sk8p1t64 35.0(-4%)
+local=2 T=   2 gemm1(us)  base 18.9  sk4p2t64 16.7  sk8p1t64 17.6
+local=2 T=   4 e2e(us)  base 45.3(+0%)  sk4p2t64 45.4(+0%)  sk8p1t64 45.6(+1%)
+local=2 T=   4 gemm1(us)  base 22.8  sk4p2t64 22.8  sk8p1t64 22.6
+local=2 T=   8 e2e(us)  base 69.9(+0%)  sk4p2t64 70.2(+1%)  sk8p1t64 71.2(+2%)
+local=2 T=   8 gemm1(us)  base 37.8  sk4p2t64 38.0  sk8p1t64 38.8
+local=2 T=  16 e2e(us)  base 98.7(+0%)  sk4p2t64 98.9(+0%)  sk8p1t64 98.8(+0%)
+local=2 T=  16 gemm1(us)  base 58.2  sk4p2t64 58.6  sk8p1t64 58.2
+
+# adaptive v2: run_tp.py check + bench
+T=  1 base         cos 3.6e-05  cos vs base 1.4e-05  run jitter 1.2e-05  OK
+T=  1 sk4p2t64     cos 3.5e-05  cos vs base 1.2e-05  run jitter 1.2e-05  OK
+T=  4 base         cos 1.8e-04  cos vs base 1.2e-05  run jitter 1.2e-05  OK
+T=  4 sk4p2t64     cos 1.8e-04  cos vs base 1.0e-05  run jitter 1.2e-05  OK
+T= 16 base         cos 9.4e-05  cos vs base 5.7e-06  run jitter 5.3e-06  OK
+T= 16 sk4p2t64     cos 9.4e-05  cos vs base 6.0e-06  run jitter 5.7e-06  OK
+ALL OK
+tp8 T=   1 [tp2k bm32 g1bcm2 g2base] e2e(us)  base 43.5(+0%)  sk1p2 38.2(-12%)  sk4p2t64 29.8(-32%)  sk8p1t64 28.7(-34%)
+tp8 T=   1 gemm1(us)  base 24.4  sk1p2 19.1  sk4p2t64 10.7  sk8p1t64 9.5
+tp8 T=   2 [tp2k bm32 g1bcm2 g2base] e2e(us)  base 44.1(+0%)  sk1p2 38.9(-12%)  sk4p2t64 32.1(-27%)  sk8p1t64 32.1(-27%)
+tp8 T=   2 gemm1(us)  base 24.3  sk1p2 19.0  sk4p2t64 12.2  sk8p1t64 12.2
+tp8 T=   4 [tp2k bm32 g1bcm2 g2nt4] e2e(us)  base 46.4(+0%)  sk1p2 41.3(-11%)  sk4p2t64 37.8(-18%)  sk8p1t64 40.1(-14%)
+tp8 T=   4 gemm1(us)  base 24.4  sk1p2 19.2  sk4p2t64 15.8  sk8p1t64 18.2
+tp8 T=   8 [tp2k bm32 g1bcm2 g2nt4] e2e(us)  base 53.1(+0%)  sk1p2 51.1(-4%)  sk4p2t64 51.1(-4%)  sk8p1t64 51.2(-4%)
+tp8 T=   8 gemm1(us)  base 25.8  sk1p2 23.9  sk4p2t64 23.9  sk8p1t64 24.1
+tp8 T=  16 [tp2k bm32 g1bcm1 g2base] e2e(us)  base 70.2(+0%)  sk1p2 71.9(+2%)  sk4p2t64 71.6(+2%)  sk8p1t64 72.8(+4%)
+tp8 T=  16 gemm1(us)  base 31.2  sk1p2 34.2  sk4p2t64 33.9  sk8p1t64 35.5
+
+# EP gemm1 (ep_gemm_sk, no split) on the TP8 shape at T=1024 (in focus range): run_tp.py bench 1024 --variants base,sk1p2,sk1p1,sk1p2w4 --prof  -> no gain, both gemm1 ~113 us = 268 MB W1 at ~2.4 TB/s
+tp8 T=1024 [tp2k bm64 g1bcm2 g2nt4] e2e(us)  base 214.9(+0%)  sk1p2 214.4(-0%)  sk1p1 213.0(-1%)  sk1p2w4 219.9(+2%)
+tp8 T=1024 gemm1(us)  base 114.4  sk1p2 113.7  sk1p1 112.7  sk1p2w4 119.2

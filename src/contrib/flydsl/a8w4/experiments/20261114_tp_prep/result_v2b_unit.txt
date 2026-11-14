@@ -1,0 +1,23 @@
+T=    1 bm= 32 nv=[256, 1] blocks tp_prep 8 vs aiter 256  OK
+T=    1 bm= 64 nv=[512, 1] blocks tp_prep 8 vs aiter 256  OK
+T=    3 bm= 32 nv=[704, 3] blocks tp_prep 24 vs aiter 257  OK
+T=    3 bm= 64 nv=[1408, 3] blocks tp_prep 24 vs aiter 257  OK
+T=   16 bm= 32 nv=[3104, 16] blocks tp_prep 132 vs aiter 260  OK
+T=   16 bm= 64 nv=[6208, 16] blocks tp_prep 130 vs aiter 258  OK
+T=  255 bm= 32 nv=[8192, 255] blocks tp_prep 319 vs aiter 320  OK
+T=  255 bm= 64 nv=[16384, 255] blocks tp_prep 287 vs aiter 288  OK
+T=  256 bm= 32 nv=[8192, 256] blocks tp_prep 320 vs aiter 320  OK
+T=  256 bm= 64 nv=[16384, 256] blocks tp_prep 288 vs aiter 288  OK
+T=  300 bm= 32 nv=[8160, 300] blocks tp_prep 331 vs aiter 331  OK
+T=  300 bm= 64 nv=[16320, 300] blocks tp_prep 293 vs aiter 294  OK
+T= 1024 bm= 32 nv=[12032, 1024] blocks tp_prep 512 vs aiter 512  OK
+T= 1024 bm= 64 nv=[16384, 1024] blocks tp_prep 384 vs aiter 384  OK
+T= 2049 bm= 32 nv=[20480, 2049] blocks tp_prep 768 vs aiter 768  OK
+T= 2049 bm= 64 nv=[24576, 2049] blocks tp_prep 512 vs aiter 512  OK
+T= 4096 bm= 32 nv=[36544, 4096] blocks tp_prep 1280 vs aiter 1280  OK
+T= 4096 bm= 64 nv=[40256, 4096] blocks tp_prep 768 vs aiter 768  OK
+T= 8192 bm= 32 nv=[69408, 8192] blocks tp_prep 2304 vs aiter 2304  OK
+T= 8192 bm= 64 nv=[73216, 8192] blocks tp_prep 1280 vs aiter 1280  OK
+T=32768 bm= 32 nv=[266240, 32768] blocks tp_prep 8448 vs aiter 8448  OK
+T=32768 bm= 64 nv=[270336, 32768] blocks tp_prep 4352 vs aiter 4352  OK
+ALL OK

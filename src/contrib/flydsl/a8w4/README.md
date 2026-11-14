@@ -2,7 +2,7 @@
 
 fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）。TP 和 EP 共用一个入口 `a8w4_moe`：每次调用按（shape，token 数）查调优表，从 5 类 kernel 里选出当前上下文（激活函数、是否在 CUDA graph capture 中、token 数）允许的最快配置。EP 的 all-to-all 接收缓冲区（例如 MORI dispatch：按容量分配，有效行数只在 device 上）用 `a8w4_moe_dyn`，不做 host 同步，可以放进 CUDA graph（2.4 节）。调优表覆盖 XiaomiMiMo/MiMo-V2.6-Flash(-RL) 的 TP8、EP8 每卡 shape（另有 TP4），1–32768 tokens，SiLU 与 SiTUv2 各一组（TP4 只有 SiLU）。
 
-本目录是一个独立的 Python 包。kernel 只依赖 torch 和 FlyDSL 0.3.2，aiter 的 FlyDSL helper 已复制到 `_vendor/`。aiter 只在三处用到：TP 族 kernel 的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
+本目录是一个独立的 Python 包。kernel 只依赖 torch 和 FlyDSL 0.3.2，aiter 的 FlyDSL helper 已复制到 `_vendor/`。aiter 只在三处用到：TP 族 kernel 跑专家切片（EP 形状）时的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
 
 ## 目录
 
@@ -73,7 +73,7 @@ E 是 `W` 中的本地专家数，e0 = `expert_offset`。
 |---|---|
 | `x` | bf16 [M, H]，连续 |
 | `topk_weights` | f32 [M, topk]。`routed_scaling_factor` 之类的系数要事先乘进去 |
-| `topk_ids` | int32 [M, topk]，全局专家 id。EP kernel 只处理 [e0, e0+E) 内的 id，其他值（包括 -1）视为不属于本卡；TP 族 kernel 走 aiter `moe_sorting`，id 必须落在 [0, num_experts) 内 |
+| `topk_ids` | int32 [M, topk]，全局专家 id。EP kernel 只处理 [e0, e0+E) 内的 id，其他值（包括 -1）视为不属于本卡；TP 族 kernel 走 `tp_prep`（专家切片时走 aiter `moe_sorting`），id 必须落在 [0, num_experts) 内 |
 | `W` | `prepare_weights` 的输出 |
 | `expert_offset` / `num_experts` | 见上；默认 0 / E，即 TP |
 | `act`, `situ` | `"silu"`（默认）或 `"situv2"`；`situ=dict(situ_beta, situ_linear_beta, swiglu_limit)`。两族 kernel 都支持（5.8 节）；查表用该 act 的行（6.2 节） |
@@ -158,6 +158,7 @@ a8w4/
   tests/test_a8w4_mori_tp8.py  8 卡 TP8 整层（a8w4_moe → all-reduce），EP8 脚本的 TP 对照：pytest 查正确性，命令行测性能（8.2 节）
   kernels/                     FlyDSL device 代码
     row_quant.py               x 按行 fp8 量化（行数是运行时参数）
+    tp_prep.py                 TP 族的 prep：全部专家的路由排序 + x 量化 + out 清零，1 次 launch
     tp_gemm1.py                TP 族 gemm1（gate|up + 激活 + q8s 量化 epilogue）；fd2 权重准备函数也在这里
     tp_gemm2.py                TP 族 gemm2（down + 路由加权 atomic 写回；base / nt4）
     tp_fmoe.py                 tp1k：BM 64 单 kernel 融合 MoE
@@ -173,7 +174,7 @@ a8w4/
 | GPU | gfx942（MI300X / MI325X） | fp8 FNUZ MFMA；硬件假设见 9.2 |
 | torch | ROCm 版，测试用 2.9.1+rocm7.2.0 | |
 | FlyDSL | **0.3.2**（用到 `flydsl.expr.meta.dsl_loc_tracing` 等新 API，0.1.x 导入时就会失败） | 全部 kernel |
-| aiter | 测试用 tq/mimo-moe 分支 | 运行时只有 TP 族用 `aiter.fused_moe.moe_sorting`；`shuffle_mxfp4` 用 `aiter.ops.shuffle`（纯 torch 重排）；`ref.py` 和测试用 `aiter.get_torch_quant` 生成权重 |
+| aiter | 测试用 tq/mimo-moe 分支 | 运行时只有 TP 族在专家切片（EP 形状）上用 `aiter.fused_moe.moe_sorting`；`shuffle_mxfp4` 用 `aiter.ops.shuffle`（纯 torch 重排）；`ref.py` 和测试用 `aiter.get_torch_quant` 生成权重 |
 
 EP 族（`ep3k` / `ep1k`）和 `prepare_weights` 在运行时都不需要 aiter。
 
@@ -187,9 +188,9 @@ EP 族（`ep3k` / `ep1k`）和 `prepare_weights` 在运行时都不需要 aiter�
 
 | 类别 | 流程（launch 数） | 适用场景 | 结构限制（`supported()`） | graph-safe |
 |---|---|---|---|---|
-| `tp2k` | moe_sorting → row_quant → gemm1（q8s）→ gemm2（4） | TP 小 / 中 batch | I % 256、H % 512；`g2nt4` 只支持 I = 256 | 是 |
-| `tp1k` | moe_sorting → row_quant → 融合 kernel（3） | TP 大 batch | I % 256；每个 CTA ≤ 512 列 inter | 是 |
-| `tp1kq` | 同上，融合 kernel 换成 persistent 工作队列（3） | TP 4096 tokens 左右 | 只支持 I = 256 | **否** |
+| `tp2k` | tp_prep → gemm1（q8s）→ gemm2（3；专家切片时 moe_sorting → row_quant → …，4） | TP 小 / 中 batch | I % 256、H % 512；`g2nt4` 只支持 I = 256 | 是 |
+| `tp1k` | tp_prep → 融合 kernel（2；专家切片时 3） | TP 大 batch | I % 256；每个 CTA ≤ 512 列 inter | 是 |
+| `tp1kq` | 同上，融合 kernel 换成 persistent 工作队列（2） | TP 4096 tokens 左右 | 只支持 I = 256 | **否** |
 | `ep3k` | ep_prep → ep gemm1 → ep gemm2（3） | EP 全部 batch；`a8w4_moe_dyn` 只用它 | 本地专家 ≤ 32、64 % topk == 0、gemm2 的 K 循环 I/ARB ≥ 8、M < 65536 | 是 |
 | `ep1k` | 单个 persistent launch（1） | EP 极小 batch（实测没有一个点最快） | 同 ep3k，另需 topk = 8、I % 2048、M ≤ 512 | 是 |
 
@@ -230,6 +231,11 @@ gemm2：A2·W2ᵀ（按 128-K 组的 scale 重标定）× 通道因子 × 路由
   - 每个专家的行数补齐到 block_m 的整数倍；
   - `sorted_expert_ids` 每个 block 存一个本地专家号；
   - `num_valid_ids[0]` 是补齐后的总行数。
+- **TP prep（`kernels/tp_prep.py`）**：全部专家都在本卡时（TP），TP 族用 1 次 launch 同时完成排序、x 行量化和 out 清零，替代 `moe_sorting` + `quantize_rows`（专家切片仍走这两个 kernel）。
+  - 前 n_sort 个 WG 排序，其余 WG 做量化（与 `quantize_rows` 逐位一致）并顺带把对应的 out 行清零，两类 WG 之间不同步；
+  - 排序 WG 各自读全部 M·topk 个专家 id，在 LDS 里统计直方图（按自己区间的起点分成"之前"和"之后"两部分），这样无需全局 atomic、grid barrier 或 workspace 就能得到每个专家的总数和自己的写入基址；之后用 LDS atomic 把自己区间内的路由写到 sorted 位置，填充行和 block 专家号由全部排序 wave 按专家分摊；
+  - 每个 WG 负责的路由数按规模取 256–2048（约 64 个排序 WG）：区间越大，scatter 的分散写越集中在少数 CU；WG 越多，重复读 id 的 L2 流量越大；
+  - 容量取 M·topk // BM + min(E, M·topk) 个 block（只有非空专家才占 block），小 batch 时 GEMM 的 block 数更少；专家内部的行顺序不确定；graph-safe。
   
   `ep_prep` 输出同样的格式，只多了两处：本卡单路 token 的 sorted id 置位 bit 31（`SID_SINGLE`），以及额外的 tile 调度和路数统计（5.6 节）。
 - **输出写法**：`out` 先清零，再用 bf16x2 atomic（agent scope）累加。EP 的 single_store 例外：本卡只有 1 路的 token 直接 store，不做 atomic。
@@ -532,6 +538,7 @@ profile 中的 kernel 名：
 
 - 排序：`opus_moe_sorting_entry`（aiter）；
 - x 量化：`kernel_0`（`row_quant`）；
+- TP prep：`tp_prep_*`。本节和 7.2 的 TP 数据是改用 `tp_prep` 之前测的（排序 + 量化两个 kernel）。改用后 TP8 端到端：≤16 tokens 快 17–23%，1024–32768 tokens 快 2–5%（8192 tokens 持平，在噪声内），见 `experiments/log_20261114b.md`；
 - TP 族：`a8w4_gemm1_*`、`a8w4_gemm2_*`、`a8w4_fmoe_bm64_*`、`a8w4_fmoe_bm64q_*`；
 - EP 族：`ep_prep_*`、`ep_gemm1_*`、`ep_gemm2_*`、`ep_small_*`。
 
@@ -884,14 +891,14 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 ## 11. 后续方向
 
 - **TP 小 batch（≤16 tokens）**：
-  - 把 `ep_prep` 推广到 256 个专家（需要把专家维的扫描从 32 lane 扩展到多个 wave），把排序和量化合成一次 launch。目前这两步合计 12.8 us，EP 的 prep 只要约 7 us；
-  - gemm1 在极少 token 时用 split-K 或窄 n-tile（做法同 EP 的 t16），让更多 WG 并行读 W（目前 1 token 时只有 16 个 WG，gemm1 要 24 us）。
+  - 排序和量化已合成一次 launch（`tp_prep`，1 token 时 3.8 us，原来两步合计约 12.6 us）；
+  - gemm1 在极少 token 时用 split-K（`experiments/20261114_splitk_gemm1` 的 split-K EP gemm1 跑 TP 形状，加上 tp_prep，1 / 2 / 4 tokens 端到端快 56% / 47% / 35%），待并入 `ep_gemm.py` 并加一个 TP 类别。
 - **EP 小 batch**：把 prep 合进 gemm1，或者与上一层计算重叠；ep1k 的固定开销还要再分析。
 - **中等 batch**：tile 数只有 CU 数的 1.7–3 倍，轮次量化明显。a8w4 gemm1 的量化组是 128 列，NI 不能再小；可以考虑让相邻 WG 交换行 amax，把 tile 切得更细。
 - **大 batch**：
   - 重写 gemm2：用更大的 M tile，解码后的 W 经 LDS 在多个 wave 之间共用，参考 pyhip 的 Down，16K tokens 有望快约 6%；
   - 提高 gemm1 的 MFMA 利用率；
-  - TP 在 8192 tokens 时排序加量化还要 75 us，换成合并的 prep 能省一半左右。
+  - TP 的 prep 已换成 `tp_prep`（8192 tokens 时 67 → 43 us），大 batch 时它基本是 x 读写和 out 清零的 HBM 流量。
 - **按需要补**：TP4 的 situv2 行；hot 路由的调优表；其他模型（例如 MiMo-V2.6-Pro TP8：H 6144、384 个专家）的调优。
 
 ## 12. 来源

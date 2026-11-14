@@ -1,0 +1,30 @@
+tp8 T=    1 [tp2k bm32 g1bcm2 g2base] e2e(us)  base 43.5(+0.0%)  prep 44.0(+1.2%)  prepwide 45.4(+4.3%)  sk4p2t64 30.6(-29.6%)  sk8p1t64 29.4(-32.4%)
+    base                         a8w4_gemm1 24.3  moe_sorting 8.6  a8w4_gemm2 4.7  kernel_0 4.5
+    prep                         a8w4_gemm1 24.3  tp_prep 14.4  a8w4_gemm2 3.5
+    prepwide                     a8w4_gemm1 24.3  tp_prep 14.4  a8w4_gemm2 4.7
+    sk4p2t64                     tp_prep 14.5  ep_gemm1 10.7  a8w4_gemm2 3.5
+    sk8p1t64                     tp_prep 14.4  ep_gemm1 9.5  a8w4_gemm2 3.5
+tp8 T=    2 [tp2k bm32 g1bcm2 g2base] e2e(us)  base 44.1(+0.0%)  prep 46.1(+4.5%)  prepwide 46.1(+4.6%)  sk4p2t64 34.6(-21.4%)  sk8p1t64 34.3(-22.2%)
+    base                         a8w4_gemm1 24.3  moe_sorting 8.7  a8w4_gemm2 4.9  kernel_0 4.4
+    prep                         a8w4_gemm1 24.2  tp_prep 14.7  a8w4_gemm2 4.9
+    prepwide                     a8w4_gemm1 24.2  tp_prep 14.7  a8w4_gemm2 5.0
+    sk4p2t64                     tp_prep 14.8  ep_gemm1 12.6  a8w4_gemm2 4.8
+    sk8p1t64                     tp_prep 14.7  ep_gemm1 12.4  a8w4_gemm2 4.8
+tp8 T=    4 [tp2k bm32 g1bcm2 g2nt4] e2e(us)  base 46.3(+0.0%)  prep 49.1(+6.0%)  prepwide 48.5(+4.6%)  sk4p2t64 40.9(-11.7%)  sk8p1t64 43.2(-6.7%)
+    base                         a8w4_gemm1 24.2  moe_sorting 9.0  a8w4_gemm2 6.6  kernel_0 4.4
+    prep                         a8w4_gemm1 24.4  tp_prep 15.4  a8w4_gemm2 7.5
+    prepwide                     a8w4_gemm1 24.3  tp_prep 15.3  a8w4_gemm2 6.5
+    sk4p2t64                     ep_gemm1 15.8  tp_prep 15.4  a8w4_gemm2 7.7
+    sk8p1t64                     ep_gemm1 18.0  tp_prep 15.6  a8w4_gemm2 7.6
+tp8 T=    8 [tp2k bm32 g1bcm2 g2nt4] e2e(us)  base 52.6(+0.0%)  prep 55.4(+5.4%)  prepwide 55.8(+6.3%)  sk4p2t64 53.0(+0.8%)  sk8p1t64 53.5(+1.8%)
+    base                         a8w4_gemm1 26.0  a8w4_gemm2 10.9  moe_sorting 9.3  kernel_0 4.4
+    prep                         a8w4_gemm1 25.7  tp_prep 16.4  a8w4_gemm2 10.9
+    prepwide                     a8w4_gemm1 25.9  tp_prep 16.4  a8w4_gemm2 10.8
+    sk4p2t64                     ep_gemm1 23.6  tp_prep 16.5  a8w4_gemm2 10.9
+    sk8p1t64                     ep_gemm1 24.6  tp_prep 16.5  a8w4_gemm2 11.1
+tp8 T=   16 [tp2k bm32 g1bcm1 g2base] e2e(us)  base 69.6(+0.0%)  prep 70.5(+1.3%)  prepwide 70.6(+1.3%)  sk4p2t64 71.8(+3.2%)  sk8p1t64 73.5(+5.5%)
+    base                         a8w4_gemm1 30.7  a8w4_gemm2 18.4  moe_sorting 13.4  kernel_0 4.6
+    prep                         a8w4_gemm1 30.7  tp_prep 18.4  a8w4_gemm2 18.3
+    prepwide                     a8w4_gemm1 30.9  a8w4_gemm2 18.4  tp_prep 18.2
+    sk4p2t64                     ep_gemm1 33.3  a8w4_gemm2 18.1  tp_prep 17.9
+    sk8p1t64                     ep_gemm1 34.2  a8w4_gemm2 18.2  tp_prep 18.1

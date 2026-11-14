@@ -1,0 +1,14 @@
+# order.py: GEMM-only time (tuned config's kernels + out.zero_, cold L2, 7 interleaved
+# rounds, median) on moe_sorting's vs tp_prep's sorted routing. prepo / aitero =
+# re-sorted by token on the host (== moe_sorting's order). aiter vs aitero are the
+# SAME rows in the SAME order (different buffers): their gap = noise floor.
+## run 1 (aiter, prep, prepo)
+T= 2048 [tp1k bcm1 ks1] GEMM-only us (incl. out.zero_): aiter 317.8  prep 317.6  prepo 318.1
+T= 4096 [tp1kq bcm1] GEMM-only us (incl. out.zero_): aiter 488.0  prep 488.6  prepo 492.5
+T= 8192 [tp1k bcm1 ks1] GEMM-only us (incl. out.zero_): aiter 806.4  prep 827.6  prepo 827.2
+T=16384 [tp1k bcm1 ks1] GEMM-only us (incl. out.zero_): aiter 1577.6  prep 1585.4  prepo 1578.7
+## run 2 (+ aitero)
+T= 8192 rows equal to moe_sorting's (of 73216): prep 52322 prepo 73216 aitero 73216; first expert rows: aiter [4, 251, 254, 280, 302, 315, 326, 356, 396, 412, 539, 564] prep [4, 251, 254, 280, 315, 302, 326, 356, 396, 412, 539, 564]
+T= 8192 [tp1k bcm1 ks1] GEMM-only us (incl. out.zero_): aiter 818.4  prep 809.1  prepo 819.7  aitero 798.3
+T=16384 rows equal to moe_sorting's (of 139200): prep 101664 prepo 139200 aitero 139200; first expert rows: aiter [5, 57, 74, 144, 245, 293, 297, 298, 319, 372, 454, 544] prep [5, 57, 74, 144, 245, 293, 319, 297, 298, 372, 454, 555]
+T=16384 [tp1k bcm1 ks1] GEMM-only us (incl. out.zero_): aiter 1584.4  prep 1582.2  prepo 1586.3  aitero 1582.9

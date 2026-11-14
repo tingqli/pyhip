@@ -18,11 +18,14 @@ dispatch): capacity-sized inputs whose valid row count is a device tensor, x in 
 or in fp8 with per-(token, 128) scales; no host sync, CUDA-graph safe.
 
 Kernel families (all consume the same ``W``; see README.md):
-  tp2k   moe_sorting -> x row quant -> gemm1 (q8s epilogue) -> gemm2 (atomic scatter)
-  tp1k   moe_sorting -> x row quant -> one fused gemm1 + gemm2 kernel (BM 64)
+  tp2k   prep -> gemm1 (q8s epilogue) -> gemm2 (atomic scatter)
+  tp1k   prep -> one fused gemm1 + gemm2 kernel (BM 64)
   tp1kq  same, persistent work-queue kernel (inter_dim 256 only; NOT graph-safe)
   ep3k   ep_prep (local sort + x quant + tile schedule) -> ep gemm1 -> ep gemm2
   ep1k   one persistent launch: routing + x quant + gemm1 + gemm2 (M <= 512)
+TP kinds' prep: all experts local -> tp_prep (ONE launch: sort over all experts + x row
+quant + out zeroing); an expert slice (EP shapes) -> aiter moe_sorting with an
+expert_mask + quantize_rows.
 """
 
 import csv
@@ -37,6 +40,7 @@ from .kernels import tp_fmoe as F
 from .kernels import tp_fmoe_q as Q
 from .kernels import tp_gemm1 as G1
 from .kernels import tp_gemm2 as G2
+from .kernels import tp_prep as TPP
 from .kernels.row_quant import quantize_rows
 from .weights import weight_shape
 
@@ -143,12 +147,23 @@ def _sort(topk_ids, topk_weights, shape, e0, block_m):
                        expert_mask=mask)[:5]
 
 
+def _prep(topk_ids, topk_weights, x, shape, e0, block_m):
+    """-> (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, zeroed out,
+    x8, xs): one tp_prep launch when every expert is local, else _sort + quantize_rows."""
+    H, _, E, EGl, topk = shape
+    if (E == EGl and not e0 and E <= TPP.NT and H % 512 == 0 and topk % 4 == 0
+            and x.shape[0] > 0):
+        sids, sw, seids, nv, x8, xs, out = TPP.tp_prep(topk_ids, topk_weights, x,
+                                                       block_m=block_m, num_experts=E)
+        return sids, sw, seids, nv, out, x8, xs
+    return (*_sort(topk_ids, topk_weights, shape, e0, block_m), *quantize_rows(x))
+
+
 def _run_tp2k(cfg, x, W, tw, ti, shape, e0, akw):
     H, I, E, _, topk = shape
     bm = cfg["block_m"]
     groups = I // 128
-    sids, sw, seids, nv, out = _sort(ti, tw, shape, e0, bm)
-    x8, xs = quantize_rows(x)
+    sids, sw, seids, nv, out, x8, xs = _prep(ti, tw, x, shape, e0, bm)
     sorted_size = seids.numel() * bm
     buf = torch.empty(sorted_size * (I + groups * 4), dtype=torch.uint8, device=x.device)
     G1.a8w4_gemm1(x8, xs, W["w1"], W["w1_scale"], W["w1_exp"], sids, seids, nv, buf,
@@ -168,8 +183,7 @@ def _run_tp2k(cfg, x, W, tw, ti, shape, e0, akw):
 
 def _run_tp1k(cfg, x, W, tw, ti, shape, e0, akw):
     I, topk = shape[1], shape[4]
-    sids, sw, seids, nv, out = _sort(ti, tw, shape, e0, F.BM)
-    x8, xs = quantize_rows(x)
+    sids, sw, seids, nv, out, x8, xs = _prep(ti, tw, x, shape, e0, F.BM)
     ks = cfg["ksplit"]
     return F.a8w4_fmoe_bm64(x8, xs, W, sids, sw, seids, nv, out, topk=topk,
                             b_cache_mod=cfg["bcm"], waves_per_eu=2 if I // ks <= 256 else 1,
@@ -177,8 +191,7 @@ def _run_tp1k(cfg, x, W, tw, ti, shape, e0, akw):
 
 
 def _run_tp1kq(cfg, x, W, tw, ti, shape, e0, akw):
-    sids, sw, seids, nv, out = _sort(ti, tw, shape, e0, Q.BM)
-    x8, xs = quantize_rows(x)
+    sids, sw, seids, nv, out, x8, xs = _prep(ti, tw, x, shape, e0, Q.BM)
     return Q.a8w4_fmoe_bm64q(x8, xs, W, sids, sw, seids, nv, out, topk=shape[4],
                              b_cache_mod=cfg["bcm"], **akw)
 

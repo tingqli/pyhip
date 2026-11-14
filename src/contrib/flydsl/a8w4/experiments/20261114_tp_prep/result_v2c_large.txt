@@ -1,0 +1,18 @@
+tp8 T= 1024 [tp2k bm64 g1bcm2 g2nt4] e2e(us)  base 218.7(+0.0%)  prep 208.1(-4.8%)
+    base                         a8w4_gemm1 116.7  a8w4_gemm2 81.3  moe_sorting 12.7  kernel_0 6.3
+    prep                         a8w4_gemm1 116.5  a8w4_gemm2 81.4  tp_prep 8.7
+tp8 T= 2048 [tp1k bcm1 ks1] e2e(us)  base 347.3(+0.0%)  prep 328.1(-5.5%)
+    base                         a8w4_fmoe_bm64 313.1  moe_sorting 22.2  kernel_0 11.5
+    prep                         a8w4_fmoe_bm64 312.5  tp_prep 14.0
+tp8 T= 4096 [tp1kq bcm1] e2e(us)  base 525.0(+0.0%)  prep 507.5(-3.3%)
+    base                         a8w4_fmoe_bm64q 487.1  moe_sorting 25.5  kernel_0 19.2
+    prep                         a8w4_fmoe_bm64q 480.9  tp_prep 24.8
+tp8 T= 8192 [tp1k bcm1 ks1] e2e(us)  base 875.2(+0.0%)  prep 881.9(+0.8%)
+    base                         a8w4_fmoe_bm64 805.9  moe_sorting 34.6  kernel_0 32.0
+    prep                         a8w4_fmoe_bm64 816.4  tp_prep 43.3
+tp8 T=16384 [tp1k bcm1 ks1] e2e(us)  base 1702.1(+0.0%)  prep 1659.6(-2.5%)
+    base                         a8w4_fmoe_bm64 1617.4  kernel_0 59.7  moe_sorting 52.2
+    prep                         a8w4_fmoe_bm64 1559.4  tp_prep 81.2
+tp8 T=32768 [tp1k bcm1 ks1] e2e(us)  base 3042.2(+0.0%)  prep 2916.7(-4.1%)
+    base                         a8w4_fmoe_bm64 2854.2  kernel_0 129.8  moe_sorting 94.2
+    prep                         a8w4_fmoe_bm64 2893.7  tp_prep 161.2

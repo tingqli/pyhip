@@ -1,0 +1,30 @@
+tp8 T= 1024 [tp2k bm64 g1bcm2 g2nt4] e2e(us)  prep 219.8(+0.0%)  prepr4096 227.2(+3.4%)  prepr8192 241.3(+9.8%)  prepr16384 241.0(+9.6%)
+    prep                         a8w4_gemm1 114.1  a8w4_gemm2 78.7  tp_prep 24.7
+    prepr4096                    a8w4_gemm1 114.5  a8w4_gemm2 78.6  tp_prep 31.8
+    prepr8192                    a8w4_gemm1 114.1  a8w4_gemm2 79.0  tp_prep 45.3
+    prepr16384                   a8w4_gemm1 115.0  a8w4_gemm2 79.0  tp_prep 44.9
+tp8 T= 2048 [tp1k bcm1 ks1] e2e(us)  prep 340.7(+0.0%)  prepr4096 347.2(+1.9%)  prepr8192 360.9(+5.9%)  prepr16384 389.7(+14.4%)
+    prep                         a8w4_fmoe_bm64 305.4  tp_prep 34.8
+    prepr4096                    a8w4_fmoe_bm64 305.4  tp_prep 41.1
+    prepr8192                    a8w4_fmoe_bm64 304.0  tp_prep 55.0
+    prepr16384                   a8w4_fmoe_bm64 304.2  tp_prep 82.8
+tp8 T= 4096 [tp1kq bcm1] e2e(us)  prep 516.7(+0.0%)  prepr4096 520.5(+0.7%)  prepr8192 529.0(+2.4%)  prepr16384 555.8(+7.6%)
+    prep                         a8w4_fmoe_bm64q 468.3  tp_prep 48.9
+    prepr4096                    a8w4_fmoe_bm64q 468.0  tp_prep 53.9
+    prepr8192                    a8w4_fmoe_bm64q 465.3  tp_prep 63.9
+    prepr16384                   a8w4_fmoe_bm64q 461.1  tp_prep 87.4
+tp8 T= 8192 [tp1k bcm1 ks1] e2e(us)  prep 860.4(+0.0%)  prepr4096 866.1(+0.7%)  prepr8192 876.4(+1.9%)  prepr16384 889.8(+3.4%)
+    prep                         a8w4_fmoe_bm64 786.2  tp_prep 60.5
+    prepr4096                    a8w4_fmoe_bm64 774.2  tp_prep 65.3
+    prepr8192                    a8w4_fmoe_bm64 790.1  tp_prep 77.5
+    prepr16384                   a8w4_fmoe_bm64 784.5  tp_prep 99.6
+tp8 T=16384 [tp1k bcm1 ks1] e2e(us)  prep 1613.3(+0.0%)  prepr4096 1619.0(+0.4%)  prepr8192 1628.3(+0.9%)  prepr16384 1661.2(+3.0%)
+    prep                         a8w4_fmoe_bm64 1516.4  tp_prep 95.8
+    prepr4096                    a8w4_fmoe_bm64 1510.0  tp_prep 100.1
+    prepr8192                    a8w4_fmoe_bm64 1502.7  tp_prep 108.6
+    prepr16384                   a8w4_fmoe_bm64 1493.7  tp_prep 135.2
+tp8 T=32768 [tp1k bcm1 ks1] e2e(us)  prep 2894.1(+0.0%)  prepr4096 2918.1(+0.8%)  prepr8192 2929.1(+1.2%)  prepr16384 2965.4(+2.5%)
+    prep                         a8w4_fmoe_bm64 2810.0  tp_prep 165.0
+    prepr4096                    a8w4_fmoe_bm64 2818.7  tp_prep 175.0
+    prepr8192                    a8w4_fmoe_bm64 2824.3  tp_prep 186.4
+    prepr16384                   a8w4_fmoe_bm64 2830.4  tp_prep 212.8

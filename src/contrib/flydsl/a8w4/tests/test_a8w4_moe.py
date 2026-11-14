@@ -7,6 +7,7 @@
 * every kernel family vs the fp8-emulating fp32 reference, on the MiMo-V2.6-Flash
   TP8 and EP8 per-rank shapes (EP: rank 3, global expert ids);
 * ``a8w4_moe`` with the tuned table, including token counts between tuned points;
+* ``tp_prep`` (the TP kinds' fused prep) vs aiter moe_sorting + quantize_rows;
 * the table's act key (SiTUv2 rows, SiLU fallback, tables without the act column);
 * CUDA-graph capture: only graph-safe configs are picked, replay matches eager;
 * SiTUv2 on every kernel family (TP and EP, incl. ``a8w4_moe_dyn``);
@@ -92,6 +93,35 @@ def test_tuned_dispatch(case, tokens):
     W, x, tw, ti, ref = data(case, tokens, seed=3)
     out = a8w4_moe(x, W, tw, ti, expert_offset=e0, num_experts=EGl)
     assert R.cos_diff(ref, out.float()) < COS_TOL
+
+
+@pytest.mark.parametrize("tokens", [1, 300, 5000])
+@pytest.mark.parametrize("bm", [32, 64])
+def test_tp_prep_vs_aiter(tokens, bm):
+    """same rows per expert block (any order inside), bit-identical x8 / xs, out zeroed."""
+    from a8w4.kernels.row_quant import quantize_rows
+    from a8w4.kernels.tp_prep import tp_prep
+    from a8w4.moe import _sort
+
+    H, I, E, EGl, K, _ = SHAPES["tp8"]
+    x, tw, ti = R.make_routing(tokens, H, EGl, K, seed=11 + tokens)
+    sa, wa, ea, nva, _ = _sort(ti, tw, (H, I, E, EGl, K), 0, bm)
+    junk = torch.full((tokens, H), float("nan"), dtype=torch.bfloat16, device="cuda")
+    del junk  # the allocator hands this block to tp_prep's out
+    s, w, e, nv, x8, xs, out = tp_prep(ti, tw, x, block_m=bm, num_experts=E)
+    assert nv.tolist() == nva.tolist()
+    n = int(nv[0])
+
+    def rows(sids, sw, seids):
+        key = (seids[:n // bm].long().repeat_interleave(bm) << 32) | sids[:n].long()
+        order = torch.argsort(key)
+        return key[order], sw[:n][order]
+
+    (k, wk), (ka, wka) = rows(s, w, e), rows(sa, wa, ea)
+    assert torch.equal(k, ka) and torch.equal(wk, wka)
+    xa8, xas = quantize_rows(x)
+    assert torch.equal(x8.view(torch.uint8), xa8.view(torch.uint8)) and torch.equal(xs, xas)
+    assert int(torch.count_nonzero(out)) == 0
 
 
 @pytest.mark.parametrize("case,tokens", [("tp8", 64), ("tp8", 4096), ("ep8", 16), ("ep8", 256)])

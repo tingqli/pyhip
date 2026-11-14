@@ -1,0 +1,57 @@
+== tokens 1024
+l128_g2arb64 FAILED (64, 128)
+l128_g2arb256 FAILED 74240
+l128_g2arb64 FAILED (64, 128)
+l128_g2arb256 FAILED 74240
+l128_g2arb64 FAILED (64, 128)
+l128_g2arb256 FAILED 74240
+l128                 193.8 us
+l128_g2nw4           197.3 us
+l128_g2no128         204.8 us
+l128_g2arb64           nan us
+l128_g2arb256          nan us
+l128_g2sch1          196.6 us
+l128_g2sch2          195.4 us
+l128_g1sch2          197.2 us
+l128_notr            195.2 us
+l128_nosst           194.8 us
+m64                  193.8 us
+m64_g2nw4            192.7 us
+== tokens 3072
+l128_g2arb64 FAILED (64, 128)
+l128_g2arb256 FAILED 74240
+l128_g2arb64 FAILED (64, 128)
+l128_g2arb256 FAILED 74240
+l128_g2arb64 FAILED (64, 128)
+l128_g2arb256 FAILED 74240
+l128                 344.7 us
+l128_g2nw4           348.9 us
+l128_g2no128         369.3 us
+l128_g2arb64           nan us
+l128_g2arb256          nan us
+l128_g2sch1          346.4 us
+l128_g2sch2          347.0 us
+l128_g1sch2          344.4 us
+l128_notr            343.0 us
+l128_nosst           349.6 us
+m64                  407.3 us
+m64_g2nw4            400.7 us
+== tokens 12288
+l128_g2arb64 FAILED (64, 128)
+l128_g2arb256 FAILED 74240
+l128_g2arb64 FAILED (64, 128)
+l128_g2arb256 FAILED 74240
+l128_g2arb64 FAILED (64, 128)
+l128_g2arb256 FAILED 74240
+l128                1058.0 us
+l128_g2nw4          1064.2 us
+l128_g2no128        1142.9 us
+l128_g2arb64           nan us
+l128_g2arb256          nan us
+l128_g2sch1         1059.4 us
+l128_g2sch2         1054.4 us
+l128_g1sch2         1050.0 us
+l128_notr           1058.2 us
+l128_nosst          1059.7 us
+m64                 1276.1 us
+m64_g2nw4           1245.8 us

@@ -1,0 +1,12 @@
+T=    1 [tp2k bm32 g1bcm2 g2base] prep                         cos 3.6e-05  vs base 1.1e-05  jitter 1.3e-05  OK
+T=    2 [tp2k bm32 g1bcm2 g2base] prep                         cos 1.2e-04  vs base 1.1e-05  jitter 1.2e-05  OK
+T=    4 [tp2k bm32 g1bcm2 g2nt4] prep                         cos 1.8e-04  vs base 1.1e-05  jitter 1.2e-05  OK
+T=    8 [tp2k bm32 g1bcm2 g2nt4] prep                         cos 1.2e-04  vs base 1.0e-05  jitter 8.8e-06  OK
+T=   16 [tp2k bm32 g1bcm1 g2base] prep                         cos 9.3e-05  vs base 5.5e-06  jitter 5.3e-06  OK
+T= 1024 [tp2k bm64 g1bcm2 g2nt4] prep                         cos 8.8e-05  vs base 3.9e-06  jitter 3.8e-06  OK
+T= 2048 [tp1k bcm1 ks1] prep                         cos 9.5e-05  vs base 5.0e-06  jitter 5.3e-06  OK
+T= 4096 [tp1kq bcm1] prep                         cos 8.8e-05  vs base 8.7e-06  jitter 8.6e-06  OK
+T= 8192 [tp1k bcm1 ks1] prep                         cos 8.9e-05  vs base 4.3e-06  jitter 4.5e-06  OK
+T=16384 [tp1k bcm1 ks1] prep                         cos 8.9e-05  vs base 2.2e-06  jitter 2.1e-06  OK
+T=32768 [tp1k bcm1 ks1] prep                         cos 8.9e-05  vs base 1.3e-06  jitter 8.9e-07  OK
+ALL OK
