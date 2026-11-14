@@ -19,8 +19,6 @@ every rank repeats the sglang steps (``moriep.py``, ``mxfp4_aiter_a16w4_moe.py``
     pytest -q a8w4/tests/test_a8w4_mori_ep8.py     # correctness vs the fp32 reference
     python a8w4/tests/test_a8w4_mori_ep8.py        # perf: T = 64 .. 4096 tokens
     python a8w4/tests/test_a8w4_mori_ep8.py -t 256 1024 --iters 50 --graph
-    python a8w4/tests/test_a8w4_mori_ep8.py --act silu situv2 --model-dim 4096 --inter-dim 2048 \
-        --experts 256 --topk 8 -t 64 512 4096        # SiLU vs SiTUv2, any EP8 shape
 
 Run from the directory that holds ``a8w4/``; needs 8 gfx942 GPUs and mori.
 
@@ -53,20 +51,9 @@ try:
 except ImportError:  # the test skips
     mori = None
 
-WORLD = 8
-MODEL = (4096, 2048, 256, 8)  # MiMo-V2.6-Flash: hidden, moe_intermediate, experts, top-k
-
-
-def _set_model(model):
-    """Set the layer shape (H, I, E_GLOBAL, TOPK) every function reads."""
-    global H, I, E_GLOBAL, TOPK, E_LOCAL, SHAPE
-    H, I, E_GLOBAL, TOPK = model
-    assert E_GLOBAL % WORLD == 0, E_GLOBAL
-    E_LOCAL = E_GLOBAL // WORLD
-    SHAPE = (H, I, E_LOCAL, E_GLOBAL, TOPK)
-
-
-_set_model(MODEL)
+H, I, E_GLOBAL, TOPK, WORLD = 4096, 2048, 256, 8, 8
+E_LOCAL = E_GLOBAL // WORLD
+SHAPE = (H, I, E_LOCAL, E_GLOBAL, TOPK)
 MAX_TOKENS = 4096  # per rank and dispatch (sglang SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK)
 FP8 = torch.float8_e4m3fnuz
 COS_TOL = 5e-3
@@ -96,7 +83,6 @@ class EpMoeLayer:
         from aiter import QuantType, get_hip_quant
 
         self.rank, self.e0 = rank, rank * E_LOCAL
-        self.set_act("silu")
         self.W, self.raw = R.make_weights(E_LOCAL, H, I, seed=rank)
         self._quant = get_hip_quant(QuantType.per_1x128)
         self.op = mori.ops.EpDispatchCombineOp(mori.ops.EpDispatchCombineConfig(
@@ -107,11 +93,6 @@ class EpMoeLayer:
             kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode, gpu_per_node=WORLD,
             rdma_block_num=0, num_qp_per_pe=2, quant_type="none"))
         assert self.op.max_num_tokens_to_recv() <= 32768  # one a8w4_moe_dyn call (sglang chunk)
-
-    def set_act(self, act):
-        """Expert activation: silu, or situv2 with the test parameters (they do not change the
-        timing)."""
-        self.act, self.situ = act, (R.SITU if act == "situv2" else None)
 
     def quant(self, x):
         if x.shape[0] == 0:  # sglang skips the quant kernel on an empty batch
@@ -139,7 +120,7 @@ class EpMoeLayer:
         if rows:
             a8w4_moe_dyn(x[:rows], self.W, tw[:rows], ti[:rows], count, x_scale=xs[:rows],
                          expert_offset=self.e0, num_experts=E_GLOBAL, est_tokens=est,
-                         out=out[:rows], act=self.act, situ=self.situ)
+                         out=out[:rows])
         return out
 
     def combine(self, out, ti):
@@ -174,7 +155,7 @@ def _check(layer, ns, x, tw, ti, graph):
     x_ref = (xq.float().view(n, H // 128, 128) * xs.unsqueeze(-1)).view(n, H)
     X, TW, TI = (_gather_rows(t, ns) for t in (x_ref, tw, ti))
     expect = int(((TI // E_LOCAL) == rank).any(-1).sum())  # a token goes once to each rank
-    ref = R.ref_moe(X, TW, TI, layer.raw, layer.e0, layer.act, layer.situ, quant_x=False)
+    ref = R.ref_moe(X, TW, TI, layer.raw, layer.e0, quant_x=False)
     dist.all_reduce(ref)
     off = sum(ns[:rank])
     diff = R.cos_diff(ref[off:off + n], y) if n else 0.0
@@ -264,23 +245,18 @@ def _bench(layer, x, tw, ti, count, args, iters, warmup, spin):
         iso.append(t)
         e2e.append(t2)
         late += (h1 > SPIN_US) + (h2 > SPIN_US)  # the GPU may have waited for the host
-    cfg = dyn_config(SHAPE, args[1], act=layer.act)["cfg"] if args[0] else "-"
+    cfg = dyn_config(SHAPE, args[1])["cfg"] if args[0] else "-"
     return dict(recv=count, cfg=cfg, iso=iso, e2e=e2e, late=late)
 
 
-def _e2e(res, iters):
-    """Median over the iterations of the slowest rank's back-to-back layer time."""
-    return statistics.median([max(r["e2e"][i] for r in res) for i in range(iters)])
-
-
-def _report(points, results, iters, graph, act):
+def _report(points, results, iters, graph):
     med = statistics.median
     call = ("CUDA-graph call: whole receive buffer, est = tokens" if graph
             else "eager call: the received rows, est = received rows")
     lines = [
         "",
-        f"EP8 MoE layer (H {H}, I {I}, {E_GLOBAL} experts, {E_LOCAL} per rank, top-{TOPK}, "
-        f"{act}): MORI IntraNode dispatch (fp8, f32 scale per 128) -> a8w4_moe_dyn "
+        f"MiMo-V2.6-Flash(-RL) MoE layer, EP8 (H {H}, I {I}, {E_GLOBAL} experts, {E_LOCAL} per "
+        f"rank, top-{TOPK}): MORI IntraNode dispatch (fp8, f32 scale per 128) -> a8w4_moe_dyn "
         f"({call}) -> MORI combine (bf16)",
         f"us, median of {iters} iterations. tokens: the batch, split evenly over the ranks. "
         "quant / dispatch / moe / combine: each stage timed alone (device barrier before it), "
@@ -295,7 +271,7 @@ def _report(points, results, iters, graph, act):
         stage = [{s: med([t[s] for t in r["iso"]]) for s in STAGES} for r in res]  # per rank
         worst = {s: max(st[s] for st in stage) for s in STAGES}
         moe_mean = statistics.fmean(st["moe"] for st in stage)
-        e2e = _e2e(res, iters)
+        e2e = med([max(r["e2e"][i] for r in res) for i in range(iters)])
         recv = [r["recv"] for r in res]
         cfgs = "/".join(sorted({r["cfg"] for r in res}))
         per = f"{min(ns)}" if min(ns) == max(ns) else f"{min(ns)}-{max(ns)}"
@@ -312,21 +288,7 @@ def _report(points, results, iters, graph, act):
 # =============================================================================
 
 
-def _report_acts(points, results, iters):
-    """SiTUv2 vs SiLU: the MoE stage (slowest rank) and the layer e2e."""
-    lines = ["", "| tokens | moe silu | moe situv2 | ratio | e2e silu | e2e situv2 | ratio |",
-             "|---:|---:|---:|---:|---:|---:|---:|"]
-    for p, ns in enumerate(points):
-        a, b = results["silu"][p], results["situv2"][p]
-        moe = [max(statistics.median(t["moe"] for t in r["iso"]) for r in x) for x in (a, b)]
-        e2e = [_e2e(x, iters) for x in (a, b)]
-        lines.append(f"| {sum(ns)} | {moe[0]:.1f} | {moe[1]:.1f} | {moe[1] / moe[0]:.3f} "
-                     f"| {e2e[0]:.1f} | {e2e[1]:.1f} | {e2e[1] / e2e[0]:.3f} |")
-    print("\n".join(lines), flush=True)
-
-
-def _worker(rank, port, points, graphs, iters, warmup, model=MODEL, acts=("silu",)):
-    _set_model(model)
+def _worker(rank, port, points, graphs, iters, warmup):
     os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "localhost", str(port)
     torch.cuda.set_device(rank)
     dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=WORLD,
@@ -335,33 +297,28 @@ def _worker(rank, port, points, graphs, iters, warmup, model=MODEL, acts=("silu"
     mori.shmem.shmem_torch_process_group_init("mori")
     layer = EpMoeLayer(rank)
     spin = _spin_cycles(SPIN_US)
-    results = {act: [] for act in acts}
+    results = []
     for ns in points:
         x, tw, ti = R.make_routing(ns[rank], H, E_GLOBAL, TOPK, seed=7919 * rank + ns[rank])
-        for act in acts:  # the activations alternate per point: drift hits all of them
-            layer.set_act(act)
-            for graph in graphs:
-                checked = _check(layer, ns, x, tw, ti, graph)
-                if rank == 0:
-                    print(f"{sum(ns)} tokens {ns}, {act}, {'graph' if graph else 'eager'} MoE "
-                          f"call: received rows {[c for c, _ in checked]}, cos diff vs "
-                          f"reference <= {max(d for _, d in checked):.1e}", flush=True)
-            if not iters:
-                continue
-            count = checked[rank][0]
-            args = layer.moe_args(count, ns, graphs[0])
-            res = [None] * WORLD
-            dist.all_gather_object(res, _bench(layer, x, tw, ti, count, args, iters, warmup, spin))
-            results[act].append(res)
-            late = sum(r["late"] for r in res)
-            if rank == 0 and late:
-                print(f"  {late} of {2 * iters * WORLD} rank runs: host enqueue > the {SPIN_US} "
-                      "us GPU spin (medians absorb a few)", flush=True)
-    if iters and rank == 0:
-        for act in acts:
-            _report(points, results[act], iters, graphs[0], act)
-        if set(acts) == {"silu", "situv2"}:
-            _report_acts(points, results, iters)
+        for graph in graphs:
+            checked = _check(layer, ns, x, tw, ti, graph)
+            if rank == 0:
+                print(f"{sum(ns)} tokens {ns}, {'graph' if graph else 'eager'} MoE call: "
+                      f"received rows {[c for c, _ in checked]}, cos diff vs reference <= "
+                      f"{max(d for _, d in checked):.1e}", flush=True)
+        if not iters:
+            continue
+        count = checked[rank][0]
+        args = layer.moe_args(count, ns, graphs[0])
+        res = [None] * WORLD
+        dist.all_gather_object(res, _bench(layer, x, tw, ti, count, args, iters, warmup, spin))
+        results.append(res)
+        late = sum(r["late"] for r in res)
+        if rank == 0 and late:
+            print(f"  {late} of {2 * iters * WORLD} rank runs: host enqueue > the {SPIN_US} us "
+                  "GPU spin (medians absorb a few)", flush=True)
+    if results and rank == 0:
+        _report(points, results, iters, graphs[0])
     torch.cuda.synchronize()
     dist.barrier()
     dist.destroy_process_group()
@@ -378,15 +335,14 @@ def split_tokens(total):
     return [total // WORLD + (r < total % WORLD) for r in range(WORLD)]
 
 
-def run(points, graphs=(False,), iters=0, warmup=3, model=MODEL, acts=("silu",)):
+def run(points, graphs=(False,), iters=0, warmup=3):
     """Spawn the 8 ranks. ``points``: tokens per rank, one list per point; every point is
     checked against the reference with each MoE call of ``graphs`` (False: sglang's eager
     call, True: its CUDA-graph call); ``iters`` > 0 also times it (one call; rank 0
     prints)."""
     assert not iters or len(graphs) == 1, graphs
-    torch.multiprocessing.spawn(
-        _worker, args=(_free_port(), points, graphs, iters, warmup, tuple(model), tuple(acts)),
-        nprocs=WORLD, join=True)
+    torch.multiprocessing.spawn(_worker, args=(_free_port(), points, graphs, iters, warmup),
+                                nprocs=WORLD, join=True)
 
 
 def test_mori_a8w4_layer():
@@ -405,12 +361,6 @@ if __name__ == "__main__":
     ap.add_argument("--graph", action="store_true",
                     help="MoE with sglang's CUDA-graph call (whole receive buffer, est = "
                          "tokens) instead of its eager call (received rows)")
-    ap.add_argument("--act", nargs="+", default=["silu"], choices=["silu", "situv2"],
-                    help="expert activation(s); both: side-by-side comparison")
-    ap.add_argument("--model-dim", type=int, default=MODEL[0])
-    ap.add_argument("--inter-dim", type=int, default=MODEL[1], help="moe_intermediate_size")
-    ap.add_argument("--experts", type=int, default=MODEL[2], help="global routed experts")
-    ap.add_argument("--topk", type=int, default=MODEL[3])
     ap.add_argument("--iters", type=int, default=20, help="timed iterations per point")
     ap.add_argument("--warmup", type=int, default=3)
     args = ap.parse_args()
@@ -419,5 +369,4 @@ if __name__ == "__main__":
     if reason:
         sys.exit(reason)
     run([split_tokens(n) for n in args.tokens], graphs=(args.graph,), iters=max(1, args.iters),
-        warmup=args.warmup, model=(args.model_dim, args.inter_dim, args.experts, args.topk),
-        acts=args.act)
+        warmup=args.warmup)
