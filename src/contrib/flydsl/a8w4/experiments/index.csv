@@ -1,0 +1,38 @@
+date,dir,area,knob,tokens,protocol,delta,verdict,log,note
+20261114,20261114_ep_cfg_sweep,ep,l128/m64: g2 nw/no/arb/sch; g1 sch/tr; sst,1024/3072/12288,cold1 (nt: unbiased),±1% (g2 no=128 +6–8%),rejected,log_20261114a.md 实验1,CFGS 在这些维度已是局部最优；g2 arb 只能 128
+20261114,20261114_r2_baseline,tp/ep,baseline + 每 kernel 分解,1–32768,cold1,-,baseline,log_20261114b.md §2,breakdown.py 的 --local 是每 token 的本地专家数（不是 rank）；现用 python -m a8w4.bench breakdown
+20261114,20261114_splitk_gemm1,ep,split-K gemm1（sk/pf/sk_tiles；最后到达的 WG 做激活+量化）,1–16,cold1 (nt),T=1 −23…−28%；T≥8 持平,pending,log_20261114b.md §3.1,ep_gemm_sk.diff 未合入 kernels/ep_gemm.py
+20261114,20261114_splitk_gemm1,tp,tp_prep + split-K EP gemm1 + tp_gemm2,1–8,cold1 (nt),T=1/2/4/8: −56/−47/−35/−23%,pending,log_20261114b.md §3.3,需要 TP 类别 + 调优表行；ep_gemm2 跑不了 TP 形状（I/arb ≥ 8）
+20261114,20261114_tp_prep,tp,fused prep v1（全局 atomic + grid barrier）,1–32768,cold1,大 batch −0.8…−3.2%；小 batch +0.3…+6.7%,rejected,log_20261114b.md §3.2,5 次依赖往返被量化的 HBM 流量拉长；奇数尾行重复量化（v1/v2a 的 bug）
+20261114,20261114_tp_prep,tp,fused prep v2a（每个排序 WG 自做直方图）,1–32768,cold1,比 v1 慢（1024: 24.8 vs 18.4 us）,rejected,log_20261114b.md §3.2,padding 是单 wave 的 readlane 循环；dummy 槽 LDS atomic 串行
+20261114,20261114_tp_prep,tp,fused prep v2b/v2c（16 B 直方图读；rng 按规模自适应）,1–32768,cold1 (nt),prep 1024: 17.9→7.6 us；e2e −2.5…−5.5%（8192 +0.8% 噪声）；T≤16 −18…−22%,landed,log_20261114b.md §3.2–3.3,kernels/tp_prep.py；SKIP 分解不可相加（DCE + 集中写），用改 rng 交叉验证
+20261114,20261114_tp_prep,tp,行顺序（tp_prep vs moe_sorting）对 GEMM 的影响,4096–16384,cold1,无影响；同内容不同 buffer 差 2.5%,finding,log_20261114b.md §3.3,order.py；大 batch <1% 的 e2e 差不作结论
+20261114,20261114_mega_sweep,mega,producers 8/16/32 × lag 1/2/4,2048–32768,cold1 (nt),producers 16 最优；lag 4 仅 4096 −1.3%,pending,log_20261114b.md §3.4,lag 4 需偏斜路由验证再改默认；领先量 = min(组数；lag)：扫参前先读调度代码
+20261114,-,ep/tp,bf16 store + sum 替代 gemm2 的 atomic,512–32768,cold1,512–1024 省约 8 us；≥8192 慢 50–98 us,rejected,README §10 #13,
+20261114,-,ep/tp,fp8 route 行 + moe_reduce 替代 atomic（aiter#7706/#7949/#7940/#6583）,≥8192,-,-,idea,log_20261114b.md §5,流量比 bf16 少一半；成功还能省掉 tp_prep 的 out 清零
+20261114,-,mega,count 与 arrival 打包进一个 atomic；自复位 barrier（DeepGEMM Mega MoE #304/#316）,2048–32768,-,-,idea,log_20261114b.md §5,mega 结构性开销约 15%（log_20261115 §3.6）
+20261114,-,mori,rank 去重（DeepEP；aiter#7297/#7497）,all,-,xGMI 流量约 −34%,idea,log_20261114b.md §5,mega 的通信只暴露 4–5%：收益有限
+20261115,20261115_baseline,tp/ep,baseline（旧表；同一份权重）,1024–32768,cold1 (biased for bcm1),-,baseline,log_20261115.md §2,TP8 的 tp1k bcm1 受 MALL 偏差影响；EP 的 nt 配置不受
+20261115,20261115_ep_prio,ep,prio（s_setprio ping-pong）,1024–32768,cold1 (nt),+0.5…+2.7%,rejected,log_20261115.md §3.1,2 wave/SIMD 的结构换不来 HipKittens 式 ping-pong
+20261115,20261115_ep_prio,ep,m64 g2.pf=1,1024–2048,coldrot8,−1.5…−1.9%,landed,log_20261115.md §3.1/§3.3,CFGS['m64']；其他 pf 1/4 持平
+20261115,20261115_ep_prio,ep,st 1/3（A 写 LDS 的步长）,2048–32768,cold1 (nt),持平,rejected,log_20261115.md §3.1,
+20261115,20261115_ep_prio,ep,acm=0（A 走 cache）,1024–32768,cold1 (biased),−0.4…−1.6%,pending,log_20261115.md §3.1,需在 coldrot8 下复测（bench ab 拒绝 cold1 计时 cached 配置）
+20261115,20261115_ep_prio,ep,W bcm 0（t16c / s16 / s32 / m64 的 g2c）,8–3072,coldrot8,轮换后 +2.5…+10.3%,rejected,log_20261115.md §3.3,旧协议下的 −4…−11% 是 MALL 假象
+20261115,20261115_ep_prio,ep,l128c（两个 gemm 都 bcm 0）,4096–32768,coldrot8,≥12288 −1.7…−4.2%；4096 +1.7%,landed,log_20261115.md §3.3–3.4,CFGS['l128c']；AUTO >5120；每专家 ≥~1.5 个 128 行 block 才赚
+20261115,20261115_ep_prio,protocol,flush 方式与 W 副本数（cold/coldrot/rotate/wflush/bigread；1/2/8/16 份）,16–1024,all,cold1 偏向 cached W 5–13%；wflush 反向 9–48%,finding,log_20261115.md §3.3,定为 coldrot + 8 份（ref.WCOPIES）；TCC 计数器 L2 不变 → 差别在 MALL
+20261115,20261115_retune,table,EP8 全表重调（旧协议）,1–32768,cold1 (biased),winner 快 3–11%,invalidated,log_20261115.md §3.2,MALL 假象；只作反例保留
+20261115,20261115_retune2,table,全表重调（2070 行）,1–32768,coldrot8,TP 小 batch g1bcm1→g1bcm2 −4.7…−7.7%；EP8 ≥6144 选 l128c,landed,log_20261115.md §3.4,configs/a8w4_moe_tuned.csv；8 进程并发不影响计时（concurrent/）
+20261115,20261115_retune2,table,situv2 与 silu 的选择差异,1–32768,coldrot8,同配置 situv2/silu = 1.016；winner 只差 0.1–0.8%,finding,log_20261115.md §3.4,python -m a8w4.tune stats
+20261115,20261115_retune2,ep,路由抽样对 block 数的影响,2048–4096,coldrot8,4096 tokens l128 block 数 ±9%；verify 与表差 7%,finding,log_20261115.md §3.4,差 <3% 的配置换一次抽样可能互换：bench ab --samples
+20261115,20261115_mega_bcm,mega,W bcm（bcm01/00/20/21 vs 22）,2048–32768,coldrot8,bcm01 ≥4096 −1.6…−3.6%；2048–3072 +1.0…+1.5%,landed,log_20261115.md §3.5,megamoe launch_big（本卡 ≥512 tokens）；result*.txt 是单份权重（作废）
+20261115,20261115_mega_overlap,mega,通信暴露（dispatch / combine 改写本地）,2048–32768,cold1 (nt),通信只暴露 4–5%,finding,log_20261115.md §3.6,FP8 combine / dispatch 去重最多回收 1–2%；结构性开销约 15%
+20261115,20261115_after,mega,megamoe vs MORI 路径（落地后）,2048–32768,coldrot8,1.09–1.28×,baseline,log_20261115.md §3.7,
+20261115,-,ep,AUTO 在 448 tokens 选 s16 → 改选 s32,448,coldrot8,−9.9%,pending,log_20261115.md §5,只影响表外的 shape
+20261115,-,ep/mega,W 复用：同专家的 m-block 在时间 / XCD 上靠近（aiter#7965 L2+MALL 光栅化）,2048–32768,-,-,idea,log_20261115.md §5,mega 为何 4096 tokens 就受益待查（需要 MALL 命中的观测手段）
+20261115,-,ep/tp,BM 256 或 8-wave ping-pong（HipKittens；DeepGEMM#473）,≥2048,-,-,idea,log_20261115.md §5,LDS / VGPR 很紧
+20261115,-,ep,gemm2 重写（更大 M tile；解码后的 W 经 LDS 共享）,≥8192,-,16K tokens 预期约 −6%,idea,README §11,
+20261115,-,ep,STRIP16：权重与 scale 同址存放（aiter#7966；vllm#67642）,all,-,上游 MI300X gate-up 1.07–1.18×,idea,log_20261115.md §1,要改权重布局
+20261115,-,ep/tp,stream-K 尾部合并 / 扁平工作列表（humming；aiter#7391）,1024–2048,-,-,idea,log_20261115.md §1,1024 tokens 时 512–640 个 tile 只有 1.7–2.1 波；需 partial tile 合并
+20261115,-,mori,MORI 调度参数表（mori#999/#1003）+ block_num / warp_num 扫描,8192–16384,-,上游 −2.1…−4.4%,idea,log_20261115.md §5,
+20261115,20261115_flydsl_cache_key,flydsl,JIT disk-cache key: what invalidates a cached kernel,-,-,closure list / other-dir helper: STALE,finding,result.txt; skill flydsl-gfx942-pitfalls §1,FlyDSL 0.3.2: closure list/dict/object 和其他目录的普通 helper（a8w4/_vendor）不在 key 里；闭包 int/tuple、同目录 helper、kernel 读到的模块全局变量在 key 里。升级 FlyDSL 后重跑 run_probe.py
+20261115,20261115_flydsl_cache_key,flydsl,static LDS > 64 KB on gfx942,-,-,no exception; output unwritten,finding,result.txt; README §10 #5,LLVM 只往 stderr 打印 local memory exceeds limit；launch 打印 hipErrorIllegalState 但不抛异常

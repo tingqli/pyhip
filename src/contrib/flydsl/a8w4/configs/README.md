@@ -48,44 +48,25 @@
 在包含 `a8w4/` 的目录下运行（pyhip 里是 `src/contrib/flydsl`）。
 
 - 每个 (act, case) 用 4 张卡，每张卡跑 1/4 的 token 点；
-- 8 张卡同时跑两个 (act, case)；
+- 8 张卡同时跑两个 (act, case)，谁先跑完谁接下一个；
 - 每个进程先把权重复制 8 份（EP8 / TP8 约 3.3 GB），计时时轮流使用；
-- 机器要空闲（先用 `rocm-smi --showuse` 确认没有别的进程在跑）。
+- 机器要空闲：`tune-all` 开始前用 `rocm-smi --showuse` 检查（忙就报错，`--force` 跳过），并拿住 `/tmp/gpu-N.lock`（与 aiter validate-kernel-pr 同一约定）。
 
 ```bash
 cd pyhip/src/contrib/flydsl
-T="1 2 3 4 6 8 12 16 24 32 48 64 96 128 192 256 320 384 448 512 640 768 1024 1280 1536 2048 2560 3072 4096 6144 8192 12288 16384 24576 32768"
-OUT=/tmp/a8w4_tune; mkdir -p $OUT
-# tune4 <act> <case> <第一张卡>：在 4 张卡上调一个 (act, case)，第 g 张卡跑第 g 份 token 点
-tune4() {
-  for g in 0 1 2 3; do
-    HIP_VISIBLE_DEVICES=$(($3 + g)) python -m a8w4.tune tune --act $1 --case $2 \
-        -t $(echo $T | tr ' ' '\n' | awk -v g=$g 'NR % 4 == g') \
-        --out $OUT/$1_$2_$g.csv > $OUT/$1_$2_$g.log 2>&1 &
-  done
-}
-
-# situv2 行
-tune4 situv2 mimo-v2.6-flash-tp8 0; tune4 situv2 mimo-v2.6-flash-ep8 4; wait
-# silu 行
-tune4 silu mimo-v2.6-flash-tp8 0; tune4 silu mimo-v2.6-flash-ep8 4; wait
-tune4 silu mimo-v2.6-flash-tp4 0; wait
-
-grep -h -E "BAD|FAIL" $OUT/*.log           # 被剔除的候选，正常应为空
-python -m a8w4.tune merge $OUT/*.csv       # 合并进 a8w4/configs/a8w4_moe_tuned.csv
+# 默认即下表的 5 组：situv2:tp8、situv2:ep8、silu:tp8、silu:ep8、silu:tp4；token 点默认 tune.TOKENS
+python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune
+# 结束时打印被剔除的候选（BAD / FAIL，正常为空），并合并成 /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
+python -m a8w4.tune compare a8w4/configs/a8w4_moe_tuned.csv /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
+cp /tmp/a8w4_tune/a8w4_moe_tuned.new.csv a8w4/configs/a8w4_moe_tuned.csv
+python -m a8w4.tune readme --write                 # 上级 README 7.2–7.4
 ```
 
 如果 FlyDSL 缓存（`~/.flydsl/cache`）里已经有这些 kernel，每一组 8 个进程约 1 分钟。缓存为空时要先编译，每个配置 5–13 s。
 
-- **只更新一部分**（例如只重调 situv2）：只跑对应的 `tune4` 再 `merge`。`merge` 只覆盖同 key 的行（同一 shape、routing、act、token 点和 config），其余行保持不变。
-- **整表重新生成**：先合并到一个新文件，确认没问题再替换。否则旧表里已经不再是候选的配置会留在表里：
-
-  ```bash
-  python -m a8w4.tune merge $OUT/*.csv --csv /tmp/a8w4_moe_tuned.new.csv
-  cp /tmp/a8w4_moe_tuned.new.csv a8w4/configs/a8w4_moe_tuned.csv
-  ```
-
-- **测量误差**：8 个进程同时跑时，大 batch 的结果和事后在空闲卡上单独复测相比相差 ±5–8%，方向不固定（见上级 README 6.3 节）。
+- **只更新一部分**（例如只重调 situv2）：`tune-all --jobs situv2:mimo-v2.6-flash-tp8 situv2:mimo-v2.6-flash-ep8`，再 `python -m a8w4.tune merge /tmp/a8w4_tune/*_[0-9].csv`。`merge` 只覆盖同 key 的行（同一 shape、routing、act、token 点和 config），其余行保持不变。
+- **整表重新生成**：用 `tune-all` 合并出的新文件整个替换（如上），不要 `merge` 进旧表，否则旧表里已经不再是候选的配置会留在表里。
+- **测量误差**：8 个进程同时跑时，大 batch 的结果和事后在空闲卡上单独复测相比相差 ±5–8%，方向不固定（见上级 README 6.3 节）。20261115 的对照实验显示这主要是运行之间的差异，不是并发造成的（`experiments/20261115_retune2/concurrent/`：并发 / 单独的比值均值 1.003）。
 
 ## 检查
 
@@ -102,6 +83,6 @@ python -m pytest a8w4/tests/test_a8w4_moe.py -q -p no:cacheprovider
 - **新 shape**：
   - 用 `--shape H,I,E_local,E_global,topk`，EP 再加 `--expert-offset`；
   - 或者在 `tune.py` 的 `CASES` 里加一项；
-  - 之后同样 `tune4` 再 `merge`。
+  - 之后同样 `tune` （或 `tune-all --jobs <act>:<case>`，新 case 要先加进 `CASES`）再 `merge`。
 - **`--routing hot`**：结果写成另一组行，调用时用 `a8w4_moe(..., routing="hot")` 选这组。
 - **`--act`**：可选值见 `ref.ACTS`。

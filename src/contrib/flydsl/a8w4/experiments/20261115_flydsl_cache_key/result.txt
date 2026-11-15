@@ -1,0 +1,15 @@
+# HIP_VISIBLE_DEVICES=0 python a8w4/experiments/20261115_flydsl_cache_key/run_probe.py   (FlyDSL 0.3.2)
+baseline                         -> 1112     (fresh: 1112   ) in the key
+module global MODE 1 -> 2        -> 2112     (fresh: 2112   ) in the key
+closure list [1] -> [2]          -> 1112     (fresh: 1212   ) STALE (not in the key)
+closure tuple (1,) -> (2,)       -> 1212     (fresh: 1212   ) in the key
+closure int 1 -> 2               -> 1122     (fresh: 1122   ) in the key
+helper in another directory      -> 1112     (fresh: 1116   ) STALE (not in the key)
+helper in the same directory     -> 1116     (fresh: 1116   ) in the key
+comment outside functions        -> reused   (fresh: reused ) no rebuild (the kernel did not change)
+# lds_probe.py 65536
+ran: 65536
+# lds_probe.py 65552
+error: <unknown>:0:0: local memory (65552) exceeds limit (65536) in function 'lds_kernel_0'
+'hipModuleLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream, params, extra)' failed with 'hipErrorIllegalState'
+ran: 0

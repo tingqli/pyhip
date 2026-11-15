@@ -36,7 +36,6 @@ import argparse
 import contextlib
 import itertools
 import os
-import socket
 import statistics
 import sys
 import time
@@ -48,8 +47,9 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from a8w4 import a8w4_moe, config_name, lookup_config  # noqa: E402
 from a8w4 import ref as R  # noqa: E402
+from a8w4.bench import dist as D  # noqa: E402
 
-WORLD = 8
+WORLD = D.WORLD
 MODEL = (4096, 2048, 256, 8)  # MiMo-V2.6-Flash: hidden, moe_intermediate, experts, top-k
 
 
@@ -68,15 +68,17 @@ STAGES = ("moe", "allreduce")
 BENCH_TOKENS = [64, 128, 256, 512, 1024, 2048, 4096]
 # tp2k base (1), tp2k nt4 (77, 600), tp1kq eager / tp1k under capture (4096)
 CHECK_TOKENS = [1, 77, 600, 4096]
-SPIN_US = 3000  # GPU spin while the host enqueues one layer
+SPIN_US = D.SPIN_US  # GPU spin while the host enqueues one layer
+
+# shared with the other 8-GPU tests and experiments (a8w4/bench/dist.py); no MORI here:
+# the device barrier is a 1-element RCCL all-reduce
+_align = D.align_rccl
+_spin_cycles = D.spin_cycles
+_free_port = D.free_port
 
 
 def _skip_reason():
-    if torch.cuda.device_count() < WORLD:
-        return f"needs {WORLD} GPUs"
-    if "gfx942" not in torch.cuda.get_device_properties(0).gcnArchName:
-        return "a8w4 kernels need gfx942 (fp8 FNUZ MFMA)"
-    return None
+    return D.skip_reason(need_mori=False)
 
 
 class TpMoeLayer:
@@ -181,50 +183,6 @@ def _check(ref, z, tokens, graph, kind):
 # timing
 # =============================================================================
 
-_BARRIER = []
-
-
-def _align():
-    """Device-side barrier of all ranks: a 1-element RCCL all-reduce the current stream waits
-    for."""
-    if not _BARRIER:
-        _BARRIER.append(torch.zeros(1, device="cuda"))
-    dist.all_reduce(_BARRIER[0])
-
-
-def _spin_cycles(us):
-    """``torch.cuda._sleep`` cycles for about ``us`` microseconds of GPU spin."""
-    torch.cuda._sleep(1000)
-    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    s.record()
-    torch.cuda._sleep(1 << 22)
-    e.record()
-    e.synchronize()
-    return int((1 << 22) * us / (s.elapsed_time(e) * 1e3))
-
-
-class _Spans:
-    """Events around each stage; ``isolated``: a device barrier between the stages (outside the
-    timed spans)."""
-
-    def __init__(self, isolated):
-        self.isolated, self.spans = isolated, []
-
-    def __call__(self, name=None):
-        if self.spans:
-            self.spans[-1][2].record()
-            if self.isolated and name:
-                _align()
-        if name:
-            s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            s.record()
-            self.spans.append((name, s, e))
-
-    def times(self):
-        """-> ({stage: us}, us from the first start to the last end)."""
-        t = {n: s.elapsed_time(e) * 1e3 for n, s, e in self.spans}
-        return t, self.spans[0][1].elapsed_time(self.spans[-1][2]) * 1e3
-
 
 def _stages(layer, x, tw, ti, graphs, kind):
     """[(stage, fn)] of one layer forward: eager calls, or replays of the captured graphs."""
@@ -242,7 +200,7 @@ def _timed(stages, isolated, spin):
     torch.cuda._sleep(spin)
     _align()
     t0 = time.perf_counter()
-    span = _Spans(isolated)
+    span = D.Spans(isolated, align=_align)
     for name, fn in stages:
         span(name)
         fn()
@@ -331,10 +289,7 @@ def _report_acts(tokens, results, iters):
 
 def _worker(rank, port, tokens, graphs, iters, warmup, model, acts, allreduces):
     _set_model(model)
-    os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "localhost", str(port)
-    torch.cuda.set_device(rank)
-    dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=WORLD,
-                            device_id=torch.device("cuda", rank))
+    D.init(rank, port, mori=False)
     layer = TpMoeLayer(rank, allreduces)
     spin = _spin_cycles(SPIN_US)
     results = {act: [] for act in acts}
@@ -376,15 +331,7 @@ def _worker(rank, port, tokens, graphs, iters, warmup, model, acts, allreduces):
             _report(tokens, results[act], iters, graphs[0], allreduces[0], act)
         if set(acts) == {"silu", "situv2"}:
             _report_acts(tokens, results, iters)
-    torch.cuda.synchronize()
-    dist.barrier()
-    dist.destroy_process_group()
-
-
-def _free_port():
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+    D.finish()
 
 
 def run(tokens, graphs=(False,), iters=0, warmup=3, model=MODEL, acts=("silu",),
@@ -393,10 +340,8 @@ def run(tokens, graphs=(False,), iters=0, warmup=3, model=MODEL, acts=("silu",),
     ``graphs`` (False: eager, True: CUDA graphs) and each all-reduce of ``allreduces`` ("aiter",
     "torch"); ``iters`` > 0 also times it (one mode and one all-reduce; rank 0 prints)."""
     assert not iters or (len(graphs) == 1 and len(allreduces) == 1), (graphs, allreduces)
-    torch.multiprocessing.spawn(
-        _worker, args=(_free_port(), list(tokens), tuple(graphs), iters, warmup, tuple(model),
-                       tuple(acts), tuple(allreduces)),
-        nprocs=WORLD, join=True)
+    D.spawn(_worker, (list(tokens), tuple(graphs), iters, warmup, tuple(model), tuple(acts),
+                      tuple(allreduces)))
 
 
 def test_a8w4_tp8_layer():

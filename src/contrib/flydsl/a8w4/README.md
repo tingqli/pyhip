@@ -149,8 +149,13 @@ a8w4/
   __init__.py                  公开接口
   moe.py                       a8w4_moe / a8w4_moe_dyn、5 类 runner、能力过滤 supported()、调优表查找（lookup_config / dyn_config）
   weights.py                   prepare_weights（fd2 权重）、shuffle_mxfp4、weight_shape
-  tune.py                      调优 CLI：tune / merge / show / verify / candidates
+  tune.py                      调优 CLI：tune / merge / show / verify / candidates / tune-all / compare / readme / stats
+  tables.py                    调优表报告：compare（两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
+  bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是计时协议和变体写法，dist.py 也是 8 卡测试共用的 helper
+  prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
+  exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
+  experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录
   configs/a8w4_moe_tuned.csv   调优表（每个点保存全部候选的耗时）
   configs/README.md            调优表的内容与生成命令
   tests/test_a8w4_moe.py       pytest
@@ -440,15 +445,17 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 ```bash
 cd <包含 a8w4/ 的目录>
 python -m a8w4.tune candidates --case mimo-v2.6-flash-ep8
-# 多卡并行：每张卡分一部分 token 数，最后合并
-T="1 2 3 4 6 8 12 16 24 32 48 64 96 128 192 256 320 384 448 512 640 768 1024 1280 1536 2048 2560 3072 4096 6144 8192 12288 16384 24576 32768"
-for g in 0 1 2 3; do
-  HIP_VISIBLE_DEVICES=$g python -m a8w4.tune tune --case mimo-v2.6-flash-ep8 \
-      -t $(echo $T | tr ' ' '\n' | awk -v g=$g 'NR % 4 == g') --out /tmp/ep8_$g.csv &
-done; wait
+# 整表：8 张空闲卡，每个 (act, case) 用 4 张卡、各跑 1/4 的 token 数；先查 GPU 空闲并加
+# /tmp/gpu-N.lock，结束时汇总 BAD / FAIL 并合并成 <out>/a8w4_moe_tuned.new.csv
+python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune
+python -m a8w4.tune compare configs/a8w4_moe_tuned.csv /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
+# 单卡手动调几个点
+HIP_VISIBLE_DEVICES=0 python -m a8w4.tune tune --case mimo-v2.6-flash-ep8 -t 1024 4096 --out /tmp/ep8_0.csv
 python -m a8w4.tune merge /tmp/ep8_*.csv          # 合并进 configs/a8w4_moe_tuned.csv
 python -m a8w4.tune show   --case mimo-v2.6-flash-ep8
 python -m a8w4.tune verify --case mimo-v2.6-flash-ep8 -t 1 100 3000 20000
+python -m a8w4.tune readme --check                # README 7.2–7.4 与表一致吗（--write 重新生成）
+python -m a8w4.tune stats                         # situv2 与 silu 行的对比（6.3 末尾的数字）
 # situv2：同样的命令加 --act situv2，结果写成 act=situv2 的行（完整命令见 configs/README.md）
 
 # 新 shape：H,I,E_local,E_global,topk（也可以把它加进 tune.py 的 CASES）
@@ -656,6 +663,7 @@ profile 中的 kernel 名：
   - topk=1 时每个输出元素只被 atomic 加一次，tp2k / tp1k / tp1kq / ep3k 全部配置在 1 / 300 / 3000 tokens 下与原 kernel 逐位相同；
   - topk=8 时，新旧 kernel 之间的 cos 差与原 kernel 自身两次运行之间的差在同一量级（1e-7 – 1e-5）。
 - **与 sglang PR #45 的 `ep8_moe_dyn` 一致**：topk=1 时 t16 / s32 / l128、bf16 / fp8 输入逐位相同；topk=8 时 cos 差约 3e-7，与 PR 版自身两次运行之间的差相同。
+- **单个配置或实验变体的检查**：`python -m a8w4.bench check --case tp8 -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph`，逐个变体查对参考、对第一个变体、重复调用的稳定性和 graph 回放（`--bitwise` 配合 topk 1 的 `--shape` 查逐位一致）。三个 8 卡测试的进程组、计时和 megamoe 参考检查共用 `bench/dist.py`。
 
 ### 8.1 整层测试与性能（MORI EP8）
 
@@ -775,7 +783,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
   
   其他 CU 数的 SKU 要先改这些常量。
 - **persistent kernel 和 grid barrier 要求相关 WG 同时驻留**：ep1k 的全部 WG、ep_prep 的排序 WG、tp1kq 的 CTA。如果 CU 更少或被别的进程占用，会死锁而不是变慢。
-- **LDS 上限 64 KB**：超过时 launch 报 `hipErrorIllegalState`，编译期不报错。
+- **LDS 上限 64 KB**：超过时编译和 launch 都只打印错误、不抛异常，输出不会被写（10 节第 5 条）。
 
 ### 9.3 加一个新 kernel 或新配置
 
@@ -793,7 +801,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
   - 把 topk 设为 1，每个输出元素只被加一次，新旧 kernel 应逐位一致；
   - 中间结果（q8s、ep gemm1 输出）直接逐位比较；
   - 再看对参考实现的 cos。
-- **再看资源**：`FLYDSL_DUMP_IR=1 FLYDSL_DEBUG_DUMP_ASM=1 FLYDSL_DUMP_DIR=/tmp/fdX`，检查 `*/21_final_isa.s` 里的 `.vgpr_count`、`.vgpr_spill_count`、`.group_segment_fixed_size`。kernel 命中磁盘缓存时不会重新 dump，需要另给一个空的 `FLYDSL_RUNTIME_CACHE_DIR`。
+- **再看资源**：`python -m a8w4.prof isa --grep <kernel> -- <能触发编译的命令>`（例如 `python -m a8w4.bench check --case ep8 -t 1024 -v m64 --repeats 0`），列出每个 kernel 的 VGPR / AGPR / SGPR、spill、LDS、scratch 和 VGPR 决定的 waves/SIMD。它用一个空的 `FLYDSL_RUNTIME_CACHE_DIR` 加 `FLYDSL_DUMP_IR=1 FLYDSL_DEBUG_DUMP_ASM=1` 运行命令，再读 `*/21_final_isa.s`（kernel 命中磁盘缓存时不会编译，也就不会 dump）。
 - **最后重新调优受影响的 shape**。tile 改动会改变各配置的相对快慢。
 
 ### 9.5 kernel 文件里保留的实验选项
@@ -809,7 +817,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
   - tp_fmoe_q：`DBG`；
   - ep_gemm：`TL`（per-tile 时间线）。
   
-  要做这类实验，改源文件里的常量即可；源码 hash 变了，FlyDSL 会重新编译。
+  要做这类实验，改源文件里的常量即可：kernel 代码按名字读到的模块级常量按值进入缓存 key，FlyDSL 会重新编译（缓存 key 的完整规则见 10 节第 1 条）。
 
 ### 9.6 集成到推理框架
 
@@ -839,14 +847,18 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 
 **FlyDSL 与编译器**
 
-1. **FlyDSL 的磁盘缓存 key 只包含源文件 hash 和闭包中的标量。** 在 helper 里 trace 时读到的运行时值（例如调试 buffer 的地址）不在 key 里，新进程会拿到把旧值写死的二进制，访存出错，这种值要放进 kernel 的闭包标量。gemm2 epilogue 的消融实验曾因为复用了旧二进制，得出「写回方式不影响耗时」的错误结论。
+1. **FlyDSL（0.3.2）的磁盘缓存 key 不包含所有会影响 kernel 的东西。** 已实测（新进程、同一个缓存目录，每次只改一处）：
+   - 会重新编译：`@flyc.jit` / `@flyc.kernel` 函数本身的源码；与 jit 函数**同一目录**里被调用的普通 helper 的源码；闭包里的标量和 tuple（int / float / bool / str / None / tuple / Enum）；kernel 代码按名字读到的模块级全局变量（标量、list / dict / set 按值，callable 按名字，其他对象只按类型）。
+   - **不会**重新编译（拿到旧二进制）：闭包里的 list / dict / set / 对象（例如用 list 传编译开关）；**其他目录**里的普通 helper（本包 `kernels/*.py` 调用的 `_vendor/*.py` helper 都是这种，改了 `_vendor` 要清缓存）；trace 时读到的运行时值（例如调试 buffer 的地址）。
+   - 函数体之外的改动（模块注释等）不触发重新编译。
+   - 对策：编译期开关用 int / tuple 放进闭包（例如 `functools.cache` 的参数）；改了 `_vendor` 或拿不准时，用一个空的 `FLYDSL_RUNTIME_CACHE_DIR` 跑。gemm2 epilogue 的消融实验曾因为复用了旧二进制，得出「写回方式不影响耗时」的错误结论。
 2. **运行时控制流的写法有限制。**
    - 运行时的 `if` / `while` 必须写在 `@flyc.jit` 或 `@flyc.kernel` 函数体里（会做 AST 改写），`range()` 也只有在 jit 函数里才会生成 `scf.for`；
    - 「编译期 if 后接运行时 elif」不可靠，要写成嵌套的 if（见 `_dispatch_rows`）；
    - 嵌套的 `@flyc.jit` 不会因为 Python int 参数不同而重新特化，尺寸要从列表长度推出来。
 3. **运行时 `while` 里不要写 lane 级发散的 `if`**（例如 `if tx == 0` 去取 ticket）。LLVM 会让整个循环体在部分 exec mask 下执行，结果错误，或者直接 hang。改成 wave 级分支，再按 lane 选择增量。
 4. **改变循环结构后，LLVM 会把按 lane 计算的地址提到循环外，长期占住 VGPR。** a16w4 曾因此出现 73–83 个 spill。用 `_opaque_tx` 打断这种提升。
-5. **LDS 超过 64 KB 是在 launch 时报 `hipErrorIllegalState`**，编译期不报错。gemm2 fp8 l128 刚好用满 64 KB，再多 16 B 就失败。
+5. **LDS 超过 64 KB 哪里都不抛异常**（FlyDSL 0.3.2 实测）：编译时 LLVM 只往 stderr 打印 `local memory (N) exceeds limit (65536)`，launch 时打印 `hipErrorIllegalState`，Python 继续运行，输出根本没被写。gemm2 fp8 l128 刚好用满 64 KB，再多 16 B 就失败；编译函数里要留着 LDS 大小的 assert，`python -m a8w4.prof isa` 也会报。
 6. **BM ≥ 64 时打开预取，或 `dyn_m` 编进两种行数变体后，VGPR 会超过 168，每个 SIMD 少驻留 wave，大 batch 反而变慢。** 所以 pipeline 只在小 BM 时打开。
 
 **内存模型与同步**
@@ -864,7 +876,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 14. **ATT 每个 dispatch 的 `realtime.json` 换算出的时钟不可靠**：同一 kernel 两次 trace 的 cycle 数能差 2 倍，只能比较 cycle 数。
 15. **计时要排除几种干扰。**
     - 刚 JIT 完的第一次计时偏慢；
-    - 刷 cache 只挤得掉 L2：每次调用都读的权重会留在 256 MB 的 MALL 里，读 512 MB 甚至 2 GB 都挤不掉（MALL 看起来不让一次性扫过的数据替换反复读的行）。W 走 nt 的配置不受影响，W 走 cache 的（bcm 0 / 1）因此显得快 5–13%；rocprof 的 L2 命中率和 HBM 读请求数在两种 cache 策略下完全相同，差别只在 L2 之后。旧调优表因此在 TP 6–128 tokens 选了 `g1bcm1`，实际慢 5–7.7%。计时要让每次调用读一份最近没读过的权重（`ref.weight_copies`，≥8 份；2 份不够）；
+    - 刷 cache 只挤得掉 L2：每次调用都读的权重会留在 256 MB 的 MALL 里，读 512 MB 甚至 2 GB 都挤不掉（MALL 看起来不让一次性扫过的数据替换反复读的行）。W 走 nt 的配置不受影响，W 走 cache 的（bcm 0 / 1）因此显得快 5–13%；rocprof 的 L2 命中率和 HBM 读请求数在两种 cache 策略下完全相同，差别只在 L2 之后。旧调优表因此在 TP 6–128 tokens 选了 `g1bcm1`，实际慢 5–7.7%。计时要让每次调用读一份最近没读过的权重（`ref.weight_copies`，≥8 份；2 份不够）。`python -m a8w4.bench ab` 默认就这样计时，W / A 走 cache 的变体在不轮换权重的协议下会被拒绝；`--protocol coldrot cold` 可以把两种协议并排测出来；
     - 先刷 cache 再写一遍（读改写）也不对：W 走 cache 的读要先把 dirty 行写回才能占位，会显得慢 9–48%；
     - host 的 launch 开销要排除（GPU 先空转，再记开始 event）；
     - 单次测量有 ±3–5% 的抖动，候选之间要交错测量；
@@ -882,7 +894,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 20. **容器自带的 FlyDSL 是 0.1.5，本包需要 0.3.2。** 用 `pip install --target <目录>` 装到独立目录，再通过 `PYTHONPATH` 生效。
 21. **aiter 的 JIT `.so` 与源码版本不一致**（`module_aiter_core` 缺 `MlaVersion`）。设置 `AITER_JIT_DIR=<新目录>`，让 aiter 在那里重新编译，不改动共享环境。
 22. **本包现在放在 pyhip 里（`pyhip.contrib.flydsl.a8w4`）。**
-    - 非 editable 安装时，`pyproject.toml` 要列出 `a8w4`、`a8w4._vendor`、`a8w4.kernels` 三个子包，并用 package-data 带上 `configs/*.csv`。漏了子包会 import 失败；漏了 CSV 不报错，查表会静默退回默认配置。
+    - 非 editable 安装时，`pyproject.toml` 要列出 `a8w4`、`a8w4._vendor`、`a8w4.kernels`、`a8w4.bench` 四个子包，并用 package-data 带上 `configs/*.csv`。漏了子包会 import 失败；漏了 CSV 不报错，查表会静默退回默认配置。
     - aiter 的 import 依赖 pyhip，要用源码里的 pyhip（例如 `pip install -e`）。早先把 pyhip stub 掉的做法不再适用。
 
 **EP all-to-all（MORI）**

@@ -35,7 +35,6 @@ Routing is uniform (random scores, renormalized softmax top-8).
 
 import argparse
 import os
-import socket
 import statistics
 import sys
 import time
@@ -47,34 +46,33 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from a8w4 import a8w4_moe_dyn, dyn_config  # noqa: E402
 from a8w4 import ref as R  # noqa: E402
+from a8w4.bench import dist as D  # noqa: E402
+from a8w4.bench.dist import E_GLOBAL, E_LOCAL, H, I, TOPK, WORLD  # noqa: E402
 
 try:
     import mori
 except ImportError:  # the test skips
     mori = None
 
-H, I, E_GLOBAL, TOPK, WORLD = 4096, 2048, 256, 8, 8
-E_LOCAL = E_GLOBAL // WORLD
 SHAPE = (H, I, E_LOCAL, E_GLOBAL, TOPK)
 MAX_TOKENS = 4096  # per rank and dispatch (sglang SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK)
 FP8 = torch.float8_e4m3fnuz
-COS_TOL = 5e-3
+COS_TOL = D.COS_TOL
 STAGES = ("quant", "dispatch", "moe", "combine")
 BENCH_TOKENS = [64, 128, 256, 512, 1024, 2048, 4096]  # T, the total over the ranks
 # tokens per rank of the correctness test: a small batch, an uneven one (idle ranks,
 # a single token) and the full dispatch capacity
 CHECK_TOKENS = [[64] * WORLD, [0, 1, 37, 300, 5, 128, 999, 0], [MAX_TOKENS] * WORLD]
-SPIN_US = 3000  # GPU spin while the host enqueues one layer
+SPIN_US = D.SPIN_US  # GPU spin while the host enqueues one layer
 
-
-def _skip_reason():
-    if mori is None:
-        return "needs mori"
-    if torch.cuda.device_count() < WORLD:
-        return f"needs {WORLD} GPUs"
-    if "gfx942" not in torch.cuda.get_device_properties(0).gcnArchName:
-        return "a8w4 kernels need gfx942 (fp8 FNUZ MFMA)"
-    return None
+# shared with the other 8-GPU tests and experiments (a8w4/bench/dist.py)
+_skip_reason = D.skip_reason
+_gather_rows = D.gather_rows
+_align = D.align_mori
+_spin_cycles = D.spin_cycles
+_Spans = D.Spans
+_free_port = D.free_port
+split_tokens = D.split_tokens
 
 
 class EpMoeLayer:
@@ -142,15 +140,6 @@ class EpMoeLayer:
 # =============================================================================
 
 
-def _gather_rows(t, ns):
-    """Every rank's rows of ``t`` ([ns[rank], ...]), concatenated in rank order."""
-    buf = t.new_zeros((max(ns), *t.shape[1:]))
-    buf[: t.shape[0]] = t
-    parts = [torch.empty_like(buf) for _ in range(WORLD)]
-    dist.all_gather(parts, buf)
-    return torch.cat([p[:n] for p, n in zip(parts, ns)])
-
-
 def _check(layer, ns, x, tw, ti, graph):
     """One layer forward (MoE: sglang's eager / CUDA-graph call) vs the fp32 reference
     (each rank evaluates its experts on all ranks' dispatched tokens, summed over the
@@ -179,45 +168,6 @@ def _check(layer, ns, x, tw, ti, graph):
 # =============================================================================
 # timing
 # =============================================================================
-
-
-def _align():
-    """Device-side barrier of all ranks (MORI shmem) on the current stream."""
-    mori.shmem.shmem_barrier_on_stream(torch.cuda.current_stream())
-
-
-def _spin_cycles(us):
-    """``torch.cuda._sleep`` cycles for about ``us`` microseconds of GPU spin."""
-    torch.cuda._sleep(1000)
-    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    s.record()
-    torch.cuda._sleep(1 << 22)
-    e.record()
-    e.synchronize()
-    return int((1 << 22) * us / (s.elapsed_time(e) * 1e3))
-
-
-class _Spans:
-    """Events around each stage; ``isolated``: a device barrier between the stages
-    (outside the timed spans)."""
-
-    def __init__(self, isolated):
-        self.isolated, self.spans = isolated, []
-
-    def __call__(self, name=None):
-        if self.spans:
-            self.spans[-1][2].record()
-            if self.isolated and name:
-                _align()
-        if name:
-            s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            s.record()
-            self.spans.append((name, s, e))
-
-    def times(self):
-        """-> ({stage: us}, us from the first start to the last end)."""
-        t = {n: s.elapsed_time(e) * 1e3 for n, s, e in self.spans}
-        return t, self.spans[0][1].elapsed_time(self.spans[-1][2]) * 1e3
 
 
 def _timed(layer, x, tw, ti, args, isolated, spin):
@@ -299,12 +249,7 @@ def _report(points, results, iters, graph):
 
 
 def _worker(rank, port, points, graphs, iters, warmup):
-    os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "localhost", str(port)
-    torch.cuda.set_device(rank)
-    dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=WORLD,
-                            device_id=torch.device("cuda", rank))
-    torch._C._distributed_c10d._register_process_group("mori", dist.group.WORLD)
-    mori.shmem.shmem_torch_process_group_init("mori")
+    D.init(rank, port)
     layer = EpMoeLayer(rank)
     spin = _spin_cycles(SPIN_US)
     results = []
@@ -329,20 +274,7 @@ def _worker(rank, port, points, graphs, iters, warmup):
                   "GPU spin (medians absorb a few)", flush=True)
     if results and rank == 0:
         _report(points, results, iters, graphs[0])
-    torch.cuda.synchronize()
-    dist.barrier()
-    dist.destroy_process_group()
-
-
-def _free_port():
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-def split_tokens(total):
-    """Tokens per rank of a ``total``-token batch (DP attention: even shares)."""
-    return [total // WORLD + (r < total % WORLD) for r in range(WORLD)]
+    D.finish()
 
 
 def run(points, graphs=(False,), iters=0, warmup=3):
@@ -351,8 +283,7 @@ def run(points, graphs=(False,), iters=0, warmup=3):
     call, True: its CUDA-graph call); ``iters`` > 0 also times it (one call; rank 0
     prints)."""
     assert not iters or len(graphs) == 1, graphs
-    torch.multiprocessing.spawn(_worker, args=(_free_port(), points, graphs, iters, warmup),
-                                nprocs=WORLD, join=True)
+    D.spawn(_worker, (points, graphs, iters, warmup))
 
 
 def test_mori_a8w4_layer():

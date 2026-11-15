@@ -27,8 +27,6 @@ slowest rank): quant / prep (count exchange) / plan / mega / finish (wait for al
 import argparse
 import itertools
 import os
-import socket
-import statistics
 import sys
 
 import pytest
@@ -37,107 +35,30 @@ import torch.distributed as dist
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from a8w4 import ref as R  # noqa: E402
+from a8w4.bench import dist as D  # noqa: E402
+from a8w4.bench.dist import E_GLOBAL, E_LOCAL, H, I, TOPK, WORLD  # noqa: E402,F401
 
-try:
-    import mori
-except ImportError:  # the test skips
-    mori = None
-
-H, I, E_GLOBAL, TOPK, WORLD = 4096, 2048, 256, 8, 8
-E_LOCAL = E_GLOBAL // WORLD
 MAX_TOKENS = 4096  # per rank (the MORI path's dispatch capacity)
-FP8 = torch.float8_e4m3fnuz
-COS_TOL = 5e-3
+COS_TOL = D.COS_TOL
 BENCH_TOKENS = [2048, 4096, 8192, 16384, 32768]  # T, the total over the ranks
 # tokens per rank of the correctness test: uniform, an uneven batch (idle ranks, a single
 # token) and the full capacity
 CHECK_TOKENS = [[256] * WORLD, [0, 1, 37, 300, 5, 128, 999, 0], [MAX_TOKENS] * WORLD]
-SPIN_US = 3000
-STAGES = ("quant", "prep", "plan", "mega", "finish")
+SPIN_US = D.SPIN_US
+STAGES = D.MEGA_STAGES
 
-
-def _skip_reason():
-    if mori is None:
-        return "needs mori"
-    if torch.cuda.device_count() < WORLD:
-        return f"needs {WORLD} GPUs"
-    if "gfx942" not in torch.cuda.get_device_properties(0).gcnArchName:
-        return "a8w4 kernels need gfx942 (fp8 FNUZ MFMA)"
-    return None
-
-
-def split_tokens(total):
-    """Tokens per rank of a ``total``-token batch (DP attention: even shares)."""
-    return [total // WORLD + (r < total % WORLD) for r in range(WORLD)]
-
-
-def _gather_rows(t, ns):
-    """Every rank's rows of ``t`` ([ns[rank], ...]), concatenated in rank order."""
-    buf = t.new_zeros((max(max(ns), 1), *t.shape[1:]))
-    buf[: t.shape[0]] = t
-    parts = [torch.empty_like(buf) for _ in range(WORLD)]
-    dist.all_gather(parts, buf)
-    return torch.cat([p[:n] for p, n in zip(parts, ns)])
-
-
-def _check(mega, raw, ns, x, tw, ti, act, situ):
-    """One megamoe call vs the fp32 reference -> [(rows needed, cos diff)] of every rank."""
-    rank, n = mega.rank, ns[mega.rank]
-    y = mega(x, ti, tw)[:n].float()
-    x_ref = (mega.x8[:n].view(FP8).float().view(n, H // 128, 128)
-             * mega.xs[:n].unsqueeze(-1)).view(n, H)
-    X, TW, TI = (_gather_rows(t, ns) for t in (x_ref, tw, ti))
-    ref = R.ref_moe(X, TW, TI, raw, rank * E_LOCAL, act, situ, quant_x=False)
-    dist.all_reduce(ref)
-    off = sum(ns[:rank])
-    diff = R.cos_diff(ref[off:off + n], y) if n else 0.0
-    res = [None] * WORLD
-    dist.all_gather_object(res, (mega.rows_needed(), diff))
-    bad = [(r, *v) for r, v in enumerate(res) if v[0] > mega.s_cap or not v[1] < COS_TOL]
-    assert not bad, f"tokens per rank {ns}: (rank, rows needed, cos diff) {bad}"
-    return res
-
-
-def _align():
-    """Device-side barrier of all ranks (MORI shmem) on the current stream."""
-    mori.shmem.shmem_barrier_on_stream(torch.cuda.current_stream())
-
-
-def _spin_cycles(us):
-    torch.cuda._sleep(1000)
-    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    s.record()
-    torch.cuda._sleep(1 << 22)
-    e.record()
-    e.synchronize()
-    return int((1 << 22) * us / (s.elapsed_time(e) * 1e3))
-
-
-def _timed(fn, spin, marks=None):
-    """One timed call -> (e2e us, {stage: us} if ``marks``)."""
-    R.flush_cache()
-    dist.barrier()
-    torch.cuda._sleep(spin)
-    _align()
-    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    s.record()
-    fn()
-    e.record()
-    torch.cuda.synchronize()
-    stages = {}
-    if marks:
-        stages = {name: a.elapsed_time(b) * 1e3 for (_, a), (name, b) in zip(marks, marks[1:])}
-        marks.clear()
-    return s.elapsed_time(e) * 1e3, stages
+# shared with the other 8-GPU tests and experiments (a8w4/bench/dist.py); the old names
+# stay for the archived experiment scripts that import them
+_skip_reason = D.skip_reason
+split_tokens = D.split_tokens
+_check = D.check_megamoe
+_spin_cycles = D.spin_cycles
+_timed = D.timed
+_free_port = D.free_port
 
 
 def _worker(rank, port, points, iters, warmup, acts):
-    os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "localhost", str(port)
-    torch.cuda.set_device(rank)
-    dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=WORLD,
-                            device_id=torch.device("cuda", rank))
-    torch._C._distributed_c10d._register_process_group("mori", dist.group.WORLD)
-    mori.shmem.shmem_torch_process_group_init("mori")
+    D.init(rank, port)
     from a8w4.megamoe import MegaMoeEpA8W4
 
     W, raw = R.make_weights(E_LOCAL, H, I, seed=rank)
@@ -157,9 +78,7 @@ def _worker(rank, port, points, iters, warmup, acts):
                           f"{max(d for _, d in res):.1e}", flush=True)
     if iters:
         _bench(rank, points, data, megas, W, iters, warmup)
-    torch.cuda.synchronize()
-    dist.barrier()
-    dist.destroy_process_group()
+    D.finish()
 
 
 def _bench(rank, points, data, megas, W, iters, warmup):
@@ -200,10 +119,9 @@ def _bench(rank, points, data, megas, W, iters, warmup):
             res = [None] * WORLD
             dist.all_gather_object(res, (t_mega, t_mori, st, mega.rows_needed()))
             if rank == 0:
-                med = statistics.median
-                e2e = med([max(r[0][i] for r in res) for i in range(iters)])
-                mori_e2e = med([max(r[1][i] for r in res) for i in range(iters)])
-                stages = {s: max(med([it[s] for it in r[2]]) for r in res) for s in STAGES}
+                e2e = D.slowest_median([r[0] for r in res])
+                mori_e2e = D.slowest_median([r[1] for r in res])
+                stages = D.stage_max([r[2] for r in res], STAGES)
                 rows.append((sum(ns), act, e2e, mori_e2e, stages, max(r[3] for r in res)))
                 print(f"T {sum(ns)} {act}: megamoe {e2e:.1f} us, MORI path {mori_e2e:.1f} us",
                       flush=True)
@@ -226,17 +144,10 @@ def _bench(rank, points, data, megas, W, iters, warmup):
         print("\n".join(lines), flush=True)
 
 
-def _free_port():
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
 def run(points, iters=0, warmup=3, acts=("silu",)):
     """Spawn the 8 ranks: check every point (tokens per rank, one list per point) against
     the reference; ``iters`` > 0 also times it against the MORI path (rank 0 prints)."""
-    torch.multiprocessing.spawn(_worker, args=(_free_port(), points, iters, warmup, acts),
-                                nprocs=WORLD, join=True)
+    D.spawn(_worker, (points, iters, warmup, acts))
 
 
 def test_megamoe_ep8():

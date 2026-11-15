@@ -11,6 +11,11 @@ allowed in its context (activation, CUDA-graph capture, token count).
     python -m a8w4.tune verify --case mimo-v2.6-flash-ep8 -t 1 100 3000
     # SiTUv2 experts: their own rows (act column), same commands with --act situv2
     python -m a8w4.tune tune --act situv2 --case mimo-v2.6-flash-ep8 -t 1 2 4 --out /tmp/s0.csv
+    # the whole table on 8 idle GPUs (4 per (act, case) job), BAD / FAIL report, merged
+    python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune
+    python -m a8w4.tune compare configs/a8w4_moe_tuned.csv /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
+    python -m a8w4.tune readme --check               # README 7.2-7.4 vs the table
+    python -m a8w4.tune stats                        # situv2 vs silu rows
 
 Run from the directory that contains ``a8w4/`` (or put it on PYTHONPATH);
 ``python a8w4/tune.py ...`` works too. Timing: cold caches (L2 flushed, and every
@@ -23,8 +28,13 @@ the time). See configs/README.md for the commands that produced the shipped tabl
 
 import argparse
 import csv
+import fcntl
+import glob
 import itertools
+import json
 import os
+import re
+import subprocess
 import sys
 import time
 
@@ -61,6 +71,9 @@ TOKENS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 320, 384,
           768, 1024, 1280, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768]
 COS_TOL = 5e-3  # vs the fp8-emulating fp32 reference (typical 1e-5 .. 1e-4)
 EP_CFGS = ("t16", "s16", "s32", "m64", "l128", "l128c")
+# (act, case) groups of the shipped table (configs/README.md)
+TABLE_JOBS = ("situv2:mimo-v2.6-flash-tp8", "situv2:mimo-v2.6-flash-ep8",
+              "silu:mimo-v2.6-flash-tp8", "silu:mimo-v2.6-flash-ep8", "silu:mimo-v2.6-flash-tp4")
 
 
 def candidates(shape):
@@ -243,10 +256,116 @@ def merge(parts, csv_path):
     print(f"merged {len(rows)} rows from {len(parts)} files into {csv_path}")
 
 
+def _gpu_list(spec):
+    """"0-7" / "0,2,4" -> [0, ..., 7] / [0, 2, 4]."""
+    out = []
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        out += list(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def busy_gpus(gpus, limit=10, samples=3):
+    """GPUs of ``gpus`` (physical indices) with > ``limit`` % GFX activity in any of
+    ``samples`` rocm-smi readings 1 s apart (a tuner next to another job measures both)."""
+    busy = {}
+    for i in range(samples):
+        out = subprocess.run(["rocm-smi", "--showuse", "--json"], capture_output=True,
+                             text=True, timeout=60).stdout
+        for card, d in json.loads(out).items():
+            g = int(re.sub(r"\D", "", card))
+            use = float(d.get("GPU use (%)", 0))
+            if g in gpus and use > limit:
+                busy[g] = max(busy.get(g, 0.0), use)
+        if i + 1 < samples:
+            time.sleep(1)
+    return busy
+
+
+def _lock(gpus):
+    """Exclusive /tmp/gpu-<i>.lock of every GPU (the convention of aiter's
+    validate-kernel-pr: other agents' jobs wait or fail instead of sharing the GPU)."""
+    held = []
+    for g in gpus:
+        fh = open(f"/tmp/gpu-{g}.lock", "w")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit(f"GPU {g} is locked by another job (/tmp/gpu-{g}.lock)")
+        held.append(fh)
+    return held
+
+
+def tune_all(jobs, gpus, per_job, tokens, out_dir, args, force=False, log=print):
+    """Every (act, case) job of ``jobs`` on ``per_job`` GPUs (GPU g of the group takes
+    tokens[g::per_job]); groups of ``gpus`` take the next job when they free up. Then the
+    BAD / FAIL lines of all logs and a merged <out_dir>/a8w4_moe_tuned.new.csv."""
+    if len(gpus) < per_job:
+        raise SystemExit(f"--per-job {per_job} needs at least that many --gpus ({gpus})")
+    for j in jobs:
+        act, _, case = j.partition(":")
+        if act not in R.ACTS or case not in CASES:
+            raise SystemExit(f"job {j!r}: expected <act>:<case>, act in {R.ACTS}, case in "
+                             f"{sorted(CASES)}")
+    if not force:
+        busy = busy_gpus(gpus)
+        if busy:
+            raise SystemExit(f"GPUs busy (GFX use %): {busy}; tuning next to another job "
+                             "skews the table. Wait, pick other --gpus, or --force")
+    held = _lock(gpus)  # noqa: F841 - released at exit
+    os.makedirs(out_dir, exist_ok=True)
+    groups = [gpus[i:i + per_job] for i in range(0, len(gpus) - per_job + 1, per_job)]
+    env = dict(os.environ, AITER_LOG_LEVEL=os.environ.get("AITER_LOG_LEVEL", "ERROR"))
+    todo, running, failed = list(jobs), {}, []
+    t0 = time.time()
+    while todo or running:
+        for gi, procs in list(running.items()):
+            if all(p.poll() is not None for _, p in procs):
+                failed += [name for name, p in procs if p.returncode]
+                del running[gi]
+        for gi, grp in enumerate(groups):
+            if gi in running or not todo:
+                continue
+            act, _, case = todo.pop(0).partition(":")
+            procs = []
+            for g, gpu in enumerate(grp):
+                shard = tokens[g::per_job]
+                if not shard:
+                    continue
+                stem = os.path.join(out_dir, f"{act}_{case}_{g}")
+                cmd = [sys.executable, os.path.abspath(__file__), "tune", "--act", act, "--case",
+                       case, "-t", *map(str, shard), "--out", stem + ".csv", "--iters",
+                       str(args.iters), "--rounds", str(args.rounds), "--wcopies", str(args.wcopies),
+                       "--routing", args.routing]
+                with open(stem + ".log", "w") as fh:
+                    procs.append((stem + ".log", subprocess.Popen(
+                        cmd, stdout=fh, stderr=subprocess.STDOUT,
+                        env=dict(env, HIP_VISIBLE_DEVICES=str(gpu)))))
+            running[gi] = procs
+            log(f"{act} {case}: GPUs {grp}, {len(tokens)} token counts")
+        time.sleep(2)
+    log(f"all jobs done in {(time.time() - t0) / 60:.1f} min")
+    logs = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.log")))
+    bad = [f"{os.path.basename(f)}: {ln.strip()}" for f in logs for ln in open(f)
+           if re.search(r"\b(BAD|FAIL)\b", ln)]
+    print("\n".join(["BAD / FAIL candidates:"] + bad) if bad else "no BAD / FAIL candidates")
+    if failed:
+        print(f"FAILED processes (see their logs): {failed}")
+    parts = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.csv")))
+    new = os.path.join(out_dir, "a8w4_moe_tuned.new.csv")
+    if os.path.exists(new):
+        os.remove(new)
+    merge(parts, new)
+    print(f"next: python -m a8w4.tune compare {DEFAULT_CSV} {new}\n"
+          f"      cp {new} {DEFAULT_CSV}   # then: python -m a8w4.tune readme --write")
+    return 1 if failed else 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("mode", choices=["tune", "merge", "show", "verify", "candidates"])
-    p.add_argument("parts", nargs="*", help="merge: tune output files")
+    p.add_argument("mode", choices=["tune", "merge", "show", "verify", "candidates", "tune-all",
+                                    "compare", "readme", "stats"])
+    p.add_argument("parts", nargs="*", help="merge: tune output files; compare: OLD NEW tables")
     p.add_argument("--case", default="mimo-v2.6-flash-tp8", choices=sorted(CASES))
     p.add_argument("--shape", default=None, help="H,I,E_local,E_global,topk (overrides --case)")
     p.add_argument("--expert-offset", type=int, default=0)
@@ -255,16 +374,39 @@ def main():
     p.add_argument("--act", default="silu", choices=R.ACTS,
                    help="experts' activation: tune / show / verify its rows (situv2: ref.SITU)")
     p.add_argument("--csv", default=DEFAULT_CSV)
-    p.add_argument("--out", default=None, help="tune: output file (default --csv)")
+    p.add_argument("--out", default=None,
+                   help="tune: output file (default --csv); tune-all: output directory "
+                        "(default /tmp/a8w4_tune)")
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--rounds", type=int, default=3, help="tune: interleaved timing rounds")
     p.add_argument("--wcopies", type=int, default=R.WCOPIES,
                    help="weight copies the timed calls cycle through (1: the same weights "
                         "every call, which the MALL keeps: favors cached W loads)")
+    p.add_argument("--gpus", default="0-7", help="tune-all: GPUs, e.g. 0-7 or 0,1,2,3")
+    p.add_argument("--per-job", type=int, default=4, help="tune-all: GPUs per (act, case) job")
+    p.add_argument("--jobs", nargs="+", default=list(TABLE_JOBS),
+                   help="tune-all: <act>:<case> jobs (default: the shipped table's)")
+    p.add_argument("--force", action="store_true", help="tune-all: skip the idle-GPU check")
+    p.add_argument("--write", action="store_true", help="readme: update README.md")
+    p.add_argument("--check", action="store_true",
+                   help="readme: exit 1 when README 7.2-7.4 differ from the table")
     args = p.parse_args()
     log = lambda s: print(f"[{time.strftime('%H:%M:%S')}] {s}", flush=True)  # noqa: E731
     if args.mode == "merge":
         return merge(args.parts, args.csv)
+    if args.mode in ("compare", "readme", "stats"):
+        from . import tables
+
+        if args.mode == "compare":
+            if len(args.parts) != 2:
+                raise SystemExit("compare OLD.csv NEW.csv")
+            return tables.compare(*args.parts)
+        if args.mode == "readme":
+            sys.exit(tables.readme(args.csv, write=args.write, check=args.check))
+        return tables.stats(args.csv)
+    if args.mode == "tune-all":
+        sys.exit(tune_all(args.jobs, _gpu_list(args.gpus), args.per_job, args.t or TOKENS,
+                          args.out or "/tmp/a8w4_tune", args, args.force, log))
     shape, e0 = _case(args)
     if args.mode == "candidates":
         for c in candidates(shape):
