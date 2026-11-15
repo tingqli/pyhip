@@ -1,0 +1,6 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[00:24:20] shape H4096 I256 E256/256 top8 e0 0 act silu: 11 candidates, 8 weight copies
+[00:24:25] tok     16: tp2k bm32 g1bcm2 g2nt4 62.7 | tp2k bm64 g1bcm2 g2nt4 63.4 | tp2k bm32 g1bcm2 g2base 63.8
+[00:24:26] tok     32: tp2k bm64 g1bcm2 g2nt4 99.7 | tp2k bm32 g1bcm2 g2nt4 100.7 | tp2k bm32 g1bcm2 g2base 101.8
+[00:24:27] tok     64: tp2k bm64 g1bcm2 g2nt4 122.6 | tp2k bm32 g1bcm2 g2nt4 123.8 | tp2k bm32 g1bcm2 g2base 125.1

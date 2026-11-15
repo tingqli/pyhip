@@ -1,0 +1,34 @@
+W20261115 00:12:33.142287 136184181939712 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.234287 sec
+W20261115 00:12:33.142801 136184181939712 simple_timer.cpp:55] [rocprofv3] 'python a8w4/experiments/20261115_ep_prio/counters.py 16384 --base l128' ::     0.000000 sec
+W20261115 00:12:36.367616 130983111278080 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.308909 sec
+W20261115 00:12:36.368757 130983111278080 simple_timer.cpp:55] [rocprofv3] '/opt/rocm-7.2.0/bin/hipconfig --version' ::     0.000000 sec
+W20261115 00:12:36.917818 130190206778880 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.229115 sec
+W20261115 00:12:36.918396 130190206778880 simple_timer.cpp:55] [rocprofv3] 'sh -c /opt/rocm-7.2.0/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W20261115 00:12:37.578559 140361771703872 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.231785 sec
+W20261115 00:12:37.581477 140361771703872 simple_timer.cpp:55] [rocprofv3] '/opt/rocm-7.2.0/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W20261115 00:12:37.582911 140361771703872 simple_timer.cpp:55] [rocprofv3] '/opt/rocm-7.2.0/lib/llvm/bin/clang++ --version' ::     0.001434 sec
+W20261115 00:12:37.583750 140361771703872 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000616 sec
+W20261115 00:12:37.583819 140361771703872 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000689 sec
+W20261115 00:12:37.605868 130983111278080 simple_timer.cpp:55] [rocprofv3] '/opt/rocm-7.2.0/bin/hipconfig --version' ::     1.237112 sec
+W20261115 00:12:37.607506 130983111278080 simple_timer.cpp:55] [rocprofv3] output generation ::     0.001249 sec
+W20261115 00:12:37.607594 130983111278080 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001346 sec
+W20261115 00:12:39.238566 135446364589568 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.233470 sec
+W20261115 00:12:39.239031 135446364589568 simple_timer.cpp:55] [rocprofv3] '/bin/sh -c cat /proc/sys/kernel/numa_balancing' ::     0.000000 sec
+W20261115 00:12:39.850663 133736301657600 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.230626 sec
+W20261115 00:12:39.851034 133736301657600 simple_timer.cpp:55] [rocprofv3] 'cat /proc/sys/kernel/numa_balancing' ::     0.000000 sec
+W20261115 00:12:39.851262 133736301657600 simple_timer.cpp:55] [rocprofv3] 'cat /proc/sys/kernel/numa_balancing' ::     0.000228 sec
+W20261115 00:12:39.852295 133736301657600 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000710 sec
+W20261115 00:12:39.852373 133736301657600 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000793 sec
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+W20261115 00:12:41.025517 136184181939712 tool.cpp:2422] HSA version 8.20.0 initialized (instance=0)
+W20261115 00:12:42.723526 136233861864960 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.337206 sec
+W20261115 00:12:42.724443 136233861864960 simple_timer.cpp:55] [rocprofv3] '/opt/rocm/llvm/bin/amdgpu-arch' ::     0.000000 sec
+W20261115 00:12:42.724933 136233861864960 simple_timer.cpp:55] [rocprofv3] '/opt/rocm/llvm/bin/amdgpu-arch' ::     0.000490 sec
+W20261115 00:12:42.726552 136233861864960 simple_timer.cpp:55] [rocprofv3] output generation ::     0.001092 sec
+W20261115 00:12:42.726621 136233861864960 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001178 sec
+W20261115 00:12:47.683196 136184181939712 simple_timer.cpp:55] [rocprofv3] 'python a8w4/experiments/20261115_ep_prio/counters.py 16384 --base l128' ::    14.540395 sec
+E20261115 00:12:47.702907 136184181939712 output_stream.cpp:111] Opened result file: a8w4/experiments/20261115_ep_prio/counters/t16384_l128_g1/c_counter_collection.csv
+E20261115 00:12:47.734758 136184181939712 output_stream.cpp:111] Opened result file: a8w4/experiments/20261115_ep_prio/counters/t16384_l128_g1/c_agent_info.csv
+W20261115 00:12:47.736514 136184181939712 simple_timer.cpp:55] [rocprofv3] output generation ::     0.040081 sec
+W20261115 00:12:47.738820 136184181939712 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.042404 sec

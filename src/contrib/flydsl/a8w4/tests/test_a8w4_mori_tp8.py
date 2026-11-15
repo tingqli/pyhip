@@ -21,7 +21,9 @@ and all experts with 1/8 of moe_intermediate. Per rank, as sglang's
 
 Run from the directory that holds ``a8w4/``; needs 8 gfx942 GPUs.
 
-Timing as in test_a8w4_mori_ep8.py: every iteration flushes L2 + MALL (cold weights), then a
+Timing as in test_a8w4_mori_ep8.py: every iteration flushes L2 and uses the next of
+``R.WCOPIES`` weight copies (the flush leaves re-read weights in the MALL; ``--graph``
+captures a graph pair per copy), then a
 host barrier, a GPU spin while the host enqueues the layer (host overhead excluded) and a
 device-side barrier (a 1-element RCCL all-reduce), so all ranks start together. Each iteration
 runs the layer twice: with a barrier before every stage (each stage timed alone) and back to
@@ -32,6 +34,7 @@ instead of copying it into its own buffer first.
 
 import argparse
 import contextlib
+import itertools
 import os
 import socket
 import statistics
@@ -83,6 +86,7 @@ class TpMoeLayer:
     def __init__(self, rank, allreduces):
         self.rank = rank
         self.W, self.raw = R.make_weights(E, H, I_LOCAL, seed=rank)
+        self._Ws = [self.W]
         self.set_act("silu")
         self.ca = None
         if "aiter" in allreduces:
@@ -101,6 +105,12 @@ class TpMoeLayer:
     def moe(self, x, tw, ti):
         return a8w4_moe(x, self.W, tw, ti, act=self.act, situ=self.situ)
 
+    def weights(self, n=R.WCOPIES):
+        """``n`` copies of the weights (the original first; made once)."""
+        if len(self._Ws) < n:
+            self._Ws = R.weight_copies(self._Ws[0], n)
+        return self._Ws[:n]
+
     def all_reduce(self, y, kind):
         """sglang ``GroupCoordinator.all_reduce``: ``kind`` "aiter" runs the custom all-reduce
         when the size fits (out of place), anything else RCCL in place -> the sum."""
@@ -112,20 +122,26 @@ class TpMoeLayer:
     def ar_path(self, y, kind):
         return "aiter custom" if kind == "aiter" and self.ca.should_custom_ar(y) else "rccl"
 
-    def capture(self, x, tw, ti, kind):
+    def capture(self, x, tw, ti, kind, copies=1):
         """CUDA graphs of the MoE and of the all-reduce, captured as sglang captures decode (one
-        graph per stage here, to time them) -> (moe graph, all-reduce graph, output)."""
+        graph per stage here, to time them), a pair per weight copy -> ([(moe graph,
+        all-reduce graph)], the first pair's output)."""
         self.all_reduce(self.moe(x, tw, ti), kind)  # warm-up: compiles, allocates workspaces
         torch.cuda.synchronize()
-        g_moe, g_ar = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        graphs, outs, W = [], [], self.W
         # aiter registers the captured inputs' addresses with its peers when capture() exits
         with self.ca.capture() if kind == "aiter" else contextlib.nullcontext():
-            with torch.cuda.graph(g_moe):
-                y = self.moe(x, tw, ti)
-            with torch.cuda.graph(g_ar):
-                z = self.all_reduce(y, kind)
+            for Wc in self.weights(copies):
+                self.W = Wc
+                g_moe, g_ar = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g_moe):
+                    y = self.moe(x, tw, ti)
+                with torch.cuda.graph(g_ar):
+                    outs.append(self.all_reduce(y, kind))
+                graphs.append((g_moe, g_ar))
+        self.W = W
         torch.cuda.synchronize()
-        return g_moe, g_ar, z
+        return graphs, outs[0]
 
 
 # =============================================================================
@@ -140,14 +156,15 @@ def _reference(layer, x, tw, ti):
     return ref
 
 
-def _forward(layer, x, tw, ti, graph, kind):
-    """One layer forward -> (output, the graphs when ``graph``: captured, then replayed)."""
+def _forward(layer, x, tw, ti, graph, kind, copies=1):
+    """One layer forward -> (output, the graphs when ``graph``: captured, a pair per weight
+    copy, then the first pair replayed)."""
     if not graph:
         return layer.all_reduce(layer.moe(x, tw, ti), kind), None
-    g_moe, g_ar, z = layer.capture(x, tw, ti, kind)
-    g_moe.replay()
-    g_ar.replay()
-    return z, (g_moe, g_ar)
+    graphs, z = layer.capture(x, tw, ti, kind, copies)
+    for g in graphs[0]:
+        g.replay()
+    return z, graphs
 
 
 def _check(ref, z, tokens, graph, kind):
@@ -236,18 +253,30 @@ def _timed(stages, isolated, spin):
 
 
 def _bench(layer, x, tw, ti, graphs, kind, iters, warmup, spin):
-    stages = _stages(layer, x, tw, ti, graphs, kind)
+    """``graphs``: a (moe, all-reduce) pair per weight copy, or None (eager). Every timed
+    forward takes the next copy."""
+    if graphs:
+        nxt = itertools.cycle([_stages(layer, x, tw, ti, g, kind) for g in graphs]).__next__
+    else:
+        stages, W = _stages(layer, x, tw, ti, None, kind), layer.W
+        Ws = itertools.cycle(layer.weights())
+
+        def nxt():
+            layer.W = next(Ws)
+            return stages
     for _ in range(warmup):
-        for _, fn in stages:
+        for _, fn in nxt():
             fn()
     torch.cuda.synchronize()
     iso, e2e, late = [], [], 0
     for _ in range(iters):  # isolated and back-to-back runs interleaved: drift hits both
-        t, _, h1 = _timed(stages, True, spin)
-        _, t2, h2 = _timed(stages, False, spin)
+        t, _, h1 = _timed(nxt(), True, spin)
+        _, t2, h2 = _timed(nxt(), False, spin)
         iso.append(t)
         e2e.append(t2)
         late += (h1 > SPIN_US) + (h2 > SPIN_US)  # the GPU may have waited for the host
+    if not graphs:
+        layer.W = W
     cfg = config_name(lookup_config(SHAPE, x.shape[0], act=layer.act, capturing=bool(graphs)))
     return dict(cfg=cfg, ar=layer.ar_path(x, kind), iso=iso, e2e=e2e, late=late)
 
@@ -319,13 +348,15 @@ def _worker(rank, port, tokens, graphs, iters, warmup, model, acts, allreduces):
             timed = None
             for graph in graphs:
                 for kind in allreduces:
-                    z, captured = _forward(layer, x, tw, ti, graph, kind)
+                    timing = iters and (graph, kind) == (graphs[0], allreduces[0])
+                    z, captured = _forward(layer, x, tw, ti, graph, kind,
+                                           R.WCOPIES if timing else 1)
                     diff = _check(ref, z, t, graph, kind)
                     if rank == 0:
                         print(f"{t} tokens, {act}, {'graph' if graph else 'eager'}, all-reduce "
                               f"{layer.ar_path(x, kind)}: cos diff vs reference <= {diff:.1e}",
                               flush=True)
-                    if (graph, kind) == (graphs[0], allreduces[0]):
+                    if timing:
                         timed = captured
                     del captured
             del ref

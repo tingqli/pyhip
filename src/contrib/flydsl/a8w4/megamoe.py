@@ -94,8 +94,16 @@ class MegaMoeEpA8W4:
         self.xs = torch.empty((self.tcap, H // 128), dtype=torch.float32, device=dev)
         self.grid = min(torch.cuda.get_device_properties(dev).multi_processor_count,
                         K.max_tasks(self.nblk, H, I, producers))
-        self.launch = K.compile_ep_mega(H=H, I=I, TOPK=topk, token_shift=self.token_shift,
-                                        producers=producers, lag=lag, ACT=act)
+        # W loads: non-temporal while an expert's rows fit one block (no reuse); from
+        # ``big_tokens`` tokens on this rank (uniform routing: rows per expert >= BLOCK_M)
+        # the blocks of an expert re-read its W1: cached gemm1 W, gemm2 W bcm 1
+        # (-1.6 .. -3.6% at 4096 - 32768 tokens in total, +1.0 .. +1.5% at 2048 - 3072;
+        # every call on its own weight copy, experiments/log_20261115.md)
+        kw = dict(H=H, I=I, TOPK=topk, token_shift=self.token_shift, producers=producers,
+                  lag=lag, ACT=act)
+        self.launch = K.compile_ep_mega(**kw)
+        self.launch_big = K.compile_ep_mega(**kw, BCM1=0, BCM2=1)
+        self.big_tokens = K.BLOCK_M * K.E_LOCAL // topk
         self.quant_k, self.prep_k = C.compile_quant(H), C.compile_prep()
         self.plan_k, self.finish_k = C.compile_plan(), C.compile_finish()
         self.epoch = 0
@@ -146,7 +154,8 @@ class MegaMoeEpA8W4:
         mark("plan")
         W = self.W
         _run_compiled(
-            self.launch, x8.data_ptr(), xs.data_ptr(), topk_weights.data_ptr(),
+            self.launch_big if T >= self.big_tokens else self.launch,
+            x8.data_ptr(), xs.data_ptr(), topk_weights.data_ptr(),
             self.send_route.data_ptr(), self.send_info.data_ptr(), tab["recv_a"].data_ptr(),
             tab["recv_scale"].data_ptr(), tab["down_ids"].data_ptr(), tab["recv_w"].data_ptr(),
             tab["ws"].data_ptr(), tab["out"].data_ptr(), self.recv_a.data_ptr(),

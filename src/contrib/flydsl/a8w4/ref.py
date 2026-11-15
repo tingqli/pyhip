@@ -154,14 +154,26 @@ def cos_diff(x, y):
 # =============================================================================
 
 _FLUSH = {}
+WCOPIES = 8  # weight copies timed calls cycle through (8 x the EP8 / TP8 weights: 3+ GB)
 
 
 def flush_cache():
-    """Read 512 MB: evicts L2 and the 256 MB MALL with clean lines (a read-modify-
-    write flush leaves dirty lines whose write-back then steals HBM bandwidth)."""
+    """Read 512 MB: evicts L2 with clean lines (a read-modify-write flush leaves dirty
+    lines whose write-back then steals HBM bandwidth). It does not evict the lines that
+    every timed call re-reads from the 256 MB MALL (a 2 GB read does not either): the
+    same weights read with cached loads stay there, so time with ``weight_copies``."""
     if "buf" not in _FLUSH:
         _FLUSH["buf"] = torch.ones(128 << 20, dtype=torch.int32, device="cuda")
     _FLUSH["buf"].amax()
+
+
+def weight_copies(W, n=WCOPIES):
+    """``n`` copies of prepared weights (``W`` first). A timed closure that takes the
+    next copy per call reads weights that no recent call touched, as consecutive layers
+    of a model do (experiments/log_20261115.md: with one copy, cached W loads looked
+    5-13% faster than they are)."""
+    return [W] + [{k: v.clone() if torch.is_tensor(v) else v for k, v in W.items()}
+                  for _ in range(n - 1)]
 
 
 def time_cold(fn, iters=20, warmup=3, flush=True):

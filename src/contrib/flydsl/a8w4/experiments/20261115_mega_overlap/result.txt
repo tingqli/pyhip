@@ -1,0 +1,41 @@
+[Gloo] Rank 6 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 0 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 1 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 2 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 4 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 5 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 7 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+producers 16 lag 2, 30 iterations, cos(p2p) <= 8.1e-06
+T  2048 p2p    e2e   389.3 us (  +0.0)  quant 6.6  prep 18.3  plan 8.1  mega 342.8  finish 21.9
+T  2048 ldisp  e2e   379.5 us (  -9.8)  quant 6.6  prep 18.4  plan 8.0  mega 332.3  finish 24.4
+T  2048 lcomb  e2e   382.8 us (  -6.5)  quant 6.6  prep 18.2  plan 8.0  mega 335.4  finish 20.9
+T  2048 local  e2e   371.8 us ( -17.6)  quant 6.5  prep 18.1  plan 7.9  mega 325.7  finish 23.9
+T  4096 p2p    e2e   574.4 us (  +0.0)  quant 6.9  prep 18.0  plan 8.0  mega 527.5  finish 53.1
+T  4096 ldisp  e2e   558.9 us ( -15.5)  quant 6.9  prep 17.8  plan 8.1  mega 511.9  finish 60.6
+T  4096 lcomb  e2e   567.1 us (  -7.4)  quant 6.9  prep 18.0  plan 8.1  mega 520.2  finish 56.3
+T  4096 local  e2e   552.8 us ( -21.7)  quant 6.9  prep 18.0  plan 7.9  mega 506.0  finish 61.2
+T  8192 p2p    e2e   937.0 us (  +0.0)  quant 8.5  prep 17.6  plan 7.9  mega 889.0  finish 43.7
+T  8192 ldisp  e2e   907.5 us ( -29.5)  quant 8.5  prep 17.7  plan 8.1  mega 860.3  finish 44.1
+T  8192 lcomb  e2e   915.7 us ( -21.3)  quant 8.5  prep 17.7  plan 8.0  mega 868.2  finish 46.5
+T  8192 local  e2e   885.9 us ( -51.0)  quant 8.5  prep 17.8  plan 8.1  mega 838.6  finish 44.9
+T 32768 p2p    e2e  3030.3 us (  +0.0)  quant 24.4  prep 27.4  plan 8.5  mega 2940.8  finish 83.4
+T 32768 ldisp  e2e  2978.4 us ( -51.9)  quant 24.4  prep 27.1  plan 8.5  mega 2886.9  finish 84.1
+T 32768 lcomb  e2e  3045.0 us ( +14.7)  quant 24.5  prep 27.2  plan 8.5  mega 2883.0  finish 145.2
+T 32768 local  e2e  2913.8 us (-116.6)  quant 24.5  prep 27.8  plan 8.6  mega 2828.0  finish 97.3

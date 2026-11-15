@@ -1,0 +1,9 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[W1114 23:39:50.272796027 collection.cpp:1133] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+ep8 T= 1024 cfg='ep3k m64' e2e   189.7 us  kernels   188.2  cos 2.7e-05  ep_gemm1 110.8  ep_gemm2 66.5  ep_prep 10.9
+ep8 T= 2048 cfg='ep3k l128' e2e   282.6 us  kernels   280.8  cos 2.4e-05  ep_gemm1 161.5  ep_gemm2 104.6  ep_prep 14.8
+ep8 T= 4096 cfg='ep3k l128' e2e   462.6 us  kernels   460.6  cos 2.6e-05  ep_gemm1 265.4  ep_gemm2 172.2  ep_prep 23.0
+ep8 T= 8192 cfg='ep3k l128' e2e   733.1 us  kernels   738.4  cos 2.4e-05  ep_gemm1 433.9  ep_gemm2 273.5  ep_prep 31.0
+ep8 T=16384 cfg='ep3k l128' e2e  1350.7 us  kernels  1350.5  cos 2.3e-05  ep_gemm1 783.5  ep_gemm2 513.2  ep_prep 53.8
+ep8 T=32768 cfg='ep3k l128' e2e  2517.7 us  kernels  2500.5  cos 2.6e-05  ep_gemm1 1512.4  ep_gemm2 888.3  ep_prep 99.9

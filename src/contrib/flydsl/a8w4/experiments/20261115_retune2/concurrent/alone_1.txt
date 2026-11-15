@@ -1,0 +1,7 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[00:42:49] tok   2048 -> point   2048: ep3k l128                   289.9 us (table    296.6) | default ep3k m64                    284.4 us | x0.98 | cos 2.4e-05
+[00:42:49] tok   4096 -> point   4096: ep3k l128                   474.5 us (table    441.5) | default ep3k l128                   473.0 us | x1.00 | cos 2.6e-05
+[00:42:49] tok   8192 -> point   8192: ep3k l128c                  764.7 us (table    751.5) | default ep3k l128c                  743.0 us | x0.97 | cos 2.4e-05
+[00:42:49] tok  16384 -> point  16384: ep3k l128c                 1350.6 us (table   1371.2) | default ep3k l128c                 1342.9 us | x0.99 | cos 2.3e-05
+[00:42:50] tok  32768 -> point  32768: ep3k l128c                 2450.2 us (table   2500.1) | default ep3k l128c                 2478.1 us | x1.01 | cos 2.6e-05

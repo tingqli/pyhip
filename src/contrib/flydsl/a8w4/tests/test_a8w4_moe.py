@@ -47,7 +47,7 @@ SHAPES = {"tp8": (4096, 256, 256, 256, 8, 0), "ep8": (4096, 2048, 32, 256, 8, 96
 CONFIGS = {
     "tp8": ["tp2k bm32 g1bcm1 g2base", "tp2k bm64 g1bcm2 g2nt4", "tp1k bcm2 ks1", "tp1kq bcm1"],
     "ep8": ["tp2k bm32 g1bcm1 g2base", "tp1k bcm1 ks4", "tp1k bcm2 ks8", "ep3k t16", "ep3k s16",
-            "ep3k s32", "ep3k m64", "ep3k l128", "ep1k m512"],
+            "ep3k s32", "ep3k m64", "ep3k l128", "ep3k l128c", "ep1k m512"],
 }
 _W = {}
 

@@ -1,0 +1,99 @@
+# Parsed with: python counters.py --parse counters/<run>  (raw rocprofv3 CSVs, ~59 MB, not kept;
+# regenerate with the rocprofv3 command in counters.py's docstring). <run> = t<tokens>_<base>_g<pmc group>:
+# g1 = TCC_HIT/MISS/READ/STREAMING_REQ, g2 = TCC_EA0_RDREQ*. Kernel names carry the W cache modifier (bcm 2 = nt, 0 = cached).
+
+=== t16_t16_g1
+ep_gemm1_fp8_h4096_i2048_e32_bm16_ni128_r16_pf2_bcm0_nw8_a256_s3_zrc
+   TCC_HIT_sum 0.06M  TCC_MISS_sum 0.84M  TCC_READ_sum 0.90M  TCC_STREAMING_REQ_sum 0.03M
+   L2 hit rate 6.9%
+ep_gemm1_fp8_h4096_i2048_e32_bm16_ni128_r16_pf2_bcm2_nw8_a256_s3_zrc
+   TCC_HIT_sum 0.06M  TCC_MISS_sum 0.84M  TCC_READ_sum 0.90M  TCC_STREAMING_REQ_sum 0.82M
+   L2 hit rate 6.8%
+ep_gemm2_fp8_h4096_i2048_e32_bm16_no64_r16_pf2_bcm0_nw4_a256_s3_sst
+   TCC_HIT_sum 0.22M  TCC_MISS_sum 0.43M  TCC_READ_sum 0.64M  TCC_STREAMING_REQ_sum 0.20M
+   L2 hit rate 33.7%
+ep_gemm2_fp8_h4096_i2048_e32_bm16_no64_r16_pf2_bcm2_nw4_a256_s3_sst
+   TCC_HIT_sum 0.22M  TCC_MISS_sum 0.43M  TCC_READ_sum 0.64M  TCC_STREAMING_REQ_sum 0.59M
+   L2 hit rate 34.0%
+
+=== t16_t16_g2
+ep_gemm1_fp8_h4096_i2048_e32_bm16_ni128_r16_pf2_bcm0_nw8_a256_s3_zrc
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 0.84M  TCC_EA0_RDREQ_sum 0.84M
+ep_gemm1_fp8_h4096_i2048_e32_bm16_ni128_r16_pf2_bcm2_nw8_a256_s3_zrc
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 0.84M  TCC_EA0_RDREQ_sum 0.84M
+ep_gemm2_fp8_h4096_i2048_e32_bm16_no64_r16_pf2_bcm0_nw4_a256_s3_sst
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 0.43M  TCC_EA0_RDREQ_sum 0.43M
+ep_gemm2_fp8_h4096_i2048_e32_bm16_no64_r16_pf2_bcm2_nw4_a256_s3_sst
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 0.43M  TCC_EA0_RDREQ_sum 0.43M
+
+=== t256_s16_g1
+ep_gemm1_fp8_h4096_i2048_e32_bm16_ni128_r16_pf2_bcm0_nw8_a256_s3_zrc
+   TCC_HIT_sum 0.22M  TCC_MISS_sum 2.28M  TCC_READ_sum 2.47M  TCC_STREAMING_REQ_sum 0.19M
+   L2 hit rate 9.0%
+ep_gemm1_fp8_h4096_i2048_e32_bm16_ni128_r16_pf2_bcm2_nw8_a256_s3_zrc
+   TCC_HIT_sum 0.24M  TCC_MISS_sum 2.27M  TCC_READ_sum 2.47M  TCC_STREAMING_REQ_sum 2.29M
+   L2 hit rate 9.4%
+ep_gemm2_fp8_h4096_i2048_e32_bm16_no256_r16_pf1_bcm0_nw8_a256_s3_sst
+   TCC_HIT_sum 0.17M  TCC_MISS_sum 1.17M  TCC_READ_sum 1.31M  TCC_STREAMING_REQ_sum 0.16M
+   L2 hit rate 12.5%
+ep_gemm2_fp8_h4096_i2048_e32_bm16_no256_r16_pf1_bcm2_nw8_a256_s3_sst
+   TCC_HIT_sum 0.18M  TCC_MISS_sum 1.16M  TCC_READ_sum 1.31M  TCC_STREAMING_REQ_sum 1.21M
+   L2 hit rate 13.1%
+
+=== t256_s16_g2
+ep_gemm1_fp8_h4096_i2048_e32_bm16_ni128_r16_pf2_bcm0_nw8_a256_s3_zrc
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 2.27M  TCC_EA0_RDREQ_sum 2.27M
+ep_gemm1_fp8_h4096_i2048_e32_bm16_ni128_r16_pf2_bcm2_nw8_a256_s3_zrc
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 2.26M  TCC_EA0_RDREQ_sum 2.26M
+ep_gemm2_fp8_h4096_i2048_e32_bm16_no256_r16_pf1_bcm0_nw8_a256_s3_sst
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 1.14M  TCC_EA0_RDREQ_sum 1.14M
+ep_gemm2_fp8_h4096_i2048_e32_bm16_no256_r16_pf1_bcm2_nw8_a256_s3_sst
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 1.14M  TCC_EA0_RDREQ_sum 1.14M
+
+=== t1024_m64_g1
+ep_gemm1_fp8_h4096_i2048_e32_bm64_ni128_r32x64_pf2_bcm0_nw8_a128_s3_tr_o_zrc
+   TCC_HIT_sum 0.72M  TCC_MISS_sum 2.39M  TCC_READ_sum 2.88M  TCC_STREAMING_REQ_sum 0.54M
+   L2 hit rate 23.1%
+ep_gemm1_fp8_h4096_i2048_e32_bm64_ni128_r32x64_pf2_bcm2_nw8_a128_s3_tr_o_zrc
+   TCC_HIT_sum 0.74M  TCC_MISS_sum 2.36M  TCC_READ_sum 2.87M  TCC_STREAMING_REQ_sum 2.64M
+   L2 hit rate 24.0%
+ep_gemm2_fp8_h4096_i2048_e32_bm64_no256_r32x64_pf1_bcm0_nw8_a128_s3_o_sst
+   TCC_HIT_sum 0.44M  TCC_MISS_sum 1.29M  TCC_READ_sum 1.60M  TCC_STREAMING_REQ_sum 0.39M
+   L2 hit rate 25.4%
+ep_gemm2_fp8_h4096_i2048_e32_bm64_no256_r32x64_pf1_bcm2_nw8_a128_s3_o_sst
+   TCC_HIT_sum 0.45M  TCC_MISS_sum 1.27M  TCC_READ_sum 1.60M  TCC_STREAMING_REQ_sum 1.44M
+   L2 hit rate 26.2%
+
+=== t1024_m64_g2
+ep_gemm1_fp8_h4096_i2048_e32_bm64_ni128_r32x64_pf2_bcm0_nw8_a128_s3_tr_o_zrc
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 2.33M  TCC_EA0_RDREQ_sum 2.33M
+ep_gemm1_fp8_h4096_i2048_e32_bm64_ni128_r32x64_pf2_bcm2_nw8_a128_s3_tr_o_zrc
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 2.30M  TCC_EA0_RDREQ_sum 2.30M
+ep_gemm2_fp8_h4096_i2048_e32_bm64_no256_r32x64_pf1_bcm0_nw8_a128_s3_o_sst
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 1.19M  TCC_EA0_RDREQ_sum 1.19M
+ep_gemm2_fp8_h4096_i2048_e32_bm64_no256_r32x64_pf1_bcm2_nw8_a128_s3_o_sst
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 1.18M  TCC_EA0_RDREQ_sum 1.18M
+
+=== t16384_l128_g1
+ep_gemm1_fp8_h4096_i2048_e32_bm128_ni128_r32x64x128_pf2_bcm0_nw8_a128_s3_tr_o_zrc
+   TCC_HIT_sum 14.60M  TCC_MISS_sum 8.54M  TCC_READ_sum 19.44M  TCC_STREAMING_REQ_sum 8.50M
+   L2 hit rate 63.1%
+ep_gemm1_fp8_h4096_i2048_e32_bm128_ni128_r32x64x128_pf2_bcm2_nw8_a128_s3_tr_o_zrc
+   TCC_HIT_sum 14.39M  TCC_MISS_sum 8.74M  TCC_READ_sum 19.44M  TCC_STREAMING_REQ_sum 18.20M
+   L2 hit rate 62.2%
+ep_gemm2_fp8_h4096_i2048_e32_bm128_no256_r32x64x128_pf2_bcm0_nw8_a128_s3_o_sst
+   TCC_HIT_sum 6.59M  TCC_MISS_sum 5.48M  TCC_READ_sum 9.96M  TCC_STREAMING_REQ_sum 4.40M
+   L2 hit rate 54.6%
+ep_gemm2_fp8_h4096_i2048_e32_bm128_no256_r32x64x128_pf2_bcm2_nw8_a128_s3_o_sst
+   TCC_HIT_sum 6.59M  TCC_MISS_sum 5.48M  TCC_READ_sum 9.96M  TCC_STREAMING_REQ_sum 9.25M
+   L2 hit rate 54.6%
+
+=== t16384_l128_g2
+ep_gemm1_fp8_h4096_i2048_e32_bm128_ni128_r32x64x128_pf2_bcm0_nw8_a128_s3_tr_o_zrc
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 7.66M  TCC_EA0_RDREQ_sum 7.66M
+ep_gemm1_fp8_h4096_i2048_e32_bm128_ni128_r32x64x128_pf2_bcm2_nw8_a128_s3_tr_o_zrc
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 7.82M  TCC_EA0_RDREQ_sum 7.82M
+ep_gemm2_fp8_h4096_i2048_e32_bm128_no256_r32x64x128_pf2_bcm0_nw8_a128_s3_o_sst
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 3.79M  TCC_EA0_RDREQ_sum 3.79M
+ep_gemm2_fp8_h4096_i2048_e32_bm128_no256_r32x64x128_pf2_bcm2_nw8_a128_s3_o_sst
+   TCC_EA0_RDREQ_32B_sum 0.00M  TCC_EA0_RDREQ_DRAM_sum 3.79M  TCC_EA0_RDREQ_sum 3.79M

@@ -1,0 +1,12 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[00:21:38] shape H4096 I512 E256/256 top8 e0 0 act silu: 8 candidates, 8 weight copies
+[00:21:42] tok      1: tp2k bm32 g1bcm2 g2base 35.9 | tp2k bm32 g1bcm1 g2base 36.0 | tp2k bm64 g1bcm1 g2base 36.6
+[00:21:43] tok      6: tp2k bm32 g1bcm2 g2base 60.1 | tp2k bm64 g1bcm2 g2base 62.3 | tp2k bm32 g1bcm1 g2base 64.3
+[00:21:44] tok     24: tp2k bm32 g1bcm2 g2base 143.6 | tp2k bm64 g1bcm2 g2base 150.7 | tp2k bm32 g1bcm1 g2base 152.8
+[00:21:45] tok     96: tp2k bm32 g1bcm2 g2base 247.5 | tp2k bm32 g1bcm1 g2base 257.6 | tp1k bcm2 ks2 259.6
+[00:21:46] tok    320: tp2k bm32 g1bcm2 g2base 266.2 | tp2k bm32 g1bcm1 g2base 276.7 | tp2k bm64 g1bcm2 g2base 280.7
+[00:21:48] tok    640: tp2k bm32 g1bcm2 g2base 300.3 | tp1k bcm2 ks2 304.9 | tp2k bm32 g1bcm1 g2base 310.4
+[00:21:49] tok   1536: tp1k bcm2 ks2 423.2 | tp1k bcm2 ks1 423.6 | tp1k bcm1 ks2 436.3
+[00:21:51] tok   4096: tp1k bcm1 ks2 909.2 | tp1k bcm2 ks2 936.0 | tp2k bm64 g1bcm1 g2base 985.6
+[00:21:54] tok  16384: tp1k bcm1 ks2 2786.5 | tp1k bcm2 ks2 2886.1 | tp2k bm64 g1bcm1 g2base 3029.3

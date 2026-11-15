@@ -8,7 +8,7 @@
 
 - **key**：`(model_dim, inter_dim, experts, experts_global, topk, routing, act)`。其中 `experts` 是本卡的专家数，`experts_global` 是全局专家数。
 - **每个 token 点保存全部候选**，不只保存最快的那个：
-  - `us` 是各轮的中位数（冷 cache，不计 host 开销，见 `ref.time_cold`）；
+  - `us` 是各轮的中位数（冷 cache，每次调用换一份权重，不计 host 开销，见 `ref.time_cold`、`ref.weight_copies`）；
   - `cos` 是各轮与 fp32 参考之间最大的 cos 差；
   - cos ≥ 5e-3 或运行失败的候选不写入。
 - **查表**：
@@ -24,16 +24,19 @@
 | `mimo-v2.6-flash-tp8` | 4096/256/256/256/8 | silu | 35 | 385 |
 | `mimo-v2.6-flash-tp8` | 4096/256/256/256/8 | situv2 | 35 | 385 |
 | `mimo-v2.6-flash-tp4` | 4096/512/256/256/8 | silu | 35 | 280 |
-| `mimo-v2.6-flash-ep8` | 4096/2048/32/256/8 | silu | 35 | 475 |
-| `mimo-v2.6-flash-ep8` | 4096/2048/32/256/8 | situv2 | 35 | 475 |
+| `mimo-v2.6-flash-ep8` | 4096/2048/32/256/8 | silu | 35 | 510 |
+| `mimo-v2.6-flash-ep8` | 4096/2048/32/256/8 | situv2 | 35 | 510 |
 
-- 共 2000 行，routing 都是 uniform。
+- 共 2070 行，routing 都是 uniform。
 - token 点为 1, 2, 3, 4, 6, 8, 12, … , 24576, 32768（`tune.TOKENS`）。
 - TP4 没有 situv2 行，所以 TP4 上的 situv2 调用用的是 silu 行。
 
-**silu 行**：初版（pyhip d31efa0）用同一个 tuner 生成。当时 CSV 还没有 act 列，加列时用 `merge` 做了迁移：内容不变，act 补成 silu。
+**来源**：20261115 用下面的命令整表重新生成（脚本、日志和各卡的 CSV 在 `experiments/20261115_retune2/`）。
+- 原因是计时方式改了：每次调用换一份权重（`tune --wcopies`，默认 `ref.WCOPIES` = 8 份）。刷 cache 挤不掉 MALL 里每次调用都读的权重，旧表在同一份权重上反复计时，W 走 cache 的配置显得快 5–13%（上级 README 10 节第 15 条）；旧表因此在 TP8 / TP4 的 6–128 tokens 选了 `g1bcm1`，新方式下比 `g1bcm2` 慢 5–7.7%。
+- EP8 的候选多了 `ep3k l128c`（W 走 cache 的 l128），≥6144 tokens 选中它。
+- 与旧表逐点的对比见 `experiments/20261115_retune2/compare_vs_head.txt`，总结见 `experiments/log_20261115.md`。
 
-**situv2 行**：用下面的命令（`--act situv2`）生成。
+**situv2 行**：
 - SiTUv2 参数取 `ref.SITU`（β 4、β_l 25、clamp 16）。
 - β 和 clamp 是 launch 参数，不影响耗时，所以这组行对任意 SiTUv2 参数都适用。
 - 与 silu 行的逐点对比见上级 README 6.3 节。
@@ -46,6 +49,7 @@
 
 - 每个 (act, case) 用 4 张卡，每张卡跑 1/4 的 token 点；
 - 8 张卡同时跑两个 (act, case)；
+- 每个进程先把权重复制 8 份（EP8 / TP8 约 3.3 GB），计时时轮流使用；
 - 机器要空闲（先用 `rocm-smi --showuse` 确认没有别的进程在跑）。
 
 ```bash
@@ -61,7 +65,7 @@ tune4() {
   done
 }
 
-# situv2 行（表里的 situv2 行就是这样生成的）
+# situv2 行
 tune4 situv2 mimo-v2.6-flash-tp8 0; tune4 situv2 mimo-v2.6-flash-ep8 4; wait
 # silu 行
 tune4 silu mimo-v2.6-flash-tp8 0; tune4 silu mimo-v2.6-flash-ep8 4; wait

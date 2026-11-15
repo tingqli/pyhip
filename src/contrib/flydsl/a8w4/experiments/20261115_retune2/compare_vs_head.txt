@@ -1,0 +1,175 @@
+ep8 silu       1  old ep3k t16                         34.8  new ep3k t16                         35.2  old-cfg-now     35.2  +0.0%
+ep8 silu       2  old ep3k t16                         34.8  new ep3k t16                         35.3  old-cfg-now     35.3  +0.0%
+ep8 silu       3  old ep3k t16                         35.0  new ep3k t16                         35.6  old-cfg-now     35.6  +0.0%
+ep8 silu       4  old ep3k t16                         36.5  new ep3k t16                         37.0  old-cfg-now     37.0  +0.0%
+ep8 silu       6  old ep3k t16                         38.0  new ep3k t16                         39.5  old-cfg-now     39.5  +0.0%
+ep8 silu       8  old ep3k t16                         43.5  new ep3k s16                         42.2  old-cfg-now     42.4  -0.5%  *
+ep8 silu      12  old ep3k t16                         50.0  new ep3k t16                         51.4  old-cfg-now     51.4  +0.0%
+ep8 silu      16  old ep3k t16                         56.2  new ep3k t16                         57.8  old-cfg-now     57.8  +0.0%
+ep8 silu      24  old ep3k s16                         74.8  new ep3k s16                         76.8  old-cfg-now     76.8  +0.0%
+ep8 silu      32  old ep3k t16                         97.5  new ep3k t16                         99.6  old-cfg-now     99.6  +0.0%
+ep8 silu      48  old ep3k s16                        106.4  new ep3k t16                        107.6  old-cfg-now    107.8  -0.2%  *
+ep8 silu      64  old ep3k t16                        115.8  new ep3k t16                        113.8  old-cfg-now    113.8  +0.0%
+ep8 silu      96  old ep3k s16                        120.4  new ep3k t16                        117.3  old-cfg-now    118.8  -1.3%  *
+ep8 silu     128  old ep3k t16                        128.5  new ep3k t16                        131.6  old-cfg-now    131.6  +0.0%
+ep8 silu     192  old ep3k s16                        136.9  new ep3k s16                        135.4  old-cfg-now    135.4  +0.0%
+ep8 silu     256  old ep3k t16                        137.4  new ep3k t16                        136.9  old-cfg-now    136.9  +0.0%
+ep8 silu     320  old ep3k t16                        137.9  new ep3k s16                        140.5  old-cfg-now    140.6  -0.1%  *
+ep8 silu     384  old ep3k s16                        143.9  new ep3k s16                        143.2  old-cfg-now    143.2  +0.0%
+ep8 silu     448  old ep3k s32                        151.7  new ep3k s32                        150.1  old-cfg-now    150.1  +0.0%
+ep8 silu     512  old ep3k s32                        149.4  new ep3k s32                        150.8  old-cfg-now    150.8  +0.0%
+ep8 silu     640  old ep3k s32                        155.2  new ep3k s32                        158.2  old-cfg-now    158.2  +0.0%
+ep8 silu     768  old ep3k s32                        158.7  new ep3k s32                        159.4  old-cfg-now    159.4  +0.0%
+ep8 silu    1024  old ep3k m64                        193.5  new ep3k m64                        194.4  old-cfg-now    194.4  +0.0%
+ep8 silu    1280  old ep3k m64                        214.5  new ep3k m64                        206.6  old-cfg-now    206.6  +0.0%
+ep8 silu    1536  old ep3k l128                       222.5  new ep3k m64                        218.7  old-cfg-now    223.5  -2.1%  *
+ep8 silu    2048  old ep3k l128                       284.8  new ep3k l128                       296.6  old-cfg-now    296.6  +0.0%
+ep8 silu    2560  old ep3k l128                       340.2  new ep3k l128                       335.9  old-cfg-now    335.9  +0.0%
+ep8 silu    3072  old ep3k l128                       347.8  new ep3k l128                       335.9  old-cfg-now    335.9  +0.0%
+ep8 silu    4096  old ep3k l128                       432.7  new ep3k l128                       441.5  old-cfg-now    441.5  +0.0%
+ep8 silu    6144  old ep3k l128                       620.7  new ep3k l128c                      625.3  old-cfg-now    630.5  -0.8%  *
+ep8 silu    8192  old ep3k l128                       760.5  new ep3k l128c                      751.5  old-cfg-now    772.7  -2.7%  *
+ep8 silu   12288  old ep3k l128                      1033.2  new ep3k l128c                     1002.7  old-cfg-now   1029.6  -2.6%  *
+ep8 silu   16384  old ep3k l128                      1414.8  new ep3k l128c                     1371.2  old-cfg-now   1398.0  -1.9%  *
+ep8 silu   24576  old ep3k l128                      2022.5  new ep3k l128c                     1966.1  old-cfg-now   2012.7  -2.3%  *
+ep8 silu   32768  old ep3k l128                      2582.6  new ep3k l128c                     2500.1  old-cfg-now   2595.9  -3.7%  *
+ep8 situv2     1  old ep3k t16                         35.3  new ep3k t16                         35.9  old-cfg-now     35.9  +0.0%
+ep8 situv2     2  old ep3k t16                         35.6  new ep3k t16                         36.0  old-cfg-now     36.0  +0.0%
+ep8 situv2     3  old ep3k t16                         35.8  new ep3k t16                         35.9  old-cfg-now     35.9  +0.0%
+ep8 situv2     4  old ep3k t16                         36.2  new ep3k t16                         37.5  old-cfg-now     37.5  +0.0%
+ep8 situv2     6  old ep3k t16                         38.5  new ep3k t16                         39.9  old-cfg-now     39.9  +0.0%
+ep8 situv2     8  old ep3k t16                         41.4  new ep3k t16                         42.7  old-cfg-now     42.7  +0.0%
+ep8 situv2    12  old ep3k t16                         50.2  new ep3k t16                         52.1  old-cfg-now     52.1  +0.0%
+ep8 situv2    16  old ep3k t16                         56.9  new ep3k t16                         58.0  old-cfg-now     58.0  +0.0%
+ep8 situv2    24  old ep3k s16                         75.6  new ep3k s16                         77.3  old-cfg-now     77.3  +0.0%
+ep8 situv2    32  old ep3k t16                         98.7  new ep3k t16                        100.6  old-cfg-now    100.6  +0.0%
+ep8 situv2    48  old ep3k s16                        107.4  new ep3k t16                        107.8  old-cfg-now    108.6  -0.7%  *
+ep8 situv2    64  old ep3k t16                        114.3  new ep3k t16                        114.8  old-cfg-now    114.8  +0.0%
+ep8 situv2    96  old ep3k t16                        118.1  new ep3k t16                        118.6  old-cfg-now    118.6  +0.0%
+ep8 situv2   128  old ep3k t16                        131.3  new ep3k s16                        132.3  old-cfg-now    132.9  -0.5%  *
+ep8 situv2   192  old ep3k t16                        136.6  new ep3k s16                        137.0  old-cfg-now    137.2  -0.1%  *
+ep8 situv2   256  old ep3k t16                        137.5  new ep3k s16                        137.5  old-cfg-now    137.6  -0.1%  *
+ep8 situv2   320  old ep3k s16                        140.5  new ep3k s16                        140.7  old-cfg-now    140.7  +0.0%
+ep8 situv2   384  old ep3k s16                        142.8  new ep3k s16                        144.9  old-cfg-now    144.9  +0.0%
+ep8 situv2   448  old ep3k s32                        151.1  new ep3k s32                        151.4  old-cfg-now    151.4  +0.0%
+ep8 situv2   512  old ep3k s32                        152.9  new ep3k s32                        152.4  old-cfg-now    152.4  +0.0%
+ep8 situv2   640  old ep3k s32                        158.5  new ep3k s32                        159.2  old-cfg-now    159.2  +0.0%
+ep8 situv2   768  old ep3k s32                        160.4  new ep3k s32                        161.7  old-cfg-now    161.7  +0.0%
+ep8 situv2  1024  old ep3k m64                        199.1  new ep3k m64                        198.3  old-cfg-now    198.3  +0.0%
+ep8 situv2  1280  old ep3k m64                        212.4  new ep3k m64                        209.2  old-cfg-now    209.2  +0.0%
+ep8 situv2  1536  old ep3k m64                        225.6  new ep3k m64                        221.1  old-cfg-now    221.1  +0.0%
+ep8 situv2  2048  old ep3k l128                       302.3  new ep3k m64                        304.3  old-cfg-now    306.8  -0.8%  *
+ep8 situv2  2560  old ep3k l128                       341.7  new ep3k l128                       348.8  old-cfg-now    348.8  +0.0%
+ep8 situv2  3072  old ep3k l128                       341.5  new ep3k l128                       345.0  old-cfg-now    345.0  +0.0%
+ep8 situv2  4096  old ep3k l128                       437.1  new ep3k l128                       450.2  old-cfg-now    450.2  +0.0%
+ep8 situv2  6144  old ep3k l128                       630.9  new ep3k l128c                      639.4  old-cfg-now    649.9  -1.6%  *
+ep8 situv2  8192  old ep3k l128                       776.5  new ep3k l128c                      773.1  old-cfg-now    779.4  -0.8%  *
+ep8 situv2 12288  old ep3k l128                      1051.6  new ep3k l128c                     1035.4  old-cfg-now   1057.6  -2.1%  *
+ep8 situv2 16384  old ep3k l128                      1430.6  new ep3k l128c                     1403.7  old-cfg-now   1428.8  -1.8%  *
+ep8 situv2 24576  old ep3k l128                      2053.6  new ep3k l128c                     2013.8  old-cfg-now   2058.9  -2.2%  *
+ep8 situv2 32768  old ep3k l128                      2670.0  new ep3k l128c                     2579.9  old-cfg-now   2653.2  -2.8%  *
+tp4 silu       1  old tp2k bm32 g1bcm1 g2base          43.9  new tp2k bm32 g1bcm2 g2base          35.9  old-cfg-now     36.0  -0.3%  *
+tp4 silu       2  old tp2k bm32 g1bcm2 g2base          46.9  new tp2k bm64 g1bcm2 g2base          38.7  old-cfg-now     38.8  -0.3%  *
+tp4 silu       3  old tp2k bm32 g1bcm2 g2base          50.4  new tp2k bm32 g1bcm2 g2base          41.9  old-cfg-now     41.9  +0.0%
+tp4 silu       4  old tp2k bm32 g1bcm2 g2base          53.9  new tp2k bm32 g1bcm2 g2base          48.2  old-cfg-now     48.2  +0.0%
+tp4 silu       6  old tp2k bm32 g1bcm1 g2base          64.1  new tp2k bm32 g1bcm2 g2base          60.1  old-cfg-now     64.3  -6.5%  *
+tp4 silu       8  old tp2k bm32 g1bcm1 g2base          73.8  new tp2k bm32 g1bcm2 g2base          67.6  old-cfg-now     72.4  -6.6%  *
+tp4 silu      12  old tp2k bm32 g1bcm1 g2base         101.7  new tp2k bm32 g1bcm2 g2base          97.8  old-cfg-now    104.6  -6.5%  *
+tp4 silu      16  old tp2k bm32 g1bcm1 g2base         114.5  new tp2k bm32 g1bcm2 g2base         109.3  old-cfg-now    115.1  -5.0%  *
+tp4 silu      24  old tp2k bm32 g1bcm2 g2base         157.0  new tp2k bm32 g1bcm2 g2base         143.6  old-cfg-now    143.6  +0.0%
+tp4 silu      32  old tp2k bm32 g1bcm2 g2base         176.5  new tp2k bm32 g1bcm2 g2base         171.4  old-cfg-now    171.4  +0.0%
+tp4 silu      48  old tp2k bm32 g1bcm2 g2base         203.2  new tp2k bm32 g1bcm2 g2base         203.0  old-cfg-now    203.0  +0.0%
+tp4 silu      64  old tp2k bm32 g1bcm2 g2base         222.3  new tp2k bm32 g1bcm2 g2base         227.2  old-cfg-now    227.2  +0.0%
+tp4 silu      96  old tp2k bm32 g1bcm2 g2base         252.0  new tp2k bm32 g1bcm2 g2base         247.5  old-cfg-now    247.5  +0.0%
+tp4 silu     128  old tp2k bm32 g1bcm2 g2base         256.7  new tp2k bm32 g1bcm2 g2base         250.2  old-cfg-now    250.2  +0.0%
+tp4 silu     192  old tp2k bm32 g1bcm2 g2base         265.6  new tp2k bm32 g1bcm2 g2base         264.7  old-cfg-now    264.7  +0.0%
+tp4 silu     256  old tp2k bm32 g1bcm2 g2base         263.7  new tp2k bm32 g1bcm2 g2base         265.9  old-cfg-now    265.9  +0.0%
+tp4 silu     320  old tp2k bm32 g1bcm2 g2base         273.2  new tp2k bm32 g1bcm2 g2base         266.2  old-cfg-now    266.2  +0.0%
+tp4 silu     384  old tp2k bm32 g1bcm2 g2base         274.3  new tp2k bm32 g1bcm2 g2base         269.2  old-cfg-now    269.2  +0.0%
+tp4 silu     448  old tp2k bm32 g1bcm2 g2base         285.7  new tp2k bm32 g1bcm2 g2base         284.7  old-cfg-now    284.7  +0.0%
+tp4 silu     512  old tp2k bm32 g1bcm2 g2base         290.9  new tp2k bm32 g1bcm2 g2base         290.1  old-cfg-now    290.1  +0.0%
+tp4 silu     640  old tp2k bm32 g1bcm2 g2base         313.8  new tp2k bm32 g1bcm2 g2base         300.3  old-cfg-now    300.3  +0.0%
+tp4 silu     768  old tp2k bm32 g1bcm2 g2base         325.6  new tp2k bm32 g1bcm2 g2base         316.3  old-cfg-now    316.3  +0.0%
+tp4 silu    1024  old tp1k bcm2 ks2                   382.4  new tp1k bcm2 ks2                   381.5  old-cfg-now    381.5  +0.0%
+tp4 silu    1280  old tp1k bcm2 ks2                   405.7  new tp1k bcm2 ks2                   407.9  old-cfg-now    407.9  +0.0%
+tp4 silu    1536  old tp1k bcm2 ks1                   440.7  new tp1k bcm2 ks2                   423.2  old-cfg-now    423.6  -0.1%  *
+tp4 silu    2048  old tp1k bcm1 ks2                   614.5  new tp1k bcm1 ks2                   580.1  old-cfg-now    580.1  +0.0%
+tp4 silu    2560  old tp1k bcm1 ks2                   724.5  new tp1k bcm1 ks2                   702.4  old-cfg-now    702.4  +0.0%
+tp4 silu    3072  old tp1k bcm1 ks2                   767.5  new tp1k bcm1 ks2                   763.9  old-cfg-now    763.9  +0.0%
+tp4 silu    4096  old tp1k bcm1 ks2                   958.3  new tp1k bcm1 ks2                   909.2  old-cfg-now    909.2  +0.0%
+tp4 silu    6144  old tp1k bcm1 ks1                  1262.7  new tp1k bcm1 ks2                  1198.1  old-cfg-now   1224.7  -2.2%  *
+tp4 silu    8192  old tp1k bcm1 ks2                  1671.0  new tp1k bcm1 ks2                  1626.9  old-cfg-now   1626.9  +0.0%
+tp4 silu   12288  old tp1k bcm1 ks2                  2259.0  new tp1k bcm1 ks2                  2212.5  old-cfg-now   2212.5  +0.0%
+tp4 silu   16384  old tp1k bcm1 ks2                  2858.6  new tp1k bcm1 ks2                  2786.5  old-cfg-now   2786.5  +0.0%
+tp4 silu   24576  old tp1k bcm1 ks2                  4166.1  new tp1k bcm1 ks2                  3857.8  old-cfg-now   3857.8  +0.0%
+tp4 silu   32768  old tp1k bcm1 ks2                  5520.8  new tp1k bcm1 ks2                  5411.8  old-cfg-now   5411.8  +0.0%
+tp8 silu       1  old tp2k bm32 g1bcm2 g2base          43.6  new tp2k bm32 g1bcm2 g2base          34.2  old-cfg-now     34.2  +0.0%
+tp8 silu       2  old tp2k bm32 g1bcm2 g2base          43.9  new tp2k bm32 g1bcm2 g2base          35.4  old-cfg-now     35.4  +0.0%
+tp8 silu       3  old tp2k bm32 g1bcm2 g2nt4           45.4  new tp2k bm32 g1bcm2 g2nt4           37.0  old-cfg-now     37.0  +0.0%
+tp8 silu       4  old tp2k bm32 g1bcm2 g2nt4           47.8  new tp2k bm32 g1bcm2 g2base          39.5  old-cfg-now     39.5  +0.0%  *
+tp8 silu       6  old tp2k bm32 g1bcm2 g2base          50.7  new tp2k bm32 g1bcm2 g2base          41.6  old-cfg-now     41.6  +0.0%
+tp8 silu       8  old tp2k bm32 g1bcm2 g2nt4           52.5  new tp2k bm32 g1bcm2 g2base          43.5  old-cfg-now     43.8  -0.7%  *
+tp8 silu      12  old tp2k bm32 g1bcm1 g2nt4           63.3  new tp2k bm64 g1bcm2 g2nt4           56.5  old-cfg-now     60.1  -6.0%  *
+tp8 silu      16  old tp2k bm32 g1bcm1 g2base          70.6  new tp2k bm32 g1bcm2 g2nt4           63.9  old-cfg-now     68.4  -6.6%  *
+tp8 silu      24  old tp2k bm32 g1bcm1 g2nt4           90.7  new tp2k bm32 g1bcm2 g2nt4           80.4  old-cfg-now     87.0  -7.6%  *
+tp8 silu      32  old tp2k bm32 g1bcm1 g2nt4           99.0  new tp2k bm32 g1bcm2 g2nt4           99.0  old-cfg-now    107.3  -7.7%  *
+tp8 silu      48  old tp2k bm32 g1bcm1 g2nt4          109.9  new tp2k bm64 g1bcm2 g2nt4          112.2  old-cfg-now    119.1  -5.8%  *
+tp8 silu      64  old tp2k bm64 g1bcm1 g2nt4          118.5  new tp2k bm64 g1bcm2 g2nt4          124.9  old-cfg-now    132.8  -5.9%  *
+tp8 silu      96  old tp2k bm64 g1bcm1 g2nt4          137.9  new tp2k bm32 g1bcm2 g2nt4          131.9  old-cfg-now    138.8  -5.0%  *
+tp8 silu     128  old tp2k bm32 g1bcm2 g2nt4          143.1  new tp2k bm64 g1bcm2 g2nt4          133.4  old-cfg-now    133.6  -0.1%  *
+tp8 silu     192  old tp2k bm32 g1bcm2 g2nt4          144.9  new tp2k bm32 g1bcm2 g2nt4          143.2  old-cfg-now    143.2  +0.0%
+tp8 silu     256  old tp2k bm32 g1bcm2 g2nt4          151.3  new tp2k bm32 g1bcm2 g2nt4          144.3  old-cfg-now    144.3  +0.0%
+tp8 silu     320  old tp2k bm32 g1bcm2 g2nt4          152.6  new tp2k bm32 g1bcm2 g2nt4          146.0  old-cfg-now    146.0  +0.0%
+tp8 silu     384  old tp2k bm32 g1bcm2 g2nt4          153.7  new tp2k bm32 g1bcm2 g2nt4          147.1  old-cfg-now    147.1  +0.0%
+tp8 silu     448  old tp2k bm64 g1bcm2 g2nt4          163.0  new tp2k bm32 g1bcm2 g2nt4          156.7  old-cfg-now    157.2  -0.3%  *
+tp8 silu     512  old tp2k bm32 g1bcm2 g2nt4          165.1  new tp2k bm32 g1bcm2 g2nt4          160.6  old-cfg-now    160.6  +0.0%
+tp8 silu     640  old tp2k bm32 g1bcm2 g2nt4          171.9  new tp2k bm64 g1bcm2 g2nt4          165.4  old-cfg-now    166.3  -0.5%  *
+tp8 silu     768  old tp2k bm32 g1bcm2 g2nt4          186.8  new tp2k bm32 g1bcm2 g2nt4          170.9  old-cfg-now    170.9  +0.0%
+tp8 silu    1024  old tp2k bm64 g1bcm2 g2nt4          215.7  new tp1k bcm2 ks1                   211.2  old-cfg-now    212.0  -0.4%  *
+tp8 silu    1280  old tp2k bm64 g1bcm2 g2nt4          232.2  new tp1k bcm2 ks1                   230.9  old-cfg-now    232.2  -0.6%  *
+tp8 silu    1536  old tp1k bcm2 ks1                   251.1  new tp1k bcm2 ks1                   236.9  old-cfg-now    236.9  +0.0%
+tp8 silu    2048  old tp1k bcm1 ks1                   343.9  new tp1k bcm1 ks1                   324.7  old-cfg-now    324.7  +0.0%
+tp8 silu    2560  old tp1k bcm1 ks1                   388.8  new tp1k bcm1 ks1                   395.1  old-cfg-now    395.1  +0.0%
+tp8 silu    3072  old tp1k bcm1 ks1                   429.6  new tp1k bcm1 ks1                   408.1  old-cfg-now    408.1  +0.0%
+tp8 silu    4096  old tp1kq bcm1                      516.9  new tp1kq bcm1                      508.0  old-cfg-now    508.0  +0.0%
+tp8 silu    6144  old tp1k bcm1 ks1                   685.3  new tp1k bcm1 ks1                   659.0  old-cfg-now    659.0  +0.0%
+tp8 silu    8192  old tp1k bcm1 ks1                   906.5  new tp1k bcm1 ks1                   876.9  old-cfg-now    876.9  +0.0%
+tp8 silu   12288  old tp1k bcm1 ks1                  1226.5  new tp1k bcm1 ks1                  1235.4  old-cfg-now   1235.4  +0.0%
+tp8 silu   16384  old tp1k bcm1 ks1                  1627.3  new tp1k bcm1 ks1                  1597.2  old-cfg-now   1597.2  +0.0%
+tp8 silu   24576  old tp1k bcm1 ks1                  2402.3  new tp1k bcm1 ks1                  2230.8  old-cfg-now   2230.8  +0.0%
+tp8 silu   32768  old tp1k bcm1 ks1                  3025.8  new tp1k bcm1 ks1                  2935.4  old-cfg-now   2935.4  +0.0%
+tp8 situv2     1  old tp2k bm32 g1bcm2 g2base          44.9  new tp2k bm32 g1bcm2 g2base          35.7  old-cfg-now     35.7  +0.0%
+tp8 situv2     2  old tp2k bm32 g1bcm2 g2base          45.2  new tp2k bm32 g1bcm2 g2base          36.8  old-cfg-now     36.8  +0.0%
+tp8 situv2     3  old tp2k bm32 g1bcm2 g2nt4           46.8  new tp2k bm32 g1bcm2 g2nt4           38.1  old-cfg-now     38.1  +0.0%
+tp8 situv2     4  old tp2k bm32 g1bcm2 g2nt4           49.0  new tp2k bm32 g1bcm2 g2nt4           40.8  old-cfg-now     40.8  +0.0%
+tp8 situv2     6  old tp2k bm32 g1bcm2 g2base          52.2  new tp2k bm32 g1bcm2 g2base          42.9  old-cfg-now     42.9  +0.0%
+tp8 situv2     8  old tp2k bm32 g1bcm2 g2nt4           53.5  new tp2k bm32 g1bcm2 g2nt4           45.0  old-cfg-now     45.0  +0.0%
+tp8 situv2    12  old tp2k bm32 g1bcm1 g2nt4           64.7  new tp2k bm32 g1bcm2 g2nt4           58.3  old-cfg-now     62.3  -6.4%  *
+tp8 situv2    16  old tp2k bm32 g1bcm1 g2nt4           71.6  new tp2k bm32 g1bcm2 g2nt4           64.7  old-cfg-now     68.3  -5.3%  *
+tp8 situv2    24  old tp2k bm32 g1bcm1 g2nt4           94.7  new tp2k bm32 g1bcm2 g2nt4           81.3  old-cfg-now     88.0  -7.6%  *
+tp8 situv2    32  old tp2k bm32 g1bcm1 g2nt4          100.3  new tp2k bm64 g1bcm2 g2nt4          100.6  old-cfg-now    108.4  -7.2%  *
+tp8 situv2    48  old tp2k bm64 g1bcm1 g2nt4          114.2  new tp2k bm64 g1bcm2 g2nt4          114.5  old-cfg-now    121.2  -5.5%  *
+tp8 situv2    64  old tp2k bm32 g1bcm1 g2nt4          125.1  new tp2k bm64 g1bcm2 g2nt4          126.9  old-cfg-now    134.7  -5.8%  *
+tp8 situv2    96  old tp2k bm64 g1bcm1 g2nt4          138.0  new tp2k bm32 g1bcm2 g2nt4          133.7  old-cfg-now    140.6  -4.9%  *
+tp8 situv2   128  old tp2k bm32 g1bcm1 g2nt4          141.8  new tp2k bm32 g1bcm2 g2nt4          136.6  old-cfg-now    143.3  -4.7%  *
+tp8 situv2   192  old tp2k bm32 g1bcm2 g2nt4          151.3  new tp2k bm32 g1bcm2 g2nt4          145.5  old-cfg-now    145.5  +0.0%
+tp8 situv2   256  old tp2k bm32 g1bcm2 g2nt4          153.7  new tp2k bm32 g1bcm2 g2nt4          146.9  old-cfg-now    146.9  +0.0%
+tp8 situv2   320  old tp2k bm64 g1bcm2 g2nt4          154.6  new tp2k bm64 g1bcm2 g2nt4          147.7  old-cfg-now    147.7  +0.0%
+tp8 situv2   384  old tp2k bm32 g1bcm2 g2nt4          155.8  new tp2k bm64 g1bcm2 g2nt4          150.2  old-cfg-now    150.5  -0.2%  *
+tp8 situv2   448  old tp2k bm32 g1bcm2 g2nt4          166.0  new tp2k bm64 g1bcm2 g2nt4          159.3  old-cfg-now    159.7  -0.3%  *
+tp8 situv2   512  old tp2k bm32 g1bcm2 g2nt4          170.9  new tp2k bm32 g1bcm2 g2nt4          162.6  old-cfg-now    162.6  +0.0%
+tp8 situv2   640  old tp2k bm64 g1bcm2 g2nt4          175.2  new tp2k bm64 g1bcm2 g2nt4          166.8  old-cfg-now    166.8  +0.0%
+tp8 situv2   768  old tp2k bm32 g1bcm2 g2nt4          182.2  new tp2k bm32 g1bcm2 g2nt4          173.5  old-cfg-now    173.5  +0.0%
+tp8 situv2  1024  old tp2k bm64 g1bcm2 g2nt4          225.8  new tp2k bm64 g1bcm2 g2nt4          216.3  old-cfg-now    216.3  +0.0%
+tp8 situv2  1280  old tp2k bm64 g1bcm2 g2nt4          245.0  new tp2k bm64 g1bcm2 g2nt4          234.7  old-cfg-now    234.7  +0.0%
+tp8 situv2  1536  old tp1k bcm2 ks1                   252.9  new tp1k bcm2 ks1                   242.2  old-cfg-now    242.2  +0.0%
+tp8 situv2  2048  old tp1k bcm1 ks1                   345.3  new tp1k bcm1 ks1                   330.9  old-cfg-now    330.9  +0.0%
+tp8 situv2  2560  old tp1k bcm1 ks1                   412.3  new tp1k bcm1 ks1                   393.8  old-cfg-now    393.8  +0.0%
+tp8 situv2  3072  old tp1k bcm1 ks1                   427.9  new tp1k bcm1 ks1                   405.4  old-cfg-now    405.4  +0.0%
+tp8 situv2  4096  old tp1kq bcm1                      528.0  new tp1kq bcm1                      509.3  old-cfg-now    509.3  +0.0%
+tp8 situv2  6144  old tp1k bcm1 ks1                   696.6  new tp1k bcm1 ks1                   678.9  old-cfg-now    678.9  +0.0%
+tp8 situv2  8192  old tp1k bcm1 ks1                   905.7  new tp1k bcm1 ks1                   882.3  old-cfg-now    882.3  +0.0%
+tp8 situv2 12288  old tp1k bcm1 ks1                  1275.9  new tp1k bcm1 ks1                  1261.3  old-cfg-now   1261.3  +0.0%
+tp8 situv2 16384  old tp1kq bcm1                     1672.0  new tp1kq bcm1                     1628.5  old-cfg-now   1628.5  +0.0%
+tp8 situv2 24576  old tp1k bcm1 ks1                  2331.0  new tp1k bcm1 ks1                  2282.3  old-cfg-now   2282.3  +0.0%
+tp8 situv2 32768  old tp1k bcm1 ks1                  3108.8  new tp1k bcm1 ks1                  3015.8  old-cfg-now   3015.8  +0.0%

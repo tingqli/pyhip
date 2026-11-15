@@ -1,0 +1,100 @@
+model_dim,inter_dim,experts,experts_global,topk,routing,act,num_tokens,config,us,cos
+4096,256,256,256,8,uniform,silu,1,tp2k bm32 g1bcm2 g2base,34.2,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp2k bm32 g1bcm1 g2base,34.4,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp2k bm64 g1bcm2 g2base,34.4,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp2k bm64 g1bcm1 g2base,34.6,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp2k bm32 g1bcm1 g2nt4,35.9,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp2k bm32 g1bcm2 g2nt4,35.9,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp2k bm64 g1bcm1 g2nt4,36.1,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp2k bm64 g1bcm2 g2nt4,36.3,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp1k bcm1 ks1,90.2,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp1k bcm2 ks1,93.9,1.5e-04
+4096,256,256,256,8,uniform,silu,1,tp1kq bcm1,103.3,1.5e-04
+4096,256,256,256,8,uniform,silu,6,tp2k bm32 g1bcm2 g2base,41.6,9.8e-05
+4096,256,256,256,8,uniform,silu,6,tp2k bm32 g1bcm2 g2nt4,42.5,9.9e-05
+4096,256,256,256,8,uniform,silu,6,tp2k bm64 g1bcm2 g2base,42.8,9.8e-05
+4096,256,256,256,8,uniform,silu,6,tp2k bm32 g1bcm1 g2base,43.1,9.8e-05
+4096,256,256,256,8,uniform,silu,6,tp2k bm64 g1bcm2 g2nt4,43.1,9.9e-05
+4096,256,256,256,8,uniform,silu,6,tp2k bm32 g1bcm1 g2nt4,43.5,9.7e-05
+4096,256,256,256,8,uniform,silu,6,tp2k bm64 g1bcm1 g2nt4,44.0,9.8e-05
+4096,256,256,256,8,uniform,silu,6,tp2k bm64 g1bcm1 g2base,44.3,9.8e-05
+4096,256,256,256,8,uniform,silu,6,tp1k bcm2 ks1,96.0,9.7e-05
+4096,256,256,256,8,uniform,silu,6,tp1k bcm1 ks1,98.8,9.7e-05
+4096,256,256,256,8,uniform,silu,6,tp1kq bcm1,111.9,9.8e-05
+4096,256,256,256,8,uniform,silu,24,tp2k bm32 g1bcm2 g2nt4,80.4,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp2k bm64 g1bcm2 g2nt4,81.6,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp2k bm32 g1bcm2 g2base,82.8,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp2k bm64 g1bcm2 g2base,85.6,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp2k bm32 g1bcm1 g2nt4,87.0,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp2k bm64 g1bcm1 g2nt4,88.2,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp2k bm32 g1bcm1 g2base,88.8,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp2k bm64 g1bcm1 g2base,92.4,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp1k bcm2 ks1,102.6,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp1k bcm1 ks1,108.5,1.1e-04
+4096,256,256,256,8,uniform,silu,24,tp1kq bcm1,120.9,1.1e-04
+4096,256,256,256,8,uniform,silu,96,tp2k bm32 g1bcm2 g2nt4,131.9,8.8e-05
+4096,256,256,256,8,uniform,silu,96,tp2k bm64 g1bcm2 g2nt4,133.6,8.7e-05
+4096,256,256,256,8,uniform,silu,96,tp2k bm32 g1bcm2 g2base,134.4,8.7e-05
+4096,256,256,256,8,uniform,silu,96,tp2k bm32 g1bcm1 g2nt4,137.8,8.8e-05
+4096,256,256,256,8,uniform,silu,96,tp2k bm64 g1bcm1 g2nt4,138.8,8.7e-05
+4096,256,256,256,8,uniform,silu,96,tp2k bm64 g1bcm2 g2base,139.7,8.7e-05
+4096,256,256,256,8,uniform,silu,96,tp2k bm32 g1bcm1 g2base,141.2,8.7e-05
+4096,256,256,256,8,uniform,silu,96,tp2k bm64 g1bcm1 g2base,145.2,8.7e-05
+4096,256,256,256,8,uniform,silu,96,tp1k bcm2 ks1,148.4,8.8e-05
+4096,256,256,256,8,uniform,silu,96,tp1k bcm1 ks1,156.5,8.8e-05
+4096,256,256,256,8,uniform,silu,96,tp1kq bcm1,182.1,8.8e-05
+4096,256,256,256,8,uniform,silu,320,tp2k bm32 g1bcm2 g2nt4,146.0,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp2k bm64 g1bcm2 g2nt4,146.1,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp2k bm32 g1bcm2 g2base,147.7,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp2k bm32 g1bcm1 g2nt4,152.1,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp2k bm64 g1bcm1 g2nt4,152.6,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp2k bm64 g1bcm2 g2base,152.8,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp2k bm32 g1bcm1 g2base,153.9,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp2k bm64 g1bcm1 g2base,158.9,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp1k bcm2 ks1,164.9,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp1k bcm1 ks1,171.5,9.6e-05
+4096,256,256,256,8,uniform,silu,320,tp1kq bcm1,197.2,9.6e-05
+4096,256,256,256,8,uniform,silu,640,tp2k bm64 g1bcm2 g2nt4,165.4,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp2k bm32 g1bcm2 g2nt4,166.3,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp2k bm32 g1bcm2 g2base,167.4,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp2k bm64 g1bcm1 g2nt4,169.8,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp2k bm32 g1bcm1 g2nt4,171.7,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp2k bm32 g1bcm1 g2base,172.4,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp2k bm64 g1bcm2 g2base,175.1,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp1k bcm2 ks1,175.4,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp2k bm64 g1bcm1 g2base,180.1,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp1k bcm1 ks1,184.0,9.3e-05
+4096,256,256,256,8,uniform,silu,640,tp1kq bcm1,209.9,9.3e-05
+4096,256,256,256,8,uniform,silu,1536,tp1k bcm2 ks1,236.9,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp1k bcm1 ks1,242.6,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp2k bm64 g1bcm2 g2nt4,246.1,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp2k bm64 g1bcm1 g2nt4,251.1,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp2k bm64 g1bcm2 g2base,257.0,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp2k bm64 g1bcm1 g2base,261.2,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp1kq bcm1,281.1,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp2k bm32 g1bcm1 g2nt4,287.0,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp2k bm32 g1bcm1 g2base,293.5,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp2k bm32 g1bcm2 g2nt4,295.5,9.0e-05
+4096,256,256,256,8,uniform,silu,1536,tp2k bm32 g1bcm2 g2base,302.1,9.0e-05
+4096,256,256,256,8,uniform,silu,4096,tp1kq bcm1,508.0,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp1k bcm1 ks1,529.8,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp2k bm64 g1bcm1 g2nt4,539.1,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp1k bcm2 ks1,547.5,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp2k bm64 g1bcm2 g2nt4,552.4,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp2k bm64 g1bcm1 g2base,556.7,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp2k bm32 g1bcm1 g2nt4,565.1,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp2k bm32 g1bcm1 g2base,584.6,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp2k bm64 g1bcm2 g2base,585.7,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp2k bm32 g1bcm2 g2nt4,590.7,9.1e-05
+4096,256,256,256,8,uniform,silu,4096,tp2k bm32 g1bcm2 g2base,604.3,9.1e-05
+4096,256,256,256,8,uniform,silu,16384,tp1k bcm1 ks1,1597.2,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp1kq bcm1,1633.5,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp1k bcm2 ks1,1646.2,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp2k bm64 g1bcm1 g2nt4,1723.6,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp2k bm64 g1bcm2 g2nt4,1809.3,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp2k bm64 g1bcm1 g2base,1865.5,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp2k bm32 g1bcm1 g2nt4,1922.5,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp2k bm64 g1bcm2 g2base,1942.8,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp2k bm32 g1bcm2 g2nt4,2006.7,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp2k bm32 g1bcm1 g2base,2022.0,9.0e-05
+4096,256,256,256,8,uniform,silu,16384,tp2k bm32 g1bcm2 g2base,2126.3,9.0e-05

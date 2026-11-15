@@ -1,0 +1,16 @@
+GPU[0]		: GPU use (%): 0
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 100
+GPU[3]		: GPU use (%): 100
+GPU[4]		: GPU use (%): 100
+GPU[5]		: GPU use (%): 100
+GPU[6]		: GPU use (%): 100
+GPU[7]		: GPU use (%): 100
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[00:43:17] tok   2048 -> point   2048: ep3k l128                   291.1 us (table    296.6) | default ep3k m64                    284.6 us | x0.98 | cos 2.4e-05
+[00:43:17] tok   4096 -> point   4096: ep3k l128                   472.1 us (table    441.5) | default ep3k l128                   489.1 us | x1.04 | cos 2.6e-05
+[00:43:17] tok   8192 -> point   8192: ep3k l128c                  752.4 us (table    751.5) | default ep3k l128c                  748.2 us | x0.99 | cos 2.4e-05
+[00:43:17] tok  16384 -> point  16384: ep3k l128c                 1356.7 us (table   1371.2) | default ep3k l128c                 1351.9 us | x1.00 | cos 2.3e-05
+[00:43:17] tok  32768 -> point  32768: ep3k l128c                 2470.5 us (table   2500.1) | default ep3k l128c                 2489.8 us | x1.01 | cos 2.6e-05
+loads still running at the end of verify: 7 / 7

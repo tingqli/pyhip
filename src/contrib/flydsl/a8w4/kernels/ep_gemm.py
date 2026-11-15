@@ -1574,6 +1574,10 @@ def ep_gemm2(a, a_scale, W, sorted_ids, sorted_weights, sorted_expert_ids, num_v
 
 # (gemm1 kwargs, gemm2 kwargs) per name; block_m is shared by both stages. "arb" only
 # applies to a8w4 (a16w4 needs 256 A bytes = one 128-K W chunk per K tile).
+# W loads: nt ("bcm" 2, the default) except in l128c: cached W (bcm 0) only pays off where
+# the m-blocks of an expert re-read its W (>= ~1.5 blocks of rows per expert, 6k+ EP8
+# tokens: 1-4% faster); below, it is up to 5% (l128) and 10% (t16 - s32) slower, timed
+# on rotated weight copies. experiments/log_20261115.md
 CFGS = {
     # <= 8 tokens: 1 - 8 active experts; narrower n-tiles put more CUs on the W
     # stream ("bf16": a16w4 overrides; a8w4 gemm1 keeps 128-col quant groups)
@@ -1584,16 +1588,20 @@ CFGS = {
     "s16": dict(bm=16, sched=False, g1=dict(ni=128, nw=8, sch=3), g2=dict(no=256, nw=8, sch=3)),
     "s32": dict(bm=32, sched=False, g1=dict(ni=128, nw=8, sch=3), g2=dict(no=256, nw=8, sch=3)),
     "m64": dict(bm=64, rowv=(32, 64), g1=dict(ni=128, nw=8, arb=128, sch=3, tr=True),
-                g2=dict(no=256, nw=8, arb=128, sch=3)),
+                g2=dict(no=256, nw=8, arb=128, sch=3, pf=1)),
     "l128": dict(bm=128, rowv=(32, 64, 128), g1=dict(ni=128, nw=8, arb=128, sch=3, tr=True),
                  g2=dict(no=256, nw=8, arb=128, sch=3)),
+    "l128c": dict(bm=128, rowv=(32, 64, 128),
+                  g1=dict(ni=128, nw=8, arb=128, sch=3, tr=True, bcm=0),
+                  g2=dict(no=256, nw=8, arb=128, sch=3, bcm=0)),
     # pre-tuning baseline (sch1, no TR, plain order), kept for A/B
     "l128_v1": dict(bm=128, rowv=(32, 64, 128), sched=False, g1=dict(ni=128, nw=8),
                     g2=dict(no=256, nw=8, arb=128)),
 }
 
-# token-count thresholds of the auto config (EP8 MI300X, uniform routing A/B)
-AUTO = ((8, "t16"), (480, "s16"), (960, "s32"), (2176, "m64"), (None, "l128"))
+# token-count thresholds of the auto config (EP8 MI300X, uniform routing A/B; l128c from
+# the 20261115 table: l128 wins at 4096 tokens, l128c from 6144)
+AUTO = ((8, "t16"), (480, "s16"), (960, "s32"), (2176, "m64"), (5120, "l128"), (None, "l128c"))
 
 
 def pick_cfg(tokens):

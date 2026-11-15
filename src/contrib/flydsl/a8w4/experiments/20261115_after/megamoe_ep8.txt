@@ -1,0 +1,77 @@
+[Gloo] Rank 6 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 0 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 2 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 4 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 5 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 1 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 7 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+2048 tokens [256, 256, 256, 256, 256, 256, 256, 256] (silu, call 1): rows needed [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096] (cap 69632), cos diff vs reference <= 8.1e-06
+2048 tokens [256, 256, 256, 256, 256, 256, 256, 256] (situv2, call 1): rows needed [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096] (cap 69632), cos diff vs reference <= 8.2e-06
+4096 tokens [512, 512, 512, 512, 512, 512, 512, 512] (silu, call 1): rows needed [6144, 6144, 6016, 6272, 5120, 5632, 6656, 6784] (cap 69632), cos diff vs reference <= 8.1e-06
+4096 tokens [512, 512, 512, 512, 512, 512, 512, 512] (situv2, call 1): rows needed [6144, 6144, 6016, 6272, 5120, 5632, 6656, 6784] (cap 69632), cos diff vs reference <= 8.1e-06
+8192 tokens [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024] (silu, call 1): rows needed [9856, 10240, 10752, 10240, 10112, 9856, 10368, 10112] (cap 69632), cos diff vs reference <= 8.1e-06
+8192 tokens [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024] (situv2, call 1): rows needed [9856, 10240, 10752, 10240, 10112, 9856, 10368, 10112] (cap 69632), cos diff vs reference <= 8.1e-06
+16384 tokens [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048] (silu, call 1): rows needed [18560, 17920, 18432, 18432, 18560, 18304, 18304, 18688] (cap 69632), cos diff vs reference <= 8.2e-06
+16384 tokens [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048] (situv2, call 1): rows needed [18560, 17920, 18432, 18432, 18560, 18304, 18304, 18688] (cap 69632), cos diff vs reference <= 8.2e-06
+32768 tokens [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096] (silu, call 1): rows needed [34944, 34688, 35328, 35072, 34432, 34304, 34944, 35328] (cap 69632), cos diff vs reference <= 8.1e-06
+32768 tokens [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096] (situv2, call 1): rows needed [34944, 34688, 35328, 35072, 34432, 34304, 34944, 35328] (cap 69632), cos diff vs reference <= 8.1e-06
+2048 tokens [256, 256, 256, 256, 256, 256, 256, 256] (silu, call 2): rows needed [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096] (cap 69632), cos diff vs reference <= 8.1e-06
+2048 tokens [256, 256, 256, 256, 256, 256, 256, 256] (situv2, call 2): rows needed [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096] (cap 69632), cos diff vs reference <= 8.1e-06
+4096 tokens [512, 512, 512, 512, 512, 512, 512, 512] (silu, call 2): rows needed [6144, 6144, 6016, 6272, 5120, 5632, 6656, 6784] (cap 69632), cos diff vs reference <= 8.1e-06
+4096 tokens [512, 512, 512, 512, 512, 512, 512, 512] (situv2, call 2): rows needed [6144, 6144, 6016, 6272, 5120, 5632, 6656, 6784] (cap 69632), cos diff vs reference <= 8.1e-06
+8192 tokens [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024] (silu, call 2): rows needed [9856, 10240, 10752, 10240, 10112, 9856, 10368, 10112] (cap 69632), cos diff vs reference <= 8.1e-06
+8192 tokens [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024] (situv2, call 2): rows needed [9856, 10240, 10752, 10240, 10112, 9856, 10368, 10112] (cap 69632), cos diff vs reference <= 8.1e-06
+16384 tokens [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048] (silu, call 2): rows needed [18560, 17920, 18432, 18432, 18560, 18304, 18304, 18688] (cap 69632), cos diff vs reference <= 8.2e-06
+16384 tokens [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048] (situv2, call 2): rows needed [18560, 17920, 18432, 18432, 18560, 18304, 18304, 18688] (cap 69632), cos diff vs reference <= 8.1e-06
+32768 tokens [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096] (silu, call 2): rows needed [34944, 34688, 35328, 35072, 34432, 34304, 34944, 35328] (cap 69632), cos diff vs reference <= 8.1e-06
+32768 tokens [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096] (situv2, call 2): rows needed [34944, 34688, 35328, 35072, 34432, 34304, 34944, 35328] (cap 69632), cos diff vs reference <= 8.1e-06
+[aiter] import [module_quant] under /sgl-workspace/aiter/aiter/jit/module_quant.so
+[aiter] import [module_quant] under /sgl-workspace/aiter/aiter/jit/module_quant.so
+[aiter] import [module_quant] under /sgl-workspace/aiter/aiter/jit/module_quant.so
+[aiter] import [module_quant] under /sgl-workspace/aiter/aiter/jit/module_quant.so
+[aiter] import [module_quant] under /sgl-workspace/aiter/aiter/jit/module_quant.so
+[aiter] import [module_quant] under /sgl-workspace/aiter/aiter/jit/module_quant.so
+[aiter] import [module_quant] under /sgl-workspace/aiter/aiter/jit/module_quant.so
+[aiter] import [module_quant] under /sgl-workspace/aiter/aiter/jit/module_quant.so
+T 2048 silu: megamoe 390.0 us, MORI path 436.5 us
+T 2048 situv2: megamoe 400.2 us, MORI path 436.0 us
+T 4096 silu: megamoe 568.0 us, MORI path 727.1 us
+T 4096 situv2: megamoe 580.6 us, MORI path 728.6 us
+T 8192 silu: megamoe 923.8 us, MORI path 1098.6 us
+T 8192 situv2: megamoe 944.1 us, MORI path 1098.3 us
+T 16384 silu: megamoe 1635.8 us, MORI path 2001.4 us
+T 16384 situv2: megamoe 1683.6 us, MORI path 2014.2 us
+T 32768 silu: megamoe 2984.7 us, MORI path 3750.2 us
+T 32768 situv2: megamoe 3074.0 us, MORI path 3771.3 us
+
+EP8 MoE layer (H 4096, I 2048, 256 experts, 32 per rank, top-8), us, slowest rank, median of 20 iterations. MORI path: quant -> MORI dispatch -> a8w4_moe_dyn (received rows) -> MORI combine; megamoe stages: slowest rank's median each.
+
+| tokens | tokens/rank | act | MORI path | megamoe | speedup | quant | prep | plan | mega | finish | rows/rank max |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 256 | silu | 436.5 | 390.0 | 1.12x | 6.6 | 18.3 | 8.1 | 343.1 | 22.8 | 4096 |
+| 2048 | 256 | situv2 | 436.0 | 400.2 | 1.09x | 6.5 | 18.3 | 8.1 | 352.2 | 25.6 | 4096 |
+| 4096 | 512 | silu | 727.1 | 568.0 | 1.28x | 6.9 | 18.6 | 8.2 | 519.6 | 47.6 | 6784 |
+| 4096 | 512 | situv2 | 728.6 | 580.6 | 1.25x | 6.9 | 18.7 | 8.1 | 532.2 | 50.4 | 6784 |
+| 8192 | 1024 | silu | 1098.6 | 923.8 | 1.19x | 9.7 | 19.3 | 8.1 | 874.3 | 44.1 | 10752 |
+| 8192 | 1024 | situv2 | 1098.3 | 944.1 | 1.16x | 9.5 | 19.1 | 8.1 | 894.6 | 44.5 | 10752 |
+| 16384 | 2048 | silu | 2001.4 | 1635.8 | 1.22x | 15.6 | 22.7 | 8.2 | 1573.0 | 81.1 | 18688 |
+| 16384 | 2048 | situv2 | 2014.2 | 1683.6 | 1.20x | 15.7 | 22.6 | 8.3 | 1616.8 | 84.0 | 18688 |
+| 32768 | 4096 | silu | 3750.2 | 2984.7 | 1.26x | 26.6 | 26.9 | 8.8 | 2912.4 | 74.7 | 35328 |
+| 32768 | 4096 | situv2 | 3771.3 | 3074.0 | 1.23x | 26.7 | 27.9 | 8.9 | 2958.5 | 81.4 | 35328 |

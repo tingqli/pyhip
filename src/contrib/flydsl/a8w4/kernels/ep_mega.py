@@ -122,9 +122,10 @@ def _store(ptr, idx, value):
 
 @functools.cache
 def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64, 128),
-                    NI=128, NO=256, NW=8, PF=2, ACT="silu"):
+                    NI=128, NO=256, NW=8, PF=2, ACT="silu", BCM1=2, BCM2=2):
     """Launcher of the mega kernel for (H, I, top-k); ``token_shift``: bits of the source
-    token in a row's down id (max tokens per rank <= 1 << token_shift)."""
+    token in a row's down id (max tokens per rank <= 1 << token_shift). ``BCM1`` /
+    ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
     assert ACT in ("silu", "situv2"), ACT
     BM = BLOCK_M
     NT = 64 * NW
@@ -151,6 +152,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
     WPG = NW // GPW
     kname = (f"a8w4_megamoe_ep_h{H}_i{I}_k{TOPK}_t{token_shift}_p{producers}_l{lag}"
              f"_r{'x'.join(map(str, ROWV))}_ni{NI}_no{NO}_pf{PF}"
+             + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
              + ("" if ACT == "silu" else f"_{ACT}"))
 
     @fx.struct
@@ -370,7 +372,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                 for gu in range(2) for c in range(NC1) for v in range(4)
             }
             core = EP._make_core(
-                FP8=True, K=H, W_ROWS=E_LOCAL * N2, BM=BM, PF=PF, bcm=2, cols=cols,
+                FP8=True, K=H, W_ROWS=E_LOCAL * N2, BM=BM, PF=PF, bcm=BCM1, cols=cols,
                 lds_ptr=lds_ptr, LDS_BYTES=LDS_BYTES, lane=lane, tx=tx, NT=NT, arg_w=a["w1"],
                 arg_ws=a["w1s"], arg_a=a["ra"], a_num_bytes=fx.Int64(rows_cap) * fx.Int64(H),
                 ARB=ARB, acm=2, SCH=3, TR=True)
@@ -500,7 +502,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
             exps = [fx.Int32(_global_i32_at(a["w2e"], e * fx.Int32(H) + col0 + fx.Int32(c * 16)
                                             + lane_mod_16)) for c in range(NC2)]
             core = EP._make_core(
-                FP8=True, K=I, W_ROWS=E_LOCAL * H, BM=BM, PF=PF, bcm=2, cols=cols,
+                FP8=True, K=I, W_ROWS=E_LOCAL * H, BM=BM, PF=PF, bcm=BCM2, cols=cols,
                 lds_ptr=lds_ptr, LDS_BYTES=LDS_BYTES, lane=lane, tx=tx, NT=NT, arg_w=a["w2"],
                 arg_ws=a["w2s"], arg_a=a["a2"], a_num_bytes=fx.Int64(rows_cap) * fx.Int64(I),
                 ARB=ARB, acm=2, SCH=3, TR=False)

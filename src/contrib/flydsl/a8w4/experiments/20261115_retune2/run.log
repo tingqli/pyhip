@@ -1,0 +1,2 @@
+grep: a8w4/experiments/20261115_retune2/run.log: input file is also the output
+merged 2070 rows from 20 files into a8w4/experiments/20261115_retune2/a8w4_moe_tuned.new.csv

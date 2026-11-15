@@ -1,0 +1,141 @@
+model_dim,inter_dim,experts,experts_global,topk,routing,act,num_tokens,config,us,cos
+4096,2048,32,256,8,uniform,situv2,3,ep3k t16c,35.4,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,ep3k t16,35.5,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,ep3k s16,39.5,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,ep3k s32,44.3,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,ep1k m512,44.7,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,ep3k m64,44.9,1.6e-04
+4096,2048,32,256,8,uniform,situv2,3,ep3k l128c,46.8,1.6e-04
+4096,2048,32,256,8,uniform,situv2,3,ep3k l128,47.8,1.6e-04
+4096,2048,32,256,8,uniform,situv2,3,tp2k bm32 g1bcm2 g2base,52.3,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,tp2k bm32 g1bcm1 g2base,52.8,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,tp2k bm64 g1bcm2 g2base,54.2,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,tp2k bm64 g1bcm1 g2base,54.6,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,tp1k bcm1 ks8,102.0,1.8e-04
+4096,2048,32,256,8,uniform,situv2,3,tp1k bcm2 ks8,106.5,1.8e-04
+4096,2048,32,256,8,uniform,situv2,3,tp1k bcm1 ks4,166.0,1.7e-04
+4096,2048,32,256,8,uniform,situv2,3,tp1k bcm2 ks4,176.3,1.7e-04
+4096,2048,32,256,8,uniform,situv2,12,ep3k t16c,44.7,1.3e-05
+4096,2048,32,256,8,uniform,situv2,12,ep3k t16,49.3,1.3e-05
+4096,2048,32,256,8,uniform,situv2,12,ep3k s16,51.4,1.3e-05
+4096,2048,32,256,8,uniform,situv2,12,ep3k l128c,53.6,2.5e-06
+4096,2048,32,256,8,uniform,situv2,12,ep3k s32,55.4,1.3e-05
+4096,2048,32,256,8,uniform,situv2,12,ep3k m64,59.8,2.5e-06
+4096,2048,32,256,8,uniform,situv2,12,ep1k m512,59.8,1.3e-05
+4096,2048,32,256,8,uniform,situv2,12,ep3k l128,60.2,2.5e-06
+4096,2048,32,256,8,uniform,situv2,12,tp2k bm32 g1bcm1 g2base,61.7,1.3e-05
+4096,2048,32,256,8,uniform,situv2,12,tp2k bm32 g1bcm2 g2base,64.2,1.3e-05
+4096,2048,32,256,8,uniform,situv2,12,tp2k bm64 g1bcm1 g2base,64.3,1.3e-05
+4096,2048,32,256,8,uniform,situv2,12,tp2k bm64 g1bcm2 g2base,66.4,1.3e-05
+4096,2048,32,256,8,uniform,situv2,12,tp1k bcm1 ks8,107.2,2.4e-05
+4096,2048,32,256,8,uniform,situv2,12,tp1k bcm2 ks8,110.8,2.3e-05
+4096,2048,32,256,8,uniform,situv2,12,tp1k bcm1 ks4,171.6,1.8e-05
+4096,2048,32,256,8,uniform,situv2,12,tp1k bcm2 ks4,180.5,1.9e-05
+4096,2048,32,256,8,uniform,situv2,48,ep3k s16,104.9,4.5e-05
+4096,2048,32,256,8,uniform,situv2,48,ep3k t16,106.8,4.5e-05
+4096,2048,32,256,8,uniform,situv2,48,ep3k s32,114.0,4.5e-05
+4096,2048,32,256,8,uniform,situv2,48,ep3k t16c,115.9,4.5e-05
+4096,2048,32,256,8,uniform,situv2,48,tp2k bm32 g1bcm1 g2base,118.3,4.5e-05
+4096,2048,32,256,8,uniform,situv2,48,tp2k bm64 g1bcm1 g2base,119.2,4.5e-05
+4096,2048,32,256,8,uniform,situv2,48,ep3k m64,122.2,3.7e-05
+4096,2048,32,256,8,uniform,situv2,48,ep1k m512,122.4,4.5e-05
+4096,2048,32,256,8,uniform,situv2,48,tp2k bm32 g1bcm2 g2base,127.1,4.5e-05
+4096,2048,32,256,8,uniform,situv2,48,ep3k l128,127.1,3.7e-05
+4096,2048,32,256,8,uniform,situv2,48,tp2k bm64 g1bcm2 g2base,127.4,4.5e-05
+4096,2048,32,256,8,uniform,situv2,48,tp1k bcm2 ks8,131.4,5.3e-05
+4096,2048,32,256,8,uniform,situv2,48,tp1k bcm1 ks8,134.1,5.3e-05
+4096,2048,32,256,8,uniform,situv2,48,ep3k l128c,136.2,3.7e-05
+4096,2048,32,256,8,uniform,situv2,48,tp1k bcm2 ks4,182.6,4.9e-05
+4096,2048,32,256,8,uniform,situv2,48,tp1k bcm1 ks4,193.3,4.9e-05
+4096,2048,32,256,8,uniform,situv2,192,ep3k s16,129.8,3.6e-05
+4096,2048,32,256,8,uniform,situv2,192,ep3k t16,137.1,3.6e-05
+4096,2048,32,256,8,uniform,situv2,192,ep3k s32,140.1,3.6e-05
+4096,2048,32,256,8,uniform,situv2,192,ep3k m64,145.1,2.6e-05
+4096,2048,32,256,8,uniform,situv2,192,ep3k l128,149.7,2.6e-05
+4096,2048,32,256,8,uniform,situv2,192,ep3k t16c,157.8,3.6e-05
+4096,2048,32,256,8,uniform,situv2,192,tp2k bm32 g1bcm2 g2base,159.3,3.6e-05
+4096,2048,32,256,8,uniform,situv2,192,tp2k bm64 g1bcm2 g2base,160.2,3.6e-05
+4096,2048,32,256,8,uniform,situv2,192,tp2k bm64 g1bcm1 g2base,162.3,3.6e-05
+4096,2048,32,256,8,uniform,situv2,192,tp2k bm32 g1bcm1 g2base,162.5,3.6e-05
+4096,2048,32,256,8,uniform,situv2,192,ep1k m512,164.6,3.6e-05
+4096,2048,32,256,8,uniform,situv2,192,tp1k bcm2 ks8,168.0,4.6e-05
+4096,2048,32,256,8,uniform,situv2,192,ep3k l128c,175.5,2.6e-05
+4096,2048,32,256,8,uniform,situv2,192,tp1k bcm1 ks8,178.7,4.7e-05
+4096,2048,32,256,8,uniform,situv2,192,tp1k bcm2 ks4,190.2,4.1e-05
+4096,2048,32,256,8,uniform,situv2,192,tp1k bcm1 ks4,206.2,4.1e-05
+4096,2048,32,256,8,uniform,situv2,448,ep3k s32,145.0,7.1e-05
+4096,2048,32,256,8,uniform,situv2,448,ep3k m64,151.1,6.0e-05
+4096,2048,32,256,8,uniform,situv2,448,ep3k l128,155.8,6.0e-05
+4096,2048,32,256,8,uniform,situv2,448,ep3k s16,157.2,7.1e-05
+4096,2048,32,256,8,uniform,situv2,448,ep3k t16,165.3,7.1e-05
+4096,2048,32,256,8,uniform,situv2,448,ep3k t16c,166.4,7.1e-05
+4096,2048,32,256,8,uniform,situv2,448,tp2k bm32 g1bcm2 g2base,172.3,7.1e-05
+4096,2048,32,256,8,uniform,situv2,448,tp2k bm64 g1bcm2 g2base,172.7,7.1e-05
+4096,2048,32,256,8,uniform,situv2,448,tp2k bm64 g1bcm1 g2base,176.2,7.1e-05
+4096,2048,32,256,8,uniform,situv2,448,tp2k bm32 g1bcm1 g2base,176.6,7.1e-05
+4096,2048,32,256,8,uniform,situv2,448,tp1k bcm2 ks8,176.6,8.1e-05
+4096,2048,32,256,8,uniform,situv2,448,ep3k l128c,179.5,6.0e-05
+4096,2048,32,256,8,uniform,situv2,448,ep1k m512,182.0,7.1e-05
+4096,2048,32,256,8,uniform,situv2,448,tp1k bcm1 ks8,188.1,8.1e-05
+4096,2048,32,256,8,uniform,situv2,448,tp1k bcm2 ks4,196.1,7.5e-05
+4096,2048,32,256,8,uniform,situv2,448,tp1k bcm1 ks4,211.2,7.6e-05
+4096,2048,32,256,8,uniform,situv2,1024,ep3k m64,188.1,4.2e-05
+4096,2048,32,256,8,uniform,situv2,1024,ep3k l128,192.6,4.2e-05
+4096,2048,32,256,8,uniform,situv2,1024,ep3k s32,201.7,5.3e-05
+4096,2048,32,256,8,uniform,situv2,1024,ep3k l128c,210.1,4.2e-05
+4096,2048,32,256,8,uniform,situv2,1024,tp1k bcm2 ks8,223.6,6.4e-05
+4096,2048,32,256,8,uniform,situv2,1024,tp1k bcm1 ks8,233.9,6.4e-05
+4096,2048,32,256,8,uniform,situv2,1024,tp2k bm32 g1bcm1 g2base,250.9,5.3e-05
+4096,2048,32,256,8,uniform,situv2,1024,tp2k bm64 g1bcm2 g2base,255.7,5.3e-05
+4096,2048,32,256,8,uniform,situv2,1024,tp2k bm32 g1bcm2 g2base,258.0,5.3e-05
+4096,2048,32,256,8,uniform,situv2,1024,ep3k s16,261.1,5.3e-05
+4096,2048,32,256,8,uniform,situv2,1024,tp2k bm64 g1bcm1 g2base,262.2,5.3e-05
+4096,2048,32,256,8,uniform,situv2,1024,ep3k t16c,267.4,5.3e-05
+4096,2048,32,256,8,uniform,situv2,1024,tp1k bcm2 ks4,273.5,5.8e-05
+4096,2048,32,256,8,uniform,situv2,1024,tp1k bcm1 ks4,281.5,5.8e-05
+4096,2048,32,256,8,uniform,situv2,1024,ep3k t16,293.4,5.3e-05
+4096,2048,32,256,8,uniform,situv2,2560,ep3k l128,334.8,3.8e-05
+4096,2048,32,256,8,uniform,situv2,2560,ep3k l128c,357.2,3.8e-05
+4096,2048,32,256,8,uniform,situv2,2560,ep3k m64,365.9,3.8e-05
+4096,2048,32,256,8,uniform,situv2,2560,ep3k s32,389.9,4.9e-05
+4096,2048,32,256,8,uniform,situv2,2560,tp1k bcm1 ks4,392.5,5.4e-05
+4096,2048,32,256,8,uniform,situv2,2560,tp1k bcm1 ks8,394.9,6.0e-05
+4096,2048,32,256,8,uniform,situv2,2560,tp1k bcm2 ks4,407.6,5.4e-05
+4096,2048,32,256,8,uniform,situv2,2560,tp1k bcm2 ks8,413.5,6.0e-05
+4096,2048,32,256,8,uniform,situv2,2560,tp2k bm32 g1bcm1 g2base,473.5,4.9e-05
+4096,2048,32,256,8,uniform,situv2,2560,tp2k bm32 g1bcm2 g2base,497.5,4.9e-05
+4096,2048,32,256,8,uniform,situv2,2560,tp2k bm64 g1bcm1 g2base,509.1,4.9e-05
+4096,2048,32,256,8,uniform,situv2,2560,tp2k bm64 g1bcm2 g2base,517.2,4.9e-05
+4096,2048,32,256,8,uniform,situv2,2560,ep3k t16c,531.5,4.9e-05
+4096,2048,32,256,8,uniform,situv2,2560,ep3k s16,537.8,4.9e-05
+4096,2048,32,256,8,uniform,situv2,2560,ep3k t16,628.1,4.9e-05
+4096,2048,32,256,8,uniform,situv2,8192,ep3k l128,760.9,4.0e-05
+4096,2048,32,256,8,uniform,situv2,8192,ep3k l128c,768.1,4.0e-05
+4096,2048,32,256,8,uniform,situv2,8192,ep3k m64,865.0,4.0e-05
+4096,2048,32,256,8,uniform,situv2,8192,tp1k bcm2 ks4,879.6,5.6e-05
+4096,2048,32,256,8,uniform,situv2,8192,tp1k bcm1 ks4,880.3,5.6e-05
+4096,2048,32,256,8,uniform,situv2,8192,tp1k bcm1 ks8,890.4,6.2e-05
+4096,2048,32,256,8,uniform,situv2,8192,tp1k bcm2 ks8,896.0,6.2e-05
+4096,2048,32,256,8,uniform,situv2,8192,ep3k s32,1033.3,5.1e-05
+4096,2048,32,256,8,uniform,situv2,8192,tp2k bm32 g1bcm1 g2base,1212.9,5.1e-05
+4096,2048,32,256,8,uniform,situv2,8192,tp2k bm64 g1bcm1 g2base,1314.0,5.1e-05
+4096,2048,32,256,8,uniform,situv2,8192,tp2k bm32 g1bcm2 g2base,1321.8,5.1e-05
+4096,2048,32,256,8,uniform,situv2,8192,tp2k bm64 g1bcm2 g2base,1348.5,5.1e-05
+4096,2048,32,256,8,uniform,situv2,8192,ep3k t16c,1539.5,5.1e-05
+4096,2048,32,256,8,uniform,situv2,8192,ep3k s16,1614.0,5.1e-05
+4096,2048,32,256,8,uniform,situv2,8192,ep3k t16,1885.3,5.1e-05
+4096,2048,32,256,8,uniform,situv2,32768,ep3k l128c,2577.8,3.4e-05
+4096,2048,32,256,8,uniform,situv2,32768,ep3k l128,2632.1,3.4e-05
+4096,2048,32,256,8,uniform,situv2,32768,tp1k bcm1 ks4,2947.7,5.0e-05
+4096,2048,32,256,8,uniform,situv2,32768,tp1k bcm1 ks8,2951.1,5.5e-05
+4096,2048,32,256,8,uniform,situv2,32768,ep3k m64,2998.2,3.4e-05
+4096,2048,32,256,8,uniform,situv2,32768,tp1k bcm2 ks4,3015.7,5.0e-05
+4096,2048,32,256,8,uniform,situv2,32768,tp1k bcm2 ks8,3137.4,5.5e-05
+4096,2048,32,256,8,uniform,situv2,32768,ep3k s32,3729.5,4.5e-05
+4096,2048,32,256,8,uniform,situv2,32768,tp2k bm32 g1bcm1 g2base,4714.9,4.5e-05
+4096,2048,32,256,8,uniform,situv2,32768,tp2k bm64 g1bcm1 g2base,5076.6,4.5e-05
+4096,2048,32,256,8,uniform,situv2,32768,tp2k bm64 g1bcm2 g2base,5374.4,4.5e-05
+4096,2048,32,256,8,uniform,situv2,32768,tp2k bm32 g1bcm2 g2base,5475.4,4.5e-05
+4096,2048,32,256,8,uniform,situv2,32768,ep3k t16c,5547.7,4.5e-05
+4096,2048,32,256,8,uniform,situv2,32768,ep3k s16,6847.2,4.5e-05
+4096,2048,32,256,8,uniform,situv2,32768,ep3k t16,7514.6,4.5e-05

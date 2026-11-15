@@ -22,7 +22,9 @@ every rank repeats the sglang steps (``moriep.py``, ``mxfp4_aiter_a16w4_moe.py``
 
 Run from the directory that holds ``a8w4/``; needs 8 gfx942 GPUs and mori.
 
-Timing: every iteration flushes L2 + MALL (cold weights), then a host barrier, a GPU
+Timing: every iteration flushes L2 and switches to the next of ``R.WCOPIES`` weight copies
+(the flush does not evict weights that every call re-reads from the MALL; a model's next
+layer reads other weights), then a host barrier, a GPU
 spin while the host enqueues the whole layer (host overhead excluded, as in a CUDA-graph
 replay; the eager count read is not timed) and a MORI device barrier, so all ranks start
 together. Each iteration runs the layer twice:
@@ -98,6 +100,13 @@ class EpMoeLayer:
         if x.shape[0] == 0:  # sglang skips the quant kernel on an empty batch
             return x.to(FP8), x.new_empty((0, H // 128), dtype=torch.float32)
         return self._quant(x, quant_dtype=FP8)
+
+    def next_weights(self):
+        """Switch to the next of ``R.WCOPIES`` copies of the weights (made on first use)."""
+        if not hasattr(self, "_Ws"):
+            self._Ws, self._wi = R.weight_copies(self.W), 0
+        self._wi = (self._wi + 1) % len(self._Ws)
+        self.W = self._Ws[self._wi]
 
     def dispatch(self, xq, xs, tw, ti):
         """-> receive buffers: x, top-k weights, x scales, top-k ids, [received rows]."""
@@ -215,6 +224,7 @@ def _timed(layer, x, tw, ti, args, isolated, spin):
     """One timed layer forward (``args``: the MoE's rows, est) -> ({stage: us}, e2e us,
     host enqueue us)."""
     R.flush_cache()
+    layer.next_weights()
     dist.barrier()
     torch.cuda._sleep(spin)
     _align()

@@ -16,14 +16,16 @@ Run from the directory that holds ``a8w4/``; needs 8 gfx942 GPUs and mori.
 Correctness: every point runs twice, the points interleaved (stale data from an earlier
 call would show up); each rank's output vs the reference (each rank evaluates its experts
 on all ranks' fp8 tokens, summed over the ranks), cos diff < 5e-3.
-Timing (as test_a8w4_mori_ep8): every iteration flushes L2 + MALL, then a host barrier, a
-GPU spin while the host enqueues the layer, and a MORI device barrier, so all ranks start
-together; e2e = the layer of the slowest rank, median over the iterations; the two paths
-alternate per iteration. Stage split of megamoe (events between its launches, slowest
-rank): quant / prep (count exchange) / plan / mega / finish (wait for all ranks).
+Timing (as test_a8w4_mori_ep8): every iteration flushes L2 and takes the next of
+``R.WCOPIES`` weight copies (the flush leaves re-read weights in the MALL), then a host
+barrier, a GPU spin while the host enqueues the layer, and a MORI device barrier, so all
+ranks start together; e2e = the layer of the slowest rank, median over the iterations; the
+two paths alternate per iteration. Stage split of megamoe (events between its launches,
+slowest rank): quant / prep (count exchange) / plan / mega / finish (wait for all ranks).
 """
 
 import argparse
+import itertools
 import os
 import socket
 import statistics
@@ -167,7 +169,7 @@ def _bench(rank, points, data, megas, W, iters, warmup):
     import test_a8w4_mori_ep8 as M
 
     layer = M.EpMoeLayer(rank)  # also provides the device barrier (_align)
-    layer.W = W  # the same experts as megamoe
+    nxt = itertools.cycle(R.weight_copies(W)).__next__  # both paths: the same experts
     rows = []
     for ns, (x, tw, ti) in zip(points, data):
         for act, mega in megas.items():
@@ -175,6 +177,7 @@ def _bench(rank, points, data, megas, W, iters, warmup):
             run_mega = lambda: mega(x, ti, tw, marks=marks)  # noqa: E731
             if hasattr(layer, "set_act"):
                 layer.set_act(act)
+            layer.W = W
             xq, xs = layer.quant(x)
             recv = layer.dispatch(xq, xs, tw, ti)
             count = int(recv[4].item())
@@ -188,9 +191,11 @@ def _bench(rank, points, data, megas, W, iters, warmup):
             torch.cuda.synchronize()
             t_mega, t_mori, st = [], [], []
             for _ in range(iters):
+                mega.W = nxt()
                 t, s = _timed(run_mega, spin, marks)
                 t_mega.append(t)
                 st.append(s)
+                layer.W = nxt()
                 t_mori.append(_timed(run_mori, spin)[0])
             res = [None] * WORLD
             dist.all_gather_object(res, (t_mega, t_mori, st, mega.rows_needed()))

@@ -13,14 +13,17 @@ allowed in its context (activation, CUDA-graph capture, token count).
     python -m a8w4.tune tune --act situv2 --case mimo-v2.6-flash-ep8 -t 1 2 4 --out /tmp/s0.csv
 
 Run from the directory that contains ``a8w4/`` (or put it on PYTHONPATH);
-``python a8w4/tune.py ...`` works too. Timing: cold caches (L2 + MALL flushed),
-host launch overhead excluded, median of ``--iters`` (see ``ref.time_cold``).
+``python a8w4/tune.py ...`` works too. Timing: cold caches (L2 flushed, and every
+timed call reads the next of ``--wcopies`` weight copies: the flush does not evict
+weights that every call re-reads from the MALL), host launch overhead excluded,
+median of ``--iters`` (see ``ref.time_cold``, ``ref.weight_copies``).
 SiTUv2 runs with ``ref.SITU`` (its betas / clamp are launch arguments: no effect on
 the time). See configs/README.md for the commands that produced the shipped table.
 """
 
 import argparse
 import csv
+import itertools
 import os
 import sys
 import time
@@ -57,7 +60,7 @@ CASES = {
 TOKENS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 320, 384, 448, 512, 640,
           768, 1024, 1280, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768]
 COS_TOL = 5e-3  # vs the fp8-emulating fp32 reference (typical 1e-5 .. 1e-4)
-EP_CFGS = ("t16", "s16", "s32", "m64", "l128")
+EP_CFGS = ("t16", "s16", "s32", "m64", "l128", "l128c")
 
 
 def candidates(shape):
@@ -125,17 +128,20 @@ def _case(args):
 
 
 def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log=print,
-         act="silu"):
+         act="silu", wcopies=R.WCOPIES):
     """Per token count, ``rounds`` rounds, each with a fresh routing draw (at small
     batches the per-rank work depends on the draw): check every candidate against
     the reference, time it (candidates interleaved, so clock / power drift hits all
-    of them); store the median per candidate. ``act``: the experts' activation (its
-    rows are stored under that act)."""
+    of them; each timed call reads the next of ``wcopies`` weight copies); store the
+    median per candidate. ``act``: the experts' activation (its rows are stored under
+    that act)."""
     H, I, E, EGl, K = shape
     situ = _situ(act)
     W, raw = R.make_weights(E, H, I)
+    nxt = itertools.cycle(R.weight_copies(W, wcopies)).__next__
     cands = candidates(shape)
-    log(f"shape H{H} I{I} E{E}/{EGl} top{K} e0 {e0} act {act}: {len(cands)} candidates")
+    log(f"shape H{H} I{I} E{E}/{EGl} top{K} e0 {e0} act {act}: {len(cands)} candidates, "
+        f"{wcopies} weight copies")
     for tok in tokens:
         names = [config_name(c) for c in cands if supported(c, shape, act=act, tokens=tok)]
         times = {n: [] for n in names}
@@ -147,9 +153,9 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
             for name in names:
                 if name in bad:
                     continue
-                fn = lambda name=name: run_config(name, x, W, tw, ti,  # noqa: E731
-                                                  expert_offset=e0, num_experts=EGl,
-                                                  act=act, situ=situ)
+                fn = lambda name=name, W=W: run_config(name, x, W, tw, ti,  # noqa: E731
+                                                       expert_offset=e0, num_experts=EGl,
+                                                       act=act, situ=situ)
                 try:
                     c = R.cos_diff(ref, fn().float())
                 except Exception as ex:  # noqa: BLE001
@@ -159,7 +165,7 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
                     bad[name] = f"BAD cos {c:.1e}"
                     continue
                 cos[name] = max(cos[name], c)
-                times[name].append(R.time_cold(fn, iters=iters))
+                times[name].append(R.time_cold(lambda fn=fn: fn(W=nxt()), iters=iters))
         rows = []
         for name in names:
             if name in bad:
@@ -201,23 +207,26 @@ def show(shape, csv_path, routing="uniform", act="silu"):
               f"{'' if safe == best else config_name(safe)} |")
 
 
-def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print, act="silu"):
+def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print, act="silu",
+           wcopies=R.WCOPIES):
     """``a8w4_moe`` (table lookup) at each token count, also between tuned points:
     cos vs the reference, time vs the table entry and vs the untuned default."""
     H, I, E, EGl, K = shape
     situ = _situ(act)
     W, raw = R.make_weights(E, H, I)
+    nxt = itertools.cycle(R.weight_copies(W, wcopies)).__next__
     pts = dict(_points(csv_path, shape, routing, act))
     for tok in tokens:
         x, tw, ti = R.make_routing(tok, H, EGl, K, seed=7 + tok, routing=routing)
         ref = R.ref_moe(x, tw, ti, raw, e0, act, situ)
         cfg = lookup_config(shape, tok, act=act, routing=routing, csv_path=csv_path)
-        fn = lambda: a8w4_moe(x, W, tw, ti, expert_offset=e0, num_experts=EGl,  # noqa: E731
-                              act=act, situ=situ, routing=routing, csv_path=csv_path)
+        fn = lambda W=W: a8w4_moe(x, W, tw, ti, expert_offset=e0,  # noqa: E731
+                                  num_experts=EGl, act=act, situ=situ, routing=routing,
+                                  csv_path=csv_path)
         c = R.cos_diff(ref, fn().float())
-        us = R.time_cold(fn, iters=iters)
+        us = R.time_cold(lambda: fn(nxt()), iters=iters)
         dflt = default_config(shape, tok, act)
-        dus = R.time_cold(lambda: run_config(dflt, x, W, tw, ti, expert_offset=e0,
+        dus = R.time_cold(lambda: run_config(dflt, x, nxt(), tw, ti, expert_offset=e0,
                                              num_experts=EGl, act=act, situ=situ), iters=iters)
         n = next((p for p in sorted(pts) if p >= tok), max(pts))
         tus = next(u for u, cc in pts[n] if cc == cfg)
@@ -249,6 +258,9 @@ def main():
     p.add_argument("--out", default=None, help="tune: output file (default --csv)")
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--rounds", type=int, default=3, help="tune: interleaved timing rounds")
+    p.add_argument("--wcopies", type=int, default=R.WCOPIES,
+                   help="weight copies the timed calls cycle through (1: the same weights "
+                        "every call, which the MALL keeps: favors cached W loads)")
     args = p.parse_args()
     log = lambda s: print(f"[{time.strftime('%H:%M:%S')}] {s}", flush=True)  # noqa: E731
     if args.mode == "merge":
@@ -259,12 +271,12 @@ def main():
             print(config_name(c))
     elif args.mode == "tune":
         tune(shape, e0, args.t or TOKENS, args.out or args.csv, args.routing, args.iters,
-             args.rounds, log, args.act)
+             args.rounds, log, args.act, args.wcopies)
     elif args.mode == "show":
         show(shape, args.csv, args.routing, args.act)
     else:
         verify(shape, e0, args.t or [1, 3, 20, 100, 300, 1000, 3000, 10000], args.csv,
-               args.routing, args.iters, log, args.act)
+               args.routing, args.iters, log, args.act, args.wcopies)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[W1114 23:39:52.281612551 collection.cpp:1133] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+tp8 T= 1024 cfg='tp2k bm64 g1bcm2 g2nt4' e2e   207.2 us  kernels   205.3  cos 8.9e-05  a8w4_gemm1 115.3  a8w4_gemm2 81.5  tp_prep_h4096_k8_e256_bm64_t1_u8_z1 8.4
+tp8 T= 2048 cfg='tp1k bcm1 ks1' e2e   325.9 us  kernels   324.7  cos 9.5e-05  a8w4_fmoe_bm64 310.9  tp_prep_h4096_k8_e256_bm64_t1_u16_z1 13.8
+tp8 T= 4096 cfg='tp1kq bcm1' e2e   501.1 us  kernels   502.1  cos 8.8e-05  a8w4_fmoe_bm64q 477.6  tp_prep_h4096_k8_e256_bm64_t2_u16_z1 24.5
+tp8 T= 8192 cfg='tp1k bcm1 ks1' e2e   831.3 us  kernels   855.8  cos 8.9e-05  a8w4_fmoe_bm64 811.7  tp_prep_h4096_k8_e256_bm64_t4_u16_z1 44.1
+tp8 T=16384 cfg='tp1k bcm1 ks1' e2e  1607.8 us  kernels  1647.6  cos 8.9e-05  a8w4_fmoe_bm64 1566.0  tp_prep_h4096_k8_e256_bm64_t8_u16_z1 81.6
+tp8 T=32768 cfg='tp1k bcm1 ks1' e2e  2904.0 us  kernels  2996.6  cos 8.9e-05  a8w4_fmoe_bm64 2832.7  tp_prep_h4096_k8_e256_bm64_t8_u16_z1 163.9

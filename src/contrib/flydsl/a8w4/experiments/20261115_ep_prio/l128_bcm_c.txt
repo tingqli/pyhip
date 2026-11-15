@@ -1,0 +1,8 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+== tokens 16384 (base l128, 9 interleaved rounds, cold)
+l128                  1428.3 us  ( +0.0%)  min   1391.5 max   1441.7
+l128_g2bcm0           1411.6 us  ( -1.2%)  min   1374.2 max   1437.9
+l128_g2bcm0pf1        1415.2 us  ( -0.9%)  min   1395.8 max   1435.4
+l128_bcm0             1392.1 us  ( -2.5%)  min   1376.2 max   1402.5
+l128_bcm0g2pf1        1403.6 us  ( -1.7%)  min   1367.7 max   1418.0

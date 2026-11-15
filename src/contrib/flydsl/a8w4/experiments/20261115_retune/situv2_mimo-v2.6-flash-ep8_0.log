@@ -1,0 +1,12 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[00:05:35] shape H4096 I2048 E32/256 top8 e0 0 act situv2: 16 candidates
+[aiter] import [module_moe_sorting_opus] under /sgl-workspace/aiter/aiter/jit/module_moe_sorting_opus.so
+[00:05:43] tok      4: ep3k t16 36.1 | ep3k t16c 36.6 | ep3k s16 40.0
+[00:05:44] tok     16: ep3k t16c 51.4 | ep3k t16 56.7 | ep3k l128c 56.9
+[00:05:45] tok     64: ep3k s16 110.4 | ep3k t16 114.0 | ep3k s32 121.0
+[00:05:47] tok    256: ep3k s16 130.3 | ep3k t16 137.1 | ep3k s32 139.6
+[00:05:48] tok    512: ep3k s32 145.2 | ep3k m64 150.9 | ep3k l128 156.9
+[00:05:50] tok   1280: ep3k m64 198.2 | ep3k l128 205.0 | ep3k l128c 226.3
+[00:05:51] tok   3072: ep3k l128 338.1 | ep3k l128c 353.8 | ep3k m64 369.0
+[00:05:54] tok  12288: ep3k l128c 1031.2 | ep3k l128 1042.3 | ep3k m64 1194.2

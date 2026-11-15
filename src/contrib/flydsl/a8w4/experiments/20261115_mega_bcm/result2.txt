@@ -1,0 +1,50 @@
+[Gloo] Rank 1 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 6 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 0 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 2 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 5 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 4 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 7 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+40 iterations (variants interleaved, ABBA order); worst cos vs ref: bcm22 8.2e-06, bcm21 8.2e-06, bcm00 8.2e-06, bcm01 8.2e-06, bcm22b 8.2e-06
+T  2048 bcm22  e2e   387.1 us ( +0.0%)  quant 6.6  prep 18.1  plan 8.1  mega 340.6  finish 23.7
+T  2048 bcm21  e2e   388.5 us ( +0.4%)  quant 6.6  prep 18.4  plan 8.0  mega 337.7  finish 22.3
+T  2048 bcm00  e2e   396.1 us ( +2.3%)  quant 6.5  prep 18.3  plan 8.1  mega 348.2  finish 21.8
+T  2048 bcm01  e2e   395.3 us ( +2.1%)  quant 6.6  prep 18.5  plan 8.1  mega 348.3  finish 21.7
+T  2048 bcm22b e2e   385.4 us ( -0.4%)  quant 6.6  prep 18.2  plan 8.1  mega 336.8  finish 22.4
+T  4096 bcm22  e2e   572.3 us ( +0.0%)  quant 6.8  prep 18.1  plan 8.1  mega 525.6  finish 52.8
+T  4096 bcm21  e2e   567.1 us ( -0.9%)  quant 7.0  prep 18.2  plan 8.0  mega 517.6  finish 49.4
+T  4096 bcm00  e2e   567.8 us ( -0.8%)  quant 7.0  prep 18.4  plan 8.0  mega 519.4  finish 49.4
+T  4096 bcm01  e2e   565.7 us ( -1.2%)  quant 6.9  prep 18.2  plan 8.1  mega 516.4  finish 47.2
+T  4096 bcm22b e2e   569.5 us ( -0.5%)  quant 7.0  prep 18.3  plan 8.1  mega 520.3  finish 51.4
+T  8192 bcm22  e2e   934.9 us ( +0.0%)  quant 8.5  prep 18.3  plan 8.2  mega 887.1  finish 44.1
+T  8192 bcm21  e2e   928.8 us ( -0.7%)  quant 9.2  prep 18.1  plan 8.1  mega 879.0  finish 43.7
+T  8192 bcm00  e2e   922.4 us ( -1.3%)  quant 9.1  prep 18.1  plan 8.1  mega 873.9  finish 46.2
+T  8192 bcm01  e2e   922.2 us ( -1.4%)  quant 8.9  prep 18.3  plan 8.1  mega 872.4  finish 44.9
+T  8192 bcm22b e2e   933.8 us ( -0.1%)  quant 8.9  prep 18.1  plan 8.1  mega 885.9  finish 45.6
+T 16384 bcm22  e2e  1669.2 us ( +0.0%)  quant 14.1  prep 20.3  plan 8.2  mega 1611.1  finish 85.5
+T 16384 bcm21  e2e  1662.9 us ( -0.4%)  quant 14.9  prep 20.8  plan 8.2  mega 1603.7  finish 87.8
+T 16384 bcm00  e2e  1640.7 us ( -1.7%)  quant 15.2  prep 21.2  plan 8.1  mega 1581.8  finish 81.5
+T 16384 bcm01  e2e  1638.6 us ( -1.8%)  quant 15.3  prep 21.4  plan 8.2  mega 1580.4  finish 80.2
+T 16384 bcm22b e2e  1671.4 us ( +0.1%)  quant 14.7  prep 21.5  plan 8.2  mega 1612.7  finish 86.4
+T 32768 bcm22  e2e  3054.3 us ( +0.0%)  quant 24.6  prep 26.7  plan 8.6  mega 2959.8  finish 93.8
+T 32768 bcm21  e2e  3087.9 us ( +1.1%)  quant 25.9  prep 27.2  plan 8.6  mega 2990.3  finish 84.7
+T 32768 bcm00  e2e  3018.7 us ( -1.2%)  quant 25.7  prep 27.0  plan 8.6  mega 2936.7  finish 91.9
+T 32768 bcm01  e2e  2995.2 us ( -1.9%)  quant 25.4  prep 27.1  plan 8.7  mega 2898.2  finish 93.4
+T 32768 bcm22b e2e  3055.0 us ( +0.0%)  quant 25.3  prep 26.9  plan 8.7  mega 2969.6  finish 101.9

@@ -1,0 +1,18 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+8 weight copies of 410 MB
+== tokens 1024: rotate (8 layers x 7 rounds) | time_cold
+  m64 old   rotate    191.1 us ( +0.0%) | cold    190.7 us ( +0.0%)
+  m64 new   rotate    192.8 us ( +0.9%) | cold    178.2 us ( -6.5%)
+== tokens 2048: rotate (8 layers x 7 rounds) | time_cold
+  m64 old   rotate    286.9 us ( +0.0%) | cold    289.4 us ( +0.0%)
+  m64 new   rotate    283.0 us ( -1.3%) | cold    272.7 us ( -5.7%)
+  l128 old  rotate    288.0 us ( +0.4%) | cold    288.8 us ( -0.2%)
+== tokens 4096: rotate (8 layers x 7 rounds) | time_cold
+  l128 old  rotate    469.1 us ( +0.0%) | cold    474.0 us ( +0.0%)
+  l128 new  rotate    466.9 us ( -0.5%) | cold    461.3 us ( -2.7%)
+  l128c     rotate    468.2 us ( -0.2%) | cold    473.8 us ( -0.1%)
+== tokens 16384: rotate (8 layers x 7 rounds) | time_cold
+  l128 old  rotate   1291.3 us ( +0.0%) | cold   1346.5 us ( +0.0%)
+  l128 new  rotate   1255.8 us ( -2.7%) | cold   1334.1 us ( -0.9%)
+  l128c     rotate   1237.7 us ( -4.1%) | cold   1312.5 us ( -2.5%)
