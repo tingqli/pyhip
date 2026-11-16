@@ -152,6 +152,7 @@ a8w4/
   tune.py                      调优 CLI：tune / merge / show / verify / candidates / tune-all / compare / readme / stats
   tables.py                    调优表报告：compare（两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
+  megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
   bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是计时协议和变体写法，dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
@@ -171,12 +172,21 @@ a8w4/
     ep_prep.py                 ep3k 的 prep：本地专家排序 + x 量化 + tile 调度 + 路数统计；m_valid 变体（MDYN）
     ep_gemm.py                 ep3k 的 gemm1 / gemm2、配置表 CFGS、入口 ep_moe 和 ep_moe_dyn（XG、DYN 变体）
     ep_small.py                ep1k：单 launch 的小 batch 融合
-    _mem.py                    共享 device helper：IR 值转换、整数除法、global / LDS 指针、buffer 读写、i32 buffer 视图
+    ep_mega.py                 megamoe：dispatch + gemm1 / gemm2 + combine 的单个 persistent kernel
+    ep_mega_comm.py            megamoe 的通信 kernel：x 量化 + out 清零、路由计划（各卡计数交换）、完成屏障
+    _hw.py                     MI300X 硬件常量（NUM_CU、NUM_XCD、LDS_BYTES_MAX、cache 策略位 CM_*）和 readfirstlane 等 wave / XCD 相关 helper
+    _mem.py                    共享 device helper：IR 值转换、整数除法、global / LDS 指针、buffer 读写（_rsrc、_ld、_store）、i32 buffer 视图
+    _atomic.py                 WG 间的原子操作（global / LDS、bf16x4 atomic add），以及轮询它们写的值用的 coherent load
     _act.py                    gemm1 epilogue 的激活（silu、situv2）
-    _cvt.py                    数值格式转换（4 个 f32 打包成 fp8）
+    _cvt.py                    数值格式转换：f32 → fp8 / bf16 打包，mxfp4 权重 fd2 解码成 fp8 和它的每通道系数
+    _mma.py                    MFMA 操作数（寄存器里的 fp8 片段）和一步 fp8 MFMA
+    _kloop.py                  EP GEMM tile 的 K 循环 _make_core（ep_gemm、ep_small、ep_mega 共用）和行数变体的分派 _dispatch_rows
+    _protocol.py               一个 kernel 写、另一个 kernel 读的 buffer 格式（EP 调度表；megamoe 的 flag / 队列布局）
     _launch.py                 host：按原始参数 launch / 只编译（封装 pyhip 的 host_launch）
     channel_exp.py             W 每行（输出通道）最大的 e8m0 scale 指数，prepare_weights 用
 ```
+
+kernel 文件之间不互相 import（只有 `ep_gemm` 的 host 入口调用 `ep_prep`）：共用的 device 代码都在 `_` 开头的共享模块里，按名字导入，这样改了 helper 也会进 FlyDSL 的缓存 key（10 节第 1 条）。
 
 | 依赖 | 版本 | 用途 |
 |---|---|---|
@@ -331,7 +341,7 @@ gemm2：A2·W2ᵀ（按 128-K 组的 scale 重标定）× 通道因子 × 路由
   - GEMM 中 WG bx 处理第 bx % 8 段的第 bx // 8 个 tile，由硬件按 WG 顺序动态派发，相当于每个 XCD 内部做一次 LPT 调度。
 - **路数统计**：统计每个 token 在本卡的路数，并在单路 token 的 sorted id 上置 `SID_SINGLE`。
 
-**GEMM 主循环**（`_make_core`，gemm1 和 gemm2 共用）
+**GEMM 主循环**（`kernels/_kloop.py` 的 `_make_core`，gemm1 和 gemm2 共用，ep1k 和 megamoe 也用它）
 
 - **tile 与 wave**：一个 WG 处理一个（m-block, n-block）tile，NW 个 wave 按列切分。每个 wave 负责自己那些列的全部行，所以一个解码出的 W 片段要喂 R/16 次 MFMA，同一 WG 内不会重复解码 W。
 - **W 的读取**：W 从全局内存直接读进 VGPR（MFMA 操作数布局），提前 PF 个 K-tile 发出。运行时的 K 循环展开 2·PF 次，每个预取 buffer 在两组静态寄存器之间轮换，循环回边处不需要拷贝。
@@ -781,13 +791,13 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 ### 9.2 硬件假设
 
 - **gfx942 专用**：kernel 用的是 fp8 **FNUZ** 的 MFMA 和 gfx942 的 cache modifier（sc0 / sc1 / nt）。gfx950 的 fp8 是 OCP 格式，指令和 LDS 容量也不同，不能直接运行。
-- **写死了 304 CU / 8 XCD**：
-  - `ep_prep.NUM_CU`、`ep_small.NUM_CU`（ep1k 的 grid = 304 × 2）；
-  - tile 到 XCD 的映射里的 8（tp_gemm1 / tp_gemm2 的 `NXCD`、tp_fmoe、tp_fmoe_q、ep_gemm 的 `bx % 8` 与 prep 调度）。
+- **写死了 304 CU / 8 XCD**：常量都在 `kernels/_hw.py`（`NUM_CU`、`NUM_XCD`）。
+  - `NUM_CU`：ep1k 的 grid = 304 × 2，ep_prep、tp_prep 的 persistent grid；
+  - `NUM_XCD`：tile 到 XCD 的映射（tp_gemm1 / tp_gemm2、tp_fmoe、tp_fmoe_q、ep_gemm 的 `bx % NUM_XCD` 与 ep_prep 的调度）。megamoe 每个 XCD 一个任务队列，队列数 `_protocol.QUEUES` 也是 8。
   
   其他 CU 数的 SKU 要先改这些常量。
 - **persistent kernel 和 grid barrier 要求相关 WG 同时驻留**：ep1k 的全部 WG、ep_prep 的排序 WG、tp1kq 的 CTA。如果 CU 更少或被别的进程占用，会死锁而不是变慢。
-- **LDS 上限 64 KB**：超过时编译和 launch 都只打印错误、不抛异常，输出不会被写（10 节第 5 条）。
+- **LDS 上限 64 KB**（`_hw.LDS_BYTES_MAX`）：超过时编译和 launch 都只打印错误、不抛异常，输出不会被写（10 节第 5 条）。
 
 ### 9.3 加一个新 kernel 或新配置
 
@@ -852,7 +862,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
    - 对策：编译期开关用 int / tuple 放进闭包（例如 `functools.cache` 的参数）；改了 helper 或拿不准时，用一个空的 `FLYDSL_RUNTIME_CACHE_DIR` 跑。gemm2 epilogue 的消融实验曾因为复用了旧二进制，得出「写回方式不影响耗时」的错误结论。
 2. **运行时控制流的写法有限制。**
    - 运行时的 `if` / `while` 必须写在 `@flyc.jit` 或 `@flyc.kernel` 函数体里（会做 AST 改写），`range()` 也只有在 jit 函数里才会生成 `scf.for`；
-   - 「编译期 if 后接运行时 elif」不可靠，要写成嵌套的 if（见 `_dispatch_rows`）；
+   - 「编译期 if 后接运行时 elif」不可靠，要写成嵌套的 if（见 `_kloop._dispatch_rows`）；
    - 嵌套的 `@flyc.jit` 不会因为 Python int 参数不同而重新特化，尺寸要从列表长度推出来。
 3. **运行时 `while` 里不要写 lane 级发散的 `if`**（例如 `if tx == 0` 去取 ticket）。LLVM 会让整个循环体在部分 exec mask 下执行，结果错误，或者直接 hang。改成 wave 级分支，再按 lane 选择增量。
 4. **改变循环结构后，LLVM 会把按 lane 计算的地址提到循环外，长期占住 VGPR。** a16w4 曾因此出现 73–83 个 spill。用 `_opaque_tx` 打断这种提升。
@@ -923,7 +933,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 
 ## 12. 来源
 
-- **从哪里来**：`kernels/` 的 kernel 文件是从实验文件机械生成的（共享 helper 模块见表的最后一行）。做法是：
+- **从哪里来**：`kernels/` 的 kernel 文件是从实验文件机械生成的（共享 helper 模块见表的最后两行）。做法是：
   - 删掉测试代码（参考实现、bench、main）；
   - import 改为指向包内；
   - 环境变量开关冻结成默认值；
@@ -945,6 +955,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 | `weights.py` | `test_flydsl_moe_a16wfp4.a8w4_prepare_weights` + `ep8_moe.prepare_weights` |
 | `moe.py`、`tune.py` | `a8w4_moe_tune.py`（TP）+ `ep8_moe.CFGS / AUTO`（EP） |
 | `ref.py` | `ep8_common.py`、`a8w4_moe_tune.torch_ref` 的参考实现和计时部分 |
-| `kernels/_mem.py`、`_act.py`、`_cvt.py`、`_launch.py`、`channel_exp.py` | aiter 7cd70aca8 的 `aiter/ops/flydsl/kernels/{buffer_ops, mxfp4_gemm_common, tensor_shim, act, kernels_common}.py`，以及 `moe_2stage_a16wmix/{a8w4, utils}.py`：只留用到的函数和参数，只在 gfx942 / FlyDSL 0.3.2 上取一个值的分支已冻结；`_launch.py` 原是 `tensor_shim._run_compiled`，现在调用 pyhip 的 `host_launch` |
+| `kernels/_mem.py`、`_act.py`、`_cvt.py`、`_launch.py`、`channel_exp.py` | aiter 7cd70aca8 的 `aiter/ops/flydsl/kernels/{buffer_ops, mxfp4_gemm_common, tensor_shim, act, kernels_common}.py`，以及 `moe_2stage_a16wmix/{a8w4, utils}.py`：只留用到的函数和参数，只在 gfx942 / FlyDSL 0.3.2 上取一个值的分支已冻结；`_launch.py` 原是 `tensor_shim._run_compiled`，现在调用 pyhip 的 `host_launch`；aiter 的 `_pack_activation` 换成了 `_cvt._fp8x4_pack`（有限输入逐位相同，指令更少；NaN 靠 scale 传播，见它的 docstring） |
+| `kernels/_hw.py`、`_atomic.py`、`_mma.py`、`_kloop.py`、`_protocol.py`，`_mem.py` / `_cvt.py` 的其余部分 | 从本包的 kernel 文件里提出来的共用代码（原先在 `tp_gemm1`、`tp_fmoe`、`ep_prep`、`ep_gemm`、`ep_mega` 里，经 `G1.x` 这类模块属性调用） |
 
 设计过程、实验数据和放弃过的方案，见 aiter 仓库 tq/mimo-moe 分支的 `doc-mimo/README.md`（第 1–3、7、8、10 节）和 `doc-mimo/experiments/`。

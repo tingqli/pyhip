@@ -82,7 +82,8 @@ Rules:
 - Graph safety: no host-side epochs as flags (tp1kq is not graph-safe); the last WG resets
   counters in-kernel (ep_prep, ep1k).
 - Persistent kernels and grid barriers need all their WGs resident at once: fewer free CUs
-  (another process) deadlocks instead of slowing down. 304 CU / 8 XCD are hard-coded in a8w4.
+  (another process) deadlocks instead of slowing down. 304 CU / 8 XCD are hard-coded in a8w4
+  (`kernels/_hw.py`: `NUM_CU`, `NUM_XCD`, `LDS_BYTES_MAX`, cache-policy bits `CM_*`).
 
 ## 5. Verifying a kernel change (before any timing)
 

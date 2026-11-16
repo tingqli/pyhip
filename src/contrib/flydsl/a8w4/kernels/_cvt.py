@@ -14,14 +14,16 @@ from ._mem import _raw
 
 
 def _fp8x4_pack(a, b, c, d):
-    """Four finite f32 -> four fp8 (FNUZ) in one i32: saturate to +-240, round to nearest
-    even, and map a rounded-to-zero magnitude to +0 (FNUZ has no -0: 0x80 is NaN).
+    """Four f32 -> four fp8 (FNUZ) in one i32: saturate to +-240, round to nearest even, and
+    map a rounded-to-zero magnitude to +0 (FNUZ has no -0: 0x80 is NaN).
 
-    Inputs are assumed NaN-free (activations and weights never hold NaN in normal use), so
-    min / max are minnumf / maxnumf: one v_min / v_max each. aiter's ``_pack_activation``
-    (7cd70aca8, moe_2stage_a16wmix/a8w4.py) used the NaN-propagating minimumf / maximumf,
-    which gives the same bits on finite inputs but cost an ep_gemm1 bm128 kernel 324 of its
-    5919 instructions."""
+    min / max are minnumf / maxnumf (one v_min / v_max each), so NaN packs to 240 (0x7F).
+    NaN reaches the output through the scale instead: the caller's amax must propagate it
+    (fx.max, not maxnumf), then the dequantized values are NaN whatever the byte. aiter's
+    ``_pack_activation`` (7cd70aca8, moe_2stage_a16wmix/a8w4.py) used the NaN-propagating
+    minimumf / maximumf (NaN packs to 0): the same bits on finite inputs, but an ep_gemm1
+    bm128 kernel needed 324 more of its 5919 instructions, and with a +-Inf input the zero
+    bytes turned the row into 0 * inf, which a maxnumf amax downstream then lost."""
     v = [fx.maxnumf(fx.Float32(fx.arith.minnumf(_raw(fx.Float32(x)), _raw(fx.Float32(240.0)))),
                     fx.Float32(-240.0))
          for x in (a, b, c, d)]
