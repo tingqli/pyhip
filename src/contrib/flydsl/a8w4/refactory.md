@@ -24,6 +24,8 @@
   - 用空的 FlyDSL 缓存编译一个固定矩阵：3 个调优 shape × 2 种激活 × `tune` 的全部候选；`dyn` 的变体（bf16、fp8 每 128 列一个 scale、fp8 每 token 一个 scale；prep 单 WG / 多 WG）；`row_quant`、`tp_prep`、`weights`；megamoe。
   - 规范化 final ISA（去掉 kernel 名和注释），每个 kernel 记一个哈希。
   - 每一步都跑全量矩阵，8 张卡并行；单次超过约 30 分钟就改成每步只跑改动涉及的子集，到里程碑再跑全量。
+  - 实测全量矩阵约 105 秒（26 个 job，8 卡 × 每卡 4 个 worker），所以每一步都跑全量。
+  - `prof isa-cover SNAPSHOT -- CMD`：检查一个命令（包括它 spawn 的子进程）编译的 kernel 是否都在快照里，用来证明矩阵覆盖了测试。
 - **中途不重新调优（Q6）**：哪一步要求重新调优，就说明它违反了上面的约束。
 - **最后的性能核对（Q30）**：用 git worktree 检出基线版本，和新代码一起用 `bench ab` 的 `py:` 变体交错计时。ep8、tp8、tp4 每个 case 测 8、1024、4096、32768 tokens 四个点，要求差异在噪声内；另外跑一遍 `tune verify`。
 - **GPU 使用（Q29）**：开始前用 `rocm-smi --showuse` 确认空闲并拿住 `/tmp/gpu-N.lock`；单卡任务只用一张空闲卡；8 卡测试只在阶段末跑；卡被占用时先停下来问，不用 `--force`。
@@ -46,6 +48,7 @@
 - **Q5**：`pyhip.contrib.flydsl.a8w4` 是唯一导入路径，不再要求“整个目录能复制到别的工程”，可以直接依赖 pyhip 的公共模块。
 - **Q7**：命令行只有一个入口 `python -m pyhip.contrib.flydsl.a8w4 <tune|bench|prof|exp>`，另注册 console script `a8w4`。删除在 `src/contrib/flydsl` 下作为顶层包运行的方式和 `sys.path` hack。
 - **Q8**：以下 7 个函数在顶层保持名字和签名不变：`prepare_weights`、`shuffle_mxfp4`、`a8w4_moe`、`a8w4_moe_dyn`、`dyn_config`、`supported`、`lookup_config`。`config_name`、`parse_config`、`run_config`、`default_config`、`DEFAULT_CSV` 移到子模块，不留兼容别名。
+  - sglang 的用法还要求（Phase 0 查到，`tests/test_a8w4_api.py` 固定下来）：`supported` 接受 dict 配置（`dict(kind="tp2k", block_m=64, g1_bcm=1, g2="base")`）；`lookup_config(...)["kind"]` 可以取下标；`dyn_config` 对没有 EP kernel 的 shape 抛 `ValueError`；`ref.ref_moe` 按位置传 8 个参数。所以 Phase 5 引入有类型的 Config 后，公开 API 边界上仍然要收 dict、返回能按 `["kind"]` 取值的对象。
 - **Q17**：`a8w4.ref` 是对外稳定的数值参考（`ref_moe`、`act_ref`、`make_weights`、`make_routing`、`cos_diff`、`quant_fp8_groups`）。计时部分（`flush_cache`、`weight_copies`、`time_cold`、`WCOPIES`）移到 `dev/timing.py`。
 
 ### 4.2 kernel 族插件和配置
@@ -145,11 +148,17 @@ a8w4/
 
 每个小步一个提交，提交信息里写 ISA 对比结论；每个阶段结束停下来等 review（Q28）。
 
-- [ ] **0 安全网**：
-  - [ ] `prof isa-snapshot` / `prof isa-diff`；
-  - [ ] 在 HEAD 上生成 ISA 基线；
-  - [ ] API 签名快照测试、CSV 往返测试；
-  - [ ] 现有单卡和 8 卡 pytest 的基线结果。
+- [x] **0 安全网**：
+  - [x] `prof isa-snapshot` / `prof isa-diff` / `prof isa-cover`（`isa_snapshot.py`）；
+  - [x] 在 HEAD 上生成 ISA 基线；
+  - [x] API 签名快照测试、CSV 往返测试（`tests/test_a8w4_api.py`，只跑 host 代码，23 个用例）；
+  - [x] 现有单卡和 8 卡 pytest 的基线结果。
+
+  基线（commit d17f502，FlyDSL 0.3.2）：
+  - ISA 快照：558 次编译，177 个不同的 ISA，4 个错误，104 秒；连续两次快照完全相同。快照放在 `/tmp/a8w4_isa/base`。
+  - 4 个错误是已有问题：`a8w4_moe_dyn` 用 `ep3k l128_v1` 且 x 是每 128 列一个 scale 的 fp8 时，gemm1 的 LDS 需要 82432 B，超过 64 KB，`compile_ep_gemm1` 里的 assert 报错（silu / situv2 × 容量 256 / 4096）。`dyn_config` 不会选 `l128_v1`，只有显式指定才会碰到，但 `supported()` 没有拒绝这种组合。
+  - `tests/test_a8w4_moe.py`：94 passed、1 skipped，303 秒；它编译的 74 个 kernel 都在快照里。
+  - 8 卡 `test_a8w4_mori_ep8.py`、`test_a8w4_mori_tp8.py`、`test_a8w4_megamoe_ep8.py`：3 passed，244 秒；它们编译的 31 个不同 kernel 都在快照里。
 - [ ] **1 删除走不到的代码**：
   - 实验选项：`q8push`/`q8pushs`、`w_layout="tile"`、`AR`/`AR_SEP`、`TILE_ORDER`、`PROBE`、`TL` 等；
   - 冻结的环境变量开关；
