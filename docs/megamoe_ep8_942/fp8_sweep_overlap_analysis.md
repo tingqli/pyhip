@@ -8,6 +8,8 @@
   的数字是第一次扫描时的版本。
 - 2026-11-13，当前版本、BF16 combine：dispatch和combine没有完全藏住。每卡512–4096 token时还露出31–141 µs
   （一层的4%–13%），每卡256 token时在噪声内；串行时这些通信要57–1758 µs，mega藏住了74%–93%（第4.3节）。
+- 2026-11-16，每卡0–256 token（含空rank和各rank不同的token数）：每个token都和MORI基线、step1一致。mega仍比基线快，
+  但每卡16 token起一层约470 µs，和256 token差不多：每个有路由的expert都按256行的整block算（第4.4节）。
 - dispatch和combine都用FP8时，mega kernel比基线（MORI FP8 dispatch + FlyDSL MoE + MORI FP8 combine）快 **17%–32%**。token越多，快得越多：8卡共32k token时随机路由快29%，均衡路由快32%。
 - 32k token、随机路由时：
   - 基线 3374 µs。
@@ -160,6 +162,44 @@ for t in 4096 2048 1024 512 256; do for r in balanced random; do
       --ep-mode step1 > /tmp/overlap/step1_${r}_${t}.log
 done; done
 python docs/megamoe_ep8_942/images/overlap_sweep.py /tmp/fonts --from-dir /tmp/overlap
+```
+
+### 4.4 每卡0–256 token（2026-11-16，BF16 combine）
+
+[test_ep8_small_tokens.py](../../tests/contrib/moe/ep8/test_ep8_small_tokens.py)：mega和step1的op像sglang一样按每卡16384 token
+建，MORI基线按每卡4096（更大时它后面的MoE的buffer超过2 GB），然后依次跑下面的用例，每个用例跑在前一个留下的状态上。
+随机路由。比较的是每个token一行的calc_diff，取8个rank里最差的一行；时间是每个rank 50次的中位数里最慢的rank，
+quant算在内，只跑了一遍。
+
+| 每卡token | 每卡最多要收的行 | 和MORI比 | 和step1比 | mega µs | MORI基线 µs |
+|---|---|---|---|---|---|
+| 1 | 2816 | 1.05e-5 | 1.39e-5 | 295 | 594 |
+| 2 | 3584 | 1.13e-5 | 1.20e-5 | 264 | 602 |
+| 4 | 5888 | 1.18e-5 | 1.34e-5 | 374 | 452 |
+| 8 | 7936 | 1.14e-5 | 1.37e-5 | 443 | 598 |
+| 16 | 8192 | 1.19e-5 | 1.34e-5 | 470 | 590 |
+| 32 | 8192 | 1.34e-5 | 1.42e-5 | 468 | 519 |
+| 64 | 8192 | 1.36e-5 | 1.30e-5 | 475 | 528 |
+| 128 | 8192 | 1.29e-5 | 1.21e-5 | 517 | 563 |
+| 256 | 8192 | 1.28e-5 | 1.46e-5 | 523 | 634 |
+| 0 1 2 3 5 8 13 21 | 7936 | 1.15e-5 | 1.34e-5 | | |
+| 0 0 0 0 64 64 64 64 | 8192 | 1.13e-5 | 1.36e-5 | | |
+| 1 0 0 0 0 0 0 0 | 512 | 7.75e-6 | 1.28e-5 | | |
+| 255 0 17 1 0 100 3 64 | 8192 | 1.16e-5 | 1.33e-5 | | |
+
+- 所有用例的每个token都和MORI、step1一致，包括空rank（0个token）、全局只有1个token、各rank token数不同。最大绝对
+  误差0.25–0.75，是BF16舍入的差别（mega用BF16原子加，相加顺序和舍入次数都和MORI不同）。op按每卡4096 token建时结果
+  一样，时间差别在噪声内。
+- 每个有路由的本地expert都按256行的整block算，padding行也算。每卡16 token起32个本地expert都有路由，每卡32
+  个block，mega约470 µs，和每卡256 token差不多（每卡4096 token时128个block 2149 µs，每个约17 µs）。每卡1–4个token时
+  只碰到11–23个block，264–374 µs。MORI基线的MoE也按256行的block算，同样有这个下限。
+- mega在每个token数下都比MORI基线快（1.1–2.3倍）。要用到decode，还差按有效行数缩小M tile，和CUDA graph（每次
+  调用的epoch现在是host参数）。
+- 构造时`max_tokens` ≤ 8会在`s_cap`的assert上失败（2 × tcap × 8不是256的倍数）；只是建op时的容量，调用时的token
+  数没有这个限制。
+
+```
+torchrun --nproc_per_node=8 tests/contrib/moe/ep8/test_ep8_small_tokens.py [--capacity 4096]
 ```
 
 ## 5. 32k：基线 → kernel之间不重叠 → mega kernel
